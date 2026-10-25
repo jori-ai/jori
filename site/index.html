@@ -3,10 +3,10 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Jori — the open-source AI coworker</title>
-<meta name="description" content="Jori is an open-source AI coworker: give it a role and the tools that role uses, and it does the work.">
-<meta property="og:title" content="Jori — the open-source AI coworker">
-<meta property="og:description" content="Give it a role and the tools that role uses. It does the work, asks when unsure, and keeps a record of everything.">
+<title>Jori · Your AI coworker</title>
+<meta name="description" content="Jori takes on your team's busywork: customer email, meetings, business travel, invoices, reports. Private, secure and yours to shape.">
+<meta property="og:title" content="Jori · Your AI coworker">
+<meta property="og:description" content="Your team's busywork, handled. Private, secure and yours to shape.">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'><rect width='64' height='64' rx='14' fill='%23111'/><text x='50%' y='54%' dominant-baseline='middle' text-anchor='middle' font-family='Georgia,serif' font-size='40' fill='%23f4efe6'>j</text></svg>">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -25,6 +25,8 @@
   li { display:grid; grid-template-columns:160px 1fr; gap:16px; padding:18px 0; border-bottom:1px solid var(--line); }
   li b { font-weight:500; }
   li span { color:var(--muted); }
+  h2 { font-family:Fraunces, Georgia, serif; font-weight:600; font-size:clamp(28px, 4.4vw, 40px); line-height:1.1; letter-spacing:-.01em; margin-top:88px; }
+  h2 + p { color:var(--muted); margin-top:12px; max-width:560px; }
   .cta { margin-top:48px; display:flex; gap:20px; flex-wrap:wrap; align-items:center; }
   .cta a { color:var(--ink); text-decoration:none; border-bottom:1px solid var(--ink); padding-bottom:2px; font-weight:500; }
   .cta small { color:var(--muted); }
@@ -34,17 +36,33 @@
 </head>
 <body>
 <main>
-  <div class="tag">Open source · Pre-alpha</div>
+  <div class="tag">Open source · Coming soon</div>
   <h1>Meet Jori,<br>your <em>AI coworker</em>.</h1>
   <p class="lede">Customer email, answered. Meetings, scheduled and prepped. Business trips, planned and booked. Invoices and spend, watched. The weekly report, written before Monday. Jori takes on your team's busywork, day and night. <strong>It's private and secure by design, so your company's data stays your company's.</strong> And it's yours to shape, until it works exactly the way your business does.</p>
+
+  <h2>Hand it the work. Get your week back.</h2>
+  <p>Give Jori a role, the way you would a new hire. It learns how your team works and takes it from there.</p>
   <ul>
-    <li><b>A worker, not a chatbot</b><span>Owns recurring work end to end — triage, follow-ups, reports, ops checks.</span></li>
-    <li><b>Open source</b><span>Self-host it. Your data, your models, your infrastructure.</span></li>
-    <li><b>Accountable</b><span>Every action is logged and reviewable. Risky moves wait for a human yes.</span></li>
+    <li><b>Inbox</b><span>Customer and vendor email sorted, answered and followed up. The urgent ones reach you first.</span></li>
+    <li><b>Meetings</b><span>Times found across calendars, agendas sent ahead, notes and next steps out the moment it ends.</span></li>
+    <li><b>Business travel</b><span>Flights and hotels that fit your travel policy, booked, tracked and rebooked when plans change.</span></li>
+    <li><b>Finance ops</b><span>Invoices chased, receipts filed, spend watched. Anything unusual is flagged before it's a problem.</span></li>
+    <li><b>Sales follow-up</b><span>Every lead gets a reply and every promise gets kept. Your CRM stays up to date on its own.</span></li>
+    <li><b>Reports</b><span>The numbers your team asks for, pulled together and sent on schedule.</span></li>
+    <li><b>Operations</b><span>Systems, renewals and deadlines watched around the clock. You hear about it before your customers do.</span></li>
   </ul>
+
+  <h2>Built for how a business works.</h2>
+  <ul>
+    <li><b>Private</b><span>It runs on infrastructure you control. Your company's data never becomes someone else's.</span></li>
+    <li><b>Secure</b><span>Credentials stay locked away, and the decisions that matter always come back to a person.</span></li>
+    <li><b>Yours to shape</b><span>Open source, top to bottom. Teach it your processes, connect your tools, make it your own.</span></li>
+    <li><b>Accountable</b><span>Everything it does is on the record, so you always know what happened and why.</span></li>
+  </ul>
+
   <div class="cta">
     <a href="https://github.com/jori-ai/jori">Follow on GitHub →</a>
-    <small>Code lands soon.</small>
+    <small>Be among the first to try it.</small>
   </div>
 </main>
 <footer>© 2026 Jori</footer>
