@@ -1,0 +1,307 @@
+#!/usr/bin/env node
+// email-send — send mail via smtp2go HTTP API as the Edva identity.
+//
+// Designed for agent-originated emails (memos, alerts, reports).
+// Defaults to the Edva identity (name + agent address) with Reply-To set to
+// the agent address so replies route back through the inbound Edva channel.
+//
+// Usage:
+//   email-send --to <addr>[,<addr>...] --subject <s> --body <text> [--html] [--attach <file>]...
+//              [--from <addr>] [--from-name <name>] [--reply-to <addr>] [--body-file <path>]
+//              [--in-reply-to <message-id>] [--references <ids>]
+//
+// --to accepts a comma-separated list (e.g. "a@x.com,b@y.com") so multiple
+// recipients land on the SAME message/thread (two recipients of one thread
+// need to see the same email, not two separate ones).
+
+import { createRequire } from "node:module";
+import fs from "node:fs";
+import path from "node:path";
+import { installTools } from "../lib/root.cjs";
+const require = createRequire(import.meta.url);
+const { loadEnv } = require("../lib/load-env.js");
+const { guessMimeType } = require("../lib/mime-types.js");
+const { instance } = require("../lib/instance.cjs");
+
+loadEnv();
+
+const API_KEY = process.env.SMTP2GO_API_KEY;
+if (!API_KEY) {
+  console.error("email-send: SMTP2GO_API_KEY not set in .env");
+  process.exit(1);
+}
+
+// The agent's own address and the operator's (lib/instance.cjs
+// agent_email / owner_email).
+const INSTANCE = instance();
+const AGENT_ADDRESS = INSTANCE.agent_email;
+const OWNER_ADDRESS = INSTANCE.owner_email;
+const DEFAULT_FROM_ADDRESS = process.env.EMAIL_FROM_ADDRESS || AGENT_ADDRESS;
+const DEFAULT_FROM_NAME = process.env.EMAIL_FROM_NAME || "Edva";
+const DEFAULT_REPLY_TO = process.env.EMAIL_REPLY_TO || AGENT_ADDRESS;
+const SENT_LOG = installTools("data/edva-sent-mail.jsonl");
+
+function parseArgs(argv) {
+  const a = {
+    to: null, subject: null, body: null, html: false,
+    attachments: [],
+    fromName: DEFAULT_FROM_NAME, fromAddress: DEFAULT_FROM_ADDRESS,
+    replyTo: DEFAULT_REPLY_TO,
+    inReplyTo: null, references: null,
+  };
+  for (let i = 2; i < argv.length; i++) {
+    const k = argv[i];
+    if (k === "--to") a.to = argv[++i];
+    else if (k === "--subject") a.subject = argv[++i];
+    else if (k === "--body") a.body = argv[++i];
+    else if (k === "--body-file") a.body = fs.readFileSync(argv[++i], "utf8");
+    else if (k === "--html") a.html = true;
+    else if (k === "--attach") a.attachments.push({ path: argv[++i] });
+    else if (k === "--inline") {
+      const spec = argv[++i];
+      const idx = spec.lastIndexOf(":");
+      if (idx < 0) { console.error(`--inline requires <path>:<cid>`); process.exit(1); }
+      a.attachments.push({ path: spec.slice(0, idx), cid: spec.slice(idx + 1) });
+    }
+    else if (k === "--from-name") a.fromName = argv[++i];
+    else if (k === "--from") a.fromAddress = argv[++i];
+    else if (k === "--reply-to") a.replyTo = argv[++i];
+    else if (k === "--no-reply-to") a.replyTo = null;
+    else if (k === "--in-reply-to") a.inReplyTo = argv[++i];
+    else if (k === "--references") a.references = argv[++i];
+    else if (k === "-h" || k === "--help") { printUsage(); process.exit(0); }
+    else { console.error(`email-send: unknown flag: ${k}`); process.exit(1); }
+  }
+  // Same guard as gmail-action: a markup body is HTML even without --html.
+  if (!a.html && a.body && looksLikeHtml(a.body)) a.html = true;
+  return a;
+}
+
+function looksLikeHtml(body) {
+  const t = String(body).trimStart();
+  return /^<(!doctype|html|body|div|p|table|h[1-6]|ul|ol|span|br)\b/i.test(t)
+    || /<\/(div|p|table|ul|ol|li|h[1-6])>/i.test(t);
+}
+
+function printUsage() {
+  console.log(`email-send — send mail via smtp2go as Edva
+Usage:
+  email-send --to <addr> --subject <s> (--body <text> | --body-file <path>)
+             [--html] [--attach <file>]...
+             [--from <addr>] [--from-name <name>]
+             [--reply-to <addr>] [--no-reply-to]
+             [--in-reply-to <message-id>] [--references <ids>]
+
+Defaults:
+  From:     ${DEFAULT_FROM_NAME} <${DEFAULT_FROM_ADDRESS}>
+  Reply-To: ${DEFAULT_REPLY_TO}`);
+}
+
+// Extract plain text from HTML for the multipart/alternative text_body.
+// Without this, SMTP2Go auto-generates a text alternative whose tag-stripper
+// preserves `<!DOCTYPE html>` and similar declarations as visible text.
+function htmlToText(html) {
+  return html
+    .replace(/<!DOCTYPE[^>]*>/gi, "")
+    .replace(/<!--[\s\S]*?-->/g, "")
+    .replace(/<(script|style)\b[^>]*>[\s\S]*?<\/\1>/gi, "")
+    // Table cells get a separator, or a row reads "Yesterday (Oct 21)200" in the text part.
+    .replace(/<\/(td|th)>\s*(?=<(td|th)\b)/gi, " | ")
+    .replace(/<br\s*\/?>/gi, "\n")
+    .replace(/<\/(p|div|h[1-6]|li|tr|table)>/gi, "\n")
+    .replace(/<li\b[^>]*>/gi, "- ")
+    .replace(/<a\b[^>]*\bhref="([^"]+)"[^>]*>([^<]*)<\/a>/gi, "$2 ($1)")
+    .replace(/<[^>]+>/g, "")
+    .replace(/&nbsp;/g, " ")
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/[ \t]+/g, " ")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+// smtp2go rejects the ENTIRE send with an opaque "json data" error once a
+// custom header value crosses ~250 chars (verified empirically on a 13-hop
+// thread). References grows one id per reply, so
+// any thread deeper than ~4-5 hops trips this. Keep only the tail — the
+// most recent ids matter most for client-side threading anyway — instead
+// of letting one oversized header silently kill the whole message.
+// Retries only on network-level throws (DNS failure, TLS reset, timeout,
+// connection refused) — a resolved HTTP response (SMTP2Go 4xx/5xx, including
+// a real bad-API-key rejection) is returned immediately on the first attempt
+// and never retried, so genuine send failures still surface right away.
+// Same shape as lib/google-auth.js fetchWithRetry; kept local here so
+// this FORCE-HIGH file gains no new cross-file dependency for a small fix.
+//
+// This call used to be a bare fetch() with zero retry, so a single transient
+// network blip (observed twice on a low-traffic weekly digest send) failed the
+// whole send outright — the caller playbooks one-shot,
+// 5-second-delay retry then raced the same still-ongoing blip and failed
+// again, dropping a fully-built email with no further recourse.
+//
+// The first 3-attempt/300ms window only bought ~900ms of total backoff —
+// enough to survive a hiccup, not a blip that runs a couple seconds long. A
+// digest hit exactly that (nothing else failed in the same window, ruling out
+// a real outage), so a caller ended up announcing "email delivery failed" for
+// mail that a slightly longer retry would have gotten out. The rule:
+// retry before announcing failure, and surface a failure only
+// when it is non-transient. Widened to 5 attempts / 500ms (linear backoff:
+// 500ms, 1s, 1.5s, 2s — about 5s of total retry budget) so more of what
+// looks like a "failure" to a caller is actually just a slower retry that
+// still succeeds. A resolved HTTP response is still never retried (see
+// above) — this only widens the window for the transient, network-level
+// case the rule is about.
+async function fetchWithRetry(url, opts, retries = 5, backoffMs = 500) {
+  let lastErr;
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      return await fetch(url, opts);
+    } catch (err) {
+      lastErr = err;
+      if (attempt < retries) {
+        console.error(`email-send: fetch attempt ${attempt} failed (${err.message}), retrying...`);
+        await new Promise((r) => setTimeout(r, backoffMs * attempt));
+      }
+    }
+  }
+  throw lastErr;
+}
+
+function truncateReferences(refs, maxLen = 240) {
+  if (!refs || refs.length <= maxLen) return refs;
+  const ids = refs.split(/\s+/).filter(Boolean);
+  const kept = [];
+  let len = 0;
+  for (let i = ids.length - 1; i >= 0; i--) {
+    const next = len + ids[i].length + (kept.length ? 1 : 0);
+    if (next > maxLen) break;
+    kept.unshift(ids[i]);
+    len = next;
+  }
+  return kept.length ? kept.join(" ") : ids[ids.length - 1];
+}
+
+async function send(a) {
+  // Comma-separated --to becomes a real multi-recipient array so everyone
+  // lands on the same message/thread.
+  const toList = String(a.to).split(",").map((s) => s.trim()).filter(Boolean);
+
+  // The self-send auto-label below reads it. (It was once deleted along with
+  // a removed check and the reference left behind, so every self-addressed
+  // send threw ReferenceError AFTER delivering, skipping the label and exiting
+  // non-zero.)
+  const toHasOwner = !!OWNER_ADDRESS && toList.some((addr) => addr.toLowerCase() === OWNER_ADDRESS.toLowerCase());
+
+  // No writing-style gate here. email-send is the internal channel only:
+  // agent-to-user digests, alerts, reports (Outbound Email Policy default). An
+  // installation's style rules for outreach are about mail that goes to a
+  // third party, not about report titles the user is the sole reader of, so
+  // they are enforced in gmail-action's send command, the actual external /
+  // on-behalf-of-the-user path.
+
+  const sender = a.fromName ? `${a.fromName} <${a.fromAddress}>` : a.fromAddress;
+  const payload = {
+    api_key: API_KEY,
+    sender,
+    to: toList,
+    subject: a.subject,
+  };
+  if (a.html) {
+    payload.html_body = a.body;
+    payload.text_body = htmlToText(a.body);
+  }
+  else payload.text_body = a.body;
+
+  const headers = [];
+  if (a.replyTo) headers.push({ header: "Reply-To", value: a.replyTo });
+  if (a.inReplyTo) headers.push({ header: "In-Reply-To", value: a.inReplyTo });
+  if (a.references) headers.push({ header: "References", value: truncateReferences(a.references) });
+  if (headers.length) payload.custom_headers = headers;
+
+  // smtp2go keeps inline images in a separate top-level `inlines` array. Putting them
+  // in `attachments` with a cid field does NOT embed them — the cid is ignored and they
+  // land as ordinary attachments at the bottom of the message. Split the two here.
+  // smtp2go resolves the Content-ID from the filename, so filename === cid.
+  const encode = (att, filename) => ({
+    filename,
+    fileblob: fs.readFileSync(att.path).toString("base64"),
+    mimetype: guessMimeType(att.path),
+  });
+
+  const inlines = a.attachments.filter((att) => att.cid);
+  const files = a.attachments.filter((att) => !att.cid);
+
+  if (files.length > 0) {
+    payload.attachments = files.map((att) => encode(att, path.basename(att.path)));
+  }
+  if (inlines.length > 0) {
+    payload.inlines = inlines.map((att) => ({ ...encode(att, att.cid), cid: att.cid }));
+  }
+
+  const res = await fetchWithRetry("https://api.smtp2go.com/v3/email/send", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  const data = await res.json();
+
+  if (!res.ok || data.data?.error) {
+    console.error(`email-send error: ${JSON.stringify(data.data?.error || data)}`);
+    process.exit(1);
+  }
+  const d = data.data || {};
+  console.log(`Sent: email_id=${d.email_id || "?"} succeeded=${d.succeeded} failed=${d.failed}`);
+
+  // Sent-mail log lets the email-inbound playbook resolve replies via In-Reply-To.
+  try {
+    const entry = {
+      ts: new Date().toISOString(),
+      email_id: d.email_id || null,
+      from: a.fromAddress,
+      to: toList,
+      subject: a.subject,
+      reply_to: a.replyTo || null,
+      in_reply_to: a.inReplyTo || null,
+      references: a.references || null,
+      originating_task: process.env.EDVA_TASK_ID || null,
+    };
+    await fs.promises.appendFile(SENT_LOG, JSON.stringify(entry) + "\n");
+  } catch (err) {
+    console.error(`email-send: sent-log append failed: ${err.message}`);
+  }
+
+  // Auto-label agent-originated mail in the user's inbox so triage/search can
+  // distinguish it from inbound mail. Only labels when the From identity is
+  // the default Edva address and the recipient is the user's address — i.e.
+  // a self-addressed agent memo. Fires in the background; failures are silent.
+  // The try/catch is load-bearing, not defensive habit. SMTP2Go has already
+  // accepted the message by this point, so a throw here cannot un-send it. It
+  // can only turn a delivered email into a non-zero exit, which every caller
+  // reads as "not delivered" and alerts on. That is exactly what happened
+  // once: a dangling variable reference threw right here, AFTER successful
+  // sends, and a digest job reported "email delivery failed (SMTP2Go
+  // unreachable)" for digests that were already in the user's inbox.
+  // Past the delivery check above, bookkeeping warns; it never fails the send.
+  try {
+    if (AGENT_ADDRESS && a.fromAddress === AGENT_ADDRESS && toHasOwner) {
+      const { spawn } = await import("node:child_process");
+      spawn(
+        path.join(path.dirname(new URL(import.meta.url).pathname), "edva-email-label.sh"),
+        [a.subject],
+        { detached: true, stdio: "ignore" }
+      ).unref();
+    }
+  } catch (err) {
+    console.error(`email-send: auto-label failed after successful delivery (email_id=${d.email_id || "?"}): ${err.message}`);
+  }
+}
+
+const args = parseArgs(process.argv);
+if (!args.to || !args.subject || args.body === null) {
+  printUsage();
+  process.exit(1);
+}
+send(args).catch((e) => { console.error(`email-send fatal: ${e.message}`); process.exit(1); });
