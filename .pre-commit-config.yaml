@@ -17,3 +17,12 @@ repos:
         language: system
         pass_filenames: false
         always_run: true
+
+      # Local hook — an install with a private overlay (docs: bin/jori-overlay)
+      # must never commit one of the overlay's files to this public repo.
+      - id: overlay-apart
+        name: Keep the private overlay out of the kernel repo
+        entry: bin/jori-overlay check --staged
+        language: system
+        pass_filenames: false
+        always_run: true
