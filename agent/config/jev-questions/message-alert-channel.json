@@ -1,5 +1,5 @@
 {
-  "_doc": "Jev site for ordinary channel traffic (lib/message-alert.mjs, rubric \"channel\"): a message in a many-member channel, such as a Slack channel, that does not @-mention {{owner_name}}. That traffic is low priority, so it pings only when it calls {{owner_name}} by name or reports a really major issue. Direct messages, group DMs and @-mentions stay on site message-alert. Legacy (fallback, and shadow while a shadow window is open) is a toolless Sonnet judgment built from this file's own wording (rubricPrompt). Kernel definition; an installation's own data/jev-questions/message-alert-channel.json replaces it.",
+  "_doc": "Jev site for ordinary channel traffic (lib/message-alert.mjs, rubric \"channel\"): a message in a many-member channel, such as a Slack channel, that does not @-mention {{owner_name}}. That traffic is low priority, so it rates above normal only when it calls {{owner_name}} by name or reports a really major issue. Direct messages, group DMs and @-mentions stay on site message-alert. Legacy (fallback, and shadow while a shadow window is open) is a toolless Sonnet judgment built from this file's own wording (rubricPrompt). Kernel definition; an installation's own data/jev-questions/message-alert-channel.json replaces it.",
   "threshold": 0.8,
   "questions": {
     "level": {

@@ -16,7 +16,7 @@ import path from "node:path";
 import readline from "node:readline";
 import { createRequire } from "node:module";
 
-const { instance } = createRequire(import.meta.url)("../../lib/instance.cjs");
+const { instance, localDir } = createRequire(import.meta.url)("../../lib/instance.cjs");
 
 const DEFAULT_CLAUDE = process.env.CLAUDE_BIN || `${process.env.HOME}/.local/bin/claude`;
 
@@ -98,6 +98,19 @@ export function buildLocalRulesFile({ localDir, role, stateDir }) {
  * CLAUDE.md is loaded there, so no local rules either). The shell twin is
  * jori_local_rules_role in agent/scripts/lib/local-rules.sh.
  */
+/**
+ * The installation's own MCP servers for a session, beside the kernel's set:
+ * `agent/local/mcp/<name>.json` for <name> = the base config's file name
+ * (`chat-mcp-config`, `mcp-config`) and the agent directory the session runs in
+ * (`ops-light-agent`, ...). Only files that exist; none means the kernel set alone.
+ */
+export function localMcpConfigs({ mcpConfig, cwd } = {}, dir = localDir()) {
+  const names = new Set();
+  if (mcpConfig && !String(mcpConfig).trim().startsWith("{")) names.add(path.basename(mcpConfig, ".json"));
+  if (cwd) names.add(path.basename(cwd));
+  return [...names].map((n) => path.join(dir, "mcp", `${n}.json`)).filter((f) => fs.existsSync(f));
+}
+
 export function localRulesRoleForCwd(cwd, root) {
   if (!cwd || !root) return null;
   // Physical paths, so a symlinked checkout or cwd still matches.
@@ -194,7 +207,8 @@ export class ClaudeSession extends EventEmitter {
     if (o.effort) args.push("--effort", o.effort);
     if (o.maxBudgetUsd) args.push("--max-budget-usd", String(o.maxBudgetUsd));
     if (o.remoteControlPrefix) args.push("--remote-control-session-name-prefix", o.remoteControlPrefix);
-    if (o.mcpConfig) args.push("--mcp-config", o.mcpConfig);
+    const mcpConfigs = [o.mcpConfig, ...localMcpConfigs(o)].filter(Boolean);
+    if (mcpConfigs.length) args.push("--mcp-config", ...mcpConfigs);
     if (o.addDirs) for (const d of o.addDirs) args.push("--add-dir", d);
     // Extra settings layered over the user/project files (a JSON string).
     // --settings outranks ~/.claude/settings.json, so this is how a supervisor
