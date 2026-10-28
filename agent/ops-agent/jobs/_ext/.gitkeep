@@ -1,0 +1,12 @@
+# Installation job playbooks.
+#
+# A playbook placed here (`<job>.md`) is dispatchable through the supervisor
+# webhooks exactly like the bundled jobs in the parent dir:
+# agent/supervisor/http-server.mjs resolves {"job": "<name>"} to
+# jobs/<name>.md first, then to jobs/_ext/<name>.md (a kernel job wins on a
+# name), and appends agent/local/jobs/<name>.md when that exists. Give a new
+# job a tier in agent/local/job-routing.json and a schedule in
+# agent/local/tasks.json (both merged with the kernel's by lib/registry.cjs).
+#
+# Everything here except this file is gitignored — see .gitignore and
+# docs/architecture-public-private.md.

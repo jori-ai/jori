@@ -1,0 +1,32 @@
+{
+  "_comment": "MCP servers for the chat agent under the chat supervisor (agent/supervisor/chat-supervisor.mjs passes this file as --mcp-config). phone-channel provides the reply/get_location tools (JORI_PHONE_PRIMARY marks it as the one Supabase subscriber); tools is agent/tools-mcp scoped to the chat agent. No secrets here: ${VAR} placeholders are expanded from the environment, which process-manager.mjs loads from .env (JORI_HOME is written there by `jori init` and exported by `jori up`). Add your own servers in a copy outside the repo only if they name accounts or machine paths.",
+  "mcpServers": {
+    "phone-channel": {
+      "command": "node",
+      "args": ["${JORI_HOME}/agent/phone-channel/index.mjs"],
+      "env": {
+        "JORI_PHONE_PRIMARY": "1"
+      },
+      "alwaysLoad": true
+    },
+    "tools": {
+      "command": "node",
+      "args": ["${JORI_HOME}/agent/tools-mcp/index.mjs"],
+      "env": {
+        "JORI_AGENT_ID": "chat"
+      },
+      "alwaysLoad": true
+    },
+    "supabase-jori": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@supabase/mcp-server-supabase@latest",
+        "--project-ref=${JORI_SUPABASE_PROJECT}"
+      ],
+      "env": {
+        "SUPABASE_ACCESS_TOKEN": "${SUPABASE_ACCESS_TOKEN}"
+      }
+    }
+  }
+}

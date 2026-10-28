@@ -1,0 +1,194 @@
+#!/usr/bin/env node
+// wiki-audit — nightly re-evaluation of the pinned-page subset.
+//
+// Reads the wiki access log (`data/wiki-access.jsonl`) for the last N
+// days and decides:
+//   - Pin: any unpinned active page hit by MCP tools >= PIN_THRESHOLD times.
+//   - Unpin: any pinned page that has been pinned for >= TENURE_DAYS and
+//            received zero MCP hits in the window. pin_locked pages are
+//            skipped — they're identity / always-needed anchors that can't
+//            be measured by tool-call frequency (the SessionStart hook
+//            injects them, so agents never explicitly fetch them).
+//
+// Usage:
+//   wiki-audit                  # apply changes + log them to the Improvements channel
+//   wiki-audit --dry-run        # report only, no DB or Improvements writes
+//   wiki-audit --no-log         # apply changes, skip the Improvements row
+//                               # (--no-email is kept as an alias)
+//   wiki-audit --window-days N  # change the lookback window (default 7)
+//   wiki-audit --pin-threshold N  # default 5
+//   wiki-audit --json           # machine-readable summary
+
+"use strict";
+
+const fs = require("node:fs");
+const os = require("node:os");
+const path = require("node:path");
+const { spawnSync } = require("node:child_process");
+const ws = require("../lib/wiki-store.js");
+
+const { installTools } = require("../lib/root.cjs");
+const args = process.argv.slice(2);
+function flag(name, def = undefined) {
+  const i = args.indexOf(`--${name}`);
+  if (i === -1) return def;
+  const next = args[i + 1];
+  if (!next || next.startsWith("--")) return true;
+  return next;
+}
+
+const DRY_RUN = Boolean(flag("dry-run", false));
+const NO_LOG = Boolean(flag("no-log", false) || flag("no-email", false));
+const AS_JSON = Boolean(flag("json", false));
+const WINDOW_DAYS = Number(flag("window-days", 7));
+const PIN_THRESHOLD = Number(flag("pin-threshold", 5));
+const TENURE_DAYS = Number(flag("tenure-days", 7));
+
+const sinceMs = Date.now() - WINDOW_DAYS * 24 * 3600 * 1000;
+
+function audit() {
+  const access = ws.readAccessLog({ sinceMs, onlyCallers: ["mcp"] });
+  const pages = ws.listPages({ status: "active" });
+  const pinNow = [];
+  const unpinNow = [];
+  const stayPinned = [];
+  const stayUnpinned = [];
+  const skippedLocked = [];
+  const tooFresh = [];
+
+  for (const p of pages) {
+    const hits = access.counts.get(p.id) || 0;
+    const isPinned = !!p.pinned;
+    if (isPinned) {
+      // Unpin?
+      if (p.pin_locked) {
+        skippedLocked.push({ ...p, hits });
+        continue;
+      }
+      if (hits === 0) {
+        // Tenure check.
+        const pinnedAt = p.pinned_at ? Date.parse(p.pinned_at) : null;
+        if (
+          pinnedAt &&
+          Number.isFinite(pinnedAt) &&
+          Date.now() - pinnedAt < TENURE_DAYS * 24 * 3600 * 1000
+        ) {
+          tooFresh.push({ ...p, hits });
+        } else {
+          unpinNow.push({ ...p, hits });
+        }
+      } else {
+        stayPinned.push({ ...p, hits });
+      }
+    } else {
+      // Pin?
+      if (hits >= PIN_THRESHOLD) {
+        pinNow.push({ ...p, hits });
+      } else {
+        stayUnpinned.push({ ...p, hits });
+      }
+    }
+  }
+
+  return {
+    window_days: WINDOW_DAYS,
+    pin_threshold: PIN_THRESHOLD,
+    tenure_days: TENURE_DAYS,
+    access_summary: {
+      entries: access.total_entries,
+      hits: access.total_hits,
+      by_tool: access.by_tool,
+    },
+    pin_now: pinNow,
+    unpin_now: unpinNow,
+    stay_pinned: stayPinned,
+    stay_unpinned: stayUnpinned,
+    skipped_locked: skippedLocked,
+    too_fresh: tooFresh,
+  };
+}
+
+function applyChanges(report) {
+  const editedBy = "wiki-audit";
+  for (const p of report.pin_now) {
+    ws.setPinned(p.id, true, { editedBy });
+  }
+  for (const p of report.unpin_now) {
+    ws.setPinned(p.id, false, { editedBy });
+  }
+}
+
+function fmtList(items, key = "id") {
+  if (!items.length) return "  (none)\n";
+  return items.map((p) => `  - ${p[key]} (hits=${p.hits}): ${p.title || ""}`).join("\n") + "\n";
+}
+
+function buildText(report) {
+  const lines = [];
+  lines.push(`Wiki pin audit: ${new Date().toISOString().slice(0, 10)}`);
+  lines.push("");
+  lines.push(
+    `Window: last ${report.window_days}d. ${report.access_summary.entries} log entries, ${report.access_summary.hits} page hits (MCP only).`,
+  );
+  lines.push(
+    `By tool: ${Object.entries(report.access_summary.by_tool).map(([k, v]) => `${k}=${v}`).join(", ") || "(none)"}`,
+  );
+  lines.push("");
+  lines.push(`Pin (newly pinned, ${report.pin_now.length}):`);
+  lines.push(fmtList(report.pin_now));
+  lines.push(`Unpin (newly unpinned, ${report.unpin_now.length}):`);
+  lines.push(fmtList(report.unpin_now));
+  lines.push(`Pinned, still active (${report.stay_pinned.length}):`);
+  lines.push(fmtList(report.stay_pinned));
+  lines.push(`Pinned, locked, skipped from auto-unpin (${report.skipped_locked.length}):`);
+  lines.push(fmtList(report.skipped_locked));
+  lines.push(`Pinned, idle but too fresh to unpin (${report.too_fresh.length}):`);
+  lines.push(fmtList(report.too_fresh));
+  return lines.join("\n");
+}
+
+// Applied pin moves are low-risk and automatic, so they land in the app's
+// Improvements channel as a green-check row (display only) instead of an email.
+// Silent on no-op nights: this is only called when something changed.
+function logToImprovements(report) {
+  const ids = (items) => items.map((p) => `${p.id} (${p.hits})`).join(", ");
+  const parts = [];
+  if (report.pin_now.length) parts.push(`${report.pin_now.length} pinned`);
+  if (report.unpin_now.length) parts.push(`${report.unpin_now.length} unpinned`);
+  const summary = `Wiki pinned set retuned: ${parts.join(", ")}`;
+  const rationale = [
+    `Last ${report.window_days}d of agent lookups (${report.access_summary.hits} page hits).`,
+    report.pin_now.length ? `Pinned (hits >= ${report.pin_threshold}): ${ids(report.pin_now)}.` : "",
+    report.unpin_now.length
+      ? `Unpinned (0 hits, pinned >= ${report.tenure_days}d, not locked): ${ids(report.unpin_now)}.`
+      : "",
+  ].filter(Boolean).join(" ");
+  const r = spawnSync(
+    installTools("bin/self-improve-feed-log"),
+    ["--type", "code-fix", "--risk", "low", "--summary", summary, "--rationale", rationale, "--status", "applied"],
+    { stdio: "inherit" },
+  );
+  if (r.status !== 0) {
+    console.error("wiki-audit: self-improve-feed-log failed (changes already applied; continuing)");
+  }
+}
+
+const report = audit();
+const txt = buildText(report);
+
+if (AS_JSON) {
+  console.log(JSON.stringify(report, null, 2));
+} else {
+  console.log(txt);
+}
+
+const hasChanges = report.pin_now.length || report.unpin_now.length;
+
+if (DRY_RUN) {
+  if (!AS_JSON) console.log("\n(dry-run: no changes applied, nothing logged)");
+} else if (hasChanges) {
+  applyChanges(report);
+  if (!NO_LOG) logToImprovements(report);
+}
+
+ws.closeDb();
