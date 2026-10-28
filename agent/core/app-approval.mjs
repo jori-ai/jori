@@ -12,6 +12,9 @@
 // no I/O, no model — so it is unit-tested with generated keys.
 
 import crypto from "node:crypto";
+import { createRequire } from "node:module";
+
+const { instanceValue } = createRequire(import.meta.url)("../../lib/instance.cjs");
 
 // P-256 (secp256r1 / prime256v1) SPKI DER prefix for an uncompressed point.
 const P256_SPKI_PREFIX = Buffer.from(
@@ -32,15 +35,16 @@ export function rawP256ToKey(rawB64) {
 }
 
 // The exact bytes the device signs. MUST match TradeApproval's message() shape
-// (the trade-approval domain → jori-approve.v1 for self-improvement). Order + newlines
+// (its own domain → the self-improvement domain here). Order + newlines
 // are load-bearing (they're part of the signed payload).
 //
 // `domain` separates approval kinds: purchases sign `jori-purchase.v1`
 // (lib/purchase-approval.mjs), so a self-improvement signature can never
 // be replayed as a purchase authorization or vice versa. Absent → the original
-// self-improvement domain, so existing rows verify unchanged.
+// self-improvement domain (`approval_domain` in agent/local/instance.json),
+// so existing rows verify unchanged.
 export function canonicalMessage({ id, hash, nonce, expiresAt, domain }) {
-  return `${domain || "jori-approve.v1"}\n${id}\n${hash}\n${nonce}\n${expiresAt}`;
+  return `${domain || instanceValue("approval_domain")}\n${id}\n${hash}\n${nonce}\n${expiresAt}`;
 }
 
 // Verify a DER ECDSA (SHA-256) signature over the canonical message. Returns a

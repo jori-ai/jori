@@ -1,0 +1,23 @@
+#!/usr/bin/env node
+// message-followup — ask the user about an urgent message they have not answered
+// in 24 hours (lib/message-followup.mjs). Code only, hourly from cron
+// (agent/scripts/trigger-message-followup.sh).
+//
+// Usage: message-followup [--dry-run] [--json]
+import path from "node:path";
+import { spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
+import { runFollowup } from "../lib/message-followup.mjs";
+
+const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const argv = process.argv.slice(2);
+const dryRun = argv.includes("--dry-run");
+
+function send(text) {
+  const r = spawnSync(path.join(ROOT, "bin/jori-send-curl"), ["--suppress-hook", "--intent", "message-followup", text], { encoding: "utf8", timeout: 60_000 });
+  if (r.status !== 0) throw new Error(`jori-send-curl exit ${r.status}: ${String(r.stderr || "").slice(0, 200)}`);
+}
+
+const out = runFollowup({ root: ROOT, send, dryRun });
+if (argv.includes("--json")) console.log(JSON.stringify(out));
+else console.log(`${new Date().toISOString()} due=${out.due} unanswered=${out.unanswered}${dryRun && out.text ? `\n${out.text}` : ""}`);

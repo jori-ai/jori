@@ -86,3 +86,6 @@ apps/telemetry/.vercel/
 .env.*
 !.env.example
 .vercel/
+
+# The private overlay's git dir (bin/jori-overlay).
+/.overlay.git/
