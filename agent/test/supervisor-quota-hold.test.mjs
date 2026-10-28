@@ -446,7 +446,7 @@ describe("quota refusal: ops supervisor end to end", { skip: !canChildListen() &
   // outranks HOME (lib/root.cjs), so the child never inherits it.
   async function boot(mode, env = {}) {
     tmp = fs.mkdtempSync(path.join(process.env.TMPDIR || os.tmpdir(), "quota-hold-"));
-    const root = path.join(tmp, "Dev/jori/tools");
+    const root = path.join(tmp, "Dev/jori");
     const bin = path.join(root, "bin");
     for (const d of ["bin", "data", "logs", "agent/ops-agent", "agent/supervisor", "agent/logs"]) fs.mkdirSync(path.join(root, d), { recursive: true });
     // The supervisor imports lib through JORI_ROOT; point it at the
