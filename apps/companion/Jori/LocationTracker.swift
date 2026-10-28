@@ -18,9 +18,9 @@ import UIKit
 // CLI and app agree on labels. The list is intentionally empty in the public
 // repo — add your own:
 //
-//   ("Home",            40.7426, -74.0015, "<street>", "<city>"),
-//   ("Office",          40.7484, -73.9857, "<street>", "<city>"),
-//   ("Parents",         42.3601, -71.0589, "<street>", "<city>"),
+//   ("Home",            37.7749, -122.4194, "<street>", "<city>"),
+//   ("Office",          37.7897, -122.3972, "<street>", "<city>"),
+//   ("Parents",         47.6062, -122.3321, "<street>", "<city>"),
 //
 // All five fields are required.
 
