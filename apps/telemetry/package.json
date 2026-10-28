@@ -1,8 +1,8 @@
 {
-  "name": "edva-telemetry",
+  "name": "jori-telemetry",
   "version": "0.1.0",
   "private": true,
-  "description": "Tiny Vercel edge function for edva's README pixel + first-run install ping.",
+  "description": "Tiny Vercel edge function for jori's README pixel + first-run install ping.",
   "scripts": {
     "deploy": "vercel --prod",
     "deploy:preview": "vercel"

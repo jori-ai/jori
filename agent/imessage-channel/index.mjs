@@ -36,7 +36,7 @@ const POLL_MS = Number(process.env.IMESSAGE_CHANNEL_POLL_MS || 3000);
 const NAMES_REFRESH_MS = 10 * 60 * 1000;
 const INBOX = installTools("data/imessage-inbox.jsonl");
 const STATE = installTools("data/imessage-channel-state.json");
-const CHAT_BIN = installTools("bin/edva-send-curl");
+const CHAT_BIN = installTools("bin/jori-send-curl");
 const FAIL_PAGE_AFTER_MS = 10 * 60 * 1000;
 const STALE_ALERT_MS = 30 * 60 * 1000;
 
@@ -76,7 +76,7 @@ function sendChat(args) {
     const child = spawn(CHAT_BIN, args, { detached: true, stdio: "ignore" });
     child.unref();
   } catch (err) {
-    log(`edva-send-curl spawn failed: ${err.message}`);
+    log(`jori-send-curl spawn failed: ${err.message}`);
   }
 }
 

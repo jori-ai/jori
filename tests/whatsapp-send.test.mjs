@@ -16,10 +16,10 @@ const BIN = new URL("../bin/whatsapp-send", import.meta.url).pathname;
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "wa-send-"));
 const local = path.join(tmp, "local");
 fs.mkdirSync(path.join(local, "config"), { recursive: true });
-fs.mkdirSync(path.join(tmp, "data"), { recursive: true }); // the sent-log mirror, under EDVA_HOME=tmp
+fs.mkdirSync(path.join(tmp, "data"), { recursive: true }); // the sent-log mirror, under JORI_HOME=tmp
 
 function send(to, env) {
-  const base = { PATH: process.env.PATH, HOME: tmp, EDVA_LOCAL_DIR: local, WHATSAPP_RUNNER_URL: "http://127.0.0.1:9" };
+  const base = { PATH: process.env.PATH, HOME: tmp, JORI_LOCAL_DIR: local, WHATSAPP_RUNNER_URL: "http://127.0.0.1:9" };
   return spawnSync(process.execPath, [BIN, "--to", to, "--text", "one — two"], { env: { ...base, ...env }, encoding: "utf8" });
 }
 const gated = (r) => r.status === 1 && /em\/en dash found/.test(r.stderr);
@@ -74,7 +74,7 @@ async function withRunner(fn) {
 function run(args, url) {
   return new Promise((resolve) => {
     const child = spawn(process.execPath, [BIN, ...args], {
-      env: { PATH: process.env.PATH, HOME: tmp, EDVA_HOME: tmp, EDVA_LOCAL_DIR: local, WHATSAPP_RUNNER_URL: url },
+      env: { PATH: process.env.PATH, HOME: tmp, JORI_HOME: tmp, JORI_LOCAL_DIR: local, WHATSAPP_RUNNER_URL: url },
     });
     let stdout = "", stderr = "";
     child.stdout.on("data", (c) => { stdout += c; });

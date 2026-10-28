@@ -22,12 +22,12 @@ const LOG = path.join(tmp, "data", "sms-sent.jsonl");
 const SID = "AC" + "0".repeat(32);
 const TOKEN = "f".repeat(32);
 const MSG_SID = "SM" + "a".repeat(32);
-const OK_TEXT = "Hi Dana, this is Edva, Alex's AI assistant. Alex asked me to text you. Please call back when you can.";
+const OK_TEXT = "Hi Dana, this is Jori, Alex's AI assistant. Alex asked me to text you. Please call back when you can.";
 
 function run(args, env = {}) {
   const base = {
-    PATH: process.env.PATH, HOME: tmp, EDVA_HOME: tmp, EDVA_LOCAL_DIR: local,
-    EDVA_OWNER_NAME: "Alex", NODE_TEST_CONTEXT: process.env.NODE_TEST_CONTEXT || "child-v8",
+    PATH: process.env.PATH, HOME: tmp, JORI_HOME: tmp, JORI_LOCAL_DIR: local,
+    JORI_OWNER_NAME: "Alex", NODE_TEST_CONTEXT: process.env.NODE_TEST_CONTEXT || "child-v8",
   };
   return new Promise((resolve) => {
     const p = spawn(process.execPath, [BIN, ...args], { env: { ...base, ...env } });
@@ -40,12 +40,12 @@ function run(args, env = {}) {
 
 test("hasIdentityOpener accepts the two policy openers and nothing else", () => {
   assert.ok(hasIdentityOpener(OK_TEXT, "Alex"));
-  assert.ok(hasIdentityOpener("Hi Dana, this is Edva — Alex’s AI assistant. Alex asked me to let you know.", "Alex"));
-  assert.ok(hasIdentityOpener("This is Edva on behalf of Alex: the meeting moved.", "Alex"));
+  assert.ok(hasIdentityOpener("Hi Dana, this is Jori — Alex’s AI assistant. Alex asked me to let you know.", "Alex"));
+  assert.ok(hasIdentityOpener("This is Jori on behalf of Alex: the meeting moved.", "Alex"));
   assert.ok(!hasIdentityOpener("Please call Alex when you can.", "Alex"));
   assert.ok(!hasIdentityOpener("Hi Dana, this is Alex. Call me.", "Alex"));
-  assert.ok(!hasIdentityOpener("Hi Dana, this is Edva, Sam's AI assistant.", "Alex"), "wrong owner");
-  assert.ok(!hasIdentityOpener("Hi, this is Edva, Alex's AI assistant.", "Alex"), "no recipient name");
+  assert.ok(!hasIdentityOpener("Hi Dana, this is Jori, Sam's AI assistant.", "Alex"), "wrong owner");
+  assert.ok(!hasIdentityOpener("Hi, this is Jori, Alex's AI assistant.", "Alex"), "no recipient name");
   assert.ok(!hasIdentityOpener(OK_TEXT, ""));
 });
 
@@ -125,7 +125,7 @@ test("send + --wait: posts the form with Basic auth, logs sent and final status,
   fs.rmSync(LOG, { force: true });
   await withTwilio(async (api, seen) => {
     const r = await run(["--to", "+15550100001", "--text", OK_TEXT, "--authorized", "Send Dana a text.", "--wait", "5", "--json"],
-      { ...CREDS, SMS_TWILIO_API_BASE: api, EDVA_TASK_ID: "t-1" });
+      { ...CREDS, SMS_TWILIO_API_BASE: api, JORI_TASK_ID: "t-1" });
     assert.equal(r.status, 0, r.stderr);
     const out = JSON.parse(r.stdout);
     assert.equal(out.sid, MSG_SID);

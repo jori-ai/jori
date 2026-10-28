@@ -35,7 +35,7 @@ loadEnv();
 const INBOX = installTools("data/slack-inbox.jsonl");
 const DECISIONS = installTools("data/slack-filter-log.jsonl");
 const STATE_FILE = installTools("data/slack-channel-state.json");
-const CHAT_BIN = installTools("bin/edva-send-curl");
+const CHAT_BIN = installTools("bin/jori-send-curl");
 const UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36";
 
 function config() {
@@ -232,10 +232,10 @@ async function resolveSendChannel(payload) {
 function systemPost(text) {
   try {
     const child = spawn(CHAT_BIN, ["--channel", "system", "--skip-precheck", text], { detached: true, stdio: "ignore" });
-    child.on("error", (err) => log(`edva-send-curl failed: ${err.message}`));
+    child.on("error", (err) => log(`jori-send-curl failed: ${err.message}`));
     child.unref();
   } catch (err) {
-    log(`edva-send-curl spawn failed: ${err.message}`);
+    log(`jori-send-curl spawn failed: ${err.message}`);
   }
 }
 
@@ -257,7 +257,7 @@ function pageOfficialFallbackOnce(error) {
   if (st.official_alert) return;
   st.official_alert = { at: new Date().toISOString(), error };
   writeState(st);
-  systemPost(`⚠️ Slack official app tokens rejected (${error}); the Slack channel fell back to the browser session. Reinstall the Edva app and update SLACK_USER_TOKEN / SLACK_APP_TOKEN in .env.`);
+  systemPost(`⚠️ Slack official app tokens rejected (${error}); the Slack channel fell back to the browser session. Reinstall the Jori app and update SLACK_USER_TOKEN / SLACK_APP_TOKEN in .env.`);
 }
 
 function clearAuthAlert() {
@@ -278,10 +278,10 @@ const sentTs = new Map(); // ts we posted → time, to drop their RTM echo
 function chatPing(body) {
   try {
     const child = spawn(CHAT_BIN, ["--suppress-hook", "--intent", "slack-inbound", body], { detached: true, stdio: "ignore" });
-    child.on("error", (err) => log(`edva-send-curl failed: ${err.message}`));
+    child.on("error", (err) => log(`jori-send-curl failed: ${err.message}`));
     child.unref();
   } catch (err) {
-    log(`edva-send-curl spawn failed: ${err.message}`);
+    log(`jori-send-curl spawn failed: ${err.message}`);
   }
 }
 

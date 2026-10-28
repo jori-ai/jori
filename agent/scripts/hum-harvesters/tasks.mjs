@@ -6,7 +6,7 @@ import { execFileSync } from "node:child_process";
 import { readStdinJson, emit, emitNull, stampRun, readTopicState, writeTopicState, GOG_ACCOUNT } from "./_common.mjs";
 
 const COOLDOWN_MS = 3 * 24 * 3600 * 1000;
-const P1_MARKER = "[edva-p1";
+const P1_MARKER = "[jori-p1";
 
 await readStdinJson();
 

@@ -18,7 +18,7 @@
 # LAUNCHED BY LAUNCHD (ai.claude.system-issue-review{,-critical}), not crontab —
 # a `claude -p` under cron cannot unlock the keychain holding the Max creds.
 #
-# Mines Edva's own SYSTEM CHANNEL for alerts, clusters them into issues,
+# Mines Jori's own SYSTEM CHANNEL for alerts, clusters them into issues,
 # root-causes each open one, and ships the fix through the unified
 # self-improvement pipeline (low/moderate auto-apply + green-check card; high
 # risk → Face-ID card). Closes the loop the system channel never had: alerts
@@ -54,10 +54,10 @@ export PATH="/opt/homebrew/bin:$PATH"
 source "$(dirname "$0")/lib/instance.sh"
 
 SCRIPTS="$(cd "$(dirname "$0")" && pwd)"
-source "$(dirname "${BASH_SOURCE[0]}")/lib/root.sh"   # EDVA_INSTALL, EDVA_INSTALL_TOOLS
-ROOT="$EDVA_INSTALL"
-LOGFILE="$EDVA_INSTALL_TOOLS/agent/logs/watchdog.log"
-JOB_MD="$EDVA_INSTALL_TOOLS/agent/ops-agent/jobs/system-issue-review.md"
+source "$(dirname "${BASH_SOURCE[0]}")/lib/root.sh"   # JORI_INSTALL, JORI_INSTALL_TOOLS
+ROOT="$JORI_INSTALL"
+LOGFILE="$JORI_INSTALL_TOOLS/agent/logs/watchdog.log"
+JOB_MD="$JORI_INSTALL_TOOLS/agent/ops-agent/jobs/system-issue-review.md"
 
 MODE="nightly"
 for arg in "$@"; do
@@ -72,7 +72,7 @@ done
 if [ "$MODE" = "critical" ]; then
   TASK='Run the SYSTEM ISSUE REVIEW job in CRITICAL-ESCALATION mode (this is the hourly same-day lane, equivalent to the webhook payload {"job":"system-issue-review","reason":"critical-escalation"}). Follow § Critical-escalation dispatch: cluster normally, then take ONLY the highest-scoring critical cluster and do that one thing. ultrathink.'
 else
-  TASK='Run the SYSTEM ISSUE REVIEW job (nightly full pass, equivalent to the webhook payload {"job":"system-issue-review"}). Follow the playbook below end-to-end. ultrathink — root-causing an alert correctly is the whole value here, and a wrong diagnosis becomes a code change '"${EDVA_OWNER_NAME:-the user}"' has to approve.'
+  TASK='Run the SYSTEM ISSUE REVIEW job (nightly full pass, equivalent to the webhook payload {"job":"system-issue-review"}). Follow the playbook below end-to-end. ultrathink — root-causing an alert correctly is the whole value here, and a wrong diagnosis becomes a code change '"${JORI_OWNER_NAME:-the user}"' has to approve.'
 fi
 
 log() { echo "$(date '+%Y-%m-%d %H:%M:%S') [system-issue-review${MODE:+/$MODE}] $1" >> "$LOGFILE"; }
@@ -83,10 +83,10 @@ log() { echo "$(date '+%Y-%m-%d %H:%M:%S') [system-issue-review${MODE:+/$MODE}] 
 # crit = NEW 🔴 conditions earning a same-day pass (deduped; see system-issue-gate.mjs)
 # sig  = base64 signature of the one condition to escalate, recorded only after
 #        a successful dispatch so a transient webhook failure doesn't burn it
-GATE=$(cd "$EDVA_INSTALL_TOOLS" && node -e '
+GATE=$(cd "$JORI_INSTALL_TOOLS" && node -e '
 const {fetchJson}=require("./lib/supabase-rest.js");
 const fs=require("fs"),os=require("os"),path=require("path");
-const D=path.join(os.homedir(),"Dev/edva/data");
+const D=path.join(os.homedir(),"Dev/jori/data");
 let cursor="1970-01-01T00:00:00Z", clusters=[];
 try{
   const s=JSON.parse(fs.readFileSync(path.join(D,"system-issue-review-state.json"),"utf8"));
@@ -98,13 +98,19 @@ try{ dispatched=JSON.parse(fs.readFileSync(path.join(D,"system-issue-review-crit
 // 14d window: the job needs recurrence history, not just the delta, to weight
 // clusters and to tell a self-healed blip from a flapping defect.
 const since=new Date(Date.now()-14*864e5).toISOString();
-const q="/rest/v1/edva_messages?select=id,role,content,created_at&channel=eq.system"
+const q="/rest/v1/jori_messages?select=id,role,content,created_at&channel=eq.system"
   +"&created_at=gt."+encodeURIComponent(since)+"&order=created_at.asc&limit=1000";
 const now=Date.now();
 const due=clusters.filter(c=>c&&["verifying","awaiting_approval"].includes(c.status)
   &&c.verify_after&&Date.parse(c.verify_after)<=now).length;
-fetchJson(q,{timeoutMs:10000}).then(rows=>{
-  rows=Array.isArray(rows)?rows.filter(r=>r&&typeof r.content==="string"&&r.content.trim()):[];
+fetchJson(q,{timeoutMs:10000}).then(rows=>import("./lib/system-issue-gate.mjs").then(g=>{
+  // ✅ recoveries are kept out of the System tab and logged locally instead
+  // (jori-send-curl § Recoveries stay out of the System tab). They are still
+  // evidence here (§ Step 2c), so they join the batch in time order.
+  let recoveryLog="";
+  try{ recoveryLog=fs.readFileSync(process.env.JORI_SYSTEM_RECOVERY_LOG||path.join(D,"system-recoveries.jsonl"),"utf8"); }catch{}
+  rows=g.mergeRecoveryLog(Array.isArray(rows)?rows:[],recoveryLog,since);
+  rows=rows.filter(r=>r&&typeof r.content==="string"&&r.content.trim());
   // Jev shadow-week disagreement pages ("🔀 Jev disagreement [...]") are owned
   // by jev-disagreement-review, which has the decision logs this job lacks.
   // Counting them here would re-investigate every one as a system defect.
@@ -123,12 +129,10 @@ fetchJson(q,{timeoutMs:10000}).then(rows=>{
   // Same-day critical selection. Dedup lives in the module so it is testable
   // (tests/system-issue-gate.test.mjs) — the failure mode is a burst of
   // duplicate heavy dispatches, which prose comments did not prevent before.
-  return import("./lib/system-issue-gate.mjs").then(g=>{
-    const {escalate}=g.selectCriticalEscalations({rows,cursor,clusters,dispatched,max:1});
-    const sig=escalate.length?Buffer.from(escalate[0].signature,"utf8").toString("base64"):"";
-    process.stdout.write(fresh+":"+due+":"+escalate.length+":"+sig);
-  });
-}).catch(()=>process.stdout.write("ERR:"+due+":0:"));
+  const {escalate}=g.selectCriticalEscalations({rows,cursor,clusters,dispatched,max:1});
+  const sig=escalate.length?Buffer.from(escalate[0].signature,"utf8").toString("base64"):"";
+  process.stdout.write(fresh+":"+due+":"+escalate.length+":"+sig);
+})).catch(()=>process.stdout.write("ERR:"+due+":0:"));
 ' 2>/dev/null || echo "ERR:0:0:")
 
 if [ "${GATE%%:*}" = "ERR" ]; then
@@ -164,9 +168,9 @@ fi
 record_critical() {
   [ "$MODE" = "critical" ] || return 0
   [ -n "$CRIT_SIG" ] || return 0
-  (cd "$EDVA_INSTALL_TOOLS" && CRIT_SIG="$CRIT_SIG" node -e '
+  (cd "$JORI_INSTALL_TOOLS" && CRIT_SIG="$CRIT_SIG" node -e '
     const fs=require("fs"),os=require("os"),path=require("path");
-    const D=path.join(os.homedir(),"Dev/edva/data");
+    const D=path.join(os.homedir(),"Dev/jori/data");
     const F=path.join(D,"system-issue-review-critical-dispatched.json");
     const sig=Buffer.from(process.env.CRIT_SIG,"base64").toString("utf8");
     import("./lib/system-issue-gate.mjs").then(g=>{
@@ -197,9 +201,9 @@ record_critical() {
 unrecord_critical() {
   [ "$MODE" = "critical" ] || return 0
   [ -n "$CRIT_SIG" ] || return 0
-  (cd "$EDVA_INSTALL_TOOLS" && CRIT_SIG="$CRIT_SIG" node -e '
+  (cd "$JORI_INSTALL_TOOLS" && CRIT_SIG="$CRIT_SIG" node -e '
     const fs=require("fs"),os=require("os"),path=require("path");
-    const D=path.join(os.homedir(),"Dev/edva/data");
+    const D=path.join(os.homedir(),"Dev/jori/data");
     const F=path.join(D,"system-issue-review-critical-dispatched.json");
     const sig=Buffer.from(process.env.CRIT_SIG,"base64").toString("utf8");
     let cur={}; try{cur=JSON.parse(fs.readFileSync(F,"utf8"))||{};}catch{}
@@ -238,8 +242,8 @@ unrecord_critical() {
 # error or an unwritable log must never stop the nightly dispatch. Turning a
 # measurement into an outage would be strictly worse than not measuring. This
 # script has no `set -e`, and nothing here relies on that either way.
-STATE_FILE="$EDVA_INSTALL_TOOLS/data/system-issue-review-state.json"
-SIR_LOG="$EDVA_INSTALL_TOOLS/agent/logs/system-issue-review.log"
+STATE_FILE="$JORI_INSTALL_TOOLS/data/system-issue-review-state.json"
+SIR_LOG="$JORI_INSTALL_TOOLS/agent/logs/system-issue-review.log"
 if [ -f "$STATE_FILE" ]; then
   STATE_BYTES="$(wc -c < "$STATE_FILE" 2>/dev/null | tr -d ' ')"
   STATE_CLUSTERS="$(/usr/bin/jq -r '[.clusters[]?] | length' "$STATE_FILE" 2>/dev/null)"

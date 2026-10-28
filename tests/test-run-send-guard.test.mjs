@@ -5,10 +5,10 @@
 //   - loadEnv() (lib/load-env.js) never lets the live service-role key
 //     into process.env: not from the .env file, and an inherited one is dropped
 //     when it is a real credential by shape; a test's own stand-in key is kept.
-//   - edva-send-curl runs its gates and then refuses (exit 9) before the P1
+//   - jori-send-curl runs its gates and then refuses (exit 9) before the P1
 //     fold, the insert, the push and the email fallback, unless the test names
-//     a stand-in transport with EDVA_SEND_TEST_CURL.
-//   - edva-send.mjs refuses outright (exit 9).
+//     a stand-in transport with JORI_SEND_TEST_CURL.
+//   - jori-send.mjs refuses outright (exit 9).
 //   - apns-push sendOne refuses before connecting to Apple.
 // Outside a test run all of it behaves exactly as before.
 //
@@ -27,8 +27,8 @@ const KERNEL = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const require = createRequire(import.meta.url);
 const { loadEnv, underTestRunner, isLiveServiceRoleKey } = require("../lib/load-env.js");
 const { KERNEL_SUBDIR } = require("../lib/root.cjs");
-const SEND_CURL = path.join(KERNEL, "bin/edva-send-curl");
-const SEND_MJS = path.join(KERNEL, "bin/edva-send.mjs");
+const SEND_CURL = path.join(KERNEL, "bin/jori-send-curl");
+const SEND_MJS = path.join(KERNEL, "bin/jori-send.mjs");
 const KEY = "SUPABASE_SERVICE_ROLE_KEY";
 
 // Stand-ins built at run time, so no credential-shaped literal sits in the
@@ -40,11 +40,11 @@ const LIVE_SHAPED = jwt({ iss: "supabase", ref: "example", role: "service_role" 
 const NEW_STYLE = ["sb", "secret", "x".repeat(24)].join("_");
 const ANON_SHAPED = jwt({ iss: "supabase", ref: "example", role: "anon" });
 
-// The env a test-spawned child inherits, minus a real key, with EDVA_HOME
+// The env a test-spawned child inherits, minus a real key, with JORI_HOME
 // (when the caller sets one) at a throwaway installation.
 function childEnv(extra = {}) {
   const env = { ...process.env, ...extra };
-  if (!("EDVA_HOME" in extra)) delete env.EDVA_HOME;
+  if (!("JORI_HOME" in extra)) delete env.JORI_HOME;
   for (const k of [KEY, "SUPABASE_ANON_KEY"]) if (!(k in extra)) delete env[k];
   return env;
 }
@@ -63,7 +63,7 @@ function sandbox(envKey = "fake") {
   const record = path.join(h, "curl.txt");
   const run = (args, extra = {}) => spawnSync(SEND_CURL, args, {
     encoding: "utf8", timeout: 20_000,
-    env: childEnv({ HOME: h, EDVA_HOME: h, PATH: `${fakeBin}:${process.env.PATH}`, CURL_RECORD: record, ...extra }),
+    env: childEnv({ HOME: h, JORI_HOME: h, PATH: `${fakeBin}:${process.env.PATH}`, CURL_RECORD: record, ...extra }),
   });
   const calls = () => { try { return fs.readFileSync(record, "utf8").split("\n").filter(Boolean); } catch { return []; } };
   return { h, data, fakeBin, run, calls };
@@ -126,7 +126,7 @@ loadEnv(${JSON.stringify(file)}); process.stdout.write(process.env.${KEY} || "<n
   assert.equal(inherited.stdout, "from-env");
 });
 
-test("edva-send-curl in a test run refuses before any network call, whatever key it finds", needsRunner, () => {
+test("jori-send-curl in a test run refuses before any network call, whatever key it finds", needsRunner, () => {
   for (const key of ["fake", LIVE_SHAPED]) {
     const box = sandbox(key);
     const chat = box.run(["--no-push", "a reply from inside a test"], { [KEY]: key });
@@ -140,7 +140,7 @@ test("edva-send-curl in a test run refuses before any network call, whatever key
   }
 });
 
-test("edva-send-curl's gates still run in a test run, ahead of the refusal", needsRunner, () => {
+test("jori-send-curl's gates still run in a test run, ahead of the refusal", needsRunner, () => {
   const box = sandbox();
   const r = box.run(["--skip-precheck", "--no-push", "a finding about the user's day"]);
   assert.match(r.stderr, /REFUSED: --skip-precheck is not available/);
@@ -148,15 +148,15 @@ test("edva-send-curl's gates still run in a test run, ahead of the refusal", nee
   assert.deepEqual(box.calls(), []);
 });
 
-test("edva-send-curl posts through a named stand-in only; no push, no stamp, no email, nothing parked", needsRunner, () => {
+test("jori-send-curl posts through a named stand-in only; no push, no stamp, no email, nothing parked", needsRunner, () => {
   const box = sandbox();
-  const ok = box.run(["--channel", "system", "--skip-precheck", "⚠️ routine notice from a test"], { EDVA_SEND_TEST_CURL: path.join(box.fakeBin, "curl") });
+  const ok = box.run(["--channel", "system", "--skip-precheck", "⚠️ routine notice from a test"], { JORI_SEND_TEST_CURL: path.join(box.fakeBin, "curl") });
   assert.equal(ok.status, 0, ok.stderr);
-  assert.match(ok.stdout, /Message sent to Edva/); // lang-regex-ok: the tool's own fixed success line, not a person's words
+  assert.match(ok.stdout, /Message sent to Jori/); // lang-regex-ok: the tool's own fixed success line, not a person's words
   assert.equal(box.calls().length, 1);
-  assert.ok(!fs.existsSync(box.data("last-edva-message-at.json")), "a test-run send stamped the live outbound clock");
+  assert.ok(!fs.existsSync(box.data("last-jori-message-at.json")), "a test-run send stamped the live outbound clock");
 
-  const bad = box.run(["--channel", "system", "--skip-precheck", "⚠️ routine notice from a test"], { EDVA_SEND_TEST_CURL: path.join(box.fakeBin, "curl"), FAKE_HTTP: "500" });
+  const bad = box.run(["--channel", "system", "--skip-precheck", "⚠️ routine notice from a test"], { JORI_SEND_TEST_CURL: path.join(box.fakeBin, "curl"), FAKE_HTTP: "500" });
   assert.equal(bad.status, 1);
   assert.match(bad.stderr, /test run, nothing parked, no fallback email/);
   assert.ok(!fs.existsSync(box.data("system-channel-spool.jsonl")), "a failed test-run send was parked for replay");
@@ -165,10 +165,10 @@ test("edva-send-curl posts through a named stand-in only; no push, no stamp, no 
 let supabaseJs = true;
 try { createRequire(SEND_MJS).resolve("@supabase/supabase-js"); } catch { supabaseJs = false; }
 
-test("edva-send.mjs refuses in a test run", { skip: needsRunner.skip || (!supabaseJs && "@supabase/supabase-js is not installed next to bin") }, () => {
+test("jori-send.mjs refuses in a test run", { skip: needsRunner.skip || (!supabaseJs && "@supabase/supabase-js is not installed next to bin") }, () => {
   const box = sandbox();
   const r = spawnSync(process.execPath, [SEND_MJS, "a reply from inside a test"], {
-    encoding: "utf8", timeout: 20_000, env: childEnv({ HOME: box.h, EDVA_HOME: box.h, [KEY]: LIVE_SHAPED }),
+    encoding: "utf8", timeout: 20_000, env: childEnv({ HOME: box.h, JORI_HOME: box.h, [KEY]: LIVE_SHAPED }),
   });
   assert.equal(r.status, 9, r.stderr);
   assert.match(r.stderr, /not sent — this is a test run/);

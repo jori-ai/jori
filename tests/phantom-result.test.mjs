@@ -86,7 +86,7 @@ test("Dispatcher: a phantom does not complete the in-flight item", () => {
 test("PriorityDispatcher: a phantom does not complete the in-flight item", () => {
   const session = fakeSession();
   const d = new PriorityDispatcher(session);
-  d.dispatch("hey edva", "phone-channel");
+  d.dispatch("hey jori", "phone-channel");
   assert.ok(d.inFlight);
   const id = d.inFlight.id;
 

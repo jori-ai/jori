@@ -4,7 +4,7 @@
 //
 // Critics that wanted to run tests against a change used to copy the whole tree
 // by hand (cp -R), which carries .env and every .env backup beside it into
-// /tmp, and then ran the tests from it with EDVA_HOME unset, so code that
+// /tmp, and then ran the tests from it with JORI_HOME unset, so code that
 // resolves the installation still found the real one. On 2026-10-25 such a copy
 // (226 MB, .env plus nine backups) was found left in /tmp after its run.
 //
@@ -12,7 +12,7 @@
 // (.env, data, logs, auth state) is in it. The change under review is laid
 // over it: the bundle given with --bundle, or else the source checkout's
 // uncommitted changes to tracked files plus its untracked, not-ignored files.
-// `run` executes a command inside it with EDVA_HOME pointed at the copy and
+// `run` executes a command inside it with JORI_HOME pointed at the copy and
 // the installation's secrets taken out of the command's environment.
 //
 // A copy with no .env file is not enough on its own: the agents that run critics
@@ -30,7 +30,7 @@
 // Usage:
 //   scratch-tree make [--label <name>] [--bundle <files.json>]   prints the new directory
 //   scratch-tree run <dir> [--keep-env NAME[,NAME]] -- <command> [args...]
-//       runs in <dir>, EDVA_HOME=<dir>, without the installation's secrets
+//       runs in <dir>, JORI_HOME=<dir>, without the installation's secrets
 //       (--keep-env, repeatable: pass these through anyway, logged)
 //   scratch-tree remove <dir>                                     deletes a scratch tree
 //   scratch-tree sweep [--max-age-hours N] [--dry-run]            nightly: delete scratch trees older
@@ -138,7 +138,7 @@ function run(args) {
     if (strip) kept.push(k);
     env[k] = v;
   }
-  env.EDVA_HOME = path.resolve(dir);
+  env.JORI_HOME = path.resolve(dir);
   if (keep.size) {
     for (const n of keep) if (!kept.includes(n)) console.error(`scratch-tree: --keep-env ${n}: not a secret here, or not set; nothing to keep`);
     if (kept.length) {

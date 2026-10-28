@@ -1,7 +1,7 @@
 {
-  "name": "edva-supervisor",
+  "name": "jori-supervisor",
   "version": "1.0.0",
-  "description": "Stream-json supervisor for Edva ops-agent. Spawns claude -p, parses events, dispatches messages over HTTP.",
+  "description": "Stream-json supervisor for Jori ops-agent. Spawns claude -p, parses events, dispatches messages over HTTP.",
   "type": "module",
   "bin": { "supervisor": "./index.mjs" },
   "scripts": {

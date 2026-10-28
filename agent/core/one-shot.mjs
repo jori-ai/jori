@@ -24,7 +24,7 @@ import { Agent } from "./agent.mjs";
 import { makeStatelessExecutor } from "./stateless-executor.mjs";
 import { localRulesFileForCwd } from "../supervisor/claude-session.mjs";
 
-import { REPO_ROOT as EDVA_ROOT } from "../../lib/root.cjs";
+import { REPO_ROOT as JORI_ROOT } from "../../lib/root.cjs";
 
 // A one-shot started inside the agent tree loads that dir's CLAUDE.md files, as
 // the supervised agents do; it gets the instance's local rules beside them
@@ -34,9 +34,9 @@ function defaultLocalRulesFile(cwd) {
   const uid = typeof process.getuid === "function" ? process.getuid() : "u";
   return localRulesFileForCwd({
     cwd: cwd || process.cwd(),
-    root: EDVA_ROOT,
-    localDir: process.env.EDVA_LOCAL_DIR || undefined,
-    stateDir: path.join(os.tmpdir(), `edva-local-rules-${uid}`),
+    root: JORI_ROOT,
+    localDir: process.env.JORI_LOCAL_DIR || undefined,
+    stateDir: path.join(os.tmpdir(), `jori-local-rules-${uid}`),
   });
 }
 

@@ -1,6 +1,6 @@
 // scratch-tree.test.mjs — pins bin/scratch-tree: a critic's copy of the
 // repo holds no gitignored file (the installation's .env above all), carries the
-// change under review, runs with EDVA_HOME at the copy and without the
+// change under review, runs with JORI_HOME at the copy and without the
 // installation's secrets in its environment, and the nightly sweep removes old
 // copies and any stray copy of a secrets file.
 //
@@ -39,7 +39,7 @@ function sandbox(extraEnv = {}) {
   fs.writeFileSync(path.join(home, K(".env.bak-1")), SECRET + "OLD=1\n");
   fs.mkdirSync(path.join(home, K("data")));
   fs.writeFileSync(path.join(home, K("data/private.json")), "{}");
-  const env = { ...process.env, ...extraEnv, EDVA_HOME: home, TMPDIR: tmp, SCRATCH_TREE_TMP_ROOTS: tmp };
+  const env = { ...process.env, ...extraEnv, JORI_HOME: home, TMPDIR: tmp, SCRATCH_TREE_TMP_ROOTS: tmp };
   const cli = (...args) => spawnSync(process.execPath, [path.join(home, K("bin/scratch-tree")), ...args], { cwd: home, env, encoding: "utf8" });
   return { home, tmp, cli, cleanup: () => { fs.rmSync(home, { recursive: true, force: true }); fs.rmSync(tmp, { recursive: true, force: true }); } };
 }
@@ -70,10 +70,10 @@ test("make --bundle lays the bundle over HEAD instead of the working tree", (t) 
   assert.equal(fs.readFileSync(path.join(dir, K("code.mjs")), "utf8"), "export const a = 3;\n");
 });
 
-test("run: inside the copy, with EDVA_HOME at the copy; a plain directory is refused", (t) => {
+test("run: inside the copy, with JORI_HOME at the copy; a plain directory is refused", (t) => {
   const s = sandbox(); t.after(s.cleanup);
   const dir = s.cli("make").stdout.trim();
-  const r = s.cli("run", dir, "--", "sh", "-c", 'printf "%s|%s" "$EDVA_HOME" "$(pwd -P)"');
+  const r = s.cli("run", dir, "--", "sh", "-c", 'printf "%s|%s" "$JORI_HOME" "$(pwd -P)"');
   assert.equal(r.status, 0, r.stderr);
   const [home, cwd] = r.stdout.split("|");
   assert.equal(home, path.resolve(dir));
@@ -83,7 +83,7 @@ test("run: inside the copy, with EDVA_HOME at the copy; a plain directory is ref
 
 // What the command run inside the copy can see, for the names asked about only
 // (never the whole environment).
-const SEEN = ["SUPABASE_SERVICE_ROLE_KEY", "FAKE_PLAIN_SETTING", "OLD", "SOME_OTHER_TOKEN", "KEEP_ME", "PATH", "HOME", "EDVA_HOME"];
+const SEEN = ["SUPABASE_SERVICE_ROLE_KEY", "FAKE_PLAIN_SETTING", "OLD", "SOME_OTHER_TOKEN", "KEEP_ME", "PATH", "HOME", "JORI_HOME"];
 const PROBE = `process.stdout.write(JSON.stringify(Object.fromEntries(${JSON.stringify(SEEN)}.map((k) => [k, process.env[k] ?? null]))))`;
 
 test("run: the installation's secrets stay out of the command's environment unless named with --keep-env", (t) => {
@@ -106,7 +106,7 @@ test("run: the installation's secrets stay out of the command's environment unle
   assert.equal(seen.KEEP_ME, "1");
   assert.equal(seen.PATH, process.env.PATH);
   assert.equal(seen.HOME, process.env.HOME);
-  assert.equal(seen.EDVA_HOME, path.resolve(dir));
+  assert.equal(seen.JORI_HOME, path.resolve(dir));
   assert.equal(r.stderr, "");   // the default run says nothing
   const log = path.join(s.home, K("agent/logs/scratch-tree.log"));
   assert.equal(fs.existsSync(log), false);
@@ -152,7 +152,7 @@ test("sweep: old scratch trees and stray copies of secrets go; everything else s
   const past = (Date.now() - 7 * 3_600_000) / 1000;
   fs.utimesSync(path.join(old, ".scratch-tree"), past, past);
   // A hand-made copy of the tree, as a critic used to make it.
-  const manual = path.join(s.tmp, "cer-critic-run", "edva", K(""));
+  const manual = path.join(s.tmp, "cer-critic-run", "jori", K(""));
   fs.mkdirSync(manual, { recursive: true });
   fs.writeFileSync(path.join(manual, ".env"), SECRET);
   fs.writeFileSync(path.join(manual, ".env.bak-1"), SECRET + "OLD=1\n");

@@ -16,8 +16,8 @@
     <string>3rd Party Mac Developer Installer</string>
     <key>provisioningProfiles</key>
     <dict>
-        <key>com.example.Edva</key>
-        <string>com.example.Edva AppStore</string>
+        <key>com.example.Jori</key>
+        <string>com.example.Jori AppStore</string>
     </dict>
 </dict>
 </plist>

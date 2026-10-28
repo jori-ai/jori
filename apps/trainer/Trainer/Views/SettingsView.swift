@@ -6,9 +6,9 @@ struct SettingsView: View {
     @Environment(AuthService.self) private var auth
     @Environment(BiometricAuth.self) private var biometric
     @Query private var settingsList: [AppSettings]
-    @State private var edvaConnected: Bool? = nil
-    @State private var edvaBusy = false
-    @State private var edvaError: String?
+    @State private var joriConnected: Bool? = nil
+    @State private var joriBusy = false
+    @State private var joriError: String?
 
     private var settings: AppSettings? { settingsList.first }
 
@@ -21,7 +21,7 @@ struct SettingsView: View {
                         if let s = settings { preferencesCard(s) }
                         accountCard
                         backendCard
-                        edvaHealthCard
+                        joriHealthCard
                         aboutCard
                         Color.clear.frame(height: 30)
                     }
@@ -30,7 +30,7 @@ struct SettingsView: View {
             }
             .navigationTitle("Settings")
             .toolbarColorScheme(.dark, for: .navigationBar)
-            .task { edvaConnected = await TrainerSupabase.hasSession() }
+            .task { joriConnected = await TrainerSupabase.hasSession() }
         }
     }
 
@@ -130,7 +130,7 @@ struct SettingsView: View {
                     .foregroundStyle(.white.opacity(0.9))
                     .font(.callout)
             }
-            Text("Finished sessions sync automatically so Edva can query your history.")
+            Text("Finished sessions sync automatically so Jori can query your history.")
                 .font(.footnote)
                 .foregroundStyle(.white.opacity(0.7))
         }
@@ -139,60 +139,60 @@ struct SettingsView: View {
         .liquidCard()
     }
 
-    private var edvaHealthCard: some View {
+    private var joriHealthCard: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text("Edva health sync").font(.headline).foregroundStyle(.white)
+            Text("Jori health sync").font(.headline).foregroundStyle(.white)
 
             HStack(spacing: 10) {
                 Circle()
-                    .fill(edvaConnected == true ? .green : .gray)
+                    .fill(joriConnected == true ? .green : .gray)
                     .frame(width: 10, height: 10)
                 Text(statusLabel)
                     .foregroundStyle(.white.opacity(0.9))
                     .font(.callout)
             }
 
-            Text("Uploads Apple Health metrics, workouts, and clinical records to Edva's Supabase so your assistant has the same context the Edva iOS app provides. Trainer is foregrounded longer than Edva, so this is where most of the sync happens.")
+            Text("Uploads Apple Health metrics, workouts, and clinical records to Jori's Supabase so your assistant has the same context the Jori iOS app provides. Trainer is foregrounded longer than Jori, so this is where most of the sync happens.")
                 .font(.footnote)
                 .foregroundStyle(.white.opacity(0.7))
 
-            if let msg = edvaError {
+            if let msg = joriError {
                 Text(msg).foregroundStyle(.orange.opacity(0.9)).font(.caption)
             }
 
             HStack {
-                if edvaConnected == true {
+                if joriConnected == true {
                     Button("Sign out", role: .destructive) {
-                        edvaBusy = true
+                        joriBusy = true
                         Task {
                             await TrainerSupabase.signOut()
-                            edvaConnected = await TrainerSupabase.hasSession()
-                            edvaBusy = false
+                            joriConnected = await TrainerSupabase.hasSession()
+                            joriBusy = false
                         }
                     }
-                    .disabled(edvaBusy)
+                    .disabled(joriBusy)
                 } else {
-                    Button("Connect to Edva") {
-                        edvaBusy = true
-                        edvaError = nil
+                    Button("Connect to Jori") {
+                        joriBusy = true
+                        joriError = nil
                         Task {
                             do {
                                 try await TrainerSupabase.signInWithGoogle()
-                                edvaConnected = await TrainerSupabase.hasSession()
-                                if edvaConnected == true {
+                                joriConnected = await TrainerSupabase.hasSession()
+                                if joriConnected == true {
                                     HealthKitManager.shared.syncOnForeground()
                                 }
                             } catch {
-                                edvaError = error.localizedDescription
+                                joriError = error.localizedDescription
                             }
-                            edvaBusy = false
+                            joriBusy = false
                         }
                     }
-                    .disabled(edvaBusy)
+                    .disabled(joriBusy)
                     .buttonStyle(.borderedProminent)
                     .tint(.green)
                 }
-                if edvaBusy { ProgressView().tint(.white) }
+                if joriBusy { ProgressView().tint(.white) }
                 Spacer()
             }
         }
@@ -202,8 +202,8 @@ struct SettingsView: View {
     }
 
     private var statusLabel: String {
-        switch edvaConnected {
-        case .some(true): return "Connected — syncing to Edva"
+        switch joriConnected {
+        case .some(true): return "Connected — syncing to Jori"
         case .some(false): return "Not connected"
         case .none: return "Checking…"
         }

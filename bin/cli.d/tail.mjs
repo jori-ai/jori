@@ -1,10 +1,10 @@
-// edva tail — follow a supervisor's event stream or a job log.
+// jori tail — follow a supervisor's event stream or a job log.
 //
-//   edva tail                    ops supervisor events (default)
-//   edva tail ops|ops-light|ops-haiku|chat
+//   jori tail                    ops supervisor events (default)
+//   jori tail ops|ops-light|ops-haiku|chat
 //                                  agent/logs/supervisor-<agent>/events.ndjson
-//   edva tail --all              every supervisor stream at once
-//   edva tail <name>             agent/logs/<name>.log, else logs/<name>.log
+//   jori tail --all              every supervisor stream at once
+//   jori tail <name>             agent/logs/<name>.log, else logs/<name>.log
 
 import fs from "node:fs";
 import path from "node:path";
@@ -19,7 +19,7 @@ export default {
   async run(args, ctx) {
     const { c, TOOLS, hasFlag } = ctx;
     if (isHelp(args)) {
-      console.log("Usage: edva tail [ops|ops-light|ops-haiku|chat] | tail <log-name> | tail --all");
+      console.log("Usage: jori tail [ops|ops-light|ops-haiku|chat] | tail <log-name> | tail --all");
       return;
     }
     const which = args.find((a) => !a.startsWith("--")) || "ops";
@@ -31,7 +31,7 @@ export default {
     else candidates = [path.join(TOOLS, "agent", "logs", `${which}.log`), path.join(TOOLS, "logs", `${which}.log`)];
     const found = candidates.filter((p) => fs.existsSync(p));
     if (!found.length) {
-      console.log(c.dim("No log yet — start the system with `edva up` and try again."));
+      console.log(c.dim("No log yet — start the system with `jori up` and try again."));
       for (const p of candidates) console.log(c.dim(`  expected: ${p}`));
       return;
     }

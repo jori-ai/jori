@@ -42,8 +42,8 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.env.WHATSAPP_CHANNEL_PORT || 9100);
 const SESSION_DIR = path.join(__dirname, "wa-auth", "baileys");
 const INBOX = installTools("data/whatsapp-inbox.jsonl");
-const NOTIFY_BIN = installTools("bin/edva-notify");
-const CHAT_BIN = installTools("bin/edva-send-curl");
+const NOTIFY_BIN = installTools("bin/jori-notify");
+const CHAT_BIN = installTools("bin/jori-send-curl");
 const PAIR_MODE = process.argv.includes("--pair");
 // Optional: pair via 8-digit code instead of QR. More reliable on flaky
 // QR rendering paths. Pass `--phone +15551234567` (your WhatsApp number).
@@ -67,8 +67,8 @@ function appendInbox(entry) {
   appendFileSync(INBOX, JSON.stringify(entry) + "\n");
 }
 
-// Surface push-worthy inbound on the main Edva chat channel. Goes through
-// edva-send-curl so the message lands in the iOS app chat (which also
+// Surface push-worthy inbound on the main Jori chat channel. Goes through
+// jori-send-curl so the message lands in the iOS app chat (which also
 // triggers its own lock-screen push). --suppress-hook prevents the chat-agent
 // from auto-reasoning on the pointer; per-sender auto-handling (specific contacts)
 // is wired separately via an inbox watcher.
@@ -81,7 +81,7 @@ function fireChatPing(body) {
     ], { detached: true, stdio: "ignore" });
     child.unref();
   } catch (err) {
-    log(`edva-send-curl spawn failed: ${err.message}`);
+    log(`jori-send-curl spawn failed: ${err.message}`);
   }
 }
 

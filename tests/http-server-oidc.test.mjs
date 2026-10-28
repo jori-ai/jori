@@ -25,14 +25,14 @@ import os from "node:os";
 import path from "node:path";
 
 // --- temp HOME so http-server's HOME-derived paths resolve to a sandbox ---
-const TMP_HOME = fs.mkdtempSync(path.join(os.tmpdir(), "edva-httptest-"));
-const SECRETS_DIR = path.join(TMP_HOME, "Dev/edva/secrets");
-const JOBS_DIR = path.join(TMP_HOME, "Dev/edva/agent/ops-agent/jobs");
+const TMP_HOME = fs.mkdtempSync(path.join(os.tmpdir(), "jori-httptest-"));
+const SECRETS_DIR = path.join(TMP_HOME, "Dev/jori/secrets");
+const JOBS_DIR = path.join(TMP_HOME, "Dev/jori/agent/ops-agent/jobs");
 fs.mkdirSync(SECRETS_DIR, { recursive: true });
 fs.mkdirSync(JOBS_DIR, { recursive: true });
 
 const AUDIENCE = "https://push.example.com";
-const SA_EMAIL = "edva-pubsub@example-project.iam.gserviceaccount.com";
+const SA_EMAIL = "jori-pubsub@example-project.iam.gserviceaccount.com";
 const INBOUND_SECRET = "test-inbound-secret-value-1234567890";
 
 fs.writeFileSync(

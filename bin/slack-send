@@ -81,7 +81,7 @@ async function main() {
     ...(t.channel || t.channel_name ? { channel: a.to } : { user: a.to }),
     text: a.text,
     thread_ts: a.thread || undefined,
-    originating_task: process.env.EDVA_TASK_ID || null,
+    originating_task: process.env.JORI_TASK_ID || null,
     logged_by_caller: true,
   };
   let res;
@@ -101,7 +101,7 @@ async function main() {
       channel_name: json.channel_name || null, channel_type: json.channel_type || null,
       user_id: json.user_id || null, user_name: json.user_name || null, from_me: true, reason: null,
       slack_ts: json.ts, thread_ts: a.thread || null, text: a.text, to: a.to,
-      originating_task: process.env.EDVA_TASK_ID || null,
+      originating_task: process.env.JORI_TASK_ID || null,
     }) + "\n");
   } catch (err) {
     console.error(`slack-send: inbox append failed: ${err.message}`);
