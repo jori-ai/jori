@@ -64,11 +64,17 @@ CACHE=$(mktemp -d)
 trap 'rm -rf "$CACHE"' EXIT
 # A target's repo is `name` (under $OWNER) or `owner/name`.
 repo_path() { case "$1" in */*) printf '%s' "$1" ;; *) printf '%s/%s' "$OWNER" "$1" ;; esac; }
+# Where a repo keeps its vendored copies: .github/scripts, unless
+# `vendor_dirs` in agent/local/config/ci-signing.json names another folder for
+# it (a private overlay repo whose checkout shares .github/scripts with the
+# kernel keeps them elsewhere, e.g. .overlay/ci).
+VENDOR_DIRS="$(node -e 'const v=require(process.argv[1]).localConfig("ci-signing", {}).vendor_dirs||{}; for (const [k,d] of Object.entries(v)) console.log(k+"="+d)' "$HOME/Dev/jori/lib/instance.cjs" 2>/dev/null)"
+vendor_dir() { local d; d=$(printf '%s\n' "$VENDOR_DIRS" | awk -F= -v r="$1" '$1==r{print $2; exit}'); printf '%s' "${d:-.github/scripts}"; }
 repo_script_sha() {
   local repo="$1" script="${2:-ci-keychain-lock.sh}" f content
   f="$CACHE/${repo//\//_}.${script}.sha"
   [ -f "$f" ] && { cat "$f"; return; }
-  content=$(gh api "repos/$(repo_path "$repo")/contents/.github/scripts/$script" \
+  content=$(gh api "repos/$(repo_path "$repo")/contents/$(vendor_dir "$repo")/$script" \
               --jq '.content' 2>/dev/null | base64 -d 2>/dev/null)
   # Test emptiness BEFORE hashing: `shasum` of no input returns the sha of the
   # empty string, so a MISSING file would otherwise look like a drifted one.
