@@ -58,7 +58,7 @@ test("a new overlay file leaves the exclude block stale until synced", () => {
   const { kernel, src } = setup();
   ov.init(src, kernel);
   write(kernel, "data/state.json", "{}\n");
-  ov.overlayGit(["add", "data/state.json"], kernel);
+  ov.overlayGit(["add", "-f", "data/state.json"], kernel);
   assert.match(ov.check({ root: kernel }).join("\n"), /stale/);
   ov.syncExcludes(kernel);
   assert.deepEqual(ov.check({ root: kernel }), []);
@@ -70,4 +70,15 @@ test("init refuses an overlay that would overwrite a kernel file", () => {
   assert.throws(() => ov.init(src, kernel), /overwrite kernel file/);
   assert.equal(fs.readFileSync(path.join(kernel, "bin/tool"), "utf8"), "kernel\n");
   assert.equal(ov.hasOverlay(kernel), false);
+});
+
+test("add tracks a file the kernel repo's .gitignore hides", () => {
+  const { kernel, src } = setup();
+  write(kernel, ".gitignore", "/.overlay.git/\n/data/\n"); git(kernel, "add", "-A"); git(kernel, "commit", "-q", "-m", "ignore data");
+  ov.init(src, kernel);
+  write(kernel, "data/new.json", "{}\n");
+  const r = execFileSync(process.execPath, [path.resolve(path.dirname(new URL(import.meta.url).pathname), "../bin/jori-overlay"), "add", "data/new.json"],
+    { cwd: kernel, env: { ...process.env, JORI_OVERLAY_GIT_DIR: path.join(kernel, ".overlay.git"), JORI_HOME: kernel } });
+  assert.ok(ov.overlayFiles(kernel).includes("data/new.json"));
+  assert.deepEqual(ov.check({ root: kernel }), []);
 });

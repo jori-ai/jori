@@ -18,7 +18,17 @@ const AGENTS_DIR = "agent/launch-agents";
 const MANIFEST_FILE = path.join(REPO, "system/kernel-manifest.json");
 const KERNEL_PLISTS = fs.existsSync(MANIFEST_FILE)
   ? Object.keys(JSON.parse(fs.readFileSync(MANIFEST_FILE, "utf8")).files).filter((f) => f.startsWith(`${AGENTS_DIR}/`) && f.endsWith(".plist"))
-  : fs.readdirSync(path.join(REPO, AGENTS_DIR)).filter((f) => f.endsWith(".plist")).map((f) => `${AGENTS_DIR}/${f}`);
+  : kernelRepoPlists();
+// No manifest: the plists the kernel repo itself tracks (a switched install's
+// overlay keeps its own, rendered plists beside them), else every plist there.
+function kernelRepoPlists() {
+  try {
+    const out = spawnSync("git", ["-C", REPO, "ls-files", "--", AGENTS_DIR], { encoding: "utf8" });
+    const tracked = out.status === 0 ? out.stdout.split("\n").filter((f) => f.endsWith(".plist")) : [];
+    if (tracked.length) return tracked;
+  } catch { /* not a checkout */ }
+  return fs.readdirSync(path.join(REPO, AGENTS_DIR)).filter((f) => f.endsWith(".plist")).map((f) => `${AGENTS_DIR}/${f}`);
+}
 const HOME = "/Users/someone";
 
 function render(rel, env = {}) {
