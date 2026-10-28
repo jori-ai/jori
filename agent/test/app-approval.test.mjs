@@ -6,7 +6,15 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import crypto from "node:crypto";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { rawP256ToKey, canonicalMessage, verifySignature, itemHash, buildApprovalRequest, checkApproval } from "../core/app-approval.mjs";
+
+// The kernel defaults, not this installation's settings (an install may pin
+// its own approval_domain in agent/local/instance.json).
+process.env.JORI_LOCAL_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "app-approval-local-"));
+delete process.env.JORI_APPROVAL_DOMAIN;
 
 // Make a device: a P-256 keypair + its raw uncompressed public point (what the
 // app registers), + a sign() that mimics the Enclave (DER ECDSA over SHA-256).
@@ -71,7 +79,7 @@ describe("app-approval crypto (device-key model)", () => {
     assert.equal(itemHash({ a: 1 }), itemHash({ a: 1 }));
     assert.notEqual(itemHash({ a: 1 }), itemHash({ a: 2 }));
     const req = buildApprovalRequest("id", { a: 1 }, { now: 1, nonce: "n" });
-    assert.match(req.message, /^jori-approve\.v1\nid\n/);
+    assert.match(req.message, /^jori-approve\.v1\nid\n/); // lang-regex-ok: the signed payload's fixed format, not language
     assert.equal(req.hash, itemHash({ a: 1 }));
   });
 });
