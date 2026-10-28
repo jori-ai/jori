@@ -1,0 +1,52 @@
+{
+  "_comment": "LaunchAgents and long-running processes that make up the Edva always-on server (the kernel's). This installation's own services live in agent/local/services.json, merged by lib/registry.cjs.",
+  "services": [
+    {
+      "name": "claude-session",
+      "type": "launchagent",
+      "label": "ai.claude.session",
+      "plist": "~/Library/LaunchAgents/ai.claude.session.plist",
+      "description": "Launches process-manager which supervises chat-supervisor, ops-supervisor, wiki-server, and whatsapp-channel. KeepAlive=true. (Gmail-push ingress is a separate Cloudflare Tunnel under com.cloudflare.cloudflared.)",
+      "script": "agent/bin/process-manager.mjs",
+      "logs": {
+        "stdout": "agent/logs/claude-launchagent.log",
+        "stderr": "agent/logs/claude-launchagent.err.log"
+      },
+      "expected_running": true
+    },
+    {
+      "name": "resilience-test",
+      "type": "launchagent",
+      "label": "ai.claude.resilience-test",
+      "plist": "~/Library/LaunchAgents/ai.claude.resilience-test.plist",
+      "description": "Scheduled kill-tests of the agent to verify recovery. StartCalendarInterval.",
+      "script": "agent/bin/resilience-test.sh",
+      "logs": {
+        "stdout": "agent/logs/resilience-test.log",
+        "stderr": "agent/logs/resilience-test.log"
+      },
+      "expected_running": false
+    },
+    {
+      "name": "hum-sense",
+      "type": "launchagent",
+      "label": "ai.claude.hum-sense",
+      "plist": "~/Library/LaunchAgents/ai.claude.hum-sense.plist",
+      "description": "Situational trigger engine for hum. Runs the sensor registry (data/hum-sensors.json), drains pushed events, and gates dispatches to the hum agent. KeepAlive=true. If it dies, trigger-hum.sh's stale-heartbeat watchdog reverts hum to a plain 20-min cron tick. Inspect with `hum-sense status`.",
+      "script": "bin/hum-sense",
+      "logs": {
+        "stdout": "agent/logs/hum-sense-launchd.log",
+        "stderr": "agent/logs/hum-sense-launchd.log"
+      },
+      "expected_running": true
+    },
+    {
+      "name": "process-manager-health",
+      "type": "http",
+      "port": 9095,
+      "path": "/health",
+      "description": "Process-manager HTTP health endpoint. Returns child process status.",
+      "expected_running": true
+    }
+  ]
+}

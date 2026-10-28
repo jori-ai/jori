@@ -1,0 +1,163 @@
+#!/usr/bin/env node
+// hum-answer — record the user's answer to a pending hum question.
+//
+// Called by the chat-agent when a phone message is recognized as an answer
+// to the currently-pending hum question. Appends the answer to TWO append-only
+// logs and clears hum-pending-question.json:
+//   - hum-learnings.jsonl   — the historical answer log (unchanged; still read
+//                             by edva-context recent_learnings + situation).
+//   - hum-responses.jsonl   — the canonical reply-capture log (shared with
+//                             suggestion-classify). The overnight `hum-consolidate`
+//                             job reads this and folds durable preferences/facts
+//                             into the GENERAL wiki with judgment + [[wikilinks]].
+//
+// Usage:
+//   hum-answer <id> "<answer text>"     # normal path
+//   hum-answer <id> --late "<answer>"   # answering after the reply window closed
+//   hum-answer --show                   # print pending question
+//   hum-answer --clear                  # force-clear (expired, rejected, etc.)
+//
+// OPEN QUESTIONS (2026-10-17): the pending slot is no longer the only thing an
+// answer can land on. Every question hum asked stays open in
+// data/open-questions.jsonl until answered (lib/open-questions.mjs), and
+// is re-asked meanwhile — so `<id>` may be any OPEN question, including one
+// whose slot window closed days ago. Filing an answer marks it answered in the
+// ledger and stamps question_state:"answered" on every chat copy, so the app
+// stops colouring it. An open question needs no --late.
+//
+// HISTORY — realtime wiki routing retired (2026-06-28). This script used to
+// route each answer straight into one of six fixed subsection pages
+// (one per topic: a taste page, a trusted-places page, …) keyed by `memory_hook`.
+// That made capture and durable-memory a single brittle step, only ever fired
+// for the question lane, and scattered facts across narrow pages. Durable
+// memory now flows: reply → hum-responses.jsonl → overnight hum-consolidate →
+// general wiki. hum-answer's only job is fast, reliable capture. The pending
+// question's `memory_hook` is preserved on the response row as a routing HINT
+// for the consolidation job, not as a destination.
+
+import fs from "node:fs";
+import path from "node:path";
+import { appendResponse } from "../lib/hum-responses.mjs";
+import { getQuestion, recordAnswered, stampRows } from "../lib/open-questions.mjs";
+
+import { installTools } from "../lib/root.cjs";
+const DATA = installTools("data");
+const PENDING = path.join(DATA, "hum-pending-question.json");
+const LEARNINGS = path.join(DATA, "hum-learnings.jsonl");
+
+function readPending() {
+  try {
+    const raw = fs.readFileSync(PENDING, "utf8").trim();
+    if (!raw || raw === "null") return null;
+    return JSON.parse(raw);
+  } catch { return null; }
+}
+
+function clearPending() {
+  fs.writeFileSync(PENDING, "null\n");
+}
+
+const args = process.argv.slice(2);
+
+if (args[0] === "--show") {
+  const p = readPending();
+  if (!p) { console.log("null"); process.exit(0); }
+  console.log(JSON.stringify(p, null, 2));
+  process.exit(0);
+}
+
+if (args[0] === "--clear") {
+  clearPending();
+  console.log("cleared");
+  process.exit(0);
+}
+
+// --late: the user is answering THIS question after its reply window closed (they replied
+// to the question's own message, or it is a question about how hum behaves, which
+// never goes stale). Without it an expired question is refused and cleared.
+const lateAt = args.indexOf("--late");
+const late = lateAt >= 0;
+if (late) args.splice(lateAt, 1);
+
+const [id, ...answerParts] = args;
+const answer = answerParts.join(" ").trim();
+if (!id || !answer) {
+  console.error('Usage: hum-answer <id> [--late] "<answer>"  |  --show  |  --clear');
+  process.exit(1);
+}
+
+const slot = readPending();
+const ledgerQ = getQuestion(id);
+const openInLedger = ledgerQ?.status === "open";
+// The question being answered: the slot when it is this id, else the ledger's
+// open record of it (an earlier ask, its window long closed).
+const pending = slot && slot.id === id ? slot
+  : openInLedger ? { id, asked_at: ledgerQ.first_asked_at, subject: ledgerQ.subject, memory_hook: ledgerQ.memory_hook, question: ledgerQ.question }
+  : null;
+if (!pending) {
+  if (!slot) { console.error(`No pending or open question with id=${id}.`); process.exit(2); }
+  console.error(`Pending id=${slot.id}, got id=${id} (and ${id} is not an open question)`);
+  process.exit(3);
+}
+const fromSlot = pending === slot;
+if (!late && !openInLedger && pending.expires_at && new Date(pending.expires_at).getTime() < Date.now()) {
+  console.error(`Pending question expired at ${pending.expires_at}`);
+  clearPending();
+  process.exit(4);
+}
+
+const record = {
+  id: pending.id,
+  asked_at: pending.asked_at,
+  answered_at: new Date().toISOString(),
+  subject: pending.subject,
+  memory_hook: pending.memory_hook,
+  // Rides along when the pending question carries one (e.g. "lane_diagnosis"
+  // for qual-delivery decay questions — see hum-metrics-collect's
+  // dispatch_qualitative_question / hum-deliver-qual). JSON.stringify drops
+  // an undefined value entirely, so this is a no-op for ordinary questions —
+  // backward-compatible, no guard needed. Without this, hum-improvement-
+  // ideation.md Step 1.4's `category:lane_diagnosis` filter over
+  // hum-learnings.jsonl silently matches nothing, even when genuine
+  // diagnosis answers exist (they were only findable via
+  // memory_hook:"hum_improvement_loop").
+  category: pending.category,
+  question: pending.question,
+  answer,
+  ...(late || !fromSlot || (pending.expires_at && Date.parse(pending.expires_at) < Date.now()) ? { late: true } : {}),
+};
+fs.appendFileSync(LEARNINGS, JSON.stringify(record) + "\n");
+
+// Canonical capture for overnight consolidation into the general wiki. The
+// `memory_hook` rides along as the lane hint (e.g. a taste or a place hook)
+// so the consolidation job knows what KIND of fact this is.
+let responseLogged = false;
+try {
+  appendResponse({
+    ping_id: pending.id,
+    lane: pending.memory_hook || "question",
+    subject: pending.subject || null,
+    subject_key: pending.subject_key || null,
+    ping_text: pending.question || null,
+    reply_text: answer,
+    disposition: "answered",
+    source: "hum-answer",
+  });
+  responseLogged = true;
+} catch (e) {
+  console.error(`hum-answer: response capture failed: ${e.message}`);
+}
+
+if (fromSlot) clearPending();
+
+let rowsStamped = 0;
+const answered = recordAnswered(id, "hum-answer");
+if (answered) rowsStamped = await stampRows(answered.msg_ids, "answered");
+
+console.log(JSON.stringify({
+  ok: true,
+  learnings_appended: true,
+  response_logged: responseLogged,
+  open_question_closed: Boolean(answered),
+  rows_stamped: rowsStamped,
+}));
