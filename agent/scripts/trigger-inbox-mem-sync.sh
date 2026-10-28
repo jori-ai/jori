@@ -18,13 +18,13 @@
 #              window missed (an outage, a burst past --max) and bounds growth.
 set -euo pipefail
 
-source "$(dirname "${BASH_SOURCE[0]}")/lib/root.sh"   # EDVA_INSTALL, EDVA_INSTALL_TOOLS
+source "$(dirname "${BASH_SOURCE[0]}")/lib/root.sh"   # JORI_INSTALL, JORI_INSTALL_TOOLS
 NODE=/opt/homebrew/bin/node
-BIN="$EDVA_INSTALL_TOOLS/bin/inbox-mem"
-LOG="$EDVA_INSTALL_TOOLS/agent/logs/inbox-mem-sync.log"
+BIN="$JORI_INSTALL_TOOLS/bin/inbox-mem"
+LOG="$JORI_INSTALL_TOOLS/agent/logs/inbox-mem-sync.log"
 
 # Pause file — stop ingestion without editing crontab.
-if [[ -f "$EDVA_INSTALL_TOOLS/data/inbox-mem-pause.json" ]]; then
+if [[ -f "$JORI_INSTALL_TOOLS/data/inbox-mem-pause.json" ]]; then
   exit 0
 fi
 

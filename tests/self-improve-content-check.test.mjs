@@ -90,7 +90,7 @@ function sandboxRepo() {
   git("-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "-m", "base");
   const out = fs.mkdtempSync(path.join(os.tmpdir(), "si-bundle-out-"));
   const env = { ...process.env };
-  delete env.EDVA_HOME;   // never the caller's installation
+  delete env.JORI_HOME;   // never the caller's installation
   return { dir, out, rev: execFileSync("git", ["rev-parse", "HEAD"], { cwd: dir, encoding: "utf8" }).trim(),
     run: (...args) => spawnSync(process.execPath, [path.join(dir, K("bin/self-improve-bundle")), ...args], { cwd: dir, encoding: "utf8", env }),
     cleanup: () => { fs.rmSync(dir, { recursive: true, force: true }); fs.rmSync(out, { recursive: true, force: true }); } };

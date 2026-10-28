@@ -3,7 +3,7 @@
 // plain line says what happened.
 //
 // Every case runs the real bin/auth-outage-replay against a throwaway
-// installation (EDVA_HOME): its own agent/logs, its own approved list
+// installation (JORI_HOME): its own agent/logs, its own approved list
 // in agent/local/config, and a stand-in launchctl that records each call.
 //
 // Run: node --test tests/auth-outage-replay.test.mjs
@@ -52,7 +52,7 @@ function install({ list = LIST, launchctlFails = false } = {}) {
   const log = (job, lines) => fs.appendFileSync(path.join(logs, `${job}.log`), lines.map(([t, rest]) => `${stamp(t)} [${job}] ${rest}\n`).join(""));
   const run = (extra = []) => spawnSync(process.execPath, [BIN, "--since", String(NOW - 10 * HOUR), "--now", String(NOW), ...extra], {
     encoding: "utf8", timeout: 20_000,
-    env: { ...process.env, EDVA_HOME: h, EDVA_LOCAL_DIR: "", AUTH_OUTAGE_REPLAY_LAUNCHCTL: fake },
+    env: { ...process.env, JORI_HOME: h, JORI_LOCAL_DIR: "", AUTH_OUTAGE_REPLAY_LAUNCHCTL: fake },
   });
   const kicks = () => { try { return fs.readFileSync(calls, "utf8").split("\n").filter(Boolean); } catch { return []; } };
   const ledger = () => { try { return fs.readFileSync(path.join(tools, "data", "auth-outage-replay.jsonl"), "utf8").split("\n").filter(Boolean).map((l) => JSON.parse(l)); } catch { return []; } };
@@ -127,7 +127,7 @@ test("a refusal older than the job's limit is reported, not re-run", () => {
   try {
     i.log("cost-efficiency-review", [[NOW - 9 * HOUR, SIGNED_OUT]]);
     const r = spawnSync(process.execPath, [BIN, "--since", String(NOW - 10 * HOUR), "--now", String(NOW + 4 * HOUR)], {
-      encoding: "utf8", env: { ...process.env, EDVA_HOME: i.h, EDVA_LOCAL_DIR: "", AUTH_OUTAGE_REPLAY_LAUNCHCTL: "/nonexistent" },
+      encoding: "utf8", env: { ...process.env, JORI_HOME: i.h, JORI_LOCAL_DIR: "", AUTH_OUTAGE_REPLAY_LAUNCHCTL: "/nonexistent" },
     });
     assert.equal(r.status, 0, r.stderr);
     assert.match(r.stdout, /the nightly cost review miss its run too long ago to re-run safely/); // lang-regex-ok: the tool's own fixed line, not a person's words

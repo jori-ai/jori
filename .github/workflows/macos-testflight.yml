@@ -1,10 +1,10 @@
-name: Edva Companion - macOS TestFlight
+name: Jori Companion - macOS TestFlight
 
 on:
   workflow_dispatch:
 
 concurrency:
-  group: edva-companion-macos-${{ github.ref }}
+  group: jori-companion-macos-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -53,7 +53,7 @@ jobs:
           # Prepend under the host-wide mutex shared by every signing repo on the
           # host. This read-modify-write of the user search list was unsynchronized:
           # two concurrent jobs lose each other's entry, and a list written from a
-          # stale read can drop login.keychain-db — which takes a Edva agent on
+          # stale read can drop login.keychain-db — which takes a Jori agent on
           # this same host fully auth-down (Max OAuth token lives there, no API-key
           # fallback by design; see docs/agent-auth-model.md).
           source "$GITHUB_WORKSPACE/.github/scripts/ci-keychain-lock.sh"
@@ -96,16 +96,16 @@ jobs:
         run: |
           BUILD_NUMBER=${{ github.run_number }}
           echo "Build number: $BUILD_NUMBER"
-          sed -i '' -E "s/CURRENT_PROJECT_VERSION = [0-9]+;/CURRENT_PROJECT_VERSION = $BUILD_NUMBER;/g" Edva.xcodeproj/project.pbxproj
+          sed -i '' -E "s/CURRENT_PROJECT_VERSION = [0-9]+;/CURRENT_PROJECT_VERSION = $BUILD_NUMBER;/g" Jori.xcodeproj/project.pbxproj
 
       - name: Clean DerivedData
-        run: rm -rf ~/Library/Developer/Xcode/DerivedData/Edva-*
+        run: rm -rf ~/Library/Developer/Xcode/DerivedData/Jori-*
 
       - name: Resolve packages
         run: |
           xcodebuild -resolvePackageDependencies \
-            -project Edva.xcodeproj \
-            -scheme Edva
+            -project Jori.xcodeproj \
+            -scheme Jori
 
       - name: Configure macOS signing
         run: |
@@ -113,28 +113,28 @@ jobs:
           import sys
           app_profile = sys.argv[1]
           ext_profile = sys.argv[2]
-          with open('Edva.xcodeproj/project.pbxproj', 'r') as f:
+          with open('Jori.xcodeproj/project.pbxproj', 'r') as f:
               content = f.read()
           content = content.replace('CODE_SIGN_STYLE = Automatic;',
               'CODE_SIGN_STYLE = Manual; "CODE_SIGN_IDENTITY[sdk=macosx*]" = "Apple Distribution";')
           content = content.replace('PROVISIONING_PROFILE_SPECIFIER = "";', '')
           content = content.replace(
-              'PRODUCT_BUNDLE_IDENTIFIER = com.example.Edva.NotificationService;',
-              f'PRODUCT_BUNDLE_IDENTIFIER = com.example.Edva.NotificationService; PROVISIONING_PROFILE_SPECIFIER = "{ext_profile}";')
+              'PRODUCT_BUNDLE_IDENTIFIER = com.example.Jori.NotificationService;',
+              f'PRODUCT_BUNDLE_IDENTIFIER = com.example.Jori.NotificationService; PROVISIONING_PROFILE_SPECIFIER = "{ext_profile}";')
           content = content.replace(
-              'PRODUCT_BUNDLE_IDENTIFIER = com.example.Edva;',
-              f'PRODUCT_BUNDLE_IDENTIFIER = com.example.Edva; PROVISIONING_PROFILE_SPECIFIER = "{app_profile}";')
-          with open('Edva.xcodeproj/project.pbxproj', 'w') as f:
+              'PRODUCT_BUNDLE_IDENTIFIER = com.example.Jori;',
+              f'PRODUCT_BUNDLE_IDENTIFIER = com.example.Jori; PROVISIONING_PROFILE_SPECIFIER = "{app_profile}";')
+          with open('Jori.xcodeproj/project.pbxproj', 'w') as f:
               f.write(content)
           PYEOF
 
       - name: Archive macOS (native)
         run: |
           xcodebuild archive \
-            -project Edva.xcodeproj \
-            -scheme Edva \
+            -project Jori.xcodeproj \
+            -scheme Jori \
             -configuration Release \
-            -archivePath $RUNNER_TEMP/Edva-macOS.xcarchive \
+            -archivePath $RUNNER_TEMP/Jori-macOS.xcarchive \
             -destination 'generic/platform=macOS' \
             DEVELOPMENT_TEAM=TEAMID_PLACEHOLDER
 
@@ -159,9 +159,9 @@ jobs:
               <string>3rd Party Mac Developer Installer</string>
               <key>provisioningProfiles</key>
               <dict>
-                  <key>com.example.Edva</key>
+                  <key>com.example.Jori</key>
                   <string>${mac_profile_name}</string>
-                  <key>com.example.Edva.NotificationService</key>
+                  <key>com.example.Jori.NotificationService</key>
                   <string>${ext_profile_name}</string>
               </dict>
           </dict>
@@ -169,7 +169,7 @@ jobs:
           EOPLIST
           echo "Generated ExportOptions with profile: $mac_profile_name"
           xcodebuild -exportArchive \
-            -archivePath $RUNNER_TEMP/Edva-macOS.xcarchive \
+            -archivePath $RUNNER_TEMP/Jori-macOS.xcarchive \
             -exportPath $RUNNER_TEMP/export-macos \
             -exportOptionsPlist $RUNNER_TEMP/ExportOptions-macOS.plist
 
@@ -187,9 +187,9 @@ jobs:
 
           PKG_PATH=$(find $RUNNER_TEMP/export-macos -name "*.pkg" -o -name "*.ipa" -o -name "*.app" | head -1)
           if [[ "$PKG_PATH" == *.app ]]; then
-            productbuild --component "$PKG_PATH" /Applications $RUNNER_TEMP/export-macos/Edva.pkg \
+            productbuild --component "$PKG_PATH" /Applications $RUNNER_TEMP/export-macos/Jori.pkg \
               --sign "${MAC_INSTALLER_IDENTITY:?set the MAC_INSTALLER_IDENTITY repo secret}"
-            PKG_PATH=$RUNNER_TEMP/export-macos/Edva.pkg
+            PKG_PATH=$RUNNER_TEMP/export-macos/Jori.pkg
           fi
 
           xcrun altool --upload-app \
@@ -221,6 +221,6 @@ jobs:
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: edva-companion-macos-build
+          name: jori-companion-macos-build
           path: ${{ runner.temp }}/export-macos/*
           retention-days: 3

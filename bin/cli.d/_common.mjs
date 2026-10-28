@@ -1,12 +1,12 @@
-// _common.mjs — helpers shared by Edva's own `edva` subcommands in
-// bin/cli.d/. The leading underscore keeps bin/edva from loading this file
+// _common.mjs — helpers shared by Jori's own `jori` subcommands in
+// bin/cli.d/. The leading underscore keeps bin/jori from loading this file
 // as a subcommand (bin/cli.d/README.md).
 //
 // Roots: the CLI's ctx.ROOT is the installation (lib/root.cjs installRoot():
-// $EDVA_HOME, else ~/Dev/edva). Commands that set up or inspect a checkout
+// $JORI_HOME, else ~/Dev/jori). Commands that set up or inspect a checkout
 // (init, overlay, audit, review-pr) work on the checkout this CLI runs from
-// instead — CHECKOUT below (EDVA_HOME when set, else the clone holding this
-// file) — so `./bin/edva init` in a fresh clone configures that clone.
+// instead — CHECKOUT below (JORI_HOME when set, else the clone holding this
+// file) — so `./bin/jori init` in a fresh clone configures that clone.
 
 import fs from "node:fs";
 import path from "node:path";
@@ -17,8 +17,8 @@ const require = createRequire(import.meta.url);
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const root = require(path.join(HERE, "..", "..", "lib", "root.cjs"));
 
-export const CHECKOUT = root.REPO_ROOT;      // the clone (or EDVA_HOME)
-export const KERNEL = root.TOOLS_DIR;        // its kernel tree (same dir in Edva)
+export const CHECKOUT = root.REPO_ROOT;      // the clone (or JORI_HOME)
+export const KERNEL = root.TOOLS_DIR;        // its kernel tree (same dir in Jori)
 export const installRoot = root.installRoot;
 
 // Parse a dotenv file into an object (KEY=value lines; # comments; optional

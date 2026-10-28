@@ -4,12 +4,12 @@ import UIKit
 import Supabase
 
 /// Reads Apple Health on-device and ships a trimmed, pre-aggregated view to
-/// **Edva's** Supabase (not Trainer's own project). Verbatim port of
-/// `client/Edva/HealthKitManager.swift` from the edva repo — only
+/// **Jori's** Supabase (not Trainer's own project). Verbatim port of
+/// `client/Jori/HealthKitManager.swift` from the jori repo — only
 /// the supabase client reference is swapped (`TrainerSupabase` here vs
 /// `SupabaseManager` there). Rationale: Trainer is foregrounded for far
 /// longer stretches during workouts, so running this same sync from
-/// Trainer dramatically expands coverage compared to the Edva app
+/// Trainer dramatically expands coverage compared to the Jori app
 /// alone.
 ///
 /// Three paths:
@@ -35,11 +35,11 @@ final class HealthKitManager: @unchecked Sendable {
 
     private let store = HKHealthStore()
     private let batchSize = 500
-    private let anchorKeyPrefix = "edva.health.anchor."
+    private let anchorKeyPrefix = "jori.health.anchor."
     /// Vendor id captured on the main actor at `start()` so the rest of the
     /// pipeline can build `device_id` strings without bouncing back to
     /// MainActor on every upload (Trainer compiles with strict concurrency
-    /// complete; Edva doesn't, which is why this isn't an issue there).
+    /// complete; Jori doesn't, which is why this isn't an issue there).
     private nonisolated(unsafe) var cachedVendorId: String?
 
     // MARK: - Type catalog
@@ -358,7 +358,7 @@ final class HealthKitManager: @unchecked Sendable {
 
     private enum StatGranularity: String { case daily, weekly, yearly }
 
-    private let backfillDoneKey = "edva.health.backfill.done"
+    private let backfillDoneKey = "jori.health.backfill.done"
     private let backfillCycleDelay: UInt64 = 8 * 1_000_000_000 // 8s between chunks
     private var backfillTask: Task<Void, Never>?
 
@@ -776,13 +776,13 @@ final class HealthKitManager: @unchecked Sendable {
     }
 
     private func currentDeviceId() -> String? {
-        // Match Edva's behaviour — APNs token if present (Trainer doesn't
+        // Match Jori's behaviour — APNs token if present (Trainer doesn't
         // register for remote notifications, so this falls through to the
         // per-vendor identifier, which is stable across reinstalls within
-        // the same vendor/team-id namespace). Different value than Edva's
-        // vendor id, so Trainer's aggregate rows sit alongside Edva's
+        // the same vendor/team-id namespace). Different value than Jori's
+        // vendor id, so Trainer's aggregate rows sit alongside Jori's
         // rather than overwriting them.
-        if let token = UserDefaults.standard.string(forKey: "edva.apnsDeviceToken"),
+        if let token = UserDefaults.standard.string(forKey: "jori.apnsDeviceToken"),
            !token.isEmpty {
             return token
         }

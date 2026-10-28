@@ -440,21 +440,21 @@ describe("quota refusal: ops supervisor end to end", { skip: !canChildListen() &
     tmp = null;
   });
 
-  // A throwaway HOME: EDVA_ROOT, the queue file, the event log and — most
+  // A throwaway HOME: JORI_ROOT, the queue file, the event log and — most
   // importantly — the alert sender all resolve under it, so no alert reaches
-  // the real system channel and no real state is touched. EDVA_HOME
+  // the real system channel and no real state is touched. JORI_HOME
   // outranks HOME (lib/root.cjs), so the child never inherits it.
   async function boot(mode, env = {}) {
     tmp = fs.mkdtempSync(path.join(process.env.TMPDIR || os.tmpdir(), "quota-hold-"));
-    const root = path.join(tmp, "Dev/edva/tools");
+    const root = path.join(tmp, "Dev/jori/tools");
     const bin = path.join(root, "bin");
     for (const d of ["bin", "data", "logs", "agent/ops-agent", "agent/supervisor", "agent/logs"]) fs.mkdirSync(path.join(root, d), { recursive: true });
-    // The supervisor imports lib through EDVA_ROOT; point it at the
+    // The supervisor imports lib through JORI_ROOT; point it at the
     // code under test. Everything it writes resolves under the fake HOME.
     fs.symlinkSync(path.join(REPO_TOOLS, "lib"), path.join(root, "lib"));
     fs.copyFileSync(path.join(REPO_TOOLS, "agent/supervisor/mcp-config.json"), path.join(root, "agent/supervisor/mcp-config.json"));
     const sends = path.join(tmp, "sends.log");
-    fs.writeFileSync(path.join(bin, "edva-send-curl"), `#!/bin/sh\nprintf '%s\\n' "$*" >> "${sends}"\n`, { mode: 0o755 });
+    fs.writeFileSync(path.join(bin, "jori-send-curl"), `#!/bin/sh\nprintf '%s\\n' "$*" >> "${sends}"\n`, { mode: 0o755 });
     const mock = path.join(tmp, "quota-claude.mjs");
     fs.writeFileSync(mock, QUOTA_CLAUDE);
     const record = path.join(tmp, "record.log");
@@ -468,7 +468,7 @@ describe("quota refusal: ops supervisor end to end", { skip: !canChildListen() &
     const stateDir = path.join(tmp, "state");
     fs.mkdirSync(stateDir, { recursive: true });
     const childEnv = { ...process.env, HOME: tmp, OPS_HANDOFF_DISABLED: "1", OPS_DISPATCH_PREAMBLE_DISABLED: "1", MEMORY_INDEX_DB: path.join(stateDir, "event-index.db"), ...env };
-    delete childEnv.EDVA_HOME;
+    delete childEnv.JORI_HOME;
     proc = spawn(NODE, [OPS_SUPERVISOR, "--agent", "test-ops", "--config", cfg, "--state-dir", stateDir, "--no-resume",
       "--claude-bin", JSON.stringify([NODE, mock, "--mode", mode, "--record", record])], {
       cwd: stateDir, stdio: ["pipe", "pipe", "pipe"], env: childEnv,

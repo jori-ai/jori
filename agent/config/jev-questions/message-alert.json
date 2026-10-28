@@ -1,5 +1,5 @@
 {
-  "_doc": "Jev site for cross-channel message alerts (lib/message-alert.mjs): is an inbound iMessage / WhatsApp / Slack message important or urgent enough that {{owner_name}} should be pinged by Edva? Legacy (shadow + fallback) is a toolless Sonnet judgment with the same rubric. Kernel definition; an installation's own data/jev-questions/message-alert.json replaces it.",
+  "_doc": "Jev site for cross-channel message alerts (lib/message-alert.mjs): is an inbound iMessage / WhatsApp / Slack message important or urgent enough that {{owner_name}} should be pinged by Jori? Legacy (shadow + fallback) is a toolless Sonnet judgment with the same rubric. Kernel definition; an installation's own data/jev-questions/message-alert.json replaces it.",
   "threshold": 0.8,
   "questions": {
     "level": {

@@ -11,9 +11,9 @@
 // Guards, all in code:
 //   - --authorized is required: what the user actually said when they asked
 //     for this text (a quote, not a flag). It is logged with the send.
-//   - the text must open with the Edva identity line the outbound policy
-//     fixes for anyone other than the user ("Hi <Name>, this is Edva,
-//     <owner>'s AI assistant. …" or "This is Edva on behalf of <owner> …").
+//   - the text must open with the Jori identity line the outbound policy
+//     fixes for anyone other than the user ("Hi <Name>, this is Jori,
+//     <owner>'s AI assistant. …" or "This is Jori on behalf of <owner> …").
 //   - --to must be E.164; the text at most 1600 characters.
 //   - inside a test run (NODE_TEST_CONTEXT) nothing is sent unless the test
 //     names a stand-in API (SMS_TWILIO_API_BASE).
@@ -64,8 +64,8 @@ Usage:
   sms-send --to <+E164> --text "..." --authorized "..." --dry-run
   sms-send status <message sid> [--json]
 
-The text must open with the Edva identity line ("Hi <Name>, this is Edva,
-<owner>'s AI assistant. ..." or "This is Edva on behalf of <owner> ...").
+The text must open with the Jori identity line ("Hi <Name>, this is Jori,
+<owner>'s AI assistant. ..." or "This is Jori on behalf of <owner> ...").
 --wait polls Twilio until the message is delivered or fails (at most 300 s).
 Sends are logged to data/sms-sent.jsonl. See docs/sms-send.md.`);
 }
@@ -94,7 +94,7 @@ async function credentials() {
     try { sdk = await import(require.resolve("@1password/sdk")); }
     catch (err) { fail(78, `the @1password/sdk package is not installed next to this script (${err.message}).`); }
     try {
-      const client = await sdk.createClient({ auth: token, integrationName: "edva-sms-send", integrationVersion: "1.0.0" });
+      const client = await sdk.createClient({ auth: token, integrationName: "jori-sms-send", integrationVersion: "1.0.0" });
       const vaults = await client.vaults.list();
       const vault = vaults.find((v) => v.id === op.vault || v.title === op.vault);
       if (!vault) fail(78, `1Password vault ${JSON.stringify(op.vault)} is not visible to the service account.`);
@@ -189,7 +189,7 @@ async function cmdSend(a) {
   }
   const owner = instance().owner_name;
   if (!hasIdentityOpener(a.text, owner)) {
-    fail(3, `refused: the text must open with the Edva identity line, e.g. "Hi <Name>, this is Edva, ${owner}'s AI assistant. ${owner} asked me to ..." or "This is Edva on behalf of ${owner} ...".`);
+    fail(3, `refused: the text must open with the Jori identity line, e.g. "Hi <Name>, this is Jori, ${owner}'s AI assistant. ${owner} asked me to ..." or "This is Jori on behalf of ${owner} ...".`);
   }
   if (a.text.length > MAX_TEXT) fail(3, `the text is ${a.text.length} characters; Twilio takes at most ${MAX_TEXT}.`);
 
@@ -205,11 +205,11 @@ async function cmdSend(a) {
 
   const r = await twilio(c, "POST", "/Messages.json", twilioForm({ to: a.to, from: c.from, text: a.text }));
   if (!r.ok) {
-    log({ kind: "refused", to: a.to, from: c.from, http_status: r.status, code: r.json.code || null, error: r.json.message || null, text: a.text, authorized: a.authorized, originating_task: process.env.EDVA_TASK_ID || null, via: "cli" });
+    log({ kind: "refused", to: a.to, from: c.from, http_status: r.status, code: r.json.code || null, error: r.json.message || null, text: a.text, authorized: a.authorized, originating_task: process.env.JORI_TASK_ID || null, via: "cli" });
     fail(1, `Twilio refused the message (${r.status}${r.json.code ? `, code ${r.json.code}` : ""}): ${r.json.message || "no detail"}`);
   }
   const msg = r.json;
-  log({ kind: "sent", sid: msg.sid, to: a.to, from: c.from, status: msg.status, text: a.text, authorized: a.authorized, originating_task: process.env.EDVA_TASK_ID || null, via: "cli" });
+  log({ kind: "sent", sid: msg.sid, to: a.to, from: c.from, status: msg.status, text: a.text, authorized: a.authorized, originating_task: process.env.JORI_TASK_ID || null, via: "cli" });
 
   if (!a.wait) { print(a, msg); return; }
   const final = await waitForFinal(c, msg, a.wait);

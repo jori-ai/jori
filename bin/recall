@@ -3,9 +3,9 @@
 // dated replies (+ activity log).
 //
 // The single entry point for "what do we know about X?", spanning what the user
-// just typed (recent chat, edva_messages pgvector), what the user ANSWERED when
+// just typed (recent chat, jori_messages pgvector), what the user ANSWERED when
 // hum asked ("<date> · <user> said: …", utterance-store), curated memory
-// (wiki hybrid), and — with --events — Edva's own activity log. Fuses them
+// (wiki hybrid), and — with --events — Jori's own activity log. Fuses them
 // via RRF.
 //
 // Usage:

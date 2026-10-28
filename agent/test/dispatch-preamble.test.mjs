@@ -12,9 +12,9 @@ import path from "node:path";
 
 // A synthetic installation: home zone and owner come from the env layer of
 // lib/instance.cjs, never from this host's local config.
-process.env.EDVA_LOCAL_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "preamble-local-"));
-process.env.EDVA_TZ = "America/Denver";
-process.env.EDVA_OWNER_NAME = "Alex";
+process.env.JORI_LOCAL_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "preamble-local-"));
+process.env.JORI_TZ = "America/Denver";
+process.env.JORI_OWNER_NAME = "Alex";
 const { Dispatcher } = await import("../supervisor/dispatcher.mjs");
 const { buildPreamble, shouldPreamble } = await import("../supervisor/dispatch-preamble.mjs");
 

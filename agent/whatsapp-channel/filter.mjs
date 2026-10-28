@@ -113,7 +113,7 @@ export function classifyForPush(entry) {
   const isNewsletter = typeof entry.chat_id === "string" && entry.chat_id.endsWith("@newsletter");
 
   // (5) 1:1 DMs are not pushed by default: WhatsApp already notifies for direct
-  // messages on the phone, so echoing each one into the Edva chat would
+  // messages on the phone, so echoing each one into the Jori chat would
   // double it. They stay in whatsapp-inbox.jsonl for the record. Set
   // `push_direct_messages: true` in filter-config.json to push them; use
   // always_push_senders above to force a push for one must-see person.

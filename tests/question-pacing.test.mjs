@@ -9,7 +9,7 @@ import os from "node:os";
 import path from "node:path";
 
 const dir = fs.mkdtempSync(path.join(os.tmpdir(), "question-pacing-"));
-process.env.EDVA_DATA_DIR = dir;
+process.env.JORI_DATA_DIR = dir;
 delete process.env.HUM_QUESTION_SCALE;
 const qp = await import("../lib/question-pacing.mjs");
 

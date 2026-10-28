@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# bootstrap.sh — fresh-install setup for Edva.
+# bootstrap.sh — fresh-install setup for Jori.
 #
 # Idempotent. Re-run any time you pull new deps. Does NOT touch your .env or
 # data dir contents — only creates them when absent.
@@ -12,8 +12,8 @@ set -euo pipefail
 QUIET=0
 [[ "${1:-}" == "--quiet" ]] && QUIET=1
 
-EDVA_HOME="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-cd "$EDVA_HOME"
+JORI_HOME="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$JORI_HOME"
 
 # ── colors ────────────────────────────────────────────────────────────────
 if [[ -t 1 ]]; then
@@ -121,7 +121,7 @@ chmod +x agent/scripts/hum-harvesters/*.mjs 2>/dev/null || true
 chmod +x agent/scripts/lib/*.sh 2>/dev/null || true
 chmod +x agent/launch-agents/*.sh 2>/dev/null || true
 chmod +x scripts/*.sh 2>/dev/null || true
-chmod +x system/test-edva.sh 2>/dev/null || true
+chmod +x system/test-jori.sh 2>/dev/null || true
 ok "executable bits set"
 
 # ── .env scaffolding ──────────────────────────────────────────────────────
@@ -132,7 +132,7 @@ else
   if [[ -f .env.example ]]; then
     cp .env.example .env
     ok ".env created from .env.example"
-    warn "Edit .env (or run \`./bin/edva init\`) to fill in your values."
+    warn "Edit .env (or run \`./bin/jori init\`) to fill in your values."
   fi
 fi
 
@@ -142,13 +142,13 @@ ok "Bootstrap complete."
 echo
 [[ $QUIET -eq 1 ]] || cat <<EOF
 Next steps:
-  1. ./bin/edva init          # interactive config wizard
-  2. ./bin/edva up            # start everything in the foreground
-  3. ./bin/edva tail ops      # watch the agent work
+  1. ./bin/jori init          # interactive config wizard
+  2. ./bin/jori up            # start everything in the foreground
+  3. ./bin/jori tail ops      # watch the agent work
 
 Your own rules, config and code go in agent/local/ and the _ext/ dirs
 (gitignored); keep them in a private repo and link it with
-  ./bin/edva overlay add <path>
+  ./bin/jori overlay add <path>
 See docs/architecture-public-private.md.
 
 For deeper docs: ./system/architecture.md

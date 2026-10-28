@@ -3,18 +3,18 @@
   "mcpServers": {
     "tools": {
       "command": "node",
-      "args": ["${EDVA_HOME}/agent/tools-mcp/index.mjs"],
+      "args": ["${JORI_HOME}/agent/tools-mcp/index.mjs"],
       "env": {
-        "EDVA_AGENT_ID": "ops-light"
+        "JORI_AGENT_ID": "ops-light"
       },
       "alwaysLoad": true
     },
-    "supabase-edva": {
+    "supabase-jori": {
       "command": "npx",
       "args": [
         "-y",
         "@supabase/mcp-server-supabase@latest",
-        "--project-ref=${EDVA_SUPABASE_PROJECT}"
+        "--project-ref=${JORI_SUPABASE_PROJECT}"
       ],
       "env": {
         "SUPABASE_ACCESS_TOKEN": "${SUPABASE_ACCESS_TOKEN}"

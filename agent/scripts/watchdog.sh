@@ -5,8 +5,8 @@
 export PATH=/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin
 source "$(dirname "$0")/lib/webhook-auth.sh"
 source "$(dirname "$0")/lib/max-auth-probe.sh"   # launchd sign-in check, see § Max auth outage
-# This installation's identity (EDVA_OWNER_EMAIL, EDVA_DOMAIN,
-# EDVA_SUPABASE_PROJECT, …) from lib/instance.cjs; env wins.
+# This installation's identity (JORI_OWNER_EMAIL, JORI_DOMAIN,
+# JORI_SUPABASE_PROJECT, …) from lib/instance.cjs; env wins.
 source "$(dirname "$0")/lib/instance.sh"
 # The instance's own checks (optional): _ext/watchdog-checks.sh defines
 # _ext_incident_label and _ext_watchdog_checks, run below where they belong.
@@ -19,29 +19,29 @@ source "$(dirname "$0")/lib/instance.sh"
 #   - Ops supervisor HTTP health + event staleness
 #   - Gmail push delivery gaps
 #   - Crash-loop detection (via supervisor /health)
-#   - Alerting via Edva / email draft
+#   - Alerting via Jori / email draft
 #
 # It no longer manages tmux sessions or panes.
 
-LOG="$HOME/Dev/edva/agent/logs/watchdog.log"
+LOG="$HOME/Dev/jori/agent/logs/watchdog.log"
 NODE=/opt/homebrew/bin/node
-SEND="$HOME/Dev/edva/bin/edva-send-curl"
-GMAIL_ACTION="$HOME/Dev/edva/bin/gmail-action"
-EMAIL_SEND="$HOME/Dev/edva/bin/email-send"
-WORKDIR="$HOME/Dev/edva/agent"
+SEND="$HOME/Dev/jori/bin/jori-send-curl"
+GMAIL_ACTION="$HOME/Dev/jori/bin/gmail-action"
+EMAIL_SEND="$HOME/Dev/jori/bin/email-send"
+WORKDIR="$HOME/Dev/jori/agent"
 SUPERVISOR_DIR="$WORKDIR/supervisor"
 CONFIG_DIR="$WORKDIR/config"
-ALERT_COOLDOWN="$HOME/Dev/edva/data/.watchdog-last-alert"
-STALE_RESTART_COOLDOWN="$HOME/Dev/edva/data/.triage-restart-cooldown"
-CLOUDFLARED_RESTART_COOLDOWN="$HOME/Dev/edva/data/.cloudflared-restart-cooldown"
+ALERT_COOLDOWN="$HOME/Dev/jori/data/.watchdog-last-alert"
+STALE_RESTART_COOLDOWN="$HOME/Dev/jori/data/.triage-restart-cooldown"
+CLOUDFLARED_RESTART_COOLDOWN="$HOME/Dev/jori/data/.cloudflared-restart-cooldown"
 # The daily-summary self-heal's once-per-24h marker. Defined up here (not in the
 # daily-summary block) because § Max auth outage also needs it: it re-arms the
 # heal when an auth outage ends.
-DS_HEAL_MARKER="$HOME/Dev/edva/data/.daily-summary-heal-cooldown"
+DS_HEAL_MARKER="$HOME/Dev/jori/data/.daily-summary-heal-cooldown"
 CLOUDFLARED_LABEL="com.cloudflare.cloudflared"
-# The tunnel's public host: EDVA_PUSH_HOST, else gmail-push.<instance domain>.
+# The tunnel's public host: JORI_PUSH_HOST, else gmail-push.<instance domain>.
 # Empty (no domain configured) → the tunnel check is skipped.
-CLOUDFLARED_HOST="${EDVA_PUSH_HOST:-${EDVA_DOMAIN:+gmail-push.$EDVA_DOMAIN}}"
+CLOUDFLARED_HOST="${JORI_PUSH_HOST:-${JORI_DOMAIN:+gmail-push.$JORI_DOMAIN}}"
 CLOUDFLARED_LSOF="/usr/sbin/lsof"
 STALE_EVENT_MS=600000  # 10 min without supervisor events = stale
 PUSH_GAP_MS=3600000    # 60 min without Gmail push = likely Pub/Sub delivery failure
@@ -60,12 +60,12 @@ HEALTH_PORT="$AGENT_SUPERVISOR_HEALTH_PORT"
 log() { echo "$(date '+%Y-%m-%d %H:%M:%S') $1" >> "$LOG"; }
 
 # home_tz_label — the home time zone's short generic name ("ET", "PT", …) for
-# alert text, from EDVA_TZ (lib/instance.sh). Only alert paths call it; an
+# alert text, from JORI_TZ (lib/instance.sh). Only alert paths call it; an
 # unknown zone prints the zone id itself.
 home_tz_label() {
   local l
-  l=$("$NODE" -e 'const p=new Intl.DateTimeFormat("en-US",{timeZone:process.argv[1],timeZoneName:"shortGeneric"}).formatToParts(new Date()).find((x)=>x.type==="timeZoneName");process.stdout.write(p?p.value:"")' "${EDVA_TZ:-UTC}" 2>/dev/null)
-  printf '%s' "${l:-${EDVA_TZ:-UTC}}"
+  l=$("$NODE" -e 'const p=new Intl.DateTimeFormat("en-US",{timeZone:process.argv[1],timeZoneName:"shortGeneric"}).formatToParts(new Date()).find((x)=>x.type==="timeZoneName");process.stdout.write(p?p.value:"")' "${JORI_TZ:-UTC}" 2>/dev/null)
+  printf '%s' "${l:-${JORI_TZ:-UTC}}"
 }
 
 # log_throttled — write a log line at most once per cooldown window (default
@@ -108,16 +108,16 @@ notify() {
   # outbound precheck because (a) precheck depends on Supabase being
   # reachable, which is itself a thing the watchdog might be alerting on,
   # and (b) delaying or suppressing a liveness alert defeats its purpose.
-  # EDVA_INFRA_PROBE=1 — this script is the ONE authorized author of
+  # JORI_INFRA_PROBE=1 — this script is the ONE authorized author of
   # machine-health pages (agent/CLAUDE.md § System Channel). It runs from
   # cron, outside the agent Bash sandbox, so its curl/pgrep/launchctl probes see
-  # the real machine. edva-send-curl rejects total-outage claims without it.
+  # the real machine. jori-send-curl rejects total-outage claims without it.
   # Consume the key stashed by incident_should_alert (see PENDING_ALERT_KEY).
   local key="$PENDING_ALERT_KEY"
   PENDING_ALERT_KEY=""
 
-  if EDVA_INFRA_PROBE=1 "$SEND" --skip-precheck --intent watchdog-alert --channel system "$1" > /dev/null 2>&1; then
-    log "Notified via Edva: $1"
+  if JORI_INFRA_PROBE=1 "$SEND" --skip-precheck --intent watchdog-alert --channel system "$1" > /dev/null 2>&1; then
+    log "Notified via Jori: $1"
     [ -n "$key" ] && touch "$INCIDENT_DIR/${key}.delivered" 2>/dev/null
     return 0
   fi
@@ -129,9 +129,9 @@ notify() {
   # draft: agent/CLAUDE.md forbids a draft as a notification fallback,
   # because the user never sees it; a draft fallback leaves later "Recovered:"
   # pings with no preceding warning anywhere in the channel.
-  if [ -x "$EMAIL_SEND" ] && [ -n "${EDVA_OWNER_EMAIL:-}" ] \
-     && "$EMAIL_SEND" --to "$EDVA_OWNER_EMAIL" --subject "🔴 ${EDVA_HOST_TITLE:-Host} Watchdog" --body "$1" > /dev/null 2>&1; then
-    log "Notified via email (Edva channel unavailable): $1"
+  if [ -x "$EMAIL_SEND" ] && [ -n "${JORI_OWNER_EMAIL:-}" ] \
+     && "$EMAIL_SEND" --to "$JORI_OWNER_EMAIL" --subject "🔴 ${JORI_HOST_TITLE:-Host} Watchdog" --body "$1" > /dev/null 2>&1; then
+    log "Notified via email (Jori channel unavailable): $1"
     [ -n "$key" ] && touch "$INCIDENT_DIR/${key}.delivered" 2>/dev/null
     return 0
   fi
@@ -170,7 +170,7 @@ should_alert() {
 # — i.e. the same condition still trips on the NEXT tick (count >= 2).
 # When the probe passes again, the incident state clears so the next failure
 # starts fresh.
-INCIDENT_DIR="$HOME/Dev/edva/data/watchdog-incidents"
+INCIDENT_DIR="$HOME/Dev/jori/data/watchdog-incidents"
 mkdir -p "$INCIDENT_DIR" 2>/dev/null
 
 # _incident_label <key> — human-readable name for a recovery ping. Falls back
@@ -197,8 +197,8 @@ _incident_label() {
     nightly-review-missing) echo "weekly self-improvement review" ;;
     gog-auth)               echo "gog (Google Tasks/Calendar/Drive) auth" ;;
     gh-auth)                echo "gh (GitHub CLI) auth" ;;
-    disk-low)               echo "${EDVA_HOST_TITLE:-Host} free disk space" ;;
-    disk-critical)          echo "${EDVA_HOST_TITLE:-Host} free disk space (critical)" ;;
+    disk-low)               echo "${JORI_HOST_TITLE:-Host} free disk space" ;;
+    disk-critical)          echo "${JORI_HOST_TITLE:-Host} free disk space (critical)" ;;
     *)  # The instance's own incident keys (_ext/watchdog-checks.sh), else the key.
         if declare -F _ext_incident_label >/dev/null && _ext_incident_label "$1"; then :; else echo "$1"; fi ;;
   esac
@@ -359,7 +359,7 @@ incident_should_alert() {
 #   cloudflared connected, other status   -> up (502 is :9090 itself, not the tunnel)
 #   cloudflared status unreadable         -> the old rule plus 530: 000/530 = down
 #
-# The X-Edva-Probe: watchdog header marks the request for log correlation.
+# The X-Jori-Probe: watchdog header marks the request for log correlation.
 #
 # Exit 0 = tunnel up; non-zero = down.
 cloudflared_tunnel_probe() {
@@ -370,7 +370,7 @@ cloudflared_tunnel_probe() {
   [ -n "$CLOUDFLARED_HOST" ] || return 0
   out=$(curl -s -o /dev/null --max-time 8 \
     -w "%{http_code} dns=%{time_namelookup}s connect=%{time_connect}s tls=%{time_appconnect}s total=%{time_total}s" \
-    -H "X-Edva-Probe: watchdog" \
+    -H "X-Jori-Probe: watchdog" \
     "https://${CLOUDFLARED_HOST}/" 2>/dev/null)
   rc=$?
   code="${out%% *}"
@@ -463,7 +463,7 @@ host_network_reachable() {
   local host code
   for host in "https://api.github.com/" "https://aws.amazon.com/"; do
     code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 8 \
-      -H "X-Edva-Probe: watchdog" "$host" 2>/dev/null)
+      -H "X-Jori-Probe: watchdog" "$host" 2>/dev/null)
     [ -n "$code" ] && [ "$code" != "000" ] && return 0
   done
   return 1
@@ -477,7 +477,7 @@ _disk_gib_threshold() {
 }
 
 # disk_free_probe [path] — free space on the volume holding [path] (default
-# $HOME/Dev/edva/data: the memory DB, its snapshots, the logs). See
+# $HOME/Dev/jori/data: the memory DB, its snapshots, the logs). See
 # "Data-volume free space" below for why it exists.
 #
 # Reads `df -Pk`: POSIX output, a header line then one line per filesystem,
@@ -501,7 +501,7 @@ _disk_gib_threshold() {
 #
 # Read-only: it measures and never deletes, prunes or moves anything.
 disk_free_probe() {
-  local target="${1:-$HOME/Dev/edva/data}"
+  local target="${1:-$HOME/Dev/jori/data}"
   local warn crit out fields avail cap mount free_gib level
   warn=$(_disk_gib_threshold "$WATCHDOG_DISK_WARN_GIB" 25)
   crit=$(_disk_gib_threshold "$WATCHDOG_DISK_CRIT_GIB" 10)
@@ -540,7 +540,7 @@ disk_alert_body() {
   else
     snap="data/memory-db-snapshots (hourly memory-DB copies, which have filled the disk before) could not be measured."
   fi
-  echo "${free} GiB free on the data volume (${pct}% used). $snap Nothing was deleted. When space runs out, downloads to ${EDVA_HOST_LABEL:-the host} stall and database and log writes start failing."
+  echo "${free} GiB free on the data volume (${pct}% used). $snap Nothing was deleted. When space runs out, downloads to ${JORI_HOST_LABEL:-the host} stall and database and log writes start failing."
 }
 
 ISSUES=""
@@ -552,11 +552,11 @@ ISSUES=""
 # state (and an empty digest). Watchdog
 # initializes any missing file from schema default so the next hum tick has
 # somewhere to land.
-HUM_STATE="$HOME/Dev/edva/data/hum-state.json"
-HUM_SEEN="$HOME/Dev/edva/data/hum-seen.json"
-HUM_FEEDBACK="$HOME/Dev/edva/data/hum-feedback.jsonl"
-HUM_RUNS="$HOME/Dev/edva/data/hum-runs.jsonl"
-HUM_TODAY=$(TZ="${EDVA_TZ:-UTC}" date +%Y-%m-%d)
+HUM_STATE="$HOME/Dev/jori/data/hum-state.json"
+HUM_SEEN="$HOME/Dev/jori/data/hum-seen.json"
+HUM_FEEDBACK="$HOME/Dev/jori/data/hum-feedback.jsonl"
+HUM_RUNS="$HOME/Dev/jori/data/hum-runs.jsonl"
+HUM_TODAY=$(TZ="${JORI_TZ:-UTC}" date +%Y-%m-%d)
 if [ ! -f "$HUM_STATE" ]; then
   log "Hum state missing: hum-state.json — initializing schema default"
   jq -n --arg today "$HUM_TODAY" \
@@ -583,7 +583,7 @@ if ! pgrep -f "process-manager.mjs" > /dev/null 2>&1; then
   launchctl kickstart -k "gui/$UID/ai.claude.session" >> "$LOG" 2>&1 || true
   # Alert only if the LaunchAgent kickstart didn't bring it back by next tick.
   if [ "$ATTEMPT" -ge 2 ] && incident_should_alert "process-manager-down"; then
-    notify "🔴 Process manager is down and didn't restart after launchctl kickstart. Manual intervention needed on ${EDVA_HOST_LABEL:-the host}."
+    notify "🔴 Process manager is down and didn't restart after launchctl kickstart. Manual intervention needed on ${JORI_HOST_LABEL:-the host}."
   fi
   exit 0
 else
@@ -684,9 +684,9 @@ if [ -n "$HEALTH_PORT" ]; then
       # sweep) which alerts with a concrete symptom. The combined-signature
       # alert (gap + stuck unread) fires from the unread sweep below.
       PUSH_AGE=$(echo "$HEALTH" | jq -r '.lastPushAgeMs // 0')
-      PUSH_GAP_RENEW_COOLDOWN="$HOME/Dev/edva/data/.watchdog-push-gap-renew-cooldown"
+      PUSH_GAP_RENEW_COOLDOWN="$HOME/Dev/jori/data/.watchdog-push-gap-renew-cooldown"
       if [ "$PUSH_AGE" -gt "$PUSH_GAP_MS" ]; then
-        log_throttled "$HOME/Dev/edva/data/.watchdog-push-gap-log" \
+        log_throttled "$HOME/Dev/jori/data/.watchdog-push-gap-log" \
           "Gmail push gap detected: lastPushAge=${PUSH_AGE}ms (>${PUSH_GAP_MS}ms) — self-healing via watch renewal"
 
         # Gmail's watch endpoint is idempotent (same topicName just extends
@@ -699,14 +699,14 @@ if [ -n "$HEALTH_PORT" ]; then
         fi
         if [ "$SHOULD_RENEW" -eq 1 ]; then
           log "Push gap — running renew-gmail-watch.sh proactively"
-          "$HOME/Dev/edva/agent/scripts/renew-gmail-watch.sh" >> "$LOG" 2>&1 || true
+          "$HOME/Dev/jori/agent/scripts/renew-gmail-watch.sh" >> "$LOG" 2>&1 || true
           touch "$PUSH_GAP_RENEW_COOLDOWN"
         fi
 
         ISSUES="$ISSUES gmail-push-gap(${PUSH_AGE}ms)"
       else
         # Recovery — clear throttles so the next gap self-heals promptly.
-        rm -f "$HOME/Dev/edva/data/.watchdog-push-gap-log" 2>/dev/null
+        rm -f "$HOME/Dev/jori/data/.watchdog-push-gap-log" 2>/dev/null
         rm -f "$PUSH_GAP_RENEW_COOLDOWN" 2>/dev/null
       fi
     fi
@@ -791,17 +791,17 @@ fi
 # --- Chat message delivery check (catches silent phone-channel failures) ---
 # Query Supabase for unread user messages older than 3 minutes.
 # If any exist, the phone-channel realtime subscription likely dropped.
-# The instance's Supabase project (EDVA_SUPABASE_PROJECT). With none
+# The instance's Supabase project (JORI_SUPABASE_PROJECT). With none
 # configured SUPABASE_KEY stays empty, which skips every Supabase check below.
-SUPABASE_URL="${EDVA_SUPABASE_PROJECT:+https://$EDVA_SUPABASE_PROJECT.supabase.co}"
+SUPABASE_URL="${JORI_SUPABASE_PROJECT:+https://$JORI_SUPABASE_PROJECT.supabase.co}"
 SUPABASE_KEY=""
-[ -n "$SUPABASE_URL" ] && SUPABASE_KEY=$(grep '^SUPABASE_SERVICE_ROLE_KEY=' "$HOME/Dev/edva/.env" 2>/dev/null | cut -d= -f2-)
+[ -n "$SUPABASE_URL" ] && SUPABASE_KEY=$(grep '^SUPABASE_SERVICE_ROLE_KEY=' "$HOME/Dev/jori/.env" 2>/dev/null | cut -d= -f2-)
 STALE_MSG_THRESHOLD=180  # 3 minutes
 
 CUTOFF=$(date -u -v-${STALE_MSG_THRESHOLD}S '+%Y-%m-%dT%H:%M:%S+00:00' 2>/dev/null || date -u -d "${STALE_MSG_THRESHOLD} seconds ago" '+%Y-%m-%dT%H:%M:%S+00:00' 2>/dev/null)
 if [ -n "$CUTOFF" ] && [ -n "$SUPABASE_URL" ]; then
   STALE_MSGS=$(curl -sf --max-time 5 \
-    "${SUPABASE_URL}/rest/v1/edva_messages?role=eq.user&read=eq.false&created_at=lt.${CUTOFF}&order=created_at.asc&limit=5" \
+    "${SUPABASE_URL}/rest/v1/jori_messages?role=eq.user&read=eq.false&created_at=lt.${CUTOFF}&order=created_at.asc&limit=5" \
     -H "apikey: ${SUPABASE_KEY}" \
     -H "Authorization: Bearer ${SUPABASE_KEY}" 2>/dev/null)
 
@@ -830,8 +830,8 @@ if [ -n "$CUTOFF" ] && [ -n "$SUPABASE_URL" ]; then
             if (!Array.isArray(msgs)) return;
             for (const m of msgs) {
               const body = JSON.stringify({
-                content: "RECOVERED MESSAGE (was stuck):\n\nNew message from " + (process.env.EDVA_OWNER_NAME || "the user") + ":\n\n" + m.content,
-                source: "edva",
+                content: "RECOVERED MESSAGE (was stuck):\n\nNew message from " + (process.env.JORI_OWNER_NAME || "the user") + ":\n\n" + m.content,
+                source: "jori",
                 priority: "high",
                 msgId: m.id
               });
@@ -860,8 +860,8 @@ fi
 # Gmail Pub/Sub + the CF Email Worker reach the ops-supervisor :9090 through a
 # Cloudflare Tunnel ($CLOUDFLARED_HOST → localhost:9090), managed by its own
 # launchd agent (com.cloudflare.cloudflared), NOT by process-manager. If the
-# tunnel drops, inbound Gmail pushes and inbound email to Edva's address stop
-# arriving while the rest of Edva looks healthy. Self-heal = kickstart the
+# tunnel drops, inbound Gmail pushes and inbound email to Jori's address stop
+# arriving while the rest of Jori looks healthy. Self-heal = kickstart the
 # launchd agent; alert only if it doesn't recover by the next tick (parity with
 # every other incident, per the heal-then-alert policy). The probe is
 # the concrete liveness check that gates the page.
@@ -899,7 +899,7 @@ if ! cloudflared_tunnel_probe; then
 
     # Alert only if the kickstart didn't bring the tunnel back by the next tick.
     if [ "$ATTEMPT" -ge 2 ] && incident_should_alert "cloudflared-tunnel"; then
-      notify "🔴 Cloudflare Tunnel ($CLOUDFLARED_HOST) is down and didn't recover after launchctl kickstart ($ATTEMPT consecutive ticks): $TUNNEL_PROBE_EVIDENCE. While it is down, Gmail pushes and inbound email to ${EDVA_AGENT_FROM_EMAIL:-the agent address} cannot reach Edva. Manual intervention needed on ${EDVA_HOST_LABEL:-the host}: launchctl kickstart -k gui/\$(id -u)/$CLOUDFLARED_LABEL"
+      notify "🔴 Cloudflare Tunnel ($CLOUDFLARED_HOST) is down and didn't recover after launchctl kickstart ($ATTEMPT consecutive ticks): $TUNNEL_PROBE_EVIDENCE. While it is down, Gmail pushes and inbound email to ${JORI_AGENT_FROM_EMAIL:-the agent address} cannot reach Jori. Manual intervention needed on ${JORI_HOST_LABEL:-the host}: launchctl kickstart -k gui/\$(id -u)/$CLOUDFLARED_LABEL"
     fi
   fi
 else
@@ -910,10 +910,10 @@ else
   # attribution and never counted, kickstarted or paged. Sustained push loss is
   # watched separately by the PUSH_GAP_MS arm.
   if [ "$TUNNEL_HAIRPIN_ONLY" = "1" ]; then
-    log_throttled "$HOME/Dev/edva/data/.watchdog-tunnel-hairpin-log" \
+    log_throttled "$HOME/Dev/jori/data/.watchdog-tunnel-hairpin-log" \
       "Cloudflare Tunnel ($CLOUDFLARED_HOST): this host could not reach its own public hostname, but cloudflared holds live connections, so the tunnel is up; not counted, no kickstart, no page [$TUNNEL_PROBE_EVIDENCE]"
   elif [ -n "$TUNNEL_PROBE_EVIDENCE" ]; then
-    log_throttled "$HOME/Dev/edva/data/.watchdog-tunnel-non2xx-log" \
+    log_throttled "$HOME/Dev/jori/data/.watchdog-tunnel-non2xx-log" \
       "Cloudflare Tunnel ($CLOUDFLARED_HOST): tunnel up, but the public URL did not answer 2xx [$TUNNEL_PROBE_EVIDENCE]"
   fi
   incident_clear "cloudflared-tunnel"
@@ -929,7 +929,7 @@ fi
 # each stuck message. (The `-label:p1` exclusion lives in
 # `gmail-action list-unread-older`'s query — without it the watchdog
 # dispatches RECLASSIFY for every legit-unread P1 every tick forever.)
-STUCK_EMAILS=$("$HOME/Dev/edva/bin/gmail-action" list-unread-older 5 2>/dev/null || echo "[]")
+STUCK_EMAILS=$("$HOME/Dev/jori/bin/gmail-action" list-unread-older 5 2>/dev/null || echo "[]")
 STUCK_COUNT=$(echo "$STUCK_EMAILS" | jq 'length' 2>/dev/null || echo 0)
 STUCK_COUNT=${STUCK_COUNT:-0}
 # The ops dispatcher's usage-limit hold (/health rateLimitHoldUntil: an ISO time
@@ -956,7 +956,7 @@ if [ "$STUCK_COUNT" -gt 0 ] && [ -n "$OPS_HOLD_UNTIL" ]; then
   # the hold lifts.
   # DO NOT "tidy" this branch into symmetry with the one below.
   ISSUES="$ISSUES gmail-unread-stuck(${STUCK_COUNT},usage-hold)"
-  log_throttled "$EDVA_INSTALL_TOOLS/data/.watchdog-stuck-sweep-hold-log" \
+  log_throttled "$JORI_INSTALL_TOOLS/data/.watchdog-stuck-sweep-hold-log" \
     "Gmail unread sweep: $STUCK_COUNT message(s) waiting, but the ops dispatcher is holding for the Claude usage limit until $OPS_HOLD_UNTIL; no RECLASSIFY dispatch, not counted, no page"
 elif [ "$STUCK_COUNT" -gt 0 ]; then
   ATTEMPT=$(incident_seen "gmail-unread-stuck")
@@ -970,7 +970,7 @@ elif [ "$STUCK_COUNT" -gt 0 ]; then
   # batched sweep per STUCK_SWEEP_BACKOFF_MIN minutes; the alert below still
   # fires on the right cadence via `incident_should_alert`.
   STUCK_SWEEP_BACKOFF_MIN=30
-  STUCK_BACKOFF_MARKER="$HOME/Dev/edva/data/.watchdog-stuck-sweep-backoff"
+  STUCK_BACKOFF_MARKER="$HOME/Dev/jori/data/.watchdog-stuck-sweep-backoff"
   GAP_FOR_BACKOFF=$(echo "$HEALTH" | jq -r '.lastPushAgeMs // 0' 2>/dev/null)
   SKIP_DISPATCH=0
   if [ -n "$GAP_FOR_BACKOFF" ] && [ "$GAP_FOR_BACKOFF" -gt "$PUSH_GAP_MS" ]; then
@@ -1061,7 +1061,7 @@ fi
 # The local model (gemma3:1b served by Ollama at :11434) is the first rung of
 # the language ladder for low-stakes non-agent tasks (lib/local-llm.mjs).
 # Phone-channel acks no longer use it (they are canned copy only).
-OLLAMA_RESTART_COOLDOWN="$HOME/Dev/edva/data/.ollama-restart-cooldown"
+OLLAMA_RESTART_COOLDOWN="$HOME/Dev/jori/data/.ollama-restart-cooldown"
 BREW_BIN=/opt/homebrew/bin/brew
 if ! curl -sf --max-time 3 http://127.0.0.1:11434/api/tags > /dev/null 2>&1; then
   ATTEMPT=$(incident_seen "ollama-down")
@@ -1090,12 +1090,12 @@ else
 fi
 
 # --- Max-auth keychain self-heal (root cause of the recurring auth flaps) ---
-# Edva's Max OAuth token is stored in the login keychain ("Claude Code-
+# Jori's Max OAuth token is stored in the login keychain ("Claude Code-
 # credentials" generic-password item). The host can ALSO be a self-hosted iOS-
-# signing CI runner for several repos (Edva's TestFlight and others),
+# signing CI runner for several repos (Jori's TestFlight and others),
 # and some of those builds run `security default-keychain -s <build-keychain>` +
 # `security list-keychains -s <build-keychain>` WITHOUT the flock-serialized,
-# prepend-and-restore discipline edva-testflight.yml uses. Their residue:
+# prepend-and-restore discipline jori-testflight.yml uses. Their residue:
 # login.keychain-db drops out of the user search list and the default keychain
 # is left pointing at a since-deleted build keychain ("A default keychain could
 # not be found"). While login is out of the search list EVERY `claude -p`
@@ -1106,7 +1106,7 @@ fi
 # NOT disturb an in-flight signing build (codesign is passed an explicit
 # --keychain). This converts the #1 auth-outage cause from a page-the-human
 # incident into a silent heal. Durable belt-and-suspenders alongside fixing the
-# CI teardowns (edva-macos.yml takes the shared mutex and rebuilds the
+# CI teardowns (jori-macos.yml takes the shared mutex and rebuilds the
 # search list; both workflows guard the empty-list case). NOTE: "move the token
 # to ~/.claude/.credentials.json" is NOT a fix and must not be introduced — the
 # client resolves credentials keychain-FIRST, so a file copy
@@ -1358,14 +1358,14 @@ case "$CREDS_MAX_RC" in
     # if Claude Code ever moves where it stores the token, this check going
     # dark forever would otherwise be silent.
     ISSUES="$ISSUES creds(shape-unknown)"
-    log_throttled "$HOME/Dev/edva/data/.watchdog-creds-shape-unknown" "Creds: ~/.claude/.credentials.json is present but its claudeAiOauth block could not be read (probe rc=$CREDS_MAX_RC: 2=unparseable, 3=unrecognised key name or token shape) -- neither paging nor clearing, because this cannot tell either way." 3600
+    log_throttled "$HOME/Dev/jori/data/.watchdog-creds-shape-unknown" "Creds: ~/.claude/.credentials.json is present but its claudeAiOauth block could not be read (probe rc=$CREDS_MAX_RC: 2=unparseable, 3=unrecognised key name or token shape) -- neither paging nor clearing, because this cannot tell either way." 3600
     ;;
   *)
     # The probe itself failed (no python3 on cron's PATH, interpreter error).
     # Same posture as above, and deliberately NOT the else-branch: a broken
     # check must never read as a clean bill of health.
     ISSUES="$ISSUES creds(probe-failed)"
-    log_throttled "$HOME/Dev/edva/data/.watchdog-creds-probe-failed" "Creds: the plaintext-credentials probe failed to run (rc=$CREDS_MAX_RC) -- not paging and not clearing." 3600
+    log_throttled "$HOME/Dev/jori/data/.watchdog-creds-probe-failed" "Creds: the plaintext-credentials probe failed to run (rc=$CREDS_MAX_RC) -- not paging and not clearing." 3600
     ;;
 esac
 
@@ -1399,7 +1399,7 @@ esac
 # lib/webhook-auth.sh); prints nothing when neither that nor an override is set.
 _max_auth_relogin_file() {
   if [ -n "${MAX_AUTH_RELOGIN_FILE:-}" ]; then printf '%s' "$MAX_AUTH_RELOGIN_FILE"
-  elif [ -n "${EDVA_INSTALL_TOOLS:-}" ]; then printf '%s' "$EDVA_INSTALL_TOOLS/data/max-auth-relogin.json"
+  elif [ -n "${JORI_INSTALL_TOOLS:-}" ]; then printf '%s' "$JORI_INSTALL_TOOLS/data/max-auth-relogin.json"
   fi
 }
 
@@ -1465,7 +1465,7 @@ max_auth_probe_read "$(date +%s)" 1200
 if [ "$MAX_AUTH_PROBE_STATE" = "fail" ]; then touch "$INCIDENT_DIR/auth-outage.signed_out" 2>/dev/null; fi
 # log timestamps are UTC (Z); parse under TZ=UTC so the epoch is correct.
 _auth_epoch() { local ts="${1%% *}"; ts="${ts%.*}"; TZ=UTC date -j -f '%Y-%m-%dT%H:%M:%S' "$ts" +%s 2>/dev/null || echo 0; }
-for slog in "$HOME"/Dev/edva/agent/logs/{ops,ops-light,ops-haiku,chat}-supervisor.log; do
+for slog in "$HOME"/Dev/jori/agent/logs/{ops,ops-light,ops-haiku,chat}-supervisor.log; do
   [ -f "$slog" ] || continue
   auth_line=$(grep 'AUTH ERROR' "$slog" 2>/dev/null | tail -1)
   [ -n "$auth_line" ] || continue
@@ -1484,7 +1484,7 @@ done
 # quietly (no page, no ✅) until live-day's next check, at most 10 minutes later.
 [ "$KEYCHAIN_HEALED" = "1" ] && touch "$INCIDENT_DIR/auth-outage.keychain_healed" 2>/dev/null
 if [ "$MAX_AUTH_PROBE_STATE" = "fail" ]; then
-  for slog in "$HOME"/Dev/edva/agent/logs/{ops,ops-light,ops-haiku,chat}-supervisor.log; do
+  for slog in "$HOME"/Dev/jori/agent/logs/{ops,ops-light,ops-haiku,chat}-supervisor.log; do
     restored_line=$(grep 'auth restored' "$slog" 2>/dev/null | tail -1)
     if [ -n "$restored_line" ] && [ "$(_auth_epoch "$restored_line")" -gt "$MAX_AUTH_PROBE_TS" ]; then
       MAX_AUTH_PROBE_STATE=restored; break
@@ -1513,7 +1513,7 @@ if [ -n "$AUTH_HIT" ]; then
     # misdiagnose. Mirrors supervisor/index.mjs's own outage page.
     auth_err_text=$(grep 'AUTH ERROR' "$AUTH_HIT" 2>/dev/null | tail -1 | sed -E 's/^.*AUTH ERROR #[0-9]+: //' | cut -c1-200)
     [ -n "$auth_err_text" ] || auth_err_text="(no error text captured)"
-    notify "🔴 Max auth is DOWN on $(basename "$AUTH_HIT" | sed 's/-supervisor\.log//'). Captured error: \"$auth_err_text\". If it mentions a keychain, check \`security default-keychain\` + \`security list-keychains\`; otherwise it's likely just expired/invalid creds needing a plain re-login. Either way: \`claude /login\` on ${EDVA_HOST_LABEL:-the host}. No API-key fallback exists by design."
+    notify "🔴 Max auth is DOWN on $(basename "$AUTH_HIT" | sed 's/-supervisor\.log//'). Captured error: \"$auth_err_text\". If it mentions a keychain, check \`security default-keychain\` + \`security list-keychains\`; otherwise it's likely just expired/invalid creds needing a plain re-login. Either way: \`claude /login\` on ${JORI_HOST_LABEL:-the host}. No API-key fallback exists by design."
   fi
 else
   # The log-recency probe above goes BLIND during a sustained outage. Once a
@@ -1550,7 +1550,7 @@ else
     AUTH_OUTAGE_HELD=1
     # Same cadence as the fresh-error page above: every 30 min, cap 4 in 6h.
     if incident_should_alert "auth-outage" 1800 4 21600; then
-      notify "🔴 Max auth is STILL down on$AUTH_STILL_PAUSED. The supervisor(s) killed the child and paused dispatch, so there is nothing new in the logs — quiet does not mean recovered here. Anything queued behind this is not being worked. Run \`claude /login\` on ${EDVA_HOST_LABEL:-the host}; there is no API-key fallback by design."
+      notify "🔴 Max auth is STILL down on$AUTH_STILL_PAUSED. The supervisor(s) killed the child and paused dispatch, so there is nothing new in the logs — quiet does not mean recovered here. Anything queued behind this is not being worked. Run \`claude /login\` on ${JORI_HOST_LABEL:-the host}; there is no API-key fallback by design."
     fi
   elif [ "$MAX_AUTH_PROBE_STATE" = "fail" ]; then
     # The authAlertSent guard above only engages once a supervisor has failed 3
@@ -1568,13 +1568,13 @@ else
     rm -f "$INCIDENT_DIR/auth-outage.green_streak" 2>/dev/null
     ISSUES="$ISSUES auth(signed-out)"
     AUTH_OUTAGE_HELD=1   # both the single-reading hold and the confirmed page
-    _auth_since_local="$(TZ="${EDVA_TZ:-UTC}" date -r "$MAX_AUTH_PROBE_SINCE" '+%-I:%M %p' 2>/dev/null) $(home_tz_label)"
+    _auth_since_local="$(TZ="${JORI_TZ:-UTC}" date -r "$MAX_AUTH_PROBE_SINCE" '+%-I:%M %p' 2>/dev/null) $(home_tz_label)"
     if [ "$MAX_AUTH_PROBE_FAIL_SEC" -lt 540 ]; then
       log "Max auth: the launchd sign-in check read signed out once ($MAX_AUTH_PROBE_SUMMARY). Not paging until the next check confirms it, and not clearing either"
     else
       log "Max auth outage: no fresh AUTH ERROR line, but the launchd sign-in check has read signed out since $_auth_since_local ($MAX_AUTH_PROBE_SUMMARY) — holding the incident open"
       if incident_should_alert "auth-outage" 1800 4 21600; then
-        notify "🔴 Max auth is down: Claude Code on ${EDVA_HOST_LABEL:-the host} has read as signed out since $_auth_since_local, checked every 10 min from launchd (the context the scheduled runs use). Every scheduled Claude run will refuse to start until it is back, and quiet supervisor logs don't mean it recovered. Run \`claude /login\` on ${EDVA_HOST_LABEL:-the host}; there is no API-key fallback by design."
+        notify "🔴 Max auth is down: Claude Code on ${JORI_HOST_LABEL:-the host} has read as signed out since $_auth_since_local, checked every 10 min from launchd (the context the scheduled runs use). Every scheduled Claude run will refuse to start until it is back, and quiet supervisor logs don't mean it recovered. Run \`claude /login\` on ${JORI_HOST_LABEL:-the host}; there is no API-key fallback by design."
       fi
     fi
   elif [ "$MAX_AUTH_PROBE_STATE" = "pre-heal" ]; then
@@ -1585,7 +1585,7 @@ else
     # Say what was actually seen. A fresh signed-in reading is real evidence.
     # Quiet logs alone, with no fresh reading, are not (see above).
     if [ "$MAX_AUTH_PROBE_STATE" = "ok" ]; then
-      AUTH_RECOVERY_HOW="Claude Code on ${EDVA_HOST_LABEL:-the host} reads as signed in to Max again (launchd check), and no supervisor has logged a new auth error (if someone logged in, that was the fix; this check can't tell)"
+      AUTH_RECOVERY_HOW="Claude Code on ${JORI_HOST_LABEL:-the host} reads as signed in to Max again (launchd check), and no supervisor has logged a new auth error (if someone logged in, that was the fix; this check can't tell)"
     elif [ "$MAX_AUTH_PROBE_STATE" = "restored" ]; then
       AUTH_RECOVERY_HOW="a supervisor has authenticated on Max again since the last signed-out reading (if someone logged in, that was the fix; this check can't tell)"
     else
@@ -1638,6 +1638,8 @@ else
     # started then only refuses again. It runs once (the marker goes first),
     # posts its one line to the system channel, and is dropped after 12 hours
     # without a confirmed sign-in. Best effort: a failure costs a re-run, never a tick.
+    # --keep-in-tab: the user asked to be told in one line what ran, so this ✅
+    # stays in the System tab rather than going to the recovery log.
     _auth_replay_marker="$INCIDENT_DIR/auth-replay.pending"
     if [ -f "$_auth_replay_marker" ] && [ "$AUTH_RECOVERY_PENDING" != "1" ]; then
       _auth_replay_since=$(head -n 1 "$_auth_replay_marker" 2>/dev/null)
@@ -1647,11 +1649,11 @@ else
         log "Max auth recovery: re-run of the jobs the outage missed dropped (no confirmed sign-in within 12 hours of it closing)"
       elif [ "$MAX_AUTH_PROBE_STATE" = "ok" ]; then
         rm -f "$_auth_replay_marker" 2>/dev/null
-        _auth_replay_bin="${AUTH_OUTAGE_REPLAY_BIN:-${EDVA_INSTALL_TOOLS:-}/bin/auth-outage-replay}"
+        _auth_replay_bin="${AUTH_OUTAGE_REPLAY_BIN:-${JORI_INSTALL_TOOLS:-}/bin/auth-outage-replay}"
         if [ -x "$_auth_replay_bin" ]; then
           _auth_replay_line=$("$_auth_replay_bin" --since "$_auth_replay_since" 2>> "${LOG:-/dev/null}" | head -n 1)
           if [ -n "$_auth_replay_line" ]; then
-            if EDVA_INFRA_PROBE=1 "$SEND" --skip-precheck --intent watchdog-alert --channel system "$_auth_replay_line" > /dev/null 2>&1; then
+            if JORI_INFRA_PROBE=1 "$SEND" --skip-precheck --intent watchdog-alert --channel system --keep-in-tab "$_auth_replay_line" > /dev/null 2>&1; then
               log "Max auth recovery: $_auth_replay_line"
             else
               log "Max auth recovery: re-run note UNDELIVERED: $_auth_replay_line"
@@ -1689,7 +1691,7 @@ if ! curl -sf --max-time 3 http://127.0.0.1:9096/healthz > /dev/null 2>&1; then
   fi
 
   if [ "$ATTEMPT" -ge 2 ] && incident_should_alert "wiki-server-down"; then
-    notify "🔴 Wiki server (:9096) down and not recovering after $ATTEMPT consecutive ticks. Manual intervention needed on ${EDVA_HOST_LABEL:-the host}."
+    notify "🔴 Wiki server (:9096) down and not recovering after $ATTEMPT consecutive ticks. Manual intervention needed on ${JORI_HOST_LABEL:-the host}."
   fi
 else
   incident_clear "wiki-server-down"
@@ -1707,7 +1709,7 @@ fi
 # (invisible from here) is covered by the next note, which comes no sooner than
 # 22 days after this one.
 #
-# Channel: system, with --push. It is about Edva's own sign-in, so it is a
+# Channel: system, with --push. It is about Jori's own sign-in, so it is a
 # system row (agent/CLAUDE.md § System Channel), and it asks the user to
 # do something within days, which is what --push is for. No 🔴: nothing is
 # broken. Daytime only (09:00-21:00 home time), so the banner never lands at
@@ -1728,7 +1730,7 @@ _max_auth_relogin_num() {   # <key> <file>: an integer field, or nothing
 # <n> failed turn(s)". (Machine-written log structure, not language.)
 MAX_AUTH_RESTORED_LINE_RE='^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\.[0-9]+)?Z (\[supervisor\] auth restored .*rotating session and resuming dispatcher|\[chat-supervisor\] auth restored after [0-9]+ failed turn\(s\))$'
 max_auth_relogin_bootstrap() {
-  local logs="${EDVA_INSTALL_TOOLS:-}/agent/logs" lf line epoch newest=0 now
+  local logs="${JORI_INSTALL_TOOLS:-}/agent/logs" lf line epoch newest=0 now
   now=$(date +%s)
   for lf in "$logs"/ops-supervisor*.log* "$logs"/ops-light-supervisor*.log* \
             "$logs"/ops-haiku-supervisor*.log* "$logs"/chat-supervisor*.log*; do
@@ -1769,11 +1771,11 @@ max_auth_renewal_heads_up() {
   days="${MAX_AUTH_RENEW_NOTE_DAYS:-22}"
   [[ "$days" =~ ^[0-9]+$ ]] || days=22
   [ $(( now - anchor )) -ge $(( days * 86400 )) ] || return 0
-  hour=$(TZ="${EDVA_TZ:-UTC}" date -r "$now" '+%H' 2>/dev/null)
+  hour=$(TZ="${JORI_TZ:-UTC}" date -r "$now" '+%H' 2>/dev/null)
   hour="${hour#0}"
   [[ "$hour" =~ ^[0-9]+$ ]] || return 0
   { [ "$hour" -ge 9 ] && [ "$hour" -lt 21 ]; } || return 0
-  host="${EDVA_HOST_LABEL:-the host}"
+  host="${JORI_HOST_LABEL:-the host}"
   if [ "$note" -lt "$relogin" ]; then
     msg="As far as I can tell, the Claude sign-in on $host hasn't been renewed in $(( (now - relogin) / 86400 )) days. It tends to run out about four weeks after a sign-in, and when it does, every scheduled Claude job stops until someone signs in again. If you run \`claude /login\` on $host sometime in the next few days, the clock starts over and you skip that outage."
   else
@@ -1784,11 +1786,11 @@ max_auth_renewal_heads_up() {
   # The banner is cut at ~100 characters, before the ask; give it its own line.
   push="Time to renew the Claude sign-in on $host: run claude /login there in the next few days."
   src=$(grep -oE '"source":"[A-Za-z0-9._-]*"' "$f" 2>/dev/null | head -n1 | sed -E 's/^"source":"//; s/"$//')
-  if EDVA_INFRA_PROBE=1 "$SEND" --skip-precheck --intent max-auth-renewal --channel system --push --push-body "$push" "$msg" > /dev/null 2>&1; then
+  if JORI_INFRA_PROBE=1 "$SEND" --skip-precheck --intent max-auth-renewal --channel system --push --push-body "$push" "$msg" > /dev/null 2>&1; then
     _max_auth_relogin_write "$relogin" "$now" "${src:-unknown}"
     log "Max sign-in heads-up sent: $msg"
   else
-    log_throttled "$EDVA_INSTALL_TOOLS/data/.watchdog-renewal-note-failed" "Max sign-in heads-up could not be delivered; it retries next tick" 3600
+    log_throttled "$JORI_INSTALL_TOOLS/data/.watchdog-renewal-note-failed" "Max sign-in heads-up could not be delivered; it retries next tick" 3600
   fi
   return 0
 }
@@ -1832,7 +1834,7 @@ fi
 # observed instead of asserting revocation, and clear through the shared
 # machinery so a real breakage gets its ✅ Recovered ping for free.
 GH_BIN=/opt/homebrew/bin/gh
-GH_TOKEN_FILE="$HOME/Dev/edva/secrets/gh-token"
+GH_TOKEN_FILE="$HOME/Dev/jori/secrets/gh-token"
 GH_MIN_TICKS=3   # ~6 min of sustained failure at the 2-min watchdog cadence
 
 # Exit 0 = api.github.com reachable (any HTTP code returned); non-zero = no
@@ -1840,7 +1842,7 @@ GH_MIN_TICKS=3   # ~6 min of sustained failure at the 2-min watchdog cadence
 github_api_reachable() {
   local code
   code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 8 \
-    -H "X-Edva-Probe: watchdog" \
+    -H "X-Jori-Probe: watchdog" \
     "https://api.github.com/" 2>/dev/null)
   [ -n "$code" ] && [ "$code" != "000" ]
 }
@@ -1878,7 +1880,7 @@ if [ -x "$GH_BIN" ]; then
       # strings, not natural language — matching them is structure, not
       # interpretation.
       if echo "$GH_OUT" | grep -qiE "bad credentials|401|requires authentication"; then
-        GH_HINT="GitHub rejected the token outright. Run: gh auth logout -h github.com${EDVA_OWNER:+ -u $EDVA_OWNER} && gh auth login -h github.com -p https -w -s repo,workflow,read:org,gist — and note that only rewrites ~/.config/gh/hosts.yml, so secrets/gh-token (what this probe reads) needs updating too."
+        GH_HINT="GitHub rejected the token outright. Run: gh auth logout -h github.com${JORI_OWNER:+ -u $JORI_OWNER} && gh auth login -h github.com -p https -w -s repo,workflow,read:org,gist — and note that only rewrites ~/.config/gh/hosts.yml, so secrets/gh-token (what this probe reads) needs updating too."
       elif echo "$GH_OUT" | grep -qiE "rate limit|403|abuse detection"; then
         GH_HINT="This looks like a rate limit rather than a bad token — it should clear on its own."
       else
@@ -1900,8 +1902,8 @@ fi
 # Alert (at most once per 24h) if the last run failed OR the watch is within
 # 24h of expiring. Silent when missing entirely — the first crontab firing
 # writes it; before that we have nothing to assert.
-GMAIL_WATCH_LAST="$HOME/Dev/edva/data/gmail-watch-last.json"
-GMAIL_WATCH_RENEW_COOLDOWN="$HOME/Dev/edva/data/.gmail-watch-self-heal-cooldown"
+GMAIL_WATCH_LAST="$HOME/Dev/jori/data/gmail-watch-last.json"
+GMAIL_WATCH_RENEW_COOLDOWN="$HOME/Dev/jori/data/.gmail-watch-self-heal-cooldown"
 if [ -r "$GMAIL_WATCH_LAST" ]; then
   GWL_OK=$(jq -r '.ok // false' "$GMAIL_WATCH_LAST" 2>/dev/null)
   GWL_ERR=$(jq -r '.error // ""' "$GMAIL_WATCH_LAST" 2>/dev/null)
@@ -1939,7 +1941,7 @@ if [ -r "$GMAIL_WATCH_LAST" ]; then
     fi
     if [ "$SHOULD_RENEW" -eq 1 ]; then
       log "Gmail watch — running renew-gmail-watch.sh proactively"
-      "$HOME/Dev/edva/agent/scripts/renew-gmail-watch.sh" >> "$LOG" 2>&1 || true
+      "$HOME/Dev/jori/agent/scripts/renew-gmail-watch.sh" >> "$LOG" 2>&1 || true
       touch "$GMAIL_WATCH_RENEW_COOLDOWN"
     fi
 
@@ -1975,7 +1977,7 @@ fi
 GOG_BIN=/opt/homebrew/bin/gog
 GOG_MIN_TICKS=3   # ~4-6 min of sustained failure at the 2-min watchdog cadence
 if [ -x "$GOG_BIN" ]; then
-  GOG_OUT=$("$GOG_BIN" tasks lists --plain ${EDVA_OWNER_EMAIL:+--account=$EDVA_OWNER_EMAIL} --no-input 2>&1)
+  GOG_OUT=$("$GOG_BIN" tasks lists --plain ${JORI_OWNER_EMAIL:+--account=$JORI_OWNER_EMAIL} --no-input 2>&1)
   GOG_RC=$?
   GOG_FAILED=0
   if [ "$GOG_RC" -ne 0 ] || echo "$GOG_OUT" | grep -qiE "no auth|no tokens|invalid_grant|expired|revoked|unauthorized|keychain|locked"; then
@@ -2005,9 +2007,9 @@ if [ -x "$GOG_BIN" ]; then
     # error strings, not natural language — matching them is structure, not
     # interpretation.
     if echo "$GOG_OUT" | grep -qiE "keychain|locked|no auth|no tokens"; then
-      GOG_HINT="The login keychain looks locked or the token store unreadable — unlock the keychain on ${EDVA_HOST_LABEL:-the host}, or run 'gog login ${EDVA_OWNER_EMAIL:-<account>}'."
+      GOG_HINT="The login keychain looks locked or the token store unreadable — unlock the keychain on ${JORI_HOST_LABEL:-the host}, or run 'gog login ${JORI_OWNER_EMAIL:-<account>}'."
     elif echo "$GOG_OUT" | grep -qiE "invalid_grant|revoked|unauthorized"; then
-      GOG_HINT="Google looks to have revoked the refresh token — run 'gog login ${EDVA_OWNER_EMAIL:-<account>}' to re-consent."
+      GOG_HINT="Google looks to have revoked the refresh token — run 'gog login ${JORI_OWNER_EMAIL:-<account>}' to re-consent."
     else
       GOG_HINT="This is not a locked keychain or a revoked token — Google's token endpoint or the network has been failing repeatedly."
     fi
@@ -2021,7 +2023,7 @@ if [ -x "$GOG_BIN" ]; then
 fi
 
 # ── Supabase DB reachability.
-# The Edva app + phone channel are dead whenever the DB is unreachable, and
+# The Jori app + phone channel are dead whenever the DB is unreachable, and
 # without this that surfaces only as a silently-spinning app. This alerts to the
 # system channel the moment it degrades. The query is AUTHENTICATED (hits
 # Postgres, not just the edge — the edge stays up during a DB outage).
@@ -2048,7 +2050,7 @@ if [ -n "$SUPABASE_KEY" ]; then
     local code
     code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 8 \
       -H "apikey: $SUPABASE_KEY" -H "Authorization: Bearer $SUPABASE_KEY" \
-      "$SUPABASE_URL/rest/v1/edva_messages?select=id&limit=1" 2>/dev/null)
+      "$SUPABASE_URL/rest/v1/jori_messages?select=id&limit=1" 2>/dev/null)
     [ "$code" = "200" ] || [ "$code" = "206" ]
   }
   # Every incident key needs a matching incident_clear on its success path;
@@ -2091,14 +2093,14 @@ if [ -n "$SUPABASE_KEY" ]; then
       ISSUES="$ISSUES supabase(unreachable)"
       log "Supabase unreachable after in-tick re-probe (attempt $ATTEMPT), host network is fine"
       if [ "$ATTEMPT" -ge 2 ] && incident_should_alert "supabase-unreachable" 1800 4 21600; then
-        notify "🔴 Supabase DB unreachable — the Edva app + phone channel are down (queries to edva_messages failing). Failing $ATTEMPT checks running. Check Supabase compute/dashboard for project ${EDVA_SUPABASE_PROJECT} (likely compute saturation)."
+        notify "🔴 Supabase DB unreachable — the Jori app + phone channel are down (queries to jori_messages failing). Failing $ATTEMPT checks running. Check Supabase compute/dashboard for project ${JORI_SUPABASE_PROJECT} (likely compute saturation)."
       fi
     fi
   fi
 fi
 
 # ── Duplicate phone-channel detection. A rogue 2nd phone-channel (e.g. a stray
-# edva-phone MCP entry in a local Claude Desktop config) double-processes
+# jori-phone MCP entry in a local Claude Desktop config) double-processes
 # the channel + Supabase and amplifies an outage. Exactly ONE should
 # run (the chat supervisor's child); alert if more. Belt-and-suspenders to the
 # in-process single-instance guard in phone-channel/index.mjs.
@@ -2155,7 +2157,7 @@ PC_PIDS=$(pgrep -f "phone-channel/index.mjs" 2>/dev/null)
 PC_COUNT=$(printf '%s' "$PC_PIDS" | grep -c . 2>/dev/null)
 # Orphans this watchdog already sent SIGTERM on an earlier tick, one "pid <n>"
 # line each, so a survivor gets SIGKILL on the next. The "pid " prefix is for
-# `edva watchdog`, which reads any un-suffixed file in this dir as an integer
+# `jori watchdog`, which reads any un-suffixed file in this dir as an integer
 # failure counter — a bare pid would show up there as a huge failure count.
 PC_ORPHAN_FILE="$INCIDENT_DIR/phone-channel-duplicate.orphans_termed"
 if [ "${PC_COUNT:-0}" -gt 1 ]; then
@@ -2297,9 +2299,9 @@ fi
 # section re-arms the marker once on recovery, so the backfill runs when auth
 # is back. The nightly-review and episode-archive heals below have related
 # shapes but are intentionally out of scope for this fix.
-HOME_HOUR=$(TZ="${EDVA_TZ:-UTC}" date +%H); HOME_HOUR=$((10#$HOME_HOUR))
+HOME_HOUR=$(TZ="${JORI_TZ:-UTC}" date +%H); HOME_HOUR=$((10#$HOME_HOUR))
 # tasks registry = kernel system/tasks.json + agent/local/tasks.json (lib/registry.cjs).
-DS_CRON_HOUR=$("$NODE" "$HOME/Dev/edva/lib/registry.cjs" tasks 2>/dev/null \
+DS_CRON_HOUR=$("$NODE" "$HOME/Dev/jori/lib/registry.cjs" tasks 2>/dev/null \
   | jq -r '.tasks[] | select(.name=="daily-summary") | .schedule | split(" ")[1]' 2>/dev/null)
 case "$DS_CRON_HOUR" in ''|*[!0-9]*) DS_CRON_HOUR=1 ;; esac  # fall back to the known schedule
 DS_GRACE_HOUR=$(( DS_CRON_HOUR + 2 ))
@@ -2310,11 +2312,11 @@ DS_GRACE_HOUR=$(( DS_CRON_HOUR + 2 ))
 # same clock — gating "yesterday at home" on the home-zone hour looks two days
 # back in a far-off time zone and misses a whole day. Falls back to the home
 # zone if local-day errors.
-DS_LOCAL=$("$HOME/Dev/edva/bin/local-day" --json 2>/dev/null)
+DS_LOCAL=$("$HOME/Dev/jori/bin/local-day" --json 2>/dev/null)
 DS_LOCAL_HOUR=$(echo "$DS_LOCAL" | jq -r '.hour // empty' 2>/dev/null)
 DS_TARGET=$(echo "$DS_LOCAL" | jq -r '.yesterday // empty' 2>/dev/null)
 case "$DS_LOCAL_HOUR" in ''|*[!0-9]*) DS_LOCAL_HOUR=$HOME_HOUR ;; esac
-[ -z "$DS_TARGET" ] && DS_TARGET=$(TZ="${EDVA_TZ:-UTC}" date -v-1d +%Y-%m-%d)
+[ -z "$DS_TARGET" ] && DS_TARGET=$(TZ="${JORI_TZ:-UTC}" date -v-1d +%Y-%m-%d)
 if [ -n "$SUPABASE_KEY" ] && [ "$DS_LOCAL_HOUR" -ge "$DS_GRACE_HOUR" ]; then
   DS_ROW=$(curl -s --max-time 8 \
     -H "apikey: $SUPABASE_KEY" -H "Authorization: Bearer $SUPABASE_KEY" \
@@ -2342,7 +2344,7 @@ if [ -n "$SUPABASE_KEY" ] && [ "$DS_LOCAL_HOUR" -ge "$DS_GRACE_HOUR" ]; then
         [ "$HEAL_AGE" -lt 86400 ] && SHOULD_HEAL=0
       fi
       if [ "$SHOULD_HEAL" -eq 1 ]; then
-        DS_TOKEN=$(cat "$HOME/Dev/edva/secrets/webhook-token" 2>/dev/null)
+        DS_TOKEN=$(cat "$HOME/Dev/jori/secrets/webhook-token" 2>/dev/null)
         curl -s --max-time 10 -X POST "http://localhost:9092" \
           -H "Content-Type: application/json" \
           ${DS_TOKEN:+-H "Authorization: Bearer $DS_TOKEN"} \
@@ -2381,15 +2383,15 @@ fi
 # and then the watchdog probes nightly for a page that cannot exist yet (bogus
 # "missing" lines, a wasted backfill, a false 🔴 page). Deriving the gate means
 # a reschedule can't desync it.
-EA_HEAL_MARKER="$HOME/Dev/edva/data/.episode-archive-heal-cooldown"
-EA_CRON_HOUR=$("$NODE" "$HOME/Dev/edva/lib/registry.cjs" tasks 2>/dev/null \
+EA_HEAL_MARKER="$HOME/Dev/jori/data/.episode-archive-heal-cooldown"
+EA_CRON_HOUR=$("$NODE" "$HOME/Dev/jori/lib/registry.cjs" tasks 2>/dev/null \
   | jq -r '.tasks[] | select(.name=="episode-archive") | .schedule | split(" ")[1]' 2>/dev/null)
 case "$EA_CRON_HOUR" in ''|*[!0-9]*) EA_CRON_HOUR=7 ;; esac  # fall back to the known schedule
 EA_GATE_HOUR=$(( EA_CRON_HOUR + 2 ))
 [ "$EA_GATE_HOUR" -gt 23 ] && EA_GATE_HOUR=23
 if [ "$HOME_HOUR" -ge "$EA_GATE_HOUR" ]; then
-  EA_TARGET=$(TZ="${EDVA_TZ:-UTC}" date -v-1d +%Y-%m-%d)
-  if "$HOME/Dev/edva/bin/wiki" read "day_${EA_TARGET}" > /dev/null 2>&1; then
+  EA_TARGET=$(TZ="${JORI_TZ:-UTC}" date -v-1d +%Y-%m-%d)
+  if "$HOME/Dev/jori/bin/wiki" read "day_${EA_TARGET}" > /dev/null 2>&1; then
     incident_clear "episode-archive-missing"
     incident_clear "episode-archive-escalation"
     incident_clear "daily-summary-orphan-row"
@@ -2418,7 +2420,7 @@ if [ "$HOME_HOUR" -ge "$EA_GATE_HOUR" ]; then
     fi
     # The day writer is the installation's (optional): without it there is no
     # self-heal, only the pages below.
-    EA_DAY_WRITER="$HOME/Dev/edva/bin/wiki-day-write"
+    EA_DAY_WRITER="$HOME/Dev/jori/bin/wiki-day-write"
     if [ "$SHOULD_HEAL" -eq 1 ] && [ -f "$EA_DAY_WRITER" ]; then
       EA_HEAL_OUT=$(timeout 60 node "$EA_DAY_WRITER" "$EA_TARGET" 2>&1)
       EA_HEAL_RC=$?
@@ -2431,7 +2433,7 @@ if [ "$HOME_HOUR" -ge "$EA_GATE_HOUR" ]; then
     HEAL_AGE=999999
     [ -f "$EA_HEAL_MARKER" ] && HEAL_AGE=$(( $(date +%s) - $(stat -f%m "$EA_HEAL_MARKER") ))
     if [ "$HEAL_AGE" -ge 1200 ] && incident_should_alert "episode-archive-missing" 86400 2 86400; then
-      notify "🔴 Episode-archive missing for $EA_TARGET — the ${EA_CRON_HOUR}:xx $(home_tz_label) cron didn't produce a day_${EA_TARGET} wiki page and a watchdog backfill dispatch didn't recover it. A day of episodic memory is at risk. Backfill manually: ~/Dev/edva/bin/wiki-day-write $EA_TARGET, or check the ops supervisor (:9093) health + watchdog.log."
+      notify "🔴 Episode-archive missing for $EA_TARGET — the ${EA_CRON_HOUR}:xx $(home_tz_label) cron didn't produce a day_${EA_TARGET} wiki page and a watchdog backfill dispatch didn't recover it. A day of episodic memory is at risk. Backfill manually: ~/Dev/jori/bin/wiki-day-write $EA_TARGET, or check the ops supervisor (:9093) health + watchdog.log."
     fi
 
     # ── Row-exists-but-no-wiki-page refinement.
@@ -2452,7 +2454,7 @@ if [ "$HOME_HOUR" -ge "$EA_GATE_HOUR" ]; then
     if echo "$DS_ROW_FOR_EA" | grep -q '"narrative":"'; then
       ISSUES="$ISSUES daily-summary-orphan-row:$EA_TARGET"
       if [ "$HEAL_AGE" -ge 1200 ] && incident_should_alert "daily-summary-orphan-row" 86400 2 86400; then
-        notify "🔴 daily_summaries has a published row for $EA_TARGET but day_${EA_TARGET} is still missing from the wiki — this is NOT a missing build (the row has a narrative). episode-archive itself is failing to render it. Run ~/Dev/edva/bin/wiki-day-write $EA_TARGET directly and check its output, or check the ops supervisor (:9093) health + watchdog.log."
+        notify "🔴 daily_summaries has a published row for $EA_TARGET but day_${EA_TARGET} is still missing from the wiki — this is NOT a missing build (the row has a narrative). episode-archive itself is failing to render it. Run ~/Dev/jori/bin/wiki-day-write $EA_TARGET directly and check its output, or check the ops supervisor (:9093) health + watchdog.log."
       fi
     else
       incident_clear "daily-summary-orphan-row"
@@ -2463,7 +2465,7 @@ if [ "$HOME_HOUR" -ge "$EA_GATE_HOUR" ]; then
     # incident key so it isn't swallowed by the 24h cooldown on the 🔴 above.
     if [ "$ATTEMPT" -ge 90 ] && incident_should_alert "episode-archive-escalation" 86400 1 86400; then
       # kernel-closure-ok: advice text in a page, not a call
-      notify "🚨 ESCALATION: day_${EA_TARGET} wiki page STILL missing after 3h and $ATTEMPT watchdog checks. Automated backfill has failed — this needs hands. Run ~/Dev/edva/bin/wiki-day-write $EA_TARGET, and check whether the ops supervisor (:9093) is dropping dispatches at /compact boundaries."
+      notify "🚨 ESCALATION: day_${EA_TARGET} wiki page STILL missing after 3h and $ATTEMPT watchdog checks. Automated backfill has failed — this needs hands. Run ~/Dev/jori/bin/wiki-day-write $EA_TARGET, and check whether the ops supervisor (:9093) is dropping dispatches at /compact boundaries."
     fi
   fi
 fi
@@ -2480,8 +2482,8 @@ fi
 # not an hour-of-day gate: nightly-review runs weekly (not nightly), so there's
 # no "today's cron hour + 2h" to derive — the natural check is "how many days
 # since last_run", with ~1 day of slack past the 7-day cadence before flagging.
-NR_HEAL_MARKER="$HOME/Dev/edva/data/.nightly-review-heal-cooldown"
-NR_STATE_FILE="$HOME/Dev/edva/data/nightly-review-state.json"
+NR_HEAL_MARKER="$HOME/Dev/jori/data/.nightly-review-heal-cooldown"
+NR_STATE_FILE="$HOME/Dev/jori/data/nightly-review-state.json"
 NR_LAST_RUN=$(jq -r '.last_run // empty' "$NR_STATE_FILE" 2>/dev/null)
 NR_AGE_DAYS=999
 if [ -n "$NR_LAST_RUN" ]; then
@@ -2530,7 +2532,7 @@ if [ "$NR_AGE_DAYS" -ge 8 ]; then
   HEAL_AGE=999999
   [ -f "$NR_HEAL_MARKER" ] && HEAL_AGE=$(( $(date +%s) - $(stat -f%m "$NR_HEAL_MARKER") ))
   if [ "$HEAL_AGE" -ge 10800 ] && incident_should_alert "nightly-review-missing" 86400 2 86400; then
-    notify "🔴 Nightly-review (weekly Self Improvement Review) hasn't updated last_run in ${NR_AGE_DAYS}d — the Tuesday 05:00 $(home_tz_label) launchd agent didn't produce a fresh nightly-review-state.json and a watchdog kickstart didn't recover it. A week+ of self-improvement analysis is at risk, and the improvement-plan cards that chain off it never got filed. Backfill manually: ~/Dev/edva/agent/scripts/trigger-nightly-review.sh, or check \`launchctl print gui/\$(id -u)/ai.claude.improvement-review\` + agent/logs/nightly-review.log."
+    notify "🔴 Nightly-review (weekly Self Improvement Review) hasn't updated last_run in ${NR_AGE_DAYS}d — the Tuesday 05:00 $(home_tz_label) launchd agent didn't produce a fresh nightly-review-state.json and a watchdog kickstart didn't recover it. A week+ of self-improvement analysis is at risk, and the improvement-plan cards that chain off it never got filed. Backfill manually: ~/Dev/jori/agent/scripts/trigger-nightly-review.sh, or check \`launchctl print gui/\$(id -u)/ai.claude.improvement-review\` + agent/logs/nightly-review.log."
   fi
 else
   incident_clear "nightly-review-missing"
@@ -2546,8 +2548,8 @@ if declare -F _ext_watchdog_checks >/dev/null; then _ext_watchdog_checks; fi
 # last_tick in watch-state.json. A stale stamp while watches are armed means
 # the user's standing reminders are silently not being checked. Page after 30 min,
 # confirmed on two watchdog runs, at most once a day.
-WATCH_STATE="$HOME/Dev/edva/data/watch-state.json"
-WATCH_ACTIVE=$(sqlite3 "$HOME/Dev/edva/data/memory-index.db" "SELECT count(*) FROM watch_rules WHERE status='active'" 2>/dev/null || echo 0)
+WATCH_STATE="$HOME/Dev/jori/data/watch-state.json"
+WATCH_ACTIVE=$(sqlite3 "$HOME/Dev/jori/data/memory-index.db" "SELECT count(*) FROM watch_rules WHERE status='active'" 2>/dev/null || echo 0)
 case "$WATCH_ACTIVE" in ''|*[!0-9]*) WATCH_ACTIVE=0 ;; esac
 if [ "$WATCH_ACTIVE" -gt 0 ] && [ -f "$WATCH_STATE" ]; then
   WATCH_LAST=$(jq -r '.last_tick // empty' "$WATCH_STATE" 2>/dev/null)
@@ -2583,8 +2585,8 @@ fi
 # is an operator decision, and the fix for a filling disk is to find what is
 # growing and stop it, not to delete whatever is biggest. The page names the
 # folder that filled it last time so that search starts in the right place.
-DISK_SNAPSHOT_DIR="$HOME/Dev/edva/data/memory-db-snapshots"
-read -r DISK_LEVEL DISK_FREE_GIB DISK_USED_PCT DISK_DETAIL <<< "$(disk_free_probe "$HOME/Dev/edva/data")"
+DISK_SNAPSHOT_DIR="$HOME/Dev/jori/data/memory-db-snapshots"
+read -r DISK_LEVEL DISK_FREE_GIB DISK_USED_PCT DISK_DETAIL <<< "$(disk_free_probe "$HOME/Dev/jori/data")"
 case "$DISK_LEVEL" in
   ok)
     incident_clear "disk-low"
@@ -2594,13 +2596,13 @@ case "$DISK_LEVEL" in
     incident_clear "disk-critical"
     ATTEMPT=$(incident_seen "disk-low")
     ISSUES="$ISSUES disk(low)"
-    log_throttled "$HOME/Dev/edva/data/.watchdog-disk-low-log" \
+    log_throttled "$HOME/Dev/jori/data/.watchdog-disk-low-log" \
       "Data volume ($DISK_DETAIL) free space low: ${DISK_FREE_GIB} GiB free, ${DISK_USED_PCT}% used (attempt $ATTEMPT)" 3600
     # The body (and its du) is built inside notify's argument, after
     # incident_should_alert has stashed PENDING_ALERT_KEY and before notify runs;
     # nothing in it calls notify, so the key reaches the right page.
     if [ "$ATTEMPT" -ge 2 ] && incident_should_alert "disk-low"; then
-      notify "⚠️ ${EDVA_HOST_TITLE:-Host} disk space low: $(disk_alert_body "$DISK_FREE_GIB" "$DISK_USED_PCT" "$DISK_SNAPSHOT_DIR")"
+      notify "⚠️ ${JORI_HOST_TITLE:-Host} disk space low: $(disk_alert_body "$DISK_FREE_GIB" "$DISK_USED_PCT" "$DISK_SNAPSHOT_DIR")"
     fi
     ;;
   critical)
@@ -2610,17 +2612,17 @@ case "$DISK_LEVEL" in
     # already says everything the ⚠️ one would.
     ATTEMPT=$(incident_seen "disk-critical")
     ISSUES="$ISSUES disk(critical)"
-    log_throttled "$HOME/Dev/edva/data/.watchdog-disk-critical-log" \
+    log_throttled "$HOME/Dev/jori/data/.watchdog-disk-critical-log" \
       "Data volume ($DISK_DETAIL) free space CRITICAL: ${DISK_FREE_GIB} GiB free, ${DISK_USED_PCT}% used (attempt $ATTEMPT)" 3600
     if [ "$ATTEMPT" -ge 2 ] && incident_should_alert "disk-critical"; then
-      notify "🔴 ${EDVA_HOST_TITLE:-Host} disk space critical: $(disk_alert_body "$DISK_FREE_GIB" "$DISK_USED_PCT" "$DISK_SNAPSHOT_DIR")"
+      notify "🔴 ${JORI_HOST_TITLE:-Host} disk space critical: $(disk_alert_body "$DISK_FREE_GIB" "$DISK_USED_PCT" "$DISK_SNAPSHOT_DIR")"
     fi
     ;;
   *)
     # df failed or did not parse: no evidence either way, so no count, no
     # clear, no page (same reasoning as the tunnel's host-offline hold).
     ISSUES="$ISSUES disk(unknown)"
-    log_throttled "$HOME/Dev/edva/data/.watchdog-disk-unknown-log" \
+    log_throttled "$HOME/Dev/jori/data/.watchdog-disk-unknown-log" \
       "Data volume free space unreadable (${DISK_DETAIL:-no probe output}); not counted, not cleared, no page" 3600
     ;;
 esac
@@ -2632,12 +2634,12 @@ if [ -n "$ISSUES" ]; then
   # Strip the gmail-push-gap duration so minor ms drift doesn't count as a
   # change — we key on the issue set, not the exact timing.
   ISSUE_KEY=$(echo "$ISSUES" | sed -E 's/gmail-push-gap\([0-9]+ms\)/gmail-push-gap/g')
-  log_on_change "$HOME/Dev/edva/data/.watchdog-issues-key" \
+  log_on_change "$HOME/Dev/jori/data/.watchdog-issues-key" \
     "$ISSUE_KEY" "Watchdog issues:$ISSUES"
 else
   # Clear the marker on clean ticks so the next issue logs even if it
   # happens to produce the same key as the last incident.
-  rm -f "$HOME/Dev/edva/data/.watchdog-issues-key" 2>/dev/null
+  rm -f "$HOME/Dev/jori/data/.watchdog-issues-key" 2>/dev/null
 fi
 
 # --- Supervisor code reload: put each supervisor on the code that is on disk ---
@@ -2658,12 +2660,12 @@ fi
 # with no page due (or process-manager is down and nothing is known): neither
 # page nor clear. The stale incident is cleared, and its recovery line sent,
 # only on exit 0, when every target runs the code on disk. Kill switch: data/.supervisor-code-reload-off.
-if [ ! -f "$HOME/Dev/edva/data/.supervisor-code-reload-off" ]; then
-  node "$HOME/Dev/edva/bin/supervisor-code-reload" >> "$LOG" 2>&1
+if [ ! -f "$HOME/Dev/jori/data/.supervisor-code-reload-off" ]; then
+  node "$HOME/Dev/jori/bin/supervisor-code-reload" >> "$LOG" 2>&1
   SCR_RC=$?
   if [ "$SCR_RC" -eq 3 ]; then
     incident_seen "supervisor-code-reload-failed" > /dev/null
-    SCR_FAILED=$(jq -r '._failed // empty' "$HOME/Dev/edva/data/supervisor-code-reload-state.json" 2>/dev/null)
+    SCR_FAILED=$(jq -r '._failed // empty' "$HOME/Dev/jori/data/supervisor-code-reload-state.json" 2>/dev/null)
     if incident_should_alert "supervisor-code-reload-failed"; then
       notify "🔴 A supervisor (or hum-sense) I restarted to load new code didn't come back (${SCR_FAILED:-unknown which; see the log}), and I've stopped reloading the others. The last committed change to its code most likely fails at startup. Details: grep supervisor-code-reload agent/logs/watchdog.log; to stop it: touch data/.supervisor-code-reload-off"
     fi
@@ -2673,7 +2675,7 @@ if [ ! -f "$HOME/Dev/edva/data/.supervisor-code-reload-off" ]; then
   if [ "$SCR_RC" -eq 4 ]; then
     incident_seen "supervisor-code-stale" > /dev/null
     if incident_should_alert "supervisor-code-stale"; then
-      notify "⚠️ A supervisor (or hum-sense) has been running older code than what's committed for 6h+, so a fix on disk isn't live yet. The reload keeps holding; the reason is in watchdog.log (grep supervisor-code-reload). edva restart session loads it now (hum-sense: launchctl kickstart -k gui/\$(id -u)/ai.claude.hum-sense)."
+      notify "⚠️ A supervisor (or hum-sense) has been running older code than what's committed for 6h+, so a fix on disk isn't live yet. The reload keeps holding; the reason is in watchdog.log (grep supervisor-code-reload). jori restart session loads it now (hum-sense: launchctl kickstart -k gui/\$(id -u)/ai.claude.hum-sense)."
     fi
   elif [ "$SCR_RC" -eq 0 ]; then
     incident_clear "supervisor-code-stale"
@@ -2689,12 +2691,12 @@ fi
 # did not take, and tracked code files left uncommitted for 12h+. Exit 6 = flag
 # (text in its state file's _flag), 0 = clear, 5 = could not read processes
 # (neither). Restarts and holds go to this log. Kill switch: data/.stale-code-watch-off.
-if [ ! -f "$HOME/Dev/edva/data/.stale-code-watch-off" ]; then
-  node "$HOME/Dev/edva/bin/stale-code-watch" >> "$LOG" 2>&1
+if [ ! -f "$HOME/Dev/jori/data/.stale-code-watch-off" ]; then
+  node "$HOME/Dev/jori/bin/stale-code-watch" >> "$LOG" 2>&1
   SCW_RC=$?
   if [ "$SCW_RC" -eq 6 ]; then
     incident_seen "stale-code-flag" > /dev/null
-    SCW_FLAG=$(jq -r '._flag // empty' "$HOME/Dev/edva/data/stale-code-watch-state.json" 2>/dev/null)
+    SCW_FLAG=$(jq -r '._flag // empty' "$HOME/Dev/jori/data/stale-code-watch-state.json" 2>/dev/null)
     if [ -n "$SCW_FLAG" ] && incident_should_alert "stale-code-flag"; then
       notify "$SCW_FLAG"
     fi

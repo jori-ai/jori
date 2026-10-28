@@ -162,7 +162,7 @@ async function cmdSend(a) {
       body: JSON.stringify({
         to: target,
         text: a.text,
-        originating_task: process.env.EDVA_TASK_ID || null,
+        originating_task: process.env.JORI_TASK_ID || null,
       }),
     });
   } catch (err) {
@@ -190,7 +190,7 @@ async function cmdSend(a) {
       to: target,
       ...(groupName ? { group_name: groupName } : {}),
       text: a.text,
-      originating_task: process.env.EDVA_TASK_ID || null,
+      originating_task: process.env.JORI_TASK_ID || null,
       via: "cli",
     }) + "\n");
   } catch (err) {

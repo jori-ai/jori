@@ -20,13 +20,13 @@ function evalWith(env, body) {
     { encoding: "utf8", env: { PATH: process.env.PATH, HOME: process.env.HOME, ...env } }).trim();
 }
 
-test("the tunnel host is EDVA_PUSH_HOST, else gmail-push.<domain>, else empty", () => {
+test("the tunnel host is JORI_PUSH_HOST, else gmail-push.<domain>, else empty", () => {
   const l = line("CLOUDFLARED_HOST=");
   assert.ok(l, "CLOUDFLARED_HOST is assigned at top level");
-  assert.equal(evalWith({ EDVA_DOMAIN: "example.test" }, `${l}\necho "$CLOUDFLARED_HOST"`), "gmail-push.example.test");
-  assert.equal(evalWith({ EDVA_DOMAIN: "example.test", EDVA_PUSH_HOST: "push.example.org" }, `${l}\necho "$CLOUDFLARED_HOST"`), "push.example.org");
+  assert.equal(evalWith({ JORI_DOMAIN: "example.test" }, `${l}\necho "$CLOUDFLARED_HOST"`), "gmail-push.example.test");
+  assert.equal(evalWith({ JORI_DOMAIN: "example.test", JORI_PUSH_HOST: "push.example.org" }, `${l}\necho "$CLOUDFLARED_HOST"`), "push.example.org");
   // No domain at all (a fresh install): no host, and the probe has nothing to check.
-  assert.equal(execFileSync("bash", ["-c", `EDVA_DOMAIN=""; ${l}\necho "[$CLOUDFLARED_HOST]"`], { encoding: "utf8" }).trim(), "[]");
+  assert.equal(execFileSync("bash", ["-c", `JORI_DOMAIN=""; ${l}\necho "[$CLOUDFLARED_HOST]"`], { encoding: "utf8" }).trim(), "[]");
 });
 
 test("the tunnel probe treats a missing host as nothing to probe", () => {
@@ -39,8 +39,8 @@ test("the tunnel probe treats a missing host as nothing to probe", () => {
 
 test("the Supabase URL comes from the instance project; none configured → empty", () => {
   const l = line("SUPABASE_URL=");
-  assert.equal(evalWith({ EDVA_SUPABASE_PROJECT: "abcdefgh" }, `${l}\necho "$SUPABASE_URL"`), "https://abcdefgh.supabase.co");
-  assert.equal(execFileSync("bash", ["-c", `EDVA_SUPABASE_PROJECT=""; ${l}\necho "[$SUPABASE_URL]"`], { encoding: "utf8" }).trim(), "[]");
+  assert.equal(evalWith({ JORI_SUPABASE_PROJECT: "abcdefgh" }, `${l}\necho "$SUPABASE_URL"`), "https://abcdefgh.supabase.co");
+  assert.equal(execFileSync("bash", ["-c", `JORI_SUPABASE_PROJECT=""; ${l}\necho "[$SUPABASE_URL]"`], { encoding: "utf8" }).trim(), "[]");
 });
 
 test("no identity literal is left in watchdog.sh's code", () => {

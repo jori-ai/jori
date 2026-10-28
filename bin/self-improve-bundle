@@ -27,7 +27,7 @@ import { createHash } from "node:crypto";
 import rootPaths from "../lib/root.cjs";
 import { contentRefusals } from "../lib/self-improve-content-check.mjs";
 
-// The checkout this code runs from (EDVA_HOME when set): the tree the change was made in.
+// The checkout this code runs from (JORI_HOME when set): the tree the change was made in.
 const ROOT = rootPaths.REPO_ROOT;
 
 const USAGE = "usage: self-improve-bundle --out <file outside the repo> [--base-rev <commit>] [--allow-shrink <path>]... <path>...";

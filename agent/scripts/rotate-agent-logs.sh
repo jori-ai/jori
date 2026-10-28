@@ -3,13 +3,13 @@
 # Uses copytruncate so open file descriptors in ManagedProcess (createWriteStream)
 # and launchd (StandardErrorPath) keep writing to the same path without reopen.
 #
-# Cron: 0 3 * * * $HOME/Dev/edva/agent/scripts/rotate-agent-logs.sh
+# Cron: 0 3 * * * $HOME/Dev/jori/agent/scripts/rotate-agent-logs.sh
 #
 # Replaces the pre-process-manager tmux pipe-pane rotation (was rotating
 # chat-agent.log / ops-agent.log that no longer exist).
 
 set -u
-LOGDIR="$HOME/Dev/edva/agent/logs"
+LOGDIR="$HOME/Dev/jori/agent/logs"
 KEEP_DAYS=14
 DATE=$(date '+%Y-%m-%d')
 
@@ -53,8 +53,8 @@ echo "$(date '+%Y-%m-%d %H:%M:%S') rotate-agent-logs: rotated $rotated file(s)" 
 # Critic scratch copies older than 6 h, and any stray copy of the installation's
 # .env files under the temp dirs (bin/scratch-tree). A copy left in /tmp
 # keeps every key in it readable long after the run that made it.
-source "$(dirname "${BASH_SOURCE[0]}")/lib/root.sh"   # EDVA_NODE, EDVA_INSTALL_TOOLS
-if [ -n "${EDVA_NODE:-}" ]; then
-  "$EDVA_NODE" "$EDVA_INSTALL_TOOLS/bin/scratch-tree" sweep >> "$LOGDIR/scratch-tree-sweep.log" 2>&1 || true
+source "$(dirname "${BASH_SOURCE[0]}")/lib/root.sh"   # JORI_NODE, JORI_INSTALL_TOOLS
+if [ -n "${JORI_NODE:-}" ]; then
+  "$JORI_NODE" "$JORI_INSTALL_TOOLS/bin/scratch-tree" sweep >> "$LOGDIR/scratch-tree-sweep.log" 2>&1 || true
 fi
 

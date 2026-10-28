@@ -189,7 +189,7 @@ const BIN = new URL("../bin/slack-send", import.meta.url).pathname;
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "slack-send-"));
 function send(args, env = {}) {
   return spawnSync(process.execPath, [BIN, ...args], {
-    env: { PATH: process.env.PATH, HOME: tmp, EDVA_HOME: tmp, SLACK_RUNNER_URL: "http://127.0.0.1:9", ...env },
+    env: { PATH: process.env.PATH, HOME: tmp, JORI_HOME: tmp, SLACK_RUNNER_URL: "http://127.0.0.1:9", ...env },
     encoding: "utf8",
   });
 }

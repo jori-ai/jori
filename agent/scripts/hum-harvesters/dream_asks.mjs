@@ -30,7 +30,7 @@ import { installTools } from "../../../lib/root.cjs";
 import { reportBacklog, scaledLanePacing, recentlyOffered, rotateOffered } from "../../../lib/question-pacing.mjs";
 await readStdinJson();
 
-const DATA = process.env.EDVA_DATA_DIR || installTools("data");
+const DATA = process.env.JORI_DATA_DIR || installTools("data");
 const IDEAS = path.join(DATA, "hum-ideas.jsonl");
 const RUNS = process.env.HUM_RUNS_FILE || path.join(DATA, "hum-runs.jsonl");
 const LOCAL_DAY = path.join(path.dirname(new URL(import.meta.url).pathname), "../../../bin/local-day");
@@ -106,7 +106,7 @@ try {
   const i = rotateOffered(waiting, (x) => x.id, recentlyOffered("dream_asks", { now }))[0];
 
   const signal = [
-    `The dream (Edva's nightly whole-day review) had a question it could not settle from the evidence, and ${OWNER_NAME} asked for these to be floated the day after. Ask it as ONE warm, specific question — the wording below is a draft; keep its meaning and any open-endedness, freshen relative time words to today, and never assert its premise as fact.`,
+    `The dream (Jori's nightly whole-day review) had a question it could not settle from the evidence, and ${OWNER_NAME} asked for these to be floated the day after. Ask it as ONE warm, specific question — the wording below is a draft; keep its meaning and any open-endedness, freshen relative time words to today, and never assert its premise as fact.`,
     `Question: ${i.verify_question.trim().slice(0, 600)}`,
     `Why it came up (from the dream of ${dreamDate(i)}): ${String(i.rationale || i.subject).slice(0, 500)}`,
   ].join("\n");

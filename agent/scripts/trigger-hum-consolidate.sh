@@ -14,9 +14,9 @@ source "$(dirname "$0")/lib/webhook-auth.sh"
 export PATH="/opt/homebrew/bin:$PATH"
 
 resolve_tier_ports hum-consolidate   # default heavy → :9092 (Opus; judgment over the wiki)
-LOGFILE="$HOME/Dev/edva/agent/logs/watchdog.log"
-RESPONSES="$HOME/Dev/edva/data/hum-responses.jsonl"
-STATE="$HOME/Dev/edva/data/hum-consolidate-state.json"
+LOGFILE="$HOME/Dev/jori/agent/logs/watchdog.log"
+RESPONSES="$HOME/Dev/jori/data/hum-responses.jsonl"
+STATE="$HOME/Dev/jori/data/hum-consolidate-state.json"
 PAYLOAD='{"job": "hum-consolidate"}'
 
 log() { echo "$(date '+%Y-%m-%d %H:%M:%S') [hum-consolidate] $1" >> "$LOGFILE"; }
