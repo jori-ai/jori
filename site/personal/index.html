@@ -1,0 +1,357 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Jori for you · The personal AI agent you own</title>
+<meta name="description" content="Jori is an open-source personal AI agent that runs on your own machine, on the Claude subscription you already have. Read every line, change how it works, build your own.">
+<meta property="og:title" content="Jori for you · The personal AI agent you own">
+<meta property="og:description" content="Open source. Runs on your machine. Your data never lives in someone else's agent cloud. Fork it and build your own.">
+<link rel="icon" type="image/png" href="/icon.png">
+<link rel="apple-touch-icon" href="/apple-touch-icon.png">
+<meta property="og:image" content="https://getjori.ai/icon.png">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,600&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400&display=swap" rel="stylesheet">
+<style>
+  :root { --bg:#f4efe6; --ink:#141414; --muted:#5e5a52; --line:#d9d1c3; --accent:#c2410c; --us:#f6e3d3; --yes:#1f7a4d; --no:#a3473a; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#121110; --ink:#f1ece3; --muted:#a39d92; --line:#2c2925; --accent:#fb923c; --us:#2a1d14; --yes:#5fc28f; --no:#e08a7c; } }
+  * { box-sizing:border-box; margin:0; }
+  body { background:var(--bg); color:var(--ink); font:16px/1.6 Inter, system-ui, sans-serif; }
+  .wrap { width:100%; max-width:1080px; margin:0 auto; padding:0 24px; }
+  header.hero { padding:12vh 0 72px; max-width:760px; }
+  .logo { display:block; width:112px; height:auto; margin-bottom:28px; }
+  .tag { font-size:13px; letter-spacing:.08em; text-transform:uppercase; color:var(--muted); margin-bottom:24px; }
+  h1 { font-family:Fraunces, Georgia, serif; font-weight:600; font-size:clamp(48px, 8.5vw, 92px); line-height:1; letter-spacing:-.01em; }
+  h1 em { color:var(--accent); }
+  .lede { font-size:clamp(18px, 2.3vw, 21px); color:var(--muted); max-width:620px; margin-top:28px; }
+  .lede strong { color:var(--ink); font-weight:500; }
+  .ctas { margin-top:36px; display:flex; gap:24px; flex-wrap:wrap; align-items:center; }
+  .btn { display:inline-block; background:var(--ink); color:var(--bg); text-decoration:none; padding:12px 20px; border-radius:999px; font-weight:500; font-size:15px; }
+  .link { color:var(--ink); text-decoration:none; border-bottom:1px solid var(--ink); padding-bottom:2px; font-weight:500; font-size:15px; }
+  code, .mono { font-family:"JetBrains Mono", ui-monospace, monospace; font-size:.88em; }
+  .pillars { display:grid; grid-template-columns:repeat(3, 1fr); gap:20px; padding:56px 0; border-top:1px solid var(--line); }
+  .pillars h3 { font-family:Fraunces, Georgia, serif; font-weight:600; font-size:28px; line-height:1.15; margin-bottom:10px; }
+  .pillars p { color:var(--muted); font-size:15px; }
+  section.needs { padding:56px 0; border-top:1px solid var(--line); }
+  section.needs h2, section.compare h2 { font-family:Fraunces, Georgia, serif; font-weight:600; font-size:clamp(32px, 5vw, 48px); line-height:1.05; }
+  section.needs .sub { color:var(--muted); margin:12px 0 28px; max-width:640px; }
+  .cards { display:grid; grid-template-columns:1fr 1fr; gap:20px; }
+  .card { background:var(--us); border-radius:14px; padding:26px 26px 24px; }
+  .card .k { font-size:13px; letter-spacing:.08em; text-transform:uppercase; color:var(--accent); margin-bottom:10px; }
+  .card h3 { font-family:Fraunces, Georgia, serif; font-weight:600; font-size:30px; line-height:1.1; margin-bottom:10px; }
+  .card p { color:var(--muted); font-size:15px; }
+  @media (max-width:760px) { .cards { grid-template-columns:1fr; } }
+  section.compare { padding:56px 0 24px; border-top:1px solid var(--line); }
+  section.compare .sub { color:var(--muted); margin:12px 0 28px; max-width:640px; }
+  .scroller { overflow-x:auto; -webkit-overflow-scrolling:touch; border:1px solid var(--line); border-radius:14px; }
+  table { border-collapse:collapse; width:100%; min-width:680px; table-layout:fixed; font-size:14px; }
+  th, td { padding:13px 14px; text-align:left; vertical-align:top; border-bottom:1px solid var(--line); }
+  tr:last-child td { border-bottom:0; }
+  thead th { font-weight:600; font-size:14px; white-space:nowrap; }
+  thead th small { display:block; font-weight:400; color:var(--muted); font-size:12px; margin-top:2px; }
+  tbody th { font-weight:500; color:var(--muted); width:150px; white-space:nowrap; position:sticky; left:0; background:var(--bg); }
+  thead th:first-child { position:sticky; left:0; background:var(--bg); }
+  .us { background:var(--us); }
+  thead th.us { color:var(--accent); }
+  .y { color:var(--yes); font-weight:500; }
+  .n { color:var(--no); }
+  .caps table { min-width:760px; }
+  .caps tbody th { white-space:normal; width:300px; color:var(--ink); font-weight:600; }
+  .caps tbody th .d { display:block; font-weight:400; color:var(--muted); font-size:12.5px; line-height:1.45; margin-top:3px; }
+  .caps thead th:first-child { width:300px; }
+  .b { color:var(--accent); font-weight:500; }
+  .p { color:#9a6b12; }
+  .u { color:var(--muted); }
+  @media (prefers-color-scheme: dark) { .p { color:#e2b45c; } }
+  .note { color:var(--muted); font-size:12.5px; margin-top:14px; max-width:820px; }
+  footer { padding:48px 0 40px; color:var(--muted); font-size:13px; display:flex; justify-content:space-between; gap:16px; flex-wrap:wrap; }
+  footer a { color:var(--muted); }
+  @media (max-width:760px) { .pillars { grid-template-columns:1fr; gap:28px; } header.hero { padding-top:8vh; } }
+  h1 { letter-spacing:-.02em; line-height:1.02; }
+  .mark { display:inline-grid; place-items:center; width:64px; height:64px; border-radius:16px; background:var(--ink); color:var(--bg); font-family:Fraunces, Georgia, serif; font-size:40px; margin-bottom:28px; }
+  .nav { display:flex; align-items:center; justify-content:space-between; gap:16px; padding:20px 0; }
+  .nav .brand { display:flex; align-items:center; gap:10px; color:var(--ink); text-decoration:none; font-family:Fraunces, Georgia, serif; font-weight:600; font-size:22px; }
+  .nav .brand img { width:30px; height:30px; }
+  .nav .seg { display:flex; gap:4px; background:var(--us); border-radius:999px; padding:4px; }
+  .nav .seg a { color:var(--muted); text-decoration:none; font-size:14px; font-weight:500; padding:6px 14px; border-radius:999px; }
+  .nav .seg a[aria-current="page"] { background:var(--ink); color:var(--bg); }
+  .nav .gh { color:var(--muted); font-size:14px; text-decoration:none; }
+  @media (max-width:560px) { .nav .gh { display:none; } }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <nav class="nav">
+    <a class="brand" href="/"><img src="/logo.png" alt="" width="30" height="30">Jori</a>
+    <div class="seg"><a href="/personal" aria-current="page">Personal</a><a href="/business">Business</a></div>
+    <a class="gh" href="https://github.com/jori-ai/jori">GitHub</a>
+  </nav>
+  <header class="hero">
+        <div class="tag">Open source · Personal</div>
+    <h1>The personal agent<br><em>you actually own</em>.</h1>
+    <p class="lede">Your inbox, handled. Your trips, planned and booked. The best table in town, wherever you land. Your money, watched. Your home, taken care of. Jori looks after the details of your life, day and night. <strong>It's private and secure by design, so what it learns about you stays yours.</strong> And it's yours to shape, until it works exactly the way you do. All on the Claude subscription you already have.</p>
+    <div class="ctas">
+      <a class="btn" href="https://github.com/jori-ai/jori">Get it on GitHub</a>
+      <a class="link" href="https://github.com/jori-ai/jori/blob/main/docs/quickstart.md">Quickstart →</a>
+    </div>
+  </header>
+
+  <div class="pillars">
+    <div>
+      <h3>Your machine, your data.</h3>
+      <p>Jori runs on a machine you control: your Mac, a Linux box, or a cloud VM you rent. Memory, logs and state stay there and in accounts you own. Nothing is indexed into a vendor's agent cloud.</p>
+    </div>
+    <div>
+      <h3>Every line is yours to read.</h3>
+      <p>Apache 2.0. Jobs are plain Markdown playbooks, rules live in files you edit, and every action leaves a record. No black box deciding what to do with your email.</p>
+    </div>
+    <div>
+      <h3>Build your own variation.</h3>
+      <p>Add jobs, channels and tools in your own <code>local/</code> and <code>_ext/</code> folders without forking, or fork it and make something new. It's a kernel, not a product you rent.</p>
+    </div>
+  </div>
+
+  <section class="needs">
+    <h2>All it takes: two things you already have.</h2>
+    <p class="sub">No new subscription, no agent cloud, no per-token bill. That's the whole point.</p>
+    <div class="cards">
+      <div class="card">
+        <div class="k">1 · Your Claude Max subscription</div>
+        <h3>The one you already pay for.</h3>
+        <p>Jori works through your own Claude login, so it costs nothing extra: one flat monthly price, no API key to manage, no bill that grows with how hard your agent works. If the subscription is ever unavailable, Jori stops and tells you; it never quietly switches to per-token billing.</p>
+      </div>
+      <div class="card">
+        <div class="k">2 · A Mac or Linux machine that stays on</div>
+        <h3>A Mac mini or a small cloud VM.</h3>
+        <p>A Mac mini in the corner works, and so does a Linux VM you rent for a few dollars a month. Either way it's your machine: the agent, its memory and everything it learns about you live on a box you control and can wipe, not in an agent vendor's cloud.</p>
+      </div>
+    </div>
+  </section>
+
+  <section class="compare">
+    <h2>How Jori compares</h2>
+    <p class="sub">Jori next to the leading personal agents as of October 2026, most used on the left.</p>
+    <div class="scroller">
+      <table>
+        <thead>
+          <tr>
+            <th></th>
+            <th class="us">Jori</th>
+            <th>Muse<small>Meta</small></th>
+            <th>OpenClaw<small>Open source</small></th>
+            <th>Instinct<small>Spear Street</small></th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <th>Runs on</th>
+            <td class="us y">Your own Mac, Linux box or cloud VM</td>
+            <td>Meta's "Muse Secure VM"</td>
+            <td class="y">Your own machine</td>
+            <td>Instinct's servers</td>
+          </tr>
+          <tr>
+            <th>Your data lives</th>
+            <td class="us y">On your machine + accounts you own</td>
+            <td class="n">With Meta</td>
+            <td class="y">On your disk</td>
+            <td class="n">With Instinct</td>
+          </tr>
+          <tr>
+            <th>Source code</th>
+            <td class="us y">Open (Apache 2.0)</td>
+            <td class="n">Closed</td>
+            <td class="y">Open (MIT)</td>
+            <td class="n">Closed</td>
+          </tr>
+          <tr>
+            <th>Build your own</th>
+            <td class="us y">Extend in place or fork; jobs are Markdown</td>
+            <td class="n">Settings only</td>
+            <td class="y">Fork it</td>
+            <td class="n">No</td>
+          </tr>
+          <tr>
+            <th>How you pay</th>
+            <td class="us y">The Claude Max plan you already have; flat, no API key</td>
+            <td>Free, $20 or $100 / mo</td>
+            <td>Your API key, per token (or local models)</td>
+            <td>Free during beta</td>
+          </tr>
+          <tr>
+            <th>Always on, proactive</th>
+            <td class="us y">Yes — 24/7 supervisors + scheduled jobs</td>
+            <td class="y">Yes</td>
+            <td class="y">Yes</td>
+            <td class="y">Yes</td>
+          </tr>
+          <tr>
+            <th>Availability</th>
+            <td class="us y">Anyone, today</td>
+            <td>US</td>
+            <td>Anyone</td>
+            <td>Invite-only</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="note">Based on each product's public announcements and coverage as of October 2026; plans, regions and features change quickly. Ordered by users: Muse has 10M+ sign-ups (Meta, Oct 2026), OpenClaw is the most-starred open-source agent on GitHub, and Instinct is invite-only.</p>
+  </section>
+
+  <section class="compare caps">
+    <h2>What it actually does</h2>
+    <p class="sub">All of this runs every day on Jori's reference installation: one always-on Mac mini serving one household.</p>
+    <div class="scroller">
+      <table>
+        <thead>
+          <tr>
+            <th></th>
+            <th class="us">Jori</th>
+            <th>Muse<small>Meta</small></th>
+            <th>OpenClaw<small>Open source</small></th>
+            <th>Instinct<small>Spear Street</small></th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <th>Inbox triage<span class="d">Sorts every email as it lands into urgent / today / later from rules it learns. Urgent mail stars, pushes to your phone and becomes a task that closes itself when you reply. Spam and scams are blocked, unknown senders held, and it proposes rule changes from your corrections every week.</span></th>
+            <td class="us y">Learned urgent/today/later, auto-closing tasks</td><td class="y">Yes</td><td class="y">Yes, via skill</td><td class="y">Yes</td>
+          </tr>
+          <tr>
+            <th>Calendar<span class="d">"Put Alice on Tuesday at 2." Creates, moves and declines events from a sentence, warns about conflicts, never invites anyone unless you ask, and audits daily for invites it can't account for.</span></th>
+            <td class="us y">Create, move, decline; conflict + invite audits</td><td class="y">Yes</td><td class="y">Yes, via skill</td><td class="p">Partial</td>
+          </tr>
+          <tr>
+            <th>Talk to it anywhere<span class="d">Its own iPhone, iPad and Mac app (threaded replies, reactions, tap-to-answer cards, photos and files, share sheet, iCloud backup), "Hey Siri" and CarPlay with replies read aloud, email to its own address, WhatsApp and iMessage, always introducing itself as your assistant to others.</span></th>
+            <td class="us y">Own app, Siri/CarPlay, email, WhatsApp, iMessage</td><td class="y">App, WhatsApp</td><td class="y">10+ channels</td><td class="y">SMS, WhatsApp, calls</td>
+          </tr>
+          <tr>
+            <th>Morning brief &amp; digests<span class="d">A morning brief of calendar, tasks, weather and the news you care about; one daily digest for all your newsletters; weekly and monthly reviews by email.</span></th>
+            <td class="us y">Daily brief, newsletter digest, weekly reviews</td><td class="u">—</td><td class="u">—</td><td class="u">—</td>
+          </tr>
+          <tr>
+            <th>Proactive pings<span class="d">Reaches out when something is worth knowing, from 30 live lanes: markets, weather, news, art, music, shows, health, travel, follow-ups and more. Capped at 6 a day, at least 45 minutes apart, held while you're walking or driving, re-checked for truth before sending. Say "done" and it stops.</span></th>
+            <td class="us y">30 lanes, 6/day cap, held while you move</td><td class="y">Yes</td><td class="y">Cron + heartbeat</td><td class="p">Partial</td>
+          </tr>
+          <tr>
+            <th>"Tell me when…" watches<span class="d">Any reminder or condition becomes a watch: when a letter or email arrives, two days before a trip, at 9 tomorrow, or "check whether they replied, then act". A model judges each match and asks when unsure; misses are reviewed weekly.</span></th>
+            <td class="us y">Email, mail, trip-relative or timed; can act<sup>*</sup></td><td class="p">Some</td><td class="p">Script it with cron</td><td class="u">Not documented</td>
+          </tr>
+          <tr>
+            <th>Follows you around the world<span class="d">When you travel, every schedule shifts to your local time, recommendations only cover the city you'll actually be in, and flight times are quoted in each airport's local time.</span></th>
+            <td class="us y">Schedules + picks follow your time zone</td><td class="u">—</td><td class="u">—</td><td class="u">—</td>
+          </tr>
+          <tr>
+            <th>Long-term memory<span class="d">A personal wiki of people, places and decisions with semantic and associative recall ("what else happened when…", "what did we do on Apr 26"). A nightly "dream" mines the day for lasting likes and patterns, a weekly deep dream looks back 90 days, and every fact is checked for contradictions before it's saved.</span></th>
+            <td class="us y">Wiki + nightly dream + 90-day deep dream</td><td class="y">Yes</td><td class="y">Yes</td><td class="p">Partial</td>
+          </tr>
+          <tr>
+            <th>Search everything<span class="d">One search across your email, chats, messages, notes, files and its own activity log.</span></th>
+            <td class="us y">Email, chats, notes, files, its own log</td><td class="u">—</td><td class="u">—</td><td class="u">—</td>
+          </tr>
+          <tr>
+            <th>People &amp; contacts<span class="d">Builds a page for everyone you meet and email, records who was with you, and looks up or enriches contacts.</span></th>
+            <td class="us y">Person pages from email, contact enrichment<sup>*</sup></td><td class="u">—</td><td class="u">—</td><td class="u">—</td>
+          </tr>
+          <tr>
+            <th>Family &amp; household<span class="d">Family members can email it for scoped answers; it accepts your partner's invites, asks before adding them to a booking, enters lotteries for both of you, and brings gift and outing ideas before birthdays and anniversaries.</span></th>
+            <td class="us y">Family Q&amp;A, shared plans, occasion ideas<sup>*</sup></td><td class="u">—</td><td class="u">—</td><td class="u">—</td>
+          </tr>
+          <tr>
+            <th>Banking &amp; cards<span class="d">Balances and transactions across your banks and cards; alerts on late income, fees, overdraft risk, unusual or duplicate charges and subscription price creep; a weekly review where every number is checked against the data; and a monthly net-worth summary. Read-only: it cannot move money.</span></th>
+            <td class="us y">All banks + cards, verified weekly review<sup>*</sup></td><td class="y">Yes (Plaid)</td><td class="n">Community skills only</td><td class="p">Partial</td>
+          </tr>
+          <tr>
+            <th>Investments<span class="d">Brokerage positions with as-of times, a weekly risk memo, a monthly rebalance debated by a council of three agents and scored against what happened, IPO and filing watches, and rate sensitivity. It can place trades, but only after you approve each one with Face ID or Touch ID.</span></th>
+            <td class="us y">Risk memo, agent council; trades with Face/Touch ID<sup>*</sup></td><td class="p">Holdings only</td><td class="n">Community skills only</td><td class="u">Not documented</td>
+          </tr>
+          <tr>
+            <th>Receipts, orders, miles &amp; points<span class="d">Turns receipt emails into vendor, total and card; recovers what every Amazon charge actually bought; files contractor quotes; tracks airline and hotel points, status and expirations.</span></th>
+            <td class="us y">Receipts, Amazon orders, points + expirations<sup>*</sup></td><td class="u">—</td><td class="u">—</td><td class="u">—</td>
+          </tr>
+          <tr>
+            <th>Physical mail<span class="d">Reads the scans from your virtual mailbox, says who sent each letter and whether it's junk, and can trigger a watch when a specific letter arrives.</span></th>
+            <td class="us y">Virtual-mailbox scans, junk flagged<sup>*</sup></td><td class="u">—</td><td class="u">—</td><td class="u">—</td>
+          </tr>
+          <tr>
+            <th>Travel<span class="d">Searches live fares (one-way, round trip, open-jaw, cabin, nonstop), Google Flights and Hotels, Booking.com and Airbnb, and books any of them with Face ID or Touch ID. Every confirmation, change and cancellation in your email lands in one travel timeline and your calendar; flights are tracked live.</span></th>
+            <td class="us y">Search &amp; book flights, hotels, Airbnb; timeline<sup>*</sup></td><td class="y">Search & book (Duffel)</td><td class="n">Community skills only</td><td class="y">Books trips</td>
+          </tr>
+          <tr>
+            <th>Trip planning<span class="d">For every upcoming destination it researches a guide in the local language, verifies each place, crosses off ones you've been to, and builds day plans around air and sea temperature, waves, tides and a beach verdict; publishes an itinerary site and emails a photo itinerary. Watches cruise prices for all-time lows.</span></th>
+            <td class="us y">Local-language guides, day plans, cruise lows<sup>*</sup></td><td class="u">—</td><td class="u">—</td><td class="u">—</td>
+          </tr>
+          <tr>
+            <th>Restaurants<span class="d">A restaurant finder ranks the best places where you are, or where your travel timeline says you'll be, on the food itself: local favourites over tourist strips, your own saved places first, walking minutes on every pick. Resy search, booking, cancelling and sniping the second tables open; it asks before suggesting.</span></th>
+            <td class="us y">Best picks where you'll be, Resy book/snipe<sup>*</sup></td><td class="y">OpenTable</td><td class="p">Search only</td><td class="y">Resy + calls</td>
+          </tr>
+          <tr>
+            <th>Shopping<span class="d">"Buy X" on any site: it stays signed in to 20+ merchants (you sign new ones in from your phone), builds the cart and stops at review. You approve the exact items, total, card and address with Face ID or Touch ID; then code places the order.</span></th>
+            <td class="us y">Any site, Face/Touch ID on the exact cart<sup>*</sup></td><td class="y">Stripe checkout</td><td class="p">Browser automation</td><td class="y">Binding purchases</td>
+          </tr>
+          <tr>
+            <th>Events &amp; tickets<span class="d">Watches for concerts, big names in small comedy rooms, theater, talks, storytelling and festivals up to 90 days ahead in every city you'll be in; enters Broadway lotteries daily; finds the best-value seats with a marked seat map; buys with Face ID or Touch ID.</span></th>
+            <td class="us y">15 watchers, lotteries, best-value seats<sup>*</sup></td><td class="y">Ticketmaster</td><td class="u">Not documented</td><td class="y">Yes</td>
+          </tr>
+          <tr>
+            <th>Shows &amp; movies<span class="d">A taste model trained on millions of ratings predicts what you'll like, shows where to stream it (at home or abroad), flags new seasons, emails a weekly film pick and learns from your ratings.</span></th>
+            <td class="us y">Taste model, where to stream, new seasons<sup>*</sup></td><td class="u">—</td><td class="u">—</td><td class="u">—</td>
+          </tr>
+          <tr>
+            <th>Works your logged-in web<span class="d">Recipes for sites you're already signed in to: Amazon, Walmart, Target, Booking.com, Airbnb, Resy, Reddit, X, LinkedIn, Facebook Marketplace, Product Hunt; it repairs a broken recipe the same day.</span></th>
+            <td class="us y">Site recipes, same-day self-repair</td><td class="p">Own browser</td><td class="y">Browser plugin</td><td class="p">Cloud computer</td>
+          </tr>
+          <tr>
+            <th>Smart home<span class="d">Lights, shades, fans, locks, door intercom, TVs, speakers, cameras, printer, spa and pool robot; checks every device every 2 minutes and emails when one drops.</span></th>
+            <td class="us y">Lights to locks to spa; 2-minute health checks<sup>*</sup></td><td class="p">Hue, Tesla, Home Link</td><td class="y">Hue, cameras, Sonos</td><td class="u">Not documented</td>
+          </tr>
+          <tr>
+            <th>Health &amp; fitness<span class="d">Apple Health vitals, workouts, sleep (from phone and Watch) and clinical records like labs and medications; schedules workouts, nudges around them and celebrates logged sessions. It finds patterns, never diagnoses, and health data never leaves your machine.</span></th>
+            <td class="us y">Labs, sleep, workout coaching; stays local<sup>*</sup></td><td class="y">Apple Health, labs</td><td class="p">Eight Sleep only</td><td class="u">Not documented</td>
+          </tr>
+          <tr>
+            <th>Location &amp; life log<span class="d">Where you were and when, stops confirmed while you still remember them, who you were with, photos placed on your day, the history of places you pass, and a daily, weekly and monthly story of your life you can correct by replying.</span></th>
+            <td class="us y">Confirmed stops, companions, daily story<sup>*</sup></td><td class="u">Not documented</td><td class="p">Location on demand</td><td class="p">Location only</td>
+          </tr>
+          <tr>
+            <th>Meetings &amp; calls<span class="d">A summary, points and next steps for both sides after every video call you host, filed to each person's page; agendas, reminders and notes for recurring meetings.</span></th>
+            <td class="us y">Call notes for every call, meeting agendas<sup>*</sup></td><td class="u">—</td><td class="u">—</td><td class="u">—</td>
+          </tr>
+          <tr>
+            <th>Documents &amp; research<span class="d">Web research, summaries and drafts; reads PDFs; creates and edits Word, Excel and Apple Notes; hands long work to background sub-agents.</span></th>
+            <td class="us y">Research, PDFs, Word/Excel/Notes, sub-agents</td><td class="y">Yes</td><td class="y">Yes</td><td class="p">Partial</td>
+          </tr>
+          <tr>
+            <th>Security watch<span class="d">Every 3 hours, checks security news, breaches and vulnerable packages against the ~100 services and the code you actually use; weekly summary by email.</span></th>
+            <td class="us y">Breaches + CVEs vs what you use, every 3h<sup>*</sup></td><td class="u">—</td><td class="u">—</td><td class="u">—</td>
+          </tr>
+          <tr>
+            <th>Phone calls for you<span class="d">Calls businesses on your behalf.</span></th>
+            <td class="us n">Not yet</td><td class="p">Beta, paused</td><td class="y">Voice plugin</td><td class="y">Early access</td>
+          </tr>
+          <tr>
+            <th>Improves itself<span class="d">Reviews its own week, finds the root cause of every failure overnight, watches its own costs, fixes broken site recipes the same day, and proposes upgrades you approve with Face ID or Touch ID.</span></th>
+            <td class="us y">Nightly root-cause, weekly self-review</td><td class="u">—</td><td class="u">—</td><td class="u">—</td>
+          </tr>
+          <tr>
+            <th>Build new abilities<span class="d">New jobs are plain Markdown playbooks; new tools drop into your own folders; or ask in chat ("build me X") and it builds, tests and ships it for your approval.</span></th>
+            <td class="us y">Markdown playbooks, "build me X" from chat</td><td class="p">Custom connectors</td><td class="y">Skills</td><td class="n">No</td>
+          </tr>
+          <tr>
+            <th>Asks before risky actions<span class="d">Anything risky waits for your Face ID or Touch ID: moving money, placing a trade, buying, booking, or messaging someone new. Every outgoing message is also checked against what's true right now.</span></th>
+            <td class="us y">Face/Touch ID on every risky action</td><td class="y">Yes</td><td class="p">Exec approvals</td><td class="n">Weak</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="note"><sup>*</sup>Running today on the reference installation; landing in the open-source repo shortly. Competitor cells are from each product's announcements, docs and press coverage as of October 2026: "Not documented" means we found no public source, not that it can't; "—" means not compared.</p>
+  </section>
+
+  <footer>
+    <span>© 2026 Jori · <a href="/business">Jori for business</a></span>
+    <a href="https://github.com/jori-ai/jori">github.com/jori-ai/jori</a>
+  </footer>
+</div>
+</body>
+</html>

@@ -3,10 +3,10 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Jori · Your AI coworker</title>
-<meta name="description" content="Jori takes on your team's busywork: customer email, meetings, business travel, invoices, reports. Private, secure and yours to shape. Open source.">
-<meta property="og:title" content="Jori · Your AI coworker">
-<meta property="og:description" content="Your team's busywork, handled. Private, secure and yours to shape.">
+<title>Jori · AI for your life and your work</title>
+<meta name="description" content="Jori is an open-source AI assistant: your personal agent for your inbox, trips, money and home, or your team's AI coworker. Private, secure and yours to shape.">
+<meta property="og:title" content="Jori · AI for your life and your work">
+<meta property="og:description" content="One open-source assistant, for you or for your business. Private, secure and yours to shape.">
 <link rel="icon" type="image/png" href="/icon.png">
 <link rel="apple-touch-icon" href="/apple-touch-icon.png">
 <meta property="og:image" content="https://getjori.ai/icon.png">
@@ -70,6 +70,22 @@
   @media (max-width:760px) { .pillars { grid-template-columns:1fr; gap:28px; } header.hero { padding-top:8vh; } }
   h1 { letter-spacing:-.02em; line-height:1.02; }
   .mark { display:inline-grid; place-items:center; width:64px; height:64px; border-radius:16px; background:var(--ink); color:var(--bg); font-family:Fraunces, Georgia, serif; font-size:40px; margin-bottom:28px; }
+  .nav { display:flex; align-items:center; justify-content:space-between; gap:16px; padding:20px 0; }
+  .nav .brand { display:flex; align-items:center; gap:10px; color:var(--ink); text-decoration:none; font-family:Fraunces, Georgia, serif; font-weight:600; font-size:22px; }
+  .nav .brand img { width:30px; height:30px; }
+  .nav .seg { display:flex; gap:4px; background:var(--us); border-radius:999px; padding:4px; }
+  .nav .seg a { color:var(--muted); text-decoration:none; font-size:14px; font-weight:500; padding:6px 14px; border-radius:999px; }
+  .nav .seg a[aria-current="page"] { background:var(--ink); color:var(--bg); }
+  .nav .gh { color:var(--muted); font-size:14px; text-decoration:none; }
+  @media (max-width:560px) { .nav .gh { display:none; } }
+.doors { display:grid; grid-template-columns:1fr 1fr; gap:20px; padding:8px 0 64px; }
+  .door { display:block; background:var(--us); border-radius:18px; padding:30px 30px 28px; color:var(--ink); text-decoration:none; transition:transform .15s ease; }
+  .door:hover { transform:translateY(-2px); }
+  .door .k { font-size:13px; letter-spacing:.08em; text-transform:uppercase; color:var(--accent); margin-bottom:12px; }
+  .door h2 { font-family:Fraunces, Georgia, serif; font-weight:600; font-size:clamp(30px, 4vw, 40px); line-height:1.08; margin-bottom:12px; }
+  .door p { color:var(--muted); font-size:16px; }
+  .door .go { display:inline-block; margin-top:18px; font-weight:500; border-bottom:1px solid var(--ink); padding-bottom:2px; }
+  @media (max-width:760px) { .doors { grid-template-columns:1fr; } }
 </style>
 </head>
 <body>
@@ -77,217 +93,39 @@
   <header class="hero">
     <img class="logo" src="/logo.png" alt="Jori" width="112" height="112">
     <div class="tag">Open source</div>
-    <h1>Meet Jori,<br>your <em>AI coworker</em>.</h1>
-    <p class="lede">Customer email, answered. Meetings, scheduled and prepped. Business trips, planned and booked. Invoices and spend, watched. The weekly report, written before Monday. Jori takes on your team's busywork, day and night. <strong>It's private and secure by design, so your company's data stays your company's.</strong> And it's yours to shape, until it works exactly the way your business does.</p>
-    <div class="ctas">
-      <a class="btn" href="https://github.com/jori-ai/jori">Follow on GitHub</a>
-      <span class="link" style="border:0;color:var(--muted);font-weight:400">Be among the first to try it.</span>
-    </div>
+    <h1>Meet Jori.<br>AI for your life <em>and your work</em>.</h1>
+    <p class="lede">One assistant that stays on and takes care of the details, day and night. <strong>It's private and secure by design, so what it learns stays yours.</strong> And it's yours to shape, until it works exactly the way you do. All on the Claude subscription you already have.</p>
   </header>
+
+  <div class="doors">
+    <a class="door" href="/personal">
+      <div class="k">For you</div>
+      <h2>Your personal agent.</h2>
+      <p>Your inbox, handled. Your trips, planned and booked. The best table in town, wherever you land. Your money, watched. Your home, taken care of.</p>
+      <span class="go">Jori for you →</span>
+    </a>
+    <a class="door" href="/business">
+      <div class="k">For your business</div>
+      <h2>Your AI coworker.</h2>
+      <p>Customer email, answered. Meetings, scheduled and prepped. Business trips, planned and booked. Spend, watched. The weekly report, written before Monday.</p>
+      <span class="go">Jori for business →</span>
+    </a>
+  </div>
 
   <div class="pillars">
     <div>
-      <h3>Your company's data stays yours.</h3>
-      <p>Jori runs on servers you control, in your office or your own cloud account. What it learns about your customers, deals and people never ends up in someone else's product.</p>
+      <h3>Your data stays yours.</h3>
+      <p>Jori runs on a machine you control: a Mac mini, a server in the office or your own cloud account. What it learns never ends up in someone else's product.</p>
     </div>
     <div>
       <h3>Nothing hidden.</h3>
       <p>Open source, top to bottom. Every job is a plain-language playbook and every action is on the record, so you always know what it did and why.</p>
     </div>
     <div>
-      <h3>Shaped to your business.</h3>
-      <p>Teach it your processes, connect your tools and set your own rules. Jori works the way your team already does, not the other way around.</p>
+      <h3>Shaped to you.</h3>
+      <p>Teach it your routines, connect your tools and set your own rules. Anything risky waits for your yes.</p>
     </div>
   </div>
-
-  <section class="needs">
-    <h2>All it takes: two things you already have.</h2>
-    <p class="sub">No new platform to buy, no per-seat agent fees.</p>
-    <div class="cards">
-      <div class="card">
-        <div class="k">1 · Your Claude plan</div>
-        <h3>The one your team already uses.</h3>
-        <p>Jori works through your company's own Claude subscription, so there's no second AI bill and no meter running every time it does the work.</p>
-      </div>
-      <div class="card">
-        <div class="k">2 · A server that stays on</div>
-        <h3>A machine in the office or a small cloud server.</h3>
-        <p>Either way it's yours: Jori, its memory and everything it learns about your business live on a server you control and can wipe.</p>
-      </div>
-    </div>
-  </section>
-
-  <section class="compare">
-    <h2>How Jori compares</h2>
-    <p class="sub">Jori next to the leading AI coworkers as of October 2026.</p>
-    <div class="scroller">
-      <table>
-        <thead>
-          <tr>
-            <th></th>
-            <th class="us">Jori</th>
-            <th>Copilot<small>Microsoft 365</small></th>
-            <th>Gemini Enterprise<small>Google</small></th>
-            <th>OpenClaw<small>Open source</small></th>
-          </tr>
-        </thead>
-        <tbody>
-          <tr>
-            <th>Runs on</th>
-            <td class="us y">Your own server or cloud account</td>
-            <td>Microsoft's cloud</td>
-            <td>Google's cloud</td>
-            <td class="y">Your own Mac, Linux or Windows server</td>
-          </tr>
-          <tr>
-            <th>Your data lives</th>
-            <td class="us y">On infrastructure you control</td>
-            <td>Your Microsoft 365 tenant, their cloud</td>
-            <td>Google's cloud (US/EU region)</td>
-            <td class="y">On your own hardware</td>
-          </tr>
-          <tr>
-            <th>Source code</th>
-            <td class="us y">Open (Apache 2.0)</td>
-            <td class="n">Closed</td>
-            <td class="n">Closed</td>
-            <td class="y">Open (MIT)</td>
-          </tr>
-          <tr>
-            <th>Make it your own</th>
-            <td class="us y">Edit any rule or job; extend or fork</td>
-            <td class="p">Copilot Studio low-code agents</td>
-            <td class="p">No-code agents, ADK, MCP</td>
-            <td class="y">Fork it; skills and plugins</td>
-          </tr>
-          <tr>
-            <th>How you pay</th>
-            <td class="us y">The Claude plan you already have</td>
-            <td>$21–$30 per seat / mo, plus Microsoft 365</td>
-            <td>$21–$30+ per seat / mo</td>
-            <td>Free; your API key, per token</td>
-          </tr>
-          <tr>
-            <th>Always on, proactive</th>
-            <td class="us y">Yes: scheduled jobs and watches</td>
-            <td class="p">Studio triggers; inbox agent in preview</td>
-            <td class="y">Scheduled and triggered workflows</td>
-            <td class="y">Yes: cron, webhooks, checks</td>
-          </tr>
-        </tbody>
-      </table>
-    </div>
-    <p class="note">Based on each product's own docs, pricing pages and press as of October 2026; plans, prices and features change quickly. Prices are list per-seat prices, billed annually.</p>
-  </section>
-
-  <section class="compare caps">
-    <h2>What it takes off your plate</h2>
-    <p class="sub">All of this runs every day on Jori's reference installation.</p>
-    <div class="scroller">
-      <table>
-        <thead>
-          <tr>
-            <th></th>
-            <th class="us">Jori</th>
-            <th>Copilot<small>Microsoft 365</small></th>
-            <th>Gemini Enterprise<small>Google</small></th>
-            <th>OpenClaw<small>Open source</small></th>
-          </tr>
-        </thead>
-        <tbody>
-          <tr>
-            <th>Inbox triage<span class="d">Sorts every email as it lands into urgent, today and later, using rules it learns from you. Urgent mail reaches you at once and becomes a task that closes itself when you reply. Spam and phishing are blocked, unknown senders held, and it suggests better rules from your corrections every week.</span></th>
-            <td class="us y">Learned priorities, auto-closing tasks<sup>*</sup></td><td class="p">Outlook agent (preview)</td><td class="p">Gmail AI Inbox (US, English)</td><td class="p">Gmail triggers; triage is DIY</td>
-          </tr>
-          <tr>
-            <th>Customer &amp; vendor email<span class="d">Flags what needs an answer, chases threads that went quiet, and drafts or sends replies when you say so, always introducing itself as your assistant.</span></th>
-            <td class="us y">Follow-ups chased, replies on your say<sup>*</sup></td><td class="p">Drafts replies; you send</td><td class="p">Drafts; follow-ups need workflows</td><td class="p">Possible via skill; DIY</td>
-          </tr>
-          <tr>
-            <th>Calendar &amp; scheduling<span class="d">"Find an hour with the Acme team next week." Creates, moves and declines events from a sentence, warns about conflicts, never invites anyone unless you ask, and audits daily for invites it can't account for.</span></th>
-            <td class="us y">Create, move, decline; conflict checks<sup>*</sup></td><td class="y">Schedules, reschedules, conflicts</td><td class="y">Help me schedule</td><td class="p">Google Calendar via skill</td>
-          </tr>
-          <tr>
-            <th>Meetings<span class="d">Built-in Zoom integration: agendas sent ahead, and a summary with decisions and next steps for everyone on the call the moment it ends, filed to each person's page. Owners get reminded until each next step is done.</span></th>
-            <td class="us y">Zoom built in: summaries, next steps chased<sup>*</sup></td><td class="y">Agenda, notes, action items</td><td class="y">Meet notes with next steps</td><td class="p">Meeting plugins: notes, summary</td>
-          </tr>
-          <tr>
-            <th>Works where your team works<span class="d">Its own iPhone, iPad and Mac app, email to its own address, WhatsApp and iMessage. When it writes to customers or vendors, it always says it's an assistant.</span></th>
-            <td class="us y">Own app, email, WhatsApp, iMessage<sup>*</sup></td><td class="p">Teams, Outlook, web, mobile; no Slack</td><td class="y">Slack, Teams, web, mobile</td><td class="y">Slack, Teams, web, mobile + more</td>
-          </tr>
-          <tr>
-            <th>Daily brief &amp; digests<span class="d">A morning brief: today's meetings, open tasks and what changed overnight. One daily digest for all your newsletters, plus weekly and monthly reviews by email.</span></th>
-            <td class="us y">Morning brief, digests, weekly reviews<sup>*</sup></td><td class="p">Scheduled prompts, catch-ups</td><td class="p">Daily Brief rolling out</td><td class="y">Scheduled briefs via automations</td>
-          </tr>
-          <tr>
-            <th>"Tell me when…" watches<span class="d">Any condition becomes a watch: when a contract comes back signed, two days before a renewal, when a big customer goes quiet, at 9 tomorrow. It judges each match and asks when unsure.</span></th>
-            <td class="us y">Email, deadline or timed; can act<sup>*</sup></td><td class="p">Studio triggers; you build them</td><td class="p">Workflow triggers, reminders</td><td class="y">Reminders, cron, webhook triggers</td>
-          </tr>
-          <tr>
-            <th>Business travel<span class="d">Searches live fares, Google Flights and Hotels and Booking.com, and books once you approve. Every confirmation, change and cancellation in your email lands in one itinerary and your calendar, and flights are tracked live.</span></th>
-            <td class="us y">Search &amp; book with approval; live itinerary<sup>*</sup></td><td class="n">Trip research only, no booking</td><td class="n">Not offered</td><td class="u">Not documented</td>
-          </tr>
-          <tr>
-            <th>Expenses &amp; receipts<span class="d">Turns receipt emails into vendor, amount and card, recovers what each charge actually bought, and files contractor quotes and invoices.</span></th>
-            <td class="us y">Receipts parsed, charges explained<sup>*</sup></td><td class="p">Dynamics 365 add-on</td><td class="n">Not built in</td><td class="p">Community receipt skill</td>
-          </tr>
-          <tr>
-            <th>Finance ops<span class="d">Balances and transactions across your banks and cards, with alerts on late payments in, fees, overdraft risk, unusual or duplicate charges and subscription creep, plus a weekly review where every number is checked against the data. Read-only: it never moves money.</span></th>
-            <td class="us y">Spend alerts, verified weekly review<sup>*</sup></td><td class="p">Dynamics 365 add-on</td><td class="n">Not built in</td><td class="u">Not documented</td>
-          </tr>
-          <tr>
-            <th>Sales follow-up<span class="d">Every promise in an email becomes a follow-up, quiet threads get nudged, and its built-in CRM keeps itself current from your email and calls, so no one types anything in.</span></th>
-            <td class="us y">Follow-ups, built-in CRM<sup>*</sup></td><td class="y">Sales agent with your CRM</td><td class="p">Salesforce connector; DIY</td><td class="p">Community CRM skills</td>
-          </tr>
-          <tr>
-            <th>Reports<span class="d">Briefs, digests and weekly and monthly reviews, pulled from your tools, checked against the data and sent on schedule.</span></th>
-            <td class="us y">Scheduled, verified reports<sup>*</sup></td><td class="p">Scheduled prompts, Analyst</td><td class="p">Scheduled workflows, data agent</td><td class="p">Team reports plugin; else DIY</td>
-          </tr>
-          <tr>
-            <th>Company memory<span class="d">A living wiki of customers, vendors, decisions and how things are done here, with recall across all of it ("what did we promise Acme in March?"). Every fact is checked for contradictions before it's saved.</span></th>
-            <td class="us y">Company wiki with recall<sup>*</sup></td><td class="y">Copilot Memory + Work IQ</td><td class="y">Memories + indexed company data</td><td class="y">Persistent memory with search</td>
-          </tr>
-          <tr>
-            <th>Search everything<span class="d">One search across email, chats, docs, files and its own activity log.</span></th>
-            <td class="us y">Email, chats, docs, its own log<sup>*</sup></td><td class="y">Copilot Search + connectors</td><td class="y">Core feature, many connectors</td><td class="p">Its own memory only</td>
-          </tr>
-          <tr>
-            <th>People &amp; accounts<span class="d">A built-in CRM: a page for every customer, vendor and contact, built from your email and meetings: who they are, what was discussed and what's open.</span></th>
-            <td class="us y">Built-in CRM: a page per contact<sup>*</sup></td><td class="p">Summaries on request, no pages</td><td class="u">Not documented</td><td class="p">Memory-wiki entity pages</td>
-          </tr>
-          <tr>
-            <th>Documents &amp; research<span class="d">Research, summaries and drafts; reads PDFs and contracts; creates and edits Word, Excel and slides; hands long work to background agents.</span></th>
-            <td class="us y">Research, contracts, Office files<sup>*</sup></td><td class="y">Researcher, Analyst, Office</td><td class="y">Deep Research, NotebookLM</td><td class="y">Web search, PDFs, sub-agents</td>
-          </tr>
-          <tr>
-            <th>Works your web apps<span class="d">Uses the tools your team is already signed in to, even ones with no integration, and fixes a broken step the same day.</span></th>
-            <td class="us y">Signed-in web apps, same-day repair<sup>*</sup></td><td class="p">Computer use in Studio (credits)</td><td class="p">Agent in private preview</td><td class="y">Built-in browser, signed-in Chrome</td>
-          </tr>
-          <tr>
-            <th>Operations<span class="d">Watches your devices, services, API keys, app builds and deadlines around the clock, and tells you before anyone else notices.</span></th>
-            <td class="us y">24/7 checks, early warnings<sup>*</sup></td><td class="n">Not built in</td><td class="n">Not offered</td><td class="p">DIY via automations</td>
-          </tr>
-          <tr>
-            <th>Security watch<span class="d">Checks security news, breaches and vulnerable packages against the services and code your company actually uses, and sends a weekly summary.</span></th>
-            <td class="us y">Breaches + CVEs vs what you use<sup>*</sup></td><td class="p">Separate product (Security Copilot)</td><td class="n">Separate product (SecOps)</td><td class="u">Not documented</td>
-          </tr>
-          <tr>
-            <th>Improves itself<span class="d">Reviews its own week, finds the root cause of every failure overnight, watches its own costs and proposes upgrades for a person to approve.</span></th>
-            <td class="us y">Nightly root-cause, weekly self-review<sup>*</sup></td><td class="n">Maker-run evaluations only</td><td class="u">Not documented</td><td class="p">Learns procedures; no root-cause</td>
-          </tr>
-          <tr>
-            <th>Build new abilities<span class="d">New jobs are plain-language playbooks; new tools drop into your own folders; or ask in chat ("build me X") and it builds, tests and ships it for your approval.</span></th>
-            <td class="us y">Playbooks, "build me X" from chat<sup>*</sup></td><td class="y">Copilot Studio, Agent Builder</td><td class="y">Workflow Builder, ADK</td><td class="y">Skills, plugin SDK, ClawHub</td>
-          </tr>
-          <tr>
-            <th>Asks before risky actions<span class="d">Paying, buying, booking or writing to someone new waits for a person's approval.</span></th>
-            <td class="us y">Human approval on anything risky<sup>*</sup></td><td class="y">Tool-call approvals</td><td class="y">Review before acting for you</td><td class="p">Exec and plugin approvals</td>
-          </tr>
-        </tbody>
-      </table>
-    </div>
-    <p class="note"><sup>*</sup>Running today on the reference installation; landing in the open-source repo shortly. Competitor cells are from each product's own docs, announcements and press as of October 2026, including features still in preview. "Not documented" means we found no public source, not that it can't; "Not built in" and "Not offered" mean we found no such feature.</p>
-  </section>
 
   <footer>
     <span>© 2026 Jori</span>
