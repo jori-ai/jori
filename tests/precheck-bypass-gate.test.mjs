@@ -26,7 +26,7 @@ const SEND = path.join(ROOT, "bin/jori-send-curl");
 // A throwaway HOME so nothing here can reach the real Supabase or logs. The
 // gate runs long before any network call, so a fake key is enough.
 const HOME = fs.mkdtempSync(path.join(os.tmpdir(), "precheck-gate-"));
-fs.mkdirSync(path.join(HOME, "Dev/jori/tools"), { recursive: true });
+fs.mkdirSync(path.join(HOME, "Dev/jori"), { recursive: true });
 fs.writeFileSync(path.join(HOME, "Dev/jori/.env"), "SUPABASE_SERVICE_ROLE_KEY=fake\n");
 // A synthetic installation that adds its own brokerage intents to the kernel's
 // jori-model-only list (agent/local/config/send-intents.json).

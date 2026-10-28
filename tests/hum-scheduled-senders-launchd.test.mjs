@@ -25,7 +25,7 @@ test.after(() => fs.rmSync(TMP, { recursive: true, force: true }));
 function sandbox({ loaded = true, maxOk = true, queue = "", runningFor = 0 } = {}) {
   const home = fs.mkdtempSync(path.join(TMP, "home-"));
   const calls = path.join(home, "calls.log");
-  const tools = path.join(home, "Dev/jori/tools");
+  const tools = path.join(home, "Dev/jori");
   fs.mkdirSync(path.join(tools, "agent/logs"), { recursive: true });
   if (queue) write(path.join(tools, "data/hum-qual-delivery-queue.json"), queue);
   write(path.join(tools, "bin/hum-explore-run"),
@@ -128,7 +128,7 @@ test("the fallback tick waits for the delivery to finish before hum is dispatche
 test("under launchd the queued question is delivered only after the Max check; otherwise it stays queued", () => {
   const ok = sandbox({ queue: QUEUED });
   assert.equal(ok.script("run-hum-deliver-qual.sh").status, 0);
-  assert.match(ok.calls(), /^claude auth status --json\nnode \S+\/dev\/jori\/tools\/bin\/hum-deliver-qual$/m);
+  assert.match(ok.calls(), /^claude auth status --json\nnode \S+\/Dev\/jori\/bin\/hum-deliver-qual$/m);
   const held = sandbox({ queue: QUEUED, maxOk: false });
   assert.equal(held.script("run-hum-deliver-qual.sh").status, 0);
   assert.doesNotMatch(held.calls(), /^node /m);

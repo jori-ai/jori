@@ -236,7 +236,7 @@ describe("dead letter: ops supervisor end to end", { skip: !canChildListen() && 
   // fake that only writes its arguments to a file.
   async function boot({ ledger = [] } = {}) {
     tmp = fs.mkdtempSync(path.join(process.env.TMPDIR || os.tmpdir(), "hang-dl-"));
-    const root = path.join(tmp, "Dev/jori/tools");
+    const root = path.join(tmp, "Dev/jori");
     for (const d of ["bin", "data", "logs", "agent/ops-agent", "agent/supervisor", "agent/logs"]) fs.mkdirSync(path.join(root, d), { recursive: true });
     fs.symlinkSync(path.join(REPO_TOOLS, "lib"), path.join(root, "lib"));
     const sup = path.join(root, "agent/supervisor");

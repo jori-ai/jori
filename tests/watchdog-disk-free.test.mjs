@@ -272,7 +272,7 @@ test("critical pages on the second consecutive tick, once, on the system channel
     assert.ok([...page].length < 350, `page must stay under ~350 characters, got ${[...page].length}`);
     assert.ok(t2.args[0].includes("--channel") && t2.args[0].includes("system"), "pages go to the system channel");
     assert.equal(t2.duCalls.length, 1);
-    assert.match(t2.duCalls[0], /^-sk .*\/tools\/data\/memory-db-snapshots$/, "du sizes that one directory only");
+    assert.match(t2.duCalls[0], /^-sk .*\/data\/memory-db-snapshots$/, "du sizes that one directory only");
 
     assert.deepEqual(t.tick(CRIT).pages, [], "the 24h cooldown holds the third tick");
   } finally {

@@ -191,15 +191,15 @@ if (type === "code-fix") {
 // baseline requires a supervisor restart"); .mcp.json servers spawn with the
 // session.
 const BOOT_LOADED = [
-  /^tools\/agent\/supervisor\//,
-  /^tools\/agent\/phone-channel\//,
-  /^tools\/agent\/chat-supervisor\.mjs$/,
-  /^tools\/agent\/bin\/process-manager\.mjs$/,
-  /^tools\/agent\/config\/agents\.json$/,
-  /^tools\/agent\/[^/]*\/?CLAUDE\.md$/,
+  /^agent\/supervisor\//,
+  /^agent\/phone-channel\//,
+  /^agent\/chat-supervisor\.mjs$/,
+  /^agent\/bin\/process-manager\.mjs$/,
+  /^agent\/config\/agents\.json$/,
+  /^agent\/[^/]*\/?CLAUDE\.md$/,
   // the instance's local rules, appended to the system prompt at spawn beside them
-  /^tools\/agent\/local\/(shared|chat|ops)\.md$/,
-  /^tools\/agent\/[^/]+\/\.mcp\.json$/,
+  /^agent\/local\/(shared|chat|ops)\.md$/,
+  /^agent\/[^/]+\/\.mcp\.json$/,
 ];
 
 // --rebuild-of <approval id>: this card re-authors an approved card
