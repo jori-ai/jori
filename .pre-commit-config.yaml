@@ -1,0 +1,19 @@
+repos:
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.30.1
+    hooks:
+      - id: gitleaks
+        name: Detect hardcoded secrets
+
+  # Local hook — reject staged content that introduces a personal-identifier
+  # pattern not already in the accepted baseline. See
+  # docs/architecture-public-private.md for the kernel/overlay contract this
+  # hook enforces.
+  - repo: local
+    hooks:
+      - id: sanitize-guard
+        name: Block personal-identifier leaks (baseline-ratchet)
+        entry: .tools/sanitize-guard.py
+        language: system
+        pass_filenames: false
+        always_run: true

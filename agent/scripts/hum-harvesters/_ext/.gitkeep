@@ -1,0 +1,11 @@
+# Installation hum harvesters.
+#
+# A harvester placed here (`<topic>.mjs`, same shape as the bundled ones in the
+# parent dir) runs when data/hum-interests.json enables a topic whose script is
+# that file name: agent/scripts/hum-harvest-all.mjs resolveHarvesterPath looks
+# in the kernel dir first, then here. A bundled harvester wins on a name. Add
+# the topic's lane to agent/local/config/hum-lanes.json (extend_place_bound /
+# extend_operational) when it is location-bound or operational.
+#
+# Everything here except this file is gitignored — see .gitignore and
+# docs/architecture-public-private.md.

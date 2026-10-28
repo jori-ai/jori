@@ -1,0 +1,17 @@
+{
+  "name": "jori-telemetry",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Tiny Vercel edge function for jori's README pixel + first-run install ping.",
+  "scripts": {
+    "deploy": "vercel --prod",
+    "deploy:preview": "vercel"
+  },
+  "dependencies": {
+    "@upstash/redis": "^1.34.0"
+  },
+  "devDependencies": {
+    "@types/node": "^25.9.3",
+    "typescript": "^6.0.3"
+  }
+}
