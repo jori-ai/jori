@@ -1,0 +1,50 @@
+#!/usr/bin/env node
+// jori-overlay — the installation's private overlay (lib/overlay.cjs).
+//
+// Usage:
+//   jori-overlay init <repo-url-or-path>   check the overlay out over this install
+//   jori-overlay git <args…>               git against the overlay (status, add, commit, push…)
+//   jori-overlay sync-excludes             refresh the kernel repo's exclude block
+//   jori-overlay check [--staged]          exit 1 when the two repos overlap (pre-commit, doctor)
+//   jori-overlay status                    overlay git dir and file count
+//
+// After `git add`/`git rm` in the overlay, run sync-excludes (git commits do it
+// for you: `jori-overlay git commit …` refreshes the block afterwards).
+"use strict";
+const ov = require("../lib/overlay.cjs");
+
+function main(argv) {
+  const [cmd, ...rest] = argv;
+  switch (cmd) {
+    case "init": {
+      if (!rest[0]) { process.stderr.write("usage: jori-overlay init <repo-url-or-path>\n"); return 2; }
+      const r = ov.init(rest[0]);
+      process.stdout.write(`jori-overlay: checked out ${r.files} overlay file(s) at ${ov.overlayGitDir()}\n`);
+      return 0;
+    }
+    case "git": {
+      try { ov.overlayGit(rest, undefined, { stdio: "inherit" }); }
+      catch (e) { return e.status || 1; }
+      if (["add", "rm", "mv", "commit", "pull", "merge", "reset", "checkout", "restore"].includes(rest[0])) ov.syncExcludes();
+      return 0;
+    }
+    case "sync-excludes":
+      process.stdout.write(`jori-overlay: ${ov.syncExcludes()} overlay file(s) excluded from the kernel repo\n`);
+      return 0;
+    case "check": {
+      const issues = ov.check({ staged: rest.includes("--staged") });
+      for (const i of issues) process.stderr.write(`jori-overlay: ${i}\n`);
+      return issues.length ? 1 : 0;
+    }
+    case "status":
+      if (!ov.hasOverlay()) { process.stdout.write("jori-overlay: no overlay\n"); return 0; }
+      process.stdout.write(`jori-overlay: ${ov.overlayFiles().length} file(s) in ${ov.overlayGitDir()}\n`);
+      return 0;
+    default:
+      process.stderr.write("usage: jori-overlay init|git|sync-excludes|check [--staged]|status\n");
+      return 2;
+  }
+}
+
+if (require.main === module) process.exit(main(process.argv.slice(2)));
+module.exports = { main };

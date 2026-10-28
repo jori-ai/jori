@@ -1179,6 +1179,16 @@ function cmdDoctor(args) {
   }
   add('cron → scripts exist', missingScripts.length === 0, missingScripts.length ? `missing: ${missingScripts.join(', ')}` : `${cronLines.length} cron entries, all targets exist`);
 
+  // 1b. the install's private overlay (lib/overlay.cjs), when it has one:
+  // nothing tracked by both repos, the kernel repo's exclude block current.
+  {
+    const overlay = require(path.join(__dirname, '..', 'lib', 'overlay.cjs'));
+    if (overlay.hasOverlay()) {
+      const issues = overlay.check();
+      add('overlay kept apart from the kernel repo', issues.length === 0, issues.length ? issues.join('; ') : `${overlay.overlayFiles().length} overlay files, none tracked by the kernel repo`);
+    }
+  }
+
   // 2. trigger-*.sh → tasks.json
   const scriptsDir = path.join(TOOLS, 'agent/scripts');
   const triggerScripts = fs.readdirSync(scriptsDir).filter(f => f.startsWith('trigger-') && f.endsWith('.sh'));
