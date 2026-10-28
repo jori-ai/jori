@@ -30,7 +30,7 @@ test.after(() => fs.rmSync(TMP, { recursive: true, force: true }));
 function sandbox({ loaded = false, repoPlist = REPO_PLIST, installed = null, bootstrapFails = false } = {}) {
   const home = fs.mkdtempSync(path.join(TMP, "home-"));
   const calls = path.join(home, "calls.log"), mark = path.join(home, "loaded");
-  const tools = path.join(home, "Dev/jori/tools");
+  const tools = path.join(home, "Dev/jori");
   fs.mkdirSync(path.join(tools, "agent/logs"), { recursive: true });
   if (loaded) write(mark, "");
   if (repoPlist) write(path.join(tools, `agent/launch-agents/${LABEL}.plist`), repoPlist, 0o644);
@@ -58,7 +58,7 @@ esac
   return {
     dst,
     // The repo plist is a template: what lands in ~/Library/LaunchAgents is it rendered for this HOME.
-    rendered: (repoPlist || "").replaceAll("__JORI_TOOLS__", path.join(home, "Dev/jori/tools")).replaceAll("__JORI_HOME__", path.join(home, "Dev/jori")).replaceAll("__HOME__", home),
+    rendered: (repoPlist || "").replaceAll("__JORI_TOOLS__", path.join(home, "Dev/jori")).replaceAll("__JORI_HOME__", path.join(home, "Dev/jori")).replaceAll("__HOME__", home),
     // As strict as the strictest callers (the trigger scripts that run under set -euo pipefail).
     kick: () => spawnSync("/bin/bash", ["-c", `set -euo pipefail\nsource "${LIB}"\nlaunchd_kick ${LABEL} hum-explore`],
       { env, encoding: "utf8", timeout: 30000 }),

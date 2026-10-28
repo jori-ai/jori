@@ -232,7 +232,7 @@ describe("chat quota: supervisor end to end", { skip: !canChildListen() && "chil
   // process the test starts in it.
   function sandbox() {
     tmp = fs.mkdtempSync(path.join(process.env.TMPDIR || os.tmpdir(), "chat-quota-"));
-    const root = path.join(tmp, "Dev/jori/tools");
+    const root = path.join(tmp, "Dev/jori");
     for (const d of ["bin", "data", "agent/chat-agent", "agent/logs"]) fs.mkdirSync(path.join(root, d), { recursive: true });
     const sends = path.join(tmp, "sends.log");
     fs.writeFileSync(path.join(root, "bin/jori-send-curl"), `#!/bin/sh\nprintf '%s\\n' "$*" >> "${sends}"\n`, { mode: 0o755 });
