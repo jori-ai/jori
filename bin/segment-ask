@@ -41,10 +41,10 @@ from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 # REPO: the installation (its bin/, data/ and .env), lib/root.cjs installRoot().
-REPO = os.environ.get("JORI_HOME") or os.path.expanduser("~/Dev/jori")
-ENV_FILE = os.path.join(REPO, ".env")
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "lib"))
 import places_local  # noqa: E402  (kernel: instance identity + local config)
+REPO = places_local.install_root()
+ENV_FILE = os.path.join(REPO, ".env")
 
 
 def _supabase_url():

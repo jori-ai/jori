@@ -79,7 +79,9 @@ from datetime import datetime, timedelta, timezone
 
 # The installation root (lib/root.cjs installRoot()): its data/, .env and secrets/
 # sit directly under it since the 2026-10-28 move off ~/Dev/gandalf/tools.
-INSTALL_ROOT = os.environ.get("JORI_HOME") or os.path.expanduser("~/Dev/jori")
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "lib"))
+import places_local  # noqa: E402  (kernel: install root, instance, local config)
+INSTALL_ROOT = places_local.install_root()
 DATA_DIR = os.path.join(INSTALL_ROOT, "data")
 CONFIRMED_FILE = os.path.join(DATA_DIR, "confirmed-stops.json")
 # Where `withdraw` keeps what it took out of CONFIRMED_FILE: a JSON list, each
@@ -986,7 +988,7 @@ def _place_label(answer: str, stop: str | None = None, guess: str | None = None)
     the model tell which of several places he named was this stop. None if he
     hedged, asked, named another or an unclear stop, or the model failed or timed
     out: the answer then stays row-only, as before."""
-    node = shutil.which("node") or "/opt/homebrew/bin/node"
+    node = shutil.which("node") or "node"  # cron-run puts node on PATH
     try:
         r = subprocess.run([node, LABEL_READER],
                            input=json.dumps({"text": answer, "stop": stop, "guess": guess}),

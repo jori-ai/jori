@@ -89,7 +89,8 @@ set -uo pipefail
 #     Removes the lock file. Always exits 0 (idempotent — releasing a lock
 #     you don't hold, or that's already gone, is a no-op, not an error).
 
-LOCK_DIR="$HOME/Dev/jori/data/locks"
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../agent/scripts/lib/root.sh"   # JORI_INSTALL_TOOLS
+LOCK_DIR="$JORI_INSTALL_TOOLS/data/locks"
 mkdir -p "$LOCK_DIR"
 
 CMD="${1:-}"
