@@ -1,0 +1,216 @@
+#!/usr/bin/env node
+// dns-health-check — measure whether the host's DNS RESOLVER is failing, as
+// distinct from any one vendor being unreachable.
+//
+// Why this exists: a recurring "gmail.googleapis.com unreachable (ENOTFOUND)"
+// alert drew a long run of Gmail-shaped fixes (retry layers, pacing, backoff,
+// diagnostics, streak and provenance gates). Each fixed a real adjacent bug;
+// none stopped the condition, because the condition was not Gmail-shaped.
+//
+// An earlier diagnosis concluded the failure was "scoped to one agent turn's
+// network path", reasoning from the fact that no ten-minute batch was ever
+// MIXED — a batch either fully succeeded or fully failed. That observation is
+// correct. The inference is not: a process whose resolver is wedged also fails
+// every request it makes, and produces exactly the same all-or-nothing shape.
+//
+// What a later pass measured: the identical getaddrinfo failure hit UNRELATED
+// VENDORS from UNRELATED PROCESSES — a cron process, not an agent turn, logged
+// dozens of ENOTFOUND records against a Supabase host, and more against
+// oauth2.googleapis.com. So the fault was not in Gmail, not in the Gmail
+// client, and not in one agent turn's network path. It was the host resolver.
+//
+// The point of this tool is to stop that argument being re-litigated from
+// scraped log lines. It resolves several hostnames belonging to deliberately
+// INDEPENDENT vendors and records the verdict, so the next investigation reads
+// a time series instead of guessing:
+//
+//   ok            every control name resolved
+//   vendor        exactly one vendor failed — that vendor really is the problem
+//   resolver-down two or more independent vendors failed at the same instant,
+//                 which no vendor outage explains
+//
+// It is deliberately inert: it resolves names, appends one JSON line, and
+// exits. It sends nothing, pages nobody, restarts nothing, and touches no
+// state any other job reads. Wiring it to a schedule is a separate, explicit
+// step (see --help).
+
+const dns = require("node:dns").promises;
+const fs = require("node:fs");
+const path = require("node:path");
+const os = require("node:os");
+
+// Independent vendors on purpose. A single vendor's outage can take out its
+// own name; it cannot take out four at once. api.anthropic.com is included
+// because the Max-auth refresh failures ("OAuth session expired and could not
+// be refreshed") kept landing on the same nights as the Gmail ones, and this
+// is the cheapest way to find out whether that correlation is real.
+const CONTROLS = [
+  { host: "gmail.googleapis.com", vendor: "google" },
+  { host: "api.anthropic.com", vendor: "anthropic" },
+  { host: "one.one.one.one", vendor: "cloudflare" },
+  { host: "aws.amazon.com", vendor: "aws" },
+];
+
+const LOOKUP_TIMEOUT_MS = Number(process.env.DNS_HEALTH_TIMEOUT_MS || 5000);
+const LOG =
+  process.env.DNS_HEALTH_LOG ||
+  require("../lib/root.cjs").installTools("data/logs/dns-health.jsonl");
+
+function usage() {
+  process.stdout.write(
+    [
+      "usage: dns-health-check [--json] [--quiet]",
+      "       dns-health-check --summary [--since-hours N]",
+      "",
+      "Resolves one hostname per independent vendor and records the verdict to",
+      "data/logs/dns-health.jsonl (override with DNS_HEALTH_LOG).",
+      "",
+      "exit 0  ok            every control name resolved",
+      "exit 1  vendor        exactly one vendor failed to resolve",
+      "exit 2  resolver-down two or more independent vendors failed at once",
+      "",
+      "This tool never sends a message and never operates the machine. It is",
+      "opt-in: nothing calls it until someone schedules it. To sample every",
+      "five minutes, add to the crontab:",
+      "",
+      `  */5 * * * * ${path.resolve(__filename)} --quiet`,
+      "",
+    ].join("\n") + "\n",
+  );
+}
+
+async function lookupOne(entry) {
+  const started = Date.now();
+  try {
+    const res = await Promise.race([
+      dns.lookup(entry.host),
+      new Promise((_, reject) =>
+        setTimeout(() => {
+          const e = new Error(`dns.lookup timed out after ${LOOKUP_TIMEOUT_MS}ms`);
+          e.code = "ETIMEDOUT";
+          reject(e);
+        }, LOOKUP_TIMEOUT_MS),
+      ),
+    ]);
+    return { ...entry, ok: true, address: res.address, ms: Date.now() - started };
+  } catch (err) {
+    return {
+      ...entry,
+      ok: false,
+      code: err.code || "UNKNOWN",
+      error: err.message,
+      ms: Date.now() - started,
+    };
+  }
+}
+
+// Verdict is arithmetic over which vendors resolved — deterministic code owns
+// this, there is no language judgment in it.
+function verdictFor(results) {
+  const failedVendors = new Set(results.filter((r) => !r.ok).map((r) => r.vendor));
+  if (failedVendors.size === 0) return "ok";
+  if (failedVendors.size === 1) return "vendor";
+  return "resolver-down";
+}
+
+const EXIT_BY_VERDICT = { ok: 0, vendor: 1, "resolver-down": 2 };
+
+function appendLog(record) {
+  try {
+    fs.mkdirSync(path.dirname(LOG), { recursive: true });
+    fs.appendFileSync(LOG, JSON.stringify(record) + "\n");
+  } catch (err) {
+    // A diagnostic that cannot write its own log must still report its finding
+    // on stdout. Never let bookkeeping swallow the measurement.
+    process.stderr.write(`dns-health-check: could not append ${LOG}: ${err.message}\n`);
+  }
+}
+
+function readLog() {
+  try {
+    return fs
+      .readFileSync(LOG, "utf8")
+      .split("\n")
+      .filter(Boolean)
+      .map((line) => {
+        try {
+          return JSON.parse(line);
+        } catch {
+          return null;
+        }
+      })
+      .filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
+function summarize(sinceHours) {
+  const cutoff = Date.now() - sinceHours * 3600 * 1000;
+  const rows = readLog().filter((r) => Date.parse(r.ts) >= cutoff);
+  if (!rows.length) {
+    process.stdout.write(`no dns-health samples in the last ${sinceHours}h (${LOG})\n`);
+    return 0;
+  }
+  const byVerdict = {};
+  const failsByHost = {};
+  for (const r of rows) {
+    byVerdict[r.verdict] = (byVerdict[r.verdict] || 0) + 1;
+    for (const c of r.controls || []) {
+      if (!c.ok) failsByHost[c.host] = (failsByHost[c.host] || 0) + 1;
+    }
+  }
+  const lines = [
+    `${rows.length} samples over the last ${sinceHours}h (${rows[0].ts} → ${rows[rows.length - 1].ts})`,
+    ...Object.entries(byVerdict)
+      .sort((a, b) => b[1] - a[1])
+      .map(([v, n]) => `  ${v.padEnd(14)} ${n} (${((n / rows.length) * 100).toFixed(1)}%)`),
+  ];
+  const hostFails = Object.entries(failsByHost).sort((a, b) => b[1] - a[1]);
+  if (hostFails.length) {
+    lines.push("  failures by host:");
+    for (const [host, n] of hostFails) lines.push(`    ${host} ${n}`);
+  }
+  process.stdout.write(lines.join("\n") + "\n");
+  return 0;
+}
+
+async function main() {
+  const argv = process.argv.slice(2);
+  if (argv.includes("--help") || argv.includes("-h")) {
+    usage();
+    return 0;
+  }
+  if (argv.includes("--summary")) {
+    const i = argv.indexOf("--since-hours");
+    const hours = i >= 0 && argv[i + 1] ? Number(argv[i + 1]) : 24;
+    return summarize(Number.isFinite(hours) && hours > 0 ? hours : 24);
+  }
+
+  const controls = await Promise.all(CONTROLS.map(lookupOne));
+  const verdict = verdictFor(controls);
+  const record = {
+    ts: new Date().toISOString(),
+    verdict,
+    failed: controls.filter((c) => !c.ok).map((c) => `${c.host}:${c.code}`),
+    controls,
+  };
+  appendLog(record);
+
+  if (argv.includes("--json")) {
+    process.stdout.write(JSON.stringify(record, null, 2) + "\n");
+  } else if (!argv.includes("--quiet")) {
+    const detail = record.failed.length ? ` — failed: ${record.failed.join(", ")}` : "";
+    process.stdout.write(`${verdict}${detail}\n`);
+  }
+  return EXIT_BY_VERDICT[verdict];
+}
+
+main().then(
+  (code) => process.exit(code),
+  (err) => {
+    // Failing open: a broken diagnostic must not look like a broken network.
+    process.stderr.write(`dns-health-check: internal error: ${err && err.message}\n`);
+    process.exit(0);
+  },
+);

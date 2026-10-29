@@ -1,0 +1,476 @@
+#!/usr/bin/env node
+// jori-calendar — the only sanctioned path for writing to the user's calendar.
+//
+// THE RULE (agent/CLAUDE.md § Calendar Invitations, marked top-tier):
+// every calendar event Jori creates or updates has zero attendees other than
+// the user (the organizer). The only valid authorization is an explicit ask
+// from the user in this conversation or in the dispatched task.
+//
+// WHY THIS IS A BINARY AND NOT A PARAGRAPH. The rule's harm is the least
+// reversible in the whole system — a third party receives a notification and
+// nothing takes that back — and a written rule alone did not hold: events were
+// auto-inviting a household member by default for weeks while the rule sat in
+// the prompt. Prose does not hold; this does.
+//
+// WHY THE FLAG TAKES A QUOTE. `--attendee-authorized "<what the user said>"`
+// requires pasting the user's actual words, not flipping a boolean. A boolean can be
+// set reflexively by an agent that believes it has authorization; a quote
+// cannot be produced unless something was actually said. The quote is also what
+// the nightly audit reads to tell an authorized invite from an unauthorized
+// one, so it is evidence, not ceremony.
+//
+// WHY THE GUARD READS EVERY ATTENDEE-CARRYING FLAG, NOT JUST --attendees
+// (2026-09-04). The guard used to key on `--attendees` alone, and everything it
+// did not recognise was forwarded to gog verbatim by the passthrough at the
+// bottom of this file. gog also has `--add-attendee` (additive; the flag you
+// reach for when adding one person to an event that already has guests), and
+// its parser accepts the `--flag=value` form of both. Either spelling walked
+// straight past the refusal below, was recorded in the audit log as
+// `attendees: []`, and — because the send-updates default keys off the same
+// empty list — was delivered with `--send-updates none`. That fired for real on
+// in practice: several show events had a guest added, silently, with the
+// audit log unable to say who had been invited. Nothing malicious; the
+// caller even passed the quote. But a guard you can miss by picking the more
+// correct-looking flag is not a guard. So: known attendee flags are parsed and
+// guarded, and any UNRECOGNISED attendee-carrying flag is refused outright
+// rather than forwarded (exit 6) — deny-by-default, so a future gog release
+// cannot quietly reopen this by adding a third spelling.
+//
+// WHY CREATE ALSO GUARDS AGAINST OVERLAP. Asked to put a lunch on the calendar,
+// an agent found a plain "Lunch" placeholder already in that exact slot,
+// created earlier the same day — and instead of amending it, created a second,
+// overlapping event. Same root
+// shape as the attendee bypass above: a decision that is pure geometry (does an
+// existing event's [start,end) overlap the one about to be created?) was left to
+// a single turn's judgment instead of being enforced in code (agent/CLAUDE.md
+// § Rule 0b — code owns geometry, a model owns language). So `create` now reads
+// the target window back from Google before writing, and refuses when an opaque
+// (busy) event already occupies it, pointing the caller at `update` instead.
+//
+// WHAT THIS DOES NOT CLOSE. Bash is open to every agent, so a determined turn
+// can call `gog calendar` directly. Three further layers cover that: the MCP
+// write tools are removed from every agent's grant (agent/config/
+// agents.json), a pre-commit lint fails new code that calls gog/gcal directly,
+// and `calendar-attendee-audit` reconciles Google against this binary's log
+// nightly. Prevention where possible, detection where not.
+//
+// Usage:
+//   jori-calendar create --calendar primary --summary "…" --from <RFC3339> --to <RFC3339> [gog flags…]
+//   jori-calendar update <eventId> --calendar primary [gog flags…]
+//   jori-calendar delete <eventId> --calendar primary
+//   …plus, only when the user actually asked:
+//     --attendees a@b.com,c@d.com     (create or update; on update this REPLACES the guest list)
+//     --add-attendee a@b.com          (update only; preserves existing guests)
+//     --attendee-authorized "invite Sam to dinner Friday"
+//   …and, only when a create's window genuinely should overlap an existing event:
+//     --overlap-ok "<why this really is a second, separate event>"
+//   …and on update of an event the user made (see below):
+//     --from-confirmation <gmail messageId>   the booking's confirmation email licenses changing time/name/details
+//     --jori-event <job>                   this id came from <job>'s own earlier create
+
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { spawnSync } from "node:child_process";
+import { createRequire } from "node:module";
+
+const require = createRequire(import.meta.url);
+const { instance, localConfig, localDir } = require("../lib/instance.cjs");
+const { installRoot } = require("../lib/root.cjs");
+
+// gog: an explicit override, else a package-manager install (launchd's PATH
+// has neither), else PATH.
+const GOG = process.env.JORI_CALENDAR_GOG_BIN || process.env.GOG_BIN
+  || ["/opt/homebrew/bin/gog", "/usr/local/bin/gog"].find((p) => fs.existsSync(p)) || "gog";
+const LOG = process.env.JORI_CALENDAR_LOG_FILE || path.join(installRoot(), "data/logs/calendar-writes.jsonl");
+// The calendar account: the owner's address (agent/local/instance.json). None
+// configured: gog's own default account.
+const ACCOUNT = instance().owner_email;
+const ACCOUNT_ARGS = ACCOUNT ? ["--account", ACCOUNT] : [];
+// agent/local/config/calendar.json: `self_addresses` — the owner's other
+// addresses, which are the organizer too and never count as attendees.
+const CAL = localConfig("calendar", { self_addresses: [] });
+
+// The user is the organizer, never an "attendee" in the sense this guard
+// cares about. Everyone else requires the user's explicit, quoted ask.
+const SELF = new Set(["primary", "self", ...[ACCOUNT, ...(CAL.self_addresses || [])].filter(Boolean).map((a) => String(a).toLowerCase())]);
+
+// This installation's standing invitation rules (who is covered, which helper
+// asks first), printed with the attendee refusal: a plain-text file in the
+// private local dir, agent/local/calendar/attendee-notes.txt. None = nothing extra.
+function attendeeNotes() {
+  try { return fs.readFileSync(path.join(localDir(), "calendar", "attendee-notes.txt"), "utf8").replace(/\n+$/, "").split("\n"); }
+  catch { return []; }
+}
+
+// A quote shorter than this is not a quote, it is a shrug. The point of the
+// flag is that it cannot be satisfied without something having been said.
+const MIN_AUTHORIZATION_CHARS = 12;
+
+// The overlap override is a much lower-harm class than the attendee one above —
+// nobody outside this calendar is ever notified, and a wrong call is fixable by
+// deleting the extra event — so this just needs to not be a reflexive shrug,
+// not to reproduce the user's literal words.
+const MIN_OVERLAP_OK_CHARS = 8;
+
+// gog flags that mention guests but cannot add one — permission toggles only.
+const GUEST_PERMISSION_FLAGS = new Set([
+  "--guests-can-invite",
+  "--guests-can-modify",
+  "--guests-can-see-others",
+]);
+
+// lang-regex-ok: matches a CLI FLAG NAME — machine-generated structure from
+// gog's own flag surface — never anything a person wrote. Deliberately broad
+// so an unknown future spelling is refused rather than forwarded.
+const ATTENDEE_FLAG_RE = /attendee|invitee|^--guests?$/;
+
+const argv = process.argv.slice(2);
+const cmd = argv.shift();
+
+// Accepts both `--name value` and `--name=value`; gog's parser takes either, so
+// a guard that only understood the spaced form was bypassable by typing an `=`.
+function flag(name, hasValue = true) {
+  const i = argv.findIndex((a) => a === name || (hasValue && typeof a === "string" && a.startsWith(`${name}=`)));
+  if (i < 0) return undefined;
+  const tok = argv[i];
+  if (!hasValue) { argv.splice(i, 1); return true; }
+  if (tok !== name) { argv.splice(i, 1); return tok.slice(name.length + 1); }
+  const v = argv[i + 1];
+  argv.splice(i, 2);
+  return v;
+}
+
+// Same lookup as flag(), but non-destructive: `--from`/`--to` are real gog
+// flags that must still reach gog via the argv passthrough at the bottom of
+// this file, so the overlap guard below only needs to READ them, never remove
+// them from argv.
+function peekFlag(name) {
+  const i = argv.findIndex((a) => a === name || (typeof a === "string" && a.startsWith(`${name}=`)));
+  if (i < 0) return undefined;
+  const tok = argv[i];
+  if (tok !== name) return tok.slice(name.length + 1);
+  return argv[i + 1];
+}
+
+function die(lines, code = 2) {
+  for (const l of [].concat(lines)) console.error(l);
+  process.exit(code);
+}
+
+function parseAttendees(raw) {
+  return (raw || "")
+    .split(",")
+    .map((s) => s.trim().toLowerCase())
+    .filter(Boolean)
+    .filter((a) => !SELF.has(a));
+}
+
+if (!cmd || !["create", "update", "delete"].includes(cmd)) {
+  die([
+    "Usage: jori-calendar create|update|delete [<eventId>] --calendar <id> [gog flags…]",
+    "",
+    "This wraps `gog calendar` and enforces the attendee rule. Adding anyone other",
+    "than the user requires --attendee-authorized \"<the user's actual words>\".",
+    "See agent/CLAUDE.md § Calendar Invitations.",
+  ]);
+}
+
+const eventId = (cmd === "update" || cmd === "delete") ? argv.shift() : null;
+if ((cmd === "update" || cmd === "delete") && !eventId) die(`jori-calendar ${cmd}: <eventId> is required`);
+
+const calendar = flag("--calendar") || "primary";
+const attendeesRaw = flag("--attendees") || "";
+const addAttendeeRaw = flag("--add-attendee") || "";
+const authorization = flag("--attendee-authorized") || "";
+const sendUpdates = flag("--send-updates");
+const dryRun = flag("--dry-run", false);
+const overlapOk = flag("--overlap-ok") || "";
+const fromConfirmation = flag("--from-confirmation") || "";
+const joriEventClaim = flag("--jori-event") || "";
+
+// ── Positional sanity, before anything is logged ──────────────────────────
+// `jori-calendar update --help` used to shift "--help" in as the eventId and
+// write a real audit row for it; `jori-calendar update primary <id>` (gog's
+// own argument order) shifted the CALENDAR in as the eventId and sent gog a
+// malformed call. Both are in the live log. Neither is an invite, but an audit
+// trail with junk rows is a worse audit trail.
+if (eventId && eventId.startsWith("--")) {
+  die([
+    `jori-calendar ${cmd}: "${eventId}" is a flag, not an event id.`,
+    `Usage: jori-calendar ${cmd} <eventId> --calendar <id> [gog flags…]`,
+  ]);
+}
+if (eventId && eventId === calendar) {
+  die([
+    `jori-calendar ${cmd}: "${eventId}" is the calendar, not an event id.`,
+    "This wrapper takes the event id positionally and the calendar as a flag —",
+    "the opposite of `gog calendar update <calendarId> <eventId>`.",
+    `Usage: jori-calendar ${cmd} <eventId> --calendar ${calendar} [gog flags…]`,
+  ]);
+}
+
+const replaceAttendees = parseAttendees(attendeesRaw);
+const addAttendees = parseAttendees(addAttendeeRaw);
+const attendees = [...new Set([...replaceAttendees, ...addAttendees])];
+
+if (cmd === "create" && addAttendees.length) {
+  die([
+    "jori-calendar create: --add-attendee only exists on `update` (there is no",
+    "existing guest list to preserve on a new event). Use --attendees instead.",
+  ]);
+}
+
+// ── Nothing attendee-shaped may be forwarded unread ───────────────────────
+// Everything left in argv is passed to gog verbatim at the bottom of this file.
+// If any of it could carry a guest, the guard above never saw it — so refuse
+// instead of forwarding. This is the check that would have caught the silent guest adds above.
+const smuggled = argv.filter((tok) => {
+  if (typeof tok !== "string" || !tok.startsWith("--")) return false;
+  const name = tok.split("=")[0];
+  if (GUEST_PERMISSION_FLAGS.has(name)) return false;
+  return ATTENDEE_FLAG_RE.test(name);
+});
+if (smuggled.length) {
+  die([
+    `REFUSED: ${smuggled.join(", ")} would add guests without passing this guard.`,
+    "",
+    "Attendees must go through a flag this wrapper understands, so that the",
+    "authorization check runs and the audit log records who was actually invited:",
+    "  --attendees a@b.com,c@d.com   (create or update; on update REPLACES the list)",
+    "  --add-attendee a@b.com        (update only; preserves existing guests)",
+    "…each with --attendee-authorized \"<what the user actually said>\".",
+    "",
+    "If you are seeing this for a flag that cannot add anyone, it needs adding to",
+    "GUEST_PERMISSION_FLAGS in this file — deliberately, not reflexively.",
+    "See agent/CLAUDE.md § Calendar Invitations.",
+  ], 6);
+}
+
+// ── The attendee guard ─────────────────────────────────────────────────────
+if (attendees.length && authorization.trim().length < MIN_AUTHORIZATION_CHARS) {
+  die([
+    `REFUSED: this would invite ${attendees.length} person(s) other than the user: ${attendees.join(", ")}`,
+    "",
+    "Every calendar event Jori creates has zero attendees other than the user,",
+    "unless the user explicitly asked for someone to be added — in this conversation or",
+    "in the dispatched task. This is a top-tier rule and an irreversible action:",
+    "an unwanted invite reaches a real person and cannot be recalled.",
+    "",
+    "What does NOT count as authorization:",
+    "  · \"it's almost always the same person\" · two tickets implying a couple",
+    "  · an invitee list on a forwarded email · a pattern you have learned",
+    "",
+    ...(() => { const n = attendeeNotes(); return n.length ? [...n, ""] : []; })(),
+    "If the user asked, pass the user's words:",
+    '  --attendee-authorized "invite Sam to dinner Friday"',
+    "",
+    "If not, create it silent and ask:",
+    '  jori-send-curl "<event> — invite <person>? (yes/no)"',
+    "On yes, re-run with the authorization.",
+    "",
+    "See agent/CLAUDE.md § Calendar Invitations.",
+  ], 4);
+}
+
+// ── The overlap guard (create only) ─────────────────────────────────────────
+// See the overlap note in the header. Scoped to `create`: `update`/`delete` already
+// operate on a known eventId, so there is no "which event did you mean"
+// ambiguity for them to resolve. Scoped to OPAQUE (busy) existing events,
+// mirroring the calendar-scheduling skill's own busy/free rule — a transparent
+// awareness event sitting in the window is not a double-booking.
+//
+// Fails OPEN, unlike the attendee guard above: a missed duplicate is a
+// recoverable annoyance (delete the extra event), while refusing every create
+// because a single read call hiccuped would be a worse regression than the bug
+// this fixes. Only the irreversible-harm guard (inviting a third party) fails
+// closed in this file.
+if (cmd === "create") {
+  const from = peekFlag("--from");
+  const to = peekFlag("--to");
+  if (from && to) {
+    const probe = spawnSync(GOG, [
+      "calendar", "events", calendar,
+      ...ACCOUNT_ARGS, "--no-input", "-j",
+      "--from", from, "--to", to,
+    ], { encoding: "utf8" });
+    if (probe.status === 0 && probe.stdout) {
+      let items = [];
+      try { items = JSON.parse(probe.stdout).items || []; } catch { items = []; }
+      const overlapping = items.filter((e) =>
+        e && e.status !== "cancelled" && (e.transparency || "opaque") !== "transparent"
+      );
+      if (overlapping.length && overlapOk.trim().length < MIN_OVERLAP_OK_CHARS) {
+        die([
+          `REFUSED: ${overlapping.length} existing event(s) already occupy this slot on "${calendar}":`,
+          "",
+          ...overlapping.map((e) => {
+            const start = e.start?.dateTime || e.start?.date || "?";
+            const end = e.end?.dateTime || e.end?.date || "?";
+            return `  · "${e.summary || "(untitled)"}"  ${start} → ${end}  (id: ${e.id})`;
+          }),
+          "",
+          "Creating a second event here leaves two overlapping events on the calendar.",
+          "The correct move is almost always to AMEND the existing one instead:",
+          `  jori-calendar update <eventId> --calendar ${calendar} --summary "…" [--from/--to/--description …]`,
+          "",
+          "If the overlap is genuinely intentional (the user wants two concurrent",
+          "events, or this really is a deliberate double-book), say why:",
+          '  --overlap-ok "<why this really is a second, separate event>"',
+          "",
+          "See agent/CLAUDE.md § Calendar Invitations and the calendar-scheduling skill.",
+        ], 7);
+      }
+    }
+    // else: the read failed or returned nothing parseable — fail open, per the
+    // comment above this block. A stderr note would just be noise here; the
+    // audit log below still records whether an override was passed.
+  }
+}
+
+// ── Events the user made (update only) ────────────────────────────────────
+// The overlap guard above sends a duplicate-looking create to `update`, and
+// the user may ask Jori to update an event already on the calendar rather than
+// refuse and ask. The rule for an event the user created: Jori may change
+// anything — time, name, details — only when the new details come from a
+// confirmation email for the same booking; otherwise it may only ADD details
+// (a location where there is none, notes and ticket links appended to the
+// existing description, attachments, a source link).
+//
+// "Made by Jori" is a fact this wrapper stamps on every create
+// (private extended property gandalf_created=1, below; the name is kept so
+// existing stamps stay valid); an event the user organizes without it is the
+// user's. Events created before the stamp carry none and are treated as the
+// user's — the safe side. Whether an email is the confirmation for the same
+// booking is the calling agent's judgment; the wrapper requires it to name that
+// email (`--from-confirmation <gmail messageId>`) and logs it.
+//
+// Events created before the stamp existed: any private extended property
+// marks a Jori event too — the Google Calendar UI never sets one. A job
+// updating an id it stored from its OWN earlier create declares it with
+// `--jori-event "<job>"`, which is logged. Never pass it for an event you
+// found on the calendar rather than created.
+//
+// Fails CLOSED for a restricted change: if the event cannot be read, a time /
+// name change or a description write without --from-confirmation is refused
+// (a wrong edit to the user's own entry is the thing that cannot be undone quietly).
+const ADDITIVE_FLAGS = new Set(["--location", "--description", "--attachment", "--source-url", "--source-title"]);
+const MIN_CONFIRMATION_ID_CHARS = 10;
+// lang-regex-ok: shape of a Gmail message id (machine identifier), not language.
+const CONFIRMATION_ID_RE = /^[A-Za-z0-9_-]+$/;
+
+function setFlag(name, value) {
+  const i = argv.findIndex((a) => a === name || (typeof a === "string" && a.startsWith(`${name}=`)));
+  if (i < 0) return;
+  if (argv[i] === name) argv[i + 1] = value; else argv[i] = `${name}=${value}`;
+}
+
+let ownerEvent = null;
+if (cmd === "update") {
+  const changed = argv.filter((t) => typeof t === "string" && t.startsWith("--")).map((t) => t.split("=")[0])
+    .filter((n) => !ADDITIVE_FLAGS.has(n) && !GUEST_PERMISSION_FLAGS.has(n));
+  const wantsDescription = peekFlag("--description") !== undefined;
+  const wantsLocation = peekFlag("--location") !== undefined;
+  const confirmed = fromConfirmation.trim().length >= MIN_CONFIRMATION_ID_CHARS && CONFIRMATION_ID_RE.test(fromConfirmation.trim());
+  if (fromConfirmation && !confirmed) {
+    die([`jori-calendar update: --from-confirmation takes the Gmail messageId of the confirmation email, got "${fromConfirmation}".`]);
+  }
+  if (joriEventClaim && joriEventClaim.trim().length < 3) {
+    die(["jori-calendar update: --jori-event takes the name of the job whose own create stored this event id."]);
+  }
+  if (!confirmed && !joriEventClaim && (changed.length || wantsDescription || wantsLocation)) {
+    const probe = spawnSync(GOG, ["calendar", "event", calendar, eventId, ...ACCOUNT_ARGS, "--no-input", "-j"], { encoding: "utf8" });
+    let ev = null;
+    if (probe.status === 0 && probe.stdout) { try { const j = JSON.parse(probe.stdout); ev = j.event || j; } catch {} }
+    const readFailed = !ev || !ev.id;
+    const organizerSelf = ev && ev.organizer && (ev.organizer.self || SELF.has(String(ev.organizer.email || "").toLowerCase()));
+    const priv = (ev && ev.extendedProperties && ev.extendedProperties.private) || {};
+    const joriMade = priv.gandalf_created === "1" || Object.keys(priv).length > 0;
+    ownerEvent = readFailed ? null : Boolean(organizerSelf && !joriMade);
+    if (readFailed || ownerEvent) {
+      const refusals = [];
+      if (changed.length) refusals.push(`it changes ${[...new Set(changed)].join(", ")}`);
+      if (readFailed && (wantsDescription || wantsLocation)) refusals.push("the event could not be read, so its notes and location cannot be preserved");
+      if (!readFailed && wantsLocation && String(ev.location || "").trim()) refusals.push(`it replaces the location the user set ("${ev.location}")`);
+      if (refusals.length) {
+        die([
+          readFailed
+            ? `REFUSED: could not read event ${eventId} to check who made it, and ${refusals.join("; ")}.`
+            : `REFUSED: "${ev.summary || "(untitled)"}" is an event the user made, and this update ${refusals.join("; ")}.`,
+          "",
+          "The rule: on an event the user created, Jori may change anything",
+          "(time, name, details) ONLY when the new details come from a confirmation",
+          "email for the same booking. Otherwise it may only ADD details: a location",
+          "where there is none, notes and ticket links (appended to the description),",
+          "attachments, a source link.",
+          "",
+          "If a confirmation email for this same booking is where the new details come from:",
+          `  jori-calendar update ${eventId} --calendar ${calendar} --from-confirmation <gmail messageId> [same flags]`,
+          "Otherwise add only the details, e.g.:",
+          `  jori-calendar update ${eventId} --calendar ${calendar} --description "Tickets: <link>"`,
+        ], 8);
+      }
+      // Additive only: the user's notes stay, the new ones go underneath.
+      if (wantsDescription && String(ev.description || "").trim()) {
+        const add = String(peekFlag("--description") || "");
+        const mine = String(ev.description);
+        if (!add.startsWith(mine)) setFlag("--description", `${mine}\n\n${add}`);
+      }
+    }
+  }
+}
+
+// ── Build the gog invocation ─────────────────────────────────────────────
+const gogArgs = ["calendar", cmd === "create" ? "create" : cmd, calendar];
+if (eventId) gogArgs.push(eventId);
+gogArgs.push(...ACCOUNT_ARGS, "--no-input");
+if (replaceAttendees.length) gogArgs.push("--attendees", replaceAttendees.join(","));
+if (addAttendees.length) gogArgs.push("--add-attendee", addAttendees.join(","));
+// Attendees exist, so they must actually be notified — an invite nobody is told
+// about is worse than none. (CLAUDE.md § Calendar Invitations.) This keys off
+// the merged list, so it now covers --add-attendee too; before 2026-09-04 an
+// --add-attendee invite got `none` and reached the guest with no notification.
+gogArgs.push("--send-updates", sendUpdates || (attendees.length ? "all" : "none"));
+// Stamp every event Jori creates, so the owner-event rule above can tell
+// Jori's events from the ones the user made.
+if (cmd === "create") gogArgs.push("--private-prop", "gandalf_created=1");
+gogArgs.push(...argv);
+if (dryRun) gogArgs.push("--dry-run");
+
+// ── Write the audit row BEFORE the call ──────────────────────────────────
+// Before, not after: if gog succeeds and this process dies, an unlogged invite
+// is exactly the case the nightly audit must flag. An extra row for a failed
+// write is harmless; a missing row for a successful one is the blind spot.
+try {
+  fs.mkdirSync(path.dirname(LOG), { recursive: true });
+  fs.appendFileSync(LOG, JSON.stringify({
+    ts: new Date().toISOString(),
+    action: cmd,
+    calendar,
+    event_id: eventId,
+    // `attendees` stays the merged set every reader already expects; the two
+    // split fields are what let the audit answer a PER-ATTENDEE question —
+    // "is this specific guest covered by an authorization?" — which it could
+    // not do while an --add-attendee write recorded an empty list.
+    attendees,
+    attendees_replace: replaceAttendees,
+    attendees_add: addAttendees,
+    authorization: authorization || null,
+    // Non-null only when a create's overlap guard was actually overridden —
+    // lets a future audit spot every deliberate double-book, same idea as the
+    // attendee authorization field above.
+    overlap_override: overlapOk || null,
+    // The confirmation email that licensed changing an event the user made,
+    // and whether this update touched one of the user's own events (null = not checked).
+    from_confirmation: fromConfirmation || null,
+    owner_event: ownerEvent,
+    jori_event_claim: joriEventClaim || null,
+    dry_run: Boolean(dryRun),
+  }) + "\n");
+} catch (e) {
+  console.error(`jori-calendar: could not write the audit log (${e.message}) — refusing rather than writing an unauditable invite`);
+  if (attendees.length) process.exit(5);
+}
+
+const res = spawnSync(GOG, gogArgs, { stdio: "inherit" });
+process.exit(res.status ?? 1);

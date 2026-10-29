@@ -1,0 +1,163 @@
+#!/usr/bin/env python3
+"""osm-lore — named history/landmark features from OpenStreetMap around a point.
+
+    osm-lore <lat> <lon> [--radius 300] [--limit 12]   -> JSON {items:[...]}
+
+The free second source (after Wikipedia geosearch, lib/place-lore.mjs)
+for hum's local-history lane: historic=*, memorials, monuments, museums,
+artworks, viewpoints, attractions, and anything OSM links to Wikipedia or
+Wikidata. Goes through the shared Overpass mirror list and backoff
+(lib/overpass_client.py). Cached per ~110 m cell for 30 days; a failed
+lookup returns the stale cache, else an empty list — never an error, because a
+missing landmark must never cost the lane its Wikipedia material.
+
+Every item carries a stable identity (`osm:<type>/<id>`, plus the Wikidata QID
+when tagged) so hum can refuse to tell the same thing twice however the model
+words it (lib/local-history-ledger.mjs). Distance is measured here, in
+code, and anything past --radius is dropped: a local explanation is only
+worth sending while the user is within reach of the subject.
+"""
+import argparse
+import hashlib
+import json
+import math
+import os
+import sys
+import time
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.join(HERE, "..", "lib"))
+
+from places_local import data_path  # noqa: E402
+
+CACHE_DIR = data_path("osm-lore")
+CACHE_TTL_S = 30 * 86400
+CACHE_V = 1
+
+# Keys whose presence makes a feature "something with a story". Tag-driven,
+# OSM's own vocabulary; no reading of names.
+TOURISM = "attraction|museum|artwork|viewpoint|gallery"
+STORY_TAGS = ("start_date", "inscription", "description", "architect", "heritage",
+              "historic", "memorial", "artist_name", "building:architecture")
+
+
+def haversine_m(a_lat, a_lon, b_lat, b_lon):
+    r = 6371000.0
+    p1, p2 = math.radians(a_lat), math.radians(b_lat)
+    dp, dl = p2 - p1, math.radians(b_lon - a_lon)
+    h = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
+    return 2 * r * math.asin(math.sqrt(h))
+
+
+def cell_key(lat, lon, radius):
+    raw = f"v{CACHE_V}:{round(lat, 3)}:{round(lon, 3)}:{int(radius)}"
+    return hashlib.sha1(raw.encode()).hexdigest()[:16]
+
+
+def cache_read(key, allow_stale=False):
+    p = os.path.join(CACHE_DIR, f"{key}.json")
+    try:
+        if not allow_stale and time.time() - os.path.getmtime(p) > CACHE_TTL_S:
+            return None
+        with open(p) as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def cache_write(key, payload):
+    try:
+        os.makedirs(CACHE_DIR, exist_ok=True)
+        tmp = os.path.join(CACHE_DIR, f"{key}.{os.getpid()}.tmp")
+        with open(tmp, "w") as f:
+            json.dump(payload, f)
+        os.replace(tmp, os.path.join(CACHE_DIR, f"{key}.json"))
+    except Exception:
+        pass
+
+
+def query(lat, lon, radius):
+    a = f"(around:{int(radius)},{lat},{lon})"
+    return (
+        "[out:json][timeout:25];("
+        f"nwr[\"historic\"][\"name\"]{a};"
+        f"nwr[\"tourism\"~\"^({TOURISM})$\"][\"name\"]{a};"
+        f"nwr[\"memorial\"][\"name\"]{a};"
+        f"nwr[\"wikidata\"][\"name\"]{a};"
+        f"nwr[\"wikipedia\"][\"name\"]{a};"
+        ");out center tags 80;"
+    )
+
+
+def shape(el, lat, lon):
+    tags = el.get("tags") or {}
+    name = tags.get("name:en") or tags.get("name")
+    if not name:
+        return None
+    elat = el.get("lat") or (el.get("center") or {}).get("lat")
+    elon = el.get("lon") or (el.get("center") or {}).get("lon")
+    if elat is None or elon is None:
+        return None
+    kind = (f"historic={tags['historic']}" if tags.get("historic")
+            else f"tourism={tags['tourism']}" if tags.get("tourism")
+            else f"memorial={tags['memorial']}" if tags.get("memorial")
+            else f"amenity={tags['amenity']}" if tags.get("amenity")
+            else f"building={tags['building']}" if tags.get("building")
+            else "feature")
+    facts = {k: tags[k] for k in STORY_TAGS if tags.get(k)}
+    return {
+        "id": f"osm:{el.get('type')}/{el.get('id')}",
+        "title": name,
+        "name_local": tags.get("name") if tags.get("name") != name else None,
+        "kind": kind,
+        "lat": float(elat),
+        "lon": float(elon),
+        "distance_m": round(haversine_m(lat, lon, float(elat), float(elon))),
+        "qid": tags.get("wikidata"),
+        "wikipedia": tags.get("wikipedia"),
+        "facts": facts,
+    }
+
+
+def lore(lat, lon, radius, limit):
+    key = cell_key(lat, lon, radius)
+    cached = cache_read(key)
+    elements = cached.get("elements") if cached else None
+    source = "cache"
+    if elements is None:
+        try:
+            from overpass_client import post
+            elements = post(query(lat, lon, radius), timeout_s=30).get("elements", [])
+            cache_write(key, {"fetched_at": time.time(), "elements": elements})
+            source = "overpass"
+        except Exception as e:
+            stale = cache_read(key, allow_stale=True)
+            elements = (stale or {}).get("elements", [])
+            source = f"stale ({e})" if stale else f"unavailable ({e})"
+    items, seen = [], set()
+    for el in elements:
+        it = shape(el, lat, lon)
+        # Distance from where the user is NOW, not the cell centre the cache was
+        # built from — the cache is shared by every point in the cell.
+        if not it or it["distance_m"] > radius or it["id"] in seen:
+            continue
+        seen.add(it["id"])
+        items.append(it)
+    # Things with a story first (Wikidata link, story tags), then nearest.
+    items.sort(key=lambda i: (-(bool(i["qid"]) + bool(i["wikipedia"]) + min(len(i["facts"]), 2)),
+                              i["distance_m"]))
+    return {"items": items[:limit], "source": source}
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    ap.add_argument("lat", type=float)
+    ap.add_argument("lon", type=float)
+    ap.add_argument("--radius", type=float, default=300)
+    ap.add_argument("--limit", type=int, default=12)
+    a = ap.parse_args()
+    print(json.dumps(lore(a.lat, a.lon, a.radius, a.limit), ensure_ascii=False))
+
+
+if __name__ == "__main__":
+    main()

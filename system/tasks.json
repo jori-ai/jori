@@ -1277,6 +1277,98 @@
       ],
       "description": "Monthly per-property real-estate review: P&L by Schedule-E category per property, month-over-month and year-over-year, short-term vs long-term comparison, rent-roll collection vs the signed leases, reconciliation health (unclassified rows), reserves, security deposits and yield on value/cost. Reports the last CLOSED month, and runs on the 16th so every rent for that month has settled before the collection check reads it. The monthly half of the split with the weekly finance review, which stays on liquidity/accuracy/anomalies. Needs the rental books (agent/local/config/rentals.json); without them the trigger dispatches nothing. READ-ONLY. Playbook: agent/ops-agent/jobs/finance-property-review.md.",
       "job": "finance-property-review"
+    },
+    {
+      "name": "choice-sweep",
+      "schedule": "17 * * * *",
+      "schedule_human": "Hourly at :17",
+      "trigger_script": "agent/scripts/trigger-choice-sweep.sh",
+      "webhook_url": null,
+      "webhook_task": null,
+      "ops_playbook_section": null,
+      "delivers_to": "jori",
+      "phrases": [],
+      "description": "Hourly: applies an expired, unanswered location_stop card default as a LOW-CONFIDENCE guess that never names nearby future stops and that any later tap or correction overrides. choice sweep --apply -> findme guess <visit_id> <default>: writes only that card's own visit row as place_type=default-applied (never user-confirmed, never confirmed-stops.json); refuses a row that already carries a verdict and a window overlapping a row the user answered. resolve-day reads it at confidence 0.4 for that one stop and the summary titles it probably X. Nothing is posted in the chat; a late tap replaces it through the normal reply path. Other card kinds are only reported. Direct script - no webhook, no Anthropic API. Kill switch: data/.choice-sweep-off. Inspect: bin/choice list; dry-run: bin/choice sweep.",
+      "job": null
+    },
+    {
+      "name": "message-digest",
+      "schedule": "40 3,12,18,23 * * *",
+      "schedule_human": "3:40 AM, 12:40 PM, 6:40 PM, 11:40 PM local (the 3:40 run finalizes yesterday for the 4 AM daily summary)",
+      "trigger_script": "agent/scripts/trigger-message-digest.sh",
+      "webhook_url": null,
+      "webhook_task": null,
+      "ops_playbook_section": null,
+      "delivers_to": "message-digests",
+      "phrases": [
+        "message digest",
+        "message summaries",
+        "summarize my messages",
+        "group chat summary"
+      ],
+      "description": "Summarizes the day's iMessage, WhatsApp and Slack conversations (1:1 and groups) into data/message-digests/<date>.json + .md; the daily summary reads it. Cron kicks launchd ai.claude.message-digest (tool-less claude -p on Max). Replaces realtime message pings. `message-digest show [--date D]` prints one; `message-digest topics <meeting-id>` picks group topics before a recurring meeting (lib/meetings.mjs).",
+      "job": null
+    },
+    {
+      "name": "ping-flush",
+      "schedule": "*/5 * * * *",
+      "schedule_human": "Every 5 minutes",
+      "trigger_script": "agent/scripts/trigger-ping-flush.sh",
+      "webhook_url": null,
+      "webhook_task": null,
+      "ops_playbook_section": null,
+      "delivers_to": "jori",
+      "phrases": [],
+      "description": "Deliver the non-urgent APNs alerts that the motion gate (lib/motion-state.mjs) parked while the user was walking/driving, once they are stationary again. Coalesces a batch into one buzz per channel; drops alerts held >90 min (the message itself stays in the app either way). Direct script — no webhook, no Anthropic API. Exits immediately when the queue is empty, which is most runs. Kill switch: data/.ping-flush-off. Status: bin/ping-flush --status.",
+      "job": null
+    },
+    {
+      "name": "jev-budget-check",
+      "schedule": "15 9 * * *",
+      "schedule_human": "Daily at 9:15 AM local",
+      "trigger_script": "agent/scripts/trigger-jev-budget-check.sh",
+      "delivers_to": "system",
+      "phrases": [
+        "jev budget",
+        "jev spend",
+        "typesafe credits",
+        "how much jev left"
+      ],
+      "description": "Jev spend vs the prepaid provider budget (data/jev-config.json `budget`: usd, since, alert_pcts). Sums per-call cost from data/jev-shadow/*.jsonl, projects the run-out date, pages the system channel once per crossed threshold (default 50/80/95%). No model; off when no budget is configured. By hand: jev-budget-check [--json] [--dry-run].",
+      "job": null,
+      "webhook_task": null,
+      "webhook_url": null,
+      "ops_playbook_section": null
+    },
+    {
+      "name": "jev-email-reconcile",
+      "schedule": "*/15 * * * *",
+      "schedule_human": "Every 15 minutes (cron, via cron-run)",
+      "scheduler": "cron",
+      "trigger_script": "bin/jev-email-reconcile",
+      "delivers_to": "none",
+      "phrases": [
+        "jev email reconcile"
+      ],
+      "description": "Jev email-triage site: for mail Jev sent to the ops dispatch (P1/P2 or low confidence), compares Jev's verdict against the ops agent's recorded triage verdict in email-memory.db and logs the late comparison (disagreements.jsonl via jev-shadow). Silent. See docs/jev.md.",
+      "job": "jev-email-reconcile"
+    },
+    {
+      "name": "shadow-cutover-check",
+      "schedule": "0 10 * * *",
+      "schedule_human": "Daily at 10:00 AM local",
+      "trigger_script": "agent/scripts/trigger-shadow-cutover-check.sh",
+      "delivers_to": "system",
+      "phrases": [
+        "shadow cutover",
+        "go live check",
+        "is triage-decide live"
+      ],
+      "description": "Flips triage-decide from shadow to live once it meets its cutover bar (triage-decide report verdict). Announces the flip once on the system channel with its rollback; reports once if it is still not ready after 21 days of shadow. No model. State: data/shadow-cutover-state.json.",
+      "job": null,
+      "webhook_task": null,
+      "webhook_url": null,
+      "ops_playbook_section": null
     }
   ]
 }

@@ -1,0 +1,46 @@
+#!/usr/bin/env node
+// jev-p1-gate — Jev gate for the p1-resolution-scan turn. Logic: lib/jev-p1-gate.mjs.
+// Called by agent/scripts/trigger-p1-resolution-scan.sh. See docs/jev.md.
+//
+// Usage:
+//   jev-p1-gate check '<json array of NEW unstarred-P1 ids>'
+//       exit 3 → skip the dispatch (Jev: leave every one untouched)
+//       exit 0 → dispatch as today (anything else, including every error)
+//       on dispatch, prints the batch id on stdout (for `dispatched` below)
+//   jev-p1-gate dispatched <batchId>   the trigger's curl succeeded — compare this batch later
+//   jev-p1-gate reconcile      late comparison for dispatched batches (every tick)
+
+const [cmd, arg] = process.argv.slice(2);
+const ts = () => new Date().toISOString();
+
+try {
+  const lib = await import("../lib/jev-p1-gate.mjs");
+  if (cmd === "reconcile") {
+    const n = lib.reconcileP1();
+    if (n) console.error(`${ts()} jev-p1-gate: reconciled ${n} batch(es)`);
+    process.exit(0);
+  }
+  if (cmd === "dispatched") { lib.confirmDispatched(arg); process.exit(0); }
+  if (cmd !== "check") { console.error("usage: jev-p1-gate check '<json ids>' | reconcile"); process.exit(0); }
+  let ids = [];
+  try { ids = JSON.parse(arg || "[]"); } catch {}
+  // Force list: ids a Haiku shadow said should be downgraded after Jev skipped
+  // them (jev-gate-shadow un-sees them). They MUST reach the real scan — never
+  // let Jev skip them a second time, or a wrong skip loops every tick.
+  const FORCE = lib.P1_FORCE_FILE;
+  let force = [];
+  try { force = JSON.parse((await import("node:fs")).readFileSync(FORCE, "utf8")).ids || []; } catch {}
+  if (Array.isArray(ids) && ids.some((x) => force.includes(x))) {
+    try { (await import("node:fs")).writeFileSync(FORCE, JSON.stringify({ ids: force.filter((x) => !ids.includes(x)) })); } catch {}
+    console.error(`${ts()} jev-p1-gate: dispatch — shadow-forced re-scan of ${ids.filter((x) => force.includes(x)).length} id(s)`);
+    process.exit(0);
+  }
+  const r = await lib.p1JevGate(Array.isArray(ids) ? ids : []);
+  console.error(`${ts()} jev-p1-gate: ${r.dispatch ? "dispatch" : "SKIP"} — ${r.reason}${r.batchId ? ` [${r.batchId}]` : ""}`);
+  if (r.dispatch && r.batchId) process.stdout.write(r.batchId + "\n");
+  process.exit(r.dispatch ? 0 : 3);
+} catch (err) {
+  // Fail-open: a gate bug must never suppress a real P1 downgrade.
+  console.error(`${ts()} jev-p1-gate: error — fail-open (${String(err?.message || err).slice(0, 160)})`);
+  process.exit(0);
+}

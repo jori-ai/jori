@@ -1,0 +1,240 @@
+#!/usr/bin/env node
+// system-channel-spool-flush — replay system-channel messages that could not be
+// written to jori_messages at the time they were sent.
+//
+// WHY THIS EXISTS:
+// jori-send-curl POSTs every message to jori_messages and, when that POST
+// fails, falls back to email and exits 0. The row is never written and never
+// retried. That is silent for most conditions and catastrophic for one: an
+// outage that breaks the writer eats the alert about itself.
+//
+// The incident, verbatim: watchdog.sh paged
+//   "🔴 Supabase DB unreachable — the Jori app + phone channel are down"
+// The POST failed (Supabase was the thing that was down), the email fallback
+// succeeded, jori-send-curl exited 0, watchdog.sh logged "Notified via
+// Jori" and marked the incident delivered. Eight minutes later Supabase
+// recovered and incident_clear posted "✅ Recovered: Supabase is back to
+// normal" — which wrote fine. Net result in the system channel: a green check
+// with nothing above it saying what had broken.
+//
+// That matters twice. The user scrolls a channel with a hole in it, and
+// system-issue-review reads jori_messages (channel='system') as its ONLY
+// input — so the one class of outage you most want root-caused is the one class
+// it can never see. The review caught it only by cross-reading watchdog.log,
+// which rotates daily and keeps 14 days.
+//
+// Contract: best-effort, never throws, never blocks a live send. Exit 0 always
+// (usage error = 2). A row leaves the spool only on a confirmed 201.
+//
+// Usage: system-channel-spool-flush [--dry-run] [--spool <path>]
+//                                   [--max-age-sec N] [--json]
+
+import fs from "node:fs";
+import path from "node:path";
+import { createRequire } from "node:module";
+
+const require = createRequire(import.meta.url);
+const { installTools } = require("../lib/root.cjs");
+const { supabaseUrl } = require("../lib/instance.cjs");
+const DEFAULT_SPOOL =
+  process.env.JORI_SEND_SPOOL ||
+  installTools("data/system-channel-spool.jsonl");
+const SUPABASE_URL = process.env.SUPABASE_URL || supabaseUrl();
+const ENV_FILE = installTools(".env");
+
+// A week-old alert is archaeology: the incident is long closed, and the raw
+// text still exists in the 14-day watchdog.log archive. Backfilling it would
+// add noise to the channel without adding a decision.
+const DEFAULT_MAX_AGE_SEC = 7 * 24 * 60 * 60;
+
+function parseArgs(argv) {
+  const opts = { dryRun: false, spool: DEFAULT_SPOOL, maxAgeSec: DEFAULT_MAX_AGE_SEC, json: false };
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === "--dry-run") opts.dryRun = true;
+    else if (a === "--json") opts.json = true;
+    else if (a === "--spool") opts.spool = argv[++i];
+    else if (a === "--max-age-sec") opts.maxAgeSec = Number(argv[++i]);
+    else if (a === "--help" || a === "-h") opts.help = true;
+    else {
+      process.stderr.write(`system-channel-spool-flush: unknown argument ${a}\n`);
+      process.exit(2);
+    }
+  }
+  if (!opts.spool || !Number.isFinite(opts.maxAgeSec) || opts.maxAgeSec < 0) {
+    process.stderr.write("system-channel-spool-flush: bad --spool or --max-age-sec\n");
+    process.exit(2);
+  }
+  return opts;
+}
+
+function serviceRoleKey() {
+  try {
+    const line = fs
+      .readFileSync(ENV_FILE, "utf8")
+      .split("\n")
+      .find((l) => l.startsWith("SUPABASE_SERVICE_ROLE_KEY="));
+    return line ? line.slice("SUPABASE_SERVICE_ROLE_KEY=".length).trim() : "";
+  } catch {
+    return "";
+  }
+}
+
+// readSpool — parse the JSONL, discarding anything unusable rather than
+// aborting. A single corrupt line must not strand every other parked alert.
+export function readSpool(text) {
+  const rows = [];
+  let malformed = 0;
+  for (const line of text.split("\n")) {
+    if (!line.trim()) continue;
+    let row;
+    try {
+      row = JSON.parse(line);
+    } catch {
+      malformed++;
+      continue;
+    }
+    if (
+      !row ||
+      typeof row.content !== "string" ||
+      typeof row.created_at !== "string" ||
+      Number.isNaN(Date.parse(row.created_at))
+    ) {
+      malformed++;
+      continue;
+    }
+    rows.push({
+      created_at: row.created_at,
+      role: typeof row.role === "string" ? row.role : "assistant",
+      content: row.content,
+      channel: typeof row.channel === "string" ? row.channel : "system",
+      http_code: typeof row.http_code === "string" ? row.http_code : "",
+      _line: line,
+    });
+  }
+  return { rows, malformed };
+}
+
+// selectRows — oldest first (so a backfilled warning lands ABOVE the recovery
+// ping that followed it, not after), with anything past the age cap dropped.
+export function selectRows(rows, maxAgeSec, nowMs = Date.now()) {
+  const cutoff = nowMs - maxAgeSec * 1000;
+  const fresh = [];
+  const expired = [];
+  for (const r of rows) (Date.parse(r.created_at) >= cutoff ? fresh : expired).push(r);
+  fresh.sort((a, b) => Date.parse(a.created_at) - Date.parse(b.created_at));
+  return { fresh, expired };
+}
+
+async function postRow(key, row) {
+  const res = await fetch(`${SUPABASE_URL}/rest/v1/jori_messages`, {
+    method: "POST",
+    headers: {
+      apikey: key,
+      Authorization: `Bearer ${key}`,
+      "Content-Type": "application/json",
+      Prefer: "return=minimal",
+    },
+    body: JSON.stringify({
+      role: row.role,
+      content: row.content,
+      channel: row.channel,
+      read: false,
+      created_at: row.created_at,
+      // Stamped so a reader — and system-issue-review's own clustering — can
+      // tell this row was replayed rather than written when it was sent.
+      metadata: { backfilled: true, original_http_code: row.http_code || null },
+    }),
+    signal: AbortSignal.timeout(10_000),
+  });
+  return res.status;
+}
+
+function writeSpool(spoolPath, rows) {
+  if (!rows.length) {
+    try {
+      fs.unlinkSync(spoolPath);
+    } catch {
+      /* already gone */
+    }
+    return;
+  }
+  const tmp = `${spoolPath}.tmp.${process.pid}`;
+  fs.writeFileSync(tmp, rows.map((r) => r._line).join("\n") + "\n");
+  fs.renameSync(tmp, spoolPath);
+}
+
+async function main() {
+  const opts = parseArgs(process.argv.slice(2));
+  if (opts.help) {
+    process.stdout.write(
+      "Usage: system-channel-spool-flush [--dry-run] [--spool <path>] [--max-age-sec N] [--json]\n"
+    );
+    return 0;
+  }
+
+  let text = "";
+  try {
+    text = fs.readFileSync(opts.spool, "utf8");
+  } catch {
+    return 0; // nothing parked — the overwhelmingly common case
+  }
+
+  const { rows, malformed } = readSpool(text);
+  const { fresh, expired } = selectRows(rows, opts.maxAgeSec);
+  const report = { sent: 0, kept: 0, expired: expired.length, malformed, dry_run: opts.dryRun };
+
+  if (opts.dryRun) {
+    report.would_send = fresh.map((r) => ({ created_at: r.created_at, channel: r.channel }));
+    report.kept = fresh.length;
+    process.stdout.write(
+      (opts.json ? JSON.stringify(report) : `spool: ${fresh.length} to send, ${expired.length} expired, ${malformed} malformed`) + "\n"
+    );
+    return 0; // --dry-run must never mutate the spool
+  }
+
+  const key = serviceRoleKey();
+  if (!key || !SUPABASE_URL) {
+    // Cannot send (no key, or no Supabase configured); leave everything parked rather than dropping it.
+    return 0;
+  }
+
+  const keep = [];
+  let stopped = false;
+  for (const row of fresh) {
+    if (stopped) {
+      keep.push(row);
+      continue;
+    }
+    let status = 0;
+    try {
+      status = await postRow(key, row);
+    } catch {
+      status = 0;
+    }
+    if (status === 201) {
+      report.sent++;
+    } else {
+      // Still broken. Keep this row and every one after it, and stop hammering
+      // a dead endpoint — the next successful send calls us again.
+      keep.push(row);
+      stopped = true;
+    }
+  }
+  report.kept = keep.length;
+
+  try {
+    writeSpool(opts.spool, keep);
+  } catch {
+    /* keep the spool as-is; a duplicate later beats a loss now */
+  }
+
+  if (opts.json) process.stdout.write(JSON.stringify(report) + "\n");
+  return 0;
+}
+
+if (import.meta.url === `file://${process.argv[1]}`) {
+  main()
+    .then((code) => process.exit(code ?? 0))
+    .catch(() => process.exit(0)); // best-effort by contract
+}

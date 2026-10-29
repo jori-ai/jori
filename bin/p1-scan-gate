@@ -1,0 +1,128 @@
+#!/usr/bin/env node
+// p1-scan-gate — change-detecting dispatch gate for the P1 unstar-scan.
+//
+// Why this exists (2026-06-08 cost audit): the old gate dispatched the Opus
+// unstar-scan whenever ANY unstarred-P1 existed in the rolling 14-day window
+// (`gmail-action count`, exit 0/3). But that query is almost always non-empty —
+// new P1s land continuously, AND the playbook deliberately LEAVES ambiguous
+// unstarred-P1s untouched (e.g. a live third-party reply that inherited the p1
+// label), so they linger as `label:p1 -is:starred` for the full 14 days. Result:
+// the gate fired every 30 min (~48 dispatches/day) re-evaluating the SAME
+// already-decided messages — ~14% of all jori tokens spent largely on no-ops.
+//
+// Fix: gate on CHANGE, not presence. Enumerate the authoritative unstarred-P1
+// message-ID set (REST via `gmail-action ids` — the connector and
+// resultSizeEstimate are both unreliable for label:p1), diff against the set we
+// last dispatched for, and dispatch ONLY when a NEW id appears. Messages the
+// scan downgrades leave the set (pruned); messages it intentionally leaves
+// untouched stay in `seen` and never re-trigger — they age out at 14d. New mail
+// activity on those threads still flows through normal triage.
+//
+// Exit 0 → dispatch (new unstarred-P1 id(s) since last run).
+// Exit 3 → skip    (no change).
+// Exit 0 on ANY error → FAIL-OPEN (preserve prior always-dispatch behavior;
+//          never let a gate bug suppress real P1 downgrades).
+//
+// State: data/p1-scan-seen.json  { ids: [...], updatedAt }
+
+const { execFileSync } = require("node:child_process");
+const fs = require("node:fs");
+const path = require("node:path");
+
+const { installTools } = require("../lib/root.cjs");
+const QUERY = "label:p1 -is:starred newer_than:14d";
+const GMAIL_ACTION = process.env.P1_SCAN_GMAIL_ACTION || installTools("bin/gmail-action"); // env = test seam
+// State path overridable via P1_SCAN_SEEN (lets a manual test run against a
+// throwaway file instead of consuming the live seen-set).
+const STATE = process.env.P1_SCAN_SEEN || installTools("data/p1-scan-seen.json");
+const { withFileLock } = require("../lib/file-lock.js");
+// Jev force list (bin/jev-gate-shadow): ids a Haiku shadow said should be
+// downgraded after Jev skipped them. They are treated as FRESH here even if they
+// are in `seen`, so the trigger always re-dispatches them — this is what makes
+// the self-heal immune to a seen-file race (code review 2026-09-23).
+const P1_FORCE = path.join(process.env.JEV_SHADOW_DIR || installTools("data/jev-shadow"), "p1-force.json");
+
+// ISO-stamp every line — the trigger script's own log() timestamps its
+// lines, but this binary's stderr was previously appended raw (2>>), leaving
+// gate output impossible to correlate against p1-resolutions.jsonl failures
+// by time. See jobs/p1-resolve.md § Reliability notes, 2026-08-07.
+function ts() { return new Date().toISOString(); }
+
+function failOpen(reason) {
+  // Print to stderr; exit 0 so the trigger dispatches as before.
+  console.error(`${ts()} p1-scan-gate: fail-open (${reason})`);
+  process.exit(0);
+}
+
+// 1. Authoritative current set of unstarred-P1 ids (REST). exit 3 = none.
+let current;
+try {
+  const out = execFileSync(GMAIL_ACTION, ["ids", QUERY], { encoding: "utf8" });
+  current = out.split("\n").map((s) => s.trim()).filter(Boolean);
+} catch (e) {
+  // gmail-action exits 3 when there are zero matches — that's "no work", not an error.
+  if (e.status === 3) {
+    // No unstarred-P1 at all → seen set is empty; skip.
+    try {
+      fs.writeFileSync(STATE, JSON.stringify({ ids: [], updatedAt: new Date().toISOString() }, null, 2));
+    } catch {}
+    console.error(`${ts()} p1-scan-gate: no unstarred-P1 — skip`);
+    process.exit(3);
+  }
+  // Any other failure (auth/network/API) → fail-open. Previously logged only
+  // e.status, discarding gmail-action's own stderr — which, after the
+  // 2026-08-07 fix, carries the real cause chain via describeError instead of
+  // the generic "fetch failed". See jobs/p1-resolve.md § Reliability notes.
+  const detail = (e.stderr || "").toString().trim();
+  failOpen(`gmail-action ids exit=${e.status ?? "?"}${detail ? ` — ${detail}` : ""}`);
+}
+
+// 2+3. Load the last-dispatched set and re-seed it to the CURRENT set, under the
+//    file lock shared with jev-gate-shadow. Re-seeding adds the fresh ids and
+//    prunes any that were downgraded or aged out, so it stays bounded. Atomic.
+let fresh = [];
+withFileLock(STATE, () => {
+  let seen = [];
+  try {
+    if (fs.existsSync(STATE)) {
+      const prev = JSON.parse(fs.readFileSync(STATE, "utf8"));
+      if (Array.isArray(prev.ids)) seen = prev.ids;
+    }
+  } catch {
+    // Corrupt state → treat as empty (will dispatch once, then re-seed). Not fail-open
+    // per se, but dispatching is the safe direction here anyway.
+    seen = [];
+  }
+  let forced = [];
+  try { forced = JSON.parse(fs.readFileSync(P1_FORCE, "utf8")).ids || []; } catch {}
+  const currentSet = new Set(current);
+  const seenSet = new Set(seen);
+  for (const id of forced) if (currentSet.has(id)) seenSet.delete(id); // forced → fresh
+  fresh = current.filter((id) => !seenSet.has(id));
+  // A forced id that is no longer an unstarred P1 (downgraded / aged out) is done.
+  if (forced.some((id) => !currentSet.has(id))) {
+    try { fs.writeFileSync(P1_FORCE, JSON.stringify({ ids: forced.filter((id) => currentSet.has(id)) })); } catch {}
+  }
+  try {
+    const tmp = STATE + ".tmp";
+    fs.writeFileSync(tmp, JSON.stringify({ ids: current, updatedAt: new Date().toISOString() }, null, 2));
+    fs.renameSync(tmp, STATE);
+  } catch (e) {
+    // If we can't persist, we'd re-dispatch next tick regardless — fail-open to
+    // avoid silently dropping a real new P1.
+    failOpen(`state write failed: ${e.message}`);
+  }
+});
+
+// 4. Decide.
+if (fresh.length > 0) {
+  console.error(`${ts()} p1-scan-gate: ${fresh.length} new unstarred-P1 (of ${current.length}) — dispatch`);
+  // The NEW ids on stdout (2026-09-23): the trigger hands them to
+  // bin/jev-p1-gate, which may skip the turn when Jev is confident every
+  // one should be left untouched. Fail-open paths above print nothing, so the
+  // trigger dispatches without asking Jev — exactly today's behavior.
+  process.stdout.write(JSON.stringify(fresh) + "\n");
+  process.exit(0);
+}
+console.error(`${ts()} p1-scan-gate: ${current.length} unstarred-P1, none new — skip`);
+process.exit(3);

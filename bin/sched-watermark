@@ -1,0 +1,103 @@
+#!/usr/bin/env node
+// sched-watermark — shared watermark + seen-set state for batched scheduled tasks.
+//
+// Part of a cost re-architecture: scheduled tasks (agent/scheduled-tasks/*) that
+// REPLACE event-driven cron jobs (an email batch, a location enrichment, a watch sweep) need a durable "what have I already processed/surfaced"
+// marker so a once-an-hour batch run does the same work the old per-event dispatch did,
+// without re-processing or re-notifying. This is that marker — one small JSON file per task.
+//
+// Watchers already own bespoke state files and do NOT
+// need this; it's for the new batched tasks that have no prior state mechanism.
+//
+// State file: data/sched-watermarks/<task>.json
+//   { "watermark": <string|null>, "seen": { "<key>": "<iso>" }, "updated_at": "<iso>" }
+//
+// Usage:
+//   sched-watermark get <task>                 -> prints watermark (empty line if unset)
+//   sched-watermark set <task> <value>         -> sets watermark
+//   sched-watermark seen <task> <key>          -> exit 0 if key already seen, exit 1 if new
+//   sched-watermark mark <task> <key>          -> record key as seen (idempotent)
+//   sched-watermark prune <task> [--days N]    -> drop seen keys older than N days (default 30)
+//   sched-watermark show <task>                -> print the full JSON
+//   sched-watermark list                       -> list known tasks
+//
+// Pure stdlib, no deps. Stamps timestamps from the system clock at call time.
+
+const fs = require("node:fs");
+const os = require("node:os");
+const path = require("node:path");
+
+const DIR = process.env.SCHED_WATERMARK_DIR || require("../lib/root.cjs").installTools("data/sched-watermarks");
+const nowIso = () => new Date().toISOString();
+
+function fileFor(task) {
+  if (!task || /[^a-zA-Z0-9._-]/.test(task)) {
+    console.error(`sched-watermark: invalid task name "${task}" (use [A-Za-z0-9._-])`);
+    process.exit(2);
+  }
+  return path.join(DIR, `${task}.json`);
+}
+function load(task) {
+  const f = fileFor(task);
+  try { return JSON.parse(fs.readFileSync(f, "utf8")); }
+  catch { return { watermark: null, seen: {}, updated_at: null }; }
+}
+function save(task, data) {
+  fs.mkdirSync(DIR, { recursive: true });
+  data.updated_at = nowIso();
+  fs.writeFileSync(fileFor(task), JSON.stringify(data, null, 2) + "\n");
+}
+
+const [cmd, task, ...rest] = process.argv.slice(2);
+
+switch (cmd) {
+  case "get": {
+    const d = load(task);
+    process.stdout.write((d.watermark ?? "") + "\n");
+    break;
+  }
+  case "set": {
+    const d = load(task);
+    d.watermark = rest.join(" ");
+    save(task, d);
+    break;
+  }
+  case "seen": {
+    const d = load(task);
+    process.exit(d.seen && Object.prototype.hasOwnProperty.call(d.seen, rest[0]) ? 0 : 1);
+    break;
+  }
+  case "mark": {
+    const d = load(task);
+    d.seen = d.seen || {};
+    if (!d.seen[rest[0]]) d.seen[rest[0]] = nowIso();
+    save(task, d);
+    break;
+  }
+  case "prune": {
+    const i = rest.indexOf("--days");
+    const days = i >= 0 ? Number(rest[i + 1]) : 30;
+    const cutoff = Date.now() - days * 86_400_000;
+    const d = load(task);
+    let dropped = 0;
+    for (const [k, ts] of Object.entries(d.seen || {})) {
+      if (new Date(ts).getTime() < cutoff) { delete d.seen[k]; dropped++; }
+    }
+    save(task, d);
+    console.error(`pruned ${dropped} seen key(s) older than ${days}d from ${task}`);
+    break;
+  }
+  case "show": {
+    process.stdout.write(JSON.stringify(load(task), null, 2) + "\n");
+    break;
+  }
+  case "list": {
+    try {
+      for (const f of fs.readdirSync(DIR)) if (f.endsWith(".json")) console.log(f.replace(/\.json$/, ""));
+    } catch { /* dir not created yet */ }
+    break;
+  }
+  default:
+    console.error("usage: sched-watermark <get|set|seen|mark|prune|show|list> <task> [args]");
+    process.exit(2);
+}

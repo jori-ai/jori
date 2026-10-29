@@ -1,0 +1,100 @@
+#!/bin/bash
+# node-tcc-warmup — make node raise every macOS privacy prompt it needs, in one
+# pass, from the GUI session (so the dialogs appear on screen and someone can
+# click Allow), then report which grants are live.
+#
+# Over SSH this proves nothing: sshd holds its own Full Disk Access and becomes
+# the "responsible process", so TCC never consults node. This script therefore
+# re-launches itself as a one-shot LaunchAgent, which makes node responsible —
+# exactly like cron-run and the supervisors.
+#
+# Usage: node-tcc-warmup   (someone should be at the screen to click Allow;
+#        re-run any time — once everything is granted it is a silent check)
+# Report: <install>/agent/logs/node-tcc-warmup.log
+#
+# Grants that never prompt (add them by hand: System Settings → Privacy &
+# Security → <pane> → +, Cmd-Shift-G, ~/.local/node/bin/node):
+#   Full Disk Access, Accessibility, Screen & System Audio Recording.
+# TCC keys a grant on the binary's path and signature, so probe the same node
+# the agents run (lib/root.sh JORI_NODE; an exported JORI_NODE wins).
+#
+# Optional Local Network probe: agent/local/node-tcc-warmup/lan-probe holds one
+# line `<label> <host> <port>` (a device on the LAN, e.g. the router's SSH
+# port). Without it the probe is skipped.
+
+set -u
+LABEL="ai.claude.node-tcc-warmup"
+SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+# shellcheck source=../agent/scripts/lib/root.sh
+source "$(dirname "$SELF")/../agent/scripts/lib/root.sh"
+LOG="$JORI_INSTALL_TOOLS/agent/logs/node-tcc-warmup.log"
+NODE="$JORI_NODE"
+[ -n "$NODE" ] || { echo "node-tcc-warmup: node not found (set JORI_NODE)" >&2; exit 1; }
+LAN_PROBE="${JORI_LOCAL_DIR:-$JORI_TOOLS/agent/local}/node-tcc-warmup/lan-probe"
+
+if [ "${NODE_TCC_WARMUP_INNER:-}" != "1" ]; then
+  plist="$HOME/Library/LaunchAgents/$LABEL.plist"
+  mkdir -p "$(dirname "$LOG")"
+  : > "$LOG"
+  cat > "$plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>$LABEL</string>
+  <key>ProgramArguments</key><array>
+    <string>$NODE</string><string>-e</string>
+    <string>require('child_process').spawnSync('/bin/bash',['$SELF'],{stdio:'inherit',env:{...process.env,NODE_TCC_WARMUP_INNER:'1'}})</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>StandardOutPath</key><string>$LOG</string>
+  <key>StandardErrorPath</key><string>$LOG</string>
+</dict></plist>
+PLIST
+  launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null
+  launchctl bootstrap "gui/$(id -u)" "$plist"
+  echo "warm-up running as $LABEL — answer any 'node' dialogs on screen; waiting up to 5 min…"
+  for _ in $(seq 1 300); do
+    grep -q '^DONE' "$LOG" 2>/dev/null && break
+    sleep 1
+  done
+  launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null
+  rm -f "$plist"
+  cat "$LOG"
+  exit 0
+fi
+
+# ---- inner: runs with node as the responsible process ----
+probe() { # name, command...
+  local name="$1"; shift
+  if out="$("$@" 2>&1)"; then echo "OK    $name"; else echo "FAIL  $name — $(echo "$out" | tail -1 | cut -c1-140)"; fi
+}
+
+echo "node: $(readlink "$NODE") $("$NODE" -v)"
+probe "Full Disk Access (chat.db)"  /usr/bin/head -c 16 "$HOME/Library/Messages/chat.db"
+probe "Documents folder"            /bin/ls "$HOME/Documents"
+probe "Desktop folder"              /bin/ls "$HOME/Desktop"
+probe "Downloads folder"            /bin/ls "$HOME/Downloads"
+probe "Photos library"              /bin/ls "$HOME/Pictures/Photos Library.photoslibrary/database"
+probe "Apple Events → Notes"        /usr/bin/osascript -e 'tell application "Notes" to get name'
+probe "Apple Events → Messages"     /usr/bin/osascript -e 'tell application "Messages" to get name'
+probe "Apple Events → Photos"       /usr/bin/osascript -e 'tell application "Photos" to get name'
+probe "Apple Events → System Events" /usr/bin/osascript -e 'tell application "System Events" to get name'
+if [ -r "$LAN_PROBE" ] && read -r lan_label lan_host lan_port < "$LAN_PROBE" && [ -n "${lan_port:-}" ]; then
+  probe "Local Network ($lan_label $lan_host:$lan_port)" "$NODE" -e '
+    const s=require("net").connect({host:process.argv[1],port:Number(process.argv[2]),timeout:5000});
+    s.on("connect",()=>{s.destroy();process.exit(0)});
+    s.on("timeout",()=>{console.error("timeout");process.exit(1)});
+    s.on("error",e=>{console.error(e.code);process.exit(1)});' "$lan_host" "$lan_port"
+else
+  echo "SKIP  Local Network — no agent/local/node-tcc-warmup/lan-probe"
+fi
+# Writing the crontab (cron-tz-sync does) needs kTCCServiceSystemPolicySysAdminFiles.
+# Rewrite it byte-for-byte, and only if the read produced something.
+ct="$(mktemp)"
+if /usr/bin/crontab -l > "$ct" 2>/dev/null && [ -s "$ct" ]; then
+  probe "crontab write (SysAdminFiles)" /usr/bin/crontab "$ct"
+else
+  echo "SKIP  crontab write — could not read the current crontab"
+fi
+rm -f "$ct"
+echo "DONE"
