@@ -178,8 +178,10 @@ printf '%s' "\${FAKE_HTTP:-201}"
 
 function sendEnv() {
   const h = fs.mkdtempSync(path.join(os.tmpdir(), "p1fold-send-"));
-  fs.mkdirSync(path.join(h, "Dev/jori/data"), { recursive: true });
-  fs.writeFileSync(path.join(h, "Dev/jori/.env"), "SUPABASE_SERVICE_ROLE_KEY=fake\n");
+  // The fake HOME holds an install at the default path, where jori-send-curl looks.
+  const inst = path.join(h, "Dev", "jori");
+  fs.mkdirSync(path.join(inst, "data"), { recursive: true });
+  fs.writeFileSync(path.join(inst, ".env"), "SUPABASE_SERVICE_ROLE_KEY=fake\n");
   const fakeBin = path.join(h, "fakebin");
   fs.mkdirSync(fakeBin);
   fs.writeFileSync(path.join(fakeBin, "curl"), FAKE_CURL);

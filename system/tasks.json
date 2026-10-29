@@ -488,6 +488,26 @@
       "phrases": [],
       "description": "Nightly build of the finance model (subscriptions, regular income streams, merchant stats, category baselines, recurring obligations) → data/finance-model.json, read by the finance hum harvester. Direct script — no webhook, no Anthropic API. READ-ONLY over plaid_*. Installation follow-up work rides the optional _ext/finance-model-after.sh hook. Kill switch: data/.finance-model-off.",
       "job": null
+    },
+    {
+      "name": "flights-scan",
+      "schedule": "20 7 * * *",
+      "schedule_human": "Daily at 7:20 AM local",
+      "trigger_script": "agent/scripts/trigger-flights-scan.sh",
+      "webhook_url": null,
+      "webhook_task": null,
+      "ops_playbook_section": "flights-scan",
+      "delivers_to": "jori",
+      "phrases": [
+        "flights scan",
+        "scan flights",
+        "extract travel bookings"
+      ],
+      "description": "Scan Gmail for flight/accommodation/car-rental confirmations (sender-domain lists + optional trip-organiser forward address in agent/local/config/flights-scan.json) and refresh data/flights.json; owns the matching calendar events and runs `travel sync`. The daily cron is the safety net; travel change/cancellation emails also dispatch it via the ops-agent triage travel-change fast-path. Scripted: the trigger kicks launchd agent ai.claude.flights-scan, which runs bin/flights-scan-run (one tool-less model call to read emails). No agent turn.",
+      "job": "flights-scan",
+      "runtime": "launchd-script",
+      "launchd_label": "ai.claude.flights-scan",
+      "script": "bin/flights-scan-run"
     }
   ]
 }

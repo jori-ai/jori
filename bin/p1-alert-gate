@@ -37,6 +37,7 @@ const SEND =
 // instead of the real network. Optional: an installation without a resolver
 // probe at this path records nothing (see probeResolver's contract).
 const DNS_PROBE =
+  // kernel-closure-ok: an optional probe; probeResolver records nothing when it is absent
   process.env.P1_ALERT_GATE_DNS_PROBE || installTools("bin/dns-health-check");
 const DNS_PROBE_TIMEOUT_MS = Number(process.env.P1_ALERT_GATE_DNS_TIMEOUT_MS || 12000);
 
