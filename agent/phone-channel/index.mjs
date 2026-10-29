@@ -832,7 +832,7 @@ async function handleIncomingMessage(row) {
       locationLine = `\n[Location: ${metadata.latitude}, ${metadata.longitude} (accuracy: ${metadata.location_accuracy || "unknown"}m)]`;
     }
 
-    // Sent from the iOS/macOS share sheet (client/JoriShare), not typed: a
+    // Sent from the iOS/macOS share sheet (apps/companion/JoriShare), not typed: a
     // photo arrives as its own bare jori-attachments URL row, the note and
     // shared text/links as the following row; shareBundler has already joined
     // them into this one message, photos first.

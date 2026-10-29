@@ -332,14 +332,15 @@ Full text: `docs/agent-rules-detail.md` § Health; skill `health-support`.
 
 ## iOS / macOS App Releases (TestFlight) — you cut these yourself, no human needed
 
-The Jori client is `client/` (bundle id in `client/`'s project settings). **Releasing is a self-service agent task — never tell the user to "archive in Xcode."** Land the change on main, optionally compile-check, then:
+The Jori app is `apps/companion/` (one source tree; an installation's identity — bundle id, team, backend, stored-name prefixes, signing contexts, features — is `Config/Installation.xcconfig`, kept in the installation's overlay at `.overlay/app/` and copied in by its build). **Releasing is a self-service agent task — never tell the user to "archive in Xcode."** Land the change (kernel `apps/companion/` and/or overlay `.overlay/app/`), optionally compile-check, then dispatch the installation's TestFlight workflow and watch it:
 
 ```bash
-gh workflow run "Jori - iOS TestFlight" --ref main
-gh run watch "$(gh run list --workflow=jori-testflight.yml -L1 --json databaseId -q '.[0].databaseId')" --exit-status
+gh workflow run <ios workflow> -R <installation repo> --ref main     # names: docs/ios-releases.md
+gh workflow run <macos workflow> -R <installation repo> --ref main
+gh run watch <run id> -R <installation repo> --exit-status
 ```
 
-**Do NOT hand-bump `CURRENT_PROJECT_VERSION`** (CI sets it). Git push and `gh` need the sandbox disabled. Full procedure (compile-check, macOS sibling, fastlane fallback, secrets): `docs/ios-releases.md`.
+**Do NOT hand-bump `CURRENT_PROJECT_VERSION`** (CI sets it from the workflow's run number). Git push and `gh` need the sandbox disabled. Full procedure (workflow names, compile-check, secrets): `docs/ios-releases.md`.
 
 ---
 

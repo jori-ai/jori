@@ -1060,7 +1060,7 @@ _spool_append() {
 }
 
 # metadata.choices is a JSON STRING (the client decodes metadata as
-# [String: String] — see client/Jori/ChoicePrompt.swift), so the payload is
+# [String: String] — see apps/companion/Jori/ChoicePrompt.swift), so the payload is
 # encoded twice: once as the object, once as the string that carries it.
 JSON_METADATA=""
 if [ -n "${CHOICES_JSON:-}" ] || [ -n "${EXTRA_METADATA_JSON:-}" ]; then
