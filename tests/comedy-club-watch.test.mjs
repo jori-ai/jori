@@ -373,6 +373,24 @@ test("seen: a show on the night the user is already going is dropped in code, no
   } finally { h.cleanup(); }
 });
 
+test("seen: a hold (\"let's wait a year\") drops every listing up to its date, new show or not, and lapses after it", () => {
+  const north = [{ comedian: "Jim North", date: "2026-05-27", venue: "Example Club", with: "Sam", hold_until: "2027-05-27" }];
+  assert.equal(repeatCheck({ comedian: "Jim North", date: "2026-11-11" }, north, "2026-10-29").held.date, "2026-05-27");
+  assert.equal(repeatCheck({ comedian: "Jim North", date: "2027-05-27" }, north, "2026-10-29").held.date, "2026-05-27");
+  assert.deepEqual(repeatCheck({ comedian: "Jim North", date: "2027-06-03" }, north, "2026-10-29"), {}, "after the hold it is offered again");
+});
+
+test("seen: a held comedian is dropped in code, not sent and not asked about", () => {
+  const d = ymd(20);
+  const h = harness({ roster: [NOR], seen: [{ comedian: "Jim North", date: earlierSameYear(d), venue: "Example Club", source: "manual", hold_until: ymd(300) }] });
+  try {
+    const r = h.ingest([show("Jim North", "Example Club", 20, "https://club.example/held")]);
+    assert.deepEqual(JSON.parse(r.stdout.trim().split("\n").at(-1)).needs_check, []);
+    assert.equal(h.calls("jori-send-curl").length + h.calls("email-send").length, 0);
+    assert.deepEqual(h.state().seen.map((s) => [s.surfaced, s.skip_reason]), [[false, "held"]]);
+  } finally { h.cleanup(); }
+});
+
 test("seen: a sighting last year does not hold a comedian back this year", () => {
   const d = ymd(20);
   const h = harness({ roster: [NOR], seen: [{ comedian: "Jim North", date: `${Number(yearOf(d)) - 1}-06-01`, venue: "Cellar Room", source: "manual" }] });

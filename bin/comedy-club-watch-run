@@ -227,6 +227,7 @@ function gate(item) {
     // whether it is a new show, and the reminder rides on the message.
     const seen = repeatCheck(item, sightingsOf(item.comedian), today);
     if (seen.already_booked) return { status: "skip", reason: "already_booked" };
+    if (seen.held) return { status: "skip", reason: "held" };
     if (seen.repeat) { item.tags.push(seen.tag); item.repeat = seen.repeat; }
     const away = exitOf("travel", ["in-city", METRO, item.date]).status === 1;
     if (away) {

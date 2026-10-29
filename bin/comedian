@@ -19,7 +19,7 @@
  *   comedian add "<name>" [--taste <t>] [--aka "<alt>"] [--language <code>]
  *   comedian rm "<name>"
  *   comedian seen "<name>" [--year YYYY] [--json]   # has the user seen/booked them this year? exit 0 = yes
- *   comedian seen add "<name>" --date YYYY-MM-DD [--venue V] [--show S] [--with <companion>] [--note N]
+ *   comedian seen add "<name>" --date YYYY-MM-DD [--venue V] [--show S] [--with <companion>] [--note N] [--hold-until YYYY-MM-DD]
  *   comedian seen list [--json]                      # the hand-kept sightings (the calendar is read live)
  *
  * `check` matches case-insensitively as a substring of the normalized input, so
@@ -112,10 +112,11 @@ if (cmd === "check") {
     if (arg === "add") {
       const name = argv[2], date = flag("date");
       if (!name || !/^\d{4}-\d{2}-\d{2}$/.test(date || "")) { // lang-regex-ok: ISO date CLI argument
-        process.stderr.write('usage: comedian seen add "<name>" --date YYYY-MM-DD [--venue V] [--show S] [--with <companion>] [--note N]\n'); process.exit(2);
+        process.stderr.write('usage: comedian seen add "<name>" --date YYYY-MM-DD [--venue V] [--show S] [--with <companion>] [--note N] [--hold-until YYYY-MM-DD]\n'); process.exit(2);
       }
       const e = { comedian: entryFor(name).name, date };
       for (const k of ["venue", "show", "with", "note"]) if (flag(k)) e[k] = flag(k);
+      if (flag("hold-until")) e.hold_until = flag("hold-until"); // "let's wait a year": no listing up to this date is offered
       seen.addManual(CFG.sightings_file, e);
       console.log(`recorded: ${e.comedian} on ${date}${e.venue ? ` at ${e.venue}` : ""}`);
     } else if (arg === "list") {
