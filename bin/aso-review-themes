@@ -1,0 +1,202 @@
+#!/usr/bin/env python3
+# aso-review-themes — monthly clustering of review language → keyword candidates + complaint patterns.
+#
+# Reads mkt-reviews-state.json (collected daily by mkt-reviews-pulse). Extracts
+# n-grams from review titles + bodies, surfaces phrases mentioned ≥2 times that
+# AREN'T already in the target keyword list (= new keyword candidates), plus
+# complaint clusters from low-star reviews and praise clusters from high-star.
+#
+# Output: mkt-aso-review-themes-state.json
+#
+# Gracefully no-ops when there are no reviews (a new app has near-zero
+# reviews; the job is harmless to run until data accumulates). OFF without
+# agent/local/config/marketing.json.
+
+import json, os, re, sys, time
+from collections import Counter
+from datetime import datetime, timedelta
+
+_BIN = os.path.dirname(os.path.realpath(globals().get("__file__") or sys.argv[0]))
+sys.path.insert(0, os.path.join(os.path.dirname(_BIN), "lib"))
+import mkt_local  # noqa: E402
+
+REVIEWS_STATE = mkt_local.data_path("mkt-reviews-state.json")
+TARGET_KW = mkt_local.data_path("mkt-aso-target-keywords.json")
+OUT_PATH = mkt_local.data_path("mkt-aso-review-themes-state.json")
+TODAY = time.strftime("%Y-%m-%d", time.gmtime())
+
+# Phrase lengths to consider. 2-3-grams are the ASO sweet spot — full
+# keyword phrases people actually search for.
+MIN_GRAM = 2
+MAX_GRAM = 3
+MIN_OCCURRENCES = 2
+LOOKBACK_DAYS = 90  # consider reviews from the last 90 days
+
+# Stop words to skip n-grams that start/end with them.
+STOPWORDS = set("""
+a an the and or but if then so as of in on at by for with from to into onto
+is are was were be been being am do does did doing done have has had having
+i you he she it we they me him her us them my your his its our their this that
+these those there here what which who whom whose when where why how all any
+can could should would may might must will shall not no nor too very just only
+""".split())
+
+
+def load(path, default=None):
+    if not os.path.exists(path):
+        return default
+    try:
+        return json.load(open(path))
+    except Exception:
+        return default
+
+
+def save_json(path, data):
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f, indent=2)
+    os.rename(tmp, path)
+
+
+def tokenize(text):
+    """Lowercase + strip punctuation + split on whitespace."""
+    if not text:
+        return []
+    text = text.lower()
+    text = re.sub(r"[^\w\s'-]", " ", text)
+    text = re.sub(r"\s+", " ", text)
+    return [t for t in text.split() if t]
+
+
+def ngrams(tokens, n):
+    out = []
+    for i in range(len(tokens) - n + 1):
+        gram = tokens[i:i + n]
+        if gram[0] in STOPWORDS or gram[-1] in STOPWORDS:
+            continue
+        if any(len(t) < 2 for t in gram):
+            continue
+        out.append(" ".join(gram))
+    return out
+
+
+def extract_phrases(text):
+    tokens = tokenize(text)
+    phrases = []
+    for n in range(MIN_GRAM, MAX_GRAM + 1):
+        phrases.extend(ngrams(tokens, n))
+    return phrases
+
+
+def collect_target_terms(target_kw):
+    """Flatten all target keywords into a single lowercased set for dedup."""
+    out = set()
+    if not target_kw:
+        return out
+    for locale, tiers in (target_kw.get("keywords") or {}).items():
+        for tier, kws in tiers.items():
+            for kw in kws:
+                out.add(kw.lower().strip())
+    return out
+
+
+def reviews_in_window(reviews_state):
+    """Walk reviews_state.history[].reviews and return reviews within LOOKBACK_DAYS."""
+    cutoff = (datetime.utcnow() - timedelta(days=LOOKBACK_DAYS)).strftime("%Y-%m-%d")
+    out = []
+    for day in (reviews_state or {}).get("history", []):
+        if day.get("date", "") < cutoff:
+            continue
+        for r in (day.get("reviews") or []):
+            r["_day"] = day.get("date")
+            out.append(r)
+    # Also include any new_today reviews if present
+    for r in (reviews_state or {}).get("new_today", []):
+        out.append(r)
+    return out
+
+
+def cluster(reviews, target_set, star_filter=None):
+    """Count n-grams across given reviews, filter ones already in target, return ranked list."""
+    counts = Counter()
+    examples = {}  # phrase → example review id (one per phrase)
+    for r in reviews:
+        if star_filter and not star_filter(r.get("rating") or r.get("stars") or 0):
+            continue
+        body = " ".join(filter(None, [r.get("title"), r.get("body"), r.get("text")]))
+        phrases = extract_phrases(body)
+        seen_in_review = set()
+        for p in phrases:
+            if p in seen_in_review:
+                continue  # only count each phrase once per review
+            seen_in_review.add(p)
+            counts[p] += 1
+            if p not in examples:
+                examples[p] = r.get("id") or r.get("review_id") or ""
+    # Filter: ≥ MIN_OCCURRENCES, not already in target keywords
+    out = []
+    for phrase, count in counts.most_common(50):
+        if count < MIN_OCCURRENCES:
+            break
+        if phrase in target_set:
+            continue
+        out.append({"phrase": phrase, "count": count, "example_review_id": examples.get(phrase, "")})
+    return out
+
+
+def main():
+    if not mkt_local.configured():
+        print(json.dumps({"ok": True, "skipped": "not configured (agent/local/config/marketing.json)"}))
+        return 0
+    reviews_state = load(REVIEWS_STATE)
+    if reviews_state is None:
+        print(json.dumps({"ok": False, "error": "mkt-reviews-state.json not found"}))
+        return 1
+    target_kw = load(TARGET_KW)
+    target_set = collect_target_terms(target_kw)
+
+    reviews = reviews_in_window(reviews_state)
+    if not reviews:
+        # Gracefully no-op when no reviews available
+        out = {
+            "version": 1,
+            "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "reviews_analyzed": 0,
+            "keyword_candidates": [],
+            "complaint_themes": [],
+            "praise_themes": [],
+            "note": "No reviews in lookback window. Job re-runs monthly; data will populate as reviews accumulate.",
+        }
+        save_json(OUT_PATH, out)
+        print(json.dumps({"ok": True, "reviews_analyzed": 0, "skipped_reason": "no reviews"}, indent=2))
+        return 0
+
+    # All-review clustering → keyword candidates
+    keyword_candidates = cluster(reviews, target_set, star_filter=None)
+    # Low-star (≤3) → complaint themes
+    complaint_themes = cluster(reviews, target_set, star_filter=lambda s: s and s <= 3)
+    # High-star (≥4) → praise themes (validates positioning)
+    praise_themes = cluster(reviews, target_set, star_filter=lambda s: s and s >= 4)
+
+    out = {
+        "version": 1,
+        "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "reviews_analyzed": len(reviews),
+        "lookback_days": LOOKBACK_DAYS,
+        "keyword_candidates": keyword_candidates[:30],
+        "complaint_themes": complaint_themes[:20],
+        "praise_themes": praise_themes[:20],
+    }
+    save_json(OUT_PATH, out)
+    print(json.dumps({
+        "ok": True,
+        "reviews_analyzed": len(reviews),
+        "keyword_candidates": len(out["keyword_candidates"]),
+        "complaint_themes": len(out["complaint_themes"]),
+        "praise_themes": len(out["praise_themes"]),
+    }, indent=2))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

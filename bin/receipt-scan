@@ -1,0 +1,678 @@
+#!/usr/bin/env node
+"use strict";
+// receipt-scan — turn order confirmations and invoices in mail into receipts.
+//
+// A bank feed says a charge happened; it never says what was bought. That
+// second half arrives by email, and this extracts it: vendor, date, total, card
+// last-4, ship-to, and the individual line items. The property hub's admin then
+// matches each receipt to its transaction, which turns categorising a year of
+// spending from guesswork into confirmation.
+//
+// Why a model reads the mail rather than a parser: every vendor formats
+// differently, and the number that matters is often not the most prominent one
+// on the page. A paid Southern Comfort invoice prints "AMOUNT DUE $0.00" above
+// line items totalling several hundred dollars; the charge was the latter. A
+// pattern takes the label it recognises and is confidently wrong. This is a
+// reading of a document, so a model does the reading. (Same rule as
+// agent: code owns geometry, a model owns language.)
+//
+// PRIVACY. The search is deliberately broad, so a vendor no allowlist
+// anticipated is still caught — which means it reads ordinary private mail too,
+// including other connected people's. Two rules make that acceptable and both are enforced below:
+// only what the model recognises as a receipt is persisted, and only its
+// FIELDS are — never a message body, never a subject of anything that was not a
+// receipt. Everything else is discarded in memory.
+//
+// Usage:
+//   receipt-scan --since 2026-01-01                 all connected accounts
+//   receipt-scan --since 2026-01-01 --account X     one mailbox
+//   receipt-scan --since 2026-01-01 --dry-run       extract + print, no writes
+//   receipt-scan --since 2026-01-01 --limit 50      cap messages examined
+//   receipt-scan --since 2026-01-01 --rescan        re-read what was already done
+//
+// Requires: gog (Gmail, multi-account), pdftotext (poppler),
+//           SUPABASE_SERVICE_ROLE_KEY, and a logged-in `claude` (Max). The model
+//           runs through `claude -p`, which only authenticates inside the GUI
+//           session: on the mini this runs as the launchd agent
+//           ai.claude.receipt-scan, not from cron. A year-long backfill is
+//           ~1,000 calls against the same Max limits jori's agents use —
+//           run one in chunks (--since/--limit), not in one go.
+
+const { execFile } = require("node:child_process");
+const { promisify } = require("node:util");
+const fs = require("node:fs");
+
+/**
+ * The operator's real environment, captured BEFORE anything loads .env.
+ *
+ * supabase-rest requires load-env, which merges .env into process.env as
+ * a side effect of being imported. That file carries GOG_KEYRING_PASSWORD for
+ * the mini's file-backed keyring, and inheriting it on a Mac makes gog use the
+ * wrong backend and fail with an integrity-check error — from inside this
+ * script only, while the identical command works in the shell. gog therefore
+ * runs with the environment the operator actually has.
+ */
+const SHELL_ENV = { ...process.env };
+
+const { request } = require("../lib/supabase-rest.js");
+const { judge } = require("../lib/max-judge.js");
+
+const run = promisify(execFile);
+
+const ARGV = process.argv.slice(2);
+const flag = (name, fallback = null) => {
+  const i = ARGV.indexOf(`--${name}`);
+  if (i === -1) return fallback;
+  const next = ARGV[i + 1];
+  return next === undefined || next.startsWith("--") ? true : next;
+};
+const DRY_RUN = ARGV.includes("--dry-run");
+const SINCE = flag("since");
+// Upper bound on the search window. Gmail caps every search at 500 results, so a
+// backfill of several years CANNOT be done with --since alone: `--since
+// 2021-01-01` returns the newest 500 matches and never reaches 2021 at all,
+// while reporting a clean run. Walk the years in windows narrow enough that no
+// single query stays under the cap, and the truncation warning says when one did.
+const UNTIL = flag("until");
+/**
+ * A file of `account<TAB>messageId` lines to examine instead of searching.
+ *
+ * The search here is built for breadth — it asks what commerce mail exists in a
+ * window, which for these mailboxes is ~1,300 messages per year each, every one
+ * of them a model call. When the question is narrower ("the invoices from these
+ * 55 service providers, across every year we have books for"), the caller can
+ * answer it with free Gmail searches and hand the result over, which turns a
+ * ten-thousand-call sweep into a few hundred.
+ *
+ * Everything downstream is unchanged: same fetch, same recall gate, same
+ * extraction, same `receipts` rows — so a message picked this way is
+ * indistinguishable from one the sweep found, and re-running skips it.
+ */
+const IDS_FILE = flag("ids-file");
+const ONLY_ACCOUNT = flag("account");
+const LIMIT = Number(flag("limit", "400"));
+const VERBOSE = ARGV.includes("--verbose");
+
+/** `account<TAB>messageId` lines → account → ids. */
+const EXPLICIT_IDS = (() => {
+  if (!IDS_FILE || IDS_FILE === true) return null;
+  const byAccount = new Map();
+  for (const line of fs.readFileSync(IDS_FILE, "utf8").split("\n")) {
+    const [account, id] = line.split("\t").map((c) => (c || "").trim());
+    if (!account || !id) continue;
+    if (!byAccount.has(account)) byAccount.set(account, []);
+    byAccount.get(account).push(id);
+  }
+  return byAccount.size ? byAccount : null;
+})();
+/** Re-read messages already extracted. Only wanted when extraction has improved. */
+const RESCAN = ARGV.includes("--rescan");
+
+/** Cheap and fast — each judgement is one short document. */
+const MODEL = "claude-sonnet-5-5";
+
+/**
+ * Mail worth looking at, as SEPARATE searches whose results are unioned.
+ *
+ * Not one clever query, because Gmail silently mis-parses a top-level OR group:
+ * `(subject:order OR from:amazon.com)` returns hundreds of subject matches and
+ * ZERO from-matches, and the same expression with spaces inside the parentheses
+ * returns nothing at all. Neither fails loudly — you get a plausible-looking
+ * result set with an entire clause missing.
+ *
+ * That is not hypothetical. It silently excluded every Amazon email from a
+ * full-year scan: 178 Amazon charges went uncategorised because the corpus that
+ * would have explained them was never searched, and the run reported success.
+ *
+ * Three independent searches, unioned by message id, cannot fail that way. Each
+ * is verifiable on its own, and a broken one shows up as a zero.
+ */
+function searchQueries(since, until) {
+  const after =
+    `after:${since.replace(/-/g, "/")}` +
+    (until && until !== true ? ` before:${until.replace(/-/g, "/")}` : "");
+  const exclude = "-in:sent -in:trash -in:draft";
+  return [
+    // Anything that names itself a purchase, split across several searches.
+    //
+    // One query covering the whole vocabulary returned exactly 500 — the cap —
+    // and so was quietly dropping the oldest months, the same failure the
+    // Amazon query had. Split until each comes back under it. The truncation
+    // warning below is what makes that visible rather than a guess.
+    `${after} subject:(receipt OR invoice OR "order confirmation") ${exclude}`,
+    `${after} subject:(order OR purchase OR ordered) ${exclude}`,
+    `${after} subject:(payment OR paid) ${exclude}`,
+    // "statement" is mostly bank and card statements, which are not receipts and
+    // get gated before the model — but it is kept because some vendors title a
+    // real invoice that way, and it is cheap to look.
+    `${after} subject:(billed OR charged OR statement) ${exclude}`,
+    // Amazon order confirmations specifically, NOT all Amazon mail.
+    //
+    // A year of Amazon is well over the 500 results a search can return, and
+    // being truncated silently costs the oldest months: a broad
+    // `from:amazon.com` returned the most recent 500 and lost every January,
+    // February and March order — 104 of them — while looking perfectly healthy.
+    // Narrowing to the confirmations keeps the result set at ~241, under the
+    // cap, and they are the only Amazon mail carrying a total anyway.
+    `${after} from:amazon.com subject:(Ordered OR "order confirmation" OR refund) ${exclude}`,
+    // Other retailers, whose volume is nowhere near the cap.
+    `${after} from:(homedepot.com OR lowes.com OR wayfair.com OR target.com OR walmart.com OR costco.com) ${exclude}`,
+    // How the vendors that matter most here — A/C, plumbing, municipal — invoice.
+    `${after} has:attachment filename:pdf ${exclude}`,
+  ];
+}
+
+/**
+ * Most results a single search can return.
+ *
+ * gog caps at 500 however high `--max` goes, and asking for more than about a
+ * thousand makes it return nothing at all. A query that comes back at the cap
+ * has therefore been silently truncated — and truncation drops the OLDEST mail,
+ * which is exactly the part a year-end report needs.
+ */
+const SEARCH_CAP = 500;
+
+const EXTRACT_SCHEMA = {
+  type: "object",
+  properties: {
+    isReceipt: {
+      type: "boolean",
+      description:
+        "True only if this documents a completed or placed purchase with a total the customer was or will be charged. False for shipping and delivery notices that carry no total, marketing, price-drop alerts, receipts belonging to someone else, subscription reminders that have not billed, and anything that merely mentions money.",
+    },
+    vendor: { type: "string", description: "Who was paid, as a person would name them." },
+    date: {
+      type: "string",
+      description:
+        "Order or invoice date, YYYY-MM-DD. If the document does not state one — Amazon's order confirmations give a total and an order number but no date — use the 'Email sent' date from the header instead. Never guess a date and never leave it blank: a receipt dated wrongly can never be matched to its charge.",
+    },
+    total: {
+      type: "number",
+      description:
+        "The amount that will appear on the card statement, POSITIVE for a purchase and NEGATIVE for a refund. This is NOT always the most prominent figure: a paid invoice may show 'amount due 0.00' while the charge was the sum of its line items. Choose the amount actually charged.",
+    },
+    currency: { type: "string", description: "ISO currency code, e.g. USD." },
+    cardLast4: {
+      type: ["string", "null"],
+      description: "Last 4 digits of the card, if the document names them. Digits only.",
+    },
+    shipTo: {
+      type: ["string", "null"],
+      description:
+        "Delivery or service address, as 'CITY, STATE' when you can tell. For a service call this is the address worked on, which is the more useful one.",
+    },
+    orderId: { type: ["string", "null"], description: "Order or invoice number." },
+    lineItems: {
+      type: "array",
+      description:
+        "What was actually bought, one entry per line. This is the point of the whole exercise, so name products specifically rather than summarising. Empty if the document genuinely itemises nothing.",
+      items: {
+        type: "object",
+        properties: {
+          description: { type: "string" },
+          quantity: { type: ["number", "null"] },
+          amount: { type: ["number", "null"] },
+        },
+        required: ["description"],
+        additionalProperties: false,
+      },
+    },
+    confidence: {
+      type: "number",
+      description:
+        "0 to 1, how sure you are this is a receipt and the total is right. Be honest — a low number means a human looks, which is cheap.",
+    },
+  },
+  required: ["isReceipt", "vendor", "date", "total", "currency", "lineItems", "confidence"],
+  additionalProperties: false,
+};
+
+/**
+ * A cheap gate to keep the model off documents that cannot be receipts.
+ *
+ * Deliberately a RECALL filter, not a judgement. It never concludes "this is a
+ * receipt" — only "this cannot be one" — and everything surviving it still goes
+ * to the model, which does the actual reading. That distinction is what keeps
+ * it on the right side of the no-regex-on-language rule: what a document MEANS
+ * stays the model's call; this only declines to spend money on documents with
+ * no monetary content whatsoever.
+ *
+ * Two conditions, both generous:
+ *
+ *  1. It states an amount. Every receipt does, in some currency. A formatted
+ *     figure is structure rather than phrasing, so matching it is exact.
+ *  2. It uses at least one word from the vocabulary of buying. Broad on
+ *     purpose — a lease or an inspection notice quotes money without any of it.
+ *
+ * The failure mode is dropping a real receipt, so every skip is counted and
+ * --verbose prints its subject. If that list ever contains something real, the
+ * vocabulary is too narrow and is the thing to widen.
+ */
+/**
+ * A monetary figure in any of the currencies that actually turn up here.
+ *
+ * Written wide after a narrow version dropped a real one: the Genki health
+ * insurance receipt is billed in euros with German decimal formatting, so a
+ * dollars-and-decimal-point pattern declined to see an amount at all and the
+ * receipt was skipped before the model could read it. A gate whose whole job is
+ * recall cannot afford to assume one country's punctuation.
+ *
+ * Covers symbols (`$ € £ ₪ ¥`), trailing codes (`29.15 USD`), and both decimal
+ * conventions (`1,350.00` and `1.350,00`).
+ */
+const MONEY =
+  /[$€£₪¥]\s?\d|\d[\d.,]*\s?(usd|eur|gbp|ils|nis|cad|chf|aud)\b|\b\d{1,3}(?:[.,]\d{3})*[.,]\d{2}\b/i;
+const BUYING_WORDS =
+  /\b(receipt|invoice|order|ordered|purchase|purchased|payment|paid|billing|billed|charged|charge|subtotal|total|amount due|balance due|transaction|refund|checkout|subscription|renewal)\b/i;
+
+function couldBeReceipt(document) {
+  return MONEY.test(document) && BUYING_WORDS.test(document);
+}
+
+const SYSTEM_PROMPT = `You read emails and extract purchase receipts, so that bank transactions can be matched to what was actually bought.
+
+Most of what you see will NOT be a receipt. Say so plainly rather than forcing a reading — the cost of a false positive is a wrong number attached to a real charge, which is worse than nothing.
+
+In particular these are NOT receipts: shipping, dispatch and delivery notices that carry no total; return and refund *requests* that have not been issued; marketing and price alerts; renewal reminders for something not yet billed; someone else's receipt forwarded for information; and anything whose only monetary content is a balance or a limit.
+
+An order confirmation with a stated total IS a receipt, even if the goods have not shipped.
+
+The total you report is the amount that will appear on a card statement. Read the document rather than the labels — a paid invoice often prints "amount due $0.00" above line items totalling several hundred dollars, and the charge was the latter. A refund is negative.
+
+Name the line items specifically. "Replacing a faulty 45/5 mfd capacitor" is useful; "AC service" is not. When a PDF is attached its text follows the email body, and it is usually the better source.`;
+
+// ── Gmail via gog ───────────────────────────────────────────────────────────
+
+async function gog(args) {
+  const { stdout } = await run("gog", args, {
+    maxBuffer: 64 * 1024 * 1024,
+    env: { ...SHELL_ENV, PATH: `/opt/homebrew/bin:${SHELL_ENV.PATH || ""}` },
+  });
+  return stdout;
+}
+
+async function listAccounts() {
+  const out = await gog(["auth", "list", "-p"]);
+  return out
+    .split("\n")
+    .map((l) => l.split("\t")[0]?.trim())
+    .filter((a) => a && a.includes("@"));
+}
+
+async function searchMessages(account, since, limit, until) {
+  const seen = new Set();
+  const warnings = [];
+
+  for (const query of searchQueries(since, until)) {
+    let ids = [];
+
+    // Retried on BOTH an error and an empty result.
+    //
+    // Gmail rate-limits a burst of searches with a 403, and — worse — a
+    // throttled search can also come back empty rather than failing. An empty
+    // result is indistinguishable from "nothing matched", so without this a
+    // throttle silently removes a whole query's worth of candidates while the
+    // run still reports success. Backoff is generous because the quota is per
+    // minute: waiting is the only thing that helps.
+    let lastError = null;
+    for (let attempt = 1; attempt <= 4; attempt++) {
+      try {
+        const out = await gog([
+          "gmail",
+          "search",
+          query,
+          "--account",
+          account,
+          "--max",
+          String(Math.min(limit, SEARCH_CAP)),
+          "-p",
+        ]);
+        ids = out
+          .split("\n")
+          .slice(1) // header row
+          .map((l) => l.split("\t")[0]?.trim())
+          .filter(Boolean);
+        lastError = null;
+        if (ids.length > 0) break;
+      } catch (e) {
+        lastError = e;
+      }
+      if (attempt < 4) {
+        const waitMs = 5000 * attempt;
+        if (VERBOSE) console.log(`    retrying in ${waitMs / 1000}s…`);
+        await new Promise((r) => setTimeout(r, waitMs));
+      }
+    }
+
+    // A query that never succeeded is a hole in the corpus, not a quiet zero.
+    if (lastError) {
+      warnings.push(`FAILED after retries: "${query.slice(0, 70)}…" — ${lastError.message.slice(0, 90)}`);
+      continue;
+    }
+
+    if (ids.length >= SEARCH_CAP) {
+      // Say so loudly. Truncation drops the oldest mail, which is precisely
+      // what a year-end report is missing when it looks complete.
+      warnings.push(
+        `TRUNCATED at ${SEARCH_CAP}: "${query.slice(0, 80)}…" — older mail was dropped. Narrow this query.`
+      );
+    }
+
+    if (VERBOSE) console.log(`    ${ids.length} from: ${query.slice(0, 72)}…`);
+    // A message caught by two searches is still one message.
+    for (const id of ids) seen.add(id);
+  }
+
+  for (const warning of warnings) console.warn(`  ! ${warning}`);
+  return [...seen];
+}
+
+/** Walk a Gmail payload, decoding text parts and noting attachments. */
+function readPayload(payload) {
+  let text = "";
+  let html = "";
+  const attachments = [];
+
+  const walk = (part) => {
+    const body = part.body || {};
+    const mime = part.mimeType || "";
+    if (body.data) {
+      const decoded = Buffer.from(body.data, "base64url").toString("utf8");
+      if (mime.includes("text/plain")) text += decoded;
+      else if (mime.includes("text/html")) html += decoded;
+    }
+    if (body.attachmentId && (part.filename || "").toLowerCase().endsWith(".pdf")) {
+      attachments.push({ id: body.attachmentId, filename: part.filename });
+    }
+    for (const child of part.parts || []) walk(child);
+  };
+  walk(payload);
+
+  return { text, html, attachments };
+}
+
+/** Strip tags when a message is HTML-only. Machine-generated markup, not language. */
+function htmlToText(html) {
+  return html
+    .replace(/<style[\s\S]*?<\/style>/gi, " ")
+    .replace(/<script[\s\S]*?<\/script>/gi, " ")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/&nbsp;/g, " ")
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&#\d+;/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function headerOf(payload, name) {
+  const h = (payload.headers || []).find(
+    (x) => (x.name || "").toLowerCase() === name.toLowerCase()
+  );
+  return h ? h.value : null;
+}
+
+/**
+ * Fetch one message, retrying through Gmail's throttling.
+ *
+ * Reading a thousand messages in a burst reliably trips the per-minute quota,
+ * and an un-retried read simply loses that message for the run. Recoverable on
+ * a later pass, since a failed message never reaches the receipts table and so
+ * is not skipped as already-extracted — but a failure that repairs itself two
+ * runs later still leaves a gap in the year in the meantime.
+ */
+async function fetchMessage(account, messageId) {
+  let lastError = null;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      const raw = await gog(["gmail", "read", messageId, "--account", account, "-j"]);
+      const parsed = JSON.parse(raw);
+      const message = parsed?.thread?.messages?.[0];
+      if (!message) return null;
+      return { message, ...readPayload(message.payload || {}) };
+    } catch (e) {
+      lastError = e;
+      if (attempt < 3) await new Promise((r) => setTimeout(r, 4000 * attempt));
+    }
+  }
+  throw lastError;
+}
+
+/** Download a PDF attachment and return its text, or null if it cannot be read. */
+async function attachmentText(account, messageId, attachment) {
+  try {
+    const out = await gog([
+      "gmail",
+      "attachment",
+      messageId,
+      attachment.id,
+      "--account",
+      account,
+      "-p",
+    ]);
+    const line = out.split("\n").find((l) => l.startsWith("path\t"));
+    if (!line) return null;
+    const file = line.split("\t")[1].trim();
+    if (!fs.existsSync(file)) return null;
+
+    const { stdout } = await run("pdftotext", ["-layout", file, "-"], {
+      maxBuffer: 16 * 1024 * 1024,
+      env: { ...SHELL_ENV, PATH: `/opt/homebrew/bin:${SHELL_ENV.PATH || ""}` },
+    });
+    return stdout;
+  } catch (e) {
+    if (VERBOSE) console.error(`    (attachment ${attachment.filename}: ${e.message})`);
+    return null;
+  }
+}
+
+// ── Extraction ──────────────────────────────────────────────────────────────
+
+async function extract(document) {
+  // On the Max subscription via a tool-less `claude -p` (lib/max-judge.js),
+  // never an API key — a shared API key once hit its monthly cap and this scan
+  // silently read nothing for weeks. A lost login
+  // or a usage limit throws `fatal` and stops the run.
+  return judge({ model: MODEL, system: SYSTEM_PROMPT, prompt: document, schema: EXTRACT_SCHEMA });
+}
+
+// ── Persistence ─────────────────────────────────────────────────────────────
+
+/**
+ * Message ids already extracted, so a re-run does not pay to read them again.
+ *
+ * This is the difference between a weekly cron costing a few model calls and
+ * costing hundreds. A message's content never changes, and once a vendor is
+ * settled by precedent the hub does not consult its receipt anyway — Genki's
+ * invoice arrives every month and is read once, not twelve times.
+ *
+ * `--rescan` forces a re-read, for when the extraction itself has improved.
+ */
+async function alreadyExtracted(account) {
+  const rows =
+    (await request(
+      `/rest/v1/receipts?select=id&account=eq.${encodeURIComponent(account)}&limit=10000`
+    )) || [];
+  return new Set(rows.map((r) => r.id));
+}
+
+async function saveReceipt(receipt, lineItems) {
+  await request("/rest/v1/receipts", {
+    method: "POST",
+    body: [receipt],
+    prefer: "resolution=merge-duplicates",
+  });
+  // Replace items wholesale so a re-scan cannot accumulate duplicates.
+  await request(`/rest/v1/receipt_line_items?receipt_id=eq.${encodeURIComponent(receipt.id)}`, {
+    method: "DELETE",
+  });
+  if (lineItems.length) {
+    await request("/rest/v1/receipt_line_items", { method: "POST", body: lineItems });
+  }
+}
+
+// ── Main ────────────────────────────────────────────────────────────────────
+
+async function main() {
+  if (!SINCE && !EXPLICIT_IDS) {
+    console.error(
+      "Usage: receipt-scan --since YYYY-MM-DD [--until YYYY-MM-DD] [--account X] [--dry-run] [--limit N]\n" +
+        "       receipt-scan --ids-file <file of account<TAB>messageId lines> [--dry-run]"
+    );
+    process.exit(1);
+  }
+
+  const accounts =
+    ONLY_ACCOUNT && ONLY_ACCOUNT !== true
+      ? [ONLY_ACCOUNT]
+      : EXPLICIT_IDS
+        ? [...EXPLICIT_IDS.keys()]
+        : await listAccounts();
+  if (EXPLICIT_IDS) {
+    const n = [...EXPLICIT_IDS.values()].reduce((a, l) => a + l.length, 0);
+    console.log(`Examining ${n} named message(s) across ${accounts.length} mailbox(es)${DRY_RUN ? " (dry run)" : ""}`);
+  } else
+  console.log(
+    `Scanning ${accounts.length} mailbox(es) since ${SINCE}` +
+      (UNTIL && UNTIL !== true ? ` until ${UNTIL}` : "") +
+      (DRY_RUN ? " (dry run)" : "")
+  );
+
+  const totals = {
+    examined: 0,
+    receipts: 0,
+    notReceipts: 0,
+    failed: 0,
+    withPdf: 0,
+    gated: 0,
+    alreadyKnown: 0,
+  };
+
+  for (const account of accounts) {
+    const ids = EXPLICIT_IDS
+      ? EXPLICIT_IDS.get(account) ?? []
+      : await searchMessages(account, SINCE, LIMIT, UNTIL);
+    const seen = RESCAN ? new Set() : await alreadyExtracted(account);
+    const fresh = ids.filter((id) => !seen.has(`gmail:${id}`));
+    totals.alreadyKnown += ids.length - fresh.length;
+    console.log(
+      `\n${account}: ${ids.length} candidate message(s)` +
+        (ids.length - fresh.length ? `, ${ids.length - fresh.length} already extracted` : '')
+    );
+
+    for (const id of fresh) {
+      totals.examined += 1;
+      try {
+        const fetched = await fetchMessage(account, id);
+        if (!fetched) continue;
+
+        const { message, text, html, attachments } = fetched;
+        const payload = message.payload || {};
+        const subject = headerOf(payload, "Subject") || "";
+        const from = headerOf(payload, "From") || "";
+
+        // Body first, then any PDF — the attachment is usually the better source
+        // but the body carries the context that identifies the sender.
+        // The email's own date matters as much as its body. Amazon's order
+        // confirmations state a total and an order number but NO date, so
+        // without this the model has nothing to answer with and invents one —
+        // it returned 2026-01-01 for an order placed on 2026-08-23, and a
+        // receipt eight months from its charge can never match.
+        const sentOn = message.internalDate
+          ? new Date(Number(message.internalDate)).toISOString().slice(0, 10)
+          : "";
+
+        let document =
+          `From: ${from}\nSubject: ${subject}\n` +
+          (sentOn ? `Email sent: ${sentOn}\n` : "") +
+          `\n${text || htmlToText(html)}`;
+        let fromAttachment = false;
+        for (const attachment of attachments.slice(0, 2)) {
+          const pdf = await attachmentText(account, id, attachment);
+          if (pdf && pdf.trim()) {
+            document += `\n\n--- attached: ${attachment.filename} ---\n${pdf}`;
+            fromAttachment = true;
+          }
+        }
+        if (fromAttachment) totals.withPdf += 1;
+
+        // Gate before spending a model call. The PDF is already extracted by
+        // this point — pdftotext is free, the model is not.
+        if (!couldBeReceipt(document)) {
+          totals.gated += 1;
+          if (VERBOSE) console.log(`  · skipped, no purchase content: ${subject.slice(0, 54)}`);
+          continue;
+        }
+
+        const verdict = await extract(document.slice(0, 60000));
+
+        if (!verdict.isReceipt) {
+          // Discarded in memory. Nothing about this message is written anywhere.
+          totals.notReceipts += 1;
+          if (VERBOSE) console.log(`  – not a receipt: ${subject.slice(0, 60)}`);
+          continue;
+        }
+
+        totals.receipts += 1;
+        const receiptId = `gmail:${id}`;
+        const receipt = {
+          id: receiptId,
+          source: "gmail",
+          account,
+          vendor: verdict.vendor,
+          date: verdict.date,
+          total: verdict.total,
+          currency: verdict.currency || "USD",
+          card_last4: verdict.cardLast4 ? String(verdict.cardLast4).replace(/\D/g, "").slice(-4) : null,
+          ship_to: verdict.shipTo ?? null,
+          order_id: verdict.orderId ?? null,
+          confidence: verdict.confidence,
+          email_subject: subject,
+          email_from: from,
+          email_date: message.internalDate
+            ? new Date(Number(message.internalDate)).toISOString()
+            : null,
+          from_attachment: fromAttachment,
+          updated_at: new Date().toISOString(),
+        };
+        const lineItems = (verdict.lineItems || []).map((item, index) => ({
+          receipt_id: receiptId,
+          line_number: index,
+          description: item.description,
+          quantity: item.quantity ?? null,
+          amount: item.amount ?? null,
+        }));
+
+        console.log(
+          `  ✓ ${verdict.vendor} ${verdict.date} $${Number(verdict.total).toFixed(2)}` +
+            ` (${lineItems.length} item${lineItems.length === 1 ? "" : "s"}` +
+            `${verdict.shipTo ? `, → ${verdict.shipTo}` : ""}${fromAttachment ? ", pdf" : ""})`
+        );
+
+        if (!DRY_RUN) await saveReceipt(receipt, lineItems);
+      } catch (e) {
+        if (e.fatal) throw e;
+        totals.failed += 1;
+        console.error(`  ! ${id}: ${e.message}`);
+      }
+    }
+  }
+
+  const modelCalls = totals.receipts + totals.notReceipts;
+  console.log(
+    `\nAlready extracted ${totals.alreadyKnown}` +
+      ` · examined ${totals.examined} · gated before the model ${totals.gated}` +
+      ` · receipts ${totals.receipts} · not receipts ${totals.notReceipts}` +
+      ` · from pdf ${totals.withPdf} · failed ${totals.failed}`
+  );
+  console.log(
+    `Model calls: ${modelCalls} of ${totals.examined} messages` +
+      (totals.examined ? ` (${Math.round((100 * modelCalls) / totals.examined)}%)` : '')
+  );
+}
+
+main().catch((e) => {
+  console.error(`receipt-scan: ${e.message}`);
+  process.exit(1);
+});

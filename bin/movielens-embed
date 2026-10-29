@@ -1,0 +1,102 @@
+#!/usr/bin/env python3
+"""movielens-embed — learn a taste vector for every film from 32 million MovieLens ratings.
+
+Part of the watch recommender's two upgrades: (1) learn from millions of other viewers,
+(2) Thompson-sampling exploration. This is (1). The user's own marks are a few hundred; MovieLens 32M (200k people,
+87k films) teaches what a film is *like* beyond its genres — tone, pacing, "smart crime".
+
+Method: truncated SVD of the user-mean-centred rating matrix (films with >= 30 ratings,
+people with >= 10). Each film's vector = V·sqrt(S), L2-normalised, so two films are close
+when the same people rate them the same way. Linked to TMDB via MovieLens links.csv and
+written to Supabase `watch_embeddings` (tmdb_id, ml_count, ml_mean, v[K]); the model in
+web/watch/lib/recsys.mjs regresses their marks on these vectors.
+
+Needs numpy, scipy and pandas: run it with a Python that has them, e.g. a venv
+(`<venv>/bin/python bin/movielens-embed`). One-off; re-run when
+GroupLens publishes a new release. Data: ~/data/movielens/ml-32m (GroupLens, research use).
+
+  movielens-embed [--k 64] [--data ~/data/movielens/ml-32m] [--dry-run]
+"""
+import argparse, json, os, sys, time, urllib.request
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+import supabase_local  # noqa: E402
+
+import numpy as np
+import pandas as pd
+from scipy.sparse import csr_matrix
+from scipy.sparse.linalg import svds
+
+ap = argparse.ArgumentParser()
+ap.add_argument("--k", type=int, default=64)
+ap.add_argument("--data", default=str(Path.home() / "data/movielens/ml-32m"))
+ap.add_argument("--min-film", type=int, default=30)
+ap.add_argument("--min-user", type=int, default=10)
+ap.add_argument("--dry-run", action="store_true")
+a = ap.parse_args()
+t0 = time.time()
+log = lambda m: print(f"[{time.time() - t0:6.1f}s] {m}", flush=True)
+
+r = pd.read_csv(f"{a.data}/ratings.csv", usecols=[0, 1, 2], dtype={"userId": "int32", "movieId": "int32", "rating": "float32"})
+log(f"ratings {len(r):,}")
+fc = r.movieId.value_counts()
+r = r[r.movieId.isin(fc[fc >= a.min_film].index)]
+uc = r.userId.value_counts()
+r = r[r.userId.isin(uc[uc >= a.min_user].index)]
+log(f"kept {len(r):,} ratings, {r.movieId.nunique():,} films, {r.userId.nunique():,} people")
+
+film_mean = r.groupby("movieId").rating.mean()
+film_count = r.movieId.value_counts()
+r["c"] = r.rating - r.groupby("userId").rating.transform("mean")  # each person's own scale
+ui, users = pd.factorize(r.userId)
+fi, films = pd.factorize(r.movieId)
+M = csr_matrix((r.c.values.astype(np.float32), (ui, fi)), shape=(len(users), len(films)))
+del r
+log(f"matrix {M.shape}, nnz {M.nnz:,}; svds k={a.k}")
+U, S, Vt = svds(M, k=a.k)
+order = np.argsort(-S)
+S, Vt = S[order], Vt[order]
+V = (Vt.T * np.sqrt(S)).astype(np.float32)
+V /= np.maximum(np.linalg.norm(V, axis=1, keepdims=True), 1e-9)
+log(f"singular values top {S[:3].round(1).tolist()} … bottom {S[-1]:.1f}")
+
+links = pd.read_csv(f"{a.data}/links.csv", dtype={"movieId": "int32", "tmdbId": "float64"}).dropna()
+tmdb_of = dict(zip(links.movieId, links.tmdbId.astype(int)))
+rows = []
+for j, mid in enumerate(films):
+    t = tmdb_of.get(int(mid))
+    if not t:
+        continue
+    rows.append({"tmdb_id": int(t), "ml_count": int(film_count[mid]), "ml_mean": round(float(film_mean[mid]), 3),
+                 "v": [round(float(x), 4) for x in V[j]], "model": f"ml-32m-svd{a.k}"})
+# A TMDB id can map from two MovieLens ids; keep the better-rated-count one.
+best = {}
+for x in rows:
+    if x["tmdb_id"] not in best or x["ml_count"] > best[x["tmdb_id"]]["ml_count"]:
+        best[x["tmdb_id"]] = x
+rows = list(best.values())
+log(f"{len(rows):,} films linked to TMDB")
+
+# Sanity: nearest neighbours of a few well-known TMDB ids (printed, never written).
+idx = {x["tmdb_id"]: i for i, x in enumerate(rows)}
+E = np.array([x["v"] for x in rows], dtype=np.float32)
+for anchor in (155, 22, 11324):
+    if anchor in idx:
+        sims = E @ E[idx[anchor]]
+        nn = [rows[i]["tmdb_id"] for i in np.argsort(-sims)[1:6]]
+        log(f"near tmdb {anchor}: tmdb {nn}")
+if a.dry_run:
+    sys.exit(0)
+
+# Upload (service role from the environment or the installation's .env).
+url, key = supabase_local.supabase_url(), supabase_local.service_key()
+if not url or not key:
+    sys.exit("movielens-embed: no Supabase project / service key configured — nothing uploaded")
+for i in range(0, len(rows), 500):
+    req = urllib.request.Request(f"{url}/rest/v1/watch_embeddings?on_conflict=tmdb_id", method="POST",
+                                 data=json.dumps(rows[i:i + 500]).encode(),
+                                 headers={"apikey": key, "Authorization": f"Bearer {key}", "Content-Type": "application/json",
+                                          "Prefer": "resolution=merge-duplicates,return=minimal"})
+    urllib.request.urlopen(req, timeout=60).read()
+log(f"uploaded {len(rows):,} embeddings")

@@ -1,0 +1,152 @@
+#!/usr/bin/env node
+// rain-walk-check — check if rain is expected during one of the user's regular
+// outdoor walk windows (a dog walk, a commute on foot). Pings only if rain
+// (>= the threshold chance) overlaps the window.
+//
+// Windows are per installation: agent/local/config/rain-walk.json
+//   windows_file  private JSON under agent/local/ (so the labels' words are not
+//                 kernel-guard tokens): { "heading": "Rain vs walks today:",
+//                 "order": ["morning", ...],
+//                 "windows": { "morning": { "label": "morning walk", "start_h": 8, "end_h": 9 }, ... } }
+//   threshold     precipitation chance that counts as wet (default 0.3)
+// Off (exits 0, says so) when no window is configured.
+//
+// Usage:
+//   rain-walk-check --window <key> [--prewalk]   # one configured window
+//   rain-walk-check --summary                    # one ping covering every window
+//
+// Intended for cron, one label per line so cron-tz-sync can retarget each
+// independently (data/clock-jobs.json); cron-tz-sync rewrites the crontab
+// MM/HH nightly to match the user's current local time, so each line fires
+// ~30 min before the real local walk, not at a fixed home-zone clock time:
+//   30 6  * * *  --label rain-walk-summary  .../rain-walk-check --summary
+//   30 7  * * *  --label rain-walk-morning  .../rain-walk-check --window morning --prewalk
+
+const { execFileSync } = require('child_process');
+const fs = require('fs');
+const path = require('path');
+const { installTools } = require('../lib/root.cjs');
+const { localConfig, localDir, instance } = require('../lib/instance.cjs');
+
+// cron's PATH may lack node's directory, so execFileSync children that use a
+// `#!/usr/bin/env node` shebang (jori-send-curl, etc.) would die with 127.
+process.env.PATH = `${path.dirname(process.execPath)}:${process.env.PATH || '/usr/bin:/bin'}`;
+
+const CFG = localConfig('rain-walk', { windows_file: '', threshold: 0.3 });
+function loadWindows() {
+  if (!CFG.windows_file) return { heading: '', windows: {}, order: [] };
+  try {
+    const d = JSON.parse(fs.readFileSync(path.join(localDir(), CFG.windows_file), 'utf8'));
+    const windows = {};
+    for (const [k, w] of Object.entries(d.windows || {})) {
+      if (w && Number.isFinite(w.start_h) && Number.isFinite(w.end_h)) {
+        windows[k] = { label: w.label || `${k} walk`, startH: w.start_h, endH: w.end_h };
+      }
+    }
+    const order = (Array.isArray(d.order) ? d.order : Object.keys(windows)).filter((k) => windows[k]);
+    return { heading: d.heading || 'Rain vs walks today:', windows, order };
+  } catch {
+    return { heading: '', windows: {}, order: [] };
+  }
+}
+const { heading: HEADING, windows: WINDOWS, order: ORDER } = loadWindows();
+const THRESHOLD = Number(CFG.threshold) || 0.3;
+
+function getWeatherJSON() {
+  const bin = installTools('bin/apple-weather');
+  const out = execFileSync(bin, ['--findme', '--json'], { encoding: 'utf8' });
+  return JSON.parse(out);
+}
+
+function hourInLocalTZ(iso, tz) {
+  return parseInt(new Intl.DateTimeFormat('en-US', { hour: 'numeric', hour12: false, timeZone: tz }).format(new Date(iso)), 10);
+}
+
+function localDateStr(date, tz) {
+  return new Intl.DateTimeFormat('en-CA', { timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit' }).format(date);
+}
+
+function formatHour(h) {
+  if (h === 0 || h === 24) return '12am';
+  if (h < 12) return `${h}am`;
+  if (h === 12) return 'noon';
+  return `${h - 12}pm`;
+}
+
+function rainInWindow(hours, tz, todayStr, startH, endH, threshold = THRESHOLD) {
+  // Find the peak precip chance and earliest wet hour inside [startH, endH).
+  let peak = 0;
+  let peakType = null;
+  let firstWetH = null;
+  for (const h of hours) {
+    const localDate = localDateStr(new Date(h.forecastStart), tz);
+    if (localDate !== todayStr) continue;
+    const hr = hourInLocalTZ(h.forecastStart, tz);
+    if (hr < startH || hr >= endH) continue;
+    const p = h.precipitationChance || 0;
+    if (p > peak) { peak = p; peakType = h.precipitationType; }
+    if (p >= threshold && firstWetH === null) firstWetH = hr;
+  }
+  return { peak, peakType, firstWetH, wet: peak >= threshold };
+}
+
+function pingJori(msg) {
+  const bin = installTools('bin/jori-send-curl');
+  execFileSync(bin, [msg], { stdio: 'inherit' });
+}
+
+function main() {
+  const args = process.argv.slice(2);
+  const summary = args.includes('--summary');
+  const prewalk = args.includes('--prewalk');
+  const windowKey = (() => {
+    const i = args.indexOf('--window');
+    return i >= 0 ? args[i + 1] : null;
+  })();
+
+  if (!ORDER.length) {
+    console.error('rain-walk-check: no walk windows configured (agent/local/config/rain-walk.json windows_file) — nothing to check');
+    process.exit(0);
+  }
+
+  const data = getWeatherJSON();
+  const hourly = (data.forecastHourly && data.forecastHourly.hours) || [];
+  const tz = (data.forecastHourly && data.forecastHourly.metadata && data.forecastHourly.metadata.timezone)
+    || instance().tz;
+  const todayStr = localDateStr(new Date(), tz);
+
+  if (summary) {
+    const lines = [];
+    for (const key of ORDER) {
+      const w = WINDOWS[key];
+      const r = rainInWindow(hourly, tz, todayStr, w.startH, w.endH);
+      if (r.wet) {
+        const type = (r.peakType && r.peakType !== 'clear') ? r.peakType.toLowerCase() : 'rain';
+        lines.push(`• ${w.label} (${formatHour(w.startH)}–${formatHour(w.endH)}): ${type} likely, starts ~${formatHour(r.firstWetH)} (peak ${Math.round(r.peak * 100)}%)`);
+      }
+    }
+    if (lines.length === 0) {
+      // Silent when no rain in any window — don't spam.
+      process.exit(0);
+    }
+    pingJori(`${HEADING}\n${lines.join('\n')}`);
+    return;
+  }
+
+  if (!windowKey || !WINDOWS[windowKey]) {
+    console.error(`Usage: rain-walk-check --window <${ORDER.join('|')}> [--prewalk]   OR   rain-walk-check --summary`);
+    process.exit(1);
+  }
+  const w = WINDOWS[windowKey];
+  const r = rainInWindow(hourly, tz, todayStr, w.startH, w.endH);
+  if (!r.wet) {
+    process.exit(0);  // silent
+  }
+  const type = (r.peakType && r.peakType !== 'clear') ? r.peakType.toLowerCase() : 'rain';
+  const msg = prewalk
+    ? `Heads up — ${type} expected during ${w.label} (starts ~${formatHour(r.firstWetH)}, peak ${Math.round(r.peak * 100)}%)`
+    : `${w.label}: ${type} likely, starts ~${formatHour(r.firstWetH)} (peak ${Math.round(r.peak * 100)}%)`;
+  pingJori(msg);
+}
+
+main();

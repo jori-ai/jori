@@ -17,7 +17,7 @@
 //        where the user is. A destination counts as the metro when its airport
 //        code is one of the metro's `airports` (agent/local/config/travel.json).
 //        Matched case-insensitively and only when an ORIG → DEST airport pair is
-//        present, so a launch called "Starship Flight 12" is ignored.
+//        present, so a rocket-launch hold titled "<vehicle> Flight 12" is ignored.
 //      • Stays    "Stay at <place> (<city>)" spanning the date, naming none of the
 //        metro's aliases = away.
 //

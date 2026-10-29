@@ -1,0 +1,37 @@
+#!/usr/bin/env node
+// calendar-at — the calendar event the user was AT during a window, by geometry.
+// A thin CLI over lib/calendar-place.mjs for the Python callers
+// (stop-identify). See that file for why this is distance, not shared words.
+//
+//   calendar-at --start ISO --end ISO --point LAT,LON [--point LAT,LON ...] [--json]
+//
+// Prints {"match": {...}|null, "error": str|null, "checked": n}. Exit 0 even
+// when nothing matches; exit 1 only when gog itself failed (the caller must
+// not read a failed lookup as "nothing on the calendar").
+import { loadEnv } from "../lib/load-env.js";
+import { calendarPlaceAt, venueForCalendarMatch } from "../lib/calendar-place.mjs";
+loadEnv();
+
+const argv = process.argv.slice(2);
+const flag = (n) => { const i = argv.indexOf(n); return i >= 0 ? argv[i + 1] : null; };
+const points = [];
+argv.forEach((a, i) => {
+  if (a !== "--point") return;
+  const [lat, lon] = String(argv[i + 1] || "").split(",").map(Number);
+  if (Number.isFinite(lat) && Number.isFinite(lon)) points.push({ lat, lon });
+});
+const start = flag("--start"), end = flag("--end");
+if (!start || !end || !points.length) {
+  console.error("usage: calendar-at --start ISO --end ISO --point LAT,LON [--point ...] [--json]");
+  process.exit(2);
+}
+const out = calendarPlaceAt({ start, end, points });
+// The place is the event's LOCATION, resolved to a venue; the title is a hint.
+if (out.match) {
+  try { out.venue = await venueForCalendarMatch(out.match, {}); }
+  catch (e) { out.venue = { name: (out.match.place_name || out.match.location.split(",")[0]).trim(), source: "calendar_address" }; }
+}
+if (argv.includes("--json")) process.stdout.write(JSON.stringify(out) + "\n");
+else if (out.match) console.log(`${out.venue.name} [${out.venue.source}] — event "${out.match.summary}" @ ${out.match.location} (${out.match.distance_m} m)`);
+else console.log(out.error ? `calendar lookup failed: ${out.error}` : `no calendar event here (${out.checked} checked)`);
+process.exit(out.error && !out.match ? 1 : 0);

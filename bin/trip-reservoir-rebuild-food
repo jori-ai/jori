@@ -1,0 +1,88 @@
+#!/usr/bin/env bash
+# trip-reservoir-rebuild-food — re-research the FORWARD-LOOKING area guides onto
+# the dish/table schema, then re-photograph and second-opinion them.
+#
+# Why a script and not four dispatches: the builds must run SEQUENTIALLY (five
+# concurrent Sonnet forks exhausted the Max pool on 2026-07-09 and killed every
+# build but the first), and they must inherit the parent's Max session — so this
+# is launched ONCE via `job-run` from an already-authenticated agent turn, never
+# straight from cron. See agent/CLAUDE.md § Auth Model + § Long-Running Jobs.
+#
+# Only areas still ahead of us are rebuilt. Re-researching a leg we've already
+# travelled spends a Sonnet fork on a guide nobody will open again; the past
+# legs keep their existing rows (and their done marks) untouched.
+#
+# Usage: trip-reservoir-rebuild-food [--areas "a b c"] [--no-venues]
+set -uo pipefail
+
+BIN="$(cd "$(dirname "$0")" && pwd)"
+# The forward-looking areas: --areas, else $AREAS. No default — which legs are
+# still ahead is the caller's knowledge, not this script's.
+AREAS="${AREAS:-}"
+RUN_VENUES=1
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --areas) AREAS="$2"; shift 2 ;;
+    --no-venues) RUN_VENUES=0; shift ;;
+    *) echo "unknown arg: $1" >&2; exit 2 ;;
+  esac
+done
+
+if [ -z "$AREAS" ]; then
+  echo "[rebuild-food] no areas given (--areas \"a b c\" or AREAS=...); nothing to do."
+  exit 0
+fi
+echo "[rebuild-food] areas: $AREAS"
+failed=""
+for area in $AREAS; do
+  echo "[rebuild-food] === building $area ($(date '+%H:%M:%S')) ==="
+  if "$BIN/trip-reservoir-build" --area "$area"; then
+    echo "[rebuild-food] $area built"
+  else
+    code=$?
+    # exit 2 is a legitimate no-op (nothing verified), not a failure.
+    if [ "$code" = "2" ]; then
+      echo "[rebuild-food] $area: no-op (nothing verified), left as-is"
+    else
+      echo "[rebuild-food] $area FAILED (exit $code)"
+      failed="$failed $area"
+    fi
+  fi
+done
+
+# Photos: --refresh-food re-fetches every food entry, which is the point — the
+# stored ones were taken against the OLD schema, where a restaurant's menu blurb
+# was photographed as if it were a dish.
+echo "[rebuild-food] === photos ($(date '+%H:%M:%S')) ==="
+for area in $AREAS; do
+  "$BIN/trip-reservoir-photos" --area "$area" --refresh-food || echo "[rebuild-food] photos failed for $area (non-fatal)"
+done
+
+# Report-only by design: swapping a venue changes where we'd actually go eat,
+# so the user reads the diff before anything is applied. The second opinion is
+# optional and the installation's own: a command named in
+# agent/local/config/trip-reservoir.json `second_opinion_cmd` (path relative to
+# the kernel tree), run once per area as `<cmd> --area <area>`. Without one the
+# pass is skipped.
+SECOND=""
+if [ "$RUN_VENUES" = "1" ]; then
+  LOCAL_DIR="${JORI_LOCAL_DIR:-$BIN/../agent/local}"
+  SECOND="$(python3 -c 'import json,sys
+try: print(json.load(open(sys.argv[1])).get("second_opinion_cmd") or "")
+except Exception: print("")' "$LOCAL_DIR/config/trip-reservoir.json" 2>/dev/null)"
+  [ -n "$SECOND" ] && SECOND="$BIN/../$SECOND"
+  if [ -z "$SECOND" ] || [ ! -x "$SECOND" ]; then
+    [ -n "$SECOND" ] && echo "[rebuild-food] second opinion $SECOND is not executable; skipping it."
+    RUN_VENUES=0
+  fi
+fi
+
+if [ "$RUN_VENUES" = "1" ]; then
+  echo "[rebuild-food] === second opinion (report only) ($(date '+%H:%M:%S')) ==="
+  for area in $AREAS; do
+    "$SECOND" --area "$area" || echo "[rebuild-food] second opinion failed for $area (non-fatal)"
+  done
+fi
+
+echo "[rebuild-food] done ($(date '+%H:%M:%S'))${failed:+ — FAILED:$failed}"
+[ -z "$failed" ]

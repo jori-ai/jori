@@ -1,0 +1,231 @@
+#!/usr/bin/env node
+"use strict";
+// awardwallet-sync — snapshot every miles / points program AwardWallet tracks
+// for the user (and the household members whose programs the user holds there)
+// into the Supabase, next to the bank accounts: loyalty_accounts (current) +
+// loyalty_balance_history (one row per account per local day, for the trend).
+//
+// Requirement: mileage and points update weekly (or on request) and are stored
+// locally beside the bank accounts. Weekly cron (trigger-awardwallet-sync.sh);
+// an on-demand refresh is just running this script.
+//
+// OFF without AWARDWALLET_API_KEY in .env: the run logs that and exits 0.
+//
+// WHAT "REFRESH" MEANS. This reads AwardWallet's copy. AwardWallet re-reads each
+// program on its own schedule, and some programs it cannot read at all (captcha,
+// expired password — `error_code` != 1). `last_retrieve_date` is when
+// AwardWallet last actually saw the program; always quote balances "as of" it,
+// never as live.
+//
+// READ-ONLY: lib/awardwallet-api.js is GET-only.
+//
+// Alerts (never on --dry-run):
+//   system channel — the API itself fails (IP_DENIED = the home IP changed;
+//     re-whitelist it at business.awardwallet.com/profile/api)
+//   chat + push    — a program DISCONNECTS: goes from current to either an
+//     error only the user can fix (bad password, locked, security code) or no
+//     successful read for > STALE_DAYS (21) — so a one-week "try again later"
+//     from the provider does not ping the user.
+//     Transition only, batched into one message per run, so a long-dead
+//     program never nags. Requirement: warn when anything disconnects.
+//   chat + push    — a balance with a real expiration date inside 60 days
+//     (once per date)
+// Silent otherwise.
+//
+// Usage:
+//   awardwallet-sync            fetch + upsert + history row
+//   awardwallet-sync --dry-run  fetch + print; no writes, no alerts
+//   awardwallet-sync --json     machine-readable summary to stdout
+//
+// Env (.env): AWARDWALLET_API_KEY. Kill switch: data/.awardwallet-sync-off
+// Config (optional): agent/local/config/loyalty.json
+//   alert_intent — the send intent of the chat warnings; it must be on
+//                  jori-send-curl's chat bypass list, or the outbound precheck
+//                  may drop a warning the user asked for (default "loyalty-alert").
+// State: data/awardwallet-sync-state.json
+//   { "unhealthy": {"<accountId>": "<reason>"}, "last_ok": {"<accountId>": "<iso>"},
+//     "expiry_alerted": {"<accountId>": "<iso date>"} }
+
+const fs = require("node:fs");
+const path = require("node:path");
+const { execFile } = require("node:child_process");
+const aw = require("../lib/awardwallet-api.js");
+const { toRow, diffHealth } = require("../lib/awardwallet-map.js");
+const { request } = require("../lib/supabase-rest.js");
+const { instance, localConfig } = require("../lib/instance.cjs");
+const { installTools } = require("../lib/root.cjs");
+
+const FLAGS = new Set(process.argv.slice(2).filter((a) => a.startsWith("--")));
+const DRY_RUN = FLAGS.has("--dry-run");
+const JSON_OUT = FLAGS.has("--json");
+const SEND_BIN = path.join(__dirname, "jori-send-curl");
+const DATA_DIR = installTools("data");
+const OFF_SWITCH = path.join(DATA_DIR, ".awardwallet-sync-off");
+const STATE_FILE = path.join(DATA_DIR, "awardwallet-sync-state.json");
+const EXPIRY_WINDOW_DAYS = 60;
+const CONFIG = localConfig("loyalty", { alert_intent: "loyalty-alert" });
+const TZ = instance().tz;
+
+function log(...a) { if (!JSON_OUT) console.log(...a); }
+
+function etDate(d) {
+  return new Intl.DateTimeFormat("en-CA", {
+    timeZone: TZ, year: "numeric", month: "2-digit", day: "2-digit",
+  }).format(d);
+}
+
+function loadState() {
+  try { return JSON.parse(fs.readFileSync(STATE_FILE, "utf8")); } catch { return {}; }
+}
+function saveState(state) {
+  if (DRY_RUN) return;
+  const tmp = `${STATE_FILE}.tmp.${process.pid}`;
+  fs.writeFileSync(tmp, JSON.stringify(state, null, 2));
+  fs.renameSync(tmp, STATE_FILE);
+}
+
+async function notify(body) {
+  if (DRY_RUN) { log(`  (notify suppressed) ${body}`); return; }
+  await new Promise((resolve) => {
+    execFile(SEND_BIN, ["--channel", "system", "--skip-precheck", "--intent", "awardwallet-sync", body],
+      (err) => { if (err) console.error(`  notify failed: ${err.message}`); resolve(); });
+  });
+}
+
+/**
+ * User-facing warning (chat + push), the same path as plaid-sync's bank
+ * alerts. The user asked for these, they fire on transitions only, and the
+ * precheck may not drop them — hence an allowlisted intent (config
+ * `alert_intent`).
+ */
+async function warn(body) {
+  if (DRY_RUN) { log(`  (warn suppressed) ${body}`); return; }
+  await new Promise((resolve) => {
+    execFile(SEND_BIN, ["--skip-precheck", "--intent", CONFIG.alert_intent, "--agent", "ops", body],
+      (err) => { if (err) console.error(`  warn failed: ${err.message}`); resolve(); });
+  });
+}
+
+async function upsert(table, rows, conflict) {
+  if (DRY_RUN || !rows.length) return;
+  for (let i = 0; i < rows.length; i += 500) {
+    await request(`/rest/v1/${table}?on_conflict=${conflict}`, {
+      method: "POST",
+      body: rows.slice(i, i + 500),
+      prefer: "resolution=merge-duplicates,return=minimal",
+    });
+  }
+}
+
+/** Drop programs removed from AwardWallet — scoped per owner, never on an empty answer. */
+async function pruneRemoved(ownerKind, ownerId, keptIds) {
+  if (DRY_RUN || !keptIds.length) return;
+  await request(
+    `/rest/v1/loyalty_accounts?owner_kind=eq.${ownerKind}&owner_id=eq.${ownerId}&account_id=not.in.(${keptIds.join(",")})`,
+    { method: "DELETE", prefer: "return=minimal" }
+  );
+}
+
+async function collect() {
+  const owners = [];
+  for (const u of await aw.listConnectedUsers()) {
+    const d = await aw.getConnectedUser(u.userId);
+    owners.push({ kind: "connectedUser", id: u.userId, name: u.fullName, accounts: d.accounts || [] });
+  }
+  for (const m of await aw.listMembers()) {
+    const d = await aw.getMember(m.memberId);
+    owners.push({ kind: "member", id: m.memberId, name: m.fullName, accounts: d.accounts || [] });
+  }
+  return owners;
+}
+
+async function main() {
+  if (fs.existsSync(OFF_SWITCH)) { log("kill switch present, skipping"); return 0; }
+
+  const now = new Date();
+  const asOf = now.toISOString();
+  let owners;
+  try {
+    owners = await collect();
+  } catch (e) {
+    if (e.code === "NOT_CONFIGURED") { log(e.message); return 0; }
+    const hint = e.code === "IP_DENIED"
+      ? " The home IP probably changed — add the new one at business.awardwallet.com/profile/api → Allowed IPs."
+      : "";
+    console.error(e.message);
+    await notify(`🎫 AwardWallet sync failed: ${e.code || e.message}.${hint}`);
+    return 1;
+  }
+
+  const rows = [];
+  for (const o of owners) for (const a of o.accounts) rows.push(toRow(a, o.kind, o.id, asOf));
+  if (!rows.length) {
+    // Same guard as the brokerage syncs: zero programs is an upstream failure,
+    // never "you closed everything" — keep the last good snapshot.
+    console.error("AwardWallet returned 0 accounts — not writing");
+    await notify("🎫 AwardWallet sync returned 0 programs — kept the last snapshot. Check the API connection.");
+    return 1;
+  }
+
+  await upsert("loyalty_accounts", rows, "account_id");
+  const asOfDate = etDate(now);
+  await upsert("loyalty_balance_history",
+    rows.map((r) => ({ account_id: r.account_id, as_of_date: asOfDate, balance_raw: r.balance_raw, as_of: asOf })),
+    "account_id,as_of_date");
+  for (const o of owners) await pruneRemoved(o.kind, o.id, o.accounts.map((a) => a.accountId));
+
+  // Programs another tool reads straight from the provider's own site
+  // (owner_kind 'direct' — a program AwardWallet cannot read) share the same
+  // health rule and the same one batched warning, so they join the comparison
+  // here.
+  try {
+    const direct = await request("/rest/v1/loyalty_accounts?owner_kind=eq.direct&select=*");
+    if (Array.isArray(direct)) rows.push(...direct);
+  } catch (e) {
+    console.error(`could not read direct programs: ${e.message}`);
+  }
+
+  // ── Alerts: transitions only ──
+  const state = loadState();
+  // State written before 2026-10-21's staleness rule has only `broken`; seed
+  // from it silently rather than alerting on every already-known stale program.
+  const { unhealthy, newly, lastOk } = diffHealth(state.unhealthy || null, rows, now, state.last_ok || {});
+  const expiryAlerted = state.expiry_alerted || {};
+  const expiring = rows.filter((r) => {
+    if (!r.expiration_date || !(r.balance_raw > 0)) return false;
+    const days = (new Date(r.expiration_date) - now) / 86400000;
+    return days >= 0 && days <= EXPIRY_WINDOW_DAYS && expiryAlerted[r.account_id] !== r.expiration_date;
+  });
+  if (newly.length) {
+    // One message per run, however many dropped — never one ping per program.
+    const lines = newly.map(({ row, reason }) => `• ${row.display_name} (${row.owner_name || "?"}): ${reason}`);
+    await warn(`🎫 ${newly.length === 1 ? "A points program" : `${newly.length} points programs`} stopped updating in AwardWallet — balances there are no longer current until it's reconnected:\n${lines.join("\n")}`);
+  }
+  for (const r of expiring) {
+    await warn(`🎫 ${r.balance} ${r.display_name} points (${r.owner_name || "?"}) expire ${etDate(new Date(r.expiration_date))}.`);
+    expiryAlerted[r.account_id] = r.expiration_date;
+  }
+  saveState({ unhealthy, last_ok: lastOk, expiry_alerted: expiryAlerted });
+
+  const summary = {
+    as_of: asOf,
+    programs: rows.length,
+    current: rows.length - Object.keys(unhealthy).length,
+    not_current: rows.filter((r) => unhealthy[r.account_id]).map((r) => ({ name: r.display_name, owner: r.owner_name, reason: unhealthy[r.account_id], balance: r.balance })),
+    newly_disconnected: newly.map(({ row, reason }) => ({ name: row.display_name, owner: row.owner_name, reason })),
+    balances: rows.filter((r) => r.balance_raw).map((r) => ({
+      name: r.display_name, owner: r.owner_name, balance: r.balance_raw, status: r.elite_status,
+      aw_last_read: r.last_retrieve_date,
+    })),
+    dry_run: DRY_RUN,
+  };
+  if (JSON_OUT) console.log(JSON.stringify(summary, null, 2));
+  else {
+    log(`AwardWallet: ${summary.programs} programs (${summary.current} current)${DRY_RUN ? " [dry-run]" : ""}`);
+    for (const n of summary.not_current) log(`  NOT CURRENT ${n.name} — ${n.owner}: ${n.reason}`);
+    for (const b of summary.balances) log(`  ${b.name} — ${b.owner}: ${b.balance.toLocaleString("en-US")}${b.status ? ` [${b.status}]` : ""} (AW read ${b.aw_last_read ? b.aw_last_read.slice(0, 10) : "never"})`);
+  }
+  return 0;
+}
+
+main().then((c) => process.exit(c), (e) => { console.error(e.stack || e.message); process.exit(1); });

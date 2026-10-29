@@ -1,0 +1,75 @@
+#!/usr/bin/env bash
+# card-pass <last4> --field number|expiry|cvv|name   |   card-pass --list
+#
+# Reads one of the user's credit cards from the 1Password "Logins" vault
+# (JORI_OP_LOGINS_VAULT) with the same read-only service account as site-pass
+# (OP_LOGINS_SERVICE_ACCOUNT_TOKEN). Requirement: the agent may enter a card at
+# checkout when the merchant has none saved, so the host must be able to read
+# the cards the user has explicitly put in that vault with the tag
+# jori-purchase (JORI_OP_CARD_TAG) — no other card is visible.
+#
+# Only `purchase card` should call this: it types the value straight into the
+# merchant's card form, so the number never enters an agent's context. --list
+# prints titles and last 4 only.
+#
+# An item can carry a 1Password sync conflict (a second number/cvv/expiry under
+# "Conflicts"); the field set whose number ends in <last4> is used.
+#
+# Exit codes: 0 ok, 5 no such card, 64 usage, 78 no token.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+source "$SCRIPT_DIR/../agent/scripts/lib/root.sh"
+ROOT="$JORI_INSTALL"
+LOGINS_VAULT="${JORI_OP_LOGINS_VAULT:-Logins}"
+CARD_TAG="${JORI_OP_CARD_TAG:-jori-purchase}"
+TOKEN="${OP_LOGINS_SERVICE_ACCOUNT_TOKEN:-}"
+if [[ -z "$TOKEN" && -f "$ROOT/.env" ]]; then
+  TOKEN="$(sed -n 's/^OP_LOGINS_SERVICE_ACCOUNT_TOKEN=//p' "$ROOT/.env" | head -1)"
+fi
+[[ -n "$TOKEN" ]] || { echo "card-pass: OP_LOGINS_SERVICE_ACCOUNT_TOKEN is not set." >&2; exit 78; }
+export OP_SERVICE_ACCOUNT_TOKEN="$TOKEN"
+
+LIST="$(op item list --vault "$LOGINS_VAULT" --categories "Credit Card" --tags "$CARD_TAG" --format=json)"
+
+if [[ "${1:-}" == "--list" ]]; then
+  printf '%s' "$LIST" | /usr/bin/python3 -c '
+import json, sys
+for i in json.load(sys.stdin):
+    print(i["id"], "|", i["title"], "|", (i.get("additional_information") or "")[-4:])'
+  exit 0
+fi
+
+LAST4="${1:-}"
+FIELD=""
+[[ "${2:-}" == "--field" ]] && FIELD="${3:-}"
+[[ "$LAST4" =~ ^[0-9]{4}$ && "$FIELD" =~ ^(number|expiry|cvv|name)$ ]] || {
+  echo "usage: card-pass <last4> --field number|expiry|cvv|name  |  card-pass --list" >&2; exit 64; }
+
+ID="$(printf '%s' "$LIST" | /usr/bin/python3 -c '
+import json, sys
+hits = [i for i in json.load(sys.stdin) if (i.get("additional_information") or "").endswith(sys.argv[1])]
+if hits: print(max(hits, key=lambda i: i.get("updated_at", ""))["id"])' "$LAST4")"
+[[ -n "$ID" ]] || { echo "card-pass: no $CARD_TAG card ending $LAST4 in the $LOGINS_VAULT vault." >&2; exit 5; }
+
+op item get "$ID" --vault "$LOGINS_VAULT" --format=json --reveal | /usr/bin/python3 -c '
+import json, sys
+last4, want = sys.argv[1], sys.argv[2]
+item = json.load(sys.stdin)
+fields = item.get("fields", [])
+def val(fid):
+    return next((str(f.get("value") or "") for f in fields if f.get("id") == fid), "")
+# The main set, then any conflict sets ("ccnum_conflict_1", ...).
+suffixes = [""] + sorted({f["id"][len("ccnum"):] for f in fields if f.get("id", "").startswith("ccnum_conflict")})
+for sfx in suffixes:
+    num = "".join(ch for ch in val("ccnum" + sfx) if ch.isdigit())
+    if num.endswith(last4):
+        out = {"number": num, "expiry": val("expiry" + sfx), "cvv": val("cvv" + sfx),
+               "name": val("cardholder")}[want]
+        if not out:
+            sys.exit(f"card-pass: card ending {last4} has no {want}")
+        sys.stdout.write(out)
+        sys.exit(0)
+iid = item.get("id")
+sys.exit(f"card-pass: no number ending {last4} in item {iid}")' "$LAST4" "$FIELD"

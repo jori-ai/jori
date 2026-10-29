@@ -1,0 +1,178 @@
+#!/usr/bin/env node
+// awardwallet-refresh — make AwardWallet re-read every program BEFORE
+// awardwallet-sync reads its API, by pressing "Update all" in the automation Chrome.
+//
+// WHY A BROWSER. Many programs can no longer be updated from AwardWallet's
+// servers: its Business "Update selected accounts" fails for them with "Browser
+// extension is missing". Only the AwardWallet v3 extension
+// (elbkchakmaiinadjpnmdgpflpjogpgmb), installed in the automation Chrome
+// profile on :9222, can read them — and only when the account-list page asks it
+// to. Requirement: the weekly sync reads freshly refreshed balances.
+//
+// OFF without AWARDWALLET_API_KEY (exits 0 before opening a tab).
+//
+// UNATTENDED BY CONSTRUCTION, and never a lockout:
+//   - Programs whose stored password the provider REJECTS (errorCode 2/3/7/8,
+//     per the API before we start) are never retried — a weekly bad-password
+//     attempt is how an account gets locked. Programs waiting on a security code (10) are
+//     skipped too. When anything is excluded we tick the rest individually and
+//     press "Update selected accounts" instead of "Update all".
+//   - Otherwise "Update all", whose confirm dialog offers "Skip N accounts that
+//     may ask a security question"; this always turns that ON. Programs marked "Manual Update" in
+// AwardWallet (some airlines) are not updatable at all and are unaffected.
+//
+// Runs in its OWN tab and closes it — never navigates a tab something else
+// (Gmail, an Amazon session) is using.
+//
+// Usage:
+//   awardwallet-refresh            press Update all, wait for it to settle
+//   awardwallet-refresh --debug    also save screenshots to /tmp/awardwallet-refresh-*.jpg
+//   awardwallet-refresh --json
+// Exit: 0 refreshed (or nothing to do), 2 signed out of AwardWallet in that
+// Chrome, 1 anything else. awardwallet-sync runs regardless — a failed refresh
+// only means the balances are as fresh as AwardWallet already had them.
+
+import fs from "node:fs";
+import { openTab, goto, clickElement as clickVisible, sleep } from "../lib/cdp-tab.mjs";
+import { createRequire } from "node:module";
+const require = createRequire(import.meta.url);
+const aw = require("../lib/awardwallet-api.js");
+const { LOCKOUT_RISK_CODES } = require("../lib/awardwallet-map.js");
+
+const LIST_URL = "https://awardwallet.com/account/list/";
+const FLAGS = new Set(process.argv.slice(2));
+const DEBUG = FLAGS.has("--debug");
+const JSON_OUT = FLAGS.has("--json");
+const MAX_WAIT_MS = 12 * 60 * 1000; // chrome-cdp-watch reaps 9222 tabs alive across two 15-min ticks
+const QUIET_POLLS = 3; // consecutive polls with nothing updating = done
+
+const log = (...a) => { if (!JSON_OUT) console.log(...a); };
+
+let shotN = 0;
+async function shot(tab, label) {
+  if (!DEBUG) return;
+  const r = await tab.send("Page.captureScreenshot", { format: "jpeg", quality: 50 });
+  const f = `/tmp/awardwallet-refresh-${String(++shotN).padStart(2, "0")}-${label}.jpg`;
+  fs.writeFileSync(f, Buffer.from(r.data, "base64"));
+  log(`  screenshot ${f}`);
+}
+
+const decodeName = (s) => String(s || "").replace(/&amp;/g, "&");
+
+const VISIBLE = (sel) => `[...document.querySelectorAll(${JSON.stringify(sel)})].find((e) => e.offsetParent)`;
+
+/**
+ * Per-row updater state. AwardWallet disables a row's checkbox from the moment
+ * the update starts until someone clicks the row's OK — so "disabled" alone means
+ * "touched", not "still running". A finished row shows its outcome
+ * ("Updated …" / "Error occurred …") next to that OK; a running one doesn't yet.
+ * (This matches AwardWallet's own fixed UI strings, not anything a person wrote.)
+ */
+const ROWS = `JSON.stringify([...document.querySelectorAll('input[id^="account_a"]')].filter((c) => c.disabled).map((c) => {
+  const row = c.closest(".account-row-block"); const t = row ? row.innerText.replace(/\\s+/g, " ") : "";
+  const name = row ? (row.querySelector("a, .name, [class*=program]") || row).innerText.split("\\n")[0].trim().slice(0, 60) : c.id;
+  return { id: c.id.replace("account_a", ""), name,
+    state: /Error occurred/i.test(t) ? "error" : /Updated/i.test(t) ? "updated" : "running" };
+}))`;
+
+async function main() {
+  if (!aw.isConfigured()) return { off: true, clicked: false, updated: 0, errors: [], excluded: [], waited_s: 0 };
+  const tab = await openTab();
+  const result = { started: new Date().toISOString(), clicked: false, skipped_security_question: false, waited_s: 0, busy_seen: 0 };
+  try {
+    await goto(tab, LIST_URL);
+
+    const href = await tab.evaluate("location.href");
+    if (/\/login/.test(href)) {
+      const e = new Error("AwardWallet is signed out in the automation Chrome (:9222) — sign in at awardwallet.com there");
+      e.code = "SIGNED_OUT";
+      throw e;
+    }
+    await shot(tab, "list");
+
+    // Decide what is safe to update, from AwardWallet's own last verdict.
+    const accounts = [];
+    for (const u of await aw.listConnectedUsers()) accounts.push(...((await aw.getConnectedUser(u.userId)).accounts || []));
+    for (const m of await aw.listMembers()) accounts.push(...((await aw.getMember(m.memberId)).accounts || []));
+    const excluded = accounts.filter((a) => LOCKOUT_RISK_CODES.has(a.errorCode) || a.errorCode === 10);
+    result.excluded = excluded.map((a) => `${decodeName(a.displayName)} (error ${a.errorCode})`);
+
+    if (excluded.length) {
+      const skip = new Set(excluded.map((a) => a.accountId));
+      let ticked = 0;
+      for (const a of accounts) {
+        if (skip.has(a.accountId)) continue;
+        if (await clickVisible(tab, `(() => { const c = document.getElementById("account_a${Number(a.accountId)}"); return c && !c.disabled && !c.checked ? c : null; })()`)) {
+          ticked += 1;
+          await sleep(400);
+        }
+      }
+      result.mode = "selected";
+      result.ticked = ticked;
+      if (!ticked) return { ...result, waited_s: 0, updated: 0, errors: [] };
+      if (!(await clickVisible(tab, `[...document.querySelectorAll("a")].find((e) => (e.innerText.trim() === "Update selected accounts" || e.title === "Update selected accounts") && e.offsetParent)`))) {
+        throw new Error("no visible 'Update selected accounts' button after ticking accounts");
+      }
+      result.clicked = true;
+      await sleep(2500);
+      await shot(tab, "selected");
+    } else {
+      result.mode = "all";
+      if (!(await clickVisible(tab, VISIBLE('a[title="Update all accounts"]')))) throw new Error("no visible 'Update all' button on the account list");
+      await sleep(2500);
+      await shot(tab, "confirm");
+
+      // The confirm dialog. Turn on "Skip N accounts that may ask a security question".
+      const toggle = await tab.evaluate(`(() => {
+        const label = [...document.querySelectorAll("*")].find((e) => e.children.length === 0 && /Skip \\d+ accounts? that may ask a security question/i.test(e.textContent) && e.offsetParent);
+        if (!label) return null;
+        let box = label; for (let k = 0; k < 5 && box; k++) { const t = box.querySelector('input[type="checkbox"], [role="switch"], .switch, [class*="toggle"]'); if (t) { const r = t.getBoundingClientRect(); return { on: !!(t.checked || t.getAttribute("aria-checked") === "true"), x: r.x + r.width / 2, y: r.y + r.height / 2 }; } box = box.parentElement; }
+        return { on: null };
+      })()`);
+      if (toggle && toggle.on === false && toggle.x) {
+        for (const type of ["mousePressed", "mouseReleased"]) await tab.send("Input.dispatchMouseEvent", { type, x: toggle.x, y: toggle.y, button: "left", clickCount: 1 });
+        result.skipped_security_question = true;
+        await sleep(800);
+      } else if (toggle && toggle.on) {
+        result.skipped_security_question = true;
+      }
+      await shot(tab, "confirm-skip");
+
+      const confirmBtn = `[...document.querySelectorAll("a,button")].find((e) => /^Update All( \\d+)? Accounts?$/i.test(e.textContent.trim()) && e.offsetParent)`;
+      if (!(await clickVisible(tab, confirmBtn))) throw new Error("Update-all confirm dialog did not appear");
+      result.clicked = true;
+    }
+
+    // Wait for every row's updater to finish: done = several consecutive polls
+    // with no row still running (after rows appear, or 30s for a slow start).
+    const t0 = Date.now();
+    let quiet = 0;
+    // Outcomes accumulate across polls: once a batch finishes the page can
+    // re-enable its rows, so the final snapshot alone may show nothing.
+    const seen = new Map();
+    while (Date.now() - t0 < MAX_WAIT_MS) {
+      await sleep(5000);
+      const rows = JSON.parse(await tab.evaluate(ROWS));
+      for (const r of rows) if (r.state !== "running" || !seen.has(r.id)) seen.set(r.id, r);
+      const running = rows.filter((r) => r.state === "running").length;
+      result.busy_seen = Math.max(result.busy_seen, rows.length);
+      if (running === 0 && (rows.length > 0 || Date.now() - t0 > 30000)) quiet += 1;
+      else quiet = 0;
+      if (quiet >= QUIET_POLLS) break;
+    }
+    result.waited_s = Math.round((Date.now() - t0) / 1000);
+    result.timed_out = quiet < QUIET_POLLS;
+    const outcomes = [...seen.values()];
+    result.updated = outcomes.filter((r) => r.state === "updated").length;
+    result.errors = outcomes.filter((r) => r.state === "error").map((r) => r.name);
+    await shot(tab, "done");
+    return result;
+  } finally {
+    await tab.close();
+  }
+}
+
+main().then(
+  (r) => { if (r.off) { log("AwardWallet refresh: off (no AWARDWALLET_API_KEY)"); process.exit(0); } JSON_OUT ? console.log(JSON.stringify(r)) : log(`AwardWallet refresh: clicked=${r.clicked} skipSQ=${r.skipped_security_question} mode=${r.mode} skipped=${(r.excluded || []).length}${(r.excluded || []).length ? ` [${r.excluded.join("; ")}]` : ""} updated=${r.updated} errors=${r.errors.length}${r.errors.length ? ` [${r.errors.join("; ")}]` : ""} waited=${r.waited_s}s${r.timed_out ? " (timed out)" : ""}`); process.exit(0); },
+  (e) => { console.error(`awardwallet-refresh: ${e.message}`); process.exit(e.code === "SIGNED_OUT" ? 2 : 1); }
+);

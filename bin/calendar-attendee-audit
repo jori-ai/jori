@@ -1,0 +1,382 @@
+#!/usr/bin/env node
+// calendar-attendee-audit — reconcile Google against jori-calendar's own log,
+// and report any invite Jori cannot account for.
+//
+// WHY A DETECTIVE CONTROL AND NOT JUST THE PREVENTIVE ONES. Three layers already
+// stand in front of this: the MCP write tools are removed from every agent's
+// grant, `jori-calendar` refuses an unauthorized attendee, and a pre-commit
+// lint fails new code that writes around it. None of them closes Bash. Every
+// agent has a shell, so a determined or confused turn can still call the API
+// directly — and the harm here is the one harm in the system that cannot be
+// undone, because an invite reaches a real person's calendar and inbox.
+//
+// So this is the layer that assumes the others failed. It does not prevent
+// anything; it makes an unexplained invite impossible to MISS, which for an
+// irreversible action is the next best thing.
+//
+// HOW IT DECIDES. `jori-calendar` writes an audit row before every call,
+// carrying the attendees and the user's quoted authorization. An event with an
+// attendee other than the user is:
+//   accounted for  — a log row covers it, with a quote → fine, silent
+//   UNAUTHORIZED   — a log row covers it, with NO quote → should be impossible
+//                    (the wrapper refuses), so this means the log or the guard
+//                    was bypassed. Report it.
+//   UNEXPLAINED    — no log row at all → written around the wrapper entirely.
+//                    Report it.
+//
+// Reports to the SYSTEM channel, never to chat: this is Jori's own hygiene.
+// Silent when everything reconciles, which should be almost every night.
+//
+// Usage: calendar-attendee-audit [--days 1] [--json] [--dry-run] [--forget <id> | --forget-all]
+//
+// Config (agent/local/config/calendar-audit.json, every key optional):
+//   self_addresses      the user's own addresses besides the instance owner_email
+//   account             the gog account to read (default: owner_email)
+//   guard_epoch         ISO time jori-calendar started logging; events created
+//                       before it are not audited (default: the write log's first
+//                       row; no write log at all → there is no guarded period yet,
+//                       so nothing is audited)
+//   attendee_log_epoch  ISO time the log started recording every guest on every
+//                       write (default: none — every row is judged guest by guest)
+
+import fs from "node:fs";
+import path from "node:path";
+import { execFileSync, spawnSync } from "node:child_process";
+import { createRequire } from "node:module";
+import { seriesKey, collapseFindings, formatFindingLine, inAuditScope } from "../lib/calendar-audit-group.js";
+
+const require = createRequire(import.meta.url);
+const { instance, localConfig } = require("../lib/instance.cjs");
+const { installTools } = require("../lib/root.cjs");
+
+// gog: $GOG_BIN, else a package-manager install (cron's PATH has neither), else PATH.
+const GOG = process.env.GOG_BIN || ["/opt/homebrew/bin/gog", "/usr/local/bin/gog"].find((p) => fs.existsSync(p)) || "gog";
+const SEND = installTools("bin/jori-send-curl");
+const LOG = installTools("data/logs/calendar-writes.jsonl");
+// Events already reported once. A detective control has to be impossible to
+// MISS, which it is on the first firing; it does not have to be repeated. The
+// population it flags is {a write that dodged the wrapper} UNION {an invite
+// the user created themselves}, and Google gives no field that separates them —
+// creator.self is true for both. So re-reporting the same event every time it
+// is touched turns the one channel that guards an irreversible action into
+// wallpaper: two meetings the user booked by hand were once paged as "Jori
+// cannot account for", with a closing line asking the user to go and check the
+// creator. Report once, remember, stay quiet.
+const SEEN = installTools("data/logs/calendar-audit-seen.json");
+
+const CFG = localConfig("calendar-audit", { self_addresses: [], account: "", guard_epoch: null, attendee_log_epoch: null });
+const OWNER = String(instance().owner_email || "").trim().toLowerCase();
+const ACCOUNT = CFG.account || OWNER;
+const SELF = new Set([OWNER, ...(CFG.self_addresses || [])].map((a) => String(a || "").trim().toLowerCase()).filter(Boolean));
+
+// The first time the write log saw any write: the start of the guarded period
+// when no guard_epoch is configured. No log → Infinity (nothing is guarded yet).
+function firstLogTs() {
+  try {
+    for (const line of fs.readFileSync(LOG, "utf8").split("\n")) {
+      if (!line.trim()) continue;
+      try { const t = Date.parse(JSON.parse(line)?.ts || ""); if (Number.isFinite(t)) return t; } catch { /* next */ }
+    }
+  } catch { /* no log */ }
+  return Infinity;
+}
+
+// The day `jori-calendar` started logging. Events created before it cannot
+// have a log row BY CONSTRUCTION, so auditing them would report every legacy
+// invite as unexplained forever — on a calendar with years of household
+// recurrences the user set up by hand, that is hundreds.
+//
+// Reporting a backlog nobody can act on is how an alert channel becomes
+// wallpaper. So the audit speaks only about the period it can actually speak
+// about. Everything before this date is history, already known, and not a finding.
+const GUARD_EPOCH = CFG.guard_epoch ? Date.parse(CFG.guard_epoch) : firstLogTs();
+
+// The day `jori-calendar` started recording WHO was actually invited on every
+// write, not just the guests parsed out of `--attendees`. Before it, an invite
+// added by any other route logged `attendees: []` beside a perfectly good
+// authorization quote. Judging a row like that guest-by-guest would report the
+// user's own authorized invites as unauthorized: a false accusation
+// manufactured entirely by the log's old shape. So a pre-epoch row that carries
+// a quote but no guest list still covers its whole event. Post-epoch there is
+// no such excuse — an empty list means nobody was invited. Self-limiting:
+// pre-epoch rows age out of the window and the branch goes dead. Not configured:
+// no row is pre-epoch.
+const ATTENDEE_LOG_EPOCH = CFG.attendee_log_epoch ? Date.parse(CFG.attendee_log_epoch) : -Infinity;
+
+// How far either side of an event's creation a `create` row may sit and still be
+// believed to describe it. A create row carries no event id (the id only exists
+// after the call returns), so the only link back is an attendee in common — and
+// without a time bound, ANY authorized write to ANY event mentioning the same
+// guest silently vouches for this one. Ten minutes is far wider than the
+// sub-second gap the wrapper actually produces.
+const CREATE_MATCH_WINDOW_MS = 10 * 60_000;
+
+const argv = process.argv.slice(2);
+const flag = (n, d) => { const i = argv.indexOf(n); return i < 0 ? d : argv[i + 1]; };
+const has = (n) => argv.includes(n);
+const DAYS = Number(flag("--days", 1)) || 1;
+const AS_JSON = has("--json");
+const DRY_RUN = has("--dry-run");
+const FORGET = flag("--forget", null);
+
+// Re-arm one event (or all of them) so the next run reports it again.
+if (FORGET !== null || has("--forget-all")) {
+  const seenNow = loadSeen();
+  if (has("--forget-all")) {
+    saveSeen({});
+    console.log(`calendar-attendee-audit: forgot ${Object.keys(seenNow).length} remembered event(s).`);
+  } else if (seenNow[FORGET]) {
+    delete seenNow[FORGET];
+    saveSeen(seenNow);
+    console.log(`calendar-attendee-audit: forgot ${FORGET} — it will be reported again.`);
+  } else {
+    console.log(`calendar-attendee-audit: ${FORGET} was not remembered; nothing to do.`);
+  }
+  process.exit(0);
+}
+
+// Off until there is something to reconcile: no owner address to tell the
+// user's own events apart, or no write log (jori-calendar has never run).
+if (!SELF.size || !ACCOUNT) {
+  console.log("calendar-attendee-audit: no owner_email in agent/local/instance.json — nothing to audit.");
+  process.exit(0);
+}
+if (!Number.isFinite(GUARD_EPOCH)) {
+  console.log(`calendar-attendee-audit: no write log at ${LOG} yet — nothing is guarded, nothing to audit.`);
+  process.exit(0);
+}
+
+function loadSeen() {
+  try { return JSON.parse(fs.readFileSync(SEEN, "utf8")) || {}; } catch { return {}; }
+}
+function saveSeen(seen) {
+  try {
+    fs.mkdirSync(path.dirname(SEEN), { recursive: true });
+    fs.writeFileSync(SEEN, JSON.stringify(seen, null, 2) + "\n");
+  } catch (e) { console.error(`calendar-attendee-audit: could not persist seen ledger (${e.message})`); }
+}
+
+// ── What Jori believes it wrote ───────────────────────────────────────
+function auditRows() {
+  const since = Date.now() - DAYS * 24 * 3600_000;
+  const rows = [];
+  try {
+    for (const line of fs.readFileSync(LOG, "utf8").split("\n")) {
+      if (!line.trim()) continue;
+      let r; try { r = JSON.parse(line); } catch { continue; }
+      const t = Date.parse(r?.ts || "");
+      if (Number.isFinite(t) && t >= since) rows.push(r);
+    }
+  } catch { /* no rows in the window — every invite will read as unexplained, which is correct */ }
+  return rows;
+}
+
+// ── What Google actually has ─────────────────────────────────────────────
+function recentEvents() {
+  const timeMin = new Date(Date.now() - DAYS * 24 * 3600_000).toISOString();
+  const timeMax = new Date(Date.now() + 400 * 24 * 3600_000).toISOString();
+  try {
+    const out = execFileSync(GOG, [
+      "calendar", "list", "primary", "--account", ACCOUNT,
+      "--from", timeMin, "--to", timeMax, "--max", "2500", "--json",
+    ], { encoding: "utf8", timeout: 60000, maxBuffer: 32 * 1024 * 1024 });
+    const parsed = JSON.parse(out);
+    const items = parsed?.items || parsed?.events || (Array.isArray(parsed) ? parsed : []);
+    // Only events CREATED or last touched inside the window are our business —
+    // a years-old event with attendees the user added by hand is not a finding.
+    return items.filter((e) => {
+      const t = Date.parse(e?.updated || e?.created || "");
+      return Number.isFinite(t) && t >= Date.parse(timeMin);
+    });
+  } catch (e) {
+    console.error(`calendar-attendee-audit: could not list events (${e.message})`);
+    return null; // distinct from "none found"
+  }
+}
+
+function foreignAttendees(ev) {
+  return (ev?.attendees || [])
+    .map((a) => String(a?.email || "").toLowerCase())
+    .filter(Boolean)
+    .filter((a) => !SELF.has(a) && !a.endsWith("calendar.google.com"));
+}
+
+/**
+ * Could Jori have written this event at all?
+ *
+ * Only events the user ORGANIZES are in scope. A meeting someone else set up and
+ * invited the user to carries their attendee list, which is theirs, not Jori's —
+ * and on a normal day that is most of the calendar. Auditing those would report
+ * every recurring work meeting as an unexplained invite, which is both wrong and
+ * the fastest way to make an alert channel worth ignoring. (Caught on the first
+ * live run: hundreds of events in two days, the top findings other people's
+ * standing 1:1s.)
+ */
+function userOrganized(ev) {
+  // The rule lives in the lib so it is unit-tested. It also drops the private
+  // copy Google writes for an invitation received from outside Google Calendar
+  // (propagation disabled, outside organizer): see inAuditScope.
+  return inAuditScope(ev, SELF);
+}
+
+const events = recentEvents();
+if (events === null) process.exit(1);
+
+const rows = auditRows();
+// Per-INSTANCE findings. `gog calendar list` expands a recurring series into one
+// event per occurrence, so these are folded by series below before anything is
+// reported or remembered — see lib/calendar-audit-group.js.
+const rawFindings = [];
+
+for (const ev of events) {
+  if (!userOrganized(ev)) continue;
+  // Created before the guard existed → no log row is possible; not a finding.
+  const created = Date.parse(ev?.created || "");
+  if (Number.isFinite(created) && created < GUARD_EPOCH) continue;
+  const foreign = foreignAttendees(ev);
+  if (!foreign.length) continue;
+
+  // EVERY log row that could describe this event, not the first one that
+  // happens to match. The row-to-event mapping is many-to-one: the write that
+  // ADDS a guest carries the authorization quote, while any later guest-free
+  // update to the same event legitimately carries authorization:null, because
+  // the wrapper only demands the flag when guests are present. The old
+  // single-`find` tried the event_id branch first, and only a post-create
+  // update can carry an event_id — so the row it picked was systematically the
+  // one LEAST likely to hold the quote. That is how an invite explicitly
+  // authorized in the create row five minutes earlier was once paged to the
+  // user as "written without authorization".
+  const foreignSet = new Set(foreign);
+  // A wrapper write against a recurring event logs the SERIES id, while the
+  // events being looped over here are its expanded instances — so without this
+  // an authorized recurring invite could never find its own log row.
+  const sKey = seriesKey(ev);
+  const evRows = rows.filter((r) => {
+    if (r.dry_run === true) return false;            // a dry run wrote nothing
+    if (r.event_id && (r.event_id === ev.id || r.event_id === sKey)) return true;
+    if (!Number.isFinite(created)) return false;
+    const rowTs = Date.parse(r.ts || "");
+    if (!Number.isFinite(rowTs) || Math.abs(rowTs - created) > CREATE_MATCH_WINDOW_MS) return false;
+    return (r.attendees || []).some((a) => foreignSet.has(String(a).toLowerCase()));
+  });
+
+  // PER-GUEST COVERAGE. Every foreign guest must itself turn up on some row
+  // carrying a quote. This is strictly STRONGER than what it replaces: one
+  // lucky first-row hit used to silence a whole event, so an unauthorized guest
+  // rode along beside an authorized one unseen. Now the extra guest still fires.
+  const covered = new Set();
+  for (const r of evRows) {
+    if (!r.authorization) continue;
+    const listed = (r.attendees || []).map((a) => String(a).toLowerCase()).filter(Boolean);
+    if (listed.length) {
+      for (const a of listed) if (foreignSet.has(a)) covered.add(a);
+      continue;
+    }
+    const rowTs = Date.parse(r.ts || "");
+    if (!Number.isFinite(rowTs) || rowTs < ATTENDEE_LOG_EPOCH) {
+      for (const a of foreign) covered.add(a);   // see ATTENDEE_LOG_EPOCH
+    }
+  }
+  const uncovered = foreign.filter((a) => !covered.has(a));
+
+  // Carry the facts a reader needs to decide, instead of asking them to go and
+  // look the event up. created/creator answer "who made this and when"; updated
+  // shows a later edit (guests added after creation). has_description stays in
+  // the --json output only: it is NOT a tell in either direction (an event Jori
+  // made with no description was once called "how a hand-made meeting usually
+  // looks" after the user added guests to it).
+  const facts = {
+    id: ev.id,
+    key: sKey,
+    summary: ev.summary || "(untitled)",
+    attendees: foreign,
+    uncovered,
+    created: ev.created || null,
+    updated: ev.updated || null,
+    creator: String(ev?.creator?.email || "") || null,
+    has_description: Boolean(String(ev?.description || "").trim()),
+  };
+  if (!uncovered.length) continue;                 // every guest has a quote on file
+  rawFindings.push({ kind: evRows.length ? "partial" : "unexplained", ...facts });
+}
+
+// ONE FINDING PER SERIES. 58 expanded instances of one hand-made weekly invite
+// is one thing to tell the user, not fifty-eight. Guests are unioned across
+// instances, so a per-instance override still fires.
+const findings = collapseFindings(rawFindings);
+
+// A remembered event stays quiet only while the guests we could not account for
+// are the same ones. A NEW unaccounted guest on an event already mentioned is a
+// new invite reaching a new person — the exact harm this control exists for — so
+// it speaks up again. Legacy ledger entries recorded the full foreign list under
+// `attendees`, which is a superset of any `uncovered`, so they stay quiet.
+function alreadyReported(seen, f) {
+  const rec = seen[f.id];
+  if (!rec) return false;
+  const known = new Set([...(rec.uncovered || []), ...(rec.attendees || [])].map((a) => String(a).toLowerCase()));
+  return f.uncovered.every((a) => known.has(a));
+}
+
+const seen = loadSeen();
+const fresh = findings.filter((f) => !alreadyReported(seen, f));
+
+if (AS_JSON) {
+  console.log(JSON.stringify({
+    window_days: DAYS, events_checked: events.length,
+    findings: findings.map((f) => ({ ...f, reported_before: alreadyReported(seen, f) })),
+    fresh: fresh.length,
+  }, null, 2));
+  process.exit(0);
+}
+
+if (!findings.length) {
+  console.log(`calendar-attendee-audit: ${events.length} event(s) in the last ${DAYS}d, no unexplained invites.`);
+  process.exit(0);
+}
+
+if (!fresh.length) {
+  console.log(`calendar-attendee-audit: ${findings.length} finding(s), all previously reported — staying quiet.`);
+  process.exit(0);
+}
+
+// Report the OBSERVATION, never the accusation. An older wording said "written
+// without authorization" three lines above a paragraph conceding that Google
+// exposes no field able to establish that — so the alert contradicted itself,
+// and the assertion half was false on every event it had fired about, each a
+// meeting the user booked by hand. State what the log does and does not say
+// and let the tells below carry the reading.
+const lines = fresh.map(formatFindingLine);
+const msg = [
+  `⚠️ ${fresh.length} calendar event(s) with attendees Jori cannot account for:`,
+  "",
+  ...lines,
+  "",
+  "Nothing in data/logs/calendar-writes.jsonl covers these, so either something",
+  "wrote around jori-calendar or you booked them yourself — Google records you as",
+  "the creator either way, so this cannot tell the two apart. Read the created and",
+  "last-changed times first: guests added at a later edit show as a last-changed time",
+  "well after the created one (a guest's RSVP also moves it).",
+  "",
+  "Each event is reported once and then remembered. To hear about one again:",
+  "  calendar-attendee-audit --forget <event-id>",
+].join("\n");
+
+console.log(msg);
+if (DRY_RUN) process.exit(0);
+
+spawnSync(SEND, ["--channel", "system", "--skip-precheck", "--intent", "calendar-attendee-audit", msg], { stdio: "inherit" });
+
+// Remember only what we actually managed to say. A send that never happened
+// must not silence tomorrow's run.
+const now = new Date().toISOString();
+for (const f of fresh) {
+  const prev = seen[f.id] || {};
+  seen[f.id] = {
+    first_reported: prev.first_reported || now,
+    last_reported: now,
+    summary: f.summary,
+    attendees: f.attendees,
+    uncovered: [...new Set([...(prev.uncovered || []), ...(prev.attendees || []), ...f.uncovered])],
+  };
+}
+saveSeen(seen);

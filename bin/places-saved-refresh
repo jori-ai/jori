@@ -1,0 +1,154 @@
+#!/usr/bin/env python3
+"""places-saved-refresh — monthly refresh of the Google Maps saved-places store
+from a "Saved" Google Takeout export delivered to Drive.
+
+The user schedules a monthly Takeout (product: "Saved") with delivery to Google
+Drive. Each export is a *batch* of files named `takeout-<YYYYMMDDTHHMMSSZ>-N-001.zip`
+(an index zip + a data zip). This worker:
+  1. lists takeout-*.zip in Drive (via gog),
+  2. groups them by the <timestamp> in the filename and picks the NEWEST batch,
+  3. skips if that batch was already imported (state file),
+  4. downloads + extracts the whole batch, runs places-saved-import on it
+     (delta-cheap: only NEW places geocode; known ftids reuse stored coords),
+  5. on success, **trashes every OLDER takeout file** (cleanup; recoverable in
+     Drive trash), and records the imported batch.
+
+Drive access is via `gog` on the owner's account (instance().owner_email, or
+config places-saved-refresh.json `account`; needs `gog login <account>`).
+The claude.ai Drive connector is NOT used here: it's interactive-only (absent in
+cron) and can't delete. If gog has no token, this logs + exits 0 (the auth
+outage is already surfaced by doctor/watchdog; no double-alert).
+
+Run from tasks.json monthly. Output -> agent/logs/places-saved-refresh.log
+"""
+
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import time
+import zipfile
+
+_BIN = os.path.dirname(os.path.realpath(globals().get("__file__") or sys.argv[0]))
+sys.path.insert(0, os.path.join(os.path.dirname(_BIN), "lib"))
+import places_local  # noqa: E402
+ROOT = places_local.install_root()
+LOG = os.path.join(ROOT, "agent/logs/places-saved-refresh.log")
+STATE = places_local.data_path("places-saved-refresh-state.json")
+IMPORTER = os.path.join(_BIN, "places-saved-import")
+SEND = os.path.join(_BIN, "jori-send-curl")
+ACCOUNT = (places_local.local_config("places-saved-refresh", {}).get("account")
+           or places_local.instance().get("owner_email") or "")
+BATCH_RE = re.compile(r"takeout-(\d{8}T\d{6}Z)", re.I)
+
+
+def log(msg):
+    line = f"{time.strftime('%Y-%m-%d %H:%M:%S')} {msg}"
+    os.makedirs(os.path.dirname(LOG), exist_ok=True)
+    with open(LOG, "a") as fh:
+        fh.write(line + "\n")
+    print(line)
+
+
+def gog(args, capture=True):
+    return subprocess.run(["gog"] + args, capture_output=capture, text=True, timeout=300)
+
+
+def alert(msg):
+    try:
+        subprocess.run([SEND, "--channel", "system", "--skip-precheck", msg],
+                       capture_output=True, timeout=30)
+    except Exception:
+        pass
+
+
+def main():
+    if not ACCOUNT:
+        log("No Google account configured (instance owner_email). Off; exit 0.")
+        return 0
+    # 1. list takeout zips
+    r = gog(["drive", "search",
+             "name contains 'takeout' and name contains '.zip' and trashed = false",
+             "--raw-query", "--account", ACCOUNT, "--json"])
+    if r.returncode != 0:
+        log(f"gog drive search failed (auth down? run `gog login {ACCOUNT}`). Exit 0. err={r.stderr.strip()[:160]}")
+        return 0
+    try:
+        data = json.loads(r.stdout)
+        files = data.get("files") if isinstance(data, dict) else data
+        files = files or (data.get("result", {}).get("files", []) if isinstance(data, dict) else [])
+    except Exception as e:
+        log(f"could not parse gog drive search JSON: {e}. Exit 0.")
+        return 0
+
+    zips = [f for f in files if str(f.get("name", "")).lower().endswith(".zip") and BATCH_RE.search(f.get("name", ""))]
+    if not zips:
+        log("No takeout-*.zip batches found in Drive. Nothing to do.")
+        return 0
+
+    def batch_ts(f):
+        m = BATCH_RE.search(f["name"])
+        return m.group(1) if m else ""
+
+    newest = max(batch_ts(f) for f in zips)
+    batch_files = [f for f in zips if batch_ts(f) == newest]
+    older_files = [f for f in zips if batch_ts(f) < newest]
+
+    # 2. skip if already imported
+    last = ""
+    if os.path.exists(STATE):
+        try:
+            last = json.load(open(STATE)).get("last_batch", "")
+        except Exception:
+            pass
+    if newest == last:
+        log(f"Newest batch {newest} already imported. Trashing {len(older_files)} stale file(s) if any.")
+        for f in older_files:
+            gog(["drive", "delete", f["id"], "--account", ACCOUNT])
+        return 0
+
+    # 3. download + extract the whole newest batch
+    tmp = tempfile.mkdtemp(prefix="takeout-saved-")
+    extract = os.path.join(tmp, "x")
+    os.makedirs(extract, exist_ok=True)
+    got = 0
+    for f in batch_files:
+        dest = os.path.join(tmp, f["name"])
+        d = gog(["drive", "download", f["id"], "--out", dest, "--account", ACCOUNT])
+        if d.returncode != 0 or not os.path.exists(dest):
+            log(f"download failed for {f['name']}: {d.stderr.strip()[:160]}")
+            continue
+        try:
+            with zipfile.ZipFile(dest) as zf:
+                zf.extractall(extract)
+            got += 1
+        except Exception as e:
+            log(f"unzip failed for {f['name']}: {e}")
+    if got == 0:
+        log(f"batch {newest}: nothing extracted. Aborting (no trash).")
+        alert(f"places-saved-refresh: found new Takeout batch {newest} but extraction failed. Check gog Drive auth/log.")
+        return 1
+
+    # 4. import (delta-cheap via ftid reuse)
+    imp = subprocess.run(["/usr/bin/python3", IMPORTER, extract], capture_output=True, text=True)
+    log(f"import(batch {newest}): rc={imp.returncode} {imp.stdout.strip().replace(chr(10), ' | ')}")
+    if imp.returncode != 0:
+        log(f"import failed; NOT trashing anything. stderr={imp.stderr.strip()[:200]}")
+        alert(f"places-saved-refresh: imported new Takeout {newest} but places-saved-import exited {imp.returncode}. Check log.")
+        return 1
+
+    # 5. cleanup: trash older batches (keep the just-imported one for audit)
+    trashed = 0
+    for f in older_files:
+        if gog(["drive", "delete", f["id"], "--account", ACCOUNT]).returncode == 0:
+            trashed += 1
+    json.dump({"last_batch": newest, "imported_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+               "trashed_old": trashed}, open(STATE, "w"), indent=2)
+    log(f"Refresh complete from batch {newest}. Trashed {trashed} older file(s).")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

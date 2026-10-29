@@ -1,0 +1,757 @@
+#!/usr/bin/env node
+/**
+ * exercise-schedule — place a 30-min exercise block on the user's Google Calendar.
+ *
+ * The habit's shape is per installation (agent/local/config/exercise.json, see
+ * lib/exercise-config.cjs): sessions a week, rest days (skipped while on track,
+ * used as makeup days when behind), preferred slot starts tried in order, then
+ * the first free 30-min window in the scan window. Off (exits 0) when the
+ * config does not enable it.
+ *
+ * Idempotent: if an exercise event already exists today, exits silently.
+ *
+ * Usage: exercise-schedule [--dry-run] [--reschedule HH:MM [--no-notify]] [--record-response <kind>]
+ */
+
+'use strict';
+
+const { spawnSync } = require('child_process');
+const fs = require('fs');
+const path = require('path');
+
+const { installTools } = require('../lib/root.cjs');
+const { exerciseConfig, hhmmToMin, zonedParts, tzOffset } = require('../lib/exercise-config.cjs');
+
+const DRY_RUN = process.argv.includes('--dry-run');
+const CFG = exerciseConfig();
+const TZ = CFG.tz;
+// gog: $GOG_BIN, else a package-manager install (launchd's PATH has neither), else PATH.
+const GOG = process.env.GOG_BIN || ['/opt/homebrew/bin/gog', '/usr/local/bin/gog'].find((p) => fs.existsSync(p)) || 'gog';
+// The only sanctioned calendar-write path — see bin/jori-calendar.
+const CAL = installTools('bin/jori-calendar');
+const JORI_SEND = installTools('bin/jori-send-curl');
+const TRACKER = CFG.tracker;
+const HOME_PRESENCE = installTools('bin/home-presence');
+const STATE_FILE = installTools('data/exercise-today.json');
+// Shared with agent/scripts/trigger-exercise-schedule.sh, which appends
+// its own "Dispatched exercise-schedule" lines here. One line per entry.
+const LOG_FILE = installTools('data/logs/exercise-schedule.log');
+// Set by agent/scripts/trigger-exercise-schedule.sh, which already runs us
+// as `exercise-schedule "$@" >> "$LOGFILE" 2>&1` — i.e. it is capturing our
+// stderr INTO LOG_FILE. Appending there ourselves as well writes every line
+// twice. Regression guard: exercise-log-double-write.
+const STDERR_ALREADY_LOGGED = process.env.EXERCISE_SCHEDULE_STDERR_TO_LOG === '1';
+// Regression guard — exercise-calendar-silent-outage: a calendar read that keeps
+// failing is a silent skip every single day. The streak lives here so three of
+// them in a row can say so out loud once, instead of twenty-one of them saying
+// nothing at all.
+const CAL_FAIL_STREAK_FILE = installTools('data/exercise-calendar-fail-streak.json');
+const calFailStreak = require('../lib/exercise-calendar-fail-streak.js');
+
+// Calendar summaries that mean "the user is traveling / in transit", not a normal
+// busy block. flights-scan marks flights opaque (so they already block) but
+// accommodation "Stay at ..." is transparent all-day; treat any of these as a
+// hard conflict regardless of transparency so a slot never lands on travel.
+const TRAVEL_SUMMARY_RE = /(✈️|\bflight\b|\bstay at\b|car (pickup|return)|\bdriv(e|ing)\b|\bin transit\b|\ben route\b|\broad trip\b)/i;
+
+// --reschedule HH:MM — move today's exercise block to a new start time.
+const rescheduleIdx = process.argv.indexOf('--reschedule');
+const RESCHEDULE_TO = rescheduleIdx > -1 ? process.argv[rescheduleIdx + 1] : null;
+
+// --no-notify — do the reschedule, skip the confirmation ping at the end of
+// rescheduleFlow. Exactly one caller passes it: the hum post-slot-miss branch
+// (hum-harvesters/exercise.mjs), which shells out to --reschedule and then
+// sends its OWN ping naming the same new time. Until 2026-09-24 that produced
+// two buzzes for one decision, about a minute apart ("Rescheduled to 15:30-16:00"
+// then "1pm slipped by, I moved your workout block to 3:30"). Jev's relevance
+// gate called both redundant and the protected-intent belt in jori-send-curl
+// correctly force-sent them anyway, because the duplication is not the gate's
+// to fix — it is here.
+// The harvester's ping is the one worth keeping: it names the missed slot, the
+// new time and the week's count, and it ASKS ("does that work, or want a
+// different time?"), which is the only handle the user has to push back.
+// The chat-agent's free-form path ("move it to 7pm") must NOT pass this — there
+// the line below is the reply to something the user asked for.
+const NO_NOTIFY = process.argv.includes('--no-notify');
+
+// --record-response <kind> — chat-agent stamps the user's pre-slot reply into
+// the state file so the harvester can suppress redundant pings.
+const recordIdx = process.argv.indexOf('--record-response');
+const RECORD_RESPONSE = recordIdx > -1 ? process.argv[recordIdx + 1] : null;
+
+// Day-of-week: 0=Sun,1=Mon,2=Tue,3=Wed,4=Thu,5=Fri,6=Sat
+const REST_DAYS = new Set((CFG.rest_days || []).map(Number));
+const TEXTS = CFG.texts;
+
+/**
+ * Log to stderr AND to the on-disk log.
+ *
+ * Regression guard — exercise-calendar-fallback-silent-skip.
+ * Defends against: consecutive days with no calendared exercise block, every
+ * run reported as success. stderr was the ONLY sink, and this script ran inside
+ * an ops-agent turn, so its stderr landed in an agent transcript and vanished —
+ * the outage was invisible for days, and the eventual page invented a
+ * mechanism that turned out to be false because there was no trace to read.
+ *
+ * Still needed now that the scheduled run is direct, for a narrower reason. The scheduled run
+ * no longer goes through an agent turn (see trigger-exercise-schedule.sh), and
+ * that caller captures our stderr into LOG_FILE itself — so it sets
+ * EXERCISE_SCHEDULE_STDERR_TO_LOG=1 and we skip the append to avoid writing
+ * every line twice. The agent-invoked entry points (`--reschedule` from the hum
+ * harvester and chat-agent, `--record-response`) set no such marker and DO run
+ * inside a turn, so for them the append is still the only durable sink.
+ *
+ * A logging problem must never become a scheduling problem: the append is
+ * best-effort and swallows every error.
+ */
+function log(msg) {
+  const ts = new Date().toISOString();
+  const line = `${ts} [exercise-schedule] ${msg}\n`;
+  process.stderr.write(line);
+  if (DRY_RUN) return; // a dry run must leave no trace on disk
+  // The caller already redirects our stderr into LOG_FILE, so the write above
+  // IS the on-disk record. Appending again would duplicate every line (and with
+  // it every occurrence count read off this log). stderr stays the surviving
+  // writer rather than the append, because it also carries uncaught-exception
+  // stack traces, which log() never sees.
+  if (STDERR_ALREADY_LOGGED) return;
+  try {
+    fs.appendFileSync(LOG_FILE, line);
+  } catch {
+    // Deliberately silent — no rethrow, no stderr storm. If the log sink is
+    // unwritable the run must still place the calendar block.
+  }
+}
+
+function run(cmd, opts = {}) {
+  try {
+    const result = spawnSync('bash', ['-c', cmd], {
+      encoding: 'utf8',
+      timeout: 30000,
+      ...opts,
+    });
+    if (result.error) throw result.error;
+    return { stdout: result.stdout || '', stderr: result.stderr || '', status: result.status };
+  } catch (err) {
+    return { stdout: '', stderr: err.message, status: 1 };
+  }
+}
+
+/**
+ * Today's date in the installation's zone as YYYY-MM-DD and the day-of-week
+ * (JS: 0=Sun..6=Sat).
+ */
+function getTodayLocal() {
+  const p = zonedParts(new Date(), TZ);
+  return { date: p.date, dow: p.dow };
+}
+
+/**
+ * The zone's UTC offset for the given date (handles DST), e.g. "-04:00".
+ */
+function getLocalOffset(dateStr) {
+  return tzOffset(dateStr, TZ);
+}
+
+/**
+ * Count days with a session this week from the configured workout tracker.
+ */
+function countSessionsThisWeek() {
+  if (!TRACKER) return 0;
+  const result = run(`"${TRACKER}" week --json`);
+  if (result.status !== 0) {
+    log(`tracker week failed: ${result.stderr}`);
+    return 0;
+  }
+  try {
+    const data = JSON.parse(result.stdout);
+    const rows = data.rows || [];
+    let count = 0;
+    for (const row of rows) {
+      if (row.sessions && row.sessions.length > 0) count++;
+    }
+    return count;
+  } catch (err) {
+    log(`tracker week parse error: ${err.message}`);
+    return 0;
+  }
+}
+
+/**
+ * Is the user home (not traveling) on the given date? Delegates to the
+ * home-presence tool, which derives this from flights.json — so it works even
+ * when the calendar/gog fetch is down. Fail-open: any error → treat as home,
+ * so a flaky read never silently kills the habit.
+ * Returns { atHome: boolean, reason: string }.
+ */
+function homePresence(dateStr) {
+  const result = run(`"${HOME_PRESENCE}" "${dateStr}" --json`);
+  try {
+    const data = JSON.parse(result.stdout);
+    if (typeof data.at_home === 'boolean') {
+      return { atHome: data.at_home, reason: data.reason || '' };
+    }
+  } catch (err) {
+    log(`home-presence parse error: ${err.message} (fail-open: home)`);
+  }
+  return { atHome: true, reason: 'home-presence unavailable — fail-open home' };
+}
+
+/**
+ * Block the thread for `ms`. getTodayEvents is synchronous and is called from
+ * two places; making it async would ripple through both flows for a 7-second
+ * total backoff, so sleep in place instead.
+ */
+function sleepSync(ms) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+// Bounded retry for the calendar read. 3 attempts, ~2s then ~5s backoff — the
+// run() helper already caps each gog call at 30s, so the added wall clock is
+// well under a minute.
+const CAL_FETCH_ATTEMPTS = 3;
+const CAL_FETCH_BACKOFF_MS = [2000, 5000];
+
+/**
+ * Fetch today's calendar events as JSON.
+ * Returns { events, _fetchFailed }.
+ *
+ * Regression guard — exercise-calendar-fallback-silent-skip.
+ * Defends against: consecutive days with no calendared exercise block, every
+ * run reported as success. A calendar READ
+ * failure is terminal for the day (main() writes the defensive state row and
+ * exits 0 without ever writing the event), so before this retry a single
+ * transient blip — one network hiccup, one slow gog token refresh — silently
+ * cancelled the whole job. Retrying is the cheap half of the fix; the other
+ * half is that a PERSISTENT failure is now visible (log() persists to disk,
+ * and the state row is stamped calendar_fetch_failed) instead of looking
+ * identical to a normal 11:00 placement.
+ */
+function getTodayEvents(dateStr, etOffset) {
+  const from = `${dateStr}T00:00:00${etOffset}`;
+  const to = `${dateStr}T23:59:59${etOffset}`;
+  // Try with --account <calendar account> first; fall back to plain primary if
+  // the gog version doesn't accept that flag. Empty stderr both ways. The two
+  // forms together are ONE attempt.
+  const accountFlag = CFG.calendar_account ? `--account "${CFG.calendar_account}"` : '';
+  let lastFetchError = null;
+
+  for (let attempt = 1; attempt <= CAL_FETCH_ATTEMPTS; attempt++) {
+    let result = run(`"${GOG}" ${accountFlag} calendar events primary --from "${from}" --to "${to}" -j`);
+    if (result.status !== 0) {
+      result = run(`"${GOG}" calendar events primary --from "${from}" --to "${to}" -j`);
+    }
+    if (result.status === 0) {
+      try {
+        const data = JSON.parse(result.stdout);
+        if (attempt > 1) log(`gog calendar events succeeded on attempt ${attempt}/${CAL_FETCH_ATTEMPTS}`);
+        clearCalFailStreak();
+        return { events: data.events || [], _fetchFailed: false };
+      } catch (err) {
+        log(`calendar parse error (attempt ${attempt}/${CAL_FETCH_ATTEMPTS}): ${err.message}`);
+      }
+    } else {
+      lastFetchError = result.stderr;
+      log(`gog calendar events failed (attempt ${attempt}/${CAL_FETCH_ATTEMPTS}): ${result.stderr}`);
+    }
+    if (attempt < CAL_FETCH_ATTEMPTS) {
+      const waitMs = CAL_FETCH_BACKOFF_MS[attempt - 1];
+      log(`Retrying calendar fetch in ${waitMs}ms`);
+      sleepSync(waitMs);
+    }
+  }
+
+  log(`Calendar fetch failed after ${CAL_FETCH_ATTEMPTS} attempts — giving up for this run.`);
+  // CALENDAR_FAIL marker — downstream callers must distinguish "calendar
+  // says zero events" (truly free day, schedule anywhere) from "calendar
+  // failed to fetch" (don't trust the empty busy list). Returns a special
+  // sentinel object so writeStateFile / findFreeSlot can fall back.
+  return { events: [], _fetchFailed: true, _lastError: lastFetchError };
+}
+
+/**
+ * Streak bookkeeping for a calendar read that will not succeed.
+ * Both helpers are wrapped so they can never throw: a failure to RECORD the
+ * outage must not become a second, louder failure on top of it.
+ */
+function clearCalFailStreak() {
+  if (DRY_RUN) return; // a dry run must leave no trace on disk
+  try {
+    if (fs.existsSync(CAL_FAIL_STREAK_FILE)) {
+      const prev = calFailStreak.readState(CAL_FAIL_STREAK_FILE);
+      if (prev.consecutive_days > 0) log(`Calendar reads are working again after ${prev.consecutive_days} failing day(s) — clearing the streak.`);
+      fs.unlinkSync(CAL_FAIL_STREAK_FILE);
+    }
+  } catch (err) {
+    log(`could not clear calendar-fail streak: ${err.message}`);
+  }
+}
+
+function recordCalFailAndMaybeEscalate(dateStr, lastError) {
+  try {
+    const state = calFailStreak.recordFailure(calFailStreak.readState(CAL_FAIL_STREAK_FILE), dateStr, lastError);
+    log(`Calendar fetch has now failed ${state.consecutive_days} day(s) in a row (since ${state.first_failed_date}).`);
+    if (calFailStreak.shouldEscalate(state, dateStr)) {
+      const message = calFailStreak.escalationMessage(state);
+      if (DRY_RUN) {
+        log(`DRY-RUN: would report to the system channel: ${message}`);
+      } else {
+        // A job reporting its own failure on the system channel — the
+        // documented skip-precheck class in agent/CLAUDE.md. It makes no
+        // claim about the machine, so the fabricated-outage gate is untouched.
+        // Single-quoted for the shell: the error text is upstream output, so it
+        // must not be able to open a substitution of its own on the way to a send.
+        const shellArg = "'" + message.split("'").join("'\\''") + "'";
+        const res = run(`"${JORI_SEND}" --channel system --skip-precheck --intent exercise-calendar-fetch-failure ${shellArg}`);
+        if (res.status !== 0) {
+          log(`could not report the calendar-fetch outage: ${res.stderr}`);
+        } else {
+          state.last_alerted_date = dateStr;
+        }
+      }
+    }
+    if (!DRY_RUN) calFailStreak.writeState(CAL_FAIL_STREAK_FILE, state);
+  } catch (err) {
+    log(`could not record calendar-fail streak: ${err.message}`);
+  }
+}
+
+/**
+ * Find today's exercise event (if any). Returns the event object or null.
+ */
+function findExerciseEvent(events) {
+  const match = TEXTS.event_match || 'Exercise';
+  return events.find(e => e.summary && e.summary.includes(match)) || null;
+}
+
+function exerciseEventExists(events) {
+  return !!findExerciseEvent(events);
+}
+
+/**
+ * Write today's planned slot to state file so the hum harvester can ping
+ * pre/mid/post-slot. Absence of the file = no slot scheduled today.
+ *
+ * `opts.calendarFetchFailed` marks the row as a defensive fallback rather than
+ * a real placement — see the _fetchFailed branch in main(). It is optional and
+ * defaults false, so existing readers are unaffected.
+ */
+function writeStateFile(dateStr, slot, etOffset, eventId, isMakeup, rescheduledFrom, opts = {}) {
+  if (DRY_RUN) {
+    log(`DRY-RUN: would write state file for ${slot.startMin}-${slot.endMin}`);
+    return;
+  }
+  const payload = {
+    date: dateStr,
+    slot: {
+      start_hhmm: minutesToHHMM(slot.startMin),
+      end_hhmm: minutesToHHMM(slot.endMin),
+      start_min: slot.startMin,
+      end_min: slot.endMin,
+    },
+    event_id: eventId || null,
+    is_makeup: !!isMakeup,
+    rescheduled_from: rescheduledFrom || null,
+    // Regression guard — exercise-calendar-fallback-silent-skip.
+    // event_id is null on BOTH the normal created path and the calendar-fail
+    // fallback, so the state file could not tell "11:00 because we chose it"
+    // from "11:00 because we could not read the calendar". That ambiguity cost
+    // a whole review pass. This field disambiguates them.
+    calendar_fetch_failed: !!(opts && opts.calendarFetchFailed),
+    created_at: new Date().toISOString(),
+    et_offset: etOffset,
+  };
+  try {
+    fs.writeFileSync(STATE_FILE, JSON.stringify(payload, null, 2));
+    log(`Wrote state file: ${STATE_FILE}`);
+  } catch (err) {
+    log(`State file write failed: ${err.message}`);
+  }
+}
+
+function readStateFile() {
+  try { return JSON.parse(fs.readFileSync(STATE_FILE, 'utf8')); }
+  catch { return null; }
+}
+
+function parseHHMM(s) {
+  const m = String(s || '').match(/^(\d{1,2}):(\d{2})$/);
+  if (!m) return null;
+  const h = parseInt(m[1], 10);
+  const mm = parseInt(m[2], 10);
+  if (h < 0 || h > 23 || mm < 0 || mm > 59) return null;
+  return h * 60 + mm;
+}
+
+/**
+ * Parse an RFC3339 time like "2026-05-08T11:00:00-04:00" into local minutes since midnight.
+ */
+function parseTimeToMinutes(timeStr) {
+  // Extract HH:MM from the local time portion
+  const match = timeStr.match(/T(\d{2}):(\d{2}):\d{2}/);
+  if (!match) return null;
+  return parseInt(match[1], 10) * 60 + parseInt(match[2], 10);
+}
+
+/**
+ * Get busy intervals (opaque/non-transparent events) as [startMin, endMin] pairs.
+ */
+function getBusyIntervals(events) {
+  const busy = [];
+  for (const event of events) {
+    const isTravel = TRAVEL_SUMMARY_RE.test(event.summary || '');
+    // A travel/transit marker blocks even when transparent (accommodation
+    // "Stay at ..." is transparent all-day). An all-day travel marker means the
+    // whole day is out — block 00:00–23:59.
+    if (isTravel && (!event.start || !event.start.dateTime)) {
+      busy.push([0, 24 * 60]);
+      continue;
+    }
+    // Skip transparent/free events, UNLESS they are travel markers.
+    if (event.transparency === 'transparent' && !isTravel) continue;
+    // Skip non-travel all-day events.
+    if (!event.start || !event.start.dateTime) continue;
+    const startMin = parseTimeToMinutes(event.start.dateTime);
+    const endMin = parseTimeToMinutes(event.end.dateTime);
+    if (startMin !== null && endMin !== null) {
+      busy.push([startMin, endMin]);
+    }
+  }
+  return busy;
+}
+
+/**
+ * Check if a [startMin, endMin] slot is free given busy intervals.
+ */
+function isSlotFree(startMin, endMin, busyIntervals) {
+  for (const [bStart, bEnd] of busyIntervals) {
+    // Overlap if not (endMin <= bStart || startMin >= bEnd)
+    if (!(endMin <= bStart || startMin >= bEnd)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+/**
+ * Find the best available 30-min slot using preference order.
+ * Skips slots that start within 60 min of now (not enough lead time).
+ * Returns { startMin, endMin } or null if none found.
+ */
+function findBestSlot(busyIntervals) {
+  // Current local minutes-since-midnight (for lead-time guard)
+  const nowP = zonedParts(new Date(), TZ);
+  const nowMin = nowP.hour * 60 + nowP.minute;
+  const LEAD_TIME = Number(CFG.lead_time_min) || 0; // skip slots starting this soon
+
+  function hasLeadTime(startMin) {
+    return startMin >= nowMin + LEAD_TIME;
+  }
+
+  const preferred = (CFG.preferred_slots || [])
+    .map((s) => hhmmToMin(s))
+    .filter((s) => s != null)
+    .map((s) => [s, s + 30]);
+
+  for (const [s, e] of preferred) {
+    if (hasLeadTime(s) && isSlotFree(s, e, busyIntervals)) {
+      return { startMin: s, endMin: e };
+    }
+  }
+
+  // Scan the window in 30-min steps for first free window with lead time
+  const [scanFrom, scanTo] = (CFG.scan_window || []).map((s) => hhmmToMin(s));
+  const winStart = scanFrom ?? 9 * 60;
+  const winEnd = scanTo ?? 18 * 60;
+  for (let start = winStart; start <= winEnd - 30; start += 30) {
+    const end = start + 30;
+    if (hasLeadTime(start) && isSlotFree(start, end, busyIntervals)) {
+      return { startMin: start, endMin: end };
+    }
+  }
+
+  return null; // No slot found with enough lead time
+}
+
+/**
+ * Format minutes since midnight to HH:MM string.
+ */
+function minutesToHHMM(minutes) {
+  const h = Math.floor(minutes / 60).toString().padStart(2, '0');
+  const m = (minutes % 60).toString().padStart(2, '0');
+  return `${h}:${m}`;
+}
+
+/**
+ * Create the exercise event via jori-calendar (the sanctioned write path).
+ */
+function createExerciseEvent(dateStr, etOffset, slot) {
+  const startTime = `${dateStr}T${minutesToHHMM(slot.startMin)}:00${etOffset}`;
+  const endTime = `${dateStr}T${minutesToHHMM(slot.endMin)}:00${etOffset}`;
+  const q = (v) => String(v || '').replace(/["\\$`]/g, '\\$&');
+  const summary = q(TEXTS.event_summary || 'Exercise');
+  const description = q(TEXTS.event_description || '');
+
+  const dryFlag = DRY_RUN ? '-n' : '';
+  // Routed through jori-calendar rather than gog directly (2026-08-04): it is
+  // the one sanctioned calendar-write path and it enforces the attendee rule.
+  // This event has no attendees and never should — the wrapper is a no-op for
+  // it — but going through the front door is what makes the front door real.
+  const cmd = `"${CAL}" create --calendar primary ${dryFlag} --summary "${summary}" --from "${startTime}" --to "${endTime}" --description "${description}" -p`;
+
+  log(`Creating event: ${startTime} → ${endTime}${DRY_RUN ? ' (dry-run)' : ''}`);
+  const result = run(cmd);
+  if (result.status !== 0) {
+    log(`jori-calendar create failed (status ${result.status}): ${result.stderr}`);
+    return false;
+  }
+  log(`Event created: ${result.stdout.trim()}`);
+  return true;
+}
+
+/**
+ * Send a phone notification via jori-send-curl.
+ */
+function sendPhoneNotification(startHHMM, endHHMM, isMakeupDay) {
+  const makeup = isMakeupDay ? ' (makeup day)' : '';
+  const message = `🏋️ ${startHHMM}–${endHHMM} blocked for exercise today${makeup}.`;
+  log(`Sending phone notification: ${message}`);
+
+  if (DRY_RUN) {
+    log(`DRY-RUN: would send: ${message}`);
+    return;
+  }
+
+  // --evidence-as-of live: same as the reschedule path — this reports the
+  // calendar event this script just created. See the note in rescheduleFlow.
+  const result = run(`"${JORI_SEND}" --suppress-hook --evidence-as-of live "${message}"`);
+  if (result.status !== 0) {
+    log(`jori-send-curl failed: ${result.stderr}`);
+  }
+}
+
+// ──────────────────────────────────────────────
+// Main
+// ──────────────────────────────────────────────
+
+/**
+ * Move an existing calendar event to a new start/end time in place.
+ */
+function updateEventTime(eventId, dateStr, etOffset, slot) {
+  if (!eventId) return false;
+  const startTime = `${dateStr}T${minutesToHHMM(slot.startMin)}:00${etOffset}`;
+  const endTime = `${dateStr}T${minutesToHHMM(slot.endMin)}:00${etOffset}`;
+  const dryFlag = DRY_RUN ? '-n' : '';
+  const cmd = `"${CAL}" update "${eventId}" --calendar primary ${dryFlag} --from "${startTime}" --to "${endTime}" --jori-event exercise-schedule -p`;
+
+  log(`Moving event ${eventId}: → ${startTime} → ${endTime}${DRY_RUN ? ' (dry-run)' : ''}`);
+  const result = run(cmd);
+  if (result.status !== 0) {
+    log(`jori-calendar update failed (status ${result.status}): ${result.stderr || result.stdout}`);
+    return false;
+  }
+  log(`Event updated: ${result.stdout.trim()}`);
+  return true;
+}
+
+/**
+ * Reschedule flow: move today's exercise block to a new start time.
+ * Updates the existing event in place so the old block isn't left behind;
+ * only creates a fresh event when none exists yet.
+ */
+async function rescheduleFlow(newStartHHMM) {
+  const startMin = parseHHMM(newStartHHMM);
+  if (startMin == null) {
+    log(`Invalid --reschedule time: ${newStartHHMM} (expected HH:MM)`);
+    process.exit(2);
+  }
+  const slot = { startMin, endMin: startMin + 30 };
+  const { date: todayStr } = getTodayLocal();
+  const etOffset = getLocalOffset(todayStr);
+  const { events } = getTodayEvents(todayStr, etOffset);
+  const existing = findExerciseEvent(events);
+  const prevSlot = existing && existing.start && existing.start.dateTime
+    ? minutesToHHMM(parseTimeToMinutes(existing.start.dateTime))
+    : null;
+
+  let eventId = existing ? existing.id : null;
+  if (existing) {
+    log(`Moving existing exercise event from ${prevSlot || 'unknown time'} to ${newStartHHMM}`);
+    const moved = updateEventTime(existing.id, todayStr, etOffset, slot);
+    if (!moved) {
+      log(`Reschedule failed: could not move event ${existing.id} to ${newStartHHMM}`);
+      process.exit(1);
+    }
+  } else {
+    log(`No existing exercise event found; creating fresh at ${newStartHHMM}`);
+    const created = createExerciseEvent(todayStr, etOffset, slot);
+    if (!created) {
+      log(`Reschedule failed: could not create new event at ${newStartHHMM}`);
+      process.exit(1);
+    }
+  }
+
+  const prevState = readStateFile();
+  const isMakeup = !!(prevState && prevState.is_makeup);
+  writeStateFile(todayStr, slot, etOffset, eventId, isMakeup, prevSlot);
+
+  const endHHMM = minutesToHHMM(slot.endMin);
+  const tail = TEXTS.reschedule_tail ? ` ${TEXTS.reschedule_tail}` : '';
+  const msg = `🏋️ Rescheduled to ${newStartHHMM}–${endHHMM}.${tail}`;
+  log(NO_NOTIFY ? `Notify suppressed (--no-notify), caller will announce: ${msg}` : `Notify: ${msg}`);
+  // --evidence-as-of live: this line reports a calendar write this script made
+  // moments ago and already verified above, so the truthfulness gate can exit
+  // at stage 0 instead of treating a 30-second-old fact as undated. Without it
+  // a reschedule ping reached a full adjudication 30s after the event was
+  // patched and was nearly rewritten. No --intent: the protected-intent belt in jori-send-curl
+  // keys on ^hum:(exercise|health): and this path has never been in that lane.
+  if (!DRY_RUN && !NO_NOTIFY) run(`"${JORI_SEND}" --suppress-hook --evidence-as-of live "${msg}"`);
+  process.exit(0);
+}
+
+function recordResponseFlow(kind) {
+  const VALID = new Set([
+    'yes_will_go', 'going_now', 'on_my_way', 'going',
+    'skip', 'skip_today', 'cant_today', 'done_for_today', 'no',
+  ]);
+  if (!VALID.has(kind)) {
+    log(`Invalid --record-response: ${kind}`);
+    process.exit(2);
+  }
+  const state = readStateFile();
+  if (!state) {
+    log(`No state file to update — nothing scheduled today.`);
+    process.exit(1);
+  }
+  state.last_response = kind;
+  state.response_at = new Date().toISOString();
+  try {
+    fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2));
+    log(`Recorded response: ${kind}`);
+  } catch (e) {
+    log(`Write failed: ${e.message}`);
+    process.exit(1);
+  }
+  process.exit(0);
+}
+
+(async function main() {
+  if (!CFG.enabled) {
+    process.stderr.write('exercise-schedule: not configured (agent/local/config/exercise.json enabled is not true) — nothing to do\n');
+    process.exit(0);
+  }
+  if (RECORD_RESPONSE) {
+    recordResponseFlow(RECORD_RESPONSE);
+    return;
+  }
+  if (RESCHEDULE_TO) {
+    await rescheduleFlow(RESCHEDULE_TO);
+    return;
+  }
+
+  const { date: todayStr, dow } = getTodayLocal();
+  log(`Running for ${todayStr} (dow=${dow})${DRY_RUN ? ' [DRY-RUN]' : ''}`);
+
+  // Clear stale state from prior days
+  const prevState = readStateFile();
+  if (prevState && prevState.date !== todayStr) {
+    try { fs.unlinkSync(STATE_FILE); log(`Cleared stale state from ${prevState.date}`); }
+    catch (e) { log(`Failed to clear stale state: ${e.message}`); }
+  }
+
+  const isRestDay = REST_DAYS.has(dow);
+  const sessionsThisWeek = countSessionsThisWeek();
+  log(`Sessions this week: ${sessionsThisWeek}, isRestDay: ${isRestDay}`);
+
+  // Rest day logic: skip if on track, continue (makeup day) if behind
+  const ON_TRACK = Number(CFG.rest_day_on_track_min) || 0;
+  if (isRestDay && sessionsThisWeek >= ON_TRACK) {
+    log(`Rest day and on track (${sessionsThisWeek} sessions). Skipping silently.`);
+    process.exit(0);
+  }
+
+  const isMakeupDay = isRestDay && sessionsThisWeek < ON_TRACK;
+  if (isMakeupDay) {
+    log(`Rest day but behind (${sessionsThisWeek} sessions). Proceeding as makeup day.`);
+  }
+
+  // Home gate: only schedule when the user is actually home with no travel
+  // disruption. On a flight/trip/away day there is no valid gym slot — placing
+  // one drops the block onto an obviously-impossible time (mid-flight, in the
+  // car, a hotel) and then the harvester nags about it. Skip the whole day.
+  const presence = homePresence(todayStr);
+  if (!presence.atHome) {
+    log(`Away today (${presence.reason}). No gym slot — skipping silently.`);
+    process.exit(0);
+  }
+  log(`Home today (${presence.reason}).`);
+
+  const etOffset = getLocalOffset(todayStr);
+  const { events, _fetchFailed, _lastError } = getTodayEvents(todayStr, etOffset);
+
+  // Idempotency: re-use existing exercise event when present
+  const existing = findExerciseEvent(events);
+  if (existing) {
+    log(`Exercise event already exists today. Re-syncing state file.`);
+    if (existing.start && existing.start.dateTime && existing.end && existing.end.dateTime) {
+      const sMin = parseTimeToMinutes(existing.start.dateTime);
+      const eMin = parseTimeToMinutes(existing.end.dateTime);
+      if (sMin != null && eMin != null) {
+        writeStateFile(todayStr, { startMin: sMin, endMin: eMin }, etOffset, existing.id, isMakeupDay, null);
+      }
+    }
+    process.exit(0);
+  }
+
+  // Defensive fallback. If the calendar fetch failed
+  // (gog auth glitch, network blip, etc.), an empty busy list is
+  // UNTRUSTWORTHY — we can't tell free from "we just don't know." Without
+  // a state file the hum exercise harvester loses every slot-dependent
+  // branch and the lane goes dark. Write the default fallback slot anyway so
+  // pre-slot / slot-start / miss / evening-recovery branches all have an
+  // anchor; mark the state row as is_makeup so the harvester treats it
+  // with appropriate flexibility. Calendar conflicts that actually exist
+  // will surface in the slot-start ping where the user can reschedule.
+  //
+  // Regression guard — exercise-calendar-fallback-silent-skip.
+  // Defends against: consecutive days with no calendared exercise block,
+  // every run reported as success. This branch
+  // exits 0 WITHOUT ever reaching createExerciseEvent(), so a calendar READ
+  // failure silently cancels the calendar WRITE that is the job's whole
+  // purpose. That is still the intended behaviour — writing a block against an
+  // untrusted (empty) busy list could double-book a real meeting, and the
+  // playbook's "gog auth failure: log, skip silently for the day" rule stands.
+  // Do NOT "fix" this by calling createExerciseEvent() here; that is the
+  // user's decision, not a bug. What changed since: the read is now retried
+  // (see getTodayEvents), so a TRANSIENT failure no longer reaches this branch
+  // at all; and when a PERSISTENT one does, it is visible — log() persists to
+  // data/logs/exercise-schedule.log and the row below is stamped
+  // calendar_fetch_failed: true, so nobody has to guess again.
+  if (_fetchFailed) {
+    const fbStart = hhmmToMin(CFG.fallback_slot, 11 * 60);
+    const FALLBACK_SLOT = { startMin: fbStart, endMin: fbStart + 30 };
+    log(`Calendar fetch failed — writing default ${minutesToHHMM(fbStart)} slot (defensive fallback), NO calendar event created today. Real conflicts will be caught at slot-start ping.`);
+    writeStateFile(todayStr, FALLBACK_SLOT, etOffset, null, isMakeupDay, null, { calendarFetchFailed: true });
+    recordCalFailAndMaybeEscalate(todayStr, _lastError);
+    process.exit(0);
+  }
+
+  const busyIntervals = getBusyIntervals(events);
+  log(`Busy intervals: ${JSON.stringify(busyIntervals.map(([s, e]) => `${minutesToHHMM(s)}-${minutesToHHMM(e)}`))}`);
+
+  const slot = findBestSlot(busyIntervals);
+  if (!slot) {
+    log(`No free 30-min slot found in the scan window. No event created.`);
+    process.exit(0);
+  }
+
+  const startHHMM = minutesToHHMM(slot.startMin);
+  const endHHMM = minutesToHHMM(slot.endMin);
+  log(`Selected slot: ${startHHMM}–${endHHMM}`);
+
+  const created = createExerciseEvent(todayStr, etOffset, slot);
+  if (created) {
+    writeStateFile(todayStr, slot, etOffset, null, isMakeupDay, null);
+    sendPhoneNotification(startHHMM, endHHMM, isMakeupDay);
+  }
+})();
