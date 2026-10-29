@@ -539,6 +539,45 @@
         "shop chrome sign in"
       ],
       "description": "Keep the shop Chrome signed in to the installation's top merchants (data/purchase-merchants.json; jobs/purchase-signin.md). Weekly, daytime, since 2FA codes go to the phone."
+    },
+    {
+      "name": "trip-reservoir-autoscan",
+      "schedule": "0 2 * * *",
+      "schedule_human": "Daily at 2:00 AM local via launchd user agent ai.claude.trip-reservoir-autoscan (NOT cron — the Sonnet research fork needs the keychain Max session; overnight, research is web-search-heavy)",
+      "trigger_script": "agent/scripts/trigger-trip-reservoir-autoscan.sh",
+      "webhook_url": null,
+      "webhook_task": null,
+      "ops_playbook_section": null,
+      "delivers_to": "supabase",
+      "phrases": [
+        "research a new place",
+        "build a travel guide",
+        "guide for where we're going",
+        "auto research destinations",
+        "reservoir for upcoming trip"
+      ],
+      "description": "Nightly gate: finds any upcoming NON-HOME location on the travel timeline that has no travel guide (reservoir) yet, and researches each one sequentially with trip-reservoir-build (geocodes any city worldwide) directly from the launchd agent — no ops-agent turn since 2026-10-04. Skips home bases (NYC/Miami) and short layovers. Makes trip-guide research automatic for anywhere we go instead of hand-kicked per trip. Silent when nothing is missing.",
+      "job": null,
+      "scheduler": "launchd"
+    },
+    {
+      "name": "reservoir-mark-done",
+      "schedule": "35 1 * * *",
+      "schedule_human": "Daily at 7:35 AM the user's local time (30 min after daily-summary; cron-tz-sync rewrites the local fields nightly)",
+      "trigger_script": "agent/scripts/trigger-reservoir-mark-done.sh",
+      "webhook_url": null,
+      "webhook_task": null,
+      "ops_playbook_section": null,
+      "delivers_to": "supabase",
+      "phrases": [
+        "mark done",
+        "already been there",
+        "strike out places we've seen",
+        "travel guide done",
+        "area guide progress"
+      ],
+      "description": "Strikes out area-guide (trip_reservoirs) places the user has already been to, so the guides stop suggesting things already done. Evidence: the daily summary first (vetted against chat + transactions + Places; catches visits that never became a stop), then GPS visits, then the travel path. Done, never removed; marks record their evidence. Runs after daily-summary because that's its primary source. Deliberately loose — the user prefers over-striking to under-striking. Cannot mark food specialties (a dish is not a place) — those rely on the site's manual done/undone button. Silent, state-only.",
+      "job": null
     }
   ]
 }
