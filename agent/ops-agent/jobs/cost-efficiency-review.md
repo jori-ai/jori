@@ -153,7 +153,7 @@ Do not report "cost went up." Report **what changed**. Check, in order:
      agent/*/.mcp.json agent/tools-mcp/index.mjs
    git diff --stat -- agent/CLAUDE.md      # uncommitted content the live agents are already carrying
    # 3. the two surfaces git cannot see at all
-   ./tools/bin/wiki-session-context | wc -c ; ./tools/bin/wiki list --pinned | tail -1
+   ./bin/wiki-session-context | wc -c ; ./bin/wiki list --pinned | tail -1
    find ~/.claude/skills -name SKILL.md -newermt '<window start>'
    ```
 

@@ -195,6 +195,10 @@ Kernel jobs: `morning-digest`, `context-sync`, `hum` (**event-driven** via the `
 
 **Merged/retired jobs:** `triage-learning` (merged into `nightly-review` Step 2c on 2026-04-23 as part of the token-audit pass — one daily Opus dispatch instead of two).
 
+## Dining (Resy, Places, meal offers)
+
+`bin/resy` (Resy API: search / slots / book / snipe / watch; the login in `data/resy-auth.json`; the city in `agent/local/config/resy.json`) and the `resy` MCP tool (`agent/tools-mcp/modules/resy.mjs`). Every Google Places request goes through `lib/places_client.py` / `lib/places-client.js`, gated on host, a `places-budget` block (scope `jori`), per-caller tier caps and a monthly ceiling; the policy is `lib/places-tier-policy.json` merged with `agent/local/config/places-tier-policy.json`. `bin/places` is the search / check CLI (one-year cell cache, the restaurant ranking; its "near me" locator is `agent/local/config/places.json` `locate_cmd`) behind the `places` MCP tool. Hum never searches Places unprompted: the `meal_offer` lane asks, and a yes runs `bin/meal-pick` (walking radius `lib/walking.mjs`, `lib/local-interest-rank.mjs`, the user's rules from `agent/local/config/meals.json`). With no Resy login and no Places key every piece reports "not set up" and does nothing.
+
 ## Browsing skills
 
 Central registry of browser actions used by cron jobs, hum, and ad-hoc agent work, modeled on the public [browsing-skills/browsing-skills](https://github.com/browsing-skills/browsing-skills) library. Pattern: one file per action, structured JSON output, validated.
@@ -665,7 +669,7 @@ The kernel sits under `<repo>/tools/` here and at the repo root in the published
 - `REPO_ROOT` / `TOOLS_DIR` (+ `toolsPath(...p)`) — the checkout the code runs from (a worktree, a CI clone, the live install), fixed at load. `TOOLS_DIR` is the kernel tree.
 - `installRoot()` / `installTools(...p)` — the installation under the operator's HOME (`~/Dev/jori`, `~/Dev/jori`), read per call so a test that points HOME at a sandbox sees it. This is what the supervisors, bins and libs that used `path.join(HOME, "Dev/jori")` now call.
 
-`JORI_HOME`, when set, is both. Paths below the kernel tree are joined onto `TOOLS_DIR` / `installTools()` with their kernel-relative spelling (`"agent/logs"`), never a leading `"tools/"`; a relative path between two kernel files is fine as it is. Shell scripts source `agent/scripts/lib/root.sh`, which sets `JORI_ROOT` / `JORI_TOOLS` (the checkout; an exported `JORI_ROOT` wins, then `JORI_HOME`), `JORI_INSTALL` / `JORI_INSTALL_TOOLS` (the installation) and `JORI_KERNEL_SUBDIR`; scripts write `"$JORI_TOOLS/bin/x"`, never `"$ROOT/tools/bin/x"`. LaunchAgent templates write `__JORI_TOOLS__/...` (rendered by `launchd-render.sh`) for paths below the kernel. The layout is one line in `root.cjs`, `const KERNEL_SUBDIR = "tools";`; `root.sh` reads it from there. `tests/kernel-layout.test.mjs` runs both helpers in both layouts.
+`JORI_HOME`, when set, is both. Paths below the kernel tree are joined onto `TOOLS_DIR` / `installTools()` with their kernel-relative spelling (`"agent/logs"`), never a leading `"tools/"`; a relative path between two kernel files is fine as it is. Shell scripts source `agent/scripts/lib/root.sh`, which sets `JORI_ROOT` / `JORI_TOOLS` (the checkout; an exported `JORI_ROOT` wins, then `JORI_HOME`), `JORI_INSTALL` / `JORI_INSTALL_TOOLS` (the installation) and `JORI_KERNEL_SUBDIR`; scripts write `"$JORI_TOOLS/bin/x"`, never `"$ROOT/bin/x"`. LaunchAgent templates write `__JORI_TOOLS__/...` (rendered by `launchd-render.sh`) for paths below the kernel. The layout is one line in `root.cjs`, `const KERNEL_SUBDIR = "tools";`; `root.sh` reads it from there. `tests/kernel-layout.test.mjs` runs both helpers in both layouts.
 
 ## Kernel boundary and its enforcement
 
