@@ -1006,6 +1006,23 @@
       ],
       "description": "Keep the rental portfolio's Google calendar in step with confirmed channel-manager stays and signed leases at active properties: 1h show-as-free check-in and 30m check-out events. Off without agent/local/config/rentals.json stay_calendar.calendar_id. Deterministic, no agent dispatch.",
       "job": null
+    },
+    {
+      "name": "meeting-calendar-check",
+      "schedule": "on-demand",
+      "schedule_human": "On demand; an installation schedules it (a morning check per recurring meeting)",
+      "trigger_script": "agent/scripts/check-meetings.sh",
+      "webhook_url": null,
+      "webhook_task": null,
+      "ops_playbook_section": null,
+      "delivers_to": "meeting-state",
+      "phrases": [
+        "meeting calendar check",
+        "is the meeting today",
+        "recurring meeting check"
+      ],
+      "description": "For each recurring meeting in agent/local/config/meetings.json: find today's occurrence on the calendar, update the meeting's state file and its crontab-safe reminder lines. Off with no meetings configured.",
+      "job": null
     }
   ]
 }
