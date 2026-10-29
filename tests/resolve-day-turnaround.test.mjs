@@ -43,14 +43,14 @@ afterEach(() => {
   if (realKey === undefined) delete process.env.SUPABASE_SERVICE_ROLE_KEY; else process.env.SUPABASE_SERVICE_ROLE_KEY = realKey;
 });
 
-// 2026-10-28, local = UTC+2: the airport run 06:00:59-06:16:34
+// 2026-10-28 at the fake origin (local = UTC-4): the airport run 06:00:59-06:16:34
 const AIRPORT_ROW = {
-  id: "9f1c-airport", arrived_at: "2026-10-28T04:00:59+00:00", departed_at: "2026-10-28T04:16:34+00:00",
+  id: "9f1c-airport", arrived_at: "2026-10-28T10:00:59+00:00", departed_at: "2026-10-28T10:16:34+00:00",
   ...LLR(0.0, 0.0),
   notes: "[turnaround] drove 15.4 km out and back to where it began; 4/4 fixes within 3 km of the far point over 16 min, no stop seen there. Purpose unknown.",
 };
 const stop = (over) => ({
-  id: "s1", start_ts_ms: Date.parse("2026-10-28T04:00:59Z"), end_ts_ms: Date.parse("2026-10-28T04:16:34Z"),
+  id: "s1", start_ts_ms: Date.parse("2026-10-28T10:00:59Z"), end_ts_ms: Date.parse("2026-10-28T10:16:34Z"),
   ...LL(-1233.43, 817.36), place: { name: "Example Airport", confidence: 0.95 }, ...over,
 });
 
