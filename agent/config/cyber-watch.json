@@ -1,0 +1,62 @@
+{
+  "_doc": "cyber-watch config (kernel defaults). Playbook: agent/ops-agent/jobs/cyber-watch.md. This installation overlays it from agent/local/config/cyber-watch.json: `enabled` (off without it), `profile` (one or two sentences on who the user is, for the model), `stack` (the software the user runs, in words), `vendors[]` (the service providers that hold the user's money, credentials, data or devices) and `uninventoried` (devices the inventory cannot see). The weekly lane also proposes additions from new Plaid merchants into data/cyber-watch-state.json → learned_vendors (a model call decides, not a pattern). Tiers: 1 = money or credentials that unlock other things (bank, broker, password manager, a platform holding API secrets); 2 = an account holding personal data, a payment method or a device on the home network; 3 = ordinary consumer account, mention only on a major breach.",
+  "feeds": [
+    {
+      "id": "cisa-advisories",
+      "url": "https://www.cisa.gov/cybersecurity-advisories/all.xml"
+    },
+    {
+      "id": "bleepingcomputer",
+      "url": "https://www.bleepingcomputer.com/feed/"
+    },
+    {
+      "id": "thehackernews",
+      "url": "https://feeds.feedburner.com/TheHackersNews"
+    },
+    {
+      "id": "securityweek",
+      "url": "https://www.securityweek.com/feed/"
+    },
+    {
+      "id": "krebs",
+      "url": "https://krebsonsecurity.com/feed/"
+    },
+    {
+      "id": "therecord",
+      "url": "https://therecord.media/feed"
+    },
+    {
+      "id": "gnews-top",
+      "url": "https://news.google.com/rss/search?q=(cyberattack%20OR%20%22data%20breach%22%20OR%20zero-day%20OR%20%22actively%20exploited%22%20OR%20ransomware)%20when:1d&hl=en-US&gl=US&ceid=US:en"
+    }
+  ],
+  "kev_url": "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json",
+  "hibp_breaches_url": "https://haveibeenpwned.com/api/v3/breaches",
+  "gnews_vendor_template": "https://news.google.com/rss/search?q=%22{NAME}%22%20(breach%20OR%20hacked%20OR%20hack%20OR%20ransomware%20OR%20%22data%20leak%22%20OR%20vulnerability%20OR%20%22security%20incident%22)%20when:7d&hl=en-US&gl=US&ceid=US:en",
+  "alert": {
+    "quiet_local": {
+      "start": 23,
+      "end": 8
+    },
+    "max_items_to_model": 160,
+    "max_alerts_per_run": 3,
+    "max_candidates_per_run": 5,
+    "alerted_memory_days": 21
+  },
+  "inventory": {
+    "max_age_hours": 20
+  },
+  "weekly": {
+    "max_dependency_findings": 25,
+    "news_per_vendor": 6,
+    "fetch_delay_ms": 900,
+    "min_tier_for_news_search": 2
+  },
+  "stack": [],
+  "vendors": [],
+  "ignore_merchants": [
+    "restaurants, cafes, bars, bakeries, grocery and convenience stores, salons, barbers, cleaners",
+    "one-off local shops, markets, parking, tolls, taxis, transit fares",
+    "government tax payments and individual people (Venmo/Zelle recipients, contractors)"
+  ]
+}

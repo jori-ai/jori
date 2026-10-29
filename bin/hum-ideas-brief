@@ -1,0 +1,50 @@
+#!/usr/bin/env node
+// hum-ideas-brief — the hum improvement loop, as the weekly review reports it.
+//
+// Requirement (2026-10-07): larger, structural hum changes belong in the weekly
+// improvement email, not the daily brief. nightly-review (Tuesdays) runs this
+// for its "HUM — IMPROVEMENT LOOP" section. It reads the ledger and says, in
+// field comparisons only: what landed on its own this week, what is waiting on
+// a card or a chat answer, and which ideas are too big for one unattended run
+// and so need the user's call.
+//
+// Usage: hum-ideas-brief [--json] [--days N]   (default 7)
+// Env (tests): HUM_IDEAS_FILE.
+
+import fs from "node:fs";
+import { fileURLToPath } from "node:url";
+import { loadLatest, routeFor } from "../lib/hum-ideas.mjs";
+
+export function brief(ideas, now = Date.now(), days = 7) {
+  const since = now - days * 86400000;
+  const ts = (i) => Date.parse(i.applied_at || i.reconciled_at || i.retired_at || "");
+  const line = (i) => ({ id: i.id, title: i.title, risk: i.risk, effort: i.effort, scope: i.scope, proposed_at: i.proposed_at || null, change: i.proposed_change || null });
+  const landed = ideas.filter((i) => i.status === "applied" && ts(i) >= since).map(line);
+  const big = ideas.filter((i) => routeFor(i) === "weekly_email").map(line);
+  const asking = ideas.filter((i) => routeFor(i) === "ask_in_chat").map(line);
+  const approved = ideas.filter((i) => routeFor(i) === "build").map(line);
+  const cards = ideas.filter((i) => i.status === "awaiting_approval").map(line);
+  return { window_days: days, landed, structural: big, asking_in_chat: asking, approved_waiting_to_build: approved, cards_waiting: cards };
+}
+
+export function text(b) {
+  const n = (a) => a.length;
+  const titles = (a) => a.map((i) => i.title).join("; ");
+  const out = [`Hum improvement loop, last ${b.window_days} days:`];
+  out.push(n(b.landed) ? `Landed (${n(b.landed)}): ${titles(b.landed)}` : "Landed: nothing this week.");
+  if (n(b.cards_waiting)) out.push(`Waiting on a card to sign (${n(b.cards_waiting)}): ${titles(b.cards_waiting)}`);
+  if (n(b.asking_in_chat)) out.push(`Asked or about to be asked in the hum chat (${n(b.asking_in_chat)}): ${titles(b.asking_in_chat)}`);
+  if (n(b.approved_waiting_to_build)) out.push(`You said yes; waiting for the next build run (${n(b.approved_waiting_to_build)}): ${titles(b.approved_waiting_to_build)}`);
+  if (n(b.structural)) {
+    out.push(`Bigger changes that need your call (${n(b.structural)}; too large to build unattended):`);
+    for (const i of b.structural) out.push(`- ${i.title} (${i.id}, effort ${i.effort || "unsized"}): ${String(i.change || "").slice(0, 240)}`);
+  } else out.push("Bigger changes that need your call: none.");
+  return out.join("\n");
+}
+
+if (process.argv[1] && fs.realpathSync(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  const args = process.argv.slice(2);
+  const di = args.indexOf("--days");
+  const b = brief(loadLatest(), Date.now(), di >= 0 ? Number(args[di + 1]) || 7 : 7);
+  console.log(args.includes("--json") ? JSON.stringify(b, null, 2) : text(b));
+}

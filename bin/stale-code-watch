@@ -1,0 +1,13 @@
+#!/usr/bin/env node
+// stale-code-watch [--dry-run] — restart the small long-running daemons whose
+// committed code is newer than the process, and flag (exit 6, text in
+// data/stale-code-watch-state.json `_flag`) big daemons on old code for
+// 6h+ and code files left uncommitted for 12h+. Run by watchdog.sh every tick,
+// right after supervisor-code-reload; watchdog.sh pages from the exit code.
+// Logic and rationale: lib/stale-code-watch.mjs.
+const path = require("node:path");
+const { pathToFileURL } = require("node:url");
+import(pathToFileURL(path.join(__dirname, "../lib/stale-code-watch.mjs")).href)
+  .then(async (m) => { process.exitCode = await m.main(process.argv.slice(2)); })
+  // A crash says nothing about the daemons: 5 (watchdog.sh neither pages nor clears).
+  .catch((e) => { console.log(`stale-code-watch: ${e.message}`); process.exitCode = 5; });

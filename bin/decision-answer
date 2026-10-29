@@ -1,0 +1,73 @@
+#!/usr/bin/env node
+// decision-answer — file the user's answer to a decision card back to its source
+// (improvement-plan-state.json or cost-efficiency-review-state.json), so the
+// planner / cost review acts on it on its next run.
+//
+//   decision-answer --ref <ref> --option "<exact option label or source text>"
+//   decision-answer --ref <ref> --text "<the answer in the user's own words>"
+//   decision-answer --latest --text "..."   the decision card sent in the last 48h
+//                                           that is still open (unthreaded reply)
+//   [--message-id <jori_messages id of the reply>]
+//
+// Who calls it: choice-reply.mjs on an exact tap (no agent turn), and the chat
+// agent when the user answers in words — the chat agent reads what was meant
+// (a model) and passes either the option it maps to or the user's words. This file does
+// no interpretation (Rule #0b): `--option` must equal one of the decision's own
+// option texts or card labels exactly, or it is refused.
+//
+// Prints {recorded, already_answered, ref, source, answer, next}. `next` is what
+// the answer leads to — which job reads it and by when, and whether the chosen
+// option changes nothing (the card model's flag for that option) — so the reply
+// after a tap can say so truthfully (choice-reply.mjs words it).
+//
+// Exit: 0 recorded (or already answered) · 4 refused (unknown ref/option) · 2 usage.
+
+import { findDecision, recordAnswer, latestAsked, readLane, followUp, hashQuestion } from "../lib/decision-queue.mjs";
+import { userTz } from "../lib/hum-events.mjs";
+
+const arg = (n) => { const i = process.argv.indexOf(`--${n}`); return i >= 0 ? process.argv[i + 1] : null; };
+const has = (n) => process.argv.includes(`--${n}`);
+
+let ref = arg("ref");
+if (!ref && has("latest")) ref = latestAsked()?.ref || null;
+const option = arg("option");
+const text = arg("text");
+if (!ref || (!option && !text) || (option && text)) {
+  console.error("usage: decision-answer (--ref <ref> | --latest) (--option <label> | --text <words>) [--message-id <id>]");
+  process.exit(ref || !has("latest") ? 2 : 4);
+}
+
+let answer = text;
+let changesNothing = null;
+if (option) {
+  const item = findDecision(ref);
+  if (!item) {
+    console.error(`decision-answer: ${ref} is not an open decision`);
+    process.exit(4);
+  }
+  const card = readLane().cards?.[ref]?.card;
+  const bySource = item.q.options.find((o) => String(o) === option);
+  const byLabel = card?.options?.find((o) => o.label === option);
+  answer = bySource ?? (byLabel ? String(item.q.options[byLabel.source_index]) : null);
+  if (!answer) {
+    console.error(`decision-answer: "${option}" is not one of ${ref}'s options; pass --text with the user's words instead`);
+    process.exit(4);
+  }
+  const idx = bySource !== undefined ? item.q.options.findIndex((o) => String(o) === option) : byLabel.source_index;
+  // Only from the card built for this exact question: an older card's flag may describe other options.
+  const current = readLane().cards?.[ref]?.question_hash === hashQuestion(item.q);
+  const flag = current ? card?.options?.find((o) => o.source_index === idx)?.changes_nothing : undefined;
+  if (typeof flag === "boolean") changesNothing = flag;
+}
+
+const r = recordAnswer({ ref, answer, kind: option ? "option" : "text", messageId: arg("message-id") });
+if (!r.ok) {
+  console.error(`decision-answer: ${r.error}`);
+  process.exit(4);
+}
+let next = null;
+if (!r.already) {
+  try { next = followUp(ref, { tz: userTz() }); } catch { next = null; }
+  if (next) next.changes_nothing = changesNothing;
+}
+console.log(JSON.stringify({ recorded: !r.already, already_answered: !!r.already, ref, source: r.source, answer, next }));

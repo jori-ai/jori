@@ -1,0 +1,536 @@
+#!/usr/bin/env node
+// cyber-watch-run — security news checked against what the user actually runs,
+// with no agent turn.
+//
+//   cyber-watch-run --lane alert  [--dry-run]   every 3h: a chat ping ONLY for an
+//                                                issue that, after checking, affects
+//                                                the user (act today / this week)
+//   cyber-watch-run --lane weekly [--dry-run]   Monday email: every checked item
+//                                                with its analysis and urgency
+//   cyber-watch-run --vendors                   print the provider inventory
+//   cyber-watch-run --inventory                 rebuild + summarise the exposure inventory
+//
+// Requirement: send a story only after checking whether it applies to the
+// user's systems and code, with the analysis, what to do and how urgently.
+//
+// Off without agent/local/config/cyber-watch.json (`enabled: true`, `profile`,
+// `stack`, `vendors`): a fresh install exits 0 with a log line.
+//
+// Pipeline: code fetches (security RSS, CISA KEV, HIBP, per-provider Google News)
+// → a TRIAGE model call picks candidate stories and names the software each is
+// about → code looks that software up in the exposure inventory
+// (lib/cyber-inventory.mjs: the Jori host + every GitHub repo's lockfiles,
+// plus an OSV.dev scan of every dependency), fetches the advisory text and NVD
+// version ranges → a VERDICT model call decides applies yes/no/unclear, writes
+// the analysis, urgency and action from that evidence → code delivers. Every
+// call is tool-less Sonnet on Max (Rule #0b: the model reads, code looks up).
+//
+// Runs in the GUI session (launchd ai.claude.cyber-watch-alert / -weekly, kicked
+// by trigger-cyber-watch-*.sh) because the model calls are `claude -p` on Max.
+// Playbook: agent/ops-agent/jobs/cyber-watch.md
+
+import fs from "node:fs";
+import { createRequire } from "node:module";
+import { spawnSync } from "node:child_process";
+import path from "node:path";
+import {
+  REPO, loadConfig, loadState, saveState, pruneState, fetchFeeds, fetchKev, fetchHibp, fetchVendorNews,
+  vendorForDomain, allVendors, vendorBrief, unseen, markSeen, localHour, inQuiet, articleText, cveIds, nvdCve,
+} from "../lib/cyber-watch.mjs";
+import { buildInventory, lookupSoftware, inventorySummary, osvScan, osvVuln } from "../lib/cyber-inventory.mjs";
+import { sendHtmlEmail, labelDigest, ogCards, escapeHtml } from "../lib/digest-deliver.mjs";
+
+const require = createRequire(import.meta.url);
+const { MODELS } = require("../lib/models.cjs");
+const { instance } = require("../lib/instance.cjs");
+const argv = process.argv.slice(2);
+const DRY = argv.includes("--dry-run");
+const LANE = argv.includes("--vendors") ? "vendors" : argv.includes("--inventory") ? "inventory" : argv[argv.indexOf("--lane") + 1];
+const log = (m) => console.error(`${new Date().toISOString()} [cyber-watch:${LANE}] ${m}`);
+const DAY = 86400000;
+const INV_FILE = path.join(REPO, "data/cyber-watch-inventory.json");
+const URGENCY_ORDER = { now: 0, this_week: 1, routine: 2, none: 3 };
+const URGENCY_LABEL = { now: "act today", this_week: "this week", routine: "when convenient", none: "no action" };
+
+// Set by main() from the merged config; the prompts below read it.
+let CFG = { profile: "", uninventoried: "" };
+const HOST = () => instance().host_title || "the server";
+const OTHER_DEVICES = () => CFG.uninventoried || "other devices (laptops, phones)";
+
+const relevanceRules = () => `${CFG.profile || "The user is a private individual, not a company, who keeps money and accounts at the providers in the provider list."}
+Two kinds of story are candidates:
+1. TOP EVENT — internet-scale, the kind every security team talks about that day: a mass-exploited flaw in very widely used software (the PHP-CGI flaw, Log4Shell, a Chrome/iOS/macOS zero-day under attack, an OpenSSH, Node.js or npm/PyPI supply-chain compromise), or a breach of a major platform holding many people's secrets or money (the Railway environment-variable breach, a password-manager or big-bank breach). Routine CVEs, patch-Tuesday roundups, single small-company breaches, nation-state attribution essays, funding news and opinion pieces are NOT top events.
+2. PROVIDER HIT — the story is about one of THE USER'S providers (list given) or software in THE USER'S stack: a breach, hack, leaked data, exploited vulnerability, credential or token reset, or an active phishing campaign aimed at that provider's customers. A story that merely mentions the provider in passing does not count; fines, lawsuits, regulation, business news and plain outages are not hits. Name the provider exactly as it appears in the list.
+Never invent facts that are not in the items. Write to the user directly as "you" (never in the third person).`;
+
+const SOFTWARE_FIELD = {
+  type: "array", description: "the software/products this story is about, to look up in the user's inventory: npm/PyPI/Pub/crate package names exactly as published, Homebrew formula names, or one of these runtime keys: macos, node, python, php, openssh, chrome, docker, tailscale, ollama, git, gh, claude-code, op. Empty for a pure account breach.",
+  items: { type: "object", additionalProperties: false, required: ["name", "ecosystem"], properties: {
+    name: { type: "string" },
+    ecosystem: { type: "string", enum: ["any", "npm", "PyPI", "Pub", "crates.io", "SwiftURL", "Go", "CocoaPods", "docker-image", "engine", "runtime", "homebrew"] },
+  } },
+};
+
+async function judgeWith(opts) {
+  const { judge } = require("../lib/max-judge.js");
+  return judge({ model: MODELS.sonnet, ...opts });
+}
+
+function send(message, intent) {
+  const r = spawnSync(path.join(REPO, "bin/jori-send-curl"), ["--intent", intent, "--evidence-as-of", "live", message],
+    { stdio: ["ignore", "pipe", "pipe"], encoding: "utf8", timeout: 120000 });
+  if (r.status !== 0) log(`jori-send-curl exit ${r.status}: ${(r.stderr || "").trim().slice(0, 200)}`);
+}
+
+async function pool(items, n, fn) {
+  const out = new Array(items.length);
+  let i = 0;
+  await Promise.all(Array.from({ length: Math.min(n, items.length) }, async () => { while (i < items.length) { const k = i++; out[k] = await fn(items[k]); } }));
+  return out;
+}
+
+// ------------------------------------------------------------ inventory
+
+async function ensureInventory(maxAgeH) {
+  let inv = null;
+  try { inv = JSON.parse(fs.readFileSync(INV_FILE, "utf8")); } catch {}
+  if (inv && Date.now() - Date.parse(inv.built_at) < maxAgeH * 3600000) return inv;
+  let fresh;
+  try { fresh = buildInventory({ log }); } catch (e) { log(`inventory build FAILED: ${e.message}`); return inv; }
+  if (!fresh.repos?.length && inv?.repos?.length) { log("inventory: GitHub returned no repos — keeping the previous repo half"); Object.assign(fresh, { repos: inv.repos, index: inv.index, names: inv.names }); }
+  const prev = inv?.osv?.vulns || {};
+  try {
+    const hits = await osvScan(fresh, { log });
+    const ids = [...new Set(hits.flatMap((h) => h.ids))];
+    const details = await pool(ids, 8, async (id) => prev[id] || osvVuln(id));
+    fresh.osv = { scanned_at: new Date().toISOString(), hits, vulns: Object.fromEntries(ids.map((id, k) => [id, details[k]])) };
+  } catch (e) { log(`OSV FAILED: ${e.message}`); fresh.osv = inv?.osv || null; }
+  const tmp = `${INV_FILE}.tmp-${process.pid}`;
+  fs.writeFileSync(tmp, JSON.stringify(fresh));
+  fs.renameSync(tmp, INV_FILE);
+  return fresh;
+}
+
+const SEV_RANK = { CRITICAL: 4, HIGH: 3, MODERATE: 2, MEDIUM: 2, LOW: 1 };
+
+/** OSV hits grouped per package, ranked: malicious > critical > high, runtime > dev-only, active repo > stale. */
+function osvFindings(inv) {
+  if (!inv?.osv?.hits) return [];
+  const recentRepo = new Map((inv.repos || []).map((r) => [r.name, Date.now() - Date.parse(r.pushed_at || 0) < 120 * DAY]));
+  const groups = new Map();
+  for (const h of inv.osv.hits) {
+    const k = `${h.eco}:${h.name}`;
+    const rows = (inv.index[`${h.eco === "SwiftURL" ? "SwiftURL" : h.eco}:${h.name.toLowerCase()}`] || []).filter((r) => r.version === h.version);
+    const vulns = h.ids.map((id) => inv.osv.vulns[id] || { id });
+    const g = groups.get(k) || { key: k, eco: h.eco, name: h.name, versions: new Set(), uses: [], vulns: new Map() };
+    g.versions.add(h.version);
+    for (const r of rows) g.uses.push({ repo: r.repo, file: r.file, version: h.version, dev: !!r.dev });
+    for (const v of vulns) g.vulns.set(v.id, v);
+    groups.set(k, g);
+  }
+  return [...groups.values()].map((g) => {
+    const vulns = [...g.vulns.values()];
+    const rank = Math.max(...vulns.map((v) => (v.malicious ? 5 : SEV_RANK[String(v.severity || "").toUpperCase()] || 1)));
+    const runtime = g.uses.some((u) => !u.dev);
+    const active = g.uses.some((u) => recentRepo.get(u.repo));
+    return {
+      key: g.key, eco: g.eco, name: g.name, versions: [...g.versions], rank, runtime, active,
+      repos: [...new Set(g.uses.map((u) => u.repo))],
+      uses: g.uses.slice(0, 8),
+      vulns: vulns.sort((a, b) => (b.malicious - a.malicious) || ((SEV_RANK[String(b.severity).toUpperCase()] || 1) - (SEV_RANK[String(a.severity).toUpperCase()] || 1))).slice(0, 4)
+        .map((v) => ({ id: v.id, aliases: (v.aliases || []).slice(0, 2), severity: v.severity, malicious: !!v.malicious, summary: v.summary, fixed: v.fixed })),
+      ids: vulns.map((v) => v.id),
+    };
+  }).sort((a, b) => b.rank - a.rank || (b.runtime - a.runtime) || (b.active - a.active));
+}
+
+// --------------------------------------------------------------- verdict
+
+const VERDICT_SCHEMA = {
+  type: "object", additionalProperties: false, required: ["verdicts"],
+  properties: { verdicts: { type: "array", items: {
+    type: "object", additionalProperties: false, required: ["id", "applies", "analysis", "urgency", "action"],
+    properties: {
+      id: { type: "string", description: "candidate id exactly as given" },
+      applies: { type: "string", enum: ["yes", "no", "unclear"] },
+      analysis: { type: "string", description: "2-4 plain sentences to the user as 'you': the issue in one clause, exactly what the inventory shows (machine, repos, versions, or that it is absent), and why that does or does not put the user at risk" },
+      urgency: { type: "string", enum: ["now", "this_week", "routine", "none"] },
+      action: { type: "string", description: "concrete steps with versions or a command; 'Nothing to do.' when none" },
+    } } } },
+};
+
+const verdictSystem = () => `You check whether a security issue actually affects the user — their ${HOST()}, their code on GitHub, their accounts — using ONLY the evidence given: their exposure inventory (summary + exact lookups of the software each story names), the advisory/article text, NVD version ranges, and OSV records. Write to the user as "you".
+- applies "yes": the inventory shows an affected product at an affected version (compare the version against the affected/fixed ranges explicitly and say so), a malicious package present, or — for a provider story — the user has an account there and their data/credentials are plausibly in scope.
+- applies "no": the software is absent, or present at a fixed version, or the flaw needs something the user lacks (Windows, a public-facing server of that kind, a feature the user does not use, a port that only listens on localhost). Say what you checked.
+- applies "unclear": the evidence cannot settle it — ${OTHER_DEVICES()} (not inventoried), device firmware, a version the article does not give. Say exactly what to check, with one command if possible.
+- urgency "now": applies AND (actively exploited, or a malicious package, or credentials known stolen). "this_week": applies, serious, not known exploited; or a provider breach where rotating a password/key is prudent. "routine": applies but low risk — dev-only dependency, no exposure path, low severity, an unused/stale repo. "none": does not apply.
+- Dependency findings (OSV): a devDependency or a package only in a stale repo is at most "routine" unless malicious. A malicious package is always "now". Name the repos and the fixed version.
+- Never invent versions, repos or facts. If a lookup came back empty, the software is not in the inventory — say "not found in your repos or on the ${HOST()}", not "you are safe" for ${OTHER_DEVICES()}.`;
+
+// Small batches, then a one-at-a-time retry for any candidate the model skipped:
+// the first weekly dry run (2026-10-23) sent 17 stories in one call and got 2
+// verdicts back — the Node.js flaw the user had named as the example was among
+// the dropped. An unchecked item must never silently vanish.
+async function verdicts(cands, inv, { batch = 5, timeoutMs = 420000 } = {}) {
+  if (!cands.length) return new Map();
+  const summary = inventorySummary(inv, { uninventoried: CFG.uninventoried });
+  const ask = async (group) => {
+    try {
+      const res = await judgeWith({
+        effort: "medium", timeoutMs, schema: VERDICT_SCHEMA, system: `${verdictSystem()}\nReturn exactly one verdict for EVERY candidate given (${group.length}), using its id.`,
+        prompt: JSON.stringify({ inventory: summary, candidates: group }),
+      });
+      return res.verdicts || [];
+    } catch (e) { if (e.fatal) throw e; log(`verdict call failed (${group.map((c) => c.id).join(",")}): ${e.message}`); return []; }
+  };
+  const groups = [];
+  for (let i = 0; i < cands.length; i += batch) groups.push(cands.slice(i, i + batch));
+  const out = new Map();
+  for (const vs of await pool(groups, 3, ask)) for (const v of vs) out.set(v.id, v);
+  const missing = cands.filter((c) => !out.has(c.id));
+  if (missing.length) {
+    log(`verdicts missing for ${missing.map((c) => c.id).join(",")} — retrying one at a time`);
+    for (const vs of await pool(missing.map((c) => [c]), 3, ask)) for (const v of vs) out.set(v.id, v);
+  }
+  const still = cands.filter((c) => !out.has(c.id));
+  if (still.length) log(`WARN: no verdict for ${still.map((c) => c.id).join(",")} after retry — left out of this run`);
+  return out;
+}
+
+/** Evidence for one news candidate: article text, NVD ranges for its CVEs, inventory lookups. */
+async function newsEvidence(c, inv, { articleCap }) {
+  const first = c.items.find((i) => i.link && !i.link.includes("news.google.com/")) || c.items[0];
+  const article = await articleText(first?.link, articleCap);
+  const cves = cveIds([...c.items.map((i) => `${i.title} ${i.summary}`), article || ""].join(" ")).slice(0, 3);
+  const nvd = (await pool(cves, 3, nvdCve)).filter(Boolean);
+  const hits = lookupSoftware(inv, c.software).slice(0, 12);
+  return {
+    id: c.id, kind: c.kind, headline: c.headline, provider: c.provider || null,
+    provider_role: c.provider ? c.providerRole || null : null,
+    context: c.context || null,
+    story: c.items.slice(0, 3).map((i) => ({ title: i.title, summary: i.summary, published: i.published })),
+    article, nvd,
+    software_named: c.software, inventory_lookups: hits.length ? hits : `none of the named software was found in the user's repos or on the ${HOST()}`,
+  };
+}
+
+function depCandidate(f, id) {
+  return { id, kind: "dependency", headline: `${f.name} (${f.eco}) ${f.versions.join(", ")}`, repos: f.repos, uses: f.uses, runtime_dependency: f.runtime, repo_active_last_120d: f.active, osv: f.vulns };
+}
+
+// ---------------------------------------------------------------- alert lane
+
+const TRIAGE_SCHEMA = {
+  type: "object", additionalProperties: false, required: ["candidates"],
+  properties: {
+    candidates: { type: "array", items: {
+      type: "object", additionalProperties: false,
+      required: ["event_key", "kind", "headline", "item_ids", "provider", "software"],
+      properties: {
+        event_key: { type: "string", description: "stable kebab-case slug for the underlying event, e.g. railway-env-var-breach-2026-10 — the same story from another outlet gets the same key" },
+        kind: { type: "string", enum: ["top_event", "provider_hit"] },
+        provider: { type: ["string", "null"], description: "provider name exactly as in the list, or null" },
+        headline: { type: "string", description: "plain words, at most 9 words, topic first" },
+        item_ids: { type: "array", items: { type: "string" }, description: "ids of the items this rests on (1-3)" },
+        software: SOFTWARE_FIELD,
+      } } },
+  },
+};
+
+async function alertLane(cfg, state) {
+  const { resolveTz } = require("../lib/clock-jobs.js");
+  const { tz } = resolveTz();
+  const hour = localHour(tz);
+  if (!DRY && inQuiet(hour, cfg.alert.quiet_local)) { log(`quiet hours in ${tz} (${hour}h) — skip, items stay unseen`); return; }
+
+  const items = await fetchFeeds(cfg, log);
+  let kev = [], hibp = [];
+  try { kev = await fetchKev(cfg); } catch (e) { log(`KEV FAILED: ${e.message}`); }
+  try { hibp = await fetchHibp(cfg); } catch (e) { log(`HIBP FAILED: ${e.message}`); }
+
+  if (!state.kev_bootstrapped && kev.length) {
+    // First run: the catalog's historical entries and HIBP's old breaches are
+    // history, not news. Mark them seen without a model call.
+    const now = Date.now();
+    for (const k of kev) state.seen[k.id] = now;
+    for (const h of hibp) if (!(now - h.added_ms < 7 * DAY)) state.seen[h.id] = now;
+    state.kev_bootstrapped = true;
+    log(`bootstrapped ${kev.length} KEV + ${hibp.length} HIBP entries as seen`);
+  }
+
+  const vendors = allVendors(cfg, state);
+  for (const h of hibp) { const v = vendorForDomain(h.domain, vendors); if (v) h.title += ` [domain matches provider ${v.name}]`; }
+
+  const inv = await ensureInventory(cfg.inventory?.max_age_hours ?? 20);
+
+  // New dependency findings: malicious anywhere, or critical in a runtime dependency of an active repo.
+  const findings = osvFindings(inv);
+  const known = new Set(state.osv_known || []);
+  const firstScan = !state.osv_known;
+  const newDeps = firstScan ? [] : findings.filter((f) => f.ids.some((id) => !known.has(`${f.key}:${id}`)) && (f.rank >= 5 || (f.rank >= 4 && f.runtime && f.active)));
+  const markDepsKnown = () => { state.osv_known = [...new Set([...known, ...findings.flatMap((f) => f.ids.map((id) => `${f.key}:${id}`))])]; };
+
+  const fresh = unseen([...kev, ...hibp, ...items], state);
+  let triaged = [];
+  const batch = fresh.slice(0, cfg.alert.max_items_to_model);
+  if (batch.length) {
+    log(`${fresh.length} new item(s), ${batch.length} to triage`);
+    const recent = state.alerted.filter((a) => Date.now() - Date.parse(a.at) <= cfg.alert.alerted_memory_days * DAY).map((a) => ({ event_key: a.event_key, headline: a.headline }));
+    const res = await judgeWith({
+      effort: "medium", timeoutMs: 300000, schema: TRIAGE_SCHEMA,
+      system: `You are the security lookout for the user's personal assistant. From a batch of fresh security news, pick the candidates worth CHECKING against the user's systems — a later step checks each against their real inventory and only what affects them reaches them, so pick on importance, not on a guess about their exposure. ${relevanceRules()}
+Never repeat an event already in already_alerted (same underlying event = same story, even from another outlet, unless the new detail changes what the user must do). Merge items about one event. At most ${cfg.alert.max_candidates_per_run ?? 5} candidates; zero is normal.`,
+      prompt: JSON.stringify({
+        providers: vendorBrief(vendors), stack: cfg.stack, already_alerted: recent,
+        items: batch.map((i) => ({ id: i.id, source: i.src, title: i.title, summary: i.summary, published: i.published })),
+      }),
+    });
+    const byId = new Map(batch.map((i) => [i.id, i]));
+    const keys = new Set(state.alerted.map((a) => a.event_key));
+    triaged = (res.candidates || []).map((c) => ({ ...c, items: (c.item_ids || []).map((id) => byId.get(id)).filter(Boolean) }))
+      .filter((c) => c.items.length && !keys.has(c.event_key)).slice(0, cfg.alert.max_candidates_per_run ?? 5)
+      .map((c, k) => ({ ...c, id: `n${k + 1}`, providerRole: vendors.find((v) => v.name === c.provider)?.role }));
+  } else log("no new news items");
+
+  if (!triaged.length && !newDeps.length) {
+    log("nothing to check");
+    if (!DRY) { markSeen(fresh, state); if (firstScan) markDepsKnown(); state.last_alert_run = new Date().toISOString(); saveState(pruneState(state)); }
+    return;
+  }
+
+  const evidence = [
+    ...(await pool(triaged, 3, (c) => newsEvidence(c, inv, { articleCap: 7000 }))),
+    ...newDeps.slice(0, 5).map((f, k) => depCandidate(f, `d${k + 1}`)),
+  ];
+  log(`checking ${evidence.length} candidate(s) against the inventory`);
+  const vmap = await verdicts(evidence, inv);
+
+  const checked = [
+    ...triaged.map((c) => ({ ...c, verdict: vmap.get(c.id), link: (c.items.find((i) => i.link && !i.link.includes("news.google.com/")) || c.items[0]).link })),
+    ...newDeps.slice(0, 5).map((f, k) => ({ id: `d${k + 1}`, event_key: `dep:${f.key}:${f.ids[0]}`, kind: "dependency", headline: `${f.name} ${f.versions.join("/")} in ${f.repos.slice(0, 3).join(", ")}`, verdict: vmap.get(`d${k + 1}`), link: `https://osv.dev/vulnerability/${f.ids[0]}` })),
+  ].filter((c) => c.verdict);
+  // Chat is for urgent impact only: "this week" and below wait for Monday's email.
+  const toSend = checked.filter((c) => ["yes", "unclear"].includes(c.verdict.applies) && c.verdict.urgency === "now")
+    .sort((a, b) => URGENCY_ORDER[a.verdict.urgency] - URGENCY_ORDER[b.verdict.urgency]).slice(0, cfg.alert.max_alerts_per_run);
+
+  if (DRY) { console.log(JSON.stringify({ tz, hour, new_items: fresh.length, new_dependency_findings: newDeps.length, checked: checked.map((c) => ({ headline: c.headline, kind: c.kind, ...c.verdict, sent: toSend.includes(c) })) }, null, 2)); return; }
+
+  if (toSend.length) {
+    const lines = [toSend.length === 1 ? "Urgent security issue — this one affects you:" : `Urgent security issues — ${toSend.length} affect you:`];
+    for (const c of toSend) lines.push(`- ${c.headline} (act today)`, `  ${c.verdict.analysis}`, `  What to do: ${c.verdict.action}`, `  ${c.link}`);
+    send(lines.join("\n"), "cyber-watch");
+  }
+  const at = new Date().toISOString();
+  for (const c of checked) {
+    state.alerted.push({ event_key: c.event_key, headline: c.headline, kind: c.kind, provider: c.provider || null, at, sent: toSend.includes(c) });
+    state.checked.push({ event_key: c.event_key, headline: c.headline, kind: c.kind, link: c.link, ...c.verdict, sent: toSend.includes(c), at });
+  }
+  log(`checked ${checked.length}: ${checked.map((c) => `${c.event_key}=${c.verdict.applies}/${c.verdict.urgency}`).join(", ")}; sent ${toSend.length}`);
+  // A story whose check failed stays unseen, so the next run triages and checks it again.
+  const unchecked = new Set(triaged.filter((c) => !vmap.has(c.id)).flatMap((c) => c.items.map((i) => i.id)));
+  markSeen(fresh.filter((i) => !unchecked.has(i.id)), state);
+  if (newDeps.slice(0, 5).every((f, k) => vmap.has(`d${k + 1}`))) markDepsKnown();
+  state.last_alert_run = at;
+  saveState(pruneState(state));
+}
+
+// --------------------------------------------------------------- weekly lane
+
+const WEEKLY_SCHEMA = {
+  type: "object", additionalProperties: false, required: ["top_events", "provider_impacts", "new_providers"],
+  properties: {
+    top_events: { type: "array", description: "the 3-6 biggest security events of the week, most important first", items: {
+      type: "object", additionalProperties: false, required: ["headline", "summary", "item_ids", "software"],
+      properties: {
+        headline: { type: "string" },
+        summary: { type: "string", description: "2-3 plain sentences: what happened" },
+        item_ids: { type: "array", items: { type: "string" } },
+        software: SOFTWARE_FIELD,
+      } } },
+    provider_impacts: { type: "array", description: "every provider in the user's list that a story this week is genuinely about; empty if none", items: {
+      type: "object", additionalProperties: false, required: ["provider", "headline", "what_happened", "item_ids", "software"],
+      properties: {
+        provider: { type: "string", description: "exactly as in the provider list" },
+        headline: { type: "string" },
+        what_happened: { type: "string" },
+        item_ids: { type: "array", items: { type: "string" } },
+        software: SOFTWARE_FIELD,
+      } } },
+    new_providers: { type: "array", description: "one verdict per merchant in new_merchants", items: {
+      type: "object", additionalProperties: false, required: ["merchant", "add", "name", "tier", "role", "domains"],
+      properties: {
+        merchant: { type: "string", description: "the merchant string exactly as given" },
+        add: { type: "boolean", description: "true only if this is a company holding an online account, stored payment card, personal data, credentials or a home device of the user's — not a restaurant, shop visit, person, tax or toll" },
+        name: { type: "string", description: "the company's common name" },
+        tier: { type: "integer", enum: [1, 2, 3] },
+        role: { type: "string", description: "what it is for the user, a few words" },
+        domains: { type: "array", items: { type: "string" } },
+      } } },
+  },
+};
+
+async function plaidCandidates(cfg, state, vendors) {
+  const { requestAll } = require("../lib/supabase-rest.js");
+  const since = new Date(Date.now() - 400 * DAY).toISOString().slice(0, 10);
+  const rows = await requestAll(`/rest/v1/plaid_transactions?select=merchant_name,name,payment_channel,website:raw->>website&date=gt.${since}&amount=gt.0`);
+  const agg = new Map();
+  for (const r of rows) {
+    const m = (r.merchant_name || r.name || "").trim();
+    if (!m) continue;
+    const a = agg.get(m) || { merchant: m, n: 0, online: false, website: null };
+    a.n++; a.online ||= r.payment_channel === "online"; a.website ||= r.website || null;
+    agg.set(m, a);
+  }
+  // Exact-name dedupe against the inventory is string identity, not reading.
+  const known = new Set(vendors.flatMap((v) => [v.name, ...(v.aliases || [])]).map((s) => s.toLowerCase()));
+  const rejected = new Set((state.rejected_merchants || []).map((s) => s.toLowerCase()));
+  return [...agg.values()]
+    .filter((a) => !known.has(a.merchant.toLowerCase()) && !rejected.has(a.merchant.toLowerCase()) && (a.n >= 3 || a.website || a.online))
+    .sort((x, y) => y.n - x.n).slice(0, 120)
+    .map((a) => ({ merchant: a.merchant, website: a.website, online: a.online, charges: a.n }));
+}
+
+async function weeklyLane(cfg, state) {
+  const vendors = allVendors(cfg, state);
+  const weekAgo = Date.now() - 7 * DAY;
+  const inv = await ensureInventory(0);
+
+  // Fresh pull so the week's log is complete even if alert runs were skipped.
+  const feedItems = await fetchFeeds(cfg, log);
+  let kev = [], hibp = [];
+  try { kev = (await fetchKev(cfg)).filter((k) => Date.parse(k.published) >= weekAgo - DAY); } catch (e) { log(`KEV FAILED: ${e.message}`); }
+  try { hibp = (await fetchHibp(cfg)).filter((h) => h.added_ms >= weekAgo); } catch (e) { log(`HIBP FAILED: ${e.message}`); }
+  for (const h of hibp) { const v = vendorForDomain(h.domain, vendors); if (v) h.title += ` [domain matches provider ${v.name}]`; }
+
+  const news = [];
+  const searched = vendors.filter((v) => v.tier <= cfg.weekly.min_tier_for_news_search);
+  for (const v of searched) {
+    try { news.push(...await fetchVendorNews(cfg, v)); } catch (e) { log(`news ${v.name} FAILED: ${e.message}`); }
+    await new Promise((r) => setTimeout(r, cfg.weekly.fetch_delay_ms));
+  }
+  log(`vendor news: ${news.length} item(s) across ${searched.length} providers`);
+
+  const logged = state.log.filter((r) => r.seen_at >= weekAgo);
+  const poolMap = new Map();
+  for (const i of [...kev, ...hibp, ...logged, ...feedItems.filter((f) => !f.published || Date.parse(f.published) >= weekAgo), ...news]) if (!poolMap.has(i.id)) poolMap.set(i.id, i);
+  const items = [...poolMap.values()].slice(0, 700);
+  const rowsForModel = items.map((it, k) => ({ id: `i${k + 1}`, source: it.src, about: it.vendor || undefined, title: it.title, summary: (it.summary || "").slice(0, 240), published: it.published }));
+  const byShort = new Map(rowsForModel.map((r, k) => [r.id, items[k]]));
+
+  let candidates = [];
+  try { candidates = await plaidCandidates(cfg, state, vendors); } catch (e) { log(`plaid candidates FAILED: ${e.message}`); }
+  log(`${items.length} item(s) to the digest call, ${candidates.length} new merchant(s) to classify`);
+
+  const res = await judgeWith({
+    effort: "medium", timeoutMs: 900000, schema: WEEKLY_SCHEMA,
+    system: `You prepare the user's weekly security briefing. A later step checks every item you pick against their real systems and code, so pick on importance. ${relevanceRules()}
+From the week's items: pick the 3-6 biggest TOP EVENTS of the week, and list EVERY provider in the user's list that a story is genuinely about (a Google News hit returned for a provider's name is only a candidate; drop it if the story is not really about a security problem at that provider). For each, name the software it is about. Cite items by id.
+One entry per underlying event: a provider hit that is the same event as a top event goes under the top event only, and one event touching several providers (e.g. a breach exposing OpenAI, Google and Anthropic keys) is ONE entry naming them all, never one per provider.
+Also give one verdict for each merchant in new_merchants (payees from the user's statements not yet in the list; ignore categories: ${cfg.ignore_merchants.join("; ")}).`,
+    prompt: JSON.stringify({ providers: vendorBrief(vendors), stack: cfg.stack, items: rowsForModel, new_merchants: candidates }),
+  });
+
+  const refs = (ids) => (ids || []).map((id) => byShort.get(id)).filter((x) => x && x.link);
+  const newsCands = [
+    ...(res.top_events || []).map((t, k) => ({ id: `t${k + 1}`, kind: "top_event", headline: t.headline, context: t.summary, software: t.software, items: refs(t.item_ids) })),
+    ...(res.provider_impacts || []).filter((p) => vendors.some((v) => v.name === p.provider))
+      .map((p, k) => ({ id: `p${k + 1}`, kind: "provider_hit", provider: p.provider, providerRole: vendors.find((v) => v.name === p.provider)?.role, headline: `${p.provider}: ${p.headline}`, context: p.what_happened, software: p.software, items: refs(p.item_ids) })),
+  ].filter((c) => c.items.length);
+
+  const findings = osvFindings(inv).filter((f) => f.rank >= 3).slice(0, cfg.weekly.max_dependency_findings ?? 25);
+  const depCands = findings.map((f, k) => depCandidate(f, `d${k + 1}`));
+  const newsEv = await pool(newsCands, 4, (c) => newsEvidence(c, inv, { articleCap: 3000 }));
+  log(`checking ${newsEv.length} stories + ${depCands.length} dependency findings against the inventory`);
+  const [vNews, vDeps] = await Promise.all([verdicts(newsEv, inv), verdicts(depCands, inv)]);
+
+  const link = (c) => (c.items.find((i) => !i.link.includes("news.google.com/")) || c.items[0]).link;
+  const checkedNews = newsCands.map((c) => ({ ...c, verdict: vNews.get(c.id), link: link(c), title: c.items[0].title })).filter((c) => c.verdict);
+  const checkedDeps = findings.map((f, k) => ({ id: `d${k + 1}`, kind: "dependency", headline: `${f.name} ${f.versions.join(" / ")} — ${f.repos.slice(0, 4).join(", ")}${f.repos.length > 4 ? ` +${f.repos.length - 4}` : ""}`, verdict: vDeps.get(`d${k + 1}`), link: `https://osv.dev/vulnerability/${f.ids[0]}`, title: f.vulns[0]?.summary || f.ids[0] })).filter((c) => c.verdict);
+  const bySev = (a, b) => URGENCY_ORDER[a.verdict.urgency] - URGENCY_ORDER[b.verdict.urgency];
+  const affects = checkedNews.filter((c) => c.verdict.applies !== "no").sort(bySev);
+  const depAffects = checkedDeps.filter((c) => c.verdict.applies !== "no").sort(bySev);
+  const notAffecting = [...checkedNews, ...checkedDeps].filter((c) => c.verdict.applies === "no");
+  const pressing = [...affects, ...depAffects].filter((c) => ["now", "this_week"].includes(c.verdict.urgency));
+
+  const candSet = new Set(candidates.map((c) => c.merchant));
+  const merchantVerdicts = (res.new_providers || []).filter((n) => candSet.has(n.merchant));
+  const added = merchantVerdicts.filter((n) => n.add);
+
+  const summaryLine = pressing.length
+    ? `${pressing.length} item${pressing.length === 1 ? "" : "s"} need${pressing.length === 1 ? "s" : ""} action — ${pressing.slice(0, 2).map((c) => c.headline).join("; ")}${pressing.length > 2 ? "; …" : ""}`
+    : affects.length + depAffects.length ? "Nothing urgent this week; a few low-priority items are below." : "Nothing this week affects your systems, code or accounts.";
+
+  if (DRY) {
+    const show = (c) => ({ headline: c.headline, applies: c.verdict.applies, urgency: c.verdict.urgency, analysis: c.verdict.analysis, action: c.verdict.action });
+    console.log(JSON.stringify({ summaryLine, affects: affects.map(show), dependencies: depAffects.map(show), not_affecting: notAffecting.map(show), added, rejected: merchantVerdicts.length - added.length }, null, 2));
+    return;
+  }
+
+  const dateHuman = new Intl.DateTimeFormat("en-US", { timeZone: instance().tz, month: "short", day: "numeric" }).format(new Date());
+  const subject = `Cyber Watch — week of ${dateHuman}`;
+  const F = "font-family:-apple-system,Segoe UI,Arial,sans-serif";
+  const color = { now: "#b42318", this_week: "#b54708", routine: "#475467", none: "#667085" };
+  // Every content URL renders through og-card (ops-agent CLAUDE.md) — one card per news item; dependency links stay plain.
+  const cardUrls = affects.map((c) => c.link);
+  const cards = new Map(ogCards(cardUrls).map((h, k) => [cardUrls[k], h]));
+  const badge = (v) => `<span style="color:${color[v.urgency]};font-size:12px;text-transform:uppercase;font-weight:600">${escapeHtml(v.applies === "unclear" ? `check · ${URGENCY_LABEL[v.urgency]}` : URGENCY_LABEL[v.urgency])}</span>`;
+  const card = (c, withOg) => [
+    `<div style="border-left:4px solid ${color[c.verdict.urgency]};padding:4px 12px;margin:12px 0">`,
+    `<div style="font-size:15px"><b>${escapeHtml(c.headline)}</b> ${badge(c.verdict)}</div>`,
+    `<div style="font-size:14px;margin-top:2px">${escapeHtml(c.verdict.analysis)}</div>`,
+    `<div style="font-size:14px;margin-top:2px"><b>What to do:</b> ${escapeHtml(c.verdict.action)}</div>`,
+    withOg ? (cards.get(c.link) || "") : `<div style="font-size:12px"><a href="${escapeHtml(c.link)}" style="color:#1a56db">${escapeHtml(String(c.title).slice(0, 110))}</a></div>`,
+    `</div>`].join("");
+  const html = [`<div style="${F};max-width:660px;color:#222;line-height:1.5">`,
+    `<p style="font-size:15px"><b>${escapeHtml(summaryLine)}</b></p>`,
+    `<p style="font-size:13px;color:#475467">Every item below was checked against what you actually run: the ${escapeHtml(HOST())} (${escapeHtml(inv.host?.runtimes?.macos ? `macOS ${inv.host.runtimes.macos}` : "macOS")}, its runtimes, Homebrew and Docker) and the ${(inv.repos || []).length} repos on your GitHub, whose lockfiles were also scanned against the OSV vulnerability database. ${escapeHtml(OTHER_DEVICES().replace(/^./, (c) => c.toUpperCase()))} ${CFG.uninventoried ? "is" : "are"} not inventoried.</p>`,
+    `<h2 style="font-size:17px;margin:22px 0 8px">Affects you</h2>`,
+    affects.length ? affects.map((c) => card(c, true)).join("\n") : `<p style="font-size:14px">None of this week's security news affects your systems, code or accounts.</p>`,
+    depAffects.length ? `<h2 style="font-size:17px;margin:22px 0 8px">Vulnerable dependencies in your code</h2>` + depAffects.map((c) => card(c, false)).join("\n") : "",
+    notAffecting.length ? `<h2 style="font-size:17px;margin:22px 0 8px">Checked — doesn't affect you</h2><ul style="font-size:13px;color:#344054;padding-left:18px">` +
+      notAffecting.map((c) => `<li style="margin:4px 0"><b>${escapeHtml(c.headline)}</b> — ${escapeHtml(c.verdict.analysis)} <a href="${escapeHtml(c.link)}" style="color:#1a56db">source</a></li>`).join("") + "</ul>" : "",
+    added.length ? `<h2 style="font-size:17px;margin:22px 0 8px">Added to your provider list</h2><p style="font-size:14px">From new payees on your statements: ${added.map((a) => escapeHtml(a.name)).join(", ")}.</p>` : "",
+    `<p style="font-size:12px;color:#667085;margin-top:24px">Sources: CISA advisories and its Known Exploited Vulnerabilities catalog, NVD, OSV.dev, Have I Been Pwned, BleepingComputer, The Hacker News, SecurityWeek, Krebs, The Record, and Google News searches for each of your ${searched.length} key providers. Urgent items reach you in chat the same day.</p>`,
+    "</div>"].join("\n");
+
+  sendHtmlEmail({ subject, html });
+  if (!(await labelDigest(subject))) log("WARN: sent but Gmail had not indexed it after the bounded wait — left unlabeled");
+  // Weekly is email only (chat is for urgent impact only) — no pointer, no push.
+
+
+  const now = Date.now();
+  const knownNames = new Set(vendors.map((v) => v.name.toLowerCase()));
+  for (const a of added) {
+    if (knownNames.has(a.name.toLowerCase())) continue;
+    state.learned_vendors.push({ name: a.name, aliases: a.merchant !== a.name ? [a.merchant] : [], domains: a.domains, tier: a.tier, role: a.role, learned_at: new Date(now).toISOString() });
+    knownNames.add(a.name.toLowerCase());
+  }
+  for (const v of merchantVerdicts.filter((n) => !n.add)) state.rejected_merchants.push(v.merchant);
+  markSeen([...kev, ...hibp, ...feedItems], state, now);
+  state.osv_known = [...new Set([...(state.osv_known || []), ...osvFindings(inv).flatMap((f) => f.ids.map((id) => `${f.key}:${id}`))])];
+  state.last_weekly_run = new Date(now).toISOString();
+  saveState(pruneState(state));
+  log(`sent: ${affects.length} affecting, ${depAffects.length} dependency, ${notAffecting.length} not affecting, ${added.length} provider(s) learned`);
+}
+
+async function main() {
+  const cfg = loadConfig();
+  CFG = cfg;
+  if (!cfg.enabled && (LANE === "alert" || LANE === "weekly")) { log("not configured (agent/local/config/cyber-watch.json enabled:false or absent) — off"); return; }
+  const state = loadState();
+  if (LANE === "vendors") {
+    for (const v of allVendors(cfg, state).sort((a, b) => a.tier - b.tier || a.name.localeCompare(b.name))) console.log(`T${v.tier}  ${v.name.padEnd(30)} ${v.role}`);
+    return;
+  }
+  if (LANE === "inventory") {
+    const inv = await ensureInventory(0);
+    console.log(JSON.stringify({ ...inventorySummary(inv), osv_findings: osvFindings(inv).slice(0, 15).map((f) => ({ pkg: f.key, versions: f.versions, rank: f.rank, runtime: f.runtime, repos: f.repos })) }, null, 2));
+    return;
+  }
+  if (LANE === "alert") return alertLane(cfg, state);
+  if (LANE === "weekly") return weeklyLane(cfg, state);
+  console.error("usage: cyber-watch-run --lane alert|weekly [--dry-run] | --vendors | --inventory");
+  process.exit(2);
+}
+
+main().catch((e) => { log(`FAILED: ${e?.stack || e}`); process.exit(e?.fatal ? 3 : 1); });

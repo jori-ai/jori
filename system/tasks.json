@@ -822,6 +822,141 @@
       "launchd_label": "ai.claude.call-log",
       "script": "bin/call-log",
       "schedule_human": "Every 30 min on the trigger-context-sync tick (no cron line of its own); prep backstop in the daily summary"
+    },
+    {
+      "name": "cyber-watch-alert",
+      "schedule": "26 1-22/3 * * *",
+      "schedule_human": "Every 3 hours (skips 23:00-08:00 in the user's current timezone)",
+      "trigger_script": "agent/scripts/trigger-cyber-watch-alert.sh",
+      "webhook_url": null,
+      "webhook_task": null,
+      "delivers_to": "jori",
+      "job": "cyber-watch",
+      "runtime": "launchd-script",
+      "script": "bin/cyber-watch-run",
+      "ops_playbook_section": "Cyber Watch",
+      "launchd_label": "ai.claude.cyber-watch-alert",
+      "phrases": [
+        "cyber watch",
+        "security alert",
+        "any cyber news",
+        "was there a breach"
+      ],
+      "description": "Checks top cyber events, provider hits and new vulnerable dependencies against the user's real inventory (the Jori host, plus the lockfiles of every GitHub repo checked against OSV). A chat ping goes out ONLY for urgent impact: the item applies and must be acted on today. Everything else waits for the weekly email. Scripted: triage call + verdict call (Sonnet, tool-less). No agent turn. Off without agent/local/config/cyber-watch.json."
+    },
+    {
+      "name": "cyber-watch-weekly",
+      "schedule": "39 6 * * 1",
+      "schedule_human": "Mondays at 6:39 AM",
+      "trigger_script": "agent/scripts/trigger-cyber-watch-weekly.sh",
+      "webhook_url": null,
+      "webhook_task": null,
+      "delivers_to": "email",
+      "job": "cyber-watch",
+      "runtime": "launchd-script",
+      "script": "bin/cyber-watch-run",
+      "ops_playbook_section": "Cyber Watch",
+      "launchd_label": "ai.claude.cyber-watch-weekly",
+      "phrases": [
+        "weekly security briefing",
+        "cyber watch weekly",
+        "security digest"
+      ],
+      "description": "Monday email ONLY (no chat pointer, no push): every security story, provider hit and vulnerable dependency of the week, each checked against the user's inventory and given an analysis, urgency and what to do; plus inventory upkeep from new Plaid merchants. No agent turn."
+    },
+    {
+      "name": "stale-code-watch",
+      "schedule": null,
+      "schedule_human": "Every watchdog tick (2 min), inside watchdog.sh right after supervisor-code-reload; no crontab line of its own",
+      "trigger_script": "bin/stale-code-watch",
+      "webhook_url": null,
+      "webhook_task": null,
+      "ops_playbook_section": null,
+      "delivers_to": "system",
+      "phrases": [
+        "stale code",
+        "code not live",
+        "uncommitted files",
+        "restart stale daemons"
+      ],
+      "description": "Item 2 of the 2026-10-20 review. Restarts the small long-running daemons whose committed code is newer than the process (heartbeat-sender, minibeat, dashboard via launchctl kickstart -k; the two wiki servers via SIGTERM, process-manager respawns), and flags through watchdog.sh's system-channel alert (exit 6, text in data/stale-code-watch-state.json) whatsapp-channel / phone-channel / process-manager on old code for 6h+, a restart that did not take, and tracked code files uncommitted for 12h+. The supervisors and hum-sense are supervisor-code-reload's. Kill switch data/.stale-code-watch-off.",
+      "job": null
+    },
+    {
+      "name": "runner-update",
+      "schedule": "10 3 * * 0",
+      "schedule_human": "Sundays at 3:10 AM local",
+      "trigger_script": "agent/scripts/trigger-runner-update.sh",
+      "webhook_url": null,
+      "webhook_task": null,
+      "job": null,
+      "ops_playbook_section": null,
+      "delivers_to": "none",
+      "phrases": [
+        "runner update",
+        "update the actions runners",
+        "github runners"
+      ],
+      "description": "Weekly in-place update of the self-hosted GitHub Actions runners (~/actions-runner*) by bin/runner-update, with no agent turn: a runner that is current or busy is skipped; otherwise its service stops, bin/ + externals/ are swapped in place (so macOS privacy grants for the bundled node survive a release), and it must be listening for jobs again within 120 s or it rolls back. Log: agent/logs/runner-update.log. Pushes a jori-notify only when a runner failed to update. By hand: runner-update [--dry-run]."
+    },
+    {
+      "name": "db-retention",
+      "schedule": "0 4 * * *",
+      "schedule_human": "Daily at 4:00 AM local",
+      "trigger_script": "agent/scripts/trigger-db-retention.sh",
+      "webhook_url": null,
+      "webhook_task": null,
+      "ops_playbook_section": null,
+      "delivers_to": "none",
+      "phrases": [],
+      "description": "Light 30-day retention prune for location_history + health_samples (raw working copies). Direct script — no webhook, no Anthropic API. See bin/db-retention.",
+      "job": null
+    },
+    {
+      "name": "embed-messages",
+      "schedule": "*/15 * * * *",
+      "schedule_human": "Every 15 minutes",
+      "trigger_script": "agent/scripts/trigger-embed-messages.sh",
+      "webhook_url": null,
+      "webhook_task": null,
+      "ops_playbook_section": null,
+      "delivers_to": "none",
+      "phrases": [],
+      "description": "Backfill local Ollama embeddings for new chat message rows. Direct script — no webhook, no Anthropic API.",
+      "job": null
+    },
+    {
+      "name": "message-followup",
+      "schedule": "23 * * * *",
+      "schedule_human": "Hourly at :23",
+      "trigger_script": "agent/scripts/trigger-message-followup.sh",
+      "webhook_url": null,
+      "webhook_task": null,
+      "ops_playbook_section": null,
+      "delivers_to": "chat",
+      "phrases": [
+        "unanswered urgent messages",
+        "message followup"
+      ],
+      "description": "Code only: asks the user once about a message the message-alert judge rated urgent that has gone unanswered in its chat for 24 hours (up to 72h old). The only ping left on the messaging channels since 2026-10-28. State: data/message-followup-state.json.",
+      "job": null
+    },
+    {
+      "name": "venue-ingest",
+      "schedule": "35 1 * * *",
+      "schedule_human": "Daily at 1:35 AM local (before the venue-watch lanes)",
+      "trigger_script": "agent/scripts/trigger-venue-ingest.sh",
+      "delivers_to": "none",
+      "phrases": [
+        "venue ingest",
+        "venue calendars",
+        "refresh venue events"
+      ],
+      "description": "Fetch every configured venue calendar (agent/local/config/venue-events.json sources or sources_file) into data/venue-events-state.json. No model, plain cron. Read by the venue-watch lanes and morning-digest. A source failing or empty 3 runs running is reported once to the system channel. Nothing to do with no sources.",
+      "job": null,
+      "webhook_task": null,
+      "webhook_url": null,
+      "ops_playbook_section": null
     }
   ]
 }

@@ -1,0 +1,132 @@
+#!/usr/bin/env python3
+"""creds-strip-max-login — remove ONLY the Max login from ~/.claude/.credentials.json.
+
+HAND-RUN ONLY. Never schedule this, never call it from watchdog.sh or any other
+cron path: CLAUDE.md § Auth Model is explicit that a cron process cannot read
+the keychain and therefore cannot know whether this plaintext copy happens to
+be the only working credential at that moment. A human at the mini can.
+
+WHY IT EXISTS. watchdog.sh used to tell the user to fix the stale-plaintext-login
+problem with `mv ~/.claude/.credentials.json ~/.claude/.credentials.json.bak`.
+That command is wrong, because Claude Code keeps two unrelated things in that
+one file:
+
+    claudeAiOauth  — the Max login. Not refreshed alongside the keychain copy,
+                     so it goes stale within hours; a stale one caused the
+                     2026-07-28 "401 OAuth access token has been revoked"
+                     outage. This is the part that should not be there.
+    mcpOAuth       — the OAuth grant for every connected MCP server (notion,
+                     linear, slack, asana, figma, atlassian, ...). Moving the
+                     file aside signs you out of all of them, and each one has
+                     to be re-authorised by hand in an interactive session.
+
+So: take out the login, leave the file. Safely —
+
+  * backs the file up first, to .credentials.json.bak-<timestamp>
+  * writes to a temp file in the same directory and os.replace()s it in, so an
+    interrupted run (^C, disk full, a concurrent token refresh) can never leave
+    a truncated file. The `>`-truncation accident this avoids is the one
+    recorded in watchdog.sh's own comments for 2026-07-27.
+  * chmods the temp file to 0600 BEFORE the swap, so the credential file never
+    briefly widens to the default 0644
+  * is idempotent: with no Max login present it reports that and changes nothing
+
+It never prints any token, any key value, or any file contents — only counts.
+
+A running Claude Code client can write a fresh claudeAiOauth block back on its
+next token refresh. If watchdog starts paging about this again, that is what
+happened; quit the client (or let it settle) and re-run.
+
+Usage:  creds-strip-max-login [--dry-run] [--path <file>]
+Exit:   0 = nothing to do, or stripped successfully.  1 = failed.
+"""
+
+import json
+import os
+import pathlib
+import shutil
+import sys
+import time
+
+MAX_KEY = "claudeAiOauth"
+
+
+def main(argv):
+    dry_run = "--dry-run" in argv
+    path = pathlib.Path.home() / ".claude" / ".credentials.json"
+    if "--path" in argv:
+        i = argv.index("--path") + 1
+        if i >= len(argv):
+            print("--path needs a file path", file=sys.stderr)
+            return 1
+        path = pathlib.Path(argv[i])
+
+    if not path.exists():
+        print(f"{path} does not exist — nothing to do.")
+        return 0
+
+    try:
+        raw = path.read_text(encoding="utf-8-sig")
+        data = json.loads(raw)
+    except Exception as exc:  # noqa: BLE001 — the message must not carry contents
+        print(f"could not parse {path} ({type(exc).__name__}) — refusing to touch it.", file=sys.stderr)
+        return 1
+
+    if not isinstance(data, dict):
+        print(f"{path} is not a JSON object — refusing to touch it.", file=sys.stderr)
+        return 1
+
+    others = sorted(k for k in data if k != MAX_KEY)
+    mcp_count = len(data.get("mcpOAuth") or {}) if isinstance(data.get("mcpOAuth"), dict) else 0
+
+    if MAX_KEY not in data:
+        print(f"no {MAX_KEY} block in {path} — nothing to strip.")
+        print(f"keeping: {', '.join(others) or '(nothing else)'}"
+              + (f" — {mcp_count} MCP grant(s)" if mcp_count else ""))
+        return 0
+
+    print(f"found a {MAX_KEY} block; will remove it and keep: "
+          f"{', '.join(others) or '(nothing else)'}"
+          + (f" — {mcp_count} MCP grant(s)" if mcp_count else ""))
+
+    if dry_run:
+        print("--dry-run: no changes written.")
+        return 0
+
+    backup = path.with_name(path.name + f".bak-{time.strftime('%Y%m%d-%H%M%S')}")
+    tmp = path.with_name(path.name + ".tmp-strip")
+    try:
+        shutil.copy2(path, backup)
+        # copy2 preserves the source mode. If the source was ever laxer than
+        # 0600 the backup would sit in ~/.claude holding a world-readable Max
+        # token, so pin it regardless of what it was copied from.
+        os.chmod(backup, 0o600)
+        del data[MAX_KEY]
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(data, fh)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+    except Exception as exc:  # noqa: BLE001
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        # Say whether the backup actually exists. shutil.copy2 is inside this
+        # try, so it can be the thing that failed -- and a credential tool that
+        # tells you a backup is waiting when none was written is the exact
+        # failure this whole change exists to stop.
+        where = f"a backup is at {backup}" if backup.exists() else "NO backup was written"
+        print(f"failed to rewrite {path} ({type(exc).__name__}) — the original is untouched; {where}",
+              file=sys.stderr)
+        return 1
+
+    print(f"removed {MAX_KEY}. backup: {backup}")
+    if mcp_count:
+        print(f"{mcp_count} MCP connector grant(s) preserved.")
+    print(f"the backup still holds the login in plaintext — delete {backup.name} once auth is confirmed healthy.")
+    print("if watchdog pages about this again, a running Claude Code client re-wrote the login — re-run then.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
