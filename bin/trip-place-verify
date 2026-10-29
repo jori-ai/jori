@@ -1,0 +1,228 @@
+#!/usr/bin/env node
+// trip-place-verify — resolve a specific named place (a sight, market, or
+// restaurant Opus's research step named) against real Google Places data, near
+// a given home-base coordinate. This is the hallucination check for
+// france-itinerary: an Opus-claimed venue that can't be resolved here is
+// dropped from the email rather than published.
+//
+// Deliberately does NOT use `bin/places` — that CLI's composite ranking
+// (rating + review-count + proximity, tuned for "find me a good coffee shop
+// nearby") does not reliably surface a SPECIFIC named landmark in its top
+// results (verified 2026-07-08: querying a town's cathedral by its full name
+// near that town returned unrelated low-relevance results even at --limit 5).
+// A direct Places Text Search call, biased but not re-ranked, resolves the
+// named entity correctly (same call shape as trip-place-photo).
+//
+// Usage: trip-place-verify "<query>" <lat> <lon>
+// Prints {"name","address","mapsUri","rating","lat","lon","placeId","photoName"}
+// JSON on a match, or exits 1 with nothing on stdout if no confident match.
+// `photoName` is the first photo RESOURCE of the resolved place (or null) —
+// trip-place-photo re-hosts exactly that image, so the inline photo always
+// depicts the SAME place this call linked/addressed (fixes 2026-07-11: a separate
+// name-search in the photo step resolved a different Places entry, e.g. a town's
+// "Old Town" verifying to one of its gates but the photo pulling the "Historic
+// Town Centre").
+
+import { loadEnv } from "../lib/load-env.js";
+import { createRequire } from "node:module";
+import { fileURLToPath } from "node:url";
+// ESM file (it uses `import`), so CJS globals must be rebuilt for the require() calls below.
+const require = createRequire(import.meta.url);
+const __dirname = fileURLToPath(new URL(".", import.meta.url));
+loadEnv();
+// Every call here is a billed Text Search; there is no useful degraded mode.
+// No up-front budget check: a cached answer is served while the month is
+// blocked; places-client gates the live call.
+
+const PLACES_KEY = process.env.GOOGLE_PLACES_API_KEY;
+const { logPlacesCall } = require(require("node:path").join(__dirname, "..", "lib", "places-log.js"));
+const argv = process.argv.slice(2);
+const flag = (n) => { const i = argv.indexOf(n); return i >= 0 ? argv[i + 1] : null; };
+const ON = flag("--on");
+const positional = argv.filter((a, i) => !a.startsWith("--") && argv[i - 1] !== "--on");
+const [query, latStr, lonStr] = positional;
+if (!query || !latStr || !lonStr) {
+  console.error("usage: trip-place-verify \"<query>\" <lat> <lon> [--on YYYY-MM-DD]");
+  process.exit(2);
+}
+if (ON && !/^\d{4}-\d{2}-\d{2}$/.test(ON)) {
+  console.error(`trip-place-verify: --on must be YYYY-MM-DD, got "${ON}"`);
+  process.exit(2);
+}
+if (!PLACES_KEY) { console.error("GOOGLE_PLACES_API_KEY not set"); process.exit(1); }
+
+const DAYS = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
+const hhmm = (h, m) => `${String(h ?? 0).padStart(2, "0")}:${String(m ?? 0).padStart(2, "0")}`;
+
+// Google returns opening hours as periods keyed on day-of-week (0 = Sunday),
+// each with an open and (unless the place never closes) a close. A period whose
+// close lands on a different day runs past midnight, which matters here: a
+// kitchen listed 19:00-01:00 is open on ITS day, not the next one.
+function intervalsForDay(periods, dow) {
+  const out = [];
+  for (const p of periods || []) {
+    if (p.open?.day !== dow) continue;
+    if (!p.close) { out.push({ from: hhmm(p.open.hour, p.open.minute), to: null, all_day: true }); continue; }
+    const overnight = p.close.day !== p.open.day;
+    out.push({
+      from: hhmm(p.open.hour, p.open.minute),
+      to: hhmm(p.close.hour, p.close.minute),
+      ...(overnight ? { crosses_midnight: true } : {}),
+    });
+  }
+  return out.sort((a, b) => a.from.localeCompare(b.from));
+}
+
+// currentOpeningHours carries holiday and one-off overrides but only spans about
+// a week; regularOpeningHours is the standing schedule. Prefer the override when
+// it actually covers the date being asked about — in France that is the
+// difference between "open Thursdays" and "closed, congés annuels".
+function resolveHours(place, onDate) {
+  const current = place.currentOpeningHours;
+  const regular = place.regularOpeningHours;
+  const src = current?.periods?.length ? current : regular;
+  if (!src) return { hours: null, on: null };
+
+  const hours = {
+    source: src === current ? "current" : "regular",
+    open_now: src.openNow ?? null,
+    weekday_text: src.weekdayDescriptions || null,
+  };
+  if (!onDate) return { hours, on: null };
+
+  // Noon avoids any DST/× midnight edge when turning a date into a weekday.
+  const dow = new Date(`${onDate}T12:00:00`).getDay();
+  const intervals = intervalsForDay(src.periods, dow);
+
+  // A dated exception published by the business for this specific date.
+  const special = (current?.specialDays || []).find((s) => {
+    const d = s.date;
+    return d && `${d.year}-${String(d.month).padStart(2, "0")}-${String(d.day).padStart(2, "0")}` === onDate;
+  });
+
+  return {
+    hours,
+    on: {
+      date: onDate,
+      weekday: DAYS[dow],
+      open: intervals.length > 0,
+      intervals,
+      // Only claim override coverage when currentOpeningHours actually reaches
+      // this date; past its ~7-day horizon this is the standing schedule and a
+      // holiday closure would not show up in it.
+      covered_by_override: src === current && !!special,
+      ...(special ? { special_day: true } : {}),
+    },
+  };
+}
+
+const VERIFY_MASK = [
+  "places.id", "places.displayName", "places.formattedAddress",
+  "places.googleMapsUri", "places.location", "places.rating", "places.photos",
+  "places.businessStatus", "places.utcOffsetMinutes",
+  "places.regularOpeningHours", "places.currentOpeningHours",
+  // Opening hours, businessStatus and utcOffsetMinutes sit in the same
+  // Enterprise field tier as places.rating — hours cost nothing extra.
+  // allowsDogs/servesLunch/servesDinner are Atmosphere-tier and DO raise the
+  // per-call tier; they earn it by replacing two guesses that were driving real
+  // decisions: `dog_ok` was unverified LLM judgment from the reservoir build
+  // even though it decides whether the dog comes, and "is the kitchen doing lunch"
+  // was being settled by web search or a phone call.
+  "places.allowsDogs", "places.servesLunch", "places.servesDinner",
+  // Background material. `reviews` is the only source in this repo for "what
+  // should we actually order here" — diners name dishes. editorialSummary +
+  // primaryTypeDisplayName give the one-line "what is this place".
+  "places.reviews", "places.editorialSummary",
+  "places.primaryTypeDisplayName", "places.priceLevel",
+  "places.userRatingCount",
+].join(",");
+
+// A trip build re-verifies the same places every time it is rebuilt, and each
+// verify is an Atmosphere call ($0.04). Keep the answer 30 days per query and
+// ~1 km bias cell; hours are resolved from the stored weekly pattern for --on,
+// so a cached answer is as good as a fresh one for that. 2026-10-20.
+const VERIFY_CACHE_DIR = require(require("node:path").join(__dirname, "..", "lib", "root.cjs")).installTools("data/.cache/trip-place-verify");
+const VERIFY_TTL_MS = 30 * 24 * 3600 * 1000;
+function verifyCacheFile() {
+  const { createHash } = require("node:crypto");
+  const k = createHash("sha256").update(`${query.trim().toLowerCase()}|${Number(latStr).toFixed(2)},${Number(lonStr).toFixed(2)}|${VERIFY_MASK}`).digest("hex").slice(0, 32);
+  return require("node:path").join(VERIFY_CACHE_DIR, `${k}.json`);
+}
+
+async function main() {
+  const fs = require("node:fs");
+  const cacheFile = verifyCacheFile();
+  let data = null;
+  try {
+    if (Date.now() - fs.statSync(cacheFile).mtimeMs < VERIFY_TTL_MS) {
+      data = JSON.parse(fs.readFileSync(cacheFile, "utf8"));
+      logPlacesCall({ tool: "trip-place-verify", method: "searchText", tier: "enterprise_atmosphere", cached: true,
+        query, lat: Number(latStr), lon: Number(lonStr), radius: 20000 });
+    }
+  } catch { data = null; }
+  if (!data) {
+    // The one guarded door: priced against the month ledger, opt-in + daily cap
+    // for the Atmosphere tier (lib/places-tier-policy.json), logged.
+    const pc = require(require("node:path").join(__dirname, "..", "lib", "places-client.js"));
+    try {
+      data = await pc.post("trip-place-verify", "places:searchText", {
+        textQuery: query,
+        locationBias: { circle: { center: { latitude: Number(latStr), longitude: Number(lonStr) }, radius: 20000 } },
+        maxResultCount: 1,
+      }, { mask: VERIFY_MASK, method: "searchText", key: PLACES_KEY, query, lat: Number(latStr), lon: Number(lonStr), radius: 20000 });
+    } catch (e) {
+      console.error(`trip-place-verify: ${e.reason || `Places search failed: ${e.message}`}`);
+      process.exit(e.code || 1);
+    }
+    try { fs.mkdirSync(VERIFY_CACHE_DIR, { recursive: true }); fs.writeFileSync(cacheFile, JSON.stringify(data)); } catch {}
+  }
+  const place = (data.places || [])[0];
+  if (!place) {
+    console.error(`trip-place-verify: no match for "${query}"`);
+    process.exit(1);
+  }
+  const { hours, on } = resolveHours(place, ON);
+  process.stdout.write(JSON.stringify({
+    name: place.displayName?.text || query,
+    address: place.formattedAddress || null,
+    mapsUri: place.googleMapsUri || null,
+    rating: place.rating ?? null,
+    lat: place.location?.latitude ?? null,
+    lon: place.location?.longitude ?? null,
+    placeId: place.id || null,
+    photoName: place.photos?.[0]?.name || null,
+    // ALL photo resources, not just the first. Google's photos[0] is whatever a
+    // user happened to upload first, and it is not always of the subject:
+    // Châtelaillon's market hall resolves correctly but leads with a punter's
+    // photo of the café next door. Determinism can't fix Google's data, but
+    // exposing the alternates makes the correction one --photo-index flag
+    // instead of a hand-run against a different query.
+    photoNames: (place.photos || []).map((p) => p.name).filter(Boolean),
+    // OPERATIONAL / CLOSED_TEMPORARILY / CLOSED_PERMANENTLY. A place can resolve
+    // cleanly and still be shuttered, which the old output could not express.
+    businessStatus: place.businessStatus || null,
+    hours,
+    on,
+    allowsDogs: place.allowsDogs ?? null,
+    servesLunch: place.servesLunch ?? null,
+    servesDinner: place.servesDinner ?? null,
+    // Background, for writing the "why are we here" line and — at a restaurant
+    // — for pulling dish names out of what diners actually said.
+    summary: place.editorialSummary?.text || null,
+    kind: place.primaryTypeDisplayName?.text || null,
+    priceLevel: place.priceLevel || null,
+    ratingCount: place.userRatingCount ?? null,
+    reviews: (place.reviews || []).map((r) => ({
+      rating: r.rating ?? null,
+      when: r.publishTime ? String(r.publishTime).slice(0, 10) : null,
+      // originalText is the review as written (often French here);
+      // `text` is Google's translation. Keep both — the original names dishes
+      // correctly, the translation is what makes them readable.
+      text: r.text?.text || null,
+      original: r.originalText?.text || null,
+      lang: r.originalText?.languageCode || null,
+    })),
+  }));
+}
+
+main();

@@ -1,0 +1,873 @@
+#!/usr/bin/env node
+"use strict";
+// trip-conditions — air + sea + tide + a deterministic beach verdict for one
+// place on one day. The conditions half of single-day trip planning.
+//
+// Why this exists: apple-weather (WeatherKit) was the ONLY weather integration
+// in the repo, and it returns nothing marine. Meanwhile the area reservoirs
+// carry tide-dependent entries (oyster beds at low water, tidal crossings,
+// rockpools) and beach days that nothing could resolve. So "is Saturday a beach
+// day, and when is low tide for the oyster beds" had no answer.
+//
+// Everything here is KEYLESS on purpose — no new 1Password item, no WorldTides
+// or Stormglass account. Sources:
+//   air    apple-weather (WeatherKit) -> falls back to Open-Meteo forecast
+//   sea    Open-Meteo Marine (SST, waves) -> NOAA observed water temp at US stations
+//   tide   NOAA CO-OPS harmonic predictions (US) -> Open-Meteo sea-level model (global)
+//   beach  computed HERE, in code, not by a model, so the verdict can't drift
+//
+// THE TIDE HONESTY RULE. Outside the US there is no keyless harmonic source, so
+// tide extremes come from Open-Meteo's sea_level_height_msl model at hourly
+// resolution (parabolically interpolated). In an extreme-range basin — some
+// Channel bays run ~14m — being wrong by 30 minutes is the
+// difference between a causeway walk and a rescue. Those extremes are stamped
+// `source: "model"` and every caller MUST treat them as indicative only. For an
+// actual tidal CROSSING, look up the official mairie / office-de-tourisme
+// horaire. The skill (trip-day-plan) states this too; it is repeated here so a
+// direct CLI user sees it.
+//
+// Usage:
+//   trip-conditions --area old_town --date 2026-07-25 [--json]
+//   trip-conditions --lat 48.65 --lon -2.02 --date 2026-07-25 [--json]
+//   trip-conditions --lat 25.79 --lon -80.13 --date today --json
+//
+// Exit 0 always when it produced something (check `warnings[]`); 2 on bad usage.
+
+const fs = require("node:fs");
+const path = require("node:path");
+const { execFileSync } = require("node:child_process");
+
+const APPLE_WEATHER = path.join(__dirname, "apple-weather");
+const CACHE_DIR = path.join(__dirname, "..", "data", "trip-conditions-cache");
+const STATIONS_FILE = path.join(__dirname, "..", "data", "tide-stations.json");
+const CACHE_TTL_MS = 3 * 60 * 60 * 1000; // 3h — conditions move slower than a planning session
+const NOAA_MAX_KM = 50; // beyond this a "nearest" station is a different body of water
+
+const argv = process.argv.slice(2);
+const has = (f) => argv.includes(f);
+const arg = (f) => { const i = argv.indexOf(f); return i >= 0 ? argv[i + 1] : null; };
+
+const warnings = [];
+const warn = (m) => { if (!warnings.includes(m)) warnings.push(m); };
+
+// ---------------------------------------------------------------- helpers
+
+function haversineKm(a, b, c, d) {
+  const R = 6371, r = Math.PI / 180;
+  const dLat = (c - a) * r, dLon = (d - b) * r;
+  const x = Math.sin(dLat / 2) ** 2 + Math.cos(a * r) * Math.cos(c * r) * Math.sin(dLon / 2) ** 2;
+  return 2 * R * Math.asin(Math.sqrt(x));
+}
+
+async function getJson(url, label) {
+  try {
+    const resp = await fetch(url, { headers: { "User-Agent": "jori-trip-conditions" } });
+    if (!resp.ok) { warn(`${label}: HTTP ${resp.status}`); return null; }
+    return await resp.json();
+  } catch (e) {
+    warn(`${label}: ${e.message}`);
+    return null;
+  }
+}
+
+// "2026-07-22T14:00" -> "14:00". Open-Meteo returns wall-clock local strings
+// when timezone=auto, so no Date parsing (and no UTC drift) is needed.
+const hhmm = (iso) => String(iso || "").slice(11, 16);
+
+function fmtWindow(startIso, endIso) {
+  return `${hhmm(startIso)}–${hhmm(endIso)}`;
+}
+
+// ---------------------------------------------------------------- location
+
+async function resolveLocation() {
+  const latArg = arg("--lat"), lonArg = arg("--lon"), area = arg("--area");
+  if (latArg != null && lonArg != null) {
+    return { lat: Number(latArg), lon: Number(lonArg), area: area || null, label: arg("--label") || null };
+  }
+  if (!area) return null;
+  const { pullReservoir } = require(path.join(__dirname, "..", "lib", "reservoir-store.js"));
+  const res = await pullReservoir(area);
+  if (!res || res.lat == null) return null;
+  return { lat: res.lat, lon: res.lon, area, label: res.label || null };
+}
+
+function resolveDate(raw) {
+  if (!raw || raw === "today") return null; // filled from the API's own local day
+  if (raw === "tomorrow") {
+    const d = new Date(Date.now() + 86400000);
+    return d.toISOString().slice(0, 10);
+  }
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(raw)) {
+    console.error(`trip-conditions: --date must be YYYY-MM-DD, "today", or "tomorrow" (got "${raw}")`);
+    process.exit(2);
+  }
+  return raw;
+}
+
+// ---------------------------------------------------------------- air
+
+function appleWeather(lat, lon) {
+  try {
+    const out = execFileSync(APPLE_WEATHER, [String(lat), String(lon), "--json"],
+      { encoding: "utf8", maxBuffer: 20 * 1024 * 1024, timeout: 30000, stdio: ["ignore", "pipe", "ignore"] });
+    return JSON.parse(out);
+  } catch {
+    // The WeatherKit .p8 lives on the mini only, so this legitimately fails on
+    // the laptop. Not an error — just a downgrade the caller must know about.
+    return null;
+  }
+}
+
+const cToNum = (v) => (typeof v === "number" ? Math.round(v * 10) / 10 : null);
+
+// WeatherKit stamps EVERYTHING in UTC ("2026-07-24T04:37:06Z"), while Open-Meteo
+// is asked for timezone=auto and answers in local time. Every consumer here —
+// hhmm(), the 9..20 daylight filter, rainWindows(), and the high-water hour
+// match against SHOM/NOAA times, which are local — assumes local. So on the mini
+// (the only host with a WeatherKit key) a French sunrise printed as 04:37 rather
+// than 06:37, and the swim window was being computed in UTC hours against local
+// tide hours. Normalize on the way in so nothing downstream has to care.
+function toLocalStamp(iso, tz) {
+  if (!iso) return null;
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return null;
+  if (!tz) return String(iso).slice(0, 16);
+  const p = Object.fromEntries(new Intl.DateTimeFormat("en-CA", {
+    timeZone: tz, year: "numeric", month: "2-digit", day: "2-digit",
+    hour: "2-digit", minute: "2-digit", hourCycle: "h23",
+  }).formatToParts(d).map((x) => [x.type, x.value]));
+  return `${p.year}-${p.month}-${p.day}T${p.hour}:${p.minute}`;
+}
+
+function airFromWeatherKit(data, date, tz) {
+  const days = data?.forecastDaily?.days || [];
+  // Daily entries are normalized to UTC midnight, so match on the local date the
+  // day's sunrise falls on rather than on the UTC stamp.
+  const day = days.find((d) => {
+    const local = toLocalStamp(d.sunrise || d.forecastStart, tz);
+    return local && local.slice(0, 10) === date;
+  }) || days.find((d) => String(d.forecastStart || "").slice(0, 10) === date) || null;
+  if (!day) return null;
+  const hours = (data?.forecastHourly?.hours || [])
+    .map((h) => ({
+      time: toLocalStamp(h.forecastStart, tz),
+      temp_c: cToNum(h.temperature),
+      precip_chance: h.precipitationChance ?? null,
+      uv: h.uvIndex ?? null,
+    }))
+    .filter((h) => h.time && h.time.slice(0, 10) === date);
+  return {
+    source: "weatherkit",
+    max_c: cToNum(day.temperatureMax),
+    min_c: cToNum(day.temperatureMin),
+    condition: day.conditionCode || null,
+    precip_chance: day.precipitationChance ?? null,
+    wind_kmh: cToNum(day.windSpeedMax),
+    uv_max: day.maxUvIndex ?? null,
+    sunrise: toLocalStamp(day.sunrise, tz),
+    sunset: toLocalStamp(day.sunset, tz),
+    hourly: hours,
+    tz: tz || null,
+  };
+}
+
+async function airFromOpenMeteo(lat, lon, date) {
+  const url = `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}`
+    + `&daily=temperature_2m_max,temperature_2m_min,precipitation_probability_max,wind_speed_10m_max,uv_index_max,sunrise,sunset,weather_code`
+    + `&hourly=temperature_2m,precipitation_probability,uv_index`
+    + `&timezone=auto&forecast_days=7`;
+  const d = await getJson(url, "open-meteo forecast");
+  if (!d?.daily?.time) return null;
+  const i = d.daily.time.indexOf(date);
+  if (i < 0) { warn(`open-meteo forecast: ${date} outside the 7-day window`); return null; }
+  const hourly = (d.hourly?.time || [])
+    .map((t, n) => ({
+      time: t,
+      temp_c: d.hourly.temperature_2m?.[n] ?? null,
+      // Open-Meteo gives 0-100; WeatherKit gives 0-1. Normalize to 0-1 here so
+      // the beach thresholds below can be written once.
+      precip_chance: d.hourly.precipitation_probability?.[n] != null ? d.hourly.precipitation_probability[n] / 100 : null,
+      uv: d.hourly.uv_index?.[n] ?? null,
+    }))
+    .filter((h) => h.time.slice(0, 10) === date);
+  return {
+    source: "open-meteo",
+    max_c: d.daily.temperature_2m_max?.[i] ?? null,
+    min_c: d.daily.temperature_2m_min?.[i] ?? null,
+    condition: null,
+    precip_chance: d.daily.precipitation_probability_max?.[i] != null ? d.daily.precipitation_probability_max[i] / 100 : null,
+    wind_kmh: d.daily.wind_speed_10m_max?.[i] ?? null,
+    uv_max: d.daily.uv_index_max?.[i] ?? null,
+    sunrise: d.daily.sunrise?.[i] ?? null,
+    sunset: d.daily.sunset?.[i] ?? null,
+    hourly,
+    tz: d.timezone || null,
+  };
+}
+
+// Contiguous runs of hours at/above 30% chance — the same threshold
+// apple-weather's own rainWindows() uses, kept consistent on purpose.
+function rainWindows(hourly) {
+  const out = [];
+  let cur = null;
+  for (const h of hourly) {
+    const wet = (h.precip_chance ?? 0) >= 0.3;
+    if (wet) {
+      if (!cur) cur = { start: h.time, end: h.time, peak: h.precip_chance };
+      else { cur.end = h.time; cur.peak = Math.max(cur.peak, h.precip_chance); }
+    } else if (cur) { out.push(cur); cur = null; }
+  }
+  if (cur) out.push(cur);
+  return out.map((w) => `${fmtWindow(w.start, w.end)} (peak ${Math.round(w.peak * 100)}%)`);
+}
+
+// ---------------------------------------------------------------- sea + tide
+
+// A reservoir's base coordinate is frequently INLAND even for a coastal area
+// (a base can sit ~15km up an estuary from the coast). Open-Meteo's marine
+// grid returns all-nulls for a land cell, which silently killed the sea and
+// tide answers for exactly the legs that need them most. So when the cell comes
+// back dry, probe outward in a bounded ring for the nearest wet cell and say so.
+// Deliberately capped: past ~40km it's a different stretch of coast and the
+// honest answer is "no marine data", not a confident number from elsewhere.
+const SEA_PROBE_DEG = [0.25, 0.5]; // ~28km, ~55km at mid-latitudes
+const SEA_PROBE_DIRS = [[0, 1], [0, -1], [1, 0], [-1, 0], [1, 1], [1, -1], [-1, 1], [-1, -1]];
+
+async function marineAt(lat, lon, date) {
+  const url = `https://marine-api.open-meteo.com/v1/marine?latitude=${lat}&longitude=${lon}`
+    + `&hourly=sea_level_height_msl,sea_surface_temperature,wave_height,wave_period`
+    + `&timezone=auto&forecast_days=7`;
+  const d = await getJson(url, "open-meteo marine");
+  if (!d?.hourly?.time) return null;
+  const idx = d.hourly.time.map((t, n) => [t, n]).filter(([t]) => t.slice(0, 10) === date).map(([, n]) => n);
+  if (!idx.length) { warn(`open-meteo marine: ${date} outside the forecast window`); return null; }
+  const pick = (k) => idx.map((n) => d.hourly[k]?.[n] ?? null);
+  const nums = (a) => a.filter((v) => typeof v === "number");
+  const sst = nums(pick("sea_surface_temperature"));
+  const wave = nums(pick("wave_height"));
+  const period = nums(pick("wave_period"));
+  return {
+    tz: d.timezone || null,
+    // Daytime mean SST is what a swimmer meets; the daily spread is tiny.
+    sst_c: sst.length ? Math.round((sst.reduce((a, b) => a + b, 0) / sst.length) * 10) / 10 : null,
+    wave_m: wave.length ? Math.round(Math.max(...wave) * 100) / 100 : null,
+    wave_period_s: period.length ? Math.round((period.reduce((a, b) => a + b, 0) / period.length) * 10) / 10 : null,
+    // Full-series sea level (not just this date) so an extremum at a day
+    // boundary still has neighbours to interpolate against.
+    level: { time: d.hourly.time, value: d.hourly.sea_level_height_msl || [] },
+  };
+}
+
+// True when the grid cell actually carries ocean data (a land cell answers 200
+// with an all-null series rather than an error, so this has to be checked).
+const isWetCell = (m) => !!m && (m.sst_c != null || m.wave_m != null || m.level?.value?.some((v) => typeof v === "number"));
+
+async function marine(lat, lon, date) {
+  const direct = await marineAt(lat, lon, date);
+  if (isWetCell(direct)) return direct;
+  for (const step of SEA_PROBE_DEG) {
+    for (const [dy, dx] of SEA_PROBE_DIRS) {
+      // Longitude degrees shrink with latitude; keep the probe roughly circular.
+      const plat = lat + dy * step;
+      const plon = lon + dx * step / Math.max(0.2, Math.cos(lat * Math.PI / 180));
+      const probe = await marineAt(plat, plon, date);
+      if (isWetCell(probe)) {
+        const km = Math.round(haversineKm(lat, lon, plat, plon));
+        warn(`the base coordinate is inland — sea and tide are taken from open water ~${km}km away, so they describe the nearest coast, not this exact spot`);
+        probe.offshore_km = km;
+        probe.offshore_at = { lat: Math.round(plat * 1000) / 1000, lon: Math.round(plon * 1000) / 1000 };
+        return probe;
+      }
+    }
+  }
+  return direct; // dry everywhere in range — caller degrades to "no marine data"
+}
+
+// Local extrema of the hourly sea-level series, refined by fitting a parabola
+// through the extremum and its two neighbours. That recovers most of the time
+// resolution hourly sampling throws away, but it is still a MODEL, not a tide
+// station — hence the source label and the honesty rule at the top of the file.
+function modelTideExtremes(level, date) {
+  const { time, value } = level;
+  const out = [];
+  for (let i = 1; i < value.length - 1; i++) {
+    const [a, b, c] = [value[i - 1], value[i], value[i + 1]];
+    if (typeof a !== "number" || typeof b !== "number" || typeof c !== "number") continue;
+    const isHigh = b > a && b >= c;
+    const isLow = b < a && b <= c;
+    if (!isHigh && !isLow) continue;
+    const denom = a - 2 * b + c;
+    // Vertex offset in hours from the sampled point, clamped to the sample gap.
+    const shift = denom === 0 ? 0 : Math.max(-0.5, Math.min(0.5, (0.5 * (a - c)) / denom));
+    const peak = denom === 0 ? b : b - 0.25 * (a - c) * shift;
+    const base = new Date(`${time[i]}:00`);
+    base.setMinutes(base.getMinutes() + Math.round(shift * 60));
+    const stamp = `${time[i].slice(0, 10)}T${String(base.getHours()).padStart(2, "0")}:${String(base.getMinutes()).padStart(2, "0")}`;
+    // The parabola can nudge across midnight; key on the sampled hour's date.
+    if (time[i].slice(0, 10) !== date) continue;
+    out.push({ type: isHigh ? "H" : "L", time: stamp, height_m: Math.round(peak * 100) / 100 });
+  }
+  return denoiseExtremes(out.sort((x, y) => x.time.localeCompare(y.time)));
+}
+
+// A raw local-extremum scan over a MODEL series finds wiggles, not tides. Real
+// semidiurnal tides alternate H/L roughly every 6h12m, but the hourly sea-level
+// series contains small non-tidal ripples that the scan reports as extra
+// extremes — observed live for one Atlantic port 2026-07-24: "high 13:00 (0.38m),
+// low 14:30 (0.32m), low 19:21 (-1.44m)", i.e. two lows in a row and a 90-minute
+// high-to-low gap, which then produced a bogus 13:00-15:00 "low water" window
+// for the oyster beds. That's the exact failure this tool exists to prevent, so
+// clean the series before anyone reads it: collapse consecutive same-type
+// extremes to the more extreme one, and drop a shallow alternation that arrives
+// implausibly soon after the previous turn.
+const MIN_TURN_GAP_MIN = 180;   // half a semidiurnal cycle, generously
+const NOISE_FRACTION = 0.15;    // a "turn" spanning under 15% of the day's range
+
+function denoiseExtremes(list) {
+  if (list.length < 2) return list;
+  const heights = list.map((e) => e.height_m);
+  const range = Math.max(...heights) - Math.min(...heights);
+  const minutes = (t) => Number(t.slice(11, 13)) * 60 + Number(t.slice(14, 16));
+  const kept = [];
+  for (const e of list) {
+    const last = kept[kept.length - 1];
+    if (!last) { kept.push(e); continue; }
+    if (last.type === e.type) {
+      // Two highs (or two lows) running: only the more extreme is the real turn.
+      const better = e.type === "H" ? e.height_m > last.height_m : e.height_m < last.height_m;
+      if (better) kept[kept.length - 1] = e;
+      continue;
+    }
+    const gap = minutes(e.time) - minutes(last.time);
+    const swing = Math.abs(e.height_m - last.height_m);
+    if (gap < MIN_TURN_GAP_MIN && range > 0 && swing < range * NOISE_FRACTION) continue; // ripple, not a tide
+    kept.push(e);
+  }
+  return kept;
+}
+
+async function noaaStations() {
+  try {
+    const cached = JSON.parse(fs.readFileSync(STATIONS_FILE, "utf8"));
+    if (Array.isArray(cached) && cached.length) return cached;
+  } catch { /* fetch below */ }
+  const d = await getJson(
+    "https://api.tidesandcurrents.noaa.gov/mdapi/prod/webapi/stations.json?type=tidepredictions",
+    "noaa station index");
+  if (!d?.stations) return [];
+  // Slim 2MB of metadata down to what nearest-station needs, then cache it.
+  // Station positions effectively never change, so this is a one-time fetch.
+  const slim = d.stations
+    .filter((s) => typeof s.lat === "number" && typeof s.lng === "number")
+    .map((s) => ({ id: s.id, name: s.name, lat: s.lat, lon: s.lng, state: s.state || null }));
+  try {
+    fs.mkdirSync(path.dirname(STATIONS_FILE), { recursive: true });
+    fs.writeFileSync(STATIONS_FILE, JSON.stringify(slim));
+  } catch { /* cache write is best-effort */ }
+  return slim;
+}
+
+async function nearestNoaaStation(lat, lon) {
+  const stations = await noaaStations();
+  let best = null;
+  for (const s of stations) {
+    const km = haversineKm(lat, lon, s.lat, s.lon);
+    if (!best || km < best.km) best = { ...s, km: Math.round(km * 10) / 10 };
+  }
+  return best && best.km <= NOAA_MAX_KM ? best : null;
+}
+
+async function noaaTide(station, date) {
+  const ymd = date.replace(/-/g, "");
+  const url = `https://api.tidesandcurrents.noaa.gov/api/prod/datagetter?product=predictions&datum=MLLW`
+    + `&interval=hilo&station=${station.id}&begin_date=${ymd}&end_date=${ymd}`
+    + `&units=metric&time_zone=lst_ldt&format=json&application=jori`;
+  const d = await getJson(url, `noaa predictions ${station.id}`);
+  if (!d?.predictions?.length) return null;
+  return d.predictions.map((p) => ({
+    type: p.type,
+    time: `${p.t.slice(0, 10)}T${p.t.slice(11, 16)}`,
+    height_m: Math.round(Number(p.v) * 100) / 100,
+  }));
+}
+
+async function noaaWaterTemp(station) {
+  const url = `https://api.tidesandcurrents.noaa.gov/api/prod/datagetter?product=water_temperature`
+    + `&station=${station.id}&date=latest&units=metric&time_zone=lst_ldt&format=json&application=jori`;
+  const d = await getJson(url, `noaa water temp ${station.id}`);
+  const v = d?.data?.[0]?.v;
+  return v != null && !Number.isNaN(Number(v)) ? Math.round(Number(v) * 10) / 10 : null;
+}
+
+// ------------------------------------------------------- SHOM (France)
+//
+// Why this exists: the Open-Meteo sea-level model was measured against SHOM on
+// the Charente-Maritime coast (2026-07-22) and runs a consistent ~1 HOUR EARLY.
+// Amplitude was fine — model range 1.95m vs 2.04m actual — but the phase lead
+// was 65/67 min on both high waters and 36/46 min on the lows:
+//
+//   Thu 23 Jul high   model 11:56   SHOM 13:01   -65 min
+//   Fri 24 Jul high   model 13:00   SHOM 14:07   -67 min
+//
+// An hour is harmless for "is it a beach day" but not for the low-water windows
+// this tool emits for oyster beds and rockpools: the +/-1h band it printed put
+// the real low at the very edge, or outside. maree.info publishes the official
+// SHOM predictions (times local, with the French coefficient), so on any coast
+// it covers we use the real thing and the model becomes the last resort.
+//
+// The one constraint: maree.info serves a rolling 7-day window from today and
+// ignores every date parameter it appears to accept (verified: ?d=, ?j=, ?date=
+// and /PORT/YYYYMMDD all return the same week). Beyond that window we fall back
+// to the model, and say so.
+const FR_PORTS_FILE = path.join(__dirname, "..", "data", "tide-ports-fr.json");
+const FR_MAX_KM = 40;          // French ports are dense; beyond this it isn't "here"
+const SHOM_WINDOW_DAYS = 7;
+const HTML_UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)";
+
+async function getHtml(url, label) {
+  try {
+    const r = await fetch(url, { headers: { "user-agent": HTML_UA }, signal: AbortSignal.timeout(20000) });
+    if (!r.ok) { warn(`${label}: HTTP ${r.status}`); return null; }
+    return await r.text();
+  } catch (e) {
+    warn(`${label}: ${e.message}`);
+    return null;
+  }
+}
+
+const FR_ENTITIES = {
+  "&eacute;": "é", "&egrave;": "è", "&agrave;": "à", "&ccedil;": "ç", "&nbsp;": " ",
+  "&amp;": "&", "&#39;": "'", "&icirc;": "î", "&ocirc;": "ô", "&ecirc;": "ê",
+  "&ucirc;": "û", "&iuml;": "ï", "&euml;": "ë", "&ugrave;": "ù", "&acirc;": "â",
+};
+const deEntity = (s) => String(s).replace(/&[a-z#0-9]+;/g, (m) => FR_ENTITIES[m] ?? m);
+
+// Query forms for the geocoder, most specific first. Port names carry harbour
+// qualifiers the gazetteer doesn't know ("<Port>-Pallice", "<Port>-
+// Antifer"), so progressively strip them rather than dropping the port.
+function portQueries(name) {
+  const base = deEntity(name).trim();
+  const noParen = base.replace(/\(.*?\)/g, " ").replace(/\s+/g, " ").trim();
+  const paren = (base.match(/\((.*?)\)/) || [])[1];
+  const slash = noParen.split("/")[0].trim();
+  const out = [base, noParen, slash];
+  if (paren) out.push(paren.trim());
+  const parts = slash.split("-");
+  if (parts.length > 1) {
+    out.push(parts.slice(0, -1).join("-").trim());
+    out.push(parts[0].trim());
+  }
+  out.push(slash.replace(/^(Iles?|Île|Ile|Entr[ée]e|Port|Anse|Pointe|Baie|Rade|Plage)\s+(de\s+la\s+|de\s+|du\s+|des\s+|d')?/i, "").trim());
+  return [...new Set(out.filter((s) => s && s.length > 2))];
+}
+
+async function geocodeFr(name) {
+  for (const q of portQueries(name)) {
+    const d = await getJson(
+      `https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(q)}`
+      + `&count=1&country=FR&language=fr&format=json`, `geocode ${q}`);
+    const r = d?.results?.[0];
+    if (r) return { lat: r.latitude, lon: r.longitude };
+  }
+  return null;
+}
+
+// One-time harvest: maree.info's port index has ids and names but no positions,
+// so each is geocoded once and the result cached. ~91% resolve (126/139); the
+// stragglers are obscure buoys and offshore marks whose neighbours cover them.
+async function frPorts() {
+  try {
+    const cached = JSON.parse(fs.readFileSync(FR_PORTS_FILE, "utf8"));
+    if (Array.isArray(cached) && cached.length) return cached;
+  } catch { /* harvest below */ }
+  const html = await getHtml("https://maree.info/?p=ports", "maree.info port index");
+  if (!html) return [];
+  const seen = new Map();
+  const re = /href="\/(\d+)"[^>]*>([^<]{2,45})</g;
+  let m;
+  while ((m = re.exec(html))) {
+    const name = deEntity(m[2]).trim();
+    if (!name || /^(Lun|Mar|Mer|Jeu|Ven|Sam|Dim)\.?$/.test(name)) continue;
+    if (!seen.has(m[1])) seen.set(m[1], { id: m[1], name });
+  }
+  const ports = [];
+  for (const p of seen.values()) {
+    const g = await geocodeFr(p.name);
+    if (g) ports.push({ ...p, lat: g.lat, lon: g.lon });
+  }
+  try {
+    fs.mkdirSync(path.dirname(FR_PORTS_FILE), { recursive: true });
+    fs.writeFileSync(FR_PORTS_FILE, JSON.stringify(ports));
+  } catch { /* cache write is best-effort */ }
+  return ports;
+}
+
+async function nearestFrPort(lat, lon) {
+  const ports = await frPorts();
+  let best = null;
+  for (const p of ports) {
+    const km = haversineKm(lat, lon, p.lat, p.lon);
+    if (!best || km < best.km) best = { ...p, km: Math.round(km * 10) / 10 };
+  }
+  return best && best.km <= FR_MAX_KM ? best : null;
+}
+
+function withinShomWindow(date) {
+  const today = new Date();
+  const days = (new Date(`${date}T12:00:00`) - new Date(`${today.toISOString().slice(0, 10)}T12:00:00`))
+    / 86400000;
+  return days >= 0 && days < SHOM_WINDOW_DAYS;
+}
+
+// Row shape: "Jeu. 23 06h19 13h19 18h49 2,59m 4,68m 2,67m 37" — every turn's
+// time, then every turn's height, then the day's coefficients. High vs low is
+// read off the heights (a turn is high iff it tops both neighbours) rather than
+// assumed to alternate from a fixed start, which breaks on days with 3 turns.
+function parseShomDay(html, date) {
+  const text = deEntity(html.replace(/<[^>]*>/g, " ")).replace(/\s+/g, " ");
+  const dom = Number(date.slice(8, 10));
+  const re = new RegExp(`(?:Lun|Mar|Mer|Jeu|Ven|Sam|Dim)\\.\\s*${dom}\\s+((?:\\d{2}h\\d{2}\\s+)+)((?:\\d,\\d{2}m\\s+)+)`, "u");
+  const m = text.match(re);
+  if (!m) return null;
+  const times = m[1].trim().split(/\s+/);
+  const heights = m[2].trim().split(/\s+/).map((h) => Number(h.replace("m", "").replace(",", ".")));
+  if (times.length !== heights.length || !times.length) return null;
+  return times.map((t, i) => {
+    const prev = heights[i - 1], next = heights[i + 1];
+    const isHigh = (prev == null || heights[i] > prev) && (next == null || heights[i] > next);
+    return { type: isHigh ? "H" : "L", time: `${date}T${t.replace("h", ":")}`, height_m: heights[i] };
+  });
+}
+
+async function shomTide(port, date) {
+  const html = await getHtml(`https://maree.info/${port.id}`, `maree.info ${port.name}`);
+  if (!html) return null;
+  return parseShomDay(html, date);
+}
+
+// ---------------------------------------------------------------- beach
+
+// Deliberately in code, not in a prompt. A model asked "is this a beach day"
+// gives a different answer on different days for the same inputs; the point of
+// a verdict is that it doesn't.
+// The thresholds are generic beach criteria; an installation tunes them to the
+// travellers in trip-planning.json `beach` (shallow-merged per key).
+const BEACH_CFG = require(path.join(__dirname, "..", "lib", "instance.cjs")).localConfig("trip-planning", { beach: {} }).beach || {};
+const T = {
+  yes:      { max_c: 24, precip: 0.25, wind_kmh: 25, sst_c: 19, wave_m: 1.0, ...(BEACH_CFG.yes || {}) },
+  marginal: { max_c: 20, precip: 0.40, sst_c: 16, ...(BEACH_CFG.marginal || {}) },
+  swim_sst_c: BEACH_CFG.swim_sst_c ?? 19,
+  // UV is reported, and gets shade advice from this index up (WHO "very high"
+  // starts at 8). It never moves the swim window. Travellers who are not
+  // UV-sensitive raise it (11 = WHO "extreme").
+  high_uv: BEACH_CFG.high_uv ?? 8,
+  // Above this the middle of the day is the problem, not the draw. The old
+  // thresholds had a floor and no ceiling, so 35C and 45C both scored "yes"
+  // with a window centred on high water — which on 2026-07-24 put the
+  // recommended block at 11:00-15:00, the peak-heat, peak-UV hours.
+  hot_c: BEACH_CFG.hot_c ?? 32,
+  heat_peak: { from: 12, to: 16, ...(BEACH_CFG.heat_peak || {}) },
+};
+
+// Plain-language band for sea temperature. Calibrated for the Atlantic coasts
+// this reservoir covers, where 24°C is a genuinely good year and 17°C is a
+// normal June — the same number means different things in the Mediterranean, so the band
+// describes how it will FEEL to swim in, not how it ranks locally.
+function seaFeel(c) {
+  if (c == null) return "unknown";
+  if (c >= 26) return "properly warm, no hesitation";
+  if (c >= 24) return "warm — in without thinking about it";
+  if (c >= 22) return "pleasant, an easy swim";
+  if (c >= 20) return "fresh but fine once you're in";
+  if (c >= 18) return "brisk — a quick one";
+  return "cold, a dip not a swim";
+}
+
+function beachVerdict(air, sea, tide) {
+  const reasons = [];
+  const missing = [];
+  if (air?.max_c == null) missing.push("air temperature");
+  if (sea?.sst_c == null) missing.push("sea-surface temperature");
+
+  // Never guess a beach day from air data alone — the whole reason this tool
+  // exists is that "22C and sunny" says nothing about a 14C sea.
+  if (missing.length) {
+    return {
+      verdict: "unknown",
+      swimmable: null,
+      reasons: [`no verdict — missing ${missing.join(" and ")}`],
+      best_window: null,
+      low_tide_windows: [],
+    };
+  }
+
+  const y = T.yes, m = T.marginal;
+  const isYes = air.max_c >= y.max_c
+    && (air.precip_chance ?? 0) <= y.precip
+    && (air.wind_kmh ?? 0) <= y.wind_kmh
+    && sea.sst_c >= y.sst_c
+    && (sea.wave_m ?? 0) <= y.wave_m;
+  const isMarginal = air.max_c >= m.max_c
+    && (air.precip_chance ?? 0) <= m.precip
+    && sea.sst_c >= m.sst_c;
+
+  const verdict = isYes ? "yes" : isMarginal ? "marginal" : "no";
+
+  reasons.push(`air ${air.max_c}°C`, `sea ${sea.sst_c}°C`);
+  if (air.precip_chance != null) reasons.push(`${Math.round(air.precip_chance * 100)}% rain`);
+  if (air.wind_kmh != null) reasons.push(`wind ${Math.round(air.wind_kmh)} km/h`);
+  if (sea.wave_m != null) reasons.push(`waves ${sea.wave_m} m`);
+  if (verdict !== "yes") {
+    if (air.max_c < y.max_c) reasons.push(`air below ${y.max_c}°C`);
+    if (sea.sst_c < y.sst_c) reasons.push(`sea below ${y.sst_c}°C`);
+    if ((air.precip_chance ?? 0) > y.precip) reasons.push("too wet");
+    if ((air.wind_kmh ?? 0) > y.wind_kmh) reasons.push("too windy");
+    if ((sea.wave_m ?? 0) > y.wave_m) reasons.push("seas too big");
+  }
+
+  const swimmable = sea.sst_c >= T.swim_sst_c;
+  if (!swimmable) reasons.push(`${sea.sst_c}°C is bracing, not swimming`);
+  // Water temperature is the headline number, not a footnote (the warmer the
+  // better). So it leads the reasons and carries a plain-language band, because 24.8°C means
+  // nothing until you know that's genuinely warm for the Atlantic coast.
+  reasons.unshift(`sea ${sea.sst_c}°C — ${seaFeel(sea.sst_c)}`);
+
+  // Swim window: dry hours, near HIGH water (on a big-range coast a low-tide
+  // "beach" is several hundred metres of mudflat), avoiding peak UV when it's
+  // high.
+  const dry = (air.hourly || []).filter((h) => (h.precip_chance ?? 0) < 0.3);
+  const daylight = dry.filter((h) => {
+    const hh = Number(hhmm(h.time).slice(0, 2));
+    return hh >= 9 && hh <= 20;
+  });
+  const highs = tide.extremes.filter((e) => e.type === "H");
+  let best = null;
+  if (daylight.length) {
+    if (highs.length) {
+      // Pick the high water with the most dry daylight hours within +/-2h.
+      let bestHigh = null;
+      for (const h of highs) {
+        const hh = Number(hhmm(h.time).slice(0, 2));
+        const near = daylight.filter((d) => Math.abs(Number(hhmm(d.time).slice(0, 2)) - hh) <= 2);
+        if (!bestHigh || near.length > bestHigh.n) bestHigh = { hour: hh, n: near.length };
+      }
+      if (bestHigh && bestHigh.n) {
+        let lo = Math.max(9, bestHigh.hour - 2), hi = Math.min(20, bestHigh.hour + 2);
+        // On a genuinely hot day, high water is not the only constraint: pull
+        // the window off the afternoon peak even though the tide is best then.
+        // Prefer the morning shoulder, since it also front-loads the day.
+        if (air.max_c >= T.hot_c) {
+          const { from, to } = T.heat_peak;
+          if (lo < from) hi = Math.min(hi, from);
+          else if (hi > to) lo = Math.max(lo, to);
+          else { lo = 9; hi = from; }
+          if (hi - lo < 2) { lo = 9; hi = from; }
+          reasons.push(`${air.max_c}°C — window pulled off the ${from}:00–${to}:00 peak`);
+        } else {
+          reasons.push("window set around high water");
+        }
+        best = `${String(lo).padStart(2, "0")}:00–${String(hi).padStart(2, "0")}:00`;
+      }
+    }
+    if (!best) {
+      best = fmtWindow(daylight[0].time, daylight[daylight.length - 1].time);
+    }
+  }
+  if ((air.uv_max ?? 0) >= T.high_uv) {
+    reasons.push(`UV ${air.uv_max} — shade ${T.heat_peak.from}:00–${T.heat_peak.to}:00`);
+  }
+
+  // The inverse signal: oyster beds, tidal crossings, rockpools all want LOW
+  // water. Never conflate this with the swim window.
+  //
+  // The band has to carry the source's error: SHOM and NOAA are predictions
+  // good to minutes, but the sea-level model was measured ~1h early, so a +/-1h
+  // band around a modelled low can exclude the real one entirely. Widen it and
+  // let the label say why rather than printing false precision.
+  const slackH = tide.source === "model" ? 2 : 1;
+  const clock = (mins) => {
+    const c = Math.max(0, Math.min(24 * 60 - 1, Math.round(mins)));
+    return `${String(Math.floor(c / 60)).padStart(2, "0")}:${String(c % 60).padStart(2, "0")}`;
+  };
+  const lowWindows = tide.extremes
+    .filter((e) => e.type === "L")
+    .map((e) => {
+      // Band the actual minute, not its hour: clamping a 23:30 low to the top
+      // of hour 23 produced "21:00-23:00 (low 23:30)", a window excluding the
+      // very thing it was pointing at.
+      const t = hhmm(e.time);
+      const mid = Number(t.slice(0, 2)) * 60 + Number(t.slice(3, 5));
+      const tag = tide.source === "model" ? " ±1h, modelled" : "";
+      return `${clock(mid - slackH * 60)}–${clock(mid + slackH * 60)} (low ${t}${tag})`;
+    });
+
+  return { verdict, swimmable, reasons, best_window: best, low_tide_windows: lowWindows };
+}
+
+// ---------------------------------------------------------------- main
+
+function cacheKey(loc, date) {
+  return `${loc.lat.toFixed(3)}_${loc.lon.toFixed(3)}_${date}.json`;
+}
+
+async function main() {
+  if (has("--help") || has("-h")) {
+    console.log(fs.readFileSync(__filename, "utf8").split("\n").filter((l) => l.startsWith("//")).join("\n"));
+    return;
+  }
+
+  const loc = await resolveLocation();
+  if (!loc || !Number.isFinite(loc.lat)) {
+    console.error("trip-conditions: need --area <key> (with a built reservoir) or --lat <n> --lon <n>.");
+    process.exit(2);
+  }
+  let date = resolveDate(arg("--date"));
+
+  // Marine first: it is required for any sea/tide answer AND it hands back the
+  // location's IANA timezone, which settles what "today" means locally.
+  let sea = await marine(loc.lat, loc.lon, date || new Date().toISOString().slice(0, 10));
+  if (!date) {
+    const tz = sea?.tz || "UTC";
+    date = new Intl.DateTimeFormat("en-CA", { timeZone: tz, year: "numeric", month: "2-digit", day: "2-digit" })
+      .format(new Date());
+    if (sea) sea = await marine(loc.lat, loc.lon, date);
+  }
+
+  const cacheFile = path.join(CACHE_DIR, cacheKey(loc, date));
+  if (!has("--no-cache")) {
+    try {
+      const st = fs.statSync(cacheFile);
+      if (Date.now() - st.mtimeMs < CACHE_TTL_MS) {
+        const hit = JSON.parse(fs.readFileSync(cacheFile, "utf8"));
+        if (has("--json")) { process.stdout.write(JSON.stringify(hit)); return; }
+        render(hit);
+        return;
+      }
+    } catch { /* miss */ }
+  }
+
+  if (!sea) warn("no marine data — sea temperature, waves and the beach verdict are unavailable");
+
+  // Air: WeatherKit when its key is present (mini), Open-Meteo otherwise.
+  let air = null;
+  const wk = appleWeather(loc.lat, loc.lon);
+  // sea.tz comes from Open-Meteo's timezone=auto and is resolved above; without
+  // it WeatherKit's UTC stamps can't be localized, so prefer the fallback there.
+  if (wk && sea?.tz) air = airFromWeatherKit(wk, date, sea.tz);
+  else if (wk) warn("no timezone resolved for this point — used open-meteo for air so times stay local");
+  if (!air) {
+    if (wk) warn(`weatherkit has no forecast for ${date} — used open-meteo`);
+    else warn("weatherkit unavailable (no key on this host) — used open-meteo");
+    air = await airFromOpenMeteo(loc.lat, loc.lon, date);
+  }
+  if (!air) warn("no air forecast from any source");
+
+  // Tide, best source first: NOAA harmonic predictions (US), then the official
+  // SHOM predictions via maree.info (France), then the sea-level model, which
+  // is known to run ~1h early and is a last resort.
+  const tide = { source: null, station: null, extremes: [] };
+  const station = await nearestNoaaStation(loc.lat, loc.lon);
+  if (station) {
+    const preds = await noaaTide(station, date);
+    if (preds?.length) {
+      tide.source = "noaa";
+      tide.station = { id: station.id, name: station.name, km: station.km };
+      tide.extremes = preds;
+    }
+  }
+  if (!tide.extremes.length) {
+    const port = await nearestFrPort(loc.lat, loc.lon);
+    if (port && !withinShomWindow(date)) {
+      warn(`SHOM predictions cover only the next ${SHOM_WINDOW_DAYS} days — ${date} is outside that window, falling back to the model`);
+    } else if (port) {
+      const preds = await shomTide(port, date);
+      if (preds?.length) {
+        tide.source = "shom";
+        tide.station = { id: port.id, name: port.name, km: port.km };
+        tide.extremes = preds;
+      }
+    }
+  }
+  if (!tide.extremes.length && sea?.level) {
+    tide.source = "model";
+    tide.extremes = modelTideExtremes(sea.level, date);
+    if (tide.extremes.length) {
+      warn("tide times are Open-Meteo MODEL output, not a tide station — measured ~1h EARLY against SHOM on the French Atlantic coast, so treat every time as +/-1h; never plan a tidal crossing or a low-water walk on them without the official local horaire");
+    }
+  }
+  if (!tide.extremes.length) warn("no tide data available for this location");
+
+  // Observed beats modelled for water temperature when NOAA has a sensor.
+  if (station && sea) {
+    const obs = await noaaWaterTemp(station);
+    if (obs != null) { sea.sst_c = obs; sea.source = `noaa observed (${station.name})`; }
+  }
+  if (sea && !sea.source) sea.source = "open-meteo marine (model)";
+
+  const beach = beachVerdict(air, sea, tide);
+
+  const out = {
+    place: { area: loc.area, label: loc.label, lat: loc.lat, lon: loc.lon, timezone: sea?.tz || air?.tz || null },
+    date,
+    air: air ? {
+      source: air.source, max_c: air.max_c, min_c: air.min_c, condition: air.condition,
+      precip_chance: air.precip_chance, wind_kmh: air.wind_kmh, uv_max: air.uv_max,
+      sunrise: air.sunrise, sunset: air.sunset, rain_windows: rainWindows(air.hourly || []),
+    } : null,
+    sea: sea ? {
+      source: sea.source, sst_c: sea.sst_c, wave_m: sea.wave_m, wave_period_s: sea.wave_period_s,
+      offshore_km: sea.offshore_km ?? null, offshore_at: sea.offshore_at ?? null,
+    } : null,
+    tide: { source: tide.source, station: tide.station, extremes: tide.extremes },
+    beach,
+    warnings,
+  };
+
+  try {
+    fs.mkdirSync(CACHE_DIR, { recursive: true });
+    fs.writeFileSync(cacheFile, JSON.stringify(out));
+  } catch { /* best-effort */ }
+
+  if (has("--json")) { process.stdout.write(JSON.stringify(out)); return; }
+  render(out);
+}
+
+function render(o) {
+  const L = [];
+  L.push(`${o.place.label || o.place.area || `${o.place.lat},${o.place.lon}`} — ${o.date}`);
+  // Water temperature leads. It is the number that decides whether the day is
+  // worth pointing at the coast, and it used to be buried under air and wind.
+  if (o.sea?.sst_c != null) {
+    L.push(`WATER: ${o.sea.sst_c}°C — ${seaFeel(o.sea.sst_c)}`
+      + `${o.sea.offshore_km ? ` (nearest open water, ~${o.sea.offshore_km}km)` : ""}`);
+  }
+  if (o.air) {
+    L.push(`Air: ${o.air.max_c}°C / ${o.air.min_c}°C${o.air.condition ? `, ${o.air.condition}` : ""}`
+      + `${o.air.precip_chance != null ? `, ${Math.round(o.air.precip_chance * 100)}% rain` : ""}`
+      + `${o.air.wind_kmh != null ? `, wind ${Math.round(o.air.wind_kmh)} km/h` : ""}`
+      + `${o.air.uv_max != null ? `, UV ${Math.round(o.air.uv_max)}` : ""}`);
+    if (o.air.sunrise) L.push(`Light: ${hhmm(o.air.sunrise)} → ${hhmm(o.air.sunset)}`);
+    if (o.air.rain_windows?.length) L.push(`Rain: ${o.air.rain_windows.join(", ")}`);
+  }
+  if (o.sea) {
+    L.push(`Sea: waves ${o.sea.wave_m ?? "?"} m${o.sea.wave_period_s ? `, period ${o.sea.wave_period_s}s` : ""} — ${o.sea.source}`
+      + `${o.sea.sst_c == null ? " (no water temperature)" : ""}`);
+  }
+  if (o.tide.extremes.length) {
+    const t = o.tide.extremes.map((e) => `${e.type === "H" ? "high" : "low"} ${hhmm(e.time)} (${e.height_m}m)`).join(", ");
+    L.push(`Tide [${o.tide.source}${o.tide.station ? `: ${o.tide.station.name}, ${o.tide.station.km}km` : ""}]: ${t}`);
+  }
+  const b = o.beach;
+  L.push(`Beach day: ${b.verdict.toUpperCase()}${b.swimmable === null ? "" : b.swimmable ? " — swimmable" : " — too cold to swim"}`);
+  if (b.best_window) L.push(`  best window: ${b.best_window}`);
+  if (b.low_tide_windows?.length) L.push(`  low water (oyster beds / tidal walks): ${b.low_tide_windows.join(", ")}`);
+  if (b.reasons?.length) L.push(`  ${b.reasons.join("; ")}`);
+  if (o.warnings.length) { L.push(""); for (const w of o.warnings) L.push(`! ${w}`); }
+  console.log(L.join("\n"));
+}
+
+main().catch((e) => {
+  console.error(`trip-conditions: ${e.message}`);
+  process.exit(1);
+});

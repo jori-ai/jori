@@ -1,0 +1,468 @@
+#!/usr/bin/env node
+// trip-day-select — BATCH day curation from the pre-built area reservoir
+// (Phase 1). Selects + sequences several days at once instead of researching
+// from scratch every morning.
+//
+// Standalone as of 2026-07-22. It was written as a source for
+// france-itinerary-run's verify/schedule/HTML steps (hence the output shape,
+// inherited from the france-itinerary-research contract), but that whole
+// pipeline is retired and this is now called directly — pipe it a request on
+// stdin and read the plan off stdout. Nothing downstream reformats the result
+// any more, so the caller owns presentation.
+//
+// For ONE day, prefer the `trip-day-plan` skill: it has the context this script
+// cannot see (live conditions, what happened yesterday, the pet judgment) and
+// it reasons rather than pattern-matches. Reach for this when you want several
+// days curated cheaply in one pass, or an offline/no-LLM fallback.
+//
+// Methodology: the `itinerary-planning` skill (trip-level) + `trip-day-plan`
+// (per-day). Neither is auto-loaded here — this is a self-contained prompt, so
+// anything the skills learn reaches it through `days[].directives[]`.
+//
+// Because the reservoir is already web-researched AND Places-verified, the
+// selection is pure curation over given data — so it forks cheap Sonnet
+// (--effort medium, NO WebSearch), not Opus. Much faster + cheaper than the
+// per-day WebSearch research it replaces, and higher quality (it draws from a
+// vetted superset with variety across days).
+//
+// Usage: echo '<request JSON>' | trip-day-select
+// Request JSON:
+//   { days: [ { date, weekday, city, home_base_label, home_base_lat,
+//               home_base_lon, is_transit, start_label, end_label,
+//               <pet_key>_along } ],   (pet_key: trip-planning.json, default "pet")
+//     reservoirs: { "<area_key>": <reservoir JSON> },   // areas covering the window
+//     food_taste, prior_context, calendar_context }
+// Output JSON (stdout, success only): {days:[{date,sights[],market,local_event,
+// lunch,coffee}]} — see the schema at the end of buildPrompt.
+
+import { execFileSync } from "node:child_process";
+import { createRequire } from "node:module";
+import os from "node:os";
+import path from "node:path";
+
+const require = createRequire(import.meta.url);
+const { localConfig } = require("../lib/instance.cjs");
+
+const CLAUDE_BIN = process.env.CLAUDE_BIN || path.join(os.homedir(), ".local/bin/claude");
+
+// Who is travelling, the pet (if any) and the trip's framing, for the prompt.
+// trip-planning.json: travellers ("a slow-traveling couple …"), trip_context
+// (" on a road trip through …"), pet_name, pet_key (the request's day field is
+// `<pet_key>_along`). No config: one traveller, no pet.
+const TRIP = localConfig("trip-planning", { travellers: "a traveler who likes to slow-travel", trip_context: "", pet_name: "", pet_key: "pet" });
+const PET_NAME = TRIP.pet_name || "the dog";
+const PET_ALONG = `${TRIP.pet_key || "pet"}_along`;
+const petAlong = (d) => !!(d && d[PET_ALONG]);
+
+function readStdin() {
+  const chunks = [];
+  return new Promise((resolve, reject) => {
+    process.stdin.on("data", (c) => chunks.push(c));
+    process.stdin.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
+    process.stdin.on("error", reject);
+  });
+}
+
+function extractJson(text) {
+  const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/);
+  const candidate = fenced ? fenced[1] : text;
+  const start = candidate.indexOf("{");
+  const end = candidate.lastIndexOf("}");
+  if (start === -1 || end === -1 || end <= start) return null;
+  try { return JSON.parse(candidate.slice(start, end + 1)); } catch { return null; }
+}
+
+// Compact the reservoir for the prompt — the model only needs enough to pick,
+// not the full verified Places blob. Keep the fields that drive selection.
+// Feedback is the scarcest and most valuable field in the reservoir — it's the
+// only one that reflects what the user ACTUALLY thought rather than what research
+// predicted — so it must survive compaction. Kept small on purpose: sentiment +
+// wants_return drive the rule, and a short excerpt of the user's own words carries the
+// "why" that the bucketing flattens. The full reply stays in the reservoir.
+function compactFeedback(f) {
+  if (!f || typeof f !== "object") return undefined;
+  const out = {};
+  if (f.sentiment) out.sentiment = f.sentiment;
+  if (f.wants_return === true || f.wants_return === false) out.wants_return = f.wants_return;
+  const said = String(f.reply_text || "").trim();
+  if (said) out.he_said = said.length > 180 ? `${said.slice(0, 177)}...` : said;
+  return Object.keys(out).length ? out : undefined;
+}
+
+function compactReservoir(res) {
+  const pick = (e) => ({
+    name: e.name || e.dish, best_place: e.best_place, why: e.why || e.why_authentic,
+    food_hook: e.food_hook, dish: e.dish, cuisine: e.cuisine,
+    search_query: e.search_query, duration_minutes: e.duration_minutes,
+    dog_ok: e.dog_ok, days: e.days, hours: e.hours, date: e.date, window: e.window,
+    iconic_detour: e.iconic_detour, state: e.state, feedback: compactFeedback(e.feedback),
+  });
+  const b = res.buckets || {};
+  return {
+    area: res.area, label: res.label,
+    must_see: (b.must_see || []).map(pick),
+    optional: (b.optional || []).map(pick),
+    food_specialties: (b.food_specialties || []).map(pick),
+    unique_experiences: (b.unique_experiences || []).map(pick),
+    time_sensitive: (b.time_sensitive || []).map(pick),
+  };
+}
+
+function buildPrompt(req) {
+  const dayLines = req.days.map((d) => {
+    const pet = !TRIP.pet_name ? "" : petAlong(d) ? `${PET_NAME} is ALONG today (only dog_ok places; NEVER a dog_ok=false pick). ` : `${PET_NAME} stays home today. `;
+    const base = d.is_transit
+      ? `- ${d.weekday} ${d.date}: TRANSIT ${d.start_label} → ${d.end_label}. Plan primarily for the destination (${d.city}); the departure point gets at most a quick coffee. ${pet}Anchor area key: ${d.city}.`
+      : `- ${d.weekday} ${d.date}: based in ${d.city} (${d.home_base_label}). ${pet}Anchor area key: ${d.city}.`;
+    // Durable user corrections for this day (from trip-overrides.jsonl). These
+    // are the user's explicit instructions and OVERRIDE the generic selection
+    // rules below — honor every one exactly.
+    const corr = Array.isArray(d.directives) && d.directives.length
+      ? `\n    ⚠ USER CORRECTIONS for ${d.date} — MANDATORY, apply EXACTLY, these OVERRIDE every rule below: ${d.directives.map((x) => `«${x}»`).join(" ")}`
+      : "";
+    return base + corr;
+  }).join("\n");
+
+  const reservoirBlock = Object.entries(req.reservoirs || {})
+    .map(([k, r]) => `### Reservoir for area "${k}" (${r.label})\n${JSON.stringify(compactReservoir(r))}`)
+    .join("\n\n");
+
+  return `You are the DAILY PLANNER for ${TRIP.travellers}${TRIP.trip_context}. For each day below, SELECT and sequence an itinerary drawn ONLY from the pre-vetted reservoir(s) provided — do NOT invent places, and do NOT add anything not in the reservoir. Every place you output must be copied from a reservoir entry (use its exact "search_query").
+
+DAYS TO PLAN:
+${dayLines}
+
+RESERVOIRS (the vetted candidate pool — pick from these):
+${reservoirBlock}
+
+${req.calendar_context ? `FIXED CALENDAR COMMITMENTS (ground truth — size each day to the open time left, don't conflict):\n${req.calendar_context}\n` : ""}
+${req.prior_context ? `PRIOR CONTEXT (yesterday's plan + any chat — carry forward what was wanted-but-missed; do NOT repeat what was already done/loved unless returning for more time):\n${req.prior_context}\n` : ""}
+
+SELECTION RULES (from how they travel):
+- USER CORRECTIONS COME FIRST. Any "⚠ USER CORRECTIONS" noted on a day above are the user's explicit standing instructions — apply each one exactly and let it override any rule below it conflicts with. Never re-introduce something a correction told you to remove, and never drop something a correction told you to keep. This explicitly beats the generic "don't lose the headliner" and "coffee must go in the morning" rules below — if a correction says to skip the market that day, "market" MUST be null even though a market rule exists below; if a correction assigns a specific candidate to a specific role or time-of-day (e.g. "the existing X coffee pick stays with the evening block, add a NEW coffee for the morning"), honor that exact assignment rather than the generic default of putting the one café pick in the morning. If a correction names specific activities to add (e.g. "add a visit to the walled town", "add the harbour in the evening"), you MUST select matching reservoir entries for them — drop an otherwise-preferred convenience pick to make room rather than silently omitting the correction. For a correction naming an evening/after-a-specific-time activity, prefer an evening/sunset-tagged variant of that place if the reservoir has one (e.g. a "unique_experiences" entry with window:"golden-hour" for the same landmark) and place it in the "local_event" slot, not "sights" — local_event is scheduled after sights/lunch/market by the downstream scheduler, so it naturally lands later in the day.
+- STATE + FEEDBACK — what the user has already done, and what they thought of it. Every entry may carry "state" and "feedback" (sentiment: loved|liked|neutral|disliked, wants_return: true|false, he_said: the user's own words). These are the only fields that reflect what ACTUALLY happened rather than what research predicted, so they outrank the generic preferences below. Apply in this order:
+  1. **state "done" → do NOT select it again.** The user has been there. The one exception is state "revisit" (set when the user said they'd go back or wanted more time) — that entry is LIVE again and should be treated as a strong pick, not a repeat.
+  2. **feedback.sentiment "disliked" → never select that entry again, and down-weight SIMILAR entries** (same dish, same kind of place, same texture). One "not worth it" about a museum is a signal about museums, not just that museum.
+  3. **feedback.sentiment "loved" → actively prefer entries LIKE it.** Read "he_said" for the reason and generalize it: loved the oysters where the boats land → prefer other provenance-at-source food picks; loved a quiet fishing port → prefer ports over monuments. This is the single best steer you have; use it over the generic "coastal towns / old quarters" defaults when the two disagree.
+  4. **Absence of feedback is NOT negative.** Asking is rate-limited to roughly one question per 12h, so the vast majority of entries will never carry it. An unreviewed entry competes normally on its own merits — do not treat "no feedback" as lukewarm.
+  5. Never contradict the user's words. If "he_said" conflicts with an entry's research "why", THE USER is right and the "why" is stale.
+- FOOD LEADS. Lunch each day = a reservoir "food_specialties" best_place (regional cuisine, where locals eat) — rotate the dish across days so they cover the local canon (one signature dish one day, another the next). Set "cuisine" and a second-person "why_authentic".
+- Packed but elastic: give 1-3 "sights" per day drawn from must_see + optional, weighting must_see first but favoring coastal towns / old quarters / ports / markets. VARIETY across the 3 days — never repeat a place, don't do three of the same texture in a row.
+- DON'T LOSE THE HEADLINER — MANDATORY, not a preference: across a multi-day stay in one area, the reservoir's single most iconic/singular must_see entry (the one whose "why" reads like "the one truly unmissable sight in range" — a UNESCO site or similarly bucket-list landmark) MUST appear on ONE of the days, even if it's farther away or takes longer than the closer everyday coastal stops, and even if that means it's the ONLY sight that day. Before returning your JSON, check your own output against this reservoir's must_see list and confirm that entry is present somewhere in the window — if it isn't, replace a convenience pick with it now. Don't let it keep losing out to convenience picks across the whole window — the days are a package, not independent draws.
+- "coffee" — MANDATORY on EVERY day when a candidate exists, not optional: the morning coffee is a DAILY ritual, not a one-time attraction. If the reservoir (any bucket) contains a genuine café/coffee-type entry (its name or why mentions café/coffee/roaster/patisserie-with-seating), you MUST give EVERY day in that area a "coffee" pick near that day's morning start point — do not skip it just because its own reservoir text describes an evening/other use; repurpose it as a morning stop. Unlike sights and lunch, coffee is EXEMPT from the no-repeat rule: if the reservoir has only one café-type entry, use that SAME café every day (a repeated morning café is exactly right, not a duplicate to strip); if it has several, rotate them across the days for variety. A real second-person "why", carried "duration_minutes" (default 25 if absent), "is_public_space":true (a café-sitting stop doesn't need confirmed hours the way a ticketed sight does). "coffee" is null ONLY on a day whose area has no café-type entry anywhere in its reservoir — do not invent one.
+- NO DUPLICATE EXPERIENCE within a day: never select two picks that are the same experience or the same dish/place across the sights/market/local_event/lunch slots (e.g. an "oyster market" sight AND an "oysters on the seawall" local_event in the same town — that's one experience, pick ONE and use the freed slot for something different). One oyster stop, one crêpe stop, etc.
+- SEQUENCE each day geographically to minimize driving: order the day's stops (sights, then market/local_event) so they run along a sensible route from the day's start toward that night's lodging, clustering everything in the same town together. Do NOT ping-pong between distant towns (e.g. town A → town B → back to town A) — group the town B stops, then the town A stops, in one pass. The output array ORDER is the visit order the scheduler uses.
+- "market": ONLY include a reservoir time_sensitive entry whose "days" array includes THIS day's weekday (a market that actually runs that day). Otherwise null. Pass through its "hours".
+- "local_event": a time_sensitive one-off whose "date" equals this day's date, OR a fitting unique_experience (e.g. a sunset spot / tidal walk) — else null.
+- Voice: every "why"/"why_authentic" in DIRECT SECOND PERSON ("you'll love…"). Never third person.
+- DOG-FRIENDLY per pick: set "dog_ok" true/false on EVERY item (sights, market, local_event, lunch). Copy the reservoir entry's "dog_ok" when it has one; otherwise judge it — dogs are welcome at open-air markets, plazas, parks, beaches, coastline, viewpoints, most outdoor terraces and, where the custom allows, café/bistro dining rooms → true; NOT at church/cathedral interiors, museums, aquariums, most ticketed indoor sites → false. CRITICAL: an outdoor place can still BAN dogs — if the entry's own text mentions ANY dog restriction (dogs banned/not allowed/no dogs, seasonal beach ban, nature-reserve leash-only or ban), set dog_ok=false even though it's outdoors. An explicit ban always beats "it's outside". This lets the travellers decide per stop whether to bring ${PET_NAME} or leave the pet home — so be accurate, not optimistic.
+
+For each pick, carry its "duration_minutes" from the reservoir (or a sensible default). Also set "is_public_space" (true for open plazas/beaches/parks/coastline/viewpoints/market streets; false for a ticketed site, church interior, restaurant) and "open_hours" ({"opens":"HH:MM","closes":"HH:MM"} 24h local time for a non-public-space when the reservoir gives hours, else null).
+
+Return ONLY strict JSON, no prose, matching exactly:
+{"days":[{"date":"YYYY-MM-DD","sights":[{"name":"","why":"","search_query":"","duration_minutes":90,"is_public_space":true,"open_hours":null,"dog_ok":true}],"market":{"name":"","why":"","search_query":"","duration_minutes":45,"is_public_space":true,"open_hours":null,"dog_ok":true}|null,"local_event":{"name":"","why":"","search_query":"","duration_minutes":60,"is_public_space":true,"open_hours":null,"dog_ok":true}|null,"lunch":{"name":"","cuisine":"","why_authentic":"","search_query":"","duration_minutes":75,"is_public_space":false,"open_hours":null,"dog_ok":true},"coffee":{"name":"","why":"","search_query":"","duration_minutes":25,"is_public_space":true,"open_hours":null,"dog_ok":true}|null}]}`;
+}
+
+// Backstop for the dog-ban rule: an explicit dog restriction in a pick's own
+// text forces dog_ok=false even if the LLM (or the reservoir) marked it true
+// because the place is outdoors. English + French phrasings (reservoir cites
+// French sources). Applied to BOTH the Sonnet output and the deterministic
+// path so the emitted data — not just the render — is correct.
+const DOG_BAN_RE = /\bdogs?\s+(?:are\s+)?(?:not\s+allowed|banned|prohibited|forbidden|excluded)\b|\bno\s+dogs?\b|\bno\s+pets\b|\bchiens?\s+(?:interdits?|non\s+admis)\b|\bpas\s+de\s+chiens\b/i;
+function applyDogBans(result) {
+  for (const day of result?.days || []) {
+    for (const item of [...(day.sights || []), day.market, day.local_event, day.lunch, day.coffee]) {
+      if (!item) continue;
+      const text = `${item.why || ""} ${item.why_authentic || ""} ${item.food_hook || ""} ${item.name || ""}`;
+      if (DOG_BAN_RE.test(text)) item.dog_ok = false;
+    }
+  }
+  return result;
+}
+
+// Same-experience dedup within a day: the Sonnet path sometimes selects two
+// picks that are the SAME food ritual in one day (2026-07-10: an "oyster market"
+// sight AND an "oysters on the seawall" local_event in one town — you
+// eat oysters once). The signal is a shared FOOD signature in the NAMES,
+// canonicalized across languages (huîtres↔oyster, galette↔crêpe) since the
+// reservoir mixes French + English. Sights rank highest, so a later slot's
+// pick loses to an earlier one with the same signature; lunch is exempt (it IS
+// the day's food slot). Matched on names only — a why-text that merely mentions
+// "pair the walk with the oysters below" must not collapse a headland walk.
+const FOOD_CANON = [
+  [/\b(oysters?|hu[iî]tres?)\b/i, "oyster"],
+  [/\b(cr[eê]pes?|galettes?)\b/i, "crepe"],
+  [/\b(cider|cidre)\b/i, "cider"],
+  [/\b(moules|mussels)\b/i, "mussels"],
+  [/\b(cheese|fromage)\b/i, "cheese"],
+  [/\b(wine|vin|vineyard|vignoble)\b/i, "wine"],
+];
+function foodSignature(name) {
+  for (const [re, tag] of FOOD_CANON) if (re.test(name || "")) return tag;
+  return null;
+}
+function dedupeExperiences(result) {
+  for (const day of result?.days || []) {
+    const seen = new Set();
+    day.sights = (day.sights || []).filter((s) => {
+      const sig = foodSignature(s.name);
+      if (sig && seen.has(sig)) return false;
+      if (sig) seen.add(sig);
+      return true;
+    });
+    for (const slot of ["local_event", "market"]) {
+      const item = day[slot];
+      if (!item) continue;
+      const sig = foodSignature(item.name);
+      if (sig && seen.has(sig)) day[slot] = null;
+      else if (sig) seen.add(sig);
+    }
+  }
+  return result;
+}
+
+function abbr3(weekday) { return String(weekday || "").slice(0, 3); }
+// No \b around caf[eé] deliberately — JS regex \b treats accented "é" as a
+// non-word character, so \bcafé\b silently fails to match "café" whenever
+// it's followed by anything other than another ASCII word character (a
+// space, hyphen, or comma — i.e. almost every real occurrence, including
+// "Café-sitting at Place Chateaubriand" which is exactly the entry this
+// regex needs to find). Found live 2026-07-10 chasing the coffee-selection
+// bug — this pre-existing bug was silently defeating deterministicSelect's
+// coffee lookup too, not just the new ensureHeadlinerAndCoffee below.
+const COFFEE_RE = /(caf[eé]|coffee|roaster|patisserie)/i;
+
+// The model reliably lost track of two "hold this steady across the whole
+// window" picks despite explicit prompt rules for both (2026-07-10, the
+// missing morning coffee was reported as a bug).
+// Investigating turned up: (1) the area's headline landmark sat in its
+// must_see bucket the whole time but kept losing out to closer convenience
+// picks across all 3 days — a soft "don't lose the headliner" instruction
+// buried in a long rule list doesn't reliably survive holistic, cross-day
+// reasoning, even after that exact rule was added; (2) the reservoir's only
+// café-type entry never got selected for the coffee slot at all, and even if
+// it had been, the then-downstream france-itinerary-run dropped any
+// non-public-space pick with no confirmed open_hours — which a café-sitting
+// reservoir entry never has, since hours weren't part of what Phase 1
+// researched for it. (That consumer is retired as of 2026-07-22; the
+// is_public_space forcing below is kept because it's independently right — a
+// café stop shouldn't need confirmed hours the way a ticketed sight does.)
+// Prompt tuning alone already failed once; this makes
+// both guarantees deterministic instead, the same pattern applyDogBans/
+// dedupeExperiences above already use for other hard rules.
+const HEADLINER_RE = /\bunesco\b|\bthe one truly\b|\bunmissable\b|\bbucket-list\b/i;
+function findHeadliner(reservoir) {
+  // Same state gate as deterministicSelect — force-injecting a headliner the user has
+  // already seen is the loudest possible version of the bug, since it OVERWRITES
+  // the day's sights rather than merely padding them.
+  return (reservoir?.buckets?.must_see || []).find((e) => e?.name && isSelectable(e) && HEADLINER_RE.test(e.why || "")) || null;
+}
+function findCoffeeEntries(reservoir) {
+  const pool = [
+    ...(reservoir?.buckets?.optional || []),
+    ...(reservoir?.buckets?.must_see || []),
+    ...(reservoir?.buckets?.unique_experiences || []),
+  ];
+  // Name only, not "why" — a neighborhood/sight entry's "why" text can
+  // casually mention "café-sitting" as part of its vibe (e.g. an old
+  // quarter: "built for aimless wandering and café-sitting")
+  // without itself being a café. Matching "why" too turns that into a false
+  // positive now that COFFEE_RE's boundary bug (above) is fixed and it
+  // actually matches things.
+  return pool.filter((e) => e?.name && isSelectable(e) && COFFEE_RE.test(e.name));
+}
+function headlinerSightPick(e) {
+  // Unlike coffee, a headliner landmark's real hours genuinely matter for
+  // scheduling (arriving after last entry is a real failure, not a
+  // low-stakes miss) — pass through confirmed open_hours from the reservoir
+  // when Phase 1 recorded them; only fall back to unconstrained if it truly
+  // has none, same as any other pick.
+  const openHours = e.open_hours?.opens && e.open_hours?.closes ? e.open_hours : null;
+  return { name: e.name, why: e.why, search_query: e.search_query, duration_minutes: e.duration_minutes || 240, is_public_space: false, open_hours: openHours, dog_ok: e.dog_ok !== false };
+}
+// is_public_space:true here is deliberate, not literal — see the comment
+// above findHeadliner. A café-sitting stop is low-stakes enough that
+// requiring confirmed hours (the strict rule real ticketed sights need) just
+// gets it silently dropped downstream for having none.
+function coffeeSlotPick(e) {
+  return { name: e.name, why: "A slower start before today's plan — worth the stop.", search_query: e.search_query, duration_minutes: e.duration_minutes || 25, is_public_space: true, open_hours: null, dog_ok: e.dog_ok !== false };
+}
+
+// Guarantees, per reservoir area covered by this window: the area's
+// headliner (if it has one) lands on at least one day, and its coffee entry
+// (if it has one) lands on at least one day — regardless of what the model
+// (or the deterministic fallback below) actually picked. Also normalizes
+// is_public_space on ANY already-selected coffee pick (model or forced) so a
+// coffee the model DID choose correctly doesn't fall into the same
+// hours-drop trap.
+function ensureHeadlinerAndCoffee(result, req) {
+  const daysByArea = {};
+  for (const d of req.days || []) (daysByArea[d.city] ||= []).push(d);
+  const outByDate = {};
+  for (const od of result.days || []) outByDate[od.date] = od;
+  for (const od of result.days || []) {
+    if (od.coffee) od.coffee.is_public_space = true;
+  }
+
+  for (const [area, reservoir] of Object.entries(req.reservoirs || {})) {
+    const areaDays = (daysByArea[area] || []).filter((d) => outByDate[d.date]);
+    if (!areaDays.length) continue;
+
+    const headliner = findHeadliner(reservoir);
+    if (headliner) {
+      const already = areaDays.some((d) => (outByDate[d.date].sights || []).some((s) => s.name === headliner.name));
+      if (!already) {
+        // Never force the headliner onto a day carrying explicit user
+        // corrections — those are MANDATORY and override every generic
+        // selection rule below them, including this one. A day with active
+        // directives has already told the selector exactly what belongs in
+        // it; silently overwriting its sights with the headliner (as
+        // happened 2026-07-11: the headline landmark got force-injected onto the
+        // one day that had four separate corrections asking for two other
+        // towns instead) defeats the "corrections
+        // override everything" guarantee. If every candidate day has
+        // directives, skip forcing entirely rather than pick the
+        // least-bad one — respecting the correction fully beats catching
+        // the headliner this window.
+        const undirectedDays = areaDays.filter((d) => !(Array.isArray(d.directives) && d.directives.length));
+        const pool = undirectedDays.length ? undirectedDays : [];
+        const target =
+          pool.find((d) => !d.is_transit && !petAlong(d)) ||
+          pool.find((d) => !d.is_transit) ||
+          pool.find((d) => !petAlong(d)) ||
+          pool[0];
+        // Anchors the whole day rather than competing with convenience picks
+        // for time it won't win, per the SELECTION RULES headliner note.
+        if (target) outByDate[target.date].sights = [headlinerSightPick(headliner)];
+      }
+    }
+
+    // Coffee is a DAILY ritual, not a one-time attraction — every day in the
+    // area gets a morning coffee, not just one (found 2026-07-23: multi-day
+    // stays came back with coffee on a single day because the old guarantee
+    // was merely "lands on at least one day" and backfilled only the first
+    // empty day). Backfill every coffee-less day, rotating across café
+    // candidates for variety when the reservoir has several and reusing the
+    // same café when it has only one — a repeated morning café is right, not
+    // a duplicate to strip.
+    const cafes = findCoffeeEntries(reservoir);
+    if (cafes.length) {
+      let rot = 0;
+      for (const d of areaDays) {
+        const od = outByDate[d.date];
+        if (od.coffee) continue; // model/deterministic pick already filled it
+        od.coffee = coffeeSlotPick(cafes[rot % cafes.length]);
+        rot++;
+      }
+    }
+  }
+  return result;
+}
+
+// The state gate — the ONE selection rule that must hold on both paths.
+// The LLM path gets "state 'done' → do NOT select it again" from the prompt,
+// but the deterministic path below had no state check at all, so whenever the
+// Sonnet call was unavailable it happily re-proposed places already visited
+// and entries the dedup pass had retired (found 2026-07-22: a fallback plan
+// led with three places all already struck `done`). A resilience path that recommends yesterday is
+// worse than useless — this is exactly the filtering the reservoir exists for.
+// `revisit` is deliberately selectable: it means the user said they'd go back.
+function isSelectable(e) {
+  const state = e?.state || "open";
+  return state !== "done" && state !== "duplicate";
+}
+
+// Deterministic, NO-LLM selection from the reservoir — the resilience path.
+// Used when the Sonnet call is unavailable (e.g. Max limit exhausted) so a
+// plan can still be produced from vetted reservoir data. Reuses each entry's
+// existing verified `why` text (no generation needed). Lower-curation than the
+// LLM path (simple ordering, no cross-day cleverness) but correct and offline.
+function deterministicSelect(req) {
+  const usedSight = new Set(), usedFood = new Set(), usedEvent = new Set(), usedCoffee = new Set();
+  const days = req.days.map((day) => {
+    const out = { date: day.date, sights: [], market: null, local_event: null, lunch: null, coffee: null };
+    const res = (req.reservoirs || {})[day.city];
+    if (!res) return out; // no reservoir for this day's anchor — caller/downstream handles the gap
+    const b = res.buckets || {};
+    const withPet = petAlong(day);
+    // sights: must_see first, then optional; skip already-used (variety) and
+    // dog-unfriendly picks when the pet is along.
+    const pool = [...(b.must_see || []), ...(b.optional || [])]
+      .filter((e) => e && e.name && isSelectable(e) && !usedSight.has(e.name) && (!withPet || e.dog_ok !== false));
+    // dog_ok: use the entry's explicit flag when present, else a type-based
+    // default (outdoor markets/experiences and café dining = welcome).
+    const dogOk = (e, fallback) => (typeof e.dog_ok === "boolean" ? e.dog_ok : fallback);
+    for (const e of pool.slice(0, day.is_transit ? 2 : 3)) {
+      usedSight.add(e.name);
+      out.sights.push({ name: e.name, why: e.why, search_query: e.search_query, duration_minutes: e.duration_minutes || 60, dog_ok: dogOk(e, true) });
+    }
+    // market: a recurring time_sensitive entry that runs on THIS weekday.
+    const wd = abbr3(day.weekday);
+    const market = (b.time_sensitive || []).find((e) => isSelectable(e) && Array.isArray(e.days) && e.days.map((x) => abbr3(x)).includes(wd));
+    if (market) out.market = { name: market.name, why: market.why, search_query: market.search_query, duration_minutes: market.duration_minutes || 45, dog_ok: dogOk(market, true) };
+    // local_event: a dated one-off matching today, else a fresh unique experience.
+    const dated = (b.time_sensitive || []).find((e) => isSelectable(e) && e.date === day.date);
+    const uniq = (b.unique_experiences || []).find((e) => e && e.name && isSelectable(e) && !usedEvent.has(e.name));
+    const ev = dated || uniq;
+    if (ev) { usedEvent.add(ev.name); out.local_event = { name: ev.name, why: ev.why, search_query: ev.search_query || "", duration_minutes: ev.duration_minutes || 60, dog_ok: dogOk(ev, true) }; }
+    // lunch: a food-specialty best_place, rotated across days for canon coverage.
+    const food = (b.food_specialties || []).find((e) => e && e.best_place && isSelectable(e) && !usedFood.has(e.best_place));
+    if (food) { usedFood.add(food.best_place); out.lunch = { name: food.best_place, cuisine: food.dish || "regional French", why_authentic: food.why, search_query: food.search_query, duration_minutes: 75, dog_ok: dogOk(food, true) }; }
+    // coffee: the morning ritual — EVERY day gets one when the reservoir has
+    // any café-type entry. Prefer a café not yet used this window for variety,
+    // but FALL BACK to reusing one when none is fresh — otherwise a stay in an
+    // area with a single café got coffee on day 1 only (found 2026-07-23).
+    // Name only, not "why" — see the matching comment on findCoffeeEntries.
+    const allEntries = [...(b.must_see || []), ...(b.optional || []), ...(b.unique_experiences || [])];
+    const cafes = allEntries.filter((e) => e && e.name && isSelectable(e) && COFFEE_RE.test(e.name));
+    const cafe = cafes.find((e) => !usedCoffee.has(e.name)) || cafes[0] || null;
+    if (cafe) { usedCoffee.add(cafe.name); out.coffee = { name: cafe.name, why: cafe.why, search_query: cafe.search_query, duration_minutes: cafe.duration_minutes || 25, dog_ok: dogOk(cafe, true) }; }
+    return out;
+  });
+  return { days };
+}
+
+async function main() {
+  const stdin = await readStdin();
+  let req;
+  try { req = JSON.parse(stdin); }
+  catch (e) { console.error(`trip-day-select: invalid request JSON: ${e.message}`); process.exit(1); }
+  if (!req.days?.length) { console.error("trip-day-select: request needs a non-empty days[]"); process.exit(1); }
+  if (!req.reservoirs || !Object.keys(req.reservoirs).length) {
+    console.error("trip-day-select: no reservoirs provided — build one first with trip-reservoir-build --area <key>");
+    process.exit(3); // distinct code so a caller can branch on "no reservoir"
+  }
+
+  const prompt = buildPrompt(req);
+  const escaped = prompt.replace(/"/g, '\\"').replace(/\n/g, "\\n");
+
+  // Preferred path: Sonnet curation (best quality when Max is available).
+  let lastErr = null;
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    let out;
+    try {
+      out = execFileSync("/bin/bash", ["-c",
+        `${CLAUDE_BIN} -p --model claude-sonnet-5-5 --effort medium --output-format text "${escaped}"`],
+        { encoding: "utf8", maxBuffer: 10 * 1024 * 1024, timeout: 300000 });
+    } catch (e) { lastErr = e; continue; }
+    const parsed = extractJson(out);
+    if (parsed && Array.isArray(parsed.days)) {
+      process.stdout.write(JSON.stringify(ensureHeadlinerAndCoffee(dedupeExperiences(applyDogBans(parsed)), req)));
+      return;
+    }
+    lastErr = new Error(`could not parse JSON from selection output (attempt ${attempt}): ${out.slice(0, 400)}`);
+  }
+
+  // Resilience path: Max/LLM unavailable — deterministic selection from the
+  // reservoir so the plan still generates offline (no generation, only picks).
+  const det = ensureHeadlinerAndCoffee(dedupeExperiences(applyDogBans(deterministicSelect(req))), req);
+  if (det.days.some((d) => d.sights.length || d.market || d.lunch || d.local_event)) {
+    console.error(`trip-day-select: LLM unavailable (${lastErr?.message || "?"}) — using deterministic reservoir selection.`);
+    process.stdout.write(JSON.stringify(det));
+    return;
+  }
+  console.error(`trip-day-select: failed — LLM unavailable and no deterministic picks: ${lastErr?.message || "unknown"}`);
+  process.exit(1);
+}
+
+main();

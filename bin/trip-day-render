@@ -1,0 +1,474 @@
+#!/usr/bin/env node
+"use strict";
+// trip-day-render — turn an LLM-authored day plan into the real artefacts:
+// resolved places, verified photos, calendar events, and an email manifest.
+//
+// WHY THIS EXISTS. The division of labour on a trip day is:
+//
+//   the model  decides WHICH places, and writes why we're going, what to order,
+//              the timings, the pet call — judgement and prose
+//   this tool  resolves each place, fetches its photo, writes the calendar,
+//              and emits the manifest — mechanical, identical every time
+//
+// The requirement: enumerating places and their photos is deterministic, not
+// left to the LLM. The LLM chooses the places and fills in the info on each
+// one; placing them on the calendar and fetching photos is code.
+//
+// That came straight out of doing it by hand, where every failure was a step
+// improvised differently for different stops:
+//   · the photo step ran its OWN Places text search instead of using the entry
+//     the itinerary had already verified and linked, so a town's steel
+//     transporter bridge shipped a picture of a famous medieval stone bridge
+//   · --photo-name was passed for the two restaurants and forgotten for the two
+//     markets, purely because it was typed each time
+//   · two stops silently ended up with no photo at all
+// None of those are judgement calls. They are the same four steps per stop, so
+// they belong in a script.
+//
+// THE INVARIANT: every stop is resolved EXACTLY ONCE, and its address, hours,
+// map link and photo all come from that one resolution. A photo is never
+// sourced from an independent search — that is the whole bug class this closes.
+//
+// Input (stdin or --plan <file>):
+//   { date, area, tz, title, <pet_key>, <pet_key>_reason,   (pet_key: trip-planning.json, default "pet")
+//     stops: [ { id, start, end, emoji, title, query, lat, lon,
+//                background, order?, droppable?, photo_index?, no_photo? } ] }
+//
+// Usage:
+//   trip-day-render --plan day.json [--dry-run] [--no-calendar] [--no-photos]
+//                    [--adopt] [--no-pick]   # --no-pick = skip the Sonnet photo review
+//   trip-day-render --plan day.json --json > manifest.json
+//
+// Calendar writes are IDEMPOTENT: each description carries a hidden marker
+// [jori:trip:<date>:<stop id>], and a re-run matches on it and patches
+// rather than duplicating. gog exposes no custom event id and no extended
+// properties, so the marker is the available handle.
+//
+// Exit 0 on success (check `warnings[]`), 2 on bad usage, 1 on a hard failure.
+
+const fs = require("node:fs");
+const path = require("node:path");
+const { execFileSync } = require("node:child_process");
+// gog reads its keyring password from GOG_KEYRING_PASSWORD and has no TTY here,
+// so without .env every calendar call fails with "no TTY available for
+// keyring file backend password prompt". Load it the same way email-send does.
+const { loadEnv } = require(path.join(__dirname, "..", "lib", "load-env.js"));
+loadEnv();
+// Fail fast and legibly. Without this the budget stop still lands, but as a
+// per-stop "resolution failed" from the trip-place-verify subprocess, which
+// reads like Google was down rather than like we pulled our own plug.
+const { assertPlacesAllowed } = require(path.join(__dirname, "..", "lib", "places-guard.js"));
+const { placePhotoBytes, placeIdFromRef } = require(path.join(__dirname, "..", "lib", "place-photo-store.js"));
+assertPlacesAllowed("trip-day-render");
+
+const BIN = __dirname;
+const VERIFY = path.join(BIN, "trip-place-verify");
+const PHOTO = path.join(BIN, "trip-place-photo");
+const { instance, localConfig, supabaseUrl } = require(path.join(__dirname, "..", "lib", "instance.cjs"));
+// The calendar the day is written to: the owner's account.
+const ACCOUNT = instance().owner_email;
+// The travelling pet, if any: the plan carries `<pet_key>` (with / home) and
+// `<pet_key>_reason`; pet_name labels it. No pet configured: key "pet".
+const PET = localConfig("trip-planning", { pet_name: "", pet_key: "pet" });
+
+const argv = process.argv.slice(2);
+const has = (f) => argv.includes(f);
+const arg = (f) => { const i = argv.indexOf(f); return i >= 0 ? argv[i + 1] : null; };
+const DRY = has("--dry-run");
+// No owner account configured: there is no calendar to write to.
+const NO_CAL = has("--no-calendar") || !ACCOUNT;
+const NO_PHOTOS = has("--no-photos");
+const JSON_OUT = has("--json");
+const ADOPT = has("--adopt");
+const NO_PICK = has("--no-pick");
+
+const warnings = [];
+const warn = (m) => { warnings.push(m); if (!JSON_OUT) process.stderr.write(`! ${m}\n`); };
+const say = (m) => { if (!JSON_OUT) process.stdout.write(`${m}\n`); };
+
+function run(bin, args) {
+  try {
+    return execFileSync(bin, args, { encoding: "utf8", maxBuffer: 32 * 1024 * 1024, stdio: ["ignore", "pipe", "pipe"] });
+  } catch (e) {
+    return null;
+  }
+}
+
+// ---------------------------------------------------------------- persist
+//
+// The plan is the source of truth — which places, the background prose, the
+// order, the pet call, the chosen photo_index. Nothing else stored it: the
+// calendar events and re-hosted photos are only a LOSSY projection (they drop
+// query/lat/lon, the droppable flags, and why a given photo_index won). So a
+// day rendered in one session was unrecoverable in the next — the email had to
+// reconstruct it from the calendar + storage and re-eyeball every photo.
+//
+// This keeps the whole manifest — the plan PLUS every resolution, photo url and
+// calendar ref — in one durable row, so a re-render, the email, or the wiki all
+// read one source of truth. Upsert keyed on (date, area), idempotent like the
+// calendar. Storage stays the home of the image bytes; the DB holds the plan.
+const SUPA_URL = process.env.JORI_SUPABASE_URL || process.env.SUPABASE_URL || supabaseUrl();
+async function persist(manifest) {
+  const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
+  if (!key) { warn("manifest not persisted — SUPABASE_SERVICE_ROLE_KEY not set"); return; }
+  const row = {
+    date: manifest.date,
+    area: manifest.area || "",
+    tz: manifest.tz || null,
+    title: manifest.title || null,
+    manifest,
+    rendered_at: manifest.rendered_at,
+  };
+  try {
+    const res = await fetch(`${SUPA_URL}/rest/v1/trip_day_plans?on_conflict=date,area`, {
+      method: "POST",
+      headers: {
+        apikey: key,
+        Authorization: `Bearer ${key}`,
+        "Content-Type": "application/json",
+        Prefer: "resolution=merge-duplicates,return=minimal",
+      },
+      body: JSON.stringify(row),
+    });
+    if (!res.ok) { warn(`manifest not persisted — Supabase ${res.status}: ${(await res.text()).slice(0, 200)}`); return; }
+    say(`\npersisted plan → trip_day_plans (${row.date}${row.area ? " / " + row.area : ""})`);
+  } catch (e) {
+    warn(`manifest not persisted — ${e.message}`);
+  }
+}
+
+// ---------------------------------------------------------------- resolve
+
+// One Places resolution per stop. Everything downstream keys off this object,
+// which is what guarantees the photo depicts the place we linked and addressed.
+function resolve(stop, date) {
+  if (!stop.query || stop.lat == null || stop.lon == null) return null;
+  const out = run(VERIFY, [stop.query, String(stop.lat), String(stop.lon), "--on", date]);
+  if (!out) { warn(`${stop.id}: could not resolve "${stop.query}"`); return null; }
+  try { return JSON.parse(out); } catch { warn(`${stop.id}: unparseable verify output`); return null; }
+}
+
+// ---------------------------------------------------------- photo choice
+//
+// Photos matter and there are few emails, so a model (Sonnet) reviews the
+// candidates and chooses the best one.
+//
+// Which photo is BEST is the one part of this pipeline that isn't mechanical.
+// Google's photos[0] is just whatever a punter uploaded first: for one town's
+// market hall it's the café next door, and elsewhere it's a menu board, a car
+// park, or a blurry plate. A vision model looking at the actual candidates is
+// the right tool, and at a few emails a day the cost is noise.
+//
+// Only the WINNER is re-hosted. Candidates are fetched to a temp dir straight
+// from the Places media endpoint and thrown away, so this costs one upload, not
+// ten.
+const CLAUDE_BIN = process.env.CLAUDE_BIN || `${process.env.HOME}/.local/bin/claude`;
+const MAX_CANDIDATES = 6;
+
+// Candidates come through the store (place-photo-store.js): each slot of a
+// place is fetched from Google once, ever, and a re-render of the same day —
+// or the same restaurant on another day — reads our own copies. Before
+// 2026-09-10 every render pulled all six from Google again.
+async function fetchCandidates(placeId, names, dir) {
+  fs.mkdirSync(dir, { recursive: true });
+  const files = [];
+  for (let i = 0; i < Math.min(names.length, MAX_CANDIDATES); i++) {
+    const f = path.join(dir, `cand-${i}.jpg`);
+    try {
+      const got = await placePhotoBytes(placeId || placeIdFromRef(names[i]), i, names[i], { tool: "trip-day-render" });
+      if (!got) continue;
+      fs.writeFileSync(f, got.buf);
+      if (got.buf.length > 4096) files.push({ index: i, file: f });
+    } catch { /* a candidate that won't fetch simply isn't a candidate */ }
+  }
+  return files;
+}
+
+function pickPhoto(stop, place, files) {
+  if (files.length < 2) return files[0]?.index ?? 0;
+  const subject = `${place.name}${place.kind ? ` (${place.kind})` : ""}${place.address ? `, ${place.address}` : ""}`;
+  const list = files.map((f) => `  index ${f.index}: ${f.file}`).join("\n");
+  const prompt = [
+    `Read each of these images and pick the single best one to head a section of a travel-plan email.`,
+    ``,
+    `The subject is: ${subject}`,
+    `The section is titled: "${stop.title}"`,
+    ``,
+    list,
+    ``,
+    `Judge in this order:`,
+    `1. DEPICTS THE SUBJECT. Reject anything that is clearly a different place, a neighbouring`,
+    `   shopfront, a menu board, a poster, a screenshot, a receipt, or a close-up of one plate`,
+    `   of food when the subject is a building or a market.`,
+    `2. CONVEYS what the place is like to arrive at — interior or exterior showing character.`,
+    `3. Decent light and composition. Prefer daylight and a clear subject; avoid dark, blurry,`,
+    `   heavily filtered or cluttered shots.`,
+    ``,
+    `If NONE of them depict the subject, say so with "index": -1.`,
+    `Reply with ONLY a JSON object, no prose: {"index": <number>, "why": "<max 15 words>"}`,
+  ].join("\n");
+
+  const escaped = prompt.replace(/"/g, '\\"').replace(/\n/g, "\\n");
+  let out;
+  try {
+    out = execFileSync("/bin/bash", ["-c",
+      `${CLAUDE_BIN} -p --model claude-sonnet-5-5 --effort low --output-format text "${escaped}"`],
+      { encoding: "utf8", maxBuffer: 4 * 1024 * 1024, timeout: 180000 });
+  } catch (e) {
+    // Most common cause by far: the Claude CLI reads its Max token from the
+    // login keychain, which is NOT unlocked in a plain ssh session — it fails
+    // with "Not logged in · Please run /login". Run from the mini's own
+    // scheduled context (cron/launchd), the same way trip-day-select does, or
+    // accept Google's first photo. Never abort the day over a photo.
+    const first = String(e.stderr || e.message || "").split("\n").find((l) => l.trim()) || "unknown";
+    warn(`${stop.id}: photo review unavailable (${first.slice(0, 120)}) — using Google's first, unreviewed`);
+    return files[0].index;
+  }
+  const m = out.match(/\{[\s\S]*?\}/);
+  if (!m) { warn(`${stop.id}: photo review returned no JSON — using Google's first`); return files[0].index; }
+  let j;
+  try { j = JSON.parse(m[0]); } catch { warn(`${stop.id}: unparseable photo review — using Google's first`); return files[0].index; }
+  if (j.index === -1) {
+    warn(`${stop.id}: reviewer says none of ${files.length} photos depict "${place.name}" — shipping without one`);
+    return -1;
+  }
+  if (!files.some((f) => f.index === j.index)) {
+    warn(`${stop.id}: photo review chose index ${j.index}, which wasn't a candidate — using Google's first`);
+    return files[0].index;
+  }
+  say(`  ${stop.id}: photo ${j.index} — ${j.why || "chosen by review"}`);
+  return j.index;
+}
+
+// ---------------------------------------------------------------- photo
+
+// Re-host EXACTLY the resolved place's photo. `photo_index` selects an
+// alternate when Google's first upload is of something else (see the Châtelaillon
+// market-hall case in trip-place-verify). Never falls back to a fresh search.
+async function photo(stop, place, date) {
+  if (NO_PHOTOS || stop.no_photo) return null;
+  const names = place?.photoNames?.length ? place.photoNames : (place?.photoName ? [place.photoName] : []);
+  if (!names.length) { warn(`${stop.id}: Places has no photo for "${place?.name || stop.query}" — shipping without one`); return null; }
+  // An explicit photo_index in the plan is a human decision and always wins.
+  // Otherwise let the reviewer look at the candidates, unless --no-pick.
+  let idx;
+  if (Number.isInteger(stop.photo_index)) {
+    idx = stop.photo_index;
+  } else if (NO_PICK || names.length < 2) {
+    idx = 0;
+  } else {
+    const dir = fs.mkdtempSync(path.join(require("node:os").tmpdir(), `tdr-${stop.id}-`));
+    try {
+      const files = await fetchCandidates(place?.placeId, names, dir);
+      // Never fall through to "keep index 0" without saying so — that silence
+      // is exactly what hid the missing -L for a whole run.
+      if (!files.length) { warn(`${stop.id}: could not fetch any of ${names.length} candidates — using Google's first, unreviewed`); }
+      idx = files.length ? pickPhoto(stop, place, files) : 0;
+    } finally {
+      try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* temp dir */ }
+    }
+    if (idx === -1) return null;
+  }
+  if (idx >= names.length) { warn(`${stop.id}: photo_index ${idx} out of range (${names.length} available)`); return null; }
+  // Slug MUST carry the date. Stop ids repeat across days by design ("lunch"
+  // every day), so a date-less slug makes day two silently overwrite day one's
+  // photo in the shared bucket — observed live: Friday's oyster cabane replaced
+  // Thursday's bistro at france-itinerary/lunch-0.jpg, and Thursday's calendar
+  // and email were left pointing at the wrong restaurant.
+  const slug = `${date}-${stop.id}-${String(idx)}`;
+  const out = run(PHOTO, [stop.query, String(stop.lat), String(stop.lon), slug, "--photo-name", names[idx],
+    ...(place?.placeId ? ["--place-id", place.placeId] : []), "--slot", String(idx)]);
+  if (!out) { warn(`${stop.id}: photo fetch failed — shipping without one`); return null; }
+  try {
+    const j = JSON.parse(out.trim().split("\n").pop());
+    return { url: j.url, source: j.source, index: idx, available: names.length, hash: j.hash };
+  } catch { warn(`${stop.id}: unparseable photo output`); return null; }
+}
+
+// ---------------------------------------------------------------- calendar
+
+const marker = (date, id) => `[jori:trip:${date}:${id}]`;
+
+function hoursLine(place) {
+  const on = place?.on;
+  if (!on) return null;
+  if (!on.open) return `${on.weekday}: CLOSED per Google`;
+  const iv = (on.intervals || [])
+    .map((i) => (i.all_day ? "open all day" : `${i.from}–${i.to}${i.crosses_midnight ? " (+1d)" : ""}`))
+    .join(", ");
+  return iv ? `${on.weekday} hours: ${iv}` : null;
+}
+
+function description(stop, place, date) {
+  const L = [];
+  if (stop.background) L.push(stop.background.trim());
+  const h = hoursLine(place);
+  // The service window comes from the API, not from prose retyped by hand.
+  if (h) L.push(h + (place?.on?.intervals?.length ? " — that's last orders, not leave-by." : ""));
+  if (stop.order) L.push(`WHAT TO ORDER: ${stop.order.trim()}`);
+  if (place?.allowsDogs === false) L.push("No dogs.");
+  if (place?.rating) L.push(`${place.rating}★${place.ratingCount ? ` (${place.ratingCount})` : ""}`);
+  if (place?.mapsUri) L.push(place.mapsUri);
+  if (stop.droppable) L.push("Droppable.");
+  L.push(marker(date, stop.id));
+  return L.join("\n\n");
+}
+
+function listDay(date) {
+  // --all-pages is REQUIRED: gog calendar list defaults to --max=10, so on a
+  // busy day (a full itinerary is easily 12+ events) the later stops fall off
+  // the list, their markers aren't found, and re-running the plan CREATES
+  // duplicates instead of patching — silently breaking the "re-running is safe"
+  // guarantee. Found 2026-07-23: a 13-event Saturday duplicated its evening
+  // legs on the second render.
+  const out = run("gog", ["calendar", "list", "--account", ACCOUNT, "--from", date, "--to", date, "--all-pages", "--json"]);
+  if (!out) { warn("could not list calendar events — calendar step skipped"); return null; }
+  try {
+    const j = JSON.parse(out);
+    const all = Array.isArray(j) ? j : (j.items || j.events || []);
+    // Drop cancelled events: a stop rendered, deleted, and re-rendered can
+    // leave a tombstone that still carries the marker. If upsert() matched it,
+    // it would try to update a cancelled event (or, listed but dead, throw off
+    // the match) — either way the live event doesn't get patched and a
+    // duplicate is created. Match only live events. (2026-07-23.)
+    return all.filter((e) => e && e.status !== "cancelled");
+  } catch { warn("unparseable calendar list"); return null; }
+}
+
+// gog passes --from/--to straight to Google as RFC3339 and sends no separate
+// timeZone field, so on CREATE Google rejects a tz-less local time with
+// "Missing time zone definition for start time" (update tolerates it only
+// because the existing event already carries a zone). Derive the plan tz's UTC
+// offset for this specific wall time — DST-correct, computed from the IANA zone
+// rather than hard-coded — and stamp it onto the timestamp. (2026-07-23.)
+function tzOffset(dateISO, timeHHMM, tz) {
+  const asUTC = new Date(`${dateISO}T${timeHHMM}:00Z`);
+  const local = new Date(asUTC.toLocaleString("en-US", { timeZone: tz }));
+  const utc = new Date(asUTC.toLocaleString("en-US", { timeZone: "UTC" }));
+  const offMin = Math.round((local - utc) / 60000);
+  const sign = offMin >= 0 ? "+" : "-";
+  const a = Math.abs(offMin);
+  const hh = String(Math.floor(a / 60)).padStart(2, "0");
+  const mm = String(a % 60).padStart(2, "0");
+  return `${sign}${hh}:${mm}`;
+}
+
+function upsert(stop, place, date, tz, existing) {
+  const summary = `${stop.emoji ? stop.emoji + " " : ""}${stop.title}`;
+  const from = `${date}T${stop.start}:00${tzOffset(date, stop.start, tz)}`;
+  const to = `${date}T${stop.end}:00${tzOffset(date, stop.end, tz)}`;
+  const desc = description(stop, place, date);
+  const loc = place?.address || "";
+  const mk = marker(date, stop.id);
+  let hit = (existing || []).find((e) => String(e.description || "").includes(mk));
+  // --adopt: take over an event written before markers existed (or by hand) by
+  // matching its exact start instant, and stamp the marker on the way through so
+  // every later run is a clean marker match. Opt-in, because an exact-time match
+  // is a weaker claim than a marker and could in principle seize an unrelated
+  // event that happens to start on the same minute.
+  if (!hit && ADOPT) {
+    hit = (existing || []).find((e) => {
+      const s = e.start?.dateTime || e.start || "";
+      return String(s).slice(11, 16) === stop.start && !String(e.description || "").includes("[jori:trip:");
+    });
+    if (hit) say(`  adopting existing event for ${stop.id} (${stop.start})`);
+  }
+
+  if (DRY) { say(`  [dry-run] ${hit ? "update" : "create"} ${summary}`); return { action: hit ? "update" : "create", dry: true }; }
+
+  const base = ["--account", ACCOUNT, "--summary", summary, "--from", from, "--to", to,
+    "--description", desc, "--location", loc];
+  // gog takes the calendarId POSITIONALLY on both verbs — `create <calendarId>`
+  // and `update <calendarId> <eventId>` — not as a --calendar flag. Passing
+  // "--calendar primary" makes gog 0.12+ abort with "unknown flag --calendar",
+  // so every NEW event silently failed to create (found 2026-07-23: the Friday
+  // coffee stop). Mirror the working update form: "primary" right after
+  // --account, then the rest of the flags.
+  const out = hit
+    ? run("gog", ["calendar", "update", ...base.slice(0, 2), "primary", hit.id, ...base.slice(2)])
+    : run("gog", ["calendar", "create", ...base.slice(0, 2), "primary", ...base.slice(2)]);
+  if (!out) { warn(`${stop.id}: calendar ${hit ? "update" : "create"} failed`); return { action: "failed" }; }
+  return { action: hit ? "updated" : "created", eventId: hit?.id || null };
+}
+
+// ---------------------------------------------------------------- main
+
+async function main() {
+  const planPath = arg("--plan");
+  let raw;
+  try {
+    raw = planPath && planPath !== "-" ? fs.readFileSync(planPath, "utf8") : fs.readFileSync(0, "utf8");
+  } catch {
+    console.error("trip-day-render: need a plan on stdin or --plan <file>. See the header.");
+    process.exit(2);
+  }
+  let plan;
+  try { plan = JSON.parse(raw); } catch (e) { console.error(`trip-day-render: plan is not valid JSON — ${e.message}`); process.exit(2); }
+  if (!plan.date || !Array.isArray(plan.stops) || !plan.stops.length) {
+    console.error("trip-day-render: plan needs { date, stops[] }");
+    process.exit(2);
+  }
+  const ids = plan.stops.map((s) => s.id);
+  if (new Set(ids).size !== ids.length) {
+    console.error("trip-day-render: stop ids must be unique — they key the calendar marker");
+    process.exit(2);
+  }
+
+  const existing = NO_CAL || DRY ? [] : (listDay(plan.date) || []);
+  say(`${plan.title || plan.area || ""} — ${plan.date}${plan[PET.pet_key] ? `  ·  ${PET.pet_name || "Pet"} ${plan[PET.pet_key]}` : ""}`);
+
+  // Refuse to write a degraded event. A stop that names a place but did not
+  // resolve has no address, no hours and no photo, and writing it anyway
+  // silently REPLACES a good description with a worse one — which is exactly
+  // what happened running this from the laptop, where GOOGLE_PLACES_API_KEY
+  // does not exist: four stops "updated" successfully, all four gutted.
+  // Resolution failing is an error, not a degraded mode. --allow-unresolved
+  // opts back in for a stop that legitimately has no Places entry.
+  const resolved = new Map();
+  for (const stop of plan.stops) resolved.set(stop.id, resolve(stop, plan.date));
+  const broken = plan.stops.filter((s) => s.query && !resolved.get(s.id));
+  if (broken.length && !has("--allow-unresolved")) {
+    console.error(`trip-day-render: ${broken.length} stop(s) named a place that did not resolve `
+      + `(${broken.map((s) => s.id).join(", ")}) — refusing to write partial events.\n`
+      + `  Is GOOGLE_PLACES_API_KEY set on this host? Re-run where it is, or pass --allow-unresolved.`);
+    process.exit(1);
+  }
+
+  const stops = [];
+  for (const stop of plan.stops) {
+    const place = resolved.get(stop.id);
+    const pic = place ? await photo(stop, place, plan.date) : null;
+    const cal = NO_CAL ? null : upsert(stop, place, plan.date, plan.tz, existing);
+    stops.push({
+      ...stop,
+      resolved: place ? {
+        name: place.name, address: place.address, mapsUri: place.mapsUri,
+        placeId: place.placeId, rating: place.rating, ratingCount: place.ratingCount,
+        businessStatus: place.businessStatus, allowsDogs: place.allowsDogs,
+        hours: hoursLine(place), on: place.on,
+      } : null,
+      photo: pic,
+      calendar: cal,
+    });
+    const bits = [
+      place ? `✓ ${place.name}` : "✗ unresolved",
+      pic ? `photo[${pic.index}/${pic.available}] ${pic.source}` : "no photo",
+      cal ? cal.action : "no calendar",
+    ];
+    say(`  ${stop.start} ${stop.title.padEnd(38).slice(0, 38)} ${bits.join(" · ")}`);
+  }
+
+  const manifest = { ...plan, stops, warnings, rendered_at: new Date().toISOString() };
+  if (!DRY) await persist(manifest);   // durable source of truth; skip on --dry-run
+  if (JSON_OUT) { process.stdout.write(JSON.stringify(manifest, null, 2)); return; }
+  // Photo CORRECTNESS still needs an eye — Places resolved 3/3 on one test set
+  // while a café storefront filed under a market hall passed every automated
+  // check there is. Print the URLs so they can be looked at, and note the fix.
+  const withPics = stops.filter((s) => s.photo);
+  if (withPics.length) {
+    say("\nphotos to eyeball (set photo_index in the plan to pick another):");
+    for (const s of withPics) say(`  ${s.id}[${s.photo.index}/${s.photo.available}]  ${s.photo.url}`);
+  }
+}
+
+main().catch((e) => { process.stderr.write(`${(e && e.stack) || e}\n`); process.exit(1); });
