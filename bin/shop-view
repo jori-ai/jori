@@ -1,0 +1,55 @@
+#!/usr/bin/env node
+// shop-view — the link to the phone sign-in page for the shop Chrome
+// (agent/shop-view/server.mjs, SHOP_VIEW_URL behind Cloudflare Access).
+//
+//   shop-view link [--site <domain>] [--url <login url>]
+//       Print the link to put in a "please sign in" message. --url (or the
+//       site's home page) is offered on the page as an "Open it" button; it is
+//       never opened just because the link was followed.
+//   shop-view done [--since <unix-seconds>]
+//       Print the last "Done" the user tapped on the page ({at, url, title}),
+//       or exit 1 if none since --since.
+//   shop-view health
+//       Is the local server answering? (exit 0/1)
+
+import fs from "node:fs";
+import path from "node:path";
+import { REPO_ROOT } from "../lib/root.cjs";
+
+const ROOT = REPO_ROOT;
+for (const l of (() => { try { return fs.readFileSync(path.join(ROOT, ".env"), "utf8").split("\n"); } catch { return []; } })()) {
+  const m = l.match(/^([A-Z_][A-Z0-9_]*)=(.*)$/); if (m && !process.env[m[1]]) process.env[m[1]] = m[2];
+}
+const V = await import(path.join(ROOT, "lib/shop-view.mjs"));
+
+const argv = process.argv.slice(2);
+const flag = (n) => { const i = argv.indexOf(`--${n}`); return i > -1 ? argv[i + 1] : null; };
+
+switch (argv[0]) {
+  case "link":
+    try { console.log(V.signinLink({ site: flag("site"), url: flag("url") })); }
+    catch (e) { console.error(`shop-view: ${e.message}`); process.exit(2); }
+    break;
+  case "done": {
+    let rec;
+    try { rec = JSON.parse(fs.readFileSync(path.join(ROOT, "data/purchases/shop-view-done.json"), "utf8")); } catch {}
+    const since = Number(flag("since")) || 0;
+    if (!rec || Date.parse(rec.at) / 1000 < since) { console.log("null"); process.exit(1); }
+    console.log(JSON.stringify(rec, null, 2));
+    break;
+  }
+  case "health": {
+    const port = process.env.SHOP_VIEW_PORT || "9086";
+    try {
+      const r = await fetch(`http://127.0.0.1:${port}/healthz`, { signal: AbortSignal.timeout(3000) });
+      console.log(r.ok ? "up" : `HTTP ${r.status}`);
+      process.exit(r.ok ? 0 : 1);
+    } catch (e) {
+      console.log(`down (${e.message})`);
+      process.exit(1);
+    }
+  }
+  default:
+    console.error(fs.readFileSync(new URL(import.meta.url), "utf8").split("\n").slice(1, 14).map((l) => l.replace(/^\/\/ ?/, "")).join("\n"));
+    process.exit(argv[0] ? 64 : 0);
+}

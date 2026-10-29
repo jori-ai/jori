@@ -1,0 +1,258 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Shop Browser</title>
+<style>
+  :root { --bg:#f6f6f4; --fg:#1d1d1b; --muted:#6b6b66; --line:#d9d9d4; --card:#fff; --accent:#1f6feb; --ok:#1a7f37; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#151514; --fg:#ececea; --muted:#9a9a94; --line:#33332f; --card:#1f1f1d; --accent:#4c8dff; --ok:#3fb950; } }
+  * { box-sizing: border-box; }
+  /* The picture fills what the controls leave, so they never scroll away. */
+  body { margin:0; background:var(--bg); color:var(--fg); font:15px/1.35 -apple-system, system-ui, sans-serif; display:flex; flex-direction:column; height:100vh; height:100dvh; }
+  header, .bar { display:flex; gap:6px; align-items:center; padding:8px 12px; flex:none; }
+  header { background:var(--bg); border-bottom:1px solid var(--line); z-index:2; flex-wrap:wrap; }
+  input, select, button { font:inherit; color:inherit; background:var(--card); border:1px solid var(--line); border-radius:8px; padding:8px 10px; min-height:40px; }
+  /* 16px: iOS zooms the whole page into a smaller field when it is tapped. */
+  input, select { font-size:16px; }
+  button { cursor:pointer; white-space:nowrap; touch-action:manipulation; }
+  button:disabled { opacity:.4; }
+  button.primary { background:var(--accent); border-color:var(--accent); color:#fff; }
+  button.done { background:var(--ok); border-color:var(--ok); color:#fff; }
+  #url { flex:1; min-width:0; }
+  #tabs { flex:1; min-width:0; }
+  /* One finger on the picture is ours (swipe = scroll the shop page); two still pinch-zoom this page where supported. */
+  #screen { position:absolute; inset:0; margin:auto; max-width:100%; max-height:100%; touch-action:none; touch-action:pinch-zoom; user-select:none; -webkit-user-select:none; -webkit-touch-callout:none; -webkit-user-drag:none; }
+  #wrap { position:relative; flex:1 1 0; min-height:160px; overflow:hidden; background:#888; }
+  /* Two lines, always: a longer message must not resize the picture under phone view. */
+  #status { color:var(--muted); font-size:13px; line-height:1.3; padding:4px 12px; flex:none; height:calc(2.6em + 8px); overflow:hidden; }
+  #offer { display:none; flex:none; margin:8px 12px; padding:10px 12px; background:var(--card); border:1px solid var(--line); border-radius:10px; }
+  .keys button { flex:1; padding:8px 4px; }
+  #text { flex:1; min-width:0; }
+  #dot { position:absolute; width:22px; height:22px; margin:-11px 0 0 -11px; border-radius:50%; border:2px solid var(--accent); pointer-events:none; display:none; }
+</style>
+</head>
+<body>
+<header>
+  <button id="back" aria-label="Back">&#8249;</button>
+  <input id="url" type="url" inputmode="url" autocapitalize="off" autocorrect="off" placeholder="Address">
+  <button id="go">Go</button>
+  <div class="bar" style="padding:0;width:100%">
+    <select id="tabs" aria-label="Tab"></select>
+    <button id="reload" aria-label="Reload">&#8635;</button>
+    <button id="phone">Phone view</button>
+    <button id="zout" class="zoom" aria-label="Zoom out" hidden>&minus;</button><button id="zin" class="zoom" aria-label="Zoom in" hidden>+</button>
+    <button id="done" class="done">Done</button>
+  </div>
+</header>
+<div id="offer"><span id="offerText"></span> <button id="offerGo" class="primary">Open it</button></div>
+<div id="status">Connecting to the shop browser…</div>
+<div id="wrap"><img id="screen" alt="Shop browser" draggable="false"><div id="dot"></div></div>
+<div class="bar">
+  <input id="text" type="text" autocapitalize="off" autocorrect="off" autocomplete="off" spellcheck="false" placeholder="Tap a field above, then type here">
+  <button id="send" class="primary">Type</button>
+</div>
+<div class="bar keys">
+  <button data-key="Backspace">&#9003;</button><button data-key="Tab">Tab</button>
+  <button data-key="Enter">Enter</button><button data-key="Escape">Esc</button>
+  <button id="up">&#9650;</button><button id="down">&#9660;</button>
+</div>
+<script>
+const $ = (id) => document.getElementById(id);
+const img = $("screen"), status = $("status");
+let seq = 0, alive = true, looping = false, stale = false, phone = false, zoom = 1, lastUrl = null, noteUntil = 0;
+const LIVE = "Live — swipe the picture to scroll, tap it to click, type below.";
+// Phone view's zoom steps: the shop page is laid out at (picture size / zoom),
+// so a smaller step fits more of a tall form on the screen at once.
+const ZOOMS = [1, 0.8, 0.65, 0.5];
+function note(text, ms = 7000) { status.textContent = text; noteUntil = Date.now() + ms; }
+
+async function post(body, ms) {
+  const signal = ms && AbortSignal.timeout ? AbortSignal.timeout(ms) : undefined;
+  const r = await fetch("/api/input", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body), signal });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) { status.textContent = j.error || ("Error " + r.status); throw new Error(j.error); }
+  return j;
+}
+
+function renderState(s) {
+  if (!s || !s.tabs) return;
+  const sel = $("tabs"); sel.innerHTML = "";
+  for (const t of s.tabs) {
+    const o = document.createElement("option");
+    o.value = t.id; o.textContent = (t.title || t.url || "tab").slice(0, 60);
+    if (t.id === s.current) { o.selected = true; if (document.activeElement !== $("url")) $("url").value = t.url; }
+    sel.appendChild(o);
+  }
+  phone = !!s.phone; $("phone").textContent = phone ? "Desktop view" : "Phone view";
+  // Zoom needs a server that reports it; an older one ignores the steps.
+  zoom = Number(s.zoom) || 1;
+  for (const b of document.querySelectorAll(".zoom")) b.hidden = !(phone && "zoom" in s);
+  $("zout").disabled = zoom <= ZOOMS[ZOOMS.length - 1] + 0.001;
+  $("zin").disabled = zoom >= 1 - 0.001;
+}
+async function refreshState() {
+  try { const r = await fetch("/api/state"); if (r.ok) renderState(await r.json()); } catch {}
+}
+
+let frameCtl = null;
+async function frames() {
+  if (looping) return;
+  looping = true;
+  while (alive) {
+    try {
+      // A stale picture asks for the newest frame now (after=0), not the next one.
+      frameCtl = new AbortController();
+      const r = await fetch("/api/frame?after=" + (stale ? 0 : seq), { cache: "no-store", signal: frameCtl.signal });
+      if (r.status === 200) {
+        seq = Number(r.headers.get("X-Frame-Seq")) || seq + 1;
+        const url = URL.createObjectURL(await r.blob());
+        img.onload = () => { if (lastUrl) URL.revokeObjectURL(lastUrl); lastUrl = url; };
+        img.src = url;
+        stale = false;
+        if (Date.now() > noteUntil) status.textContent = LIVE;
+      } else if (r.status !== 204) {
+        status.textContent = "The shop browser isn't answering (" + r.status + "). Retrying…";
+        await nap(3000);
+      }
+    } catch (e) { if (!(stale && e.name === "AbortError")) await nap(3000); }
+  }
+  looping = false;
+}
+let wake = null;
+const nap = (ms) => new Promise((res) => { wake = res; setTimeout(res, ms); });
+// Back from another app: the picture may be old, so taps wait for a new one.
+function restale() { stale = true; frameCtl?.abort(); wake?.(); }
+document.addEventListener("visibilitychange", () => { if (!document.hidden) { restale(); refreshState(); } });
+
+// Where on the picture, as fractions of it: the server maps those onto the
+// shop page, so the phone never needs to know the window size.
+function frac(ev) {
+  const b = img.getBoundingClientRect();
+  return { x: (ev.clientX - b.left) / b.width, y: (ev.clientY - b.top) / b.height };
+}
+
+// Scrolling: deltas pile up while one request is in flight and go as one, so
+// a slow connection never queues a backlog of swipes.
+let pend = { x: 0.5, y: 0.5, fdx: 0, fdy: 0 }, sending = false, last = { x: 0.5, y: 0.5 };
+function queueScroll(x, y, fdx, fdy) {
+  if (!alive) return revive();
+  pend.x = x; pend.y = y; pend.fdx += fdx; pend.fdy += fdy;
+  if (!sending) flushScroll();
+}
+async function flushScroll() {
+  sending = true;
+  while (Math.abs(pend.fdx) > 0.002 || Math.abs(pend.fdy) > 0.002) {
+    const p = pend;
+    pend = { x: p.x, y: p.y, fdx: 0, fdy: 0 };
+    // dx/dy are a pixel guess for a server that predates fdx/fdy.
+    try { await post({ type: "scroll", x: p.x, y: p.y, fdx: p.fdx, fdy: p.fdy, dx: Math.round(p.fdx * 800), dy: Math.round(p.fdy * 800) }, 8000); }
+    catch { pend.fdx = pend.fdy = 0; }
+  }
+  sending = false;
+}
+
+// One finger on the picture: a tap clicks there; a drag scrolls the shop page
+// under the finger (an inner scroll box or a modal scrolls too), the page
+// following the finger like any phone browser. A second finger cancels it
+// (that is a pinch, not a scroll).
+const SLOP = 8;
+let g = null;
+const down = new Set();
+img.addEventListener("pointerdown", (ev) => {
+  if (ev.isPrimary) down.clear();
+  down.add(ev.pointerId);
+  try { img.setPointerCapture(ev.pointerId); } catch {}
+  if (down.size > 1) { g = null; return; }
+  if (ev.pointerType === "mouse" && ev.button !== 0) return;
+  ev.preventDefault();
+  const p = frac(ev);
+  g = { id: ev.pointerId, sx: ev.clientX, sy: ev.clientY, lx: ev.clientX, ly: ev.clientY, x: p.x, y: p.y, axis: null };
+});
+img.addEventListener("pointermove", (ev) => {
+  if (!g || ev.pointerId !== g.id) return;
+  const ax = ev.clientX - g.sx, ay = ev.clientY - g.sy;
+  if (!g.axis) {
+    if (Math.hypot(ax, ay) < SLOP) return;
+    g.axis = Math.abs(ay) >= Math.abs(ax) ? "y" : "x";
+  }
+  const b = img.getBoundingClientRect();
+  const fdx = g.axis === "x" ? (g.lx - ev.clientX) / b.width : 0;
+  const fdy = g.axis === "y" ? (g.ly - ev.clientY) / b.height : 0;
+  g.lx = ev.clientX; g.ly = ev.clientY;
+  queueScroll(g.x, g.y, fdx, fdy);
+});
+img.addEventListener("pointerup", (ev) => {
+  down.delete(ev.pointerId);
+  if (!g || ev.pointerId !== g.id) return;
+  const t = g; g = null;
+  last = { x: t.x, y: t.y };
+  if (!t.axis) tap(t);
+});
+img.addEventListener("pointercancel", (ev) => { down.delete(ev.pointerId); g = null; });
+img.addEventListener("lostpointercapture", (ev) => { down.delete(ev.pointerId); if (g && ev.pointerId === g.id) g = null; });
+img.addEventListener("dragstart", (ev) => ev.preventDefault());
+img.addEventListener("wheel", (ev) => {
+  ev.preventDefault();
+  const b = img.getBoundingClientRect(), p = frac(ev);
+  const unit = ev.deltaMode === 1 ? 16 : ev.deltaMode === 2 ? b.height : 1;
+  queueScroll(p.x, p.y, (ev.deltaX * unit) / b.width, (ev.deltaY * unit) / b.height);
+}, { passive: false });
+
+// After Done, or back from another app, the picture may be old: a tap brings
+// the live view back and clicks nothing, so it never lands on what has moved.
+function revive() { alive = true; restale(); note("Picking the page back up… tap again once the picture is live."); refreshState(); frames(); }
+function tap(t) {
+  if (!alive) return revive();
+  if (stale) return note("Refreshing the picture… tap again in a moment.", 3000);
+  const b = img.getBoundingClientRect(), w = $("wrap").getBoundingClientRect();
+  const d = $("dot"); d.style.left = (b.left - w.left + t.x * b.width) + "px"; d.style.top = (b.top - w.top + t.y * b.height) + "px"; d.style.display = "block";
+  setTimeout(() => (d.style.display = "none"), 400);
+  post({ type: "tap", x: t.x, y: t.y }).catch(() => {});
+}
+// The arrow buttons scroll most of a screen, where the user last touched the page.
+$("up").onclick = () => queueScroll(last.x, last.y, 0, -0.8);
+$("down").onclick = () => queueScroll(last.x, last.y, 0, 0.8);
+document.querySelectorAll("[data-key]").forEach((b) => (b.onclick = () => post({ type: "key", key: b.dataset.key }).catch(() => {})));
+$("send").onclick = async () => {
+  const t = $("text").value; if (!t) return;
+  $("text").value = "";
+  await post({ type: "text", text: t }).catch(() => {});
+};
+$("text").addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); $("send").onclick(); } });
+$("go").onclick = () => post({ type: "navigate", url: $("url").value }).then(() => $("url").blur()).catch(() => {});
+$("url").addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); $("go").onclick(); } });
+$("back").onclick = () => post({ type: "back" }).catch(() => {});
+$("reload").onclick = () => post({ type: "reload" }).catch(() => {});
+$("tabs").onchange = (e) => post({ type: "tab", id: e.target.value }).then((s) => { seq = 0; renderState(s); }).catch(() => {});
+// Phone view lays the shop page out at the picture's own size on this screen,
+// so it shows 1:1; the zoom steps lay it out bigger in the same space.
+function setView(on, z) {
+  const w = $("wrap").getBoundingClientRect();
+  return post({ type: "phone", on, zoom: z, width: Math.round(w.width), height: Math.round(w.height) })
+    .then((s) => { renderState(s); note("Tip: pick the view before you start filling in a form. Some checkout pages start over when it changes."); })
+    .catch(() => {});
+}
+$("phone").onclick = () => setView(!phone, 1);
+$("zout").onclick = () => setView(true, ZOOMS.find((z) => z < zoom - 0.001) ?? ZOOMS[ZOOMS.length - 1]);
+$("zin").onclick = () => setView(true, [...ZOOMS].reverse().find((z) => z > zoom + 0.001) ?? 1);
+$("done").onclick = async () => {
+  await post({ type: "done" }).catch(() => {});
+  alive = false;
+  note("Thanks — Jori will take it from here. You can close this page.", 864e5);
+};
+
+// A link from Jori can suggest a sign-in page; it is opened only when tapped.
+const q = new URLSearchParams(location.search);
+if (q.get("open")) {
+  $("offer").style.display = "block";
+  $("offerText").textContent = "Jori needs you signed in to " + (q.get("site") || new URL(q.get("open")).host) + ".";
+  $("offerGo").onclick = () => post({ type: "navigate", url: q.get("open") }).then(() => ($("offer").style.display = "none")).catch(() => {});
+}
+
+refreshState();
+setInterval(() => { if (alive) refreshState(); }, 5000);
+frames();
+</script>
+</body>
+</html>

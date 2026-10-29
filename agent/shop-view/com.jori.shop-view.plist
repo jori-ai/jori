@@ -1,0 +1,56 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Phone sign-in page for the shop Chrome (agent/shop-view/server.mjs).
+  Serves 127.0.0.1:9086 ONLY; the outside world reaches it solely through the
+  Cloudflare tunnel hostname (SHOP_VIEW_URL / purchase.json shop_view_url),
+  behind a Cloudflare Access application that admits the user only. The server
+  re-verifies the Access JWT and the email itself (lib/shop-view.mjs), and
+  refuses everything until SHOP_VIEW_CF_AUD and SHOP_VIEW_EMAILS are in .env.
+
+  This is a TEMPLATE (__JORI_HOME__ / __JORI_TOOLS__ / __HOME__). Install by
+  rendering it, never `cp`:
+    source agent/scripts/lib/launchd-render.sh
+    launchd_render_plist agent/shop-view/com.jori.shop-view.plist ~/Library/LaunchAgents/com.jori.shop-view.plist
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.jori.shop-view.plist
+  Restart after a code change:
+    launchctl kickstart -k gui/$(id -u)/com.jori.shop-view
+  node is the first one on PATH (a user-local build first, then Homebrew).
+  Log: agent/logs/shop-view.log (never contains typed text).
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.jori.shop-view</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/env</string>
+        <string>node</string>
+        <string>__JORI_TOOLS__/agent/shop-view/server.mjs</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+
+    <key>StandardOutPath</key>
+    <string>__JORI_TOOLS__/agent/logs/shop-view.out.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>__JORI_TOOLS__/agent/logs/shop-view.err.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>__HOME__</string>
+        <key>PATH</key>
+        <string>__HOME__/.local/node/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    </dict>
+</dict>
+</plist>

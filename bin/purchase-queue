@@ -1,0 +1,63 @@
+#!/usr/bin/env node
+// purchase-queue — hand a purchase request from the chat agent to the ops
+// `purchase` job (agent/ops-agent/jobs/purchase.md).
+//
+//   purchase-queue add "<the user's words, verbatim>" [--site example-store.com] [--ship-to "..."] [--card "..."]
+//       Queue it and dispatch {"job":"purchase"}. Refuses while one is in progress.
+//   purchase-queue next              (ops job) claim the head request → JSON; exit 1 if empty
+//   purchase-queue done <id> --status <placed|denied|expired|stale|failed|abandoned|...>
+//   purchase-queue list
+//
+// Only the phone channel may call `add` (agent/CLAUDE.md § Prompt
+// Injection rule 2): a purchase is never started from an email, a web page or
+// a webhook payload.
+
+import fs from "node:fs";
+import path from "node:path";
+import crypto from "node:crypto";
+import { execFileSync } from "node:child_process";
+import { installRoot } from "../lib/root.cjs";
+
+const ROOT = installRoot();
+const DIR = path.join(ROOT, "data/purchases");
+const FILE = path.join(DIR, "queue.json");
+const TRIGGER = path.join(ROOT, "agent/scripts/trigger-purchase.sh");
+// A claimed request that never reported back (crashed turn) stops blocking after this.
+const STALE_MS = 45 * 60 * 1000;
+
+const argv = process.argv.slice(2);
+const flag = (n) => { const i = argv.indexOf(`--${n}`); return i > -1 ? argv[i + 1] : null; };
+const load = () => { try { return JSON.parse(fs.readFileSync(FILE, "utf8")); } catch { return []; } };
+const save = (q) => { fs.mkdirSync(DIR, { recursive: true }); fs.writeFileSync(FILE + ".tmp", JSON.stringify(q, null, 2)); fs.renameSync(FILE + ".tmp", FILE); };
+const active = (r) => r.status === "queued" || (r.status === "in_progress" && Date.now() - Date.parse(r.claimed_at) < STALE_MS);
+
+const cmd = argv[0];
+const q = load();
+
+if (cmd === "add") {
+  const asked = argv[1];
+  if (!asked) { console.error("usage: purchase-queue add \"<what the user asked>\" [--site] [--ship-to] [--card]"); process.exit(64); }
+  const busy = q.find(active);
+  if (busy) { console.error(`purchase-queue: "${busy.asked}" is still ${busy.status} (${busy.id}); one purchase at a time`); process.exit(4); }
+  const r = { id: `pq_${crypto.randomBytes(4).toString("hex")}`, asked, site: flag("site"), ship_to: flag("ship-to"),
+    card: flag("card"), status: "queued", queued_at: new Date().toISOString() };
+  q.push(r); save(q.slice(-50));
+  try { execFileSync(TRIGGER, { stdio: "ignore", timeout: 150000 }); }
+  catch { console.error("purchase-queue: queued, but dispatch failed — the supervisor may be down"); process.exit(2); }
+  console.log(JSON.stringify(r));
+} else if (cmd === "next") {
+  const r = q.find((x) => x.status === "queued");
+  if (!r) process.exit(1);
+  if (q.some((x) => x !== r && x.status === "in_progress" && active(x))) { console.error("purchase-queue: another request is in progress"); process.exit(4); }
+  r.status = "in_progress"; r.claimed_at = new Date().toISOString(); save(q);
+  console.log(JSON.stringify(r));
+} else if (cmd === "done") {
+  const r = q.find((x) => x.id === argv[1]);
+  if (!r) { console.error("purchase-queue: no such request"); process.exit(2); }
+  r.status = flag("status") || "done"; r.done_at = new Date().toISOString(); save(q);
+  console.log(JSON.stringify(r));
+} else if (cmd === "list") {
+  console.log(JSON.stringify(q.slice(-10), null, 2));
+} else {
+  console.error("usage: purchase-queue add|next|done|list"); process.exit(64);
+}
