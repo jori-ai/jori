@@ -556,7 +556,7 @@
         "auto research destinations",
         "reservoir for upcoming trip"
       ],
-      "description": "Nightly gate: finds any upcoming NON-HOME location on the travel timeline that has no travel guide (reservoir) yet, and researches each one sequentially with trip-reservoir-build (geocodes any city worldwide) directly from the launchd agent — no ops-agent turn since 2026-10-04. Skips home bases (NYC/Miami) and short layovers. Makes trip-guide research automatic for anywhere we go instead of hand-kicked per trip. Silent when nothing is missing.",
+      "description": "Nightly gate: finds any upcoming NON-HOME location on the travel timeline that has no travel guide (reservoir) yet, and researches each one sequentially with trip-reservoir-build (geocodes any city worldwide) directly from the launchd agent. Skips the home metros (travel.json home_metros) and short layovers. Makes trip-guide research automatic for anywhere the user goes instead of hand-kicked per trip. Silent when nothing is missing.",
       "job": null,
       "scheduler": "launchd"
     },
