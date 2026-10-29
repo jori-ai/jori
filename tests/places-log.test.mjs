@@ -126,7 +126,7 @@ test("caller chain records basenames only — never arguments or KEY=value", () 
   const ps = [
     "    1     0 /sbin/launchd",
     "   10     1 /usr/sbin/cron",
-    "   20    10 node /Users/x/Dev/jori/bin/cron-run --label trigger-hum -- /x/trigger-hum.sh",
+    "   20    10 node /x/bin/cron-run --label trigger-hum -- /x/trigger-hum.sh",
     "   30    20 /bin/bash /x/trigger-hum.sh",
     "   40    30 env GOOGLE_PLACES_API_KEY=AIzaSECRET node /x/hum-harvest-all.mjs --model sk-ant-SECRET",
     "   50    40 /usr/bin/python3 /x/tools/bin/places at 1,2 coffee --key AIzaSECRET",

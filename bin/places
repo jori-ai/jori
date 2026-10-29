@@ -9,10 +9,9 @@ import urllib.request
 import math
 from datetime import datetime, timedelta, timezone
 
-# This script's own path. Tests exec it into a module without __file__; they
-# set one, and without it the installation's copy is assumed.
-_SELF = os.path.realpath(globals().get("__file__") or os.path.join(
-    os.environ.get("JORI_HOME") or os.path.expanduser("~/Dev/jori"), "bin", "places"))
+# This script's own path. Tests exec it into a module without __file__ and set
+# one; failing that, the path it was started by.
+_SELF = os.path.realpath(globals().get("__file__") or sys.argv[0])
 _BIN = os.path.dirname(_SELF)
 sys.path.insert(0, os.path.join(os.path.dirname(_BIN), "lib"))
 import places_local  # noqa: E402
