@@ -1,0 +1,657 @@
+#!/usr/bin/env node
+"use strict";
+/**
+ * travel — manage and consult the user's canonical travel/presence timeline
+ * (a Supabase table of stays, see TABLE). Single source of truth for "where
+ * will the user be (and when)".
+ *
+ * Jori maintains the flights-derived backbone automatically (`travel sync`,
+ * run by flights-scan); manual rows capture anything bookings can't (road
+ * trips, "we're staying an extra day", corrections). The `travel` hum lane
+ * audits the two against each other and floats a question on any discrepancy.
+ *
+ * Usage:
+ *   travel list [--from YYYY-MM-DD] [--to YYYY-MM-DD] [--json]
+ *   travel where [<when>] [--json]            # where will I be at <when> (default now)
+ *   travel in-city <metro> [<when>] [--strict] [--json]   # exit 0 if in metro, 1 if not
+ *   travel check-picks "<city>@<when>" [...] [--json]      # chat event picks: exit 0 all reachable, 1 if any AWAY
+ *   travel flights [--from YYYY-MM-DD] [--to YYYY-MM-DD] [--json]  # flight legs, each airport's LOCAL time
+ *   travel calendar [--json]                  # current calendar overrides (calendar beats the timeline)
+ *   travel calendar-refresh [--force]         # rebuild the calendar overrides now
+ *   travel add <metro> --arrive <when> [--depart <when>] [--label "..."] [--note "..."]
+ *     <metro> may be a comma list ("city_a,city_b") = a Schrodinger stay: the user is
+ *     in one of them and we do not yet know which. Either city reads IN; a third
+ *     city AWAY.
+ *   travel edit <id> [--metro m] [--arrive w] [--depart w|none] [--label "..."] [--note "..."]
+ *   travel rm <id>
+ *   travel sync [--dry-run]                   # rebuild flights-derived rows from flights.json
+ *   travel audit [--json]                     # report timeline vs. bookings discrepancies
+ *   travel wiki                               # refresh the "Travel Schedule" wiki review page
+ *
+ * <when>: "now" | "YYYY-MM-DD" (→ 19:00 home time) | "YYYY-MM-DDTHH:MM" (home
+ *         time) | any tz-qualified ISO. Home time = instance().tz.
+ * <metro>: a city/airport/venue string — normalized to a canonical key (the
+ *          metros in agent/local/config/travel.json, else a slug of the city).
+ *
+ * Config (agent/local/config/travel.json, see lib/presence.js): metros,
+ * home_metros, areas, and `plan_page_id` — a hand-authored wiki plan page whose
+ * AUTO:itinerary / AUTO:past blocks `travel wiki` keeps current (none = skip).
+ *
+ * Calendar beats the timeline. `where`,
+ * `in-city` and `check-picks` resolve through presence.resolvePresence, which
+ * applies data/calendar-presence-overrides.json: a day whose calendar
+ * shows the user away from the timeline's city (a model's reading of the event
+ * titles, lib/calendar-presence.js) reads AWAY for the evidence events'
+ * window. Weaken-only. Refresh on read: when that file is older than 30 min
+ * these commands rebuild it first (lock-guarded, ~15 s budget, never fatal).
+ * TRAVEL_CALENDAR_REFRESH=0 skips the refresh; CALENDAR_PRESENCE=off (or
+ * `touch data/.calendar-presence-off`) ignores the override entirely.
+ */
+
+const path = require("path");
+const { execFileSync } = require("child_process");
+const fs = require("fs");
+const P = require("../lib/presence.js");
+const { request } = require("../lib/supabase-rest.js");
+
+const TABLE = "/rest/v1/travel_segments";
+const TRIP_HISTORY_PATH = path.join(__dirname, "..", "data", "trip-history.json");
+const { localConfig } = require("../lib/instance.cjs");
+const PLAN_PAGE_ID = localConfig("travel", { plan_page_id: null }).plan_page_id || null;
+const HOME_TZ = P.homeTz();
+const argv = process.argv.slice(2);
+const cmd = argv[0];
+
+function flag(name) {
+  const i = argv.indexOf(`--${name}`);
+  return i >= 0 ? (argv[i + 1] ?? null) : null;
+}
+function has(name) { return argv.includes(`--${name}`); }
+function die(msg, code = 1) { process.stderr.write(msg + "\n"); process.exit(code); }
+
+function toISO(when) { return new Date(P.parseWhen(when)).toISOString(); }
+function fmtRow(r) {
+  const dep = r.depart_at ? new Date(r.depart_at).toISOString().slice(0, 16).replace("T", " ") : "open";
+  const arr = new Date(r.arrive_at).toISOString().slice(0, 16).replace("T", " ");
+  const lbl = r.place_label ? ` "${r.place_label}"` : "";
+  return `${r.id.slice(0, 8)}  ${r.metro.padEnd(12)} ${arr} → ${dep}  [${r.source}]${lbl}${r.note ? `  — ${r.note}` : ""}`;
+}
+
+async function resolveId(prefix) {
+  if (!prefix) die("need an id");
+  const rows = await request(`${TABLE}?select=id&id=like.${prefix}*`).catch(() => null);
+  if (rows && rows.length === 1) return rows[0].id;
+  // Fallback: scan all (prefix may be the short 8-char form)
+  const all = await P.fetchSegments();
+  const m = all.filter(r => r.id.startsWith(prefix));
+  if (m.length === 1) return m[0].id;
+  if (m.length === 0) die(`no segment id matching "${prefix}"`);
+  die(`ambiguous id "${prefix}" (${m.length} matches)`);
+}
+
+async function cmdList() {
+  const from = flag("from"), to = flag("to");
+  // Strict: `list` is a report, so an empty result must mean the timeline is
+  // empty — never "the read failed". It used to fail open, so a blocked network
+  // printed "(no segments)" and exited 0, which reads as "no travel planned".
+  let rows = await P.fetchSegmentsStrict();
+  if (from) rows = rows.filter(r => (r.depart_at || r.arrive_at) >= from);
+  if (to) rows = rows.filter(r => r.arrive_at <= `${to}T23:59:59Z`);
+  if (has("json")) return console.log(JSON.stringify(rows, null, 2));
+  if (!rows.length) return console.log("(no segments)");
+  for (const r of rows) console.log(fmtRow(r));
+}
+
+/** Refresh-on-read for the calendar override (D9, 2026-10-22). Never throws; bounded by the producer's budget. */
+async function refreshCalendarOverride({ force = false } = {}) {
+  if (!force && process.env.TRAVEL_CALENDAR_REFRESH === "0") return { refreshed: false, reason: "skipped (env)" };
+  try {
+    const R = await import("../lib/calendar-presence-refresh.mjs");
+    return await R.maybeRefresh({ force });
+  } catch (e) {
+    return { refreshed: false, reason: `error: ${e && e.message ? e.message : e}` };
+  }
+}
+
+async function cmdWhere() {
+  const when = argv[1] && !argv[1].startsWith("--") ? argv[1] : "now";
+  await refreshCalendarOverride();
+  const res = await P.resolvePresence(when);
+  if (has("json")) return console.log(JSON.stringify(res));
+  if (res.ambiguous) {
+    return console.log(`${res.et_date}  ${res.candidates.join(" or ")} (ambiguous — either)${res.label ? ` — ${res.label}` : ""}  [${res.source}]`);
+  }
+  const where = res.metro || "unknown";
+  console.log(`${res.et_date}  ${where}${res.label && res.label !== where ? ` (${res.label})` : ""}  [${res.source}]`);
+}
+
+async function cmdInCity() {
+  const metroArg = argv[1];
+  if (!metroArg || metroArg.startsWith("--")) die("usage: travel in-city <metro> [<when>]", 2);
+  const when = argv[2] && !argv[2].startsWith("--") ? argv[2] : "now";
+  await refreshCalendarOverride();
+  // The shared helper (presence.isInCity → inCityVerdict) owns the semantics:
+  // an ambiguous stay is knowledge, not a gap (a candidate metro is IN, any other
+  // city AWAY); unknown fails open unless --strict; a calendar override reads AWAY.
+  const v = await P.isInCity(metroArg, when, { strict: has("strict") });
+  const { target, res } = v;
+  if (has("json")) {
+    console.log(JSON.stringify({
+      target, metro: res.metro, in: v.in, unknown: v.unknown,
+      ambiguous: !!res.ambiguous, candidates: res.candidates || null,
+      when: res.instant, et_date: res.et_date, source: res.source,
+      ...(res.calendar_override ? { base_metro: res.base_metro, calendar_override: res.calendar_override } : {}),
+    }));
+  } else {
+    const resolved = res.ambiguous ? res.candidates.join("|") : (res.metro || "unknown");
+    console.log(`${v.verdict} ${target} ${res.et_date} — resolved ${resolved}${res.source === "calendar" ? ` (${res.label})` : ""} [${res.source}]`);
+  }
+  process.exit(v.in ? 0 : 1);
+}
+
+/** Pure: "<city>@<when>" → { city, when }. The split is on the LAST "@" (structure, not language). */
+function parsePick(arg) {
+  const s = String(arg || "");
+  const i = s.lastIndexOf("@");
+  if (i <= 0 || i === s.length - 1) return null;
+  return { city: s.slice(0, i).trim(), when: s.slice(i + 1).trim() };
+}
+
+/**
+ * The chat agent's event picks — "only suggest events on dates the timeline
+ * puts the user in that city". One verdict per pick, from the same
+ * shared helper every lane's `in-city` gate uses (calendar override included).
+ * Exit 0 = every pick reachable (IN, ambiguous-IN or unknown/fail-open),
+ * 1 = at least one AWAY, 2 = usage.
+ */
+async function cmdCheckPicks() {
+  const picks = argv.slice(1).filter((a) => !a.startsWith("--")).map((a) => ({ arg: a, p: parsePick(a) }));
+  if (!picks.length || picks.some((x) => !x.p)) die('usage: travel check-picks "<city>@<YYYY-MM-DD[THH:MM]>" ["<city>@<when>" ...] [--json]', 2);
+  await refreshCalendarOverride();
+  const out = [];
+  for (const { arg, p } of picks) {
+    const v = await P.isInCity(p.city, p.when);
+    const r = v.res;
+    out.push({ pick: arg, city: p.city, target: v.target, when: r.instant, et_date: r.et_date, verdict: v.verdict, ok: v.in,
+      resolved: r.ambiguous ? r.candidates.join("|") : (r.metro || "unknown"), label: r.label || null, source: r.source });
+  }
+  const ok = out.every((r) => r.ok);
+  if (has("json")) console.log(JSON.stringify({ ok, picks: out }, null, 2));
+  else for (const r of out) console.log(`${r.ok ? "OK  " : "DROP"} ${r.pick} — ${r.verdict}, resolved ${r.resolved}${r.label && r.label !== r.resolved ? ` (${r.label})` : ""} [${r.source}]`);
+  process.exit(ok ? 0 : 1);
+}
+
+/**
+ * Flight times as STORED — each airport's own wall clock
+ * and offset (flights-scan Step 3.5 sets them from the airport's zone on that
+ * date). Chat quotes these, never a time re-read from a booking email.
+ */
+function flightLegLine(b) {
+  // Stored values are machine-written ISO strings; slicing them is structure.
+  const wall = (v) => (typeof v === "string" && v.length >= 16 ? `${v.slice(0, 10)} ${v.slice(11, 16)}` : String(v || "?"));
+  const off = (v) => {
+    const s = String(v || "");
+    if (s.endsWith("Z")) return "UTC";
+    const sign = Math.max(s.lastIndexOf("+"), s.lastIndexOf("-"));
+    return sign > 10 ? s.slice(sign) : "";
+  };
+  const unverified = Array.isArray(b.tz_unverified) && b.tz_unverified.length ? `  ⚠ time zone unverified: ${b.tz_unverified.join(", ")}` : "";
+  return `${String(b.number || "?").padEnd(8)} ${b.from} ${wall(b.depart)} (${off(b.depart)}, ${b.from_city || b.from} time) → ${b.to} ${wall(b.arrive)} (${off(b.arrive)}, ${b.to_city || b.to} time)  ${b.airline || ""} [${b.status || "confirmed"}]${unverified}`;
+}
+
+function cmdFlights() {
+  const from = flag("from"), to = flag("to");
+  let legs = P.loadFlights().filter((b) => b.type === "flight" && b.depart)
+    .sort((a, b) => new Date(a.depart).getTime() - new Date(b.depart).getTime());
+  if (from) legs = legs.filter((b) => String(b.arrive || b.depart).slice(0, 10) >= from);
+  if (to) legs = legs.filter((b) => String(b.depart).slice(0, 10) <= to);
+  if (has("json")) {
+    return console.log(JSON.stringify(legs.map((b) => ({
+      number: b.number, airline: b.airline, from: b.from, from_city: b.from_city, depart_local: b.depart,
+      to: b.to, to_city: b.to_city, arrive_local: b.arrive, status: b.status || "confirmed",
+      confirmation: b.confirmation, tz_unverified: b.tz_unverified || null,
+    })), null, 2));
+  }
+  if (!legs.length) return console.log("(no live flight legs)");
+  for (const b of legs) console.log(flightLegLine(b));
+}
+
+function cmdCalendar() {
+  const CAL = require("../lib/calendar-presence.js");
+  const doc = CAL.loadOverrides();
+  if (has("json")) return console.log(JSON.stringify(doc, null, 2));
+  if (!doc) return console.log(CAL.disabled() ? "calendar override: switched off" : "calendar override: no usable file (missing or older than 6h) — presence is the timeline's");
+  console.log(`calendar override: generated ${doc.generated_at}${doc.incomplete ? " (incomplete)" : ""} — ${doc.windows.length} away window(s)${doc.horizon ? ` over ${doc.horizon.from}..${doc.horizon.to}` : ""}`);
+  for (const w of doc.windows) console.log(`  ${w.date}  away from ${w.base}  ${etCell(w.from)} → ${etCell(w.to)}  — ${(w.evidence || []).map((e) => e.title).join(", ")}`);
+}
+
+async function cmdCalendarRefresh() {
+  console.log(JSON.stringify(await refreshCalendarOverride({ force: has("force") })));
+}
+
+/** User-typed "city_a,city_b" / "city_a|city_b" -> canonical ambiguous metro. */
+function normalizeMetroArg(str) {
+  return P.normalizeMetro(String(str || "").replace(/,/g, P.AMBIGUOUS_SEP));
+}
+
+async function cmdAdd() {
+  const metro = normalizeMetroArg(argv[1]);
+  if (!argv[1] || argv[1].startsWith("--")) die("usage: travel add <metro> --arrive <when> [--depart <when>] [--label ..] [--note ..]", 2);
+  if (!flag("arrive")) die("--arrive is required", 2);
+  const row = {
+    metro,
+    place_label: flag("label") || null,
+    arrive_at: toISO(flag("arrive")),
+    depart_at: flag("depart") ? toISO(flag("depart")) : null,
+    source: flag("source") || "manual",
+    note: flag("note") || null,
+  };
+  const out = await request(TABLE, { method: "POST", body: row, prefer: "return=representation" });
+  const created = Array.isArray(out) ? out[0] : out;
+  console.log("added: " + fmtRow(created));
+  await refreshWikiSafe();
+}
+
+async function cmdEdit() {
+  const id = await resolveId(argv[1]);
+  const patch = { updated_at: new Date().toISOString() };
+  if (flag("metro")) patch.metro = normalizeMetroArg(flag("metro"));
+  if (flag("arrive")) patch.arrive_at = toISO(flag("arrive"));
+  if (flag("depart") != null) patch.depart_at = flag("depart") === "none" ? null : toISO(flag("depart"));
+  if (flag("label") != null) patch.place_label = flag("label") || null;
+  if (flag("note") != null) patch.note = flag("note") || null;
+  const out = await request(`${TABLE}?id=eq.${id}`, { method: "PATCH", body: patch, prefer: "return=representation" });
+  const r = Array.isArray(out) ? out[0] : out;
+  console.log("updated: " + fmtRow(r));
+  await refreshWikiSafe();
+}
+
+async function cmdRm() {
+  const id = await resolveId(argv[1]);
+  await request(`${TABLE}?id=eq.${id}`, { method: "DELETE", prefer: "return=minimal" });
+  console.log("removed " + id.slice(0, 8));
+  await refreshWikiSafe();
+}
+
+// Build the flights-derived row set we WANT to exist (source=flights).
+function desiredFlightRows(flights) {
+  const flightLegs = flights.filter(b => b.type === "flight" && b.depart && b.arrive)
+    .sort((a, b) => new Date(a.depart).getTime() - new Date(b.depart).getTime());
+  const desired = new Map();
+  flightLegs.forEach((b, i) => {
+    const depISO = new Date(b.depart).toISOString();
+    const arrISO = new Date(b.arrive).toISOString();
+    // transit segment for the flight itself
+    const tRef = `flight:${b.confirmation || "?"}:${b.from}-${b.to}:${depISO}`;
+    desired.set(tRef, { metro: "transit", place_label: `${b.from}→${b.to} (${b.airline || b.number || "flight"})`, arrive_at: depISO, depart_at: arrISO, source: "flights", ref: tRef, note: null });
+    // destination stay: from landing until the next flight departs (or open)
+    const next = flightLegs[i + 1];
+    const dRef = `dest:${b.confirmation || "?"}:${b.to}:${arrISO}`;
+    desired.set(dRef, {
+      metro: P.normalizeMetro(b.to_city || b.to),
+      place_label: b.to_city || b.to,
+      arrive_at: arrISO,
+      depart_at: next ? new Date(next.depart).toISOString() : null,
+      source: "flights", ref: dRef, note: null,
+    });
+  });
+  return desired;
+}
+
+// Build the lodging-derived row set (source=lodging). Each hotel/rental stay
+// refines the coarse flight-airport "dest" city to the actual city — EXCEPT
+// stays in a home metro (config home_metros), where the user is at their own
+// residence and no refinement is wanted. Keyed by `ref` for idempotent upsert/prune.
+function desiredLodgingRows(flights) {
+  const desired = new Map();
+  for (const b of flights) {
+    if (b.type !== "accommodation") continue;
+    const ci = b.checkin || (b.depart ? P.dateOf(b.depart) : null);
+    if (!ci) continue;
+    const metro = P.normalizeMetro(b.location);
+    if (!metro || P.HOME_METROS.has(metro)) continue; // at home → don't refine
+    // Check-in datetime: prefer the booking's own tz-qualified time, else 15:00Z.
+    const arrive = b.depart && /T\d/.test(b.depart) ? new Date(b.depart).toISOString() : `${ci}T15:00:00Z`;
+    const co = b.checkout || ci;
+    const depart = `${co}T11:00:00Z`;
+    const ref = `lodging:${b.confirmation || b.name || ci}`;
+    const label = b.location ? (b.name ? `${b.location} — ${b.name}` : b.location) : (b.name || metro);
+    desired.set(ref, { metro, place_label: label, arrive_at: arrive, depart_at: depart, source: "lodging", ref, note: null });
+  }
+  return desired;
+}
+
+// Everything the timeline should auto-derive from flights.json (flights + lodging).
+function desiredAutoRows(flights) {
+  return new Map([...desiredFlightRows(flights), ...desiredLodgingRows(flights)]);
+}
+
+async function cmdSync() {
+  const dry = has("dry-run");
+  const flights = P.loadFlights();
+  const desired = desiredAutoRows(flights);
+  const existing = (await P.fetchSegmentsStrict()).filter(r => r.source !== "manual" && r.ref);
+  const existingByRef = new Map(existing.map(r => [r.ref, r]));
+
+  let added = 0, updated = 0, removed = 0;
+  for (const [ref, want] of desired) {
+    const cur = existingByRef.get(ref);
+    if (!cur) {
+      if (!dry) await request(TABLE, { method: "POST", body: want, prefer: "return=minimal" });
+      added++;
+    } else {
+      const changed = cur.metro !== want.metro || cur.arrive_at !== want.arrive_at ||
+        (cur.depart_at || null) !== (want.depart_at || null) || (cur.place_label || null) !== (want.place_label || null);
+      if (changed) {
+        if (!dry) await request(`${TABLE}?id=eq.${cur.id}`, { method: "PATCH", body: { ...want, updated_at: new Date().toISOString() }, prefer: "return=minimal" });
+        updated++;
+      }
+    }
+  }
+  for (const cur of existing) {
+    if (!desired.has(cur.ref)) {
+      if (!dry) await request(`${TABLE}?id=eq.${cur.id}`, { method: "DELETE", prefer: "return=minimal" });
+      removed++;
+    }
+  }
+  console.log(`${dry ? "[dry-run] " : ""}sync: +${added} ~${updated} -${removed} (from ${flights.filter(b => b.type === "flight").length} flight legs)`);
+  if (!dry) await refreshWikiSafe();
+}
+
+// Compare the timeline against bookings; report drift for the hum audit lane.
+function buildAuditIssues(flights, segments) {
+  const desired = desiredAutoRows(flights);
+  const segByRef = new Map(segments.filter(s => s.ref).map(s => [s.ref, s]));
+  const issues = [];
+
+  // 1. Booking legs not reflected in the timeline (sync stale / never ran).
+  for (const [ref, want] of desired) {
+    if (!segByRef.has(ref)) issues.push({ kind: "missing_segment", ref, detail: `booking leg not in timeline: ${want.place_label} arriving ${want.arrive_at}`, suggest: "run `travel sync`" });
+  }
+  // 2. Auto-sourced segments with no live booking (stale / canceled).
+  for (const s of segments) {
+    if (s.source !== "manual" && s.ref && !desired.has(s.ref)) {
+      issues.push({ kind: "stale_segment", id: s.id, ref: s.ref, detail: `auto segment with no live booking: ${s.metro} ${s.arrive_at}`, suggest: "run `travel sync` (auto-prunes)" });
+    }
+  }
+  // 3. Non-home flight-destination regions with NO lodging booking — the city
+  //    is still just the airport metro (coarse). Surface so the user knows where a
+  //    specific-city hotel/rental booking is missing (or hasn't been scanned).
+  // Only flag a non-home dest region as "unrefined" if it's an actual OVERNIGHT
+  // stay with no lodging. Short same-day layovers / connections (a few hours
+  // between flights, a day-trip) have no overnight and need no hotel, so they
+  // are not discrepancies. Threshold: ≥18h on the ground (open-ended = flag).
+  const MIN_OVERNIGHT_HOURS = 18;
+  // Coverage must include manual segments, not just auto-synced lodging
+  // bookings. A manual segment recording a specific address (`travel add`/
+  // `edit`, used for off-platform stays with no receipt to sync from
+  // flights.json) is literally the remedy this check's own `suggest` text
+  // asks for ("add ... a manual segment for the real city") — if only
+  // desiredLodgingRows() counted as coverage, that remedy could never
+  // satisfy the check, and it would re-flag the same already-recorded stay
+  // forever. (A month-long stay kept resurfacing as an "unrefined_city" gap
+  // for weeks after a manual segment with the street address was added,
+  // because this loop only ever looked at desiredLodgingRows().) Require depart_at (a bounded stay) and a
+  // matching metro so an unrelated open-ended manual row can't falsely
+  // cover a different city's gap.
+  const manualLodging = segments.filter(s => s.source === "manual" && s.depart_at);
+  const lodgingSegs = [...desiredLodgingRows(flights).values(), ...manualLodging];
+  for (const [ref, want] of desiredFlightRows(flights)) {
+    if (!ref.startsWith("dest:")) continue;
+    if (want.metro === "transit" || P.HOME_METROS.has(want.metro)) continue;
+    const a = new Date(want.arrive_at).getTime();
+    const d = want.depart_at ? new Date(want.depart_at).getTime() : Infinity;
+    if ((d - a) / 3600000 < MIN_OVERNIGHT_HOURS) continue; // stopover, no overnight
+    const covered = lodgingSegs.some(L => {
+      if (L.metro && L.metro !== want.metro) return false;
+      const la = new Date(L.arrive_at).getTime(), ld = new Date(L.depart_at).getTime();
+      return la < d && ld > a; // any lodging overlapping the dest window
+    });
+    if (!covered) {
+      const span = `${P.dateOf(want.arrive_at)}→${want.depart_at ? P.dateOf(want.depart_at) : "open"}`;
+      issues.push({ kind: "unrefined_city", detail: `${want.metro} overnight stay (${span}) has no hotel/rental booking — city is just the airport metro`, suggest: "add the lodging booking, or a manual segment for the real city" });
+    }
+  }
+  // 4. Two lodging stays in different cities overlapping the same nights — you
+  //    can't be in two places; one booking is likely stale/erroneous (e.g. a
+  //    Michigan hotel landing inside the Paris stay).
+  // Compare by NIGHT (date half-open [checkin, checkout)) so back-to-back stays
+  // that share only a checkout/checkin day are NOT flagged — only stays that
+  // share an actual night.
+  const lod = segments.filter(s => s.source === "lodging" && s.depart_at)
+    .map(s => ({ ...s, _ci: P.dateOf(s.arrive_at), _co: P.dateOf(s.depart_at) }))
+    .filter(s => s._ci && s._co);
+  for (let i = 0; i < lod.length; i++) {
+    for (let j = i + 1; j < lod.length; j++) {
+      const A = lod[i], B = lod[j];
+      if (A.metro === B.metro) continue;
+      if (A._ci < B._co && B._ci < A._co) {
+        issues.push({ kind: "double_booked", detail: `overlapping lodging in two cities: "${A.place_label}" (${A.metro}) and "${B.place_label}" (${B.metro}) share a night — one is likely wrong/stale` });
+      }
+    }
+  }
+
+  // 5. Manual segments that overlap a flight (you can't be planted somewhere mid-flight).
+  for (const s of segments.filter(x => x.source === "manual")) {
+    const sArr = new Date(s.arrive_at).getTime();
+    const sDep = s.depart_at ? new Date(s.depart_at).getTime() : Infinity;
+    for (const b of flights) {
+      if (b.type !== "flight") continue;
+      const fDep = new Date(b.depart).getTime(), fArr = new Date(b.arrive).getTime();
+      if (fDep < sDep && fArr > sArr && s.metro !== "transit") {
+        issues.push({ kind: "overlap_flight", id: s.id, detail: `manual stay ${s.metro} overlaps flight ${b.from}→${b.to} (${b.depart})` });
+        break;
+      }
+    }
+  }
+
+  return issues;
+}
+
+async function cmdAudit() {
+  const flights = P.loadFlights();
+  const segments = await P.fetchSegmentsStrict();
+  const issues = buildAuditIssues(flights, segments);
+  if (has("json")) return console.log(JSON.stringify({ ok: issues.length === 0, count: issues.length, issues }, null, 2));
+  if (!issues.length) return console.log("audit: clean — timeline consistent with bookings");
+  console.log(`audit: ${issues.length} issue(s)`);
+  for (const i of issues) console.log(`  [${i.kind}] ${i.detail}${i.suggest ? ` → ${i.suggest}` : ""}`);
+}
+
+// ── Wiki page: human-readable timeline + discrepancies, for eyeball review ──
+function etCell(iso) {
+  if (!iso) return "open";
+  return new Date(iso).toLocaleString("en-US", { timeZone: HOME_TZ, year: "numeric", month: "short", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false });
+}
+function renderWikiBody(segments, issues, nowISO) {
+  const L = [];
+  L.push("---", "type: reference", "title: Travel Schedule", "status: active", "---", "");
+  L.push("# Travel Schedule — where the user will be", "");
+  L.push(`_Single source of truth: the travel timeline table. Auto-generated by \`travel wiki\` — refreshed on every booking sync and manual edit. Last refresh: ${nowISO}._`, "");
+  L.push("Scan the rows for anything wrong — that's the manual discrepancy check. Fix via `travel add|edit|rm` (manual rows) or `travel sync` (re-pull bookings). A gap between two stays = in transit.", "");
+  L.push(`| Metro | Place | Arrive (${HOME_TZ}) | Depart (${HOME_TZ}) | Source |`, "|---|---|---|---|---|");
+  for (const s of segments) L.push(`| ${s.metro} | ${(s.place_label || "").replace(/\|/g, "/")} | ${etCell(s.arrive_at)} | ${etCell(s.depart_at)} | ${s.source} |`);
+  L.push("");
+  L.push("## ⚠️ Discrepancies (timeline vs. bookings)", "");
+  if (!issues.length) L.push("None — timeline is consistent with current bookings.");
+  else for (const i of issues) L.push(`- **${i.kind}** — ${i.detail}${i.suggest ? ` → ${i.suggest}` : ""}`);
+  L.push("");
+  return L.join("\n");
+}
+function writeWiki(body) {
+  execFileSync(path.join(__dirname, "wiki"), ["save", "travel_schedule", "--body", "-", "--no-precheck", "--by", "cli:travel-render"],
+    { input: body, stdio: ["pipe", "ignore", "ignore"], timeout: 15000 });
+}
+// ── Plan page auto-sync: rewrite the AUTO blocks in the hand-authored
+// plan page (config plan_page_id) from the same resolved timeline (+ trip history) so its
+// factual sections can never go stale. Human planning prose outside the markers is
+// left untouched. Best-effort — never fails a mutation. ──
+function etDay(iso) {
+  if (!iso) return "open";
+  return new Date(iso).toLocaleString("en-US", { timeZone: HOME_TZ, month: "short", day: "numeric", year: "numeric" });
+}
+function etDayShort(iso) {
+  if (!iso) return "open";
+  return new Date(iso).toLocaleString("en-US", { timeZone: HOME_TZ, month: "short", day: "numeric" });
+}
+// Assign a lodging stay to the flight leg it overlaps most (robust to check-in
+// times that fall on a travel day, which would otherwise double-count).
+function legIndexFor(lodge, legs) {
+  let best = -1, bestOv = 0;
+  const la = new Date(lodge.arrive_at).getTime();
+  const ld = lodge.depart_at ? new Date(lodge.depart_at).getTime() : la;
+  for (let i = 0; i < legs.length; i++) {
+    const a = new Date(legs[i].arrive_at).getTime();
+    const d = legs[i].depart_at ? new Date(legs[i].depart_at).getTime() : Infinity;
+    const ov = Math.min(d, ld) - Math.max(a, la);
+    if (ov > bestOv) { bestOv = ov; best = i; }
+  }
+  return best;
+}
+function etDayKey(iso) {
+  return iso ? new Date(iso).toLocaleDateString("en-CA", { timeZone: HOME_TZ }) : null;
+}
+// The public table of US state names (generic, not this installation's places).
+const US_STATES = { AL: "Alabama", AK: "Alaska", AZ: "Arizona", AR: "Arkansas", CA: "California", CO: "Colorado", CT: "Connecticut", DE: "Delaware", FL: "Florida", GA: "Georgia", HI: "Hawaii", ID: "Idaho", IL: "Illinois", IN: "Indiana", IA: "Iowa", KS: "Kansas", KY: "Kentucky", LA: "Louisiana", ME: "Maine", MD: "Maryland", MA: "Massachusetts", MI: "Michigan", MN: "Minnesota", MS: "Mississippi", MO: "Missouri", MT: "Montana", NE: "Nebraska", NV: "Nevada", NH: "New Hampshire", NJ: "New Jersey", NM: "New Mexico", NY: "New York", NC: "North Carolina", ND: "North Dakota", OH: "Ohio", OK: "Oklahoma", OR: "Oregon", PA: "Pennsylvania", RI: "Rhode Island", SC: "South Carolina", SD: "South Dakota", TN: "Tennessee", TX: "Texas", UT: "Utah", VT: "Vermont", VA: "Virginia", WA: "Washington", WV: "West Virginia", WI: "Wisconsin", WY: "Wyoming", DC: "Washington, D.C." }; // kernel-guard-ok: public US state names
+// Parse a lodging place_label ("City, Region — Property name") into { city, region }.
+// Region is the country (international) or the US state code; the property part
+// (after the first em-dash) is ignored, and may itself contain hyphens.
+// `structured` is true only for labels shaped "City, Region — property" (the
+// lodging convention). Bare human labels (e.g. a manual override's --label,
+// "Sixty LES Hotel") have no comma and must NOT count as a distinct "city" —
+// otherwise a single such entry falsely triggers the multi-city region rollup
+// below and mislabels the whole leg (e.g. relabeling months of ordinary
+// home-city residency as a neighbouring state because of one unrelated
+// overnight nested under it).
+function parsePlace(label) {
+  const loc = String(label || "").split(" — ")[0].trim();
+  const parts = loc.split(",").map(s => s.trim()).filter(Boolean);
+  return { city: parts[0] || loc, region: parts.length > 1 ? parts[parts.length - 1] : null, structured: parts.length > 1 };
+}
+function parentLabel(region) {
+  return region ? (US_STATES[region] || region) : null;
+}
+function renderItineraryBlock(segments) {
+  const legs = segments.filter(s => s.source === "flights" && s.metro !== "transit");
+  if (!legs.length) return "_No booked travel on the timeline yet — see [[travel_schedule]]._";
+  const lodging = segments.filter(s => s.source === "lodging" || s.source === "manual");
+  const byLeg = legs.map(() => []);
+  for (const l of lodging) { const i = legIndexFor(l, legs); if (i >= 0) byLeg[i].push(l); }
+  const lines = [];
+  let suppressed = 0;
+  legs.forEach((leg, i) => {
+    // Suppress same-day connections/layovers (arrive & depart on the same home-zone day,
+    // no overnight stay) for a cleaner overview — they remain in [[travel_schedule]].
+    const aKey = etDayKey(leg.arrive_at), dKey = etDayKey(leg.depart_at);
+    if (aKey && dKey && aKey === dKey && byLeg[i].length === 0) { suppressed++; return; }
+    // When a leg spans multiple lodging cities, label it by the next hierarchy
+    // level up (country, or US state) instead of the arrival airport's city —
+    // e.g. the country for a leg with stays in three of its cities. Single-city or
+    // lodging-less legs keep the flight leg's own label.
+    const parsed = byLeg[i].map(l => parsePlace(l.place_label));
+    const structured = parsed.filter(p => p.structured);
+    const cities = [...new Set(structured.map(p => p.city))];
+    let place = leg.place_label || leg.metro || "";
+    if (cities.length >= 2) {
+      const regions = [...new Set(structured.map(p => p.region).filter(Boolean))];
+      if (regions.length === 1 && parentLabel(regions[0])) place = parentLabel(regions[0]);
+    }
+    place = String(place).replace(/\|/g, "/");
+    lines.push(`- **${place}** — ${etDay(leg.arrive_at)} → ${etDay(leg.depart_at)}`);
+    byLeg[i].sort((x, y) => new Date(x.arrive_at) - new Date(y.arrive_at));
+    for (const l of byLeg[i]) {
+      const lp = (l.place_label || l.metro || "").replace(/\|/g, "/");
+      lines.push(`  - ${lp} (${etDayShort(l.arrive_at)}–${etDayShort(l.depart_at)})`);
+    }
+  });
+  if (suppressed) lines.push("", `_(${suppressed} same-day connection${suppressed === 1 ? "" : "s"} omitted for clarity — full routing in [[travel_schedule]].)_`);
+  return lines.join("\n");
+}
+function renderPastBlock() {
+  let trips = [];
+  try {
+    const j = JSON.parse(fs.readFileSync(TRIP_HISTORY_PATH, "utf8"));
+    trips = Array.isArray(j) ? j : (Array.isArray(j.trips) ? j.trips : Object.values(j));
+  } catch { return "_Trip history unavailable — see [[reference_trip_history]]._"; }
+  const now = Date.now();
+  const year = new Date().toLocaleString("en-US", { timeZone: HOME_TZ, year: "numeric" });
+  const past = trips.filter(t => {
+    if (!t.end) return false;
+    const ended = new Date(t.end + "T23:59:59").getTime() < now;
+    const inYear = String(t.start || "").startsWith(year) || String(t.end || "").startsWith(year);
+    return ended && inYear;
+  }).sort((a, b) => String(a.start).localeCompare(String(b.start)));
+  if (!past.length) return `_No past ${year} trips logged yet — see [[reference_trip_history]]._`;
+  return past.map(t => `- **${(t.title || "Trip").replace(/\|/g, "/")}**${t.location ? ` (${t.location})` : ""} — ${t.dateText || `${t.start} → ${t.end}`}`).join("\n");
+}
+// Replace the inner content between `<!-- AUTO:<name> START … -->` and
+// `<!-- AUTO:<name> END -->`. Returns null if the markers aren't present.
+function replaceAutoBlock(md, name, inner) {
+  const startTag = `<!-- AUTO:${name} START`;
+  const endTag = `<!-- AUTO:${name} END -->`;
+  const si = md.indexOf(startTag);
+  if (si < 0) return null;
+  const startClose = md.indexOf("-->", si);
+  if (startClose < 0) return null;
+  const ei = md.indexOf(endTag, startClose);
+  if (ei < 0) return null;
+  return md.slice(0, startClose + 3) + "\n" + inner + "\n" + md.slice(ei);
+}
+async function syncPlanPageSafe(segments) {
+  if (!PLAN_PAGE_ID) return; // no plan page configured
+  try {
+    const wikiBin = path.join(__dirname, "wiki");
+    let md;
+    try { md = execFileSync(wikiBin, ["render", PLAN_PAGE_ID], { encoding: "utf8", timeout: 15000 }); }
+    catch { return; } // page absent → nothing to sync
+    if (!md || md.indexOf("<!-- AUTO:itinerary START") < 0) return; // not marker-enabled (opt-in)
+    let out = replaceAutoBlock(md, "itinerary", renderItineraryBlock(segments)) || md;
+    out = replaceAutoBlock(out, "past", renderPastBlock()) || out;
+    out = out.replace(/^last_verified_at:.*$/m, `last_verified_at: ${new Date().toISOString().slice(0, 10)}`);
+    if (out === md) return; // no change
+    execFileSync(wikiBin, ["save", PLAN_PAGE_ID, "--body", "-", "--no-precheck", "--by", "cli:travel-plan-sync"],
+      { input: out, stdio: ["pipe", "ignore", "ignore"], timeout: 15000 });
+  } catch { /* best-effort — never break the mutation */ }
+}
+async function cmdWiki() {
+  const flights = P.loadFlights();
+  const segments = await P.fetchSegments();
+  const issues = buildAuditIssues(flights, segments);
+  writeWiki(renderWikiBody(segments, issues, new Date().toISOString()));
+  await syncPlanPageSafe(segments);
+  console.log(`wiki: travel_schedule updated (${segments.length} segments, ${issues.length} discrepanc${issues.length === 1 ? "y" : "ies"})`);
+}
+// Best-effort wiki refresh after any mutation — keeps the review page current
+// without the caller having to remember. Never fails the mutation.
+async function refreshWikiSafe() {
+  try {
+    const flights = P.loadFlights();
+    const segments = await P.fetchSegments();
+    writeWiki(renderWikiBody(segments, buildAuditIssues(flights, segments), new Date().toISOString()));
+    await syncPlanPageSafe(segments);
+  } catch { /* page refresh is best-effort */ }
+}
+
+(async () => {
+  try {
+    switch (cmd) {
+      case "list": await cmdList(); break;
+      case "where": await cmdWhere(); break;
+      case "in-city": await cmdInCity(); break;
+      case "check-picks": await cmdCheckPicks(); break;
+      case "flights": cmdFlights(); break;
+      case "calendar": cmdCalendar(); break;
+      case "calendar-refresh": await cmdCalendarRefresh(); break;
+      case "add": await cmdAdd(); break;
+      case "edit": await cmdEdit(); break;
+      case "rm": case "remove": case "delete": await cmdRm(); break;
+      case "sync": case "import": await cmdSync(); break;
+      case "audit": await cmdAudit(); break;
+      case "wiki": await cmdWiki(); break;
+      default:
+        die("usage: travel <list|where|in-city|check-picks|flights|calendar|calendar-refresh|add|edit|rm|sync|audit|wiki> ... (see header)", 2);
+    }
+  } catch (err) {
+    die("travel: " + (err && err.message ? err.message : String(err)));
+  }
+})();
