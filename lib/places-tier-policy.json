@@ -1,0 +1,17 @@
+{
+  "notes": "THE single policy for every Google Places request this repo makes, enforced by lib/places_client.py and lib/places-client.js (the only files allowed to reach places.googleapis.com; tests/places-choke-point.test.mjs fails any other). These are generic, safe defaults; an installation's own values go in agent/local/config/places-tier-policy.json, merged over this file (lib/places-guard.js readPolicy / lib/places_guard.py read_policy: scalars and lists replace, assumed_free_per_month and each daily_live_caps tier merge key by key). Before each request the client: (1) refuses on a host not in allowed_hosts when the list is non-empty (set it when several machines share the code but one holds the ledger); (2) refuses when places-budget has the month blocked; (3) for a text search at enterprise / enterprise_atmosphere, refuses a caller (--lane / PLACES_LANE, or the tool) absent from daily_live_caps for that tier, or over its daily count; (4) reserves the call's cost in the month ledger (data/places-ledger.json) and refuses if month spend would pass monthly_ceiling_usd. Spend so far = max(ledger, places-budget's billed figure). A call is charged at list price unless it falls inside assumed_free_per_month for its SKU (default: none, so every call is charged), further cut to what places-budget last saw left in the account's free pool. Google's free allowances are per billing account, so another project on the same account can spend them first: only count on a pool nothing else draws from. Any of policy, ledger or lock unreadable = refuse (fail closed). Raising a number is a spending decision: say why in the commit.",
+  "allowed_hosts": [],
+  "monthly_ceiling_usd": 10,
+  "assumed_free_per_month": {},
+  "daily_live_caps": {
+    "enterprise_atmosphere": {
+      "mcp-rich": 10
+    },
+    "enterprise": {
+      "hum-meal-offer": 6,
+      "mcp": 30,
+      "untagged": 15
+    }
+  },
+  "daily_caps_sized_from": "hum-meal-offer = the one search after a YES to a hum meal offer (bin/meal-pick): at most a few offers a day, one search each, 6 leaves headroom for a re-ask. mcp / mcp-rich = the places MCP tool (standard / with reviews). untagged = a hand run of `places`. Worst case per day if every listed caller hits its cap: 10x$0.04 + (6+30+15)x$0.035 = $2.19; the month ceiling stops the month regardless."
+}

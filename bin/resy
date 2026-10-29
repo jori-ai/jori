@@ -1,0 +1,1266 @@
+#!/usr/bin/env node
+"use strict";
+
+const fs = require("fs");
+const path = require("path");
+const { execSync, spawn } = require("child_process");
+
+const { instance, localConfig } = require(path.join(__dirname, "..", "lib", "instance.cjs"));
+const { installTools } = require(path.join(__dirname, "..", "lib", "root.cjs"));
+
+// ── Paths ──────────────────────────────────────────────────────────────────
+const HOME = process.env.HOME || require("os").homedir();
+const DATA_DIR = installTools("data");
+const AUTH_FILE = path.join(DATA_DIR, "resy-auth.json");
+const LOG_FILE = installTools("logs", "resy-snipe.log");
+
+// ── Per-installation config (agent/local/config/resy.json) ────────────────
+// location:      the Resy city slug venue lookups default to ("" = pass
+//                --location each time; Resy has no city-free venue lookup).
+// slug_suffixes: suffixes Resy adds to venue slugs in that city, tried when
+//                the bare slug is not found (e.g. a city code).
+// tz:            the zone drop times and "today" are read in (default: the
+//                installation's zone).
+// Without a Resy login (`resy login`) every command that needs the API says
+// so and stops; `watch run` (cron) is a no-op.
+const CFG = localConfig("resy", { location: "", slug_suffixes: [], tz: "" });
+const TZ = CFG.tz || instance().tz;
+
+// ── Resy API ───────────────────────────────────────────────────────────────
+const RESY_BASE = "https://api.resy.com";
+const DEFAULT_API_KEY = "youarewhereyoueat";
+
+// ── Alert delivery ─────────────────────────────────────────────────────────
+const JORI_SEND = path.join(__dirname, "jori-send-curl");
+
+// ── Snipe timing ───────────────────────────────────────────────────────────
+const SNIPE_BUFFER_MS = 2000; // wake up 2s early
+const SNIPE_RETRY_WINDOW_MS = 10_000; // retry for 10s
+const SNIPE_POLL_INTERVAL_MS = 250; // poll every 250ms during snipe
+
+// ── Utility functions ──────────────────────────────────────────────────────
+
+function flag(args, name) {
+  const i = args.indexOf("--" + name);
+  if (i === -1) return null;
+  return args[i + 1] || null;
+}
+
+function hasFlag(args, name) {
+  return args.includes("--" + name);
+}
+
+function log(msg) {
+  const ts = new Date().toISOString();
+  const line = `${ts} [resy] ${msg}`;
+  try {
+    fs.appendFileSync(LOG_FILE, line + "\n");
+  } catch {}
+  if (process.env.RESY_VERBOSE) console.error(line);
+}
+
+function today() {
+  return new Date().toLocaleDateString("en-CA", { timeZone: TZ });
+}
+
+// ── Auth file I/O ──────────────────────────────────────────────────────────
+
+function loadAuth() {
+  try {
+    return JSON.parse(fs.readFileSync(AUTH_FILE, "utf8"));
+  } catch {
+    return null;
+  }
+}
+
+function saveAuth(auth) {
+  fs.mkdirSync(DATA_DIR, { recursive: true });
+  fs.writeFileSync(AUTH_FILE, JSON.stringify(auth, null, 2) + "\n");
+}
+
+function requireAuth() {
+  const auth = loadAuth();
+  if (!auth || !auth.authToken) {
+    console.error("Not logged in. Run: resy login --email <email> --password <password>");
+    process.exit(1);
+  }
+  // Check token age (warn if >30 days)
+  if (auth.obtainedAt) {
+    const ageMs = Date.now() - new Date(auth.obtainedAt).getTime();
+    const ageDays = ageMs / (24 * 3600_000);
+    if (ageDays > 30) {
+      console.error("Warning: Auth token is " + Math.floor(ageDays) + " days old. Consider re-running: resy login");
+    }
+  }
+  return auth;
+}
+
+function resolveVenue(auth, venueInput) {
+  // Check if it's a numeric venue ID
+  const num = parseInt(venueInput, 10);
+  if (!isNaN(num) && String(num) === venueInput) return num;
+  // Check aliases
+  if (auth.aliases && auth.aliases[venueInput.toLowerCase()]) {
+    return auth.aliases[venueInput.toLowerCase()];
+  }
+  console.error(`Unknown venue: "${venueInput}". Use a numeric venue ID or create an alias with: resy alias "${venueInput}" <venue_id>`);
+  process.exit(1);
+}
+
+// ── Resy API client ────────────────────────────────────────────────────────
+
+function resyHeaders(auth) {
+  return {
+    Authorization: `ResyAPI api_key="${auth.apiKey || DEFAULT_API_KEY}"`,
+    "x-resy-auth-token": auth.authToken,
+    Accept: "application/json, text/plain, */*",
+    Origin: "https://resy.com",
+    Referer: "https://resy.com/",
+    "Cache-Control": "no-cache",
+    "X-Origin": "https://resy.com",
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.3.1 Safari/605.1.15",
+  };
+}
+
+async function resyGet(endpoint, params, auth) {
+  const url = new URL(RESY_BASE + endpoint);
+  for (const [k, v] of Object.entries(params || {})) {
+    if (v != null) url.searchParams.set(k, v);
+  }
+  const res = await fetch(url.toString(), {
+    headers: resyHeaders(auth),
+    signal: AbortSignal.timeout(15_000),
+  });
+  if (!res.ok) {
+    const body = await res.text().catch(() => "");
+    throw new Error(`Resy ${endpoint} returned ${res.status}: ${body.slice(0, 200)}`);
+  }
+  return res.json();
+}
+
+async function resyPost(endpoint, formData, auth, extraHeaders = {}) {
+  const res = await fetch(RESY_BASE + endpoint, {
+    method: "POST",
+    headers: {
+      ...resyHeaders(auth),
+      "Content-Type": "application/x-www-form-urlencoded",
+      Origin: "https://widgets.resy.com",
+      Referer: "https://widgets.resy.com/",
+      ...extraHeaders,
+    },
+    body: new URLSearchParams(formData).toString(),
+    signal: AbortSignal.timeout(10_000),
+  });
+  if (!res.ok) {
+    const body = await res.text().catch(() => "");
+    throw new Error(`Resy POST ${endpoint} returned ${res.status}: ${body.slice(0, 200)}`);
+  }
+  return res.json();
+}
+
+// ── Alert delivery ─────────────────────────────────────────────────────────
+
+async function sendAlert(text) {
+  log(`ALERT: ${text}`);
+  try {
+    execSync(`${JORI_SEND}`, { input: text, timeout: 10_000 });
+  } catch (err) {
+    log(`Alert delivery failed: ${err.message}`);
+  }
+}
+
+// ── Slot parsing ───────────────────────────────────────────────────────────
+
+function parseSlots(data) {
+  const venues = data?.results?.venues || [];
+  const slots = [];
+  for (const venue of venues) {
+    const venueName = venue?.venue?.name || "Unknown";
+    const venueId = venue?.venue?.id?.resy;
+    const neighborhood = venue?.venue?.location?.neighborhood || "";
+    for (const slot of venue?.slots || []) {
+      const time = slot?.date?.start; // "2026-04-15 18:00:00"
+      const tableType = slot?.config?.type || "";
+      const configToken = slot?.config?.token || "";
+      if (time && configToken) {
+        slots.push({
+          venueName,
+          venueId,
+          neighborhood,
+          time: time.slice(11, 16), // "18:00"
+          timeFull: time,
+          tableType,
+          configToken,
+        });
+      }
+    }
+  }
+  return slots;
+}
+
+function matchSlot(slots, timePrefs, tableType) {
+  // timePrefs is comma-separated: "18:00,18:15,18:30"
+  const prefs = timePrefs.split(",").map((t) => t.trim());
+  const typeLower = (tableType || "").toLowerCase();
+
+  for (const pref of prefs) {
+    for (const slot of slots) {
+      const timeMatch = slot.time === pref;
+      const typeMatch = !typeLower || slot.tableType.toLowerCase().includes(typeLower);
+      if (timeMatch && typeMatch) return slot;
+    }
+  }
+  // If no exact match, try closest time
+  return null;
+}
+
+// ── Commands ───────────────────────────────────────────────────────────────
+
+async function cmdLogin(args) {
+  const email = flag(args, "email");
+  const password = flag(args, "password");
+  const apiKey = flag(args, "api-key") || DEFAULT_API_KEY;
+
+  if (!email || !password) {
+    console.error("Usage: resy login --email <email> --password <password> [--api-key <key>]");
+    process.exit(1);
+  }
+
+  console.log("Authenticating with Resy...");
+
+  try {
+    const res = await fetch(RESY_BASE + "/3/auth/password", {
+      method: "POST",
+      headers: {
+        Authorization: `ResyAPI api_key="${apiKey}"`,
+        "Content-Type": "application/x-www-form-urlencoded",
+      },
+      body: new URLSearchParams({ email, password }).toString(),
+      signal: AbortSignal.timeout(10_000),
+    });
+
+    if (!res.ok) {
+      const body = await res.text().catch(() => "");
+      console.error(`Login failed (${res.status}): ${body.slice(0, 200)}`);
+      process.exit(1);
+    }
+
+    const data = await res.json();
+    const authToken = data.token || data.auth_token;
+
+    if (!authToken) {
+      console.error("Login succeeded but no auth token in response.");
+      console.error("Response keys:", Object.keys(data).join(", "));
+      console.error("Try providing your auth token directly: resy token --auth-token <token>");
+      process.exit(1);
+    }
+
+    const existing = loadAuth() || {};
+    const auth = {
+      ...existing,
+      apiKey,
+      authToken,
+      email,
+      obtainedAt: new Date().toISOString(),
+      aliases: existing.aliases || {},
+    };
+    saveAuth(auth);
+
+    if (hasFlag(args, "json")) {
+      console.log(JSON.stringify({ success: true, email }, null, 2));
+    } else {
+      console.log(`Logged in as ${email}`);
+      console.log(`Auth token stored in ${AUTH_FILE}`);
+    }
+  } catch (err) {
+    console.error(`Login error: ${err.message}`);
+    process.exit(1);
+  }
+}
+
+async function cmdToken(args) {
+  const authToken = flag(args, "auth-token");
+  const apiKey = flag(args, "api-key") || DEFAULT_API_KEY;
+
+  if (!authToken) {
+    console.error("Usage: resy token --auth-token <token> [--api-key <key>]");
+    console.error("\nGet your auth token from browser DevTools:");
+    console.error("1. Log in to resy.com");
+    console.error("2. Open DevTools → Network tab");
+    console.error('3. Find any api.resy.com request');
+    console.error('4. Copy the x-resy-auth-token header value');
+    process.exit(1);
+  }
+
+  const existing = loadAuth() || {};
+  const auth = {
+    ...existing,
+    apiKey,
+    authToken,
+    obtainedAt: new Date().toISOString(),
+    aliases: existing.aliases || {},
+  };
+  saveAuth(auth);
+  console.log("Auth token saved.");
+}
+
+async function cmdSearch(args) {
+  const auth = requireAuth();
+  const query = args.find((a) => !a.startsWith("--"));
+  const date = flag(args, "date") || today();
+  const party = flag(args, "party") || "2";
+  const location = flag(args, "location") || CFG.location;
+  const jsonOut = hasFlag(args, "json");
+
+  if (!query) {
+    console.error("Usage: resy search <query> [--date YYYY-MM-DD] [--party N] [--location SLUG]");
+    process.exit(1);
+  }
+  if (!location) {
+    console.error("No Resy city: pass --location <slug> (the city part of a resy.com/cities/<slug>/... URL) or set `location` in agent/local/config/resy.json.");
+    process.exit(1);
+  }
+
+  // Convert query to URL slug: "Some Restaurant" → "some-restaurant"
+  const slug = query.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
+
+  try {
+    // Step 1: Look up venue by slug
+    const venueData = await resyGet("/3/venue", {
+      url_slug: slug,
+      location,
+    }, auth);
+
+    const venueId = venueData?.id?.resy;
+    const name = venueData?.name || query;
+    const hood = venueData?.location?.neighborhood || "";
+    const cuisine = venueData?.type || "";
+    const priceRange = venueData?.price_range;
+    const rating = venueData?.rating;
+    const needToKnow = venueData?.content?.[0]?.body || "";
+
+    if (!venueId) {
+      // Venue slug not found — try with common suffixes
+      const suffixes = [...(CFG.slug_suffixes || []), `-${location.split("-")[0]}`, ""];
+      let found = false;
+      for (const suffix of suffixes) {
+        if (suffix === "" && slug === query.toLowerCase().replace(/[^a-z0-9]+/g, "-")) continue;
+        try {
+          const retryData = await resyGet("/3/venue", {
+            url_slug: slug + suffix,
+            location,
+          }, auth);
+          if (retryData?.id?.resy) {
+            return cmdSearchDisplay(auth, retryData, date, party, jsonOut);
+          }
+        } catch {}
+      }
+      if (!found) {
+        console.error(`Venue not found for "${query}" (tried slug: ${slug})`);
+        console.error("Tip: Check the URL on resy.com — the slug is in the URL path.");
+        console.error("Example: resy.com/cities/<city>/<venue-slug> → use '<venue-slug>'");
+        process.exit(1);
+      }
+      return;
+    }
+
+    await cmdSearchDisplay(auth, venueData, date, party, jsonOut);
+  } catch (err) {
+    if (err.message.includes("404")) {
+      // Try the city's configured slug suffixes
+      for (const suffix of CFG.slug_suffixes || []) {
+        try {
+          const retryData = await resyGet("/3/venue", {
+            url_slug: slug + suffix,
+            location,
+          }, auth);
+          if (retryData?.id?.resy) {
+            return cmdSearchDisplay(auth, retryData, date, party, jsonOut);
+          }
+        } catch {}
+      }
+      console.error(`Venue not found for "${query}". Check the slug on resy.com.`);
+    } else {
+      console.error(`Search failed: ${err.message}`);
+    }
+    process.exit(1);
+  }
+}
+
+async function cmdSearchDisplay(auth, venueData, date, party, jsonOut) {
+  const venueId = venueData?.id?.resy;
+  const name = venueData?.name || "Unknown";
+  const hood = venueData?.location?.neighborhood || "";
+  const cuisine = venueData?.type || "";
+  const priceRange = venueData?.price_range;
+  const rating = venueData?.rating;
+
+  // Get availability
+  let slots = [];
+  try {
+    const findData = await resyGet("/4/find", {
+      venue_id: venueId,
+      day: date,
+      party_size: party,
+      lat: 0,
+      long: 0,
+    }, auth);
+    slots = parseSlots(findData);
+  } catch {}
+
+  if (jsonOut) {
+    console.log(JSON.stringify({
+      venueId,
+      name,
+      neighborhood: hood,
+      cuisine,
+      priceRange,
+      rating,
+      date,
+      partySize: parseInt(party),
+      slots: slots.map((s) => ({ time: s.time, type: s.tableType })),
+    }, null, 2));
+    return;
+  }
+
+  console.log(`\n${name} (ID: ${venueId})`);
+  if (hood || cuisine) console.log(`  ${hood}${cuisine ? " · " + cuisine : ""}`);
+  if (priceRange) console.log(`  Price: ${"$".repeat(priceRange)}`);
+  if (rating) console.log(`  Rating: ${rating.toFixed(1)}`);
+  console.log(`\n  Availability for ${date} (party of ${party}):`);
+  if (slots.length > 0) {
+    for (const s of slots) {
+      const type = s.tableType ? ` [${s.tableType}]` : "";
+      console.log(`    ${s.time}${type}`);
+    }
+  } else {
+    console.log("    No availability");
+    const ntk = venueData?.content?.find(c => c?.name === "need_to_know");
+    if (ntk?.body) {
+      // Extract drop time info from need-to-know
+      const dropMatch = ntk.body.match(/(\d+)\s*(?:days?)\s*in\s*advance.*?(\d{1,2})\s*(AM|PM)/i);
+      if (dropMatch) {
+        console.log(`\n  Tip: Reservations open ${dropMatch[1]} days ahead at ${dropMatch[2]} ${dropMatch[3]}`);
+        console.log(`  Try: resy snipe ${venueId} --date <DATE> --time <TIME> --drop ${dropMatch[3] === "AM" ? dropMatch[2] + ":00" : (parseInt(dropMatch[2]) + 12) + ":00"}`);
+      }
+    }
+  }
+  console.log("");
+}
+
+async function cmdSlots(args) {
+  const auth = requireAuth();
+  const venueInput = args.find((a) => !a.startsWith("--"));
+  const date = flag(args, "date") || today();
+  const party = flag(args, "party") || "2";
+  const jsonOut = hasFlag(args, "json");
+
+  if (!venueInput) {
+    console.error("Usage: resy slots <venue_id> --date YYYY-MM-DD [--party N]");
+    process.exit(1);
+  }
+
+  const venueId = resolveVenue(auth, venueInput);
+
+  try {
+    const data = await resyGet("/4/find", {
+      venue_id: venueId,
+      day: date,
+      party_size: party,
+      lat: 0,
+      long: 0,
+    }, auth);
+
+    const slots = parseSlots(data);
+
+    if (jsonOut) {
+      console.log(JSON.stringify(slots, null, 2));
+      return;
+    }
+
+    if (slots.length === 0) {
+      console.log(`No availability for venue ${venueId} on ${date} (party of ${party}).`);
+      return;
+    }
+
+    const venueName = slots[0]?.venueName || venueId;
+    console.log(`\n${venueName} — ${date} (party of ${party})`);
+    console.log("─".repeat(50));
+    for (const slot of slots) {
+      const type = slot.tableType ? ` [${slot.tableType}]` : "";
+      console.log(`  ${slot.time}${type}`);
+    }
+    console.log(`\n${slots.length} slot(s) available`);
+  } catch (err) {
+    console.error(`Slots failed: ${err.message}`);
+    process.exit(1);
+  }
+}
+
+async function cmdBook(args) {
+  const auth = requireAuth();
+  const venueInput = args.find((a) => !a.startsWith("--"));
+  const date = flag(args, "date");
+  const timeStr = flag(args, "time");
+  const party = flag(args, "party") || "2";
+  const tableType = flag(args, "type") || "";
+  const jsonOut = hasFlag(args, "json");
+
+  if (!venueInput || !date || !timeStr) {
+    console.error("Usage: resy book <venue_id> --date YYYY-MM-DD --time HH:MM[,HH:MM,...] [--party N] [--type TYPE]");
+    process.exit(1);
+  }
+
+  const venueId = resolveVenue(auth, venueInput);
+
+  try {
+    // Step 1: Find available slots
+    console.log("Finding available slots...");
+    const findData = await resyGet("/4/find", {
+      venue_id: venueId,
+      day: date,
+      party_size: party,
+      lat: 0,
+      long: 0,
+    }, auth);
+
+    const slots = parseSlots(findData);
+    if (slots.length === 0) {
+      console.error("No availability found.");
+      process.exit(1);
+    }
+
+    // Step 2: Match preferred time
+    const matched = matchSlot(slots, timeStr, tableType);
+    if (!matched) {
+      console.error(`No slot matching time ${timeStr}${tableType ? " (" + tableType + ")" : ""}.`);
+      console.error("Available times: " + slots.map((s) => s.time).join(", "));
+      process.exit(1);
+    }
+
+    console.log(`Found slot: ${matched.time} ${matched.tableType ? "[" + matched.tableType + "]" : ""}`);
+
+    // Step 3: Get booking details
+    console.log("Getting booking details...");
+    const details = await resyGet("/3/details", {
+      config_id: matched.configToken,
+      day: date,
+      party_size: party,
+    }, auth);
+
+    const bookToken = details?.book_token?.value;
+    const paymentMethodId = details?.user?.payment_methods?.[0]?.id;
+
+    if (!bookToken) {
+      console.error("Could not get booking token from details.");
+      process.exit(1);
+    }
+
+    // Step 4: Book
+    console.log("Booking...");
+    const bookParams = { book_token: bookToken };
+    if (paymentMethodId) {
+      bookParams.struct_payment_method = JSON.stringify({ id: paymentMethodId });
+    }
+
+    const bookResult = await resyPost("/3/book", bookParams, auth);
+    const resyToken = bookResult?.resy_token || bookResult?.reservation_id || "confirmed";
+
+    if (jsonOut) {
+      console.log(JSON.stringify({
+        success: true,
+        venue: matched.venueName,
+        venueId,
+        date,
+        time: matched.time,
+        tableType: matched.tableType,
+        partySize: party,
+        resyToken,
+      }, null, 2));
+    } else {
+      console.log(`\nBooked! ${matched.venueName}`);
+      console.log(`  Date:  ${date}`);
+      console.log(`  Time:  ${matched.time}`);
+      console.log(`  Party: ${party}`);
+      if (matched.tableType) console.log(`  Type:  ${matched.tableType}`);
+      console.log(`  Confirmation: ${resyToken}`);
+    }
+
+    await sendAlert(
+      `Resy booking confirmed: ${matched.venueName}\n` +
+      `Date: ${date}, Time: ${matched.time}, Party: ${party}\n` +
+      `Confirmation: ${resyToken}`
+    );
+  } catch (err) {
+    console.error(`Booking failed: ${err.message}`);
+    process.exit(1);
+  }
+}
+
+// ── Snipe command ──────────────────────────────────────────────────────────
+
+async function cmdSnipe(args) {
+  const auth = requireAuth();
+  const venueInput = args.find((a) => !a.startsWith("--"));
+  const date = flag(args, "date");
+  const timeStr = flag(args, "time");
+  const party = flag(args, "party") || "2";
+  const tableType = flag(args, "type") || "";
+  const dropTime = flag(args, "drop") || "00:00";
+  const jsonOut = hasFlag(args, "json");
+
+  if (!venueInput || !date || !timeStr) {
+    console.error("Usage: resy snipe <venue_id> --date YYYY-MM-DD --time HH:MM [--drop HH:MM] [--party N] [--type TYPE]");
+    console.error(`\n  --drop    When reservations become available (default: 00:00 ${TZ})`);
+    console.error("  --time    Preferred time(s), comma-separated priority list");
+    process.exit(1);
+  }
+
+  const venueId = resolveVenue(auth, venueInput);
+
+  // Calculate ms until drop time
+  const [dropH, dropM] = dropTime.split(":").map(Number);
+  const now = new Date();
+  const etNow = new Date(now.toLocaleString("en-US", { timeZone: TZ }));
+  const dropDate = new Date(etNow);
+  dropDate.setHours(dropH, dropM, 0, 0);
+
+  // If drop time already passed today, schedule for tomorrow
+  if (dropDate <= etNow) {
+    dropDate.setDate(dropDate.getDate() + 1);
+  }
+
+  // Convert back to system time
+  const etOffset = etNow.getTime() - now.getTime();
+  const dropSystemTime = new Date(dropDate.getTime() - etOffset);
+  const msUntilDrop = dropSystemTime.getTime() - Date.now();
+
+  if (msUntilDrop < 0) {
+    console.error("Drop time is in the past.");
+    process.exit(1);
+  }
+
+  const hoursUntil = (msUntilDrop / 3600_000).toFixed(1);
+
+  // Fork background process for the snipe
+  const snipeArgs = [
+    process.argv[1], "_snipe",
+    String(venueId), date, timeStr, party, tableType, dropTime,
+    String(dropSystemTime.getTime()),
+  ];
+
+  const child = spawn(process.execPath, snipeArgs, {
+    detached: true,
+    stdio: ["ignore", "ignore", "ignore"],
+    env: { ...process.env, HOME },
+  });
+  child.unref();
+
+  const pidFile = path.join(DATA_DIR, `resy-snipe-${venueId}-${date}.pid`);
+  fs.mkdirSync(DATA_DIR, { recursive: true });
+  fs.writeFileSync(pidFile, String(child.pid));
+
+  if (jsonOut) {
+    console.log(JSON.stringify({
+      scheduled: true,
+      venueId,
+      date,
+      time: timeStr,
+      dropTime,
+      dropAt: dropSystemTime.toISOString(),
+      hoursUntil: parseFloat(hoursUntil),
+      pid: child.pid,
+    }, null, 2));
+  } else {
+    console.log(`Snipe scheduled!`);
+    console.log(`  Venue:  ${venueId}`);
+    console.log(`  Date:   ${date}`);
+    console.log(`  Time:   ${timeStr}`);
+    console.log(`  Drop:   ${dropTime} ${TZ} (in ${hoursUntil}h)`);
+    console.log(`  Party:  ${party}`);
+    console.log(`  PID:    ${child.pid}`);
+    console.log(`  Log:    ${LOG_FILE}`);
+    console.log(`\nWill alert via the agent's push channel on success/failure.`);
+  }
+}
+
+// Internal snipe execution (called as background process)
+async function cmdSnipeExec(args) {
+  const venueId = parseInt(args[0], 10);
+  const date = args[1];
+  const timeStr = args[2];
+  const party = args[3];
+  const tableType = args[4];
+  const dropTime = args[5];
+  const dropTimestamp = parseInt(args[6], 10);
+
+  const auth = requireAuth();
+  const msUntilDrop = dropTimestamp - Date.now() - SNIPE_BUFFER_MS;
+
+  log(`Snipe scheduled: venue=${venueId} date=${date} time=${timeStr} drop=${dropTime}`);
+  log(`Sleeping ${(msUntilDrop / 1000).toFixed(0)}s until ${SNIPE_BUFFER_MS / 1000}s before drop...`);
+
+  if (msUntilDrop > 0) {
+    await new Promise((r) => setTimeout(r, msUntilDrop));
+  }
+
+  log("Woke up — starting snipe loop");
+
+  const deadline = dropTimestamp + SNIPE_RETRY_WINDOW_MS;
+  let attempts = 0;
+  let booked = false;
+
+  while (Date.now() < deadline && !booked) {
+    attempts++;
+    try {
+      // Step 1: Find slots
+      const findData = await resyGet("/4/find", {
+        venue_id: venueId,
+        day: date,
+        party_size: party,
+        lat: 0,
+        long: 0,
+      }, auth);
+
+      const slots = parseSlots(findData);
+      if (slots.length === 0) {
+        log(`Attempt ${attempts}: no slots yet`);
+        await new Promise((r) => setTimeout(r, SNIPE_POLL_INTERVAL_MS));
+        continue;
+      }
+
+      log(`Attempt ${attempts}: found ${slots.length} slots`);
+
+      // Step 2: Match time
+      const matched = matchSlot(slots, timeStr, tableType);
+      if (!matched) {
+        log(`Attempt ${attempts}: no matching time (${timeStr}). Available: ${slots.map(s => s.time).join(",")}`);
+        // Try any slot if we're running out of time
+        if (Date.now() > deadline - 3000 && slots.length > 0) {
+          log("Running out of time — trying first available slot");
+          const fallback = slots[0];
+          const result = await attemptBook(auth, fallback, date, party);
+          if (result) {
+            booked = true;
+            break;
+          }
+        }
+        await new Promise((r) => setTimeout(r, SNIPE_POLL_INTERVAL_MS));
+        continue;
+      }
+
+      // Step 3+4: Details + Book
+      const result = await attemptBook(auth, matched, date, party);
+      if (result) {
+        booked = true;
+        break;
+      }
+    } catch (err) {
+      log(`Attempt ${attempts} error: ${err.message}`);
+    }
+
+    await new Promise((r) => setTimeout(r, SNIPE_POLL_INTERVAL_MS));
+  }
+
+  if (booked) {
+    log("SNIPE SUCCESS");
+  } else {
+    log(`SNIPE FAILED after ${attempts} attempts`);
+    await sendAlert(
+      `Resy snipe FAILED: venue ${venueId}, date ${date}, time ${timeStr}\n` +
+      `Tried ${attempts} times over ${SNIPE_RETRY_WINDOW_MS / 1000}s window. No booking secured.`
+    );
+  }
+
+  // Clean up PID file
+  const pidFile = path.join(DATA_DIR, `resy-snipe-${venueId}-${date}.pid`);
+  try { fs.unlinkSync(pidFile); } catch {}
+}
+
+async function attemptBook(auth, slot, date, party) {
+  try {
+    // Get details
+    const details = await resyGet("/3/details", {
+      config_id: slot.configToken,
+      day: date,
+      party_size: party,
+    }, auth);
+
+    const bookToken = details?.book_token?.value;
+    const paymentMethodId = details?.user?.payment_methods?.[0]?.id;
+
+    if (!bookToken) {
+      log("No book token from details");
+      return false;
+    }
+
+    // Book
+    const bookParams = { book_token: bookToken };
+    if (paymentMethodId) {
+      bookParams.struct_payment_method = JSON.stringify({ id: paymentMethodId });
+    }
+
+    const result = await resyPost("/3/book", bookParams, auth);
+    const resyToken = result?.resy_token || result?.reservation_id || "confirmed";
+
+    log(`BOOKED: ${slot.venueName} ${date} ${slot.time} — ${resyToken}`);
+    await sendAlert(
+      `Resy snipe SUCCESS! Booked ${slot.venueName}\n` +
+      `Date: ${date}, Time: ${slot.time}, Party: ${party}\n` +
+      `Confirmation: ${resyToken}`
+    );
+    return true;
+  } catch (err) {
+    log(`Book attempt failed: ${err.message}`);
+    return false;
+  }
+}
+
+// ── Upcoming reservations ──────────────────────────────────────────────────
+
+async function cmdUpcoming(args) {
+  const auth = requireAuth();
+  const jsonOut = hasFlag(args, "json");
+
+  try {
+    const data = await resyGet("/3/user/reservations", {}, auth);
+    const reservations = data?.reservations || data || [];
+
+    if (jsonOut) {
+      console.log(JSON.stringify(reservations, null, 2));
+      return;
+    }
+
+    if (!Array.isArray(reservations) || reservations.length === 0) {
+      console.log("No upcoming reservations.");
+      return;
+    }
+
+    console.log("Upcoming Reservations:");
+    console.log("─".repeat(50));
+    for (const r of reservations) {
+      const venue = r?.venue?.name || r?.restaurant?.name || "Unknown";
+      const date = r?.date?.start || r?.day || "";
+      const time = date.includes(" ") ? date.split(" ")[1]?.slice(0, 5) : "";
+      const party = r?.num_seats || r?.party_size || "?";
+      const token = r?.resy_token || r?.confirmation || "";
+      console.log(`  ${venue}`);
+      console.log(`    ${date.slice(0, 10)} at ${time} — party of ${party}`);
+      if (token) console.log(`    Confirmation: ${token}`);
+    }
+  } catch (err) {
+    console.error(`Failed to get reservations: ${err.message}`);
+    process.exit(1);
+  }
+}
+
+// ── Alias management ───────────────────────────────────────────────────────
+
+function cmdAlias(args) {
+  const name = args[0];
+  const venueId = args[1];
+  const jsonOut = hasFlag(args, "json");
+
+  if (!name) {
+    // List aliases
+    const auth = loadAuth() || {};
+    const aliases = auth.aliases || {};
+    if (jsonOut) {
+      console.log(JSON.stringify(aliases, null, 2));
+    } else if (Object.keys(aliases).length === 0) {
+      console.log("No aliases defined. Add one with: resy alias <name> <venue_id>");
+    } else {
+      console.log("Venue Aliases:");
+      for (const [n, id] of Object.entries(aliases)) {
+        console.log(`  ${n.padEnd(25)} → ${id}`);
+      }
+    }
+    return;
+  }
+
+  if (name === "rm" || name === "remove") {
+    const target = args[1];
+    if (!target) {
+      console.error("Usage: resy alias remove <name>");
+      process.exit(1);
+    }
+    const auth = loadAuth() || {};
+    if (auth.aliases) {
+      delete auth.aliases[target.toLowerCase()];
+      saveAuth(auth);
+      console.log(`Removed alias: ${target}`);
+    }
+    return;
+  }
+
+  if (!venueId || isNaN(parseInt(venueId, 10))) {
+    console.error("Usage: resy alias <name> <venue_id>");
+    console.error("Example: resy alias don-angie 835");
+    process.exit(1);
+  }
+
+  const auth = loadAuth() || { aliases: {} };
+  if (!auth.aliases) auth.aliases = {};
+  auth.aliases[name.toLowerCase()] = parseInt(venueId, 10);
+  saveAuth(auth);
+
+  if (jsonOut) {
+    console.log(JSON.stringify({ alias: name.toLowerCase(), venueId: parseInt(venueId, 10) }));
+  } else {
+    console.log(`Alias saved: ${name.toLowerCase()} → ${venueId}`);
+  }
+}
+
+// ── Snipes management ──────────────────────────────────────────────────────
+
+function cmdSnipes(args) {
+  const jsonOut = hasFlag(args, "json");
+  const snipeDir = DATA_DIR; // where cmdSnipe writes resy-snipe-<venue>-<date>.pid
+  let dirFiles = [];
+  try { dirFiles = fs.readdirSync(snipeDir); } catch {}
+  const pidFiles = dirFiles.filter((f) => f.startsWith("resy-snipe-") && f.endsWith(".pid"));
+
+  if (pidFiles.length === 0) {
+    console.log("No active snipes.");
+    return;
+  }
+
+  const snipes = [];
+  for (const f of pidFiles) {
+    const pid = fs.readFileSync(path.join(snipeDir, f), "utf8").trim();
+    const parts = f.replace("resy-snipe-", "").replace(".pid", "").split("-");
+    const venueId = parts[0];
+    const date = parts.slice(1).join("-");
+    // Check if process is still running
+    let alive = false;
+    try {
+      process.kill(parseInt(pid, 10), 0);
+      alive = true;
+    } catch {}
+    snipes.push({ venueId, date, pid, alive, file: f });
+  }
+
+  if (jsonOut) {
+    console.log(JSON.stringify(snipes, null, 2));
+    return;
+  }
+
+  console.log("Active Snipes:");
+  for (const s of snipes) {
+    const status = s.alive ? "running" : "finished";
+    console.log(`  Venue ${s.venueId}  Date ${s.date}  PID ${s.pid}  [${status}]`);
+  }
+}
+
+// ── Watch (cancellation monitor) ───────────────────────────────────────────
+
+function cmdWatch(args) {
+  const subcmd = args[0];
+
+  if (subcmd === "add") {
+    return cmdWatchAdd(args.slice(1));
+  } else if (subcmd === "remove" || subcmd === "rm") {
+    return cmdWatchRemove(args.slice(1));
+  } else if (subcmd === "list" || !subcmd) {
+    return cmdWatchList(args.slice(1));
+  } else if (subcmd === "run") {
+    return cmdWatchRun(args.slice(1));
+  } else {
+    console.error("Usage: resy watch [add|remove|list|run]");
+    process.exit(1);
+  }
+}
+
+function cmdWatchAdd(args) {
+  const venueInput = args.find((a) => !a.startsWith("--"));
+  const timeMin = flag(args, "time-min") || "11:00";
+  const timeMax = flag(args, "time-max") || "14:00";
+  const party = flag(args, "party") || "2";
+  const daysAhead = flag(args, "days") || "30";
+  const autoBook = hasFlag(args, "auto-book") || hasFlag(args, "book");
+  const jsonOut = hasFlag(args, "json");
+
+  if (!venueInput) {
+    console.error("Usage: resy watch add <venue_id> [--time-min HH:MM] [--time-max HH:MM] [--party N] [--days N] [--auto-book]");
+    process.exit(1);
+  }
+
+  const auth = loadAuth() || {};
+  const venueId = resolveVenue(auth, venueInput);
+
+  if (!auth.watches) auth.watches = [];
+
+  // Dedup
+  const exists = auth.watches.find((w) => w.venueId === venueId && w.timeMin === timeMin && w.timeMax === timeMax);
+  if (exists) {
+    console.error("Watch already exists for this venue/time range.");
+    process.exit(1);
+  }
+
+  const watch = {
+    id: `${venueId}-${Date.now()}`,
+    venueId,
+    venueName: venueInput,
+    timeMin,
+    timeMax,
+    partySize: parseInt(party),
+    daysAhead: parseInt(daysAhead),
+    autoBook,
+    createdAt: new Date().toISOString(),
+    lastAlertedSlot: null, // "YYYY-MM-DD HH:MM" — dedup alerts
+  };
+
+  auth.watches.push(watch);
+  saveAuth(auth);
+
+  if (jsonOut) {
+    console.log(JSON.stringify(watch, null, 2));
+  } else {
+    console.log(`Watch added for venue ${venueId}`);
+    console.log(`  Time window: ${timeMin} - ${timeMax}`);
+    console.log(`  Party size:  ${party}`);
+    console.log(`  Scanning:    next ${daysAhead} days`);
+    console.log(`  Auto-book:   ${autoBook ? "YES — will book first matching slot" : "no (alert only)"}`);
+  }
+}
+
+function cmdWatchRemove(args) {
+  const target = args[0];
+  if (!target) {
+    console.error("Usage: resy watch remove <venue_id_or_watch_id>");
+    process.exit(1);
+  }
+
+  const auth = loadAuth() || {};
+  if (!auth.watches) { console.log("No watches."); return; }
+
+  const before = auth.watches.length;
+  const targetNum = parseInt(target, 10);
+  auth.watches = auth.watches.filter((w) =>
+    w.id !== target && w.venueId !== targetNum && w.venueName !== target
+  );
+
+  if (auth.watches.length === before) {
+    console.error("Watch not found.");
+    process.exit(1);
+  }
+
+  saveAuth(auth);
+  console.log("Watch removed.");
+}
+
+function cmdWatchList(args) {
+  const auth = loadAuth() || {};
+  const watches = auth.watches || [];
+  const jsonOut = hasFlag(args, "json");
+
+  if (jsonOut) {
+    console.log(JSON.stringify(watches, null, 2));
+    return;
+  }
+
+  if (watches.length === 0) {
+    console.log("No active watches. Add one with: resy watch add <venue_id> --time-min 11:00 --time-max 14:00");
+    return;
+  }
+
+  console.log("Active Watches:");
+  for (const w of watches) {
+    console.log(`  Venue ${w.venueId} (${w.venueName})  ${w.timeMin}-${w.timeMax}  party ${w.partySize}  ${w.daysAhead}d  ${w.autoBook ? "[AUTO-BOOK]" : "[alert only]"}`);
+  }
+}
+
+async function cmdWatchRun(args) {
+  // Cron entry point: an installation without a Resy login has nothing to watch.
+  const loaded = loadAuth();
+  if (!loaded || !loaded.authToken) return;
+  const auth = requireAuth();
+  const watches = auth.watches || [];
+
+  if (watches.length === 0) {
+    log("Watch run: no watches configured");
+    return;
+  }
+
+  for (const watch of watches) {
+    log(`Checking watch: venue ${watch.venueId} (${watch.venueName}) ${watch.timeMin}-${watch.timeMax}`);
+
+    const now = new Date();
+    const todayStr = now.toLocaleDateString("en-CA", { timeZone: TZ });
+
+    // Scan each day in the window
+    for (let d = 0; d < watch.daysAhead; d++) {
+      const checkDate = new Date(now.getTime() + d * 24 * 3600_000);
+      const dateStr = checkDate.toLocaleDateString("en-CA", { timeZone: TZ });
+
+      try {
+        const findData = await resyGet("/4/find", {
+          venue_id: watch.venueId,
+          day: dateStr,
+          party_size: watch.partySize,
+          lat: 0,
+          long: 0,
+        }, auth);
+
+        const slots = parseSlots(findData);
+        const matching = slots.filter((s) => s.time >= watch.timeMin && s.time <= watch.timeMax);
+
+        if (matching.length > 0) {
+          const slotKey = `${dateStr} ${matching[0].time}`;
+
+          // Skip if we already alerted for this exact slot
+          if (watch.lastAlertedSlot === slotKey) {
+            log(`Already alerted for ${slotKey}, skipping`);
+            continue;
+          }
+
+          log(`FOUND ${matching.length} slots for ${dateStr}: ${matching.map(s => s.time).join(", ")}`);
+
+          if (watch.autoBook) {
+            // Auto-book the first matching slot
+            const slot = matching[0];
+            log(`Auto-booking: ${dateStr} ${slot.time}`);
+            const booked = await attemptBook(auth, slot, dateStr, String(watch.partySize));
+            if (booked) {
+              watch.lastAlertedSlot = slotKey;
+              saveAuth(auth);
+              return; // Done — booked successfully
+            } else {
+              // Book failed, alert instead
+              await sendAlert(
+                `Resy cancellation spotted at ${slot.venueName}!\n` +
+                `Date: ${dateStr}, Time: ${slot.time}, Party: ${watch.partySize}\n` +
+                `Auto-book FAILED — book manually: resy book ${watch.venueId} --date ${dateStr} --time ${slot.time} --party ${watch.partySize}`
+              );
+              watch.lastAlertedSlot = slotKey;
+              saveAuth(auth);
+              return;
+            }
+          } else {
+            // Alert only
+            const times = matching.map((s) => s.time).join(", ");
+            await sendAlert(
+              `Resy cancellation spotted at ${matching[0].venueName}!\n` +
+              `Date: ${dateStr}, Times: ${times}, Party: ${watch.partySize}\n` +
+              `Book now: resy book ${watch.venueId} --date ${dateStr} --time ${matching[0].time} --party ${watch.partySize}`
+            );
+            watch.lastAlertedSlot = slotKey;
+            saveAuth(auth);
+            return; // Alert once per run, don't spam
+          }
+        }
+      } catch (err) {
+        log(`Watch check failed for ${dateStr}: ${err.message}`);
+      }
+
+      // Small delay between date checks to avoid rate limiting
+      await new Promise((r) => setTimeout(r, 500));
+    }
+  }
+
+  log("Watch run complete — no matching cancellations found");
+  saveAuth(auth);
+}
+
+// ── Help ───────────────────────────────────────────────────────────────────
+
+function cmdHelp() {
+  console.log(`resy — Book restaurant reservations via Resy
+
+Usage:
+  resy login --email <email> --password <pass>     Authenticate with Resy
+  resy token --auth-token <token>                  Set auth token manually (from DevTools)
+  resy search <query> [--date DATE] [--party N]    Search venues in the configured city
+    [--location SLUG]
+  resy slots <venue_id> --date DATE [--party N]    Show available time slots
+  resy book <venue_id> --date DATE --time HH:MM    Book a reservation
+    [--party N] [--type TYPE]
+  resy snipe <venue_id> --date DATE --time HH:MM   Snipe a reservation at drop time
+    [--drop HH:MM] [--party N] [--type TYPE]
+  resy upcoming                                    List upcoming reservations
+  resy alias [<name> <venue_id>]                   Manage venue aliases
+  resy alias remove <name>                         Remove an alias
+  resy snipes                                      Show active snipe processes
+  resy help                                        Show this help
+
+Options:
+  --json       Output in JSON format
+  --party N    Party size (default: 2)
+  --date DATE  Date in YYYY-MM-DD format
+  --time TIME  Preferred time(s), comma-separated (e.g., 18:00,18:15,18:30)
+  --type TYPE  Table type preference (e.g., "Dining Room", "Bar")
+  --drop TIME  When reservations drop, in the installation's zone (default: 00:00)
+
+Snipe mode:
+  For hard-to-get restaurants, snipe fires at the exact moment reservations
+  become available (the "drop time"). It hammers the API for 10 seconds,
+  booking the first matching slot. Many restaurants drop at local midnight.
+
+Examples:
+  resy login --email me@example.com --password hunter2
+  resy search "Some Restaurant" --date 2026-04-15 --party 2
+  resy alias some-restaurant 1234
+  resy slots some-restaurant --date 2026-04-15 --party 2
+  resy book some-restaurant --date 2026-04-15 --time 18:00,18:15 --party 2
+  resy snipe some-restaurant --date 2026-04-15 --time 18:00 --drop 00:00 --party 2`);
+}
+
+// ── Main ───────────────────────────────────────────────────────────────────
+
+async function main() {
+  const args = process.argv.slice(2);
+  const cmd = args[0];
+  const rest = args.slice(1);
+
+  switch (cmd) {
+    case "login":
+      await cmdLogin(rest);
+      break;
+    case "token":
+      await cmdToken(rest);
+      break;
+    case "search":
+      await cmdSearch(rest);
+      break;
+    case "slots":
+      await cmdSlots(rest);
+      break;
+    case "book":
+      await cmdBook(rest);
+      break;
+    case "snipe":
+      await cmdSnipe(rest);
+      break;
+    case "_snipe":
+      await cmdSnipeExec(rest);
+      break;
+    case "upcoming":
+      await cmdUpcoming(rest);
+      break;
+    case "alias":
+      cmdAlias(rest);
+      break;
+    case "snipes":
+      cmdSnipes(rest);
+      break;
+    case "watch":
+      await cmdWatch(rest);
+      break;
+    case "help":
+    case "--help":
+    case "-h":
+    case undefined:
+      cmdHelp();
+      break;
+    default:
+      console.error(`Unknown command: ${cmd}`);
+      cmdHelp();
+      process.exit(1);
+  }
+}
+
+main().catch((err) => {
+  console.error(`Fatal: ${err.message}`);
+  log(`Fatal: ${err.stack}`);
+  process.exit(1);
+});
