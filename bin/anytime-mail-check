@@ -1,0 +1,339 @@
+#!/usr/bin/env node
+// anytime-mail-check — when an Anytime Mailbox virtual mailbox says new mail
+// arrived, look at the new envelope scans and tell the user in chat how many
+// came, who sent them and which are junk.
+//
+// A user requirement: open the portal when its "new mail" notice lands, read
+// the sender off each scanned envelope, let Jev judge important vs junk (most
+// mail not addressed to the box's owners is junk; one sender, e.g. a bank,
+// sends both), and report in one chat message.
+//
+// OFF until configured: agent/local/config/anytime-mail.json `base_url` (the
+// account's portal site, https://<site>.anytimemailbox.com) — without it the
+// run logs and exits 0. Same file: `label` (how the chat line names the box),
+// `mailbox` { name, address, owners[] } (the names official mail uses, which
+// the judge reads to tell the owners' mail from household and someone else's).
+//
+// Pipeline (no agent turn):
+//   1. Settle: wait SETTLE_S so a burst of notices (three in ten minutes on
+//      10-16) becomes one run. --now skips it.
+//   2. One short-lived tab in the host's automation Chrome (CDP :9222) reads
+//      the portal's JSON feed /app/mailbox-ajax/inbox (signing in first when
+//      the session has expired) and resolves a presigned S3 link for each
+//      scan not in the seen set — see § CDP for why it is shaped this way.
+//   3. With the tab closed, each new envelope is downloaded from S3 and OCR'd
+//      on-device (lib/photo-ocr.swift, Apple Vision), in parallel.
+//   4. Jev judges important/junk, the recipient and which OCR line is the
+//      sender (lib/anytime-mail-jev.mjs); Haiku is the fallback.
+//   5. One chat message, important first. Silent when nothing is new.
+//   6. If another notice landed while this ran (the supervisor touches
+//      KICK_FILE), go round once more.
+//
+// READ-ONLY on the portal: it never opens, scans, forwards, recycles or shreds.
+// Signed out → one sign-in attempt with ANYTIME_MAILBOX_EMAIL/PASSWORD from
+// .env (canonical copy in the installation's secret store); still out →
+// one chat line, once per outage (state.session_broken).
+//
+// Kicked by launchd agent ai.claude.anytime-mail-check (GUI session: the Haiku
+// fallback is a tool-less claude -p on Max). Playbook:
+// agent/ops-agent/jobs/anytime-mail-check.md
+//
+// Usage: anytime-mail-check [--now] [--dry-run] [--reprocess <malId>]
+
+import fs from "node:fs";
+import path from "node:path";
+import { spawnSync, execFile } from "node:child_process";
+import { fileURLToPath } from "node:url";
+import { createRequire } from "node:module";
+import { judgeEnvelope } from "../lib/anytime-mail-jev.mjs";
+
+const require = createRequire(import.meta.url);
+const { localConfig } = require("../lib/instance.cjs");
+const { installTools } = require("../lib/root.cjs");
+
+const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const DATA = installTools("data");
+const STATE_FILE = path.join(DATA, "anytime-mail-state.json");
+const LOCK_FILE = path.join(DATA, "anytime-mail-check.lock");
+export const KICK_FILE = path.join(DATA, ".anytime-mail-kick");
+const SCAN_DIR = path.join(DATA, "anytime-mail");
+const OCR_SRC = path.join(ROOT, "lib/photo-ocr.swift");
+const OCR_BIN = path.join(DATA, ".bin/photo-ocr");
+const SEND = path.join(ROOT, "bin/jori-send-curl");
+
+export const DEFAULTS = Object.freeze({ base_url: null, label: "the virtual mailbox", mailbox: { name: "", address: "", owners: [] } });
+export function loadConfig() { return localConfig("anytime-mail", DEFAULTS); }
+const CFG = loadConfig();
+const BASE = String(CFG.base_url || "").replace(/\/+$/, ""); // lang-regex-ok: URL trailing slash
+const CDP = `http://localhost:${process.env.CDP_PORT || "9222"}`;
+const SETTLE_S = Number(process.env.ANYTIME_MAIL_SETTLE_S || 90);
+// Which scan rendition to OCR: "" = full size, ".s1000" = 1000 px wide.
+const SCAN_SIZE = process.env.ANYTIME_MAIL_SCAN_SIZE ?? "";
+// What the judge is told about the box (owner names as official mail spells them).
+const MAILBOX = { ...DEFAULTS.mailbox, ...(CFG.mailbox || {}) };
+
+const args = process.argv.slice(2);
+const DRY = args.includes("--dry-run");
+const NOW = args.includes("--now");
+const REPROCESS = (() => { const i = args.indexOf("--reprocess"); return i >= 0 ? Number(args[i + 1]) : null; })();
+// --folder <key> reads another portal folder (e.g. recycled) — for testing the
+// judge on past mail with --dry-run --reprocess; production always reads inbox.
+const FOLDER = (() => { const i = args.indexOf("--folder"); return i >= 0 ? args[i + 1] : "inbox"; })();
+const log = (...a) => console.log(new Date().toISOString(), ...a);
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+function readState() {
+  try { return JSON.parse(fs.readFileSync(STATE_FILE, "utf8")); } catch { return { seen: {} }; }
+}
+function writeState(s) {
+  if (DRY) return;
+  const tmp = `${STATE_FILE}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify(s, null, 2) + "\n");
+  fs.renameSync(tmp, STATE_FILE);
+}
+
+function takeLock() {
+  try {
+    const pid = Number(fs.readFileSync(LOCK_FILE, "utf8"));
+    if (pid && pid !== process.pid) { try { process.kill(pid, 0); return false; } catch {} }
+  } catch {}
+  fs.writeFileSync(LOCK_FILE, String(process.pid));
+  return true;
+}
+
+// ---- CDP ------------------------------------------------------------------
+//
+// Lean on purpose (a requirement: browser use as efficient as possible). The automation Chrome's tabs are swept between jobs and the
+// portal's server session expires, so a typical run starts signed out in a
+// fresh tab. So:
+//   - one tab of our own, closed at the end; the portal UI is never loaded —
+//     the tab goes straight to the JSON feed URL (plain text when signed in,
+//     the bare login page when not);
+//   - the ad/analytics hosts the portal pulls in (~a dozen on the login page)
+//     are blocked in that tab, and every wait is a load event, not a sleep;
+//   - ONE in-page call returns the feed plus a presigned S3 URL per new scan:
+//     the XHR is aborted as soon as the /imagestore redirect resolves, so no
+//     image bytes cross CDP; Node downloads them straight from S3.
+// The tab never hands its cookies out; only per-image 1-hour S3 links leave it.
+
+const BLOCK = [
+  "*pinterest.com*", "*pinimg.com*", "*tiktok*", "*taboola*", "*bing.com*", "*outbrain*",
+  "*quantserve*", "*quantcount*", "*mxpnl*", "*mixpanel*", "*doubleclick*", "*googleadservices*",
+  "*googletagmanager*", "*google-analytics*", "*analytics.google.com*", "*google.com/ccm*",
+  "*google.com/rmkt*", "*google.com/pagead*", "*google.co.il*", "*luckyorange*", "*linkedin*",
+  "*quora*", "*freshchat*", "*rokt*", "*facebook*", "*monitor.azure.com*", "*stripe*",
+  "*.woff", "*.woff2", "*.png", "*.gif", "*.svg",
+];
+
+class Page {
+  static async create() {
+    const tab = await (await fetch(`${CDP}/json/new?about:blank`, { method: "PUT", signal: AbortSignal.timeout(10000) })).json();
+    const p = new Page();
+    p.tabId = tab.id; p.id = 0; p.pending = new Map(); p.waiters = [];
+    p.ws = new WebSocket(tab.webSocketDebuggerUrl);
+    p.ws.onmessage = (e) => {
+      const m = JSON.parse(e.data);
+      if (m.id) { const f = p.pending.get(m.id); if (f) { p.pending.delete(m.id); f(m); } }
+      else if (m.method) p.waiters = p.waiters.filter((w) => (w.ev === m.method ? (w.res(m), false) : true));
+    };
+    await new Promise((res, rej) => {
+      const t = setTimeout(() => rej(new Error("cdp websocket open timed out")), 10000);
+      p.ws.onopen = () => { clearTimeout(t); res(); };
+      p.ws.onerror = () => { clearTimeout(t); rej(new Error("cdp websocket failed")); };
+    });
+    await Promise.all([p.cmd("Page.enable"), p.cmd("Network.enable").then(() => p.cmd("Network.setBlockedURLs", { urls: BLOCK }))]);
+    return p;
+  }
+  cmd(method, params = {}) {
+    return new Promise((res, rej) => {
+      const id = ++this.id;
+      const t = setTimeout(() => { this.pending.delete(id); rej(new Error(`${method} timed out`)); }, 30000);
+      this.pending.set(id, (m) => { clearTimeout(t); m.error ? rej(new Error(`${method}: ${m.error.message}`)) : res(m.result); });
+      this.ws.send(JSON.stringify({ id, method, params }));
+    });
+  }
+  loaded(timeoutMs = 20000) {
+    return new Promise((res) => {
+      const t = setTimeout(res, timeoutMs);
+      this.waiters.push({ ev: "Page.loadEventFired", res: () => { clearTimeout(t); res(); } });
+    });
+  }
+  async eval(expression) {
+    const r = await this.cmd("Runtime.evaluate", { expression, returnByValue: true, awaitPromise: true });
+    if (r.exceptionDetails) throw new Error(`page eval: ${r.exceptionDetails.exception?.description || r.exceptionDetails.text}`.slice(0, 300));
+    return r.result.value;
+  }
+  async goto(url) { const l = this.loaded(); await this.cmd("Page.navigate", { url }); await l; }
+  async close() {
+    try { this.ws.close(); } catch {}
+    try { await fetch(`${CDP}/json/close/${this.tabId}`, { signal: AbortSignal.timeout(5000) }); } catch {}
+  }
+}
+
+// Feed + presigned scan URLs for the items not in `seen`, in one round trip.
+// null = not signed in (the portal answers the feed with its login page).
+const FEED = (folder, seen, reprocess) => `(async () => {
+  const x = await new Promise((res) => { const r = new XMLHttpRequest(); r.open("GET", "/app/mailbox-ajax/${folder}");
+    r.setRequestHeader("X-Requested-With", "XMLHttpRequest"); r.onload = () => res(r.responseText); r.onerror = () => res(""); r.send(); });
+  let items; try { items = JSON.parse(x).mail.items; } catch { return null; }
+  if (!Array.isArray(items)) return null;
+  const seen = new Set(${JSON.stringify(seen)}), only = ${JSON.stringify(reprocess)};
+  const fresh = items.filter((it) => only != null ? it.malId === only : !seen.has(String(it.malId)));
+  const sign = (id) => new Promise((res) => { const r = new XMLHttpRequest(); r.open("GET", "/imagestore/" + id + "${SCAN_SIZE}.jpg?s3");
+    r.onreadystatechange = () => { if (r.readyState === 2) { const u = r.status === 200 ? r.responseURL : null; r.abort(); res(u); } };
+    r.onerror = () => res(null); r.send(); });
+  const urls = await Promise.all(fresh.map((it) => sign(it.malId)));
+  return { total: items.length, fresh: fresh.map((it, i) => ({ malId: it.malId, arrived: it.creationDate_utc, scan: urls[i] })) };
+})()`;
+
+async function readFeed(page, seen) {
+  await page.goto(`${BASE}/app/mailbox-ajax/${FOLDER}`);
+  return page.eval(FEED(FOLDER, seen, REPROCESS));
+}
+
+// The login page is a jQuery form (f_uid / f_pwd, submitted by its own button
+// handler). Fill it and press the button; the page navigates when it succeeds.
+async function signIn(page) {
+  const email = process.env.ANYTIME_MAILBOX_EMAIL, pw = process.env.ANYTIME_MAILBOX_PASSWORD;
+  if (!email || !pw) return "no ANYTIME_MAILBOX_EMAIL/PASSWORD in .env";
+  const l = page.loaded();
+  const res = await page.eval(`(() => {
+    const u = document.getElementById("f_uid"), p = document.getElementById("f_pwd");
+    if (!u || !p) return "no login form on " + location.pathname;
+    u.value = ${JSON.stringify(email)}; p.value = ${JSON.stringify(pw)};
+    const b = (p.form || document).querySelector("button[type=submit], input[type=submit]");
+    if (!b) return "no submit button";
+    b.click(); return "submitted";
+  })()`);
+  if (res === "submitted") await l;
+  return res;
+}
+
+async function download(malId, url) {
+  const r = await fetch(url, { signal: AbortSignal.timeout(30000) });
+  if (!r.ok) throw new Error(`scan ${malId}: HTTP ${r.status}`);
+  fs.mkdirSync(SCAN_DIR, { recursive: true });
+  const file = path.join(SCAN_DIR, `${malId}.jpg`);
+  fs.writeFileSync(file, Buffer.from(await r.arrayBuffer()));
+  return file;
+}
+
+// ---- OCR ------------------------------------------------------------------
+
+function ensureOcrBin() {
+  const stale = !fs.existsSync(OCR_BIN) || fs.statSync(OCR_SRC).mtimeMs > fs.statSync(OCR_BIN).mtimeMs;
+  if (!stale) return;
+  fs.mkdirSync(path.dirname(OCR_BIN), { recursive: true });
+  const b = spawnSync("swiftc", ["-O", OCR_SRC, "-o", OCR_BIN], { encoding: "utf8", timeout: 180000 });
+  if (b.status !== 0) throw new Error(`swiftc failed: ${(b.stderr || "").slice(0, 200)}`);
+}
+
+function ocr(file) {
+  return new Promise((res, rej) => execFile(OCR_BIN, [file], { encoding: "utf8", timeout: 60000 }, (err, out, errOut) => {
+    if (err) return rej(new Error(`ocr failed: ${(errOut || err.message).slice(0, 200)}`));
+    // "<text>\t<confidence>" per line — the tool's own output format.
+    res(out.split("\n").map((l) => l.split("\t")[0].trim()).filter(Boolean));
+  }));
+}
+
+// ---- message --------------------------------------------------------------
+
+const RECIPIENT_NOTE = { household: "to household", someone_else: "not addressed to you" };
+
+export function composeMessage(results, { label = CFG.label || DEFAULTS.label, base = BASE } = {}) {
+  const order = { important: 0, unclear: 1, junk: 2 };
+  const rows = [...results].sort((a, b) => order[a.verdict] - order[b.verdict]);
+  const n = (v) => rows.filter((r) => r.verdict === v).length;
+  const imp = n("important"), junk = n("junk"), unc = n("unclear");
+  const count = rows.length === 1 ? "One piece of mail" : `${rows.length} pieces of mail`;
+  const verdict = imp === 0 && unc === 0 ? (rows.length === 1 ? "it's junk" : "all junk")
+    : junk === 0 && unc === 0 ? (rows.length === 1 ? "it looks worth opening" : "all look worth opening")
+    : [imp && `${imp} worth opening`, unc && `${unc} I couldn't call`, junk && `${junk} junk`].filter(Boolean).join(", ");
+  const head = `📬 ${count} came in at ${label} — ${verdict}`;
+  const lines = rows.map((r) => {
+    const who = !r.sender ? "Sender unidentified" : r.sender.length > 48 ? `${r.sender.slice(0, 47)}…` : r.sender;
+    const tag = r.verdict === "important" ? "looks important" : r.verdict === "junk" ? "junk" : "couldn't tell";
+    const note = RECIPIENT_NOTE[r.recipient];
+    return `- ${who} — ${tag}${note && r.verdict !== "important" ? ` (${note})` : ""}`;
+  });
+  return [head, ...lines, ...(base ? [`${base}/app/mailbox/inbox`] : [])].join("\n");
+}
+
+function send(msg) {
+  if (DRY) { log("DRY message:\n" + msg); return; }
+  const r = spawnSync(SEND, ["--intent", "anytime-mail", "--evidence-as-of", "live", msg], { encoding: "utf8", timeout: 120000 });
+  if (r.status !== 0) throw new Error(`jori-send-curl exit ${r.status}: ${(r.stderr || "").slice(0, 200)}`);
+}
+
+// ---- run ------------------------------------------------------------------
+
+async function runOnce(state) {
+  const page = await Page.create();
+  let feed;
+  try {
+    feed = await readFeed(page, Object.keys(state.seen));
+    if (!feed) {
+      log(`signed out; sign-in: ${await signIn(page)}`);
+      feed = await readFeed(page, Object.keys(state.seen));
+    }
+  } finally { await page.close(); }
+  if (!feed) {
+    if (!state.session_broken) {
+      send(`📬 New mail arrived at ${CFG.label || DEFAULTS.label}, but the Anytime Mailbox portal is signed out on this host and signing back in failed — please sign in on the automation Chrome. ${BASE}/app/home`);
+      state.session_broken = new Date().toISOString();
+    }
+    return;
+  }
+  if (state.session_broken) { log("session restored"); delete state.session_broken; }
+  log(`${FOLDER} ${feed.total}, new ${feed.fresh.length}`);
+  if (!feed.fresh.length) return;
+
+  // Browser is closed; downloads, OCR and Jev run in parallel per envelope.
+  ensureOcrBin();
+  const results = await Promise.all(feed.fresh.map(async (it) => {
+    let lines = [];
+    try {
+      if (!it.scan) throw new Error("no scan link");
+      lines = await ocr(await download(it.malId, it.scan));
+    } catch (e) { log(`item ${it.malId}: ${e.message}`); }
+    const j = await judgeEnvelope({ id: it.malId, lines, mailbox: MAILBOX });
+    log(`item ${it.malId}: ${j.verdict} sender=${j.sender ?? "-"} recipient=${j.recipient} via ${j.source}${j.confidence != null ? ` @${j.confidence.toFixed(2)}` : ""}`);
+    state.seen[it.malId] = { arrived: it.arrived, verdict: j.verdict, sender: j.sender, recipient: j.recipient, source: j.source, ocr: lines.slice(0, 40) };
+    return { malId: it.malId, ...j };
+  }));
+  send(composeMessage(results));
+}
+
+async function main() {
+  if (!BASE) { log("no portal configured (agent/local/config/anytime-mail.json base_url) — off"); return; }
+  if (!takeLock()) { log("another run holds the lock; it will pick up this notice"); return; }
+  try {
+    if (!NOW && !REPROCESS && !DRY) await sleep(SETTLE_S * 1000);
+    for (let round = 0; round < 3; round++) {
+      const started = Date.now();
+      const state = readState();
+      state.seen ||= {};
+      await runOnce(state);
+      state.last_run = new Date().toISOString();
+      // Keep 120 days of seen ids; the portal inbox holds far fewer.
+      const cutoff = Date.now() - 120 * 864e5;
+      for (const [k, v] of Object.entries(state.seen)) if (v.arrived && Date.parse(v.arrived) < cutoff) delete state.seen[k];
+      writeState(state);
+      let kicked = 0;
+      try { kicked = fs.statSync(KICK_FILE).mtimeMs; } catch {}
+      if (kicked <= started || REPROCESS || DRY) break;
+      log("another notice arrived during the run; checking again");
+      await sleep(SETTLE_S * 1000);
+    }
+  } finally { try { fs.unlinkSync(LOCK_FILE); } catch {} }
+}
+
+if (process.argv[1] && fs.realpathSync(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  main().catch((e) => {
+    log(`FAILED: ${e.stack || e}`);
+    // A job reporting its own failure (system channel, not chat).
+    if (!DRY) spawnSync(SEND, ["--channel", "system", "--skip-precheck", "--intent", "anytime-mail",
+      `anytime-mail-check failed, so new Anytime Mailbox mail was not checked: ${String(e.message || e).slice(0, 200)}. Log: data/logs/anytime-mail-check.log`], { timeout: 60000 });
+    process.exit(1);
+  });
+}

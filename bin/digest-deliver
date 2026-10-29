@@ -1,0 +1,67 @@
+#!/usr/bin/env node
+// digest-deliver — the long-form delivery rule (ops-agent CLAUDE.md
+// § Long-form delivery rule) as one command, for playbook-driven jobs whose
+// fork would otherwise hand-type the Gmail sequence. Script-driven jobs
+// (morning-digest-run, newsletter-digest-run, …) import the same functions
+// from lib/digest-deliver.mjs directly.
+//
+// Sequence: email-send → find it in Gmail (bounded wait) → label + star +
+// mark read → verify still in INBOX (restore if not) → phone pointer → push.
+//
+// Why (2026-10-05): the daily-summary fork picked `gmail-action label-archive`
+// and the Oct 4 summary never showed in the inbox. A model should not be
+// choosing these commands.
+//
+// Usage:
+//   digest-deliver --subject <s> --body-file <html> --intent <job>
+//                  [--label personal] [--pointer "<one line + hook>"] [--push "<text>"]
+//                  [--evidence-live]
+//
+// Omit --pointer when the email has nothing worth surfacing (the rule says no
+// pointer then). Exit: 0 done · 1 email did not send (nothing else ran) ·
+// 2 sent, but it could not be found in Gmail to label.
+
+import fs from "node:fs";
+import { sendHtmlEmail, labelDigest, pointerAndPush } from "../lib/digest-deliver.mjs";
+
+function usage(msg) {
+  if (msg) console.error(`digest-deliver: ${msg}`);
+  console.error("usage: digest-deliver --subject S --body-file F --intent JOB [--label L] [--pointer TEXT] [--push TEXT] [--evidence-live]");
+  process.exit(64);
+}
+
+const o = { label: "personal", evidenceLive: false };
+const argv = process.argv.slice(2);
+for (let i = 0; i < argv.length; i++) {
+  const k = argv[i];
+  const v = () => { const x = argv[++i]; if (x === undefined) usage(`${k} needs a value`); return x; };
+  if (k === "--subject") o.subject = v();
+  else if (k === "--body-file") o.bodyFile = v();
+  else if (k === "--intent") o.intent = v();
+  else if (k === "--label") o.label = v();
+  else if (k === "--pointer") o.pointer = v();
+  else if (k === "--push") o.push = v();
+  else if (k === "--evidence-live") o.evidenceLive = true;
+  else if (k === "-h" || k === "--help") usage();
+  else usage(`unknown arg ${k}`);
+}
+if (!o.subject || !o.bodyFile || !o.intent) usage("--subject, --body-file and --intent are required");
+
+const log = (m) => console.error(`digest-deliver: ${m}`);
+
+try {
+  sendHtmlEmail({ subject: o.subject, html: fs.readFileSync(o.bodyFile, "utf8") });
+} catch (e) {
+  log(`email-send failed — nothing else ran: ${String(e.stderr || e.message).trim().slice(0, 400)}`);
+  process.exit(1);
+}
+log(`sent "${o.subject}"`);
+
+const id = await labelDigest(o.subject, { label: o.label, log });
+if (id) log(`labeled ${o.label} + starred + read, in INBOX: ${id}`);
+else log("sent, but Gmail had not indexed it after the bounded wait — left unlabeled");
+
+pointerAndPush({ pointer: o.pointer, push: o.push, intent: o.intent, evidenceLive: o.evidenceLive });
+log(`pointer ${o.pointer ? "sent" : "skipped"}, push ${o.push ? "sent" : "skipped"}`);
+
+process.exit(id ? 0 : 2);

@@ -1,0 +1,290 @@
+#!/usr/bin/env node
+// p1-alert-gate — decides whether an unstar-scan failure is worth paging about.
+//
+// Why this exists: telling the agent turn to page on ANY scan error produced
+// dozens of pages for a condition that cleared itself on the next cycle —
+// failed batches were all-or-nothing, the backlog drained between alerts, and
+// several retry-shaped fixes each fixed an adjacent bug without stopping one
+// page. A transient that resolves itself in one cycle, paging a human who
+// cannot act on it, is `severity: noise`; an alert channel the user learns to
+// skim past is worse than no channel.
+//
+// What this gate does NOT do: hide a real outage. A sweep that is genuinely
+// stuck still pages — once the streak shows it has been blocked across
+// several runs AND for a real span of wall-clock time.
+//
+// Usage:
+//   p1-alert-gate --ok                          sweep completed; reset the streak
+//   p1-alert-gate --failed "<captured error>"   sweep blocked; page only if stuck
+//   p1-alert-gate --status                      print the streak state (diagnostics)
+//
+// Exit 0 always (except --help/usage errors). This is an alerting decision,
+// never a reason to fail the caller's job.
+
+const fs = require("node:fs");
+const { execFileSync } = require("node:child_process");
+
+const { installTools } = require("../lib/root.cjs");
+const STATE =
+  process.env.P1_ALERT_GATE_STATE ||
+  installTools("data/p1-scan-failure-streak.json");
+// Overridable so the regression test can assert what WOULD be sent without
+// paging the user. Same shape as p1-scan-gate's P1_SCAN_SEEN override.
+const SEND =
+  process.env.P1_ALERT_GATE_SEND || installTools("bin/jori-send-curl");
+
+// The resolver probe. Overridable so the regression test can drive a stub
+// instead of the real network. Optional: an installation without a resolver
+// probe at this path records nothing (see probeResolver's contract).
+const DNS_PROBE =
+  process.env.P1_ALERT_GATE_DNS_PROBE || installTools("bin/dns-health-check");
+const DNS_PROBE_TIMEOUT_MS = Number(process.env.P1_ALERT_GATE_DNS_TIMEOUT_MS || 12000);
+
+// lang-regex-ok: these are Node/libc resolver error CODES emitted by machine,
+// not language a human wrote. Rule 0b governs deciding what someone MEANT;
+// this only asks whether the runtime already told us the name lookup failed.
+const RESOLUTION_FAILURE = /\b(ENOTFOUND|EAI_AGAIN|EAI_NODATA|EAI_NONAME)\b/;
+
+// Why this probe exists: an all-or-nothing failure shape is also what a
+// wedged host resolver produces, and the same lookup failure has been seen
+// across unrelated vendors from unrelated processes. Rather than argue the
+// mechanism from scraped log lines, this records a measurement at the only
+// instant the question has an answer — the moment a sweep failed — and the
+// alert states the resolver finding only when THIS streak's own probe found
+// every control host (across unrelated vendors, including Cloudflare's own
+// resolver hostname) unresolvable. That is a report of a measurement, not a
+// diagnosis; a fast getaddrinfo refusal across all of them is a local
+// resolver, not any one vendor's outage.
+//
+// Contract: best-effort, bounded, and incapable of failing the caller. A
+// missing or broken probe records nothing and changes nothing.
+function probeResolver() {
+  try {
+    if (!fs.existsSync(DNS_PROBE)) return null;
+  } catch {
+    return null;
+  }
+  let stdout = "";
+  try {
+    stdout = execFileSync(DNS_PROBE, ["--json"], {
+      encoding: "utf8",
+      timeout: DNS_PROBE_TIMEOUT_MS,
+      stdio: ["ignore", "pipe", "ignore"],
+    });
+  } catch (err) {
+    // Exit 1 (one vendor) and exit 2 (resolver-down) are RESULTS, not errors --
+    // execFileSync throws on any non-zero exit, so the finding arrives here.
+    stdout = (err && err.stdout) || "";
+  }
+  try {
+    const rec = JSON.parse(String(stdout));
+    if (!rec || typeof rec.verdict !== "string") return null;
+    return {
+      verdict: rec.verdict,
+      failed: Array.isArray(rec.failed) ? rec.failed : [],
+      at: rec.ts || new Date().toISOString(),
+    };
+  } catch {
+    return null;
+  }
+}
+
+// A page needs BOTH: enough consecutive blocked runs to rule out a one-off,
+// and enough elapsed time to mean the sweep is actually behind. Both are
+// required because the dispatch is change-gated (bin/p1-scan-gate), so
+// consecutive runs are NOT reliably 15 minutes apart — three failures could
+// span ten minutes or ten hours, and only one of those is worth a page.
+const STREAK_THRESHOLD = 3;
+const ELAPSED_THRESHOLD_MS = 45 * 60 * 1000;
+
+function readState() {
+  try {
+    const raw = JSON.parse(fs.readFileSync(STATE, "utf8"));
+    return {
+      streak: Number(raw.streak) || 0,
+      first_failure_at: raw.first_failure_at || null,
+      last_failure_at: raw.last_failure_at || null,
+      last_error: raw.last_error || null,
+      last_alert_at: raw.last_alert_at || null,
+      alerted_for_streak: !!raw.alerted_for_streak,
+      last_dns_verdict: raw.last_dns_verdict || null,
+      last_dns_failed: Array.isArray(raw.last_dns_failed) ? raw.last_dns_failed : [],
+      last_dns_checked_at: raw.last_dns_checked_at || null,
+    };
+  } catch {
+    return {
+      streak: 0,
+      first_failure_at: null,
+      last_failure_at: null,
+      last_error: null,
+      last_alert_at: null,
+      alerted_for_streak: false,
+      last_dns_verdict: null,
+      last_dns_failed: [],
+      last_dns_checked_at: null,
+    };
+  }
+}
+
+function writeState(s) {
+  try {
+    fs.writeFileSync(STATE, JSON.stringify(s, null, 2) + "\n");
+  } catch (err) {
+    console.error(`p1-alert-gate: could not write ${STATE}: ${err.message}`);
+  }
+}
+
+// The message is composed HERE, from fixed text plus the caller's captured
+// error string. There is deliberately no free-text message parameter: every
+// misleading alert in this cluster's history came from a caller narrating a
+// mechanism it never observed ("SMTP2Go unreachable", "possible OAuth/quota
+// issue", "cannot downgrade in sandboxed context" — the last one contradicted
+// by a live reproduction the same morning). Callers report what failed; this
+// binary owns what is claimed about it.
+function pageOwner(state, now) {
+  const since = state.first_failure_at || state.last_failure_at || now.toISOString();
+  const mins = Math.round((now - new Date(since)) / 60000);
+  const lastError = state.last_error || "(none recorded)";
+  // Only this streak's own probe may speak. A verdict recorded days ago
+  // describes a different outage, and --ok deliberately preserves it across a
+  // recovery, so without this check the alert would quote a stale measurement
+  // as though it had just been taken.
+  const probedAt = state.last_dns_checked_at ? new Date(state.last_dns_checked_at) : null;
+  const probeInThisStreak =
+    probedAt && !Number.isNaN(probedAt.valueOf()) && probedAt >= new Date(since);
+  const resolverNote =
+    probeInThisStreak && state.last_dns_verdict === "resolver-down"
+      ? ` Measured at the moment it failed: ${state.last_dns_failed.length} control hosts across ` +
+        `unrelated vendors — including one.one.one.one, Cloudflare's own resolver — also failed to ` +
+        `resolve, so what was not working is name lookup on this host rather than anything at Gmail. ` +
+        `Retrying will not help until that clears.`
+      : "";
+  const msg =
+    `⚠️ Unstar-scan has been blocked for ${state.streak} runs in a row, about ${mins} minutes now — ` +
+    `long enough that it is not the usual blip. P1 emails you unstarred are not getting downgraded ` +
+    `until it clears. Last error as captured: ${lastError}` + resolverNote;
+  try {
+    // --observed-error mirrors what this line already claims
+    // (jori-send-curl's mechanism-attestation gate): the SAME captured
+    // string, not a re-description of it, so the gate can never separate
+    // from what this binary actually recorded in its own state file.
+    execFileSync(
+      SEND,
+      ["--channel", "system", "--skip-precheck", "--intent", "unstar-scan-blocked", "--observed-error", lastError, msg],
+      // JORI_P1_ALERT_GATE=1 is the provenance marker jori-send-curl's
+      // P1-sweep gate checks. This binary is the only sanctioned author of an
+      // unstar-scan alert; the marker is what proves the send came from it.
+      { stdio: "ignore", timeout: 30000, env: { ...process.env, JORI_P1_ALERT_GATE: "1" } }
+    );
+    return true;
+  } catch (err) {
+    console.error(`p1-alert-gate: alert send failed: ${err.message}`);
+    return false;
+  }
+}
+
+function main() {
+  const argv = process.argv.slice(2);
+  const mode = argv[0];
+  const now = new Date();
+
+  if (mode === "--status") {
+    console.log(JSON.stringify(readState(), null, 2));
+    return;
+  }
+
+  if (mode === "--ok") {
+    const prev = readState();
+    if (prev.streak > 0) {
+      console.error(`p1-alert-gate: sweep recovered after ${prev.streak} blocked run(s)`);
+    }
+    writeState({
+      streak: 0,
+      first_failure_at: null,
+      last_failure_at: null,
+      last_error: null,
+      last_alert_at: prev.last_alert_at,
+      alerted_for_streak: false,
+      // Kept across a reset on purpose: these describe the last observed
+      // FAILURE, and a recovery does not make that measurement untrue.
+      last_dns_verdict: prev.last_dns_verdict,
+      last_dns_failed: prev.last_dns_failed,
+      last_dns_checked_at: prev.last_dns_checked_at,
+    });
+    return;
+  }
+
+  if (mode === "--failed") {
+    const captured = (argv[1] || "").trim();
+    const prev = readState();
+    const dns = RESOLUTION_FAILURE.test(captured) ? probeResolver() : null;
+    const state = {
+      streak: prev.streak + 1,
+      first_failure_at: prev.streak > 0 && prev.first_failure_at ? prev.first_failure_at : now.toISOString(),
+      last_failure_at: now.toISOString(),
+      last_error: captured || prev.last_error,
+      last_alert_at: prev.last_alert_at,
+      alerted_for_streak: prev.alerted_for_streak,
+      last_dns_verdict: dns ? dns.verdict : prev.last_dns_verdict,
+      last_dns_failed: dns ? dns.failed : prev.last_dns_failed,
+      last_dns_checked_at: dns ? dns.at : prev.last_dns_checked_at,
+    };
+    if (dns) {
+      console.error(`p1-alert-gate: resolver probe verdict=${dns.verdict}${dns.failed.length ? ` failed=${dns.failed.join(",")}` : ""}`);
+    }
+
+    const elapsed = now - new Date(state.first_failure_at);
+    const stuck = state.streak >= STREAK_THRESHOLD && elapsed >= ELAPSED_THRESHOLD_MS;
+
+    // One page per streak, not one per run. A sustained outage should be
+    // impossible to miss once; it should not become 30 identical messages,
+    // which is the failure mode that buries a real alert under repeats
+    // (agent/CLAUDE.md § System Channel).
+    if (stuck && !state.alerted_for_streak) {
+      if (pageOwner(state, now)) {
+        state.last_alert_at = now.toISOString();
+        state.alerted_for_streak = true;
+      }
+    } else {
+      console.error(
+        `p1-alert-gate: blocked run ${state.streak} recorded, no page ` +
+          `(threshold ${STREAK_THRESHOLD} runs + ${ELAPSED_THRESHOLD_MS / 60000}min` +
+          `${state.alerted_for_streak ? ", already paged for this streak" : ""})`
+      );
+    }
+    writeState(state);
+    return;
+  }
+
+  console.error(
+    "usage: p1-alert-gate --ok | --failed \"<captured error>\" | --status\n" +
+      "  --ok      sweep completed; reset the consecutive-failure streak\n" +
+      "  --failed  sweep blocked; record it and page only if genuinely stuck\n" +
+      "  --status  print the current streak state"
+  );
+  process.exit(1);
+}
+
+try {
+  main();
+} catch (err) {
+  // Fail OPEN, in the direction that preserves the signal: if this gate is
+  // broken we would rather send a page than silently swallow a real outage.
+  console.error(`p1-alert-gate: internal error, failing open: ${err.message}`);
+  try {
+    execFileSync(
+      SEND,
+      [
+        "--channel",
+        "system",
+        "--skip-precheck",
+        "--intent",
+        "unstar-scan-blocked",
+        "--observed-error",
+        err.message || "(no message on the caught error)",
+        `⚠️ Unstar-scan reported a failure and p1-alert-gate could not decide whether to page (${err.message}), so it is passing the alert through rather than dropping it.`,
+      ],
+      { stdio: "ignore", timeout: 30000 }
+    );
+  } catch {}
+}
