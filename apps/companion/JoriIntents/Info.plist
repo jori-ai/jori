@@ -1,0 +1,66 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- What this build is (SupabaseConfig.swift, `Install`): each value is a
+	     build setting from Config/Jori.xcconfig, overridden by an
+	     installation's Config/Installation.xcconfig. -->
+	<key>JoriStoragePrefix</key>
+	<string>$(JORI_STORAGE_PREFIX)</string>
+	<key>JoriKeyTagPrefix</key>
+	<string>$(JORI_KEY_TAG_PREFIX)</string>
+	<key>JoriURLScheme</key>
+	<string>$(JORI_URL_SCHEME)</string>
+	<key>JoriAppGroup</key>
+	<string>$(JORI_APP_GROUP)</string>
+	<key>JoriKeychainGroup</key>
+	<string>$(JORI_KEYCHAIN_GROUP)</string>
+	<key>JoriSupabaseURL</key>
+	<string>$(JORI_SUPABASE_URL)</string>
+	<key>JoriSupabaseAnonKey</key>
+	<string>$(JORI_SUPABASE_ANON_KEY)</string>
+	<key>JoriAttachmentsBucket</key>
+	<string>$(JORI_ATTACHMENTS_BUCKET)</string>
+	<key>JoriLegacyName</key>
+	<string>$(JORI_LEGACY_NAME)</string>
+	<key>JoriSigningPurchase</key>
+	<string>$(JORI_SIGNING_PURCHASE)</string>
+	<key>JoriSigningApprove</key>
+	<string>$(JORI_SIGNING_APPROVE)</string>
+	<key>JoriWikiURL</key>
+	<string>$(JORI_WIKI_URL)</string>
+	<key>JoriTradeApprovalURL</key>
+	<string>$(JORI_TRADE_APPROVAL_URL)</string>
+	<key>JoriTradeApprovalNamespace</key>
+	<string>$(JORI_TRADE_APPROVAL_NAMESPACE)</string>
+	<key>JoriTradeApprovalLabel</key>
+	<string>$(JORI_TRADE_APPROVAL_LABEL)</string>
+	<key>JoriLocationDeviceId</key>
+	<string>$(JORI_LOCATION_DEVICE_ID)</string>
+	<key>JoriFeatures</key>
+	<string>$(JORI_FEATURES)</string>
+	<key>NSExtension</key>
+	<dict>
+		<key>NSExtensionAttributes</key>
+		<dict>
+			<!-- BOTH intents are required for the AirPods listen-and-reply loop.
+			     With only INSendMessageIntent, Siri announces but rejects the
+			     spoken reply ("hasn't added support for that with Siri"). -->
+			<key>IntentsSupported</key>
+			<array>
+				<string>INSendMessageIntent</string>
+				<string>INSearchForMessagesIntent</string>
+			</array>
+			<!-- Empty = no messaging intents are blocked while the device is
+			     locked, so Siri can send "tell Jori …" and announced replies
+			     with the screen off (driving). -->
+			<key>IntentsRestrictedWhileLocked</key>
+			<array/>
+		</dict>
+		<key>NSExtensionPointIdentifier</key>
+		<string>com.apple.intents-service</string>
+		<key>NSExtensionPrincipalClass</key>
+		<string>$(PRODUCT_MODULE_NAME).IntentHandler</string>
+	</dict>
+</dict>
+</plist>

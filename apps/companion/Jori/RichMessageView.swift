@@ -15,9 +15,21 @@ private let codeFill = Color(UIColor.systemGray4)
 
 struct RichMessageView: View {
     let segments: [MessageSegment]
+    /// The whole message, when it folds (see `MessageContentParser.fold`).
+    let fullSegments: [MessageSegment]?
+    let foldLabel: String
+    @State private var expanded = false
 
     init(content: String) {
-        self.segments = MessageContentParser.parse(content)
+        if let fold = MessageContentParser.fold(content) {
+            self.segments = MessageContentParser.parse(fold.head)
+            self.fullSegments = MessageContentParser.parse(fold.full)
+            self.foldLabel = fold.label
+        } else {
+            self.segments = MessageContentParser.parse(content)
+            self.fullSegments = nil
+            self.foldLabel = ""
+        }
     }
 
     /// Cheap fast-path: if the text has no markdown syntax characters, skip
@@ -32,6 +44,35 @@ struct RichMessageView: View {
     }
 
     var body: some View {
+        if let full = fullSegments {
+            VStack(alignment: .leading, spacing: 8) {
+                segmentStack(expanded ? full : segments)
+                Button {
+                    withAnimation(.easeInOut(duration: 0.2)) { expanded.toggle() }
+                } label: {
+                    HStack(spacing: 6) {
+                        Text(expanded ? "Show less" : foldLabel)
+                        // The chevron turns rather than swapping glyphs, so
+                        // the control visibly answers the tap.
+                        Image(systemName: "chevron.down")
+                            .font(.caption.weight(.bold))
+                            .rotationEffect(.degrees(expanded ? 180 : 0))
+                    }
+                    .font(.system(size: JoriFontSize.body - 1, weight: .semibold))
+                    .foregroundStyle(JoriTheme.cobalt)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 6)
+                    .background(Capsule().fill(JoriTheme.cobalt.opacity(0.1)))
+                    .contentShape(Capsule())
+                }
+                .buttonStyle(PressableStyle())
+            }
+        } else {
+            segmentStack(segments)
+        }
+    }
+
+    private func segmentStack(_ segments: [MessageSegment]) -> some View {
         VStack(alignment: .leading, spacing: 8) {
             ForEach(Array(segments.enumerated()), id: \.offset) { _, segment in
                 switch segment {
@@ -115,11 +156,11 @@ extension MarkdownUI.Theme {
                 }
                 .padding(10)
                 .background(codeFill)
-                .clipShape(RoundedRectangle(cornerRadius: 8))
+                .clipShape(RoundedRectangle(cornerRadius: Radius.thumb, style: .continuous))
                 .markdownMargin(top: 4, bottom: 4)
         }
         .link {
-            ForegroundColor(.blue)
+            ForegroundColor(JoriTheme.cobalt)
         }
         .listItem { configuration in
             configuration.label

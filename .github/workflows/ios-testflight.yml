@@ -105,27 +105,19 @@ jobs:
             -scheme Jori \
             -derivedDataPath "$RUNNER_TEMP/DerivedData"
 
-      - name: Pin distribution profile specifiers in pbxproj
+      # This build's identity (bundle id, team, backend, …) is
+      # Config/Installation.xcconfig: a fork either commits it (remove it from
+      # apps/companion/.gitignore) or stores it in the JORI_INSTALLATION_XCCONFIG
+      # secret. Without it the public defaults in Config/Jori.xcconfig apply.
+      - name: Installation build configuration
+        env:
+          JORI_INSTALLATION_XCCONFIG: ${{ secrets.JORI_INSTALLATION_XCCONFIG }}
         run: |
-          python3 <<'PYEOF'
-          path = 'Jori.xcodeproj/project.pbxproj'
-          with open(path) as f:
-              c = f.read()
-          # Force Manual + Apple Distribution signing. -allowProvisioningUpdates
-          # on xcodebuild + ASC key will fetch/regenerate the named profiles
-          # from Apple on every build.
-          c = c.replace('CODE_SIGN_STYLE = Automatic;',
-              'CODE_SIGN_STYLE = Manual; "CODE_SIGN_IDENTITY[sdk=iphoneos*]" = "Apple Distribution";')
-          c = c.replace('PROVISIONING_PROFILE_SPECIFIER = "";', '')
-          c = c.replace(
-              'PRODUCT_BUNDLE_IDENTIFIER = com.example.Jori.NotificationService;',
-              'PRODUCT_BUNDLE_IDENTIFIER = com.example.Jori.NotificationService; PROVISIONING_PROFILE_SPECIFIER = "Jori NotificationService AppStore";')
-          c = c.replace(
-              'PRODUCT_BUNDLE_IDENTIFIER = com.example.Jori;',
-              'PRODUCT_BUNDLE_IDENTIFIER = com.example.Jori; PROVISIONING_PROFILE_SPECIFIER = "Jori AppStore";')
-          with open(path, 'w') as f:
-              f.write(c)
-          PYEOF
+          if [ -n "$JORI_INSTALLATION_XCCONFIG" ]; then
+            printf '%s\n' "$JORI_INSTALLATION_XCCONFIG" > Config/Installation.xcconfig
+          fi
+          TEAM=$(sed -n 's/^JORI_TEAM_ID *= *//p' Config/Jori.xcconfig Config/Installation.xcconfig 2>/dev/null | tail -1)
+          echo "JORI_TEAM_ID=$TEAM" >> "$GITHUB_ENV"
 
       - name: Archive iOS (manual signing, JIT profile fetch)
         env:
@@ -143,7 +135,14 @@ jobs:
             -authenticationKeyPath "$ASC_DIR/AuthKey_${ASC_KEY_ID}.p8" \
             -authenticationKeyID "$ASC_KEY_ID" \
             -authenticationKeyIssuerID "$ASC_ISSUER_ID" \
-            DEVELOPMENT_TEAM=TEAMID_PLACEHOLDER \
+            DEVELOPMENT_TEAM="$JORI_TEAM_ID" \
+            JORI_CODE_SIGN_STYLE=Manual \
+            JORI_CODE_SIGN_IDENTITY="Apple Distribution" \
+            JORI_PROFILE_APP="Jori AppStore" \
+            JORI_PROFILE_NOTIFICATION_SERVICE="Jori NotificationService AppStore" \
+            JORI_PROFILE_SHARE="Jori Share AppStore" \
+            JORI_PROFILE_INTENTS="Jori Intents AppStore" \
+            JORI_PROFILE_USAGE_MONITOR="Jori UsageMonitor AppStore" \
             OTHER_CODE_SIGN_FLAGS="--keychain $KEYCHAIN"
 
       - name: Export iOS IPA

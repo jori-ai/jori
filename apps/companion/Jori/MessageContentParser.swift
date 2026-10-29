@@ -35,6 +35,26 @@ struct MessageContentParser {
         "/wp-content/uploads/",   // WordPress media
     ]
 
+    /// A line `<!-- more: <label> -->` folds a long message: the bubble shows what is above it and a
+    /// tappable <label> ("+14 more"); tapping shows the whole message, marker removed. Sent by the
+    /// meeting-agenda reminders. Nil when there is no marker or nothing follows it.
+    static func fold(_ content: String) -> (head: String, full: String, label: String)? {
+        let lines = content.components(separatedBy: "\n")
+        guard let i = lines.firstIndex(where: {
+            let t = $0.trimmingCharacters(in: .whitespaces)
+            return t.hasPrefix("<!-- more") && t.hasSuffix("-->")
+        }) else { return nil }
+        let rest = lines[(i + 1)...].joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !rest.isEmpty else { return nil }
+        var label = lines[i].trimmingCharacters(in: .whitespaces).dropFirst("<!-- more".count).dropLast("-->".count)
+            .trimmingCharacters(in: .whitespaces)
+        if label.hasPrefix(":") { label = String(label.dropFirst()).trimmingCharacters(in: .whitespaces) }
+        let head = lines[..<i].joined(separator: "\n")
+        // The marker sits between two list chunks; joining with a single newline keeps them one list.
+        let full = (Array(lines[..<i]) + Array(lines[(i + 1)...])).joined(separator: "\n")
+        return (head, full, label.isEmpty ? "Show more" : label)
+    }
+
     /// Parse message content into renderable segments.
     /// Standalone URLs on their own line become images or link previews.
     /// Everything else is coalesced into markdown segments.
@@ -156,7 +176,7 @@ struct MessageContentParser {
         }
 
         // 6. Supabase attachment images
-        if absString.contains("jori-attachments") {
+        if absString.contains(Install.attachmentsBucket) {
             return true
         }
 

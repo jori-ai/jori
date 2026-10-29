@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>aps-environment</key>
+	<string>production</string>
+	<key>com.apple.developer.siri</key>
+	<true/>
+	<!-- NOTE: com.apple.developer.usernotifications.communication was REMOVED
+	     (2026-06-27). It requires NSUserActivityTypes=INSendMessageIntent in
+	     Info.plist (ITMS-90894) and reclassified the app as a SiriKit messaging
+	     provider, which broke the plain AirPods announce. We ship plain
+	     notifications now; the profile may still carry the capability (a
+	     superset is fine), but the binary must not claim it. -->
+	<!-- Lets urgent proactive pings break through Driving/DND Focus. Gated:
+	     only pushes sent with --urgent carry interruption-level time-sensitive. -->
+	<key>com.apple.developer.usernotifications.time-sensitive</key>
+	<true/>
+	<!-- Shared keychain group so the JoriIntents extension (separate
+	     process) can read the same Supabase auth session the app wrote, and
+	     insert reply/"ask Jori" messages as the authenticated user. -->
+	<key>keychain-access-groups</key>
+	<array>
+		<string>$(AppIdentifierPrefix)$(JORI_BUNDLE_ID).shared</string>
+	</array>
+	<key>com.apple.developer.healthkit</key>
+	<true/>
+	<key>com.apple.developer.healthkit.background-delivery</key>
+	<true/>
+	<key>com.apple.developer.healthkit.access</key>
+	<array>
+		<string>health-records</string>
+	</array>
+	<key>com.apple.developer.networking.wifi-info</key>
+	<true/>
+	<!-- Jori.entitlements plus Screen Time (Sleep & wake): Family Controls
+	     (Distribution) must be granted by Apple to the team first. Selected
+	     with JORI_APP_ENTITLEMENTS = Jori/Jori-ScreenTime.entitlements (and
+	     JORI_FEATURES containing screen-time). The App Group is shared with
+	     the JoriUsageMonitor extension, which writes the usage log the app
+	     uploads. -->
+	<key>com.apple.developer.family-controls</key>
+	<true/>
+	<key>com.apple.security.application-groups</key>
+	<array>
+		<string>$(JORI_APP_GROUP)</string>
+	</array>
+</dict>
+</plist>
