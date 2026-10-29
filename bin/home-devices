@@ -1,0 +1,656 @@
+#!/usr/bin/env python3
+"""home-devices — heartbeat sweep of the installation's fixed home devices.
+
+    home-devices sweep [--dry-run]   # probe every device, email on DOWN / back UP (cron, every 2 min)
+    home-devices status              # table of the last sweep's view
+    home-devices unlisted            # DHCP leases that are NOT in the roster (to decide what to add)
+
+Requirement: watch every fixed device at each of the user's sites and email
+the user when one drops off or comes back. The host's OWN liveness is a
+separate, off-box concern (bin/minibeat + checkMinibeat in firebase), because
+a dead host can't report itself.
+
+The roster is agent/local/config/home-devices.json (private; see its `_doc`):
+`sites`, `devices`, `ignore`, `ring_battery_alert_pct`. With no roster the
+sweep is off: every command says "no home devices configured" and exits 0.
+
+How a device is judged, by site kind:
+
+  router  a LAN behind a router we can SSH into as root (`router_ssh`, e.g. an
+          OpenWrt box that is also the DHCP server). Devices are keyed by MAC
+          (DHCP addresses drift, MACs don't). Each sweep reads the router's
+          lease table to turn MAC -> IP, then, ON THE ROUTER:
+            1. ping once — most devices answer;
+            2. if not, drop the neighbour entry and ping again, then read the
+               ARP entry. An ARP answer from the right MAC proves the device is
+               on the LAN even when it ignores ICMP (cameras, TVs, ...). The
+               probe runs on the router because clearing an ARP entry needs root.
+          A device behind a Wi-Fi extender may be answered for with the
+          extender's MAC: list it in `alt_macs`.
+  remote  a site with no box of ours on its LAN, reached over a routed tunnel
+          (a subnet route through a device there). Devices are keyed by IP and
+          judged from HERE: ping, then a TCP connect to the device's `ports`.
+          Everything there depends on the device that carries the route, so it
+          is the site's ANCHOR: if it doesn't answer, the other devices are "not
+          judged" and the one email says the whole site is unreachable (the
+          site's `unreachable_cause` says what that can mean). A router site's
+          router is its anchor the same way.
+
+Cloud-judged devices (any site):
+
+  ring        cameras and doorbells stream only to their cloud, so there is
+              nothing local to probe: they are judged by the cloud's
+              `alerts.connection`, which also means a camera is still judged
+              while its site's anchor is down. One cloud query per sweep covers
+              every camera; the login is homectl's (refreshed in place).
+              `ring_name` is matched case-insensitively.
+  lock_cloud  a lock whose LAN presence proves nothing (behind an extender that
+              answers ARP for it) is judged by its cloud `connected` flag, via
+              the `device_state()` of the installation's `lock_cloud_script`.
+
+Both cloud checks run under homectl's own interpreter: the python next to the
+homectl the installation binds at bin/homectl (HOMECTL_BIN, or `homectl_bin` /
+`homectl_python` / `homectl_dir` in the roster, override it). Without one they
+report "not judged", never DOWN.
+
+Camera batteries: the same cloud query reports each camera's battery when one
+is fitted (health.battery_present — mains-powered cameras report a fake 100).
+One email when a battery reaches ring_battery_alert_pct, and one "recharged"
+email once it is back above that +5, so a battery hovering at the threshold
+can't spam. A site's `ring_prefix` maps a camera name to the site.
+
+A device is reported DOWN after DOWN_AFTER consecutive failed sweeps (a Wi-Fi
+IoT device missing one 2-minute probe is normal), and UP on the first good
+sweep after that. A roster entry can raise that bar with `down_after_min`: it
+must ALSO have been failing continuously for that many minutes (a doorbell
+whose Wi-Fi power-save naps would otherwise flap Offline/Back online several
+times a day; alert only on an outage longer than the hold). A nap shorter than
+the hold sends nothing, neither the DOWN nor the matching UP.
+
+Alerts go out as ONE email per sweep via email-send to the instance owner
+(`alert_to` in the roster overrides); if the send fails (e.g. the site's
+internet is down, which minibeat reports separately) they stay queued in the
+state file and go with the next successful sweep. A Tuya smart-plug check was
+removed with its last roster entry (plugs switched off at the wall are
+indistinguishable from dropped ones, so every alert was a false positive).
+"""
+import argparse
+import datetime as dt
+import json
+import os
+import re
+import subprocess
+import sys
+
+HOME = os.path.expanduser("~")
+# cron's PATH has no /opt/homebrew/bin, and email-send is `#!/usr/bin/env node`.
+# cron's PATH is /usr/bin:/bin — no /sbin (ping) either.
+os.environ["PATH"] = "/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin:" + os.environ.get("PATH", "")
+
+# The kernel tree this file runs from (it sits in <kernel>/bin/ in every
+# layout), and the installation's kernel tree, where state lives (the Python
+# twin of lib/root.cjs installTools(): JORI_HOME, else ~/Dev/jori, plus the
+# layout's KERNEL_SUBDIR read from root.cjs so it is written down once).
+CODE_TOOLS = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def _kernel_subdir():
+    try:
+        with open(os.path.join(CODE_TOOLS, "lib", "root.cjs")) as f:
+            m = re.search(r'^const KERNEL_SUBDIR = "([^"]*)";', f.read(), re.M)
+        return m.group(1) if m else ""
+    except OSError:
+        return ""
+
+
+INSTALL = os.environ.get("JORI_HOME") or os.path.join(HOME, "Dev", "jori")
+INSTALL_TOOLS = os.path.join(INSTALL, _kernel_subdir())
+TOOLS = os.path.join(os.environ["JORI_HOME"], _kernel_subdir()) if os.environ.get("JORI_HOME") else CODE_TOOLS
+LOCAL = os.environ.get("JORI_LOCAL_DIR") or os.path.join(TOOLS, "agent", "local")
+ROSTER = os.path.join(LOCAL, "config", "home-devices.json")
+STATE = os.path.join(INSTALL_TOOLS, "data", "home-devices-state.json")
+EMAIL_SEND = os.environ.get("HOME_DEVICES_EMAIL_SEND") or os.path.join(TOOLS, "bin", "email-send")
+DOWN_AFTER = 3  # consecutive failed sweeps; at a 2-min cadence ~6 min
+NOT_CONFIGURED = "no home devices configured (agent/local/config/home-devices.json)"
+
+
+def load(path, default):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return default
+
+
+def save(path, data):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f, indent=2)
+    os.replace(tmp, path)
+
+
+def instance():
+    """The identity values this tool needs (lib/instance.cjs: local file, then env)."""
+    keys = {"owner_email": "JORI_OWNER_EMAIL", "tz": "JORI_TZ", "host": "JORI_HOST", "host_label": "JORI_HOST_LABEL"}
+    out = {"owner_email": "", "tz": "", "host": "", "host_label": "the host"}
+    f = load(os.path.join(LOCAL, "instance.json"), {})
+    for k, env in keys.items():
+        if f.get(k):
+            out[k] = f[k]
+        if os.environ.get(env):
+            out[k] = os.environ[env]
+    return out
+
+
+INST = instance()
+
+
+def load_env():
+    """cron-run loads .env for us; a hand run needs the same values (the cloud
+    checks' subprocesses inherit them)."""
+    try:
+        with open(os.path.join(INSTALL_TOOLS, ".env")) as f:
+            lines = f.read().splitlines()
+    except FileNotFoundError:
+        return
+    for line in lines:
+        line = line.strip()
+        if line and not line.startswith("#") and "=" in line:
+            k, v = line.split("=", 1)
+            os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
+
+
+def roster_cfg():
+    """The roster, or None when this installation has none."""
+    cfg = load(ROSTER, None)
+    if not isinstance(cfg, dict) or not cfg.get("devices"):
+        return None
+    return cfg
+
+
+def expand(p):
+    return os.path.expanduser(p) if isinstance(p, str) else p
+
+
+def homectl_env(cfg):
+    """(python, cwd) of the installation's homectl, or (None, None)."""
+    py, cwd = expand(cfg.get("homectl_python")), expand(cfg.get("homectl_dir"))
+    if py and cwd:
+        return py, cwd
+    bins = [os.environ.get("HOMECTL_BIN")] + [expand(b) for b in ([cfg["homectl_bin"]] if isinstance(cfg.get("homectl_bin"), str) else cfg.get("homectl_bin") or [])]
+    bins.append(os.path.join(INSTALL_TOOLS, "bin", "homectl"))
+    for b in bins:
+        if not b or not os.path.exists(b):
+            continue
+        # bin/homectl is a symlink to <tree>/.venv/bin/homectl: one level is the venv.
+        target = b
+        if os.path.islink(b):
+            target = os.readlink(b)
+            if not os.path.isabs(target):
+                target = os.path.join(os.path.dirname(b), target)
+        venv_bin = os.path.dirname(target)
+        return py or os.path.join(venv_bin, "python"), cwd or os.path.dirname(os.path.dirname(venv_bin))
+    return py, cwd
+
+
+def now_iso():
+    return dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
+
+
+def local_time(iso):
+    t = dt.datetime.fromisoformat(iso)
+    try:
+        from zoneinfo import ZoneInfo
+        t = t.astimezone(ZoneInfo(INST["tz"])) if INST["tz"] else t.astimezone()
+    except Exception:
+        pass
+    return t.strftime("%b %-d, %-I:%M %p")
+
+
+# Runs on a router site's router (BusyBox ash). Reads "ip" lines on stdin,
+# prints "<ip> ping" | "<ip> arp <mac>" | "<ip> none" for each.
+PROBE = r'''
+while read ip; do
+  if ping -c1 -W1 "$ip" >/dev/null 2>&1; then echo "$ip ping"; continue; fi
+  # Power-saving Wi-Fi devices (doorbells) need a few ARP tries and a moment
+  # to wake - a 1-ping/1-second window missed a doorbell while it was fine.
+  ip neigh del "$ip" dev "$IFACE" 2>/dev/null
+  ping -c3 -W1 "$ip" >/dev/null 2>&1
+  sleep 2
+  mac=$(ip neigh show "$ip" dev "$IFACE" | awk '/lladdr/ && !/FAILED|INCOMPLETE/ {print $3}')
+  if [ -n "$mac" ]; then echo "$ip arp $mac"; else echo "$ip none"; fi
+done
+'''
+
+
+def router_ssh(site, cmd, stdin=None, timeout=60):
+    return subprocess.run(
+        ["ssh", "-o", "ConnectTimeout=5", "-o", "BatchMode=yes", site["router_ssh"], cmd],
+        input=stdin, capture_output=True, text=True, timeout=timeout,
+    )
+
+
+def leases(site):
+    """MAC -> (ip, hostname) from the router's dnsmasq lease file."""
+    r = router_ssh(site, site.get("lease_file_cmd", "cat /tmp/dhcp.leases"))
+    if r.returncode != 0:
+        raise RuntimeError(r.stderr.strip() or f"ssh exit {r.returncode}")
+    out = {}
+    for line in r.stdout.splitlines():
+        parts = line.split()
+        if len(parts) >= 4:
+            out[parts[1].lower()] = (parts[2], parts[3])
+    return out
+
+
+def probe(site, ips):
+    if not ips:
+        return {}
+    iface = site.get("lan_iface", "br-lan")
+    r = router_ssh(site, f"IFACE={iface}\n" + PROBE, stdin="\n".join(ips) + "\n", timeout=30 + 4 * len(ips))
+    res = {}
+    for line in r.stdout.splitlines():
+        parts = line.split()
+        if len(parts) >= 2:
+            res[parts[0]] = parts[1:]
+    return res
+
+
+def lock_cloud_connected(cfg):
+    """True / False from the lock's cloud, or None if it couldn't be asked."""
+    script = cfg.get("lock_cloud_script")
+    py, _ = homectl_env(cfg)
+    if not script or not py:
+        return None
+    script = expand(script)
+    if not os.path.isabs(script):
+        script = os.path.join(TOOLS, script)
+    code = (
+        "import importlib.util,json;"
+        f"s=importlib.util.spec_from_file_location('h',{script!r});"
+        "h=importlib.util.module_from_spec(s);s.loader.exec_module(h);"
+        "d,a=h.device_state();print(json.dumps(d.get('connected')))"
+    )
+    try:
+        r = subprocess.run([py, "-c", code], capture_output=True, text=True, timeout=45)
+        v = json.loads(r.stdout.strip().splitlines()[-1])
+        return v if isinstance(v, bool) else None
+    except Exception:
+        return None
+
+
+RING_Q = """
+import asyncio, json
+from homectl.devices.ring import RingClient
+async def main():
+    c = RingClient()
+    try:
+        d = (await c._get_ring()).devices()
+        out = {}
+        for x in list(d.doorbots) + list(d.stickup_cams):
+            h = x._attrs.get("health") or {}
+            batt = h.get("battery_percentage") if h.get("battery_present") else None
+            out[x.name] = {"conn": (x._attrs.get("alerts") or {}).get("connection"), "battery": batt}
+        print(json.dumps(out))
+    finally:
+        await c.close()
+asyncio.run(main())
+"""
+
+
+RING = {"data": "unfetched"}
+
+
+def ring_connections(cfg):
+    """Camera name -> {"conn": "online"/..., "battery": pct|None}, or None if
+    the cloud couldn't be asked. Fetched once per sweep, shared by the
+    connection and battery checks."""
+    if RING["data"] == "unfetched":
+        py, cwd = homectl_env(cfg)
+        if not py:
+            RING["data"] = None
+            return None
+        try:
+            r = subprocess.run([py, "-c", RING_Q], capture_output=True, text=True, timeout=90, cwd=cwd)
+            RING["data"] = json.loads(r.stdout.strip().splitlines()[-1])
+        except Exception:
+            RING["data"] = None
+    return RING["data"]
+
+
+def check_ring(cfg, devs):
+    results = {}
+    if not devs:
+        return results
+    conn = ring_connections(cfg)
+    by_name = {k.lower(): v for k, v in (conn or {}).items()}
+    for d in devs:
+        want = d["ring_name"].lower()
+        if conn is None:
+            results[d["name"]] = (None, "Ring cloud unavailable")
+        elif want not in by_name:
+            results[d["name"]] = (False, "not on the Ring account")
+        else:
+            c = by_name[want]["conn"]
+            results[d["name"]] = (c == "online", f"Ring: {c}")
+    return results
+
+
+def tcp_open(ip, ports):
+    for port in ports:
+        if subprocess.run(["nc", "-z", "-G2", ip, str(port)], capture_output=True).returncode == 0:
+            return port
+    return None
+
+
+def check_remote_device(d):
+    ip = d["ip"]
+    if subprocess.run(["ping", "-c2", "-t3", ip], capture_output=True).returncode == 0:
+        return True, f"{ip} ping"
+    port = tcp_open(ip, d.get("ports", []))
+    if port:
+        return True, f"{ip} tcp/{port}"
+    return False, f"{ip} no ping, no TCP"
+
+
+def check_router_site(cfg, site, devs):
+    results = {}
+    try:
+        lease = leases(site)
+    except Exception as e:
+        # The router itself isn't answering SSH. Ping it from here to tell
+        # "router down" from "SSH broke"; either way nothing behind it can be judged.
+        rip = site.get("router_ip") or site["router_ssh"].split("@")[-1]
+        alive = subprocess.run(["ping", "-c2", "-t3", rip], capture_output=True).returncode == 0
+        for d in devs:
+            if d.get("check") == "router":
+                results[d["name"]] = (alive, "answers ping, SSH failed" if alive else f"no response ({e})")
+            else:
+                results[d["name"]] = (None, "router unreachable, not judged")
+        return results
+
+    lan = [d for d in devs if d.get("check", "lan") == "lan"]
+    ip_of = {d["mac"]: lease.get(d["mac"], (None, None))[0] for d in lan}
+    got = probe(site, sorted({ip for ip in ip_of.values() if ip}))
+
+    for d in devs:
+        kind = d.get("check", "lan")
+        if kind == "router":
+            results[d["name"]] = (True, "SSH OK")
+        elif kind == "lock_cloud":
+            c = lock_cloud_connected(cfg)
+            results[d["name"]] = (c, {True: "cloud: connected", False: "cloud: NOT connected", None: "cloud API unavailable"}[c])
+        else:
+            ip = ip_of[d["mac"]]
+            if not ip:
+                results[d["name"]] = (False, "no DHCP lease")
+                continue
+            p = got.get(ip)
+            if not p:
+                results[d["name"]] = (None, f"{ip}: probe returned nothing")
+            elif p[0] == "ping":
+                results[d["name"]] = (True, f"{ip} ping")
+            elif p[0] == "arp" and len(p) > 1 and p[1].lower() in [d["mac"]] + d.get("alt_macs", []):
+                results[d["name"]] = (True, f"{ip} ARP")
+            elif p[0] == "arp":
+                results[d["name"]] = (False, f"{ip} answered by another MAC {p[1]}")
+            else:
+                results[d["name"]] = (False, f"{ip} no ping, no ARP")
+    return results
+
+
+def check_remote_site(cfg, devs):
+    results = {}
+    anchor = next((d for d in devs if d.get("anchor")), None)
+    if anchor:
+        ok, detail = check_remote_device(anchor)
+        results[anchor["name"]] = (ok, detail)
+        if not ok:
+            for d in devs:
+                if d is not anchor:
+                    results[d["name"]] = (None, "site unreachable, not judged")
+            return results
+    for d in devs:
+        if d is not anchor:
+            if d.get("check") == "lock_cloud":
+                c = lock_cloud_connected(cfg)
+                results[d["name"]] = (c, {True: "cloud: connected", False: "cloud: NOT connected", None: "cloud API unavailable"}[c])
+            else:
+                results[d["name"]] = check_remote_device(d)
+    return results
+
+
+def check_all(cfg):
+    """name -> (ok: True/False/None, detail). None = couldn't judge, don't count."""
+    roster = cfg.get("devices", [])
+    sites = cfg.get("sites", {})
+    results = {}
+    ring = [d for d in roster if d.get("check") == "ring"]
+    rest = [d for d in roster if d.get("check") != "ring"]
+    for key, site in sites.items():
+        devs = [d for d in rest if d["site"] == key]
+        if not devs:
+            continue
+        if site.get("kind") == "router":
+            results.update(check_router_site(cfg, site, devs))
+        else:
+            results.update(check_remote_site(cfg, devs))
+    for d in rest:
+        if d["name"] not in results:
+            results[d["name"]] = (None, f"site {d['site']!r} is not in the roster's sites")
+    results.update(check_ring(cfg, ring))
+    return results
+
+
+def describe(e):
+    if e.get("anchor") and e["kind"] == "down":
+        return f"{e['site']} UNREACHABLE ({e['name']} not answering)"
+    return f"{e['site']} {e['name']}"
+
+
+def alert_to(cfg):
+    return cfg.get("alert_to") or INST["owner_email"]
+
+
+def send_email(cfg, events):
+    downs = [e for e in events if e["kind"] == "down"]
+    ups = [e for e in events if e["kind"] == "up"]
+    lows = [e for e in events if e["kind"] == "battery"]
+    charged = [e for e in events if e["kind"] == "recharged"]
+    if lows and not (downs or ups):
+        subj = "Low battery: " + "; ".join("%s %s%%" % (describe(e), e["pct"]) for e in lows)
+    elif charged and not (downs or ups or lows):
+        subj = f"Recharged: {'; '.join(describe(e) for e in charged)}"
+    elif downs and not ups:
+        subj = f"Offline: {'; '.join(describe(e) for e in downs)}"
+    elif ups and not downs:
+        subj = f"Back online: {'; '.join(describe(e) for e in ups)}"
+    else:
+        subj = f"Home devices: {len(downs)} offline, {len(ups)} back online"
+    if len(subj) > 120:
+        subj = subj[:117] + "..."
+    causes = {s.get("label", k): s.get("unreachable_cause") for k, s in cfg.get("sites", {}).items()}
+    lines = []
+    if downs:
+        lines.append("OFFLINE")
+        for e in downs:
+            lines.append(f"  - {describe(e)}: last seen {local_time(e['last_seen']) if e.get('last_seen') else 'never'} ({e['detail']})")
+            if e.get("anchor"):
+                lines.append(f"    Everything else at {e['site']} is reached through it, so nothing there can be checked until it's back.")
+                if causes.get(e["site"]):
+                    lines.append(f"    {causes[e['site']]}")
+        lines.append("")
+    if lows:
+        lines.append("LOW BATTERY")
+        for e in lows:
+            lines.append(f"  - {describe(e)}: {e['pct']}% (alert threshold {e['thresh']}%). Charge or swap the battery; one email per drop.")
+        lines.append("")
+    if charged:
+        lines.append("RECHARGED")
+        for e in charged:
+            lines.append(f"  - {describe(e)}: back to {e['pct']}%")
+        lines.append("")
+    if ups:
+        lines.append("BACK ONLINE")
+        for e in ups:
+            lines.append(f"  - {describe(e)}: back at {local_time(e['at'])}, was down since {local_time(e['since'])}")
+        lines.append("")
+    held = any(d.get("down_after_min") for d in cfg.get("devices", []))
+    lines.append(f"Checked from {INST['host_label']} every 2 minutes; a device is called offline after {DOWN_AFTER} missed checks"
+                 + (" (a device with a hold only after it has failed that long)." if held else "."))
+    where = INSTALL_TOOLS.replace(HOME, "~", 1).rstrip("/")
+    lines.append(f"Current view: {'ssh ' + INST['host'] + ' ' if INST['host'] else ''}{where}/bin/home-devices status")
+    to = alert_to(cfg)
+    if not to:
+        print(f"no alert recipient (owner_email / alert_to) — {subj}\n" + "\n".join(lines))
+        return True, "printed (no recipient)"
+    r = subprocess.run(
+        [EMAIL_SEND, "--to", to, "--subject", subj, "--body", "\n".join(lines)],
+        capture_output=True, text=True, timeout=60,
+    )
+    return r.returncode == 0, (r.stderr or r.stdout).strip()
+
+
+def ring_site(cfg, rname):
+    low = rname.lower()
+    for k, s in cfg.get("sites", {}).items():
+        pre = (s.get("ring_prefix") or "").lower()
+        if pre and low.startswith(pre):
+            return s.get("label", k)
+    return "Ring"
+
+
+def cmd_sweep(args, cfg):
+    roster = cfg.get("devices", [])
+    labels = {k: v.get("label", k) for k, v in cfg.get("sites", {}).items()}
+    state = load(STATE, {"devices": {}, "pending": []})
+    results = check_all(cfg)
+    t = now_iso()
+    for d in roster:
+        name = d["name"]
+        tag = {"site": labels.get(d["site"], d["site"]), "anchor": bool(d.get("anchor") or d.get("check") == "router")}
+        ok, detail = results[name]
+        s = state["devices"].setdefault(name, {"status": "up", "fails": 0})
+        s["detail"], s["checked"] = detail, t
+        if ok is None:
+            continue
+        if ok:
+            s["last_seen"] = t
+            if s["status"] == "down":
+                state["pending"].append({**tag, "kind": "up", "name": name, "at": t, "since": s.get("since", t)})
+            s.update(status="up", fails=0)
+            s.pop("since", None)
+            s.pop("failing_since", None)
+        else:
+            s["fails"] = s.get("fails", 0) + 1
+            s.setdefault("failing_since", t)
+            held = dt.datetime.fromisoformat(t) - dt.datetime.fromisoformat(s["failing_since"])
+            if (s["status"] == "up" and s["fails"] >= DOWN_AFTER
+                    and held >= dt.timedelta(minutes=d.get("down_after_min", 0))):
+                s.update(status="down", since=s["failing_since"])
+                state["pending"].append({**tag, "kind": "down", "name": name, "detail": detail, "last_seen": s.get("last_seen")})
+    # Drop devices removed from the roster.
+    names = {d["name"] for d in roster}
+    state["devices"] = {k: v for k, v in state["devices"].items() if k in names}
+    state["last_sweep"] = t
+
+    thresh = cfg.get("ring_battery_alert_pct")
+    ring = ring_connections(cfg) if thresh and any(d.get("check") == "ring" for d in roster) else None
+    if ring:
+        bstate = state.setdefault("ring_battery", {})
+        for rname, info in ring.items():
+            pct = info.get("battery")
+            if pct is None:
+                continue
+            pct = int(pct)
+            b = bstate.setdefault(rname, {"alerted": False})
+            b["pct"], b["checked"] = pct, t
+            site = ring_site(cfg, rname)
+            if pct <= thresh and not b["alerted"]:
+                b["alerted"] = True
+                state["pending"].append({"kind": "battery", "site": site, "anchor": False, "name": rname, "pct": pct, "thresh": thresh})
+            elif pct >= thresh + 5 and b["alerted"]:
+                b["alerted"] = False
+                state["pending"].append({"kind": "recharged", "site": site, "anchor": False, "name": rname, "pct": pct})
+
+    if args.dry_run:
+        if ring:
+            print("ring batteries:", {k: v.get("battery") for k, v in ring.items() if v.get("battery") is not None})
+        for name, (ok, detail) in results.items():
+            print(f"{'OK  ' if ok else ('??  ' if ok is None else 'FAIL')} {name:34} {detail}")
+        print("pending:", json.dumps(state["pending"]))
+        return
+
+    if state["pending"]:
+        sent, info = send_email(cfg, state["pending"])
+        if sent:
+            print(f"{t} emailed {len(state['pending'])} event(s)")
+            state["pending"] = []
+        else:
+            print(f"{t} email failed, keeping {len(state['pending'])} queued: {info}", file=sys.stderr)
+    save(STATE, state)
+
+
+def cmd_status(_args, _cfg):
+    state = load(STATE, {"devices": {}})
+    print(f"last sweep: {local_time(state['last_sweep']) if state.get('last_sweep') else 'never'}")
+    for name, s in sorted(state["devices"].items()):
+        tag = "DOWN" if s["status"] == "down" else ("miss" if s.get("fails") else "up")
+        held = f"  (failing since {local_time(s['failing_since'])})" if s.get("failing_since") and s["status"] != "down" else ""
+        print(f"  {tag:4} {name:28} {s.get('detail', '')}{held}")
+    for rname, b in sorted(state.get("ring_battery", {}).items()):
+        print(f"  batt {rname:28} {b.get('pct')}%{'  (low-battery alert sent)' if b.get('alerted') else ''}")
+    if state.get("pending"):
+        print(f"queued, not yet emailed: {len(state['pending'])}")
+
+
+def cmd_unlisted(_args, cfg):
+    known = {d["mac"] for d in cfg.get("devices", []) if "mac" in d}
+    known |= set(cfg.get("ignore", {}).keys())
+    for key, site in cfg.get("sites", {}).items():
+        if site.get("kind") != "router":
+            continue
+        for mac, (ip, host) in sorted(leases(site).items(), key=lambda kv: kv[1][0]):
+            if mac not in known:
+                print(f"  {site.get('label', key)}  {mac}  {ip:15}  {host}")
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    sw = sub.add_parser("sweep")
+    sw.add_argument("--dry-run", action="store_true", help="probe and print; no email, no state write")
+    sub.add_parser("status")
+    sub.add_parser("unlisted")
+    args = ap.parse_args()
+    cfg = roster_cfg()
+    if cfg is None:
+        print(NOT_CONFIGURED)
+        return
+    load_env()
+    if args.cmd != "sweep" or args.dry_run:
+        return {"sweep": cmd_sweep, "status": cmd_status, "unlisted": cmd_unlisted}[args.cmd](args, cfg)
+    # A sweep that crashes leaves the user silently unmonitored, so say so —
+    # at most every 6 hours, so a persistent bug is one email, not 180.
+    try:
+        cmd_sweep(args, cfg)
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        state = load(STATE, {"devices": {}, "pending": []})
+        last = state.get("crash_emailed")
+        to = alert_to(cfg)
+        if to and (not last or dt.datetime.now(dt.timezone.utc) - dt.datetime.fromisoformat(last) > dt.timedelta(hours=6)):
+            where = INSTALL_TOOLS.replace(HOME, "~", 1).rstrip("/")
+            r = subprocess.run([EMAIL_SEND, "--to", to, "--subject", "Home device monitor is failing",
+                                "--body", f"The home-devices sweep on {INST['host_label']} crashed, so devices are NOT being checked.\n\n{type(e).__name__}: {e}\n\nLog: {where}/logs/home-devices.log"],
+                               capture_output=True, text=True, timeout=60)
+            if r.returncode == 0:
+                state["crash_emailed"] = now_iso()
+                save(STATE, state)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
