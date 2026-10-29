@@ -508,6 +508,37 @@
       "runtime": "launchd-script",
       "launchd_label": "ai.claude.flights-scan",
       "script": "bin/flights-scan-run"
+    },
+    {
+      "name": "purchase",
+      "schedule": "on-demand",
+      "schedule_human": "On demand (bin/purchase-queue)",
+      "trigger_script": "agent/scripts/trigger-purchase.sh",
+      "webhook_url": "http://localhost:9092",
+      "webhook_task": "purchase",
+      "ops_playbook_section": null,
+      "delivers_to": "chat",
+      "phrases": [
+        "make a purchase",
+        "buy this"
+      ],
+      "description": "Dispatches one queued purchase to the ops agent (jobs/purchase.md); started by bin/purchase-queue, never by cron. Face ID in the app approves; code places the order."
+    },
+    {
+      "name": "purchase-signin",
+      "schedule": "23 11 * * 0",
+      "schedule_human": "Sundays at 11:23 AM local",
+      "trigger_script": "agent/scripts/trigger-purchase-signin.sh",
+      "webhook_url": "http://localhost:9092",
+      "webhook_task": "purchase-signin",
+      "ops_playbook_section": null,
+      "delivers_to": "chat",
+      "phrases": [
+        "purchase sign-in",
+        "sign in to merchants",
+        "shop chrome sign in"
+      ],
+      "description": "Keep the shop Chrome signed in to the installation's top merchants (data/purchase-merchants.json; jobs/purchase-signin.md). Weekly, daytime, since 2FA codes go to the phone."
     }
   ]
 }
