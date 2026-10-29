@@ -1,0 +1,518 @@
+#!/usr/bin/env node
+// cruise-watch — orchestrates per-line extractors, filters against the travel
+// plan, drops user-skipped sailings, and writes the match payload to stdout
+// (JSON) for the playbook to consume.
+//
+// Usage:
+//   cruise-watch --plan data/travel-plan-<year>.json [--dry-run] [--lines royal,...]
+//
+// Configuration: agent/local/config/cruise-watch.json (lib/cruise/config.mjs).
+// With no plan file the watch is not configured: it says so and exits 0.
+//
+// The plan JSON shape: { "windows": [{ "city": "...", "start": "YYYY-MM-DD", "end": "YYYY-MM-DD" }, ...] }
+//
+// Output (stdout, JSON):
+//   { matches: [...], total_sailings: N, dropped: {...}, per_line_status: {...} }
+//
+// Behavior: every run surfaces ALL currently-matching sailings in `matches`
+// (that is the corpus the site browses), and separately classifies what
+// actually MOVED into `alerts` — the only part the weekly email is allowed to
+// send since 2026-08-31 (alert only on significant price drops, not on every
+// cruise). The full list lives on the browsing site; see
+// lib/cruise/alerts.mjs for the drop/new-deal/all-time-low definitions.
+//
+// The state file `cruise-watch-state.json` tracks `skipped_sailing_ids` — only
+// sailings the user explicitly opted out of (via the skip CLI) get suppressed.
+//
+// Side effect: updates data/cruise-watch-state.json (per_line_status +
+// last_run_at; skipped list is only mutated by the skip CLI, never by runs).
+// On --dry-run, state is NOT written.
+
+import { readFile, writeFile, mkdir } from "node:fs/promises";
+import { existsSync } from "node:fs";
+import { dirname } from "node:path";
+
+import { applyFilters } from "../lib/cruise/filter.mjs";
+import {
+  upsertSailings, loadFavorites, loadFavoriteRows, recordCruisefeedPrices, loadShipRatings,
+  loadFutureSailingsForRegate, applyRegatePatches,
+} from "../lib/cruise/db.mjs";
+import { REGATE_COLUMNS, sailingFromRow, gateTargets, regatePatches } from "../lib/cruise/regate.mjs";
+import { enrichVirginPrices } from "../lib/cruise/virgin-prices.mjs";
+import { classifyAlerts, classifyWatchlist, loadAlertThresholds } from "../lib/cruise/alerts.mjs";
+import { withDefaultWindows, defaultCities, defaultHorizonDays } from "../lib/cruise/plan.mjs";
+import { dataPath } from "../lib/cruise/config.mjs";
+import * as royal from "../lib/cruise/royal.mjs";
+import * as celebrity from "../lib/cruise/celebrity.mjs";
+import * as ncl from "../lib/cruise/ncl.mjs";
+import * as holland from "../lib/cruise/holland.mjs";
+import * as msc from "../lib/cruise/msc.mjs";
+import * as virgin from "../lib/cruise/virgin.mjs";
+import * as princess from "../lib/cruise/princess.mjs";
+import * as cruisefeed from "../lib/cruise/cruisefeed.mjs";
+
+const STATE_PATH = dataPath("cruise-watch-state.json");
+const LAST_RUN_PATH = dataPath("cruise-watch-last-run.json");
+const ALERT_HISTORY_CAP = 5000;
+
+const EXTRACTORS = {
+  royal,
+  celebrity,
+  ncl,
+  holland,
+  msc,
+  virgin,
+  princess,
+};
+
+function parseArgs(argv) {
+  const out = {
+    plan: null, dryRun: false, lines: null,
+    // Virgin balcony-fare resolution: on by default (it is the only way that
+    // line reaches the site at all), with escapes for a fast run or a probe.
+    noVirginPrices: false, virginConcurrency: 4, virginLimit: Infinity,
+    noCruisefeed: false, forceCruisefeed: false, cruisefeedMax: 1500, favoritesOnly: false,
+    regateOnly: false,
+  };
+  for (let i = 2; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === "--dry-run") out.dryRun = true;
+    else if (a === "--plan") out.plan = argv[++i];
+    else if (a === "--lines") out.lines = argv[++i].split(",").map((s) => s.trim()).filter(Boolean);
+    else if (a === "--no-virgin-prices") out.noVirginPrices = true;
+    else if (a === "--no-cruisefeed") out.noCruisefeed = true;
+    else if (a === "--cruisefeed") out.forceCruisefeed = true;
+    else if (a === "--favorites-only") out.favoritesOnly = true;
+    else if (a === "--regate-only") out.regateOnly = true;
+    else if (a === "--cruisefeed-max") out.cruisefeedMax = Math.max(0, Number(argv[++i]) || 0);
+    else if (a === "--virgin-concurrency") out.virginConcurrency = Math.max(1, Number(argv[++i]) || 4);
+    else if (a === "--virgin-limit") out.virginLimit = Math.max(0, Number(argv[++i]) || 0);
+    else if (a === "--help" || a === "-h") {
+      console.log("Usage: cruise-watch --plan <path> [--dry-run] [--lines royal,ncl,...]\n"
+        + "                    [--no-virgin-prices] [--virgin-concurrency N] [--virgin-limit N]\n"
+        + "                    [--no-cruisefeed] [--cruisefeed] [--cruisefeed-max N]\n"
+        + "                    [--favorites-only]   daily re-price of starred sailings only\n"
+        + "                    [--regate-only]      re-apply the plan to every stored sailing, nothing else");
+      process.exit(0);
+    }
+  }
+  return out;
+}
+
+async function loadPlan(path) {
+  const raw = await readFile(path, "utf8");
+  const json = JSON.parse(raw);
+  const windows = Array.isArray(json?.windows) ? json.windows : [];
+  return windows.filter((w) => w?.city && w?.start && w?.end);
+}
+
+async function loadState() {
+  if (!existsSync(STATE_PATH)) {
+    return {
+      last_run_at: null,
+      skipped_sailing_ids: [],
+      per_line_status: {},
+      unresolved_ships: [],
+    };
+  }
+  const raw = await readFile(STATE_PATH, "utf8");
+  const parsed = JSON.parse(raw);
+  // Migrate legacy alerted_sailing_ids → skipped_sailing_ids one-time. Old
+  // state used dedup-on-alert semantics; new model is user-opt-out only. We
+  // do NOT carry the old IDs over (those weren't user-skipped, just
+  // previously-alerted) — fresh empty skip list is the right default.
+  if (parsed.alerted_sailing_ids && !parsed.skipped_sailing_ids) {
+    parsed.skipped_sailing_ids = [];
+    delete parsed.alerted_sailing_ids;
+  }
+  if (!Array.isArray(parsed.skipped_sailing_ids)) parsed.skipped_sailing_ids = [];
+  return parsed;
+}
+
+async function saveState(state) {
+  await mkdir(dirname(STATE_PATH), { recursive: true });
+  await writeFile(STATE_PATH, JSON.stringify(state, null, 2) + "\n", "utf8");
+}
+
+function pruneStaleSkips(ids, today) {
+  // Drop skipped_sailing_ids whose embedded depart_date is past — once a
+  // sailing has departed, the skip is meaningless. Capped at ALERT_HISTORY_CAP
+  // as a safety bound. sailing_id examples: "royal:WN4BH349_2026-09-14".
+  const cutoff = today.toISOString().slice(0, 10);
+  const kept = ids.filter((id) => {
+    const m = id.match(/(\d{4}-\d{2}-\d{2})/);
+    return !m || m[1] >= cutoff;
+  });
+  return kept.slice(-ALERT_HISTORY_CAP);
+}
+
+// Re-apply the current plan to every stored future sailing — see
+// lib/cruise/regate.mjs. A failure here is logged, never fatal: stale flags
+// for one more day beat a missed price refresh.
+async function regateCorpus(planWindows, skipped, dryRun) {
+  try {
+    const rows = await loadFutureSailingsForRegate(REGATE_COLUMNS);
+    if (!rows) {
+      console.error("[regate] skipped — no Supabase key");
+      return;
+    }
+    const [favorites, ratings] = await Promise.all([loadFavorites(), loadShipRatings()]);
+    const gated = await applyFilters(rows.map(sailingFromRow), planWindows, skipped, { favorites, ratings });
+    const groups = regatePatches(rows, gateTargets(rows, gated));
+    const n = groups.reduce((a, g) => a + g.ids.length, 0);
+    if (dryRun) {
+      console.error(`[regate] ${rows.length} future sailings, ${n} would change (dry run)`);
+      return;
+    }
+    const patched = n ? await applyRegatePatches(groups) : 0;
+    console.error(`[regate] ${rows.length} future sailings, ${patched} re-flagged to the current plan`);
+  } catch (err) {
+    console.error(`[regate] FAILED: ${err?.message || err}`);
+  }
+}
+
+async function main() {
+  const args = parseArgs(process.argv);
+  if (!args.plan) {
+    console.error("error: --plan <path> is required");
+    process.exit(2);
+  }
+  if (!existsSync(args.plan)) {
+    console.error(`[cruise-watch] no travel plan at ${args.plan} — not configured, nothing to do`);
+    return;
+  }
+  const explicitWindows = await loadPlan(args.plan);
+  if (explicitWindows.length === 0) {
+    console.error("error: plan has no usable windows");
+    process.exit(2);
+  }
+  // The written plan stops where the user has actually decided; everything after
+  // it matched nothing, so two thirds of the corpus was unreachable. Gaps in
+  // the next two years are assumed to be a home city — explicit windows still
+  // win, so a leg abroad stays exclusive. See lib/cruise/plan.mjs.
+  const planWindows = withDefaultWindows(explicitWindows);
+  const assumed = planWindows.length - explicitWindows.length;
+  console.error(
+    `[plan] ${explicitWindows.length} explicit windows + ${assumed} assumed ` +
+      `(${defaultCities().join(" / ") || "no home cities"}, ${defaultHorizonDays()}d horizon)`,
+  );
+
+  const state = await loadState();
+
+  // The plan may have changed since a sailing was last scraped; the daily run
+  // is what makes a travel change reach the site within a day.
+  if (args.regateOnly || args.favoritesOnly) {
+    await regateCorpus(planWindows, new Set(state.skipped_sailing_ids || []), args.dryRun);
+    if (args.regateOnly) return;
+  }
+
+  // ---- DAILY MODE ---------------------------------------------------------
+  // Re-price only the starred sailings and stop: starred cruises refresh daily,
+  // the rest monthly. A dozen stars
+  // is ~12 results a day (~360/month against a 2,000 grant); a daily corpus
+  // pull would be 24,750. No extractor runs, so this costs seconds, not the
+  // 20-25 minutes a full sweep takes.
+  if (args.favoritesOnly) {
+    const favIds = await loadFavorites();
+    const favRows = await loadFavoriteRows(favIds);
+    console.error(`[favorites] ${favIds.size ?? favIds.length} starred, ${favRows.length} rows loaded`);
+    if (!favRows.length) {
+      console.error("[favorites] nothing to refresh — no email");
+      return;
+    }
+    const r = await cruisefeed.refreshFavorites(favRows);
+    if (r.skipped) {
+      console.error(`[favorites] skipped — ${r.skipped}`);
+      return;
+    }
+    console.error(
+      `[favorites] ${r.matched} re-priced, ${r.missed} not found (${r.results_spent} results spent)` +
+        (r.allowance ? ` · allowance ${r.allowance.remaining}/${r.allowance.limit} left` : ""),
+    );
+
+    // Write CruiseFeed's price into its OWN series, never the scraped one.
+    // Both measure the same sailing and disagree — mixing them made Odyssey of
+    // the Seas oscillate 2937.65 ↔ 1735.96 and fired a phantom -40.9% drop.
+    // See recordCruisefeedPrices.
+    const moved = await recordCruisefeedPrices(r.rows);
+    const th = await loadAlertThresholds();
+    const drops = [];
+    for (const [id, m] of moved) {
+      if (m.change_pct !== null && m.change_pct <= -th.drop_min_pct) {
+        const row = r.rows.find((x) => x.sailing_id === id) || { sailing_id: id };
+        drops.push({ ...row, prev_price: m.prev, change_pct: m.change_pct });
+      }
+    }
+    const wl = { drops, promos: [], gone: [], any: drops.length > 0 };
+    console.error(
+      `[watchlist] ${wl.drops.length} drops ≥${th.drop_min_pct}%, ${wl.promos.length} new promos` +
+        (wl.any ? "" : " — NOTHING TO SEND"),
+    );
+    // Same file the weekly run writes, so the playbook has one read source.
+    // `mode` is what tells it this was a daily re-price, not a full sweep.
+    await writeFile(LAST_RUN_PATH, JSON.stringify({
+      mode: "favorites-only",
+      run_at: new Date().toISOString(),
+      favorites_count: favIds.size ?? favIds.length,
+      refresh: { matched: r.matched, missed: r.missed, results_spent: r.results_spent },
+      allowance: r.allowance ?? null,
+      watchlist: wl,
+      alert_thresholds: th,
+    }, null, 2) + "\n", "utf8");
+    return;
+  }
+
+  const skipped = new Set(state.skipped_sailing_ids || []);
+  const linesToRun = args.lines || Object.keys(EXTRACTORS);
+  const perLineStatus = { ...(state.per_line_status || {}) };
+
+  const allSailings = [];
+  for (const line of linesToRun) {
+    const ext = EXTRACTORS[line];
+    if (!ext) {
+      perLineStatus[line] = { ...(perLineStatus[line] || {}), last_error: "no extractor", last_failure_at: new Date().toISOString() };
+      continue;
+    }
+    const t0 = Date.now();
+    try {
+      const { sailings, total_cruises, pages } = await ext.fetchSailings({});
+      allSailings.push(...sailings);
+      perLineStatus[line] = {
+        last_ok: new Date().toISOString(),
+        last_count: sailings.length,
+        last_pages: pages,
+        last_total_cruises: total_cruises,
+        last_duration_ms: Date.now() - t0,
+        consecutive_failures: 0,
+        last_error: null,
+      };
+      console.error(`[${line}] ${sailings.length} sailings (${pages} pages, ${total_cruises} cruises) in ${Date.now() - t0}ms`);
+    } catch (err) {
+      const prev = perLineStatus[line] || {};
+      perLineStatus[line] = {
+        ...prev,
+        last_failure_at: new Date().toISOString(),
+        last_error: String(err?.message || err).slice(0, 300),
+        consecutive_failures: (prev.consecutive_failures || 0) + 1,
+      };
+      console.error(`[${line}] FAILED: ${err?.message || err}`);
+    }
+  }
+
+  // Virgin publishes one price per sailing — the cheapest cabin — and that
+  // cabin is an Insider on 91.5% of them, so the extractor could record a
+  // BALCONY fare for 4 of 458 and the line was effectively absent from the
+  // site. This renders each unpriced Virgin voyage page and reads the real Sea
+  // Terrace fare. It must run BEFORE applyFilters, not just before the upsert:
+  // the plan filter tests price, so a sailing priced afterwards would be
+  // filtered as if it had none.
+  //
+  // Estimating instead was measured and rejected — the Sea Terrace / Insider
+  // ratio is mean 1.247 but sd 0.153, missing the real fare by a median 10.8%
+  // and up to 37.6%. The watchlist alerts on a 10% drop, so an estimate would
+  // manufacture alerts out of its own error. See virgin-prices.mjs.
+  if (!args.noVirginPrices) {
+    const t0 = Date.now();
+    const r = await enrichVirginPrices(allSailings, {
+      concurrency: args.virginConcurrency,
+      limit: args.virginLimit,
+    });
+    console.error(
+      `[virgin-prices] ${r.priced}/${r.attempted} balcony fares resolved` +
+        `${r.failed ? `, ${r.failed} failed` : ""} in ${Math.round((Date.now() - t0) / 1000)}s`,
+    );
+    perLineStatus.virgin = { ...(perLineStatus.virgin || {}), balcony_fares_resolved: r.priced, balcony_fares_attempted: r.attempted };
+  }
+
+  // PRIMARY SOURCE. CruiseFeed covers 61 lines under one schema where our own
+  // extractors cover seven under seven, so from 2026-09-01 it leads and the
+  // per-line scrapes verify and complement it. It is additive
+  // here rather than exclusive: its rows carry `cf:` ids and
+  // `data_source=cruisefeed`, ours keep theirs, and nothing is thrown away
+  // until the two have been compared on real data.
+  //
+  // No key configured is not an error — the run simply proceeds on the
+  // per-line scrapes, which is exactly what it did before.
+  // CADENCE: MONTHLY, not weekly. One in-plan pull is ~825 results against a
+  // 2,000/month grant, so weekly would need 3,300 and cannot fit. The scrapers
+  // run weekly and carry the price watch; CruiseFeed refreshes the wider
+  // corpus once a month. `--cruisefeed` forces it regardless.
+  const cfMonth = new Date().toISOString().slice(0, 7);
+  const cfDue = args.forceCruisefeed || state.cruisefeed_last_month !== cfMonth;
+  if (!args.noCruisefeed && !cfDue) {
+    console.error(`[cruisefeed] skipped — already pulled in ${cfMonth} (monthly cadence; --cruisefeed to force)`);
+  }
+  if (!args.noCruisefeed && cfDue) {
+    try {
+      const t0 = Date.now();
+      // Only the windows for the ports we pull: a window abroad is not a
+      // reason to spend budget on home-port departures.
+      // EXPLICIT windows only. `withDefaultWindows` fills the next 730 days
+      // with assumed home-city stays, which is right for the plan filter
+      // but wrong here: merging an assumed two-year home-city window turns an
+      // 825-result pull into 1,500+ and burns the monthly grant on dates that
+      // are a guess. A paid source spends budget only on decided travel.
+      const planForPorts = explicitWindows.filter((w) =>
+        cruisefeed.defaultEmbarkPorts().some((p) => String(w.city || "").toLowerCase().startsWith(p.toLowerCase())));
+      console.error(
+        `[cruisefeed] ${planForPorts.length} explicit in-plan windows for ` +
+          `${cruisefeed.defaultEmbarkPorts().join(" / ")} → ` +
+          cruisefeed.mergeWindows(planForPorts).map((w) => `${w.start}..${w.end}`).join(", "),
+      );
+      const cf = await cruisefeed.fetchSailings({
+        maxResults: args.cruisefeedMax,
+        windows: planForPorts,
+      });
+      if (cf.skipped) {
+        console.error(`[cruisefeed] skipped — ${cf.skipped}`);
+      } else {
+        allSailings.push(...cf.sailings);
+        const a = cf.allowance;
+        console.error(
+          `[cruisefeed] ${cf.sailings.length} sailings from ${cf.pages} pages ` +
+            `(${cf.results_spent} results spent) in ${Math.round((Date.now() - t0) / 1000)}s` +
+            (a ? ` · allowance ${a.remaining}/${a.limit} left, resets ${String(a.resets_at).slice(0, 10)}` : "") +
+            (cf.stopped_on_allowance ? " · STOPPED EARLY to protect the monthly grant" : ""),
+        );
+      }
+      perLineStatus.cruisefeed = { last_count: cf.sailings.length, last_error: null };
+      // Only mark the month done when the pull actually ran to completion —
+      // a truncated run must be allowed to try again.
+      if (!cf.skipped && !cf.stopped_on_allowance) state.cruisefeed_last_month = cfMonth;
+    } catch (err) {
+      // The primary source failing must not take the run down: the per-line
+      // extractors are the whole point of keeping a verification path.
+      console.error(`[cruisefeed] FAILED: ${err?.message || err}`);
+      perLineStatus.cruisefeed = { last_error: String(err?.message || err).slice(0, 300) };
+    }
+  }
+
+  // Stars and ratings both outrank the built-year floor — see applyFilters.
+  const [favoritesForFilter, shipRatings] = await Promise.all([loadFavorites(), loadShipRatings()]);
+  const { matches, reachable, dropped } = await applyFilters(allSailings, planWindows, skipped, {
+    favorites: favoritesForFilter,
+    ratings: shipRatings,
+  });
+  if (dropped.age_overridden) {
+    console.error(`[filter] ${dropped.age_overridden} older ship(s) kept — starred or rated 4.0+`);
+  }
+
+  // Persist every sailing to Supabase `cruise_sailings` so the corpus is
+  // queryable at any time. Matches get is_match=true; non-matches still get
+  // a row (with is_match=false). No-ops gracefully when the table doesn't
+  // exist yet or the service-role key isn't set.
+  let dbResult = null;
+  try {
+    dbResult = await upsertSailings(allSailings, matches, reachable);
+    if (dbResult?.skipped) {
+      console.error(`[db] skipped (${dbResult.skipped})${dbResult.error ? `: ${dbResult.error}` : ""}`);
+    } else {
+      console.error(`[db] upserted ${dbResult.inserted} sailings in ${dbResult.batches} batches${dbResult.error ? ` (last_err=${dbResult.error})` : ""}`);
+    }
+  } catch (err) {
+    dbResult = { error: String(err?.message || err) };
+    console.error(`[db] FAILED: ${dbResult.error}`);
+  }
+  // The upsert only re-flags what this run saw; lines that failed, CruiseFeed's
+  // off-months and unscraped ports would otherwise keep an old plan's flags.
+  await regateCorpus(planWindows, skipped, args.dryRun);
+
+  // Classify what moved. Alerts are scoped to `matches` (plan window + price
+  // ceiling + ship age): the corpus is ~8,300 sailings and a 10% drop on 2028
+  // inventory out of Piraeus is not news. Needs the price events from the
+  // upsert, so a DB failure degrades to "no alerts" rather than to bad ones.
+  const alertThresholds = await loadAlertThresholds();
+  const alerts = dbResult?.price_events
+    ? classifyAlerts(matches, dbResult.price_events, alertThresholds, dbResult.run_at)
+    : { price_drops: [], new_deals: [], all_time_lows: [], unavailable: true };
+  console.error(
+    `[alerts] ${alerts.price_drops.length} drops, ${alerts.new_deals.length} new deals, ` +
+      `${alerts.all_time_lows.length} all-time lows (of ${matches.length} matches; ` +
+      `${dbResult?.changed ?? 0} price changes seen)`,
+  );
+
+  // THE WATCHLIST — what the weekly email is actually built from since
+  // 2026-09-01. Scoped to the sailings anyone in the household starred on the
+  // site, alerting on a ≥10% drop or a newly-appeared promotion. `watchlist.any`
+  // is the send/don't-send decision: the requirement is silence in a week where nothing
+  // on the list moved, so an empty result must produce NO email at all.
+  const favorites = await loadFavorites();
+  const bySailing = new Map(allSailings.map((s) => [s.sailing_id, s]));
+  const watchlist = dbResult?.price_events
+    ? classifyWatchlist(favorites, bySailing, dbResult.price_events, alertThresholds, dbResult.run_at, new Set(linesToRun))
+    : { drops: [], promos: [], gone: [], any: false, unavailable: true };
+  // A LINE'S RESULT SET IS NOT STABLE BETWEEN RUNS, so one absence is not a
+  // disappearance. Celebrity Ascent 2027-04-19 was returned at 03:58 on
+  // 2026-09-01, missing at 15:46, and present on CruiseFeed the whole time at
+  // the same $2,419 — the watchlist called it "no longer offered" on the
+  // strength of a single miss. An MSC sailing did the same on 2026-08-31. So a starred sailing must be missed by
+  // GONE_AFTER_MISSES consecutive runs before we say anything, and a single
+  // sighting resets the count.
+  const GONE_AFTER_MISSES = 3;
+  const misses = { ...(state.favorite_misses || {}) };
+  for (const id of favorites) {
+    if (bySailing.has(id)) delete misses[id];
+    else if (linesToRun.includes(String(id).split(":")[0])) misses[id] = (misses[id] || 0) + 1;
+  }
+  for (const id of Object.keys(misses)) if (!favorites.has(id)) delete misses[id];
+  state.favorite_misses = misses;
+
+  const confirmedGone = watchlist.gone.filter((g) => (misses[g.sailing_id] || 0) >= GONE_AFTER_MISSES);
+  const provisional = watchlist.gone.length - confirmedGone.length;
+  watchlist.gone = confirmedGone;
+  // Unseen sailings never trigger an email — see classifyWatchlist.
+  watchlist.any = watchlist.drops.length + watchlist.promos.length > 0;
+  if (provisional) {
+    console.error(
+      `[watchlist] ${provisional} starred sailing(s) missing this run but under ` +
+        `${GONE_AFTER_MISSES} consecutive misses — not reported`,
+    );
+  }
+
+  console.error(
+    `[watchlist] ${favorites.size} starred · ${watchlist.drops.length} drops ≥${alertThresholds.drop_min_pct}%, ` +
+      `${watchlist.promos.length} new promos, ${watchlist.gone.length} no longer offered` +
+      `${watchlist.any ? "" : " — NOTHING TO SEND"}`,
+  );
+
+  // Update state (only if not dry-run). Runs DON'T mutate skipped_sailing_ids
+  // — that list is owned by the skip CLI; here we just prune entries whose
+  // depart_date has passed (the skip is no longer meaningful).
+  if (!args.dryRun) {
+    const today = new Date();
+    state.last_run_at = today.toISOString();
+    state.per_line_status = perLineStatus;
+    state.skipped_sailing_ids = pruneStaleSkips(state.skipped_sailing_ids || [], today);
+    await saveState(state);
+  }
+
+  const payload = {
+    matches,
+    reachable_count: reachable.length,
+    alerts,
+    watchlist,
+    favorites_count: favorites.size,
+    alert_thresholds: alertThresholds,
+    price_changes_seen: dbResult?.changed ?? 0,
+    total_sailings: allSailings.length,
+    dropped,
+    per_line_status: perLineStatus,
+    // price_events is a Map (alerts already consumed it) — a Map serializes to
+    // `{}`, so drop it rather than write a lie into the last-run payload.
+    db_result: dbResult ? { ...dbResult, price_events: undefined } : null,
+    plan_windows: planWindows,
+    explicit_plan_windows: explicitWindows.length,
+    dry_run: args.dryRun,
+    run_at: new Date().toISOString(),
+  };
+  // Always write the last-run payload so the playbook has a stable read path
+  // independent of whether it was a dry run.
+  await mkdir(dirname(LAST_RUN_PATH), { recursive: true });
+  await writeFile(LAST_RUN_PATH, JSON.stringify(payload, null, 2) + "\n", "utf8");
+  process.stdout.write(JSON.stringify(payload, null, 2) + "\n");
+}
+
+main().catch((err) => {
+  console.error(`fatal: ${err?.stack || err}`);
+  process.exit(1);
+});

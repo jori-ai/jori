@@ -1,0 +1,106 @@
+#!/usr/bin/env node
+// cruise-link — build a deep link into the cruise browsing site for the weekly
+// email. The site's base URL is the cruise-watch config `site_url`; with none
+// configured it prints nothing and exits 3.
+//
+// The email stopped being a list on 2026-08-31 and became an alert on price
+// movement, with the full corpus on the site. That only works if the email can
+// point AT something: a card saying "<ship> dropped 19%" is a
+// dead end if clicking through lands on the front page, where the default
+// $440/night cap and travel-plan filter may well hide the very sailing the
+// email was excited about. A focused link clears those.
+//
+// This exists so no playbook hand-encodes a URL. Sailing ids contain a colon
+// (`celebrity:RF4BH330_2026-12-07`) and must be percent-escaped; the params are
+// a contract with web/cruises/lib/deep-link.ts and change together.
+//
+// Usage:
+//   cruise-link sailing <sailing_id>        one sailing, every filter cleared
+//   cruise-link drops                       the price-drop view
+//   cruise-link lows                        the all-time-low view
+//   cruise-link plan                        everything reachable on the plan
+//   cruise-link browse [--line X] [--port Y] [--region Z]
+//                      [--month 1-12] [--year YYYY] [--q text]
+//                      [--sort depart|pppn|price|nights|drop|changed]
+//                      [--max-night N|any]
+//
+// Every subcommand prints one URL to stdout, so a playbook can do:
+//   HREF=$(bin/cruise-link sailing "$SAILING_ID")
+
+import { cruiseConfig } from "../lib/cruise/config.mjs";
+
+const SITE = cruiseConfig().site_url;
+if (!SITE) {
+  console.error("cruise-link: no site_url in agent/local/config/cruise-watch.json");
+  process.exit(3);
+}
+const BASE = SITE.endsWith("/") ? SITE : SITE + "/";
+
+function build(params) {
+  const u = new URL(BASE);
+  for (const [k, v] of Object.entries(params)) {
+    if (v === undefined || v === null || v === "") continue;
+    u.searchParams.set(k, Array.isArray(v) ? v.join(",") : String(v));
+  }
+  return u.toString();
+}
+
+function flags(argv) {
+  const out = {};
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (!a.startsWith("--")) continue;
+    const key = a.slice(2);
+    const val = argv[i + 1] && !argv[i + 1].startsWith("--") ? argv[++i] : "1";
+    // Repeatable: --line royal --line celebrity
+    if (out[key]) out[key] = [].concat(out[key], val);
+    else out[key] = val;
+  }
+  return out;
+}
+
+const [, , cmd, ...rest] = process.argv;
+
+switch (cmd) {
+  case "sailing": {
+    const id = rest.find((a) => !a.startsWith("--"));
+    if (!id) {
+      console.error("usage: cruise-link sailing <sailing_id>");
+      process.exit(2);
+    }
+    console.log(build({ sailing: id }));
+    break;
+  }
+  case "drops":
+    console.log(build({ drops: 1, sort: "drop" }));
+    break;
+  case "lows":
+    console.log(build({ atl: 1 }));
+    break;
+  case "plan":
+    console.log(build({ plan: 1 }));
+    break;
+  case "browse": {
+    const f = flags(rest);
+    console.log(build({
+      line: f.line,
+      port: f.port,
+      region: f.region,
+      month: f.month,
+      year: f.year,
+      q: f.q,
+      sort: f.sort,
+      maxnight: f["max-night"],
+    }));
+    break;
+  }
+  default:
+    console.error(
+      "usage:\n" +
+        "  cruise-link sailing <sailing_id>\n" +
+        "  cruise-link drops | lows | plan\n" +
+        "  cruise-link browse [--line X] [--port Y] [--region Z] [--month N] [--year YYYY]\n" +
+        "                     [--q text] [--sort KEY] [--max-night N|any]\n",
+    );
+    process.exit(2);
+}

@@ -1,0 +1,294 @@
+#!/usr/bin/env node
+// cruise-ship-ratings — collect Cruise Critic member ratings per ship into
+// Supabase `cruise_ship_ratings`, for the cruise browsing site's cards.
+//
+// The member rating is shown on each card. It is the one quality signal the lines' own APIs will
+// never carry — every ship is excellent according to the company selling it.
+//
+// MUST RUN ON THE HOST. cruisecritic.com answers 403 to every plain HTTP
+// request — curl, node fetch, any datacenter user-agent — so this drives the
+// Chrome already running there with --remote-debugging-port=9222 through
+// lib/cdp.mjs. That is a real browser profile on a residential
+// connection, which is exactly why the page loads at all. There is no non-CDP
+// fallback on purpose: a silent 403 parsed as "no rating" would write nulls
+// over good data.
+//
+// The numbers come from the page's own schema.org JSON-LD `aggregateRating`,
+// not from scraped visible text: it is the site's own machine-readable
+// contract, and it survives the layout changes that break text scraping.
+//
+// WRONG-SHIP GUARD. URL slugs are guessed from the ship name, and a guess that
+// happens to hit another ship's page would attach its rating silently. So the
+// JSON-LD's own `name` must match the ship we asked for before anything is
+// written — same discipline as cruise-ship-photos, for the same reason.
+//
+// Usage (on the host):
+//   cruise-ship-ratings sync [--limit N] [--only <line>] [--force <ship>] [--dry-run]
+//                             [--retry-misses]   re-attempt ships with no rating
+//   cruise-ship-ratings list
+//
+// Schema: data/migrations/20260831_cruise_ship_ratings.sql
+
+import { connect } from "../lib/cdp.mjs";
+import { cruiseSupabaseUrl } from "../lib/cruise/config.mjs";
+import { loadEnvOnce } from "../lib/cruise/db.mjs";
+
+const SUPABASE_URL = cruiseSupabaseUrl();
+const TABLE = "cruise_ship_ratings";
+
+/**
+ * How Cruise Critic prefixes a ship's name in its own JSON-LD. Royal Caribbean
+ * and Holland America title theirs "Royal Caribbean Independence of the Seas"
+ * where our catalogue says "Independence of the Seas"; Celebrity does not. The
+ * wrong-ship guard has to allow the prefix or it rejects every ship on those
+ * lines — which is exactly what it did, 0 of 10 and 0 of 6.
+ */
+const LINE_BRANDS = {
+  royal: "royal caribbean",
+  celebrity: "celebrity cruises",
+  ncl: "norwegian cruise line",
+  holland: "holland america",
+  msc: "msc cruises",
+  virgin: "virgin voyages",
+};
+
+/**
+ * Does this page's own name refer to the ship we asked for?
+ *
+ * Still an equality test, not a substring one — "Celebrity Xcel" must not pass
+ * for "Celebrity Reflection" — but tolerant of the line brand being prepended.
+ */
+function namesMatch(pageName, line, shipName) {
+  const pn = norm(pageName);
+  const sn = norm(shipName);
+  if (!pn || !sn) return false;
+  if (pn === sn) return true;
+  const brand = LINE_BRANDS[line];
+  return !!brand && pn === `${brand} ${sn}`;
+}
+
+/** Cruise Critic's own line slugs, taken from its review-index links. */
+const LINE_SLUGS = {
+  royal: "royal-caribbean",
+  celebrity: "celebrity",
+  ncl: "norwegian-ncl",
+  holland: "holland-america",
+  msc: "msc",
+  virgin: "virgin",
+};
+
+function slug(s) {
+  // lang-regex-ok: builds a URL path from a proper noun; no meaning is inferred
+  return s.toLowerCase().trim().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
+}
+
+function norm(s) {
+  return String(s ?? "").toLowerCase().replace(/\s+/g, " ").trim();
+}
+
+/**
+ * Candidate URLs for a ship, most-likely first. Cruise Critic mostly uses the
+ * full ship name ("celebrity-reflection", "wonder-of-the-seas"), but Holland
+ * America's ships are listed bare ("rotterdam") while some lines repeat the
+ * brand, so try both shapes rather than assuming one.
+ */
+function candidateUrls(line, ship) {
+  const lineSlug = LINE_SLUGS[line];
+  if (!lineSlug) return [];
+  const base = `https://www.cruisecritic.com/cruise/${lineSlug}`;
+  const full = slug(ship);
+  const out = [`${base}/${full}/reviews`];
+  // "MSC Seaside" → "seaside", "Norwegian Prima" → "prima": the bare form, for
+  // lines whose pages drop the brand from the slug.
+  const bare = slug(ship.split(" ").slice(1).join(" "));
+  if (bare && bare !== full) out.push(`${base}/${bare}/reviews`);
+  // ...and the reverse, for a bare catalogue name on a brand-prefixed page.
+  const prefixed = slug(`${lineSlug.split("-")[0]} ${ship}`);
+  if (prefixed !== full) out.push(`${base}/${prefixed}/reviews`);
+  return out;
+}
+
+
+async function rest(key, pathAndQuery, init = {}) {
+  const r = await fetch(`${SUPABASE_URL}/rest/v1/${pathAndQuery}`, {
+    ...init,
+    headers: {
+      apikey: key,
+      Authorization: `Bearer ${key}`,
+      "Content-Type": "application/json",
+      Accept: "application/json",
+      ...(init.headers ?? {}),
+    },
+    signal: AbortSignal.timeout(20_000),
+  });
+  if (!r.ok) throw new Error(`${pathAndQuery} HTTP ${r.status}: ${(await r.text()).slice(0, 200)}`);
+  // `Prefer: return=minimal` answers 200 with an empty body, not 204.
+  const body = await r.text();
+  return body ? JSON.parse(body) : null;
+}
+
+async function liveShips(key) {
+  // PostgREST caps a response at 1000 rows whatever `limit` says.
+  const today = new Date().toISOString().slice(0, 10);
+  const seen = new Map();
+  const PAGE_SIZE = 1000;
+  for (let offset = 0; ; offset += PAGE_SIZE) {
+    const rows = await rest(
+      key,
+      `cruise_sailings?select=source,ship_name&depart_date=gte.${today}&lowest_balcony_per_person_usd=not.is.null&order=sailing_id.asc&offset=${offset}&limit=${PAGE_SIZE}`,
+    );
+    for (const r of rows) {
+      if (r.source && r.ship_name) seen.set(`${r.source}::${r.ship_name}`, { line: r.source, ship: r.ship_name });
+    }
+    if (rows.length < PAGE_SIZE) break;
+  }
+  return [...seen.values()].sort((a, b) => a.line.localeCompare(b.line) || a.ship.localeCompare(b.ship));
+}
+
+/**
+ * Read the page's JSON-LD in the browser and hand back only the fields we
+ * want — the extraction runs in the page so we never ship a megabyte of HTML
+ * back over the CDP socket.
+ */
+const EXTRACT = `(() => {
+  const out = { name: null, rating: null, count: null, editor: null, notFound: false };
+  const body = document.body ? document.body.innerText : "";
+  // READ THE DATA FIRST, judge "not found" second. The 404 phrase turns up in
+  // the page text of pages that are emphatically NOT 404s — Royal Caribbean's
+  // Explorer of the Seas carries "out at sea" somewhere in its chrome while
+  // serving a perfectly good 3.9 from 2,050 reviews. Short-circuiting on that
+  // string threw the rating away before anything looked for it.
+  for (const n of document.querySelectorAll('script[type="application/ld+json"]')) {
+    let d; try { d = JSON.parse(n.textContent); } catch { continue; }
+    for (const node of (Array.isArray(d) ? d : [d])) {
+      const ar = node && node.aggregateRating;
+      if (ar && ar.ratingValue != null) {
+        out.name = node.name ?? null;
+        out.rating = Number(ar.ratingValue);
+        out.count = ar.reviewCount != null ? Number(ar.reviewCount) : null;
+      }
+    }
+  }
+  // Only a page with NO rating in it gets to claim it is missing — that is what
+  // stops the poll below waiting out its full budget on a genuine 404.
+  if (out.rating == null && body.includes("out at sea")) out.notFound = true;
+  const em = body.match(/([0-9](?:\\.[0-9])?)\\s*\\/\\s*5\\.0\\s*Editor Rating/i);
+  if (em) out.editor = Number(em[1]);
+  return JSON.stringify(out);
+})()`;
+
+function parseArgs(argv) {
+  const out = { cmd: argv[2] ?? "sync", limit: Infinity, only: null, force: null, dryRun: false, retryMisses: false };
+  for (let i = 3; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === "--dry-run") out.dryRun = true;
+    else if (a === "--retry-misses") out.retryMisses = true;
+    else if (a === "--limit") out.limit = Number(argv[++i]);
+    else if (a === "--only") out.only = argv[++i];
+    else if (a === "--force") out.force = argv[++i];
+  }
+  return out;
+}
+
+async function main() {
+  const args = parseArgs(process.argv);
+  await loadEnvOnce();
+  const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
+  if (!key) {
+    console.error("fatal: SUPABASE_SERVICE_ROLE_KEY missing from .env");
+    process.exit(1);
+  }
+
+  const stored = await rest(key, `${TABLE}?select=*`);
+  if (args.cmd === "list") {
+    for (const r of stored.sort((a, b) => a.line.localeCompare(b.line) || a.ship_name.localeCompare(b.ship_name))) {
+      console.log(`${r.rating ? String(r.rating).padEnd(4) : "  · "} ${r.line.padEnd(10)} ${r.ship_name.padEnd(28)} ${r.review_count ?? ""}`);
+    }
+    console.log(`\n${stored.filter((r) => r.rating != null).length} rated, ${stored.filter((r) => r.rating == null).length} recorded misses`);
+    return;
+  }
+
+  const have = new Map(stored.map((r) => [`${r.line}::${r.ship_name}`, r]));
+  const ships = await liveShips(key);
+
+  const session = await connect();
+  let hit = 0, missed = 0, done = 0;
+  try {
+    for (const { line, ship } of ships) {
+      if (done >= args.limit) break;
+      if (args.only && line !== args.only) continue;
+      const k = `${line}::${ship}`;
+      const forced = args.force && norm(args.force) === norm(ship);
+      const row = have.get(k);
+      const isMiss = row && row.rating == null;
+      // --retry-misses reopens rows recorded with no rating, for when the
+      // reader improves — otherwise a miss is skipped forever.
+      if (row && !forced && !(args.retryMisses && isMiss)) continue;
+      done++;
+
+      let found = null;
+      for (const url of candidateUrls(line, ship)) {
+        try {
+          // POLL, don't guess. A fixed settle was 8s, which was enough for
+          // Celebrity's pages and not for Royal Caribbean's or Holland
+          // America's — every one of those came back as a miss with a perfectly
+          // good rating sitting in the page a second later. Wait for the thing
+          // we actually need to appear instead of for a clock.
+          await session.goto(url, { settleMs: 3000 });
+          let d = null;
+          for (let attempt = 0; attempt < 9; attempt++) {
+            d = JSON.parse(await session.evaluate(EXTRACT));
+            if (d.notFound || d.rating != null) break;
+            await new Promise((r) => setTimeout(r, 2000));
+          }
+          if (!d || d.notFound || d.rating == null) continue;
+          // The guard: a guessed slug that lands on another ship's page would
+          // otherwise attach its rating with no sign anything went wrong.
+          if (!namesMatch(d.name, line, ship)) {
+            console.error(`  ? ${ship}: page says "${d.name}" — skipping`);
+            continue;
+          }
+          found = { ...d, url };
+          break;
+        } catch (err) {
+          console.error(`  ! ${ship}: ${err.message}`);
+        }
+      }
+
+      const now = new Date().toISOString();
+      if (!found) {
+        missed++;
+        console.log(`MISS ${line.padEnd(10)} ${ship}`);
+      } else {
+        hit++;
+        console.log(`OK   ${line.padEnd(10)} ${ship.padEnd(28)} ${found.rating} (${found.count} reviews)${found.editor ? ` editor ${found.editor}` : ""}`);
+      }
+      if (!args.dryRun) {
+        await rest(key, `${TABLE}?on_conflict=line,ship_name`, {
+          method: "POST",
+          headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
+          body: JSON.stringify([{
+            line, ship_name: ship,
+            rating: found?.rating ?? null,
+            review_count: found?.count ?? null,
+            editor_rating: found?.editor ?? null,
+            source_url: found?.url ?? null,
+            checked_at: now, updated_at: now,
+          }]),
+        });
+      }
+      // Human-paced: this is one real browser on a residential line, and the
+      // whole reason the page loads is that it does not look like a scraper.
+      await new Promise((r) => setTimeout(r, 1500));
+    }
+  } finally {
+    session.close();
+  }
+
+  console.log(`\n${hit} rated, ${missed} missed, ${done} attempted${args.dryRun ? " (dry run — nothing written)" : ""}`);
+}
+
+main().catch((err) => {
+  console.error(`fatal: ${err?.stack || err}`);
+  process.exit(1);
+});

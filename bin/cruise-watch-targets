@@ -1,0 +1,163 @@
+#!/usr/bin/env node
+// cruise-watch-targets — track specific sailings for last-minute price drops,
+// independent of the standard plan-window/per-night price filter. Some
+// sailings the user wants watched (e.g. a specific repeat cruise) don't clear
+// that filter, but a price fall on them is still news.
+//
+// Usage:
+//   cruise-watch-targets add <sailing_id> [--label "..."] [--reason "..."] [--highlight-days N]
+//     Captures the sailing's CURRENT price from cruise_sailings as the baseline.
+//   cruise-watch-targets remove <sailing_id>
+//   cruise-watch-targets list
+//   cruise-watch-targets check
+//     Re-reads current prices from cruise_sailings and prints any target that
+//     is now cheaper than its baseline (drop = the thing the job highlights).
+//
+// sailing_id format matches cruise_sailings.sailing_id, e.g.
+//   celebrity:RF4BH330_2026-12-07
+
+import { readFile, writeFile, mkdir } from "node:fs/promises";
+import { existsSync } from "node:fs";
+import { dirname } from "node:path";
+import { fetchJson } from "../lib/supabase-rest.js";
+import { dataPath } from "../lib/cruise/config.mjs";
+
+// This installation's own list (private data; absent → no targets).
+const TARGETS_PATH = dataPath("cruise-watch-targets.json");
+const DEFAULT_HIGHLIGHT_DAYS = 30;
+
+async function loadTargets() {
+  if (!existsSync(TARGETS_PATH)) return { targets: [] };
+  const parsed = JSON.parse(await readFile(TARGETS_PATH, "utf8"));
+  if (!Array.isArray(parsed.targets)) parsed.targets = [];
+  return parsed;
+}
+
+async function saveTargets(state) {
+  await mkdir(dirname(TARGETS_PATH), { recursive: true });
+  await writeFile(TARGETS_PATH, JSON.stringify(state, null, 2) + "\n", "utf8");
+}
+
+async function fetchSailing(sailingId) {
+  const rows = await fetchJson(
+    `/rest/v1/cruise_sailings?sailing_id=eq.${encodeURIComponent(sailingId)}&select=*`,
+  );
+  return Array.isArray(rows) && rows.length ? rows[0] : null;
+}
+
+function usage() {
+  process.stderr.write(
+    "Usage:\n" +
+      '  cruise-watch-targets add <sailing_id> [--label "..."] [--reason "..."] [--highlight-days N]\n' +
+      "  cruise-watch-targets remove <sailing_id>\n" +
+      "  cruise-watch-targets list\n" +
+      "  cruise-watch-targets check\n",
+  );
+  process.exit(2);
+}
+
+function parseFlags(rest) {
+  const flags = {};
+  const positional = [];
+  for (let i = 0; i < rest.length; i++) {
+    const arg = rest[i];
+    if (arg.startsWith("--")) {
+      const key = arg.slice(2);
+      const val = rest[i + 1] && !rest[i + 1].startsWith("--") ? rest[++i] : true;
+      flags[key] = val;
+    } else {
+      positional.push(arg);
+    }
+  }
+  return { flags, positional };
+}
+
+async function main() {
+  const [, , cmd, ...rest] = process.argv;
+  if (!cmd) usage();
+  const state = await loadTargets();
+
+  if (cmd === "add") {
+    const { flags, positional } = parseFlags(rest);
+    const sailingId = positional[0];
+    if (!sailingId) usage();
+
+    const sailing = await fetchSailing(sailingId);
+    if (!sailing) {
+      console.error(
+        `fatal: no cruise_sailings row for ${sailingId} — run cruise-watch (or wait for the next weekly run) so it's in the DB first`,
+      );
+      process.exit(1);
+    }
+    const baselinePrice = Number(sailing.lowest_balcony_per_person_usd);
+    if (!Number.isFinite(baselinePrice)) {
+      console.error(`fatal: ${sailingId} has no balcony price on record yet`);
+      process.exit(1);
+    }
+
+    const existing = state.targets.find((t) => t.sailing_id === sailingId);
+    const entry = {
+      sailing_id: sailingId,
+      label:
+        flags.label ||
+        existing?.label ||
+        `${sailing.ship_name} — ${sailing.depart_date} to ${sailing.return_date} (${sailing.nights}n)`,
+      reason: flags.reason || existing?.reason || null,
+      baseline_balcony_price: baselinePrice,
+      baseline_captured_at: new Date().toISOString(),
+      highlight_within_days: flags["highlight-days"]
+        ? Number(flags["highlight-days"])
+        : existing?.highlight_within_days || DEFAULT_HIGHLIGHT_DAYS,
+      depart_date: sailing.depart_date,
+      added_at: existing?.added_at || new Date().toISOString(),
+    };
+    state.targets = state.targets.filter((t) => t.sailing_id !== sailingId);
+    state.targets.push(entry);
+    await saveTargets(state);
+    console.log(`watching ${sailingId} — baseline $${baselinePrice.toFixed(2)}/person (balcony)`);
+  } else if (cmd === "remove") {
+    const id = rest[0];
+    if (!id) usage();
+    state.targets = state.targets.filter((t) => t.sailing_id !== id);
+    await saveTargets(state);
+    console.log(`stopped watching ${id}`);
+  } else if (cmd === "list") {
+    if (state.targets.length === 0) {
+      console.log("(no sailings on the price-drop watch)");
+    } else {
+      for (const t of state.targets) {
+        console.log(
+          `${t.sailing_id}  ${t.label}  baseline $${Number(t.baseline_balcony_price).toFixed(2)} (as of ${t.baseline_captured_at})`,
+        );
+      }
+    }
+  } else if (cmd === "check") {
+    const results = [];
+    for (const t of state.targets) {
+      const sailing = await fetchSailing(t.sailing_id);
+      if (!sailing) {
+        results.push({ ...t, current_price: null, status: "not_found" });
+        continue;
+      }
+      const current = Number(sailing.lowest_balcony_per_person_usd);
+      const daysOut = Math.round((new Date(t.depart_date) - new Date()) / 86400000);
+      const isDrop = Number.isFinite(current) && current < t.baseline_balcony_price;
+      results.push({
+        ...t,
+        current_price: Number.isFinite(current) ? current : null,
+        days_until_departure: daysOut,
+        is_drop: isDrop,
+        within_highlight_window: daysOut <= t.highlight_within_days,
+        booking_url: sailing.booking_url,
+      });
+    }
+    console.log(JSON.stringify({ checked_at: new Date().toISOString(), results }, null, 2));
+  } else {
+    usage();
+  }
+}
+
+main().catch((err) => {
+  console.error(`fatal: ${err?.stack || err}`);
+  process.exit(1);
+});

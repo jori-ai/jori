@@ -1,0 +1,630 @@
+#!/usr/bin/env node
+// cruise-ship-photos — find one photo per SHIP, re-host it, and record it in
+// Supabase `cruise_ship_photos` for the cruise browsing site's cards.
+//
+// Why this exists: the cards used to show `cruise_sailings.hero_image_url`,
+// which is the image each line attaches to an ITINERARY — so a Caribbean
+// sailing got a stock shot of a Mediterranean island. Requirement: show
+// photos of the ships, not of destinations.
+//
+// A photo belongs to the ship, not the sailing, so 79 rows cover ~6,800
+// sailings.
+//
+// RESOLUTION IS THE HARD PART, AND IT FAILS QUIETLY IF YOU LET IT. The first
+// attempt searched Wikipedia for "<ship> <line> cruise ship" and accepted any
+// hit whose categories mentioned ships. It "resolved" 77 of 77 — and was wrong
+// for most of them: Norwegian Joy resolved to the *Norwegian Cruise Line*
+// article, Celebrity Reflection to *Celebrity Xcel*, and Holland's 2010 Nieuw
+// Amsterdam to *SS Nieuw Amsterdam (1937)*, a liner scrapped in 1974. Every one
+// of those would have put a confidently wrong ship on the card, which is worse
+// than an empty frame because nothing about it looks broken.
+//
+// So acceptance is now a conjunction, and a ship that fails it gets NO photo:
+//   1. the article's title, stripped of an MS/MV/SS prefix and any
+//      parenthetical, must equal the ship's name (not merely contain it);
+//   2. its categories must place it among ships;
+//   3. a year in the title's parenthetical must be within a year of the
+//      catalogue's built_year — this is what rejects the 1937 Nieuw Amsterdam;
+//   4. it must have a lead image.
+// Search is only a source of CANDIDATE TITLES; the same four checks decide.
+//
+// Fallback chain for ships Wikipedia can't prove (new hulls, mostly): the
+// line's own ship page read for an og:image, then — on the host, where a CDP
+// Chrome is listening — that same page loaded in a real browser and its largest
+// rendered image taken. The browser step is not optional for two lines: MSC
+// answers 403 to every plain request, and NCL renders unlaunched ships' pages
+// client-side, so their HTML contains no image URL to parse. The system is for
+// personal use only and the site is behind an auth allowlist, so a line's own
+// marketing photo of its own ship is a private-use display, and it is
+// guaranteed to be the right ship.
+//
+// Images are DOWNLOADED and re-hosted in the public `cruise-ships` bucket, not
+// hotlinked: the lines' CDNs rotate paths behind Akamai (the same rotation that
+// broke another photo cache here), and a dead <img> is worse than none.
+//
+// Usage:
+//   cruise-ship-photos sync [--limit N] [--force <ship>] [--dry-run] [--only <line>]
+//                            [--retry-misses]   re-attempt ships recorded as misses
+//   cruise-ship-photos set-url "<ship>" <image url>   # hand-found image
+//   cruise-ship-photos list           # what is stored
+//   cruise-ship-photos missing        # ships in live inventory with no photo
+//
+// Schema: data/migrations/20260831_cruise_ship_photos.sql
+// NOTE: node's fetch is blocked inside the Claude Code bash sandbox; run this
+// with the sandbox disabled (or from cron on the host, where it does not apply).
+
+import { readFile, writeFile, mkdir, rm } from "node:fs/promises";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { createRequire } from "node:module";
+import { cruiseConfig, cruiseSupabaseUrl, dataPath } from "../lib/cruise/config.mjs";
+import { loadEnvOnce } from "../lib/cruise/db.mjs";
+
+const { instance } = createRequire(import.meta.url)("../lib/instance.cjs");
+const execFileP = promisify(execFile);
+const CATALOG_PATH = dataPath("cruise-ships.json");
+const SUPABASE_URL = cruiseSupabaseUrl();
+const BUCKET = "cruise-ships";
+const TABLE = "cruise_ship_photos";
+const WIKI_API = "https://en.wikipedia.org/w/api.php";
+// Wikipedia asks API clients for a contact: the site and the agent's address.
+const UA_CONTACT = [cruiseConfig().site_url, instance().agent_email || instance().owner_email].filter(Boolean).join("; ");
+const UA = `jori-cruise-watch/1.0${UA_CONTACT ? ` (${UA_CONTACT})` : ""}`;
+const TARGET_WIDTH = 1200;
+
+/**
+ * Ships whose line-site URL doesn't follow that line's own pattern. New hulls
+ * often sit under a different path until they launch (NCL parks unlaunched
+ * ships under /vacations/ rather than /cruise-ship/).
+ */
+const SHIP_PAGE_OVERRIDES = {
+  "ncl::norwegian aura": "https://www.ncl.com/vacations/norwegian-aura",
+  "ncl::norwegian luna": "https://www.ncl.com/vacations/norwegian-luna",
+  "msc::msc world america": "https://www.msccruises.com/en-us/cruise-ship/msc-world-america.html",
+  "msc::msc world atlantic": "https://www.msccruises.com/en-us/cruise-ship/msc-world-atlantic.html",
+};
+
+const LINE_SITES = {
+  royal: (s) => `https://www.royalcaribbean.com/cruise-ships/${slug(s)}`,
+  celebrity: (s) => `https://www.celebritycruises.com/ships/${slug(s.replace(/^celebrity /i, ""))}`,
+  ncl: (s) => `https://www.ncl.com/cruise-ship/${slug(s.replace(/^norwegian /i, ""))}`,
+  msc: (s) => `https://www.msccruises.com/en-gl/Discover-MSC/Cruise-Ships/${slug(s.replace(/^msc /i, ""))}.html`,
+  holland: (s) => `https://www.hollandamerica.com/en/us/cruise-ships/${slug(s)}`,
+  virgin: (s) => `https://www.virginvoyages.com/ships/${slug(s)}`,
+};
+
+function slug(s) {
+  // lang-regex-ok: builds a URL path from a proper noun; no meaning is inferred
+  return s.toLowerCase().trim().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
+}
+
+
+async function wiki(params) {
+  const u = new URL(WIKI_API);
+  for (const [k, v] of Object.entries({ format: "json", formatversion: "2", ...params })) {
+    u.searchParams.set(k, v);
+  }
+  const r = await fetch(u, { headers: { "User-Agent": UA }, signal: AbortSignal.timeout(20_000) });
+  if (!r.ok) throw new Error(`wikipedia HTTP ${r.status}`);
+  return r.json();
+}
+
+/** "MS Nieuw Statendam" / "SS Nieuw Amsterdam (1937)" → "Nieuw Statendam" / "Nieuw Amsterdam". */
+function bareTitle(title) {
+  // lang-regex-ok: strips an encyclopedia's own title conventions (vessel
+  // prefix, disambiguating parenthetical) — structure, not meaning
+  return title
+    .replace(/^(MS|MV|SS|RMS|MSC)\s+/i, (m) => (m.trim().toUpperCase() === "MSC" ? m : ""))
+    .replace(/\s*\([^)]*\)\s*$/, "")
+    .trim();
+}
+
+/** The 4-digit year in a title's parenthetical, if any. */
+function titleYear(title) {
+  // lang-regex-ok: reads a disambiguating year from an article title
+  const m = title.match(/\((\d{4})\)\s*$/);
+  return m ? Number(m[1]) : null;
+}
+
+function norm(s) {
+  return s.toLowerCase().replace(/\s+/g, " ").trim();
+}
+
+/**
+ * Brand prefixes a LINE puts on its own ship names that an encyclopedia does
+ * not. Oceania's catalogue says "Oceania Insignia"; Wikipedia titles the same
+ * hull "MS Insignia", so the equals-check below rejected all six Oceania ships
+ * as confidently as it rejects a wrong ship — a correct rule refusing a correct
+ * answer. Stripping a KNOWN brand token gives the check a second name to
+ * compare, without loosening it into a substring match.
+ *
+ * Deliberately not a generic "drop the first word": that would let "Norwegian
+ * Joy" match an article titled "Joy", and the whole point of this function's
+ * neighbours is that a plausible-looking wrong ship is worse than none.
+ */
+const BRAND_PREFIXES = {
+  "oceania-cruises": ["Oceania"],
+  "margaritaville-at-sea-cruises": ["Margaritaville at Sea"],
+  "aida-cruises": ["AIDA"],
+  azamara: ["Azamara"],
+};
+
+/** Every name this ship might legitimately be titled under. */
+function shipAliases(line, shipName) {
+  const out = [shipName];
+  for (const prefix of BRAND_PREFIXES[line] ?? []) {
+    const re = new RegExp(`^${prefix}\\s+`, "i");
+    if (re.test(shipName)) {
+      const bare = shipName.replace(re, "").trim();
+      if (bare && bare.length > 2) out.push(bare);
+    }
+  }
+  return out;
+}
+
+/**
+ * Decide whether a Wikipedia page really is THIS ship. See the header — every
+ * clause here exists because its absence produced a confidently wrong photo.
+ */
+function accepts(page, shipName, builtYear, aliases = null) {
+  if (!page || page.missing) return null;
+  const img = page.original?.source;
+  if (!img) return null;
+
+  const cats = (page.categories ?? []).map((c) => c.title.toLowerCase()).join(" ");
+  if (!cats.includes("ship") && !cats.includes("cruise")) return null;
+
+  // EQUALS, not includes: "Celebrity Xcel" contains neither more nor less of
+  // "Celebrity Reflection" than a coin flip would. The alias list adds only
+  // the brand-stripped form for lines that prefix their own name — still an
+  // equals-check, just against a second known-good spelling.
+  const names = (aliases && aliases.length ? aliases : [shipName]).map(norm);
+  const bare = norm(bareTitle(page.title));
+  if (!names.includes(bare)) return null;
+
+  // THE YEAR CHECK ONLY APPLIES WHEN THE TITLE IS NOT AN EXACT MATCH.
+  //
+  // It exists for one failure: a ship named after a place, whose article title
+  // needs a vessel prefix or a year to disambiguate it from an older ship of
+  // the same name. "SS Rotterdam" (1958) and Holland's Rotterdam (2021) both
+  // reduce to the bare title "Rotterdam", so something else has to break the
+  // tie. But when the article is titled EXACTLY the ship's name — "Norwegian
+  // Breakaway", "Celebrity Constellation" — there is nothing to disambiguate,
+  // and demanding a year in the prose rejected six ships that were plainly
+  // right because their intros happen not to state a delivery year.
+  const exactTitle = names.includes(norm(page.title));
+  if (builtYear && !exactTitle) {
+    const near = [builtYear - 1, builtYear, builtYear + 1];
+    const ty = titleYear(page.title);
+    if (ty !== null) {
+      if (Math.abs(ty - builtYear) > 1) return null;
+    } else {
+      // Delivery slips a year either way between launch, float-out and
+      // handover, so accept the built year or its neighbours — from the intro
+      // or from a "Ships built in <year>" category, which many articles carry
+      // even when the prose does not give a date.
+      const intro = page.extract ?? "";
+      const cats2 = (page.categories ?? []).map((c) => c.title).join(" ");
+      if (!near.some((y) => intro.includes(String(y)) || cats2.includes(String(y)))) return null;
+    }
+  }
+
+  return { image: img.split("?")[0], title: page.title };
+}
+
+async function fetchPages(titles) {
+  if (titles.length === 0) return [];
+  const d = await wiki({
+    action: "query",
+    prop: "pageimages|categories|extracts",
+    piprop: "original",
+    cllimit: "max",
+    exintro: "1",
+    explaintext: "1",
+    titles: titles.join("|"),
+  });
+  return d?.query?.pages ?? [];
+}
+
+/** Wikipedia first, strictly. Returns {image, title, source} or null. */
+async function resolveFromWikipedia(line, shipName, builtYear) {
+  // Direct titles are tried before search because they are the ones most likely
+  // to be exactly right; search only widens the candidate pool.
+  const aliases = shipAliases(line, shipName);
+  const direct = aliases.flatMap((n) => [n, `MS ${n}`, `MV ${n}`, `${n} (ship)`]);
+  for (const page of await fetchPages(direct)) {
+    const hit = accepts(page, shipName, builtYear, aliases);
+    if (hit) return { ...hit, source: "wikipedia" };
+  }
+
+  for (const n of aliases) {
+    const s = await wiki({ action: "query", list: "search", srsearch: `${n} cruise ship`, srlimit: "5" });
+    const candidates = (s?.query?.search ?? []).map((h) => h.title).filter((t) => !direct.includes(t));
+    for (const page of await fetchPages(candidates)) {
+      const hit = accepts(page, shipName, builtYear, aliases);
+      if (hit) return { ...hit, source: "wikipedia" };
+    }
+  }
+  return null;
+}
+
+/**
+ * The line's own ship page, read for an og:image. Guaranteed the right ship
+ * when the URL resolves; several of these sit behind Akamai and simply won't,
+ * which is why it is a fallback and not the primary.
+ */
+function linePageUrl(line, shipName) {
+  const override = SHIP_PAGE_OVERRIDES[`${line}::${norm(shipName)}`];
+  if (override) return override;
+  const build = LINE_SITES[line];
+  return build ? build(shipName) : null;
+}
+
+async function resolveFromLine(line, shipName) {
+  const url = linePageUrl(line, shipName);
+  if (!url) return null;
+  try {
+    const r = await fetch(url, {
+      headers: { "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126 Safari/537.36" },
+      signal: AbortSignal.timeout(20_000),
+      redirect: "follow",
+    });
+    if (!r.ok) return null;
+    const html = await r.text();
+    // lang-regex-ok: reads an og:image meta tag — machine-written page structure
+    const m = html.match(/<meta[^>]+property=["']og:image["'][^>]+content=["']([^"']+)["']/i)
+      || html.match(/<meta[^>]+content=["']([^"']+)["'][^>]+property=["']og:image["']/i);
+    if (!m) return null;
+    const img = m[1].startsWith("//") ? `https:${m[1]}` : m[1];
+    if (!img.startsWith("http")) return null;
+    return { image: img, title: url, source: line };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Wikimedia Commons, for ships whose Wikipedia article exists but carries no
+ * lead image — MSC World America is the case that motivated this: a real 2025
+ * ship with an article, no infobox photo, and a perfectly good
+ * `File:MSC World America.jpg` sitting in Commons.
+ *
+ * MATCHES ON THE FILENAME, EXACTLY. A Commons search for "MSC World Atlantic"
+ * returns Military Sealift Command reports; one for "Norwegian Aura" returns
+ * photographs of a Norwegian black metal band called Aura Noir. Ranking those
+ * by relevance and taking the top hit would put a guitarist on a cruise card.
+ * So the file's own title, minus the namespace, extension and any "(cropped)"
+ * suffix, must EQUAL the ship's name — the same rule the Wikipedia path uses,
+ * for the same reason.
+ */
+async function resolveFromCommons(shipName) {
+  const u = new URL("https://commons.wikimedia.org/w/api.php");
+  for (const [k, v] of Object.entries({
+    action: "query", format: "json", formatversion: "2",
+    generator: "search", gsrsearch: shipName, gsrnamespace: "6", gsrlimit: "8",
+    prop: "imageinfo", iiprop: "url|size",
+  })) u.searchParams.set(k, v);
+
+  let pages;
+  try {
+    const r = await fetch(u, { headers: { "User-Agent": UA }, signal: AbortSignal.timeout(20_000) });
+    if (!r.ok) return null;
+    pages = (await r.json())?.query?.pages ?? [];
+  } catch {
+    return null;
+  }
+
+  const want = norm(shipName);
+  let best = null;
+  for (const p of pages) {
+    const info = (p.imageinfo ?? [])[0];
+    if (!info?.url) continue;
+    // "File:MSC World America (cropped).jpg" → "msc world america"
+    // lang-regex-ok: strips Commons' own filename conventions, not language
+    const stem = norm(
+      String(p.title ?? "")
+        .replace(/^File:/i, "")
+        .replace(/\.(jpe?g|png|webp)$/i, "")
+        .replace(/\s*\((cropped|edited|retouched)\)\s*$/i, ""),
+    );
+    if (stem !== want) continue;
+    if (!best || (info.width ?? 0) * (info.height ?? 0) > best.px) {
+      best = { image: info.url.split("?")[0], title: p.title, px: (info.width ?? 0) * (info.height ?? 0) };
+    }
+  }
+  return best ? { image: best.image, title: best.title, source: "commons" } : null;
+}
+
+/**
+ * Last resort: load the line's own ship page in the host's REAL Chrome and take
+ * the biggest image on it.
+ *
+ * Needed because the two remaining classes of miss are both unreachable any
+ * other way. MSC answers 403 to every plain request, exactly like Cruise Critic
+ * does. And NCL's pages for unlaunched ships are client-rendered — the HTML
+ * curl receives contains no image URL at all, so there is nothing to parse
+ * until a browser has run the page's JavaScript.
+ *
+ * Only available where a CDP Chrome is listening (the host); elsewhere this
+ * returns null and the ship stays a recorded miss rather than failing the run.
+ */
+async function resolveViaCdp(line, shipName) {
+  const url = linePageUrl(line, shipName);
+  if (!url) return null;
+  let session;
+  try {
+    const { connect } = await import("../lib/cdp.mjs");
+    session = await connect({ timeoutMs: 8000 });
+  } catch {
+    return null; // no CDP Chrome here — expected off the host
+  }
+  try {
+    await session.goto(url, { settleMs: 9000 });
+    // Biggest rendered image wins: on a ship page that is the hero, and it
+    // sidesteps having to know each line's markup. Skip anything small (logos,
+    // icons, tracking pixels) and anything not obviously a photo.
+    const best = await session.evaluate(`(() => {
+      const imgs = [...document.querySelectorAll("img")]
+        .map((el) => ({ src: el.currentSrc || el.src, w: el.naturalWidth || 0, h: el.naturalHeight || 0 }))
+        .filter((i) => i.src && i.src.startsWith("http") && i.w >= 600 && i.h >= 300);
+      imgs.sort((a, b) => b.w * b.h - a.w * a.h);
+      return imgs.length ? imgs[0].src : null;
+    })()`);
+    if (!best) return null;
+    return { image: best, title: url, source: `${line} (cdp)` };
+  } catch {
+    return null;
+  } finally {
+    session.close();
+  }
+}
+
+/** Download, downscale to TARGET_WIDTH with sips, return {buffer, w, h}. */
+async function fetchAndResize(imageUrl) {
+  const r = await fetch(imageUrl, {
+    headers: { "User-Agent": UA },
+    signal: AbortSignal.timeout(45_000),
+    redirect: "follow",
+  });
+  if (!r.ok) throw new Error(`image HTTP ${r.status}`);
+  const buf = Buffer.from(await r.arrayBuffer());
+  if (buf.length < 2000) throw new Error("image too small to be real");
+
+  const dir = join(tmpdir(), `cruise-ship-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+  await mkdir(dir, { recursive: true });
+  const inPath = join(dir, "in");
+  const outPath = join(dir, "out.jpg");
+  try {
+    await writeFile(inPath, buf);
+    // sips ships with macOS; --resampleWidth only ever shrinks here because the
+    // sources are marketing/encyclopedia originals, all far wider than 1200.
+    await execFileP("sips", ["-s", "format", "jpeg", "-s", "formatOptions", "80",
+      "--resampleWidth", String(TARGET_WIDTH), inPath, "--out", outPath], { timeout: 60_000 });
+    const out = await readFile(outPath);
+    const { stdout } = await execFileP("sips", ["-g", "pixelWidth", "-g", "pixelHeight", outPath]);
+    // lang-regex-ok: parses sips' own key/value output
+    const w = Number(stdout.match(/pixelWidth:\s*(\d+)/)?.[1] ?? 0);
+    const h = Number(stdout.match(/pixelHeight:\s*(\d+)/)?.[1] ?? 0);
+    return { buffer: out, w, h };
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+}
+
+async function upload(key, path, buffer) {
+  const r = await fetch(`${SUPABASE_URL}/storage/v1/object/${BUCKET}/${path}`, {
+    method: "POST",
+    headers: {
+      apikey: key,
+      Authorization: `Bearer ${key}`,
+      "Content-Type": "image/jpeg",
+      "x-upsert": "true",
+    },
+    body: buffer,
+    signal: AbortSignal.timeout(60_000),
+  });
+  if (!r.ok) throw new Error(`upload HTTP ${r.status}: ${(await r.text()).slice(0, 200)}`);
+  return `${SUPABASE_URL}/storage/v1/object/public/${BUCKET}/${path}`;
+}
+
+async function rest(key, pathAndQuery, init = {}) {
+  const r = await fetch(`${SUPABASE_URL}/rest/v1/${pathAndQuery}`, {
+    ...init,
+    headers: {
+      apikey: key,
+      Authorization: `Bearer ${key}`,
+      "Content-Type": "application/json",
+      Accept: "application/json",
+      ...(init.headers ?? {}),
+    },
+    signal: AbortSignal.timeout(20_000),
+  });
+  if (!r.ok) throw new Error(`${pathAndQuery} HTTP ${r.status}: ${(await r.text()).slice(0, 200)}`);
+  // `Prefer: return=minimal` answers 200 with an EMPTY body, not 204, so
+  // r.json() throws "Unexpected end of JSON input" on every successful write.
+  const body = await r.text();
+  return body ? JSON.parse(body) : null;
+}
+
+/** Ships that actually appear in bookable inventory — not the whole catalogue. */
+async function liveShips(key) {
+  // PostgREST hard-caps a response at 1000 rows whatever `limit` says — asking
+  // for 10000 silently returned the first 1000, i.e. 53 of the 79 ships, and
+  // the missing 26 looked like ships with no sailings rather than a paging bug.
+  const today = new Date().toISOString().slice(0, 10);
+  const seen = new Map();
+  const PAGE_SIZE = 1000;
+  for (let offset = 0; ; offset += PAGE_SIZE) {
+    const rows = await rest(
+      key,
+      `cruise_sailings?select=source,ship_name&depart_date=gte.${today}&lowest_balcony_per_person_usd=not.is.null&order=sailing_id.asc&offset=${offset}&limit=${PAGE_SIZE}`,
+    );
+    for (const r of rows) {
+      if (!r.source || !r.ship_name) continue;
+      seen.set(`${r.source}::${r.ship_name}`, { line: r.source, ship: r.ship_name });
+    }
+    if (rows.length < PAGE_SIZE) break;
+  }
+  return [...seen.values()].sort((a, b) => a.line.localeCompare(b.line) || a.ship.localeCompare(b.ship));
+}
+
+async function builtYears() {
+  const cat = JSON.parse(await readFile(CATALOG_PATH, "utf8").catch(() => "{}")); // no catalog → no built years
+  const m = new Map();
+  for (const [line, ships] of Object.entries(cat.ships ?? {})) {
+    for (const s of ships) m.set(`${line}::${norm(s.name)}`, s.built_year ?? null);
+  }
+  return m;
+}
+
+function parseArgs(argv) {
+  const out = { cmd: argv[2] ?? "sync", limit: Infinity, force: null, dryRun: false, only: null, retryMisses: false };
+  for (let i = 3; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === "--dry-run") out.dryRun = true;
+    else if (a === "--retry-misses") out.retryMisses = true;
+    else if (a === "--limit") out.limit = Number(argv[++i]);
+    else if (a === "--force") out.force = argv[++i];
+    else if (a === "--only") out.only = argv[++i];
+  }
+  return out;
+}
+
+async function main() {
+  const args = parseArgs(process.argv);
+  await loadEnvOnce();
+  const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
+  if (!key) {
+    console.error("fatal: SUPABASE_SERVICE_ROLE_KEY missing from .env");
+    process.exit(1);
+  }
+
+  const stored = await rest(key, `${TABLE}?select=*`);
+  const have = new Map(stored.map((r) => [`${r.line}::${r.ship_name}`, r]));
+
+  if (args.cmd === "set-url") {
+    // For the ships nothing can resolve automatically — an unlaunched hull
+    // whose only image is a render on the line's own site. Same download,
+    // resize, upload and record path as everything else, so a hand-found URL
+    // is not a different kind of row.
+    const [, , , shipArg, imageUrl] = process.argv;
+    if (!shipArg || !imageUrl) {
+      console.error('usage: cruise-ship-photos set-url "<ship name>" <image url>');
+      process.exit(2);
+    }
+    const target = (await liveShips(key)).find((s) => norm(s.ship) === norm(shipArg));
+    if (!target) {
+      console.error(`fatal: no ship named "${shipArg}" in live inventory`);
+      process.exit(1);
+    }
+    const { buffer, w, h } = await fetchAndResize(imageUrl);
+    const url = await upload(key, `${target.line}/${slug(target.ship)}.jpg`, buffer);
+    const now = new Date().toISOString();
+    await rest(key, `${TABLE}?on_conflict=line,ship_name`, {
+      method: "POST",
+      headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
+      body: JSON.stringify([{
+        line: target.line, ship_name: target.ship, photo_url: url, width: w, height: h,
+        source: "manual", source_page: imageUrl, credit: `${target.line} official`,
+        checked_at: now, updated_at: now,
+      }]),
+    });
+    console.log(`OK   ${target.line}  ${target.ship}  ${w}x${h}\n     ${url}`);
+    return;
+  }
+
+  if (args.cmd === "list") {
+    for (const r of stored.sort((a, b) => a.line.localeCompare(b.line) || a.ship_name.localeCompare(b.ship_name))) {
+      console.log(`${r.photo_url ? "✓" : "·"} ${r.line.padEnd(10)} ${r.ship_name.padEnd(28)} ${r.source ?? "—"}`);
+    }
+    console.log(`\n${stored.filter((r) => r.photo_url).length} with photos, ${stored.filter((r) => !r.photo_url).length} recorded misses`);
+    return;
+  }
+
+  const ships = await liveShips(key);
+  if (args.cmd === "missing") {
+    const missing = ships.filter((s) => !have.get(`${s.line}::${s.ship}`)?.photo_url);
+    for (const s of missing) console.log(`${s.line.padEnd(10)} ${s.ship}`);
+    console.log(`\n${missing.length} of ${ships.length} ships have no photo`);
+    return;
+  }
+
+  const years = await builtYears();
+  let done = 0, hit = 0, missed = 0;
+
+  for (const { line, ship } of ships) {
+    if (done >= args.limit) break;
+    if (args.only && line !== args.only) continue;
+    const k = `${line}::${ship}`;
+    const forced = args.force && norm(args.force) === norm(ship);
+    // A recorded row (photo OR miss) is skipped: re-resolving a ship nothing
+    // could find, every run, is how a sync job turns into a rate-limit problem.
+    // --retry-misses reopens just the misses, for when the resolver improves.
+    const row = have.get(k);
+    const isMiss = row && !row.photo_url;
+    if (row && !forced && !(args.retryMisses && isMiss)) continue;
+
+    done++;
+    const built = years.get(`${line}::${norm(ship)}`) ?? null;
+    let found = null;
+    try {
+      found = await resolveFromWikipedia(line, ship, built);
+      if (!found) found = await resolveFromCommons(ship);
+      if (!found) found = await resolveFromLine(line, ship);
+      if (!found) found = await resolveViaCdp(line, ship);
+    } catch (err) {
+      console.error(`  ! ${ship}: ${err.message}`);
+    }
+
+    if (!found) {
+      missed++;
+      console.log(`MISS ${line.padEnd(10)} ${ship}`);
+      if (!args.dryRun) {
+        await rest(key, `${TABLE}?on_conflict=line,ship_name`, {
+          method: "POST",
+          headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
+          body: JSON.stringify([{ line, ship_name: ship, photo_url: null, checked_at: new Date().toISOString(), updated_at: new Date().toISOString() }]),
+        });
+      }
+      await new Promise((r) => setTimeout(r, 200));
+      continue;
+    }
+
+    if (args.dryRun) {
+      hit++;
+      console.log(`OK   ${line.padEnd(10)} ${ship.padEnd(28)} ${found.source.padEnd(10)} ${found.title}`);
+      await new Promise((r) => setTimeout(r, 200));
+      continue;
+    }
+
+    try {
+      const { buffer, w, h } = await fetchAndResize(found.image);
+      const url = await upload(key, `${line}/${slug(ship)}.jpg`, buffer);
+      await rest(key, `${TABLE}?on_conflict=line,ship_name`, {
+        method: "POST",
+        headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
+        body: JSON.stringify([{
+          line, ship_name: ship, photo_url: url, width: w, height: h,
+          source: found.source, source_page: found.title,
+          credit: found.source === "wikipedia" ? `Wikipedia — ${found.title}` : `${line} official`,
+          checked_at: new Date().toISOString(), updated_at: new Date().toISOString(),
+        }]),
+      });
+      hit++;
+      console.log(`OK   ${line.padEnd(10)} ${ship.padEnd(28)} ${found.source.padEnd(10)} ${w}x${h}`);
+    } catch (err) {
+      missed++;
+      console.error(`FAIL ${line.padEnd(10)} ${ship}: ${err.message}`);
+    }
+    await new Promise((r) => setTimeout(r, 250));
+  }
+
+  console.log(`\n${hit} resolved, ${missed} missed, ${done} attempted${args.dryRun ? " (dry run — nothing written)" : ""}`);
+}
+
+main().catch((err) => {
+  console.error(`fatal: ${err?.stack || err}`);
+  process.exit(1);
+});

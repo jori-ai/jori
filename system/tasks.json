@@ -682,6 +682,25 @@
         "movie db"
       ],
       "description": "Keeps the movie database (watch_catalog) fresh: TMDB now_playing → in_theaters, new US digital releases, US where-to-watch providers + release dates, and the taste model's model_p for every relevant film (past 10 years or in theaters, unseen). Feeds the ratings site Watch now, the weekly movie email and the hum in-theaters pick. Playbook: ops-agent/jobs/movie-db-refresh.md."
+    },
+    {
+      "name": "cruise-watch",
+      "schedule": "25 9 * * 1",
+      "schedule_human": "Mondays at 9:30 AM local",
+      "trigger_script": "agent/scripts/trigger-cruise-watch.sh",
+      "webhook_url": "http://localhost:9092",
+      "webhook_task": "CRUISE WATCH",
+      "ops_playbook_section": null,
+      "delivers_to": "email+jori",
+      "phrases": [
+        "cruise watch",
+        "cruise deals",
+        "cruise scan",
+        "cruise alert",
+        "cruise alerts"
+      ],
+      "description": "Weekly scan for cruise deals matching the installation's travel plan and thresholds (agent/local/config/cruise-watch.json: home cities, embark ports, filters, alerts); alerts only on price drops. Off with no config or no plan.",
+      "job": "cruise-watch"
     }
   ]
 }
