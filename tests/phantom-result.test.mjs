@@ -9,6 +9,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
+import fs from "node:fs";
+import path from "node:path";
+import { REPO_ROOT as ROOT } from "../lib/root.cjs";
 import { isPhantomResult } from "../agent/lib/phantom-result.mjs";
 import { Dispatcher } from "../agent/supervisor/dispatcher.mjs";
 import { PriorityDispatcher } from "../agent/lib/priority-dispatcher.mjs";
@@ -118,4 +121,60 @@ test("Dispatcher: the sessionNotFound requeue guard still wins over the phantom 
   assert.equal(phantoms, 0);
   assert.equal(d.inFlight, null);
   assert.equal(d.queue.length, 1, "item goes back on the queue for the fresh session");
+});
+
+// --- cold start: a restored queue must drain ------------------------------
+//
+// Guards the watchdog's "Supervisor stale: lastEventAge=… queueDepth=N —
+// triggering /restart" for the other restart path. A fresh supervisor process
+// replays its persisted queue with Dispatcher.restore(), which only reloads it,
+// and the one drain kick after setup used to run only for items handed over by
+// an in-process restart. A fresh process has none, so a restored queue sat
+// idle until some new dispatch arrived (for a quiet tier, an hour or more).
+// The supervisor is not booted here (it spawns a claude -p child): the wiring
+// is pinned from the live source, the dispatcher half with a fake session.
+
+function queued(id) {
+  return { id, source: "webhook", content: `task ${id}`, enqueuedAt: new Date().toISOString() };
+}
+
+test("Dispatcher: restore() alone dispatches nothing; the first drain sends the head", () => {
+  const session = fakeSession();
+  const d = new Dispatcher(session);
+  d.restore({ queue: [queued("a1"), queued("b2")], inFlight: null });
+  assert.equal(session.sent.length, 0, "restore() must not dispatch: the supervisor kicks the drain once its listeners are attached");
+  d._drain();
+  assert.equal(session.sent.length, 1);
+  assert.equal(d.inFlight.id, "a1");
+});
+
+test("Dispatcher: a restored queue still waits while held for the usage limit or paused", () => {
+  const held = fakeSession();
+  const d1 = new Dispatcher(held);
+  d1.restore({ queue: [queued("c3")] });
+  d1.hold(Date.now() + 60_000);
+  d1._drain();
+  assert.equal(held.sent.length, 0, "the cold-start kick must not override a quota hold");
+  d1.dispose();
+
+  const paused = fakeSession();
+  const d2 = new Dispatcher(paused);
+  d2.restore({ queue: [queued("d4")] });
+  d2.setPaused(true);
+  d2._drain();
+  assert.equal(paused.sent.length, 0, "nor an auth pause");
+});
+
+test("supervisor: drains whenever the new dispatcher has a queue, restored or transferred", () => {
+  const SRC = fs.readFileSync(path.join(ROOT, "agent/supervisor/index.mjs"), "utf8");
+  const start = SRC.indexOf("this.dispatcher.restore(persisted)");
+  assert.ok(start > -1, "cold-start restore not found in supervisor/index.mjs: was it renamed?");
+  const kick = SRC.indexOf("this.dispatcher._drain()", start);
+  assert.ok(kick > start, "no _drain() call after the cold-start restore");
+  const line = SRC.slice(SRC.lastIndexOf("\n", kick) + 1, SRC.indexOf("\n", kick));
+  assert.match(line, /this\.dispatcher\.queue\.length/, "the kick must be gated on the queue, not only on items transferred in-process");
+  // It has to follow the listeners it relies on (turn watchdog arm, event
+  // log), or the first restored turn runs unwatched.
+  const listener = SRC.indexOf('this.dispatcher.on("dispatching"', start);
+  assert.ok(listener > start && listener < kick, "the drain must follow the dispatching listener");
 });
