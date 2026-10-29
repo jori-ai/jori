@@ -227,7 +227,8 @@ done
 def router_ssh(site, cmd, stdin=None, timeout=60):
     return subprocess.run(
         ["ssh", "-o", "ConnectTimeout=5", "-o", "BatchMode=yes", site["router_ssh"], cmd],
-        input=stdin, capture_output=True, text=True, timeout=timeout,
+        # A lease's hostname is whatever the client sent, not always UTF-8.
+        input=stdin, capture_output=True, text=True, errors="replace", timeout=timeout,
     )
 
 
