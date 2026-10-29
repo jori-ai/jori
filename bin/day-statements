@@ -34,6 +34,12 @@
  * Output is strict JSON on stdout. It never invents a place: every entry must
  * quote the words it came from.
  *
+ * It also reads the iMessages the user sent that day, one model call of their own
+ * on the same ladder, into `self_messages[] = {at, text, kind, quote}` with kind
+ * correction | declarative | chatter. resolve-day turns those into its
+ * `corrections` and `declarative_self_messages` (they replaced the regex
+ * lib/message-classifier.js, 2026-10-29).
+ *
  * Usage: day-statements <YYYY-MM-DD> [--tz Europe/Paris] [--model sonnet|opus]
  *
  * NOTE: this forks `claude -p`, so it must be launched from an already
@@ -42,7 +48,7 @@
  * nothing — the same constraint documented for daily-summary-run.
  */
 const path = require("node:path");
-const { execFileSync } = require("node:child_process");
+const { execFileSync, spawnSync } = require("node:child_process");
 
 const JORI = require("../lib/root.cjs").TOOLS_DIR;
 const { request } = require(path.join(JORI, "lib/supabase-rest.js"));
@@ -246,6 +252,127 @@ function chatText(rows, date, tz) {
     .join("\n");
 }
 
+// ---------------------------------------------------------------------------
+// The user's own sent iMessages for the day, each read by a model as a
+// correction, a declarative fact or chatter (2026-10-29).
+//
+// `lib/message-classifier.js` used to do this with regular expressions inside
+// resolve-day ("time stamps are wrong", "had lunch", "at <Capitalised>"), the
+// same string-matching treadmill this file exists to retire. resolve-day must stay
+// deterministic (it runs from cron, with no model), so the reading happens here and
+// resolve-day reads `self_messages` from this file's output. Code owns the message
+// list (its time, its text); the model only says which kind each one is and quotes
+// the words that make it so. When in doubt it is chatter: a correction or a fact
+// reaches the narrator, chatter never does.
+// ---------------------------------------------------------------------------
+
+const SELF_KINDS = ["correction", "declarative", "chatter"];
+
+// The day's sent iMessages, in the zone the day was lived in. `imsg sent` takes
+// UTC wall-clock strings (see bin/imsg parseUtcClock).
+function fetchImsgSent(date, tz) {
+  const w = dayWindow(date, tz, 1);
+  const utcClock = (ms) => new Date(ms).toISOString().slice(0, 19).split("T").join(" ");
+  const res = spawnSync(path.join(JORI, "bin/imsg"),
+    ["sent", "--since", utcClock(w.startMs), "--until", utcClock(w.endMs - 1000), "--json"],
+    { encoding: "utf8", maxBuffer: 16 * 1024 * 1024, timeout: 60000 });
+  if (res.status !== 0) return null;          // unreadable: not the same as "sent nothing"
+  try { return JSON.parse(res.stdout || "[]"); } catch { return null; }
+}
+
+// The messages as the model sees them: numbered, so its answer names a message by
+// index and code keeps the time and the text.
+function selfMessageList(msgs) {
+  return (msgs || []).map((m, i) => {
+    const to = m.contact ? ` to ${m.contact}${m.is_group ? " (group)" : ""}` : "";
+    return `[${i}] ${m.date || "?"}${to}: ${String(m.text || "").replace(/\s+/g, " ").slice(0, 600)}`;
+  }).join("\n");
+}
+
+const SELF_SCHEMA = `{
+  "self_messages": [
+    { "i": <the message's number>, "kind": "correction" | "declarative" | "chatter",
+      "quote": "<the words in THAT message that make it this kind, verbatim; null for chatter>" }
+  ]
+}`;
+
+function selfMessagesPrompt(date, tz, msgs) {
+  return `You are reading the iMessages the user SENT on ${date} (times are the host's clock; the day was lived in ${tz}). For each one, say what kind of statement it is, for a daily summary of where the user was and what the user did.
+
+Return ONLY a JSON object matching this schema, with no prose around it:
+${SELF_SCHEMA}
+
+The kinds:
+- "correction": the user saying something recorded or assumed about a day is wrong, or that something happened at a different time or on a different day ("the time stamps are wrong", "that was yesterday", "that wasn't today"). It is a signal about a PRIOR record, never a fact about this day.
+- "declarative": the user stating a fact about this day: where the user was or went, what the user did, who the user was with ("had lunch with Sam at the cafe", "flew to Lisbon"). Only the user's own day, stated as having happened: a plan, a recommendation, a question or someone else's day is not one.
+- "chatter": everything else: replies, logistics, opinions, questions, single words, emoji, links without a statement.
+
+When you are unsure, it is "chatter". Judge the meaning, not the wording. Every correction or declarative quotes the words of that same message verbatim.
+
+The messages:
+${selfMessageList(msgs)}`;
+}
+
+// Provenance, not language: each index exists, each kind is one of the three, and
+// each non-chatter quote is in the message it names.
+function validateSelfMessages(parsed, msgs) {
+  if (!parsed || typeof parsed !== "object") return "not an object";
+  if (!Array.isArray(parsed.self_messages)) return "self_messages is not an array";
+  for (const e of parsed.self_messages) {
+    if (!e || !Number.isInteger(e.i) || e.i < 0 || e.i >= msgs.length) return `no message ${e && e.i}`;
+    if (!SELF_KINDS.includes(e.kind)) return `message ${e.i}: kind "${e.kind}" is not one of ${SELF_KINDS.join("/")}`;
+    if (e.kind === "chatter") continue;
+    if (!e.quote) return `message ${e.i}: no quote for a ${e.kind}`;
+    if (!quoteInChat(e.quote, norm(msgs[e.i].text))) {
+      return `message ${e.i}: quote is not in the message: "${String(e.quote).slice(0, 60)}"`;
+    }
+  }
+  return null;
+}
+
+// Every message, in order, with the model's kind (chatter where it gave none).
+function buildSelfMessages(parsed, msgs) {
+  const byI = new Map();
+  for (const e of parsed.self_messages) if (!byI.has(e.i)) byI.set(e.i, e);
+  return msgs.map((m, i) => {
+    const e = byI.get(i);
+    const kind = e ? e.kind : "chatter";
+    return { at: m.date || null, text: String(m.text || "").replace(/\s+/g, " ").trim(),
+             kind, quote: kind === "chatter" ? null : e.quote };
+  });
+}
+
+function parseJsonOut(raw) {
+  const jm = String(raw).match(/\{[\s\S]*\}/);
+  if (!jm) return { error: "no JSON in output" };
+  try { return { value: JSON.parse(jm[0]) }; } catch { return { error: "unparseable JSON" }; }
+}
+
+// The ladder, as for the places: a rung is climbed only when the one below fails
+// validation. `ask(promptText, tier)` returns the model's raw text (tests stub it).
+// Returns { self_messages, tier, attempts }; self_messages is null when no tier
+// gave a valid reading, so the day has none rather than a guess.
+async function classifySelfMessages(msgs, { date, tz, ask, ladder = TIERS }) {
+  if (!msgs || !msgs.length) return { self_messages: [], tier: null, attempts: [] };
+  const promptText = selfMessagesPrompt(date, tz, msgs);
+  const attempts = [];
+  for (const tier of ladder) {
+    let raw;
+    try { raw = await ask(promptText, tier); }
+    catch (e) { attempts.push({ tier, error: String(e.message || e).slice(0, 120) }); continue; }
+    const { value, error } = parseJsonOut(raw);
+    if (error) { attempts.push({ tier, error }); continue; }
+    const bad = validateSelfMessages(value, msgs);
+    if (bad) { attempts.push({ tier, error: bad }); continue; }
+    attempts.push({ tier, ok: true });
+    return { self_messages: buildSelfMessages(value, msgs), tier, attempts };
+  }
+  return { self_messages: null, tier: null, attempts };
+}
+
+const askTier = (promptText, tier) =>
+  tier === "local" ? runLocal(promptText) : runClaude(promptText, MODELS[tier]);
+
 async function main() {
   const date = process.argv[2];
   if (!date || !/^\d{4}-\d{2}-\d{2}$/.test(date)) {
@@ -311,7 +438,18 @@ async function main() {
     console.error("every tier failed:\n" + JSON.stringify(attempts, null, 1));
     process.exit(1);
   }
+  // The day's sent iMessages, read the same way (see classifySelfMessages). An
+  // unreadable message store or a ladder with no valid reading leaves the field
+  // out, and resolve-day then reports no corrections or facts from them.
+  const sent = fetchImsgSent(date, tz);
+  let self = { self_messages: null, tier: null, attempts: [{ error: "imsg sent unreadable" }] };
+  if (sent) self = await classifySelfMessages(sent, { date, tz, ask: askTier, ladder });
+  if (self.self_messages) parsed.self_messages = self.self_messages;
+  else process.stderr.write("[day-statements] self-sent iMessages not read: "
+    + JSON.stringify(self.attempts) + "\n");
   parsed._meta = { date, tz, tier: used, attempts, messages: (rows || []).length,
+                   self_messages: { tier: self.tier, attempts: self.attempts,
+                                    count: sent ? sent.length : null },
                    generated_at: new Date().toISOString() };
   const outArg = process.argv.indexOf("--out");
   const outFile = outArg > -1 ? process.argv[outArg + 1] : `/tmp/day-statements-${date}.json`;
@@ -324,4 +462,6 @@ if (require.main === module) {
   main().catch(e => { console.error(e.message); process.exit(1); });
 }
 
-module.exports = { validate, evidencePieces, quoteInChat, norm, chatWindow, chatText, prompt, SCHEMA };
+module.exports = { validate, evidencePieces, quoteInChat, norm, chatWindow, chatText, prompt, SCHEMA,
+  SELF_KINDS, selfMessageList, selfMessagesPrompt, validateSelfMessages, buildSelfMessages,
+  classifySelfMessages, fetchImsgSent };
