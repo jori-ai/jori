@@ -24,12 +24,12 @@
 
 set -euo pipefail
 
+# The installation's kernel tree (JORI_INSTALL, JORI_INSTALL_TOOLS), from root.sh.
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../agent/scripts/lib/root.sh"
 # Claude Code's project slug: the session start path (~/Dev/jori) with every
 # non-alphanumeric character turned into "-" (lib/instance.cjs claudeMemoryDir).
-PROJECT_SLUG="$(printf '%s' "${JORI_PROJECT_DIR:-$HOME/Dev/jori}" | tr -c 'A-Za-z0-9' '-')"
+PROJECT_SLUG="$(printf '%s' "${JORI_PROJECT_DIR:-$JORI_INSTALL}" | tr -c 'A-Za-z0-9' '-')"
 MEMORY_DIR="${MEMORY_INDEX_DIR:-$HOME/.claude/projects/$PROJECT_SLUG/memory}"
-# The installation's kernel tree (JORI_INSTALL_TOOLS), from root.sh.
-. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../agent/scripts/lib/root.sh"
 TARBALL_DIR="${MEMORY_SNAPSHOT_DIR:-$JORI_INSTALL_TOOLS/data/memory-snapshots}"
 
 if [[ ! -d "$MEMORY_DIR/.git" ]]; then

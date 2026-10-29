@@ -25,10 +25,12 @@
 
 set -uo pipefail
 
-CANON="$HOME/Dev/jori/.github/scripts/ci-keychain-lock.sh"
+# shellcheck source=/dev/null
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../agent/scripts/lib/root.sh"   # JORI_INSTALL
+CANON="$JORI_INSTALL/.github/scripts/ci-keychain-lock.sh"
 # Second shared helper: per-job scoping for provisioning profiles + ASC keys.
 # Same defect class, same vendoring discipline, so it gets the same drift check.
-CANON_SA="$HOME/Dev/jori/.github/scripts/ci-signing-assets.sh"
+CANON_SA="$JORI_INSTALL/.github/scripts/ci-signing-assets.sh"
 JSON=0
 [ "${1:-}" = "--json" ] && JSON=1
 
@@ -38,9 +40,9 @@ JSON=0
 # lib/instance.cjs github_owner); `owner/repo:workflow` names another owner.
 # No targets → exit 2 (nothing to audit).
 # shellcheck source=/dev/null
-source "$HOME/Dev/jori/agent/scripts/lib/instance.sh"
+source "$JORI_INSTALL/agent/scripts/lib/instance.sh"
 OWNER="${JORI_OWNER:-}"
-TARGETS="${JORI_CI_SIGNING_TARGETS:-$(node -e 'for (const t of require(process.argv[1]).localConfig("ci-signing", { targets: [] }).targets || []) console.log(t)' "$HOME/Dev/jori/lib/instance.cjs" 2>/dev/null)}"
+TARGETS="${JORI_CI_SIGNING_TARGETS:-$(node -e 'for (const t of require(process.argv[1]).localConfig("ci-signing", { targets: [] }).targets || []) console.log(t)' "$JORI_INSTALL/lib/instance.cjs" 2>/dev/null)}"
 [ -n "$TARGETS" ] || { echo "ci-keychain-lock-audit: no signing targets configured (agent/local/config/ci-signing.json or JORI_CI_SIGNING_TARGETS)" >&2; exit 2; }
 [ -n "$OWNER" ] || { echo "ci-keychain-lock-audit: no GitHub owner configured (instance github_owner / JORI_OWNER)" >&2; exit 2; }
 
@@ -68,7 +70,7 @@ repo_path() { case "$1" in */*) printf '%s' "$1" ;; *) printf '%s/%s' "$OWNER" "
 # `vendor_dirs` in agent/local/config/ci-signing.json names another folder for
 # it (a private overlay repo whose checkout shares .github/scripts with the
 # kernel keeps them elsewhere, e.g. .overlay/ci).
-VENDOR_DIRS="$(node -e 'const v=require(process.argv[1]).localConfig("ci-signing", {}).vendor_dirs||{}; for (const [k,d] of Object.entries(v)) console.log(k+"="+d)' "$HOME/Dev/jori/lib/instance.cjs" 2>/dev/null)"
+VENDOR_DIRS="$(node -e 'const v=require(process.argv[1]).localConfig("ci-signing", {}).vendor_dirs||{}; for (const [k,d] of Object.entries(v)) console.log(k+"="+d)' "$JORI_INSTALL/lib/instance.cjs" 2>/dev/null)"
 vendor_dir() { local d; d=$(printf '%s\n' "$VENDOR_DIRS" | awk -F= -v r="$1" '$1==r{print $2; exit}'); printf '%s' "${d:-.github/scripts}"; }
 repo_script_sha() {
   local repo="$1" script="${2:-ci-keychain-lock.sh}" f content
