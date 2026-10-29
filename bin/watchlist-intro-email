@@ -1,0 +1,230 @@
+#!/usr/bin/env node
+// watchlist-intro-email — one email introducing every title newly added to the
+// shows & movies list (2026-10-10). Daily via cron-run; silent when nothing new.
+//
+// For each watch_titles row added in the last 30 days that hasn't been
+// introduced yet (intro_emailed_at null) and isn't rejected/dropped/watched:
+//   code   TMDB details + cast + images + trailer, OMDb ratings + awards, Rotten Tomatoes
+//          id from Wikidata (falls back to an RT search link), IMDb link. A row with no
+//          tmdb_id is looked up by name (exact match only); a missing IMDb id comes from
+//          TMDB, else the card links an IMDb search (2026-10-11: every card opens IMDb,
+//          has a description, and a trailer when one exists)
+//   model  one Sonnet call for the whole batch writes, per title: what it's
+//          about, how critics took it, and why its audience would like it
+// Then one HTML email (digest-deliver: email + pointer + push) and
+// intro_emailed_at is stamped on every title in it.
+//
+// Movies go weekly (2026-10-11: one email a week about the new films on the list): the daily run introduces shows and documentaries only; `--movies` (Sundays)
+// introduces the week's new films best-predicted first (model_p: the films the model thinks
+// they'd like best come first) with where to watch, plus films new in theaters or on
+// streaming this week that the model rates highly and that aren't on the list yet.
+//
+//   watchlist-intro-email                 send (what the job-run launches)
+//   watchlist-intro-email --movies        the weekly movie email (same flags apply)
+//   watchlist-intro-email --resend-days N introduce again everything added in the last N days,
+//                                         even if already emailed (on the user's ask, e.g. "send me an
+//                                         email with the shows recently added")
+//   watchlist-intro-email --check         exit 0 if anything is pending, 3 if not (the trigger's gate; no model, no send)
+//   watchlist-intro-email --dry-run       build the email, write it to $TMPDIR, send/stamp nothing
+//   watchlist-intro-email --dry-run --no-prose   same, without the model call
+//
+// Playbook: agent/ops-agent/jobs/watchlist-intro-email.md
+
+import { execFileSync } from "node:child_process";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { createRequire } from "node:module";
+import { loadAll, patchTitle, hasTmdb, rest, normName, omdbRating } from "../lib/watch-db.mjs";
+import {
+  WHO, selectPending, tmdbFacts, omdbFacts, wikidataRtId, imdbUrl, imdbSearchUrl, rtUrl, renderCard, renderEmail, subjectFor,
+  whereText, renderNewRows, moviesSubject, trailerLink, searchHit,
+} from "../lib/watch-intro.mjs";
+import { sendHtmlEmail, labelDigest, pointerAndPush } from "../lib/digest-deliver.mjs";
+import { tasteProfile } from "../lib/watch-fit.mjs";
+import { PARTNER, whoFor } from "../lib/watch-config.mjs";
+
+const require = createRequire(import.meta.url);
+const { MODELS } = require("../lib/models.cjs");
+
+const DRY = process.argv.includes("--dry-run");
+const CHECK = process.argv.includes("--check");
+const NO_PROSE = process.argv.includes("--no-prose");
+const MOVIES = process.argv.includes("--movies");
+const isMovie = (t) => t.kind === "movie";
+const NEW_MIN_P = 0.75, NEW_MAX = 6;
+
+/** Movie-database rows (watch_catalog) by TMDB id, for model_p and where to watch. */
+async function catalogRows(tmdbIds) {
+  if (!tmdbIds.length) return new Map();
+  const rows = await rest(`watch_catalog?select=tmdb_id,model_p,in_theaters,providers&kind=eq.movie&tmdb_id=in.(${tmdbIds.join(",")})`);
+  return new Map(rows.map((r) => [r.tmdb_id, r]));
+}
+/** New in theaters or on digital in the last 7 days, not on the list, model ≥ NEW_MIN_P. */
+async function newThisWeek() {
+  const since = new Date(Date.now() - 7 * 86400000).toISOString().slice(0, 10);
+  const rows = await rest(`watch_catalog?select=tmdb_id,imdb_id,title,year,poster_path,overview,genres,model_p,imdb_rating,in_theaters,providers,theatrical_date,digital_date&kind=eq.movie&title_id=is.null&not_for_us=eq.false&model_p=gte.${NEW_MIN_P}&and=(or(seen.is.null,seen.eq.false),or(digital_date.gte.${since},theatrical_date.gte.${since}))&order=model_p.desc&limit=${NEW_MAX}`);
+  return rows;
+}
+const RESEND = (() => { const i = process.argv.indexOf("--resend-days"); return i >= 0 ? parseInt(process.argv[i + 1], 10) : 0; })();
+const pendingFor = (titles) => selectPending(RESEND ? titles.map((t) => ({ ...t, intro_emailed_at: null })) : titles, RESEND ? { lookbackDays: RESEND } : {})
+  .filter((t) => (MOVIES ? isMovie(t) : !isMovie(t)));
+const MAX_PER_EMAIL = 12;
+const HOME = os.homedir();
+const log = (m) => console.log(`${new Date().toISOString()} ${m}`);
+
+if (CHECK) {
+  const n = pendingFor((await loadAll()).titles).length + (MOVIES ? (await newThisWeek()).length : 0);
+  console.log(`${n} pending`);
+  process.exit(n ? 0 : 3);
+}
+if (!hasTmdb()) { console.error("TMDB_API_KEY missing"); process.exit(1); }
+
+async function tmdbGet(p) {
+  try {
+    const res = await fetch(`https://api.themoviedb.org/3/${p}${p.includes("?") ? "&" : "?"}api_key=${process.env.TMDB_API_KEY}`, { signal: AbortSignal.timeout(10000) });
+    return res.ok ? await res.json() : null;
+  } catch { return null; }
+}
+async function omdbGet(imdbId) {
+  if (!imdbId || !process.env.OMDB_API_KEY) return null;
+  try { return await (await fetch(`https://www.omdbapi.com/?apikey=${process.env.OMDB_API_KEY}&i=${imdbId}&tomatoes=true`, { signal: AbortSignal.timeout(8000) })).json(); }
+  catch { return null; }
+}
+
+/** No TMDB id on the row: search by name and take only an exact match (same name, year ±1). */
+async function searchTmdbId(t, media) {
+  const s = await tmdbGet(`search/${media}?query=${encodeURIComponent(t.name)}`);
+  return searchHit(s?.results, { name: t.name, year: t.year_start }, normName)?.id || null;
+}
+
+async function gatherFacts(t) {
+  const media = t.kind === "show" ? "tv" : "movie";
+  const tmdbId = t.tmdb_id || await searchTmdbId(t, media);
+  const d = tmdbId ? await tmdbGet(`${media}/${tmdbId}?append_to_response=${media === "tv" ? "aggregate_credits" : "credits"},videos,external_ids`) : null;
+  const tf = tmdbFacts(d, media);
+  const imdbId = t.imdb_id || tf.imdb_id || null;
+  const year = t.year_start || parseInt(String(d?.release_date || d?.first_air_date || "").slice(0, 4), 10) || null;
+  const [omdb, rtId] = await Promise.all([omdbGet(imdbId), wikidataRtId(imdbId)]);
+  return {
+    ...tf, ...omdbFacts(omdb),
+    imdb: imdbUrl(imdbId) || imdbSearchUrl(t.name, year),
+    rt: rtUrl(rtId, t.name),
+    trailer: trailerLink(tf.videos, { name: t.name, year, matched: !!d }),
+  };
+}
+
+/** A new-this-week row's way in: IMDb id (TMDB fills a missing one), synopsis, IMDb score, trailer.
+ *  Never throws: a lookup failure leaves the row as the catalog has it. */
+async function freshFacts(c) {
+  try {
+    const d = await tmdbGet(`movie/${c.tmdb_id}?append_to_response=videos,external_ids`);
+    const imdbId = c.imdb_id || d?.imdb_id || d?.external_ids?.imdb_id || null;
+    return {
+      ...c,
+      imdb_id: imdbId,
+      overview: c.overview || d?.overview || null,
+      imdb_rating: c.imdb_rating ?? (imdbId ? await omdbRating(imdbId) : null),
+      trailer: trailerLink(d?.videos?.results, { name: c.title, year: c.year, matched: !!d }),
+    };
+  } catch (e) {
+    log(`facts for ${c.title} failed (${String(e?.message || e).slice(0, 120)}) — row goes as the catalog has it`);
+    return c;
+  }
+}
+
+/** One model call for the batch → Map(id → {about, reviews, why}). Empty map on failure (cards fall back to the TMDB synopsis). */
+function writeProse(items, { titles, feedback }) {
+  const byId = new Map(titles.map((t) => [t.id, t]));
+  const liked = [...new Set(feedback.filter((f) => ["loved", "liked"].includes(f.verdict)).map((f) => byId.get(f.title_id)?.name).filter(Boolean))].slice(-25);
+  const disliked = [...new Set(feedback.filter((f) => ["disliked", "dropped", "not_interested", "meh"].includes(f.verdict)).map((f) => byId.get(f.title_id)?.name).filter(Boolean))].slice(-20);
+  const facts = items.map(({ t, f }) => ({
+    id: t.id, title: t.name, kind: t.kind, year: t.year_start, genres: t.genres,
+    for: WHO[t.audience] || WHO.together,
+    synopsis: f.overview || t.description || f.plot, cast: (f.cast || []).map((c) => c.name), creators: f.creators,
+    ratings: f.ratings || {}, awards: f.awards || null, why_it_was_added: t.source_reason || null,
+  }));
+  const prompt = `You are writing short introductions to shows and films just added to the watch lists ${whoFor("solo")} shares with ${whoFor(PARTNER)}, for an email they read. Warm, specific, like a friend with great taste — not marketing copy.
+
+ALWAYS refer to them by name — "${whoFor("solo")}", "${whoFor(PARTNER)}", or "${whoFor("together")}" — never "he", "him", "his", "she", "her", "you" or "the two of you". They asked for this so it's always clear who is meant.
+
+The taste profile:
+---
+${tasteProfile()}
+---
+Loved/liked: ${liked.join("; ") || "(none recorded)"}
+Didn't like: ${disliked.join("; ") || "(none recorded)"}
+
+The titles (facts below are verified — never contradict them, never invent cast or ratings):
+${JSON.stringify(facts, null, 1)}
+
+For EACH title, run a web search for its critical reception, then write:
+- "about": 2-3 sentences on the premise and tone. No spoilers past the setup.
+- "reviews": 2-3 sentences on how critics and audiences received it — the consensus, what they praised, any common complaint. Quote a publication only if your search actually found it.
+- "why": 1-2 sentences on why the person or people in "for" will like it, tied to specific titles they loved or to the profile. Every title here already passed a strict quality check, so write with conviction — no hedging, no "stretch", no "gamble", no "worth a try".
+
+Output ONE JSON object and nothing else:
+{"items":[{"id":<id>,"about":"...","reviews":"...","why":"..."}]}`;
+  try {
+    const out = execFileSync(path.join(HOME, ".local/bin/claude"), [
+      "-p", "--model", MODELS.sonnet, "--effort", "low", "--allowedTools", "WebSearch", "--output-format", "text", prompt,
+    ], { encoding: "utf8", timeout: 420000, maxBuffer: 4 * 1024 * 1024, stdio: ["ignore", "pipe", "ignore"] });
+    const json = out.slice(out.indexOf("{"), out.lastIndexOf("}") + 1);
+    return new Map((JSON.parse(json).items || []).map((x) => [x.id, x]));
+  } catch (e) {
+    log(`prose failed (${e.message.slice(0, 160)}) — falling back to TMDB synopses`);
+    return new Map();
+  }
+}
+
+const data = await loadAll();
+let pending = pendingFor(data.titles);
+const cat = MOVIES ? await catalogRows(pending.map((t) => t.tmdb_id).filter(Boolean)) : new Map();
+// Best predicted first (movies; shows keep newest-first).
+if (MOVIES) pending = [...pending].sort((a, b) => (cat.get(b.tmdb_id)?.model_p ?? 0) - (cat.get(a.tmdb_id)?.model_p ?? 0));
+const fresh = MOVIES ? await Promise.all((await newThisWeek()).map(freshFacts)) : [];
+if (!pending.length && !fresh.length) { log("nothing new"); process.exit(0); }
+const batch = pending.slice(0, MAX_PER_EMAIL);
+log(`${pending.length} pending; introducing ${batch.length}: ${batch.map((t) => t.name).join(", ")}`);
+
+const items = [];
+for (const t of batch) items.push({ t, f: { ...await gatherFacts(t), where: whereText(cat.get(t.tmdb_id)) } });
+const prose = NO_PROSE || !items.length ? new Map() : writeProse(items, data);
+if (!NO_PROSE && prose.size < items.length) log(`prose for ${prose.size}/${items.length} titles`);
+
+const subject = MOVIES ? moviesSubject(batch, fresh.length) : subjectFor(batch);
+const intro = MOVIES
+  ? (batch.length ? `This week's new movies on ${whoFor("together")}'s list, the ones Jori thinks they'll like most first, with where to watch each.` : `Nothing new on the list this week, but these just arrived in theaters or on streaming and look like ${whoFor("together")}'s kind of film.`)
+  : batch.length === 1
+    ? `${batch[0].name} just landed on your list. Here's what it is and why it's there.`
+    : `${batch.length} new titles on your lists. Here's what each one is and why it's there.`;
+const html = renderEmail([...items.map(({ t, f }) => renderCard(t, f, prose.get(t.id) || {})), renderNewRows(fresh)].filter(Boolean), { intro });
+
+if (DRY) {
+  const file = path.join(process.env.TMPDIR || os.tmpdir(), `watchlist-intro-${Date.now()}.html`);
+  fs.writeFileSync(file, html);
+  log(`dry run — "${subject}" written to ${file}`);
+  process.exit(0);
+}
+
+try {
+  sendHtmlEmail({ subject, html });
+} catch (e) {
+  log(`SEND FAILED: ${e.message}`);
+  pointerAndPush({ pointer: `${MOVIES ? "Weekly movie email" : "Watchlist intro email"} for ${batch.map((t) => t.name).join(", ") || "new releases"} built but UNDELIVERED — will retry ${MOVIES ? "next week" : "tomorrow"}.`, intent: "watchlist-intro" });
+  process.exit(1);
+}
+const stamp = new Date().toISOString();
+for (const t of batch) {
+  try { await patchTitle(t.id, { intro_emailed_at: stamp }); } catch (e) { log(`stamp failed for ${t.name}: ${e.message}`); }
+}
+if (!(await labelDigest(subject, { log }))) log("WARN: sent but not indexed after the bounded wait — left unlabeled");
+
+const top = [...items.map(({ t, f }) => `${t.name}${f.ratings?.imdb ? ` (IMDb ${f.ratings.imdb.replace("/10", "")})` : ""}`), ...fresh.map((c) => c.title)];
+pointerAndPush({
+  pointer: `${MOVIES ? "This week's movies" : "New on your watchlist"}: ${top.slice(0, 3).join(", ")}${top.length > 3 ? ` and ${top.length - 3} more` : ""}. Writeups and where to watch are in your inbox.`,
+  push: subject,
+  intent: "watchlist-intro",
+  evidenceLive: true,
+});
+log(`sent "${subject}"${pending.length > batch.length ? `; ${pending.length - batch.length} left for the next run` : ""}`);

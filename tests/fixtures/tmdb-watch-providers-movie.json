@@ -1,0 +1,24 @@
+{
+  "id": 4242,
+  "results": {
+    "US": {
+      "link": "https://www.themoviedb.org/movie/4242/watch?locale=US",
+      "flatrate": [
+        { "provider_id": 2528, "provider_name": "PBS Documentaries Amazon Channel", "display_priority": 40 }
+      ],
+      "ads": [
+        { "provider_id": 73, "provider_name": "Tubi TV", "display_priority": 9 }
+      ],
+      "rent": [
+        { "provider_id": 2, "provider_name": "Apple TV Store", "display_priority": 4 },
+        { "provider_id": 10, "provider_name": "Amazon Video", "display_priority": 2 },
+        { "provider_id": 3, "provider_name": "Google Play Movies", "display_priority": 6 }
+      ],
+      "buy": [
+        { "provider_id": 10, "provider_name": "Amazon Video", "display_priority": 2 },
+        { "provider_id": 2, "provider_name": "Apple TV Store", "display_priority": 4 },
+        { "provider_id": 7, "provider_name": "Fandango At Home", "display_priority": 5 }
+      ]
+    }
+  }
+}

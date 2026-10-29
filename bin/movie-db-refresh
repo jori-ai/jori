@@ -1,0 +1,144 @@
+#!/usr/bin/env node
+// movie-db-refresh — keep the movie database fresh: what's relevant to the viewers and
+// where they can see it (theaters, streaming services, rent), so every recommendation can
+// put the films the model rates highest first (2026-10-11). No LLM.
+//
+// The database is watch_catalog (kind movie). Daily, this:
+//   1. In theaters: TMDB now_playing (home region) → in_theaters = true (and false for films that left);
+//      films not yet in the catalog are added.
+//   2. Newly on streaming/digital: TMDB discover, home-region digital releases of the last 120 days →
+//      added to the catalog.
+//   3. Features for the new rows: runs watch-catalog-enrich (TMDB genres/keywords/people).
+//   4. Where to watch (home region, TMDB/JustWatch): providers = {stream:[…], free:[…], rent:bool} plus
+//      theatrical/digital release dates, for every relevant film — refreshed weekly, daily
+//      while in theaters.
+//   5. The model's p(like) (lib/watch-recsys.mjs, trained on everything collected) →
+//      model_p, so the site, the weekly email and the hum all sort best-first.
+// "Relevant" = a film from the past 10 years (re-releases in theaters excluded) they haven't seen and
+// haven't called not their thing.
+//
+//   movie-db-refresh [--providers-days 7] [--dry-run]
+// Daily 09:12 via cron-run (before watch-catalog-enrich's OMDb pass at 09:40).
+// Playbook: agent/ops-agent/jobs/movie-db-refresh.md
+
+import { execFileSync } from "node:child_process";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+import { rest, hasTmdb, todayEt } from "../lib/watch-db.mjs";
+import { shortName, isResellerVariant } from "../lib/tmdb-providers.mjs";
+import { loadModel } from "../lib/watch-model.mjs";
+import * as recsys from "../lib/watch-recsys.mjs";
+import { HOME_REGION } from "../lib/watch-where.mjs";
+
+const HERE = path.dirname(fileURLToPath(import.meta.url));
+const arg = (n, d) => { const i = process.argv.indexOf(`--${n}`); return i >= 0 ? parseInt(process.argv[i + 1], 10) : d; };
+const PROVIDERS_DAYS = arg("providers-days", 7);
+const DRY = process.argv.includes("--dry-run");
+const today = todayEt();
+const MIN_YEAR = parseInt(today.slice(0, 4), 10) - 10;
+const log = (m) => console.log(`${new Date().toISOString()} ${m}`);
+if (!hasTmdb()) { console.error("TMDB_API_KEY missing"); process.exit(1); }
+
+async function tmdb(p) {
+  for (let i = 0; i < 3; i++) {
+    const r = await fetch(`https://api.themoviedb.org/3/${p}${p.includes("?") ? "&" : "?"}api_key=${process.env.TMDB_API_KEY}`, { signal: AbortSignal.timeout(15000) }).catch(() => null);
+    if (r?.ok) return r.json();
+    if (r?.status === 404) return null;
+    await new Promise((res) => setTimeout(res, 1500 * (i + 1)));
+  }
+  return null;
+}
+async function pool(items, n, fn) {
+  let i = 0;
+  await Promise.all(Array.from({ length: n }, async () => { while (i < items.length) await fn(items[i++]); }));
+}
+async function all(q) {
+  const out = [];
+  for (let off = 0; ; off += 1000) {
+    const page = await rest(`${q}&order=id&limit=1000&offset=${off}`);
+    out.push(...page);
+    if (page.length < 1000) return out;
+  }
+}
+const patch = (id, body) => DRY ? null : rest(`watch_catalog?id=eq.${id}`, { method: "PATCH", prefer: "return=minimal", body });
+
+const genreMap = new Map((await tmdb("genre/movie/list"))?.genres?.map((g) => [g.id, g.name]) || []);
+let catalog = await all("watch_catalog?select=id,tmdb_id,year,seen,not_for_us,in_theaters,providers_at,features_at&kind=eq.movie");
+const known = new Set(catalog.map((r) => r.tmdb_id));
+const toAdd = new Map();
+const consider = (m) => {
+  if (!m?.id || known.has(m.id) || toAdd.has(m.id) || !m.title) return;
+  const g = (m.genre_ids || []).map((x) => genreMap.get(x)).filter(Boolean);
+  toAdd.set(m.id, {
+    kind: "movie", tmdb_id: m.id, title: m.title, year: m.release_date ? parseInt(m.release_date.slice(0, 4), 10) : null,
+    poster_path: m.poster_path || null, overview: m.overview || null, original_language: m.original_language || null,
+    genres: g.join(", ") || null, vote_count: m.vote_count || 0, vote_average: Math.round((m.vote_average || 0) * 10) / 10,
+    rank: 60000, // after the seed films; never grows the graph (watch-catalog-enrich)
+  });
+};
+
+// 1. In theaters now.
+const playing = new Set();
+for (let page = 1; page <= 8; page++) {
+  const r = await tmdb(`movie/now_playing?region=${HOME_REGION}&language=en-US&page=${page}`);
+  for (const m of r?.results || []) { playing.add(m.id); consider(m); }
+  if (!r || page >= (r.total_pages || 1)) break;
+}
+// 2. Newly on streaming / digital in the home region.
+const since = new Date(Date.parse(today) - 120 * 86400000).toISOString().slice(0, 10);
+for (let page = 1; page <= 6; page++) {
+  const r = await tmdb(`discover/movie?region=${HOME_REGION}&with_release_type=4&release_date.gte=${since}&release_date.lte=${today}&sort_by=popularity.desc&vote_count.gte=20&page=${page}`);
+  for (const m of r?.results || []) consider(m);
+  if (!r || page >= (r.total_pages || 1)) break;
+}
+log(`in theaters ${playing.size}; new to the catalog ${toAdd.size}`);
+if (toAdd.size && !DRY) {
+  await rest("watch_catalog?on_conflict=kind,tmdb_id", { method: "POST", prefer: "resolution=ignore-duplicates,return=minimal", body: [...toAdd.values()] });
+}
+
+// 3. Features for the new rows (and any other pending ones); OMDb stays with the 09:40 run.
+if (toAdd.size && !DRY) {
+  try {
+    execFileSync(process.execPath, [path.join(HERE, "watch-catalog-enrich"), "--max", "400", "--omdb-max", "0"], { stdio: "inherit", timeout: 20 * 60000 });
+  } catch (e) { log(`enrich failed: ${e.message}`); }
+}
+catalog = await all("watch_catalog?select=id,tmdb_id,year,seen,not_for_us,in_theaters,providers_at,features_at&kind=eq.movie");
+
+// In-theaters flags.
+const flip = catalog.filter((r) => playing.has(r.tmdb_id) !== !!r.in_theaters);
+await pool(flip, 6, (r) => patch(r.id, { in_theaters: playing.has(r.tmdb_id) }));
+for (const r of flip) r.in_theaters = playing.has(r.tmdb_id);
+
+// 4. Where to watch, for every relevant film.
+// Past 10 years only — in theaters too: now_playing includes anniversary re-releases (North by
+// Northwest, 1959) that aren't what they asked for.
+const relevant = catalog.filter((r) => r.seen !== true && !r.not_for_us && (r.year ?? 0) >= MIN_YEAR);
+const stale = new Date(Date.now() - PROVIDERS_DAYS * 86400000).toISOString();
+const fresh1d = new Date(Date.now() - 20 * 3600000).toISOString();
+const due = relevant.filter((r) => !r.providers_at || r.providers_at < stale || (r.in_theaters && r.providers_at < fresh1d));
+const names = (xs) => [...new Set((xs || []).map(shortName).filter((n) => n && !isResellerVariant(n)))];
+let withStream = 0;
+await pool(due, 6, async (r) => {
+  const d = await tmdb(`movie/${r.tmdb_id}?append_to_response=watch/providers,release_dates`);
+  if (!d) return;
+  const us = d["watch/providers"]?.results?.[HOME_REGION] || {};
+  const providers = { stream: names(us.flatrate), free: names([...(us.free || []), ...(us.ads || [])]), rent: !!(us.rent?.length || us.buy?.length) };
+  if (providers.stream.length) withStream++;
+  const dates = (d.release_dates?.results || []).find((x) => x.iso_3166_1 === HOME_REGION)?.release_dates || [];
+  const first = (types) => dates.filter((x) => types.includes(x.type)).map((x) => x.release_date.slice(0, 10)).sort()[0] || null;
+  await patch(r.id, { providers, providers_at: new Date().toISOString(), theatrical_date: first([2, 3]), digital_date: first([4]) });
+});
+log(`where-to-watch refreshed for ${due.length} of ${relevant.length} relevant films (${withStream} streaming on a service)`);
+
+// 5. The model's p(like), best-first everywhere.
+const M = await loadModel();
+const byTmdb = new Map(M.catalog.filter((r) => r.kind === "movie").map((r) => [r.tmdb_id, r]));
+const scored = relevant.map((r) => byTmdb.get(r.tmdb_id)).filter((r) => r?.features_at)
+  .map((r) => ({ r, p: Math.round(recsys.predict(M.model, r).p * 1000) / 1000 }))
+  .filter(({ r, p }) => r.model_p == null || Math.abs(r.model_p - p) >= 0.005);
+const now = new Date().toISOString();
+await pool(scored, 8, ({ r, p }) => patch(r.id, { model_p: p, model_at: now }));
+const top = relevant.map((r) => byTmdb.get(r.tmdb_id)).filter((r) => r?.features_at)
+  .map((r) => ({ t: r.title, p: recsys.predict(M.model, r).p, th: playing.has(r.tmdb_id) })).sort((a, b) => b.p - a.p).slice(0, 8);
+log(`model_p updated for ${scored.length}; top: ${top.map((x) => `${x.t}${x.th ? " (theaters)" : ""} ${Math.round(x.p * 100)}%`).join(", ")}`);
+console.log(JSON.stringify({ in_theaters: playing.size, added: toAdd.size, providers_refreshed: due.length, relevant: relevant.length, model_p_updated: scored.length, dry_run: DRY }));

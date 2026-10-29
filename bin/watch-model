@@ -1,0 +1,48 @@
+#!/usr/bin/env node
+// watch-model — inspect the watch-list recommendation model (web/watch/lib/recsys.mjs) on
+// the real data: what it has learned, the batch it would show next, and a leave-one-out
+// backtest. Read-only.
+//
+//   watch-model [summary|batch|backtest|calibrate|tune|predict <title>] [--json]
+import { loadModel, backtest, fitPlatt } from "../lib/watch-model.mjs";
+import * as recsys from "../lib/watch-recsys.mjs";
+
+const cmd = process.argv[2] || "summary";
+const json = process.argv.includes("--json");
+const ctx = await loadModel();
+const out = (o, text) => console.log(json ? JSON.stringify(o, null, 2) : text);
+
+if (cmd === "summary") {
+  const s = recsys.tasteSummary(ctx.model, 10);
+  out(s, `labels: ${s.labels}\nlikes: ${s.likes.join("; ")}\ndislikes: ${s.dislikes.join("; ")}`);
+} else if (cmd === "batch") {
+  const pool = ctx.catalog.filter((r) => r.kind === "movie" && r.seen === null && !r.not_for_us && r.features_at && (r.vote_count || 0) >= 800);
+  const b = recsys.designBatch(ctx.model, pool);
+  out(b.map((x) => ({ title: x.row.title, year: x.row.year, slot: x.slot, p: x.p, u: x.u, why: x.why })),
+    b.map((x) => `${x.slot.padEnd(8)} p=${x.p.toFixed(2)} u=${x.u.toFixed(2)}  ${x.row.title} (${x.row.year}) — ${x.why}`).join("\n"));
+} else if (cmd === "backtest") {
+  const r = backtest(ctx);
+  out(r, `leave-one-out: ${r.hit}/${r.n} = ${r.n ? Math.round(100 * r.hit / r.n) : 0}% sign-correct (always-majority baseline ${r.n ? Math.round(100 * r.baseline / r.n) : 0}%), AUC ${r.auc?.toFixed(3)} (random = 0.5)`);
+} else if (cmd === "calibrate") {
+  // Fit on uncalibrated LOO predictions, then report accuracy with the fitted calibration.
+  const raw = backtest(ctx, { ...recsys.PARAMS, calib: { a: 1, b: 0 } });
+  const calib = fitPlatt(raw.preds);
+  const after = backtest(ctx, { ...recsys.PARAMS, calib });
+  out({ calib, before: raw.hit / raw.n, after: after.hit / after.n, auc: after.auc },
+    `calib ${JSON.stringify(calib)} — accuracy ${(100 * raw.hit / raw.n).toFixed(1)}% → ${(100 * after.hit / after.n).toFixed(1)}% (baseline ${(100 * after.baseline / after.n).toFixed(1)}%), AUC ${after.auc.toFixed(3)}. Put it in PARAMS.calib in web/watch/lib/recsys.mjs.`);
+} else if (cmd === "tune") {
+  // Small grid over the hyperparameters that matter; prints the best few by AUC.
+  const base = recsys.PARAMS, res = [];
+  for (const ze of [0, 1, 2, 4]) for (const tau of [0.5, 1, 2]) for (const zc of [1.2, 1.8]) {
+    const params = { ...base, ze, tau, zc, calib: { a: 1, b: 0 } };
+    const r = backtest(ctx, params);
+    res.push({ ze, tau, zc, auc: r.auc });
+  }
+  res.sort((a, b) => b.auc - a.auc);
+  out(res.slice(0, 8), res.slice(0, 8).map((r) => JSON.stringify(r)).join("\n"));
+} else if (cmd === "predict") {
+  const q = process.argv.slice(3).filter((a) => !a.startsWith("--")).join(" ").toLowerCase();
+  const hits = ctx.catalog.filter((r) => (r.title || "").toLowerCase().includes(q)).slice(0, 5);
+  out(hits.map((r) => ({ title: r.title, ...recsys.predict(ctx.model, r) })),
+    hits.map((r) => { const p = recsys.predict(ctx.model, r); return `${r.title} (${r.year}) p=${p.p.toFixed(2)} u=${p.u.toFixed(2)} top=${p.top.map((t) => `${t.f}:${t.v.toFixed(2)}`).join(", ")}`; }).join("\n"));
+} else { console.error("usage: watch-model [summary|batch|backtest|predict <title>] [--json]"); process.exit(1); }

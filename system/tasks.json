@@ -578,6 +578,110 @@
       ],
       "description": "Strikes out area-guide (trip_reservoirs) places the user has already been to, so the guides stop suggesting things already done. Evidence: the daily summary first (vetted against chat + transactions + Places; catches visits that never became a stop), then GPS visits, then the travel path. Done, never removed; marks record their evidence. Runs after daily-summary because that's its primary source. Deliberately loose — the user prefers over-striking to under-striking. Cannot mark food specialties (a dish is not a place) — those rely on the site's manual done/undone button. Silent, state-only.",
       "job": null
+    },
+    {
+      "name": "watchlist-discover",
+      "schedule": "17 10 1 * *",
+      "schedule_human": "1st of each month at 10:17 AM",
+      "trigger_script": "agent/scripts/trigger-watchlist-discover.sh",
+      "webhook_url": null,
+      "webhook_task": null,
+      "ops_playbook_section": null,
+      "delivers_to": "jori",
+      "phrases": [
+        "watchlist discover",
+        "watchlist scan",
+        "discover new shows",
+        "find new shows",
+        "monthly watchlist",
+        "show recommendations"
+      ],
+      "description": "Monthly wide pass (60-day window, max 12) of bin/watch-discover: the model proposes new series/films from the taste profile + the user's verdicts, code enforces TMDB match, id dedup incl. rejected, IMDb >= 7.5, season 1 fully dropped. Adds to watch_titles; one phone pointer if anything was added. Cron posts job=watchlist-discover to the ops supervisor, which launches agent/scripts/watchlist-discover-run.sh via job-run (claude -p needs the Max session). Playbook: ops-agent/jobs/watchlist-discover.md."
+    },
+    {
+      "name": "watchlist-intro-email",
+      "schedule": "27 2 * * *",
+      "schedule_human": "Daily at 2:27 AM (dispatches only when a new title is pending)",
+      "trigger_script": "agent/scripts/trigger-watchlist-intro-email.sh",
+      "webhook_url": null,
+      "webhook_task": null,
+      "ops_playbook_section": null,
+      "delivers_to": "email",
+      "phrases": [
+        "watchlist intro email",
+        "new on my watchlist",
+        "new show email",
+        "watchlist writeups"
+      ],
+      "description": "One HTML email introducing every show and documentary (films go in the weekly watchlist-movies-email) added to watch_titles in the last 30 days and not yet introduced (intro_emailed_at null): TMDB backdrop + cast headshots, what it's about, the reviews (OMDb scores + searched critical reception), why the user would like it, IMDb + Rotten Tomatoes links. Several titles per email. Trigger gates in code (watchlist-intro-email --check), then posts job=watchlist-intro-email to ops-light, which launches watchlist-intro-email-run.sh via job-run (claude -p needs the Max session). Playbook: ops-agent/jobs/watchlist-intro-email.md."
+    },
+    {
+      "name": "watchlist-movies-email",
+      "schedule": "56 4 * * 0",
+      "schedule_human": "Sundays at 4:56 AM (dispatches only when there's something to say)",
+      "trigger_script": "agent/scripts/trigger-watchlist-movies-email.sh",
+      "webhook_url": null,
+      "webhook_task": null,
+      "ops_playbook_section": null,
+      "delivers_to": "email",
+      "phrases": [
+        "weekly movie email",
+        "new movies this week",
+        "movies email",
+        "movies added to the list"
+      ],
+      "description": "Weekly email: films added to the list that week, best predicted first (model_p), with writeups, cast, reviews and where to watch; plus films new in theaters/streaming this week the taste model rates >= 75%. watchlist-intro-email --movies via job-run. Playbook: ops-agent/jobs/watchlist-movies-email.md."
+    },
+    {
+      "name": "watch-catalog-enrich",
+      "schedule": "40 9 * * *",
+      "schedule_human": "Daily at 9:40 AM",
+      "trigger_script": null,
+      "webhook_url": null,
+      "webhook_task": null,
+      "ops_playbook_section": null,
+      "delivers_to": "none",
+      "phrases": [
+        "watch catalog enrich",
+        "movie features",
+        "recommendation model data"
+      ],
+      "description": "Deterministic TMDB enrichment for the watch-list recommendation model (web/watch/lib/recsys.mjs): syncs every list title (films + shows) into watch_catalog, fills genres/keywords/directors/cast, records TMDB recommendation edges in watch_film_edges, adds recommended films (>=300 votes). No LLM; cron-run direct. Playbook: ops-agent/jobs/watch-catalog-enrich.md."
+    },
+    {
+      "name": "movie-discover",
+      "schedule": "27 8 * * 6",
+      "schedule_human": "Saturdays at 8:27 AM",
+      "trigger_script": "agent/scripts/trigger-movie-discover.sh",
+      "webhook_url": null,
+      "webhook_task": null,
+      "ops_playbook_section": null,
+      "delivers_to": "none",
+      "phrases": [
+        "movie discover",
+        "movie harvester",
+        "find movies",
+        "movie recommendations",
+        "back catalog films"
+      ],
+      "description": "Weekly back-catalog film harvester (bin/movie-discover): TMDB recommendations from films the viewers loved/liked on the ratings site + well-known films they marked haven't seen; code gates (not seen/listed, past 10 years, IMDb >= 6.8 (no RT/Metacritic floors), US availability, no kids/romance-led); fit by Jev site watchlist-fit (Sonnet shadow/fallback, fails closed); adds up to 5 queued. Silent — the weekly watchlist-movies-email introduces them. Cron → ops-light → job-run of movie-discover-run.sh. Playbook: ops-agent/jobs/movie-discover.md."
+    },
+    {
+      "name": "movie-db-refresh",
+      "schedule": "40 10 * * *",
+      "schedule_human": "Daily at 10:40 AM (cron-run, no LLM)",
+      "trigger_script": null,
+      "webhook_url": null,
+      "webhook_task": null,
+      "ops_playbook_section": null,
+      "delivers_to": "none",
+      "phrases": [
+        "movie database",
+        "what's in theaters",
+        "where to watch movies",
+        "movie db"
+      ],
+      "description": "Keeps the movie database (watch_catalog) fresh: TMDB now_playing → in_theaters, new US digital releases, US where-to-watch providers + release dates, and the taste model's model_p for every relevant film (past 10 years or in theaters, unseen). Feeds the ratings site Watch now, the weekly movie email and the hum in-theaters pick. Playbook: ops-agent/jobs/movie-db-refresh.md."
     }
   ]
 }
