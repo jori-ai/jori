@@ -45,7 +45,7 @@ const { htmlToMarkdown } = require("../lib/episode-html-to-md.js");
 // The daily-summary renderer is optional: without it every day converts from
 // the narrative HTML (the fallback narrativeMarkdown already has).
 let buildMarkdown = null;
-try { ({ buildMarkdown } = require("../lib/daily-summary-render.js")); } catch { /* not installed: HTML path */ }
+try { ({ buildMarkdown } = require("../lib/daily-summary-render.js")); } catch { /* not installed: HTML path */ }  // kernel-closure-ok: the daily-summary renderer is optional; without it the HTML path is used
 const { request } = require("../lib/supabase-rest.js");
 const { instance } = require("../lib/instance.cjs");
 
