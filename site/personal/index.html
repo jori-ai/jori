@@ -14,8 +14,9 @@
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,600&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400&display=swap" rel="stylesheet">
 <style>
-  :root { --bg:#f4efe6; --ink:#141414; --muted:#5e5a52; --line:#d9d1c3; --accent:#c2410c; --us:#f6e3d3; --yes:#1f7a4d; --no:#a3473a; }
-  @media (prefers-color-scheme: dark) { :root { --bg:#121110; --ink:#f1ece3; --muted:#a39d92; --line:#2c2925; --accent:#fb923c; --us:#2a1d14; --yes:#5fc28f; --no:#e08a7c; } }
+  /* Palettes: life = red, work = blue, neutral when a page speaks to both. Each page maps its accent to one. */
+  :root { --bg:#f4efe6; --ink:#141414; --muted:#5e5a52; --line:#d9d1c3; --life:#b42318; --life-tint:#f7e2de; --work:#1d4ed8; --work-tint:#e1e7f4; --neutral:#57534e; --neutral-tint:#ebe4d8; --accent:var(--life); --us:var(--life-tint); --yes:#1f7a4d; --no:#a3473a; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#121110; --ink:#f1ece3; --muted:#a39d92; --line:#2c2925; --life:#f87171; --life-tint:#2d1716; --work:#7aa2f7; --work-tint:#151f36; --neutral:#d6d0c4; --neutral-tint:#24211d; --yes:#5fc28f; --no:#e08a7c; } }
   * { box-sizing:border-box; margin:0; }
   body { background:var(--bg); color:var(--ink); font:16px/1.6 Inter, system-ui, sans-serif; }
   .wrap { width:100%; max-width:1080px; margin:0 auto; padding:0 24px; }
@@ -75,7 +76,7 @@
   .nav .brand img { width:30px; height:30px; }
   .nav .seg { display:flex; gap:4px; background:var(--us); border-radius:999px; padding:4px; }
   .nav .seg a { color:var(--muted); text-decoration:none; font-size:14px; font-weight:500; padding:6px 14px; border-radius:999px; }
-  .nav .seg a[aria-current="page"] { background:var(--ink); color:var(--bg); }
+  .nav .seg a[aria-current="page"] { background:var(--accent); color:var(--bg); }
   .nav .gh { color:var(--muted); font-size:14px; text-decoration:none; }
   @media (max-width:560px) { .nav .gh { display:none; } }
 </style>

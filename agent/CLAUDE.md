@@ -177,7 +177,8 @@ jori-send-curl --channel system --skip-precheck "⚠️ <what happened>"
 ```
 
 - **System rows are silent by default** — written to the System tab, no push. A system row notifies only if it starts with 🔴/🚨 (critical) or the caller passes `--push` because it needs the user to act now. Never add `--push` to informational notices (Jev disagreements, hung-turn retries, recoveries, "job didn't run").
-- **Chat** (default `--channel chat`) is for the user's life: hum pings, digests, ticket confirmations, reminders, questions needing their reply, P1 email pointers.
+- **Chat** (default `--channel chat`) is for the user's life: hum pings, digests, ticket confirmations, reminders, urgent questions needing their reply, P1 email pointers.
+- **Questions** (`--channel questions`) holds non-urgent questions, written without a push. You do not pick it: `jori-send-curl` routes every question bound for chat (an intent ending `:question`/`:ask`, hum context, or `--question`) through `bin/question-route`; Jev site `question-urgency` keeps urgent ones in chat. **Location questions are always urgent** (chat, time-sensitive push; pass `--location-question` if your sender is not recognised). A reply typed in a tab is answered in that tab.
 - **Root-cause narration of Jori's own bugs goes to `--channel improvements`**, not chat — unless the user asked for it, or they can observe the difference (say that in one line in chat).
 - Email triage decisions, ops-agent internal state, and routine cron completions go to **neither** channel.
 - Repeat system alerts are deduplicated automatically (`system-alert-dedup`; check `system-alert-dedup --stats` before concluding a condition stopped; deliberate re-page: `JORI_ALERT_NO_DEDUP=1`). This is not licence to alert more freely.

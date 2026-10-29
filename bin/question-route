@@ -1,0 +1,42 @@
+#!/usr/bin/env node
+// question-route — CLI over lib/question-route.mjs, for bin/jori-send-curl.
+//
+// Prints one JSON line: {"channel":"chat"|"questions","urgent":bool,"question":bool,"reason":...}
+// Always exits 0; any failure prints the chat route, so a broken router can
+// never lose or delay a message.
+//
+// Usage:
+//   question-route [--intent <i>] [--hum-context <file>] [--question] [--location] < message
+
+import fs from "node:fs";
+
+const args = process.argv.slice(2);
+function flag(name, hasValue = true) {
+  const i = args.indexOf(name);
+  if (i < 0) return undefined;
+  if (!hasValue) { args.splice(i, 1); return true; }
+  const v = args[i + 1];
+  args.splice(i, 2);
+  return v;
+}
+
+const DEADLINE_MS = Number(process.env.QUESTION_ROUTE_DEADLINE_MS) || 90000;
+const FALLBACK = { channel: "chat", urgent: false, question: false, reason: "router unavailable" };
+
+try {
+  const intent = flag("--intent") || "";
+  const ctxFile = flag("--hum-context");
+  const explicit = Boolean(flag("--question", false));
+  const location = Boolean(flag("--location", false));
+  let context = null;
+  if (ctxFile) { try { context = JSON.parse(fs.readFileSync(ctxFile, "utf8")); } catch { /* route without it */ } }
+  const text = fs.readFileSync(0, "utf8");
+  const { routeQuestion } = await import("../lib/question-route.mjs");
+  // Bounded: the send waits on this. Past the deadline the message stays in chat.
+  const deadline = new Promise((resolve) => setTimeout(() => resolve({ ...FALLBACK, reason: "router timeout" }), DEADLINE_MS).unref());
+  const r = await Promise.race([routeQuestion({ text, intent, context, explicit, location }), deadline]);
+  console.log(JSON.stringify(r));
+  process.exit(0);
+} catch (e) {
+  console.log(JSON.stringify({ ...FALLBACK, reason: `router error: ${String(e?.message || e).slice(0, 120)}` }));
+}

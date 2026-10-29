@@ -86,18 +86,35 @@ test("preRankFilter drops a 24h dedup repeat but spares Rule #1 lanes and urgent
   assert.deepEqual(eligible.map((c) => c.dedup_key), ["practice:dup", "urgent:dup", "news:fresh"]);
 });
 
-test("preRankFilter enforces the retrospective-ask daily cap", async () => {
+// Location asks are always urgent (2026-10-29): no daily cap and no budget,
+// unless an installation opts back in with HUM_LOCATION_ASK_CAP.
+test("preRankFilter never caps or budgets a location ask by default", async () => {
   const today = new Date().toISOString();
   const rows = [1, 2, 3].map((i) => JSON.stringify({ sent_at: today, ping_id: `p-${i}`, findings: [{ dedup_key: `location_ask:v${i}` }] }));
   fs.writeFileSync(FEEDBACK, rows.join("\n") + "\n");
   const { eligible, vetoed } = await vetoes.preRankFilter([
     { topic: "location_context", dedup_key: "location_ask:v9", urgency: 0.6, signal: "were you at X?" },
-    { topic: "nearby", dedup_key: "nearby:1", urgency: 0.6, signal: "a market" },
-  // The three asks went out "now", so the 45-min ping budget would also hold the
-  // nearby candidate; that gate has its own tests (ping-budget.test.mjs).
-  ], { embed: async () => null, checkPingBudget: () => ({ ok: true }) });
-  assert.deepEqual(vetoed.map((v) => v.gate), ["retrospective_ask_cap"]);
-  assert.deepEqual(eligible.map((c) => c.topic), ["nearby"]);
+  ], { embed: async () => null, checkPingBudget: () => ({ ok: false, gate: "daily_cap", detail: "spent" }),
+    checkQuestionBudget: () => ({ ok: false, gate: "daily_cap", detail: "spent" }) });
+  assert.deepEqual(vetoed, []);
+  assert.deepEqual(eligible.map((c) => c.dedup_key), ["location_ask:v9"]);
+});
+
+test("HUM_LOCATION_ASK_CAP restores the retrospective-ask daily cap", async () => {
+  const today = new Date().toISOString();
+  const rows = [1, 2, 3].map((i) => JSON.stringify({ sent_at: today, ping_id: `p-${i}`, findings: [{ dedup_key: `location_ask:v${i}` }] }));
+  fs.writeFileSync(FEEDBACK, rows.join("\n") + "\n");
+  process.env.HUM_LOCATION_ASK_CAP = "3";
+  try {
+    const { eligible, vetoed } = await vetoes.preRankFilter([
+      { topic: "location_context", dedup_key: "location_ask:v9", urgency: 0.6, signal: "were you at X?" },
+      { topic: "nearby", dedup_key: "nearby:1", urgency: 0.6, signal: "a market" },
+    // The three asks went out "now", so the 45-min ping budget would also hold the
+    // nearby candidate; that gate has its own tests (ping-budget.test.mjs).
+    ], { embed: async () => null, checkPingBudget: () => ({ ok: true }), questionScale: 1 });
+    assert.deepEqual(vetoed.map((v) => v.gate), ["retrospective_ask_cap"]);
+    assert.deepEqual(eligible.map((c) => c.topic), ["nearby"]);
+  } finally { delete process.env.HUM_LOCATION_ASK_CAP; }
 });
 
 test("preRankFilter applies the novelty gate and fails open on a dead embedder", async () => {
