@@ -1,0 +1,47 @@
+#!/usr/bin/env node
+// photo-ocr — accurate on-device OCR of one Photos item, as ordered lines.
+//
+//   photo-ocr <uuid> [--json]     → {"uuid","lines":[{"text","confidence"}],"cached":bool}
+//
+// Resolves the original via osxphotos, runs lib/photo-ocr.swift (compiled
+// once to data/.bin/photo-ocr, rebuilt when the source is newer), and
+// caches by uuid in data/photo-ocr-cache.json — a photo's pixels don't
+// change. Only on the machine that holds the Photos library (the host). Exit 1
+// with {"error"} when it can't read; callers fall back to Photos' own OCR.
+import fs from "node:fs";
+import path from "node:path";
+import { spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
+
+const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const SRC = path.join(ROOT, "lib/photo-ocr.swift");
+const BIN = path.join(ROOT, "data/.bin/photo-ocr");
+const CACHE = path.join(ROOT, "data/photo-ocr-cache.json");
+const uuid = process.argv[2];
+const fail = (error) => { process.stdout.write(JSON.stringify({ uuid, error }) + "\n"); process.exit(1); };
+if (!uuid || uuid.startsWith("--")) fail("usage: photo-ocr <uuid> [--json]");
+
+let cache = {};
+try { cache = JSON.parse(fs.readFileSync(CACHE, "utf8")); } catch {}
+if (cache[uuid]) { process.stdout.write(JSON.stringify({ uuid, lines: cache[uuid].lines, cached: true }) + "\n"); process.exit(0); }
+
+const stale = !fs.existsSync(BIN) || fs.statSync(SRC).mtimeMs > fs.statSync(BIN).mtimeMs;
+if (stale) {
+  fs.mkdirSync(path.dirname(BIN), { recursive: true });
+  const b = spawnSync("swiftc", ["-O", SRC, "-o", BIN], { encoding: "utf8", timeout: 180000 });
+  if (b.status !== 0) fail(`swiftc failed: ${(b.stderr || "").slice(0, 200)}`);
+}
+const PATH = `${process.env.HOME}/.local/bin:/opt/homebrew/bin:${process.env.PATH || ""}`;
+const q = spawnSync("osxphotos", ["query", "--uuid", uuid, "--json"], { encoding: "utf8", timeout: 120000, env: { ...process.env, PATH } });
+let file = null;
+try { const d = JSON.parse(q.stdout || "[]")[0] || {}; file = d.path || (d.path_derivatives || [])[0] || null; } catch {}
+if (!file || !fs.existsSync(file)) fail("original not available locally");
+const r = spawnSync(BIN, [file], { encoding: "utf8", timeout: 60000 });
+if (r.status !== 0) fail(`ocr failed: ${(r.stderr || "").slice(0, 200)}`);
+const lines = (r.stdout || "").split("\n").filter(Boolean).map((l) => {
+  const [text, c] = l.split("\t");
+  return { text, confidence: Number(c) };
+});
+cache[uuid] = { lines, at: new Date().toISOString() };
+try { fs.writeFileSync(`${CACHE}.tmp`, JSON.stringify(cache)); fs.renameSync(`${CACHE}.tmp`, CACHE); } catch {}
+process.stdout.write(JSON.stringify({ uuid, lines, cached: false }) + "\n");

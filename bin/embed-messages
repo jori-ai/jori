@@ -1,0 +1,143 @@
+#!/usr/bin/env node
+// embed-messages — embed jori_messages rows with the local Ollama
+// nomic-embed-text model (see lib/local-llm.mjs#localLlmEmbed).
+//
+// Usage:
+//   embed-messages              # default: embed rows with embedding IS NULL
+//   embed-messages --batch 100  # at most 100 rows this run
+//   embed-messages --reembed    # re-embed everything (migration / model switch)
+//
+// Depends on:
+//   1) data/migrations/20260417_jori_messages_pgvector.sql applied
+//   2) Ollama running at :11434 with `ollama pull nomic-embed-text`
+//
+// Max-only guardrail: no Anthropic API calls. All embedding happens locally.
+
+"use strict";
+
+const { localLlmEmbed, LOCAL_EMBED_DEFAULT_MODEL } = require("../lib/local-llm.mjs");
+const { loadEnv } = require("../lib/load-env.js");
+loadEnv();
+
+const SUPABASE_URL = process.env.SUPABASE_URL || require("../lib/instance.cjs").supabaseUrl();
+const KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_ANON_KEY;
+if (!KEY) {
+  console.error("ERROR: SUPABASE_SERVICE_ROLE_KEY not set in .env");
+  process.exit(1);
+}
+
+const args = process.argv.slice(2);
+const argFlag = (name, def = null) => {
+  const i = args.indexOf(name);
+  if (i === -1) return def;
+  return args[i + 1] && !args[i + 1].startsWith("--") ? args[i + 1] : true;
+};
+const BATCH = Number(argFlag("--batch", 200));
+const REEMBED = Boolean(argFlag("--reembed", false));
+
+async function sb(path, { method = "GET", body, prefer } = {}) {
+  const res = await fetch(SUPABASE_URL + path, {
+    method,
+    headers: {
+      apikey: KEY,
+      Authorization: `Bearer ${KEY}`,
+      "Content-Type": "application/json",
+      Accept: "application/json",
+      ...(prefer ? { Prefer: prefer } : {}),
+    },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  const text = await res.text();
+  if (!res.ok) throw new Error(`Supabase ${res.status} ${path}: ${text.slice(0, 300)}`);
+  return text ? JSON.parse(text) : null;
+}
+
+function filterClause() {
+  // Order oldest→newest within the selection so progressive runs embed in
+  // time-order (helps when tailing logs).
+  const base = "select=id,content&order=created_at.asc&limit=" + BATCH;
+  if (REEMBED) return base;
+  return "embedding=is.null&" + base;
+}
+
+// nomic-embed-text has a 2048-token context. A long message (a pasted log, a
+// full email body) blows past it and Ollama answers 500 "the input length
+// exceeds the context length". Because the scan filter is `embedding=is.null`,
+// a row that fails is re-selected on EVERY subsequent run — so two oversized
+// messages were retried 254 times on 2026-07-20 alone and wrote ~17k identical
+// log lines, and would have retried forever.
+//
+// Embeddings are for recall, and the leading few thousand characters carry the
+// retrievable signal, so truncating is the right call over skipping: a
+// truncated embedding still makes the message findable, whereas a skipped one
+// is invisible to semantic recall permanently. ~6000 chars is a conservative
+// fit for 2048 tokens at typical English/Hebrew density; the halving retry
+// covers token-dense content (code, CJK, base64) that busts the estimate.
+const MAX_EMBED_CHARS = 6000;
+
+async function embedWithShrink(content, id) {
+  let text = content.length > MAX_EMBED_CHARS ? content.slice(0, MAX_EMBED_CHARS) : content;
+  if (text.length < content.length) {
+    console.error(`[embed-messages] id=${id} truncated ${content.length}->${text.length} chars for embedding`);
+  }
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await localLlmEmbed(text);
+    } catch (e) {
+      const tooLong = /context length|input length/i.test(e.message || "");
+      if (!tooLong || attempt >= 4 || text.length <= 256) throw e;
+      text = text.slice(0, Math.floor(text.length / 2));
+      console.error(`[embed-messages] id=${id} still too long, retrying at ${text.length} chars`);
+    }
+  }
+}
+
+async function main() {
+  console.error(
+    `[embed-messages] model=${LOCAL_EMBED_DEFAULT_MODEL} batch=${BATCH} reembed=${REEMBED}`,
+  );
+
+  const rows = await sb("/rest/v1/jori_messages?" + filterClause());
+  if (!rows.length) {
+    console.error("[embed-messages] nothing to do");
+    return;
+  }
+
+  let ok = 0;
+  let failed = 0;
+  for (const r of rows) {
+    const content = (r.content || "").trim();
+    if (!content) {
+      // Skip empty rows but mark them so we don't re-scan forever.
+      await sb(`/rest/v1/jori_messages?id=eq.${r.id}`, {
+        method: "PATCH",
+        body: { embedding_model: LOCAL_EMBED_DEFAULT_MODEL, embedded_at: new Date().toISOString() },
+      });
+      continue;
+    }
+    try {
+      const vec = await embedWithShrink(content, r.id);
+      // PostgREST takes vector literals as the Postgres vector string form:
+      // "[0.1,0.2,...]". Send as a string; Supabase casts to vector.
+      const vecLit = "[" + vec.join(",") + "]";
+      await sb(`/rest/v1/jori_messages?id=eq.${r.id}`, {
+        method: "PATCH",
+        body: {
+          embedding: vecLit,
+          embedding_model: LOCAL_EMBED_DEFAULT_MODEL,
+          embedded_at: new Date().toISOString(),
+        },
+      });
+      ok++;
+    } catch (e) {
+      failed++;
+      console.error(`[embed-messages] id=${r.id} failed: ${e.message}`);
+    }
+  }
+  console.error(`[embed-messages] done ok=${ok} failed=${failed} of ${rows.length}`);
+}
+
+main().catch((e) => {
+  console.error(`[embed-messages] fatal: ${e.message}`);
+  process.exit(1);
+});

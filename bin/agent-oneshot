@@ -1,0 +1,65 @@
+#!/usr/bin/env node
+// agent-oneshot — run a bounded task through the Conway substrate's one-shot
+// path (Agent + stateless executor → Max-compliant `claude -p
+// --no-session-persistence`). A fresh-context sub-agent that touches no live
+// --resume conversation. Use for parallel research / focused analysis offloaded
+// from a caller that shouldn't spend its own context window on it.
+//
+// Usage:
+//   agent-oneshot "your task text"
+//   echo "your task" | agent-oneshot
+//   agent-oneshot --model claude-sonnet-5-5 --tools "WebSearch WebFetch Read" \
+//     --system "You are a research assistant. Be terse." --json "research X"
+//
+// Flags: --model, --system, --system-file, --tools (space-separated allowedTools),
+//   --cwd, --timeout <seconds>, --json (emit {id,text} JSON), --mcp-config <path>.
+//
+// Max invariant: the executor strips ANTHROPIC_API_KEY; never a raw SDK/API key.
+
+import fs from "node:fs";
+import { runOneShot } from "../agent/core/one-shot.mjs";
+
+function parse(argv) {
+  const o = { json: false };
+  const rest = [];
+  for (let i = 2; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === "--model") o.model = argv[++i];
+    else if (a === "--system") o.system = argv[++i];
+    else if (a === "--system-file") o.system = fs.readFileSync(argv[++i], "utf8");
+    else if (a === "--tools") o.allowedTools = argv[++i];
+    else if (a === "--cwd") o.cwd = argv[++i];
+    else if (a === "--mcp-config") o.mcpConfig = argv[++i];
+    else if (a === "--timeout") o.timeoutMs = Math.max(1, Number(argv[++i]) || 120) * 1000;
+    else if (a === "--json") o.json = true;
+    else rest.push(a);
+  }
+  o.task = rest.join(" ").trim();
+  return o;
+}
+
+async function main() {
+  const o = parse(process.argv);
+  if (!o.task && !process.stdin.isTTY) {
+    o.task = fs.readFileSync(0, "utf8").trim();   // read task from stdin
+  }
+  if (!o.task) {
+    console.error("agent-oneshot: a task is required (arg or stdin)");
+    process.exit(2);
+  }
+  const { id, text } = await runOneShot(o.task, {
+    model: o.model || "claude-sonnet-5-5",
+    system: o.system || "",
+    allowedTools: o.allowedTools || null,
+    cwd: o.cwd || null,
+    mcpConfig: o.mcpConfig || null,
+    timeoutMs: o.timeoutMs || 120_000,
+  });
+  if (o.json) process.stdout.write(JSON.stringify({ id, text }) + "\n");
+  else process.stdout.write(text + "\n");
+}
+
+main().catch((err) => {
+  console.error(`agent-oneshot: ${err.message}`);
+  process.exit(1);
+});

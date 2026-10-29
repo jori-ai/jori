@@ -1,0 +1,33 @@
+#!/usr/bin/env node
+// ping-budget — the shared daily ping budget (6/day, 45 min apart) from the shell.
+//
+//   ping-budget check [--json]   exit 0 = a ping fits, 1 = over budget (prints why)
+//   ping-budget record [--json]  count one ping sent outside hum-ping (the
+//                                location-ambient lane) into hum-state.json
+//
+// Any other exit is an error; callers fail OPEN on it. Logic and rationale live
+// in lib/ping-budget.mjs.
+
+import { checkPingBudget, recordPing } from "../lib/ping-budget.mjs";
+
+const [cmd, ...rest] = process.argv.slice(2);
+const json = rest.includes("--json");
+
+try {
+  if (cmd === "check") {
+    const v = checkPingBudget();
+    if (json) console.log(JSON.stringify(v));
+    else console.log(v.ok ? `ok: ${v.detail}` : `${v.gate}: ${v.detail}`);
+    process.exit(v.ok ? 0 : 1);
+  } else if (cmd === "record") {
+    const today = recordPing();
+    console.log(json ? JSON.stringify(today) : `recorded: ${today.pings} pings on ${today.date}`);
+    process.exit(0);
+  } else {
+    console.error("usage: ping-budget check|record [--json]");
+    process.exit(2);
+  }
+} catch (e) {
+  console.error(`ping-budget: ${e.message}`);
+  process.exit(3);
+}

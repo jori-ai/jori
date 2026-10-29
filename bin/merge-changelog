@@ -1,0 +1,119 @@
+#!/usr/bin/env python3
+"""merge-changelog — git merge driver for append-only changelogs.
+
+    merge-changelog <base> <ours> <theirs>      (git passes %O %A %B)
+
+Why: every change to Jori prepends a dated bullet under "## Recent changes"
+in system/changelog.md (Rule #1; the section lived in
+system/architecture.md until 2026-10-24). When the laptop and the mini each
+commit one, a rebase sees two insertions at the same line and stops — that was
+the one conflict `jori-sync` still handed to a human after 2026-09-08, and it
+recurs by construction because the file is edited on every change.
+
+What it does: runs git's own 3-way merge, then looks at each conflict hunk. A
+hunk where BOTH sides consist only of whole changelog bullets (lines that open
+with a dated bullet, plus that bullet's continuation lines) is resolved by
+keeping both — ours first, then theirs, identical bullets once. Any other
+hunk — an edited sentence, a moved section — is left as a real conflict with
+markers, and the driver exits 1 so git reports it exactly as it would have.
+
+This is a structural test (does the line start a dated bullet?), never a
+reading of what the bullet says.
+
+Wired by .gitattributes (`merge=changelog`) and the local git config
+`merge.changelog.driver`, which jori-sync sets on each host it runs on.
+"""
+import re
+import subprocess
+import sys
+
+BULLET = re.compile(r"^- \d{4}-\d{2}-\d{2}\b")
+MARK_OURS = "<<<<<<< "
+MARK_SEP = "=======\n"
+MARK_THEIRS = ">>>>>>> "
+
+
+def only_bullets(lines):
+    """Every line either opens a dated bullet or continues one (indented /
+    blank); and at least one bullet is present."""
+    if not any(BULLET.match(l) for l in lines):
+        return False
+    seen_bullet = False
+    for l in lines:
+        if BULLET.match(l):
+            seen_bullet = True
+            continue
+        if not seen_bullet:
+            return False
+        if l.strip() == "" or l.startswith("  "):
+            continue
+        return False
+    return True
+
+
+def resolve(merged_lines):
+    out, i, unresolved = [], 0, 0
+    n = len(merged_lines)
+    while i < n:
+        line = merged_lines[i]
+        if not line.startswith(MARK_OURS):
+            out.append(line)
+            i += 1
+            continue
+        # conflict hunk
+        j = i + 1
+        ours = []
+        while j < n and merged_lines[j] != MARK_SEP:
+            ours.append(merged_lines[j]); j += 1
+        k = j + 1
+        theirs = []
+        while k < n and not merged_lines[k].startswith(MARK_THEIRS):
+            theirs.append(merged_lines[k]); k += 1
+        if j >= n or k >= n:
+            # malformed — keep as is
+            out.extend(merged_lines[i:]); unresolved += 1
+            break
+        if only_bullets(ours) and only_bullets(theirs):
+            keep = list(ours)
+            ours_set = {l for l in ours if BULLET.match(l)}
+            skip = False
+            for l in theirs:
+                if BULLET.match(l):
+                    skip = l in ours_set
+                if not skip:
+                    keep.append(l)
+            out.extend(keep)
+        else:
+            out.extend(merged_lines[i:k + 1]); unresolved += 1
+        i = k + 1
+    return out, unresolved
+
+
+def main(argv):
+    if len(argv) != 4:
+        sys.stderr.write("usage: merge-changelog <base> <ours> <theirs>\n")
+        return 2
+    base, ours, theirs = argv[1:4]
+    r = subprocess.run(["git", "merge-file", "-p", "-L", "ours", "-L", "base", "-L", "theirs", ours, base, theirs],
+                       capture_output=True, text=True)
+    # merge-file exits with the number of conflicts (>0), <0 on error
+    if r.returncode < 0:
+        sys.stderr.write(r.stderr)
+        return 2
+    merged = r.stdout.splitlines(keepends=True)
+    if r.returncode == 0:
+        with open(ours, "w") as f:
+            f.write(r.stdout)
+        return 0
+    resolved, unresolved = resolve(merged)
+    with open(ours, "w") as f:
+        f.write("".join(resolved))
+    if unresolved:
+        sys.stderr.write(f"merge-changelog: {unresolved} hunk(s) are not plain changelog bullets — left as conflicts\n")
+        return 1
+    sys.stderr.write(f"merge-changelog: {r.returncode} changelog hunk(s) resolved by keeping both sides\n")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

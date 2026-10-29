@@ -1,0 +1,112 @@
+#!/bin/bash
+# runner-update — keep the self-hosted GitHub Actions runners (~/actions-runner*)
+# on the latest release, updating IN PLACE.
+#
+# Why: the runners have "disableUpdate": true in .runner (2026-10-03). Their own
+# self-updater unpacked every release into fresh bin.<ver>/externals.<ver> dirs,
+# so the bundled node got a new path each time and macOS raised a fresh batch of
+# "node" privacy prompts per runner per release. Here bin/ and externals/ are
+# real dirs whose contents are swapped, so paths never change; the bundled node
+# is Node.js-Foundation-signed, so any grant survives. GitHub stops queueing
+# jobs to a runner ~30 days behind the latest release — hence the weekly cron.
+#
+# Per runner: skip if current or busy (a job running); else stop the service,
+# swap bin/ + externals/ + top-level scripts, start it, and require "Listening
+# for Jobs" in the new _diag log within 120s — otherwise roll back.
+# .runner/.credentials/_work are never touched.
+#
+# Usage: runner-update [--dry-run]   (RUNNER_UPDATE_FORCE=<dir-name> reinstalls
+#        that one runner even when current — for testing the swap path)      Log: agent/logs/runner-update.log
+# Exits non-zero (and pushes a jori-notify) if any runner failed to update.
+
+set -uo pipefail
+export PATH=/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin
+
+DRY=0; [ "${1:-}" = "--dry-run" ] && DRY=1
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../agent/scripts/lib/root.sh"   # JORI_INSTALL_TOOLS
+log() { echo "$(date '+%F %T') $*"; }
+
+rel="$(gh api repos/actions/runner/releases/latest)" || { log "ERROR: cannot read latest release"; exit 1; }
+LATEST="$(jq -r '.tag_name' <<<"$rel" | sed 's/^v//')"
+ASSET="actions-runner-osx-$(uname -m | sed 's/x86_64/x64/')-$LATEST.tar.gz"
+URL="$(jq -r --arg n "$ASSET" '.assets[] | select(.name==$n) | .browser_download_url' <<<"$rel")"
+SHA="$(jq -r --arg n "$ASSET" '.assets[] | select(.name==$n) | .digest' <<<"$rel" | sed 's/^sha256://')"
+[ -n "$URL" ] && [ -n "$SHA" ] && [ "$SHA" != null ] || { log "ERROR: no $ASSET (or digest) in release $LATEST"; exit 1; }
+
+tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
+pkg=""
+fetch() {
+  [ -n "$pkg" ] && return 0
+  curl -fsSL -o "$tmp/$ASSET" "$URL" || return 1
+  echo "$SHA  $tmp/$ASSET" | shasum -a 256 -c - >/dev/null || { log "ERROR: checksum mismatch for $ASSET"; return 1; }
+  mkdir "$tmp/new" && tar xzf "$tmp/$ASSET" -C "$tmp/new" || return 1
+  pkg="$tmp/new"
+}
+
+listening_since() { # dir, epoch → 0 when a _diag log newer than epoch says Listening
+  local f; f="$(ls -t "$1"/_diag/Runner_*.log 2>/dev/null | head -1)"
+  [ -n "$f" ] && [ "$(stat -f %m "$f")" -ge "$2" ] && grep -q "Listening for Jobs" "$f"
+}
+
+# Replace a dir-or-symlink with the new contents at the same, unversioned path.
+swap() { # runner-dir, name
+  local d="$1" n="$2"
+  rm -rf "$d/$n.prev"
+  mv "$d/$n" "$d/$n.prev"
+  cp -R "$pkg/$n" "$d/$n"
+}
+restore() { # runner-dir, name
+  local d="$1" n="$2"
+  [ -e "$d/$n.prev" ] || [ -L "$d/$n.prev" ] || return 0
+  rm -rf "$d/$n"; mv "$d/$n.prev" "$d/$n"
+}
+
+# svc.sh uses `launchctl load/unload`, which fails outside the GUI session
+# (i.e. from cron); bootout/bootstrap address gui/<uid> directly. .service
+# holds the runner's LaunchAgent plist path.
+svc() { # runner-dir, stop|start
+  local plist label; plist="$(cat "$1/.service")"; label="$(basename "$plist" .plist)"
+  if [ "$2" = stop ]; then launchctl bootout "gui/$(id -u)/$label" 2>/dev/null; sleep 3
+  else launchctl bootstrap "gui/$(id -u)" "$plist"; fi
+}
+
+failed=()
+for d in "$HOME"/actions-runner*; do
+  [ -f "$d/.runner" ] && [ -f "$d/.service" ] || continue
+  name="${d##*/}"
+  cur="$("$d/bin/Runner.Listener" --version 2>/dev/null)"
+  if [ "$cur" = "$LATEST" ] && [ "${RUNNER_UPDATE_FORCE:-}" != "$name" ]; then log "$name: current ($cur)"; continue; fi
+  if pgrep -f "$d/bin[^ ]*/Runner.Worker" >/dev/null; then
+    log "$name: busy (job running) — will retry next run ($cur → $LATEST)"; continue
+  fi
+  if [ $DRY = 1 ]; then log "$name: would update $cur → $LATEST"; continue; fi
+  fetch || { log "ERROR: download/verify failed"; failed+=("$name"); continue; }
+
+  log "$name: updating $cur → $LATEST"
+  svc "$d" stop
+  swap "$d" bin; swap "$d" externals
+  for f in "$pkg"/*; do [ -f "$f" ] && cp -p "$f" "$d/"; done   # config.sh, run.sh, …
+  started="$(date +%s)"
+  svc "$d" start
+
+  ok=0
+  for _ in $(seq 1 24); do sleep 5; listening_since "$d" "$started" && { ok=1; break; }; done
+  if [ $ok = 1 ]; then
+    rm -rf "$d/bin.prev" "$d/externals.prev" "$d"/bin.2.* "$d"/externals.2.*
+    log "$name: OK on $("$d/bin/Runner.Listener" --version)"
+  else
+    log "$name: not listening after update — rolling back to $cur"
+    svc "$d" stop
+    restore "$d" bin; restore "$d" externals
+    svc "$d" start
+    failed+=("$name")
+  fi
+done
+
+if [ ${#failed[@]} -gt 0 ]; then
+  msg="Runner update to $LATEST failed: ${failed[*]} (rolled back) — see agent/logs/runner-update.log"
+  log "$msg"
+  "$JORI_INSTALL_TOOLS/bin/jori-notify" "$msg" >/dev/null 2>&1 || true
+  exit 1
+fi
+exit 0
