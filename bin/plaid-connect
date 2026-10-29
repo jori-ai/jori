@@ -1,0 +1,439 @@
+#!/usr/bin/env node
+"use strict";
+// plaid-connect — one-time setup CLI for connecting a bank via Plaid.
+//
+// The ONLY non-headless step in the whole integration: most banks are OAuth
+// institutions, so the first connection requires a human to log in and
+// approve once, in a browser. We use Plaid Hosted Link so there is no frontend
+// to build — `link` prints a URL you open, and `finish` collects the result
+// server-side. After this, plaid-sync runs headless indefinitely.
+//
+// Usage:
+//   plaid-connect link [--user <id>] [--products transactions,auth]
+//       → creates a Hosted Link session, prints the URL to open in a browser.
+//   plaid-connect finish
+//       → after you finish in the browser, exchanges the token and stores it.
+//   plaid-connect sandbox [--institution ins_127989]
+//       → SANDBOX ONLY: mints + exchanges a token with no browser, to prove the
+//         pipeline end-to-end. (ins_127989 is a Plaid sandbox test bank.)
+//   plaid-connect status
+//       → list connected Items and their status.
+//   plaid-connect webhook [--url <url>] [--item <id>] [--clear] [--dry-run]
+//       → point Items at the webhook that makes the sync event-driven. Safe on
+//         a live Item: /item/webhook/update changes only the callback address,
+//         it does NOT re-link, so the history window is untouched. Defaults to
+//         PLAID_WEBHOOK_URL from .env, else `plaid_webhook_url` in
+//         agent/local/config/finance.json.
+//   plaid-connect remove --item <id> [--institution <name>] --yes [--reason "..."]
+//       → permanently disconnects an Item at Plaid (/item/remove) for an account
+//         that is gone for good — closed, cancelled — with no replacement link.
+//         Different from `relink`: relink removes-then-relinks the SAME
+//         institution to widen history; `remove` is the end of the line for
+//         this Item. Requires --yes. Does not touch Supabase rows — those are
+//         a separate, deliberate cleanup (see docs/plaid-setup.md § Fully
+//         disconnecting an Item).
+
+const plaid = require("../lib/plaid-api.js");
+const { instance, localConfig } = require("../lib/instance.cjs");
+
+// This installation's public webhook route (the supervisor's /plaid-webhook
+// behind its tunnel). Unset → Items are linked without a webhook and the
+// scheduled sync is the only trigger.
+const DEFAULT_WEBHOOK_URL = localConfig("finance", { plaid_webhook_url: "" }).plaid_webhook_url || "";
+const store = require("../lib/plaid-store.js");
+
+// Plaid's stable client_user_id for this installation's one user.
+const DEFAULT_USER = instance().owner_id;
+
+function parseFlags(argv) {
+  const flags = {};
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (!a.startsWith("--")) continue;
+    // A flag whose next argument is another flag (or which ends the line) is a
+    // boolean. Consuming unconditionally made a trailing `--yes` parse as
+    // undefined — which silently read as "not confirmed" and made the one
+    // confirmation gate in this tool impossible to satisfy.
+    const next = argv[i + 1];
+    if (next === undefined || next.startsWith("--")) {
+      flags[a.slice(2)] = true;
+    } else {
+      flags[a.slice(2)] = next;
+      i++;
+    }
+  }
+  return flags;
+}
+
+// Where Plaid should call when an Item has new data. Every link path passes
+// this, so a new Item is event-driven from birth rather than waiting for
+// someone to remember `plaid-connect webhook`.
+function webhookUrl() {
+  return process.env.PLAID_WEBHOOK_URL || DEFAULT_WEBHOOK_URL || undefined;
+}
+
+async function recordItem(accessToken, itemId) {
+  // Look up the institution so we store a human-readable name alongside the token.
+  let institutionId = null;
+  let institutionName = null;
+  try {
+    const item = await plaid.getItem(accessToken);
+    institutionId = item.item && item.item.institution_id;
+    if (institutionId) {
+      const inst = await plaid.getInstitution(institutionId);
+      institutionName = inst.institution && inst.institution.name;
+    }
+  } catch (e) {
+    console.warn(`(could not resolve institution name: ${e.message})`);
+  }
+  store.upsertItem({
+    item_id: itemId,
+    access_token: accessToken,
+    institution_id: institutionId,
+    institution_name: institutionName,
+    status: "active",
+    cursor: null,
+    added_at: new Date().toISOString(),
+    last_synced_at: null,
+  });
+  return institutionName || institutionId || itemId;
+}
+
+async function cmdLink(flags) {
+  const userId = flags.user || DEFAULT_USER;
+  const products = (flags.products || "transactions").split(",").map((s) => s.trim());
+  const count = Math.max(1, Math.min(10, parseInt(flags.count || "1", 10) || 1));
+  store.setEnv(plaid.env());
+  const urls = [];
+  for (let i = 0; i < count; i++) {
+    const resp = await plaid.createLinkToken({ userId, products, webhook: webhookUrl() });
+    store.addPendingLinks([resp.link_token]);
+    urls.push(resp.hosted_link_url);
+  }
+  console.log(`\nEnvironment: ${plaid.env()}`);
+  console.log(`Products:    ${products.join(", ")}`);
+  if (count === 1) {
+    console.log("\n── Open this URL in a browser, log into your bank, and approve ──\n");
+    console.log(`  ${urls[0]}\n`);
+  } else {
+    console.log(`\n── Open one URL per institution-login you want to add (in one`);
+    console.log(`   browser sitting), pick the issuer, log in, and approve. Extra/unused`);
+    console.log(`   URLs expire harmlessly. ──\n`);
+    urls.forEach((u, i) => console.log(`  ${i + 1}.  ${u}`));
+    console.log("");
+  }
+  console.log("When you've finished in the browser, run:\n");
+  console.log("  plaid-connect finish\n");
+}
+
+async function cmdFinish() {
+  const pending = store.getPendingLinks();
+  if (!pending.length) {
+    console.error("No pending Link sessions. Run `plaid-connect link` first.");
+    process.exit(1);
+  }
+  const connected = [];
+  let stillOpen = 0;
+  for (const p of pending) {
+    let publicToken = null;
+    try {
+      publicToken = plaid.extractPublicToken(await plaid.getLinkToken(p.link_token));
+    } catch (e) {
+      console.warn(`(could not read a Link session: ${e.message})`);
+    }
+    if (!publicToken) {
+      stillOpen++;
+      continue;
+    }
+    try {
+      const exchange = await plaid.exchangePublicToken(publicToken);
+      const name = await recordItem(exchange.access_token, exchange.item_id);
+      store.removePendingLink(p.link_token);
+      connected.push({ name, item_id: exchange.item_id });
+    } catch (e) {
+      // Expired public token or already-exchanged → drop it so it stops retrying.
+      console.warn(`(skipped a session: ${e.message})`);
+      store.removePendingLink(p.link_token);
+    }
+  }
+  if (!connected.length) {
+    console.error(
+      "\nNo completed Link results yet — finish logging in via the Hosted Link URL(s),\n" +
+        "then re-run `plaid-connect finish`."
+    );
+    process.exit(2);
+  }
+  console.log(`\nConnected ${connected.length} institution${connected.length > 1 ? "s" : ""}:`);
+  for (const c of connected) console.log(`  • ${c.name}  (item_id ${c.item_id})`);
+  if (stillOpen) console.log(`\n${stillOpen} Link session(s) not completed yet — re-run \`plaid-connect finish\` after finishing them.`);
+  console.log("\nRun `plaid-sync` to pull balances + transactions.\n");
+}
+
+async function cmdSandbox(flags) {
+  if (plaid.env() !== "sandbox") {
+    console.error("`sandbox` only works when PLAID_ENV=sandbox.");
+    process.exit(1);
+  }
+  const institutionId = flags.institution || "ins_127989"; // a Plaid sandbox test bank
+  const pt = await plaid.sandboxPublicToken({ institutionId });
+  const exchange = await plaid.exchangePublicToken(pt.public_token);
+  store.setEnv("sandbox");
+  const name = await recordItem(exchange.access_token, exchange.item_id);
+  console.log(`\n[sandbox] Connected: ${name}  (item_id ${exchange.item_id})`);
+  console.log("Run `plaid-sync` to pull balances + transactions.\n");
+}
+
+function cmdStatus() {
+  const items = store.getItems();
+  console.log(`Environment: ${store.getEnv() || plaid.env()}`);
+  if (!items.length) {
+    console.log("No connected Items. Run `plaid-connect link` (or `sandbox`).");
+    return;
+  }
+  for (const it of items) {
+    console.log(
+      `\n• ${it.institution_name || it.institution_id || "(unknown bank)"}\n` +
+        `    item_id:      ${it.item_id}\n` +
+        `    status:       ${it.status}\n` +
+        `    last_synced:  ${it.last_synced_at || "never"}`
+    );
+  }
+}
+
+// Update mode: re-link an EXISTING Item to add a product/consent (e.g. add
+// `liabilities` to a card linked transactions-only). Same Item — keeps the
+// transaction history + cursor; the user just re-approves to grant the new
+// consent. No public-token exchange needed afterward (the existing access
+// token gains the product); run `plaid-sync` to pull the new data.
+async function cmdUpdate(flags) {
+  const items = store.getItems();
+  let target;
+  if (flags.item) target = items.find((i) => i.item_id === flags.item);
+  else if (flags.institution) target = items.find((i) => (i.institution_name || "").toLowerCase().includes(flags.institution.toLowerCase()));
+  if (!target) {
+    console.error("Specify --item <item_id> or --institution <name>. Connected:");
+    for (const it of items) console.error(`  ${it.institution_name} — ${it.item_id}`);
+    process.exit(1);
+  }
+  // Default is `transactions` alone, NOT `transactions,liabilities` (fixed
+  // 2026-08-09). The liabilities product was never enabled on this Plaid client
+  // and its adoption was declined on 2026-07-20 (the card issuers already send
+  // their own due-date alerts), so asking for it made every invocation fail with
+  // `INVALID_PRODUCT — Your account is not enabled for liabilities` before it
+  // could even print a URL. That broke the ONE command that repairs a card in
+  // `login_required`, which is exactly when you need it (it blocked a card
+  // re-auth). Pass `--products` explicitly if a future product is ever added.
+  const products = (flags.products || "transactions").split(",").map((s) => s.trim());
+  const resp = await plaid.createLinkToken({ userId: flags.user || DEFAULT_USER, products, accessToken: target.access_token, webhook: webhookUrl() });
+  store.addPendingLinks([resp.link_token]);
+  console.log(`\nUpdate (re-consent) for: ${target.institution_name} (${target.item_id})`);
+  console.log(`Adding products: ${products.join(", ")}`);
+  console.log("\n── Open this URL, log in, and APPROVE the additional access ──\n");
+  console.log(`  ${resp.hosted_link_url}\n`);
+  console.log("Same card, same history — you're just re-granting consent.");
+  console.log("When done, run:  plaid-sync\n");
+}
+
+/**
+ * Replace an Item so it can be linked with a wider history window.
+ *
+ * An Item's transaction-history depth is fixed when Transactions is first added
+ * to it. Plaid does not let update mode raise it — verified the hard way: a
+ * re-consent with days_requested=730 reported a clean sync and still returned
+ * zero 2025 transactions, because "the maximum amount of transaction history to
+ * request on an Item cannot be updated if Transactions has already been added".
+ * Their documented remedy is to remove the Item and link a new one, which is
+ * what this does.
+ *
+ * `--yes` is required. This disconnects a working bank connection, and the only
+ * way back is the user logging into the bank again — not something to trigger
+ * by autocompleting a command.
+ *
+ * The old item_id is recorded as superseded before removal. The replacement
+ * Item issues NEW account ids for the same cards, so every row already in
+ * Supabase becomes stale; that record is the only way to find them afterwards.
+ * They are NOT deleted here — the old data is the fallback if the new link
+ * comes back with less history than hoped, so it stays until the replacement is
+ * verified. Clean up with `plaid-cleanup-superseded` once it is.
+ */
+async function cmdRelink(flags) {
+  const items = store.getItems();
+  const target = flags.item
+    ? items.find((i) => i.item_id === flags.item)
+    : flags.institution
+      ? items.find((i) => (i.institution_name || "").toLowerCase().includes(flags.institution.toLowerCase()))
+      : null;
+
+  if (!target) {
+    console.error("Specify --item <item_id> or --institution <name>. Connected:");
+    for (const it of items) console.error(`  ${it.institution_name} — ${it.item_id}`);
+    process.exit(1);
+  }
+
+  if (!flags.yes) {
+    console.error(`\nThis DISCONNECTS ${target.institution_name} (${target.item_id}) at Plaid.`);
+    console.error("You will have to log into the bank again to restore it.");
+    console.error("\nRe-run with --yes if that is what you want.\n");
+    process.exit(1);
+  }
+
+  const products = (flags.products || "transactions").split(",").map((s) => s.trim());
+
+  console.log(`\nRemoving ${target.institution_name} (${target.item_id}) at Plaid…`);
+  await plaid.removeItem(target.access_token);
+  store.removeItem(target.item_id, "relinked for a wider transaction history window");
+  console.log("  removed. Old rows in Supabase are now stale but kept as a fallback.");
+
+  const resp = await plaid.createLinkToken({ userId: flags.user || DEFAULT_USER, products, webhook: webhookUrl() });
+  store.addPendingLinks([resp.link_token]);
+
+  console.log(`\n── Open this URL, log in, and approve — this is a NEW connection ──\n`);
+  console.log(`  ${resp.hosted_link_url}\n`);
+  console.log("Then run:  plaid-connect finish  &&  plaid-sync\n");
+}
+
+/**
+ * Permanently disconnect an Item at Plaid — for an account that is gone for
+ * good (closed, cancelled), with no relink to follow.
+ *
+ * This is `relink`'s remove-half without the relink-half: same
+ * `/item/remove` + `store.removeItem` call, but there is no new Hosted Link
+ * session afterward. `--yes` is required for the same reason as `relink` —
+ * the access token dies with the Item, and undoing this means logging into
+ * the institution again from scratch (or, if the account is truly closed,
+ * not being possible at all).
+ *
+ * Deliberately does NOT touch Supabase. `plaid_accounts` / `plaid_holdings`
+ * rows are a separate, deliberate cleanup — see the operator instructions in
+ * docs/plaid-setup.md § Fully disconnecting an Item. Unlike a relink,
+ * there is no live replacement Item to merge stale rows into, so
+ * `plaid-cleanup-superseded` (which only merges onto a covering live Item)
+ * does not apply here; the rows are deleted outright once removal at Plaid
+ * is confirmed.
+ */
+async function cmdRemove(flags) {
+  const items = store.getItems();
+  const target = flags.item
+    ? items.find((i) => i.item_id === flags.item)
+    : flags.institution
+      ? items.find((i) => (i.institution_name || "").toLowerCase().includes(flags.institution.toLowerCase()))
+      : null;
+
+  if (!target) {
+    console.error("Specify --item <item_id> or --institution <name>. Connected:");
+    for (const it of items) console.error(`  ${it.institution_name} — ${it.item_id}`);
+    process.exit(1);
+  }
+
+  if (!flags.yes) {
+    console.error(`\nThis PERMANENTLY DISCONNECTS ${target.institution_name} (${target.item_id}) at Plaid.`);
+    console.error("No new link will be started — use `relink` instead if you want to reconnect immediately.");
+    console.error("\nRe-run with --yes if that is what you want.\n");
+    process.exit(1);
+  }
+
+  const reason = flags.reason || "removed via plaid-connect remove";
+  console.log(`\nRemoving ${target.institution_name} (${target.item_id}) at Plaid…`);
+  await plaid.removeItem(target.access_token);
+  store.removeItem(target.item_id, reason);
+  console.log("  removed. Access token invalidated.");
+  console.log(`\nStale rows remain in plaid_accounts / plaid_holdings / plaid_transactions`);
+  console.log(`for item_id ${target.item_id} — clean those up per`);
+  console.log(`docs/plaid-setup.md § Fully disconnecting an Item.\n`);
+}
+
+/**
+ * Register (or clear) the webhook URL on connected Items.
+ *
+ * Why this is not part of `link`: every Item here was linked before the webhook
+ * existed, and re-linking to attach one would reset the transaction history
+ * window — which cannot be widened afterwards. /item/webhook/update is the
+ * documented way to change the address on a live Item, and it costs nothing.
+ *
+ * Plaid confirms by firing ITEM/WEBHOOK_UPDATE_ACKNOWLEDGED at the NEW url, so
+ * a successful run here is also an end-to-end test of the tunnel, the route and
+ * the signature check. Watch for it:
+ *   tail -f agent/logs/plaid-sync.log
+ */
+async function cmdWebhook(flags) {
+  const clear = flags.clear === true;
+  const url = clear ? null : (flags.url || process.env.PLAID_WEBHOOK_URL || DEFAULT_WEBHOOK_URL);
+  if (!clear && !url) {
+    console.error("No webhook URL: pass --url, set PLAID_WEBHOOK_URL, or set plaid_webhook_url in agent/local/config/finance.json.");
+    process.exit(1);
+  }
+  if (!clear && !/^https:\/\//.test(url)) {
+    console.error(`Refusing to register a non-HTTPS webhook: ${url}`);
+    process.exit(1);
+  }
+
+  let items = store.getItems().filter((i) => i.access_token);
+  if (flags.item) items = items.filter((i) => i.item_id === flags.item);
+  if (!items.length) {
+    console.error(flags.item ? `No connected Item with id ${flags.item}.` : "No connected Items.");
+    process.exit(1);
+  }
+
+  console.log(clear ? "Clearing webhook on:" : `Registering webhook: ${url}\n`);
+  let ok = 0;
+  for (const item of items) {
+    const label = item.institution_name || item.item_id;
+    if (flags["dry-run"]) { console.log(`  · ${label} — would ${clear ? "clear" : "set"}`); continue; }
+    try {
+      const res = await plaid.updateItemWebhook(item.access_token, url);
+      const applied = (res && res.item && res.item.webhook) || "(none)";
+      console.log(`  ✓ ${label} → ${applied}`);
+      ok++;
+    } catch (e) {
+      // One bad Item must not strand the rest — a login_required Item still
+      // rejects this call, and the others should still end up wired.
+      console.error(`  ✗ ${label} — ${e.message}`);
+    }
+  }
+  if (!flags["dry-run"]) {
+    console.log(`\n${ok}/${items.length} Item(s) updated.`);
+    if (ok) console.log("Expect ITEM/WEBHOOK_UPDATE_ACKNOWLEDGED in agent/logs/plaid-sync.log within seconds.");
+  }
+}
+
+async function main() {
+  const [cmd, ...rest] = process.argv.slice(2);
+  const flags = parseFlags(rest);
+  try {
+    switch (cmd) {
+      case "link":
+        await cmdLink(flags);
+        break;
+      case "finish":
+        await cmdFinish();
+        break;
+      case "update":
+        await cmdUpdate(flags);
+        break;
+      case "relink":
+        await cmdRelink(flags);
+        break;
+      case "remove":
+        await cmdRemove(flags);
+        break;
+      case "sandbox":
+        await cmdSandbox(flags);
+        break;
+      case "status":
+        cmdStatus();
+        break;
+      case "webhook":
+        await cmdWebhook(flags);
+        break;
+      default:
+        console.error("Usage: plaid-connect <link|finish|update|relink|remove|sandbox|status|webhook> [flags]");
+        process.exit(1);
+    }
+  } catch (e) {
+    console.error(`Error: ${e.message}`);
+    if (e.plaid) console.error(JSON.stringify(e.plaid, null, 2));
+    process.exit(1);
+  }
+}
+
+main();
