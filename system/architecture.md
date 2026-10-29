@@ -632,7 +632,6 @@ Kernel code carries generic defaults only; an installation's own values and beha
 - **Registries** — kernel file + `agent/local/<name>.json`, merged by `lib/registry.cjs` (§ Scheduled Tasks).
 - **Behaviour** — `_ext/` modules next to the calling kernel code, loaded by `lib/ext-hooks.mjs` (`loadHook` / `runHook`; a missing or failing hook falls back to the generic path). Each `_ext/` dir's `.gitkeep` documents its contract. The hook points:
   - `lib/_ext/choice-handlers.mjs` — choice-card and checklist tap handlers for the installation's own card kinds (location cards included; `lib/choice-reply.mjs` `loadExtHandlers`);
-  - `lib/_ext/watches.mjs` — the watch engine `hum-sense` offers every fresh event to (`spoolEvents(events)`); without it, and without `bin/watch`, hum runs with no watches;
   - `lib/_ext/context-sources/*.mjs` — extra `context-sync` sources (`export default { name, describe, async sync({ cm, wiki, run, BIN, DATA }) }`; run by `context-sync <name>` and after the kernel sources by `all`; kernel names win);
   - `lib/_ext/jori-context.cjs` — extra context sources (`lib/jori-context.js`);
   - `lib/_ext/claim-freshness-timeline.mjs` — the travel timeline CLI for claim-freshness Stage 2b;

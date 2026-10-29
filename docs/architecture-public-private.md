@@ -64,7 +64,6 @@ Optional; a missing hook means the generic path, and each dir's `.gitkeep` docum
 | Hook | Loaded by | For |
 |---|---|---|
 | `lib/_ext/choice-handlers.mjs` | `lib/choice-reply.mjs` | tap handlers for your own card kinds |
-| `lib/_ext/watches.mjs` | `bin/hum-sense` | a watch engine offered every event |
 | `lib/_ext/context-sources/*.mjs` | `bin/context-sync` | extra indexed sources |
 | `lib/_ext/jori-context.cjs` | `lib/jori-context.js` | extra context tables (tastes, profile, projects) |
 | `lib/_ext/presence.mjs` | `lib/claim-facts.mjs`, hum locality | where you are on a date (travel timeline) |

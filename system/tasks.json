@@ -428,6 +428,24 @@
       ],
       "description": "Nightly wide-window inbox re-index + prune. Repairs whatever the 20-minute short window missed (outage, burst past --max) and bounds index growth at 120 days.",
       "trigger_args": "--deep"
+    },
+    {
+      "name": "watch-review",
+      "schedule": "29 8 * * 1",
+      "schedule_human": "Mondays at 8:29 AM",
+      "trigger_script": "agent/scripts/trigger-watch-review.sh",
+      "webhook_url": "http://localhost:9082",
+      "webhook_task": "watch-review",
+      "delivers_to": "email",
+      "phrases": [
+        "watch review",
+        "reminder review",
+        "how are the watches doing",
+        "watch scorecard",
+        "reminder coverage"
+      ],
+      "description": "Weekly scorecard + coverage audit of the watch engine: every reminder request in the week's chat became a watch? did watches fire on time, reach the user, help? Ships <=3 fixes, keeps data/watch-review/history.jsonl, emails only when something happened.",
+      "job": "watch-review"
     }
   ]
 }
