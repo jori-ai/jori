@@ -228,3 +228,75 @@ test("morning brief events: only the metro the user is in, and only near-zone re
 test("templates: unknown placeholders are left as written", () => {
   assert.equal(L.fill("{n} new{s} {nope}", { n: 2, s: "s" }), "2 news {nope}");
 });
+
+test("web_search lane: one capped search adds dated future events; past, undated and failures add nothing", async () => {
+  const calls = [];
+  const run = async (o) => { calls.push(o); return { events: [
+    { title: "Hall Sing Night", date: "2026-11-20", time: "19:30", venue: "Hall A", city: "Home City", url: "https://x/a" },
+    { title: "Old Night", date: "2026-10-01", time: "", venue: "Hall A", city: "Home City", url: "https://x/b" },
+    { title: "Someday", date: "", time: "", venue: "Hall B", city: "Home City", url: "https://x/c" },
+  ] }; };
+  const lane = L.buildLane("sing-lane", { groups: ["sing"], web_search: { ask: "Find sing nights at Hall A.", category: "singing", max_searches: 3 }, sections: ["show"] }, {}, { judge: run });
+  const rows = await lane.extraCandidates({ today: "2026-10-30", log: () => {} });
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].webSearch, true);
+  assert.match(calls[0].system, /at most 3 web searches/);
+  assert.match(calls[0].prompt, /^Today is 2026-10-30\. Find sing nights at Hall A\./);
+  assert.deepEqual(rows.map((r) => [r.title, r.date, r.time, r.venue, r.source, r.category]), [["Hall Sing Night", "2026-11-20", "19:30", "Hall A", "web-sing-lane", "singing"]]);
+
+  const failing = L.buildLane("sing-lane", { web_search: { ask: "x" } }, {}, { judge: async () => { throw new Error("timeout"); } });
+  assert.deepEqual(await failing.extraCandidates({ today: "2026-10-30" }), []);
+  const fatal = L.buildLane("sing-lane", { web_search: { ask: "x" } }, {}, { judge: async () => { throw Object.assign(new Error("not on Max"), { fatal: true }); } });
+  await assert.rejects(() => fatal.extraCandidates({ today: "2026-10-30" }), /not on Max/);
+  assert.equal(L.buildLane("plain", { groups: ["g"] }).extraCandidates, undefined, "no web_search, no watchlist: store rows only");
+});
+
+test("also_to: every email of the lane also goes to each extra recipient; one failing does not stop the rest", async () => {
+  const { sent, send } = stubSend();
+  const failing = { ...send, email: (m) => { if (m.to === "bad@example.com") throw new Error("send failed"); send.email(m); } };
+  const c = { groups: ["g"], sections: ["show"], deliver: { mode: "email", subject: "Shows — {n}", also_to: ["bad@example.com", "friend@example.com"] } };
+  await L.buildLane("duo-lane", c, {}, { send: failing }).deliver([pick({ title: "Duo", pick: { section: "show", why: "." } })], { today: "2026-10-30" });
+  assert.deepEqual(sent.email.map((m) => m.to ?? "owner"), ["owner", "friend@example.com"]);
+  assert.equal(sent.email[1].subject, "Shows — 1");
+  assert.equal(sent.label.length, 1, "labelled once");
+});
+
+test("a browsing-skill row's start in its own field (date_field) gives the date and the clock", async () => {
+  const F = await import("../lib/venue-events/fetchers.mjs");
+  const src = { key: "cinema", venue: "Cinema A", category: "film", date_field: "showTimeLocal" };
+  const rows = F.cdpRows(src, [{ title: "Musical Sing-Along", showTimeLocal: "2026-11-14T19:30:00", url: "https://x/s" }, { title: "No time" }], { ref: "2026-10-30" });
+  assert.deepEqual([rows[0].date, rows[0].time, rows[0].venue, rows[0].url], ["2026-11-14", "19:30", "Cinema A", "https://x/s"]);
+  assert.equal(rows[1].date, null);
+  const plain = F.cdpRows({ key: "list", venue: "V" }, [{ title: "T", isoDate: "2026-11-01", time: "8pm" }], { ref: "2026-10-30", pageUrl: "https://x/list" });
+  assert.deepEqual([plain[0].date, plain[0].time, plain[0].url], ["2026-11-01", "20:00", "https://x/list"]);
+});
+
+test("lanes_file and sources_file may be lists of private files, read in order; a missing one is skipped", async () => {
+  const C = await import("../lib/venue-events/config.mjs");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "venue-files-"));
+  const a = path.join(dir, "a.json"), b = path.join(dir, "b.json");
+  fs.writeFileSync(a, JSON.stringify({ voice: "First.", soft_block: { name: "sam" }, lanes: { one: { groups: ["g1"] }, two: { groups: ["g2"] } },
+    sources: [{ key: "s1", kind: "tm", groups: ["g1"] }], metro_tz: { metro_b: "Etc/GMT-2" }, horizon_days: 90 }));
+  fs.writeFileSync(b, JSON.stringify({ voice: "Second.", lanes: { two: { groups: ["g2b"] }, three: { groups: ["g3"] } },
+    sources: [{ key: "s2", kind: "cdp", groups: ["g3"] }], metro_tz: { metro_c: "Etc/GMT+5" } }));
+  const missing = path.join(dir, "nope.json");
+  const cfgDir = path.join(LOCAL, "config");
+  fs.writeFileSync(path.join(cfgDir, "venue-watch.json"), JSON.stringify({ lanes_file: [a, missing, b] }));
+  fs.writeFileSync(path.join(cfgDir, "venue-events.json"), JSON.stringify({ home_metro: "metro_a", sources_file: [a, missing, b] }));
+  try {
+    const wc = L.watchConfig();
+    assert.deepEqual(Object.keys(wc.lanes), ["one", "two", "three"]);
+    assert.deepEqual(wc.lanes.two.groups, ["g2b"], "a later file replaces a lane by name");
+    assert.equal(wc.voice, "First.", "other keys: the first file that has one");
+    assert.equal(W.softBlockConfig().name, "sam");
+    const vc = C.venueConfig({ fresh: true });
+    assert.deepEqual(vc.sources.map((s) => s.key), ["s1", "s2"]);
+    assert.deepEqual(vc.metro_tz, { metro_b: "Etc/GMT-2", metro_c: "Etc/GMT+5" });
+    fs.writeFileSync(b, "{ broken");
+    assert.throws(() => L.watchConfig(), /lanes_file/);
+  } finally {
+    fs.rmSync(path.join(cfgDir, "venue-watch.json"));
+    fs.writeFileSync(path.join(cfgDir, "venue-events.json"), JSON.stringify({ home_metro: "metro_a", metros: ["metro_a", "metro_b"], near_zone: "near" }));
+    C.resetVenueConfig();
+  }
+});

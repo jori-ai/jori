@@ -41,6 +41,23 @@ export function pickTopEvent(candidates, { geoGateFn, todayStr, gateCap = GATE_C
   return null;
 }
 
+/**
+ * The events in the watch jobs' `{ seen: [] }` states. A venue-watch lane keys
+ * its entries by `key` (older playbook-written ones by `id`) and also records
+ * the candidates it judged and did NOT surface (`surfaced: false`): those are
+ * not ideas to float. Exported for unit testing.
+ */
+export function seenEvents(states) {
+  const out = [];
+  for (const state of states) {
+    for (const ev of state?.seen || []) {
+      if (!ev || ev.surfaced === false) continue;
+      out.push(ev.id ? ev : { ...ev, id: ev.key });
+    }
+  }
+  return out;
+}
+
 function loadSkippedKeys() {
   const skipped = new Set();
   try {
@@ -69,13 +86,12 @@ function run() {
   }
 
   // Merge events from all watched sources
-  const seen = [];
+  const states = [];
   for (const f of SEEN_FILES) {
-    try {
-      const state = JSON.parse(fs.readFileSync(f, "utf8"));
-      seen.push(...(state.seen || []));
-    } catch { /* source not yet initialized — skip */ }
+    try { states.push(JSON.parse(fs.readFileSync(f, "utf8"))); }
+    catch { /* source not yet initialized — skip */ }
   }
+  const seen = seenEvents(states);
   if (seen.length === 0) {
     stampRun("talks", false);
     emitNull("no events in any state file");

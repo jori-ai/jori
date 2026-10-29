@@ -10,7 +10,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { pickTopEvent } from "../agent/scripts/hum-harvesters/talks.mjs";
+import { pickTopEvent, seenEvents } from "../agent/scripts/hum-harvesters/talks.mjs";
 
 const TODAY = "2026-10-06";
 
@@ -87,4 +87,17 @@ test("pickTopEvent: returns null for an empty candidate list", () => {
   const top = pickTopEvent([], { geoGateFn, todayStr: TODAY });
   assert.equal(top, null);
   assert.deepEqual(geoGateFn.calls, []);
+});
+
+test("seenEvents: a venue-watch lane's entries float by key; ones it did not surface do not", () => {
+  const states = [
+    { seen: [{ id: "old-1", title: "Playbook-written talk", date: "2026-11-01" }] },
+    { seen: [
+      { key: "series-night|hall-a|2026-11-05", title: "Series Night", date: "2026-11-05", surfaced: true },
+      { key: "routine-night|hall-a|2026-11-06", title: "Routine Night", date: "2026-11-06", surfaced: false },
+    ] },
+    {},
+  ];
+  const evs = seenEvents(states);
+  assert.deepEqual(evs.map((e) => e.id), ["old-1", "series-night|hall-a|2026-11-05"]);
 });
