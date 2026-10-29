@@ -108,6 +108,8 @@ The installation's own integrations are in `system/architecture-local.md` § Ext
 
 ## Data Stores
 
+The Supabase schema lives in the kernel at `system/migrations/` (apply with `bin/jori-migrate`; capability map in `docs/schema.md`); installation-only tables (asset histories named in `investments.json`, site-only tables) stay in the overlay's `data/migrations/`. The chat-attachments bucket is the instance setting `attachments_bucket` (default `jori-attachments`).
+
 | Path | Contents |
 |---|---|
 | `data/email-memory.db` | SQLite FTS5 of past email classifications (`email-mem` CLI) |

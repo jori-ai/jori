@@ -7,6 +7,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+process.env.JORI_ATTACHMENTS_BUCKET = "test-attachments"; // the bucket name is an instance setting (lib/instance.cjs)
 
 // A synthetic installation, set before the module reads the owner's name.
 const LOCAL = fs.mkdtempSync(path.join(os.tmpdir(), "stop-evidence-"));
@@ -92,10 +93,10 @@ test("a sent photo is a camera fix only near where he rested and inside the wind
 });
 
 test("attachment links are recognised by their storage path, nothing else", () => {
-  assert.ok(attachmentUrl("https://example-project.supabase.co/storage/v1/object/public/gandalf-attachments/8079728F/photo.jpg"));
+  assert.ok(attachmentUrl("https://example-project.supabase.co/storage/v1/object/public/test-attachments/8079728F/photo.jpg"));
   assert.equal(attachmentUrl("Having lunch here today"), null);
   assert.equal(attachmentUrl("https://example.com/photo.jpg"), null);
-  assert.equal(attachmentUrl("https://example-project.supabase.co/storage/v1/object/public/gandalf-attachments/x/doc.pdf"), null);
+  assert.equal(attachmentUrl("https://example-project.supabase.co/storage/v1/object/public/test-attachments/x/doc.pdf"), null);
 });
 
 test("candidates are measured from the REST, so the restaurant 20 m from him is in and ranked first", () => {
@@ -182,7 +183,7 @@ test("evidenceVerdict end to end on the 2026-10-08 lunch (stubbed DB, map, model
   const photoBuf = jpegWithExif({ ...fakeAt(-28.01, 15.76), dt: "2026:10:08 14:32:23", offset: "+03:00" });
   const sb = async (q) => {
     if (q.startsWith("jori_messages")) return [
-      { role: "user", content: "https://example-project.supabase.co/storage/v1/object/public/gandalf-attachments/8079/photo.jpg", created_at: "2026-10-08T12:00:57Z" },
+      { role: "user", content: "https://example-project.supabase.co/storage/v1/object/public/test-attachments/8079/photo.jpg", created_at: "2026-10-08T12:00:57Z" },
       { role: "user", content: "Having lunch here today", created_at: "2026-10-08T12:00:58Z" },
       { role: "assistant", content: "That looks like Corner Grill (גריל הפינה), the grill on the corner.", created_at: "2026-10-08T12:01:01Z" },
       { role: "user", content: "Yes! It's great. Food is delicious and portions are gigantic", created_at: "2026-10-08T12:02:16Z" },

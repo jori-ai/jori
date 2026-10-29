@@ -1,0 +1,164 @@
+#!/usr/bin/env node
+"use strict";
+// jori-migrate — create (or bring up to date) this installation's Supabase
+// schema from the kernel's system/migrations/*.sql. See docs/schema.md.
+//
+// The default is a DRY RUN: it prints the plan (the files in order and what
+// each creates) and changes nothing. Every file is idempotent, so applying
+// the whole directory again is safe.
+//
+// Usage:
+//   jori-migrate                          the plan (dry run)
+//   jori-migrate --print                  the plan plus the full SQL, in order
+//   jori-migrate --only 0010,0030         limit to files whose name starts with these prefixes
+//   jori-migrate --json                   the plan as JSON
+//   jori-migrate --allow-user <email>     add the SQL that puts <email> on the app allowlist
+//   jori-migrate --apply --project <ref>  run it against the configured project
+//
+// --apply runs only when ALL of these hold:
+//   * the installation names a project: agent/local/instance.json
+//     `supabase_project` (or JORI_SUPABASE_PROJECT);
+//   * --project <ref> repeats that same ref (so a typo or the wrong install
+//     cannot apply anywhere by accident);
+//   * a Management API token: SUPABASE_ACCESS_TOKEN, else bin/supabase-token.
+// It sends each file to the Supabase Management API's SQL endpoint
+// (POST /v1/projects/<ref>/database/query) through curl (Cloudflare refuses
+// some non-browser clients; see bin/supabase-token) and stops at the first error.
+
+const fs = require("node:fs");
+const path = require("node:path");
+const { execFileSync } = require("node:child_process");
+const { listMigrations, createdObjects } = require("../lib/schema-migrations.cjs");
+
+function parseArgs(argv) {
+  const a = { apply: false, print: false, json: false, only: [], project: "", allow: [] };
+  for (let i = 0; i < argv.length; i++) {
+    const x = argv[i];
+    if (x === "--apply") a.apply = true;
+    else if (x === "--print") a.print = true;
+    else if (x === "--json") a.json = true;
+    else if (x === "--only") a.only.push(...String(argv[++i] || "").split(",").filter(Boolean));
+    else if (x === "--project") a.project = String(argv[++i] || "");
+    else if (x === "--allow-user") a.allow.push(String(argv[++i] || "").trim().toLowerCase());
+    else if (x === "-h" || x === "--help") a.help = true;
+    else { a.bad = x; }
+  }
+  return a;
+}
+
+const sqlString = (s) => `'${String(s).replace(/'/g, "''")}'`;
+
+function allowSql(emails) {
+  if (!emails.length) return "";
+  const rows = emails.map((e) => `(${sqlString(e)})`).join(", ");
+  return `insert into public.jori_allowed_users (email) values ${rows} on conflict (email) do nothing;\n`;
+}
+
+function plan(opts) {
+  const files = listMigrations().filter((f) => !opts.only.length || opts.only.some((p) => path.basename(f).startsWith(p)));
+  return files.map((f) => {
+    const sql = fs.readFileSync(f, "utf8");
+    const o = createdObjects(sql);
+    return { file: path.relative(path.resolve(__dirname, ".."), f), sql, ...o };
+  });
+}
+
+function configuredProject() {
+  try {
+    return require("../lib/instance.cjs").instance().supabase_project || "";
+  } catch {
+    return process.env.JORI_SUPABASE_PROJECT || "";
+  }
+}
+
+function managementToken() {
+  if (process.env.SUPABASE_ACCESS_TOKEN) return process.env.SUPABASE_ACCESS_TOKEN;
+  try { return require("./supabase-token").current().access_token || ""; } catch { return ""; }
+}
+
+/** Whether --apply may proceed: a configured project, the same ref typed again, a token. */
+function applyGate({ project, flagProject, token }) {
+  if (!project) return { ok: false, reason: "no supabase_project configured (agent/local/instance.json or JORI_SUPABASE_PROJECT)" };
+  if (flagProject !== project) return { ok: false, reason: "--apply needs --project <ref> repeating the configured project" };
+  if (!token) return { ok: false, reason: "no Management API token (SUPABASE_ACCESS_TOKEN or bin/supabase-token)" };
+  return { ok: true, token };
+}
+
+function runQuery(ref, token, query) {
+  const out = execFileSync("curl", [
+    "-sS", "-w", "\n%{http_code}", "-X", "POST",
+    `https://api.supabase.com/v1/projects/${ref}/database/query`,
+    "-H", `Authorization: Bearer ${token}`,
+    "-H", "Content-Type: application/json",
+    "--data-binary", "@-",
+  ], { input: JSON.stringify({ query }), encoding: "utf8", maxBuffer: 16 * 1024 * 1024 });
+  const nl = out.lastIndexOf("\n");
+  const status = Number(out.slice(nl + 1));
+  return { status, body: out.slice(0, nl) };
+}
+
+function main(argv) {
+  const opts = parseArgs(argv);
+  if (opts.help) { process.stdout.write(fs.readFileSync(__filename, "utf8").split("\n").slice(2, 28).join("\n").replace(/^\/\/ ?/gm, "") + "\n"); return 0; }
+  if (opts.bad) { process.stderr.write(`jori-migrate: unknown argument ${opts.bad} (see --help)\n`); return 2; }
+  if (opts.allow.some((e) => !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e))) {
+    process.stderr.write("jori-migrate: --allow-user needs an email address\n"); return 2;
+  }
+
+  const steps = plan(opts);
+  if (!steps.length) { process.stderr.write("jori-migrate: no migration files matched\n"); return 1; }
+  const extra = allowSql(opts.allow);
+  const project = configuredProject();
+
+  if (opts.json) {
+    process.stdout.write(JSON.stringify({
+      project: project || null, apply: opts.apply,
+      files: steps.map(({ sql, ...rest }) => rest), allow_users: opts.allow.length,
+    }, null, 2) + "\n");
+    if (!opts.apply) return 0;
+  } else {
+    process.stdout.write(`jori-migrate: ${opts.apply ? "APPLY" : "dry run"} — ${steps.length} file(s), project ${project || "(none configured)"}\n`);
+    for (const s of steps) {
+      const what = [
+        s.tables.length && `tables: ${s.tables.join(", ")}`,
+        s.views.length && `views: ${s.views.join(", ")}`,
+        s.functions.length && `functions: ${s.functions.join(", ")}`,
+        s.buckets.length && `buckets: ${s.buckets.join(", ")}`,
+      ].filter(Boolean).join("; ");
+      process.stdout.write(`  ${s.file}${what ? `  — ${what}` : ""}\n`);
+    }
+    if (extra) process.stdout.write(`  + allowlist: ${opts.allow.length} user(s)\n`);
+    if (opts.print) {
+      for (const s of steps) process.stdout.write(`\n-- ===== ${s.file} =====\n${s.sql}`);
+      if (extra) process.stdout.write(`\n-- ===== allowlist =====\n${extra}`);
+    }
+  }
+
+  if (!opts.apply) {
+    if (!opts.json) process.stdout.write("\nNothing was changed. Re-run with --apply --project <ref> to apply (docs/schema.md).\n");
+    return 0;
+  }
+
+  // The token is only looked up (bin/supabase-token may refresh it) once the target is settled.
+  const target = applyGate({ project, flagProject: opts.project, token: "pending" });
+  if (!target.ok) { process.stderr.write(`jori-migrate: ${target.reason}; not applying\n`); return 1; }
+  const gate = applyGate({ project, flagProject: opts.project, token: managementToken() });
+  if (!gate.ok) { process.stderr.write(`jori-migrate: ${gate.reason}; not applying\n`); return 1; }
+  const token = gate.token;
+
+  const queue = steps.map((s) => ({ name: s.file, sql: s.sql }));
+  if (extra) queue.push({ name: "allowlist", sql: extra });
+  for (const q of queue) {
+    const r = runQuery(project, token, q.sql);
+    if (r.status < 200 || r.status >= 300) {
+      process.stderr.write(`jori-migrate: ${q.name} failed (HTTP ${r.status}): ${r.body.slice(0, 500)}\n`);
+      return 1;
+    }
+    process.stdout.write(`  applied ${q.name}\n`);
+  }
+  process.stdout.write("jori-migrate: done.\n");
+  return 0;
+}
+
+if (require.main === module) process.exit(main(process.argv.slice(2)));
+module.exports = { parseArgs, allowSql, plan, applyGate, main };
