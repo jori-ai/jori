@@ -59,7 +59,7 @@ class Fake:
         self.emails = []
         self.calls = []
 
-    def __call__(self, argv, input=None, capture_output=False, text=False, timeout=None, cwd=None):
+    def __call__(self, argv, input=None, capture_output=False, text=False, timeout=None, cwd=None, errors=None):
         self.calls.append(argv)
         out, rc = "", 0
         exe = os.path.basename(argv[0])
