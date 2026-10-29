@@ -49,6 +49,7 @@ const CFG = sc.settings();
 const GOG = process.env.GOG_BIN || "/opt/homebrew/bin/gog";
 // The installation's calendar-write gate (bin/jori-calendar): every write goes
 // through it. Without one this tool plans but does not write.
+// kernel-closure-ok: the installation's calendar write gate; without it the plan is computed and nothing is written
 const CAL_WRITE = installTools("bin/jori-calendar");
 const ACCOUNT = CFG.calendar_account;
 const CALENDAR = process.env.STAY_CALENDAR_ID || CFG.calendar_id;
