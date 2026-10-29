@@ -1,0 +1,487 @@
+#!/usr/bin/env node
+"use strict";
+// net-worth — assemble the whole picture, snapshot it, and optionally email the
+// monthly "Net worth update" to the configured recipients.
+//
+// WHY A SNAPSHOT TABLE. Month-over-month needs a past for every line, and
+// plaid_accounts holds CURRENT balances only — so cash and card debt had no
+// history to compare against. Every run writes one net_worth_snapshots row,
+// and the email diffs the two most recent.
+//
+// NO LLM, DELIBERATELY. Every figure here is arithmetic over rows we already
+// hold, and the email is a rendered table. Handing money math to a model would
+// add arithmetic errors and would mean passing model-only rows into a reasoner
+// for no gain ("money math is done in code").
+//
+// RECIPIENTS come from config and nowhere else. A second recipient is
+// legitimate only where the assets are jointly held (a household trust,
+// accounts in the partner's own name), so it is the operator's explicit
+// choice, and it authorizes THIS email and no other.
+//
+// Config: agent/local/config/investments.json `net_worth`:
+//   recipients            ["owner@…", …]; --email refuses without one
+//   sources               [{ key, label, history_table, detail?, position? }] — each a
+//                         value-history table (newest total_value) whose key is
+//                         also its net_worth_snapshots column; detail:
+//                         { table, select, label_field, value_field,
+//                           sub_field?, exclude_field? } itemises it
+//   plaid_holdings        { key, label, exclude_institutions[] } — Plaid
+//                         investment holdings not already counted by a source
+//                         (exclude the institutions a source covers, so a
+//                         brokerage linked both ways cannot double-count)
+//   property              { key, label, totals_table, sources_table?,
+//                           breakdown_command?, breakdown_args?, registry?,
+//                           footnote? } — optional real-estate line
+//   private_holdings_file data file of funded private stakes, each marked at
+//                         its latest round (value = committed × mark / entry)
+//   account_map_file      { cards: { <mask>: { product, label } } } — friendly
+//                         card names; masks never reach the email
+//   footer_note           extra sentence for the footnote
+// No `net_worth` section = OFF: exits 0.
+//
+// Usage:
+//   net-worth                 compute + print + write today's snapshot
+//   net-worth --json          machine-readable
+//   net-worth --email         also send the monthly update to the recipients
+//   net-worth --dry-run       compute + print; no snapshot, no email
+//   net-worth --no-snapshot   print (and optionally email) without writing
+
+const fs = require("node:fs");
+const os = require("node:os");
+const path = require("node:path");
+const { execFileSync } = require("node:child_process");
+const { request } = require("../lib/supabase-rest.js");
+const { localConfig, instance } = require("../lib/instance.cjs");
+const { installTools } = require("../lib/root.cjs");
+
+const ARGV = process.argv.slice(2);
+const FLAGS = new Set(ARGV.filter((a) => a.startsWith("--")));
+const DRY_RUN = FLAGS.has("--dry-run");
+const JSON_OUT = FLAGS.has("--json");
+const WANT_EMAIL = FLAGS.has("--email");
+const NO_SNAPSHOT = FLAGS.has("--no-snapshot") || DRY_RUN;
+
+const CFG = localConfig("investments", {}).net_worth || null;
+const TZ = instance().tz;
+const EMAIL_SEND = path.join(__dirname, "email-send");
+
+const log = (...a) => { if (!JSON_OUT) console.log(...a); };
+const num = (v) => { if (v === null || v === undefined || v === "") return null; const n = Number(v); return Number.isFinite(n) ? n : null; };
+const usd0 = (n) => (n == null ? "—" : `${n < 0 ? "−" : ""}$${Math.abs(Math.round(n)).toLocaleString("en-US")}`);
+const localDate = (d = new Date()) =>
+  new Intl.DateTimeFormat("en-CA", { timeZone: TZ, year: "numeric", month: "2-digit", day: "2-digit" }).format(d);
+const monthName = (dateStr) =>
+  new Intl.DateTimeFormat("en-US", { timeZone: "UTC", month: "long", year: "numeric" }).format(new Date(`${dateStr}T00:00:00Z`));
+const resolvePath = (p) => (!p ? "" : p.startsWith("/") ? p : installTools(p));
+const readJson = (p, fallback) => { try { return JSON.parse(fs.readFileSync(resolvePath(p), "utf8")); } catch { return fallback; } };
+
+/** Funded private holdings, each valued at its latest round. */
+function privateHoldings(cfg) {
+  if (!cfg.private_holdings_file) return [];
+  const reg = readJson(cfg.private_holdings_file, { holdings: [] });
+  return (reg.holdings || []).filter((h) => h.status === "funded" && num(h.committed_usd))
+    .map((h) => {
+      const entry = num(h.entry_valuation_usd);
+      const mark = num(h.mark_valuation_usd);
+      const value = entry && mark ? num(h.committed_usd) * mark / entry : num(h.committed_usd);
+      return { name: h.name, vehicle: h.vehicle || null, committed: num(h.committed_usd), value, mark, mark_as_of: h.mark_as_of || null };
+    });
+}
+
+/**
+ * Per-holding property breakdown, from the tool that owns the reconciliation
+ * (`property.breakdown_command`, which must print JSON with `holdings`).
+ * Asked for rather than stored: that tool is the single place that decides how
+ * several opinions of value become one number. Detail is a nicety; the
+ * headline number must still ship if it fails.
+ */
+function propertyBreakdown(prop) {
+  if (!prop || !prop.breakdown_command) return [];
+  try {
+    const out = execFileSync(resolvePath(prop.breakdown_command), prop.breakdown_args || [], { encoding: "utf8" });
+    return JSON.parse(out.slice(out.indexOf("{"))).holdings || [];
+  } catch {
+    return [];
+  }
+}
+
+async function gather(cfg) {
+  const sources = Array.isArray(cfg.sources) ? cfg.sources : [];
+  const prop = cfg.property || null;
+  const ph = cfg.plaid_holdings || null;
+  const today = localDate();
+
+  const [srcLatest, srcDetail, holdings, accounts, property, propSources] = await Promise.all([
+    Promise.all(sources.map((s) =>
+      request(`/rest/v1/${s.history_table}?select=as_of_date,total_value&order=as_of_date.desc&limit=1`).catch(() => []))),
+    Promise.all(sources.map((s) => (s.detail
+      ? request(`/rest/v1/${s.detail.table}?select=${s.detail.select}&order=${s.detail.value_field}.desc`).catch(() => [])
+      : Promise.resolve([])))),
+    ph ? request("/rest/v1/plaid_holdings?select=account_id,ticker,name,shares,market_value,asset_type,as_of").catch(() => []) : Promise.resolve([]),
+    request("/rest/v1/plaid_accounts?select=account_id,name,mask,type,institution_name,balance_current,last_synced_at").catch(() => []),
+    prop && prop.totals_table
+      ? request(`/rest/v1/${prop.totals_table}?select=as_of_date,total_estimate,basis_note&order=as_of_date.desc&limit=1`).catch(() => [])
+      : Promise.resolve([]),
+    prop && prop.sources_table
+      ? request(`/rest/v1/${prop.sources_table}?select=parcel_id&as_of_date=eq.${today}`).catch(() => [])
+      : Promise.resolve([]),
+  ]);
+
+  // Plaid investment holdings not already counted by a source.
+  const excluded = (ph && ph.exclude_institutions || []).map((s) => String(s).toLowerCase());
+  const excludedAcctIds = new Set(
+    (accounts || []).filter((a) => excluded.some((x) => (a.institution_name || "").toLowerCase().includes(x))).map((a) => a.account_id)
+  );
+  const phRows = (holdings || []).filter((h) => !excludedAcctIds.has(h.account_id));
+  const phTotal = phRows.reduce((s, h) => s + (Number(h.market_value) || 0), 0);
+  const bankCash = (accounts || []).filter((a) => a.type === "depository")
+    .reduce((s, a) => s + (Number(a.balance_current) || 0), 0);
+  const cardDebt = (accounts || []).filter((a) => a.type === "credit")
+    .reduce((s, a) => s + (Number(a.balance_current) || 0), 0);
+
+  // Plaid can return a generic product name ("CREDIT CARD") for several cards,
+  // which would put identical rows in the email. The account map supplies the
+  // product and what the card is FOR — never the mask, an identifier that
+  // stays out of this email.
+  const acctMap = cfg.account_map_file ? readJson(cfg.account_map_file, { cards: {} }) : { cards: {} };
+  const mappedCard = (a) => (acctMap.cards && acctMap.cards[a.mask]) || {};
+  const cardLabel = (a) => {
+    const mapped = mappedCard(a);
+    const product = (a.name || "").trim();
+    const generic = !product || product.toUpperCase() === "CREDIT CARD";
+    const issuer = (a.institution_name || "").replace(/ - Cards$/i, "").replace(/ Online$/i, ""); // lang-regex-ok: trimming a known institution-name suffix
+    return { label: mapped.product || (generic ? issuer || "Credit card" : product), extra: mapped.label || null };
+  };
+
+  // A card whose Item stopped reporting makes debt a floor, not a balance —
+  // and understating debt overstates net worth, so it is named, not buried.
+  const staleCards = (accounts || [])
+    .filter((a) => a.type === "credit" && a.last_synced_at &&
+      Math.round((new Date(`${today}T00:00:00Z`) - new Date(`${String(a.last_synced_at).slice(0, 10)}T00:00:00Z`)) / 86400000) >= 2)
+    .map((a) => ({ name: mappedCard(a).product || a.name || a.institution_name, last_synced: String(a.last_synced_at).slice(0, 10) }));
+
+  // Signed but not closed: a commitment, not an asset.
+  const registry = prop && prop.registry ? readJson(prop.registry, { parcels: [] }) : { parcels: [] };
+  const pending = (registry.parcels || []).filter((p) => !p.owned)
+    .map((p) => ({ address: p.address, contract_price: num(p.acquisition_price) }));
+
+  // Plaid holdings: crypto itemised (a single volatile coin is worth watching
+  // by name), equities aggregated into one line (individual tickers are noise
+  // next to the main brokerage). Cash rides with the stocks line.
+  const isCrypto = (h) => String(h.asset_type || "").toLowerCase().includes("crypto");
+  const phCrypto = phRows.filter(isCrypto)
+    .map((h) => ({
+      label: h.ticker || h.name || "crypto",
+      value: num(h.market_value),
+      sub: h.shares != null ? `${Number(h.shares).toLocaleString("en-US", { maximumFractionDigits: 6 })}` : null,
+    }))
+    .filter((x) => x.value)
+    .sort((a, b) => b.value - a.value);
+  const phOther = phRows.filter((h) => !isCrypto(h));
+  const phStockTotal = phOther.reduce((s2, h) => s2 + (num(h.market_value) || 0), 0);
+  const phStockCount = phOther.filter((h) => String(h.asset_type || "").toLowerCase() === "equity").length;
+  const phHasCash = phOther.some((h) => String(h.asset_type || "").toLowerCase() === "cash");
+  const phPositions = [
+    ...phCrypto,
+    ...(phStockTotal
+      ? [{ label: "Stocks", value: phStockTotal, sub: `${phStockCount} position${phStockCount === 1 ? "" : "s"}${phHasCash ? " + cash" : ""}` }]
+      : []),
+  ];
+
+  const privateNow = privateHoldings(cfg);
+  const privateTotal = privateNow.reduce((s2, h) => s2 + h.value, 0);
+
+  const out = { as_of_date: today };
+  const lines = [];
+  const detail = {};
+
+  if (prop) {
+    const key = prop.key || "real_estate";
+    out[key] = (property || [])[0] ? num(property[0].total_estimate) : null;
+    out[`${key}_as_of`] = (property || [])[0]?.as_of_date || null;
+    out[`${key}_basis`] = (property || [])[0]?.basis_note || null;
+    lines.push([key, prop.label || "Real estate"]);
+    detail[prop.label || "Real estate"] = propertyBreakdown(prop).map((h) => ({
+      label: (h.holding || "").replace(/_/g, " "), // lang-regex-ok: formatting a machine id for display
+      value: num(h.value),
+      sub: h.basis ? `${String(h.basis).replace(/_/g, " ")}${h.contributors && h.contributors.length ? ` · ${h.contributors.join(" + ")}` : ""}` : null, // lang-regex-ok: same
+    }));
+  }
+  sources.forEach((s, i) => {
+    const latest = (srcLatest[i] || [])[0];
+    out[s.key] = latest ? num(latest.total_value) : null;
+    out[`${s.key}_as_of`] = latest?.as_of_date || null;
+    lines.push([s.key, s.label]);
+    if (s.detail) {
+      const d = s.detail;
+      detail[s.label] = (srcDetail[i] || [])
+        .filter((r) => !(d.exclude_field && r[d.exclude_field]))
+        .map((r) => ({
+          label: r[d.label_field] || "account",
+          value: num(r[d.value_field]),
+          sub: d.sub_field && r[d.sub_field] != null ? `${Number(r[d.sub_field]).toLocaleString("en-US", { maximumFractionDigits: 6 })}` : null,
+        }))
+        .filter((x) => x.value);
+    }
+  });
+  lines.push(["bank_cash", "Bank cash"]);
+  detail["Bank accounts"] = (accounts || []).filter((a) => a.type === "depository")
+    .map((a) => ({ label: a.name || a.institution_name, value: num(a.balance_current), sub: null }))
+    .filter((x) => x.value).sort((a, b) => b.value - a.value);
+  if (ph) {
+    out[ph.key] = phTotal;
+    lines.push([ph.key, ph.label]);
+    detail[ph.label] = phPositions;
+  }
+  lines.push(["private_holdings", "Private"]);
+  detail["Private holdings"] = privateNow.map((h) => ({
+    label: h.name,
+    value: h.value,
+    sub: `${usd0(h.committed)} in${h.mark ? ` at the round's $${Math.round(h.mark / 1e9)}B valuation` : ""}${h.mark_as_of ? ` (${h.mark_as_of})` : ""}`,
+  }));
+  detail["Credit cards"] = (accounts || []).filter((a) => a.type === "credit")
+    .map((a) => ({ ...cardLabel(a), value: -Math.abs(num(a.balance_current) || 0) }))
+    .filter((x) => x.value).sort((a, b) => a.value - b.value);
+
+  // Display order: each line has a position (property 10, sources 20+index,
+  // bank cash 30, Plaid holdings 50, private 60); a source's `position`
+  // overrides its default, so a configured layout reads the same every month.
+  const pos = (k) => {
+    if (prop && k === (prop.key || "real_estate")) return Number(prop.position) || 10;
+    if (k === "bank_cash") return 30;
+    if (ph && k === ph.key) return Number(ph.position) || 50;
+    if (k === "private_holdings") return 60;
+    const i = sources.findIndex((x) => x.key === k);
+    return i >= 0 ? Number(sources[i].position) || 20 + i : 70;
+  };
+  lines.sort((a, b) => pos(a[0]) - pos(b[0]));
+  const sectionOf = { bank_cash: "Bank accounts", private_holdings: "Private holdings" };
+  const orderedDetail = {};
+  for (const [k, label] of lines) {
+    const section = sectionOf[k] || label;
+    if (detail[section]) orderedDetail[section] = detail[section];
+  }
+  orderedDetail["Credit cards"] = detail["Credit cards"];
+
+  const gross = lines.reduce((s, [k]) => s + (k === "bank_cash" ? bankCash : k === "private_holdings" ? privateTotal : (num(out[k]) || 0)), 0);
+  return {
+    ...out,
+    private_holdings: privateTotal,
+    bank_cash: bankCash,
+    card_debt: cardDebt,
+    gross_assets: gross,
+    net_worth: gross - cardDebt,
+    pending_commitments: pending.reduce((s, p) => s + (p.contract_price || 0), 0),
+    pending,
+    stale_cards: staleCards,
+    detail: orderedDetail,
+    lines,
+    property_sources: (propSources || []).length,
+  };
+}
+
+function renderHtml(now, prev, cfg) {
+  const d = (k) => (prev && num(prev[k]) != null && num(now[k]) != null ? num(now[k]) - num(prev[k]) : null);
+  const pct = (k) => {
+    const before = prev && num(prev[k]);
+    const delta = d(k);
+    return before && delta != null && before !== 0 ? (delta / Math.abs(before)) * 100 : null;
+  };
+  const arrow = (v) => (v == null ? "" : v > 0 ? "▲" : v < 0 ? "▼" : "—");
+  const colour = (v) => (v == null ? "#666" : v > 0 ? "#1a7f37" : v < 0 ? "#b3261e" : "#666");
+  const cell = (k) => {
+    const delta = d(k);
+    const p = pct(k);
+    if (delta == null) return `<span style="color:#999">—</span>`;
+    return `<span style="color:${colour(delta)};white-space:nowrap">${arrow(delta)} ${usd0(Math.abs(delta))}${p != null ? ` <span style="color:#888;font-size:12px">(${p >= 0 ? "+" : "−"}${Math.abs(p).toFixed(1)}%)</span>` : ""}</span>`;
+  };
+
+  const netDelta = d("net_worth");
+  const netPct = pct("net_worth");
+  const period = prev ? `since ${monthName(prev.as_of_date)}` : "first snapshot";
+
+  const bodyRows = now.lines.filter(([k]) => num(now[k]) != null && num(now[k]) !== 0)
+    .map(([k, label]) => `
+      <tr>
+        <td style="padding:8px 12px;border-bottom:1px solid #eee">${label}</td>
+        <td style="padding:8px 12px;border-bottom:1px solid #eee;text-align:right;white-space:nowrap">${usd0(num(now[k]))}</td>
+        <td style="padding:8px 12px;border-bottom:1px solid #eee;text-align:right">${cell(k)}</td>
+      </tr>`).join("");
+
+  const pendingBlock = (now.pending || []).length
+    ? `<p style="margin:18px 0 0;padding:12px;background:#fff8e6;border-left:3px solid #e0a800;font-size:14px;color:#5c4600">
+         <strong>Not counted:</strong> ${now.pending.map((p) => `${p.address} contracted at ${usd0(p.contract_price)}`).join("; ")}.
+         A signed contract is a commitment, not an asset, so it stays out of the total until it closes.
+       </p>` : "";
+
+  const staleBlock = (now.stale_cards || []).length
+    ? `<p style="margin:12px 0 0;padding:12px;background:#fdeceb;border-left:3px solid #b3261e;font-size:14px;color:#7a1c15">
+         <strong>Heads up:</strong> ${now.stale_cards.map((c) => `${c.name} last reported ${c.last_synced}`).join("; ")}.
+         Card debt is a floor rather than a balance until that reconnects, so net worth here is slightly optimistic.
+       </p>` : "";
+
+  const detailBlocks = Object.entries(now.detail || {})
+    .filter(([, items]) => items && items.length)
+    .map(([section, items]) => {
+      const subtotal = items.reduce((s2, i) => s2 + (i.value || 0), 0);
+      // A section grows a middle column only if its rows carry one (the cards,
+      // where what a card is FOR matters as much as which card it is).
+      const hasExtra = items.some((i) => i.extra);
+      const cols = hasExtra ? 3 : 2;
+      const rows = items.map((i) => `
+        <tr>
+          <td style="padding:5px 12px;border-bottom:1px solid #f2f2f2">${i.label}${i.sub ? `<div style="color:#999;font-size:12px">${i.sub}</div>` : ""}</td>
+          ${hasExtra ? `<td style="padding:5px 12px;border-bottom:1px solid #f2f2f2;color:#666">${i.extra || ""}</td>` : ""}
+          <td style="padding:5px 12px;border-bottom:1px solid #f2f2f2;text-align:right;white-space:nowrap;${i.value < 0 ? "color:#b3261e" : ""}">${usd0(i.value)}</td>
+        </tr>`).join("");
+      return `
+      <table style="border-collapse:collapse;width:100%;font-size:14px;margin:0 0 20px">
+        <thead>
+          <tr>
+            <th colspan="${cols}" style="text-align:left;padding:10px 12px 6px;border-bottom:2px solid #222;font-size:12px;text-transform:uppercase;letter-spacing:0.4px;color:#444">
+              ${section}
+              <span style="float:right;font-weight:600;letter-spacing:0;text-transform:none;font-size:14px;${subtotal < 0 ? "color:#b3261e" : ""}">${usd0(subtotal)}</span>
+            </th>
+          </tr>
+        </thead>
+        <tbody>${hasExtra ? `<tr style="color:#999;font-size:11px;text-transform:uppercase;letter-spacing:0.3px"><td style="padding:4px 12px 2px">Card</td><td style="padding:4px 12px 2px">Used for</td><td style="padding:4px 12px 2px;text-align:right">Balance</td></tr>` : ""}${rows}</tbody>
+      </table>`;
+    }).join("");
+
+  const asOfs = now.lines
+    .filter(([k]) => now[`${k}_as_of`] !== undefined)
+    .map(([k, label]) => `${label} as of ${now[`${k}_as_of`] || "—"}`)
+    .join("; ");
+  const propNote = cfg.property && cfg.property.footnote ? ` ${cfg.property.footnote}` : "";
+  const footer = cfg.footer_note ? ` ${cfg.footer_note}` : "";
+
+  const cardDelta = d("card_debt");
+  return `<div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;max-width:640px;color:#222">
+  <p style="margin:0 0 4px;color:#666;font-size:13px">${monthName(now.as_of_date)}</p>
+  <h1 style="margin:0 0 2px;font-size:34px;letter-spacing:-0.5px">${usd0(now.net_worth)}</h1>
+  <p style="margin:0 0 22px;font-size:15px;color:${colour(netDelta)}">
+    ${netDelta == null ? period : `${arrow(netDelta)} ${usd0(Math.abs(netDelta))}${netPct != null ? ` (${netPct >= 0 ? "+" : "−"}${Math.abs(netPct).toFixed(1)}%)` : ""} ${period}`}
+  </p>
+
+  <table style="border-collapse:collapse;width:100%;font-size:15px">
+    <thead>
+      <tr style="text-align:left;color:#666;font-size:12px;text-transform:uppercase;letter-spacing:0.4px">
+        <th style="padding:0 12px 6px">Holding</th>
+        <th style="padding:0 12px 6px;text-align:right">Value</th>
+        <th style="padding:0 12px 6px;text-align:right">Change</th>
+      </tr>
+    </thead>
+    <tbody>
+      ${bodyRows}
+      <tr>
+        <td style="padding:8px 12px;border-bottom:1px solid #eee;color:#b3261e">Credit cards</td>
+        <td style="padding:8px 12px;border-bottom:1px solid #eee;text-align:right;color:#b3261e;white-space:nowrap">−${usd0(now.card_debt).replace("−", "")}</td>
+        <td style="padding:8px 12px;border-bottom:1px solid #eee;text-align:right;white-space:nowrap">${cardDelta == null
+          ? `<span style="color:#999">—</span>`
+          // Debt going UP is bad, so the colour is inverted against the raw sign.
+          : `<span style="color:${cardDelta > 0 ? "#b3261e" : "#1a7f37"}">${cardDelta > 0 ? "▲" : cardDelta < 0 ? "▼" : "—"} ${usd0(Math.abs(cardDelta))}</span>`}</td>
+      </tr>
+      <tr style="font-weight:600">
+        <td style="padding:12px">Net worth</td>
+        <td style="padding:12px;text-align:right;white-space:nowrap">${usd0(now.net_worth)}</td>
+        <td style="padding:12px;text-align:right;white-space:nowrap">${cell("net_worth")}</td>
+      </tr>
+    </tbody>
+  </table>
+  ${pendingBlock}
+  ${staleBlock}
+
+  <h2 style="margin:34px 0 4px;font-size:17px;letter-spacing:-0.2px">Every account</h2>
+  <p style="margin:0 0 16px;font-size:13px;color:#888">The same money, itemised.</p>
+  ${detailBlocks}
+  <p style="margin:22px 0 0;font-size:12px;color:#888;line-height:1.55">
+    Every figure is a point-in-time snapshot, not a live quote.${propNote}
+    ${asOfs ? `${asOfs}.` : ""}${footer} Assembled by Jori from your own accounts; nothing here left your machines.
+  </p>
+</div>`;
+}
+
+// The snapshot row: the fixed columns plus one per configured line.
+function snapshotRow(now) {
+  const row = {
+    as_of_date: now.as_of_date,
+    private_holdings: now.private_holdings,
+    bank_cash: now.bank_cash,
+    card_debt: now.card_debt,
+    gross_assets: now.gross_assets,
+    net_worth: now.net_worth,
+    pending_commitments: now.pending_commitments,
+    detail: now,
+    as_of: new Date().toISOString(),
+    updated_at: new Date().toISOString(),
+  };
+  for (const [k] of now.lines) if (!(k in row)) row[k] = now[k];
+  return row;
+}
+
+async function main() {
+  if (!CFG) {
+    log("net-worth: not configured (agent/local/config/investments.json has no net_worth section) — nothing to do.");
+    if (JSON_OUT) console.log(JSON.stringify({ configured: false }));
+    return;
+  }
+  const recipients = (Array.isArray(CFG.recipients) ? CFG.recipients : String(CFG.recipients || "").split(","))
+    .map((s) => String(s).trim()).filter(Boolean);
+  if (WANT_EMAIL && !recipients.length) {
+    console.error("net-worth: --email needs net_worth.recipients in agent/local/config/investments.json");
+    process.exit(1);
+  }
+
+  const now = await gather(CFG);
+  const prevRows = (await request(
+    `/rest/v1/net_worth_snapshots?select=*&as_of_date=lt.${now.as_of_date}&order=as_of_date.desc&limit=1`
+  ).catch(() => [])) || [];
+  const prev = prevRows[0] || null;
+
+  if (!NO_SNAPSHOT) {
+    await request("/rest/v1/net_worth_snapshots?on_conflict=as_of_date", {
+      method: "POST",
+      body: [snapshotRow(now)],
+      prefer: "resolution=merge-duplicates,return=minimal",
+    });
+  }
+
+  if (JSON_OUT) {
+    console.log(JSON.stringify({ now, prev: prev ? { as_of_date: prev.as_of_date, net_worth: num(prev.net_worth) } : null }, null, 2));
+  } else {
+    log(`Net worth — ${now.as_of_date}`);
+    for (const [k, label] of now.lines) if (num(now[k])) log(`  ${label.padEnd(14)} ${usd0(num(now[k])).padStart(13)}`);
+    log(`  ${"Credit cards".padEnd(14)} ${("−" + usd0(now.card_debt).replace("−", "")).padStart(13)}`);
+    log(`  ${"".padEnd(14)} ${"─────────────"}`);
+    log(`  ${"NET WORTH".padEnd(14)} ${usd0(now.net_worth).padStart(13)}`);
+    if (prev) {
+      const delta = now.net_worth - num(prev.net_worth);
+      log(`  ${delta >= 0 ? "▲" : "▼"} ${usd0(Math.abs(delta))} since ${prev.as_of_date}`);
+    } else {
+      log("  (first snapshot — no prior month to compare)");
+    }
+    if (now.pending_commitments) log(`  pending, not counted: ${usd0(now.pending_commitments)}`);
+  }
+
+  if (WANT_EMAIL) {
+    const html = renderHtml(now, prev, CFG);
+    const tmp = path.join(os.tmpdir(), `net-worth-${now.as_of_date}.html`);
+    fs.writeFileSync(tmp, html);
+    if (DRY_RUN) {
+      log(`\n(dry-run — HTML written to ${tmp}, not sent)`);
+      return;
+    }
+    const subject = `Net worth update — ${monthName(now.as_of_date)}: ${usd0(now.net_worth)}`;
+    execFileSync(EMAIL_SEND, ["--to", recipients.join(","), "--subject", subject, "--body-file", tmp, "--html"], { stdio: "inherit" });
+    log(`\nEmailed to ${recipients.join(", ")}`);
+  }
+}
+
+if (require.main === module) {
+  main().catch((e) => {
+    console.error(`net-worth: ${e && e.message ? e.message : e}`);
+    process.exit(1);
+  });
+}
+
+module.exports = { gather, renderHtml, snapshotRow };
