@@ -10,7 +10,9 @@
 //   spa jets on|off       jets (idempotent — reads state first)
 //   spa --json            machine-readable output (works with any subcommand)
 //
-// Config: agent/local/config/spa.json `server_url` (the SpaServer base URL).
+// Config: agent/local/config/spa.json `server_url` (the SpaServer base URL)
+// and optional `device_id` (the name SpaServer's session lock knows; default
+// jori-cli).
 // No server_url = no spa: the CLI says so and exits.
 // Env (.env):
 //   SPA_SERVER_API_KEY  — the SpaServer API key (kept in .env, never in config)
@@ -44,7 +46,9 @@ const API_KEY = process.env.SPA_SERVER_API_KEY;
 // keys the lock on this string, so keep it stable — changing it would orphan
 // an in-flight session and make the spa unstoppable from here until it times
 // out on its own.
-const DEVICE_ID = "jori-cli";
+// An installation whose SpaServer already knows another name pins it in
+// spa.json `device_id`.
+const DEVICE_ID = String(CFG.device_id || "jori-cli");
 const DEVICE_NAME = "Jori";
 
 // /spaOn and /spaOff each sleep ~10s server-side waiting for iAqualink to

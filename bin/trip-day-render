@@ -287,7 +287,12 @@ async function photo(stop, place, date) {
 
 // ---------------------------------------------------------------- calendar
 
-const marker = (date, id) => `[jori:trip:${date}:${id}]`;
+// New and updated events carry the first prefix; events an installation wrote
+// under an older one (trip-planning.json extend_marker_prefixes) still match.
+const MARKER_PREFIXES = [].concat(localConfig("trip-planning", { marker_prefixes: ["jori"] }).marker_prefixes);
+const marker = (date, id, prefix = MARKER_PREFIXES[0]) => `[${prefix}:trip:${date}:${id}]`;
+const hasMarker = (e, date, id) => MARKER_PREFIXES.some((p) => String(e.description || "").includes(marker(date, id, p)));
+const hasAnyMarker = (e) => MARKER_PREFIXES.some((p) => String(e.description || "").includes(`[${p}:trip:`));
 
 function hoursLine(place) {
   const on = place?.on;
@@ -359,8 +364,7 @@ function upsert(stop, place, date, tz, existing) {
   const to = `${date}T${stop.end}:00${tzOffset(date, stop.end, tz)}`;
   const desc = description(stop, place, date);
   const loc = place?.address || "";
-  const mk = marker(date, stop.id);
-  let hit = (existing || []).find((e) => String(e.description || "").includes(mk));
+  let hit = (existing || []).find((e) => hasMarker(e, date, stop.id));
   // --adopt: take over an event written before markers existed (or by hand) by
   // matching its exact start instant, and stamp the marker on the way through so
   // every later run is a clean marker match. Opt-in, because an exact-time match
@@ -369,7 +373,7 @@ function upsert(stop, place, date, tz, existing) {
   if (!hit && ADOPT) {
     hit = (existing || []).find((e) => {
       const s = e.start?.dateTime || e.start || "";
-      return String(s).slice(11, 16) === stop.start && !String(e.description || "").includes("[jori:trip:");
+      return String(s).slice(11, 16) === stop.start && !hasAnyMarker(e);
     });
     if (hit) say(`  adopting existing event for ${stop.id} (${stop.start})`);
   }
