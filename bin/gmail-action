@@ -29,16 +29,17 @@ const triageDecisions = require("../lib/triage-decisions.js");
 const { getAccessToken, fetchWithRetry, describeError } = require("../lib/google-auth.js");
 // This installation's own addresses (agent/local/instance.json): the
 // user's mailbox and the agent's sending address.
-const { instance } = require("../lib/instance.cjs");
+const { instance, agentAddresses } = require("../lib/instance.cjs");
 const OWNER_ADDR = String(instance().owner_email || "").toLowerCase();
-const AGENT_ADDR = String(instance().agent_email || "").toLowerCase();
+// Every address that is the agent's own (its sending address and any aliases).
+const AGENT_ADDRS = agentAddresses();
 const OWNER_NAME = instance().owner_name;
 const reEsc = (x) => x.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 // The agent's own address and the user's (with any +tag): mail from either is
 // never a "correspondent" for reply-to-me.
 function selfAddressRe() {
   const alts = [];
-  if (AGENT_ADDR) alts.push(reEsc(AGENT_ADDR));
+  for (const a of AGENT_ADDRS) alts.push(reEsc(a));
   const at = OWNER_ADDR.lastIndexOf("@");
   if (at > 0) alts.push(`${reEsc(OWNER_ADDR.slice(0, at))}(\\+[^@]*)?@${reEsc(OWNER_ADDR.slice(at + 1))}`);
   return alts.length ? new RegExp(`^(${alts.join("|")})$`) : /(?!)/;
@@ -172,7 +173,7 @@ async function isJoriP1(messageId) {
     const m = await gmailRequest(`/messages/${messageId}?format=metadata&metadataHeaders=From&metadataHeaders=Subject`);
     const h = (n) => (m.payload?.headers || []).find((x) => x.name.toLowerCase() === n)?.value || "";
     const addr = (h("from").match(/<([^>]+)>/)?.[1] || h("from")).trim().toLowerCase();
-    if (!AGENT_ADDR || addr !== AGENT_ADDR || (m.labelIds || []).includes("SENT")) return false;
+    if (!AGENT_ADDRS.includes(addr) || (m.labelIds || []).includes("SENT")) return false;
     const { spawnSync } = await import("node:child_process");
     const r = spawnSync(process.execPath, [path.join(path.dirname(new URL(import.meta.url).pathname), "p1-sender"), "check", "--sender", addr, "--subject", h("subject")], { timeout: 5000 });
     return r.status === 0;
@@ -191,7 +192,7 @@ async function spamRefusal(messageId) {
   const h = (n) => (m.payload?.headers || []).find((x) => x.name.toLowerCase() === n)?.value || "";
   const addr = (h("from").match(/<([^>]+)>/)?.[1] || h("from")).trim().toLowerCase();
   const labelIds = m.labelIds || [];
-  if (AGENT_ADDR && addr === AGENT_ADDR) return "Jori's own email";
+  if (AGENT_ADDRS.includes(addr)) return "Jori's own email";
   if ((OWNER_ADDR && addr === OWNER_ADDR) || labelIds.includes("SENT")) return `${OWNER_NAME} sent it`;
   if (labelIds.includes("STARRED")) return "it is starred (P1/P2)";
   const { spawnSync } = await import("node:child_process");

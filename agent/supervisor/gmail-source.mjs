@@ -19,7 +19,7 @@ import { installTools } from "../../lib/root.cjs";
 const require = createRequire(import.meta.url);
 // This installation's identity (lib/instance.cjs): the agent's own
 // address and the operator's name, from agent/local/instance.json.
-const { instance, localConfig } = require("../../lib/instance.cjs");
+const { instance, agentAddresses, localConfig } = require("../../lib/instance.cjs");
 const INSTANCE = instance();
 // A label an installation's own Gmail filter applies to every inbound message
 // server-side (email-triage-rules.md Step 4 "Pre-applied label mismatch"), which
@@ -28,6 +28,9 @@ const INSTANCE = instance();
 const PRE_APPLIED_LABEL = String(localConfig("gmail-intake", { pre_applied_label: "" }).pre_applied_label || "");
 const OWNER_NAME = INSTANCE.owner_name;
 const AGENT_EMAIL = String(INSTANCE.agent_email || "").trim().toLowerCase();
+// Every address that is the agent's own: the sending address first, then any
+// aliases it answered to before a rename (instance.json agent_email_aliases).
+const AGENT_EMAILS = agentAddresses();
 // Structured per-message triage outcomes (lib/triage-decisions.js). Intake
 // registers each message's sender; gmail-action records every label/star/read.
 let _triageDecisions = null;
@@ -276,7 +279,7 @@ async function runExtIntake(messageId, fromHeader, subject) {
 // apply or the label fails, the message dispatches as before.
 export const JORI_SENDER = AGENT_EMAIL;
 function finishJoriP1(messageId, fromHeader, stamp) {
-  if (!JORI_SENDER || extractEmailAddr(fromHeader) !== JORI_SENDER || !stamp || !stamp.applied) return { handled: false };
+  if (!AGENT_EMAILS.includes(extractEmailAddr(fromHeader)) || !stamp || !stamp.applied) return { handled: false };
   try {
     const r = spawnSync(GMAIL_ACTION_BIN, ["label", messageId, "personal"], GA_OPTS);
     // ALL Jori mail is P1 and stays unread. A sending job may have
@@ -509,8 +512,9 @@ export function isDraftMessage(message) {
 // dispatch (email-triage-rules.md line 165 and § "Freeform instructions in
 // the user's reply emails") — is scoped to a reply on a Jori-originated thread,
 // i.e. one addressed to Jori's inbound address. Extend this list if Jori ever gains
-// a second inbound address; do not widen it to "any self-sent mail".
-export const JORI_INBOUND_ADDRESSES = AGENT_EMAIL ? [AGENT_EMAIL] : [];
+// a second inbound address (agent_email_aliases does: the address before a
+// rename); do not widen it to "any self-sent mail".
+export const JORI_INBOUND_ADDRESSES = AGENT_EMAILS;
 
 // True for a message this account SENT that never landed in the inbox and is not
 // addressed to Jori — i.e. the user writing to a third party. That is not

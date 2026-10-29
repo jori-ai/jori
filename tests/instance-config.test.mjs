@@ -11,8 +11,8 @@ import { loadHook, runHook, clearHookCache } from "../lib/ext-hooks.mjs";
 const require = createRequire(import.meta.url);
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "instance-"));
 process.env.JORI_LOCAL_DIR = tmp;
-for (const k of ["JORI_TZ", "JORI_OWNER_EMAIL", "JORI_OWNER_NAME", "JORI_OWNER_ID"]) delete process.env[k];
-const { instance, instanceValue, localConfig, ownerIdOf, supabaseAnonKey } = require("../lib/instance.cjs");
+for (const k of ["JORI_TZ", "JORI_OWNER_EMAIL", "JORI_OWNER_NAME", "JORI_OWNER_ID", "JORI_AGENT_FROM_EMAIL", "JORI_AGENT_EMAIL_ALIASES"]) delete process.env[k];
+const { instance, instanceValue, agentAddresses, localConfig, ownerIdOf, supabaseAnonKey } = require("../lib/instance.cjs");
 
 test("defaults without a local dir: generic owner, host time zone", () => {
   const inst = instance();
@@ -65,6 +65,17 @@ test("supabaseAnonKey: one home, local config supabase.json anon_key", () => {
   fs.writeFileSync(path.join(tmp, "config", "supabase.json"), JSON.stringify({ anon_key: "anon-123" }));
   assert.equal(supabaseAnonKey(), "anon-123");
   fs.rmSync(path.join(tmp, "config", "supabase.json"));
+});
+
+// After a rename the old address still reaches the agent and is still its own.
+test("agentAddresses: the sending address first, then its aliases, lowercased and deduped", () => {
+  assert.deepEqual(agentAddresses(), []);
+  fs.writeFileSync(path.join(tmp, "instance.json"), JSON.stringify({ agent_email: "New@example.com", agent_email_aliases: ["old@example.com", "new@example.com"] }));
+  assert.deepEqual(agentAddresses(), ["new@example.com", "old@example.com"]);
+  process.env.JORI_AGENT_EMAIL_ALIASES = "a@example.com, b@example.com";
+  assert.deepEqual(agentAddresses(), ["new@example.com", "a@example.com", "b@example.com"]);
+  delete process.env.JORI_AGENT_EMAIL_ALIASES;
+  fs.rmSync(path.join(tmp, "instance.json"));
 });
 
 test("a malformed local file is an error, not a silent default", () => {
