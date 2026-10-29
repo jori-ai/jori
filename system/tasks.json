@@ -462,6 +462,32 @@
       ],
       "description": "Combine the phone's last lock before the night / first unlock after it (phone_lock_events, live) with the Apple Watch's sleep onset/wake (health_samples, lands late) into sleep_nights; refresh data/sleep-night-state.json so `jori activity` follows the phone. Deterministic, no agent dispatch.",
       "job": null
+    },
+    {
+      "name": "plaid-sync",
+      "schedule": "15 0,10 * * *",
+      "schedule_human": "12:15 AM and 10:15 AM local (backstop; the primary trigger is Plaid's SYNC_UPDATES_AVAILABLE webhook)",
+      "trigger_script": "agent/scripts/trigger-plaid-sync.sh",
+      "webhook_url": null,
+      "webhook_task": null,
+      "ops_playbook_section": null,
+      "delivers_to": "none",
+      "phrases": [],
+      "description": "Pull Plaid balances + transactions into plaid_accounts/plaid_transactions and push alerts (a large charge unusual for its merchant, a large deposit, low balance, re-auth needed). Direct script — no agent, no Anthropic API. READ-ONLY, cannot move money. A backstop: the webhook (agent/supervisor/plaid-webhook.mjs) drives the sync per Item when the bank posts. Thresholds, webhook URL: agent/local/config/finance.json. Kill switches: data/.plaid-sync-off (both paths), data/.plaid-webhook-off (event path only). No connected Items → a no-op.",
+      "job": null
+    },
+    {
+      "name": "finance-model",
+      "schedule": "45 0 * * *",
+      "schedule_human": "Daily at 12:45 AM local",
+      "trigger_script": "agent/scripts/trigger-finance-model.sh",
+      "webhook_url": null,
+      "webhook_task": null,
+      "ops_playbook_section": null,
+      "delivers_to": "none",
+      "phrases": [],
+      "description": "Nightly build of the finance model (subscriptions, regular income streams, merchant stats, category baselines, recurring obligations) → data/finance-model.json, read by the finance hum harvester. Direct script — no webhook, no Anthropic API. READ-ONLY over plaid_*. Installation follow-up work rides the optional _ext/finance-model-after.sh hook. Kill switch: data/.finance-model-off.",
+      "job": null
     }
   ]
 }
