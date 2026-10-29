@@ -446,6 +446,22 @@
       ],
       "description": "Weekly scorecard + coverage audit of the watch engine: every reminder request in the week's chat became a watch? did watches fire on time, reach the user, help? Ships <=3 fixes, keeps data/watch-review/history.jsonl, emails only when something happened.",
       "job": "watch-review"
+    },
+    {
+      "name": "sleep-night",
+      "schedule": "*/5 * * * *",
+      "schedule_human": "Every 5 minutes",
+      "trigger_script": "agent/scripts/trigger-sleep-night.sh",
+      "delivers_to": "none",
+      "phrases": [
+        "sleep night",
+        "when did I fall asleep",
+        "when did I wake up",
+        "phone down",
+        "bedtime"
+      ],
+      "description": "Combine the phone's last lock before the night / first unlock after it (phone_lock_events, live) with the Apple Watch's sleep onset/wake (health_samples, lands late) into sleep_nights; refresh data/sleep-night-state.json so `jori activity` follows the phone. Deterministic, no agent dispatch.",
+      "job": null
     }
   ]
 }
