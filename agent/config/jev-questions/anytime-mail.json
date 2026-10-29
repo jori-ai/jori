@@ -1,0 +1,34 @@
+{
+  "_doc": "Jev judgment for one scanned envelope at an Anytime Mailbox virtual mailbox (bin/anytime-mail-check, lib/anytime-mail-jev.mjs). Kernel default; an installation's data/jev-questions/anytime-mail.json replaces it. State = {mailbox, envelope_text} where envelope_text is the on-device OCR (Apple Vision, lib/photo-ocr.swift) of the envelope-front scan, one numbered line each. `verdict` decides important vs junk and is the decision the threshold applies to; `recipient` says who the envelope is addressed to (the strongest junk signal: most mail not addressed to the box's owners is junk); the sender is a choice over the numbered OCR lines built from sender_question, because Jev never writes text - it can only point at a line the OCR already read. Legacy (fallback below threshold or on a Jev error) is a tool-less Haiku reading the same text.",
+  "threshold": 0.8,
+  "notes": "0.8 to start. A wrong 'junk' costs a real letter being reported as junk in the chat line; the envelope is still in the portal Inbox untouched (this job never recycles or shreds), so the cost is bounded. A bank is the typical hard case: the same sender mails statements/notices (first-class, to the owner by name) and credit-card offers (presorted standard, often 'or current resident'). The criteria therefore judge the MAILING, not the sender.",
+  "sender_min_confidence": 0.7,
+  "_sender_doc": "One choice over the OCR lines (criteria line_0..line_N built from line_criterion, plus none). Per-line booleans picked postage text and missed most senders; the choice form named most senders correctly, and its wrong picks (a misread recipient line, postage noise) sat below 0.7, so a pick under sender_min_confidence is reported as unidentified.",
+  "sender_question": {
+    "type": "choice",
+    "instructions": "`envelope_text` is the OCR of the front of one envelope, one numbered line each. Which line names the SENDER — the company, organisation, campaign or person the piece is FROM (return address name, printed brand/logo, or 'paid for by X')? The recipient (the person/household it is addressed to), street addresses, city/ZIP lines, postage/permit text, barcodes and slogans are never the sender. If only a street address is shown with no name, answer none.",
+    "line_criterion": "line {{n}} (\"{{text}}\") is the sender's name",
+    "none_criterion": "no line names who sent the piece (only recipient, address, postage, slogans or noise)"
+  },
+  "questions": {
+    "verdict": {
+      "type": "choice",
+      "instructions": "`envelope_text` is the OCR of the front of one envelope that arrived at {{owner_name}}'s virtual mailbox (`mailbox` gives the owner names and address). Is this a piece of mail {{owner_name}} should actually look at, or junk mail? Judge the MAILING, not just the sender: the same company (a bank, an insurer, a utility) sends both real notices and marketing. Signs of junk: bulk-rate postage ('PRSRT STD', 'Presorted Standard', 'ECRWSS', 'ECRLOT', 'Nonprofit Org', 'Permit No'), addressed to a household, 'Resident' or 'Current Occupant' rather than a person, addressed to someone who is not one of the mailbox owners, political ads, catalogues, offers, pre-approved credit, 'Paid political advertisement'. Signs of important: first-class postage, addressed to one of the mailbox owners by name, government agencies (tax authority, courts, motor vehicles, pensions and benefits), banks/brokerages/insurers sending statements, tax forms, checks, legal or certified mail, 'Important tax document', 'Time-sensitive', 'Return service requested' on a non-marketing piece.",
+      "criteria": {
+        "important": "a personal, financial, legal, tax, government or business letter addressed to one of the mailbox owners by name that they would want to open",
+        "junk": "advertising, political mail, catalogues, credit or insurance offers, bulk-rate mail, or mail addressed to a household, resident or someone else",
+        "unclear": "the text is too sparse or garbled to tell"
+      }
+    },
+    "recipient": {
+      "type": "choice",
+      "instructions": "`envelope_text` is the OCR of the front of one envelope; `mailbox` lists the owners of this mailbox. Who is the piece addressed to?",
+      "criteria": {
+        "owner": "one of the names in `mailbox.owners`, by name — OCR may misspell it slightly",
+        "household": "a household or family name ('The <Surname> Household'), 'Resident', 'Current Occupant' or 'X or Current Resident', not just a named person",
+        "someone_else": "a named person or company that is not one of the mailbox owners",
+        "unreadable": "no recipient line can be read"
+      }
+    }
+  }
+}
