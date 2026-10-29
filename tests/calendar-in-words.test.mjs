@@ -93,3 +93,86 @@ test("an event with a place of its own is never matched by his words, even if st
     provenance: { tier: "CONFIRMED", confirmed_name: "Hilton Seaside City" } };
   assert.equal(calendarCorroborated(s), false);
 });
+
+// ---- the trip to a stop (markCalendarTrips) ----
+// A place-less "Drive to the airport", 5:15-6:00, sat on the lodging stop the user
+// left at 5:40 (it overlapped only that one) and was listed under "Events not
+// matched to a location" right below the 6:00 airport stop it led to. Code picks
+// the question by timing; whether the entry is the way there is a model's reading
+// (Rule #0b), injected here.
+const { tripCandidates, markCalendarTrips } = await import("../lib/calendar-in-words.mjs");
+const T = (hhmm) => Date.parse(`2026-10-21T${hhmm}:00+03:00`);
+const DRIVE = { summary: "Drive to the airport", location: "", physical: "", location_match: false,
+  start: "2026-10-21T05:15:00+03:00", end: "2026-10-21T06:00:00+03:00", duration_min: 45, event_share: 0.13 };
+const tripDay = () => ({ date: "2026-10-21", tz: "Asia/Jerusalem", unmatched_calendar_events: [], stops: [
+  { id: "s-1", start: "05:14", end: "05:40", start_ts_ms: T("05:14"), end_ts_ms: T("05:40"),
+    place: { name: "The Old Port Airbnb" }, calendar_event: { ...DRIVE },
+    provenance: { tier: "CONFIRMED", confirmed_name: "The Old Port Airbnb" } },
+  { id: "s-2", start: "06:01", end: "06:16", start_ts_ms: T("06:01"), end_ts_ms: T("06:16"),
+    place: { name: "Seaside City Airport" }, calendar_event: null,
+    provenance: { tier: "CONFIRMED", confirmed_name: "Seaside City Airport" } },
+  { id: "s-3", start: "06:44", end: "12:21", start_ts_ms: T("06:44"), end_ts_ms: T("12:21"),
+    place: { name: "The Old Port Airbnb" }, calendar_event: null,
+    provenance: { tier: "CONFIRMED", confirmed_name: "The Old Port Airbnb" } },
+] });
+
+test("trip: an event under way when the user set off and ending at the arrival is asked about, for that stop only", () => {
+  const c = tripCandidates(tripDay());
+  assert.deepEqual(c.map((x) => x.stop_id), ["s-2"]);
+  assert.deepEqual(c[0].state, {
+    event: { title: "Drive to the airport", from: "05:15", to: "06:00" },
+    left: { place: "The Old Port Airbnb", at: "05:40" },
+    arrived: { place: "Seaside City Airport", from: "06:01", to: "06:16" },
+  });
+});
+
+test("trip: no question for an event over before leaving, starting after arriving, with a place, or for an unnamed stop", () => {
+  const over = tripDay(); over.stops[0].calendar_event = { ...DRIVE, start: "2026-10-21T05:00:00+03:00", end: "2026-10-21T05:30:00+03:00" };
+  assert.deepEqual(tripCandidates(over), []);
+  const after = tripDay(); after.stops[0].calendar_event = null;
+  after.unmatched_calendar_events = [{ ...DRIVE, start: "2026-10-21T06:05:00+03:00", end: "2026-10-21T06:15:00+03:00" }];
+  assert.deepEqual(tripCandidates(after), []);
+  const placed = tripDay(); placed.stops[0].calendar_event = { ...DRIVE, location: "Terminal 3" };
+  assert.deepEqual(tripCandidates(placed), []);
+  const unnamed = tripDay(); unnamed.stops[1].provenance = { tier: "GUESS" };
+  assert.deepEqual(tripCandidates(unnamed), []);
+  const far = tripDay(); far.stops[1].start_ts_ms = T("06:20");
+  assert.deepEqual(tripCandidates(far), [], "ends 20 minutes before the arrival");
+});
+
+test("trip: a yes stamps every copy and the event leaves 'Events not matched', without corroborating the stop left", async () => {
+  const d = tripDay(), file = tmpFile();
+  d.unmatched_calendar_events = [{ ...DRIVE }];
+  assert.deepEqual(eventsNotMatched(d).map((e) => e.summary), ["Drive to the airport"]);
+  let calls = 0;
+  const ask = async () => { calls += 1; return { yes: true, by: "sonnet" }; };
+  const out = await markCalendarTrips(d, { file, ask });
+  assert.deepEqual(out.map((o) => [o.stop_id, o.yes, o.cached]), [["s-2", true, false]]);
+  const stamp = { stop_id: "s-2", place: "Seaside City Airport", by: "sonnet" };
+  assert.deepEqual(d.stops[0].calendar_event.trip_to, stamp);
+  assert.deepEqual(d.unmatched_calendar_events[0].trip_to, stamp);
+  assert.equal(calendarCorroborated(d.stops[0]), false, "the lodging is not where the drive happened");
+  assert.deepEqual(eventsNotMatched(d), []);
+  const again = tripDay();
+  const out2 = await markCalendarTrips(again, { file, ask });
+  assert.equal(calls, 1, "asked once; a re-prep reads the answer back");
+  assert.equal(out2[0].cached, true);
+  assert.ok(again.stops[0].calendar_event.trip_to);
+});
+
+test("trip: a no (a call taken on the way), a failed model or the kill switch leave it listed", async () => {
+  const no = tripDay();
+  no.stops[0].calendar_event = { ...DRIVE, summary: "Call with Alex" };
+  await markCalendarTrips(no, { file: tmpFile(), ask: async () => ({ yes: false, by: "sonnet" }) });
+  assert.equal(no.stops[0].calendar_event.trip_to, undefined);
+  assert.deepEqual(eventsNotMatched(no).map((e) => e.summary), ["Call with Alex"]);
+  const fail = tripDay();
+  assert.deepEqual(await markCalendarTrips(fail, { file: tmpFile(), ask: async () => { throw new Error("not_logged_in"); } }), []);
+  assert.equal(fail.stops[0].calendar_event.trip_to, undefined);
+  process.env.JORI_CALENDAR_TRIP = "0";
+  try {
+    const off = tripDay();
+    assert.deepEqual(await markCalendarTrips(off, { file: tmpFile(), ask: async () => ({ yes: true }) }), []);
+    assert.equal(off.stops[0].calendar_event.trip_to, undefined);
+  } finally { delete process.env.JORI_CALENDAR_TRIP; }
+});

@@ -349,6 +349,17 @@ async function cmdPrep(date, resolvedOverride, confirmedPath, freshHarvest = fal
   } catch (e) {
     process.stderr.write(`[daily-summary-build] calendar-in-words failed: ${String((e && e.message) || e).split("\n")[0].slice(0, 200)}\n`);
   }
+  // A place-less event that ends as the user reaches a stop may be the way there
+  // ("Drive to the airport" and the airport stop). A model reads it
+  // (lib/calendar-in-words.mjs markCalendarTrips); a yes leaves "Events not matched".
+  try {
+    const { markCalendarTrips } = await import(path.join(__dirname, "../lib/calendar-in-words.mjs"));
+    const trips = await markCalendarTrips(resolved);
+    if (trips.length) resolved.calendar_trips = trips;
+    else delete resolved.calendar_trips;
+  } catch (e) {
+    process.stderr.write(`[daily-summary-build] calendar-trip failed: ${String((e && e.message) || e).split("\n")[0].slice(0, 200)}\n`);
+  }
 
   const manifest = buildManifest(resolved, txnData);
   // Anchored against the SETTLED stops (the ids the prose JSON keys by).
