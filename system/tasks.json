@@ -1870,6 +1870,23 @@
       ],
       "description": "Runs one config-defined venue-watch lane (agent/local/config/venue-watch.json lanes / lanes_file): trigger-venue-watch.sh <lane> kicks launchd ai.claude.venue-watch-<lane>. Off with no lanes.",
       "job": null
+    },
+    {
+      "name": "launch-watch",
+      "schedule": "on-demand",
+      "schedule_human": "On demand; an installation schedules it (the trigger's cadence gate runs daily within 7 days of a launch, else weekly)",
+      "trigger_script": "agent/scripts/trigger-launch-watch.sh",
+      "webhook_url": null,
+      "webhook_task": null,
+      "ops_playbook_section": null,
+      "delivers_to": "calendar",
+      "phrases": [
+        "launch watch",
+        "rocket launches",
+        "launch calendar"
+      ],
+      "description": "Free calendar holds for upcoming launches matching agent/local/config/launch-watch.json `search` (Launch Library 2), sized by NET precision in the home zone; pings only on add, a move over 6h, or removal. Off without `search`. Playbook: agent/ops-agent/jobs/launch-watch.md.",
+      "job": null
     }
   ]
 }
