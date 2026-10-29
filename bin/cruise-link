@@ -12,7 +12,7 @@
 //
 // This exists so no playbook hand-encodes a URL. Sailing ids contain a colon
 // (`celebrity:RF4BH330_2026-12-07`) and must be percent-escaped; the params are
-// a contract with web/cruises/lib/deep-link.ts and change together.
+// a contract with apps/cruises/lib/deep-link.ts and change together.
 //
 // Usage:
 //   cruise-link sailing <sailing_id>        one sailing, every filter cleared

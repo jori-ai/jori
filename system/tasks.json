@@ -646,7 +646,7 @@
         "movie features",
         "recommendation model data"
       ],
-      "description": "Deterministic TMDB enrichment for the watch-list recommendation model (web/watch/lib/recsys.mjs): syncs every list title (films + shows) into watch_catalog, fills genres/keywords/directors/cast, records TMDB recommendation edges in watch_film_edges, adds recommended films (>=300 votes). No LLM; cron-run direct. Playbook: ops-agent/jobs/watch-catalog-enrich.md."
+      "description": "Deterministic TMDB enrichment for the watch-list recommendation model (apps/watch/lib/recsys.mjs): syncs every list title (films + shows) into watch_catalog, fills genres/keywords/directors/cast, records TMDB recommendation edges in watch_film_edges, adds recommended films (>=300 votes). No LLM; cron-run direct. Playbook: ops-agent/jobs/watch-catalog-enrich.md."
     },
     {
       "name": "movie-discover",

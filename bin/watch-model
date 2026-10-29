@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// watch-model — inspect the watch-list recommendation model (web/watch/lib/recsys.mjs) on
+// watch-model — inspect the watch-list recommendation model (apps/watch/lib/recsys.mjs) on
 // the real data: what it has learned, the batch it would show next, and a leave-one-out
 // backtest. Read-only.
 //
@@ -29,7 +29,7 @@ if (cmd === "summary") {
   const calib = fitPlatt(raw.preds);
   const after = backtest(ctx, { ...recsys.PARAMS, calib });
   out({ calib, before: raw.hit / raw.n, after: after.hit / after.n, auc: after.auc },
-    `calib ${JSON.stringify(calib)} — accuracy ${(100 * raw.hit / raw.n).toFixed(1)}% → ${(100 * after.hit / after.n).toFixed(1)}% (baseline ${(100 * after.baseline / after.n).toFixed(1)}%), AUC ${after.auc.toFixed(3)}. Put it in PARAMS.calib in web/watch/lib/recsys.mjs.`);
+    `calib ${JSON.stringify(calib)} — accuracy ${(100 * raw.hit / raw.n).toFixed(1)}% → ${(100 * after.hit / after.n).toFixed(1)}% (baseline ${(100 * after.baseline / after.n).toFixed(1)}%), AUC ${after.auc.toFixed(3)}. Put it in PARAMS.calib in apps/watch/lib/recsys.mjs.`);
 } else if (cmd === "tune") {
   // Small grid over the hyperparameters that matter; prints the best few by AUC.
   const base = recsys.PARAMS, res = [];

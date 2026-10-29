@@ -9,7 +9,7 @@ Method: truncated SVD of the user-mean-centred rating matrix (films with >= 30 r
 people with >= 10). Each film's vector = V·sqrt(S), L2-normalised, so two films are close
 when the same people rate them the same way. Linked to TMDB via MovieLens links.csv and
 written to Supabase `watch_embeddings` (tmdb_id, ml_count, ml_mean, v[K]); the model in
-web/watch/lib/recsys.mjs regresses their marks on these vectors.
+apps/watch/lib/recsys.mjs regresses their marks on these vectors.
 
 Needs numpy, scipy and pandas: run it with a Python that has them, e.g. a venv
 (`<venv>/bin/python bin/movielens-embed`). One-off; re-run when

@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // watch-catalog-enrich — give every watch_catalog film the features the recommendation
 // model learns from, and record TMDB's recommendation graph as item-item edges
-// (2026-10-10, web/watch/lib/recsys.mjs). No LLM.
+// (2026-10-10, apps/watch/lib/recsys.mjs). No LLM.
 //
 // One TMDB call per film (details + keywords + credits + recommendations):
 //   genres, keywords (top 15), directors, top-6 cast, popularity, imdb_id → watch_catalog
