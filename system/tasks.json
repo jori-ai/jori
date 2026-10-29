@@ -701,6 +701,107 @@
       ],
       "description": "Weekly scan for cruise deals matching the installation's travel plan and thresholds (agent/local/config/cruise-watch.json: home cities, embark ports, filters, alerts); alerts only on price drops. Off with no config or no plan.",
       "job": "cruise-watch"
+    },
+    {
+      "name": "chat-consolidate",
+      "schedule": "20 3 * * *",
+      "schedule_human": "Daily at 3:20 AM local",
+      "trigger_script": "agent/scripts/trigger-chat-consolidate.sh",
+      "webhook_url": "http://localhost:9092",
+      "webhook_task": "CHAT CONSOLIDATE",
+      "ops_playbook_section": null,
+      "delivers_to": "none",
+      "phrases": [
+        "chat consolidate",
+        "fold chat into wiki",
+        "remember what I said in chat",
+        "consolidate my conversation into memory"
+      ],
+      "description": "Nightly fold of durable facts the user states in ORDINARY CHAT (jori_messages, role=user) into the general wiki — the write-side counterpart to unified recall, so a fact he typed in conversation graduates from short-term into permanent, recallable memory. Complements daily-summary (venues visited) and hum-consolidate (hum replies). Broad + auto-apply; dedupe-before-write; skips health/financial specifics + commands/questions. The trigger (un-sandboxed cron) fetches the pending batch to a local file so the sandboxed agent turn stays fully local. Silent (no email/ping/push). Added 2026-07-19.",
+      "job": "chat-consolidate"
+    },
+    {
+      "name": "wiki-link-weave",
+      "schedule": "1 3 * * 1",
+      "schedule_human": "Mondays at 3:01 AM local",
+      "trigger_script": "agent/scripts/trigger-wiki-link-weave.sh",
+      "webhook_url": "http://localhost:9082",
+      "webhook_task": "WIKI LINK WEAVE",
+      "ops_playbook_section": null,
+      "delivers_to": "chat",
+      "phrases": [
+        "wiki link weave",
+        "link the wiki",
+        "person pages",
+        "connect people in the wiki"
+      ],
+      "description": "Weekly wiki linking pass: splits people out of hub pages into their own `entity: person` pages (≤15/run, facts moved never dropped, links retargeted with `wiki-people retarget`), grows the nightly linker's concept map (`wiki-people concept-add`; shared or ordinary-word first names are model-only `ambiguous_aliases`), links relational phrases and ambiguous names from context in this week's changed pages + a rotating 1/8 slice, makes person relations two-way, and links or flags orphan pages. One short chat message when something changed; ≤3 hum questions. Added 2026-10-23.",
+      "job": "wiki-link-weave"
+    },
+    {
+      "name": "memory-reindex",
+      "schedule": null,
+      "schedule_human": "DISABLED (2026-05-02, step 5e)",
+      "trigger_script": "agent/scripts/trigger-memory-reindex.sh",
+      "webhook_url": null,
+      "webhook_task": null,
+      "ops_playbook_section": null,
+      "delivers_to": "none",
+      "phrases": [],
+      "description": "DISABLED 2026-05-02 (wiki migration step 5e). Was: reindex memory/*.md into memory_chunks + FTS5 + nomic-embed-text embeddings to power `memory search`. Replaced by `wiki_search` (uses pages_fts, kept current in-transaction by every savePage). Script kept around in case a manual memory_chunks rebuild is needed during recovery; cron is off.",
+      "job": null
+    },
+    {
+      "name": "wiki-link-audit",
+      "schedule": "45 3 * * *",
+      "schedule_human": "Daily at 3:45 AM local",
+      "trigger_script": "agent/scripts/trigger-wiki-link-audit.sh",
+      "webhook_url": null,
+      "webhook_task": null,
+      "ops_playbook_section": null,
+      "delivers_to": "none",
+      "phrases": [
+        "wiki link audit",
+        "memory link audit",
+        "concept link audit"
+      ],
+      "description": "Nightly concept-link auto-apply (auto-apply replaced a manual-review digest). Runs `wiki-link-audit --apply --json` against the curated alias map in data/wiki-link-concepts.json — deterministic and safe (first-occurrence-only, skips code/existing-links/self-links). Since 2026-07-17, email notification is suppressed per the user's follow-up (\"No need to email\") — it still auto-applies and logs to agent/logs/wiki-link-audit.log, controlled by data/wiki-link-audit-config.json (`silent: true`). Direct script — no webhook, no Anthropic API.",
+      "job": null
+    },
+    {
+      "name": "memory-consolidation",
+      "schedule": "45 9 * * 0",
+      "schedule_human": "Sundays at 10:00 AM",
+      "trigger_script": "agent/scripts/trigger-memory-consolidation.sh",
+      "webhook_url": "http://localhost:9092",
+      "webhook_task": "MEMORY CONSOLIDATION",
+      "ops_playbook_section": "memory-consolidation",
+      "delivers_to": "email",
+      "phrases": [
+        "memory consolidation",
+        "consolidate memory",
+        "memory review"
+      ],
+      "description": "Weekly content-level audit of the WIKI (pages table) — auto-applies merges/supersedes/retires/expands via the wiki CLI (tracked revisions, revertable), then emails a report. Diff-mode: scopes to pages changed in the last 7 days + their hybrid-recall duplication neighbors. The hygiene counterpart to the wiki's writers (daily-summary/hum-consolidate/chat-consolidate). Repointed 2026-07-19 from the legacy .md files (a no-op under DB-as-truth — render-all clobbered .md edits within 30 min) to the authoritative DB.",
+      "job": "memory-consolidation"
+    },
+    {
+      "name": "episode-archive",
+      "schedule": "25 7 * * *",
+      "schedule_human": "Daily at 7:25 AM local",
+      "trigger_script": "agent/scripts/trigger-episode-archive.sh",
+      "webhook_url": null,
+      "webhook_task": null,
+      "ops_playbook_section": "episode-archive",
+      "delivers_to": "none",
+      "phrases": [
+        "episode archive",
+        "commit yesterday to memory",
+        "archive yesterday",
+        "write episode"
+      ],
+      "description": "Nightly ingest of yesterday's daily_summaries row into the wiki as `day_YYYY-MM-DD` (type=day) via `wiki-day-write`. On Monday / 1st-of-month also ingests weekly + monthly rollup pages, then backfills embeddings. Direct cron script, no webhook or agent turn since 2026-10-04; 'yesterday' is the user's local yesterday (local-day). Failures to the system channel. Recallable via `bin/episode`, `wiki_search`, or the wiki HTTP browser at :9096 — episodic and permanent memory share the same `pages` table.",
+      "job": "episode-archive"
     }
   ]
 }
