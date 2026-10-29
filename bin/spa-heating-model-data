@@ -1,0 +1,395 @@
+#!/usr/bin/env node
+"use strict";
+// spa-heating-model-data — deterministic packet for the spa-heating-model job.
+//
+// Usage:
+//   spa-heating-model-data            full JSON packet
+//   spa-heating-model-data --count    usable session count only (cron gate)
+//   spa-heating-model-data --text     human-readable summary
+//
+// All arithmetic lives here, not in the playbook. The LLM job interprets the
+// packet and writes the email; it never re-derives the numbers.
+//
+// THE MODEL
+// ---------
+// The heater delivers roughly constant power, so the heating RATE is set by
+// how fast the water loses heat, which scales with the water/air temperature
+// gap:
+//
+//     dT/dt  =  a  -  b * (T_water - T_air)
+//
+// `a` is the heater's rate into a spa at ambient; `b` is the loss coefficient
+// (wind, evaporation, surface area). Both fall out of an ordinary least
+// squares fit once there are enough sessions across enough ambient conditions.
+// That is the whole reason for the year of logging: a single flat "minutes per
+// degree" cannot express this, which is why the two constants in SpaServer
+// disagreed by 3x — they were each right for different weather.
+//
+// Per-session rate comes from a regression of temperature against time across
+// the session's ticks, NOT from (end - start) / duration. The probe reports
+// integer °F, so at ~0.2 °F/min most consecutive ticks read an identical
+// value; a slope over the whole curve is robust to that quantisation, while
+// endpoint differencing throws away every intermediate reading and inherits
+// the full ±0.5 °F rounding error at both ends.
+//
+// The slope covers the HEATING PHASE only: settled baseline up to the first
+// tick at the heater setpoint (max_temp). A session can then hold at setpoint
+// for hours (one ran 40h), and those flat ticks drag a whole-session slope
+// toward zero — that, not rain, is what produces absurd 100+ min/°F rows. A phase too short to measure (<10 min or <3°F
+// climbed) drops the session rather than falling back to the session summary,
+// whose rate spans the same hold time.
+//
+// AMBIENT comes from one source for every session: the weather API. The
+// on-site air sensor can read warm against the weather API (equipment-pad
+// heat, worst at night) and may only exist for the newest sessions, so mixing
+// it in shifts the gap for exactly those sessions. The sensor is a fallback only when the weather API has no
+// value, and then as its heating-phase mean, not a mean over a multi-hour
+// hold.
+const PHASE_MIN_MINUTES = 10;
+const PHASE_MIN_CLIMB_F = 3;
+
+const { fetchJson } = require("../lib/supabase-rest.js");
+const { localConfig } = require("../lib/instance.cjs");
+
+// agent/local/config/spa.json: `server_url` (no spa without it) and
+// `fallback_f_per_min`, the rate SpaServer currently quotes ETAs from
+// (its HEATING_DEGREES_PER_MINUTE), shown next to what the data says.
+// Keep it in sync if that constant changes; unset = not shown.
+const CFG = localConfig("spa", { server_url: "", fallback_f_per_min: null });
+
+const FLAGS = new Set(process.argv.slice(2).filter((a) => a.startsWith("--")));
+const COUNT_ONLY = FLAGS.has("--count");
+const TEXT = FLAGS.has("--text");
+
+const FALLBACK_F_PER_MIN = Number(CFG.fallback_f_per_min) > 0 ? Number(CFG.fallback_f_per_min) : null;
+
+/** Ordinary least squares. Returns null when the x values carry no spread. */
+function ols(points) {
+  const n = points.length;
+  if (n < 2) return null;
+  const mx = points.reduce((s, p) => s + p.x, 0) / n;
+  const my = points.reduce((s, p) => s + p.y, 0) / n;
+  let sxx = 0, sxy = 0, syy = 0;
+  for (const p of points) {
+    sxx += (p.x - mx) ** 2;
+    sxy += (p.x - mx) * (p.y - my);
+    syy += (p.y - my) ** 2;
+  }
+  if (sxx === 0) return null;
+  const slope = sxy / sxx;
+  const intercept = my - slope * mx;
+  const r2 = syy === 0 ? null : (sxy * sxy) / (sxx * syy);
+  return { slope, intercept, r2, n };
+}
+
+/**
+ * Multiple linear regression via the normal equations, solved by Gaussian
+ * elimination. Small-scale on purpose (a handful of predictors, at most a
+ * few hundred rows) — not worth a dependency for that.
+ *
+ * @param {Array<object>} rows
+ * @param {string[]} xKeys   predictor field names
+ * @param {string} yKey      target field name
+ * @returns {{coeffs: Record<string, number>, r2: number|null, n: number} | null}
+ */
+function multiRegress(rows, xKeys, yKey) {
+  const clean = rows.filter((r) => xKeys.every((k) => r[k] != null) && r[yKey] != null);
+  const n = clean.length;
+  const p = xKeys.length + 1; // + intercept
+  if (n <= p) return null;
+
+  // Design matrix X (with intercept column) and target vector y.
+  const X = clean.map((r) => [1, ...xKeys.map((k) => Number(r[k]))]);
+  const y = clean.map((r) => Number(r[yKey]));
+
+  // Normal equations: (XtX) beta = Xty
+  const XtX = Array.from({ length: p }, () => new Array(p).fill(0));
+  const Xty = new Array(p).fill(0);
+  for (let i = 0; i < n; i++) {
+    for (let a = 0; a < p; a++) {
+      Xty[a] += X[i][a] * y[i];
+      for (let b = 0; b < p; b++) XtX[a][b] += X[i][a] * X[i][b];
+    }
+  }
+
+  // Gaussian elimination with partial pivoting, augmented [XtX | Xty].
+  const aug = XtX.map((row, i) => [...row, Xty[i]]);
+  for (let col = 0; col < p; col++) {
+    let pivot = col;
+    for (let row = col + 1; row < p; row++) {
+      if (Math.abs(aug[row][col]) > Math.abs(aug[pivot][col])) pivot = row;
+    }
+    if (Math.abs(aug[pivot][col]) < 1e-10) return null; // singular — collinear predictors
+    [aug[col], aug[pivot]] = [aug[pivot], aug[col]];
+    for (let row = 0; row < p; row++) {
+      if (row === col) continue;
+      const factor = aug[row][col] / aug[col][col];
+      for (let k = col; k <= p; k++) aug[row][k] -= factor * aug[col][k];
+    }
+  }
+  const beta = aug.map((row, i) => row[p] / row[i]);
+
+  const my = y.reduce((s, v) => s + v, 0) / n;
+  let ssTot = 0, ssRes = 0;
+  for (let i = 0; i < n; i++) {
+    const pred = X[i].reduce((s, x, j) => s + x * beta[j], 0);
+    ssRes += (y[i] - pred) ** 2;
+    ssTot += (y[i] - my) ** 2;
+  }
+  const r2 = ssTot === 0 ? null : 1 - ssRes / ssTot;
+
+  const coeffs = { intercept: beta[0] };
+  xKeys.forEach((k, i) => (coeffs[k] = beta[i + 1]));
+  return { coeffs, r2, n };
+}
+
+async function main() {
+  if (!CFG.server_url && !process.env.SPA_SERVER_URL) {
+    // No spa configured: nothing has ever been synced, so nothing to fit.
+    if (COUNT_ONLY) console.log(0);
+    else if (TEXT) console.log("spa-heating-model-data: off — no spa configured (agent/local/config/spa.json server_url)");
+    else console.log(JSON.stringify({ configured: false, sessions_total: 0, sessions_usable: 0 }, null, 2));
+    return;
+  }
+  const sessions =
+    (await fetchJson(
+      "/rest/v1/spa_heating_sessions?select=*&order=started_at.asc&limit=2000"
+    )) || [];
+
+  // Only settled sessions can produce an honest rate: before circulation the
+  // reading describes a stratified body, not the spa.
+  const usable = sessions.filter(
+    (s) => s.temp_settled != null && s.heating_seconds > 600
+  );
+
+  if (COUNT_ONLY) {
+    console.log(usable.length);
+    return;
+  }
+
+  // Per-session slope from the tick curve where available.
+  const rows = [];
+  for (const s of usable) {
+    const ticks =
+      (await fetchJson(
+        `/rest/v1/spa_heating_ticks?session_id=eq.${encodeURIComponent(
+          s.session_id
+        )}&circulation_settled=is.true&select=observed_at,spa_temp,air_temp&order=observed_at.asc&limit=2000`
+      )) || [];
+
+    let rate = s.observed_f_per_min == null ? null : Number(s.observed_f_per_min);
+    let rateSource = "session";
+    let waterMean =
+      (Number(s.temp_settled) + Number(s.temp_final ?? s.max_temp_reached ?? s.temp_settled)) / 2;
+    let phase = null;
+    if (ticks.length >= 4) {
+      // Cut at the first tick at the heater setpoint; without one, the
+      // session ended while still climbing and the whole curve is heating.
+      const setpoint = s.max_temp == null ? null : Number(s.max_temp);
+      const atSetpoint =
+        setpoint == null ? -1 : ticks.findIndex((t) => Number(t.spa_temp) >= setpoint);
+      phase = atSetpoint >= 0 ? ticks.slice(0, atSetpoint + 1) : ticks;
+
+      const t0 = new Date(phase[0].observed_at).getTime();
+      const pts = phase.map((t) => ({
+        x: (new Date(t.observed_at).getTime() - t0) / 60000,
+        y: Number(t.spa_temp),
+      }));
+      const temps = pts.map((p) => p.y);
+      const lo = Math.min(...temps);
+      const hi = Math.max(...temps);
+      const fit = ols(pts);
+      if (
+        pts.length < 4 ||
+        pts[pts.length - 1].x < PHASE_MIN_MINUTES ||
+        hi - lo < PHASE_MIN_CLIMB_F ||
+        !fit ||
+        fit.slope <= 0
+      ) {
+        continue;
+      }
+      rate = fit.slope;
+      rateSource = "ticks";
+      waterMean = (lo + hi) / 2;
+    }
+    if (!rate || rate <= 0) continue;
+
+    const weatherAir = s.weather_air_temp_f == null ? null : Number(s.weather_air_temp_f);
+    const phaseAir = phase ? phase.map((t) => t.air_temp).filter((a) => a != null).map(Number) : [];
+    const sensorAir = phaseAir.length
+      ? Number((phaseAir.reduce((sum, a) => sum + a, 0) / phaseAir.length).toFixed(2))
+      : s.air_temp_mean == null ? null : Number(s.air_temp_mean);
+    const air = weatherAir != null ? weatherAir : sensorAir;
+    const airSource = weatherAir != null ? "weather-api" : sensorAir != null ? "sensor" : null;
+    const windMph = s.weather_wind_mph == null ? null : Number(s.weather_wind_mph);
+    const precipIn = s.weather_precip_in == null ? null : Number(s.weather_precip_in);
+
+    rows.push({
+      session_id: s.session_id,
+      started_at: s.started_at,
+      temp_settled: Number(s.temp_settled),
+      settle_delta: s.settle_delta == null ? null : Number(s.settle_delta),
+      air_temp_mean: air,
+      air_source: airSource,
+      sensor_air: sensorAir,
+      wind_mph: windMph,
+      rain: precipIn == null ? null : precipIn > 0,
+      water_mean: Number(waterMean.toFixed(2)),
+      gap: air == null ? null : Number((waterMean - air).toFixed(2)),
+      jets_on_seconds: s.jets_on_seconds ?? 0,
+      f_per_min: Number(rate.toFixed(4)),
+      min_per_degree: Number((1 / rate).toFixed(2)),
+      rate_source: rateSource,
+      ticks: ticks.length,
+    });
+  }
+
+  // The fit uses tick-measured sessions only. Session-summary rates (older
+  // recovered history) are endpoint differences over whatever
+  // the session spanned, and they scatter 0.9–15 min/°F on one heater, far
+  // more than ambient can explain, so they drowned the gap term (R² ≈ 0 at
+  // n=102). They still count toward `observed` and appear in `sessions`.
+  const withGap = rows.filter((r) => r.gap != null && r.rate_source === "ticks");
+  const fit = ols(withGap.map((r) => ({ x: r.gap, y: r.f_per_min })));
+
+  // Wind as a second predictor alongside the water/air gap. Gated separately
+  // from the base model (needs more rows: 3 fitted coefficients instead of 2)
+  // and reported alongside it, never replacing it — see spa-heating-model.md.
+  const windFit = multiRegress(withGap, ["gap", "wind_mph"], "f_per_min");
+  const windSpeeds = withGap.map((r) => r.wind_mph).filter((w) => w != null);
+  const windSpread = windSpeeds.length
+    ? Number((Math.max(...windSpeeds) - Math.min(...windSpeeds)).toFixed(1))
+    : 0;
+
+  const rates = rows.map((r) => r.f_per_min).sort((a, b) => a - b);
+  const median = rates.length
+    ? rates[Math.floor(rates.length / 2)]
+    : null;
+  const airs = withGap.map((r) => r.air_temp_mean);
+  const deltas = rows.map((r) => r.settle_delta).filter((d) => d != null);
+  const ambientCoverage = rows.reduce(
+    (acc, r) => {
+      if (r.air_source === "sensor") acc.sensor++;
+      else if (r.air_source === "weather-api") acc.weather_api++;
+      else acc.none++;
+      return acc;
+    },
+    { sensor: 0, weather_api: 0, none: 0 }
+  );
+  const sensorBias = rows
+    .filter((r) => r.sensor_air != null && r.air_source === "weather-api")
+    .map((r) => r.sensor_air - r.air_temp_mean);
+
+  const packet = {
+    generated_at: new Date().toISOString(),
+    sessions_total: sessions.length,
+    sessions_usable: rows.length,
+    // Tick-measured sessions with ambient — the set `model` is fitted on.
+    sessions_fit: withGap.length,
+    // A fit is only meaningful across a real spread of conditions. One
+    // season's data will look tight and generalise badly to the opposite one.
+    ambient_range: airs.length
+      ? { min: Math.min(...airs), max: Math.max(...airs), span: Number((Math.max(...airs) - Math.min(...airs)).toFixed(1)) }
+      : null,
+    // Where each session's ambient reading came from. Weather-api is used
+    // whenever present, so `sensor` counts only sessions the API missed.
+    ambient_coverage: ambientCoverage,
+    // On-site sensor minus weather-api, over sessions that have both — why
+    // the sensor is not the primary source. Informational.
+    sensor_vs_weather: sensorBias.length
+      ? {
+          n: sensorBias.length,
+          mean_f: Number((sensorBias.reduce((s, d) => s + d, 0) / sensorBias.length).toFixed(2)),
+          min_f: Number(Math.min(...sensorBias).toFixed(2)),
+          max_f: Number(Math.max(...sensorBias).toFixed(2)),
+        }
+      : null,
+    current_fallback: FALLBACK_F_PER_MIN
+      ? { f_per_min: FALLBACK_F_PER_MIN, min_per_degree: Number((1 / FALLBACK_F_PER_MIN).toFixed(2)) }
+      : null,
+    observed: median
+      ? { median_f_per_min: median, median_min_per_degree: Number((1 / median).toFixed(2)) }
+      : null,
+    // dT/dt = a - b * (T_water - T_air)
+    model:
+      fit && withGap.length >= 5
+        ? {
+            form: "f_per_min = a + b * (water_mean - air_mean)",
+            a: Number(fit.intercept.toFixed(5)),
+            b: Number(fit.slope.toFixed(5)),
+            r2: fit.r2 == null ? null : Number(fit.r2.toFixed(3)),
+            n: fit.n,
+          }
+        : null,
+    model_ready: Boolean(fit && withGap.length >= 5 && fit.r2 != null && fit.r2 >= 0.5),
+    // Second, informational model: gap + wind together. Reported alongside
+    // `model`, never in place of it — see spa-heating-model.md § wind model.
+    // Needs more rows (3 fitted coefficients) and real spread in wind speed,
+    // or the wind coefficient is just noise dressed up as a number.
+    model_wind:
+      windFit && windFit.n >= 15 && windSpread >= 3
+        ? {
+            form: "f_per_min = a + b * gap + c * wind_mph",
+            a: Number(windFit.coeffs.intercept.toFixed(5)),
+            b: Number(windFit.coeffs.gap.toFixed(5)),
+            c: Number(windFit.coeffs.wind_mph.toFixed(5)),
+            r2: windFit.r2 == null ? null : Number(windFit.r2.toFixed(3)),
+            n: windFit.n,
+            wind_spread_mph: windSpread,
+          }
+        : null,
+    settle_delta: deltas.length
+      ? {
+          n: deltas.length,
+          mean: Number((deltas.reduce((s, d) => s + d, 0) / deltas.length).toFixed(2)),
+          min: Math.min(...deltas),
+          max: Math.max(...deltas),
+        }
+      : null,
+    sessions: rows,
+  };
+
+  if (TEXT) {
+    console.log(
+      `sessions: ${packet.sessions_usable} usable of ${packet.sessions_total}, ${packet.sessions_fit} tick-measured in the fit`
+    );
+    console.log(
+      `fallback: ${packet.current_fallback ? `${packet.current_fallback.min_per_degree} min/°F` : "(not set)"}` +
+        (packet.observed ? `   observed median: ${packet.observed.median_min_per_degree} min/°F` : "")
+    );
+    if (packet.model) {
+      console.log(
+        `model:    f_per_min = ${packet.model.a} + ${packet.model.b} * gap   (R²=${packet.model.r2}, n=${packet.model.n})`
+      );
+    } else {
+      console.log("model:    not enough sessions yet (need 5+ with ambient data)");
+    }
+    console.log(
+      `ambient:  sensor=${packet.ambient_coverage.sensor} weather-api=${packet.ambient_coverage.weather_api} none=${packet.ambient_coverage.none}`
+    );
+    if (packet.model_wind) {
+      console.log(
+        `wind:     f_per_min = ${packet.model_wind.a} + ${packet.model_wind.b} * gap + ${packet.model_wind.c} * wind_mph   (R²=${packet.model_wind.r2}, n=${packet.model_wind.n})`
+      );
+    }
+    if (packet.settle_delta) {
+      console.log(
+        `settle:   pre-circulation reading off by mean ${packet.settle_delta.mean}°F ` +
+          `(range ${packet.settle_delta.min}..${packet.settle_delta.max})`
+      );
+    }
+    return;
+  }
+
+  console.log(JSON.stringify(packet, null, 2));
+}
+
+main().catch((err) => {
+  if (COUNT_ONLY) {
+    // The cron gate must never crash the trigger; zero means "skip".
+    console.log(0);
+    process.exit(0);
+  }
+  console.error(`spa-heating-model-data: ${err.message || err}`);
+  process.exit(1);
+});

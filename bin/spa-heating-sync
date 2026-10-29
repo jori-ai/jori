@@ -1,0 +1,218 @@
+#!/usr/bin/env node
+"use strict";
+// spa-heating-sync — pull the spa heating dataset from SpaServer into Postgres.
+//
+// Usage:
+//   spa-heating-sync              sync both ticks and sessions
+//   spa-heating-sync --dry-run    fetch + summarise, no DB writes
+//   spa-heating-sync --json       machine-readable summary
+//   spa-heating-sync --full       ignore the watermark, re-pull everything
+//
+// Config: agent/local/config/spa.json `server_url`. No server_url = no spa:
+// the sync says so and exits 0 (a cron run on an installation without a spa).
+// Env (.env): SPA_SERVER_API_KEY, SUPABASE_SERVICE_ROLE_KEY.
+//
+// WHY THIS EXISTS
+// ---------------
+// Two constants in SpaServer disagreed about how fast the spa heats — 5.0
+// min/°F in config vs 1.5 min/°F in the notification path, a 3x spread — and
+// nothing had ever recorded enough data to settle it. Rather than pick one,
+// the plan is to log real sessions for ~a year and fit the formula, reassessing
+// every 30 days. This is the transport half: SpaServer writes JSONL locally,
+// jori pulls it into Postgres where it can actually be queried.
+//
+// WHY JORI PULLS INSTEAD OF THE SERVER PUSHING
+// -----------------------------------------------
+// Pushing would put a service-role database credential on a public-facing box
+// whose only other secret is scoped to a single pool controller. Pulling keeps
+// that key here, matches the shape of the other pull-based syncs, and leaves
+// the server's JSONL as the buffer of record — a
+// sync that is broken or paused for a month loses nothing, it just catches up.
+
+const path = require("node:path");
+const { loadEnv } = require("../lib/load-env.js");
+const { request, fetchJson } = require("../lib/supabase-rest.js");
+const { runWeatherBackfill } = require("../lib/spa-weather-backfill.js");
+const { localConfig } = require("../lib/instance.cjs");
+loadEnv();
+
+const FLAGS = new Set(process.argv.slice(2).filter((a) => a.startsWith("--")));
+const DRY_RUN = FLAGS.has("--dry-run");
+const JSON_OUT = FLAGS.has("--json");
+const FULL = FLAGS.has("--full");
+
+const BASE_URL = String(
+  process.env.SPA_SERVER_URL || localConfig("spa", { server_url: "" }).server_url || ""
+).replace(/\/+$/, "");
+const API_KEY = process.env.SPA_SERVER_API_KEY;
+
+// The tick file grows at ~2 rows/minute while heating. A generous page keeps
+// the daily sync to a single round trip in normal operation.
+const PAGE = 20000;
+
+function log(...a) {
+  if (!JSON_OUT) console.log(...a);
+}
+
+async function fetchRows(kind, since) {
+  const qs = new URLSearchParams({ kind, limit: String(PAGE) });
+  if (since) qs.set("since", since);
+  const res = await fetch(`${BASE_URL}/heating-telemetry?${qs}`, {
+    headers: { "X-API-Key": API_KEY, Accept: "application/json" },
+    signal: AbortSignal.timeout(60_000),
+  });
+  if (!res.ok) {
+    throw new Error(`SpaServer HTTP ${res.status} for kind=${kind}`);
+  }
+  const body = await res.json();
+  return body.rows || [];
+}
+
+/**
+ * Newest row we already hold, so we only ask for what we are missing.
+ *
+ * Returns null on any failure rather than a date, because the caller treats
+ * null as "pull everything" — re-pulling is cheap and idempotent (both tables
+ * upsert on a natural key), whereas guessing a watermark forward would create
+ * a permanent hole in a dataset meant to be fitted a year from now.
+ */
+async function watermark(table, column) {
+  if (FULL) return null;
+  const rows = await fetchJson(
+    `/rest/v1/${table}?select=${column}&order=${column}.desc&limit=1`
+  );
+  if (!Array.isArray(rows) || !rows.length) return null;
+  return rows[0][column] || null;
+}
+
+async function upsert(table, rows, conflict) {
+  if (DRY_RUN || !rows.length) return 0;
+  let written = 0;
+  for (let i = 0; i < rows.length; i += 500) {
+    const chunk = rows.slice(i, i + 500);
+    await request(`/rest/v1/${table}?on_conflict=${conflict}`, {
+      method: "POST",
+      body: chunk,
+      prefer: "resolution=merge-duplicates,return=minimal",
+    });
+    written += chunk.length;
+  }
+  return written;
+}
+
+const num = (v) => (v === null || v === undefined || v === "" ? null : Number(v));
+
+function tickRow(r) {
+  return {
+    session_id: r.session_id || r.operation_id || "unknown",
+    observed_at: r.ts,
+    spa_temp: num(r.spa_temp),
+    air_temp: num(r.air_temp),
+    pool_temp: num(r.pool_temp),
+    heater_mode: r.heater_mode ?? null,
+    cycle_state: r.cycle_state ?? null,
+    spa_mode: r.spa_mode ?? null,
+    jets_mode: r.jets_mode ?? null,
+    minutes_since_spa_on: num(r.minutes_since_spa_on),
+    circulation_settled: r.circulation_settled ?? null,
+    heating_rate_f_per_min: num(r.heating_rate_f_per_min),
+  };
+}
+
+function sessionRow(r) {
+  return {
+    // Sessions written before session_id was threaded through fall back to the
+    // end timestamp, which is unique per session in practice. Without this the
+    // upsert key would be null and the whole batch would fail.
+    session_id: r.session_id || `legacy-${r.ended_at}`,
+    started_at: r.started_at || r.ended_at,
+    ended_at: r.ended_at,
+    temp_at_command: num(r.temp_at_command),
+    temp_settled: num(r.temp_settled),
+    settled_after_s: num(r.settled_after_s),
+    settle_delta: num(r.settle_delta),
+    target_temp: num(r.target_temp),
+    max_temp: num(r.max_temp),
+    temp_final: num(r.temp_final),
+    max_temp_reached: num(r.max_temp_reached),
+    air_temp_start: num(r.air_temp_start),
+    air_temp_end: num(r.air_temp_end),
+    air_temp_mean: num(r.air_temp_mean),
+    pool_temp_start: num(r.pool_temp_start),
+    jets_on_seconds: num(r.jets_on_seconds),
+    heating_seconds: num(r.heating_seconds),
+    observed_f_per_min: num(r.observed_f_per_min),
+    extensions_used: num(r.extensions_used),
+    shutdown_reason: r.shutdown_reason ?? null,
+    system_status: r.system_status ?? null,
+    raw: r,
+  };
+}
+
+async function main() {
+  if (!BASE_URL) {
+    if (JSON_OUT) console.log(JSON.stringify({ ok: true, off: "no spa configured" }));
+    else log("spa-heating-sync: off — no spa configured (agent/local/config/spa.json server_url)");
+    return;
+  }
+  if (!API_KEY) {
+    console.error("spa-heating-sync: SPA_SERVER_API_KEY missing from .env (the SpaServer API key).");
+    process.exit(1);
+  }
+
+  const sinceTicks = await watermark("spa_heating_ticks", "observed_at");
+  const sinceSessions = await watermark("spa_heating_sessions", "ended_at");
+  log(`spa-heating-sync: since ticks=${sinceTicks || "(all)"} sessions=${sinceSessions || "(all)"}`);
+
+  const [ticks, sessions] = await Promise.all([
+    fetchRows("ticks", sinceTicks),
+    fetchRows("sessions", sinceSessions),
+  ]);
+
+  const tickRows = ticks.filter((r) => r.ts).map(tickRow);
+  const sessionRows = sessions.filter((r) => r.ended_at).map(sessionRow);
+
+  const wroteTicks = await upsert("spa_heating_ticks", tickRows, "session_id,observed_at");
+  const wroteSessions = await upsert("spa_heating_sessions", sessionRows, "session_id");
+
+  // Backfill ambient temp/rain/wind for any session missing them (new ones
+  // just written above, plus anything a prior run deferred). Best-effort —
+  // a weather-API hiccup should never fail the sync itself.
+  let weather = { pending: 0, filled: 0, deferred: 0 };
+  if (!DRY_RUN) {
+    try {
+      weather = await runWeatherBackfill({ dryRun: false });
+    } catch (err) {
+      log(`spa-heating-sync: weather backfill failed (non-fatal): ${err.message || err}`);
+    }
+  }
+
+  const summary = {
+    ok: true,
+    dry_run: DRY_RUN,
+    ticks_fetched: tickRows.length,
+    ticks_written: wroteTicks,
+    sessions_fetched: sessionRows.length,
+    sessions_written: wroteSessions,
+    weather_filled: weather.filled,
+    weather_deferred: weather.deferred,
+  };
+
+  if (JSON_OUT) console.log(JSON.stringify(summary, null, 2));
+  else {
+    log(
+      `ticks:    ${tickRows.length} fetched, ${wroteTicks} written${DRY_RUN ? " (dry run)" : ""}`
+    );
+    log(
+      `sessions: ${sessionRows.length} fetched, ${wroteSessions} written${DRY_RUN ? " (dry run)" : ""}`
+    );
+    log(`weather:  ${weather.filled} filled, ${weather.deferred} deferred`);
+  }
+}
+
+main().catch((err) => {
+  const msg = err.message || String(err);
+  if (JSON_OUT) console.log(JSON.stringify({ ok: false, error: msg }, null, 2));
+  else console.error(`spa-heating-sync: ${msg}`);
+  process.exit(1);
+});

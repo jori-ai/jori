@@ -1,0 +1,103 @@
+#!/usr/bin/env node
+"use strict";
+// finance-invoices-reconcile — the user's invoices to a client vs the payments
+// that settled them. Deterministic; rules in lib/finance-invoice-reconcile.js.
+//
+//   finance-invoices-reconcile            reconcile, write tables, print the report
+//   finance-invoices-reconcile --dry-run  print only
+//
+// Reads the invoice sheet (one row per invoice: number, date, —, amount, —,
+// notes) through `gog`, and the client's ACH credits into one checking account
+// from plaid_transactions. Writes fin_invoices, fin_invoice_matches (rule rows
+// replaced each run; recorded rows kept) and one fin_invoice_reconciliations
+// row per run. Nightly (the finance-model tick's after-hook), and before each
+// weekly review.
+//
+// Config: agent/local/config/rental-finance.json `invoices`:
+//   label           the invoices' name in reports ("<label> invoices")
+//   client          the client's display name
+//   sheet_id, range the sheet and A1 range holding the invoice list
+//   account_mask    the last four of the checking account the client pays into
+//   payment_match   a substring of the client's payment description (ilike)
+//   scope_from      YYYY-MM-DD: invoices before it are carried as out of scope
+//                   (paid somewhere Plaid does not sync), never as unpaid
+//   scope_note      why earlier invoices are out of scope
+//   gog_account     the Google account that can read the sheet (default: the
+//                   owner's email)
+//   due_day, grace_days
+// The payer column stores the owner id (lib/instance.cjs `owner_id`). No
+// `invoices` config = off: it says so and exits 0.
+
+const { execFileSync } = require("node:child_process");
+const { loadEnv } = require("../lib/load-env.js");
+const { request } = require("../lib/supabase-rest.js");
+const { reconcileInvoices } = require("../lib/finance-invoice-reconcile.js");
+const { instance, localConfig } = require("../lib/instance.cjs");
+loadEnv();
+
+const DRY = process.argv.includes("--dry-run");
+const INV = localConfig("rental-finance", { invoices: null }).invoices || null;
+const inst = instance();
+const usd = (n) => `$${Number(n).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+const mdy = (s) => { const m = String(s || "").trim().match(/^(\d{1,2})\/(\d{1,2})\/(\d{2,4})$/); if (!m) return null; const y = m[3].length === 2 ? `20${m[3]}` : m[3]; return `${y}-${m[1].padStart(2, "0")}-${m[2].padStart(2, "0")}`; };
+
+async function main() {
+  if (!INV || !INV.sheet_id || !INV.account_mask || !INV.payment_match) {
+    console.log("finance-invoices-reconcile: no invoices are configured (agent/local/config/rental-finance.json `invoices`) — nothing to reconcile.");
+    return;
+  }
+  const today = new Intl.DateTimeFormat("en-CA", { timeZone: inst.tz }).format(new Date());
+  const LABEL = INV.label || "Client";
+  const CLIENT = INV.client || "the client";
+  const SCOPE_FROM = INV.scope_from || "0000-01-01";
+  const PAYER = inst.owner_id;
+  const account = INV.gog_account || inst.owner_email;
+  const gogArgs = ["sheets", "get", INV.sheet_id, INV.range || "A1:F500", ...(account ? ["--account", account] : []), "--json"];
+  const out = execFileSync(process.env.GOG_BIN || "/opt/homebrew/bin/gog", gogArgs, { encoding: "utf8" });
+  const values = JSON.parse(out).values || [];
+  const invoices = values.slice(1).filter((r) => /^\d+$/.test(String(r[0] || "").trim())).map((r) => {
+    const date = mdy(r[1]);
+    const notes = String(r[5] || "");
+    return {
+      number: String(r[0]).trim(), payer: PAYER, invoice_date: date,
+      amount: Number(String(r[3] || "").replace(/[$,]/g, "")),
+      voided: /\bvoided?\b/i.test(notes), in_scope: !!date && date >= SCOPE_FROM,
+      scope_note: date && date >= SCOPE_FROM ? null : (INV.scope_note || `before ${SCOPE_FROM}: paid to an account Plaid does not sync`),
+      sheet_notes: notes || null,
+    };
+  }).filter((i) => i.invoice_date && Number.isFinite(i.amount));
+
+  const accts = await request(`/rest/v1/plaid_accounts?select=account_id&mask=eq.${encodeURIComponent(INV.account_mask)}`);
+  if (!accts.length) throw new Error(`no Plaid account ends in ${INV.account_mask}`);
+  const txns = await request(`/rest/v1/plaid_transactions?select=transaction_id,date,amount,name,pending&account_id=eq.${accts[0].account_id}&name=ilike.*${encodeURIComponent(INV.payment_match)}*&date=gte.${SCOPE_FROM}&order=date.asc`);
+  const payments = txns.filter((t) => !t.pending && Number(t.amount) < 0).map((t) => ({ transaction_id: t.transaction_id, date: t.date, amount: -Number(t.amount), name: t.name }));
+  const recorded = await request("/rest/v1/fin_invoice_matches?select=*&recorded=eq.true");
+
+  const r = reconcileInvoices({ invoices, payments, recorded, today, dueDay: INV.due_day ?? 6, graceDays: INV.grace_days ?? 3 });
+
+  if (!DRY) {
+    await request(`/rest/v1/fin_invoices?payer=eq.${encodeURIComponent(PAYER)}`, { method: "DELETE", prefer: "return=minimal" });
+    await request("/rest/v1/fin_invoices", { method: "POST", prefer: "return=minimal", body: r.rows.map((x) => ({
+      number: x.number, payer: PAYER, invoice_date: x.invoice_date, amount: x.amount, voided: x.voided, in_scope: x.in_scope,
+      scope_note: x.scope_note, sheet_notes: x.sheet_notes, due_date: x.due_date, paid_amount: x.paid_amount, status: x.status, updated_at: new Date().toISOString(),
+    })) });
+    await request("/rest/v1/fin_invoice_matches?recorded=eq.false", { method: "DELETE", prefer: "return=minimal" });
+    const derived = r.matches.filter((m) => !m.recorded).map((m) => ({ invoice_number: m.invoice_number, plaid_transaction_id: m.plaid_transaction_id, amount: m.amount, paid_on: m.paid_on, basis: m.basis, evidence: m.evidence || null, recorded: false }));
+    if (derived.length) await request("/rest/v1/fin_invoice_matches", { method: "POST", prefer: "return=minimal", body: derived });
+    await request("/rest/v1/fin_invoice_reconciliations", { method: "POST", prefer: "return=minimal", body: [{
+      payer: PAYER, invoiced: r.proof.invoiced, paid: r.proof.paid, outstanding: r.proof.outstanding, ok: r.proof.ok,
+      report: { label: LABEL, scope: `invoices dated from ${SCOPE_FROM} (${LABEL} billing)`, proof: r.proof, rows: r.rows.filter((x) => x.in_scope), ambiguities: r.ambiguities, unmatched: r.unmatched },
+    }] });
+  }
+
+  const p = r.proof;
+  console.log(`${LABEL} invoices (${inst.owner_name}, from ${SCOPE_FROM}): invoiced ${usd(p.invoiced)} = paid ${usd(p.paid)} + open ${usd(p.outstanding)} ${p.ok ? "✓ reconciled" : "✗ NOT reconciled"}`);
+  for (const x of r.rows.filter((x) => x.in_scope)) {
+    const ms = r.matches.filter((m) => m.invoice_number === x.number);
+    console.log(`  ${x.number}  ${x.invoice_date}  ${usd(x.amount).padStart(11)}  ${x.status.padEnd(9)} ${ms.map((m) => `${usd(m.amount)} on ${m.paid_on}`).join(" + ")}${x.status === "void" ? `  (${(x.sheet_notes || "").slice(0, 50)})` : ""}${["open", "late", "part_paid"].includes(x.status) ? `  due ${x.due_date}` : ""}`);
+  }
+  if (r.ambiguities.length) { console.log("AMBIGUOUS:"); for (const a of r.ambiguities) console.log(`  ${a.text}`); }
+  console.log(`${CLIENT} payments not matched to ${inst.owner_name}'s invoices (presumably another payee's): ${r.unmatched.length}, ${usd(r.unmatched.reduce((s, x) => s + x.amount, 0))}`);
+}
+
+main().catch((e) => { console.error(`finance-invoices-reconcile error: ${e.stack || e.message}`); process.exit(1); });

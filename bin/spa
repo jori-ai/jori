@@ -1,0 +1,211 @@
+#!/usr/bin/env node
+"use strict";
+// spa — control a hot tub through its SpaServer (a small HTTP service that
+// fronts the pool controller's cloud account).
+//
+// Usage:
+//   spa [status]          current temp, heater mode, jets, system status
+//   spa on                start the spa + heating cycle
+//   spa off               stop the spa and close the session
+//   spa jets on|off       jets (idempotent — reads state first)
+//   spa --json            machine-readable output (works with any subcommand)
+//
+// Config: agent/local/config/spa.json `server_url` (the SpaServer base URL).
+// No server_url = no spa: the CLI says so and exits.
+// Env (.env):
+//   SPA_SERVER_API_KEY  — the SpaServer API key (kept in .env, never in config)
+//   SPA_SERVER_URL      — optional override of server_url
+//
+// WHY THIS GOES THROUGH THE SERVER, NOT iAqualink DIRECTLY
+// -------------------------------------------------------
+// Talking to iAqualink directly would put the pool-controller account password
+// on this machine (another copy of that credential, logged in on every call)
+// and would let jori flip the spa behind SpaServer's back — no session
+// tracking, no heating cycle, no auto-shutdown timer, and a stale server state
+// cache.
+//
+// SpaServer is the only component that should hold iAqualink credentials.
+// Everything else is a client of it.
+//
+// NOT YET WIRED: `spa extend`. The server's GET /askedForMore currently
+// awaits the full maintenance timer + grace period before returning — a
+// ~35 minute blocking HTTP handler — so there is no safe way to call it from
+// a CLI. It gets added here once that endpoint is made non-blocking.
+
+const { loadEnv } = require("../lib/load-env.js");
+const { localConfig } = require("../lib/instance.cjs");
+loadEnv();
+
+const CFG = localConfig("spa", { server_url: "" });
+const BASE_URL = String(process.env.SPA_SERVER_URL || CFG.server_url || "").replace(/\/+$/, "");
+const API_KEY = process.env.SPA_SERVER_API_KEY;
+
+// Identifies jori to SpaServer's single-active-device lock. The server
+// keys the lock on this string, so keep it stable — changing it would orphan
+// an in-flight session and make the spa unstoppable from here until it times
+// out on its own.
+const DEVICE_ID = "jori-cli";
+const DEVICE_NAME = "Jori";
+
+// /spaOn and /spaOff each sleep ~10s server-side waiting for iAqualink to
+// settle, on top of two refreshes against an API that is routinely slow.
+const READ_TIMEOUT_MS = 45_000;
+const WRITE_TIMEOUT_MS = 90_000;
+
+const args = process.argv.slice(2);
+const JSON_OUT = args.includes("--json");
+const positional = args.filter((a) => !a.startsWith("--"));
+
+function out(obj, human) {
+  if (JSON_OUT) console.log(JSON.stringify(obj, null, 2));
+  else console.log(human);
+}
+
+function die(msg, code = 1) {
+  if (JSON_OUT) console.log(JSON.stringify({ ok: false, error: msg }, null, 2));
+  else console.error(`spa: ${msg}`);
+  process.exit(code);
+}
+
+async function call(path, { timeout = READ_TIMEOUT_MS } = {}) {
+  if (!BASE_URL) {
+    die("no spa configured (set server_url in agent/local/config/spa.json).");
+  }
+  if (!API_KEY) {
+    die("SPA_SERVER_API_KEY missing from .env (the SpaServer API key).");
+  }
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeout);
+  let res;
+  try {
+    res = await fetch(`${BASE_URL}${path}`, {
+      headers: { "X-API-Key": API_KEY, Accept: "application/json" },
+      signal: ctrl.signal,
+    });
+  } catch (err) {
+    if (err.name === "AbortError") {
+      die(`timed out after ${Math.round(timeout / 1000)}s calling ${path}`);
+    }
+    die(`could not reach ${BASE_URL} — ${err.message}`);
+  } finally {
+    clearTimeout(timer);
+  }
+
+  const body = await res.text();
+  let parsed = null;
+  try {
+    parsed = JSON.parse(body);
+  } catch {
+    /* non-JSON error page */
+  }
+
+  if (!res.ok) {
+    // 403 from /spaOn means another device holds the control lock, and the
+    // server's `detail` names it. That message is more useful than ours.
+    const detail = parsed?.detail || parsed?.message || body.slice(0, 200);
+    die(`HTTP ${res.status} from ${path} — ${detail}`, 2);
+  }
+  return parsed;
+}
+
+const F = (n) => `${Math.round(n)}°F`;
+
+async function getState() {
+  return call("/spa-state");
+}
+
+function renderState(s) {
+  const heater = s.heater_mode?.value || s.heater_mode;
+  const lines = [
+    `Spa:    ${s.spa_mode ? "ON" : "OFF"}${s.spa_mode ? ` (${heater})` : ""}`,
+    `Temp:   ${F(s.spa_temp)}`,
+    `Jets:   ${s.jets_mode ? "ON" : "OFF"}`,
+  ];
+  // iAqualink reports Service/Offline when the panel is in maintenance mode or
+  // unreachable. Surfacing it explains an otherwise baffling "command did
+  // nothing" — worth a line even though it is usually "Online".
+  if (s.system_status && s.system_status !== "Online") {
+    lines.push(`System: ${s.system_status}`);
+  }
+  return lines.join("\n");
+}
+
+async function cmdStatus() {
+  const s = await getState();
+  out({ ok: true, ...s }, renderState(s));
+}
+
+async function cmdSpa(want) {
+  const before = await getState();
+  if (before.spa_mode === want) {
+    out(
+      { ok: true, changed: false, ...before },
+      `Spa is already ${want ? "ON" : "OFF"}. No change.`
+    );
+    return;
+  }
+  const path = want
+    ? `/spaOn/${DEVICE_ID}?device_name=${encodeURIComponent(DEVICE_NAME)}`
+    : `/spaOff/${DEVICE_ID}?device_name=${encodeURIComponent(DEVICE_NAME)}`;
+  const res = await call(path, { timeout: WRITE_TIMEOUT_MS });
+  const after = await getState();
+  out(
+    { ok: true, changed: true, message: res?.message, ...after },
+    `${res?.message || "Done."}\n${renderState(after)}`
+  );
+}
+
+async function cmdJets(want) {
+  const before = await getState();
+  if (before.jets_mode === want) {
+    out(
+      { ok: true, changed: false, jets_mode: before.jets_mode },
+      `Jets are already ${want ? "ON" : "OFF"}. No change.`
+    );
+    return;
+  }
+  // The endpoint is a toggle, not a setter — which is why we read first.
+  await call(`/toggleJets/${DEVICE_ID}`, { timeout: WRITE_TIMEOUT_MS });
+  const after = await getState();
+  out(
+    { ok: true, changed: true, jets_mode: after.jets_mode },
+    `Jets are now ${after.jets_mode ? "ON" : "OFF"}.`
+  );
+}
+
+function usage() {
+  console.log(`Usage:
+  spa [status]        show spa temp, heater mode, jets
+  spa on|off          start / stop the spa and its heating cycle
+  spa jets on|off     turn jets on or off
+  spa --json          machine-readable output
+
+Talks to SpaServer at ${BASE_URL || "(not configured: agent/local/config/spa.json server_url)"}.`);
+}
+
+async function main() {
+  const cmd = positional[0] || "status";
+  const target = positional[1];
+
+  const wants = (v) =>
+    v === "on" ? true : v === "off" ? false : die(`expected "on" or "off", got "${v ?? ""}"`);
+
+  switch (cmd) {
+    case "status":
+      return cmdStatus();
+    case "on":
+      return cmdSpa(true);
+    case "off":
+      return cmdSpa(false);
+    case "jets":
+      return cmdJets(wants(target));
+    case "help":
+    case "--help":
+    case "-h":
+      return usage();
+    default:
+      die(`unknown command "${cmd}". Run \`spa help\`.`);
+  }
+}
+
+main().catch((err) => die(err.message || String(err)));

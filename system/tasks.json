@@ -957,6 +957,55 @@
       "webhook_task": null,
       "webhook_url": null,
       "ops_playbook_section": null
+    },
+    {
+      "name": "spa-heating-sync",
+      "schedule": "28 9 * * *",
+      "schedule_human": "Daily at 9:28 AM local",
+      "trigger_script": "agent/scripts/trigger-spa-heating-sync.sh",
+      "webhook_url": null,
+      "webhook_task": null,
+      "ops_playbook_section": null,
+      "delivers_to": "none",
+      "phrases": [
+        "spa heating sync",
+        "spa telemetry",
+        "spa heating data"
+      ],
+      "description": "Pull the spa's heating telemetry (ticks + session summaries) from its SpaServer into Supabase, then backfill ambient weather for new sessions. Off without agent/local/config/spa.json server_url. Deterministic, no agent dispatch, read-only on the spa.",
+      "job": null
+    },
+    {
+      "name": "spa-heating-model",
+      "schedule": "37 9 1 * *",
+      "schedule_human": "Monthly on the 1st at 9:37 AM local",
+      "trigger_script": "agent/scripts/trigger-spa-heating-model.sh",
+      "webhook_url": null,
+      "webhook_task": "SPA HEATING MODEL",
+      "ops_playbook_section": null,
+      "delivers_to": "email",
+      "phrases": [
+        "spa heating model",
+        "spa heating formula",
+        "refit spa model"
+      ],
+      "description": "Monthly re-fit of the spa heating formula (rate vs water/air gap, plus wind) from synced sessions; emails the analysis. Silent below 3 usable sessions or without a spa configured. Playbook: agent/ops-agent/jobs/spa-heating-model.md.",
+      "job": "spa-heating-model"
+    },
+    {
+      "name": "stay-calendar",
+      "schedule": "7,22,37,52 * * * *",
+      "schedule_human": "Every 15 minutes (safety net; the real trigger is POST /stay-sync)",
+      "trigger_script": "agent/scripts/trigger-stay-calendar.sh",
+      "delivers_to": "none",
+      "phrases": [
+        "stay calendar",
+        "rental calendar",
+        "check-in calendar",
+        "guest check-ins on my calendar"
+      ],
+      "description": "Keep the rental portfolio's Google calendar in step with confirmed channel-manager stays and signed leases at active properties: 1h show-as-free check-in and 30m check-out events. Off without agent/local/config/rentals.json stay_calendar.calendar_id. Deterministic, no agent dispatch.",
+      "job": null
     }
   ]
 }

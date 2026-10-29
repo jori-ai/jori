@@ -1,0 +1,261 @@
+#!/usr/bin/env node
+"use strict";
+// stay-calendar — keep the portfolio's Google calendar in step with who is
+// checking in and out: confirmed channel-manager stays at the active
+// short-term properties, and signed leases at the long-term ones.
+//
+// A full reconcile every run: read the truth (the channel manager + the
+// portfolio's Firestore books), read the calendar, write the difference
+// through jori-calendar. Cheap enough to run on every change — two
+// channel-manager calls, three Firestore
+// lists, one calendar list — so there is no per-stay code path to drift.
+//
+// WHAT TRIGGERS IT
+//   - POST /stay-sync on the supervisor (:9090, via the tunnel), sent by the
+//     portfolio's hub right after its channel-manager webhook lands, and by the
+//     Firestore trigger on `leases` / `tenants`. Seconds, not minutes.
+//   - Cron every 15 minutes: the safety net for a missed ping.
+//
+// DETERMINISTIC. No model, no agent turn, no Anthropic spend — same stance as
+// plaid-sync, and for the same reason: it sits behind a public endpoint.
+//
+// READS the books' Firestore (read-only client) and the channel manager (GET only).
+// WRITES only to the configured calendar, only events carrying its own
+// `phStay` key, and only through jori-calendar (no attendees, ever).
+//
+// Usage:
+//   stay-calendar [sync]        reconcile now
+//   stay-calendar --dry-run     print the plan, change nothing
+//   stay-calendar --json        machine-readable summary
+//   stay-calendar --force       allow a run that would delete many events
+//   stay-calendar --since 2026-01-01
+//                               backfill: also own events back to that date
+//                               (normal runs never touch the past)
+//
+// Kill switch: touch data/.stay-calendar-off (stops cron AND webhook runs).
+// Config: agent/local/config/rentals.json `stay_calendar` (no `calendar_id` =
+// off). Design + rules: docs/stay-calendar.md.
+
+const fs = require("node:fs");
+const path = require("node:path");
+const { spawnSync } = require("node:child_process");
+const { loadEnv } = require("../lib/load-env.js");
+const { installTools } = require("../lib/root.cjs");
+const { firestore, registry } = require("../lib/rental-ledger.js");
+const sc = require("../lib/stay-calendar.js");
+loadEnv();
+
+const CFG = sc.settings();
+const GOG = process.env.GOG_BIN || "/opt/homebrew/bin/gog";
+// The installation's calendar-write gate (bin/jori-calendar): every write goes
+// through it. Without one this tool plans but does not write.
+const CAL_WRITE = installTools("bin/jori-calendar");
+const ACCOUNT = CFG.calendar_account;
+const CALENDAR = process.env.STAY_CALENDAR_ID || CFG.calendar_id;
+const LOGFILE = installTools("agent/logs/stay-calendar.log");
+const LOCK = installTools("data/.stay-calendar.lock");
+const OFF = installTools("data/.stay-calendar-off");
+const CHANNEL = CFG.channel_label;
+
+/**
+ * A run that would delete more than this many events, and more than half of
+ * what is there, stops and asks for --force. The failure it guards against is a
+ * source that answered "nothing" without erroring — an empty page, a revoked
+ * token that returns 200 — which would otherwise wipe the calendar.
+ */
+const MASS_DELETE_FLOOR = 6;
+
+const args = process.argv.slice(2);
+const DRY = args.includes("--dry-run");
+const JSON_OUT = args.includes("--json");
+const FORCE = args.includes("--force");
+const sinceArg = args.includes("--since") ? args[args.indexOf("--since") + 1] : null;
+if (sinceArg && !/^\d{4}-\d{2}-\d{2}$/.test(sinceArg)) { // lang-regex-ok: a CLI date argument, not the user's words
+  console.error("stay-calendar: --since takes YYYY-MM-DD"); process.exit(2);
+}
+const SINCE_MS = sinceArg ? sc.zonedMs(sinceArg, "00:00", CFG.tz) : undefined;
+
+function log(line) {
+  const stamp = new Date().toISOString().replace("T", " ").slice(0, 19);
+  try { fs.mkdirSync(path.dirname(LOGFILE), { recursive: true }); fs.appendFileSync(LOGFILE, `${stamp} ${line}\n`); } catch {}
+  if (!JSON_OUT) console.error(line);
+}
+
+// ── One run at a time ──────────────────────────────────────────────────────
+// A webhook ping and the cron can land together; two concurrent runs would both
+// see "missing" and both create. The supervisor coalesces its own pings, this
+// covers cron-vs-webhook. A second run just exits: the first one's read happens
+// after the change that woke the second, or the supervisor re-runs it.
+
+function takeLock() {
+  try {
+    fs.writeFileSync(LOCK, String(process.pid), { flag: "wx" });
+    return true;
+  } catch {
+    let pid = 0;
+    try { pid = Number(fs.readFileSync(LOCK, "utf8")); } catch {}
+    let alive = false;
+    try { if (pid) { process.kill(pid, 0); alive = true; } } catch {}
+    if (alive) return false;
+    fs.writeFileSync(LOCK, String(process.pid));
+    return true;
+  }
+}
+const dropLock = () => { try { if (Number(fs.readFileSync(LOCK, "utf8")) === process.pid) fs.unlinkSync(LOCK); } catch {} };
+
+// ── Sources ────────────────────────────────────────────────────────────────
+
+async function channelGet(pathAndQuery) {
+  if (!CFG.channel_api_base || !CFG.channel_token_env) throw new Error(`${CHANNEL}: no API configured (rentals.json stay_calendar channel_api_base / channel_token_env)`);
+  const token = process.env[CFG.channel_token_env];
+  if (!token) throw new Error(`${CFG.channel_token_env} is not set (.env)`);
+  const res = await fetch(`${CFG.channel_api_base}${pathAndQuery}`, {
+    headers: { Authorization: `Bearer ${token}`, Accept: "application/json" },
+  });
+  const body = await res.json().catch(() => null);
+  if (!res.ok) throw new Error(`${CHANNEL} ${res.status}: ${body?.message || "request failed"}`);
+  return body;
+}
+
+/** Every reservation touching the window at the given channel-manager properties, all pages. */
+async function fetchReservations(channelIds, nowMs, sinceMs) {
+  if (!channelIds.length) return [];
+  const day = (ms) => new Date(ms).toISOString().slice(0, 10);
+  // Back 120 days so a long stay that arrived months ago still yields its
+  // upcoming check-out; forward past the sync window.
+  const from = day(Math.min(nowMs - 120 * 86400000, (sinceMs ?? Infinity) - 60 * 86400000));
+  const to = day(nowMs + 410 * 86400000);
+  const props = channelIds.map((id) => `properties[]=${id}`).join("&");
+  const out = [];
+  for (let page = 1; page <= 50; page++) {
+    const body = await channelGet(
+      `/reservations?${props}&start_date=${from}&end_date=${to}&include=guest,properties&per_page=100&page=${page}`
+    );
+    if (!body || !Array.isArray(body.data)) throw new Error(`${CHANNEL} returned no data array`);
+    out.push(...body.data);
+    const last = body.meta?.last_page ?? page;
+    if (page >= last) break;
+  }
+  return out;
+}
+
+/** Events already on the calendar in the window (a READ — gog directly is fine). */
+function listCalendar(win) {
+  const r = spawnSync(GOG, [
+    "calendar", "events", CALENDAR,
+    "--account", ACCOUNT, "--json", "--no-input",
+    "--from", sc.isoUtc(win.from), "--to", sc.isoUtc(win.to),
+    "--all-pages", "--max", "2500",
+  ], { encoding: "utf8", maxBuffer: 32 * 1024 * 1024 });
+  if (r.status !== 0) throw new Error(`gog calendar events failed: ${(r.stderr || "").trim().slice(0, 300)}`);
+  const body = JSON.parse(r.stdout || "{}");
+  return Array.isArray(body) ? body : (body.events || []);
+}
+
+// ── Writes (all through jori-calendar) ──────────────────────────────────
+
+function calWrite(argv) {
+  if (!fs.existsSync(CAL_WRITE)) throw new Error("no calendar-write gate (bin/jori-calendar) on this installation");
+  const r = spawnSync(process.execPath, [CAL_WRITE, ...argv], { encoding: "utf8", maxBuffer: 8 * 1024 * 1024 });
+  if (r.status !== 0) throw new Error((r.stderr || r.stdout || "").trim().slice(0, 300) || `exit ${r.status}`);
+}
+
+function eventFlags(ev) {
+  return [
+    "--summary", ev.summary,
+    "--from", ev.start,
+    "--to", ev.end,
+    "--description", ev.description,
+    "--transparency", "transparent",
+    "--private-prop", `phStay=${ev.key}`,
+    "--private-prop", `phHash=${ev.hash}`,
+  ];
+}
+
+// ── Main ───────────────────────────────────────────────────────────────────
+
+async function main() {
+  if (fs.existsSync(OFF)) { log("stay-calendar: kill switch present, not syncing"); return { skipped: "killswitch" }; }
+  if (!CALENDAR) { log("stay-calendar: no stay calendar configured (rentals.json stay_calendar.calendar_id), nothing to do"); return { skipped: "unconfigured" }; }
+  if (!DRY && !takeLock()) { log("stay-calendar: another run is in progress, exiting"); return { skipped: "locked" }; }
+
+  try {
+    const nowMs = Date.now();
+    const win = sc.windowOf(nowMs, SINCE_MS);
+
+    // Every source must answer, or nothing is written: a missing source looks
+    // exactly like "no stays", and acting on that deletes real events.
+    const reg = await registry();
+    const active = sc.activeProperties(reg.properties);
+    const channelIds = active.map((p) => CFG.channel_property_ids[p.id]).filter(Boolean);
+    const db = firestore();
+    const [reservations, leases, tenants] = await Promise.all([
+      fetchReservations(channelIds, nowMs, SINCE_MS),
+      db.list("leases"),
+      db.list("tenants"),
+    ]);
+    const existing = listCalendar(win);
+
+    const desired = sc.desiredEvents({ reservations, leases, tenants, properties: reg.properties, nowMs, sinceMs: SINCE_MS });
+    const plan = sc.planSync(desired, existing, nowMs, SINCE_MS);
+    const managed = existing.filter((e) => e?.extendedProperties?.private?.phStay).length;
+
+    const summary = {
+      properties: active.map((p) => p.id),
+      reservations: reservations.length,
+      leases: leases.length,
+      desired: desired.length,
+      managed,
+      create: plan.create.length,
+      update: plan.update.length,
+      remove: plan.remove.length,
+      dryRun: DRY,
+    };
+
+    const realRemovals = plan.remove.filter((r) => r.reason !== "duplicate").length;
+    if (!FORCE && realRemovals > MASS_DELETE_FLOOR && realRemovals > managed / 2) {
+      log(`stay-calendar: REFUSING — would delete ${realRemovals} of ${managed} events. A source may have returned empty. Re-run with --force if this is real.`);
+      summary.refused = "mass-delete";
+      process.exitCode = 3;
+      return summary;
+    }
+
+    if (DRY) {
+      for (const d of plan.create) log(`  + ${d.start}  ${d.summary}`);
+      for (const u of plan.update) log(`  ~ ${u.event.start}  ${u.event.summary}`);
+      for (const r of plan.remove) log(`  - ${r.key}  (${r.reason})`);
+      return summary;
+    }
+
+    const failures = [];
+    for (const d of plan.create) {
+      try { calWrite(["create", "--calendar", CALENDAR, ...eventFlags(d)]); }
+      catch (e) { failures.push(`create ${d.key}: ${e.message}`); }
+    }
+    for (const u of plan.update) {
+      try { calWrite(["update", u.id, "--calendar", CALENDAR, ...eventFlags(u.event)]); }
+      catch (e) { failures.push(`update ${u.event.key}: ${e.message}`); }
+    }
+    for (const r of plan.remove) {
+      try { calWrite(["delete", r.id, "--calendar", CALENDAR, "--force"]); }
+      catch (e) { failures.push(`delete ${r.key}: ${e.message}`); }
+    }
+
+    summary.failures = failures.length;
+    log(`stay-calendar: ${summary.desired} desired · +${summary.create} ~${summary.update} -${summary.remove}` +
+      (failures.length ? ` · ${failures.length} FAILED` : ""));
+    for (const f of failures) log(`  ✗ ${f}`);
+    if (failures.length) process.exitCode = 1;
+    return summary;
+  } finally {
+    if (!DRY) dropLock();
+  }
+}
+
+main()
+  .then((summary) => { if (JSON_OUT) console.log(JSON.stringify(summary)); })
+  .catch((err) => {
+    log(`stay-calendar: FAILED — ${err.message}`);
+    if (JSON_OUT) console.log(JSON.stringify({ error: err.message }));
+    process.exitCode = 1;
+  });

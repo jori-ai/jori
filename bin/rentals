@@ -1,0 +1,630 @@
+#!/usr/bin/env node
+"use strict";
+// rentals — a rental portfolio's books, answerable from one command.
+//
+// WHY THIS EXISTS. Everything about the properties was real and none of it was
+// reachable from here. Who lives at a given house, when their lease ends, what
+// one property earned last year, what an $801.43 Amazon charge actually
+// bought — all of it existed, in two different stores, and jori could reach
+// neither. Asked any of those questions it had to say it did not know, about a
+// business it watches the email of every day.
+//
+// THE TWO STORES, and why it is two:
+//
+//   • The BOOKS live in the portfolio's Firestore (agent/local/config/
+//     rentals.json `firebase_project`; none configured = no books here) —
+//     properties, tenants, leases, the categorised ledger, the chart of
+//     accounts. That app owns the accounting and is the only thing that writes
+//     it: sync writes the bank's facts, a classifier writes its verdict, the
+//     admin writes corrections. Three authors, by design.
+//
+//   • The EVIDENCE lives in jori's Supabase — `receipts` from mail and
+//     `amazon_orders` / `amazon_order_items` from Amazon's data export. A bank
+//     feed says a charge happened and never says what was bought; this is the
+//     other half, and jori is the thing that collects it.
+//
+// The books already reach across: `reconcile` pulls receipts into the ledger.
+// This tool reaches the other way, so a question can be answered without
+// knowing which store holds the answer.
+//
+// READ-ONLY, IN EVERY DIRECTION, and deliberately so. The ledger is a book of
+// record with three authors and a tax return at the end of it; a fourth author
+// arriving over a CLI is how a correction gets silently overwritten. There is
+// no write path in this file and none in lib/firestore-rest.js — not a
+// flag that is off by default, no code at all. Corrections happen in the hub's
+// Financials tab, where they are attributed to a person.
+//
+// Usage: rentals <command> [options]   ·  `rentals help` for the list.
+
+const { loadEnv } = require("../lib/load-env.js");
+const { request } = require("../lib/supabase-rest.js");
+// The books' reference data and accounting rules. Shared with the finance
+// reviews so the weekly review and this CLI cannot drift
+// into two different answers for the same question — see the library's header.
+const {
+  today, has,
+  firestore, registry, resolveProperty, publicSlugOf,
+  effectiveCategoryId, effectivePropertyId, countsInReports, contributionsOf,
+  loadTransactions, dateRange, statement, config,
+} = require("../lib/rental-ledger.js");
+loadEnv();
+
+// ── Formatting ──────────────────────────────────────────────────────────────
+
+const usd = (n) =>
+  n == null || Number.isNaN(Number(n))
+    ? "—"
+    : `${Number(n) < 0 ? "−" : ""}$${Math.abs(Number(n)).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+
+/** Dates are shown in the user's zone; storage stays whatever it is. */
+const day = (v) => (v ? String(v).slice(0, 10) : "—");
+const daysUntil = (iso) =>
+  iso ? Math.round((Date.parse(`${String(iso).slice(0, 10)}T00:00:00Z`) - Date.parse(`${today()}T00:00:00Z`)) / 86400000) : null;
+
+/** Column-aligned output. Money columns right-align; everything else left. */
+function table(rows, columns) {
+  if (!rows.length) return "  (nothing)";
+  const widths = columns.map((c) =>
+    Math.max(c.header.length, ...rows.map((r) => String(c.value(r) ?? "").length))
+  );
+  const line = (cells) =>
+    "  " + cells.map((cell, i) => (columns[i].right ? String(cell).padStart(widths[i]) : String(cell).padEnd(widths[i]))).join("  ").trimEnd();
+  return [
+    line(columns.map((c) => c.header)),
+    line(widths.map((w) => "─".repeat(w))),
+    ...rows.map((r) => line(columns.map((c) => c.value(r) ?? ""))),
+  ].join("\n");
+}
+
+// ── Arguments ───────────────────────────────────────────────────────────────
+
+function parseArgs(argv) {
+  const flags = {};
+  const positional = [];
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a.startsWith("--")) {
+      const [key, inline] = a.slice(2).split("=");
+      const next = argv[i + 1];
+      if (inline !== undefined) flags[key] = inline;
+      else if (next && !next.startsWith("--")) { flags[key] = next; i++; }
+      else flags[key] = true;
+    } else positional.push(a);
+  }
+  return { flags, positional };
+}
+
+
+// ── Commands: properties ────────────────────────────────────────────────────
+
+async function cmdProperties(flags) {
+  const { properties } = await registry();
+  const rows = properties.filter((p) => (flags.all ? true : p.kind === "property"));
+  if (flags.json) return print(rows);
+  console.log(`Portfolio — ${rows.filter((p) => p.kind === "property" && !p.disposedOn).length} held, ${rows.filter((p) => p.disposedOn).length} sold\n`);
+  console.log(table(rows, [
+    { header: "id", value: (p) => p.id },
+    { header: "name", value: (p) => p.name },
+    { header: "kind", value: (p) => (p.rentalType || p.kind) },
+    { header: "acquired", value: (p) => day(p.acquiredOn) },
+    { header: "sold", value: (p) => (p.disposedOn ? day(p.disposedOn) : "—") },
+    { header: "address", value: (p) => p.address || "—" },
+  ]));
+}
+
+async function cmdProperty(positional, flags) {
+  const reg = await registry();
+  const property = resolveProperty(reg.properties, positional[0]);
+  const db = firestore();
+  const slug = publicSlugOf(property);
+
+  const [tenants, availability] = await Promise.all([
+    slug ? db.query("tenants", { where: [["propertySlug", "EQUAL", slug]] }) : Promise.resolve([]),
+    slug ? db.get("unit-availability", slug) : Promise.resolve(null),
+  ]);
+  const accounts = reg.accounts.filter((a) => (a.ownership || []).some((o) => o.propertyId === property.id));
+
+  const units = Object.entries(availability?.units || {}).map(([unitId, u]) => ({
+    unitId,
+    name: u.name,
+    monthlyRent: u.monthlyRent,
+    available: u.available,
+    availableFrom: u.availableFrom || null,
+    tenants: tenants.filter((t) => t.unitId === unitId && t.status === "current").map((t) => `${t.firstName} ${t.lastName}`),
+  }));
+
+  if (flags.json) return print({ property, units, accounts, tenants });
+
+  console.log(`${property.name}  (${property.id})`);
+  console.log(`  ${property.address || "—"}`);
+  console.log(`  ${property.rentalType || property.kind}${property.acquiredOn ? ` · acquired ${day(property.acquiredOn)}` : ""}${property.disposedOn ? ` · SOLD ${day(property.disposedOn)}` : ""}`);
+  if (units.length) {
+    console.log(`\nUnits`);
+    console.log(table(units, [
+      { header: "unit", value: (u) => u.unitId },
+      { header: "rent", value: (u) => usd(u.monthlyRent), right: true },
+      { header: "status", value: (u) => (u.tenants.length ? "occupied" : u.available ? "AVAILABLE" : "vacant") },
+      { header: "next free", value: (u) => day(u.availableFrom) },
+      { header: "tenants", value: (u) => u.tenants.join(", ") || "—" },
+    ]));
+  }
+  const current = tenants.filter((t) => t.status === "current");
+  if (current.length) {
+    console.log(`\nCurrent tenants (${current.length})`);
+    console.log(table(current, [
+      { header: "name", value: (t) => `${t.firstName} ${t.lastName}` },
+      { header: "unit", value: (t) => t.unitId },
+      { header: "lease", value: (t) => `${day(t.leaseStartDate)} → ${day(t.leaseEndDate)}` },
+      { header: "ends in", value: (t) => { const d = daysUntil(t.leaseEndDate); return d == null ? "—" : `${d}d`; }, right: true },
+      { header: "email", value: (t) => t.email || "—" },
+    ]));
+  }
+  if (accounts.length) {
+    console.log(`\nAccounts`);
+    console.log(table(accounts, [
+      { header: "account", value: (a) => a.name },
+      { header: "mask", value: (a) => a.mask || "—" },
+      { header: "type", value: (a) => a.type },
+      { header: "sync", value: (a) => a.syncMode },
+      { header: "held", value: (a) => (a.ownership || []).filter((o) => o.propertyId === property.id).map((o) => `${o.from || "…"} → ${o.to || "now"}`).join(", ") },
+    ]));
+  }
+}
+
+// ── Commands: tenants & leases ──────────────────────────────────────────────
+
+async function cmdTenants(flags) {
+  const reg = await registry();
+  const db = firestore();
+  let tenants = await db.list("tenants");
+
+  if (flags.property) {
+    const property = resolveProperty(reg.properties, flags.property);
+    const slug = publicSlugOf(property);
+    tenants = tenants.filter((t) => t.propertySlug === slug);
+  }
+  const status = flags.status || "current";
+  if (status !== "all") tenants = tenants.filter((t) => t.status === status);
+  if (flags.search) {
+    const q = flags.search;
+    tenants = tenants.filter((t) => has(`${t.firstName} ${t.lastName}`, q) || has(t.email, q) || has(t.phone, q) || has(t.unitId, q));
+  }
+  if (flags.expiring) {
+    const limit = Number(flags.expiring);
+    tenants = tenants.filter((t) => { const d = daysUntil(t.leaseEndDate); return d != null && d >= 0 && d <= limit; });
+  }
+  tenants.sort((a, b) => String(a.leaseEndDate).localeCompare(String(b.leaseEndDate)));
+
+  if (flags.json) return print(tenants);
+  console.log(`Tenants — ${tenants.length} ${status === "all" ? "" : status}\n`);
+  console.log(table(tenants, [
+    { header: "name", value: (t) => `${t.firstName} ${t.lastName}` },
+    { header: "property", value: (t) => t.propertySlug },
+    { header: "unit", value: (t) => t.unitId },
+    { header: "status", value: (t) => t.status },
+    { header: "lease", value: (t) => `${day(t.leaseStartDate)} → ${day(t.leaseEndDate)}` },
+    { header: "ends in", value: (t) => { const d = daysUntil(t.leaseEndDate); return d == null ? "—" : `${d}d`; }, right: true },
+    { header: "contact", value: (t) => t.email || t.phone || "—" },
+  ]));
+}
+
+async function cmdTenant(positional, flags) {
+  const db = firestore();
+  const q = positional.join(" ");
+  const all = await db.list("tenants");
+  const matches = all.filter((t) => t.id === q || has(`${t.firstName} ${t.lastName}`, q) || has(t.email, q) || has(t.phone, q));
+  if (!matches.length) return fail(`No tenant matches "${q}".`);
+  if (matches.length > 1 && !flags.json) {
+    console.log(`"${q}" matches ${matches.length} tenants:`);
+    console.log(table(matches, [
+      { header: "name", value: (t) => `${t.firstName} ${t.lastName}` },
+      { header: "property", value: (t) => t.propertySlug },
+      { header: "status", value: (t) => t.status },
+      { header: "email", value: (t) => t.email || "—" },
+    ]));
+    return;
+  }
+  const t = matches[0];
+  const lease = t.leaseId ? await db.get("leases", t.leaseId) : null;
+  if (flags.json) return print({ tenant: t, lease });
+
+  console.log(`${t.firstName} ${t.lastName}  (${t.status})`);
+  console.log(`  ${t.propertySlug} · unit ${t.unitId}`);
+  console.log(`  ${t.email || "—"} · ${t.phone || "—"}`);
+  console.log(`  Lease ${day(t.leaseStartDate)} → ${day(t.leaseEndDate)}${(() => { const d = daysUntil(t.leaseEndDate); return d == null ? "" : ` (${d >= 0 ? `${d} days left` : `ended ${-d} days ago`})`; })()}`);
+  if (lease?.terms) {
+    console.log(`  Rent ${usd(lease.terms.rentAmount)}/mo, due on the ${lease.terms.rentDueOn}${lease.terms.securityDeposit ? ` · deposit ${usd(lease.terms.securityDeposit)}` : ""}`);
+    console.log(`  Lease ${lease.terms.leaseNumber} · ${lease.status}${lease.paymentProvider === "avail" ? " · billed through Avail" : ""}`);
+  }
+  if (t.occupationType) console.log(`  ${t.occupationType}${t.employerName ? ` at ${t.employerName}` : ""}${t.schoolName ? ` — ${t.schoolName}` : ""}`);
+  if (t.hasPet) console.log(`  Pet: ${t.petName || "unnamed"} (${t.petType || "?"}${t.petBreed ? `, ${t.petBreed}` : ""})`);
+  if (t.emergencyContact) console.log(`  Emergency: ${t.emergencyContact.name || "—"} ${t.emergencyContact.phone || ""}`);
+  if (t.ttlockPasscode) console.log(`  Door code ${t.ttlockPasscode}${t.ttlockFirstUnlockAt ? ` · first used ${day(t.ttlockFirstUnlockAt)}` : " · never used"}`);
+  if (t.occupants?.length) console.log(`  Also on the lease: ${t.occupants.map((o) => `${o.firstName || ""} ${o.lastName || ""}`.trim()).join(", ")}`);
+  if (t.notes) console.log(`  Notes: ${t.notes}`);
+}
+
+async function cmdLeases(flags) {
+  const reg = await registry();
+  const db = firestore();
+  let leases = await db.list("leases");
+  if (flags.property) {
+    const slug = publicSlugOf(resolveProperty(reg.properties, flags.property));
+    leases = leases.filter((l) => l.terms?.propertySlug === slug);
+  }
+  if (flags.status) leases = leases.filter((l) => l.status === flags.status);
+  if (flags.expiring) {
+    const limit = Number(flags.expiring);
+    leases = leases.filter((l) => { const d = daysUntil(l.terms?.endDate); return d != null && d >= 0 && d <= limit; });
+  }
+  leases.sort((a, b) => String(a.terms?.endDate).localeCompare(String(b.terms?.endDate)));
+  if (flags.json) return print(leases);
+  console.log(`Leases — ${leases.length}\n`);
+  console.log(table(leases, [
+    { header: "lease", value: (l) => l.terms?.leaseNumber || l.id },
+    { header: "property", value: (l) => l.terms?.propertySlug || "—" },
+    { header: "unit", value: (l) => l.terms?.unitId || "—" },
+    { header: "lessees", value: (l) => (l.lessees || []).map((x) => x.name).filter(Boolean).join(", ") || "—" },
+    { header: "term", value: (l) => `${day(l.terms?.startDate)} → ${day(l.terms?.endDate)}` },
+    { header: "rent", value: (l) => usd(l.terms?.rentAmount), right: true },
+    { header: "status", value: (l) => l.status },
+  ]));
+}
+
+// ── Commands: money ─────────────────────────────────────────────────────────
+
+async function cmdAccounts(flags) {
+  const reg = await registry();
+  if (flags.json) return print(reg.accounts);
+  console.log(`Accounts — ${reg.accounts.length}\n`);
+  console.log(table(reg.accounts, [
+    { header: "account", value: (a) => a.name },
+    { header: "institution", value: (a) => a.institution },
+    { header: "mask", value: (a) => a.mask || "—" },
+    { header: "type", value: (a) => a.type },
+    { header: "sync", value: (a) => a.syncMode },
+    { header: "attribution", value: (a) => (a.ownership || []).map((o) => `${o.propertyId} ${o.from || "…"}→${o.to || "now"}`).join(" · ") || "unattributed" },
+  ]));
+}
+
+async function cmdCategories(flags) {
+  const reg = await registry();
+  if (flags.json) return print(reg.categories);
+  console.log(`Chart of accounts — ${reg.categories.length}\n`);
+  console.log(table(reg.categories, [
+    { header: "id", value: (c) => c.id },
+    { header: "name", value: (c) => c.name },
+    { header: "kind", value: (c) => c.kind },
+    { header: "Schedule E", value: (c) => c.scheduleELine || "—" },
+    { header: "note", value: (c) => (c.isUnclassified ? "unclassified bucket" : c.excludedFromReports ? "excluded from reports" : c.archived ? "archived" : "") },
+  ]));
+}
+
+async function cmdTransactions(flags) {
+  const reg = await registry();
+  const range = dateRange(flags);
+  let txns = await loadTransactions(range);
+
+  const property = flags.property ? resolveProperty(reg.properties, flags.property) : null;
+  if (property) txns = txns.filter((t) => contributionsOf(t, reg.properties).some((c) => c.propertyId === property.id));
+  if (flags.category) txns = txns.filter((t) => effectiveCategoryId(t) === flags.category);
+  if (flags.account) {
+    txns = txns.filter((t) => {
+      const acct = reg.accountById.get(t.source.accountId);
+      return t.source.accountId === flags.account || has(acct?.name, flags.account) || acct?.mask === flags.account;
+    });
+  }
+  if (flags.search) {
+    const q = flags.search;
+    txns = txns.filter((t) =>
+      has(t.source.description, q) ||
+      has(t.source.merchantName, q) ||
+      has(t.override?.memo, q) ||
+      has(t.receipt?.vendor, q) ||
+      (t.receipt?.lineItems || []).some((li) => has(li.description, q)));
+  }
+  if (flags.min) txns = txns.filter((t) => Math.abs(t.source.amount) >= Number(flags.min));
+  if (flags.max) txns = txns.filter((t) => Math.abs(t.source.amount) <= Number(flags.max));
+  if (flags.unclassified) txns = txns.filter((t) => { const c = effectiveCategoryId(t); return !c || c === reg.unclassifiedId; });
+  if (flags.unreviewed) txns = txns.filter((t) => !t.reviewed);
+  if (!flags["include-excluded"]) txns = txns.filter(countsInReports);
+
+  const limit = Number(flags.limit || 50);
+  const shown = txns.slice(0, limit);
+  if (flags.json) return print(shown);
+
+  const total = txns.reduce((sum, t) => sum + t.source.amount, 0);
+  console.log(`Transactions ${range.since} → ${range.until}${property ? ` · ${property.name}` : ""} — ${txns.length} rows, net ${usd(total)} out\n`);
+  console.log(table(shown, [
+    { header: "date", value: (t) => t.source.date },
+    { header: "amount", value: (t) => usd(t.source.amount), right: true },
+    { header: "description", value: (t) => String(t.source.merchantName || t.source.description).slice(0, 42) },
+    { header: "category", value: (t) => effectiveCategoryId(t) || "—" },
+    { header: "property", value: (t) => effectivePropertyId(t) || (t.override?.propertyGroup ? `group:${t.override.propertyGroup}` : "—") },
+    { header: "what it was", value: (t) => receiptSummary(t) },
+  ]));
+  if (txns.length > shown.length) console.log(`\n  … ${txns.length - shown.length} more (--limit to raise)`);
+}
+
+/** The receipt's own words, which is the point of having matched one. */
+function receiptSummary(txn) {
+  const r = txn.receipt;
+  if (!r) return "—";
+  const items = (r.lineItems || []).map((li) => li.description).filter(Boolean);
+  if (!items.length) return r.vendor || "receipt";
+  const head = items.slice(0, 2).join("; ");
+  return (items.length > 2 ? `${head} +${items.length - 2}` : head).slice(0, 52);
+}
+
+async function cmdPnl(flags) {
+  const reg = await registry();
+  const range = flags.year || flags.since || flags.until ? dateRange(flags) : dateRange({ year: today().slice(0, 4) });
+  const txns = await loadTransactions(range);
+  const property = flags.property ? resolveProperty(reg.properties, flags.property) : null;
+
+  if (flags["by-property"]) {
+    const held = reg.properties.filter((p) => p.kind === "property");
+    const rows = held.map((p) => ({ property: p, ...statement(txns, reg, p) })).filter((r) => r.income || r.expenses || r.unclassifiedCount);
+    if (flags.json) return print(rows.map((r) => ({ propertyId: r.property.id, name: r.property.name, income: r.income, expenses: r.expenses, noi: r.noi, unclassifiedCount: r.unclassifiedCount })));
+    console.log(`P&L by property · ${range.since} → ${range.until}\n`);
+    console.log(table(rows, [
+      { header: "property", value: (r) => r.property.name },
+      { header: "income", value: (r) => usd(r.income), right: true },
+      { header: "expenses", value: (r) => usd(r.expenses), right: true },
+      { header: "net", value: (r) => usd(r.noi), right: true },
+      { header: "unclassified", value: (r) => (r.unclassifiedCount ? `${r.unclassifiedCount} rows ${usd(r.unclassifiedAmount)}` : "—") },
+    ]));
+    const t = rows.reduce((a, r) => ({ income: a.income + r.income, expenses: a.expenses + r.expenses, noi: a.noi + r.noi }), { income: 0, expenses: 0, noi: 0 });
+    console.log(`\n  Portfolio: income ${usd(t.income)} · expenses ${usd(t.expenses)} · net ${usd(t.noi)}`);
+    return;
+  }
+
+  const st = statement(txns, reg, property);
+  if (flags.json) return print({ range, property: property?.id ?? null, ...st });
+
+  console.log(`${property ? property.name : "All properties"} · ${range.since} → ${range.until}\n`);
+  for (const section of ["income", "expense"]) {
+    const lines = st.lines.filter((l) => l.kind === section);
+    if (!lines.length) continue;
+    console.log(section === "income" ? "Income" : "Expenses");
+    console.log(table(lines, [
+      { header: "category", value: (l) => l.name },
+      { header: "Schedule E", value: (l) => l.scheduleELine || "—" },
+      { header: "rows", value: (l) => l.count, right: true },
+      { header: "amount", value: (l) => usd(l.amount), right: true },
+    ]));
+    console.log(`  ${section === "income" ? "Total income" : "Total expenses"}: ${usd(section === "income" ? st.income : st.expenses)}\n`);
+  }
+  console.log(`Net operating income: ${usd(st.noi)}`);
+  if (st.unclassifiedCount) console.log(`Still unclassified: ${st.unclassifiedCount} rows, ${usd(st.unclassifiedAmount)} — these count in no total.`);
+}
+
+// ── Commands: what was in the box ───────────────────────────────────────────
+
+async function cmdOrders(flags) {
+  const params = new URLSearchParams({ select: "*", order: "order_date.desc", limit: String(Number(flags.limit || 40)) });
+  const filters = [];
+  if (flags.since) filters.push(`order_date=gte.${flags.since}`);
+  if (flags.until) filters.push(`order_date=lte.${flags.until}T23:59:59`);
+  if (flags.card) filters.push(`card_last4=eq.${flags.card}`);
+  if (flags.min) filters.push(`order_total=gte.${flags.min}`);
+  if (flags.max) filters.push(`order_total=lte.${flags.max}`);
+
+  // A product search is a search of the LINE ITEMS, so it starts there and
+  // comes back up to the orders. Anything else finds only the orders whose
+  // total happens to be memorable.
+  let orderIds = null;
+  if (flags.search) {
+    const items = await request(`/rest/v1/amazon_order_items?select=order_id&product_name=ilike.*${encodeURIComponent(flags.search)}*&limit=2000`);
+    orderIds = [...new Set((items || []).map((i) => i.order_id))];
+    if (!orderIds.length) { console.log(`No Amazon orders mention "${flags.search}".`); return; }
+    filters.push(`order_id=in.(${orderIds.join(",")})`);
+  }
+  const orders = await request(`/rest/v1/amazon_orders?${params}${filters.length ? "&" + filters.join("&") : ""}`) || [];
+  if (!orders.length) { console.log("No matching orders."); return; }
+
+  const items = await request(
+    `/rest/v1/amazon_order_items?select=order_id,product_name,quantity,item_total&order_id=in.(${orders.map((o) => o.order_id).join(",")})&limit=5000`
+  ) || [];
+  const byOrder = new Map();
+  for (const i of items) { if (!byOrder.has(i.order_id)) byOrder.set(i.order_id, []); byOrder.get(i.order_id).push(i); }
+
+  if (flags.json) return print(orders.map((o) => ({ ...o, items: byOrder.get(o.order_id) || [] })));
+  console.log(`Amazon orders — ${orders.length}${flags.search ? ` mentioning "${flags.search}"` : ""}\n`);
+  console.log(table(orders, [
+    { header: "date", value: (o) => day(o.order_date) },
+    { header: "total", value: (o) => usd(o.order_total), right: true },
+    { header: "card", value: (o) => o.card_last4 || "—" },
+    { header: "shipped to", value: (o) => String(o.ship_to || "—").slice(0, 28) },
+    { header: "what", value: (o) => {
+      const list = (byOrder.get(o.order_id) || []).map((i) => i.product_name);
+      const head = list.slice(0, 2).join("; ");
+      return (list.length > 2 ? `${head} +${list.length - 2}` : head).slice(0, 60) || "—";
+    } },
+    { header: "order", value: (o) => o.order_id },
+  ]));
+}
+
+async function cmdOrder(positional, flags) {
+  const id = positional[0];
+  if (!id) return fail("Usage: rentals order <order-id>");
+  const [order] = await request(`/rest/v1/amazon_orders?order_id=eq.${encodeURIComponent(id)}&select=*`) || [];
+  if (!order) return fail(`No Amazon order ${id} in the import. History ends at the last data export; newer orders arrive nightly via amazon-order-detail.`);
+  const items = await request(`/rest/v1/amazon_order_items?order_id=eq.${encodeURIComponent(id)}&select=*&order=line_number.asc`) || [];
+  if (flags.json) return print({ ...order, items });
+  console.log(`Order ${order.order_id} · ${day(order.order_date)} · ${usd(order.order_total)}`);
+  console.log(`  ${order.payment_method || "—"}${order.status ? ` · ${order.status}` : ""}${order.website && order.website !== "Amazon.com" ? ` · ${order.website}` : ""}`);
+  // The export repeats the recipient inside ship_to more often than not; printing
+  // it twice makes a long address unreadable.
+  const shipTo = order.ship_to || "—";
+  const recipient = order.ship_recipient && !has(shipTo, order.ship_recipient) ? `${order.ship_recipient}, ` : "";
+  console.log(`  Shipped to ${recipient}${shipTo}\n`);
+  console.log(table(items, [
+    { header: "#", value: (i) => i.line_number, right: true },
+    { header: "qty", value: (i) => i.quantity ?? "", right: true },
+    { header: "item", value: (i) => String(i.product_name).slice(0, 70) },
+    { header: "total", value: (i) => usd(i.item_total), right: true },
+    { header: "asin", value: (i) => i.asin || "—" },
+  ]));
+}
+
+async function cmdReceipts(flags) {
+  const params = new URLSearchParams({ select: "*", order: "date.desc", limit: String(Number(flags.limit || 40)) });
+  const filters = [];
+  if (flags.since) filters.push(`date=gte.${flags.since}`);
+  if (flags.until) filters.push(`date=lte.${flags.until}`);
+  if (flags.vendor) filters.push(`vendor=ilike.*${encodeURIComponent(flags.vendor)}*`);
+  if (flags.card) filters.push(`card_last4=eq.${flags.card}`);
+  if (flags.min) filters.push(`total=gte.${flags.min}`);
+
+  let ids = null;
+  if (flags.search) {
+    const lines = await request(`/rest/v1/receipt_line_items?select=receipt_id&description=ilike.*${encodeURIComponent(flags.search)}*&limit=2000`);
+    ids = [...new Set((lines || []).map((l) => l.receipt_id))];
+    if (!ids.length) { console.log(`No receipt line mentions "${flags.search}".`); return; }
+    filters.push(`id=in.(${ids.map((i) => `"${i}"`).join(",")})`);
+  }
+  const receipts = await request(`/rest/v1/receipts?${params}${filters.length ? "&" + filters.join("&") : ""}`) || [];
+  if (!receipts.length) { console.log("No matching receipts."); return; }
+  const lines = await request(
+    `/rest/v1/receipt_line_items?select=receipt_id,description,amount&receipt_id=in.(${receipts.map((r) => `"${r.id}"`).join(",")})&limit=5000`
+  ) || [];
+  const byReceipt = new Map();
+  for (const l of lines) { if (!byReceipt.has(l.receipt_id)) byReceipt.set(l.receipt_id, []); byReceipt.get(l.receipt_id).push(l); }
+
+  if (flags.json) return print(receipts.map((r) => ({ ...r, lineItems: byReceipt.get(r.id) || [] })));
+  console.log(`Receipts — ${receipts.length}\n`);
+  console.log(table(receipts, [
+    { header: "date", value: (r) => day(r.date) },
+    { header: "vendor", value: (r) => String(r.vendor).slice(0, 24) },
+    { header: "total", value: (r) => usd(r.total), right: true },
+    { header: "card", value: (r) => r.card_last4 || "—" },
+    { header: "shipped to", value: (r) => String(r.ship_to || "—").slice(0, 24) },
+    { header: "items", value: (r) => {
+      const list = (byReceipt.get(r.id) || []).map((l) => l.description);
+      const head = list.slice(0, 2).join("; ");
+      return (list.length > 2 ? `${head} +${list.length - 2}` : head).slice(0, 48) || "—";
+    } },
+  ]));
+}
+
+// ── Commands: the whole picture ─────────────────────────────────────────────
+
+async function cmdOverview(flags) {
+  const reg = await registry();
+  const db = firestore();
+  const year = flags.year || today().slice(0, 4);
+  const [tenants, txns] = await Promise.all([
+    db.list("tenants"),
+    loadTransactions({ since: `${year}-01-01`, until: `${year}-12-31` }),
+  ]);
+  const held = reg.properties.filter((p) => p.kind === "property" && !p.disposedOn);
+  const current = tenants.filter((t) => t.status === "current");
+  const st = statement(txns, reg, null);
+  const expiring = current
+    .map((t) => ({ t, d: daysUntil(t.leaseEndDate) }))
+    .filter((x) => x.d != null && x.d >= 0 && x.d <= 120)
+    .sort((a, b) => a.d - b.d);
+
+  if (flags.json) return print({ year, held: held.map((p) => p.id), currentTenants: current.length, statement: st, expiring: expiring.map((x) => ({ tenant: `${x.t.firstName} ${x.t.lastName}`, property: x.t.propertySlug, unit: x.t.unitId, endsIn: x.d })) });
+
+  console.log(`${config().portfolio_label || "Portfolio"} · ${year}\n`);
+  console.log(`  ${held.length} properties held: ${held.map((p) => p.name).join(", ")}`);
+  console.log(`  ${current.length} current tenants across ${new Set(current.map((t) => t.propertySlug)).size} properties`);
+  console.log(`  Income ${usd(st.income)} · expenses ${usd(st.expenses)} · net ${usd(st.noi)}`);
+  if (st.unclassifiedCount) console.log(`  ${st.unclassifiedCount} transactions still unclassified (${usd(st.unclassifiedAmount)}) — in no total`);
+  if (expiring.length) {
+    console.log(`\nLeases ending within 120 days`);
+    console.log(table(expiring, [
+      { header: "tenant", value: (x) => `${x.t.firstName} ${x.t.lastName}` },
+      { header: "property", value: (x) => x.t.propertySlug },
+      { header: "unit", value: (x) => x.t.unitId },
+      { header: "ends", value: (x) => day(x.t.leaseEndDate) },
+      { header: "in", value: (x) => `${x.d}d`, right: true },
+    ]));
+  }
+}
+
+// ── Plumbing ────────────────────────────────────────────────────────────────
+
+const print = (v) => console.log(JSON.stringify(v, null, 2));
+const fail = (msg) => { console.error(msg); process.exitCode = 1; };
+
+const HELP = `rentals — the rental portfolio's books, read-only.
+
+  overview [--year Y]                     properties, tenants, the year's P&L, leases running out
+  properties [--all]                      the registry (--all adds business/personal/buffer)
+  property <name>                         one property: units, tenants, accounts
+  tenants [--property P] [--status current|future|former|evicted|pending|all]
+          [--search Q] [--expiring DAYS]
+  tenant <name|email|id>                  one tenant, with their lease terms
+  leases [--property P] [--status S] [--expiring DAYS]
+  accounts                                bank/card accounts and which property owns them when
+  categories                              the chart of accounts
+  transactions [--year Y | --since D --until D] [--property P] [--category C]
+               [--account A] [--search Q] [--min N] [--max N]
+               [--unclassified] [--unreviewed] [--include-excluded] [--limit N]
+  pnl [--year Y | --since D --until D] [--property P] [--by-property]
+  orders [--search Q] [--since D] [--until D] [--card 1234] [--min N] [--limit N]
+  order <order-id>                        one Amazon order, line by line
+  receipts [--search Q] [--vendor V] [--since D] [--card N] [--limit N]
+  where                                   which store answers which question
+
+Every command takes --json.  Dates are YYYY-MM-DD, shown in the user's zone.
+A property can be named any way: its id, its public slug, a name or address
+fragment, or an alias from agent/local/config/rentals.json.`;
+
+const WHERE = `Where each answer comes from — two stores, one question.
+
+  The portfolio's Firestore (rentals.json firebase_project) — THE BOOKS
+    financial-properties   the registry, including the three sold ones
+    financial-accounts     accounts + which property owned them on which dates
+    financial-categories   the chart of accounts (Schedule E lines)
+    financial-transactions the ledger: source / classification / override / receipt
+    tenants, leases        who lives where, on what terms, until when
+    unit-availability      units, asking rent, when each next comes free
+  Written ONLY by the hub (sync, classifier, admin). This tool never writes.
+
+  jori Supabase — THE EVIDENCE
+    receipts, receipt_line_items   extracted from mail by receipt-scan
+    amazon_orders, amazon_order_items   21 years, from Amazon's data export
+  A bank feed says a charge happened; these say what was bought.
+
+  The books already pull evidence in (reconcile attaches a receipt to a charge),
+  so a transaction usually answers "what was it" by itself. Reach for orders /
+  receipts when it does not — an unmatched charge, a multi-shipment order, or a
+  purchase that never became a charge on a synced card.
+
+  Not here: nightly bookings and guest messages (the short-term-rental channel
+  manager is authoritative), rent collection (the rent-payment provider),
+  door codes beyond the tenant record.`;
+
+async function main() {
+  const { flags, positional } = parseArgs(process.argv.slice(2));
+  const command = positional.shift() || "overview";
+  const commands = {
+    overview: () => cmdOverview(flags),
+    properties: () => cmdProperties(flags),
+    property: () => cmdProperty(positional, flags),
+    tenants: () => cmdTenants(flags),
+    tenant: () => cmdTenant(positional, flags),
+    leases: () => cmdLeases(flags),
+    accounts: () => cmdAccounts(flags),
+    categories: () => cmdCategories(flags),
+    transactions: () => cmdTransactions(flags),
+    txns: () => cmdTransactions(flags),
+    pnl: () => cmdPnl(flags),
+    orders: () => cmdOrders(flags),
+    order: () => cmdOrder(positional, flags),
+    receipts: () => cmdReceipts(flags),
+    where: () => console.log(WHERE),
+    help: () => console.log(HELP),
+  };
+  if (!commands[command]) { console.error(`Unknown command "${command}".\n`); console.log(HELP); process.exit(1); }
+  await commands[command]();
+}
+
+main().catch((err) => {
+  console.error(`rentals: ${err.message}`);
+  process.exit(1);
+});
