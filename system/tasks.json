@@ -1648,7 +1648,7 @@
         "where did my money go",
         "weekly spending"
       ],
-      "description": "Weekly financial review across all connected accounts: cash and runway with shortfalls, income arrival, spending by category, card and merchant, anomalies and fees; a deterministic packet (bin/finance-review-data, -compose) narrated once. READ-ONLY. Playbook: agent/ops-agent/jobs/finance-review.md (the installation's).",
+      "description": "Weekly financial review across all connected accounts: cash and runway with shortfalls, income arrival, spending by category, card and merchant, anomalies and fees; a deterministic packet (bin/finance-review-data, -compose) narrated once. READ-ONLY. Playbook: agent/ops-agent/jobs/finance-review.md.",
       "job": "finance-review"
     },
     {
@@ -1887,6 +1887,61 @@
       ],
       "description": "Free calendar holds for upcoming launches matching agent/local/config/launch-watch.json `search` (Launch Library 2), sized by NET precision in the home zone; pings only on add, a move over 6h, or removal. Off without `search`. Playbook: agent/ops-agent/jobs/launch-watch.md.",
       "job": null
+    },
+    {
+      "name": "weekend-events",
+      "schedule": "50 2 * * 5",
+      "schedule_human": "Fridays at 9:00 AM",
+      "trigger_script": "agent/scripts/trigger-weekend-events.sh",
+      "webhook_url": "http://localhost:9092",
+      "webhook_task": "WEEKEND EVENTS",
+      "ops_playbook_section": "Weekend Events",
+      "delivers_to": "jori",
+      "phrases": [
+        "weekend events",
+        "weekend plans",
+        "weekend activities",
+        "weekend activity list",
+        "weekend digest",
+        "what's on this weekend",
+        "whats on this weekend"
+      ],
+      "description": "Find the best events this weekend in the city the user will be in (travel timeline), verified against primary sources; one email + phone pointer + push.",
+      "job": "weekend-events"
+    },
+    {
+      "name": "birthday-brainstorm",
+      "schedule": "0 10 * * *",
+      "schedule_human": "Daily at 10:00 AM (date-gated — fires only on the stage days in agent/local/birthday-brainstorm/people.json)",
+      "trigger_script": "agent/scripts/trigger-birthday-brainstorm.sh",
+      "webhook_url": "http://localhost:9092",
+      "webhook_task": "BIRTHDAY BRAINSTORM",
+      "ops_playbook_section": null,
+      "delivers_to": "email+jori",
+      "phrases": [
+        "birthday brainstorm",
+        "birthday gift brainstorm",
+        "birthday ideas"
+      ],
+      "description": "Experience-gift ideas ahead of each configured birthday: kickoff (T-2 months), concrete options (T-1 month), reminder (T-7), day-of. Off with no people configured. Never drafts birthday messages.",
+      "job": "birthday-brainstorm"
+    },
+    {
+      "delivers_to": "email",
+      "job": "occasion-ideas",
+      "ops_playbook_section": null,
+      "phrases": [
+        "occasion ideas",
+        "anniversary ideas"
+      ],
+      "webhook_task": null,
+      "webhook_url": null,
+      "name": "occasion-ideas",
+      "schedule": "25 5 * * *",
+      "schedule_human": "Daily at 5:25 AM local (launchd agent ai.claude.occasion-ideas, NOT cron — Opus via claude -p needs the in-session Max keychain); emails only inside the window before an occasion in agent/local/occasion-ideas/occasions.json",
+      "trigger_script": "agent/scripts/trigger-occasion-ideas.sh",
+      "scheduler": "launchd",
+      "description": "One Opus email a day for the weeks before each configured occasion (an anniversary, a birthday): a great meal + evening bar + one activity/show in the city the user will be in. Off with no occasions configured. See ops-agent/jobs/occasion-ideas.md."
     }
   ]
 }

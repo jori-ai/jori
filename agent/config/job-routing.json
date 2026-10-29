@@ -122,6 +122,21 @@
       "model": "haiku",
       "effort": "low",
       "rationale": "Venue sweep + roster match + gates run as code (bin/comedy-club-watch-run). This tier only receives the dispatches that need language: the Hits check on a roster hit and the daily Direction A roster search."
+    },
+    "weekend-events": {
+      "disposition": "scheduled",
+      "target": "watch-sweep",
+      "model": "haiku",
+      "effort": "low",
+      "rationale": "Weekend event scan. Fold."
+    },
+    "occasion-ideas": {
+      "disposition": "scheduled",
+      "target": "watch-sweep",
+      "model": "opus",
+      "effort": "xhigh",
+      "runtime": "ephemeral-opus",
+      "rationale": "Daily ideas email for the weeks before each configured occasion. Opus tier, run as a dedicated ephemeral `claude -p` on $JORI_MODEL_OPUS via launchd (ai.claude.occasion-ideas); `model: opus` here is only a tier label. Date-gated in trigger-occasion-ideas.sh from agent/local/occasion-ideas/occasions.json, so it spends nothing outside a window."
     }
   }
 }
