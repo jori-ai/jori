@@ -1,0 +1,424 @@
+#!/usr/bin/env node
+// stop-passage — before asking "where was this?", ask the data whether it was
+// a stop at all. Layer 1 is geometry (lib/stop-passage.mjs), layer 2 is
+// Jev over photos + calendar + messages (lib/stop-passage-jev.mjs).
+//
+// Called by BOTH ask paths before they compose a question:
+//   bin/findme enrich   (→ location-enrich → location-ask-queue → hum)
+//   bin/segment-ask     (→ choice card)
+// A `passage` verdict with --apply marks the visit row `non-stop` (the reason
+// goes in `notes` as `[passage-auto] …`), so neither path asks and enrich's
+// pending-queue hygiene drops it. Every other outcome — rest, inconclusive with
+// no confident Jev walk, any error — leaves the row alone and the caller asks
+// exactly as before (fail-open toward asking, never toward silence).
+//
+// Two outcomes come BEFORE the walk/stop question (2026-10-08, the 09:28 print
+// shop the user had on the user's calendar, withdrawn as a walk and printed as "not a stop,
+// not a stop"):
+//   `calendar` — a timed calendar event whose geocoded location is within
+//                150 m of where the user was in the window (lib/calendar-place.mjs).
+//                The user already said where the user'd be: with --apply the row is named
+//                after the event (`named`, `[calendar]` in notes) and neither
+//                path asks.
+//   `hold`     — the trace says walk, but the photo library has not synced
+//                past the window yet. The 09:29 photo at the counter synced 47
+//                minutes later. Nothing is written; the next run re-judges.
+//
+//   `evidence` — (2026-10-08, the 14:24 lunch the user had already told Jori
+//                about) what the user SAID in chat and SHOWED in photos during the
+//                window names the place: the user's words, Jori naming it from the user's
+//                photo and the user going along, a sign in a photo
+//                (lib/stop-evidence.mjs, Jev site `stop-evidence`, Sonnet
+//                fallback). Runs only on a window that would otherwise be asked
+//                about (rest / inconclusive). With --apply the row is named
+//                (`named`, `[stop-evidence]` in notes) and neither path asks.
+//                A model judgment can't self-confirm, so this never writes
+//                confirmed-stops.json — except the user's own words, below.
+//                (a lunch the user had named at 12:42 for a 13:31 stop)
+//                The step first reads the WHOLE DAY's chat and the
+//                calendar around the window (lib/stated-place.mjs, a
+//                model ladder: local, Sonnet, Opus). When the user's own words name
+//                the place (read by a Claude rung), the row is saved through the confirm path —
+//                `location-confirm save-visit`, the write the user's answer to the
+//                card would have made (`user-confirmed` + confirmed-stops.json);
+//                layer `stated`. Named from the calendar alone, or by the
+//                on-device rung, it is `named` as above. Either way the verdict is `evidence`, so neither
+//                path asks.
+//
+// Before any of it, the PHONE is asked for its photos of the window
+// (lib/photo-probe.mjs: a probe row + silent push; the app reads its
+// camera roll and upserts those photos into `photos`): the phone's roll is
+// checked rather than waiting for the photos to sync to the host. A probe the
+// phone answered satisfies the photo-sync hold below; one still unanswered
+// after the wait returns `hold` for up to PROBE_HOLD_MIN, then the run goes on
+// without it (fail-open). --no-probe skips it.
+//
+// Usage:
+//   stop-passage --visit <id> [--start ISO --end ISO] [--tz Area/City]
+//                [--apply] [--no-jev] [--no-probe] [--no-stated] [--evidence-dry] [--audit] [--json]
+// --no-stated: skip the whole-day stated-place read (lib/stated-place.mjs).
+// --evidence-dry: run the evidence step even on a settled row (user-confirmed /
+// named) and never write it — for checking the step against the user's own answers.
+// --audit: --no-probe --evidence-dry, nothing written, log row tagged audit.
+// --evidence-asof ISO: read only chat sent by then (the audit passes when the
+// question went out, so the user's answer to it doesn't count as prior evidence).
+// --start/--end override the row's window (segment-ask derives the end from
+// arrival + minutes; a sweeper-synthesized departed_at can be hours late).
+// Log: data/stop-passage-log.jsonl (one row per call).
+
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { installTools } from "../lib/root.cjs";
+import { instance, localConfig, supabaseUrl } from "../lib/instance.cjs";
+import { spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
+import { createRequire } from "node:module";
+import { pointsFrom, classifyWindow, isTurnaround, asTurnaround, JEV_MAX_HIDDEN_MIN, PATH_ACC_MAX_M } from "../lib/stop-passage.mjs";
+import { calendarPlaceAt, venueForCalendarMatch, businessesNear } from "../lib/calendar-place.mjs";
+const { haversineMeters } = createRequire(import.meta.url)("../lib/stop-rests.js");
+
+const HERE = path.dirname(fileURLToPath(import.meta.url));
+const ROOT = path.resolve(HERE, "..");
+const ENV_FILE = installTools(".env");
+const DATA = installTools("data");
+const LOG = path.join(DATA, "stop-passage-log.jsonl");
+const SUPABASE_URL = process.env.SUPABASE_URL || supabaseUrl();
+// gog: $GOG_BIN, else a package-manager install (launchd's PATH has neither), else PATH.
+const GOG = process.env.GOG_BIN || ["/opt/homebrew/bin/gog", "/usr/local/bin/gog"].find((p) => fs.existsSync(p)) || "gog";
+// The cron job that syncs the photo library to this host (its name in
+// data/cron-runs.jsonl), for the photo-sync hold below; agent/local/config/
+// location-ask.json `photo_sync_job`. Unset (a fresh install): no hold.
+const PHOTO_SYNC_JOB = localConfig("location-ask", { photo_sync_job: "" }).photo_sync_job || "";
+const CONTEXT_PAD_MIN = 45; // fixes either side: the gaps crossing the window edge, and the out-and-back check
+const PHOTO_PAD_MIN = 10;
+// iCloud carries a photo to the host's library some minutes after it is taken,
+// and the photo sync job runs every half hour: a 09:29 photo missed the 09:45
+// run and landed at 10:15. A sync that STARTED this long after the window
+// has had its chance to see the window's photos.
+const PHOTO_SETTLE_MIN = 30;
+const CRON_RUNS = path.join(DATA, "cron-runs.jsonl");
+// How long the phone may sit on a probe before the run goes ahead without it.
+const PROBE_HOLD_MIN = 15;
+const PROBE_WAIT_MS = 30000;
+
+/** Start (ms) of the last successful photo sync run, or null if unknown
+ *  (no job configured, or no log here — e.g. a laptop run — so don't hold on
+ *  missing information). */
+function lastPhotoSync() {
+  if (!PHOTO_SYNC_JOB) return null;
+  try {
+    const fd = fs.openSync(CRON_RUNS, "r");
+    const size = fs.fstatSync(fd).size, len = Math.min(size, 512 * 1024);
+    const buf = Buffer.alloc(len);
+    fs.readSync(fd, buf, 0, len, size - len);
+    fs.closeSync(fd);
+    const lines = buf.toString("utf8").split("\n").reverse();
+    for (const l of lines) {
+      if (!l.includes(JSON.stringify(PHOTO_SYNC_JOB))) continue;
+      try { const r = JSON.parse(l); if (r.exit === 0) return Date.parse(r.start); } catch {}
+    }
+  } catch {}
+  return null;
+}
+
+function arg(name) { const i = process.argv.indexOf(name); return i > 0 ? process.argv[i + 1] : null; }
+const has = (n) => process.argv.includes(n);
+
+function envValue(k) {
+  if (process.env[k]) return process.env[k];
+  try {
+    const m = fs.readFileSync(ENV_FILE, "utf8").match(new RegExp(`^${k}=(.+)$`, "m"));
+    return m ? m[1].trim().replace(/^["']|["']$/g, "") : null;
+  } catch { return null; }
+}
+// jev.mjs reads TYPESAFE_API_KEY from the environment; cron-launched callers
+// don't carry .env, so lift it here before the Jev module loads.
+for (const k of ["TYPESAFE_API_KEY", "GOG_KEYRING_PASSWORD"]) if (!process.env[k]) { const v = envValue(k); if (v) process.env[k] = v; }
+
+function defaultTz() {
+  try { return JSON.parse(fs.readFileSync(path.join(DATA, "user-timezone.json"), "utf8")).timezone || instance().tz; }
+  catch { return instance().tz; }
+}
+
+async function sb(pathQs, init = {}) {
+  const key = envValue("SUPABASE_SERVICE_ROLE_KEY");
+  if (!key) throw new Error("no SUPABASE_SERVICE_ROLE_KEY");
+  const r = await fetch(`${SUPABASE_URL}/rest/v1/${pathQs}`, {
+    ...init,
+    headers: { apikey: key, Authorization: `Bearer ${key}`, "Content-Type": "application/json", ...(init.headers || {}) },
+    signal: AbortSignal.timeout(15000),
+  });
+  if (!r.ok) throw new Error(`supabase ${r.status}: ${(await r.text()).slice(0, 200)}`);
+  return init.method === "PATCH" ? null : r.json();
+}
+const iso = (t) => new Date(t).toISOString();
+const q = encodeURIComponent;
+
+// `description` only for the stated-place step: Jev's walk/stop state stays as it was.
+function calendarAround(s, e, { description = false } = {}) {
+  try {
+    const r = spawnSync(GOG, ["calendar", "list", "--json", "--results-only", "--from", iso(s), "--to", iso(e), "--all"],
+      { encoding: "utf8", timeout: 8000 });
+    if (r.status !== 0 || !r.stdout) return [];
+    const parsed = JSON.parse(r.stdout);
+    return (Array.isArray(parsed) ? parsed : [])
+      .filter((ev) => (ev.transparency || "opaque") !== "transparent")
+      .map((ev) => ({ summary: ev.summary || "", location: ev.location || "",
+        ...(description ? { description: String(ev.description || "").slice(0, 500) } : {}),
+        start: ev.start?.dateTime || ev.start?.date || "", end: ev.end?.dateTime || ev.end?.date || "" }));
+  } catch { return []; }
+}
+
+/** The confirm path for a stop the user named themself (location-confirm save-visit). */
+function confirmVisit(visitId, name) {
+  const r = spawnSync(path.join(HERE, "location-confirm"), ["save-visit", visitId, name, "--source", "user_stated_chat"],
+    { encoding: "utf8", timeout: 60000 });
+  let out = null;
+  try { out = JSON.parse((r.stdout || "").trim().split("\n").pop() || "null"); } catch {}
+  if (r.status !== 0 || !out) return { ok: false, error: `exit ${r.status}: ${String(r.stderr || r.stdout || "").trim().slice(-200)}` };
+  return { ok: true, promoted: !!out.promoted, reason: out.reason || null,
+    patched: out.saved ? out.saved.patched_location_history === true : null };
+}
+
+function log(row) {
+  if (has("--audit")) row = { ...row, audit: true };
+  try { fs.appendFileSync(LOG, JSON.stringify({ ts: new Date().toISOString(), ...row }) + "\n"); } catch {}
+}
+
+/** Ask the phone for its camera-roll photos of the window. Never throws. */
+async function phoneProbe(visitId, start, end) {
+  if (has("--no-probe") || has("--audit") || Date.now() <= end) return { status: "skipped" };
+  try {
+    const { probeForWindow } = await import("../lib/photo-probe.mjs");
+    return await probeForWindow({ visitId, start, end, waitMs: PROBE_WAIT_MS });
+  } catch (e) {
+    return { status: "unavailable", error: String(e.message || e).slice(0, 160) };
+  }
+}
+
+async function main() {
+  const visitId = arg("--visit");
+  if (!visitId) { console.error("usage: stop-passage --visit <id> [--start ISO --end ISO] [--tz Z] [--apply] [--no-jev] [--json]"); process.exit(2); }
+  const tz = arg("--tz") || defaultTz();
+  const [visit] = await sb(`location_history?id=eq.${q(visitId)}&select=id,segment_type,place_type,place_name,latitude,longitude,arrived_at,departed_at,notes&limit=1`);
+  if (!visit) throw new Error(`no row ${visitId}`);
+  const start = Date.parse(arg("--start") || visit.arrived_at);
+  const end = Date.parse(arg("--end") || visit.departed_at || visit.arrived_at);
+  if (!(end > start)) throw new Error("window has no length");
+
+  // The phone first: its photos land in `photos` before we read them below.
+  const probe = await phoneProbe(visitId, start, end);
+  if (probe.status === "pending" && (probe.age_min ?? 0) < PROBE_HOLD_MIN) {
+    const out = { visit_id: visitId, window: { start: iso(start), end: iso(end) }, verdict: "hold", layer: "probe",
+      reason: `asked the phone for its photos of the window (probe ${probe.id || "?"}, ${probe.age_min ?? 0} min ago) — re-judge next run`,
+      applied: false, probe };
+    log(out);
+    if (has("--json")) process.stdout.write(JSON.stringify(out) + "\n"); else console.log(`hold (probe) — ${out.reason}`);
+    return;
+  }
+  const probeDone = probe.status === "done";
+
+  const pad = CONTEXT_PAD_MIN * 60000, ppad = PHOTO_PAD_MIN * 60000;
+  const [fixes, photos] = await Promise.all([
+    sb(`location_history?segment_type=eq.transit&arrived_at=gte.${q(iso(start - pad))}&arrived_at=lte.${q(iso(end + pad))}`
+      + `&select=latitude,longitude,accuracy_m,activity,arrived_at&order=arrived_at.asc&limit=2000`),
+    sb(`photos?taken_at=gte.${q(iso(start - pad))}&taken_at=lte.${q(iso(end + pad))}&in_trash=is.false`
+      + `&select=taken_at,latitude,longitude,self_captured,labels,detected_text,media_type&order=taken_at.asc&limit=200`).catch(() => []),
+  ]);
+  const points = pointsFrom({ fixes, photos });
+  const protectedRow = ["user-confirmed", "non-stop"].includes(visit.place_type);
+
+  // The user put it on the user's calendar, and the user was there: name it, never ask, never
+  // withdraw it. Measured from where the user WAS in the window, not the row alone.
+  const atPoints = points.filter((p) => p.t >= start && p.t <= end && (p.acc == null || p.acc <= PATH_ACC_MAX_M))
+    .concat(Number.isFinite(Number(visit.latitude)) ? [{ lat: Number(visit.latitude), lon: Number(visit.longitude) }] : []);
+  const cal = calendarPlaceAt({ start, end, points: atPoints });
+  if (cal.error) console.error(`[stop-passage] calendar lookup failed: ${cal.error}`);
+  if (cal.match) {
+    const m = cal.match;
+    // The PLACE comes from the event's location field; the title is only a
+    // hint (2026-10-08: "Print & Coffee" was written up as the shop's name).
+    const inWindow = photos.filter((p) => Date.parse(p.taken_at) >= start && Date.parse(p.taken_at) <= end && p.self_captured !== false);
+    let venue;
+    try { venue = await venueForCalendarMatch(m, { photos: inWindow, id: visitId }); }
+    catch { venue = { name: (m.place_name || m.location.split(",")[0]).trim(), source: "calendar_address" }; }
+    // Several businesses at the address fit: a real stop, never withdrawn, but
+    // not ours to name — the ask goes out with just those (stop-identify).
+    if (venue.source === "calendar_ambiguous") {
+      const out = { visit_id: visitId, window: { start: iso(start), end: iso(end) }, verdict: "rest", layer: "calendar",
+        reason: `at the location of the user's calendar event "${m.summary}" (${m.location}); more than one business there fits: `
+          + venue.shortlist.map((c) => c.name).join(" / "), applied: false, protected: protectedRow, calendar: m, venue };
+      log(out);
+      if (has("--json")) process.stdout.write(JSON.stringify(out) + "\n"); else console.log(`rest (calendar) — ${out.reason}`);
+      return;
+    }
+    const reason = `at the location of the user's calendar event "${m.summary}" (${m.location}, ${m.distance_m} m): ${venue.name} [${venue.source}]`;
+    let applied = false;
+    if (has("--apply") && !has("--audit") && !protectedRow && visit.segment_type === "visit" && venue.name) {
+      const note = `[calendar] ${venue.name} (${venue.source}) — event "${m.summary}" @ ${m.location}, ${m.distance_m} m`
+        + (visit.place_name ? ` — was: ${visit.place_name}` : "");
+      await sb(`location_history?id=eq.${q(visitId)}`, {
+        method: "PATCH", headers: { Prefer: "return=minimal" },
+        body: JSON.stringify({ place_type: "named", place_name: venue.name, notes: visit.notes ? `${visit.notes} | ${note}` : note }),
+      });
+      applied = true;
+    }
+    const out = { visit_id: visitId, window: { start: iso(start), end: iso(end) }, verdict: "calendar", layer: "calendar",
+      reason, applied, protected: protectedRow, calendar: m, venue, name: venue.name };
+    log(out);
+    if (has("--json")) process.stdout.write(JSON.stringify(out) + "\n");
+    else console.log(`calendar — ${reason}${applied ? "  [named]" : ""}`);
+    return;
+  }
+
+  // The far end of a drive out and back (bin/day-segments § turnaround_stops,
+  // 2026-10-29). The car is moving through the whole window, which is how it got
+  // here, so the geometry can only ever call it a passage, and Jev reading it as
+  // a walk would withdraw the only record of a destination. It skips both and
+  // goes on to the evidence step, which is where "do we already know the
+  // purpose of the drive" is answered (the user's calendar, what the user said in chat). The
+  // calendar check above has already run. Set membership over a token we wrote.
+  const turnaround = isTurnaround(visit.notes);
+  let l1 = classifyWindow({ points, start, end });
+  if (turnaround) l1 = asTurnaround(l1);
+
+  let verdict = l1.verdict, layer = "geometry", reason = l1.reason, jev = null;
+  if (l1.verdict === "inconclusive" && !turnaround && !has("--no-jev")) {
+    const { buildState, judgeWindow } = await import("../lib/stop-passage-jev.mjs");
+    const near = photos.filter((p) => Date.parse(p.taken_at) >= start - ppad && Date.parse(p.taken_at) <= end + ppad && p.self_captured !== false);
+    let messages = [];
+    try {
+      // The column is `content`. Until 2026-10-08 this selected `body`, the
+      // query 400'd into the catch, and Jev never saw a single message of the user's.
+      messages = await sb(`jori_messages?role=eq.user&created_at=gte.${q(iso(start - 15 * 60000))}&created_at=lte.${q(iso(end + 45 * 60000))}`
+        + `&select=content,created_at&order=created_at.asc&limit=20`);
+      messages = messages.map((m) => ({ body: m.content, at: m.created_at }));
+    } catch {}
+    const state = buildState({
+      start: iso(start), end: iso(end), tz, features: l1.features,
+      areaName: visit.place_type === "segment-derived" ? visit.place_name : null,
+      photos: near, calendar: calendarAround(start, end), messages,
+    });
+    try {
+      jev = await judgeWindow({ id: visitId, state });
+      if (jev.decision === "passage" && l1.features.longest_hidden_min >= JEV_MAX_HIDDEN_MIN)
+        reason = `${l1.reason}; jev: walk (${(jev.confidence ?? 0).toFixed(2)}) overruled, a ${l1.features.longest_hidden_min}-min silence is a still phone`;
+      else if (jev.decision === "passage") { verdict = "passage"; layer = "jev"; reason = `jev: walk (${(jev.confidence ?? 0).toFixed(2)})`; }
+      else reason = `${l1.reason}; jev → ${jev.source}${jev.confidence != null ? ` (${jev.confidence.toFixed(2)})` : ""}`;
+    } catch (e) {
+      reason = `${l1.reason}; jev failed: ${String(e.message || e).slice(0, 120)}`;
+    }
+  }
+
+  // A passage that runs straight into (or out of) a stay must leave that stay
+  // recorded elsewhere — otherwise withdrawing this row could lose the stop.
+  if (verdict === "passage") {
+    for (const [edge, stay] of [["arrival", l1.features.arrival_stay], ["departure", l1.features.departure_stay]]) {
+      if (!stay) continue;
+      const rows = await sb(`location_history?segment_type=eq.visit&id=neq.${q(visitId)}`
+        // An open row (no departure yet) is a stay still in progress — it counts.
+        + `&arrived_at=lt.${q(stay.end)}&or=(departed_at.gt.${q(stay.start)},departed_at.is.null)`
+        + `&select=id,place_type,latitude,longitude&limit=50`);
+      const recorded = rows.some((r) => r.place_type !== "non-stop"
+        && haversineMeters(Number(r.latitude), Number(r.longitude), stay.lat, stay.lon) <= 150);
+      if (!recorded) {
+        verdict = "inconclusive";
+        reason = `${reason}; but the window ${edge === "arrival" ? "runs into" : "comes out of"} a stay no other row records`;
+        layer = "geometry";
+      }
+    }
+  }
+
+  // The camera is often the only witness of a short stop, and the library
+  // syncs late. Withdrawing a stop is final, so it waits for the photos.
+  if (verdict === "passage" && !has("--no-photo-wait") && !probeDone) {
+    const syncedTo = lastPhotoSync();
+    if (syncedTo != null && !(syncedTo >= end + PHOTO_SETTLE_MIN * 60000)) {
+      verdict = "hold";
+      reason = `${reason}; photos last synced ${iso(syncedTo)}, under ${PHOTO_SETTLE_MIN} min after the window — re-judge next run`;
+    }
+  }
+
+  // Has the user already said where the user was? Only for a window we'd otherwise ask about.
+  let evidence = null;
+  const settledRow = ["user-confirmed", "named", "non-stop"].includes(visit.place_type);
+  if ((verdict === "rest" || verdict === "inconclusive") && (!settledRow || has("--evidence-dry") || has("--audit"))
+      && !has("--no-evidence")) {
+    try {
+      const { evidenceVerdict } = await import("../lib/stop-evidence.mjs");
+      // Its own import: a broken stated-place must not take the evidence step with it.
+      let statedPlace = null;
+      if (!has("--no-stated")) {
+        try { ({ statedPlace } = await import("../lib/stated-place.mjs")); }
+        catch (e) { console.error(`[stop-passage] stated-place unavailable: ${String(e.message || e).slice(0, 160)}`); }
+      }
+      const restAt = l1.features && l1.features.longest_rest_at;
+      const rest = restAt && Number.isFinite(restAt.lat) ? { lat: restAt.lat, lon: restAt.lon } : null;
+      const fallback = Number.isFinite(Number(visit.latitude)) ? { lat: Number(visit.latitude), lon: Number(visit.longitude) } : null;
+      const asOf = arg("--evidence-asof") ? Date.parse(arg("--evidence-asof")) : null;
+      const calendar = calendarAround(start - 30 * 60000, end + 30 * 60000, { description: true });
+      evidence = await evidenceVerdict({ sb, start, end, tz, rest, fallback, near: businessesNear, id: visitId, asOf,
+        stated: statedPlace, calendar });
+    } catch (e) {
+      evidence = { settled: false, reason: `evidence step failed: ${String(e.message || e).slice(0, 160)}` };
+    }
+    if (evidence.settled) {
+      const v = evidence.venue;
+      verdict = "evidence"; layer = evidence.confirm ? "stated" : "evidence";
+      reason = `${v.name} — ${evidence.reason} (${v.by}, ${(v.confidence ?? 0).toFixed(2)})`;
+      let applied = false, confirmed = null;
+      if (has("--apply") && !has("--evidence-dry") && !has("--audit") && !settledRow && visit.segment_type === "visit") {
+        // The user's own words: the confirm path, exactly as if the user had answered the
+        // card. If that writer fails, the row is still named so the user isn't asked.
+        if (evidence.confirm) {
+          confirmed = confirmVisit(visitId, v.name);
+          applied = confirmed.ok;
+          if (!confirmed.ok) console.error(`[stop-passage] confirm path failed for ${visitId.slice(0, 8)}: ${confirmed.error} — naming the row instead`);
+        }
+        if (!applied) {
+          const note = `[stop-evidence] ${v.name} (${v.by} ${(v.confidence ?? 0).toFixed(2)}): ${evidence.reason}`
+            + (visit.place_name ? ` — was: ${visit.place_name}` : "");
+          await sb(`location_history?id=eq.${q(visitId)}`, {
+            method: "PATCH", headers: { Prefer: "return=minimal" },
+            body: JSON.stringify({ place_type: "named", place_name: v.name, notes: visit.notes ? `${visit.notes} | ${note}` : note }),
+          });
+          applied = true;
+        }
+      }
+      const out = { visit_id: visitId, window: { start: iso(start), end: iso(end) }, verdict, layer, reason, applied,
+        protected: protectedRow, name: v.name, ...(confirmed ? { confirmed } : {}), evidence, probe, features: l1.features, geometry_verdict: l1.verdict, jev };
+      log(out);
+      if (has("--json")) process.stdout.write(JSON.stringify(out) + "\n");
+      else console.log(`evidence — ${reason}${applied ? (confirmed && confirmed.ok ? "  [confirmed]" : "  [named]") : ""}`);
+      return;
+    }
+  }
+
+  // Never touch an answer of the user's, or a row already settled as a non-stop.
+  let applied = false;
+  if (verdict === "passage" && has("--apply") && !has("--audit") && !protectedRow && visit.segment_type === "visit") {
+    const note = `[passage-auto ${layer}] ${reason}` + (visit.place_name ? ` — was: ${visit.place_name}` : "");
+    await sb(`location_history?id=eq.${q(visitId)}`, {
+      method: "PATCH", headers: { Prefer: "return=minimal" },
+      // The geocoder's street name goes to `notes` ("was: …"), not along with
+      // the verdict: resolve-day reads a non-stop's name as HIS description.
+      body: JSON.stringify({ place_type: "non-stop", place_name: null, notes: visit.notes ? `${visit.notes} | ${note}` : note }),
+    });
+    applied = true;
+  }
+
+  const out = { visit_id: visitId, window: { start: iso(start), end: iso(end) }, verdict, layer, reason,
+    applied, protected: protectedRow, features: l1.features, geometry_verdict: l1.verdict, jev, evidence, probe };
+  log(out);
+  if (has("--json")) process.stdout.write(JSON.stringify(out) + "\n");
+  else console.log(`${verdict} (${layer}) — ${reason}${applied ? "  [marked non-stop]" : ""}`);
+}
+
+main().catch((e) => {
+  // Fail open: the caller asks as before.
+  const out = { verdict: "error", error: String(e.message || e) };
+  log({ visit_id: arg("--visit"), ...out });
+  if (has("--json")) process.stdout.write(JSON.stringify(out) + "\n"); else console.error(out.error);
+  process.exit(1);
+});

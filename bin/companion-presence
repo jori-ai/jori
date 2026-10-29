@@ -1,0 +1,556 @@
+#!/usr/bin/env python3
+"""companion-presence — who was with the user, read from Find My every 10 minutes.
+
+When a day's summary has to ask whether a companion was with the user (before
+coffee, on an evening walk), the answer was usually "together all day", so it
+is checked periodically instead of asked.
+
+Every 10 minutes (cron, trigger-companion-presence.sh) this records one Find My
+reading per person the user shares locations with (`findme presence-sample`;
+never the user), then reconciles: each reading is compared with where the
+user's own GPS trail puts them at that moment, and a person who was with the
+user across one of the user's visit rows is added to that row's
+`location_history.companions`, which resolve-day already carries onto the day's
+stops. It never removes a name it did not add. The geometry and the tagging
+rule live in lib/companion_presence.py.
+
+Usage:
+  companion-presence tick                       # sample + reconcile (the cron run)
+  companion-presence sample                     # one Find My reading per person
+  companion-presence reconcile [--hours 72] [--dry-run] [--json]
+  companion-presence show [YYYY-MM-DD] [--tz Europe/Paris] [--json]
+  companion-presence who YYYY-MM-DD HH:MM HH:MM [--tz ...] [--json]
+  companion-presence untag <row id> <person> --reason "<the user's words>"
+
+`show` and `who` answer "was <person> with the user then?" for the Daily
+Summary Fix and the chat agent before anyone asks the user.
+
+Files (data/companion-presence/, gitignored):
+  samples-<UTC date>.jsonl   raw readings with coordinates, kept 3 days
+  readings-<UTC date>.json   each reading's verdict and distance, no coordinates, kept 60 days
+  tagged.jsonl               every name this added, withdrew or was told to untag (audit)
+  provisional.json           names added while the row was still open, re-read each run
+  blocked.json               (row, person) pairs the user took off with `untag`; never re-added
+  last-run.json              last tick's counts and consecutive Find My failures
+Kill switch: data/.companion-presence-off
+"""
+
+import argparse
+import fcntl
+import json
+import os
+import subprocess
+import sys
+import urllib.parse
+import urllib.request
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.join(HERE, "..", "lib"))
+import companion_presence as cp  # noqa: E402
+import companions  # noqa: E402
+import places_local  # noqa: E402
+import supabase_local  # noqa: E402
+
+G = places_local.install_root()
+DATA = os.environ.get("COMPANION_PRESENCE_DIR") or places_local.data_path("companion-presence")
+SUPABASE_URL = supabase_local.supabase_url()
+FINDME = os.path.join(HERE, "findme")  # the Find My reader (`findme presence-sample`)
+TZ_FILE = places_local.data_path("user-timezone.json")
+OFF_FILE = places_local.data_path(".companion-presence-off")
+
+RAW_KEEP_DAYS = 3
+READINGS_KEEP_DAYS = 60
+FAIL_PAGE_AT = 6          # one silent system row after an hour of failed Find My reads
+
+
+def now_ms():
+    return int(datetime.now(timezone.utc).timestamp() * 1000)
+
+
+def utc_date(ms):
+    return datetime.fromtimestamp(ms / 1000, tz=timezone.utc).date().isoformat()
+
+
+def load_json(path, default):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return default
+
+
+def write_json(path, obj):
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(obj, f, ensure_ascii=False)
+    os.replace(tmp, path)
+
+
+def user_tz(name=None):
+    """The zone asked for, else the phone's last reported zone
+    (data/user-timezone.json), else the installation's home zone."""
+    try:
+        return ZoneInfo(name or (load_json(TZ_FILE, {}) or {}).get("timezone") or supabase_local.home_tz())
+    except Exception:
+        return ZoneInfo("UTC")
+
+
+def names_config():
+    """Face-tag aliases (lib/companions.py) and the canonical names of the
+    people already known (data/known-companions.json)."""
+    aliases = companions.companion_names()["aliases"]
+    known_set = {aliases.get(n, n) for n in companions.known_companions()}
+    return aliases, known_set
+
+
+# ── Supabase ─────────────────────────────────────────────────────────────────
+
+def _key():
+    return supabase_local.service_key()
+
+
+def _request(path, method="GET", body=None):
+    key = _key()
+    if not key or not SUPABASE_URL:
+        raise RuntimeError("no Supabase configured (SUPABASE_SERVICE_ROLE_KEY in .env, supabase_project in instance.json)")
+    req = urllib.request.Request(
+        f"{SUPABASE_URL}/rest/v1/{path}", method=method,
+        data=None if body is None else json.dumps(body).encode(),
+        headers={"apikey": key, "Authorization": f"Bearer {key}", "Accept": "application/json",
+                 "Content-Type": "application/json", "Prefer": "return=minimal"})
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        raw = resp.read()
+    return json.loads(raw) if raw else None
+
+
+def _select_all(query):
+    out, offset = [], 0
+    while True:
+        page = _request(f"location_history?{query}&limit=1000&offset={offset}") or []
+        out.extend(page)
+        if len(page) < 1000:
+            return out
+        offset += 1000
+
+
+def his_rows(from_ms, to_ms):
+    """The user's transit fixes and the visit rows touching [from, to]."""
+    f = urllib.parse.quote(cp.iso(from_ms - 60 * cp.MIN))
+    t = urllib.parse.quote(cp.iso(to_ms))
+    cols = "id,segment_type,place_type,arrived_at,departed_at,latitude,longitude,accuracy_m,companions"
+    transit = _select_all(f"select={cols}&segment_type=eq.transit&arrived_at=gte.{f}&arrived_at=lt.{t}"
+                          f"&order=arrived_at.asc")
+    w0 = urllib.parse.quote(cp.iso(from_ms))
+    visits = _select_all(f"select={cols}&segment_type=eq.visit&arrived_at=lt.{t}"
+                         f"&or=(departed_at.gte.{w0},and(departed_at.is.null,arrived_at.gte.{f}))"
+                         f"&order=arrived_at.asc")
+    return transit, visits
+
+
+def _row_companions(row_id):
+    rows = _request(f"location_history?id=eq.{urllib.parse.quote(row_id)}&select=companions") or []
+    if not rows:
+        return None
+    return [c for c in (rows[0].get("companions") or []) if isinstance(c, str)]
+
+
+def add_companion(row_id, person):
+    """Re-read the row just before writing, so a name another writer put there
+    a moment ago is kept (the column is replaced whole)."""
+    current = _row_companions(row_id)
+    if current is None or person in current:
+        return False
+    _request(f"location_history?id=eq.{urllib.parse.quote(row_id)}", method="PATCH",
+             body={"companions": current + [person]})
+    return True
+
+
+def remove_companion(row_id, person):
+    current = _row_companions(row_id)
+    if not current or person not in current:
+        return False
+    _request(f"location_history?id=eq.{urllib.parse.quote(row_id)}", method="PATCH",
+             body={"companions": [c for c in current if c != person]})
+    return True
+
+
+# ── files ────────────────────────────────────────────────────────────────────
+
+def _dated(prefix, ext):
+    out = {}
+    try:
+        names = os.listdir(DATA)
+    except OSError:
+        return out
+    for n in names:
+        if n.startswith(prefix) and n.endswith(ext):
+            out[n[len(prefix):-len(ext)]] = os.path.join(DATA, n)
+    return out
+
+
+def load_samples():
+    rows = []
+    for _, path in sorted(_dated("samples-", ".jsonl").items()):
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    try:
+                        rows.append(json.loads(line))
+                    except ValueError:
+                        continue
+    return rows
+
+
+def prune(today):
+    for prefix, ext, keep in (("samples-", ".jsonl", RAW_KEEP_DAYS), ("readings-", ".json", READINGS_KEEP_DAYS)):
+        cutoff = (datetime.fromisoformat(today) - timedelta(days=keep)).date().isoformat()
+        for d, path in _dated(prefix, ext).items():
+            if d < cutoff:
+                os.remove(path)
+
+
+def load_readings(from_ms, to_ms):
+    out = []
+    d = datetime.fromtimestamp(from_ms / 1000, tz=timezone.utc).date()
+    end = datetime.fromtimestamp(to_ms / 1000, tz=timezone.utc).date()
+    while d <= end:
+        for r in load_json(os.path.join(DATA, f"readings-{d.isoformat()}.json"), []) or []:
+            t = cp.parse_ms(r.get("t"))
+            if t is not None and from_ms <= t < to_ms:
+                out.append({**r, "t": t})
+        d += timedelta(days=1)
+    return out
+
+
+# ── commands ─────────────────────────────────────────────────────────────────
+
+def cmd_sample():
+    """Append one reading per person; returns how many were new."""
+    os.makedirs(DATA, exist_ok=True)
+    proc = subprocess.run([FINDME, "presence-sample"], capture_output=True, text=True, timeout=120)
+    if proc.returncode != 0:
+        raise RuntimeError((proc.stderr or proc.stdout or "findme presence-sample failed").strip()[-300:])
+    readings = json.loads(proc.stdout or "[]")
+    seen = {(s.get("person"), s.get("at")) for s in load_samples()}
+    polled = cp.iso(now_ms())
+    new = 0
+    for r in readings:
+        t = cp.parse_ms(r.get("at"))
+        if t is None or (r.get("person"), r.get("at")) in seen:
+            continue
+        with open(os.path.join(DATA, f"samples-{utc_date(t)}.jsonl"), "a") as f:
+            f.write(json.dumps({**r, "polled_at": polled}, ensure_ascii=False) + "\n")
+        new += 1
+    return new
+
+
+def cmd_reconcile(hours=72, dry_run=False):
+    samples = load_samples()
+    now = now_ms()
+    w0 = now - int(hours * 3600 * 1000)
+    samples = [s for s in samples if (cp.parse_ms(s.get("at")) or 0) >= w0]
+    result = {"readings": len(samples), "placed": 0, "together": 0, "apart": 0, "added": []}
+    if not samples:
+        return result
+    first = min(cp.parse_ms(s["at"]) for s in samples)
+    transit, visits = his_rows(first, now)
+    fixes = cp.fixes_from_rows(transit)
+    spans = cp.visit_spans(visits)
+    readings = cp.classify(samples, fixes, spans)
+    result["placed"] = sum(1 for r in readings if r["placed"])
+    result["together"] = sum(1 for r in readings if r["verdict"] == "together")
+    result["apart"] = sum(1 for r in readings if r["verdict"] == "apart")
+
+    if not dry_run:
+        by_day = {}
+        for r in readings:
+            by_day.setdefault(utc_date(r["t"]), []).append({**r, "t": cp.iso(r["t"])})
+        for day, rows in by_day.items():
+            path = os.path.join(DATA, f"readings-{day}.json")
+            # A day only partly inside the window keeps its older readings.
+            kept = [r for r in (load_json(path, []) or [])
+                    if (cp.parse_ms(r.get("t")) or 0) < first]
+            write_json(path, kept + rows)
+
+    # Names added while a row was open are re-read first: one the person left in the
+    # meantime comes back off.
+    prov_path = os.path.join(DATA, "provisional.json")
+    provisional = load_json(prov_path, {}) or {}
+    withdraw, keep = cp.review_provisional(visits, readings, provisional, now)
+    if hours < RAW_KEEP_DAYS * 24:
+        # A narrower hand-run window did not fetch every provisional row; those
+        # are not settled, just unseen.
+        fetched = {v.get("id") for v in visits}
+        for rid, persons in provisional.items():
+            if rid not in fetched:
+                keep[rid] = persons
+    result["withdrawn"] = []
+    try:
+        for row_id, person in withdraw:
+            if not dry_run and remove_companion(row_id, person):
+                _audit({"at": cp.iso(now), "action": "withdrawn", "id": row_id, "person": person})
+            result["withdrawn"].append({"id": row_id, "person": person})
+
+        aliases, known = names_config()
+        blocked = {(b.get("id"), b.get("person")) for b in (load_json(os.path.join(DATA, "blocked.json"), []) or [])}
+        # Rows that began before the first reading in hand are not judged: their
+        # start was never observed (at install) or has aged out.
+        additions = cp.row_additions(visits, readings, now, aliases=aliases, known=known,
+                                     window_start_ms=max(w0, first), blocked=blocked | set(withdraw))
+        for a in additions:
+            entry = {k: a[k] for k in ("id", "person", "cover", "open", "arrived_at", "departed_at")}
+            if not dry_run and add_companion(a["id"], a["person"]):
+                _audit({"at": cp.iso(now), "action": "added", **entry})
+                if a["open"]:
+                    keep.setdefault(a["id"], []).append(a["person"])
+            result["added"].append(entry)
+    finally:
+        if not dry_run:
+            write_json(prov_path, keep)
+    return result
+
+
+def _audit(entry):
+    with open(os.path.join(DATA, "tagged.jsonl"), "a") as f:
+        f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+
+def cmd_untag(row_id, person, reason):
+    """Take a name this job added back off a row, and never add it there again.
+    Refuses (exit 2) a name it did not add: that came from the user's words or photos."""
+    added = False
+    try:
+        with open(os.path.join(DATA, "tagged.jsonl")) as f:
+            for line in f:
+                try:
+                    e = json.loads(line)
+                except ValueError:
+                    continue
+                if e.get("id") == row_id and e.get("person") == person and e.get("action", "added") == "added":
+                    added = True
+    except OSError:
+        pass
+    if not added:
+        print(f"companion-presence: {person} on {row_id} was not added by companion-presence; nothing changed",
+              file=sys.stderr)
+        return 2
+    removed = remove_companion(row_id, person)
+    path = os.path.join(DATA, "blocked.json")
+    blocked = load_json(path, []) or []
+    if not any(b.get("id") == row_id and b.get("person") == person for b in blocked):
+        blocked.append({"id": row_id, "person": person, "reason": reason, "at": cp.iso(now_ms())})
+        write_json(path, blocked)
+    prov_path = os.path.join(DATA, "provisional.json")
+    prov = load_json(prov_path, {}) or {}
+    if person in (prov.get(row_id) or []):
+        prov[row_id] = [p for p in prov[row_id] if p != person]
+        write_json(prov_path, {k: v for k, v in prov.items() if v})
+    _audit({"at": cp.iso(now_ms()), "action": "untagged", "id": row_id, "person": person, "reason": reason})
+    print(f"{'removed' if removed else 'already absent'}: {person} on {row_id}; it will not be added there again")
+    return 0
+
+
+def _page_once(fails, err):
+    if fails != FAIL_PAGE_AT:
+        return
+    send = os.path.join(G, "bin", "jori-send-curl")
+    try:
+        subprocess.run([send, "--channel", "system", "--skip-precheck", "--observed-error", err[-500:],
+                        f"⚠️ companion-presence: Find My readings have failed for an hour ({err[:160]}). "
+                        "Companion presence is not being recorded."], capture_output=True, timeout=60)
+    except Exception:
+        pass
+
+
+def take_lock(wait):
+    """The tick's lock. A tick skips when it is held; a hand-run reconcile or
+    untag waits for it, so neither can lose the other's provisional names."""
+    os.makedirs(DATA, exist_ok=True)
+    lock = open(os.path.join(DATA, ".lock"), "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | (0 if wait else fcntl.LOCK_NB))
+    except BlockingIOError:
+        lock.close()
+        return None
+    return lock
+
+
+def cmd_tick(as_json=False):
+    if os.path.exists(OFF_FILE):
+        return 0
+    lock = take_lock(wait=False)
+    if lock is None:
+        return 0
+    state = load_json(os.path.join(DATA, "last-run.json"), {}) or {}
+    out = {"at": cp.iso(now_ms())}
+    rc = 0
+    try:
+        out["sampled"] = cmd_sample()
+        state["find_my_failures"] = 0
+        state["last_sample_ok"] = out["at"]
+    except Exception as e:
+        state["find_my_failures"] = int(state.get("find_my_failures") or 0) + 1
+        out["sample_error"] = str(e)[-300:]
+        _page_once(state["find_my_failures"], str(e))
+        rc = 1
+    try:
+        r = cmd_reconcile()
+        out.update({k: r[k] for k in ("readings", "placed", "together", "apart")}, added=len(r["added"]),
+                   withdrawn=len(r.get("withdrawn") or []))
+    except Exception as e:
+        out["reconcile_error"] = str(e)[-300:]
+        rc = 1
+    prune(utc_date(now_ms()))
+    state.update(out)
+    write_json(os.path.join(DATA, "last-run.json"), state)
+    print(json.dumps(out) if as_json else " ".join(f"{k}={v}" for k, v in out.items()))
+    return rc
+
+
+def _day_range(date_str, tz):
+    d0 = datetime.fromisoformat(date_str).replace(tzinfo=tz)
+    return int(d0.timestamp() * 1000), int((d0 + timedelta(days=1)).timestamp() * 1000)
+
+
+def _hm(ms, tz):
+    return datetime.fromtimestamp(ms / 1000, tz=tz).strftime("%H:%M")
+
+
+def cmd_show(date_str, tz, as_json=False):
+    t0, t1 = _day_range(date_str, tz)
+    readings = load_readings(t0, t1)
+    together, apart = cp.stretches(readings, "together"), cp.stretches(readings, "apart")
+    people = {}
+    for p in sorted({r["person"] for r in readings}):
+        mine = [r for r in readings if r["person"] == p]
+        people[p] = {
+            "together": [{"start": cp.iso(max(t0, s["start"])), "end": cp.iso(min(t1, s["end"])), "n": s["n"]}
+                         for s in together.get(p, [])],
+            "apart": [{"start": cp.iso(max(t0, s["start"])), "end": cp.iso(min(t1, s["end"])), "n": s["n"]}
+                      for s in apart.get(p, [])],
+            "readings": len(mine),
+            "undecided": sum(1 for r in mine if r.get("verdict") is None),
+        }
+    state = load_json(os.path.join(DATA, "last-run.json"), {}) or {}
+    if as_json:
+        print(json.dumps({"date": date_str, "tz": str(tz), "people": people,
+                          "last_sample_ok": state.get("last_sample_ok")}, ensure_ascii=False, indent=1))
+        return 0
+    print(f"{date_str} ({tz}), Find My readings every 10 min")
+    if not people:
+        print("  no readings for this day")
+    for p, v in people.items():
+        w = ", ".join(f"{_hm(cp.parse_ms(s['start']), tz)}-{_hm(cp.parse_ms(s['end']), tz)}" for s in v["together"])
+        a = ", ".join(f"{_hm(cp.parse_ms(s['start']), tz)}-{_hm(cp.parse_ms(s['end']), tz)}" for s in v["apart"])
+        print(f"  {p}: together {w or 'never'}; apart {a or 'never'} "
+              f"({v['readings']} readings, {v['undecided']} undecided)")
+    if state.get("last_sample_ok"):
+        print(f"  last good Find My reading: {state['last_sample_ok']}")
+    return 0
+
+
+def cmd_who(date_str, start_hm, end_hm, tz, as_json=False):
+    d = datetime.fromisoformat(date_str).replace(tzinfo=tz)
+    sh, sm = (int(x) for x in start_hm.split(":"))
+    eh, em = (int(x) for x in end_hm.split(":"))
+    a = d.replace(hour=sh, minute=sm)
+    b = d.replace(hour=eh, minute=em)
+    if b <= a:
+        b += timedelta(days=1)
+    t0, t1 = int(a.timestamp() * 1000), int(b.timestamp() * 1000)
+    readings = load_readings(t0 - 60 * cp.MIN, t1 + 60 * cp.MIN)
+    tagged, tagged_off = {}, set()
+    try:
+        with open(os.path.join(DATA, "tagged.jsonl")) as f:
+            for line in f:
+                try:
+                    e = json.loads(line)
+                except ValueError:
+                    continue
+                key = (e.get("id"), e.get("person"))
+                if e.get("action", "added") != "added":
+                    tagged_off.add(key)
+                    continue
+                a0, a1 = cp.parse_ms(e.get("arrived_at")), cp.parse_ms(e.get("departed_at"))
+                if a0 is not None and a0 < t1 and (a1 is None or a1 > t0):
+                    tagged.setdefault(e.get("person"), []).append(e.get("id"))
+    except OSError:
+        pass
+    tagged = {p: [i for i in ids if (i, p) not in tagged_off] for p, ids in tagged.items()}
+    out = {}
+    for p in sorted({r["person"] for r in readings}):
+        j = cp.judge_window([r for r in readings if r["person"] == p], t0, t1)
+        answer = ("together" if j["with"] else "mixed" if j["apart"] and j["together"]
+                  else "apart" if j["apart"] else "not enough readings")
+        out[p] = {**j, "answer": answer,
+                  "rows_tagged": sorted(set(tagged.get(p, [])))}
+    if as_json:
+        print(json.dumps({"date": date_str, "from": start_hm, "to": end_hm, "tz": str(tz), "people": out}))
+        return 0
+    if not out:
+        print("no Find My readings for that window")
+    for p, v in out.items():
+        rows = f"; rows it tagged: {', '.join(v['rows_tagged'])}" if v["rows_tagged"] else ""
+        print(f"{p}: {v['answer']} (together {v['together']}, apart {v['apart']}, cover {v['cover']:.0%}){rows}")
+    return 0
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="companion-presence", description=__doc__.split("\n")[0])
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    t = sub.add_parser("tick")
+    t.add_argument("--json", action="store_true")
+    sub.add_parser("sample")
+    r = sub.add_parser("reconcile")
+    r.add_argument("--hours", type=float, default=72)
+    r.add_argument("--dry-run", action="store_true")
+    r.add_argument("--json", action="store_true")
+    s = sub.add_parser("show")
+    s.add_argument("date", nargs="?")
+    s.add_argument("--tz")
+    s.add_argument("--json", action="store_true")
+    u = sub.add_parser("untag")
+    u.add_argument("row_id")
+    u.add_argument("person")
+    u.add_argument("--reason", required=True)
+    w = sub.add_parser("who")
+    w.add_argument("date")
+    w.add_argument("start")
+    w.add_argument("end")
+    w.add_argument("--tz")
+    w.add_argument("--json", action="store_true")
+    a = ap.parse_args(argv)
+
+    if a.cmd == "tick":
+        return cmd_tick(a.json)
+    if a.cmd == "untag":
+        lock = take_lock(wait=True)  # noqa: F841 (held until exit)
+        return cmd_untag(a.row_id, a.person, a.reason)
+    if a.cmd == "sample":
+        print(f"new readings: {cmd_sample()}")
+        return 0
+    if a.cmd == "reconcile":
+        lock = None if a.dry_run else take_lock(wait=True)  # noqa: F841 (held until exit)
+        res = cmd_reconcile(a.hours, a.dry_run)
+        if a.json:
+            print(json.dumps(res, indent=1))
+        else:
+            print(f"readings={res['readings']} placed={res['placed']} together={res['together']} "
+                  f"apart={res['apart']} {'would add' if a.dry_run else 'added'}={len(res['added'])} "
+                  f"withdrawn={len(res.get('withdrawn') or [])}")
+            for x in res["added"]:
+                print(f"  {x['person']} -> {x['id']} {x['arrived_at']} .. {x['departed_at']} cover {x['cover']}")
+        return 0
+    tz = user_tz(a.tz)
+    if a.cmd == "show":
+        return cmd_show(a.date or datetime.now(tz).date().isoformat(), tz, a.json)
+    if a.cmd == "who":
+        return cmd_who(a.date, a.start, a.end, tz, a.json)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

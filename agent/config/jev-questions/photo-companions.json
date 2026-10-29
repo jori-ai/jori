@@ -1,0 +1,10 @@
+{
+  "notes": "lib/photo-companions.mjs presentCompanions — for each person Apple Photos face-tagged in the photos the user took at a stop, was that person physically there with the user, or only pictured (a screen, a printed or framed photo, a poster, a photo someone sent)? Jev reads text only: labels, OCR'd text, who else is tagged, whether the user took the photo, how many of the stop's photos each person is in. One boolean per person, built per call from `person_template`. Jev can only REMOVE a person (present=false); legacy (shadow + fallback) = every tag is a companion. Callers: the stop finder's companion backfill, photos-synthesize-stops (via bin/photo-companions). Agreement = same set of names.",
+  "threshold": 0.9,
+  "shadow_until": "",
+  "questions": {},
+  "person_template": {
+    "type": "boolean",
+    "instructions": "Apple Photos recognised {{name}}'s face in the photos {{owner_name}} took at this stop (`photos`: what each shows, any text in it, who is tagged, whether {{owner_name}} took it). Was {{name}} physically there with {{owner_name}} — in the same place, in person? Answer no only if every photo of {{name}} is plainly a picture of a picture: a phone, laptop or TV screen, a framed or printed photo, a poster, a magazine, a screenshot, or a photo someone else took and sent to {{owner_name}}. Ordinary photos of people at a table, on a walk, at an event, or posing together mean yes."
+  }
+}

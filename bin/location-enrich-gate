@@ -1,0 +1,53 @@
+#!/usr/bin/env node
+// location-enrich-gate — prints the number of stops a location-enrich dispatch
+// would actually act on (askable AND not already sitting composed in the ask
+// queue with unchanged signals), or ERR. See lib/location-enrich-gate.mjs.
+//
+// Also writes data/location-enrich-brief.json (code-computed local times
+// + framing buckets for each askable stop, oldest first) for the agent to read
+// instead of converting UTC by hand.
+//
+// Usage: location-enrich-gate [--json]
+
+import fs from "node:fs";
+import path from "node:path";
+import { installTools } from "../lib/root.cjs";
+import { decide, features, resolveTz } from "../lib/location-enrich-gate.mjs";
+
+const DATA = installTools("data");
+const PENDING = path.join(DATA, "location-pending-enrich.json");
+const QUEUE = path.join(DATA, "location-ask-queue.json");
+const STATE = path.join(DATA, "location-enrich-gate-state.json");
+const BRIEF = path.join(DATA, "location-enrich-brief.json");
+const TZ_FILE = path.join(DATA, "user-timezone.json");
+
+const readJson = (p, dflt) => { try { return JSON.parse(fs.readFileSync(p, "utf8")); } catch { return dflt; } };
+function writeAtomic(p, obj) {
+  const tmp = `${p}.tmp.${process.pid}`;
+  fs.writeFileSync(tmp, JSON.stringify(obj, null, 2) + "\n");
+  fs.renameSync(tmp, p);
+}
+
+try {
+  const pending = JSON.parse(fs.readFileSync(PENDING, "utf8")).pending || [];
+  const queue = readJson(QUEUE, { queue: [] }).queue || [];
+  const state = readJson(STATE, {});
+  const tz = resolveTz(readJson(TZ_FILE, null));
+  const r = decide({ pending, queue, state, now: Date.now(), tz });
+  writeAtomic(STATE, r.state);
+
+  const want = new Set(r.askable);
+  const stops = pending
+    .filter((p) => want.has(String(p.visit_id)))
+    .sort((a, b) => Date.parse(a.departed_at || 0) - Date.parse(b.departed_at || 0))
+    .map((p) => ({ ...features(p, tz), recompose: r.requeued.includes(String(p.visit_id)) }));
+  writeAtomic(BRIEF, { generated_at: new Date().toISOString(), stops });
+
+  if (process.argv.includes("--json")) {
+    console.log(JSON.stringify({ count: r.askable.length, askable: r.askable, requeued: r.requeued, skipped_queued: r.skippedQueued }));
+  } else {
+    process.stdout.write(String(r.askable.length));
+  }
+} catch {
+  process.stdout.write("ERR");
+}

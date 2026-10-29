@@ -1,0 +1,3397 @@
+#!/usr/bin/env python3
+"""Find My CLI — locate devices and people via iCloud Find My.
+
+For the user: queries the Jori app (Supabase) first — live GPS from the phone.
+For everyone else: uses iCloud Find My as before.
+
+pyicloud lives in the installation's own venv (agent/findmy-venv/.venv); run
+directly without it, this script re-executes under that venv's python.
+
+Config — agent/local/config/findme.json (optional; with none, only the user is
+known and nobody is a companion):
+  icloud_account       the Find My account (default: instance owner_email)
+  people               { "<prsId>": "<name>" } — family members Find My shares
+  primary_devices      { "<name, lower case>": "<device-name keyword>" }
+  device_overrides     { "<device id prefix>": {"owner"?, "name"?} }
+  companion_people     [names] checked by Find My for "with you" at a stop
+  generic_place_names  Apple-geocoder area names (a borough, a city) that are
+                       not a venue when they come back as a visit's POI name
+"""
+
+import sys
+import os
+import re
+import json
+import math
+import subprocess
+import urllib.parse
+import urllib.request
+from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
+
+_LIB = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "lib")
+sys.path.insert(0, _LIB)
+import places_local  # noqa: E402
+import companions as _companions  # noqa: E402
+
+try:
+    from pyicloud import PyiCloudService
+except ImportError:
+    _VENV_PY = os.path.join(places_local.install_root(), "agent", "findmy-venv", ".venv", "bin", "python")
+    if (__name__ == "__main__" and os.path.exists(_VENV_PY)
+            and os.path.realpath(sys.executable) != os.path.realpath(_VENV_PY)):
+        os.execv(_VENV_PY, [_VENV_PY, os.path.abspath(__file__)] + sys.argv[1:])
+    PyiCloudService = None  # iCloud commands fail in get_api(); the app and DB paths still work
+
+_INST = places_local.instance()
+OWNER_NAME = _INST.get("owner_name") or "the user"
+OWNER_ID = _INST.get("owner_id") or "user"
+CFG = places_local.local_config("findme", {
+    "icloud_account": "", "people": {}, "primary_devices": {}, "device_overrides": {},
+    "companion_people": [], "generic_place_names": [],
+})
+
+
+def _home_tz():
+    """The installation's home zone (instance tz), else the host's."""
+    tz = _INST.get("tz")
+    try:
+        return ZoneInfo(tz) if tz else datetime.now().astimezone().tzinfo
+    except Exception:
+        return datetime.now().astimezone().tzinfo
+
+
+LOCAL_TZ = _home_tz()
+
+
+def _now_utc():
+    return datetime.now(timezone.utc)
+
+
+def _parse_iso(value):
+    """Parse an ISO timestamp to an aware UTC datetime, or None if unusable.
+
+    Returning None for a missing/garbage stamp matters: callers treat "cannot
+    date this" as "too old to trust" rather than as "fresh", which is the safe
+    direction for anything deciding whether a queued question may still absorb
+    one of the user's replies.
+    """
+    if not value:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return None
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+ICLOUD_ACCOUNT = CFG.get("icloud_account") or _INST.get("owner_email") or ""
+ENV_FILE = os.path.join(places_local.install_root(), ".env")
+import place_naming as _place_naming  # noqa: E402
+SUPABASE_URL = _place_naming.SUPABASE_URL  # SUPABASE_URL, else the instance's supabase_project
+def _read_env_var(name):
+    if os.path.exists(ENV_FILE):
+        with open(ENV_FILE) as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith(f"{name}="):
+                    return line.split("=", 1)[1]
+    return None
+def _read_op_secret(ref):
+    # Only attempt op CLI when a service-account token is present. Without it,
+    # `op read` falls back to interactive auth, which on a headless host (no
+    # Touch ID) pops a master-password prompt — every cron tick. .env is the primary
+    # source; op is bootstrap/rotation only.
+    if not os.environ.get("OP_SERVICE_ACCOUNT_TOKEN"):
+        return None
+    try:
+        return subprocess.run(["op", "read", ref], capture_output=True, text=True, check=False).stdout.strip() or None
+    except FileNotFoundError:
+        return None
+def _log_secret_failure(secret_name, reason):
+    # Append-only JSONL, daily-deduped per (script, secret). Never raises.
+    try:
+        from datetime import datetime, timezone
+        log_path = places_local.data_path("secret-failures.jsonl")
+        now = datetime.now(timezone.utc)
+        today = now.strftime("%Y-%m-%d")
+        if os.path.exists(log_path):
+            with open(log_path) as f:
+                for line in f.readlines()[-50:]:
+                    try:
+                        r = json.loads(line)
+                        if (r.get("script") == "findme"
+                            and r.get("secret") == secret_name
+                            and r.get("ts", "").startswith(today)):
+                            return
+                    except Exception:
+                        continue
+        record = {
+            "ts": now.isoformat(timespec="seconds").replace("+00:00", "Z"),
+            "script": "findme",
+            "secret": secret_name,
+            "reason": reason,
+        }
+        with open(log_path, "a") as f:
+            f.write(json.dumps(record) + "\n")
+    except Exception:
+        pass
+GOOGLE_PLACES_API_KEY = (
+    os.environ.get("GOOGLE_PLACES_API_KEY")
+    or _read_env_var("GOOGLE_PLACES_API_KEY")
+    or (_read_op_secret(os.environ["JORI_PLACES_OP_REF"]) if os.environ.get("JORI_PLACES_OP_REF") else None)
+)
+if not GOOGLE_PLACES_API_KEY:
+    _log_secret_failure(
+        "GOOGLE_PLACES_API_KEY",
+        "no env var, no .env entry, no SA token"
+        if not os.environ.get("OP_SERVICE_ACCOUNT_TOKEN")
+        else "no env var, no .env entry; SA token present but op read returned empty",
+    )
+PENDING_ENRICH_FILE = places_local.data_path("location-pending-enrich.json")
+# Stops the resolver drops because Google Places returned zero candidates
+# are appended here as one JSONL row each. Surfaces what used to be silent
+# gaps (a real supermarket stop missed). Read by
+# daily-summary / live-day to render "stop @ lat,lon — unresolved" instead
+# of pretending nothing happened.
+ENRICH_DROPPED_FILE = places_local.data_path("location-enrich-dropped.jsonl")
+
+# Shared Places-API disk cache (also used by bin/location-segment).
+# 7-day TTL — venues don't churn that fast and the resolver only hits Places
+# for stops not yet user-confirmed. Without this, every enrich tick re-Places'd
+# the same unresolved visits. (2026-05-11)
+import hashlib
+import time
+PLACES_CACHE_DIR = places_local.data_path(".cache", "google-places")
+PLACES_CACHE_TTL_SEC = 7 * 24 * 3600
+
+
+def _places_blocked():
+    """True when the Jori Places budget is spent. Never raises: findme runs
+    under its own venv and on the location hot path, so a missing or malformed
+    guard must read as 'not blocked'."""
+    try:
+        from places_guard import places_block_reason
+
+        return places_block_reason() is not None
+    except Exception:
+        return False
+
+def _places_cache_key(prefix, lat, lon, radius_m, max_results, query=""):
+    lat_r = round(lat, 4)
+    lon_r = round(lon, 4)
+    rad_r = int(radius_m / 20) * 20
+    raw = f"{prefix}|{lat_r}|{lon_r}|{rad_r}|{max_results}|{query}"
+    return hashlib.md5(raw.encode("utf-8")).hexdigest()[:16]
+
+def _places_cache_get(key):
+    path = os.path.join(PLACES_CACHE_DIR, f"{key}.json")
+    try:
+        if not os.path.exists(path):
+            return None
+        if time.time() - os.path.getmtime(path) > PLACES_CACHE_TTL_SEC:
+            return None
+        with open(path) as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+def _places_cache_set(key, results):
+    try:
+        os.makedirs(PLACES_CACHE_DIR, exist_ok=True)
+        path = os.path.join(PLACES_CACHE_DIR, f"{key}.json")
+        tmp = path + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(results, f)
+        os.replace(tmp, path)
+    except Exception:
+        pass
+
+# Known person → prsId mapping (None = the account owner, the user). The family
+# members Find My shares come from config `people`.
+KNOWN_PEOPLE = {None: OWNER_NAME, **(CFG.get("people") or {})}
+
+# Primary device per person (used for "where is <person>"): a keyword of the
+# device name, by lower-case person name. The user's own default is their
+# owner id ("<owner_id>'s iPhone").
+PRIMARY_DEVICES = {OWNER_NAME.lower(): OWNER_ID, **{str(k).lower(): v for k, v in (CFG.get("primary_devices") or {}).items()}}
+# What a query for the user themself reads as.
+OWNER_QUERIES = {"me", OWNER_ID.lower(), OWNER_NAME.lower()}
+
+# Named locations — matched by proximity (within 150m). Homes and family homes,
+# read from data/named-locations.json, the one list place_naming and
+# resolve-day read too (this was once a second literal copy, and missed a
+# family home the other list had).
+def _load_named_locations():
+    path = places_local.data_path("named-locations.json")
+    try:
+        with open(path) as f:
+            d = json.load(f)
+    except FileNotFoundError:
+        return []
+    except (OSError, ValueError) as e:
+        print(f"[findme] named-locations.json unreadable: {e}", file=sys.stderr)
+        return []
+    items = d.get("entries") if isinstance(d, dict) else d
+    return [e for e in (items or []) if isinstance(e, dict) and e.get("name")
+            and isinstance(e.get("lat"), (int, float)) and isinstance(e.get("lon"), (int, float))]
+
+NAMED_LOCATIONS = _load_named_locations()
+
+def match_named_location(lat, lon, threshold_km=0.15):
+    """Return named location if within threshold, else None."""
+    for loc in NAMED_LOCATIONS:
+        dist = haversine_km(lat, lon, loc["lat"], loc["lon"])
+        if dist <= threshold_km:
+            return loc
+    return None
+
+def _get_password():
+    """Get iCloud password from .env file, then keychain."""
+    if os.path.exists(ENV_FILE):
+        with open(ENV_FILE) as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith("ICLOUD_PASS="):
+                    return line.split("=", 1)[1]
+    try:
+        return subprocess.check_output(
+            ["security", "find-generic-password", "-s", "pyicloud", "-a", ICLOUD_ACCOUNT, "-w"],
+            stderr=subprocess.DEVNULL
+        ).decode().strip()
+    except Exception:
+        return None
+
+def _get_supabase_key():
+    """Get Supabase service role key from .env."""
+    if os.path.exists(ENV_FILE):
+        with open(ENV_FILE) as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith("SUPABASE_SERVICE_ROLE_KEY="):
+                    return line.split("=", 1)[1]
+    return None
+
+def _get_owner_location_from_app():
+    """Get the user's location from the Jori app via Supabase.
+
+    Queries the most recent user message with location metadata.
+    Returns dict with lat, lon, ts (epoch ms), accuracy, timezone — or None.
+    """
+    key = _get_supabase_key()
+    if not key:
+        return None
+    try:
+        # Fetch most recent user message (the user's messages have location in metadata)
+        url = (
+            f"{SUPABASE_URL}/rest/v1/jori_messages"
+            "?role=eq.user"
+            "&order=created_at.desc"
+            "&limit=1"
+            "&select=metadata,created_at"
+        )
+        req = urllib.request.Request(url, headers={
+            "apikey": key,
+            "Authorization": f"Bearer {key}",
+            "Accept": "application/json",
+        })
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            rows = json.loads(resp.read())
+        if not rows:
+            return None
+        meta = rows[0].get("metadata") or {}
+        lat = meta.get("latitude")
+        lon = meta.get("longitude")
+        if not lat or not lon:
+            return None
+        # Parse the location timestamp if available, else use message created_at
+        loc_ts_str = meta.get("location_timestamp")
+        if loc_ts_str:
+            try:
+                loc_dt = datetime.fromisoformat(loc_ts_str.replace("Z", "+00:00"))
+                ts_ms = int(loc_dt.timestamp() * 1000)
+            except Exception:
+                ts_ms = int(datetime.fromisoformat(rows[0]["created_at"].replace("Z", "+00:00")).timestamp() * 1000)
+        else:
+            ts_ms = int(datetime.fromisoformat(rows[0]["created_at"].replace("Z", "+00:00")).timestamp() * 1000)
+        return {
+            "lat": float(lat),
+            "lon": float(lon),
+            "ts": ts_ms,
+            "accuracy": meta.get("location_accuracy", "unknown"),
+            "timezone": meta.get("timezone") or _INST.get("tz") or "UTC",
+            "source": "gandalf-app",
+        }
+    except Exception:
+        return None
+
+def get_api():
+    if PyiCloudService is None:
+        print("ERROR: pyicloud is not installed (agent/findmy-venv)", file=sys.stderr)
+        sys.exit(1)
+    if not ICLOUD_ACCOUNT:
+        print("ERROR: no Find My account (config findme icloud_account or instance owner_email)", file=sys.stderr)
+        sys.exit(1)
+    password = _get_password()
+    try:
+        api = PyiCloudService(ICLOUD_ACCOUNT, password=password, with_family=True)
+        # Don't check requires_2fa — it's unreliable when password is provided.
+        # Instead, try to access devices directly. If session is truly invalid, it'll throw.
+        try:
+            _ = api.devices
+        except Exception:
+            print("ERROR: iCloud session expired. Run: icloud --username " + ICLOUD_ACCOUNT + " --locate", file=sys.stderr)
+            sys.exit(1)
+        return api
+    except Exception as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        sys.exit(1)
+
+def owner_name(prs_id):
+    return KNOWN_PEOPLE.get(prs_id, prs_id or "Unknown")
+
+def format_time(ts):
+    if not ts:
+        return "?"
+    try:
+        dt = datetime.fromtimestamp(ts / 1000)
+        now = datetime.now()
+        diff = now - dt
+        mins = int(diff.total_seconds() / 60)
+        if mins < 1:
+            return "just now"
+        if mins < 60:
+            return f"{mins}m ago"
+        hours = mins // 60
+        if hours < 24:
+            return f"{hours}h ago"
+        return dt.strftime("%b %d %H:%M")
+    except:
+        return "?"
+
+def haversine_km(lat1, lon1, lat2, lon2):
+    R = 6371
+    dlat = math.radians(lat2 - lat1)
+    dlon = math.radians(lon2 - lon1)
+    a = math.sin(dlat/2)**2 + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.sin(dlon/2)**2
+    return R * 2 * math.asin(math.sqrt(a))
+
+def reverse_geocode(lat, lon, structured=False):
+    """Best-effort reverse geocode using Nominatim."""
+    try:
+        import urllib.request
+        url = f"https://nominatim.openstreetmap.org/reverse?lat={lat}&lon={lon}&format=json&zoom=18&addressdetails=1"
+        req = urllib.request.Request(url, headers={"User-Agent": "findme-cli/1.0"})
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read())
+            addr = data.get("address", {})
+            house = addr.get("house_number", "")
+            road = addr.get("road", "")
+            neighbourhood = addr.get("neighbourhood") or addr.get("suburb") or addr.get("quarter", "")
+            city = addr.get("city") or addr.get("town") or addr.get("village", "")
+            state = addr.get("state", "")
+            country = addr.get("country", "")
+            postcode = addr.get("postcode", "")
+            # Build street address
+            street = f"{house} {road}".strip() if road else ""
+            if structured:
+                result = {}
+                if street: result["address"] = street
+                if neighbourhood: result["neighbourhood"] = neighbourhood
+                if city: result["city"] = city
+                if state: result["state"] = state
+                if postcode: result["postcode"] = postcode
+                if country and country not in ("United States", "United States of America"):
+                    result["country"] = country
+                return result
+            # Build short location string
+            parts = [p for p in [city, state] if p]
+            if country and country not in ("United States", "United States of America"):
+                parts.append(country)
+            return ", ".join(parts) if parts else f"{lat:.4f},{lon:.4f}"
+    except:
+        if structured:
+            return {"address": f"{lat:.4f},{lon:.4f}"}
+        return f"{lat:.4f},{lon:.4f}"
+
+# Override owner/name for specific devices (by device ID prefix): a family
+# member's device on the user's account, a spare phone kept at home as a
+# controller. Config `device_overrides`.
+DEVICE_OVERRIDES = dict(CFG.get("device_overrides") or {})
+
+def norm(s):
+    """Normalize curly quotes to ASCII for matching."""
+    return s.replace("\u2018", "'").replace("\u2019", "'").replace("\u201c", '"').replace("\u201d", '"').lower()
+
+def device_label(d):
+    """Format device label avoiding "Sam's Sam's iPhone"."""
+    name = d["name"]
+    owner = d["owner"]
+    if norm(owner) in norm(name):
+        return name
+    return f"{owner}'s {name}"
+
+def get_devices(api):
+    """Get all devices with location, grouped by owner."""
+    results = []
+    for dev in api.devices:
+        c = dev._content
+        loc = c.get("location")
+        if not loc or not loc.get("latitude"):
+            continue
+        dev_id = c.get("id", "")
+        override = next((v for k, v in DEVICE_OVERRIDES.items() if dev_id.startswith(k)), None)
+        entry = {
+            "name": c.get("name", "?"),
+            "model": c.get("deviceDisplayName", c.get("modelDisplayName", "?")),
+            "class": c.get("deviceClass", "?"),
+            "owner": owner_name(c.get("prsId")),
+            "prsId": c.get("prsId"),
+            "lat": loc["latitude"],
+            "lon": loc["longitude"],
+            "ts": loc.get("timeStamp", 0),
+            "battery": c.get("batteryLevel", -1),
+            "batteryStatus": c.get("batteryStatus", ""),
+            "fmlyShare": c.get("fmlyShare", False),
+        }
+        if override:
+            if "owner" in override:
+                entry["owner"] = override["owner"]
+            if "name" in override:
+                entry["name"] = override["name"]
+        results.append(entry)
+    return results
+
+def _owner_device_from_app(app_loc):
+    """Convert Jori app location to a device-like dict for unified output."""
+    return {
+        "name": "Jori App (iPhone)",
+        "model": "iPhone",
+        "class": "iPhone",
+        "owner": OWNER_NAME,
+        "prsId": None,
+        "lat": app_loc["lat"],
+        "lon": app_loc["lon"],
+        "ts": app_loc["ts"],
+        "battery": -1,
+        "batteryStatus": "",
+        "fmlyShare": False,
+        "_source": "gandalf-app",
+    }
+
+def cmd_locate(args, as_json=False):
+    """Locate a person or device."""
+    query = " ".join(args).lower().strip() if args else ""
+
+    # For the user specifically, try the Jori app first (live GPS from phone)
+    owner_from_app = None
+    if not query or query in OWNER_QUERIES | {"all", ""}:
+        app_loc = _get_owner_location_from_app()
+        if app_loc:
+            owner_from_app = _owner_device_from_app(app_loc)
+
+    # For the user only — return app location without hitting iCloud at all
+    if query in OWNER_QUERIES and owner_from_app:
+        matched = [owner_from_app]
+        _print_devices(matched, as_json)
+        return
+
+    api = get_api()
+    devices = get_devices(api)
+
+    if not query or query in OWNER_QUERIES | {"all"}:
+        # Show primary device per person
+        if query == "all":
+            matched = devices
+        else:
+            matched = []
+            seen_owners = set()
+
+            # Use Jori app location for the user if available
+            if owner_from_app:
+                matched.append(owner_from_app)
+                seen_owners.add(OWNER_NAME.lower())
+
+            for d in devices:
+                owner = d["owner"].lower()
+                if owner in seen_owners:
+                    continue
+                prim = PRIMARY_DEVICES.get(owner)
+                if prim and prim in norm(d["name"]) and d["class"] == "iPhone":
+                    matched.append(d)
+                    seen_owners.add(owner)
+            # Add any owners we haven't seen yet (pick first iPhone)
+            for d in devices:
+                owner = d["owner"].lower()
+                if owner not in seen_owners and d["class"] == "iPhone":
+                    matched.append(d)
+                    seen_owners.add(owner)
+    else:
+        # Search by person name or device name
+        matched = [d for d in devices if query in norm(d["name"]) or query in d["owner"].lower()]
+        if not matched:
+            matched = [d for d in devices if any(w in norm(d["name"]) or w in d["owner"].lower() for w in query.split())]
+
+    if not matched:
+        if as_json:
+            print(json.dumps({"error": f"No device found matching '{query}'"}))
+        else:
+            print(f"No device found matching '{query}'")
+        return
+
+    _print_devices(matched, as_json)
+
+def _print_devices(matched, as_json=False):
+    """Print device location results in human or JSON format."""
+    if as_json:
+        out = []
+        for d in matched:
+            named = match_named_location(d["lat"], d["lon"])
+            if named:
+                geo = {"address": named.get("address") or "", "place": named["name"]}
+            else:
+                geo = reverse_geocode(d["lat"], d["lon"], structured=True)
+            entry = {
+                "name": d["name"],
+                "model": d["model"],
+                "owner": d["owner"],
+                "lat": d["lat"],
+                "lon": d["lon"],
+                "updated": format_time(d["ts"]),
+                "battery": f"{d['battery']:.0%}" if d["battery"] >= 0 else None,
+                "source": d.get("_source", "findmy"),
+            }
+            entry.update(geo)
+            out.append(entry)
+        print(json.dumps(out, indent=2))
+    else:
+        for d in matched:
+            loc_str = reverse_geocode(d["lat"], d["lon"])
+            bat = f" ({d['battery']:.0%} battery)" if d["battery"] >= 0 else ""
+            age = format_time(d["ts"])
+            source = " [via Jori app]" if d.get("_source") == "gandalf-app" else ""
+            label = device_label(d)
+            print(f"{label} ({d['model']})")
+            print(f"  {loc_str} — {age}{bat}{source}")
+            print()
+
+def cmd_near(args, as_json=False):
+    """Find devices near a location or near each other."""
+    api = get_api()
+    devices = get_devices(api)
+    # Group by owner, pick primary or first iPhone
+    people = {}
+    # Use Jori app for the user first
+    app_loc = _get_owner_location_from_app()
+    if app_loc:
+        people[OWNER_NAME] = _owner_device_from_app(app_loc)
+    for d in devices:
+        owner = d["owner"]
+        if owner in people:
+            continue
+        prim = PRIMARY_DEVICES.get(owner.lower(), "")
+        if owner not in people or (prim and prim.lower() in d["name"].lower()):
+            people[owner] = d
+
+    results = []
+    owners = list(people.values())
+    for i, a in enumerate(owners):
+        for b in owners[i+1:]:
+            dist = haversine_km(a["lat"], a["lon"], b["lat"], b["lon"])
+            results.append((a["owner"], b["owner"], dist))
+
+    results.sort(key=lambda x: x[2])
+    if as_json:
+        print(json.dumps([{"a": a, "b": b, "distance_km": round(d, 1)} for a, b, d in results], indent=2))
+    else:
+        for a, b, dist in results:
+            if dist < 1:
+                print(f"{a} and {b}: {dist*1000:.0f}m apart")
+            else:
+                print(f"{a} and {b}: {dist:.1f}km apart")
+
+def cmd_list(as_json=False):
+    """List all devices."""
+    api = get_api()
+    devices = get_devices(api)
+    if as_json:
+        print(json.dumps([{
+            "name": d["name"], "model": d["model"], "owner": d["owner"],
+            "lat": d["lat"], "lon": d["lon"], "updated": format_time(d["ts"]),
+            "battery": f"{d['battery']:.0%}" if d["battery"] >= 0 else None,
+        } for d in devices], indent=2))
+    else:
+        by_owner = {}
+        for d in devices:
+            by_owner.setdefault(d["owner"], []).append(d)
+        for owner, devs in sorted(by_owner.items()):
+            print(f"{owner}:")
+            for d in devs:
+                age = format_time(d["ts"])
+                bat = f" {d['battery']:.0%}" if d["battery"] >= 0 else ""
+                print(f"  {d['name']} ({d['model']}) — {age}{bat}")
+            print()
+
+def _parse_date_range(args):
+    """Parse date args into (start_iso, end_iso) for Supabase query."""
+    from datetime import timedelta
+    today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+
+    if not args or args[0].lower() == "today":
+        start = today
+    elif args[0].lower() == "yesterday":
+        start = today - timedelta(days=1)
+    else:
+        try:
+            start = datetime.strptime(args[0], "%Y-%m-%d")
+        except ValueError:
+            start = today
+
+    end = start + timedelta(days=1)
+    return start.isoformat() + "Z", end.isoformat() + "Z"
+
+def _query_location_history(start_iso, end_iso):
+    """Query Supabase location_history for a date range."""
+    key = _get_supabase_key()
+    if not key:
+        print("ERROR: No Supabase key", file=sys.stderr)
+        sys.exit(1)
+    try:
+        url = (
+            f"{SUPABASE_URL}/rest/v1/location_history"
+            f"?arrived_at=gte.{start_iso}"
+            f"&arrived_at=lte.{end_iso}"
+            f"&order=arrived_at.asc"
+            f"&select=*"
+        )
+        req = urllib.request.Request(url, headers={
+            "apikey": key,
+            "Authorization": f"Bearer {key}",
+            "Accept": "application/json",
+        })
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return json.loads(resp.read())
+    except Exception as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        return []
+
+MOVEMENT_EVIDENCE_PAD_MIN = 10  # widen the raw-sample query beyond the exact
+# visit boundary -- sparse GPS (5-20 min gaps between pings is normal) routinely
+# lands the samples that would reveal drift just outside [arrived_at, departed_at],
+# starving the check of the evidence it exists to find (2026-07-24: a 24-min
+# Chatelaillon market stop had exactly 1 raw sample inside its own boundary --
+# the other 3 landed 10s-5min outside it -- so len(samples) < 3 returned None and
+# the ask went out as a confident bakery/lunch hypothesis with no "just walking
+# around" option, even though the raw track showed ~200m of drift at ~0.5 km/h).
+
+MOVEMENT_EVIDENCE_BROWSE_RADIUS_M = 60.0  # absolute GPS drift from the sample
+# centroid, NOT a radius/duration ratio like location-segment's dwell/browse
+# split. A slow multi-stop wander (market stalls, browsing shopfronts) keeps
+# roughly the same physical footprint the longer it runs, so a ratio actively
+# UNDERweights long slow wanders -- the Chatelaillon case above ratios to
+# ~4.4 m/min, under location-segment's 5.0 m/min browse cutoff, despite the user
+# confirming it was pure wandering. 60m sits comfortably above the ~15-40m
+# accuracy_m these samples typically report, so it flags real movement, not
+# GPS noise around a single fixed table.
+
+def _movement_evidence(arrived_at, departed_at, visit_id=None):
+    """Independent GPS-sample check for a visit window, used to keep
+    findme enrich from asking about a "stop" that was actually continuous
+    movement (2026-07-22: a 15-min walk on Ile-d'Aix was queued as a stop,
+    and the location-enrich playbook then invented an unsupported "waiting
+    for the ferry" narrative around it). Looks at raw breadcrumb rows
+    inside a window padded by MOVEMENT_EVIDENCE_PAD_MIN around
+    [arrived_at, departed_at] and reports the dominant on-device `activity`,
+    total path length, and spatial drift (`cluster_radius_m` / `pattern`:
+    "browse" when the drift or activity signal says wandering, else
+    "dwell"). Returns None when there's too little raw-sample signal to say
+    anything -- callers must treat that as "no evidence either way", never
+    as confirmation of a stationary stop.
+    """
+    from datetime import timedelta
+    try:
+        arr_dt = datetime.fromisoformat(arrived_at.replace("Z", "+00:00"))
+        dep_dt = datetime.fromisoformat(departed_at.replace("Z", "+00:00"))
+    except Exception:
+        return None
+    pad = timedelta(minutes=MOVEMENT_EVIDENCE_PAD_MIN)
+    try:
+        rows = _query_location_history(
+            (arr_dt - pad).isoformat().replace("+00:00", "Z"),
+            (dep_dt + pad).isoformat().replace("+00:00", "Z"),
+        )
+    except Exception:
+        return None
+    # Exclude only the visit row being evaluated, not every segment_type="visit"
+    # row in the padded window. A slow wander routinely logs several short
+    # ADJACENT visit rows (2026-07-24: the Chatelaillon window had a second,
+    # 1-min "visit" 10s after the target's departed_at) -- blanket-excluding
+    # segment_type=="visit" threw those samples away too, leaving only 2 raw
+    # points and tripping the len(samples) < 3 floor right back into None.
+    # When visit_id isn't given (e.g. ad-hoc CLI use), fall back to the old
+    # blanket exclusion.
+    samples = [
+        r for r in rows
+        if (r.get("id") != visit_id if visit_id else r.get("segment_type") != "visit")
+        and r.get("activity") and r.get("latitude") is not None
+    ]
+    if len(samples) < 3:
+        return None
+    samples.sort(key=lambda r: r.get("arrived_at") or "")
+    activities = [s["activity"] for s in samples]
+    dominant_activity = max(set(activities), key=activities.count)
+    path_m = 0.0
+    for i in range(1, len(samples)):
+        path_m += haversine_km(
+            samples[i - 1]["latitude"], samples[i - 1]["longitude"],
+            samples[i]["latitude"], samples[i]["longitude"],
+        ) * 1000
+    try:
+        dur_min = (dep_dt - arr_dt).total_seconds() / 60
+    except Exception:
+        dur_min = None
+    avg_speed_kmh = round((path_m / 1000) / (dur_min / 60), 1) if dur_min else None
+    clat = sum(s["latitude"] for s in samples) / len(samples)
+    clon = sum(s["longitude"] for s in samples) / len(samples)
+    cluster_radius_m = max(
+        (haversine_km(clat, clon, s["latitude"], s["longitude"]) * 1000 for s in samples),
+        default=0.0,
+    )
+    is_browse = (
+        cluster_radius_m > MOVEMENT_EVIDENCE_BROWSE_RADIUS_M
+        or dominant_activity in ("walking", "running", "cycling", "driving")
+    )
+    return {
+        "dominant_activity": dominant_activity,
+        "sample_count": len(samples),
+        "path_length_m": round(path_m),
+        "avg_speed_kmh": avg_speed_kmh,
+        "cluster_radius_m": round(cluster_radius_m),
+        "pattern": "browse" if is_browse else "dwell",
+    }
+
+def _ask_gate(v, dry_run=False):
+    """bin/ask-gate's verdict for visit `v`: may we ask about it yet?
+
+    Refuses a slice of a stay he never left (`same-stay`, marked non-stop
+    unless dry_run) and a stop with no point away from it since it ended
+    (`no-departure`, left alone and re-judged next run). Raw fixes, not rows.
+    Fail-open: any error returns {"ask": True}.
+    """
+    cmd = [os.path.join(os.path.dirname(os.path.abspath(__file__)), "ask-gate"),
+           "--visit", v["id"], "--json"]
+    if not dry_run:
+        cmd.append("--apply")
+    try:
+        out = subprocess.run(cmd, capture_output=True, text=True, timeout=45)
+        return json.loads(out.stdout or "{}") or {"ask": True}
+    except Exception as e:
+        print(f"[findme enrich] ask-gate failed for {v['id'][:8]}: {e}", file=sys.stderr)
+        return {"ask": True}
+
+def _passage_check(v, dry_run=False):
+    """Ask bin/stop-passage whether visit `v` was a stop at all.
+
+    Returns the verdict dict when it was a PASSAGE (part of a walk), else None.
+    With dry_run the row is left alone; otherwise stop-passage marks it
+    non-stop itself, so both ask paths share one writer. Fail-open: any error,
+    timeout or non-passage verdict returns None and the caller asks as before.
+    """
+    cmd = [os.path.join(os.path.dirname(os.path.abspath(__file__)), "stop-passage"),
+           "--visit", v["id"], "--json"]
+    if not dry_run:
+        cmd.append("--apply")
+    try:
+        # 150 s: the phone photo probe waits up to 30 s and the evidence step
+        # may make one model call (stop-passage header).
+        out = subprocess.run(cmd, capture_output=True, text=True, timeout=150)
+        res = json.loads(out.stdout or "{}")
+    except Exception as e:
+        print(f"[findme enrich] stop-passage failed for {v['id'][:8]}: {e}", file=sys.stderr)
+        return None
+    # `calendar` (named from his calendar), `evidence` (he already said or
+    # showed where he was) and `hold` (waiting on the phone's or the library's
+    # photos) are not questions either — see stop-passage's header.
+    if res.get("verdict") in ("calendar", "evidence", "hold"):
+        return res
+    if res.get("verdict") != "passage":
+        return None
+    if not dry_run and not res.get("applied"):
+        return None  # not written (protected row) — leave it to the normal path
+    return res
+
+def _interpret_segments(segments):
+    """Interpret raw segments into a narrative timeline.
+
+    Groups transit waypoints between visits, infers transport mode from
+    distance/speed, calculates durations, and produces a list of events:
+      [{type: "stay", place, arrived, departed, duration_min, city}, ...]
+      [{type: "travel", mode, from_place, to_place, departed, arrived, distance_km, duration_min}, ...]
+    """
+    from datetime import timedelta
+
+    # Separate visits and transits
+    visits = [s for s in segments if s.get("segment_type") == "visit"]
+    if not visits:
+        return []
+
+    # Drop visits confirmed as non-stops (data blips / brief pauses the user rejected)
+    visits = [v for v in visits if v.get("place_type") != "non-stop"]
+    if not visits:
+        return []
+
+    events = []
+    for i, v in enumerate(visits):
+        # Add a travel event between consecutive visits
+        if i > 0:
+            prev = visits[i - 1]
+            prev_lat, prev_lon = prev["latitude"], prev["longitude"]
+            curr_lat, curr_lon = v["latitude"], v["longitude"]
+            dist = haversine_km(prev_lat, prev_lon, curr_lat, curr_lon)
+
+            # Travel time: from previous departure to current arrival
+            try:
+                dep_dt = datetime.fromisoformat((prev.get("departed_at") or prev["arrived_at"]).replace("Z", "+00:00"))
+                arr_dt = datetime.fromisoformat(v["arrived_at"].replace("Z", "+00:00"))
+                travel_min = max(0, (arr_dt - dep_dt).total_seconds() / 60)
+            except:
+                travel_min = 0
+
+            # Collect transit waypoints between these two visits for activity info
+            transit_activities = []
+            for t in segments:
+                if t.get("segment_type") != "transit":
+                    continue
+                try:
+                    t_dt = datetime.fromisoformat(t["arrived_at"].replace("Z", "+00:00"))
+                    if dep_dt <= t_dt <= arr_dt and t.get("activity"):
+                        transit_activities.append(t["activity"])
+                except:
+                    pass
+
+            # Infer transport mode
+            dominant_activity = max(set(transit_activities), key=transit_activities.count) if transit_activities else "unknown"
+            if dist < 0.5:
+                mode = "walked"
+            elif dist < 2 and dominant_activity == "walking":
+                mode = "walked"
+            elif dist > 50:
+                # Long distance — could be train, flight, or long drive
+                speed_kmh = dist / (travel_min / 60) if travel_min > 0 else 0
+                if speed_kmh > 200:
+                    mode = "flew"
+                elif speed_kmh > 80:
+                    mode = "took the train"  # faster than typical driving
+                else:
+                    mode = "drove"
+            elif dominant_activity == "walking":
+                mode = "walked"
+            elif dominant_activity in ("driving", "unknown"):
+                mode = "drove"
+            elif dominant_activity == "cycling":
+                mode = "cycled"
+            elif dominant_activity == "running":
+                mode = "ran"
+            else:
+                mode = "traveled"
+
+            from_place = prev.get("place_name") or prev.get("address") or f"{prev_lat:.4f},{prev_lon:.4f}"
+            to_place = v.get("place_name") or v.get("address") or f"{curr_lat:.4f},{curr_lon:.4f}"
+
+            events.append({
+                "type": "travel",
+                "mode": mode,
+                "from_place": from_place,
+                "to_place": to_place,
+                "departed": prev.get("departed_at") or prev["arrived_at"],
+                "arrived": v["arrived_at"],
+                "distance_km": round(dist, 1),
+                "duration_min": round(travel_min),
+            })
+
+        # Add the visit as a stay event
+        place = v.get("place_name") or v.get("address") or f"{v['latitude']:.4f},{v['longitude']:.4f}"
+        try:
+            arr_dt = datetime.fromisoformat(v["arrived_at"].replace("Z", "+00:00"))
+            if v.get("departed_at"):
+                dep_dt = datetime.fromisoformat(v["departed_at"].replace("Z", "+00:00"))
+                dur_min = (dep_dt - arr_dt).total_seconds() / 60
+            else:
+                dur_min = (datetime.now(arr_dt.tzinfo) - arr_dt).total_seconds() / 60
+        except:
+            dur_min = 0
+
+        events.append({
+            "type": "stay",
+            "place": place,
+            "arrived": v["arrived_at"],
+            "departed": v.get("departed_at"),
+            "duration_min": round(dur_min),
+            "city": v.get("city", ""),
+            "place_type": v.get("place_type", ""),
+            "companions": v.get("companions") or [],
+        })
+
+    return events
+
+def _format_duration(minutes):
+    """Format minutes as 'Xh Ym' or 'Ym'."""
+    if minutes < 1:
+        return "<1m"
+    h = int(minutes // 60)
+    m = int(minutes % 60)
+    if h > 0 and m > 0:
+        return f"{h}h {m}m"
+    elif h > 0:
+        return f"{h}h"
+    else:
+        return f"{m}m"
+
+def _format_distance(km):
+    """Format distance in miles."""
+    mi = km * 0.621371
+    if mi < 0.1:
+        return ""
+    if mi < 1:
+        return f"{mi:.1f} mi"
+    return f"{mi:.0f} mi"
+
+def cmd_history(args, as_json=False):
+    """Show location history timeline."""
+    # Check for --narrative flag
+    narrative = "--narrative" in args
+    if narrative:
+        args = [a for a in args if a != "--narrative"]
+
+    start_iso, end_iso = _parse_date_range(args)
+    segments = _query_location_history(start_iso, end_iso)
+
+    if not segments:
+        if as_json:
+            print(json.dumps({"segments": [], "events": [], "summary": "No location data for this date."}))
+        else:
+            print("No location data for this date.")
+        return
+
+    events = _interpret_segments(segments)
+
+    if as_json:
+        print(json.dumps({
+            "segments": segments,
+            "events": events,
+            "date": args[0] if args else "today",
+        }, indent=2))
+        return
+
+    # Human-readable timeline
+    date_label = args[0].capitalize() if args else "Today"
+    print(f"{date_label}'s Timeline:")
+    print()
+
+    total_walked_km = 0
+    total_traveled_km = 0
+    places_visited = set()
+
+    for ev in events:
+        if ev["type"] == "stay":
+            # Format: "  09:45 - 11:20  Blue Bottle Coffee [1h 35m]"
+            try:
+                arr = datetime.fromisoformat(ev["arrived"].replace("Z", "+00:00")).astimezone(LOCAL_TZ).strftime("%H:%M")
+            except:
+                arr = "?"
+            if ev.get("departed"):
+                try:
+                    dep = datetime.fromisoformat(ev["departed"].replace("Z", "+00:00")).astimezone(LOCAL_TZ).strftime("%H:%M")
+                except:
+                    dep = "?"
+            else:
+                dep = "now  "
+            dur = _format_duration(ev["duration_min"])
+            companions = ev.get("companions") or []
+            comp_str = f" with {', '.join(companions)}" if companions else ""
+            print(f"  {arr} - {dep}  {ev['place']}{comp_str}  [{dur}]")
+            places_visited.add(ev["place"])
+
+        elif ev["type"] == "travel":
+            # Format: "     └─ walked 10m (0.3 mi)"  or  "     └─ drove 25m (12 mi)"
+            dur = _format_duration(ev["duration_min"])
+            dist = _format_distance(ev["distance_km"])
+            dist_str = f" ({dist})" if dist else ""
+            print(f"     └─ {ev['mode']} {dur}{dist_str}")
+
+            if ev["mode"] == "walked":
+                total_walked_km += ev["distance_km"]
+            total_traveled_km += ev["distance_km"]
+
+    print()
+    walked_mi = total_walked_km * 0.621371
+    traveled_mi = total_traveled_km * 0.621371
+    parts = [f"{len(places_visited)} places"]
+    if walked_mi > 0.1:
+        parts.append(f"{walked_mi:.1f} mi walked")
+    if traveled_mi > walked_mi + 0.5:
+        parts.append(f"{traveled_mi:.0f} mi total travel")
+    print(f"  Summary: {', '.join(parts)}")
+
+def cmd_activity(args, as_json=False):
+    """Show current activity (what the user is doing right now)."""
+    key = _get_supabase_key()
+    if not key:
+        print("ERROR: No Supabase key", file=sys.stderr)
+        sys.exit(1)
+    try:
+        # Query most recent segment (open visit preferred)
+        url = (
+            f"{SUPABASE_URL}/rest/v1/location_history"
+            "?order=arrived_at.desc"
+            "&limit=1"
+            "&select=*"
+        )
+        req = urllib.request.Request(url, headers={
+            "apikey": key,
+            "Authorization": f"Bearer {key}",
+            "Accept": "application/json",
+        })
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            rows = json.loads(resp.read())
+    except Exception as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        return
+
+    if not rows:
+        msg = "No location data available."
+        if as_json:
+            print(json.dumps({"status": "unknown", "message": msg}))
+        else:
+            print(msg)
+        return
+
+    seg = rows[0]
+    place = seg.get("place_name") or seg.get("address") or f"{seg['latitude']:.4f},{seg['longitude']:.4f}"
+    activity = seg.get("activity", "unknown")
+    arrived = seg.get("arrived_at", "")
+    departed = seg.get("departed_at")
+
+    try:
+        arr_dt = datetime.fromisoformat(arrived.replace("Z", "+00:00"))
+        age = format_time(int(arr_dt.timestamp() * 1000))
+    except:
+        age = "?"
+
+    if as_json:
+        print(json.dumps(seg, indent=2))
+    else:
+        status = activity.capitalize()
+        if seg.get("segment_type") == "visit" and not departed:
+            print(f"{status} at {place} since {age}")
+        elif seg.get("segment_type") == "transit":
+            print(f"{status} (in transit) since {age}")
+        else:
+            print(f"Last known: {status} at {place} ({age})")
+
+# ────────────────────────────────────────────────────────────────────
+# Google Places enrichment — identify what place a visit corresponds to
+# ────────────────────────────────────────────────────────────────────
+
+# Place type priority (higher = more likely the place the stop was for)
+PLACE_TYPE_PRIORITY = {
+    "restaurant": 100, "cafe": 95, "coffee_shop": 95, "bar": 90,
+    "meal_takeaway": 85, "meal_delivery": 80, "bakery": 85,
+    "food": 80, "night_club": 75, "ice_cream_shop": 75,
+    "asian_restaurant": 100, "chinese_restaurant": 100, "italian_restaurant": 100,
+    "japanese_restaurant": 100, "korean_restaurant": 100, "thai_restaurant": 100,  # kernel-guard-ok: Google Places primary types, the same for every user
+    "vietnamese_restaurant": 100, "mexican_restaurant": 100, "indian_restaurant": 100,  # kernel-guard-ok: Google Places primary types, the same for every user
+    "mediterranean_restaurant": 100, "french_restaurant": 100, "american_restaurant": 100,  # kernel-guard-ok: Google Places primary types, the same for every user
+    "seafood_restaurant": 100, "steak_house": 100, "sushi_restaurant": 100,
+    "pizza_restaurant": 100, "vegetarian_restaurant": 100, "vegan_restaurant": 100,
+    "noodle_shop": 100, "brunch_restaurant": 95, "breakfast_restaurant": 95,
+    "spa": 60, "massage_spa": 60, "gym": 50, "museum": 55, "art_gallery": 50,
+    "store": 30, "clothing_store": 30, "shoe_store": 30, "grocery_store": 35,
+    "dentist": 40, "doctor": 40, "hair_salon": 40, "beauty_salon": 40,
+    "hotel": 70, "lodging": 70, "park": 45,
+    # Service noise sharing a doorway: a clinic was offered for a café stop. Unlisted types score 20, so a clinic TIED an
+    # untyped real venue and won on a few metres. Below the unknown default,
+    # matching stop-identify's SERVICE_TYPES prior (destination > other >
+    # service). Google types and the OSM `kind` values the fallback carries.
+    "medical_clinic": 10, "medical_lab": 10, "physiotherapist": 10,
+    "pharmacy": 10, "drugstore": 10, "hospital": 10,
+    "clinic": 10, "doctors": 10,
+}
+
+def _google_places_nearby(lat, lon, radius=40, max_results=20):
+    """Places within radius metres, nearest first.
+
+    Delegates to `lib/places_nearby.py`, shared with `visit-anchor` so
+    that anything identifying a stop can ask what is AT it.
+    The function name and the cache namespace are both kept: every call site
+    here uses the name, and changing the namespace would cold-start a warm
+    7-day cache.
+
+    Extracted rather than copied because the FIELD MASK is billed per field —
+    the 2026-07 Places bill reached $267 on mask contents — and two copies of
+    that drift the first time either is touched. Behaviour is unchanged,
+    including the fail-open-to-empty on a spent budget.
+    """
+    try:
+        from places_nearby import nearby
+    except Exception as e:
+        print(f"[enrich] places_nearby unavailable: {e}", file=sys.stderr)
+        return []
+    return nearby(lat, lon, radius=radius, max_results=max_results,
+                  cache_prefix="findme-nearby")
+
+
+def _history_name(lat, lon, exclude_id=None, stop_min=None, stop_arrived=None):
+    """What the user's own history says this stop is, before any paid geocoder.
+
+    Delegates to `lib/place_naming.py`, which `stop-identify` uses for the
+    same two rungs -- one implementation, so the two tools cannot drift about
+    what "we have been here before" means.
+
+    This runs FIRST, ahead of Google and OSM, for two reasons. It is the
+    strongest evidence in the system (the user's own confirmed answer beats any
+    geocoder), and it is free -- which is what stops a blocked Places budget
+    from making Jori forget a cafe visited weekly. That is not hypothetical: a
+    blocked budget once dropped every unnamed stop for three days while the
+    answers sat in the user's confirmation history.
+
+    Returns the place_naming verdict dict, or None when history is silent or
+    disagrees with itself.
+    """
+    try:
+        import place_naming
+    except Exception as e:
+        print(f"[enrich] place_naming unavailable: {e}", file=sys.stderr)
+        return None
+    try:
+        # The stop's length and arrival let one earlier answer name a second
+        # STAY at the same spot (place_naming.repeat_stay_name, 2026-10-14).
+        return place_naming.name_from_history(lat, lon, exclude_id=exclude_id,
+                                              stop_min=stop_min, stop_arrived=stop_arrived)
+    except Exception as e:
+        print(f"[enrich] history rung failed: {e}", file=sys.stderr)
+        return None
+
+
+# OSM fallback for stop identification (2026-08-21).
+#
+# `_google_places_nearby` fails open to an empty list on a spent budget, and an
+# empty list is also exactly what a genuine miss looks like -- so before this a
+# blocked Places budget silently dropped EVERY unnamed stop and location-enrich
+# could not queue a single question ("no askable stop" 288x over three days,
+# 2026-08-15..18). Google was the ONLY candidate source here, even though
+# `day-segments` has ranked OSM polygons ABOVE Google since 2026-08-10 and
+# `lib/osm_places.py` is already trusted by stop-identify.
+#
+# Two things OSM gives that a Places pin cannot: it is free, so a budget block
+# no longer blinds the ask queue; and it returns real FOOTPRINTS, so "is he AT
+# this place" becomes point-in-polygon instead of a guess about how big the
+# place probably is.
+OSM_AUTONAME_MAX_SPAN_M = 150
+# Tier 2 thresholds. Measured on a dense city block: of 78 named
+# OSM features within 200m, only 7 (9%) are mapped as AREAS -- the rest are
+# point nodes. So containment alone, while the strongest signal, would almost
+# never fire. Tier 2 covers the point-node majority but demands the answer be
+# unambiguous: one feature very close, and nothing else nearby that could
+# plausibly be it. `NEAR` is deliberately tighter than the Google search radius
+# (40-100m) that produced the "big place claims the pavement beside it" misses.
+OSM_AUTONAME_NEAR_M = 20
+OSM_AUTONAME_RIVAL_M = 45
+
+
+def _osm_span_m(poly):
+    """Bounding-box diagonal of a polygon, in metres."""
+    from osm_places import meters
+    lats = [q[0] for q in poly]
+    lons = [q[1] for q in poly]
+    return meters((min(lats), min(lons)), (max(lats), max(lons)))
+
+
+def _osm_fallback(lat, lon, radius=200):
+    """Candidates from OpenStreetMap when Google has nothing.
+
+    Returns (auto, candidates). `auto` is a single feature confident enough to
+    name the stop WITHOUT asking, and is set only when all four hold: the fix is
+    INSIDE the polygon, the polygon is small (<= OSM_AUTONAME_MAX_SPAN_M
+    across), it is the ONLY containing candidate, and it is not a `demoted`
+    category. That conjunction is deliberately strict -- the location-spine
+    standing warning is that a wrong name is worse than no name, because
+    `resolution_rate` scores 1.0 either way and rung 8 turns it into narrative.
+    A 2.6km "footprint" once claimed a stop; the span guard is what keeps the
+    container from being bigger than the place.
+
+    An auto-name is written as place_type `named`, the same authority the
+    saved-places branch above already uses -- NOT `user-confirmed`, which
+    outranks it, so a later correction from the user still wins (spine rung 4).
+
+    `candidates` are shaped like the Google rows so the existing ranking and
+    queueing path works unchanged.
+    """
+    try:
+        import osm_places
+    except Exception as e:
+        print(f"[enrich] osm_places unavailable: {e}", file=sys.stderr)
+        return None, []
+    try:
+        feats = osm_places.nearby(lat, lon, radius=radius)
+    except Exception as e:
+        print(f"[enrich] osm nearby failed: {e}", file=sys.stderr)
+        return None, []
+
+    containing, cands = [], []
+    for f in feats:
+        poly = f.get("polygon")
+        inside = bool(poly) and osm_places.point_in_polygon(lat, lon, poly)
+        if inside and f.get("category") != "demoted":
+            try:
+                if _osm_span_m(poly) <= OSM_AUTONAME_MAX_SPAN_M:
+                    containing.append(f)
+            except Exception:
+                pass
+        try:
+            dist = osm_places.meters((lat, lon), (f["lat"], f["lon"]))
+        except Exception:
+            continue
+        cands.append({
+            "name": f["name"],
+            "address": "",
+            "primary_type": f.get("kind") or "point_of_interest",
+            "type_display": f.get("kind") or "",
+            "rating": None,
+            "reviews": None,
+            "distance_m": 0.0 if inside else dist,
+            "summary": "",
+            "osm_id": f.get("osm_id"),
+            "source": "osm_overpass",
+        })
+
+    cands.sort(key=lambda c: c["distance_m"])
+
+    # Tier 1 -- containment. The fix is INSIDE exactly one small footprint.
+    auto = containing[0] if len(containing) == 1 else None
+
+    # Tier 2 -- unambiguous proximity, for the point-node majority that has no
+    # polygon to be inside of. One feature within OSM_AUTONAME_NEAR_M and no
+    # rival within OSM_AUTONAME_RIVAL_M, so there is nothing else it could
+    # reasonably be. Anything less clear-cut goes to the queue and gets asked.
+    if auto is None and cands:
+        near = [c for c in cands if c["distance_m"] <= OSM_AUTONAME_NEAR_M]
+        rivals = [c for c in cands if c["distance_m"] <= OSM_AUTONAME_RIVAL_M]
+        if len(near) == 1 and len(rivals) == 1:
+            only = near[0]
+            match = next((f for f in feats if f.get("osm_id") == only["osm_id"]), None)
+            if match is not None and match.get("category") != "demoted":
+                auto = match
+
+    return auto, cands[:20]
+
+
+def _places_block_reason():
+    """The Places budget block reason, or None when calls are flowing.
+
+    `places_nearby` fails open to an empty list on a spent budget, which is the
+    right call on the location hot path — but downstream that is byte-identical
+    to "Google knows of nothing here", and the two mean opposite things. One is
+    a rural fix; the other is every stop in the day being dropped because we
+    never asked.
+
+    2026-08-15 to 08-18: the jori scope hit its $20 cap at 02:53Z on the 15th
+    and location-enrich — the largest job on the ledger — ran ZERO times for
+    three days. The drop log recorded 26 rows, all of them reading
+    `google_places_zero_candidates`, so the trail pointed at Google rather than
+    at the cap. Diagnosis cost three days and an escalation that named the wrong
+    subsystem. Distinguishing the two reasons is the whole fix.
+    """
+    try:
+        from places_guard import places_block_reason
+        return places_block_reason()
+    except Exception:
+        return None
+
+def _score_candidate(cand):
+    """Score a candidate: higher = better match.
+
+    Combines: place type priority + proximity + popularity.
+    Food-type places are heavily favored: a stop is most often a meal.
+    """
+    type_score = PLACE_TYPE_PRIORITY.get(cand["primary_type"], 20)
+    # Proximity: 100 at 0m, 0 at 50m+
+    prox_score = max(0, 100 - (cand["distance_m"] * 2))
+    # Popularity: log-scale review count, capped
+    reviews = cand.get("reviews", 0) or 0
+    pop_score = min(50, reviews ** 0.5)
+    # Rating bonus: 0-20 for 0-5 stars
+    rating_score = (cand.get("rating") or 3.0) * 4
+    return type_score + prox_score + pop_score + rating_score
+
+def _rank_candidates(candidates):
+    """Sort candidates by score (best first)."""
+    return sorted(candidates, key=_score_candidate, reverse=True)
+
+def _load_pending_enrich():
+    """Load pending-enrichment state."""
+    if not os.path.exists(PENDING_ENRICH_FILE):
+        return {"pending": []}
+    try:
+        with open(PENDING_ENRICH_FILE) as f:
+            return json.load(f)
+    except Exception:
+        return {"pending": []}
+
+def _save_pending_enrich(state):
+    """Save pending-enrichment state."""
+    os.makedirs(os.path.dirname(PENDING_ENRICH_FILE), exist_ok=True)
+    with open(PENDING_ENRICH_FILE, "w") as f:
+        json.dump(state, f, indent=2)
+
+def _update_location_row(visit_id, updates):
+    """Update a location_history row via Supabase REST API."""
+    key = _get_supabase_key()
+    if not key:
+        return False
+    try:
+        url = f"{SUPABASE_URL}/rest/v1/location_history?id=eq.{visit_id}"
+        req = urllib.request.Request(
+            url,
+            data=json.dumps(updates).encode("utf-8"),
+            headers={
+                "apikey": key,
+                "Authorization": f"Bearer {key}",
+                "Content-Type": "application/json",
+                "Prefer": "return=minimal",
+            },
+            method="PATCH"
+        )
+        with urllib.request.urlopen(req, timeout=10):
+            return True
+    except Exception as e:
+        print(f"[enrich] Update failed: {e}", file=sys.stderr)
+        return False
+
+def _detect_companions_nearby(visit_lat, visit_lon, threshold_km=0.15, accuracy_m=None):
+    """Check Find My for family members near a visit location.
+
+    Returns list of names (e.g., ["Sam"]) of the config's companion_people
+    whose current Find My location is within threshold_km of the visit. Skips
+    the user.
+
+    Called at enrich time — Find My is current-state, so this catches people
+    still at/near the place. Photo-face backfill (see cmd_backfill_companions)
+    and bin/companion-presence (a Find My reading every 10 min, compared
+    with the user's trail afterwards, home stays and walks included) catch the rest.
+
+    GPS accuracy scaling: in dense urban blocks Find My can be 50-100m off on
+    each device, so the effective threshold must grow with observed accuracy.
+    """
+    if accuracy_m:
+        threshold_km = max(threshold_km, (float(accuracy_m) * 3) / 1000.0)
+    try:
+        api = get_api()
+        devices = get_devices(api)
+    except (Exception, SystemExit):
+        # get_api calls sys.exit on auth failure — catch SystemExit so a
+        # broken iCloud session doesn't kill the whole enrich run.
+        return []
+
+    companions = []
+    seen = set()
+    for person_name in CFG.get("companion_people") or []:
+        if person_name in seen:
+            continue
+        for d in devices:
+            if d["owner"] == person_name and d["class"] == "iPhone":
+                dist = haversine_km(visit_lat, visit_lon, d["lat"], d["lon"])
+                if dist <= threshold_km:
+                    companions.append(person_name)
+                    seen.add(person_name)
+                break
+    return companions
+
+def _merge_existing_companions(visit_id, found):
+    """The row's companions plus `found`. The writes below replace the column, and
+    since 2026-10-18 companion-presence and the photo backfill may have put people
+    on the row before enrich reaches it; replacing would erase them."""
+    key = _get_supabase_key()
+    if not key:
+        return found
+    try:
+        req = urllib.request.Request(
+            f"{SUPABASE_URL}/rest/v1/location_history?id=eq.{urllib.parse.quote(str(visit_id))}&select=companions",
+            headers={"apikey": key, "Authorization": f"Bearer {key}", "Accept": "application/json"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            rows = json.loads(resp.read())
+    except Exception as e:
+        print(f"[enrich] companions lookup failed: {e}", file=sys.stderr)
+        return found
+    existing = [c for c in ((rows[0].get("companions") if rows else None) or []) if isinstance(c, str)]
+    return existing + [c for c in found if c not in existing]
+
+
+def _clean_resolved_from_pending(dry_run=False):
+    """Remove pending entries whose DB visit row is already resolved.
+
+    A pending entry can go stale when someone updates place_type directly in
+    Supabase (e.g. a raw PATCH, or a chat-agent resolve flow that wrote the
+    DB but hit an error before touching pending). The enrich ask loop picks
+    the oldest unasked pending without re-checking the DB, so these stale
+    entries cause asks about stops that are already known to be non-stops
+    or already named.
+    """
+    key = _get_supabase_key()
+    if not key:
+        return []
+    state = _load_pending_enrich()
+    if not state.get("pending"):
+        return []
+    dropped = []
+    kept = []
+    RESOLVED = {"named", "user-confirmed", "non-stop"}
+    for p in state["pending"]:
+        vid = p["visit_id"]
+        # A declined entry exists only to stop `enrich --lookback` re-queueing
+        # the stop; once the stop is older than any lookback it can go.
+        _declined = _parse_iso(p.get("declined_at"))
+        if _declined is not None and (_now_utc() - _declined) > timedelta(days=3):
+            dropped.append({"visit_id": vid, "place_type": None, "place_name": None,
+                            "reason": "declined, aged out"})
+            continue
+        try:
+            url = (
+                f"{SUPABASE_URL}/rest/v1/location_history"
+                f"?id=eq.{vid}&select=id,place_type,place_name"
+            )
+            req = urllib.request.Request(url, headers={
+                "apikey": key, "Authorization": f"Bearer {key}", "Accept": "application/json",
+            })
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                rows = json.loads(resp.read())
+        except Exception:
+            kept.append(p)
+            continue
+        if rows and rows[0].get("place_type") in RESOLVED:
+            dropped.append({
+                "visit_id": vid,
+                "place_type": rows[0].get("place_type"),
+                "place_name": rows[0].get("place_name"),
+            })
+        else:
+            kept.append(p)
+    if dropped and not dry_run:
+        state["pending"] = kept
+        _save_pending_enrich(state)
+    return dropped
+
+
+def _sweep_stale_open_visits(dry_run=False, lookback_hours=24, threshold_m=150):
+    """Close open visits where a subsequent segment shows the user moved away.
+
+    iOS CLVisit's departure callback is unreliable — it skips often enough that
+    visits stack up with departed_at=NULL forever, invisible to the enrich query.
+    This sweeper finds such orphans and synthesizes departed_at from the first
+    subsequent segment whose coord is >threshold_m from the visit location.
+
+    Returns a list of repaired visit dicts (full Supabase rows with departed_at
+    patched in-memory so callers can merge them into the normal enrich scan
+    even when they're outside its narrow lookback window).
+    """
+    from datetime import timedelta
+    key = _get_supabase_key()
+    if not key:
+        return []
+    cutoff = (datetime.utcnow() - timedelta(hours=lookback_hours)).isoformat() + "Z"
+    url = (
+        f"{SUPABASE_URL}/rest/v1/location_history"
+        f"?segment_type=eq.visit"
+        f"&departed_at=is.null"
+        f"&arrived_at=gte.{cutoff}"
+        f"&order=arrived_at.asc"
+        f"&select=*"
+    )
+    try:
+        req = urllib.request.Request(url, headers={
+            "apikey": key, "Authorization": f"Bearer {key}", "Accept": "application/json",
+        })
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            opens = json.loads(resp.read())
+    except Exception as e:
+        print(f"[sweep] Query failed: {e}", file=sys.stderr)
+        return []
+
+    repaired = []
+    for v in opens:
+        vid, vlat, vlon = v["id"], v["latitude"], v["longitude"]
+        arrived = v["arrived_at"]
+        # URL-encode the timestamp — raw + gets interpreted as space by PostgREST
+        seg_url = (
+            f"{SUPABASE_URL}/rest/v1/location_history"
+            f"?arrived_at=gt.{urllib.parse.quote(arrived, safe='')}"
+            f"&order=arrived_at.asc"
+            f"&limit=200"
+            f"&select=id,arrived_at,latitude,longitude,segment_type"
+        )
+        try:
+            req = urllib.request.Request(seg_url, headers={
+                "apikey": key, "Authorization": f"Bearer {key}", "Accept": "application/json",
+            })
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                subs = json.loads(resp.read())
+        except Exception as e:
+            print(f"[sweep] Subseq query failed for {vid[:8]}: {e}", file=sys.stderr)
+            continue
+
+        # First subsequent segment whose timestamp is strictly after arrived_at
+        # (guards against the duplicate-row / inverted-timestamp bug) AND whose
+        # coord is >threshold_m away.
+        first_outbound = None
+        for s in subs:
+            if s["arrived_at"] <= arrived:
+                continue  # broken row
+            d_m = haversine_km(vlat, vlon, s["latitude"], s["longitude"]) * 1000
+            if d_m > threshold_m:
+                first_outbound = (s, d_m)
+                break
+        if not first_outbound:
+            continue
+
+        seg, dist_m = first_outbound
+        new_departed = seg["arrived_at"]
+        action = "would-close" if dry_run else "closed"
+        if not dry_run:
+            ok = _update_location_row(vid, {
+                "departed_at": new_departed,
+                "notes": f"[sweeper] departed_at synthesized from segment {seg['id'][:8]} {round(dist_m)}m away",
+            })
+            if not ok:
+                action = "update-failed"
+        # Patch in-memory so caller can feed this into the normal enrich pipeline
+        v_patched = dict(v)
+        v_patched["departed_at"] = new_departed
+        repaired.append({
+            "visit": v_patched,
+            "visit_id": vid,
+            "visit_arrived": arrived,
+            "synth_departed": new_departed,
+            "distance_m": round(dist_m),
+            "outbound_seg_id": seg["id"],
+            "action": action,
+        })
+    return repaired
+
+
+def cmd_enrich(args, as_json=False):
+    """Scan recent unresolved visits and enrich via Google Places.
+
+    Auto-resolves when confident. Queues uncertain ones to pending file
+    so the location-enrich job can ask the user.
+    """
+    from datetime import timedelta
+
+    min_duration_min = 15  # Only queue stops ≥15 min. Short clusters (red lights, a dog's sniff, GPS wobble) aren't worth asking about — the user can't reliably recall them and flat "pause or stop?" pings became noise.
+    # Named-venue lower-floor exception.
+    # A 13-min stop at a restaurant (a real food pickup) was filtered out by the
+    # 15-min floor and surfaced as a "browse" blip in the daily summary, requiring
+    # post-hoc correction. Lower the floor to 8 min ONLY when the top Google Places
+    # candidate is a high-priority "real venue" (restaurant/cafe/store/etc., score
+    # ≥80 in PLACE_TYPE_PRIORITY) AND none of the top candidates is an airport or
+    # transit station (filters out airport-terminal / transit-hub class blips).
+    min_duration_named = 8
+    AIRPORT_TYPES = {"airport", "international_airport", "transit_station", "bus_station", "train_station", "subway_station", "light_rail_station", "taxi_stand"}
+    lookback_hours = 6
+    dry_run = False
+
+    # Allow --lookback / --dry-run override
+    for i, a in enumerate(args):
+        if a == "--lookback" and i + 1 < len(args):
+            lookback_hours = int(args[i + 1])
+        if a == "--min-duration" and i + 1 < len(args):
+            min_duration_min = int(args[i + 1])
+        if a == "--dry-run":
+            dry_run = True
+
+    # Step 0-pre: drop pending entries whose duration_min is below the current
+    # min_duration_min floor. When the floor is raised (e.g. 5 → 15 on
+    # 2026-04-19) already-queued sub-floor entries get stuck as asked:true
+    # with no resolution path, since later gates only apply to NEW queueing.
+    # Purge here before any further processing. Idempotent — a no-op when no
+    # sub-floor entries remain.
+    pruned_below_floor = []
+    if not dry_run:
+        _floor_state = _load_pending_enrich()
+        if _floor_state.get("pending"):
+            _kept = []
+            for _p in _floor_state["pending"]:
+                try:
+                    _dm = float(_p.get("duration_min") or 0)
+                except (TypeError, ValueError):
+                    _dm = 0.0
+                # Prune below the named-venue absolute floor only — entries
+                # between min_duration_named and min_duration_min are intentional
+                # short-named queue items (added 2026-05-18) and must not be
+                # silently pruned by this stale-sub-floor sweeper.
+                if _dm < min_duration_named:
+                    pruned_below_floor.append({
+                        "visit_id": _p.get("visit_id"),
+                        "duration_min": _p.get("duration_min"),
+                    })
+                else:
+                    _kept.append(_p)
+            if pruned_below_floor:
+                _floor_state["pending"] = _kept
+                _save_pending_enrich(_floor_state)
+                if not as_json:
+                    print(
+                        f"[enrich] Pruned {len(pruned_below_floor)} pending entr"
+                        f"{'y' if len(pruned_below_floor) == 1 else 'ies'} below "
+                        f"min_duration_min={min_duration_min} (stale sub-floor)",
+                        file=sys.stderr,
+                    )
+                    for _d in pruned_below_floor:
+                        _vid = (_d.get("visit_id") or "")[:8]
+                        print(
+                            f"[enrich]   × visit {_vid} — duration_min={_d.get('duration_min')}",
+                            file=sys.stderr,
+                        )
+
+    # Step 0a-prime: prune UNASKED entries whose visit ended >24h ago. These are
+    # "zombies" — the ask loop will never surface them (jobs/location-enrich.md
+    # Step 2 only asks about stops that ended within the last 12h, since the
+    # user can't recall older ones), but nothing else removes them: the resolved-sweep
+    # (Step 0a) only drops DB-resolved stops, and the agent's 48h sweep covers
+    # only ASKED entries. Left alone they accumulate forever and made the dispatch
+    # gate fire perpetually for stops the agent always declined (fixed alongside in
+    # trigger-location-enrich.sh's 12h freshness bound, 2026-06-07). 24h = the 12h
+    # ask window plus a generous margin, so a still-fresh entry is never dropped.
+    pruned_stale_unasked = []
+    if not dry_run:
+        _z_state = _load_pending_enrich()
+        if _z_state.get("pending"):
+            _now_ts = time.time()
+            _kept_z = []
+            for _p in _z_state["pending"]:
+                if _p.get("asked"):
+                    _kept_z.append(_p)
+                    continue
+                _end = _p.get("departed_at") or _p.get("arrived_at")
+                _drop = False
+                if _end:
+                    try:
+                        _end_ts = datetime.fromisoformat(_end.replace("Z", "+00:00")).timestamp()
+                        _drop = (_now_ts - _end_ts) > 24 * 3600
+                    except (ValueError, TypeError):
+                        _drop = False
+                if _drop:
+                    pruned_stale_unasked.append({
+                        "visit_id": _p.get("visit_id"),
+                        "departed_at": _p.get("departed_at"),
+                    })
+                else:
+                    _kept_z.append(_p)
+            if pruned_stale_unasked:
+                _z_state["pending"] = _kept_z
+                _save_pending_enrich(_z_state)
+                if not as_json:
+                    print(
+                        f"[enrich] Pruned {len(pruned_stale_unasked)} stale unasked "
+                        f"entr{'y' if len(pruned_stale_unasked) == 1 else 'ies'} "
+                        f"(visit ended >24h ago — never askable)",
+                        file=sys.stderr,
+                    )
+
+    # Step 0a: pending-queue hygiene. Drop entries whose DB row is already
+    # resolved (named / user-confirmed / non-stop) so the ask loop can't
+    # pick up a stale entry and pester the user about an already-settled stop.
+    cleaned = _clean_resolved_from_pending(dry_run=dry_run)
+
+    # Step 0b: close orphaned open visits using transit-movement evidence.
+    # Patches DB (unless dry_run) and returns the repaired rows so we can
+    # fold them into the normal enrich scan even when they're older than
+    # lookback_hours.
+    swept = _sweep_stale_open_visits(dry_run=dry_run)
+
+    key = _get_supabase_key()
+    if not key:
+        print("ERROR: No Supabase key", file=sys.stderr)
+        sys.exit(1)
+
+    # Fetch recent completed visits that aren't resolved to a named/poi place
+    cutoff = (datetime.utcnow() - timedelta(hours=lookback_hours)).isoformat() + "Z"
+    url = (
+        f"{SUPABASE_URL}/rest/v1/location_history"
+        f"?segment_type=eq.visit"
+        f"&departed_at=not.is.null"
+        f"&arrived_at=gte.{cutoff}"
+        f"&order=arrived_at.desc"
+        f"&select=*"
+    )
+    try:
+        req = urllib.request.Request(url, headers={
+            "apikey": key,
+            "Authorization": f"Bearer {key}",
+            "Accept": "application/json",
+        })
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            visits = json.loads(resp.read())
+    except Exception as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        return
+
+    # Fold swept (newly-closed) visits into the scan so they can be queued to
+    # ask. Dedupe by id in case one is already in the lookback window.
+    scanned_ids = {v["id"] for v in visits}
+    for s in swept:
+        if s["visit"]["id"] not in scanned_ids:
+            visits.append(s["visit"])
+            scanned_ids.add(s["visit"]["id"])
+
+    pending_state = _load_pending_enrich()
+    already_pending = {p["visit_id"] for p in pending_state["pending"]}
+
+    # location_history routinely holds two or three rows for ONE physical stop:
+    # the iOS client's flushUnsynced() has no re-entrancy guard, so two
+    # overlapping flushes upload the same locally-cached segments twice (the
+    # duplicate rows carry created_at values milliseconds apart). Measured over
+    # the 14 days to 2026-08-04: 54 of 224 distinct visits duplicated (24%).
+    # Deduping on visit_id alone therefore queues the same stop two or three
+    # times, and each copy is independently askable — `findme resolve pending`
+    # only ever resolves asked_pending[0], so answering one leaves its twin live
+    # to be asked again. Key on (coords, arrived_at) as well: identical for
+    # duplicates of one stop, distinct for genuinely separate stops.
+    # The real fix belongs in the client; this keeps its noise out of the asks.
+    def _stop_key(latitude, longitude, arrived_at):
+        try:
+            return (round(float(latitude), 5), round(float(longitude), 5), str(arrived_at))
+        except (TypeError, ValueError):
+            return None
+
+    already_pending_keys = set()
+    for p in pending_state["pending"]:
+        k = _stop_key(p.get("latitude"), p.get("longitude"), p.get("arrived_at"))
+        if k:
+            already_pending_keys.add(k)
+
+    auto_resolved = []
+    queued_to_ask = []
+
+    for v in visits:
+        # Skip if already resolved or confirmed as a non-stop
+        if v.get("place_type") in ("named", "user-confirmed", "non-stop"):
+            continue
+        # Skip if place_name is a real business name (has specific details) — heuristic:
+        # Apple's on-device geocoder often returns generic borough names like "Manhattan"
+        # for POI. We only trust it if place_name is genuinely specific.
+        place_name = (v.get("place_name") or "").strip()
+        if v.get("place_type") == "poi" and place_name and place_name not in (
+            set(CFG.get("generic_place_names") or []) | {""}
+        ):
+            continue
+        # Skip if already pending — by id, or by (coords, arrived_at) so a
+        # duplicate DB row for a stop already queued can't queue a second ask.
+        if v["id"] in already_pending:
+            continue
+        v_key = _stop_key(v.get("latitude"), v.get("longitude"), v.get("arrived_at"))
+        if v_key and v_key in already_pending_keys:
+            continue
+        # Skip (auto-resolve instead) if this visit's window overlaps an
+        # already user-confirmed visit. The exact-duplicate dedupe above only
+        # catches rows with identical (coords, arrived_at); iOS also splits
+        # one real stop into two location_history rows with slightly
+        # different windows (one stop became a 06:32-07:06 row the user
+        # confirmed as a cafe and a separate 07:02-08:01 row that still got
+        # queued and asked about — a question the user had already answered). `_overlapping_confirmed_visit` is
+        # the same check `findme resolve` uses to refuse a double-booking;
+        # running it here stops the duplicate ask from ever going out.
+        clash = _overlapping_confirmed_visit(v)
+        # Only a TWIN (same stop, within 150m) inherits the confirmed name. A
+        # confirmed visit far away that merely overlaps in time is a late
+        # CLVisit departure (see _lagging_departure_trim) — copying its name
+        # would label the breakfast with the rental's name. Ask about that one.
+        if clash and not _is_twin(v, clash):
+            clash = None
+        if clash:
+            updates = {"place_name": clash.get("place_name"), "place_type": "named"}
+            if not dry_run:
+                _update_location_row(v["id"], updates)
+            auto_resolved.append({
+                "visit_id": v["id"], "place": clash.get("place_name"),
+                "confidence": "overlap_confirmed", "companions": [],
+            })
+            print(
+                f"[findme enrich] overlap-resolved {v['id']} -> {clash.get('place_name')} "
+                f"(overlaps confirmed visit {clash.get('id', '')[:8]})",
+                file=sys.stderr,
+            )
+            continue
+        # Check duration
+        try:
+            arr = datetime.fromisoformat(v["arrived_at"].replace("Z", "+00:00"))
+            dep = datetime.fromisoformat(v["departed_at"].replace("Z", "+00:00"))
+            dur_min = (dep - arr).total_seconds() / 60
+        except:
+            continue
+        # Absolute floor: never look at stops under 8 min (way below the named-venue
+        # short-stop threshold, and a fast-pickup runtime that's not worth the
+        # user's attention even if it resolves).
+        if dur_min < min_duration_named:
+            continue
+        # If the stop is 8-15 min, it can ONLY enter the queue via the named-venue
+        # gate below (post Google Places lookup). Mark it as such so we can short-
+        # circuit if no strong candidate is present.
+        short_named_only = dur_min < min_duration_min
+
+        # Detect companions via Find My (skip at home — the household lives there)
+        named = match_named_location(v["latitude"], v["longitude"])
+        if not named:
+            # The same home by its street address (a transliterated street
+            # name, a house number a few doors off); a model reads the
+            # addresses in bin/address-match. The row's label goes along only when the
+            # iOS geocoder wrote it.
+            try:
+                import place_naming
+                named = place_naming.match_named_location_by_address(
+                    v["latitude"], v["longitude"],
+                    [v.get("place_name")] if v.get("place_type") == "address" else [])
+            except Exception as e:
+                print(f"[enrich] address match unavailable: {e}", file=sys.stderr)
+                named = None
+        is_home = named and "Home" in named["name"]
+        companions = []
+        if not is_home:
+            companions = _detect_companions_nearby(
+                v["latitude"], v["longitude"], accuracy_m=v.get("accuracy_m")
+            )
+            if companions:
+                companions = _merge_existing_companions(v["id"], companions)
+
+        # Check named location match first
+        if named:
+            updates = {
+                "place_name": named["name"],
+                "place_type": "named",
+                "address": named.get("address"),
+            }
+            if companions:
+                updates["companions"] = companions
+            if not dry_run:
+                _update_location_row(v["id"], updates)
+            auto_resolved.append({
+                "visit_id": v["id"], "place": named["name"],
+                "confidence": "named", "companions": companions,
+            })
+            continue
+
+        # Rung 0 -- the user's own history. Free, strongest, and checked BEFORE
+        # any paid geocoder so a spent Places budget can never hide a place
+        # visited regularly. `skip-known` doctrine from stop-identify applies:
+        # both rungs clear the >80% certainty bar (ask only what is not known
+        # with very high certainty), so a hit names the stop instead of queueing
+        # a question the user has already answered.
+        hist = _history_name(v["latitude"], v["longitude"], exclude_id=v["id"],
+                             stop_min=dur_min, stop_arrived=v.get("arrived_at"))
+        # `favorite` does NOT auto-name. Saving a place in Google Maps is an act
+        # of intent, but it is not an answer about THIS visit, and the labels are
+        # often not venue names: measured on the build, the rung offered a bare
+        # street address for the user's own home and another for a stop whose
+        # actual neighbours were a poke bar and a cafe. Auto-naming floats a
+        # question when not sure. So a favorite becomes the single candidate on
+        # a one-tap question instead -- which also skips Google and OSM
+        # entirely, because the answer is already in front of the user and a
+        # geocoder cannot improve on the user's own label.
+        if hist and hist.get("rung") == "favorite" and hist.get("name"):
+            candidates = [{
+                "name": hist["name"], "address": "",
+                "primary_type": "point_of_interest", "type_display": "saved place",
+                "rating": None, "reviews": None, "distance_m": 0.0,
+                "summary": hist.get("detail", ""), "source": "favorite",
+            }]
+            hist = None
+        else:
+            candidates = None
+
+        if hist and hist.get("name"):
+            updates = {"place_name": hist["name"], "place_type": "named"}
+            if companions:
+                updates["companions"] = companions
+            if not dry_run:
+                _update_location_row(v["id"], updates)
+            auto_resolved.append({
+                "visit_id": v["id"], "place": hist["name"],
+                "confidence": hist["rung"], "companions": companions,
+            })
+            print(
+                f"[findme enrich] {hist['rung']} named {v['id']} -> {hist['name']} "
+                f"({hist['detail']})",
+                file=sys.stderr,
+            )
+            continue
+
+        # Was it a stop at all? Before paying for Places or queueing a
+        # question, let the trace answer: a walk that merely crossed this
+        # cluster is marked non-stop here and never asked about. The data
+        # answers what it was before anyone is asked. Geometry first, Jev on the inconclusive ones; any
+        # failure falls through to the normal ask.
+        # Has the user even left it? Asked before anything else that
+        # could compose a question: a quiet stretch of a stay still in
+        # progress produced "were you at the airbnb?" at 22:30 when he had
+        # not moved all evening.
+        gate = _ask_gate(v, dry_run=dry_run)
+        if gate.get("ask") is False:
+            if gate.get("check") == "same-stay":
+                auto_resolved.append({
+                    "visit_id": v["id"], "place": "(same stay — not a new stop)",
+                    "confidence": "ask-gate:same-stay", "companions": [],
+                })
+            print(f"[findme enrich] ask-gate hold {v['id']} ({gate.get('check')}: {gate.get('reason')})", file=sys.stderr)
+            continue
+
+        passage = _passage_check(v, dry_run=dry_run)
+        if passage and passage.get("verdict") == "hold":
+            print(f"[findme enrich] hold {v['id']} ({passage.get('reason')})", file=sys.stderr)
+            continue
+        if passage and passage.get("verdict") in ("calendar", "evidence"):
+            auto_resolved.append({
+                "visit_id": v["id"], "place": passage.get("name") or f"({passage.get('verdict')})",
+                "confidence": passage.get("verdict"), "companions": [],
+            })
+            print(f"[findme enrich] {passage.get('verdict')} {v['id']} -> {passage.get('name')} ({passage.get('reason')})", file=sys.stderr)
+            continue
+        if passage:
+            auto_resolved.append({
+                "visit_id": v["id"], "place": "(walk — not a stop)",
+                "confidence": f"passage:{passage.get('layer')}", "companions": [],
+            })
+            print(f"[findme enrich] passage {v['id']} -> non-stop ({passage.get('reason')})", file=sys.stderr)
+            continue
+
+        # Query Google Places — radius scales with GPS accuracy (min 40m, max 100m)
+        # This handles cases where GPS lands across the street from the actual spot
+        acc = v.get("accuracy_m") or 20
+        search_radius = max(40, min(100, int(acc * 2)))
+        if candidates is None:
+            candidates = _google_places_nearby(v["latitude"], v["longitude"], radius=search_radius, max_results=20)
+        if not candidates:
+            # Google had nothing (genuine miss OR spent budget) -- ask OSM before
+            # giving up, so the queue can still fill when Places is blocked.
+            osm_auto, osm_cands = _osm_fallback(v["latitude"], v["longitude"])
+            if osm_auto is not None:
+                updates = {"place_name": osm_auto["name"], "place_type": "named"}
+                if companions:
+                    updates["companions"] = companions
+                if not dry_run:
+                    _update_location_row(v["id"], updates)
+                auto_resolved.append({
+                    "visit_id": v["id"], "place": osm_auto["name"],
+                    "confidence": "osm_auto", "companions": companions,
+                })
+                print(
+                    f"[findme enrich] osm auto-named {v['id']} -> {osm_auto['name']} "
+                    f"({osm_auto.get('osm_id')})",
+                    file=sys.stderr,
+                )
+                continue
+            candidates = osm_cands
+
+        if not candidates:
+            # Log dropped stops so they don't disappear silently.
+            # A supermarket miss had this shape — Google Places returned 0
+            # nearby places for a real stop (e.g. shop just outside the search
+            # radius, or a place not in Google's data), so the resolver dropped
+            # it without trace. Now every drop writes a diagnostic row.
+            #
+            # The reason matters as much as the row: a blocked budget produces
+            # the same empty list, and calling that "zero candidates" sent the
+            # 2026-08-15 investigation after the wrong subsystem for three days.
+            _blocked = _places_block_reason()
+            _reason = "places_budget_blocked" if _blocked else "google_places_zero_candidates"
+            try:
+                drop = {
+                    "ts": datetime.utcnow().isoformat() + "Z",
+                    "visit_id": v["id"],
+                    "arrived_at": v.get("arrived_at"),
+                    "departed_at": v.get("departed_at"),
+                    "duration_min": round(dur_min) if isinstance(dur_min, (int, float)) else None,
+                    "latitude": v["latitude"],
+                    "longitude": v["longitude"],
+                    "accuracy_m": acc,
+                    "search_radius_m": search_radius,
+                    "reason": _reason,
+                    "osm_tried": True,
+                }
+                if _blocked:
+                    drop["block_reason"] = _blocked
+                if not dry_run:
+                    with open(ENRICH_DROPPED_FILE, "a") as fh:
+                        fh.write(json.dumps(drop) + "\n")
+                print(
+                    f"[findme enrich] dropped {v['id']} @ ({v['latitude']:.4f},{v['longitude']:.4f}) "
+                    f"dur={round(dur_min)}min reason={_reason}",
+                    file=sys.stderr,
+                )
+            except Exception as _e:
+                print(f"[findme enrich] dropped-log write failed: {_e}", file=sys.stderr)
+            continue
+
+        ranked = _rank_candidates(candidates)
+
+        # Policy: never silently auto-resolve. Every stop is queued for the user to
+        # confirm, because GPS clusters can be genuine stops, brief pauses, or
+        # data blips — heuristics can't reliably tell them apart.
+        if companions and not dry_run:
+            _update_location_row(v["id"], {"companions": companions})
+
+        food_first = [c for c in ranked if c["primary_type"] in PLACE_TYPE_PRIORITY and PLACE_TYPE_PRIORITY[c["primary_type"]] >= 80]
+        others = [c for c in ranked if c not in food_first]
+        top_candidates = (food_first + others)[:4]
+        food_heavy = len(food_first) >= 2 or (len(food_first) == 1 and food_first[0]["distance_m"] < 20)
+        # Short-named gate (2026-05-18). 8-15 min stops are queued ONLY when
+        # food_first has at least one strong candidate AND no top candidate is an
+        # airport / transit type. Otherwise drop silently — those are the noise
+        # the 15-min floor was originally protecting against.
+        if short_named_only:
+            has_strong_named = bool(food_first)
+            has_airport_candidate = any(c.get("primary_type") in AIRPORT_TYPES for c in top_candidates)
+            if not has_strong_named or has_airport_candidate:
+                continue
+        # Ready to ask 15 min after departure — fresh enough to recall, late enough
+        # that a data blip has already resolved itself.
+        try:
+            dep = datetime.fromisoformat(v["departed_at"].replace("Z", "+00:00"))
+            ready_at = (dep + timedelta(minutes=15)).isoformat()
+        except Exception:
+            ready_at = datetime.utcnow().isoformat() + "Z"
+        # Movement evidence (2026-07-22): independent of the visit boundary iOS
+        # reported, so the ask can be honest when raw GPS during the window
+        # looks like continuous walking/driving rather than a dwell. None when
+        # there's too little raw-sample signal -- never treated as "confirmed
+        # stationary".
+        movement_evidence = _movement_evidence(v["arrived_at"], v["departed_at"], visit_id=v["id"])
+        entry = {
+            "visit_id": v["id"],
+            "arrived_at": v["arrived_at"],
+            "departed_at": v["departed_at"],
+            "duration_min": round(dur_min),
+            "latitude": v["latitude"],
+            "longitude": v["longitude"],
+            "companions": companions,
+            "food_heavy": food_heavy,
+            "queued_at": datetime.utcnow().isoformat() + "Z",
+            "ready_at": ready_at,
+            "stage": "confirm",  # confirm → identify (after the user says yes it's a real stop)
+            "asked": False,
+            "candidates": [
+                {
+                    "name": c["name"],
+                    "address": c["address"],
+                    "type": c.get("type_display") or c["primary_type"],
+                    "rating": c.get("rating"),
+                    "reviews": c.get("reviews"),
+                    "distance_m": round(c["distance_m"]),
+                    "summary": c.get("summary", ""),
+                } for c in top_candidates
+            ],
+        }
+        if movement_evidence:
+            entry["movement_evidence"] = movement_evidence
+        pending_state["pending"].append(entry)
+        # Register both keys immediately: the duplicate rows for one stop are
+        # created milliseconds apart and so arrive in the SAME scan, where a
+        # check against the loaded-from-disk set alone would let both through.
+        already_pending.add(v["id"])
+        if v_key:
+            already_pending_keys.add(v_key)
+        queued_to_ask.append({"visit_id": v["id"], "candidates_count": len(top_candidates)})
+
+    if not dry_run:
+        _save_pending_enrich(pending_state)
+
+    if as_json:
+        print(json.dumps({
+            "dry_run": dry_run,
+            "pruned_below_floor": pruned_below_floor,
+            "pruned_stale_unasked": pruned_stale_unasked,
+            "cleaned": cleaned,
+            "swept": swept,
+            "auto_resolved": auto_resolved,
+            "queued_to_ask": queued_to_ask,
+            "total_pending": len(pending_state["pending"]),
+        }, indent=2, default=str))
+    else:
+        if dry_run:
+            print("DRY-RUN — no DB writes performed")
+        print(f"Pending cleaned (already resolved in DB): {len(cleaned)}")
+        for c in cleaned:
+            print(f"  × visit {c['visit_id'][:8]} — {c['place_type']} ({c['place_name'] or '-'})")
+        print(f"Swept (orphan visits closed): {len(swept)}")
+        for s in swept:
+            print(f"  → visit {s['visit_id'][:8]} arrived {s['visit_arrived']} → synth departed {s['synth_departed']} (outbound {s['distance_m']}m, {s['action']})")
+        print(f"Auto-resolved: {len(auto_resolved)}")
+        for r in auto_resolved:
+            print(f"  ✓ {r['place']} ({r['confidence']})")
+        print(f"Queued to ask: {len(queued_to_ask)}")
+        for q in queued_to_ask:
+            print(f"  ? visit {q['visit_id'][:8]} — {q['candidates_count']} candidates")
+        print(f"Total pending: {len(pending_state['pending'])}")
+
+# A negative answer usually carries the real answer inside it. "we were walking
+# along the coastline in the minimes park" is BOTH "not a stop" AND the truest
+# label that window will ever get — nothing downstream can re-derive it. The old
+# code matched a fixed set of bare tokens and wrote place_name=None for anything
+# it read as negative, so the words were discarded; resolve-day then went back to
+# the OSM guess and the 2026-07-26 daily summary titled that window
+# "~L'Équinoxe? · unconfirmed (also: Domino's, Le Transat)" while its own prose
+# said "you were walking the coastline through the park".
+#
+# Bare negatives (no information beyond "not a stop").
+NEGATIVE_TOKENS = {"no", "n", "nope", "blip", "not a stop", "none", "nothing",
+                   "data error", "data blip", "pause", "just a pause", "walk"}
+
+# A negative that DESCRIBES the window. Deliberately narrow — each pattern needs
+# an explicit not-a-stop marker ("not a stop", "just", "we were") so an ordinary
+# identification that happens to mention walking ("we walked to Le Récif") is not
+# swallowed as a non-stop.
+NON_STOP_DESCRIBED = [
+    re.compile(r"\bnot\s+(?:really\s+)?a\s+(?:real\s+)?stop\b", re.I),
+    re.compile(r"\bwasn'?t\s+a\s+stop\b", re.I),
+    re.compile(r"\b(?:just|only|merely)\s+(?:walking|walked|driving|drove|strolling|"
+               r"wandering|biking|cycling|passing|riding|out\s+for\s+a\s+walk)\b", re.I),
+    re.compile(r"^(?:no[,.]?\s*)?(?:we|i)\s+(?:were|was)\s+(?:just\s+)?"
+               r"(?:walking|driving|strolling|wandering|biking|cycling|passing)\b", re.I),
+]
+
+
+# Protocol tokens (2026-10-06) — strings WE define and hand to this CLI, never
+# place names. Matching them is set membership over our own vocabulary (the
+# same test choice-reply.mjs uses on its own button labels), not a reading of
+# what he meant; that judgment already happened upstream, in the chat agent's
+# model turn or in which button he tapped.
+#   "skip"      — chat procedures pass it for "no / not a stop". Withdraws the
+#                 stop, exactly like location-confirm's SKIP_TOKEN.
+#   "unknown"   — procedures/location-enrichment-replies.md passes it for
+#                 "none of those" at stage identify: a real stop, no name. The
+#                 pending entry is kept but marked declined so it is never asked
+#                 again and no word is stored as a venue.
+#   "__other__" — the stored value of a "Somewhere else" / "No, somewhere else"
+#                 / "Type it in" button (stop-identify OTHER_VALUE). It means
+#                 "ask me", so there is nothing to store; refused with exit 2.
+# Before this, all three reached the identification branch below and were
+# written as user-confirmed place names ("skip" on one home row).
+PROTOCOL_WITHDRAW = {"skip"}
+PROTOCOL_DECLINED = {"unknown"}
+PROTOCOL_NOT_A_NAME = {"__other__"}
+
+
+def _protocol_answer(answer):
+    t = (answer or "").strip().lower()
+    if t in PROTOCOL_WITHDRAW:
+        return "withdraw"
+    if t in PROTOCOL_DECLINED:
+        return "declined"
+    if t in PROTOCOL_NOT_A_NAME:
+        return "not_a_name"
+    return None
+
+
+def _mark_declined(pending_state, visit_id):
+    """Keep the pending entry (so findme enrich does not re-queue the stop) but
+    take it out of every ask path: asked stays true, `declined_at` is set."""
+    hit = False
+    for x in pending_state["pending"]:
+        if x.get("visit_id") == visit_id:
+            x["asked"] = True
+            x["declined_at"] = _now_utc().isoformat()
+            hit = True
+    if hit:
+        _save_pending_enrich(pending_state)
+    return hit
+
+
+def _classify_non_stop(answer):
+    """Read an enrichment answer as a non-stop.
+
+    Returns None when it isn't one (caller falls through to identification),
+    "" for a bare negative (no place_name to keep), or the description to store
+    as place_name so the permanent record holds the user's own words.
+    """
+    text = (answer or "").strip()
+    if text.lower().strip(".!? ") in NEGATIVE_TOKENS:
+        return ""
+    if not any(p.search(text) for p in NON_STOP_DESCRIBED):
+        return None
+    # Strip the leading classification ("no," / "not a stop,") — that part is
+    # already captured by place_type; what's worth keeping is what follows.
+    desc = text
+    for pat in (r"^(?:no|nope)[,.]?\s+",
+                r"^not\s+(?:really\s+)?a\s+(?:real\s+)?stop\s*[,.;:-]?\s+"):
+        desc = re.sub(pat, "", desc, flags=re.I)
+    desc = desc.strip(" .!?")
+    if not desc:
+        return ""
+    desc = desc[0].upper() + desc[1:]
+    return desc[:120]
+
+
+# A confirmation asserts two things at once: "this window WAS a stop" and "it was
+# X". The enrichment queue only ever asks about windows that could physically be
+# a stop — cmd_enrich refuses anything under `min_duration_named` — but that floor
+# lived ONLY in cmd_enrich, so every caller reaching past the queue skipped it.
+#
+# One morning a 22.8-minute coffee stop (09:11 local) was confirmed onto a
+# DIFFERENT row — an 84-second blip at 10:38 sitting 740m away, mid-walk,
+# whose centroid is reached
+# from the preceding fix at an implied 32 km/h and left 174m backwards 86 seconds
+# later. The queue had correctly refused it: 1.4 min is under the 8-minute floor,
+# and it appears nowhere in location-pending-enrich.json while five other stops
+# from that morning do. `findme resolve <id> <text>` PATCHed it anyway, because
+# the direct form validated nothing — not that the id existed, not that it was a
+# visit, not how long it lasted. The result outranks every other signal
+# downstream: resolve-day treats place_type='user-confirmed' as absolute.
+#
+# These checks are structural only — existence, segment type, dwell, overlap.
+# Nothing here reads the user's wording; classifying language stays a model's job.
+CONFIRM_MIN_DURATION_MIN = 8
+
+
+def _fetch_location_row(visit_id):
+    """Fetch one location_history row by id, or None if absent/unreachable."""
+    key = _get_supabase_key()
+    if not key:
+        return None
+    try:
+        url = (f"{SUPABASE_URL}/rest/v1/location_history"
+               f"?id=eq.{urllib.parse.quote(str(visit_id))}"
+               f"&select=id,segment_type,latitude,longitude,arrived_at,departed_at,"
+               f"place_name,place_type,notes")
+        req = urllib.request.Request(url, headers={
+            "apikey": key, "Authorization": f"Bearer {key}", "Accept": "application/json"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            rows = json.loads(resp.read())
+        return rows[0] if rows else None
+    except Exception as e:
+        print(f"[resolve] Lookup failed: {e}", file=sys.stderr)
+        return None
+
+
+def _overlapping_confirmed_visit(row):
+    """An already user-confirmed visit whose window overlaps `row`'s, if any.
+    (First of `_overlapping_confirmed_visits`; enrich's twin check uses this.)"""
+    clashes = _overlapping_confirmed_visits(row)
+    return clashes[0] if clashes else None
+
+
+def _overlapping_confirmed_visits(row):
+    """Every already user-confirmed visit whose window overlaps `row`'s.
+
+    Two confirmed stops cannot both own the same minutes. iOS emits overlapping
+    visits routinely — on 2026-08-10 five pairs shared an identical arrived_at to
+    the second, including "Harvest Cafe" (22.8 min) against "29 Rue Keller"
+    (87.5 min) 253m away — so a confirmation landing on the wrong twin silently
+    double-books the day instead of failing loudly.
+    """
+    key = _get_supabase_key()
+    arr, dep = _parse_iso(row.get("arrived_at")), _parse_iso(row.get("departed_at"))
+    if not key or arr is None:
+        return None
+    # Open-ended rows can't bound a window; treat arrival as a zero-width probe.
+    dep = dep or arr
+    # STRICT inequalities. Consecutive segments share an endpoint by construction
+    # — one's departed_at IS the next one's arrived_at — so an inclusive compare
+    # reports every adjacent pair as overlapping and blocks ordinary back-to-back
+    # confirms. Caught in test: with 29 Rue Keller starting at Harvest's 09:34:03
+    # departure, lte/gte flagged the two as double-booked when they merely touch.
+    try:
+        url = (f"{SUPABASE_URL}/rest/v1/location_history"
+               f"?segment_type=eq.visit"
+               f"&place_type=eq.user-confirmed"
+               f"&arrived_at=lt.{urllib.parse.quote(dep.isoformat())}"
+               f"&departed_at=gt.{urllib.parse.quote(arr.isoformat())}"
+               f"&select=id,arrived_at,departed_at,place_name,latitude,longitude,notes")
+        req = urllib.request.Request(url, headers={
+            "apikey": key, "Authorization": f"Bearer {key}", "Accept": "application/json"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            rows = json.loads(resp.read())
+    except Exception:
+        return []  # advisory check — never block a resolve on a lookup failure
+    return [o for o in rows if o.get("id") != row.get("id")]
+
+
+LAG_TRIM_MIN_SEPARATION_M = 150
+
+
+def _is_twin(a, b):
+    """Two visit rows close enough (<= LAG_TRIM_MIN_SEPARATION_M) to be one
+    stop. Rows without coords are treated as twins — the pre-2026-10-06
+    behaviour, so a missing coordinate never newly triggers an ask."""
+    try:
+        return haversine_km(a["latitude"], a["longitude"], b["latitude"], b["longitude"]) * 1000 <= LAG_TRIM_MIN_SEPARATION_M
+    except (KeyError, TypeError):
+        return True
+
+
+def _lagging_departure_trim(row, clashes):
+    """When confirming `row` collides with ONE confirmed visit at a DIFFERENT
+    place, the earlier of the two is still "there" only because its departure
+    came in late — trim it to the later one's arrival. Returns
+    {id, place_name, old_departed, new_departed, notes} or None. Pure.
+
+    THE CASE. An overnight row at a rented flat ran to 08:41Z; breakfast at a
+    café 155m away began 07:21Z. The phone writes a visit's `departed_at` when
+    iOS gets round to delivering the CLVisit departure (the iOS client's
+    LocationTracker), and that routinely lags — so the flat "lasted" through
+    breakfast and `findme resolve` refused to confirm the café as a
+    double-booking. Nobody is in two places 150m+ apart: the user's
+    confirmation of the later stop is the evidence the earlier one had ended.
+
+    Still refused (returns None): more than one clash; a clash within 150m (the
+    iOS twin case — two rows for ONE stop, which the refusal exists for); rows
+    without coords or times; identical arrivals; or a trim that would leave the
+    earlier visit under the confirm floor (then it was not a real stay either,
+    and a human should look)."""
+    if len(clashes) != 1:
+        return None
+    other = clashes[0]
+    try:
+        d_m = haversine_km(row["latitude"], row["longitude"],
+                           other["latitude"], other["longitude"]) * 1000
+    except (KeyError, TypeError):
+        return None
+    if d_m <= LAG_TRIM_MIN_SEPARATION_M:
+        return None
+    ra, oa = _parse_iso(row.get("arrived_at")), _parse_iso(other.get("arrived_at"))
+    if ra is None or oa is None or ra == oa:
+        return None
+    earlier, later = (row, other) if ra < oa else (other, row)
+    e_arr, e_dep = _parse_iso(earlier.get("arrived_at")), _parse_iso(earlier.get("departed_at"))
+    l_arr = _parse_iso(later.get("arrived_at"))
+    if e_dep is None or not (e_arr < l_arr < e_dep):
+        return None
+    if (l_arr - e_arr).total_seconds() / 60 < CONFIRM_MIN_DURATION_MIN:
+        return None
+    return {"id": earlier["id"], "place_name": earlier.get("place_name"),
+            "old_departed": earlier.get("departed_at"),
+            "new_departed": later["arrived_at"],
+            "notes": earlier.get("notes"), "distance_m": round(d_m)}
+
+
+def _apply_departure_trim(trim):
+    """Write a `_lagging_departure_trim` plan; the old departure is kept in notes."""
+    note = ((trim.get("notes") or "") + ("; " if trim.get("notes") else "") +
+            f"[resolve-trim] departed_at {trim['old_departed']} -> {trim['new_departed']}: "
+            f"a confirmed stop {trim['distance_m']}m away began then (late CLVisit departure)")
+    return _update_location_row(trim["id"], {"departed_at": trim["new_departed"], "notes": note})
+
+
+INNER_STOP_MAX_SHARE = 0.25
+
+
+def _inner_stops(row, clashes, name):
+    """The clashes that are stops WITHIN this stay: inside its window by more than a
+    minute at each end, at most a quarter of its length, under another name. Two
+    rows for one visit share its minutes; a café inside a morning at the flat does
+    not (a flat's 05:39-14:20 row could not take back the user's name for it
+    because a 39-minute café stop the user named sat inside it). A near-twin covering most
+    of the row is still a clash. Without the name being confirmed, none."""
+    arr, dep = _parse_iso(row.get("arrived_at")), _parse_iso(row.get("departed_at"))
+    if not name or arr is None or dep is None or os.environ.get("FINDME_INNER_STOPS") == "0":
+        return []
+    span = (dep - arr).total_seconds()
+    out = []
+    for c in clashes or []:
+        ca, cd = _parse_iso(c.get("arrived_at")), _parse_iso(c.get("departed_at"))
+        if ca is None or cd is None:
+            continue
+        if (ca - arr).total_seconds() > 60 and (dep - cd).total_seconds() > 60 \
+                and (cd - ca).total_seconds() <= INNER_STOP_MAX_SHARE * span \
+                and (c.get("place_name") or "").strip().lower() != name.strip().lower():
+            out.append(c)
+    return out
+
+
+# A confirmation carried by every twin row of one stay is ONE answer (2026-10-28).
+# iOS writes a stay as two or three rows with near-identical windows, and a save
+# names all of them. When that name was wrong, each twin's correction was refused
+# on the other twins, which still carried it, so the wrong name could only be
+# forced off. A twin is a confirmed row covering CONFIRMATION_TWIN_SHARE of the
+# longer of the two windows; it is this answer when it carries this row's own
+# confirmed name. Correcting the row corrects those twins too (cmd_resolve). A twin
+# under any other name is still a clash.
+CONFIRMATION_TWIN_SHARE = 0.8
+
+
+def _confirmation_twins(row, clashes):
+    """The confirmed twins of `row` that carry the same confirmation as it does."""
+    if os.environ.get("FINDME_CONFIRMATION_TWINS") == "0":
+        return []
+    if (row or {}).get("place_type") != "user-confirmed":
+        return []
+    own = (row.get("place_name") or "").strip().lower()
+    arr, dep = _parse_iso(row.get("arrived_at")), _parse_iso(row.get("departed_at"))
+    if not own or arr is None or dep is None:
+        return []
+    out = []
+    for c in clashes or []:
+        ca, cd = _parse_iso(c.get("arrived_at")), _parse_iso(c.get("departed_at"))
+        if ca is None or cd is None or str(c.get("id")) == str(row.get("id")):
+            continue
+        if (c.get("place_name") or "").strip().lower() != own:
+            continue
+        overlap = (min(dep, cd) - max(arr, ca)).total_seconds()
+        longer = max((dep - arr).total_seconds(), (cd - ca).total_seconds())
+        if longer > 0 and overlap >= CONFIRMATION_TWIN_SHARE * longer:
+            out.append(c)
+    return out
+
+
+def _carry_to_twins(twins, fields, as_json):
+    """Write the correction onto the twins that carried the same wrong answer."""
+    done = []
+    for t in twins or []:
+        if _update_location_row(t.get("id"), dict(fields)):
+            done.append(str(t.get("id")))
+            if not as_json:
+                print(f"[resolve] Also corrected its twin {str(t.get('id'))[:8]} "
+                      f"({t.get('place_name') or '?'} -> {fields.get('place_name')})", file=sys.stderr)
+        else:
+            print(f"[resolve] could not correct twin {str(t.get('id'))[:8]}", file=sys.stderr)
+    return done
+
+
+def _confirm_blocker(visit_id, force=False, name=None):
+    """Why `visit_id` may not carry a user confirmation — or None if it may.
+
+    Guards only the promotion to `user-confirmed` ("this was a stop, and it was
+    X"). Marking a row `non-stop` is never blocked: that only ever WITHDRAWS a
+    claim, and refusing it would leave a bad row uncorrectable. A confirmed stop
+    wholly inside this row under another name is not a clash (_inner_stops).
+    """
+    row = _fetch_location_row(visit_id)
+    if row is None:
+        return f"visit {visit_id[:8]} not found in location_history"
+    if row.get("segment_type") != "visit":
+        return (f"row {visit_id[:8]} is segment_type={row.get('segment_type')!r}, "
+                f"not a visit — only visits can be confirmed as stops")
+
+    arr, dep = _parse_iso(row.get("arrived_at")), _parse_iso(row.get("departed_at"))
+    if arr is None:
+        return f"visit {visit_id[:8]} has no usable arrived_at"
+    if dep is not None:
+        dur_min = (dep - arr).total_seconds() / 60
+        if dur_min < CONFIRM_MIN_DURATION_MIN:
+            return (f"visit {visit_id[:8]} lasted {dur_min:.1f} min — under the "
+                    f"{CONFIRM_MIN_DURATION_MIN}-minute floor cmd_enrich uses to "
+                    f"decide a window is even worth asking about. A stop this "
+                    f"short is a GPS blip, not somewhere the user went.")
+
+    clashes = _overlapping_confirmed_visits(row)
+    if clashes and _lagging_departure_trim(row, clashes):
+        return None  # resolvable: cmd_resolve trims the late departure first
+    inner = _inner_stops(row, clashes, name)
+    twins = _confirmation_twins(row, clashes)
+    clashes = [c for c in (clashes or []) if c not in inner and c not in twins]
+    clash = clashes[0] if clashes else None
+    if clash:
+        return (f"visit {visit_id[:8]} overlaps already-confirmed visit "
+                f"{str(clash.get('id'))[:8]} ({clash.get('place_name') or '?'}, "
+                f"{clash.get('arrived_at')} → {clash.get('departed_at')}) — "
+                f"confirming both would double-book the same minutes")
+    return None
+
+
+def _trim_before_confirm(visit_id, as_json):
+    """Apply the late-departure trim `_confirm_blocker` allowed, before the
+    confirmation is written. Returns the trim (or None). A failed trim refuses
+    the confirm rather than leaving a double-booked day."""
+    row = _fetch_location_row(visit_id)
+    if row is None:
+        return None
+    trim = _lagging_departure_trim(row, _overlapping_confirmed_visits(row))
+    if not trim:
+        return None
+    if not _apply_departure_trim(trim):
+        _refuse_confirm(f"could not trim {trim['id'][:8]}'s late departure "
+                        f"({trim['old_departed']} -> {trim['new_departed']})", as_json)
+    print(f"[resolve] Trimmed {trim['id'][:8]} ({trim['place_name'] or '?'}) departure "
+          f"{trim['old_departed']} -> {trim['new_departed']} — a confirmed stop "
+          f"{trim['distance_m']}m away began then", file=sys.stderr)
+    return trim
+
+
+def _refuse_confirm(reason, as_json):
+    """Report a blocked confirmation. Exit non-zero so callers can't ignore it."""
+    if as_json:
+        print(json.dumps({"success": False, "blocked": True, "reason": reason}))
+    else:
+        print(f"[resolve] REFUSED: {reason}", file=sys.stderr)
+        print("[resolve] If this really is the right row, re-run with --force.",
+              file=sys.stderr)
+    sys.exit(2)
+
+
+def _apply_protocol_answer(proto, visit_id, pending_state, as_json):
+    """Act on a protocol token without ever writing it as a place name."""
+    if proto == "not_a_name":
+        msg = ("REFUSED: '__other__' is a 'none of these' tap, not a place — ask "
+               "the user where it was and resolve with the user's answer")
+        if as_json:
+            print(json.dumps({"visit_id": visit_id, "refused": True, "reason": msg}))
+        print(msg, file=sys.stderr)
+        sys.exit(2)
+    if proto == "withdraw":
+        ok = _update_location_row(visit_id, {"place_name": None, "place_type": "non-stop"})
+        pending_state["pending"] = [x for x in pending_state["pending"] if x["visit_id"] != visit_id]
+        _save_pending_enrich(pending_state)
+        if as_json:
+            print(json.dumps({"visit_id": visit_id, "place_type": "non-stop",
+                              "place_name": None, "success": ok}))
+        else:
+            print(f"Marked visit {visit_id[:8]} as non-stop (skipped)")
+        return
+    # declined: a real stop he could not / would not name. Nothing is written
+    # to the row; the pending entry stays, marked, so it is never re-asked.
+    kept = _mark_declined(pending_state, visit_id)
+    if as_json:
+        print(json.dumps({"visit_id": visit_id, "declined": True, "pending_kept": kept}))
+    else:
+        print(f"Visit {visit_id[:8]} left unnamed (the user didn't say) — won't ask again")
+
+
+def cmd_resolve(args, as_json=False):
+    """Set the place for a visit. Used when the user answers an enrichment question.
+
+    Usage: findme resolve <visit_id> <place_name>
+           findme resolve pending <n>     # resolve nth pending by candidate number
+    """
+    force = "--force" in args
+    args = [a for a in args if a != "--force"]
+
+    if len(args) < 2:
+        print("Usage: findme resolve <visit_id> <place_name> [--force]", file=sys.stderr)
+        print("       findme resolve pending <candidate_number_or_name>", file=sys.stderr)
+        sys.exit(1)
+
+    pending_state = _load_pending_enrich()
+
+    # Special form: "resolve pending <answer>" — act on the oldest asked pending
+    if args[0] == "pending":
+        answer = " ".join(args[1:]).strip()
+        if not pending_state["pending"]:
+            print("No pending enrichments.")
+            return
+        # FIFO among the FRESH ones only.
+        #
+        # chat-agent's playbook has always said "only treat a reply as an
+        # enrichment answer when asked_at is within the last 12 hours", but the
+        # rule lived exclusively in prose while this CLI picked the oldest asked
+        # entry with no age check at all. On 2026-07-31 that misrouted a live
+        # reply: three stale entries from 2026-07-29 (~40h old) sat ahead of the
+        # day's real ones in FIFO order, so "Just walking around." — answering a
+        # question asked seconds earlier about Saint-Séverin — was silently
+        # applied to a Châtelet stop from two days before.
+        #
+        # Stale entries are not merely skipped, they are re-armed: dropped back
+        # to stage=confirm/asked=false so they can be asked again fresh if they
+        # still matter, rather than lurking forever as absorbers for whatever
+        # the user types next.
+        FRESH_H = 12
+        fresh, staled = [], 0
+        for _p in pending_state["pending"]:
+            if not _p.get("asked") or _p.get("declined_at"):
+                # A declined entry ("none of those") is answered; it must not
+                # absorb the next reply, nor be re-armed for another ask.
+                continue
+            _asked_at = _parse_iso(_p.get("asked_at"))
+            if _asked_at is None or (_now_utc() - _asked_at) > timedelta(hours=FRESH_H):
+                _p["asked"] = False
+                _p["stage"] = "confirm"
+                staled += 1
+            else:
+                fresh.append(_p)
+        if staled:
+            _save_pending_enrich(pending_state)
+            print(f"[resolve] Re-armed {staled} asked-pending entr"
+                  f"{'y' if staled == 1 else 'ies'} older than {FRESH_H}h "
+                  f"— they can no longer absorb a fresh reply.", file=sys.stderr)
+        asked_pending = fresh
+        if not asked_pending:
+            print("No pending enrichments have been asked yet.")
+            return
+        p = asked_pending[0]
+        visit_id = p["visit_id"]
+        answer_low = answer.lower().strip(".!? ")
+
+        proto = _protocol_answer(answer)
+        if proto is not None:
+            _apply_protocol_answer(proto, visit_id, pending_state, as_json)
+            return
+
+        # "no" / "blip" / "not a stop" → mark as non-stop, drop from pending.
+        # A DESCRIBED non-stop ("we were walking along the coastline in the
+        # minimes park") keeps its description as place_name — see
+        # _classify_non_stop; the daily summary renders those words instead of
+        # re-guessing a POI for the window.
+        non_stop_desc = _classify_non_stop(answer)
+        if non_stop_desc is not None:
+            ok = _update_location_row(visit_id, {
+                "place_name": non_stop_desc or None,
+                "place_type": "non-stop",
+            })
+            pending_state["pending"] = [x for x in pending_state["pending"] if x["visit_id"] != visit_id]
+            _save_pending_enrich(pending_state)
+            if as_json:
+                print(json.dumps({"visit_id": visit_id, "place_type": "non-stop",
+                                  "place_name": non_stop_desc or None, "success": ok}))
+            else:
+                suffix = f' — "{non_stop_desc}"' if non_stop_desc else ""
+                print(f"Marked visit {visit_id[:8]} as non-stop{suffix}")
+            return
+
+        # "yes" / "real stop" → keep pending but advance stage so the next run asks for the place name
+        AFFIRMATIVE = {"yes", "y", "yep", "yeah", "real", "real stop", "stop", "confirmed"}
+        if p.get("stage") == "confirm" and answer_low in AFFIRMATIVE:
+            for x in pending_state["pending"]:
+                if x["visit_id"] == visit_id:
+                    x["stage"] = "identify"
+                    x["asked"] = False  # re-queue for the candidate-list ask
+            _save_pending_enrich(pending_state)
+            if as_json:
+                print(json.dumps({"visit_id": visit_id, "stage": "identify"}))
+            else:
+                print(f"Visit {visit_id[:8]} confirmed as real stop — will ask for place name next run")
+            return
+
+        # Otherwise treat answer as a place identification (number, candidate name, or free text)
+        place_name = None
+        address = None
+        if answer.isdigit():
+            idx = int(answer) - 1
+            if 0 <= idx < len(p["candidates"]):
+                place_name = p["candidates"][idx]["name"]
+                address = p["candidates"][idx]["address"]
+        if not place_name:
+            for c in p["candidates"]:
+                if answer_low in c["name"].lower() or c["name"].lower() in answer_low:
+                    place_name = c["name"]
+                    address = c["address"]
+                    break
+        if not place_name:
+            place_name = answer
+
+        # Queue-vetted rows should already clear the floor; check anyway, because
+        # a row's departed_at can shrink after it was queued (the client patches
+        # departures in late, and _sweep_stale_open_visits synthesizes them).
+        if not force:
+            blocker = _confirm_blocker(visit_id, force, name=place_name)
+            if blocker:
+                _refuse_confirm(blocker, as_json)
+            _trim_before_confirm(visit_id, as_json)
+
+        _row = _fetch_location_row(visit_id)
+        twins = _confirmation_twins(_row, _overlapping_confirmed_visits(_row)) if _row else []
+        ok = _update_location_row(visit_id, {
+            "place_name": place_name,
+            "place_type": "user-confirmed",
+            "address": address or "",
+        })
+        if ok:
+            _carry_to_twins(twins, {"place_name": place_name, "place_type": "user-confirmed",
+                                    "address": address or ""}, as_json)
+        pending_state["pending"] = [x for x in pending_state["pending"] if x["visit_id"] != visit_id]
+        _save_pending_enrich(pending_state)
+        promotion = _promote_answer(visit_id, place_name, p) if ok else None
+
+        if as_json:
+            print(json.dumps({"visit_id": visit_id, "place_name": place_name, "success": ok,
+                              "promotion": promotion}))
+        else:
+            print(f"Resolved visit {visit_id[:8]} → {place_name}")
+        return
+
+    # Direct form: resolve <visit_id> <place_name|no|blip>
+    visit_id = args[0]
+    place_name = " ".join(args[1:])
+    proto = _protocol_answer(place_name)
+    if proto is not None:
+        _apply_protocol_answer(proto, visit_id, pending_state, as_json)
+        return
+    non_stop_desc = _classify_non_stop(place_name)
+    if non_stop_desc is not None:
+        ok = _update_location_row(visit_id, {
+            "place_name": non_stop_desc or None,
+            "place_type": "non-stop",
+        })
+        pending_state["pending"] = [x for x in pending_state["pending"] if x["visit_id"] != visit_id]
+        _save_pending_enrich(pending_state)
+        if as_json:
+            print(json.dumps({"visit_id": visit_id, "place_type": "non-stop",
+                              "place_name": non_stop_desc or None, "success": ok}))
+        else:
+            suffix = f' — "{non_stop_desc}"' if non_stop_desc else ""
+            print(f"Marked visit {visit_id[:8]} as non-stop{suffix}")
+        return
+    if not force:
+        blocker = _confirm_blocker(visit_id, force, name=place_name)
+        if blocker:
+            _refuse_confirm(blocker, as_json)
+        _trim_before_confirm(visit_id, as_json)
+
+    _row = _fetch_location_row(visit_id)
+    twins = _confirmation_twins(_row, _overlapping_confirmed_visits(_row)) if _row else []
+    ok = _update_location_row(visit_id, {
+        "place_name": place_name,
+        "place_type": "user-confirmed",
+    })
+    if ok:
+        _carry_to_twins(twins, {"place_name": place_name, "place_type": "user-confirmed"}, as_json)
+    # Remove from pending if present
+    entry = next((x for x in pending_state["pending"] if x["visit_id"] == visit_id), None)
+    pending_state["pending"] = [x for x in pending_state["pending"] if x["visit_id"] != visit_id]
+    _save_pending_enrich(pending_state)
+    promotion = _promote_answer(visit_id, place_name, entry) if ok else None
+
+    if as_json:
+        print(json.dumps({"visit_id": visit_id, "place_name": place_name, "success": ok,
+                          "promotion": promotion}))
+    else:
+        print(f"Resolved visit {visit_id[:8]} → {place_name}")
+
+
+def _promote_answer(visit_id, place_name, pending_entry):
+    """Carry a confirmed answer to the two durable stores the row alone never
+    reached: confirmed-stops.json (the 30 m fast lane) and the drift ledger.
+
+    Delegates to `location-confirm save-visit`, the one writer of
+    confirmed-stops.json. The guess is the pending entry's lead candidate — the
+    name the question proposed. When his answer IS that candidate (our own
+    string, stored verbatim by the number/name match above) it corroborates
+    rather than corrects, and no drift row is written. Best-effort: the row is
+    already right, so a failure here is reported, never raised.
+    See bin/location-confirm § "Every answer reaches the durable stores".
+    """
+    if os.environ.get("FINDME_NO_PROMOTE") == "1":
+        return {"skipped": "FINDME_NO_PROMOTE"}
+    cands = (pending_entry or {}).get("candidates") or []
+    guess = cands[0].get("name") if cands and isinstance(cands[0], dict) else None
+    cmd = [os.path.join(os.path.dirname(os.path.abspath(__file__)), "location-confirm"),
+           "save-visit", visit_id, place_name]
+    if guess and guess != place_name:
+        cmd += ["--guess", guess, "--signal", "chat_correction"]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+    except Exception as e:
+        print(f"[resolve] promotion to confirmed-stops failed: {e}", file=sys.stderr)
+        return {"error": str(e)}
+    if r.returncode != 0:
+        print(f"[resolve] promotion to confirmed-stops failed: {r.stderr.strip()[-300:]}",
+              file=sys.stderr)
+        return {"error": r.stderr.strip()[-300:]}
+    try:
+        return json.loads(r.stdout.strip().splitlines()[-1])
+    except Exception:
+        return {"raw": r.stdout.strip()[-300:]}
+
+
+# ── An unanswered card's default, applied as a GUESS ─────────────────────────
+#
+# A card has a default answer in case the user doesn't respond, applied as a
+# low-confidence guess that never names nearby future stops and that any later
+# tap or correction overrides.
+# `choice sweep --apply` calls this when a "where was this?" card expires.
+#
+# What makes it a guess and not an answer:
+#   - place_type `default-applied`, never `user-confirmed` (absolute to
+#     resolve-day) and never `named`. resolve-day reads it at confidence 0.4 for
+#     the one stop overlapping THIS row; the summary shows "probably X".
+#   - it reaches nothing else: no `location-confirm save-visit`, so nothing
+#     enters confirmed-stops.json (the 30 m fast lane that names every later
+#     stop nearby), no drift row, and place_naming's history rung reads only
+#     `user-confirmed` rows, so it never names a future visit.
+#   - a later tap or correction overrides it: `findme resolve` and
+#     `location-confirm save` PATCH the row whatever its type.
+# Three of the 12 recorded-but-never-applied defaults (Aug 12 – Oct 3) sat
+# under stops he had named himself. So it refuses a row that already carries a
+# verdict, and a window that overlaps a row he answered (a twin he named, or a
+# window he said was not a stop). Structural checks only (Rule #0b).
+DEFAULT_APPLIED_TYPE = "default-applied"
+DEFAULT_GUESS_REFUSE_TYPES = {"user-confirmed", "named", "non-stop", DEFAULT_APPLIED_TYPE}
+
+
+def _overlapping_answered_visits(row):
+    """Every OTHER visit row overlapping `row`'s window that he answered:
+    user-confirmed (he named it) or non-stop (he, or the trace, said it was not
+    a stop). Returns None when the lookup fails, so the caller can refuse."""
+    key = _get_supabase_key()
+    arr, dep = _parse_iso(row.get("arrived_at")), _parse_iso(row.get("departed_at"))
+    if not key or arr is None:
+        return None
+    dep = dep or arr
+    try:
+        url = (f"{SUPABASE_URL}/rest/v1/location_history"
+               f"?segment_type=eq.visit"
+               f"&place_type=in.(user-confirmed,non-stop)"
+               f"&arrived_at=lt.{urllib.parse.quote(dep.isoformat())}"
+               f"&or=(departed_at.gt.{urllib.parse.quote(arr.isoformat())},departed_at.is.null)"
+               f"&select=id,arrived_at,departed_at,place_name,place_type")
+        req = urllib.request.Request(url, headers={
+            "apikey": key, "Authorization": f"Bearer {key}", "Accept": "application/json"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            rows = json.loads(resp.read())
+    except Exception:
+        return None
+    return [o for o in rows if o.get("id") != row.get("id")]
+
+
+def default_guess_blocker(row, name, answered):
+    """Why this default must NOT be applied, or None. Pure, for tests.
+    `answered` is _overlapping_answered_visits(row) (None = lookup failed)."""
+    if not row:
+        return "no such location_history row"
+    if row.get("segment_type") != "visit":
+        return f"row is a {row.get('segment_type')!r}, not a visit"
+    clean = (name or "").strip()
+    if not clean:
+        return "empty default"
+    # Our own protocol tokens and the card's own non-venue options are not names.
+    if _protocol_answer(clean) is not None or clean.lower() in ("not a stop", OTHER_CHOICE_VALUE):
+        return f"default {clean!r} is not a place name"
+    if row.get("place_type") in DEFAULT_GUESS_REFUSE_TYPES:
+        return (f"row is already {row.get('place_type')}"
+                + (f" as {row.get('place_name')!r}" if row.get("place_name") else ""))
+    if answered is None:
+        return "could not check for an answer on an overlapping row (refusing rather than guessing)"
+    if answered:
+        o = answered[0]
+        return (f"an overlapping row is already {o.get('place_type')}"
+                + (f" ({o.get('place_name')!r})" if o.get("place_name") else ""))
+    return None
+
+
+OTHER_CHOICE_VALUE = "__other__"
+
+
+def cmd_guess(args, as_json=False):
+    """Apply an unanswered card's default as a low-confidence guess.
+
+    Usage: findme guess <visit_id> "<default>" [--source <message_id>]
+    Exit 2 when refused (the card simply stays open, as before)."""
+    source = None
+    if "--source" in args:
+        i = args.index("--source")
+        source = args[i + 1] if i + 1 < len(args) else None
+        args = args[:i] + args[i + 2:]
+    if len(args) < 2:
+        print('Usage: findme guess <visit_id> "<default>" [--source <message_id>]', file=sys.stderr)
+        sys.exit(1)
+    visit_id, name = args[0], " ".join(args[1:]).strip()
+    row = _fetch_location_row(visit_id)
+    answered = _overlapping_answered_visits(row) if row else []
+    why = default_guess_blocker(row, name, answered)
+    if why:
+        if as_json:
+            print(json.dumps({"visit_id": visit_id, "applied": False, "reason": why}))
+        else:
+            print(f"Not applied ({visit_id[:8]}): {why}", file=sys.stderr)
+        sys.exit(2)
+    notes = row.get("notes") or ""
+    tag = (f"[choice-default{' ' + source if source else ''}] unanswered card's default "
+           f"{name!r}, applied as a low-confidence guess; any tap or correction replaces it")
+    ok = _update_location_row(visit_id, {
+        "place_name": name,
+        "place_type": DEFAULT_APPLIED_TYPE,
+        "notes": (notes + "\n" if notes else "") + tag,
+    })
+    if as_json:
+        print(json.dumps({"visit_id": visit_id, "applied": ok, "place_name": name,
+                          "place_type": DEFAULT_APPLIED_TYPE}))
+    else:
+        print(f"{'Guessed' if ok else 'FAILED to write'} visit {visit_id[:8]} → probably {name}")
+    if not ok:
+        sys.exit(1)
+
+
+def cmd_note(args, as_json=False):
+    """Append a note to a visit (impressions, what they ordered, etc.).
+
+    Usage: findme note <visit_id> <note text>
+           findme note last <note text>     # annotate the most recent visit
+    """
+    if len(args) < 2:
+        print("Usage: findme note <visit_id|last> <note text>", file=sys.stderr)
+        sys.exit(1)
+
+    target = args[0]
+    note_text = " ".join(args[1:])
+
+    visit_id = None
+    if target == "last":
+        # Find the most recent visit
+        key = _get_supabase_key()
+        url = (
+            f"{SUPABASE_URL}/rest/v1/location_history"
+            "?segment_type=eq.visit"
+            "&order=arrived_at.desc&limit=1"
+            "&select=id"
+        )
+        try:
+            req = urllib.request.Request(url, headers={
+                "apikey": key, "Authorization": f"Bearer {key}",
+                "Accept": "application/json",
+            })
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                rows = json.loads(resp.read())
+            if rows:
+                visit_id = rows[0]["id"]
+        except Exception as e:
+            print(f"ERROR: {e}", file=sys.stderr)
+            return
+    else:
+        visit_id = target
+
+    if not visit_id:
+        print("No visit found to annotate.", file=sys.stderr)
+        return
+
+    ok = _update_location_row(visit_id, {"notes": note_text})
+    if as_json:
+        print(json.dumps({"visit_id": visit_id, "note": note_text, "success": ok}))
+    else:
+        print(f"Note saved on visit {visit_id[:8]}: {note_text}")
+
+def cmd_pending(args, as_json=False):
+    """Show pending enrichment questions."""
+    state = _load_pending_enrich()
+    if as_json:
+        print(json.dumps(state, indent=2))
+        return
+    if not state["pending"]:
+        print("No pending enrichments.")
+        return
+    for p in state["pending"]:
+        asked_tag = " [asked]" if p.get("asked") else ""
+        print(f"Visit {p['visit_id'][:8]} ({p['duration_min']}m){asked_tag}")
+        print(f"  Location: {p['latitude']:.4f},{p['longitude']:.4f}")
+        for i, c in enumerate(p["candidates"], 1):
+            rating = f" {c['rating']}★" if c.get("rating") else ""
+            reviews = f" ({c['reviews']} reviews)" if c.get("reviews") else ""
+            print(f"  {i}. {c['name']}{rating}{reviews} — {c['type']} · {c['distance_m']}m")
+        print()
+
+def _local_llm_phrase_area(geo):
+    """Ask the local model (gemma3:1b via Ollama) to phrase a short
+    location-context clause from reverse-geocoded address parts.
+
+    Code owns the geometry (lat/lon -> structured address via Nominatim,
+    see reverse_geocode()); turning that into a natural clause is a
+    language decision, so a model makes it, per Rule 0b ("code owns
+    geometry, a model owns language") — deciding how to phrase "near X" vs
+    "in Y" from raw address components is exactly the kind of judgment call
+    that must not be a hardcoded string join. Runs local/free, tight
+    timeout, and fails open to "" (caller falls back to a plain join) on
+    any error — never blocks composing the ask.
+    """
+    if not geo:
+        return ""
+    parts = {k: v for k, v in geo.items()
+             if k in ("address", "neighbourhood", "city", "state", "country") and v}
+    if not parts:
+        return ""
+    try:
+        req = urllib.request.Request(
+            "http://127.0.0.1:11434/api/chat",
+            data=json.dumps({
+                "model": "gemma3:1b",
+                "stream": False,
+                "keep_alive": "15m",
+                "think": False,
+                "messages": [
+                    {"role": "system", "content": (
+                        "You phrase a short location-context clause for a sentence shaped "
+                        "like '<time> <clause> — which of these was it?'. Given structured "
+                        "address parts as JSON, reply with ONLY a short lowercase clause "
+                        "starting with 'near' or 'in' (e.g. 'near Rue des Arquebusiers, "
+                        "Paris' or 'in the 11th arrondissement'). One line, no punctuation "
+                        "at the end, no extra words, no explanation."
+                    )},
+                    {"role": "user", "content": json.dumps(parts)},
+                ],
+                "options": {"num_predict": 40, "temperature": 0.3},
+            }).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read())
+        phrase = ((data.get("message") or {}).get("content") or "").strip()
+    except Exception:
+        return ""
+    # Guard rails on the model's own output — same spirit as the phone-channel
+    # ack sanitizer (never trust raw model text uncritically): single line,
+    # short, and actually shaped like the clause we asked for.
+    low = phrase.lower()
+    if not phrase or "\n" in phrase or len(phrase) > 80:
+        return ""
+    if not (low.startswith("near ") or low.startswith("in ")):
+        return ""
+    return phrase
+
+def cmd_question(args, as_json=False):
+    """Format a "which of these was it?" ask for one pending entry.
+
+    Anchors on the window's own absolute date/time, PLUS a location-context
+    clause a model phrases from the stop's own reverse-geocoded coordinates
+    — never on a relative "after <last landmark>" phrase chained back to an
+    earlier, possibly stale, stop. A relative anchor goes stale the moment
+    another segment (a flight, a border crossing) lands between the landmark
+    and the stop being asked about, with no way for a reader to tell it has
+    gone stale (see feedback_location_enrich_anchor, 2026-08-12: a Lisbon
+    airport-lounge stop was asked about as "after the airbnb" — the airbnb
+    was in Paris, three segments and a flight earlier). The area context
+    still matters for orienting the reader (the user needs some context
+    about the location: "around <area>" or "in <place>") — the fix sources
+    that context from the stop's OWN coordinates, and phrases it with a
+    language model rather than a hardcoded join.
+    """
+    if not args:
+        print("usage: findme question <visit_id>|pending", file=sys.stderr)
+        sys.exit(64)
+    target = args[0]
+    state = _load_pending_enrich()
+    entry = None
+    if target == "pending":
+        asked = [p for p in state["pending"] if p.get("asked")]
+        entry = asked[0] if asked else (state["pending"][0] if state["pending"] else None)
+    else:
+        for p in state["pending"]:
+            if p["visit_id"] == target or p["visit_id"].startswith(target):
+                entry = p
+                break
+    if not entry:
+        print(f"No pending entry matching {target!r}", file=sys.stderr)
+        sys.exit(1)
+
+    arr = _parse_iso(entry.get("arrived_at"))
+    if arr is None:
+        print(f"Entry {entry['visit_id'][:8]} has no usable arrived_at", file=sys.stderr)
+        sys.exit(1)
+    dep = _parse_iso(entry.get("departed_at"))
+    arr_local = arr.astimezone(LOCAL_TZ)
+    dep_local = dep.astimezone(LOCAL_TZ) if dep else None
+    time_str = f"{arr_local.strftime('%H:%M')}–{dep_local.strftime('%H:%M')}" if dep_local else arr_local.strftime("%H:%M")
+    duration = entry.get("duration_min")
+    dur_str = f" ({duration} min)" if duration else ""
+
+    area_str = ""
+    lat, lon = entry.get("latitude"), entry.get("longitude")
+    if lat is not None and lon is not None:
+        geo = reverse_geocode(lat, lon, structured=True) or {}
+        phrase = _local_llm_phrase_area(geo)
+        if phrase:
+            area_str = f", {phrase}"
+        else:
+            # Ollama down/timed out/rejected output — fall back to a plain
+            # geometry-only join rather than dropping context entirely.
+            area_bits = []
+            if geo.get("neighbourhood"):
+                area_bits.append(geo["neighbourhood"])
+            elif geo.get("address"):
+                area_bits.append(geo["address"])
+            if geo.get("city"):
+                area_bits.append(geo["city"])
+            if area_bits:
+                area_str = f", near {', '.join(area_bits)}"
+
+    lines = [f"{arr_local.strftime('%b %d')}, {time_str}{dur_str}{area_str} — which of these was it?"]
+    for i, c in enumerate(entry.get("candidates", []), 1):
+        lines.append(f"{i}. {c['name']}")
+    question = "\n".join(lines)
+
+    if as_json:
+        print(json.dumps({"visit_id": entry["visit_id"], "question": question}))
+    else:
+        print(question)
+
+def cmd_mark_asked(args, as_json=False):
+    """Mark ONE pending enrichment as asked. Usage: findme mark-asked <visit_id>
+
+    Requires an explicit visit_id (2026-10-04). The old no-argument form marked
+    EVERY unasked pending row as asked in one call — fine back when the job
+    composed and sent exactly one ask per run, a footgun once 2026-08-04 made
+    the pending file hold several unrelated unasked rows at once (one visit
+    genuinely asked via a direct choice-card send, others merely queued for
+    hum's ranker and not yet sent to the user at all). Confirmed live: a turn
+    called this bare, which silently flipped three other pending visits to
+    asked:true even though none of them had been shown to the user — a later turn had to notice and revert
+    them by hand. Nothing in the codebase calls the bare form anymore
+    (jobs/location-enrich.md's queue path explicitly says not to call this at
+    all); this just makes the dangerous shape impossible to reach instead of
+    relying on an agent to remember not to reach for it.
+    """
+    if not args or args[0].startswith("--"):
+        print("Usage: findme mark-asked <visit_id>", file=sys.stderr)
+        sys.exit(1)
+    visit_id = args[0]
+    state = _load_pending_enrich()
+    count = 0
+    for p in state["pending"]:
+        if p.get("visit_id") == visit_id and not p.get("asked"):
+            p["asked"] = True
+            p["asked_at"] = datetime.utcnow().isoformat() + "Z"
+            count += 1
+    _save_pending_enrich(state)
+    if as_json:
+        print(json.dumps({"marked": count, "visit_id": visit_id}))
+    elif count:
+        print(f"Marked {visit_id} as asked.")
+    else:
+        print(f"No unasked pending entry found for {visit_id}.", file=sys.stderr)
+        sys.exit(1)
+
+# Map Apple Photos face-tag name → canonical companion name used in
+# location_history.companions[]. Includes aliases (full name, just first name)
+# and pets, which are meaningful walk companions. One table, shared with the
+# photo tools and resolve-day (lib/companions.py, config companion-names).
+_COMPANION_NAMES = _companions.companion_names()
+PHOTO_FACE_TO_COMPANION = _COMPANION_NAMES["aliases"]
+SELF_NAMES = set(_COMPANION_NAMES["self"])
+
+def _photo_tz():
+    try:
+        with open(places_local.data_path("user-timezone.json")) as f:
+            return json.load(f).get("timezone") or "UTC"
+    except Exception:
+        return "UTC"
+
+
+def _present_companions(photos, visit):
+    """Canonical names of the tagged people Jev did not rule out (bin/photo-companions)."""
+    if not photos:
+        return []
+    fallback = [PHOTO_FACE_TO_COMPANION.get(n, n) for p in photos for n in (p.get("persons") or [])
+                if n not in SELF_NAMES]
+    try:
+        payload = json.dumps({"photos": photos, "place": visit.get("place_name"), "id": visit.get("id"),
+                              "tz": _photo_tz()})
+        out = subprocess.run([os.path.join(os.path.dirname(os.path.abspath(__file__)), "photo-companions")],
+                             input=payload, capture_output=True, text=True, timeout=30)
+        res = json.loads(out.stdout or "{}")
+        if res.get("dropped"):
+            print(f"[findme backfill] {visit.get('id', '')[:8]}: not there in person — "
+                  f"{', '.join(d['name'] for d in res['dropped'])} ({res.get('used')})", file=sys.stderr)
+        return res.get("present", fallback)
+    except Exception as e:
+        print(f"[findme backfill] photo-companions failed: {e}", file=sys.stderr)
+        return fallback
+
+
+def cmd_backfill_companions(args, as_json=False):
+    """Retro-fill location_history.companions[] from photo face tags.
+
+    Find My only catches companions who are still at/near the place when enrich
+    runs (~15 min post-departure). For longer visits or late enrichments, the
+    family member has typically walked off. Apple Photos' face-tagging is the
+    backstop: if a photo was taken inside the visit's time window (optionally
+    with matching GPS) and its `persons[]` includes a family member, attribute
+    them as a companion.
+
+    Lookback defaults to 48h. Non-destructive: only adds names, never removes.
+    """
+    from datetime import timedelta
+
+    lookback_hours = 48
+    for i, a in enumerate(args):
+        if a == "--lookback" and i + 1 < len(args):
+            lookback_hours = int(args[i + 1])
+
+    key = _get_supabase_key()
+    if not key:
+        print("ERROR: No Supabase key", file=sys.stderr)
+        sys.exit(1)
+
+    cutoff = (datetime.utcnow() - timedelta(hours=lookback_hours)).isoformat() + "Z"
+    # Visits within the window — we want them all, even already-resolved ones,
+    # so companion backfill runs even after the user confirmed the place name.
+    url = (
+        f"{SUPABASE_URL}/rest/v1/location_history"
+        f"?segment_type=eq.visit"
+        f"&departed_at=not.is.null"
+        f"&arrived_at=gte.{cutoff}"
+        f"&order=arrived_at.desc"
+        f"&select=id,arrived_at,departed_at,latitude,longitude,companions,place_name,place_type"
+    )
+    try:
+        req = urllib.request.Request(url, headers={
+            "apikey": key, "Authorization": f"Bearer {key}",
+            "Accept": "application/json",
+        })
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            visits = json.loads(resp.read())
+    except Exception as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        return
+
+    updated = 0
+    details = []
+    for v in visits:
+        is_home = v.get("place_name") and "Home" in v["place_name"]
+        if is_home:
+            continue
+        # Photos already linked to this visit via segment_id (set at index time).
+        phurl = (
+            f"{SUPABASE_URL}/rest/v1/photos"
+            f"?segment_id=eq.{v['id']}"
+            f"&select=persons,taken_at,latitude,longitude,labels,detected_text,self_captured"
+        )
+        try:
+            preq = urllib.request.Request(phurl, headers={
+                "apikey": key, "Authorization": f"Bearer {key}",
+                "Accept": "application/json",
+            })
+            with urllib.request.urlopen(preq, timeout=10) as resp:
+                photos = json.loads(resp.read())
+        except Exception:
+            continue
+
+        # Jev (site photo-companions) drops anyone who is only PICTURED — on a
+        # screen, in a framed photo, on a poster. It can only remove a name;
+        # on any failure every tag stands, as before.
+        tagged = [p for p in photos if p.get("persons")]
+        present = _present_companions(tagged, v)
+        # Unknown tags are KEPT: a face tag in Photos with no alias (a parent,
+        # under a full name) used to be dropped from the lunch they hosted.
+        found = {PHOTO_FACE_TO_COMPANION.get(n, n) for n in present if n not in SELF_NAMES}
+
+        if not found:
+            continue
+
+        existing = set(v.get("companions") or [])
+        merged = sorted(existing | found)
+        if set(merged) == existing:
+            continue
+
+        if _update_location_row(v["id"], {"companions": merged}):
+            updated += 1
+            details.append({
+                "visit_id": v["id"],
+                "place": v.get("place_name") or "(unresolved)",
+                "added": sorted(found - existing),
+                "companions": merged,
+            })
+
+    if as_json:
+        print(json.dumps({"updated": updated, "details": details}))
+    else:
+        print(f"Backfilled companions on {updated} visit(s) (lookback {lookback_hours}h).")
+        for d in details:
+            added = ", ".join(d["added"])
+            print(f"  {d['place']}: +{added}")
+
+
+def cmd_presence_sample(args, as_json=False):
+    """One Find My reading per person, for bin/companion-presence.
+
+    Everyone Jori sees through Find My except the user (the user's trail is the
+    app's GPS). Each person's freshest iPhone, with its accuracy and the time Find
+    My took the fix. Raw positions only: whether they were with the user is
+    decided later, against the user's own trail, by companion-presence. Always JSON.
+    """
+    api = get_api()
+    people = {n for n in KNOWN_PEOPLE.values() if n != OWNER_NAME}
+    best = {}
+    for dev in api.devices:
+        c = dev._content
+        loc = c.get("location") or {}
+        if c.get("deviceClass") != "iPhone" or not loc.get("latitude") or not loc.get("timeStamp"):
+            continue
+        person = owner_name(c.get("prsId"))
+        if person not in people:
+            continue
+        if person in best and best[person]["_ts"] >= loc["timeStamp"]:
+            continue
+        best[person] = {
+            "_ts": loc["timeStamp"],
+            "person": person,
+            "at": datetime.fromtimestamp(loc["timeStamp"] / 1000, tz=timezone.utc).isoformat(),
+            "lat": loc["latitude"],
+            "lon": loc["longitude"],
+            "acc_m": loc.get("horizontalAccuracy"),
+            "old": bool(loc.get("isOld")),
+            "inaccurate": bool(loc.get("isInaccurate")),
+            "device": c.get("deviceDisplayName") or c.get("name"),
+        }
+    out = [{k: v for k, v in b.items() if k != "_ts"} for b in best.values()]
+    print(json.dumps(sorted(out, key=lambda r: r["person"])))
+
+
+def usage():
+    print("Usage: findme <command> [args]")
+    print()
+    print("Commands:")
+    print("  locate [person|device]  Find a person or device (default: everyone)")
+    print("  locate all              Show all devices with locations")
+    print("  history [today|yesterday|YYYY-MM-DD]  Location timeline")
+    print("  activity                Current activity (walking, driving, at home, etc.)")
+    print("  enrich                  Scan recent visits, auto-resolve or queue asks")
+    print("  pending                 Show pending enrichment questions")
+    print("  question <id>|pending   Format a \"which of these was it?\" ask (absolute time, no relative anchor)")
+    print("  resolve <id> <name>     Set place for a visit")
+    print("  resolve pending <n>     Resolve oldest pending with candidate number or name")
+    print("  guess <id> <name>       Apply an unanswered card's default as a low-confidence guess (choice sweep)")
+    print("  list                    List all devices grouped by owner")
+    print("  near                    Show distances between people")
+    print("  backfill-companions [--lookback 48]  Add companions from photo face tags")
+    print("  presence-sample         One Find My reading per family member (JSON, for companion-presence)")
+    print()
+    print("Options:")
+    print("  --json                  Output JSON")
+    print()
+    print("Examples:")
+    print("  findme locate           Where is everyone?")
+    print("  findme locate me        Where am I?")
+    print("  findme history today    Where was I today?")
+    print("  findme history 2026-04-11  Location timeline for a date")
+    print("  findme activity         What am I doing right now?")
+    print("  findme near             How far apart is everyone?")
+    print("  findme list --json      All devices as JSON")
+
+def main():
+    args = sys.argv[1:]
+    as_json = "--json" in args
+    if as_json:
+        args.remove("--json")
+
+    if not args or args[0] in ("-h", "--help", "help"):
+        usage()
+        return
+
+    cmd = args[0].lower()
+    rest = args[1:]
+
+    if cmd == "locate":
+        cmd_locate(rest, as_json)
+    elif cmd == "history":
+        cmd_history(rest, as_json)
+    elif cmd == "activity":
+        cmd_activity(rest, as_json)
+    elif cmd == "enrich":
+        cmd_enrich(rest, as_json)
+    elif cmd == "pending":
+        cmd_pending(rest, as_json)
+    elif cmd == "question":
+        cmd_question(rest, as_json)
+    elif cmd == "resolve":
+        cmd_resolve(rest, as_json)
+    elif cmd == "note":
+        cmd_note(rest, as_json)
+    elif cmd == "guess":
+        cmd_guess(rest, as_json)
+    elif cmd == "mark-asked":
+        cmd_mark_asked(rest, as_json)
+    elif cmd == "backfill-companions":
+        cmd_backfill_companions(rest, as_json)
+    elif cmd == "presence-sample":
+        cmd_presence_sample(rest, as_json)
+    elif cmd == "list":
+        cmd_list(as_json)
+    elif cmd == "near":
+        cmd_near(rest, as_json)
+    else:
+        # Treat the whole thing as a locate query
+        cmd_locate(args, as_json)
+
+if __name__ == "__main__":
+    main()

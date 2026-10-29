@@ -1,0 +1,157 @@
+#!/bin/bash
+set -uo pipefail
+# daily-summary-lock — per-date exclusive lock for the daily-summary pipeline
+# (settle -> prose -> publish, Steps 1-5 of jobs/daily-summary.md).
+#
+# Why this exists (2026-07-28). The
+# daily-summary pipeline for a given date can be relaunched from three
+# independent places — the scheduled local-morning cron, watchdog.sh's
+# cron-miss self-heal backfill , and a manual "DAILY SUMMARY
+# [date]" redispatch — and jobs/daily-summary.md's own idempotency claim
+# ("job-run here is idempotent... launching it again for the same date is
+# always safe") is only true for the final `daily_summaries` upsert, NOT for
+# the settle+prose+publish sub-sequence that leads up to it: two overlapping
+# runs for the same date both read/write the SAME /tmp/ds-day-<date>.json and
+# /tmp/ds-prose-<date>.json files, so one run's re-settle can land between the
+# other run's prep and its publish. `daily-summary-build publish`'s own guard
+#  correctly refuses to publish prose against a settling it
+# wasn't written for — but that guard has no fallback, so an interleaved race
+# just leaves the day with a permanent zero-output refusal (2026-07-27:
+# day_2026-07-27 never rendered until this week's nightly-review manually
+# backfilled it). This lock serializes the whole pipeline per date so two
+# relaunches for the same date never interleave in the first place, instead
+# of trying to detect and repair the interleaving after the fact.
+#
+# Locking primitive: `shlock` (BSD/macOS, already used the same way by
+# trigger-context-sync.sh) atomically creates the lock file stamped with the
+# caller's PID and refuses if a LIVE pid already holds it — so a crashed or
+# killed holder never leaves a stale lock behind (shlock re-checks PID
+# liveness itself; no manual staleness heuristic needed for THAT case).
+#
+# A second gap, found the hard way (2026-07-29). shlock's liveness check only
+# covers a holder that's DEAD. It does nothing for a holder that's alive but
+# forgotten — a process that acquired the lock and then hung, or an orphaned
+# child of a finished job that never called `release` and never exits. That
+# is indistinguishable from a legitimate long-running holder from shlock's
+# point of view, and it wedges the lock for as long as that process happens
+# to stay alive — which can be many hours, well past shlock's crash-recovery
+# design. Confirmed live: the 2026-07-28 lock blocked three consecutive real
+# daily-summary-run launches (01:05, 02:12, 03:00 home time, 2026-07-29), each one
+# burning its full 900s wait and giving up, with no automatic recovery in
+# between. The fix is a generous age ceiling on top of (not instead of) the
+# pid-liveness check: no real daily-summary build has ever taken close to 30
+# minutes (the longest observed real run is ~26m), so a lock older than
+# STALE_AGE is treated as forgotten and force-reclaimed even if its pid is
+# technically still alive, logged distinctly from the ordinary dead-pid
+# reclaim so this rarer path is visible in the job's own log.
+#
+# Usage:
+#   daily-summary-lock acquire <YYYY-MM-DD> [timeout_seconds=900] [owner_pid] [stale_age_seconds=1800]
+#     Blocks (polling every 2s) until the per-date lock is acquired or the
+#     timeout elapses. On success, prints the lock file path to stdout and
+#     exits 0 — the caller now owns the lock and MUST release it (normally via
+#     a `trap ... EXIT` calling `daily-summary-lock release <date>`). On
+#     timeout, prints nothing to stdout, writes a diagnostic to stderr
+#     (including the PID currently holding it) and exits 1.
+#
+#     `owner_pid` (default: $PPID) is the pid `shlock` stamps into the lock
+#     file and later checks for liveness. This MUST be the pid of the
+#     long-lived process that actually holds the critical section
+#     (daily-summary-run), never this script's own $$ — `daily-summary-lock
+#     acquire` itself exits the instant it succeeds, so stamping its own pid
+#     would make the lock look stale (and stealable) the moment it returns,
+#     defeating the lock entirely.
+#
+#     ALWAYS pass owner_pid explicitly — do not rely on the $PPID default.
+#     Verified live on this box's bash (3.2.57, the macOS-shipped default):
+#     `X=$(daily-summary-lock acquire ...)` run as anything other than the
+#     LAST statement in its shell (i.e. there's a further command after it,
+#     which is exactly daily-summary-run's shape — acquire, then fork the
+#     claude session, then exit) makes bash fork a real subshell to run the
+#     substitution, so $PPID as seen inside `acquire` is that SUBSHELL's pid,
+#     not the caller script's — and the subshell exits the moment the
+#     substitution completes, so the lock looks stale a heartbeat later even
+#     though the real holder is still very much alive. Argument expansion
+#     happens in the CALLER's shell before the subshell forks, so passing the
+#     caller's own `$$` as a literal argument (captured into a variable
+#     BEFORE entering any command substitution, since $$ itself is stable but
+#     best captured early for clarity) sidesteps the ambiguity entirely — see
+#     daily-summary-run and tests/daily-summary-lock.test.mjs for the
+#     canonical pattern. The $PPID default remains only so a bare `acquire`
+#     run interactively (nothing after it on the command line) still does
+#     something sane, not as an invitation to skip the explicit pid.
+#
+#     `stale_age_seconds` (default: 1800 = 30 minutes) is the age ceiling
+#     described above. Callers should not normally need to override this —
+#     it exists as an argument (rather than a hardcoded constant) purely so
+#     tests can exercise the reclaim path without an actual 30-minute wait.
+#   daily-summary-lock release <YYYY-MM-DD>
+#     Removes the lock file. Always exits 0 (idempotent — releasing a lock
+#     you don't hold, or that's already gone, is a no-op, not an error).
+
+LOCK_DIR="$HOME/Dev/jori/data/locks"
+mkdir -p "$LOCK_DIR"
+
+CMD="${1:-}"
+DATE_ARG="${2:-}"
+
+usage() {
+  echo "usage: daily-summary-lock <acquire|release> <YYYY-MM-DD> [timeout_seconds]" >&2
+  exit 2
+}
+
+[[ -z "$CMD" || -z "$DATE_ARG" ]] && usage
+[[ "$DATE_ARG" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || { echo "daily-summary-lock: DATE must be YYYY-MM-DD, got '$DATE_ARG'" >&2; exit 2; }
+
+LOCK="$LOCK_DIR/daily-summary-${DATE_ARG}.lock"
+
+case "$CMD" in
+  acquire)
+    TIMEOUT="${3:-900}"
+    OWNER_PID="${4:-$PPID}"
+    STALE_AGE="${5:-1800}"
+    # Poll every 2s, not e.g. 5-10s. Two reasons: (1) the real production
+    # timeout is up to 900s, so a couple extra shlock calls/sec is noise; (2)
+    # verified live on this box — right after a hard-killed holder is reaped,
+    # there's a brief (observed up to ~300ms) kernel-level lag before
+    # kill(pid, 0) reliably reports it as gone, so the very first retry can
+    # spuriously see a dead pid as still alive. A short poll interval makes
+    # that resolve on the next tick instead of stalling a full cycle.
+    ELAPSED=0
+    while ! /usr/bin/shlock -p "$OWNER_PID" -f "$LOCK" 2>/dev/null; do
+      # Age-ceiling reclaim: a lock whose file is older than STALE_AGE has
+      # outlived every real build this pipeline has ever taken (~26m max
+      # observed), so treat its holder as forgotten regardless of whether
+      # shlock still sees the pid as alive, and force-reclaim by removing the
+      # file — the next loop iteration's shlock call then grabs it cleanly.
+      # Deliberately a distinct, louder log line from the timeout path below
+      # so this rarer "we broke a live-looking lock" event is easy to find in
+      # the caller's log, even though it doesn't stop the acquire loop itself.
+      if [ -f "$LOCK" ]; then
+        LOCK_MTIME=$(stat -f %m "$LOCK" 2>/dev/null || echo 0)
+        LOCK_AGE=$(( $(date +%s) - LOCK_MTIME ))
+        if [ "$LOCK_MTIME" -gt 0 ] && [ "$LOCK_AGE" -ge "$STALE_AGE" ]; then
+          HOLDER=$(cat "$LOCK" 2>/dev/null || echo "?")
+          echo "daily-summary-lock: WARNING — ${DATE_ARG} lock held ${LOCK_AGE}s (>= ${STALE_AGE}s ceiling) by pid ${HOLDER}, which shlock still sees as alive; no real build has ever taken this long — treating it as forgotten and force-reclaiming" >&2
+          rm -f "$LOCK"
+        fi
+      fi
+      if [ "$ELAPSED" -ge "$TIMEOUT" ]; then
+        HOLDER=$(cat "$LOCK" 2>/dev/null || echo "?")
+        echo "daily-summary-lock: timed out after ${TIMEOUT}s waiting for the ${DATE_ARG} lock (held by pid ${HOLDER})" >&2
+        exit 1
+      fi
+      sleep 2
+      ELAPSED=$((ELAPSED + 2))
+    done
+    echo "$LOCK"
+    exit 0
+    ;;
+  release)
+    rm -f "$LOCK"
+    exit 0
+    ;;
+  *)
+    usage
+    ;;
+esac

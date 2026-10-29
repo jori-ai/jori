@@ -1,0 +1,183 @@
+#!/usr/bin/env node
+// metro-presence — is the user in a given metro on a given date?
+//
+// A deterministic travel gate for date-sensitive, city-bound jobs (a lottery or
+// a same-day rush that only makes sense when the user is in town). Better than
+// a hand-set pause file, which goes stale and silences a lane for a week the
+// user was still in town.
+//
+// Signals, in order:
+//   1. The canonical travel timeline (lib/presence.js resolvePresence: the
+//      travel_segments table, with the flights.json fallback). When it names
+//      a metro for the date, that is the answer.
+//   2. Otherwise the owner's primary Google calendar (`gog calendar list --json`,
+//      account JORI_CAL_ACCOUNT or instance owner_email):
+//      • Flights  "Flight to <city> (XX 123) — AAA → BBB": walk chronologically;
+//        the destination of the most recent flight as of the end of the date is
+//        where the user is. A destination counts as the metro when its airport
+//        code is one of the metro's `airports` (agent/local/config/travel.json).
+//        Matched case-insensitively and only when an ORIG → DEST airport pair is
+//        present, so a launch called "Starship Flight 12" is ignored.
+//      • Stays    "Stay at <place> (<city>)" spanning the date, naming none of the
+//        metro's aliases = away.
+//
+// Two hard-won gotchas baked in:
+//   - `gog calendar list --json` defaults to --max=10 and SILENTLY truncates. Always
+//     pass a high --max or the timeline loses the return leg → false "away".
+//   - lookback must reach the outbound leg of the current trip (90d).
+//
+// FAIL-OPEN for a home metro (travel.json `home_metros`): with no away signal in
+// the window, the user is home → in. The failure guarded against is a false
+// "away" that drops real entries; "in" only risks an occasional wasted entry
+// for a trip not yet on the calendar. A metro that is not a home is "away"
+// unless a signal puts the user there.
+//
+// Usage:   metro-presence [--metro <key>] [YYYY-MM-DD] [--json]
+//          (default metro: the first of travel.json home_metros; default date:
+//          today in the home zone)
+// Exit:    0 = in the metro (proceed),  1 = away (skip),  2 = error
+// Stdout:  "IN <metro> <date> — <reason>"  /  "AWAY <metro> <date> — <reason>"  (or JSON)
+
+"use strict";
+
+const { execFileSync } = require("node:child_process");
+const presence = require("../lib/presence.js");
+const { zonedMidnightMs, addDays } = require("../lib/day-window.js");
+const { instance } = require("../lib/instance.cjs");
+
+const LOOKBACK_DAYS = 90;
+const MAX_RESULTS = 2500; // gog/Google API ceiling — never rely on the default 10
+
+function usage(msg) {
+  if (msg) process.stderr.write(`metro-presence: ${msg}\n`);
+  process.stderr.write("usage: metro-presence [--metro <key>] [YYYY-MM-DD] [--json]\n");
+  process.exit(2);
+}
+
+function parseArgs(argv) {
+  const o = { metro: null, date: null, json: false };
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === "--json") o.json = true;
+    else if (a === "--metro") { if (i + 1 >= argv.length) usage("--metro needs a value"); o.metro = argv[++i]; }
+    else if (/^\d{4}-\d{2}-\d{2}$/.test(a)) o.date = a;
+    else usage(`unknown argument ${a}`);
+  }
+  return o;
+}
+
+// The metro's airport codes and lower-cased aliases (travel.json metros).
+function metroDef(key) {
+  const def = presence.METRO_DEFS.find(([k]) => k === key);
+  return { aliases: def ? def[1] : [String(key).replace(/_/g, " ")], airports: new Set(def ? def[2] : []) };
+}
+
+// Does a lodging title name the metro? Word-bounded alias match on the
+// lower-cased title (calendar titles are machine-written by the booking flow).
+function namesMetro(summary, aliases) {
+  const s = ` ${String(summary || "").toLowerCase().replace(/[^a-z0-9]+/g, " ")} `;
+  return aliases.some((a) => {
+    const w = String(a).toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+    return w && s.includes(` ${w} `);
+  });
+}
+
+/**
+ * The calendar walk, pure: { in, reason, signal } for `target` from the events.
+ * @param events  gog calendar events [{summary, start:{date|dateTime}, end:{…}}]
+ */
+function fromCalendar(events, target, metro, { home = false, tz = presence.homeTz() } = {}) {
+  const { aliases, airports } = metroDef(metro);
+  const dateFmt = new Intl.DateTimeFormat("en-CA", { timeZone: tz, year: "numeric", month: "2-digit", day: "2-digit" });
+  const eventDate = (part) => (!part ? null : part.date ? part.date : dateFmt.format(new Date(part.dateTime)));
+  // lang-regex-ok: a machine-written flight title's ORIG → DEST airport-code pair
+  const flightRe = /flight\b.*?[—–-]\s*([A-Z]{3})\s*(?:→|->)\s*([A-Z]{3})/i;
+  const flights = [];
+  for (const e of events) {
+    const m = (e.summary || "").match(flightRe);
+    if (!m) continue;
+    const ts = e.start?.dateTime ? Date.parse(e.start.dateTime)
+      : e.start?.date ? zonedMidnightMs(e.start.date, tz) + 12 * 3600e3 : NaN;
+    if (!Number.isFinite(ts)) continue;
+    flights.push({ ts, from: m[1].toUpperCase(), to: m[2].toUpperCase(), date: eventDate(e.start) });
+  }
+  flights.sort((a, b) => a.ts - b.ts);
+  const targetEnd = zonedMidnightMs(addDays(target, 1), tz) - 1000;
+  let lastFlight = null;
+  for (const f of flights) { if (f.ts <= targetEnd) lastFlight = f; else break; }
+
+  let inMetro, reason;
+  if (lastFlight) {
+    inMetro = airports.has(lastFlight.to);
+    reason = inMetro
+      ? `last flight ${lastFlight.from}→${lastFlight.to} (${lastFlight.date}) landed in ${metro}`
+      : `flew ${lastFlight.from}→${lastFlight.to} (${lastFlight.date}), no return to ${metro} by ${target}`;
+  } else {
+    inMetro = home;
+    reason = home ? `no flight in the ${LOOKBACK_DAYS}d before ${target} — assume home (${metro})`
+      : `no flight to ${metro} in the ${LOOKBACK_DAYS}d before ${target}`;
+  }
+
+  // Lodging cross-check (only flips in → away).
+  if (inMetro) {
+    for (const e of events) {
+      const s = e.summary || "";
+      // lang-regex-ok: the booking flow's own "Stay at …" title prefix
+      if (!/^\s*Stay at\b/i.test(s)) continue;
+      const sd = eventDate(e.start), ed = eventDate(e.end);
+      if (!sd) continue;
+      const endIncl = ed && ed > sd ? addDays(ed, -1) : sd; // checkout morning isn't an away night
+      if (target >= sd && target <= endIncl) {
+        if (namesMetro(s, aliases)) continue;
+        const paren = (s.match(/\(([^)]+)\)/) || [])[1] || "";
+        inMetro = false;
+        reason = `lodging "${s.replace(/^\s*Stay at\s*/i, "").trim()}" covers ${target}${paren ? ` (${paren})` : ""}`;
+        break;
+      }
+    }
+  }
+  return { in: inMetro, reason, signal: lastFlight ? "flight" : inMetro ? "default" : "lodging" };
+}
+
+function print(o, r) {
+  if (o.json) console.log(JSON.stringify({ date: o.date, metro: o.metro, in_metro: r.in, reason: r.reason, signal: r.signal }));
+  else console.log(`${r.in ? "IN" : "AWAY"} ${o.metro} ${o.date} — ${r.reason}`);
+  process.exit(r.in ? 0 : 1);
+}
+
+async function main() {
+  const o = parseArgs(process.argv.slice(2));
+  o.metro = o.metro || [...presence.HOME_METROS][0] || null;
+  if (!o.metro) usage("no --metro and no home_metros in agent/local/config/travel.json");
+  o.date = o.date || presence.homeDateOf(new Date());
+  const home = presence.HOME_METROS.has(o.metro);
+
+  // 1. The travel timeline.
+  try {
+    const res = await presence.resolvePresence(o.date);
+    if (res.metro != null) {
+      print(o, { in: res.metro === o.metro,
+        reason: `travel timeline: ${res.metro}${res.label && res.label !== res.metro ? ` (${res.label})` : ""} [${res.source}]`,
+        signal: res.source });
+    }
+  } catch { /* fall through to the calendar walk */ }
+
+  // 2. The calendar.
+  let events;
+  try {
+    // The calendar account: JORI_CAL_ACCOUNT, else the owner's address, else gog's default.
+    const account = process.env.JORI_CAL_ACCOUNT || instance().owner_email;
+    const out = execFileSync("gog", ["calendar", "list", ...(account ? ["--account", account] : []),
+      "--from", addDays(o.date, -LOOKBACK_DAYS), "--to", addDays(o.date, 1),
+      `--max=${MAX_RESULTS}`, "--json"], { encoding: "utf8", maxBuffer: 64 * 1024 * 1024 });
+    events = JSON.parse(out).events || [];
+  } catch (e) {
+    console.error(`metro-presence: calendar query failed: ${e.message}`);
+    process.exit(2);
+  }
+  print(o, fromCalendar(events, o.date, o.metro, { home }));
+}
+
+if (require.main === module) main();
+
+module.exports = { fromCalendar, namesMetro, metroDef };

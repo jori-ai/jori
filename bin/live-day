@@ -1,0 +1,338 @@
+#!/usr/bin/env node
+"use strict";
+// live-day CLI — read or refresh data/live-day.json.
+//
+// Subcommands:
+//   live-day current             → JSON of the current interval (or null)
+//   live-day show                → entire live-day.json
+//   live-day at <ISO|HH:MM>      → intervals overlapping that time
+//   live-day refresh             → rebuild from resolve-day + calendar +
+//                                  chat + task signals; writes the file
+//   live-day accuracy <date>     → coverage/correctness metrics for one day (graded on the ORIGINAL record)
+//   live-day day <date>          → that day with the user's corrections on top (day-overlay.js);
+//                                  --original for the record exactly as stored
+//   live-day blank-days          → archived days holding no intervals at all
+
+const fs = require("node:fs");
+const path = require("node:path");
+
+const { installTools } = require("../lib/root.cjs");
+const { instance } = require("../lib/instance.cjs");
+const LIVE_DAY_FILE = installTools("data", "live-day.json");
+const ARCHIVE_DIR = installTools("data", "live-day-archive");
+const { refreshLiveDay, loadDayFile, computeAccuracy } = require("../lib/live-day.js");
+
+function readLive() {
+  try { return JSON.parse(fs.readFileSync(LIVE_DAY_FILE, "utf8")); }
+  catch { return null; }
+}
+
+function usage() {
+  process.stderr.write("usage: live-day <current|show|refresh|at <ISO|HH:MM>|accuracy <YYYY-MM-DD>|day <YYYY-MM-DD> [--original]|blank-days>\n");
+  process.exit(1);
+}
+
+// An archived day with no intervals is a day we failed to resolve, not a quiet
+// one — 2026-08-07 is 776 bytes of nothing while location_history still holds
+// 178 rows and 30 visits for it. Nothing revisits an archived day, so the least
+// it can do is be findable.
+function blankDays() {
+  let names;
+  try { names = fs.readdirSync(ARCHIVE_DIR); } catch { return []; }
+  const out = [];
+  for (const f of names.sort()) {
+    if (!f.endsWith(".json")) continue;
+    let day;
+    try { day = JSON.parse(fs.readFileSync(path.join(ARCHIVE_DIR, f), "utf8")); }
+    catch { out.push({ date: f.slice(0, -5), intervals: null, note: "unreadable" }); continue; }
+    const n = Array.isArray(day.intervals) ? day.intervals.length : 0;
+    if (n === 0) {
+      out.push({
+        date: day.date || f.slice(0, -5),
+        intervals: n,
+        degraded: day.degraded === true,
+        wake: day.wake?.at || null,
+        bytes: fs.statSync(path.join(ARCHIVE_DIR, f)).size,
+      });
+    }
+  }
+  return out;
+}
+
+// --- Blob-day guard -------------------------------------------------------
+//
+// `resolution_rate` is COVERAGE, not correctness: the fraction of covered
+// minutes whose place carries a confident-looking SOURCE. It says nothing
+// about whether the day was enumerated. So the one shape where the belief
+// structure recorded *nothing* — a single interval swallowing the whole day —
+// scores a perfect 1.0, because its one blob does carry a confident name.
+// The case: one 22-hour interval named for the house that ate a
+// real evening walk through four separate addresses, reported as 1.0, while
+// a day with 8 real intervals reported 0.676. The metric is inversely
+// correlated with quality exactly where it matters, and nightly-review reads
+// it to decide whether location tracking is healthy. That playbook already
+// warns in prose that it "must never be reported alone" — prose does not stop
+// a number from being read as success, so on this shape we refuse to emit one.
+//
+// THE TEST IS A DISAGREEMENT BETWEEN TWO STORES, NOT A DURATION. The archive
+// holds 1 interval while `location_history` holds visit rows at two or more
+// genuinely different places. Two stores saw the same day and only one of them
+// enumerated it — that is the bug stated directly rather than inferred.
+//
+// Duration was tried first and cannot do this job at ANY threshold, which is
+// worth recording so nobody re-derives it. Someone who works long hours
+// mostly from home has long single intervals at home on ordinary days, not
+// collapses. One such day: one interval, 530 min, and its two visit rows at
+// the SAME coordinate — a real all-day-at-home Sunday whose 1.0 was correct. A 600-min bar missed the real
+// blob's neighbour case; a 360-min bar flagged 8 of 116 archived days with
+// only the real blob corroborated — seven false positives, every one of them
+// an ordinary day at home. Interval count alone fails the same way for the
+// same reason. Only the second store separates "the user stayed in" from "we
+// collapsed the user's stops".
+const BLOB_DAY_INTERVAL_COUNT = 1;
+
+// Two visit rows count as DIFFERENT PLACES only if they sit more than 150 m
+// apart, so co-located rows at one address (photo-inferred rows re-derived at
+// the same house, GPS jitter at a fixed location) never manufacture a split.
+// Both bounds come from 2026-08-24 itself: the rows at the house cluster
+// within ~5 m of each other, while the nearest real walk stop that evening was
+// an address 190 m out — so 150 m sits comfortably above the noise and
+// comfortably below the signal. The day's full span is 714 m.
+const DISTINCT_PLACE_METERS = 150;
+
+function metersBetween(a, b) {
+  const R = 6371000;
+  const rad = (d) => (d * Math.PI) / 180;
+  const dLat = rad(b.lat - a.lat);
+  const dLon = rad(b.lon - a.lon);
+  const h = Math.sin(dLat / 2) ** 2
+    + Math.cos(rad(a.lat)) * Math.cos(rad(b.lat)) * Math.sin(dLon / 2) ** 2;
+  return 2 * R * Math.asin(Math.min(1, Math.sqrt(h)));
+}
+
+// Widest gap between any two visit rows. Day-sized inputs (tens of rows), so
+// the O(n^2) walk is cheaper than any clustering scheme would be.
+function maxPairwiseMeters(points) {
+  let max = 0;
+  for (let i = 0; i < points.length; i++) {
+    for (let j = i + 1; j < points.length; j++) {
+      const d = metersBetween(points[i], points[j]);
+      if (d > max) max = d;
+    }
+  }
+  return max;
+}
+
+// `visits` is the day's location_history rows, or null/undefined when the read
+// FAILED. The distinction is load-bearing: [] means the store genuinely holds
+// nothing (so there is no disagreement and no flag), while null means we could
+// not look — and a guard that cannot see its evidence must FAIL OPEN, leaving
+// resolution_rate exactly as computeAccuracy reported it. Blanking the metric
+// on a network blip would be a worse bug than the one being fixed.
+function applyBlobDayGuard(acc, visits) {
+  if (!acc || typeof acc !== "object") return acc;
+  if (acc.interval_count !== BLOB_DAY_INTERVAL_COUNT) return acc;
+  if (!Array.isArray(visits)) return acc; // read failed → fail open
+
+  // Number(null) is 0, not NaN — so a row with a null coordinate would sail
+  // through a bare Number.isFinite() check as a point at null island and
+  // manufacture a ~9,000 km span, flagging the day on missing data. Coerce
+  // null/undefined/"" to NaN deliberately, and drop (0,0) for the same reason:
+  // no visit of his is in the Gulf of Guinea, so that value means "absent".
+  const num = (x) => (x === null || x === undefined || x === "" ? NaN : Number(x));
+  const points = visits
+    .map(v => ({ lat: num(v?.latitude), lon: num(v?.longitude) }))
+    .filter(p => Number.isFinite(p.lat) && Number.isFinite(p.lon)
+      && Math.abs(p.lat) <= 90 && Math.abs(p.lon) <= 180
+      && !(p.lat === 0 && p.lon === 0));
+  if (points.length < 2) return acc;
+
+  const span = maxPairwiseMeters(points);
+  if (span <= DISTINCT_PLACE_METERS) return acc; // one place, all day — a real day
+
+  const reason = `1 interval archived, but location_history holds ${visits.length} `
+    + `visits spanning ${Math.round(span)} m — stops were collapsed`;
+  // Rebuild preserving key order, nulling resolution_rate in place and putting
+  // the flag immediately beside it so no reader can pick up one without
+  // meeting the other.
+  const out = {};
+  for (const [k, v] of Object.entries(acc)) {
+    if (k === "resolution_rate") {
+      out.resolution_rate = null;
+      out.blob_day = true;
+      out.blob_day_reason = reason;
+      continue;
+    }
+    out[k] = v;
+  }
+  if (!("blob_day" in out)) { // upstream dropped the key; still flag the day
+    out.blob_day = true;
+    out.blob_day_reason = reason;
+  }
+  return out;
+}
+
+// The day's visit rows. Returns null — never [] — when the read fails, so the
+// guard above can tell "nothing there" from "could not look".
+async function fetchDayVisits(date) {
+  try {
+    const { fetchJson } = require("../lib/supabase-rest.js");
+    const { _internal: { dayWindowMs } } = require("../lib/live-day.js");
+    const day = loadDayFile(date);
+    const win = dayWindowMs(date, day?.tz || instance().tz);
+    const startIso = new Date(win.start).toISOString();
+    const endIso = new Date(win.end).toISOString();
+    // Windowed on arrived_at alone: an open visit (departed_at null) is still a
+    // place the user went, and 3 of the blob day's rows were exactly that.
+    const rows = await fetchJson(
+      "/rest/v1/location_history?select=id,arrived_at,departed_at,latitude,longitude,place_name,place_type"
+      + "&segment_type=eq.visit"
+      + `&arrived_at=gte.${encodeURIComponent(startIso)}`
+      + `&arrived_at=lt.${encodeURIComponent(endIso)}`
+      + "&order=arrived_at.asc",
+      { timeoutMs: 8000 },
+    );
+    return Array.isArray(rows) ? rows : null;
+  } catch (err) {
+    process.stderr.write(`[live-day] could not load visits: ${err.message}\n`);
+    return null;
+  }
+}
+
+async function main() {
+  const cmd = process.argv[2];
+  if (!cmd) usage();
+
+  if (cmd === "blank-days") {
+    const blanks = blankDays();
+    console.log(JSON.stringify({ count: blanks.length, days: blanks }, null, 2));
+    return;
+  }
+
+  if (cmd === "refresh") {
+    const live = await refreshLiveDay();
+    console.log(JSON.stringify({
+      ok: true,
+      as_of: live.as_of,
+      date: live.date,
+      intervals: live.intervals.length,
+      current_interval_id: live.current_interval_id,
+      summary: live.summary,
+    }, null, 2));
+    return;
+  }
+
+  if (cmd === "accuracy") {
+    const date = process.argv[3];
+    if (!date || !/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+      process.stderr.write("usage: live-day accuracy <YYYY-MM-DD>\n");
+      process.exit(1);
+    }
+    const day = loadDayFile(date);
+    if (!day) {
+      process.stderr.write(`no live-day file for ${date} (checked archive + today)\n`);
+      process.exit(2);
+    }
+    // Grade the day against his own corrections. Fetched here rather than
+    // inside computeAccuracy so that stays pure and testable; on failure we
+    // still print coverage, with name_accuracy null — never a fabricated 1.0.
+    let confirmations = [];
+    try {
+      const { fetchUserConfirmedStops } = require("../lib/resolve-day.js");
+      confirmations = await fetchUserConfirmedStops(date);
+    } catch (err) {
+      process.stderr.write(`[live-day] could not load confirmations: ${err.message}\n`);
+    }
+    // Second store, for the blob-day guard. Fetched here for the same reason
+    // confirmations are: computeAccuracy stays pure and testable, and a failed
+    // read degrades to "no flag" rather than a blanked metric.
+    const visits = await fetchDayVisits(date);
+    // `day` is the ORIGINAL record, never the corrected view (`live-day day`):
+    // accuracy grades what Jori believed against what the user later said, so
+    // layering the corrections in first would score every corrected day 1.0
+    // (the measurement keeps comparing against the original).
+    console.log(JSON.stringify(applyBlobDayGuard(computeAccuracy(day, confirmations), visits), null, 2));
+    return;
+  }
+
+  if (cmd === "day") {
+    // A stored day as a reader should see it: the user's corrections first
+    // (lib/day-overlay.js). --original: the record exactly as stored.
+    const date = process.argv[3];
+    if (!date || !/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+      process.stderr.write("usage: live-day day <YYYY-MM-DD> [--original]\n");
+      process.exit(1);
+    }
+    const day = loadDayFile(date);
+    if (!day) {
+      process.stderr.write(`no live-day file for ${date} (checked archive + today)\n`);
+      process.exit(2);
+    }
+    if (process.argv.includes("--original")) { console.log(JSON.stringify(day, null, 2)); return; }
+    const { correctedLiveDay, readDayCorrections } = require("../lib/day-overlay.js");
+    let confirmations = [];
+    try {
+      const { fetchUserConfirmedStops } = require("../lib/resolve-day.js");
+      confirmations = await fetchUserConfirmedStops(date);
+    } catch (err) {
+      process.stderr.write(`[live-day] could not load the user's answers; the written corrections still apply: ${err.message}\n`);
+    }
+    console.log(JSON.stringify(correctedLiveDay(day, { confirmations, corrections: readDayCorrections(date) }), null, 2));
+    return;
+  }
+
+  const live = readLive();
+  if (!live) {
+    process.stderr.write("live-day file missing — run `live-day refresh` first\n");
+    process.exit(2);
+  }
+
+  if (cmd === "show") {
+    console.log(JSON.stringify(live, null, 2));
+    return;
+  }
+
+  if (cmd === "current") {
+    if (!live.current_interval_id) { console.log("null"); return; }
+    const cur = live.intervals.find(i => i.id === live.current_interval_id) || null;
+    console.log(JSON.stringify(cur, null, 2));
+    return;
+  }
+
+  if (cmd === "at") {
+    const arg = process.argv[3];
+    if (!arg) usage();
+    let ms;
+    if (/^\d{1,2}:\d{2}$/.test(arg)) {
+      // HH:MM on the live day's date, in the day's own zone (else the home zone).
+      const [hh, mm] = arg.split(":").map(n => parseInt(n, 10));
+      const { zonedMidnightMs } = require("../lib/day-window.js");
+      ms = zonedMidnightMs(live.date, live.tz || instance().tz) + (hh * 60 + mm) * 60000;
+    } else {
+      ms = Date.parse(arg);
+    }
+    if (!Number.isFinite(ms)) {
+      process.stderr.write(`invalid time: ${arg}\n`); process.exit(1);
+    }
+    const matches = live.intervals.filter(i => i.start_ts_ms <= ms && i.end_ts_ms >= ms);
+    console.log(JSON.stringify(matches, null, 2));
+    return;
+  }
+
+  process.stderr.write(`unknown command: ${cmd}\n`);
+  usage();
+}
+
+// Exported for tests; the CLI only runs when executed directly.
+module.exports = {
+  applyBlobDayGuard,
+  fetchDayVisits,
+  metersBetween,
+  maxPairwiseMeters,
+  BLOB_DAY_INTERVAL_COUNT,
+  DISTINCT_PLACE_METERS,
+};
+
+if (require.main === module) {
+  main().catch(e => { process.stderr.write(String(e?.stack || e) + "\n"); process.exit(1); });
+}

@@ -1,0 +1,14 @@
+{
+  "notes": "Ordered Overpass mirrors, shared by lib/overpass_client.py (location-segment, osm_places) and lib/day-excursions.js. Probed from the host 2026-10-20: overpass.openstreetmap.fr 200 in 0.8s; maps.mail.ru 200 in 16s; overpass-api.de refuses connections (down/blocking since ~2026-10-16, with no venue source the live question offered bare street addresses); kumi, private.coffee, openstreetmap.ru, openstreetmap.ie timed out; overpass.osm.ch is Switzerland-only. NextGIS offers a free keyed instance if more are ever needed. Resilience lives in overpass_client.py: the last mirror that answered goes first; a failed mirror backs off (2 min doubling, 30 min start for a refused connection, max 120); per_mirror_s caps one attempt inside the caller's overall deadline; health in data/.cache/overpass-health.json, failures in data/overpass-log.jsonl; the watchdog pages when no mirror has answered for 6 h.",
+  "endpoints": [
+    "https://overpass.openstreetmap.fr/api/interpreter",
+    "https://maps.mail.ru/osm/tools/overpass/api/interpreter",
+    "https://overpass-api.de/api/interpreter",
+    "https://overpass.kumi.systems/api/interpreter",
+    "https://overpass.private.coffee/api/interpreter"
+  ],
+  "per_mirror_s": 20,
+  "skip_failed_min": 2,
+  "skip_refused_min": 30,
+  "skip_failed_max_min": 120
+}

@@ -1,0 +1,501 @@
+#!/usr/bin/env python3
+"""location-annotate — tag location_history samples retroactively.
+
+Adds companions and/or notes to samples in a time range. Use to mark
+walks with the dog, meetings with a person, or "this was a work lunch"
+so daily summaries and pattern analysis pick up the context.
+
+Usage:
+  location-annotate --last 30m --companion Rover --note "morning walk"
+  location-annotate --today 08:28-08:42 --companion Rover
+  location-annotate --start 2026-04-16T12:27 --end 2026-04-16T12:43 --note "dog walk"
+  location-annotate --yesterday 19:00-22:00 --companion "Sam" --note "the theatre"
+  location-annotate --last 1h --dry-run
+  # Scan past weeks for similar walks and tag them all with the same annotation:
+  location-annotate --today 08:28-08:42 --companion Rover --scan-similar --weeks 4
+
+Times without a zone (--today/--yesterday/--date, bare --start/--end) are the
+installation's home zone (instance tz).
+
+A companion must be someone Jori already knows (data/known-companions.json).
+An unfamiliar name is refused with exit 4 and nothing is written: ask the user who
+it is (on the phone-channel), then re-run with the user's answer quoted:
+  location-annotate ... --companion Dana --new-companion-authorized "Dana is my cousin"
+"""
+
+import sys
+import os
+import json
+import re
+import urllib.request
+import urllib.parse
+from zoneinfo import ZoneInfo
+from datetime import datetime, timedelta, timezone
+from typing import Optional, List, Tuple
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "lib"))
+import places_local  # noqa: E402
+import place_naming  # noqa: E402
+import companions as _companions  # noqa: E402
+
+ENV_FILE = os.path.join(places_local.install_root(), ".env")
+SUPABASE_URL = place_naming.SUPABASE_URL  # SUPABASE_URL, else the instance's supabase_project
+
+
+def _home_tz():
+    """The installation's home zone (instance tz), else the host's."""
+    tz = places_local.instance().get("tz")
+    try:
+        return ZoneInfo(tz) if tz else datetime.now().astimezone().tzinfo
+    except Exception:
+        return datetime.now().astimezone().tzinfo
+
+
+HZ = _home_tz()
+
+# place_type values findme enrich already treats as "settled" (bin/findme
+# cmd_enrich + _clean_resolved_from_pending). Stamping these here is what
+# lets the two independent location Q&A systems (this tool's free-form
+# hum-harvester answers, and the location-enrich job's confirm/identify
+# ask) share state instead of asking about the same stop twice.
+RESOLVED_PLACE_TYPES = {"named", "user-confirmed", "non-stop"}
+
+# Who counts as "someone I already know". A name read out of a chat message
+# ("Sam, Alex and Iad lunch here" -- really "I had") used to be written straight
+# onto the day's location points, and from there into the daily summary. Now an
+# unfamiliar name stops the tagging until the user says who it is.
+KNOWN_FILE = _companions.known_companions_file()
+AUTH_LOG = places_local.data_path("logs", "companion-authorizations.jsonl")
+EXIT_UNKNOWN_COMPANION = 4
+
+
+def get_key() -> Optional[str]:
+    if not os.path.exists(ENV_FILE):
+        return None
+    with open(ENV_FILE) as f:
+        for line in f:
+            line = line.strip()
+            if line.startswith("SUPABASE_SERVICE_ROLE_KEY="):
+                return line.split("=", 1)[1]
+    return None
+
+
+def parse_last(s: str) -> timedelta:
+    m = re.fullmatch(r"(\d+)([hm])", s.lower())
+    if not m:
+        raise ValueError(f"bad --last value: {s}")
+    n, unit = int(m.group(1)), m.group(2)
+    return timedelta(hours=n) if unit == "h" else timedelta(minutes=n)
+
+
+def parse_hhmm_range(s: str) -> Tuple[int, int]:
+    """'08:28-08:42' -> (h1*60+m1, h2*60+m2), minutes from midnight."""
+    m = re.fullmatch(r"(\d{1,2}):(\d{2})-(\d{1,2}):(\d{2})", s)
+    if not m:
+        raise ValueError(f"bad time range (expected HH:MM-HH:MM): {s}")
+    h1, m1, h2, m2 = [int(x) for x in m.groups()]
+    return h1 * 60 + m1, h2 * 60 + m2
+
+
+def resolve_window(args) -> Tuple[datetime, datetime]:
+    if args.last:
+        delta = parse_last(args.last)
+        end = datetime.now(timezone.utc)
+        return end - delta, end
+    if args.start and args.end:
+        start = datetime.fromisoformat(args.start)
+        end = datetime.fromisoformat(args.end)
+        if start.tzinfo is None:
+            start = start.replace(tzinfo=HZ)
+        if end.tzinfo is None:
+            end = end.replace(tzinfo=HZ)
+        return start.astimezone(timezone.utc), end.astimezone(timezone.utc)
+
+    home_base = None
+    hhmm = None
+    if args.today:
+        home_base = datetime.now(HZ).replace(hour=0, minute=0, second=0, microsecond=0)
+        hhmm = args.today
+    elif args.yesterday:
+        home_base = (datetime.now(HZ) - timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+        hhmm = args.yesterday
+    elif args.date:
+        home_base = datetime.fromisoformat(args.date).replace(tzinfo=HZ)
+        hhmm = args.date_range or "00:00-23:59"
+
+    if home_base and hhmm:
+        s_min, e_min = parse_hhmm_range(hhmm)
+        start = home_base + timedelta(minutes=s_min)
+        end = home_base + timedelta(minutes=e_min)
+        return start.astimezone(timezone.utc), end.astimezone(timezone.utc)
+
+    raise ValueError("specify a window: --last, --today HH:MM-HH:MM, --yesterday HH:MM-HH:MM, or --start/--end")
+
+
+def fetch_samples(start: datetime, end: datetime) -> List[dict]:
+    key = get_key()
+    if not key:
+        raise RuntimeError("no SUPABASE_SERVICE_ROLE_KEY")
+    qs = urllib.parse.urlencode([
+        ("arrived_at", f"gte.{start.isoformat()}"),
+        ("arrived_at", f"lte.{end.isoformat()}"),
+        ("order", "arrived_at.asc"),
+        ("limit", "5000"),
+        ("select", "id,arrived_at,latitude,longitude,segment_type,activity,companions,notes"),
+    ])
+    url = f"{SUPABASE_URL}/rest/v1/location_history?{qs}"
+    req = urllib.request.Request(url, headers={"apikey": key, "Authorization": f"Bearer {key}"})
+    with urllib.request.urlopen(req, timeout=10) as r:
+        return json.loads(r.read())
+
+
+def load_known_companions() -> List[str]:
+    """The roster. A missing file is an empty roster (every name is then
+    unfamiliar); an unreadable one raises, so a corrupt roster fails closed."""
+    try:
+        with open(KNOWN_FILE) as f:
+            return list(json.load(f).get("names", []))
+    except FileNotFoundError:
+        return []
+
+
+def is_known_companion(name: str, known: List[str]) -> bool:
+    """Exact match on the whole name, or a bare first name that opens a known
+    full name ("Sam" -> "Sam Example"). Case-insensitive."""
+    n = name.strip().casefold()
+    for k in known:
+        kc = k.strip().casefold()
+        if n == kc or (" " not in n and kc.split(" ")[0] == n):
+            return True
+    return False
+
+
+def remember_companions(names: List[str], known: List[str], quote: str) -> None:
+    """Add newly authorized names to the roster so they are recognized next
+    time, and log what the user said that authorized them."""
+    merged = list(known)
+    for n in names:
+        if not is_known_companion(n, merged):
+            merged.append(n)
+    tmp = KNOWN_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump({"names": merged, "updated": datetime.now(timezone.utc).isoformat()}, f, indent=2, ensure_ascii=False)
+        f.write("\n")
+    os.replace(tmp, KNOWN_FILE)
+    os.makedirs(os.path.dirname(AUTH_LOG), exist_ok=True)
+    with open(AUTH_LOG, "a") as f:
+        f.write(json.dumps({"ts": datetime.now(timezone.utc).isoformat(), "names": names, "quote": quote},
+                           ensure_ascii=False) + "\n")
+
+
+def merge_companions(existing: Optional[list], new: List[str]) -> List[str]:
+    merged = list(existing or [])
+    for c in new:
+        if c not in merged:
+            merged.append(c)
+    return merged
+
+
+import math
+
+
+def haversine_km(la1, lo1, la2, lo2):
+    R = 6371
+    dl = math.radians(la2 - la1); dn = math.radians(lo2 - lo1)
+    a = math.sin(dl/2)**2 + math.cos(math.radians(la1))*math.cos(math.radians(la2))*math.sin(dn/2)**2
+    return R * 2 * math.asin(math.sqrt(a))
+
+
+WALK_ACT = {"walking", "running", "cycling"}
+
+
+def _minutes_of_day_home(iso: str) -> int:
+    dt = datetime.fromisoformat(iso.replace("Z", "+00:00")).astimezone(HZ)
+    return dt.hour * 60 + dt.minute
+
+
+def _extract_walk_runs(samples: List[dict]) -> List[dict]:
+    """Collapse consecutive walking samples into runs with centroid + window."""
+    runs = []
+    cur = None
+    for s in samples:
+        if s.get("latitude") is None:
+            continue
+        is_walk = s.get("activity") in WALK_ACT
+        if not is_walk:
+            if cur and len(cur["samples"]) >= 2:
+                runs.append(cur)
+            cur = None
+            continue
+        if cur is None:
+            cur = {"samples": [s]}
+        else:
+            cur["samples"].append(s)
+    if cur and len(cur["samples"]) >= 2:
+        runs.append(cur)
+
+    for r in runs:
+        first, last = r["samples"][0], r["samples"][-1]
+        r["start_ts"] = first["arrived_at"]
+        r["end_ts"] = last["arrived_at"]
+        r["start_lat"] = first["latitude"]; r["start_lon"] = first["longitude"]
+        r["end_lat"] = last["latitude"]; r["end_lon"] = last["longitude"]
+        r["duration_min"] = (datetime.fromisoformat(last["arrived_at"].replace("Z","+00:00"))
+                              - datetime.fromisoformat(first["arrived_at"].replace("Z","+00:00"))).total_seconds() / 60
+        r["start_min_et"] = _minutes_of_day_home(first["arrived_at"])
+    return runs
+
+
+def find_similar_walks(reference_start: datetime, reference_end: datetime, weeks: int = 4) -> List[Tuple[datetime, datetime, List[dict]]]:
+    """Find walk runs in the last N weeks that resemble the reference window.
+    Similarity: start time-of-day ±90 min, duration within ±50%, start/end within 500m.
+    Returns [(start_dt_utc, end_dt_utc, row_ids_in_run)]."""
+    cutoff = datetime.now(timezone.utc) - timedelta(weeks=weeks)
+    samples = fetch_samples(cutoff, datetime.now(timezone.utc))
+    # Fetch reference samples to characterize the pattern
+    ref = fetch_samples(reference_start, reference_end)
+    ref_runs = _extract_walk_runs(ref)
+    if not ref_runs:
+        return []
+    # Use the span of all reference walk samples as a single reference run
+    ref_run = ref_runs[0]
+    for r in ref_runs[1:]:
+        if r["duration_min"] > ref_run["duration_min"]:
+            ref_run = r
+    ref_start_min = ref_run["start_min_et"]
+    ref_duration = ref_run["duration_min"]
+    ref_sx, ref_sy = ref_run["start_lat"], ref_run["start_lon"]
+    ref_ex, ref_ey = ref_run["end_lat"], ref_run["end_lon"]
+
+    all_runs = _extract_walk_runs(samples)
+    matches = []
+    for run in all_runs:
+        # Skip the reference itself
+        if run["start_ts"] == ref_run["start_ts"]:
+            continue
+        # Time-of-day window ±90 min
+        if abs(run["start_min_et"] - ref_start_min) > 90:
+            continue
+        # Duration ±50%
+        if ref_duration > 0:
+            lo, hi = ref_duration * 0.5, ref_duration * 1.5
+            if not (lo <= run["duration_min"] <= hi):
+                continue
+        # Start + end locations within 500m of reference
+        if haversine_km(run["start_lat"], run["start_lon"], ref_sx, ref_sy) > 0.5:
+            continue
+        if haversine_km(run["end_lat"], run["end_lon"], ref_ex, ref_ey) > 0.5:
+            continue
+        start_dt = datetime.fromisoformat(run["start_ts"].replace("Z", "+00:00"))
+        end_dt = datetime.fromisoformat(run["end_ts"].replace("Z", "+00:00"))
+        matches.append((start_dt, end_dt, run["samples"]))
+    return matches
+
+
+def patch_row(row_id: str, patch: dict) -> bool:
+    key = get_key()
+    if not key:
+        return False
+    req = urllib.request.Request(
+        f"{SUPABASE_URL}/rest/v1/location_history?id=eq.{row_id}",
+        data=json.dumps(patch).encode(),
+        headers={
+            "apikey": key,
+            "Authorization": f"Bearer {key}",
+            "Content-Type": "application/json",
+            "Prefer": "return=minimal",
+        },
+        method="PATCH",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10):
+            return True
+    except Exception as e:
+        print(f"  failed to patch {row_id}: {e}", file=sys.stderr)
+        return False
+
+
+def resolve_nearby_visit(near_start: datetime, note: str) -> Optional[dict]:
+    """Stamp the nearest not-yet-resolved VISIT row following near_start.
+
+    Root cause this closes (a double-ask about one stop): the
+    location_context hum harvester asks forward-looking questions like
+    "Left X -- where are you going?" on a departure edge. The stop being
+    asked about (the destination) often hasn't completed in
+    location_history yet at ask time, and the plain annotation above only
+    ever writes `companions`/`notes` on whatever raw samples fall in the
+    passed window -- it never touches `place_type`/`place_name`. Meanwhile
+    the separate location-enrich job (findme enrich) scans visits
+    independently and only skips a visit when its `place_type` is already
+    in ("named", "user-confirmed", "non-stop"). With no shared signal, a
+    stop the user already answered about through this flow gets asked about
+    again, later, through that one.
+
+    Look forward (not just at the exact instant) from near_start for the
+    next unresolved visit and stamp it directly, so findme enrich's
+    existing resolved-check sees it settled and never queues/re-asks.
+    Picks the single earliest match in the window -- good enough for the
+    common case (one destination stop following one departure/answer);
+    an ambiguous multi-stop window is rare and not worth over-engineering.
+    """
+    key = get_key()
+    if not key:
+        return None
+    window_start = near_start - timedelta(minutes=15)
+    window_end = near_start + timedelta(hours=3)
+    qs = urllib.parse.urlencode([
+        ("segment_type", "eq.visit"),
+        ("arrived_at", f"gte.{window_start.isoformat()}"),
+        ("arrived_at", f"lte.{window_end.isoformat()}"),
+        ("order", "arrived_at.asc"),
+        ("limit", "5"),
+        ("select", "id,arrived_at,place_type,place_name"),
+    ])
+    url = f"{SUPABASE_URL}/rest/v1/location_history?{qs}"
+    req = urllib.request.Request(url, headers={"apikey": key, "Authorization": f"Bearer {key}"})
+    try:
+        with urllib.request.urlopen(req, timeout=10) as r:
+            rows = json.loads(r.read())
+    except Exception:
+        return None
+    for row in rows:
+        if row.get("place_type") in RESOLVED_PLACE_TYPES:
+            continue
+        place_name = note.strip()[:120]
+        if patch_row(row["id"], {"place_name": place_name, "place_type": "user-confirmed"}):
+            return {"id": row["id"], "arrived_at": row.get("arrived_at"), "place_name": place_name}
+        return None
+    return None
+
+
+def main():
+    import argparse
+    p = argparse.ArgumentParser(
+        description="Tag location_history samples retroactively.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p.add_argument("--last", help="Relative window, e.g. '30m' or '2h'")
+    p.add_argument("--today", metavar="HH:MM-HH:MM", help="Today's time range (home zone)")
+    p.add_argument("--yesterday", metavar="HH:MM-HH:MM", help="Yesterday's time range (home zone)")
+    p.add_argument("--date", help="Explicit date YYYY-MM-DD (pair with --date-range)")
+    p.add_argument("--date-range", metavar="HH:MM-HH:MM", help="Time range for --date (default 00:00-23:59)")
+    p.add_argument("--start", help="ISO 8601 start")
+    p.add_argument("--end", help="ISO 8601 end")
+    p.add_argument("--companion", action="append", default=[], help="Add companion (repeatable, or comma-separated)")
+    p.add_argument("--new-companion-authorized", metavar="QUOTE",
+                   help="What the user actually said when telling you who an unfamiliar companion is "
+                        "(a quote, not a flag). Without it, a name not in known-companions.json is refused.")
+    p.add_argument("--note", help="Set/append note")
+    p.add_argument("--append-note", action="store_true", help="Append to existing notes instead of overwriting")
+    p.add_argument("--dry-run", action="store_true", help="Preview without writing")
+    p.add_argument("--scan-similar", action="store_true",
+                   help="Also tag similar walks in the past N weeks (±90 min time-of-day, ±50%% duration, start/end within 500m)")
+    p.add_argument("--weeks", type=int, default=4, help="Weeks of history to scan for --scan-similar (default 4)")
+    p.add_argument("--no-resolve-visit", action="store_true",
+                   help="Skip stamping the nearby unresolved visit's place_type/place_name (diagnostics only)")
+    args = p.parse_args()
+
+    # Expand comma-separated companions
+    companions: List[str] = []
+    for c in args.companion:
+        for part in c.split(","):
+            part = part.strip()
+            if part:
+                companions.append(part)
+
+    if not companions and not args.note:
+        print("ERROR: nothing to annotate — pass --companion and/or --note", file=sys.stderr)
+        sys.exit(1)
+
+    known = load_known_companions()
+    unknown = [c for c in companions if not is_known_companion(c, known)]
+    quote = (args.new_companion_authorized or "").strip()
+    if unknown and not quote:
+        print(json.dumps({
+            "refused": "unknown_companion",
+            "unknown": unknown,
+            "next": "Nothing was written. Ask the user on the phone-channel who this is (it may be a "
+                    "misread word, not a person), then re-run with --new-companion-authorized "
+                    "\"<what the user said>\" if the user confirms a new person.",
+        }, ensure_ascii=False), file=sys.stderr)
+        sys.exit(EXIT_UNKNOWN_COMPANION)
+
+    try:
+        start, end = resolve_window(args)
+    except ValueError as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    try:
+        rows = fetch_samples(start, end)
+    except Exception as e:
+        print(f"ERROR: fetch failed: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    print(json.dumps({
+        "window_utc": {"start": start.isoformat(), "end": end.isoformat()},
+        "window_local": {"start": start.astimezone(HZ).isoformat(), "end": end.astimezone(HZ).isoformat()},
+        "samples_matched": len(rows),
+        "companions_to_add": companions,
+        "note": args.note,
+        "dry_run": args.dry_run,
+    }, indent=2))
+
+    def apply_to_rows(sample_rows: List[dict]) -> int:
+        n = 0
+        for row in sample_rows:
+            patch: dict = {}
+            if companions:
+                patch["companions"] = merge_companions(row.get("companions"), companions)
+            if args.note:
+                if args.append_note and row.get("notes"):
+                    patch["notes"] = f"{row['notes']}; {args.note}"
+                else:
+                    patch["notes"] = args.note
+            if patch and patch_row(row["id"], patch):
+                n += 1
+        return n
+
+    if args.dry_run and not args.scan_similar:
+        return
+
+    updated = 0 if args.dry_run else apply_to_rows(rows)
+    if unknown and not args.dry_run:
+        remember_companions(unknown, known, quote)
+
+    # Pattern scan: find and tag similar walks in history
+    scan_result = None
+    if args.scan_similar:
+        matches = find_similar_walks(start, end, weeks=args.weeks)
+        scan_result = {
+            "weeks_scanned": args.weeks,
+            "similar_walks_found": len(matches),
+            "windows": [],
+        }
+        for (ms, me, run_samples) in matches:
+            scan_result["windows"].append({
+                "start_local": ms.astimezone(HZ).isoformat(),
+                "end_local": me.astimezone(HZ).isoformat(),
+                "sample_count": len(run_samples),
+            })
+            if not args.dry_run:
+                updated += apply_to_rows(run_samples)
+
+    out = {"rows_updated": updated}
+
+    # Close the loop with findme enrich: a free-form note answers exactly the
+    # kind of question the location-enrich job would otherwise ask about the
+    # same stop later. Stamp the nearest unresolved visit so that job's
+    # existing "already resolved" skip (bin/findme cmd_enrich +
+    # _clean_resolved_from_pending) sees it settled and never re-asks.
+    if args.note and not args.dry_run and not args.no_resolve_visit:
+        visit_resolved = resolve_nearby_visit(start, args.note)
+        out["visit_resolved"] = visit_resolved
+
+    if scan_result is not None:
+        out["scan_similar"] = scan_result
+    print(json.dumps(out, indent=2))
+
+
+if __name__ == "__main__":
+    main()

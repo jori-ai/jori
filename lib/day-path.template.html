@@ -1,0 +1,322 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Day path</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<style>
+  :root{ --bg:#f7f6f3; --panel:#fff; --ink:#17160f; --muted:#6d6b61; --line:#e3e1d9; --warn:#b4532a; }
+  @media (prefers-color-scheme: dark){
+    :root{ --bg:#141410; --panel:#1d1d18; --ink:#f0eee6; --muted:#9d9989; --line:#2f2f27; --warn:#e08a5c; }
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;height:100%}
+  body{background:var(--bg);color:var(--ink);display:flex;flex-direction:column;height:100vh;
+    font:15px/1.5 ui-sans-serif,-apple-system,"Segoe UI",Roboto,sans-serif}
+  header{padding:13px 18px 11px;border-bottom:1px solid var(--line);flex:none}
+  h1{margin:0;font-size:17px;font-weight:650;letter-spacing:-.01em}
+  h1 span{color:var(--muted);font-weight:400;font-size:14px}
+  .stats{display:flex;flex-wrap:wrap;gap:17px;margin-top:9px}
+  .stat b{display:block;font-size:16px;font-weight:620;font-variant-numeric:tabular-nums}
+  .stat i{font-style:normal;font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.05em}
+  .stat.bad b{color:var(--warn)}
+  main{flex:1;display:flex;min-height:0}
+  #map{flex:1;min-width:0;background:var(--panel)}
+  aside{width:296px;flex:none;border-left:1px solid var(--line);background:var(--panel);
+    overflow-y:auto;padding:10px 0}
+  @media (max-width:780px){
+    main{flex-direction:column}
+    aside{width:auto;border-left:0;border-top:1px solid var(--line);max-height:38vh}
+    #map{min-height:44vh}
+  }
+  .stop{display:flex;gap:9px;padding:6px 14px;align-items:baseline;cursor:pointer}
+  .stop:hover{background:rgba(128,128,128,.09)}
+  .stop time{font-variant-numeric:tabular-nums;font-size:12px;color:var(--muted);flex:none;width:36px}
+  .stop .nm{font-size:13.5px}
+  .stop .du{font-size:11.5px;color:var(--muted)}
+  .dot{width:9px;height:9px;border-radius:50%;flex:none;margin-top:5px}
+  .unnamed{color:var(--muted);font-style:italic}
+  .sect{padding:9px 14px 4px;font-size:11px;letter-spacing:.06em;text-transform:uppercase;color:var(--muted)}
+  .conf{padding:6px 14px;font-size:12.5px;border-left:3px solid var(--warn);margin:3px 0}
+  .conf b{color:var(--warn)}
+  .legend{padding:10px 14px;border-top:1px solid var(--line);margin-top:8px;font-size:12px;color:var(--muted)}
+  .ramp{height:8px;border-radius:4px;margin:6px 0 4px;
+    background:linear-gradient(90deg,#3b5f9e,#4b8fb0,#d8a03d,#c2622c,#8d3f6d,#3d3160)}
+  .rampx{display:flex;justify-content:space-between;font-variant-numeric:tabular-nums}
+  .key{display:flex;gap:13px;margin-top:9px;flex-wrap:wrap}
+  .key span{display:flex;align-items:center;gap:5px}
+  .swatch{width:20px;height:0;border-top:3px solid currentColor}
+  .swatch.dash{border-top-style:dashed}
+  .leaflet-container{font:inherit;background:var(--panel)}
+  .leaflet-popup-content{margin:9px 12px;font-size:13px}
+  .pop b{display:block;font-size:13.5px;margin-bottom:2px}
+  .pop small{color:#777}
+  .fallback{padding:20px;color:var(--muted);font-size:13px}
+  .leaflet-tooltip.lbl{
+    background:none;border:none;box-shadow:none;padding:0;margin:0;
+    font:600 12px/1.25 ui-sans-serif,-apple-system,"Segoe UI",Roboto,sans-serif;
+    color:#1c1a12;
+    text-shadow:0 0 3px #fff,0 0 3px #fff,0 0 3px #fff,0 0 6px #fff;
+    white-space:nowrap;
+  }
+  .leaflet-tooltip.lbl::before{display:none}
+  .leaflet-tooltip.lbl .t{font-weight:500;opacity:.7}
+  body.print .leaflet-tooltip.lbl{font-size:12.5px}
+  /* print mode: the static image for the email -- map fills the frame */
+  body.print aside{display:none}
+  body.print .stats{gap:14px;margin-top:7px}
+  body.print header{padding:11px 16px 9px}
+  body.print #map{min-height:0}
+  body.print .leaflet-control-zoom{display:none}
+</style>
+</head>
+<body>
+<header>
+  <h1 id="ttl">Day path <span id="sub"></span></h1>
+  <div class="stats" id="stats"></div>
+</header>
+<main>
+  <div id="map"></div>
+  <aside>
+    <div class="sect">Major dwells</div>
+    <div id="stops"></div>
+    <div id="nonstops"></div>
+    <div id="conflicts"></div>
+    <div class="legend">
+      <div>Time of day</div>
+      <div class="ramp"></div>
+      <div class="rampx"><span>00</span><span>06</span><span>12</span><span>18</span><span>24</span></div>
+      <div class="key">
+        <span style="color:#888"><i class="swatch"></i>observed</span>
+        <span style="color:#888"><i class="swatch dash"></i>unobserved, routed</span>
+        <span style="color:#888"><i class="swatch" style="border-top-width:1px;border-top-style:dashed"></i>raw fixes</span>
+      </div>
+    </div>
+  </aside>
+</main>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+const SEGMENTS=__SEGMENTS__, VISITS=__VISITS__, PLACES=__PLACES__, NONSTOPS=__NONSTOPS__, CONFLICTS=__CONFLICTS__, STATS=__STATS__, UNSUPPORTED=__UNSUPPORTED__;
+
+const RAMP=[[0,[59,95,158]],[6,[75,143,176]],[11,[216,160,61]],[15,[194,98,44]],[20,[141,63,109]],[24,[61,49,96]]];
+function hourColor(h){
+  h=Math.max(0,Math.min(24,h));
+  for(let i=0;i<RAMP.length-1;i++){
+    const [h0,c0]=RAMP[i],[h1,c1]=RAMP[i+1];
+    if(h>=h0&&h<=h1){const t=(h-h0)/(h1-h0||1);
+      return `rgb(${c0.map((c,k)=>Math.round(c+(c1[k]-c)*t)).join(',')})`;}
+  }
+  return 'rgb(61,49,96)';
+}
+const esc=s=>s.replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const dur=m=>m>=60?`${Math.floor(m/60)}h ${m%60}m`:`${m}m`;
+// 12-hour clock throughout, matching how the user writes times ("12:30pm").
+function fmt12(t){const m=/^(\d{1,2}):(\d{2})/.exec(String(t||''));if(!m)return String(t||'');
+  let h=+m[1];const s=h>=12?'pm':'am';h=h%12||12;return `${h}:${m[2]}${s}`;}
+
+document.title='Day path · '+STATS.date;
+document.getElementById('sub').textContent=`· ${STATS.date} · 00:00–24:00 ${STATS.tz}`;
+const PRINT=document.body.classList.contains('print');
+// The email header carries only what a reader wants at a glance; the full
+// diagnostic set stays in the interactive view.
+const FULL=[['coverage_pct','% of day traced'],['observed_km','km observed'],
+  ['inferred_km','km interpolated'],['dwell_h','h at stops'],
+  ['moving_h','h moving'],['visits','stops'],['fixes','gps fixes'],['bridges','gaps bridged']];
+const BRIEF=[['walked_km','km walked'],['stops','stops'],
+  ['dwell_h','h at stops'],['pace_kmh','km/h pace']];
+document.getElementById('stats').innerHTML=(PRINT?BRIEF:FULL)
+  .filter(([k])=>STATS[k]!==undefined&&STATS[k]!==null)
+  .map(([k,l])=>`<div class="stat"><b>${STATS[k]}</b><i>${l}</i></div>`).join('')
+ + (PRINT?'':`<div class="stat${STATS.implied_kmh>7?' bad':''}"><b>${STATS.implied_kmh}</b><i>km/h implied${STATS.implied_kmh>7?' · too fast':''}</i></div>`
+ + `<div class="stat"><b>${STATS.match_pct}%</b><i>street-matched</i></div>`)
+ + (STATS.conflicts?`<div class="stat bad"><b>${STATS.conflicts}</b><i>conflicts${STATS.impossible?` · ${STATS.impossible} impossible`:''}</i></div>`:'')
+ + (!PRINT&&STATS.holes?`<div class="stat"><b>${STATS.holes}</b><i>unobserved stretch${STATS.holes>1?'es':''}</i></div>`:'')
+ + (!PRINT&&STATS.unsupported?`<div class="stat"><b>${STATS.unsupported}</b><i>records set aside</i></div>`:'')
+ + (!PRINT&&STATS.dup_writes?`<div class="stat"><b>${STATS.dup_writes}</b><i>dupes merged</i></div>`:'');
+
+const MAJOR_MIN=30;
+const MAJOR=PLACES.filter(v=>v.mins>=MAJOR_MIN||v.ptype==='user-confirmed');
+const MINOR=PLACES.length-MAJOR.length;
+document.getElementById('stops').innerHTML=MAJOR.map((v)=>`
+  <div class="stop" data-i="${PLACES.indexOf(v)}">
+    <span class="dot" style="background:${hourColor(v.hour)}"></span>
+    <time>${fmt12(v.start)}</time>
+    <span><span class="nm ${v.name?'':'unnamed'}">${v.name?esc(v.name):'unlabelled stop'}</span>
+    <span class="du"> · ${dur(v.mins)}${v.visits>1?` · ${v.visits} visits`:''}</span></span>
+  </div>`).join('')
+  + (MINOR?`<div class="conf" style="border-left-color:var(--line);color:var(--muted)">plus ${MINOR} shorter stop${MINOR>1?'s':''} under ${MAJOR_MIN} min, shown on the map but not named</div>`:'');
+
+if(NONSTOPS.length){
+  document.getElementById('nonstops').innerHTML='<div class="sect">Moving — your words, not stops</div>'+
+    NONSTOPS.map(n=>`<div class="stop"><span class="dot" style="background:transparent;border:2px solid ${hourColor(n.hour)};margin-top:4px"></span>
+      <time>${fmt12(n.start)}</time><span><span class="nm unnamed">${n.name?esc(n.name):'in transit'}</span>
+      <span class="du"> · ${dur(n.mins)}</span></span></div>`).join('');
+}
+
+if(CONFLICTS.length){
+  document.getElementById('conflicts').innerHTML='<div class="sect">Conflicting records</div>'+
+    CONFLICTS.map(c=>`<div class="conf"><b>${c.at}</b> — “${esc(c.a)}” and “${esc(c.b)}” overlap ${c.ov_min}m apart in time but sit ${c.m>=1000?(c.m/1000).toFixed(1)+' km':c.m+' m'} apart${c.impossible?' (impossible)':''}</div>`).join('');
+}
+// Visit rows the fixes never supported. They are drawn nowhere -- a stale
+// departed_at on a Sept-5 address visit is how 2026-09-06 got a bridge from
+// home to the theatre district -- but they are not hidden either.
+if(UNSUPPORTED.length){
+  document.getElementById('conflicts').innerHTML+='<div class="sect">Records set aside</div>'+
+    UNSUPPORTED.map(u=>`<div class="conf" style="border-left-color:var(--line);color:var(--muted)">“${esc(u.name||'unlabelled')}” claimed ${u.claimed}${u.kept?`, kept ${u.kept}`:''} — ${esc(u.reason)}</div>`).join('');
+}
+
+if(typeof L==='undefined'){
+  document.getElementById('map').innerHTML='<div class="fallback">Map tiles could not load in this view — open the file in a browser for the basemap. The path data is intact.</div>';
+}else{
+  const map=L.map('map'); const bounds=[];
+  // Esri's Light Gray canvas: keyless, the same quiet grey the CARTO light
+  // basemap used to be before basemaps.cartocdn.com started stamping every
+  // tile "API KEY REQUIRED" (2026-09-07). Base + reference layer so streets
+  // keep their names. Native tiles stop at 16; Leaflet upscales past that.
+  const ESRI='https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/';
+  const ESRI_ATTR='&copy; Esri, HERE, Garmin, &copy; OpenStreetMap contributors';
+  L.tileLayer(ESRI+'World_Light_Gray_Base/MapServer/tile/{z}/{y}/{x}',
+    {maxNativeZoom:16,maxZoom:20,attribution:ESRI_ATTR}).addTo(map);
+  L.tileLayer(ESRI+'World_Light_Gray_Reference/MapServer/tile/{z}/{y}/{x}',
+    {maxNativeZoom:16,maxZoom:20,opacity:.9}).addTo(map);
+
+  SEGMENTS.forEach(seg=>{
+    seg.coords.forEach(c=>bounds.push(c));
+    if(seg.runs&&seg.runs.length){
+      // One run per routed waypoint pair, each with its own time span and
+      // whether it crosses a hole -- so an unobserved stretch inside an
+      // otherwise observed leg is drawn dashed, and only that stretch.
+      seg.runs.forEach(run=>{
+        const n=run.coords.length; if(n<2) return;
+        const RUN=Math.max(1,Math.ceil(n/12));
+        for(let i=0;i<n-1;i+=RUN){
+          const j=Math.min(i+RUN,n-1);
+          const h=run.h0+(run.h1-run.h0)*((i+j)/2/(n-1));
+          L.polyline(run.coords.slice(i,j+1),{color:hourColor(h),
+            weight:run.hole?3:4.5, opacity:run.hole?.7:.92,
+            dashArray:run.hole?'6,6':null, lineCap:'round',lineJoin:'round'}).addTo(map);
+        }
+      });
+      if(!PRINT) L.polyline(seg.coords,{color:'#888',weight:1,opacity:.28,dashArray:'2,4'}).addTo(map);
+      if(!PRINT) (seg.holes||[]).forEach(h=>{
+        L.circleMarker([h.lat,h.lon],{radius:3,color:'#999',fillColor:'#fff',fillOpacity:1,weight:1.5})
+         .bindPopup(`<div class="pop"><b>unobserved</b><small>no fix for ${h.min} min · ${(h.m/1000).toFixed(1)} km · ${h.t0}–${h.t1}</small></div>`).addTo(map);
+      });
+      return;
+    }
+    if(seg.matched&&seg.matched.length>1){
+      // street-matched geometry: colour by the time of the nearest input point.
+      // Drawn in short multi-point runs, not one pair at a time -- Valhalla
+      // returns a vertex every few metres, which at whole-day zoom is finer
+      // than a screen pixel, so a per-pair stroke has zero length and Chrome
+      // never paints it. A run gives each visible stroke real on-screen
+      // length while keeping the same gradient, just at coarser steps
+      // (found 2026-08-05: ~55% of per-pair strokes were invisible).
+      const n=seg.matched.length, h0=seg.hours[0], h1=seg.hours[seg.hours.length-1];
+      const RUN=Math.max(1,Math.ceil(n/40));
+      for(let i=0;i<n-1;i+=RUN){
+        const j=Math.min(i+RUN,n-1);
+        const h=h0+(h1-h0)*((i+j)/2/(n-1));
+        L.polyline(seg.matched.slice(i,j+1),{color:hourColor(h),
+          weight:seg.kind==='inferred'?3:4.5,
+          opacity:seg.kind==='inferred'?.7:.92,
+          dashArray:seg.kind==='inferred'?'6,6':null,
+          lineCap:'round',lineJoin:'round'}).addTo(map);
+      }
+      if(!PRINT) L.polyline(seg.coords,{color:'#888',weight:1,opacity:.28,dashArray:'2,4'}).addTo(map);
+    } else {
+      for(let i=0;i<seg.coords.length-1;i++){
+        L.polyline([seg.coords[i],seg.coords[i+1]],{color:hourColor(seg.hours[i]),
+          weight:seg.kind==='inferred'?2.5:4,opacity:.85,
+          dashArray:seg.kind==='inferred'?'5,7':null,
+          lineCap:'round',lineJoin:'round'}).addTo(map);
+      }
+    }
+    if(seg.kind==='inferred'){
+      const m=[(seg.coords[0][0]+seg.coords[1][0])/2,(seg.coords[0][1]+seg.coords[1][1])/2];
+      L.circleMarker(m,{radius:3,color:'#999',fillColor:'#fff',fillOpacity:1,weight:1.5})
+       .bindPopup(`<div class="pop"><b>interpolated</b><small>no fix for ${seg.gap_min} min · ${(seg.dist_m/1000).toFixed(1)} km straight-line · ${seg.t0}–${seg.t1}</small></div>`).addTo(map);
+    }
+  });
+
+  // Places he actually spent time in are named ON the map, not just in a popup.
+  // Labels alternate side and are suppressed for very short or unnamed stops so
+  // a dense day stays readable.
+  // Only major dwells are named. Shorter stops stay on the
+  // map as dots -- they are part of the day -- but naming every one of them is
+  // what made a dense afternoon unreadable.
+  const LABEL_MIN_MIN=30;
+  // Only dwells of >=10 min (or ones he confirmed) get a marker; the address
+  // visits of a few minutes that ride along a walk never reach PLACES at all
+  // (day-path folds them into the leg) -- they were the string of dots.
+  const markers=PLACES.map((v,i)=>{
+    const r=v.major===false?4:Math.max(6,Math.min(24,Math.sqrt(v.mins)*1.9));
+    const m=L.circleMarker([v.lat,v.lon],{radius:r,
+      color:'#fff',weight:2,fillColor:hourColor(v.hour),fillOpacity:.88}).addTo(map);
+    m.bindPopup(`<div class="pop"><b>${v.name?esc(v.name):'unlabelled stop'}</b><small>from ${fmt12(v.start)} · ${dur(v.mins)} total${v.visits>1?` over ${v.visits} visits`:''}${v.ptype==='user-confirmed'?' · you confirmed this':''}</small></div>`);
+    bounds.push([v.lat,v.lon]); return {m,v,r};
+  }).map(x=>x);
+
+  NONSTOPS.forEach(n=>{
+    L.circleMarker([n.lat,n.lon],{radius:5,color:hourColor(n.hour),weight:2,fillColor:'#fff',fillOpacity:.9})
+     .bindPopup(`<div class="pop"><b>${n.name?esc(n.name):'in transit'}</b><small>${n.start}–${n.end} · ${dur(n.mins)} · moving, not a stop</small></div>`).addTo(map);
+    bounds.push([n.lat,n.lon]);
+  });
+
+  if(!PRINT) CONFLICTS.forEach(c=>{
+    L.circleMarker([c.lat,c.lon],{radius:9,color:'#b4532a',weight:2.5,fill:false})
+     .bindPopup(`<div class="pop"><b>conflicting records</b><small>${c.at} · “${esc(c.a)}” vs “${esc(c.b)}” · ${c.m} m apart, overlapping ${c.ov_min} min</small></div>`).addTo(map);
+  });
+
+  map.fitBounds(bounds,{padding:[46,46]});
+
+  // Label placement. A dense day puts eight stops inside 200 m, so labelling
+  // everything makes the map unreadable. Longest stays win, each label is
+  // placed only if its box clears every label already placed, and names are
+  // truncated -- an unplaceable label is dropped rather than overlapped.
+  function placeLabels(){
+    const placed=[];
+    const boxes=[];
+    const hit=(b)=>boxes.some(o=>!(b.x2<o.x1||b.x1>o.x2||b.y2<o.y1||b.y1>o.y2));
+    const cand=[...markers].filter(x=>x.v.name&&(x.v.mins>=LABEL_MIN_MIN||x.v.ptype==='user-confirmed'))
+                           .sort((a,b)=>b.v.mins-a.v.mins);
+    // reserve the markers themselves so labels never sit on a dot
+    markers.forEach(x=>{
+      const p=map.latLngToContainerPoint([x.v.lat,x.v.lon]);
+      boxes.push({x1:p.x-x.r,y1:p.y-x.r,x2:p.x+x.r,y2:p.y+x.r});
+    });
+    const size=map.getSize();
+    for(const x of cand){
+      const label=x.v.name.length>30?x.v.name.slice(0,29)+'…':x.v.name;
+      const w=label.length*6.6+34, h=16;
+      const p=map.latLngToContainerPoint([x.v.lat,x.v.lon]);
+      let done=false;
+      for(const [dir,dx,dy] of [['right',x.r+6,0],['left',-(x.r+6),0],
+                                ['top',0,-(x.r+8)],['bottom',0,x.r+8]]){
+        const cx=dir==='left'?p.x+dx-w:dir==='right'?p.x+dx:p.x-w/2;
+        const cy=p.y+dy-h/2;
+        const b={x1:cx,y1:cy,x2:cx+w,y2:cy+h};
+        if(b.x1<2||b.y1<2||b.x2>size.x-2||b.y2>size.y-2) continue;
+        if(hit(b)) continue;
+        boxes.push(b); placed.push(x);
+        x.m.bindTooltip(`${esc(label)} <span class="t">${x.v.start}</span>`,
+          {permanent:true,direction:dir,className:'lbl',
+           offset:dir==='left'?[-(x.r+4),0]:dir==='right'?[x.r+4,0]:[0,dir==='top'?-(x.r+2):x.r+2],
+           opacity:1});
+        done=true; break;
+      }
+      if(!done) x.m.bindTooltip(`${esc(label)}`,{direction:'top',className:'lbl'});
+    }
+    return placed.length;
+  }
+  map.whenReady(()=>setTimeout(placeLabels,60));
+  document.querySelectorAll('.stop').forEach(el=>el.addEventListener('click',()=>{
+    const m=markers[+el.dataset.i].m;
+    map.setView(m.getLatLng(),Math.max(map.getZoom(),16),{animate:true}); m.openPopup();
+  }));
+}
+</script>
+</body>
+</html>

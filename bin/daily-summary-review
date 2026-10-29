@@ -1,0 +1,659 @@
+#!/usr/bin/env node
+/**
+ * daily-summary-review — critique a built report before it ships, and with
+ * --repair fix what the critique finds.
+ *
+ * the user, 2026-07-30: "maybe we should add a loop to review and improve the
+ * report until it's ready to publish ... catch duplicates, missing info, etc."
+ * the user, 2026-10-15: "before sending we should have another LLM review (opus
+ * level) to catch any issues or inconsistencies and repair them before sending."
+ *
+ * Every defect this looks for actually shipped:
+ *   - DUPLICATE  2026-07-30 listed "Lunch at La Cappadoce" twice, 11:11am and
+ *                11:55am, because dedup only merges ADJACENT stops and the
+ *                Marché Bastille drinks sat between the two halves.
+ *   - INVENTED   2026-07-30 titled a 67-minute window "~Les Marcheurs de
+ *                Planète? · unconfirmed" — a resolver guess for a window the user was
+ *                asked about and never answered.
+ *   - MISSING    2026-07-29 dropped Le Oken and the Enfants Rouges drink, both
+ *                of which the user had named in chat hours earlier.
+ *   - SPLIT      2026-07-29 wrote "Cocktails + Lebanese ice cream" as ONE stop
+ *                when the user had given two separate Maps links.
+ *   - TIMES      2026-10-14 opened "7:00am · Café Antilia" while its own night
+ *                paragraph said the Watch had the user asleep until 7:29. The
+ *                reviewer then ran on Sonnet over the report text alone, so it
+ *                had nothing to compare the 7:00 against.
+ *
+ * Division of labour, per Rule #0b: structural checks are CODE (comparing two
+ * lists, two clock times, or a set-difference is arithmetic, not
+ * interpretation); judgment is a MODEL (does the prose contradict its own
+ * header or the facts, would a careful reader notice something absent, does the
+ * day read as a coherent narrative). Since 2026-10-15 that model is Opus at high
+ * effort, shown the facts the report was built from, not just the report.
+ *
+ * Whether a place the user named is in the report: code can only CLEAR it (2026-10-27).
+ * What code cannot match by its words or its time is a CANDIDATE, settled by that
+ * same model call, and cleared only when the model quotes the heading of a stop
+ * that names a venue, never an unlabeled stop or a walk (R.settleCandidates). Before, a non-match was a high finding by
+ * itself, and in the week of Oct 20 most of them were false ("&" for "and", a
+ * possessive, the user's answer saved under the venue's own name). Closed tasks stay a
+ * code check: the renderer prints each title as it is, so a mismatch is a build
+ * fault, not a wording question.
+ *
+ * With --repair, the same Opus pass edits the PROSE slots it was told are wrong
+ * (never a header, a time or a stop: those are code), the report is
+ * re-assembled and reviewed again, and the edit is KEPT ONLY IF the findings
+ * score went down. An edit that cannot be verified (out of time, the model
+ * unavailable) is reverted. Do no harm.
+ *
+ * Every finding carries `fix_by`: "prose" (this command's repair can), "fork"
+ * (needs the settle step: a confirmed venue, a re-prep, a re-render) or "none"
+ * (a code defect nobody can repair in this pipeline: publish and list it under
+ * Corrections & follow-ups).
+ *
+ * Exit 3 = revise: a high finding that someone can still fix remains; findings
+ * are on stdout as JSON. Exit 0 is not a publish verdict: the gate is `confirmed`
+ * in the result (no high or medium finding, and the review ran).
+ *
+ * Structural checks also cover playbook Step 4.5 (moved into code 2026-10-04):
+ * unfilled slots, photo-count phrasing, and every standout purchase shipped /
+ * no dollar figure the builder didn't compute.
+ *
+ * One call can run several minutes (review, repair, re-review on Opus). Give the
+ * Bash tool `timeout: 600000`; --budget-sec (default 570) keeps the whole run
+ * inside it and a partial result is still written to /tmp/ds-review-<date>.json.
+ *
+ * Usage: daily-summary-review <YYYY-MM-DD> [--model opus|sonnet] [--effort E]
+ *          [--repair] [--max-repairs N] [--budget-sec S] [--no-model]
+ */
+const fs = require("node:fs");
+const path = require("node:path");
+
+// Model ids live in agent/config/models.env (2026-10-06) — one place.
+const { MODELS } = require(path.join(__dirname, "../lib/models.cjs"));
+// The pinned Claude Code (CLAUDE_BIN, else ~/.local/bin/claude), never a bare `claude`:
+// a job's PATH put a stray Homebrew 2.1.81 first .
+const { judge, CLAUDE_BIN } = require(path.join(__dirname, "../lib/max-judge.js"));
+const { claudeVersionLine } = require(path.join(__dirname, "../lib/claude-binaries.js"));
+const { recordForkCost } = require(path.join(__dirname, "../lib/fork-cost-ledger.cjs"));
+const { readCorrections } = require(path.join(__dirname, "../lib/daily-summary-harvest.js"));
+const { assemble, _internal: { isMainStop } } = require(path.join(__dirname, "../lib/daily-summary-render.js"));
+const { commitLines, visibleCommits } = require(path.join(__dirname, "../lib/daily-summary-commits.js"));
+const COMMIT_LINE_MAX = 140;
+const { zonedMidnightMs } = require(path.join(__dirname, "../lib/day-window.js"));
+const R = require(path.join(__dirname, "../lib/daily-summary-review.js"));
+
+const date = process.argv[2];
+if (!date || !/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+  console.error("usage: daily-summary-review <YYYY-MM-DD> [--model opus|sonnet] [--effort E] [--repair] [--max-repairs N] [--budget-sec S] [--no-model]");
+  process.exit(2);
+}
+const arg = (f, d) => { const i = process.argv.indexOf(f); return i > -1 ? process.argv[i + 1] : d; };
+const flag = (f) => process.argv.includes(f);
+const modelName = arg("--model", "opus");
+const model = MODELS[modelName] || MODELS.opus;
+const effort = arg("--effort", "high");
+const noModel = flag("--no-model");
+const repair = flag("--repair") && !noModel;
+const maxRepairs = Math.max(0, parseInt(arg("--max-repairs", "2"), 10) || 0);
+const budgetMs = Math.max(30, parseInt(arg("--budget-sec", "570"), 10) || 570) * 1000;
+const startedAt = Date.now();
+const deadline = startedAt + budgetMs;
+
+const CALL_CAP_MS = 200000;   // one Opus judgment; typical is 40-120 s
+const CALL_MIN_MS = 45000;    // don't start a call there is no time to finish
+
+const REPORT = `/tmp/daily-summary-${date}.html`;
+const PROSE = `/tmp/ds-prose-${date}.json`;
+const SKELETON = `/tmp/ds-skeleton-${date}.html`;
+
+const read = (f) => { try { return fs.readFileSync(f, "utf8"); } catch { return null; } };
+const readJson = (f) => { try { return JSON.parse(fs.readFileSync(f, "utf8")); } catch { return null; } };
+const log = (m) => process.stderr.write(`[daily-summary-review] ${m}\n`);
+
+if (!read(REPORT)) { console.error(`no report at ${REPORT}`); process.exit(2); }
+const resolved = readJson(`/tmp/resolved-day-${date}.json`) || {};
+const statements = readJson(`/tmp/day-statements-${date}.json`) || {};
+const day = readJson(`/tmp/ds-day-${date}.json`) || {};
+const manifest = readJson(`/tmp/ds-manifest-${date}.json`) || {};
+
+// "&" is the word "and" (2026-10-20: the user said "the old man and the sea", the stop
+// carries the venue's own "The Old Man & The Sea", and the word test called the user's
+// lunch missing because "&" was stripped as punctuation and "and" was not).
+const norm = (s) => String(s || "").split("&").join(" and ").toLowerCase()
+  .normalize("NFD").replace(/[̀-ͯ]/g, "")                // lang-regex-ok: strips diacritics for comparison
+  .replace(/[^a-z0-9 ]+/g, " ").replace(/\s+/g, " ").trim();       // lang-regex-ok: normalises for set comparison
+
+// ---- structural checks (code) ------------------------------------------------
+// Parsing our OWN generated markup is structural, not language interpretation.
+// Each finding says who can fix it (`fix_by`); see the header.
+function structural(html) {
+  const findings = [];
+  // Places the user named that code found no match for: settled by the model, not here.
+  const candidates = [];
+  const candidate = (c) => candidates.push({ id: `c${candidates.length + 1}`, ...c });
+  const headers = [...html.matchAll(/<h3[^>]*>([\s\S]*?)<\/h3>/g)]   // lang-regex-ok: parses our own HTML, not the user's words
+    .map(m => m[1].replace(/<[^>]*>/g, "").split("&amp;").join("&").trim());
+  const stripTime = (h) => h.replace(/^[^·]*·\s*/, "").trim();       // lang-regex-ok: our own header format
+  const titles = headers.map(stripTime);
+  // The stop headings as the reviewer reads them (every escape our renderer makes,
+  // decoded): a model's "present" for a place must quote one of these, and one
+  // whose stop names a venue (R.classifyStopHeadings).
+  const headingLines = [...html.matchAll(/<h3[^>]*>([\s\S]*?)<\/h3>/g)].map((m) => R.headingTextOf(m[1]));   // lang-regex-ok: parses our own HTML
+
+  // 1. duplicates — the same place listed more than once.
+  // Repetition alone is not a defect: the user goes home in the morning, returns after
+  // lunch and again at night, and those are three real visits. What IS a defect
+  // is one visit split in two — 2026-07-30 listed "Lunch at La Cappadoce" at
+  // 11:11am and again at 11:55am, one meal broken by a GPS drift. Time between
+  // the entries separates the two cases, so accommodation is exempt and a wide
+  // gap is only a note.
+  const SPLIT_VISIT_MAX_MIN = 120;
+  const minutesOf = (h) => {
+    const m = /(\d{1,2}):(\d{2})(am|pm)/i.exec(h);                  // lang-regex-ok: our own header time format
+    if (!m) return null;
+    let hh = parseInt(m[1], 10) % 12;
+    if (/pm/i.test(m[3])) hh += 12;                                   // lang-regex-ok: our own header time format
+    return hh * 60 + parseInt(m[2], 10);
+  };
+  const accommodationNames = new Set(
+    (resolved.stops || [])
+      .filter(s => ((s.place && s.place.source) || "") === "accommodation")
+      .map(s => norm(s.place.name)));
+
+  const seen = new Map();
+  titles.forEach((t, i) => {
+    const k = norm(t);
+    if (!k) return;
+    if (!seen.has(k)) { seen.set(k, i); return; }
+    const j = seen.get(k);
+    seen.set(k, i);
+    if (accommodationNames.has(k)) return;        // going home twice is not a bug
+    const a = minutesOf(headers[j]), b = minutesOf(headers[i]);
+    const gap = (a != null && b != null) ? Math.abs(b - a) : null;
+    // A split visit has nothing between its halves. Another stop in between (the
+    // door, a café 170 m away, the door again — 2026-10-10) is an outing and a
+    // return, however short, so it is only ever a note.
+    const split = gap != null && gap <= SPLIT_VISIT_MAX_MIN && i - j === 1;
+    findings.push({
+      kind: "duplicate", severity: split ? "high" : "low", fix_by: "fork",
+      detail: split
+        ? `"${t}" appears twice ${gap} min apart ("${headers[j]}", "${headers[i]}") — one visit split by a GPS drift`
+        : `"${t}" appears at "${headers[j]}" and "${headers[i]}" — probably a genuine return, worth a glance`,
+      fix: split ? "merge them into a single stop spanning both windows"
+                 : "leave as-is if the user really went back",
+    });
+  });
+
+  // 2. invented venues — a resolver guess presented as a place
+  for (const h of headers) {
+    if (/unconfirmed|~/.test(h)) {                                    // lang-regex-ok: matches our own hedge markup
+      findings.push({
+        kind: "invented", severity: "high", fix_by: "fork",
+        detail: `"${h}" is a resolver guess the user never confirmed`,
+        fix: "the user did not name this window; render it as movement or as an unlabelled stop, never as a venue",
+      });
+    }
+  }
+
+  // 3. missing — a place the user named that the report does not carry.
+  // A match below CLEARS the place; no match makes it a candidate for the model
+  // (see the header): the word rules are only a cheap first pass, never a verdict.
+  // The venue is day-statements' own canonical field ("Falafel Example");
+  // `name` can be the user's whole message, link and all (2026-10-17: "had dinner here
+  // - https://maps.app…" was reported missing although the dinner was a stop).
+  // Present = every word of the venue, beyond articles, is in some stop title,
+  // so "the Airbnb" is "The Old Town Airbnb". Both strings are set members after our
+  // own normalisation; anything finer is the model's job (rubric A, the user's messages).
+  // "and" and a lone "s" are not words of the place either: "Sam and Alex's"
+  // normalises to "sam and alex s", and the header that carried it, "Parents'
+  // home · with … Alex … Sam", joins people with "+" and has no possessive, so the evening at the user's parents' was called missing.
+  const ARTICLES = new Set(["the", "a", "an", "at", "my", "our", "his"]);
+  const JOINERS = new Set(["and", "s"]);
+  const words = (x) => norm(x).split(" ").filter((w) => w && !ARTICLES.has(w) && !JOINERS.has(w));
+  const titleWords = titles.map((t) => new Set(words(t)));
+  // A statement that names no place ("We had lunch at a place I ate last week
+  // with the lassers", "stopped for gas") has only the user's sentence in `name`, so the
+  // word test can never pass: on 2026-10-18 it called a lunch the report carried
+  // missing. It is checked instead for a stop shown at the time the model put it
+  // at (when_hint); with no clock time, the model pass over the user's messages is the check.
+  const shown = (day.stops || []).filter((s) => isMainStop(s) && !s.excursion && !s.user_non_stop && !s.is_movement);
+  const day0 = zonedMidnightMs(date, (statements._meta && statements._meta.tz) || day.tz);
+  const hintMs = (v) => {
+    const m = /^(\d{1,2}):(\d{2})$/.exec(String(v || ""));          // lang-regex-ok: a model-emitted HH:MM stamp
+    return m ? day0 + Number(m[1]) * 3600_000 + Number(m[2]) * 60_000 : null;
+  };
+  const HINT_SLACK_MS = 2 * 60_000;
+  for (const p of (statements.places || [])) {
+    if (!p.venue) {
+      const t = hintMs(p.when_hint);
+      if (t == null || !p.name) continue;
+      if (shown.some((s) => s.start_ts_ms - HINT_SLACK_MS <= t && t <= s.end_ts_ms + HINT_SLACK_MS)) continue;
+      candidate({ type: "place_time", label: p.name, evidence: p.evidence || p.name, when: p.when_hint, missing: {
+        kind: "missing", severity: "high", fix_by: "fork",
+        headline: `${p.name}, which you mentioned, is not in the summary`,
+        detail: `the user said "${String(p.evidence || p.name).slice(0, 80)}" about ${p.when_hint} and no stop in the report covers that time`,
+        fix: "add it as a stop; the user's own statement outranks every resolver",
+      } });
+      continue;
+    }
+    const label = p.venue;
+    const want = words(label);
+    if (!want.length || want.some((w) => w.startsWith("http"))) continue;
+    const present = titleWords.some((tw) => want.every((w) => tw.has(w)));
+    // The user's own answer for that very window, saved under other words ("the
+    // hotel for the AI conference", the user's reply to the 10:30 ask, is the stop
+    // named with the hotel's full name). Whether two wordings are one place is language, so
+    // the model's pass over the user's messages judges it; the word test only steps
+    // aside when the stop at the model's time is a row the user answered and its title
+    // shares a word with what the user said. A different name there is still missing.
+    const t = hintMs(p.when_hint);
+    const answered = !present && t != null && shown.some((s) =>
+      s.start_ts_ms - HINT_SLACK_MS <= t && t <= s.end_ts_ms + HINT_SLACK_MS
+      && s.confirmed_row && s.confirmed_row.place_type === "user-confirmed"
+      && words((s.provenance && s.provenance.title) || (s.place && s.place.name)).some((w) => want.includes(w)));
+    if (!present && !answered) {
+      candidate({ type: "place", label, evidence: p.evidence || "", when: p.when_hint || null, missing: {
+        kind: "missing", severity: "high", fix_by: "fork",
+        headline: `${label}, which you mentioned, is not in the summary`,
+        detail: `the user named "${label}" ("${String(p.evidence || "").slice(0, 80)}") and it is not in the report`,
+        fix: "add it as a stop; the user's own statement outranks every resolver",
+      } });
+    }
+  }
+
+  // 4. unfilled template slots
+  const slots = html.match(/\{\{[^}]*\}\}/g) || [];                   // lang-regex-ok: our own template markers
+  if (slots.length) {
+    findings.push({ kind: "unfilled", severity: "high", fix_by: "fork",
+      detail: `${slots.length} unfilled slot(s): ${[...new Set(slots)].slice(0, 5).join(", ")}`,
+      fix: "a prose slot id did not match a stop id; fix the prose JSON and re-assemble" });
+  }
+
+  // 5. arithmetic that cannot be true
+  // Walking pace only means something on a day that was mostly walking: on
+  // 2026-10-16 an airport drive and two Rishon round trips made matched_km 36 km
+  // against 1.2 km walked, and the check called it "walking 17.6 km/h".
+  const st = (resolved.path && resolved.path.stats) || {};
+  const mostlyWalking = Number.isFinite(st.walked_km) && Number.isFinite(st.matched_km) && st.matched_km > 0
+    ? st.walked_km >= 0.8 * st.matched_km : true;
+  if (st.pace_kmh_after && st.pace_kmh_after > 7 && mostlyWalking) {
+    findings.push({ kind: "impossible", severity: "medium", fix_by: "none",
+      detail: `implied walking pace ${st.pace_kmh_after} km/h over ${st.matched_km} km`,
+      fix: "stop windows overlap and are eating the travel time between them" });
+  }
+
+  // 5b. times that cannot be true (2026-10-15): a stop that begins while the
+  // Watch has the user asleep, and stops that overlap. Both are code-owned content,
+  // so nobody can repair them in prose (fix_by "none"): publish and disclose.
+  for (const f of R.stopsBeforeWake(day)) findings.push({ ...f, fix_by: "none" });
+  for (const f of R.overlappingStops(day)) findings.push({ ...f, fix_by: "none" });
+
+  // 5c. one stay cut into back-to-back headers, accommodation included
+  // (a rented flat as four stops, which check 1 exempts as lodging).
+  for (const f of R.splitStays(day)) findings.push(f);
+
+  // 5c'. a photo in the day the email could not show (2026-10-17: Friday Oct 16
+  // shipped twice without its Milk Bakery and August photos, and nothing said so).
+  for (const f of R.photosNotShown(manifest, day)) findings.push(f);
+
+  // 5d. the place-statement extraction never ran. Check 3 is then blind to every
+  // place the user named (2026-10-16: no day-statements file, so the dinner the user named
+  // was never compared with the report). The model still reads the user's messages.
+  const msgCount = R.hisMessages(manifest, (day.path && day.path.tz) || day.tz).length;
+  if (msgCount && !Array.isArray(statements.places)) {
+    findings.push({ kind: "quality", severity: "medium", from: "code", fix_by: "none",
+      detail: `/tmp/day-statements-${date}.json is missing although the user sent ${msgCount} message(s) that day, so the code check for places the user named could not run`,
+      fix: "find why day-statements did not run in prep and make it run (or fail loudly)" });
+  }
+
+  // 6. a task closed that day that the report does not carry.
+  // The list is emitted by the skeleton, so an absence here means the assembled
+  // HTML was hand-edited or built from a stale skeleton — exactly the way the
+  // completions used to vanish when they were only ever prose (the user,
+  // 2026-08-23: "remembering when a task was done is extremely important").
+  // Compared as decoded text: the render escapes "&" as "&amp;" (and < > "), so a
+  // title holding one never matched the raw markup and was called missing.
+  const reportWords = norm(html.split("&lt;").join("<").split("&gt;").join(">")
+    .split("&quot;").join('"').split("&#39;").join("'").split("&nbsp;").join(" ").split("&amp;").join("&"));
+  for (const t of (day.tasks_completed || [])) {
+    const n = norm(t.title);
+    if (!n) continue;
+    if (!reportWords.includes(n)) {
+      findings.push({
+        kind: "missing", severity: "high", fix_by: "fork",
+        detail: `the user closed the task "${t.title}" at ${t.completed_at} and it is not in the report`,
+        fix: "re-run `daily-summary-build render` + `assemble`; the closed-task list is deterministic and must ship verbatim",
+      });
+    }
+  }
+  for (const f of R.duplicateTasks(day.tasks_completed || manifest.tasks_completed)) findings.push(f);
+
+  // 6b. a call the day settled that the report does not carry. Its
+  // line is emitted by the skeleton (class "call", our own markup), so a
+  // shortfall means a stale skeleton or a hand-edited report.
+  const callLines = html.split('class="call"').length - 1;
+  if ((day.calls || []).length > callLines) {
+    findings.push({
+      kind: "missing", severity: "high", fix_by: "fork",
+      detail: `the day has ${day.calls.length} call(s) and the report shows ${callLines}`,
+      fix: "re-run `daily-summary-build render` + `assemble`; the call lines are deterministic and must ship",
+    });
+  }
+  // 6c. the day's commits — what the user worked on, listed under each stop (the user,
+  // 2026-10-21). The lists are emitted by the skeleton; a commit no prose.commits line covers ships under its raw
+  // subject, which is the defect named here.
+  // Commits code left out as routine (`omitted`, 2026-10-22) are not owed to the report.
+  const shownCommits = visibleCommits(day.commits);
+  if (shownCommits.length) {
+    if (!html.includes('class="worked"') && !html.includes('class="commits"')) {
+      findings.push({
+        kind: "missing", severity: "high", fix_by: "fork",
+        detail: `the day has ${shownCommits.length} commit(s) and the report lists none of them`,
+        fix: "re-run `daily-summary-build render` + `assemble`; the commit lists are deterministic and must ship",
+      });
+    }
+    const { uncovered, lines: commitLinesOut } = commitLines(day.commits, (readJson(PROSE) || {}).commits);
+    // One short line per project ("Combine multiple commits into a
+    // single project. No need to list every commit."). A written line past this length
+    // is a list of changes, not a project; a raw-subject fallback is the `uncovered` finding.
+    const wordy = commitLinesOut.filter((l) => l.plain && l.text.length > COMMIT_LINE_MAX);
+    if (wordy.length) {
+      findings.push({
+        kind: "quality", severity: "medium", fix_by: "fork",
+        detail: `${wordy.length} commit line(s) over ${COMMIT_LINE_MAX} characters, listing changes instead of naming one project: ${wordy.slice(0, 4).map((l) => `"${l.text.slice(0, 60)}…"`).join("; ")}`,
+        fix: "rewrite each as one short sentence naming the project (keep every sha in `shas`), edit prose.commits and re-assemble",
+      });
+    }
+    if (uncovered.length) {
+      findings.push({
+        kind: "quality", severity: "medium", fix_by: "fork",
+        detail: `${uncovered.length} commit(s) shown under their raw subject, not in plain language: ${uncovered.slice(0, 8).join(", ")}`,
+        fix: "add a plain-language line covering these shas to prose.commits and re-assemble",
+      });
+    }
+  }
+  if (day.tasks_completed_error) {
+    findings.push({
+      kind: "quality", severity: "medium", fix_by: "none",
+      detail: `Google Tasks could not be read for this day (${String(day.tasks_completed_error).slice(0, 120)})`,
+      fix: "re-run `daily-summary-build prep` once gog auth/network is back, so the closed-task list is complete",
+    });
+  }
+
+  // 7. photo-count phrasing (playbook Step 4.5 #2, moved into code 2026-10-04).
+  // The images are already in the spine; "5 photos" in prose is the 2026-04-18
+  // NYBG failure. This scans OUR OWN generated report for a banned output
+  // template — it does not interpret anything the user said.
+  const bodyText = html.replace(/<[^>]*>/g, " ");                     // lang-regex-ok: strips our own markup
+  const photoCounts = bodyText.match(/\b\d+\s+(photos|images|pics|pictures)\b/gi) || []; // lang-regex-ok: banned template in our own generated prose
+  if (photoCounts.length) {
+    findings.push({ kind: "quality", severity: "high", fix_by: "prose",
+      detail: `photo-count phrasing in prose: ${[...new Set(photoCounts)].slice(0, 3).join(", ")}`,
+      fix: "remove the count from the prose JSON and re-assemble; the photos are already shown" });
+  }
+
+  // 8. standout purchases (Step 4.5 #3, in code 2026-10-04): every builder-
+  // computed amount ships, and no dollar figure appears that the builder did
+  // not compute. Amounts are machine-formatted strings ("$120"), so this is
+  // string membership, not interpretation.
+  const standouts = (manifest.standout_transactions || []).map(t => t.amount_usd).filter(Boolean);
+  for (const amt of new Set(standouts)) {
+    if (!html.includes(amt)) {
+      findings.push({ kind: "missing", severity: "high", fix_by: "prose",
+        detail: `standout purchase ${amt} (${(manifest.standout_transactions.find(t => t.amount_usd === amt) || {}).merchant || "?"}) is not in the report`,
+        fix: "weave it into its stop's prose, or one line in other_anchors if it has no stop_id, and re-assemble" });
+    }
+  }
+  if (standouts.length || manifest.standout_transactions) {
+    const known = new Set(standouts);
+    // The call paragraph is neither prose nor money the user spent: code attaches it from
+    // Zoom's own record of the call (or the user's notes for it), and its
+    // figures are the call's ("$2 million in August bookings"). Amounts
+    // are looked for in the rest of the report.
+    const moneyText = html.replace(/<(p|ul) class="call-talk"[^>]*>[\s\S]*?<\/\1>/g, " ")   // lang-regex-ok: our own call-paragraph markup
+      .replace(/<[^>]*>/g, " ");                                                     // lang-regex-ok: strips our own markup
+    const seenAmts = moneyText.match(/\$\d[\d,]*(?:\.\d{1,2})?/g) || [];     // lang-regex-ok: machine-formatted currency figures
+    // A closed task prints exactly as it was titled ("Tasks closed today", code's own
+    // section, 2026-10-28): an amount in its title is the task's text, not one the
+    // prose invented, and no prose edit can remove it. Prose amounts are still checked.
+    for (const t of manifest.tasks_completed || []) {
+      for (const a of String((t && t.title) || "").match(/\$\d[\d,]*(?:\.\d{1,2})?/g) || []) known.add(a); // lang-regex-ok: the same currency-figure test, on code-printed titles
+    }
+    const stray = [...new Set(seenAmts)].filter(a => !known.has(a) && ![...known].some(k => k.startsWith(a) || a.startsWith(k)));
+    if (stray.length) {
+      findings.push({ kind: "invented", severity: "medium", fix_by: "prose",
+        detail: `dollar figure(s) not computed by the builder: ${stray.slice(0, 5).join(", ")}`,
+        fix: "remove any amount the manifest does not carry; quote amount_usd verbatim" });
+    }
+  }
+  return { findings, headers, titles, candidates, headingLines };
+}
+
+// ---- judgment: hand the report to a model ------------------------------------
+// The report as readable lines: block ends become newlines before the markup is
+// stripped, so the reviewer sees paragraphs, not one run-on.
+function reportText(html) {
+  return html
+    .replace(/<\/(p|h[1-6]|li|div|tr|ul)>|<br\s*\/?>/gi, "\n")      // lang-regex-ok: our own block markup
+    .replace(/<[^>]*>/g, " ")                                         // lang-regex-ok: strips our own markup
+    .replace(/&nbsp;/g, " ").replace(/&amp;/g, "&")                   // lang-regex-ok: decodes our own HTML escapes
+    .split("\n").map((l) => l.replace(/\s+/g, " ").trim()).filter(Boolean).join("\n")  // lang-regex-ok: whitespace of our own markup
+    .slice(0, 40000);
+}
+
+let versionLogged = false;
+let unavailableReason = null;
+
+// One structured Opus judgment with a single retry. Never throws: a failure
+// returns {error}, and a fatal one (not logged in, usage limit) is not retried.
+// `appendSystem` is static text sent as an appended system prompt, which the CLI
+// caches between calls (the review rubric; see R.REVIEW_RUBRIC).
+async function ask(kind, prompt, schema, appendSystem = null) {
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    const remaining = deadline - Date.now();
+    if (remaining < CALL_MIN_MS) return { error: `out of time budget before the ${kind}` };
+    if (!versionLogged) { versionLogged = true; log(claudeVersionLine(CLAUDE_BIN)); }
+    try {
+      log(`${kind}: ${modelName} (${model}), effort ${effort}, attempt ${attempt}, ${Math.round(remaining / 1000)}s left`);
+      return await judge({
+        model, effort, prompt, schema, appendSystem,
+        timeoutMs: Math.min(CALL_CAP_MS, remaining - 5000),
+        onResult: (out) => recordForkCost({ job: `daily-summary-review:${kind}`, result: out, model }),
+      });
+    } catch (e) {
+      log(`${kind} failed: ${e.message}`);
+      if (e.fatal || attempt === 2) return { error: String(e.message).slice(0, 160) };
+    }
+  }
+  return { error: "unreachable" };
+}
+
+// The user's photos for the day, with what the phone and Photos read in them
+// (2026-10-17: the reviewer never saw a photo). Fetched once; null = the fetch
+// failed, which the fact pack states rather than reading it as "no photos".
+let dayPhotos;
+async function loadPhotos() {
+  if (process.env.DS_REVIEW_PHOTOS_FILE) { try { dayPhotos = JSON.parse(fs.readFileSync(process.env.DS_REVIEW_PHOTOS_FILE, "utf8")); } catch { dayPhotos = null; } return; }
+  const win = (manifest.harvest && manifest.harvest.window) || {};
+  if (!win.start || !win.end) { dayPhotos = null; return; }
+  try {
+    const { fetchJson } = require(path.join(__dirname, "../lib/supabase-rest.js"));
+    const rows = await fetchJson(`/rest/v1/photos?select=taken_at,latitude,longitude,device_venue,detected_text,labels,persons,self_captured`
+      + `&taken_at=gte.${encodeURIComponent(win.start)}&taken_at=lt.${encodeURIComponent(win.end)}&in_trash=eq.false&hidden=eq.false&order=taken_at.asc&limit=200`, { timeoutMs: 15000 });
+    dayPhotos = Array.isArray(rows) ? rows : null;
+  } catch { dayPhotos = null; }
+}
+
+// The previous day's calls as its summary published them (2026-10-22): context for a
+// note the user wrote after midnight about one (R.priorNightCalls). null = not read, and the
+// fact pack then says nothing about them.
+let priorCalls = null;
+async function loadPriorCalls() {
+  if (process.env.DS_REVIEW_PRIOR_CALLS_FILE) {
+    try { priorCalls = JSON.parse(fs.readFileSync(process.env.DS_REVIEW_PRIOR_CALLS_FILE, "utf8")); } catch { priorCalls = null; }
+    return;
+  }
+  const win = (manifest.harvest && manifest.harvest.window) || {};
+  if (!win.start) return;
+  const prev = new Date(Date.parse(`${date}T12:00:00Z`) - 86400_000).toISOString().slice(0, 10);
+  try {
+    const { fetchJson } = require(path.join(__dirname, "../lib/supabase-rest.js"));
+    const rows = await fetchJson(`/rest/v1/daily_summaries?select=day_json->calls&date=eq.${prev}`, { timeoutMs: 15000 });
+    priorCalls = Array.isArray(rows) ? R.priorNightCalls(rows[0] && rows[0].calls, win.start) : null;
+  } catch { priorCalls = null; }
+}
+
+const factsText = () => R.factPack({
+  date, manifest, day, statements,
+  corrections: readCorrections(date),
+  photos: dayPhotos,
+  priorCalls,
+});
+
+// The static rubric rides as an appended system prompt (cached between calls);
+// the day's facts, the report, what code caught and the candidates go on stdin.
+async function modelReview(text, known = [], candidates = []) {
+  if (noModel) return { skipped: true, issues: [], candidates: [] };
+  const r = await ask("review", R.reviewDayPart({ facts: factsText(), reportText: text, known, candidates }),
+    R.REVIEW_SCHEMA, R.REVIEW_RUBRIC);
+  if (r.error) { unavailableReason = r.error; return { error: r.error, issues: [], candidates: [] }; }
+  const issues = (Array.isArray(r.issues) ? r.issues : []).map((i) => ({
+    ...i, from: "model",
+    fix_by: i.slot && i.slot.type && i.slot.type !== "none" ? "prose" : "fork",
+  }));
+  return { issues, verdict: r.verdict, candidates: Array.isArray(r.candidates) ? r.candidates : [] };
+}
+
+// All findings for a report: the structural ones, the candidates as the model
+// settled them, and the model's own. When the model could not run, say so as a
+// finding (medium: it is a hole in the review, not in the report).
+async function review(html) {
+  const s = structural(html);
+  const text = reportText(html);
+  const m = await modelReview(text, s.findings.filter((f) => f.from === "code").map((f) => f.detail), s.candidates);
+  const kinds = R.classifyStopHeadings(day, s.headingLines);
+  const settled = R.settleCandidates(s.candidates, m.candidates, {
+    judged: !m.error && !m.skipped, reportText: text,
+    headings: s.headingLines, namedHeadings: kinds.named, unnamedHeadings: kinds.unnamed,
+    why: m.skipped ? "the review ran without a model (--no-model)" : (m.error ? `the review did not run (${m.error})` : null),
+  });
+  const findings = [...s.findings, ...settled.findings, ...m.issues];
+  if (m.error) {
+    findings.push({ kind: "quality", severity: "medium", from: "model", fix_by: "none", review_hole: true,
+      detail: `the ${modelName} review did not run (${m.error})`,
+      fix: "structural checks still applied; say in the final output that the independent review was unavailable" });
+  }
+  return { findings, titles: s.titles, modelOk: !m.error, candidates: settled.record };
+}
+
+// ---- repair ------------------------------------------------------------------
+async function repairLoop(first) {
+  const repairs = [];
+  let cur = first;
+  const skeleton = read(SKELETON);
+  if (!skeleton) { log("no skeleton on disk; cannot re-assemble, so no repair"); return { cur, repairs }; }
+  const slots = R.slotIds(skeleton);
+
+  for (let round = 1; round <= maxRepairs; round++) {
+    const todo = cur.findings.filter((f) => f.fix_by === "prose" && f.severity !== "low");
+    if (!todo.length) break;
+    const proseBefore = read(PROSE);
+    const prose = readJson(PROSE);
+    if (!prose) { log("no prose JSON on disk; nothing to repair"); break; }
+
+    const rep = await ask("repair", R.repairPrompt({ facts: factsText(), prose, issues: todo }), R.REPAIR_SCHEMA);
+    if (rep.error) { repairs.push({ round, kept: false, why: `repair unavailable: ${rep.error}` }); break; }
+    const { prose: next, applied, rejected } = R.applyEdits(prose, rep.edits, slots);
+    const entry = { round, applied, rejected, unfixable: rep.unfixable || [], issues: todo.length };
+    if (!applied.length) { repairs.push({ ...entry, kept: false, why: "no edit survived validation" }); break; }
+
+    // Try it: write the prose, re-assemble, re-review. Anything short of a
+    // verified improvement puts the original back.
+    const htmlBefore = read(REPORT);
+    const revert = () => { fs.writeFileSync(PROSE, proseBefore); fs.writeFileSync(REPORT, htmlBefore); };
+    fs.writeFileSync(`/tmp/ds-prose-${date}.pre-repair-${round}.json`, proseBefore);
+    fs.writeFileSync(PROSE, JSON.stringify(next, null, 2));
+    let htmlAfter;
+    try { htmlAfter = assemble(skeleton, next); }
+    catch (e) { revert(); repairs.push({ ...entry, kept: false, why: `assemble failed: ${e.message}` }); break; }
+    fs.writeFileSync(REPORT, htmlAfter);
+
+    const after = await review(htmlAfter);
+    const before = R.scoreFindings(cur.findings), now = R.scoreFindings(after.findings);
+    if (after.modelOk && now < before) {
+      repairs.push({ ...entry, kept: true, score_before: before, score_after: now });
+      cur = after;
+    } else {
+      revert();
+      repairs.push({ ...entry, kept: false, score_before: before, score_after: now,
+        why: after.modelOk ? "findings did not improve" : "could not be verified" });
+      break;
+    }
+  }
+  return { cur, repairs };
+}
+
+// ---- code-owned defects: the record the fix loop works from --------------------
+// A `fork`/`none` finding names a defect in code (resolve-day, the spine, prep).
+// Until 2026-10-16 the playbook said to "put it in the final output", which
+// nothing reads, so the same classes of defect shipped day after day. Each NEW
+// one (by date + detail) is appended to data/daily-summary-defects.jsonl.
+// The FIXER (jobs/daily-summary-fix.md) root-causes and fixes them; only what it
+// gives up on goes to the system channel (`daily-summary-fix done --status
+// gave_up`), so system-issue-review never races the fixer on the same bug.
+function recordCodeDefects(findings) {
+  if (process.env.DS_REVIEW_NO_ROUTE) return; // tests set it; an empty string records
+  const ROOT = path.join(__dirname, "..");
+  const ledger = process.env.DS_REVIEW_DEFECTS_LEDGER || path.join(ROOT, "data/daily-summary-defects.jsonl");
+  // A review that could not run is a hole in the review, not a defect in the code;
+  // so is a candidate it could not settle (`unconfirmed`): it stays in the result
+  // for the fix loop, and is recorded here only once the model calls it absent.
+  const code = findings.filter((f) => (f.fix_by === "fork" || f.fix_by === "none") && f.severity !== "low" && !f.review_hole && !f.unconfirmed);
+  if (!code.length) return;
+  const seen = new Set();
+  try {
+    for (const l of fs.readFileSync(ledger, "utf8").split("\n")) {
+      if (!l.trim()) continue;
+      try { const j = JSON.parse(l); seen.add(`${j.date}|${j.detail}`); } catch {}
+    }
+  } catch {}
+  const fresh = code.filter((f) => !seen.has(`${date}|${f.detail}`));
+  if (!fresh.length) return;
+  const now = new Date().toISOString();
+  try {
+    fs.appendFileSync(ledger, fresh.map((f) => JSON.stringify({ ts: now, date, kind: f.kind, severity: f.severity,
+      fix_by: f.fix_by, from: f.from || "code", headline: f.headline || null, detail: f.detail, fix: f.fix })).join("\n") + "\n");
+  } catch (e) { log(`could not write the defects ledger: ${e.message}`); }
+}
+
+// ---- main --------------------------------------------------------------------
+(async () => {
+  if (!noModel) { await loadPhotos(); await loadPriorCalls(); }
+  let cur = await review(read(REPORT));
+  let repairs = [];
+  if (repair) ({ cur, repairs } = await repairLoop(cur));
+
+  const findings = cur.findings;
+  const blocking = findings.filter((f) => f.severity === "high" && f.fix_by !== "none").length;
+  const result = {
+    date,
+    verdict: blocking > 0 ? "revise" : (findings.length ? "publish_with_notes" : "publish"),
+    // The fix loop's gate (2026-10-17): the day is CONFIRMED only when no high or
+    // medium issue remains, whoever owns it. A review that could not run never
+    // confirms. Not confirmed → jobs/daily-summary-fix.md takes over.
+    confirmed: !noModel && !unavailableReason && !findings.some((f) => f.severity === "high" || f.severity === "medium"),
+    reviewer: noModel ? "none (structural only)" : `${modelName} ${effort}`,
+    independent_review: noModel ? "skipped" : (unavailableReason ? "unavailable" : "ok"),
+    stops_in_report: cur.titles.length,
+    findings,
+    // Every place code could not match, and what the review made of it.
+    ...(cur.candidates && cur.candidates.length ? { candidates: cur.candidates } : {}),
+    ...(repair ? { repairs } : {}),
+    elapsed_sec: Math.round((Date.now() - startedAt) / 1000),
+  };
+  process.stdout.write(JSON.stringify(result, null, 1) + "\n");
+  fs.writeFileSync(`/tmp/ds-review-${date}.json`, JSON.stringify(result, null, 1));
+  recordCodeDefects(findings);
+  process.exit(blocking > 0 ? 3 : 0);
+})().catch((e) => { console.error(e && e.stack || e); process.exit(1); });

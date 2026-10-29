@@ -1,0 +1,210 @@
+#!/usr/bin/env python3
+"""stop-map — a picture of ONE stop, for the question that asks about it.
+
+WHY. An answer ("Just browsing the market") was stored as a place name and
+later re-applied to an evening dog walk. An answer like that means the
+question was not clear: a question about a stop carries a map of the route or
+location, so it is easy to see what the question is truly about.
+
+A time window and a street name ask the user to reconstruct which stretch of
+the day we mean before answering. A map of the trace shows it: grey for the way
+in, orange for the stop itself, dashed grey for the way out, with a pin where
+the user rested. Pure geometry (Rule #0b) — nothing here reads language.
+
+Same renderer as place-map / day-path (headless Chrome + Leaflet, Esri light
+canvas), same public bucket. Content-addressed, so asking twice about one
+visit renders once.
+
+Usage:
+  stop-map --visit <location_history id> [--tz Asia/Jerusalem] [--upload] [--json]
+  stop-map --start <ISO> --end <ISO> [--tz …] [--upload]     # a route (walk/drive)
+
+Prints the public URL with --upload, else the local PNG path. Exits non-zero
+on any failure — callers treat the map as optional and send the question
+without it.
+"""
+import argparse
+import hashlib
+import json
+import math
+import os
+import subprocess
+import sys
+import tempfile
+import urllib.parse
+import urllib.request
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
+
+HERE = os.path.dirname(os.path.realpath(globals().get("__file__") or sys.argv[0]))
+sys.path.insert(0, os.path.join(HERE, "..", "lib"))
+import places_local  # noqa: E402
+
+REPO = places_local.install_root()
+ENV_FILE = os.path.join(REPO, ".env")
+TEMPLATE = os.path.join(HERE, "..", "lib", "stop-map.template.html")
+CHROME = os.environ.get("JORI_CHROME_BIN") or "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+
+
+def supabase_url():
+    """SUPABASE_URL, else https://<instance supabase_project>.supabase.co, else ""."""
+    if os.environ.get("SUPABASE_URL"):
+        return os.environ["SUPABASE_URL"].rstrip("/")
+    inst = places_local._read(os.path.join(places_local.local_dir(), "instance.json")) or {}
+    proj = os.environ.get("JORI_SUPABASE_PROJECT") or inst.get("supabase_project") or ""
+    return f"https://{proj}.supabase.co" if proj else ""
+
+
+SUPABASE_URL = supabase_url()
+MAP_BUCKET, MAP_PREFIX = "daily-photos", "stop-maps"
+WIDTH, HEIGHT = 520, 416        # see place-map: tuned for basemap label legibility
+CONTEXT_MIN = 25                # approach/exit drawn on either side of the stop
+ACC_MAX_M = 60                  # same gate as the location spine (cell fixes carry no position)
+
+
+def load_key():
+    k = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
+    if k:
+        return k
+    for line in (open(ENV_FILE) if os.path.exists(ENV_FILE) else []):
+        if line.startswith("SUPABASE_SERVICE_ROLE_KEY="):
+            return line.split("=", 1)[1].strip().strip('"').strip("'")
+    sys.exit("stop-map: no SUPABASE_SERVICE_ROLE_KEY")
+
+
+def get(path, key):
+    req = urllib.request.Request(f"{SUPABASE_URL}/rest/v1/{path}",
+                                 headers={"apikey": key, "Authorization": f"Bearer {key}"})
+    with urllib.request.urlopen(req, timeout=30) as r:
+        return json.load(r)
+
+
+def ts(s):
+    return datetime.fromisoformat(s.replace("Z", "+00:00"))
+
+
+def fixes(lo, hi, key):
+    qs = urllib.parse.urlencode({
+        "select": "latitude,longitude,accuracy_m,arrived_at",
+        "segment_type": "eq.transit",
+        "arrived_at": f"gte.{lo.isoformat()}",
+        "and": f"(arrived_at.lt.{hi.isoformat()})",
+        "order": "arrived_at.asc", "limit": "3000"})
+    rows = get(f"location_history?{qs}", key) or []
+    return [r for r in rows if r.get("latitude") is not None
+            and (r.get("accuracy_m") is None or r["accuracy_m"] <= ACC_MAX_M)]
+
+
+def build(visit, tz, key):
+    arr, dep = ts(visit["arrived_at"]), ts(visit["departed_at"])
+    rows = fixes(arr - timedelta(minutes=CONTEXT_MIN), dep + timedelta(minutes=CONTEXT_MIN), key)
+    pt = lambda r: [round(r["latitude"], 6), round(r["longitude"], 6)]
+    before = [pt(r) for r in rows if ts(r["arrived_at"]) < arr]
+    during = [pt(r) for r in rows if arr <= ts(r["arrived_at"]) <= dep]
+    after = [pt(r) for r in rows if ts(r["arrived_at"]) > dep]
+    stop = [round(visit["latitude"], 6), round(visit["longitude"], 6)]
+    # Join the pieces so the line is continuous through the stop.
+    if before:
+        before.append(during[0] if during else stop)
+    if after:
+        after.insert(0, during[-1] if during else stop)
+    a, d = arr.astimezone(tz), dep.astimezone(tz)
+    mins = round((dep - arr).total_seconds() / 60)
+    label = f"{a:%a} {a:%H:%M}–{d:%H:%M} · {mins} min"
+    return stop, before, during, after, label
+
+
+def build_window(start, end, tz, key):
+    """A ROUTE, not a stop: the trace inside [start, end] in the stop colour,
+    with the pin where it began. Used for walk/drive questions (no visit row)."""
+    rows = fixes(start - timedelta(minutes=5), end + timedelta(minutes=1), key)
+    pt = lambda r: [round(r["latitude"], 6), round(r["longitude"], 6)]
+    before = [pt(r) for r in rows if ts(r["arrived_at"]) < start]
+    during = [pt(r) for r in rows if start <= ts(r["arrived_at"]) <= end]
+    if not during:
+        raise RuntimeError("no usable fixes in the window")
+    if before:
+        before.append(during[0])
+    a, d = start.astimezone(tz), end.astimezone(tz)
+    mins = round((end - start).total_seconds() / 60)
+    return during[0], before, during, [], f"{a:%a} {a:%H:%M}–{d:%H:%M} · {mins} min"
+
+
+def render(stop, before, during, after, label, out_png):
+    src = open(TEMPLATE).read()
+    esc = lambda s: s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    for token, val in (("__STOP__", json.dumps(stop)), ("__BEFORE__", json.dumps(before)),
+                       ("__DURING__", json.dumps(during)), ("__AFTER__", json.dumps(after)),
+                       ("__LABEL__", esc(label))):
+        src = src.replace(token, val)
+    with tempfile.NamedTemporaryFile("w", suffix=".html", delete=False) as fh:
+        fh.write(src)
+        html = fh.name
+    # Explicit throwaway profile: otherwise headless Chrome leaks a scoped_dir
+    # profile + cache under ~/Library on every render (same fix as place-map).
+    try:
+        with tempfile.TemporaryDirectory(prefix="stop-map-chrome-", ignore_cleanup_errors=True) as profile:
+            subprocess.run([CHROME, "--headless=new", "--use-mock-keychain", "--disable-gpu", "--hide-scrollbars",
+                            f"--user-data-dir={profile}", f"--disk-cache-dir={profile}/cache",
+                            f"--window-size={WIDTH},{HEIGHT}", "--virtual-time-budget=15000",
+                            f"--screenshot={out_png}", f"file://{html}"],
+                           check=True, capture_output=True, timeout=90)
+    finally:
+        os.unlink(html)
+    # A tile-less frame compresses to almost nothing; a map with no map on it is
+    # worse than no image (same floor as place-map).
+    if not os.path.exists(out_png) or os.path.getsize(out_png) < 15000:
+        raise RuntimeError("chrome produced no usable screenshot (tiles missing?)")
+
+
+def upload(png, obj, key):
+    url = f"{SUPABASE_URL}/storage/v1/object/{MAP_BUCKET}/{MAP_PREFIX}/{obj}.png"
+    req = urllib.request.Request(url, data=open(png, "rb").read(), method="POST", headers={
+        "apikey": key, "Authorization": f"Bearer {key}", "Content-Type": "image/png",
+        "x-upsert": "true", "cache-control": "public, max-age=31536000, immutable"})
+    with urllib.request.urlopen(req, timeout=60) as r:
+        if r.status not in (200, 201):
+            raise RuntimeError(f"upload failed: {r.status}")
+    return f"{SUPABASE_URL}/storage/v1/object/public/{MAP_BUCKET}/{MAP_PREFIX}/{obj}.png"
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--visit")
+    ap.add_argument("--start", help="ISO start of a route window (with --end, instead of --visit)")
+    ap.add_argument("--end")
+    ap.add_argument("--tz", default="UTC")
+    ap.add_argument("--upload", action="store_true")
+    ap.add_argument("--json", action="store_true")
+    a = ap.parse_args()
+    key = load_key()
+    if a.start and a.end:
+        stop, before, during, after, label = build_window(ts(a.start), ts(a.end), ZoneInfo(a.tz), key)
+    elif a.visit:
+        rows = get(f"location_history?id=eq.{urllib.parse.quote(a.visit)}"
+                   "&select=id,latitude,longitude,arrived_at,departed_at", key)
+        if not rows or not rows[0].get("departed_at"):
+            sys.exit(f"stop-map: no closed visit {a.visit}")
+        stop, before, during, after, label = build(rows[0], ZoneInfo(a.tz), key)
+    else:
+        sys.exit("stop-map: need --visit or --start/--end")
+    obj = hashlib.sha256(json.dumps([stop, before, during, after, label, WIDTH, HEIGHT])
+                         .encode()).hexdigest()[:16]
+    png = os.path.join(tempfile.gettempdir(), f"stop-map-{obj}.png")
+    render(stop, before, during, after, label, png)
+    out = upload(png, obj, key) if a.upload else png
+    if a.json:
+        # The trace itself rides along for the client's full-screen map
+        # (ChoicePrompt § subject.path): an interactive map needs coordinates,
+        # not a picture. Thinned to keep the message metadata small.
+        thin = lambda pts, n=120: pts if len(pts) <= n else [pts[round(i * (len(pts) - 1) / (n - 1))] for i in range(n)]
+        print(json.dumps({"url" if a.upload else "path": out, "label": label,
+                          "fixes": {"before": len(before), "during": len(during), "after": len(after)},
+                          "trace": {"stop": stop, "before": thin(before), "during": thin(during),
+                                    "after": thin(after)}}))
+    else:
+        print(out)
+
+
+if __name__ == "__main__":
+    main()

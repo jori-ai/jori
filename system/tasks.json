@@ -1023,6 +1023,260 @@
       ],
       "description": "For each recurring meeting in agent/local/config/meetings.json: find today's occurrence on the calendar, update the meeting's state file and its crontab-safe reminder lines. Off with no meetings configured.",
       "job": null
+    },
+    {
+      "name": "photos-daily",
+      "schedule": "0 3 * * *",
+      "schedule_human": "Daily at 3:00 AM the user's local time (cron-tz-sync rewrites the crontab fields nightly)",
+      "trigger_script": "agent/scripts/trigger-photos-daily.sh",
+      "webhook_url": null,
+      "webhook_task": null,
+      "ops_playbook_section": "photos-daily",
+      "delivers_to": "none",
+      "phrases": [
+        "photos daily",
+        "daily photos",
+        "index photos"
+      ],
+      "description": "Index yesterday's (local) Apple Photos into Supabase and link to location segments, backfill companions, synthesize missed stops, and repair stale-render days (ledger: normal → SILENT → give up). Direct cron script, no webhook or agent turn. Failures to the system channel; success silent.",
+      "job": "photos-daily"
+    },
+    {
+      "name": "photos-backfill-thumbs",
+      "schedule": "15 3 * * *",
+      "schedule_human": "Daily at 3:15 AM the user's local time (15 min after photos-daily, 45 min before daily-summary)",
+      "trigger_script": "agent/scripts/trigger-photos-backfill-thumbs.sh",
+      "webhook_url": null,
+      "webhook_task": null,
+      "ops_playbook_section": null,
+      "delivers_to": "supabase",
+      "phrases": [
+        "backfill thumbs",
+        "warm photo thumbs"
+      ],
+      "description": "Pre-warm yesterday's photo thumbs in Supabase so daily-summary hits warm URLs instead of cold osxphotos exports."
+    },
+    {
+      "name": "photos-intraday",
+      "schedule": "15,45 * * * *",
+      "schedule_human": "Every 30 min at :15/:45, no time-of-day window",
+      "trigger_script": "agent/scripts/trigger-photos-intraday.sh",
+      "delivers_to": "none",
+      "phrases": [
+        "photos intraday",
+        "intraday photo sync",
+        "today's photos sync"
+      ],
+      "description": "Sync today's photos every 30 min, then backfill companions (2h lookback) and synthesize today's stops, so same-day stops/companions surface before the 03:00 photos-daily pass. Direct cron script, no webhook or agent turn. Silent — logs to watchdog.log. Kill switch data/.photos-intraday-off.",
+      "job": null,
+      "webhook_task": null,
+      "webhook_url": null
+    },
+    {
+      "name": "companion-presence",
+      "schedule": "8-59/10 * * * *",
+      "schedule_human": "Every 10 min at :08/:18/..., around the clock",
+      "trigger_script": "agent/scripts/trigger-companion-presence.sh",
+      "delivers_to": "none",
+      "phrases": [
+        "companion presence",
+        "who was with me"
+      ],
+      "description": "One Find My reading per shared person every 10 min, compared with the user's own GPS trail at the reading's timestamp; whoever was with the user across a visit row is added to location_history.companions, which resolve-day carries onto the day's stops. Names on still-open rows stay provisional; it never removes a name it did not add (wrong add: companion-presence untag). Direct cron script. Silent: data/logs/companion-presence.log. Kill switch data/.companion-presence-off. Query: companion-presence show|who.",
+      "job": "companion-presence",
+      "webhook_task": null,
+      "webhook_url": null
+    },
+    {
+      "name": "daily-summary",
+      "schedule": "0 4 * * *",
+      "schedule_human": "Daily at 4:00 AM the user's local time (cron-tz-sync rewrites the home-zone fields nightly)",
+      "trigger_script": "agent/scripts/trigger-daily-summary.sh",
+      "webhook_url": "http://localhost:9092",
+      "webhook_task": "DAILY SUMMARY",
+      "ops_playbook_section": null,
+      "delivers_to": "email",
+      "phrases": [
+        "daily summary",
+        "day summary",
+        "yesterday summary",
+        "my day",
+        "day recap"
+      ],
+      "description": "Narrative of the day that just ended — wake time, places, travel, meals, work, conversations, events — with photos embedded inline at the segment where they were taken. Persists structured row in daily_summaries. Replaced the location-narrative portion of the old location-daily + nightly-review (the self-improvement memo is still in nightly-review, now weekly).",
+      "job": "daily-summary"
+    },
+    {
+      "name": "daily-summary-fix",
+      "schedule": "52 * * * *",
+      "schedule_human": "On demand when a day's review is not confirmed; hourly at :52 a sweep re-queues days whose question the user has since answered",
+      "trigger_script": "agent/scripts/trigger-daily-summary-fix.sh",
+      "cron_label": "daily-summary-fix-sweep",
+      "webhook_url": null,
+      "webhook_task": null,
+      "ops_playbook_section": null,
+      "delivers_to": "jori",
+      "phrases": [
+        "daily summary fix",
+        "fix the day summary",
+        "summary is wrong",
+        "rebuild the summary",
+        "what the review caught"
+      ],
+      "description": "The daily-summary fix loop (2026-10-17). When daily-summary-review does not confirm a day, an ephemeral Opus fixer root-causes each finding, fixes the wording, his records (findme resolve / location-confirm) or the code (self-improve-auto-apply), rebuilds and re-reviews until the reviewer confirms, asks the user in chat when only he can decide (resumes on his answer), and sends the summary with a closing 'What the review caught' section. Also sends a confirmed day the daily-summary run held for its questions (2026-10-20). The email waits for his answers: `daily-summary-fix gate` holds it until every question is answered or the answer window closes (11am his time the next morning, or 3 hours when asked later), and the hourly sweep starts the fixer when the window closes, so the best version goes out then, with a correction once confirmed. Questions composed in his quiet hours (2026-10-27; 01:00-09:00 his current time, agent/local/config/daily-summary-fix.json) are held until he is up (his phone's sleep-night reading, else his chat, from 07:00): the sweep only marks them due, and this launchd runner sends them (`daily-summary-fix release-held`) after its Max sign-in check, since from cron the outbound check cannot sign in; their answer window opens when they go out. State: bin/daily-summary-fix status <date>. See ops-agent/jobs/daily-summary-fix.md. Cost (2026-10-22): the fixer stays Opus at xhigh for the fix; its helper agents (triage, evidence, reading his answers, code search) run on Sonnet at low effort and the code-fix critic on Opus at medium (playbook § Helpers; the trigger exports CLAUDE_CODE_SUBAGENT_MODEL from models.env).",
+      "job": "daily-summary-fix",
+      "runtime": "launchd-script",
+      "launchd_label": "ai.claude.daily-summary-fix",
+      "script": "agent/scripts/trigger-daily-summary-fix.sh"
+    },
+    {
+      "name": "location-confirm",
+      "schedule": "*/10 * * * *",
+      "schedule_human": "Every 10 minutes — ask about unconfirmed dwells ≥20 min",
+      "trigger_script": "agent/scripts/trigger-location-confirm.sh",
+      "webhook_url": null,
+      "webhook_task": null,
+      "ops_playbook_section": null,
+      "delivers_to": "jori",
+      "phrases": [
+        "location confirm",
+        "where am i",
+        "confirm location"
+      ],
+      "description": "Every 10 minutes, runs `location-current-stop` to detect if the user is currently dwelling ≥20 min at a venue the algorithm can't confidently name. Skips when (a) primary source is named_location/confirmed_stop/known_recurring/wifi_ssid, (b) confidence ≥0.90, or (c) photo evidence pushes a ≥0.80 candidate to ≥0.90. Honors quiet windows (sleep 00–09 + active calendar event) by queueing into pending-asks.json and draining when the window ends. Anti-spams by (date, rounded centroid). Phrases the ask in natural language via local Gemma (bin/location-confirm-phrase.mjs) and pushes directly via jori-send — zero Anthropic API tokens, no ops-agent dispatch. Confirmations land in confirmed-stops.json and propagate to all future stops within 30 m at conf 0.95.",
+      "job": "location-confirm-ask"
+    },
+    {
+      "name": "location-enrich",
+      "schedule": "*/15 * * * *",
+      "schedule_human": "Every 15 minutes",
+      "trigger_script": "agent/scripts/trigger-location-enrich.sh",
+      "webhook_url": "http://localhost:9092",
+      "webhook_task": "LOCATION ENRICH",
+      "ops_playbook_section": "location-enrich",
+      "delivers_to": "jori",
+      "phrases": [
+        "location enrich",
+        "enrich location"
+      ],
+      "description": "Confirm every stop with the user; never silently guess a place. Every 15 min the gate finds stops needing a new ask; code composes them (bin/location-enrich-compose via launchd ai.claude.location-enrich-compose: calendar routing + one batched local-Gemma→Sonnet-low phrasing call, structurally validated) and queues them for hum; each NEW ask also spools a perishable location.ask_ready hum event so hum dispatches as hum:moment within minutes (priority lane) instead of waiting for an unrelated tick, and asks are bounded by askTiming (late = says so, >4h = not asked). The ops agent is dispatched only for the residue in location-enrich-residue.json (a calendar event in the stop window, or nothing phrased validly).",
+      "job": "location-enrich"
+    },
+    {
+      "name": "segment-ask",
+      "schedule": "*/30 * * * *",
+      "schedule_human": "Every 30 minutes",
+      "trigger_script": "agent/scripts/trigger-segment-ask.sh",
+      "delivers_to": "jori",
+      "phrases": [
+        "segment ask",
+        "ask about my stops",
+        "confirm my stops"
+      ],
+      "description": "Ask about a stop while the user can still remember it, instead of reconstructing it at night. Only a wire: `day-segments --write` gives every stop a row (including stops CLVisit never recorded, which is why a 45.7-min cafe stop once had nothing to attach a name to), `stop-identify` decides whether a question is warranted at all (>80% certain -> stay silent), and `choice send` puts tappable options in the chat. Never asks twice about the same ref, answered or not; never touches a user-confirmed row. Brakes: kill switch data/.segment-ask-off, quiet window 23:00-09:00 in the user's reported timezone, and a hard cap of 2 asks per run which it reports rather than silently drops. Age bound (same as askTiming): a stop the user left >45 min ago is asked with a 'Looking back to this morning, around HH:MM' lead; >4h ago or on an earlier day it is not asked (daily summary carries it). A night at the booked lodging is never asked: stop-identify names a 6h+ stay (or one covering 2-6am local) on a booked date as the booking when the user slept within 150 m of it on another night of that booking, or the stop's street address matches the booking's (address-match --booking). Where he is staying is always on offer: a stop within 50 m of the median of the booking's other nights (150 m for a night), or before the first night one whose street address matches the booking's, gets the booking as its first option with no default (the default when no venue is nearby); a whole night no rung could name (not the user's own answers, not a bed he has slept in) and nothing places elsewhere is one tap, 'were you at <booking>?', where a lone cafe used to name it silently.",
+      "job": "segment-ask"
+    },
+    {
+      "name": "location-ambient",
+      "schedule": "*/30 * * * *",
+      "schedule_human": "Every 30 minutes",
+      "trigger_script": "agent/scripts/trigger-location-ambient.sh",
+      "webhook_url": "http://localhost:9092",
+      "webhook_task": "LOCATION AMBIENT",
+      "ops_playbook_section": null,
+      "delivers_to": "jori",
+      "phrases": [
+        "location ambient",
+        "ambient pulse",
+        "ambient insights",
+        "ambient context",
+        "where am i insights",
+        "neighborhood insights"
+      ],
+      "description": "Ambient thought-partner ping when the user stops during a wander through a neighborhood: one nearby place (a restaurant recommendation, a nearby event, or a neighborhood insight) within 150 m of the stop. Max 1 ping per walking session; respects the daily ping budget. Silent runs are fine. Haiku-tier scan job.",
+      "job": "location-ambient",
+      "model": "haiku"
+    },
+    {
+      "name": "live-day",
+      "schedule": "*/10 * * * *",
+      "schedule_human": "Every 10 minutes — refresh the live-day belief structure",
+      "trigger_script": "agent/scripts/trigger-live-day.sh",
+      "webhook_url": null,
+      "webhook_task": null,
+      "ops_playbook_section": null,
+      "delivers_to": null,
+      "phrases": [
+        "live day",
+        "current location",
+        "where am i now",
+        "what am i doing",
+        "today so far"
+      ],
+      "description": "Maintains data/live-day.json — a continuously-evolving belief structure for the user's current day. Calendar events seed intervals at expected start/end times with source=calendar_seed (priors); GPS dwell evidence merges in to confirm or contradict (gps_status: supports/contradicts/missed/no_evidence_yet); user-confirm replies lock the place name absolutely (gps_status=confirmed). Chat signals (regex over today's jori_messages — \"at X\", \"going to X\", \"just left X\", \"had lunch at X\") and Google Tasks completions attach as evidence on the matching interval, populating activity_hint for narrative anchoring. Each interval carries an evidence_log audit trail of how Jori came to its current belief. At day rollover the prior file archives to data/live-day-archive/<YYYY-MM-DD>.json. CLI: `live-day current|show|refresh|at <ISO|HH:MM>|day <date> [--original]|accuracy <date>`. The archive is never rewritten by a correction (2026-10-22): `live-day day <date>` layers his answers and day-corrections on top (lib/day-overlay.js) while `accuracy` keeps grading the original. Future readers (hum, chat-agent, location-confirm) consume this single source of truth instead of re-deriving from raw signals every tick.",
+      "job": "live-day"
+    },
+    {
+      "name": "dream",
+      "schedule": "*/30 * * * *",
+      "schedule_human": "Every 30 min via launchd agent ai.claude.dream; a no-op until a local day has its daily_summaries row and has not been dreamed (oldest of the last 3 first)",
+      "scheduler": "launchd",
+      "trigger_script": "agent/scripts/trigger-dream.sh",
+      "webhook_url": null,
+      "webhook_task": null,
+      "ops_playbook_section": null,
+      "delivers_to": "none",
+      "phrases": [
+        "dream",
+        "the dream",
+        "what did you learn today",
+        "nightly learnings",
+        "digest the day into memory"
+      ],
+      "description": "The DREAM: reads EVERYTHING that happened on a day (daily summary + settled stops, chat both roles, Claude Code typed prompts, sent mail/commits/notes, HealthKit metrics vs his 28-day baseline, workouts, sleep, weather at each place, transactions, photos, travel, hum activity) gathered by bin/dream-prefetch, and turns it into durable wiki learnings (people, places, tastes, decisions, corrections, outcomes, cross-day patterns) plus up to 3 ideas and 3 questions for the hum via hum-ideas-append. Ephemeral Opus (JORI_MODEL_OPUS, xhigh). Silent. Added 2026-10-15.",
+      "job": "dream"
+    },
+    {
+      "name": "dream-deep",
+      "schedule": "*/30 * * * *",
+      "schedule_human": "Weekly: launchd ai.claude.dream-deep ticks every 30 min and runs when the last deep dream is >=7 days old, it is 02:00-08:00 on the host, and yesterday's nightly dream is done",
+      "scheduler": "launchd",
+      "trigger_script": "agent/scripts/trigger-dream-deep.sh",
+      "webhook_url": null,
+      "webhook_task": null,
+      "ops_playbook_section": null,
+      "delivers_to": "none",
+      "phrases": [
+        "deep dream",
+        "long view",
+        "what is the user like lately",
+        "long-term trends",
+        "likes and dislikes",
+        "patterns over time"
+      ],
+      "description": "The DEEP DREAM: weekly long view over the last 90 days (bin/dream-deep-prefetch: places recent-vs-prior, rhythm, companions, weather, health trends, spending drifts, his chat words, hum replies/reactions, show verdicts, photos, nightly dreams' learnings and set-asides) to find likes, dislikes, drifts and rhythms; writes them to subject pages and rewrites the user_long_view portrait; questions go to the hum via the dream_asks lane. Ephemeral Opus, xhigh. Silent. Added 2026-10-15.",
+      "job": "dream-deep"
+    },
+    {
+      "name": "finance-property-review",
+      "schedule": "40 7 16 * *",
+      "schedule_human": "16th of each month at 7:40 AM local",
+      "trigger_script": "agent/scripts/trigger-finance-property-review.sh",
+      "webhook_url": "http://localhost:9082",
+      "webhook_task": "FINANCE PROPERTY REVIEW",
+      "ops_playbook_section": null,
+      "delivers_to": "jori",
+      "phrases": [
+        "property review",
+        "monthly property review",
+        "per-property p&l",
+        "property p&l",
+        "how did the properties do",
+        "real estate review",
+        "schedule e"
+      ],
+      "description": "Monthly per-property real-estate review: P&L by Schedule-E category per property, month-over-month and year-over-year, short-term vs long-term comparison, rent-roll collection vs the signed leases, reconciliation health (unclassified rows), reserves, security deposits and yield on value/cost. Reports the last CLOSED month, and runs on the 16th so every rent for that month has settled before the collection check reads it. The monthly half of the split with the weekly finance review, which stays on liquidity/accuracy/anomalies. Needs the rental books (agent/local/config/rentals.json); without them the trigger dispatches nothing. READ-ONLY. Playbook: agent/ops-agent/jobs/finance-property-review.md.",
+      "job": "finance-property-review"
     }
   ]
 }

@@ -1,0 +1,106 @@
+#!/usr/bin/env python3
+"""location-route-answer — record the user's answer to a walk/drive question.
+
+The tap on a route card ("Yes — evening walk with <companion>") lands here
+from lib/choice-reply.mjs, without an agent turn. Two writes, both needed:
+
+  1. `location-annotate` over the window — the long-standing contract for a
+     hum yes/no walk answer (companions + note on the samples, settles any
+     visit rows inside so findme enrich stops asking).
+  2. A `non-stop` VISIT row carrying the user's words for the whole window.
+     That is what makes the walk a slot in the daily summary: resolve-day's
+     addDescribedNonStops turns described non-stop rows into a movement entry
+     (a walk vanished from the day when its only rows were relabelled and
+     nothing else carried the description).
+
+Usage:
+  location-route-answer --start <ISO> --end <ISO> --note "Evening walk with <companion>"
+                        [--companion <name>] [--lat L --lon L]
+"""
+import argparse
+import json
+import os
+import subprocess
+import sys
+import urllib.parse
+import urllib.request
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+sys.path.insert(0, os.path.join(HERE, "..", "lib"))
+import places_local  # noqa: E402
+import supabase_local  # noqa: E402
+
+# The phone's device id on the rows it writes (location_history.device_id).
+DEVICE_ID = f"{places_local.instance()['owner_id']}-iphone"
+
+
+def req(path, method="GET", body=None):
+    k, base = supabase_local.service_key(), supabase_local.supabase_url()
+    if not k or not base:
+        sys.exit("location-route-answer: no Supabase configured (supabase_project / SUPABASE_SERVICE_ROLE_KEY)")
+    h = {"apikey": k, "Authorization": f"Bearer {k}", "Content-Type": "application/json",
+         "Prefer": "return=representation"}
+    r = urllib.request.Request(f"{base}/rest/v1/{path}", method=method, headers=h,
+                               data=json.dumps(body).encode() if body is not None else None)
+    with urllib.request.urlopen(r, timeout=30) as resp:
+        raw = resp.read()
+        return json.loads(raw) if raw else None
+
+
+def first_fix(start, end):
+    qs = urllib.parse.urlencode({"select": "latitude,longitude", "segment_type": "eq.transit",
+                                 "arrived_at": f"gte.{start}", "and": f"(arrived_at.lte.{end})",
+                                 "order": "arrived_at.asc", "limit": "1"})
+    rows = req(f"location_history?{qs}") or []
+    return (rows[0]["latitude"], rows[0]["longitude"]) if rows else (None, None)
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--start", required=True)
+    ap.add_argument("--end", required=True)
+    ap.add_argument("--note", required=True)
+    ap.add_argument("--companion", action="append", default=[])
+    ap.add_argument("--new-companion-authorized", metavar="QUOTE",
+                    help="what the user said about an unfamiliar companion (see location-annotate)")
+    ap.add_argument("--lat", type=float)
+    ap.add_argument("--lon", type=float)
+    ap.add_argument("--annotate-only", action="store_true",
+                    help="place/event answers: tag the window, no movement row")
+    a = ap.parse_args()
+
+    cmd = [os.path.join(HERE, "location-annotate"), "--start", a.start, "--end", a.end,
+           "--note", a.note]
+    for c in a.companion:
+        cmd += ["--companion", c]
+    if a.new_companion_authorized:
+        cmd += ["--new-companion-authorized", a.new_companion_authorized]
+    if not os.path.exists(cmd[0]):
+        sys.exit("location-route-answer: location-annotate is not installed")
+    ann = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+    if ann.returncode == 4:
+        # An unfamiliar companion name: location-annotate wrote nothing, so this
+        # must not write the visit row (it would carry the same name).
+        print(f"location-route-answer: {ann.stderr.strip()}", file=sys.stderr)
+        sys.exit(4)
+    if ann.returncode != 0:
+        print(f"location-annotate failed: {ann.stderr[-300:]}", file=sys.stderr)
+
+    if a.annotate_only:
+        print(json.dumps({"row": None, "annotated": ann.returncode == 0}))
+        return
+    lat, lon = (a.lat, a.lon) if a.lat is not None and a.lon is not None else first_fix(a.start, a.end)
+    if lat is None:
+        sys.exit("location-route-answer: no position for the window")
+    row = req("location_history", "POST", {
+        "segment_type": "visit", "place_type": "non-stop", "place_name": a.note,
+        "arrived_at": a.start, "departed_at": a.end, "latitude": lat, "longitude": lon,
+        "device_id": DEVICE_ID, "source": "route-answer",
+        "companions": a.companion or None,
+        "notes": "the user's answer to a route card (location-route-answer)",
+    })
+    print(json.dumps({"row": (row or [{}])[0].get("id"), "annotated": ann.returncode == 0}))
+
+
+if __name__ == "__main__":
+    main()

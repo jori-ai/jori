@@ -1,0 +1,14 @@
+{
+  "notes": "lib/photo-place-name.js nameStopsFromPhotoText — the text Apple Photos read out of a photo the user took at an unnamed stop (an UNORDERED word bag), plus the places near it: does that text name one of those places as the venue the user was at? Jev cannot write a name, so it CHOOSES: c0..cN (a nearby place), `unlisted` (the words name a venue that isn't on the list — the legacy model read spells it), or `none` (no venue named). A pick still has to pass groundedInPhoto (every substantial word of the name in the bag). `unlisted` and low confidence fall to legacy. Legacy (shadow + fallback) = the model read in the same file. Agreement = same PLACE: same name (case-insensitive), or legacy's `listed` (the list entry it says it means) equals Jev's pick, which is how a venue listed in one script under a sign in another agrees with itself; null = null. Threshold 0.8: a café sign read 0.85 and fell on either side of 0.85 run to run; a list pick must still pass groundedInPhoto or sit within 75 m, so 0.8 is guarded.",
+  "threshold": 0.8,
+  "shadow_until": "",
+  "questions": {},
+  "venue_template": {
+    "type": "choice",
+    "instructions": "`photo_lines`, when present, are the lines of text read off a photo {{owner_name}} took while stopped somewhere, in order, as they appear on the signs. `photo_words` is the same photo's text as an unordered, lowercased bag that mixes the venue's own signage with menus, slogans, street signs, other shops across the street and OCR errors. `photo_labels` say what the photo shows. `nearby_places` are real places near where {{owner_name}} stood. Do the photo's words name the venue {{owner_name}} was AT? Pick that place's id only if the words actually spell its name (a distinctive proper noun, often repeated or in a social handle) — never because it is close, or because a generic word like coffee or bar matches. Pick unlisted if the words clearly name a venue that is not on the list. Pick none if they name no venue: only generic words, streets, cities, or brands being sold.",
+    "fixed_criteria": {
+      "unlisted": "the words clearly name the venue, but it is not one of the nearby places",
+      "none": "the words do not name a venue: generic words only, streets or cities, or brands being sold rather than the seller"
+    }
+  }
+}

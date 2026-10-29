@@ -1,0 +1,183 @@
+#!/usr/bin/env python3
+"""location-pattern — find habitual location for a time-of-day / day-of-week.
+
+Analyzes N weeks of location_history to find where the user is typically
+at a given time window, in the home time zone (instance tz). Useful for
+"where am I usually at 6pm on Wednesdays?" context. Named places come from
+data/named-locations.json (lib/named_places.py).
+
+Usage:
+  location-pattern --hour 18 --dow wed              # 6pm Wednesdays, 4 weeks default
+  location-pattern --time 17:00-19:00 --weekdays    # weekdays 5-7pm
+  location-pattern --now                            # current time window (± 1h, same dow)
+  location-pattern --hour 9 --weeks 8               # 9am any day, 8 weeks
+"""
+
+import sys
+import os
+import json
+import re
+import urllib.parse
+from zoneinfo import ZoneInfo
+from datetime import datetime, timedelta, timezone
+from collections import defaultdict
+from typing import List, Dict, Any, Optional, Tuple
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "lib"))
+import named_places  # noqa: E402
+import supabase_local  # noqa: E402
+
+HOME_TZ = ZoneInfo(supabase_local.home_tz())
+
+DOW_MAP = {"mon": 0, "tue": 1, "wed": 2, "thu": 3, "fri": 4, "sat": 5, "sun": 6}
+CLUSTER_KM = 0.15
+
+
+haversine_km = named_places.haversine_km
+
+
+def match_named(lat: float, lon: float, entries=None) -> Optional[str]:
+    for loc in (named_places.load() if entries is None else entries):
+        if haversine_km(lat, lon, loc["lat"], loc["lon"]) <= CLUSTER_KM:
+            return loc["name"]
+    return None
+
+
+def fetch_samples(weeks: int) -> List[Dict[str, Any]]:
+    if not supabase_local.service_key() or not supabase_local.supabase_url():
+        print("ERROR: no Supabase configured (supabase_project / SUPABASE_SERVICE_ROLE_KEY)", file=sys.stderr)
+        sys.exit(1)
+    cutoff = (datetime.now(timezone.utc) - timedelta(weeks=weeks)).isoformat()
+    qs = urllib.parse.urlencode([
+        ("arrived_at", f"gte.{cutoff}"),
+        ("order", "arrived_at.asc"),
+        ("limit", "50000"),
+        ("select", "arrived_at,latitude,longitude"),
+    ])
+    return supabase_local.rest_get(f"location_history?{qs}", timeout=15)
+
+
+def parse_time_range(s: str) -> Tuple[int, int]:
+    # "17:00-19:00" -> (17*60, 19*60)
+    m = re.fullmatch(r"(\d{1,2}):?(\d{2})?-(\d{1,2}):?(\d{2})?", s)
+    if not m:
+        raise ValueError(f"bad time range: {s}")
+    h1, m1, h2, m2 = m.groups()
+    return int(h1)*60 + int(m1 or 0), int(h2)*60 + int(m2 or 0)
+
+
+def cluster_locations(samples: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Cluster samples by proximity, return [{name, lat, lon, count, samples}]."""
+    clusters: List[Dict[str, Any]] = []
+    for s in samples:
+        lat, lon = s["latitude"], s["longitude"]
+        placed = False
+        for c in clusters:
+            if haversine_km(c["lat"], c["lon"], lat, lon) <= CLUSTER_KM:
+                c["count"] += 1
+                c["lat"] = (c["lat"] * (c["count"] - 1) + lat) / c["count"]
+                c["lon"] = (c["lon"] * (c["count"] - 1) + lon) / c["count"]
+                c["samples"].append(s)
+                placed = True
+                break
+        if not placed:
+            clusters.append({
+                "name": match_named(lat, lon),
+                "lat": lat, "lon": lon, "count": 1, "samples": [s]
+            })
+
+    # Resolve names for clusters that didn't match named
+    for c in clusters:
+        if not c["name"]:
+            named = match_named(c["lat"], c["lon"])
+            c["name"] = named or f"{c['lat']:.4f}, {c['lon']:.4f}"
+
+    clusters.sort(key=lambda c: c["count"], reverse=True)
+    return clusters
+
+
+def main():
+    import argparse
+    p = argparse.ArgumentParser(description="Find habitual location for a time window.")
+    p.add_argument("--hour", type=int, help="Hour of day (0-23, home time zone)")
+    p.add_argument("--time", help="Time range in the home time zone, e.g. '17:00-19:00'")
+    p.add_argument("--dow", help="Day of week: mon|tue|wed|thu|fri|sat|sun (comma-separated ok)")
+    p.add_argument("--weekdays", action="store_true", help="Mon-Fri")
+    p.add_argument("--weekends", action="store_true", help="Sat-Sun")
+    p.add_argument("--weeks", type=int, default=4, help="How many weeks back (default 4)")
+    p.add_argument("--now", action="store_true", help="Use current hour ±1h and current day-of-week")
+    args = p.parse_args()
+
+    # Determine time window
+    if args.now:
+        now_home = datetime.now(HOME_TZ)
+        time_start = max(0, now_home.hour * 60 + now_home.minute - 60)
+        time_end = min(24 * 60 - 1, now_home.hour * 60 + now_home.minute + 60)
+        dow_set = {now_home.weekday()}
+    else:
+        if args.time:
+            time_start, time_end = parse_time_range(args.time)
+        elif args.hour is not None:
+            time_start = args.hour * 60
+            time_end = time_start + 60
+        else:
+            time_start, time_end = 0, 24 * 60
+
+        dow_set = set()
+        if args.weekdays:
+            dow_set |= {0, 1, 2, 3, 4}
+        if args.weekends:
+            dow_set |= {5, 6}
+        if args.dow:
+            for d in args.dow.split(","):
+                d = d.strip().lower()[:3]
+                if d in DOW_MAP:
+                    dow_set.add(DOW_MAP[d])
+        if not dow_set:
+            dow_set = set(range(7))
+
+    all_samples = fetch_samples(args.weeks)
+
+    # Filter to time window
+    filtered = []
+    for s in all_samples:
+        if s.get("latitude") is None:
+            continue
+        dt = datetime.fromisoformat(s["arrived_at"].replace("Z", "+00:00")).astimezone(HOME_TZ)
+        if dt.weekday() not in dow_set:
+            continue
+        mins = dt.hour * 60 + dt.minute
+        if not (time_start <= mins <= time_end):
+            continue
+        filtered.append(s)
+
+    clusters = cluster_locations(filtered)
+    total = sum(c["count"] for c in clusters) or 1
+
+    result = {
+        "window": {
+            "time_start_min": time_start,
+            "time_end_min": time_end,
+            "dow": sorted(dow_set),
+            "weeks": args.weeks,
+        },
+        "sample_count": len(filtered),
+        "total_samples_in_history": len(all_samples),
+        "clusters": [
+            {
+                "name": c["name"],
+                "lat": round(c["lat"], 6),
+                "lon": round(c["lon"], 6),
+                "count": c["count"],
+                "share": round(c["count"] / total, 3),
+            }
+            for c in clusters[:10]
+        ],
+        "prediction": clusters[0]["name"] if clusters else None,
+        "confidence": round(clusters[0]["count"] / total, 3) if clusters else 0,
+    }
+    print(json.dumps(result, indent=2))
+
+
+if __name__ == "__main__":
+    main()

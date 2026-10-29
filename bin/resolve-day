@@ -1,0 +1,78 @@
+#!/usr/bin/env node
+// resolve-day — print a ResolvedDay JSON for a given date (home-zone dates).
+//
+// Usage:
+//   resolve-day <YYYY-MM-DD>
+//   resolve-day yesterday
+//   resolve-day today
+//   resolve-day --skip-calendar <YYYY-MM-DD>
+//   resolve-day --tz <IANA> <YYYY-MM-DD>
+//   resolve-day --no-writeback <YYYY-MM-DD>   (never PATCH a visit row; see stop-name-writeback.js)
+//
+// --tz sets the zone the day is cut in AND the default display zone for
+// wake/sleep/stop/travel HH:MM strings. Without it the day-path asks the travel
+// timeline (lib/travel-timezone.js: the metro slug, then a country in the
+// label; the home zone otherwise). The day runs midnight to midnight in that
+// zone, so a day abroad starts at local midnight -- see DAY_BOUNDARY_TZ in
+// lib/resolve-day.js and lib/day-window.js. daily-summary.md passes
+// the zone it looked up; pass --tz explicitly to override.
+//
+// Output: one JSON object to stdout. See lib/resolve-day.js for the
+// schema. This is the deterministic location/classification layer consumed
+// by jobs/daily-summary.md — the narrative is built FROM this JSON, not
+// re-synthesized from raw sources.
+
+"use strict";
+
+const path = require("node:path");
+const { resolveDay } = require(path.join(__dirname, "..", "lib", "resolve-day.js"));
+const { instance } = require(path.join(__dirname, "..", "lib", "instance.cjs"));
+
+function usage(code = 2) {
+  process.stderr.write(
+    "usage: resolve-day <YYYY-MM-DD|yesterday|today> [--skip-calendar] [--tz <IANA>] [--no-writeback]\n",
+  );
+  process.exit(code);
+}
+
+function resolveDateArg(arg) {
+  const now = new Date();
+  const fmt = new Intl.DateTimeFormat("en-CA", {
+    timeZone: instance().tz,
+    year: "numeric", month: "2-digit", day: "2-digit",
+  });
+  if (arg === "today") return fmt.format(now);
+  if (arg === "yesterday") return fmt.format(new Date(now.getTime() - 86400_000));
+  if (/^\d{4}-\d{2}-\d{2}$/.test(arg)) return arg;
+  return null;
+}
+
+async function main() {
+  const args = process.argv.slice(2);
+  if (!args.length || args.includes("-h") || args.includes("--help")) usage(0);
+
+  let skipCalendar = false;
+  let writeBack = process.env.JORI_NAME_WRITEBACK !== "0";
+  let displayTz = null;
+  let dateArg = null;
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a === "--skip-calendar") { skipCalendar = true; continue; }
+    if (a === "--no-writeback") { writeBack = false; continue; }
+    if (a === "--tz") { displayTz = args[++i]; continue; }
+    if (a.startsWith("-")) { process.stderr.write(`resolve-day: unknown flag ${a}\n`); usage(2); }
+    if (!dateArg) { dateArg = a; continue; }
+    usage(2);
+  }
+
+  const date = resolveDateArg(dateArg);
+  if (!date) usage(2);
+
+  const result = await resolveDay(date, { skipCalendar, displayTz, writeBack });
+  process.stdout.write(JSON.stringify(result, null, 2) + "\n");
+}
+
+main().catch((err) => {
+  process.stderr.write(`resolve-day: ${err && err.stack || err}\n`);
+  process.exit(1);
+});

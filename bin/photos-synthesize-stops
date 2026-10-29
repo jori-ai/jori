@@ -1,0 +1,254 @@
+#!/usr/bin/env node
+// photos-synthesize-stops — fill in location_history visits when iOS GPS
+// failed to record a visit but Apple Photos + Google Calendar agree the
+// user was somewhere. Closes a failure mode a nightly review found: a run and
+// a walk produced 0 iOS visits despite physical presence (~1.4km GPS accuracy
+// was the cause).
+//
+// Synthesis rule: cluster photos for the date by time (≤60min gap) and
+// location (≤200m). For each cluster:
+//   - require ≥2 photos
+//   - require at least one photo with GPS coords (use centroid of those)
+//   - require persons (face tags) OR a calendar event covering the window
+//   - require NO existing visit row in location_history overlapping the
+//     cluster window within 300m of centroid
+// If satisfied, INSERT a synthetic visit with:
+//   place_name = calendar event title (if matched) or "(photo-inferred)"
+//   place_type = "photo-synthesized"
+//   segment_type = "visit"
+//   source = "photos+calendar"
+//
+// Window expansion: photo timestamps alone produce a narrow window (e.g. 6s
+// for 3 burst photos). Expand to surrounding non-visit location_history
+// rows within ±30min of the photo span and ≤200m of the cluster centroid,
+// so the visit covers the dwell the GPS tracker actually saw.
+//
+// Usage:
+//   photos-synthesize-stops <YYYY-MM-DD>            # dry-run
+//   DROP=1 photos-synthesize-stops <YYYY-MM-DD>     # commit synthesized rows
+
+import fs from "node:fs";
+import { createRequire } from "node:module";
+import { presentCompanions, taggedPeople } from "../lib/photo-companions.mjs";
+import { execFileSync } from "node:child_process";
+import { loadEnv } from "../lib/load-env.js";
+
+loadEnv();
+
+const require = createRequire(import.meta.url);
+const { instance, supabaseUrl } = require("../lib/instance.cjs");
+const { dayWindow, addDays } = require("../lib/day-window.js");
+
+const SUPABASE_URL = process.env.SUPABASE_URL || supabaseUrl();
+const KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
+const COMMIT = process.env.DROP === "1";
+const CLUSTER_GAP_MIN = 60;
+const CLUSTER_RADIUS_M = 200;
+const VISIT_OVERLAP_RADIUS_M = 300;
+const EXPAND_WINDOW_MIN = 30;
+const EXPAND_RADIUS_M = 200;
+
+const date = process.argv[2];
+if (!/^\d{4}-\d{2}-\d{2}$/.test(date || "")) {
+  console.error("usage: photos-synthesize-stops <YYYY-MM-DD>");
+  process.exit(2);
+}
+if (!KEY || !SUPABASE_URL) {
+  console.error("photos-synthesize-stops: SUPABASE_SERVICE_ROLE_KEY or the Supabase project not set");
+  process.exit(1);
+}
+
+function haversineMeters(lat1, lon1, lat2, lon2) {
+  const toRad = (d) => d * Math.PI / 180;
+  const R = 6371000;
+  const dLat = toRad(lat2 - lat1);
+  const dLon = toRad(lon2 - lon1);
+  const a = Math.sin(dLat / 2) ** 2 + Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon / 2) ** 2;
+  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+}
+
+async function rest(method, path, body) {
+  const res = await fetch(`${SUPABASE_URL}/rest/v1/${path}`, {
+    method,
+    headers: {
+      apikey: KEY,
+      Authorization: `Bearer ${KEY}`,
+      "Content-Type": "application/json",
+      Prefer: method === "POST" ? "return=representation" : "return=minimal",
+    },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  if (!res.ok) {
+    const err = await res.text();
+    throw new Error(`${method} ${path} → ${res.status}: ${err.slice(0, 240)}`);
+  }
+  if (res.status === 204) return null;
+  return res.json();
+}
+
+// The day, midnight to midnight in the home zone.
+const DAY = dayWindow(date);
+const startIso = DAY.start;
+const endIso = DAY.end;
+
+// self_captured=not.is.false keeps photos the user took (true) + older
+// un-resynced rows (null), excludes received ones (false) — their GPS is the
+// sender's: photo location is strong evidence ONLY for self-captured photos.
+const photos = await rest("GET", `photos?select=uuid,taken_at,latitude,longitude,persons,place_name,labels,detected_text,self_captured&taken_at=gte.${encodeURIComponent(startIso)}&taken_at=lt.${encodeURIComponent(endIso)}&order=taken_at.asc&latitude=not.is.null&self_captured=not.is.false`);
+if (!Array.isArray(photos) || photos.length === 0) {
+  console.log(`photos-synthesize-stops: no photos with GPS for ${date}`);
+  process.exit(0);
+}
+
+// The location rows, with half an hour either side of the day.
+const lhWindowStart = new Date(DAY.startMs - 30 * 60000).toISOString();
+const lhWindowEnd = new Date(DAY.endMs + 30 * 60000).toISOString();
+const lhRows = await rest("GET", `location_history?select=arrived_at,departed_at,latitude,longitude,segment_type&arrived_at=gte.${encodeURIComponent(lhWindowStart)}&arrived_at=lt.${encodeURIComponent(lhWindowEnd)}`);
+const visits = (lhRows || []).filter((r) => r.segment_type === "visit");
+const nonVisits = (lhRows || []).filter((r) => r.segment_type !== "visit");
+
+const clusters = [];
+for (const p of photos) {
+  const taken = new Date(p.taken_at).getTime();
+  const last = clusters[clusters.length - 1];
+  if (last) {
+    const gapMin = (taken - new Date(last.photos[last.photos.length - 1].taken_at).getTime()) / 60000;
+    const distM = haversineMeters(last.centroid.lat, last.centroid.lon, p.latitude, p.longitude);
+    if (gapMin <= CLUSTER_GAP_MIN && distM <= CLUSTER_RADIUS_M) {
+      last.photos.push(p);
+      const n = last.photos.length;
+      last.centroid = {
+        lat: (last.centroid.lat * (n - 1) + p.latitude) / n,
+        lon: (last.centroid.lon * (n - 1) + p.longitude) / n,
+      };
+      continue;
+    }
+  }
+  clusters.push({
+    centroid: { lat: p.latitude, lon: p.longitude },
+    photos: [p],
+  });
+}
+
+const candidates = clusters.filter((c) => {
+  // Photos are the PRIMARY location signal — a single self-captured photo IS
+  // a stop (by definition photos form dwells). GPS is
+  // only a secondary corroborator. So NO count/dwell gate: every cluster of
+  // self-captured photos (even one photo) becomes a stop. The photos query
+  // already filtered to self_captured + GPS-present, and clustering keeps each
+  // cluster ≤200m. The only skip below is to avoid duplicating a stop that
+  // already exists in location_history (confirmed/named/prior photo-synth) at
+  // the same place + overlapping time — those get the photos attached downstream.
+  const startMs = new Date(c.photos[0].taken_at).getTime();
+  const endMs = new Date(c.photos[c.photos.length - 1].taken_at).getTime();
+  for (const v of visits || []) {
+    const vStart = new Date(v.arrived_at).getTime();
+    const vEnd = v.departed_at ? new Date(v.departed_at).getTime() : vStart;
+    if (vEnd < startMs || vStart > endMs) continue;
+    if (v.latitude == null || v.longitude == null) continue;
+    const d = haversineMeters(c.centroid.lat, c.centroid.lon, v.latitude, v.longitude);
+    if (d <= VISIT_OVERLAP_RADIUS_M) return false;
+  }
+  return true;
+});
+
+console.log(`photos-synthesize-stops: ${date} — ${photos.length} photos / ${clusters.length} clusters / ${candidates.length} synthesizable`);
+
+let calEvents = [];
+try {
+  // The owner's calendar: JORI_CAL_ACCOUNT, else instance owner_email.
+  const account = process.env.JORI_CAL_ACCOUNT || instance().owner_email;
+  const gog = process.env.GOG_BIN || ["/opt/homebrew/bin/gog", "/usr/local/bin/gog"].find((p) => fs.existsSync(p)) || "gog";
+  const out = execFileSync(gog, ["calendar", "events", `--from=${date}`, `--to=${date}`, "-j",
+    ...(account ? [`--account=${account}`] : []), "--no-input"], { encoding: "utf8", timeout: 6000, stdio: ["ignore", "pipe", "ignore"] });
+  const parsed = JSON.parse(out);
+  calEvents = Array.isArray(parsed) ? parsed : (parsed?.items || []);
+} catch {
+  calEvents = [];
+}
+
+function eventCovering(startMs, endMs) {
+  for (const ev of calEvents) {
+    const evStart = Date.parse(ev.start?.dateTime || ev.start?.date || "");
+    const evEnd = Date.parse(ev.end?.dateTime || ev.end?.date || "");
+    if (!Number.isFinite(evStart) || !Number.isFinite(evEnd)) continue;
+    if (evStart <= endMs && evEnd >= startMs) return ev;
+  }
+  return null;
+}
+
+function expandWindow(c, startMs, endMs) {
+  const lo = startMs - EXPAND_WINDOW_MIN * 60000;
+  const hi = endMs + EXPAND_WINDOW_MIN * 60000;
+  let outStart = startMs;
+  let outEnd = endMs;
+  let matched = 0;
+  for (const r of nonVisits) {
+    if (r.latitude == null || r.longitude == null) continue;
+    const rStart = new Date(r.arrived_at).getTime();
+    const rEnd = r.departed_at ? new Date(r.departed_at).getTime() : rStart;
+    if (rEnd < lo || rStart > hi) continue;
+    const d = haversineMeters(c.centroid.lat, c.centroid.lon, r.latitude, r.longitude);
+    if (d > EXPAND_RADIUS_M) continue;
+    if (rStart < outStart) outStart = rStart;
+    if (rEnd > outEnd) outEnd = rEnd;
+    matched++;
+  }
+  return { startMs: outStart, endMs: outEnd, matched };
+}
+
+let inserted = 0;
+for (const c of candidates) {
+  const photoStart = new Date(c.photos[0].taken_at).getTime();
+  const photoEnd = new Date(c.photos[c.photos.length - 1].taken_at).getTime();
+  const expanded = expandWindow(c, photoStart, photoEnd);
+  let startMs = expanded.startMs;
+  let endMs = expanded.endMs;
+  // A single photo (or a very short burst) still marks a real stop — give it a
+  // minimum visible duration so it renders as a brief stop, not a zero-width point.
+  const MIN_WIDTH_MS = 5 * 60000;
+  if (endMs - startMs < MIN_WIDTH_MS) {
+    const mid = (startMs + endMs) / 2;
+    startMs = Math.round(mid - MIN_WIDTH_MS / 2);
+    endMs = Math.round(mid + MIN_WIDTH_MS / 2);
+  }
+  const ev = eventCovering(startMs, endMs);
+  const placeName = ev?.summary || ev?.title || "(photo-inferred)";
+  // Canonical names, never the user (lib/companions.js), and only
+  // people who were THERE: Jev (site photo-companions) drops a face that is
+  // only pictured — on a screen, in a framed photo, on a poster. On any
+  // failure every tag stands, as before.
+  let companions = [];
+  try {
+    companions = (await presentCompanions({ photos: c.photos, place: placeName, id: c.photos[0].uuid })).present;
+  } catch {
+    companions = [...taggedPeople(c.photos).keys()];
+  }
+  const synthetic = {
+    arrived_at: new Date(startMs).toISOString(),
+    departed_at: new Date(endMs).toISOString(),
+    latitude: c.centroid.lat,
+    longitude: c.centroid.lon,
+    segment_type: "visit",
+    place_name: placeName,
+    place_type: "photo-synthesized",
+    companions,
+    source: ev ? "photos+calendar" : (companions.length ? "photos+companions" : "photos+gps"),
+  };
+  const widthMin = ((endMs - startMs) / 60000).toFixed(1);
+  console.log(`  ${COMMIT ? "INSERT" : "[dry-run]"}  ${synthetic.arrived_at} → ${synthetic.departed_at}  ${placeName}  companions=${companions.join(",")}  (${c.photos.length} photos, ${widthMin}min, +${expanded.matched} GPS rows)`);
+  if (COMMIT) {
+    try {
+      await rest("POST", "location_history", synthetic);
+      inserted++;
+    } catch (e) {
+      console.error(`    insert failed: ${e.message}`);
+    }
+  }
+}
+
+if (!COMMIT) {
+  console.log(`photos-synthesize-stops: dry-run; re-run with DROP=1 to insert`);
+} else {
+  console.log(`photos-synthesize-stops: inserted ${inserted}/${candidates.length} synthesized stops`);
+}
