@@ -150,13 +150,16 @@ struct ChannelBadgeBubble: View {
 }
 
 #if os(macOS)
-/// Mac only: the channels as tabs in the toolbar, each carrying its own count,
-/// so switching is one click and what's waiting is visible without looking at
-/// the sidebar (which stays — it also holds Memory and the approvals).
+/// Mac only: the conversation channels as tabs in the toolbar, each carrying
+/// its own count, so switching is one click and what's waiting is visible
+/// without looking at the sidebar. System and Improvements live only in the
+/// sidebar (with Memory and the approvals).
 ///
-/// Memory isn't a channel, so on Memory no tab is selected; clicking one goes
-/// back to that channel.
+/// On a destination without a tab no tab is selected; clicking one goes back
+/// to that channel.
 struct ChannelTabBar: View {
+    static let channels: [ChatChannel] = [.chat, .questions]
+
     let selection: ChatChannel?
     @ObservedObject var badges: ChannelBadges
     let onSelect: (ChatChannel) -> Void
@@ -165,7 +168,7 @@ struct ChannelTabBar: View {
 
     var body: some View {
         HStack(spacing: 2) {
-            ForEach(ChatChannel.allCases) { channel in
+            ForEach(Self.channels) { channel in
                 ChannelTab(
                     channel: channel,
                     count: badges.count(for: channel),
