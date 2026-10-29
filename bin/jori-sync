@@ -49,6 +49,10 @@ done
 # which both validates the .git tree and resolves any symlinks.
 SELF=$(cd "$(dirname "$0")" && pwd -P)/$(basename "$0")
 SCRIPT_REPO_GUESS=$(cd "$(dirname "$SELF")/.." && pwd -P)
+# The passes run a copy of this script: a pass can move bin/jori-sync itself
+# between the repos (the overlay pull deletes it, the kernel pull adds it back),
+# and the next pass must not exec a path that is briefly gone.
+[ -n "${JORI_SYNC_REPO:-}" ] && SCRIPT_REPO_GUESS="$JORI_SYNC_REPO"
 REPO_ROOT=$(git -C "$SCRIPT_REPO_GUESS" rev-parse --show-toplevel 2>/dev/null) \
   || { echo "jori-sync: $SCRIPT_REPO_GUESS is not a git repo (script self-located from $SELF)" >&2; exit 2; }
 cd "$REPO_ROOT" || exit 2
@@ -70,8 +74,10 @@ loud() { echo "[$TS $HOST] $*"; }
 OVERLAY_GIT="${JORI_OVERLAY_GIT_DIR:-$REPO_ROOT/.overlay.git}"
 if [ -z "${JORI_SYNC_PASS:-}" ] && [ -f "$OVERLAY_GIT/HEAD" ]; then
   rc=0
-  JORI_SYNC_PASS=overlay GIT_DIR="$OVERLAY_GIT" GIT_WORK_TREE="$REPO_ROOT" "$SELF" "$@" || rc=$?
-  JORI_SYNC_PASS=kernel "$SELF" "$@" || { r=$?; [ "$r" -gt "$rc" ] && rc=$r; }
+  RUN=$(mktemp "${TMPDIR:-/tmp}/jori-sync.XXXXXX") && cp "$SELF" "$RUN" && chmod +x "$RUN" || RUN="$SELF"
+  JORI_SYNC_REPO="$REPO_ROOT" JORI_SYNC_PASS=overlay GIT_DIR="$OVERLAY_GIT" GIT_WORK_TREE="$REPO_ROOT" "$RUN" "$@" || rc=$?
+  JORI_SYNC_REPO="$REPO_ROOT" JORI_SYNC_PASS=kernel "$RUN" "$@" || { r=$?; [ "$r" -gt "$rc" ] && rc=$r; }
+  [ "$RUN" != "$SELF" ] && rm -f "$RUN"
   "$REPO_ROOT/bin/jori-overlay" sync-excludes >/dev/null 2>&1 || true
   exit "$rc"
 fi
