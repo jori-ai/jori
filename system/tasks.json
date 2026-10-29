@@ -802,6 +802,26 @@
       ],
       "description": "Nightly ingest of yesterday's daily_summaries row into the wiki as `day_YYYY-MM-DD` (type=day) via `wiki-day-write`. On Monday / 1st-of-month also ingests weekly + monthly rollup pages, then backfills embeddings. Direct cron script, no webhook or agent turn since 2026-10-04; 'yesterday' is the user's local yesterday (local-day). Failures to the system channel. Recallable via `bin/episode`, `wiki_search`, or the wiki HTTP browser at :9096 — episodic and permanent memory share the same `pages` table.",
       "job": "episode-archive"
+    },
+    {
+      "name": "call-log",
+      "schedule": null,
+      "trigger_script": "agent/scripts/trigger-call-log.sh",
+      "ops_playbook_section": "call-log",
+      "delivers_to": "wiki",
+      "phrases": [
+        "call log",
+        "my calls",
+        "what did we talk about on the call",
+        "zoom summary",
+        "call summaries"
+      ],
+      "description": "Logs every call the user hosts on Zoom (not only the recurring meetings'): code finds the ended meetings in the user's room(s) and any meeting a Zoom summary email names, a model writes an English log (summary, one-line points, next steps for the user and for the others) and matches participants to wiki person pages; stored in data/call-log.json, written to each person page's Calls block and the day page, and added to the daily summary. Recurring meetings' calls are left to their notes. Read-only on Zoom and Gmail; messages no one. No agent turn.",
+      "job": "call-log",
+      "runtime": "launchd-script",
+      "launchd_label": "ai.claude.call-log",
+      "script": "bin/call-log",
+      "schedule_human": "Every 30 min on the trigger-context-sync tick (no cron line of its own); prep backstop in the daily summary"
     }
   ]
 }

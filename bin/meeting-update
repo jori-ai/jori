@@ -1,0 +1,238 @@
+#!/bin/bash
+# meeting-update — a recurring meeting's state file (the next call ahead) and its reminder crontab lines.
+# Usage:
+#   meeting-update [--meeting <id>] set "2026-04-04" "10:00" "Europe/Paris" [event_id]
+#   meeting-update [--meeting <id>] clear
+#   meeting-update [--meeting <id>] show
+# The meeting: --meeting, else $MEETING_ID, else the first in agent/local/config/meetings.json.
+# Exit: 0 done (or no meeting configured); 1 usage; 3 refused (a later day's call vs one still ahead);
+#       4 state file written but the crontab left as it was (see crontab-safe).
+
+source "$(dirname "$0")/../agent/scripts/lib/root.sh"
+KDIR="$(cd "$(dirname "$0")/.." && pwd)"
+ARGS=(); MID="${MEETING_ID:-}"
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --meeting) MID="$2"; shift 2 ;;
+    *) ARGS+=("$1"); shift ;;
+  esac
+done
+set -- "${ARGS[@]}"
+
+eval "$("$JORI_NODE" "$KDIR/lib/meetings.mjs" env "$MID")"
+if [ "${MEETING_OK:-0}" != 1 ]; then
+  echo "meeting-update: no recurring meeting configured${MID:+ as $MID} (agent/local/config/meetings.json); nothing to do" >&2
+  exit 0
+fi
+
+STATE_FILE="$MEETING_STATE"
+mkdir -p "$(dirname "$STATE_FILE")"
+CRON_TAG="$MEETING_CRON_TAG"
+REMINDER_SCRIPT="$MEETING_REMINDER_BIN"
+REMINDER_EXTRA="${MEETING_REMINDER_ARGS:+ $MEETING_REMINDER_ARGS}"
+
+# Every crontab change goes through crontab-safe (2026-10-20). The old
+# `crontab -l | grep -v TAG | crontab -` installed whatever the read produced,
+# so a failed or hung `crontab -l` wiped every cron line, from a
+# script that runs each morning. crontab-safe reads the whole crontab under a
+# timeout and installs only "read, minus the tagged lines, plus the new ones";
+# otherwise it changes nothing and this exits 4 after its state-file work.
+# Run through bash, so a lost exec bit can't turn into exit 126.
+CRONTAB_SAFE="$(dirname "$0")/crontab-safe"
+# MEETING_CRONTAB_TIMEOUT (this script family's own knob) reaches crontab-safe as
+# its CRONTAB_SAFE_TIMEOUT; an explicit CRONTAB_SAFE_TIMEOUT still wins.
+export CRONTAB_SAFE_TIMEOUT="${CRONTAB_SAFE_TIMEOUT:-${MEETING_CRONTAB_TIMEOUT:-}}"
+CRON_FAILED=""
+
+clear_cron_reminders() {
+  /bin/bash "$CRONTAB_SAFE" remove "$CRON_TAG" || CRON_FAILED=1
+}
+
+schedule_reminders() {
+  local EPOCH="$1"
+  local MEETING_TIME="$2"
+  local TZ="$3"
+  local NOW
+  NOW=$(date +%s)
+
+  local NEW_CRONS=() SAID=()
+
+  # --- Pre-meeting reminder: T-15 minutes ---
+  local PRE_EPOCH=$((EPOCH - 15 * 60))
+  if [ "$PRE_EPOCH" -gt "$NOW" ]; then
+    local PRE_CRON
+    PRE_CRON=$(python3 -c "
+from datetime import datetime; import zoneinfo
+dt = datetime.fromtimestamp($PRE_EPOCH, zoneinfo.ZoneInfo('$TZ'))
+print(f'{dt.minute} {dt.hour} {dt.day} {dt.month} *')
+")
+    NEW_CRONS+=("$PRE_CRON $REMINDER_SCRIPT pre \"$MEETING_TIME\"$REMINDER_EXTRA $CRON_TAG")
+    SAID+=("Pre-meeting reminder scheduled at $(python3 -c "from datetime import datetime; import zoneinfo; print(datetime.fromtimestamp($PRE_EPOCH, zoneinfo.ZoneInfo('$TZ')).strftime('%H:%M %Z'))")")
+  else
+    SAID+=("Pre-meeting time already passed, skipping")
+  fi
+
+  # --- Pre-call topics: T-40 ---
+  # `prep` kicks the meeting's topics agent (when it has one), whose topics the
+  # T-15 reminder lists.
+  local PREP_EPOCH=$((EPOCH - 40 * 60))
+  if [ "$PREP_EPOCH" -gt "$NOW" ]; then
+    local PREP_CRON
+    PREP_CRON=$(python3 -c "
+from datetime import datetime; import zoneinfo
+dt = datetime.fromtimestamp($PREP_EPOCH, zoneinfo.ZoneInfo('$TZ'))
+print(f'{dt.minute} {dt.hour} {dt.day} {dt.month} *')
+")
+    NEW_CRONS+=("$PREP_CRON $REMINDER_SCRIPT prep \"$MEETING_TIME\"$REMINDER_EXTRA $CRON_TAG")
+  fi
+
+  # --- Post-meeting follow-up: T+60, then T+100 / T+150 / T+240 minutes ---
+  # The first run that finds Zoom's summary of the call folds it into the notes
+  # and sends the post-call message (meeting-notes-from-zoom); that removes the
+  # later lines. The last one sends the plain ask if Zoom never had it.
+  # Without Zoom set up, the T+60 run sends the plain ask.
+  local POST_MIN POST_EPOCH POST_CRON POST_SAID=()
+  for POST_MIN in 60 100 150 240; do
+    POST_EPOCH=$((EPOCH + POST_MIN * 60))
+    [ "$POST_EPOCH" -gt "$NOW" ] || continue
+    POST_CRON=$(python3 -c "
+from datetime import datetime; import zoneinfo
+dt = datetime.fromtimestamp($POST_EPOCH, zoneinfo.ZoneInfo('$TZ'))
+print(f'{dt.minute} {dt.hour} {dt.day} {dt.month} *')
+")
+    NEW_CRONS+=("$POST_CRON $REMINDER_SCRIPT post \"$MEETING_TIME\"$REMINDER_EXTRA $CRON_TAG")
+    POST_SAID+=("$(python3 -c "from datetime import datetime; import zoneinfo; print(datetime.fromtimestamp($POST_EPOCH, zoneinfo.ZoneInfo('$TZ')).strftime('%H:%M %Z'))")")
+  done
+  if [ "${#POST_SAID[@]}" -gt 0 ]; then
+    SAID+=("Post-meeting reminder scheduled at ${POST_SAID[*]}")
+  else
+    SAID+=("Post-meeting time already passed, skipping")
+  fi
+
+  # One read, one install: the previous call's reminder lines out, this call's in.
+  if /bin/bash "$CRONTAB_SAFE" replace "$CRON_TAG" "${NEW_CRONS[@]}"; then
+    printf '%s\n' "${SAID[@]}"
+  else
+    CRON_FAILED=1
+    echo "$MEETING_NAME reminders NOT scheduled: the crontab was not changed. Re-run meeting-calendar-check once crontab -l works." >&2
+  fi
+}
+
+case "$1" in
+  set)
+    DATE="$2"
+    TIME="$3"
+    TZ="${4:-$MEETING_TZ}"
+    EVENT_ID="${5:-null}"
+
+    if [ -z "$DATE" ] || [ -z "$TIME" ]; then
+      echo "Usage: meeting-update [--meeting <id>] set <date> <time> [timezone] [event_id]" >&2
+      echo "  e.g.: meeting-update set 2026-04-04 10:00 Europe/Paris abc123" >&2
+      exit 1
+    fi
+
+    # Convert to epoch
+    EPOCH=$(python3 -c "
+from datetime import datetime
+import zoneinfo
+tz = zoneinfo.ZoneInfo('$TZ')
+dt = datetime.strptime('${DATE}T${TIME}', '%Y-%m-%dT%H:%M').replace(tzinfo=tz)
+print(int(dt.timestamp()))
+" 2>/dev/null)
+
+    if [ -z "$EPOCH" ]; then
+      echo "Failed to compute epoch for $DATE $TIME $TZ" >&2
+      exit 1
+    fi
+
+    if [ "$EVENT_ID" = "null" ]; then
+      EID_JSON="null"
+    else
+      EID_JSON="\"$EVENT_ID\""
+    fi
+
+    # A later day's call never displaces one that is still ahead. The calls are
+    # a recurring series and each day's instance is moved on its own: an
+    # "Updated invitation" that moves FRIDAY's call must not overwrite
+    # THURSDAY's while Thursday's is still on the calendar (and clear its T-15
+    # reminder). An update to another day's instance is not evidence about
+    # today's, so the calendar decides. The state file tracks the next call
+    # ahead, so while that call is still upcoming, only a call on the same
+    # date, or a sooner one, may replace it. A call that is off comes off the
+    # calendar, and then meeting-calendar-check clears it.
+    # MEETING_FORCE=1 overrides.
+    if [ -z "$MEETING_FORCE" ]; then
+      HELD=$(python3 - "$STATE_FILE" "$DATE" "$EPOCH" <<'PY' 2>/dev/null
+import json, sys, time
+try:
+    s = json.load(open(sys.argv[1]))
+except Exception:
+    sys.exit(0)
+held = s.get("epoch_start")
+if (s.get("status") == "scheduled" and isinstance(held, (int, float)) and held > time.time()
+        and s.get("date") and s["date"] != sys.argv[2] and int(sys.argv[3]) > held):
+    print(f'{s["date"]} {s.get("time")} {s.get("timezone")}')
+PY
+)
+      if [ -n "$HELD" ]; then
+        echo "Not changed: the tracked $MEETING_NAME call ($HELD) is still ahead, and $DATE is a later day." >&2
+        echo "  An update for another day's instance does not move this one. If this call itself" >&2
+        echo "  moved or was cancelled, run meeting-calendar-check (it re-reads the calendar)." >&2
+        exit 3
+      fi
+    fi
+
+    # The previous call's reminders are swapped out by schedule_reminders below,
+    # in the same crontab install as the new ones (handles reschedules).
+    cat > "$STATE_FILE" <<EOF
+{
+  "date": "$DATE",
+  "time": "$TIME",
+  "timezone": "$TZ",
+  "epoch_start": $EPOCH,
+  "calendar_event_id": $EID_JSON,
+  "status": "scheduled",
+  "pre_reminder_sent": false,
+  "post_reminder_sent": false,
+  "last_checked": "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+}
+EOF
+    echo "$MEETING_NAME meeting set: $DATE $TIME $TZ (epoch $EPOCH)"
+
+    # Schedule the reminders via cron
+    schedule_reminders "$EPOCH" "$TIME" "$TZ"
+    if [ -n "$CRON_FAILED" ]; then exit 4; fi
+    ;;
+
+  clear)
+    clear_cron_reminders
+
+    cat > "$STATE_FILE" <<EOF
+{
+  "date": null,
+  "time": null,
+  "timezone": "$MEETING_TZ",
+  "epoch_start": null,
+  "calendar_event_id": null,
+  "status": "none_today",
+  "pre_reminder_sent": false,
+  "post_reminder_sent": false,
+  "last_checked": "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+}
+EOF
+    echo "$MEETING_NAME meeting cleared for today."
+    if [ -n "$CRON_FAILED" ]; then
+      echo "$MEETING_NAME reminder lines NOT removed: the crontab was not changed." >&2
+      exit 4
+    fi
+    ;;
+
+  show)
+    cat "$STATE_FILE"
+    ;;
+
+  *)
+    echo "Usage: meeting-update [--meeting <id>] {set|clear|show}" >&2
+    exit 1
+    ;;
+esac

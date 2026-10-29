@@ -1,0 +1,100 @@
+#!/usr/bin/env node
+// meeting-calendar-check — find today's call of each recurring meeting on the
+// calendar and refresh its state file (+ its reminder crontab lines) through
+// bin/meeting-update. Runs from cron each morning (agent/scripts/check-meetings.sh),
+// and from email triage when a meeting's invite is updated or cancelled: it
+// re-reads the calendar instead of trusting a date read from the email.
+//
+// Code, not an agent turn: list today's events through gog with the meeting's
+// home-zone day bounds stated explicitly (a calendar read with no explicit zone
+// once defaulted to another one), find the meeting (lib/meeting-event.mjs: the
+// stored series id first, then its configured words in the title or attendees),
+// then `set` or `clear`.
+//
+// Usage: meeting-calendar-check [--meeting <id>] [--date YYYY-MM-DD] [--dry-run] [--json]
+//   Every configured meeting, or the one named (--meeting, else $MEETING_ID).
+// Exit 0 on a normal run (found or not, or no meeting configured); 2 on a calendar
+// read failure, which leaves that meeting's state untouched rather than clearing it.
+
+import { execFileSync } from "node:child_process";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+import { isMeetingEvent } from "../lib/meeting-event.mjs";
+import { meetings, meeting, knownSeriesId } from "../lib/meetings.mjs";
+import { createRequire } from "node:module";
+
+const HERE = path.dirname(fileURLToPath(import.meta.url));
+const UPDATE = path.join(HERE, "meeting-update");
+const GOG = process.env.GOG_BIN || "gog";
+const ACCOUNT = process.env.JORI_CAL_ACCOUNT || createRequire(import.meta.url)("../lib/instance.cjs").instance().owner_email;
+
+const argv = process.argv.slice(2);
+const dryRun = argv.includes("--dry-run");
+const jsonOut = argv.includes("--json");
+const flag = (n) => { const i = argv.indexOf(n); return i >= 0 ? argv[i + 1] : null; };
+
+function localHHMM(iso, tz) {
+  return new Intl.DateTimeFormat("en-GB", { timeZone: tz, hour: "2-digit", minute: "2-digit", hour12: false }).format(new Date(iso));
+}
+
+/** The day's first live instance of the meeting, or null. Pure. */
+export function pickMeeting(events, m, id) {
+  return (events || [])
+    .filter((e) => e.start?.dateTime && e.status !== "cancelled" && isMeetingEvent(e, m, id))
+    .sort((a, b) => Date.parse(a.start.dateTime) - Date.parse(b.start.dateTime))[0] || null;
+}
+
+// "-04:00" / "-05:00" for that date in `tz`, from the tz database rather than a month rule.
+function tzOffset(date, tz) {
+  const name = new Intl.DateTimeFormat("en-US", { timeZone: tz, timeZoneName: "longOffset" })
+    .formatToParts(new Date(`${date}T12:00:00Z`)).find((p) => p.type === "timeZoneName")?.value || "GMT+00:00";
+  return name.replace("GMT", "") || "+00:00";
+}
+
+function checkOne(m, cache) {
+  const today = flag("--date") || new Intl.DateTimeFormat("en-CA", { timeZone: m.tz }).format(new Date());
+  const off = tzOffset(today, m.tz);
+  const key = `${today}${off}`;
+  let events = cache.get(key);
+  if (!events) {
+    try {
+      const out = execFileSync(GOG, ["calendar", "list", ...(ACCOUNT ? ["--account", ACCOUNT] : []), "--from", `${today}T00:00:00${off}`, "--to", `${today}T23:59:59${off}`,
+        "--max=250", "--json"], { encoding: "utf8", maxBuffer: 16 * 1024 * 1024, timeout: 30_000 });
+      events = JSON.parse(out).events || [];
+      cache.set(key, events);
+    } catch (e) {
+      process.stderr.write(`meeting-calendar-check ${m.id}: calendar read failed (${String(e.message).split("\n")[0]}) — state left as is\n`);
+      return 2;
+    }
+  }
+  const ev = pickMeeting(events, m, knownSeriesId(m));
+  let args;
+  if (ev) {
+    const tz = ev.start.timeZone || m.tz;
+    args = ["set", today, localHHMM(ev.start.dateTime, tz), tz, ev.recurringEventId || ev.id];
+  } else {
+    args = ["clear"];
+  }
+  if (jsonOut) console.log(JSON.stringify({ meeting: m.id, date: today, found: !!ev, summary: ev?.summary || null, args }));
+  else console.log(ev ? `${m.name} call today: ${ev.summary} → meeting-update --meeting ${m.id} ${args.join(" ")}`
+    : `No ${m.name} call on ${today} → clear`);
+  if (dryRun) return 0;
+  try { execFileSync(UPDATE, args, { stdio: "inherit", env: { ...process.env, MEETING_ID: m.id } }); }
+  catch (e) { return e.status || 1; }
+  return 0;
+}
+
+function main() {
+  const want = flag("--meeting") || process.env.MEETING_ID || null;
+  const list = want ? [meeting(want)].filter(Boolean) : meetings();
+  if (!list.length) {
+    console.log(`meeting-calendar-check: no recurring meeting configured${want ? ` as ${want}` : ""} (agent/local/config/meetings.json); nothing to do`);
+    return 0;
+  }
+  const cache = new Map();
+  let rc = 0;
+  for (const m of list) rc = Math.max(rc, checkOne(m, cache));
+  return rc;
+}
+
+if (import.meta.url === `file://${process.argv[1]}` || process.argv[1]?.endsWith("meeting-calendar-check")) process.exit(main());
