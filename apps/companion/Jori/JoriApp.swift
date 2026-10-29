@@ -197,7 +197,7 @@ final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCent
         LocationTracker.shared.startTracking()
 
         // Request HealthKit authorization and start background delivery.
-        // Clinical FHIR types were reverted in f39b315 (missing entitlement).
+        // Clinical FHIR types were reverted (the app lacks the entitlement).
         // Kill-switch removed — the crash was from clinical types, not fitness sync.
         HealthKitManager.shared.start()
 
