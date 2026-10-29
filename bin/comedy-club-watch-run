@@ -1,0 +1,485 @@
+#!/usr/bin/env node
+// comedy-club-watch-run — big-name comedians booking small rooms.
+// Direction B (venue-up) as code; the model is woken only when a roster
+// comedian actually turns up and something needs language.
+//
+// Configured per installation (lib/comedy-config.cjs: the roster, the rooms,
+// their metro, quiet hours, companions). No rooms configured: the scheduled run
+// logs that and exits 0 — off, not broken.
+//
+//   - rooms: a venue-events source kind (`kind`: any kind lib/venue-events
+//     loads, its own or an installation hook's — a club's lineup API, Dice, a
+//     WordPress show list) or, by default, the calendar page in the automation
+//     Chrome → schema.org JSON-LD events + event-link cards (raw HTTP fallback)
+//   - roster match, room size, dedup, travel + headliner gates, calendar
+//     conflict annotation, on-sale phrasing, delivery — all code
+//   - a comedian the user has already seen or booked THIS calendar year
+//     (calendar + the sightings file, lib/comedy-seen.mjs) is not offered
+//     again: the same night → dropped as already_booked; another date → carried
+//     to the Hits check with a reminder of the last time ("new show or the
+//     same material" is language)
+//   - a hit whose show date has ANY calendar event goes to a Haiku turn
+//     (the calendar-supersedes-travel check reads event titles: language),
+//     as do aggregator hits whose room size is unknown
+//   - Direction A (roster-down web search) stays an agent job, dispatched
+//     once a day on the deep pass with the roster slice chosen here; it hands
+//     its candidates back through `--ingest` so the same gates apply.
+//   Playbook: agent/ops-agent/jobs/comedy-club-watch.md.
+//
+// Usage:
+//   comedy-club-watch-run [--dry-run] [--deep] [--scheduled]
+//                                                    a sweep (deep = first run of the local day, or forced;
+//                                                    --scheduled = from the trigger: quiet hours + pause file apply)
+//   comedy-club-watch-run --ingest <file|->          Direction A candidates [{comedian?, title, venue, cap, date, time?, url, onsale?}]
+//   comedy-club-watch-run --pending                  items waiting on the model's calendar check
+//   comedy-club-watch-run --deliver <key> [--deliver <key> ...] [--away "<calendar event title>"]
+//   comedy-club-watch-run --skip <key> --reason "<why>"
+//
+// geo-gate-ok: every item is gated through `travel in-city` (away + not a
+// headliner → suppressed; away + headliner → sent tagged), and any item on a
+// date with calendar events gets the model's calendar-supersedes-travel check
+// before it can be delivered.
+
+import { execFileSync, spawnSync } from "node:child_process";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { createRequire } from "node:module";
+import { eventsFromHtml } from "../lib/event-ld.mjs";
+import { rosterHits, cardDate, onsalePhrase, itemKey, pingText, to24, urlDate,
+  groupByComedian, groupHeader, groupText, groupNotify, sharedVenue, showLine } from "../lib/comedy.mjs";
+import { loadSightings, forComedian, repeatCheck } from "../lib/comedy-seen.mjs";
+
+const require = createRequire(import.meta.url);
+const { comedyConfig, root } = require("../lib/comedy-config.cjs");
+const { instance } = require("../lib/instance.cjs");
+
+const CFG = comedyConfig();
+const ROOT = root();
+const BIN = path.join(ROOT, "bin");
+const STATE = CFG.seen_file;
+const WEBHOOK_AUTH = path.join(ROOT, "agent", "scripts", "lib", "webhook-auth.sh");
+const UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0 Safari/537.36";
+const TZ = instance().tz;
+const METRO = CFG.metro;
+const PLACE = CFG.place_label ? `${CFG.place_label} ` : "";
+const HORIZON_DAYS = CFG.horizon_days;
+const SLICE = CFG.roster_slice;
+// Bounds: one room can never hold the run.
+const VENUE_MS = 90_000;        // per room, whatever the method
+const RUN_MS = 15 * 60_000;     // stop starting new rooms past this
+const HARD_EXIT_MS = 20 * 60_000;
+
+const argv = process.argv.slice(2);
+const has = (f) => argv.includes(f);
+const opt = (f) => { const i = argv.indexOf(f); return i >= 0 ? argv[i + 1] : null; };
+const opts = (f) => argv.flatMap((a, i) => (a === f && argv[i + 1] != null ? [argv[i + 1]] : []));
+const DRY = has("--dry-run");
+const log = (...a) => console.log(`[${new Date().toISOString()}]`, ...a);
+const localToday = () => new Intl.DateTimeFormat("en-CA", { timeZone: TZ }).format(new Date());
+const today = localToday();
+const addDays = (d, n) => { const x = new Date(`${d}T12:00:00Z`); x.setUTCDate(x.getUTCDate() + n); return x.toISOString().slice(0, 10); };
+
+const readJson = (f, d) => { try { return JSON.parse(fs.readFileSync(f, "utf8")); } catch { return d; } };
+
+// Everything the user has seen or booked, read once per run and only when a roster hit needs it.
+let SIGHTINGS = null;
+const rosterAll = () => readJson(CFG.roster_file, { comedians: [] }).comedians || [];
+function sightingsOf(comedian) {
+  const roster = rosterAll();
+  SIGHTINGS ||= loadSightings({ file: CFG.sightings_file, roster, today, log, companions: CFG.companions });
+  return forComedian(roster.find((c) => c.name === comedian) || { name: comedian }, SIGHTINGS);
+}
+function saveState(s) {
+  if (DRY) return;
+  fs.mkdirSync(path.dirname(STATE), { recursive: true });
+  const tmp = `${STATE}.tmp-${process.pid}`;
+  fs.writeFileSync(tmp, JSON.stringify(s, null, 2) + "\n");
+  fs.renameSync(tmp, STATE);
+}
+const loadState = () => {
+  const s = readJson(STATE, { last_run: null, last_deep_run: null, roster_cursor: 0, seen: [] });
+  s.seen ||= []; s.broken_sources ||= []; s.pending ||= [];
+  return s;
+};
+
+// ── Fetching ───────────────────────────────────────────────────────────────
+
+// A room with a `kind` is read by that venue-events source kind (the shared
+// fetchers, plus this installation's hook kinds). `days` / `performer_days`
+// may be {fast, deep}: a deep pass looks further ahead.
+let KINDS = null;
+const perPass = (v, deep) => (v && typeof v === "object" ? (deep ? v.deep : v.fast) : v);
+
+/** A venue-events row's sold-out status → the schema.org availability onsalePhrase reads. */
+const kindAvailability = (status) => (["soldout", "sold_out"].includes(String(status || "").toLowerCase()) ? "SoldOut" : null);
+
+async function viaKind(venue, deep) {
+  if (!KINDS) {
+    const { loadFetchers } = await import("../lib/venue-events/fetchers.mjs");
+    KINDS = await loadFetchers({ log });
+  }
+  const fetcher = KINDS[venue.kind];
+  if (!fetcher) throw new Error(`unknown venue-events kind ${venue.kind}`);
+  const days = perPass(venue.days, deep), performerDays = perPass(venue.performer_days, deep);
+  const src = { key: venue.id || venue.name, category: "comedy", ...venue, venue: venue.name,
+    ...(days != null ? { days } : {}), ...(performerDays != null ? { performer_days: performerDays } : {}) };
+  const evs = await fetcher(src, { ref: today, days: HORIZON_DAYS, performerDays,
+    apiKey: process.env.TICKETMASTER_CONSUMER_KEY || process.env.TICKETMASTER_API_KEY });
+  return rowsFromEvents(evs);
+}
+
+/** venue-events rows → listing rows: title plus any billed name it does not already carry. */
+export function rowsFromEvents(evs) {
+  return (evs || []).map((e) => {
+    const title = String(e.title || "");
+    const extra = (e.performers || []).filter((n) => n && !title.includes(n));
+    return { text: [title, ...extra].join(" · "), url: e.url, date: e.date || null, time: e.time || null,
+      venue: e.venue || null, availability: kindAvailability(e.status) };
+  });
+}
+
+const withTimeout = (p, ms, what) => Promise.race([
+  p, new Promise((_, rej) => setTimeout(() => rej(new Error(`${what} timed out after ${ms / 1000}s`)), ms).unref()),
+]);
+
+// Waits for content instead of a fixed 2 s: client-rendered calendars fill in
+// after load, so poll (≤12 s) until event JSON-LD or event-like links appear.
+// An event link is an /event(s)/, /e/, /show(s)/ or ticket path, or a link to one
+// of the installation's ticketing hosts (config `link_hosts`, e.g. "tickets.example.com").
+const escRe = (x) => String(x).replace(/[.*+?^${}()|[\]\\/]/g, "\\$&"); // lang-regex-ok: escaping configured host strings for a URL pattern
+const HREF_SRC = ["\\/events?\\/", "\\/e\\/", "\\/shows?\\/", "ticket", ...(CFG.link_hosts || []).map(escRe)].join("|");
+const PAGE_ACTION = `({ execute: async function () {
+  var hrefRe = new RegExp(${JSON.stringify(`(${HREF_SRC})`)}, "i");
+  for (var waited = 0; waited < 12000; waited += 500) {
+    var ldNow = Array.from(document.querySelectorAll('script[type="application/ld+json"]')).some(function (s) { return /"Event"|ComedyEvent|"startDate"/.test(s.textContent); });
+    var links = Array.from(document.querySelectorAll("a[href]")).filter(function (a) { return hrefRe.test(a.href); }).length;
+    if (ldNow || links >= 3) break;
+    await new Promise(function (r) { setTimeout(r, 500); });
+  }
+  var ld = Array.from(document.querySelectorAll('script[type="application/ld+json"]')).map(function (s) { return s.textContent; });
+  var seen = {}; var cards = [];
+  Array.from(document.querySelectorAll("a[href]")).forEach(function (a) {
+    var href = a.href; if (!href || !hrefRe.test(href) || seen[href]) return; seen[href] = 1;
+    var card = a.closest("article, li, [class*=event], [class*=show], [class*=card], [class*=item]") || a;
+    var t = (card.innerText || a.innerText || "").replace(/\\s+/g, " ").trim().slice(0, 500);
+    if (t) cards.push({ href: href, text: t });
+  });
+  return { content: [{ type: "text", text: JSON.stringify({ ok: true, ld: ld, cards: cards.slice(0, 400) }) }] };
+} })`;
+
+/** Calendar page → [{text, url, date, time, availability}] */
+async function page(venue) {
+  let ldBlocks = [], cards = [];
+  let via = "chrome";
+  try {
+    const { runActionCdp } = await import("../browsing-skills/tools/cdp-runner.mjs");
+    const r = await runActionCdp({ url: venue.url, actionBlock: PAGE_ACTION, params: {}, settleMs: 1500, loadTimeoutMs: 20_000, evalTimeoutMs: 45_000 });
+    const j = JSON.parse(r?.result?.content?.[0]?.text || "null");
+    if (!r?.ok || !j?.ok) throw new Error(r?.error || "page action failed");
+    ldBlocks = j.ld; cards = j.cards;
+  } catch (e) {
+    via = "http";
+    const r = await fetch(venue.url, { headers: { "User-Agent": UA }, signal: AbortSignal.timeout(20_000) });
+    if (!r.ok) throw new Error(`HTTP ${r.status} (chrome: ${String(e.message || e).slice(0, 80)})`);
+    const html = await r.text();
+    ldBlocks = null;
+    const ev = eventsFromHtml(html, venue.url);
+    return { via, rows: ev.map(ldRow) };
+  }
+  const html = ldBlocks.map((b) => `<script type="application/ld+json">${b}</script>`).join("");
+  const rows = eventsFromHtml(html, venue.url).map(ldRow);
+  const ldUrls = new Set(rows.map((x) => x.url));
+  for (const c of cards) {
+    if (ldUrls.has(c.href)) continue;
+    rows.push({ text: c.text, url: c.href, date: cardDate(c.text, today), time: to24(c.text), availability: null });
+  }
+  return { via, rows };
+}
+
+function ldRow(e) {
+  const date = e.start ? String(e.start).slice(0, 10) : null;
+  const time = e.start && String(e.start).length > 10 ? String(e.start).slice(11, 16) : null;
+  // Title + performer list only: a description that name-drops a big comedian
+  // ("as seen opening for …") is not that comedian playing the room.
+  return { text: [e.name, ...e.performers].join(" · "), url: e.url, date, time, availability: e.availability };
+}
+
+// ── Gates ──────────────────────────────────────────────────────────────────
+
+const exitOf = (bin, args) => spawnSync(path.join(BIN, bin), args, { encoding: "utf8", timeout: 60_000 });
+
+function dayEvents(date) {
+  const r = exitOf("calendar-conflict-check", [date, "--time", "00:00", "--duration-hours", "24", "--json"]);
+  try { return JSON.parse(r.stdout).events || []; } catch { return []; }
+}
+
+/** Code gates for one roster hit. → {status: "send"|"check"|"drop"|"skip", item} */
+function gate(item) {
+  item.tags ||= [];
+  // No date → no travel/calendar gate can run, so never ping blind (an undated
+  // listing for tonight would ping while the user is abroad).
+  if (!item.date) return { status: "skip", reason: "undated" };
+  {
+    if (item.date < today || item.date > addDays(today, HORIZON_DAYS)) return { status: "drop" };
+    // Seen or booked this calendar year. The very same night is simply already on
+    // the user's calendar; another date waits for the Hits check, which decides
+    // whether it is a new show, and the reminder rides on the message.
+    const seen = repeatCheck(item, sightingsOf(item.comedian), today);
+    if (seen.already_booked) return { status: "skip", reason: "already_booked" };
+    if (seen.repeat) { item.tags.push(seen.tag); item.repeat = seen.repeat; }
+    const away = exitOf("travel", ["in-city", METRO, item.date]).status === 1;
+    if (away) {
+      if (exitOf("headliner", ["check", item.comedian]).status !== 0) return { status: "skip", reason: "away_not_headliner" };
+      item.tags.push("⚠︎ you're away that night");
+    } else {
+      const evs = dayEvents(item.date).filter((e) => e.status !== "tentative");
+      const c = exitOf("calendar-conflict-check", [item.date, ...(item.time ? ["--time", item.time] : []), "--json"]);
+      if (c.status === 1) {
+        try {
+          const ev = JSON.parse(c.stdout).events?.[0];
+          if (ev) {
+            const t = ev.start && ev.start.length > 10 ? new Intl.DateTimeFormat("en-US", { timeZone: TZ, hour: "numeric", minute: "2-digit" }).format(new Date(ev.start)) : "all day";
+            item.tags.push(`⚠︎ you already have ${ev.summary} that night (${t})`);
+          }
+        } catch {}
+      }
+      // The calendar supersedes the travel DB — but whether an event title places
+      // the user in another city is language, so a model reads it.
+      if (evs.length) { item.calendar_events = evs.map((e) => ({ summary: e.summary, start: e.start, location: e.location })); return { status: "check" }; }
+    }
+  }
+  if (item.room_unknown || item.repeat) return { status: "check" };
+  return { status: "send" };
+}
+
+// ── Delivery ───────────────────────────────────────────────────────────────
+
+// One item per comedian: several shows by one comedian are ONE ping (or one
+// email entry) listing every date and room, and the email threshold
+// (`email_threshold`, default 3) counts comedians, not shows.
+//
+// Away from the rooms' metro TODAY: the lane keeps running, the per-date gate
+// above keeps only shows on dates the user is back, and they go by email only —
+// no chat ping, no push (a ping must not reach the user abroad).
+function send(items) {
+  if (!items.length) return [];
+  const groups = groupByComedian(items);
+  const sent = [];
+  try {
+    const awayToday = exitOf("travel", ["in-city", METRO, today]).status === 1;
+    if (groups.length >= CFG.email_threshold || awayToday) {
+      const f = path.join(os.tmpdir(), `comedy-club-watch-${process.pid}.html`);
+      const esc = (s) => String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;");
+      const tix = (it) => ` <a href="${esc(it.url)}">tickets</a>`;
+      const entry = (g) => g.shows.length === 1
+        ? `<li>${esc(pingText(g.shows[0]).replace(g.shows[0].url, ""))}${tix(g.shows[0])}</li>`
+        : `<li>${esc(groupHeader(g))}<ul>${g.shows.map((it) => `<li>${esc(showLine(it, !sharedVenue(g)))}${tix(it)}</li>`).join("")}</ul></li>`;
+      fs.writeFileSync(f, `<p>Big names in small rooms:</p><ul>${groups.map(entry).join("")}</ul>`);
+      const subject = groups.length === 1 ? `🎤 ${groups[0].comedian} in a small ${PLACE}room` : `🎤 ${groups.length} big comedians in small rooms`;
+      if (!DRY) {
+        execFileSync(path.join(BIN, "email-send"), ["--to", instance().owner_email, "--subject", subject, "--body-file", f, "--html"], { stdio: "inherit", timeout: 120_000 });
+        if (!awayToday) {
+          execFileSync(path.join(BIN, "jori-send-curl"), ["--no-push", "--evidence-as-of", "live", "--intent", "comedy-club-watch",
+            `🎤 ${groups.length} big comedians just showed up at small ${PLACE}rooms — ${groups.slice(0, 2).map((g) => g.comedian).join(", ")} and more, details in your inbox.`], { stdio: "inherit", timeout: 120_000 });
+          execFileSync(path.join(BIN, "jori-notify"), [`${groups.length} big comedians in small rooms`], { stdio: "ignore", timeout: 60_000 });
+        }
+      } else log(`DRY email${awayToday ? " (away today: email only)" : ""}: ${groups.length} comedians, ${items.length} shows`);
+      fs.rmSync(f, { force: true });
+      sent.push(...groups.flatMap((g) => g.shows));
+    } else {
+      for (const g of groups) {
+        if (DRY) { log(`DRY send: ${groupText(g)}`); sent.push(...g.shows); continue; }
+        execFileSync(path.join(BIN, "jori-send-curl"), ["--suppress-hook", "--evidence-as-of", "live", "--intent", "comedy-club-watch", groupText(g)], { stdio: "inherit", timeout: 120_000 });
+        execFileSync(path.join(BIN, "jori-notify"), [groupNotify(g)], { stdio: "ignore", timeout: 60_000 });
+        sent.push(...g.shows);
+      }
+    }
+  } catch (e) { log(`delivery failed: ${e.message}`); }
+  return sent; // surfaced is written only for what actually went out
+}
+
+function dispatch(task, extra = {}) {
+  if (DRY) { log(`DRY dispatch ${task}`); return; }
+  const payload = JSON.stringify({ task, source: "cron-comedy-club-watch", ...extra });
+  spawnSync("bash", ["-c", 'source "$1"; dispatch_or_skip "$2" comedy-club-watch', "_", WEBHOOK_AUTH, payload], { stdio: "inherit", timeout: 60_000 });
+}
+
+// ── Pipeline ───────────────────────────────────────────────────────────────
+
+/** Raw venue rows → new roster items (not yet gated). Pure apart from `seen`. */
+export function toItems(rows, venue, roster, seenKeys) {
+  const out = [];
+  for (const r of rows) {
+    for (const c of rosterHits(r.text, roster)) {
+      const it = {
+        // An aggregator row names its own room.
+        comedian: c.name, taste: c.taste || "neutral", venue: (venue.aggregator && r.venue) || venue.name, cap: venue.cap ?? null,
+        date: r.date || urlDate(r.url) || null, time: r.time || null, url: r.url, onsale: onsalePhrase(r.availability),
+        // What the listing says, for the Hits check's "new show or the same material" read.
+        listing: String(r.text || "").slice(0, 240),
+        room_unknown: !!venue.aggregator, first_seen: new Date().toISOString(),
+      };
+      const k = itemKey(it);
+      if (seenKeys.has(k)) continue;
+      seenKeys.add(k);
+      out.push(it);
+    }
+  }
+  return out;
+}
+
+function settle(state, items) {
+  const gated = items.map((it) => {
+    const g = gate(it);
+    log(`hit ${it.comedian} @ ${it.venue} ${it.date || "?"} → ${g.status}${g.reason ? ` (${g.reason})` : ""}`);
+    return { it, g };
+  });
+  // One comedian, one message: when any of a comedian's shows waits on the
+  // model's check, the rest of that comedian's shows wait with it, so the Hits
+  // check delivers them together in one `--deliver` call.
+  const waiting = new Set(gated.filter(({ g }) => g.status === "check").map(({ it }) => it.comedian));
+  const toSend = [], toCheck = [];
+  for (const { it, g } of gated) {
+    if (g.status === "drop") continue;
+    if (g.status === "skip") { state.seen.push({ ...it, surfaced: false, skip_reason: g.reason }); continue; }
+    if (g.status === "check" || waiting.has(it.comedian)) { toCheck.push(it); continue; }
+    toSend.push(it);
+  }
+  const sent = new Set(send(toSend).map(itemKey));
+  for (const it of toSend) state.seen.push({ ...it, surfaced: sent.has(itemKey(it)), ...(sent.has(itemKey(it)) ? {} : { skip_reason: "delivery_failed" }) });
+  for (const it of toCheck) state.pending.push({ ...it, key: itemKey(it), queued_at: new Date().toISOString() });
+  return { sent: sent.size, check: toCheck.length };
+}
+
+async function cronRun() {
+  const state = loadState();
+  const roster = rosterAll();
+  const venues = CFG.venues_file ? readJson(CFG.venues_file, { venues: [] }).venues || [] : [];
+  if (!venues.length) { log("no rooms configured (comedy-club-watch venues_file) — nothing to do"); return; }
+  const hour = Number(new Intl.DateTimeFormat("en-US", { timeZone: TZ, hour: "numeric", hourCycle: "h23" }).format(new Date()));
+  // Quiet hours and the pause file hold the schedule only (the trigger passes
+  // --scheduled); a run started by hand always runs.
+  if (has("--scheduled")) {
+    if (hour < (CFG.quiet_before_hour || 0)) { log(`quiet hours (before ${CFG.quiet_before_hour}:00 local) — nothing to do`); return; }
+    if (CFG.pause_file && fs.existsSync(CFG.pause_file)) { log(`paused (${path.basename(CFG.pause_file)})`); return; }
+  }
+  const deep = has("--deep") || state.last_deep_run !== today;
+  const cutoff = addDays(today, -7);
+  state.seen = state.seen.filter((s) => !s.date || s.date >= cutoff);
+  const seenKeys = new Set([...state.seen, ...state.pending].map((s) => s.key || itemKey(s)));
+  const broken = new Map(state.broken_sources.map((b) => [b.venue, b]));
+
+  const items = [];
+  const t0 = Date.now();
+  const tally = { fetched: 0, failed: 0, backoff: 0, deadline: 0 };
+  for (const v of venues) {
+    if (Date.now() - t0 > RUN_MS) { tally.deadline++; log(`${v.name}: skipped (run deadline ${RUN_MS / 60_000} min reached)`); continue; }
+    const b = broken.get(v.name);
+    // Back-off: a room blocked 3+ days is re-probed on the deep pass only —
+    // unless its config changed since it was marked blocked (a fixed URL or a
+    // new method must be tried at once). Skips are logged, never silent.
+    const method = v.kind || v.method || "page";
+    const configChanged = b && (b.url !== v.url || (b.method && b.method !== method));
+    if (!deep && b && b.status !== "recovered" && (b.days_blocked || 0) >= 3 && !configChanged) {
+      tally.backoff++;
+      log(`${v.name}: skipped (back-off — blocked ${b.days_blocked}d: ${b.error}; re-probed on the deep pass)`);
+      continue;
+    }
+    try {
+      const fetchRows = v.kind ? viaKind(v, deep) : page(v).then((x) => x.rows);
+      const rows = await withTimeout(fetchRows, VENUE_MS, v.name);
+      if (!rows.length) throw new Error("no listings extracted");
+      if (b) { b.status = "recovered"; b.recovered_on = today; }
+      items.push(...toItems(rows, v, roster, seenKeys));
+      tally.fetched++;
+      log(`${v.name}: ${rows.length} listings`);
+    } catch (e) {
+      tally.failed++;
+      const prev = broken.get(v.name);
+      const first = prev && prev.status !== "recovered" && !configChanged ? prev.first_seen : today;
+      const entry = { venue: v.name, url: v.url, method, error: String(e.message || e).slice(0, 160), first_seen: first,
+        days_blocked: Math.round((Date.parse(today) - Date.parse(first)) / 86400_000) + 1, status: "blocked", last_checked: today };
+      broken.set(v.name, entry);
+      log(`${v.name}: FAILED ${entry.error}`);
+    }
+  }
+  log(`rooms: ${venues.length} configured — ${tally.fetched} fetched, ${tally.failed} failed, ${tally.backoff} backed off, ${tally.deadline} past deadline${deep ? " (deep pass)" : ""}`);
+  state.broken_sources = [...broken.values()].filter((b) => b.status !== "recovered" || b.recovered_on >= addDays(today, -7));
+
+  const res = settle(state, items);
+  log(`${items.length} new roster hits → sent ${res.sent}, model check ${res.check}`);
+  if (res.check) dispatch("COMEDY CLUB WATCH HITS — follow agent/ops-agent/jobs/comedy-club-watch.md § Hits check. Run `comedy-club-watch-run --pending` for the items.");
+
+  if (deep) {
+    const n = roster.length;
+    const start = n ? (state.roster_cursor || 0) % n : 0;
+    const slice = Array.from({ length: Math.min(SLICE, n) }, (_, i) => roster[(start + i) % n].name);
+    state.roster_cursor = n ? (start + slice.length) % n : 0;
+    state.last_deep_run = today;
+    const longBroken = state.broken_sources.filter((b) => b.status === "blocked" && b.days_blocked >= 7).map((b) => `${b.venue} (${b.days_blocked}d: ${b.error})`);
+    dispatch("COMEDY CLUB WATCH DIRECTION A — follow agent/ops-agent/jobs/comedy-club-watch.md § Direction A.", { roster_slice: slice, blind_spots: longBroken });
+  }
+  state.last_run = new Date().toISOString();
+  saveState(state);
+}
+
+function ingest(file) {
+  const raw = file === "-" ? fs.readFileSync(0, "utf8") : fs.readFileSync(file, "utf8");
+  const cands = JSON.parse(raw);
+  const state = loadState();
+  const roster = rosterAll();
+  const seenKeys = new Set([...state.seen, ...state.pending].map((s) => s.key || itemKey(s)));
+  const items = [];
+  for (const c of [].concat(cands)) {
+    if (!c?.url || !c.venue) continue;
+    if (c.cap != null && Number(c.cap) > CFG.max_cap) continue; // theaters/arenas belong to the venue watch lanes
+    const venue = { name: c.venue, cap: c.cap ?? null, aggregator: c.cap == null };
+    const row = { text: [c.comedian, c.title].filter(Boolean).join(" · "), url: c.url, date: c.date || null, time: c.time || null, availability: c.onsale || null };
+    items.push(...toItems([row], venue, roster, seenKeys).map((it) => (c.onsale_text ? { ...it, onsale: c.onsale_text } : it)));
+  }
+  const res = settle(state, items);
+  saveState(state);
+  console.log(JSON.stringify({ accepted: items.length, sent: res.sent, needs_check: state.pending.filter((p) => items.some((i) => itemKey(i) === p.key)).map((p) => p.key) }));
+}
+
+function pendingCmd() {
+  console.log(JSON.stringify(loadState().pending, null, 2));
+}
+
+/** --deliver / --skip one or more pending keys. Keys delivered in one call go out as one send, grouped by comedian. */
+function resolve(keys, deliver) {
+  keys = [...new Set(keys)];
+  const state = loadState();
+  const found = keys.map((k) => state.pending.find((p) => p.key === k));
+  const missing = keys.filter((_, i) => !found[i]);
+  if (missing.length) { console.error(`no pending item ${missing.join(", ")}`); process.exit(3); }
+  state.pending = state.pending.filter((p) => !keys.includes(p.key));
+  const items = found.map(({ key: _k, queued_at, calendar_events, ...item }) => item);
+  if (deliver) {
+    const away = opt("--away");
+    if (away) for (const item of items) item.tags = [...(item.tags || []), `⚠︎ you're away that night (per calendar: ${away})`];
+    const sent = new Set(send(items).map(itemKey));
+    for (const item of items) {
+      const ok = sent.has(itemKey(item));
+      state.seen.push({ ...item, surfaced: ok, ...(ok ? {} : { skip_reason: "delivery_failed" }) });
+    }
+  } else {
+    for (const item of items) state.seen.push({ ...item, surfaced: false, skip_reason: opt("--reason") || "model_check" });
+  }
+  saveState(state);
+  console.log(`${deliver ? "delivered" : "skipped"}: ${keys.join(", ")}`);
+}
+
+async function main() {
+  if (opt("--ingest")) return ingest(opt("--ingest"));
+  if (has("--pending")) return pendingCmd();
+  if (opt("--deliver")) return resolve(opts("--deliver"), true);
+  if (opt("--skip")) return resolve(opts("--skip"), false);
+  return cronRun();
+}
+
+if (process.argv[1]?.endsWith("comedy-club-watch-run")) {
+  setTimeout(() => { log(`run exceeded ${HARD_EXIT_MS / 60_000} min — aborting`); process.exit(2); }, HARD_EXIT_MS).unref();
+  main().catch((e) => { log(`FATAL ${e.stack || e}`); process.exit(1); });
+}

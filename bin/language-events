@@ -1,0 +1,108 @@
+#!/usr/bin/env node
+// language-events — the code half of the language-events agent job (events
+// performed in the user's languages, wherever the user is). Logic and config:
+// lib/language-events.mjs.
+//
+//   language-events stays [--days N] [--json]
+//       the cities the timeline (+ calendar override) puts the user in, as date runs
+//   language-events gate --in <candidates.json> [--dry-run]
+//       gate the agent's candidates (date/city + headliner bypass, calendar
+//       clash, already surfaced), one item per performer, pick the channel;
+//       writes data/language-events-pending.json (not with --dry-run)
+//   language-events record
+//       after the email went out: mark the pending shows surfaced, clear pending
+//
+// Exit: 0 ok · 3 nothing survived the gates (silent run) · 2 usage · 1 error.
+
+import fs from "node:fs";
+import path from "node:path";
+import { spawnSync } from "node:child_process";
+import {
+  REPO, DATA, HORIZON_DAYS, loadStays, localDate, gateCandidates, groupByPerformer,
+  channelFor, knownChecker, recordSurfaced, languageConfig, homeTz,
+} from "../lib/language-events.mjs";
+import { isHeadliner } from "../lib/venue-events/watch.mjs";
+import { isMeetingEvent } from "../lib/meeting-event.mjs";
+import { meeting, knownSeriesId } from "../lib/meetings.mjs";
+
+const PENDING = process.env.LANGUAGE_EVENTS_PENDING_FILE || path.join(DATA, "language-events-pending.json");
+const BIN = (n) => path.join(REPO, "bin", n);
+const argv = process.argv.slice(2);
+const cmd = argv[0];
+const arg = (n) => { const i = argv.indexOf(`--${n}`); return i >= 0 ? argv[i + 1] : null; };
+const has = (n) => argv.includes(`--${n}`);
+const readJson = (p, d) => { try { return JSON.parse(fs.readFileSync(p, "utf8")); } catch { return d; } };
+
+// travel in-city at the show's own local evening instant; 1 = away, anything
+// else (incl. an error) fails open, like every lane's gate.
+function inCity(metro, iso) {
+  const r = spawnSync(BIN("travel"), ["in-city", metro, iso], { stdio: "ignore", timeout: 30000 });
+  return r.status !== 1;
+}
+
+// The configured soft-block meeting (language-events.json soft_block_meeting):
+// an overlap with it alone is not a clash, as in every venue lane. None: every
+// overlap is one.
+function softBlock() {
+  const id = languageConfig().soft_block_meeting;
+  const m = id ? meeting(id) : null;
+  return m ? { m, knownId: knownSeriesId(m) } : null;
+}
+
+// calendar-conflict-check in the show's zone.
+function clash(date, time, tz) {
+  const args = [date, ...(time ? ["--time", time] : []), ...(tz ? ["--tz", tz] : []), "--json"];
+  const r = spawnSync(BIN("calendar-conflict-check"), args, { encoding: "utf8", timeout: 60000 });
+  if (r.status !== 1) return { conflict: false };
+  let events = [];
+  try { events = JSON.parse(r.stdout).events || []; } catch { return { conflict: false }; }
+  const sb = softBlock();
+  const hard = sb ? events.filter((ev) => !isMeetingEvent(ev, sb.m, sb.knownId)) : events;
+  return hard.length ? { conflict: true, label: hard.map((e) => e.summary).filter(Boolean).join(" + ") || null } : { conflict: false };
+}
+
+async function stays() {
+  const days = Number(arg("days")) || HORIZON_DAYS;
+  const runs = await loadStays({ days });
+  const today = localDate(Date.now());
+  const todayMetros = runs.filter((r) => r.dates.includes(today)).map((r) => r.metro);
+  if (has("json")) { console.log(JSON.stringify({ today, today_metros: todayMetros, stays: runs }, null, 2)); return 0; }
+  for (const r of runs) console.log(`${r.metro.padEnd(12)} ${r.from} → ${r.to}  (${r.dates.length} night${r.dates.length === 1 ? "" : "s"}, ${r.tz})  ${r.label}`);
+  if (!runs.length) console.log("no known city in the window (timeline empty or in transit)");
+  return 0;
+}
+
+async function gate() {
+  const file = arg("in");
+  if (!file) { console.error("usage: language-events gate --in <candidates.json> [--dry-run]"); return 2; }
+  const raw = readJson(file, null);
+  const cands = Array.isArray(raw) ? raw : raw?.candidates;
+  if (!Array.isArray(cands)) { console.error(`language-events: ${file} is not a JSON array of candidates`); return 2; }
+  const runs = await loadStays({ days: 1 });
+  const today = localDate(Date.now());
+  const todayMetros = runs.filter((r) => r.dates.includes(today)).map((r) => r.metro);
+  const todayTz = runs.find((r) => r.dates.includes(today))?.tz || homeTz();
+  const { kept, dropped } = gateCandidates(cands, {
+    inCity, clash, known: knownChecker(), today,
+    isHeadliner: (n) => isHeadliner(n),
+  });
+  const groups = groupByPerformer(kept);
+  const channel = channelFor(groups, { todayMetros, todayTz });
+  const out = { built_at: new Date().toISOString(), today, today_metros: todayMetros, channel, groups, dropped: dropped.map((d) => ({ performer: d.candidate?.performer, date: d.candidate?.date, city: d.candidate?.city, reason: d.reason })) };
+  if (!has("dry-run") && groups.length) fs.writeFileSync(PENDING, JSON.stringify(out, null, 2) + "\n");
+  console.log(JSON.stringify(out, null, 2));
+  return groups.length ? 0 : 3;
+}
+
+function record() {
+  const p = readJson(PENDING, null);
+  if (!p?.groups?.length) { console.error("language-events: nothing pending"); return 3; }
+  const n = recordSurfaced(p.groups);
+  try { fs.unlinkSync(PENDING); } catch {}
+  console.log(JSON.stringify({ recorded: p.groups.reduce((a, g) => a + g.shows.length, 0), ledger: n }));
+  return 0;
+}
+
+const handlers = { stays, gate, record };
+if (!handlers[cmd]) { console.error("usage: language-events stays|gate|record …"); process.exit(2); }
+Promise.resolve(handlers[cmd]()).then((c) => process.exit(c ?? 0), (e) => { console.error(`language-events: ${e?.message || e}`); process.exit(1); });

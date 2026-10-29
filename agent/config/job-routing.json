@@ -115,6 +115,13 @@
       "model": "sonnet",
       "effort": "medium",
       "rationale": "Monthly per-property real-estate review. Deterministic packet (finance-property-review-data) does the math; sonnet narrates. Runs 1x/month, so the heavier per-property narrative the weekly review deliberately omits is affordable here. Ledger + bank rows are jori-model-only."
+    },
+    "comedy-club-watch": {
+      "disposition": "scheduled",
+      "target": "watch-sweep",
+      "model": "haiku",
+      "effort": "low",
+      "rationale": "Venue sweep + roster match + gates run as code (bin/comedy-club-watch-run). This tier only receives the dispatches that need language: the Hits check on a roster hit and the daily Direction A roster search."
     }
   }
 }

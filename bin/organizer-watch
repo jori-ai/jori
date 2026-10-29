@@ -1,0 +1,263 @@
+#!/usr/bin/env node
+// organizer-watch — new events from one ticketing organizer page, as code, no model.
+//
+//   organizer-watch <watch> [--dry-run] [--force]
+//   organizer-watch --list
+//
+// A watch reads one organizer page in the host's automation Chrome, follows its
+// event links, parses each event page's schema.org Event JSON-LD, dedups by
+// event id against its seen file, keeps the ones in its area that are not sold
+// out, drops dates the user is elsewhere (`travel in-city <metro> <date>`) and
+// dates the calendar already has something (calendar-conflict-check), and
+// sends one templated ping. While the user is away TODAY the survivors go by
+// email instead (the travel-timeline channel rule). The first run of a watch
+// seeds its seen file silently. --force is accepted and ignored (old callers).
+//
+// Some ticketing sites refuse server-side fetches and their organizer JSON
+// endpoints even in the browser, so the page is read in the automation Chrome:
+// the organizer page's event links, then each event page same-origin. An event
+// URL's trailing number is the event id, so seen state carries over from an
+// organizer-API reader. Every request is bounded.
+//
+// Config: agent/local/config/organizer-watch.json
+//   watches       {<name>: watch}
+//   watches_file  a private JSON file (repo-relative) with {watches: {...}} —
+//                 organizer names, URLs and neighbourhoods kept out of the
+//                 config the kernel guard derives tokens from
+// Per watch:
+//   label         how messages name it ("<Series> <City>")
+//   url           the organizer page
+//   link_selector CSS selector of its event links (default a[href*="/e/"])
+//   title_prefix  stripped from event names ("<Series> - ")
+//   metro         the travel metro its events are in (the presence gate)
+//   region        the address region an in-area event has (e.g. a state code)
+//   localities    lower-case city/borough names an in-area address contains
+//                 (none: every event is in the area)
+//   seen_file     repo-relative state (default data/<watch>-seen.json)
+//   emoji, noun   the ping's lead emoji and what an event is called ("show")
+//   intent        the ping's intent (default the watch name)
+//   max_events    event links read per run (default 40)
+// No watch configured: nothing runs (off, not broken).
+//
+// geo-gate-ok: every notified event passes `travel in-city <watch metro> <its date>`
+// (fails open); the channel is chosen by `travel in-city <watch metro> <today>`.
+
+import { execFileSync, spawnSync } from "node:child_process";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { createRequire } from "node:module";
+import { travelInCity, calendarClash } from "../lib/venue-events/watch.mjs";
+import { todayLocal } from "../lib/digest-deliver.mjs";
+
+const require = createRequire(import.meta.url);
+const { instance, localConfig } = require("../lib/instance.cjs");
+const { REPO_ROOT } = require("../lib/root.cjs");
+
+const BIN = path.join(REPO_ROOT, "bin");
+// Bounds: per in-page request, the whole browser action, and the run.
+const PAGE_MS = 20_000;
+const EVAL_MS = 120_000;
+const RUN_MS = 5 * 60_000;
+const FAIL_ALERT_STREAK = 3;
+const log = (...a) => console.log(`[${new Date().toISOString()}]`, ...a);
+
+/** Every configured watch, by name: the config's own, over a private watches_file's. */
+export function watches(cfg = localConfig("organizer-watch", { watches: {}, watches_file: null })) {
+  let file = {};
+  if (cfg.watches_file) {
+    try { file = JSON.parse(fs.readFileSync(path.isAbsolute(cfg.watches_file) ? cfg.watches_file : path.join(REPO_ROOT, cfg.watches_file), "utf8")) || {}; }
+    catch (e) { if (e.code !== "ENOENT") throw new Error(`organizer-watch watches_file ${cfg.watches_file}: ${e.message}`); }
+  }
+  return { ...(file.watches || {}), ...(cfg.watches || {}) };
+}
+
+/** Is an event address in the watch's area? No region/localities configured: yes. */
+export function inArea(addr, w = {}) {
+  if (w.region && addr.region !== w.region) return false;
+  const locs = w.localities || [];
+  if (!locs.length) return true;
+  const hay = `${addr.city || ""} ${addr.localized_address_display || ""}`.toLowerCase();
+  return locs.some((b) => hay.includes(String(b).toLowerCase()));
+}
+
+/** Organizer event (organizer-API shape) → our row. Pure. */
+export function toRow(e, w = {}) {
+  const v = e.venue || {};
+  const addr = v.address || {};
+  const display = String(addr.localized_address_display || "");
+  const city = String(addr.city || "");
+  const name = String(e.name?.text || e.name || "");
+  const prefix = w.title_prefix || "";
+  return {
+    id: String(e.id),
+    title: prefix && name.startsWith(prefix) ? name.slice(prefix.length) : name,
+    date: String(e.start?.local || "").slice(0, 10),
+    time: e.start?.formatted_time || String(e.start?.local || "").slice(11, 16),
+    venue: v.name || "",
+    neighborhood: city || display,
+    price: e.price_range || "",
+    // has_available_tickets, not is_sold_out — the latter reports false positives.
+    sold_out: e.ticket_availability ? e.ticket_availability.has_available_tickets === false : false,
+    in_area: inArea(addr, w),
+    url: e.url || "",
+  };
+}
+
+const plural = (n, noun) => `${n} new ${noun}${n > 1 ? "s" : ""}`;
+
+export function message(rows, w = {}) {
+  const top = [...rows].sort((a, b) => a.date.localeCompare(b.date)).slice(0, 5);
+  const fmt = (d) => new Date(`${d}T12:00:00Z`).toLocaleDateString("en-US", { weekday: "short", month: "short", day: "numeric", timeZone: "UTC" });
+  const items = top.map((r) => `• ${r.title} — ${r.neighborhood}, ${fmt(r.date)} @ ${r.time}${r.price ? ` (${r.price})` : ""}\n${r.url}`);
+  return `${w.emoji ? `${w.emoji} ` : ""}${w.label || "New events"}: ${plural(rows.length, w.noun || "show")} announced\n\n${items.join("\n\n")}`;
+}
+
+const IN_PAGE = `({ execute: async function (p) {
+  var links = Array.from(document.querySelectorAll(p.linkSelector)).map(function (a) { return a.href.split("?")[0]; })
+    .filter(function (v, i, a) { return a.indexOf(v) === i; }).slice(0, p.maxEvents);
+  var out = [], errors = [];
+  for (var i = 0; i < links.length; i++) {
+    var ctl = new AbortController();
+    var timer = setTimeout(function () { ctl.abort(); }, p.pageMs);
+    try {
+      var r = await fetch(links[i], { credentials: "include", signal: ctl.signal });
+      if (!r.ok) { errors.push("HTTP " + r.status); continue; }
+      var doc = new DOMParser().parseFromString(await r.text(), "text/html");
+      var ld = Array.from(doc.querySelectorAll('script[type="application/ld+json"]'))
+        .map(function (s) { try { return JSON.parse(s.textContent); } catch (e) { return null; } }).filter(Boolean);
+      var flat = [].concat.apply([], ld.map(function (x) { return Array.isArray(x) ? x : [x]; }));
+      var ev = flat.find(function (x) { return String(x["@type"] || "").indexOf("Event") >= 0 && x.startDate; });
+      if (!ev) { errors.push("no Event JSON-LD"); continue; }
+      var loc = ev.location || {}, addr = loc.address || {};
+      var offers = [].concat(ev.offers || []);
+      var prices = offers.map(function (o) { return Number(o.lowPrice != null ? o.lowPrice : o.price); }).filter(function (n) { return !isNaN(n); });
+      var avail = offers.map(function (o) { return String(o.availability || ""); });
+      var idm = links[i].match(/-(\\d+)$/);
+      out.push({
+        id: idm ? idm[1] : links[i], name: ev.name, url: ev.url || links[i],
+        start: { local: String(ev.startDate).slice(0, 19) },
+        venue: { name: loc.name || "", address: { city: addr.addressLocality || "", region: addr.addressRegion || "",
+          localized_address_display: [addr.streetAddress, addr.addressLocality].filter(Boolean).join(", ") } },
+        price_range: prices.length ? "$" + Math.min.apply(null, prices) + (Math.max.apply(null, prices) > Math.min.apply(null, prices) ? "–$" + Math.max.apply(null, prices) : "") : "",
+        ticket_availability: avail.length ? { has_available_tickets: avail.some(function (a) { return a.indexOf("SoldOut") < 0; }) } : null,
+      });
+    } catch (e) {
+      errors.push(e && e.name === "AbortError" ? "timeout after " + p.pageMs + "ms" : String(e));
+    } finally { clearTimeout(timer); }
+  }
+  if (!links.length) return { content: [{ type: "text", text: JSON.stringify({ ok: false, error: "no event links on organizer page" }) }] };
+  if (!out.length) return { content: [{ type: "text", text: JSON.stringify({ ok: false, error: "0/" + links.length + " event pages parsed: " + errors.slice(0, 3).join("; ") }) }] };
+  return { content: [{ type: "text", text: JSON.stringify({ ok: true, events: out, errors: errors }) }] };
+} })`;
+
+async function fetchAll(w) {
+  const { runActionCdp } = await import("../browsing-skills/tools/cdp-runner.mjs");
+  const r = await runActionCdp({
+    url: w.url, actionBlock: IN_PAGE,
+    params: { pageMs: PAGE_MS, maxEvents: w.max_events || 40, linkSelector: w.link_selector || 'a[href*="/e/"]' },
+    loadTimeoutMs: 20_000, evalTimeoutMs: EVAL_MS,
+  });
+  let j = null;
+  try { j = JSON.parse(r?.result?.content?.[0]?.text || "null"); } catch {}
+  if (!r?.ok || !j?.ok) throw new Error(j?.error || r?.error || "in-page fetch failed");
+  return j.events;
+}
+
+/** Does the calendar already have something then? Only a definite overlap says yes; anything else fails open. */
+function conflicts(date, time) {
+  const t = /^\d{2}:\d{2}$/.test(time || "") ? time : null; // lang-regex-ok: HH:MM shape check
+  return calendarClash(date, t, null, { softBlock: null }).conflict;
+}
+
+async function run(name, w, { dry }) {
+  const STATE = path.join(REPO_ROOT, w.seen_file || `data/${name}-seen.json`);
+  const intent = w.intent || name;
+  const metro = w.metro || null;
+  const here = (date) => !metro || travelInCity(metro, date);
+  const state = (() => { try { return JSON.parse(fs.readFileSync(STATE, "utf8")); } catch { return { last_run: "", seen: [] }; } })();
+  state.seen ||= [];
+  const coldStart = !state.seen.length && !state.last_run;
+  let events;
+  try { events = await fetchAll(w); } catch (e) {
+    // Fail soft: no ping, no state churn — but a source that stays broken is
+    // reported ONCE on the system channel when the streak reaches the threshold.
+    state.fetch_fail_streak = (state.fetch_fail_streak || 0) + 1;
+    state.last_fetch_error = String(e.message || e).slice(0, 200);
+    log(`[${name}] organizer fetch failed (${state.last_fetch_error}) — streak ${state.fetch_fail_streak}, retry next run`);
+    if (!dry) {
+      if (state.fetch_fail_streak === FAIL_ALERT_STREAK) systemNote(intent, `${name}: the organizer page fetch has failed ${FAIL_ALERT_STREAK} runs running (${state.last_fetch_error}) — new ${w.label || name} events are not being seen until it is fixed.`);
+      saveState(STATE, state);
+    }
+    return;
+  }
+  state.fetch_fail_streak = 0;
+  delete state.last_fetch_error;
+  if (!events.length) { log(`[${name}] no events returned`); if (!dry) saveState(STATE, state); return; }
+
+  const cutoff = new Date(Date.now() - 7 * 86400_000).toISOString().slice(0, 10);
+  state.seen = state.seen.filter((s) => !s.date || s.date >= cutoff);
+  const byId = new Map(state.seen.map((s) => [s.id, s]));
+  const fresh = [];
+  for (const e of events) {
+    const r = toRow(e, w);
+    const prev = byId.get(r.id);
+    if (prev) { prev.sold_out = r.sold_out; continue; }
+    const row = { ...r, first_seen: new Date().toISOString() };
+    state.seen.push(row);
+    byId.set(r.id, row);
+    fresh.push(row);
+  }
+  // Per-date presence first (cheapest drop), then the calendar conflict check.
+  const notify = coldStart ? [] : fresh.filter((r) => r.in_area && !r.sold_out && here(r.date) && !conflicts(r.date, r.time));
+  log(`[${name}] ${events.length} events, ${fresh.length} new, ${notify.length} to notify${coldStart ? " (cold start — seeding silently)" : ""}`);
+  if (dry) { console.log(JSON.stringify(notify, null, 2)); return; }
+
+  if (notify.length) {
+    try {
+      if (here(todayLocal())) {
+        execFileSync(path.join(BIN, "jori-send-curl"), ["--evidence-as-of", "live", "--intent", intent, message(notify, w)], { stdio: "inherit", timeout: 120_000 });
+      } else {
+        // Away today: email only, no phone ping.
+        const to = instance().owner_email;
+        if (!to) throw new Error("no owner_email configured for the away-today email");
+        const f = path.join(os.tmpdir(), `${name}-${process.pid}.txt`);
+        fs.writeFileSync(f, `${message(notify, w)}\n`);
+        try {
+          execFileSync(path.join(BIN, "email-send"), ["--to", to, "--subject", `${w.label || name}: ${plural(notify.length, w.noun || "show")} for when you're back`, "--body-file", f], { stdio: "inherit", timeout: 120_000 });
+        } finally { fs.rmSync(f, { force: true }); }
+      }
+    } catch (e) { log(`[${name}] delivery failed: ${e.message}`); }
+  }
+  state.last_run = new Date().toISOString();
+  saveState(STATE, state);
+}
+
+function saveState(file, state) {
+  const tmp = `${file}.tmp-${process.pid}`;
+  fs.writeFileSync(tmp, JSON.stringify(state, null, 2) + "\n");
+  fs.renameSync(tmp, file);
+}
+
+function systemNote(intent, msg) {
+  try {
+    execFileSync(path.join(BIN, "jori-send-curl"), ["--channel", "system", "--skip-precheck", "--intent", intent, msg], { stdio: "ignore", timeout: 30_000 });
+  } catch { /* an alert must never fail the run */ }
+}
+
+async function main(argv) {
+  const all = watches();
+  const name = argv.find((a) => !a.startsWith("--"));
+  if (argv.includes("--list")) { console.log(Object.keys(all).join("\n")); return; }
+  if (!name) { console.error(`usage: organizer-watch <${Object.keys(all).join("|") || "watch"}> [--dry-run]`); process.exit(2); }
+  const w = all[name];
+  // Not configured here: the watch is off, which is not an error.
+  if (!w || !w.url) { log(`[${name}] not configured (agent/local/config/organizer-watch.json watches) — off`); return; }
+  await run(name, w, { dry: argv.includes("--dry-run") });
+}
+
+if (process.argv[1]?.endsWith("organizer-watch")) {
+  // Whole-run deadline: whatever wedges, the cron slot is released.
+  setTimeout(() => { log(`run exceeded ${RUN_MS / 1000}s — aborting`); process.exit(2); }, RUN_MS).unref();
+  main(process.argv.slice(2)).catch((e) => { log(`FATAL ${e.stack || e}`); process.exit(1); });
+}

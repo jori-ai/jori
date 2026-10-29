@@ -1,0 +1,86 @@
+#!/usr/bin/env node
+// ticket-shows — the one write path for the curated show list the ticket
+// lottery and the day-of rush watcher read (bin/ticket-lottery-run,
+// bin/ticket-rush-run; the file is agent/local/config/ticket-lottery.json
+// `shows_file`).
+//
+//   ticket-shows list [--json]
+//   ticket-shows add "<title>" [--note "<text>"]
+//   ticket-shows retire "<title>" --reason "<why>"     e.g. --reason "won + attended"
+//   ticket-shows unretire "<title>"
+//
+// Titles resolve the same way the scripts match platform listings (case,
+// punctuation, a leading "The", whole-word prefix), so "outsiders" finds "The
+// Outsiders". An ambiguous name is refused rather than guessed. Retiring also
+// drops the show's entry from the per-show pauses file — a permanent
+// retirement supersedes a temporary pause (email triage retires a show once
+// the user has seen it).
+
+import { lotteryConfig, readJson, writeJson, localDate, sameTitle } from "../lib/ticket-lottery.mjs";
+
+const CFG = lotteryConfig();
+const SHOWS_FILE = CFG.shows_file;
+const [cmd, title, ...rest] = process.argv.slice(2);
+const opt = (n) => { const i = rest.indexOf(n); return i >= 0 ? rest[i + 1] : null; };
+const die = (m, code = 1) => { process.stderr.write(`ticket-shows: ${m}\n`); process.exit(code); };
+
+const j = readJson(SHOWS_FILE, null) || (cmd === "add" ? {} : cmd === "list" ? {} : die(`no curated list at ${SHOWS_FILE}`));
+j.shows ||= []; j.retired ||= [];
+
+function find(list, t) {
+  const hits = list.filter((e) => sameTitle(e.title, t));
+  if (hits.length > 1) die(`"${t}" matches several: ${hits.map((h) => h.title).join(", ")} — be more specific`, 2);
+  return hits[0] || null;
+}
+
+switch (cmd) {
+  case "list": {
+    if (rest.includes("--json") || title === "--json") { console.log(JSON.stringify(j, null, 2)); break; }
+    console.log("Enter / watch:");
+    for (const s of j.shows) console.log(`  • ${s.title}${s.note ? ` — ${s.note}` : ""}`);
+    console.log("Retired:");
+    for (const s of j.retired) console.log(`  • ${s.title} — ${s.reason} (${s.date})`);
+    break;
+  }
+  case "add": {
+    if (!title) die("usage: ticket-shows add \"<title>\" [--note <text>]", 2);
+    if (find(j.shows, title)) { console.log(`already on the list: ${find(j.shows, title).title}`); break; }
+    const was = find(j.retired, title);
+    if (was) j.retired = j.retired.filter((e) => e !== was);
+    j.shows.push({ title: was?.title || title, ...(opt("--note") ? { note: opt("--note") } : {}) });
+    writeJson(SHOWS_FILE, j);
+    console.log(`added: ${was?.title || title}${was ? " (was retired)" : ""}`);
+    break;
+  }
+  case "retire": {
+    const reason = opt("--reason");
+    if (!title || !reason) die("usage: ticket-shows retire \"<title>\" --reason \"<why>\"", 2);
+    const s = find(j.shows, title);
+    if (!s) {
+      if (find(j.retired, title)) { console.log(`already retired: ${find(j.retired, title).title}`); break; }
+      die(`"${title}" is not on the active list`, 3);
+    }
+    j.shows = j.shows.filter((e) => e !== s);
+    j.retired.push({ title: s.title, reason, date: localDate(CFG.tz) });
+    writeJson(SHOWS_FILE, j);
+    const pf = CFG.files.pauses;
+    const p = readJson(pf, null);
+    if (p && Array.isArray(p.entries)) {
+      const kept = p.entries.filter((e) => !sameTitle(e.show, s.title));
+      if (kept.length !== p.entries.length) writeJson(pf, { ...p, entries: kept });
+    }
+    console.log(`retired: ${s.title} — ${reason}`);
+    break;
+  }
+  case "unretire": {
+    const s = title && find(j.retired, title);
+    if (!s) die(`"${title}" is not retired`, 3);
+    j.retired = j.retired.filter((e) => e !== s);
+    j.shows.push({ title: s.title });
+    writeJson(SHOWS_FILE, j);
+    console.log(`back on the list: ${s.title}`);
+    break;
+  }
+  default:
+    die("usage: ticket-shows list|add|retire|unretire …", 2);
+}

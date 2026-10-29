@@ -1369,6 +1369,48 @@
       "webhook_task": null,
       "webhook_url": null,
       "ops_playbook_section": null
+    },
+    {
+      "name": "festival-watch",
+      "schedule": "10 7 * * 1",
+      "schedule_human": "Mondays at 7:10 AM",
+      "trigger_script": "agent/scripts/trigger-festival-watch.sh",
+      "webhook_url": null,
+      "webhook_task": null,
+      "ops_playbook_section": null,
+      "delivers_to": "jori",
+      "phrases": [
+        "festivals",
+        "festival watch",
+        "upcoming festivals",
+        "public events",
+        "what festivals are coming up",
+        "any festivals coming up",
+        "festivals near me",
+        "festivals while traveling"
+      ],
+      "description": "Forward-looking 90-day scan for festivals and major public events in every city the travel timeline puts the user in (home + trips); net-new finds emailed, the rest deferred. Scripted: cron kicks launchd ai.claude.festival-watch → bin/festival-watch-run (code does windows, deep/weekly band, gates, render, delivery; one capped web-search judgment on Max). Off unless agent/local/config/festival-watch.json enables it.",
+      "job": "festival-watch",
+      "runtime": "launchd-script",
+      "launchd_label": "ai.claude.festival-watch",
+      "script": "bin/festival-watch-run"
+    },
+    {
+      "delivers_to": "jori",
+      "job": "comedy-club-watch",
+      "ops_playbook_section": null,
+      "phrases": [
+        "comedy club watch",
+        "comedians small rooms",
+        "big comedian small room"
+      ],
+      "webhook_task": "comedy-club-watch",
+      "webhook_url": "http://localhost:9092",
+      "name": "comedy-club-watch",
+      "schedule": "12 8,11,14,17,20,23 * * *",
+      "schedule_human": "Every 3h through the day (installation's schedule; the first pass of the local day is the deep roster pass)",
+      "trigger_script": "agent/scripts/trigger-comedy-club-watch.sh",
+      "description": "Big-name comedians (or any roster headliners) booking small rooms (≤ max_cap seats). Membership is stature × room size, never taste; a show on a date the user is away is suppressed unless a headliner; the calendar supersedes the travel DB. The venue sweep runs as code (bin/comedy-club-watch-run, config lib/comedy-config.cjs, off without rooms); the Haiku agent is dispatched only for the Hits check on a roster hit and once a day for Direction A. See ops-agent/jobs/comedy-club-watch.md."
     }
   ]
 }
