@@ -262,6 +262,9 @@ incident_clear() {
         # it crossed, never "auto-healed".
         disk-low)        how="free space on the data volume is back above the $(_disk_gib_threshold "$WATCHDOG_DISK_WARN_GIB" 25) GiB warning line" ;;
         disk-critical)   how="free space on the data volume is back above the $(_disk_gib_threshold "$WATCHDOG_DISK_CRIT_GIB" 10) GiB critical line" ;;
+        # stale-code-watch flags only what it cannot fix itself (see "Stale code,
+        # the rest"), so report the flag gone, never "auto-healed".
+        stale-code-flag) how="stale-code-watch no longer flags any daemon or uncommitted code file (this check sees the flag gone, not what cleared it)" ;;
       esac
       notify "✅ Recovered: $(_incident_label "$key") is back to normal — $how, stable for 3 checks."
     elif [ -f "$INCIDENT_DIR/${key}.alerted" ]; then

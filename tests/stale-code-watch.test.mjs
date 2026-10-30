@@ -262,3 +262,35 @@ test("watchdog.sh block: 6 pages the state file's text once, 0 clears, 5 does ne
   assert.equal(run(0), "clear stale-code-flag");
   assert.equal(run(5), "");
 });
+
+// Regression guard for the "✅ Recovered: stale-code-flag ... auto-healed" line:
+// nothing automatic clears this flag (it goes when someone restarts a daemon or
+// commits a file), so incident_clear must report what it observed, never
+// "auto-healed" and never a restart (a commit clears it too).
+test("watchdog.sh incident_clear: the stale-code-flag recovery says what it saw, once, never 'auto-healed'", async () => {
+  const { execFileSync } = await import("node:child_process");
+  const src = fs.readFileSync(path.join(REPO, "agent/scripts/watchdog.sh"), "utf8");
+  const fn = (name) => {
+    const from = src.indexOf(`\n${name}() {`);
+    assert.notEqual(from, -1, `${name} is defined in watchdog.sh`);
+    return src.slice(from + 1, src.indexOf("\n}\n", from) + 3);
+  };
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "scw-clear-"));
+  const dir = path.join(home, "incidents");
+  fs.mkdirSync(dir);
+  fs.writeFileSync(path.join(dir, "stale-code-flag.alerted"), "");
+  fs.writeFileSync(path.join(dir, "stale-code-flag.delivered"), "");
+  const out = path.join(home, "out");
+  const script = [`INCIDENT_DIR=${JSON.stringify(dir)}`, `log() { :; }`, `notify() { printf '%s\\n' "$1" >> ${JSON.stringify(out)}; }`,
+    fn("_incident_label"), fn("_disk_gib_threshold"), fn("incident_clear"),
+    `incident_clear stale-code-flag`, `incident_clear stale-code-flag`, `incident_clear stale-code-flag`, `incident_clear stale-code-flag`].join("\n");
+  execFileSync("bash", ["-c", script], { env: { PATH: "/usr/bin:/bin", HOME: home } });
+  const lines = fs.readFileSync(out, "utf8").split("\n").filter(Boolean);
+  assert.equal(lines.length, 1, `one recovery line after 3 green ticks, none after: ${JSON.stringify(lines)}`);
+  assert.ok(lines[0].startsWith("✅ Recovered: ") && lines[0].endsWith(", stable for 3 checks."), lines[0]);
+  assert.ok(lines[0].includes("stale-code-watch no longer flags any daemon or uncommitted code file"), lines[0]);
+  assert.ok(!lines[0].includes("auto-healed"), lines[0]);
+  assert.ok(!lines[0].toLowerCase().includes("restart"), lines[0]);
+  assert.ok(!fs.existsSync(path.join(dir, "stale-code-flag.alerted")), "the incident is closed after the recovery");
+  fs.rmSync(home, { recursive: true, force: true });
+});
