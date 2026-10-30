@@ -87,3 +87,69 @@ test("a gap does not claim a drive that runs through the stop before it", () => 
     assert.match(text(travelHtml({ from: "s-a2", to: "s-5", duration_min: 34, distance_km: 8.6 }, nana, flat, day([home]))), /at least 24\.0 km/);
   } finally { delete process.env.JORI_TRAVEL_THROUGH_STOP; }
 });
+
+// ── the travel line spans the short dwells the email does not print ─────────
+//
+// travel_legs join each stop to the next one in the whole day; two printed stops
+// with halts in traffic between them had no leg of their own, so a long drive
+// between an afternoon at the flat and an evening stop printed no line at all.
+
+{
+const { buildSkeleton } = require("../lib/daily-summary-render.js");
+const { legOverHidden } = _internal;
+const TZ = "Europe/Paris";
+const UH = (hms) => Date.parse(`2026-05-04T${hms}Z`);
+const named = (id, start, end, s, e, name) => ({ id, start, end, start_ts_ms: UH(s), end_ts_ms: UH(e),
+  duration_min: Math.round((UH(e) - UH(s)) / 60000), tz: TZ, companions: [], photos: [],
+  place: { name, source: "user_confirmed", confidence: 1 } });
+const halt = (id, start, end, s, e) => ({ id, start, end, start_ts_ms: UH(s), end_ts_ms: UH(e),
+  duration_min: Math.round((UH(e) - UH(s)) / 60000), tz: TZ, companions: [], photos: [], pattern: "browse",
+  place: { name: "Example Road", source: "spine_dwell", confidence: 0.85 } });
+
+const STOPS = [
+  named("s-1", "15:54", "18:00", "13:54:00", "16:00:00", "The Example Flat"),
+  halt("s-2", "18:12", "18:24", "16:12:00", "16:24:00"),
+  halt("s-3", "18:42", "19:06", "16:42:00", "17:06:00"),
+  named("s-4", "20:41", "22:55", "18:41:00", "20:55:00", "Example Hall"),
+];
+const LEGS = [
+  { from: "s-1", to: "s-2", duration_min: 12, distance_km: 1.4, mode: null },
+  { from: "s-2", to: "s-3", duration_min: 18, distance_km: 6.1, mode: null },
+  { from: "s-3", to: "s-4", duration_min: 95, distance_km: 47.8, mode: null },
+];
+// The trace drove the whole gap; nothing in it was a walk.
+const drive = (id, s, e, m) => ({ type: "leg", id, mode: "driving", mode_uncertain: false,
+  start_ms: UH(s), end_ms: UH(e), routed_m: m, straight_m: m * 0.8, geometry: "map_matched" });
+const SPINE = [drive("l1", "16:00:00", "16:12:00", 1400), drive("l2", "16:24:00", "16:42:00", 6100),
+  drive("l3", "17:06:00", "18:41:00", 47800)];
+const hidDay = (legs) => ({ date: "2026-05-04", tz: TZ, tzs: [TZ], stops: STOPS, travel_legs: legs, path: { spine: SPINE } });
+const flat = (html) => html.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ");
+
+test("the leg over hidden stops runs from one printed stop's end to the next one's start", () => {
+  const leg = legOverHidden(STOPS, LEGS, "s-1", "s-4");
+  assert.equal(leg.duration_min, 161);
+  assert.ok(Math.abs(leg.distance_km - 55.3) < 1e-9);
+  assert.equal(leg.over_hidden, 2);
+});
+
+test("neighbours in the whole day, a missing link, or the wrong order give no leg", () => {
+  assert.equal(legOverHidden(STOPS, LEGS, "s-1", "s-2"), undefined);
+  assert.equal(legOverHidden(STOPS, LEGS.filter(l => l.from !== "s-2"), "s-1", "s-4"), undefined);
+  assert.equal(legOverHidden(STOPS, LEGS, "s-4", "s-1"), undefined);
+});
+
+test("the email prints a travel line for the gap the hidden halts sit in", () => {
+  const html = flat(buildSkeleton(hidDay(LEGS), {}));
+  assert.doesNotMatch(html, /Example Road/, "the short halts are not printed as stops");
+  assert.match(html, /6:00pm · Drove 2h 41m \(55\.3 km\) to next\./);
+});
+
+test("JORI_TRAVEL_OVER_HIDDEN=0 prints no line there", () => {
+  process.env.JORI_TRAVEL_OVER_HIDDEN = "0";
+  try {
+    assert.doesNotMatch(flat(buildSkeleton(hidDay(LEGS), {})), /to next/);
+  } finally {
+    delete process.env.JORI_TRAVEL_OVER_HIDDEN;
+  }
+});
+}
