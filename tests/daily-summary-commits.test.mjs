@@ -13,7 +13,7 @@ import { createRequire } from "node:module";
 
 const require = createRequire(import.meta.url);
 const ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
-const { dayCommits, commitLines, partOf, routineTags } = require(path.join(ROOT, "lib/daily-summary-commits.js"));
+const { dayCommits, commitLines, partOf, routineTags, placeCommits } = require(path.join(ROOT, "lib/daily-summary-commits.js"));
 const { buildSkeleton, buildMarkdown, assemble } = require(path.join(ROOT, "lib/daily-summary-render.js"));
 
 const NY = "America/New_York";
@@ -214,4 +214,32 @@ test("a bare merge commit is left out and not owed; a described merge and the me
   const both = dayCommits([{ sha: "aaaaaaa1", at: "2026-10-21T12:05:32Z", subject: "Merge branch 'worktree-agent-a1'" }],
     [FIRST, SECOND], JLM, [FIRST, SECOND], { routineTags: new Set(["[auto-impl]"]) });
   assert.equal(both[0].omitted, "merge");
+});
+
+// A commit that landed after the stop he left ended, before the next one began,
+// still belongs to that stop, but a diary prints it after the stop's travel
+// line: an 11:08 approval sat under a stop that ended at 10:58, above the
+// "10:58am · 26 min to next" line.
+test("work that landed between stops prints after the travel line, in time order", () => {
+  const between = [{ sha: "c0ffee11", at: "2026-10-20T17:05:00Z", subject: "self-improve: apply owner-approved fix (Face-ID)" }];
+  const legs = [{ from: "s1", to: "s2", duration_min: 90, distance_km: 3.2, mode: null }];
+  const day = { date: "2026-10-20", tz: NY, tzs: [NY], stops: STOPS, travel_legs: legs, commits: dayCommits(between, STOPS, NY) };
+  const placed = placeCommits(day.commits, STOPS);
+  assert.equal(placed[0].stop_id, "s1");
+  assert.equal(placed[0].after_stop, true);
+  const html = assemble(buildSkeleton(day, {}), { commits: [{ shas: ["c0ffee11"], text: "You approved a fix." }] });
+  assert.ok(!html.includes("{{"));
+  const flat = html.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ");
+  assert.match(flat, /12:30pm · 1h 30m [^.]*\. 1:05pm You approved a fix\. 2:00pm ·/,
+    "the 1:05pm line comes after the 12:30pm travel line and before the next stop");
+});
+
+test("work at the stop stays inside it; JORI_WORK_AFTER_LEG=0 keeps every line inside the stop", () => {
+  const during = [{ sha: "abad1dea", at: "2026-10-20T15:00:00Z", subject: "x" }];
+  assert.ok(!placeCommits(dayCommits(during, STOPS, NY), STOPS)[0].after_stop);
+  process.env.JORI_WORK_AFTER_LEG = "0";
+  try {
+    const between = [{ sha: "c0ffee11", at: "2026-10-20T17:05:00Z", subject: "x" }];
+    assert.ok(!placeCommits(dayCommits(between, STOPS, NY), STOPS)[0].after_stop);
+  } finally { delete process.env.JORI_WORK_AFTER_LEG; }
 });
