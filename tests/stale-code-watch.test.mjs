@@ -136,6 +136,75 @@ test("big daemons are never restarted, only flagged after 6h on old code", async
   touch("agent/whatsapp-channel/index.mjs", OLD); touch("agent/phone-channel/index.mjs", OLD);
 });
 
+// Regression guard for the stale-code-flag alert: missedSince sees only a
+// file's newest mtime, so a second commit to a file a long-running daemon had
+// already missed used to reset the age to 0, clear the flag (watchdog's false
+// "Recovered: stale-code-flag ... auto-healed") and page again 6h later, while
+// the daemon ran the old code the whole time.
+test("a re-commit to a file a long-running daemon already missed does not clear or reset the stale-code flag", async () => {
+  const WA = "agent/whatsapp-channel/index.mjs";
+  touch(WA, NOW - 7 * H);
+  const h1 = harness();
+  assert.equal(await m.main([], h1.io, ROOT), 6);
+  assert.match(h1.state()._flag, /whatsapp-channel: on code older than committed for 7h/);
+  const first = h1.state()._missed_since["whatsapp-channel"];
+  assert.equal(first.pid, 24134);
+  assert.equal(first.sinceMs, NOW - 7 * H);
+
+  touch(WA, NOW - 1 * H);                       // the same file committed again; the daemon still was not restarted
+  const h2 = harness({ state: h1.state() });
+  assert.equal(await m.main([], h2.io, ROOT), 6, "flag must not clear");
+  assert.match(h2.state()._flag, /whatsapp-channel: on code older than committed for 7h \(jori restart whatsapp-channel\)/);
+  assert.ok(!h2.state()._flag.includes("for 1h"), h2.state()._flag);
+  assert.equal(h2.state()._missed_since["whatsapp-channel"].sinceMs, NOW - 7 * H);
+
+  // an uncommitted edit on top hides the file from missedSince; the same process is still on old code
+  const h3 = harness({ state: h2.state(), dirty: [WA] });
+  assert.equal(await m.main([], h3.io, ROOT), 6);
+  assert.match(h3.state()._flag, /whatsapp-channel: on code older than committed for 7h/);
+
+  // restarted after the last commit: current, no flag, the entry is gone
+  const h4 = harness({ state: h2.state(), startOf: { 24134: NOW - 30 * MIN } });
+  assert.equal(await m.main([], h4.io, ROOT), 0);
+  assert.equal(h4.state()._flag, undefined);
+  assert.equal(h4.state()._missed_since?.["whatsapp-channel"], undefined);
+
+  // restarted between the two commits: a new process ages from what it missed, not the old process's sighting
+  const h5 = harness({ state: h2.state(), startOf: { 24134: NOW - 3 * H } });
+  assert.equal(await m.main([], h5.io, ROOT), 0);
+  assert.equal(h5.state()._missed_since["whatsapp-channel"].sinceMs, NOW - 1 * H);
+  touch(WA, OLD);
+});
+
+test("no stored sighting (first run after deploy) or one from an earlier process: the computed age is used", async () => {
+  const WA = "agent/whatsapp-channel/index.mjs";
+  touch(WA, NOW - 7 * H);
+  for (const state of [{}, { _missed_since: { "whatsapp-channel": { pid: 999, startedMs: NOW - 9 * 86_400_000, sinceMs: NOW - 40 * H } } }]) {
+    const h = harness({ state });
+    assert.equal(await m.main([], h.io, ROOT), 6);
+    assert.match(h.state()._flag, /whatsapp-channel: on code older than committed for 7h/, JSON.stringify(state));
+    assert.equal(h.state()._missed_since["whatsapp-channel"].pid, 24134);
+    assert.equal(h.state()._missed_since["whatsapp-channel"].sinceMs, NOW - 7 * H);
+  }
+  // an uncommitted edit with no sighting stored: not flagged, same as before the ledger existed
+  const h = harness({ dirty: [WA] });
+  assert.equal(await m.main([], h.io, ROOT), 0);
+  assert.equal(h.state()._missed_since, undefined);
+  touch(WA, OLD);
+});
+
+test("stickyMissed: keeps the first sighting for the same process only", () => {
+  const run = { pid: 7, startedMs: 1000 };
+  assert.equal(m.stickyMissed(undefined, run, 0), null);
+  assert.deepEqual(m.stickyMissed(undefined, run, 5000), { pid: 7, startedMs: 1000, sinceMs: 5000 });
+  assert.equal(m.stickyMissed({ pid: 7, startedMs: 1000, sinceMs: 2000 }, run, 9000).sinceMs, 2000);
+  assert.equal(m.stickyMissed({ pid: 8, startedMs: 1000, sinceMs: 2000 }, run, 9000).sinceMs, 9000);
+  assert.equal(m.stickyMissed({ pid: 7, startedMs: 999, sinceMs: 2000 }, run, 9000).sinceMs, 9000);
+  assert.equal(m.stickyMissed({ pid: 7, startedMs: 1000, sinceMs: 2000 }, run, 0), null);
+  assert.equal(m.stickyMissed({ pid: 7, startedMs: 1000, sinceMs: 2000 }, run, 0, true).sinceMs, 2000);
+  assert.equal(m.stickyMissed({ pid: 8, startedMs: 1000, sinceMs: 2000 }, run, 0, true), null);
+});
+
 test("code left uncommitted 12h+ is flagged; runtime data and young edits are not", async () => {
   const since = (h) => new Date(NOW - h * H).toISOString();
   const h = harness({
