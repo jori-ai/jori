@@ -13,6 +13,19 @@
 // --to accepts a comma-separated list (e.g. "a@x.com,b@y.com") so multiple
 // recipients land on the SAME message/thread (two recipients of one thread
 // need to see the same email, not two separate ones).
+//
+//   email-send --check-delivery <email_id> [--wait <seconds>] [--interval <seconds>] [--json]
+//   email-send --check-delivery --subject "<exact subject>" [--wait …] [--json]
+//
+// "Sent: … succeeded=1" means the mail service ACCEPTED the message, not that it
+// arrived. --check-delivery waits (default 300s; 0 = check once) for the real
+// answer from the service's delivery record and, when the owner is a recipient,
+// the owner's mailbox (lib/digest-deliver.mjs § Did it arrive?). --subject takes
+// the newest send with exactly that subject in the last day from the sent-mail
+// log. Prints one line (or JSON). Exit: 0 in the inbox (anyone else: accepted by
+// their server) · 2 still held by the mail service · 3 bounced, rejected or never
+// taken · 4 arrived but not in the inbox (Spam, Trash, archived, or not visible
+// minutes after acceptance) · 1 could not check. Sends nothing.
 
 import { createRequire } from "node:module";
 import fs from "node:fs";
@@ -91,6 +104,8 @@ Usage:
              [--from <addr>] [--from-name <name>]
              [--reply-to <addr>] [--no-reply-to]
              [--in-reply-to <message-id>] [--references <ids>]
+  email-send --check-delivery (<email_id> | --subject <s>) [--wait <seconds>] [--json]
+             did a sent message arrive? (exit 0 inbox · 2 held · 3 bounced · 4 not in inbox · 1 unknown)
 
 Defaults:
   From:     ${DEFAULT_FROM_NAME} <${DEFAULT_FROM_ADDRESS}>
@@ -299,9 +314,49 @@ async function send(a) {
   }
 }
 
-const args = parseArgs(process.argv);
-if (!args.to || !args.subject || args.body === null) {
-  printUsage();
-  process.exit(1);
+// Read-only mode: did a message this tool sent arrive? Loaded only here, so the
+// send path gains no dependency.
+async function checkDeliveryMode(argv) {
+  const d = await import("../lib/digest-deliver.mjs");
+  const o = { emailId: null, subject: null, wait: 300, interval: 15, json: false };
+  const usage = 'usage: email-send --check-delivery (<email_id> | --subject "<exact subject>") [--wait <seconds>] [--interval <seconds>] [--json]';
+  for (let i = 0; i < argv.length; i++) {
+    const k = argv[i];
+    if (k === "-h" || k === "--help") { console.log(usage); process.exit(0); }
+    else if (k === "--subject") o.subject = argv[++i];
+    else if (k === "--wait") o.wait = Number(argv[++i]);
+    else if (k === "--interval") o.interval = Number(argv[++i]);
+    else if (k === "--json") o.json = true;
+    else if (!k.startsWith("--") && !o.emailId) o.emailId = k;
+    else { console.error(`email-send --check-delivery: unknown arg: ${k}`); process.exit(1); }
+  }
+  if ((!o.emailId && o.subject == null) || !(o.wait >= 0) || !(o.interval > 0)) {
+    console.error(usage);
+    process.exit(1);
+  }
+  const report = (r) => {
+    console.log(o.json ? JSON.stringify(r) : `${r.status}: ${r.detail}${r.subject ? ` (${r.subject})` : ""}`);
+    process.exit(r.exit);
+  };
+  const sent = d.findSentLogEntry({ emailId: o.emailId, subject: o.subject, logText: d.readSentLog(SENT_LOG) });
+  if (!sent) {
+    report({ status: "unknown", exit: d.DELIVERY_EXIT.unknown, subject: o.subject,
+      detail: o.emailId ? `no send with email id ${o.emailId} in the sent-mail log` : "no send with exactly that subject in the last day" });
+  }
+  try {
+    report(await d.checkDelivery(sent, { owner: OWNER_ADDRESS, waitMs: o.wait * 1000, intervalMs: o.interval * 1000, deps: await d.deliveryDeps() }));
+  } catch (e) {
+    report({ status: "unknown", exit: d.DELIVERY_EXIT.unknown, detail: `check failed: ${e.message}`, subject: sent.subject });
+  }
 }
-send(args).catch((e) => { console.error(`email-send fatal: ${e.message}`); process.exit(1); });
+
+if (process.argv[2] === "--check-delivery") {
+  await checkDeliveryMode(process.argv.slice(3));
+} else {
+  const args = parseArgs(process.argv);
+  if (!args.to || !args.subject || args.body === null) {
+    printUsage();
+    process.exit(1);
+  }
+  send(args).catch((e) => { console.error(`email-send fatal: ${e.message}`); process.exit(1); });
+}
