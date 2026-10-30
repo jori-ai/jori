@@ -73,9 +73,11 @@ function doctorChecks({ tasks, clockJobs = [], cronLines, execs = {} }) {
   fs.writeFileSync(path.join(bin, "crontab"), `#!/bin/sh\ncat <<'EOF'\n${lines.join("\n")}\nEOF\n`, { mode: 0o755 });
   fs.writeFileSync(path.join(bin, "curl"), "#!/bin/sh\nexit 7\n", { mode: 0o755 });
   try {
+    // JORI_TZ: the installation's home zone (the crontab's) is the fixture's too,
+    // whatever the host's zone or the checkout's agent/local says.
     const r = spawnSync(process.execPath, [path.join(ROOT, "bin/jori"), "doctor", "--json"], {
       encoding: "utf8", timeout: 60000,
-      env: { PATH: `${bin}:/usr/bin:/bin`, HOME: home, NO_COLOR: "1" },
+      env: { PATH: `${bin}:/usr/bin:/bin`, HOME: home, NO_COLOR: "1", JORI_TZ: "America/New_York" },
     });
     assert.ok(!r.stderr.includes("TypeError"), r.stderr.slice(0, 400));
     return JSON.parse(r.stdout);

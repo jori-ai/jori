@@ -14,7 +14,8 @@ import { fileURLToPath } from "node:url";
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "jev-loc-"));
 process.env.JEV_CONFIG_FILE = path.join(tmp, "jev-config.json");
-process.env.JEV_QUESTIONS_DIR = path.join(HERE, "../data/jev-questions");
+// The kernel's question definitions (an installation may override them in data/jev-questions).
+process.env.JEV_QUESTIONS_DIR = path.join(HERE, "../agent/config/jev-questions");
 process.env.JEV_SHADOW_DIR = path.join(tmp, "shadow");
 process.env.JEV_NO_ALERT = "1";
 process.env.TYPESAFE_API_KEY = "test-key";

@@ -44,7 +44,8 @@
 //
 //   --root <dir>        repo root (default: two levels above this script)
 //   --manifest <file>   default <root>/system/kernel-manifest.json (absent in a
-//                       switched install: built from the kernel and overlay repos)
+//                       switched install: built from the kernel and overlay repos;
+//                       in a plain clone of the kernel repo, from its files alone)
 //   --patterns <file>   default: $KERNEL_GUARD_PATTERNS, else
 //                       agent/local/config/kernel-guard.json `patterns_file`, else
 //                       <root>/system/personal-patterns.json (paths relative to the root)
@@ -201,6 +202,9 @@ function loadManifest(o) {
     // A switched install: no manifest file, its kernel and overlay repos instead.
     const synth = kg.synthManifest(o.root);
     if (synth) return synth;
+    // A plain clone of the kernel repo (CI): every tracked file is kernel.
+    const kernelOnly = kg.kernelOnlyManifest(o.root);
+    if (kernelOnly) return kernelOnly;
   }
   return readJson(o.manifest, "manifest");
 }

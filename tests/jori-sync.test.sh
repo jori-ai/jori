@@ -168,7 +168,13 @@ check "HEAD unchanged"                '[ "$(g "$TMP/mini" rev-parse HEAD)" = "$b
 check "no conflict markers"           '! grep -q "^<<<<<<<" "$TMP/mini/${KT}system/changelog.md"'
 
 echo "9. the real repo routes the changelog to the merge driver"
-check "changelog.md merge=changelog"  'grep -qx "system/changelog.md merge=changelog" "$HERE/../.gitattributes"'
+# The changelog and its .gitattributes line are the installation's (a plain
+# kernel checkout has neither), so this is checked where they exist.
+if [ -f "$HERE/../system/changelog.md" ]; then
+  check "changelog.md merge=changelog"  'grep -qx "system/changelog.md merge=changelog" "$HERE/../.gitattributes"'
+else
+  echo "  skip no system/changelog.md in this checkout"
+fi
 
 echo "10. the commit gates are wired on a host that is not, never overridden"
 fresh

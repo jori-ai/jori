@@ -49,6 +49,21 @@ test("no overlay and no manifest: nothing to synthesize", () => {
   assert.equal(kg.synthManifest(setup({ overlay: false })), null);
 });
 
+test("a plain kernel clone (no overlay, no manifest, as CI checks out): every tracked file is kernel", () => {
+  const root = setup({ overlay: false });
+  const m = kg.kernelOnlyManifest(root);
+  assert.ok(m._kernel_only && m._synthesized);
+  assert.deepEqual(Object.keys(m.files).sort(), [K("lib/generic.mjs")]);
+  assert.ok(K("lib/icon.png") in m.jori_owned);
+  assert.deepEqual(m.personal_globs, []);
+  assert.equal(kg.kernelOnlyManifest(setup()), null, "an install with an overlay is synthManifest's");
+  const r = spawnSync(process.execPath, [BIN, "--root", root, "--report", "--json"], { encoding: "utf8", env: ENV });
+  assert.equal(r.status, 0, r.stderr);
+  assert.equal(JSON.parse(r.stdout).totals.files_scanned, 1);
+  const c = spawnSync(process.execPath, [BIN, "--root", root, "--closure", "--json"], { encoding: "utf8", env: ENV });
+  assert.equal(c.status, 0, c.stderr);
+});
+
 test("the kernel is the kernel repo's files, the personal files the overlay's; media is classified, not scanned", () => {
   const root = setup();
   const m = kg.synthManifest(root);

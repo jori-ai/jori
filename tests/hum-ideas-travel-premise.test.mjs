@@ -27,7 +27,12 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { travelPremiseValid as check } from "../agent/scripts/hum-harvesters/ideas.mjs";
-import { buildGazetteer } from "../lib/claim-facts.mjs";
+import { buildGazetteer, presenceProvider, NO_PRESENCE } from "../lib/claim-facts.mjs";
+
+// Resolving where the user was on a date is the installation's presence hook
+// (lib/_ext/presence.mjs); the kernel ships none, and without one every claim
+// passes (fail-open), so the contradiction case needs the hook.
+const NO_HOOK = presenceProvider() === NO_PRESENCE ? "no presence provider installed (lib/_ext/presence.mjs)" : false;
 
 const segments = [
   { metro: "northport", place_label: "Northport", arrive_at: "2026-06-01T12:00:00+00:00", depart_at: "2026-06-04T09:00:00+00:00", source: "manual" },
@@ -48,7 +53,7 @@ function idea(overrides = {}) {
   };
 }
 
-test("travelPremiseValid: rejects a stale city claim (Northport, swapped for Southvale)", () => {
+test("travelPremiseValid: rejects a stale city claim (Northport, swapped for Southvale)", { skip: NO_HOOK }, () => {
   assert.equal(travelPremiseValid(idea()), false);
 });
 

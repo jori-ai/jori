@@ -74,7 +74,11 @@ test("the real ruleset: core is a fraction of the file, every category has a uni
   const local = readOptional(fileURLToPath(new URL("../agent/local/email-triage-rules.md", import.meta.url)));
   const md = mergeSectionedMarkdown(kernel, local);
   const doc = parse(md);
-  assert.ok(core(doc).length < md.length * 0.45, "core must be well under half the file");
+  if (local) assert.ok(core(doc).length < md.length * 0.45, "core must be well under half the file");
+  // A fresh install reads the kernel ruleset alone, whose categories are few
+  // (an installation adds its own): its core was ~55% of it when this bound
+  // was set. The bound keeps the always-read part from growing.
+  else assert.ok(core(doc).length < md.length * 0.6, "the kernel ruleset's core must not grow past 60% of it");
   const slugs = doc.sections.filter((s) => !s.core).map((s) => s.slug);
   assert.equal(new Set(slugs).size, slugs.length);
   assert.ok(core(doc).includes("### Step 5: Act"));

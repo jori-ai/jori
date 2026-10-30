@@ -1,0 +1,110 @@
+#!/usr/bin/env node
+// heartbeat-watchdog-env — the deploy-time parameters of the off-box heartbeat
+// watchdog (firebase/functions/index.js: checkHeartbeat + checkMinibeat), from
+// this installation's own config. Never deploys anything.
+//
+// The functions read every per-installation value from firebase/functions/.env
+// (Firebase parameterized configuration; the file is gitignored). This renders
+// that file:
+//
+//   HEARTBEAT_DATABASE_URL  agent/local/config/heartbeat.json firebase_url
+//                           (the database heartbeat-sender.sh and bin/minibeat write)
+//   ALERT_EMAIL             instance.json owner_email (sends + receives; its Gmail
+//                           app password is the GMAIL_APP_PASSWORD secret)
+//   OWNER_TZ                instance.json tz
+//   SUPABASE_URL            instance.json supabase_project (device_tokens for push)
+//   APNS_TEAM_ID / APNS_KEY_ID / APNS_BUNDLE_ID   agent/local/config/apns.json
+//
+// How the alerts word things (HOST_NAME, HEARTBEAT_HOST_NAME, ALERT_SENDER_NAME,
+// ROUTER_LABEL, OUT_OF_BAND_CHECKS; see index.js for the defaults) is the
+// installation's own file firebase/functions/.env.<project id>, which the
+// Firebase CLI layers over .env at deploy. Mail rules may key on the alert
+// subjects, so an installation pins its wording there.
+//
+// The Firebase project is instance.json gcp_project.
+//
+// Usage:
+//   heartbeat-watchdog-env            print the .env it would write
+//   heartbeat-watchdog-env --write    write firebase/functions/.env
+//   heartbeat-watchdog-env --project  print the Firebase project id
+//
+// Deploying (by hand, from the install; needs the firebase CLI logged in to
+// the project, and the three secrets set once with
+// `firebase functions:secrets:set <NAME> --project <id>`: GMAIL_APP_PASSWORD,
+// APNS_KEY_P8, SUPABASE_SERVICE_ROLE_KEY):
+//
+//   bin/heartbeat-watchdog-env --write
+//   (cd firebase/functions && npm ci)
+//   (cd firebase && firebase deploy --only functions,database --project "$(../bin/heartbeat-watchdog-env --project)")
+//
+// Afterwards, check that the two Cloud Scheduler jobs
+// (firebase-schedule-checkHeartbeat-us-central1, ...-checkMinibeat-...) are
+// ENABLED: a paused scheduler is a silently dead watchdog.
+//
+// Without a firebase_url, owner_email or gcp_project the watchdog is not
+// configured: this says so on stderr, writes nothing and exits 0.
+
+"use strict";
+const fs = require("node:fs");
+const path = require("node:path");
+const { instance, localConfig, supabaseUrl } = require("../lib/instance.cjs");
+const { toolsPath } = require("../lib/root.cjs");
+
+const args = process.argv.slice(2);
+for (const a of args) {
+  if (!["--write", "--project", "-h", "--help"].includes(a)) {
+    process.stderr.write(`heartbeat-watchdog-env: unknown option ${a}\nusage: heartbeat-watchdog-env [--write | --project]\n`);
+    process.exit(2);
+  }
+}
+if (args.includes("-h") || args.includes("--help")) {
+  const head = [];
+  for (const l of fs.readFileSync(__filename, "utf8").split("\n").slice(1)) { if (!l.startsWith("//")) break; head.push(l.replace(/^\/\/ ?/, "")); }
+  process.stdout.write(head.join("\n") + "\n");
+  process.exit(0);
+}
+
+const inst = instance();
+const hb = localConfig("heartbeat", { firebase_url: "" });
+const apns = localConfig("apns", { team_id: "", key_id: "", bundle_id: "" });
+const project = inst.gcp_project || "";
+
+const missing = [];
+if (!hb.firebase_url) missing.push("agent/local/config/heartbeat.json firebase_url");
+if (!inst.owner_email) missing.push("instance.json owner_email");
+if (!project) missing.push("instance.json gcp_project");
+if (missing.length) {
+  // stderr, so `--project` in a deploy command expands to nothing rather than to this.
+  process.stderr.write(`heartbeat-watchdog-env: the off-box watchdog is not configured (missing ${missing.join(", ")})\n`);
+  process.exit(0);
+}
+
+if (args.includes("--project")) {
+  process.stdout.write(project + "\n");
+  process.exit(0);
+}
+
+const params = {
+  HEARTBEAT_DATABASE_URL: String(hb.firebase_url).replace(/\/+$/, ""),
+  ALERT_EMAIL: inst.owner_email,
+  OWNER_TZ: inst.tz,
+  SUPABASE_URL: supabaseUrl(),
+  APNS_TEAM_ID: apns.team_id || "",
+  APNS_KEY_ID: apns.key_id || "",
+  APNS_BUNDLE_ID: apns.bundle_id || "",
+};
+// An empty value would override the function's default with "": leave it out.
+const quote = (v) => (/^[\w@.:/+-]*$/.test(v) ? v : JSON.stringify(v));
+const text = "# Rendered by bin/heartbeat-watchdog-env from this installation's config; do not edit by hand.\n"
+  + Object.entries(params).filter(([, v]) => v !== "" && v != null).map(([k, v]) => `${k}=${quote(String(v))}`).join("\n") + "\n";
+
+if (args.includes("--write")) {
+  const out = toolsPath("firebase", "functions", ".env"); // kernel-closure-ok: the file this command writes (gitignored output)
+  fs.mkdirSync(path.dirname(out), { recursive: true });
+  fs.writeFileSync(out, text);
+  const wording = toolsPath("firebase", "functions", `.env.${project}`);
+  process.stdout.write(`wrote ${path.relative(toolsPath(), out)} (${text.split("\n").length - 2} parameters) for project ${project}`
+    + (fs.existsSync(wording) ? `; alert wording from ${path.relative(toolsPath(), wording)}\n` : "; no alert wording file, the defaults apply\n"));
+} else {
+  process.stdout.write(text);
+}

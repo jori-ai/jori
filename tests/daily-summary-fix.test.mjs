@@ -606,15 +606,21 @@ test("his quiet hours are read in his current zone, so they follow him when he t
   } finally { s.done(); }
 });
 
+// The phone reading comes from the installation's optional device hook
+// (bin/_ext/jori-cli.cjs activityOverride); the kernel ships none, so a plain
+// kernel checkout only has the chat signal.
+const HAS_DEVICE_HOOK = fs.existsSync(path.resolve(import.meta.dirname, "..", "bin", "_ext", "jori-cli.cjs"));
+
 test("he is up when his phone says so (the sleep-night reading hum uses), else when he has written in chat; never before 7am", () => {
-  for (const [why, phone, lastMsg, sweepAt, due] of [
+  for (const [why, phone, lastMsg, sweepAt, due, needsHook] of [
     ["phone locked since bed", { inBed: true }, "", "2026-10-27T05:52:00Z", false],
-    ["the night's first unlock 20 minutes ago", { upMinAgo: 20 }, "", "2026-10-27T05:52:00Z", true],
+    ["the night's first unlock 20 minutes ago", { upMinAgo: 20 }, "", "2026-10-27T05:52:00Z", true, true],
     ["the phone is up, but it is 6:52am", { upMinAgo: 20 }, "", "2026-10-27T04:52:00Z", false],
     ["no fresh phone reading; he wrote at 7:26am", { upMinAgo: 20, writtenMinAgo: 30 }, "2026-10-27T05:26:00Z", "2026-10-27T05:52:00Z", true],
     ["no fresh phone reading; he last wrote at 6:30am", { writtenMinAgo: 30 }, "2026-10-27T04:30:00Z", "2026-10-27T05:52:00Z", false],
     ["no phone reading at all; he wrote at 7:26am", null, "2026-10-27T05:26:00Z", "2026-10-27T05:52:00Z", true],
   ]) {
+    if (needsHook && !HAS_DEVICE_HOOK) continue;
     const s = sandbox({ quiet: QUIET });
     try {
       s.at("2026-10-27T02:19:18Z")("ask", OCT26, "--question", "Was Sam with you at dinner?");
@@ -626,14 +632,16 @@ test("he is up when his phone says so (the sleep-night reading hum uses), else w
     } finally { s.done(); }
   }
   // Once the user is up, a new question goes straight away; a 7:52 release keeps the 11am window.
+  // (Up by the phone where the device hook exists, else by a chat message at 7:30.)
   const s = sandbox({ quiet: QUIET });
+  const up = HAS_DEVICE_HOOK ? {} : { DS_FIX_LAST_USER_MSG: "2026-10-27T05:30:00Z" };
   try {
     s.at("2026-10-27T02:19:18Z")("ask", OCT26, "--question", "Was Sam with you at dinner?");
     s.sleep({ upMinAgo: 20 });
-    s.at("2026-10-27T05:52:01Z")("sweep");
-    s.at("2026-10-27T05:52:20Z")("release-held");
+    s.at("2026-10-27T05:52:01Z", "Asia/Jerusalem", up)("sweep");
+    s.at("2026-10-27T05:52:20Z", "Asia/Jerusalem", up)("release-held");
     assert.ok(s.sends()[0].endsWith("(I'm holding the summary until you answer, or until 11am at the latest.)"), s.sends()[0]);
-    s.at("2026-10-27T05:55:00Z")("ask", OCT26, "--question", "Did you walk home?");
+    s.at("2026-10-27T05:55:00Z", "Asia/Jerusalem", up)("ask", OCT26, "--question", "Did you walk home?");
     assert.equal(s.sends().length, 2);
     assert.ok(s.sends()[1].startsWith("--no-push ") && s.sends()[1].endsWith("summary: Did you walk home?"), s.sends()[1]);
   } finally { s.done(); }

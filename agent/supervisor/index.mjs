@@ -284,7 +284,8 @@ function loadAgentConfig(configPath, agentName) {
 }
 
 async function importTriageLog() {
-  const mod = await import(path.join(JORI_ROOT, "lib/triage-log.js"));
+  // Code comes from this checkout (a worktree, a CI clone), not the install.
+  const mod = await import(new URL("../../lib/triage-log.js", import.meta.url).href);
   return mod.triageLog;
 }
 

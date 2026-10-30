@@ -26,10 +26,11 @@ import { fileURLToPath } from "node:url";
 const HERE = dirname(fileURLToPath(import.meta.url));
 const BIN = process.env.PHOTOS_SYNC_GAPS_BIN || join(HERE, "..", "bin", "photos-sync-gaps");
 
-const dayOffset = (n) => {
-  const d = new Date(Date.now() - n * 86400000 - 4 * 3600000);
-  return d.toISOString().slice(0, 10);
-};
+// The binary counts days in the installation's zone: pin it to UTC for the
+// child (JORI_TZ) so these UTC dates are the binary's dates on any host and
+// with or without a private installation.
+const ENV = { ...process.env, JORI_TZ: "UTC" };
+const dayOffset = (n) => new Date(Date.now() - n * 86400000).toISOString().slice(0, 10);
 
 function scratch() {
   return mkdtempSync(join(tmpdir(), "photos-gaps-"));
@@ -83,7 +84,7 @@ function run(args, { counts, ledgerPath, photosBin, rendered }) {
     writeFileSync(rp, JSON.stringify(rendered));
     argv.push("--rendered-json", rp);
   }
-  return JSON.parse(execFileSync(BIN, argv, { encoding: "utf8" }));
+  return JSON.parse(execFileSync(BIN, argv, { encoding: "utf8", env: ENV }));
 }
 
 test("a day with zero rows in the window is a catch-up candidate", () => {
