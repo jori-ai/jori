@@ -5,6 +5,14 @@
 // Defaults to the Jori identity (name + agent address) with Reply-To set to
 // the agent address so replies route back through the inbound Jori channel.
 //
+// Mail from the agent's own address whose ONLY recipient is the owner skips
+// the mail service: it is put straight into the owner's mailbox through the
+// Gmail API (lib/digest-deliver.mjs § Straight into the owner's mailbox), in
+// the inbox the moment this returns, and prints `… via=mailbox`. SMTP2Go can
+// hold a message in its own queue for minutes (up to 45 seen) before it even
+// tries to deliver it. Anything else, and any failure of that path, goes through
+// SMTP2Go. EMAIL_SEND_VIA_PROVIDER=1 sends everything through SMTP2Go.
+//
 // Usage:
 //   email-send --to <addr>[,<addr>...] --subject <s> --body <text> [--html] [--attach <file>]...
 //              [--from <addr>] [--from-name <name>] [--reply-to <addr>] [--body-file <path>]
@@ -18,7 +26,8 @@
 //   email-send --check-delivery --subject "<exact subject>" [--wait …] [--json]
 //
 // "Sent: … succeeded=1" means the mail service ACCEPTED the message, not that it
-// arrived. --check-delivery waits (default 300s; 0 = check once) for the real
+// arrived (a `via=mailbox` send is already in the owner's inbox; the check
+// confirms it is still there). --check-delivery waits (default 300s; 0 = check once) for the real
 // answer from the service's delivery record and, when the owner is a recipient,
 // the owner's mailbox (lib/digest-deliver.mjs § Did it arrive?). --subject takes
 // the newest send with exactly that subject in the last day from the sent-mail
@@ -109,7 +118,11 @@ Usage:
 
 Defaults:
   From:     ${DEFAULT_FROM_NAME} <${DEFAULT_FROM_ADDRESS}>
-  Reply-To: ${DEFAULT_REPLY_TO}`);
+  Reply-To: ${DEFAULT_REPLY_TO}
+
+Mail from the agent's address to the owner alone goes straight into the
+owner's mailbox (prints via=mailbox); EMAIL_SEND_VIA_PROVIDER=1 sends it
+through SMTP2Go instead.`);
 }
 
 // Extract plain text from HTML for the multipart/alternative text_body.
@@ -217,6 +230,39 @@ async function send(a) {
   // they are enforced in gmail-action's send command, the actual external /
   // on-behalf-of-the-user path.
 
+  // Mail from the agent's own address whose only recipient is the owner goes
+  // straight into the owner's mailbox instead (lib/digest-deliver.mjs §
+  // Straight into the owner's mailbox): SMTP2Go can hold a message in its queue
+  // for minutes before it even tries to deliver it, and this mail never needs to
+  // leave the owner's own account. If that path fails for any reason, the
+  // message goes through SMTP2Go below exactly as before.
+  if (toHasOwner && toList.length === 1) {
+    let direct = null;
+    try {
+      const dd = await import("../lib/digest-deliver.mjs");
+      if (dd.ownerMailboxEligible({ to: toList, from: a.fromAddress, owner: OWNER_ADDRESS })) {
+        direct = await dd.deliverToOwnerMailbox({
+          from: a.fromAddress, fromName: a.fromName, to: toList, subject: a.subject,
+          html: a.html ? a.body : null, text: a.html ? htmlToText(a.body) : a.body,
+          replyTo: a.replyTo, inReplyTo: a.inReplyTo, references: a.references,
+          attachments: a.attachments.map((att) => ({
+            filename: att.cid || path.basename(att.path), cid: att.cid || null,
+            mimetype: guessMimeType(att.path), content: fs.readFileSync(att.path),
+          })),
+        }, { owner: OWNER_ADDRESS });
+      }
+    } catch (err) {
+      direct = null;
+      console.error(`email-send: could not put it straight into the owner's mailbox (${err.message}); sending through SMTP2Go`);
+    }
+    if (direct) {
+      console.log(`Sent: email_id=${direct.emailId} succeeded=1 failed=0 via=mailbox`);
+      await logSent(a, toList, { email_id: direct.emailId, message_id: direct.messageId, gmail_id: direct.gmailId, transport: "mailbox" });
+      await autoLabel(a, toHasOwner, direct.emailId);
+      return;
+    }
+  }
+
   const sender = a.fromName ? `${a.fromName} <${a.fromAddress}>` : a.fromAddress;
   const payload = {
     api_key: API_KEY,
@@ -269,12 +315,18 @@ async function send(a) {
   }
   const d = data.data || {};
   console.log(`Sent: email_id=${d.email_id || "?"} succeeded=${d.succeeded} failed=${d.failed}`);
+  await logSent(a, toList, { email_id: d.email_id || null });
+  await autoLabel(a, toHasOwner, d.email_id);
+}
 
-  // Sent-mail log lets the email-inbound playbook resolve replies via In-Reply-To.
+// Sent-mail log lets the email-inbound playbook resolve replies via In-Reply-To.
+// `extra` carries the email id, and for a message put straight into the
+// owner's mailbox its Message-ID, mailbox id and `transport: "mailbox"`.
+async function logSent(a, toList, extra) {
   try {
     const entry = {
       ts: new Date().toISOString(),
-      email_id: d.email_id || null,
+      ...extra,
       from: a.fromAddress,
       to: toList,
       subject: a.subject,
@@ -287,19 +339,21 @@ async function send(a) {
   } catch (err) {
     console.error(`email-send: sent-log append failed: ${err.message}`);
   }
+}
 
-  // Auto-label agent-originated mail in the user's inbox so triage/search can
-  // distinguish it from inbound mail. Only labels when the From identity is
-  // the default Jori address and the recipient is the user's address — i.e.
-  // a self-addressed agent memo. Fires in the background; failures are silent.
-  // The try/catch is load-bearing, not defensive habit. SMTP2Go has already
-  // accepted the message by this point, so a throw here cannot un-send it. It
-  // can only turn a delivered email into a non-zero exit, which every caller
-  // reads as "not delivered" and alerts on. That is exactly what happened
-  // once: a dangling variable reference threw right here, AFTER successful
-  // sends, and a digest job reported "email delivery failed (SMTP2Go
-  // unreachable)" for digests that were already in the user's inbox.
-  // Past the delivery check above, bookkeeping warns; it never fails the send.
+// Auto-label agent-originated mail in the user's inbox so triage/search can
+// distinguish it from inbound mail. Only labels when the From identity is
+// the default Jori address and the recipient is the user's address — i.e.
+// a self-addressed agent memo. Fires in the background; failures are silent.
+// The try/catch is load-bearing, not defensive habit. The message has already
+// been accepted (or put into the mailbox) by this point, so a throw here cannot
+// un-send it. It can only turn a delivered email into a non-zero exit, which
+// every caller reads as "not delivered" and alerts on. That is exactly what
+// happened once: a dangling variable reference threw right here, AFTER
+// successful sends, and a digest job reported "email delivery failed (SMTP2Go
+// unreachable)" for digests that were already in the user's inbox.
+// Past the delivery check above, bookkeeping warns; it never fails the send.
+async function autoLabel(a, toHasOwner, emailId) {
   try {
     if (AGENT_ADDRESS && a.fromAddress === AGENT_ADDRESS && toHasOwner) {
       const { spawn } = await import("node:child_process");
@@ -310,12 +364,12 @@ async function send(a) {
       ).unref();
     }
   } catch (err) {
-    console.error(`email-send: auto-label failed after successful delivery (email_id=${d.email_id || "?"}): ${err.message}`);
+    console.error(`email-send: auto-label failed after successful delivery (email_id=${emailId || "?"}): ${err.message}`);
   }
 }
 
-// Read-only mode: did a message this tool sent arrive? Loaded only here, so the
-// send path gains no dependency.
+// Read-only mode: did a message this tool sent arrive? The library is loaded
+// lazily, here and on the owner-mailbox send path only.
 async function checkDeliveryMode(argv) {
   const d = await import("../lib/digest-deliver.mjs");
   const o = { emailId: null, subject: null, wait: 300, interval: 15, json: false };

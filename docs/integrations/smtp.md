@@ -59,6 +59,10 @@ email-send --to <to> --subject <subj> [--body <text> | --body-file <path>] [--ht
 
 If you want some emails sent FROM the user's actual Gmail (not from a Jori sender), that's a separate path — see the `gmail-action send --from <your address> ...` pattern in `agent/CLAUDE.md` § Outbound Email Policy. Requires the same Gmail OAuth flow as inbound triage (`docs/integrations/gmail.md`). Strict rule: only used when the user explicitly asks the agent to email a third party as themselves.
 
+## Mail to your own address skips the provider
+
+When the agent emails **you alone** from its own address, `email-send` does not use the provider at all: it hands the message straight to your Gmail with the Gmail API's `messages.import` (with `neverMarkSpam`), using the same OAuth token as inbound triage (`docs/integrations/gmail.md`). It is in your inbox when the command returns, classified and announced like any arriving mail, and prints `via=mailbox`. A transactional provider can hold a message in its own queue for minutes before its first delivery attempt, and this mail never needs to leave your account. It first checks the token belongs to your address, and on any failure it sends through the provider as usual. Mail to anyone else (or to you and someone else) always goes through the provider. Set `EMAIL_SEND_VIA_PROVIDER=1` to send everything through the provider.
+
 ## House style
 
 `email-send` itself applies no style gate; style rules for agent-written mail live in the agent rules (`agent/CLAUDE.md` § Outbound Email Policy) and in your own `agent/local/` rules. Mail the agent sends to your own address is auto-labeled on arrival so triage does not treat it as new inbound mail.

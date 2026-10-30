@@ -216,3 +216,197 @@ test("providerEvents keeps only this message's events and surfaces API errors", 
   await assert.rejects(providerEvents("x", { since: T0, until: T0, apiKey: "k", fetchImpl: bad }), /denied/);
   await assert.rejects(providerEvents("x", { since: T0, until: T0, apiKey: "", fetchImpl }), /SMTP2GO_API_KEY/);
 });
+
+// ── Straight into the owner's mailbox: the mail service's own queue held agent
+// mail for minutes before trying to deliver it, so mail to the owner alone no
+// longer goes through it. These pin who qualifies, that the message is well
+// formed, that the mailbox is checked to be the owner's, that a lost answer
+// never produces a second copy, and that --check-delivery reads it from the
+// mailbox alone.
+
+import {
+  ownerMailboxEligible, newMessageId, encodeHeaderWords, buildMimeMessage, rfc5322Date,
+  importIntoOwnerMailbox, deliverToOwnerMailbox, bareMessageId,
+} from "../lib/digest-deliver.mjs";
+
+const OWNER = SYNTHETIC.owner_email;
+const AGENT = SYNTHETIC.agent_email;
+
+test("only agent mail to the owner alone goes straight into the mailbox", () => {
+  const base = { owner: OWNER, agents: [AGENT], env: {} };
+  assert.equal(ownerMailboxEligible({ ...base, to: [OWNER], from: AGENT }), true);
+  assert.equal(ownerMailboxEligible({ ...base, to: [OWNER.toUpperCase()], from: ` ${AGENT.toUpperCase()}` }), true);
+  assert.equal(ownerMailboxEligible({ ...base, to: [OWNER, "partner@example.org"], from: AGENT }), false, "a second recipient needs the same message, so the provider");
+  assert.equal(ownerMailboxEligible({ ...base, to: ["someone@example.org"], from: AGENT }), false);
+  assert.equal(ownerMailboxEligible({ ...base, to: [OWNER], from: "other@example.org" }), false, "never put another sender into the mailbox");
+  assert.equal(ownerMailboxEligible({ ...base, to: [OWNER], from: AGENT, env: { EMAIL_SEND_VIA_PROVIDER: "1" } }), false);
+  assert.equal(ownerMailboxEligible({ ...base, owner: "", to: [OWNER], from: AGENT }), false);
+});
+
+test("the logged id sits inside the Message-ID, so reply matching finds it", () => {
+  const { emailId, messageId } = newMessageId(AGENT, { now: 1, rand: "ab12" });
+  assert.equal(emailId, "m.1.ab12");
+  assert.equal(messageId, `<m.1.ab12@${SYNTHETIC.domain}>`);
+  assert.ok(messageId.includes(emailId) && emailId.length >= 8);
+  assert.equal(bareMessageId(messageId), `m.1.ab12@${SYNTHETIC.domain}`);
+});
+
+function decodeWords(v) {
+  return v.split("\r\n ").map((w) => Buffer.from(w.slice("=?UTF-8?B?".length, -2), "base64").toString("utf8")).join("");
+}
+
+test("non-ASCII headers become short encoded-words that decode back exactly", () => {
+  assert.equal(encodeHeaderWords("Plain subject"), "Plain subject");
+  const subject = "Weekly report — October 30 — status ✓ שלום עולם, a long line that needs several words";
+  const enc = encodeHeaderWords(subject);
+  for (const w of enc.split("\r\n ")) assert.ok(w.length <= 75, `${w.length}: ${w}`);
+  assert.equal(decodeWords(enc), subject);
+  assert.equal(encodeHeaderWords("line\r\nInjected: x"), "line  Injected: x");
+});
+
+function parts(raw) {
+  const [head, ...rest] = raw.split("\r\n\r\n");
+  return { head, body: rest.join("\r\n\r\n") };
+}
+
+test("an HTML memo with an inline image and an attachment is a well-formed 7-bit message", () => {
+  const html = "<div><p>Memo — body</p><img src=\"cid:logo.png\"></div>";
+  const raw = buildMimeMessage({
+    from: AGENT, fromName: "Agent \"Bot\"", to: [OWNER], subject: "Memo — Oct 30",
+    html, text: "Memo — body", replyTo: AGENT, inReplyTo: "<a@x>", references: "<a@x> <b@y>",
+    messageId: "<m.1.ab12@example.com>", date: new Date("2026-01-02T12:00:00Z"),
+    attachments: [
+      { filename: "logo.png", cid: "logo.png", mimetype: "image/png", content: Buffer.from([1, 2, 3]) },
+      { filename: "מסמך.pdf", mimetype: "application/pdf", content: Buffer.from("pdf") },
+    ],
+    boundary: (() => { let n = 0; return () => `B${++n}`; })(),
+  });
+  assert.ok(isAsciiText(raw), "7-bit only");
+  for (const line of raw.split("\r\n")) assert.ok(line.length <= 998);
+  assert.equal(raw.split("\r\n").join("").includes("\n"), false, "no bare line feeds");
+  const { head } = parts(raw);
+  assert.ok(head.includes("Date: Fri, 02 Jan 2026 12:00:00 +0000"));
+  assert.ok(head.includes("Message-ID: <m.1.ab12@example.com>"));
+  assert.ok(head.includes(`From: "Agent \\"Bot\\"" <${AGENT}>`));
+  assert.ok(head.includes(`To: ${OWNER}`));
+  assert.ok(head.includes(`Reply-To: ${AGENT}`));
+  assert.ok(head.includes("In-Reply-To: <a@x>"));
+  assert.ok(head.includes("References: <a@x>\r\n <b@y>"));
+  assert.ok(head.includes('Content-Type: multipart/mixed; boundary="B3"'));
+  // mixed(related(alternative(text, html), inline), attachment)
+  assert.ok(raw.indexOf('multipart/related; boundary="B2"') < raw.indexOf('multipart/alternative; boundary="B1"'));
+  assert.ok(raw.includes("Content-ID: <logo.png>"));
+  assert.ok(raw.includes("filename*=UTF-8''%D7%9E%D7%A1%D7%9E%D7%9A.pdf"));
+  const htmlB64 = Buffer.from(html, "utf8").toString("base64");
+  assert.ok(raw.includes(htmlB64.slice(0, 60)), "the HTML part is base64 of the exact body");
+});
+
+function isAsciiText(s) { return Buffer.byteLength(s, "utf8") === s.length; }
+
+test("a plain-text message with nothing attached is a single text part", () => {
+  const raw = buildMimeMessage({ from: AGENT, to: [OWNER], subject: "S", text: "hello", messageId: "<x@y>" });
+  const { head, body } = parts(raw);
+  assert.ok(head.includes("Content-Type: text/plain; charset=UTF-8"));
+  assert.equal(Buffer.from(body.trim(), "base64").toString("utf8"), "hello");
+  const multi = parts(buildMimeMessage({ from: AGENT, to: [OWNER], subject: "S", text: "a\nb\r\nc", messageId: "<x@y>" })).body;
+  assert.equal(Buffer.from(multi.trim(), "base64").toString("utf8"), "a\r\nb\r\nc", "text lines end in CRLF before encoding");
+  assert.equal(rfc5322Date(new Date("2026-10-30T12:00:25Z")), "Fri, 30 Oct 2026 12:00:25 +0000");
+});
+
+// A fake Gmail API: `routes` answers by URL substring, `calls` records what was asked.
+function fakeGmail({ profile = OWNER, parent = null, upload = { ok: true, body: { id: "g1", threadId: "t1" } }, found = [] } = {}) {
+  const calls = [];
+  let searches = 0;
+  const reply = (ok, body, status = ok ? 200 : 500) => ({ ok, status, json: async () => body, text: async () => JSON.stringify(body) });
+  const fetchImpl = async (url, opts = {}) => {
+    calls.push({ url, opts });
+    if (url.endsWith("/profile")) return reply(true, { emailAddress: profile });
+    if (url.includes("/upload/")) {
+      if (upload === "throw") throw new Error("socket hang up");
+      return reply(upload.ok, upload.body, upload.status);
+    }
+    if (url.includes("/messages?q=")) {
+      const q = decodeURIComponent(url.split("q=")[1].split("&")[0]);
+      if (parent && q.includes(bareMessageId(parent.id))) return reply(true, { messages: [{ id: "p", threadId: parent.threadId }] });
+      searches++;
+      return reply(true, { messages: found[searches - 1] || [] });
+    }
+    return reply(false, {}, 404);
+  };
+  return { calls, fetchImpl };
+}
+
+test("it never writes into a mailbox that is not the owner's", async () => {
+  const g = fakeGmail({ profile: "someone-else@example.org" });
+  await assert.rejects(importIntoOwnerMailbox({ raw: "x", messageId: "<m@x>", owner: OWNER }, { token: "t", fetchImpl: g.fetchImpl }), /not the owner/);
+  assert.equal(g.calls.some((c) => c.url.includes("/upload/")), false);
+});
+
+test("it lands unread in the inbox, never names a thread (import refuses one), and returns the mailbox ids", async () => {
+  const g = fakeGmail();
+  const r = await importIntoOwnerMailbox({ raw: "RAW", messageId: "<m@x>", owner: OWNER }, { token: "t", fetchImpl: g.fetchImpl });
+  assert.deepEqual(r, { gmailId: "g1", threadId: "t1" });
+  const up = g.calls.find((c) => c.url.includes("/upload/"));
+  assert.ok(up.url.endsWith("/messages/import?uploadType=multipart&neverMarkSpam=true"), "delivered like arriving mail, never into Spam");
+  assert.ok(up.opts.signal, "every Gmail call has a timeout");
+  assert.equal(up.opts.method, "POST");
+  assert.ok(up.opts.body.includes('{"labelIds":["INBOX","UNREAD"]}'));
+  assert.ok(up.opts.body.includes("Content-Type: message/rfc822\r\n\r\nRAW\r\n"));
+  assert.equal(up.opts.headers.Authorization, "Bearer t");
+});
+
+test("a lost answer is looked up before giving up, so a sent message is never sent twice", async () => {
+  const g = fakeGmail({ upload: "throw", found: [[], [{ id: "g7", threadId: "t7" }]] });
+  const r = await importIntoOwnerMailbox({ raw: "x", messageId: "<m@x>", owner: OWNER }, { token: "t", fetchImpl: g.fetchImpl, lookupDelayMs: 0 });
+  assert.deepEqual(r, { gmailId: "g7", threadId: "t7" });
+});
+
+test("an import that did not go in throws, so email-send falls back to the provider", async () => {
+  const g = fakeGmail({ upload: { ok: false, status: 403, body: { error: "insufficient scope" } } });
+  await assert.rejects(importIntoOwnerMailbox({ raw: "x", messageId: "<m@x>", owner: OWNER }, { token: "t", fetchImpl: g.fetchImpl, lookupDelayMs: 0 }), /import 403/);
+});
+
+test("deliverToOwnerMailbox builds the message from the agent's address and reports its ids", async () => {
+  const g = fakeGmail();
+  const r = await deliverToOwnerMailbox({ from: AGENT, fromName: "Agent", to: [OWNER], subject: "S", html: "<p>x</p>", text: "x" },
+    { owner: OWNER, getToken: async () => "t", fetchImpl: g.fetchImpl, now: new Date(T0) });
+  assert.equal(r.gmailId, "g1");
+  assert.ok(r.messageId.includes(r.emailId));
+  const up = g.calls.find((c) => c.url.includes("/upload/"));
+  assert.ok(up.opts.body.includes(`Message-ID: ${r.messageId}`));
+});
+
+const DIRECT = { ...SENT, email_id: "m.1.ab12", message_id: "<m.1.ab12@example.com>", gmail_id: "g1", transport: "mailbox" };
+
+test("a message put straight into the mailbox is checked in the mailbox alone", async () => {
+  let eventsAsked = 0, seen = null;
+  const deps = {
+    events: async () => { eventsAsked++; return []; },
+    mailbox: async (_id, sent) => { seen = sent; return { id: "g1", labels: ["INBOX", "UNREAD"] }; },
+    now: () => T0 + 1000, sleep: async () => {},
+  };
+  const r = await checkDelivery(DIRECT, { owner: OWNER, waitMs: 0, deps });
+  assert.equal(r.status, "landed");
+  assert.equal(r.exit, 0);
+  assert.equal(eventsAsked, 0, "the mail service has no record of it and is not asked");
+  assert.equal(seen.message_id, DIRECT.message_id);
+});
+
+test("gone from the mailbox is 'not in the inbox', never 'never taken' (which would re-send)", () => {
+  const args = { events: [], mailbox: null, ownerRecipient: true, sentAt: T0, provider: false };
+  assert.equal(classifyDelivery({ ...args, now: T0 + 20000 }).status, "in-transit");
+  const r = classifyDelivery({ ...args, now: T0 + 11 * 60000 });
+  assert.equal(r.status, "not-in-inbox");
+  assert.equal(classifyDelivery({ ...args, mailbox: undefined, now: T0 + 11 * 60000, final: true }).status, "unknown");
+});
+
+test("the mailbox lookup uses the logged Message-ID, then the mailbox id; a deleted message is not there", async () => {
+  let q = null;
+  const empty = { searchIds: async (query) => { q = query; return []; } };
+  const found = await mailboxLookup("m.1.ab12", { gmail: { ...empty, getMessage: async (id) => ({ id, labelIds: ["INBOX"] }) }, messageId: "<m.1.ab12@example.com>", gmailId: "g1" });
+  assert.equal(q, "in:anywhere rfc822msgid:m.1.ab12@example.com");
+  assert.deepEqual(found, { id: "g1", labels: ["INBOX"], receivedAt: null });
+  const gone = await mailboxLookup("m.1.ab12", { gmail: { ...empty, getMessage: async () => { throw new Error("Gmail 404: not found"); } }, messageId: "<m.1.ab12@example.com>", gmailId: "g1" });
+  assert.equal(gone, null);
+  await assert.rejects(mailboxLookup("m.1.ab12", { gmail: { ...empty, getMessage: async () => { throw new Error("Gmail 500: oops"); } }, messageId: "<m@x>", gmailId: "g1" }), /500/);
+});
