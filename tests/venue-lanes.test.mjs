@@ -300,3 +300,141 @@ test("lanes_file and sources_file may be lists of private files, read in order; 
     C.resetVenueConfig();
   }
 });
+
+// ─── artist watches ────────────────────────────────────────────────────────
+
+const RULES = [
+  { id: "w-singer-2", updated_at: "2026-10-03T00:00:00Z", title: "Singer One in any city", condition: "a Singer One show", request: "and Singer One anywhere" },
+  { id: "w-singer", updated_at: "2026-10-01T00:00:00Z", title: "Tell the user when Singer One plays where they are", condition: "a show by Singer One (not Singer Two)", request: "watch for Singer One" },
+  { id: "w-letter", updated_at: "2026-10-02T00:00:00Z", title: "When the bank letter arrives", condition: "a bank letter", request: "tell me when it arrives" },
+];
+const READ = { watches: [
+  { id: "w-singer-2", artist: "Singer One", aliases: [], note: "Singer One, the vocalist (not Singer Two)", query: "Singer One concerts", category: "music" },
+  { id: "w-singer", artist: "Singer One", aliases: ["סינגר וואן"], note: "Singer One, the vocalist (not Singer Two)", query: "Singer One concerts", category: "music" },
+  { id: "w-letter", artist: "", aliases: [], note: "", query: "", category: "other" },
+] };
+
+test("watchedArtists: one read per new or edited watch, inactive ones dropped, a failed read waits for the next run", async () => {
+  const calls = [];
+  const run = async (o) => { calls.push(o); return READ; };
+  const cache = { "w-gone": { updated_at: "x", artist: "Old Act", aliases: ["Old Act"] } };
+  const a = await L.watchedArtists({ rules: RULES, cache, run });
+  assert.deepEqual(a.map((x) => [x.watch_id, x.artist, x.aliases.join("|"), x.query]), [["w-singer-2", "Singer One", "Singer One", "Singer One concerts"], ["w-singer", "Singer One", "Singer One|סינגר וואן", "Singer One concerts"]]);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].model, W.HAIKU);
+  assert.equal(cache["w-gone"], undefined);
+  assert.equal(cache["w-letter"].artist, "", "a watch that is not about a performer is remembered as such");
+  await L.watchedArtists({ rules: RULES, cache, run });
+  assert.equal(calls.length, 1, "nothing new: no model call");
+  const edited = [RULES[0], { ...RULES[1], updated_at: "2026-10-05T00:00:00Z" }, RULES[2]];
+  await L.watchedArtists({ rules: edited, cache, run: async () => { throw new Error("timeout"); } });
+  assert.equal(cache["w-singer"].updated_at, "2026-10-01T00:00:00Z", "the failed read leaves it to be read again");
+  await assert.rejects(() => L.watchedArtists({ rules: edited, cache, run: async () => { throw Object.assign(new Error("not on Max"), { fatal: true }); } }), /not on Max/);
+});
+
+const TOUR = {
+  events_results: [
+    { title: "Far City, ST", date: { start_date: "Nov 12", when: "Thu 7:00 PM" }, time: "7:00 PM", venue: "Hall A" },
+    { title: "Next City, ST", date: { start_date: "Mar 4", when: "Thu 6:30 PM 2027" }, time: "6:30 PM", venue: "Hall B" },
+    { title: "Gone City, ST", date: { start_date: "Oct 27", when: "Tue 8:00 PM" }, venue: "Hall C" },
+    { title: "Ignored title", address: ["Hall D", "Home City, ST"], date: { start_date: "Dec 1", when: "Dec 1, 8:30 PM" }, venue: { name: "Hall D" } },
+  ],
+  organic_results: [{ link: "https://fan-wiki.example.org/singer-one" }, { link: "https://www.ticketmaster.com/singer-one-tickets/artist/1" }],
+};
+
+test("googleTourRows: Google's tour block becomes dated rows with the page's ticketing link; no ticket link, no rows", () => {
+  const rows = L.googleTourRows(TOUR, { artist: "Singer One", today: "2026-10-30" });
+  assert.deepEqual(rows.map((r) => [r.title, r.city, r.state, r.date, r.time, r.url, r.performers[0], r.source]), [
+    ["Singer One — Hall A", "Far City", "ST", "2026-11-12", "19:00", "https://www.ticketmaster.com/singer-one-tickets/artist/1", "Singer One", "serpapi-tour"],
+    ["Singer One — Hall B", "Next City", "ST", "2027-03-04", "18:30", "https://www.ticketmaster.com/singer-one-tickets/artist/1", "Singer One", "serpapi-tour"],
+    ["Singer One — Hall D", "Home City", "ST", "2026-12-01", "20:30", "https://www.ticketmaster.com/singer-one-tickets/artist/1", "Singer One", "serpapi-tour"],
+  ]);
+  assert.deepEqual(L.googleTourRows({ ...TOUR, organic_results: [{ link: "https://fan-wiki.example.org/x" }] }, { artist: "Singer One", today: "2026-10-30" }), []);
+  assert.equal(L.ticketLink({ organic_results: [{ link: "https://shop.example-tix.com/a" }] }, ["example-tix.com"]), "https://shop.example-tix.com/a");
+  assert.equal(L.ticketLink({ organic_results: [{ link: "/goto?url=x" }] }, ["example-tix.com"]), null, "a relative link is not a ticket link");
+  const own = L.googleTourRows({ events_results: [
+    { title: "Far City, ST", date: { start_date: "Nov 12", when: "Thu 7:00 PM" }, venue: "Hall A", link: "https://www.example-tix.com/e/1" },
+    { title: "Far City, ST", date: { start_date: "Nov 13", when: "Fri 7:00 PM" }, venue: "Hall A", link: "https://www.search.example/goto?x" },
+  ], organic_results: [] }, { artist: "Singer One", today: "2026-10-30", hosts: ["example-tix.com"] });
+  assert.deepEqual(own.map((r) => [r.date, r.url]), [["2026-11-12", "https://www.example-tix.com/e/1"]], "an event's own ticketing link, else none");
+  assert.equal(L.ticketLink({ organic_results: [{ link: "https://notexample-tix.com/a" }] }, ["example-tix.com"]), null);
+});
+
+test("artist watches: store, Ticketmaster and the capped Google search feed watchlist rows; away dates wait unseen; dry runs never search", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "artist-watch-"));
+  const stateFile = path.join(dir, "state.json");
+  process.env.TICKETMASTER_API_KEY = process.env.TICKETMASTER_API_KEY || "test-key";
+  const searches = [];
+  let clock = Date.parse("2026-10-30T07:00:00Z");
+  const deps = {
+    run: async () => READ, rules: async () => RULES,
+    search: (engine, q, p) => { searches.push([engine, q, p]); return { result: TOUR }; },
+    searchesLeft: () => 200,
+    tm: async (name) => (name === "Singer One" ? [{ key: "tm1", source: "tm-artist", title: "Singer One", venue: "Arena", city: "Home City", date: "2026-11-20", time: "20:00", performers: ["Singer One"], url: "https://tm.example/e/1", category: "music" }] : []),
+    inCity: (metro) => metro !== "far city",
+    headliner: () => false, now: () => clock,
+  };
+  const store = { events: {
+    s1: { key: "s1", title: "סינגר וואן בהופעה", venue: "Hall E", date: "2026-11-25", performers: [], category: "music", gate_metro: "metro_b" },
+    s2: { key: "s2", title: "Someone Else", venue: "Hall F", date: "2026-11-26", performers: [], category: "music" },
+    s3: { key: "s3", title: "Singer One", venue: "Hall G", date: "2026-10-01", performers: [], category: "music" },
+  } };
+  const lane = L.buildLane("tour-watch", { ...CFG.lanes["tour-watch"], artist_watches: { state_file: stateFile, max_searches: 3, reserve: 50, refresh_hours: 72 } }, CFG, { artistWatch: deps });
+
+  const all = await lane.extraCandidates({ store, today: "2026-10-30" });
+  assert.deepEqual(searches, [["google", "Singer One concerts", { hl: "en", gl: "us" }]], "two watches for one performer: one search");
+  const rows = all.filter((r) => !r.held);
+  const google = L.googleTourRows(TOUR, { artist: "Singer One", today: "2026-10-30" });
+  assert.deepEqual(rows.map((r) => r.key).sort(), ["s1", "tm1", ...google.filter((r) => r.city !== "Far City").map((r) => r.key)].sort());
+  assert.deepEqual(all.filter((r) => r.held).map((r) => r.city), ["Far City"], "the Far City date is held: the user is not there then");
+  for (const r of all) {
+    assert.equal(r.branch, "watchlist");
+    assert.equal(r.artist, "Singer One");
+    assert.equal(r.watch, "Singer One, the vocalist (not Singer Two)");
+    assert.equal(r.watch_id, "w-singer-2");
+  }
+  const rowsForModel = W.candidateRows(rows);
+  assert.ok(rowsForModel.every((r) => r.watch === "Singer One, the vocalist (not Singer Two)" && r.branch === "watchlist"));
+
+  clock += 24 * 3600e3;
+  await lane.extraCandidates({ store, today: "2026-10-31" });
+  assert.equal(searches.length, 1, "inside refresh_hours: the cached rows, no new search");
+
+  clock += 72 * 3600e3;
+  const before = fs.readFileSync(stateFile, "utf8");
+  const dry = await lane.extraCandidates({ store, today: "2026-11-03", dryRun: true });
+  assert.equal(searches.length, 1, "a dry run never spends a search");
+  assert.equal(fs.readFileSync(stateFile, "utf8"), before, "and writes nothing");
+  assert.ok(dry.some((r) => r.source === "serpapi-tour"), "it still sees the cached rows");
+
+  const low = L.buildLane("tour-watch", { ...CFG.lanes["tour-watch"], artist_watches: { state_file: stateFile, reserve: 50 } }, CFG, { artistWatch: { ...deps, searchesLeft: () => 50 } });
+  await low.extraCandidates({ store, today: "2026-11-03" });
+  assert.equal(searches.length, 1, "at the reserve: no search");
+  const blind = L.buildLane("tour-watch", { ...CFG.lanes["tour-watch"], artist_watches: { state_file: stateFile } }, CFG, { artistWatch: { ...deps, searchesLeft: () => null } });
+  await blind.extraCandidates({ store, today: "2026-11-03" });
+  assert.equal(searches.length, 1, "an unreadable allowance fails closed");
+  await lane.extraCandidates({ store, today: "2026-11-03" });
+  assert.equal(searches.length, 2, "past refresh_hours with allowance: searched again");
+
+  const failing = L.buildLane("tour-watch", { ...CFG.lanes["tour-watch"], artist_watches: { state_file: stateFile } }, CFG, { artistWatch: { ...deps, search: () => ({ error: "timeout" }) } });
+  clock += 72 * 3600e3;
+  const kept = await failing.extraCandidates({ store, today: "2026-11-03" });
+  assert.ok(kept.some((r) => r.source === "serpapi-tour"), "a failed search keeps the last rows");
+
+  const noRules = L.buildLane("tour-watch", { artist_watches: { state_file: stateFile } }, CFG, { artistWatch: { ...deps, rules: async () => { throw new Error("db locked"); } } });
+  assert.deepEqual(await noRules.extraCandidates({ store, today: "2026-11-03" }), []);
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test("mergeExtras: a held extra row keeps the same show out of the pool, unseen; other extras join it", () => {
+  const pool = [
+    { key: "p1", title: "Singer One", venue: "Hall A", date: "2026-11-20", performers: ["Singer One"] },
+    { key: "p2", title: "Other Act", venue: "Hall B", date: "2026-11-21", performers: [] },
+  ];
+  const extra = [
+    { key: "x1", title: "Singer One — Hall A", venue: "Hall A", date: "2026-11-20", performers: ["Singer One"], held: true },
+    { key: "x2", title: "Singer One — Hall C", venue: "Hall C", date: "2026-12-02", performers: ["Singer One"] },
+  ];
+  assert.deepEqual(W.mergeExtras(pool, extra).map((e) => e.key), ["p2", "x2"]);
+  assert.deepEqual(W.mergeExtras(pool, []).map((e) => e.key), ["p1", "p2"]);
+});
