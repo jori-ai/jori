@@ -22,9 +22,7 @@
 // knows these are time-anchored, not domain rarities.
 
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
-import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { readStdinJson, readCache, writeCache, emit, emitNull, emitNoop, stampRun } from "./_common.mjs";
 import { extractJsonObject } from "../../../lib/extract-json.mjs";
@@ -32,12 +30,11 @@ import { createRequire } from "node:module";
 
 const require = createRequire(import.meta.url);
 const { MODELS } = require("../../../lib/models.cjs");
-const HOME = os.homedir();
+const { textSync } = require("../../../lib/max-judge.js");
 const DATA = path.join(require("../../../lib/root.cjs").installRoot(), "data");
 const LEARNINGS = path.join(DATA, "hum-learnings.jsonl");
 const LIVE_DAY = path.join(DATA, "live-day.json");
 const FEEDBACK = path.join(DATA, "hum-feedback.jsonl");
-const CLAUDE_BIN = path.join(HOME, ".local/bin/claude");
 
 const { situation: sit, context } = await readStdinJson();
 
@@ -195,26 +192,17 @@ ${recentLearnings.map(l => `- [${(l.answered_at || "").slice(0,10)}] ${l.subject
 RECENT FEEDBACK (last 12 — don't repeat a recently-pinged anchor):
 ${recentFeedback.map(f => `- ${f.sent_at || ""} ${f.lane || ""} ${(f.findings || []).map(x => x.summary || "").join("; ").slice(0,120)} reaction=${f.reaction || "null"}`).join("\n") || "(none)"}`;
 
-// Spawn Sonnet --effort low (cheap, fast). Per agent/CLAUDE.md
-// § Effort Policy, fork-per-invocation subagents use --effort low inline.
-// Inherit parent env unchanged — the supervisor has already stripped
-// ANTHROPIC_API_KEY at spawn time per the Max-only auth invariant in
-// agent/CLAUDE.md § Auth Model. Re-setting the var to "" here
-// confused the Max-auth check and failed every call.
-const r = spawnSync(CLAUDE_BIN, [
-  "-p",
-  "--model", MODELS.sonnet,
-  "--effort", "low",
-  "--output-format", "text",
-  prompt,
-], {
-  encoding: "utf8",
-  timeout: 30000,
-});
+// Sonnet --effort low (cheap, fast). Per agent/CLAUDE.md § Effort Policy,
+// fork-per-invocation subagents use --effort low inline. textSync is the lean
+// tool-less call (no tools, MCP servers, skills, memory or hooks: the answer
+// needs none) on the Max session (it deletes ANTHROPIC_API_KEY rather than
+// setting it to "", which confused the Max-auth check), and it writes the
+// run's cost row.
+const r = textSync({ model: MODELS.sonnet, effort: "low", prompt, timeoutMs: 30000, job: "hum-harvester:situation" });
 
-if (r.status !== 0) {
+if (r.error || r.status !== 0 || r.isError) {
   stampRun("situation", false);
-  emitNull(`sonnet exit=${r.status}: ${(r.stderr || "").slice(0,200)}`);
+  emitNull(`sonnet exit=${r.status}: ${(r.stderr || r.text || (r.error && r.error.message) || "").slice(0,200)}`);
   process.exit(0);
 }
 
@@ -222,11 +210,11 @@ let parsed;
 try {
   // Sonnet sometimes wraps JSON in prose; take the first balanced object that
   // carries the `emit` key (a greedy {...} match broke on any brace in prose).
-  parsed = extractJsonObject(String(r.stdout || "").trim(), { requireKey: "emit" });
+  parsed = extractJsonObject(String(r.text || "").trim(), { requireKey: "emit" });
   if (!parsed) throw new Error("no JSON object");
 } catch {
   stampRun("situation", false);
-  emitNull(`sonnet output non-JSON: ${String(r.stdout || "").slice(0,200)}`);
+  emitNull(`sonnet output non-JSON: ${String(r.text || "").slice(0,200)}`);
   process.exit(0);
 }
 

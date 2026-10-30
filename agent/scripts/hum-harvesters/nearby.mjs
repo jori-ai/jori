@@ -20,7 +20,6 @@
 // saying and how to say it.
 
 import { execFileSync } from "node:child_process";
-import os from "node:os";
 import path from "node:path";
 import { readStdinJson, emit, emitNull, emitNoop, stampRun, localConfig, OWNER_NAME } from "./_common.mjs";
 import { installTools } from "../../../lib/root.cjs";
@@ -28,10 +27,14 @@ import { localLore, renderLocalLoreBlock } from "../../../lib/local-lore.mjs";
 import { PROXIMITY_M } from "../../../lib/local-history-ledger.mjs";
 import { stashMedia } from "../../../lib/ping-media.mjs";
 import { extractJsonObject } from "../../../lib/extract-json.mjs";
+import { createRequire } from "node:module";
+
+const require = createRequire(import.meta.url);
+const { MODELS } = require("../../../lib/models.cjs");
+const { textSync } = require("../../../lib/max-judge.js");
 
 const TOPIC = "nearby";
 const BIN = installTools("bin");
-const CLAUDE = path.join(os.homedir(), ".local/bin/claude");
 // Lowercase substrings of the situation's place label that mean "at home"
 // (shared with meal_offer: agent/local/config/meals.json `home_labels`).
 const HOME_LABELS = localConfig("meals", { home_labels: ["home ("] }).home_labels || ["home ("];
@@ -103,10 +106,12 @@ if (!sayable.length) {
 const prompt = buildPrompt({ place, hour, moving: MOVING, items: sayable.slice(0, 8), intent, event: locEvent });
 let verdict;
 try {
-  const out = execFileSync(CLAUDE, [
-    "-p", "--model", "claude-sonnet-5-5", "--effort", "low", "--output-format", "text", prompt,
-  ], { encoding: "utf8", timeout: 60000, maxBuffer: 2 * 1024 * 1024, stdio: ["ignore", "pipe", "ignore"] });
-  verdict = extractJsonObject(out, { requireKey: "say" });
+  // Lean tool-less call (no tools, MCP servers, skills, memory or hooks; the
+  // verdict needs none of them), with the run's cost row.
+  const r = textSync({ model: MODELS.sonnet, effort: "low", prompt, timeoutMs: 60000, maxBuffer: 2 * 1024 * 1024, job: "hum-harvester:nearby" });
+  if (r.error) throw r.error;
+  if (r.status !== 0 || r.isError) throw new Error(`claude exit ${r.status}: ${(r.text || r.stderr || "").slice(0, 160)}`);
+  verdict = extractJsonObject(r.text, { requireKey: "say" });
   if (!verdict) { stampRun(TOPIC, false); emitNull("no JSON in subagent output"); process.exit(0); }
 } catch (e) {
   stampRun(TOPIC, false);

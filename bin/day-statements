@@ -60,7 +60,7 @@ const { MODELS } = require(path.join(__dirname, "../lib/models.cjs"));
 
 // The pinned Claude Code (CLAUDE_BIN, else ~/.local/bin/claude), never a bare `claude`:
 // a job's PATH put a stray Homebrew 2.1.81 first .
-const { CLAUDE_BIN } = require(path.join(__dirname, "../lib/max-judge.js"));
+const { CLAUDE_BIN, textSync } = require(path.join(__dirname, "../lib/max-judge.js"));
 const { claudeVersionLine } = require(path.join(__dirname, "../lib/claude-binaries.js"));
 let claudeBinLogged = false;
 
@@ -153,10 +153,14 @@ function runClaude(promptText, model) {
     claudeBinLogged = true;
     process.stderr.write(`[day-statements] ${claudeVersionLine(CLAUDE_BIN)}\n`);
   }
-  return execFileSync(CLAUDE_BIN,
-    ["-p", "--model", model, "--effort", "medium", promptText],
-    { encoding: "utf8", maxBuffer: 32 * 1024 * 1024, timeout: 300000,
-      env: { ...process.env, ANTHROPIC_API_KEY: undefined } });
+  // Lean tool-less call (no tools, MCP servers, skills, memory or hooks: the
+  // reading needs none), Max session only, with the run's cost row. Throws on a
+  // failed call, as the ladder expects, so the next rung is tried.
+  const r = textSync({ model, effort: "medium", prompt: promptText, timeoutMs: 300000,
+    maxBuffer: 32 * 1024 * 1024, job: "day-statements" });
+  if (r.error) throw r.error;
+  if (r.status !== 0 || r.isError) throw new Error(`claude exit ${r.status}: ${(r.text || r.stderr).slice(0, 200)}`);
+  return r.text;
 }
 
 const SCHEMA = `{
