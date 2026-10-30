@@ -160,3 +160,76 @@ test("without a confirmed span the overlay still uses the dwell window (older da
     start_ms: ET(18, 9), end_ms: ET(18, 51) }] });
   assert.equal(one[0].end, "18:51");
 });
+
+// ── a stop built after the calendar pass still gets the event it holds ──────
+//
+// The calendar pass runs on the raw stops; an evening stop the spine built later
+// (no raw stop overlapped it) kept no event, and the evening's show was listed
+// as "not matched to a location" right under the stop that held it.
+
+{
+const { attachCalendarToFinalStops } = _internal;
+const UL = (iso) => Date.parse(iso);
+const lateStop = (id, from, to, extra = {}) => ({ id, start_ts_ms: UL(from), end_ts_ms: UL(to),
+  place: { name: "Example Street", source: "spine_dwell" }, calendar_event: null, ...extra });
+const SHOW = { summary: "An Example Band", location: null, physical: "",
+  start: "2026-05-04T21:00:00+02:00", end: "2026-05-04T23:00:00+02:00", duration_min: 120 };
+const TOMORROW = { summary: "Breakfast with a friend", location: null, physical: "",
+  start: "2026-05-05T10:30:00+02:00", end: "2026-05-05T12:00:00+02:00", duration_min: 90 };
+
+test("an unmatched event goes on the late stop that holds it, and leaves the unmatched list", () => {
+  const evening = lateStop("s-9", "2026-05-04T18:41:00Z", "2026-05-04T20:55:00Z");
+  const { unmatched, attached } = attachCalendarToFinalStops([evening], [SHOW, TOMORROW]);
+  assert.equal(evening.calendar_event.summary, "An Example Band");
+  assert.ok(evening.calendar_event.event_share > 0.9);
+  assert.equal(evening.calendar_event.location_match, false);
+  assert.equal(evening.calendar_event.attached_late, true);
+  assert.deepEqual(unmatched.map(e => e.summary), ["Breakfast with a friend"]);
+  assert.equal(attached.length, 1);
+});
+
+test("an event no final stop overlaps stays unmatched", () => {
+  const afternoon = lateStop("s-3", "2026-05-04T12:00:00Z", "2026-05-04T14:00:00Z");
+  const { unmatched } = attachCalendarToFinalStops([afternoon], [SHOW]);
+  assert.equal(afternoon.calendar_event, null);
+  assert.deepEqual(unmatched, [SHOW]);
+});
+
+test("a more specific event already on the stop keeps it", () => {
+  const OWN = { summary: "Soundcheck", start: "2026-05-04T20:45:00+02:00", end: "2026-05-04T21:15:00+02:00",
+    duration_min: 30, event_share: 1, location_match: false };
+  const evening = lateStop("s-9", "2026-05-04T18:41:00Z", "2026-05-04T20:55:00Z", { calendar_event: OWN });
+  const { unmatched } = attachCalendarToFinalStops([evening], [SHOW]);
+  assert.equal(evening.calendar_event.summary, "Soundcheck");
+  assert.deepEqual(unmatched.map(e => e.summary), ["An Example Band"]);
+});
+
+test("a longer event it displaces is listed as unmatched, never dropped", () => {
+  const BLOCK = { summary: "Evening out", start: "2026-05-04T18:00:00+02:00", end: "2026-05-05T00:00:00+02:00",
+    duration_min: 360, event_share: 0.4, location_match: false, location: null, physical: "" };
+  const evening = lateStop("s-9", "2026-05-04T18:41:00Z", "2026-05-04T20:55:00Z", { calendar_event: BLOCK });
+  const { unmatched } = attachCalendarToFinalStops([evening], [SHOW]);
+  assert.equal(evening.calendar_event.summary, "An Example Band");
+  assert.deepEqual(unmatched.map(e => e.summary), ["Evening out"]);
+});
+
+test("an all-day event is not attached by this pass", () => {
+  const ALLDAY = { summary: "Holiday", location: null, start: "2026-05-04", end: "2026-05-05", duration_min: 1440 };
+  const evening = lateStop("s-9", "2026-05-04T18:41:00Z", "2026-05-04T20:55:00Z");
+  const { unmatched } = attachCalendarToFinalStops([evening], [ALLDAY]);
+  assert.equal(evening.calendar_event, null);
+  assert.deepEqual(unmatched, [ALLDAY]);
+});
+
+test("JORI_LATE_CALENDAR=0 leaves the stops and the list alone", () => {
+  process.env.JORI_LATE_CALENDAR = "0";
+  try {
+    const evening = lateStop("s-9", "2026-05-04T18:41:00Z", "2026-05-04T20:55:00Z");
+    const { unmatched } = attachCalendarToFinalStops([evening], [SHOW]);
+    assert.equal(evening.calendar_event, null);
+    assert.deepEqual(unmatched, [SHOW]);
+  } finally {
+    delete process.env.JORI_LATE_CALENDAR;
+  }
+});
+}
