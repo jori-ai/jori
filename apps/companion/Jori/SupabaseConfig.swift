@@ -135,6 +135,45 @@ enum SupabaseConfig {
     static let keychainAccessGroup = Install.keychainGroup
 }
 
+/// Where an attachment goes in the attachments bucket: a fresh UUID folder
+/// plus an ASCII spelling of the file's name. Storage refuses any object key
+/// with a character outside ASCII (`400 InvalidKey`), so a file named in
+/// another script could not be sent at all. Only the key is rewritten: the
+/// name as shared stays with the caller for display. The app's attachment send
+/// and the share extension both use this, so their keys look the same.
+enum AttachmentKey {
+    static func make(for filename: String) -> String {
+        "\(UUID().uuidString)/\(asciiName(filename))"
+    }
+
+    /// `Résumé 2026.PDF` → `Resume-2026.pdf`. Letters from other scripts are
+    /// transliterated where ICU can, so the key stays readable; a name with
+    /// nothing left becomes `file`, and the extension is always kept.
+    static func asciiName(_ filename: String) -> String {
+        let name = filename.trimmingCharacters(in: .whitespacesAndNewlines) as NSString
+        let ext = String(ascii(name.pathExtension).filter { $0.isLetter || $0.isNumber }.prefix(16)).lowercased()
+        var base = ""
+        for ch in ascii(name.deletingPathExtension) {
+            if ch.isASCII && (ch.isLetter || ch.isNumber || ch == "_" || ch == ".") {
+                base.append(ch)
+            } else if let last = base.last, last != "-" {
+                base.append("-")  // one dash per run of anything else
+            }
+        }
+        let edges = CharacterSet(charactersIn: "-_.")
+        base = String(base.trimmingCharacters(in: edges).prefix(80)).trimmingCharacters(in: edges)
+        if base.isEmpty { base = "file" }
+        return ext.isEmpty ? base : "\(base).\(ext)"
+    }
+
+    /// `é` → `e`, other scripts → Latin letters; whatever has no ASCII
+    /// spelling (an emoji) becomes a space, so it still separates words.
+    private static func ascii(_ text: String) -> String {
+        let latin = text.applyingTransform(StringTransform(rawValue: "Any-Latin; Latin-ASCII"), reverse: false) ?? text
+        return String(latin.map { (c: Character) -> Character in c.isASCII ? c : " " })
+    }
+}
+
 /// The chat tables' names: `jori_messages` / `jori_commands`. An installation
 /// whose backend predates Jori (`Install.legacyName` set) may still have
 /// `<legacy>_*`; the app asks which exist (`resolve()`, before it subscribes)

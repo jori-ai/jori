@@ -943,7 +943,7 @@ final class ChatViewModel: ObservableObject {
     func sendAttachment(data: Data, filename: String, contentType: String) async {
         isWaitingForResponse = true
 
-        let path = "\(UUID().uuidString)/\(filename)"
+        let path = AttachmentKey.make(for: filename)  // Storage keys take ASCII only
         do {
             try await supabase.storage
                 .from(Install.attachmentsBucket)

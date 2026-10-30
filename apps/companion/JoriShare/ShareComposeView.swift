@@ -86,9 +86,10 @@ final class ShareComposeModel: ObservableObject {
     }
 
     /// Same bucket + key layout as the app's own attachment send
-    /// (ChatViewModel.sendAttachment), via Storage REST.
+    /// (ChatViewModel.sendAttachment), via Storage REST. The key is an ASCII
+    /// spelling of the name: Storage answers 400 InvalidKey to anything else.
     private func upload(_ attachment: SharedContent.Attachment) async throws -> URL {
-        let path = "\(UUID().uuidString)/\(attachment.filename)"
+        let path = AttachmentKey.make(for: attachment.filename)
         var req = URLRequest(url: SupabaseConfig.url
             .appendingPathComponent("storage/v1/object/\(Install.attachmentsBucket)")
             .appendingPathComponent(path))

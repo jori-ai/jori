@@ -11,6 +11,8 @@ struct SharedContent {
     struct Attachment: Identifiable {
         let id = UUID()
         let data: Data
+        /// The name as shared, for the preview. The storage key is spelled
+        /// from it separately (AttachmentKey), since Storage takes only ASCII.
         let filename: String
         let contentType: String
         let thumbnail: CGImage?
@@ -109,7 +111,7 @@ struct SharedContent {
         #endif
         guard let data, let source = CGImageSourceCreateWithData(data as CFData, nil),
               let jpeg = downscaledJPEG(source) else { return nil }
-        let base = provider.suggestedName.map(sanitize) ?? "photo"
+        let base = displayName(provider.suggestedName, or: "photo")
         return Attachment(data: jpeg, filename: "\(base).jpg", contentType: "image/jpeg",
                           thumbnail: thumbnail(source))
     }
@@ -135,11 +137,11 @@ struct SharedContent {
         if type?.conforms(to: .image) == true,
            let source = CGImageSourceCreateWithData(data as CFData, nil),
            let jpeg = downscaledJPEG(source) {
-            let base = sanitize(url.deletingPathExtension().lastPathComponent)
+            let base = displayName(url.deletingPathExtension().lastPathComponent, or: "photo")
             return Attachment(data: jpeg, filename: "\(base).jpg", contentType: "image/jpeg",
                               thumbnail: thumbnail(source))
         }
-        return Attachment(data: data, filename: sanitize(url.lastPathComponent),
+        return Attachment(data: data, filename: displayName(url.lastPathComponent, or: "file"),
                           contentType: type?.preferredMIMEType ?? "application/octet-stream",
                           thumbnail: nil)
     }
@@ -185,10 +187,11 @@ struct SharedContent {
         return CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary)
     }
 
-    /// Storage object keys must be URL-safe.
-    private static func sanitize(_ name: String) -> String {
-        let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-_."))
-        let cleaned = String(name.unicodeScalars.map { allowed.contains($0) ? Character($0) : "-" })
-        return cleaned.isEmpty ? "file" : String(cleaned.prefix(80))
+    /// The shared name as the user knows it, in any script, for display.
+    /// The storage key is spelled separately (AttachmentKey): Storage takes
+    /// ASCII only, which `CharacterSet.alphanumerics` is not.
+    private static func displayName(_ name: String?, or fallback: String) -> String {
+        let trimmed = (name ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? fallback : trimmed
     }
 }
