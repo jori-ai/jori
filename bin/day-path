@@ -608,6 +608,10 @@ def valhalla_route_points(pts, costing):
                                  t0=a["t"], t1=b["t"], hole=hole, m=round(lm)))
             for m in leg.get("maneuvers", []):
                 for n in m.get("street_names", []) or []:
+                    # A bare road number ("3350") is not a street a person reads;
+                    # it printed as "Walked 0.3 miles along <street> and 3350".
+                    if not any(ch.isalpha() for ch in str(n)):
+                        continue
                     if not names or names[-1] != n:
                         names.append(n)
     # ordered, consecutive-deduped, then globally deduped keeping first sighting

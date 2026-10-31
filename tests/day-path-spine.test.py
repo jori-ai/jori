@@ -295,5 +295,30 @@ class Fixes(unittest.TestCase):
         self.assertEqual(st[0]["n"], 3)
 
 
+
+class RouteStreetNames(unittest.TestCase):
+    """A bare road number from the router is not a street name.
+
+    A short walk between two stops printed "Walked 0.3 miles along <street> and
+    3350": the router's maneuvers named a numbered road by its number alone.
+    """
+
+    def test_number_only_names_are_dropped(self):
+        trip = {"trip": {"legs": [{"shape": "", "summary": {"length": 0.4}, "maneuvers": [
+            {"street_names": ["Example Street"]}, {"street_names": ["3350"]},
+            {"street_names": ["Second Way", "3350"]}, {"street_names": ["Route 9"]}]}]}}
+        saved = mod._post_json
+        mod._post_json = lambda url, body: trip
+        try:
+            t0 = datetime(2026, 1, 1, 9, 0)
+            a, b = G(0.0, 0.0), G(120.0, 90.0)
+            pts = [{"lat": a[0], "lon": a[1], "acc": 10, "t": t0},
+                   {"lat": b[0], "lon": b[1], "acc": 10, "t": t0 + timedelta(minutes=4)}]
+            _shape, names, _m, _legs, _runs = mod.valhalla_route_points(pts, "pedestrian")
+        finally:
+            mod._post_json = saved
+        self.assertEqual(names, ["Example Street", "Second Way", "Route 9"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=1)
