@@ -144,7 +144,13 @@ if [ -z "${JORI_COMMIT_PASS:-}" ] && [ -f "$OVERLAY_GIT/HEAD" ]; then
     echo "jori-commit: kernel repo (${#KP[@]} path(s))"
     JORI_COMMIT_PASS=kernel "$0" "${pass_args[@]}" -- "${KP[@]}" || rc=$?
   fi
-  if [ "${#OP[@]}" -gt 0 ]; then
+  if [ "${#OP[@]}" -gt 0 ] && [ "$rc" -ne 0 ]; then
+    # The kernel commit was refused: leave the overlay paths uncommitted too, so
+    # the two repos never hold half of one change. Committing the overlay half
+    # anyway meant the caller's retry found it already in the overlay, reported
+    # "nothing to commit" there, and failed even after the kernel half landed.
+    echo "jori-commit: the kernel commit was refused, so the overlay (${#OP[@]} path(s)) is not committed either; fix the refusal and rerun with the same paths" >&2
+  elif [ "${#OP[@]}" -gt 0 ]; then
     echo "jori-commit: overlay (${#OP[@]} path(s))"
     JORI_COMMIT_PASS=overlay GIT_DIR="$OVERLAY_GIT" GIT_WORK_TREE="$REPO_ROOT" "$0" "${pass_args[@]}" -- "${OP[@]}" || rc=$?
     # A new overlay file must leave the kernel repo's view too.

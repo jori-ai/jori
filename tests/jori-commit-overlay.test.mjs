@@ -91,3 +91,24 @@ test("--promote refuses a path the overlay does not track, and changes nothing",
   assert.throws(() => commit(root, "-m", "x", "--promote", "--", K("lib/stray.mjs")), (e) => /not an overlay file/.test(e.stderr) && e.status === 1);
   assert.ok(!git(root, "ls-files").split("\n").includes(K("lib/stray.mjs")));
 });
+
+test("a refused kernel commit leaves the overlay uncommitted too, and the rerun lands both", () => {
+  // Defends against a half-landed change: the overlay half committed while the
+  // kernel half was refused, so the rerun failed with "nothing to commit".
+  const root = setup();
+  write(root, K("bin/tool"), "kernel v2\n");
+  write(root, "data/state.json", "{\"v\":2}\n");
+  const hooks = path.join(root, ".test-hooks");
+  write(root, ".test-hooks/pre-commit", "#!/bin/sh\necho refused >&2\nexit 1\n");
+  fs.chmodSync(path.join(hooks, "pre-commit"), 0o755);
+  git(root, "config", "core.hooksPath", hooks);
+  const kernelHead = git(root, "rev-parse", "HEAD").trim();
+  const overlayHead = ovGit(root, "rev-parse", "HEAD").trim();
+  assert.throws(() => commit(root, "-m", "both", "--", K("bin/tool"), "data/state.json"));
+  assert.equal(git(root, "rev-parse", "HEAD").trim(), kernelHead, "kernel refused");
+  assert.equal(ovGit(root, "rev-parse", "HEAD").trim(), overlayHead, "overlay not committed either");
+  git(root, "config", "--unset", "core.hooksPath");
+  commit(root, "-m", "both", "--", K("bin/tool"), "data/state.json");
+  assert.equal(git(root, "show", "--name-only", "--format=%s", "HEAD").trim(), `both\n\n${K("bin/tool")}`);
+  assert.equal(ovGit(root, "show", "--name-only", "--format=%s", "HEAD").trim(), "both\n\ndata/state.json");
+});
