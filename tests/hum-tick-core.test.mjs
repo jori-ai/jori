@@ -23,7 +23,7 @@ process.env.JORI_LOCAL_DIR = LOCAL;
 const core = await import("../lib/hum-tick-core.mjs");
 const { extractJsonObject, balancedObjectSpans } = await import("../lib/extract-json.mjs");
 const vetoes = await import("../lib/hum-vetoes.mjs");
-const { previewVerdict } = await import("../lib/jev-hum-gate.mjs");
+const { previewVerdict, previewScope } = await import("../lib/jev-hum-gate.mjs");
 
 // ─── extract-json ──────────────────────────────────────────────────────────
 test("extractJsonObject survives braces in surrounding prose (the greedy-match bug)", () => {
@@ -146,6 +146,32 @@ test("previewVerdict skips only when nothing is eligible and nothing went unseen
   const v = previewVerdict({ candidates: [], claim_check: { dropped: [] }, meta: { eligible_count: 0, errors: [], attempted: ["tasks", "news"], pre_rank_vetoes: [{}] } });
   assert.equal(v.skip, true);
   assert.match(v.reason, /nothing eligible/);
+});
+
+test("previewVerdict on a bundle that names its lanes waits only on those lanes", () => {
+  const lanes = ["decisions", "dream_asks", "hum_asks"];
+  const quiet = { eligible_count: 0, attempted: ["weather", "hum_asks", "decisions"], pre_rank_vetoes: [{}] };
+  // An unrelated model lane due and an unrelated lane erroring do not hold a questions tick open.
+  const v = previewVerdict({ candidates: [], meta: { ...quiet, preview_skipped_model_lanes: ["art", "situation"], errors: [{ topic: "weather" }] } }, { lanes });
+  assert.equal(v.skip, true);
+  assert.match(v.reason, /outside this bundle's lanes: art due, situation due, weather errored/);
+  // One of its own lanes erroring still dispatches.
+  assert.equal(previewVerdict({ candidates: [], meta: { ...quiet, errors: [{ topic: "hum_asks" }] } }, { lanes }).skip, false);
+  // An eligible candidate in any lane still dispatches.
+  assert.equal(previewVerdict({ candidates: [{}], meta: { ...quiet, eligible_count: 1, preview_skipped_model_lanes: ["art"] } }, { lanes }).skip, false);
+  // No named lanes: every lane counts, as before.
+  assert.equal(previewVerdict({ candidates: [], meta: { ...quiet, preview_skipped_model_lanes: ["art"], errors: [] } }, { lanes: [] }).skip, false);
+  assert.equal(previewVerdict({ candidates: [], meta: { ...quiet, errors: [{ topic: "weather" }] } }).skip, false);
+});
+
+test("previewScope narrows only a bundle made entirely of questions events", () => {
+  const lanes = ["decisions", "hum_asks"];
+  assert.deepEqual(previewScope({ accepted: [{ sensor: "questions" }], lanes }), lanes);
+  // An idle event in the bundle: judged on every lane, so the idle fallback is never consumed by a narrow skip.
+  assert.deepEqual(previewScope({ accepted: [{ sensor: "questions" }, { sensor: "idle" }], lanes }), []);
+  assert.deepEqual(previewScope({ accepted: [{ sensor: "idle" }], lanes: [] }), []);
+  assert.deepEqual(previewScope({ accepted: [], lanes }), []);
+  assert.deepEqual(previewScope(null), []);
 });
 
 // ─── preview write-guard (_common.mjs) ─────────────────────────────────────
