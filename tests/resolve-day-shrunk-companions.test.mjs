@@ -23,7 +23,7 @@ const LLG = (e, n) => { const p = fakeAt(e, n); return { lat: p.lat, lng: p.lon 
 
 const require = createRequire(import.meta.url);
 const ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
-const { pruneShrunkCompanions } = require(path.join(ROOT, "lib/resolve-day.js"))._internal;
+const { pruneShrunkCompanions, pieceCompanions } = require(path.join(ROOT, "lib/resolve-day.js"))._internal;
 
 const iso = (s) => Date.parse(s);
 const FLAT = { ...LL(0.0, 0.0) };
@@ -99,4 +99,44 @@ test("both sides must be close: a long gap on either side is no bracket", () => 
   const stops = [before, bakery(), after];
   pruneShrunkCompanions(stops, rows, []);
   assert.deepEqual(stops[1].companions, []);
+});
+
+// A row the piece only grazes is not the piece's. A long stay at the flat was cut
+// on its rests; the café piece's own row ran a few seconds past the café's end into
+// the flat piece after it, and the two friends from breakfast rode on the whole
+// afternoon at the flat.
+test("a row that runs a few seconds into the next piece gives that piece nobody", () => {
+  const CAFE = { ...LL(120.0, 90.0) };
+  const blend = { start_ts_ms: iso("2026-10-22T22:38:00Z"), end_ts_ms: iso("2026-10-23T17:01:00Z"), ...FLAT,
+                  companions: ["Paige", "Olin", "Yuri"] };
+  const graze = [
+    // breakfast photo row, wholly inside the café piece
+    { arrived_at: "2026-10-23T09:12:48Z", departed_at: "2026-10-23T09:17:48Z",
+      ...LLR(120.0, 90.0), companions: ["Paige", "Olin", "Yuri"] },
+    // the café row that ends five seconds into the flat piece
+    { arrived_at: "2026-10-23T11:00:25Z", departed_at: "2026-10-23T11:31:55Z",
+      ...LLR(120.0, 90.0), companions: ["Paige", "Olin", "Yuri"] },
+    // the flat's own afternoon row
+    { arrived_at: "2026-10-23T12:00:00Z", departed_at: "2026-10-23T16:00:00Z",
+      ...LLR(0.0, 0.0), companions: ["Paige"] },
+  ];
+  const cafe = { start_ts_ms: iso("2026-10-23T08:46:40Z"), end_ts_ms: iso("2026-10-23T11:29:40Z"), ...CAFE };
+  const flat = { start_ts_ms: iso("2026-10-23T11:31:50Z"), end_ts_ms: iso("2026-10-23T17:01:00Z"), ...FLAT };
+  assert.deepEqual(pieceCompanions(blend, cafe, graze), ["Paige", "Olin", "Yuri"]);
+  assert.deepEqual(pieceCompanions(blend, flat, graze), ["Paige"]);
+});
+
+test("a short row wholly inside a piece, or one it holds minutes of, still counts", () => {
+  const blend = { start_ts_ms: iso("2026-10-22T22:38:00Z"), end_ts_ms: iso("2026-10-23T17:01:00Z"), ...FLAT,
+                  companions: ["Paige", "Olin"] };
+  const piece = { start_ts_ms: iso("2026-10-23T12:00:00Z"), end_ts_ms: iso("2026-10-23T13:00:00Z"), ...FLAT };
+  const short = [{ arrived_at: "2026-10-23T12:10:00Z", departed_at: "2026-10-23T12:11:00Z",
+                   ...LLR(0.0, 0.0), companions: ["Olin"] }];
+  assert.deepEqual(pieceCompanions(blend, piece, short), ["Paige", "Olin"], "Paige came from no row: kept");
+  const minutes = [{ arrived_at: "2026-10-23T11:00:00Z", departed_at: "2026-10-23T12:03:00Z",
+                     ...LLR(0.0, 0.0), companions: ["Olin"] }];
+  assert.deepEqual(pieceCompanions(blend, piece, minutes), ["Paige", "Olin"]);
+  const sliver = [{ arrived_at: "2026-10-23T11:00:00Z", departed_at: "2026-10-23T12:00:30Z",
+                    ...LLR(0.0, 0.0), companions: ["Olin"] }];
+  assert.deepEqual(pieceCompanions(blend, piece, sliver), ["Paige"]);
 });
