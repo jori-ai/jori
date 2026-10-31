@@ -686,7 +686,7 @@ struct ContentView: View {
 
     @ViewBuilder
     private var messagesListContent: some View {
-        let all = viewModel.messages.filter { !viewModel.isChecklistTick($0) }
+        let all = viewModel.messages.filter { !viewModel.isChecklistTick($0) && !viewModel.isQuestionDismissal($0) }
         let visible = Array(all.suffix(renderLimit))
         let layout = BubbleLayout.compute(visible)
         let actions = bubbleActions
@@ -721,7 +721,8 @@ struct ContentView: View {
             react: { message, reaction in Task { await vm.setReaction(for: message, to: reaction) } },
             answer: { label, parent in Task { await vm.sendMessage(label, replyTo: parent) } },
             toggleChecklist: { label, on, id in vm.toggleChecklistItem(label, checked: on, on: id) },
-            resolveParent: { vm.resolveQuotedParent($0) }
+            resolveParent: { vm.resolveQuotedParent($0) },
+            dismiss: { vm.dismissQuestion($0) }
         )
     }
 
@@ -884,6 +885,15 @@ struct ContentView: View {
                             .transition(.scale(scale: 0.6).combined(with: .opacity))
                     }
                 }
+                .padding(.horizontal, 14)
+            }
+            if viewModel.currentChannel == .chat || viewModel.currentChannel == .questions {
+                OpenQuestionsTray(
+                    questions: viewModel.openQuestions,
+                    reveal: { quoteJumpTarget = $0.id },
+                    answer: { beginReply(to: $0) },
+                    dismiss: { viewModel.dismissQuestion($0) }
+                )
                 .padding(.horizontal, 14)
             }
             inputBar
@@ -1534,6 +1544,7 @@ struct BubbleActions {
     var answer: (String, UUID) -> Void
     var toggleChecklist: (String, Bool, UUID) -> Void
     var resolveParent: (UUID) -> Void
+    var dismiss: (Message) -> Void
 }
 
 /// Equatable on its inputs (the closures are deliberately left out — they
@@ -1943,6 +1954,13 @@ struct MessageBubble: View, Equatable {
         #endif
         .contextMenu {
             replyMenuItem
+            if thread.isOpenQuestion {
+                Button {
+                    actions.dismiss(message)
+                } label: {
+                    Label("Dismiss Question", systemImage: "xmark.circle")
+                }
+            }
             Divider()
             ForEach(Reaction.allCases, id: \.self) { reaction in
                 Button {
@@ -2457,4 +2475,95 @@ private struct MacTextViewRepresentable: NSViewRepresentable {
 
 #Preview {
     ContentView()
+}
+
+
+// MARK: - Open questions tray
+
+/// The questions still waiting for an answer in this channel, pinned at the
+/// bottom of the stream above the composer so what is open is always in view,
+/// however far the flow of messages has pushed the question itself. Tap a row
+/// to jump to the question; Answer opens a reply to it; the x dismisses it
+/// (a silent reply the server closes in code — see ChatViewModel.dismissQuestion).
+struct OpenQuestionsTray: View {
+    let questions: [Message]
+    var reveal: (Message) -> Void
+    var answer: (Message) -> Void
+    var dismiss: (Message) -> Void
+    @AppStorage(Install.key("openQuestionsTrayExpanded")) private var expanded = true
+
+    var body: some View {
+        if !questions.isEmpty {
+            VStack(alignment: .leading, spacing: 0) {
+                Button {
+                    withAnimation(.spring(response: 0.3, dampingFraction: 0.85)) { expanded.toggle() }
+                } label: {
+                    HStack(spacing: 6) {
+                        Image(systemName: "sparkle")
+                        Text(questions.count == 1 ? "1 open question" : "\(questions.count) open questions")
+                        Spacer(minLength: 0)
+                        Image(systemName: expanded ? "chevron.down" : "chevron.up")
+                    }
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(JoriTheme.staffInk)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 8)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                if expanded {
+                    ScrollView {
+                        VStack(spacing: 0) {
+                            ForEach(questions) { q in
+                                Divider().overlay(JoriTheme.hairline)
+                                row(q)
+                            }
+                        }
+                    }
+                    .frame(maxHeight: 176)
+                    .fixedSize(horizontal: false, vertical: questions.count <= 3)
+                }
+            }
+            .background(JoriTheme.staffWash, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+            .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous).stroke(JoriTheme.staff.opacity(0.35), lineWidth: 0.5))
+            .transition(.move(edge: .bottom).combined(with: .opacity))
+        }
+    }
+
+    private func row(_ q: Message) -> some View {
+        HStack(alignment: .center, spacing: 8) {
+            Button { reveal(q) } label: {
+                Text(Self.headline(q.content))
+                    .font(.subheadline)
+                    .lineLimit(2)
+                    .multilineTextAlignment(.leading)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            Button("Answer") { answer(q) }
+                .font(.caption.weight(.semibold))
+                .buttonStyle(.borderless)
+                .foregroundStyle(JoriTheme.staffInk)
+            Button { dismiss(q) } label: {
+                Image(systemName: "xmark.circle.fill")
+                    .font(.system(size: 18))
+                    .foregroundStyle(.secondary)
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Dismiss question")
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 7)
+    }
+
+    /// The line worth showing: our own card formatting (a `❓ Title` header,
+    /// bold markers) stripped, and the first line that asks something preferred.
+    static func headline(_ content: String) -> String {
+        let lines = content
+            .split(whereSeparator: \.isNewline)
+            .map { $0.replacingOccurrences(of: "**", with: "").replacingOccurrences(of: "❓", with: "").trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+        return lines.first(where: { $0.contains("?") }) ?? lines.first ?? content
+    }
 }

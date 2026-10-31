@@ -441,7 +441,37 @@ final class ChatViewModel: ObservableObject {
     /// inserts. Nothing to migrate, nothing to keep in sync, and two devices
     /// cannot disagree.
     func tappedAnswer(for messageID: UUID) -> String? {
-        threadIndex.replies[messageID]?.last { $0.role == "user" }?.content
+        threadIndex.replies[messageID]?.last { $0.role == "user" && !Self.isDismissal($0) }?.content
+    }
+
+    // MARK: - Dismissing a question
+
+    /// Metadata key on the silent reply that dismisses a question. The server
+    /// (lib/question-dismiss.mjs via lib/choice-reply.mjs) closes the question
+    /// in code — no agent turn, no reply — and stamps question_state on every
+    /// copy; the reply itself closes it here at once, on every device.
+    static let dismissKey = "question_dismiss"
+
+    static func isDismissal(_ m: Message) -> Bool {
+        m.role == "user" && m.metadata?[dismissKey] != nil
+    }
+
+    /// A dismissal reply, which the thread hides (the question just stops being open).
+    func isQuestionDismissal(_ message: Message) -> Bool { Self.isDismissal(message) }
+
+    func wasDismissed(_ messageID: UUID) -> Bool {
+        threadIndex.replies[messageID]?.contains(where: Self.isDismissal) ?? false
+    }
+
+    func dismissQuestion(_ message: Message) {
+        Task { await sendMessage("Dismissed", replyTo: message.id, quiet: true, extraMetadata: [Self.dismissKey: "1"]) }
+    }
+
+    /// The open questions in the current channel, oldest first, one per
+    /// question (a re-ask replaces the earlier copy). Drawn in a tray at the
+    /// bottom of the stream so what is still open is always in view.
+    var openQuestions: [Message] {
+        messages.filter { isOpenQuestion($0) }
     }
 
     /// A default the server applied because the user never answered.
@@ -493,7 +523,7 @@ final class ChatViewModel: ObservableObject {
     /// later re-ask of the same question takes over the colour.
     func isOpenQuestion(_ message: Message) -> Bool {
         guard message.isAssistant, let meta = message.metadata else { return false }
-        if tappedAnswer(for: message.id) != nil { return false }
+        if tappedAnswer(for: message.id) != nil || wasDismissed(message.id) { return false }
         if let state = meta["question_state"], !state.isEmpty { return false }
         if let qid = meta["question_id"] {
             if let until = meta["question_until"].flatMap(Self.parseISO), until < Date() { return false }
@@ -527,7 +557,7 @@ final class ChatViewModel: ObservableObject {
 
     /// - Parameter quiet: a checklist tick — no reply is coming, so no "working"
     ///   indicator, and the typed draft is left alone.
-    func sendMessage(_ rawText: String, replyTo: UUID? = nil, quiet: Bool = false) async {
+    func sendMessage(_ rawText: String, replyTo: UUID? = nil, quiet: Bool = false, extraMetadata: [String: String] = [:]) async {
         let text = rawText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { return }
 
@@ -541,6 +571,8 @@ final class ChatViewModel: ObservableObject {
             "timezone": tz.identifier,
             "utc_offset": "\(tz.secondsFromGMT() / 3600)"
         ]
+
+        metadata.merge(extraMetadata) { _, new in new }
 
         if let location = locationManager.lastKnownLocation {
             metadata.merge(location.metadataStrings) { _, new in new }
