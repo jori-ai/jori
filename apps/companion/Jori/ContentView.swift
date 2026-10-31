@@ -364,7 +364,8 @@ struct ContentView: View {
                         .badge(count)
                         // Improvements counts cards waiting on Face ID — the one
                         // thing that blocks on you — so its badge shouts.
-                        .badgeProminence(channel == .improvements && count > 0 ? .increased : .standard)
+                        // So do unanswered questions: red, like the Mac toolbar tab.
+                        .badgeProminence((channel == .improvements || channel == .questions) && count > 0 ? .increased : .standard)
                         .tag(Destination.channel(channel))
                 }
             }
@@ -1227,6 +1228,9 @@ struct ContentView: View {
                 .task {
                     badges.activeChannel = viewModel.currentChannel
                     badges.start()
+                }
+                .onChange(of: viewModel.openQuestions.count) { _, n in
+                    if viewModel.currentChannel == .questions { badges.setOpenQuestions(n) }
                 }
                 .onChange(of: viewModel.currentChannel) { _, newChannel in
                     badges.activeChannel = newChannel

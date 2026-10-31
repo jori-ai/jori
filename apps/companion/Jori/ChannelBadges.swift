@@ -12,7 +12,13 @@
 //
 //  "Unread" is not the same thing in every channel, and pretending otherwise
 //  would make the badge lie:
-//    - chat / questions / system
+//    - questions        → questions still WAITING FOR AN ANSWER (the owner,
+//                         2026-10-31: "the question tabs ... should show a red
+//                         badge with the number of unanswered questions").
+//                         Same rule as the bubble colour and the open-questions
+//                         tray (ChatViewModel.isOpenQuestion), and it stays lit
+//                         while you look at the tab — reading is not answering.
+//    - chat / system
 //                       → assistant messages the app hasn't marked read yet
 //                         (ChatViewModel marks them on load, but only for the
 //                         channel you are actually looking at, so the others
@@ -98,7 +104,9 @@ final class ChannelBadges: ObservableObject {
             case .improvements:
                 next[channel] = (try? await SelfImproveApproval.pendingApprovalCount())
                     ?? count(for: channel)
-            case .chat, .questions, .system:
+            case .questions:
+                next[channel] = await openQuestions() ?? count(for: channel)
+            case .chat, .system:
                 if channel == activeChannel {
                     next[channel] = 0
                 } else {
@@ -110,6 +118,33 @@ final class ChannelBadges: ObservableObject {
         // Publishing an unchanged dictionary still redraws every observer —
         // the whole window — once per poll.
         if next != counts { counts = next }
+    }
+
+    /// The open view's own count is fresher than a poll (a dismissal or an
+    /// answer shows at once), so the questions tab reports it on every change.
+    func setOpenQuestions(_ n: Int) {
+        if counts[.questions] != n { counts[.questions] = n }
+    }
+
+    /// Questions in the Questions channel still waiting for an answer: the
+    /// last 45 days of the channel, judged by the shared rule. nil on failure.
+    private func openQuestions() async -> Int? {
+        do {
+            try await SupabaseManager.ensureAuthenticated()
+            let since = Date().addingTimeInterval(-45 * 86400).ISO8601Format()
+            let rows: [Message] = try await SupabaseManager.shared
+                .from(DBTables.messages)
+                .select("id,role,content,read,created_at,reaction,channel,reply_to,metadata")
+                .eq("channel", value: ChatChannel.questions.rawValue)
+                .gte("created_at", value: since)
+                .order("created_at", ascending: true)
+                .limit(1000)
+                .execute()
+                .value
+            return ChatViewModel.openQuestions(in: rows).count
+        } catch {
+            return nil
+        }
     }
 
     private func unreadMessages(in channel: ChatChannel) async -> Int {
@@ -199,7 +234,11 @@ private struct ChannelTab: View {
     /// blocks on them — so it wears the "waiting on you" gold, like everywhere
     /// else in the app. Unread messages are just cobalt.
     private var badgeColor: Color {
-        channel == .improvements ? JoriTheme.staff : JoriTheme.cobalt
+        switch channel {
+        case .improvements: return JoriTheme.staff
+        case .questions: return .red        // unanswered questions
+        default: return JoriTheme.cobalt
+        }
     }
 
     var body: some View {

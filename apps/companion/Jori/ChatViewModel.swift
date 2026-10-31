@@ -522,28 +522,52 @@ final class ChatViewModel: ObservableObject {
     /// defaulted or expired. A threaded reply to it closes it at once, and a
     /// later re-ask of the same question takes over the colour.
     func isOpenQuestion(_ message: Message) -> Bool {
+        let qid = message.metadata?["question_id"]
+        return Self.isOpenQuestion(message,
+                                   replies: threadIndex.replies[message.id] ?? [],
+                                   latestAsk: qid.flatMap { threadIndex.latestAsk[$0] })
+    }
+
+    /// The one rule for "still open", shared by the bubble colour, the tray and
+    /// the Questions badge (ChannelBadges), so they can never disagree.
+    /// - Parameters:
+    ///   - replies: the replies to `message`, in list order.
+    ///   - latestAsk: the newest createdAt carrying the same question_id.
+    nonisolated static func isOpenQuestion(_ message: Message, replies: [Message], latestAsk: Date?) -> Bool {
         guard message.isAssistant, let meta = message.metadata else { return false }
-        if tappedAnswer(for: message.id) != nil || wasDismissed(message.id) { return false }
+        if replies.contains(where: { $0.role == "user" }) { return false }   // answered or dismissed
         if let state = meta["question_state"], !state.isEmpty { return false }
-        if let qid = meta["question_id"] {
-            if let until = meta["question_until"].flatMap(Self.parseISO), until < Date() { return false }
-            let reasked = (threadIndex.latestAsk[qid] ?? .distantPast) > message.createdAt
-            return !reasked
+        if let qid = meta["question_id"], !qid.isEmpty {
+            if let until = meta["question_until"].flatMap(parseISO), until < Date() { return false }
+            return (latestAsk ?? .distantPast) <= message.createdAt
         }
         if let prompt = ChoicePrompt.from(metadata: meta) {
-            if defaultApplied(for: message.id) != nil { return false }
-            if let exp = prompt.expiresAt.flatMap(Self.parseISO), exp < Date() { return false }
+            if replies.contains(where: { $0.metadata?["choice_default"] != nil }) { return false }
+            if let exp = prompt.expiresAt.flatMap(parseISO), exp < Date() { return false }
             return true
         }
         return false
     }
 
-    private static let isoFractional: ISO8601DateFormatter = {
+    /// Open questions among a channel's messages, oldest first.
+    nonisolated static func openQuestions(in messages: [Message]) -> [Message] {
+        var replies: [UUID: [Message]] = [:]
+        var latestAsk: [String: Date] = [:]
+        for m in messages {
+            if let parent = m.replyTo { replies[parent, default: []].append(m) }
+            if let qid = m.metadata?["question_id"], (latestAsk[qid] ?? .distantPast) < m.createdAt { latestAsk[qid] = m.createdAt }
+        }
+        return messages.filter { m in
+            isOpenQuestion(m, replies: replies[m.id] ?? [], latestAsk: m.metadata?["question_id"].flatMap { latestAsk[$0] })
+        }
+    }
+
+    nonisolated(unsafe) private static let isoFractional: ISO8601DateFormatter = {
         let f = ISO8601DateFormatter()
         f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
         return f
     }()
-    private static let isoPlain: ISO8601DateFormatter = {
+    nonisolated(unsafe) private static let isoPlain: ISO8601DateFormatter = {
         let f = ISO8601DateFormatter()
         f.formatOptions = [.withInternetDateTime]
         return f
@@ -551,7 +575,7 @@ final class ChatViewModel: ObservableObject {
 
     /// Shared formatters: building one per call (per bubble, per redraw) was
     /// a measurable share of a redraw.
-    private static func parseISO(_ s: String) -> Date? {
+    nonisolated private static func parseISO(_ s: String) -> Date? {
         isoFractional.date(from: s) ?? isoPlain.date(from: s)
     }
 
