@@ -1,0 +1,63 @@
+#!/usr/bin/env node
+"use strict";
+// finance-review-compose — turn a finance-review packet (+ an optional model
+// summary) into the email HTML, and record the run.
+//
+//   finance-review-compose --packet P.json [--summary S.json] --out review.html
+//       Verifies the summary against packet.facts (finance-review-verify.js).
+//       A summary that fails is DROPPED — the email goes with tables only — and
+//       the problems are printed and stored. Renders, writes the HTML, inserts a
+//       fin_review_runs row, prints JSON: {run_id, html, subject, pointer,
+//       summary_used, problems}.
+//   finance-review-compose --mark-sent <run_id>
+//
+// The pointer text is built here, from the top attention flag verbatim, so the
+// phone message cannot say anything the email does not.
+
+const fs = require("node:fs");
+const { loadEnv } = require("../lib/load-env.js");
+const { request } = require("../lib/supabase-rest.js");
+const { verifySummary } = require("../lib/finance-review-verify.js");
+const { renderReview } = require("../lib/finance-review-render.js");
+loadEnv();
+
+const arg = (k) => { const i = process.argv.indexOf(`--${k}`); return i > -1 ? process.argv[i + 1] : null; };
+
+async function main() {
+  const sentId = arg("mark-sent");
+  if (sentId) {
+    await request(`/rest/v1/fin_review_runs?id=eq.${encodeURIComponent(sentId)}`, { method: "PATCH", body: { sent: true }, prefer: "return=minimal" });
+    console.log(JSON.stringify({ run_id: Number(sentId), sent: true }));
+    return;
+  }
+  const packetPath = arg("packet"), summaryPath = arg("summary"), outPath = arg("out");
+  if (!packetPath || !outPath) { console.error("usage: finance-review-compose --packet P.json [--summary S.json] --out review.html"); process.exit(2); }
+  const packet = JSON.parse(fs.readFileSync(packetPath, "utf8"));
+
+  let summary = null, verify = { ok: true, problems: [], skipped: true };
+  if (summaryPath) {
+    try { summary = JSON.parse(fs.readFileSync(summaryPath, "utf8")); }
+    catch (e) { summary = null; verify = { ok: false, problems: [{ sentence: null, issue: `summary is not valid JSON: ${e.message}` }] }; }
+    if (summary) verify = verifySummary(packet, summary);
+  }
+  const used = summary && verify.ok ? summary : null;
+  const html = renderReview(packet, used);
+  fs.writeFileSync(outPath, html);
+
+  const rows = await request("/rest/v1/fin_review_runs", {
+    method: "POST", prefer: "return=representation",
+    body: [{ week_end: packet.meta.week_end, packet, summary, verify, html, sent: false }],
+  });
+  const top = (packet.attention || []).find((a) => a.tag !== "questions");
+  const weekEnd = new Date(`${packet.meta.week_end}T12:00:00Z`).toLocaleDateString("en-US", { month: "short", day: "numeric", timeZone: "UTC" });
+  console.log(JSON.stringify({
+    run_id: rows?.[0]?.id ?? null,
+    html: outPath,
+    subject: `Weekly finance review — week ending ${weekEnd}`,
+    pointer: `Weekly finance review is in your inbox${top ? ` — ${top.text}` : " — nothing urgent this week."}${packet.questions?.length ? ` (${packet.questions.length} open questions at the end.)` : ""}`,
+    summary_used: !!used,
+    problems: verify.problems,
+  }, null, 2));
+}
+
+main().catch((e) => { console.error(`finance-review-compose error: ${e.message}`); process.exit(1); });

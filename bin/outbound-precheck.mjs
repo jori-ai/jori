@@ -300,6 +300,10 @@ const supportingData = input.supporting_data || null;
 // place. The residual exposure is small and bounded: in every observed case
 // Jori's chat-channel answer immediately followed and carries the substance.
 // Revisit with a real disagreement, not a hypothesis.
+//
+// The `questions` channel (2026-10-29) is in: it is the user's own Q&A with
+// Jori, split out of chat by urgency (lib/question-route.mjs), so a question
+// asked or answered there is part of the conversation this gate must see.
 let recentMessages = [];
 const sbKey = readSupabaseKey();
 if (sbKey) {
@@ -308,7 +312,7 @@ if (sbKey) {
     const qs = new URLSearchParams({
       select: "role,content,created_at",
       "created_at": `gt.${since}`,
-      channel: "eq.chat",
+      channel: "in.(chat,questions)",
       order: "created_at.desc",
       limit: "60",
     });

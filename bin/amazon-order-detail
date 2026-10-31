@@ -1,0 +1,355 @@
+#!/usr/bin/env node
+// amazon-order-detail — fill in what an Amazon order actually contained, by
+// reading the order page the confirmation email refuses to describe.
+//
+// WHY THIS EXISTS. Amazon anonymised its order mail. A confirmation says, in
+// its entirety: "Ordered: 1 Appliances item", an order number, the recipient's
+// first name and town, and a total. No product name — not in the subject, not
+// in the body, and not in the Shipped or Delivered notices either. receipt-scan
+// extracts that faithfully and stores "Appliances item", which categorises
+// nothing: a ledger cannot tell a pool vacuum from a coffee machine.
+//
+// The order page behind the email's own "View order" link has all of it: the
+// product, the seller, the line price and the shipping address. This tool
+// reads that page through the automation Chrome (:9222) and writes it back
+// onto the receipt.
+//
+// WHY A BROWSER. There is no orders API. Amazon's order pages are gated by
+// session cookies, so there is no fetch-and-parse route and no key to buy.
+// Same posture as `zestimate`, for the same reasons and with the same limits:
+// the account's own orders, from the account's own machine, a few pages a week,
+// paced — and it STOPS on a bot challenge rather than hardening the block.
+//
+// AUTH. The automation Chrome keeps its own profile, separate from the one the
+// user browses with, so it needs its own Amazon login done once by hand. This
+// tool never types a password and never logs itself in: on a sign-in wall it
+// stops and says so. An automated Amazon login means CAPTCHA and OTP, and a
+// locked account is a much worse outcome than a stale ledger.
+//
+// OFF without the amazon.com browsing skill (browsing-skills/skills/amazon.com/
+// references/order-details.md — the page's selectors live there, private to
+// the install): the run says so and exits 0.
+//
+// Usage:
+//   amazon-order-detail                     the last 60 days, newest first
+//   amazon-order-detail --since 2026-01-01  reach further back
+//   amazon-order-detail --all               no date floor (deliberate backfill)
+//   amazon-order-detail --limit 20          cap one run (default 25)
+//   amazon-order-detail --only <id,...>     just these order numbers, any age
+//   amazon-order-detail --rescan            re-read orders already fetched
+//   amazon-order-detail --dry-run           fetch + print, write nothing
+//   amazon-order-detail --json              machine-readable summary
+
+import fs from "node:fs";
+import path from "node:path";
+import { execFileSync } from "node:child_process";
+import { connect } from "../lib/cdp.mjs";
+import supa from "../lib/supabase-rest.js";
+import rootLib from "../lib/root.cjs";
+const { request } = supa;
+const { installRoot, installTools } = rootLib;
+
+const SKILL = path.join(installRoot(), "browsing-skills/skills/amazon.com/references/order-details.md");
+
+const ARGV = process.argv.slice(2);
+const FLAGS = new Set(ARGV.filter((a) => a.startsWith("--")));
+const flagVal = (n, d) => {
+  const i = ARGV.indexOf(`--${n}`);
+  return i >= 0 && ARGV[i + 1] ? ARGV[i + 1] : d;
+};
+const DRY_RUN = FLAGS.has("--dry-run");
+const JSON_OUT = FLAGS.has("--json");
+const RESCAN = FLAGS.has("--rescan");
+const LIMIT = Number(flagVal("limit", "25"));
+const ONLY = (flagVal("only", "") || "").split(",").map((s) => s.trim()).filter(Boolean);
+
+/**
+ * How far back a routine run reaches. Sixty days by default, NOT all of it.
+ *
+ * There are ~300 Amazon receipts with an order number and history is not this
+ * tool's job: Amazon's "Request my data" export hands over everything already
+ * bought, in bulk, for nothing. Reading those same orders here would be about
+ * an hour and a half of page loads against a site that challenges browsers for
+ * exactly that pattern — spending the whole risk budget on the half we already
+ * have another copy of.
+ *
+ * `--all` lifts the floor for a deliberate backfill; `--since` sets it.
+ */
+const SINCE = FLAGS.has("--all")
+  ? null
+  : flagVal("since", new Date(Date.now() - 60 * 86400000).toISOString().slice(0, 10));
+
+// Human-scale pacing. Not politeness theatre: a burst of rapid loads is the
+// signature that gets a browser challenged, and a challenged profile costs far
+// more than the seconds saved. Amazon is stricter about this than most.
+const DELAY_MS = Number(flagVal("delay", "7000"));
+
+const log = (...a) => { if (!JSON_OUT) console.log(...a); };
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/**
+ * The action body, read from the browsing-skill at run time.
+ *
+ * Deliberately not a copy. The registry exists so that when Amazon ships a UI
+ * change the selector is fixed in exactly one file and every consumer picks it
+ * up — a second copy here is how that guarantee quietly stops being true.
+ */
+function loadAction() {
+  const src = fs.readFileSync(SKILL, "utf8");
+  const blocks = [...src.matchAll(/```js\n([\s\S]*?)```/g)].map((m) => m[1]); // lang-regex-ok: fenced code block in our own file
+  const block = blocks.filter((b) => b.includes("execute:")).pop();
+  if (!block) throw new Error(`no execute block in ${SKILL}`);
+  return block;
+}
+
+const orderUrl = (id) =>
+  `https://www.amazon.com/your-orders/order-details?orderID=${encodeURIComponent(id)}`;
+
+/**
+ * Say out loud when the run stalls on something only a human can clear.
+ *
+ * This is what makes the tool safe to leave on a schedule. A weekly job that
+ * quietly reads nothing looks exactly like a weekly job with nothing to read,
+ * and the ledger would go on filing "Appliances item" for months with nobody
+ * the wiser. Re-authing is a sixty-second task; not knowing it is needed is
+ * the expensive part.
+ *
+ * `--observed-error` carries the verbatim status the page actually returned,
+ * because jori-send-curl refuses a system-channel message that asserts a
+ * mechanism without one — a quote cannot be produced by a turn that merely
+ * believes its own narration.
+ */
+function alert(message, observedError) {
+  try {
+    execFileSync(installTools("bin", "jori-send-curl"), [
+      "--channel", "system",
+      // The gate on the system channel refuses a message asserting a mechanism
+      // without the verbatim output behind it — a quote cannot be produced by a
+      // turn that merely believes its own narration.
+      "--observed-error", observedError.slice(0, 400),
+      message,
+    ], { stdio: "ignore", timeout: 20000 });
+  } catch (e) {
+    // An alert that cannot be sent must not take the run down with it. The
+    // console line and the non-zero exit still stand on their own.
+    log(`  (could not send the alert: ${e.message.slice(0, 80)})`);
+  }
+}
+
+function alertHuman(status, receipt) {
+  alert(
+    status === "login_required"
+      ? "amazon-order-detail stopped: the automation Chrome is signed out of Amazon. " +
+          "Sign it in once by hand (profile ~/.cache/chrome-devtools-mcp/chrome-profile) — " +
+          "receipts will keep saying \"1 Electronics item\" until then."
+      : "amazon-order-detail stopped: Amazon showed a bot challenge. Left alone deliberately; " +
+          "re-run later rather than hammering it.",
+    `order-details returned status="${status}" for order ${receipt.order_id}`
+  );
+}
+
+/**
+ * Receipts that have an order number and no order page read yet.
+ *
+ * NEWEST FIRST, deliberately. History is not this tool's job — Amazon's own
+ * "Request my data" export covers everything already bought, in bulk, without
+ * a single page load. What this exists for is the orders arriving from now on,
+ * and those are the ones a run should reach before it hits its ceiling or a
+ * challenge stops it. Oldest-first would spend the budget on the half we
+ * already have another copy of.
+ */
+async function pending() {
+  const params = new URLSearchParams();
+  params.set("select", "id,vendor,date,total,order_id,ship_to,detail_status");
+  params.set("vendor", "ilike.*amazon*");
+  params.set("order_id", "not.is.null");
+  params.set("order", "date.desc");
+  if (ONLY.length) {
+    // An explicit order number always wins: asking for one by name means it,
+    // however old it is.
+    params.set("order_id", `in.(${ONLY.join(",")})`);
+  } else {
+    if (!RESCAN) params.set("detail_fetched_at", "is.null");
+    if (SINCE) params.set("date", `gte.${SINCE}`);
+  }
+  const rows = await request(`/rest/v1/receipts?${params}`);
+  return rows.slice(0, LIMIT);
+}
+
+async function writeBack(receipt, detail) {
+  const patch = {
+    detail_fetched_at: new Date().toISOString(),
+    detail_status: detail.status,
+  };
+  if (detail.address) {
+    if (detail.address.full) patch.ship_address = detail.address.full;
+    if (detail.address.recipient) patch.ship_recipient = detail.address.recipient;
+  }
+  await request(`/rest/v1/receipts?id=eq.${encodeURIComponent(receipt.id)}`, {
+    method: "PATCH",
+    body: patch,
+    prefer: "return=minimal",
+  });
+
+  if (!detail.items || !detail.items.length) return 0;
+
+  // Replace rather than merge. The email's placeholder lines ("Appliances
+  // item") describe the same purchase as the real ones, so keeping both would
+  // double the receipt and, downstream, double what the classifier reads.
+  await request(
+    `/rest/v1/receipt_line_items?receipt_id=eq.${encodeURIComponent(receipt.id)}`,
+    { method: "DELETE", prefer: "return=minimal" }
+  );
+  await request(`/rest/v1/receipt_line_items`, {
+    method: "POST",
+    prefer: "return=minimal",
+    body: detail.items.map((item, i) => ({
+      receipt_id: receipt.id,
+      line_number: i + 1,
+      description: item.title,
+      quantity: item.quantity ?? null,
+      // The line total, which is what the email's version held. unitPrice ×
+      // quantity, because a receipt line is what that line cost.
+      amount: item.unitPrice == null ? null : Number((item.unitPrice * (item.quantity || 1)).toFixed(2)),
+      asin: item.asin ?? null,
+      seller: item.seller ?? null,
+    })),
+  });
+  return detail.items.length;
+}
+
+async function main() {
+  if (!fs.existsSync(SKILL)) {
+    log(`amazon-order-detail: off — no amazon.com browsing skill at ${SKILL}`);
+    if (JSON_OUT) console.log(JSON.stringify({ off: true, considered: 0, filled: 0, items: 0 }));
+    return;
+  }
+  const rows = await pending();
+  if (!rows.length) {
+    log("Nothing to read — every Amazon receipt with an order number has its page.");
+    if (JSON_OUT) console.log(JSON.stringify({ considered: 0, filled: 0, items: 0 }));
+    return;
+  }
+
+  log(`${rows.length} Amazon order${rows.length === 1 ? "" : "s"} to read.`);
+  const block = loadAction();
+  const expression = `(${block}).execute({})`;
+
+  let browser;
+  try {
+    browser = await connect();
+  } catch (e) {
+    const detail = `connect() to localhost:9222 failed: ${e.message}`;
+    console.error(
+      `Cannot reach the automation Chrome (${e.message}).\n` +
+        `It is the LaunchAgent com.jori.chrome-cdp, port 9222.`
+    );
+    // chrome-cdp-watch also notices a dead port, but it cannot know this job
+    // needed it — and this one failing silently means receipts stop improving.
+    if (!DRY_RUN) {
+      alert(
+        "amazon-order-detail could not reach the automation Chrome " +
+          "(com.jori.chrome-cdp, port 9222), so no Amazon orders were read.",
+        detail
+      );
+    }
+    process.exit(2);
+  }
+
+  const summary = { considered: rows.length, filled: 0, items: 0, skipped: [], stoppedOn: null };
+
+  for (const [index, receipt] of rows.entries()) {
+    if (index > 0) await sleep(DELAY_MS);
+
+    let detail;
+    try {
+      await browser.goto(orderUrl(receipt.order_id));
+      detail = await browser.evaluate(expression);
+    } catch (e) {
+      summary.skipped.push({ orderId: receipt.order_id, reason: e.message.slice(0, 120) });
+      log(`  ${receipt.order_id}: could not read — ${e.message.slice(0, 90)}`);
+      continue;
+    }
+
+    // Stop rather than grind. Once the profile is challenged or signed out,
+    // every further load makes it worse and none of them can succeed.
+    if (detail.status === "login_required" || detail.status === "blocked") {
+      summary.stoppedOn = detail.status;
+      if (!DRY_RUN) alertHuman(detail.status, receipt);
+      log(
+        detail.status === "login_required"
+          ? `  ${receipt.order_id}: the automation profile is signed out of Amazon — stopping.`
+          : `  ${receipt.order_id}: bot challenge shown — stopping.`
+      );
+      break;
+    }
+
+    if (detail.status !== "ok" || !detail.items.length) {
+      summary.skipped.push({ orderId: receipt.order_id, reason: detail.status });
+      log(`  ${receipt.order_id}: ${detail.status}, nothing to write.`);
+      if (!DRY_RUN) await writeBack(receipt, detail);
+      continue;
+    }
+
+    const titles = detail.items.map((i) => i.title.slice(0, 60)).join("; ");
+    log(`  ${receipt.order_id}: ${titles}`);
+    if (detail.address && detail.address.street) log(`      → ${detail.address.full}`);
+
+    if (!DRY_RUN) {
+      summary.items += await writeBack(receipt, detail);
+      summary.filled += 1;
+    }
+  }
+
+  // Hang up the CDP socket. Without this the run finishes, prints, and then
+  // never exits: an open WebSocket keeps node's event loop alive, so cron-run
+  // waits forever on a child that is done, and a daily schedule accumulates one
+  // wedged process per day. Found the expensive way — a test run was still
+  // resident ten minutes after it had written its last line.
+  try {
+    browser.close();
+  } catch {
+    /* already gone — nothing to hang up */
+  }
+
+  if (JSON_OUT) {
+    console.log(JSON.stringify(summary));
+  } else {
+    log(
+      `\n${summary.filled} receipt${summary.filled === 1 ? "" : "s"} filled in, ` +
+        `${summary.items} line item${summary.items === 1 ? "" : "s"} written.` +
+        (DRY_RUN ? "  (dry run — nothing written)" : "")
+    );
+    if (summary.stoppedOn === "login_required") {
+      log(
+        `\n⚠ Sign the automation profile into Amazon, once, by hand:\n` +
+          `    the Chrome on --user-data-dir=~/.cache/chrome-devtools-mcp/chrome-profile\n` +
+          `  Nothing here will log itself in — that path is CAPTCHA and OTP, and a\n` +
+          `  locked account is worse than a stale ledger.`
+      );
+    }
+    if (summary.stoppedOn === "blocked") {
+      log(`\n⚠ Stopped early on a bot challenge — re-run later, don't hammer it.`);
+    }
+  }
+}
+
+// Anything that breaks says so out loud. On a schedule nobody watches, a job
+// that dies is indistinguishable from a job with nothing to do — and the whole
+// point of this one is that the ledger goes quietly wrong when it stalls. The
+// error text is carried verbatim rather than summarised, because a paraphrase
+// of a failure is how a real cause gets lost.
+main()
+  .then(() => {
+    // Belt to close()'s braces. If any socket or timer is still holding the
+    // loop open, exit anyway rather than leaving cron-run parked on us.
+    process.exit(0);
+  })
+  .catch((e) => {
+    const detail = e && e.message ? e.message : String(e);
+    console.error(detail);
+    if (!DRY_RUN) {
+      alert(`amazon-order-detail failed and read nothing this run: ${detail.slice(0, 200)}`, detail);
+    }
+    process.exit(1);
+  });

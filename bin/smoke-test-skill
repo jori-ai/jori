@@ -1,0 +1,51 @@
+#!/bin/bash
+# smoke-test-skill — convenience wrapper for running a browsing-skill action
+# against a live URL via the host's automation Chrome (CDP on :9222).
+#
+# Usage:
+#   smoke-test-skill <url> <skill-path> [paramsJson]
+#
+# Resolves skill paths relative to browsing-skills/ for ergonomics:
+#   smoke-test-skill https://www.amnh.org/events skills/_events-generic/references/listing-extract.md '{"sourceKey":"amnh","cardSelector":"a.amnh-calendar-new-event","fields":{"title":"h3","url":"self"},"limit":3}'
+#
+# Or with an absolute path:
+#   smoke-test-skill https://example.com/ /abs/path/to/browsing-skills/skills/<site>/references/<action>.md '{}'
+#
+# Runs via local Node (must be 22+). The skill file must contain at least one
+# ```js fenced block with an `execute:` (the standard browsing-skills shape).
+
+set -euo pipefail
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+JORI_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+SKILLS_DIR="$JORI_ROOT/browsing-skills"
+RUNNER="$SKILLS_DIR/tools/cdp-runner.mjs"
+
+if [ $# -lt 2 ]; then
+  echo "usage: smoke-test-skill <url> <skill-path> [paramsJson]" >&2
+  echo "       (skill path is resolved relative to browsing-skills/ if not absolute)" >&2
+  exit 2
+fi
+
+URL="$1"
+SKILL_PATH="$2"
+PARAMS="${3:-{\}}"
+
+# Resolve skill path: absolute as-is; relative to SKILLS_DIR otherwise.
+if [ "${SKILL_PATH:0:1}" != "/" ]; then
+  SKILL_PATH="$SKILLS_DIR/$SKILL_PATH"
+fi
+
+if [ ! -f "$SKILL_PATH" ]; then
+  echo "skill not found: $SKILL_PATH" >&2
+  exit 2
+fi
+
+# Locate node — $NODE wins, else the kernel's JORI_NODE (root.sh).
+. "$SCRIPT_DIR/../agent/scripts/lib/root.sh"
+NODE="${NODE:-$JORI_NODE}"
+if [ ! -x "$NODE" ]; then
+  echo "node not found at $NODE" >&2
+  exit 2
+fi
+
+exec "$NODE" "$RUNNER" "$URL" "$SKILL_PATH" "$PARAMS"

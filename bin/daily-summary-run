@@ -1,0 +1,575 @@
+#!/bin/bash
+set -uo pipefail
+# daily-summary-run — forks a protected, single-shot `claude -p` session that
+# runs the ENTIRE daily-summary pipeline (Steps 1-5 of jobs/daily-summary.md)
+# to completion, so the build no longer runs as a blocking multi-turn stretch
+# inside the persistent ops-agent's own long-lived session.
+#
+# Why this exists (2026-07-17). The persistent ops-agent session handles
+# every dispatch of the day (triage, hum, every other scheduled job) end to
+# end, and periodically compacts/rotates/restarts as it accumulates context
+# across those dispatches. Steps 1-5 of daily-summary are a long, many-tool-
+# call stretch (Google Calendar, Gmail, Supabase, Notes, chat vetting, prose
+# writing, the deterministic builder) run as blocking work inside that same
+# session — so a rotation, restart, or even a single Bash-tool timeout
+# landing mid-build silently orphans the whole thing: no error, no
+# `daily_summaries` row, no process left alive, and the dispatcher's own
+# "turn complete" bookkeeping still looks like an ordinary success from the
+# outside. Confirmed repeatedly the week of 2026-07-15/16 — the scheduled
+# 05:05 UTC dispatch left no row for either date; only a watchdog.sh backfill
+# or a fully separate manual re-dispatch eventually landed one, hours later
+# (see system/changelog.md, 2026-07-17, for the
+# specific Jul-16 instance: a `daily-summary-build prep` call that blew past
+# the agent's 120s Bash-tool timeout and got silently abandoned — one
+# concrete manifestation of this exact structural risk, already patched at
+# its own root cause (osxphotos PATH) but not the only way this class of
+# failure can happen).
+#
+# Same root cause and same fix shape as the france-itinerary orphaning bug
+# (the france-itinerary pipeline, retired 2026-07-22) — except daily-summary's
+# pipeline is judgment-heavy (vetting chat venue candidates, writing prose)
+# rather than a pure deterministic script, so instead of rewriting it in
+# Node this forks a FRESH, single-shot `claude -p` session — same Max auth,
+# same agent/ops-agent/.mcp.json + CLAUDE.md hierarchy, same
+# claude_ai_* connectors (Gmail/Calendar) the persistent session uses — that
+# runs the playbook start to finish with nothing left in the middle to
+# orphan: it either completes or the whole process tree under job-run's
+# detached wrapper dies with it, visible via job-status/job-list. Same
+# "fork a single-shot claude -p from an authenticated parent" pattern
+# `the weekly memo trigger` already uses for the weekly Opus memo.
+#
+# The receiving ops-agent's job (per jobs/daily-summary.md's launch section)
+# is now just: launch this via job-run, end the turn. Nothing else runs
+# inside the persistent session for this dispatch.
+#
+# A THIRD orphaning shape (2026-07-26). Orphan #1 (shared-session rotation) and
+# #2 (job-run self-recursion, fixed 2026-07-17, see the IMPORTANT note below) are
+# both closed. This one is the forked session choosing to run one of ITS OWN Bash
+# tool calls in the background instead of foreground/blocking (e.g. Step 4.1's
+# `daily-summary-build prep` / `render`, the latter now the slow one since it
+# embeds photos) — harmless in an interactive session with a future
+# turn to check back on it, but fatal here: a single-shot `claude -p -p`
+# invocation has no future turn, so the moment the model emits its final text the
+# CLI's turn ends and the backgrounded subprocess is orphaned mid-pipeline —
+# RC=0, no `daily_summaries` row, no email, completely silent to job-run/
+# job-status. Confirmed live 2026-07-26: the 01:05 home time run for 2026-07-25 exited
+# in 7.5min (half the duration of every other successful run) with its ENTIRE
+# output being the one line "Waiting for the background prep job to finish
+# before continuing." A second, compounding failure let the gap survive an
+# extra day: the watchdog.sh backfill dispatch that followed was skipped by the
+# receiving ops-agent turn, which checked `job-status` on the ORIGINAL (already-
+# exited-0) job and treated that as proof the date was covered — see
+# jobs/daily-summary.md's "This launch is unconditional" note for that half of
+# the fix. Fixed here by telling the fork explicitly, in its own prepended
+# instructions below, never to background a Bash call in this session.
+#
+# Usage: daily-summary-run [DATE] [SILENT] [--effort E] [--dry-run --out DIR]
+#   (--effort / --dry-run / --out: the effort A/B harness, bin/daily-summary-ab)
+#   DATE     YYYY-MM-DD override. Omit for the normal scheduled run — this
+#            script resolves "yesterday" in the user's current local tz
+#            (bin/local-day) and passes it to the fork explicitly.
+#   SILENT   literal token, only valid together with an explicit DATE — a
+#            re-render after a late correction (DB + episode file only, no
+#            email/push; see jobs/daily-summary.md Step 0).
+#
+# Exit codes: 0 = the fork ran to completion (claude -p's own exit code was
+# 0). This does NOT independently re-verify that a daily_summaries row
+# landed — that safety net already belongs to watchdog.sh's same-morning
+# backfill+page check (see jobs/daily-summary.md "Manual recovery"); adding
+# a second check here would double-alert on the same signal, which
+# agent/CLAUDE.md § System Channel reserves for watchdog.sh alone.
+# 1 = the fork never authenticated or produced no output at all — a
+# distinct, more specific failure than "no row by 9am", so it's alerted
+# here once (mirrors the weekly memo trigger's own guard, which is a
+# plain script probing real subprocess output, not an agent-turn self-check).
+# Exit 1 also covers two narrower conditions that are alerted with their own
+# wording rather than as "auth/empty", because the remedy differs: the fork was
+# killed mid-build (RC > 128 — 2026-09-08), and this script could not create
+# the temp file the fork's output redirect needs (mktemp failed — 2026-10-01,
+# checked BEFORE the fork, so no build was attempted at all). Neither is an
+# auth failure and neither should suggest re-login.
+# 3 = could not acquire the per-date lock (bin/daily-summary-lock)
+# within 15 minutes — a concurrent relaunch for the same date is still
+# building it. This run made no attempt at all (no fork launched); alerted
+# once via the system channel so a genuinely-stuck holder gets noticed rather
+# than silently losing a night. See bin/daily-summary-lock's header for
+# why every relaunch path (cron, watchdog self-heal, manual redispatch) goes
+# through this lock.
+# 4 = refused to start because this process was launched from an SSH session
+# (SSH_CONNECTION or SSH_CLIENT set) — 2026-10-13, cluster
+# . An SSH session cannot reach the Max
+# login in the GUI session's keychain, so the fork could only fail with "Not
+# logged in" and be paged as auth/empty. Checked BEFORE the per-date lock: no
+# lock taken, no fork, no system-channel alert; the remedy (dispatch `DAILY
+# SUMMARY <date> [SILENT]` to the ops supervisor) is printed to stderr and the
+# refusal is logged. DAILY_SUMMARY_ALLOW_SSH=1 skips the check for an operator
+# who has confirmed the keychain is reachable. See the SSH guard below.
+#
+# IMPORTANT: this script pipes only the "Step 0 onward" BODY of
+# jobs/daily-summary.md to the fork — NOT the file's own "## Pipeline —
+# launch via job-run" or "## Manual recovery" sections (both instruct
+# launching job-run, and are meant for the DISPATCHING turn deciding whether
+# to run this script, not for the forked session itself). Piping the whole
+# file verbatim caused the fork to read its own launch instructions and
+# recursively re-launch job-run on itself every ~10s (caught live
+# 2026-07-17, 8 generations before being killed by hand, no DB writes —
+# see the awk extraction below). Keep this extraction in sync if either
+# section's heading text changes.
+
+# shellcheck source=/dev/null
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../agent/scripts/lib/root.sh"   # JORI_INSTALL, JORI_INSTALL_TOOLS, JORI_NODE
+# shellcheck source=/dev/null
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../agent/scripts/lib/instance.sh"   # JORI_TZ
+[ -d /opt/homebrew/bin ] && export PATH="/opt/homebrew/bin:$PATH"
+CLAUDE="${CLAUDE_BIN:-$HOME/.local/bin/claude}"
+CWD="$JORI_INSTALL_TOOLS/agent/ops-agent"
+JOB_MD="$CWD/jobs/daily-summary.md"
+LOG="$JORI_INSTALL_TOOLS/agent/logs/daily-summary-run.log"
+ENV_FILE="$JORI_INSTALL/.env"
+
+mkdir -p "$(dirname "$LOG")" 2>/dev/null || true
+log() { echo "$(date '+%Y-%m-%d %H:%M:%S') [daily-summary-run] $1" >> "$LOG"; }
+
+# Flags (2026-10-04, the effort A/B harness — bin/daily-summary-ab):
+#   --effort low|medium|high|xhigh   fork effort (default xhigh, the production value)
+#   --dry-run                        Steps 0-4.6 only: no confirm-venue, no publish,
+#                                    no email/push; requires DATE
+#   --out DIR                        with --dry-run: copy the run's /tmp artifacts
+#                                    + metrics.json (cost, turns, duration) to DIR
+EFFORT="xhigh"
+DRY_RUN=0
+AB_OUT=""
+POSITIONAL=()
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --effort) EFFORT="${2:-}"; shift 2 ;;
+    --dry-run) DRY_RUN=1; shift ;;
+    --out) AB_OUT="${2:-}"; shift 2 ;;
+    *) POSITIONAL+=("$1"); shift ;;
+  esac
+done
+set -- ${POSITIONAL[@]+"${POSITIONAL[@]}"}
+DATE_ARG="${1:-}"
+MODE_ARG="${2:-}"
+if [[ ! "$EFFORT" =~ ^(low|medium|high|xhigh)$ ]]; then
+  log "ERROR: --effort must be low|medium|high|xhigh, got '$EFFORT'"
+  exit 1
+fi
+if (( DRY_RUN )) && [[ -z "$DATE_ARG" || -n "$MODE_ARG" ]]; then
+  log "ERROR: --dry-run needs an explicit DATE and no SILENT"
+  exit 1
+fi
+
+if [[ ! -f "$JOB_MD" ]]; then
+  log "ERROR: job file missing: $JOB_MD"
+  exit 1
+fi
+
+if [[ -n "$DATE_ARG" && ! "$DATE_ARG" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
+  log "ERROR: DATE arg '$DATE_ARG' is not YYYY-MM-DD"
+  exit 1
+fi
+if [[ -n "$MODE_ARG" && "$MODE_ARG" != "SILENT" ]]; then
+  log "ERROR: second arg must be the literal SILENT, got '$MODE_ARG'"
+  exit 1
+fi
+if [[ -n "$MODE_ARG" && -z "$DATE_ARG" ]]; then
+  log "ERROR: SILENT requires an explicit DATE"
+  exit 1
+fi
+
+# No date given (the scheduled run): resolve "yesterday" in the user's CURRENT
+# local timezone and pass it to the fork explicitly, so the fork never falls
+# back to the playbook's home-zone default. This job fires at 04:00 LOCAL; far
+# east of home, "yesterday" in the home zone at that moment is two local days
+# ago — one such run rebuilt the day before yesterday and yesterday never
+# shipped. local-day resolves the tz exactly as cron-tz-sync does when it sets
+# the fire time. Fall back to the home zone (JORI_TZ) only if it errors, and
+# say so.
+if [[ -z "$DATE_ARG" ]]; then
+  if ! DATE_ARG=$("$JORI_INSTALL_TOOLS/bin/local-day" yesterday 2>>"$LOG") || [[ ! "$DATE_ARG" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
+    DATE_ARG=$(TZ="${JORI_TZ:-UTC}" date -v-1d +%Y-%m-%d)
+    log "WARN: local-day failed — falling back to yesterday in the home zone ($DATE_ARG)"
+  fi
+fi
+
+if [[ -n "$DATE_ARG" && -n "$MODE_ARG" ]]; then
+  TASK_LINE="DAILY SUMMARY $DATE_ARG $MODE_ARG"
+elif [[ -n "$DATE_ARG" ]]; then
+  TASK_LINE="DAILY SUMMARY $DATE_ARG"
+else
+  TASK_LINE="DAILY SUMMARY"
+fi
+
+# SSH guard (2026-10-13).
+# Refuse, BEFORE the per-date lock and before anything that can page, when this
+# process was started from an SSH session. Defends against this system-channel
+# alert, which looks like a Max-auth outage and is not one:
+#   "⚠️ daily-summary-run exited without producing output (DAILY SUMMARY
+#    2026-10-12) — auth/empty ("Not logged in · Please run /login")"
+# On 2026-10-13 at 01:16 home time an operator ran `daily-summary-run 2026-10-12` in an
+# SSH session on the mini. It waited 6.6 min on the lock behind a legitimate
+# SILENT re-render, forked `claude -p`, and the fork died in ~1s with "Not logged
+# in": the Max OAuth credential lives in the login keychain of the GUI security
+# session, and an SSH session is outside it (the same constraint as cron — see
+# system/changelog.md, 2026-07-30: "daily-summary-run cannot be invoked
+# over SSH"). The auth/empty guard at the bottom of this script then paged. The
+# same trap is in daily-summary-run.log on 2026-07-27 (x2), 07-30 and 09-07 (x2).
+# Dispatching `DAILY SUMMARY 2026-10-12` to the ops supervisor worked first time.
+#
+# Why key on the SSH session and NOT on `claude auth status`: the status command
+# can report a cached login without ever touching the keychain, so a probe-based
+# guard could pass here and the fork still fail — i.e. a guard that never fires.
+#
+# This is NOT the scheduled-vs-hand-run discriminator that run-ephemeral-opus.sh
+# and tests/ephemeral-opus-auth-guard.test.mjs rule out. That one would
+# have SILENCED the auth/empty page for some runs; this one never changes when
+# that page fires for a run that reaches the fork. It stops a launch that cannot
+# authenticate from being attempted at all. Every unattended path (launchd ->
+# ops supervisor -> job-run, the watchdog's webhook backfill) has neither
+# variable set — measured on the live ops supervisor's environment 2026-10-13.
+#
+# `set -u` is on: the `:-` defaults below are mandatory. A bare $SSH_CONNECTION
+# would abort EVERY scheduled run (where it is unset) as an unbound variable.
+# Escape hatch: DAILY_SUMMARY_ALLOW_SSH=1, for an operator who has confirmed the
+# login keychain is reachable from this session (e.g. a tmux pane whose server
+# was started in the GUI session). No jori-send-curl on this path, on purpose:
+# the person reading this terminal is the only audience, and paging the system
+# channel is exactly the noise this removes. Exit 4 is documented in the header.
+# Pinned by tests/daily-summary-run-ssh-guard.test.mjs.
+if [[ -n "${SSH_CONNECTION:-}${SSH_CLIENT:-}" && "${DAILY_SUMMARY_ALLOW_SSH:-}" != "1" ]]; then
+  log "REFUSED: launched from an SSH session (SSH_CONNECTION/SSH_CLIENT set) — the Max login in the GUI session's keychain is not reachable from SSH, so the fork could not authenticate. Nothing built, no lock taken, no alert sent. Dispatch '$TASK_LINE' to the ops supervisor instead (jobs/daily-summary.md § Manual recovery), or set DAILY_SUMMARY_ALLOW_SSH=1 if the keychain is reachable"
+  {
+    printf '\ndaily-summary-run: refused to start, because this shell is an SSH session\n'
+    printf '(SSH_CONNECTION or SSH_CLIENT is set). Nothing was built for %s:\n' "$DATE_ARG"
+    printf 'no lock was taken, no claude -p was forked, and no alert was sent.\n\n'
+    printf 'Why: the fork signs in with the Max login stored in the login keychain of\n'
+    printf "the Mac's GUI session. An SSH session sits outside that session, so the\n"
+    printf 'keychain is invisible to it and claude -p fails within a second with\n'
+    printf '"Not logged in · Please run /login" (the same limit cron has). That is not\n'
+    printf 'a Max outage, and logging in again will not help.\n\n'
+    if (( DRY_RUN )); then
+      printf 'What to do instead: a --dry-run comparison must be launched from an\n'
+      printf 'authenticated ops-agent turn (job-run inherits its keychain access), e.g.\n\n'
+      printf '  %s/bin/job-run --name ds-ab -- %s/bin/daily-summary-ab run %s --efforts xhigh,medium\n\n' "$JORI_INSTALL_TOOLS" "$JORI_INSTALL_TOOLS" "$DATE_ARG"
+      printf 'Do NOT dispatch "DAILY SUMMARY %s" for this: that runs a real build.\n\n' "$DATE_ARG"
+    else
+      printf 'What to do instead: dispatch it to the resident ops supervisor, which runs\n'
+      printf 'in the GUI session (the recipe in agent/ops-agent/jobs/daily-summary.md\n'
+      printf '§ Manual recovery):\n\n'
+      printf '  TOKEN=$(cat %s/secrets/webhook-token)\n' "$JORI_INSTALL"
+      printf '  curl -s -X POST http://localhost:9092 \\\n'
+      printf '    -H "Authorization: Bearer $TOKEN" \\\n'
+      printf '    -H "Content-Type: application/json" \\\n'
+      printf '    -d '\''{"task": "%s", "source": "manual-backfill"}'\''\n\n' "$TASK_LINE"
+      if [[ -z "$MODE_ARG" ]]; then
+        printf 'Without SILENT that build sends the day email and push. If this date already\n'
+        printf 'shipped and you only want the stored narrative re-rendered, use\n'
+        printf '"%s SILENT" as the task instead.\n\n' "$TASK_LINE"
+      fi
+    fi
+    printf 'If you have confirmed the login keychain IS reachable from this session,\n'
+    printf 'rerun with DAILY_SUMMARY_ALLOW_SSH=1 to skip this check.\n'
+  } >&2
+  log "exit 4 (guard: SSH session, refused before the lock)"
+  exit 4
+fi
+
+# Per-date lock (2026-07-28). The settle+prose+publish
+# sub-sequence this script forks a session to run is NOT safe against a
+# second relaunch for the SAME date overlapping it — see
+# bin/daily-summary-lock's header for the full race + why a lock (not a
+# retry or a smarter publish) is the fix. DATE_ARG is always set by here
+# (resolved above for the scheduled run), so a no-arg scheduled run and a
+# same-day backfill/manual redispatch key to the identical lock.
+LOCK_DATE="$DATE_ARG"
+LOCK_BIN="$JORI_INSTALL_TOOLS/bin/daily-summary-lock"
+# Pass our OWN pid explicitly — see daily-summary-lock's header for why
+# relying on its $PPID default is unsafe here: this acquire call is not the
+# last statement in this script (there's the fork + exit after it), so bash
+# forks a real subshell to run the command substitution below, and that
+# subshell's pid (not ours) would otherwise get stamped into the lock file —
+# making it look stale and stealable the instant the substitution returns,
+# even though this script (the real holder) keeps running for many minutes
+# after. $$ is expanded here, in our own shell, before that subshell exists.
+MY_PID=$$
+if ! LOCK_PATH=$("$LOCK_BIN" acquire "$LOCK_DATE" 900 "$MY_PID"); then
+  log "ERROR: could not acquire daily-summary lock for $LOCK_DATE within 900s — a concurrent run is likely still building this date; skipping this launch rather than racing it ($TASK_LINE)"
+  "$JORI_INSTALL_TOOLS/bin/jori-send-curl" --skip-precheck --channel system \
+    "⚠️ daily-summary-run skipped for $LOCK_DATE — could not acquire the per-date lock within 15m (another run appears to still be building this date). No new build was attempted; check job-list for a stuck daily-summary job before manually redispatching." >> "$LOG" 2>&1 || true
+  exit 3
+fi
+log "acquired lock for $LOCK_DATE ($LOCK_PATH)"
+trap '"$LOCK_BIN" release "$LOCK_DATE"' EXIT INT TERM
+
+# MCP service secrets (SUPABASE_ACCESS_TOKEN, etc.), then force the Max
+# session — same two-step as the weekly memo trigger.
+if [[ -f "$ENV_FILE" ]]; then set -a; source "$ENV_FILE"; set +a; fi
+unset ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN
+
+DRY_NOTE=""
+if (( DRY_RUN )); then
+  TASK_LINE="$TASK_LINE DRY-RUN"
+  # A dry run must start clean: stale prose/confirmed/report files from an
+  # earlier run of this date would leak into this one's output. The per-date
+  # lock above guarantees no real run is mid-build on these files.
+  for f in "/tmp/ds-confirmed-$DATE_ARG.json" "/tmp/ds-prose-$DATE_ARG.json" "/tmp/daily-summary-$DATE_ARG.html" \
+           "/tmp/ds-review-$DATE_ARG.json" "/tmp/ds-skeleton-$DATE_ARG.html"; do
+    rm -f "$f"
+  done
+  DRY_NOTE="DRY RUN (an effort A/B comparison, bin/daily-summary-ab): execute Steps 0 through 4.6 exactly as written — including every review round — then STOP. Do NOT run Step 5 or anything with an effect outside /tmp: no \`daily-summary-build confirm-venue\`, no \`daily-summary-build publish\`, no SQL insert/update/upsert, no \`digest-deliver\`, \`email-send\`, \`gmail-action\`, \`jori-send-curl\` or \`jori-notify\`. Your output is the files in /tmp (/tmp/ds-confirmed-$DATE_ARG.json, /tmp/ds-prose-$DATE_ARG.json, /tmp/daily-summary-$DATE_ARG.html, /tmp/ds-review-$DATE_ARG.json); they are collected after you exit.\n\n"
+fi
+
+log "start ($TASK_LINE, sonnet-5 $EFFORT)"
+# Explicit template, NOT `mktemp -t daily-summary-run` — do not "simplify" it back
+# (2026-10-01/02).
+# On macOS, `mktemp -t <prefix>` IGNORES $TMPDIR: it resolves the per-user Darwin
+# temp dir via confstr(_CS_DARWIN_USER_TEMP_DIR), i.e. /var/folders/<...>/T.
+# This script is routinely launched by `job-run` from an AGENT Bash turn, which
+# runs under the macOS sandbox — and that sandbox remaps TMPDIR to a writable dir
+# of its own (/tmp/claude-<uid>) while DENYING writes to /var/folders/.../T. So
+# `-t` aimed at the denied directory and failed with EPERM, verbatim from
+# data/logs/jobs/20261002-070207-day-rerender-2026-09-26-245f.log:
+#   mktemp: mkstemp failed on /var/folders/c0/.../T/daily-summary-run.oaoO5lUIOL:
+#   Operation not permitted
+# No temp file meant no fork, so the date was never built — it failed identically
+# on 2026-10-01 and 2026-10-02 for both 2026-09-26 and 2026-09-27, which stay
+# flagged in data/photos-sync-gaps.json and so get retried every night.
+# Giving mktemp a full template makes it honor whatever TMPDIR the parent actually
+# has, sandboxed or not. The live unsandboxed TMPDIR ends in a slash
+# (/var/folders/.../T/), hence the `%/` strip — otherwise every path we create and
+# log carries a cosmetic `//`.
+TMP_BASE="${TMPDIR:-/tmp}"
+TMP_BASE="${TMP_BASE%/}"
+OUT_TMP="$(mktemp "$TMP_BASE/daily-summary-run.XXXXXXXX")"
+MKTEMP_RC=$?
+
+# Guard: a failed mktemp is not an auth failure, and must not reach the fork
+# (2026-10-01).
+#
+# This script runs `set -uo pipefail` with NO `set -e`, and `set -u` does not
+# fire on a variable that is SET but EMPTY — so a failed mktemp left OUT_TMP=""
+# and execution walked straight into the fork below. Observed live on
+# 2026-10-01 at 03:02:11 and 03:02:12 home time: two backfill forks (for 2026-09-26
+# and 2026-09-27) launched by jobs/photos-daily.md's repair step via
+# `job-run --name day-rerender` both hit
+#   mktemp: mkstemp failed on /var/folders/c0/.../T/daily-summary-run.iCsKa7fmjJ:
+#   Operation not permitted
+# and then, with OUT_TMP empty: the fork's `> "$OUT_TMP"` redirect became `> ""`
+# and FAILED, so `claude -p` never ran at all; `cat ""` / `grep ""` / `head ""`
+# each errored ("No such file or directory"); and the auth/empty guard's
+# `[[ ! -s "$OUT_TMP" ]]` test is trivially TRUE of the empty string, so both
+# runs paged the system channel as
+#   "⚠️ daily-summary-run did NOT run (DAILY SUMMARY 2026-09-26) — auth/empty
+#   output (\"\"). No build was attempted."
+# Auth was never involved: the normal 04:00 run on the same host an hour later
+# exited 0. RC there was 1 (the failed redirect), not > 128, so the
+# killed-by-signal branch below correctly did not fire either. The only honest
+# reading of an empty OUT_TMP at this point is "we have no temp file", so check
+# it here, before anything uses it.
+#
+# HONESTY NOTE about the alert below. If TMPDIR is broken host-wide then
+# `jori-send-curl` will ALSO fail to create its own temp file (it does
+# `RESP_BODY_FILE=$(mktemp -t jori-send.XXXXXX)`), so this page may simply
+# not be deliverable. That is why the send carries `|| true` and why the `log`
+# line is not optional: the local log append is what actually guarantees a
+# durable record of why this date was skipped. Do not treat the page as the
+# record. mktemp's own stderr (the "mkstemp failed on ..." line, which names the
+# exact path) is not captured here — capturing it would itself need a temp file
+# — it lands in this run's job-run log, which is where to read the real cause.
+if (( MKTEMP_RC != 0 )) || [[ -z "$OUT_TMP" ]]; then
+  log "ERROR: mktemp failed (rc=$MKTEMP_RC, TMPDIR=${TMPDIR:-unset}) — no temp file for the fork's output redirect, so no fork was launched ($TASK_LINE)"
+  "$JORI_INSTALL_TOOLS/bin/jori-send-curl" --skip-precheck --channel system \
+    "⚠️ daily-summary-run could not create its temp file ($TASK_LINE) — mktemp exited $MKTEMP_RC with TMPDIR=${TMPDIR:-unset}, so no fork was launched and nothing was published for this date. This is NOT an auth failure, so re-login is not the remedy; check the temp dir's permissions and free space, and read this run's job-run log for mktemp's own error line." >> "$LOG" 2>&1 || true
+  log "exit 1 (guard: mktemp failed)"
+  exit 1
+fi
+
+# Extract ONLY the "what to execute" body of the playbook — the intro, plus
+# everything from Step 0 through (not including) "## Manual recovery". This
+# deliberately DROPS the file's own "## Pipeline — launch via job-run"
+# section and the "## Manual recovery" section, both of which contain
+# instructions to launch `job-run` — piping those to the fork caused it to
+# read its own launch instructions and recursively call `job-run` on itself
+# (observed live 2026-07-17: 8 generations of daily-summary-run spawning a
+# fresh job-run child roughly every 10s before being killed by hand — no DB
+# writes happened, but it burned real API calls and process churn). Those
+# two sections are for the DISPATCHING ops-agent turn deciding whether to
+# launch this script in the first place; the forked session IS the launch
+# target and must never re-derive that decision from the same text.
+# Connector deny (2026-10-09, cost-efficiency-review). Same list and reason as
+# run-ephemeral-opus.sh: the ops supervisors (agents.json, 10-06)
+# and the Opus forks (10-08) stopped carrying the claude.ai connectors they
+# never call, but this fork has its own `claude -p` line, so every turn still
+# re-read ~985 tool names. 30 days of these sessions (61 transcripts): zero
+# calls to any server below except 5 to jori-tools (wiki_search,
+# notes_search, gmail_labels), a second registration of the `tools` server
+# that exposes the same three. A per-run deny, not an account change; set
+# DS_DISALLOWED_TOOLS="" to turn it off. The list lives in
+# agent/scripts/lib/fork-connector-deny.sh (2026-10-10).
+source "$JORI_INSTALL_TOOLS/agent/scripts/lib/fork-connector-deny.sh"
+DS_DISALLOWED_TOOLS="${DS_DISALLOWED_TOOLS-${JORI_FORK_CONNECTOR_DENY-}}"
+# Skills hidden from the build (2026-10-14), from the same file; DS_SKILL_SETTINGS=""
+# turns it off.
+DS_SKILL_SETTINGS="${DS_SKILL_SETTINGS-${JORI_FORK_SKILL_SETTINGS-}}"
+# + the git-rollback guard hook (D2), merged into the same --settings.
+DS_SKILL_SETTINGS="$(jori_fork_settings "$DS_SKILL_SETTINGS")"
+
+# The instance's own rules (agent/local/, scripts/lib/local-rules.sh):
+# the playbook's local companion after the playbook body, and shared.md +
+# ops.md as --append-system-prompt-file — what the ops CLAUDE.md files used to
+# carry for this cwd.
+source "$JORI_INSTALL_TOOLS/agent/scripts/lib/local-rules.sh"
+LOCAL_COMPANION="$(jori_job_companion "$JOB_MD")"
+LOCAL_RULES_FILE="$OUT_TMP.local-rules"
+jori_local_rules_file "$(jori_local_rules_role "$CWD")" "$LOCAL_RULES_FILE" || LOCAL_RULES_FILE=""
+
+PLAYBOOK_BODY=$(awk '
+  /^## Pipeline — launch via job-run/ { skip=1 }
+  /^### What the forked session executes/ { skip=0; next }
+  /^## Manual recovery/ { exit }
+  !skip { print }
+' "$JOB_MD")
+
+{
+  printf 'You are ALREADY running inside the protected job-run harness as a fresh, single-shot, isolated session — this IS the protected execution context daily-summary-run exists to provide. Do NOT call job-run, job-status, job-cancel, or dispatch any new instance of this job under any circumstance, even if instructions further below seem to describe launching one — those describe what OTHER sessions do before reaching you, not what you do now. Proceed directly to Step 0 below and execute Steps 0-5 yourself, to completion, in this turn. This is a single-shot session with no future turn — NEVER run a Bash tool call in the background (no run_in_background, no trailing `&`, no detached/async invocation) anywhere in this session, including the Step 4.1 `daily-summary-build prep` and `render` builder calls. Every Bash call must run in the foreground and block until it returns real output before you proceed; a backgrounded call here is silently orphaned the instant this turn ends, with no error and no way for you or anything else to notice.\n\n'
+  [[ -n "$DRY_NOTE" ]] && printf '%b' "$DRY_NOTE"
+  printf '%s\n' "$PLAYBOOK_BODY"
+  [[ -n "$LOCAL_COMPANION" ]] && printf '\n%s\n' "$(cat "$LOCAL_COMPANION")"
+  printf '\n---\n\nDispatch instruction for this run (the target date is always given; it supersedes any default in Step 1): %s\n' "$TASK_LINE"
+} | ( cd "$CWD" && "$CLAUDE" -p \
+      --model claude-sonnet-5-5 \
+      --effort "$EFFORT" \
+      $( (( DRY_RUN )) && echo "--output-format json" ) \
+      --permission-mode bypassPermissions \
+      ${DS_DISALLOWED_TOOLS:+--disallowedTools $DS_DISALLOWED_TOOLS} \
+      ${DS_SKILL_SETTINGS:+--settings "$DS_SKILL_SETTINGS"} \
+      ${LOCAL_RULES_FILE:+--append-system-prompt-file "$LOCAL_RULES_FILE"} \
+      --add-dir "$JORI_INSTALL" ) > "$OUT_TMP" 2>&1
+RC=$?
+rm -f "$OUT_TMP.local-rules"
+cat "$OUT_TMP" >> "$LOG"
+
+# Dry run: collect the artifacts + the fork's own usage (it ran with
+# --output-format json) and stop here — no system-channel paging for an
+# operator-driven comparison run; its result is the files it leaves.
+if (( DRY_RUN )); then
+  if [[ -n "$AB_OUT" ]]; then
+    mkdir -p "$AB_OUT"
+    for f in "daily-summary-$DATE_ARG.html" "ds-prose-$DATE_ARG.json" "ds-confirmed-$DATE_ARG.json" \
+             "ds-review-$DATE_ARG.json" "ds-manifest-$DATE_ARG.json" "ds-day-$DATE_ARG.json" "ds-harvest-$DATE_ARG.json"; do
+      [[ -f "/tmp/$f" ]] && cp "/tmp/$f" "$AB_OUT/"
+    done
+    "$JORI_NODE" -e '
+      const fs = require("fs");
+      let o = {}; try { o = JSON.parse(fs.readFileSync(process.argv[1], "utf8")); } catch {}
+      const m = { effort: process.argv[2], rc: Number(process.argv[3]),
+        is_error: !!o.is_error, total_cost_usd: o.total_cost_usd ?? null, num_turns: o.num_turns ?? null,
+        duration_ms: o.duration_ms ?? null, usage: o.usage ?? null };
+      fs.writeFileSync(process.argv[4], JSON.stringify(m, null, 2));
+    ' "$OUT_TMP" "$EFFORT" "$RC" "$AB_OUT/metrics.json" 2>>"$LOG" || true
+  fi
+  rm -f "$OUT_TMP"
+  log "dry-run exit $RC (effort $EFFORT${AB_OUT:+, out $AB_OUT})"
+  exit "$RC"
+fi
+
+# Guard: never let an auth failure or empty run exit 0 silently (same
+# pattern as the weekly memo trigger's 2026-07-04 guard). This is a
+# plain script checking real subprocess output, not a sandboxed agent-turn
+# self-check, so it's exempt from the "only watchdog.sh alerts" rule the
+# same way that script's guard already is.
+# A killed run is not an auth failure (2026-09-08,
+# ). RC above is the forked
+# session's status and bash reports a signal death as 128+signal, but RC was
+# captured and then never consulted — so a killed fork fell through to the
+# empty-output arm below. On 2026-09-07 at 11:57:24 and 11:59:29 home time, during a
+# sequence of operator-requested regenerations, two superseded forks were
+# SIGTERM'd (RC=143) and left OUT_TMP empty, and this guard paged:
+#   "daily-summary-run did NOT run (...) - auth/empty output (\"\"). No build
+#   was attempted."
+# Wrong on both counts: a build WAS attempted, and nothing about auth was
+# broken. Cancelling a superseded regeneration is normal, so check RC first and
+# name the condition an operator can actually act on.
+if (( RC > 128 )); then
+  "$JORI_INSTALL_TOOLS/bin/jori-send-curl" --skip-precheck --channel system \
+    "⚠️ daily-summary-run was killed mid-build ($TASK_LINE, signal $((RC - 128))) — interrupted, not an auth failure. Nothing was published for this date; check job-list / job-status for what stopped it before redispatching." >> "$LOG" 2>&1 || true
+  log "exit 1 (guard: killed by signal $((RC - 128)))"
+  rm -f "$OUT_TMP"
+  exit 1
+fi
+
+# The auth-word scan is BOUNDED BY OUTPUT SIZE, and the bound is the entire
+# point. Do NOT restore the unbounded form this replaces, which was:
+#   grep -qiE 'not logged in|please run /login|invalid (api )?key|authentication_error|unauthorized' "$OUT_TMP" || [[ ! -s "$OUT_TMP" ]]
+# That grepped the WHOLE forked-session transcript, so any successful run which
+# merely MENTIONED an auth word was reported as a failure. Collected 2026-10-03
+# : the 05:23 home time run for
+# DAILY SUMMARY 2026-10-02 succeeded completely — narrative persisted to
+# daily_summaries at 09:36 UTC, email sent 09:37, phone pointer delivered — and
+# its closing paragraph read "the Supabase MCP tools (`execute_sql`,
+# `list_tables`, etc.) were unauthorized for this whole session — I worked
+# around it using the local REST helper". The single word "unauthorized" matched,
+# so the guard exited 1 and paged a claim that the job had not run and that no
+# build was attempted, while quoting a visibly successful report as the
+# "auth/empty output". The non-zero exit then drew a backfill dispatch at 05:38
+# which rebuilt the same date, sent the user a SECOND daily-summary email plus a
+# duplicate push, and spent its own turn unstarring and archiving the first one.
+# All of it is in agent/logs/daily-summary-run.log under 2026-10-03.
+#
+# A real auth failure is one line in ~2 seconds; it is never a 19-line report.
+# So scope by OUTPUT SIZE rather than by "does the text appear anywhere". This is
+# the 2026-08-06 hardening that run-ephemeral-opus.sh and
+# run-ephemeral-fable.sh have carried since, and that
+# the weekly memo trigger got on 2026-10-03 for this
+# identical bug. This is the FOURTH and last copy, now at parity: same
+# AUTH_FAIL_RE, same bound. All four are pinned together by
+# tests/ephemeral-opus-auth-guard.test.mjs so they cannot drift again —
+# this copy drifted precisely because that test watched only three.
+#
+# Narrowing the scan is safe here only because a mid-run auth death still
+# surfaces by exit code: the fork's status is kept in RC and this script ends in
+# `log "exit $RC"` / `exit "$RC"`, so a session that dies after writing output
+# exits non-zero and propagates to job-run. Do not remove that passthrough — it
+# is the backstop the narrowing depends on.
+#
+# The word list is WIDER than the one it replaces, deliberately. The real
+# failure string on this host is "Failed to authenticate: OAuth session expired
+# and could not be refreshed" (daily-summary-run.log, 2026-10-03 05:14:19 and
+# 20:01:32) and the old pattern matched NONE of its words — neither of those two
+# runs paged at all; they exited 1 only because `claude -p` itself returned 1.
+# Covering those shapes is only safe now that the scan is size-bounded.
+AUTH_FAIL_RE='not logged in|please run /login|invalid (api )?key|authentication_error|unauthorized|failed to authenticate|token has been revoked|oauth session expired'
+AUTH_MAX_OUTPUT_LINES=3
+
+auth_or_empty_run() {
+  local f="$1"
+  [ -s "$f" ] || return 0                                          # produced nothing at all
+  [ "$(wc -l < "$f")" -le "$AUTH_MAX_OUTPUT_LINES" ] || return 1   # produced a real report
+  grep -qiE "$AUTH_FAIL_RE" "$f"
+}
+
+if auth_or_empty_run "$OUT_TMP"; then
+  FIRST="$(head -n1 "$OUT_TMP" | cut -c1-100)"
+  # The wording is SCOPED TO THIS INVOCATION on purpose. This process knows
+  # exactly one thing: the `claude -p` it launched produced nothing. It does not
+  # know the date's final outcome, and the sentence it replaces asserted that
+  # twice over — "did NOT run" was false of the 2026-10-03 run before the user
+  # read it, and "No build was attempted" was false of a run that had already
+  # published and emailed. A later backfill can falsify any claim about the
+  # date's end state; nothing can falsify "nothing was produced by this
+  # invocation". Do not strengthen it back.
+  # --observed-error: $FIRST is text this script actually captured, which is what
+  # jori-send-curl's mechanism-attestation gate requires whenever the message
+  # names a specific mechanism — its MECHANISM_CLAIM_RE matches both
+  # "oauth … expired" and "tools unauthorized", so a GENUINE auth page from here
+  # was being rejected with exit 6, silently, behind the `|| true`.
+  "$JORI_INSTALL_TOOLS/bin/jori-send-curl" --skip-precheck --channel system --observed-error "$FIRST" \
+    "⚠️ daily-summary-run exited without producing output ($TASK_LINE) — auth/empty (\"${FIRST}\"). Nothing was produced by this invocation; if this was the scheduled run, the day's summary is missing." >> "$LOG" 2>&1 || true
+  log "exit 1 (guard: auth/empty run)"
+  rm -f "$OUT_TMP"
+  exit 1
+fi
+rm -f "$OUT_TMP"
+log "exit $RC"
+exit "$RC"

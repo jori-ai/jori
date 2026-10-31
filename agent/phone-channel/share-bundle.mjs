@@ -1,6 +1,6 @@
 // share-bundle.mjs — one share-sheet send is one message to the agent.
 //
-// The share extension (client/JoriShare) posts a share as back-to-back
+// The share extension (apps/companion/JoriShare) posts a share as back-to-back
 // jori_messages rows with metadata.source "share": one bare attachment-URL
 // row per photo, then one row with the user's note, text and links. Dispatched
 // row by row, whichever reaches the supervisor first starts a turn alone and

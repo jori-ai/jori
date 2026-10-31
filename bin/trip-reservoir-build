@@ -1,0 +1,507 @@
+#!/usr/bin/env node
+// trip-reservoir-build — Phase 1 of the trip-planning agency (see
+// data/reviews/trip-planning-agency-2026-07-09.md and the
+// `itinerary-planning` skill). Researches ONE area/base once into the 5-bucket
+// reservoir, verifies every place against Google Places, and writes it to
+// data/trip-reservoir/<area>.json + a browsable wiki page
+// `trip_reservoir_<area>`. Daily planning (Phase 2 — the `trip-day-plan` skill,
+// or `trip-day-select` for a batch) then SELECTS from this reservoir instead of
+// researching from scratch each morning.
+//
+// The research step forks a `claude -p --model claude-sonnet-5-5 --effort medium`
+// subprocess (WebSearch only) that inherits the parent's Max session — this must
+// run from within the already-Max-authenticated ops session (via job-run), never
+// straight from cron. It is a web-search + summary job (NOT Opus xhigh — that
+// tier is overkill and, run 5-concurrent, exhausted the Max pool on 2026-07-09).
+// Resumable: the parsed research is checkpointed the instant it succeeds and
+// verified entries are checkpointed incrementally, so a mid-stream kill resumes
+// instead of re-forking. See agent/CLAUDE.md § Auth Model + § Long-Running Jobs.
+//
+// Usage:
+//   trip-reservoir-build --area <key> [--from YYYY-MM-DD] [--to YYYY-MM-DD] [--dry-run]
+//   trip-reservoir-build --label "<area label>" --lat <n> --lon <n> \
+//       [--from YYYY-MM-DD] [--to YYYY-MM-DD] [--dry-run]
+//
+// --area looks the base up in AREAS (a small seed cache of curated bases). For
+//   ANY OTHER location, pass --area <slug> --label "City, Country" (or just
+//   --label): the center is geocoded automatically, so this builds a reservoir
+//   for anywhere the user travels, not a fixed list. This is the path
+//   the nightly autoscan uses to research each upcoming non-home stay.
+// --dry-run runs the full research + verify but prints the reservoir to stdout
+//   instead of writing the JSON/wiki — use it after any edit to this script
+//   before letting a real build persist.
+//
+// Read-only research: no sends, no bookings, no money. Exits 0 on a written
+// reservoir, 1 on failure (after posting a system-channel alert), 2 on a
+// no-op (nothing verified for any bucket).
+
+const fs = require("node:fs");
+const path = require("node:path");
+const { execFileSync, spawnSync } = require("node:child_process");
+const { loadEnv } = require("../lib/load-env.js");
+loadEnv();
+const ws = require("../lib/wiki-store.js");
+const { saveReservoir } = require("../lib/reservoir-store.js");
+const { refinePasses, resolveFuzzy } = require("../lib/reservoir-refine.js");
+const { wantedKind } = require("../lib/reservoir-photo-policy.js");
+const { reservoirTarget } = require("../lib/reservoir-target.js");
+const { installTools } = require("../lib/root.cjs");
+const { localConfig } = require("../lib/instance.cjs");
+
+const BIN = installTools("bin");
+const DATA_DIR = installTools("data/trip-reservoir");
+const VERIFY_BIN = path.join(BIN, "trip-place-verify");
+const SEND_CURL_BIN = path.join(BIN, "jori-send-curl");
+const CLAUDE_BIN = process.env.CLAUDE_BIN || path.join(require("node:os").homedir(), ".local/bin/claude");
+
+// Who travels and how, from trip-planning.json: `travellers` (the research
+// prompt's subject), `research_style` (lines for HOW THEY TRAVEL — what to
+// weight the reservoir by) and `areas` (below). No config: a generic traveller
+// and a balanced style.
+const TRIP = localConfig("trip-planning", {
+  travellers: "a traveler who likes to slow-travel",
+  research_style: [
+    "- A balanced mix: the area's signature sights, its everyday local life, and where locals actually eat — popular, welcoming, honest tables over touristy or fine-dining ones.",
+  ],
+  areas: {},
+});
+const LOCAL_RULES_SH = path.join(__dirname, "../agent/scripts/lib/local-rules.sh");
+
+// Seed cache of curated bases (nice labels + hand-picked centers), from
+// trip-planning.json `areas`: { "<key>": { label, lat, lon, localOnly? } }.
+// NOT the set of buildable areas — any location geocodes automatically via
+// --label (see main). These just save a geocode + give a richer label for
+// frequent bases; `localOnly` marks a place the travellers know well (local
+// favourites only, no tourist highlights).
+const AREAS = TRIP.areas || {};
+
+function log(msg) { process.stderr.write(`[trip-reservoir-build] ${msg}\n`); }
+
+function parseArgs(argv) {
+  const a = { dryRun: false };
+  for (let i = 0; i < argv.length; i++) {
+    const t = argv[i];
+    if (t === "--dry-run") a.dryRun = true;
+    else if (t === "--local-only") a.localOnly = true;
+    else if (t === "--area") a.area = argv[++i];
+    else if (t === "--label") a.label = argv[++i];
+    else if (t === "--lat") a.lat = Number(argv[++i]);
+    else if (t === "--lon") a.lon = Number(argv[++i]);
+    else if (t === "--from") a.from = argv[++i];
+    else if (t === "--to") a.to = argv[++i];
+    else if (t === "--top-up") a.topUp = true;
+  }
+  return a;
+}
+
+function slug(s) {
+  return String(s).toLowerCase().normalize("NFD").replace(/[̀-ͯ]/g, "")
+    .replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "").slice(0, 48) || "x";
+}
+
+// --- Resumability (checkpoint/resume so a mid-stream kill doesn't restart from
+// scratch — added 2026-07-09, after 5 concurrent builds died to a Max limit).
+function emptyBuckets() { return { must_see: [], optional: [], food_specialties: [], unique_experiences: [], time_sensitive: [] }; }
+function countVerified(b) { return Object.values(b).reduce((n, arr) => n + arr.filter((e) => e && e.verified).length, 0); }
+function writeCkpt(p, obj) { try { fs.writeFileSync(p, JSON.stringify(obj)); } catch { /* checkpoint is best-effort */ } }
+
+function extractJson(text) {
+  const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/);
+  const candidate = fenced ? fenced[1] : text;
+  const start = candidate.indexOf("{");
+  const end = candidate.lastIndexOf("}");
+  if (start === -1 || end === -1 || end <= start) return null;
+  try { return JSON.parse(candidate.slice(start, end + 1)); } catch { return null; }
+}
+
+// One research fork can't reliably return 200+ entries (a 60-day stay targets
+// ~196), so research runs in rounds of at most this many, each told what the
+// guide already holds. A round that adds almost nothing means the area is
+// tapped out — stop there rather than pad.
+const ROUND_MAX = 60;
+const ROUND_MIN_GAIN = 5;
+const entryKey = (e) => (e.name || e.dish || e.best_place || "").toLowerCase().trim();
+const BUCKET_NAMES = ["must_see", "optional", "food_specialties", "unique_experiences", "time_sensitive"];
+
+// round = { want, have:[names] } for a follow-up / top-up pass; omitted for a
+// single-pass build.
+function buildPrompt(area, round) {
+  const window = area.from && area.to
+    ? `\nSTAY WINDOW: ${area.from} to ${area.to}. For the "time_sensitive" bucket, HUNT HARD for anything happening in and around this base DURING these exact dates — and only include what you can confirm falls within (or recurs within) the window; give the exact day(s)/date.`
+    : `\n(No fixed stay window given — for "time_sensitive", capture recurring items with their weekday/hours; only include a dated one-off if you can confirm the date from a real source.)`;
+
+  // Size scales with the stay, per-day density falling as it lengthens
+  // (lib/reservoir-target.js). No window → no number, as before.
+  const target = reservoirTarget(area.from, area.to);
+  const splitFor = (n) => {
+    const f = n / target.total;
+    return BUCKET_NAMES.map((b) => `${b} ~${Math.max(b === "must_see" || b === "time_sensitive" ? 0 : 1, Math.round(target.split[b] * f))}`).join(", ");
+  };
+  let sizeDirective = "";
+  if (target && !round) {
+    sizeDirective = `\n\nSIZE — scale to the stay. This is a ${target.days}-day stay: aim for roughly ${target.low}–${target.high} entries IN TOTAL across all five buckets (about ${target.total}). Rough split: ${splitFor(target.total)} (time_sensitive = only what is genuinely on). A short stay wants a tight, dense shortlist of the very best; a long stay wants depth — more of the deeper cut and more day-trip range — not a padded list. This is a TARGET, not a quota: if the area genuinely offers less, return less; never invent or pad with weak picks to hit the number.`;
+  } else if (round) {
+    const whole = target ? `This is a ${target.days}-day stay and the whole guide targets about ${target.total} entries. ` : "";
+    const pass = round.have.length
+      ? `THIS IS A FOLLOW-UP PASS on an existing guide. ${whole}It already holds ${round.have.length} entries (listed below). Return about ${round.want} NEW entries that are NOT already in it`
+      : `THIS IS THE FIRST OF SEVERAL PASSES. ${whole}For this pass, return about ${round.want} entries — the strongest first; later passes will go deeper`;
+    sizeDirective = `\n\nSIZE — ${pass} — rough split: ${target ? splitFor(round.want) : "your judgment"}. Go deeper and wider: more neighborhoods, more of the day-trip range, more everyday local tables, more of the regional canon. Never repeat or re-word an existing entry (a different branch/stall of the same venue is a repeat). This is a TARGET, not a quota: if the area genuinely offers less, return less; never pad with weak picks.${round.have.length ? `\n\nALREADY IN THE GUIDE — do NOT return any of these again:\n${round.have.map((n) => `- ${n}`).join("\n")}` : ""}`;
+  }
+
+  const localOnlyDirective = area.localOnly
+    ? `\n\nIMPORTANT — THEY KNOW THIS PLACE WELL (been many times). SKIP the famous tourist highlights and monuments ENTIRELY — no guidebook-cover sights, they've done them. Surface ONLY LOCAL FAVORITES: where a local friend would take them — the neighborhood market a resident actually shops, the café/bistro/wine bar locals sit at, the specific boulangerie/fromagerie/cave, hidden-gem quarters, the workaday corners. "must_see" here means LOCAL musts (the non-touristy things locals rate), NOT the monuments. If something is primarily a tourist attraction, leave it out.`
+    : "";
+  const placesTier = area.localOnly
+    ? `- Places: LOCAL life only — market streets, old quarters locals live in, neighborhood squares, wine bars, the good boulangerie/fromagerie. NO monuments, NO tourist-crammed sights, NO big museums unless it's a genuinely local, off-the-path one.`
+    : `- Places, tiered: coastal towns, working markets, old city centers / old quarters, ports, scenic coastline = default yes. Tourist-crammed spots ONLY if genuinely iconic/must-see. Museums & churches ONLY if truly must-see (never stack them).`;
+
+  return `You are building a reusable RESERVOIR of everything worth doing in and around one base for ${TRIP.travellers}. This is not a daily plan — it is the standing candidate list a daily planner will later select from. Research the whole area ONCE, properly. Ground EVERY factual claim (names, hours, open days, event dates) in live web search — never invent or recall from training. If you cannot verify something, omit it.
+
+BASE: ${area.label}
+Coordinates: ${area.lat},${area.lon} — cover this base plus everything in comfortable day-trip range.${window}${sizeDirective}${localOnlyDirective}
+
+HOW THEY TRAVEL (weight the reservoir by this):
+${[].concat(TRIP.research_style || []).join("\n")}
+${placesTier}
+
+SEARCH DINING IN THE LOCAL LANGUAGE. The family, blue-collar, locals-recommend-to-locals restaurants (and cafés) do NOT surface on English tourist pages — they live on the local-language web. For every restaurant/café you propose, run the search in the region's OWN language — the language actually spoken at BASE (French in France, Italian in Italy, Spanish in Spain, Portuguese in Portugal, German in Austria/Germany, Greek in Greece, Hebrew in Israel, Japanese in Japan, and so on; if a place is bilingual/regional, use the everyday local tongue). Translate these patterns into that language: "where do locals eat in <town>", "best family/home-cooking restaurant <town>", "cheap friendly bistro / tavern / diner / trattoria <town>", "popular local restaurant <town> reviews" — plus that country's own review sites, local forums and neighborhood blogs. Read those local-language sources, then return the venue's real name and a "search_query" that resolves on Google Maps. RESTAURANTS ARE THE PRIORITY; a genuine local coffee shop for the morning is a welcome bonus but NOT required — do not pad with weak café picks.
+
+Return FIVE buckets. Every place/venue MUST include a "search_query" precise enough to resolve on Google Maps. Every entry needs a one-line "why" that GENERALIZES (not "nice oysters" but "eat them right where the boats land").
+
+1. "must_see" — the signature things this area is genuinely known for, done well (each with "name", "why", "food_hook" = what local food to eat there / where locals eat it, "search_query", "duration_minutes", "dog_ok" = true/false whether dogs are welcome).
+2. "optional" — the deeper cut: coastal towns, old quarters, ports, viewpoints, the spot a resident would send you to (same fields as must_see; this is the bulk).
+3. "food_specialties" — TWO kinds of entry live here, both wanted, and every entry MUST declare which it is in "kind". The distinction is load-bearing downstream (the guide photographs a dish with a picture of THAT FOOD, and a table with a picture of the restaurant), so never blur it:
+
+   (a) "kind":"dish" — a must-try local dish or product, mapped to the best, most authentic place to eat it (the crêperie/port/farm/market-stall locals swear by). "dish" MUST be the CANONICAL NAME OF ONE SPECIFIC FOOD, exactly as a local names it on a menu or as an encyclopedia titles it: "Kouign-amann", "Beurre blanc", "Mouclade charentaise", "Navarin d'agneau", "Huîtres de Marennes-Oléron". It is a NOUN. It is never a description, never a comma-list, never a sentence, never a style of cooking, never a sales pitch. Set "known_for": null. If you cannot name one specific food, this is not a dish entry — make it a table.
+
+   (b) "kind":"table" — an everyday LOCAL FAMILY RESTAURANT worth eating at for its own sake, not for one signature dish: the pleasant, welcoming, blue-collar, popular table where residents actually eat. Set "dish": null and put what they're loved for in "known_for" ("cuisine familiale, plat du jour"; "poisson du jour, frites maison"). NEVER put a cooking style in "dish".
+
+   ONE ENTRY PER DISH — dedupe before you answer. Do not emit variations of the same food under different wordings: "huîtres de la baie", "huîtres fines et spéciales", "oysters from the bay" and "plateau de fruits de mer" are ONE dish, not four. Pick its single best place. A region has a handful of genuinely distinct specialties, not a dozen rewordings of seafood.
+
+   For BOTH kinds, prefer family-run, unpretentious, full-of-regulars, strongly-rated-BY-LOCALS venues found via LOCAL-LANGUAGE search; NEVER a Michelin / white-tablecloth / gastronomique place. Fields: "kind", "dish", "known_for", "best_place" (a real named venue), "why" (generalizes — e.g. "where the town actually eats lunch"), "search_query" (for best_place), "iconic_detour" = true only if that venue is worth going to on its own. This is a coverage checklist so they don't leave without eating the local canon — and the everyday local table — at the right spot.
+4. "unique_experiences" — memorable DOINGS, not places or meals (a sunset from a specific spot, a particular sailing/boat trip, a tidal crossing, a hidden-cove swim). Fields: "name", "why", "window" (golden-hour / tide / seasonal / weather / null), "search_query" (if it has a fixed location, else null), "duration_minutes".
+5. "time_sensitive" — anything pinned to a window you can't move. **Festivals and events are a FIRST-CLASS target here, not an afterthought — search for them explicitly.** A memorable dated happening near where they're staying is exactly what they don't want to miss (a real example that was almost missed: a medieval festival in a nearby town). Work it in this order:
+   a. **HOLIDAY CALENDAR FIRST.** Check what national/religious/seasonal HOLIDAYS fall in the stay window for this country — these are fixed and findable even far ahead (e.g. Sukkot / Passover / Ramadan / Ferragosto / Bastille Day / Día de los Muertos / Golden Week / harvest & saint's-day feasts). A holiday reshapes the whole visit: it brings street festivals, processions, special markets and night events, AND closures (shops/sites shut, transit changes). Name each holiday in the window with its dates and what actually happens locally — this is the single highest-value thing here.
+   b. **DATED FESTIVALS & EVENTS during the window:** festivals of every kind (music, food/wine, medieval/historical, film, folk), fêtes and village feasts, fairs and brocantes/flea markets, religious or seasonal processions, night markets, concerts and open-air performances, sporting events — in nearby towns too, not just the base. Search the local-language "what's on" calendars for those exact dates ("events / festival / agenda <region> <month year>" in the local language).
+   c. **Recurring items:** the steady ones — a morning-only farmers market, a weekly market with its day, a seasonal catch.
+   Fields: "name", "why" (name the confirming source), "days" (array of weekdays, or null), "hours", "date" (exact YYYY-MM-DD for a one-off, else null), "source_url", "search_query". Dated one-offs are the top hallucination risk — no verified source for the specific date → do NOT include it; but DO make the effort to find the real ones (a fixed holiday's dates are always verifiable). Recurring markets with their weekday(s) are the common, valuable case.
+
+Return ONLY strict JSON, no prose, matching exactly:
+{"must_see":[{"name":"","why":"","food_hook":"","search_query":"","duration_minutes":90,"dog_ok":true}],"optional":[{"name":"","why":"","food_hook":"","search_query":"","duration_minutes":60,"dog_ok":true}],"food_specialties":[{"kind":"dish","dish":"","known_for":null,"best_place":"","why":"","search_query":"","iconic_detour":false}],"unique_experiences":[{"name":"","why":"","window":null,"search_query":null,"duration_minutes":60}],"time_sensitive":[{"name":"","why":"","days":["Tue","Fri"],"hours":"","date":null,"source_url":"","search_query":""}]}`;
+}
+
+// A 30-day stay asks for ~4x the entries a weekend does, and every one is
+// web-searched — give the fork ~12s per targeted entry, never under 10 minutes.
+function researchTimeoutMs(want) {
+  return Math.max(600000, (want || 0) * 12000);
+}
+
+function countResearch(r) { return BUCKET_NAMES.reduce((n, b) => n + (r[b] || []).length, 0); }
+
+// Fold a round's research into the running total, dropping anything whose name
+// is already held (by an earlier round or the existing guide in --top-up).
+function mergeResearch(into, add, seen) {
+  let gained = 0;
+  for (const b of BUCKET_NAMES) for (const e of add[b] || []) {
+    const k = entryKey(e);
+    if (!k || seen.has(k)) continue;
+    seen.add(k); (into[b] = into[b] || []).push(e); gained++;
+  }
+  return gained;
+}
+
+// Research in rounds until the stay's target is met, the area runs dry, or the
+// round budget is spent. `have` = names already in the guide (top-up), which
+// count toward the target. Checkpoints after every round.
+function researchRounds(area, { have, saveCkpt }, research = emptyBuckets()) {
+  const target = reservoirTarget(area.from, area.to);
+  const seen = new Set(have.map((n) => n.toLowerCase().trim()));
+  for (const b of BUCKET_NAMES) for (const e of research[b] || []) seen.add(entryKey(e));
+  // Research toward the TOP of the range: Places verification and dedup drop
+  // ~15-20% of what research returns (one top-up 2026-10-02: 69 found →
+  // 57 kept), so aiming research at the center lands the guide under the band.
+  const goal = target ? target.high : 0;
+  const maxRounds = target ? Math.ceil(target.high / ROUND_MAX) + 1 : 1;
+  for (let round = 1; round <= maxRounds; round++) {
+    const held = have.length + countResearch(research);
+    const gap = goal - held;
+    // No window → one classic pass. With a window, stop once the target is met.
+    if (target && gap < ROUND_MIN_GAIN) break;
+    if (!target && round > 1) break;
+    const first = held === 0;
+    const want = target ? Math.min(gap, ROUND_MAX) : null;
+    const names = [...have, ...BUCKET_NAMES.flatMap((b) => (research[b] || []).map((e) => e.name || e.dish || e.best_place).filter(Boolean))];
+    const prompt = first && (!target || target.total <= ROUND_MAX)
+      ? buildPrompt(area)
+      : buildPrompt(area, { want: want || ROUND_MAX, have: names });
+    log(`research round ${round}/${maxRounds}: holding ${held}, asking for ~${want ?? "the classic pass"} ...`);
+    let out;
+    try { out = runResearch(prompt, researchTimeoutMs(want)); }
+    catch (e) { if (round === 1 || countResearch(research) === 0) throw e; log(`round ${round} failed (${e.message.slice(0, 200)}) — keeping what earlier rounds found`); break; }
+    const gained = mergeResearch(research, out, seen);
+    log(`round ${round}: +${gained} new`);
+    saveCkpt(research, false);
+    if (gained < ROUND_MIN_GAIN) { log("area looks tapped out — stopping rounds"); break; }
+  }
+  saveCkpt(research, true);
+  return research;
+}
+
+// Building a reservoir is web-search + structured summary — a Sonnet job, NOT
+// Opus xhigh (it is basically a web search and summary).
+// Using Sonnet keeps this light on the Max pool — 5 concurrent Opus-xhigh forks
+// exhausted the limit and killed every build but the first. Same cheap-subagent
+// pattern the Effort Policy prescribes (hum harvesters: sonnet --effort low).
+function runResearch(prompt, timeoutMs = 600000) {
+  let lastErr = null;
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    let out;
+    try {
+      // Prompt goes in as $1, never spliced into the command string — a
+      // follow-up round lists existing venue names, and a ` or $ in one
+      // would otherwise be shell-evaluated.
+      // The fork inherits this process's cwd (the ops-agent dir under launchd,
+      // or the calling agent's), so it loads that dir's CLAUDE.md files; it
+      // also gets the instance's local rules beside them
+      // (agent/scripts/lib/local-rules.sh), as the agents do.
+      out = execFileSync("/bin/bash", ["-c",
+        `source "$2"; lr="$(mktemp)"; jori_local_rules_file "$(jori_local_rules_role "$PWD")" "$lr" || lr=""
+${CLAUDE_BIN} -p --model claude-sonnet-5-5 --effort medium --allowedTools WebSearch --output-format text \${lr:+--append-system-prompt-file "$lr"} "$1"
+rc=$?; [ -n "$lr" ] && rm -f "$lr"; exit $rc`, "_", prompt, LOCAL_RULES_SH],
+        { encoding: "utf8", maxBuffer: 20 * 1024 * 1024, timeout: timeoutMs });
+    } catch (e) { lastErr = e; continue; }
+    const parsed = extractJson(out);
+    if (parsed) return parsed;
+    lastErr = new Error(`could not parse JSON (attempt ${attempt}): ${out.slice(0, 400)}`);
+  }
+  throw lastErr || new Error("reservoir research failed");
+}
+
+// Geocode an arbitrary area label to a center lat/lon, so the build works for
+// ANY location visited — not just the seeded AREAS. Reuses the Places text
+// search in trip-place-verify; its locationBias is soft, so a
+// "City, Country" query resolves correctly even with a neutral 0,0 center
+// (verified for four cities on three continents). Returns {lat,lon} or null.
+function geocodeArea(label) {
+  if (!label) return null;
+  const res = spawnSync(VERIFY_BIN, [label, "0", "0"], {
+    encoding: "utf8", maxBuffer: 4 * 1024 * 1024, timeout: 30000 });
+  if (res.status !== 0 || !res.stdout) return null;
+  try {
+    const p = JSON.parse(res.stdout);
+    if (Number.isFinite(p.lat) && Number.isFinite(p.lon)) return { lat: p.lat, lon: p.lon };
+  } catch { /* fall through */ }
+  return null;
+}
+
+// Resolve a named place near the area; returns {mapsUri,address,rating,lat,lon} or null.
+function verifyPlace(query, area) {
+  if (!query) return null;
+  const res = spawnSync(VERIFY_BIN, [query, String(area.lat), String(area.lon)], {
+    encoding: "utf8", maxBuffer: 4 * 1024 * 1024, timeout: 30000 });
+  if (res.status !== 0 || !res.stdout) return null;
+  try { return JSON.parse(res.stdout); } catch { return null; }
+}
+
+// Merge prior done/skipped/felt annotations onto a freshly-built entry by name.
+// A rebuild re-researches an area from scratch, so anything not carried here is
+// lost — including the `done` marks trip-reservoir-mark-done writes nightly.
+// Carry their provenance (done_at/done_date/done_source/done_evidence) with the
+// state, or a rebuild would strike-through places with no record of why.
+function carryAnnotations(entry, priorByName, bucket) {
+  const key = (entry.name || entry.dish || entry.best_place || "").toLowerCase();
+  const prior = priorByName.get(key);
+  if (prior) {
+    entry.state = prior.state || "open";
+    if (prior.skip_reason) entry.skip_reason = prior.skip_reason;
+    if (prior.felt) entry.felt = prior.felt;
+    for (const f of ["done_at", "done_date", "done_source", "done_evidence", "photo_url", "photo_kind",
+      "photo_attempts", "photo_failed_at", "photo_source"]) {
+      if (prior[f]) entry[f] = prior[f];
+    }
+    // ...but a photo is only worth carrying if it still depicts this entry.
+    // Carrying blindly is why rebuilding could never fix a bad picture: the
+    // whole point of the 2026-07-21 schema split is that some entries were
+    // photographed as dishes when they are restaurants, and those photos are
+    // exactly the ones a rebuild must DROP rather than preserve. Kind changed
+    // (or the dish was renamed) → re-fetch from scratch.
+    const isFood = bucket === "food_specialties";
+    const want = wantedKind(entry, isFood);
+    const dishChanged = (prior.dish || "") !== (entry.dish || "");
+    if (isFood && entry.photo_url && (entry.photo_kind !== want || dishChanged)) {
+      delete entry.photo_url; delete entry.photo_kind; delete entry.photo_source;
+      delete entry.photo_attempts; delete entry.photo_failed_at;
+    }
+  } else {
+    entry.state = "open";
+  }
+  return entry;
+}
+
+// The reservoir wiki + site renderers live in lib/reservoir-render.js and
+// are driven by saveReservoir() below, so both views render from one source.
+
+async function main() {
+  const args = parseArgs(process.argv.slice(2));
+  let area;
+  if (args.area && AREAS[args.area]) {
+    // A seeded base with a known center + curated label.
+    area = { key: args.area, ...AREAS[args.area] };
+  } else if (args.label && Number.isFinite(args.lat) && Number.isFinite(args.lon)) {
+    // Fully specified by hand.
+    area = { key: slug(args.area || args.label), label: args.label, lat: args.lat, lon: args.lon };
+  } else if (args.label || args.area) {
+    // ANY location: geocode the label (or the area slug) to a center. This is
+    // the automatic path — the autoscan passes the travel-timeline
+    // place label for a location we've never built before.
+    const label = args.label || args.area;
+    const geo = geocodeArea(label);
+    if (!geo) {
+      log(`could not geocode "${label}" — pass --lat/--lon explicitly, or check the label`);
+      process.exit(2);
+    }
+    area = { key: slug(args.area || args.label), label, lat: geo.lat, lon: geo.lon };
+    log(`geocoded "${label}" -> ${geo.lat},${geo.lon}`);
+  } else {
+    log(`usage: trip-reservoir-build --area <key> [--label "City, Country"] [--from --to --dry-run]  |  --label "City, Country" [--lat --lon]`);
+    process.exit(2);
+  }
+  area.from = args.from; area.to = args.to;
+  area.localOnly = area.localOnly || args.localOnly || false;
+
+  // Prior reservoir → carry forward annotations on rebuild.
+  const statePath = path.join(DATA_DIR, `${area.key}.json`);
+  const priorByName = new Map();
+  let prior = null;
+  if (fs.existsSync(statePath)) {
+    try {
+      prior = JSON.parse(fs.readFileSync(statePath, "utf8"));
+      for (const arr of Object.values(prior.buckets || {})) for (const e of arr) {
+        const k = (e.name || e.dish || e.best_place || "").toLowerCase();
+        if (k) priorByName.set(k, e);
+      }
+    } catch { prior = null; /* ignore corrupt prior */ }
+  }
+  // --top-up: keep every entry of the existing guide as-is and research only
+  // the gap to the stay's target — for a guide that's already in use mid-trip,
+  // where a from-scratch rebuild would drop whatever it didn't re-find.
+  if (args.topUp && !prior) { log(`--top-up: no existing guide for ${area.key} — run a normal build`); process.exit(2); }
+  const keep = args.topUp ? prior.buckets : null;
+  const have = keep ? BUCKET_NAMES.flatMap((b) => (keep[b] || []).filter((e) => e.state !== "duplicate").map((e) => e.name || e.dish || e.best_place).filter(Boolean)) : [];
+  if (args.topUp) {
+    if (!area.from && prior.date_range) { area.from = prior.date_range.start; area.to = prior.date_range.end; }
+    const t = reservoirTarget(area.from, area.to);
+    log(`top-up: guide holds ${have.length}; ${t ? `stay target ~${t.total} (${t.low}–${t.high})` : "no stay window"}`);
+    if (!t || t.total - have.length < ROUND_MIN_GAIN) { log("already at target — nothing to add"); process.exit(2); }
+  }
+
+  const CKPT = path.join(DATA_DIR, `.${area.key}.ckpt.json`);
+  if (!args.dryRun) fs.mkdirSync(DATA_DIR, { recursive: true });
+
+  // Resume from a checkpoint if a prior run died mid-stream: reuse its research
+  // (never re-fork the model) and its already-verified entries.
+  let ckpt = null;
+  if (!args.dryRun && fs.existsSync(CKPT)) {
+    try { ckpt = JSON.parse(fs.readFileSync(CKPT, "utf8")); } catch { ckpt = null; }
+  }
+
+  let research = ckpt?.research || null;
+  const saveCkpt = (r, complete) => { if (!args.dryRun) writeCkpt(CKPT, { area: area.key, research: r, research_complete: complete, verified: emptyBuckets(), done: [] }); };
+  if (research && ckpt.research_complete !== false) {
+    log(`resuming ${area.key} from checkpoint — reusing cached research (no model fork).`);
+  } else {
+    log(`researching reservoir for ${area.label} (Sonnet + WebSearch) ...`);
+    try { research = researchRounds(area, { have, saveCkpt }, research || emptyBuckets()); }
+    catch (e) {
+      const reason = `reservoir research failed for ${area.key}: ${e.message}`;
+      log(reason);
+      if (!args.dryRun) try { execFileSync(SEND_CURL_BIN, ["--skip-precheck", "--channel", "system", `⚠️ trip-reservoir-build: ${reason}`], { stdio: "ignore" }); } catch {}
+      process.exit(1);
+    }
+    // researchRounds checkpointed after every round — a later crash (in
+    // verification) must never re-run the fork.
+  }
+
+  // Verify + resolve each bucket's places, checkpointing as we go. Drop what
+  // won't resolve (except a unique_experience with no fixed location).
+  const BUCKETS = [
+    ["must_see", "ms", (e) => e.name, true],
+    ["optional", "op", (e) => e.name, true],
+    ["food_specialties", "fs", (e) => e.dish, true],
+    ["unique_experiences", "ux", (e) => e.name, false],
+    ["time_sensitive", "ts", (e) => e.name, true],
+  ];
+  const buckets = (ckpt?.research_complete !== false && ckpt?.verified) || emptyBuckets();
+  // Top-up: the existing guide's entries go in first, untouched (they keep their
+  // ids, verification, done marks and photos); research only appends.
+  const keptIds = new Set();
+  if (keep && countVerified(buckets) === 0) {
+    for (const b of BUCKET_NAMES) for (const e of keep[b] || []) { buckets[b].push(e); keptIds.add(e.id); }
+  } else if (keep) for (const b of BUCKET_NAMES) for (const e of buckets[b]) keptIds.add(e.id);
+  const done = new Set(ckpt?.done || []);
+  let verifiedCount = countVerified(buckets);
+  let processed = 0;
+
+  for (const [bname, prefix, keyOf, required] of BUCKETS) {
+    for (const e of research[bname] || []) {
+      const id = `${prefix}_${slug(keyOf(e) || "x")}`;
+      if (done.has(id)) continue; // already handled in a prior (killed) run
+      if (keptIds.has(id)) { done.add(id); continue; } // top-up: already in the guide
+      const entry = { id, ...e };
+      const p = verifyPlace(e.search_query, area);
+      if (p) {
+        entry.verified = true; entry.mapsUri = p.mapsUri; entry.address = p.address;
+        entry.rating = p.rating; entry.lat = p.lat; entry.lon = p.lon;
+        verifiedCount++; buckets[bname].push(carryAnnotations(entry, priorByName, bname));
+      } else {
+        entry.verified = false;
+        if (!required) buckets[bname].push(carryAnnotations(entry, priorByName, bname));
+      }
+      done.add(id);
+      if (!args.dryRun && (++processed % 5 === 0)) writeCkpt(CKPT, { area: area.key, research, verified: buckets, done: [...done] });
+    }
+  }
+
+  if (verifiedCount === 0) {
+    log(`no places verified for ${area.key} — not writing an empty reservoir`);
+    if (!args.dryRun) try { fs.unlinkSync(CKPT); } catch {}
+    process.exit(2);
+  }
+
+  const reservoir = {
+    area: area.key, label: area.label, lat: area.lat, lon: area.lon,
+    // {start,end} — the shape the site (lib/reservoirs.ts) and the nightly
+    // date sync (reservoir-dates.js) use. Saving {from,to} here left a freshly
+    // built area with no date on its tab until the nightly sync overwrote it.
+    date_range: area.from && area.to ? { start: area.from, end: area.to } : null,
+    built_at: new Date().toISOString(),
+    buckets,
+  };
+
+  // Pass 2 (dedup) + pass 3 (cluster + numbering) run BEFORE the dry-run print,
+  // so --dry-run shows exactly what a real build would persist.
+  refinePasses(reservoir, { resolve: args.dryRun ? null : resolveFuzzy, log });
+
+  if (args.dryRun) {
+    log(`DRY RUN — ${verifiedCount} verified entries across 5 buckets. Reservoir:`);
+    process.stdout.write(JSON.stringify(reservoir, null, 2) + "\n");
+    return;
+  }
+
+  // Single source of truth: write the reservoir to Supabase (trip_reservoirs),
+  // which also regenerates every view from it — the local JSON cache (fast sync
+  // reads for the itinerary builder), the travel site HTML, and the
+  // wiki page (a mirror of the same Supabase data). One call, no divergence.
+  await saveReservoir(area.key, reservoir, {
+    wikiSave: (id, body) => ws.savePage(id, body, { editedBy: "trip-reservoir-build" }),
+  });
+  log(`saved reservoir ${area.key} (${verifiedCount} entries) → Supabase (source of truth) + wiki mirror + local cache`);
+
+  // Complete — drop the checkpoint so the next run starts fresh (a rebuild).
+  try { fs.unlinkSync(CKPT); } catch { /* no checkpoint to remove */ }
+}
+
+main().catch((e) => {
+  process.stderr.write(`[trip-reservoir-build] fatal: ${e.stack || e.message}\n`);
+  process.exit(1);
+});

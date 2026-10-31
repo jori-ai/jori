@@ -1,0 +1,420 @@
+#!/usr/bin/env node
+// office — Create and read MS Word (.docx) and Excel (.xlsx) files.
+// Usage:
+//   office create-doc --path ~/Documents/report.docx --data '<json>'
+//   office edit-doc --path ~/Documents/report.docx --data '<json>'
+//   office read-doc --path ~/Documents/report.docx
+//   office create-sheet --path ~/Documents/data.xlsx --data '<json>'
+//   office edit-sheet --path ~/Documents/data.xlsx --data '<json>'
+//   office read-sheet --path ~/Documents/data.xlsx [--sheet "Sheet1"]
+
+import { createRequire } from "node:module";
+import { writeFileSync, readFileSync, existsSync } from "node:fs";
+import { resolve } from "node:path";
+
+const require = createRequire(import.meta.url);
+const args = process.argv.slice(2);
+const cmd = args[0];
+
+function flag(name) {
+  const i = args.indexOf(`--${name}`);
+  if (i === -1 || i + 1 >= args.length) return undefined;
+  return args[i + 1];
+}
+
+function resolvePath(p) {
+  if (!p) return null;
+  return resolve(p.replace(/^~/, process.env.HOME));
+}
+
+// ── Word Document Creation ──
+
+async function createDoc(filePath, data) {
+  const docx = require("docx");
+  const { Document, Paragraph, TextRun, HeadingLevel, Table, TableRow, TableCell,
+          WidthType, AlignmentType, BorderStyle, Packer, ExternalHyperlink } = docx;
+
+  const children = [];
+
+  // Title
+  if (data.title) {
+    children.push(new Paragraph({
+      text: data.title,
+      heading: HeadingLevel.TITLE,
+      spacing: { after: 200 },
+    }));
+  }
+
+  // Process sections
+  for (const section of (data.sections || [])) {
+    // Heading
+    if (section.heading) {
+      const level = section.level === 2 ? HeadingLevel.HEADING_2
+        : section.level === 3 ? HeadingLevel.HEADING_3
+        : HeadingLevel.HEADING_1;
+      children.push(new Paragraph({
+        text: section.heading,
+        heading: level,
+        spacing: { before: 240, after: 120 },
+      }));
+    }
+
+    // Paragraph content
+    if (section.content) {
+      const lines = Array.isArray(section.content) ? section.content : [section.content];
+      for (const line of lines) {
+        if (typeof line === "string") {
+          children.push(new Paragraph({
+            children: [new TextRun({ text: line })],
+            spacing: { after: 120 },
+          }));
+        } else if (line.bold || line.italic || line.text) {
+          children.push(new Paragraph({
+            children: [new TextRun({
+              text: line.text || "",
+              bold: line.bold || false,
+              italics: line.italic || false,
+              size: line.size || undefined,
+            })],
+            spacing: { after: 120 },
+          }));
+        }
+      }
+    }
+
+    // Bullet list
+    if (section.bullets) {
+      for (const item of section.bullets) {
+        children.push(new Paragraph({
+          children: [new TextRun({ text: item })],
+          bullet: { level: 0 },
+          spacing: { after: 60 },
+        }));
+      }
+    }
+
+    // Numbered list
+    if (section.numbered) {
+      for (let i = 0; i < section.numbered.length; i++) {
+        children.push(new Paragraph({
+          children: [new TextRun({ text: `${i + 1}. ${section.numbered[i]}` })],
+          spacing: { after: 60 },
+        }));
+      }
+    }
+
+    // Table
+    if (section.table) {
+      const { headers, rows } = section.table;
+      const tableRows = [];
+
+      if (headers) {
+        tableRows.push(new TableRow({
+          children: headers.map(h => new TableCell({
+            children: [new Paragraph({
+              children: [new TextRun({ text: String(h), bold: true })],
+            })],
+            width: { size: Math.floor(100 / headers.length), type: WidthType.PERCENTAGE },
+          })),
+        }));
+      }
+
+      for (const row of (rows || [])) {
+        tableRows.push(new TableRow({
+          children: row.map(cell => new TableCell({
+            children: [new Paragraph({ text: String(cell ?? "") })],
+          })),
+        }));
+      }
+
+      if (tableRows.length > 0) {
+        children.push(new Table({
+          rows: tableRows,
+          width: { size: 100, type: WidthType.PERCENTAGE },
+        }));
+        children.push(new Paragraph({ text: "", spacing: { after: 120 } }));
+      }
+    }
+  }
+
+  const doc = new Document({
+    sections: [{ children }],
+    creator: data.author || "Jori",
+    title: data.title || "",
+    description: data.description || "",
+  });
+
+  const buffer = await Packer.toBuffer(doc);
+  writeFileSync(filePath, buffer);
+  console.log(`Created: ${filePath} (${buffer.length} bytes)`);
+}
+
+// ── Word Document Append/Edit ──
+
+async function editDoc(filePath, data) {
+  // docx library can't edit in-place; we read text, append new sections, and rewrite
+  // For now, create a new doc with the appended content
+  // Read existing content first
+  const { execSync } = await import("node:child_process");
+  let existingText = "";
+  try {
+    existingText = execSync(`textutil -convert txt -stdout "${filePath}"`, { encoding: "utf8" });
+  } catch {}
+
+  // Build new doc with existing content + new sections
+  const combined = {
+    title: data.title || "",
+    sections: [],
+  };
+
+  // Add existing content as a section
+  if (existingText.trim()) {
+    combined.sections.push({
+      heading: "Existing Content",
+      content: existingText.trim().split("\n"),
+    });
+  }
+
+  // Add new sections
+  if (data.sections) {
+    combined.sections.push(...data.sections);
+  }
+
+  await createDoc(filePath, combined);
+}
+
+// ── Read Word Document ──
+
+function readDoc(filePath) {
+  const { execSync } = require("node:child_process");
+  try {
+    const text = execSync(`textutil -convert txt -stdout "${filePath}"`, { encoding: "utf8" });
+    console.log(text.trim());
+  } catch (err) {
+    console.error(`Error reading ${filePath}: ${err.message}`);
+    process.exit(1);
+  }
+}
+
+// ── Excel Creation ──
+
+async function createSheet(filePath, data) {
+  const ExcelJS = require("exceljs");
+  const workbook = new ExcelJS.Workbook();
+  workbook.creator = data.author || "Jori";
+  workbook.created = new Date();
+
+  for (const sheetData of (data.sheets || [])) {
+    const sheet = workbook.addWorksheet(sheetData.name || "Sheet1");
+
+    // Headers
+    if (sheetData.headers) {
+      const headerRow = sheet.addRow(sheetData.headers);
+      headerRow.font = { bold: true };
+      headerRow.eachCell((cell) => {
+        cell.fill = {
+          type: "pattern",
+          pattern: "solid",
+          fgColor: { argb: "FFE0E0E0" },
+        };
+        cell.border = {
+          bottom: { style: "thin" },
+        };
+      });
+    }
+
+    // Column widths
+    if (sheetData.column_widths) {
+      sheetData.column_widths.forEach((w, i) => {
+        sheet.getColumn(i + 1).width = w;
+      });
+    } else if (sheetData.headers) {
+      // Auto-width based on header length (minimum 12)
+      sheetData.headers.forEach((h, i) => {
+        sheet.getColumn(i + 1).width = Math.max(12, String(h).length + 4);
+      });
+    }
+
+    // Rows
+    for (const row of (sheetData.rows || [])) {
+      sheet.addRow(row);
+    }
+
+    // Auto-filter on headers
+    if (sheetData.headers && sheetData.rows?.length > 0) {
+      sheet.autoFilter = {
+        from: { row: 1, column: 1 },
+        to: { row: 1 + (sheetData.rows?.length || 0), column: sheetData.headers.length },
+      };
+    }
+
+    // Freeze header row
+    if (sheetData.headers) {
+      sheet.views = [{ state: "frozen", ySplit: 1 }];
+    }
+  }
+
+  await workbook.xlsx.writeFile(filePath);
+  const stats = data.sheets?.map(s => `${s.name || "Sheet1"}: ${s.rows?.length || 0} rows`) || [];
+  console.log(`Created: ${filePath} (${stats.join(", ")})`);
+}
+
+// ── Excel Edit (add/modify sheets) ──
+
+async function editSheet(filePath, data) {
+  const ExcelJS = require("exceljs");
+  const workbook = new ExcelJS.Workbook();
+
+  if (existsSync(filePath)) {
+    await workbook.xlsx.readFile(filePath);
+  }
+
+  for (const sheetData of (data.sheets || [])) {
+    let sheet = workbook.getWorksheet(sheetData.name);
+
+    if (sheetData.replace && sheet) {
+      workbook.removeWorksheet(sheet.id);
+      sheet = null;
+    }
+
+    if (!sheet) {
+      sheet = workbook.addWorksheet(sheetData.name || "Sheet1");
+      // Add headers for new sheet
+      if (sheetData.headers) {
+        const headerRow = sheet.addRow(sheetData.headers);
+        headerRow.font = { bold: true };
+        headerRow.eachCell((cell) => {
+          cell.fill = {
+            type: "pattern",
+            pattern: "solid",
+            fgColor: { argb: "FFE0E0E0" },
+          };
+        });
+      }
+    }
+
+    // Append rows
+    for (const row of (sheetData.rows || [])) {
+      sheet.addRow(row);
+    }
+
+    // Column widths
+    if (sheetData.column_widths) {
+      sheetData.column_widths.forEach((w, i) => {
+        sheet.getColumn(i + 1).width = w;
+      });
+    }
+  }
+
+  await workbook.xlsx.writeFile(filePath);
+  console.log(`Updated: ${filePath} (${workbook.worksheets.length} sheet(s))`);
+}
+
+// ── Read Excel ──
+
+async function readSheet(filePath, sheetName) {
+  const ExcelJS = require("exceljs");
+  const workbook = new ExcelJS.Workbook();
+  await workbook.xlsx.readFile(filePath);
+
+  const sheets = sheetName
+    ? [workbook.getWorksheet(sheetName)].filter(Boolean)
+    : workbook.worksheets;
+
+  if (sheets.length === 0) {
+    console.log(sheetName ? `Sheet "${sheetName}" not found.` : "No sheets found.");
+    return;
+  }
+
+  for (const sheet of sheets) {
+    if (workbook.worksheets.length > 1) {
+      console.log(`=== ${sheet.name} ===`);
+    }
+    sheet.eachRow((row, rowNum) => {
+      const values = [];
+      row.eachCell({ includeEmpty: true }, (cell, colNum) => {
+        values.push(cell.text || cell.value || "");
+      });
+      console.log(values.join("\t"));
+    });
+    if (workbook.worksheets.length > 1) console.log();
+  }
+}
+
+// ── Main ──
+
+function usage() {
+  console.log(`office — create and read MS Word & Excel files
+
+Commands:
+  create-doc --path <file.docx> --data '<json>'     Create a Word document
+  edit-doc --path <file.docx> --data '<json>'        Append to a Word document
+  read-doc --path <file.docx>                        Read a Word document as text
+
+  create-sheet --path <file.xlsx> --data '<json>'    Create an Excel spreadsheet
+  edit-sheet --path <file.xlsx> --data '<json>'       Add/modify sheets in an Excel file
+  read-sheet --path <file.xlsx> [--sheet "Name"]      Read an Excel spreadsheet
+
+Doc JSON format:
+  { "title": "...", "sections": [
+    { "heading": "...", "content": ["..."] },
+    { "heading": "...", "bullets": ["..."] },
+    { "heading": "...", "table": { "headers": [...], "rows": [[...]] } }
+  ]}
+
+Sheet JSON format:
+  { "sheets": [
+    { "name": "Sheet1", "headers": [...], "rows": [[...]], "column_widths": [...] }
+  ]}
+`);
+}
+
+(async () => {
+  try {
+    const filePath = resolvePath(flag("path"));
+
+    switch (cmd) {
+      case "create-doc": {
+        if (!filePath) { console.error("--path is required"); process.exit(1); }
+        const data = JSON.parse(flag("data") || "{}");
+        await createDoc(filePath, data);
+        break;
+      }
+      case "edit-doc": {
+        if (!filePath) { console.error("--path is required"); process.exit(1); }
+        if (!existsSync(filePath)) { console.error(`File not found: ${filePath}`); process.exit(1); }
+        const data = JSON.parse(flag("data") || "{}");
+        await editDoc(filePath, data);
+        break;
+      }
+      case "read-doc": {
+        if (!filePath) { console.error("--path is required"); process.exit(1); }
+        readDoc(filePath);
+        break;
+      }
+      case "create-sheet": {
+        if (!filePath) { console.error("--path is required"); process.exit(1); }
+        const data = JSON.parse(flag("data") || "{}");
+        await createSheet(filePath, data);
+        break;
+      }
+      case "edit-sheet": {
+        if (!filePath) { console.error("--path is required"); process.exit(1); }
+        const data = JSON.parse(flag("data") || "{}");
+        await editSheet(filePath, data);
+        break;
+      }
+      case "read-sheet": {
+        if (!filePath) { console.error("--path is required"); process.exit(1); }
+        const sheetName = flag("sheet");
+        await readSheet(filePath, sheetName);
+        break;
+      }
+      default:
+        usage();
+    }
+  } catch (err) {
+    console.error(`Error: ${err.message}`);
+    process.exit(1);
+  }
+})();

@@ -1,0 +1,416 @@
+#!/usr/bin/env python3
+"""segment-ask — ask about a stop as soon as it ends, not at the end of the day.
+
+The requirement: check after each segment and ask the user as soon as
+possible — not at the end of the day.
+
+Every correction during the build session came from forensics hours later:
+two restaurants and a park walk were all reconstructed at night from GPS the
+user could barely recall. Asked at 13:35 instead of 21:00, each would have been
+one tap while the meal was still in front of the user.
+
+THIS FILE IS ONLY THE WIRE. The three parts already existed and none of them
+knew about each other:
+
+  `day-segments --write`  finds the stops and gives each one a row — including
+                          stops CLVisit never recorded at all, which is why the
+                          45.7-minute restaurant stop had nothing to attach a
+                          name to.
+  `stop-identify`         decides whether a question is warranted (>80% certain
+                          → stay quiet), and produces the options and default.
+  `choice send`           puts tappable options in the chat and pushes them.
+
+WHAT IT WILL NOT DO. It never asks twice about the same stop: a prompt already
+carrying this `ref` closes the matter whether or not it was answered, because
+re-asking an ignored question is how the old enrich loop produced 46 asks in a
+week with two thirds unanswered. It never asks about a `user-confirmed` row —
+that is settled. And it honours `stop-identify`'s skip verdict rather than
+second-guessing it, so the >80% rule lives in exactly one place.
+
+Usage:
+  segment-ask [YYYY-MM-DD] [--tz Area/City] [--apply] [--max N]
+"""
+import argparse
+import json
+import os
+import subprocess
+import sys
+import urllib.parse
+import urllib.request
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
+
+# REPO: the installation (its bin/, data/ and .env), lib/root.cjs installRoot().
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "lib"))
+import places_local  # noqa: E402  (kernel: instance identity + local config)
+REPO = places_local.install_root()
+ENV_FILE = os.path.join(REPO, ".env")
+
+
+def _supabase_url():
+    """SUPABASE_URL (environment), else https://<supabase_project>.supabase.co
+    from agent/local/instance.json (JORI_SUPABASE_PROJECT overrides); "" when none."""
+    url = os.environ.get("SUPABASE_URL")
+    if url:
+        return url.rstrip("/")
+    project = os.environ.get("JORI_SUPABASE_PROJECT")
+    if not project:
+        try:
+            with open(os.path.join(places_local.local_dir(), "instance.json")) as fh:
+                project = (json.load(fh) or {}).get("supabase_project")
+        except (OSError, ValueError):
+            project = None
+    return f"https://{project}.supabase.co" if project else ""
+
+
+SUPABASE_URL = _supabase_url()
+# The zone when no --tz is given: the phone's last reported zone, else home.
+HOME_TZ = places_local.instance().get("tz") or "UTC"
+# A stop must have been over for this long before we ask. Not politeness —
+# `day-segments` can still extend a run when the next fix arrives, and asking
+# about a boundary that is about to move produces a question about a stop that
+# never existed in the shape described.
+SETTLE_MIN = 10.0
+# Never more than this in one pass. A backlog is a sign something is wrong, and
+# emptying it into the user's lock screen is the failure mode this whole design exists
+# to avoid.
+MAX_ASKS = 3
+# How late is too late — the same bound as askTiming in
+# lib/location-ask-queue.mjs, so the two ask paths agree: location questions
+# arrive while the user is there or shortly after, not hours after the fact.
+# Measured from when the user LEFT: past HONEST_AFTER_MIN the prompt says it is looking back, with the time;
+# past DROP_AFTER_H (or on an earlier local day) it is not sent at all and the
+# stop waits for the daily summary's Corrections block instead.
+HONEST_AFTER_MIN = 45
+DROP_AFTER_H = 4
+
+
+def late_lead(arr_local):
+    """Code-built opener for a question about a stop he left a while ago."""
+    part = ("this morning" if arr_local.hour < 12 else
+            "this afternoon" if arr_local.hour < 17 else "this evening")
+    return f"Looking back to {part}, around {arr_local:%H:%M} — "
+
+
+def key():
+    k = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
+    if k:
+        return k
+    with open(ENV_FILE) as fh:
+        for line in fh:
+            if line.startswith("SUPABASE_SERVICE_ROLE_KEY="):
+                return line.split("=", 1)[1].strip().strip('"').strip("'")
+    sys.exit("no SUPABASE_SERVICE_ROLE_KEY")
+
+
+def get(path):
+    k = key()
+    r = urllib.request.Request(f"{SUPABASE_URL}/rest/v1/{path}",
+                               headers={"apikey": k, "Authorization": f"Bearer {k}"})
+    with urllib.request.urlopen(r, timeout=45) as resp:
+        return json.loads(resp.read())
+
+
+def already_asked(since_h=72):
+    """Every `ref` we have already put a question about, answered or not."""
+    since = (datetime.now(timezone.utc) - timedelta(hours=since_h)).isoformat()
+    rows = get("jori_messages?role=eq.assistant"
+               f"&created_at=gte.{urllib.parse.quote(since)}"
+               "&metadata=not.is.null&select=metadata&limit=500") or []
+    refs = set()
+    for r in rows:
+        raw = (r.get("metadata") or {}).get("choices")
+        if not raw:
+            continue
+        try:
+            p = json.loads(raw)
+        except ValueError:
+            continue
+        if p.get("ref"):
+            refs.add(str(p["ref"]))
+    return refs
+
+
+def windows_for(refs):
+    """Time windows of the rows we have already asked about.
+
+    Seeded across runs, not just within one: the duplicate row survives to the
+    next cycle otherwise, and its id is different so the `ref` check never
+    fires. Cheap — one query for the handful of refs in play.
+    """
+    out = []
+    for ref in list(refs)[:50]:
+        try:
+            rows = get(f"location_history?id=eq.{urllib.parse.quote(ref)}"
+                       "&select=arrived_at,departed_at&limit=1") or []
+        except Exception:
+            continue
+        for r in rows:
+            if not (r.get("arrived_at") and r.get("departed_at")):
+                continue
+            out.append((datetime.fromisoformat(r["arrived_at"].replace("Z", "+00:00")),
+                        datetime.fromisoformat(r["departed_at"].replace("Z", "+00:00"))))
+    return out
+
+
+def settled_rows(day, tz):
+    """Rows that need no question: he named them, or we know they are not stops."""
+    d0 = datetime.strptime(day, "%Y-%m-%d").replace(tzinfo=tz)
+    d1 = d0 + timedelta(days=1)
+    rows = get("location_history?segment_type=eq.visit"
+               f"&arrived_at=gte.{urllib.parse.quote(d0.astimezone(timezone.utc).isoformat())}"
+               f"&arrived_at=lt.{urllib.parse.quote(d1.astimezone(timezone.utc).isoformat())}"
+               "&select=id,place_type&limit=500") or []
+    return {str(r["id"]) for r in rows
+            if r.get("place_type") in ("user-confirmed", "non-stop", "named")}
+
+
+def ask_gate(vid, arr, end, apply):
+    """bin/ask-gate's verdict: may we ask about this stop yet?
+
+    Two refusals (2026-10-07): `same-stay` — a slice of a stay he never left
+    (the 21:29 "were you at the airbnb?" when he hadn't moved all evening);
+    `no-departure` — no point away from it since it ended, so he may still be
+    there. Reads raw fixes, not rows. Fail-open: any error returns ask=True.
+    """
+    cmd = [os.path.join(REPO, "bin/ask-gate"), "--visit", vid,
+           "--start", arr.isoformat(), "--end", end.isoformat(), "--json"]
+    if apply:
+        cmd.append("--apply")
+    try:
+        out = subprocess.run(cmd, capture_output=True, text=True, timeout=45)
+        return json.loads(out.stdout or "{}") or {"ask": True}
+    except Exception as e:
+        print(f"[segment-ask] ask-gate failed for {vid[:8]}: {e}", file=sys.stderr)
+        return {"ask": True}
+
+
+def run(cmd, **kw):
+    return subprocess.run(cmd, capture_output=True, text=True, timeout=900, **kw)
+
+
+def passage_verdict(vid, arr, end, tz_name, apply):
+    """bin/stop-passage's verdict when the window was a walk, else None.
+
+    With apply the row is marked non-stop by stop-passage itself. Any failure
+    returns None so the question goes out exactly as before.
+    """
+    cmd = [os.path.join(REPO, "bin/stop-passage"), "--visit", vid,
+           "--start", arr.isoformat(), "--end", end.isoformat(),
+           "--tz", tz_name, "--json"]
+    if apply:
+        cmd.append("--apply")
+    try:
+        # 150 s: the phone photo probe waits up to 30 s and the evidence step
+        # may make one model call (stop-passage header).
+        out = subprocess.run(cmd, capture_output=True, text=True, timeout=150)
+        res = json.loads(out.stdout or "{}")
+    except Exception as e:
+        print(f"[segment-ask] stop-passage failed for {vid[:8]}: {e}", file=sys.stderr)
+        return None
+    # `calendar`: the user put this place on the user's calendar and was there — named, not
+    # asked. `evidence`: the user already said or showed where the user was (chat, the user's
+    # photos) — named, not asked. `hold`: waiting on the phone's photos, or a
+    # walk whose photos have not synced yet — not asked THIS run.
+    if res.get("verdict") in ("calendar", "evidence", "hold"):
+        return res
+    if res.get("verdict") != "passage" or (apply and not res.get("applied")):
+        return None
+    return res
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("date", nargs="?")
+    ap.add_argument("--tz", default=None,
+                    help="IANA zone of the day (default: data/user-timezone.json, else the home zone)")
+    ap.add_argument("--apply", action="store_true", help="actually send the prompts")
+    ap.add_argument("--max", type=int, default=MAX_ASKS)
+    a = ap.parse_args()
+    if not a.tz:
+        try:
+            with open(os.path.join(REPO, "data", "user-timezone.json")) as fh:
+                a.tz = json.load(fh).get("timezone") or HOME_TZ
+        except (OSError, ValueError):
+            a.tz = HOME_TZ
+    tz = ZoneInfo(a.tz)
+    day = a.date or datetime.now(tz).strftime("%Y-%m-%d")
+
+    # 1. Give every stop a row. Without this a stop the visit model missed has
+    #    no id, and `ref` is what makes the answer land somewhere.
+    seg = run([os.path.join(REPO, "bin/day-segments"), day,
+               "--tz", a.tz, "--write" if a.apply else "--plan"])
+    if seg.returncode != 0:
+        print(f"[segment-ask] day-segments failed: {seg.stderr[-400:]}", file=sys.stderr)
+        return 1
+
+    # 2. Ask stop-identify what, if anything, is worth a question.
+    ident = run([os.path.join(REPO, "bin/stop-identify"), day,
+                 "--tz", a.tz, "--json"])
+    if ident.returncode != 0:
+        print(f"[segment-ask] stop-identify failed: {ident.stderr[-400:]}", file=sys.stderr)
+        return 1
+    try:
+        results = json.loads(ident.stdout)
+    except ValueError:
+        print("[segment-ask] stop-identify emitted no JSON", file=sys.stderr)
+        return 1
+
+    asked = already_asked()
+    settled = settled_rows(day, tz)
+    # The client still writes duplicate visit rows (24.7% of them in one 14-day
+    # window), so ONE stop can arrive as two rows with different ids — 08:46/36min
+    # and 08:46/35min on 2026-08-11. Dedup by ref alone lets both through and the user
+    # gets the same question twice. Track the windows actually asked about.
+    asked_windows = windows_for(asked)
+    now = datetime.now(timezone.utc)
+    sent = 0
+    for r in results:
+        vid = str(r.get("id") or "")
+        # Known from the user's calendar: not asked, but the name has to reach the row
+        # or the summary prints the street. stop-passage is the one writer.
+        if r.get("verdict") == "skip-known" and r.get("confidence") == "calendar" and vid and vid not in settled:
+            try:
+                arr = datetime.fromisoformat(r["arrived_at"].replace("Z", "+00:00"))
+                end = arr + timedelta(minutes=float(r.get("minutes") or 0))
+                res = passage_verdict(vid, arr, end, a.tz, a.apply)
+                print(f"  skip  {arr.astimezone(tz):%H:%M}  on his calendar — {r.get('name')}"
+                      f"{' [named]' if res and res.get('applied') else ''}")
+            except (KeyError, ValueError):
+                pass
+            continue
+        if r.get("verdict") in ("below-floor", "skip-known") or not r.get("options"):
+            continue
+        if not vid or vid in asked:
+            continue
+        # ALREADY ANSWERED — check the ROW, not the verdict. `stop-identify`
+        # scores how confidently a stop can be NAMED from surrounding evidence;
+        # it does not ask whether the user already told us. Trusting its verdict
+        # alone pushed two questions about stops the user had confirmed hours
+        # before (a café at 09:11, a restaurant at 11:25) — precisely the redundant
+        # nagging the >80% rule exists to prevent.
+        if vid in settled:
+            continue
+        # `stop-identify` reports arrival and duration, not a departure — derive
+        # the end rather than requiring a field it does not emit.
+        try:
+            arr = datetime.fromisoformat(r["arrived_at"].replace("Z", "+00:00"))
+        except (KeyError, ValueError):
+            continue
+        end = arr + timedelta(minutes=float(r.get("minutes") or 0))
+        since_min = (now - end).total_seconds() / 60
+        if since_min < SETTLE_MIN:
+            continue
+        if since_min >= DROP_AFTER_H * 60 or arr.astimezone(tz).date() != now.astimezone(tz).date():
+            print(f"  skip  {arr.astimezone(tz):%H:%M}  too old to interrupt about "
+                  f"({since_min:.0f} min since he left) — left for the daily summary")
+            continue
+        if any(arr < w_end and w_start < end for w_start, w_end in asked_windows):
+            print(f"  skip  {arr.astimezone(tz):%H:%M}  duplicate of a stop already asked about")
+            continue
+        gate = ask_gate(vid, arr, end, a.apply)
+        if gate.get("ask") is False:
+            print(f"  skip  {arr.astimezone(tz):%H:%M}  {gate.get('check')}: {gate.get('reason')}")
+            if gate.get("check") == "same-stay":
+                asked_windows.append((arr, end))
+            continue
+        # Was it a stop at all? (2026-10-06) The 18:05–18:29 "Where was this?"
+        # in Charles Clore Park was a sunset walk — six photos along the
+        # promenade, no pause over two minutes. stop-passage answers from the
+        # trace (and Jev over photos/calendar/messages when the trace can't);
+        # a passage is marked non-stop and not asked. Fail-open: anything else
+        # asks as before.
+        passage = passage_verdict(vid, arr, end, a.tz, a.apply)
+        if passage and passage.get("verdict") == "hold":
+            print(f"  hold  {arr.astimezone(tz):%H:%M}  {passage.get('reason')}")
+            continue
+        if passage and passage.get("verdict") == "calendar":
+            print(f"  skip  {arr.astimezone(tz):%H:%M}  on his calendar — {passage.get('reason')}")
+            asked_windows.append((arr, end))
+            continue
+        if passage and passage.get("verdict") == "evidence":
+            print(f"  skip  {arr.astimezone(tz):%H:%M}  he already said where — {passage.get('reason')}")
+            asked_windows.append((arr, end))
+            continue
+        if passage:
+            print(f"  skip  {arr.astimezone(tz):%H:%M}  part of a walk, not a stop "
+                  f"({passage.get('layer')}: {passage.get('reason')})")
+            asked_windows.append((arr, end))
+            continue
+        if sent >= a.max:
+            print(f"[segment-ask] stopping at {a.max}; more remain (say so, never silently drop)")
+            break
+        opts = []
+        for c in r["options"]:
+            # Forward `value` as `label=value`. stop-identify splits what a
+            # button READS ("Yes — the airbnb") from what it STORES ("the
+            # airbnb"), and `choice send` accepts the split — but this wire
+            # dropped it, so on 2026-10-05 the tap text itself was saved as the
+            # name of the user's flat. The 2026-08-13 fix never reached this path.
+            spec = f"{c['label']}={c['value']}" if c.get("value") else c["label"]
+            opts.append(f"{spec}|{c['sublabel']}" if c.get("sublabel") else spec)
+        default_idx = None
+        if r.get("default_id"):
+            for i, c in enumerate(r["options"], 1):
+                if c["id"] == r["default_id"]:
+                    default_idx = str(i)
+        prompt = r.get("prompt") or "Where was this?"
+        if since_min >= HONEST_AFTER_MIN:
+            # Never as though the user were still there: say it is looking back.
+            prompt = late_lead(arr.astimezone(tz)) + prompt
+        cmd = [os.path.join(REPO, "bin/choice"), "send",
+               "--kind", "location_stop", "--ref", vid,
+               "--prompt", prompt]
+        for o in opts:
+            cmd += ["--option", o]
+        if default_idx:
+            cmd += ["--default", default_idx]
+        # Show the user WHICH stretch we mean: the trace in, the stop, the trace
+        # out. An unclear question got "Just browsing the market" as its answer, and that answer later named a different walk.
+        # Optional — a failed render sends the question without a picture.
+        map_url, trace = None, None
+        if a.apply:
+            m = run([os.path.join(REPO, "bin/stop-map"), "--visit", vid,
+                     "--tz", a.tz, "--upload", "--json"])
+            try:
+                mj = json.loads(m.stdout) if m.returncode == 0 else {}
+            except ValueError:
+                mj = {}
+            if str(mj.get("url") or "").startswith("https://"):
+                map_url, trace = mj["url"], mj.get("trace")
+                cmd += ["--image-url", map_url]
+            else:
+                print(f"[segment-ask] stop-map failed (asking without a map): "
+                      f"{(m.stderr or '')[-200:]}", file=sys.stderr)
+        # The card (client ChoicePrompt § subject). A location question must
+        # make plain whether it is about a place, a
+        # route or an event, and when. The client draws the time relative to
+        # when the user READS it, so the window travels as timestamps, not words.
+        subject = {
+            "kind": "event" if r.get("confidence") == "calendar" else "place",
+            "start": arr.isoformat(), "end": end.isoformat(), "tz": a.tz,
+            "lat": r.get("lat"), "lon": r.get("lon"),
+            "map_url": map_url,
+            "path": trace,
+            "context": (r.get("where") or "").strip() or None,
+            "question": r.get("question") or None,
+        }
+        cmd += ["--subject-json", json.dumps({k: v for k, v in subject.items() if v is not None},
+                                             ensure_ascii=False)]
+        t = datetime.fromisoformat(r["arrived_at"].replace("Z", "+00:00")).astimezone(tz)
+        print(f"{'SEND' if a.apply else 'would send'}  {t:%H:%M}  {r.get('verdict')}  "
+              f"{[c['label'] for c in r['options']]}")
+        asked_windows.append((arr, end))
+        if a.apply:
+            out = run(cmd)
+            if out.returncode != 0:
+                print(f"[segment-ask] choice send failed: {out.stderr[-300:]}", file=sys.stderr)
+                continue
+        sent += 1
+    print(f"\n{sent} ask(s) {'sent' if a.apply else 'pending'}"
+          + ("" if a.apply else "   (dry run; --apply to send)"))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

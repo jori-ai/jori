@@ -1,0 +1,813 @@
+#!/usr/bin/env node
+// daily-summary-fix — state + plumbing for the daily-summary FIX LOOP.
+//
+// the user, 2026-10-17: "catching issues is the primary job [of the reviewer]. if
+// issues are found, a second process should find the root cause, fix it, and
+// regenerate as needed until the reviewer confirms the day summary is correct
+// and accurate. If a fix isn't possible without consulting me, ask for guidance
+// in the chat, and then continue the process." And: "the daily summary email
+// should include a section at the end about any issues found by the reviewer
+// and how they were fixed."
+//
+// The reviewer is bin/daily-summary-review (catches). The fixer is the
+// ephemeral Opus job jobs/daily-summary-fix.md (root-causes, fixes code or data,
+// regenerates, re-reviews, sends once confirmed). This CLI is the only writer of
+// its state, data/daily-summary-fix/<date>.json, and the launcher's queue.
+//
+// Questions come before the email ("Good guesses - but these
+// questions should come before the summary is sent, not after."). Monday Oct 19's
+// three questions went out at 04:42 the user's time and the email at 04:55, because the
+// fixer's playbook said to send whenever it was waiting on the user: nothing else would
+// send it at a deadline. The deadline is code now. The first question of a day
+// opens its answer window (11am the user's time the next morning, or 3 hours when asked
+// later in the day), `gate` holds the email until every question is answered or
+// the window closes, and the hourly sweep starts the fixer when it closes.
+//
+// Questions wait for the user to be up (the user, 2026-10-21, after a question about the
+// day before reached the user at 4:37am: "Why wait until 4:37am to ask this?" and
+// "Create an improvement to ask in time."). The summary is built in the small hours,
+// so its questions were composed then and sent at once: eight more arrived between
+// 4 and 5am the user's time from Oct 22 to Oct 27. A question composed inside the user's quiet
+// hours (agent/local/config/daily-summary-fix.json, read in the user's CURRENT zone,
+// so they follow the user when the user travels) is now held, not sent. From `awake_from` on,
+// the user counts as up when the user's phone says so (the sleep-night state hum's quiet hours
+// read) or, failing a phone reading, when the user has written in chat. The email waits
+// for a held question like any other, and the answer window opens when it actually
+// reaches the user, so the user gets the same time to answer.
+//
+// Who sends a held question: never the hourly sweep. It runs from cron, where
+// `claude -p` cannot reach the Max login, so the outbound check's model step and the
+// truth gate's extractor fail there and a question would go out unchecked (the check
+// had stopped a fixer question on Oct 26 that the user had asked not to get). The sweep
+// only marks the day due and drops a marker in the launchd queue; the launchd runner
+// (trigger-daily-summary-fix.sh, keychain session) confirms the Max sign-in and runs
+// `release-held`, which sends through the full check.
+//
+//   daily-summary-fix request <date> [--reason R] [--answer "<the user's words>"] [--no-kick]
+//       queue a fix run (the daily-summary fork on a non-confirmed review; the
+//       chat agent with the user's answer to a fixer question; the hourly sweep)
+//   daily-summary-fix status <date>                  the state JSON
+//   daily-summary-fix log <date> --finding F --action A --outcome fixed|data-corrected|code-landed|asked|unresolved [--commit SHA]
+//       record one finding and what was done about it (feeds the email section); prints the entry's log index
+//   daily-summary-fix ask <date> --question "<plain question>"
+//       ask the user in chat (once per question), mark the day awaiting the user's answer;
+//       the first question opens the answer window (and says so to the user). Exit 5:
+//       the outbound check held it back, so it was not asked and holds nothing.
+//       Inside the user's quiet hours it is recorded and held (exit 0, `held_until` on the
+//       question); it is asked once the user is up (sweep → release-held), and the email waits for it.
+//       Questions never carry a card charge, an amount or a health reading.
+//   daily-summary-fix gate <date> [--peek]           may the email go now? exit 0 = send, 3 = hold (JSON on stdout);
+//       a hold parks the day awaiting_<owner_id> so the sweep watches it (--peek: read only).
+//       `open` lists the questions the user has been asked and owes an answer to; a question
+//       held for the user's quiet hours is under `held_not_asked` ("held, not yet asked") instead.
+//   daily-summary-fix answered <date> <n> [<n> ...]  mark the questions the user's words settle (the fixer's reading)
+//   daily-summary-fix release <date> [--reason R]    the user asked for the summary now: end the wait, queue a run
+//   daily-summary-fix mark-sent <date> [--corrected]   record that the email went out (first send or a correction)
+//   daily-summary-fix done <date> --status confirmed|gave_up [--note N] [--still-open <i,j,...|none>]
+//       close the loop; gave_up files the remaining code-owned defects to the system channel:
+//       with --still-open only those log entries (0-based indices, as `log` prints them; none = nothing),
+//       without it every `unresolved` entry. An index the log does not have is refused (exit 64, nothing closed).
+//   daily-summary-fix sweep                          (cron, hourly) mark questions held through the user's quiet
+//       hours due once the user is up (sends nothing: queues `release-held` for launchd); start the fixer for a day whose answer window
+//       has closed unsent, for a never-sent day whose run died, and for a day still waiting on
+//       the user after its window once the user has written since the question
+//   daily-summary-fix release-held                   (launchd only, after the Max sign-in check) send the
+//       held questions the sweep marked due, one at a time, saving after each
+//   daily-summary-fix section <date> [--settled <i,j,...|none>] [--into <html>]  the "What the review caught"
+//       section (HTML), from the review result and the fix log; --into inserts it before </body> (idempotent).
+//       --settled: the 0-based log indices of `unresolved` / `asked` entries a later entry settled; they are
+//       left out (the later entry is the item), and kept on the day for later renders without the flag.
+//       Over 15 items, every open one stays and the oldest fixes go.
+
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { execFileSync } from "node:child_process";
+import { createRequire } from "node:module";
+
+const INST = createRequire(import.meta.url)("../lib/instance.cjs");
+const ROOT = process.env.JORI_ROOT || createRequire(import.meta.url)("../lib/root.cjs").installRoot();
+// The status of a day waiting on the user's answer. It embeds the owner id
+// (instance owner_id), as the state files already store it.
+const AWAITING = `awaiting_${INST.instance().owner_id}`;
+const DIR = process.env.DS_FIX_DIR || path.join(ROOT, "data", "daily-summary-fix");
+const QUEUE = path.join(DIR, "queue");
+const SEND = process.env.DS_FIX_SEND_BIN || path.join(ROOT, "bin", "jori-send-curl");
+const TMP = process.env.DS_FIX_TMP || "/tmp";
+const MAX_QUESTIONS_PER_DAY = 5;
+const HOLD_LOCAL_HOUR = 11;              // the answer window closes at 11am his time the next morning...
+const HOLD_MIN_MS = 3 * 3600e3;          // ...but never sooner than 3 hours after the first question,
+const HOLD_MAX_MS = 14 * 3600e3;         // and a question asked late in the day waits 3 hours, not until tomorrow
+const CORRECTION_HOLD_MS = 3 * 3600e3;   // a question after the send holds the correction this long
+const BURST_MS = 15 * 60e3;              // questions this close together buzz his phone once
+const DEADLINE_RETRY_MS = 2.5 * 3600e3;  // a deadline run that did not send is retried after this (fixer cap: 2h)
+const DEADLINE_MAX_RUNS = 3;
+const HELD_MAX_MS = 36 * 3600e3;         // a question held through his quiet hours and still unsent after this is dropped
+// The fix log's action for a held question until it is asked (then "asked you in chat").
+const HELD_ACTION = "saved to ask you once you're up, not overnight";
+// The launchd queue marker for `release-held` (date markers start the fixer).
+const RELEASE_MARKER = "release-held";
+// A release sent within this long of the sweep that marked it due takes its answer
+// window from that sweep's minute, so a window measured in hours ends on a sweep
+// tick (at :52 the sweep then sees it closed, instead of an hour later).
+const RELEASE_ANCHOR_MS = 10 * 60e3;
+// The sweep's due mark is honoured this long (the next sweep renews it).
+const RELEASE_DUE_MAX_MS = 6 * 3600e3;
+
+const argv = process.argv.slice(2);
+const cmd = argv[0];
+const date = argv[1];
+const opt = (f) => { const i = argv.indexOf(f); return i >= 0 ? argv[i + 1] : null; };
+const has = (f) => argv.includes(f);
+const clock = () => (process.env.DS_FIX_NOW ? new Date(process.env.DS_FIX_NOW) : new Date()); // DS_FIX_NOW: tests
+const now = () => clock().toISOString();
+const die = (m, code = 64) => { console.error(`daily-summary-fix: ${m}`); process.exit(code); };
+const isDate = (d) => /^\d{4}-\d{2}-\d{2}$/.test(String(d || "")); // lang-regex-ok: machine date argument
+
+const stateFile = (d) => path.join(DIR, `${d}.json`);
+function load(d) {
+  try { return JSON.parse(fs.readFileSync(stateFile(d), "utf8")); }
+  catch { return { date: d, status: "new", created_at: now(), requests: [], answers: [], questions: [], log: [], rounds: 0 }; }
+}
+function save(s) {
+  fs.mkdirSync(DIR, { recursive: true });
+  s.updated_at = now();
+  const tmp = `${stateFile(s.date)}.tmp-${process.pid}`;
+  fs.writeFileSync(tmp, JSON.stringify(s, null, 2) + "\n");
+  fs.renameSync(tmp, stateFile(s.date));
+}
+const send = (args) => execFileSync(SEND, args, { stdio: "ignore", timeout: 120000 });
+const readJson = (p) => { try { return JSON.parse(fs.readFileSync(p, "utf8")); } catch { return null; } };
+// Load, change, save in one step, from the file as it is now: a write here never
+// overwrites what a concurrent command (the user's answer through `request`) saved meanwhile.
+function mutate(d, fn) { const s = load(d); fn(s); save(s); return s; }
+const escapeHtml = (t) => String(t ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;"); // lang-regex-ok: HTML escaping
+
+function kick(d) {
+  fs.mkdirSync(QUEUE, { recursive: true });
+  fs.writeFileSync(path.join(QUEUE, d), now() + "\n"); // launchd QueueDirectories starts the runner
+}
+
+// ── The answer window ──────────────────────────────────────────────────────
+// The user's clock, resolved the way cron-tz-sync and local-day resolve it.
+// A zone Intl cannot read (the phone's value passes through unchecked) falls back
+// to the home zone (instance tz) rather than throwing and taking the whole sweep down with it.
+function localTz() {
+  let tz = process.env.DS_FIX_TZ;
+  if (!tz) { try { tz = createRequire(import.meta.url)(path.join(ROOT, "lib", "clock-jobs.js")).resolveTz().tz; } catch {} }
+  const home = INST.instance().tz;
+  try { new Intl.DateTimeFormat("en-US", { timeZone: tz }); return tz || home; } catch { return home; }
+}
+function partsIn(ms, tz) {
+  const p = Object.fromEntries(new Intl.DateTimeFormat("en-CA", { timeZone: tz, year: "numeric", month: "2-digit", day: "2-digit",
+    hour: "2-digit", minute: "2-digit", hourCycle: "h23" }).formatToParts(new Date(ms)).map((x) => [x.type, x.value]));
+  return { date: `${p.year}-${p.month}-${p.day}`, hour: Number(p.hour), minute: Number(p.minute) };
+}
+const addDays = (d, n) => { const t = new Date(`${d}T12:00:00Z`); t.setUTCDate(t.getUTCDate() + n); return t.toISOString().slice(0, 10); };
+// The instant it is <hour>:<minute> on a local calendar date in tz (two passes settle a DST change).
+function wallToUtc(d, hour, tz, minute = 0) {
+  const want = Date.parse(`${d}T${String(hour).padStart(2, "0")}:${String(minute).padStart(2, "0")}:00Z`);
+  let t = want;
+  for (let i = 0; i < 2; i++) {
+    const p = partsIn(t, tz);
+    t += want - Date.parse(`${p.date}T${String(p.hour).padStart(2, "0")}:${String(p.minute).padStart(2, "0")}:00Z`);
+  }
+  return t;
+}
+/** When the email stops waiting for a first question asked at askMs. */
+export function holdUntilFor(askMs, tz) {
+  const start = partsIn(askMs, tz).date;
+  for (let i = 0; i <= 2; i++) {
+    const t = wallToUtc(addDays(start, i), HOLD_LOCAL_HOUR, tz);
+    if (t - askMs >= HOLD_MIN_MS) return t - askMs <= HOLD_MAX_MS ? t : askMs + HOLD_MIN_MS;
+  }
+  return askMs + HOLD_MIN_MS;
+}
+/** "11am", "6:07pm", "11am tomorrow": how he reads a deadline. */
+export function clockLabel(ms, tz, fromMs) {
+  const p = partsIn(ms, tz);
+  const t = `${p.hour % 12 || 12}${p.minute ? `:${String(p.minute).padStart(2, "0")}` : ""}${p.hour < 12 ? "am" : "pm"}`;
+  return partsIn(fromMs, tz).date === p.date ? t : `${t} tomorrow`;
+}
+const lastSendAt = (s) => (s.sends || []).map((x) => x.at).sort().pop() || null;
+
+// ── The user's quiet hours ────────────────────────────────────────────────────────
+// A held question (composed in the user's quiet hours) has `held_until`; it reaches the user
+// when the sweep sends it (`sent_at`), or is dropped (`dropped_at`) if it stopped
+// mattering first. Every other question reached the user when it was asked (`at`).
+/** When the question reached him (ISO), or null while it is still held / was dropped. */
+export function reachedAt(q) {
+  if (q.dropped_at) return null;
+  return q.held_until ? q.sent_at || null : q.at;
+}
+// "HH:MM" from the instance config to minutes after midnight (null if malformed).
+function hhmm(t) {
+  const [h, m = "0"] = String(t ?? "").split(":");
+  const H = Number(h), M = Number(m);
+  return h !== "" && Number.isInteger(H) && Number.isInteger(M) && H >= 0 && H < 24 && M >= 0 && M < 60 ? H * 60 + M : null;
+}
+// Minute-of-day windows may wrap midnight (01:00-09:00 does not, 23:00-07:00 does).
+function inMinuteWindow(m, a, b) { return a < b ? m >= a && m < b : m >= a || m < b; }
+/**
+ * The user's quiet hours from agent/local/config/daily-summary-fix.json
+ * (`quiet_hours: {start, end, awake_from}`, HH:MM the user's local time), as minutes.
+ * No file, or a malformed one: null, and nothing is ever held (the old behaviour).
+ */
+export function quietHours() {
+  let qh = null;
+  try { qh = createRequire(import.meta.url)("../lib/instance.cjs").localConfig("daily-summary-fix", { quiet_hours: null }).quiet_hours; } catch {}
+  if (!qh) return null;
+  const start = hhmm(qh.start), end = hhmm(qh.end);
+  if (start === null || end === null || start === end) return null;
+  const awake = qh.awake_from == null ? null : hhmm(qh.awake_from);
+  return { start, end, awake_from: awake !== null && inMinuteWindow(awake, start, end) ? awake : null };
+}
+/**
+ * Is it the user's quiet time at `ms` in the user's zone `tz`? Returns the instant (ms) the user's quiet
+ * hours end when a question should wait, or null when it can go now. From
+ * `awake_from` on, `isUp(sinceIso, localHour)` may say the user is already up (called only
+ * in that stretch). Pure apart from that callback.
+ */
+export function quietUntil(ms, tz, qh, isUp = () => false) {
+  if (!qh) return null;
+  const p = partsIn(ms, tz);
+  const m = p.hour * 60 + p.minute;
+  if (!inMinuteWindow(m, qh.start, qh.end)) return null;
+  if (qh.awake_from !== null && inMinuteWindow(m, qh.awake_from, qh.end)) {
+    const since = ms - (ms % 60e3) - ((m - qh.awake_from + 1440) % 1440) * 60e3;
+    if (isUp(new Date(since).toISOString(), p.hour)) return null;
+  }
+  return wallToUtc(m < qh.end ? p.date : addDays(p.date, 1), Math.floor(qh.end / 60), tz, qh.end % 60);
+}
+
+/**
+ * Is the user up? First the user's phone, read exactly as hum's quiet hours read it (`jori
+ * activity` → bin/_ext/jori-cli.cjs activityOverride, over
+ * data/sleep-night-state.json, which the sleep-night cron refreshes every 5
+ * minutes from the user's phone's locks and unlocks): "waking" (the night's first unlock
+ * came within the last 3 hours) means up, "sleeping" (locked since bed) means not.
+ * Only when the phone gives no fresh reading, the user's chat: a message since `sinceIso`.
+ * Returns "phone", "chat" or null.
+ */
+function heIsUp(tz) {
+  return (sinceIso, localHour) => {
+    let reading = null;
+    try {
+      const ext = createRequire(import.meta.url)("./_ext/jori-cli.cjs");
+      if (typeof ext.activityOverride === "function") reading = ext.activityOverride({ tz, localHour, ageMin: null, dataDir: path.join(ROOT, "data"), readJson });
+    } catch {}
+    if (reading && reading.state === "waking") return "phone";
+    if (reading && reading.state === "sleeping") return null;
+    return newUserMessageSince(sinceIso) ? "chat" : null;
+  };
+}
+
+/**
+ * Send one question to the user's chat; true when it went, false when the outbound check
+ * held it back. Throws when the send itself failed. `asOf` is "live" for a question
+ * composed by this run, its composition time for one held through the user's quiet hours
+ * (Rule #2: stored content carries its own date). Tagged as a question so the app
+ * colours it while open (2026-10-17); the user's reply resumes the fixer (chat-agent
+ * procedure daily-summary-fix.md, or the hourly sweep), which has its own loop, so
+ * it fades after 48h rather than joining hum's re-ask ledger.
+ */
+function sendQuestion(d, n, text, { note = "", burst = false, asOf = "live", nowMs }) {
+  const dayName = new Date(`${d}T12:00:00Z`).toLocaleDateString("en-US", { weekday: "long", month: "long", day: "numeric", timeZone: "UTC" });
+  const qmeta = { question_id: `dsf:${d}:${n}`, question_until: new Date(nowMs + 48 * 3600e3).toISOString() };
+  // --capture-id: the send exits 0 even when the outbound check holds the message
+  // back, and a question the user never saw must not hold the user's email. It writes
+  // {"suppressed":true} in that case (the row id otherwise).
+  const cap = path.join(os.tmpdir(), `dsfix-ask-${process.pid}-${nowMs}-${n}`);
+  let suppressed = false;
+  try {
+    send([...(burst ? ["--no-push"] : []), "--capture-id", cap, "--metadata-json", JSON.stringify(qmeta), "--channel", "chat", "--intent", "daily-summary-fix", "--evidence-as-of", asOf, `📝 Fixing your ${dayName} summary: ${text}${note}`]);
+    try { suppressed = JSON.parse(fs.readFileSync(cap, "utf8")).suppressed === true; } catch {}
+  } finally { fs.rmSync(cap, { force: true }); }
+  return !suppressed;
+}
+
+/**
+ * The answer window as a question composed at `qAt` reaches the user, measured from
+ * `fromMs` (now, or for a held question the minute of the sweep that marked it
+ * due), and the note it carries: {note, apply}; apply(state) writes the window into
+ * the state as saved after the send (re-read then, so nothing written meanwhile is lost).
+ * Before the first send, the first question to reach the user opens the day's window
+ * and tells the user the email is waiting. One held through the user's quiet hours left a
+ * provisional window (`after_quiet`, only so `gate` holds meanwhile; the user never saw
+ * it): it is set afresh from `fromMs`, and never reopened once the user asked for the
+ * summary (`release`). A question that only came up after the send says so, and
+ * holds the correction for a shorter window; one composed before the send that
+ * reaches the user after it says the summary went out. Neither window is ever moved by
+ * later questions.
+ */
+function windowOnReach(s, qAt, fromMs, tz) {
+  const noop = () => {};
+  const iso = (ms) => new Date(ms).toISOString();
+  const holding = (label) => ` (I'm holding the summary until you answer, or until ${label} at the latest.)`;
+  const after = " (This one only came up after I'd sent the summary.)";
+  const sent = lastSendAt(s);
+  const fresh = (h) => h && h.after_quiet && !h.opened_at && !h.released_at;
+  if (!sent) {
+    if (!s.hold) {
+      const until = holdUntilFor(fromMs, tz);
+      const hold = { set_at: now(), until: iso(until), label: clockLabel(until, tz, fromMs), tz };
+      return { note: holding(hold.label), apply: (t) => { if (!t.hold) t.hold = hold; } };
+    }
+    if (fresh(s.hold)) {
+      const until = holdUntilFor(fromMs, tz);
+      const label = clockLabel(until, tz, fromMs);
+      return { note: holding(label), apply: (t) => { if (fresh(t.hold)) Object.assign(t.hold, { until: iso(until), label, tz, opened_at: now() }); } };
+    }
+    // Asked after the window closed: the email follows in minutes, so say so.
+    if (fromMs >= Date.parse(s.hold.until)) return { note: " (Your summary is going out now; I'll correct it if your answer changes anything.)", apply: noop };
+    return { note: "", apply: noop };
+  }
+  if (qAt <= sent) return { note: " (Your summary already went out; I'll correct it if your answer changes anything.)", apply: noop };
+  const ch = s.correction_hold && s.correction_hold.set_at > sent ? s.correction_hold : null;
+  const until = fromMs + CORRECTION_HOLD_MS;
+  const label = clockLabel(until, tz, fromMs);
+  if (!ch) {
+    const hold = { set_at: now(), until: iso(until), label, tz };
+    return { note: after, apply: (t) => { if (!(t.correction_hold && t.correction_hold.set_at > sent)) t.correction_hold = hold; } };
+  }
+  if (fresh(ch)) return { note: after, apply: (t) => { if (fresh(t.correction_hold)) Object.assign(t.correction_hold, { until: iso(until), label, tz, opened_at: now() }); } };
+  return { note: "", apply: noop };
+}
+
+/**
+ * May the email go now? Before the first send, every unanswered question holds it
+ * until the day's window closes; so does a question still held for the user's quiet hours
+ * (its window opens when it reaches the user). After a send, only questions composed
+ * since then hold the correction, for their own shorter window. `open` is what the user
+ * has been asked and owes an answer to; a held question is listed apart, under
+ * `held_not_asked`, so nobody tells the user the user owes an answer to a question the user has not
+ * seen (reason `waiting_to_ask` when only those hold it). Pure: state and clock in.
+ */
+export function verdict(s, nowMs = clock().getTime()) {
+  const sent = lastSendAt(s);
+  const hold = sent ? (s.correction_hold && s.correction_hold.set_at > sent ? s.correction_hold : null) : (s.hold || null);
+  const pending = (s.questions || []).map((q, i) => ({ ...q, n: q.n || i + 1 }))
+    .filter((q) => !q.answered_at && !q.dropped_at && (!sent || q.at > sent));
+  const open = pending.filter((q) => reachedAt(q)).map(({ n, text, at }) => ({ n, text, at }));
+  const held = pending.filter((q) => !reachedAt(q)).map(({ n, text, at, held_until }) => ({ n, text, composed_at: at, held_until, status: "held, not yet asked" }));
+  const base = { phase: sent ? "correction" : "first_send", open, held_not_asked: held, hold_until: hold ? hold.until : null, hold_until_local: hold ? hold.label : null };
+  if (!open.length && !held.length) return { send: true, reason: "no_open_questions", ...base };
+  if (!hold) return { send: true, reason: "no_hold", ...base };
+  if (nowMs < Date.parse(hold.until)) return { send: false, reason: open.length ? "waiting_on_answers" : "waiting_to_ask", ...base };
+  return { send: true, reason: "window_closed", ...base };
+}
+
+if (cmd === "request") {
+  if (!isDate(date)) die("usage: request <YYYY-MM-DD> [--reason R] [--answer TEXT] [--no-kick]");
+  const s = load(date);
+  if (s.status === "confirmed") {
+    // A confirmed day can still be reopened by the user's answer or a new reason.
+    if (!opt("--answer") && !opt("--reason")) { console.log(`${date} already ${s.status}`); process.exit(0); }
+  }
+  s.requests.push({ at: now(), reason: opt("--reason") || (opt("--answer") ? "his answer" : "unspecified") });
+  if (opt("--answer")) s.answers.push({ at: now(), text: String(opt("--answer")).slice(0, 2000) });
+  s.status = "queued";
+  save(s);
+  if (!has("--no-kick")) kick(date);
+  console.log(`queued ${date}`);
+} else if (cmd === "status") {
+  if (!isDate(date)) die("usage: status <YYYY-MM-DD>");
+  console.log(JSON.stringify(load(date), null, 2));
+} else if (cmd === "log") {
+  if (!isDate(date)) die("usage: log <date> --finding F --action A --outcome O");
+  const outcome = opt("--outcome");
+  if (!["fixed", "data-corrected", "code-landed", "asked", "unresolved"].includes(outcome)) die("--outcome fixed|data-corrected|code-landed|asked|unresolved");
+  if (!opt("--finding") || !opt("--action")) die("--finding and --action are required");
+  const s = load(date);
+  s.log.push({ at: now(), finding: String(opt("--finding")).slice(0, 400), action: String(opt("--action")).slice(0, 400), outcome, commit: opt("--commit") || null });
+  save(s);
+  console.log(`logged (log index ${s.log.length - 1})`); // the index `done --still-open` takes
+} else if (cmd === "ask") {
+  if (!isDate(date)) die("usage: ask <date> --question TEXT");
+  const q = String(opt("--question") || "").trim();
+  if (!q) die("--question is required");
+  const s = load(date);
+  if (s.questions.some((x) => x.text === q && !x.answered_at && !x.dropped_at)) { console.log("already asked"); process.exit(0); }
+  if (s.questions.length >= MAX_QUESTIONS_PER_DAY) die(`already asked ${MAX_QUESTIONS_PER_DAY} questions about ${date}; the rest stay in the email's follow-ups`, 3);
+  const nowMs = clock().getTime();
+  const tz = localTz();
+  const n = s.questions.length + 1;
+  // Composed in the user's quiet hours: recorded and held, not sent. It is asked once the user is
+  // up (the sweep marks it due, the launchd runner sends it). The email waits for it
+  // meanwhile: a provisional answer window, as if asked when they end, set afresh
+  // when it actually goes.
+  const quietEnd = quietUntil(nowMs, tz, quietHours(), heIsUp(tz));
+  if (quietEnd !== null) {
+    const sent = lastSendAt(s);
+    if (!sent && !s.hold) {
+      const until = holdUntilFor(quietEnd, tz);
+      s.hold = { set_at: now(), until: new Date(until).toISOString(), label: clockLabel(until, tz, quietEnd), tz, after_quiet: true };
+    } else if (sent && !(s.correction_hold && s.correction_hold.set_at > sent)) {
+      const until = quietEnd + CORRECTION_HOLD_MS;
+      s.correction_hold = { set_at: now(), until: new Date(until).toISOString(), label: clockLabel(until, tz, quietEnd), tz, after_quiet: true };
+    }
+    s.questions.push({ n, at: now(), text: q, held_until: new Date(quietEnd).toISOString() });
+    s.status = AWAITING;
+    s.log.push({ at: now(), finding: q, action: HELD_ACTION, outcome: "asked", commit: null });
+    save(s);
+    const v = verdict(s, nowMs);
+    console.log(`held (question ${n}): inside his quiet hours; asked once he is up, ${clockLabel(quietEnd, tz, nowMs)} at the latest${v.send ? "" : `; the email waits until ${v.hold_until_local} or his answers`}`);
+    process.exit(0);
+  }
+  // Questions asked together buzz the user's phone once; the rest land quietly beside it.
+  const burst = s.questions.some((x) => reachedAt(x) && nowMs - Date.parse(reachedAt(x)) < BURST_MS);
+  const w = windowOnReach(s, now(), nowMs, tz);
+  // A question the user must answer; the fixer resumes on the user's reply. Live: composed this run.
+  if (!sendQuestion(date, n, q, { note: w.note, burst, asOf: "live", nowMs })) {
+    // Kept out of the fix log: it is not a defect, and the email should not list it.
+    (s.held_back = s.held_back || []).push({ at: now(), text: q });
+    save(s);
+    console.log("not asked: the outbound check held it back (the summary does not wait on it)");
+    process.exit(5);
+  }
+  w.apply(s);
+  s.questions.push({ n, at: now(), text: q });
+  s.status = AWAITING;
+  s.log.push({ at: now(), finding: q, action: "asked you in chat", outcome: "asked", commit: null });
+  save(s);
+  const v = verdict(s, nowMs);
+  console.log(v.send ? `asked (question ${n})` : `asked (question ${n}); the email waits until ${v.hold_until_local} or his answers`);
+} else if (cmd === "gate") {
+  if (!isDate(date)) die("usage: gate <YYYY-MM-DD> [--peek]");
+  const s = load(date);
+  const v = verdict(s);
+  // A held day is parked on the user, so the sweep starts the fixer when the window closes.
+  // --peek (the chat agent's "where is my summary?") only reads.
+  if (!v.send && !has("--peek") && s.status !== AWAITING) { s.status = AWAITING; save(s); }
+  console.log(JSON.stringify(v));
+  process.exit(v.send ? 0 : 3);
+} else if (cmd === "answered") {
+  if (!isDate(date)) die("usage: answered <YYYY-MM-DD> <n> [<n> ...]");
+  const ns = argv.slice(2).filter((a) => !a.startsWith("--")).map(Number);
+  if (!ns.length || ns.some((x) => !Number.isInteger(x) || x < 1)) die("answered: give the question number(s) shown by `status`");
+  const s = load(date);
+  const byN = new Map(s.questions.map((q, i) => [q.n || i + 1, q]));
+  const unknown = ns.filter((x) => !byN.has(x));
+  if (unknown.length) die(`answered: ${date} has no question ${unknown.join(", ")}`);
+  for (const x of ns) if (!byN.get(x).answered_at) byN.get(x).answered_at = now();
+  save(s);
+  console.log(JSON.stringify(verdict(s)));
+} else if (cmd === "release") {
+  if (!isDate(date)) die("usage: release <YYYY-MM-DD> [--reason R]");
+  // The user asked for the summary now: the wait ends, whatever is still open.
+  const s = load(date);
+  const t = now();
+  for (const h of [s.hold, s.correction_hold]) if (h && h.until > t) { h.until = t; h.released_at = t; }
+  s.requests.push({ at: t, reason: opt("--reason") || "he asked for the summary now" });
+  s.status = "queued";
+  save(s);
+  if (!has("--no-kick")) kick(date);
+  console.log(`released ${date}`);
+} else if (cmd === "done") {
+  if (!isDate(date)) die("usage: done <date> --status confirmed|gave_up [--note N] [--still-open <i,j,...|none>]");
+  const st = opt("--status");
+  if (!["confirmed", "gave_up"].includes(st)) die("--status confirmed|gave_up");
+  const s = load(date);
+  // Checked before anything is written: a mistyped index must never close the day
+  // or quietly drop an item that is still open.
+  let stillOpen = null;
+  if (has("--still-open")) {
+    try { stillOpen = parseStillOpen(opt("--still-open"), s.log.length); } catch (e) { die(e.message); }
+  }
+  s.status = st;
+  s.closed_at = now();
+  if (opt("--note")) s.note = String(opt("--note")).slice(0, 600);
+  if (st === "gave_up" && stillOpen) s.still_open = stillOpen;
+  for (const q of s.questions) {
+    const asked = reachedAt(q); // a question still held, or dropped, was never put to him
+    if (asked && !q.answered_at && s.answers.some((a) => a.at > asked)) q.answered_at = s.answers.find((a) => a.at > asked).at;
+  }
+  save(s);
+  if (st === "gave_up") {
+    // Backstop: what the fixer could not fix goes where code defects are fixed.
+    const open = pagedEntries(s.log, stillOpen);
+    if (open.length) {
+      const lines = open.slice(0, 8).map((l) => `• ${l.finding.slice(0, 200)} (tried: ${l.action.slice(0, 120)})`);
+      try { send(["--channel", "system", "--skip-precheck", "--intent", "daily-summary-fix", `⚠️ daily-summary-fix: ${open.length} defect(s) in the ${date} report it could not fix — the spine or prep needs work.\n${lines.join("\n")}`]); } catch {}
+    }
+  }
+  console.log(`${date} ${st}`);
+} else if (cmd === "mark-sent") {
+  if (!isDate(date)) die("usage: mark-sent <date> [--corrected]");
+  const s = load(date);
+  s.sends = s.sends || [];
+  s.sends.push({ at: now(), corrected: has("--corrected") });
+  // Sent with questions still open (the window closed): keep the day parked on the user,
+  // so a late answer the chat agent misses is still picked up by the sweep.
+  if (s.questions.some((q) => !q.answered_at && !q.dropped_at) && !["confirmed", "gave_up"].includes(s.status)) s.status = AWAITING;
+  save(s);
+  console.log(`${date} send recorded`);
+} else if (cmd === "sweep") {
+  // (0) Questions held through the user's quiet hours: once the user is up (the user's phone, else the user's
+  //     chat, from `awake_from`; at the latest when they end), mark the day due and
+  //     drop the `release-held` marker in the launchd queue. This cron process NEVER
+  //     sends them: from cron the outbound check's model step cannot sign in, so they
+  //     would go out unchecked. The launchd runner sends them (`release-held`). A held
+  //     question that stopped mattering (the day closed, the user answered it, 36 hours
+  //     passed) is dropped here; if that leaves an unsent day with nothing open, the
+  //     fixer is started to send it. Inside the user's quiet hours a held question changes
+  //     nothing below: its day has a window, so it is not chased.
+  // (1) A day whose answer window has closed, still unsent in that phase: start the
+  //     fixer, which sends the best version with what is still open listed. This is
+  //     the time limit; without it a held summary would wait for the user forever.
+  // (2) A never-sent day whose fix run ended without sending or asking anything
+  //     (the 2h cap, a crash, Max signed out): run it again. Its data row is already
+  //     published, so the watchdog's missing-row rebuild no longer covers it.
+  //     Both retry after 2.5h, three runs at most, then say so on the system channel.
+  // (3) Inside an open window, nothing: the user's answer comes through the chat agent, the
+  //     close through (1). (Waking an Opus run each hour the user chats about anything
+  //     else would queue the run carrying the user's real answer behind them.)
+  // (4) A day still waiting on the user after its window (sent with questions open):
+  //     re-queue when the user has written since the question, at most every 6 hours.
+  //     Whether it IS the answer is the fixer model's call (it reads the user's messages).
+  let n = 0, dueDays = 0, dropped = 0;
+  const nowMs = clock().getTime();
+  let tz = null, quietEnd; // resolved once, and only when a held question is waiting
+  for (const f of (fs.existsSync(DIR) ? fs.readdirSync(DIR) : [])) {
+    const d = f.slice(0, 10);
+    if (f !== `${d}.json` || !isDate(d)) continue;
+    const s = load(d);
+    const held = (s.questions || []).filter((q) => q.held_until && !q.sent_at && !q.dropped_at);
+    if (held.length) {
+      let changed = false;
+      const drop = (q, why) => { q.dropped_at = now(); q.dropped_why = why; dropped++; changed = true; };
+      for (const q of held) {
+        if (["confirmed", "gave_up"].includes(s.status)) drop(q, "the day was closed");
+        else if (q.answered_at) drop(q, "he answered it");
+        else if (nowMs - Date.parse(q.at) > HELD_MAX_MS) drop(q, "held too long");
+      }
+      const due = held.filter((q) => !q.dropped_at);
+      if (due.length && tz === null) { tz = localTz(); quietEnd = quietUntil(nowMs, tz, quietHours(), heIsUp(tz)); }
+      // Stamped with the sweep's start (its :52 tick): the answer window is measured from it.
+      if (due.length && quietEnd === null) { s.release_due_at = new Date(nowMs).toISOString(); changed = true; dueDays++; }
+      if (changed) save(s);
+      if (held.some((q) => q.dropped_at) && startIfNothingOpen(d, "sweep: the question held through his quiet hours was not asked after all; nothing is waiting on him, send it")) { n++; continue; }
+    }
+    if (s.status !== AWAITING && s.status !== "queued") continue;
+    const sent = lastSendAt(s);
+    const hold = sent ? (s.correction_hold && s.correction_hold.set_at > sent ? s.correction_hold : null) : (s.hold || null);
+    const lastReq = Math.max(0, ...s.requests.map((r) => Date.parse(r.at) || 0));
+    const windowClosed = !!hold && nowMs >= Date.parse(hold.until);
+    const stranded = !sent && !hold && s.status === "queued" && lastReq > 0 && nowMs - Date.parse(`${d}T12:00:00Z`) < 4 * 86400e3;
+    if (windowClosed || stranded) {
+      if (fs.existsSync(path.join(QUEUE, d))) continue; // a run is already coming
+      const since = windowClosed ? hold.set_at : "";
+      const prev = s.deadline_queued_at && s.deadline_queued_at > since ? Date.parse(s.deadline_queued_at) : null;
+      if (prev && (sent || nowMs - prev < DEADLINE_RETRY_MS)) continue; // a correction window starts one run
+      if (!prev && s.status === "queued" && nowMs - lastReq < DEADLINE_RETRY_MS) continue; // a run may be under way
+      s.deadline_runs = prev ? (s.deadline_runs || 1) + 1 : 1;
+      if (s.deadline_runs > DEADLINE_MAX_RUNS) {
+        s.status = "gave_up";
+        s.note = `${DEADLINE_MAX_RUNS} fix runs ${windowClosed ? `since the answer window closed at ${hold.label}` : "in a row"} ended without sending it`;
+        save(s);
+        try { send(["--channel", "system", "--skip-precheck", "--intent", "daily-summary-fix", `⚠️ daily-summary-fix: the ${d} summary is still unsent after ${DEADLINE_MAX_RUNS} fix runs ${windowClosed ? "past its answer window" : "that ended without sending it"} — see agent/logs/daily-summary-fix.log.`]); } catch {}
+        continue;
+      }
+      s.requests.push({ at: now(), reason: windowClosed
+        ? `sweep: the answer window closed at ${hold.label}; send the best version now, the open question(s) listed`
+        : "sweep: the last fix run ended without sending the summary; run it again" });
+      s.deadline_queued_at = now();
+      s.status = "queued";
+      save(s); kick(d); n++;
+      continue;
+    }
+    if (hold) continue; // inside the window
+    if (s.status !== AWAITING) continue;
+    const lastQ = s.questions.filter((q) => !q.answered_at && reachedAt(q)).map(reachedAt).sort().pop(); // asked, not just held
+    if (!lastQ) continue;
+    const ageDays = (nowMs - Date.parse(lastQ)) / 86400e3;
+    if (ageDays > 3) { s.status = "gave_up"; s.note = "no answer within 3 days"; save(s); continue; }
+    if (s.sweep_seen_at && nowMs - Date.parse(s.sweep_seen_at) < 6 * 3600e3) continue;
+    const since = [lastQ, s.sweep_seen_at || "", sent || ""].sort().pop(); // the send's run already read what came before it
+    if (newUserMessageSince(since)) { s.requests.push({ at: now(), reason: "sweep: he wrote since the question" }); s.sweep_seen_at = now(); s.status = "queued"; save(s); kick(s.date); n++; }
+  }
+  if (dueDays) {
+    fs.mkdirSync(QUEUE, { recursive: true });
+    fs.writeFileSync(path.join(QUEUE, RELEASE_MARKER), now() + "\n"); // launchd sends them, after its Max check
+  }
+  if (dueDays || dropped) console.log(`held questions: ${dueDays} day(s) due to ask (queued for launchd), ${dropped} dropped`);
+  console.log(`re-queued ${n}`);
+} else if (cmd === "release-held") {
+  // Launchd only (trigger-daily-summary-fix.sh runs it after confirming the Max
+  // sign-in): the outbound check and the truth gate each need `claude -p`. Sends the
+  // held questions of every day the sweep marked due, in order, as one batch per day
+  // (the first buzzes the user's phone and opens the answer window). Each question is
+  // re-read before it goes and saved right after, so an answer that came in through
+  // `request` meanwhile is never overwritten, and a question the user has answered since
+  // is not sent. A failed send is logged and recorded (`release_error`); the rest of
+  // that day waits for the next sweep, which marks it due again.
+  const nowMs = clock().getTime();
+  const tz = localTz();
+  let sentN = 0, droppedN = 0, failed = 0;
+  const heldUnsent = (q) => q.held_until && !q.sent_at && !q.dropped_at;
+  for (const f of (fs.existsSync(DIR) ? fs.readdirSync(DIR) : [])) {
+    const d = f.slice(0, 10);
+    if (f !== `${d}.json` || !isDate(d)) continue;
+    const s0 = load(d);
+    const dueMs = Date.parse(s0.release_due_at || "");
+    if (!Number.isFinite(dueMs) || nowMs - dueMs > RELEASE_DUE_MAX_MS) continue;
+    // The window runs from the minute of the sweep that marked the day due when the
+    // release follows it promptly, so an hours-long window ends on a sweep tick.
+    const fromMs = nowMs - dueMs <= RELEASE_ANCHOR_MS ? Math.floor(dueMs / 60e3) * 60e3 : nowMs;
+    let first = true, dayDropped = false, dayFailed = false;
+    for (const n of s0.questions.filter(heldUnsent).map((q) => q.n)) {
+      const s = load(d);
+      const q = s.questions.find((x) => x.n === n);
+      if (!q || !heldUnsent(q)) continue;
+      const moot = ["confirmed", "gave_up"].includes(s.status) ? "the day was closed" : q.answered_at ? "he answered it" : nowMs - Date.parse(q.at) > HELD_MAX_MS ? "held too long" : null;
+      if (moot) {
+        mutate(d, (t) => { const x = t.questions.find((y) => y.n === n); if (x && heldUnsent(x)) Object.assign(x, { dropped_at: now(), dropped_why: moot }); });
+        droppedN++; dayDropped = true; continue;
+      }
+      const w = first ? windowOnReach(s, q.at, fromMs, tz) : { note: "", apply: () => {} };
+      const burst = !first || s.questions.some((x) => reachedAt(x) && nowMs - Date.parse(reachedAt(x)) < BURST_MS);
+      let ok;
+      try {
+        ok = sendQuestion(d, n, q.text, { note: w.note, burst, asOf: q.at, nowMs });
+      } catch (e) {
+        const why = `send failed (exit ${e.status ?? "none"}${e.signal ? `, ${e.signal}` : ""}${e.code ? `, ${e.code}` : ""})`;
+        console.error(`daily-summary-fix: release-held ${d} question ${n}: ${why}; the rest of the day waits for the next sweep`);
+        mutate(d, (t) => { t.release_error = { at: now(), n, error: why }; });
+        failed++; dayFailed = true;
+        break;
+      }
+      if (!ok) {
+        // Not a defect and not the user's to answer: kept out of the email's section, like `ask` exit 5.
+        mutate(d, (t) => {
+          const x = t.questions.find((y) => y.n === n);
+          if (x) Object.assign(x, { dropped_at: now(), dropped_why: "the outbound check held it back" });
+          (t.held_back = t.held_back || []).push({ at: now(), text: q.text });
+        });
+        console.log(`${d}: question ${n} not asked: the outbound check held it back`);
+        droppedN++; dayDropped = true; continue;
+      }
+      const opens = first;
+      mutate(d, (t) => {
+        const x = t.questions.find((y) => y.n === n);
+        if (x) x.sent_at = now();
+        if (opens) w.apply(t);
+        const entry = t.log.find((l) => l.outcome === "asked" && l.finding === q.text && l.action === HELD_ACTION);
+        if (entry) entry.action = "asked you in chat";
+        delete t.release_error;
+      });
+      first = false; sentN++;
+      console.log(`${d}: asked question ${n}`);
+    }
+    if (!dayFailed) mutate(d, (t) => { if (!t.questions.some(heldUnsent)) delete t.release_due_at; });
+    if (dayDropped) startIfNothingOpen(d, "release-held: the question held through his quiet hours was not asked after all; nothing is waiting on him, send it");
+  }
+  console.log(`released ${sentN}, dropped ${droppedN}${failed ? `, ${failed} send failure(s): see above` : ""}`);
+  process.exit(failed ? 1 : 0);
+} else if (cmd === "section") {
+  if (!isDate(date)) die("usage: section <date> [--settled <i,j,...|none>] [--into <html>]");
+  // The fixer's list is kept on the day, so a later render without it (the daily
+  // summary's own send step runs `section --into` again) does not bring the
+  // settled entries back.
+  const sday = load(date);
+  let settled = Array.isArray(sday.settled) ? sday.settled : null;
+  if (has("--settled")) {
+    try { settled = parseIndexList(opt("--settled"), sday.log.length, "--settled"); } catch (e) { die(e.message); }
+    sday.settled = settled;
+    save(sday);
+  }
+  const html = renderSection(date, { settled });
+  const into = opt("--into");
+  if (!into) { process.stdout.write(html + "\n"); process.exit(0); }
+  let doc = fs.readFileSync(into, "utf8");
+  doc = doc.replace(/<!-- ds-review-section -->[\s\S]*?<!-- \/ds-review-section -->\s*/, ""); // lang-regex-ok: our own section markers
+  if (html) doc = doc.includes("</body>") ? doc.replace("</body>", `${html}\n</body>`) : doc + "\n" + html;
+  fs.writeFileSync(into, doc);
+  console.log(html ? "section inserted" : "no review notes; nothing inserted");
+} else {
+  die("usage: request|status|log|ask|gate|answered|release|mark-sent|done|sweep|release-held|section — see the header");
+}
+
+/**
+ * A never-sent day parked on the user with nothing left to wait for (its held questions
+ * were dropped): start the fixer, whose gate now says send. True when it did.
+ */
+function startIfNothingOpen(d, reason) {
+  const s = load(d);
+  if (s.questions.some((q) => !q.answered_at && !q.dropped_at)) return false;
+  if (lastSendAt(s) || s.status !== AWAITING || fs.existsSync(path.join(QUEUE, d))) return false;
+  s.requests.push({ at: now(), reason });
+  s.status = "queued";
+  save(s); kick(d);
+  return true;
+}
+
+/**
+ * At most `cap` items, in their original order: every open item (`ok: false`),
+ * then the newest done ones in the room left. Open items are never dropped.
+ */
+export function capItems(items, cap) {
+  if (items.length <= cap) return items;
+  const room = Math.max(0, cap - items.filter((i) => !i.ok).length);
+  const doneAt = items.map((i, k) => (i.ok ? k : -1)).filter((k) => k >= 0);
+  const keep = new Set(doneAt.slice(doneAt.length - room));
+  return items.filter((i, k) => !i.ok || keep.has(k));
+}
+
+/**
+ * `done --still-open <spec>`: the fixer's own list of what is still open at close,
+ * as 0-based indices into the day's log. "" or "none" is an explicit empty list.
+ * Throws on a missing value, a non-index, or an index the log does not have, so a
+ * typo never silently drops a real item.
+ */
+export function parseStillOpen(spec, logLength) {
+  return parseIndexList(spec, logLength, "--still-open");
+}
+
+/**
+ * A comma-separated list of 0-based log indices for `flag` (`done --still-open`,
+ * `section --settled`); "" or "none" is an explicit empty list. Throws on a missing
+ * value, a non-index, or an index the log does not have.
+ */
+export function parseIndexList(spec, logLength, flag) {
+  if (spec === null || spec === undefined || String(spec).startsWith("--")) {
+    throw new Error(`${flag} needs a value: comma-separated log indices (0-based, as \`log\` prints them), or none`);
+  }
+  const raw = String(spec).trim();
+  if (raw === "" || raw.toLowerCase() === "none") return [];
+  const parts = raw.split(",").map((x) => x.trim());
+  const bad = parts.filter((x) => !/^\d+$/.test(x) || Number(x) >= logLength); // lang-regex-ok: machine index list
+  if (bad.length) {
+    throw new Error(`${flag}: no log entry ${bad.map((x) => x || '""').join(", ")} (the log has ${logLength} ${logLength === 1 ? "entry" : "entries"}; indices start at 0)`);
+  }
+  return [...new Set(parts.map(Number))].sort((a, b) => a - b);
+}
+
+/**
+ * The log entries a gave_up close files to the system channel. Without the
+ * fixer's list (null): every `unresolved` entry. With it: exactly those entries.
+ */
+export function pagedEntries(log, stillOpen = null) {
+  if (stillOpen === null) return (log || []).filter((l) => l.outcome === "unresolved");
+  return stillOpen.map((i) => log[i]);
+}
+
+function newUserMessageSince(iso) {
+  // Tests: the time of the user's latest chat message ("" = none), instead of reading Supabase.
+  if (process.env.DS_FIX_LAST_USER_MSG !== undefined) return Boolean(process.env.DS_FIX_LAST_USER_MSG) && Date.parse(process.env.DS_FIX_LAST_USER_MSG) > Date.parse(iso);
+  try {
+    const env = fs.readFileSync(path.join(ROOT, ".env"), "utf8");
+    const key = (env.split("\n").find((l) => l.startsWith("SUPABASE_SERVICE_ROLE_KEY=")) || "").split("=").slice(1).join("=").replace(/^"|"$/g, ""); // lang-regex-ok: .env quoting
+    if (!key) return false;
+    const out = execFileSync("curl", ["-s", "-m", "20", "-H", `apikey: ${key}`, "-H", `Authorization: Bearer ${key}`,
+      `${process.env.SUPABASE_URL || INST.supabaseUrl()}/rest/v1/jori_messages?select=id&role=eq.user&created_at=gt.${encodeURIComponent(iso)}&limit=1`], { encoding: "utf8" });
+    return JSON.parse(out).length > 0;
+  } catch { return false; }
+}
+
+/**
+ * The email's closing section: what the reviewer found and what was done.
+ * Built only from our own records (the review result's prose repairs, the fix
+ * log, and findings still open at send time), so it cannot claim a fix that
+ * did not happen. Empty string when there is nothing to say.
+ *
+ * The log is append-only, so an `unresolved` finding a later run fixed, or a
+ * question answered and applied in other words, would still read as open; the
+ * fixer names those (`settled`, log indices) and they are left out, since the
+ * later entry is the item. Without it every entry shows as logged. Over
+ * 15 items, every open one is kept and the oldest fixes are dropped.
+ */
+export function renderSection(d, { review = null, state = null, settled = null } = {}) {
+  const SECTION_CAP = 15;   // a const at module level is not yet set when the CLI dispatch above runs
+  const rv = review || (() => { try { return JSON.parse(fs.readFileSync(path.join(TMP, `ds-review-${d}.json`), "utf8")); } catch { return null; } })();
+  const st = state || load(d);
+  const items = [];
+  for (const r of (rv && rv.repairs) || []) {
+    if (r.kept) for (const a of r.applied || []) items.push({ what: a.why || `reworded the ${a.slot} text`, how: "fixed in the wording", ok: true });
+  }
+  const LABEL = { fixed: "fixed", "data-corrected": "corrected in your records", "code-landed": "fixed in the code, and the day was rebuilt", asked: "waiting on your answer", unresolved: "not fixed yet" };
+  // A question the user has answered is not "waiting on your answer": what was done with
+  // the user's answer is its own entry. (Matched on the exact text `ask` logged.) Nor is one
+  // held for the user's quiet hours that was dropped before it reached the user.
+  const answered = new Set((st.questions || []).filter((q) => q.answered_at || q.dropped_at).map((q) => q.text));
+  const settledSet = new Set(settled || []);
+  for (const [k, l] of (st.log || []).entries()) {
+    if (l.outcome === "asked" && answered.has(l.finding)) continue;
+    if (settledSet.has(k) && (l.outcome === "unresolved" || l.outcome === "asked")) continue;
+    items.push({ what: l.finding, how: `${l.action} (${LABEL[l.outcome] || l.outcome})`, ok: l.outcome !== "unresolved" && l.outcome !== "asked" });
+  }
+  // Open items come from the FINAL review (the fixer overwrites ds-review-<date>.json
+  // on every re-review), so anything it fixed is no longer listed there.
+  const fixedText = new Set(items.map((i) => i.what));
+  for (const f of (rv && rv.findings) || []) {
+    if (f.severity === "low" || f.review_hole || fixedText.has(f.detail) || fixedText.has(f.headline)) continue;
+    items.push({ what: f.headline || f.detail, how: "still open: flagged by the review, not fixed before this was sent", ok: false });
+  }
+  if (rv && rv.independent_review === "unavailable") items.push({ what: "The independent review could not run this time", how: "only the automatic checks were applied", ok: false });
+  if (!items.length) return "";
+  const shown = capItems(items, SECTION_CAP);
+  const dropped = items.length - shown.length;
+  const li = shown.map((i) => `<li>${i.ok ? "✓" : "•"} ${escapeHtml(i.what)}<br><span style="color:#666">${escapeHtml(i.how)}</span></li>`)
+    .concat(dropped ? [`<li style="color:#666">…and ${dropped} earlier ${dropped === 1 ? "fix" : "fixes"} not listed here</li>`] : [])
+    .join("\n");
+  return `<!-- ds-review-section -->\n<h2 style="font-size:16px;margin-top:28px">What the review caught</h2>\n<ul style="padding-left:18px;color:#333">\n${li}\n</ul>\n<!-- /ds-review-section -->`;
+}

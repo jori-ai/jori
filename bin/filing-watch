@@ -1,0 +1,263 @@
+#!/usr/bin/env node
+"use strict";
+// filing-watch — watch a list of private companies for the moment one becomes
+// buyable: an SEC going-public filing where the company itself is the filer.
+//
+// WHY. Being ready for an IPO means knowing before the first trade, not reading
+// about it after — so this watches the registry, not the news cycle.
+//
+// DETERMINISTIC BY DESIGN. The high-value signal is a real SEC filing, and that
+// is a fact, not a judgment: EDGAR full-text search, filtered to the forms that
+// mean "going public" (S-1, F-1, S-4, 424B4). No model is involved in deciding
+// whether something was filed, so this cannot hallucinate an IPO.
+//
+// THE FILER CHECK IS THE WHOLE TRICK. A full-text hit only means the phrase
+// appears SOMEWHERE in a filing — another company's S-1 that merely mentions a
+// watched name is a hit. So a hit counts as a real signal only when the company
+// is the FILER (a known CIK, or its name in `display_names`); anything else is
+// recorded as a mention and never alerts.
+//
+// Qualitative signals — funding rounds, banker mandates, CFO hires — and
+// listings outside the SEC's reach belong to the user's own memo jobs. This
+// tool covers the half that should never depend on a model reading a headline.
+//
+// Config: agent/local/config/filing-watch.json — no `watchlist_file` = OFF.
+//   watchlist_file  JSON watchlist (relative to the install's kernel tree):
+//                   { buckets: {<id>: description}, companies: [{ id, name,
+//                     aka?, bucket, status?, ticker?, ticker_proxy?,
+//                     valuation?: {confirmed|reported_seeking}, edgar_ciks?,
+//                     edgar_search_aliases?, not_in_edgar?, not_in_edgar_reason?,
+//                     exchange_target? }], thesis_pure_plays?: {companies},
+//                     public_proxies?: [{ticker, held}] }
+//   state_file      where seen filing ids are kept
+//   intent          jori-send-curl intent for the alert
+//   label           how the alert names the watchlist
+//   user_agent      SEC wants a descriptive User-Agent with a contact address
+//                   (default: "<agent> Personal Research <owner_email>")
+//
+// Usage:
+//   filing-watch              check every tracked company, alert on new filings
+//   filing-watch --json       machine-readable
+//   filing-watch --dry-run    check + print; no state write, no alert
+//   filing-watch --list       print the watchlist and exit (no network)
+
+const fs = require("node:fs");
+const path = require("node:path");
+const { execFile } = require("node:child_process");
+const { localConfig, instance } = require("../lib/instance.cjs");
+const { installTools } = require("../lib/root.cjs");
+
+const CFG = localConfig("filing-watch", {
+  watchlist_file: "",
+  state_file: "data/filing-watch-state.json",
+  intent: "filing-watch",
+  label: "watchlist",
+  user_agent: "",
+});
+const abs = (p) => (!p ? "" : p.startsWith("/") ? p : installTools(p));
+const WATCHLIST = abs(CFG.watchlist_file);
+const STATE = abs(CFG.state_file);
+const SEND = process.env.JORI_SEND_BIN || path.join(__dirname, "jori-send-curl");
+
+const FLAGS = new Set(process.argv.slice(2).filter((a) => a.startsWith("--")));
+const DRY_RUN = FLAGS.has("--dry-run");
+const JSON_OUT = FLAGS.has("--json");
+
+// SEC asks for a descriptive User-Agent with contact details and rate-limits
+// hard without one. Ten requests/second is their published ceiling; this makes
+// about a dozen requests once a week, so one per second is plenty polite.
+const UA = CFG.user_agent || `Jori Personal Research ${instance().owner_email || ""}`.trim();
+const FORMS = "S-1,F-1,S-4,424B4";
+// Exhibits are attachments to a filing, not filings. A single S-1 drags 20+
+// EX-* rows along with it, and alerting on those buries the one line that
+// matters. Only these forms mean "a company is going public".
+const SIGNAL_FORMS = new Set(["S-1", "S-1/A", "S-4", "S-4/A", "F-1", "F-1/A", "424B4"]);
+
+const log = (...a) => { if (!JSON_OUT) console.log(...a); };
+const usdB = (n) => (n == null ? "—" : `$${(n / 1e9).toFixed(1)}B`);
+
+function readJson(p, dflt) {
+  try { return JSON.parse(fs.readFileSync(p, "utf8")); } catch { return dflt; }
+}
+
+async function edgarSearch(name) {
+  const url = `https://efts.sec.gov/LATEST/search-index?q=${encodeURIComponent(`"${name}"`)}&forms=${encodeURIComponent(FORMS)}`;
+  const res = await fetch(url, { headers: { "User-Agent": UA }, signal: AbortSignal.timeout(20000) });
+  if (!res.ok) throw new Error(`EDGAR HTTP ${res.status}`);
+  const j = await res.json();
+  const hits = (j.hits && j.hits.hits) || [];
+  return hits.map((h) => {
+    const s = h._source || {};
+    return {
+      id: h._id,
+      filers: s.display_names || [],
+      ciks: s.ciks || [],
+      form: s.root_form || s.file_type || null,
+      filed: s.file_date || null,
+    };
+  });
+}
+
+/**
+ * Is the company the FILER, or merely mentioned by someone else?
+ *
+ * `edgar_ciks` matters as much as the name. In a SPAC merger the filer is the
+ * SPAC, not the target — watching only the target's name would miss the most
+ * imminent event on the list.
+ */
+function isFiler(hit, company) {
+  // CIK first, because it is exact. Substring matching on names is not: a SPAC
+  // named "… Corp XI" also matches "… Corp XIII", a different SPAC entirely,
+  // and one real signal becomes dozens of fake ones. Where a CIK is known, it
+  // is the only test.
+  const ciks = (company.edgar_ciks || []).map((c) => String(c).replace(/^0+/, "")); // lang-regex-ok: normalising zero-padded CIK identifiers
+  if (ciks.length) {
+    return (hit.ciks || []).some((c) => ciks.includes(String(c).replace(/^0+/, ""))); // lang-regex-ok: same
+  }
+  // No CIK on file: fall back to name matching, but require a boundary so a
+  // longer name cannot swallow a shorter one.
+  const names = [company.name, ...(company.aka || [])].map((n) => n.toLowerCase());
+  return (hit.filers || []).some((d) => {
+    const dn = d.toLowerCase();
+    return names.some((n) => {
+      const i = dn.indexOf(n);
+      if (i === -1) return false;
+      const after = dn[i + n.length];
+      return after === undefined || !/[a-z0-9]/.test(after); // lang-regex-ok: character-class boundary check on an identifier, not prose
+    });
+  });
+}
+
+async function notify(body) {
+  if (DRY_RUN) { log(`  (alert suppressed) ${body}`); return; }
+  await new Promise((resolve) => {
+    execFile(SEND, ["--skip-precheck", "--intent", CFG.intent, body], (err) => {
+      if (err) console.error(`  notify failed: ${err.message}`);
+      resolve();
+    });
+  });
+}
+
+async function main() {
+  if (!WATCHLIST || !fs.existsSync(WATCHLIST)) {
+    log("filing-watch: not configured (agent/local/config/filing-watch.json watchlist_file) — nothing to do");
+    if (JSON_OUT) console.log(JSON.stringify({ configured: false }));
+    return;
+  }
+  const wl = readJson(WATCHLIST, null);
+  if (!wl || !Array.isArray(wl.companies)) { console.error("filing-watch: watchlist unreadable"); process.exit(1); }
+
+  if (FLAGS.has("--list")) {
+    log(`${CFG.label} — ordered by how close each name is to being buyable\n`);
+    for (const [b, desc] of Object.entries(wl.buckets || {})) {
+      const inB = wl.companies.filter((c) => c.bucket === b);
+      if (!inB.length) continue;
+      log(`${b.toUpperCase().replace(/_/g, " ")} — ${desc}`); // lang-regex-ok: formatting a machine key for display
+      for (const c of inB) {
+        const v = c.valuation && (c.valuation.confirmed || c.valuation.reported_seeking);
+        const tick = c.ticker || c.ticker_proxy || "";
+        log(`  ${c.name.padEnd(22)} ${tick.padEnd(9)} ${usdB(v).padStart(8)}${c.not_in_edgar ? "   [outside EDGAR]" : ""}`);
+      }
+      log("");
+    }
+    if (wl.thesis_pure_plays && Array.isArray(wl.thesis_pure_plays.companies)) {
+      log(`Thesis pure-plays (no IPO path): ${wl.thesis_pure_plays.companies.map((c) => c.name).join(", ")}`);
+    }
+    if (Array.isArray(wl.public_proxies)) {
+      log(`Public proxies: ${wl.public_proxies.map((p) => p.ticker + (p.held ? "" : "*")).join(", ")}   (* not held)`);
+    }
+    return;
+  }
+
+  if (!/@/.test(UA)) { console.error("filing-watch: no contact address for the SEC User-Agent (set owner_email or user_agent)"); process.exit(1); } // lang-regex-ok: checking an identifier, not prose
+
+  const state = readJson(STATE, { seen: {}, last_run: null });
+  // FIRST RUN SEEDS, IT DOES NOT ALERT. Every historical filing is "new" to an
+  // empty state, so a first run would page about years of unrelated paperwork
+  // filed by an alias (a SPAC's own IPO). Seed silently; from the second run
+  // on, genuinely new means genuinely new.
+  const seeding = !state.last_run;
+  if (seeding) log("  (first run — recording what already exists, alerting on nothing)");
+  const now = new Date().toISOString();
+  const findings = [];
+  const errors = [];
+  const skipped = [];
+
+  for (const c of wl.companies) {
+    // Already trading — nothing to wait for.
+    if (c.status === "public") continue;
+
+    // EDGAR IS SEC-ONLY, AND THAT IS A REAL HOLE. A company listing on a
+    // non-US exchange will never appear here, so a clean EDGAR run says nothing
+    // about it. Skipping it loudly is the honest move: a silent pass would read
+    // as "checked, nothing found" when the truth is "this tool cannot see it."
+    if (c.not_in_edgar) {
+      skipped.push({ company: c.name, reason: c.not_in_edgar_reason || `listing venue is outside SEC coverage (${c.exchange_target || "non-US"})` });
+      log(`  ${c.name.padEnd(24)} not visible to EDGAR — ${c.exchange_target || "non-US listing"}; tracked by the memo instead`);
+      continue;
+    }
+    let hits;
+    try {
+      hits = await edgarSearch(c.name);
+      // Aliases widen the SEARCH; the CIK check above narrows the MATCH.
+      for (const alias of c.edgar_search_aliases || []) {
+        await new Promise((r) => setTimeout(r, 1100));
+        hits = hits.concat(await edgarSearch(alias));
+      }
+    } catch (e) {
+      errors.push({ company: c.name, error: e.message });
+      log(`  ${c.name}: EDGAR check failed — ${e.message}`);
+      continue;
+    }
+    const real = hits.filter((h) => isFiler(h, c) && SIGNAL_FORMS.has(String(h.form || "").toUpperCase()));
+    const mentions = hits.length - real.length;
+    const seen = new Set(state.seen[c.id] || []);
+    const fresh = real.filter((h) => !seen.has(h.id));
+
+    if (fresh.length && !seeding) {
+      findings.push({ company: c.name, bucket: c.bucket, filings: fresh });
+      log(`  ⚑ ${c.name}: ${fresh.length} NEW filing(s) where it is the filer`);
+      for (const f of fresh) log(`      ${f.form || "?"} filed ${f.filed || "?"} — ${f.filers.join("; ")}`);
+    } else if (fresh.length && seeding) {
+      log(`  ${c.name.padEnd(24)} ${fresh.length} existing filing(s) recorded as the baseline`);
+    } else {
+      log(`  ${c.name.padEnd(24)} no new filings${mentions ? `  (${mentions} mention${mentions === 1 ? "" : "s"} by others)` : ""}`);
+    }
+    if (!DRY_RUN) state.seen[c.id] = [...seen, ...real.map((h) => h.id)];
+    await new Promise((r) => setTimeout(r, 1100)); // SEC rate-limit courtesy
+  }
+
+  if (!DRY_RUN) {
+    state.last_run = now;
+    try { fs.writeFileSync(STATE, JSON.stringify(state, null, 2)); }
+    catch (e) { console.error(`  (warning: could not write state: ${e.message})`); }
+  }
+
+  // Alert only on a company becoming the filer of a going-public form — rare
+  // enough that every one deserves a ping.
+  for (const f of findings) {
+    const forms = f.filings.map((x) => x.form || "filing").join(", ");
+    await notify(
+      `⚑ ${f.company} just filed ${forms} with the SEC — the first hard signal it is going public. ` +
+      `Bucket: ${String(f.bucket || "").replace(/_/g, " ")} on the ${CFG.label}. Worth a look before it prices.`
+    );
+  }
+
+  if (JSON_OUT) console.log(JSON.stringify({ as_of: now, findings, errors, skipped, tracked: wl.companies.length }, null, 2));
+  else {
+    log(`\n  ${wl.companies.length} tracked · ${findings.length} new filing signal(s) · ${skipped.length} outside EDGAR${errors.length ? ` · ${errors.length} check(s) failed` : ""}`);
+    if (!findings.length) log("  (nothing filed — the expected result most weeks)");
+  }
+}
+
+module.exports = { isFiler, SIGNAL_FORMS, main };
+
+function cli() {
+  main().catch((e) => {
+    console.error(`filing-watch: ${e && e.message ? e.message : e}`);
+    process.exit(1);
+  });
+}
+module.exports.cli = cli;
+
+if (require.main === module) cli();

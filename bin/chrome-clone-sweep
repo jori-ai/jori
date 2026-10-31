@@ -1,0 +1,108 @@
+#!/usr/bin/env python3
+"""chrome-clone-sweep — delete Chrome code-sign clones left behind by dead Chromes.
+
+WHY. On macOS every Chrome browser process, at launch, makes an APFS clone of
+its whole app bundle under $TMPDIR/../X/com.google.Chrome.code_sign_clone/
+(~2 GB as `du` counts it). It deletes that clone only on a graceful quit
+(a user Quit, or CDP `Browser.close`). Any signal — SIGTERM from launchd
+stopping/restarting a KeepAlive agent, SIGKILL from a job's `finally`, a
+crash, a reboot — leaves the clone behind forever (tested on the mini,
+2026-10-31, Chrome 156). Once Chrome auto-updates, every clone of the old
+version pins that version's blocks, so a box that launches automation Chromes
+all day accumulates hundreds of them: 196 clones / 387 GB (du) on the mini by
+2026-10-31, the "snapshots" eating the disk.
+
+WHAT. A clone belongs to a running Chrome iff it was created when that Chrome's
+browser process started (the clone is made in the first moments of launch; no
+process keeps a file open inside it, so lsof cannot tell). Keep every clone
+born within [start - 10 s, start + 5 min] of a running browser process, and
+any clone younger than --min-age (a Chrome still starting up); delete the rest.
+
+Usage: chrome-clone-sweep [--dry-run] [--min-age SECONDS] [--quiet]
+Exit 0 always unless the arguments are bad; prints one summary line.
+"""
+import argparse
+import os
+import shutil
+import subprocess
+import sys
+import time
+
+CHROME_EXE_SUFFIX = "Google Chrome.app/Contents/MacOS/Google Chrome"
+
+
+def clone_root():
+    try:
+        tmp = subprocess.run(["getconf", "DARWIN_USER_TEMP_DIR"], capture_output=True,
+                             text=True, timeout=10).stdout.strip()
+    except Exception:
+        tmp = ""
+    tmp = tmp or os.environ.get("TMPDIR", "")
+    if not tmp:
+        return None
+    return os.path.join(os.path.dirname(tmp.rstrip("/")), "X", "com.google.Chrome.code_sign_clone")
+
+
+def chrome_start_times():
+    """Start epochs of running Chrome *browser* processes (not helpers)."""
+    out = subprocess.run(["ps", "-axww", "-o", "lstart=,command="], capture_output=True, text=True,
+                         timeout=20, env={**os.environ, "LC_ALL": "C"}).stdout
+    starts = []
+    for line in out.splitlines():
+        # lstart is a fixed 24-char field: "Sat Oct 31 07:01:02 2026"
+        lstart, cmd = line[:24], line[24:].strip()
+        exe = cmd.split(" --", 1)[0].strip()
+        if not exe.endswith(CHROME_EXE_SUFFIX):
+            continue
+        try:
+            starts.append(time.mktime(time.strptime(" ".join(lstart.split()), "%a %b %d %H:%M:%S %Y")))
+        except ValueError:
+            continue
+    return starts
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--min-age", type=int, default=900, help="never touch a clone younger than this (s)")
+    ap.add_argument("--quiet", action="store_true", help="print nothing when nothing was removed")
+    a = ap.parse_args()
+
+    root = clone_root()
+    if not root or not os.path.isdir(root):
+        if not a.quiet:
+            print("chrome-clone-sweep: no clone directory")
+        return 0
+    starts = chrome_start_times()
+    now = time.time()
+    kept = removed = failed = 0
+    for name in sorted(os.listdir(root)):
+        if not name.startswith("code_sign_clone."):
+            continue
+        p = os.path.join(root, name)
+        try:
+            st = os.lstat(p)
+        except OSError:
+            continue
+        born = getattr(st, "st_birthtime", st.st_mtime)
+        if now - born < a.min_age or any(s - 10 <= born <= s + 300 for s in starts):
+            kept += 1
+            continue
+        if a.dry_run:
+            removed += 1
+            continue
+        try:
+            shutil.rmtree(p)
+            removed += 1
+        except Exception as e:
+            failed += 1
+            print(f"chrome-clone-sweep: could not remove {p}: {e}", file=sys.stderr)
+    if removed or failed or not a.quiet:
+        verb = "would remove" if a.dry_run else "removed"
+        print(f"chrome-clone-sweep: {verb} {removed} orphaned clone(s), kept {kept}"
+              f" ({len(starts)} Chrome browser process(es) running)" + (f", {failed} failed" if failed else ""))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

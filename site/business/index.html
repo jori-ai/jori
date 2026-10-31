@@ -14,8 +14,9 @@
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,600&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400&display=swap" rel="stylesheet">
 <style>
-  :root { --bg:#f4efe6; --ink:#141414; --muted:#5e5a52; --line:#d9d1c3; --accent:#c2410c; --us:#f6e3d3; --yes:#1f7a4d; --no:#a3473a; }
-  @media (prefers-color-scheme: dark) { :root { --bg:#121110; --ink:#f1ece3; --muted:#a39d92; --line:#2c2925; --accent:#fb923c; --us:#2a1d14; --yes:#5fc28f; --no:#e08a7c; } }
+  /* Palettes: life = red, work = blue, neutral when a page speaks to both. Each page maps its accent to one. */
+  :root { --bg:#f4efe6; --ink:#141414; --muted:#5e5a52; --line:#d9d1c3; --life:#b42318; --life-tint:#f7e2de; --work:#1d4ed8; --work-tint:#e1e7f4; --neutral:#57534e; --neutral-tint:#ebe4d8; --accent:var(--work); --us:var(--work-tint); --yes:#1f7a4d; --no:#a3473a; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#121110; --ink:#f1ece3; --muted:#a39d92; --line:#2c2925; --life:#f87171; --life-tint:#2d1716; --work:#7aa2f7; --work-tint:#151f36; --neutral:#d6d0c4; --neutral-tint:#24211d; --yes:#5fc28f; --no:#e08a7c; } }
   * { box-sizing:border-box; margin:0; }
   body { background:var(--bg); color:var(--ink); font:16px/1.6 Inter, system-ui, sans-serif; }
   .wrap { width:100%; max-width:1080px; margin:0 auto; padding:0 24px; }
@@ -75,7 +76,7 @@
   .nav .brand img { width:30px; height:30px; }
   .nav .seg { display:flex; gap:4px; background:var(--us); border-radius:999px; padding:4px; }
   .nav .seg a { color:var(--muted); text-decoration:none; font-size:14px; font-weight:500; padding:6px 14px; border-radius:999px; }
-  .nav .seg a[aria-current="page"] { background:var(--ink); color:var(--bg); }
+  .nav .seg a[aria-current="page"] { background:var(--accent); color:var(--bg); }
   .nav .gh { color:var(--muted); font-size:14px; text-decoration:none; }
   @media (max-width:560px) { .nav .gh { display:none; } }
 </style>
@@ -209,96 +210,96 @@
         <tbody>
           <tr>
             <th>Inbox triage<span class="d">Sorts every email as it lands into urgent, today and later, using rules it learns from you. Urgent mail reaches you at once and becomes a task that closes itself when you reply. Spam and phishing are blocked, unknown senders held, and it suggests better rules from your corrections every week.</span></th>
-            <td class="us y">Learned priorities, auto-closing tasks<sup>*</sup></td><td class="p">Outlook agent (preview)</td><td class="p">Gmail AI Inbox (US, English)</td><td class="p">Gmail triggers; triage is DIY</td>
+            <td class="us y">Learned priorities, auto-closing tasks</td><td class="p">Outlook agent (preview)</td><td class="p">Gmail AI Inbox (US, English)</td><td class="p">Gmail triggers; triage is DIY</td>
           </tr>
           <tr>
             <th>Customer &amp; vendor email<span class="d">Flags what needs an answer, chases threads that went quiet, and drafts or sends replies when you say so, always introducing itself as your assistant.</span></th>
-            <td class="us y">Follow-ups chased, replies on your say<sup>*</sup></td><td class="p">Drafts replies; you send</td><td class="p">Drafts; follow-ups need workflows</td><td class="p">Possible via skill; DIY</td>
+            <td class="us y">Follow-ups chased, replies on your say</td><td class="p">Drafts replies; you send</td><td class="p">Drafts; follow-ups need workflows</td><td class="p">Possible via skill; DIY</td>
           </tr>
           <tr>
             <th>Calendar &amp; scheduling<span class="d">"Find an hour with the Acme team next week." Creates, moves and declines events from a sentence, warns about conflicts, never invites anyone unless you ask, and audits daily for invites it can't account for.</span></th>
-            <td class="us y">Create, move, decline; conflict checks<sup>*</sup></td><td class="y">Schedules, reschedules, conflicts</td><td class="y">Help me schedule</td><td class="p">Google Calendar via skill</td>
+            <td class="us y">Create, move, decline; conflict checks</td><td class="y">Schedules, reschedules, conflicts</td><td class="y">Help me schedule</td><td class="p">Google Calendar via skill</td>
           </tr>
           <tr>
             <th>Meetings<span class="d">Built-in Zoom integration: agendas sent ahead, and a summary with decisions and next steps for everyone on the call the moment it ends, filed to each person's page. Owners get reminded until each next step is done.</span></th>
-            <td class="us y">Zoom built in: summaries, next steps chased<sup>*</sup></td><td class="y">Agenda, notes, action items</td><td class="y">Meet notes with next steps</td><td class="p">Meeting plugins: notes, summary</td>
+            <td class="us y">Zoom built in: summaries, next steps chased</td><td class="y">Agenda, notes, action items</td><td class="y">Meet notes with next steps</td><td class="p">Meeting plugins: notes, summary</td>
           </tr>
           <tr>
             <th>Works where your team works<span class="d">Its own iPhone, iPad and Mac app, email to its own address, WhatsApp and iMessage. When it writes to customers or vendors, it always says it's an assistant.</span></th>
-            <td class="us y">Own app, email, WhatsApp, iMessage<sup>*</sup></td><td class="p">Teams, Outlook, web, mobile; no Slack</td><td class="y">Slack, Teams, web, mobile</td><td class="y">Slack, Teams, web, mobile + more</td>
+            <td class="us y">Own app, email, WhatsApp, iMessage</td><td class="p">Teams, Outlook, web, mobile; no Slack</td><td class="y">Slack, Teams, web, mobile</td><td class="y">Slack, Teams, web, mobile + more</td>
           </tr>
           <tr>
             <th>Daily brief &amp; digests<span class="d">A morning brief: today's meetings, open tasks and what changed overnight. One daily digest for all your newsletters, plus weekly and monthly reviews by email.</span></th>
-            <td class="us y">Morning brief, digests, weekly reviews<sup>*</sup></td><td class="p">Scheduled prompts, catch-ups</td><td class="p">Daily Brief rolling out</td><td class="y">Scheduled briefs via automations</td>
+            <td class="us y">Morning brief, digests, weekly reviews</td><td class="p">Scheduled prompts, catch-ups</td><td class="p">Daily Brief rolling out</td><td class="y">Scheduled briefs via automations</td>
           </tr>
           <tr>
             <th>"Tell me when…" watches<span class="d">Any condition becomes a watch: when a contract comes back signed, two days before a renewal, when a big customer goes quiet, at 9 tomorrow. It judges each match and asks when unsure.</span></th>
-            <td class="us y">Email, deadline or timed; can act<sup>*</sup></td><td class="p">Studio triggers; you build them</td><td class="p">Workflow triggers, reminders</td><td class="y">Reminders, cron, webhook triggers</td>
+            <td class="us y">Email, deadline or timed; can act</td><td class="p">Studio triggers; you build them</td><td class="p">Workflow triggers, reminders</td><td class="y">Reminders, cron, webhook triggers</td>
           </tr>
           <tr>
             <th>Business travel<span class="d">Searches live fares, Google Flights and Hotels and Booking.com, and books once you approve. Every confirmation, change and cancellation in your email lands in one itinerary and your calendar, and flights are tracked live.</span></th>
-            <td class="us y">Search &amp; book with approval; live itinerary<sup>*</sup></td><td class="n">Trip research only, no booking</td><td class="n">Not offered</td><td class="u">Not documented</td>
+            <td class="us y">Search &amp; book with approval; live itinerary</td><td class="n">Trip research only, no booking</td><td class="n">Not offered</td><td class="u">Not documented</td>
           </tr>
           <tr>
             <th>Expenses &amp; receipts<span class="d">Turns receipt emails into vendor, amount and card, recovers what each charge actually bought, and files contractor quotes and invoices.</span></th>
-            <td class="us y">Receipts parsed, charges explained<sup>*</sup></td><td class="p">Dynamics 365 add-on</td><td class="n">Not built in</td><td class="p">Community receipt skill</td>
+            <td class="us y">Receipts parsed, charges explained</td><td class="p">Dynamics 365 add-on</td><td class="n">Not built in</td><td class="p">Community receipt skill</td>
           </tr>
           <tr>
             <th>Finance ops<span class="d">Balances and transactions across your banks and cards, with alerts on late payments in, fees, overdraft risk, unusual or duplicate charges and subscription creep, plus a weekly review where every number is checked against the data. Read-only: it never moves money.</span></th>
-            <td class="us y">Spend alerts, verified weekly review<sup>*</sup></td><td class="p">Dynamics 365 add-on</td><td class="n">Not built in</td><td class="u">Not documented</td>
+            <td class="us y">Spend alerts, verified weekly review</td><td class="p">Dynamics 365 add-on</td><td class="n">Not built in</td><td class="u">Not documented</td>
           </tr>
           <tr>
             <th>Sales follow-up<span class="d">Every promise in an email becomes a follow-up, quiet threads get nudged, and its built-in CRM keeps itself current from your email and calls, so no one types anything in.</span></th>
-            <td class="us y">Follow-ups, built-in CRM<sup>*</sup></td><td class="y">Sales agent with your CRM</td><td class="p">Salesforce connector; DIY</td><td class="p">Community CRM skills</td>
+            <td class="us y">Follow-ups, built-in CRM</td><td class="y">Sales agent with your CRM</td><td class="p">Salesforce connector; DIY</td><td class="p">Community CRM skills</td>
           </tr>
           <tr>
             <th>Reports<span class="d">Briefs, digests and weekly and monthly reviews, pulled from your tools, checked against the data and sent on schedule.</span></th>
-            <td class="us y">Scheduled, verified reports<sup>*</sup></td><td class="p">Scheduled prompts, Analyst</td><td class="p">Scheduled workflows, data agent</td><td class="p">Team reports plugin; else DIY</td>
+            <td class="us y">Scheduled, verified reports</td><td class="p">Scheduled prompts, Analyst</td><td class="p">Scheduled workflows, data agent</td><td class="p">Team reports plugin; else DIY</td>
           </tr>
           <tr>
             <th>Company memory<span class="d">A living wiki of customers, vendors, decisions and how things are done here, with recall across all of it ("what did we promise Acme in March?"). Every fact is checked for contradictions before it's saved.</span></th>
-            <td class="us y">Company wiki with recall<sup>*</sup></td><td class="y">Copilot Memory + Work IQ</td><td class="y">Memories + indexed company data</td><td class="y">Persistent memory with search</td>
+            <td class="us y">Company wiki with recall</td><td class="y">Copilot Memory + Work IQ</td><td class="y">Memories + indexed company data</td><td class="y">Persistent memory with search</td>
           </tr>
           <tr>
             <th>Search everything<span class="d">One search across email, chats, docs, files and its own activity log.</span></th>
-            <td class="us y">Email, chats, docs, its own log<sup>*</sup></td><td class="y">Copilot Search + connectors</td><td class="y">Core feature, many connectors</td><td class="p">Its own memory only</td>
+            <td class="us y">Email, chats, docs, its own log</td><td class="y">Copilot Search + connectors</td><td class="y">Core feature, many connectors</td><td class="p">Its own memory only</td>
           </tr>
           <tr>
             <th>People &amp; accounts<span class="d">A built-in CRM: a page for every customer, vendor and contact, built from your email and meetings: who they are, what was discussed and what's open.</span></th>
-            <td class="us y">Built-in CRM: a page per contact<sup>*</sup></td><td class="p">Summaries on request, no pages</td><td class="u">Not documented</td><td class="p">Memory-wiki entity pages</td>
+            <td class="us y">Built-in CRM: a page per contact</td><td class="p">Summaries on request, no pages</td><td class="u">Not documented</td><td class="p">Memory-wiki entity pages</td>
           </tr>
           <tr>
             <th>Documents &amp; research<span class="d">Research, summaries and drafts; reads PDFs and contracts; creates and edits Word, Excel and slides; hands long work to background agents.</span></th>
-            <td class="us y">Research, contracts, Office files<sup>*</sup></td><td class="y">Researcher, Analyst, Office</td><td class="y">Deep Research, NotebookLM</td><td class="y">Web search, PDFs, sub-agents</td>
+            <td class="us y">Research, contracts, Office files</td><td class="y">Researcher, Analyst, Office</td><td class="y">Deep Research, NotebookLM</td><td class="y">Web search, PDFs, sub-agents</td>
           </tr>
           <tr>
             <th>Works your web apps<span class="d">Uses the tools your team is already signed in to, even ones with no integration, and fixes a broken step the same day.</span></th>
-            <td class="us y">Signed-in web apps, same-day repair<sup>*</sup></td><td class="p">Computer use in Studio (credits)</td><td class="p">Agent in private preview</td><td class="y">Built-in browser, signed-in Chrome</td>
+            <td class="us y">Signed-in web apps, same-day repair</td><td class="p">Computer use in Studio (credits)</td><td class="p">Agent in private preview</td><td class="y">Built-in browser, signed-in Chrome</td>
           </tr>
           <tr>
             <th>Operations<span class="d">Watches your devices, services, API keys, app builds and deadlines around the clock, and tells you before anyone else notices.</span></th>
-            <td class="us y">24/7 checks, early warnings<sup>*</sup></td><td class="n">Not built in</td><td class="n">Not offered</td><td class="p">DIY via automations</td>
+            <td class="us y">24/7 checks, early warnings</td><td class="n">Not built in</td><td class="n">Not offered</td><td class="p">DIY via automations</td>
           </tr>
           <tr>
             <th>Security watch<span class="d">Checks security news, breaches and vulnerable packages against the services and code your company actually uses, and sends a weekly summary.</span></th>
-            <td class="us y">Breaches + CVEs vs what you use<sup>*</sup></td><td class="p">Separate product (Security Copilot)</td><td class="n">Separate product (SecOps)</td><td class="u">Not documented</td>
+            <td class="us y">Breaches + CVEs vs what you use</td><td class="p">Separate product (Security Copilot)</td><td class="n">Separate product (SecOps)</td><td class="u">Not documented</td>
           </tr>
           <tr>
             <th>Improves itself<span class="d">Reviews its own week, finds the root cause of every failure overnight, watches its own costs and proposes upgrades for a person to approve.</span></th>
-            <td class="us y">Nightly root-cause, weekly self-review<sup>*</sup></td><td class="n">Maker-run evaluations only</td><td class="u">Not documented</td><td class="p">Learns procedures; no root-cause</td>
+            <td class="us y">Nightly root-cause, weekly self-review</td><td class="n">Maker-run evaluations only</td><td class="u">Not documented</td><td class="p">Learns procedures; no root-cause</td>
           </tr>
           <tr>
             <th>Build new abilities<span class="d">New jobs are plain-language playbooks; new tools drop into your own folders; or ask in chat ("build me X") and it builds, tests and ships it for your approval.</span></th>
-            <td class="us y">Playbooks, "build me X" from chat<sup>*</sup></td><td class="y">Copilot Studio, Agent Builder</td><td class="y">Workflow Builder, ADK</td><td class="y">Skills, plugin SDK, ClawHub</td>
+            <td class="us y">Playbooks, "build me X" from chat</td><td class="y">Copilot Studio, Agent Builder</td><td class="y">Workflow Builder, ADK</td><td class="y">Skills, plugin SDK, ClawHub</td>
           </tr>
           <tr>
             <th>Asks before risky actions<span class="d">Paying, buying, booking or writing to someone new waits for a person's approval.</span></th>
-            <td class="us y">Human approval on anything risky<sup>*</sup></td><td class="y">Tool-call approvals</td><td class="y">Review before acting for you</td><td class="p">Exec and plugin approvals</td>
+            <td class="us y">Human approval on anything risky</td><td class="y">Tool-call approvals</td><td class="y">Review before acting for you</td><td class="p">Exec and plugin approvals</td>
           </tr>
         </tbody>
       </table>
     </div>
-    <p class="note"><sup>*</sup>Running today on the reference installation; landing in the open-source repo shortly. Competitor cells are from each product's own docs, announcements and press as of October 2026, including features still in preview. "Not documented" means we found no public source, not that it can't; "Not built in" and "Not offered" mean we found no such feature.</p>
+    <p class="note">Competitor cells are from each product's own docs, announcements and press as of October 2026, including features still in preview. "Not documented" means we found no public source, not that it can't; "Not built in" and "Not offered" mean we found no such feature.</p>
   </section>
 
   <footer>

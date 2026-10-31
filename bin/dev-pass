@@ -1,0 +1,95 @@
+#!/usr/bin/env bash
+# dev-pass <domain> [--stdout|--user|--field FIELD] [--json]
+#
+# Fetches a website credential from the 1Password "Dev" vault using the
+# service-account token in $OP_SERVICE_ACCOUNT_TOKEN. Non-interactive —
+# never prompts for biometric or master password.
+#
+# Vault: JORI_OP_DEV_VAULT (default "Dev"), the agent's own credentials vault.
+# Item naming convention: title = "site:<domain>" (e.g. "site:example.com")
+#                         tags  = "site-credential" (+ optional service tag)
+#                         fields= username, password, notes
+#
+# Default output: password on clipboard (auto-clears in 30s via pbcopy reset).
+#   --stdout         print password to stdout, then auto-clear clipboard
+#   --user           print username to stdout
+#   --field NAME     print named field to stdout (e.g. notes, totp)
+#   --json           dump the full item (no secrets in the title/labels) as JSON
+#
+# Refuses domains on the financial denylist — those still go through
+# apple-pass (manual approval) by policy.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+source "$SCRIPT_DIR/../agent/scripts/lib/root.sh"
+source "$SCRIPT_DIR/../agent/scripts/lib/credential-denylist.sh"
+DEV_VAULT="${JORI_OP_DEV_VAULT:-Dev}"
+
+DOMAIN="${1:-}"
+shift || true
+
+MODE="clipboard"
+FIELD="password"
+case "${1:-}" in
+  --stdout)         MODE="stdout"; FIELD="password" ;;
+  --user)           MODE="stdout"; FIELD="username" ;;
+  --field)          MODE="stdout"; FIELD="${2:-password}" ;;
+  --json)           MODE="json" ;;
+  "" )              ;;
+  *) echo "dev-pass: unknown flag '${1:-}'" >&2; exit 64 ;;
+esac
+
+if [[ -z "$DOMAIN" ]]; then
+  cat >&2 <<USAGE
+usage: dev-pass <domain> [--stdout|--user|--field NAME|--json]
+
+  domain   short domain key, e.g. 'example.com'. Resolves to 1P item
+           titled 'site:<domain>' in the agent's credentials vault.
+
+Examples:
+  dev-pass example.com               # password to clipboard
+  PW=\$(dev-pass example.com --stdout)
+  USER=\$(dev-pass example.com --user)
+  dev-pass example.com --field totp
+USAGE
+  exit 64
+fi
+
+# --- financial denylist: these still require manual approval via apple-pass ---
+if jori_financial_domain "$DOMAIN"; then
+  echo "dev-pass: '$DOMAIN' is on the financial denylist — use apple-pass instead (manual approval required)." >&2
+  exit 77
+fi
+
+if [[ -z "${OP_SERVICE_ACCOUNT_TOKEN:-}" ]]; then
+  echo "dev-pass: OP_SERVICE_ACCOUNT_TOKEN is not set; cannot read the 1Password $DEV_VAULT vault." >&2
+  exit 78
+fi
+
+ITEM="site:${DOMAIN}"
+
+if [[ "$MODE" == "json" ]]; then
+  op item get "$ITEM" --vault="$DEV_VAULT" --format=json
+  exit 0
+fi
+
+VAL="$(op read "op://${DEV_VAULT}/${ITEM}/${FIELD}" 2>/dev/null || true)" # kernel-guard-ok: the reference is built from the configured vault; no vault is spelled
+if [[ -z "$VAL" ]]; then
+  echo "dev-pass: no value for field '${FIELD}' on item '${ITEM}' in the ${DEV_VAULT} vault." >&2
+  echo "          create with: op item create --vault=${DEV_VAULT} --category=Login --title='${ITEM}' \\" >&2
+  echo "                          --tags='site-credential' \\" >&2
+  echo "                          username='<user>' password='<pw>'" >&2
+  exit 1
+fi
+
+case "$MODE" in
+  stdout)
+    printf '%s' "$VAL"
+    ;;
+  clipboard)
+    printf '%s' "$VAL" | pbcopy
+    LEN=${#VAL}
+    echo "dev-pass: ${LEN}-char ${FIELD} for '${DOMAIN}' on clipboard" >&2
+    ;;
+esac

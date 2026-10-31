@@ -140,6 +140,13 @@ CAPTURE_ID_FILE=""
 SKIP_PRECHECK=false
 EVIDENCE_AS_OF=""
 INTENT=""
+# --question / --location-question: this message is a question. See "Question
+# routing" below; most question senders are recognised from their intent or hum
+# context and never need the flag.
+IS_QUESTION=false
+IS_LOCATION_QUESTION=false
+# Set by question routing for a location question: the push is time-sensitive.
+URGENT_PUSH=false
 # The verbatim captured error text behind a message that asserts a specific
 # technical failure mechanism — see the mechanism-attestation gate below.
 OBSERVED_ERROR=""
@@ -183,6 +190,8 @@ while [[ $# -gt 0 ]]; do
     --intent)         INTENT="$2"; shift 2 ;;
     --agent)          AGENT="$2"; shift 2 ;;
     --channel)        CHANNEL="$2"; shift 2 ;;
+    --question)       IS_QUESTION=true; shift ;;
+    --location-question) IS_QUESTION=true; IS_LOCATION_QUESTION=true; shift ;;
     # Event geo-gate (see the block below): the city and date of the dated,
     # place-bound event this message recommends. Both are required together.
     --event-city)     EVENT_CITY="$2"; shift 2 ;;
@@ -216,7 +225,7 @@ set -- "${POSITIONAL[@]}"
 for arg in "$@"; do
   if [[ "$arg" == --* ]]; then
     echo "FATAL: unknown flag: $arg" >&2
-    echo "jori-send-curl accepts: --no-push, --push, --keep-in-tab, --push-body, --media, --choices-json, --metadata-json, --capture-id, --suppress-hook, --skip-precheck, --intent, --evidence-as-of, --observed-error, --hum-context, --agent, --channel, --event-city, --event-date, --event-artist, --p1-message" >&2
+    echo "jori-send-curl accepts: --no-push, --push, --keep-in-tab, --push-body, --media, --choices-json, --metadata-json, --capture-id, --suppress-hook, --skip-precheck, --intent, --evidence-as-of, --observed-error, --hum-context, --agent, --channel, --question, --location-question, --event-city, --event-date, --event-artist, --p1-message" >&2
     echo "Message body goes via \$1 (inline) or stdin (pipe). For long/multi-line: cat file.txt | jori-send-curl ..." >&2
     exit 2
   fi
@@ -228,7 +237,7 @@ elif [ ! -t 0 ]; then
   MESSAGE=$(cat)
 fi
 if [ -z "$MESSAGE" ]; then
-  echo "Usage: jori-send-curl [--no-push] [--push] [--keep-in-tab] [--push-body <text>] [--skip-precheck] [--intent <topic>] [--evidence-as-of <iso|live>] [--observed-error <verbatim captured output>] [--agent ops|chat|infra] [--channel chat|system|improvements] [--event-city <metro> --event-date <YYYY-MM-DD> [--event-artist <name>]] [--p1-message <gmail messageId>] <message>" >&2
+  echo "Usage: jori-send-curl [--no-push] [--push] [--keep-in-tab] [--push-body <text>] [--skip-precheck] [--intent <topic>] [--evidence-as-of <iso|live>] [--observed-error <verbatim captured output>] [--agent ops|chat|infra] [--channel chat|system|improvements|questions] [--question|--location-question] [--event-city <metro> --event-date <YYYY-MM-DD> [--event-artist <name>]] [--p1-message <gmail messageId>] <message>" >&2
   exit 1
 fi
 
@@ -899,6 +908,50 @@ if [ "$CHANNEL" = "system" ] && [ "$FORCE_PUSH" = false ] && [ "$KEEP_IN_TAB" = 
   esac
 fi
 
+# ─── Question routing (chat → questions channel) ─────────────────────────
+# The user (2026-10-29): non-urgent questions go to their own channel; urgent
+# ones stay in chat; location questions are always urgent and arrive at once.
+# AFTER every gate above (precheck, resolve-first, freshness) has decided the
+# message goes out at all, bin/question-route decides where. A message is a
+# question by structure only: --question, an intent ending `:question` or
+# `:ask`, or hum context whose finding is a question candidate. Then:
+#   location question → stays in chat, pushed time-sensitive (URGENT_PUSH), so
+#                       the motion gate does not park it.
+#   other question    → Jev site `question-urgency`: urgent stays in chat as
+#                       before; otherwise CHANNEL=questions and no push (the row
+#                       waits in the Questions tab, which badges in the app).
+# Chat channel only. FAILS OPEN to chat: a missing router, an error or a
+# timeout leaves the message exactly where it was going. Not run in a test run
+# unless JORI_QUESTION_ROUTE_BIN names a stand-in. Off switch:
+# data/.questions-channel-off (judged questions stay in chat; location
+# questions are still pushed time-sensitive).
+QUESTION_ROUTE="${JORI_QUESTION_ROUTE_BIN:-$JORI_INSTALL_TOOLS/bin/question-route}"
+if [ "$CHANNEL" = "chat" ] && [ -f "$QUESTION_ROUTE" ] \
+   && { [ "$TEST_RUN" = false ] || [ -n "${JORI_QUESTION_ROUTE_BIN:-}" ]; }; then
+  QR_ARGS=(--intent "${INTENT:-}")
+  [ -n "${HUM_CONTEXT_FILE:-}" ] && [ -f "$HUM_CONTEXT_FILE" ] && QR_ARGS+=(--hum-context "$HUM_CONTEXT_FILE")
+  [ "$IS_QUESTION" = true ] && QR_ARGS+=(--question)
+  [ "$IS_LOCATION_QUESTION" = true ] && QR_ARGS+=(--location)
+  QR_OUT=$(printf '%s' "$MESSAGE" | node "$QUESTION_ROUTE" "${QR_ARGS[@]}" 2>/dev/null)
+  QR_FIELDS=$(printf '%s' "$QR_OUT" | python3 -c 'import json,sys
+try:
+  r=json.load(sys.stdin); print(r.get("channel","chat"), "true" if r.get("urgent") else "false")
+except Exception: print("chat false")' 2>/dev/null)
+  QR_CHANNEL="${QR_FIELDS%% *}"
+  QR_URGENT="${QR_FIELDS##* }"
+  # Where it went, for a caller that captures the id (hum-ask: a question in the
+  # Questions tab does not hold hum's single pending-question slot).
+  if [ -n "$CAPTURE_ID_FILE" ] && [ -n "$QR_OUT" ]; then
+    printf '%s\n' "$QR_OUT" > "${CAPTURE_ID_FILE}.route" 2>/dev/null
+  fi
+  if [ "$QR_CHANNEL" = "questions" ]; then
+    CHANNEL="questions"
+    [ "$FORCE_PUSH" = false ] && NO_PUSH=true
+  elif [ "$QR_URGENT" = "true" ]; then
+    URGENT_PUSH=true
+  fi
+fi
+
 # ─── P1 push fold ─────────────────────────────────────────────────────────
 # Two P1 pings seconds apart about one email: it was triaged twice (the
 # watchdog's stuck-unread RECLASSIFY and the delayed Gmail push dispatch), and
@@ -1007,7 +1060,7 @@ _spool_append() {
 }
 
 # metadata.choices is a JSON STRING (the client decodes metadata as
-# [String: String] — see client/Jori/ChoicePrompt.swift), so the payload is
+# [String: String] — see apps/companion/Jori/ChoicePrompt.swift), so the payload is
 # encoded twice: once as the object, once as the string that carries it.
 JSON_METADATA=""
 if [ -n "${CHOICES_JSON:-}" ] || [ -n "${EXTRA_METADATA_JSON:-}" ]; then
@@ -1085,12 +1138,14 @@ except Exception:
   if [ "$NO_PUSH" = false ] && [ -x "$NOTIFY" ]; then
     # Use custom push body if provided, otherwise truncate message.
     # Pass --channel so system/infra alerts never touch the app icon badge.
+    NOTIFY_ARGS=(--channel "$CHANNEL")
+    [ "$URGENT_PUSH" = true ] && NOTIFY_ARGS+=(--urgent)
     if [ -n "$PUSH_BODY" ]; then
-      "$NOTIFY" --channel "$CHANNEL" "$PUSH_BODY" > /dev/null 2>&1 &
+      "$NOTIFY" "${NOTIFY_ARGS[@]}" "$PUSH_BODY" > /dev/null 2>&1 &
     else
       TRUNCATED=$(printf '%s' "$PUSH_TEXT" | head -c 100)
       [ ${#PUSH_TEXT} -gt 100 ] && TRUNCATED="${TRUNCATED}..."
-      "$NOTIFY" --channel "$CHANNEL" "$TRUNCATED" > /dev/null 2>&1 &
+      "$NOTIFY" "${NOTIFY_ARGS[@]}" "$TRUNCATED" > /dev/null 2>&1 &
     fi
   fi
 

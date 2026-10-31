@@ -1,0 +1,107 @@
+#!/usr/bin/env node
+// decision-ask — send ONE waiting decision to the user as a tappable card.
+//
+// Called by the hum turn (jobs/hum.md Step 4, `decisions` lane) when the
+// decisions candidate wins; never composed by hand. The card is built from the
+// source entry (lib/decision-queue.mjs): a short header chip, the bold
+// question, numbered options with a grey one-line description, the recommended
+// option first and marked "(Recommended)", and a free-text "Type something".
+//
+//   decision-ask --ref <ref> [--dry-run]   send it (or print the card)
+//   decision-ask --next [--dry-run]         the lane's pick right now
+//   decision-ask --list                     every open decision, in order
+//
+// Exit: 0 sent (or printed) · 5 nothing to send (unknown/answered ref, already
+// one today) · 6 the outbound precheck held it (nothing recorded) · 3 send failed.
+//
+// Sends through jori-send-curl (outbound precheck, push + motion gate),
+// with intent `decision:ask` — deliberately NOT a `hum:` intent: the
+// resolve-first gate exists to answer questions from Jori's records, and
+// these are the user's own judgment calls by construction. Counts one send
+// against the question pool (lib/question-pacing.mjs) once it lands.
+
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { spawnSync } from "node:child_process";
+import { createRequire } from "node:module";
+import {
+  loadOpen, orderDecisions, nextDecision, findDecision, buildCard, renderDecision, groupOf,
+  readLane, writeLane, hashQuestion,
+} from "../lib/decision-queue.mjs";
+import { userTz } from "../lib/hum-events.mjs";
+import { recordQuestionSend, currentScale } from "../lib/question-pacing.mjs";
+
+const BIN = createRequire(import.meta.url)("../lib/root.cjs").installTools("bin");
+const arg = (n) => { const i = process.argv.indexOf(`--${n}`); return i >= 0 ? process.argv[i + 1] : null; };
+const has = (n) => process.argv.includes(`--${n}`);
+
+async function main() {
+  const items = loadOpen();
+  if (has("list")) {
+    const lane = readLane();
+    for (const it of orderDecisions(items)) {
+      const asked = (lane.asked || []).filter((a) => a.ref === it.ref).map((a) => a.at).pop();
+      console.log(`${it.ref.padEnd(40)} ${it.source.padEnd(11)} rank=${it.q.rank ?? "-"}${it.q.time_sensitive ? " TIME-SENSITIVE" : ""}${asked ? ` asked ${asked}` : ""}\n    ${String(it.q.question).slice(0, 140)}`);
+    }
+    console.log(`\n${items.length} open decision(s)`);
+    return 0;
+  }
+
+  let item = null;
+  if (has("next")) {
+    const r = nextDecision({ items, tz: userTz(), perDay: currentScale() });
+    if (!r.decision) { console.error(`decision-ask: ${r.reason}`); return 5; }
+    item = r.decision;
+  } else {
+    const ref = arg("ref");
+    if (!ref) { console.error("usage: decision-ask --ref <ref> [--dry-run] | --next [--dry-run] | --list"); return 2; }
+    item = findDecision(ref, items);
+    if (!item) { console.error(`decision-ask: ${ref} is not an open decision (answered, superseded or unknown)`); return 5; }
+    if (!has("dry-run")) {
+      const guard = nextDecision({ items, tz: userTz(), group: groupOf(item.source), perDay: currentScale() });
+      if (!guard.decision && guard.reason?.startsWith("already asked one today")) { console.error(`decision-ask: ${guard.reason}`); return 5; }
+    }
+  }
+
+  const lane = readLane();
+  const card = await buildCard(item, { lane });
+  const { choices, text } = renderDecision(item, card);
+
+  if (has("dry-run")) {
+    console.log(JSON.stringify({ ref: item.ref, text, choices }, null, 2));
+    return 0;
+  }
+
+  const capture = path.join(os.tmpdir(), `decision-ask-capture.${process.pid}`);
+  const r = spawnSync(path.join(BIN, "jori-send-curl"), [
+    "--capture-id", capture,
+    "--intent", "decision:ask",
+    "--choices-json", JSON.stringify(choices),
+    "--metadata-json", JSON.stringify({ decision_ref: item.ref }),
+    "--push-body", `Decision: ${card.header}`,
+    text,
+  ], { encoding: "utf8", timeout: 180_000 });
+  let captured = "";
+  try { captured = fs.readFileSync(capture, "utf8").trim(); fs.unlinkSync(capture); } catch {}
+  if (r.status !== 0) {
+    console.error(`decision-ask: send failed (exit ${r.status}): ${String(r.stderr || "").slice(0, 300)}`);
+    return 3;
+  }
+  if (!captured || captured.startsWith("{")) {
+    console.error(`decision-ask: held before sending (${captured || "no message id"}); nothing recorded`);
+    return 6;
+  }
+
+  // Record the ask (re-read: the card build may have taken a while).
+  const fresh = readLane();
+  fresh.asked = [...(fresh.asked || []), { ref: item.ref, at: new Date().toISOString(), message_id: captured, prompt_id: choices.id }].slice(-200);
+  fresh.cards = { ...(fresh.cards || {}), [item.ref]: { question_hash: hashQuestion(item.q), card, built_at: new Date().toISOString() } };
+  writeLane(fresh);
+  // A question: it counts against the question pool, not the shared ping budget.
+  recordQuestionSend({ lane: "decisions", id: item.ref });
+  console.log(JSON.stringify({ sent: true, ref: item.ref, message_id: captured }));
+  return 0;
+}
+
+main().then((c) => process.exit(c ?? 0), (e) => { console.error(`decision-ask: ${e?.message || e}`); process.exit(3); });

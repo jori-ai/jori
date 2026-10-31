@@ -1,0 +1,1834 @@
+#!/usr/bin/env python3
+"""day-path — build one day as a single continuous, time-ordered GPS path.
+
+Replaces the cluster-first view of a day (independent stop records, resolved in
+isolation) with a trace: every fix and visit ordered by time, connected, with
+gaps marked as explicitly interpolated rather than silently bridged.
+
+THE DAY WINDOW: a day is ALWAYS midnight to midnight in the ORIGIN timezone --
+the zone the user was in when the day began -- and runs exactly 24 hours. It
+does NOT re-anchor on a zone crossing mid-day; a westbound flight on the 3rd is
+still "the 3rd, 00:00-24:00 in the zone of departure". This file's HH:MM are
+in that origin zone; the daily summary then re-states each stop in the local
+zone of where it was (resolve-day applyPerStopTz; the old "clock never jumps
+mid-narrative" display rule was reversed).
+
+Segments are selected by OVERLAP with that window, not by arrived_at. A stay
+that begins at 22:00 the previous night and runs to 09:00 belongs to both days;
+filtering on arrived_at drops it from the second one entirely, which is how the
+Jul 29 summary lost its whole morning-at-home anchor.
+
+HOW THE DAY IS COMPOSED (2026-09-07). Fixes own geometry; visits own time.
+  1. fixes      dedupe, drop cell-tower accuracy unless nothing else saw the half hour
+  2. stays      runs of fixes within 60 m for >= 8 min are dwells in their own right
+  3. reconcile  a visit row stops the clock only where fixes within 150 m back it;
+                fixes > 400 m away clip it (or split it: he went out and came back);
+                a row no fix ever supports is listed as unsupported, drawn nowhere
+  4. waypoints  an address visit of < 5 min on a walk is the walk, not a stop
+  5. dwells     one place one identity; overlapping dwells: the lower-ranked yields,
+                and at equal rank the longer visit names and places the marker
+  6. legs       the fixes between consecutive dwells, anchored at the dwells' own points
+  7. holes      a jump past 400 m, 3x the leg's median step, or 2x its median speed
+                is unobserved: routed, but drawn dashed and never asserted
+  8. simplify   Douglas-Peucker at GPS accuracy, waypoints >= 100 m apart, then route
+  9. spine      dwell -> leg -> dwell -> ..., the one structure every reader walks
+A visit's coordinates never become a vertex of the line. That single rule is
+what a stale Sept-5 visit whose departed_at was written 35 h late exploited to
+draw a bridge from home to the theatre district on 2026-09-06.
+
+Usage:
+  day-path <YYYY-MM-DD> [--tz Europe/Paris] [--out FILE] [--json] [--spine]
+"""
+import argparse, json, math, os, re, subprocess, sys, tempfile, unicodedata, urllib.parse, urllib.request
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
+
+# This file's directory (a test that exec()s the file has no __file__: then the
+# test's own path, which sits beside bin/ as well).
+HERE = os.path.dirname(os.path.realpath(globals().get("__file__") or sys.argv[0]))
+sys.path.insert(0, os.path.join(HERE, "..", "lib"))
+import places_local  # noqa: E402
+
+REPO = places_local.install_root()
+ENV_FILE = os.path.join(REPO, ".env")
+TEMPLATE = os.path.join(HERE, "..", "lib", "day-path.template.html")
+
+
+def supabase_url():
+    """SUPABASE_URL, else https://<instance supabase_project>.supabase.co, else ""."""
+    if os.environ.get("SUPABASE_URL"):
+        return os.environ["SUPABASE_URL"].rstrip("/")
+    inst = places_local._read(os.path.join(places_local.local_dir(), "instance.json")) or {}
+    proj = os.environ.get("JORI_SUPABASE_PROJECT") or inst.get("supabase_project") or ""
+    return f"https://{proj}.supabase.co" if proj else ""
+
+
+SUPABASE_URL = supabase_url()
+
+# Tuning. DUP_M/CONFLICT_M separate a double-written visit from two visits
+# that genuinely disagree about where he was.
+DUP_M, CONFLICT_M = 120, 200
+DWELL_ABSORB_M = 90
+# Fixes own geometry; visits own time (2026-09-07). Everything below is about
+# letting a visit row stop the clock only where the fixes agree.
+ACC_MAX_M = 100            # worse than this is a cell-tower guess (acc=1414 rows)
+LONE_FIX_WINDOW_MIN = 30   # ...kept anyway when nothing better saw that half hour
+STAY_R_M, STAY_MIN = 60, 8 # a run of fixes this tight for this long is a dwell
+CORROB_M, CONTRA_M = 150, 400   # a fix this close backs a visit; this far contradicts it
+BRACKET_MIN = 30           # a quiet phone: a near fix within this of either end still backs it
+FAR_RUN_MIN_FIXES, FAR_RUN_MIN_MIN = 2, 3   # one far fix is a glitch; a run means he left
+# A REST this far from a visit row's place is somewhere else, even inside the 150-400 m
+# band that otherwise counts as neither. Once a 19:48-23:15 row at the rented flat
+# swallowed a 67-minute stay at a cafe 190 m away, so the spine drew one dwell and
+# resolve-day dropped the cafe as "elsewhere: the flat". 130 m is resolve-day's
+# SPLIT_SEPARATION_M, the bar between two venues and one venue's footprint.
+STAY_SPLIT_M, STAY_SPLIT_PRECISE_M, STAY_SPLIT_MIN_PRECISE = 130, 35, 3
+# ...and a rest closer than that is still somewhere else when it sits AT another place
+# the day names (within PLACE_AT_M of that place's row) and not at the row's own
+# (further than STAY_R_M): the flat and the café 73 m apart (mark_stays_at_named_places).
+PLACE_AT_M = 30
+# A still phone stops emitting, so ONE precise fix followed by a long silence is where
+# the user stood still, when the next fix shows almost no travel meanwhile. The case:
+# 20:38 one fix 5 m from the restaurant the user named for dinner, nothing for 66
+# minutes, 21:44 a walking fix 166 m away on the way back. The flat's visit row ran
+# 20:13 to the next morning, the lone fix counted as a glitch, and the dinner vanished.
+SILENCE_STAY_MIN = 30      # minutes of silence after the fix
+SILENCE_STAY_MAX_M = 400   # the fix that ends the silence is this close...
+SILENCE_STAY_MAX_KMH = 1.5 # ...and implies no real travel over the silence
+SILENCE_WALK_MPS = 1.2     # he walks from the stay to that fix at this pace
+LOOKBACK_H = 36            # read fixes this far before the day to judge cross-in visits
+WAYPOINT_MAX_MIN = 5       # an address visit shorter than this on a walk IS the walk
+SAME_PLACE_GAP_MIN = 2     # same place, this close together: one dwell
+DWELL_MARKER_MIN = 10      # a dwell gets a marker (and counts as a stop) from here
+SIMPLIFY_EPS_M = 25        # Douglas-Peucker at GPS accuracy, before routing
+WAYPOINT_SPACING_M = 100   # routed waypoints no closer than this
+HOLE_ABS_M = 400           # a jump past this is unobserved whatever the leg's density...
+HOLE_STEP_X = 3.0          # ...or past 3x the leg's own median step
+HOLE_SPEED_X = 2.0         # ...or 2x its median speed
+NONSTOP_WORDS = {"skip", "non-stop", "nonstop", "not a stop", "no stop", "passing through"}
+
+
+def load_env():
+    out = {}
+    if os.path.exists(ENV_FILE):
+        for line in open(ENV_FILE):
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                k, v = line.split("=", 1)
+                out[k.strip()] = v.strip()
+    return out
+
+
+def fetch(day_start, day_end):
+    key = load_env().get("SUPABASE_SERVICE_ROLE_KEY") or os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
+    if not key:
+        sys.exit("no SUPABASE_SERVICE_ROLE_KEY in .env")
+    s, e = day_start.isoformat(), day_end.isoformat()
+    qs = urllib.parse.urlencode({
+        "select": "id,segment_type,latitude,longitude,accuracy_m,arrived_at,"
+                  "departed_at,activity,place_name,place_type,city",
+        "arrived_at": f"lt.{e}",
+        "or": f"(departed_at.gte.{s},arrived_at.gte.{s})",
+        "order": "arrived_at.asc",
+        "limit": "5000",
+    })
+    req = urllib.request.Request(
+        f"{SUPABASE_URL}/rest/v1/location_history?{qs}",
+        headers={"apikey": key, "Authorization": f"Bearer {key}"})
+    with urllib.request.urlopen(req, timeout=45) as r:
+        return json.load(r)
+
+
+def fetch_fixes(lo, hi):
+    """Non-visit rows in [lo, hi) -- the lookback for cross-in visits."""
+    key = load_env().get("SUPABASE_SERVICE_ROLE_KEY") or os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
+    qs = urllib.parse.urlencode({
+        "select": "id,segment_type,latitude,longitude,accuracy_m,arrived_at,"
+                  "departed_at,activity,place_name,place_type,city",
+        "segment_type": "neq.visit",
+        "arrived_at": f"gte.{lo.isoformat()}",
+        "and": f"(arrived_at.lt.{hi.isoformat()})",
+        "order": "arrived_at.asc",
+        "limit": "5000",
+    })
+    req = urllib.request.Request(
+        f"{SUPABASE_URL}/rest/v1/location_history?{qs}",
+        headers={"apikey": key, "Authorization": f"Bearer {key}"})
+    try:
+        with urllib.request.urlopen(req, timeout=45) as r:
+            return json.load(r)
+    except Exception as e:
+        print(f"lookback fetch failed ({e}); judging cross-in visits on today's fixes only",
+              file=sys.stderr)
+        return []
+
+
+def origin_tz(date_str, override):
+    """The zone the user was in when the day began. The travel timeline owns this."""
+    if override:
+        return override
+    try:
+        out = subprocess.run(
+            ["node", "-e", "console.log(require(process.argv[1]).getDisplayTzForDate(process.argv[2]))",
+             os.path.join(HERE, "..", "lib", "travel-timezone.js"), date_str],
+            capture_output=True, text=True, timeout=20)
+        tz = out.stdout.strip()
+        if tz:
+            ZoneInfo(tz)
+            return tz
+    except Exception:
+        pass
+    return places_local.instance().get("tz") or "UTC"
+
+
+def demojibake(s):
+    """place_name carries double-encoded UTF-8 from the writer: Marche' -> MarchA(c)."""
+    if not s:
+        return s
+    try:
+        fixed = s.encode("latin-1").decode("utf-8")
+        return fixed if "�" not in fixed else s
+    except (UnicodeEncodeError, UnicodeDecodeError):
+        return s
+
+
+# Mirrors nameSimilarity() in lib/resolve-day.js -- one venue can reach a
+# day under two spellings ("Cafe Republic" / "Cafe Republique"), which
+# distance-only clustering cannot see.
+_STOPWORDS = re.compile(r"\b(the|le|la|les|el|il|a|an|de|du|des|of)\b")
+
+
+def norm_name(n):
+    t = unicodedata.normalize("NFD", str(n or ""))
+    t = "".join(c for c in t if not unicodedata.combining(c)).lower()
+    # Letters and digits of ANY script (2026-10-13). "[^a-z0-9 ]" turned every
+    # Hebrew name into "", and name_similarity("", ...) is 0, so two twin rows
+    # of one Hebrew-named restaurant 175 m apart became two places and the meal two dwells.
+    t = re.sub(r"[\W_]+", " ", t)
+    t = _STOPWORDS.sub(" ", t)
+    return re.sub(r"\s+", " ", t).strip()
+
+
+def name_similarity(a, b):
+    x, y = norm_name(a), norm_name(b)
+    if not x or not y:
+        return 0.0
+    if x == y:
+        return 1.0
+    if x in y or y in x:
+        return 0.95
+    return 1.0 - (_lev(x, y) / max(len(x), len(y)))
+
+
+def _lev(a, b):
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        cur = [i]
+        for j, cb in enumerate(b, 1):
+            cur.append(min(prev[j] + 1, cur[j - 1] + 1,
+                           prev[j - 1] + (ca != cb)))
+        prev = cur
+    return prev[len(b)]
+
+
+def load_statements(date_str):
+    try:
+        with open(f"/tmp/day-statements-{date_str}.json") as fh:
+            return json.load(fh)
+    except Exception:
+        return None
+
+
+def load_venue_map(date_str, doc=None, labels_only=False):
+    """His answers are phrased as activities ("Coffee at Typica"); a map pin
+    wants the place ("Typica"). The split is a language judgment, so it is made
+    by the model in `day-statements` and merely consumed here (Rule #0b).
+    Absent that file, labels stay as he phrased them -- never guessed apart.
+    labels_only: just the stored labels the model split, the only entries a
+    stored name may be matched to by containment (see build step 6)."""
+    doc = doc if doc is not None else load_statements(date_str)
+    if not doc:
+        return {}
+    out = {}
+    # `labels` is the reliable path: the model was handed the STORED labels and
+    # split each one, so the keys match what is actually in location_history.
+    # `places` is a fallback and often will not match, because how the user
+    # phrased a place in chat ("dropped the dog back at the flat") differs from
+    # how the answer was saved ("Flat - dropped off the dog").
+    for l in doc.get("labels", []) or []:
+        stored, venue = l.get("stored"), l.get("venue")
+        if stored and venue:
+            out[norm_name(stored)] = venue
+    if labels_only:
+        return out
+    for p in doc.get("places", []) or []:
+        said, venue = p.get("name"), p.get("venue")
+        if said and venue:
+            out.setdefault(norm_name(said), venue)
+    return out
+
+
+def clean_name(s):
+    s = demojibake(s)
+    if not s:
+        return None
+    t = s.strip()
+    # CLI arguments have leaked into place_name ("--help"); they are not places.
+    if t.startswith("--") or t.lower() in ("null", "none", "unknown", ""):
+        return None
+    # Trailing parentheticals are provenance notes the writer appended, not part
+    # of the name: "Cafe Example (confirmed by the user)", "... (already reported)",
+    # "(photo-inferred)". They belong in the tier, not on a map label.
+    t = re.sub(r"\s*\((?:confirmed by [^)]*|already reported|photo[- ]inferred|"
+               r"inferred|guess|unconfirmed)\)\s*$", "", t, flags=re.I).strip()
+    return t or None
+
+
+def ts(s):
+    return datetime.fromisoformat(s.replace("Z", "+00:00"))
+
+
+def haversine(a, b):
+    R = 6371000.0
+    p1, p2 = math.radians(a[0]), math.radians(b[0])
+    h = (math.sin((p2 - p1) / 2) ** 2
+         + math.cos(p1) * math.cos(p2) * math.sin(math.radians(b[1] - a[1]) / 2) ** 2)
+    return 2 * R * math.asin(math.sqrt(h))
+
+
+# --- map matching ------------------------------------------------------------
+# Points are always snapped to the map and a real path is routed BETWEEN them
+# A raw fix sits wherever the phone thought it was --
+# mid-building, in a river, on the wrong side of a block -- and a straight
+# line between two fixes crosses whatever is in the way. Snapping gives a
+# position that exists, routing gives a path that could have been walked, and
+# the routed distance is the one worth reporting.
+VALHALLA = "https://valhalla1.openstreetmap.de"
+OSRM = "https://router.project-osrm.org"
+# The public Valhalla /route endpoint hard-caps requests at 50 locations
+# (error_code 150). Chunks overlap by one point for leg continuity, so the
+# request size is MATCH_CHUNK + 1 -- this must stay at 49, not 50, or the
+# request is rejected outright and that chunk's whole route silently vanishes
+# (discovered 2026-08-05: a 51-location chunk 400'd, dropping the routed path
+# for most of the day while the raw-fix overlay kept showing the real stops).
+MATCH_CHUNK = 49
+
+
+# The mini's system python (3.9/LibreSSL) cannot complete a TLS handshake with
+# the routing hosts, though curl on the same box can. Shell out rather than
+# pinning a python TLS workaround.
+def _curl_json(url, body=None, timeout=30):
+    cmd = ["curl", "-sS", "--max-time", str(timeout), url]
+    if body is not None:
+        cmd += ["-X", "POST", "-H", "Content-Type: application/json",
+                "--data-binary", json.dumps(body)]
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode != 0:
+        raise RuntimeError(f"curl {r.returncode}: {r.stderr.strip()[:120]}")
+    return json.loads(r.stdout)
+
+
+def _post_json(url, body, timeout=30):
+    return _curl_json(url, body, timeout)
+
+
+def decode_polyline(s, precision=6):
+    coords, idx, lat, lon, factor = [], 0, 0, 0, 10 ** precision
+    while idx < len(s):
+        for is_lat in (True, False):
+            shift, result = 0, 0
+            while True:
+                b = ord(s[idx]) - 63  # kernel-guard-ok: Python's ord() builtin, decoding a polyline
+                idx += 1
+                result |= (b & 0x1F) << shift
+                shift += 5
+                if b < 0x20:
+                    break
+            d = ~(result >> 1) if result & 1 else (result >> 1)
+            if is_lat:
+                lat += d
+            else:
+                lon += d
+        coords.append([lat / factor, lon / factor])
+    return coords
+
+
+def median_kmh(pts):
+    speeds = []
+    for a, b in zip(pts, pts[1:]):
+        if a.get("kind") == "anchor" or b.get("kind") == "anchor" or b.get("hole_from_prev"):
+            continue
+        dt = (b["t"] - a["t"]).total_seconds() / 3600
+        if dt > 0:
+            speeds.append(haversine((a["lat"], a["lon"]), (b["lat"], b["lon"])) / 1000 / dt)
+    return round(_median(speeds), 1) if speeds else None
+
+
+def costing_for(pts):
+    """Pick a routing profile from the trace's own speed, not a lookup table."""
+    speeds = []
+    for a, b in zip(pts, pts[1:]):
+        if a.get("kind") == "anchor" or b.get("kind") == "anchor" or b.get("hole_from_prev"):
+            continue            # a visit row's timestamp is not a fix's; a hole is not a speed
+        dt = (b["t"] - a["t"]).total_seconds() / 3600
+        if dt > 0:
+            speeds.append(haversine((a["lat"], a["lon"]), (b["lat"], b["lon"])) / 1000 / dt)
+    if not speeds:
+        return "pedestrian"
+    speeds.sort()
+    med = speeds[len(speeds) // 2]
+    # Under 22 km/h the fixes are routed as a PEDESTRIAN even when the pace
+    # says bus, cab or subway: that profile follows whichever street the fixes
+    # sit on, while "auto" obeys one-way avenues and once sent a ride home --
+    # fixes plainly on a northbound-only avenue -- down one avenue and back up
+    # another for a 5.1 km "drive" of 2.5 km. The MODE is reported separately
+    # (see leg_mode) so nothing reads this as a claim the user walked.
+    if med < 22:
+        return "pedestrian"
+    return "auto"
+
+
+def leg_mode(median_kmh):
+    """What the pace says he was doing, independent of how it was routed."""
+    if median_kmh is None or median_kmh < 7:
+        return "walking"
+    if median_kmh < 22:
+        return "riding"      # bus, cab, subway, e-bike: fast for feet, slow for a car
+    return "driving"
+
+
+WALK_PAIR_MAX_KMH = 7      # leg_mode's walking ceiling, applied per fix pair
+VEHICLE_PAIR_KMH = 15
+VEHICLE_ACTIVITY = "driving"   # the client's word for CMMotionActivity.automotive
+
+
+def walked_share(pts):
+    """Share of a leg's metres covered at walking pace, by consecutive point pair.
+
+    A leg is moded by its MEDIAN pace, so one that holds a drive and a walk
+    (2026-10-12: Harim -> 10 km by car with the phone silent -> two hours on
+    foot in the Old City) is "walking", and all 16.8 km of it reached the
+    "miles walked" caption. Pairs faster than walking pace -- including the
+    jump across a hole the car covered -- are not walked metres.
+
+    A pair with no elapsed time, or one touching an anchor, has no pace to
+    read: an anchor's time is the visit row's departure/arrival, which the
+    hole detector below already refuses to read a speed off. Within
+    HOLE_ABS_M such a pair is the leg's own walking (once the walk back from
+    a coffee shop counted 0 of its 768 m and the evening walk lost a quarter of
+    its length, so the day printed "1.1 miles walked" under a 1.3-mile walk).
+    A longer one is still judged by its pace.
+
+    Pace alone cannot see a car in traffic (a drive from a car park, 2.4 km
+    in 31 minutes, every pair under 7 km/h, printed "Walked 1.5 miles along"
+    two avenues). The phone's motion sensor can:
+    a pair either of whose fixes it called "driving" (CMMotionActivity
+    automotive, LocationTracker.motionType) is not walked.
+    """
+    walk = total = 0.0
+    for a, b in zip(pts, pts[1:]):
+        d = haversine((a["lat"], a["lon"]), (b["lat"], b["lon"]))
+        dt = (b["t"] - a["t"]).total_seconds() / 3600
+        total += d
+        untimed = dt <= 0 or "anchor" in (a.get("kind"), b.get("kind"))
+        if untimed and d <= HOLE_ABS_M:
+            walk += d
+            continue
+        kmh = d / 1000 / dt if dt > 0 else float("inf")
+        # A single fast pair a few dozen metres long is GPS jitter on a walk;
+        # a vehicle shows as clearly fast (≥ VEHICLE_PAIR_KMH) or fast and long.
+        vehicle = (kmh >= VEHICLE_PAIR_KMH or (kmh >= WALK_PAIR_MAX_KMH and d >= 300)
+                   or VEHICLE_ACTIVITY in (a.get("activity"), b.get("activity")))
+        if not vehicle:
+            walk += d
+    return (walk / total) if total > 0 else 1.0
+
+
+def walk_metres(matched_m, straight_m, pts):
+    """The metres a walking leg covered, before walked_share scales them.
+
+    The street match is the better figure, except where the router detoured:
+    2026-10-19, after the game at Teddy Stadium, the pedestrian profile routed
+    the 516 m from the stadium to the car round Highway 50 for 2,272 m, a path
+    6 minutes could only cover at 23 km/h, and the header said "3.3 miles
+    walked". A street path faster than walking pace, over fixes that are not,
+    was not walked; the straight line between the fixes is the floor."""
+    m = matched_m or straight_m
+    secs = (pts[-1]["t"] - pts[0]["t"]).total_seconds() if len(pts) > 1 else 0
+    if matched_m and straight_m and secs > 0 and matched_m > straight_m:
+        kmh = lambda metres: metres / 1000 / (secs / 3600)
+        if kmh(matched_m) > WALK_PAIR_MAX_KMH >= kmh(straight_m):
+            return straight_m
+    return m
+
+
+def _median(xs):
+    xs = sorted(xs)
+    return xs[len(xs) // 2] if xs else 0.0
+
+
+def _centroid(pts):
+    return (sum(p["lat"] for p in pts) / len(pts), sum(p["lon"] for p in pts) / len(pts))
+
+
+def _dist(a, b):
+    return haversine((a["lat"], a["lon"]), (b["lat"], b["lon"]))
+
+
+# --- geometry before routing -----------------------------------------------
+# A "break" waypoint is an order to the router: go THROUGH here. Handing it
+# every 5 m fix makes it honour every side-of-street wobble, and the drawn line
+# zigzags across the avenue it was walked down. Thin the fixes to the shape
+# they describe first (Douglas-Peucker at GPS accuracy), then space what is
+# left ~100 m apart. Forced points -- leg ends, hole ends -- are always kept.
+def _perp_m(p, a, b):
+    """Distance from p to segment a-b, in metres, on a local flat projection."""
+    kx = 111320.0 * math.cos(math.radians(a["lat"]))
+    ax, ay = 0.0, 0.0
+    bx, by = (b["lon"] - a["lon"]) * kx, (b["lat"] - a["lat"]) * 111320.0
+    px, py = (p["lon"] - a["lon"]) * kx, (p["lat"] - a["lat"]) * 111320.0
+    L2 = bx * bx + by * by
+    if L2 == 0:
+        return math.hypot(px, py)
+    u = max(0.0, min(1.0, (px * bx + py * by) / L2))
+    return math.hypot(px - u * bx, py - u * by)
+
+
+def _dp_keep(pts, eps):
+    keep = [False] * len(pts)
+    keep[0] = keep[-1] = True
+    stack = [(0, len(pts) - 1)]
+    while stack:
+        i, j = stack.pop()
+        if j <= i + 1:
+            continue
+        best, bi = -1.0, -1
+        for k in range(i + 1, j):
+            d = _perp_m(pts[k], pts[i], pts[j])
+            if d > best:
+                best, bi = d, k
+        if best > eps:
+            keep[bi] = True
+            stack.append((i, bi))
+            stack.append((bi, j))
+    return keep
+
+
+def simplify(pts, forced=(), eps=None, spacing=None):
+    """Thin a leg's points for routing, keeping forced indices."""
+    eps = SIMPLIFY_EPS_M if eps is None else eps
+    spacing = WAYPOINT_SPACING_M if spacing is None else spacing
+    if len(pts) <= 2:
+        return list(pts)
+    forced = set(forced) | {0, len(pts) - 1}
+    keep = [i in forced for i in range(len(pts))]
+    cuts = sorted(forced)
+    for a, b in zip(cuts, cuts[1:]):
+        if b - a >= 2:
+            sub = _dp_keep(pts[a:b + 1], eps)
+            for k, kp in enumerate(sub):
+                if kp:
+                    keep[a + k] = True
+    out = []
+    for i, p in enumerate(pts):
+        if not keep[i]:
+            continue
+        if out and i not in forced and _dist(out[-1], p) < spacing:
+            continue
+        out.append(p)
+    if len(out) < 2:
+        out = [pts[0], pts[-1]]
+    return out
+
+
+def valhalla_route_points(pts, costing):
+    """Route along streets THROUGH every point, keeping all of them.
+
+    Never drops a point, never emits a straight line.
+    Every location is typed "break", which is load-bearing and was measured:
+    on the Jul 29 trace against 4334 m of straight line,
+        break         5397 m  (1.25x)  <- ordinary urban walking detour
+        break_through 6730 m  (1.55x)
+        through       6730 m  (1.55x)
+    "break_through"/"through" forbid u-turns, so two consecutive fixes on
+    opposite sides of a street send the route all the way around the block.
+    "break" permits a u-turn at each waypoint, giving the shortest street path
+    between consecutive points -- the best fit to the data we actually have.
+
+    (trace_route/map_snap was tried first and rejected: it discards points it
+    cannot align, which is exactly what we must not do.)
+
+    Each location carries a `radius` of its own GPS accuracy, so the router may
+    snap within the error circle rather than to the literal, possibly
+    wrong-side-of-the-street, coordinate.
+
+    Returns (shape, ordered street names, metres, legs, runs). `runs` is one
+    entry per consecutive waypoint pair -- its own shape, time span and whether
+    that pair straddles a hole -- so the map can draw an unobserved stretch
+    dashed inside an otherwise observed leg.
+    """
+    if len(pts) < 2:
+        return [], [], 0.0, [], []
+    shape, names, meters, legs, runs = [], [], 0.0, [], []
+    for i in range(0, len(pts) - 1, MATCH_CHUNK):
+        chunk = pts[i:i + MATCH_CHUNK + 1]
+        if len(chunk) < 2:
+            continue
+        r = _post_json(f"{VALHALLA}/route", {
+            "locations": [{"lat": round(p["lat"], 6), "lon": round(p["lon"], 6),
+                           "type": "break",
+                           "radius": int(max(30, min(100, p.get("acc") or 30)))}
+                          for p in chunk],
+            "costing": costing})
+        trip = r.get("trip", {})
+        # Valhalla returns one leg per consecutive waypoint pair, so each leg's
+        # length belongs to a KNOWN time interval. Keeping legs is what makes a
+        # per-window pace honest: apportioning a whole segment's distance evenly
+        # by time smears walking across the hours he sat still, which reported
+        # 3982 m of movement during a 400-minute stay at the apartment.
+        #
+        # Each leg also carries its two endpoints. Distance alone cannot tell a
+        # walk THROUGH somewhere from a walk AROUND inside it -- both cover the
+        # same metres at the same pace -- and only the endpoints say whether the
+        # walking ended up anywhere. resolve-day's movement test reads these.
+        for k, leg in enumerate(trip.get("legs", [])):
+            coords = decode_polyline(leg.get("shape", ""))
+            shape.extend(coords)
+            lm = leg.get("summary", {}).get("length", 0) * 1000
+            meters += lm
+            if k + 1 < len(chunk):
+                a, b = chunk[k], chunk[k + 1]
+                hole = bool(b.get("hole_from_prev"))
+                legs.append(dict(
+                    t0=int(a["t"].timestamp() * 1000), t1=int(b["t"].timestamp() * 1000),
+                    lat0=round(a["lat"], 6), lon0=round(a["lon"], 6),
+                    lat1=round(b["lat"], 6), lon1=round(b["lon"], 6),
+                    m=round(lm), hole=hole))
+                runs.append(dict(coords=[[round(c[0], 6), round(c[1], 6)] for c in coords],
+                                 t0=a["t"], t1=b["t"], hole=hole, m=round(lm)))
+            for m in leg.get("maneuvers", []):
+                for n in m.get("street_names", []) or []:
+                    # A bare road number ("3350") is not a street a person reads;
+                    # it printed as "Walked 0.3 miles along <street> and 3350".
+                    if not any(ch.isalpha() for ch in str(n)):
+                        continue
+                    if not names or names[-1] != n:
+                        names.append(n)
+    # ordered, consecutive-deduped, then globally deduped keeping first sighting
+    seen, ordered = set(), []
+    for n in names:
+        if n not in seen:
+            seen.add(n)
+            ordered.append(n)
+    return shape, ordered, meters, legs, runs
+
+
+def osrm_match(pts):
+    coords = ";".join(f"{round(p['lon'],6)},{round(p['lat'],6)}" for p in pts)
+    url = (f"{OSRM}/match/v1/driving/{coords}"
+           "?overview=full&geometries=geojson&tidy=true")
+    d = _curl_json(url)
+    out, meters = [], 0.0
+    for m in d.get("matchings", []):
+        out.extend([[c[1], c[0]] for c in m.get("geometry", {}).get("coordinates", [])])
+        meters += m.get("distance", 0)
+    return out, meters
+
+
+def match_segments(segments, verbose=False):
+    """Route every leg through its thinned waypoints. Degrades to raw."""
+    for seg in segments:
+        pts = seg["route_pts"]
+        seg["costing"] = costing_for(pts) if len(pts) > 1 else "pedestrian"
+        # The pace is read from every fix, not the thinned routing waypoints: with
+        # half the pairs gone the median is whichever few survive. A beach walk:
+        # 4.7 km/h over its 8 fixes, 8.6 km/h over the 4 waypoints, so the leg was
+        # "riding" and the header's miles walked left out the mile the summary
+        # printed as "Walk on the beach · 1.0 mi".
+        # JORI_PACE_FROM_WAYPOINTS=1 restores the old reading.
+        seg["median_kmh"] = median_kmh(pts if os.environ.get("JORI_PACE_FROM_WAYPOINTS") == "1" else seg["pts"])
+        try:
+            shape, names, meters, legs, runs = valhalla_route_points(pts, seg["costing"])
+            seg["matched"], seg["streets"], seg["matched_m"] = shape, names[:12], meters
+            seg["legs"], seg["runs"] = legs, runs
+        except Exception as e:
+            if verbose:
+                print(f"  valhalla failed ({e}); trying osrm", file=sys.stderr)
+            try:
+                shape, meters = osrm_match(pts)
+                seg["matched"], seg["streets"], seg["matched_m"] = shape, [], meters
+                seg["legs"], seg["runs"] = [], []
+            except Exception as e2:
+                if verbose:
+                    print(f"  osrm failed too ({e2}); keeping raw", file=sys.stderr)
+                seg["matched"], seg["streets"], seg["matched_m"] = [], [], 0.0
+                seg["legs"], seg["runs"] = [], []
+    return segments
+
+
+# --- fixes ------------------------------------------------------------------
+def clean_fixes(rows, lo, hi):
+    """Every non-visit row in [lo, hi), deduped, sorted, with cell-tower
+    guesses removed. A fix worse than ACC_MAX_M (the recurring acc=1414 rows)
+    is kept only when nothing better saw that half hour -- then it is the only
+    evidence and is flagged low_conf rather than discarded."""
+    seen, fixes = set(), []
+    for r in rows:
+        if r["segment_type"] == "visit":
+            continue
+        t = ts(r["arrived_at"])
+        if not (lo <= t < hi):
+            continue
+        k = (round(r["latitude"], 6), round(r["longitude"], 6), int(t.timestamp()))
+        if k in seen:                      # the writer emits exact duplicate fixes
+            continue
+        seen.add(k)
+        fixes.append(dict(t=t, lat=r["latitude"], lon=r["longitude"],
+                          acc=r.get("accuracy_m"), kind="fix", activity=r.get("activity")))
+    fixes.sort(key=lambda p: p["t"])
+    good = [f for f in fixes if f["acc"] is None or f["acc"] <= ACC_MAX_M]
+    good_ts = [g["t"] for g in good]
+    kept, dropped = [], 0
+    for f in fixes:
+        if f["acc"] is None or f["acc"] <= ACC_MAX_M:
+            kept.append(f)
+            continue
+        lone = not any(abs((g - f["t"]).total_seconds()) <= LONE_FIX_WINDOW_MIN * 60
+                       for g in good_ts)
+        if lone:
+            f["low_conf"] = True
+            kept.append(f)
+        else:
+            dropped += 1
+    return kept, dropped
+
+
+# --- dwells from the fixes themselves ----------------------------------------
+def stay_points(fixes):
+    """Runs of consecutive fixes that stay within STAY_R_M of their own centroid
+    for at least STAY_MIN minutes. Independent of the visit table, so a stale
+    or invented visit row cannot manufacture a dwell -- and a real evening at
+    home with no visit row written for it is still found."""
+    stays, i, n = [], 0, len(fixes)
+    while i < n:
+        members = [fixes[i]]
+        j = i + 1
+        while j < n:
+            c = _centroid(members)
+            if haversine(c, (fixes[j]["lat"], fixes[j]["lon"])) <= STAY_R_M:
+                members.append(fixes[j])
+                j += 1
+            else:
+                break
+        span = (members[-1]["t"] - members[0]["t"]).total_seconds() / 60
+        if len(members) >= 2 and span >= STAY_MIN:
+            c = _centroid(members)
+            stays.append(dict(start=members[0]["t"], end=members[-1]["t"],
+                              lat=c[0], lon=c[1], n=len(members)))
+            i = j
+        else:
+            i += 1
+    return stays
+
+
+def silence_stays(fixes, stays=()):
+    """Lone precise fixes followed by SILENCE_STAY_MIN+ minutes of silence that end
+    at a fix within reach (SILENCE_STAY_MAX_M, under SILENCE_STAY_MAX_KMH): he stood
+    still at the lone fix until he walked to the next one. A fix already inside a
+    stay is left to it. `prev` is the fix before, so a caller can tell he walked
+    there from a phone that drifted while he sat elsewhere."""
+    if os.environ.get("JORI_SILENCE_STAY") == "0":
+        return []
+    out = []
+    for i in range(1, len(fixes) - 1):
+        a, b = fixes[i], fixes[i + 1]
+        if a["acc"] is None or a["acc"] > STAY_SPLIT_PRECISE_M or a.get("low_conf"):
+            continue
+        if any(st["start"] <= a["t"] <= st["end"] for st in stays):
+            continue
+        gap = (b["t"] - a["t"]).total_seconds()
+        if gap < SILENCE_STAY_MIN * 60:
+            continue
+        dab = haversine((a["lat"], a["lon"]), (b["lat"], b["lon"]))
+        if dab > SILENCE_STAY_MAX_M or dab / 1000 / (gap / 3600) > SILENCE_STAY_MAX_KMH:
+            continue
+        out.append(dict(start=a["t"], end=b["t"] - timedelta(seconds=dab / SILENCE_WALK_MPS),
+                        lat=a["lat"], lon=a["lon"], n=1, silence=True, prev=fixes[i - 1]))
+    return out
+
+
+def mark_stays_at_named_places(stays, visit_rows):
+    """Mark each ordinary stay that sits AT a place the day names: a row the user
+    answered for, or the phone naming one of the user's places on arrival (`named`), within
+    PLACE_AT_M of the stay. away_stay_fixes reads it: a stay at ANOTHER named place
+    is somewhere else even under STAY_SPLIT_M.
+
+    The case: the phone named the 14:12 arrival "the café" and iOS ran that row to
+    17:35, but from 14:35 to 17:28 58 precise fixes sat 3 m from the flat, 2 m from
+    that morning's arrival row for the flat and 73 m from the café's.
+    Under the 130 m bar the stay stayed inside the café's row and the afternoon at the
+    flat was drawn as three hours at the café. JORI_STAY_AT_NAMED=0 turns it off."""
+    if os.environ.get("JORI_STAY_AT_NAMED") == "0":
+        return
+    named = []
+    for r in visit_rows or []:
+        nm = clean_name(r.get("place_name"))
+        if r.get("place_type") not in ("user-confirmed", "named") or not nm \
+                or r.get("latitude") is None or r.get("longitude") is None:
+            continue
+        named.append((nm, (r["latitude"], r["longitude"]), r.get("id")))
+    for st in stays or []:
+        if st.get("silence"):
+            continue
+        best = None
+        for nm, at, rid in named:
+            dd = haversine((st["lat"], st["lon"]), at)
+            if dd <= PLACE_AT_M and (best is None or dd < best[0]):
+                best = (dd, nm, rid)
+        if best:
+            st["at_place"] = dict(name=best[1], row_id=best[2], m=round(best[0]))
+
+
+def anchor_silence_stays(stays, visit_rows):
+    """Mark each silence stay that sits at a place the user confirmed being at during it.
+
+    The fix before a silence stay tells a walk from a phone that jumped, but only when
+    the phone saw the walk. The case: the flat's row ran 19:12 to morning (the phone
+    reported leaving 14 h late); its last fix at the flat was 19:15, the phone was
+    quiet until one precise fix at the restaurant at 20:06, quiet again until 22:09,
+    and the restaurant is the dinner the user confirmed (its row 21:56-22:09, two
+    photos there). With the fix before it at the flat, the stay never cut the row and
+    the flat swallowed the dinner. The user's confirmed row within STAY_R_M of the fix, overlapping the silence,
+    is the evidence the walk would have been. JORI_SILENCE_ANCHOR=0 turns it off."""
+    if os.environ.get("JORI_SILENCE_ANCHOR") == "0":
+        return
+    confirmed = []
+    for r in visit_rows or []:
+        if r.get("place_type") != "user-confirmed" or r.get("latitude") is None or r.get("longitude") is None:
+            continue
+        a = ts(r["arrived_at"])
+        confirmed.append((a, ts(r["departed_at"]) if r.get("departed_at") else a,
+                          (r["latitude"], r["longitude"]), r.get("id")))
+    for st in stays or []:
+        if not st.get("silence"):
+            continue
+        for a, d, at, rid in confirmed:
+            if a <= st["end"] and d >= st["start"] and haversine((st["lat"], st["lon"]), at) <= STAY_R_M:
+                st["anchored_by"] = rid
+                break
+
+
+# --- visit rows, checked against the fixes -----------------------------------
+def away_stay_fixes(v, stays, fixes):
+    """ids of the fixes inside a stay that sits STAY_SPLIT_M+ from the row's place:
+    {id(fix): the silence stay it belongs to, or None for an ordinary stay}.
+
+    A stay is a rest, not a pass-by (STAY_MIN minutes inside STAY_R_M), and it needs
+    STAY_SPLIT_MIN_PRECISE tight fixes so a drifting indoor phone cannot split a row
+    on its own noise. Such a rest is not "at" the row, whatever the 150-400 m band says.
+    A silence stay has one fix, so it also needs the fix before it to be away from the
+    row's place already: he walked there, the phone did not jump there. Or a place he
+    confirmed at that fix during the silence (anchor_silence_stays): a phone that
+    jumped does not also leave his answer and his photos at the spot it jumped to."""
+    here = (v["lat"], v["lon"])
+    away = {}
+    if os.environ.get("JORI_STAY_SPLIT") == "0":
+        return away
+    # A window he answered for is his: a stay across a market or a library campus is
+    # him moving about inside the place he named (2026-10-11 Hatikva Market, 2026-10-12
+    # National Library: 187 m apart, both user-confirmed).
+    if v.get("ptype") == "user-confirmed":
+        return away
+    for st in stays or []:
+        if st["end"] <= v["start"] or st["start"] >= v["end"]:
+            continue
+        dd = haversine(here, (st["lat"], st["lon"]))
+        other = st.get("at_place")
+        at_other_place = bool(other and v.get("name") and dd > STAY_R_M
+                              and name_similarity(other["name"], v["name"]) < 0.80)
+        if dd <= STAY_SPLIT_M and not at_other_place:
+            continue
+        members = [f for f in fixes if st["start"] <= f["t"] <= st["end"]]
+        if st.get("silence"):
+            p = st["prev"]
+            if members and (haversine(here, (p["lat"], p["lon"])) > CORROB_M or st.get("anchored_by")):
+                away.update((id(f), st) for f in members)
+            continue
+        precise = [f for f in members if f["acc"] is not None and f["acc"] <= STAY_SPLIT_PRECISE_M]
+        if len(precise) >= STAY_SPLIT_MIN_PRECISE:
+            away.update((id(f), None) for f in members)
+    return away
+
+
+# A visit row's tail the trace walked out of. The case: a 15:45 row on a side street
+# ran to 17:13, iOS's own departure. Its last near fix was 15:50; the
+# last fix before the phone went quiet, at 16:02 (3.9 m accuracy), stood 181 m from the
+# row and 98 m from the flat, and the next one, at 17:18, was at the flat, where the
+# fixes then sat all evening. The row's point was where iOS saw the user slow down on the
+# walk home, and the 150-400 m band counted the 16:02 fix as neither for nor against it, so
+# the row kept the silence and the walk home ran to 17:13 (the user wrote at 16:16 of being
+# back at the apartment). A row whose fixes after its last near one all put the user
+# beyond it, the last of them precise and nearer a stay the user was next found sitting in,
+# ends at the first of those fixes; that stay begins when the walk to it would have
+# ended. The user's own answers are never cut (away_stay_fixes). JORI_WALKED_OUT=0 disables.
+WALKED_OUT_MIN = 10        # a tail shorter than this is not worth cutting
+
+
+def walked_out(v, inside, cls, fixes, stays):
+    """(cut, dest, arrive) when the row's tail after its last near fix is the trace
+    leaving for a stay elsewhere, else None. `fixes` is every fix, `stays` the stays."""
+    if os.environ.get("JORI_WALKED_OUT") == "0" or v.get("ptype") == "user-confirmed":
+        return None
+    if "near" not in cls:
+        return None
+    k = len(cls) - 1 - cls[::-1].index("near")
+    tail = inside[k + 1:]
+    if not tail:
+        return None
+    last = tail[-1]
+    if last["acc"] is None or last["acc"] > STAY_SPLIT_PRECISE_M or last.get("low_conf"):
+        return None
+    nxt = next((f for f in fixes if f["t"] > last["t"]), None)
+    if nxt is None or (nxt["t"] - last["t"]).total_seconds() < SILENCE_STAY_MIN * 60:
+        return None
+    dest = next((st for st in stays or [] if not st.get("silence")
+                 and st["start"] <= nxt["t"] <= st["end"]), None)
+    if dest is None:
+        return None
+    here, there, at = (v["lat"], v["lon"]), (dest["lat"], dest["lon"]), (last["lat"], last["lon"])
+    if haversine(here, there) < STAY_SPLIT_M or haversine(at, there) > SILENCE_STAY_MAX_M \
+            or haversine(at, there) >= haversine(at, here):
+        return None
+    cut = tail[0]["t"]
+    arrive = last["t"] + timedelta(seconds=haversine(at, there) / SILENCE_WALK_MPS)
+    return cut, dest, min(arrive, dest["start"])
+
+
+def reconcile_visit(v, fixes, stays=None):
+    """A visit row may only stop the clock where the fixes agree he was there.
+
+    Returns a list of (start, end, witnessed_min, corroborated_by) spans, or
+    [] with a reason when the fixes never support the row at all. The row's
+    own timestamps are the claim; the fixes are the evidence:
+      - fixes within CORROB_M during the row corroborate it;
+      - fixes beyond CONTRA_M contradict it, and the row is CLIPPED at them --
+        it cannot start before he arrived or run past when he left;
+      - a run of far fixes in the middle splits it: he went out and came back;
+      - a row with no fix inside it at all is a quiet phone, not a lie: kept,
+        with witnessed_min 0, if a fix within CORROB_M brackets it.
+    The 2026-09-06 map is why: two Sept-5 address visits whose departed_at was
+    written 35 h late overlapped the whole of Sept 6, drew the day's two biggest
+    markers, every one of its 19 conflicts, and a bridge from home to the
+    theatre district that he never walked.
+    """
+    inside = [f for f in fixes if v["start"] <= f["t"] <= v["end"]]
+    here = (v["lat"], v["lon"])
+
+    def d(f):
+        return haversine(here, (f["lat"], f["lon"]))
+
+    if not inside:
+        before = [f for f in fixes if f["t"] < v["start"]
+                  and (v["start"] - f["t"]).total_seconds() <= BRACKET_MIN * 60]
+        after = [f for f in fixes if f["t"] > v["end"]
+                 and (f["t"] - v["end"]).total_seconds() <= BRACKET_MIN * 60]
+        if (before and d(before[-1]) <= CORROB_M) or (after and d(after[0]) <= CORROB_M):
+            return [(v["start"], v["end"], 0, "bracket")], None
+        if not before and not after and not fixes:
+            return [(v["start"], v["end"], 0, None)], None    # no trace at all
+        return [], "no fix near it, before, during or after"
+
+    # classify each inside fix: near / far / neither
+    away = away_stay_fixes(v, stays, inside)
+    cls = []
+    for f in inside:
+        dm = d(f)
+        cls.append("far" if dm > CONTRA_M or (id(f) in away and not away[id(f)]) else
+                   "near" if dm <= CORROB_M else "silent" if id(f) in away else "mid")
+    if "near" not in cls:
+        before = [f for f in fixes if f["t"] < v["start"]
+                  and (v["start"] - f["t"]).total_seconds() <= BRACKET_MIN * 60]
+        if before and d(before[-1]) <= CORROB_M and "far" in cls:
+            # arrived, phone went quiet, first thing it saw was him elsewhere
+            first_far = inside[cls.index("far")]
+            if first_far["t"] > v["start"]:
+                return [(v["start"], first_far["t"], 0, "bracket")], None
+        if "far" in cls:
+            return [], "every fix during it is elsewhere"
+        return [(v["start"], v["end"], 0, None)], None   # only mid fixes: leave it
+
+    def left_for(st, last_near):
+        # The phone went quiet HERE and next woke at a stay the user confirmed
+        # (anchor_silence_stays): the walk was never seen and silence is stillness, so the
+        # user stayed until the walk there: the flat until 20:03, dinner from its 20:06 fix.
+        if not st.get("anchored_by") or d(st["prev"]) > CORROB_M:
+            return last_near
+        walk = timedelta(seconds=haversine(here, (st["lat"], st["lon"])) / SILENCE_WALK_MPS)
+        return max(last_near, st["start"] - walk)
+
+    # far RUNS split the row; a lone far fix is a glitch, not a departure
+    spans, cur_start, near_seen, witnessed = [], v["start"], False, 0.0
+    back_after = None       # set after a silence stay: resume at the next near fix
+    back_from = None        # ...that is nearer the row than the stay he left
+    i = 0
+    while i < len(inside):
+        if cls[i] == "far":
+            j = i
+            while j < len(inside) and cls[j] == "far":
+                j += 1
+            run = inside[i:j]
+            run_min = (run[-1]["t"] - run[0]["t"]).total_seconds() / 60
+            if len(run) >= FAR_RUN_MIN_FIXES or run_min >= FAR_RUN_MIN_MIN:
+                if near_seen:
+                    spans.append((cur_start, run[0]["t"], witnessed, "fixes"))
+                cur_start, near_seen, witnessed = run[-1]["t"], False, 0.0
+            i = j
+            continue
+        if cls[i] == "silent":
+            # A silence stay is one fix, but after time AT the row's place it is a
+            # departure: the row ends at the last fix that had him there and resumes
+            # at the first one that has him back, never inside the stay. Before he
+            # was seen there it is only a mid fix (a quiet visit keeps its row).
+            st = away[id(inside[i])]
+            if near_seen:
+                st["split_row"] = True
+                spans.append((cur_start, left_for(st, last_near), witnessed, "fixes"))
+                cur_start, near_seen, witnessed = st["end"], False, 0.0
+                back_after, back_from = cur_start, st
+            i += 1
+            continue
+        if cls[i] == "near" and not near_seen and back_from is not None \
+                and haversine((inside[i]["lat"], inside[i]["lon"]), (back_from["lat"], back_from["lon"])) < d(inside[i]):
+            # nearer the stay just left than the row's place: the walk back, not
+            # the arrival (86 m from the restaurant, 102 m from the flat, at 22:09)
+            i += 1
+            continue
+        if cls[i] == "near":
+            if not near_seen:
+                if cur_start == v["start"] and not spans:
+                    pass            # first arrival: the row's own start stands
+                elif back_after is not None:
+                    cur_start, back_after, back_from = max(cur_start, inside[i]["t"]), None, None
+                near_seen = True
+                last_near = inside[i]["t"]
+            else:
+                witnessed += (inside[i]["t"] - last_near).total_seconds() / 60
+                last_near = inside[i]["t"]
+        i += 1
+    if near_seen:
+        end = v["end"]
+        out = walked_out(v, inside, cls, fixes, stays)
+        if out and (v["end"] - out[0]).total_seconds() >= WALKED_OUT_MIN * 60 and out[0] > cur_start:
+            end, dest = out[0], out[1]
+            dest["walked_in_from"] = dest.get("walked_in_from") or dest["start"]
+            dest["start"] = min(dest["start"], out[2])
+        spans.append((cur_start, end, witnessed, "fixes"))
+    return [s for s in spans if s[1] > s[0]], None
+
+
+def walking_pace(segments):
+    m, secs = 0.0, 0.0
+    for seg in segments:
+        if leg_mode(seg["median_kmh"]) != "walking":
+            continue
+        fx = [p for p in seg["pts"] if p["kind"] == "fix"]
+        if len(fx) < 3:
+            continue
+        span = (fx[-1]["t"] - fx[0]["t"]).total_seconds()
+        if span < 10 * 60:
+            continue
+        m += seg["matched_m"] or seg["straight_m"]
+        secs += span
+    return round(m / 1000 / (secs / 3600), 1) if secs else None
+
+
+def build(date_str, tzname, rows, do_match=True, verbose=False, statements=None):
+    tz = ZoneInfo(tzname)
+    day_start = datetime.combine(datetime.strptime(date_str, "%Y-%m-%d").date(),
+                                 datetime.min.time(), tzinfo=tz)
+    day_end = day_start + timedelta(hours=24)   # exactly 24h, no re-anchoring
+
+    def hhmm(dt, mark_next_day=False):
+        loc = dt.astimezone(tz)
+        s = loc.strftime("%H:%M")
+        return s + "⁺" if mark_next_day and loc.date() > day_start.date() else s
+
+    def hour_of(dt):
+        loc = dt.astimezone(tz)
+        return (loc - day_start).total_seconds() / 3600.0
+
+    def ms(dt):
+        return int(dt.timestamp() * 1000)
+
+    # --- 1. fixes: the only source of geometry ---------------------------------
+    # Fixes from before the window are read too (main() fetches back to the
+    # earliest cross-in visit), so a visit that began yesterday is judged on
+    # its whole life, not on the slice that happens to overlap today.
+    all_fixes, dropped_fixes = clean_fixes(rows, day_start - timedelta(hours=LOOKBACK_H), day_end)
+    fixes = [f for f in all_fixes if f["t"] >= day_start]
+    stays = stay_points(fixes)
+    stays += silence_stays(fixes, stays)
+
+    # --- 2. visit rows, reconciled against the fixes ---------------------------
+    # A row the user answered as "not a real stop" is MOVEMENT, not dwell. It is
+    # still the user's own words about that window, so it annotates the path -- but
+    # counting it as time-at-a-place once put 22.6 of 24 h "at stops" on a day
+    # the user walked 9.5 km, which is self-contradictory. "skip" is the same answer
+    # saved under the wrong type.
+    all_visits = [r for r in rows if r["segment_type"] == "visit"]
+    def is_nonstop(r):
+        return r.get("place_type") == "non-stop" or (clean_name(r.get("place_name")) or "").lower() in NONSTOP_WORDS
+    raw_visits = [r for r in all_visits if not is_nonstop(r)]
+    raw_nonstops = [r for r in all_visits if is_nonstop(r)]
+    anchor_silence_stays(stays, raw_visits)
+    mark_stays_at_named_places(stays, raw_visits)
+    rank = {"user-confirmed": 3, "named": 2, "address": 1, "stay-point": 1, "segment-derived": 0}
+
+    nonstops = [dict(start=ts(r["arrived_at"]), end=ts(r["departed_at"] or r["arrived_at"]),
+                     lat=r["latitude"], lon=r["longitude"], name=clean_name(r["place_name"]))
+                for r in sorted(raw_nonstops, key=lambda r: r["arrived_at"])]
+
+    unsupported, visits = [], []
+    for r in sorted(raw_visits, key=lambda r: r["arrived_at"]):
+        a, dpt = ts(r["arrived_at"]), ts(r["departed_at"] or r["arrived_at"])
+        v0 = dict(start=a, end=dpt, lat=r["latitude"], lon=r["longitude"], ptype=r["place_type"],
+                  name=clean_name(r["place_name"]))
+        spans, why = reconcile_visit(v0, all_fixes, stays)
+        claimed_min = round((dpt - a).total_seconds() / 60)
+        if not spans:
+            unsupported.append(dict(id=r["id"], name=clean_name(r["place_name"]), ptype=r["place_type"],
+                                    claimed=f"{hhmm(a)}–{hhmm(dpt, True)}", claimed_min=claimed_min,
+                                    lat=r["latitude"], lon=r["longitude"], reason=why))
+            continue
+        if not any(e > day_start and s < day_end for (s, e, _w, _c) in spans):
+            # the row claimed part of today, the fixes put all of it elsewhere
+            unsupported.append(dict(id=r["id"], name=clean_name(r["place_name"]), ptype=r["place_type"],
+                                    claimed=f"{hhmm(a)}–{hhmm(dpt, True)}", claimed_min=claimed_min,
+                                    kept=", ".join(f"{hhmm(s)}–{hhmm(e, True)}" for (s, e, _w, _c) in spans),
+                                    lat=r["latitude"], lon=r["longitude"],
+                                    reason="the fixes end it before today began"))
+            continue
+        # An unanswered card's default (2026-10-22, `findme guess`) is a guess:
+        # the map says so, and it ranks with the machine labels (rank 0).
+        vname = clean_name(r["place_name"])
+        if vname and r.get("place_type") == "default-applied":
+            vname = f"probably {vname}"
+        for (s, e, wit, corr) in spans:
+            if e <= day_start or s >= day_end:
+                continue            # clipped entirely out of this day
+            visits.append(dict(start=s, end=e, lat=r["latitude"], lon=r["longitude"],
+                               name=vname, ptype=r["place_type"],
+                               rank=rank.get(r["place_type"], 0), dupes=1, row_id=r["id"],
+                               # the span HE confirmed, kept apart from whatever
+                               # this row is later merged with (step 3, step 8)
+                               cstart=s if r["place_type"] == "user-confirmed" else None,
+                               cend=e if r["place_type"] == "user-confirmed" else None,
+                               witnessed_min=round(wit), corroborated_by=corr,
+                               clipped=(s != a or e != dpt),
+                               claimed=(hhmm(a), hhmm(dpt, True))))
+            if (s != a or e != dpt) and (dpt - a) - (e - s) > timedelta(minutes=30):
+                unsupported.append(dict(id=r["id"], name=clean_name(r["place_name"]), ptype=r["place_type"],
+                                        claimed=f"{hhmm(a)}–{hhmm(dpt, True)}", claimed_min=claimed_min,
+                                        kept=f"{hhmm(s)}–{hhmm(e, True)}",
+                                        lat=r["latitude"], lon=r["longitude"],
+                                        reason="clipped to what the fixes support"))
+
+    # --- 3. merge double-writes -------------------------------------------------
+    # ...but two of the user's ANSWERS under different names are two places, not one row
+    # written twice ("the café" for 10:18-10:57 inside "the flat" for 05:39-14:20, 41 m apart as the rows average it; merged, one name won the
+    # whole morning). Same rule as step 6's CONFIRMED_PLACE_M.
+    def two_answers(a, b):
+        return (a["ptype"] == "user-confirmed" and b["ptype"] == "user-confirmed"
+                and os.environ.get("JORI_ANSWER_OWN_PLACE") != "0"
+                and name_similarity(a["name"], b["name"]) < 0.80
+                and haversine((a["lat"], a["lon"]), (b["lat"], b["lon"])) >= 30)
+    merged = []
+    for v in sorted(visits, key=lambda v: v["start"]):
+        for m in merged:
+            if min(v["end"], m["end"]) > max(v["start"], m["start"]) \
+                    and haversine((v["lat"], v["lon"]), (m["lat"], m["lon"])) < DUP_M \
+                    and not two_answers(v, m):
+                m["start"], m["end"] = min(v["start"], m["start"]), max(v["end"], m["end"])
+                m["witnessed_min"] = max(m["witnessed_min"], v["witnessed_min"])
+                cs = [x for x in (m.get("cstart"), v.get("cstart")) if x]
+                ce = [x for x in (m.get("cend"), v.get("cend")) if x]
+                m["cstart"], m["cend"] = (min(cs) if cs else None), (max(ce) if ce else None)
+                if v["rank"] > m["rank"]:
+                    m.update(lat=v["lat"], lon=v["lon"], name=v["name"], ptype=v["ptype"], rank=v["rank"])
+                m["dupes"] += 1
+                break
+        else:
+            merged.append(v)
+    visits = merged
+
+    # --- 4. stay points the visit table never wrote ---------------------------
+    for st in stays:
+        covered = sum(max(0.0, (min(st["end"], v["end"]) - max(st["start"], v["start"])).total_seconds())
+                      for v in visits)
+        span = (st["end"] - st["start"]).total_seconds()
+        # A silence stay is a dwell only where it cut a visit row: one fix and a
+        # quiet phone is too little to add a stop anywhere the visit table is silent.
+        if st.get("silence") and not st.get("split_row"):
+            continue
+        if span > 0 and covered / span < 0.5:
+            # a silence stay was seen arriving, not sitting: nothing witnessed its length
+            visits.append(dict(start=st["start"], end=st["end"], lat=st["lat"], lon=st["lon"],
+                               name=None, ptype="stay-point", rank=1, dupes=1, row_id=None,
+                               # the silence walked_out() credited to it was not seen
+                               witnessed_min=0 if st.get("silence") else round(
+                                   (st["end"] - st.get("walked_in_from", st["start"])).total_seconds() / 60),
+                               corroborated_by="silence" if st.get("silence") else "fixes",
+                               silence=bool(st.get("silence")), clipped=False, claimed=None))
+    visits.sort(key=lambda v: v["start"])
+
+    # --- 5. an address visit of a few minutes on a walk IS the walk ------------
+    # "279–281 Main St", 1 min, then "449 Main St", 3 min: reverse-geocodes of
+    # where the phone happened to cluster on the way up the avenue. They are
+    # movement; drawing them as stops is what put a string of dots on the walk.
+    waypoints = [v for v in visits if v["ptype"] in ("address", "segment-derived")
+                 and (v["end"] - v["start"]).total_seconds() / 60 < WAYPOINT_MAX_MIN]
+    visits = [v for v in visits if v not in waypoints]
+
+    # --- 6. one place, one identity ---------------------------------------------
+    # The apartment's stops merge into one. The apartment was written as "the
+    # apartment", "5 Rue Example" and "1 Rue Example" -- three names for one
+    # address, so it drew three markers.
+    # Visits within PLACE_M of each other are the same place; the best-ranked
+    # name wins for all of them, and the map draws ONE marker carrying the
+    # day's total dwell. Rank ties go to the LONGER visit, never the earlier:
+    # once two `address` rows 144 m apart -- the sweeper's 61-minute
+    # "354-358 Oak Ave" and the 139-minute "131 Elm St" the user actually sat at
+    # (a jazz club) -- merged, and arrival order let the short one name and place
+    # the marker. A place is where the user spent the evening, not where the
+    # first geocode on the way in landed.
+    PLACE_M = 150
+    PLACE_M_FUZZY = 700      # same name, GPS drifted indoors (see resolve-day)
+    NAME_SIM_MIN = 0.80
+    # Confirmed-vs-confirmed distance (see CONFIRMED_STOP_MATCH_M in
+    # location-segment): a dense block can fit several distinct, independently
+    # confirmed stalls inside PLACE_M. Once two different user-confirmed visits
+    # ~102m apart in a market (a 31-minute food stall and a 43-minute coffee stand)
+    # merged on plain distance and the longer one's name silently overwrote the
+    # shorter one's -- the daily summary reported the food stall's whole visit as
+    # the coffee stand. A confirmed name is
+    # gospel (resolve-day.js), so two DIFFERENT confirmed names must stay apart
+    # unless they're genuinely close together, not just within market-block range.
+    CONFIRMED_PLACE_M = 30
+    VERDICT_PTYPES = ("user-confirmed", "named")
+
+    def visit_minutes(v):
+        return (v["end"] - v["start"]).total_seconds() / 60
+
+    def outranks(v, pl):
+        if v["rank"] != pl["rank"]:
+            return v["rank"] > pl["rank"]
+        if bool(v["name"]) != bool(pl["name"]):
+            return bool(v["name"])
+        return visit_minutes(v) > pl["mins"]
+
+    def same_name(v, pl):
+        return bool(v["name"]) and bool(pl["name"]) and name_similarity(v["name"], pl["name"]) >= NAME_SIM_MIN
+
+    places = []
+    for v in visits:
+        # Nearest place first: a visit joins the closest place it qualifies for, not
+        # the first one the day built. The case: the evening stay at the flat sat 13 m
+        # from the flat's own place (named on arrival at 17:43) but joined the place the
+        # morning had renamed for a café (72 m), because that place came first in the
+        # list, and the night at home came out "8:18pm · <the café>". JORI_NEAREST_PLACE=0 restores first-built order.
+        order = places if os.environ.get("JORI_NEAREST_PLACE") == "0" else sorted(
+            places, key=lambda pl: haversine((v["lat"], v["lon"]), (pl["lat"], pl["lon"])))
+        for pl in order:
+            dd = haversine((v["lat"], v["lon"]), (pl["lat"], pl["lon"]))
+            # A silence stay is somewhere the row it cut is not, placed by one
+            # precise fix: it is another place's visit only if it is AT that place
+            # (the 30 m naming radius), not merely in the same market block.
+            if v.get("silence"):
+                if dd < CONFIRMED_PLACE_M:
+                    pl["members"].append(v)
+                    break
+                continue
+            # A place the user named INSIDE another place's longer visit is a stop within
+            # that stay, not more of it (the user's answer for a café, 10:18-10:57, sat
+            # 104 m from the flat's anchor inside the flat's 05:39-14:20 row; it joined the
+            # flat's place, outranked it, and the whole day at the flat became the café). Unless it is AT that place, it is its own.
+            if v.get("ptype") == "user-confirmed" and not same_name(v, pl) and dd >= CONFIRMED_PLACE_M \
+                    and os.environ.get("JORI_ANSWER_OWN_PLACE") != "0" \
+                    and any(m is not v and m["start"] <= v["start"] and v["end"] <= m["end"]
+                            and (m["end"] - m["start"]) > (v["end"] - v["start"]) for m in pl["members"]):
+                continue
+            # Two DIFFERENT names that are each a verdict -- the user's answer, or the
+            # phone naming one of the user's places on arrival (`named`) -- are two places
+            # unless they are AT each other. The case: the flat (named on arrival 10:41)
+            # and a café (named on arrival 14:12) 73 m apart; the café row joined the
+            # flat's place, won the tie on length, and the overnight and the late morning
+            # at the flat both came out as the café. Before, only two answers were kept apart this way.
+            if v.get("ptype") in VERDICT_PTYPES and pl.get("ptype") in VERDICT_PTYPES \
+                    and not same_name(v, pl) \
+                    and (v.get("ptype") == pl.get("ptype") == "user-confirmed"
+                         or os.environ.get("JORI_NAMED_OWN_PLACE") != "0"):
+                if dd < CONFIRMED_PLACE_M:
+                    pl["members"].append(v)
+                    if outranks(v, pl):
+                        pl.update(name=v["name"], rank=v["rank"], lat=v["lat"], lon=v["lon"],
+                                  mins=visit_minutes(v), ptype=v["ptype"])
+                    break
+                continue
+            if dd < PLACE_M or (dd < PLACE_M_FUZZY and same_name(v, pl)):
+                pl["members"].append(v)
+                if outranks(v, pl):
+                    pl.update(name=v["name"], rank=v["rank"], lat=v["lat"], lon=v["lon"],
+                              mins=visit_minutes(v), ptype=v["ptype"])
+                break
+        else:
+            places.append(dict(name=v["name"], rank=v["rank"], lat=v["lat"], lon=v["lon"],
+                               mins=visit_minutes(v), members=[v], ptype=v.get("ptype")))
+    venue_map = load_venue_map(date_str, statements)
+    label_map = load_venue_map(date_str, statements, labels_only=True)
+    for pl in places:
+        key = norm_name(pl["name"])
+        v2 = venue_map.get(key)
+        if not v2 and key:
+            # "Lunch at Cafe Example (Turkish, ...)" contains "Cafe Example" -- but
+            # only for a stored label the model split. A place name the user merely
+            # said is not a split of anything: "The Flat" (the user's answer) is
+            # contained in "The Old Town Flat" (the flat's own name) and renamed it.
+            for stored_key, venue in label_map.items():
+                vk = norm_name(venue)
+                if vk and len(vk) > 3 and vk in key:
+                    v2 = venue
+                    break
+        if v2:
+            pl["name"] = v2
+    for pi, pl in enumerate(places):
+        for v in pl["members"]:
+            v["place_id"] = pi
+            v["name"] = pl["name"]          # one canonical name
+            v["place_lat"], v["place_lon"] = pl["lat"], pl["lon"]
+            v["place_visits"] = len(pl["members"])
+
+    # --- 7. conflicts, on the reconciled rows, BEFORE clipping to the day -------
+    conflicts = []
+    for i, x in enumerate(visits):
+        for y in visits[i + 1:]:
+            ov = (min(x["end"], y["end"]) - max(x["start"], y["start"])).total_seconds() / 60
+            dist = haversine((x["lat"], x["lon"]), (y["lat"], y["lon"]))
+            if ov > 0 and dist >= CONFLICT_M:
+                conflicts.append(dict(
+                    a=x["name"] or "unlabelled", b=y["name"] or "unlabelled",
+                    at=hhmm(max(x["start"], y["start"])), m=round(dist), ov_min=round(ov),
+                    lat=(x["lat"] + y["lat"]) / 2, lon=(x["lon"] + y["lon"]) / 2,
+                    impossible=dist > 5000))
+
+    for v in visits:
+        v["cross_in"] = v["start"] < day_start
+        v["cross_out"] = v["end"] > day_end
+        v["start"], v["end"] = max(v["start"], day_start), min(v["end"], day_end)
+    visits = [v for v in visits if v["end"] > v["start"] or v["cross_in"]]
+    for n in nonstops:
+        n["start"], n["end"] = max(n["start"], day_start), min(n["end"], day_end)
+    nonstops = [n for n in nonstops if n["end"] > n["start"]]
+
+    # --- 8. dwells: a non-overlapping sequence -----------------------------------
+    # Same place, back to back -> one dwell. Different places overlapping -> the
+    # lower-ranked one yields the overlap (it is already in `conflicts`).
+    # Two rows of one rank that start at the same instant are tied, and the database
+    # returns a tie in no fixed order (`order=arrived_at.asc` only). The tie goes to
+    # the row the fixes witnessed, then the longer one. The case: "4 Example Street"
+    # (the flat, 160 min witnessed) and "15 Example Street" (a pass-by on the walk
+    # home from coffee, 0 min witnessed) both arrived 09:04:46; one build gave the
+    # flat the morning, the next gave 09:04-09:27 to a stop the user never made.
+    dwells = []
+    for v in sorted(visits, key=lambda v: (v["start"], -v["rank"], -v["witnessed_min"],
+                                           -(v["end"] - v["start"]).total_seconds())):
+        if dwells:
+            last = dwells[-1]
+            if v["place_id"] == last["place_id"] and \
+                    (v["start"] - last["end"]).total_seconds() / 60 <= SAME_PLACE_GAP_MIN:
+                last["end"] = max(last["end"], v["end"])
+                last["members"].append(v)
+                last["witnessed_min"] += v["witnessed_min"]
+                continue
+            if v["start"] < last["end"]:
+                # An answer inside another place's longer stay is a stop within it:
+                # the stay resumes after it instead of ending (or swallowing it).
+                tail = None
+                if v["ptype"] == "user-confirmed" and v["rank"] >= last["rank"] and v["end"] < last["end"] \
+                        and os.environ.get("JORI_ANSWER_OWN_PLACE") != "0":
+                    tail = dict(last, start=v["end"], members=list(last["members"]), trimmed=True)
+                    last["end"] = v["start"]
+                    last["trimmed"] = True
+                elif v["rank"] > last["rank"]:
+                    last["end"] = v["start"]
+                    last["trimmed"] = True
+                else:
+                    v["start"] = last["end"]
+                    v["trimmed"] = True
+                if last["end"] <= last["start"]:
+                    dwells.pop()
+                if tail is not None:
+                    dwells.append(dict(v, members=[v]))
+                    dwells.append(tail)
+                    continue
+        if v["end"] > v["start"] or v["cross_in"]:
+            dwells.append(dict(v, members=[v]))
+    dwells = [dw for dw in dwells if dw["end"] > dw["start"]]
+
+    def in_dwell(p):
+        return any(dw["start"] <= p["t"] <= dw["end"]
+                   and haversine((p["lat"], p["lon"]), (dw["lat"], dw["lon"])) < DWELL_ABSORB_M
+                   for dw in dwells)
+
+    moving = [p for p in fixes if not in_dwell(p)]
+    if not dwells and not moving:
+        sys.exit(f"no location data overlapping {date_str} in {tzname}")
+
+    # --- 9. legs: the fixes between consecutive dwells -------------------------
+    # A leg is anchored to the dwell's canonical point at each end -- the place
+    # the marker is drawn at -- so the line meets the marker instead of ending
+    # on whichever fix the phone last managed 40 m away. A visit's coordinates
+    # never enter a leg anywhere else: visits own TIME, fixes own GEOMETRY.
+    def anchor(dw, t):
+        return dict(t=t, lat=dw["place_lat"], lon=dw["place_lon"], acc=30, kind="anchor")
+
+    legs = []
+    bounds = [(None, dwells[0])] if dwells else [(None, None)]
+    for a, b in zip(dwells, dwells[1:]):
+        bounds.append((a, b))
+    if dwells:
+        bounds.append((dwells[-1], None))
+    for (a, b) in bounds:
+        t0 = a["end"] if a else day_start
+        t1 = b["start"] if b else day_end
+        pts = [p for p in moving if t0 <= p["t"] <= t1]
+        gap_min = (t1 - t0).total_seconds() / 60
+        if not pts and (a is None or b is None or gap_min < SAME_PLACE_GAP_MIN):
+            continue
+        if not pts and a["place_id"] == b["place_id"]:
+            continue                        # same place, a moment apart: nothing moved
+        if a is None and b is None:
+            pass                            # a day with no dwell at all: one leg
+        seq = ([anchor(a, t0)] if a else []) + pts + ([anchor(b, t1)] if b else [])
+        if len(seq) < 2:
+            continue
+        legs.append(dict(from_dwell=a, to_dwell=b, pts=seq, bridged=not pts))
+
+    # --- 10. holes: where the phone was not looking ----------------------------
+    # Relative to the leg's own sampling, not an absolute clock: a 5-minute,
+    # 1.5 km jump in a walk sampled every 250 m is a hole even though it is
+    # under the old 12-minute test (2026-09-06, 35th St to 14th St).
+    for leg in legs:
+        pts = leg["pts"]
+        steps = [_dist(x, y) for x, y in zip(pts, pts[1:])]
+        secs = [max(1.0, (y["t"] - x["t"]).total_seconds()) for x, y in zip(pts, pts[1:])]
+        speeds = [d / s for d, s in zip(steps, secs)]
+        # An anchor's time is the visit row's departure/arrival, which lags or
+        # leads the first real fix by a minute either way: never read a speed
+        # off a pair that touches one.
+        real = [x["kind"] != "anchor" and y["kind"] != "anchor" for x, y in zip(pts, pts[1:])]
+        med_speed = _median([v for v, r in zip(speeds, real) if v > 0 and r])
+        holes = []
+        for i, (d, s, sp) in enumerate(zip(steps, secs, speeds)):
+            # the step is measured against the OTHER steps of its leg: with
+            # four steps a plain median lands on the second-largest, and a
+            # 1.5 km jump hides behind a 570 m one (2026-09-06, 35th -> 14th)
+            others = [x for j, x in enumerate(steps) if j != i and x > 0]
+            big = d > max(HOLE_ABS_M, HOLE_STEP_X * _median(others)) if others else d > HOLE_ABS_M
+            fast = real[i] and d > 150 and med_speed > 0 and sp > HOLE_SPEED_X * med_speed and s >= 30
+            if big or fast or (leg["bridged"] and d > HOLE_ABS_M):
+                pts[i + 1]["hole_from_prev"] = True
+                holes.append(dict(i=i, t0=pts[i]["t"], t1=pts[i + 1]["t"], m=round(d),
+                                  min=round(s / 60), straight=True))
+        leg["holes"] = holes
+        forced = {0, len(pts) - 1} | {h["i"] for h in holes} | {h["i"] + 1 for h in holes}
+        leg["route_pts"] = simplify(pts, forced=forced)
+
+    # --- 11. route ---------------------------------------------------------------
+    segments = []
+    for leg in legs:
+        seg = dict(kind="inferred" if leg["bridged"] else "observed",
+                   pts=leg["pts"], route_pts=leg["route_pts"], holes=leg["holes"], leg=leg)
+        if leg["bridged"]:
+            seg["gap_min"] = round((leg["pts"][-1]["t"] - leg["pts"][0]["t"]).total_seconds() / 60)
+            seg["dist_m"] = round(_dist(leg["pts"][0], leg["pts"][-1]))
+        segments.append(seg)
+    if do_match:
+        if verbose:
+            print(f"map-matching {len(segments)} legs...", file=sys.stderr)
+        match_segments(segments, verbose)
+    for seg in segments:
+        seg.setdefault("matched", [])
+        seg.setdefault("streets", [])
+        seg.setdefault("matched_m", 0.0)
+        seg.setdefault("legs", [])
+        seg.setdefault("runs", [])
+        seg.setdefault("costing", costing_for(seg["pts"]) if len(seg["pts"]) > 1 else "pedestrian")
+        seg.setdefault("median_kmh", median_kmh(seg["pts"]))
+        # straight-line floor, per pair, so an unrouted day still has distances
+        seg["straight_m"] = sum(_dist(x, y) for x, y in zip(seg["pts"], seg["pts"][1:]))
+        seg["hole_m"] = sum(r["m"] for r in seg["runs"] if r["hole"]) if seg["runs"] \
+            else sum(h["m"] for h in seg["holes"])
+        for h in seg["holes"]:
+            for r in seg["runs"]:
+                if r["hole"] and r["t0"] == h["t0"]:
+                    h["m"], h["straight"] = r["m"], False
+
+    # --- 12. numbers, all from the same nodes -------------------------------------
+    def seg_m(seg):
+        return seg["matched_m"] or seg["straight_m"]
+    matched_m = sum(seg["matched_m"] for seg in segments)
+    total_m = sum(seg_m(seg) for seg in segments)
+    walked_m = sum(walk_metres(seg["matched_m"], seg["straight_m"], seg["pts"]) * walked_share(seg["pts"])
+                   for seg in segments if leg_mode(seg["median_kmh"]) == "walking")
+    hole_m = sum(seg["hole_m"] for seg in segments)
+    n_matched = sum(1 for s in segments if s.get("matched"))
+    dwell_min = sum((dw["end"] - dw["start"]).total_seconds() / 60 for dw in dwells)
+    moving_min = max(0.0, 24 * 60 - dwell_min)
+    covered = sum((s["pts"][-1]["t"] - s["pts"][0]["t"]).total_seconds() / 60 for s in segments) + dwell_min
+
+    def is_major(dw):
+        return (dw["end"] - dw["start"]).total_seconds() / 60 >= DWELL_MARKER_MIN \
+            or dw["ptype"] == "user-confirmed"
+
+    out_places = []
+    for pi, pl in enumerate(places):
+        mem = [dw for dw in dwells if dw["place_id"] == pi]
+        if not mem:
+            continue
+        mins = round(sum((dw["end"] - dw["start"]).total_seconds() / 60 for dw in mem))
+        out_places.append(dict(lat=pl["lat"], lon=pl["lon"], name=pl["name"], visits=len(mem), mins=mins,
+                               start=hhmm(min(dw["start"] for dw in mem)),
+                               hour=hour_of(min(dw["start"] for dw in mem)),
+                               ptype=max(mem, key=lambda m: m["rank"])["ptype"],
+                               major=any(is_major(dw) for dw in mem)))
+
+    # A dwell is the merged place's whole stay; the rows the user CONFIRMED inside
+    # it may cover only part of that (a market hall was a 42-minute
+    # confirmed row inside a 171-minute address row for the same building —
+    # the movie next door was the rest). Carry the confirmed rows' own span so
+    # a reader can tell the user's window from the cluster's.
+    def confirmed_span(dw):
+        cs = [m["cstart"] for m in dw["members"] if m.get("cstart")]
+        ce = [m["cend"] for m in dw["members"] if m.get("cend")]
+        if not cs or not ce:
+            return None, None
+        return ms(min(cs)), ms(max(ce))
+
+    def _cspan(dw, i):
+        return confirmed_span(dw)[i]
+
+    # At the place's own point, as the spine and the legs draw it (step 6: the
+    # longer visit places it), never the first row's: 2026-10-20 the lunch at The
+    # Old Man & The Sea came in through a 13:20 row 256 m up the road from the
+    # table he sat at from 13:31, and resolve-day pinned the whole lunch there.
+    out_visits = [dict(lat=dw.get("place_lat", dw["lat"]), lon=dw.get("place_lon", dw["lon"]), name=dw["name"],
+                       ptype=max(dw["members"], key=lambda m: m["rank"])["ptype"],
+                       place_id=dw.get("place_id"),
+                       start_ms=ms(dw["start"]), end_ms=ms(dw["end"]),
+                       confirmed_start_ms=_cspan(dw, 0), confirmed_end_ms=_cspan(dw, 1),
+                       start=hhmm(dw["start"]), end=hhmm(dw["end"], True),
+                       mins=round((dw["end"] - dw["start"]).total_seconds() / 60),
+                       dupes=sum(m["dupes"] for m in dw["members"]),
+                       cross_in=dw["cross_in"], cross_out=dw["cross_out"],
+                       hour=hour_of(dw["start"]), witnessed_min=dw["witnessed_min"],
+                       corroborated_by=dw["corroborated_by"], major=is_major(dw))
+                  for dw in dwells]
+
+    out_nonstops = [dict(lat=n["lat"], lon=n["lon"], name=n["name"],
+                         start=hhmm(n["start"]), end=hhmm(n["end"], True),
+                         mins=round((n["end"] - n["start"]).total_seconds() / 60),
+                         hour=hour_of(n["start"]))
+                    for n in nonstops]
+
+    out_segments = [dict(kind=s["kind"],
+                         coords=[[round(p["lat"], 6), round(p["lon"], 6)] for p in s["pts"]],
+                         hours=[hour_of(p["t"]) for p in s["pts"]],
+                         matched=[[round(c[0], 6), round(c[1], 6)] for c in (s.get("matched") or [])],
+                         runs=[dict(coords=r["coords"], hole=r["hole"], m=r["m"],
+                                    h0=hour_of(r["t0"]), h1=hour_of(r["t1"])) for r in s["runs"]],
+                         holes=[dict(t0=hhmm(h["t0"]), t1=hhmm(h["t1"], True), m=h["m"], min=h["min"],
+                                     start_ms=ms(h["t0"]), end_ms=ms(h["t1"]),
+                                     lat=(s["pts"][h["i"]]["lat"] + s["pts"][h["i"] + 1]["lat"]) / 2,
+                                     lon=(s["pts"][h["i"]]["lon"] + s["pts"][h["i"] + 1]["lon"]) / 2)
+                                for h in s["holes"]],
+                         streets=s.get("streets") or [], costing=s.get("costing"),
+                         median_kmh=s.get("median_kmh"), mode=leg_mode(s.get("median_kmh")),
+                         matched_m=round(s.get("matched_m") or 0), straight_m=round(s["straight_m"]),
+                         hole_m=round(s["hole_m"]),
+                         legs=s.get("legs") or [],
+                         t0=hhmm(s["pts"][0]["t"]), t1=hhmm(s["pts"][-1]["t"], True),
+                         start_ms=ms(s["pts"][0]["t"]), end_ms=ms(s["pts"][-1]["t"]),
+                         gap_min=s.get("gap_min"), dist_m=s.get("dist_m"))
+                    for s in segments]
+
+    # --- 13. the spine: the day as one ordered sequence ---------------------------
+    # dwell -> leg -> dwell -> ... Every downstream reader walks THIS; nothing
+    # should intersect time windows against segments to guess what happened
+    # between two stops (that is how "first two streets of the whole day" got
+    # printed on every leg, 2026-08-06).
+    words = attach_words(statements, tz, day_start)
+    spine, seg_i = [], 0
+    dwell_index = {id(dw): k for k, dw in enumerate(dwells)}
+
+    def dwell_node(dw, k):
+        v = out_visits[k]
+        tier = ("user-confirmed" if dw["ptype"] == "user-confirmed" else
+                "corroborated" if dw["ptype"] in ("named", "address") and dw["corroborated_by"] else
+                "stay-point" if dw["ptype"] == "stay-point" else
+                "unwitnessed" if not dw["corroborated_by"] else "recorded")
+        return dict(type="dwell", id=f"d{k}", place=dict(name=dw["name"], tier=tier, ptype=dw["ptype"],
+                                                            lat=dw["place_lat"], lon=dw["place_lon"],
+                                                            place_id=dw.get("place_id")),
+                    start=v["start"], end=v["end"], start_ms=v["start_ms"], end_ms=v["end_ms"],
+                    mins=v["mins"], witnessed_min=v["witnessed_min"], corroborated_by=v["corroborated_by"],
+                    cross_in=v["cross_in"], cross_out=v["cross_out"], major=v["major"],
+                    trimmed=bool(dw.get("trimmed")), clipped=any(m.get("clipped") for m in dw["members"]),
+                    his_words=words.for_dwell(dw), evidence=[m["row_id"] for m in dw["members"] if m["row_id"]])
+
+    def leg_node(seg, k):
+        leg = seg["leg"]
+        a, b = leg["from_dwell"], leg["to_dwell"]
+        os_ = out_segments[k]
+        conf = ("bridged" if leg["bridged"] else "partly inferred" if seg["holes"] else "observed")
+        return dict(type="leg", id=f"l{k}",
+                    **{"from": f"d{dwell_index[id(a)]}" if a else None, "to": f"d{dwell_index[id(b)]}" if b else None},
+                    from_name=a["name"] if a else None, to_name=b["name"] if b else None,
+                    mode=leg_mode(seg["median_kmh"]), costing=os_["costing"], median_kmh=seg["median_kmh"],
+                    mode_uncertain=bool(seg["median_kmh"] is not None and 7 <= seg["median_kmh"] < 22),
+                    start=os_["t0"], end=os_["t1"], start_ms=os_["start_ms"], end_ms=os_["end_ms"],
+                    mins=round((seg["pts"][-1]["t"] - seg["pts"][0]["t"]).total_seconds() / 60),
+                    routed_m=os_["matched_m"], straight_m=os_["straight_m"], hole_m=os_["hole_m"],
+                    walked_m=(round(walk_metres(os_["matched_m"], os_["straight_m"], seg["pts"]) * walked_share(seg["pts"]))
+                              if leg_mode(seg["median_kmh"]) == "walking" else 0),
+                    geometry="map_matched" if os_["matched_m"] else "straight_line",
+                    streets=os_["streets"], holes=os_["holes"], confidence=conf,
+                    fixes=sum(1 for p in seg["pts"] if p["kind"] == "fix"),
+                    # when the phone actually saw him moving -- the leg's span
+                    # runs dwell-to-dwell and can be mostly a quiet phone
+                    first_fix=next((hhmm(p["t"]) for p in seg["pts"] if p["kind"] == "fix"), None),
+                    last_fix=next((hhmm(p["t"], True) for p in reversed(seg["pts"]) if p["kind"] == "fix"), None),
+                    his_words=words.for_leg(seg["pts"][0]["t"], seg["pts"][-1]["t"]))
+
+    for seg in segments:
+        seg["_k"] = seg_i
+        seg_i += 1
+    k_leg = 0
+    pending = [s for s in segments if s["leg"]["from_dwell"] is None]
+    for s in pending:
+        spine.append(leg_node(s, s["_k"]))
+    for k, dw in enumerate(dwells):
+        spine.append(dwell_node(dw, k))
+        for s in segments:
+            if s["leg"]["from_dwell"] is dw:
+                spine.append(leg_node(s, s["_k"]))
+
+    stats = dict(
+        date=date_str, tz=tzname,
+        window=f"{hhmm(day_start)} {date_str} → 24h",
+        fixes=len(fixes), raw_fixes=len([r for r in rows if r["segment_type"] != "visit"]),
+        dropped_fixes=dropped_fixes,
+        visits=len(dwells), stops=sum(1 for dw in dwells if is_major(dw)),
+        raw_visits=len(all_visits), nonstops=len(nonstops),
+        unsupported=len(unsupported), waypoints=len(waypoints), stay_points=len(stays),
+        moving_h=round(moving_min / 60, 1),
+        dup_writes=sum(v["dupes"] - 1 for v in visits),
+        conflicts=len(conflicts), impossible=sum(1 for c in conflicts if c["impossible"]),
+        observed_km=round((total_m - hole_m) / 1000, 1),
+        inferred_km=round(hole_m / 1000, 1),
+        straight_km=round(sum(s["straight_m"] for s in segments) / 1000, 1),
+        matched_km=round(matched_m / 1000, 1),
+        walked_km=round(walked_m / 1000, 1),
+        matched_segments=n_matched, total_segments=len(segments),
+        match_pct=round(100 * n_matched / max(1, len(segments))),
+        dwell_h=round(dwell_min / 60, 1), coverage_pct=min(100, round(100 * covered / (24 * 60))),
+        # Routed distance and movement time must imply a believable pace. When
+        # they do not, the day's records contradict each other.
+        implied_kmh=round(total_m / 1000 / max(0.05, moving_min / 60), 1),
+        # walking pace over the time the phone actually SAW him walking, on
+        # legs it saw enough of; dwell-to-dwell spans include the quiet phone
+        # before and after a walk and read 1.4 km/h for a 5 km/h day
+        pace_kmh=walking_pace(segments),
+        bridges=sum(1 for s in segments if s["kind"] == "inferred"),
+        holes=sum(len(s["holes"]) for s in segments),
+        first=hhmm(min([dw["start"] for dw in dwells] + [s["pts"][0]["t"] for s in segments])),
+        last=hhmm(max([dw["end"] for dw in dwells] + [s["pts"][-1]["t"] for s in segments]), True),
+        places=len(out_places))
+
+    out_unsupported = [dict(u, lat=round(u["lat"], 6), lon=round(u["lon"], 6)) for u in unsupported]
+    out_waypoints = [dict(name=w["name"], start=hhmm(w["start"]), mins=round((w["end"] - w["start"]).total_seconds() / 60),
+                          lat=round(w["lat"], 6), lon=round(w["lon"], 6)) for w in waypoints]
+    return dict(stats=stats, segments=out_segments, visits=out_visits, conflicts=conflicts,
+                nonstops=out_nonstops, places=out_places, spine=spine,
+                unsupported_records=out_unsupported, waypoint_visits=out_waypoints)
+
+
+class attach_words:
+    """The user's own statements (from `day-statements`, a model's reading of the
+    user's messages -- never a regex here) attached to the node whose window they
+    fall in. Dwells match on the stored label or on the venue name; legs take the
+    movement statements ("evening walk with the dog": venue null) by time."""
+    def __init__(self, doc, tz, day_start):
+        self.doc = doc or {}
+        self.tz, self.day_start = tz, day_start
+
+    def _at(self, hhmm_s):
+        m = re.match(r"^(\d{1,2}):(\d{2})", str(hhmm_s or ""))
+        if not m:
+            return None
+        return self.day_start + timedelta(hours=int(m.group(1)), minutes=int(m.group(2)))
+
+    def for_dwell(self, dw):
+        out = []
+        names = {norm_name(m.get("name")) for m in dw["members"] if m.get("name")} | {norm_name(dw["name"])}
+        names.discard("")
+        for l in self.doc.get("labels", []) or []:
+            if norm_name(l.get("stored")) in names or (l.get("venue") and norm_name(l["venue"]) in names):
+                out.append(dict(kind="label", venue=l.get("venue"), activity=l.get("activity"), stored=l.get("stored")))
+        for p in self.doc.get("places", []) or []:
+            if not p.get("venue"):
+                continue
+            hit = norm_name(p["venue"]) in names or norm_name(p.get("name")) in names
+            if not hit:
+                t = self._at(p.get("when_hint"))
+                hit = t is not None and dw["start"] <= t <= dw["end"]
+            if hit:
+                out.append(dict(kind="said", venue=p.get("venue"), activity=p.get("activity"),
+                                evidence=p.get("evidence"), companions=p.get("companions") or [],
+                                sentiment=p.get("sentiment")))
+        return out
+
+    def for_leg(self, t0, t1):
+        out = []
+        for p in self.doc.get("places", []) or []:
+            if p.get("venue"):
+                continue
+            t = self._at(p.get("when_hint")) or self._at(p.get("said_at"))
+            if t is not None and t0 <= t <= t1:
+                out.append(dict(kind="movement", activity=p.get("activity"), evidence=p.get("evidence"),
+                                companions=p.get("companions") or []))
+        for n in self.doc.get("non_stops", []) or []:
+            t = self._at(n.get("covers")) or self._at(n.get("said_at"))
+            if t is not None and t0 <= t <= t1:
+                out.append(dict(kind="non-stop", evidence=n.get("evidence")))
+        return out
+
+
+CHROME = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+MAP_BUCKET, MAP_PREFIX = "daily-photos", "maps"
+
+
+def render_png(html_path, out_png, width=1080, height=680):
+    """Screenshot the SAME html the interactive view uses.
+
+    Email cannot run Leaflet, so the summary needs a static image -- but keeping
+    a second tile-stitching renderer would mean two map styles drifting apart.
+    Headless Chrome renders the one definition; there is no second codebase.
+    The throwaway --user-data-dir matters: without it headless Chrome leaks a
+    scoped_dir profile + cache under ~/Library on every render.
+    """
+    with tempfile.TemporaryDirectory(prefix="day-path-chrome-", ignore_cleanup_errors=True) as profile:
+        subprocess.run(
+            [CHROME, "--headless=new", "--use-mock-keychain", "--disable-gpu", "--hide-scrollbars",
+             f"--user-data-dir={profile}", f"--disk-cache-dir={profile}/cache",
+             "--force-device-scale-factor=2", f"--window-size={width},{height}",
+             "--virtual-time-budget=20000", f"--screenshot={out_png}",
+             f"file://{html_path}"],
+            check=True, capture_output=True, timeout=120)
+    if not os.path.exists(out_png) or os.path.getsize(out_png) < 5000:
+        raise RuntimeError("chrome produced no usable screenshot")
+    return out_png
+
+
+def upload_png(png_path, date_str):
+    key = load_env().get("SUPABASE_SERVICE_ROLE_KEY") or os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
+    obj = f"{MAP_PREFIX}/{date_str}.png"
+    url = f"{SUPABASE_URL}/storage/v1/object/{MAP_BUCKET}/{obj}"
+    data = open(png_path, "rb").read()
+    req = urllib.request.Request(url, data=data, method="POST", headers={
+        "apikey": key, "Authorization": f"Bearer {key}",
+        "Content-Type": "image/png", "x-upsert": "true",
+        "cache-control": "public, max-age=2592000"})
+    with urllib.request.urlopen(req, timeout=90) as r:
+        if r.status not in (200, 201):
+            raise RuntimeError(f"map upload failed: {r.status}")
+    return f"{SUPABASE_URL}/storage/v1/object/public/{MAP_BUCKET}/{obj}"
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("date")
+    ap.add_argument("--tz", default=None, help="origin IANA tz (default: travel timeline)")
+    ap.add_argument("--out", default=None)
+    ap.add_argument("--json", action="store_true")
+    ap.add_argument("--spine", action="store_true",
+                    help="print only the day spine (dwell -> leg -> dwell ...) and stats")
+    ap.add_argument("--no-match", action="store_true", help="skip map matching")
+    ap.add_argument("-v", "--verbose", action="store_true")
+    ap.add_argument("--png", metavar="FILE", nargs="?", const="auto",
+                    help="also render a static PNG (headless Chrome)")
+    ap.add_argument("--stats-override", metavar="JSON",
+                    help="merge reconciled stats in (resolve-day passes these)")
+    ap.add_argument("--upload", action="store_true",
+                    help="upload the PNG to Supabase storage and print its URL")
+    a = ap.parse_args()
+
+    tzname = origin_tz(a.date, a.tz)
+    tz = ZoneInfo(tzname)
+    d0 = datetime.combine(datetime.strptime(a.date, "%Y-%m-%d").date(),
+                          datetime.min.time(), tzinfo=tz)
+    d0u, d1u = d0.astimezone(timezone.utc), (d0 + timedelta(hours=24)).astimezone(timezone.utc)
+    rows = fetch(d0u, d1u)
+    # A visit that began before the day is judged on its whole life: read the
+    # fixes back to its arrival (capped), so "every fix during it is elsewhere"
+    # can be said of a stale row and "he was there all night" of a real one.
+    earliest = min([ts(r["arrived_at"]) for r in rows if r["segment_type"] == "visit"] + [d0u])
+    if earliest < d0u:
+        rows += fetch_fixes(max(earliest, d0u - timedelta(hours=LOOKBACK_H)), d0u)
+    day = build(a.date, tzname, rows, do_match=not a.no_match, verbose=a.verbose,
+                statements=load_statements(a.date))
+    stats, segments, visits, conflicts, nonstops, places = (
+        day["stats"], day["segments"], day["visits"], day["conflicts"], day["nonstops"], day["places"])
+    if a.stats_override:
+        stats.update(json.loads(a.stats_override))
+
+    html_src = open(TEMPLATE).read()
+    for token, val in (("__SEGMENTS__", segments), ("__VISITS__", visits),
+                       ("__NONSTOPS__", nonstops), ("__CONFLICTS__", conflicts),
+                       ("__PLACES__", places), ("__STATS__", stats),
+                       ("__UNSUPPORTED__", day["unsupported_records"])):
+        html_src = html_src.replace(token, json.dumps(val, separators=(",", ":")))
+    out = a.out or f"/tmp/day-path-{a.date}.html"
+    open(out, "w").write(html_src)
+
+    if a.png or a.upload:
+        png = (a.png if a.png and a.png != "auto" else f"/tmp/day-path-{a.date}.png")
+        pf = out.replace(".html", ".print.html")
+        open(pf, "w").write(html_src.replace("<body>", '<body class="print">'))
+        try:
+            render_png(pf, png)
+            stats["png"] = png
+            if a.upload:
+                stats["map_url"] = upload_png(png, a.date)
+        except Exception as e:
+            # A missing map must never fail the day's resolve.
+            print(f"map render failed: {e}", file=sys.stderr)
+
+    if a.spine:
+        print(json.dumps(dict(stats=stats, spine=day["spine"],
+                              unsupported_records=day["unsupported_records"],
+                              waypoint_visits=day["waypoint_visits"]), indent=1))
+        return
+    if a.json:
+        print(json.dumps(dict(stats=stats, visits=visits, places=places,
+                              nonstops=nonstops, conflicts=conflicts,
+                              segments=segments, spine=day["spine"],
+                              unsupported_records=day["unsupported_records"],
+                              waypoint_visits=day["waypoint_visits"]), indent=1))
+        return
+
+    print(json.dumps(stats, indent=1))
+    print("wrote", out)
+
+
+if __name__ == "__main__":
+    main()

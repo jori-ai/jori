@@ -1,0 +1,97 @@
+#!/usr/bin/env node
+// p1-task — create or close the Google Task that belongs to a P1 email.
+//
+//   p1-task add <messageId> --title "<title>" [--due YYYY-MM-DD] [--notes "<text>"]
+//       Creates the task in @default and stamps the email's thread/message ids
+//       into its notes so the task can be closed by id later. This is the ONLY
+//       way triage should create a P1 task (email-triage-rules.md Step 5).
+//
+//   p1-task close <messageId> [--reason "<text>"] [--dry-run]
+//       Marks the linked task completed. Marker match first; otherwise a single
+//       clear subject match. Prints one JSON line; exit 0 even when nothing
+//       matched (a missing task is a report, not a failure).
+//
+//   p1-task match <messageId>
+//       Same as close --dry-run.
+//
+// Called by p1-downgrade (every P1 resolution: unstar, text-resolve, reply)
+// and by the triage agent at P1 creation time. See lib/p1-task.js.
+
+"use strict";
+
+const path = require("node:path");
+const LIB = path.join(__dirname, "..", "lib");
+const { getAccessToken, fetchWithRetry, describeError } = require(path.join(LIB, "google-auth.js"));
+const p1task = require(path.join(LIB, "p1-task.js"));
+
+function die(msg, code = 1) { console.error(`p1-task: ${msg}`); process.exit(code); }
+
+function parseArgs(argv) {
+  const out = { positional: [], title: null, due: null, notes: null, reason: null, dryRun: false };
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === "--title") out.title = argv[++i];
+    else if (a === "--due") out.due = argv[++i];
+    else if (a === "--notes") out.notes = argv[++i];
+    else if (a === "--reason") out.reason = argv[++i];
+    else if (a === "--dry-run") out.dryRun = true;
+    else if (a === "--no-input") { /* accepted for gog-call-site compatibility */ }
+    else if (a === "--help" || a === "-h") { usage(); process.exit(0); }
+    else out.positional.push(a);
+  }
+  return out;
+}
+
+function usage() {
+  console.log(`p1-task — create or close the Google Task linked to a P1 email
+
+Usage:
+  p1-task add <messageId> --title "<title>" [--due YYYY-MM-DD] [--notes "<text>"]
+  p1-task close <messageId> [--reason "<text>"] [--dry-run]
+  p1-task match <messageId>
+
+The task's notes carry "[jori-p1 thread:<threadId> msg:<messageId>]" so a
+resolution (reply / unstar / "that's handled") closes exactly this task.`);
+}
+
+async function fetchMeta(messageId) {
+  const token = await getAccessToken();
+  const url = `https://gmail.googleapis.com/gmail/v1/users/me/messages/${messageId}?format=metadata&metadataHeaders=Subject&metadataHeaders=From`;
+  const r = await fetchWithRetry(url, { headers: { Authorization: `Bearer ${token}` } });
+  const data = await r.json();
+  if (data.error) throw new Error(`${data.error.message} (http ${r.status})`);
+  const headers = (data.payload && data.payload.headers) || [];
+  const h = (n) => (headers.find((x) => x.name.toLowerCase() === n) || {}).value || "";
+  return { threadId: data.threadId, subject: h("subject"), from: h("from"), labelIds: data.labelIds || [] };
+}
+
+async function main() {
+  const [cmd, ...rest] = process.argv.slice(2);
+  const args = parseArgs(rest);
+  const messageId = args.positional[0];
+  if (!cmd || cmd === "--help" || cmd === "-h") { usage(); return; }
+  if (!messageId || !/^[a-zA-Z0-9_-]{8,40}$/.test(messageId)) die(`need a Gmail <messageId> (got ${JSON.stringify(messageId || "")})`);
+
+  let meta;
+  try { meta = await fetchMeta(messageId); }
+  catch (e) { die(`metadata fetch failed for ${messageId}: ${describeError(e)}`); }
+
+  if (cmd === "add") {
+    if (!args.title) die("add: --title required");
+    const res = p1task.addTask({ title: args.title, due: args.due, notes: args.notes, threadId: meta.threadId, messageId });
+    console.log(JSON.stringify({ ok: true, action: "add", taskId: res.id, title: res.title, threadId: meta.threadId, messageId }));
+    return;
+  }
+  if (cmd === "close" || cmd === "match") {
+    const dryRun = cmd === "match" || args.dryRun;
+    const res = p1task.closeTasksFor({ threadId: meta.threadId, messageId, subject: meta.subject, dryRun });
+    console.log(JSON.stringify({
+      ok: !res.error, action: dryRun ? "match" : "close", messageId, threadId: meta.threadId,
+      subject: meta.subject, reason: args.reason || null, ...res,
+    }));
+    return;
+  }
+  die(`unknown command "${cmd}"`);
+}
+
+main().catch((e) => die(describeError(e)));

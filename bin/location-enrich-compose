@@ -1,0 +1,193 @@
+#!/usr/bin/env node
+// location-enrich-compose — compose the location-enrich asks in code + one
+// batched model call, queue them, and hand only the residue to the agent.
+// Design: lib/location-enrich-compose.mjs. Playbook: jobs/location-enrich.md.
+//
+// Runs inside the GUI session (launchd agent ai.claude.location-enrich-compose,
+// kicked by trigger-location-enrich.sh) because the Sonnet rung is `claude -p`
+// on the Max subscription, which cron cannot authenticate.
+//
+// Reads  data/location-enrich-brief.json   (the gate wrote it moments ago)
+//        data/location-pending-enrich.json
+// Writes data/location-ask-queue.json       (via the queue lib)
+//        data/location-enrich-residue.json  (what the agent must handle)
+//        data/logs/location-enrich-compose.jsonl (one line per run)
+//
+// Usage: location-enrich-compose [--dry-run] [--no-sonnet] [--json]
+// Prints a JSON summary; `.residue` is the count the runner dispatches on.
+
+import fs from "node:fs";
+import path from "node:path";
+import { installTools } from "../lib/root.cjs";
+import { spawnSync } from "node:child_process";
+import { createRequire } from "node:module";
+import { localLlmChat } from "../lib/local-llm.mjs";
+import { extractJsonObject } from "../lib/extract-json.mjs";
+import { add as queueAdd, has as queueHas } from "../lib/location-ask-queue.mjs";
+import { spoolEvent } from "../lib/hum-events.mjs";
+import {
+  buildItems, calendarBlockers, identifyMessage, validateAsks, askReadyEvent,
+  SYSTEM_PROMPT, userPrompt, ASK_SCHEMA, CAL_PAD_MS,
+} from "../lib/location-enrich-compose.mjs";
+
+const require = createRequire(import.meta.url);
+const DATA = installTools("data");
+const BRIEF = path.join(DATA, "location-enrich-brief.json");
+const PENDING = path.join(DATA, "location-pending-enrich.json");
+const RESIDUE = path.join(DATA, "location-enrich-residue.json");
+const RUNLOG = path.join(DATA, "logs/location-enrich-compose.jsonl");
+// gog: $GOG_BIN, else a package-manager install (launchd's PATH has neither), else PATH.
+const GOG = process.env.GOG_BIN || ["/opt/homebrew/bin/gog", "/usr/local/bin/gog"].find((p) => fs.existsSync(p)) || "gog";
+const SCORE = 0.55; // same score the agent path used
+
+const argv = process.argv.slice(2);
+const DRY = argv.includes("--dry-run");
+const NO_SONNET = argv.includes("--no-sonnet");
+
+const readJson = (p, d) => { try { return JSON.parse(fs.readFileSync(p, "utf8")); } catch { return d; } };
+function writeAtomic(p, obj) {
+  const tmp = `${p}.tmp.${process.pid}`;
+  fs.mkdirSync(path.dirname(p), { recursive: true });
+  fs.writeFileSync(tmp, JSON.stringify(obj, null, 2) + "\n");
+  fs.renameSync(tmp, p);
+}
+
+/** One gog call covering every stop's padded window. null = lookup failed. */
+function fetchEvents(items) {
+  const starts = items.map((i) => Date.parse(i.arrived_at || "")).filter(Number.isFinite);
+  const ends = items.map((i) => Date.parse(i.departed_at || "")).filter(Number.isFinite);
+  if (!starts.length || !ends.length) return [];
+  const from = new Date(Math.min(...starts) - CAL_PAD_MS).toISOString();
+  const to = new Date(Math.max(...ends) + CAL_PAD_MS).toISOString();
+  try {
+    const r = spawnSync(GOG, ["calendar", "list", "--json", "--results-only", "--from", from, "--to", to, "--all"],
+      { encoding: "utf8", timeout: 15000 });
+    if (r.status !== 0) return null;
+    const parsed = JSON.parse(r.stdout || "[]");
+    return Array.isArray(parsed) ? parsed : null;
+  } catch { return null; }
+}
+
+async function localRung(items) {
+  try {
+    const out = await localLlmChat({
+      system: SYSTEM_PROMPT,
+      user: userPrompt(items),
+      maxTokens: 220 * items.length + 100,
+      timeoutMs: 20000 + 8000 * items.length,
+      think: false,
+      temperature: 0.4,
+    });
+    return extractJsonObject(out, { requireKey: "asks" });
+  } catch (e) {
+    return { _error: `local: ${e.message}` };
+  }
+}
+
+async function sonnetRung(items) {
+  const { judge } = require("../lib/max-judge.js");
+  try {
+    return await judge({
+      model: "claude-sonnet-5-5", effort: "low",
+      system: SYSTEM_PROMPT, prompt: userPrompt(items), schema: ASK_SCHEMA, timeoutMs: 120000,
+    });
+  } catch (e) {
+    return { _error: `sonnet: ${e.message}` };
+  }
+}
+
+async function main() {
+  const brief = readJson(BRIEF, { stops: [] });
+  const pending = readJson(PENDING, { pending: [] }).pending || [];
+  const items = buildItems(brief, pending);
+  const summary = { at: new Date().toISOString(), dry_run: DRY, stops: items.length, composed: [], residue: 0, errors: [] };
+  const residue = [];
+
+  if (!items.length) {
+    if (!DRY) writeAtomic(RESIDUE, { generated_at: summary.at, visits: [] });
+    return summary;
+  }
+
+  // 1. Calendar: any specific event in the window → the agent's ticket/Gmail
+  //    lookup applies. A failed lookup is treated the same way (the agent can
+  //    still read the calendar itself) rather than composing blind.
+  const events = fetchEvents(items);
+  if (events === null) summary.errors.push("calendar lookup failed — all stops to the agent");
+  const toCompose = [];
+  const toIdentify = [];
+  for (const it of items) {
+    if (events === null) { residue.push({ visit_id: it.visit_id, reason: "calendar lookup failed" }); continue; }
+    const blockers = calendarBlockers(it, events);
+    if (blockers.length) {
+      residue.push({
+        visit_id: it.visit_id, reason: "calendar event in the stop window",
+        events: blockers.map((e) => ({ summary: e.summary || "", location: e.location || "", start: e.start?.dateTime, end: e.end?.dateTime })),
+      });
+      continue;
+    }
+    if (!it.candidates.length) { residue.push({ visit_id: it.visit_id, reason: "no candidates on the pending row" }); continue; }
+    (it.stage === "identify" ? toIdentify : toCompose).push(it);
+  }
+
+  const queued = [];
+  for (const it of toIdentify) queued.push({ item: it, message: identifyMessage(it), by: "template", framing: "identify", hyp: null });
+
+  // 2. The ladder: local first, Sonnet low only for what failed validation.
+  let remaining = toCompose;
+  for (const rung of [{ name: "local", run: localRung }, { name: "sonnet", run: sonnetRung, skip: NO_SONNET }]) {
+    if (!remaining.length || rung.skip) continue;
+    const raw = await rung.run(remaining);
+    if (raw && raw._error) summary.errors.push(raw._error);
+    const { valid, invalid } = validateAsks(raw && !raw._error ? raw : {}, remaining);
+    for (const it of remaining) {
+      const a = valid.get(String(it.visit_id));
+      if (a) queued.push({ item: it, message: a.message, by: rung.name, framing: a.framing, hyp: a.hypothesis_candidate_id ?? null });
+    }
+    if (invalid.size) summary.errors.push(`${rung.name}: ${[...invalid].map(([id, why]) => `${id}=${why}`).join("; ")}`);
+    remaining = remaining.filter((it) => invalid.has(String(it.visit_id)));
+  }
+  for (const it of remaining) residue.push({ visit_id: it.visit_id, reason: "no rung produced a valid ask" });
+
+  // 3. Queue. Never mark-asked: hum-ping does that when one actually ships.
+  //    A NEW ask (not a re-compose) also wakes hum through the priority lane —
+  //    see askReadyEvent in the lib for why the queue alone was hours slow.
+  summary.woke = [];
+  for (const q of queued) {
+    summary.composed.push({ visit_id: q.item.visit_id, by: q.by, framing: q.framing, hypothesis: q.hyp, message: q.message });
+    if (DRY) continue;
+    try {
+      const isNew = !queueHas(q.item.visit_id);
+      queueAdd({ visit_id: q.item.visit_id, message: q.message, score_hint: SCORE,
+        stop_started_at: q.item.arrived_at || null, stop_ended_at: q.item.departed_at || null,
+        signals: { composed_by: q.by, framing: q.framing, hypothesis_candidate_id: q.hyp,
+          drift_m: q.item.drift_m ?? null, duration_min: q.item.duration_min ?? null } });
+      if (isNew && spoolEvent(askReadyEvent(q.item))) summary.woke.push(q.item.visit_id);
+    } catch (e) {
+      summary.errors.push(`queue ${q.item.visit_id}: ${e.message}`);
+      residue.push({ visit_id: q.item.visit_id, reason: "queue write failed" });
+    }
+  }
+
+  summary.residue = residue.length;
+  summary.residue_visits = residue;
+  if (!DRY) writeAtomic(RESIDUE, { generated_at: summary.at, visits: residue });
+  return summary;
+}
+
+main().then((summary) => {
+  if (!DRY) {
+    try {
+      fs.mkdirSync(path.dirname(RUNLOG), { recursive: true });
+      const { composed, ...rest } = summary;
+      fs.appendFileSync(RUNLOG, JSON.stringify({ ...rest, composed: composed.map(({ message, ...c }) => c) }) + "\n");
+    } catch {}
+  }
+  process.stdout.write(JSON.stringify(summary, null, argv.includes("--json") ? 0 : 2) + "\n");
+}).catch((e) => {
+  // Fail-open to the agent: whatever we could not compose, it still can.
+  const brief = readJson(BRIEF, { stops: [] });
+  const visits = (brief.stops || []).map((s) => ({ visit_id: s.visit_id, reason: `compose crashed: ${e.message}` }));
+  if (!DRY) { try { writeAtomic(RESIDUE, { generated_at: new Date().toISOString(), visits }); } catch {} }
+  process.stdout.write(JSON.stringify({ error: e.message, residue: visits.length }) + "\n");
+  process.exit(0);
+});

@@ -1,0 +1,56 @@
+#!/usr/bin/env node
+// address-match — is a stop one of the user's homes, judged by its street address?
+//
+// The CLI face of lib/address-match.mjs, for the Python naming paths
+// (place_naming.match_named_location_by_address: stop-identify, findme enrich)
+// and for checking a spot by hand. Code picks the candidate homes by geometry;
+// a model decides whether the addresses name the same house, across languages
+// and transliterations, with nearby house numbers on the same street counting
+// as the same home. Each answer is remembered.
+//
+// Usage:
+//   address-match --lat 12.3456 --lon -65.4321 [--label "12 Example Lane"]... [--cached-only]
+//   address-match --lat 12.3501 --lon -65.4288 --label "4 Sample Street" --booking "Sample Street 4, Exampletown"
+//
+// --booking (2026-10-18): judge the stop against the booked lodging's label
+// from travel_segments instead of named-locations.json — the only candidate,
+// in the stop's own timezone (the booking is where he is that date). Used by
+// stop-identify for the first night of a booking, when there is no earlier
+// night there to measure from (place_naming.match_booking_by_address).
+//
+// Prints one JSON line: {"match": {name, address, distance_m, cached} | null}.
+// Exit 0 always on a clean run (a miss is not an error), 64 on bad usage.
+
+import { createRequire } from "node:module";
+import { matchHomeByAddress } from "../lib/address-match.mjs";
+const { timezoneForCoords } = createRequire(import.meta.url)("../lib/geo-timezone.js");
+
+const argv = process.argv.slice(2);
+const labels = [];
+let lat = null, lon = null, cachedOnly = false, booking = null;
+for (let i = 0; i < argv.length; i++) {
+  const a = argv[i];
+  if (a === "--lat") lat = Number(argv[++i]);
+  else if (a === "--lon") lon = Number(argv[++i]);
+  else if (a === "--label") labels.push(argv[++i]);
+  else if (a === "--cached-only") cachedOnly = true;
+  else if (a === "--booking") booking = String(argv[++i] || "").trim() || null;
+  else { console.error(`address-match: unknown argument ${a}`); process.exit(64); }
+}
+if (!Number.isFinite(lat) || !Number.isFinite(lon)) {
+  console.error('usage: address-match --lat <lat> --lon <lon> [--label "<geocoder address>"]... [--booking "<lodging label>"] [--cached-only]');
+  process.exit(64);
+}
+
+const tz = booking ? timezoneForCoords(lat, lon) : undefined;
+if (booking && !tz) { console.log(JSON.stringify({ match: null })); process.exit(0); }
+const hit = await matchHomeByAddress({ lat, lon, labels }, {
+  ...(booking ? { entries: [{ name: booking, address: booking, tz }], tz } : {}),
+  allowAsk: !cachedOnly,
+  onError: (e) => console.error(`address-match: no answer: ${String(e && e.message || e).slice(0, 200)}`),
+});
+console.log(JSON.stringify({
+  match: hit ? { name: hit.entry.name, address: hit.entry.address,
+                 distance_m: hit.distance_m == null ? null : Math.round(hit.distance_m),
+                 cached: hit.cached, stop_addresses: hit.stop_addresses } : null,
+}));

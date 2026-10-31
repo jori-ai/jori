@@ -1,0 +1,13 @@
+{
+  "_doc": "Jev gate in front of the p1-resolution-scan (unstar-scan) agent turn (lib/jev-p1-gate.mjs, called from the p1-resolution-scan trigger AFTER bin/p1-scan-gate found NEW unstarred-P1 ids). One boolean per NEW id: should the scan downgrade it (the user is done with it) or leave it untouched (a live thread someone is waiting on)? If Jev is confident EVERY new id should be left, the turn is skipped; anything else dispatches as before. Kernel definition; an installation's own data/jev-questions/p1-resolution.json replaces it (lib/jev.mjs jevSiteDef).",
+  "threshold": 0.9,
+  "notes": "0.9, per id (confidence = the least-certain id). Skipping only ever means 'leave untouched', so a wrong skip leaves an unstarred P1 labelled p1 with its task still open: the costly direction, hence the high bar. The state carries no star history (Gmail exposes none), so the question asks what the state can answer: is anyone waiting.",
+  "item_question": {
+    "type": "boolean",
+    "instructions": "Message {{n}} in `messages` is labelled P1 (urgent) in {{owner_name}}'s Gmail but is NOT starred. The agent stars every P1 it creates, so an unstarred P1 usually means the user removed the star because they are done with it — then it should be downgraded. BUT a fresh inbound reply on a live P1 thread can carry the p1 label without ever having been starred (thread-inherited, or triage still in progress); downgrading that silently kills a live P1. Should message {{n}} be downgraded? The test is whether anyone is actually WAITING on the user. Leave it untouched when the thread is a live exchange — more than one message, a person expecting an answer, a closing, a payment, a deadline — or when it is genuinely ambiguous. A message that merely arrived recently, from someone other than the user, is not by itself a live thread. An automated one-off notice is not one either: a transactional or recurring system notification, a preview or test send, a receipt, a delivery or status alert — a single-message thread with nobody awaiting a reply — is low-stakes and should be downgraded however new it is. Also downgrade anything stale, any self-sent or agent digest, and anything whose thread shows the user already dealt with it.",
+    "criteria": {
+      "true": "downgrade — a genuine unstar, a stale or low-stakes item, or a one-off automated notice nobody is waiting on",
+      "false": "leave untouched — a live exchange where someone is waiting on the user (a reply, a closing, a payment, a deadline), or genuinely ambiguous"
+    }
+  }
+}

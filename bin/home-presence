@@ -1,0 +1,84 @@
+#!/usr/bin/env node
+/**
+ * home-presence — is the user at one of their home bases (config
+ * `home_metros` in agent/local/config/travel.json) with no travel disruption
+ * on a given date?
+ *
+ * Built for an exercise-scheduling gate: only place a gym block when the user
+ * is home. With no home metros configured, a resolved city is never "home";
+ * no signal at all still fails open to home.
+ *
+ * Source of truth: the canonical travel timeline via
+ * lib/presence.js, which resolves DB segments first and falls back to
+ * flights.json when a date isn't covered. So this tool now respects manual
+ * timeline edits, not just booked flights — and still works (flights.json path)
+ * if the DB is unreachable.
+ *
+ * AWAY when: a flight departs/arrives on the date (travel day — gym disrupted);
+ * the date resolves to 'transit'; or it resolves to a non-home metro.
+ * Fail-open: no signal at all → assume home (don't silently drop the habit).
+ *
+ * Usage:  home-presence [YYYY-MM-DD] [--json]
+ * Exit:   0 = home, 1 = away, 2 = error
+ * Stdout: "AT_HOME 2026-06-24 — <reason>" / "AWAY 2026-06-24 — <reason>" (or --json)
+ * Dates are the installation's home-zone dates (instance().tz).
+ */
+
+'use strict';
+
+const P = require('../lib/presence.js');
+
+const JSON_OUT = process.argv.includes('--json');
+const dateArg = process.argv.slice(2).find(a => /^\d{4}-\d{2}-\d{2}$/.test(a));
+
+function todayHome() {
+  return P.homeDateOf(new Date());
+}
+
+async function decide(target) {
+  const flights = P.loadFlights();
+
+  // 1. A flight departing or arriving on the target date = travel day. Even a
+  //    return-home flight disrupts the day, so the gym block is skipped.
+  for (const b of flights) {
+    if (b.type !== 'flight') continue;
+    if (P.dateOf(b.depart) === target || P.dateOf(b.arrive) === target) {
+      return { at_home: false, reason: `flight ${b.from || '?'}→${b.to || '?'} on ${target} — travel day` };
+    }
+  }
+
+  // 2. Resolve the day's metro from the timeline (DB segments → flights).
+  const segments = await P.fetchSegments();
+  const res = P.resolvePresenceAt(P.parseWhen(target), segments, flights);
+  if (res.metro === 'transit') return { at_home: false, reason: `in transit on ${target} [${res.source}]` };
+  // A Schrodinger stay whose candidates are ALL home metros is still a confident
+  // "the user is home" — we just can't say which home.
+  if (res.ambiguous && res.candidates.every(m => P.HOME_METROS.has(m))) {
+    return { at_home: true, reason: `${res.candidates.join(' or ')} — both home [${res.source}]` };
+  }
+  if (res.ambiguous) {
+    return { at_home: false, reason: `ambiguous ${res.candidates.join(' or ')} — not all home [${res.source}]` };
+  }
+  if (res.metro && P.HOME_METROS.has(res.metro)) {
+    return { at_home: true, reason: `${res.metro}${res.label && res.label !== res.metro ? ` (${res.label})` : ''} [${res.source}]` };
+  }
+  if (res.metro) return { at_home: false, reason: `away in ${res.metro} [${res.source}]` };
+
+  // 3. No signal anywhere → assume home (fail-open).
+  return { at_home: true, reason: `no travel signal for ${target} — assume home` };
+}
+
+(async () => {
+  const target = dateArg || todayHome();
+  let result;
+  try {
+    result = await decide(target);
+  } catch (err) {
+    if (JSON_OUT) console.log(JSON.stringify({ date: target, at_home: true, reason: `error: ${err.message} — fail-open home`, error: true }));
+    else console.log(`AT_HOME ${target} — error (${err.message}); fail-open home`);
+    process.exit(2);
+  }
+  if (JSON_OUT) console.log(JSON.stringify({ date: target, at_home: result.at_home, reason: result.reason }));
+  else console.log(`${result.at_home ? 'AT_HOME' : 'AWAY'} ${target} — ${result.reason}`);
+  process.exit(result.at_home ? 0 : 1);
+})();

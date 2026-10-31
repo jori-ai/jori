@@ -1,0 +1,15 @@
+{
+  "notes": "lib/stop-passage-jev.mjs, reached only when the deterministic layer (lib/stop-passage.mjs classifyWindow) returned INCONCLUSIVE — usually a silence in the GPS long enough to hide a short stop. Jev reads the movement features (in words, not raw numbers), the photos the user took in the window (labels, OCR'd text, how far apart), calendar events and the user's own messages, and decides whether the window was part of a walk (no question needed) or a stop worth asking about. A wrong 'walk' silently withdraws a real stop, so the threshold is high and anything else falls through to the ask. Legacy is the old behaviour: always ask. Agreement is deferred (legacy is a constant, not a judgment) — the asks that still go out are the ground truth.",
+  "threshold": 0.9,
+  "questions": {
+    "kind": {
+      "type": "choice",
+      "instructions": "{{owner_name}}'s phone recorded a possible stop during `window`. `movement` describes what GPS and the phone's motion sensor saw. `photos` are photos {{owner_name}} took during or around it, `calendar` {{owner_name}}'s calendar events then, `messages` what {{owner_name}} wrote in chat around then. Was this window part of a walk or outing in motion — strolling, sightseeing, taking photos along the way — or did {{owner_name}} stay at one place long enough that it's worth asking where? Brief pauses (a photo, a street crossing, a view) during a walk are still a walk. Pick stop if anything suggests {{owner_name}} sat down, ate, shopped, visited or met someone in one place. If the evidence doesn't clearly show either, pick unclear.",
+      "criteria": {
+        "walk": "{{owner_name}} was moving through: walking, strolling or sightseeing, with at most short pauses; no single place held them",
+        "stop": "{{owner_name}} stayed at one place for a while (sat, ate, drank, shopped, visited, met someone) — a real stop worth naming",
+        "unclear": "the evidence does not clearly show either"
+      }
+    }
+  }
+}

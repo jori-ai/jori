@@ -21,6 +21,7 @@ import { fileURLToPath } from "node:url";
 import {
   laneOf, kindOf, isPrivateLane, validateVerdict, decideAction, resolveFirst, buildPrompt,
   logRow, rememberIfSettled, writeCaptureArtifacts, readSidecar, sidecarPath,
+  loadOverlaySources, gatherEvidence,
 } from "../lib/hum-resolve-first.mjs";
 import { resolvedKeys, recentResolved, forgetResolved, recordResolved } from "../lib/hum-resolve-first-store.mjs";
 import { preRankFilter } from "../lib/hum-vetoes.mjs";
@@ -257,6 +258,97 @@ test("pre-rank: a key the gate already settled is vetoed as resolved_first; urge
   });
   assert.deepEqual(eligible.map((c) => c.dedup_key), ["travel:XY123:2026-04-01", "idea-other"]);
   assert.deepEqual(vetoed.map((v) => [v.dedup_key, v.gate]), [["idea-jordan", "resolved_first"]]);
+});
+
+// ── standing reviews: "covered" ────────────────────────────────────────────
+// A report Jori already wrote for the user (an overlay source marked review:
+// true). A message whose point it already covered is dropped, or sent with a
+// caveat when it adds something the review did not have.
+
+const REVIEW = { id: "market_review", title: "The weekly market review, already sent to the user", as_of: "report current as of Monday 8:10, a weekly snapshot, not real-time", text: "Chip stocks fell 9% on the week on the capex news; the review held its warning level.", review: true };
+const reviewGather = async () => [...SECTIONS, REVIEW];
+const PING = {
+  message: "Chip stocks are sliding on the capex news. Might be worth a glance with the market review in mind.\nhttps://example.com/chips",
+  intent: "hum:news:chips", context: { kind: "ping", dedup_key: "news:https://example.com/chips" },
+};
+const COVERED = {
+  floats: "the chip selloff, in light of the review", verdict: "covered", answer: "The review already covered the capex news and the selloff, and held its warning level.",
+  remaining_gap: null, sources: ["market_review"], checked: "the market review", useful_fyi: false, fyi_text: null, gap_text: null, caveat_text: null, choices_still_fit: false,
+};
+const CAVEAT = "Chip stocks are sliding again today. The market review (current as of 8:10 this morning, a snapshot, not live) already covered the capex news behind it; today's drop came after it.\nhttps://example.com/chips";
+
+test("covered: must cite a standing review that was in the bundle, and say what it found", () => {
+  const ids = new Set(["bookings", "market_review"]);
+  const reviews = new Set(["market_review"]);
+  assert.equal(validateVerdict(COVERED, ids, reviews).ok, true);
+  let v = validateVerdict({ ...COVERED, sources: ["bookings"] }, ids, reviews);
+  assert.equal(v.ok, false);
+  assert.match(v.errors.join(" "), /standing review/);
+  assert.equal(validateVerdict(COVERED, ids).ok, false, "no review in the bundle, so nothing can be covered");
+  assert.equal(validateVerdict({ ...COVERED, answer: null }, ids, reviews).ok, false);
+  assert.equal(validateVerdict({ ...COVERED, caveat_text: "x".repeat(700) }, ids, reviews).ok, false);
+  assert.equal(validateVerdict({ verdict: "nothing_to_resolve", caveat_text: "stray" }, ids, reviews).verdict.caveat_text, null, "a caveat counts only on covered");
+});
+
+test("the action table: covered drops, or sends the caveat when the message adds something", () => {
+  assert.deepEqual(decideAction({ verdict: "covered", caveat_text: null }), { action: "drop" });
+  assert.deepEqual(decideAction({ verdict: "covered", caveat_text: CAVEAT }),
+    { action: "rewrite", text: CAVEAT, still_question: false, keep_choices: false });
+});
+
+test("covered, whole pass: dropped, or caveated; remembered and vetoed; invalid without a review", async () => {
+  const file = path.join(tmp(), "store.jsonl");
+  let d = await resolveFirst(PING, { gather: reviewGather, model: model(COVERED), killSwitch: false });
+  assert.equal(d.action, "drop");
+  assert.equal(d.verdict, "covered");
+  assert.equal(rememberIfSettled(d, { file }), true);
+  assert.ok(resolvedKeys({ file }).has("news:https://example.com/chips"), "the same item is vetoed pre-rank");
+  assert.equal(recentResolved({ file })[0].verdict, "covered");
+
+  d = await resolveFirst(PING, { gather: reviewGather, model: model({ ...COVERED, caveat_text: CAVEAT }), killSwitch: false });
+  assert.equal(d.action, "rewrite");
+  assert.equal(d.still_question, false);
+  assert.equal(d.text, CAVEAT);
+
+  d = await resolveFirst(PING, { gather, model: model(COVERED), killSwitch: false });
+  assert.equal(d.action, "send", "covered with no review in the bundle fails validation twice and sends as written");
+  assert.equal(d.verdict, "error");
+
+  const cap = path.join(tmp(), "cap");
+  writeCaptureArtifacts(cap, { action: "drop", decision_id: "hr-c", verdict: "covered", answer: "the review covered it" });
+  assert.match(JSON.parse(fs.readFileSync(cap, "utf8")).reason, /standing review/);
+});
+
+test("the prompt carries rule 8 and the covered verdict only when a standing review is in the bundle", () => {
+  const args = { message: PING.message, intent: PING.intent, lane: "news", kind: "ping", nowMs: Date.parse("2026-03-16T14:00:00Z"), tz: "America/Denver" };
+  const without = buildPrompt({ ...args, sections: SECTIONS });
+  assert.ok(!without.includes("standing review") && !without.includes("caveat_text"));
+  assert.ok(without.includes('"verdict":"resolved|partial|unresolved|nothing_to_resolve"'));
+  const withReview = buildPrompt({ ...args, sections: [...SECTIONS, REVIEW] });
+  assert.ok(withReview.includes("8. Already covered by a standing review. [market_review] is a standing review"));
+  assert.ok(withReview.includes("unless rule 8 applies"));
+  assert.ok(withReview.includes("not real-time"));
+  assert.ok(withReview.includes("never the user's own holdings, positions, weights or amounts"));
+  assert.ok(withReview.includes('"verdict":"resolved|partial|unresolved|covered|nothing_to_resolve"'));
+  assert.ok(withReview.includes('"caveat_text":null'));
+});
+
+test("overlay sources: the review flag reaches the bundle", async () => {
+  const dir = tmp();
+  fs.writeFileSync(path.join(dir, "weekly.mjs"),
+    'export default { id: "weekly", review: true, async read() { return { title: "Weekly review", as_of: "current as of Monday", text: "covered the selloff" }; } };\n');
+  fs.writeFileSync(path.join(dir, "plain.mjs"),
+    'export default { id: "plain", async read() { return { title: "Plain", text: "a record" }; } };\n');
+  const overlay = await loadOverlaySources(dir);
+  assert.deepEqual(overlay.map((s) => [s.id, s.review]), [["plain", false], ["weekly", true]]);
+  const sections = await gatherEvidence({
+    message: "x", overlay, storeFile: path.join(dir, "store.jsonl"),
+    run: async () => ({ ok: false, out: "", error: "stub" }), fetchFn: async () => ({ ok: false, status: 500 }),
+  });
+  const weekly = sections.find((s) => s.id === "weekly");
+  assert.equal(weekly.review, true);
+  assert.equal(weekly.as_of, "current as of Monday");
+  assert.equal(sections.find((s) => s.id === "plain").review, undefined);
 });
 
 // ── the CLI, end to end with fixtures ──────────────────────────────────────

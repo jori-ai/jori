@@ -1,0 +1,105 @@
+#!/usr/bin/env node
+// ping-flush — deliver the alerts that lib/apns-push.mjs parked while
+// the user was moving. Cron runs this every 5 minutes; it is silent and cheap
+// when the queue is empty, which is almost always.
+//
+// Usage:
+//   ping-flush              flush if the user is stationary
+//   ping-flush --status     print queue + motion state, deliver nothing
+//   ping-flush --force      flush regardless of motion (debugging)
+//
+// The queue holds ALERTS, not content — every message is already in
+// `jori_messages` and readable in the app. See lib/ping-hold.mjs.
+
+import { createClient } from "@supabase/supabase-js";
+import { createRequire } from "node:module";
+import { sendApnsPush } from "../lib/apns-push.mjs";
+import { getMotionState } from "../lib/motion-state.mjs";
+import { readQueue, writeQueue, partitionQueue, coalesce, QUEUE_FILE } from "../lib/ping-hold.mjs";
+import { loadEnv } from "../lib/load-env.js";
+import { readPending, forgetPending, splitWithdrawn, latestFix, retractTold } from "../lib/local-history-ledger.mjs";
+
+loadEnv();
+
+const { supabaseUrl, supabaseAnonKey } = createRequire(import.meta.url)("../lib/instance.cjs");
+const SUPABASE_URL = process.env.SUPABASE_URL || supabaseUrl();
+const SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || supabaseAnonKey();
+
+const args = process.argv.slice(2);
+const statusOnly = args.includes("--status");
+const force = args.includes("--force");
+
+const queue = readQueue();
+if (queue.length === 0 && !statusOnly) process.exit(0);
+if (!SUPABASE_URL || !SUPABASE_KEY) {
+  console.log("ping-flush: no Supabase configured (agent/local/config/supabase.json) — nothing to flush");
+  process.exit(0);
+}
+const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
+
+const motion = await getMotionState(supabase);
+
+if (statusOnly) {
+  const { due, expired } = partitionQueue(queue);
+  console.log(`motion:  ${motion.state} (${motion.reason})`);
+  console.log(`queued:  ${queue.length}  due: ${due.length}  expired: ${expired.length}`);
+  console.log(`file:    ${QUEUE_FILE}`);
+  for (const e of queue) console.log(`  [${e.channel}] ${e.held_at} — ${e.body.slice(0, 70)}`);
+  process.exit(0);
+}
+
+// Still moving: leave everything parked. Expiry is handled on a tick where the
+// user has actually stopped, so a long walk does not quietly burn the whole queue.
+if (motion.state === "mobile" && !force) {
+  console.log(`Still mobile (${motion.reason}) — ${queue.length} ping(s) still held.`);
+  process.exit(0);
+}
+
+// Local explanations (hum `nearby` factoids) are only worth having within
+// 300 m of the subject. One that waited out a walk here is re-checked against
+// the newest fix; if the user has moved on, it is WITHDRAWN — alert dropped
+// and the message removed before the app is opened — and taken off the
+// told-ledger so the subject can be told properly on the next visit. Everything else flushes as before.
+const pending = readPending();
+let flushable = queue;
+if (queue.some((e) => e.messageId && pending[e.messageId])) {
+  const fix = await latestFix();
+  const { keep, withdraw } = splitWithdrawn(queue, pending, fix);
+  for (const w of withdraw) {
+    try {
+      await supabase.from("jori_messages").delete().eq("id", w.entry.messageId);
+      retractTold(w.pending.ping_id);
+      console.log(`Withdrawn local explanation "${w.pending.title}" — ${w.reason}`);
+    } catch (e) {
+      console.error(`Withdraw failed for ${w.entry.messageId}: ${e?.message || e}`);
+    }
+  }
+  forgetPending(queue.filter((e) => e.messageId && pending[e.messageId]).map((e) => e.messageId));
+  flushable = keep;
+}
+
+const { due, expired } = partitionQueue(flushable);
+
+for (const e of expired) {
+  console.log(`Expired (>90m held), alert dropped — message still in app: ${e.body.slice(0, 70)}`);
+}
+
+if (due.length === 0) {
+  writeQueue([]);
+  process.exit(0);
+}
+
+// Clear the queue BEFORE pushing. A crash mid-send costs one alert; leaving the
+// queue intact on a partial failure would re-buzz everything on the next tick.
+writeQueue([]);
+
+for (const push of coalesce(due)) {
+  try {
+    await sendApnsPush(supabase, { ...push, skipMotionGate: true });
+    console.log(`Flushed ${push.count} ping(s) on ${push.channel}: ${push.body.slice(0, 70)}`);
+  } catch (e) {
+    console.error(`Flush failed for ${push.channel}: ${e?.message || e}`);
+  }
+}
+
+process.exit(0);

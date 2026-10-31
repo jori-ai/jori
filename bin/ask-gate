@@ -1,0 +1,160 @@
+#!/usr/bin/env node
+// ask-gate — may we ask him about this stop, or say that he left it?
+// Logic and rationale: lib/ask-gate.mjs. Reads RAW points only (fixes +
+// self-captured photos); rows are consulted solely as earlier stays for the
+// same-stay check, never for when anything ended.
+//
+// Called before every location question and every "Left X" event:
+//   bin/segment-ask            (choice card)          --mode ask
+//   bin/findme enrich          (→ hum ask queue)      --mode ask
+//   hum-sensors/location.mjs         (location.departure)   --mode departure
+//   phone-channel dispatchLocationEdge (realtime departure) --mode departure
+//
+// Usage:
+//   ask-gate --visit <id> [--start ISO --end ISO] [--mode ask|departure] [--apply] [--json]
+// --apply: a `same-stay` verdict marks the row `non-stop` (`[ask-gate same-stay]`
+// in notes), so day-segments stops re-writing the slice and the daily summary
+// doesn't carry it as an unknown stop. Never touches user-confirmed/named/non-stop.
+// `no-departure` never writes — the stop is re-judged next run.
+//   ask-gate audit [YYYY-MM-DD] [--tz Area/City]   questions he answered that day
+//                                                   that the gate would now refuse
+// Prints one JSON object with --json ({ask, check, reason, ...}). Fail-open: on
+// an error it prints {ask: true, check: "error"} — the caller asks as before.
+// Log: data/ask-gate-log.jsonl
+
+import fs from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+import { createRequire } from "node:module";
+import { gate, LOOKBACK_H, ACC_MAX_M } from "../lib/ask-gate.mjs";
+
+const HERE = path.dirname(fileURLToPath(import.meta.url));
+const ROOT = path.resolve(HERE, "..");
+const ENV_FILE = path.join(ROOT, ".env");
+const LOG = path.join(ROOT, "data", "ask-gate-log.jsonl");
+const CONFIRMED = path.join(ROOT, "data", "confirmed-stops.json");
+const { supabaseUrl, instance } = createRequire(import.meta.url)("../lib/instance.cjs");
+const SUPABASE_URL = process.env.SUPABASE_URL || supabaseUrl();
+
+const argv = process.argv.slice(2);
+function arg(name) { const i = argv.indexOf(name); return i >= 0 ? argv[i + 1] : null; }
+const has = (n) => argv.includes(n);
+
+function envValue(k) {
+  if (process.env[k]) return process.env[k];
+  try {
+    const m = fs.readFileSync(ENV_FILE, "utf8").match(new RegExp(`^${k}=(.+)$`, "m"));
+    return m ? m[1].trim().replace(/^["']|["']$/g, "") : null;
+  } catch { return null; }
+}
+async function sb(pathQs, init = {}) {
+  const key = envValue("SUPABASE_SERVICE_ROLE_KEY");
+  if (!key) throw new Error("no SUPABASE_SERVICE_ROLE_KEY");
+  const r = await fetch(`${SUPABASE_URL}/rest/v1/${pathQs}`, {
+    ...init,
+    headers: { apikey: key, Authorization: `Bearer ${key}`, "Content-Type": "application/json", ...(init.headers || {}) },
+    signal: AbortSignal.timeout(15000),
+  });
+  if (!r.ok) throw new Error(`supabase ${r.status}: ${(await r.text()).slice(0, 200)}`);
+  return init.method === "PATCH" ? null : r.json();
+}
+const PROTECTED = new Set(["user-confirmed", "named", "non-stop"]);
+const iso = (t) => new Date(t).toISOString();
+const q = encodeURIComponent;
+function log(row) { try { fs.appendFileSync(LOG, JSON.stringify({ ts: new Date().toISOString(), ...row }) + "\n"); } catch {} }
+
+async function points(from, to) {
+  const [fixes, photos] = await Promise.all([
+    sb(`location_history?segment_type=eq.transit&arrived_at=gte.${q(iso(from))}&arrived_at=lte.${q(iso(to))}`
+      + `&select=latitude,longitude,accuracy_m,arrived_at&order=arrived_at.asc&limit=10000`),
+    sb(`photos?taken_at=gte.${q(iso(from))}&taken_at=lte.${q(iso(to))}&in_trash=is.false`
+      + `&select=taken_at,latitude,longitude,self_captured&order=taken_at.asc&limit=500`).catch(() => []),
+  ]);
+  const out = [];
+  for (const f of fixes) {
+    const lat = Number(f.latitude), lon = Number(f.longitude);
+    const acc = f.accuracy_m == null ? null : Number(f.accuracy_m);
+    if (!Number.isFinite(lat) || !Number.isFinite(lon) || (acc != null && acc > ACC_MAX_M)) continue;
+    out.push({ t: Date.parse(f.arrived_at), lat, lon, acc, kind: "fix" });
+  }
+  for (const p of photos) {
+    const lat = Number(p.latitude), lon = Number(p.longitude);
+    if (!Number.isFinite(lat) || !Number.isFinite(lon) || !p.taken_at || p.self_captured === false) continue;
+    out.push({ t: Date.parse(p.taken_at), lat, lon, acc: null, kind: "photo" });
+  }
+  return out.sort((a, b) => a.t - b.t);
+}
+
+export async function judge({ visitId, start, end, mode = "ask", now = Date.now() }) {
+  const [visit] = await sb(`location_history?id=eq.${q(visitId)}&select=id,place_name,place_type,latitude,longitude,arrived_at,departed_at,notes&limit=1`);
+  if (!visit) throw new Error(`no row ${visitId}`);
+  const s = Date.parse(start || visit.arrived_at);
+  const e = Date.parse(end || visit.departed_at || visit.arrived_at);
+  const pts = await points(s - LOOKBACK_H * 3600000, now);
+  const lat = Number(visit.latitude), lon = Number(visit.longitude);
+  const d = 0.003;
+  const prior = mode === "ask" && Number.isFinite(lat)
+    ? await sb(`location_history?segment_type=eq.visit&id=neq.${q(visitId)}`
+      + `&arrived_at=gte.${q(iso(s - LOOKBACK_H * 3600000))}&arrived_at=lt.${q(iso(s))}`
+      + `&latitude=gte.${lat - d}&latitude=lte.${lat + d}&longitude=gte.${lon - d * 1.3}&longitude=lte.${lon + d * 1.3}`
+      + `&select=id,place_name,place_type,latitude,longitude,arrived_at,departed_at&limit=200`)
+    : [];
+  const res = gate({ points: pts, start: s, end: e, priorStays: prior, mode,
+    fallbackCenter: Number.isFinite(lat) ? { lat, lon } : null });
+  return { visit_id: visitId, mode, window: { start: iso(s), end: iso(e) }, place_name: visit.place_name || null,
+    place_type: visit.place_type || null, notes: visit.notes || "", ...res };
+}
+
+// Questions he answered on `day` that the gate would refuse now: each one is a
+// phantom that got past (or predates) the gate. Read by the nightly review.
+async function audit(day, tz) {
+  let entries = [];
+  try { entries = JSON.parse(fs.readFileSync(CONFIRMED, "utf8")); } catch {}
+  const localDay = (t) => new Intl.DateTimeFormat("en-CA", { timeZone: tz }).format(new Date(t));
+  const out = [];
+  for (const en of Array.isArray(entries) ? entries : []) {
+    const m = String(en.ask_id || "").match(/^lc-visit-([0-9a-f-]{36})$/); // lang-regex-ok: our own ask_id format
+    const w = en.stop_window;
+    if (!m || !w?.start || localDay(w.start) !== day) continue;
+    try {
+      const r = await judge({ visitId: m[1], start: w.start, end: w.end, mode: "ask" });
+      if (!r.ask) out.push({ name: en.name, window: w, check: r.check, reason: r.reason, visit_id: m[1] });
+    } catch (e) { out.push({ name: en.name, window: w, check: "error", reason: String(e.message || e).slice(0, 160) }); }
+  }
+  return out;
+}
+
+async function main() {
+  if (argv[0] === "audit") {
+    let tz = arg("--tz");
+    if (!tz) { try { tz = JSON.parse(fs.readFileSync(path.join(ROOT, "data/user-timezone.json"), "utf8")).timezone; } catch {} }
+    tz = tz || instance().tz;
+    const day = argv[1] && !argv[1].startsWith("--") ? argv[1]
+      : new Intl.DateTimeFormat("en-CA", { timeZone: tz }).format(new Date(Date.now() - 86400000));
+    const phantoms = await audit(day, tz);
+    console.log(JSON.stringify({ day, tz, phantoms }, null, 2));
+    return;
+  }
+  const visitId = arg("--visit");
+  if (!visitId) { console.error("usage: ask-gate --visit <id> [--start ISO --end ISO] [--mode ask|departure] [--json] | ask-gate audit [date]"); process.exit(2); }
+  const mode = arg("--mode") || "ask";
+  let res;
+  try {
+    res = await judge({ visitId, start: arg("--start"), end: arg("--end"), mode });
+    res.applied = false;
+    if (has("--apply") && res.check === "same-stay" && !PROTECTED.has(res.place_type)) {
+      const note = `[ask-gate same-stay] continues ${res.same_stay.id.slice(0, 8)} from ${res.same_stay.arrived_at}`;
+      await sb(`location_history?id=eq.${q(visitId)}`, { method: "PATCH",
+        body: JSON.stringify({ place_type: "non-stop", notes: res.notes ? `${res.notes} | ${note}` : note }) });
+      res.applied = true;
+    }
+    delete res.notes;
+  } catch (e) {
+    res = { visit_id: visitId, mode, ask: true, check: "error", reason: String(e.message || e).slice(0, 200) };
+  }
+  log(res);
+  if (has("--json")) console.log(JSON.stringify(res));
+  else console.log(`${res.ask ? "ASK " : "HOLD"}  ${res.check}  ${res.reason}`);
+}
+
+if (process.argv[1] && fs.realpathSync(process.argv[1]) === fileURLToPath(import.meta.url)) main();

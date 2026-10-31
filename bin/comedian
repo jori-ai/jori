@@ -1,0 +1,141 @@
+#!/usr/bin/env node
+"use strict";
+/**
+ * comedian — the roster of comedians big enough that a SMALL-ROOM date is news.
+ *
+ * Backed by the comedy-club-watch roster file (lib/comedy-config.cjs
+ * `roster_file`, default data/comedy-headliners.json). Membership is judged on
+ * stature (fills theaters/arenas), NOT on taste — the alert lane exists to
+ * catch "arena name just booked a 200-seat club". The `taste` field only labels
+ * and sorts the output; it never gates surfacing (the requirement: every large
+ * comedian doing small club dates).
+ *
+ * Distinct from `headliner` (bin/headliner), which is the music
+ * travel-anywhere bypass set.
+ *
+ * Usage:
+ *   comedian check "<name or event title>"   # exit 0 if on roster, 1 if not
+ *   comedian list [--json] [--taste <core|yes|neutral|avoid>]
+ *   comedian add "<name>" [--taste <t>] [--aka "<alt>"] [--language <code>]
+ *   comedian rm "<name>"
+ *   comedian seen "<name>" [--year YYYY] [--json]   # has the user seen/booked them this year? exit 0 = yes
+ *   comedian seen add "<name>" --date YYYY-MM-DD [--venue V] [--show S] [--with <companion>] [--note N] [--hold-until YYYY-MM-DD]
+ *   comedian seen list [--json]                      # the hand-kept sightings (the calendar is read live)
+ *
+ * `check` matches case-insensitively as a substring of the normalized input, so
+ * "An Evening with <Name>" and "<Name>: Live" both match. Prints the roster
+ * entry as JSON on a hit so callers can read `taste` without a second lookup.
+ */
+
+const fs = require("fs");
+const path = require("path");
+const { comedyConfig } = require("../lib/comedy-config.cjs");
+const { instance } = require("../lib/instance.cjs");
+
+const CFG = comedyConfig();
+const FILE = CFG.roster_file;
+
+function load() {
+  try { return JSON.parse(fs.readFileSync(FILE, "utf8")); }
+  catch { return { comedians: [], updated_at: null }; }
+}
+function save(data) {
+  data.updated_at = new Date().toISOString().slice(0, 10);
+  fs.mkdirSync(path.dirname(FILE), { recursive: true });
+  fs.writeFileSync(FILE, JSON.stringify(data, null, 2) + "\n");
+}
+function norm(s) {
+  return String(s || "")
+    .normalize("NFD").replace(/[̀-ͯ]/g, "")
+    .toLowerCase()
+    .replace(/^the\s+/, "")
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim();
+}
+// Every string a roster entry can be recognized by: its name plus any aka.
+function keysFor(entry) {
+  return [entry.name, ...(entry.aka || [])].map(norm).filter(Boolean);
+}
+
+const argv = process.argv.slice(2);
+const cmd = argv[0];
+const arg = argv[1];
+const flag = (f) => {
+  const i = argv.indexOf(`--${f}`);
+  return i >= 0 ? argv[i + 1] : undefined;
+};
+const has = (f) => argv.includes(`--${f}`);
+
+const data = load();
+data.comedians = data.comedians || [];
+
+if (cmd === "check") {
+  if (!arg) { process.stderr.write('usage: comedian check "<name or title>"\n'); process.exit(2); }
+  const input = norm(arg);
+  const hit = data.comedians.find(c => keysFor(c).some(k => k && input.includes(k)));
+  if (hit) { console.log(JSON.stringify(hit)); process.exit(0); }
+  console.log("not on the comedy roster"); process.exit(1);
+
+} else if (cmd === "list") {
+  const taste = flag("taste");
+  const rows = taste ? data.comedians.filter(c => c.taste === taste) : data.comedians;
+  if (has("json")) console.log(JSON.stringify(rows, null, 2));
+  else rows.forEach(c => console.log(`${c.name}\t${c.taste || "-"}${c.language ? "\t" + c.language : ""}`));
+
+} else if (cmd === "add") {
+  if (!arg) { process.stderr.write('usage: comedian add "<name>" [--taste <t>]\n'); process.exit(2); }
+  if (data.comedians.some(c => keysFor(c).includes(norm(arg)))) {
+    console.log(`already on the roster: ${arg}`); process.exit(0);
+  }
+  const entry = { name: arg, taste: flag("taste") || "neutral" };
+  if (flag("aka")) entry.aka = [flag("aka")];
+  if (flag("language")) entry.language = flag("language");
+  data.comedians.push(entry);
+  save(data);
+  console.log(`added: ${arg} (${entry.taste})`);
+
+} else if (cmd === "rm") {
+  if (!arg) { process.stderr.write('usage: comedian rm "<name>"\n'); process.exit(2); }
+  const before = data.comedians.length;
+  data.comedians = data.comedians.filter(c => !keysFor(c).includes(norm(arg)));
+  if (data.comedians.length === before) { console.log(`not found: ${arg}`); process.exit(1); }
+  save(data);
+  console.log(`removed: ${arg}`);
+
+} else if (cmd === "seen") {
+  // Never recommend the same comedian twice in a calendar year unless it is a new
+  // show. The calendar (performer in the event title) plus the hand-kept
+  // sightings file say what the user has seen or booked.
+  import(require("url").pathToFileURL(path.join(__dirname, "../lib/comedy-seen.mjs")).href).then((seen) => {
+    const entryFor = (name) => data.comedians.find(c => keysFor(c).includes(norm(name))) || { name };
+    const etYear = new Intl.DateTimeFormat("en-CA", { timeZone: instance().tz, year: "numeric" }).format(new Date());
+    if (arg === "add") {
+      const name = argv[2], date = flag("date");
+      if (!name || !/^\d{4}-\d{2}-\d{2}$/.test(date || "")) { // lang-regex-ok: ISO date CLI argument
+        process.stderr.write('usage: comedian seen add "<name>" --date YYYY-MM-DD [--venue V] [--show S] [--with <companion>] [--note N] [--hold-until YYYY-MM-DD]\n'); process.exit(2);
+      }
+      const e = { comedian: entryFor(name).name, date };
+      for (const k of ["venue", "show", "with", "note"]) if (flag(k)) e[k] = flag(k);
+      if (flag("hold-until")) e.hold_until = flag("hold-until"); // "let's wait a year": no listing up to this date is offered
+      seen.addManual(CFG.sightings_file, e);
+      console.log(`recorded: ${e.comedian} on ${date}${e.venue ? ` at ${e.venue}` : ""}`);
+    } else if (arg === "list") {
+      const rows = seen.loadManual(CFG.sightings_file);
+      if (has("json")) console.log(JSON.stringify(rows, null, 2));
+      else rows.forEach(r => console.log(`${r.date}\t${r.comedian}\t${r.venue || "-"}${r.with ? "\twith " + r.with : ""}`));
+    } else {
+      if (!arg) { process.stderr.write('usage: comedian seen "<name>" [--year YYYY] [--json]\n'); process.exit(2); }
+      const entry = entryFor(arg), year = flag("year") || etYear;
+      const rows = seen.forComedian(entry, seen.loadSightings({ file: CFG.sightings_file, roster: [entry], today: `${year}-01-01`, log: (m) => process.stderr.write(m + "\n") }))
+        .filter(r => r.date.startsWith(year)).sort((a, b) => a.date.localeCompare(b.date));
+      if (has("json")) console.log(JSON.stringify(rows, null, 2));
+      else if (!rows.length) console.log(`no sightings of ${entry.name} in ${year}`);
+      else rows.forEach(r => console.log(`${r.date}\t${entry.name}\t${r.venue || "-"}${r.with ? "\twith " + r.with : ""}\t${r.source}${r.show ? "\t" + r.show : ""}`));
+      process.exit(rows.length ? 0 : 1);
+    }
+  });
+
+} else {
+  process.stderr.write("usage: comedian check|list|add|rm|seen  (see header for flags)\n");
+  process.exit(2);
+}

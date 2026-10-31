@@ -10,7 +10,7 @@ import UIKit
 /// land under the same auth.uid() that the Jori iOS app uses — RLS
 /// in Jori scopes everything by that user id, so without it the
 /// inserts would fail. Ported verbatim from
-/// `client/Jori/SupabaseManager.swift` in the jori repo; kept here
+/// `apps/companion/Jori/SupabaseManager.swift` in the jori repo; kept here
 /// as a standalone module so Trainer's existing Supabase plumbing is
 /// untouched.
 enum TrainerSupabase {

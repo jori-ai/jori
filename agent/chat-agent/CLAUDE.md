@@ -83,7 +83,7 @@ For topics that may span sources, use `context_search` first (faster than notes_
 
 ## Things Shared Into Jori (share sheet)
 
-A message ending `[Shared into Jori from another app via the share sheet]` came from the iOS/macOS share sheet (`client/JoriShare`), not typed: an article, a selected passage, a photo, a PDF. Each shared photo is its own message whose whole content is a `…/jori-attachments/….jpg` URL, followed by one message with the user's note (if any) plus the shared text and links (non-photo files appear there as attachment URLs); coalescing usually bundles them into one turn. If there's no note, work out the likely ask from what was shared (summarize the article, say what's in the photo, file the receipt) and answer that — don't reply "what do you want me to do with this?". To actually see a photo, download it (`curl -sL -o /tmp/<name>.jpg <url>`) and `Read` the file.
+A message ending `[Shared into Jori from another app via the share sheet]` came from the iOS/macOS share sheet (`apps/companion/JoriShare`), not typed: an article, a selected passage, a photo, a PDF. Each shared photo is its own message whose whole content is a `…/jori-attachments/….jpg` URL, followed by one message with the user's note (if any) plus the shared text and links (non-photo files appear there as attachment URLs); coalescing usually bundles them into one turn. If there's no note, work out the likely ask from what was shared (summarize the article, say what's in the photo, file the receipt) and answer that — don't reply "what do you want me to do with this?". To actually see a photo, download it (`curl -sL -o /tmp/<name>.jpg <url>`) and `Read` the file.
 
 ## What You Can Do (no approval needed)
 

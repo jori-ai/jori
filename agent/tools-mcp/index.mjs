@@ -694,15 +694,20 @@ const TOOLS = [
 // session's cached prompt prefix — keeps a stable order; without it they are
 // appended. A name a kernel tool already has is ignored (the kernel tool wins);
 // a module that fails to import is skipped with a log line.
-const EXT_TOOLS_DIR = new URL("./_ext/", import.meta.url);
+// The kernel's own optional integrations (home control, …) are modules of the
+// same shape in agent/tools-mcp/modules/, loaded first: each one answers "not
+// configured" until the installation sets it up.
+const TOOL_MODULE_DIRS = [new URL("./modules/", import.meta.url), new URL("./_ext/", import.meta.url)];
 async function loadExtTools() {
-  let files;
-  try { files = fsSync.readdirSync(EXT_TOOLS_DIR).filter((f) => /\.m?js$/.test(f)).sort(); } // lang-regex-ok: file extension
-  catch { return; } // no _ext/ dir: no installation tools
+  const entries = [];
+  for (const dir of TOOL_MODULE_DIRS) {
+    try { for (const f of fsSync.readdirSync(dir).filter((f) => /\.m?js$/.test(f)).sort()) entries.push({ dir, file: f }); } // lang-regex-ok: file extension
+    catch {} // no such dir: nothing from it
+  }
   const groups = [];
-  for (const file of files) {
+  for (const { dir, file } of entries) {
     try {
-      const mod = await import(new URL(file, EXT_TOOLS_DIR).href);
+      const mod = await import(new URL(file, dir).href);
       const raw = mod.tools ?? mod.default?.tools ?? mod.default;
       const list = typeof raw === "function" ? await raw({ run, exec, BIN, ws }) : raw;
       if (!Array.isArray(list)) { console.error(`[tools-mcp/_ext] ${file}: no exported 'tools' — skipped`); continue; }

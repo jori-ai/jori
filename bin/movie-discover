@@ -1,0 +1,143 @@
+#!/usr/bin/env node
+// movie-discover — back-catalog film harvester (2026-10-10). watch-discover only sees
+// films that reached streaming in the last few weeks; this finds the great films
+// the viewers haven't seen yet, from any year. What they have watched (and how much
+// each of them liked it) comes from the ratings site; fit is judged through Jev.
+//
+// Candidates (code):
+//   - TMDB recommendations for every film either of them loved or liked
+//     (watch_ratings from the ratings site + older shared verdicts)
+//   - well-known films they marked "haven't seen" on the ratings site (watch_catalog)
+//   - the taste model's top predictions over the enriched catalog (lib/watch-recsys.mjs,
+//     trained on every mark, rating, verdict and list status), and every candidate is ORDERED by that model's p(like)
+// Code gates: not on the list in any status and not marked seen; IMDb >= 6.8 (no critic
+// floors — see RATING_FLOOR); released and available in the home region
+// (stream, rent or buy, per TMDB/JustWatch); released in the past 10 years; no kids/family
+// animation or romance-led films.
+// Fit: lib/watch-fit.mjs judgeFit (Jev site watchlist-fit, Sonnet shadow/fallback),
+// as the together audience — movies are one shared list. Fails closed.
+// Adds up to --max as queued; the intro email introduces them the next morning.
+//
+//   movie-discover [--max 5] [--judge 15] [--dry-run]
+// Playbook: agent/ops-agent/jobs/movie-discover.md
+
+import { loadAll, insertTitle, findExisting, omdbRecord, todayEt, hasTmdb, rest } from "../lib/watch-db.mjs";
+import { judgeFit } from "../lib/watch-fit.mjs";
+import { loadModel } from "../lib/watch-model.mjs";
+import * as recsys from "../lib/watch-recsys.mjs";
+import { HOME_REGION } from "../lib/watch-where.mjs";
+
+const arg = (n, d) => { const i = process.argv.indexOf(`--${n}`); return i >= 0 ? parseInt(process.argv[i + 1], 10) : d; };
+const MAX = arg("max", 5);
+const JUDGE = arg("judge", 15);
+const DRY = process.argv.includes("--dry-run");
+// IMDb ≥ 6.8 only. Critic floors were dropped 2026-10-10: on 270 films they'd rated, IMDb ≥ 7.5
+// would have cut 50% of the films they liked and RT ≥ 75% cut 27% while passing 57% of the ones
+// they disliked (RT predicts their marks at chance). The model and Jev judge fit; RT and
+// Metacritic still go to the judge and the intro email.
+const RATING_FLOOR = 6.8;
+const today = todayEt();
+const MIN_YEAR = parseInt(today.slice(0, 4), 10) - 10;
+if (!hasTmdb()) { console.log(JSON.stringify({ error: "TMDB_API_KEY missing", added: [] })); process.exit(1); }
+
+async function tmdb(p) {
+  const r = await fetch(`https://api.themoviedb.org/3/${p}${p.includes("?") ? "&" : "?"}api_key=${process.env.TMDB_API_KEY}`, { signal: AbortSignal.timeout(12000) });
+  return r.ok ? r.json() : null;
+}
+
+const data = await loadAll();
+const { titles, feedback, ratings } = data;
+// Paged: PostgREST caps a response at 1,000 rows and the catalog is several thousand films —
+// an unpaged read silently missed most "seen" marks.
+const catalog = [];
+for (let off = 0; ; off += 1000) {
+  const page = await rest(`watch_catalog?select=tmdb_id,imdb_id,title,year,seen,not_for_us,vote_average&kind=eq.movie&order=id&limit=1000&offset=${off}`);
+  catalog.push(...page);
+  if (page.length < 1000) break;
+}
+// Seen, or "not our thing" — never a candidate.
+const seenTmdb = new Set(catalog.filter((c) => c.seen === true || c.not_for_us).map((c) => c.tmdb_id));
+
+// Seeds: films either of them loved or liked.
+const liked = new Set([
+  ...ratings.filter((r) => ["loved", "liked"].includes(r.verdict)).map((r) => r.title_id),
+  ...feedback.filter((f) => ["loved", "liked"].includes(f.verdict)).map((f) => f.title_id),
+]);
+const seeds = titles.filter((t) => liked.has(t.id) && t.kind !== "show" && t.tmdb_id).slice(-40);
+
+const pool = new Map(); // tmdb_id → {tmdb_id, title, because:Set, vote}
+const addC = (m, because) => {
+  if (!m?.id || seenTmdb.has(m.id)) return;
+  const y = m.year ?? (m.release_date ? parseInt(m.release_date.slice(0, 4), 10) : null);
+  if (y != null && y < MIN_YEAR) return; // older than the 10-year window (re-checked after details)
+  const c = pool.get(m.id) || { tmdb_id: m.id, title: m.title, because: new Set(), vote: m.vote_average || 0 };
+  if (because) c.because.add(because);
+  pool.set(m.id, c);
+};
+for (const s of seeds) {
+  const r = await tmdb(`movie/${s.tmdb_id}/recommendations`);
+  for (const m of (r?.results || []).slice(0, 12)) addC(m, s.name);
+}
+for (const c of catalog.filter((c) => c.seen === false && !c.not_for_us && (c.vote_average || 0) >= 7.3)) addC({ id: c.tmdb_id, title: c.title, vote_average: c.vote_average, year: c.year }, null);
+
+// The taste model: its best unseen catalog films join the pool, and it orders the whole pool.
+const M = await loadModel();
+const catRow = new Map(M.catalog.filter((r) => r.kind === "movie").map((r) => [r.tmdb_id, r]));
+const unseen = M.catalog.filter((r) => r.kind === "movie" && r.seen !== true && !r.not_for_us && r.features_at && !r.title_id && (r.year ?? 0) >= MIN_YEAR);
+for (const r of unseen.map((r) => ({ r, p: recsys.predict(M.model, r).p })).sort((a, b) => b.p - a.p).slice(0, 40)) {
+  addC({ id: r.r.tmdb_id, title: r.r.title, vote_average: r.r.vote_average, year: r.r.year }, "Jori's taste model");
+}
+for (const c of pool.values()) { const r = catRow.get(c.tmdb_id); c.p = r?.features_at ? recsys.predict(M.model, r).p : null; }
+// Highest predicted like first; unenriched candidates rank by how many loved films point at them.
+const ordered = [...pool.values()].sort((a, b) => (b.p ?? 0.5 + 0.05 * b.because.size) - (a.p ?? 0.5 + 0.05 * a.because.size) || b.vote - a.vote);
+const skipped = [], cands = [];
+const skip = (title, why) => skipped.push({ title, why });
+
+for (const c of ordered) {
+  if (cands.length >= JUDGE) break;
+  const d = await tmdb(`movie/${c.tmdb_id}?append_to_response=external_ids,keywords`);
+  if (!d) { skip(c.title, "no TMDB details"); continue; }
+  const m = {
+    kind: (d.genres || []).some((g) => g.name === "Documentary") ? "documentary" : "movie",
+    tmdb_id: d.id, name: d.title, imdb_id: d.imdb_id || d.external_ids?.imdb_id || null,
+    year_start: d.release_date ? parseInt(d.release_date.slice(0, 4), 10) : null,
+    genres: (d.genres || []).map((g) => g.name).join(", ") || null, description: d.overview || null,
+    original_language: d.original_language || null, release_date: d.release_date || null,
+    keywords: (d.keywords?.keywords || []).map((k) => k.name).join(", ") || null,
+  };
+  if (findExisting(titles, { imdb_id: m.imdb_id, tmdb_id: m.tmdb_id, name: m.name, kind: m.kind })) { skip(m.name, "already on the list"); continue; }
+  if (!m.release_date || m.release_date > today) { skip(m.name, "not released"); continue; }
+  if (m.year_start < MIN_YEAR) { skip(m.name, `from ${m.year_start}, before ${MIN_YEAR}`); continue; }
+  const g = m.genres || "";
+  if (g.includes("Animation") && g.includes("Family")) { skip(m.name, "kids/family animation"); continue; }
+  if (g.startsWith("Romance")) { skip(m.name, "romance-led"); continue; }
+  const omdb = await omdbRecord(m.imdb_id);
+  if (omdb.imdb == null || omdb.imdb < RATING_FLOOR) { skip(m.name, `IMDb ${omdb.imdb ?? "unknown"} < ${RATING_FLOOR}`); continue; }
+  const prov = (await tmdb(`movie/${m.tmdb_id}/watch/providers`))?.results?.[HOME_REGION];
+  if (!prov || !["flatrate", "free", "ads", "rent", "buy"].some((k) => prov[k]?.length)) { skip(m.name, `not available in ${HOME_REGION}`); continue; }
+  const platform = prov.flatrate?.[0]?.provider_name || null;
+  const because = [...c.because].slice(0, 3);
+  cands.push({ m, omdb, platform, p: c.p, why: because.length ? `recommended from ${because.join(", ")}` : "a well-known film they marked haven't seen" });
+}
+
+const verdicts = await judgeFit(cands.map(({ m, omdb, why, p }) => ({
+  name: m.name, kind: m.kind, audience: "together", year: m.year_start, genres: m.genres, language: m.original_language,
+  synopsis: m.description, imdb: omdb.imdb, rt: omdb.rt, metacritic: omdb.metacritic, why, model_p: p != null ? Math.round(p * 100) / 100 : null,
+})), { ...data, learned: recsys.tasteSummary(M.model, 10) });
+
+const added = [];
+for (const [i, { m, omdb, platform, why }] of cands.entries()) {
+  const v = verdicts[i];
+  if (!v?.keep) { skip(m.name, `fit gate (${v?.used || "none"}): ${v?.reason || "no verdict"}`); continue; }
+  if (added.length >= MAX) { skip(m.name, "over this run's cap"); continue; }
+  const row = {
+    kind: m.kind, name: m.name, imdb_id: m.imdb_id, tmdb_id: m.tmdb_id, audience: "together", status: "queued",
+    year_start: m.year_start, genres: m.genres, platform, original_language: m.original_language, keywords: m.keywords || null,
+    imdb_rating: omdb.imdb, description: m.description, source: "movie-discover", source_reason: why.slice(0, 300),
+  };
+  if (DRY) { added.push({ name: row.name, rating: omdb.imdb, why, p: cands[i].p, dry_run: true }); continue; }
+  try { const t = await insertTitle(row); titles.push({ ...t, seasons: [] }); added.push({ name: t.name, rating: omdb.imdb, why }); }
+  catch (e) { skip(m.name, `insert failed: ${e.message}`); }
+}
+
+console.log(JSON.stringify({ model_labels: M.labels.size, seeds: seeds.length, pool: pool.size, judged: cands.length, added, skipped }, null, 2));

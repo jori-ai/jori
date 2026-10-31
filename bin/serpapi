@@ -1,0 +1,75 @@
+#!/usr/bin/env node
+// serpapi — search Google (and its verticals) through SerpApi, which returns the
+// result page as structured JSON. Covers what Jori otherwise scrapes or
+// cannot reach: Google web results with knowledge-graph / answer boxes, Maps
+// local results, News, Scholar, Shopping, Flights, Hotels, Events.
+//
+// Usage:
+//   serpapi <engine> "<query>" [--param=value ...] [--raw]
+//   serpapi account                      # plan + searches left (free, uncounted)
+//
+// <engine> is any SerpApi engine name (google, google_maps, google_news,
+// google_scholar, google_shopping, google_flights, google_hotels,
+// google_events, ...) — see https://serpapi.com/search-api. Extra engine
+// parameters pass straight through: `--location="<city, region>"`,
+// `--gl=fr`, `--num=20`, `--departure_id=<airport code>`. Engines that take no free-text
+// query (google_flights) accept "-" as the query.
+//
+// Prints compact JSON: the result blocks only, with SerpApi's
+// search_metadata / search_parameters / pagination bookkeeping dropped
+// (--raw keeps everything). Exits 1 on an API error with its message on stderr.
+//
+// Every search counts against the plan's monthly quota (the free plan is
+// small), so callers should cache and never loop over it. Key: SERPAPI_API_KEY
+// in .env.
+
+import { loadEnv } from "../lib/load-env.js";
+loadEnv();
+
+const KEY = process.env.SERPAPI_API_KEY;
+const BASE = "https://serpapi.com";
+const DROP = ["search_metadata", "search_parameters", "search_information", "pagination", "serpapi_pagination"];
+
+function die(msg) {
+  process.stderr.write(`serpapi: ${msg}\n`);
+  process.exit(1);
+}
+
+async function getJson(path, params) {
+  const url = `${BASE}${path}?${new URLSearchParams({ ...params, api_key: KEY })}`;
+  const res = await fetch(url, { signal: AbortSignal.timeout(60_000) })
+    .catch((e) => die(`request failed: ${e.cause?.code || e.message}`));
+  const body = await res.json().catch(() => ({ error: `HTTP ${res.status} (non-JSON body)` }));
+  if (!res.ok || body.error) die(body.error || `HTTP ${res.status}`);
+  return body;
+}
+
+const args = process.argv.slice(2);
+if (!args.length || args[0] === "-h" || args[0] === "--help") {
+  process.stdout.write('usage: serpapi <engine> "<query>" [--param=value ...] [--raw] | serpapi account\n');
+  process.exit(args.length ? 0 : 1);
+}
+if (!KEY) die("SERPAPI_API_KEY is not set (.env)");
+
+if (args[0] === "account") {
+  const a = await getJson("/account.json", {});
+  const { api_key, account_email, ...rest } = a;
+  process.stdout.write(JSON.stringify(rest) + "\n");
+  process.exit(0);
+}
+
+const [engine, query, ...flags] = args;
+if (!query) die("missing query (use \"-\" for engines that take none)");
+const raw = flags.includes("--raw");
+const params = { engine, output: "json" };
+if (query !== "-") params.q = query;
+for (const f of flags) {
+  if (f === "--raw") continue;
+  const m = f.match(/^--([a-z0-9_]+)=(.*)$/i);
+  if (!m) die(`bad flag ${f} (expected --param=value)`);
+  params[m[1]] = m[2];
+}
+
+const result = await getJson("/search.json", params);
+if (!raw) for (const k of DROP) delete result[k];
+process.stdout.write(JSON.stringify(result) + "\n");

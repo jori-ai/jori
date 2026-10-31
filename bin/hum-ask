@@ -131,6 +131,11 @@ sendArgs.push(message.trim());
 const res = spawnSync(SEND, sendArgs, { encoding: "utf8" });
 try { fs.unlinkSync(contextFile); } catch {}
 const side = readSidecar(captureFile);
+// Where jori-send-curl routed it (lib/question-route.mjs): chat or the Questions tab.
+let route = null;
+try { route = JSON.parse(fs.readFileSync(`${captureFile}.route`, "utf8")); } catch {}
+try { fs.unlinkSync(`${captureFile}.route`); } catch {}
+const inQuestionsTab = route?.channel === "questions";
 let capture = "";
 try { capture = fs.readFileSync(captureFile, "utf8").trim(); } catch {}
 try { fs.unlinkSync(captureFile); } catch {}
@@ -185,7 +190,10 @@ const pending = {
   expires_at: new Date(now.getTime() + ttlMin * 60_000).toISOString(),
 };
 if (side && side.action === "rewrite") pending.resolve = { decision_id: side.decision_id, narrowed_to_gap: true };
-try {
+// A question routed to the Questions tab waits there for the user, with no push,
+// so it does not hold the single pending slot that pauses every other question;
+// its reply arrives on that channel, threaded to it.
+if (!inQuestionsTab) try {
   fs.mkdirSync(path.dirname(PENDING), { recursive: true });
   const tmp = `${PENDING}.tmp.${process.pid}`;
   fs.writeFileSync(tmp, JSON.stringify(pending, null, 2) + "\n");
@@ -200,4 +208,4 @@ try {
 } catch (e) {
   console.error(`hum-ask: sent, but the open-questions ledger could not be written (${e.message})`);
 }
-await done(0, "asked", { message_id: messageId, text_sent: textSent, reask: Boolean(prior), asks: (prior?.asks || 0) + 1 });
+await done(0, "asked", { message_id: messageId, text_sent: textSent, reask: Boolean(prior), asks: (prior?.asks || 0) + 1, channel: route?.channel || "chat" });

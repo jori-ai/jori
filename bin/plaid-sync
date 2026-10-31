@@ -1,0 +1,830 @@
+#!/usr/bin/env node
+"use strict";
+// plaid-sync — headless pull of balances + transactions for every connected
+// Plaid Item, into the jori Supabase DB, with threshold alerts.
+//
+// Deterministic (no LLM): cheap and reliable, safe to run on a tight cron. The
+// LLM-driven "spending insights" narrative is a SEPARATE weekly job that reads
+// the rows this job writes — keeping the frequent sync off the model budget.
+//
+// READ-ONLY: only calls balance + transactions/sync. Cannot move money.
+//
+// Usage:
+//   plaid-sync                 sync all items, upsert to Supabase, alert
+//   plaid-sync --dry-run       fetch + print summary; NO Supabase writes, NO notify
+//   plaid-sync --no-notify     write to Supabase but suppress push alerts
+//   plaid-sync --json          machine-readable summary to stdout
+//   plaid-sync --fresh-balances
+//                              force a real-time balance pull from the bank
+//                              instead of Plaid's cached figure. COSTS MONEY
+//                              ($0.10 per Item per run); the default is free.
+//   plaid-sync --reset-cursor [--item <id>]
+//                              forget where the last sync stopped and replay the
+//                              Item from the start of its history window
+//
+// Alert thresholds (agent/local/config/finance.json `alerts`, env wins):
+//   PLAID_ALERT_LARGE_TXN     large_txn     default 500   (USD; alert on new spend >= this)
+//   PLAID_ALERT_LARGE_DEPOSIT large_deposit default 1000  (USD; alert on new deposit >= this)
+//   PLAID_ALERT_LOW_BALANCE   low_balance   default 100   (USD; alert when available < this)
+
+const { execFile } = require("node:child_process");
+const path = require("node:path");
+const plaid = require("../lib/plaid-api.js");
+const store = require("../lib/plaid-store.js");
+const { request } = require("../lib/supabase-rest.js");
+const { categoryOf, findCounterLeg, OWN_MOVEMENT_OUT, LEG_WINDOW_DAYS } = require("../lib/plaid-alert-rules.js");
+const { instance, localConfig } = require("../lib/instance.cjs");
+
+const FINANCE = localConfig("finance", { alerts: {}, recurring_refresh_url: "" });
+const ALERTS = { large_txn: 500, large_deposit: 1000, low_balance: 100, ...(FINANCE.alerts || {}) };
+
+const ARGV = process.argv.slice(2);
+const FLAGS = new Set(ARGV.filter((a) => a.startsWith("--")));
+const DRY_RUN = FLAGS.has("--dry-run");
+const NO_NOTIFY = FLAGS.has("--no-notify") || DRY_RUN;
+const JSON_OUT = FLAGS.has("--json");
+
+/**
+ * Pay Plaid to dial the bank for a this-instant balance, instead of reading the
+ * figure it already has.
+ *
+ * Off by default since 2026-09-06, and that is a billing decision as much as a
+ * technical one: /accounts/balance/get is $0.10 a call, and at one call per Item
+ * per run it was 304 calls = $30.40 of a $35.40 August invoice — 86% of the bill
+ * for the whole integration. /accounts/get returns the same numbers for free
+ * from Plaid's last Item update.
+ *
+ * What made the paid call defensible was a once-nightly cron, where "Plaid's
+ * last update" could be many hours stale. That reasoning died with the webhook:
+ * the sync now runs because Plaid just refreshed the Item, so the free figure is
+ * seconds old at the moment we read it. Paying to force a refresh Plaid had
+ * already performed also meant every extra sync cost money — which would have
+ * made the event-driven design more expensive than the cron it replaced.
+ */
+const FRESH_BALANCES = FLAGS.has("--fresh-balances");
+
+/**
+ * Replay an Item from the start of its history window instead of resuming.
+ *
+ * `/transactions/sync` returns only what changed since the saved cursor, so
+ * widening an Item's history (via `plaid-connect update`, which now asks for
+ * 730 days) delivers nothing on its own — the cursor still points past the
+ * newly available backfill. Dropping the cursor is what makes Plaid replay the
+ * Item from the beginning.
+ *
+ * Safe to re-run: transactions upsert on `transaction_id`, so a replay
+ * refreshes rows rather than duplicating them. It also makes the run look like
+ * a first sync, which suppresses the alert avalanche a two-year backfill would
+ * otherwise send.
+ */
+const RESET_CURSOR = FLAGS.has("--reset-cursor");
+const ONLY_ITEM = (() => {
+  const i = ARGV.indexOf("--item");
+  return i !== -1 ? ARGV[i + 1] : null;
+})();
+
+const LARGE_TXN = Number(process.env.PLAID_ALERT_LARGE_TXN || ALERTS.large_txn);
+const LARGE_DEPOSIT = Number(process.env.PLAID_ALERT_LARGE_DEPOSIT || ALERTS.large_deposit);
+const LOW_BALANCE = Number(process.env.PLAID_ALERT_LOW_BALANCE || ALERTS.low_balance);
+
+const SEND_BIN = path.join(__dirname, "jori-send-curl");
+
+function log(...a) {
+  if (!JSON_OUT) console.log(...a);
+}
+
+function usd(n) {
+  if (n === null || n === undefined) return "—";
+  return `$${Number(n).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+}
+
+// ── Supabase upserts ────────────────────────────────────────────────────────
+
+async function upsertAccounts(rows) {
+  if (DRY_RUN || !rows.length) return;
+  await request("/rest/v1/plaid_accounts?on_conflict=account_id", {
+    method: "POST",
+    body: rows,
+    prefer: "resolution=merge-duplicates,return=minimal",
+  });
+}
+
+async function upsertTransactions(rows) {
+  if (DRY_RUN || !rows.length) return;
+  // Chunk to stay well under any payload limits.
+  for (let i = 0; i < rows.length; i += 500) {
+    await request("/rest/v1/plaid_transactions?on_conflict=transaction_id", {
+      method: "POST",
+      body: rows.slice(i, i + 500),
+      prefer: "resolution=merge-duplicates,return=minimal",
+    });
+  }
+}
+
+async function deleteTransactions(ids) {
+  if (DRY_RUN || !ids.length) return;
+  const list = ids.map((id) => `"${id}"`).join(",");
+  await request(`/rest/v1/plaid_transactions?transaction_id=in.(${list})`, {
+    method: "DELETE",
+    prefer: "return=minimal",
+  });
+}
+
+// ── Mapping Plaid → rows ────────────────────────────────────────────────────
+
+function accountRow(acct, itemId, institutionName, now) {
+  const b = acct.balances || {};
+  return {
+    // Health travels on the account rows because that is the only Plaid table
+    // the hub's `plaid_readonly` role can read. A separate items table would be
+    // the cleaner shape and would need a new grant on the other side of a trust
+    // boundary; three denormalised columns need none, and every account of an
+    // Item shares its connection's fate anyway.
+    sync_status: "ok",
+    sync_error: null,
+    sync_failed_at: null,
+    account_id: acct.account_id,
+    item_id: itemId,
+    institution_name: institutionName || null,
+    name: acct.name || null,
+    official_name: acct.official_name || null,
+    mask: acct.mask || null,
+    type: acct.type || null,
+    subtype: acct.subtype || null,
+    balance_current: b.current ?? null,
+    balance_available: b.available ?? null,
+    balance_limit: b.limit ?? null,
+    iso_currency_code: b.iso_currency_code || null,
+    last_synced_at: now,
+    updated_at: now,
+  };
+}
+
+function txnRow(t, itemId, now) {
+  const pfc = t.personal_finance_category || {};
+  return {
+    transaction_id: t.transaction_id,
+    account_id: t.account_id,
+    item_id: itemId,
+    amount: t.amount,
+    iso_currency_code: t.iso_currency_code || null,
+    date: t.date,
+    authorized_date: t.authorized_date || null,
+    name: t.name || null,
+    merchant_name: t.merchant_name || null,
+    category_primary: pfc.primary || null,
+    category_detailed: pfc.detailed || null,
+    payment_channel: t.payment_channel || null,
+    pending: !!t.pending,
+    // Retain the COMPLETE Plaid object so no field is ever lost (location,
+    // counterparties, payment_meta, logos, future fields). Curated columns
+    // above stay for fast queries; `raw` is the source of truth.
+    raw: t,
+    updated_at: now,
+  };
+}
+
+/**
+ * Flag every account of an Item that could not be refreshed.
+ *
+ * An Item that fails at the balance call never yields accounts, so there is
+ * nothing to upsert — but rows for it already exist from previous runs, and
+ * those are what the hub reads. Patching them is what turns "this balance is a
+ * day old, and nobody knows why" into a warning that names the reason.
+ *
+ * `last_synced_at` is deliberately left alone. It means "when this balance was
+ * true", and the balance still is what it was; overwriting it would make a
+ * stale figure look fresh, which is the opposite of the point.
+ */
+async function markItemUnhealthy(itemId, status, reason, now) {
+  if (DRY_RUN) return;
+  try {
+    await request(`/rest/v1/plaid_accounts?item_id=eq.${encodeURIComponent(itemId)}`, {
+      method: "PATCH",
+      body: { sync_status: status, sync_error: String(reason || "").slice(0, 200), sync_failed_at: now },
+      prefer: "return=minimal",
+    });
+  } catch (e) {
+    // Never let the bookkeeping of a failure become a second failure.
+    console.error(`  could not record sync health: ${e.message}`);
+  }
+}
+
+// ── Alerts ──────────────────────────────────────────────────────────────────
+
+async function notify(body) {
+  if (NO_NOTIFY) {
+    log(`  (notify suppressed) ${body}`);
+    return;
+  }
+  // Writes to jori_messages (so it's visible in chat, not just a push
+  // banner) AND fires the push, in one call. --skip-precheck is required
+  // here, not optional: bank transaction content must never be passed into
+  // outbound-precheck's reasoning/log per the Financial Operations rule in
+  // agent/CLAUDE.md (jori-model-only tier). Owner-authorized: alerts land
+  // in chat as well as on the push banner.
+  await new Promise((resolve) => {
+    execFile(
+      SEND_BIN,
+      ["--skip-precheck", "--intent", "plaid-alert", "--agent", "ops", body],
+      (err) => {
+        if (err) console.error(`  notify failed: ${err.message}`);
+        resolve();
+      }
+    );
+  });
+}
+
+// Update-mode Hosted Link for a broken Item: same call `plaid-connect update`
+// makes. Minted fresh on every login_required hit rather than reused, since a
+// stale link may have expired by the time the user taps it and re-minting is
+// cheap. Never throws — a mint
+// failure falls back to the old "run this command" instruction so a Plaid
+// hiccup can't silently swallow the re-auth alert entirely.
+async function mintReconnectLink(item) {
+  if (NO_NOTIFY) return null; // dry-run / --no-notify: alert is suppressed, link would go nowhere
+  try {
+    const resp = await plaid.createLinkToken({
+      userId: instance().owner_id,
+      products: ["transactions"],
+      accessToken: item.access_token,
+    });
+    return resp.hosted_link_url || null;
+  } catch (e) {
+    console.error(`  reconnect-link mint failed: ${e.message}`);
+    return null;
+  }
+}
+
+// Categories that represent money coming IN, used (alongside amount sign) to
+// tell deposits from spend so payroll/refunds aren't mislabeled as "charges".
+const INFLOW_CATEGORIES = new Set(["INCOME", "TRANSFER_IN"]);
+
+// Plaid sign: positive amount = money OUT, negative = money IN. We treat a txn
+// as an inflow if EITHER the sign or the category says so (robust to either).
+// categoryOf() reads both shapes: the raw Plaid object buildAlerts judges
+// (category nested under personal_finance_category) and our stored row.
+function isInflow(t) {
+  return t.amount < 0 || INFLOW_CATEGORIES.has(categoryOf(t).primary);
+}
+
+// Verb for an outflow, so a wire/transfer or loan payment isn't called a "charge".
+function outflowVerb(category, detailed) {
+  if (detailed === "LOAN_PAYMENTS_CREDIT_CARD_PAYMENT") return "Card payment";
+  if (category === "TRANSFER_OUT") return "Transfer out";
+  if (category === "LOAN_PAYMENTS") return "Loan payment";
+  return "Charge";
+}
+
+/**
+ * What the user has paid this merchant before. Used to tell "large" from
+ * "unusual", which are not the same thing and were being conflated.
+ *
+ * Returns {count, max} over the last ~12 months, or null when we cannot tell
+ * (no history, query failed). Null means "no judgement available" and the
+ * caller falls back to alerting — a missed alert on a genuinely odd charge is
+ * worse than one redundant ping.
+ *
+ * History is POSTED charges other than this one. `t` is the raw Plaid object
+ * being judged: its own `transaction_id`, and the `pending_transaction_id` of
+ * the pending copy it replaces, never count as a precedent.
+ */
+async function merchantHistory(label, t = {}) {
+  if (!label || label === "transaction") return null;
+  try {
+    const since = new Date(Date.now() - 365 * 24 * 3600_000).toISOString().slice(0, 10);
+    const qs = new URLSearchParams({
+      select: "amount",
+      date: `gte.${since}`,
+      merchant_name: `eq.${label}`,
+      // A pending row is a charge not yet posted — usually the posted one's own
+      // earlier copy. Plaid sometimes delivers the posted charge a sync before
+      // it removes that copy, so for a sync or more the copy sits in the table
+      // at the same amount, and a merchant never seen before looked like one
+      // with exactly one prior charge of exactly this size. (`pending` is
+      // `boolean not null default false`, 20260623_plaid.sql.)
+      pending: "is.false",
+      limit: "200",
+    });
+    // upsertTransactions() already ran this tick, so the charge we are judging
+    // is itself in the table. Leaving it in would make every transaction its
+    // own precedent — `mag <= hist.max` trivially true — and a 10x jump at a
+    // familiar merchant would suppress itself. Its pending copy is excluded by
+    // id too, in case that copy was ever stored without the pending flag.
+    for (const id of new Set([t.transaction_id, t.pending_transaction_id].filter(Boolean))) {
+      qs.append("transaction_id", `neq.${id}`);
+    }
+    const rows = await request(`/rest/v1/plaid_transactions?${qs}`, { method: "GET" });
+    if (!Array.isArray(rows) || !rows.length) return null;
+    const amounts = rows.map((r) => Math.abs(Number(r.amount))).filter(Number.isFinite);
+    if (!amounts.length) return null;
+    return { count: amounts.length, max: Math.max(...amounts) };
+  } catch { return null; }
+}
+
+/**
+ * The other leg of a movement between two of the user's own linked accounts, if
+ * there is one. Candidates are this run's new transactions across every Item
+ * synced in this run (alerts are built only after the Item loop — see main())
+ * plus stored rows, because the card side of a payment is often posted, and
+ * synced, days before the checking side. Stored rows of BOTH signs are fetched,
+ * over twice the pairing window, so a rival partner is visible and an
+ * ambiguous match alerts instead of pairing. The decision itself — including
+ * the rules that keep Zelle/Venmo payments and rent/payroll credits out — is
+ * the pure findCounterLeg() in lib/plaid-alert-rules.js.
+ *
+ * Fails toward alerting: if the stored-row lookup errors, only this run's
+ * transactions are considered, and no match means the alert goes out as before.
+ */
+async function counterLeg(t, runAdded, consumed, accountTypes) {
+  const pool = [...runAdded];
+  const day = Date.parse(`${String(t.date).slice(0, 10)}T00:00:00Z`);
+  if (Number.isFinite(day)) {
+    const iso = (ms) => new Date(ms).toISOString().slice(0, 10);
+    const span = 2 * LEG_WINDOW_DAYS * 86_400_000;
+    const m = Math.abs(t.amount);
+    const band = (v) => `and(amount.gte.${(v - 0.005).toFixed(3)},amount.lte.${(v + 0.005).toFixed(3)})`;
+    const qs = new URLSearchParams({
+      select: "transaction_id,account_id,amount,date,category_primary,category_detailed",
+      or: `(${band(-m)},${band(m)})`,
+      limit: "100",
+    });
+    qs.append("date", `gte.${iso(day - span)}`);
+    qs.append("date", `lte.${iso(day + span)}`);
+    try {
+      const rows = await request(`/rest/v1/plaid_transactions?${qs}`, { method: "GET" });
+      if (Array.isArray(rows)) pool.push(...rows.map((r) => ({ ...r, amount: Number(r.amount) })));
+    } catch (e) {
+      log(`    (counter-leg lookup failed: ${e.message} — judging on this run's transactions only)`);
+    }
+  }
+  return findCounterLeg(t, pool, consumed, accountTypes);
+}
+
+/**
+ * Build alert lines from this run's NEW transactions + current balances.
+ *
+ * A LARGE charge and an UNUSUAL charge are different things, and until
+ * 2026-08-04 this only knew how to detect the first one. That produced twelve
+ * bare echoes in a week — "<Bank>: Charge: $1,511.48 at <insurer>" — carrying
+ * no anomaly flag, no question, and nothing to do. A recurring rent payment or
+ * a familiar restaurant crossing a fixed dollar threshold is not news; the
+ * finance track's daily digest is the right home for it.
+ *
+ * So a large outflow now has to also be unusual FOR THAT MERCHANT to interrupt
+ * the user: never seen before, or well above anything paid to them in a year.
+ * Deposits, low balances, and re-auth failures are unchanged — those are
+ * inherently exceptional.
+ */
+async function buildAlerts(institutionName, addedTxns, accounts, runAdded = [], consumed = new Set(), accountTypes = {}) {
+  const alerts = [];
+  for (const t of addedTxns) {
+    if (t.pending) continue; // wait until posted
+    const label = t.merchant_name || t.name || "transaction";
+    const mag = Math.abs(t.amount);
+    const inflow = isInflow(t);
+    if (mag < (inflow ? LARGE_DEPOSIT : LARGE_TXN)) continue;
+    // Already paired as the other leg of a transfer judged earlier this run.
+    if (consumed.has(t.transaction_id)) continue;
+    const leg = await counterLeg(t, runAdded, consumed, accountTypes);
+    if (leg) {
+      consumed.add(t.transaction_id);
+      consumed.add(leg.transaction_id);
+      log(`    (not alerting ${usd(mag)} ${label} — the matching ${usd(mag)} ${inflow ? "debit" : "credit"} is in another of your linked accounts on ${leg.date}; your own money moving)`);
+      continue;
+    }
+    if (inflow) {
+      alerts.push(`Deposit: ${usd(mag)} — ${label} (${t.date}).`);
+    } else {
+      const hist = await merchantHistory(t.merchant_name, t);
+      // Paid this merchant before, and this is in line with it (within 25% of
+      // the user's own high-water mark) → expected, not news.
+      //
+      // This used to also require TWO prior charges. With exactly one, every
+      // large charge fell through to the alert below and was told it was "well
+      // above" the earlier payment whatever its size: on 2026-10-17 a charge
+      // about a fifth of the earlier one was called well above it. One earlier
+      // payment is a fine yardstick for "bigger than before", and the alert may
+      // only make that claim when it is true — so the wording and the decision
+      // read the same predicate. (The two-charge rule had also been masking a
+      // charge counting its own pending copy as that one prior charge;
+      // merchantHistory() now excludes it, so a first charge stays a first.)
+      const wellAbove = hist ? mag > hist.max * 1.25 : false;
+      if (hist && !wellAbove) {
+        log(`    (not alerting ${usd(mag)} at ${label} — ${hist.count} prior charge${hist.count === 1 ? "" : "s"}, max ${usd(hist.max)}; expected, goes to the daily digest)`);
+        continue;
+      }
+      const category = categoryOf(t).primary;
+      // "First charge from this merchant" is only a claim we can make when
+      // there IS a merchant — a transfer or card payment has none, so
+      // merchantHistory() returns null for it and every one used to be called
+      // a first charge. What is true of those is that no linked account
+      // received the money.
+      const why = wellAbove
+        ? ` — well above the ${usd(hist.max)} you've paid them before`
+        : t.merchant_name
+          ? ` — first charge from this merchant`
+          : OWN_MOVEMENT_OUT.has(category)
+            ? ` — no matching credit in any of your linked accounts`
+            : "";
+      alerts.push(`${outflowVerb(category, categoryOf(t).detailed)}: ${usd(mag)} at ${label} (${t.date})${why}.`);
+    }
+  }
+  for (const a of accounts) {
+    const avail = a.balances && a.balances.available;
+    if (typeof avail === "number" && a.type === "depository" && avail < LOW_BALANCE) {
+      alerts.push(`Low balance: ${a.name || a.subtype} is at ${usd(avail)}.`);
+    }
+  }
+  return alerts.map((line) => `${institutionName ? institutionName + ": " : ""}${line}`);
+}
+
+// ── Per-item sync ───────────────────────────────────────────────────────────
+
+// Fetch + store credit-card liabilities for this Item. Returns the number of
+// cards stored. Silently returns 0 for Items without the liabilities consent
+// (ADDITIONAL_CONSENT_REQUIRED) — only cards re-consented via `plaid-connect
+// update` return data.
+// INVALID_PRODUCT is CLIENT-level, not item-level: the `liabilities` product
+// isn't enabled on the Plaid client at all, so every Item is guaranteed to fail
+// identically. Retrying it per-Item meant 9 doomed API calls and 9 warning
+// lines on every run since 2026-06-24 (day one of the integration). Latch on
+// the first occurrence and skip the rest of the run — one clear line instead of
+// nine, and no wasted calls. Enabling the product in the Plaid dashboard is the
+// actual remediation; until then this stays a quiet, honest no-op.
+let liabilitiesUnavailable = null; // null = unknown, string = reason, latched per run
+
+async function syncLiabilities(item, now) {
+  if (liabilitiesUnavailable) return 0;
+  let resp;
+  try {
+    resp = await plaid.getLiabilities(item.access_token);
+  } catch (e) {
+    const code = e.plaid && e.plaid.error_code;
+    if (code === "INVALID_PRODUCT") {
+      liabilitiesUnavailable = code;
+      console.error(
+        `  liabilities: skipped for all Items — the 'liabilities' product is not enabled on this Plaid client ` +
+        `(declined 2026-07-20; card issuers already send their own overdue alerts). No APR/statement/due-date ` +
+        `data is collected. The probe is left in place so the path lights up automatically if it's ever enabled.`,
+      );
+      return 0;
+    }
+    if (["ADDITIONAL_CONSENT_REQUIRED", "PRODUCTS_NOT_SUPPORTED", "PRODUCT_NOT_READY", "NO_LIABILITY_ACCOUNTS"].includes(code)) return 0;
+    throw e;
+  }
+  const credit = (resp.liabilities && resp.liabilities.credit) || [];
+  if (!credit.length || DRY_RUN) return credit.length;
+  const rows = credit.map((c) => {
+    const purchase = (c.aprs || []).find((a) => a.apr_type === "purchase_apr") || (c.aprs || [])[0];
+    return {
+      account_id: c.account_id,
+      item_id: item.item_id,
+      last_statement_balance: c.last_statement_balance ?? null,
+      last_statement_issue_date: c.last_statement_issue_date || null,
+      minimum_payment_amount: c.minimum_payment_amount ?? null,
+      next_payment_due_date: c.next_payment_due_date || null,
+      last_payment_amount: c.last_payment_amount ?? null,
+      last_payment_date: c.last_payment_date || null,
+      is_overdue: c.is_overdue ?? null,
+      purchase_apr: purchase ? purchase.apr_percentage : null,
+      aprs: c.aprs || null,
+      updated_at: now,
+    };
+  });
+  await request("/rest/v1/plaid_liabilities?on_conflict=account_id", { method: "POST", body: rows, prefer: "resolution=merge-duplicates,return=minimal" });
+  return rows.length;
+}
+
+async function syncItem(item, summary) {
+  const now = new Date().toISOString();
+  const tag = item.institution_name || item.item_id;
+  // First ever sync = full backfill of historical transactions. Alerting on
+  // those would be an avalanche of stale "Large charge" pings, so we suppress
+  // alerts on the initial sync and only alert on activity from later syncs.
+  const firstSync = !item.cursor;
+  log(`\n▸ ${tag}`);
+
+  let balanceResp;
+  try {
+    balanceResp = await plaid.withRetry(
+      () =>
+        FRESH_BALANCES
+          ? plaid.getBalances(item.access_token)
+          : plaid.getAccounts(item.access_token),
+      {
+        onRetry: (e, n) => log(`  ⟳ ${e.plaid?.error_code || e.message} — retry ${n}`),
+      }
+    );
+    // A broken Item must still be caught here, and the free endpoint does not
+    // promise to throw for one: Plaid documents the Item's error as a field on
+    // the response, and serving CACHED accounts for an Item that can no longer
+    // reach the bank is exactly what a cache is for. So the error is read from
+    // the body as well as the throw. Without this the re-auth alert would have
+    // quietly stopped firing from this call site the day the paid endpoint was
+    // switched off — the failure being silence, not a crash.
+    const bodyErr = balanceResp && balanceResp.item && balanceResp.item.error;
+    if (bodyErr && bodyErr.error_code) {
+      const err = new Error(bodyErr.error_message || bodyErr.error_code);
+      err.plaid = bodyErr;
+      throw err;
+    }
+  } catch (e) {
+    if (plaid.isLoginRequired(e)) {
+      store.setStatus(item.item_id, "login_required");
+      summary.login_required.push(tag);
+      await markItemUnhealthy(item.item_id, "login_required", e.plaid?.error_code || e.message, now);
+      // `update`, not `link` — link mints a SECOND Item for the same login,
+      // duplicating rows and burning another slot against the 10-Item cap.
+      const link = await mintReconnectLink(item);
+      log(
+        link
+          ? `  ⚠ login required — reconnect link included in the alert.`
+          : `  ⚠ login required — run \`plaid-connect update --institution ${(item.institution_name || "").split(" ")[0].toLowerCase()}\` to re-authenticate.`
+      );
+      await notify(
+        link
+          ? `${tag}: bank re-authentication required. Tap to reconnect — ${link}`
+          : `${tag}: bank re-authentication required. Reconnect to resume syncing.`
+      );
+      return;
+    }
+    throw e;
+  }
+
+  const accounts = balanceResp.accounts || [];
+  const accountRows = accounts.map((a) => accountRow(a, item.item_id, item.institution_name, now));
+  await upsertAccounts(accountRows);
+  for (const a of accounts) {
+    log(`    ${a.name || a.subtype} ••${a.mask || "----"}  ${usd(a.balances && a.balances.current)}`);
+  }
+
+  // Liabilities (statement balance, due date, minimum, APR, overdue) for cards
+  // that have the consent. Silently skips cards linked transactions-only.
+  try {
+    const nLiab = await syncLiabilities(item, now);
+    if (nLiab) log(`    liabilities: ${nLiab} card(s) — statement/due/min/APR refreshed`);
+  } catch (e) {
+    console.error(`  liabilities sync warning: ${e.message}`);
+  }
+
+  // Incremental transaction sync from the saved cursor.
+  let delta;
+  try {
+    delta = await plaid.withRetry(
+      () => plaid.syncAllTransactions(item.access_token, item.cursor),
+      { onRetry: (e, n) => log(`  ⟳ ${e.plaid?.error_code || e.message} — retry ${n}`) }
+    );
+  } catch (e) {
+    if (plaid.isLoginRequired(e)) {
+      store.setStatus(item.item_id, "login_required");
+      summary.login_required.push(tag);
+      await markItemUnhealthy(item.item_id, "login_required", e.plaid?.error_code || e.message, now);
+      const link = await mintReconnectLink(item);
+      await notify(
+        link
+          ? `${tag}: bank re-authentication required. Tap to reconnect — ${link}`
+          : `${tag}: bank re-authentication required. Reconnect to resume syncing.`
+      );
+      return;
+    }
+    // An Item linked for a DIFFERENT product simply has no transactions consent,
+    // and that is not a failure of this run. A brokerage Item linked
+    // `investments`-only /transactions/sync answers
+    // ADDITIONAL_CONSENT_REQUIRED — which used to propagate and abort the whole
+    // sync, taking every not-yet-processed Item down with it. Its balances are
+    // already recorded above; skip the transaction half and carry on.
+    const code = e && e.plaid && e.plaid.error_code;
+    if (code === "ADDITIONAL_CONSENT_REQUIRED" || code === "INVALID_PRODUCT" || code === "PRODUCTS_NOT_SUPPORTED") {
+      log(`    transactions: not consented for this Item — balances only.`);
+      if (!DRY_RUN) {
+        store.setStatus(item.item_id, "active");
+        store.markSynced(item.item_id, now);
+      }
+      return;
+    }
+    throw e;
+  }
+
+  const upserts = [...delta.added, ...delta.modified].map((t) => txnRow(t, item.item_id, now));
+  await upsertTransactions(upserts);
+  await deleteTransactions(delta.removed.map((r) => r.transaction_id));
+
+  if (!DRY_RUN) {
+    store.setCursor(item.item_id, delta.cursor);
+    store.setStatus(item.item_id, "active");
+    store.markSynced(item.item_id, now);
+  }
+
+  log(
+    `    transactions: +${delta.added.length} new, ~${delta.modified.length} updated, ` +
+      `-${delta.removed.length} removed`
+  );
+
+  // Alerts from this run's new activity (suppressed on the initial backfill).
+  // Queued, not sent: they are built in main() once EVERY Item has synced, so
+  // the two legs of a transfer between the user's own accounts at different banks can
+  // be matched no matter which bank came first in the list.
+  if (firstSync && delta.added.length) {
+    log(`    (first sync — ${delta.added.length} historical txns backfilled, alerts suppressed)`);
+  }
+  const summaryItem = {
+    institution: item.institution_name,
+    item_id: item.item_id,
+    accounts: accountRows.length,
+    added: delta.added.length,
+    modified: delta.modified.length,
+    removed: delta.removed.length,
+    alerts: 0,
+  };
+  summary.items.push(summaryItem);
+  if (!firstSync) {
+    ALERT_QUEUE.push({ institution: item.institution_name, added: delta.added, accounts, summaryItem });
+  }
+}
+
+// Filled by syncItem(), drained by sendQueuedAlerts() after the Item loop.
+const ALERT_QUEUE = [];
+
+// Plaid account type per account id ("depository", "credit", …) — the pairing
+// rules treat a credit into a card differently from one into checking. This
+// run's Items come from the balance call; the rest (a webhook run syncs one
+// Item) from the stored rows. Unknown = not a card, the stricter reading.
+async function accountTypeMap() {
+  const types = {};
+  try {
+    const rows = await request("/rest/v1/plaid_accounts?select=account_id,type", { method: "GET" });
+    if (Array.isArray(rows)) for (const r of rows) if (r.account_id && r.type) types[r.account_id] = r.type;
+  } catch (e) {
+    log(`  (account-type lookup failed: ${e.message} — using this run's accounts only)`);
+  }
+  for (const q of ALERT_QUEUE) for (const a of q.accounts || []) if (a.account_id && a.type) types[a.account_id] = a.type;
+  return types;
+}
+
+async function sendQueuedAlerts(summary) {
+  if (!ALERT_QUEUE.length) return;
+  const runAdded = ALERT_QUEUE.flatMap((q) => q.added);
+  const consumed = new Set();
+  const accountTypes = await accountTypeMap();
+  for (const q of ALERT_QUEUE) {
+    let alerts = [];
+    try {
+      alerts = await buildAlerts(q.institution, q.added, q.accounts, runAdded, consumed, accountTypes);
+    } catch (e) {
+      // Fail loudly: this bank's new transactions went unchecked, which is the
+      // one thing this path must never do silently. Same shape as a sync
+      // failure — alerted once, and the run exits non-zero.
+      const tag = q.institution || "bank";
+      console.error(`  ✗ ${tag}: alert build failed: ${e.message}`);
+      summary.failed.push({ item: tag, code: "alert_build_failed", message: e.message });
+      await notify(`${tag}: couldn't check this run's new transactions for alerts (${e.message}). They're saved, but nothing was flagged.`);
+      continue;
+    }
+    q.summaryItem.alerts = alerts.length;
+    for (const line of alerts) {
+      log(`  🔔 ${line}`);
+      await notify(line);
+    }
+  }
+}
+
+/**
+ * Tell an external recurring-charges tracker that new charges landed, when the
+ * installation has one (`recurring_refresh_url` in agent/local/config/finance.json,
+ * called with `Authorization: Bearer $EXPENSES_CRON_SECRET`). Unset → skipped.
+ *
+ * The recurring list should update every time a vendor bills more than once.
+ * This sync is the moment a second charge becomes visible —
+ * it is driven by Plaid's webhook — so it is the right trigger; the app's own
+ * daily cron is only the safety net. Detection there is idempotent and writes
+ * only its own fields, so an extra call costs a feed read and nothing else.
+ *
+ * Only when this run added rows, never on a dry run, and never fatal: the bank
+ * sync has already succeeded by the time this runs, and a slow or failing
+ * tracker must not turn it into a failed run.
+ */
+async function refreshRecurring(summary) {
+  const added = summary.items.reduce((n, i) => n + (i.added || 0), 0);
+  const secret = process.env.EXPENSES_CRON_SECRET;
+  const url = FINANCE.recurring_refresh_url;
+  if (!url) return;
+  if (DRY_RUN || added === 0 || !secret) {
+    if (added > 0 && !secret && !DRY_RUN) log("  (recurring refresh skipped: EXPENSES_CRON_SECRET not set)");
+    return;
+  }
+  try {
+    const res = await fetch(url, {
+      headers: { Authorization: `Bearer ${secret}` },
+      signal: AbortSignal.timeout(280_000),
+    });
+    const body = await res.json().catch(() => ({}));
+    const d = body.detection || {};
+    log(`  recurring: ${res.status} — ${d.created ?? "?"} new, ${d.updated ?? "?"} updated, alerts ${JSON.stringify(body.alerts ?? null)}`);
+  } catch (e) {
+    console.error(`  recurring refresh failed (non-fatal): ${e.message}`);
+  }
+}
+
+async function main() {
+  let items = store.getItems().filter((i) => i.access_token);
+  const summary = { env: store.getEnv() || plaid.env(), items: [], login_required: [], failed: [], dry_run: DRY_RUN };
+
+  if (!items.length) {
+    log("No connected Items. Run `plaid-connect link` (or `sandbox`) first.");
+    if (JSON_OUT) console.log(JSON.stringify(summary));
+    return;
+  }
+
+  if (ONLY_ITEM) {
+    items = items.filter((i) => i.item_id === ONLY_ITEM);
+    if (!items.length) {
+      console.error(`No connected Item with id ${ONLY_ITEM}.`);
+      process.exit(1);
+    }
+  }
+
+  if (RESET_CURSOR) {
+    if (DRY_RUN) {
+      log(`--dry-run: would forget the cursor on ${items.length} Item(s)`);
+    } else {
+      for (const item of items) store.setCursor(item.item_id, null);
+      // Re-read so the loop below sees the cleared cursors.
+      items = store
+        .getItems()
+        .filter((i) => i.access_token)
+        .filter((i) => !ONLY_ITEM || i.item_id === ONLY_ITEM);
+      log(`Cursor reset on ${items.length} Item(s) — replaying full history.`);
+    }
+  }
+
+  for (const item of items) {
+    // A `login_required` Item is RETRIED, not skipped (fixed 2026-08-09).
+    //
+    // Skipping it made the flag a one-way door: `syncItem` only clears the
+    // status back to "active" after a successful sync, and the skip above meant
+    // no sync was ever attempted, so nothing could ever clear it. Re-consenting
+    // through `plaid-connect update` fixed the Item at Plaid and changed nothing
+    // here — a card re-authed at Plaid and the very next run still reported
+    // "skipped (login required)". The only escape was `plaid-connect link`,
+    // which mints a *second* Item for the same login; that is almost certainly
+    // why the docs used to recommend it.
+    //
+    // Retrying costs one balance call that fails fast when the Item is still
+    // broken, and re-marks it `login_required` right where it did before. When
+    // it has been fixed, the sync simply succeeds and the flag clears itself.
+    if (item.status === "login_required") {
+      log(`\n▸ ${item.institution_name || item.item_id} — was login-required, retrying…`);
+    }
+    /*
+     * One Item's bad night is not every Item's.
+     *
+     * This loop used to call `syncItem` bare, so anything it threw unwound
+     * `main()` and ended the process — and the Items after it in the list were
+     * simply never attempted. On 2026-09-03 one bank's balance call answered
+     * INTERNAL_SERVER_ERROR, and three other Items went twenty-four hours
+     * without a refresh because of it. Nothing about their connections was wrong; they were
+     * merely later in the array.
+     *
+     * The failure is now recorded on the Item's account rows, alerted once, and
+     * the run carries on to the rest. `withRetry` inside `syncItem` has already
+     * had three goes at anything transient before we get here.
+     */
+    try {
+      await syncItem(item, summary);
+    } catch (e) {
+      const tag = item.institution_name || item.item_id;
+      const code = (e && e.plaid && e.plaid.error_code) || e.name || "error";
+      summary.failed.push({ item: tag, code, message: e.message });
+      console.error(`  ✗ ${tag}: ${e.message}`);
+      await markItemUnhealthy(item.item_id, "error", code, new Date().toISOString());
+      await notify(`${tag}: bank sync failed (${code}). Balances are stale until the next run.`);
+    }
+  }
+
+  await sendQueuedAlerts(summary);
+  await refreshRecurring(summary);
+
+  if (JSON_OUT) console.log(JSON.stringify(summary, null, 2));
+  else log(`\nDone${DRY_RUN ? " (dry-run — nothing written)" : ""}.`);
+
+  /*
+   * A run that could not refresh an Item did not succeed, and the exit code has
+   * to say so: the cron wrapper records it, and a run that always reports 0 is
+   * a run nothing can monitor. Every one of the four failures in this log's
+   * history was written as `exit 0`.
+   */
+  if (summary.failed.length > 0) process.exitCode = 1;
+}
+
+// Run only when invoked directly; importing this file (tests) just gets the
+// pure helpers below without triggering a real sync.
+if (require.main === module) {
+  main().catch((e) => {
+    console.error(`Error: ${e.message}`);
+    if (e.plaid) console.error(JSON.stringify(e.plaid, null, 2));
+    process.exit(1);
+  });
+}
+
+module.exports = { buildAlerts, isInflow, outflowVerb };

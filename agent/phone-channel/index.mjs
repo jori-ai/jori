@@ -139,13 +139,13 @@ const REPLY_GATE_DEADLINE_MS = 45_000;
 // just the user's message, or nothing.
 const REPLY_EXCHANGE_ROWS = 4;
 
-async function replyExchange(rowId, repliedTo) {
+async function replyExchange(rowId, repliedTo, channel = "chat") {
   const fallback = repliedTo ? `${OWNER_LABEL}: ${String(repliedTo).slice(0, 500)}` : "";
   try {
     const { data, error } = await supabase
       .from("jori_messages")
       .select("id, role, content, metadata")
-      .eq("channel", "chat")
+      .eq("channel", channel)
       .neq("id", rowId)
       .order("created_at", { ascending: false })
       .limit(REPLY_EXCHANGE_ROWS * 2);
@@ -161,10 +161,10 @@ async function replyExchange(rowId, repliedTo) {
   }
 }
 
-async function correctReplyInPlace(rowId, text, repliedTo = null) {
+async function correctReplyInPlace(rowId, text, repliedTo = null, channel = "chat") {
   try {
     const { checkFreshness } = await import("../../lib/claim-freshness.mjs");
-    const conversation = await replyExchange(rowId, repliedTo);
+    const conversation = await replyExchange(rowId, repliedTo, channel);
     const fresh = await checkFreshness(
       { text, solicited: true, conversation },
       { deadlineMs: REPLY_GATE_DEADLINE_MS },
@@ -299,6 +299,9 @@ mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
     // with the real reply — that keeps a single stable message row in the
     // chat UI (ack → real reply) instead of a delete+insert flicker.
     const pendingEntry = profMsgId ? pendingMessages.get(profMsgId) : null;
+    // The answer goes where the user wrote: a reply typed in the Questions or
+    // System tab is answered there, not in chat.
+    const replyChannel = pendingEntry?.channel || "chat";
     // Tells a still-in-flight ack (generated off the critical path, see
     // startAck) that the reply beat it, so it must not land after the answer.
     if (pendingEntry) pendingEntry.replied = true;
@@ -351,6 +354,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
           role: "assistant",
           content: deliveredMessage,
           read: false,
+          channel: replyChannel,
         }).select("id").single());
       }
 
@@ -373,7 +377,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
       // of record seconds ago — it IS the live evidence, so the freshness gate has nothing to
       // re-check; and a rewrite would replace the whole row with prose (e.g. a poster list cut
       // to 1,200 chars, with "as of when I looked" hedges on live data).
-      if (msgId && !request.params.arguments?.message_file) correctReplyInPlace(msgId, message, pendingEntry?.text || null);
+      if (msgId && !request.params.arguments?.message_file) correctReplyInPlace(msgId, message, pendingEntry?.text || null, replyChannel);
       setTimeout(async () => {
         try {
           if (msgId) {
@@ -398,7 +402,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
           // is separate from `urgent`: that still decides whether the reply
           // pierces Focus and gets read aloud, and stays narrow by design.
           await sendApnsPush(supabase, {
-            body, messageId: msgId, urgent: timeSensitive, skipMotionGate: true,
+            body, messageId: msgId, channel: replyChannel, urgent: timeSensitive, skipMotionGate: true,
           });
         } catch (err) {
           console.error(`[phone-channel] Push failed: ${err.message}`);
@@ -691,7 +695,7 @@ async function handleIncomingMessage(row) {
   if (pendingMessages.has(msgId)) return; // already processing
   // Anything new the user sends goes after a share still being collected.
   if (!row.shareBundleIds) shareBundler.flush();
-  pendingMessages.set(msgId, { text, t0_created: createdAt });
+  pendingMessages.set(msgId, { text, t0_created: createdAt, channel: row.channel || "chat" });
   ensureStreamPoll();
 
   // Persist the user's current timezone for trigger scripts (pulse sleep-window check).
@@ -828,7 +832,7 @@ async function handleIncomingMessage(row) {
       locationLine = `\n[Location: ${metadata.latitude}, ${metadata.longitude} (accuracy: ${metadata.location_accuracy || "unknown"}m)]`;
     }
 
-    // Sent from the iOS/macOS share sheet (client/JoriShare), not typed: a
+    // Sent from the iOS/macOS share sheet (apps/companion/JoriShare), not typed: a
     // photo arrives as its own bare jori-attachments URL row, the note and
     // shared text/links as the following row; shareBundler has already joined
     // them into this one message, photos first.
@@ -917,7 +921,7 @@ async function startAck(msgId, row, text) {
         .from("jori_messages")
         // is_ack marks this row as placeholder copy so the next message's ack
         // history skips it. Cleared when the real reply overwrites the row.
-        .insert({ role: "assistant", content: ackMsg, read: false, metadata: { is_ack: "1" } })
+        .insert({ role: "assistant", content: ackMsg, read: false, channel: pending.channel || "chat", metadata: { is_ack: "1" } })
         .select("id")
         .single();
       if (ackErr) {
@@ -1063,7 +1067,7 @@ async function streamTick() {
             })
           : supabase.from("jori_messages")
               // is_ack keeps it out of the next ack's history until it's final.
-              .insert({ role: "assistant", content: shown, read: false, metadata: { is_ack: "1" } })
+              .insert({ role: "assistant", content: shown, read: false, channel: pending?.channel || "chat", metadata: { is_ack: "1" } })
               .select("id").single().then(({ data, error }) => {
                 if (error) throw error;
                 entry.rowId = data?.id || null;

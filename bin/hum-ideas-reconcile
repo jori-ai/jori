@@ -1,0 +1,84 @@
+#!/usr/bin/env node
+// hum-ideas-reconcile — make the hum idea ledger agree with the Improvements cards.
+//
+// hum-action-executor stages an idea as a Face-ID card and marks the idea
+// `awaiting_approval`. Nothing ever moved it past that: when the user signed the
+// card the change landed, but the ledger kept saying "awaiting" (the known gap
+// hum-i-20260823-04 left open). Measured 2026-10-07: all 24 ideas the ledger
+// called awaiting had in fact been applied, so the backlog looked 24 deep when
+// it was empty. This reads each card's real status and writes it back.
+//
+//   card applied            -> idea `applied`   (+ applied_at, card id)
+//   card failed             -> idea `proposed`  (re-queued; the executor retries)
+//   card expired unsigned,
+//   or skipped              -> idea `proposed`  (re-queued: it now lands on its own
+//                                                if low/moderate, or gets a fresh card)
+//   card still live         -> left alone
+//
+// Field comparisons only. Appends rows to the ledger; never rewrites history.
+//
+// Usage: hum-ideas-reconcile [--dry-run] [--json]
+// Env (tests): HUM_IDEAS_FILE, HUM_RECONCILE_CARDS (path to {cardId: {status, applied_at, expires_at, skipped}})
+
+import fs from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+import { createRequire } from "node:module";
+import { appendRow, latestById, readRows } from "../lib/hum-ideas.mjs";
+
+const { supabaseUrl } = createRequire(import.meta.url)("../lib/instance.cjs");
+
+const ROOT = path.resolve(path.dirname(fs.realpathSync(fileURLToPath(import.meta.url))), "..");
+
+async function fetchCards(ids) {
+  if (process.env.HUM_RECONCILE_CARDS) return JSON.parse(fs.readFileSync(process.env.HUM_RECONCILE_CARDS, "utf8"));
+  for (const l of (() => { try { return fs.readFileSync(path.join(ROOT, ".env"), "utf8").split("\n"); } catch { return []; } })()) {
+    const m = l.match(/^([A-Z_]+)=(.*)$/); if (m && !process.env[m[1]]) process.env[m[1]] = m[2]; // lang-regex-ok: parsing KEY=VALUE lines of a dotenv file
+  }
+  const base = process.env.SUPABASE_URL || supabaseUrl();
+  if (!base) throw new Error("no Supabase project configured");
+  const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
+  if (!key) throw new Error("no SUPABASE_SERVICE_ROLE_KEY");
+  const out = {};
+  for (let i = 0; i < ids.length; i += 40) {
+    const chunk = ids.slice(i, i + 40);
+    const r = await fetch(`${base}/rest/v1/self_improve_approvals?id=in.(${chunk.map(encodeURIComponent).join(",")})&select=id,status,applied_at,expires_at,skipped`, {
+      headers: { apikey: key, Authorization: "Bearer " + key },
+    });
+    if (!r.ok) throw new Error(`approvals fetch ${r.status}`);
+    for (const row of await r.json()) out[row.id] = row;
+  }
+  return out;
+}
+
+/** What the ledger row should become, given the card. null = leave it. */
+export function nextState(card, now = Date.now()) {
+  if (!card) return null;
+  if (card.status === "applied") return { status: "applied", applied_at: card.applied_at || null };
+  if (card.skipped) return { status: "proposed", execution_notes: "Card skipped by the user; re-queued (reconcile)." };
+  if (card.status === "failed") return { status: "proposed", execution_notes: "Card failed to apply; re-queued (reconcile)." };
+  const expired = card.status === "expired" || (card.status === "pending" && Date.parse(card.expires_at || "") < now);
+  if (expired) return { status: "proposed", execution_notes: "Card expired unsigned; re-queued (reconcile)." };
+  return null;
+}
+
+async function main() {
+  const dry = process.argv.includes("--dry-run");
+  const json = process.argv.includes("--json");
+  const awaiting = [...latestById(readRows()).values()].filter((r) => r.status === "awaiting_approval" && r.self_improve_request_id);
+  const cards = awaiting.length ? await fetchCards(awaiting.map((r) => r.self_improve_request_id)) : {};
+  const changes = [];
+  for (const idea of awaiting) {
+    const next = nextState(cards[idea.self_improve_request_id]);
+    if (!next) continue;
+    const row = { id: idea.id, ...next, reconciled_at: new Date().toISOString(), self_improve_request_id: idea.self_improve_request_id };
+    changes.push(row);
+    if (!dry) appendRow(row);
+  }
+  const summary = { checked: awaiting.length, changed: changes.length, applied: changes.filter((c) => c.status === "applied").length, requeued: changes.filter((c) => c.status === "proposed").length, dry_run: dry };
+  console.log(json ? JSON.stringify({ ...summary, changes }) : `hum-ideas-reconcile: ${JSON.stringify(summary)}`);
+}
+
+if (process.argv[1] && fs.realpathSync(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  main().catch((e) => { console.error(`hum-ideas-reconcile: ${e.message}`); process.exit(1); });
+}

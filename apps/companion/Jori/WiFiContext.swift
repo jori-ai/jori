@@ -12,7 +12,7 @@ import NetworkExtension
 /// Requires `com.apple.developer.networking.wifi-info` (set in
 /// Jori.entitlements) AND any of: a configured Wi-Fi via NEHotspotConfiguration,
 /// the active VPN configuration's app, or precise-location-while-using granted.
-/// If the user has already granted precise location to Jori, the third path covers us.
+/// The app already asks for precise location, so the third path covers us.
 enum WiFiContext {
 
     struct Snapshot {

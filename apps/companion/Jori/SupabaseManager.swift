@@ -9,13 +9,17 @@ import UIKit
 #endif
 
 enum SupabaseManager {
-    static let url = URL(string: "https://${JORI_SUPABASE_PROJECT}.supabase.co")!
+    // Connection constants live in SupabaseConfig (from the build
+    // configuration) so the JoriIntents
+    // extension can share them. Aliased here to keep existing call sites
+    // (SupabaseManager.url / .anonKey) working.
+    static let url = SupabaseConfig.url
     // Supabase anon JWT — intentionally public (RLS enforces access, not secrecy).
-    static let anonKey = "${JORI_SUPABASE_ANON_KEY}"
+    static let anonKey = SupabaseConfig.anonKey
 
     // OAuth redirect — must match a CFBundleURLScheme in Info.plist and the
     // Supabase Auth "Redirect URLs" allowlist (Dashboard → Auth → URL Configuration).
-    static let callbackScheme = "com.example.jori"
+    static let callbackScheme = Install.urlScheme
     static let redirectURL = URL(string: "\(callbackScheme)://auth-callback")!
 
     static let shared: SupabaseClient = {
@@ -29,6 +33,10 @@ enum SupabaseManager {
         )
         return SupabaseClient(supabaseURL: url, supabaseKey: anonKey, options: options)
         #else
+        // iOS: keep the SDK's default keychain storage. Routing this client
+        // through the shared-access-group keychain broke the PKCE sign-in
+        // (code-verifier round-trip). The JoriIntents extension gets the
+        // session via SharedSession (token mirror), not by sharing this store.
         return SupabaseClient(supabaseURL: url, supabaseKey: anonKey)
         #endif
     }()
@@ -56,6 +64,7 @@ enum SupabaseManager {
     static func signOut() async {
         do {
             try await shared.auth.signOut()
+            SharedSession.clear()
         } catch {
             print("[Auth] signOut error: \(error)")
         }
@@ -85,6 +94,37 @@ enum SupabaseManager {
         )
         let callbackURL = try await presentWebAuth(url: authURL, scheme: callbackScheme)
         try await shared.auth.session(from: callbackURL)
+        await mirrorSessionForExtension()
+    }
+
+    /// Mirror the current session into the shared keychain for the
+    /// JoriShare extension, then send anything it parked while the mirror
+    /// was stale. Accessing `.session` refreshes a near-expiry token first, so
+    /// the extension gets a usable access token. Safe to call on sign-in and on
+    /// app foreground/background.
+    static func mirrorSessionForExtension() async {
+        guard let session = try? await shared.auth.session else { return }
+        SharedSession.mirror(session)
+        await ShareOutbox.drain(accessToken: session.accessToken)
+    }
+
+    /// Keep the mirror current for as long as the app process lives: the SDK
+    /// auto-refreshes hourly, and without this the share extension would see a
+    /// stale token whenever the app had merely stayed open (the usual macOS
+    /// case) rather than been re-foregrounded.
+    static func mirrorOnTokenChanges() async {
+        for await (event, session) in shared.auth.authStateChanges {
+            switch event {
+            case .initialSession, .signedIn, .tokenRefreshed:
+                guard let session else { continue }
+                SharedSession.mirror(session)
+                await ShareOutbox.drain(accessToken: session.accessToken)
+            case .signedOut:
+                SharedSession.clear()
+            default:
+                break
+            }
+        }
     }
 
     @MainActor

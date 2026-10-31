@@ -1,0 +1,638 @@
+#!/usr/bin/env node
+"use strict";
+// finance-property-review-data — deterministic builder for the MONTHLY
+// per-property review. Prints a JSON packet; the playbook narrates it.
+//
+// WHY THIS IS SEPARATE FROM THE WEEKLY REVIEW. The weekly one is about
+// liquidity, accuracy and anomalies — what needs attention in the next seven
+// days — and it deliberately keeps the property section to one table, because a
+// paragraph per property every week says almost the same thing every week. The
+// questions that DO change month to month are the ones this job asks: what did
+// each property actually earn, in which Schedule E categories, against the
+// month before and against the same month last year; is the ledger clean enough
+// to quote; is the rent roll being collected in full; and what is each property
+// yielding on what it is worth.
+//
+// That split is the weekly-review research's own cadence table
+// (the weekly review's design doc): weekly = liquidity/accuracy/anomalies,
+// monthly = per-property P&L, Schedule-E categorisation, reserves,
+// reconciliation. This is the monthly half, and it exists so the weekly one can
+// stay a page.
+//
+// READ-ONLY. Bank + ledger rows are jori-model-only (health-data tier).
+//
+// Usage: finance-property-review-data [--json] [--month YYYY-MM]
+//        (default month = the last CLOSED calendar month)
+//
+// Needs the rental books (lib/rental-ledger.js, agent/local/config/rentals.json);
+// without them it exits 1 and the trigger dispatches nothing. Optional, in
+// agent/local/config/rental-finance.json: `brokerage_tables` ({accounts,
+// positions}: the Supabase tables holding the brokerage's accounts and
+// positions, for the cash buckets), `accounts_map_file` (the account map,
+// relative to the install), `platform_income_pattern` / `extra_income_platforms` (the booking
+// platforms whose payouts are rental income), `rent_income_category_id`.
+
+const fs = require("node:fs");
+const { loadEnv } = require("../lib/load-env.js");
+const { request, requestAll } = require("../lib/supabase-rest.js");
+const ledger = require("../lib/rental-ledger.js");
+// Owner-use properties (rentals the household also lives in): judged on the
+// nights they were available to rent. Config: lib/owner-stays.js.
+const ownerStays = require("../lib/owner-stays.js");
+const { buildCashBuckets, buildRealEstate } = require("../lib/finance-real-estate.js");
+// Deposits: the persisted, cent-exact reconciliation (finance-deposits-reconcile),
+// the same one the weekly review reports.
+const { depositSection } = require("../lib/finance-deposit-reconcile.js");
+const { instance, localConfig } = require("../lib/instance.cjs");
+const { installTools } = require("../lib/root.cjs");
+loadEnv();
+
+const INST = instance();
+const RF = localConfig("rental-finance", {
+  accounts_map_file: "",
+  brokerage_tables: null,
+  platform_income_pattern: "airbnb|booking\\.com|vrbo|expedia",
+  rent_income_category_id: "income",
+  rent_alarm_floor_usd: 1500,
+  rent_alarm_share: 0.08,
+});
+
+const etDate = (d = new Date()) => new Intl.DateTimeFormat("en-CA", { timeZone: INST.tz, year: "numeric", month: "2-digit", day: "2-digit" }).format(d);
+const etStamp = () => new Intl.DateTimeFormat("en-US", { timeZone: INST.tz, month: "short", day: "numeric", year: "numeric", hour: "numeric", minute: "2-digit", hour12: true, timeZoneName: "short" }).format(new Date());
+const usd0 = (n) => (n == null ? "—" : `${n < 0 ? "−" : ""}$${Math.abs(Number(n)).toLocaleString("en-US", { maximumFractionDigits: 0 })}`);
+const usd = (n) => (n == null ? "—" : `${n < 0 ? "−" : ""}$${Math.abs(Number(n)).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`);
+const signed = (n) => (n == null ? "—" : `${n >= 0 ? "+" : "−"}$${Math.abs(n).toLocaleString("en-US", { maximumFractionDigits: 0 })}`);
+const pct = (n) => (n == null ? "—" : `${(n * 100).toFixed(1)}%`);
+const pctChange = (now, before) => {
+  if (before == null || Math.abs(before) < 1) return null;
+  return (now - before) / Math.abs(before);
+};
+const round2 = (n) => Math.round(n * 100) / 100;
+const sum = (arr, f) => arr.reduce((s, x) => s + (Number(f(x)) || 0), 0);
+
+/** Month arithmetic on YYYY-MM, without dragging a date library in. */
+const monthAdd = (ym, n) => {
+  const [y, m] = ym.split("-").map(Number);
+  const t = (y * 12 + (m - 1)) + n;
+  return `${String(Math.floor(t / 12)).padStart(4, "0")}-${String((t % 12) + 1).padStart(2, "0")}`;
+};
+const monthStart = (ym) => `${ym}-01`;
+const monthEnd = (ym) => {
+  const [y, m] = ym.split("-").map(Number);
+  return `${ym}-${String(new Date(Date.UTC(y, m, 0)).getUTCDate()).padStart(2, "0")}`;
+};
+const monthLabel = (ym) => new Intl.DateTimeFormat("en-US", { timeZone: "UTC", month: "long", year: "numeric" }).format(new Date(`${ym}-01T00:00:00Z`));
+
+function load(file, fallback) {
+  try { return JSON.parse(fs.readFileSync(file, "utf8")); } catch { return fallback; }
+}
+
+function arg(name) {
+  const i = process.argv.indexOf(`--${name}`);
+  return i >= 0 ? process.argv[i + 1] : null;
+}
+
+async function main() {
+  // The installation's account map (attribution overrides, taxable brokerage
+  // accounts), relative to the install: `accounts_map_file`.
+  const map = RF.accounts_map_file ? load(installTools(RF.accounts_map_file), { tax: {} }) : { tax: {} };
+  const today = etDate();
+  // The month under review is the last CLOSED one. Running on the 2nd and
+  // reporting the month that ended two days ago is the whole point — a P&L for
+  // a month still in progress is a number that will be wrong by the time
+  // anybody acts on it.
+  const month = arg("month") || monthAdd(today.slice(0, 7), -1);
+  const prior = monthAdd(month, -1);
+  const yearAgo = monthAdd(month, -12);
+
+  if (!ledger.config().firebase_project) {
+    console.error("finance-property-review-data: no rental books are configured on this installation (agent/local/config/rentals.json) — nothing to review.");
+    process.exit(1);
+  }
+  let reg = null, unitAvailability = [], tenants = [], leases = [];
+  let pnlTxns = [];
+  try {
+    const db = ledger.firestore();
+    reg = await ledger.registry();
+    // Reads back through the same month last year, so month-over-month and
+    // year-over-year are both available from one window; the deposit check
+    // reads the whole book for the reason its own function documents.
+    [pnlTxns, unitAvailability, tenants, leases] = await Promise.all([
+      ledger.loadTransactions({ since: monthStart(monthAdd(month, -13)), until: monthEnd(month) }),
+      db.list("unit-availability"),
+      db.list("tenants"),
+      db.list("leases"),
+    ]);
+  } catch (e) {
+    console.error(`finance-property-review-data: the rental ledger is unreachable (${e.message}). This job is the ledger's report — there is nothing to say without it.`);
+    process.exit(1);
+  }
+
+  const bt = RF.brokerage_tables || {};
+  const [accounts, brokerageAccounts, brokeragePositions, propertyValues, reconciledAll, depositRuns] = await Promise.all([
+    request("/rest/v1/plaid_accounts?select=account_id,institution_name,name,mask,type,subtype,balance_current,balance_available,balance_limit"),
+    bt.accounts ? request(`/rest/v1/${bt.accounts}?select=account_hash,account_name,cash_balance,total_value,as_of`).catch(() => []) : [],
+    bt.positions ? request(`/rest/v1/${bt.positions}?select=account_hash,ticker,market_value,asset_type,as_of`).catch(() => []) : [],
+    request("/rest/v1/property_values?select=parcel_id,holding,address,owned,estimate,acquisition_price,as_of").catch(() => []),
+    request("/rest/v1/property_value_reconciled?select=as_of_date,parcel_id,holding,value,basis&order=as_of_date.desc&limit=200").catch(() => []),
+    request("/rest/v1/fin_deposit_reconciliations?select=run_at,report&order=run_at.desc&limit=1").catch(() => []),
+  ]);
+  const reconciledValues = (reconciledAll || []).filter((r) => r.as_of_date === reconciledAll[0]?.as_of_date);
+
+  const cash = buildCashBuckets({
+    plaidAccounts: accounts, registry: reg, brokerageAccounts, brokeragePositions,
+    brokerageAccountHistory: [], brokeragePositionHistory: [], posted: [], today, config: map,
+  });
+  // The weekly builder is reused for the today-shaped facts — cash, reserves,
+  // rent roll, vacancy, valuations — so the two reviews cannot disagree about
+  // them. Everything month-shaped below is computed here.
+  const nowState = buildRealEstate({
+    registry: reg, ledgerTxns: pnlTxns, cash, propertyValues, reconciledValues,
+    unitAvailability, tenants, leases, today, config: map,
+  });
+  const dep = depositSection((depositRuns || [])[0] || null, today);
+
+  const inMonth = (txns, ym) => txns.filter((t) => t.source.date >= monthStart(ym) && t.source.date <= monthEnd(ym));
+  const stmt = (property, ym) => ledger.statement(inMonth(pnlTxns, ym), reg, property);
+  const held = reg.properties.filter((p) => p.kind === "property" && !p.disposedOn);
+  const stateById = Object.fromEntries(nowState.properties.map((r) => [r.id, r]));
+
+  // ── Owner-use properties: take the family's own nights out ────────────────
+  //
+  // Some rentals are also the household's own homes, and their income and
+  // expenses are judged without the time the household is in them: otherwise a
+  // month the family spent 29 of 30 nights in reads as a loss-making rental.
+  // Nights come from the phone's location record, computed here in code
+  // (lib/owner-stays.js); the money rule is in that file's header. If the
+  // location record cannot be read, the properties fall back to as-booked and
+  // say so — a silent fallback would present unadjusted numbers as adjusted.
+  const ouCfg = ownerStays.loadConfig();
+  const guestDriven = new Set(ouCfg?.guest_driven_category_ids || []);
+  const firstAdjustable = ouCfg?.adjustable_from_month || null;
+  const ownerHomes = held.map((p) => ownerStays.ownerUseFor(p.id, ouCfg)).filter(Boolean);
+  let nightsMap = null, ownerUseError = null;
+  if (ownerHomes.length && firstAdjustable && month >= firstAdjustable) {
+    try {
+      const fromDate = monthStart(firstAdjustable), toDate = monthEnd(month);
+      const rows = await requestAll(
+        `/rest/v1/location_history?select=arrived_at,latitude,longitude,accuracy_m` +
+        `&arrived_at=gte.${ownerStays.addDays(fromDate, -1)}T00:00:00Z&arrived_at=lt.${ownerStays.addDays(toDate, 3)}T00:00:00Z&order=arrived_at.asc`,
+        { maxRows: 200000 }
+      );
+      nightsMap = ownerStays.classifyNights(fromDate, toDate, rows, ownerHomes, ouCfg.night_hour_et);
+    } catch (e) { ownerUseError = e.message; }
+  }
+  const isOwnerUse = (p) => ownerHomes.some((h) => h.propertyId === p.id);
+  /** One month of an owner-use property with the family's nights out, or null when it cannot be done. */
+  const ownerView = (p, ym) => {
+    if (!nightsMap || !isOwnerUse(p) || ym < firstAdjustable) return null;
+    const nm = ownerStays.monthNights(ym, nightsMap, p.id, { fullMonthsOnly: ownerHomes.find((h) => h.propertyId === p.id)?.fullMonthsOnly });
+    const share = ownerStays.ownerShareOf(nm);
+    return { nm, share, adj: ownerStays.adjustStatement(stmt(p, ym), share, guestDriven) };
+  };
+  /** First adjustable month through `month`, summed: the longest stretch the location record supports. */
+  const ownerWindow = (p) => {
+    if (!nightsMap) return null;
+    const t = { income: 0, expenses: 0, bookedIncome: 0, bookedExpenses: 0, owner: 0, rentable: 0, unknown: 0, days: 0, months: 0, notRentableMonths: 0, rentableIncome: 0, rentableMonthNights: 0, notRentableIncome: 0, byMonth: [] };
+    for (let m = firstAdjustable; m <= month; m = monthAdd(m, 1)) {
+      const v = ownerView(p, m);
+      if (!v) continue;
+      t.income += v.adj.income; t.expenses += v.adj.expenses;
+      t.bookedIncome += v.adj.asBooked.income; t.bookedExpenses += v.adj.asBooked.expenses;
+      t.owner += v.nm.owner; t.rentable += v.nm.rentable; t.unknown += v.nm.unknown; t.days += v.nm.days; t.months += 1; if (v.nm.ineligible) { t.notRentableMonths += 1; t.notRentableIncome += v.adj.income; }
+      else { t.rentableIncome += v.adj.income; t.rentableMonthNights += v.nm.rentable; }
+      t.byMonth.push({ month: monthLabel(m), owner_nights: v.nm.owner, not_rentable: !!v.nm.ineligible, income_fmt: usd0(v.adj.income), expenses_fmt: usd0(v.adj.expenses), net_fmt: signed(v.adj.income - v.adj.expenses), as_booked_net_fmt: signed(v.adj.asBooked.income - v.adj.asBooked.expenses) });
+    }
+    return t;
+  };
+
+  /** Contracted rent for one property in one month, from the leases running then. */
+  const slugOfProperty = (prop) => (prop.publicSlug || "").toLowerCase();
+  function expectedRollForMonth(prop, ym) {
+    const start = monthStart(ym), end = monthEnd(ym);
+    const slug = slugOfProperty(prop);
+    if (!slug) return null;
+    const byUnit = new Map();
+    for (const l of leases) {
+      const t = l.terms || {};
+      if (l.status !== "completed") continue;
+      if (String(t.propertySlug || "").toLowerCase() !== slug) continue;
+      const s = String(t.startDate || "").slice(0, 10), e = String(t.endDate || "").slice(0, 10);
+      if (!s || !e) continue;
+      // Running for any part of the month — a lease that starts mid-month is
+      // owed that month, which is what makes lease-up months come out right.
+      if (s > end || e < start) continue;
+      const rent = Number(t.rentAmount) || 0;
+      const unit = t.unitId || t.unitAddress || l.id;
+      // One lease per unit: an extension and the lease it extends both cover
+      // the overlap month, and counting both doubles that unit's rent.
+      byUnit.set(unit, Math.max(byUnit.get(unit) || 0, rent));
+    }
+    if (!byUnit.size) return null;
+    return sum([...byUnit.values()], (v) => v);
+  }
+  function expectedRollOverMonths(prop, endYm, months) {
+    let total = 0, seen = 0;
+    for (let i = 0; i < months; i++) {
+      const r = expectedRollForMonth(prop, monthAdd(endYm, -i));
+      if (r == null) continue;
+      total += r; seen += 1;
+    }
+    return seen === months ? total : null;
+  }
+
+  const properties = held.map((p) => {
+    const bookedNow = stmt(p, month), bookedPrior = stmt(p, prior);
+    // An owner-use property's month and prior month are read with the family's
+    // nights out; its year-ago month is not (the location record starts at
+    // `presence_record_starts`), so the year-over-year line is dropped rather than compared
+    // across two different bases.
+    const ov = ownerView(p, month), ovPrior = ownerView(p, prior);
+    const now = ov ? ov.adj : bookedNow;
+    const was = ovPrior ? ovPrior.adj : bookedPrior;
+    const yoy = ov ? { income: 0, expenses: 0, noi: 0 } : stmt(p, yearAgo);
+    const t12 = ledger.statement(
+      pnlTxns.filter((t) => t.source.date > monthEnd(monthAdd(month, -12)) && t.source.date <= monthEnd(month)),
+      reg, p
+    );
+    const s = stateById[p.id] || {};
+    const lines = now.lines.map((l) => {
+      const priorLine = was.lines.find((x) => x.categoryId === l.categoryId);
+      return {
+        category: l.name, kind: l.kind, schedule_e: l.scheduleELine, count: l.count,
+        amount_fmt: usd(l.amount),
+        prior_fmt: priorLine ? usd(priorLine.amount) : "—",
+        change_fmt: priorLine ? signed(l.amount - priorLine.amount) : "new this month",
+        // Owner-use only: what the ledger booked, and how the line was treated.
+        ...(ov && l.kind === "expense" ? {
+          as_booked_fmt: usd(l.asBooked),
+          treatment: guestDriven.has(l.categoryId) ? "kept whole (a guest cost)" : (ov.nm.ineligible ? "set aside (a month the family stayed, so not let)" : "scaled to the rentable share"),
+        } : {}),
+      };
+    });
+
+    // The owner-use block: the nights, the as-booked figures beside the adjusted
+    // ones, and the longer stretch. Everything pre-formatted for the narrator.
+    let ownerUse = null;
+    if (isOwnerUse(p)) {
+      const win = ownerWindow(p);
+      const minNights = ouCfg.min_rentable_nights_to_judge ?? 7;
+      const fullMonthsOnly = !!ownerHomes.find((h) => h.propertyId === p.id)?.fullMonthsOnly;
+      const per = (inc, n) => (n >= minNights ? usd0(inc / n) : null);
+      ownerUse = !ov ? {
+        applies: true, available: false,
+        reason: ownerUseError
+          ? `the location record could not be read (${ownerUseError})`
+          : `the phone's location record only starts ${ouCfg.presence_record_starts}, so ${monthLabel(month)} cannot be adjusted`,
+      } : {
+        applies: true, available: true,
+        basis: `Nights are counted from the phone's location record: a night is ${INST.owner_name}'s phone inside the property at ${ouCfg.night_hour_et ?? 3}am local time. Income stays as booked. Cleaning, turnover and platform fees (costs a guest causes) stay whole. ` +
+          (fullMonthsOnly
+            ? "This property is let by whole months only: any month the family stayed in it is not rentable, so every other expense that month is set aside in full, however few nights were the family's. "
+            : "Every other expense is scaled by the share of the month the property was available to rent. ") +
+          "Other household members' own travel is not tracked.",
+        full_months_only: fullMonthsOnly,
+        month: {
+          days: ov.nm.days, owner_nights: ov.nm.owner, rentable_nights: ov.nm.rentable, unknown_nights: ov.nm.unknown,
+          // Full-months-only property with any owner night: the whole month is the family's.
+          not_rentable_month: !!ov.nm.ineligible,
+          // Income booked in a month the family stayed: kept as booked, but worth a sentence,
+          // because the expenses set aside make that month read better than a let month would.
+          income_in_not_rentable_month_fmt: ov.nm.ineligible && bookedNow.income >= 1 ? usd0(bookedNow.income) : null,
+          owner_share_fmt: `${Math.round(ov.share * 100)}%`,
+          as_booked: { income_fmt: usd0(bookedNow.income), expenses_fmt: usd0(bookedNow.expenses), net_fmt: signed(bookedNow.noi) },
+          adjusted: { income_fmt: usd0(now.income), expenses_fmt: usd0(now.expenses), net_fmt: signed(now.noi), margin_fmt: now.income >= 1 ? pct(now.noi / now.income) : null },
+          expenses_set_aside_fmt: usd0(bookedNow.expenses - now.expenses),
+          income_per_rentable_night_fmt: per(now.income, ov.nm.rentable),
+        },
+        prior_month: ovPrior ? {
+          owner_nights: ovPrior.nm.owner, rentable_nights: ovPrior.nm.rentable, not_rentable_month: !!ovPrior.nm.ineligible,
+          income_in_not_rentable_month_fmt: ovPrior.nm.ineligible && bookedPrior.income >= 1 ? usd0(bookedPrior.income) : null,
+          as_booked_net_fmt: signed(bookedPrior.noi), adjusted_net_fmt: signed(was.noi),
+        } : { adjusted: false, as_booked_net_fmt: signed(bookedPrior.noi) },
+        // Enough rentable nights to say anything about how the property is doing?
+        judge: ov.nm.rentable >= minNights,
+        judge_min_nights: minNights,
+        window: win && win.months ? {
+          label: `${monthLabel(firstAdjustable)} to ${monthLabel(month)}`,
+          months: win.months, not_rentable_months: win.notRentableMonths, income_in_not_rentable_months_fmt: win.notRentableIncome >= 1 ? usd0(win.notRentableIncome) : null, days: win.days, owner_nights: win.owner, rentable_nights: win.rentable, unknown_nights: win.unknown,
+          as_booked: { income_fmt: usd0(win.bookedIncome), expenses_fmt: usd0(win.bookedExpenses), net_fmt: signed(win.bookedIncome - win.bookedExpenses) },
+          adjusted: { income_fmt: usd0(win.income), expenses_fmt: usd0(win.expenses), net_fmt: signed(win.income - win.expenses) },
+          // Income from the months that were rentable over those months' nights; income booked
+          // in a month the family stayed is not divided by nights it was never offered for.
+          income_per_rentable_night_fmt: per(win.rentableIncome, win.rentableMonthNights),
+          by_month: win.byMonth,
+        } : null,
+        year_ago_note: `Not compared: the phone's location record starts ${ouCfg.presence_record_starts}, so a year-ago month cannot be read on the same basis.`,
+        year_ago_as_booked_net_fmt: (() => { const y = stmt(p, yearAgo); return y.income || y.expenses ? signed(y.noi) : null; })(),
+      };
+    }
+    // ── Rent roll vs collected ──────────────────────────────────────────
+    //
+    // The roll is what the signed leases say should arrive each month.
+    // Collected is what the ledger booked as rental income. The naive
+    // comparison — one calendar month of cash against one month of roll — is
+    // NOT a reliable signal: a property with an unchanged roll and tenants who
+    // were paying read a deficit one month, a surplus the next, and a deficit
+    // again.
+    //
+    // The cause is that rent processors settle around the turn of the month:
+    // one month's rent is paid out on the 30th of the month before, and money
+    // landing late in a month is the next month's. A calendar window cuts
+    // straight through that cycle, so it reports a deficit one month and a
+    // surplus the next, forever. Shifting the window does not fix it either —
+    // it still cuts the cycle, just somewhere else.
+    //
+    // A TRAILING THREE MONTHS does fix it, because whichever side of a boundary
+    // any single payout lands on, it is inside the window. A tenant who stops
+    // paying shows up as a persistent shortfall; a payout that merely arrived on
+    // the 30th instead of the 1st does not show up at all. So the month figure
+    // is reported as information and the FLAG is raised on the trailing three.
+    const rentRoll = s.rent_roll ?? null;
+    const collected = now.lines.filter((l) => l.kind === "income" && l.categoryId === RF.rent_income_category_id).reduce((a, l) => a + l.amount, 0);
+    const rentGap = rentRoll != null ? round2(collected - rentRoll) : null;
+
+    // Only over whole months the property was actually held and let: for a
+    // property bought mid-July, June and July rent went to the seller and
+    // would read as $0 collected against a full roll — a miss that never happened.
+    const monthsHeldAtEnd = p.acquiredOn
+      ? (Date.parse(`${monthEnd(month)}T00:00:00Z`) - Date.parse(`${String(p.acquiredOn).slice(0, 10)}T00:00:00Z`)) / (86400000 * 30.4375)
+      : 99;
+    const rentWindow = Math.min(3, Math.floor(monthsHeldAtEnd));
+    let rentTrailing = null;
+    if (rentRoll != null && rentWindow >= 2) {
+      const from = monthStart(monthAdd(month, -(rentWindow - 1)));
+      const st = ledger.statement(
+        pnlTxns.filter((t) => t.source.date >= from && t.source.date <= monthEnd(month)), reg, p
+      );
+      const got = st.lines.filter((l) => l.kind === "income" && l.categoryId === RF.rent_income_category_id).reduce((a, l) => a + l.amount, 0);
+      // The expected side must be the roll AS IT WAS IN EACH MONTH, not today's
+      // roll multiplied out. A multi-unit property whose units let up over a
+      // summer, measured against the full roll it only reached later, read
+      // thousands short of rent nobody had yet agreed to pay. Summed per month from the leases actually running that
+      // month, taking one lease per unit so an extension does not double-count.
+      const expected = expectedRollOverMonths(p, month, rentWindow);
+
+      // ── And the roll is still not, on its own, a thing to raise an alarm on.
+      //
+      // A property can read short of its roll for months while nothing is
+      // wrong: a tenancy that paid less than the lease record says has the
+      // BOOKS disagreeing with the BANK, persistently. Nobody was behind on
+      // rent; the contracted figure simply was not what that tenancy paid.
+      //
+      // So a gap against the roll answers "do the books match the bank", which
+      // is a reconciliation question and belongs in the reconciliation section
+      // ONCE. The question worth an alarm is different: "has this property
+      // stopped collecting what it had been collecting" — a break against its
+      // OWN recent history, which is what a tenant going quiet actually looks
+      // like, and which a stale lease amount cannot manufacture.
+      const baseFrom = monthStart(monthAdd(month, -(rentWindow + 8)));
+      const baseTo = monthEnd(monthAdd(month, -rentWindow));
+      const baseSt = ledger.statement(
+        pnlTxns.filter((t) => t.source.date >= baseFrom && t.source.date <= baseTo), reg, p
+      );
+      const baseMonths = 9;
+      const baseGot = baseSt.lines.filter((l) => l.kind === "income" && l.categoryId === RF.rent_income_category_id).reduce((a, l) => a + l.amount, 0);
+      const baseline = baseGot > 0 ? (baseGot / baseMonths) * rentWindow : null;
+
+      rentTrailing = expected == null ? null : {
+        months: rentWindow,
+        collected: round2(got),
+        expected: round2(expected),
+        gap: round2(got - expected),
+        baseline: baseline == null ? null : round2(baseline),
+        baseline_gap: baseline == null ? null : round2(got - baseline),
+      };
+    }
+
+    return {
+      id: p.id, name: p.name, rental_type: p.rentalType,
+      // For an owner-use property these three are the ADJUSTED month; the booked
+      // figures are in owner_use.month.as_booked and month_as_booked.
+      month: { income: round2(now.income), expenses: round2(now.expenses), net: round2(now.noi) },
+      month_as_booked: { income: round2(bookedNow.income), expenses: round2(bookedNow.expenses), net: round2(bookedNow.noi) },
+      owner_use: ownerUse,
+      income_fmt: usd0(now.income), expenses_fmt: usd0(now.expenses), net_fmt: signed(now.noi),
+      prior_net_fmt: signed(was.noi), mom_change_fmt: signed(now.noi - was.noi),
+      mom_pct_fmt: pctChange(now.noi, was.noi) == null ? null : pct(pctChange(now.noi, was.noi)),
+      yoy_net_fmt: yoy.income || yoy.expenses ? signed(yoy.noi) : null,
+      yoy_change_fmt: yoy.income || yoy.expenses ? signed(now.noi - yoy.noi) : null,
+      // Trailing twelve is ALWAYS as booked. For an owner-use property it still
+      // includes the family's own months, which the location record cannot
+      // remove before it starts; owner_use.window is the adjusted stretch.
+      t12_income_fmt: usd0(t12.income), t12_net_fmt: signed(t12.noi),
+      t12_note: ownerUse?.available ? "As booked, including the nights you stayed. The adjusted read is owner_use.window." : null,
+      // A margin on a few cents of interest income is meaningless, so it needs
+      // at least a dollar of income to be stated.
+      margin_fmt: now.income >= 1 ? pct(now.noi / now.income) : null,
+      lines,
+      unclassified_count: now.unclassifiedCount,
+      unclassified_amount_fmt: now.unclassifiedCount ? usd(now.unclassifiedAmount) : null,
+      cash_fmt: s.cash_fmt ?? null,
+      reserve_fmt: s.reserve_fmt ?? null,
+      reserve_low: s.reserve_low ?? false,
+      rent_roll_fmt: rentRoll == null ? null : usd0(rentRoll),
+      rent_collected_fmt: rentRoll == null ? null : usd0(collected),
+      rent_gap_fmt: rentGap == null || Math.abs(rentGap) < 1 ? null : signed(rentGap),
+      rent_timing_note: rentRoll == null ? null : "Rent payouts settle around the turn of the month, so a single month's cash can sit either side of the roll it pays for — read the trailing figure, not this one.",
+      rent_trailing: rentTrailing && {
+        months: rentTrailing.months,
+        collected_fmt: usd0(rentTrailing.collected),
+        expected_fmt: usd0(rentTrailing.expected),
+        gap_fmt: signed(rentTrailing.gap),
+        baseline_fmt: rentTrailing.baseline == null ? null : usd0(rentTrailing.baseline),
+        baseline_gap_fmt: rentTrailing.baseline_gap == null ? null : signed(rentTrailing.baseline_gap),
+        // THE ALARM: collection has broken against its own recent history.
+        // Needs a baseline to compare to — a property held under a year has
+        // none, and inventing one from a shorter window would just re-create
+        // the noise this replaced.
+        broke: rentTrailing.baseline != null &&
+          rentTrailing.baseline_gap < -Math.max(RF.rent_alarm_floor_usd, rentTrailing.baseline * RF.rent_alarm_share),
+        // THE NOTE: the books and the bank disagree about what this property
+        // contracts for. Not money missing — a lease record to reconcile.
+        books_mismatch: rentTrailing.gap < -Math.max(RF.rent_alarm_floor_usd, rentTrailing.expected * RF.rent_alarm_share) &&
+          !(rentTrailing.baseline != null && rentTrailing.baseline_gap < -Math.max(RF.rent_alarm_floor_usd, rentTrailing.baseline * RF.rent_alarm_share)),
+      },
+      vacant_units: s.vacant_units ?? [],
+      leases_expiring_90d: s.leases_expiring_90d ?? [],
+      value_fmt: s.value_estimate != null ? usd0(s.value_estimate) : null,
+      acquisition_fmt: s.acquisition_price == null ? null : usd0(s.acquisition_price),
+      // Cash-on-cash and yield-on-value are annualised from the TRAILING TWELVE
+      // months, not from this one month scaled up by twelve — a single roof
+      // repair would otherwise put a property's yield deeply negative for a year.
+      // No ledger rows in twelve months is a data gap, not a 0% yield.
+      // Not stated for an owner-use property: the twelve months include the
+      // family's own time (a yield that reads as a rental's weakness), and the
+      // adjusted stretch is only a few months, too short to annualise honestly.
+      yield_on_value_fmt: ownerUse?.available ? null : (s.value_estimate && (t12.income || t12.expenses) ? pct(t12.noi / s.value_estimate) : null),
+      cash_on_cash_fmt: ownerUse?.available ? null : (s.acquisition_price && (t12.income || t12.expenses) ? pct(t12.noi / s.acquisition_price) : null),
+      yield_note: ownerUse?.available ? "Left out: the twelve months include the family's own stays, and the adjusted stretch is too short to annualise." : null,
+    };
+  });
+
+  const rollup = (label, members) => {
+    if (!members.length) return null;
+    const nowNet = sum(members, (m) => m.month.net);
+    return {
+      label,
+      count: members.length,
+      income_fmt: usd0(sum(members, (m) => m.month.income)),
+      expenses_fmt: usd0(sum(members, (m) => m.month.expenses)),
+      net_fmt: signed(nowNet),
+      margin_fmt: sum(members, (m) => m.month.income) > 0 ? pct(nowNet / sum(members, (m) => m.month.income)) : null,
+      // The same members as the ledger booked them, before any owner-stay
+      // adjustment — so the adjustment is visible, not buried.
+      as_booked_expenses_fmt: usd0(sum(members, (m) => m.month_as_booked.expenses)),
+      as_booked_net_fmt: signed(sum(members, (m) => m.month_as_booked.net)),
+    };
+  };
+  const shortTerm = properties.filter((r) => r.rental_type === "short-term");
+  const longTerm = properties.filter((r) => r.rental_type === "long-term");
+
+  // Portfolio Schedule E — what the year's return is shaping up to look like,
+  // categories summed across every held property for the month and year to date.
+  const ytdFrom = `${month.slice(0, 4)}-01-01`;
+  const ytdTxns = pnlTxns.filter((t) => t.source.date >= ytdFrom && t.source.date <= monthEnd(month));
+  const ytd = ledger.statement(ytdTxns, reg, null);
+  const monthAll = ledger.statement(inMonth(pnlTxns, month), reg, null);
+  const scheduleE = ytd.lines.map((l) => {
+    const m = monthAll.lines.find((x) => x.categoryId === l.categoryId);
+    return { category: l.name, kind: l.kind, schedule_e: l.scheduleELine, month_fmt: m ? usd(m.amount) : "—", ytd_fmt: usd(l.amount), rows: l.count };
+  });
+
+  const sold = reg.properties
+    .filter((p) => p.kind === "property" && p.disposedOn && String(p.disposedOn).slice(0, 10) >= ytdFrom)
+    .map((p) => {
+      const s = ledger.statement(ytdTxns, reg, p);
+      return { name: p.name, disposed_on: String(p.disposedOn).slice(0, 10), ytd_income_fmt: usd0(s.income), ytd_net_fmt: signed(s.noi) };
+    })
+    .filter((r) => r.ytd_income_fmt !== "$0");
+
+  // ── Platform income that reached no property ────────────────────────────
+  //
+  // A short-term rental once reported $0 of income for a month while a
+  // turnover cleaning was booked against it — guests had plainly stayed. No
+  // payout from the main platform reached its account, but another platform's
+  // payout had landed in a general checking account, classified to nothing and
+  // attributed to no property. Money arrived, and every property total was
+  // blind to it.
+  //
+  // The reconciliation-health count could not catch it either, and that is the
+  // sharper lesson: `statement()` drops a contribution whose propertyId is null
+  // BEFORE the unclassified counter runs, so a row belonging to no property is
+  // not "unclassified", it is absent. The metric built to surface unreconciled
+  // money reported zero while this sat there.
+  //
+  // So it is checked directly, at the source: platform money that arrived in a
+  // DEPOSITORY account and reached no property. Credit-card rows are excluded
+  // deliberately — a platform credit on a credit card is a refund from a trip
+  // the user booked as a guest, not rental income.
+  const esc = (w) => String(w).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const STR_PLATFORM = new RegExp([RF.platform_income_pattern, ...(RF.extra_income_platforms || []).map(esc)].filter(Boolean).join("|"), "i");
+  const depositoryIds = new Set(
+    (reg.accounts || []).filter((a) => String(a.type || "").toLowerCase() === "depository").map((a) => a.id)
+  );
+  const acctLabel = Object.fromEntries((reg.accounts || []).map((a) => [a.id, `${a.name} ••${a.mask}`]));
+  const strayIncome = [];
+  for (const t of pnlTxns) {
+    const o = t.override || {};
+    if (o.excluded || o.ignored) continue;
+    if ((o.propertyId ?? t.classification?.propertyId ?? null) !== null) continue;
+    if (o.propertyGroup) continue;
+    if (!depositoryIds.has(t.source.accountId)) continue;
+    const amt = -Number(t.source.amount);
+    if (amt <= 0) continue;
+    if (!STR_PLATFORM.test(String(t.source.description || ""))) continue;
+    strayIncome.push({
+      date: t.source.date,
+      amount: round2(amt),
+      amount_fmt: usd(amt),
+      account: acctLabel[t.source.accountId] || "unknown account",
+      description: String(t.source.description || "").slice(0, 70),
+      in_month: t.source.date >= monthStart(month) && t.source.date <= monthEnd(month),
+    });
+  }
+  strayIncome.sort((a, b) => b.date.localeCompare(a.date));
+
+  const attention = [];
+  const flag = (priority, tag, text) => attention.push({ priority, tag, text });
+  for (const p of properties) {
+    if (p.unclassified_count) {
+      flag(80, "unclassified", `${p.name}: ${p.unclassified_count} row(s) totalling ${p.unclassified_amount_fmt} are still unclassified for ${monthLabel(month)} — they count in no total, so its ${p.net_fmt} net is provisional.`);
+    }
+    // Two different findings, deliberately ranked apart — see the long note
+    // where rent_trailing is built. A break against the property's own history
+    // is money; a gap against a lease record it has never matched is paperwork.
+    if (p.rent_trailing?.broke) {
+      flag(88, "rent-break", `${p.name} collected ${p.rent_trailing.collected_fmt} over ${p.rent_trailing.months} months, against ${p.rent_trailing.baseline_fmt} over the same stretch in the nine months before — ${p.rent_trailing.baseline_gap_fmt}. It is collecting less than it was, which is what a tenant going quiet looks like.`);
+    } else if (p.rent_trailing?.books_mismatch) {
+      flag(35, "rent-books-mismatch", `${p.name}'s leases contract for ${p.rent_trailing.expected_fmt} over ${p.rent_trailing.months} months and it collected ${p.rent_trailing.collected_fmt} — but collection is steady against its own history, so this is a lease record to reconcile, not rent behind.`);
+    }
+    // An owner-use property with almost no rentable nights has nothing to judge
+    // it on: its "loss" is the family's own home costs.
+    if (p.month.net < 0 && (!p.owner_use?.available || p.owner_use.judge)) {
+      flag(72, "negative-month", `${p.name} was negative in ${monthLabel(month)}: ${p.income_fmt} in against ${p.expenses_fmt} out.`);
+    }
+    if (p.reserve_low) flag(70, "reserve", `${p.name} holds ${p.cash_fmt}, about ${p.reserve_fmt} of its own running costs.`);
+    for (const v of p.vacant_units) flag(76, "vacancy", `${p.name} unit ${v.unit} is vacant${v.rent ? ` — ${usd0(v.rent)}/mo` : ""}.`);
+    if (p.leases_expiring_90d.length) {
+      const first = [...p.leases_expiring_90d].sort((a, b) => a.ends.localeCompare(b.ends))[0];
+      flag(50, "lease-ending", `${p.name}: ${p.leases_expiring_90d.length} lease(s) end within 90 days, first on ${first.ends} (unit ${first.unit}).`);
+    }
+  }
+  // Ranked high: this is money that arrived and is in no statement. It is the
+  // only check here that can change a property's reported income.
+  const strayThisMonth = strayIncome.filter((r) => r.in_month);
+  if (strayThisMonth.length) {
+    const tot = sum(strayThisMonth, (r) => r.amount);
+    flag(92, "income-unattributed", `${usd0(tot)} of booking-platform income reached a bank account in ${monthLabel(month)} but is attributed to no property, so it is in no statement — ${strayThisMonth.map((r) => `${r.amount_fmt} ${r.description.split(" ")[0]} into ${r.account} on ${r.date}`).join("; ")}.`);
+  }
+  const strayOlder = strayIncome.filter((r) => !r.in_month);
+  if (strayOlder.length) {
+    flag(46, "income-unattributed-history", `${strayOlder.length} earlier booking-platform payment(s) totalling ${usd0(sum(strayOlder, (r) => r.amount))} are also attributed to no property — the same gap, going back to ${strayOlder[strayOlder.length - 1].date}.`);
+  }
+  for (const f of dep.flags.filter((f) => ["deposit-recon-unbalanced", "deposit-missing"].includes(f.tag))) flag(85, f.tag, f.text);
+  // A transfer that fits two sets of tenants: none of them is called missing, so say it is in question rather than say nothing.
+  for (const f of dep.flags.filter((f) => f.tag === "deposit-ambiguous")) flag(f.priority, f.tag, f.text);
+  if (ownerUseError) {
+    flag(60, "owner-use-unavailable", `The owner-stay adjustment could not run (${ownerUseError}), so ${properties.filter((r) => r.owner_use).map((r) => r.name).join(" and ")} are shown as the ledger booked them, including your own nights.`);
+  }
+  attention.sort((a, b) => b.priority - a.priority);
+
+  const packet = {
+    meta: {
+      generated_at: etStamp(), month, month_label: monthLabel(month),
+      prior_month: prior, prior_month_label: monthLabel(prior),
+      year_ago_month: yearAgo,
+      range: { since: monthStart(month), until: monthEnd(month) },
+      note: "Monthly per-property review: P&L by Schedule-E category, month-over-month and year-over-year, reconciliation health, rent-roll collection, reserves and yield. Figures come from the rental ledger and are pre-formatted — quote them, do not recompute. Liquidity/anomalies belong to the WEEKLY review; this job never duplicates them.",
+    },
+    attention: attention.slice(0, 10),
+    properties: properties.sort((a, b) => a.month.net - b.month.net),
+    groups: { short_term: rollup("Short-term", shortTerm), long_term: rollup("Long-term", longTerm) },
+    portfolio: {
+      ...rollup("All held properties", properties),
+      ytd_income_fmt: usd0(ytd.income), ytd_expenses_fmt: usd0(ytd.expenses), ytd_net_fmt: signed(ytd.noi),
+      ytd_unclassified_count: ytd.unclassifiedCount,
+      ytd_unclassified_amount_fmt: ytd.unclassifiedCount ? usd(ytd.unclassifiedAmount) : null,
+      sold_this_year: sold,
+    },
+    schedule_e: scheduleE,
+    schedule_e_note: "Schedule E and year-to-date figures are the books as they stand, before any owner-stay adjustment.",
+    unattributed_income: {
+      this_month: strayThisMonth,
+      this_month_total_fmt: usd0(sum(strayThisMonth, (r) => r.amount)),
+      earlier: strayOlder.slice(0, 12),
+      earlier_total_fmt: usd0(sum(strayOlder, (r) => r.amount)),
+      note: `Booking-platform money that landed in a bank account and reached no property. It is in NO statement — not as income, and not in the unclassified count either, because a row with no property is dropped before that count is taken. Credit-card refunds are excluded: those are trips ${INST.owner_name} booked as a guest.`,
+    },
+    deposits: dep.section ? {
+      liability_fmt: dep.section.liability_fmt, balance_fmt: dep.section.balance_fmt, reconciled: dep.section.ok,
+      missing: dep.section.missing.map((m) => `${m.tenant} ${m.amount_fmt} (${m.property_name} lease ${m.lease_number}): ${m.where}`).concat(dep.section.groups),
+    } : null,
+  };
+
+  console.log(JSON.stringify(packet, null, 2));
+}
+
+main().catch((e) => { console.error(`finance-property-review-data error: ${e.message}`); process.exit(1); });

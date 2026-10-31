@@ -1,0 +1,471 @@
+#!/usr/bin/env node
+/**
+ * day-statements — read what the user SAID about a day and return it structured.
+ *
+ * the user, 2026-07-30: "we shouldn't treat my answers deterministically - leave
+ * that to mapping and gps points. use an LLM (sonnet or even opus) to understand
+ * what I say - even across multiple chat messages."
+ *
+ * The split this enforces:
+ *   deterministic (code) — GPS fixes, map matching, routed distance, pace,
+ *                          window boundaries, the day's timezone. Facts.
+ *   interpretive  (LLM)  — what the user meant. Which places the user named, which window
+ *                          each belongs to, "earlier", corrections, "that's all
+ *                          the stops", and what is genuinely still ambiguous.
+ *
+ * It replaces a regex treadmill, not a working component. The patterns being
+ * retired all failed the same way, by matching strings instead of reading:
+ *   - `chat_venue_candidates` mined venues by grammar, and bound "the villa
+ *     is 1.6" (a property VALUE) and "the balaboosta restaurant is a
+ *     great rec" (a tip the user had not visited) onto random stops.
+ *   - ALL_STOPS_RE (added earlier today) pattern-matched "I already mentioned
+ *     all our stops" and would miss every paraphrase of the same idea.
+ *   - A proposed check for composite names ("Cocktails + Lebanese ice cream")
+ *     would have treated the SYMPTOM of two places collapsing into one row.
+ *
+ * The 2026-07-29 case this exists to get right: at 21:58 the user sent a Maps link
+ * for cocktails, at 21:59 "And Lebanese ice cream earlier", at 22:01 a SECOND
+ * Maps link. Two specific spots, at two different times, across three messages.
+ * Jori even asked "What time or area was that? Want to make sure I tag it to
+ * the right stop" — then wrote both into one record at one coordinate. What
+ * makes them separate is that the user identified two places, which is a reading
+ * problem, not a parsing one.
+ *
+ * Output is strict JSON on stdout. It never invents a place: every entry must
+ * quote the words it came from.
+ *
+ * It also reads the iMessages the user sent that day, one model call of their own
+ * on the same ladder, into `self_messages[] = {at, text, kind, quote}` with kind
+ * correction | declarative | chatter. resolve-day turns those into its
+ * `corrections` and `declarative_self_messages` (they replaced the regex
+ * lib/message-classifier.js, 2026-10-29).
+ *
+ * Usage: day-statements <YYYY-MM-DD> [--tz Europe/Paris] [--model sonnet|opus]
+ *
+ * NOTE: this forks `claude -p`, so it must be launched from an already
+ * authenticated session (job-run / an agent turn). Straight from cron or a
+ * non-interactive ssh there is no GUI keychain and the fork exits 0 having done
+ * nothing — the same constraint documented for daily-summary-run.
+ */
+const path = require("node:path");
+const { execFileSync, spawnSync } = require("node:child_process");
+
+const JORI = require("../lib/root.cjs").TOOLS_DIR;
+const { request } = require(path.join(JORI, "lib/supabase-rest.js"));
+const { getDisplayTzForDate } = require(path.join(JORI, "lib/travel-timezone.js"));
+const { dayWindow } = require(path.join(JORI, "lib/day-window.js"));
+
+// Model ids live in agent/config/models.env (2026-10-06) — one place.
+const { MODELS } = require(path.join(__dirname, "../lib/models.cjs"));
+
+// The pinned Claude Code (CLAUDE_BIN, else ~/.local/bin/claude), never a bare `claude`:
+// a job's PATH put a stray Homebrew 2.1.81 first .
+const { CLAUDE_BIN, textSync } = require(path.join(__dirname, "../lib/max-judge.js"));
+const { claudeVersionLine } = require(path.join(__dirname, "../lib/claude-binaries.js"));
+let claudeBinLogged = false;
+
+// Always a model, never a pattern -- but not always an expensive one (the user,
+// 2026-07-30: "we can use the local model first and a more sophisticated model
+// if we need to, but always use a model"). The ladder is local -> sonnet ->
+// opus, and a rung is only climbed when the one below fails VALIDATION, so cost
+// tracks difficulty instead of being assumed.
+//
+// Realistic expectation, stated rather than pretended: the local default is
+// gemma3:1b, and this task -- structured extraction across a whole day of
+// interleaved conversation -- is well beyond a 1B model. It will usually fail
+// validation and cost ~1s to find out. Where local genuinely pays is the small
+// single-judgment calls ("is this message answering the open location ask?"),
+// which is what a caller should use askLocalJudgment for.
+const TIERS = ["local", "sonnet", "opus"];
+
+// Verifying that a quote exists is provenance checking, not language parsing:
+// it is a substring test against what the user actually wrote, and it is the cheapest
+// defence against a model inventing a place the user never mentioned.
+//
+// Typography must be folded before comparing, or a genuine quote fails to
+// match: the model returns a straight apostrophe where the user typed a curly one,
+// and this check then rejected correct output at EVERY tier, leaving the day
+// with no interpretation at all. The repo had already recorded this exact
+// trap once ("we went to ping's" never matched: lowercase + curly quote).
+// Accents and the ellipsis character fold too: "Cafe" for the user's "Café", "…" for
+// the user's "...".
+const norm = (x) => String(x || "")
+  .normalize("NFD").replace(/[\u0300-\u036F]/g, "")  // lang-regex-ok: folds accents before comparison
+  .replace(/[\u2018\u2019\u201B\u02BC]/g, "'")       // lang-regex-ok: folds typography before comparison
+  .replace(/[\u201C\u201D\u201E]/g, '"')              // lang-regex-ok: folds typography before comparison
+  .replace(/[\u2013\u2014\u2212]/g, "-")              // lang-regex-ok: folds typography before comparison
+  .replace(/\u2026/g, "...")                          // lang-regex-ok: folds typography before comparison
+  .replace(/\s+/g, " ").trim().toLowerCase();
+
+// The prompt tells the model to read across messages, so a quote can come from
+// two of them: on 2026-10-15 "I was at Café Antilia most of this morning..." and
+// "I was working there from before 9:30 until around 12:30pm" arrived as one
+// evidence string joined with " / ", no contiguous span of the chat matched it,
+// and every tier was rejected, so the day was built without any of the user's words.
+// The joins are the model's (" / " is the one the schema asks for; an ellipsis or
+// a line break are the ones it uses unasked); every piece must still be the user's.
+const EVIDENCE_JOINS = [" / ", "\u2026", "...", "\n"];
+function evidencePieces(evidence) {
+  let parts = [String(evidence || "")];
+  for (const join of EVIDENCE_JOINS) parts = parts.flatMap((p) => p.split(join));
+  return parts.map((p) => p.trim()).filter(Boolean);
+}
+
+// True when the quote is in the user's messages: as one span, or as pieces that EVERY
+// one are, however short ("We had lunch at Guetta / Puaa" must not pass on the
+// strength of its first half), with at least one long enough to mean something.
+function quoteInChat(evidence, hay) {
+  const whole = norm(evidence).slice(0, 60);
+  if (whole.length <= 12 || hay.includes(whole)) return true;
+  const pieces = evidencePieces(evidence).map((p) => norm(p).slice(0, 60)).filter(Boolean);
+  return pieces.some((p) => p.length > 12) && pieces.every((p) => hay.includes(p));
+}
+
+function validate(parsed, chatText) {
+  if (!parsed || typeof parsed !== "object") return "not an object";
+  if (!Array.isArray(parsed.places)) return "places is not an array";
+  if (!parsed.all_stops_declared || typeof parsed.all_stops_declared !== "object") {
+    return "all_stops_declared missing";
+  }
+  const hay = norm(chatText);
+  for (const p of parsed.places) {
+    if (!p.name) return "a place has no name";
+    if (!p.evidence) return `no evidence quoted for "${p.name}"`;
+    if (!quoteInChat(p.evidence, hay)) {
+      return `evidence for "${p.name}" is not in the user's messages: "${String(p.evidence).slice(0, 60)}"`;
+    }
+  }
+  return null;
+}
+
+async function runLocal(promptText) {
+  const { localLlmChat } = await import(
+    "file://" + path.join(JORI, "lib/local-llm.mjs"));
+  const out = await localLlmChat({
+    messages: [{ role: "user", content: promptText }],
+    maxTokens: 2000, timeoutMs: 60000,
+  });
+  return typeof out === "string" ? out : (out && (out.text || out.content)) || "";
+}
+
+function runClaude(promptText, model) {
+  if (!claudeBinLogged) {
+    claudeBinLogged = true;
+    process.stderr.write(`[day-statements] ${claudeVersionLine(CLAUDE_BIN)}\n`);
+  }
+  // Lean tool-less call (no tools, MCP servers, skills, memory or hooks: the
+  // reading needs none), Max session only, with the run's cost row. Throws on a
+  // failed call, as the ladder expects, so the next rung is tried.
+  const r = textSync({ model, effort: "medium", prompt: promptText, timeoutMs: 300000,
+    maxBuffer: 32 * 1024 * 1024, job: "day-statements" });
+  if (r.error) throw r.error;
+  if (r.status !== 0 || r.isError) throw new Error(`claude exit ${r.status}: ${(r.text || r.stderr).slice(0, 200)}`);
+  return r.text;
+}
+
+const SCHEMA = `{
+  "places": [
+    {
+      "name": "<exactly how THE USER referred to it, verbatim — e.g. 'Coffee at Typica'>",
+      "venue": "<JUST the place, as a map pin would label it: Typica. Never an activity, never a person, never a verb. If the user named no place, use null>",
+      "activity": "<what the user did there: coffee, lunch, dropped off Rover. null if the user did not say>",
+      "evidence": "<the user's exact words, verbatim. Words from several messages: copy each piece exactly and join the pieces with ' / '>",
+      "said_at": "<HH:MM local, when the user said it>",
+      "when_hint": "<'now' | 'earlier' | 'HH:MM' | 'unknown'  — WHEN THE USER WAS THERE, not when the user said it>",
+      "companions": ["<a person, by the name the user uses: Sam, Dana>", "..."],
+      "sentiment": "<positive | negative | neutral | null>"
+    }
+  ],
+  "non_stops": [
+    { "evidence": "<verbatim>", "said_at": "<HH:MM>", "covers": "<which window/time the user meant, or 'unknown'>",
+      "from": "<HH:MM local when that stretch began, or null if you cannot tell>",
+      "to": "<HH:MM local when it ended, or null>",
+      "companions": ["<who the user's words put on that stretch with the user>", "..."] }
+  ],
+  "all_stops_declared": { "value": true|false, "evidence": "<verbatim, or null>" },
+  "corrections": [ { "evidence": "<verbatim>", "what_it_changes": "<plain description>" } ],
+  "labels": [
+    { "stored": "<a stored label, copied EXACTLY from the list below>", "venue": "<just the place a map pin would carry, or null if it names no place>", "activity": "<what the user did, or null>" }
+  ],
+  "ambiguities": [ { "question": "<one short question to resolve it>", "about": "<what is unclear>" } ]
+}`;
+
+function prompt(dateStr, tz, chat, windows) {
+  return `You are reading the user's own messages about the user's day (${dateStr}, times in ${tz}) and extracting what the user SAID about where the user was. You are not looking at GPS; another system owns that. Your only job is to understand the user's words.
+
+Return ONLY a JSON object matching this schema, with no prose around it:
+${SCHEMA}
+
+Rules that matter, each learned from a real failure:
+
+0. SEPARATE THE PLACE FROM THE ACTIVITY. The user writes them together: "Coffee at Typica", "Lunch at La Cappadoce (Turkish, 98 Rue de la Roquette)", "Airbnb - dropped off Rover", "Marche Bastille - drinks at Le Paris cafe". The venue field is ONLY the place a map pin would carry (Typica; La Cappadoce; the Airbnb; Le Paris cafe); the activity field is what the user did there (coffee; lunch; dropped off Rover; drinks). The map shows only places the user has been to, not activities: Typica, not Coffee at Typica. If a statement names an activity but no place at all, such as "evening walk with Rover", then venue is null and it is movement, not a stop.
+
+1. ONE DISTINCT PLACE HE IDENTIFIED = ONE ENTRY. If the user names or links two different spots, that is two entries, no matter how many messages it took the user or how close together they were. Two Maps links are always two places. Never merge two places into one name like "Cocktails + Lebanese ice cream" — that is not a place.
+
+2. READ ACROSS MESSAGES. A place, its link, its photo and its timing may arrive in four separate messages over several minutes. Assemble them. Equally, ONE message can contain two facts ("Walked around. Stopped for a drink at a random spot by the market") — that is a non-stop AND a place.
+
+3. WHEN THE USER WAS THERE IS NOT WHEN THE USER SAID IT. "And Lebanese ice cream earlier" means an EARLIER window than the one being discussed. Put that in when_hint. The user often reports a stop well after leaving it.
+
+4. ONLY WHERE THE USER WAS, ON THIS DAY. A jori line marked "(asking about <another day>)" is a question about THAT day, and the user's reply to it is about that day too: never a place for this one. A recommendation, a plan, a property value, a shortlist the user is building for a project, a place the user is commenting on, or somewhere the user says the user did NOT go is never a visit. Real failure to avoid: the user discussed candidate restaurants for a food-tour project ("Food focused of course - this is for the tours") and an interpreter logged three of the restaurants as places the user visited. The user was at home at the time. Ask yourself for every candidate: is the user telling me WHERE HE WAS, or talking ABOUT a place? Only the first counts. When the surrounding conversation is about work, planning, or a list, it is the second.
+
+5. A CLOSING STATEMENT IS ABOUT THE WHOLE DAY. Any way of saying the user has told you about every stop — "I already mentioned all our stops", "that's everything", "nothing else" — sets all_stops_declared.value true. Judge the meaning, not the wording.
+
+6. NEVER INVENT. Every entry quotes the user's verbatim words in "evidence". If you are unsure whether something is a place, put it in ambiguities with the question you would ask the user, rather than guessing.
+
+7. THE PEOPLE CARRY ACROSS A SENTENCE. "We (Sam, Rover and I) had our morning coffee at the café, then took Rover for a long walk along the beach" puts Sam and Rover at the café AND on the walk, so list them on both entries (the walk was once left with nobody on it). Only people the user's words put there; "I drove Alex back home" puts Alex on that drive and nobody else. For a non-stop, give from/to as when that stretch ran. A walk or a drive is usually the GAP between two windows below (it began when the user left one and ended when the user reached the next: coffee, then a walk, then home is the gap between the coffee and home), sometimes a window itself; null only when neither the windows nor the conversation place it. Companions are people, one per entry, by the name the user uses for each. A group the user mentions without naming anyone ("my cousins and their kids were also there", "with friends") is not a name: never put it in companions, say it in activity instead ("dinner, with the user's cousins and their kids"). ("cousins and their kids" was once printed beside the cousins the user had named, as if they were more people.)
+
+ALSO: for EVERY stored label in the window list below that reads as an activity rather than a place, return a "labels" entry splitting it. These are the user's answers as they were saved, and their wording will differ from how the user phrased it in chat, so match them by meaning. Examples of the split: "Coffee at Typica" -> venue "Typica", activity "coffee"; "Airbnb - dropped off Rover" -> venue "the Airbnb", activity "dropped off Rover"; "Marche Bastille - drinks at Le Paris cafe" -> venue "Le Paris cafe", activity "drinks at Marche Bastille"; "Lunch at La Cappadoce (Turkish, 98 Rue de la Roquette)" -> venue "La Cappadoce", activity "lunch". A label naming no place at all, like "Evening walk with Rover", gets venue null. Copy "stored" verbatim from the list so it can be matched back.
+
+Deterministic GPS windows for the day, ONLY so you can say which one the user meant (do not treat these names as truth — several are machine guesses the user never confirmed):
+${windows}
+
+The user's conversation (both sides, so you can see what the user was answering):
+${chat}`;
+}
+
+// The chat this day is read from: from the day's own midnight, in the zone it was
+// lived in, to the end of the NEXT day (an evening stop is routinely reported the
+// following morning). It once began at 00:00 UTC the day BEFORE, so a day far east
+// of UTC read 21 hours of the previous day's chat and took the user's late answer
+// about the previous day as a place of this one.
+function chatWindow(date, tz) {
+  const w = dayWindow(date, tz, 2);
+  return { start: w.start, end: w.end };
+}
+
+// The user's conversation as the model reads it: chat-channel rows only (the improvements
+// and system channels are Jori's own notices, which quote the user's answers about other
+// days), and a fix-loop question about another day says which day it is about. The
+// day comes from the question's own id (`dsf:<date>:<n>`, written by
+// daily-summary-fix ask), never from its wording.
+function chatText(rows, date, tz) {
+  const fmt = (iso) => new Date(iso).toLocaleString("en-GB",
+    { timeZone: tz, month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false });
+  const aboutDay = (r) => {
+    const qid = r && r.metadata && r.metadata.question_id;
+    const parts = typeof qid === "string" ? qid.split(":") : [];
+    return parts[0] === "dsf" && parts[1] && parts[1] !== date ? parts[1] : null;
+  };
+  return (rows || [])
+    .filter(r => r && (r.channel == null || r.channel === "chat"))
+    .map(r => {
+      const other = r.role === "user" ? null : aboutDay(r);
+      const who = r.role === "user" ? "USER" : (other ? `jori (asking about ${other})` : "jori");
+      return `[${fmt(r.created_at)}] ${who}: ${String(r.content || "").replace(/\s+/g, " ").slice(0, 600)}`;
+    })
+    .join("\n");
+}
+
+// ---------------------------------------------------------------------------
+// The user's own sent iMessages for the day, each read by a model as a
+// correction, a declarative fact or chatter (2026-10-29).
+//
+// `lib/message-classifier.js` used to do this with regular expressions inside
+// resolve-day ("time stamps are wrong", "had lunch", "at <Capitalised>"), the
+// same string-matching treadmill this file exists to retire. resolve-day must stay
+// deterministic (it runs from cron, with no model), so the reading happens here and
+// resolve-day reads `self_messages` from this file's output. Code owns the message
+// list (its time, its text); the model only says which kind each one is and quotes
+// the words that make it so. When in doubt it is chatter: a correction or a fact
+// reaches the narrator, chatter never does.
+// ---------------------------------------------------------------------------
+
+const SELF_KINDS = ["correction", "declarative", "chatter"];
+
+// The day's sent iMessages, in the zone the day was lived in. `imsg sent` takes
+// UTC wall-clock strings (see bin/imsg parseUtcClock).
+function fetchImsgSent(date, tz) {
+  const w = dayWindow(date, tz, 1);
+  const utcClock = (ms) => new Date(ms).toISOString().slice(0, 19).split("T").join(" ");
+  const res = spawnSync(path.join(JORI, "bin/imsg"),
+    ["sent", "--since", utcClock(w.startMs), "--until", utcClock(w.endMs - 1000), "--json"],
+    { encoding: "utf8", maxBuffer: 16 * 1024 * 1024, timeout: 60000 });
+  if (res.status !== 0) return null;          // unreadable: not the same as "sent nothing"
+  try { return JSON.parse(res.stdout || "[]"); } catch { return null; }
+}
+
+// The messages as the model sees them: numbered, so its answer names a message by
+// index and code keeps the time and the text.
+function selfMessageList(msgs) {
+  return (msgs || []).map((m, i) => {
+    const to = m.contact ? ` to ${m.contact}${m.is_group ? " (group)" : ""}` : "";
+    return `[${i}] ${m.date || "?"}${to}: ${String(m.text || "").replace(/\s+/g, " ").slice(0, 600)}`;
+  }).join("\n");
+}
+
+const SELF_SCHEMA = `{
+  "self_messages": [
+    { "i": <the message's number>, "kind": "correction" | "declarative" | "chatter",
+      "quote": "<the words in THAT message that make it this kind, verbatim; null for chatter>" }
+  ]
+}`;
+
+function selfMessagesPrompt(date, tz, msgs) {
+  return `You are reading the iMessages the user SENT on ${date} (times are the host's clock; the day was lived in ${tz}). For each one, say what kind of statement it is, for a daily summary of where the user was and what the user did.
+
+Return ONLY a JSON object matching this schema, with no prose around it:
+${SELF_SCHEMA}
+
+The kinds:
+- "correction": the user saying something recorded or assumed about a day is wrong, or that something happened at a different time or on a different day ("the time stamps are wrong", "that was yesterday", "that wasn't today"). It is a signal about a PRIOR record, never a fact about this day.
+- "declarative": the user stating a fact about this day: where the user was or went, what the user did, who the user was with ("had lunch with Sam at the cafe", "flew to Lisbon"). Only the user's own day, stated as having happened: a plan, a recommendation, a question or someone else's day is not one.
+- "chatter": everything else: replies, logistics, opinions, questions, single words, emoji, links without a statement.
+
+When you are unsure, it is "chatter". Judge the meaning, not the wording. Every correction or declarative quotes the words of that same message verbatim.
+
+The messages:
+${selfMessageList(msgs)}`;
+}
+
+// Provenance, not language: each index exists, each kind is one of the three, and
+// each non-chatter quote is in the message it names.
+function validateSelfMessages(parsed, msgs) {
+  if (!parsed || typeof parsed !== "object") return "not an object";
+  if (!Array.isArray(parsed.self_messages)) return "self_messages is not an array";
+  for (const e of parsed.self_messages) {
+    if (!e || !Number.isInteger(e.i) || e.i < 0 || e.i >= msgs.length) return `no message ${e && e.i}`;
+    if (!SELF_KINDS.includes(e.kind)) return `message ${e.i}: kind "${e.kind}" is not one of ${SELF_KINDS.join("/")}`;
+    if (e.kind === "chatter") continue;
+    if (!e.quote) return `message ${e.i}: no quote for a ${e.kind}`;
+    if (!quoteInChat(e.quote, norm(msgs[e.i].text))) {
+      return `message ${e.i}: quote is not in the message: "${String(e.quote).slice(0, 60)}"`;
+    }
+  }
+  return null;
+}
+
+// Every message, in order, with the model's kind (chatter where it gave none).
+function buildSelfMessages(parsed, msgs) {
+  const byI = new Map();
+  for (const e of parsed.self_messages) if (!byI.has(e.i)) byI.set(e.i, e);
+  return msgs.map((m, i) => {
+    const e = byI.get(i);
+    const kind = e ? e.kind : "chatter";
+    return { at: m.date || null, text: String(m.text || "").replace(/\s+/g, " ").trim(),
+             kind, quote: kind === "chatter" ? null : e.quote };
+  });
+}
+
+function parseJsonOut(raw) {
+  const jm = String(raw).match(/\{[\s\S]*\}/);
+  if (!jm) return { error: "no JSON in output" };
+  try { return { value: JSON.parse(jm[0]) }; } catch { return { error: "unparseable JSON" }; }
+}
+
+// The ladder, as for the places: a rung is climbed only when the one below fails
+// validation. `ask(promptText, tier)` returns the model's raw text (tests stub it).
+// Returns { self_messages, tier, attempts }; self_messages is null when no tier
+// gave a valid reading, so the day has none rather than a guess.
+async function classifySelfMessages(msgs, { date, tz, ask, ladder = TIERS }) {
+  if (!msgs || !msgs.length) return { self_messages: [], tier: null, attempts: [] };
+  const promptText = selfMessagesPrompt(date, tz, msgs);
+  const attempts = [];
+  for (const tier of ladder) {
+    let raw;
+    try { raw = await ask(promptText, tier); }
+    catch (e) { attempts.push({ tier, error: String(e.message || e).slice(0, 120) }); continue; }
+    const { value, error } = parseJsonOut(raw);
+    if (error) { attempts.push({ tier, error }); continue; }
+    const bad = validateSelfMessages(value, msgs);
+    if (bad) { attempts.push({ tier, error: bad }); continue; }
+    attempts.push({ tier, ok: true });
+    return { self_messages: buildSelfMessages(value, msgs), tier, attempts };
+  }
+  return { self_messages: null, tier: null, attempts };
+}
+
+const askTier = (promptText, tier) =>
+  tier === "local" ? runLocal(promptText) : runClaude(promptText, MODELS[tier]);
+
+async function main() {
+  const date = process.argv[2];
+  if (!date || !/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+    console.error("usage: day-statements <YYYY-MM-DD> [--tz TZ] [--model sonnet|opus]");
+    process.exit(2);
+  }
+  const tzArg = process.argv.indexOf("--tz");
+  // The zone the day was lived in (travel timeline), not the home zone: the user's messages
+  // are shown to the model in this zone and day-path cuts the day in it.
+  const tz = tzArg > -1 ? process.argv[tzArg + 1] : getDisplayTzForDate(date);
+  const mArg = process.argv.indexOf("--model");
+  const model = MODELS[mArg > -1 ? process.argv[mArg + 1] : "sonnet"] || MODELS.sonnet;
+
+  const { start, end } = chatWindow(date, tz);
+  const rows = await request(
+    `/rest/v1/jori_messages?select=role,content,created_at,channel,metadata`
+    + `&created_at=gte.${start}&created_at=lt.${end}`
+    + `&or=(channel.eq.chat,channel.is.null)`
+    + `&order=created_at&limit=2000`, { timeoutMs: 30000 });
+
+  const chat = chatText(rows, date, tz);
+
+  let windows = "(unavailable)";
+  try {
+    const out = execFileSync(path.join(JORI, "bin/day-path"),
+      [date, "--tz", tz, "--json", "--no-match"],
+      { encoding: "utf8", maxBuffer: 64 * 1024 * 1024, timeout: 120000 });
+    const d = JSON.parse(out);
+    windows = (d.visits || [])
+      .map(v => `  ${v.start}-${v.end} (${v.mins}m) currently labelled: ${v.name || "unlabelled"} [${v.ptype}]`)
+      .join("\n");
+  } catch (e) {
+    windows = `(day-path failed: ${e.message})`;
+  }
+
+  const promptText = prompt(date, tz, chat, windows);
+  const startAt = mArg > -1 ? TIERS.indexOf(process.argv[mArg + 1]) : 0;
+  const ladder = TIERS.slice(startAt < 0 ? 0 : startAt);
+
+  let parsed = null, used = null;
+  const attempts = [];
+  for (const tier of ladder) {
+    let raw = "";
+    try {
+      raw = tier === "local" ? await runLocal(promptText)
+                             : runClaude(promptText, MODELS[tier]);
+    } catch (e) {
+      attempts.push({ tier, error: e.message.slice(0, 120) });
+      continue;
+    }
+    const jm = String(raw).match(/\{[\s\S]*\}/);
+    if (!jm) { attempts.push({ tier, error: "no JSON in output" }); continue; }
+    let cand;
+    try { cand = JSON.parse(jm[0]); }
+    catch (e) { attempts.push({ tier, error: "unparseable JSON" }); continue; }
+    const bad = validate(cand, chat);
+    if (bad) { attempts.push({ tier, error: bad }); continue; }
+    parsed = cand; used = tier;
+    attempts.push({ tier, ok: true });
+    break;
+  }
+  if (!parsed) {
+    console.error("every tier failed:\n" + JSON.stringify(attempts, null, 1));
+    process.exit(1);
+  }
+  // The day's sent iMessages, read the same way (see classifySelfMessages). An
+  // unreadable message store or a ladder with no valid reading leaves the field
+  // out, and resolve-day then reports no corrections or facts from them.
+  const sent = fetchImsgSent(date, tz);
+  let self = { self_messages: null, tier: null, attempts: [{ error: "imsg sent unreadable" }] };
+  if (sent) self = await classifySelfMessages(sent, { date, tz, ask: askTier, ladder });
+  if (self.self_messages) parsed.self_messages = self.self_messages;
+  else process.stderr.write("[day-statements] self-sent iMessages not read: "
+    + JSON.stringify(self.attempts) + "\n");
+  parsed._meta = { date, tz, tier: used, attempts, messages: (rows || []).length,
+                   self_messages: { tier: self.tier, attempts: self.attempts,
+                                    count: sent ? sent.length : null },
+                   generated_at: new Date().toISOString() };
+  const outArg = process.argv.indexOf("--out");
+  const outFile = outArg > -1 ? process.argv[outArg + 1] : `/tmp/day-statements-${date}.json`;
+  require("node:fs").writeFileSync(outFile, JSON.stringify(parsed, null, 1) + "\n");
+  process.stdout.write(JSON.stringify(parsed, null, 1) + "\n");
+  process.stderr.write(`wrote ${outFile}\n`);
+}
+
+if (require.main === module) {
+  main().catch(e => { console.error(e.message); process.exit(1); });
+}
+
+module.exports = { validate, evidencePieces, quoteInChat, norm, chatWindow, chatText, prompt, SCHEMA,
+  SELF_KINDS, selfMessageList, selfMessagesPrompt, validateSelfMessages, buildSelfMessages,
+  classifySelfMessages, fetchImsgSent };

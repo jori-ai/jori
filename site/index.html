@@ -14,8 +14,9 @@
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,600&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400&display=swap" rel="stylesheet">
 <style>
-  :root { --bg:#f4efe6; --ink:#141414; --muted:#5e5a52; --line:#d9d1c3; --accent:#c2410c; --us:#f6e3d3; --yes:#1f7a4d; --no:#a3473a; }
-  @media (prefers-color-scheme: dark) { :root { --bg:#121110; --ink:#f1ece3; --muted:#a39d92; --line:#2c2925; --accent:#fb923c; --us:#2a1d14; --yes:#5fc28f; --no:#e08a7c; } }
+  /* Palettes: life = red, work = blue, neutral when a page speaks to both. Each page maps its accent to one. */
+  :root { --bg:#f4efe6; --ink:#141414; --muted:#5e5a52; --line:#d9d1c3; --life:#b42318; --life-tint:#f7e2de; --work:#1d4ed8; --work-tint:#e1e7f4; --neutral:#57534e; --neutral-tint:#ebe4d8; --accent:var(--neutral); --us:var(--neutral-tint); --yes:#1f7a4d; --no:#a3473a; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#121110; --ink:#f1ece3; --muted:#a39d92; --line:#2c2925; --life:#f87171; --life-tint:#2d1716; --work:#7aa2f7; --work-tint:#151f36; --neutral:#d6d0c4; --neutral-tint:#24211d; --yes:#5fc28f; --no:#e08a7c; } }
   * { box-sizing:border-box; margin:0; }
   body { background:var(--bg); color:var(--ink); font:16px/1.6 Inter, system-ui, sans-serif; }
   .wrap { width:100%; max-width:1080px; margin:0 auto; padding:0 24px; }
@@ -24,6 +25,8 @@
   .tag { font-size:13px; letter-spacing:.08em; text-transform:uppercase; color:var(--muted); margin-bottom:24px; }
   h1 { font-family:Fraunces, Georgia, serif; font-weight:600; font-size:clamp(48px, 8.5vw, 92px); line-height:1; letter-spacing:-.01em; }
   h1 em { color:var(--accent); }
+  h1 em.life { color:var(--life); }
+  h1 em.work { color:var(--work); }
   .lede { font-size:clamp(18px, 2.3vw, 21px); color:var(--muted); max-width:620px; margin-top:28px; }
   .lede strong { color:var(--ink); font-weight:500; }
   .ctas { margin-top:36px; display:flex; gap:24px; flex-wrap:wrap; align-items:center; }
@@ -75,7 +78,7 @@
   .nav .brand img { width:30px; height:30px; }
   .nav .seg { display:flex; gap:4px; background:var(--us); border-radius:999px; padding:4px; }
   .nav .seg a { color:var(--muted); text-decoration:none; font-size:14px; font-weight:500; padding:6px 14px; border-radius:999px; }
-  .nav .seg a[aria-current="page"] { background:var(--ink); color:var(--bg); }
+  .nav .seg a[aria-current="page"] { background:var(--accent); color:var(--bg); }
   .nav .gh { color:var(--muted); font-size:14px; text-decoration:none; }
   @media (max-width:560px) { .nav .gh { display:none; } }
 .doors { display:grid; grid-template-columns:1fr 1fr; gap:20px; padding:8px 0 64px; }
@@ -86,6 +89,10 @@
   .door p { color:var(--muted); font-size:16px; }
   .door .go { display:inline-block; margin-top:18px; font-weight:500; border-bottom:1px solid var(--ink); padding-bottom:2px; }
   @media (max-width:760px) { .doors { grid-template-columns:1fr; } }
+  .door.life { background:var(--life-tint); }
+  .door.life .k, .door.life .go { color:var(--life); border-color:var(--life); }
+  .door.work { background:var(--work-tint); }
+  .door.work .k, .door.work .go { color:var(--work); border-color:var(--work); }
 </style>
 </head>
 <body>
@@ -93,18 +100,18 @@
   <header class="hero">
     <img class="logo" src="/logo.png" alt="Jori" width="112" height="112">
     <div class="tag">Open source</div>
-    <h1>Meet Jori.<br>AI for your life <em>and your work</em>.</h1>
+    <h1>Meet Jori.<br>AI for <em class="life">life</em> and <em class="work">work</em>.</h1>
     <p class="lede">One assistant that stays on and takes care of the details, day and night. <strong>It's private and secure by design, so what it learns stays yours.</strong> And it's yours to shape, until it works exactly the way you do. All on the Claude subscription you already have.</p>
   </header>
 
   <div class="doors">
-    <a class="door" href="/personal">
+    <a class="door life" href="/personal">
       <div class="k">For you</div>
       <h2>Your personal agent.</h2>
       <p>Your inbox, handled. Your trips, planned and booked. The best table in town, wherever you land. Your money, watched. Your home, taken care of.</p>
       <span class="go">Jori for you →</span>
     </a>
-    <a class="door" href="/business">
+    <a class="door work" href="/business">
       <div class="k">For your business</div>
       <h2>Your AI coworker.</h2>
       <p>Customer email, answered. Meetings, scheduled and prepped. Business trips, planned and booked. Spend, watched. The weekly report, written before Monday.</p>

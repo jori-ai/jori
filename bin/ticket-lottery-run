@@ -1,0 +1,579 @@
+#!/usr/bin/env node
+// ticket-lottery-run — daily theater rush-lottery entries, as code.
+//
+// Every step is mechanical: read the curated list and pause files, call the
+// verified browsing skills through cdp-runner, gate each date on
+// metro-presence and calendar-conflict-check, parse the platform's
+// confirmation email, write the state file, send one templated summary. No
+// model, except one tool-less classification of an error code the script has
+// never seen (lib/ticket-lottery-error-triage.mjs).
+//
+// Platforms, files and the travel metro are this installation's
+// (agent/local/config/ticket-lottery.json, lib/ticket-lottery.mjs). No platform
+// configured: the run is off — it logs that and exits 0.
+//
+// Usage: ticket-lottery-run --platform <key>|all [--dry-run] [--force]
+//   --platform  a configured platform key, or all (every platform, in config order)
+//   --dry-run   read everything, gate everything, submit nothing, send nothing, write nothing
+//   --force     ignore the once-per-platform-per-day idempotency guard
+//
+// Each platform has its own entry window, so the installation schedules one
+// trigger per platform (`--platform <key>`). Output goes to the job log, which
+// browsing-skills/tools/skill-health.js scans for the per-skill
+// {"skill","action","error"} lines this script prints.
+//
+// geo-gate-ok: every performance date is gated through `metro-presence` before any
+// entry (AWAY dates are skipped and an all-away run sends nothing), so the summary
+// only ever reports entries for dates the user is in the configured metro.
+
+import { execFile, execFileSync } from "node:child_process";
+import fs from "node:fs";
+import path from "node:path";
+import { promisify } from "node:util";
+import { createRequire } from "node:module";
+import { runActionCdp, extractActionBlock } from "../browsing-skills/tools/cdp-runner.mjs";
+import {
+  lotteryConfig, installPath, readJson, writeJson, localDate, loadShows, matchShow, sameTitle,
+  parseStamp, showWindow, pauseAllMode, activePauses, ownerEntrant,
+  verifyLink, quantityRequested, receivedMatches, RECEIVED_MARKER, entryKey, doneKeys,
+} from "../lib/ticket-lottery.mjs";
+import { isMeetingEvent } from "../lib/meeting-event.mjs";
+import { meeting, knownSeriesId } from "../lib/meetings.mjs";
+import * as gmail from "../lib/gmail-parsed.mjs";
+import { createTriager, isUnknown } from "../lib/ticket-lottery-error-triage.mjs";
+
+const require = createRequire(import.meta.url);
+const { instance } = require("../lib/instance.cjs");
+
+const pexec = promisify(execFile);
+const CFG = lotteryConfig();
+const BIN = installPath("bin");
+const SKILLS = installPath("browsing-skills/skills");
+const F = CFG.files;
+const STATE_FILE = F.state;
+const OWNER = ownerEntrant();
+const OWNER_CDP = CFG.cdp_host || "localhost:9222";
+const TICKETS = Number(CFG.tickets) || 2;
+const portOf = (host) => String(host).split(":").pop();
+const HOST_LABEL = instance().host_label || "the host";
+
+const argv = process.argv.slice(2);
+const flag = (n) => argv.includes(n);
+const opt = (n, d) => { const i = argv.indexOf(n); return i >= 0 ? argv[i + 1] : d; };
+const PLATFORM = opt("--platform", "all");
+const DRY = flag("--dry-run");
+const FORCE = flag("--force");
+const today = localDate(CFG.tz);
+const nowIso = () => new Date().toISOString();
+const log = (...a) => console.log(`[${new Date().toISOString()}]`, ...a);
+const failedSkills = new Set(); // "<skill>/<action>" keys this run logged an error for
+const skillLog = (skill, action, error, extra = {}) => {
+  if (error) failedSkills.add(`${skill}/${action}`);
+  console.log(JSON.stringify({ skill, action, error: error ?? null, ...extra }));
+};
+
+const ALL_KEYS = Object.keys(CFG.platforms);
+const RUN_KEYS = PLATFORM === "all" ? ALL_KEYS : ALL_KEYS.filter((k) => k === PLATFORM);
+const label = (key) => CFG.platforms[key]?.label || key;
+
+// ── Browser ────────────────────────────────────────────────────────────────
+
+async function cdpUp(host) {
+  try {
+    const r = await fetch(`http://${host}/json/version`, { signal: AbortSignal.timeout(5000) });
+    return r.ok;
+  } catch { return false; }
+}
+
+const blocks = new Map();
+function block(site, action) {
+  const p = path.join(SKILLS, site, "references", `${action}.md`);
+  if (!blocks.has(p)) blocks.set(p, extractActionBlock(p));
+  return blocks.get(p);
+}
+
+/** Run a browsing-skill action and return its parsed JSON payload (or {ok:false,error}). */
+async function skill(site, action, url, params, cdpHost = OWNER_CDP) {
+  try {
+    const r = await runActionCdp({ url, actionBlock: block(site, action), params, cdpHost });
+    if (r && r.ok === true) {
+      const text = r.result?.content?.[0]?.text;
+      try { return JSON.parse(text); } catch { return { ok: false, error: "unparseable_result", raw: String(text).slice(0, 300) }; }
+    }
+    return { ok: false, error: r?.error || "runner_error", message: r?.message };
+  } catch (e) {
+    return { ok: false, error: "runner_exception", message: String(e.message || e).slice(0, 300) };
+  }
+}
+
+// ── Gates ──────────────────────────────────────────────────────────────────
+
+const presenceCache = new Map();
+async function inTown(date) {
+  if (!CFG.metro) return true; // no metro configured: no travel gate
+  if (!presenceCache.has(date)) {
+    presenceCache.set(date, pexec(path.join(BIN, "metro-presence"), ["--metro", CFG.metro, date], { timeout: 60_000 })
+      .then(() => true).catch((e) => (e.code === 1 ? false : true))); // fail open on anything but a definite AWAY
+  }
+  return presenceCache.get(date);
+}
+
+// A run that never got a listing (Chrome down, a signed-out session, a failed
+// list) has no performance dates to gate, so a blocker it hits is judged
+// against the lookahead instead: today..today+3. Listings carry performances
+// one or two days out, so this covers them with a day to spare.
+const LOOKAHEAD_DAYS = 3;
+const lookaheadDates = () => {
+  const [y, m, d] = today.split("-").map(Number);
+  return Array.from({ length: LOOKAHEAD_DAYS + 1 }, (_, i) => new Date(Date.UTC(y, m - 1, d + i)).toISOString().slice(0, 10));
+};
+
+/** True only when every lookahead date is a definite AWAY and none is a guest-mode date (inTown fails open). */
+async function awayForLookahead(guestDates) {
+  for (const d of lookaheadDates()) if (guestDates.has(d) || (await inTown(d))) return false;
+  return true;
+}
+
+/** Log, don't send: no updates about entries while the user is away from the metro for every date they could cover. */
+const logQuietBlocker = (what) => {
+  log(`blocker not reported — every date ${lookaheadDates()[0]}..${lookaheadDates().at(-1)} is AWAY: ${what}`);
+  // The same decision for the nightly skill-health check, which reads this log:
+  // these skill failures still count toward its streak but are not alerted.
+  if (failedSkills.size) {
+    console.log(JSON.stringify({ skill_health: "quiet", reason: "away", skills: [...failedSkills], ts: nowIso() }));
+  }
+};
+
+// The soft block: one recurring meeting (lib/meetings.mjs) the user would move for a win.
+const softMeeting = CFG.soft_block?.meeting ? meeting(CFG.soft_block.meeting) : null;
+const softId = softMeeting ? knownSeriesId(softMeeting) : null;
+const SOFT_NOTE = CFG.soft_block?.note || "meeting overlap — soft block, would reschedule it if won";
+
+/** {conflict:boolean, note?:string} — the soft-block meeting, all-day and tentative events never block. */
+async function calendarGate(date, time) {
+  const w = showWindow(time);
+  let res;
+  try {
+    const { stdout } = await pexec(path.join(BIN, "calendar-conflict-check"),
+      [date, "--time", w.time, "--duration-hours", String(w.hours), "--json"], { timeout: 60_000 });
+    res = JSON.parse(stdout);
+  } catch (e) {
+    if (e.code === 1 && e.stdout) { try { res = JSON.parse(e.stdout); } catch { return { conflict: false }; } }
+    else return { conflict: false }; // fail open, same as the tool itself (and when it is not installed)
+  }
+  const events = (res.events || []).filter((ev) => !ev.all_day && ev.status !== "tentative");
+  const hard = events.filter((ev) => !(softMeeting && isMeetingEvent(ev, softMeeting, softId)));
+  if (hard.length) return { conflict: true, note: `calendar conflict: ${hard.map((e) => e.summary).join("; ")}` };
+  if (events.length) return { conflict: false, note: SOFT_NOTE };
+  return { conflict: false };
+}
+
+// ── State ──────────────────────────────────────────────────────────────────
+
+const state = readJson(STATE_FILE, { last_run: "", entries: [] });
+state.entries ||= [];
+state.last_run_by_platform ||= {};
+const done = doneKeys(state, OWNER);
+const rows = []; // this run's new rows
+
+function record(row) {
+  const r = { entrant: OWNER, submitted_at: nowIso(), ...row };
+  rows.push(r);
+  if (["submitted", "pending_validation", "failed_permanent"].includes(r.status)) done.add(entryKey(r, OWNER));
+  return r;
+}
+
+// ── Unknown error codes ──────────────────────────────────────────────────
+// A code outside KNOWN_CODES gets one tool-less Haiku classification (cached
+// per code for 30 days, ≤3 calls a run) and code acts on the class — see
+// lib/ticket-lottery-error-triage.mjs. Any failure falls back to a plain
+// "error" row, exactly the pre-triage behaviour.
+const triager = createTriager({ cacheFile: F.error_classes, log });
+const sleep = (ms) => new Promise((res) => setTimeout(res, ms));
+const mirrorLabel = (entrant) => {
+  for (const p of Object.values(CFG.platforms)) for (const m of p.mirror || []) if (m.entrant === entrant) return m.label || entrant;
+  return entrant;
+};
+
+/** → {r, c}: the final skill result (after at most one retry for "retryable") and the class, if any. */
+async function triageUnknown(r, ctx, retry) {
+  if (DRY || r.ok || !isUnknown(r.error)) return { r, c: null };
+  const c = await triager.classify({ code: r.error, message: r.message || r.raw, platform: ctx.platform, show: ctx.show });
+  if (!c) return { r, c: null };
+  console.log(JSON.stringify({ error_triage: r.error, class: c.class, source: c.source, show: ctx.show, platform: ctx.platform }));
+  if (c.class !== "retryable") return { r, c };
+  await sleep(5000);
+  const r2 = await retry();
+  skillLog(`${ctx.site}/lottery-enter`, "lottery-enter", r2.ok ? null : r2.error, { show: ctx.show, retry_of: r.error, ...(ctx.entrant ? { entrant: ctx.entrant } : {}) });
+  return { r: r2, c, retriedFrom: r.error };
+}
+
+/** Record a failed entry according to its triage class. */
+function recordFailure(base, r, c, blockers, retriedFrom) {
+  const code = retriedFrom || r.error || "unknown";
+  if (!c) return record({ ...base, status: "error", note: r.error || "unknown" });
+  if (c.class === "permanent") return record({ ...base, status: "failed_permanent", note: `${code}: ${c.explanation}` });
+  if (c.class === "needs_attention") {
+    const who = base.entrant && base.entrant !== OWNER ? ` (${mirrorLabel(base.entrant)})` : "";
+    blockers.push(`${label(base.platform)}${who} — ${c.explanation}`);
+    return record({ ...base, status: "error", note: code });
+  }
+  return record({ ...base, status: "error", note: `${code} (retried once, will retry next run)` });
+}
+
+// ── Main ───────────────────────────────────────────────────────────────────
+
+async function main() {
+  if (!ALL_KEYS.length) { log("no lottery platforms configured (agent/local/config/ticket-lottery.json) — off"); return; }
+  if (!RUN_KEYS.length) { log(`unknown --platform ${PLATFORM}`); process.exit(2); }
+  if (!FORCE && RUN_KEYS.every((p) => state.last_run_by_platform[p] === today)) {
+    log(`already ran ${RUN_KEYS.join("+")} today — exit`); return;
+  }
+
+  const { shows, retired } = loadShows(CFG.shows_file);
+  const guest = readJson(F.guest, null);
+  const guestDates = new Set(guest?.active === true ? guest.dates || [] : []);
+  const guestNote = guest?.for ? `guest-mode: for ${guest.for}` : "guest-mode";
+
+  // Pause-all. Guest dates are exempt from every pause.
+  const exemptions = (readJson(F.exemptions, {})?.shows || []).map((s) => s.show);
+  const mode = pauseAllMode(readJson(F.pause_all, null), today, exemptions);
+  if (mode === "expired" && !DRY) { fs.rmSync(F.pause_all, { force: true }); log("pause-all expired — removed"); }
+  if (mode === "all" && !guestDates.size) { log("pause-all active (not weekly-cap-exemptible) — exit silently"); return; }
+
+  const pz = activePauses(readJson(F.pauses, null), today);
+  if (pz.changed && !DRY) writeJson(F.pauses, { entries: pz.kept });
+
+  /** Is this listing a target on this date? → {show, guest} | null. */
+  function target(listingTitle, date) {
+    if (guestDates.has(date)) {
+      const s = matchShow(listingTitle, shows) || matchShow(listingTitle, retired);
+      return { show: s?.title || listingTitle, guest: true };
+    }
+    if (mode === "all") return null;
+    const s = matchShow(listingTitle, shows);
+    if (!s) return null;
+    if (mode === "exempt-only" && !exemptions.some((x) => sameTitle(x, s.title))) return null;
+    if (pz.active.some((x) => sameTitle(x, s.title))) return null;
+    return { show: s.title, guest: false };
+  }
+
+  // Chrome pre-flight — fast fail, one ping, no hang.
+  if (!(await cdpUp(OWNER_CDP))) {
+    log(`CDP :${portOf(OWNER_CDP)} unreachable`);
+    if (!DRY) {
+      state.last_run = today;
+      state.last_run_status = "blocked";
+      state.last_run_blocker = `CDP port ${portOf(OWNER_CDP)} unreachable in 5s`;
+      writeJson(STATE_FILE, state);
+      if (await awayForLookahead(guestDates)) logQuietBlocker(state.last_run_blocker);
+      else send(`${CFG.title} skipped today — the automation Chrome (port ${portOf(OWNER_CDP)}) isn't answering, so nothing could be entered. It usually needs Chrome restarted on ${HOST_LABEL}.`);
+    }
+    return;
+  }
+
+  const datesSeen = new Set();
+  let anyInTown = false;
+  const blockers = [];
+
+  async function gateDate(date, time, isGuest) {
+    datesSeen.add(date);
+    if (!isGuest && !(await inTown(date))) return { skip: "away" };
+    anyInTown = true;
+    if (isGuest) return {};
+    const c = await calendarGate(date, time);
+    if (c.conflict) return { skip: "conflict", note: c.note };
+    return { note: c.note };
+  }
+
+  const ctx = { target, gateDate, blockers, guestNote };
+  for (const key of RUN_KEYS) {
+    const P = { key, ...CFG.platforms[key] };
+    if (P.kind === "list-enter") await listEnter(P, ctx);
+    else if (P.kind === "form-email") await formEmail(P, ctx);
+    else { log(`platform ${key}: unknown kind ${P.kind} — skipped`); }
+  }
+
+  // ── Persist + summarise ──
+  const allAway = datesSeen.size > 0 && !anyInTown;
+  if (DRY) { log(`DRY done: ${rows.length} rows, allAway=${allAway}, blockers=${blockers.length}`); console.log(JSON.stringify(rows, null, 2)); return; }
+
+  // Keep 60 days of rows: the duplicate guard only needs upcoming performances.
+  const keepFrom = localDate(CFG.tz, new Date(Date.now() - 60 * 86400_000));
+  state.entries = state.entries.filter((e) => !e.date || e.date >= keepFrom);
+  state.entries.push(...rows.map(({ submit_ms, ...r }) => r));
+  state.last_run = today;
+  for (const p of RUN_KEYS) state.last_run_by_platform[p] = today;
+  state.last_run_status = blockers.length ? "blocked" : rows.some((r) => r.status === "submitted") ? "submitted"
+    : allAway ? "away_no_entries" : rows.length ? "no_new_entries" : "no_drawings_open";
+  state.last_run_note = `${PLATFORM} run`;
+  writeJson(STATE_FILE, state);
+
+  closeTabs();
+  if (allAway && !blockers.length) { log("every candidate date AWAY — no summary"); return; }
+  // No date reached in-town, so every blocker is listing-level (dates unknown) — judge it on the lookahead.
+  if (blockers.length && !anyInTown && (await awayForLookahead(guestDates))) {
+    logQuietBlocker([...new Set(blockers)].join("; "));
+    return;
+  }
+  const msg = summary(rows, blockers);
+  if (msg) send(msg);
+}
+
+// ── list-enter platforms: list the open drawings, enter each by event id ──
+
+async function listEnter(P, { target, gateDate, blockers, guestNote }) {
+  const enterParams = (eventId) => ({ eventId: String(eventId), ticketCount: TICKETS, dryRun: false, confirm: true });
+  const list = await skill(P.site, "lottery-list-active", P.url, {});
+  skillLog(`${P.site}/lottery-list-active`, "lottery-list-active", list.error === "not_logged_in" ? "not_logged_in" : (list.ok === false ? list.error : null), { showCount: list.shows?.length || 0 });
+  if (list.error === "not_logged_in") {
+    blockers.push(`${P.label} session is signed out on the automation Chrome (port ${portOf(OWNER_CDP)}) — it needs a one-time manual login`);
+    return;
+  }
+  if (list.ok === false && !list.shows) { blockers.push(`${P.label} list failed (${list.error})`); return; }
+  if (list.state === "no_drawings_yet") return;
+
+  const ownerSubmitted = [];
+  for (const s of list.shows || []) {
+    const pd = parseStamp(s.performanceDate, P.date_format);
+    const date = pd?.date || today;
+    const t = target(s.title, date);
+    if (!t) continue;
+    const base = { show: t.show, platform: P.key, date, eventId: s.eventId, ...(pd ? {} : { note: "date inferred — performanceDate missing" }) };
+    if (t.guest) base.note = guestNote;
+    if (done.has(entryKey(base, OWNER))) continue;
+    const g = await gateDate(date, pd?.time, t.guest);
+    if (g.skip === "away") continue;
+    if (g.skip === "conflict") { record({ ...base, status: "conflict", note: g.note }); continue; }
+    if (g.note && !base.note) base.note = g.note;
+    if (s.status === "already_entered") { record({ ...base, status: "submitted", note: "pre-existing" }); ownerSubmitted.push(base); continue; }
+    if (!s.eventId) { record({ ...base, status: "not_offered" }); continue; }
+    if (DRY) { log(`DRY would enter ${P.label} ${t.show} ${date} (#${s.eventId})`); ownerSubmitted.push(base); continue; }
+    const r = await skill(P.site, "lottery-enter", P.url, enterParams(s.eventId));
+    skillLog(`${P.site}/lottery-enter`, "lottery-enter", r.ok ? null : r.error, { show: t.show });
+    if (r.ok && r.entered) { record({ ...base, status: "submitted" }); ownerSubmitted.push(base); }
+    else if (r.error === "already_entered") { record({ ...base, status: "submitted", note: "pre-existing" }); ownerSubmitted.push(base); }
+    else if (["captcha_challenge", "not_logged_in", "no_drawings_window"].includes(r.error)) {
+      record({ ...base, status: "blocked", note: r.error });
+      blockers.push(`${P.label} stopped: ${r.error}`);
+      break;
+    } else {
+      const tr = await triageUnknown(r, { platform: P.key, site: P.site, show: t.show },
+        () => skill(P.site, "lottery-enter", P.url, enterParams(s.eventId)));
+      if ((tr.r.ok && tr.r.entered) || tr.r.error === "already_entered") {
+        record({ ...base, status: "submitted", ...(tr.r.error ? { note: "pre-existing" } : {}) });
+        ownerSubmitted.push(base);
+      } else recordFailure(base, tr.r, tr.c, blockers, tr.retriedFrom);
+    }
+  }
+
+  // Each mirror entrant enters the owner's submitted set on their own account, in their own Chrome.
+  if (ownerSubmitted.length) for (const m of P.mirror || []) await mirrorPass(P, m, ownerSubmitted, blockers);
+}
+
+async function mirrorPass(P, M, ownerRows, blockers) {
+  const host = M.cdp_host;
+  const who = M.label || M.entrant;
+  const enterParams = (eventId) => ({ eventId: String(eventId), ticketCount: TICKETS, dryRun: false, confirm: true });
+  if (!host || !(await cdpUp(host))) { blockers.push(`${who}'s Chrome (port ${portOf(host)}) isn't answering — ${who}'s ${P.label} entries were skipped`); return; }
+  const list = await skill(P.site, "lottery-list-active", P.url, {}, host);
+  skillLog(`${P.site}/lottery-list-active`, "lottery-list-active", list.error === "not_logged_in" ? "not_logged_in" : null, { entrant: M.entrant, showCount: list.shows?.length || 0 });
+  if (list.error === "not_logged_in") {
+    record({ show: ownerRows[0].show, entrant: M.entrant, platform: P.key, date: ownerRows[0].date, status: "blocked", note: `session signed out on port ${portOf(host)}` });
+    blockers.push(`${who}'s ${P.label} session is signed out (port ${portOf(host)}) — it needs a one-time manual login; your own entries still went in`);
+    return;
+  }
+  if (list.state === "no_drawings_yet") return;
+  const theirs = new Map((list.shows || []).map((s) => [String(s.eventId), s]));
+  for (const o of ownerRows) {
+    const row = { show: o.show, entrant: M.entrant, platform: P.key, date: o.date, eventId: o.eventId, ...(o.note ? { note: o.note } : {}) };
+    if (done.has(entryKey(row, OWNER))) continue;
+    if (theirs.get(String(o.eventId))?.status === "already_entered") { record({ ...row, status: "submitted", note: "pre-existing" }); continue; }
+    if (DRY) { log(`DRY would enter ${who} ${o.show} ${o.date}`); continue; }
+    const r = await skill(P.site, "lottery-enter", P.url, enterParams(o.eventId), host);
+    skillLog(`${P.site}/lottery-enter`, "lottery-enter", r.ok ? null : r.error, { show: o.show, entrant: M.entrant });
+    if ((r.ok && r.entered) || r.error === "already_entered") record({ ...row, status: "submitted", ...(r.error ? { note: "pre-existing" } : {}) });
+    else if (["captcha_challenge", "not_logged_in"].includes(r.error)) { record({ ...row, status: "blocked", note: r.error }); blockers.push(`${who}'s ${P.label} entries stopped: ${r.error}`); break; }
+    else {
+      const tr = await triageUnknown(r, { platform: P.key, site: P.site, show: o.show, entrant: M.entrant },
+        () => skill(P.site, "lottery-enter", P.url, enterParams(o.eventId), host));
+      if ((tr.r.ok && tr.r.entered) || tr.r.error === "already_entered") record({ ...row, status: "submitted", ...(tr.r.error ? { note: "pre-existing" } : {}) });
+      else recordFailure(row, tr.r, tr.c, blockers, tr.retriedFrom);
+    }
+  }
+}
+
+// ── form-email platforms: submit the entry form, finalise from the email ──
+
+async function formEmail(P, { target, gateDate, blockers, guestNote }) {
+  const profile = readJson(F.profile, null);
+  const list = await skill(P.site, "lottery-list-active", P.url, { fetchPerfIds: true });
+  skillLog(`${P.site}/lottery-list-active`, "lottery-list-active", list.ok === false && !list.shows ? list.error : null, { showCount: list.shows?.length || 0 });
+  if (list.ok === false && !list.shows) { blockers.push(`${P.label} list failed (${list.error})`); return; }
+  if (list.windowDiagnostic) { log(`${P.label} outside its entry window (no perfIds)`); return; }
+  if (!profile?.email) blockers.push(`${path.basename(F.profile)} is missing ${P.label} form fields`);
+  const retryCodes = ["captcha_invalid", "cloudflare_challenge"];
+  for (const s of profile?.email ? list.shows || [] : []) {
+    for (const p of s.performances || []) {
+      const pd = parseStamp(p.dateTimeText, P.date_format);
+      const date = pd?.date || today;
+      const t = target(s.title, date);
+      if (!t) continue;
+      const base = { show: t.show, platform: P.key, date, perfId: p.perfId, ...(t.guest ? { note: guestNote } : {}) };
+      if (done.has(entryKey(base, OWNER))) continue;
+      const g = await gateDate(date, pd?.time, t.guest);
+      if (g.skip === "away") continue;
+      if (g.skip === "conflict") { record({ ...base, status: "conflict", note: g.note }); continue; }
+      if (g.note && !base.note) base.note = g.note;
+      if (DRY) { log(`DRY would enter ${P.label} ${t.show} ${date} (perf ${p.perfId})`); continue; }
+      const params = {
+        firstName: profile.firstName, lastName: profile.lastName, email: profile.email,
+        dobMonth: profile.dobMonth, dobDay: profile.dobDay, dobYear: profile.dobYear,
+        zip: profile.zip, country: profile.country, ticketCount: TICKETS, dryRun: false, confirm: true,
+      };
+      const url = p.popupUrl || String(P.entry_url || "").split("{perfId}").join(String(p.perfId));
+      let r = await skill(P.site, "lottery-enter", url, params);
+      if (retryCodes.includes(r.error)) {
+        await new Promise((res) => setTimeout(res, 5000));
+        r = await skill(P.site, "lottery-enter", url, params);
+      }
+      if ((r.ok && r.entered) || r.error === "tab_navigated_mid_eval") {
+        // The email, not the submit return, is the source of truth — finalised below.
+        record({ ...base, status: "pending_validation", submit_ms: Date.now() });
+      } else if (["form_not_found", "entry_window_closed"].includes(r.error)) {
+        record({ ...base, status: "blocked", note: r.error });
+        skillLog(`${P.site}/lottery-enter`, "lottery-enter", r.error, { show: t.show });
+      } else if (retryCodes.includes(r.error)) {
+        record({ ...base, status: "error", note: r.error });
+        skillLog(`${P.site}/lottery-enter`, "lottery-enter", r.error, { show: t.show });
+        blockers.push(`${P.label} ${r.error} — the automation profile may have lost Cloudflare trust and need a manual browse`);
+      } else {
+        skillLog(`${P.site}/lottery-enter`, "lottery-enter", r.error || "submit_no_result", { show: t.show });
+        const tr = await triageUnknown(r, { platform: P.key, site: P.site, show: t.show },
+          () => skill(P.site, "lottery-enter", url, params));
+        if ((tr.r.ok && tr.r.entered) || tr.r.error === "tab_navigated_mid_eval") {
+          record({ ...base, status: "pending_validation", submit_ms: Date.now() });
+        } else if (tr.c) recordFailure(base, tr.r, tr.c, blockers, tr.retriedFrom);
+        else record({ ...base, status: "error", note: r.error || "no-result" });
+      }
+    }
+  }
+  await finalizeByEmail(P, rows.filter((r) => r.platform === P.key && r.status === "pending_validation"));
+}
+
+const VERIFY_ACTION = `({ execute: async function () {
+  await new Promise(function (r) { setTimeout(r, 2500); });
+  return { content: [{ type: "text", text: JSON.stringify({ ok: true, text: (document.body && document.body.innerText || "").slice(0, 3000) }) }] };
+} })`;
+
+/** Finalisation: the confirm link, or the verified-address "entry received" shortcut. */
+async function finalizeByEmail(P, pending) {
+  if (!pending.length) return;
+  const em = P.emails || {};
+  const marker = String(em.received_marker || RECEIVED_MARKER).toLowerCase();
+  const queries = [em.verify, em.received].filter(Boolean);
+  const waitMin = Number(em.wait_min) || 10;
+  const deadline = Date.now() + (queries.length ? waitMin * 60_000 : 0);
+  const seen = new Set();
+  while (pending.some((r) => r.status === "pending_validation") && Date.now() < deadline) {
+    await new Promise((res) => setTimeout(res, 60_000));
+    let ids = [];
+    try {
+      for (const q of queries) ids.push(...(await gmail.search(q)));
+    } catch (e) { log(`gmail search failed: ${e.message}`); continue; }
+    for (const id of ids) {
+      if (seen.has(id)) continue;
+      let m;
+      try { m = await gmail.getMessage(id); } catch (e) { log(`gmail get ${id} failed: ${e.message}`); continue; }
+      seen.add(id);
+      for (const row of pending.filter((r) => r.status === "pending_validation")) {
+        if (m.internalDate && row.submit_ms && m.internalDate < row.submit_ms - 60_000) continue;
+        if (m.subject.toLowerCase().includes(marker)) {
+          if (!receivedMatches(m.subject, row, marker)) continue;
+          const q = quantityRequested(m.text);
+          row.status = "submitted";
+          row.note = q === TICKETS ? "entry-received email (verified address)" : `entry-received email, quantity ${q ?? "unreadable"}`;
+          skillLog(`${P.site}/lottery-enter`, "lottery-enter", null, { show: row.show, via: "entry_received" });
+          break;
+        }
+        const link = verifyLink([...m.links, m.text].join("\n"), row.perfId);
+        if (!link) continue;
+        const r = await runActionCdp({ url: link, actionBlock: VERIFY_ACTION, params: {}, cdpHost: OWNER_CDP }).catch(() => null);
+        let pageText = "";
+        try { pageText = JSON.parse(r?.result?.content?.[0]?.text || "{}").text || ""; } catch {}
+        const t = pageText.toLowerCase();
+        // The platform's own fixed confirmation copy ("your entry has already been validated" / "entry validated" / "confirmed").
+        if (t.includes("validated") || t.includes("confirmed")) {
+          row.status = "submitted"; row.note = "email confirm link validated";
+          skillLog(`${P.site}/lottery-enter`, "lottery-enter", null, { show: row.show, via: "verify_link" });
+        } else {
+          row.note = "confirm link opened, validation not shown";
+        }
+        break;
+      }
+    }
+  }
+  for (const row of pending.filter((r) => r.status === "pending_validation")) {
+    skillLog(`${P.site}/lottery-enter`, "lottery-enter", "pending_validation_timeout", { show: row.show });
+    row.note ||= `no confirmation email within ${waitMin} min`;
+  }
+}
+
+// ── Summary ───────────────────────────────────────────────────────────────
+
+function summary(rs, blockers) {
+  const fmt = (d) => new Date(`${d}T12:00:00Z`).toLocaleDateString("en-US", { month: "short", day: "numeric", timeZone: "UTC" });
+  const by = new Map();
+  for (const r of rs) {
+    const k = r.show;
+    if (!by.has(k)) by.set(k, { dates: new Map(), mirror: new Map(), pending: new Map(), conflicts: [], errors: [], permanent: [] });
+    const g = by.get(k);
+    if (r.status === "submitted") {
+      if (r.entrant && r.entrant !== OWNER) {
+        const m = g.mirror.get(r.platform) || new Map();
+        m.set(r.entrant, (m.get(r.entrant) || 0) + 1);
+        g.mirror.set(r.platform, m);
+      } else {
+        if (!g.dates.has(r.platform)) g.dates.set(r.platform, new Set());
+        g.dates.get(r.platform).add(r.date);
+      }
+    } else if (r.status === "pending_validation") g.pending.set(r.platform, (g.pending.get(r.platform) || 0) + 1);
+    else if (r.status === "conflict") g.conflicts.push(r.date);
+    else if (r.status === "failed_permanent") g.permanent.push(`${fmt(r.date)} (${String(r.note || "").split(": ").slice(1).join(": ") || "can't be entered"})`);
+    else if (["error", "blocked"].includes(r.status)) g.errors.push(r.note || r.status);
+  }
+  const lines = [];
+  for (const [show, g] of by) {
+    const parts = [];
+    for (const key of ALL_KEYS) {
+      const n = g.dates.get(key)?.size || 0;
+      if (!n) continue;
+      const extra = [...(g.mirror.get(key) || new Map())].map(([who, c]) => ` (+${c} for ${mirrorLabel(who)})`).join("");
+      parts.push(`${label(key)} ${n} date${n > 1 ? "s" : ""}${extra}`);
+    }
+    for (const [key, n] of g.pending) parts.push(`${n} ${label(key)} still waiting on the confirmation email`);
+    if (g.conflicts.length) parts.push(`skipped ${g.conflicts.map(fmt).join(", ")} for a calendar conflict`);
+    if (g.permanent.length) parts.push(`won't retry ${g.permanent.join(", ")}`);
+    if (g.errors.length) parts.push(`errors: ${[...new Set(g.errors)].join(", ")}`);
+    if (parts.length) lines.push(`• ${show} — ${parts.join("; ")}`);
+  }
+  if (!lines.length && !blockers.length) return null;
+  let msg = lines.length ? `🎟️ ${CFG.title} entries for today:\n${lines.join("\n")}` : `🎟️ ${CFG.title} — nothing got entered today.`;
+  if (blockers.length) msg += `\n\nNeeds a look: ${[...new Set(blockers)].join("; ")}.`;
+  return msg;
+}
+
+function send(msg) {
+  try {
+    execFileSync(path.join(BIN, "jori-send-curl"), ["--evidence-as-of", "live", "--intent", CFG.intent, msg], { stdio: "inherit", timeout: 120_000 });
+  } catch (e) { log(`send failed: ${e.message}`); }
+}
+
+function closeTabs() {
+  if (!(CFG.close_tabs || []).length) return;
+  try {
+    execFileSync(path.join(BIN, "chrome-close-tabs"), CFG.close_tabs, { stdio: "ignore", timeout: 30_000 });
+  } catch {}
+}
+
+main().catch((e) => { log(`FATAL ${e.stack || e}`); closeTabs(); process.exit(1); });

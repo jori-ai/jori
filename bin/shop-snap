@@ -1,0 +1,91 @@
+#!/usr/bin/env python3
+"""shop-snap — put a shop-Chrome screenshot (a seat map, an option) in the chat.
+
+Requirement for ticket purchases: show the options so the user can decide
+whether the extra cost is worth it, with a seat map that marks the seats when
+one helps. The chat client renders a bare Supabase Storage URL as an inline
+image, so a picture is an upload plus `jori-send-curl --media <url>`.
+
+Usage:
+  shop-snap <png>            upload, print the public URL
+  shop-snap --shot <png>     screenshot the shop Chrome (CDP :9224) to <png> first,
+                             with every card field and payment frame covered
+                             (`purchase shot`)
+
+Names are random (not guessable) and the bucket is the public-read one place-map
+and day-path already use. Upload seat maps and listings only: never a page that
+shows a card, an address or an order number.
+"""
+import os, sys, secrets, subprocess, urllib.request
+
+_BIN = os.path.dirname(os.path.realpath(__file__))
+sys.path.insert(0, os.path.join(os.path.dirname(_BIN), "lib"))
+import places_local  # noqa: E402
+
+REPO = places_local.install_root()
+ENV_FILE = os.path.join(REPO, ".env")
+BUCKET, PREFIX = "daily-photos", "shop-snaps"
+
+
+def supabase_url(env):
+    """SUPABASE_URL (.env or environment), else https://<supabase_project>.supabase.co
+    from agent/local/instance.json (JORI_SUPABASE_PROJECT overrides); "" when none."""
+    url = env.get("SUPABASE_URL") or os.environ.get("SUPABASE_URL")
+    if url:
+        return url.rstrip("/")
+    project = os.environ.get("JORI_SUPABASE_PROJECT")
+    if not project:
+        try:
+            import json
+            with open(os.path.join(places_local.local_dir(), "instance.json")) as fh:
+                project = (json.load(fh) or {}).get("supabase_project")
+        except (OSError, ValueError):
+            project = None
+    return f"https://{project}.supabase.co" if project else ""
+
+
+def load_env():
+    out = {}
+    if os.path.exists(ENV_FILE):
+        for line in open(ENV_FILE):
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                k, v = line.split("=", 1)
+                out[k.strip()] = v.strip().strip('"').strip("'")
+    return out
+
+
+def main():
+    args = sys.argv[1:]
+    if not args or args[0] in ("-h", "--help"):
+        print(__doc__.strip()); sys.exit(0 if args else 64)
+    if args[0] == "--shot":
+        if len(args) < 2:
+            print("usage: shop-snap --shot <png>", file=sys.stderr); sys.exit(64)
+        png = args[1]
+        # Never an uncovered picture of a checkout: this one goes to public storage.
+        subprocess.run([os.path.join(REPO, "bin/purchase"), "shot", png],
+                       check=True, capture_output=True, timeout=60)
+    else:
+        png = args[0]
+    if not os.path.exists(png) or os.path.getsize(png) < 2000:
+        print(f"shop-snap: no usable image at {png}", file=sys.stderr); sys.exit(2)
+    env = load_env()
+    base = supabase_url(env)
+    if not base:
+        print("shop-snap: no Supabase project configured (SUPABASE_URL or instance supabase_project)", file=sys.stderr); sys.exit(2)
+    key = (env.get("SUPABASE_SERVICE_ROLE_KEY") or os.environ.get("SUPABASE_SERVICE_ROLE_KEY"))
+    if not key:
+        print("shop-snap: no SUPABASE_SERVICE_ROLE_KEY in .env", file=sys.stderr); sys.exit(2)
+    obj = f"{PREFIX}/{secrets.token_hex(12)}.png"
+    req = urllib.request.Request(f"{base}/storage/v1/object/{BUCKET}/{obj}",
+                                 data=open(png, "rb").read(), method="POST", headers={
+        "apikey": key, "Authorization": f"Bearer {key}", "Content-Type": "image/png"})
+    with urllib.request.urlopen(req, timeout=60) as r:
+        if r.status not in (200, 201):
+            print(f"shop-snap: upload failed: {r.status}", file=sys.stderr); sys.exit(1)
+    print(f"{base}/storage/v1/object/public/{BUCKET}/{obj}")
+
+
+if __name__ == "__main__":
+    main()

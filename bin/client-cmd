@@ -1,0 +1,99 @@
+#!/usr/bin/env node
+// client-cmd — dispatch a silent command to the Jori iOS client.
+//
+// Writes a pending row into `jori_commands`; the client is subscribed
+// to that table via Supabase realtime and will execute when a new row
+// appears. Polls for status change and prints the response.
+//
+// Usage:
+//   client-cmd <command> [payload-json]
+//   client-cmd reset_health_anchors
+//   client-cmd reset_health_anchors '{"types":"StepCount,HeartRate,ActiveEnergyBurned"}'
+//   client-cmd refresh_health_sync
+//   client-cmd get_location
+
+import { createClient } from '@supabase/supabase-js';
+import { readFileSync } from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { createRequire } from 'node:module';
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+// Load .env sitting above bin (.env).
+try {
+  const env = readFileSync(path.join(__dirname, '..', '.env'), 'utf8');
+  for (const line of env.split('\n')) {
+    const m = line.match(/^([A-Z_][A-Z0-9_]*)=(.*)$/);
+    if (m && !process.env[m[1]]) process.env[m[1]] = m[2];
+  }
+} catch {}
+
+const { supabaseUrl } = createRequire(import.meta.url)('../lib/instance.cjs');
+const SUPABASE_URL = process.env.SUPABASE_URL || supabaseUrl();
+const SUPABASE_SERVICE_KEY =
+  process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_SERVICE_KEY;
+
+if (!SUPABASE_URL) {
+  console.error('client-cmd: no Supabase project configured (agent/local/instance.json supabase_project or SUPABASE_URL)');
+  process.exit(2);
+}
+if (!SUPABASE_SERVICE_KEY) {
+  console.error('client-cmd: SUPABASE_SERVICE_ROLE_KEY not set in env');
+  process.exit(2);
+}
+
+const [, , command, payloadArg] = process.argv;
+if (!command) {
+  console.error('usage: client-cmd <command> [payload-json]');
+  console.error('commands: reset_health_anchors, refresh_health_sync, get_location, flush_location, speak, haptic');
+  console.error('  client-cmd speak \'{"text":"heading out in 10"}\'');
+  console.error('  client-cmd haptic \'{"style":"success"}\'');
+  process.exit(64);
+}
+
+let payload = null;
+if (payloadArg) {
+  try {
+    payload = JSON.parse(payloadArg);
+  } catch (e) {
+    console.error('client-cmd: payload must be valid JSON:', e.message);
+    process.exit(64);
+  }
+}
+
+const supa = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY, {
+  auth: { persistSession: false },
+});
+
+const { data: inserted, error: insErr } = await supa
+  .from('jori_commands')
+  .insert({ command, payload, status: 'pending' })
+  .select()
+  .single();
+
+if (insErr) {
+  console.error('client-cmd: insert failed:', insErr.message);
+  process.exit(1);
+}
+
+const id = inserted.id;
+console.error(`client-cmd: dispatched ${command} (${id.slice(0, 8)}…) — waiting for client…`);
+
+const deadline = Date.now() + 60_000; // 60s timeout
+while (Date.now() < deadline) {
+  await new Promise((r) => setTimeout(r, 1000));
+  const { data, error } = await supa
+    .from('jori_commands')
+    .select('status, response, completed_at')
+    .eq('id', id)
+    .single();
+  if (error) continue;
+  if (data.status === 'completed' || data.status === 'failed') {
+    process.stdout.write(
+      JSON.stringify({ id, status: data.status, response: data.response }, null, 2) + '\n',
+    );
+    process.exit(data.status === 'completed' ? 0 : 1);
+  }
+}
+console.error(`client-cmd: timeout — command ${id} still pending after 60s`);
+process.exit(3);

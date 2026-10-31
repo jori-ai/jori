@@ -1,0 +1,192 @@
+#!/usr/bin/env node
+// slack-inbox — the review surface over data/slack-inbox.jsonl.
+//
+// The log is written in real time by the slack-channel runner
+// (agent/slack-channel/index.mjs, see docs/slack-channel-setup.md):
+// every message event in the user's Slack session (kind "message"), edits
+// (kind "edit"), deletions (kind "delete") and the user's own sends via
+// slack-send (kind "sent"). Older rows from the retired slack-poll job
+// (source "poll") share the same fields and still read here.
+//
+// Subcommands:
+//   slack-inbox [recent] [filters]   read recent messages (default)
+//   slack-inbox <shortcut>           a person shortcut: their recent activity + your DMs
+//                                    with them (agent/local/config/slack-inbox.json
+//                                    {"shortcuts": {"<name>": "<user filter>"}})
+//   slack-inbox since / ingest       legacy helpers of the retired poller (kept for old callers)
+//
+// Reader filters: --limit N  --since <30m|6h|2d|ISO>  --user <str>  --channel <str>
+//                 --reason <dm|mpim|mention>  --kind <message,edit,delete,sent|all>
+//                 --thread <ts>  --no-mine  --json
+//
+// Log:   data/slack-inbox.jsonl      (gitignored — sensitive Slack DM content)
+
+import fs from "node:fs";
+import path from "node:path";
+import crypto from "node:crypto";
+import { createRequire } from "node:module";
+
+const require = createRequire(import.meta.url);
+const { instance, localConfig } = require("../lib/instance.cjs");
+const { installRoot } = require("../lib/root.cjs");
+const DATA = path.join(installRoot(), "data");
+const SHORTCUTS = localConfig("slack-inbox", { shortcuts: {} }).shortcuts || {};
+const INBOX = path.join(DATA, "slack-inbox.jsonl");
+const STATE = path.join(DATA, "slack-poll-state.json");
+
+const BACKFILL_CAP_S = 43200; // 12h — covers the overnight poll gate without unbounded backfill
+const DEFAULT_FIRST_S = 1800; // 30m — first run / no prior state
+const OVERLAP_S = 120;        // re-fetch a 2-min overlap each run; content-hash dedup removes repeats
+const SEEN_TTL_MS = 3 * 86400 * 1000; // prune dedup hashes after 3 days
+
+const argv = process.argv.slice(2);
+const sub = argv[0] && !argv[0].startsWith("--") ? argv[0] : "recent";
+function arg(name, fallback = null) { const i = argv.indexOf(name); return i > -1 && argv[i + 1] ? argv[i + 1] : fallback; }
+function flag(name) { return argv.includes(name); }
+function nowUnix() { return Math.floor(Date.now() / 1000); }
+
+function readState() {
+  try { return JSON.parse(fs.readFileSync(STATE, "utf8")); }
+  catch { return { last_run: null, last_run_unix: null, last_count: 0, seen: {} }; }
+}
+function writeState(s) {
+  fs.mkdirSync(path.dirname(STATE), { recursive: true });
+  fs.writeFileSync(STATE, JSON.stringify(s, null, 2) + "\n");
+}
+function hashKey(m) {
+  const chan = (m.channel_name || m.channel_id || m.channel_type || "").toLowerCase();
+  const who = (m.user_name || m.user_id || "").toLowerCase();
+  const text = (m.text || "").trim().toLowerCase();
+  return crypto.createHash("sha1").update(`${chan}|${who}|${text}`).digest("hex");
+}
+
+// ── since: compute the `after` unix ts for the next poll ────────────────────
+if (sub === "since") {
+  const minutes = arg("--minutes");
+  const now = nowUnix();
+  let after;
+  if (minutes) {
+    after = now - Number(minutes) * 60;
+  } else {
+    const st = readState();
+    if (st.last_run_unix) {
+      after = st.last_run_unix - OVERLAP_S;
+      if (now - after > BACKFILL_CAP_S) after = now - BACKFILL_CAP_S; // cap backfill (e.g. after the night gate)
+    } else {
+      after = now - DEFAULT_FIRST_S;
+    }
+  }
+  process.stdout.write(String(after) + "\n");
+  process.exit(0);
+}
+
+// ── ingest: dedup a JSON array of messages and append the new ones ──────────
+if (sub === "ingest") {
+  let raw = "";
+  try { raw = fs.readFileSync(0, "utf8"); } catch { raw = ""; }
+  raw = raw.trim();
+  if (!raw) { console.log("ingested 0 new (0 dup) — empty input"); process.exit(0); }
+  let items;
+  try {
+    const parsed = JSON.parse(raw);
+    items = Array.isArray(parsed) ? parsed : Array.isArray(parsed.messages) ? parsed.messages : null;
+  } catch (err) { console.error(`ingest: bad JSON on stdin: ${err.message}`); process.exit(1); }
+  if (!items) { console.error("ingest: expected a JSON array (or {messages:[...]})"); process.exit(1); }
+
+  const st = readState();
+  st.seen = st.seen || {};
+  // prune stale dedup hashes
+  const cutoff = Date.now() - SEEN_TTL_MS;
+  for (const [k, iso] of Object.entries(st.seen)) {
+    if (Date.parse(iso) < cutoff) delete st.seen[k];
+  }
+
+  fs.mkdirSync(path.dirname(INBOX), { recursive: true });
+  const nowIso = new Date().toISOString();
+  let added = 0, dup = 0, empty = 0;
+  for (const m of items) {
+    const text = (m.text || "").trim();
+    if (!text) { empty++; continue; }
+    const key = hashKey(m);
+    if (st.seen[key]) { dup++; continue; }
+    const entry = {
+      ts: nowIso,
+      kind: "message",
+      source: "poll",
+      channel_id: m.channel_id || null,
+      channel_name: m.channel_name || null,
+      channel_type: m.channel_type || null,
+      user_id: m.user_id || null,
+      user_name: m.user_name || null,
+      reason: m.reason || null,
+      slack_ts: m.slack_ts || null,
+      text,
+    };
+    fs.appendFileSync(INBOX, JSON.stringify(entry) + "\n");
+    st.seen[key] = nowIso;
+    added++;
+  }
+  st.last_run = nowIso;
+  st.last_run_unix = nowUnix();
+  st.last_count = added;
+  writeState(st);
+  console.log(`ingested ${added} new (${dup} dup${empty ? `, ${empty} empty` : ""})`);
+  process.exit(0);
+}
+
+// ── reader (recent / a person shortcut / default) ───────────────────────────
+const shortcut = Object.prototype.hasOwnProperty.call(SHORTCUTS, sub) ? String(SHORTCUTS[sub] || sub) : null;
+const limit = Number(arg("--limit", shortcut ? 30 : 20));
+const sinceRaw = arg("--since");
+let userFilter = (arg("--user") || "").toLowerCase();
+const channelFilter = (arg("--channel") || "").toLowerCase();
+const reasonFilter = (arg("--reason") || "").toLowerCase();
+const kindArg = (arg("--kind") || "message,edit,sent").toLowerCase();
+const kinds = kindArg === "all" ? null : new Set(kindArg.split(","));
+const threadFilter = arg("--thread");
+const noMine = flag("--no-mine");
+const asJson = flag("--json");
+if (shortcut && !userFilter) userFilter = shortcut.toLowerCase();
+
+function sinceMs(s) {
+  if (!s) return null;
+  const m = /^(\d+)([mhd])$/.exec(s);
+  if (m) { const n = Number(m[1]); return Date.now() - n * { m: 60e3, h: 3600e3, d: 86400e3 }[m[2]]; }
+  const t = Date.parse(s);
+  return Number.isFinite(t) ? t : null;
+}
+const sinceCutoff = sinceMs(sinceRaw);
+
+if (!fs.existsSync(INBOX)) {
+  console.error("No Slack inbox yet (data/slack-inbox.jsonl missing). Is the slack-channel runner running? See docs/slack-channel-setup.md.");
+  process.exit(0);
+}
+
+let rows = [];
+for (const line of fs.readFileSync(INBOX, "utf8").split("\n").filter(Boolean)) {
+  try { rows.push(JSON.parse(line)); } catch { /* skip malformed */ }
+}
+if (kinds) rows = rows.filter((r) => kinds.has(r.kind));
+if (noMine) rows = rows.filter((r) => !r.from_me);
+if (threadFilter) rows = rows.filter((r) => r.thread_ts === threadFilter || r.slack_ts === threadFilter);
+if (sinceCutoff) rows = rows.filter((r) => Date.parse(r.ts) >= sinceCutoff);
+if (userFilter) rows = rows.filter((r) => (r.user_name || "").toLowerCase().includes(userFilter) || (r.user_id || "").toLowerCase().includes(userFilter));
+if (channelFilter) rows = rows.filter((r) => (r.channel_name || "").toLowerCase().includes(channelFilter) || (r.channel_id || "").toLowerCase().includes(channelFilter));
+if (reasonFilter) rows = rows.filter((r) => (r.reason || "").toLowerCase().includes(reasonFilter));
+rows = rows.slice(-limit);
+
+if (asJson) { for (const r of rows) console.log(JSON.stringify(r)); process.exit(0); }
+if (rows.length === 0) { console.log("(no matching Slack messages)"); process.exit(0); }
+for (const r of rows) {
+  const when = new Date(r.ts).toLocaleString("en-US", { timeZone: instance().tz || undefined, month: "short", day: "numeric", hour: "numeric", minute: "2-digit" });
+  const who = r.user_name || r.user_id || "unknown";
+  const where = r.channel_type === "im" ? `DM${r.from_me && r.channel_name ? ` with ${r.channel_name}` : ""}`
+    : r.channel_type === "mpim" ? "group DM"
+    : r.channel_name ? (["channel", "private"].includes(r.channel_type) ? `#${r.channel_name}` : r.channel_name)
+    : (r.channel_type || r.channel_id || "?");
+  const tags = [r.reason, r.kind !== "message" ? r.kind : null, r.thread_ts ? "thread" : null].filter(Boolean);
+  const tag = tags.length ? ` [${tags.join(", ")}]` : "";
+  console.log(`${when} — ${r.from_me ? "you" : who} in ${where}${tag}`);
+  console.log(`  ${(r.text || "").replace(/\n/g, "\n  ")}`);
+}
+console.log(`\n${rows.length} message(s).`);

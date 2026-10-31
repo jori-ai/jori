@@ -1,0 +1,862 @@
+#!/usr/bin/env python3
+"""photos — index Apple Photos library into Supabase, link to location segments.
+
+Commands:
+  photos sync [--date YYYY-MM-DD]       default: yesterday (home zone)
+  photos sync --from D --to D           backfill range (inclusive); also how
+                                        detected_text gets filled for history
+  photos at <date>                      photos for a day
+  photos segment <segment_id>           photos linked to one segment
+  photos find "<query>"                 date-based lookup (accepts YYYY-MM-DD or 'yesterday')
+  photos show <uuid>                    export thumb to cache, open in Preview
+  photos thumb <uuid> [--size N]        export thumb, print path (no open)
+  photos thumb-url <uuid> [--refresh]   ensure a ~900px JPEG is uploaded to the
+                                        `daily-photos` Supabase storage bucket;
+                                        write photos.thumb_url; print the URL.
+  photos embed-img <uuid> [--caption]   emit an <img> tag sourced from thumb_url
+                                        (NEVER base64 — see daily-summary.md).
+  photos embed-day <date> [--per-loc N] deterministic per-location media HTML for
+                                        a day: up to N (default 3) <img> per place,
+                                        photos + video poster-frames (labeled).
+                                        Used by daily-summary to guarantee media.
+  photos backfill-thumbs [--date D]     ensure thumb_url for every photo on D.
+  photos stats                          counts
+  photos unmatched [--date D]           list photos with no segment
+"""
+import sys, os, glob, json, math, shutil, subprocess, urllib.request, urllib.parse
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "lib"))
+import places_local  # noqa: E402
+import supabase_local  # noqa: E402
+
+SUPABASE_URL = supabase_local.supabase_url()
+THUMB_DIR = places_local.data_path("photo-thumbs")
+# The home zone: "yesterday", a day's bounds and the clock times printed.
+HOME_TZ = ZoneInfo(supabase_local.home_tz())
+# Tokens kept from Photos' OCR per image. A storefront needs a handful; a
+# photographed menu or document returns hundreds that name nothing.
+MAX_DETECTED_TEXT = 60
+
+KEY = supabase_local.service_key()
+if not KEY or not SUPABASE_URL:
+    print("ERROR: no Supabase configured (SUPABASE_SERVICE_ROLE_KEY in .env, supabase_project in agent/local/instance.json)", file=sys.stderr)
+    sys.exit(1)
+
+HEADERS = {
+    "apikey": KEY,
+    "Authorization": f"Bearer {KEY}",
+    "Content-Type": "application/json",
+}
+
+def _rest(path, method="GET", body=None, query=None, prefer=None):
+    """query: list of (k,v) tuples to allow duplicate keys."""
+    url = f"{SUPABASE_URL}/rest/v1/{path}"
+    if query:
+        url += "?" + "&".join(f"{urllib.parse.quote(k, safe='')}={urllib.parse.quote(str(v), safe='.,():*')}" for k,v in query)
+    data = json.dumps(body).encode() if body is not None else None
+    h = dict(HEADERS)
+    if prefer: h["Prefer"] = prefer
+    req = urllib.request.Request(url, data=data, headers=h, method=method)
+    with urllib.request.urlopen(req, timeout=30) as r:
+        txt = r.read().decode()
+        return (json.loads(txt) if txt else []), dict(r.headers)
+
+def _resolve_date(s):
+    s = (s or "").lower()
+    home_today = datetime.now(HOME_TZ).date()
+    if s in ("", "yesterday"): return (home_today - timedelta(days=1)).isoformat()
+    if s == "today": return home_today.isoformat()
+    datetime.strptime(s, "%Y-%m-%d")
+    return s
+
+def _day_bound(date_str, hms):
+    """`date_str` at local time `hms` (HH:MM:SS) in the home zone, as ISO."""
+    return datetime.fromisoformat(f"{date_str}T{hms}").replace(tzinfo=HOME_TZ).isoformat()
+
+def _haversine(lat1, lng1, lat2, lng2):
+    if None in (lat1, lng1, lat2, lng2): return float("inf")
+    R = 6371000.0
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dp = math.radians(lat2 - lat1); dl = math.radians(lng2 - lng1)
+    a = math.sin(dp/2)**2 + math.cos(p1)*math.cos(p2)*math.sin(dl/2)**2
+    return 2 * R * math.asin(math.sqrt(a))
+
+def _osxphotos_bin():
+    """Absolute path to osxphotos. pipx installs it under ~/.local/bin, which is
+    on the interactive-shell PATH but NOT on cron's — resolving it here keeps
+    cron-driven callers (trigger-photos-backfill-thumbs) working."""
+    found = shutil.which("osxphotos")
+    if found:
+        return found
+    for c in (os.path.expanduser("~/.local/bin/osxphotos"), "/opt/homebrew/bin/osxphotos"):
+        if os.path.exists(c):
+            return c
+    raise RuntimeError(
+        "osxphotos not found on PATH or in ~/.local/bin — thumbnails cannot be exported")
+
+def _library_args():
+    """`--library <path>` so osxphotos never has to look the library up.
+
+    Without it, osxphotos finds the library by reading Photos.app's own
+    preferences plist inside its sandbox container
+    (~/Library/Containers/com.apple.Photos/...). macOS guards other apps'
+    containers ("access data from other apps"), and from cron that open()
+    blocks forever waiting on a consent prompt nothing can show — scheduled
+    runs have hung in get_last_library_path until the 600s timeout. The library path itself is ordinary, so naming it sidesteps
+    the whole lookup. Override with PHOTOS_LIBRARY."""
+    lib = _library_path()
+    return ["--library", lib] if lib else []
+
+def _library_path():
+    lib = os.environ.get("PHOTOS_LIBRARY") or os.path.expanduser("~/Pictures/Photos Library.photoslibrary")
+    return lib if os.path.isdir(lib) else None
+
+def _library_derivative(uuid):
+    """The largest preview JPEG Photos keeps for an asset, or None.
+
+    An asset whose original is not on this Mac has nothing for `osxphotos
+    export` to write, even with --preview-if-missing: a photo received in
+    Messages (`syndicated`, `ismissing`, path null) or an original iCloud never
+    downloaded. Photos still keeps its own preview of it under the library's
+    derivatives, sharded by the uuid's first character, and for shared-with-you
+    assets under a scope (`scopes/syndication/...`). A photo received in
+    Messages was once in the day but never in the email, because export
+    produced no file and nothing looked here."""
+    lib = _library_path()
+    if not lib:
+        return None
+    roots = [os.path.join(lib, "resources", "derivatives")]
+    roots += sorted(glob.glob(os.path.join(lib, "scopes", "*", "resources", "derivatives")))
+    found = set()
+    for root in roots:
+        for shard in {uuid[:1].upper(), uuid[:1].lower()}:
+            for sub in (shard, os.path.join("masters", shard)):
+                found.update(glob.glob(os.path.join(root, sub, f"{uuid}_*")))
+    found = [f for f in found
+             if f.lower().endswith((".jpg", ".jpeg")) and os.path.getsize(f) > 0]
+    return max(found, key=os.path.getsize) if found else None
+
+def _run_osxphotos(from_iso, to_iso):
+    r = subprocess.run(
+        [_osxphotos_bin(), "query", *_library_args(), "--from-date", from_iso, "--to-date", to_iso, "--json"],
+        capture_output=True, text=True, timeout=600)
+    if r.returncode != 0:
+        raise RuntimeError(f"osxphotos failed: {r.stderr[-400:]}")
+    return json.loads(r.stdout) if r.stdout.strip() else []
+
+def _media_type(p):
+    if p.get("screenshot"): return "screenshot"
+    if p.get("screen_recording"): return "screen_recording"
+    if p.get("slow_mo"): return "slow_mo"
+    if p.get("time_lapse"): return "time_lapse"
+    if p.get("ismovie"): return "video"
+    if p.get("live_photo"): return "live"
+    if p.get("panorama"): return "panorama"
+    if p.get("selfie"): return "selfie"
+    if p.get("burst"): return "burst"
+    return "photo"
+
+def _self_captured(p):
+    """True only for photos the user TOOK on one of their own devices — the
+    Camera app sets imported_by to ['Camera', 'com.apple.camera']. Received
+    photos (Messages/AirDrop/downloads) and screenshots have a different import
+    source. Photo GPS is stronger evidence than phone GPS, but ONLY for
+    self-captured photos — a received photo's GPS is the sender's location, not
+    the user's. Gap-fill stop synthesis filters on this."""
+    imp = p.get("imported_by") or []
+    if isinstance(imp, list) and any("camera" in str(x).lower() for x in imp):
+        return True
+    return False
+
+def _detected_text(p):
+    """Text Apple Photos already read out of the image, via osxphotos.
+
+    Photos runs OCR on every image on-device and indexes the result; osxphotos
+    surfaces it at search_info.detected_text. It costs nothing to carry and it
+    is routinely the only thing in the frame that NAMES the place — a stop
+    shipped "unlabeled" while its photo showed an awning spelling the café's
+    name, because this field was being dropped on the floor.
+
+    The bag is lowercased, de-duplicated and alphabetically SORTED by Photos, so
+    word order is already gone; downstream must not read it as a phrase. Capped
+    because a photo of a menu or a page of text can return hundreds of tokens
+    and none of them help name a building.
+    """
+    si = p.get("search_info") or {}
+    if not isinstance(si, dict):
+        return []
+    words = si.get("detected_text") or []
+    if not isinstance(words, list):
+        return []
+    out, seen = [], set()
+    for w in words:
+        w = str(w).strip()
+        if not w or w in seen:
+            continue
+        seen.add(w)
+        out.append(w)
+    return out[:MAX_DETECTED_TEXT]
+
+def _row_from_photo(p):
+    persons = [x for x in (p.get("persons") or []) if x and x != "_UNKNOWN_"]
+    row = {
+        "uuid": p["uuid"],
+        "taken_at": p.get("date"),
+        "tz_offset_seconds": p.get("tzoffset"),
+        "latitude": p.get("latitude"),
+        "longitude": p.get("longitude"),
+        "media_type": _media_type(p),
+        "favorite": bool(p.get("favorite")),
+        "hidden": bool(p.get("hidden")),
+        "in_trash": bool(p.get("intrash")),
+        "filename": p.get("filename"),
+        "original_filename": p.get("original_filename"),
+        "width": p.get("width"),
+        "height": p.get("height"),
+        "persons": persons,
+        "keywords": p.get("keywords") or [],
+        "albums": p.get("albums") or [],
+        "labels": p.get("labels_normalized") or [],
+        # Photos' own OCR (photos.detected_text, added 2026-09-06). The
+        # classifier's labels say "sign"; this says what the sign SAYS.
+        "detected_text": _detected_text(p),
+        "title": p.get("title"),
+        "description": p.get("description"),
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    # self_captured (the photos.self_captured column). Only photos the user
+    # took place the user for gap-fill evidence; received ones carry the
+    # sender's GPS.
+    row["self_captured"] = _self_captured(p)
+    # Never add ocr_lines, device_venue, thumb_url or device_id here. The phone
+    # writes those first when the server probes it for a stop's photos
+    # (lib/photo-probe.mjs, 2026-10-08), and the merge-duplicates upsert
+    # below only overwrites the columns this row carries.
+    return row
+
+def _match(photo_row, segments):
+    t = datetime.fromisoformat(photo_row["taken_at"]).astimezone(timezone.utc)
+    lat, lng = photo_row.get("latitude"), photo_row.get("longitude")
+    match = None
+    for i, s in enumerate(segments):
+        arr = datetime.fromisoformat(s["arrived_at"].replace("Z","+00:00"))
+        if s.get("departed_at"):
+            nxt = datetime.fromisoformat(s["departed_at"].replace("Z","+00:00"))
+        elif i + 1 < len(segments):
+            nxt = datetime.fromisoformat(segments[i+1]["arrived_at"].replace("Z","+00:00"))
+        else:
+            nxt = None
+        if arr <= t and (nxt is None or t < nxt):
+            match = s; break
+    if match:
+        if lat is not None and match.get("latitude") is not None:
+            d = _haversine(lat, lng, match["latitude"], match["longitude"])
+            if d <= 500:
+                return match["id"], match.get("place_name"), "time+gps", f"dist={int(d)}m"
+        else:
+            return match["id"], match.get("place_name"), "exact_time", "no_gps"
+    if lat is not None:
+        best, best_d = None, float("inf")
+        for s in segments:
+            if s.get("latitude") is None: continue
+            d = _haversine(lat, lng, s["latitude"], s["longitude"])
+            if d < best_d: best, best_d = s, d
+        if best and best_d <= 1000:
+            return best["id"], best.get("place_name"), "gps_only", f"dist={int(best_d)}m"
+    return None, None, "unmatched", "no_match"
+
+def _fetch_segments_for_day(date_str):
+    start = (datetime.fromisoformat(_day_bound(date_str, "00:00:00")) - timedelta(hours=6)).astimezone(timezone.utc).isoformat()
+    end   = (datetime.fromisoformat(_day_bound(date_str, "23:59:59")) + timedelta(hours=6)).astimezone(timezone.utc).isoformat()
+    rows, _ = _rest("location_history", query=[
+        ("arrived_at", f"gte.{start}"),
+        ("arrived_at", f"lte.{end}"),
+        ("order", "arrived_at.asc"),
+        ("select", "id,arrived_at,departed_at,latitude,longitude,place_name,place_type,segment_type"),
+    ])
+    return rows
+
+def cmd_sync(date_str):
+    date_str = _resolve_date(date_str)
+    print(f"[sync] {date_str} — querying Apple Photos…", file=sys.stderr)
+    photos = _run_osxphotos(f"{date_str}T00:00:00", f"{date_str}T23:59:59")
+    print(f"[sync] {len(photos)} media items", file=sys.stderr)
+    if not photos:
+        print(json.dumps({"date": date_str, "count": 0})); return 0
+
+    segments = _fetch_segments_for_day(date_str)
+    print(f"[sync] {len(segments)} segments (± 6h)", file=sys.stderr)
+
+    rows = []
+    stats = {"exact_time": 0, "time+gps": 0, "gps_only": 0, "unmatched": 0}
+    for p in photos:
+        if not p.get("date"): continue
+        row = _row_from_photo(p)
+        sid, pname, conf, reason = _match(row, segments)
+        row["segment_id"] = sid
+        row["place_name"] = pname
+        row["match_confidence"] = conf
+        row["match_reason"] = reason
+        stats[conf] += 1
+        rows.append(row)
+
+    for i in range(0, len(rows), 100):
+        _rest("photos", method="POST", body=rows[i:i+100],
+              query=[("on_conflict", "uuid")],
+              prefer="resolution=merge-duplicates,return=minimal")
+
+    merged = _merge_phone_twins(rows)
+    out = {"date": date_str, "count": len(rows), "stats": stats}
+    if merged: out["phone_twins_merged"] = merged
+    print(json.dumps(out, indent=2))
+    return 0
+
+def _merge_phone_twins(rows):
+    """Fold a photo the phone wrote first into the row this sync just wrote.
+
+    The phone answers a stop's photo probe before iCloud reaches this library,
+    and its localIdentifier is not this library's uuid (one photo had one id
+    on the phone and another here), so the same photo landed twice.
+    A phone row is one carrying ocr_lines (only the phone writes that column).
+    Its phone-only columns move onto our row, then it is deleted."""
+    if not rows: return 0
+    ts = sorted(datetime.fromisoformat(r["taken_at"]) for r in rows)
+    lo = (ts[0] - timedelta(seconds=2)).astimezone(timezone.utc).isoformat()
+    hi = (ts[-1] + timedelta(seconds=2)).astimezone(timezone.utc).isoformat()
+    try:
+        phone, _ = _rest("photos", query=[
+            ("taken_at", f"gte.{lo}"), ("taken_at", f"lte.{hi}"), ("ocr_lines", "not.is.null"),
+            ("select", "uuid,taken_at,original_filename,ocr_lines,device_venue,thumb_url")])
+    except Exception as e:
+        print(f"[sync] phone-twin lookup failed: {e}", file=sys.stderr); return 0
+    ours = {r["uuid"]: r for r in rows}
+    merged = 0
+    for ph in phone:
+        if ph["uuid"] in ours: continue
+        t = datetime.fromisoformat(ph["taken_at"].replace("Z", "+00:00"))
+        twin = next((r for r in rows
+                     if abs((datetime.fromisoformat(r["taken_at"]) - t).total_seconds()) < 1
+                     and (not r.get("original_filename") or not ph.get("original_filename")
+                          or r["original_filename"] == ph["original_filename"])), None)
+        if not twin: continue
+        try:
+            _rest("photos", method="PATCH", query=[("uuid", f"eq.{twin['uuid']}")],
+                  body={k: ph[k] for k in ("ocr_lines", "device_venue", "thumb_url") if ph.get(k) is not None},
+                  prefer="return=minimal")
+            _rest("photos", method="DELETE", query=[("uuid", f"eq.{ph['uuid']}")], prefer="return=minimal")
+            merged += 1
+        except Exception as e:
+            print(f"[sync] phone-twin merge failed for {ph['uuid'][:8]}: {e}", file=sys.stderr)
+    return merged
+
+def cmd_backfill(from_d, to_d):
+    cur = datetime.fromisoformat(_resolve_date(from_d))
+    end = datetime.fromisoformat(_resolve_date(to_d))
+    while cur <= end:
+        cmd_sync(cur.date().isoformat())
+        cur += timedelta(days=1)
+    return 0
+
+def cmd_at(date_str):
+    date_str = _resolve_date(date_str)
+    rows, _ = _rest("photos", query=[
+        ("taken_at", f"gte.{_day_bound(date_str, '00:00:00')}"),
+        ("taken_at", f"lte.{_day_bound(date_str, '23:59:59')}"),
+        ("order", "taken_at.asc"),
+        ("select", "uuid,taken_at,media_type,favorite,place_name,segment_id,original_filename,latitude,longitude,persons,match_confidence"),
+    ])
+    print(json.dumps(rows, indent=2, default=str))
+    return 0
+
+def cmd_segment(sid):
+    rows, _ = _rest("photos", query=[
+        ("segment_id", f"eq.{sid}"),
+        ("order", "taken_at.asc"),
+        ("select", "uuid,taken_at,media_type,favorite,original_filename,match_confidence"),
+    ])
+    print(json.dumps(rows, indent=2, default=str))
+    return 0
+
+def _osxphotos_export(uuid):
+    # osxphotos can interactively click.confirm() on unsigned output dirs,
+    # which aborts with SIGPIPE/click.Abort() when stdin isn't a TTY. Feed "y\n"
+    # so any confirmation prompt auto-accepts. --retry isn't enough because the
+    # click.Abort raises before retry logic runs.
+    return subprocess.run(
+        [_osxphotos_bin(), "export", THUMB_DIR, *_library_args(), "--uuid", uuid,
+         "--convert-to-jpeg", "--jpeg-quality", "0.85",
+         "--filename", uuid, "--preview-if-missing", "--retry", "2",
+         "--update", "--ignore-signature"],
+        capture_output=True, text=True, timeout=120, input="y\ny\ny\n")
+
+def _osxphotos_export_preview(uuid):
+    """Export the Apple-generated PREVIEW image (a JPEG poster) for an asset.
+    For VIDEOS this is the poster frame — the only still we can show inline in
+    email (sips can't resize a .mov). `--preview-suffix ''` writes it as
+    <uuid>.jpeg so the normal resize+upload path picks it up."""
+    return subprocess.run(
+        [_osxphotos_bin(), "export", THUMB_DIR, *_library_args(), "--uuid", uuid,
+         "--preview", "--preview-suffix", "", "--filename", uuid,
+         "--retry", "2", "--update", "--ignore-signature"],
+        capture_output=True, text=True, timeout=120, input="y\ny\ny\n")
+
+
+THUMB_BUCKET = "daily-photos"
+THUMB_PREFIX = "thumbs"  # object key = thumbs/<uuid>.jpg
+
+def _thumb_public_url(uuid):
+    return f"{SUPABASE_URL}/storage/v1/object/public/{THUMB_BUCKET}/{THUMB_PREFIX}/{uuid}.jpg"
+
+def _storage_head(uuid):
+    """Return True if the thumb object already exists in the bucket."""
+    url = f"{SUPABASE_URL}/storage/v1/object/info/{THUMB_BUCKET}/{THUMB_PREFIX}/{uuid}.jpg"
+    req = urllib.request.Request(url, method="GET",
+        headers={"apikey": KEY, "Authorization": f"Bearer {KEY}"})
+    try:
+        with urllib.request.urlopen(req, timeout=15) as r:
+            return r.status == 200
+    except urllib.error.HTTPError as e:
+        if e.code == 404: return False
+        raise
+
+def _storage_upload(uuid, jpeg_path):
+    """Upload jpeg_path to daily-photos/thumbs/<uuid>.jpg (upsert). Returns public URL."""
+    url = f"{SUPABASE_URL}/storage/v1/object/{THUMB_BUCKET}/{THUMB_PREFIX}/{uuid}.jpg"
+    with open(jpeg_path, "rb") as f: data = f.read()
+    req = urllib.request.Request(url, data=data, method="POST", headers={
+        "apikey": KEY,
+        "Authorization": f"Bearer {KEY}",
+        "Content-Type": "image/jpeg",
+        "x-upsert": "true",
+        "cache-control": "public, max-age=2592000",
+    })
+    with urllib.request.urlopen(req, timeout=60) as r:
+        if r.status not in (200, 201):
+            raise RuntimeError(f"storage upload failed: {r.status}")
+    return _thumb_public_url(uuid)
+
+def _write_thumb_url(uuid, url):
+    """Patch photos.thumb_url for this uuid (fire-and-forget)."""
+    _rest("photos", method="PATCH",
+          body={"thumb_url": url},
+          query=[("uuid", f"eq.{uuid}")],
+          prefer="return=minimal")
+
+def _build_resized_jpeg(uuid, max_px=900, is_video=False):
+    """Export original (or, for videos, the preview poster) + sips to ~max_px
+    JPEG. Returns path to resized JPEG."""
+    os.makedirs(THUMB_DIR, exist_ok=True)
+    resized = os.path.join(THUMB_DIR, f"{uuid}_w{max_px}.jpg")
+    if os.path.exists(resized): return resized
+    IMG_EXT = (".jpg", ".jpeg", ".png", ".heic", ".heif", ".tiff")
+    def _imgs():
+        # Only still-image files — never a .mov, which sips can't resize.
+        return [f for f in os.listdir(THUMB_DIR)
+                if f.startswith(uuid) and not f.endswith(f"_w{max_px}.jpg")
+                and f.lower().endswith(IMG_EXT)]
+    existing = _imgs()
+    if not existing:
+        # Videos: export the Apple preview (poster-frame JPEG). Photos: original.
+        r = _osxphotos_export_preview(uuid) if is_video else _osxphotos_export(uuid)
+        existing = _imgs()
+        if not existing:
+            # Nothing exported (no original on this Mac): use Photos' own preview.
+            deriv = _library_derivative(uuid)
+            if deriv:
+                shutil.copyfile(deriv, os.path.join(THUMB_DIR, f"{uuid}.jpeg"))
+                existing = _imgs()
+        if not existing:
+            if r.returncode != 0:
+                raise RuntimeError(f"export failed: {r.stderr[-200:]}")
+            raise RuntimeError("export produced no image file")
+    src = os.path.join(THUMB_DIR, existing[0])
+    r = subprocess.run(["sips", "-Z", str(max_px), "-s", "format", "jpeg",
+                        "-s", "formatOptions", "80", src, "--out", resized],
+                       capture_output=True, text=True, timeout=60)
+    if r.returncode != 0:
+        # sips occasionally chokes on HEIC variants from Live Photos / iOS18+
+        # encodings — see 2026-04-29 self-improvement review (a HEIC case).
+        # Fall back to ImageIO via a small Python helper that uses Foundation
+        # + CGImageSource. If that also fails, raise the original sips error.
+        fallback = _heic_fallback(src, resized, max_px)
+        if fallback:
+            return resized
+        raise RuntimeError(f"sips failed: {r.stderr[-200:]}")
+    return resized
+
+
+def _heic_fallback(src, dst, max_px):
+    """Convert HEIC/HEIF to JPEG via macOS's ImageIO (Foundation +
+    CGImageSource), bypassing sips's known fragility with Live Photo HEIC
+    variants. Returns True on success, False on any failure (including
+    Python bridge unavailable). Caller falls back to raising the original
+    sips error.
+    """
+    script = f'''
+import sys
+try:
+    from Foundation import NSURL
+    from CoreFoundation import CFDictionaryCreate
+    from CoreGraphics import (
+        CGImageSourceCreateWithURL,
+        CGImageSourceCreateThumbnailAtIndex,
+        CGImageDestinationCreateWithURL,
+        CGImageDestinationAddImage,
+        CGImageDestinationFinalize,
+    )
+except Exception:
+    sys.exit(2)
+try:
+    src_url = NSURL.fileURLWithPath_("{src}")
+    dst_url = NSURL.fileURLWithPath_("{dst}")
+    source = CGImageSourceCreateWithURL(src_url, None)
+    if source is None:
+        sys.exit(3)
+    options = {{
+        "kCGImageSourceCreateThumbnailFromImageAlways": True,
+        "kCGImageSourceThumbnailMaxPixelSize": {max_px},
+        "kCGImageSourceCreateThumbnailWithTransform": True,
+    }}
+    thumb = CGImageSourceCreateThumbnailAtIndex(source, 0, options)
+    if thumb is None:
+        sys.exit(4)
+    dest = CGImageDestinationCreateWithURL(dst_url, "public.jpeg", 1, None)
+    if dest is None:
+        sys.exit(5)
+    CGImageDestinationAddImage(dest, thumb, None)
+    if not CGImageDestinationFinalize(dest):
+        sys.exit(6)
+except Exception:
+    sys.exit(7)
+'''
+    try:
+        r = subprocess.run(
+            ["/usr/bin/python3", "-c", script],
+            capture_output=True, text=True, timeout=30,
+        )
+        return r.returncode == 0 and os.path.exists(dst) and os.path.getsize(dst) > 0
+    except Exception:
+        return False
+
+def cmd_thumb_url(uuid, max_px=900, refresh=False):
+    """Ensure a ~max_px JPEG is uploaded to Supabase storage and photos.thumb_url is set.
+
+    Idempotent: if photos.thumb_url is already populated and --refresh is not set,
+    prints the cached URL and returns 0 without touching the filesystem.
+    """
+    if not refresh:
+        rows, _ = _rest("photos", query=[("uuid", f"eq.{uuid}"), ("select", "thumb_url")])
+        if rows and rows[0].get("thumb_url"):
+            print(rows[0]["thumb_url"]); return 0
+    resized = _build_resized_jpeg(uuid, max_px=max_px)
+    url = _storage_upload(uuid, resized)
+    _write_thumb_url(uuid, url)
+    print(url)
+    return 0
+
+def cmd_embed_img(uuid, max_px=900, caption=None):
+    """Print an <img> tag whose src points at the Supabase-hosted thumb.
+
+    NEVER base64 — embedding HEICs/JPEGs as data: URIs pushes emails past Gmail's
+    ~102 KB clip limit. See agent/ops-agent/jobs/daily-summary.md.
+    """
+    rows, _ = _rest("photos", query=[("uuid", f"eq.{uuid}"), ("select", "thumb_url")])
+    url = (rows[0].get("thumb_url") if rows else None)
+    if not url:
+        resized = _build_resized_jpeg(uuid, max_px=max_px)
+        url = _storage_upload(uuid, resized)
+        _write_thumb_url(uuid, url)
+    style = "max-width:100%;width:600px;border-radius:8px;display:block;margin:8px 0;"
+    print(f'<img src="{url}" style="{style}" alt="{caption or uuid}">')
+    if caption:
+        print(f'<div style="color:#888;font-size:13px;margin-bottom:12px;">{caption}</div>')
+    return 0
+
+def _thumb_url_for(uuid, max_px=900, is_video=False):
+    """Return a Supabase-hosted thumb URL for uuid, building+uploading lazily.
+    For videos, the thumb is the poster frame."""
+    rows, _ = _rest("photos", query=[("uuid", f"eq.{uuid}"), ("select", "thumb_url")])
+    url = (rows[0].get("thumb_url") if rows else None)
+    if not url:
+        resized = _build_resized_jpeg(uuid, max_px=max_px, is_video=is_video)
+        url = _storage_upload(uuid, resized)
+        _write_thumb_url(uuid, url)
+    return url
+
+def cmd_embed_day(date_str, per_loc=3):
+    """Deterministic per-location media HTML for a day: groups the day's located
+    photos AND videos by place and emits a heading + up to `per_loc` (default 3)
+    <img> per place (favorite > earliest). Videos render as their poster frame
+    with a "(video)" label. Built so daily-summary GUARANTEES the media per
+    location without the rendering agent hand-looping embed-img per stop (a
+    recurring silent failure). Screenshots and location-less
+    media are excluded. Times in the home zone."""
+    date_str = _resolve_date(date_str)
+    rows, _ = _rest("photos", query=[
+        ("taken_at", f"gte.{_day_bound(date_str, '00:00:00')}"),
+        ("taken_at", f"lte.{_day_bound(date_str, '23:59:59')}"),
+        ("order", "taken_at.asc"),
+        ("select", "uuid,taken_at,media_type,favorite,place_name,segment_id,latitude,longitude,persons"),
+    ])
+    DISPLAY = {"photo", "selfie", "live", "panorama", "burst", "video"}
+    def loc_key(r):
+        if r.get("place_name"): return ("name", r["place_name"])
+        if r.get("segment_id"): return ("seg", r["segment_id"])
+        if r.get("latitude") is not None and r.get("longitude") is not None:
+            return ("gps", round(r["latitude"], 3), round(r["longitude"], 3))
+        return None
+    groups = {}
+    for r in rows:
+        if r.get("media_type") not in DISPLAY:
+            continue
+        k = loc_key(r)
+        if k is None:
+            continue
+        groups.setdefault(k, []).append(r)
+    if not groups:
+        print(f"<!-- photos embed-day {date_str}: no located photos -->")
+        return 0
+    def et_hhmm(ts):
+        try: return datetime.fromisoformat(ts.replace("Z", "+00:00")).astimezone(HOME_TZ).strftime("%H:%M")
+        except Exception: return (ts or "")[11:16]
+    # Photos often carry segment_id but no place_name — resolve the segment's
+    # place name from location_history so the per-location heading is meaningful.
+    seg_ids = [k[1] for k in groups if k[0] == "seg"]
+    seg_names = {}
+    if seg_ids:
+        try:
+            srows, _ = _rest("location_history", query=[("id", "in.(" + ",".join(seg_ids) + ")"), ("select", "id,place_name")])
+            for s in srows:
+                if s.get("place_name"): seg_names[s["id"]] = s["place_name"]
+        except Exception:
+            pass
+    ordered = sorted(groups.items(), key=lambda kv: min(p["taken_at"] for p in kv[1]))
+    blocks, n_loc = [], 0
+    for k, photos in ordered:
+        photos.sort(key=lambda p: (0 if p.get("favorite") else 1, p["taken_at"]))
+        reps = photos[:per_loc]
+        if k[0] == "name": place = k[1]
+        elif k[0] == "seg": place = seg_names.get(k[1], "this stop")
+        elif k[0] == "gps": place = f"near {k[1]:.3f},{k[2]:.3f}"
+        else: place = "this stop"
+        persons = reps[0].get("persons") or []
+        who = f" · with {', '.join(persons)}" if persons else ""
+        hdr = f'<p style="margin:14px 0 4px;font-weight:600;">{place} · {et_hhmm(reps[0]["taken_at"])}{who}</p>'
+        imgs = []
+        for p in reps:
+            is_vid = p.get("media_type") == "video"
+            try:
+                url = _thumb_url_for(p["uuid"], is_video=is_vid)
+            except Exception as e:
+                print(f"[embed-day] thumb failed {p['uuid']}: {e}", file=sys.stderr)
+                continue
+            if url:
+                alt = f"{place}{' (video)' if is_vid else ''}"
+                imgs.append(f'<img src="{url}" style="max-width:100%;width:600px;border-radius:8px;display:block;margin:4px 0;" alt="{alt}">')
+                if is_vid:
+                    imgs.append('<div style="color:#888;font-size:12px;margin:-2px 0 6px;">(video)</div>')
+        if imgs:
+            blocks.append(hdr + "\n" + "\n".join(imgs))
+            n_loc += 1
+    print("\n".join(blocks))
+    print(f"[embed-day] {date_str}: {n_loc} location(s) rendered", file=sys.stderr)
+    return 0
+
+# One tile size for every stop, however many photos it has: the smallest size,
+# whatever the number of photos — the 3-column, 160px cell that used to be the
+# 3/5/6-photo layout.
+GRID_COLS = 3
+GRID_CELL_H = 160
+
+def _grid_cell(url, is_vid, cell_h, cell_w_pct):
+    img = (f'<img src="{url}" width="100%" style="width:100%;height:{cell_h}px;'
+           f'object-fit:cover;border-radius:6px;display:block;" '
+           f'alt="{"video" if is_vid else "photo"}">')
+    if is_vid:
+        # Centered play triangle (pure CSS, no emoji). Best-effort overlay — if a
+        # client strips position:absolute, the poster still renders.
+        tri = ('<span style="position:absolute;left:50%;top:50%;margin:-11px 0 0 -7px;'
+               'width:0;height:0;border-style:solid;border-width:11px 0 11px 18px;'
+               'border-color:transparent transparent transparent rgba(255,255,255,0.92);'
+               'filter:drop-shadow(0 0 2px rgba(0,0,0,0.55));"></span>')
+        img = f'<div style="position:relative;line-height:0;">{img}{tri}</div>'
+    return f'<td width="{cell_w_pct}%" style="padding:0;vertical-align:top;">{img}</td>'
+
+def _render_grid(items, cols, cell_h):
+    """items: list of (url, is_vid). One email-safe grid table, footprint <=600px."""
+    cell_w = round(100.0 / cols, 4)
+    rows = []
+    for i in range(0, len(items), cols):
+        row = items[i:i + cols]
+        cells = "".join(_grid_cell(u, v, cell_h, cell_w) for (u, v) in row)
+        cells += f'<td width="{cell_w}%" style="padding:0;"></td>' * (cols - len(row))
+        rows.append(f"<tr>{cells}</tr>")
+    return ('<table role="presentation" cellpadding="0" cellspacing="0" border="0" '
+            'style="width:600px;border-collapse:separate;border-spacing:4px;margin:6px 0;">'
+            + "".join(rows) + "</table>")
+
+def cmd_embed_uuids(uuid_csv, cap=60):
+    """Deterministic photo HTML for one stop's uuids: one grid of same-size tiles
+    (GRID_COLS across, GRID_CELL_H tall) whether the stop has 1 photo or 40.
+    ALL photos/videos are shown, bounded at `cap` for safety. Videos render as
+    poster frames with a play triangle. Used by the daily-summary builder. Grid
+    added 2026-06-22; one fixed tile size since 2026-10-22."""
+    uuids = [u.strip() for u in (uuid_csv or "").split(",") if u.strip()]
+    if not uuids:
+        return 0
+    quoted = ",".join(uuids)
+    rows, _ = _rest("photos", query=[("uuid", f"in.({quoted})"),
+                                     ("select", "uuid,taken_at,media_type,favorite")])
+    meta = {r["uuid"]: r for r in (rows or [])}
+    DISPLAY = {"photo", "selfie", "live", "panorama", "burst", "video"}
+    cand = [meta[u] for u in uuids if u in meta and meta[u].get("media_type") in DISPLAY]
+    cand.sort(key=lambda p: (0 if p.get("favorite") else 1, p.get("taken_at") or ""))
+    items = []
+    for p in cand[:cap]:
+        is_vid = p.get("media_type") == "video"
+        try:
+            url = _thumb_url_for(p["uuid"], is_video=is_vid)
+        except Exception as e:
+            print(f"[embed-uuids] thumb failed {p['uuid']}: {e}", file=sys.stderr)
+            continue
+        if url:
+            items.append((url, is_vid))
+    if not items:
+        return 0
+    print(_render_grid(items, GRID_COLS, GRID_CELL_H))
+    return 0
+
+def cmd_backfill_thumbs(date_str=None, refresh=False):
+    """Ensure thumb_url is populated for every photo taken on date_str (default: yesterday, home zone).
+    Skips rows that already have thumb_url unless --refresh."""
+    date_str = _resolve_date(date_str)
+    q = [
+        ("taken_at", f"gte.{_day_bound(date_str, '00:00:00')}"),
+        ("taken_at", f"lte.{_day_bound(date_str, '23:59:59')}"),
+        ("order", "taken_at.asc"),
+        ("select", "uuid,thumb_url,media_type"),
+    ]
+    rows, _ = _rest("photos", query=q)
+    done, skipped, failed = 0, 0, 0
+    for row in rows:
+        u = row["uuid"]
+        if row.get("media_type") not in ("photo", "selfie", "live", "panorama", "burst", "screenshot"):
+            skipped += 1; continue
+        if row.get("thumb_url") and not refresh:
+            skipped += 1; continue
+        try:
+            resized = _build_resized_jpeg(u)
+            url = _storage_upload(u, resized)
+            _write_thumb_url(u, url)
+            done += 1
+            print(f"[thumb] {u} -> {url}", file=sys.stderr)
+        except Exception as e:
+            failed += 1
+            print(f"[thumb] {u} FAILED: {e}", file=sys.stderr)
+    print(json.dumps({"date": date_str, "uploaded": done, "skipped": skipped, "failed": failed}, indent=2))
+    return 0 if failed == 0 else 1
+
+def cmd_thumb(uuid, size=1024, open_it=False):
+    os.makedirs(THUMB_DIR, exist_ok=True)
+    # osxphotos export names files after original; use --filename template to control
+    # We'll scan THUMB_DIR for existing <uuid>*.jpeg first
+    existing = [f for f in os.listdir(THUMB_DIR) if f.startswith(uuid)]
+    if existing:
+        out = os.path.join(THUMB_DIR, existing[0])
+    else:
+        r = _osxphotos_export(uuid)
+        if r.returncode != 0:
+            print(f"export failed: {r.stderr[-400:]}", file=sys.stderr); return 1
+        existing = [f for f in os.listdir(THUMB_DIR) if f.startswith(uuid)]
+        if not existing:
+            print("export produced no file", file=sys.stderr); return 1
+        out = os.path.join(THUMB_DIR, existing[0])
+    print(out)
+    if open_it: subprocess.run(["open", out])
+    return 0
+
+def cmd_stats():
+    def count(*filters):
+        q = [("select", "uuid")] + list(filters)
+        _, hdrs = _rest("photos", query=q, prefer="count=exact")
+        cr = hdrs.get("Content-Range", "0-0/0")
+        return int(cr.split("/")[-1])
+    out = {
+        "total": count(),
+        "linked": count(("segment_id", "not.is.null")),
+        "unmatched": count(("match_confidence", "eq.unmatched")),
+        "favorites": count(("favorite", "eq.true")),
+    }
+    print(json.dumps(out, indent=2))
+    return 0
+
+def cmd_unmatched(date_str=None):
+    q = [
+        ("match_confidence", "eq.unmatched"),
+        ("order", "taken_at.desc"),
+        ("limit", "50"),
+        ("select", "uuid,taken_at,latitude,longitude,original_filename"),
+    ]
+    if date_str:
+        d = _resolve_date(date_str)
+        q += [("taken_at", f"gte.{_day_bound(d, '00:00:00')}"), ("taken_at", f"lte.{_day_bound(d, '23:59:59')}")]
+    rows, _ = _rest("photos", query=q)
+    print(json.dumps(rows, indent=2, default=str))
+    return 0
+
+def cmd_find(query):
+    import re
+    m = re.search(r"\d{4}-\d{2}-\d{2}", query)
+    if m: return cmd_at(m.group(0))
+    if "yesterday" in query.lower(): return cmd_at("yesterday")
+    if "today" in query.lower(): return cmd_at("today")
+    print("find: need a date (YYYY-MM-DD, 'today', or 'yesterday')", file=sys.stderr); return 1
+
+def main():
+    args = sys.argv[1:]
+    if not args or args[0] in ("-h","--help","help"):
+        print(__doc__); return 0
+    cmd, rest = args[0], args[1:]
+    try:
+        if cmd in ("sync", "backfill"):
+            if "--from" in rest and "--to" in rest:
+                return cmd_backfill(rest[rest.index("--from")+1], rest[rest.index("--to")+1])
+            date = rest[rest.index("--date")+1] if "--date" in rest else None
+            return cmd_sync(date)
+        if cmd == "at":         return cmd_at(rest[0] if rest else None)
+        if cmd == "segment":    return cmd_segment(rest[0])
+        if cmd == "thumb":
+            size = int(rest[rest.index("--size")+1]) if "--size" in rest else 1024
+            return cmd_thumb(rest[0], size=size)
+        if cmd == "show":       return cmd_thumb(rest[0], open_it=True)
+        if cmd == "embed-img":
+            caption = rest[rest.index("--caption")+1] if "--caption" in rest else None
+            mx = int(rest[rest.index("--max")+1]) if "--max" in rest else 900
+            return cmd_embed_img(rest[0], max_px=mx, caption=caption)
+        if cmd == "embed-day":
+            per = int(rest[rest.index("--per-loc")+1]) if "--per-loc" in rest else 1
+            return cmd_embed_day(rest[0] if rest and not rest[0].startswith("--") else None, per_loc=per)
+        if cmd == "embed-uuids":
+            cap = int(rest[rest.index("--cap")+1]) if "--cap" in rest else 60
+            return cmd_embed_uuids(rest[0] if rest else "", cap=cap)
+        if cmd == "thumb-url":
+            mx = int(rest[rest.index("--max")+1]) if "--max" in rest else 900
+            refresh = "--refresh" in rest
+            return cmd_thumb_url(rest[0], max_px=mx, refresh=refresh)
+        if cmd == "backfill-thumbs":
+            d = rest[rest.index("--date")+1] if "--date" in rest else None
+            refresh = "--refresh" in rest
+            return cmd_backfill_thumbs(date_str=d, refresh=refresh)
+        if cmd == "stats":      return cmd_stats()
+        if cmd == "unmatched":
+            d = rest[rest.index("--date")+1] if "--date" in rest else None
+            return cmd_unmatched(d)
+        if cmd == "find":       return cmd_find(" ".join(rest))
+        print(f"unknown command: {cmd}", file=sys.stderr); return 2
+    except Exception as e:
+        print(f"ERROR: {e}", file=sys.stderr); return 1
+
+if __name__ == "__main__":
+    sys.exit(main())

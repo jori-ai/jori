@@ -27,8 +27,9 @@ const require = createRequire(import.meta.url);
 const { triageLog } = require("../lib/triage-log.js");
 
 const HOME = process.env.HOME || "";
-const FILE = path.join(HOME, "Dev/jori/data/p1-senders.json");
-const SPAM_FILE = path.join(HOME, "Dev/jori/data/spam-blocklist.json");
+const { installTools } = require("../lib/root.cjs");
+const FILE = process.env.JORI_P1_SENDERS_FILE || installTools("data/p1-senders.json");
+const SPAM_FILE = process.env.JORI_SPAM_BLOCKLIST_FILE || installTools("data/spam-blocklist.json");
 
 function load() {
   try {

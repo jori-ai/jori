@@ -428,6 +428,1520 @@
       ],
       "description": "Nightly wide-window inbox re-index + prune. Repairs whatever the 20-minute short window missed (outage, burst past --max) and bounds index growth at 120 days.",
       "trigger_args": "--deep"
+    },
+    {
+      "name": "watch-review",
+      "schedule": "29 8 * * 1",
+      "schedule_human": "Mondays at 8:29 AM",
+      "trigger_script": "agent/scripts/trigger-watch-review.sh",
+      "webhook_url": "http://localhost:9082",
+      "webhook_task": "watch-review",
+      "delivers_to": "email",
+      "phrases": [
+        "watch review",
+        "reminder review",
+        "how are the watches doing",
+        "watch scorecard",
+        "reminder coverage"
+      ],
+      "description": "Weekly scorecard + coverage audit of the watch engine: every reminder request in the week's chat became a watch? did watches fire on time, reach the user, help? Ships <=3 fixes, keeps data/watch-review/history.jsonl, emails only when something happened.",
+      "job": "watch-review"
+    },
+    {
+      "name": "sleep-night",
+      "schedule": "*/5 * * * *",
+      "schedule_human": "Every 5 minutes",
+      "trigger_script": "agent/scripts/trigger-sleep-night.sh",
+      "delivers_to": "none",
+      "phrases": [
+        "sleep night",
+        "when did I fall asleep",
+        "when did I wake up",
+        "phone down",
+        "bedtime"
+      ],
+      "description": "Combine the phone's last lock before the night / first unlock after it (phone_lock_events, live) with the Apple Watch's sleep onset/wake (health_samples, lands late) into sleep_nights; refresh data/sleep-night-state.json so `jori activity` follows the phone. Deterministic, no agent dispatch.",
+      "job": null
+    },
+    {
+      "name": "plaid-sync",
+      "schedule": "15 0,10 * * *",
+      "schedule_human": "12:15 AM and 10:15 AM local (backstop; the primary trigger is Plaid's SYNC_UPDATES_AVAILABLE webhook)",
+      "trigger_script": "agent/scripts/trigger-plaid-sync.sh",
+      "webhook_url": null,
+      "webhook_task": null,
+      "ops_playbook_section": null,
+      "delivers_to": "none",
+      "phrases": [],
+      "description": "Pull Plaid balances + transactions into plaid_accounts/plaid_transactions and push alerts (a large charge unusual for its merchant, a large deposit, low balance, re-auth needed). Direct script — no agent, no Anthropic API. READ-ONLY, cannot move money. A backstop: the webhook (agent/supervisor/plaid-webhook.mjs) drives the sync per Item when the bank posts. Thresholds, webhook URL: agent/local/config/finance.json. Kill switches: data/.plaid-sync-off (both paths), data/.plaid-webhook-off (event path only). No connected Items → a no-op.",
+      "job": null
+    },
+    {
+      "name": "finance-model",
+      "schedule": "45 0 * * *",
+      "schedule_human": "Daily at 12:45 AM local",
+      "trigger_script": "agent/scripts/trigger-finance-model.sh",
+      "webhook_url": null,
+      "webhook_task": null,
+      "ops_playbook_section": null,
+      "delivers_to": "none",
+      "phrases": [],
+      "description": "Nightly build of the finance model (subscriptions, regular income streams, merchant stats, category baselines, recurring obligations) → data/finance-model.json, read by the finance hum harvester. Direct script — no webhook, no Anthropic API. READ-ONLY over plaid_*. Installation follow-up work rides the optional _ext/finance-model-after.sh hook. Kill switch: data/.finance-model-off.",
+      "job": null
+    },
+    {
+      "name": "flights-scan",
+      "schedule": "20 7 * * *",
+      "schedule_human": "Daily at 7:20 AM local",
+      "trigger_script": "agent/scripts/trigger-flights-scan.sh",
+      "webhook_url": null,
+      "webhook_task": null,
+      "ops_playbook_section": "flights-scan",
+      "delivers_to": "jori",
+      "phrases": [
+        "flights scan",
+        "scan flights",
+        "extract travel bookings"
+      ],
+      "description": "Scan Gmail for flight/accommodation/car-rental confirmations (sender-domain lists + optional trip-organiser forward address in agent/local/config/flights-scan.json) and refresh data/flights.json; owns the matching calendar events and runs `travel sync`. The daily cron is the safety net; travel change/cancellation emails also dispatch it via the ops-agent triage travel-change fast-path. Scripted: the trigger kicks launchd agent ai.claude.flights-scan, which runs bin/flights-scan-run (one tool-less model call to read emails). No agent turn.",
+      "job": "flights-scan",
+      "runtime": "launchd-script",
+      "launchd_label": "ai.claude.flights-scan",
+      "script": "bin/flights-scan-run"
+    },
+    {
+      "name": "purchase",
+      "schedule": "on-demand",
+      "schedule_human": "On demand (bin/purchase-queue)",
+      "trigger_script": "agent/scripts/trigger-purchase.sh",
+      "webhook_url": "http://localhost:9092",
+      "webhook_task": "purchase",
+      "ops_playbook_section": null,
+      "delivers_to": "chat",
+      "phrases": [
+        "make a purchase",
+        "buy this"
+      ],
+      "description": "Dispatches one queued purchase to the ops agent (jobs/purchase.md); started by bin/purchase-queue, never by cron. Face ID in the app approves; code places the order."
+    },
+    {
+      "name": "purchase-signin",
+      "schedule": "23 11 * * 0",
+      "schedule_human": "Sundays at 11:23 AM local",
+      "trigger_script": "agent/scripts/trigger-purchase-signin.sh",
+      "webhook_url": "http://localhost:9092",
+      "webhook_task": "purchase-signin",
+      "ops_playbook_section": null,
+      "delivers_to": "chat",
+      "phrases": [
+        "purchase sign-in",
+        "sign in to merchants",
+        "shop chrome sign in"
+      ],
+      "description": "Keep the shop Chrome signed in to the installation's top merchants (data/purchase-merchants.json; jobs/purchase-signin.md). Weekly, daytime, since 2FA codes go to the phone."
+    },
+    {
+      "name": "trip-reservoir-autoscan",
+      "schedule": "0 2 * * *",
+      "schedule_human": "Daily at 2:00 AM local via launchd user agent ai.claude.trip-reservoir-autoscan (NOT cron — the Sonnet research fork needs the keychain Max session; overnight, research is web-search-heavy)",
+      "trigger_script": "agent/scripts/trigger-trip-reservoir-autoscan.sh",
+      "webhook_url": null,
+      "webhook_task": null,
+      "ops_playbook_section": null,
+      "delivers_to": "supabase",
+      "phrases": [
+        "research a new place",
+        "build a travel guide",
+        "guide for where we're going",
+        "auto research destinations",
+        "reservoir for upcoming trip"
+      ],
+      "description": "Nightly gate: finds any upcoming NON-HOME location on the travel timeline that has no travel guide (reservoir) yet, and researches each one sequentially with trip-reservoir-build (geocodes any city worldwide) directly from the launchd agent. Skips the home metros (travel.json home_metros) and short layovers. Makes trip-guide research automatic for anywhere the user goes instead of hand-kicked per trip. Silent when nothing is missing.",
+      "job": null,
+      "scheduler": "launchd"
+    },
+    {
+      "name": "reservoir-mark-done",
+      "schedule": "35 1 * * *",
+      "schedule_human": "Daily at 7:35 AM the user's local time (30 min after daily-summary; cron-tz-sync rewrites the local fields nightly)",
+      "trigger_script": "agent/scripts/trigger-reservoir-mark-done.sh",
+      "webhook_url": null,
+      "webhook_task": null,
+      "ops_playbook_section": null,
+      "delivers_to": "supabase",
+      "phrases": [
+        "mark done",
+        "already been there",
+        "strike out places we've seen",
+        "travel guide done",
+        "area guide progress"
+      ],
+      "description": "Strikes out area-guide (trip_reservoirs) places the user has already been to, so the guides stop suggesting things already done. Evidence: the daily summary first (vetted against chat + transactions + Places; catches visits that never became a stop), then GPS visits, then the travel path. Done, never removed; marks record their evidence. Runs after daily-summary because that's its primary source. Deliberately loose — the user prefers over-striking to under-striking. Cannot mark food specialties (a dish is not a place) — those rely on the site's manual done/undone button. Silent, state-only.",
+      "job": null
+    },
+    {
+      "name": "watchlist-discover",
+      "schedule": "17 10 1 * *",
+      "schedule_human": "1st of each month at 10:17 AM",
+      "trigger_script": "agent/scripts/trigger-watchlist-discover.sh",
+      "webhook_url": null,
+      "webhook_task": null,
+      "ops_playbook_section": null,
+      "delivers_to": "jori",
+      "phrases": [
+        "watchlist discover",
+        "watchlist scan",
+        "discover new shows",
+        "find new shows",
+        "monthly watchlist",
+        "show recommendations"
+      ],
+      "description": "Monthly wide pass (60-day window, max 12) of bin/watch-discover: the model proposes new series/films from the taste profile + the user's verdicts, code enforces TMDB match, id dedup incl. rejected, IMDb >= 7.5, season 1 fully dropped. Adds to watch_titles; one phone pointer if anything was added. Cron posts job=watchlist-discover to the ops supervisor, which launches agent/scripts/watchlist-discover-run.sh via job-run (claude -p needs the Max session). Playbook: ops-agent/jobs/watchlist-discover.md."
+    },
+    {
+      "name": "watchlist-intro-email",
+      "schedule": "27 2 * * *",
+      "schedule_human": "Daily at 2:27 AM (dispatches only when a new title is pending)",
+      "trigger_script": "agent/scripts/trigger-watchlist-intro-email.sh",
+      "webhook_url": null,
+      "webhook_task": null,
+      "ops_playbook_section": null,
+      "delivers_to": "email",
+      "phrases": [
+        "watchlist intro email",
+        "new on my watchlist",
+        "new show email",
+        "watchlist writeups"
+      ],
+      "description": "One HTML email introducing every show and documentary (films go in the weekly watchlist-movies-email) added to watch_titles in the last 30 days and not yet introduced (intro_emailed_at null): TMDB backdrop + cast headshots, what it's about, the reviews (OMDb scores + searched critical reception), why the user would like it, IMDb + Rotten Tomatoes links. Several titles per email. Trigger gates in code (watchlist-intro-email --check), then posts job=watchlist-intro-email to ops-light, which launches watchlist-intro-email-run.sh via job-run (claude -p needs the Max session). Playbook: ops-agent/jobs/watchlist-intro-email.md."
+    },
+    {
+      "name": "watchlist-movies-email",
+      "schedule": "56 4 * * 0",
+      "schedule_human": "Sundays at 4:56 AM (dispatches only when there's something to say)",
+      "trigger_script": "agent/scripts/trigger-watchlist-movies-email.sh",
+      "webhook_url": null,
+      "webhook_task": null,
+      "ops_playbook_section": null,
+      "delivers_to": "email",
+      "phrases": [
+        "weekly movie email",
+        "new movies this week",
+        "movies email",
+        "movies added to the list"
+      ],
+      "description": "Weekly email: films added to the list that week, best predicted first (model_p), with writeups, cast, reviews and where to watch; plus films new in theaters/streaming this week the taste model rates >= 75%. watchlist-intro-email --movies via job-run. Playbook: ops-agent/jobs/watchlist-movies-email.md."
+    },
+    {
+      "name": "watch-catalog-enrich",
+      "schedule": "40 9 * * *",
+      "schedule_human": "Daily at 9:40 AM",
+      "trigger_script": null,
+      "webhook_url": null,
+      "webhook_task": null,
+      "ops_playbook_section": null,
+      "delivers_to": "none",
+      "phrases": [
+        "watch catalog enrich",
+        "movie features",
+        "recommendation model data"
+      ],
+      "description": "Deterministic TMDB enrichment for the watch-list recommendation model (apps/watch/lib/recsys.mjs): syncs every list title (films + shows) into watch_catalog, fills genres/keywords/directors/cast, records TMDB recommendation edges in watch_film_edges, adds recommended films (>=300 votes). No LLM; cron-run direct. Playbook: ops-agent/jobs/watch-catalog-enrich.md."
+    },
+    {
+      "name": "movie-discover",
+      "schedule": "27 8 * * 6",
+      "schedule_human": "Saturdays at 8:27 AM",
+      "trigger_script": "agent/scripts/trigger-movie-discover.sh",
+      "webhook_url": null,
+      "webhook_task": null,
+      "ops_playbook_section": null,
+      "delivers_to": "none",
+      "phrases": [
+        "movie discover",
+        "movie harvester",
+        "find movies",
+        "movie recommendations",
+        "back catalog films"
+      ],
+      "description": "Weekly back-catalog film harvester (bin/movie-discover): TMDB recommendations from films the viewers loved/liked on the ratings site + well-known films they marked haven't seen; code gates (not seen/listed, past 10 years, IMDb >= 6.8 (no RT/Metacritic floors), US availability, no kids/romance-led); fit by Jev site watchlist-fit (Sonnet shadow/fallback, fails closed); adds up to 5 queued. Silent — the weekly watchlist-movies-email introduces them. Cron → ops-light → job-run of movie-discover-run.sh. Playbook: ops-agent/jobs/movie-discover.md."
+    },
+    {
+      "name": "movie-db-refresh",
+      "schedule": "40 10 * * *",
+      "schedule_human": "Daily at 10:40 AM (cron-run, no LLM)",
+      "trigger_script": null,
+      "webhook_url": null,
+      "webhook_task": null,
+      "ops_playbook_section": null,
+      "delivers_to": "none",
+      "phrases": [
+        "movie database",
+        "what's in theaters",
+        "where to watch movies",
+        "movie db"
+      ],
+      "description": "Keeps the movie database (watch_catalog) fresh: TMDB now_playing → in_theaters, new US digital releases, US where-to-watch providers + release dates, and the taste model's model_p for every relevant film (past 10 years or in theaters, unseen). Feeds the ratings site Watch now, the weekly movie email and the hum in-theaters pick. Playbook: ops-agent/jobs/movie-db-refresh.md."
+    },
+    {
+      "name": "cruise-watch",
+      "schedule": "25 9 * * 1",
+      "schedule_human": "Mondays at 9:30 AM local",
+      "trigger_script": "agent/scripts/trigger-cruise-watch.sh",
+      "webhook_url": "http://localhost:9092",
+      "webhook_task": "CRUISE WATCH",
+      "ops_playbook_section": null,
+      "delivers_to": "email+jori",
+      "phrases": [
+        "cruise watch",
+        "cruise deals",
+        "cruise scan",
+        "cruise alert",
+        "cruise alerts"
+      ],
+      "description": "Weekly scan for cruise deals matching the installation's travel plan and thresholds (agent/local/config/cruise-watch.json: home cities, embark ports, filters, alerts); alerts only on price drops. Off with no config or no plan.",
+      "job": "cruise-watch"
+    },
+    {
+      "name": "chat-consolidate",
+      "schedule": "20 3 * * *",
+      "schedule_human": "Daily at 3:20 AM local",
+      "trigger_script": "agent/scripts/trigger-chat-consolidate.sh",
+      "webhook_url": "http://localhost:9092",
+      "webhook_task": "CHAT CONSOLIDATE",
+      "ops_playbook_section": null,
+      "delivers_to": "none",
+      "phrases": [
+        "chat consolidate",
+        "fold chat into wiki",
+        "remember what I said in chat",
+        "consolidate my conversation into memory"
+      ],
+      "description": "Nightly fold of durable facts the user states in ORDINARY CHAT (jori_messages, role=user) into the general wiki — the write-side counterpart to unified recall, so a fact he typed in conversation graduates from short-term into permanent, recallable memory. Complements daily-summary (venues visited) and hum-consolidate (hum replies). Broad + auto-apply; dedupe-before-write; skips health/financial specifics + commands/questions. The trigger (un-sandboxed cron) fetches the pending batch to a local file so the sandboxed agent turn stays fully local. Silent (no email/ping/push). Added 2026-07-19.",
+      "job": "chat-consolidate"
+    },
+    {
+      "name": "wiki-link-weave",
+      "schedule": "1 3 * * 1",
+      "schedule_human": "Mondays at 3:01 AM local",
+      "trigger_script": "agent/scripts/trigger-wiki-link-weave.sh",
+      "webhook_url": "http://localhost:9082",
+      "webhook_task": "WIKI LINK WEAVE",
+      "ops_playbook_section": null,
+      "delivers_to": "chat",
+      "phrases": [
+        "wiki link weave",
+        "link the wiki",
+        "person pages",
+        "connect people in the wiki"
+      ],
+      "description": "Weekly wiki linking pass: splits people out of hub pages into their own `entity: person` pages (≤15/run, facts moved never dropped, links retargeted with `wiki-people retarget`), grows the nightly linker's concept map (`wiki-people concept-add`; shared or ordinary-word first names are model-only `ambiguous_aliases`), links relational phrases and ambiguous names from context in this week's changed pages + a rotating 1/8 slice, makes person relations two-way, and links or flags orphan pages. One short chat message when something changed; ≤3 hum questions. Added 2026-10-23.",
+      "job": "wiki-link-weave"
+    },
+    {
+      "name": "memory-reindex",
+      "schedule": null,
+      "schedule_human": "DISABLED (2026-05-02, step 5e)",
+      "trigger_script": "agent/scripts/trigger-memory-reindex.sh",
+      "webhook_url": null,
+      "webhook_task": null,
+      "ops_playbook_section": null,
+      "delivers_to": "none",
+      "phrases": [],
+      "description": "DISABLED 2026-05-02 (wiki migration step 5e). Was: reindex memory/*.md into memory_chunks + FTS5 + nomic-embed-text embeddings to power `memory search`. Replaced by `wiki_search` (uses pages_fts, kept current in-transaction by every savePage). Script kept around in case a manual memory_chunks rebuild is needed during recovery; cron is off.",
+      "job": null
+    },
+    {
+      "name": "wiki-link-audit",
+      "schedule": "45 3 * * *",
+      "schedule_human": "Daily at 3:45 AM local",
+      "trigger_script": "agent/scripts/trigger-wiki-link-audit.sh",
+      "webhook_url": null,
+      "webhook_task": null,
+      "ops_playbook_section": null,
+      "delivers_to": "none",
+      "phrases": [
+        "wiki link audit",
+        "memory link audit",
+        "concept link audit"
+      ],
+      "description": "Nightly concept-link auto-apply (auto-apply replaced a manual-review digest). Runs `wiki-link-audit --apply --json` against the curated alias map in data/wiki-link-concepts.json — deterministic and safe (first-occurrence-only, skips code/existing-links/self-links). Since 2026-07-17, email notification is suppressed per the user's follow-up (\"No need to email\") — it still auto-applies and logs to agent/logs/wiki-link-audit.log, controlled by data/wiki-link-audit-config.json (`silent: true`). Direct script — no webhook, no Anthropic API.",
+      "job": null
+    },
+    {
+      "name": "memory-consolidation",
+      "schedule": "45 9 * * 0",
+      "schedule_human": "Sundays at 10:00 AM",
+      "trigger_script": "agent/scripts/trigger-memory-consolidation.sh",
+      "webhook_url": "http://localhost:9092",
+      "webhook_task": "MEMORY CONSOLIDATION",
+      "ops_playbook_section": "memory-consolidation",
+      "delivers_to": "email",
+      "phrases": [
+        "memory consolidation",
+        "consolidate memory",
+        "memory review"
+      ],
+      "description": "Weekly content-level audit of the WIKI (pages table) — auto-applies merges/supersedes/retires/expands via the wiki CLI (tracked revisions, revertable), then emails a report. Diff-mode: scopes to pages changed in the last 7 days + their hybrid-recall duplication neighbors. The hygiene counterpart to the wiki's writers (daily-summary/hum-consolidate/chat-consolidate). Repointed 2026-07-19 from the legacy .md files (a no-op under DB-as-truth — render-all clobbered .md edits within 30 min) to the authoritative DB.",
+      "job": "memory-consolidation"
+    },
+    {
+      "name": "episode-archive",
+      "schedule": "25 7 * * *",
+      "schedule_human": "Daily at 7:25 AM local",
+      "trigger_script": "agent/scripts/trigger-episode-archive.sh",
+      "webhook_url": null,
+      "webhook_task": null,
+      "ops_playbook_section": "episode-archive",
+      "delivers_to": "none",
+      "phrases": [
+        "episode archive",
+        "commit yesterday to memory",
+        "archive yesterday",
+        "write episode"
+      ],
+      "description": "Nightly ingest of yesterday's daily_summaries row into the wiki as `day_YYYY-MM-DD` (type=day) via `wiki-day-write`. On Monday / 1st-of-month also ingests weekly + monthly rollup pages, then backfills embeddings. Direct cron script, no webhook or agent turn since 2026-10-04; 'yesterday' is the user's local yesterday (local-day). Failures to the system channel. Recallable via `bin/episode`, `wiki_search`, or the wiki HTTP browser at :9096 — episodic and permanent memory share the same `pages` table.",
+      "job": "episode-archive"
+    },
+    {
+      "name": "call-log",
+      "schedule": null,
+      "trigger_script": "agent/scripts/trigger-call-log.sh",
+      "ops_playbook_section": "call-log",
+      "delivers_to": "wiki",
+      "phrases": [
+        "call log",
+        "my calls",
+        "what did we talk about on the call",
+        "zoom summary",
+        "call summaries"
+      ],
+      "description": "Logs every call the user hosts on Zoom (not only the recurring meetings'): code finds the ended meetings in the user's room(s) and any meeting a Zoom summary email names, a model writes an English log (summary, one-line points, next steps for the user and for the others) and matches participants to wiki person pages; stored in data/call-log.json, written to each person page's Calls block and the day page, and added to the daily summary. Recurring meetings' calls are left to their notes. Read-only on Zoom and Gmail; messages no one. No agent turn.",
+      "job": "call-log",
+      "runtime": "launchd-script",
+      "launchd_label": "ai.claude.call-log",
+      "script": "bin/call-log",
+      "schedule_human": "Every 30 min on the trigger-context-sync tick (no cron line of its own); prep backstop in the daily summary"
+    },
+    {
+      "name": "cyber-watch-alert",
+      "schedule": "26 1-22/3 * * *",
+      "schedule_human": "Every 3 hours (skips 23:00-08:00 in the user's current timezone)",
+      "trigger_script": "agent/scripts/trigger-cyber-watch-alert.sh",
+      "webhook_url": null,
+      "webhook_task": null,
+      "delivers_to": "jori",
+      "job": "cyber-watch",
+      "runtime": "launchd-script",
+      "script": "bin/cyber-watch-run",
+      "ops_playbook_section": "Cyber Watch",
+      "launchd_label": "ai.claude.cyber-watch-alert",
+      "phrases": [
+        "cyber watch",
+        "security alert",
+        "any cyber news",
+        "was there a breach"
+      ],
+      "description": "Checks top cyber events, provider hits and new vulnerable dependencies against the user's real inventory (the Jori host, plus the lockfiles of every GitHub repo checked against OSV). A chat ping goes out ONLY for urgent impact: the item applies and must be acted on today. Everything else waits for the weekly email. Scripted: triage call + verdict call (Sonnet, tool-less). No agent turn. Off without agent/local/config/cyber-watch.json."
+    },
+    {
+      "name": "cyber-watch-weekly",
+      "schedule": "39 6 * * 1",
+      "schedule_human": "Mondays at 6:39 AM",
+      "trigger_script": "agent/scripts/trigger-cyber-watch-weekly.sh",
+      "webhook_url": null,
+      "webhook_task": null,
+      "delivers_to": "email",
+      "job": "cyber-watch",
+      "runtime": "launchd-script",
+      "script": "bin/cyber-watch-run",
+      "ops_playbook_section": "Cyber Watch",
+      "launchd_label": "ai.claude.cyber-watch-weekly",
+      "phrases": [
+        "weekly security briefing",
+        "cyber watch weekly",
+        "security digest"
+      ],
+      "description": "Monday email ONLY (no chat pointer, no push): every security story, provider hit and vulnerable dependency of the week, each checked against the user's inventory and given an analysis, urgency and what to do; plus inventory upkeep from new Plaid merchants. No agent turn."
+    },
+    {
+      "name": "stale-code-watch",
+      "schedule": null,
+      "schedule_human": "Every watchdog tick (2 min), inside watchdog.sh right after supervisor-code-reload; no crontab line of its own",
+      "trigger_script": "bin/stale-code-watch",
+      "webhook_url": null,
+      "webhook_task": null,
+      "ops_playbook_section": null,
+      "delivers_to": "system",
+      "phrases": [
+        "stale code",
+        "code not live",
+        "uncommitted files",
+        "restart stale daemons"
+      ],
+      "description": "Item 2 of the 2026-10-20 review. Restarts the small long-running daemons whose committed code is newer than the process (heartbeat-sender, minibeat, dashboard via launchctl kickstart -k; the two wiki servers via SIGTERM, process-manager respawns), and flags through watchdog.sh's system-channel alert (exit 6, text in data/stale-code-watch-state.json) whatsapp-channel / phone-channel / process-manager on old code for 6h+, a restart that did not take, and tracked code files uncommitted for 12h+. The supervisors and hum-sense are supervisor-code-reload's. Kill switch data/.stale-code-watch-off.",
+      "job": null
+    },
+    {
+      "name": "runner-update",
+      "schedule": "10 3 * * 0",
+      "schedule_human": "Sundays at 3:10 AM local",
+      "trigger_script": "agent/scripts/trigger-runner-update.sh",
+      "webhook_url": null,
+      "webhook_task": null,
+      "job": null,
+      "ops_playbook_section": null,
+      "delivers_to": "none",
+      "phrases": [
+        "runner update",
+        "update the actions runners",
+        "github runners"
+      ],
+      "description": "Weekly in-place update of the self-hosted GitHub Actions runners (~/actions-runner*) by bin/runner-update, with no agent turn: a runner that is current or busy is skipped; otherwise its service stops, bin/ + externals/ are swapped in place (so macOS privacy grants for the bundled node survive a release), and it must be listening for jobs again within 120 s or it rolls back. Log: agent/logs/runner-update.log. Pushes a jori-notify only when a runner failed to update. By hand: runner-update [--dry-run]."
+    },
+    {
+      "name": "db-retention",
+      "schedule": "0 4 * * *",
+      "schedule_human": "Daily at 4:00 AM local",
+      "trigger_script": "agent/scripts/trigger-db-retention.sh",
+      "webhook_url": null,
+      "webhook_task": null,
+      "ops_playbook_section": null,
+      "delivers_to": "none",
+      "phrases": [],
+      "description": "Light 30-day retention prune for location_history + health_samples (raw working copies). Direct script — no webhook, no Anthropic API. See bin/db-retention.",
+      "job": null
+    },
+    {
+      "name": "embed-messages",
+      "schedule": "*/15 * * * *",
+      "schedule_human": "Every 15 minutes",
+      "trigger_script": "agent/scripts/trigger-embed-messages.sh",
+      "webhook_url": null,
+      "webhook_task": null,
+      "ops_playbook_section": null,
+      "delivers_to": "none",
+      "phrases": [],
+      "description": "Backfill local Ollama embeddings for new chat message rows. Direct script — no webhook, no Anthropic API.",
+      "job": null
+    },
+    {
+      "name": "message-followup",
+      "schedule": "23 * * * *",
+      "schedule_human": "Hourly at :23",
+      "trigger_script": "agent/scripts/trigger-message-followup.sh",
+      "webhook_url": null,
+      "webhook_task": null,
+      "ops_playbook_section": null,
+      "delivers_to": "chat",
+      "phrases": [
+        "unanswered urgent messages",
+        "message followup"
+      ],
+      "description": "Code only: asks the user once about a message the message-alert judge rated urgent that has gone unanswered in its chat for 24 hours (up to 72h old). The only ping left on the messaging channels since 2026-10-28. State: data/message-followup-state.json.",
+      "job": null
+    },
+    {
+      "name": "venue-ingest",
+      "schedule": "35 1 * * *",
+      "schedule_human": "Daily at 1:35 AM local (before the venue-watch lanes)",
+      "trigger_script": "agent/scripts/trigger-venue-ingest.sh",
+      "delivers_to": "none",
+      "phrases": [
+        "venue ingest",
+        "venue calendars",
+        "refresh venue events"
+      ],
+      "description": "Fetch every configured venue calendar (agent/local/config/venue-events.json sources or sources_file) into data/venue-events-state.json. No model, plain cron. Read by the venue-watch lanes and morning-digest. A source failing or empty 3 runs running is reported once to the system channel. Nothing to do with no sources.",
+      "job": null,
+      "webhook_task": null,
+      "webhook_url": null,
+      "ops_playbook_section": null
+    },
+    {
+      "name": "spa-heating-sync",
+      "schedule": "28 9 * * *",
+      "schedule_human": "Daily at 9:28 AM local",
+      "trigger_script": "agent/scripts/trigger-spa-heating-sync.sh",
+      "webhook_url": null,
+      "webhook_task": null,
+      "ops_playbook_section": null,
+      "delivers_to": "none",
+      "phrases": [
+        "spa heating sync",
+        "spa telemetry",
+        "spa heating data"
+      ],
+      "description": "Pull the spa's heating telemetry (ticks + session summaries) from its SpaServer into Supabase, then backfill ambient weather for new sessions. Off without agent/local/config/spa.json server_url. Deterministic, no agent dispatch, read-only on the spa.",
+      "job": null
+    },
+    {
+      "name": "spa-heating-model",
+      "schedule": "37 9 1 * *",
+      "schedule_human": "Monthly on the 1st at 9:37 AM local",
+      "trigger_script": "agent/scripts/trigger-spa-heating-model.sh",
+      "webhook_url": null,
+      "webhook_task": "SPA HEATING MODEL",
+      "ops_playbook_section": null,
+      "delivers_to": "email",
+      "phrases": [
+        "spa heating model",
+        "spa heating formula",
+        "refit spa model"
+      ],
+      "description": "Monthly re-fit of the spa heating formula (rate vs water/air gap, plus wind) from synced sessions; emails the analysis. Silent below 3 usable sessions or without a spa configured. Playbook: agent/ops-agent/jobs/spa-heating-model.md.",
+      "job": "spa-heating-model"
+    },
+    {
+      "name": "stay-calendar",
+      "schedule": "7,22,37,52 * * * *",
+      "schedule_human": "Every 15 minutes (safety net; the real trigger is POST /stay-sync)",
+      "trigger_script": "agent/scripts/trigger-stay-calendar.sh",
+      "delivers_to": "none",
+      "phrases": [
+        "stay calendar",
+        "rental calendar",
+        "check-in calendar",
+        "guest check-ins on my calendar"
+      ],
+      "description": "Keep the rental portfolio's Google calendar in step with confirmed channel-manager stays and signed leases at active properties: 1h show-as-free check-in and 30m check-out events. Off without agent/local/config/rentals.json stay_calendar.calendar_id. Deterministic, no agent dispatch.",
+      "job": null
+    },
+    {
+      "name": "meeting-calendar-check",
+      "schedule": "on-demand",
+      "schedule_human": "On demand; an installation schedules it (a morning check per recurring meeting)",
+      "trigger_script": "agent/scripts/check-meetings.sh",
+      "webhook_url": null,
+      "webhook_task": null,
+      "ops_playbook_section": null,
+      "delivers_to": "meeting-state",
+      "phrases": [
+        "meeting calendar check",
+        "is the meeting today",
+        "recurring meeting check"
+      ],
+      "description": "For each recurring meeting in agent/local/config/meetings.json: find today's occurrence on the calendar, update the meeting's state file and its crontab-safe reminder lines. Off with no meetings configured.",
+      "job": null
+    },
+    {
+      "name": "photos-daily",
+      "schedule": "0 3 * * *",
+      "schedule_human": "Daily at 3:00 AM the user's local time (cron-tz-sync rewrites the crontab fields nightly)",
+      "trigger_script": "agent/scripts/trigger-photos-daily.sh",
+      "webhook_url": null,
+      "webhook_task": null,
+      "ops_playbook_section": "photos-daily",
+      "delivers_to": "none",
+      "phrases": [
+        "photos daily",
+        "daily photos",
+        "index photos"
+      ],
+      "description": "Index yesterday's (local) Apple Photos into Supabase and link to location segments, backfill companions, synthesize missed stops, and repair stale-render days (ledger: normal → SILENT → give up). Direct cron script, no webhook or agent turn. Failures to the system channel; success silent.",
+      "job": "photos-daily"
+    },
+    {
+      "name": "photos-backfill-thumbs",
+      "schedule": "15 3 * * *",
+      "schedule_human": "Daily at 3:15 AM the user's local time (15 min after photos-daily, 45 min before daily-summary)",
+      "trigger_script": "agent/scripts/trigger-photos-backfill-thumbs.sh",
+      "webhook_url": null,
+      "webhook_task": null,
+      "ops_playbook_section": null,
+      "delivers_to": "supabase",
+      "phrases": [
+        "backfill thumbs",
+        "warm photo thumbs"
+      ],
+      "description": "Pre-warm yesterday's photo thumbs in Supabase so daily-summary hits warm URLs instead of cold osxphotos exports."
+    },
+    {
+      "name": "photos-intraday",
+      "schedule": "15,45 * * * *",
+      "schedule_human": "Every 30 min at :15/:45, no time-of-day window",
+      "trigger_script": "agent/scripts/trigger-photos-intraday.sh",
+      "delivers_to": "none",
+      "phrases": [
+        "photos intraday",
+        "intraday photo sync",
+        "today's photos sync"
+      ],
+      "description": "Sync today's photos every 30 min, then backfill companions (2h lookback) and synthesize today's stops, so same-day stops/companions surface before the 03:00 photos-daily pass. Direct cron script, no webhook or agent turn. Silent — logs to watchdog.log. Kill switch data/.photos-intraday-off.",
+      "job": null,
+      "webhook_task": null,
+      "webhook_url": null
+    },
+    {
+      "name": "companion-presence",
+      "schedule": "8-59/10 * * * *",
+      "schedule_human": "Every 10 min at :08/:18/..., around the clock",
+      "trigger_script": "agent/scripts/trigger-companion-presence.sh",
+      "delivers_to": "none",
+      "phrases": [
+        "companion presence",
+        "who was with me"
+      ],
+      "description": "One Find My reading per shared person every 10 min, compared with the user's own GPS trail at the reading's timestamp; whoever was with the user across a visit row is added to location_history.companions, which resolve-day carries onto the day's stops. Names on still-open rows stay provisional; it never removes a name it did not add (wrong add: companion-presence untag). Direct cron script. Silent: data/logs/companion-presence.log. Kill switch data/.companion-presence-off. Query: companion-presence show|who.",
+      "job": "companion-presence",
+      "webhook_task": null,
+      "webhook_url": null
+    },
+    {
+      "name": "daily-summary",
+      "schedule": "0 4 * * *",
+      "schedule_human": "Daily at 4:00 AM the user's local time (cron-tz-sync rewrites the home-zone fields nightly)",
+      "trigger_script": "agent/scripts/trigger-daily-summary.sh",
+      "webhook_url": "http://localhost:9092",
+      "webhook_task": "DAILY SUMMARY",
+      "ops_playbook_section": null,
+      "delivers_to": "email",
+      "phrases": [
+        "daily summary",
+        "day summary",
+        "yesterday summary",
+        "my day",
+        "day recap"
+      ],
+      "description": "Narrative of the day that just ended — wake time, places, travel, meals, work, conversations, events — with photos embedded inline at the segment where they were taken. Persists structured row in daily_summaries. Replaced the location-narrative portion of the old location-daily + nightly-review (the self-improvement memo is still in nightly-review, now weekly).",
+      "job": "daily-summary"
+    },
+    {
+      "name": "daily-summary-fix",
+      "schedule": "52 * * * *",
+      "schedule_human": "On demand when a day's review is not confirmed; hourly at :52 a sweep re-queues days whose question the user has since answered",
+      "trigger_script": "agent/scripts/trigger-daily-summary-fix.sh",
+      "cron_label": "daily-summary-fix-sweep",
+      "webhook_url": null,
+      "webhook_task": null,
+      "ops_playbook_section": null,
+      "delivers_to": "jori",
+      "phrases": [
+        "daily summary fix",
+        "fix the day summary",
+        "summary is wrong",
+        "rebuild the summary",
+        "what the review caught"
+      ],
+      "description": "The daily-summary fix loop (2026-10-17). When daily-summary-review does not confirm a day, an ephemeral Opus fixer root-causes each finding, fixes the wording, his records (findme resolve / location-confirm) or the code (self-improve-auto-apply), rebuilds and re-reviews until the reviewer confirms, asks the user in chat when only he can decide (resumes on his answer), and sends the summary with a closing 'What the review caught' section. Also sends a confirmed day the daily-summary run held for its questions (2026-10-20). The email waits for his answers: `daily-summary-fix gate` holds it until every question is answered or the answer window closes (11am his time the next morning, or 3 hours when asked later), and the hourly sweep starts the fixer when the window closes, so the best version goes out then, with a correction once confirmed. Questions composed in his quiet hours (2026-10-27; 01:00-09:00 his current time, agent/local/config/daily-summary-fix.json) are held until he is up (his phone's sleep-night reading, else his chat, from 07:00): the sweep only marks them due, and this launchd runner sends them (`daily-summary-fix release-held`) after its Max sign-in check, since from cron the outbound check cannot sign in; their answer window opens when they go out. State: bin/daily-summary-fix status <date>. See ops-agent/jobs/daily-summary-fix.md. Cost (2026-10-22): the fixer stays Opus at xhigh for the fix; its helper agents (triage, evidence, reading his answers, code search) run on Sonnet at low effort and the code-fix critic on Opus at medium (playbook § Helpers; the trigger exports CLAUDE_CODE_SUBAGENT_MODEL from models.env).",
+      "job": "daily-summary-fix",
+      "runtime": "launchd-script",
+      "launchd_label": "ai.claude.daily-summary-fix",
+      "script": "agent/scripts/trigger-daily-summary-fix.sh"
+    },
+    {
+      "name": "location-confirm",
+      "schedule": "*/10 * * * *",
+      "schedule_human": "Every 10 minutes — ask about unconfirmed dwells ≥20 min",
+      "trigger_script": "agent/scripts/trigger-location-confirm.sh",
+      "webhook_url": null,
+      "webhook_task": null,
+      "ops_playbook_section": null,
+      "delivers_to": "jori",
+      "phrases": [
+        "location confirm",
+        "where am i",
+        "confirm location"
+      ],
+      "description": "Every 10 minutes, runs `location-current-stop` to detect if the user is currently dwelling ≥20 min at a venue the algorithm can't confidently name. Skips when (a) primary source is named_location/confirmed_stop/known_recurring/wifi_ssid, (b) confidence ≥0.90, or (c) photo evidence pushes a ≥0.80 candidate to ≥0.90. Honors quiet windows (sleep 00–09 + active calendar event) by queueing into pending-asks.json and draining when the window ends. Anti-spams by (date, rounded centroid). Phrases the ask in natural language via local Gemma (bin/location-confirm-phrase.mjs) and pushes directly via jori-send — zero Anthropic API tokens, no ops-agent dispatch. Confirmations land in confirmed-stops.json and propagate to all future stops within 30 m at conf 0.95.",
+      "job": "location-confirm-ask"
+    },
+    {
+      "name": "location-enrich",
+      "schedule": "*/15 * * * *",
+      "schedule_human": "Every 15 minutes",
+      "trigger_script": "agent/scripts/trigger-location-enrich.sh",
+      "webhook_url": "http://localhost:9092",
+      "webhook_task": "LOCATION ENRICH",
+      "ops_playbook_section": "location-enrich",
+      "delivers_to": "jori",
+      "phrases": [
+        "location enrich",
+        "enrich location"
+      ],
+      "description": "Confirm every stop with the user; never silently guess a place. Every 15 min the gate finds stops needing a new ask; code composes them (bin/location-enrich-compose via launchd ai.claude.location-enrich-compose: calendar routing + one batched local-Gemma→Sonnet-low phrasing call, structurally validated) and queues them for hum; each NEW ask also spools a perishable location.ask_ready hum event so hum dispatches as hum:moment within minutes (priority lane) instead of waiting for an unrelated tick, and asks are bounded by askTiming (late = says so, >4h = not asked). The ops agent is dispatched only for the residue in location-enrich-residue.json (a calendar event in the stop window, or nothing phrased validly).",
+      "job": "location-enrich"
+    },
+    {
+      "name": "segment-ask",
+      "schedule": "*/30 * * * *",
+      "schedule_human": "Every 30 minutes",
+      "trigger_script": "agent/scripts/trigger-segment-ask.sh",
+      "delivers_to": "jori",
+      "phrases": [
+        "segment ask",
+        "ask about my stops",
+        "confirm my stops"
+      ],
+      "description": "Ask about a stop while the user can still remember it, instead of reconstructing it at night. Only a wire: `day-segments --write` gives every stop a row (including stops CLVisit never recorded, which is why a 45.7-min cafe stop once had nothing to attach a name to), `stop-identify` decides whether a question is warranted at all (>80% certain -> stay silent), and `choice send` puts tappable options in the chat. Never asks twice about the same ref, answered or not; never touches a user-confirmed row. Brakes: kill switch data/.segment-ask-off, quiet window 23:00-09:00 in the user's reported timezone, and a hard cap of 2 asks per run which it reports rather than silently drops. Age bound (same as askTiming): a stop the user left >45 min ago is asked with a 'Looking back to this morning, around HH:MM' lead; >4h ago or on an earlier day it is not asked (daily summary carries it). A night at the booked lodging is never asked: stop-identify names a 6h+ stay (or one covering 2-6am local) on a booked date as the booking when the user slept within 150 m of it on another night of that booking, or the stop's street address matches the booking's (address-match --booking). Where he is staying is always on offer: a stop within 50 m of the median of the booking's other nights (150 m for a night), or before the first night one whose street address matches the booking's, gets the booking as its first option with no default (the default when no venue is nearby); a whole night no rung could name (not the user's own answers, not a bed he has slept in) and nothing places elsewhere is one tap, 'were you at <booking>?', where a lone cafe used to name it silently.",
+      "job": "segment-ask"
+    },
+    {
+      "name": "location-ambient",
+      "schedule": "*/30 * * * *",
+      "schedule_human": "Every 30 minutes",
+      "trigger_script": "agent/scripts/trigger-location-ambient.sh",
+      "webhook_url": "http://localhost:9092",
+      "webhook_task": "LOCATION AMBIENT",
+      "ops_playbook_section": null,
+      "delivers_to": "jori",
+      "phrases": [
+        "location ambient",
+        "ambient pulse",
+        "ambient insights",
+        "ambient context",
+        "where am i insights",
+        "neighborhood insights"
+      ],
+      "description": "Ambient thought-partner ping when the user stops during a wander through a neighborhood: one nearby place (a restaurant recommendation, a nearby event, or a neighborhood insight) within 150 m of the stop. Max 1 ping per walking session; respects the daily ping budget. Silent runs are fine. Haiku-tier scan job.",
+      "job": "location-ambient",
+      "model": "haiku"
+    },
+    {
+      "name": "live-day",
+      "schedule": "*/10 * * * *",
+      "schedule_human": "Every 10 minutes — refresh the live-day belief structure",
+      "trigger_script": "agent/scripts/trigger-live-day.sh",
+      "webhook_url": null,
+      "webhook_task": null,
+      "ops_playbook_section": null,
+      "delivers_to": null,
+      "phrases": [
+        "live day",
+        "current location",
+        "where am i now",
+        "what am i doing",
+        "today so far"
+      ],
+      "description": "Maintains data/live-day.json — a continuously-evolving belief structure for the user's current day. Calendar events seed intervals at expected start/end times with source=calendar_seed (priors); GPS dwell evidence merges in to confirm or contradict (gps_status: supports/contradicts/missed/no_evidence_yet); user-confirm replies lock the place name absolutely (gps_status=confirmed). Chat signals (regex over today's jori_messages — \"at X\", \"going to X\", \"just left X\", \"had lunch at X\") and Google Tasks completions attach as evidence on the matching interval, populating activity_hint for narrative anchoring. Each interval carries an evidence_log audit trail of how Jori came to its current belief. At day rollover the prior file archives to data/live-day-archive/<YYYY-MM-DD>.json. CLI: `live-day current|show|refresh|at <ISO|HH:MM>|day <date> [--original]|accuracy <date>`. The archive is never rewritten by a correction (2026-10-22): `live-day day <date>` layers his answers and day-corrections on top (lib/day-overlay.js) while `accuracy` keeps grading the original. Future readers (hum, chat-agent, location-confirm) consume this single source of truth instead of re-deriving from raw signals every tick.",
+      "job": "live-day"
+    },
+    {
+      "name": "dream",
+      "schedule": "*/30 * * * *",
+      "schedule_human": "Every 30 min via launchd agent ai.claude.dream; a no-op until a local day has its daily_summaries row and has not been dreamed (oldest of the last 3 first)",
+      "scheduler": "launchd",
+      "trigger_script": "agent/scripts/trigger-dream.sh",
+      "webhook_url": null,
+      "webhook_task": null,
+      "ops_playbook_section": null,
+      "delivers_to": "none",
+      "phrases": [
+        "dream",
+        "the dream",
+        "what did you learn today",
+        "nightly learnings",
+        "digest the day into memory"
+      ],
+      "description": "The DREAM: reads EVERYTHING that happened on a day (daily summary + settled stops, chat both roles, Claude Code typed prompts, sent mail/commits/notes, HealthKit metrics vs his 28-day baseline, workouts, sleep, weather at each place, transactions, photos, travel, hum activity) gathered by bin/dream-prefetch, and turns it into durable wiki learnings (people, places, tastes, decisions, corrections, outcomes, cross-day patterns) plus up to 3 ideas and 3 questions for the hum via hum-ideas-append. Ephemeral Opus (JORI_MODEL_OPUS, xhigh). Silent. Added 2026-10-15.",
+      "job": "dream"
+    },
+    {
+      "name": "dream-deep",
+      "schedule": "*/30 * * * *",
+      "schedule_human": "Weekly: launchd ai.claude.dream-deep ticks every 30 min and runs when the last deep dream is >=7 days old, it is 02:00-08:00 on the host, and yesterday's nightly dream is done",
+      "scheduler": "launchd",
+      "trigger_script": "agent/scripts/trigger-dream-deep.sh",
+      "webhook_url": null,
+      "webhook_task": null,
+      "ops_playbook_section": null,
+      "delivers_to": "none",
+      "phrases": [
+        "deep dream",
+        "long view",
+        "what is the user like lately",
+        "long-term trends",
+        "likes and dislikes",
+        "patterns over time"
+      ],
+      "description": "The DEEP DREAM: weekly long view over the last 90 days (bin/dream-deep-prefetch: places recent-vs-prior, rhythm, companions, weather, health trends, spending drifts, his chat words, hum replies/reactions, show verdicts, photos, nightly dreams' learnings and set-asides) to find likes, dislikes, drifts and rhythms; writes them to subject pages and rewrites the user_long_view portrait; questions go to the hum via the dream_asks lane. Ephemeral Opus, xhigh. Silent. Added 2026-10-15.",
+      "job": "dream-deep"
+    },
+    {
+      "name": "finance-property-review",
+      "schedule": "40 7 16 * *",
+      "schedule_human": "16th of each month at 7:40 AM local",
+      "trigger_script": "agent/scripts/trigger-finance-property-review.sh",
+      "webhook_url": "http://localhost:9082",
+      "webhook_task": "FINANCE PROPERTY REVIEW",
+      "ops_playbook_section": null,
+      "delivers_to": "jori",
+      "phrases": [
+        "property review",
+        "monthly property review",
+        "per-property p&l",
+        "property p&l",
+        "how did the properties do",
+        "real estate review",
+        "schedule e"
+      ],
+      "description": "Monthly per-property real-estate review: P&L by Schedule-E category per property, month-over-month and year-over-year, short-term vs long-term comparison, rent-roll collection vs the signed leases, reconciliation health (unclassified rows), reserves, security deposits and yield on value/cost. Reports the last CLOSED month, and runs on the 16th so every rent for that month has settled before the collection check reads it. The monthly half of the split with the weekly finance review, which stays on liquidity/accuracy/anomalies. Needs the rental books (agent/local/config/rentals.json); without them the trigger dispatches nothing. READ-ONLY. Playbook: agent/ops-agent/jobs/finance-property-review.md.",
+      "job": "finance-property-review"
+    },
+    {
+      "name": "choice-sweep",
+      "schedule": "17 * * * *",
+      "schedule_human": "Hourly at :17",
+      "trigger_script": "agent/scripts/trigger-choice-sweep.sh",
+      "webhook_url": null,
+      "webhook_task": null,
+      "ops_playbook_section": null,
+      "delivers_to": "jori",
+      "phrases": [],
+      "description": "Hourly: applies an expired, unanswered location_stop card default as a LOW-CONFIDENCE guess that never names nearby future stops and that any later tap or correction overrides. choice sweep --apply -> findme guess <visit_id> <default>: writes only that card's own visit row as place_type=default-applied (never user-confirmed, never confirmed-stops.json); refuses a row that already carries a verdict and a window overlapping a row the user answered. resolve-day reads it at confidence 0.4 for that one stop and the summary titles it probably X. Nothing is posted in the chat; a late tap replaces it through the normal reply path. Other card kinds are only reported. Direct script - no webhook, no Anthropic API. Kill switch: data/.choice-sweep-off. Inspect: bin/choice list; dry-run: bin/choice sweep.",
+      "job": null
+    },
+    {
+      "name": "message-digest",
+      "schedule": "40 3,12,18,23 * * *",
+      "schedule_human": "3:40 AM, 12:40 PM, 6:40 PM, 11:40 PM local (the 3:40 run finalizes yesterday for the 4 AM daily summary)",
+      "trigger_script": "agent/scripts/trigger-message-digest.sh",
+      "webhook_url": null,
+      "webhook_task": null,
+      "ops_playbook_section": null,
+      "delivers_to": "message-digests",
+      "phrases": [
+        "message digest",
+        "message summaries",
+        "summarize my messages",
+        "group chat summary"
+      ],
+      "description": "Summarizes the day's iMessage, WhatsApp and Slack conversations (1:1 and groups) into data/message-digests/<date>.json + .md; the daily summary reads it. Cron kicks launchd ai.claude.message-digest (tool-less claude -p on Max). Replaces realtime message pings. `message-digest show [--date D]` prints one; `message-digest topics <meeting-id>` picks group topics before a recurring meeting (lib/meetings.mjs).",
+      "job": null
+    },
+    {
+      "name": "ping-flush",
+      "schedule": "*/5 * * * *",
+      "schedule_human": "Every 5 minutes",
+      "trigger_script": "agent/scripts/trigger-ping-flush.sh",
+      "webhook_url": null,
+      "webhook_task": null,
+      "ops_playbook_section": null,
+      "delivers_to": "jori",
+      "phrases": [],
+      "description": "Deliver the non-urgent APNs alerts that the motion gate (lib/motion-state.mjs) parked while the user was walking/driving, once they are stationary again. Coalesces a batch into one buzz per channel; drops alerts held >90 min (the message itself stays in the app either way). Direct script — no webhook, no Anthropic API. Exits immediately when the queue is empty, which is most runs. Kill switch: data/.ping-flush-off. Status: bin/ping-flush --status.",
+      "job": null
+    },
+    {
+      "name": "jev-budget-check",
+      "schedule": "15 9 * * *",
+      "schedule_human": "Daily at 9:15 AM local",
+      "trigger_script": "agent/scripts/trigger-jev-budget-check.sh",
+      "delivers_to": "system",
+      "phrases": [
+        "jev budget",
+        "jev spend",
+        "typesafe credits",
+        "how much jev left"
+      ],
+      "description": "Jev spend vs the prepaid provider budget (data/jev-config.json `budget`: usd, since, alert_pcts). Sums per-call cost from data/jev-shadow/*.jsonl, projects the run-out date, pages the system channel once per crossed threshold (default 50/80/95%). No model; off when no budget is configured. By hand: jev-budget-check [--json] [--dry-run].",
+      "job": null,
+      "webhook_task": null,
+      "webhook_url": null,
+      "ops_playbook_section": null
+    },
+    {
+      "name": "jev-email-reconcile",
+      "schedule": "*/15 * * * *",
+      "schedule_human": "Every 15 minutes (cron, via cron-run)",
+      "scheduler": "cron",
+      "trigger_script": "bin/jev-email-reconcile",
+      "delivers_to": "none",
+      "phrases": [
+        "jev email reconcile"
+      ],
+      "description": "Jev email-triage site: for mail Jev sent to the ops dispatch (P1/P2 or low confidence), compares Jev's verdict against the ops agent's recorded triage verdict in email-memory.db and logs the late comparison (disagreements.jsonl via jev-shadow). Silent. See docs/jev.md.",
+      "job": "jev-email-reconcile"
+    },
+    {
+      "name": "shadow-cutover-check",
+      "schedule": "0 10 * * *",
+      "schedule_human": "Daily at 10:00 AM local",
+      "trigger_script": "agent/scripts/trigger-shadow-cutover-check.sh",
+      "delivers_to": "system",
+      "phrases": [
+        "shadow cutover",
+        "go live check",
+        "is triage-decide live"
+      ],
+      "description": "Flips triage-decide from shadow to live once it meets its cutover bar (triage-decide report verdict). Announces the flip once on the system channel with its rollback; reports once if it is still not ready after 21 days of shadow. No model. State: data/shadow-cutover-state.json.",
+      "job": null,
+      "webhook_task": null,
+      "webhook_url": null,
+      "ops_playbook_section": null
+    },
+    {
+      "name": "festival-watch",
+      "schedule": "10 7 * * 1",
+      "schedule_human": "Mondays at 7:10 AM",
+      "trigger_script": "agent/scripts/trigger-festival-watch.sh",
+      "webhook_url": null,
+      "webhook_task": null,
+      "ops_playbook_section": null,
+      "delivers_to": "jori",
+      "phrases": [
+        "festivals",
+        "festival watch",
+        "upcoming festivals",
+        "public events",
+        "what festivals are coming up",
+        "any festivals coming up",
+        "festivals near me",
+        "festivals while traveling"
+      ],
+      "description": "Forward-looking 90-day scan for festivals and major public events in every city the travel timeline puts the user in (home + trips); net-new finds emailed, the rest deferred. Scripted: cron kicks launchd ai.claude.festival-watch → bin/festival-watch-run (code does windows, deep/weekly band, gates, render, delivery; one capped web-search judgment on Max). Off unless agent/local/config/festival-watch.json enables it.",
+      "job": "festival-watch",
+      "runtime": "launchd-script",
+      "launchd_label": "ai.claude.festival-watch",
+      "script": "bin/festival-watch-run"
+    },
+    {
+      "delivers_to": "jori",
+      "job": "comedy-club-watch",
+      "ops_playbook_section": null,
+      "phrases": [
+        "comedy club watch",
+        "comedians small rooms",
+        "big comedian small room"
+      ],
+      "webhook_task": "comedy-club-watch",
+      "webhook_url": "http://localhost:9092",
+      "name": "comedy-club-watch",
+      "schedule": "12 8,11,14,17,20,23 * * *",
+      "schedule_human": "Every 3h through the day (installation's schedule; the first pass of the local day is the deep roster pass)",
+      "trigger_script": "agent/scripts/trigger-comedy-club-watch.sh",
+      "description": "Big-name comedians (or any roster headliners) booking small rooms (≤ max_cap seats). Membership is stature × room size, never taste; a show on a date the user is away is suppressed unless a headliner; the calendar supersedes the travel DB. The venue sweep runs as code (bin/comedy-club-watch-run, config lib/comedy-config.cjs, off without rooms); the Haiku agent is dispatched only for the Hits check on a roster hit and once a day for Direction A. See ops-agent/jobs/comedy-club-watch.md."
+    },
+    {
+      "name": "mkt-aso-baseline",
+      "schedule": "0 8 * * 0",
+      "schedule_human": "Sundays at 8:00 AM local",
+      "trigger_script": "agent/scripts/trigger-mkt-aso-baseline.sh",
+      "webhook_url": "http://localhost:9092",
+      "webhook_task": "MKT ASO BASELINE",
+      "ops_playbook_section": null,
+      "delivers_to": "file",
+      "phrases": [
+        "aso baseline",
+        "app store baseline",
+        "aso snapshot"
+      ],
+      "description": "Weekly snapshot of the app's + competitors' App Store / Play Store metadata (agent/local/config/marketing.json; off without it). Diffs against last week into data/mkt-aso-baseline-state.json. Silent.",
+      "job": "mkt-aso-baseline"
+    },
+    {
+      "name": "mkt-aso-rank-pulse",
+      "schedule": "8 11 * * *",
+      "schedule_human": "Daily at 11:08 AM local",
+      "trigger_script": "agent/scripts/trigger-mkt-aso-rank-pulse.sh",
+      "webhook_url": "http://localhost:9092",
+      "webhook_task": "MKT ASO RANK PULSE",
+      "ops_playbook_section": null,
+      "delivers_to": "file",
+      "phrases": [
+        "aso rank pulse",
+        "app store rank",
+        "keyword rank pulse"
+      ],
+      "description": "Daily keyword-rank pulse for the app across its target keywords × locales × both stores (bin/aso-rank-pulse-collect, public search APIs). Writes data/mkt-aso-ranks-state.json. Silent; off without marketing.json.",
+      "job": "mkt-aso-rank-pulse"
+    },
+    {
+      "name": "mkt-aso-opportunity-scan",
+      "schedule": "8 10 * * 3",
+      "schedule_human": "Wednesdays at 10:08 AM local",
+      "trigger_script": "agent/scripts/trigger-mkt-aso-opportunity-scan.sh",
+      "webhook_url": "http://localhost:9092",
+      "webhook_task": "MKT ASO OPPORTUNITY SCAN",
+      "ops_playbook_section": null,
+      "delivers_to": "file",
+      "phrases": [
+        "aso opportunity scan",
+        "aso digest",
+        "keyword opportunities"
+      ],
+      "description": "Weekly ASO digest: bin/aso-opportunity-scan scores opportunities from the baseline + rank state, the playbook emails the top ones (digest-deliver). Off without marketing.json.",
+      "job": "mkt-aso-opportunity-scan"
+    },
+    {
+      "name": "mkt-aso-search-terms",
+      "schedule": "18 11 * * 2",
+      "schedule_human": "Tuesdays at 11:18 AM local",
+      "trigger_script": "agent/scripts/trigger-mkt-aso-search-terms.sh",
+      "webhook_url": "http://localhost:9092",
+      "webhook_task": "MKT ASO SEARCH TERMS",
+      "ops_playbook_section": null,
+      "delivers_to": "file",
+      "phrases": [
+        "aso search terms",
+        "apple search ads terms",
+        "asa search terms"
+      ],
+      "description": "Weekly Apple Search Ads search-terms pull (bin/aso-search-terms-collect). Dormant (auth_broken state) until the ASA credentials exist; off without marketing.json.",
+      "job": "mkt-aso-search-terms"
+    },
+    {
+      "name": "mkt-aso-experiments",
+      "schedule": "29 11 * * *",
+      "schedule_human": "Daily at 11:29 AM local",
+      "trigger_script": "agent/scripts/trigger-mkt-aso-experiments.sh",
+      "webhook_url": "http://localhost:9092",
+      "webhook_task": "MKT ASO EXPERIMENTS",
+      "ops_playbook_section": null,
+      "delivers_to": "file",
+      "phrases": [
+        "aso experiments",
+        "ppo check",
+        "app store experiments"
+      ],
+      "description": "Daily iOS Product Page Optimization experiment state check via asc-api-call (bin/aso-experiments-check). Silent; off without marketing.json ios_app_id.",
+      "job": "mkt-aso-experiments"
+    },
+    {
+      "name": "mkt-aso-review-themes",
+      "schedule": "15 3 3 * *",
+      "schedule_human": "3rd of each month at 3:15 AM local",
+      "trigger_script": "agent/scripts/trigger-mkt-aso-review-themes.sh",
+      "webhook_url": "http://localhost:9092",
+      "webhook_task": "MKT ASO REVIEW THEMES",
+      "ops_playbook_section": null,
+      "delivers_to": "file",
+      "phrases": [
+        "aso review themes",
+        "review language clusters",
+        "app review themes"
+      ],
+      "description": "Monthly clustering of App Store review language into keyword candidates + complaint/praise themes (bin/aso-review-themes). Silent; off without marketing.json.",
+      "job": "mkt-aso-review-themes"
+    },
+    {
+      "name": "mkt-reviews-pulse",
+      "schedule": "0 9 * * *",
+      "schedule_human": "Daily at 9:00 AM local",
+      "trigger_script": "agent/scripts/trigger-mkt-reviews-pulse.sh",
+      "webhook_url": "http://localhost:9092",
+      "webhook_task": "MKT REVIEWS PULSE",
+      "ops_playbook_section": null,
+      "delivers_to": "file",
+      "phrases": [
+        "reviews pulse",
+        "app store reviews",
+        "new reviews",
+        "review check"
+      ],
+      "description": "Daily silent poll of Apple's customer-reviews RSS for the app in each configured storefront (marketing.json review_countries). Dedups into data/mkt-reviews-state.json; the digest flags low-star reviews. Off without marketing.json.",
+      "job": "mkt-reviews-pulse"
+    },
+    {
+      "name": "mkt-metrics-collect",
+      "schedule": "45 8 * * *",
+      "schedule_human": "Daily at 8:45 AM local",
+      "trigger_script": "agent/scripts/trigger-mkt-metrics-collect.sh",
+      "execution": "direct-cron",
+      "execution_note": "Pure cron: runs bin/mkt-metrics-collect directly, NO agent dispatch. Deterministic state-only producer with no outbound comms, so it spends 0 model tokens.",
+      "webhook_url": null,
+      "webhook_task": null,
+      "ops_playbook_section": null,
+      "delivers_to": "file",
+      "phrases": [
+        "metrics collect",
+        "improvement metrics",
+        "site visits and downloads",
+        "gsc daily clicks",
+        "asc daily downloads"
+      ],
+      "description": "Daily silent collector: Search Console clicks/impressions for marketing.json gsc_site + App Store Connect daily downloads (analytics report requests in asc_report_requests). Rolling 7d/30d + WoW in data/mkt-metrics-state.json. Off without config.",
+      "job": "mkt-metrics-collect"
+    },
+    {
+      "name": "mkt-conversion-collect",
+      "schedule": "2 9 * * *",
+      "schedule_human": "Daily at 9:02 AM local",
+      "trigger_script": "agent/scripts/trigger-mkt-conversion-collect.sh",
+      "webhook_url": "http://localhost:9092",
+      "webhook_task": "MKT CONVERSION COLLECT",
+      "ops_playbook_section": null,
+      "delivers_to": "file",
+      "phrases": [
+        "conversion collect",
+        "conversion funnel",
+        "reddit conversion funnel",
+        "paid funnel collector",
+        "per-creative installs"
+      ],
+      "description": "Daily silent paid-funnel collector: per-creative impressions → clicks → LP views → installs (CPC/LP-CTR/CPI) from the Reddit-ads + metrics state, GA4 and AppsFlyer when their creds exist. Writes data/mkt-conversion-state.json. Off without marketing.json.",
+      "job": "mkt-conversion-collect"
+    },
+    {
+      "name": "mkt-actions-audit",
+      "schedule": "50 8 * * 0",
+      "schedule_human": "Weekly Sunday at 8:50 AM local",
+      "trigger_script": "agent/scripts/trigger-mkt-actions-audit.sh",
+      "webhook_url": "http://localhost:9092",
+      "webhook_task": "MKT ACTIONS AUDIT",
+      "ops_playbook_section": null,
+      "delivers_to": "email",
+      "phrases": [
+        "actions audit",
+        "ledger hygiene",
+        "reconcile actions",
+        "retire stale tasks",
+        "audit marketing actions",
+        "clean up the action queue",
+        "what's open and what's done"
+      ],
+      "description": "Weekly ledger hygiene over data/mkt-actions-state.json via bin/mkt-actions: auto-completes rows verified done on the live site (marketing.json site_url), retires dead-premise/duplicates, flags the rest; never touches the user's manual_<owner_id> rows. Silent on a clean run; kill switch data/mkt-actions-audit-pause.json.",
+      "job": "mkt-actions-audit"
+    },
+    {
+      "name": "awardwallet-sync",
+      "schedule": "1 7 * * 0",
+      "schedule_human": "Sundays at 7:01 AM local",
+      "trigger_script": "agent/scripts/trigger-awardwallet-sync.sh",
+      "webhook_url": null,
+      "webhook_task": null,
+      "ops_playbook_section": null,
+      "delivers_to": "none",
+      "phrases": [
+        "refresh my points",
+        "refresh miles",
+        "update awardwallet"
+      ],
+      "description": "Weekly: optional direct readers (agent/local/config/loyalty.json `direct_readers`, for programs AwardWallet cannot read) run first, then bin/awardwallet-refresh presses Update in AwardWallet via its extension in the automation Chrome on :9222 (skipping programs whose saved password the provider rejects — lockout risk), then bin/awardwallet-sync snapshots every miles/points program AwardWallet tracks into loyalty_accounts + loyalty_balance_history via the AwardWallet Business Account Access API (GET-only; key AWARDWALLET_API_KEY). Off without the key. Silent unless the API fails, a program disconnects, points expire within 60 days, or AwardWallet is signed out (intent from loyalty.json `alert_intent`). Kill switch: data/.awardwallet-sync-off.",
+      "job": null
+    },
+    {
+      "name": "exercise-schedule",
+      "schedule": "30 1 * * *",
+      "schedule_human": "Daily at 7:30 AM local",
+      "trigger_script": "agent/scripts/trigger-exercise-schedule.sh",
+      "webhook_url": "http://localhost:9092",
+      "webhook_task": "exercise-schedule",
+      "delivers_to": "jori",
+      "phrases": [
+        "exercise schedule",
+        "gym block",
+        "add exercise block",
+        "schedule exercise",
+        "block exercise today",
+        "exercise calendar"
+      ],
+      "description": "Place a 30-min exercise block on today's calendar (Rule #1 habit). Skips rest days when on track (4+ sessions this week).",
+      "job": "exercise-schedule"
+    },
+    {
+      "name": "finance-review",
+      "schedule": "0 8 * * 0",
+      "schedule_human": "Sundays at 8:00 AM local",
+      "trigger_script": "agent/scripts/trigger-finance-review.sh",
+      "webhook_url": "http://localhost:9082",
+      "webhook_task": "FINANCE REVIEW",
+      "ops_playbook_section": null,
+      "delivers_to": "jori",
+      "phrases": [
+        "finance review",
+        "weekly finance review",
+        "money review",
+        "weekly money review",
+        "review my accounts",
+        "spending summary",
+        "where did my money go",
+        "weekly spending"
+      ],
+      "description": "Weekly financial review across all connected accounts: cash and runway with shortfalls, income arrival, spending by category, card and merchant, anomalies and fees; a deterministic packet (bin/finance-review-data, -compose) narrated once. READ-ONLY. Playbook: agent/ops-agent/jobs/finance-review.md.",
+      "job": "finance-review"
+    },
+    {
+      "name": "net-worth-monthly",
+      "schedule": "20 7 1 * *",
+      "schedule_human": "1st of the month at 7:20 AM local",
+      "trigger_script": "agent/scripts/trigger-net-worth-monthly.sh",
+      "webhook_url": null,
+      "webhook_task": null,
+      "ops_playbook_section": null,
+      "delivers_to": "email",
+      "phrases": [
+        "net worth",
+        "net worth update",
+        "how much am i worth",
+        "property value",
+        "what are my properties worth"
+      ],
+      "description": "Monthly net-worth refresh + the 'Net worth update' email to the user AND the partner (the only financial path with a second recipient — carve-out in agent/CLAUDE.md § Financial Operations rule 5). Runs zestimate (Zillow via the host's Chrome) -> property-values (RentCast AVM + reconcile) -> net-worth --email. Order is load-bearing: valuing after snapshotting would repeat last month's property figure and read as 'property flat'. Steps 1-2 may fail without stopping the run; step 3 failing pages the system channel. Deterministic - NO LLM, every figure is arithmetic and the HTML is rendered in code. READ-ONLY, jori-model-only. Kill switch: data/.net-worth-monthly-off. See docs/property-values.md.",
+      "job": null
+    },
+    {
+      "name": "hum-metrics-collect",
+      "schedule": "29 6 * * *",
+      "schedule_human": "Daily at 6:29 AM local",
+      "trigger_script": "agent/scripts/trigger-hum-metrics-collect.sh",
+      "webhook_url": null,
+      "webhook_task": null,
+      "ops_playbook_section": "Hum Metrics Collect",
+      "delivers_to": "file",
+      "phrases": [
+        "hum metrics",
+        "hum signal",
+        "collect hum metrics",
+        "hum improvement metrics"
+      ],
+      "description": "Daily collector for the hum improvement loop. Reads yesterday's hum-runs, suggestion-history, hum-feedback, hum-state, confirmed-stops; writes one row to data/hum-metrics-state.json.daily[] (signal_score_raw, signal_per_surfaced, surface_rate, silent_rate, per-lane yields, reactions histogram). Runs decay detector (lane_decay_silent, global_decay_drop, surface_rate anomalies) and, when triggered (14-day per-lane cooldown), QUEUES a qualitative-diagnosis question to hum-qual-delivery-queue.json (it runs 06:29 local, inside the sleep window, so it must not send or occupy the pending slot itself); bin/hum-deliver-qual — kicked by trigger-hum.sh after the gates, through launchd agent ai.claude.hum-deliver-qual so its send can reach the Max login, and since hum-sense took over only on a fallback tick — delivers it at the next good tick and only then writes the pending slot (delivery + slot-lock atomic, so a never-delivered zombie can't block the question channel — 2026-07-21 fix). Also re-runs intervention attribution: for every open hum-interventions.jsonl row whose measure_at has passed, computes 7-day before/after deltas. Silent by default; on script error emits one infra ping. Conditionally dispatches HUM IMPROVEMENT IDEATION: decay <lane> if an answered qualitative question is present. Canonical design: data/hum-improvement-loop.md.",
+      "job": "hum-metrics-collect"
+    },
+    {
+      "delivers_to": "jori",
+      "job": "hum-action-executor",
+      "ops_playbook_section": null,
+      "phrases": [
+        "hum action executor"
+      ],
+      "webhook_task": "hum-action-executor",
+      "webhook_url": "http://localhost:9082",
+      "name": "hum-action-executor",
+      "schedule": "15 10 * * *",
+      "schedule_human": "Daily at 10:15 AM local",
+      "trigger_script": "agent/scripts/trigger-hum-action-executor.sh",
+      "description": "Executing half of the hum self-improvement loop for jori_autonomous-scoped ideas; approval-gated since 2026-08-23 (every improvement goes to the approval channel). The trigger selects the work set in code and skips the dispatch on an empty backlog; tier-routed to ops-light (2026-10-04). See ops-agent/jobs/hum-action-executor.md."
+    },
+    {
+      "name": "hum-improvement-ideation-weekly",
+      "schedule": "25 9 * * 0",
+      "schedule_human": "Sundays at 9:25 AM local",
+      "trigger_script": "agent/scripts/trigger-hum-improvement-ideation-weekly.sh",
+      "webhook_url": "http://localhost:9082",
+      "webhook_task": "HUM IMPROVEMENT IDEATION: weekly",
+      "ops_playbook_section": "Hum Improvement Ideation",
+      "delivers_to": "file",
+      "phrases": [
+        "hum improvement ideation",
+        "hum weekly ideation",
+        "generate hum improvement ideas",
+        "weekly hum review ideation"
+      ],
+      "description": "Weekly comprehensive hum-improvement ideation. Reads hum-metrics-state.json (30d), hum-learnings.jsonl (lane_diagnosis rows), hum-interventions.jsonl (verdicts), recent commits, prior ideas; proposes 3-6 ideas with evidence + scope (jori_autonomous vs manual_<owner_id>) + predicted_effect. Writes to data/hum-improvement-ideas.jsonl. jori_autonomous low/moderate ideas flow through self-improvement-executor (commits tagged [hum-intervention id=hum-i-...]); manual ideas surface in next morning-digest. Decay-triggered targeted ideation has its own dispatch path inside trigger-hum-metrics-collect.sh. Canonical design: data/hum-improvement-loop.md. Playbook: jobs/hum-improvement-ideation.md.",
+      "job": "hum-improvement-ideation"
+    },
+    {
+      "name": "calendar-attendee-audit",
+      "schedule": "17 5 * * *",
+      "schedule_human": "Daily at 1:17 AM local",
+      "trigger_script": "bin/calendar-attendee-audit",
+      "delivers_to": "system-channel",
+      "phrases": [
+        "calendar attendee audit",
+        "unexplained calendar invites",
+        "who did jori invite"
+      ],
+      "description": "Reconciles Google Calendar against data/logs/calendar-writes.jsonl and reports any the user-organized event carrying a non-the user attendee that jori-calendar cannot account for. The DETECTIVE half of the calendar-invite guard (2026-08-04): the preventive layers are the narrowed MCP grant, the jori-calendar wrapper's --attendee-authorized requirement, and the lint-unguarded-calendar-write pre-commit gate -- none of which closes Bash, and the harm here (an invite reaching a real person) cannot be undone. Scoped to events the user ORGANIZES (a meeting someone else set up carries their attendee list, not Jori's) and to events created on/after the guard's epoch (earlier ones cannot have a log row by construction). Silent when everything reconciles, which should be almost every night."
+    },
+    {
+      "name": "people-watch",
+      "schedule": "5 3 * * *",
+      "schedule_human": "Daily at 3:05 AM local (research) + hourly at :41, 9 AM-9 PM local (answers and drafts)",
+      "trigger_script": "agent/scripts/trigger-people-watch.sh",
+      "webhook_url": "http://localhost:9082",
+      "webhook_task": "PEOPLE WATCH",
+      "ops_playbook_section": null,
+      "delivers_to": "chat",
+      "phrases": [
+        "people watch",
+        "stay in touch",
+        "keep in touch with",
+        "slipping away",
+        "track their job changes",
+        "background research on people"
+      ],
+      "description": "Staying in touch with the people the user knows, always asked first. Code (`people-watch`) reads contact dates from the email and texts ledgers, finds people slipping away and people overdue a nudge, and enqueues one question at a time as a hum decision card (its own one-a-day slot). For people he says yes to (and, asked singly, the people he works with) the nightly turn researches LinkedIn, X and the news, records a snapshot, writes a `## Background` block linking their Google Contacts card, and code turns job and life changes into questions. 'Draft a note' answers get a draft in chat; nothing is ever sent to anyone. Added 2026-10-27.",
+      "job": "people-watch"
+    },
+    {
+      "name": "people-watch-day",
+      "schedule": "41 9-21 * * *",
+      "schedule_human": "Hourly at :41, 9 AM-9 PM local",
+      "trigger_script": "agent/scripts/trigger-people-watch-day.sh",
+      "webhook_url": "http://localhost:9082",
+      "webhook_task": "PEOPLE WATCH",
+      "ops_playbook_section": null,
+      "delivers_to": "chat",
+      "phrases": [
+        "people watch day pass"
+      ],
+      "description": "people-watch's day pass: typed answers and requested drafts (the nightly research run is people-watch)."
+    },
+    {
+      "name": "places-budget",
+      "schedule": "53 * * * *",
+      "schedule_human": "Hourly at :53",
+      "trigger_script": "agent/scripts/trigger-places-budget.sh",
+      "delivers_to": "none",
+      "phrases": [
+        "places budget",
+        "places api spend",
+        "google places spend",
+        "places meter"
+      ],
+      "description": "Hourly Google Places API spend meter; blocks a scope when its cap is reached. Deterministic, no agent dispatch. See docs/places-budget.md.",
+      "job": null
+    },
+    {
+      "name": "places-saved-refresh",
+      "schedule": "0 10 3 * *",
+      "schedule_human": "Monthly on the 3rd at 10:00 AM local",
+      "trigger_script": "agent/scripts/trigger-places-saved-refresh.sh",
+      "webhook_url": null,
+      "webhook_task": null,
+      "ops_playbook_section": null,
+      "delivers_to": "none",
+      "phrases": [
+        "saved places refresh",
+        "refresh saved places",
+        "google maps saved refresh",
+        "takeout saved import"
+      ],
+      "description": "Monthly refresh of the Google Maps saved-places store (data/google-saved-places.json, which `places nearby` cross-references) from a 'Saved' Google Takeout export auto-delivered to Drive. The worker (bin/places-saved-refresh) finds the newest takeout-<ts>-*.zip batch in Drive via gog, downloads+extracts it, runs places-saved-import (delta-cheap: only NEW places geocode; known ftids reuse stored coords), then trashes older takeout files. Direct script — no webhook, no Anthropic API. Requires gog Google auth (Drive scope); logs + exits 0 when auth is absent. NOTE: confirm the cron slot via jori-cron-slots on the host.",
+      "job": null
+    },
+    {
+      "name": "chat-build",
+      "schedule": "on-demand",
+      "schedule_human": "On-demand — launchd ai.claude.chat-build starts it whenever bin/build-request queues a request (QueueDirectories on data/build-queue/pending)",
+      "scheduler": "launchd",
+      "trigger_script": "agent/scripts/trigger-chat-build.sh",
+      "job": "chat-build",
+      "ops_playbook_section": "chat-build",
+      "delivers_to": "chat",
+      "phrases": [
+        "build this",
+        "add a feature",
+        "make jori do",
+        "change how jori",
+        "build status"
+      ],
+      "description": "Builds what the user asks for in chat on ephemeral Opus (claude -p --model $JORI_MODEL_OPUS --effort xhigh, 120-min cap). The chat agent queues the request with build-request and ends its turn; the build lands through self-improve-auto-apply (live, green check) or self-improve-request (Face-ID card), and a short report is posted back to chat. One build at a time. See ops-agent/jobs/chat-build.md."
+    },
+    {
+      "name": "weekly-summary",
+      "schedule": "20 0 * * 1",
+      "schedule_human": "Mondays at 12:20 AM",
+      "trigger_script": "agent/scripts/trigger-weekly-summary.sh",
+      "webhook_url": "http://localhost:9092",
+      "webhook_task": "WEEKLY SUMMARY",
+      "ops_playbook_section": null,
+      "delivers_to": "email",
+      "phrases": [
+        "weekly summary",
+        "week summary",
+        "week recap",
+        "weekly digest"
+      ],
+      "description": "Compact the last 7 daily_summaries (local calendar) into a weekly narrative. period-summary prep builds the packet (exact stats, home/away nights from the travel timeline) in the trigger; the agent turn (sonnet tier) only writes {narrative, themes}; period-summary publish persists to weekly_summaries and emails.",
+      "job": "weekly-summary"
+    },
+    {
+      "name": "monthly-summary",
+      "schedule": "30 0 1 * *",
+      "schedule_human": "1st of each month at 12:30 AM",
+      "trigger_script": "agent/scripts/trigger-monthly-summary.sh",
+      "webhook_url": "http://localhost:9092",
+      "webhook_task": "MONTHLY SUMMARY",
+      "ops_playbook_section": null,
+      "delivers_to": "email",
+      "phrases": [
+        "monthly summary",
+        "month summary",
+        "month recap",
+        "monthly digest"
+      ],
+      "description": "Compact the prior month (local calendar) into a monthly narrative. period-summary prep builds the packet (exact stats, home/away nights from the travel timeline, weekly narratives) in the trigger; the agent turn (sonnet tier) only writes {narrative, themes}; period-summary publish persists to monthly_summaries and emails.",
+      "job": "monthly-summary"
+    },
+    {
+      "name": "venue-watch",
+      "schedule": "on-demand",
+      "schedule_human": "On demand; an installation schedules one entry per lane",
+      "trigger_script": "agent/scripts/trigger-venue-watch.sh",
+      "webhook_url": null,
+      "webhook_task": null,
+      "ops_playbook_section": null,
+      "delivers_to": "email+jori",
+      "phrases": [
+        "venue watch",
+        "venue lane"
+      ],
+      "description": "Runs one config-defined venue-watch lane (agent/local/config/venue-watch.json lanes / lanes_file): trigger-venue-watch.sh <lane> kicks launchd ai.claude.venue-watch-<lane>. Off with no lanes.",
+      "job": null
+    },
+    {
+      "name": "launch-watch",
+      "schedule": "on-demand",
+      "schedule_human": "On demand; an installation schedules it (the trigger's cadence gate runs daily within 7 days of a launch, else weekly)",
+      "trigger_script": "agent/scripts/trigger-launch-watch.sh",
+      "webhook_url": null,
+      "webhook_task": null,
+      "ops_playbook_section": null,
+      "delivers_to": "calendar",
+      "phrases": [
+        "launch watch",
+        "rocket launches",
+        "launch calendar"
+      ],
+      "description": "Free calendar holds for upcoming launches matching agent/local/config/launch-watch.json `search` (Launch Library 2), sized by NET precision in the home zone; pings only on add, a move over 6h, or removal. Off without `search`. Playbook: agent/ops-agent/jobs/launch-watch.md.",
+      "job": null
+    },
+    {
+      "name": "weekend-events",
+      "schedule": "50 2 * * 5",
+      "schedule_human": "Fridays at 9:00 AM",
+      "trigger_script": "agent/scripts/trigger-weekend-events.sh",
+      "webhook_url": "http://localhost:9092",
+      "webhook_task": "WEEKEND EVENTS",
+      "ops_playbook_section": "Weekend Events",
+      "delivers_to": "jori",
+      "phrases": [
+        "weekend events",
+        "weekend plans",
+        "weekend activities",
+        "weekend activity list",
+        "weekend digest",
+        "what's on this weekend",
+        "whats on this weekend"
+      ],
+      "description": "Find the best events this weekend in the city the user will be in (travel timeline), verified against primary sources; one email + phone pointer + push.",
+      "job": "weekend-events"
+    },
+    {
+      "name": "birthday-brainstorm",
+      "schedule": "0 10 * * *",
+      "schedule_human": "Daily at 10:00 AM (date-gated — fires only on the stage days in agent/local/birthday-brainstorm/people.json)",
+      "trigger_script": "agent/scripts/trigger-birthday-brainstorm.sh",
+      "webhook_url": "http://localhost:9092",
+      "webhook_task": "BIRTHDAY BRAINSTORM",
+      "ops_playbook_section": null,
+      "delivers_to": "email+jori",
+      "phrases": [
+        "birthday brainstorm",
+        "birthday gift brainstorm",
+        "birthday ideas"
+      ],
+      "description": "Experience-gift ideas ahead of each configured birthday: kickoff (T-2 months), concrete options (T-1 month), reminder (T-7), day-of. Off with no people configured. Never drafts birthday messages.",
+      "job": "birthday-brainstorm"
+    },
+    {
+      "delivers_to": "email",
+      "job": "occasion-ideas",
+      "ops_playbook_section": null,
+      "phrases": [
+        "occasion ideas",
+        "anniversary ideas"
+      ],
+      "webhook_task": null,
+      "webhook_url": null,
+      "name": "occasion-ideas",
+      "schedule": "25 5 * * *",
+      "schedule_human": "Daily at 5:25 AM local (launchd agent ai.claude.occasion-ideas, NOT cron — Opus via claude -p needs the in-session Max keychain); emails only inside the window before an occasion in agent/local/occasion-ideas/occasions.json",
+      "trigger_script": "agent/scripts/trigger-occasion-ideas.sh",
+      "scheduler": "launchd",
+      "description": "One Opus email a day for the weeks before each configured occasion (an anniversary, a birthday): a great meal + evening bar + one activity/show in the city the user will be in. Off with no occasions configured. See ops-agent/jobs/occasion-ideas.md."
     }
   ]
 }

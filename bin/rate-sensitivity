@@ -1,0 +1,223 @@
+#!/usr/bin/env node
+"use strict";
+/**
+ * rate-sensitivity — how much the CURRENT book moves when long rates move.
+ *
+ * WHY THIS EXISTS. A book can fall several percent in a week because long
+ * rates spike while every holding's fundamentals are intact. A portfolio
+ * monitor that reports the rate LEVEL does not say what a rate move COSTS this
+ * particular book. That is arithmetic over price
+ * history, so it is code (same rule as domain-allocation): the agents quote
+ * the number, they never estimate it.
+ *
+ * METHOD. Today's holdings at today's weights (constant-weight backcast — the
+ * question is "this book", not "the book we used to own"), regressed on the
+ * daily change in the 30Y UST yield (FRED DGS30) and, separately, the 10Y
+ * TIPS real yield (FRED DFII10), over a trailing window (default 1y). Both a
+ * daily and a weekly (Fri→Fri) fit are reported; weekly is the headline
+ * because it is less sensitive to close-time mismatch. Beta is a correlation
+ * fact about the window, not a law — the R² is printed so a weak fit reads
+ * as weak. Per-ticker betas give the top contributors (weight × beta).
+ *
+ * DATA BOUNDARY. Only bare TICKER SYMBOLS go to Yahoo (public price history);
+ * position values and weights never leave this machine — same tier as
+ * domain-allocation (agent/CLAUDE.md § Financial Operations 5-7).
+ * Tickers with no history (money-market sweeps, private stakes) are excluded
+ * from the fit and named, never silently zeroed.
+ *
+ * Usage:
+ *   rate-sensitivity                 # table + writes the JSON below
+ *   rate-sensitivity --json          # machine-readable to stdout
+ *   rate-sensitivity --days 365      # window (calendar days)
+ *   rate-sensitivity --no-write      # don't update the shared file
+ *
+ * Positions: the brokerage positions table (lib/broker-config.cjs, from
+ * agent/local/config/investments.json `broker`); no broker connected = OFF
+ * (says so, exits 0). Writes the JSON to agent/local/config/rate-sensitivity.json
+ * `out` (relative to the installation; default data/rate-sensitivity.json),
+ * where the portfolio playbooks read it.
+ */
+
+const fs = require("node:fs");
+const path = require("node:path");
+const { loadEnv } = require("../lib/load-env.js");
+const { requestAll } = require("../lib/supabase-rest.js");
+const { brokerConfig } = require("../lib/broker-config.cjs");
+const { localConfig } = require("../lib/instance.cjs");
+const { installTools } = require("../lib/root.cjs");
+loadEnv();
+
+const BROKER = brokerConfig();
+const OUT = installTools(localConfig("rate-sensitivity", { out: "data/rate-sensitivity.json" }).out || "data/rate-sensitivity.json");
+const args = process.argv.slice(2);
+const JSON_OUT = args.includes("--json");
+const NO_WRITE = args.includes("--no-write");
+const DAYS = Number(args[args.indexOf("--days") + 1]) > 30 ? Number(args[args.indexOf("--days") + 1]) : 365;
+const SHOCK_BPS = 50;
+const UA = { "User-Agent": "Mozilla/5.0 (jori rate-sensitivity)" };
+
+const yahooSymbol = (t) => t.replace(/[./]/g, "-");
+
+async function fredSeries(id) {
+  const res = await fetch(`https://fred.stlouisfed.org/graph/fredgraph.csv?id=${id}`, { signal: AbortSignal.timeout(30000) });
+  if (!res.ok) throw new Error(`FRED ${id}: HTTP ${res.status}`);
+  const out = new Map();
+  for (const line of (await res.text()).split("\n").slice(1)) {
+    const [d, v] = line.split(",");
+    const n = Number(v);
+    if (d && v && v.trim() !== "." && Number.isFinite(n)) out.set(d.trim(), n);
+  }
+  return out;
+}
+
+async function yahooCloses(ticker) {
+  const range = DAYS > 730 ? "5y" : DAYS > 365 ? "2y" : "1y";
+  const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(yahooSymbol(ticker))}?range=${range}&interval=1d`;
+  try {
+    const res = await fetch(url, { headers: UA, signal: AbortSignal.timeout(20000) });
+    if (!res.ok) return null;
+    const r = (await res.json())?.chart?.result?.[0];
+    const ts = r?.timestamp || [];
+    const px = r?.indicators?.adjclose?.[0]?.adjclose || r?.indicators?.quote?.[0]?.close || [];
+    const out = new Map();
+    ts.forEach((t, i) => {
+      if (Number.isFinite(px[i]) && px[i] > 0) out.set(new Date(t * 1000).toISOString().slice(0, 10), px[i]);
+    });
+    return out.size >= 40 ? out : null;
+  } catch { return null; }
+}
+
+async function pool(items, n, fn) {
+  const out = new Array(items.length);
+  let i = 0;
+  await Promise.all(Array.from({ length: n }, async () => {
+    while (i < items.length) { const k = i++; out[k] = await fn(items[k]); }
+  }));
+  return out;
+}
+
+function ols(x, y) {
+  const n = x.length;
+  if (n < 10) return null;
+  const mx = x.reduce((a, b) => a + b, 0) / n, my = y.reduce((a, b) => a + b, 0) / n;
+  let sxy = 0, sxx = 0, syy = 0;
+  for (let i = 0; i < n; i++) { sxy += (x[i] - mx) * (y[i] - my); sxx += (x[i] - mx) ** 2; syy += (y[i] - my) ** 2; }
+  if (!sxx || !syy) return null;
+  return { beta: sxy / sxx, r2: (sxy * sxy) / (sxx * syy), n };
+}
+
+// Daily (or weekly) series: portfolio return (constant current weights,
+// renormalized over tickers that have both closes) vs Δ yield in bps.
+function buildSeries(dates, closes, weights, rate) {
+  const xs = [], ys = [], perTicker = {};
+  for (const t of Object.keys(weights)) perTicker[t] = { x: [], y: [] };
+  for (let i = 1; i < dates.length; i++) {
+    const d0 = dates[i - 1], d1 = dates[i];
+    if (!rate.has(d0) || !rate.has(d1)) continue;
+    const dy = (rate.get(d1) - rate.get(d0)) * 100;
+    let r = 0, w = 0;
+    for (const [t, wt] of Object.entries(weights)) {
+      const p0 = closes[t].get(d0), p1 = closes[t].get(d1);
+      if (!p0 || !p1) continue;
+      const ret = p1 / p0 - 1;
+      r += wt * ret; w += wt;
+      perTicker[t].x.push(dy); perTicker[t].y.push(ret);
+    }
+    if (w < 0.8) continue; // too much of the book missing that day
+    xs.push(dy); ys.push(r / w);
+  }
+  return { xs, ys, perTicker };
+}
+
+function fridays(dates) {
+  // last trading day of each ISO week
+  const byWeek = new Map();
+  for (const d of dates) {
+    const dt = new Date(d + "T12:00:00Z");
+    const monday = new Date(dt); monday.setUTCDate(dt.getUTCDate() - ((dt.getUTCDay() + 6) % 7));
+    byWeek.set(monday.toISOString().slice(0, 10), d);
+  }
+  return [...byWeek.values()].sort();
+}
+
+function fit(label, rate, dates, closes, weights, total) {
+  const daily = buildSeries(dates, closes, weights, rate);
+  const weekly = buildSeries(fridays(dates), closes, weights, rate);
+  const d = ols(daily.xs, daily.ys), w = ols(weekly.xs, weekly.ys);
+  const head = w || d;
+  if (!head) return { series: label, error: "insufficient overlapping data" };
+  const pct = head.beta * SHOCK_BPS * 100;
+  const contributors = Object.entries(weights).map(([t, wt]) => {
+    const pt = (w ? weekly : daily).perTicker[t];
+    const f = ols(pt.x, pt.y);
+    return f ? { ticker: t, weight_pct: +(wt * 100).toFixed(2), pct_per_50bps: +(f.beta * SHOCK_BPS * 100).toFixed(2), contribution_pp: +(wt * f.beta * SHOCK_BPS * 100).toFixed(3), r2: +f.r2.toFixed(2) } : null;
+  }).filter(Boolean).sort((a, b) => a.contribution_pp - b.contribution_pp);
+  return {
+    series: label,
+    latest: { date: [...rate.keys()].pop(), yield_pct: [...rate.values()].pop() },
+    headline_fit: w ? "weekly" : "daily",
+    pct_per_50bps: +pct.toFixed(2),
+    usd_per_50bps: Math.round(head.beta * SHOCK_BPS * total),
+    r2: +head.r2.toFixed(2),
+    fit_quality: head.r2 < 0.1 ? "weak" : head.r2 < 0.3 ? "moderate" : "strong",
+    n_obs: head.n,
+    daily: d && { pct_per_50bps: +(d.beta * SHOCK_BPS * 100).toFixed(2), r2: +d.r2.toFixed(2), n_obs: d.n },
+    weekly: w && { pct_per_50bps: +(w.beta * SHOCK_BPS * 100).toFixed(2), r2: +w.r2.toFixed(2), n_obs: w.n },
+    most_rate_sensitive: contributors.slice(0, 5),
+    least_rate_sensitive: contributors.slice(-3).reverse(),
+  };
+}
+
+(async () => {
+  if (!BROKER.api_url) { console.log("rate-sensitivity: no brokerage connected (agent/local/config/investments.json broker) — nothing to measure."); return; }
+  const table = BROKER.tables.positions;
+  const rows = await requestAll(`/rest/v1/${table}?select=ticker,market_value,as_of`);
+  if (!rows || !rows.length) { console.error(`rate-sensitivity: no ${table} rows`); process.exit(1); }
+  const asOf = rows.map((r) => r.as_of).sort().pop();
+  const value = {};
+  for (const r of rows) {
+    const v = Number(r.market_value) || 0;
+    if (r.ticker && v > 0) value[r.ticker] = (value[r.ticker] || 0) + v;
+  }
+  const total = Object.values(value).reduce((a, b) => a + b, 0);
+  const tickers = Object.keys(value);
+
+  const [dgs30, dfii10, closesList] = await Promise.all([
+    fredSeries("DGS30"), fredSeries("DFII10"), pool(tickers, 6, yahooCloses),
+  ]);
+  const closes = {}, excluded = [];
+  tickers.forEach((t, i) => (closesList[i] ? (closes[t] = closesList[i]) : excluded.push(t)));
+  const coveredValue = Object.keys(closes).reduce((s, t) => s + value[t], 0);
+  const weights = {};
+  for (const t of Object.keys(closes)) weights[t] = value[t] / coveredValue;
+
+  const since = new Date(Date.now() - DAYS * 864e5).toISOString().slice(0, 10);
+  const dates = [...new Set(Object.values(closes).flatMap((m) => [...m.keys()]))].filter((d) => d >= since).sort();
+
+  const out = {
+    as_of: new Date().toISOString(),
+    positions_as_of: asOf,
+    window: { from: dates[0], to: dates[dates.length - 1], calendar_days: DAYS },
+    shock_bps: SHOCK_BPS,
+    book_value_usd: Math.round(total),
+    coverage_pct: +((coveredValue / total) * 100).toFixed(1),
+    excluded_tickers: excluded.map((t) => ({ ticker: t, value_pct: +((value[t] / total) * 100).toFixed(2) })),
+    nominal_30y: fit("DGS30 (30Y UST)", dgs30, dates, closes, weights, total),
+    real_10y: fit("DFII10 (10Y TIPS real)", dfii10, dates, closes, weights, total),
+    method: "constant current weights backcast; OLS of book return on Δyield (bps); weekly fit is the headline; a correlation over the window, not a forecast",
+  };
+
+  if (!NO_WRITE) { fs.mkdirSync(path.dirname(OUT), { recursive: true }); fs.writeFileSync(OUT, JSON.stringify(out, null, 2) + "\n"); }
+  if (JSON_OUT) { console.log(JSON.stringify(out, null, 2)); return; }
+
+  const line = (f) => f.error ? `  ${f.series}: ${f.error}` :
+    `  ${f.series} — now ${f.latest.yield_pct.toFixed(2)}% (${f.latest.date})\n` +
+    `    +${SHOCK_BPS}bps ⇒ book ${f.pct_per_50bps >= 0 ? "+" : ""}${f.pct_per_50bps}% (≈ ${f.usd_per_50bps < 0 ? "−" : "+"}$${Math.abs(f.usd_per_50bps).toLocaleString()}), R² ${f.r2}${f.fit_quality === "weak" ? " (weak fit — rates explain little of the book's moves)" : ""}, ${f.headline_fit} n=${f.n_obs}` +
+    (f.daily && f.weekly ? `  [daily ${f.daily.pct_per_50bps}% R² ${f.daily.r2}]` : "") +
+    `\n    most sensitive: ${f.most_rate_sensitive.map((c) => `${c.ticker} ${c.contribution_pp}pp`).join(", ")}`;
+  console.log(`Rate sensitivity — positions as of ${asOf} (snapshot, not live); window ${out.window.from}→${out.window.to}`);
+  console.log(`  book $${out.book_value_usd.toLocaleString()}, coverage ${out.coverage_pct}%` +
+    (excluded.length ? `; excluded: ${out.excluded_tickers.map((e) => `${e.ticker} ${e.value_pct}%`).join(", ")}` : ""));
+  console.log(line(out.nominal_30y));
+  console.log(line(out.real_10y));
+})().catch((e) => { console.error(`rate-sensitivity: ${e.message}`); process.exit(1); });

@@ -1,0 +1,12 @@
+{
+  "notes": "lib/address-match.mjs askSameHome — is a stop one of the user's known homes (data/named-locations.json), judged by addresses? Code has already picked the candidate homes by geometry (within 500 m of a home's recorded spot, or an address-only home in the stop's timezone); this question reads only the addresses. State: stop_addresses (the geocoders' labels for the spot, in English and the local language) and homes (h0..hN, their addresses). Jev picks a home id or none. Below threshold, an error, or a missing key: the Sonnet → Opus read in the same file. Agreement = the same id. Threshold 0.9 because Jev is weak on numbers and the house-number tolerance is a number judgement; a wrong pick names a stranger's house after the user's family. A street named across languages and transliterations is one street, and nearby house numbers on the same street count as the same home; a model decides (Rule #0b).",
+  "threshold": 0.9,
+  "questions": {},
+  "home_template": {
+    "type": "choice",
+    "instructions": "`stop_addresses` are what map geocoders call the spot where {{owner_name}} stopped: street addresses in English or another language, sometimes transliterated, often with a different house number for the same building. `homes` are addresses of homes {{owner_name}} knows. Is the stop at one of these homes? Pick a home's id only when a stop address names the same street as the home's address (in the same town when both name a town) and its house number, if any, is the home's number or within a few doors of it. The same street across languages and transliterations counts (a street name in its own script and its Latin transliteration are one street name, and Alley, Lane and their local-language words are the same kind of street, which a geocoder may drop or translate). Pick none for a street of the same name in another town, a different street, or a house number far along the street.",
+    "fixed_criteria": {
+      "none": "the stop is not at any of these homes: a different street, a different town, or a house number far from the home's"
+    }
+  }
+}

@@ -1,0 +1,209 @@
+#!/usr/bin/env node
+// meeting-notes-from-zoom — after a recurring meeting's call, fold Zoom's record of
+// it into the meeting notes and tell the user what was added.
+//
+// The requirement: a transcript of each call updates the call summaries and the
+// action items for the next call. The call runs in the user's own Zoom room;
+// AI Companion summaries auto-start there when the account has them on, and a
+// cloud recording's transcript is used instead when one exists
+// (lib/zoom-content.mjs).
+//
+// When: the post-call cron lines bin/meeting-update schedules (T+60, T+100,
+// T+150, T+240 minutes after the call's start) run `meeting-remind post`,
+// which kicks the meeting's launchd agent (`notes_agent`; the Max login for
+// `claude -p` is only readable from the GUI session, never from cron). Each run:
+//   - the post message was already sent for this call → nothing.
+//   - Zoom shows the call (an ended instance of the room with the counterpart
+//     in it, started from 90 min before the slot to 4h after) and has its
+//     transcript or summary → a model (tool-less Sonnet, then Opus) reads it and
+//     answers with a structured edit (lib/meeting-notes-update.mjs); code checks
+//     it, backs the notes up, applies it by heading, and sends "here is what I
+//     added — anything else?". The T-15 reminder before the next call then lists
+//     the new To Discuss items as it always does.
+//   - not yet (the call still running, AI Companion still writing) → wait for
+//     the next cron line; on the last one (T+230 min or later) send the plain
+//     "anything to remember?" ask, saying why nothing was added.
+// The message keeps the post-call wording the chat agent's meeting-notes
+// procedure answers to ("Anything to remember from the call?").
+//
+// Usage: meeting-notes-from-zoom [--meeting <id>] [--dry-run] [--date YYYY-MM-DD --at <ISO start>]
+//   The meeting: --meeting, else $MEETING_ID; with neither, every configured
+//   meeting in turn. Default call: the meeting's state file. --dry-run reads
+//   Zoom and runs the model but writes nothing, sends nothing, and prints the edit.
+// Exit 0 done, waiting or nothing configured (the line printed says which), 1 failure, 2 usage.
+
+import fs from "node:fs";
+import path from "node:path";
+import { spawnSync } from "node:child_process";
+import { createRequire } from "node:module";
+import { loadCredentials, createZoomClient } from "../lib/zoom-client.mjs";
+import { writeFileAtomic } from "../lib/atomic-write.js";
+import { participantMatch, participantIds } from "../lib/meeting-call.mjs";
+import { callContent } from "../lib/zoom-content.mjs";
+import { editPrompt, validateEdit, applyEdit, cleanLabels, cleanPriority, openItems } from "../lib/meeting-notes-update.mjs";
+import { meeting, meetings, statePath, notesPath, backupsDir, installPath } from "../lib/meetings.mjs";
+
+const require = createRequire(import.meta.url);
+const { installTools } = require("../lib/root.cjs");
+const SEND = installTools("bin/jori-send-curl");
+const CRONTAB_SAFE = installTools("bin/crontab-safe");
+const BEFORE_MS = 90 * 60_000, AFTER_MS = 4 * 3600_000, FINAL_MS = 230 * 60_000;
+
+const argv = process.argv.slice(2);
+const flag = (n) => { const i = argv.indexOf(n); return i >= 0 ? argv[i + 1] : null; };
+const DRY = argv.includes("--dry-run");
+const say = (s) => process.stdout.write(`${new Date().toISOString()} ${s}\n`);
+const readJson = (f, d) => { try { return JSON.parse(fs.readFileSync(f, "utf8")); } catch { return d; } };
+
+function localTz(fallback) {
+  const t = readJson(installPath("data/user-timezone.json"), {}).timezone;
+  return t || fallback;
+}
+const clock = (ms, tz) => new Intl.DateTimeFormat("en-US", { timeZone: tz, hour: "numeric", minute: "2-digit" })
+  .format(new Date(ms)).split(" ").join("").toLowerCase();
+
+/** The counterpart's ended instances of the room around the slot: [{uuid, start_ms, end_ms}] (their own time there). */
+async function counterpartInstances(client, m, slotMs) {
+  const day = (ms) => new Date(ms).toISOString().slice(0, 10);
+  const ids = participantIds(m);
+  const list = await client.pastInstances(m.room_id, { from: day(slotMs - 86400_000), to: day(slotMs + 86400_000) });
+  const out = [];
+  for (const x of list) {
+    const t = Date.parse(x.start_time);
+    if (!(t >= slotMs - BEFORE_MS && t <= slotMs + AFTER_MS)) continue;
+    const recs = (await client.pastParticipants(x.uuid)).filter((p) => participantMatch(p, ids));
+    if (!recs.length) continue;
+    const joins = recs.map((p) => Date.parse(p.join_time)).filter(Number.isFinite);
+    const leaves = recs.map((p) => Date.parse(p.leave_time)).filter(Number.isFinite);
+    out.push({ uuid: x.uuid, start_ms: joins.length ? Math.min(...joins) : t, end_ms: leaves.length ? Math.max(...leaves) : t });
+  }
+  return out.sort((a, b) => a.start_ms - b.start_ms);
+}
+
+async function readEdit(prompt, notesText) {
+  const { runToollessDetailed, parseModelJson } = await import("../lib/jev-claude.mjs");
+  const { MODELS } = require("../lib/models.cjs");
+  const tried = [];
+  for (const [tier, model] of [["sonnet", MODELS.sonnet], ["opus", MODELS.opus]]) {
+    const { out, error } = await runToollessDetailed({ model, prompt, timeoutMs: 240_000, effort: "medium" });
+    if (error) throw new Error(`${tier}: ${error.kind}: ${error.message}`);
+    const edit = parseModelJson(out);
+    const bad = validateEdit(edit, notesText);
+    if (!bad) return { tier, edit };
+    tried.push(`${tier}: ${bad}`);
+  }
+  throw new Error(`no tier gave a usable edit (${tried.join("; ")})`);
+}
+
+function send(text) {
+  if (DRY) { process.stdout.write(`--- message (not sent) ---\n${text}\n`); return true; }
+  const r = spawnSync(SEND, [], { input: text, encoding: "utf8", timeout: 60_000 });
+  if (r.status !== 0) say(`send failed (exit ${r.status}): ${String(r.stderr || "").trim().slice(-200)}`);
+  return r.status === 0;
+}
+
+function markSent(m, state) {
+  if (DRY) return;
+  const STATE = statePath(m);
+  const cur = readJson(STATE, null);
+  if (cur && cur.epoch_start === state.epoch_start) {
+    cur.post_reminder_sent = true;
+    writeFileAtomic(STATE, JSON.stringify(cur, null, 2) + "\n");
+  }
+  // MEETING_CRONTAB_TIMEOUT reaches crontab-safe as its CRONTAB_SAFE_TIMEOUT
+  // (an explicit CRONTAB_SAFE_TIMEOUT still wins).
+  const env = { ...process.env, CRONTAB_SAFE_TIMEOUT: process.env.CRONTAB_SAFE_TIMEOUT || process.env.MEETING_CRONTAB_TIMEOUT || "" };
+  spawnSync("/bin/bash", [CRONTAB_SAFE, "remove", m.cron_tag], { encoding: "utf8", timeout: 60_000, env });
+}
+
+const ASK = "Anything to remember from the call? Reply and I'll add it to the notes.";
+
+async function runOne(m) {
+  const NOTES = notesPath(m), APPLIED = m.paths.applied, LABELS = m.paths.labels, BACKUPS = backupsDir(m);
+  let state = readJson(statePath(m), null);
+  if (flag("--date")) {
+    const at = Date.parse(flag("--at") || "");
+    if (!Number.isFinite(at)) { process.stderr.write("usage: meeting-notes-from-zoom [--meeting <id>] [--dry-run] [--date YYYY-MM-DD --at <ISO start>]\n"); process.exit(2); }
+    state = { date: flag("--date"), epoch_start: Math.floor(at / 1000), timezone: m.tz, post_reminder_sent: false };
+  }
+  if (!state || !state.date || !state.epoch_start) { say(`no ${m.name} call in the state file; nothing to do`); return; }
+  if (state.post_reminder_sent && !DRY) { say(`post-call message for ${state.date} already sent; nothing to do`); return; }
+  const slotMs = state.epoch_start * 1000;
+  const final = Date.now() - slotMs >= FINAL_MS;
+  const tz = localTz(state.timezone || m.tz) || m.tz;
+
+  const creds = loadCredentials();
+  let why = "Zoom is not set up here";
+  if (creds.cfg && m.room_id) {
+    try {
+      const client = createZoomClient({ cfg: creds.cfg });
+      const insts = await counterpartInstances(client, m, slotMs);
+      const applied = readJson(APPLIED, { applied: {} });
+      if (insts.some((i) => applied.applied[i.uuid]) && !DRY) { say(`Zoom call ${state.date} already folded into the notes`); markSent(m, state); return; }
+      const content = insts.length ? await callContent(client, insts.map((i) => i.uuid)) : null;
+      if (content) {
+        const s = insts[0].start_ms, e = insts[insts.length - 1].end_ms;
+        const when = `${clock(s, tz)}-${clock(e, tz)}, ${Math.round((e - s) / 60000)} min`;
+        const notesText = fs.readFileSync(NOTES, "utf8");
+        const { tier, edit } = await readEdit(editPrompt({ date: state.date, when, source: content.kind, content: content.text, notesText, name: m.name }), notesText);
+        const next = applyEdit(notesText, state.date, edit);
+        const labels = cleanLabels(edit, notesText), priority = cleanPriority(edit, notesText);
+        if (DRY) {
+          process.stdout.write(`--- edit by ${tier} from the Zoom ${content.kind} ---\n${JSON.stringify(edit, null, 1)}\n`);
+        } else {
+          fs.mkdirSync(BACKUPS, { recursive: true });
+          fs.copyFileSync(NOTES, path.join(BACKUPS, `${m.backup_prefix}-${new Date().toISOString().split(":").join("")}.md`));
+          // Unchanged since it was read, or someone (the chat agent) wrote it meanwhile: never write over that.
+          if (fs.readFileSync(NOTES, "utf8") !== notesText) throw new Error(`${path.basename(NOTES)} changed while the call was read; try again next run`);
+          // Atomic: chat reads the notes at any moment.
+          writeFileAtomic(NOTES, next);
+          fs.mkdirSync(path.dirname(APPLIED), { recursive: true });
+          for (const i of insts) applied.applied[i.uuid] = { date: state.date, source: content.kind, read_by: tier, at: new Date().toISOString() };
+          writeFileAtomic(APPLIED, JSON.stringify(applied, null, 1) + "\n");
+          // Short agenda labels for the next reminder: this call's, over the ones kept, for items still open.
+          const all = { ...(readJson(LABELS, {}).labels || {}), ...labels };
+          const open = openItems(next);
+          // `order` is the model's ranking of the open items, which the reminder lists first.
+          fs.mkdirSync(path.dirname(LABELS), { recursive: true });
+          writeFileAtomic(LABELS, JSON.stringify({ updated: new Date().toISOString(),
+            labels: Object.fromEntries(open.filter((k) => all[k]).map((k) => [k, all[k]])),
+            order: priority.filter((k) => open.includes(k)) }, null, 1) + "\n");
+        }
+        // Short bullets, to the point, most important first. The notes keep the full wording.
+        // "- " not "•": the app renders Markdown, where "•" lines run together as one paragraph.
+        const rank = (x) => (priority.includes(x) ? priority.indexOf(x) : priority.length);
+        const list = (xs) => [...xs].sort((a, b) => rank(a) - rank(b)).map((x) => `- ${labels[x] || x}`).join("\n");
+        const msg = [`📝 ${m.name} call · ${when}`,
+          `Discussed:\n${edit.recap.map((x) => `- ${x}`).join("\n")}`,
+          edit.follow_ups.length ? `Next time:\n${list(edit.follow_ups)}` : "",
+          edit.closed_items.length ? `Done:\n${list(edit.closed_items)}` : "",
+          ASK].filter(Boolean).join("\n\n");
+        if (send(msg)) markSent(m, state);
+        say(`${DRY ? "would fold" : "folded"} the Zoom ${content.kind} for ${state.date} into the notes (${tier})`);
+        return;
+      }
+      why = insts.length ? "Zoom has no summary or transcript for the call" : `Zoom shows no call with ${m.name} in your room`;
+    } catch (e) {
+      why = `Zoom could not be read (${String((e && e.message) || e).slice(0, 120)})`;
+      say(why);
+      if (!final) return;
+    }
+  }
+  if (!creds.cfg || !m.room_id || final) {
+    const msg = `📝 ${m.name} call · ${clock(slotMs, tz)}${creds.cfg && m.room_id ? `\n\n${why}, so nothing was added.` : ""}\n\n${ASK}`;
+    if (send(msg)) markSent(m, state);
+    say(`${DRY ? "would send" : "sent"} the plain post-call ask for ${state.date} (${why})`);
+    return;
+  }
+  say(`waiting: ${why} yet (${state.date}); the next post-call run tries again`);
+}
+
+async function main() {
+  require("../lib/load-env.js").loadEnv();
+  const want = flag("--meeting") || process.env.MEETING_ID || null;
+  const list = want ? [meeting(want)].filter(Boolean) : meetings();
+  if (!list.length) { say(`no recurring meeting configured${want ? ` as ${want}` : ""} (agent/local/config/meetings.json); nothing to do`); return; }
+  for (const m of list) await runOne(m);
+}
+
+main().catch((e) => { process.stderr.write(`meeting-notes-from-zoom: ${(e && e.stack) || e}\n`); process.exit(1); });

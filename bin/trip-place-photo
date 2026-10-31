@@ -1,0 +1,381 @@
+#!/usr/bin/env node
+// trip-place-photo — find a representative photo for a place via Google
+// Places (Text Search near a coordinate), then re-host it in Supabase storage
+// so the outbound email never carries a Google-hosted URL with an embedded API
+// key (feedback_daily_summary_photos convention: Supabase public URLs only,
+// never base64/CID, never a third-party URL with a live key in it).
+//
+// Usage:
+//   trip-place-photo "<query>" <lat> <lon> <slug>
+// On success prints a JSON object to stdout — `{url, mapsUri, address,
+// displayName, hash}` — where `url` is the re-hosted public Supabase URL. Parse
+// it and read `.url` (trip-reservoir-photos does).
+// On failure exits non-zero with a stderr message (no photo found / upload
+// failed) — callers should treat failure as "skip the photo here", not a job
+// error.
+
+import { createHash } from "node:crypto";
+import { loadEnv } from "../lib/load-env.js";
+import { assertPlacesAllowed } from "../lib/places-guard.js";
+import { createRequire } from "node:module";
+import { fileURLToPath } from "node:url";
+// ESM file (it uses `import`), so CJS globals must be rebuilt for the require() calls below.
+const require = createRequire(import.meta.url);
+const __dirname = fileURLToPath(new URL(".", import.meta.url));
+loadEnv();
+assertPlacesAllowed("trip-place-photo");
+
+const PLACES_KEY = process.env.GOOGLE_PLACES_API_KEY;
+const { placePhotoBytes, placeIdFromRef } = require(require("node:path").join(__dirname, "..", "lib", "place-photo-store.js"));
+const { logPlacesCall } = require(require("node:path").join(__dirname, "..", "lib", "places-log.js"));
+const UNSPLASH_KEY = process.env.UNSPLASH_ACCESS_KEY;
+const { instance, supabaseUrl } = require(require("node:path").join(__dirname, "..", "lib", "instance.cjs"));
+const SUPABASE_URL = process.env.SUPABASE_URL || supabaseUrl();
+// Wikimedia asks every client to name a contact in its User-Agent.
+const UA = `jori-trip-guide/1.0 (${instance().agent_email || instance().owner_email || "no contact configured"})`;
+const SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
+const BUCKET = "daily-photos";
+const PREFIX = "france-itinerary";
+
+// --landmark makes Unsplash the PREFERRED source (professional town/landmark/
+// scenery shots are better there than user-uploaded Places photos); without it
+// Places is preferred (accurate for a specific venue) and Unsplash is the
+// fallback when Places has no photo. Either way the winning image is re-hosted
+// on Supabase (no third-party URL in the email, per the photos convention).
+//
+// --photo-name <resource> re-hosts EXACTLY that Places photo resource (as
+// returned by trip-place-verify for the place we already resolved),
+// skipping the independent Places text-search entirely. This guarantees the
+// inline photo depicts the SAME place the itinerary linked + addressed — a
+// separate name-search here used to resolve a DIFFERENT Places entry (2026-07-11:
+// a town's "Old Town" verified to one of its gates but the photo search
+// returned its "Historic Town Centre"). The positional <query> is still used, but only
+// as the Unsplash fallback keyword if the exact media fetch fails.
+// --unsplash-only skips Places entirely (for a pick with no Google photo, or a
+// place-less event such as a temporary fair).
+const flagVal = (name) => { const i = process.argv.indexOf(name); return i >= 0 ? process.argv[i + 1] : null; };
+const PHOTO_NAME = flagVal("--photo-name");
+// The place and slot this photograph belongs to, so the store (place-photo-store.js)
+// can answer without Google when it has been fetched before. Derived from the
+// photo name when the caller does not say.
+const PLACE_ID = flagVal("--place-id") || placeIdFromRef(PHOTO_NAME);
+const SLOT = Number(flagVal("--slot") || 0);
+const UNSPLASH_ONLY = process.argv.includes("--unsplash-only");
+const WIKI_FIRST = process.argv.includes("--wiki-first");
+// --wiki-only is --wiki-first with NO Unsplash fallback. Used for dish photos:
+// Unsplash keyword search has no notion of correctness, so for a dish it can't
+// find it answers with the nearest stock-photography genre — which is where the
+// sushi platters standing in for Atlantic seafood came from. For a dish, "no
+// photo" is a better answer than "a photo of some other food".
+const WIKI_ONLY = process.argv.includes("--wiki-only");
+const skipVals = new Set(["--landmark", "--unsplash-only", "--wiki-first", "--wiki-only", "--photo-name", PHOTO_NAME,
+  "--place-id", flagVal("--place-id"), "--slot", flagVal("--slot")].filter(Boolean));
+const argv = process.argv.slice(2).filter((a) => !skipVals.has(a));
+const LANDMARK = process.argv.includes("--landmark");
+const [query, latStr, lonStr, slug] = argv;
+if (!query || !latStr || !lonStr || !slug) {
+  console.error("usage: trip-place-photo \"<query>\" <lat> <lon> <slug> [--landmark] [--photo-name <resource>] [--unsplash-only] [--wiki-first] [--wiki-only]");
+  process.exit(2);
+}
+if (!PLACES_KEY) { console.error("GOOGLE_PLACES_API_KEY not set"); process.exit(1); }
+if (!SUPABASE_KEY) { console.error("SUPABASE_SERVICE_ROLE_KEY not set"); process.exit(1); }
+
+async function getPlacesImage() {
+  const body = {
+    textQuery: query,
+    locationBias: { circle: { center: { latitude: Number(latStr), longitude: Number(lonStr) }, radius: 20000 } },
+    maxResultCount: 3,
+  };
+  // The one guarded door: priced, gated and logged by places-client.
+  const placesClient = require(require("node:path").join(__dirname, "..", "lib", "places-client.js"));
+  const data = await placesClient.post("trip-place-photo", "places:searchText", body,
+    { mask: "places.id,places.displayName,places.photos,places.googleMapsUri,places.formattedAddress",
+      method: "searchText", key: PLACES_KEY, query, lat: Number(latStr), lon: Number(lonStr) });
+  const place = (data.places || [])[0];
+  if (!place || !place.photos || !place.photos.length) return null;
+  // The store answers from our own copy when this place's first photograph
+  // has ever been fetched; Google is asked once, the first time only.
+  const got = await placePhotoBytes(place.id || placeIdFromRef(place.photos[0].name), 0, place.photos[0].name, { tool: "trip-place-photo" });
+  if (!got) return null;
+  return {
+    buf: got.buf,
+    mapsUri: place.googleMapsUri || null,
+    address: place.formattedAddress || null,
+    displayName: place.displayName?.text || query,
+  };
+}
+
+// Re-host an EXACT Places photo resource (from trip-place-verify's
+// photoName) — no search, so it's guaranteed to be the resolved place's own
+// image. Returns null if the media fetch fails (caller falls back to Unsplash).
+async function getImageByName() {
+  // Through the store: fetched from Google only if this place's slot has
+  // never been stored (trip-day-render's candidate pass usually already has).
+  const got = await placePhotoBytes(PLACE_ID, SLOT, PHOTO_NAME, { tool: "trip-place-photo" });
+  if (!got) return null;
+  return { buf: got.buf, mapsUri: null, address: null, displayName: query };
+}
+
+// Unsplash search → first landscape result, re-hosted on Supabase (keyless
+// Unsplash CDN would be fine to hotlink, but the photos convention is
+// Supabase-only). Tries UNSPLASH_ACCESS_KEY then UNSPLASH_ACCESS_KEY_2 so a
+// rate-limited Demo-tier key (50 req/hr) rolls over to the backup.
+async function getUnsplashImage() {
+  const keys = [UNSPLASH_KEY, process.env.UNSPLASH_ACCESS_KEY_2].filter(Boolean);
+  for (const key of keys) {
+    const u = `https://api.unsplash.com/search/photos?query=${encodeURIComponent(query)}&per_page=1&orientation=landscape&content_filter=high`;
+    const res = await fetch(u, { headers: { Authorization: `Client-ID ${key}`, "Accept-Version": "v1" } });
+    if (!res.ok) continue; // rate-limited / bad key → try the next key
+    const data = await res.json();
+    const photo = (data.results || [])[0];
+    const imgUrl = photo?.urls?.regular || photo?.urls?.small;
+    if (!imgUrl) return null; // a valid empty result — no point retrying other keys
+    const imgRes = await fetch(imgUrl);
+    if (!imgRes.ok) return null;
+    return { buf: Buffer.from(await imgRes.arrayBuffer()), mapsUri: null, address: null, displayName: query };
+  }
+  return null;
+}
+
+// Wikipedia / Wikimedia Commons lead image for a NAMED subject — the right
+// source for a specific regional dish ("Far breton", "Kouign-amann", "Gâteau
+// nantais"), which Unsplash keyword search misses or answers with a generic
+// shot. Uses the search generator so we don't need the exact article title, and
+// tries French Wikipedia first (better coverage for French food) then English.
+// Wikimedia images are freely licensed and correctly captioned — the labelled
+// photo of that exact dish, not a lookalike.
+// Categories are the cheapest reliable "is this article about food" signal.
+// Tier 1 is a prepared dish/drink/cheese; tier 2 is a raw ingredient or the
+// living organism (fr:Sardine is a fish, fr:Beurre blanc is the sauce). Both
+// are edible; tier 1 photographs as the thing on the plate, so prefer it.
+const CAT_T1 = /cuisine|gastronom|\bplat\b|dessert|p[âa]tisser|sp[ée]cialit[ée]|\bmets\b|sauce|salade|soupe|confiserie|charcuterie|fromage|\bpain\b|biscuit|boisson|\bvin\b|dish|cake|pastr|confection|cheese|wine|beverage|bread|stew|soup/i;
+const CAT_T2 = /aliment|poisson|crustac|mollusque|coquillage|viande|l[ée]gume|\bfruit|food|seafood|meat|vegetable|esp[èe]ce|faune/i;
+const MIN_TITLE_SIM = 0.34;
+
+function normTitle(s) {
+  return String(s || "").normalize("NFD").replace(/[̀-ͯ]/g, "")
+    .toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+}
+
+// Dice coefficient over bigrams — does the article actually NAME what we asked
+// for? Without this, a search for "Fresh landed fish and seafood" returns
+// en:Sashimi (a real food article, and a literal sushi photo that once shipped)
+// and "sandre au beurre blanc" returns fr:Cuisine angevine. A title sharing no
+// letters with the query is a coincidence, not an answer.
+function dice(a, b) {
+  const x = a.replace(/[^a-z0-9]/g, ""), y = b.replace(/[^a-z0-9]/g, "");
+  if (!x || !y) return 0;
+  if (x === y) return 1;
+  if (x.length < 2 || y.length < 2) return 0;
+  const g = new Map();
+  for (let i = 0; i < x.length - 1; i++) { const k = x.slice(i, i + 2); g.set(k, (g.get(k) || 0) + 1); }
+  let hit = 0;
+  for (let i = 0; i < y.length - 1; i++) { const k = y.slice(i, i + 2); const n = g.get(k) || 0; if (n) { g.set(k, n - 1); hit++; } }
+  return (2 * hit) / (x.length - 1 + y.length - 1);
+}
+
+// Wikipedia / Wikimedia Commons lead image for a NAMED dish. Gated three ways,
+// because an ungated `generator=search` ALWAYS returns something: a search for
+// "sardines grillées fraîches de la criée du matin" returned the TOWN of
+// Douarnenez and we shipped a photo of its harbour as a food picture.
+//   1. no `coordinates`  — a page with a location is a place, not a dish
+//   2. a food category   — the page is actually about something edible
+//   3. title similarity  — the page names the thing we searched for
+// Anything that fails all three yields no photo, which is the correct answer.
+async function getWikiImage() {
+  const termKey = normTitle(query);
+  const hits = [];
+  for (const lang of ["fr", "en"]) {
+    try {
+      const api = `https://${lang}.wikipedia.org/w/api.php?action=query&format=json&generator=search` +
+        `&gsrsearch=${encodeURIComponent(query)}&gsrlimit=5&gsrnamespace=0` +
+        `&prop=pageimages|coordinates|categories&piprop=thumbnail&pithumbsize=1000` +
+        `&cllimit=max&clshow=!hidden&redirects=1&origin=*`;
+      const res = await fetch(api, { headers: { "User-Agent": UA } });
+      if (!res.ok) continue;
+      const data = await res.json();
+      const pages = Object.values(data?.query?.pages || {});
+      for (const p of pages) {
+        if (!p?.thumbnail?.source) continue;
+        if (p.coordinates) continue;
+        const cats = (p.categories || []).map((c) => c.title).join(" | ");
+        if (!CAT_T1.test(cats) && !CAT_T2.test(cats)) continue;
+        // "Cuisine italienne" / "Cuisine angevine" / "Gastronomie française"
+        // are survey articles about a REGION'S cooking, not a dish. They pass
+        // the category test trivially (they ARE cuisine) and their lead image
+        // is a generic spread, so they become the fallback for anything vaguely
+        // food-shaped — which is how "sandre au beurre blanc" resolved to
+        // fr:Cuisine angevine. A dish is never named "cuisine of <place>".
+        if (/^(cuisine|gastronomie|culinar|food)\b/i.test(p.title)) continue;
+        const bare = normTitle(p.title.replace(/\s*\(.*?\)\s*/g, " "));
+        const sim = Math.max(dice(termKey, bare), dice(termKey, normTitle(p.title)));
+        if (sim < MIN_TITLE_SIM) continue;
+        hits.push({ thumb: p.thumbnail.source, sim, tier: CAT_T1.test(cats) ? 1 : 2, rank: p.index ?? 99 });
+      }
+      if (hits.some((h) => h.tier === 1 && h.sim > 0.8)) break;
+    } catch { /* try next language */ }
+  }
+  if (!hits.length) return null;
+  hits.sort((a, b) => b.sim - a.sim || a.tier - b.tier || a.rank - b.rank);
+  for (const h of hits) {
+    try {
+      const imgRes = await fetch(h.thumb, { headers: { "User-Agent": UA } });
+      if (!imgRes.ok) continue;
+      return { buf: Buffer.from(await imgRes.arrayBuffer()), mapsUri: null, address: null, displayName: query };
+    } catch { /* next candidate */ }
+  }
+  return null;
+}
+
+// Rung 2 for a dish: Wikimedia Commons FILE search, not just the article lead
+// image. An article has at most one photo and many real dishes have no article
+// at all; Commons has millions of categorized food photographs, and — the part
+// that matters here — the FILENAME carries the subject ("File:Navarin
+// d'agneau.jpg"), so the same title-similarity gate that protects rung 1 works
+// unchanged. Freely licensed, no key, no quota.
+async function getCommonsImage() {
+  const termKey = normTitle(query);
+  try {
+    const api = `https://commons.wikimedia.org/w/api.php?action=query&format=json&generator=search` +
+      `&gsrsearch=${encodeURIComponent(query)}&gsrnamespace=6&gsrlimit=10` +
+      `&prop=imageinfo&iiprop=url|mime&iiurlwidth=1200&origin=*`;
+    const res = await fetch(api, { headers: { "User-Agent": UA } });
+    if (!res.ok) return null;
+    const data = await res.json();
+    const pages = Object.values(data?.query?.pages || {});
+    pages.sort((a, b) => (a.index ?? 99) - (b.index ?? 99));
+    const scored = [];
+    for (const p of pages) {
+      const ii = (p.imageinfo || [])[0];
+      if (!ii || !/^image\/(jpeg|png|webp)$/.test(ii.mime || "")) continue;
+      const name = normTitle(String(p.title).replace(/^File:/i, "").replace(/\.\w+$/, ""));
+      const sim = dice(termKey, name);
+      if (sim < MIN_TITLE_SIM) continue;
+      scored.push({ url: ii.thumburl || ii.url, sim, rank: p.index ?? 99 });
+    }
+    scored.sort((a, b) => b.sim - a.sim || a.rank - b.rank);
+    for (const s of scored) {
+      const r = await fetch(s.url, { headers: { "User-Agent": UA } });
+      if (!r.ok) continue;
+      return { buf: Buffer.from(await r.arrayBuffer()), mapsUri: null, address: null, displayName: query };
+    }
+  } catch { /* fall through to the next rung */ }
+  return null;
+}
+
+// Rung 3, last resort: a photo from a Google image search. Google Custom Search JSON API with
+// searchType=image. This rung is UNVERIFIABLE — unlike rungs 1 and 2 there is
+// no title to check the result against, so it is trusted only because by the
+// time we reach it the query is a canonical dish NOUN from the schema, not the
+// menu blurb that made every source return garbage. Never reached for a table
+// (those get the restaurant's own Places photo) and never for a blurb.
+// Off unless GOOGLE_CSE_ID is set — the cx must be created once at
+// programmablesearchengine.google.com (search the entire web, image search on)
+// and the Custom Search JSON API enabled on the project.
+async function getGoogleImage() {
+  const cx = process.env.GOOGLE_CSE_ID;
+  const key = process.env.GOOGLE_CSE_KEY || PLACES_KEY;
+  if (!cx || !key) return null;
+  try {
+    const u = `https://www.googleapis.com/customsearch/v1?key=${key}&cx=${cx}` +
+      `&searchType=image&num=3&imgSize=large&safe=active&q=${encodeURIComponent(query)}`;
+    const res = await fetch(u);
+    if (!res.ok) return null;
+    const data = await res.json();
+    for (const item of data.items || []) {
+      if (!item.link) continue;
+      const r = await fetch(item.link, { headers: { "User-Agent": UA } });
+      if (!r.ok) continue;
+      const buf = Buffer.from(await r.arrayBuffer());
+      if (buf.length < 4096) continue; // a placeholder/1px, not a photo
+      return { buf, mapsUri: null, address: null, displayName: query };
+    }
+  } catch { /* give up — no photo is still an acceptable answer */ }
+  return null;
+}
+
+async function main() {
+  // THE UNSPLASH RULE, generalized 2026-07-22. The dish reasoning above —
+  // "Unsplash keyword search has no notion of correctness, so for a dish it
+  // can't find it answers with the nearest stock-photography genre" — turns out
+  // to apply to any NAMED subject, not just food. Measured on one day's
+  // plan, Unsplash went 0 for 3 and each miss looked plausible enough to ship:
+  //   a town's steel transporter bridge → a famous medieval stone arch bridge
+  //      500km away
+  //   a named town square             → a famous square in the capital
+  //   a beach resort                  → a generic fruit stall
+  // Google Places went 3 for 3 over the same set. So Unsplash is now reserved
+  // for subjects with no single right answer, and is never a silent fallback
+  // behind a named one: for a named place, "no photo" beats a confident wrong
+  // one, exactly as for a dish. Pass --unsplash-only to ask for it deliberately.
+  //
+  // Source order:
+  //  --photo-name  → exact place photo, then the verifiable ladder (never Unsplash)
+  //  --wiki-only   → the DISH ladder, most-verifiable first and never Unsplash:
+  //                  gated Wikipedia article → gated Commons file search →
+  //                  Google image search (last resort, off unless GOOGLE_CSE_ID)
+  //  --wiki-first  → Wikipedia → Commons → Places. Commons was MISSING here and
+  //                  is where landmark photography actually lives, so this fell
+  //                  straight through to Unsplash on its first real outing.
+  //  --unsplash-only → Unsplash keyword (place-less event, generic banner)
+  //  --landmark    → Wikipedia → Commons → Places. Was Unsplash-first, on the
+  //                  theory that professional scenery beats user uploads; true
+  //                  for a mood shot, false for a named landmark.
+  //  default       → Places, then the verifiable ladder
+  const sources = PHOTO_NAME
+    ? [getImageByName, getPlacesImage, getWikiImage, getCommonsImage]
+    : WIKI_ONLY
+    ? [getWikiImage, getCommonsImage, getGoogleImage]
+    : WIKI_FIRST
+    ? [getWikiImage, getCommonsImage, getPlacesImage]
+    : UNSPLASH_ONLY
+    ? [getUnsplashImage]
+    : LANDMARK
+    ? [getWikiImage, getCommonsImage, getPlacesImage]
+    : [getPlacesImage, getWikiImage, getCommonsImage];
+  // Which source won is reported back as `source`. Re-hosting into Supabase
+  // storage erases provenance, and diagnosing the wrong-photo bug needed
+  // forensics (downloading the stored images and replaying each API) purely
+  // because nothing recorded where a picture came from. Never again.
+  const SOURCE_LABEL = {
+    getWikiImage: "wiki", getCommonsImage: "commons", getGoogleImage: "google-images",
+    getPlacesImage: "places", getImageByName: "places", getUnsplashImage: "unsplash",
+  };
+  let img = null, source = null;
+  for (const src of sources) {
+    try { img = await src(); } catch { img = null; }
+    if (img) { source = SOURCE_LABEL[src.name] || src.name; break; }
+  }
+  if (!img) {
+    console.error(`trip-place-photo: no photo found for "${query}"`);
+    process.exit(1);
+  }
+
+  const objectKey = `${PREFIX}/${slug}.jpg`;
+  const uploadRes = await fetch(`${SUPABASE_URL}/storage/v1/object/${BUCKET}/${objectKey}`, {
+    method: "POST",
+    headers: {
+      apikey: SUPABASE_KEY,
+      Authorization: `Bearer ${SUPABASE_KEY}`,
+      "Content-Type": "image/jpeg",
+      "x-upsert": "true",
+      "cache-control": "public, max-age=2592000",
+    },
+    body: img.buf,
+  });
+  if (!uploadRes.ok) {
+    console.error(`trip-place-photo: storage upload failed: ${uploadRes.status} ${await uploadRes.text()}`);
+    process.exit(1);
+  }
+
+  const publicUrl = `${SUPABASE_URL}/storage/v1/object/public/${BUCKET}/${objectKey}`;
+  // Content hash lets the caller dedupe — the same underlying image can come
+  // back for two different queries/slugs (e.g. a generic town search reused
+  // by two nearby stops), and Places' displayName/mapsUri don't catch that
+  // since each upload gets its own object key regardless (the rule:
+  // a photo is never repeated across two activities).
+  const hash = createHash("sha256").update(img.buf).digest("hex");
+  process.stdout.write(JSON.stringify({ url: publicUrl, source, mapsUri: img.mapsUri, address: img.address, displayName: img.displayName, hash }));
+}
+
+main();

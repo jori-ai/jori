@@ -1,0 +1,194 @@
+#!/usr/bin/env node
+// watch-discover — find NEW shows/movies for the list. One pipeline, two callers:
+//   daily   hum `screen` lane      watch-discover --window-days 21 --max 4 --source screen
+//   monthly watchlist-discover     watch-discover --window-days 60 --max 12 --source monthly-discover --effort medium
+//
+// The model only PROPOSES candidates (web search, taste profile, and — new in
+// v2 — the user's own verdicts as examples). Code decides what gets added:
+//   - must resolve on TMDB (real title, real ids)          → no invented "9.1, no IMDb id" rows
+//   - dedup on IMDb/TMDB id against every row incl. rejected → a "no" never resurfaces
+//   - IMDb rating ≥ 7.5 (shows) / ≥ 6.8 (films) from OMDb, unknown rating = skip   → the floor is enforced, not requested
+//   - shows: season 1 fully dropped per TMDB episode dates → the fully-dropped rule is enforced
+//   - hard-excluded genres (reality, talk, soap, kids, romance-led films)
+//   - taste fit from feedback not strongly negative for the target audience
+//   - shows only: critics not mixed (Rotten Tomatoes >= 75% and Metacritic >= 65 when OMDb has
+//     them). Films have no critic floor — critics predict their film marks at chance.
+//   - the fit gate (2026-10-10): Jev site `watchlist-fit` per survivor, a batched Sonnet
+//     judgement as shadow/fallback (lib/watch-fit.mjs) — keeps only titles the audience
+//     would truly enjoy (no stretches; every harvester gates fit through Jev).
+//     Fails CLOSED: no verdict, no add.
+// New SEASONS are not discovered here: watchlist-season-check finds those
+// deterministically from TMDB for shows the user has watched.
+//
+// Prints a JSON summary {added:[...], skipped:[...]} on stdout. --dry-run skips writes.
+
+import { execFileSync } from "node:child_process";
+import os from "node:os";
+import path from "node:path";
+import {
+  loadAll, insertTitle, findExisting, lookupMeta, tmdbSeasons, omdbRecord, syncShowSeasons,
+  audienceFrom, todayEt, hasTmdb, PREFERRED_LANGUAGES, languageName,
+} from "../lib/watch-db.mjs";
+import { PARTNER, whoFor, watchConfig } from "../lib/watch-config.mjs";
+import { tasteProfile } from "../lib/watch-fit.mjs";
+import { createRequire } from "node:module";
+const { MODELS } = createRequire(import.meta.url)("../lib/models.cjs");
+import { genreAffinity, tasteFit } from "../lib/watch-rank.mjs";
+import { judgeFit } from "../lib/watch-fit.mjs";
+import { loadModel } from "../lib/watch-model.mjs";
+import * as recsys from "../lib/watch-recsys.mjs";
+
+// What the taste model has learned from every mark and verdict, for the fit gate. Optional:
+// a model that can't load leaves the gate exactly as it was.
+async function learnedTaste() {
+  try { return recsys.tasteSummary((await loadModel()).model, 10); } catch { return null; }
+}
+
+const arg = (n, d) => { const i = process.argv.indexOf(`--${n}`); return i >= 0 ? process.argv[i + 1] : d; };
+const WINDOW = parseInt(arg("window-days", "21"), 10);
+const MAX = parseInt(arg("max", "4"), 10);
+const SOURCE = arg("source", "manual-discover");
+const DRY = process.argv.includes("--dry-run");
+const EFFORT = ["low", "medium", "high"].includes(arg("effort")) ? arg("effort") : "low";
+const RATING_FLOOR = 7.5;     // shows
+// Films: IMDb ≥ 6.8 and no critic floors (2026-10-10 — critics predicted the viewers'
+// film marks at chance). Shows keep the stricter bar: no evidence yet.
+const FILM_RATING_FLOOR = 6.8;
+const FIT_FLOOR = -0.4;
+const RT_FLOOR = 75;          // percent
+const METACRITIC_FLOOR = 65;  // out of 100
+const HOME = os.homedir();
+const today = todayEt();
+
+if (!hasTmdb()) { console.log(JSON.stringify({ error: "TMDB_API_KEY missing", added: [] })); process.exit(1); }
+
+const { titles, feedback, prefs, ratings } = await loadAll();
+const prefLine = (aud) => prefs.filter((p) => p.audience === aud || p.audience === "all").map((p) => `${p.tag} ${p.weight > 0 ? "+" : ""}${p.weight}`).join(", ") || "(none)";
+const byId = new Map(titles.map((t) => [t.id, t]));
+const verdictList = (vs) => [...new Map(feedback.filter((f) => vs.includes(f.verdict)).map((f) => [f.title_id, f])).values()]
+  .map((f) => byId.get(f.title_id)).filter(Boolean)
+  .map((t) => `${t.name} (${t.kind === "show" ? t.audience : t.kind})`);
+const loved = verdictList(["loved", "liked"]).slice(-25);
+const disliked = verdictList(["disliked", "dropped", "not_interested", "meh"]).slice(-25);
+const watchedNames = titles.filter((t) => t.status === "watched").slice(-40).map((t) => t.name);
+
+const cfg = watchConfig();
+const tastes = cfg.audience_tastes || {};
+const taste = (aud) => (tastes[aud] ? ` — ${tastes[aud]}` : "");
+const rules = [].concat(cfg.fit_rules || []).filter(Boolean).join(" ");
+const langs = [...PREFERRED_LANGUAGES].map(languageName).join(" or ");
+const me = whoFor("solo"), both = whoFor("together"), partner = whoFor(PARTNER);
+
+const prompt = `You are scouting NEW TV series and films for ${me}'s watch list. Today is ${today}.
+
+The taste profile:
+---
+${tasteProfile()}
+---
+
+What the viewers actually thought of things (strongest signal — weigh this above the profile):
+- Loved/liked: ${loved.join("; ") || "(no verdicts yet)"}
+- Disliked / dropped / not interested: ${disliked.join("; ") || "(none yet)"}
+- Recently watched: ${watchedNames.join("; ")}
+
+Stated genre preferences (weights; negative = avoid):
+- together: ${prefLine("together")}
+- solo: ${prefLine("solo")}
+
+Audiences: "solo" (${me} alone${taste("solo")}) and "together" (${both}${taste("together")}). "${PARTNER}" only for titles clearly for ${partner} alone${taste(PARTNER)}.
+
+Run several separate searches (new streaming series by platform, best-of lists for the period, critics' picks, new films on streaming) and find up to ${MAX * 2} titles that became available in roughly the last ${WINDOW} days and that the audience would rate highly:
+- brand-new SERIES whose first season has FULLY released (every episode out), on any major streamer
+- FILMS newly available to stream
+Only propose titles the audience would truly enjoy: strong reviews, a clear match to what they loved. No stretches, no "worth a try", no mixed-reception gambles — when in doubt, leave it out.${rules ? ` ${rules}` : ""}
+Strongly prefer ${langs}-language titles. A title in another language only qualifies if it is exceptional — those rank at the end of the list anyway.
+Do NOT include new seasons of existing shows (tracked separately), reality TV, sitcoms, network procedurals, romance-led stories, or relationship drama.
+
+Output ONE JSON object, no prose:
+{"items":[{"title":"...","type":"show|movie|documentary","year":2026,"imdb_id":"tt... or null","audience":"solo|together|${PARTNER}","platform":"Netflix|Apple TV+|...","why":"one line tying it to something they loved or to the profile"}]}
+Return {"items":[]} if nothing qualifies.`;
+
+let items = [];
+try {
+  const out = execFileSync(path.join(HOME, ".local/bin/claude"), [
+    "-p", "--model", MODELS.sonnet, "--effort", EFFORT, "--allowedTools", "WebSearch", "--output-format", "text", prompt,
+  ], { encoding: "utf8", timeout: 240000, maxBuffer: 4 * 1024 * 1024, stdio: ["ignore", "pipe", "ignore"] });
+  const m = out.match(/\{[\s\S]*"items"[\s\S]*\}/);
+  items = m ? JSON.parse(m[0]).items || [] : [];
+} catch (e) {
+  console.log(JSON.stringify({ error: `search failed: ${e.message.slice(0, 200)}`, added: [], skipped: [] }));
+  process.exit(0);
+}
+
+const EXCLUDED_GENRES = /reality|talk|soap|kids|news/i;
+const added = [], skipped = [], candidates = [];
+const skip = (title, why) => skipped.push({ title, why });
+
+for (const it of items) {
+  if (candidates.length >= MAX * 2) break;
+  const name = String(it.title || "").trim();
+  if (!name) continue;
+  const kindHint = ["show", "movie", "documentary"].includes(it.type) ? it.type : null;
+  let meta;
+  try { meta = await lookupMeta({ imdb_id: /^tt\d+$/.test(it.imdb_id || "") ? it.imdb_id : null, name, kind: kindHint, year: it.year }); }
+  catch (e) { skip(name, `TMDB error: ${e.message}`); continue; }
+  if (!meta) { skip(name, "no TMDB match"); continue; }
+
+  const existing = findExisting(titles, { imdb_id: meta.imdb_id, tmdb_id: meta.tmdb_id, name: meta.name, kind: meta.kind });
+  if (existing) { skip(meta.name, `already on list (${existing.status})`); continue; }
+
+  if (meta.genres && EXCLUDED_GENRES.test(meta.genres)) { skip(meta.name, `excluded genre: ${meta.genres}`); continue; }
+  if (meta.kind === "movie" && /^romance/i.test(meta.genres || "")) { skip(meta.name, "romance-led film"); continue; }
+
+  const omdb = await omdbRecord(meta.imdb_id);
+  const rating = omdb.imdb;
+  if (rating == null) { skip(meta.name, "no IMDb rating yet"); continue; }
+  const film = meta.kind !== "show";
+  const floor = film ? FILM_RATING_FLOOR : RATING_FLOOR;
+  if (rating < floor) { skip(meta.name, `IMDb ${rating} < ${floor}`); continue; }
+  if (!film && omdb.rt != null && omdb.rt < RT_FLOOR) { skip(meta.name, `Rotten Tomatoes ${omdb.rt}% < ${RT_FLOOR}%`); continue; }
+  if (!film && omdb.metacritic != null && omdb.metacritic < METACRITIC_FLOOR) { skip(meta.name, `Metacritic ${omdb.metacritic} < ${METACRITIC_FLOOR}`); continue; }
+
+  if (meta.kind === "show") {
+    const seasons = await tmdbSeasons(meta._tv, today);
+    const s1 = seasons.find((s) => s.n === 1);
+    if (!s1 || !s1.fully_dropped) { skip(meta.name, `season 1 not fully dropped${s1?.finale_date ? ` (finale ${s1.finale_date})` : ""}`); continue; }
+  } else if (meta.release_date && meta.release_date > today) {
+    skip(meta.name, `not released until ${meta.release_date}`); continue;
+  }
+
+  const audience = meta.kind === "show" ? audienceFrom(it.audience) || "together" : "together";
+  const fit = tasteFit({ genres: meta.genres, keywords: meta.keywords }, genreAffinity(titles, feedback, meta.kind === "show" ? audience : null), prefs, meta.kind === "show" ? audience : "together");
+  if (fit < FIT_FLOOR) { skip(meta.name, `poor taste fit (${fit.toFixed(2)}) for ${audience}`); continue; }
+
+  const row = {
+    kind: meta.kind, name: meta.name, imdb_id: meta.imdb_id, tmdb_id: meta.tmdb_id, audience, status: "queued",
+    year_start: meta.year_start, year_end: meta.year_end || null, genres: meta.genres, platform: it.platform || null,
+    original_language: meta.original_language || null,
+    keywords: meta.keywords || null,
+    imdb_rating: rating, description: meta.description, source: SOURCE, source_reason: String(it.why || "").slice(0, 300) || null,
+  };
+  candidates.push({ row, omdb, why: it.why || null });
+}
+
+// Fit gate — Jev (site watchlist-fit) per candidate, Sonnet batch as shadow/fallback.
+// lib/watch-fit.mjs; fails closed.
+const verdicts = await judgeFit(candidates.map(({ row, omdb, why }) => ({
+  name: row.name, kind: row.kind, audience: row.audience, year: row.year_start, genres: row.genres,
+  language: row.original_language, synopsis: row.description, imdb: omdb.imdb, rt: omdb.rt, metacritic: omdb.metacritic, why,
+})), { titles, feedback, prefs, ratings, learned: await learnedTaste() });
+
+for (const [i, { row, omdb }] of candidates.entries()) {
+  if (added.length >= MAX) break;
+  const v = verdicts[i];
+  if (!v?.keep) { skip(row.name, `fit gate (${v?.used || "none"}): ${v?.reason || "no verdict"}`); continue; }
+  if (DRY) { added.push({ name: row.name, kind: row.kind, audience: row.audience, rating: omdb.imdb, dry_run: true }); continue; }
+  try {
+    const t = await insertTitle(row);
+    titles.push({ ...t, seasons: [] });
+    if (t.kind === "show") await syncShowSeasons({ ...t, seasons: [] }, today);
+    added.push({ name: t.name, kind: t.kind, audience: row.audience, rating: omdb.imdb });
+  } catch (e) { skip(row.name, `insert failed: ${e.message}`); }
+}
+
+console.log(JSON.stringify({ source: SOURCE, proposed: items.length, added, skipped }, null, 2));

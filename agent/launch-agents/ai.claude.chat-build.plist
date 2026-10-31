@@ -1,0 +1,52 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Chat Build — runs a build the user asked for in chat on ephemeral Opus
+  (jobs/chat-build.md). No schedule: QueueDirectories starts it whenever
+  data/build-queue/pending/ is non-empty (bin/build-request writes
+  there) and keeps restarting it until the directory is empty. The trigger moves
+  each request out of pending/ before running it, so a failed run cannot loop.
+  launchd runs one instance per label, so builds are serial.
+
+  launchd USER agent, not crontab (keychain / Max auth — see lib/run-ephemeral-opus.sh).
+
+  Install (renders __JORI_HOME__ / __JORI_TOOLS__ / __HOME__, then launchctl bootstrap):
+    mkdir -p <install>/data/build-queue/pending
+    agent/launch-agents/install.sh ai.claude.chat-build
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>ai.claude.chat-build</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>__JORI_TOOLS__/agent/scripts/trigger-chat-build.sh</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>__HOME__</string>
+        <key>PATH</key>
+        <string>__HOME__/.local/bin:/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:__JORI_TOOLS__/bin</string>
+        <key>LANG</key>
+        <string>en_US.UTF-8</string>
+    </dict>
+    <key>WorkingDirectory</key>
+    <string>__JORI_TOOLS__/agent/ops-agent</string>
+    <key>QueueDirectories</key>
+    <array>
+        <string>__JORI_HOME__/data/build-queue/pending</string>
+    </array>
+    <key>RunAtLoad</key>
+    <false/>
+    <key>KeepAlive</key>
+    <false/>
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+    <key>StandardOutPath</key>
+    <string>__JORI_TOOLS__/agent/logs/chat-build-launchd.log</string>
+    <key>StandardErrorPath</key>
+    <string>__JORI_TOOLS__/agent/logs/chat-build-launchd.log</string>
+</dict>
+</plist>

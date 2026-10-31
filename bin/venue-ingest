@@ -1,0 +1,162 @@
+#!/usr/bin/env node
+// venue-ingest — fetch every configured venue calendar into ONE store.
+//
+// Fetching a calendar is not a language task: several watch lanes once each
+// sent a model to scrape the same rooms (hundreds of web searches a week).
+// This script does all of it with no model — Ticketmaster Discovery by pinned
+// venue id, platform calendars (WordPress Events Calendar, Squarespace, Dice,
+// JSON-LD pages), the verified browsing skills through the host's automation
+// Chrome, and whatever kinds this installation adds in lib/venue-events/_ext/.
+// The watch lanes (`venue-watch <lane>`) read the store and only ever show a
+// model the events that are NEW to them.
+//
+// Usage:
+//   venue-ingest [--only <key,key>] [--skip-browser] [--dry-run] [--json]
+//
+// Sources: agent/local/config/venue-events.json `sources` (none configured:
+//          nothing is fetched — off, not broken)
+// Store:   data/venue-events-state.json  (see lib/venue-events/store.mjs)
+// Cron:    daily, via trigger-venue-ingest.sh — no agent, no model.
+//
+// A source that has errored or returned zero rows 3 runs running is reported
+// ONCE (on the run it crosses 3) to the system channel — a job reporting its
+// own failure, class 5 of agent/CLAUDE.md § Outbound Precheck. A scrape that
+// returns 0 rows for months unnoticed is what this counter exists to catch.
+//
+// All of a run's unhealthy sources go out as ONE row, and a source that has
+// never produced a row is worded differently from one that produced rows and
+// stopped — see `sourceHealthVerdict` in the store. Separate rows seconds apart
+// once claimed lanes were "blind to that venue" when two of three were not.
+//
+// A source whose every listed show has already happened (verdict "ran-out": a
+// season or calendar that ran out) is NOT reported, only logged as one line:
+// the system channel only carries something the user can or should act on.
+
+import path from "node:path";
+import { execFileSync } from "node:child_process";
+import { loadFetchers, BROWSER_KINDS, REPO, sourceCodeRef } from "../lib/venue-events/fetchers.mjs";
+import { loadStore, mergeSource, prune, writeJsonAtomic, venueHealthNote, repairSignal, sourceHealthVerdict, STORE_PATH } from "../lib/venue-events/store.mjs";
+import { requestRepair } from "../lib/skill-repair.mjs";
+import { todayLocal } from "../lib/venue-events/normalize.mjs";
+import { venueConfig } from "../lib/venue-events/config.mjs";
+import { loadEnv } from "../lib/tickets/config.mjs";
+
+const args = process.argv.slice(2);
+const flag = (n) => args.includes(n);
+const opt = (n) => { const i = args.indexOf(n); return i >= 0 ? args[i + 1] : null; };
+const ONLY = opt("--only") ? new Set(opt("--only").split(",")) : null;
+const DRY = flag("--dry-run");
+const SKIP_BROWSER = flag("--skip-browser");
+const JSON_OUT = flag("--json");
+const STREAK_ALERT = 3;
+
+const CONFIG = venueConfig();
+
+async function cdpUp() {
+  try {
+    const r = await fetch(`http://${process.env.CDP_HOST || "localhost:9222"}/json/version`, { signal: AbortSignal.timeout(3000) });
+    return r.ok;
+  } catch { return false; }
+}
+
+// `observed` is the verbatim fetcher output behind any mechanism claim in the
+// message. jori-send-curl exits 6 on words like ETIMEDOUT / "unreachable ("
+// unless it is given the text that was actually seen, and since a run's
+// findings now travel as ONE row, one source's error string could otherwise
+// take every other source's bullet down with it.
+function systemNote(msg, observed) {
+  try {
+    const argv = ["--channel", "system", "--skip-precheck", "--intent", "venue-ingest"];
+    if (observed) argv.push("--observed-error", String(observed).slice(0, 1500));
+    argv.push(msg);
+    execFileSync(path.join(REPO, "bin/jori-send-curl"), argv, { stdio: "ignore", timeout: 30000 });
+  } catch { /* never let an alert fail the ingest */ }
+}
+
+async function main() {
+  loadEnv();
+  const apiKey = process.env.TICKETMASTER_CONSUMER_KEY || process.env.TICKETMASTER_API_KEY || null;
+  const FETCHERS = await loadFetchers();
+  const ref = todayLocal();
+  const nowIso = new Date().toISOString();
+  const store = loadStore();
+  const browserOk = SKIP_BROWSER ? false : await cdpUp();
+  const report = [];
+  const flagged = [];
+  const notes = [];
+  const horizon = CONFIG.horizon_days || 120;
+  if (!(CONFIG.sources || []).length) {
+    // No venues configured: the capability is off. Nothing to fetch, nothing to write.
+    if (JSON_OUT) process.stdout.write(JSON.stringify({ updated_at: null, sources: [], notes: ["no venue sources configured"] }, null, 2) + "\n");
+    else console.log("venue-ingest: no venue sources configured (agent/local/config/venue-events.json) — nothing to do");
+    return;
+  }
+
+  for (const src of CONFIG.sources) {
+    if (ONLY && !ONLY.has(src.key)) continue;
+    const fetcher = FETCHERS[src.kind];
+    if (!fetcher) { report.push({ key: src.key, error: `unknown kind ${src.kind}` }); continue; }
+    if (BROWSER_KINDS.has(src.kind) && !browserOk) {
+      // Skipped, not failed: the automation Chrome being down is chrome-cdp-watch's
+      // alert to send, and a skip must not bump this source's error streak.
+      report.push({ key: src.key, skipped: SKIP_BROWSER ? "--skip-browser" : "cdp unreachable" });
+      continue;
+    }
+    let events = [], error = null;
+    try {
+      events = await fetcher(src, { ref, apiKey, days: horizon });
+    } catch (e) { error = e?.message || String(e); }
+    const prevCount = store.sources[src.key]?.last_count ?? null;
+    const res = mergeSource(store, src, { events, error, ref }, nowIso);
+    // First bad run of a markup-reading source → same-day repair, not a
+    // 3-night wait (lib/skill-repair.mjs; jobs/skill-repair.md).
+    const sig = DRY ? null : repairSignal(src, prevCount, { events, error });
+    if (sig) {
+      try { requestRepair({ skill: "venue-ingest", action: src.key, ...sig, ...sourceCodeRef(src), producer: "venue-ingest", log_file: "data/logs/venue-ingest.log" }); }
+      catch (e) { console.error(`venue-ingest: repair request for ${src.key} failed: ${e?.message || e}`); }
+    }
+    const h = store.sources[src.key];
+    report.push({ key: src.key, count: error ? null : events.length, error, ...res });
+    // Crossing the streak reports ONCE (=== not >=), so a chronically empty
+    // source cannot page every night. Collected here, sent as one row below.
+    // A calendar that ran out is logged, never sent: nobody can act on it.
+    const crossed = h.error_streak === STREAK_ALERT || h.zero_streak === STREAK_ALERT;
+    if (crossed && sourceHealthVerdict(h, STREAK_ALERT) === "ran-out") {
+      notes.push(`${src.key}: every listed show has happened (last ${h.listed_through}) and nothing is listed in the next ${horizon} days, so this is a calendar that ran out, not a broken feed; not reported`);
+    } else if (crossed && !DRY) {
+      flagged.push({ key: src.key, health: h, groups: src.groups || [] });
+    }
+  }
+
+  // Building the note must never cost the run its store write, which happens
+  // below. systemNote already swallows send failures; this covers composition.
+  if (flagged.length) {
+    try {
+      const observed = flagged.filter((f) => f.health?.last_error)
+        .map((f) => `${f.key}: ${f.health.last_error}`).join("\n");
+      systemNote(venueHealthNote(flagged, STREAK_ALERT), observed);
+    } catch (e) { console.error(`venue-ingest: could not report ${flagged.length} unhealthy source(s): ${e?.message || e}`); }
+  }
+
+  // Drop health rows for sources no longer configured, so a removed source does
+  // not linger as a row that never updates. Only on a full, non-dry run.
+  if (!ONLY && !DRY) {
+    const configured = new Set(CONFIG.sources.map((s) => s.key));
+    for (const key of Object.keys(store.sources)) if (!configured.has(key)) delete store.sources[key];
+  }
+
+  const removed = prune(store, ref);
+  store.updated_at = nowIso;
+  if (!DRY) writeJsonAtomic(STORE_PATH, store);
+
+  const summary = { updated_at: nowIso, total_events: Object.keys(store.events).length, pruned: removed, browser: browserOk, sources: report, notes };
+  if (JSON_OUT) { process.stdout.write(JSON.stringify(summary, null, 2) + "\n"); return; }
+  for (const r of report) {
+    const s = r.skipped ? `skipped (${r.skipped})` : r.error ? `ERROR ${r.error}` : `${r.count} events (+${r.added} new)`;
+    console.log(`${r.key.padEnd(26)} ${s}`);
+  }
+  for (const n of notes) console.log(n);
+  console.log(`store: ${summary.total_events} events, pruned ${removed}${DRY ? " (dry run — not written)" : ""}`);
+}
+
+main().catch((e) => { console.error(`venue-ingest: ${e?.stack || e}`); process.exit(1); });

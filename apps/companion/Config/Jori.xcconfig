@@ -1,0 +1,74 @@
+// Jori.xcconfig — what this build of the Jori app is.
+//
+// One source tree builds the public Jori app and any installation's own app.
+// Everything that differs between them is a setting below. These are the
+// public defaults; an installation overrides any of them in
+// Config/Installation.xcconfig (never committed to the kernel — its overlay
+// keeps the file and copies it here before a build), included at the end.
+//
+// The values reach the code as Info.plist keys (Jori* in each target's
+// Info.plist, read by `Install` in Jori/SupabaseConfig.swift), and the
+// identifiers reach the project and the entitlements as $(JORI_…).
+//
+// xcconfig treats `//` as a comment, so a URL is written https:/$()/host.
+
+// Identity
+JORI_DISPLAY_NAME = Jori
+JORI_BUNDLE_ID = com.example.Jori
+JORI_TEAM_ID = TEAMID_PLACEHOLDER
+JORI_MARKETING_VERSION = 1.1
+// OAuth callback scheme (CFBundleURLSchemes; the backend's allowed redirect).
+JORI_URL_SCHEME = com.example.jori
+JORI_APP_GROUP = group.$(JORI_BUNDLE_ID)
+// = the keychain-access-groups entitlement, $(AppIdentifierPrefix)$(JORI_BUNDLE_ID).shared
+JORI_KEYCHAIN_GROUP = $(JORI_TEAM_ID).$(JORI_BUNDLE_ID).shared
+
+// Device-local names. An installation whose app stored data under other names
+// pins them here so an update keeps it (UserDefaults keys, local stores,
+// keychain services, Secure Enclave key tags).
+JORI_STORAGE_PREFIX = jori
+JORI_KEY_TAG_PREFIX = $(JORI_URL_SCHEME)
+// device_id on location_history / photos rows.
+JORI_LOCATION_DEVICE_ID = phone
+
+// Backend. Unset: the app runs but cannot sign in.
+JORI_SUPABASE_URL =
+JORI_SUPABASE_ANON_KEY =
+JORI_ATTACHMENTS_BUCKET = jori-attachments
+// The backend's name before it became Jori, if it had one: legacy chat table
+// names (<name>_messages) and push kinds are then accepted too.
+JORI_LEGACY_NAME =
+
+// Face ID signing contexts. Must equal the server's (purchase.json
+// signing_domain, instance.json approval_domain); never change once paired.
+JORI_SIGNING_PURCHASE = jori-purchase.v1
+JORI_SIGNING_APPROVE = jori-approve.v1
+
+// Optional surfaces. Each is off until set.
+// The Memory tab's wiki, e.g. http:/$()/<host>:9096
+JORI_WIKI_URL =
+// Trade approval: the trading web app that verifies the Face ID signature.
+JORI_TRADE_APPROVAL_URL =
+JORI_TRADE_APPROVAL_NAMESPACE = trade
+JORI_TRADE_APPROVAL_LABEL = your trading app
+// Space-separated: screen-time phone-lock photo-probe app-perf
+JORI_FEATURES =
+
+// Entitlements. Screen Time (screen-time) needs Apple's Family Controls
+// grant; such a build points both at the -ScreenTime variants.
+JORI_APP_ENTITLEMENTS = Jori/Jori.entitlements
+JORI_USAGE_MONITOR_ENTITLEMENTS = JoriUsageMonitor/JoriUsageMonitor.entitlements
+
+// Signing. Automatic by default; CI signs manually by passing
+// JORI_CODE_SIGN_STYLE=Manual JORI_CODE_SIGN_IDENTITY="Apple Distribution"
+// and the profile names below on the xcodebuild command line (only the app's
+// own targets read these, never the Swift package targets).
+JORI_CODE_SIGN_STYLE = Automatic
+JORI_CODE_SIGN_IDENTITY = Apple Development
+JORI_PROFILE_APP =
+JORI_PROFILE_NOTIFICATION_SERVICE =
+JORI_PROFILE_SHARE =
+JORI_PROFILE_INTENTS =
+JORI_PROFILE_USAGE_MONITOR =
+
+#include? "Installation.xcconfig"

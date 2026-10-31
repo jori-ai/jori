@@ -1,0 +1,107 @@
+#!/usr/bin/env node
+// ticket-rush-run — day-of rush watcher, as code. Never purchases.
+//
+// One verified browsing skill lists today's rush offers; code matches them to
+// the curated list the lottery also reads (lib/ticket-lottery.mjs shows_file),
+// diffs against what was already pinged today and sends one fixed template.
+// The rush source (site skill, page, label, state and pause files, send intent)
+// is this installation's `rush` entry in agent/local/config/ticket-lottery.json.
+// Not configured: off — logs that and exits 0.
+//
+// Usage: ticket-rush-run [--dry-run]
+//
+// geo-gate-ok: same-day rush in the configured metro; the run exits before any fetch
+// when `metro-presence` says the user is not there today, so every send is for
+// today, in the city the user is in.
+
+import { execFile, execFileSync } from "node:child_process";
+import fs from "node:fs";
+import path from "node:path";
+import { promisify } from "node:util";
+import { runActionCdp, extractActionBlock } from "../browsing-skills/tools/cdp-runner.mjs";
+import { lotteryConfig, installPath, readJson, writeJson, localDate, loadShows, matchShow } from "../lib/ticket-lottery.mjs";
+
+const pexec = promisify(execFile);
+const log = (...a) => console.log(`[${new Date().toISOString()}]`, ...a);
+
+/** New rush listings for curated shows, minus what was already pinged today. Pure — tested. */
+export function newDrops(shows, curated, pinged, date) {
+  const seen = new Set((pinged || []).map((p) => `${p.show}|${p.date}`));
+  const out = [];
+  for (const s of shows || []) {
+    if (s.isLottery || s.kind === "lottery") continue;
+    const c = matchShow(s.title, curated);
+    if (!c) continue;
+    const key = `${c.title}|${date}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push({ show: c.title, date, price: s.priceFrom ?? null, url: s.url });
+  }
+  return out;
+}
+
+/** The ping: up to five drops, the rest counted. `label` names the rush source. */
+export function message(drops, label = "the rush page") {
+  const top = drops.slice(0, 5);
+  const body = top.map((d) => `• ${d.show} — today${d.price != null ? `, from $${d.price}` : ""}\n${d.url}`).join("\n\n");
+  const more = drops.length > top.length ? `\n\n(+${drops.length - top.length} more on ${label}'s rush page)` : "";
+  return `🎟️ Rush tickets just showed up for today:\n\n${body}${more}\n\nTap a link to grab them on ${label}.`;
+}
+
+async function main() {
+  const cfg = lotteryConfig();
+  const R = cfg.rush;
+  if (!R || !R.site || !R.url) { log("no rush source configured (agent/local/config/ticket-lottery.json rush) — off"); return; }
+  const DRY = process.argv.includes("--dry-run");
+  const BIN = installPath("bin");
+  const STATE = installPath(R.state_file || "data/ticket-rush-state.json");
+  const PAUSE = installPath(R.pause_file || "data/ticket-rush-pause.json");
+  const SKILL = installPath(path.join("browsing-skills", "skills", R.site, "references", `${R.action || "rush-availability"}.md`));
+  const cdp = cfg.cdp_host || "localhost:9222";
+  const today = localDate(cfg.tz);
+
+  const pause = readJson(PAUSE, null);
+  if (pause?.paused_until) {
+    if (pause.paused_until >= today) { log("paused"); return; }
+    if (!DRY) fs.rmSync(PAUSE, { force: true });
+  }
+  if (cfg.metro) {
+    try { await pexec(path.join(BIN, "metro-presence"), ["--metro", cfg.metro, today], { timeout: 60_000 }); }
+    catch (e) { if (e.code === 1) { log(`not in ${cfg.metro} today — exit`); return; } } // fail open otherwise
+  }
+
+  try {
+    const r = await fetch(`http://${cdp}/json/version`, { signal: AbortSignal.timeout(5000) });
+    if (!r.ok) throw new Error(String(r.status));
+  } catch { log(`CDP ${cdp} down — silent exit (chrome-cdp-watch owns that alert)`); return; }
+
+  const res = await runActionCdp({ url: R.url, actionBlock: extractActionBlock(SKILL), params: { limit: 50 }, cdpHost: cdp })
+    .catch((e) => ({ ok: false, error: String(e.message || e) }));
+  let data = null;
+  if (res?.ok) { try { data = JSON.parse(res.result?.content?.[0]?.text); } catch {} }
+  const rushOnly = (data?.shows || []).filter((s) => !s.isLottery);
+  const action = R.action || "rush-availability";
+  console.log(JSON.stringify({ skill: `${R.site}/${action}`, action, error: data ? null : (res?.error || "unparseable"), showCount: data?.shows?.length || 0, rushOnlyCount: rushOnly.length }));
+  if (!data) return;
+
+  const { shows } = loadShows(cfg.shows_file);
+  const state = readJson(STATE, { last_run: "", pinged: [] });
+  state.pinged = (state.pinged || []).filter((p) => (p.date || p.performance_at?.slice(0, 10) || "") >= today);
+  const drops = newDrops(rushOnly, shows, state.pinged, today);
+  log(`${rushOnly.length} rush listings, ${drops.length} new curated drops`);
+  if (DRY) { console.log(JSON.stringify(drops, null, 2)); return; }
+
+  if (drops.length) {
+    try {
+      execFileSync(path.join(BIN, "jori-send-curl"), ["--evidence-as-of", "live", "--intent", R.intent || "ticket-rush", message(drops, R.label || R.site)], { stdio: "inherit", timeout: 120_000 });
+      state.pinged.push(...drops.map((d) => ({ ...d, pinged_at: new Date().toISOString() })));
+    } catch (e) { log(`send failed: ${e.message}`); }
+  }
+  state.last_run = today;
+  writeJson(STATE, state);
+  if ((R.close_tabs || []).length) {
+    try { execFileSync(path.join(BIN, "chrome-close-tabs"), R.close_tabs, { stdio: "ignore", timeout: 30_000 }); } catch {}
+  }
+}
+
+if (process.argv[1]?.endsWith("ticket-rush-run")) main().catch((e) => { log(`FATAL ${e.stack || e}`); process.exit(1); });

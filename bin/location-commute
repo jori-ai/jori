@@ -1,0 +1,161 @@
+#!/usr/bin/env python3
+"""location-commute — travel-time estimate from here to a destination.
+
+Uses Google Distance Matrix API. Current location comes from latest
+Supabase sample. Destination can be a named location, coordinates, or
+free-text address.
+
+Usage:
+  location-commute home                        # ETA home (a named-location alias)
+  location-commute "<named place>"
+  location-commute --to "<venue>, <street address>"
+  location-commute home --mode walking
+  location-commute home --mode transit
+
+Named locations: data/named-locations.json (name or alias, lib/named_places.py).
+"""
+
+import sys
+import os
+import json
+import urllib.request
+import urllib.parse
+from datetime import datetime, timezone
+from typing import Optional, Dict, Any
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "lib"))
+import named_places  # noqa: E402
+import supabase_local  # noqa: E402
+
+
+# Google API key: GOOGLE_PLACES_API_KEY / GOOGLE_API_KEY from the environment, then .env
+def _load_google_key() -> Optional[str]:
+    if os.environ.get("GOOGLE_PLACES_API_KEY") or os.environ.get("GOOGLE_API_KEY"):
+        return os.environ.get("GOOGLE_PLACES_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+    return supabase_local.env_value("GOOGLE_PLACES_API_KEY")
+
+
+def latest_location() -> Optional[Dict[str, Any]]:
+    if not supabase_local.service_key() or not supabase_local.supabase_url():
+        return None
+    qs = urllib.parse.urlencode([
+        ("order", "arrived_at.desc"),
+        ("limit", "1"),
+        ("select", "arrived_at,latitude,longitude"),
+    ])
+    rows = supabase_local.rest_get(f"location_history?{qs}", timeout=10)
+    return rows[0] if rows else None
+
+
+def resolve_destination(target: str, entries=None) -> Optional[Dict[str, Any]]:
+    loc = named_places.resolve(target, entries)
+    if loc:
+        return {"name": loc["name"], "address": loc.get("address"),
+                "lat": loc["lat"], "lon": loc["lon"]}
+    return {"name": target, "address": target}
+
+
+MODE_MAP = {
+    "driving": "DRIVE",
+    "walking": "WALK",
+    "transit": "TRANSIT",
+    "bicycling": "BICYCLE",
+}
+
+
+def fetch_route(origin_lat: float, origin_lon: float, dest: Dict[str, Any], mode: str) -> Dict[str, Any]:
+    api_key = _load_google_key()
+    if not api_key:
+        return {"ok": False, "error": "no Google API key (set GOOGLE_PLACES_API_KEY in env or .env)"}
+    travel_mode = MODE_MAP.get(mode, "DRIVE")
+
+    if dest.get("lat") is not None:
+        destination = {"location": {"latLng": {"latitude": dest["lat"], "longitude": dest["lon"]}}}
+    else:
+        destination = {"address": dest["address"]}
+
+    body = {
+        "origin": {"location": {"latLng": {"latitude": origin_lat, "longitude": origin_lon}}},
+        "destination": destination,
+        "travelMode": travel_mode,
+    }
+    if travel_mode == "DRIVE":
+        body["routingPreference"] = "TRAFFIC_AWARE"
+        body["departureTime"] = datetime.now(timezone.utc).isoformat()
+
+    url = "https://routes.googleapis.com/directions/v2:computeRoutes"
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(body).encode(),
+        headers={
+            "Content-Type": "application/json",
+            "X-Goog-Api-Key": api_key,
+            "X-Goog-FieldMask": "routes.duration,routes.distanceMeters,routes.staticDuration",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as r:
+            data = json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        return {"ok": False, "error": f"http {e.code}", "message": e.read().decode()[:300]}
+
+    routes = data.get("routes") or []
+    if not routes:
+        return {"ok": False, "error": "no route found"}
+
+    route = routes[0]
+    duration_s = int(route["duration"].rstrip("s"))
+    distance_m = route["distanceMeters"]
+    result = {
+        "ok": True,
+        "mode": mode,
+        "distance_m": distance_m,
+        "distance_km": round(distance_m / 1000, 2),
+        "duration_s": duration_s,
+        "duration_min": round(duration_s / 60, 1),
+        "duration_text": f"{round(duration_s / 60)} min" if duration_s >= 60 else f"{duration_s} s",
+    }
+    if "staticDuration" in route:
+        static_s = int(route["staticDuration"].rstrip("s"))
+        result["duration_without_traffic_s"] = static_s
+        result["duration_without_traffic_min"] = round(static_s / 60, 1)
+        if duration_s > static_s:
+            result["traffic_delay_s"] = duration_s - static_s
+    return result
+
+
+def main():
+    import argparse
+    p = argparse.ArgumentParser(description="Travel time from here to destination.")
+    p.add_argument("target", nargs="?", help="Named location or address")
+    p.add_argument("--to", help="Destination (same as positional)")
+    p.add_argument("--mode", default="driving", choices=["driving", "walking", "transit", "bicycling"])
+    args = p.parse_args()
+
+    target = args.target or args.to
+    if not target:
+        print("ERROR: specify destination", file=sys.stderr)
+        sys.exit(1)
+
+    current = latest_location()
+    if not current or current.get("latitude") is None:
+        print(json.dumps({"ok": False, "error": "no recent location data"}, indent=2))
+        sys.exit(1)
+
+    cur_lat = float(current["latitude"])
+    cur_lon = float(current["longitude"])
+    age_min = (datetime.now(timezone.utc) - datetime.fromisoformat(current["arrived_at"].replace("Z", "+00:00"))).total_seconds() / 60
+
+    dest = resolve_destination(target)
+    route = fetch_route(cur_lat, cur_lon, dest, args.mode)
+
+    print(json.dumps({
+        "from": {"lat": cur_lat, "lon": cur_lon, "age_minutes": round(age_min, 1)},
+        "to": dest,
+        "route": route,
+    }, indent=2))
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,2800 @@
+#!/usr/bin/env python3
+"""location-segment — gap-free GPS timeline builder.
+
+Given a (start, end) window and the GPS pings stored in Supabase
+location_history, produces a JSON timeline that covers every minute
+of the window with exactly one of:
+  - stops[]   — clusters where you stayed >= MIN_STOP_MIN (Li/Zheng anchor-walk)
+  - routes[]  — movement between stops, split into legs by transport mode
+  - gaps[]    — windows where no GPS samples exist
+
+Stop naming is tiered (named locations -> known recurring stops -> Wi-Fi SSID
+-> Google Places searchNearby -> Nominatim -> coords). Each route leg gets a
+transport mode ("walked", "drove", "train", "cycled", "e_scooter_likely",
+"flew", "unknown") with a confidence score derived from speed/straightness/
+bearing-change features. Optional Valhalla snapping turns raw polylines
+into road-matched ones.
+
+Lives alongside `location-stops`. Same Supabase data source, same date
+parsing, but with anchor-walk clustering, multi-leg routes, gap-explicit
+coverage, and venue-grade naming on by default.
+
+Usage:
+  location-segment yesterday
+  location-segment today
+  location-segment --start 2026-04-24T14:00 --end 2026-04-24T20:00
+  location-segment --input fixture.json --no-places --no-photos
+  location-segment yesterday --snap valhalla --output timeline.json
+
+Flags:
+  --json                JSON to stdout (default)
+  --output PATH         write JSON to file instead of stdout
+  --input PATH          read raw samples from a JSON file (test/replay)
+  --min-stop-min N      stop dwell threshold (default 15)
+  --stop-radius-m N     anchor-walk radius (default 200)
+  --merge-gap-min N     temporal-merge gap threshold (default 15)
+  --snap valhalla|none  polyline source (default none -> raw downsampled)
+  --no-places           skip Google Places (rating/review enrichment + fallback)
+  --no-overpass         skip OSM Overpass (primary venue lookup)
+  --no-photos           skip photo-table waypoint join
+  --no-audio            skip phone_context audio snapshot join
+  --debug               include cluster diagnostics in output
+"""
+
+import argparse
+import json
+import math
+import os
+import re
+import subprocess
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+from dataclasses import dataclass, field, asdict
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, List, Optional, Tuple
+from zoneinfo import ZoneInfo
+
+# ============================================================================
+# Constants
+# ============================================================================
+
+# The kernel lib (place_naming, osm_places, places_*) and the installation
+# root (lib/root.cjs installRoot()), whose .env and data/ sit directly under it.
+_LIB = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "lib")
+sys.path.insert(0, _LIB)
+import places_local  # noqa: E402
+import place_naming as _place_naming  # noqa: E402
+
+INSTALL_ROOT = places_local.install_root()
+ENV_FILE = os.path.join(INSTALL_ROOT, ".env")
+DATA_DIR = places_local.data_path()
+SUPABASE_URL = _place_naming.SUPABASE_URL  # SUPABASE_URL, else the instance's supabase_project
+
+
+def _home_tz():
+    """The installation's home zone (instance tz), else the host's."""
+    tz = places_local.instance().get("tz")
+    try:
+        return ZoneInfo(tz) if tz else datetime.now().astimezone().tzinfo
+    except Exception:
+        return datetime.now().astimezone().tzinfo
+
+
+HOME_TZ = _home_tz()
+# Config — agent/local/config/location-segment.json (optional):
+#   scooter_bbox  [min_lat, min_lon, max_lat, max_lon] — where a fast, straight
+#                 ride reads as a shared e-scooter rather than a bicycle
+#                 (none: never "e_scooter_likely")
+_CFG = places_local.local_config("location-segment", {"scooter_bbox": None})
+KNOWN_STOPS_FILE = os.path.join(DATA_DIR, "known-recurring-stops.json")
+WIFI_MAP_FILE = os.path.join(DATA_DIR, "wifi-ssid-map.json")
+TRANSIT_FILE = os.path.join(DATA_DIR, "transit-stations.json")
+CONFIRMED_STOPS_FILE = os.path.join(DATA_DIR, "confirmed-stops.json")
+CONFIRMED_STOP_MATCH_M = 30.0  # past confirmations within this distance auto-name future stops
+# The user's own Google Maps saved places (Takeout export). Offered as live-ask
+# candidates when opts.saved_places is set: they are the user's labels, and they
+# cost nothing when Overpass is unreachable or the Places budget is spent (when
+# both happened at once, every live question shipped a bare street address).
+SAVED_PLACES_FILE = os.path.join(DATA_DIR, "google-saved-places.json")
+SAVED_PLACE_LIVE_M = 60.0       # offered as a candidate within this of where the user sat
+SAVED_PLACE_LEAD_M = 30.0       # exactly one inside this → leads the question
+SNAP_CACHE_DIR = os.path.join(DATA_DIR, ".cache", "valhalla-snap")
+PLACES_CACHE_DIR = os.path.join(DATA_DIR, ".cache", "google-places")
+# 7-day TTL is safe: venues don't open/close minute-to-minute, and the
+# resolver only hits Places for stops not yet user-confirmed (confirmed
+# stops short-circuit at tier 2 of resolve_place). Without this cache
+# live-day's 10-min refresh + location-confirm's 10-min refresh were
+# re-Places'ing every unresolved stop on every tick — thousands of
+# searchNearby+searchText calls/day at $0.032/call. (2026-05-11)
+PLACES_CACHE_TTL_SEC = 7 * 24 * 3600
+
+# Stop detection — Li/Zheng anchor-walk.
+#
+# 2026-04-30: lowered MIN_STOP_MIN from 15 → 5. Pre-fix, the Li/Zheng walk
+# rejected any cluster shorter than 15min, which silently dropped dog-walk
+# waypoints (4 stops of 6-9 min in one evening), sub-15min errands, drive-thru
+# pickups, brief social check-ins — the entire class of "where I was for ~10
+# min" was invisible to Jori (a summary that "completely missed the lunch
+# location and the evening walk"). The daily-summary playbook now groups consecutive short stops as a
+# single "walk loop" line so the rendering stays scannable while the data is
+# captured. Set lower than 5 only if you want raw-noise traffic-light clusters.
+DEFAULT_MIN_STOP_MIN = 5.0
+DEFAULT_STOP_RADIUS_M = 200.0
+DEFAULT_MERGE_GAP_MIN = 15.0
+SEMANTIC_MERGE_RADIUS_M = 250.0  # both stops within this of same named anchor -> merge
+# Max time gap between two same-named stops to consider semantic-merging them.
+# Without this cap, semantic-merge collapses the morning walk pattern (Home →
+# 6h gap with a walk → Home) into one false 12-hour Home stop. 60 min is
+# enough to absorb sparse-GPS gaps within a single stay but small enough that
+# any real outing breaks the merge. Discovered 2026-04-25.
+SEMANTIC_MERGE_MAX_GAP_MIN = 60.0
+STATIONARY_NOISE_KM = 0.2  # routes shorter than this collapse into adjacent stop
+NOISE_ROUTE_MAX_MIN = 5.0  # also-shorter-than to trigger collapse
+# Stops with cluster_radius/duration above this are "browse" patterns (wandering
+# while photographing, looking at a menu, etc.) rather than real venue dwells.
+# 5 m/min separates real stops (a restaurant 1.4, a music club 1.8) from
+# drift-walks (a diner "stop" ran 7.2 m/min — confirmed by the user as "took
+# pictures + looked at menu, not a real stop").
+BROWSE_PATTERN_RATIO_M_PER_MIN = 5.0
+
+# Place naming
+PLACES_RADIUS_M = 40
+PLACES_PRIMARY_CONF_THRESHOLD = 0.8
+
+# OSM Overpass — primary venue source. Free, deterministic, no API key.
+# Switched in 2026-04-25 after Google Places searchText proved non-deterministic
+# (same query returning 1 vs 4 hits across calls). Overpass returned both
+# of a test day's venues on first try.
+OVERPASS_URL = "https://overpass-api.de/api/interpreter"
+OVERPASS_TIMEOUT_S = 30  # whole call across mirrors (overpass_client); was one mirror
+# Tag-bonus on top of the base scorer for verified OSM POIs with both
+# `name` and an `amenity` we recognize — they're authoritative venue identities.
+OSM_VERIFIED_BONUS = 25.0
+# Notability boosts — surface POIs Wikipedia/Wikidata editors thought were worth
+# documenting. A landmark music club has a `wikidata` tag; a corner noodle bar has none. This
+# lets a notable venue beat an equally-close generic neighbor.
+OSM_WIKIDATA_BONUS = 30.0   # wikidata or wikipedia tag → encyclopedic notability
+OSM_TOURISM_BONUS = 20.0    # tourism=attraction or heritage=*
+OSM_WEBSITE_BONUS = 5.0     # has a website (small "this venue exists professionally")
+OSM_BRAND_BONUS = 8.0       # part of a known brand (Citi Bike, Whole Foods, etc.)
+OSM_CUISINE_TAG_BONUS = 5.0  # someone bothered to record cuisine — venue has a real identity
+# Stops past this dwell get a wider Places search + lower primary threshold,
+# since the longer you sit somewhere the more likely it's a real venue worth naming.
+LONG_STOP_MIN = 30.0
+LONG_STOP_PRIMARY_CONF_THRESHOLD = 0.7
+LONG_STOP_PLACES_RADIUS_M = 120.0  # min radius for long stops
+LONG_STOP_PLACES_RADIUS_CAP_M = 250.0
+LONG_STOP_MAX_RESULTS = 8
+
+# Polyline simplification (Douglas-Peucker)
+POLYLINE_EPSILON_M = 10.0
+POLYLINE_MAX_POINTS = 200
+
+# Route boundary cleanup
+ROUTE_BOUNDARY_CLEANUP_M = 50.0  # drop route samples within this of stop centroid
+
+# Gap declaration
+MIN_GAP_MIN = 10.0  # stop-to-stop quiet windows shorter than this are still routes
+
+# Inferred stop from inter-sample silence (cafes/indoors that kill GPS)
+INFERRED_STOP_GAP_MIN = 20.0       # min silence between two GPS samples to suspect a stop
+INFERRED_STOP_BRACKET_RADIUS_M = 200.0  # bracketing samples must be within this of each other
+INFERRED_STOP_NEAR_EXISTING_M = 100.0   # skip if inferred centroid is this close to an adjacent real stop
+INFERRED_STOP_SIDE_TRIP_MAX_M = 2500.0  # for the "side-trip & return" case, the anchor must be a
+                                        # plausible side trip from the base it returned to — not a
+                                        # travel waypoint kilometres away (a phantom salad-bar stop:
+                                        # a lone in-transit ping on a drive to a theatre, 18 km away)
+
+# Audio context freshness
+AUDIO_CONTEXT_FRESHNESS_MIN = 10.0
+
+# NAMED_LOCATIONS / match_named_location moved to lib/place_naming.py on
+# `stop-identify` needed the same list and was missing it entirely (it asked
+# the user to pick a venue for a stop at the user's own home, twice in one
+# afternoon), so this is now the one copy both tools import.
+
+# OSM amenity values we treat as venue-class POIs (others — bench, post_box,
+# fountain — are noise for stop naming).
+OSM_AMENITY_KINDS = (
+    "restaurant", "bar", "cafe", "pub", "fast_food", "nightclub",
+    "theatre", "cinema", "biergarten", "food_court", "ice_cream",
+    "lounge", "music_venue", "events_venue", "concert_hall",
+)
+
+# OSM amenity → Google-style primary_type so the scorer can reuse PLACE_TYPE_PRIORITY.
+OSM_AMENITY_TO_TYPE = {
+    "restaurant": "restaurant",
+    "bar": "bar",
+    "cafe": "cafe",
+    "pub": "pub",
+    "fast_food": "meal_takeaway",
+    "nightclub": "night_club",
+    "theatre": "performing_arts_theater",
+    "cinema": "movie_theater",
+    "biergarten": "bar",
+    "food_court": "restaurant",
+    "ice_cream": "ice_cream_shop",
+    "lounge": "lounge",
+    "music_venue": "live_music_venue",
+    "events_venue": "performing_arts_theater",
+    "concert_hall": "concert_hall",
+}
+
+# OSM shop values worth naming a stop after — grocery/retail destinations a
+# visit can center on (Whole Foods, Costco) that carry no `amenity` tag at
+# all, only `shop`. Added 2026-08-19: these never entered the candidate list
+# because the Overpass query only searched the `amenity` key, so a closer
+# supermarket lost to a farther restaurant by never being in the running.
+OSM_SHOP_KINDS = (
+    "supermarket", "convenience", "wholesale", "department_store", "mall",
+)
+
+# Mapped onto existing Google-style types (grocery_store/store) rather than
+# new priority entries — these should compete on distance like any other
+# candidate, not get a bespoke weight.
+OSM_SHOP_TO_TYPE = {
+    "supermarket": "grocery_store",
+    "convenience": "grocery_store",
+    "wholesale": "grocery_store",
+    "department_store": "store",
+    "mall": "store",
+}
+
+# OSM `cuisine` tag (first value before `;`) → Google-style primary_type. When
+# both `amenity=restaurant` and `cuisine=vietnamese` are present, the cuisine
+# wins because it's more specific (vietnamese_restaurant scores 100 vs
+# restaurant 100, but downstream consumers may want the cuisine).
+OSM_CUISINE_TO_TYPE = {
+    "vietnamese": "vietnamese_restaurant", "chinese": "chinese_restaurant",
+    "italian": "italian_restaurant", "japanese": "japanese_restaurant",
+    "korean": "korean_restaurant", "thai": "thai_restaurant",  # kernel-guard-ok: Google Places primary types for OSM cuisines, the same for every user
+    "mexican": "mexican_restaurant", "indian": "indian_restaurant",  # kernel-guard-ok: Google Places primary types for OSM cuisines, the same for every user
+    "mediterranean": "mediterranean_restaurant", "french": "french_restaurant",
+    "american": "american_restaurant", "seafood": "seafood_restaurant",  # kernel-guard-ok: Google Places primary types for OSM cuisines, the same for every user
+    "steak_house": "steak_house", "sushi": "sushi_restaurant",
+    "pizza": "pizza_restaurant", "vegetarian": "vegetarian_restaurant",
+    "vegan": "vegan_restaurant", "noodle": "noodle_shop",
+    "rice_noodle": "noodle_shop", "ramen": "noodle_shop",
+    "brunch": "brunch_restaurant", "breakfast": "breakfast_restaurant",
+    "asian": "asian_restaurant", "bubble_tea": "cafe",
+    "coffee_shop": "coffee_shop", "bakery": "bakery",
+}
+
+PLACE_TYPE_PRIORITY = {
+    "restaurant": 100, "cafe": 95, "coffee_shop": 95, "bar": 90,
+    "meal_takeaway": 85, "meal_delivery": 80, "bakery": 85,
+    "food": 80, "night_club": 75, "ice_cream_shop": 75,
+    "asian_restaurant": 100, "chinese_restaurant": 100, "italian_restaurant": 100,
+    "japanese_restaurant": 100, "korean_restaurant": 100, "thai_restaurant": 100,  # kernel-guard-ok: Google Places primary types for OSM cuisines, the same for every user
+    "vietnamese_restaurant": 100, "mexican_restaurant": 100, "indian_restaurant": 100,  # kernel-guard-ok: Google Places primary types for OSM cuisines, the same for every user
+    "mediterranean_restaurant": 100, "french_restaurant": 100, "american_restaurant": 100,  # kernel-guard-ok: Google Places primary types for OSM cuisines, the same for every user
+    "seafood_restaurant": 100, "steak_house": 100, "sushi_restaurant": 100,
+    "pizza_restaurant": 100, "vegetarian_restaurant": 100, "vegan_restaurant": 100,
+    "noodle_shop": 100, "brunch_restaurant": 95, "breakfast_restaurant": 95,
+    "spa": 60, "massage_spa": 60, "gym": 50, "museum": 55, "art_gallery": 50,
+    "store": 30, "clothing_store": 30, "shoe_store": 30, "grocery_store": 35,
+    "dentist": 40, "doctor": 40, "hair_salon": 40, "beauty_salon": 40,
+    "hotel": 70, "lodging": 70, "park": 45,
+    # Nightlife — these are common dwell venues that the base searchNearby
+    # ladder under-weighted (stops at a music club were resolving to whatever
+    # sushi place was 8 m closer).
+    "live_music_venue": 95, "performing_arts_theater": 85, "concert_hall": 95,
+    "comedy_club": 90, "lounge": 85, "wine_bar": 90, "pub": 90, "cocktail_bar": 90,
+    "movie_theater": 70,
+}
+
+# Time-of-day Places-text fallback. Long stops trigger a second pass through
+# `places:searchText` with a bucket-appropriate query, so e.g. a 22:00 stop
+# explicitly searches for bars/music-venues even if the nearest indexed place
+# is a sushi restaurant. Hours are the home zone's (HOME_TZ).
+TIME_OF_DAY_PROMPTS: List[Tuple[Tuple[int, int], List[str]]] = [
+    # Shorter is better: Google's searchText returns 0 results for compound queries
+    # like "restaurant cafe bar" but 4+ for "restaurant" alone. Each prompt = 1 API call.
+    ((6, 11),  ["cafe", "bakery"]),
+    ((11, 15), ["restaurant", "cafe"]),
+    ((15, 17), ["cafe", "bar"]),
+    ((17, 22), ["restaurant", "bar"]),
+    ((22, 27), ["bar music venue", "restaurant"]),  # 22-03; "bar music venue" surfaces clubs
+    ((0, 4),   ["bar music venue", "restaurant"]),
+]
+TIME_OF_DAY_BOOST = {
+    # hour bucket → {primary_type → score boost}
+    "morning":   {"cafe": 25, "bakery": 25, "coffee_shop": 25, "brunch_restaurant": 25,
+                  "breakfast_restaurant": 25},
+    "lunch":     {"restaurant": 20, "noodle_shop": 25, "cafe": 15, "meal_takeaway": 15,
+                  "vietnamese_restaurant": 25, "chinese_restaurant": 20, "thai_restaurant": 20,
+                  "japanese_restaurant": 20, "korean_restaurant": 20, "mexican_restaurant": 20,  # kernel-guard-ok: Google Places primary types for OSM cuisines, the same for every user
+                  "indian_restaurant": 20, "mediterranean_restaurant": 20},  # kernel-guard-ok: Google Places primary types for OSM cuisines, the same for every user
+    "afternoon": {"cafe": 15, "coffee_shop": 15, "bar": 10},
+    "dinner":    {"restaurant": 25, "bar": 20, "wine_bar": 25, "italian_restaurant": 25,
+                  "sushi_restaurant": 25, "steak_house": 25, "seafood_restaurant": 25},
+    "night":     {"bar": 50, "live_music_venue": 60, "concert_hall": 60, "lounge": 50,
+                  "night_club": 60, "comedy_club": 50, "cocktail_bar": 50, "wine_bar": 40,
+                  "pub": 45, "performing_arts_theater": 45, "movie_theater": 35,
+                  "restaurant": 10},  # restaurants still possible but down-weighted vs. nightlife
+}
+
+# ============================================================================
+# Dataclasses
+# ============================================================================
+
+@dataclass
+class Sample:
+    ts_ms: int
+    lat: float
+    lon: float
+    accuracy_m: Optional[float] = None
+    activity: Optional[str] = None  # CoreMotion: walking/driving/cycling/running/...
+
+@dataclass
+class PlaceCandidate:
+    name: str
+    address: Optional[str]
+    source: str  # named_location / known_recurring / wifi_ssid / google_places / reverse_geocode / coordinate
+    confidence: float
+    distance_m: Optional[float] = None
+    place_id: Optional[str] = None
+    primary_type: Optional[str] = None
+    name_native: Optional[str] = None  # the map's own label when `name` is its English
+
+@dataclass
+class StopCandidate:
+    samples: List[Sample]
+    inferred: bool = False  # True for stops synthesized from a long inter-sample silence
+
+    @property
+    def start_ts_ms(self) -> int: return self.samples[0].ts_ms
+    @property
+    def end_ts_ms(self) -> int: return self.samples[-1].ts_ms
+    @property
+    def duration_min(self) -> float:
+        return (self.end_ts_ms - self.start_ts_ms) / 60_000
+
+    def centroid(self) -> Tuple[float, float]:
+        n = len(self.samples)
+        return (sum(s.lat for s in self.samples) / n,
+                sum(s.lon for s in self.samples) / n)
+
+    def cluster_radius_m(self) -> float:
+        clat, clon = self.centroid()
+        return max((haversine_m(clat, clon, s.lat, s.lon) for s in self.samples), default=0.0)
+
+@dataclass
+class Stop:
+    id: str
+    start_ts_ms: int
+    end_ts_ms: int
+    centroid_lat: float
+    centroid_lon: float
+    cluster_radius_m: float
+    sample_count: int
+    primary: PlaceCandidate
+    alternatives: List[PlaceCandidate] = field(default_factory=list)
+    wifi_ssid: Optional[str] = None
+    audio_context: Optional[Dict[str, Any]] = None  # {audio_class, confidence, age_min}
+    photos: List[Dict[str, Any]] = field(default_factory=list)
+    pattern: str = "dwell"  # "dwell" | "browse" — browse = wandering, not real venue stop
+    inferred: bool = False  # True if synthesized from a long inter-sample GPS silence (cafes/indoors)
+    debug: Optional[Dict[str, Any]] = None
+
+@dataclass
+class Waypoint:
+    ts_ms: int
+    lat: float
+    lon: float
+    kind: str  # photo / transit / mode_change
+    label: str
+
+@dataclass
+class Leg:
+    start_ts_ms: int
+    end_ts_ms: int
+    distance_km: float
+    mode: str
+    mode_confidence: float
+    mode_features: Dict[str, Any]
+    sample_count: int
+
+@dataclass
+class Route:
+    id: str
+    from_stop_id: Optional[str]  # None for leading route (window-start to first stop)
+    to_stop_id: Optional[str]    # None for trailing route (last stop to window-end)
+    start_ts_ms: int
+    end_ts_ms: int
+    distance_km: float
+    legs: List[Leg]
+    polyline: List[List[float]]  # [[lat, lon], ...]
+    polyline_source: str         # raw_downsampled / valhalla
+    waypoints: List[Waypoint] = field(default_factory=list)
+
+@dataclass
+class Gap:
+    start_ts_ms: int
+    end_ts_ms: int
+    reason: str  # no_gps_samples / between_stop_and_window_edge
+
+# ============================================================================
+# Env / secrets
+# ============================================================================
+
+_env_cache: Optional[Dict[str, str]] = None
+
+def _load_env() -> Dict[str, str]:
+    global _env_cache
+    if _env_cache is not None:
+        return _env_cache
+    out: Dict[str, str] = {}
+    if os.path.exists(ENV_FILE):
+        with open(ENV_FILE) as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                out[k.strip()] = v.strip()
+    _env_cache = out
+    return out
+
+def get_supabase_key() -> Optional[str]:
+    env = _load_env()
+    return env.get("SUPABASE_SERVICE_ROLE_KEY") or os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
+
+_places_key_cache: Optional[str] = None
+
+def _log_secret_failure(secret_name: str, reason: str) -> None:
+    # Append-only JSONL, daily-deduped per (script, secret). Never raises.
+    try:
+        from datetime import datetime, timezone
+        log_path = os.path.join(DATA_DIR, "secret-failures.jsonl")
+        now = datetime.now(timezone.utc)
+        today = now.strftime("%Y-%m-%d")
+        if os.path.exists(log_path):
+            with open(log_path) as f:
+                for line in f.readlines()[-50:]:
+                    try:
+                        r = json.loads(line)
+                        if (r.get("script") == "location-segment"
+                            and r.get("secret") == secret_name
+                            and r.get("ts", "").startswith(today)):
+                            return
+                    except Exception:
+                        continue
+        record = {
+            "ts": now.isoformat(timespec="seconds").replace("+00:00", "Z"),
+            "script": "location-segment",
+            "secret": secret_name,
+            "reason": reason,
+        }
+        with open(log_path, "a") as f:
+            f.write(json.dumps(record) + "\n")
+    except Exception:
+        pass
+
+try:
+    from places_log import log_call as _places_log, timed as _places_timed
+except Exception:  # never let the logger break a caller
+    def _places_log(*a, **k): pass
+    class _places_timed:
+        ms = None
+        def __enter__(self): return self
+        def __exit__(self, *e): return False
+
+
+def _places_blocked() -> bool:
+    """True when the Jori Places budget is spent. Never raises — a broken
+    guard must read as 'not blocked' rather than silently strip every venue."""
+    try:
+        from places_guard import places_block_reason
+
+        return places_block_reason() is not None
+    except Exception:
+        return False
+
+
+def get_google_places_key() -> Optional[str]:
+    """Google Places API key. Env first, then .env, then 1Password (SA-token only,
+    the secret reference in JORI_PLACES_OP_REF).
+
+    Returns None when the Jori Places budget is spent. Every caller here
+    already treats a missing key as "no Places enrichment" and returns [], so
+    this one line degrades the whole module — segments still resolve from GPS,
+    they just come back without venue names. Checked before the cache so the
+    block takes effect within a run, and lifts the same way.
+    """
+    global _places_key_cache
+    if _places_blocked():
+        print("[location-segment] Google Places blocked (monthly budget cap) — "
+              "skipping Places supplement this call", file=sys.stderr)
+        return None
+    if _places_key_cache is not None:
+        return _places_key_cache or None
+    key = os.environ.get("GOOGLE_PLACES_API_KEY") or _load_env().get("GOOGLE_PLACES_API_KEY")
+    op_ref = os.environ.get("JORI_PLACES_OP_REF")
+    if not key and op_ref and os.environ.get("OP_SERVICE_ACCOUNT_TOKEN"):
+        try:
+            r = subprocess.run(
+                ["op", "read", op_ref],
+                capture_output=True, text=True, check=False, timeout=10,
+            )
+            if r.returncode == 0:
+                key = r.stdout.strip() or None
+        except Exception:
+            key = None
+    _places_key_cache = key or ""
+    if not key:
+        _log_secret_failure(
+            "GOOGLE_PLACES_API_KEY",
+            "no env var, no .env entry, no SA token"
+            if not os.environ.get("OP_SERVICE_ACCOUNT_TOKEN")
+            else "no env var, no .env entry; SA token present but op read returned empty",
+        )
+    return key or None
+
+# ============================================================================
+# Geo math
+# ============================================================================
+
+EARTH_KM = 6371.0088
+
+def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    dlat = math.radians(lat2 - lat1)
+    dlon = math.radians(lon2 - lon1)
+    a = (math.sin(dlat / 2) ** 2 +
+         math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.sin(dlon / 2) ** 2)
+    return EARTH_KM * 2 * math.asin(math.sqrt(a))
+
+def haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    return haversine_km(lat1, lon1, lat2, lon2) * 1000.0
+
+def bearing_deg(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Initial bearing from p1 to p2, in degrees [0, 360)."""
+    rlat1 = math.radians(lat1)
+    rlat2 = math.radians(lat2)
+    dlon = math.radians(lon2 - lon1)
+    y = math.sin(dlon) * math.cos(rlat2)
+    x = (math.cos(rlat1) * math.sin(rlat2) -
+         math.sin(rlat1) * math.cos(rlat2) * math.cos(dlon))
+    brng = math.degrees(math.atan2(y, x))
+    return (brng + 360.0) % 360.0
+
+def angle_delta(a: float, b: float) -> float:
+    """Smallest angular distance between two bearings (degrees)."""
+    d = abs(a - b) % 360.0
+    return d if d <= 180.0 else 360.0 - d
+
+def in_scooter_area(lat: float, lon: float) -> bool:
+    """Inside the configured scooter_bbox (where shared e-scooters are common)."""
+    b = _CFG.get("scooter_bbox")
+    try:
+        a, bb, c, d = (float(x) for x in b)
+    except (TypeError, ValueError):
+        return False
+    return a <= lat <= c and bb <= lon <= d
+
+def percentile(values: List[float], p: float) -> float:
+    """Pure-stdlib percentile. p in [0, 100]. Returns 0 for empty input."""
+    if not values:
+        return 0.0
+    s = sorted(values)
+    if len(s) == 1:
+        return s[0]
+    k = (len(s) - 1) * (p / 100.0)
+    lo = int(math.floor(k))
+    hi = int(math.ceil(k))
+    if lo == hi:
+        return s[lo]
+    return s[lo] + (s[hi] - s[lo]) * (k - lo)
+
+# ============================================================================
+# Time parsing
+# ============================================================================
+
+def parse_iso_to_ms(iso_str: str) -> int:
+    try:
+        dt = datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return int(dt.timestamp() * 1000)
+    except Exception:
+        return 0
+
+def ms_to_iso(ts_ms: int, tz: Optional[ZoneInfo] = None) -> str:
+    dt = datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc)
+    if tz is not None:
+        dt = dt.astimezone(tz)
+    return dt.isoformat()
+
+def parse_period(period_arg: Optional[str], start_arg: Optional[str], end_arg: Optional[str]
+                 ) -> Tuple[int, int]:
+    HZ = HOME_TZ  # dates without a zone are the home zone's
+    if start_arg and end_arg:
+        try:
+            sd = datetime.fromisoformat(start_arg)
+            ed = datetime.fromisoformat(end_arg)
+            if sd.tzinfo is None:
+                sd = sd.replace(tzinfo=HZ)
+            if ed.tzinfo is None:
+                ed = ed.replace(tzinfo=HZ)
+            return int(sd.timestamp() * 1000), int(ed.timestamp() * 1000)
+        except Exception:
+            sys.exit("ERROR: bad --start/--end. Use YYYY-MM-DD or ISO 8601.")
+    if not period_arg:
+        sys.exit("ERROR: specify period (yesterday/today/YYYY-MM-DD) or --start + --end.")
+
+    arg = period_arg.lower()
+    now_home = datetime.now(HZ)
+
+    if arg == "today":
+        start = now_home.replace(hour=0, minute=0, second=0, microsecond=0)
+        end = start + timedelta(days=1)
+    elif arg == "yesterday":
+        start = (now_home - timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+        end = start + timedelta(days=1)
+    else:
+        try:
+            d = datetime.fromisoformat(arg)
+            if d.tzinfo is None:
+                d = d.replace(tzinfo=HZ)
+            start = d.replace(hour=0, minute=0, second=0, microsecond=0)
+            end = start + timedelta(days=1)
+        except Exception:
+            sys.exit(f"ERROR: bad period '{period_arg}'. Use today/yesterday/YYYY-MM-DD.")
+
+    return int(start.timestamp() * 1000), int(end.timestamp() * 1000)
+
+# ============================================================================
+# Supabase queries
+# ============================================================================
+
+def _sb_get(path: str, params: List[Tuple[str, str]], timeout: float = 15.0) -> List[Dict[str, Any]]:
+    key = get_supabase_key()
+    if not key:
+        return []
+    qs = urllib.parse.urlencode(params)
+    url = f"{SUPABASE_URL}{path}?{qs}"
+    req = urllib.request.Request(url, headers={
+        "apikey": key,
+        "Authorization": f"Bearer {key}",
+        "Accept": "application/json",
+        "User-Agent": "location-segment/1.0",
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read())
+            return data if isinstance(data, list) else []
+    except Exception as e:
+        print(f"[location-segment] supabase {path} error: {e}", file=sys.stderr)
+        return []
+
+def fetch_samples(start_ts_ms: int, end_ts_ms: int) -> List[Sample]:
+    start_iso = ms_to_iso(start_ts_ms)
+    end_iso = ms_to_iso(end_ts_ms)
+    rows = _sb_get("/rest/v1/location_history", [
+        ("arrived_at", f"gte.{start_iso}"),
+        ("arrived_at", f"lte.{end_iso}"),
+        ("order", "arrived_at.asc"),
+        ("limit", "20000"),
+        ("select", "latitude,longitude,arrived_at,accuracy_m,activity"),
+    ])
+    out: List[Sample] = []
+    for r in rows:
+        ts = parse_iso_to_ms(r.get("arrived_at", ""))
+        lat = r.get("latitude")
+        lon = r.get("longitude")
+        if not ts or lat is None or lon is None:
+            continue
+        out.append(Sample(
+            ts_ms=ts, lat=float(lat), lon=float(lon),
+            accuracy_m=float(r["accuracy_m"]) if r.get("accuracy_m") is not None else None,
+            activity=r.get("activity"),
+        ))
+    return out
+
+def fetch_photos(start_ts_ms: int, end_ts_ms: int) -> List[Dict[str, Any]]:
+    rows = _sb_get("/rest/v1/photos", [
+        ("taken_at", f"gte.{ms_to_iso(start_ts_ms)}"),
+        ("taken_at", f"lte.{ms_to_iso(end_ts_ms)}"),
+        ("latitude", "not.is.null"),
+        ("order", "taken_at.asc"),
+        ("limit", "1000"),
+        ("select", "uuid,taken_at,latitude,longitude,original_filename"),
+    ])
+    out = []
+    for r in rows:
+        ts = parse_iso_to_ms(r.get("taken_at", ""))
+        if not ts or r.get("latitude") is None or r.get("longitude") is None:
+            continue
+        out.append({
+            "ts_ms": ts,
+            "lat": float(r["latitude"]),
+            "lon": float(r["longitude"]),
+            "uuid": r.get("uuid"),
+            "filename": r.get("original_filename"),
+        })
+    return out
+
+def fetch_phone_context_latest() -> Optional[Dict[str, Any]]:
+    rows = _sb_get("/rest/v1/phone_context", [
+        ("order", "ts.desc"),
+        ("limit", "1"),
+        ("select", "*"),
+    ])
+    return rows[0] if rows else None
+
+# ============================================================================
+# Static data loaders
+# ============================================================================
+
+def load_known_recurring_stops() -> List[Dict[str, Any]]:
+    if not os.path.exists(KNOWN_STOPS_FILE):
+        return []
+    try:
+        with open(KNOWN_STOPS_FILE) as f:
+            data = json.load(f)
+        return data.get("entries", [])
+    except Exception:
+        return []
+
+def load_confirmed_stops() -> List[Dict[str, Any]]:
+    """Past one-off venue confirmations from the live ask-cron. Format:
+    [{"centroid":[lat,lon], "name", "place_id", "ts", "address", "primary_type", "source"}].
+    Each entry takes precedence over OSM/Google for any future stop within
+    CONFIRMED_STOP_MATCH_M of its centroid — this is how a confirmed restaurant
+    auto-resolves on the second visit even though it's not a recurring weekly stop."""
+    if not os.path.exists(CONFIRMED_STOPS_FILE):
+        return []
+    try:
+        with open(CONFIRMED_STOPS_FILE) as f:
+            data = json.load(f)
+        if isinstance(data, list):
+            return data
+        if isinstance(data, dict):
+            return data.get("entries", [])
+    except Exception:
+        pass
+    return []
+
+_SAVED_PLACES_CACHE: Optional[List[Dict[str, Any]]] = None
+
+def load_saved_places() -> List[Dict[str, Any]]:
+    global _SAVED_PLACES_CACHE
+    if _SAVED_PLACES_CACHE is not None:
+        return _SAVED_PLACES_CACHE
+    try:
+        with open(SAVED_PLACES_FILE) as f:
+            data = json.load(f)
+        _SAVED_PLACES_CACHE = [p for p in data.get("places", [])
+                               if p.get("name") and p.get("lat") is not None and p.get("lng") is not None]
+    except Exception:
+        _SAVED_PLACES_CACHE = []
+    return _SAVED_PLACES_CACHE
+
+def saved_place_candidates(stop: "StopCandidate") -> List[PlaceCandidate]:
+    """Saved places near where the user SAT — measured from the nearest sample as well
+    as the centroid, since a centroid that includes the walk in can sit 40 m off
+    the table (location-spine: 'a centroid is a summary statistic')."""
+    clat, clon = stop.centroid()
+    pts = [(clat, clon)] + [(s.lat, s.lon) for s in stop.samples]
+    near = []
+    for p in load_saved_places():
+        d = min(haversine_m(lat, lon, p["lat"], p["lng"]) for lat, lon in pts)
+        if d <= SAVED_PLACE_LIVE_M:
+            near.append((d, p))
+    near.sort(key=lambda x: x[0])
+    lead_ok = sum(1 for d, _ in near if d <= SAVED_PLACE_LEAD_M) == 1
+    out = []
+    for i, (d, p) in enumerate(near[:3]):
+        conf = 0.85 if (i == 0 and lead_ok) else max(0.5, 0.75 - d / 400.0)
+        out.append(PlaceCandidate(
+            name=p["name"], address=p.get("address"),
+            source="saved_place", confidence=conf, distance_m=d,
+            place_id=p.get("place_id"),
+        ))
+    return out
+
+def load_wifi_map() -> List[Dict[str, Any]]:
+    if not os.path.exists(WIFI_MAP_FILE):
+        return []
+    try:
+        with open(WIFI_MAP_FILE) as f:
+            data = json.load(f)
+        if isinstance(data, list):
+            return data
+        if isinstance(data, dict):
+            return data.get("entries", [])
+    except Exception:
+        pass
+    return []
+
+def load_transit_stations() -> List[Dict[str, Any]]:
+    if not os.path.exists(TRANSIT_FILE):
+        return []
+    try:
+        with open(TRANSIT_FILE) as f:
+            data = json.load(f)
+        return data.get("stations", [])
+    except Exception:
+        return []
+
+# ============================================================================
+# Reverse geocode (Nominatim — fallback only)
+# ============================================================================
+
+def reverse_geocode_nominatim(lat: float, lon: float) -> Optional[Tuple[str, str, float, Optional[str]]]:
+    """Returns (name, address, confidence, name_native). Confidence reflects how venue-like the match is:
+    POI hit (amenity/shop/etc.) → 0.75, street address → 0.65, neighborhood-only → 0.55.
+    """
+    try:
+        url = (f"https://nominatim.openstreetmap.org/reverse"
+               f"?lat={lat}&lon={lon}&format=json&zoom=18&addressdetails=1&namedetails=1&extratags=1"
+               "&accept-language=en")
+        req = urllib.request.Request(url, headers={"User-Agent": "location-segment/1.0"})
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            data = json.loads(resp.read())
+        addr = data.get("address", {}) or {}
+        road = addr.get("road") or addr.get("pedestrian") or addr.get("footway")
+        house = addr.get("house_number")
+        nbhd = addr.get("neighbourhood") or addr.get("suburb") or addr.get("quarter")
+        city = addr.get("city") or addr.get("town") or addr.get("village")
+        state = addr.get("state")
+        nd = data.get("namedetails") or {}
+        # The matched feature IS the road and has no name tag of any kind, only
+        # `ref`: Nominatim printed its route number as its name (2026-10-19).
+        ref_road = road if (road and data.get("addresstype") == "road" and road == nd.get("ref")
+                            and not any("name" in k for k in nd)) else None
+        venue_keys = ("amenity", "shop", "tourism", "leisure", "office", "craft")
+        en = english_names([(x, k) for x, k in ((road, "street"), (nbhd, "area"), (city, "area"), *(
+            (v, "place") for v in (data.get("name"), *map(addr.get, venue_keys)))) if x and x != ref_road])
+        _en = lambda x: x if x not in en else (en[x]["en"] if en[x]["is_name"] else None)
+        # isdigit() reads an OSM `ref` tag value, machine structure ("3976" vs "I 95"), not language.
+        road = (f"Route {ref_road}" if ref_road.isdigit() else ref_road) if ref_road else _en(road)
+        nbhd, city = _en(nbhd), _en(city)
+        # Build the canonical address line first (street, neighborhood, city, state).
+        parts: List[str] = []
+        if house and road:
+            parts.append(f"{house} {road}")
+        elif road:
+            parts.append(road)
+        if nbhd:
+            parts.append(nbhd)
+        if city:
+            parts.append(city)
+        if state:
+            parts.append(state)
+        addr_line = ", ".join(parts) if parts else ""
+
+        # Try to surface a real venue name. Nominatim exposes POIs through address.amenity /
+        # shop / tourism / leisure / office / craft / building (when named), and the top-level
+        # `name` field when the matched feature is a POI rather than a road/area.
+        venue = next((addr.get(k) for k in venue_keys if addr.get(k)), None)
+        addr_type = data.get("addresstype") or ""
+        top_name = data.get("name")
+        # Top-level name is only trustworthy when it's not just a road/area echo.
+        AREA_TYPES = {"road", "residential", "neighbourhood", "suburb", "quarter",
+                      "city", "town", "village", "state", "country", "postcode"}
+        if not venue and top_name and addr_type and addr_type not in AREA_TYPES:
+            venue = top_name
+        native, venue = venue, _en(venue)
+        native = native if venue and native != venue else None
+
+        if venue:
+            name = venue
+            if nbhd and nbhd != venue:
+                name = f"{venue} ({nbhd})"
+            confidence = 0.75
+        elif house and road:
+            name = f"{house} {road}"
+            if nbhd:
+                name = f"{name}, {nbhd}"
+            confidence = 0.65
+        elif road:
+            name = road
+            if nbhd:
+                name = f"{name}, {nbhd}"
+            confidence = 0.6
+        elif nbhd:
+            name = f"{nbhd}, {city}" if city and city != nbhd else nbhd
+            confidence = 0.55
+        else:
+            name = city or addr_line
+            confidence = 0.5
+        return (name, addr_line, confidence, native) if name else None
+    except Exception:
+        return None
+
+def nominatim_neighborhood(lat: float, lon: float) -> Optional[str]:
+    """Just the neighborhood/suburb (else city) name for a point — the fallback
+    label for the confidence-gated naming ladder, so a caller always has a
+    locality even when the primary resolve is a confident venue. Lower zoom (14)
+    biases toward the neighborhood, not a street/POI."""
+    try:
+        # zoom 15 surfaces the actual neighborhood — zoom 14 collapses to the
+        # borough/city. Prefer the neighborhood-grain fields; in a big city
+        # `suburb` is the borough, so it ranks below the finer fields.
+        url = (f"https://nominatim.openstreetmap.org/reverse"
+               f"?lat={lat}&lon={lon}&format=json&zoom=15&addressdetails=1&accept-language=en")
+        req = urllib.request.Request(url, headers={"User-Agent": "location-segment/1.0"})
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            data = json.loads(resp.read())
+        addr = data.get("address", {}) or {}
+        return (addr.get("neighbourhood") or addr.get("quarter")
+                or addr.get("city_district") or addr.get("suburb")
+                or addr.get("city") or addr.get("town") or addr.get("village"))
+    except Exception:
+        return None
+
+# ============================================================================
+# Google Places
+# ============================================================================
+
+import hashlib
+import time
+
+def _places_locale(lat: float, lon: float) -> Dict[str, str]:
+    """Hebrew names for Israeli coordinates — lib/places_nearby.py
+    places_locale (2026-10-06). {} elsewhere, and on any import trouble."""
+    try:
+        from places_nearby import places_locale
+        return places_locale(lat, lon)
+    except Exception:
+        return {}
+
+
+def _places_cache_key(prefix: str, lat: float, lon: float, radius_m: float,
+                       max_results: int, query: str = "") -> str:
+    # Round centroid to 4 decimals (~11 m). Real movement still cache-misses;
+    # GPS jitter on the same dwell hits the same key. Bucket radius to 20m
+    # so neighboring stop-radius values collapse to one entry.
+    lat_r = round(lat, 4)
+    lon_r = round(lon, 4)
+    rad_r = int(radius_m / 20) * 20
+    raw = f"{prefix}|{lat_r}|{lon_r}|{rad_r}|{max_results}|{query}"
+    return hashlib.md5(raw.encode("utf-8")).hexdigest()[:16]
+
+def _places_cache_get(key: str, allow_stale: bool = False) -> Optional[List[Dict[str, Any]]]:
+    path = os.path.join(PLACES_CACHE_DIR, f"{key}.json")
+    try:
+        if not os.path.exists(path):
+            return None
+        age = time.time() - os.path.getmtime(path)
+        if age > PLACES_CACHE_TTL_SEC and not allow_stale:
+            return None
+        with open(path) as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+def _places_cache_set(key: str, results: List[Dict[str, Any]]) -> None:
+    try:
+        os.makedirs(PLACES_CACHE_DIR, exist_ok=True)
+        path = os.path.join(PLACES_CACHE_DIR, f"{key}.json")
+        tmp = path + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(results, f)
+        os.replace(tmp, path)
+    except Exception:
+        pass
+
+# rating + userRatingCount make both searches Enterprise tier (not Atmosphere).
+_LS_PLACES_MASK = ("places.displayName,places.formattedAddress,places.rating,"
+                   "places.userRatingCount,places.primaryType,places.types,"
+                   "places.location,places.id")
+
+
+def google_places_nearby(lat: float, lon: float, radius_m: float = PLACES_RADIUS_M,
+                         max_results: int = 20) -> List[Dict[str, Any]]:
+    key = get_google_places_key()
+    if not key:
+        return []
+    locale = _places_locale(lat, lon)
+    ck = _places_cache_key("nearby", lat, lon, radius_m, max_results,
+                           ("lang=" + locale["languageCode"]) if locale else "")
+    cached = _places_cache_get(ck)
+    if cached is not None:
+        _places_log("location-segment", "searchNearby", tier="enterprise", cached=True)
+        return cached
+    try:
+        body = {
+            "locationRestriction": {
+                "circle": {"center": {"latitude": lat, "longitude": lon}, "radius": radius_m},
+            },
+            "rankPreference": "DISTANCE",
+            "maxResultCount": max_results,
+            **locale,
+        }
+        from places_client import post as _places_post  # the one guarded door: prices, gates, logs
+        data = _places_post("location-segment", "places:searchNearby", body, _LS_PLACES_MASK, "searchNearby",
+                            timeout=10, api_key=key, lat=lat, lon=lon, radius=radius_m)
+    except Exception as e:
+        print(f"[location-segment] places error: {e}", file=sys.stderr)
+        return []
+
+    results: List[Dict[str, Any]] = []
+    for p in data.get("places", []):
+        loc = p.get("location") or {}
+        plat = loc.get("latitude")
+        plon = loc.get("longitude")
+        if plat is None or plon is None:
+            continue
+        results.append({
+            "name": (p.get("displayName") or {}).get("text", "?"),
+            "address": p.get("formattedAddress", ""),
+            "rating": p.get("rating"),
+            "reviews": p.get("userRatingCount", 0) or 0,
+            "primary_type": p.get("primaryType", ""),
+            "types": p.get("types", []),
+            "lat": plat,
+            "lon": plon,
+            "distance_m": haversine_m(lat, lon, plat, plon),
+            "place_id": p.get("id", ""),
+        })
+    # Only cache a NON-EMPTY answer. An empty Overpass response is far more
+    # likely a rate-limit or a partial outage than "there are no venues here",
+    # and caching it would freeze the wrong POI in place for the full 7 days —
+    # the precise failure this cache exists to prevent.
+    if results:
+        _places_cache_set(ck, results)
+    else:
+        stale = _places_cache_get(ck, allow_stale=True)
+        if stale:
+            print(f"[location-segment] overpass returned 0 POIs — using cached ({len(stale)})", file=sys.stderr)
+            return stale
+    return results
+
+# ============================================================================
+# Vacation-rental listing filter
+# ============================================================================
+#
+# Hosts publish Airbnb/Vrbo listings into Google Places, so a coastal block in a
+# tourist town is carpeted with pins whose "name" is a marketing headline. They
+# are dense, they sit meters from the path, and they can never be corroborated —
+# so they win the nearest-POI joust and then get printed as if they were venues.
+# One seaside day shipped two of them as stop titles:
+#
+#   ~T2 Sea View. The small ones. Near the port. Family. Balcony.?
+#   ~Résidence avec Piscine face au port 200m plage?
+#
+# ...for two stretches of walking near the marina. They also drive the
+# location-enrich ASKS ("20m near a cluster of vacation rentals…"), so filtering
+# here — at the producer — fixes the questions and the summary together.
+#
+# Dropping one costs nothing: the ladder falls through to Nominatim, and a
+# beach's name or a street address is a strictly better label than a listing
+# headline. A REAL hotel (ordinary name, street address, reviews) trips none of
+# these tests and is unaffected.
+
+# Unmistakable on their own.
+_LISTING_BRAND = re.compile(r"\b(vrbo|airbnb|homeaway|abritel|booking\.com|expedia|tripadvisor\s+rental)\b", re.I)  # kernel-guard-ok: public rental-platform names a listing title carries, the same for every user
+_LISTING_ID = re.compile(r"\b[A-Z]{2}-\d+-\d+-\d+\b")
+_GUEST_COUNT = re.compile(
+    r"\b(sleeps?\s*\d+|\d+\s*(guests?|bedrooms?|beds?|chambres?|pi[eè]ces?|personnes?|pers\.?|couchages?)|\d+\s*br\b|\bT[1-6]\b)",
+    re.I)
+
+# Need two or more of these.
+_ACCOM_NOUN = re.compile(
+    r"\b(appartements?|apartments?|appart|studios?|duplex|lofts?|r[ée]sidences?|"
+    r"g[iî]tes?|cottages?|bungalows?|mobil[- ]?home|chambre\s+d.h[oô]te)\b", re.I)
+_AMENITY_PITCH = re.compile(
+    r"(sea\s*view|ocean\s*view|vue\s*mer|panoramic|beach\s*front|bord\s*de\s*mer|"
+    r"pr[eè]s\s+de\s+la\s+plage|face\s+au\s+port|steps?\s+from|\d+\s*m\s*(from\s+)?(the\s+)?(beach|plage)|"
+    r"avec\s+(piscine|terrasse|balcon|jardin)|with\s+(pool|terrace|balcony|garden|hot\s*tub))", re.I)
+_LODGING_TYPES = {"lodging", "guest_house", "bed_and_breakfast", "cottage", "farmstay",
+                  "apartment_complex", "apartment_building", "condominium_complex",
+                  "housing_complex", "vacation_rental_agency"}
+
+
+def _has_street_address(address: Optional[str]) -> bool:
+    """A real walk-in venue publishes a street. Listing pins publish a city."""
+    if not address:
+        return False
+    first = address.split(",")[0].strip()
+    # "14 Rue de l'Exemple" -> yes. "17000 Villeneuve" (postcode + city) -> no.
+    return bool(re.match(r"^\d+\S*\s+\S", first)) and not re.match(r"^\d{4,6}\s", first)
+
+
+def is_rental_listing(c: Dict[str, Any]) -> bool:
+    """Is this Places candidate a vacation-rental LISTING rather than a venue?"""
+    name = (c.get("name") or "").strip()
+    if not name:
+        return False
+    if _LISTING_BRAND.search(name) or _LISTING_ID.search(name) or _GUEST_COUNT.search(name):
+        return True
+    # A name written as several sentences is a listing headline, never a venue.
+    if len([seg for seg in re.split(r"\.\s+|\.$", name) if seg.strip()]) >= 3:
+        return True
+    weak = 0
+    if _ACCOM_NOUN.search(name):
+        weak += 1
+    if _AMENITY_PITCH.search(name):
+        weak += 1
+    if len(name) > 40:
+        weak += 1
+    if not _has_street_address(c.get("address")):
+        weak += 1
+    if (c.get("primary_type") or "") in _LODGING_TYPES and not (c.get("reviews") or 0):
+        weak += 1
+    return weak >= 3
+
+
+def score_places_candidate(c: Dict[str, Any], hour_local: Optional[int] = None) -> float:
+    type_score = PLACE_TYPE_PRIORITY.get(c.get("primary_type", ""), 20)
+    # Gentler prox decay: 100 at 0 m, 75 at 50 m, 50 at 100 m, 0 at 200 m.
+    # The old formula (max(0, 100 - 2d)) zeroed at 50 m, which made venues at the
+    # edge of a 150 m cluster impossible to ever beat the closest indexed business —
+    # so The Bitter End at 54 m kept losing to a sushi restaurant at 8 m.
+    distance_m = c.get("distance_m", 0) or 0
+    prox_score = max(0.0, 100.0 - distance_m * 0.5)
+    reviews = c.get("reviews", 0) or 0
+    # Cap raised popularity at 25 (was 50) AND decay by distance: a famous venue
+    # at 100 m shouldn't outweigh a closer venue at 30 m. Without this decay,
+    # Shu Jiao Fu Zhou (2999 reviews, 97 m) beat Pho Grand (993 reviews, 33 m)
+    # for yesterday's lunch stop.
+    pop_raw = min(25.0, reviews ** 0.5)
+    pop_decay = 1.0 / (1.0 + distance_m / 100.0)
+    pop_score = pop_raw * pop_decay
+    # Rating is now a small bonus, not a baseline. Pre-2026-04-25 we used
+    # `(rating or 3.0) * 4` which gave un-enriched OSM POIs a 12-point baseline
+    # while a Google-enriched venue at 4.3 stars scored 17 — net 5-point handicap
+    # against any OSM venue Google didn't surface. Now rating only adds points
+    # when the venue is genuinely well-rated (≥4.0) and contributes 0 otherwise.
+    rating = c.get("rating")
+    if rating is None:
+        rating_score = 0.0
+    elif rating >= 4.5:
+        rating_score = 10.0
+    elif rating >= 4.0:
+        rating_score = 5.0
+    else:
+        rating_score = 0.0
+    boost = 0.0
+    if hour_local is not None:
+        bucket = hour_to_bucket(hour_local)
+        boost = TIME_OF_DAY_BOOST.get(bucket, {}).get(c.get("primary_type", ""), 0)
+    return type_score + prox_score + pop_score + rating_score + boost
+
+def hour_to_bucket(h: int) -> str:
+    if 6 <= h < 11: return "morning"
+    if 11 <= h < 15: return "lunch"
+    if 15 <= h < 17: return "afternoon"
+    if 17 <= h < 22: return "dinner"
+    return "night"  # 22-05
+
+def stop_local_hour(start_ts_ms: int, end_ts_ms: int) -> int:
+    """Return local-hour at the stop midpoint (the home zone, HOME_TZ)."""
+    mid_s = (start_ts_ms + end_ts_ms) / 2 / 1000.0
+    return datetime.fromtimestamp(mid_s, tz=HOME_TZ).hour
+
+def time_of_day_queries(hour_local: int) -> List[str]:
+    for (lo, hi), prompts in TIME_OF_DAY_PROMPTS:
+        if lo <= hour_local < hi:
+            return prompts
+        # Late-night window straddles midnight (22-27 means 22-23 wraps to 0-3).
+        if hi > 24 and (hour_local >= lo or hour_local < hi - 24):
+            return prompts
+    return []
+
+def google_places_search_text(query: str, lat: float, lon: float, radius_m: float,
+                              max_results: int = 20) -> List[Dict[str, Any]]:
+    """20 is the Google cap; using less arbitrarily drops good hits — Pho Grand at
+    33 m only surfaced via `restaurant` when max_results was raised from 8 to 20."""
+    # places:searchText — biased to the centroid. Different surface than searchNearby:
+    # catches venues by category prompt ("bar music venue") that nearest-20 misses in dense
+    # blocks. Returns candidates inside 1.5x radius so the bias doesn't pull from a block away.
+    key = get_google_places_key()
+    if not key:
+        return []
+    locale = _places_locale(lat, lon)
+    ck = _places_cache_key("text", lat, lon, radius_m, max_results,
+                           query + (("|lang=" + locale["languageCode"]) if locale else ""))
+    cached = _places_cache_get(ck)
+    if cached is not None:
+        _places_log("location-segment", "searchText", tier="enterprise", cached=True)
+        return cached
+    try:
+        body = {
+            "textQuery": query,
+            "locationBias": {"circle": {"center": {"latitude": lat, "longitude": lon},
+                                         "radius": radius_m}},
+            "maxResultCount": max_results,
+            **locale,
+        }
+        from places_client import post as _places_post  # the one guarded door: prices, gates, logs
+        data = _places_post("location-segment", "places:searchText", body, _LS_PLACES_MASK, "searchText",
+                            timeout=10, api_key=key, query=query, lat=lat, lon=lon, radius=radius_m)
+    except Exception as e:
+        print(f"[location-segment] places searchText error: {e}", file=sys.stderr)
+        return []
+
+    cap_m = radius_m * 1.5
+    results: List[Dict[str, Any]] = []
+    for p in data.get("places", []):
+        loc = p.get("location") or {}
+        plat = loc.get("latitude")
+        plon = loc.get("longitude")
+        if plat is None or plon is None:
+            continue
+        d = haversine_m(lat, lon, plat, plon)
+        if d > cap_m:
+            continue
+        results.append({
+            "name": (p.get("displayName") or {}).get("text", "?"),
+            "address": p.get("formattedAddress", ""),
+            "rating": p.get("rating"),
+            "reviews": p.get("userRatingCount", 0) or 0,
+            "primary_type": p.get("primaryType", ""),
+            "types": p.get("types", []),
+            "lat": plat,
+            "lon": plon,
+            "distance_m": d,
+            "place_id": p.get("id", ""),
+        })
+    _places_cache_set(ck, results)
+    return results
+
+# ============================================================================
+# OSM Overpass — primary venue source (free, deterministic, no API key)
+# ============================================================================
+
+def osm_overpass_pois(lat: float, lon: float, radius_m: float,
+                      kinds: Tuple[str, ...] = OSM_AMENITY_KINDS,
+                      timeout_s: int = OVERPASS_TIMEOUT_S) -> List[Dict[str, Any]]:
+    """Return named OSM venue POIs around (lat, lon) shaped like the Google Places
+    result records so the existing scorer + merger can consume them transparently.
+    Only POIs with both an amenity tag and a name come through — unnamed buildings
+    are noise here. Cuisine tag takes precedence over plain amenity for primary_type
+    so a Vietnamese restaurant scores as `vietnamese_restaurant` not just `restaurant`.
+    """
+    # CACHE (2026-07-27). Google Places has been cached for 7 days; Overpass was
+    # not, so every re-resolve re-queried a free, heavily rate-limited public
+    # endpoint — and when it errored the OSM candidates simply vanished, taking
+    # the OSM_VERIFIED_BONUS with them and handing the stop to a different POI.
+    # That is why 2026-07-26's 12:09 stop rendered "Capitaine café" on one run
+    # and "Yélomobile autopartage : Station Les Minimes" on the next: the same
+    # day resolving differently depending on whether Overpass happened to answer.
+    # An unconfirmed title has to at least be STABLE.
+    ck = _places_cache_key("osm-en", lat, lon, radius_m, len(kinds), len(OSM_SHOP_KINDS))  # "osm": local names only
+    cached = _places_cache_get(ck)
+    if cached is not None:
+        return cached
+
+    # Two unioned clauses: `amenity` (restaurant/bar/cafe/...) and `shop`
+    # (supermarket/convenience/...) — these are different OSM tag keys, so a
+    # single amenity-only selector structurally cannot match a Whole Foods or
+    # Costco no matter how the value list is extended.
+    amenity_selector = "|".join(kinds)
+    shop_selector = "|".join(OSM_SHOP_KINDS)
+    q = (
+        f"[out:json][timeout:{max(timeout_s - 2, 5)}];"
+        f"(nwr[\"amenity\"~\"^({amenity_selector})$\"][\"name\"](around:{radius_m},{lat},{lon});"
+        f"nwr[\"shop\"~\"^({shop_selector})$\"][\"name\"](around:{radius_m},{lat},{lon}););"
+        f"out center tags;"
+    )
+    try:
+        from overpass_client import post as _overpass_post
+        data = _overpass_post(q, timeout_s=timeout_s)
+    except Exception as e:
+        # A stale venue list beats a different answer every run.
+        stale = _places_cache_get(ck, allow_stale=True) or _places_cache_get(
+            _places_cache_key("osm", lat, lon, radius_m, len(kinds), len(OSM_SHOP_KINDS)), allow_stale=True)
+        print(f"[location-segment] overpass error: {e}"
+              + (f" — using cached POIs ({len(stale)})" if stale else ""), file=sys.stderr)
+        return stale if stale is not None else []
+
+    results: List[Dict[str, Any]] = []
+    for el in data.get("elements", []):
+        tags = el.get("tags") or {}
+        name, native = osm_display_name(tags)
+        if not name:
+            continue
+        elat = el.get("lat") or (el.get("center") or {}).get("lat")
+        elon = el.get("lon") or (el.get("center") or {}).get("lon")
+        if elat is None or elon is None:
+            continue
+        amenity = tags.get("amenity") or ""
+        shop = tags.get("shop") or ""
+        cuisine_first = (tags.get("cuisine") or "").split(";")[0].strip().lower()
+        primary_type = (OSM_CUISINE_TO_TYPE.get(cuisine_first)
+                        or OSM_AMENITY_TO_TYPE.get(amenity)
+                        or OSM_SHOP_TO_TYPE.get(shop)
+                        or (amenity or shop))
+        # Address line from OSM addr:* tags (often present in big cities).
+        addr_parts: List[str] = []
+        if tags.get("addr:housenumber") and tags.get("addr:street"):
+            addr_parts.append(f"{tags['addr:housenumber']} {tags['addr:street']}")
+        elif tags.get("addr:street"):
+            addr_parts.append(tags["addr:street"])
+        if tags.get("addr:city"):
+            addr_parts.append(tags["addr:city"])
+        # Notability tags — used by the scorer to break ties between equally-close
+        # venues. wikidata/wikipedia mark encyclopedically-notable places (The
+        # Bitter End at 147 Bleecker has both; Terra Blues next door has neither).
+        notability = {
+            "wikidata": tags.get("wikidata") or tags.get("brand:wikidata"),
+            "wikipedia": tags.get("wikipedia"),
+            "tourism": tags.get("tourism"),
+            "heritage": tags.get("heritage"),
+            "website": tags.get("website") or tags.get("contact:website"),
+            "brand": tags.get("brand"),
+            "cuisine": cuisine_first,
+        }
+        results.append({
+            "name": name,
+            "name_native": native,
+            "address": ", ".join(addr_parts),
+            "rating": None,         # OSM doesn't carry ratings; Google enrichment may fill
+            "reviews": 0,           # OSM doesn't carry review counts
+            "primary_type": primary_type,
+            "types": [t for t in (amenity, shop, cuisine_first) if t],
+            "lat": elat,
+            "lon": elon,
+            "distance_m": haversine_m(lat, lon, elat, elon),
+            "place_id": f"osm:{el.get('type')}/{el.get('id')}",
+            "_source": "osm",
+            "_notability": notability,
+        })
+    _places_cache_set(ck, results)
+    return results
+
+def name_token_overlap(a: str, b: str) -> float:
+    """Jaccard over normalized word tokens (≥3 chars each, common words dropped).
+    Diacritics are stripped (Phở → pho) so OSM's `Pho Grand` matches Google's
+    `Phở Grand` — without this we miss Google enrichment for any non-ASCII venue.
+    """
+    import unicodedata
+    STOP = {"the", "and", "bar", "cafe", "restaurant", "shop", "store", "house",
+            "of", "for", "at", "by", "on", "new", "york"}  # kernel-guard-ok: a city word in many venue names, a stopword for any user
+    def normalize(s: str) -> str:
+        # NFKD decomposes "ở" → "o" + combining-tilde; the second filter drops the mark.
+        n = unicodedata.normalize("NFKD", s)
+        return "".join(c for c in n if not unicodedata.combining(c)).lower()
+    def toks(s: str) -> set:
+        return {w for w in (t.strip(".,()[]'\"") for t in normalize(s).split())
+                if len(w) >= 3 and w not in STOP}
+    ta, tb = toks(a), toks(b)
+    if not ta or not tb:
+        return 0.0
+    return len(ta & tb) / len(ta | tb)
+
+# ============================================================================
+# Place resolution (tiered)
+# ============================================================================
+
+from place_naming import match_named_location, english_names  # noqa: E402
+from osm_places import osm_display_name  # noqa: E402
+
+
+def _in_english(picked: List[PlaceCandidate]) -> List[PlaceCandidate]:
+    """Surfaced OSM/Google guesses with no English tag, in English; his own names are never touched."""
+    ask = [c for c in picked if c.source in ("osm_overpass", "google_places") and not c.name_native]
+    en = english_names([c.name for c in ask]) if ask else {}
+    for c in ask:
+        a = en.get(c.name)
+        if a and a["is_name"] and a["en"] != c.name:
+            c.name_native, c.name = c.name, a["en"]
+    return picked
+
+def match_known_recurring(lat: float, lon: float, entries: List[Dict[str, Any]]
+                          ) -> Optional[Tuple[Dict[str, Any], float]]:
+    best: Optional[Tuple[Dict[str, Any], float]] = None
+    for e in entries:
+        coords = e.get("coords")
+        if not coords or len(coords) != 2:
+            continue
+        d = haversine_m(lat, lon, coords[0], coords[1])
+        prox = e.get("proximity_m") or 120
+        if d <= prox and (best is None or d < best[1]):
+            best = (e, d)
+    return best
+
+def match_confirmed_stop(lat: float, lon: float, entries: List[Dict[str, Any]]
+                         ) -> Optional[Tuple[Dict[str, Any], float]]:
+    """Closest past confirmation within CONFIRMED_STOP_MATCH_M, if any. The saver
+    writes centroid as `{"lat":..., "lon":...}` but tolerate `[lat, lon]` lists too."""
+    best: Optional[Tuple[Dict[str, Any], float]] = None
+    for e in entries:
+        c = e.get("centroid") or e.get("coords")
+        if not c:
+            continue
+        if isinstance(c, dict):
+            elat, elon = c.get("lat"), c.get("lon")
+        elif isinstance(c, (list, tuple)) and len(c) == 2:
+            elat, elon = c[0], c[1]
+        else:
+            continue
+        if elat is None or elon is None:
+            continue
+        d = haversine_m(lat, lon, elat, elon)
+        if d <= CONFIRMED_STOP_MATCH_M and (best is None or d < best[1]):
+            best = (e, d)
+    return best
+
+REST_ACC_MAX_M = 35.0  # a sample must be this precise to say where he SAT (mirrors stop-rests.js)
+
+def match_confirmed_stop_at_rest(stop: StopCandidate, entries: List[Dict[str, Any]]
+                                 ) -> Optional[Tuple[Dict[str, Any], float]]:
+    """The centroid match above averages in the walk to the door, so a long
+    stay can sit 40 m from its own confirmation and miss the 30 m ring -- on
+    one day a jazz club's cluster centroid was 41 m from an earlier
+    confirmation 13 m off the visit row, and the stop went unnamed. Ask the
+    samples instead: a confirmation names the stop when at least two precise
+    samples, and most of the precise samples, are within CONFIRMED_STOP_MATCH_M
+    of it (the same majority rule as resolve-day's restSatAt). Nearest wins
+    among several that pass; a stop whose samples never settle names nothing."""
+    precise = [s for s in stop.samples
+               if s.accuracy_m is None or s.accuracy_m <= REST_ACC_MAX_M]
+    if len(precise) < 2:
+        return None
+    best: Optional[Tuple[Dict[str, Any], float]] = None
+    for e in entries:
+        c = e.get("centroid") or e.get("coords")
+        if isinstance(c, dict):
+            elat, elon = c.get("lat"), c.get("lon")
+        elif isinstance(c, (list, tuple)) and len(c) == 2:
+            elat, elon = c[0], c[1]
+        else:
+            continue
+        if elat is None or elon is None:
+            continue
+        dists = [haversine_m(s.lat, s.lon, elat, elon) for s in precise]
+        at = [d for d in dists if d <= CONFIRMED_STOP_MATCH_M]
+        if len(at) < 2 or len(at) * 2 < len(precise):
+            continue
+        d = min(at)
+        if best is None or d < best[1]:
+            best = (e, d)
+    return best
+
+def match_wifi(stop: StopCandidate, wifi_entries: List[Dict[str, Any]]
+               ) -> Optional[Dict[str, Any]]:
+    """Wi-Fi match requires a recent phone_context snapshot whose ts falls in the stop's window
+    AND whose ssid matches a wifi-map entry. v1 does a single latest-context check; if that
+    snapshot's ts overlaps a stop window, attach. Stop-specific historical SSID requires the
+    append-only history table (deferred). Returns the matched wifi entry or None.
+    """
+    if not wifi_entries:
+        return None
+    # Latest snapshot only — limit of single-row-per-device upsert table.
+    ctx = fetch_phone_context_latest()
+    if not ctx:
+        return None
+    ssid = ctx.get("wifi_ssid")
+    bssid = ctx.get("wifi_bssid")
+    ctx_ts = parse_iso_to_ms(ctx.get("ts", "")) if isinstance(ctx.get("ts"), str) else 0
+    if not ssid or not ctx_ts:
+        return None
+    if not (stop.start_ts_ms - 5 * 60_000 <= ctx_ts <= stop.end_ts_ms + 5 * 60_000):
+        return None
+    for e in wifi_entries:
+        if e.get("ssid") and e["ssid"] == ssid:
+            if not e.get("bssid") or e.get("bssid") == bssid:
+                return e
+    return None
+
+def resolve_place(stop: StopCandidate, opts: "Options",
+                  recurring: List[Dict[str, Any]],
+                  wifi_entries: List[Dict[str, Any]],
+                  confirmed: Optional[List[Dict[str, Any]]] = None,
+                  ) -> Tuple[PlaceCandidate, List[PlaceCandidate]]:
+    clat, clon = stop.centroid()
+    confirmed = confirmed or []
+
+    # 1) named locations (anchors)
+    named = match_named_location(clat, clon)
+    if named:
+        loc, d = named
+        primary = PlaceCandidate(
+            name=loc["name"], address=loc.get("address"),
+            source="named_location", confidence=0.95, distance_m=d,
+        )
+        return primary, []
+
+    # 2) confirmed stops — past one-off venue confirmations from the live ask-cron.
+    #    Beats known-recurring because a fresh user confirmation is more authoritative
+    #    than a hand-curated entry that may be stale.
+    #    Matched at the centroid first, then at the samples themselves -- the
+    #    centroid of a long stay includes the walk in (see match_confirmed_stop_at_rest).
+    conf_match = match_confirmed_stop(clat, clon, confirmed) \
+        or match_confirmed_stop_at_rest(stop, confirmed)
+    if conf_match:
+        e, d = conf_match
+        primary = PlaceCandidate(
+            name=e["name"], address=e.get("address"),
+            source="confirmed_stop", confidence=0.95, distance_m=d,
+            place_id=e.get("place_id"),
+            primary_type=e.get("primary_type"),
+        )
+        return primary, []
+
+    # 3) known recurring stops
+    rec = match_known_recurring(clat, clon, recurring)
+    if rec:
+        e, d = rec
+        primary = PlaceCandidate(
+            name=e["name"], address=e.get("address"),
+            source="known_recurring", confidence=0.92, distance_m=d,
+        )
+        return primary, []
+
+    # 3) Wi-Fi SSID overlay (best-effort, latest snapshot only)
+    if wifi_entries:
+        wifi = match_wifi(stop, wifi_entries)
+        if wifi and wifi.get("place"):
+            primary = PlaceCandidate(
+                name=wifi["place"], address=None,
+                source="wifi_ssid", confidence=0.90,
+            )
+            return primary, []
+
+    candidates: List[PlaceCandidate] = []
+    is_long = stop.duration_min >= LONG_STOP_MIN
+    hour_local = stop_local_hour(stop.start_ts_ms, stop.end_ts_ms)
+
+    # Common search radius — scales with cluster footprint so noisy stops still
+    # surface real venues; long stops get a wider window since dwell-time +
+    # hour-of-day strongly predict the venue category.
+    if is_long:
+        radius = max(LONG_STOP_PLACES_RADIUS_M,
+                     min(stop.cluster_radius_m() + 20, LONG_STOP_PLACES_RADIUS_CAP_M))
+        google_max = LONG_STOP_MAX_RESULTS
+    else:
+        radius = max(PLACES_RADIUS_M, min(stop.cluster_radius_m() + 20, 200.0))
+        google_max = 5
+
+    # 4) OSM Overpass — primary source. Free, deterministic, and far more
+    #    comprehensive than Google's nearest-20 in dense urban blocks.
+    osm_pois: List[Dict[str, Any]] = []
+    if not opts.no_overpass:
+        raw_osm = osm_overpass_pois(clat, clon, radius_m=radius)
+        # Dedupe — OSM often models a business as both a node and a way (the building
+        # polygon) with identical name+coords. Keep the first occurrence per (name, lat, lon).
+        seen_osm: set = set()
+        for o in raw_osm:
+            key = (o["name"].lower(), round(o["lat"], 5), round(o["lon"], 5))
+            if key in seen_osm:
+                continue
+            seen_osm.add(key)
+            osm_pois.append(o)
+
+    # 5) Google Places — enrichment (rating/reviews) + fallback when OSM is sparse.
+    google_pois: List[Dict[str, Any]] = []
+    text_n = 0
+    if not opts.no_places:
+        google_pois = google_places_nearby(clat, clon, radius_m=radius, max_results=google_max)
+        if is_long:
+            for q in time_of_day_queries(hour_local):
+                hits = google_places_search_text(q, clat, clon, radius_m=radius, max_results=20)
+                google_pois.extend(hits)
+                text_n += len(hits)
+        # Dedupe Google results by place_id.
+        seen_g: set = set()
+        google_pois = [p for p in google_pois
+                       if not (p.get("place_id") in seen_g or seen_g.add(p.get("place_id")))]
+
+    # 6) Merge — for each OSM POI, find a matching Google POI (within 60 m AND
+    #    name overlap ≥ 0.4) and inherit its rating/review count. Google POIs
+    #    that don't match any OSM entry come through on their own (covers
+    #    new venues OSM hasn't picked up yet).
+    matched_google_ids: set = set()
+    pool: List[Dict[str, Any]] = []
+    for o in osm_pois:
+        best_g, best_score = None, 0.0
+        for g in google_pois:
+            d = haversine_m(o["lat"], o["lon"], g["lat"], g["lon"])
+            if d > 60.0:
+                continue
+            ov = max(name_token_overlap(o["name"], g.get("name", "")),  # Google may be in Hebrew
+                     name_token_overlap(o.get("name_native") or "", g.get("name", "")))
+            if ov >= 0.4 and ov > best_score:
+                best_g, best_score = g, ov
+        merged = dict(o)
+        if best_g is not None:
+            merged["rating"] = best_g.get("rating")
+            merged["reviews"] = best_g.get("reviews", 0)
+            merged["place_id_google"] = best_g.get("place_id")
+            matched_google_ids.add(best_g.get("place_id"))
+        pool.append(merged)
+    for g in google_pois:
+        if g.get("place_id") in matched_google_ids:
+            continue
+        gp = dict(g)
+        gp["_source"] = "google"
+        pool.append(gp)
+
+    # Drop vacation-rental listings BEFORE scoring — they're dense, they sit
+    # meters off the path in any tourist town, and they can never be corroborated,
+    # so left in the pool they win the nearest-POI joust and get printed as venues.
+    # See is_rental_listing().
+    rentals = [p for p in pool if is_rental_listing(p)]
+    if rentals:
+        pool = [p for p in pool if p not in rentals]
+
+    if opts.debug:
+        print(f"[location-segment] resolve stop@({clat:.4f},{clon:.4f}) "
+              f"r={radius:.0f}m long={is_long} hour={hour_local}({hour_to_bucket(hour_local)}) "
+              f"→ osm={len(osm_pois)} google_nearby+text={len(google_pois)} "
+              f"merged={len(pool)} text_q={text_n} "
+              f"rentals_dropped={len(rentals)}"
+              + (f" [{'; '.join((p.get('name') or '')[:40] for p in rentals[:3])}]" if rentals else ""),
+              file=sys.stderr)
+
+    def pool_score(p: Dict[str, Any]) -> float:
+        s = score_places_candidate(p, hour_local)
+        if p.get("_source") == "osm":
+            s += OSM_VERIFIED_BONUS  # named amenity in OSM = authoritative venue identity
+            n = p.get("_notability") or {}
+            if n.get("wikidata") or n.get("wikipedia"):
+                s += OSM_WIKIDATA_BONUS
+            if n.get("tourism") or n.get("heritage"):
+                s += OSM_TOURISM_BONUS
+            if n.get("brand"):
+                s += OSM_BRAND_BONUS
+            if n.get("website"):
+                s += OSM_WEBSITE_BONUS
+            if n.get("cuisine"):
+                s += OSM_CUISINE_TAG_BONUS
+        return s
+
+    scored = sorted(pool, key=pool_score, reverse=True)
+    # Tie-aware confidence cap: if the top candidate's lead over #2 is < 10 score
+    # points, both are essentially tied — drop the cap to 0.80 so downstream
+    # consumers (the live ask-cron) know to ask rather than auto-accept. Without
+    # this, Fruit Vanity (cafe, 19 m) and Pho Grand (vietnamese, 33 m) both hit
+    # the 0.92 cap and the cron skips on "high confidence" even though it's a coin flip.
+    top_score = pool_score(scored[0]) if scored else 0.0
+    runner_up = pool_score(scored[1]) if len(scored) >= 2 else 0.0
+    is_tied = (top_score - runner_up) < 10.0
+    cap = 0.80 if is_tied else 0.92
+    for i, p in enumerate(scored[:5]):
+        raw = pool_score(p)
+        conf = max(0.45, min(cap, 0.45 + raw / 400.0))
+        src = "osm_overpass" if p.get("_source") == "osm" else "google_places"
+        candidates.append(PlaceCandidate(
+            name=p["name"], address=p.get("address"),
+            source=src, confidence=conf,
+            distance_m=p.get("distance_m"),
+            place_id=p.get("place_id"),
+            primary_type=p.get("primary_type"),
+            name_native=p.get("name_native"),
+        ))
+
+    if getattr(opts, "saved_places", False):
+        saved = saved_place_candidates(stop)
+        if saved:
+            ids = {c.place_id for c in saved if c.place_id}
+            candidates = saved + [c for c in candidates
+                                  if not (c.place_id and c.place_id in ids)
+                                  and all(name_token_overlap(c.name, sv.name) < 0.6 for sv in saved)]
+            candidates.sort(key=lambda c: c.confidence, reverse=True)
+
+    threshold = LONG_STOP_PRIMARY_CONF_THRESHOLD if is_long else PLACES_PRIMARY_CONF_THRESHOLD
+    if candidates and candidates[0].confidence >= threshold:
+        picked = _in_english(candidates[:3])
+        return picked[0], picked[1:3]
+
+    # 5) Nominatim — venue-aware reverse geocode. Always merge with any weak Places
+    #    candidates so the user sees both the address ("12 Example St") and any nearby
+    #    venue guesses ("Example Noodle Bar", "Example Pizza") as alternatives.
+    geo = reverse_geocode_nominatim(clat, clon)
+    nom_candidate: Optional[PlaceCandidate] = None
+    if geo:
+        name, addr, conf, native = geo
+        nom_candidate = PlaceCandidate(
+            name=name, address=addr or None,
+            source="reverse_geocode", confidence=conf, name_native=native,
+        )
+
+    pool: List[PlaceCandidate] = list(candidates)
+    if nom_candidate:
+        pool.append(nom_candidate)
+    pool.sort(key=lambda c: c.confidence, reverse=True)
+
+    if pool:
+        picked = _in_english(pool[:3])
+        return picked[0], picked[1:3]
+
+    # 6) coords fallback
+    return PlaceCandidate(
+        name=f"{clat:.4f}, {clon:.4f}", address=None,
+        source="coordinate", confidence=0.3,
+    ), []
+
+# ============================================================================
+# Stop detection — Li/Zheng anchor-walk
+# ============================================================================
+
+def detect_stops(samples: List[Sample], min_stop_min: float, stop_radius_m: float
+                 ) -> List[StopCandidate]:
+    """Li/Zheng (2008) anchor-walk.
+
+    For each anchor, walk forward through samples while every following sample
+    is within `stop_radius_m` of the anchor. If the spanned window meets
+    `min_stop_min`, emit a stop candidate and skip past those samples.
+    Otherwise advance the anchor by one and try again.
+    """
+    if not samples:
+        return []
+    pts = sorted(samples, key=lambda s: s.ts_ms)
+    n = len(pts)
+    out: List[StopCandidate] = []
+    i = 0
+    while i < n:
+        anchor = pts[i]
+        j = i + 1
+        while j < n and haversine_m(anchor.lat, anchor.lon, pts[j].lat, pts[j].lon) <= stop_radius_m:
+            j += 1
+        # candidate window = pts[i..j-1] (j-1 inclusive)
+        end_idx = j - 1
+        if end_idx > i:
+            duration_min = (pts[end_idx].ts_ms - anchor.ts_ms) / 60_000
+            if duration_min >= min_stop_min:
+                out.append(StopCandidate(samples=pts[i:j]))
+                i = j
+                continue
+        i += 1
+    return out
+
+def merge_stops_temporal(stops: List[StopCandidate], merge_gap_min: float
+                         ) -> List[StopCandidate]:
+    """Merge consecutive stops separated by a short gap and within ~250 m centroid distance."""
+    if len(stops) <= 1:
+        return stops
+    out: List[StopCandidate] = [stops[0]]
+    for nxt in stops[1:]:
+        cur = out[-1]
+        gap_min = (nxt.start_ts_ms - cur.end_ts_ms) / 60_000
+        clat, clon = cur.centroid()
+        nlat, nlon = nxt.centroid()
+        dist_m = haversine_m(clat, clon, nlat, nlon)
+        if gap_min <= merge_gap_min and dist_m <= SEMANTIC_MERGE_RADIUS_M:
+            out[-1] = StopCandidate(samples=cur.samples + nxt.samples)
+        else:
+            out.append(nxt)
+    return out
+
+def merge_stops_semantic(stops: List[StopCandidate]) -> List[StopCandidate]:
+    """Collapse consecutive stops that both fall on the same NAMED_LOCATION anchor.
+
+    Deliberately conservative: only fires for named locations, not for nameless
+    coords. Patches "Home -> short walk -> Home" being three rows when the two
+    Home stops are clearly the same stay punctuated by sparse sampling.
+    """
+    if len(stops) <= 1:
+        return stops
+    out: List[StopCandidate] = [stops[0]]
+    for nxt in stops[1:]:
+        cur = out[-1]
+        gap_min = (nxt.start_ts_ms - cur.end_ts_ms) / 60_000
+        c_lat, c_lon = cur.centroid()
+        n_lat, n_lon = nxt.centroid()
+        c_named = match_named_location(c_lat, c_lon)
+        n_named = match_named_location(n_lat, n_lon)
+        same_named = c_named and n_named and c_named[0]["name"] == n_named[0]["name"]
+        if same_named and gap_min <= SEMANTIC_MERGE_MAX_GAP_MIN:
+            out[-1] = StopCandidate(samples=cur.samples + nxt.samples)
+        else:
+            out.append(nxt)
+    return out
+
+def expand_inferred_stops(stops: List[StopCandidate], samples: List[Sample],
+                          window_start_ms: int, window_end_ms: int
+                          ) -> List[StopCandidate]:
+    """Inject inferred stops where a long inter-sample silence happens between
+    two GPS samples that bracket the gap within a small radius — the textbook
+    cafe / indoor case where the phone loses GPS for ≥20 min while the user
+    sits still. The anchor-walk in detect_stops can't see these because there
+    are no samples to anchor on.
+
+    For each between-stop gap window, scan the contained samples for an
+    inter-sample delta >= INFERRED_STOP_GAP_MIN where the bracketing samples
+    are within INFERRED_STOP_BRACKET_RADIUS_M of each other. Inject a synthetic
+    StopCandidate at the last pre-gap sample's coordinates, spanning the gap.
+    Skip if too close to an already-existing adjacent stop (avoid dupes).
+    """
+    if not samples:
+        return stops
+    boundaries: List[Tuple[int, int, Optional[StopCandidate], Optional[StopCandidate]]] = []
+    if not stops:
+        boundaries.append((window_start_ms, window_end_ms, None, None))
+    else:
+        boundaries.append((window_start_ms, stops[0].start_ts_ms, None, stops[0]))
+        for i, st in enumerate(stops):
+            nxt = stops[i + 1] if i + 1 < len(stops) else None
+            nxt_start = nxt.start_ts_ms if nxt else window_end_ms
+            boundaries.append((st.end_ts_ms, nxt_start, st, nxt))
+
+    inferred: List[StopCandidate] = []
+    for a, b, prev_st, next_st in boundaries:
+        if b - a < INFERRED_STOP_GAP_MIN * 60_000:
+            continue
+        seg = [s for s in samples if a <= s.ts_ms <= b]
+        if len(seg) < 2:
+            continue
+        prev_centroid = prev_st.centroid() if prev_st else None
+        next_centroid = next_st.centroid() if next_st else None
+        for k in range(1, len(seg)):
+            gap_min = (seg[k].ts_ms - seg[k - 1].ts_ms) / 60_000
+            if gap_min < INFERRED_STOP_GAP_MIN:
+                continue
+            anchor = seg[k - 1]
+            post = seg[k]
+            # Skip if the anchor sample sits on top of an existing adjacent
+            # stop — the long silence is just a quiet stretch at that stop,
+            # not a separate venue.
+            anchor_at_adjacent = False
+            for adj_centroid in (prev_centroid, next_centroid):
+                if adj_centroid is None:
+                    continue
+                if haversine_m(anchor.lat, anchor.lon, adj_centroid[0], adj_centroid[1]) <= INFERRED_STOP_NEAR_EXISTING_M:
+                    anchor_at_adjacent = True
+                    break
+            if anchor_at_adjacent:
+                continue
+            # Two acceptance signals for a real dwell at the anchor location:
+            #   (A) bracketing samples are close — classic indoor-stay case
+            #       (sat down and didn't move; GPS came back roughly where it
+            #       died).
+            #   (B) the post-gap sample lands back at a known existing stop —
+            #       user took a side trip to the anchor location and returned.
+            bracket_close = haversine_m(anchor.lat, anchor.lon, post.lat, post.lon) <= INFERRED_STOP_BRACKET_RADIUS_M
+            post_returned = (
+                next_centroid is not None
+                and haversine_m(post.lat, post.lon, next_centroid[0], next_centroid[1]) <= INFERRED_STOP_NEAR_EXISTING_M
+                # ...AND the anchor is a plausible side trip from that base, not a
+                # travel waypoint. A lone in-transit ping during a long drive
+                # (GPS died en route) otherwise becomes a phantom stop named for
+                # whatever venue its coordinates happen to land on.
+                and haversine_m(anchor.lat, anchor.lon, next_centroid[0], next_centroid[1]) <= INFERRED_STOP_SIDE_TRIP_MAX_M
+            )
+            if not (bracket_close or post_returned):
+                continue
+            synthetic_start = Sample(ts_ms=anchor.ts_ms, lat=anchor.lat, lon=anchor.lon)
+            synthetic_end = Sample(ts_ms=post.ts_ms, lat=anchor.lat, lon=anchor.lon)
+            inferred.append(StopCandidate(samples=[synthetic_start, synthetic_end], inferred=True))
+
+    if not inferred:
+        return stops
+    combined = sorted(list(stops) + inferred, key=lambda sc: sc.start_ts_ms)
+    return combined
+
+# ============================================================================
+# Route segmentation + features
+# ============================================================================
+
+def slice_samples(samples: List[Sample], start_ts_ms: int, end_ts_ms: int) -> List[Sample]:
+    return [s for s in samples if start_ts_ms < s.ts_ms < end_ts_ms]
+
+def trim_route_boundary(samples: List[Sample],
+                        prev_centroid: Optional[Tuple[float, float]],
+                        next_centroid: Optional[Tuple[float, float]],
+                        ) -> List[Sample]:
+    """Drop leading/trailing samples within ROUTE_BOUNDARY_CLEANUP_M of a stop centroid."""
+    out = list(samples)
+    if prev_centroid:
+        plat, plon = prev_centroid
+        while out and haversine_m(plat, plon, out[0].lat, out[0].lon) <= ROUTE_BOUNDARY_CLEANUP_M:
+            out.pop(0)
+    if next_centroid:
+        nlat, nlon = next_centroid
+        while out and haversine_m(nlat, nlon, out[-1].lat, out[-1].lon) <= ROUTE_BOUNDARY_CLEANUP_M:
+            out.pop()
+    return out
+
+def compute_segment_features(seg: List[Sample]) -> Dict[str, Any]:
+    """Aggregate features for a route or leg sample list."""
+    if len(seg) < 2:
+        return {
+            "p50_speed_kmh": 0.0, "p95_speed_kmh": 0.0,
+            "straightness": 1.0, "bearing_changes_per_km": 0.0,
+            "total_dist_km": 0.0, "geodesic_dist_km": 0.0,
+            "max_gap_min": 0.0, "dominant_activity": None,
+            "duration_min": 0.0,
+        }
+    distances_km: List[float] = []
+    durations_h: List[float] = []
+    speeds: List[float] = []
+    bearings: List[float] = []
+    durations_min: List[float] = []
+    activities: Dict[str, int] = {}
+    for a, b in zip(seg, seg[1:]):
+        d_km = haversine_km(a.lat, a.lon, b.lat, b.lon)
+        d_h = max((b.ts_ms - a.ts_ms) / 3_600_000, 1e-6)
+        distances_km.append(d_km)
+        durations_h.append(d_h)
+        durations_min.append((b.ts_ms - a.ts_ms) / 60_000)
+        if d_km > 0.005:  # filter near-zero noise
+            speeds.append(d_km / d_h)
+            bearings.append(bearing_deg(a.lat, a.lon, b.lat, b.lon))
+        if a.activity:
+            activities[a.activity] = activities.get(a.activity, 0) + 1
+    if seg[-1].activity:
+        activities[seg[-1].activity] = activities.get(seg[-1].activity, 0) + 1
+
+    total_km = sum(distances_km)
+    geo_km = haversine_km(seg[0].lat, seg[0].lon, seg[-1].lat, seg[-1].lon)
+    straightness = (geo_km / total_km) if total_km > 1e-6 else 1.0
+
+    bcr = 0.0
+    if len(bearings) >= 2 and total_km > 1e-3:
+        total_change = sum(angle_delta(a, b) for a, b in zip(bearings, bearings[1:]))
+        bcr = total_change / (total_km * 360.0) * 360.0  # = total_change / total_km
+        # interpretation: "degrees of bearing change per km" — divide by 90 to get
+        # "right-angle-turns per km". A walk through Manhattan grid hits ~6-15.
+
+    dominant = max(activities, key=lambda k: activities[k]) if activities else None
+    return {
+        "p50_speed_kmh": round(percentile(speeds, 50), 2),
+        "p95_speed_kmh": round(percentile(speeds, 95), 2),
+        "straightness": round(straightness, 3),
+        "bearing_changes_per_km": round(bcr, 2),
+        "total_dist_km": round(total_km, 3),
+        "geodesic_dist_km": round(geo_km, 3),
+        "max_gap_min": round(max(durations_min) if durations_min else 0.0, 2),
+        "n_samples": len(seg),
+        "dominant_activity": dominant,
+        "duration_min": round(sum(durations_min), 2),
+    }
+
+# ============================================================================
+# Mode classification (rule ladder)
+# ============================================================================
+
+def classify_mode(feat: Dict[str, Any], centroid_lat: float, centroid_lon: float
+                  ) -> Tuple[str, float]:
+    """Returns (mode, confidence)."""
+    p50 = feat["p50_speed_kmh"]
+    p95 = feat["p95_speed_kmh"]
+    straight = feat["straightness"]
+    bcr = feat["bearing_changes_per_km"]
+    total = feat["total_dist_km"]
+    activity = feat["dominant_activity"]
+
+    if total < STATIONARY_NOISE_KM:
+        return "stationary_noise", 0.7
+
+    if p95 > 200:
+        return "flew", 0.95
+    if p95 > 80 and straight > 0.85:
+        return "train", _conf_band(p95, 80, 200, 0.7, 0.95)
+    if p95 > 25:
+        # could be drove or train (low straightness urban train)
+        if straight > 0.75 and total > 5:
+            return "drove", _conf_band(p95, 25, 100, 0.6, 0.9)
+        return "drove", _conf_band(p95, 25, 100, 0.55, 0.85)
+    if 12 <= p95 <= 25:
+        if activity == "cycling":
+            return "cycled", 0.85
+        # Two fixes bracketing one gap have a speed but no shape: 1.47 km in
+        # 5.8 min between two streets is the subway as readily as a bike
+        # (once narrated as "biked home"). A ride needs to have
+        # been SEEN -- several fixes, none of them a long silence.
+        if feat.get("n_samples", 0) < 4 or feat.get("max_gap_min", 0) >= 3:
+            return "unknown", 0.4
+        if straight < 0.7 and in_scooter_area(centroid_lat, centroid_lon):
+            return "e_scooter_likely", 0.65
+        return "cycled", 0.55
+    if p50 >= 3 and p50 <= 7 and bcr > 200:  # bearing changes per km > 200° (~ several turns)
+        mode_conf = 0.8
+        if activity == "walking":
+            mode_conf = min(0.95, mode_conf + 0.1)
+        return "walked", mode_conf
+    if total < 0.5 and p50 < 2:
+        return "walked", 0.7
+
+    # CoreMotion fallback
+    if activity == "walking":
+        return "walked", 0.65
+    if activity == "running":
+        return "ran", 0.7
+    if activity == "cycling":
+        return "cycled", 0.7
+    if activity == "driving":
+        return "drove", 0.6
+    return "unknown", 0.4
+
+def _conf_band(value: float, lo: float, hi: float, conf_lo: float, conf_hi: float) -> float:
+    if value <= lo:
+        return conf_lo
+    if value >= hi:
+        return conf_hi
+    return conf_lo + (conf_hi - conf_lo) * (value - lo) / (hi - lo)
+
+# ============================================================================
+# Multi-leg splitting (v2)
+# ============================================================================
+
+def _instantaneous_mode(window_samples: List[Sample], centroid_lat: float, centroid_lon: float
+                        ) -> str:
+    """Classify a small rolling window of samples into a coarse mode."""
+    feat = compute_segment_features(window_samples)
+    mode, _ = classify_mode(feat, centroid_lat, centroid_lon)
+    # Collapse minor variants for boundary detection.
+    if mode in ("ran", "walked"):
+        return "walked"
+    if mode in ("drove", "train", "flew"):
+        return "vehicle"
+    if mode in ("cycled", "e_scooter_likely"):
+        return "wheels"
+    if mode == "stationary_noise":
+        return "stationary"
+    return "unknown"
+
+def split_into_legs(samples: List[Sample], window: int = 5, min_leg_samples: int = 4,
+                    max_legs: int = 4) -> List[List[Sample]]:
+    """Split a route into legs based on rolling-window mode change-points.
+
+    For each sample, classify a centered window of `window` samples; emit a new
+    leg whenever the mode flips. Smooth tiny flips (<min_leg_samples) by merging
+    them back into the surrounding leg. Hard cap at max_legs to avoid noise
+    runaway.
+    """
+    n = len(samples)
+    if n < window * 2:
+        return [samples]
+
+    clat = sum(s.lat for s in samples) / n
+    clon = sum(s.lon for s in samples) / n
+    half = window // 2
+    labels: List[str] = []
+    for i in range(n):
+        lo = max(0, i - half)
+        hi = min(n, i + half + 1)
+        labels.append(_instantaneous_mode(samples[lo:hi], clat, clon))
+
+    # Build runs of identical labels.
+    runs: List[Tuple[str, int, int]] = []  # (label, start_idx, end_idx_exclusive)
+    cur_label = labels[0]
+    run_start = 0
+    for i in range(1, n):
+        if labels[i] != cur_label:
+            runs.append((cur_label, run_start, i))
+            cur_label = labels[i]
+            run_start = i
+    runs.append((cur_label, run_start, n))
+
+    # Smooth: merge runs shorter than min_leg_samples into the previous run.
+    smoothed: List[Tuple[str, int, int]] = []
+    for run in runs:
+        label, lo, hi = run
+        size = hi - lo
+        if smoothed and size < min_leg_samples:
+            prev = smoothed[-1]
+            smoothed[-1] = (prev[0], prev[1], hi)
+        else:
+            if smoothed and smoothed[-1][0] == label:
+                prev = smoothed[-1]
+                smoothed[-1] = (prev[0], prev[1], hi)
+            else:
+                smoothed.append((label, lo, hi))
+
+    # Cap leg count: if too many, keep the longest legs and absorb shorter ones into neighbors.
+    while len(smoothed) > max_legs:
+        # find shortest run, fold into smaller-of-its-neighbors
+        idx = min(range(len(smoothed)), key=lambda k: smoothed[k][2] - smoothed[k][1])
+        lo, hi = smoothed[idx][1], smoothed[idx][2]
+        if idx == 0:
+            nxt = smoothed[1]
+            smoothed[1] = (nxt[0], lo, nxt[2])
+            smoothed.pop(0)
+        elif idx == len(smoothed) - 1:
+            prv = smoothed[idx - 1]
+            smoothed[idx - 1] = (prv[0], prv[1], hi)
+            smoothed.pop(idx)
+        else:
+            prv = smoothed[idx - 1]
+            nxt = smoothed[idx + 1]
+            if (prv[2] - prv[1]) <= (nxt[2] - nxt[1]):
+                smoothed[idx - 1] = (prv[0], prv[1], hi)
+            else:
+                smoothed[idx + 1] = (nxt[0], lo, nxt[2])
+            smoothed.pop(idx)
+
+    return [samples[lo:hi] for _, lo, hi in smoothed]
+
+# ============================================================================
+# Polyline simplification + snap
+# ============================================================================
+
+def _perpendicular_distance_m(lat: float, lon: float,
+                              lat1: float, lon1: float,
+                              lat2: float, lon2: float) -> float:
+    """Approximate perpendicular distance from point to segment in meters,
+    using equirectangular projection (good enough for ~1km segments)."""
+    if lat1 == lat2 and lon1 == lon2:
+        return haversine_m(lat, lon, lat1, lon1)
+    mlat = math.radians((lat1 + lat2) / 2.0)
+    x = (lon - lon1) * math.cos(mlat)
+    y = (lat - lat1)
+    x1 = (lon2 - lon1) * math.cos(mlat)
+    y1 = (lat2 - lat1)
+    t = max(0.0, min(1.0, (x * x1 + y * y1) / (x1 * x1 + y1 * y1 + 1e-12)))
+    px = lon1 + t * (lon2 - lon1)
+    py = lat1 + t * (lat2 - lat1)
+    return haversine_m(lat, lon, py, px)
+
+def douglas_peucker(points: List[Tuple[float, float]], epsilon_m: float
+                    ) -> List[Tuple[float, float]]:
+    if len(points) < 3:
+        return list(points)
+    # iterative DP to avoid recursion limits on long tracks
+    keep = [False] * len(points)
+    keep[0] = keep[-1] = True
+    stack: List[Tuple[int, int]] = [(0, len(points) - 1)]
+    while stack:
+        lo, hi = stack.pop()
+        if hi <= lo + 1:
+            continue
+        max_d = 0.0
+        max_i = lo
+        a = points[lo]
+        b = points[hi]
+        for i in range(lo + 1, hi):
+            d = _perpendicular_distance_m(points[i][0], points[i][1], a[0], a[1], b[0], b[1])
+            if d > max_d:
+                max_d = d
+                max_i = i
+        if max_d > epsilon_m:
+            keep[max_i] = True
+            stack.append((lo, max_i))
+            stack.append((max_i, hi))
+    return [p for p, k in zip(points, keep) if k]
+
+def downsample_polyline(samples: List[Sample]) -> List[List[float]]:
+    if not samples:
+        return []
+    pts = [(s.lat, s.lon) for s in samples]
+    simplified = douglas_peucker(pts, POLYLINE_EPSILON_M)
+    if len(simplified) > POLYLINE_MAX_POINTS:
+        # uniform-stride decimation as a final cap
+        stride = math.ceil(len(simplified) / POLYLINE_MAX_POINTS)
+        simplified = simplified[::stride]
+        if simplified[-1] != pts[-1]:
+            simplified.append(pts[-1])
+    return [[round(la, 6), round(lo, 6)] for la, lo in simplified]
+
+def _valhalla_costing(mode: str) -> str:
+    if mode in ("walked", "ran"):
+        return "pedestrian"
+    if mode in ("cycled", "e_scooter_likely"):
+        return "bicycle"
+    if mode in ("drove", "train", "flew", "unknown"):
+        return "auto"
+    return "auto"
+
+def snap_via_valhalla(samples: List[Sample], mode: str) -> Optional[List[List[float]]]:
+    if not samples:
+        return None
+    os.makedirs(SNAP_CACHE_DIR, exist_ok=True)
+    cache_key = f"{samples[0].ts_ms}-{samples[-1].ts_ms}-{mode}.json"
+    cache_path = os.path.join(SNAP_CACHE_DIR, cache_key)
+    if os.path.exists(cache_path):
+        try:
+            with open(cache_path) as f:
+                return json.load(f)
+        except Exception:
+            pass
+
+    body = json.dumps({
+        "shape": [{"lat": s.lat, "lon": s.lon, "time": s.ts_ms // 1000} for s in samples],
+        "shape_match": "map_snap",
+        "costing": _valhalla_costing(mode),
+        "format": "osrm",
+    }).encode("utf-8")
+    try:
+        req = urllib.request.Request(
+            "https://valhalla1.openstreetmap.de/trace_attributes",
+            data=body, method="POST",
+            headers={"Content-Type": "application/json", "User-Agent": "location-segment/1.0"},
+        )
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read())
+    except Exception as e:
+        print(f"[location-segment] valhalla snap error: {e}", file=sys.stderr)
+        return None
+
+    edges = data.get("edges") or []
+    points: List[List[float]] = []
+    for e in edges:
+        shape = e.get("shape")
+        if isinstance(shape, list):
+            points.extend([[round(p[0], 6), round(p[1], 6)] for p in shape])
+    if not points:
+        return None
+    try:
+        with open(cache_path, "w") as f:
+            json.dump(points, f)
+    except Exception:
+        pass
+    return points
+
+# ============================================================================
+# Waypoints
+# ============================================================================
+
+def waypoints_for_route(samples: List[Sample], leg_boundaries: List[int],
+                        photos: List[Dict[str, Any]],
+                        transit: List[Dict[str, Any]],
+                        no_photos: bool) -> List[Waypoint]:
+    out: List[Waypoint] = []
+
+    # mode-change waypoints (skip first/last; they are stop boundaries)
+    for idx in leg_boundaries[1:-1]:
+        s = samples[idx]
+        out.append(Waypoint(ts_ms=s.ts_ms, lat=s.lat, lon=s.lon,
+                            kind="mode_change", label="leg boundary"))
+
+    # photo waypoints
+    if not no_photos and photos and samples:
+        win_start = samples[0].ts_ms
+        win_end = samples[-1].ts_ms
+        relevant = [p for p in photos if win_start <= p["ts_ms"] <= win_end]
+        # cluster by 5-min window
+        clusters: List[List[Dict[str, Any]]] = []
+        for p in sorted(relevant, key=lambda x: x["ts_ms"]):
+            if clusters and (p["ts_ms"] - clusters[-1][-1]["ts_ms"]) <= 5 * 60_000:
+                clusters[-1].append(p)
+            else:
+                clusters.append([p])
+        for cl in clusters:
+            # require proximity to route polyline
+            if not any(haversine_m(p["lat"], p["lon"], s.lat, s.lon) <= 50
+                       for p in cl for s in samples):
+                continue
+            mid = cl[len(cl) // 2]
+            label = f"{len(cl)} photo{'s' if len(cl) != 1 else ''}"
+            out.append(Waypoint(ts_ms=mid["ts_ms"], lat=mid["lat"], lon=mid["lon"],
+                                kind="photo", label=label))
+
+    # transit station passthroughs
+    for stn in transit:
+        radius = stn.get("radius_m", 80)
+        match = next(
+            (s for s in samples
+             if haversine_m(s.lat, s.lon, stn["lat"], stn["lon"]) <= radius),
+            None,
+        )
+        if match:
+            out.append(Waypoint(
+                ts_ms=match.ts_ms, lat=match.lat, lon=match.lon,
+                kind="transit", label=stn["name"],
+            ))
+
+    out.sort(key=lambda w: w.ts_ms)
+    # dedupe waypoints within 100 m
+    deduped: List[Waypoint] = []
+    for w in out:
+        if any(haversine_m(w.lat, w.lon, d.lat, d.lon) <= 100 and w.kind == d.kind
+               for d in deduped):
+            continue
+        deduped.append(w)
+    return deduped[:10]
+
+# ============================================================================
+# Audio context (v2 — best-effort)
+# ============================================================================
+
+def attach_audio_context(stop: Stop) -> None:
+    """If the latest phone_context snapshot's ts falls inside (or within
+    AUDIO_CONTEXT_FRESHNESS_MIN of) this stop's window, attach the audio
+    snapshot. Single-row-per-device upsert table means this is only useful
+    for the most recent stop — older stops get None."""
+    ctx = fetch_phone_context_latest()
+    if not ctx:
+        return
+    audio_class = ctx.get("audio_class")
+    if not audio_class:
+        return
+    ts_str = ctx.get("ts")
+    if not ts_str:
+        return
+    ctx_ts = parse_iso_to_ms(ts_str)
+    window_lo = stop.start_ts_ms - AUDIO_CONTEXT_FRESHNESS_MIN * 60_000
+    window_hi = stop.end_ts_ms + AUDIO_CONTEXT_FRESHNESS_MIN * 60_000
+    if not (window_lo <= ctx_ts <= window_hi):
+        return
+    age_min = abs((ctx_ts - (stop.start_ts_ms + stop.end_ts_ms) // 2)) / 60_000
+    stop.audio_context = {
+        "audio_class": audio_class,
+        "audio_confidence": ctx.get("audio_confidence"),
+        "ambient_db_bucket": ctx.get("ambient_db_bucket"),
+        "snapshot_ts": ts_str,
+        "age_min": round(age_min, 2),
+    }
+
+# ============================================================================
+# Photo-to-stop matching (annotate stops with on-site photos)
+# ============================================================================
+
+PHOTO_STOP_WINDOW_BUFFER_MS = 5 * 60 * 1000
+
+def attach_photos_to_stop(stop: Stop, photos: List[Dict[str, Any]]) -> None:
+    # +/-5min buffer around the stop window (mirrors resolve-day.js's
+    # attachPhotosToStop, which added the buffer for the orphan-visit path but
+    # never got backported here): a photo snapped while arriving at or leaving
+    # a stop routinely lands a few seconds to a few minutes outside the strict
+    # detected window and was silently dropped with no buffer at all. Confirmed
+    # 2026-09-13: a photo 37s before the Bellevue Hospital stop's start_ts_ms
+    # missed the strict bound and fell into the day's unmatched-photo bucket.
+    matches: List[Dict[str, Any]] = []
+    for p in photos:
+        if not (stop.start_ts_ms - PHOTO_STOP_WINDOW_BUFFER_MS
+                <= p["ts_ms"]
+                <= stop.end_ts_ms + PHOTO_STOP_WINDOW_BUFFER_MS):
+            continue
+        if haversine_m(stop.centroid_lat, stop.centroid_lon, p["lat"], p["lon"]) > 200:
+            continue
+        matches.append({
+            "uuid": p.get("uuid"),
+            "ts": ms_to_iso(p["ts_ms"]),
+            "filename": p.get("filename"),
+        })
+    stop.photos = matches
+
+# ============================================================================
+# Pipeline
+# ============================================================================
+
+@dataclass
+class Options:
+    min_stop_min: float
+    stop_radius_m: float
+    merge_gap_min: float
+    snap: str  # "valhalla" or "none"
+    no_places: bool
+    no_overpass: bool
+    no_photos: bool
+    no_audio: bool
+    debug: bool
+    saved_places: bool = False  # live ask only; resolve-day names from saved places itself
+
+def build_timeline(samples: List[Sample], window_start_ms: int, window_end_ms: int,
+                   opts: Options) -> Dict[str, Any]:
+    samples = sorted(samples, key=lambda s: s.ts_ms)
+    stops_raw = detect_stops(samples, opts.min_stop_min, opts.stop_radius_m)
+    stops_raw = merge_stops_temporal(stops_raw, opts.merge_gap_min)
+    stops_raw = merge_stops_semantic(stops_raw)
+    stops_raw = expand_inferred_stops(stops_raw, samples, window_start_ms, window_end_ms)
+
+    recurring = load_known_recurring_stops()
+    wifi_entries = load_wifi_map()
+    confirmed = load_confirmed_stops()
+    transit = load_transit_stations()
+    photos = [] if opts.no_photos else fetch_photos(window_start_ms, window_end_ms)
+
+    # ---- resolve places
+    stops: List[Stop] = []
+    for i, sc in enumerate(stops_raw, start=1):
+        primary, alts = resolve_place(sc, opts, recurring, wifi_entries, confirmed)
+        clat, clon = sc.centroid()
+        stop = Stop(
+            id=f"stop-{i}",
+            start_ts_ms=sc.start_ts_ms,
+            end_ts_ms=sc.end_ts_ms,
+            centroid_lat=round(clat, 6),
+            centroid_lon=round(clon, 6),
+            cluster_radius_m=round(sc.cluster_radius_m(), 1),
+            sample_count=len(sc.samples),
+            primary=primary,
+            alternatives=alts,
+            inferred=sc.inferred,
+        )
+        if opts.debug:
+            stop.debug = {
+                "first_sample_ts": ms_to_iso(sc.samples[0].ts_ms),
+                "last_sample_ts": ms_to_iso(sc.samples[-1].ts_ms),
+            }
+        if not opts.no_audio:
+            attach_audio_context(stop)
+        if not opts.no_photos:
+            attach_photos_to_stop(stop, photos)
+        stops.append(stop)
+
+    # ---- routes + gaps
+    routes: List[Route] = []
+    gaps: List[Gap] = []
+    boundaries: List[Tuple[int, int]] = []  # (segment_start_ts, segment_end_ts)
+    boundaries.append((window_start_ms, stops[0].start_ts_ms if stops else window_end_ms))
+    for i, st in enumerate(stops):
+        nxt_start = stops[i + 1].start_ts_ms if i + 1 < len(stops) else window_end_ms
+        boundaries.append((st.end_ts_ms, nxt_start))
+
+    route_idx = 1
+    for b_idx, (a, b) in enumerate(boundaries):
+        if b - a < 60_000:  # < 1 minute, skip
+            continue
+        seg_samples = slice_samples(samples, a, b)
+        prev_centroid = (stops[b_idx - 1].centroid_lat, stops[b_idx - 1].centroid_lon) if b_idx > 0 else None
+        next_centroid = (stops[b_idx].centroid_lat, stops[b_idx].centroid_lon) if b_idx < len(stops) else None
+        seg_samples = trim_route_boundary(seg_samples, prev_centroid, next_centroid)
+
+        # gap if no samples and the interval is meaningful
+        if len(seg_samples) < 2:
+            duration_min = (b - a) / 60_000
+            if duration_min >= MIN_GAP_MIN:
+                gaps.append(Gap(start_ts_ms=a, end_ts_ms=b, reason="no_gps_samples"))
+            continue
+
+        # split into legs (v2)
+        leg_chunks = split_into_legs(seg_samples)
+        legs: List[Leg] = []
+        leg_boundaries: List[int] = [0]
+        cursor = 0
+        for chunk in leg_chunks:
+            if len(chunk) < 2:
+                cursor += len(chunk)
+                continue
+            feat = compute_segment_features(chunk)
+            clat = sum(s.lat for s in chunk) / len(chunk)
+            clon = sum(s.lon for s in chunk) / len(chunk)
+            mode, conf = classify_mode(feat, clat, clon)
+            legs.append(Leg(
+                start_ts_ms=chunk[0].ts_ms,
+                end_ts_ms=chunk[-1].ts_ms,
+                distance_km=round(feat["total_dist_km"], 3),
+                mode=mode,
+                mode_confidence=round(conf, 2),
+                mode_features=feat,
+                sample_count=len(chunk),
+            ))
+            cursor += len(chunk)
+            leg_boundaries.append(cursor)
+
+        # if everything reduced to zero or one leg, recompute on whole route
+        if not legs:
+            feat = compute_segment_features(seg_samples)
+            clat = sum(s.lat for s in seg_samples) / len(seg_samples)
+            clon = sum(s.lon for s in seg_samples) / len(seg_samples)
+            mode, conf = classify_mode(feat, clat, clon)
+            legs.append(Leg(
+                start_ts_ms=seg_samples[0].ts_ms,
+                end_ts_ms=seg_samples[-1].ts_ms,
+                distance_km=round(feat["total_dist_km"], 3),
+                mode=mode,
+                mode_confidence=round(conf, 2),
+                mode_features=feat,
+                sample_count=len(seg_samples),
+            ))
+            leg_boundaries = [0, len(seg_samples)]
+
+        # polyline
+        polyline_source = "raw_downsampled"
+        polyline: List[List[float]] = []
+        if opts.snap == "valhalla":
+            dominant_mode = max(legs, key=lambda lg: lg.distance_km).mode
+            snapped = snap_via_valhalla(seg_samples, dominant_mode)
+            if snapped:
+                polyline = snapped
+                polyline_source = "valhalla"
+        if not polyline:
+            polyline = downsample_polyline(seg_samples)
+
+        from_stop_id = stops[b_idx - 1].id if b_idx > 0 else None
+        to_stop_id = stops[b_idx].id if b_idx < len(stops) else None
+        total_km = sum(lg.distance_km for lg in legs)
+
+        # waypoints
+        wps = waypoints_for_route(seg_samples, leg_boundaries, photos, transit, opts.no_photos)
+
+        routes.append(Route(
+            id=f"route-{route_idx}",
+            from_stop_id=from_stop_id,
+            to_stop_id=to_stop_id,
+            start_ts_ms=seg_samples[0].ts_ms,
+            end_ts_ms=seg_samples[-1].ts_ms,
+            distance_km=round(total_km, 3),
+            legs=legs,
+            polyline=polyline,
+            polyline_source=polyline_source,
+            waypoints=wps,
+        ))
+        route_idx += 1
+
+    # ---- collapse short stationary-noise routes into the adjacent stop.
+    # Yesterday's route-2 (15:47–15:52, 0.09 km between two stops) is GPS jitter,
+    # not a real movement; emitting it as a route both clutters the output and
+    # wastes a route id. We extend the adjacent stop's window to cover the noise
+    # interval so the (stops + routes + gaps) timeline stays gap-free.
+    stops_by_id = {s.id: s for s in stops}
+    kept_routes: List[Route] = []
+    for r in routes:
+        is_short_noise = (
+            len(r.legs) == 1
+            and r.legs[0].mode == "stationary_noise"
+            and r.distance_km < STATIONARY_NOISE_KM
+            and (r.end_ts_ms - r.start_ts_ms) / 60_000 < NOISE_ROUTE_MAX_MIN
+        )
+        if not is_short_noise:
+            kept_routes.append(r)
+            continue
+        target = stops_by_id.get(r.from_stop_id) or stops_by_id.get(r.to_stop_id)
+        if target is None:
+            kept_routes.append(r)  # no adjacent stop to absorb into; keep as-is
+            continue
+        if target.id == r.from_stop_id:
+            target.end_ts_ms = max(target.end_ts_ms, r.end_ts_ms)
+        else:
+            target.start_ts_ms = min(target.start_ts_ms, r.start_ts_ms)
+    # Renumber surviving routes.
+    for i, r in enumerate(kept_routes, start=1):
+        r.id = f"route-{i}"
+    routes = kept_routes
+
+    # ---- classify each stop as `dwell` or `browse` based on m/min drift ratio.
+    for s in stops:
+        duration_min = max((s.end_ts_ms - s.start_ts_ms) / 60_000, 1.0)
+        ratio = s.cluster_radius_m / duration_min
+        s.pattern = "browse" if ratio > BROWSE_PATTERN_RATIO_M_PER_MIN else "dwell"
+
+    return _serialize_timeline(window_start_ms, window_end_ms, stops, routes, gaps)
+
+# ============================================================================
+# Serialization
+# ============================================================================
+
+def _candidate_to_dict(c: PlaceCandidate) -> Dict[str, Any]:
+    out: Dict[str, Any] = {
+        "name": c.name,
+        "address": c.address,
+        "source": c.source,
+        "confidence": round(c.confidence, 2),
+    }
+    if c.distance_m is not None:
+        out["distance_m"] = round(c.distance_m, 1)
+    if c.place_id:
+        out["place_id"] = c.place_id
+    if c.primary_type:
+        out["primary_type"] = c.primary_type
+    if c.name_native:
+        out["name_native"] = c.name_native
+    return out
+
+def _stop_to_dict(s: Stop) -> Dict[str, Any]:
+    out = {
+        "id": s.id,
+        "start": ms_to_iso(s.start_ts_ms),
+        "end": ms_to_iso(s.end_ts_ms),
+        "duration_min": round((s.end_ts_ms - s.start_ts_ms) / 60_000, 1),
+        "place": _candidate_to_dict(s.primary),
+        "alternatives": [_candidate_to_dict(a) for a in s.alternatives],
+        "centroid": {"lat": s.centroid_lat, "lon": s.centroid_lon},
+        "cluster_radius_m": s.cluster_radius_m,
+        "sample_count": s.sample_count,
+        "pattern": s.pattern,
+        "audio_context": s.audio_context,
+        "photos": s.photos,
+    }
+    if s.inferred:
+        out["inferred"] = True
+    if s.debug is not None:
+        out["debug"] = s.debug
+    return out
+
+def _leg_to_dict(lg: Leg) -> Dict[str, Any]:
+    return {
+        "start": ms_to_iso(lg.start_ts_ms),
+        "end": ms_to_iso(lg.end_ts_ms),
+        "duration_min": round((lg.end_ts_ms - lg.start_ts_ms) / 60_000, 1),
+        "distance_km": lg.distance_km,
+        "mode": lg.mode,
+        "mode_confidence": lg.mode_confidence,
+        "mode_features": lg.mode_features,
+        "sample_count": lg.sample_count,
+    }
+
+def _route_to_dict(r: Route) -> Dict[str, Any]:
+    return {
+        "id": r.id,
+        "from_stop_id": r.from_stop_id,
+        "to_stop_id": r.to_stop_id,
+        "start": ms_to_iso(r.start_ts_ms),
+        "end": ms_to_iso(r.end_ts_ms),
+        "duration_min": round((r.end_ts_ms - r.start_ts_ms) / 60_000, 1),
+        "distance_km": r.distance_km,
+        "legs": [_leg_to_dict(lg) for lg in r.legs],
+        "polyline": r.polyline,
+        "polyline_source": r.polyline_source,
+        "waypoints": [
+            {
+                "ts": ms_to_iso(w.ts_ms),
+                "lat": round(w.lat, 6),
+                "lon": round(w.lon, 6),
+                "kind": w.kind,
+                "label": w.label,
+            }
+            for w in r.waypoints
+        ],
+    }
+
+def _gap_to_dict(g: Gap) -> Dict[str, Any]:
+    return {
+        "start": ms_to_iso(g.start_ts_ms),
+        "end": ms_to_iso(g.end_ts_ms),
+        "duration_min": round((g.end_ts_ms - g.start_ts_ms) / 60_000, 1),
+        "reason": g.reason,
+    }
+
+def _serialize_timeline(window_start_ms: int, window_end_ms: int,
+                        stops: List[Stop], routes: List[Route], gaps: List[Gap]
+                        ) -> Dict[str, Any]:
+    modes = sorted({lg.mode for r in routes for lg in r.legs})
+    return {
+        "window": {
+            "start": ms_to_iso(window_start_ms),
+            "end": ms_to_iso(window_end_ms),
+        },
+        "summary": {
+            "stop_count": len(stops),
+            "route_count": len(routes),
+            "gap_count": len(gaps),
+            "total_distance_km": round(sum(r.distance_km for r in routes), 2),
+            "modes_seen": modes,
+        },
+        "stops": [_stop_to_dict(s) for s in stops],
+        "routes": [_route_to_dict(r) for r in routes],
+        "gaps": [_gap_to_dict(g) for g in gaps],
+    }
+
+# ============================================================================
+# Input loading (Supabase or file)
+# ============================================================================
+
+def load_samples_from_file(path: str) -> List[Sample]:
+    with open(path) as f:
+        data = json.load(f)
+    rows = data if isinstance(data, list) else data.get("samples", [])
+    out: List[Sample] = []
+    for r in rows:
+        ts = r.get("ts_ms")
+        if ts is None and r.get("ts"):
+            ts = parse_iso_to_ms(r["ts"])
+        if ts is None and r.get("arrived_at"):
+            ts = parse_iso_to_ms(r["arrived_at"])
+        if ts is None:
+            continue
+        if r.get("latitude") is not None:
+            lat, lon = float(r["latitude"]), float(r["longitude"])
+        else:
+            lat, lon = float(r["lat"]), float(r["lon"])
+        out.append(Sample(
+            ts_ms=int(ts), lat=lat, lon=lon,
+            accuracy_m=r.get("accuracy_m"),
+            activity=r.get("activity"),
+        ))
+    return sorted(out, key=lambda s: s.ts_ms)
+
+# ============================================================================
+# CLI
+# ============================================================================
+
+def parse_args(argv: List[str]) -> Tuple[argparse.Namespace, Options]:
+    p = argparse.ArgumentParser(prog="location-segment", add_help=True,
+                                description="Gap-free GPS timeline builder.")
+    p.add_argument("period", nargs="?",
+                   help="today | yesterday | YYYY-MM-DD (use --start/--end for explicit window)")
+    p.add_argument("--start")
+    p.add_argument("--end")
+    p.add_argument("--input", help="read samples from JSON file (default: Supabase)")
+    p.add_argument("--output", help="write JSON to file (default: stdout)")
+    p.add_argument("--json", action="store_true", help="JSON to stdout (default)")
+    p.add_argument("--min-stop-min", type=float, default=DEFAULT_MIN_STOP_MIN)
+    p.add_argument("--stop-radius-m", type=float, default=DEFAULT_STOP_RADIUS_M)
+    p.add_argument("--merge-gap-min", type=float, default=DEFAULT_MERGE_GAP_MIN)
+    p.add_argument("--snap", choices=("valhalla", "none"), default="none")
+    p.add_argument("--no-places", action="store_true",
+                   help="skip Google Places (rating/review enrichment + fallback)")
+    p.add_argument("--no-overpass", action="store_true",
+                   help="skip OSM Overpass (primary venue lookup)")
+    p.add_argument("--no-photos", action="store_true")
+    p.add_argument("--no-audio", action="store_true")
+    p.add_argument("--debug", action="store_true")
+    args = p.parse_args(argv)
+    opts = Options(
+        min_stop_min=args.min_stop_min,
+        stop_radius_m=args.stop_radius_m,
+        merge_gap_min=args.merge_gap_min,
+        snap=args.snap,
+        no_places=args.no_places,
+        no_overpass=args.no_overpass,
+        no_photos=args.no_photos,
+        no_audio=args.no_audio,
+        debug=args.debug,
+    )
+    return args, opts
+
+def cmd_resolve_point(argv: List[str]) -> int:
+    """resolve-point <lat> <lon> [--at <iso>] — name a single point via the full
+    resolve_place ladder. Returns JSON {name, source, confidence, address,
+    primary_type, distance_m, neighborhood, alternatives}. `neighborhood` is
+    ALWAYS populated (separate Nominatim call) so the caller can apply the
+    confidence gate: use `name` when confidence is high, else fall back to
+    `neighborhood`. Reuses every existing resolver — no new geocoding."""
+    p = argparse.ArgumentParser(prog="location-segment resolve-point")
+    p.add_argument("lat", type=float)
+    p.add_argument("lon", type=float)
+    p.add_argument("--at", help="ISO timestamp (for time-of-day boosting / wifi window)")
+    p.add_argument("--no-places", action="store_true")
+    p.add_argument("--no-overpass", action="store_true")
+    a = p.parse_args(argv)
+    os.environ.pop("JORI_PLACE_NAMES_MODEL", None)  # resolve-day allows 30 s: remembered English names only
+
+    if a.at:
+        try:
+            t = int(datetime.fromisoformat(a.at.replace("Z", "+00:00")).timestamp() * 1000)
+        except Exception:
+            t = int(time.time() * 1000)
+    else:
+        t = int(time.time() * 1000)
+
+    opts = Options(
+        min_stop_min=DEFAULT_MIN_STOP_MIN, stop_radius_m=DEFAULT_STOP_RADIUS_M,
+        merge_gap_min=DEFAULT_MERGE_GAP_MIN, snap="none",
+        no_places=a.no_places, no_overpass=a.no_overpass,
+        no_photos=True, no_audio=True, debug=False,
+    )
+    # Minimal stop: two samples at the point spanning a 10-min dwell so the
+    # time-of-day + wifi tiers behave.
+    sc = StopCandidate(samples=[Sample(ts_ms=t, lat=a.lat, lon=a.lon),
+                                Sample(ts_ms=t + 600_000, lat=a.lat, lon=a.lon)])
+    recurring = load_known_recurring_stops()
+    wifi_entries = load_wifi_map()
+    confirmed = load_confirmed_stops()
+    primary, alts = resolve_place(sc, opts, recurring, wifi_entries, confirmed)
+    out = {
+        "name": primary.name,
+        "source": primary.source,
+        "confidence": primary.confidence,
+        "address": primary.address,
+        "primary_type": primary.primary_type,
+        "distance_m": primary.distance_m,
+        "neighborhood": nominatim_neighborhood(a.lat, a.lon),
+        "alternatives": [
+            {"name": x.name, "source": x.source, "confidence": x.confidence}
+            for x in (alts or [])[:4]
+        ],
+    }
+    print(json.dumps(out, ensure_ascii=False))
+    return 0
+
+def main(argv: Optional[List[str]] = None) -> int:
+    raw = argv if argv is not None else sys.argv[1:]
+    if raw and raw[0] == "resolve-point":
+        return cmd_resolve_point(raw[1:])
+    args, opts = parse_args(raw)
+
+    if args.input:
+        # When reading from a file, derive window from samples unless --start/--end given.
+        samples = load_samples_from_file(args.input)
+        if args.start and args.end:
+            ws, we = parse_period(None, args.start, args.end)
+        else:
+            if not samples:
+                sys.exit("ERROR: input file has no samples and no --start/--end given.")
+            ws = samples[0].ts_ms
+            we = samples[-1].ts_ms
+    else:
+        ws, we = parse_period(args.period, args.start, args.end)
+        samples = fetch_samples(ws, we)
+
+    timeline = build_timeline(samples, ws, we, opts)
+
+    payload = json.dumps(timeline, indent=2, ensure_ascii=False)
+    if args.output:
+        with open(args.output, "w") as f:
+            f.write(payload)
+            f.write("\n")
+    else:
+        print(payload)
+
+    s = timeline["summary"]
+    dur_h = (we - ws) / 3_600_000
+    print(
+        f"{s['stop_count']} stops · {s['route_count']} routes · "
+        f"{s['gap_count']} gaps · {s['total_distance_km']} km · {dur_h:.1f}h window",
+        file=sys.stderr,
+    )
+    return 0
+
+if __name__ == "__main__":
+    sys.exit(main())

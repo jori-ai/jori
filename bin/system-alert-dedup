@@ -1,0 +1,242 @@
+#!/usr/bin/env node
+// system-alert-dedup — decide whether a system-channel alert is news.
+//
+// THE PROBLEM. In ten days the system channel took 23 "Ops
+// turn from X hung 10min — killing and restarting" messages across six jobs and
+// 10 "unstar-scan: gmail-action fetch failed" messages. That is not 33
+// incidents. It is two chronic conditions, each re-reported every time it
+// recurred, and the effect is that the channel reads as weather rather than as
+// something to act on. A real one — a brokerage OAuth token expiring — sat
+// unnoticed in the middle of it for a day.
+//
+// THE RULE. First occurrence of a condition pages. Repeats inside the same day
+// are counted, not sent. EVERY third distinct day escalates, carrying the
+// count, because "this has now failed on three separate days" is genuinely new
+// information that no individual firing conveys. Recovery always sends and
+// resets the condition.
+//
+// "Every third day" and not "the third day": a condition that simply never
+// stops must never become permanently invisible. See the escalation branch
+// below for the credentials page that this cost.
+//
+// WHAT COUNTS AS "THE SAME CONDITION" is deliberately crude: the message with
+// its varying parts removed. Counts, timestamps, message ids, durations and
+// subject lines differ on every firing and say nothing about what is wrong; the
+// job name and the error class are what identify it. This is clustering
+// machine-generated alert text — the strings here are composed by jobs, never
+// by the user — so it is geometry, not language (Rule #0b).
+//
+// NEVER SUPPRESSED: 🔴 (capability-down / data-loss, per the severity
+// convention), ✅ recovery, and anything from an unrecognised shape it cannot
+// key. When in doubt this sends — a duplicate page costs attention, a swallowed
+// first-of-its-kind costs an outage.
+//
+// Usage:
+//   system-alert-dedup --intent <label> --message <text>
+//     exit 0  → send it (and the decision is recorded)
+//     exit 1  → suppress; a repeat inside the window
+//   system-alert-dedup --stats [--json]
+
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { createHash } from "node:crypto";
+import { createRequire } from "node:module";
+
+const { installTools } = createRequire(import.meta.url)("../lib/root.cjs");
+
+const STATE = process.env.JORI_ALERT_DEDUP_STATE
+  || installTools("data/system-alert-dedup.json");
+const ESCALATE_ON_DAY = 3;   // distinct days before one summary page
+const FORGET_AFTER_DAYS = 14; // a condition quiet this long starts over
+const REARM_AFTER_QUIET_HOURS = 48; // a condition quiet this long has CLEARED
+
+const argv = process.argv.slice(2);
+function flag(name, hasValue = true) {
+  const i = argv.indexOf(name);
+  if (i < 0) return undefined;
+  if (!hasValue) { argv.splice(i, 1); return true; }
+  const v = argv[i + 1];
+  argv.splice(i, 2);
+  return v;
+}
+
+const wantStats = flag("--stats", false);
+const asJson = flag("--json", false);
+const intent = flag("--intent") || "none";
+const message = flag("--message") || "";
+
+function read() {
+  try {
+    const raw = JSON.parse(fs.readFileSync(STATE, "utf8"));
+    return raw && typeof raw === "object" ? raw : {};
+  } catch { return {}; }
+}
+
+function write(state) {
+  const tmp = `${STATE}.tmp.${process.pid}`;
+  fs.mkdirSync(path.dirname(STATE), { recursive: true });
+  fs.writeFileSync(tmp, JSON.stringify(state, null, 2) + "\n");
+  fs.renameSync(tmp, STATE);
+}
+
+function today() { return new Date().toISOString().slice(0, 10); }
+
+/**
+ * Collapse a firing to its condition. Everything that varies per occurrence
+ * goes; what identifies the fault stays.
+ */
+function conditionKey(text) {
+  // lang-regex-ok: normalising machine-composed alert strings (job names, error
+  // classes, counts, ids) so two firings of one condition hash alike. No part of
+  // this reads anything the user wrote.
+  const norm = String(text)
+    .toLowerCase()
+    .replace(/\d+/g, "#")                  // counts, durations, ports, dates
+    .replace(/\b[0-9a-f]{8,}\b/g, "#id")   // message ids, hashes, uuids
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 300);
+  return createHash("sha256").update(`${intent}\0${norm}`).digest("hex").slice(0, 16);
+}
+
+if (wantStats) {
+  const state = read();
+  const rows = Object.entries(state).map(([k, v]) => ({ key: k, ...v }))
+    .sort((a, b) => (b.count || 0) - (a.count || 0));
+  if (asJson) { console.log(JSON.stringify(rows, null, 2)); process.exit(0); }
+  if (!rows.length) { console.log("(no tracked conditions)"); process.exit(0); }
+  for (const r of rows) {
+    console.log(`${String(r.count).padStart(4)}×  ${(r.days || []).length}d  ${r.last_seen}  ${String(r.sample || "").slice(0, 80)}`);
+  }
+  process.exit(0);
+}
+
+if (!message.trim()) { console.error("system-alert-dedup: --message is required"); process.exit(0); }
+
+// Never gate the two classes where a repeat is itself the signal.
+// A recovery closes the condition, so it also clears the counter.
+const isRecovery = message.trimStart().startsWith("✅");
+const isCritical = message.trimStart().startsWith("🔴") || message.trimStart().startsWith("🚨");
+
+const state = read();
+const key = conditionKey(message);
+const day = today();
+
+// Forget conditions nobody has seen in a fortnight, so the file stays small and
+// a long-resolved fault pages properly if it ever comes back.
+const cutoff = Date.now() - FORGET_AFTER_DAYS * 24 * 3600_000;
+for (const [k, v] of Object.entries(state)) {
+  const last = Date.parse(v?.last_seen || "");
+  if (!Number.isFinite(last) || last < cutoff) delete state[k];
+}
+
+if (isRecovery) {
+  // Clear whatever this recovery closes. We cannot know its exact key (the
+  // wording differs from the failure), so clear on intent — recoveries and
+  // their failures share one.
+  for (const [k, v] of Object.entries(state)) {
+    if (v?.intent === intent) delete state[k];
+  }
+  write(state);
+  process.exit(0);
+}
+
+// A condition that went quiet and came BACK is a new incident, not a repeat.
+//
+// This helper already understands incident closure — the isRecovery branch above
+// clears the counter — but only a handful of conditions ever emit a ✅. The rest
+// simply stop firing, leaving a counter that never clears, so a fault that
+// returns a week later reads as "repeat 2" and is swallowed.
+//
+// Not theoretical. A brokerage OAuth grant that must be re-linked by hand every
+// ~7 days has a token watch that pages exactly once per cycle (it re-arms only
+// when the token fingerprint changes). Cycle 1: sent. Cycle 2, a week later:
+// suppressed as "repeat 2 of a condition first seen <cycle 1>" and the user was
+// told nothing about a window only they can renew. Worse, each cycle refreshes
+// last_seen, so the 14-day forget sweep above can never fire on a 7-day cycle:
+// after the one third-distinct-day escalation, EVERY later warning is suppressed
+// for good. The same shape ate a "positions didn't refresh" page 8 days after
+// its first.
+//
+// 48h is measured against the conditions this helper exists for: the 23
+// turn-hang pages over 10 days and the 10 unstar-scan failures over 6 days that
+// motivated it all re-fired inside a day. Chronic noise has no two-day gap;
+// only a recurrence does.
+let rearmedAfterHours = 0;
+const prior = state[key];
+if (prior) {
+  const quietMs = Date.now() - Date.parse(prior.last_seen || "");
+  if (Number.isFinite(quietMs) && quietMs >= REARM_AFTER_QUIET_HOURS * 3600_000) {
+    rearmedAfterHours = Math.round(quietMs / 3600_000);
+    state[key] = {
+      intent,
+      first_seen: new Date().toISOString(),
+      count: 0,
+      days: [],
+      sample: message.slice(0, 200),
+      cycles: (prior.cycles || 1) + 1,
+      previously_seen: prior.last_seen,
+    };
+  }
+}
+
+const entry = state[key] || { intent, first_seen: new Date().toISOString(), count: 0, days: [], sample: message.slice(0, 200) };
+entry.count += 1;
+entry.last_seen = new Date().toISOString();
+if (!entry.days.includes(day)) entry.days.push(day);
+entry.intent = intent;
+state[key] = entry;
+
+// Older entries carry escalated_at but not escalated_on_days;
+// they escalated at exactly ESCALATE_ON_DAY, so read them that way rather than
+// re-paging them on the day they already escalated.
+const escalatedOnDays = entry.escalated_on_days ?? (entry.escalated_at ? ESCALATE_ON_DAY : 0);
+
+let send;
+let why;
+if (isCritical) {
+  send = true; why = "critical severity — never deduped";
+} else if (entry.count === 1) {
+  send = true;
+  why = rearmedAfterHours
+    ? `condition returned after ${rearmedAfterHours}h quiet — recurrence ${entry.cycles}, not a repeat`
+    : "first occurrence of this condition";
+} else if (entry.days.length % ESCALATE_ON_DAY === 0 && entry.days.length !== escalatedOnDays) {
+  // EVERY third distinct day, not only the first one.
+  //
+  // This read `=== ESCALATE_ON_DAY && !entry.escalated_at`, a one-shot. days
+  // only ever grows, so from day 4 on every firing fell to the else branch and
+  // the condition went silent for good. Nothing else could rescue it: a daily
+  // condition never reaches REARM_AFTER_QUIET_HOURS (24h < 48h), and its own
+  // firing refreshes last_seen so the FORGET_AFTER_DAYS sweep never runs either.
+  //
+  // It cost a real alert. A watchdog page for a plaintext
+  // ~/.claude/.credentials.json — a second credential store whose stale refresh
+  // token had caused an auth outage — asked for it once a day until a human
+  // moves it aside. It paged on day 1, was swallowed on day 2, escalated on
+  // day 3, and would have been silent from day 4 onward with the file still on
+  // disk. Every watchdog condition throttled to a day has the
+  // same shape: episode-archive-missing, daily-summary-missing,
+  // nightly-review-missing, location-ask-undelivered.
+  //
+  // And it is worse than the user not hearing. jori-send-curl exits BEFORE the
+  // jori_messages insert when this returns 1, so a swallowed alert is also
+  // invisible to system-issue-review — the condition stops being reviewable at
+  // the same moment it stops being reported.
+  entry.escalated_at = new Date().toISOString();
+  entry.escalated_on_days = entry.days.length;
+  send = true;
+  why = `${entry.days.length} distinct days — ${entry.count} firings since ${entry.first_seen.slice(0, 10)}`;
+} else {
+  send = false;
+  why = `repeat ${entry.count} of a condition first seen ${entry.first_seen.slice(0, 10)} (${entry.days.length} day(s))`;
+}
+
+write(state);
+console.error(`system-alert-dedup: ${send ? "SEND" : "SUPPRESS"} — ${why}`);
+if (send && entry.count > 1) {
+  // Hand the caller a line worth sending: the escalation says how bad it is.
+  console.log(`(${entry.count} times over ${entry.days.length} days)`);
+}
+process.exit(send ? 0 : 1);

@@ -5,7 +5,7 @@ import Supabase
 
 /// Reads Apple Health on-device and ships a trimmed, pre-aggregated view to
 /// **Jori's** Supabase (not Trainer's own project). Verbatim port of
-/// `client/Jori/HealthKitManager.swift` from the jori repo — only
+/// `apps/companion/Jori/HealthKitManager.swift` from the jori repo — only
 /// the supabase client reference is swapped (`TrainerSupabase` here vs
 /// `SupabaseManager` there). Rationale: Trainer is foregrounded for far
 /// longer stretches during workouts, so running this same sync from

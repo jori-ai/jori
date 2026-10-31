@@ -12,9 +12,17 @@ final class CachedMessage {
     // Optional so SwiftData can lightweight-migrate existing stores. nil rows
     // were inserted before channels existed; treat them as 'chat' on read.
     var channel: String?
+    // Also optional for lightweight migration — rows cached before threaded
+    // replies existed simply have no parent.
+    var replyTo: UUID?
+    // Optional for lightweight migration. The row's metadata as a JSON object
+    // string, so a cached question keeps its colour and a cached choice card
+    // keeps its buttons before the network fetch lands (2026-10-17).
+    var metadataJSON: String?
 
     init(id: UUID, role: String, content: String, read: Bool, createdAt: Date,
-         reaction: String? = nil, channel: String? = ChatChannel.chat.rawValue) {
+         reaction: String? = nil, channel: String? = ChatChannel.chat.rawValue,
+         replyTo: UUID? = nil, metadataJSON: String? = nil) {
         self.id = id
         self.role = role
         self.content = content
@@ -22,6 +30,19 @@ final class CachedMessage {
         self.createdAt = createdAt
         self.reaction = reaction
         self.channel = channel
+        self.replyTo = replyTo
+        self.metadataJSON = metadataJSON
+    }
+
+    static func encode(_ metadata: [String: String]?) -> String? {
+        guard let metadata, !metadata.isEmpty,
+              let data = try? JSONEncoder().encode(metadata) else { return nil }
+        return String(data: data, encoding: .utf8)
+    }
+
+    static func decode(_ json: String?) -> [String: String]? {
+        guard let data = json?.data(using: .utf8) else { return nil }
+        return try? JSONDecoder().decode([String: String].self, from: data)
     }
 
     convenience init(from message: Message) {
@@ -31,7 +52,9 @@ final class CachedMessage {
                   read: message.read,
                   createdAt: message.createdAt,
                   reaction: message.reaction?.rawValue,
-                  channel: message.channel)
+                  channel: message.channel,
+                  replyTo: message.replyTo,
+                  metadataJSON: Self.encode(message.metadata))
     }
 
     func apply(_ message: Message) {
@@ -41,12 +64,16 @@ final class CachedMessage {
         self.createdAt = message.createdAt
         self.reaction = message.reaction?.rawValue
         self.channel = message.channel
+        self.replyTo = message.replyTo
+        self.metadataJSON = Self.encode(message.metadata)
     }
 
     var asMessage: Message {
         Message(id: id, role: role, content: content, read: read, createdAt: createdAt,
                 reaction: reaction.flatMap { Reaction(rawValue: $0) },
-                channel: channel ?? ChatChannel.chat.rawValue)
+                channel: channel ?? ChatChannel.chat.rawValue,
+                replyTo: replyTo,
+                metadata: Self.decode(metadataJSON))
     }
 }
 
@@ -68,7 +95,7 @@ final class MessageStore {
                                in: .userDomainMask,
                                appropriateFor: nil,
                                create: true)) ?? fm.temporaryDirectory
-        let storeURL = dir.appendingPathComponent("jori_messages.store")
+        let storeURL = dir.appendingPathComponent("\(Install.storagePrefix)_messages.store")
         let config = ModelConfiguration(schema: schema, url: storeURL)
         if let c = try? ModelContainer(for: schema, configurations: config) {
             self.container = c
@@ -145,6 +172,12 @@ final class MessageStore {
         if runningBytes > Self.budgetBytes {
             evictOverBudget()
         }
+    }
+
+    /// Single-row lookup — used to resolve a quoted reply parent that has
+    /// already scrolled out of the loaded window.
+    func message(id: UUID) -> Message? {
+        row(id: id)?.asMessage
     }
 
     func delete(id: UUID) {

@@ -1,0 +1,154 @@
+#!/usr/bin/env node
+// triage-eval — pilot runner for email-triage evaluation fixtures.
+//
+// Today this is an eyeball-grade harness, not an automated grader:
+// loads each JSON fixture and prints the dispatch + expected side-by-side
+// so the user (or a reviewer) can trace what the current ops-agent rules
+// SHOULD produce and notice drift between fixture and policy.
+//
+// Future: stub-tool-based runner that replays each dispatch as an isolated
+// ops session with tool-call recording, grades the log against
+// expected.actions_in_order and expected.forbidden_actions, emits a pass/
+// fail report. Stubbed scaffold below; see README.md in the cases dir.
+//
+// Usage:
+//   triage-eval                        run all cases
+//   triage-eval <case_id>              run one case
+//   triage-eval list                   list case IDs
+//   triage-eval validate               lint every fixture's schema (no run)
+
+import fs from "node:fs";
+import path from "node:path";
+import { TOOLS_DIR as ROOT } from "../lib/root.cjs";
+
+const CASES_DIR = path.join(ROOT, "agent/test/triage-evals/cases");
+
+function loadCases() {
+  if (!fs.existsSync(CASES_DIR)) {
+    console.error(`triage-eval: cases directory missing: ${CASES_DIR}`);
+    process.exit(1);
+  }
+  const files = fs.readdirSync(CASES_DIR).filter(f => f.endsWith(".json"));
+  return files.map(f => {
+    const p = path.join(CASES_DIR, f);
+    try { return { file: f, path: p, data: JSON.parse(fs.readFileSync(p, "utf8")) }; }
+    catch (err) { return { file: f, path: p, error: err.message }; }
+  });
+}
+
+function validateSchema(c) {
+  if (c.error) return [`parse error: ${c.error}`];
+  const d = c.data;
+  const errs = [];
+  if (!d.case_id) errs.push("missing case_id");
+  if (!d.dispatch) errs.push("missing dispatch");
+  if (!d.expected) errs.push("missing expected");
+  if (d.expected) {
+    if (!d.expected.priority) errs.push("expected.priority missing");
+    if (!d.expected.label) errs.push("expected.label missing");
+    if (!Array.isArray(d.expected.actions_in_order)) errs.push("expected.actions_in_order not an array");
+    if (!Array.isArray(d.expected.forbidden_actions)) errs.push("expected.forbidden_actions not an array");
+  }
+  return errs;
+}
+
+function renderCase(c) {
+  const d = c.data;
+  const sep = "─".repeat(78);
+  const lines = [];
+  lines.push(sep);
+  lines.push(`CASE: ${d.case_id}  (${c.file})`);
+  lines.push(`DESCRIPTION: ${d.description || "(none)"}`);
+  lines.push(sep);
+  lines.push("DISPATCH (as the supervisor would hand it to the ops-agent):");
+  lines.push("");
+  lines.push(d.dispatch.split("\n").map(l => "  " + l).join("\n"));
+  lines.push("");
+  lines.push(sep);
+  lines.push("EXPECTED:");
+  lines.push(`  priority: ${d.expected.priority}`);
+  lines.push(`  label:    ${d.expected.label}`);
+  if (d.expected.additional_labels?.length) {
+    lines.push(`  extra labels: ${d.expected.additional_labels.join(", ")}`);
+  }
+  lines.push("");
+  lines.push("  actions_in_order:");
+  for (const [i, a] of (d.expected.actions_in_order || []).entries()) {
+    lines.push(`    ${i + 1}. ${a}`);
+  }
+  lines.push("");
+  lines.push("  forbidden:");
+  for (const f of (d.expected.forbidden_actions || [])) {
+    lines.push(`    × ${f}`);
+  }
+  if (d.expected.key_rules_exercised?.length) {
+    lines.push("");
+    lines.push("  rules exercised:");
+    for (const r of d.expected.key_rules_exercised) lines.push(`    - ${r}`);
+  }
+  if (d.notes) {
+    lines.push("");
+    lines.push("  notes:");
+    for (const line of d.notes.split("\n")) lines.push(`    ${line}`);
+  }
+  lines.push("");
+  return lines.join("\n");
+}
+
+function usage() {
+  console.log(`usage: triage-eval [<case_id> | list | validate]
+  (no args)       print every case side-by-side
+  <case_id>       print one case
+  list            print case IDs only
+  validate        lint every fixture's schema (exits non-zero on any error)`);
+}
+
+function main() {
+  const [cmd, arg] = process.argv.slice(2);
+  const cases = loadCases();
+
+  if (cmd === "--help" || cmd === "-h") return usage();
+
+  if (cmd === "list") {
+    for (const c of cases) {
+      if (c.error) console.log(`${c.file}  [INVALID: ${c.error}]`);
+      else console.log(c.data.case_id);
+    }
+    return;
+  }
+
+  if (cmd === "validate") {
+    let bad = 0;
+    for (const c of cases) {
+      const errs = validateSchema(c);
+      if (errs.length) {
+        bad++;
+        console.log(`✗ ${c.file}`);
+        for (const e of errs) console.log(`    ${e}`);
+      } else {
+        console.log(`✓ ${c.data.case_id}`);
+      }
+    }
+    if (bad) process.exit(1);
+    return;
+  }
+
+  // Default: print everything (or just <case_id> if specified)
+  const targets = cmd ? cases.filter(c => c.data?.case_id === cmd) : cases;
+  if (!targets.length) {
+    console.error(`triage-eval: no case matching "${cmd}"`);
+    process.exit(1);
+  }
+  for (const c of targets) {
+    const errs = validateSchema(c);
+    if (errs.length) {
+      console.log(`✗ ${c.file}  (invalid — run \`triage-eval validate\`)`);
+      for (const e of errs) console.log(`    ${e}`);
+      continue;
+    }
+    console.log(renderCase(c));
+  }
+  console.log(`\n${targets.length} case${targets.length === 1 ? "" : "s"} rendered. No automated grading yet — eyeball against ops-agent/CLAUDE.md § Email Triage Rules.`);
+}
+
+main();

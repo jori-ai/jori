@@ -1,0 +1,1669 @@
+#!/usr/bin/env python3
+"""hum-metrics-collect — daily metrics collector + decay detector for the
+hum improvement loop. Reads tick traces, reactions, and the cross-lane
+suggestion ledger; writes one row per local day to hum-metrics-state.json.daily[];
+detects decay events; dispatches qualitative-diagnosis questions on trigger.
+
+Canonical design: data/hum-improvement-loop.md. Read that before
+editing this script.
+
+Usage:
+  hum-metrics-collect                       # collect yesterday's local day
+  hum-metrics-collect --date 2026-05-19     # collect specific local date
+  hum-metrics-collect --json                # print today's row to stdout
+  hum-metrics-collect --dry-run             # compute but don't write or dispatch
+  hum-metrics-collect --measure             # also run intervention attribution
+  hum-metrics-collect --date 2026-05-19 --backfill
+                                             # write a historical gap's row (same
+                                             # collection code path) without
+                                             # dispatching qualitative-diagnosis
+                                             # questions for its decay_events
+
+Exits 0 on success; nonzero on read/parse failure. Idempotent: re-running for
+the same date overwrites that date's row (in case sources gain late data).
+
+Cron: system/tasks.json registers this daily in the early morning (local
+time), after the prior local day fully closes.
+"""
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+from collections import defaultdict
+from datetime import date, datetime, time, timedelta, timezone
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+TOOLS = os.path.dirname(HERE)
+# Shared atomic writer (D15): hum-deliver-qual reads the qual queue while this writes it.
+sys.path.insert(0, os.path.join(TOOLS, "lib"))
+from atomic_write import write_json_atomic  # noqa: E402
+import places_local  # noqa: E402
+
+DATA = places_local.data_path()
+# Per-installation settings (agent/local/config/hum-metrics.json):
+#   workout_recent_cmd  argv of a command printing recent workout sessions as a
+#                       JSON list of {started_at, finished_at}; a relative first
+#                       element resolves against this checkout. Empty (the
+#                       default) = no workout source: the exercise lane's
+#                       outcome_signal stays None (unknown).
+CFG = places_local.local_config("hum-metrics", {"workout_recent_cmd": []})
+# Calendar summary prefixes that mark someone else's events (shared with the
+# hum calendar harvester: agent/local/config/hum-calendar.json).
+CALENDAR_IGNORE_PREFIXES = tuple(
+    str(x) for x in (places_local.local_config(
+        "hum-calendar", {"ignore_summary_prefixes": []}).get("ignore_summary_prefixes") or [])
+    if str(x))
+
+HUM_RUNS = os.path.join(DATA, "hum-runs.jsonl")
+HUM_FEEDBACK = os.path.join(DATA, "hum-feedback.jsonl")
+SUGG_HISTORY = os.path.join(DATA, "suggestion-history.jsonl")
+HUM_STATE = os.path.join(DATA, "hum-state.json")
+TZ_FILE = os.path.join(DATA, "user-timezone.json")
+METRICS_STATE = os.path.join(DATA, "hum-metrics-state.json")
+HOME_PRESENCE_BIN = os.path.join(HERE, "home-presence")
+INTERVENTIONS = os.path.join(DATA, "hum-interventions.jsonl")
+REPO_ROOT = os.path.dirname(os.path.dirname(DATA))  # the clone DATA lives in
+# applied_at -> measure_at for a row that carries no measure_at of its own.
+# Same 7 days as the ledger's other writers: MEASURE_WINDOW_MS in
+# lib/hum-interventions-reconcile.mjs and `jori hum intervention record`.
+MEASURE_WINDOW = timedelta(days=7)
+PENDING_Q = os.path.join(DATA, "hum-pending-question.json")
+QUAL_QUEUE = os.path.join(DATA, "hum-qual-delivery-queue.json")
+QUAL_COOLDOWN = os.path.join(DATA, "hum-qual-cooldown.json")
+QUAL_STARVATION = os.path.join(DATA, "hum-qual-starvation.json")
+HUM_LEARNINGS = os.path.join(DATA, "hum-learnings.jsonl")
+HUM_IMPROVEMENT_IDEAS = os.path.join(DATA, "hum-improvement-ideas.jsonl")
+
+# Reaction-token weights. The hum-improvement-loop's north star.
+TOKEN_WEIGHTS = {
+    "love": 2.0,
+    "up": 1.0,
+    "freeform_pos": 1.0,    # free-text positive without strength marker
+    "down": -1.0,
+    "freeform_neg": -0.5,   # free-text negative — soft negative, same weight as snooze
+    "snooze": -0.5,
+    # Neutral / deferred contribute 0 — present so .get() doesn't KeyError.
+    "deferred": 0.0,
+    "visited": 0.0,
+    None: 0.0,
+}
+
+# Accountability lanes (per hum-improvement-loop.md § Accountability lanes).
+# These lanes' entire success criterion is "did the thing get done", not "did
+# the user tap back a reaction" -- a behavioural nudge that gets the user to the
+# gym has done its job even with no reaction to the ping that prompted it.
+# Scoring them by tapback drags the global signal_per_surfaced KPI down for a
+# lane that may be working exactly as designed, and spawns spurious
+# lane_decay_silent asks (measured 2026-08-25: the exercise lane surfaced a
+# ping nearly every day yet fired lane_decay_silent on 2026-08-22, -23 and
+# -25 anyway). A small, explicit list, not a schema migration -- extend it if
+# another lane earns the same treatment.
+ACCOUNTABILITY_LANES = {"exercise", "health"}
+
+# Decay thresholds (per hum-improvement-loop.md § decay detection).
+DECAY_DAYS_SILENT = 5            # 5+ consecutive days zero reactions
+DECAY_DROP_PCT = 0.25            # 3-day rolling drop ≥25% vs prior 7d
+DECAY_DROP_WINDOW = 3
+DECAY_DROP_BASELINE = 7
+DECAY_DROP_MIN_PINGS = 4         # global_decay_drop needs >= this many delivered pings in the 3d window
+# hum-i-20260920-01: a day that was paused for most of its waking hours
+# carries no real decay signal -- zero surfacing/reactions that day means
+# "hum wasn't running", not "the lane/global trend is collapsing". The
+# surface-rate anomaly checks below already get this protection for free
+# (an empty hum-runs.jsonl zeroes ticks_3d, which fails their own >= 30
+# gate), but the per-lane silent/negative walks and the global 3-day-drop
+# read reactions/signal_per_surfaced directly and have no such proxy --
+# during the 2026-09-12 -> 2026-09-20 pause, global_decay_drop fired twice
+# on fully-paused days (2026-09-14, 2026-09-15) and the second queued a
+# nonsense "anything change for you this week?" qual question. 12h is a
+# majority of a local waking day; see the today_mostly_paused guard in
+# detect_decay().
+DECAY_PAUSE_MIN_HOURS = 12
+SURFACE_RATE_LOW = 0.05
+# SURFACE_RATE_HIGH was 0.25, set for the retired ~72-tick/day cadence. The
+# 2026-08-02 event-driven redesign dropped ticks/day to ~15-22, which shifted
+# the whole surface_rate distribution up -- over the 26 ticked days from
+# 2026-08-09 through 2026-09-10, daily surface_rate has a median of 0.36 and
+# a mean of 0.38 (stdev 0.21), so 0.25 sat BELOW the ordinary-day median and
+# fired surface_rate_chatter on a slight majority of typical days (measured:
+# 4 straight days 8/27-8/30, rolling_3d 0.447->0.355->0.478->0.507). Raised
+# to 0.55 (~mean+1stdev of the post-redesign distribution) on 2026-09-11 so
+# the alert flags genuine outlier chatter again rather than routine noise.
+# Re-baseline this the same way if the tick cadence changes again.
+SURFACE_RATE_HIGH = 0.55
+QUAL_COOLDOWN_DAYS = 14          # don't re-ask same lane within 14d
+# hum-i-20260830-02: a lane that loses the single-slot race this many times
+# in a row (without ever reaching QUAL_QUEUE) preempts the live occupant on
+# its next decay event instead of losing again. See dispatch_qualitative_
+# question()'s docstring for why this is safe against the existing
+# single-slot contract.
+QUAL_STARVATION_THRESHOLD = 2
+
+# Persistent-negative-reception thresholds (hum-i-20260712-03). Distinct from
+# DECAY_DAYS_SILENT: that walk only sees a lane nobody reacts to at all. A
+# lane reacted to every time but always negatively never accumulates a
+# silent day, so it needs its own trailing-window trigger.
+DECAY_NEGATIVE_WINDOW_DAYS = 7    # trailing days considered (today inclusive)
+DECAY_NEGATIVE_MIN_SURFACED = 3   # minimum surfacings in the window before scoring
+DECAY_NEGATIVE_THRESHOLD = -0.5   # mean daily signal_per_surfaced at/below this triggers
+
+# Full-suppression ("dark lane") thresholds (hum-i-20260816-01). Distinct
+# from both walks above: DECAY_DAYS_SILENT and DECAY_NEGATIVE_* only ever
+# consider a lane once it has surfaced_in_window > 0 for the window --
+# something was actually delivered. A lane that generates real candidate
+# volume but is surfaced ZERO times trips neither: it never reaches a
+# surfaced-then-ignored day, and it never has a reaction to score
+# negatively. This trigger reads candidates instead of reactions/surfacing.
+DECAY_DARK_WINDOW_DAYS = 7          # trailing days considered (today inclusive)
+DECAY_DARK_MIN_AVG_CANDIDATES = 3.0 # trailing-window avg candidates/day at/above this qualifies
+
+# The instance time zone unless user-timezone.json overrides it (UTC when
+# neither is set).
+DEFAULT_TZ_NAME = places_local.instance().get("tz") or "UTC"
+
+# context_flags.calendar_density (derive_calendar_density below). The lookup is
+# a single read-only `gog calendar list` of the target local day's window, invoked
+# the same way agent/scripts/hum-harvesters/calendar.mjs and
+# bin/calendar-conflict-check do (absolute gog path, primary calendar,
+# `--json`, response `{"events": [...]}`). Hard-bounded so a hung gog can never
+# stall the daily collector: any failure degrades the flag to None.
+GOG_BIN = "/opt/homebrew/bin/gog"
+GOG_CALENDAR_ACCOUNT = places_local.instance().get("owner_email") or ""
+CALENDAR_LIST_TIMEOUT_SECS = 15
+CALENDAR_LIST_MAX_EVENTS = 250
+# Density buckets, by count of counted (timed, non-free) events on the day:
+# fewer than CALENDAR_DENSITY_NORMAL_MIN -> "light"; up to and including
+# CALENDAR_DENSITY_NORMAL_MAX -> "normal"; more than that -> "dense".
+# i.e. 0-2 light / 3-6 normal / 7+ dense.
+CALENDAR_DENSITY_NORMAL_MIN = 3
+CALENDAR_DENSITY_NORMAL_MAX = 6
+
+
+def load_json(path, default):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return default
+
+
+def load_jsonl(path):
+    rows = []
+    try:
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rows.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+    except FileNotFoundError:
+        pass
+    return rows
+
+
+def as_dict(x):
+    """Return `x` when it is a dict, else `{}`.
+
+    Defensive accessor for the append-only JSONL logs this collector reads
+    (hum-runs / hum-feedback / suggestion-history). Those files are written by
+    several producers over months and are never rewritten, so a single
+    off-shape record is permanent — it must degrade one row's contribution,
+    not abort the run. See the malformed-candidate note in collect_for_day for
+    the concrete failure this was added for.
+    """
+    return x if isinstance(x, dict) else {}
+
+
+def get_local_tz():
+    # Python 3.9+ has zoneinfo; fall back to UTC if not.
+    try:
+        from zoneinfo import ZoneInfo
+        tz_name = load_json(TZ_FILE, {}).get("timezone", DEFAULT_TZ_NAME)
+        return ZoneInfo(tz_name)
+    except Exception:
+        return timezone.utc
+
+
+def parse_iso(s, tz=None):
+    """Parse an ISO-8601 string into a timezone-AWARE datetime, or None.
+
+    A value with no offset (a bare date like "2026-11-08", or a datetime
+    written without one) is read in `tz`, defaulting to the user's local
+    timezone. Every caller compares the result against an aware datetime
+    (a `datetime.now(timezone.utc)` or an `et_day_window` bound), so a naive
+    return used to raise "can't compare offset-naive and offset-aware
+    datetimes" and abort the whole run (the daily "hum-metrics-collect
+    failed (exit 1)" system alert, from a ledger row whose measure_at was a
+    bare date)."""
+    if not s:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(s).replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=tz or get_local_tz())
+    return dt
+
+
+def et_day_window(target_date, tz):
+    start_local = datetime.combine(target_date, time(0, 0, 0), tzinfo=tz)
+    end_local = datetime.combine(target_date, time(23, 59, 59), tzinfo=tz)
+    return start_local, end_local
+
+
+def in_window(iso_str, start, end):
+    dt = parse_iso(iso_str)
+    if dt is None:
+        return False
+    return start <= dt <= end
+
+
+def workout_recent_cmd():
+    """argv for the configured workout source, or [] when none is set. A
+    relative first element resolves against this checkout (e.g. a bin/ tool)."""
+    cmd = CFG.get("workout_recent_cmd") or []
+    if not isinstance(cmd, list) or not cmd:
+        return []
+    cmd = [str(c) for c in cmd]
+    if not os.path.isabs(cmd[0]) and os.sep in cmd[0]:
+        cmd[0] = os.path.join(TOOLS, cmd[0])
+    return cmd
+
+
+def exercise_outcome_signal(start, end):
+    """Did the user complete a logged workout inside this local-day window?
+    Same check as the exercise harvester's "did the user exercise" (any
+    session with a truthy finished_at), read for a historical day from the
+    installation's workout source (CFG workout_recent_cmd), not reinvented.
+
+    Best-effort like every other accessor in this file: no configured source,
+    or any subprocess or parse failure, returns None (unknown) rather than
+    raising, so a workout-tracker outage can never take down the whole daily
+    collector. The command should list enough recent sessions (e.g. 100) to
+    cover an ad-hoc `--date` backfill; the normal daily cron call is for
+    yesterday, so a handful of recent sessions is plenty.
+    """
+    cmd = workout_recent_cmd()
+    if not cmd:
+        return None
+    try:
+        proc = subprocess.run(
+            cmd,
+            capture_output=True, text=True, timeout=15, check=True,
+        )
+        sessions = json.loads(proc.stdout)
+    except Exception:
+        return None
+    if not isinstance(sessions, list):
+        return None
+    for s in sessions:
+        s = as_dict(s)
+        if not s.get("finished_at"):
+            continue
+        if in_window(s.get("started_at"), start, end):
+            return True
+    return False
+
+
+def lane_from_subject_key(k):
+    if not isinstance(k, str) or ":" not in k:
+        return None
+    return k.split(":", 1)[0]
+
+
+def pings_delivered_for_day(feedback, start, end):
+    """Distinct count of hum-feedback.jsonl rows actually delivered (i.e.
+    sent) within the local day window.
+
+    hum-feedback.jsonl is written by `hum-ping` only on a successful send
+    (jobs/hum-operations.md § Step 2 file shape: `{"ping_id":...,"sent_at":
+    ...,"message_id":...}`), and `jori hum audit`'s drift check treats a
+    1:1 correspondence between hum-runs.jsonl's `outcome.sent` and
+    hum-feedback.jsonl rows as the healthy baseline. So a count of these rows
+    is a genuine POST-delivery ping count -- whatever cap or gate stood
+    between a tick's decision and the actual push (the documented 4/day
+    combined pulse cap, hum's own send gates, etc.) has already been applied
+    by the time a row lands here.
+
+    This is deliberately a *different* denominator than `surfaced` /
+    `ticks_info` (which come from hum-runs.jsonl tick decisions and answer
+    "how often did a tick decide to ship something", not "how many pushes
+    actually reached the user"). Added per hum-i-20260628-02 to make that gap
+    observable -- surface_rate_chatter fired on ~24/27 June days while
+    hum-feedback.jsonl logged 6-13 rows/day against a documented 4/day cap,
+    and nothing in the existing metrics could tell you whether the accounting
+    or the cap enforcement was the one out of sync. Purely additive: does not
+    change `surfaced`, `ticks_info`, `surface_rate`, `silent_rate`, or any
+    other existing field's computation or meaning.
+
+    Distinct by `ping_id` (falling back to `message_id`, then to counting the
+    row outright) so a row that somehow got double-logged doesn't inflate the
+    count.
+    """
+    seen = set()
+    count = 0
+    for r in feedback:
+        r = as_dict(r)
+        if not in_window(r.get("sent_at"), start, end):
+            continue
+        key = r.get("ping_id") or r.get("message_id")
+        if key is None:
+            count += 1
+            continue
+        if key in seen:
+            continue
+        seen.add(key)
+        count += 1
+    return count
+
+
+def collect_for_day(target_date, tz, runs, feedback, history):
+    start, end = et_day_window(target_date, tz)
+    iso_start, iso_end = start.isoformat(), end.isoformat()
+
+    # 1. Tick decisions (from hum-runs.jsonl).
+    ticks_silent = ticks_info = ticks_question = ticks_error = 0
+    candidates_total = 0
+    lane_candidates = defaultdict(int)
+    lane_surfaced = defaultdict(int)
+    surfaced_count = 0
+    for r in runs:
+        r = as_dict(r)
+        ts = r.get("ts") or r.get("started_at")
+        if not in_window(ts, start, end):
+            continue
+        decision = as_dict(r.get("sonnet")).get("decision", "error")
+        if decision == "silent":
+            ticks_silent += 1
+        elif decision == "info":
+            ticks_info += 1
+        elif decision == "question":
+            ticks_question += 1
+        else:
+            ticks_error += 1
+        outcome = as_dict(r.get("outcome"))
+        if outcome.get("sent"):
+            surfaced_count += 1
+            # Lane attribution here feeds detect_decay's per-lane silence walk,
+            # which is scored purely off suggestion-history reaction tokens
+            # (love/up/down/snooze). Question outcomes are answered via
+            # hum-answer's separate free-text feedback loop and never produce a
+            # reaction token, so counting a question as "surfaced" here made a
+            # lane look permanently ignored even when every question was
+            # answered. Only pings (which have a ping_id) are token-scorable.
+            if outcome.get("ping_id"):
+                topic = as_dict(r.get("sonnet")).get("based_on_topic")
+                if topic:
+                    lane_surfaced[topic] += 1
+        # `harvest.candidates` is normally a list of candidate OBJECTS, but a
+        # producer can emit an off-shape element and hum-runs.jsonl is
+        # append-only, so the bad row is permanent. On 2026-08-14T15:30Z one
+        # row stored bare lane-name STRINGS ("news", "art", "music", …)
+        # instead; `cand.get("topic")` raised
+        # AttributeError: 'str' object has no attribute 'get'
+        # and killed the entire collector with exit 1 — no metrics row was
+        # written for that day at all (root-caused 2026-08-15). One malformed
+        # element must cost that element, never a whole day. A non-dict
+        # candidate is therefore still COUNTED in candidates_total (the
+        # pre-fix increment already happened before the .get, so the total
+        # keeps its old semantics) but contributes no lane attribution — we
+        # deliberately do NOT guess the lane from a bare string, since nothing
+        # guarantees an off-shape element is a lane name.
+        cands = as_dict(r.get("harvest")).get("candidates")
+        for cand in (cands if isinstance(cands, list) else []):
+            candidates_total += 1
+            if not isinstance(cand, dict):
+                continue
+            t = cand.get("topic")
+            if t:
+                lane_candidates[t] += 1
+    ticks_total = ticks_silent + ticks_info + ticks_question + ticks_error
+
+    # 2a. Reactions + surfaced from suggestion-history (cross-lane ledger).
+    #     This is the authoritative source for per-lane attribution; hum-runs
+    #     captures only the global decision side. Treat them as complementary.
+    by_token = defaultdict(int)
+    lane_reactions = defaultdict(lambda: defaultdict(int))
+    history_surfaced_lane = defaultdict(int)
+    history_surfaced_total = 0
+    for h in history:
+        # Same defense as the candidates loop above: a non-dict row in this
+        # append-only ledger degrades to an empty record (and falls out at the
+        # window check) rather than aborting the day.
+        h = as_dict(h)
+        kind = h.get("kind")
+        ts = h.get("ts")
+        if not in_window(ts, start, end):
+            continue
+        if kind == "surfaced":
+            history_surfaced_total += 1
+            lane = h.get("lane") or lane_from_subject_key(h.get("subject_key"))
+            if lane:
+                history_surfaced_lane[lane] += 1
+            continue
+        if kind != "reaction":
+            continue
+        tok = h.get("reaction_token")
+        if not tok:
+            disp = h.get("disposition")
+            tok = {"positive": "freeform_pos", "negative": "freeform_neg",
+                   "snoozed": "snooze", "deferred": "deferred",
+                   "visited": "visited"}.get(disp)
+        if tok:
+            by_token[tok] += 1
+            lane = lane_from_subject_key(h.get("subject_key"))
+            if lane:
+                lane_reactions[lane][tok] += 1
+
+    # 2a-bis. Fold hum-feedback.jsonl reactions — the ledger `jori hum
+    #     feedback` (the production reaction-capture path per CLAUDE.md's Hum
+    #     Inbound Handling) actually writes to. `feedback` was loaded and
+    #     passed into this function since 2026-05-20 but never read: every
+    #     lane's reactions were invisible here, so detect_decay's per-lane
+    #     silent-day walk (which reads exactly this `lane_reactions` dict)
+    #     saw zero reactions even on days the user reacted, firing false
+    #     lane_decay_silent events. Root-caused 2026-07-08, diagnosed as
+    #     hum-i-20260705-01, recurred 29 times before this fix (the "ideas"
+    #     lane alone: e.g. 2026-08-02 claims 5 silent days despite a "more"
+    #     reaction on 7/30 and a "helpful" reaction on 8/1, both inside that
+    #     window). Unlike suggestion-history's subject_key-prefix parsing
+    #     (lane_from_subject_key), every hum-feedback.jsonl row already
+    #     carries an explicit `lane` field, so no parsing is needed. Token
+    #     vocabulary matches the mapping already documented (and used
+    #     elsewhere for the same purpose in bin/jori
+    #     humReactionToDisposition) in hum-intent.md § Primary KPIs and
+    #     hum-improvement-loop.md: helpful=up, more=love, skip=down,
+    #     snooze=snooze. Free-text (non-tapback) replies are left alone —
+    #     scoring their valence needs a model, not string matching (Rule
+    #     #0b), and is out of scope for this fix.
+    FEEDBACK_TOKEN_MAP = {"helpful": "up", "more": "love", "skip": "down", "snooze": "snooze"}
+    # Dedup guard: if the same reaction event already reached suggestion-
+    # history (message_id match), don't double-count it here.
+    history_reaction_message_ids = {
+        h.get("message_id") for h in (as_dict(x) for x in history)
+        if h.get("kind") == "reaction" and h.get("message_id")
+        and in_window(h.get("ts"), start, end)
+    }
+    for r in feedback:
+        r = as_dict(r)
+        tok = FEEDBACK_TOKEN_MAP.get(r.get("reaction"))
+        if not tok:
+            continue
+        if not in_window(r.get("reaction_at"), start, end):
+            continue
+        mid = r.get("message_id")
+        if mid and mid in history_reaction_message_ids:
+            continue
+        by_token[tok] += 1
+        lane = r.get("lane")
+        if lane:
+            lane_reactions[lane][tok] += 1
+
+    # 2b. Surfaced count: prefer history's count when hum-runs is empty (this
+    #     covers the case where the runs file isn't yet populated). Per-lane
+    #     surfacing comes from history too — based_on_topic in hum-runs only
+    #     captures the winning lane per tick, not multi-finding pings.
+    if surfaced_count == 0 and history_surfaced_total > 0:
+        surfaced_count = history_surfaced_total
+    for lane, n in history_surfaced_lane.items():
+        if lane_surfaced.get(lane, 0) == 0:
+            lane_surfaced[lane] = n
+
+    # 3. Signal score (raw) + per-surfaced.
+    signal_raw = sum(by_token[t] * w for t, w in TOKEN_WEIGHTS.items())
+    signal_per_surfaced = signal_raw / surfaced_count if surfaced_count > 0 else None
+
+    # 4. Per-lane.
+    lane_yield = {}
+    all_lanes = set(lane_candidates) | set(lane_surfaced) | set(lane_reactions)
+    for lane in all_lanes:
+        c = lane_candidates.get(lane, 0)
+        s = lane_surfaced.get(lane, 0)
+        rxns = dict(lane_reactions.get(lane, {}))
+        lane_signal = sum(rxns.get(t, 0) * w for t, w in TOKEN_WEIGHTS.items())
+        lane_yield[lane] = {
+            "candidates": c,
+            "surfaced": s,
+            "reactions": rxns,
+            "signal_per_surfaced": (lane_signal / s) if s > 0 else None,
+            "yield_rate": (s / c) if c > 0 else None,
+        }
+
+    # 4b. Accountability-lane outcome signal. Only computed for a lane that
+    #     actually appears in today's lane_yield (no point spending a workout-
+    #     source round trip on a lane with no activity). See ACCOUNTABILITY_LANES.
+    for lane in ACCOUNTABILITY_LANES:
+        if lane not in lane_yield:
+            continue
+        if lane == "exercise":
+            lane_yield[lane]["outcome_signal"] = exercise_outcome_signal(start, end)
+        else:
+            # No workout-equivalent completion source exists yet for this
+            # lane -- health nudges span sleep/weight/steps/RHR checks with
+            # no single "logged" event the way a workout has. Left
+            # explicitly unknown (None) rather than reusing the exercise/
+            # workout check, which would mislabel an unrelated health nudge
+            # as "worked" just because a workout happened to be logged that
+            # day. A lane-appropriate check can be added here later without
+            # touching anything else in this file.
+            lane_yield[lane]["outcome_signal"] = None
+
+    # 4c. Discretionary (non-accountability) aggregate. The tapback-based
+    #     signal_per_surfaced dilutes whenever an accountability lane
+    #     surfaces reliably and earns ~0 tapbacks by design -- the user
+    #     doesn't need to react to a reminder that already got them to the
+    #     gym. Subtract those lanes' reactions/surfaced counts from the
+    #     global aggregate so the discretionary-lane KPI isn't dragged down
+    #     by a lane that may be working exactly as intended. Purely
+    #     additive: `signal_per_surfaced` / `surfaced` (all lanes) are
+    #     unchanged for every existing reader.
+    accountability_reactions = defaultdict(int)
+    accountability_surfaced = 0
+    for lane in ACCOUNTABILITY_LANES:
+        ly = lane_yield.get(lane)
+        if not ly:
+            continue
+        for tok, n in ly["reactions"].items():
+            accountability_reactions[tok] += n
+        accountability_surfaced += ly["surfaced"]
+    signal_raw_discretionary = signal_raw - sum(
+        accountability_reactions.get(t, 0) * w for t, w in TOKEN_WEIGHTS.items())
+    surfaced_discretionary = max(0, surfaced_count - accountability_surfaced)
+    signal_per_surfaced_discretionary = (
+        signal_raw_discretionary / surfaced_discretionary
+        if surfaced_discretionary > 0 else None)
+
+    # 5. Surface + silent rates.
+    surface_rate = (ticks_info / ticks_total) if ticks_total > 0 else 0.0
+    silent_rate = (ticks_silent / ticks_total) if ticks_total > 0 else 0.0
+
+    _pings_day = pings_delivered_for_day(feedback, start, end)
+    return {
+        "date": target_date.isoformat(),
+        "window_et": [iso_start, iso_end],
+        "ticks": ticks_total,
+        "ticks_silent": ticks_silent,
+        "ticks_info": ticks_info,
+        "ticks_question": ticks_question,
+        "ticks_error": ticks_error,
+        "candidates_total": candidates_total,
+        "surfaced": surfaced_count,
+        "pings_delivered": _pings_day,
+        "reactions": {k: by_token[k] for k in
+                      ("love", "up", "down", "snooze", "freeform_pos", "freeform_neg")},
+        "signal_score_raw": round(signal_raw, 3),
+        # Additive (hum-i-20261018-04): signal per ping actually delivered.
+        # None when no ping was delivered that day.
+        "signal_per_ping": (round(signal_raw / _pings_day, 3)
+                            if _pings_day else None),
+        "signal_per_surfaced": (round(signal_per_surfaced, 3)
+                                if signal_per_surfaced is not None else None),
+        "surfaced_discretionary": surfaced_discretionary,
+        "signal_score_raw_discretionary": round(signal_raw_discretionary, 3),
+        "signal_per_surfaced_discretionary": (round(signal_per_surfaced_discretionary, 3)
+                                if signal_per_surfaced_discretionary is not None else None),
+        "surface_rate": round(surface_rate, 4),
+        "silent_rate": round(silent_rate, 4),
+        "lane_yield": lane_yield,
+        # context_flags populated separately; downstream readers tolerate absence.
+        "context_flags": derive_context_flags(target_date, tz),
+    }
+
+
+def fetch_calendar_events(target_date, tz):
+    """Raw Google Calendar events overlapping `target_date`'s local-day window,
+    or None if they could not be read.
+
+    Best-effort by contract: ANY failure (gog missing, auth failure under
+    cron/launchd, timeout, non-zero exit, unparseable or off-shape JSON)
+    returns None and never raises. Kept as its own function so tests (and any
+    future caller) can substitute it without shelling out to gog.
+
+    Mirrors agent/scripts/hum-harvesters/calendar.mjs's invocation
+    (`gog calendar list --account ... --json`, primary calendar) but scopes it
+    to the target day via --from/--to instead of `--days 2` from now, because
+    this collector processes past days too. The window is midnight-to-midnight
+    in `tz`, sent as UTC RFC3339 the way bin/calendar-conflict-check
+    does.
+    """
+    try:
+        day_start = datetime.combine(target_date, time(0, 0, 0), tzinfo=tz)
+        day_end = datetime.combine(target_date + timedelta(days=1),
+                                   time(0, 0, 0), tzinfo=tz)
+        fmt = "%Y-%m-%dT%H:%M:%SZ"
+        proc = subprocess.run(
+            [GOG_BIN, "calendar", "list",
+             *(["--account", GOG_CALENDAR_ACCOUNT] if GOG_CALENDAR_ACCOUNT else []),
+             "--from", day_start.astimezone(timezone.utc).strftime(fmt),
+             "--to", day_end.astimezone(timezone.utc).strftime(fmt),
+             f"--max={CALENDAR_LIST_MAX_EVENTS}", "--json", "--no-input"],
+            capture_output=True, text=True,
+            stdin=subprocess.DEVNULL,
+            timeout=CALENDAR_LIST_TIMEOUT_SECS,
+        )
+        if proc.returncode != 0:
+            return None
+        data = json.loads(proc.stdout)
+        # Same tolerated shapes as calendar.mjs: {"events": [...]},
+        # {"items": [...]}, or a bare list. Pick the key by presence, not
+        # truthiness: an empty `"events": []` is a real, empty day (-> "light"),
+        # not an unreadable calendar (-> None).
+        if isinstance(data, dict):
+            data = data["events"] if "events" in data else data.get("items")
+        return data if isinstance(data, list) else None
+    except Exception:
+        return None
+
+
+def count_calendar_density_events(events, target_date, tz):
+    """How many of `events` count toward the target day's calendar density.
+
+    Counts only timed events that start inside the target local day, and skips
+    (same rules as calendar.mjs's filterScannableEvents, minus its
+    conflict-detection-only plumbing):
+      - transparency == "transparent" (shown as free: maintenance blocks,
+        workout placeholders, other people's events marked free)
+      - summaries starting with a configured prefix that marks someone
+        else's events (hum-calendar `ignore_summary_prefixes`, shared with
+        calendar.mjs -- they don't take the user's time)
+      - malformed entries (non-dict, no parseable start)
+    Also skips all-day events (start carries `date`, not `dateTime`). This is
+    the one deliberate difference from calendar.mjs, which has no explicit
+    all-day rule (it reads an all-day `start.date` as UTC midnight): density
+    is about how many timed commitments crowd the day, and all-day entries are
+    banners (birthdays, holidays, multi-day "Trip to ..." spans) that would
+    inflate it.
+    """
+    day_start = datetime.combine(target_date, time(0, 0, 0), tzinfo=tz)
+    day_end = datetime.combine(target_date + timedelta(days=1),
+                               time(0, 0, 0), tzinfo=tz)
+    n = 0
+    for e in events or []:
+        if not isinstance(e, dict):
+            continue
+        if e.get("transparency") == "transparent":
+            continue
+        if CALENDAR_IGNORE_PREFIXES and str(e.get("summary") or "").strip().startswith(
+                CALENDAR_IGNORE_PREFIXES):
+            continue
+        # An offset-less dateTime is read in this day's tz (parse_iso's tz arg).
+        start = parse_iso(as_dict(e.get("start")).get("dateTime"), tz)
+        if start is None:
+            continue  # all-day (date only) or unparseable
+        if day_start <= start < day_end:
+            n += 1
+    return n
+
+
+def bucket_calendar_density(n_events):
+    """Map a counted-event total to 'light' / 'normal' / 'dense'."""
+    if n_events < CALENDAR_DENSITY_NORMAL_MIN:
+        return "light"
+    if n_events <= CALENDAR_DENSITY_NORMAL_MAX:
+        return "normal"
+    return "dense"
+
+
+def derive_calendar_density(target_date, tz):
+    """'light' | 'normal' | 'dense' for `target_date`'s calendar, or None when
+    the calendar could not be read. Never raises."""
+    try:
+        events = fetch_calendar_events(target_date, tz)
+        if events is None:
+            return None
+        return bucket_calendar_density(
+            count_calendar_density_events(events, target_date, tz))
+    except Exception:
+        return None
+
+
+def derive_context_flags(target_date, tz):
+    """Best-effort context: traveling? hum paused? calendar density?
+    hum_paused_hours reads existing state files; traveling resolves via the
+    `home-presence` CLI, which reads the canonical travel_segments timeline
+    (Supabase) with a flights.json fallback -- see the comment below;
+    calendar_density makes ONE short, time-bounded, read-only
+    `gog calendar list` (see fetch_calendar_events). Every part degrades to
+    None rather than raising, so a flaky source can cost a flag but never
+    the day's row."""
+    flags = {"traveling": None, "hum_paused_hours": None, "calendar_density": None}
+    # Hum-state has pause field.
+    hs = load_json(HUM_STATE, {})
+    pause = hs.get("pause") or {}
+    if pause.get("until"):
+        try:
+            until = parse_iso(pause["until"])
+            start, end = et_day_window(target_date, tz)
+            if until and until > start:
+                overlap_end = min(until, end)
+                flags["hum_paused_hours"] = round(
+                    (overlap_end - start).total_seconds() / 3600, 1)
+        except Exception:
+            pass
+    # Traveling: resolve against the canonical travel timeline via
+    # `home-presence <date> --json` (agent/CLAUDE.md § Travel Timeline —
+    # travel_segments is the single source of truth for presence), not a
+    # hand-rolled single-city lat/lon bounding box. The old bbox treated a day
+    # at the user's other home as "traveling", and had no signal at all --
+    # null -- on any day without confirmed-stops rows. home-presence already
+    # knows every home metro (lib/presence.js HOME_METROS) and fails open to "at home" when the
+    # timeline has no signal for the date, printing that verdict as JSON
+    # regardless of its own exit code -- so read at_home from stdout rather
+    # than gating on returncode, and leave the flag null only when the
+    # subprocess itself can't be run or its output can't be parsed.
+    try:
+        proc = subprocess.run(
+            [HOME_PRESENCE_BIN, target_date.isoformat(), "--json"],
+            capture_output=True, text=True, timeout=15,
+        )
+        at_home = json.loads(proc.stdout).get("at_home")
+        if isinstance(at_home, bool):
+            flags["traveling"] = not at_home
+    except Exception:
+        pass
+    # Calendar density: derive_calendar_density never raises, but this runs
+    # inside collect_for_day -- an escaped exception here would abort the whole
+    # row write (the hum-i-20260816-04 failure class) -- so guard it anyway.
+    try:
+        flags["calendar_density"] = derive_calendar_density(target_date, tz)
+    except Exception:
+        pass
+    return flags
+
+
+def compute_rolling(daily_rows, target_date, days):
+    """Mean signal_per_surfaced and surface_rate over the prior `days` days
+    ending at target_date (inclusive). Returns None for missing samples."""
+    cutoff = target_date - timedelta(days=days - 1)
+    window = [r for r in daily_rows if r["date"] >= cutoff.isoformat()
+              and r["date"] <= target_date.isoformat()]
+    if not window:
+        return None
+    sps = [r["signal_per_surfaced"] for r in window if r.get("signal_per_surfaced") is not None]
+    # Legacy rows written before the accountability-lane fix won't carry this
+    # key at all -- .get() degrades them out of the mean rather than KeyError.
+    spsd = [r["signal_per_surfaced_discretionary"] for r in window
+            if r.get("signal_per_surfaced_discretionary") is not None]
+    sr = [r.get("surface_rate", 0) for r in window]
+    # signal_per_ping (hum-i-20261018-04): pooled sum(signal raw) / sum(pings
+    # delivered) over rows carrying both fields, so tiny days don't dominate.
+    # Legacy rows lacking either field are skipped; no usable rows -> None.
+    pp = [r for r in window if r.get("signal_score_raw") is not None
+          and r.get("pings_delivered") is not None]
+    pings_total = sum(r["pings_delivered"] for r in pp)
+    spp = (round(sum(r["signal_score_raw"] for r in pp) / pings_total, 3)
+           if pings_total > 0 else None)
+    return {
+        "n_days": len(window),
+        "pings_delivered": pings_total if pp else None,
+        "signal_per_ping": spp,
+        "signal_per_surfaced": round(sum(sps) / len(sps), 3) if sps else None,
+        "signal_per_surfaced_discretionary": round(sum(spsd) / len(spsd), 3) if spsd else None,
+        "surface_rate": round(sum(sr) / len(sr), 4) if sr else None,
+    }
+
+
+def detect_daily_gap(existing_daily, target_date):
+    """Return the missing ISO dates strictly between the most recent daily[]
+    row on file before `target_date` and `target_date` itself, walking
+    backward from `target_date - 1 day`. Stops at the first date it finds a
+    row for, or once it walks earlier than the earliest date on file (that's
+    just "no history recorded yet", not a gap) -- so it never flags the very
+    first day(s) of the series.
+
+    In the common case this only ever looks one day back: the daily cron
+    always targets yesterday, so `target_date - 1` IS the prior run's own
+    target and should already have a row. Because the walk stops the instant
+    it finds an existing row, a gap gets reported exactly once -- the next
+    day's run (whose own `target_date - 1` is the now-filled date) finds it
+    immediately and never re-flags it.
+
+    See hum-i-20260816-04: the 2026-08-14 row was never written because that
+    day's collector run crashed on a malformed `harvest.candidates` element
+    (see the defensive isinstance(cand, dict) check in collect_for_day above)
+    and exited before reaching the write step. Nothing else noticed -- every
+    rolling_7d/rolling_30d/decay computation since then silently averaged
+    across the hole. This function is read-only; callers decide whether/how
+    to surface what it finds.
+    """
+    existing_dates = {r.get("date") for r in existing_daily
+                       if isinstance(r, dict) and r.get("date")}
+    if not existing_dates:
+        return []
+    earliest = min(existing_dates)
+    missing = []
+    d = target_date - timedelta(days=1)
+    while d.isoformat() >= earliest:
+        ds = d.isoformat()
+        if ds in existing_dates:
+            break
+        missing.append(ds)
+        d -= timedelta(days=1)
+    return list(reversed(missing))
+
+
+def detect_decay(state, today_row):
+    """Returns a list of decay events to surface + dispatch on."""
+    events = []
+    today_date = today_row["date"]
+    daily = state.get("daily", [])
+
+    # today_row was mostly paused (see DECAY_PAUSE_MIN_HOURS) -- skip the
+    # walks that would otherwise read a paused day's empty reactions/signal
+    # as decay. lane_decay_dark is deliberately excluded: it keys off
+    # candidate volume, which a pause also zeroes out, so it's already
+    # self-protecting without this guard.
+    paused_hours = (today_row.get("context_flags") or {}).get("hum_paused_hours")
+    today_mostly_paused = paused_hours is not None and paused_hours >= DECAY_PAUSE_MIN_HOURS
+
+    # --- Per-lane sustained silence ---
+    today_lanes = today_row.get("lane_yield", {})
+    if not today_mostly_paused:
+        for lane, ly in today_lanes.items():
+            if ly.get("surfaced", 0) == 0:
+                continue
+            if lane in ACCOUNTABILITY_LANES and ly.get("outcome_signal") is True:
+                # The nudge did its job today even without a tapback -- don't
+                # flag an accountability lane as decaying on a day it's
+                # demonstrably still working via the outcome check. See
+                # ACCOUNTABILITY_LANES above.
+                continue
+            # Walk backwards through daily rows; count consecutive surfaced-zero-reactions days for this lane.
+            silent_days = 0
+            total_surfaced = 0
+            for r in [today_row] + list(reversed(daily)):
+                if r["date"] > today_date:
+                    continue
+                ly2 = r.get("lane_yield", {}).get(lane, {})
+                rxns = ly2.get("reactions") or {}
+                if sum(rxns.values()) == 0:
+                    silent_days += 1
+                    total_surfaced += ly2.get("surfaced", 0)
+                    if silent_days >= DECAY_DAYS_SILENT and total_surfaced >= 3:
+                        events.append({
+                            "type": "lane_decay_silent",
+                            "lane": lane,
+                            "days_silent": silent_days,
+                            "surfaced_in_window": total_surfaced,
+                            "ts": datetime.now(timezone.utc).isoformat(),
+                        })
+                        break
+                else:
+                    break
+
+    # --- Per-lane persistent negative reception ---
+    # "They keep saying no", not "nobody's looking". The silent-day walk
+    # above structurally cannot see this: a lane reacted to every time it
+    # surfaces, but always negatively (down / snooze / freeform_neg), never
+    # has a day where sum(rxns.values()) == 0, so it never accumulates a
+    # silent day no matter how long the pattern runs -- yet sustained
+    # rejection is a worse signal than silence. See hum-i-20260712-03 (the
+    # tasks lane's 2026-07-10 row -- surfaced 1, down + freeform_neg,
+    # signal_per_surfaced -2.0 -- is the shape this exists to catch before it
+    # can recur silently for weeks).
+    #
+    # Window is the trailing DECAY_NEGATIVE_WINDOW_DAYS days (today
+    # inclusive) and does NOT require contiguity the way the silent walk
+    # does -- a lane that alternates quiet and negative days across the week
+    # should still be caught. Deliberately NOT gated on ACCOUNTABILITY_LANES
+    # the way the silent walk is: that gate exists because an accountability
+    # lane's success criterion is "did the thing get done", not "did the user tap
+    # back" -- silence there is expected and fine. An explicit, repeated
+    # thumbs-down is a different claim (the user is actively telling us the nudge
+    # itself is wrong) and is exactly as meaningful for an accountability
+    # lane as for a discretionary one, so it is not suppressed here.
+    if not today_mostly_paused:
+        window_start = (date.fromisoformat(today_date)
+                         - timedelta(days=DECAY_NEGATIVE_WINDOW_DAYS - 1)).isoformat()
+        window_rows = [r for r in [today_row] + list(reversed(daily))
+                       if window_start <= r["date"] <= today_date]
+        for lane, ly in today_lanes.items():
+            if ly.get("surfaced", 0) == 0:
+                continue
+            total_surfaced = 0
+            sps_values = []
+            for r in window_rows:
+                ly2 = r.get("lane_yield", {}).get(lane, {})
+                total_surfaced += ly2.get("surfaced", 0)
+                sps = ly2.get("signal_per_surfaced")
+                if sps is not None:
+                    sps_values.append(sps)
+            if total_surfaced < DECAY_NEGATIVE_MIN_SURFACED or not sps_values:
+                continue
+            mean_sps = sum(sps_values) / len(sps_values)
+            if mean_sps <= DECAY_NEGATIVE_THRESHOLD:
+                events.append({
+                    "type": "lane_decay_negative",
+                    "lane": lane,
+                    "surfaced_in_window": total_surfaced,
+                    "mean_signal_per_surfaced": round(mean_sps, 3),
+                    "window_days": DECAY_NEGATIVE_WINDOW_DAYS,
+                    "ts": datetime.now(timezone.utc).isoformat(),
+                })
+
+    # --- Per-lane full suppression ("dark") ---
+    # hum-i-20260816-01: both walks above key off surfacing/reactions, so
+    # neither can ever see a lane that generates real candidate volume but
+    # is surfaced ZERO times -- it never has a surfaced-then-silent day to
+    # start the DECAY_DAYS_SILENT clock, and it never has a reaction to
+    # score negatively. Measured 2026-08-15 (trailing 14d): six lanes hit
+    # exactly this blind spot with real candidate volume and zero decay
+    # alerts (six lanes with 13-106 candidates each and 0 surfaced). This walk reads `candidates` (from
+    # every harvest tick, gated or not) instead of `surfaced`/`reactions`,
+    # so it is the one detector in this function that can catch a lane
+    # that never clears the ranker at all -- upstream misfire, not
+    # downstream ignoring.
+    #
+    # Averaging divides by the fixed DECAY_DARK_WINDOW_DAYS, not by however
+    # many daily rows actually exist in that span (contrast compute_rolling,
+    # which divides by len(window)) -- deliberately, so a short/early data
+    # history can only pull the average DOWN (a missing day contributes 0
+    # candidates toward a fixed-size denominator) and can never manufacture
+    # a false trigger out of one or two days of real data, mirroring the
+    # fail-conservative posture of the ticks_3d >= 30 gate below.
+    dark_window_start = (date.fromisoformat(today_date)
+                          - timedelta(days=DECAY_DARK_WINDOW_DAYS - 1)).isoformat()
+    dark_window_rows = [r for r in [today_row] + list(reversed(daily))
+                         if dark_window_start <= r["date"] <= today_date]
+    dark_lanes = set()
+    for r in dark_window_rows:
+        dark_lanes.update(r.get("lane_yield", {}).keys())
+    for lane in dark_lanes:
+        total_candidates = 0
+        total_surfaced = 0
+        for r in dark_window_rows:
+            ly2 = r.get("lane_yield", {}).get(lane, {})
+            total_candidates += ly2.get("candidates", 0)
+            total_surfaced += ly2.get("surfaced", 0)
+        if total_surfaced > 0:
+            continue
+        avg_candidates = total_candidates / DECAY_DARK_WINDOW_DAYS
+        if avg_candidates >= DECAY_DARK_MIN_AVG_CANDIDATES:
+            events.append({
+                "type": "lane_decay_dark",
+                "lane": lane,
+                "candidates_in_window": total_candidates,
+                "window_days": DECAY_DARK_WINDOW_DAYS,
+                "avg_candidates_per_day": round(avg_candidates, 2),
+                "ts": datetime.now(timezone.utc).isoformat(),
+            })
+
+    # --- Global signal 3-day-drop ---
+    today_3 = compute_rolling([today_row] + daily, date.fromisoformat(today_date), DECAY_DROP_WINDOW)
+    prior_7 = compute_rolling(daily, date.fromisoformat(today_date) - timedelta(days=DECAY_DROP_WINDOW),
+                              DECAY_DROP_BASELINE)
+    # today_3/prior_7 stay computed unconditionally -- the surface-rate
+    # anomaly checks below reuse them -- but a mostly-paused today must not
+    # itself generate a global_decay_drop event off the back of them: a
+    # paused day's near-zero signal_per_surfaced reads as a collapse against
+    # the prior week's baseline when it's really just "hum wasn't running".
+    # hum-i-20261018-04: keyed on signal per DELIVERED ping, and only when the
+    # 3-day window holds >= DECAY_DROP_MIN_PINGS pings, so small-n windows
+    # can't trip it. Rows without the new fields are not computable -> no event.
+    pings_3d = (today_3 or {}).get("pings_delivered")
+    spp_3 = (today_3 or {}).get("signal_per_ping")
+    spp_7 = (prior_7 or {}).get("signal_per_ping")
+    if not today_mostly_paused and pings_3d is not None and pings_3d >= DECAY_DROP_MIN_PINGS \
+            and spp_3 is not None and spp_7 is not None and spp_7 > 0.0:
+        delta = spp_3 - spp_7
+        if delta < 0 and abs(delta) / max(0.01, spp_7) >= DECAY_DROP_PCT:
+            events.append({
+                "type": "global_decay_drop",
+                "metric": "signal_per_ping",
+                "today_3d": spp_3,
+                "baseline_7d": spp_7,
+                "pings_3d": pings_3d,
+                "delta_pct": round(delta / spp_7, 3),
+                "ts": datetime.now(timezone.utc).isoformat(),
+            })
+
+    # --- Surface-rate anomalies ---
+    # Require non-trivial tick volume; otherwise an empty hum-runs.jsonl (or
+    # the system being paused) trips surface_rate_collapse on every empty day.
+    today_ticks = today_row.get("ticks", 0)
+    daily_3 = [r for r in [today_row] + list(reversed(daily))][:DECAY_DROP_WINDOW]
+    ticks_3d = sum(r.get("ticks", 0) for r in daily_3)
+    if today_3 and today_3.get("surface_rate") is not None and ticks_3d >= 30:
+        sr = today_3["surface_rate"]
+        if sr < SURFACE_RATE_LOW:
+            events.append({"type": "surface_rate_collapse", "rolling_3d": sr,
+                          "ticks_3d": ticks_3d,
+                          "ts": datetime.now(timezone.utc).isoformat()})
+        elif sr > SURFACE_RATE_HIGH:
+            # Cross-check quality before firing (added 2026-09-01).
+            # hum-intent.md's 2026-08-03 note already flags that surface_rate
+            # now reads low by construction post-redesign and should be
+            # re-baselined against dispatches before it's trusted alone --
+            # this is that re-baseline applied at the detector, not just a
+            # caveat in a doc. Real chatter degrades quality as volume rises;
+            # 8/6-8/9 showed the opposite (rolling_3d climbing 0.30->0.45
+            # while signal_per_surfaced rose to 2-6x its 30d baseline), which
+            # is a quality *improvement*, not chatter. Reuse the same
+            # today_3/prior_7 windows already computed above for
+            # global_decay_drop rather than inventing a new mechanism, and
+            # only fire when quality is flat-or-declining (delta <= 0)
+            # alongside the volume spike. Missing signal_per_surfaced data on
+            # either side fails open -- fires as before -- so an absent
+            # cross-check can never silently suppress a real alert.
+            quality_today = today_3.get("signal_per_surfaced") if today_3 else None
+            quality_prior = prior_7.get("signal_per_surfaced") if prior_7 else None
+            quality_rising = (quality_today is not None and quality_prior is not None
+                               and (quality_today - quality_prior) > 0)
+            if not quality_rising:
+                events.append({"type": "surface_rate_chatter", "rolling_3d": sr,
+                              "ticks_3d": ticks_3d,
+                              "signal_per_surfaced_3d": quality_today,
+                              "signal_per_surfaced_baseline_7d": quality_prior,
+                              "ts": datetime.now(timezone.utc).isoformat()})
+
+    return events
+
+
+def dispatch_qualitative_question(event, today_row):
+    """When a decay event lands, QUEUE a lane-diagnosis question for delivery at
+    the next gated hum tick. Honors per-lane cooldown AND the single-slot
+    queue (see below).
+
+    This job runs in the early morning — inside hum's sleep window — so it must NOT send
+    or occupy the pending-question slot directly. Doing so (pre-2026-07-21) wrote
+    a 48h-TTL question into hum-pending-question.json that was never delivered:
+    it sat occupied for two days, downgrading every real tick question to silent
+    (pending_question_active) and blocking ideation refills, while the user never
+    saw it. Instead we write the question to hum-qual-delivery-queue.json;
+    bin/hum-deliver-qual (invoked by trigger-hum.sh after the sleep/
+    activity/calendar/pause gates) delivers it at a good moment and only THEN
+    writes the pending slot — making delivery and the slot-lock atomic, so a
+    never-delivered zombie is impossible. See data/hum-improvement-loop.md
+    and jobs/hum.md.
+
+    hum-i-20260712-02: QUAL_QUEUE holds exactly ONE queued question at a time
+    (hum-deliver-qual consumes + deletes it once delivered, or once past its
+    own deliver_by) — the filename says "queue" but the write below is a full
+    single-object overwrite, not an append. main() calls this function once
+    per decay event detected THIS run, and on 2026-07-09 two lane_decay_silent
+    events fired 39ms apart for different lanes ('ideas' then 'calendar'):
+    the second call's unconditional json.dump clobbered the first's
+    still-undelivered queued question, AND still stamped the clobbered lane's
+    cooldown as though it had been asked — blocking a re-ask for
+    QUAL_COOLDOWN_DAYS even though that question was never seen. Guard against
+    this by checking for a live (not-yet-expired) occupant before writing; if
+    one is present, skip this dispatch entirely and leave cooldown untouched
+    so the skipped lane can be asked again once the current occupant clears.
+
+    hum-i-20260712-03: the cooldown key is `f"{lane}:{event_type}"`, not the
+    bare lane name. An earlier attempt at adding lane_decay_negative kept the
+    bare-lane key and was reverted specifically over this -- lane_decay_silent
+    and lane_decay_negative (and global_decay_drop's "global" pseudo-lane)
+    would otherwise compete for one 14-day clock per lane with no stated
+    reason to share it, so answering one diagnosis question about a lane
+    could silently block a completely different diagnosis about the same
+    lane for two weeks. Each (lane, event_type) pair now gets its own clock.
+    The read path also checks the bare `cooldown[lane]` key as a fallback --
+    that shape only exists in cooldown files written before this change (the
+    write path below never produces it again), so the fallback is purely a
+    migration bridge: it keeps honoring already-in-flight cooldowns on the
+    day this ships, and ages itself out within QUAL_COOLDOWN_DAYS since
+    nothing refreshes it.
+
+    hum-i-20260830-02: the slot_occupied guard above (hum-i-20260712-02)
+    fixed the SAME-tick clobber but created a slower-burning problem --
+    "skip and leave cooldown untouched" is fair to the skipped lane in
+    isolation, but a lane that keeps co-occurring with a lane that reliably
+    wins the race (e.g. exercise and health, both ACCOUNTABILITY_LANES,
+    tend to decay in lockstep) can lose that race every single time it's
+    tried and never once reach QUAL_QUEUE, let alone the user. Audited
+    2026-09-21: hum-learnings.jsonl has zero category:lane_diagnosis rows
+    mentioning exercise despite exercise-lane decay being logged repeatedly
+    since May (hum-i-20260607-01, hum-i-20260621-02, hum-i-20260823-02).
+    QUAL_STARVATION (hum-qual-starvation.json) tracks, per (lane, event_type)
+    cooldown_key, how many consecutive times a dispatch has hit
+    slot_occupied without that key ever successfully reaching QUAL_QUEUE.
+    Once a key crosses QUAL_STARVATION_THRESHOLD, its NEXT dispatch preempts
+    the live occupant outright instead of skipping again. This is a
+    per-lane counter, not a FIFO rewrite of QUAL_QUEUE's on-disk shape --
+    hum-deliver-qual (the only other reader) still consumes a single JSON
+    object, unmodified, so this stays additive and low-risk. The preempted
+    occupant's own cooldown was already stamped when IT queued (at that
+    point it wasn't occupied, so it went through the normal write path
+    below), so preempting it doesn't grant it an early re-ask; the only
+    real cost is that a question already in flight never reaches the user,
+    which is the accepted trade for guaranteeing a chronically-starved lane
+    is eventually asked instead of indefinitely deferring. A key's counter
+    resets to 0 the moment its own dispatch succeeds (queued or preempting),
+    whether or not that question is ever delivered or answered downstream --
+    this function's job is getting a lane INTO the queue, not tracking what
+    happens after. Cooldown-gated skips never touch the starvation counter;
+    only slot_occupied skips do, since a lane correctly sitting out its
+    14-day cooldown isn't starved, it's just recently asked."""
+    if event["type"] not in ("lane_decay_silent", "global_decay_drop", "lane_decay_negative",
+                              "lane_decay_dark"):
+        return None
+    lane = event.get("lane") or "global"
+    event_type = event["type"]
+    cooldown_key = f"{lane}:{event_type}"
+    cooldown = load_json(QUAL_COOLDOWN, {})
+    last = cooldown.get(cooldown_key) or cooldown.get(lane)
+    now = datetime.now(timezone.utc)
+    if last:
+        last_dt = parse_iso(last)
+        if last_dt and (now - last_dt) < timedelta(days=QUAL_COOLDOWN_DAYS):
+            return {"skipped": "cooldown", "lane": lane, "last_asked": last}
+
+    # Single-slot guard (hum-i-20260712-02). A malformed/unparseable
+    # deliver_by is treated as "still occupied" — never clobber a live
+    # question just because we couldn't confirm it had expired.
+    existing = load_json(QUAL_QUEUE, None)
+    slot_occupied = False
+    if isinstance(existing, dict) and existing.get("question"):
+        existing_deliver_by = parse_iso(existing.get("deliver_by"))
+        slot_occupied = existing_deliver_by is None or existing_deliver_by > now
+
+    preempted = None
+    if slot_occupied:
+        # Starvation escape hatch (hum-i-20260830-02). A key that has lost
+        # the slot race QUAL_STARVATION_THRESHOLD times in a row without
+        # ever reaching the queue gets its turn now instead of skipping
+        # again -- see the docstring for why preempting is safe here.
+        starvation = load_json(QUAL_STARVATION, {})
+        losses = starvation.get(cooldown_key, 0)
+        if losses < QUAL_STARVATION_THRESHOLD:
+            starvation[cooldown_key] = losses + 1
+            write_json_atomic(QUAL_STARVATION, starvation, indent=2)
+            return {
+                "skipped": "slot_occupied",
+                "lane": lane,
+                "occupied_by_lane": existing.get("lane"),
+                "occupied_by_id": existing.get("id"),
+                "deliver_by": existing.get("deliver_by"),
+                "starvation_count": starvation[cooldown_key],
+            }
+        preempted = {"lane": existing.get("lane"), "id": existing.get("id")}
+
+    qid = f"qual-{lane}-{now.strftime('%Y%m%d')}"
+    if event_type == "lane_decay_silent":
+        ly = today_row.get("lane_yield", {}).get(lane, {})
+        question = (f"Hum's {lane} lane has shipped {event['surfaced_in_window']} "
+                    f"pings over {event['days_silent']} days and you haven't reacted to any. "
+                    f"What's not working — wrong picks, wrong moment, taste shift, "
+                    f"something else? (One-line answer is fine.)")
+        snapshot = {
+            "lane": lane,
+            "days_silent": event["days_silent"],
+            "surfaced_in_window": event["surfaced_in_window"],
+            "signal_per_surfaced": ly.get("signal_per_surfaced"),
+        }
+    elif event_type == "lane_decay_negative":
+        question = (f"Hum's {lane} lane keeps getting a thumbs-down — "
+                    f"{event['surfaced_in_window']} pings over the last "
+                    f"{event['window_days']} days, averaging "
+                    f"{event['mean_signal_per_surfaced']} signal per ping. "
+                    f"What's off? (One-line answer is fine.)")
+        snapshot = {
+            "lane": lane,
+            "surfaced_in_window": event["surfaced_in_window"],
+            "mean_signal_per_surfaced": event["mean_signal_per_surfaced"],
+            "window_days": event["window_days"],
+        }
+    elif event_type == "lane_decay_dark":
+        question = (f"Hum's {lane} lane has generated {event['candidates_in_window']} "
+                    f"candidates over the last {event['window_days']} days and none of them "
+                    f"reached you — still worth having, or something misfiring upstream? "
+                    f"(One-line answer is fine.)")
+        snapshot = {
+            "lane": lane,
+            "candidates_in_window": event["candidates_in_window"],
+            "window_days": event["window_days"],
+            "avg_candidates_per_day": event["avg_candidates_per_day"],
+        }
+    else:
+        question = (f"Hum's global signal score dropped {abs(int(event['delta_pct']*100))}% "
+                    f"over the last 3 days (today rolling avg {event['today_3d']} vs "
+                    f"7-day baseline {event['baseline_7d']}). Anything change for you "
+                    f"this week? (One-line is fine.)")
+        snapshot = {"delta_pct": event["delta_pct"], "today_3d": event["today_3d"],
+                   "baseline_7d": event["baseline_7d"]}
+
+    queued = {
+        "id": qid,
+        "category": "lane_diagnosis",
+        "lane": lane,
+        "metric_snapshot": snapshot,
+        "subject": f"hum {lane} decay",
+        "memory_hook": "hum_improvement_loop",
+        "question": question,
+        "delivered": False,
+        "queued_at": now.isoformat(),
+        # hum-deliver-qual drops the queue entry if it hasn't landed by here
+        # (a day-old decay diagnosis isn't worth the interruption).
+        "deliver_by": (now + timedelta(hours=24)).isoformat(),
+        "trigger_event": event,
+    }
+    write_json_atomic(QUAL_QUEUE, queued, indent=2)
+    cooldown[cooldown_key] = now.isoformat()
+    write_json_atomic(QUAL_COOLDOWN, cooldown, indent=2)
+    # This key got its turn -- its starvation streak (if any) ends here,
+    # regardless of what happens to the question after this point.
+    starvation = load_json(QUAL_STARVATION, {})
+    if starvation.get(cooldown_key):
+        starvation[cooldown_key] = 0
+        write_json_atomic(QUAL_STARVATION, starvation, indent=2)
+    result = {"queued": qid, "lane": lane}
+    if preempted:
+        result["preempted"] = preempted
+    return result
+
+
+def latest_qualitative_id_for_lane(lane, learnings):
+    """Return the `id` of the most recently ANSWERED qualitative-diagnosis
+    question for this lane -- the hum-learnings.jsonl row whose `subject` is
+    "hum <lane> decay" -- or None if the user has never answered one for this
+    lane. `id` matches 1:1 with the `evidence.qualitative_id` a
+    decay-triggered ideation run stamps onto the idea(s) it proposes (see
+    hum-improvement-ideation.md § Step 3), so this is the join key between
+    "what was answered" and "what was already proposed about it".
+
+    hum-learnings.jsonl is append-only and roughly chronological, but this
+    sorts explicitly on answered_at (falling back to asked_at for a row
+    that's missing it) rather than trusting file order -- a late-arriving
+    write could otherwise shadow a more recent answer.
+    """
+    subject = f"hum {lane} decay"
+    candidates = []
+    for r in learnings:
+        r = as_dict(r)
+        if r.get("subject") != subject or not r.get("id"):
+            continue
+        ts = r.get("answered_at") or r.get("asked_at") or ""
+        candidates.append((ts, r["id"]))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda pair: pair[0])
+    return candidates[-1][1]
+
+
+def find_blocking_idea(lane, qualitative_id, ideas_rows):
+    """Return the hum-improvement-ideas.jsonl row (dict) that makes a fresh
+    decay-triggered ideation dispatch for (lane, qualitative_id) redundant,
+    or None.
+
+    "Redundant" means: some prior ideation run already root-caused this
+    EXACT answered diagnosis (evidence.qualitative_id match) for this exact
+    lane, and the idea it produced is still open (status == "proposed") --
+    i.e. neither applied, abandoned, retired, nor already concluded
+    "no_change_recommended". A lane can pick up a fresh decay well after an
+    older diagnosis's fix has landed; once that idea's status moves off
+    "proposed" (applied / abandoned / retired) it stops blocking, and the
+    next matching decay is genuinely new information again.
+
+    ideas_rows is the append-only ledger in roughly chronological order;
+    when more than one open idea cites the same (lane, qualitative_id) --
+    which happens because each redundant dispatch used to write its own new
+    "proposed" row documenting the same finding -- the most recent one
+    (last in file order) is treated as the current standing proposal, since
+    that's the one the user would see referenced in the digest.
+    """
+    if not qualitative_id:
+        return None
+    match = None
+    for row in ideas_rows:
+        row = as_dict(row)
+        if row.get("lane") != lane or row.get("status") != "proposed":
+            continue
+        if as_dict(row.get("evidence")).get("qualitative_id") != qualitative_id:
+            continue
+        match = row
+    return match
+
+
+def bump_recurrence(idea_id, ideas_rows):
+    """Rewrite HUM_IMPROVEMENT_IDEAS, incrementing `recurrence_count` and
+    appending an ISO timestamp to `recurrence_dispatches` on the row whose
+    `id` matches idea_id. `ideas_rows` is the already-loaded in-memory list
+    (the same one find_blocking_idea() was called against) so the write
+    reflects exactly what was inspected, not a possibly-changed re-read.
+
+    Returns the new recurrence_count, or None if idea_id wasn't found in
+    ideas_rows (defensive -- the caller just found it in this same list, so
+    this should never miss in practice). No-ops the write in that case.
+    """
+    now = datetime.now(timezone.utc).isoformat()
+    new_count = None
+    out_rows = []
+    for row in ideas_rows:
+        row = as_dict(row)
+        if row.get("id") == idea_id:
+            new_count = row.get("recurrence_count", 0) + 1
+            row["recurrence_count"] = new_count
+            row.setdefault("recurrence_dispatches", []).append(now)
+        out_rows.append(row)
+    if new_count is None:
+        return None
+    with open(HUM_IMPROVEMENT_IDEAS, "w") as f:
+        for row in out_rows:
+            f.write(json.dumps(row) + "\n")
+    return new_count
+
+
+def run_dedup_check(lane):
+    """Entry point for `--dedup-check --lane <lane>`. Decides whether a
+    decay-triggered `HUM IMPROVEMENT IDEATION: decay <lane>` dispatch would
+    be redundant -- fired before the trigger script spends a full
+    xhigh-effort ops-agent turn to re-derive a conclusion already on
+    record. Called only after the caller has already confirmed the
+    qualitative question for this lane was answered (trigger-hum-metrics-
+    collect.sh Step 2); this re-derives which answer is the latest one and
+    checks whether it already produced a still-open idea.
+
+    On a hit: bumps that idea's recurrence counter (visible/auditable —
+    the redundancy still shows up, it just doesn't cost a turn) and tells
+    the caller to skip the dispatch. On a miss, or on ANY internal error,
+    tells the caller to dispatch as normal -- this check can only ever
+    suppress a turn, never silently swallow a genuinely new decay signal.
+    See hum-i-20260711-02 and hum-improvement-loop.md § Decay detection.
+    """
+    try:
+        learnings = load_jsonl(HUM_LEARNINGS)
+        qid = latest_qualitative_id_for_lane(lane, learnings)
+        if not qid:
+            return {"blocked": False, "lane": lane, "reason": "no_qualitative_answer_recorded"}
+        ideas_rows = load_jsonl(HUM_IMPROVEMENT_IDEAS)
+        blocker = find_blocking_idea(lane, qid, ideas_rows)
+        if not blocker:
+            return {"blocked": False, "lane": lane, "qualitative_id": qid}
+        new_count = bump_recurrence(blocker["id"], ideas_rows)
+        return {
+            "blocked": True,
+            "lane": lane,
+            "qualitative_id": qid,
+            "idea_id": blocker.get("id"),
+            "recurrence_count": new_count,
+        }
+    except Exception as e:
+        return {"blocked": False, "lane": lane, "reason": f"error:{e}"}
+
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("--date", help="Local date (YYYY-MM-DD), defaults to yesterday")
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--measure", action="store_true",
+                  help="Also run intervention attribution measurement")
+    p.add_argument("--backfill", action="store_true",
+                  help="Write the row (with decay_events) into state without "
+                       "dispatching qualitative-diagnosis questions -- for "
+                       "filling a historical gap without live side effects "
+                       "on a stale day (see hum-i-20260816-04)")
+    p.add_argument("--dedup-check", action="store_true",
+                  help="Check whether a decay-triggered ideation dispatch for "
+                       "--lane would be redundant against an already-open idea "
+                       "citing the same answered qualitative diagnosis; prints "
+                       "a JSON verdict and exits without collecting a day.")
+    p.add_argument("--lane", help="Lane name, required with --dedup-check")
+    args = p.parse_args()
+
+    if args.dedup_check:
+        if not args.lane:
+            print(json.dumps({"blocked": False, "reason": "missing --lane"}))
+            return
+        print(json.dumps(run_dedup_check(args.lane)))
+        return
+
+    tz = get_local_tz()
+    if args.date:
+        target = date.fromisoformat(args.date)
+    else:
+        target = (datetime.now(tz).date() - timedelta(days=1))
+
+    runs = load_jsonl(HUM_RUNS)
+    feedback = load_jsonl(HUM_FEEDBACK)
+    history = load_jsonl(SUGG_HISTORY)
+    state = load_json(METRICS_STATE, {"schema_version": 1, "daily": [],
+                                       "decay_events": [], "_comment": "hum metrics time series; canonical: data/hum-improvement-loop.md"})
+
+    row = collect_for_day(target, tz, runs, feedback, history)
+
+    # Compute rolling metrics relative to existing daily history.
+    other_daily = [r for r in state.get("daily", []) if r["date"] != row["date"]]
+    row["rolling_7d"] = compute_rolling(other_daily + [row],
+                                         date.fromisoformat(row["date"]), 7)
+    row["rolling_30d_baseline"] = compute_rolling(other_daily,
+        date.fromisoformat(row["date"]) - timedelta(days=7), 30)
+
+    # Decay detection runs against the not-yet-written state.
+    decay_events = detect_decay(state, row)
+    row["decay_events"] = decay_events
+
+    if args.json:
+        print(json.dumps(row, indent=2))
+        if args.dry_run:
+            return
+
+    if args.dry_run:
+        print(f"[dry-run] would write date={row['date']} signal_per_surfaced="
+              f"{row['signal_per_surfaced']} decay_events={len(decay_events)}", file=sys.stderr)
+        return
+
+    # Gap detection (hum-i-20260816-04): before writing today's row, check
+    # whether the collector's own history has a hole right before it. Not an
+    # outbound alert -- per agent/CLAUDE.md's watchdog-only-alerts rule
+    # and hum.md's "never ask the user to verify Jori's own state" (this is
+    # purely Jori's own internal bookkeeping) -- just a stderr line, which
+    # the trigger wrapper (trigger-hum-metrics-collect.sh) already redirects
+    # into data/logs/hum-metrics.log alongside every other line this
+    # script prints.
+    gap_days = detect_daily_gap(state.get("daily", []), target)
+    if gap_days:
+        print(f"[hum-metrics-collect] gap detected: no daily[] row for "
+              f"{', '.join(gap_days)} ({len(gap_days)} day"
+              f"{'s' if len(gap_days) != 1 else ''}) before writing {row['date']} "
+              f"-- prior run likely crashed before its write step; backfill with "
+              f"--date <date> --backfill once the cause is fixed",
+              file=sys.stderr)
+
+    # Zero-tick detection (hum-i-20260823-03): distinct from the gap check
+    # above -- that one catches a MISSING daily[] row (the collector never
+    # ran/wrote at all). This one catches a WRITTEN row where ticks==0 for
+    # the entire local day, i.e. trigger-hum.sh's ~72x/day */20min cron never
+    # once cleared a gate. Under the 2026-08-02 event-driven redesign a
+    # quiet day is plausible on its own, but a full 24h with not a single
+    # cleared gate has no precedent across the daily[] history (see
+    # 2026-08-20, the incident this exists to catch next time) -- worth
+    # being able to tell apart from "the trigger cron itself silently
+    # stopped running." Same non-outbound posture as the gap check: a
+    # stderr line only, which the trigger wrapper redirects into
+    # data/logs/hum-metrics.log. When hum was paused for most of the
+    # day (see DECAY_PAUSE_MIN_HOURS, reused from detect_decay's own
+    # mostly-paused guard) the zero is already explained, so the line notes
+    # that instead of reading as an unexplained gap.
+    if row.get("ticks", 0) == 0:
+        paused_hours = (row.get("context_flags") or {}).get("hum_paused_hours")
+        if paused_hours is not None and paused_hours >= DECAY_PAUSE_MIN_HOURS:
+            print(f"[hum-metrics-collect] zero ticks for {row['date']} -- "
+                  f"explained by hum_paused_hours={paused_hours}",
+                  file=sys.stderr)
+        else:
+            print(f"[hum-metrics-collect] zero ticks for {row['date']} -- "
+                  f"trigger-hum.sh's cron never cleared a gate all day; if this "
+                  f"recurs without a pause explaining it, check the trigger cron "
+                  f"is actually running (see hum-i-20260823-03)",
+                  file=sys.stderr)
+
+    # Merge into state.daily (replace if same date already present).
+    state["daily"] = [r for r in state.get("daily", []) if r["date"] != row["date"]]
+    state["daily"].append(row)
+    state["daily"].sort(key=lambda r: r["date"])
+    state["daily"] = state["daily"][-180:]  # keep last 180 days
+    # Append decay events to global log.
+    for ev in decay_events:
+        state.setdefault("decay_events", []).append(ev)
+    state["decay_events"] = state["decay_events"][-200:]  # keep last 200
+
+    with open(METRICS_STATE, "w") as f:
+        json.dump(state, f, indent=2)
+
+    # Queue a qualitative diagnosis question for each decay event (delivered at
+    # the next gated tick by bin/hum-deliver-qual). Skipped entirely in
+    # --backfill mode: a decay event derived from a stale historical day (e.g.
+    # filling a gap weeks after the fact) must never occupy the live
+    # QUAL_QUEUE/QUAL_COOLDOWN slot and eventually reach the user framed as a
+    # fresh diagnosis question about a day that's ancient history --
+    # hum-i-20260816-04 is a backfill fix, not a reason to re-trigger the
+    # live qualitative-question pipeline for weeks-old data.
+    if args.backfill:
+        if decay_events:
+            print(f"[hum-metrics-collect] backfill {row['date']}: "
+                  f"{len(decay_events)} decay_events recorded on the row, "
+                  f"qualitative-question dispatch skipped (--backfill)",
+                  file=sys.stderr)
+    else:
+        for ev in decay_events:
+            result = dispatch_qualitative_question(ev, row)
+            if result:
+                print(f"[hum-metrics-collect] decay {ev['type']} → {result}", file=sys.stderr)
+
+    if args.measure:
+        measure_open_interventions(row, state)
+
+
+def commit_time(sha):
+    """Committer time of `sha` in this clone as an aware datetime, or None.
+
+    Best-effort: a non-hex value, a sha this clone doesn't have, a missing
+    git binary or a slow git all return None (the caller then skips the row
+    and retries on the next run). The hex check keeps a ledger value from
+    ever reaching git as an option."""
+    if not isinstance(sha, str) or not (4 <= len(sha) <= 40) \
+            or not all(c in "0123456789abcdefABCDEF" for c in sha):
+        return None
+    try:
+        out = subprocess.run(
+            ["git", "-C", REPO_ROOT, "show", "-s", "--format=%cI", sha],
+            capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if out.returncode != 0:
+        return None
+    lines = (out.stdout or "").strip().splitlines()
+    return parse_iso(lines[0]) if lines else None
+
+
+def measure_open_interventions(today_row, state):
+    """For each open intervention whose measure_at has passed, compute the
+    7-day before/after deltas and append a measurement block. A missing
+    applied_at falls back to the commit's committer time (commit_time), a
+    missing measure_at to applied + MEASURE_WINDOW.
+
+    A lane-scoped intervention (r["lane"] set, e.g. "exercise") is measured
+    against that lane's OWN lane_yield[lane].signal_per_surfaced -- not the
+    top-level daily signal_per_surfaced, which blends in every other lane's
+    reactions. Scoring a lane-specific fix against the global signal means
+    its real effect is diluted by every other lane's noise and can never be
+    distinguished from a global-scope intervention (hum-i-20260705-03: two
+    exercise-scoped interventions carried byte-identical measurement blocks
+    to two lane:None ones, because both paths read the same top-level key).
+    Global (lane:None) interventions are unaffected -- they keep reading the
+    top-level signal_per_surfaced exactly as before.
+
+    A row whose commit hasn't actually landed is skipped outright, even if
+    applied_at + measure_at have both passed. "commit" is None for a row
+    still sitting at status="awaiting_approval" (staged, not yet signed off
+    -- these also lack applied_at today, so the applied_at guard below would
+    catch them anyway) and the literal string "pending" for a handful of
+    legacy rows (hum-i-20260520-02/03/04) that got applied_at stamped without
+    ever having a real commit sha backfilled. Measuring either shape scores
+    ambient drift over the window and stamps it as a verdict on a hypothesis
+    that was never actually tested -- confirmed 2026-08-28: all three
+    "pending" rows carried a measurement block byte-identical to -01's (which
+    did ship)."""
+    rows = load_jsonl(INTERVENTIONS)
+    if not rows:
+        return
+    now = datetime.now(timezone.utc)
+    daily = state.get("daily", [])
+    updated = False
+    for r in rows:
+        if r.get("measurement"):
+            continue  # already measured
+        if r.get("commit") in (None, "pending"):
+            continue  # not actually shipped -- no commit sha yet, nothing to measure
+        # A shipped row may lack applied_at and/or measure_at (an executor
+        # turn that never wrote them). Fall back to the commit's own time and
+        # applied + MEASURE_WINDOW rather than skipping the row forever. The
+        # row's own fields are not rewritten.
+        applied = parse_iso(r.get("applied_at")) or commit_time(r.get("commit"))
+        if not applied:
+            continue
+        measure_at = parse_iso(r.get("measure_at")) or applied + MEASURE_WINDOW
+        if now < measure_at:
+            continue
+        # Compare 7d before applied_at vs 7d after.
+        applied_date = applied.astimezone(get_local_tz()).date()
+        before_window = [d for d in daily
+                        if d["date"] >= (applied_date - timedelta(days=7)).isoformat()
+                        and d["date"] < applied_date.isoformat()]
+        after_window = [d for d in daily
+                       if d["date"] >= applied_date.isoformat()
+                       and d["date"] < (applied_date + timedelta(days=7)).isoformat()]
+        # For a lane-scoped intervention, pull each day's value from that
+        # lane's own lane_yield entry instead of the top-level (all-lanes)
+        # signal_per_surfaced. Mirrors the None-tolerant shape of lane_yield
+        # lookups elsewhere in this file (e.g. detect_decay's per-lane walk):
+        # a day with no lane_yield entry for this lane, or a lane_yield entry
+        # missing signal_per_surfaced, degrades to None and falls out of the
+        # mean below -- same graceful-degradation behavior `mean()` already
+        # has for a plain missing/None top-level value.
+        lane = r.get("lane")
+
+        def lane_sps(d):
+            if not lane:
+                return d.get("signal_per_surfaced")
+            return as_dict(as_dict(d.get("lane_yield")).get(lane)).get("signal_per_surfaced")
+
+        def mean(rows):
+            vals = [v for v in (lane_sps(d) for d in rows) if v is not None]
+            return sum(vals) / len(vals) if vals else None
+        before_sps = mean(before_window)
+        after_sps = mean(after_window)
+        delta_sps = None
+        if before_sps is not None and after_sps is not None:
+            delta_sps = round(after_sps - before_sps, 3)
+        # Verdict
+        verdict = "inconclusive"
+        if delta_sps is not None:
+            if delta_sps > 0.05:
+                verdict = "positive"
+            elif delta_sps < -0.05:
+                verdict = "negative"
+            else:
+                verdict = "neutral"
+        r["measurement"] = {
+            "after_window": {"start": after_window[0]["date"] if after_window else None,
+                            "end": after_window[-1]["date"] if after_window else None,
+                            "n_days": len(after_window)},
+            "before_window": {"start": before_window[0]["date"] if before_window else None,
+                             "end": before_window[-1]["date"] if before_window else None,
+                             "n_days": len(before_window)},
+            "before_signal_per_surfaced": round(before_sps, 3) if before_sps is not None else None,
+            "after_signal_per_surfaced": round(after_sps, 3) if after_sps is not None else None,
+            "delta_signal_per_surfaced": delta_sps,
+            "verdict": verdict,
+            "measured_at": now.isoformat(),
+        }
+        updated = True
+        print(f"[hum-metrics-collect] measured intervention {r['id']}: {verdict} (Δ={delta_sps})",
+              file=sys.stderr)
+    if updated:
+        with open(INTERVENTIONS, "w") as f:
+            for r in rows:
+                f.write(json.dumps(r) + "\n")
+
+
+if __name__ == "__main__":
+    main()

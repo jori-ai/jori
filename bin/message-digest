@@ -1,0 +1,88 @@
+#!/usr/bin/env node
+// message-digest — summarize the day's iMessage / WhatsApp / Slack
+// conversations (lib/message-digest.mjs), and the group-chat topics worth
+// raising on a recurring meeting's next call (lib/meetings.mjs).
+//
+// Runs from launchd (the Max login `claude -p` needs is only readable from
+// the GUI session, never from cron): a few times a day for `day`, and from a
+// meeting's `topics_agent`, kicked at T-40 by its reminder, for `topics`.
+//
+// Usage:
+//   message-digest [day] [--date YYYY-MM-DD] [--dry-run]
+//       default date: the user's local today, or yesterday before 05:00 (that
+//       run finalizes the day the 04:00 daily summary reads)
+//   message-digest topics [<meeting-id>] [--force] [--dry-run]
+//   message-digest <meeting-id> [--force] [--dry-run]      the same, by the meeting's id
+//       only when the meeting's state file has a call today starting within 2h
+//       (--force: any time). No meeting configured: says so and exits 0.
+//   message-digest show [--date YYYY-MM-DD]     print the stored Markdown digest
+import fs from "node:fs";
+import path from "node:path";
+import { execFileSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
+import { createRequire } from "node:module";
+import { buildDayDigest, writeDigest, buildMeetingTopics, DIGEST_DIR } from "../lib/message-digest.mjs";
+import { toDiscussItems } from "../lib/meeting-reminder.mjs";
+import { meeting, meetings, statePath, notesPath } from "../lib/meetings.mjs";
+
+const require = createRequire(import.meta.url);
+const { dayWindow } = require("../lib/day-window.js");
+const { instance } = require("../lib/instance.cjs");
+const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const argv = process.argv.slice(2);
+const positional = argv.filter((a, i) => !a.startsWith("--") && !(i > 0 && argv[i - 1] === "--date"));
+const cmd = positional[0] || "day";
+const opt = (k) => (argv.includes(k) ? argv[argv.indexOf(k) + 1] : undefined);
+const dryRun = argv.includes("--dry-run");
+const log = (s) => console.log(`${new Date().toISOString()} ${s}`);
+
+function localDay() {
+  try {
+    return JSON.parse(execFileSync(process.execPath, [path.join(ROOT, "bin/local-day"), "--json"], { encoding: "utf8", timeout: 20000, stdio: ["ignore", "pipe", "ignore"] }));
+  } catch {
+    const tz = instance().tz;
+    const today = new Intl.DateTimeFormat("en-CA", { timeZone: tz }).format(new Date());
+    return { tz, today, yesterday: null, hour: 12 };
+  }
+}
+
+async function day() {
+  const ld = localDay();
+  const date = opt("--date") || (ld.hour < 5 && ld.yesterday ? ld.yesterday : ld.today);
+  const d = await buildDayDigest({ date, tz: ld.tz, dayWindow });
+  if (dryRun) return console.log(JSON.stringify(d, null, 2));
+  const file = writeDigest(d);
+  log(`day ${date} tz=${ld.tz} conversations=${d.counts.conversations} messages=${d.counts.messages} errors=${Object.keys(d.errors).join(",") || "none"} → ${file}`);
+}
+
+async function topics(id) {
+  const m = meeting(id || null);
+  if (!m) return log(`topics: no recurring meeting configured${id ? ` with id ${id}` : ""} (agent/local/config/meetings.json) — nothing to do`);
+  let state = null;
+  try { state = JSON.parse(fs.readFileSync(statePath(m), "utf8")); } catch {}
+  const now = Date.now(), start = Number(state?.epoch_start) * 1000;
+  const soon = Number.isFinite(start) && start > now && start - now <= 2 * 3600_000;
+  if (!soon && !argv.includes("--force")) return log(`${m.id}: no call within 2h (status=${state?.status || "none"})`);
+  let agenda = [];
+  try { agenda = toDiscussItems(fs.readFileSync(notesPath(m), "utf8")).map((i) => i.text.split("**").join("")); } catch {}
+  const t = await buildMeetingTopics({ callEpoch: state?.epoch_start ?? null, tz: localDay().tz, agenda, with: m.name, context: m.topics_context || "" });
+  if (dryRun) return console.log(JSON.stringify(t, null, 2));
+  const file = m.paths.topics;
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(`${file}.tmp`, JSON.stringify(t, null, 2));
+  fs.renameSync(`${file}.tmp`, file);
+  log(`${m.id}: call_epoch=${t.call_epoch} groups=${t.groups} topics=${t.topics.length}`);
+}
+
+function show() {
+  const date = opt("--date") || localDay().today;
+  try { process.stdout.write(fs.readFileSync(path.join(DIGEST_DIR, `${date}.md`), "utf8")); }
+  catch { console.error(`no digest for ${date}`); process.exit(1); }
+}
+
+const commands = { day, show, topics: () => topics(positional[1]) };
+let run = commands[cmd];
+// A meeting's id works as the command, so its topics agent can say `message-digest <id>`.
+if (!run && meetings().some((m) => m.id === cmd)) run = () => topics(cmd);
+if (!run) { console.error(`unknown command: ${cmd}`); process.exit(2); }
+Promise.resolve(run()).catch((e) => { log(`${cmd} failed: ${e.message}`); process.exit(1); });

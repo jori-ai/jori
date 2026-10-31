@@ -1,0 +1,47 @@
+#!/usr/bin/env node
+"use strict";
+// gdate — deterministic date / day-of-week CLI, anchored to the installation's
+// home time zone (instance().tz).
+// Use this for ANY date question. Never compute a weekday or relative date by
+// hand — call gdate and quote what it prints. See lib/gdate.js for why.
+//
+// Usage:
+//   gdate                         today's local date + weekday
+//   gdate <expr>                  resolve expr → "YYYY-MM-DD Weekday"
+//        expr: today | tomorrow | yesterday | +Nd | -Nd | +Nw | -Nw
+//              | next|last|this <weekday> | <weekday> | YYYY-MM-DD
+//   gdate dow <YYYY-MM-DD>        just the weekday name of a date
+//   gdate add <YYYY-MM-DD> <n>    date plus n days
+//   gdate diff <isoA> <isoB>      whole-day difference B - A (integer)
+//   gdate --json [expr]           structured: {iso, weekday, dow_num, is_today, days_from_today, tz}
+//
+// Exit 0 on success, 1 on a parse/validation error (message on stderr).
+
+const g = require("../lib/gdate.js");
+
+function out(s) { process.stdout.write(s + "\n"); }
+function fail(e) { process.stderr.write(`gdate: ${e.message || e}\n`); process.exit(1); }
+
+try {
+  const args = process.argv.slice(2);
+  const json = args.includes("--json");
+  const rest = args.filter((a) => a !== "--json");
+  const [cmd, ...params] = rest;
+
+  if (cmd === "dow") {
+    if (!params[0]) throw new Error("usage: gdate dow <YYYY-MM-DD>");
+    out(json ? JSON.stringify({ iso: g.assertISO(params[0]), weekday: g.dow(params[0]) }) : g.dow(params[0]));
+  } else if (cmd === "add") {
+    if (!params[0] || params[1] == null) throw new Error("usage: gdate add <YYYY-MM-DD> <n>");
+    const iso = g.addDays(params[0], params[1]);
+    out(json ? JSON.stringify(g.describe(iso)) : `${iso} ${g.dow(iso)}`);
+  } else if (cmd === "diff") {
+    if (!params[0] || !params[1]) throw new Error("usage: gdate diff <isoA> <isoB>");
+    out(String(g.diffDays(params[0], params[1])));
+  } else {
+    // default: resolve an expression (or today)
+    const d = g.describe(rest.join(" ").trim() || "today");
+    if (json) { out(JSON.stringify(d)); }
+    else { out(`${d.iso} ${d.weekday}${d.is_today ? " (today)" : ""}`); }
+  }
+} catch (e) { fail(e); }

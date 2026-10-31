@@ -1,0 +1,36 @@
+#!/usr/bin/env node
+// jori-messages-search — semantic search over jori_messages using the
+// pgvector column populated by bin/embed-messages.
+//
+// Usage:
+//   jori-messages-search "what did I ask about Broadway?"
+//   jori-messages-search "LDL results" --k 5 --role user --since 2026-01-01
+//
+// Output: JSON array of { id, role, content, created_at, similarity }.
+// Rows without embeddings are invisible to this search — run embed-messages
+// first if a recent message isn't appearing.
+//
+// Thin CLI over lib/chat-recall.mjs#searchChat (the shared, fail-soft
+// primitive the unified `recall` path + hum also use). Default role is null
+// here (search both roles) to preserve this CLI's historical behavior.
+
+import { searchChat } from "../lib/chat-recall.mjs";
+
+const raw = process.argv.slice(2);
+const pos = [];
+const opts = { k: 10, role: null, since: null };
+for (let i = 0; i < raw.length; i++) {
+  const a = raw[i];
+  if (a === "--k") opts.k = Number(raw[++i]);
+  else if (a === "--role") opts.role = raw[++i];
+  else if (a === "--since") opts.since = raw[++i];
+  else pos.push(a);
+}
+const query = pos.join(" ").trim();
+if (!query) {
+  console.error('usage: jori-messages-search "query text" [--k 10] [--role user|assistant] [--since YYYY-MM-DD]');
+  process.exit(2);
+}
+
+const rows = await searchChat(query, { k: opts.k, role: opts.role, since: opts.since });
+process.stdout.write(JSON.stringify(rows, null, 2) + "\n");

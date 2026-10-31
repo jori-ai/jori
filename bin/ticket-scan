@@ -1,0 +1,503 @@
+#!/usr/bin/env python3
+"""ticket-scan — every listing for an event in one pass, with seats, positions and a value frontier.
+
+Requirement: find the best tickets with a single search. The purchase job
+used to page through Ticketmaster's list (40 of 105 at a time), click each listing to
+learn its seats and hand-draw rings on a screenshot: 14 minutes for one show.
+
+This is the deterministic half (Rule #0b: code owns geometry). It never decides which
+seats are "good"; it measures. The job's model picks the options from the frontier.
+
+  ticket-scan scan <event-url> --qty N [--out scan.json]
+      Opens the event in its OWN tab of the shop Chrome (CDP :9224; the job's working
+      tab is left alone), dismisses the all-in-pricing notice, scrolls the listing panel
+      to the end and reads every listing once (section, row, all-in price per ticket,
+      flags, listing id). The listing id carries the first seat's place id; the venue's
+      public seat geometry (the file the page itself loads) turns that into seat numbers
+      and an x/y position, so nothing is clicked. Each listing gets: the N adjacent seats,
+      total for N, distance to the stage and angle off the centre line (both from the
+      geometry), and `frontier: true` when no other listing is both cheaper-or-equal and
+      closer (obstructed/limited-view listings never sit on the frontier).
+  ticket-scan shot --scan scan.json --pick <id> [--seats 38,40] [--out shot.png] [--upload]
+      Ticketmaster's OWN seat chart with the listing selected (the site highlights
+      the section) and the exact seats ringed in red under "Your seats" (each seat
+      on the chart carries the same place id the scan has): the approval sheet must
+      show where the seats are on the site's own chart. Use this for the approval
+      sheet. A quick-picks listing (seats unknown) rings its row and says "Your row";
+      pass --seats with the numbers read off the opened listing to ring exactly those.
+  ticket-scan map --scan scan.json --pick <id>[,<id>...] [--out map.png] [--upload]
+      Draws the venue from the geometry: every seat a dot, seats on sale tinted, the
+      picked listings ringed and numbered 1..k in the order given, stage marked.
+      2400px wide so it stays sharp when zoomed in the app. --upload prints the URL
+      (bin/shop-snap).
+
+Ticketmaster only, today. Exit 0 ok, 2 usage / page not understood, 3 no listings.
+"""
+import base64, json, math, os, re, subprocess, sys, time, urllib.parse, urllib.request
+import websocket
+
+PORT = 9224
+REPO = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+
+
+def upload(out):
+    """Upload a shot through bin/shop-snap and return its URL; the local path when that tool is absent."""
+    snap = os.path.join(REPO, "bin/shop-snap")
+    if not os.path.exists(snap):
+        print("ticket-scan: no bin/shop-snap here, so --upload keeps the file local", file=sys.stderr)
+        return out
+    return subprocess.run([snap, out], check=True, capture_output=True, text=True).stdout.strip()
+UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/155.0.0.0 Safari/537.36"
+
+
+def die(msg, code=2):
+    print(f"ticket-scan: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def flag(args, name, default=None):
+    return args[args.index(name) + 1] if name in args and args.index(name) + 1 < len(args) else default
+
+
+class Tab:
+    """A private tab in the shop Chrome, closed on exit."""
+    def __init__(self):
+        req = urllib.request.Request(f"http://localhost:{PORT}/json/new?about:blank", method="PUT")
+        self.tab = json.loads(urllib.request.urlopen(req, timeout=20).read())
+        self.ws = websocket.create_connection(self.tab["webSocketDebuggerUrl"], timeout=60, suppress_origin=True)
+        self.n = 0
+
+    def call(self, method, params=None, timeout=60):
+        self.n += 1
+        mid = self.n
+        self.ws.send(json.dumps({"id": mid, "method": method, "params": params or {}}))
+        end = time.time() + timeout
+        while time.time() < end:
+            self.ws.settimeout(max(1, end - time.time()))
+            try:
+                msg = json.loads(self.ws.recv())
+            except websocket.WebSocketTimeoutException:
+                continue
+            if msg.get("id") == mid:
+                if "error" in msg:
+                    raise RuntimeError(f"{method}: {msg['error']}")
+                return msg.get("result", {})
+        raise TimeoutError(method)
+
+    def js(self, expr, timeout=60):
+        r = self.call("Runtime.evaluate", {"expression": expr, "returnByValue": True, "awaitPromise": True}, timeout)
+        if r.get("exceptionDetails"):
+            raise RuntimeError("page JS failed: " + json.dumps(r["exceptionDetails"])[:300])
+        return r.get("result", {}).get("value")
+
+    def close(self):
+        try:
+            self.ws.close()
+        finally:
+            try:
+                urllib.request.urlopen(f"http://localhost:{PORT}/json/close/{self.tab['id']}", timeout=10)
+            except Exception:
+                pass
+
+
+# ── reading the page ────────────────────────────────────────────────────────
+
+# Runs in the page. Clicks only the "Accept & Continue" notice (no purchase control),
+# scrolls the listing panel until the count stops growing, returns every listing row.
+READ_LISTINGS = r"""
+(async () => {
+  const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+  // Two layouts: the seat-map list (li[data-listing-id], first seat's place id in
+  // the id) and the older "quick picks" list (li[data-bdd^=quick-picks-list-item],
+  // section/row/price only).
+  const ROWS = '[data-listing-id], li[data-bdd^="quick-picks-list-item"]';
+  for (let i = 0; i < 40 && !document.querySelector(ROWS); i++) await sleep(500);
+  const accept = [...document.querySelectorAll('button')].find(b => /^\s*(Accept\s*&\s*Continue|I\s*Agree|Accept)\s*$/i.test(b.innerText || ''));
+  if (accept) { accept.click(); await sleep(800); }  // the all-in pricing notice ("Accept & Continue" / "I Agree")
+  const first = document.querySelector(ROWS);
+  if (!first) return {error: 'no listings on the page', text: document.body.innerText.slice(0, 600)};
+  let box = first.parentElement;
+  while (box && !(box.scrollHeight > box.clientHeight + 10 && /(auto|scroll)/.test(getComputedStyle(box).overflowY))) box = box.parentElement;
+  const header = (document.body.innerText.match(/(\d+)\s+Results/) || [])[1];
+  const qtyBtn = [...document.querySelectorAll('button')].map(b => b.innerText.trim()).find(t => /^\d+\s+Tickets?$/i.test(t));
+  const seen = new Map();
+  let stable = 0;
+  for (let i = 0; i < 80 && stable < 4; i++) {
+    const before = seen.size;
+    document.querySelectorAll(ROWS).forEach(el => {
+      const text = (el.innerText || '').replace(/\s+/g, ' ').trim();
+      const id = el.getAttribute('data-listing-id') || ('qp:' + text.slice(0, 60) + ':' + (el.getAttribute('data-price') || ''));
+      if (!seen.has(id)) seen.set(id, {id, label: el.getAttribute('aria-label') || '', text, index: el.getAttribute('data-index') || null});
+    });
+    stable = seen.size === before ? stable + 1 : 0;
+    if (box) box.scrollTop = box.scrollHeight; else window.scrollBy(0, 2000);
+    await sleep(450);
+  }
+  return {results: header ? Number(header) : null, qty: qtyBtn || null, rows: [...seen.values()]};
+})()
+"""
+
+
+def event_id_from(url):
+    m = re.search(r"/event/([0-9A-Fa-f]{16})", url)  # lang-regex-ok: Ticketmaster URL structure
+    if not m:
+        die("not a Ticketmaster event URL (…/event/<16 hex>)")
+    return m.group(1).upper()
+
+
+def fetch_geometry(event_id):
+    u = (f"https://mapsapi.tmol.io/maps/geometry/3/event/{event_id}/placeDetailNoKeys"
+         "?useHostGrids=true&app=CCP&sectionLevel=true&systemId=HOST")
+    req = urllib.request.Request(u, headers={"User-Agent": UA})
+    return json.loads(urllib.request.urlopen(req, timeout=30).read())
+
+
+def index_geometry(geo):
+    """place id -> seat; row key -> ordered seats; stage point; seat bounds."""
+    places, rows, labels = {}, {}, []
+    page = geo["pages"][0]
+
+    def walk(seg, section, human=None):
+        name = (seg.get("name") or "").replace("\r", " ").strip()
+        cat = seg.get("segmentCategory")
+        if cat == "COMPOSITE":
+            human = name.title() or human
+        if cat == "SECTION" or (cat == "COMPOSITE" and not section):
+            section = name or section
+        for sh in seg.get("shapes") or []:
+            for lab in sh.get("labels") or []:
+                labels.append((lab.get("text") or "", lab.get("x"), lab.get("y")))
+        if seg.get("placesNoKeys"):
+            key = f"{section}|{name}"
+            seats = []
+            for p in seg["placesNoKeys"]:
+                pid, num, x, y = p[0], p[1], p[2], p[3]
+                order = p[5] if len(p) > 5 else len(seats)
+                s = {"place": pid, "section": section, "section_name": human or section, "row": name, "seat": num, "x": x, "y": y, "order": order, "rowkey": key}
+                places[pid] = s
+                seats.append(s)
+            rows[key] = sorted(seats, key=lambda s: s["order"])
+        for sub in seg.get("segments") or []:
+            walk(sub, section, human)
+
+    for seg in page.get("segments") or []:
+        walk(seg, None)
+    for sh in page.get("shapes") or []:
+        for lab in sh.get("labels") or []:
+            labels.append((lab.get("text") or "", lab.get("x"), lab.get("y")))
+    stage = next(((x, y) for t, x, y in labels if "STAGE" in t.upper() and x is not None), None)
+    xs = [s["x"] for s in places.values()]
+    ys = [s["y"] for s in places.values()]
+    if not places:
+        die("seat geometry has no seats for this event")
+    bounds = (min(xs), min(ys), max(xs), max(ys))
+    if stage is None:
+        # No label: the stage is the open side of the seat bowl; use the far-left midpoint
+        # (Ticketmaster draws stages on the left) and say so in the output.
+        stage = (bounds[0] - 0.08 * (bounds[2] - bounds[0]), (bounds[1] + bounds[3]) / 2)
+    return places, rows, stage, bounds, labels
+
+
+def parse_row(r):
+    """Price, section and row from a listing's own text (page structure, not language)."""
+    text = r["text"] + " " + r["label"]
+    prices = [float(p.replace(",", "")) for p in re.findall(r"\$([\d,]+(?:\.\d\d)?)", text)]  # lang-regex-ok: price format
+    flags = [f for f in ("OBSTRUCTED VIEW", "LIMITED VIEW", "PARTIAL VIEW", "RESALE", "PLATINUM", "VIP", "ACCESSIBLE")
+             if f in text.upper()]
+    return (prices[-1] if prices else None), flags
+
+
+def place_of(listing_id, places):
+    # Listing ids look like UBALC4-F-KVBECTCDGQ5EMORUGY-: section-row-firstPlace-.
+    for part in listing_id.split("-"):
+        if part in places:
+            return places[part]
+    return None
+
+
+def row_of(r, rows):
+    """Quick-picks rows carry no place id: 'Sec UBALC1 • Row M' -> that row's seats."""
+    m = re.search(r"Sec\s+(\S+)\s*\u2022\s*Row\s+(\S+)", r["text"] + " " + r["label"])  # lang-regex-ok: listing label structure
+    return rows.get(f"{m.group(1)}|{m.group(2)}") if m else None
+
+
+def adjacent(first, rows, qty):
+    row = rows.get(first["rowkey"]) or [first]
+    i = next((k for k, s in enumerate(row) if s["place"] == first["place"]), 0)
+    return row[i:i + qty] if i + qty <= len(row) else row[max(0, len(row) - qty):]
+
+
+def scan(args):
+    if len(args) < 2:
+        die("usage: ticket-scan scan <event-url> --qty N [--out scan.json]")
+    url, qty = args[1], int(flag(args, "--qty", "2"))
+    out = flag(args, "--out", f"/tmp/ticket-scan-{event_id_from(url)}.json")
+    eid = event_id_from(url)
+    t0 = time.time()
+    geo = fetch_geometry(eid)
+    places, rows, stage, bounds, _ = index_geometry(geo)
+    tab = Tab()
+    try:
+        tab.call("Page.enable")
+        tab.call("Page.navigate", {"url": url})
+        page = tab.js(READ_LISTINGS, timeout=120)
+    finally:
+        tab.close()
+    if not page or page.get("error"):
+        die(f"{(page or {}).get('error', 'page not understood')}: {(page or {}).get('text', '')[:300]}")
+    qty_on_page = page.get("qty")
+    listings, unmatched = [], 0
+    for r in page["rows"]:
+        price, flags = parse_row(r)
+        first = place_of(r["id"], places)
+        known = first is not None
+        if not known:
+            row = row_of(r, rows)
+            first = row[len(row) // 2] if row else None
+        if first is None or price is None:
+            unmatched += 1
+            continue
+        # Without a place id the seats are unknown until the listing is opened:
+        # place the pair by its whole row.
+        seats = adjacent(first, rows, qty) if known else rows[first["rowkey"]]
+        cx = sum(s["x"] for s in seats) / len(seats)
+        cy = sum(s["y"] for s in seats) / len(seats)
+        dist = math.hypot(cx - stage[0], cy - stage[1])
+        # Angle off the line from the stage through the middle of the seating.
+        mid = ((bounds[0] + bounds[2]) / 2, (bounds[1] + bounds[3]) / 2)
+        a1 = math.atan2(mid[1] - stage[1], mid[0] - stage[0])
+        a2 = math.atan2(cy - stage[1], cx - stage[0])
+        off = abs(math.degrees((a2 - a1 + math.pi) % (2 * math.pi) - math.pi))
+        listings.append({
+            "id": r["id"], "row_index": r.get("index"), "section": first["section"], "section_name": first["section_name"], "row": first["row"],
+            "seats": [s["seat"] for s in seats] if known else [], "seats_known": known,
+            "places": [s["place"] for s in seats],
+            "price_each": price, "total": round(price * qty, 2), "flags": flags,
+            "stage_distance": round(dist), "off_centre_deg": round(off, 1), "x": round(cx), "y": round(cy),
+        })
+    if not listings:
+        die(f"no listings matched the seat map ({len(page['rows'])} read, {unmatched} unmatched)", 3)
+    # Distance as a share of the hall's depth, for the model to read.
+    far = max(l["stage_distance"] for l in listings) or 1
+    for l in listings:
+        l["depth_pct"] = round(100 * l["stage_distance"] / far)
+    clear = [l for l in listings if not any(f in l["flags"] for f in ("OBSTRUCTED VIEW", "LIMITED VIEW", "PARTIAL VIEW"))]
+    for l in listings:
+        l["frontier"] = l in clear and not any(
+            o is not l and o["total"] <= l["total"] and o["stage_distance"] < l["stage_distance"] for o in clear)
+    listings.sort(key=lambda l: (l["total"], l["stage_distance"]))
+    result = {
+        "event_url": url, "event_id": eid, "qty": qty, "qty_on_page": qty_on_page,
+        "results_on_page": page.get("results"), "listings_read": len(page["rows"]),
+        "listings_matched": len(listings), "unmatched": unmatched, "stage": stage,
+        "seconds": round(time.time() - t0, 1), "listings": listings,
+        "frontier": [l["id"] for l in listings if l["frontier"]],
+    }
+    json.dump(result, open(out, "w"), indent=1)
+    print(json.dumps({k: v for k, v in result.items() if k != "listings"}
+                     | {"out": out, "frontier_rows": [l for l in listings if l["frontier"]]}, indent=1))
+    if qty_on_page and not qty_on_page.startswith(f"{qty} "):
+        print(f"ticket-scan: WARNING the page is set to '{qty_on_page}', not {qty}; prices/listings are for that quantity",
+              file=sys.stderr)
+
+
+# ── drawing the map ─────────────────────────────────────────────────────────
+
+MAP_HTML = r"""<!doctype html><html><body style="margin:0;background:#fff">
+<canvas id="c"></canvas><script>
+const D = __DATA__;
+const W = 2400, pad = 120, [x0, y0, x1, y1] = D.bounds;
+const s = (W - 2 * pad) / (x1 - x0), H = Math.round((y1 - y0) * s + 2 * pad + 140);
+const c = document.getElementById('c'); c.width = W; c.height = H;
+const g = c.getContext('2d'); g.fillStyle = '#fff'; g.fillRect(0, 0, W, H);
+const X = x => pad + (x - x0) * s, Y = y => pad + 140 + (y - y0) * s;
+const r = Math.max(2.2, Math.min(7, 16 * s));
+for (const p of D.seats) { g.beginPath(); g.arc(X(p[0]), Y(p[1]), r, 0, 7); g.fillStyle = p[2] ? '#8fb3ff' : '#dcdcdc'; g.fill(); }
+g.fillStyle = 'rgba(60,60,60,0.55)'; g.font = 'bold 26px -apple-system,Helvetica'; g.textAlign = 'center'; g.textBaseline = 'middle';
+for (const [t, lx, ly] of D.labels) { const ls = t.split('\n'); ls.forEach((ln, k) => g.fillText(ln, X(lx), Y(ly) + (k - (ls.length - 1) / 2) * 30)); }
+const [sx, sy] = D.stage;
+g.fillStyle = '#222'; g.font = 'bold 44px -apple-system,Helvetica'; g.textAlign = 'center'; g.textBaseline = 'middle';
+g.save(); g.translate(Math.max(60, X(sx)), Y(sy)); g.rotate(-Math.PI / 2); g.fillText('STAGE', 0, 0); g.restore();
+const col = ['#e0245e', '#f57c00', '#2e7d32', '#6a1b9a', '#00838f', '#5d4037'];
+D.picks.forEach((pk, i) => {
+  const cl = col[i % col.length];
+  for (const q of pk.pts) { g.beginPath(); g.arc(X(q[0]), Y(q[1]), r * 2.6, 0, 7); g.lineWidth = 5; g.strokeStyle = cl; g.stroke(); }
+  const cx = pk.pts.reduce((a, q) => a + X(q[0]), 0) / pk.pts.length, cy = Math.min(...pk.pts.map(q => Y(q[1]))) - r * 2.6 - 40;
+  g.beginPath(); g.arc(cx, cy, 30, 0, 7); g.fillStyle = cl; g.fill();
+  g.fillStyle = '#fff'; g.font = 'bold 36px -apple-system,Helvetica'; g.fillText(String(i + 1), cx, cy + 1);
+});
+g.textAlign = 'left'; g.font = '34px -apple-system,Helvetica'; let lx = pad, ly = 50;
+D.picks.forEach((pk, i) => { g.fillStyle = col[i % col.length]; const t = `${i + 1}  ${pk.label}`; if (lx + g.measureText(t).width > W - pad) { lx = pad; ly += 44; } g.fillText(t, lx, ly); lx += g.measureText(t).width + 60; });
+document.title = 'ready:' + W + 'x' + H;
+</script></body></html>"""
+
+
+def draw(args):
+    scan_file, pick = flag(args, "--scan"), flag(args, "--pick")
+    if not scan_file or not pick:
+        die("usage: ticket-scan map --scan scan.json --pick <id>[,<id>...] [--out map.png] [--upload]")
+    sc = json.load(open(scan_file))
+    by_id = {l["id"]: l for l in sc["listings"]}
+    ids = [p for p in pick.split(",") if p]
+    missing = [p for p in ids if p not in by_id]
+    if missing:
+        die(f"not in the scan: {', '.join(missing)}")
+    places, rows, stage, bounds, labels = index_geometry(fetch_geometry(sc["event_id"]))
+    on_sale = {p for l in sc["listings"] for p in l["places"]}
+    picks = []
+    for pid in ids:
+        l = by_id[pid]
+        picks.append({"pts": [[places[p]["x"], places[p]["y"]] for p in l["places"] if p in places],
+                      "label": f"{l.get('section_name') or l['section']}, row {l['row']}: ${l['total']:,.0f}"})
+    data = {"bounds": bounds, "stage": stage, "picks": picks,
+            "labels": [[t.replace("\r", "\n"), x, y] for t, x, y in labels if t and x is not None and "STAGE" not in t.upper()],
+            "seats": [[s["x"], s["y"], 1 if s["place"] in on_sale else 0] for s in places.values()]}
+    html = MAP_HTML.replace("__DATA__", json.dumps(data))
+    out = flag(args, "--out", f"/tmp/ticket-map-{sc['event_id']}.png")
+    path = out + ".html"
+    open(path, "w").write(html)
+    tab = Tab()
+    try:
+        tab.call("Page.enable")
+        tab.call("Page.navigate", {"url": "file://" + path})
+        for _ in range(40):
+            t = tab.js("document.title") or ""
+            if t.startswith("ready:"):
+                break
+            time.sleep(0.25)
+        w, h = (int(v) for v in t.split(":")[1].split("x"))
+        tab.call("Emulation.setDeviceMetricsOverride", {"width": w, "height": h, "deviceScaleFactor": 1, "mobile": False})
+        shot = tab.call("Page.captureScreenshot", {"format": "png", "clip": {"x": 0, "y": 0, "width": w, "height": h, "scale": 1}})
+    finally:
+        tab.close()
+    open(out, "wb").write(base64.b64decode(shot["data"]))
+    os.remove(path)
+    if "--upload" in args:
+        print(upload(out))
+    else:
+        print(out)
+
+
+# ── Ticketmaster's own chart with the seats ringed ─────────────────────────
+
+RING_JS = r"""(() => {
+  const ids = __IDS__, label = __LABEL__;
+  const pts = [];
+  for (const id of ids) {
+    const c = document.querySelector(`[data-id="${id}"]`) || document.getElementById(id);
+    if (!c) continue;
+    const r = c.getBoundingClientRect();
+    if (!r.width) continue;
+    pts.push([r.left + r.width / 2, r.top + r.height / 2, r.width]);
+  }
+  const few = pts.length <= 8;
+  for (const [x, y, w] of pts) {
+    const d = document.createElement("div"), R = few ? Math.max(14, w * 2.2) : Math.max(8, w * 1.6);
+    Object.assign(d.style, {position: "fixed", left: (x - R / 2) + "px", top: (y - R / 2) + "px", width: R + "px", height: R + "px",
+      border: (few ? 4 : 2) + "px solid #e0245e", borderRadius: "50%", zIndex: 99999, pointerEvents: "none", boxShadow: "0 0 0 2px #fff"});
+    d.className = "jori-ring"; document.body.appendChild(d);
+  }
+  if (pts.length) {
+    const xs = pts.map(p => p[0]), ys = pts.map(p => p[1]);
+    const l = document.createElement("div"); l.textContent = label; l.className = "jori-ring";
+    Object.assign(l.style, {position: "fixed", left: (Math.min(...xs) - 20) + "px", top: (Math.min(...ys) - 58) + "px", background: "#e0245e",
+      color: "#fff", font: "bold 16px -apple-system,Helvetica", padding: "4px 10px", borderRadius: "14px", zIndex: 99999, pointerEvents: "none"});
+    document.body.appendChild(l);
+  }
+  return pts.length;
+})()"""
+
+MAP_RECT_JS = r"""(() => {
+  const c = [...document.querySelectorAll("svg")].map(e => [e, e.getBoundingClientRect()])
+    .filter(([e, r]) => r.width > 300 && r.height > 250 && r.left < innerWidth * 0.6)
+    .sort((a, b) => b[1].width * b[1].height - a[1].width * a[1].height)[0];
+  if (!c) return null;
+  const r = c[1];
+  return {x: r.left, y: r.top, w: r.width, h: r.height};
+})()"""
+
+
+def shot(args):
+    scan_file, pick = flag(args, "--scan"), flag(args, "--pick")
+    if not scan_file or not pick:
+        die("usage: ticket-scan shot --scan scan.json --pick <id> [--out shot.png] [--upload]")
+    sc = json.load(open(scan_file))
+    l = next((x for x in sc["listings"] if x["id"] == pick), None)
+    if not l:
+        die(f"not in the scan: {pick}")
+    known = l.get("seats_known", True)
+    places = l["places"]
+    want = [x.strip() for x in (flag(args, "--seats") or "").split(",") if x.strip()]
+    if want:   # seat numbers read off the opened listing: ring exactly those
+        geo_places, geo_rows, *_ = index_geometry(fetch_geometry(sc["event_id"]))
+        rk = geo_places[places[0]]["rowkey"] if places and places[0] in geo_places else None
+        hit = [p["place"] for p in geo_rows.get(rk, []) if p["seat"] in want]
+        if len(hit) != len(want):
+            die(f"seats {want} not all in {l['section']} row {l['row']}", 3)
+        places, known = hit, True
+    sel = (f'[data-listing-id="{l["id"]}"]' if l.get("seats_known", True) else f'li[data-index="{l.get("row_index")}"]')
+    out = flag(args, "--out", f"/tmp/ticket-shot-{sc['event_id']}.png")
+    tab = Tab()
+    try:
+        tab.call("Emulation.setDeviceMetricsOverride", {"width": 1400, "height": 1000, "deviceScaleFactor": 2, "mobile": False})
+        tab.call("Page.enable")
+        tab.call("Page.navigate", {"url": sc["event_url"]})
+        page = tab.js(READ_LISTINGS.replace("for (let i = 0; i < 80 && stable < 4; i++)", "for (let i = 0; i < 0; i++)"), timeout=120)  # waits + dismisses the notice
+        if not page or page.get("error"):
+            die("event page did not load its listings")
+        pos = None
+        for _ in range(60):   # scroll the list until the listing is rendered
+            pos = tab.js(f"""(() => {{ const e = document.querySelector({json.dumps(sel)}); if (!e) return null;
+                e.scrollIntoView({{block: "center"}}); const r = e.getBoundingClientRect(); return [r.left + r.width / 2, r.top + r.height / 2]; }})()""")
+            if pos:
+                break
+            tab.js("""(() => { const f = document.querySelector('[data-listing-id], li[data-bdd^="quick-picks-list-item"]'); let b = f && f.parentElement;
+                while (b && !(b.scrollHeight > b.clientHeight + 10 && /(auto|scroll)/.test(getComputedStyle(b).overflowY))) b = b.parentElement;
+                if (b) b.scrollTop += 600; else window.scrollBy(0, 600); })()""")
+            time.sleep(0.4)
+        if not pos:
+            die(f"listing not found on the page: {sel}", 3)
+        time.sleep(0.4)
+        pos = tab.js(f"""(() => {{ const r = document.querySelector({json.dumps(sel)}).getBoundingClientRect(); return [r.left + r.width / 2, r.top + r.height / 2]; }})()""")
+        # Opening a listing only shows its detail panel (the site highlights the section); nothing is reserved.
+        for t in ("mouseMoved", "mousePressed", "mouseReleased"):
+            tab.call("Input.dispatchMouseEvent", {"type": t, "x": pos[0], "y": pos[1], "button": "left", "clickCount": 1})
+            time.sleep(0.08)
+        time.sleep(3)
+        n = tab.js(RING_JS.replace("__IDS__", json.dumps(places)).replace("__LABEL__", json.dumps("Your seats" if known else "Your row")))
+        if not n:
+            die("the chart has no seats with these place ids (layout changed?)", 3)
+        m = tab.js(MAP_RECT_JS)
+        if not m:
+            die("seat chart not found on the page", 3)
+        time.sleep(0.4)
+        # The seat-map layout puts filter pills inside the chart's box; skip them.
+        top = tab.js(f"""(() => {{ const b = [...document.querySelectorAll("button")].find(e => /^\\d+ Tickets?$/.test((e.innerText || "").trim()));
+            if (!b) return 0; const r = b.getBoundingClientRect(); return r.bottom > {m["y"]} && r.bottom < {m["y"]} + 150 ? Math.ceil(r.bottom - {m["y"]} + 8) : 0; }})()""") or 0
+        shot_ = tab.call("Page.captureScreenshot", {"format": "png", "clip": {"x": m["x"], "y": m["y"] + top, "width": m["w"], "height": m["h"] - top, "scale": 1}})
+    finally:
+        tab.close()
+    open(out, "wb").write(base64.b64decode(shot_["data"]))
+    if "--upload" in args:
+        print(upload(out))
+    else:
+        print(out)
+
+
+def main():
+    args = sys.argv[1:]
+    if not args or args[0] in ("-h", "--help"):
+        print(__doc__.strip())
+        sys.exit(0 if args else 2)
+    if args[0] == "scan":
+        scan(args)
+    elif args[0] == "shot":
+        shot(args)
+    elif args[0] == "map":
+        draw(args)
+    else:
+        die(f"unknown command {args[0]}")
+
+
+if __name__ == "__main__":
+    main()

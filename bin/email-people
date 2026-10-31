@@ -1,0 +1,416 @@
+#!/usr/bin/env node
+// email-people — who the user emails with, and when (header-only Gmail ledger).
+//
+// Code side of the people-from-email pipeline: fetches thread metadata
+// (never bodies) into data/email-people.db, decides who qualifies,
+// and writes the `## Email` block onto a person's wiki page. The model side
+// is jobs/people-email.md (nightly, capped) — it decides who an address is
+// and writes the summary. See lib/email-people.js.
+
+"use strict";
+
+const fs = require("node:fs");
+const path = require("node:path");
+const { spawnSync } = require("node:child_process");
+const ep = require("../lib/email-people.js");
+const google = require("../lib/google-auth.js");
+
+const ENV_FILE = path.join(__dirname, "..", ".env");
+const GMAIL = "https://gmail.googleapis.com/gmail/v1/users/me";
+const { instance } = require("../lib/instance.cjs");
+const ACCOUNT = instance().owner_email;
+const META_HEADERS = ["From", "To", "Cc", "Subject", "List-Id", "Precedence"];
+
+const args = process.argv.slice(2);
+const cmd = args[0];
+
+function flag(name, def = undefined) {
+  const i = args.indexOf(`--${name}`);
+  if (i === -1) return def;
+  const next = args[i + 1];
+  if (!next || next.startsWith("--")) return true;
+  return next;
+}
+
+function multi(name) {
+  const out = [];
+  args.forEach((a, i) => {
+    if (a === `--${name}` && args[i + 1] && !args[i + 1].startsWith("--")) out.push(args[i + 1]);
+  });
+  return out;
+}
+
+function envValue(k) {
+  if (process.env[k]) return process.env[k];
+  try {
+    const m = fs.readFileSync(ENV_FILE, "utf8").match(new RegExp(`^${k}=(.+)$`, "m"));
+    return m ? m[1].trim().replace(/^["']|["']$/g, "") : null;
+  } catch {
+    return null;
+  }
+}
+
+function usage() {
+  console.log(`email-people — Gmail correspondence ledger for person pages
+
+Ingest (code only, no model):
+  backfill [--concurrency 4] [--max-threads N]   every thread the user wrote in (resumable)
+  backfill-inbound [--max-people N]              threads qualified people started without a reply
+  sync                                           incremental via Gmail history (nightly cron)
+  contacts-refresh                               cache Google Contacts emails (the 1-thread rule)
+
+Read:
+  stats
+  candidates [--stale] [--limit N] [--json]      qualified people, newest-stale first
+  person <email|key> [--limit N] [--json]        thread timeline for one person
+
+Write (used by jobs/people-email.md):
+  self-add <email>...                            the user's own old/other addresses (never a person)
+  merge --into <email> <email>...                same person, several addresses
+  ignore <email> [--note "..."]                  not a person (vendor, shared inbox)
+  link --person <key> --wiki <id>                person ↔ wiki page, no summary
+  write-section --person <key> --wiki <id> --summary @file
+                                                 replace the page's ## Email block, mark summarized
+
+DB: ${ep.DB_PATH}
+`);
+}
+
+// ── Gmail ──
+
+async function gmail(pathAndQuery, attempt = 1) {
+  const token = await google.getAccessToken();
+  const res = await google.fetchWithRetry(`${GMAIL}${pathAndQuery}`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  if (res.status === 401 && attempt < 3) {
+    google.clearCache();
+    return gmail(pathAndQuery, attempt + 1);
+  }
+  // Gmail signals per-user quota exhaustion as 403 rateLimitExceeded /
+  // userRateLimitExceeded, not only 429 (the 2026-10-23 backfill lost 8,161
+  // of 13,389 threads to it before this).
+  let body = "";
+  if (res.status === 403) body = await res.text();
+  const rateLimited = res.status === 429 || (res.status === 403 && /rate ?limit|quota/i.test(body));
+  if ((rateLimited || res.status >= 500) && attempt < 8) {
+    await new Promise((r) => setTimeout(r, Math.min(64000, 1000 * 2 ** attempt) + Math.random() * 1000));
+    return gmail(pathAndQuery, attempt + 1);
+  }
+  if (!res.ok) {
+    const err = new Error(`gmail ${res.status} ${pathAndQuery.slice(0, 80)}${body ? ` ${body.slice(0, 120)}` : ""}`);
+    err.status = res.status;
+    throw err;
+  }
+  return res.json();
+}
+
+async function selfEmails() {
+  const cached = ep.getMeta("self_emails");
+  if (cached) return JSON.parse(cached);
+  const r = await gmail("/settings/sendAs");
+  const list = (r.sendAs || []).map((s) => s.sendAsEmail.toLowerCase());
+  ep.setMeta("self_emails", JSON.stringify(list));
+  return list;
+}
+
+function selfEmailsCached() {
+  const cached = ep.getMeta("self_emails");
+  if (!cached) throw new Error("no self_emails yet — run `email-people backfill` or `sync` once");
+  return JSON.parse(cached);
+}
+
+async function listThreadIds(q, { max = Infinity } = {}) {
+  const ids = new Set();
+  let pageToken = null;
+  do {
+    const r = await gmail(
+      `/messages?maxResults=500&q=${encodeURIComponent(q)}${pageToken ? `&pageToken=${pageToken}` : ""}`,
+    );
+    for (const m of r.messages || []) ids.add(m.threadId);
+    pageToken = r.nextPageToken || null;
+  } while (pageToken && ids.size < max);
+  return [...ids];
+}
+
+async function fetchThread(id) {
+  const hq = META_HEADERS.map((h) => `metadataHeaders=${h}`).join("&");
+  return gmail(`/threads/${id}?format=metadata&${hq}`);
+}
+
+async function pool(items, concurrency, fn) {
+  let i = 0;
+  let done = 0;
+  let failed = 0;
+  const workers = Array.from({ length: Math.min(concurrency, items.length) }, async () => {
+    while (i < items.length) {
+      const item = items[i++];
+      try {
+        await fn(item);
+        done++;
+      } catch (err) {
+        if (err.status === 404) continue; // thread deleted since listing
+        failed++;
+        if (failed <= 5) console.error(`  ${item}: ${err.message}`);
+      }
+      if ((done + failed) % 500 === 0) console.error(`  ${done + failed}/${items.length}`);
+    }
+  });
+  await Promise.all(workers);
+  return { done, failed };
+}
+
+async function ingestIds(ids, concurrency) {
+  const self = await selfEmails();
+  return pool(ids, concurrency, async (id) => ep.ingestThread(await fetchThread(id), { selfEmails: self }));
+}
+
+// ── Commands ──
+
+async function backfill() {
+  const concurrency = Number(flag("concurrency", 4));
+  const max = flag("max-threads") ? Number(flag("max-threads")) : Infinity;
+  const profile = await gmail("/profile");
+  if (!ep.getMeta("history_id")) ep.setMeta("history_id", profile.historyId);
+  await selfEmails();
+  console.error("listing threads the user wrote in…");
+  // Gmail's Sent folder, plus mail from his other addresses (old work
+  // accounts, Hotmail) that reached this inbox as copies, not as SENT.
+  const all = [...new Set([
+    ...(await listThreadIds("in:sent", { max })),
+    ...(await Promise.all((await selfEmails()).map((e) => listThreadIds(`from:${e} -in:sent`, { max })))).flat(),
+  ])];
+  const have = ep.fetchedThreadIds();
+  const todo = all.filter((id) => !have.has(id)).slice(0, max);
+  console.error(`${all.length} sent threads, ${todo.length} to fetch`);
+  const r = await ingestIds(todo, concurrency);
+  ep.setMeta("backfill_at", new Date().toISOString());
+  console.log(JSON.stringify({ sent_threads: all.length, fetched: r.done, failed: r.failed }));
+}
+
+async function backfillInbound() {
+  const self = await selfEmails();
+  const max = Number(flag("max-people", 100000));
+  const people = ep.candidates({ selfEmails: self }).slice(0, max);
+  const have = ep.fetchedThreadIds();
+  let fetched = 0;
+  let failedPeople = 0;
+  for (const p of people) {
+    for (const email of p.emails) {
+      try {
+        const ids = (await listThreadIds(`from:${email}`, { max: 500 })).filter((id) => !have.has(id));
+        const r = await ingestIds(ids, 4);
+        ids.forEach((id) => have.add(id));
+        fetched += r.done;
+      } catch (err) {
+        // One person's listing failing must not end the run; a re-run picks them up.
+        failedPeople++;
+        console.error(`  ${email}: ${err.message}`);
+      }
+    }
+  }
+  ep.setMeta("backfill_inbound_at", new Date().toISOString());
+  console.log(JSON.stringify({ people: people.length, fetched, failed_people: failedPeople }));
+}
+
+// New mail since the last run: Gmail history, falling back to a date query
+// when the stored historyId has expired (~a week of inactivity).
+async function sync() {
+  const self = await selfEmails();
+  const start = ep.getMeta("history_id");
+  const profile = await gmail("/profile");
+  let threadIds = new Set();
+  let mode = "history";
+  if (!start) {
+    mode = "init";
+  } else {
+    try {
+      let pageToken = null;
+      do {
+        const r = await gmail(
+          `/history?startHistoryId=${start}&historyTypes=messageAdded&maxResults=500${pageToken ? `&pageToken=${pageToken}` : ""}`,
+        );
+        for (const h of r.history || []) for (const a of h.messagesAdded || []) threadIds.add(a.message.threadId);
+        pageToken = r.nextPageToken || null;
+      } while (pageToken);
+    } catch (err) {
+      if (err.status !== 404) throw err;
+      mode = "query";
+      const since = ep.getMeta("synced_at") || new Date(Date.now() - 14 * 864e5).toISOString();
+      const days = Math.ceil((Date.now() - Date.parse(since)) / 864e5) + 1;
+      threadIds = new Set(await listThreadIds(`newer_than:${days}d -in:spam -in:trash`));
+    }
+  }
+  // Keep a thread only when the user wrote in it or a known correspondent is on it.
+  const known = new Set(ep.candidates({ selfEmails: self }).flatMap((c) => c.emails));
+  let kept = 0;
+  let skipped = 0;
+  await pool([...threadIds], 4, async (id) => {
+    const t = await fetchThread(id);
+    const keep = (t.messages || []).some((m) => {
+      if ((m.labelIds || []).includes("SENT")) return true;
+      const hs = m.payload?.headers || [];
+      return ["From", "To", "Cc"].some((n) =>
+        ep.parseAddressList(hs.find((h) => h.name.toLowerCase() === n.toLowerCase())?.value).some((a) => known.has(a.email)),
+      );
+    });
+    if (!keep) return void skipped++;
+    ep.ingestThread(t, { selfEmails: self });
+    kept++;
+  });
+  ep.setMeta("history_id", profile.historyId);
+  ep.setMeta("synced_at", new Date().toISOString());
+  console.log(JSON.stringify({ mode, threads_seen: threadIds.size, kept, skipped }));
+}
+
+function contactsRefresh() {
+  const env = { ...process.env, GOG_KEYRING_PASSWORD: envValue("GOG_KEYRING_PASSWORD") || "" };
+  let page = null;
+  let total = 0;
+  do {
+    const a = ["contacts", "list", "-a", ACCOUNT, "-j", "--max", "500", ...(page ? ["--page", page] : [])];
+    const r = spawnSync("gog", a, { env, encoding: "utf8", maxBuffer: 64 * 1024 * 1024, timeout: 600000 });
+    if (r.status !== 0) throw new Error(`gog contacts list: ${(r.stderr || "").trim().slice(0, 200)}`);
+    const data = JSON.parse(r.stdout);
+    const rows = (data.contacts || []).filter((c) => c.email);
+    ep.upsertContacts(rows);
+    total += rows.length;
+    page = data.nextPageToken || null;
+  } while (page);
+  ep.setMeta("contacts_at", new Date().toISOString());
+  console.log(JSON.stringify({ contacts_with_email: total }));
+}
+
+function stats() {
+  const d = ep.db();
+  const n = (sql) => d.prepare(sql).get().n;
+  const self = JSON.parse(ep.getMeta("self_emails") || "[]");
+  const c = self.length ? ep.candidates({ selfEmails: self }) : [];
+  console.log(
+    JSON.stringify(
+      {
+        threads: n("SELECT COUNT(*) n FROM threads"),
+        threads_written: n("SELECT COUNT(*) n FROM threads WHERE has_outbound = 1"),
+        messages: n("SELECT COUNT(*) n FROM messages"),
+        contacts: n("SELECT COUNT(*) n FROM contacts"),
+        qualified_people: c.length,
+        linked: c.filter((x) => x.wiki_id).length,
+        stale: c.filter((x) => x.stale).length,
+        ignored: n("SELECT COUNT(*) n FROM people WHERE ignored = 1"),
+        backfill_at: ep.getMeta("backfill_at"),
+        synced_at: ep.getMeta("synced_at"),
+      },
+      null,
+      2,
+    ),
+  );
+}
+
+function day(ms) {
+  return ms ? new Date(ms).toISOString().slice(0, 10) : "—";
+}
+
+function writeSection() {
+  const ws = require("../lib/wiki-store.js");
+  try {
+    const key = ep.personKeyOf(String(flag("person")).toLowerCase());
+    const wikiId = flag("wiki");
+    const summaryArg = flag("summary");
+    if (!key || typeof wikiId !== "string" || typeof summaryArg !== "string") {
+      throw new Error("write-section needs --person, --wiki and --summary @file");
+    }
+    const summary = summaryArg.startsWith("@") ? fs.readFileSync(summaryArg.slice(1), "utf8") : summaryArg;
+    const row = ws.getPage(wikiId);
+    if (!row) throw new Error(`no wiki page ${wikiId}`);
+    const c = ep.candidates({ selfEmails: selfEmailsCached() }).find((x) => x.person_key === key);
+    if (!c) throw new Error(`${key} is not a qualified correspondent`);
+    const next = ep.renderSection(row.raw_md, {
+      threadsWritten: c.threads_written,
+      firstAt: c.first_at,
+      lastAt: c.last_at,
+      summary,
+    });
+    const out = ws.savePage(wikiId, next, { editedBy: "people-email" });
+    ep.link(key, wikiId, { summarizedLastAt: c.last_at });
+    console.log(JSON.stringify({ person_key: key, wiki_id: wikiId, rev: out.rev, changed: out.changed || out.isNew }));
+  } finally {
+    ws.closeDb();
+  }
+}
+
+async function main() {
+  const asJson = Boolean(flag("json", false));
+  switch (cmd) {
+    case "backfill":
+      return backfill();
+    case "backfill-inbound":
+      return backfillInbound();
+    case "sync":
+      return sync();
+    case "contacts-refresh":
+      return contactsRefresh();
+    case "stats":
+      return stats();
+    case "candidates": {
+      const rows = ep.candidates({
+        selfEmails: selfEmailsCached(),
+        staleOnly: Boolean(flag("stale", false)),
+        limit: flag("limit") ? Number(flag("limit")) : null,
+      });
+      if (asJson) return console.log(JSON.stringify(rows, null, 2));
+      for (const r of rows) {
+        console.log(
+          `${String(r.threads_written).padStart(4)}  ${day(r.last_at)}  ${r.stale ? "*" : " "} ${r.person_key}  ${r.names[0] || ""}${r.wiki_id ? `  → ${r.wiki_id}` : ""}`,
+        );
+      }
+      return console.log(`\n${rows.length} people (* = summary stale)`);
+    }
+    case "person": {
+      const who = args[1];
+      if (!who) throw new Error("person <email|key>");
+      const r = ep.personThreads(who, { limit: Number(flag("limit", 80)) });
+      if (asJson) return console.log(JSON.stringify(r, null, 2));
+      console.log(`${r.person_key}  (${r.emails.join(", ")})`);
+      for (const t of r.threads) {
+        console.log(`  ${day(t.first_at)}…${day(t.last_at)}  ${t.messages} msg${t.from_owner ? "" : " (inbound only)"}  ${t.subject || "(no subject)"}`);
+      }
+      return;
+    }
+    case "merge": {
+      const into = flag("into");
+      const rest = args.slice(1).filter((a, i, arr) => a !== "--into" && arr[i - 1] !== "--into");
+      if (typeof into !== "string" || !rest.length) throw new Error("merge --into <email> <email>...");
+      ep.merge(into, rest);
+      return console.log(`merged ${rest.join(", ")} → ${into}`);
+    }
+    case "self-add": {
+      const add = args.slice(1).map((e) => e.toLowerCase()).filter((e) => e.includes("@"));
+      if (!add.length) throw new Error("self-add <email>...");
+      const list = [...new Set([...selfEmailsCached(), ...add])];
+      ep.setMeta("self_emails", JSON.stringify(list));
+      const marked = ep.recomputeOutbound(list);
+      return console.log(`self addresses: ${list.length}; ${marked} stored message(s) now count as the user's`);
+    }
+    case "ignore": {
+      if (!args[1]) throw new Error("ignore <email>");
+      ep.ignore(args[1], typeof flag("note") === "string" ? flag("note") : null);
+      return console.log(`ignored ${args[1]}`);
+    }
+    case "link": {
+      const key = ep.link(String(flag("person")), String(flag("wiki")));
+      return console.log(`${key} → ${flag("wiki")}`);
+    }
+    case "write-section":
+      return writeSection();
+    default:
+      usage();
+      if (cmd && cmd !== "-h" && cmd !== "--help") process.exitCode = 2;
+  }
+}
+
+main()
+  .catch((err) => {
+    console.error(`email-people: ${err.message}`);
+    process.exitCode = 1;
+  })
+  .finally(() => ep.closeDb());

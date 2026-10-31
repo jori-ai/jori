@@ -1,0 +1,259 @@
+#!/usr/bin/env node
+// zoom-probe — do the Zoom keys work, and what does Zoom see for a day?
+//
+// The daily summary's calls for a recurring meeting (agent/local/config/
+// meetings.json, lib/meetings.mjs) read Zoom first (lib/meeting-call.mjs,
+// through lib/zoom-client.mjs) and fall back to the calendar when Zoom
+// does not answer. This is the one command that says which it will be, before
+// a summary depends on it: where the three values were found (masked), whether
+// Zoom gives a token and with which scopes, whether the account's plan exposes
+// past meetings, every meeting in the user's room that day with who joined, and
+// what the summary would print for that day's calls with the counterpart.
+//
+//   zoom-probe [YYYY-MM-DD] [--tz <IANA>] [--meeting <id>] [--room <zoom id>] [--json]
+//       --meeting: a meetings.json id (default: $MEETING_ID, else the first
+//       configured). Default date: yesterday in the home zone. Default zone:
+//       the travel timeline's for that date. Default room: the meeting's
+//       zoom.room_id (a bare Zoom id given to --meeting is still read as a room).
+//   zoom-probe --install --item <1Password item> --vault <vault> [then the probe flags]
+//       Copies account_id / client_id / client_secret from that 1Password item
+//       (service account from .env, never prompts) into secrets/zoom-s2s.json
+//       at 0600, then runs the probe.
+//
+// Never prints, logs or passes on a credential: values are shown as their last
+// two characters and length, and Zoom's own error text is scrubbed of them.
+// Read-only on Zoom. Messages no one.
+//
+// Exit: 0 Zoom answers · 2 no usable credentials · 3 Zoom refused the token
+//       4 Zoom refused a read (scope, plan, meeting) · 5 network or timeout
+//       64 usage · 1 anything else.
+
+import { execFileSync } from "node:child_process";
+import { createRequire } from "node:module";
+import {
+  SECRETS_FILE, REQUIRED_SCOPES, ZoomError, loadCredentials, writeCredentials, createZoomClient, maskValue, scrub,
+} from "../lib/zoom-client.mjs";
+import { participantIds, participantMatch, callsForDay, zoomCalls } from "../lib/meeting-call.mjs";
+import { meeting as meetingById, meetings } from "../lib/meetings.mjs";
+
+const require = createRequire(import.meta.url);
+const { fmtDur } = require("../lib/daily-summary-render.js")._internal;
+const { dayWindow, addDays } = require("../lib/day-window.js");
+const { getDisplayTzForDate } = require("../lib/travel-timezone.js");
+const { loadEnv } = require("../lib/load-env.js");
+const { instance } = require("../lib/instance.cjs");
+
+const HOME_TZ = instance().tz;
+
+function usage(code = 64) {
+  process.stderr.write("usage: zoom-probe [YYYY-MM-DD] [--tz <IANA>] [--meeting <id>] [--room <zoom id>] [--json]\n"
+    + "       zoom-probe --install --item <1Password item> --vault <vault> [YYYY-MM-DD] [--tz <IANA>] [--json]\n");
+  process.exit(code);
+}
+
+const argv = process.argv.slice(2);
+const opt = { install: false, item: null, vault: null, json: false, tz: null, meeting: null, room: null, date: null };
+for (let i = 0; i < argv.length; i++) {
+  const a = argv[i];
+  if (a === "--install") opt.install = true;
+  else if (a === "--json") opt.json = true;
+  else if (a === "--item") opt.item = argv[++i];
+  else if (a === "--vault") opt.vault = argv[++i];
+  else if (a === "--room") opt.room = argv[++i];
+  else if (a === "--tz") opt.tz = argv[++i];
+  else if (a === "--meeting") opt.meeting = argv[++i];
+  else if (a === "-h" || a === "--help") usage(0);
+  else if (!opt.date && a.length === 10 && a[4] === "-" && a[7] === "-") opt.date = a;
+  else usage();
+}
+if ((opt.install && (!opt.item || !opt.vault)) || opt.tz === undefined || opt.room === undefined || opt.meeting === undefined) usage();
+// The meeting: a configured id; a bare Zoom id passed as --meeting is the room (the old flag).
+let M = meetingById(opt.meeting);
+if (!M && opt.meeting && /^[0-9 ]+$/.test(opt.meeting)) { opt.room = opt.room || opt.meeting; M = meetingById(null); }
+if (opt.meeting && !M && !opt.room) {
+  process.stderr.write(`zoom-probe: no meeting "${opt.meeting}" in agent/local/config/meetings.json (configured: ${meetings().map((m) => m.id).join(", ") || "none"})\n`);
+  process.exit(64);
+}
+opt.room = String(opt.room || (M && M.room_id) || "").split(" ").join("") || null;
+if (!opt.room) {
+  process.stdout.write("zoom-probe: no recurring meeting with a zoom.room_id in agent/local/config/meetings.json, and no --room — nothing to probe.\n");
+  process.exit(0);
+}
+const WHO = (M && M.name) || "the counterpart";
+const ids = participantIds(M);
+const today = new Intl.DateTimeFormat("en-CA", { timeZone: HOME_TZ }).format(new Date());
+opt.date = opt.date || addDays(today, -1);
+opt.tz = opt.tz || getDisplayTzForDate(opt.date) || HOME_TZ;
+
+const report = { date: opt.date, tz: opt.tz, meeting: M ? M.id : null, meeting_id: opt.room };
+const lines = [];
+const say = (s = "") => lines.push(s);
+function finish(code) {
+  if (opt.json) process.stdout.write(JSON.stringify({ ...report, exit: code }, null, 2) + "\n");
+  else process.stdout.write(lines.join("\n") + "\n");
+  process.exit(code);
+}
+
+// ---- --install: a 1Password item → secrets/zoom-s2s.json (0600) ----
+function opToken() {
+  if (!process.env.OP_SERVICE_ACCOUNT_TOKEN) { try { loadEnv(); } catch { /* no .env */ } }
+  return process.env.OP_SERVICE_ACCOUNT_TOKEN || null;
+}
+
+function install() {
+  const tok = opToken();
+  if (!tok) { say(`Install: no 1Password service-account token (OP_SERVICE_ACCOUNT_TOKEN), so the ${opt.vault} vault cannot be read.`); report.install = "no service account"; finish(2); }
+  let item;
+  try {
+    item = JSON.parse(execFileSync("op", ["item", "get", opt.item, "--vault", opt.vault, "--format", "json"], {
+      encoding: "utf8", timeout: 30_000, maxBuffer: 4 * 1024 * 1024, stdio: ["ignore", "pipe", "pipe"],
+      env: { ...process.env, OP_SERVICE_ACCOUNT_TOKEN: tok },
+    }));
+  } catch (e) {
+    const why = String((e && e.stderr) || "").trim().split("\n")[0].slice(0, 160) || `op exit ${e && e.status}`;
+    say(`Install: could not read "${opt.item}" from the 1Password ${opt.vault} vault (${why}).`);
+    report.install = "1Password item not readable";
+    finish(2);
+  }
+  const field = (label) => {
+    const f = (item.fields || []).find((x) => String(x.label || "").toLowerCase() === label);
+    return f && typeof f.value === "string" ? f.value : "";
+  };
+  const vals = { accountId: field("account_id"), clientId: field("client_id"),
+                 clientSecret: field("client_secret") || field("credential") };
+  if (!vals.accountId || !vals.clientId || !vals.clientSecret) {
+    say(`Install: "${opt.item}" needs fields account_id, client_id and client_secret; it has `
+      + `${["account_id", "client_id", "client_secret"].filter((l) => field(l)).join(", ") || "none of them"}.`);
+    report.install = "1Password item incomplete";
+    finish(2);
+  }
+  writeCredentials(vals, SECRETS_FILE);
+  say(`Install: copied "${opt.item}" from 1Password into ${SECRETS_FILE} (0600).`);
+  report.install = "ok";
+}
+
+// ---- the probe ----
+const clock = (ms, tz) => {
+  const p = Object.fromEntries(new Intl.DateTimeFormat("en-US", { timeZone: tz, hour: "numeric", minute: "2-digit", hour12: true })
+    .formatToParts(new Date(ms)).map((x) => [x.type, x.value]));
+  return `${p.hour}:${p.minute}${String(p.dayPeriod || "").toLowerCase()}`;
+};
+const span = (s, e, tz) => `${clock(s, tz)}-${clock(e, tz)}`;
+
+function refused(e, cfg) {
+  const detail = e.detail ? ` Zoom said: "${scrub(e.detail, cfg)}"` : "";
+  if (e.kind === "paid_plan_required") return `Zoom says this account is on the free plan: past-meeting data needs a paid (Pro or higher) account.${detail}`;
+  if (e.kind === "missing_scope") return `the app lacks a scope it needs (add ${REQUIRED_SCOPES.join(", ")} in the Zoom Marketplace app, then reactivate it).${detail}`;
+  if (e.kind === "not_found") return `Zoom does not know meeting ${opt.room} on this account (is the app on the account that hosts the room?).${detail}`;
+  if (e.kind === "forbidden") return `Zoom refused access (403).${detail}`;
+  if (e.kind === "unauthorized") return `Zoom refused the token for this read (401).${detail}`;
+  if (e.kind === "rate_limited") return `Zoom is rate-limiting this account (429); try again in a minute.`;
+  return `${e.message}.${detail}`;
+}
+
+async function probe() {
+  const creds = loadCredentials();
+  report.credentials = { source: creds.source, file: SECRETS_FILE, problem: creds.problem };
+  say(`Zoom probe for ${opt.date} (${opt.tz}), room ${opt.room}${M ? ` (meeting ${M.id})` : ""}`);
+  if (!creds.cfg) {
+    say(creds.problem ? `Keys: refused, ${creds.problem}.`
+      : `Keys: none. Run zoom-probe --install --item <item> --vault <vault> to copy them from 1Password into ${SECRETS_FILE}.`);
+    say("Result: the daily summary keeps using the calendar.");
+    finish(2);
+  }
+  const { cfg } = creds;
+  say(`Keys: from ${creds.source === "file" ? `${SECRETS_FILE} (0600)` : "the environment (ZOOM_ACCOUNT_ID / ZOOM_CLIENT_ID / ZOOM_CLIENT_SECRET)"}; `
+    + `account ${maskValue(cfg.accountId)}, client ${maskValue(cfg.clientId)}, secret ${maskValue(cfg.clientSecret, { secret: true })}.`);
+  report.credentials.masked = { account_id: maskValue(cfg.accountId), client_id: maskValue(cfg.clientId),
+                                client_secret: maskValue(cfg.clientSecret, { secret: true }) };
+
+  const client = createZoomClient({ cfg });
+  try {
+    await client.token();
+  } catch (e) {
+    const z = e instanceof ZoomError ? e : new ZoomError("http");
+    report.token = { ok: false, error: z.message, detail: scrub(z.detail, cfg) };
+    say(`Token: Zoom refused it (${z.message})${z.detail ? `: "${scrub(z.detail, cfg)}"` : ""}. `
+      + "Check the three values, and that the app is activated in the Zoom Marketplace.");
+    say("Result: the daily summary keeps using the calendar.");
+    finish(z.kind === "timeout" || z.kind === "network" ? 5 : 3);
+  }
+  const granted = client.scopes() || [];
+  const missing = REQUIRED_SCOPES.filter((s) => !granted.includes(s) && !granted.includes(s.slice(0, -":admin".length)));
+  report.token = { ok: true, scopes: granted, missing_scopes: missing };
+  say(`Token: works. Scopes: ${granted.join(", ") || "(none listed)"}${missing.length ? `. Missing: ${missing.join(", ")}` : ""}.`);
+
+  const w = dayWindow(opt.date, opt.tz);
+  let list;
+  try {
+    list = await client.pastInstances(opt.room, { from: addDays(opt.date, -30), to: addDays(opt.date, 1) });
+  } catch (e) {
+    const z = e instanceof ZoomError ? e : new ZoomError("http");
+    report.room = { ok: false, error: z.message };
+    if (z.kind === "paid_plan_required") report.plan = "free";
+    say(`Room: ${refused(z, cfg)}`);
+    say("Result: the daily summary keeps using the calendar.");
+    finish(z.kind === "timeout" || z.kind === "network" ? 5 : 4);
+  }
+  const day = list.filter((m) => { const t = Date.parse(m.start_time); return t >= w.startMs && t < w.endMs; });
+  report.room = { ok: true, meetings_last_30_days: list.length, that_day: [] };
+  say(`Room: ${list.length} meeting${list.length === 1 ? "" : "s"} in the 30 days to ${opt.date}; ${day.length} that day.`);
+
+  let plan = null;
+  for (const m of day) {
+    try {
+      const d = await client.pastMeeting(m.uuid);
+      const s = Date.parse(d.start_time || m.start_time), e = Date.parse(d.end_time) || s + (Number(d.duration) || 0) * 60000;
+      let ppl = null;
+      try { ppl = await client.pastParticipants(m.uuid); plan = plan || "paid"; } catch (pe) {
+        if (pe instanceof ZoomError && pe.kind === "paid_plan_required") plan = "free";
+        else throw pe;
+      }
+      const names = ppl == null ? null
+        : [...new Set(ppl.map((p) => `${p.name || "(no name)"}${participantMatch(p, ids) ? ` [${WHO}]` : ""}${p.status === "in_waiting_room" ? " (waiting room)" : ""}`))];
+      report.room.that_day.push({ start: new Date(s).toISOString(), end: new Date(e).toISOString(), duration: d.duration ?? null,
+        participants_count: d.participants_count ?? null, participants: names, counterpart: ppl == null ? null : ppl.some((p) => participantMatch(p, ids)) });
+      say(`  ${span(s, e, opt.tz)} · ${d.duration ?? "?"} min · ${d.participants_count ?? "?"} joined`
+        + (names == null ? " · participants not readable on this plan" : names.length ? ` · ${names.join(", ")}` : " · no participant list (one-person meeting)"));
+    } catch (e) {
+      const z = e instanceof ZoomError ? e : new ZoomError("http");
+      if (z.kind === "paid_plan_required") plan = "free";
+      report.room.that_day.push({ start: m.start_time, error: z.message });
+      say(`  ${clock(Date.parse(m.start_time), opt.tz)} · ${refused(z, cfg)}`);
+    }
+  }
+  report.plan = plan || "unknown";
+  say(`Plan: ${plan === "paid" ? "paid (Zoom returned past-meeting participants)"
+    : plan === "free" ? "free: Zoom says past-meeting details need a paid (Pro or higher) account, so the summary will keep using the calendar"
+    : "not shown yet (no meeting that day to ask about)"}.`);
+
+  // What the summary would print for the day's calls (the calendar, then Zoom; no model reading here).
+  if (!M) { say("Calls: no recurring meeting configured, so the summary part was skipped."); report.summary = { skipped: "no meeting" }; }
+  else try {
+    const r = await callsForDay({ m: M, date: opt.date, tz: opt.tz, zoom: (a) => zoomCalls({ ...a, m: M, creds, client }) });
+    report.summary = { zoom: r.zoom, calls: r.calls, left_out: r.left_out };
+    say(`${WHO} calls on the calendar that day (Zoom: ${r.zoom}):`);
+    for (const c of r.calls) {
+      const s = Date.parse(c.start), e = Date.parse(c.end);
+      say(c.source === "zoom" ? `  ${span(s, e, opt.tz)} · Call with ${WHO} · ran ${fmtDur(c.minutes)} (Zoom)`
+        : `  ${span(s, e, opt.tz)} · Call with ${WHO} · ${fmtDur(c.minutes)} · calendar times`);
+    }
+    for (const x of r.left_out) say(`  ${span(Date.parse(x.start), Date.parse(x.end), opt.tz)} · left out: ${x.why}`);
+    if (!r.calls.length && !r.left_out.length) say("  none");
+  } catch (e) {
+    report.summary = { error: "calendar not read" };
+    say(`${WHO} calls: the calendar could not be read here (gog), so this part was skipped.`);
+  }
+  const works = plan !== "free" && !missing.length;
+  report.works = works && plan === "paid" ? "yes" : works ? "so far" : "no";
+  say(!works ? "Result: Zoom does not answer fully yet; the daily summary keeps using the calendar."
+    : plan === "paid" ? `Result: Zoom answers; the daily summary will use Zoom's times for ${WHO} calls.`
+    : "Result: the keys work; pick a date with a call (zoom-probe <date>) to see participants come back.");
+  finish(works ? 0 : 4);
+}
+
+if (opt.install) install();
+probe().catch((e) => {
+  say(`Probe failed: ${e instanceof ZoomError ? e.message : `unexpected ${(e && e.name) || "error"}`}.`);
+  finish(1);
+});

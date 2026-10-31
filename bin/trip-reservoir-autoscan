@@ -1,0 +1,146 @@
+#!/usr/bin/env node
+"use strict";
+// trip-reservoir-autoscan — find upcoming NON-HOME locations that don't yet have
+// a travel guide (reservoir), so the research runs automatically for anywhere we
+// go instead of being kicked off by hand per trip.
+//
+// Requirement: the research is generic and automatic for any non-home location
+// on the timeline.
+//
+// Reads the canonical travel timeline (travel_segments) for real STAYS (lodging,
+// not transit/flights) starting within the lookahead window, drops home bases
+// and too-short stops (airport-hotel overnights, layovers), and reports the ones
+// with no reservoir in trip_reservoirs yet. It does NOT build them itself —
+// trigger-trip-reservoir-autoscan.sh (launched by the launchd user agent
+// ai.claude.trip-reservoir-autoscan, which can reach the keychain Max session
+// the Sonnet research fork needs) consumes this list and runs each build in turn.
+//
+// Modes:
+//   trip-reservoir-autoscan            # human-readable list of what's missing
+//   trip-reservoir-autoscan --list     # JSON [{key,label,from,to}] for the agent
+//   trip-reservoir-autoscan --check    # exit 0 if any missing (for the cron gate), else 1
+//
+// Env knobs: LOOKAHEAD_DAYS (default 30), MIN_STAY_HOURS (default 36).
+
+const path = require("node:path");
+const { fetchJson } = require(path.join(__dirname, "..", "lib", "supabase-rest.js"));
+const { localConfig } = require(path.join(__dirname, "..", "lib", "instance.cjs"));
+
+const LOOKAHEAD_DAYS = Number(process.env.LOOKAHEAD_DAYS || 30);
+const MIN_STAY_HOURS = Number(process.env.MIN_STAY_HOURS || 36);
+
+// Home bases — never researched (the user lives there). Match on the
+// travel_segments `metro` slug: the travel config's home metros (travel.json
+// `home_metros`) and the slugs of their aliases, plus any extra slugs in
+// trip-planning.json `home_metros` (variants the timeline has used). No config:
+// nothing is home, every qualifying stay gets a guide.
+function homeMetros() {
+  const travel = localConfig("travel", { metros: [], home_metros: [] });
+  const extra = localConfig("trip-planning", { home_metros: [] }).home_metros;
+  const out = new Set();
+  for (const key of travel.home_metros || []) {
+    out.add(slug(key));
+    const m = (travel.metros || []).find((x) => x.key === key);
+    for (const a of (m && m.aliases) || []) out.add(slug(a));
+  }
+  for (const s of extra || []) out.add(slug(s));
+  return out;
+}
+const HOME_METROS = homeMetros();
+
+function slug(s) {
+  return String(s || "").toLowerCase().normalize("NFD").replace(/[̀-ͯ]/g, "")
+    .replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "").slice(0, 48);
+}
+
+// travel_segments place_label looks like "Townsville, ST — Charming River
+// Cottage (host Alex)". The part before the em/en/hyphen dash is the
+// geocodable "City, Region" — that's the guide's label.
+function areaLabel(seg) {
+  const raw = seg.place_label || seg.metro || "";
+  const cut = raw.split(/\s[—–-]\s/)[0].trim();
+  return cut || raw.trim();
+}
+
+async function scan() {
+  const now = Date.now();
+  const horizon = now + LOOKAHEAD_DAYS * 86400000;
+
+  const segs = await fetchJson(
+    "/rest/v1/travel_segments?select=metro,place_label,arrive_at,depart_at,source&order=arrive_at.asc",
+    { timeoutMs: 15000 },
+  );
+  if (!segs) return { error: "travel_segments unreachable", missing: [] };
+
+  const reservoirs = await fetchJson(
+    "/rest/v1/trip_reservoirs?select=area,structured", { timeoutMs: 15000 },
+  ) || [];
+  const haveArea = new Set(reservoirs.filter(r => {
+    // "has a reservoir" = the row exists AND has at least one non-empty bucket.
+    const b = r.structured?.buckets || {};
+    return Object.values(b).some(a => Array.isArray(a) && a.length);
+  }).map(r => r.area));
+
+  // Group every non-transit segment by metro. A metro can appear as several
+  // segments — a flights-derived destination span PLUS one or more lodging
+  // stays. Prefer the lodging/manual dates (the flights span covers the whole
+  // arrival→final-departure and would give a wrong, over-wide window, e.g. a city
+  // 7/9→8/12 vs the real 8/6→8/12 stay); fall back to flights only when there's
+  // no booked stay yet (a place we're flying to but haven't booked — still a
+  // visit worth a guide, e.g. a city before lodging is booked).
+  const byMetro = new Map();
+  for (const s of segs) {
+    if (!s.metro || s.metro === "transit") continue;
+    const arrive = Date.parse(s.arrive_at);
+    const depart = Date.parse(s.depart_at);
+    if (Number.isNaN(arrive)) continue;
+    const booked = s.source === "lodging" || s.source === "manual";
+    const g = byMetro.get(s.metro) || { metro: s.metro, booked: null, flights: null };
+    const tier = booked ? "booked" : "flights";
+    const cur = g[tier];
+    if (!cur) g[tier] = { arrive, depart, label: areaLabel(s) };
+    else { cur.arrive = Math.min(cur.arrive, arrive); if (Number.isFinite(depart)) cur.depart = Math.max(cur.depart || 0, depart); }
+    byMetro.set(s.metro, g);
+  }
+
+  const missing = [];
+  for (const g of byMetro.values()) {
+    if (HOME_METROS.has(g.metro)) continue;
+    const win = g.booked || g.flights;           // lodging dates win
+    if (!win) continue;
+    if (!Number.isFinite(win.depart) || win.depart <= now) continue;   // over / open-ended
+    if (win.arrive > horizon) continue;                                // beyond lookahead
+    if ((win.depart - win.arrive) < MIN_STAY_HOURS * 3600000) continue; // layover / airport overnight
+
+    const key = slug(g.metro);
+    if (!key || haveArea.has(key)) continue;     // already researched
+
+    missing.push({
+      key,
+      label: win.label,
+      from: new Date(win.arrive).toISOString().slice(0, 10),
+      to: new Date(win.depart).toISOString().slice(0, 10),
+    });
+  }
+  return { missing };
+}
+
+(async () => {
+  const mode = process.argv.includes("--list") ? "list"
+    : process.argv.includes("--check") ? "check" : "human";
+  const { missing, error } = await scan();
+
+  if (mode === "list") {
+    process.stdout.write(JSON.stringify(missing));
+    process.exit(0);
+  }
+  if (mode === "check") {
+    // Gate for the cron trigger: exit 0 iff there's work to dispatch.
+    process.exit(missing.length ? 0 : 1);
+  }
+  // human
+  if (error) { console.error(error); process.exit(1); }
+  if (!missing.length) { console.log(`No non-home stays in the next ${LOOKAHEAD_DAYS}d without a guide.`); process.exit(0); }
+  console.log(`${missing.length} upcoming non-home location(s) with no guide yet:`);
+  for (const m of missing) console.log(`  ${m.key.padEnd(16)} ${m.label.padEnd(28)} ${m.from} → ${m.to}`);
+})().catch((e) => { console.error(`trip-reservoir-autoscan failed: ${e.message}`); process.exit(1); });

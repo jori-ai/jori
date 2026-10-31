@@ -29,7 +29,11 @@ final class CloudBackup {
         }
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
-        return try? decoder.decode([Message].self, from: data)
+        // Chat rows only. Restores land in the Chat view, and a backup written
+        // before 2026-10-06 can hold System rows (the backup used to snapshot
+        // whichever channel was on screen).
+        return (try? decoder.decode([Message].self, from: data))?
+            .filter { $0.channel == ChatChannel.chat.rawValue }
     }
 
     func lastBackupDate() -> Date? {

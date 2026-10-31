@@ -61,7 +61,7 @@ Top-tier rule. **Default: every calendar event Jori creates or updates has zero 
 
 When in doubt, create silent and ask — a missed invite is recoverable in seconds, an unwanted invite to a third party is not.
 
-**Amend, don't duplicate — and the user's own events (2026-10-22).** When `jori-calendar create` refuses an overlap because the booking is already on the calendar, amend that event with `update` instead of asking. On an event **the user made themselves**, Jori may change anything (time, name, details) **only when the new details come from a confirmation email for the same booking** — pass `--from-confirmation <that email's Gmail messageId>`; otherwise it may only **add** details: a location where there is none, notes and ticket links (appended under their description), attachments. `jori-calendar` enforces it (exit 8): it stamps every event it creates (`jori_created=1`), treats an unstamped event the user organizes as theirs, and fails closed when it cannot read the event. Whether an email is the confirmation for the same booking is your judgment; name it honestly. A job updating an id from its own earlier create passes `--jori-event <job>`.
+**Amend, don't duplicate — and the user's own events (2026-10-22).** When `jori-calendar create` refuses an overlap because the booking is already on the calendar, amend that event with `update` instead of asking. On an event **the user made themselves**, Jori may change anything (time, name, details) **only when the new details come from a confirmation email for the same booking** — pass `--from-confirmation <that email's Gmail messageId>`; otherwise it may only **add** details: a location where there is none, notes and ticket links (appended under their description), attachments. `jori-calendar` enforces it (exit 8): it stamps every event it creates (`gandalf_created=1`), treats an unstamped event the user organizes as theirs, and fails closed when it cannot read the event. Whether an email is the confirmation for the same booking is your judgment; name it honestly. A job updating an id from its own earlier create passes `--jori-event <job>`.
 
 Full rule, enforcement layers and history: `docs/calendar-invite-guard.md`.
 
@@ -177,7 +177,8 @@ jori-send-curl --channel system --skip-precheck "⚠️ <what happened>"
 ```
 
 - **System rows are silent by default** — written to the System tab, no push. A system row notifies only if it starts with 🔴/🚨 (critical) or the caller passes `--push` because it needs the user to act now. Never add `--push` to informational notices (Jev disagreements, hung-turn retries, recoveries, "job didn't run").
-- **Chat** (default `--channel chat`) is for the user's life: hum pings, digests, ticket confirmations, reminders, questions needing their reply, P1 email pointers.
+- **Chat** (default `--channel chat`) is for the user's life: hum pings, digests, ticket confirmations, reminders, urgent questions needing their reply, P1 email pointers.
+- **Questions** (`--channel questions`) holds non-urgent questions, written without a push. You do not pick it: `jori-send-curl` routes every question bound for chat (an intent ending `:question`/`:ask`, hum context, or `--question`) through `bin/question-route`; Jev site `question-urgency` keeps urgent ones in chat. **Location questions are always urgent** (chat, time-sensitive push; pass `--location-question` if your sender is not recognised). A reply typed in a tab is answered in that tab.
 - **Root-cause narration of Jori's own bugs goes to `--channel improvements`**, not chat — unless the user asked for it, or they can observe the difference (say that in one line in chat).
 - Email triage decisions, ops-agent internal state, and routine cron completions go to **neither** channel.
 - Repeat system alerts are deduplicated automatically (`system-alert-dedup`; check `system-alert-dedup --stats` before concluding a condition stopped; deliberate re-page: `JORI_ALERT_NO_DEDUP=1`). This is not licence to alert more freely.
@@ -331,14 +332,16 @@ Full text: `docs/agent-rules-detail.md` § Health; skill `health-support`.
 
 ## iOS / macOS App Releases (TestFlight) — you cut these yourself, no human needed
 
-The Jori client is `client/` (bundle id in `client/`'s project settings). **Releasing is a self-service agent task — never tell the user to "archive in Xcode."** Land the change on main, optionally compile-check, then:
+The Jori app is `apps/companion/` (one source tree; an installation's identity — bundle id, team, backend, stored-name prefixes, signing contexts, features — is `Config/Installation.xcconfig`, kept in the installation's overlay at `.overlay/app/` and copied in by its build). **Releasing is a self-service agent task — never tell the user to "archive in Xcode."** Land the change (kernel `apps/companion/` and/or overlay `.overlay/app/`), optionally compile-check, then dispatch the installation's TestFlight workflow and watch it:
 
 ```bash
-gh workflow run "Jori - iOS TestFlight" --ref main
-gh run watch "$(gh run list --workflow=jori-testflight.yml -L1 --json databaseId -q '.[0].databaseId')" --exit-status
+bin/app-build where            # where this installation builds (agent/local/config/app-builds.json)
+bin/app-build all --watch      # or ios|macos; --input kernel_ref=<branch> to build another kernel ref
 ```
 
-**Do NOT hand-bump `CURRENT_PROJECT_VERSION`** (CI sets it). Git push and `gh` need the sandbox disabled. Full procedure (compile-check, macOS sibling, fastlane fallback, secrets): `docs/ios-releases.md`.
+**Never pick the repo or workflow yourself.** Where builds run is set in `agent/local/config/app-builds.json` (`lib/app-builds.cjs`); with no config, the targets are this repo's own `{ios,macos}-testflight.yml`. Running `gh workflow run` against a repo with no runner leaves the build queued forever.
+
+**Do NOT hand-bump `CURRENT_PROJECT_VERSION`** (CI sets it from the workflow's run number). Git push and `gh` need the sandbox disabled. Full procedure (workflow names, compile-check, secrets): `docs/ios-releases.md`.
 
 ---
 

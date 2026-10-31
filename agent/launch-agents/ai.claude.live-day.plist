@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  live-day — ON-DEMAND launchd user agent (no schedule of its own). Cron's
+  trigger-live-day.sh kicks it every 10 minutes; it reruns that script with its
+  run flag, where the photo step's `claude -p` can reach the Max login.
+
+  Install:
+    agent/launch-agents/install.sh ai.claude.live-day
+    (renders __JORI_HOME__ / __JORI_TOOLS__ / __HOME__, then launchctl bootstrap)
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>ai.claude.live-day</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>__JORI_TOOLS__/bin/cron-run</string>
+        <string>--label</string>
+        <string>live-day</string>
+        <string>--</string>
+        <string>/bin/bash</string>
+        <string>__JORI_TOOLS__/agent/scripts/trigger-live-day.sh</string>
+        <string>--run</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>__HOME__</string>
+        <key>PATH</key>
+        <string>__HOME__/.local/node/bin:__HOME__/.local/bin:/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:__JORI_TOOLS__/bin</string>
+        <key>LANG</key>
+        <string>en_US.UTF-8</string>
+    </dict>
+    <key>WorkingDirectory</key>
+    <string>__JORI_TOOLS__</string>
+    <key>RunAtLoad</key>
+    <false/>
+    <key>KeepAlive</key>
+    <false/>
+    <key>StandardOutPath</key>
+    <string>__JORI_TOOLS__/data/logs/live-day-launchd.log</string>
+    <key>StandardErrorPath</key>
+    <string>__JORI_TOOLS__/data/logs/live-day-launchd.log</string>
+</dict>
+</plist>

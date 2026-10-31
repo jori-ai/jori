@@ -1,0 +1,1227 @@
+#!/usr/bin/env python3
+"""Places CLI — search for nearby places using Google Places API + Find My location."""
+
+import sys
+import os
+import json
+import subprocess
+import urllib.request
+import math
+from datetime import datetime, timedelta, timezone
+
+# This script's own path. Tests exec it into a module without __file__ and set
+# one; failing that, the path it was started by.
+_SELF = os.path.realpath(globals().get("__file__") or sys.argv[0])
+_BIN = os.path.dirname(_SELF)
+sys.path.insert(0, os.path.join(os.path.dirname(_BIN), "lib"))
+import places_local  # noqa: E402
+ENV_FILE = os.path.join(places_local.install_root(), ".env")
+import places_client  # noqa: E402  (the one guarded door to Google Places)
+import places_cache  # noqa: E402
+try:
+    from places_log import log_call as _places_log, timed as _places_timed
+except Exception:  # never let the logger break a caller
+    def _places_log(*a, **k): pass
+    class _places_timed:
+        ms = None
+        def __enter__(self): return self
+        def __exit__(self, *e): return False
+
+# Searching is the whole job here, so a budget stop is a stop, not a degrade --
+# for a LIVE call. A cache hit costs nothing, so it is served even when the
+# budget is spent (assert_places_allowed runs just before each request, not at
+# import). 2026-10-13: the gate used to sit here, so a blown budget refused
+# answers that were already on disk.
+
+
+def _load_places_key():
+    # env var first, then GOOGLE_PLACES_API_KEY from .env. NEVER hardcode the key
+    # (secrets-env-first policy + secret-scan). Mirrors bin/location-commute.
+    k = os.environ.get("GOOGLE_PLACES_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+    if k:
+        return k
+    if os.path.exists(ENV_FILE):
+        with open(ENV_FILE) as fh:
+            for line in fh:
+                line = line.strip()
+                if line.startswith("GOOGLE_PLACES_API_KEY="):
+                    return line.split("=", 1)[1].strip().strip('"').strip("'")
+    return ""
+
+
+API_KEY = _load_places_key()
+# Where "near me" comes from when no coordinates are given: a locator command
+# printing [{"lat":..,"lon":..,"name":..}] as JSON (agent/local/config/places.json
+# `locate_cmd`: one command line, split on spaces, or a list; a bare name is
+# resolved next to this script). Unset: `nearby` asks for `places at`.
+_CFG = places_local.local_config("places", {"locate_cmd": ""})
+_lc = _CFG.get("locate_cmd") or []
+LOCATE_CMD = _lc.split() if isinstance(_lc, str) else list(_lc)
+DEFAULT_RADIUS = 1000  # meters
+MIN_RESULTS = 3
+MAX_RESULTS = 5
+MIN_RATING = 4.2
+MAX_PHOTOS = 3
+
+# Saved-places cross-reference (Google Maps tagged places imported via
+# places-saved-import). When running a nearby search we ALSO surface any of
+# the user's saved/starred/want-to-go places within range — a starred spot a bit
+# further than the query radius is still worth a heads-up, so the saved radius
+# floors at 1500m.
+SAVED_STORE = places_local.data_path("google-saved-places.json")
+SAVED_RADIUS_MIN = 1500
+SAVED_SHOW = 8  # max saved places to list in the nearby section (rest summarized)
+
+
+def list_label(name):
+    """Emoji + the list's own name, e.g. '❤️ favorite places', '🚩 want to go',
+    '📍 lunch spots'. Works for both canonical tags and free-form list titles."""
+    n = (name or "").lower()
+    if "favorite" in n or "favourite" in n:
+        emoji = "❤️"
+    elif "want" in n and "go" in n:
+        emoji = "🚩"
+    elif "star" in n:
+        emoji = "⭐"
+    else:
+        emoji = "📍"
+    return f"{emoji} {name}"
+
+USAGE = """Usage: places <command> [options]
+
+Commands:
+  nearby <query>              Search for places near the user's current location
+  at <lat>,<lng> <query>      Search for places near specific coordinates
+  check <place-id-or-query>   Is this place open at a SPECIFIC date/time?
+
+Options:
+  --radius <meters>           Search radius (default: 1000)
+  --limit <n>                 Max results (default: 5, minimum: 3)
+  --include-closed            Include places that are currently closed
+  --json                      Output JSON (includes photo URLs)
+  --no-saved                  Don't cross-reference your Google Maps saved places
+  --saved-radius <meters>     Radius for saved-place matches (default: max(radius,1500))
+  --lean                      Names, types and positions only. Far cheaper (Google's Pro
+                              tier, not Enterprise + Atmosphere): no ratings, hours,
+                              prices or overviews. For callers that read only name,
+                              type and distance.
+  --tier lean|standard|rich   Field mask = price tier. standard (default): ratings,
+                              hours, price, photos — Text Search Enterprise. rich adds
+                              reviews and the overview line — Enterprise + Atmosphere,
+                              $0.04 a call, opt-in per --lane with a daily cap in
+                              lib/places-tier-policy.json (exit 4 beyond it).
+                              --lean = --tier lean.
+  --lane <name>               Tag this call's log lines with the lane that asked
+                              (hum-nearby, hum-excursion, ...) so spend is attributable.
+  --refresh                   Skip the cache read and fetch live (the result is still cached)
+  --rank <mode>               auto (default), restaurant or default. See Ranking below.
+
+Cache: answers are kept a year on disk, keyed on the query, radius and a ~110 m
+cell (lib/places_cache.py), and "open now" is re-derived from the stored
+weekly hours on every hit. A cache hit costs nothing and is served even when the
+Places budget is spent.
+
+Saved places: results include a "Your saved places nearby" section listing any
+Google Maps places you tagged (Favorites/Want-to-go/Starred) within range —
+imported via `places-saved-import`. Independent of the search query.
+
+By default, only places open NOW are shown, and only places rated 4.2+ when
+enough of them exist. Each result includes a short overview and up to 3 photo URLs.
+
+Ranking: when most of the places Google returns are somewhere to eat or drink
+(its primaryType ids), they are ordered by the restaurant ranking:
+open first, then a rating pulled toward 4.0 until ~40 reviews have accumulated,
+plus a bonus for being much more reviewed than the places within 500 m. Sheer
+popularity cannot outrank a better rating. Anything else (a pharmacy, a gallery,
+a park) is ordered by a composite of open now, rating, review count and
+proximity. --rank restaurant or --rank default forces one; --json says which
+applied ("ranking"). `places` leaves out a tourist-area penalty, which would
+need two extra searches.
+
+Examples:
+  places nearby "coffee shop"
+  places nearby "gas station" --radius 2000
+  places at 12.3456,-65.4321 "restaurant" --limit 5
+  places nearby "brunch" --include-closed
+
+--- check ---
+
+`places check` answers "will THIS place be open at THIS date/time" — for a
+future reservation, a specific day-of-week question, etc. `nearby`/`at` only
+ever report "open right now"; this is for everything else.
+
+Usage: places check <place-id-or-query> [--near lat,lng] (--at <ISO datetime> | --date YYYY-MM-DD [--time HH:MM])
+
+  <place-id-or-query>  A Google place_id (starts "ChIJ...") used directly, or
+                        a free-text query resolved via Text Search (top match).
+  --near lat,lng        Location bias for the query search (default: the
+                        user's current location via the configured locator). Ignored for a place_id.
+  --at <ISO datetime>   e.g. 2026-09-29T13:00:00. Any trailing Z/offset is
+                        dropped — this is the venue's own local wall-clock time,
+                        not a UTC instant (business hours are inherently local).
+  --date / --time       Alternative to --at: YYYY-MM-DD and HH:MM (time
+                        defaults to 12:00 if omitted).
+  --json                 Output JSON instead of text.
+
+Checks businessStatus (permanently/temporarily closed overrides everything),
+then matches the requested day-of-week + time-of-day against the place's
+regular weekly hours (handles overnight spans, e.g. a bar open Fri 6pm-2am).
+Flags when Google's currentOpeningHours differs from the regular pattern —
+that usually means a holiday/special-hours override is active and worth a
+direct check for dates near today.
+
+Examples:
+  places check "Some Bistro Downtown" --at 2026-09-29T13:00:00
+  places check ChIJN1t_tDeuEmsRUsoyG83frY4 --date 2026-09-29 --time 13:00
+  places check "Some Bistro" --near 12.3456,-65.4321 --date 2026-10-04 --json
+"""
+
+# `--tier rich`: everything, including reviews and Google's AI/editorial
+# summaries. Those three fields (editorialSummary, generativeSummary, reviews)
+# are what make a call "Text Search Enterprise + Atmosphere" — $0.04 each once
+# the billing account's 1,000 free calls are gone. Rich is opt-in per caller
+# with a daily cap (lib/places-tier-policy.json); default is STANDARD.
+RICH_FIELD_MASK = ",".join([
+    "places.id",
+    "places.displayName",
+    "places.formattedAddress",
+    "places.rating",
+    "places.userRatingCount",
+    "places.currentOpeningHours",
+    "places.priceLevel",
+    "places.googleMapsUri",
+    "places.location",
+    "places.primaryTypeDisplayName",
+    "places.editorialSummary",
+    "places.generativeSummary",
+    "places.reviews",
+    "places.photos",
+    # Tier-neutral (the mask is already Enterprise + Atmosphere): the weekly hours
+    # and the venue's UTC offset let a cache hit work out whether the place is
+    # open NOW, instead of repeating what was true when the entry was written.
+    "places.regularOpeningHours",
+    "places.utcOffsetMinutes",
+    # Google's own machine type id ("italian_restaurant", "cafe"). Also tier-neutral.
+    # It is how a search is told to be a food search without reading the query.
+    "places.primaryType",
+])
+
+# The default since 2026-10-20: ratings, review counts, price, hours, photos and
+# type — "Text Search Enterprise" (1,000 free a month on the account; October
+# used ~310). No overview line: that is what the Atmosphere tier bought, and it
+# was most of October's $31.72 (hum lanes asking on every tick and every 150 m).
+_ATMOSPHERE_ONLY = {"places.editorialSummary", "places.generativeSummary", "places.reviews"}
+FIELD_MASK = ",".join(f for f in RICH_FIELD_MASK.split(",") if f not in _ATMOSPHERE_ONLY)
+
+# `--lean`: names and positions only. This is the PRO tier, not Enterprise +
+# Atmosphere. The billing export (2026-09-01 to 10-13) names the only SKU that
+# ever cost money: "Text Search Enterprise + Atmosphere", $0.04 a call once its
+# 1,000 free calls a month are gone (shared across the billing account; another
+# project spent them on Oct 2-3). "Text Search Pro" calls sat inside the free
+# allowance in the same period. Callers that read only name, type and distance
+# (the excursion sensor; the dining lane's "is this restaurant near me" check)
+# never needed ratings, hours or reviews. Billing follows the field mask alone,
+# not request parameters like openNow (Google's SKU docs).
+LEAN_FIELD_MASK = ",".join([
+    "places.id",
+    "places.displayName",
+    "places.formattedAddress",
+    "places.location",
+    "places.primaryTypeDisplayName",
+    "places.googleMapsUri",
+])
+
+# Always ask Google for a full page. The price is per request, not per result,
+# so one entry serves a --limit 5 caller and a --limit 20 caller alike.
+FETCH_COUNT = 20
+
+# Restaurant ranking: a rating shrunk toward a prior mean until enough reviews
+# have accumulated (so sheer popularity cannot outrank a better rating), plus a
+# bonus for being much more reviewed than the places around it (people go there
+# on purpose). An installation that ranks the same way elsewhere can pin the two
+# together with a parity test of its own.
+APP_PRIOR_MEAN_RATING = 4.0
+APP_PRIOR_WEIGHT = 40
+APP_DESTINATION_WEIGHT = 0.15
+APP_TOURIST_WEIGHT = 0.35
+APP_NEIGHBORHOOD_RADIUS_M = 500
+APP_MIN_NEIGHBORS = 3
+APP_MAX_DESTINATION_EXCESS = 1.5
+
+# Google's primaryType ids that mean somewhere to eat or drink. Machine ids from
+# the API, not words from the query (Rule #0b); every cuisine id ends in
+# `_restaurant`. Bars, bakeries, coffee shops, delis, diners and pubs rank the
+# same way.
+FOOD_PRIMARY_TYPES = frozenset({
+    "restaurant", "cafe", "coffee_shop", "bakery", "bar", "bar_and_grill", "pub",
+    "wine_bar", "deli", "diner", "steak_house", "sandwich_shop", "cafeteria",
+    "food_court", "ice_cream_shop", "dessert_shop", "donut_shop", "juice_shop",
+    "tea_house", "acai_shop", "meal_takeaway", "meal_delivery",
+})
+RANK_MODES = ("auto", "restaurant", "default")
+
+
+def _locate_argv():
+    if not LOCATE_CMD:
+        return None
+    cmd = list(LOCATE_CMD)
+    if os.sep not in cmd[0]:
+        sibling = os.path.join(_BIN, cmd[0])
+        if os.path.exists(sibling):
+            cmd[0] = sibling
+    return cmd
+
+
+def get_location_from_findme():
+    """Fallback: the user's position from the configured locator command."""
+    argv = _locate_argv()
+    if not argv:
+        return None
+    try:
+        result = subprocess.run(
+            argv,
+            capture_output=True, text=True, timeout=15
+        )
+        if result.returncode != 0:
+            return None
+        data = json.loads(result.stdout)
+        for device in data:
+            # findme returns flat "lat"/"lon" keys
+            lat = device.get("lat")
+            lon = device.get("lon")
+            if lat and lon:
+                return lat, lon, device.get("name", "device") + " (locator)"
+    except (subprocess.TimeoutExpired, json.JSONDecodeError, Exception):
+        pass
+    return None
+
+
+def get_my_location():
+    """The user's current coordinates, from the configured locator."""
+    loc = get_location_from_findme()
+    if loc:
+        return loc
+    if not LOCATE_CMD:
+        print("ERROR: No locator configured (agent/local/config/places.json locate_cmd).", file=sys.stderr)
+    else:
+        print("ERROR: Could not get location: the locator returned no position.", file=sys.stderr)
+    print("Tip: Use 'places at <lat>,<lng> <query>' to specify coordinates manually.", file=sys.stderr)
+    sys.exit(1)
+
+
+def haversine(lat1, lon1, lat2, lon2):
+    """Distance in meters between two coordinates."""
+    R = 6371000
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlam = math.radians(lon2 - lon1)
+    a = math.sin(dphi/2)**2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlam/2)**2
+    return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
+
+
+def load_saved_places():
+    """Load the Google Maps saved-places store (written by places-saved-import).
+    Returns [] if the store is absent or unreadable — saved cross-ref is optional."""
+    if not os.path.exists(SAVED_STORE):
+        return []
+    try:
+        with open(SAVED_STORE) as fh:
+            return json.load(fh).get("places", [])
+    except (json.JSONDecodeError, OSError):
+        return []
+
+
+def saved_nearby(lat, lng, radius):
+    """Return saved places within `radius` meters of (lat,lng), nearest first.
+    Skips entries that were never geocoded (lat/lng null)."""
+    hits = []
+    for p in load_saved_places():
+        if p.get("lat") is None or p.get("lng") is None:
+            continue
+        dist = haversine(lat, lng, p["lat"], p["lng"])
+        if dist <= radius:
+            hits.append({
+                "name": p.get("name", "Saved place"),
+                "list": p.get("list", "custom"),
+                "listLabel": list_label(p.get("list", "custom")),
+                "note": p.get("note", ""),
+                "distance": round(dist),
+                "distanceText": format_distance(dist),
+                "url": p.get("url", ""),
+                "address": p.get("address", ""),
+            })
+    hits.sort(key=lambda h: h["distance"])
+    return hits
+
+
+def stored_photo_url(place_id, slot, photo_name):
+    """Our own stored copy of a place's photograph, fetched from Google at most
+    once per place and slot (lib/place-photo-store.js). Never a Google
+    media URL: those carried the API key and billed on every load by whatever
+    rendered them, long after this tool had exited."""
+    if not place_id or not photo_name:
+        return None
+    try:
+        store = os.path.join(_BIN, "place-photo-store")
+        if not os.path.exists(store):
+            return None  # no photo store on this installation: no photo URLs
+        r = subprocess.run([store,
+                            "ensure", place_id, str(slot), photo_name],
+                           capture_output=True, text=True, timeout=60,
+                           env={**os.environ, "PLACE_PHOTO_TOOL": "places"})
+        if r.returncode != 0:
+            return None
+        return json.loads(r.stdout.strip() or "{}").get("url")
+    except Exception:
+        return None
+
+
+def _now_utc():
+    return datetime.now(timezone.utc)
+
+
+def local_open_status(place, now_utc):
+    """True/False/None for whether `place` is open at `now_utc`, from its stored
+    weekly hours and UTC offset. None when either is missing -- unknown, which is
+    not the same as closed. Pure geometry over Google's own periods (Rule #0b)."""
+    off = place.get("utcOffsetMinutes")
+    periods = (place.get("regularOpeningHours") or {}).get("periods")
+    if off is None or not periods:
+        return None
+    local = (now_utc + timedelta(minutes=off)).replace(tzinfo=None)
+    return match_periods(periods, local)
+
+
+def refresh_open_status(data, open_now, now_utc, age_sec):
+    """Bring a cached response's open-now answer up to date.
+
+    The entry says what was true when it was written. Served days later it
+    would call a place open on Shabbat because it was open on Tuesday, so each
+    place's `openNow` is re-derived from its weekly hours, and, for an open-now
+    search, places that are closed by those hours right now are dropped.
+    Returns None (treat as a miss) when too few survive to be an answer; the
+    live call that follows replaces the entry."""
+    raw = data.get("places", [])
+    out = []
+    for p in raw:
+        status = local_open_status(p, now_utc)
+        if status is False and open_now:
+            continue
+        q = dict(p)
+        cur = dict(q.get("currentOpeningHours") or {})
+        if status is not None:
+            cur["openNow"] = status
+        elif age_sec > 1800:
+            cur["openNow"] = None   # cannot be re-derived and too old to trust
+        q["currentOpeningHours"] = cur
+        out.append(q)
+    if open_now and len(out) < min(MIN_RESULTS, len(raw)):
+        return None
+    return {**data, "places": out}
+
+
+def lean_when_bucket(lng, now_utc):
+    """Weekday + 3-hour block of the venue's local clock (longitude / 15 is good
+    enough for a bucket). A lean entry carries no hours to re-derive open-now
+    from, so it is only reused at the same time of the same weekday."""
+    local = now_utc + timedelta(hours=round(lng / 15.0))
+    return f"d{local.weekday()}h{local.hour // 3}"
+
+
+def _compact(data):
+    """What process_results reads, and no more: the cache holds up to 20 places
+    per entry, and photo lists and review bodies are most of the weight."""
+    places = []
+    for p in data.get("places", []):
+        q = dict(p)
+        if q.get("photos"):
+            q["photos"] = [{"name": ph.get("name")} for ph in q["photos"][:MAX_PHOTOS]]
+        if q.get("reviews"):
+            q["reviews"] = q["reviews"][:1]
+        places.append(q)
+    return {**data, "places": places}
+
+
+TIER_MASKS = {"lean": LEAN_FIELD_MASK, "standard": FIELD_MASK, "rich": RICH_FIELD_MASK}
+
+
+def search_places(lat, lng, query, radius=DEFAULT_RADIUS, open_now=False, lean=False, refresh=False,
+                  tier=None):
+    """Google Places Text Search, behind a one-year cache keyed on the search and
+    a ~110 m cell (lib/places_cache.py). Always fetches a full page so one
+    entry serves every --limit; the caller ranks and trims.
+
+    tier: lean (Pro) | standard (Enterprise, default) | rich (Enterprise +
+    Atmosphere, opt-in and capped per caller). `lean=True` is tier="lean"."""
+    tier = tier or ("lean" if lean else "standard")
+    lean = tier == "lean"
+    mask = TIER_MASKS[tier]
+    now = _now_utc()
+    when = lean_when_bucket(lng, now) if (lean and open_now) else ""
+    key = places_cache.search_key(query, lat, lng, radius, open_now, mask, when)
+    # A rich entry is a superset of a standard one: serve it rather than buy again.
+    keys = [key]
+    if tier == "standard":
+        keys.append(places_cache.search_key(query, lat, lng, radius, open_now, RICH_FIELD_MASK, when))
+    for k in ([] if refresh else keys):
+        entry = places_cache.get(k, places_cache.SEARCH_TTL_SEC)
+        if entry is not None:
+            data = entry["payload"] if lean else refresh_open_status(
+                entry["payload"], open_now, now, entry["age_sec"])
+            if data is not None:
+                _places_log("places", "searchText", mask=mask, cached=True,
+                            query=query, lat=lat, lon=lng, radius=radius)
+                return data
+
+    body = {
+        "textQuery": query,
+        "locationBias": {
+            "circle": {
+                "center": {"latitude": lat, "longitude": lng},
+                "radius": float(radius)
+            }
+        },
+        "maxResultCount": FETCH_COUNT,
+        "languageCode": "en",
+    }
+    if open_now:
+        body["openNow"] = True
+
+    # places_client prices and gates the call (budget block, tier opt-in and
+    # daily cap, month ledger ceiling), logs it, and exits on a refusal.
+    try:
+        data = places_client.post("places", "places:searchText", body, mask, "searchText", timeout=15,
+                                  api_key=API_KEY, query=query, lat=lat, lon=lng, radius=radius)
+    except places_client.PlacesRefused as e:
+        places_client.refused_exit(e, "places")
+    except urllib.error.HTTPError as e:
+        err_body = e.read().decode() if e.fp else ""
+        print(f"ERROR: Places API {e.code}: {err_body[:300]}", file=sys.stderr)
+        sys.exit(1)
+    except Exception as e:
+        print(f"ERROR: Places API request failed: {e}", file=sys.stderr)
+        sys.exit(1)
+    data = _compact(data)
+    places_cache.put(key, data)
+    return data
+
+
+def rank_score(dist, rating, review_count, is_open):
+    """Composite score: higher is better.
+    - Open places get a big bonus
+    - Rating scaled (4.2-5.0 range mapped to 0-1)
+    - Popularity via log(reviews) — diminishing returns after ~1000
+    - Distance penalty — normalized against radius
+    """
+    open_bonus = 10.0 if is_open else 0.0
+    rating_score = max(0, (rating - 4.0) / 1.0) * 5.0 if rating else 0.0  # 4.0->0, 5.0->5
+    pop_score = math.log10(max(review_count, 1)) * 1.5  # 10->1.5, 100->3, 1000->4.5
+    dist_penalty = min(dist / 2000.0, 3.0)  # cap at 3 points penalty
+    return open_bonus + rating_score + pop_score - dist_penalty
+
+
+def app_quality(rating, review_count):
+    """Quality score: the rating pulled toward 4.0 until about 40
+    reviews have accumulated, so 20,000 reviews give almost no edge over 200."""
+    if not review_count:
+        return 0.0
+    return ((review_count * (rating or 0.0) + APP_PRIOR_WEIGHT * APP_PRIOR_MEAN_RATING)
+            / (review_count + APP_PRIOR_WEIGHT))
+
+
+def app_ranking_score(rating, review_count, destination_bonus=0.0, tourist_penalty=0.0):
+    """Ranking score, in star units. `places` never has a tourist penalty to
+    pass (that would need two extra hotel/attraction searches)."""
+    if not review_count:
+        return 0.0
+    return (app_quality(rating, review_count)
+            + APP_DESTINATION_WEIGHT * destination_bonus
+            - APP_TOURIST_WEIGHT * tourist_penalty)
+
+
+def _median(values):
+    if not values:
+        return 0.0
+    s = sorted(values)
+    mid = len(s) // 2
+    return s[mid] if len(s) % 2 else (s[mid - 1] + s[mid]) / 2
+
+
+def destination_bonuses(positions, review_counts):
+    """Destination bonus for every place of one result page: how
+    much more reviewed (log scale) it is than the places within 500 m of it, or
+    than the whole page when fewer than three are that close. Positive means
+    people go there on purpose; negative means it rides a busy strip. A position
+    of None is a place Google gave no coordinates for: it has no neighbours."""
+    logs = [math.log((c or 0) + 1) for c in review_counts]
+    pool_median = _median(logs)
+    out = []
+    for i, pos in enumerate(positions):
+        near = []
+        if pos is not None:
+            for j, other in enumerate(positions):
+                if j != i and other is not None and haversine(*pos, *other) <= APP_NEIGHBORHOOD_RADIUS_M:
+                    near.append(logs[j])
+        baseline = _median(near) if len(near) >= APP_MIN_NEIGHBORS else pool_median
+        out.append(max(-APP_MAX_DESTINATION_EXCESS, min(APP_MAX_DESTINATION_EXCESS, logs[i] - baseline)))
+    return out
+
+
+def is_food_type(primary_type):
+    t = primary_type or ""
+    return t in FOOD_PRIMARY_TYPES or t.endswith("_restaurant")
+
+
+def wants_restaurant_rank(raw_places, mode="auto"):
+    """Whether this page gets the restaurant ranking. `auto`: more
+    than half of the places Google typed are somewhere to eat or drink. One page
+    is one formula, because scores from two formulas cannot be compared."""
+    if mode in ("restaurant", "default"):
+        return mode == "restaurant"
+    typed = [p.get("primaryType") for p in raw_places if p.get("primaryType")]
+    return bool(typed) and 2 * sum(is_food_type(t) for t in typed) > len(typed)
+
+
+def build_overview(place_data):
+    """Extract a short overview from editorial summary, generative summary, or top review."""
+    # Editorial summary (curated by Google)
+    editorial = place_data.get("editorialSummary", {}).get("text")
+    if editorial:
+        return editorial
+
+    # Generative summary
+    gen = place_data.get("generativeSummary", {})
+    gen_overview = gen.get("overview", {}).get("text")
+    if gen_overview:
+        # Trim to ~200 chars at sentence boundary
+        if len(gen_overview) > 200:
+            cut = gen_overview[:200].rfind(".")
+            if cut > 80:
+                return gen_overview[:cut + 1]
+        return gen_overview
+
+    # Fall back to first review snippet
+    reviews = place_data.get("reviews", [])
+    if reviews:
+        txt = reviews[0].get("text", {}).get("text", "")
+        if txt:
+            if len(txt) > 200:
+                cut = txt[:200].rfind(".")
+                if cut > 50:
+                    return txt[:cut + 1]
+                return txt[:200] + "..."
+            return txt
+
+    return ""
+
+
+def format_distance(meters):
+    if meters < 200:
+        return f"{int(meters)}m"
+    elif meters < 1000:
+        return f"{int(round(meters, -1))}m"
+    else:
+        return f"{meters/1000:.1f}km"
+
+
+PRICE_MAP = {
+    "PRICE_LEVEL_FREE": "Free",
+    "PRICE_LEVEL_INEXPENSIVE": "$",
+    "PRICE_LEVEL_MODERATE": "$$",
+    "PRICE_LEVEL_EXPENSIVE": "$$$",
+    "PRICE_LEVEL_VERY_EXPENSIVE": "$$$$",
+}
+
+
+def process_results(data, my_lat, my_lng, limit, as_json=False, saved_hits=None, want_photos=False,
+                    rank="auto"):
+    saved_hits = saved_hits or []
+    raw_places = data.get("places", [])
+    if not raw_places and not saved_hits:
+        print("No places found." if not as_json else json.dumps({"results": [], "savedNearby": []}, indent=2))
+        return
+
+    # A food page is ordered by the restaurant ranking (open places first,
+    # then its rankingScore, nearest breaking a tie); anything else keeps
+    # rank_score. The destination bonus reads the whole page, so it is worked out
+    # here before any place is dropped.
+    food_rank = wants_restaurant_rank(raw_places, rank)
+    bonuses = [0.0] * len(raw_places)
+    if food_rank:
+        spots = []
+        for p in raw_places:
+            loc = p.get("location") or {}
+            has_fix = loc.get("latitude") is not None and loc.get("longitude") is not None
+            spots.append((loc["latitude"], loc["longitude"]) if has_fix else None)
+        bonuses = destination_bonuses(spots, [p.get("userRatingCount", 0) for p in raw_places])
+
+    results = []
+    for idx, p in enumerate(raw_places):
+        loc = p.get("location", {})
+        plat = loc.get("latitude", 0)
+        plng = loc.get("longitude", 0)
+        dist = haversine(my_lat, my_lng, plat, plng)
+
+        rating = p.get("rating")
+        rating_count = p.get("userRatingCount", 0)
+        hours = p.get("currentOpeningHours", {})
+        is_open = hours.get("openNow")
+
+        if food_rank:
+            score = (1 if is_open else 0,
+                     app_ranking_score(rating, rating_count, bonuses[idx]),
+                     -dist)
+        else:
+            score = rank_score(dist, rating, rating_count, is_open)
+
+        # Photographs only when asked for (--photos): each one is a stored
+        # copy, fetched from Google once per place and slot, never a key-bearing
+        # Google URL. Off by default because a 20-result answer is 60 fetches
+        # the first time and most callers never render them.
+        photos = []
+        if want_photos:
+            for slot, photo in enumerate((p.get("photos") or [])[:MAX_PHOTOS]):
+                url = stored_photo_url(p.get("id"), slot, photo.get("name"))
+                if url:
+                    photos.append(url)
+        overview = build_overview(p)
+
+        results.append({
+            "name": p.get("displayName", {}).get("text", "?"),
+            "address": p.get("formattedAddress", ""),
+            "rating": rating,
+            "ratingCount": rating_count,
+            "priceLevel": PRICE_MAP.get(p.get("priceLevel", ""), ""),
+            "distance": round(dist),
+            "distanceText": format_distance(dist),
+            # Where the place actually IS. Distance alone can't draw a map, and
+            # the hum `nearby` lane needs a subject coordinate to render the
+            # "you are here, it is there" mini-map on its pings.
+            "lat": plat,
+            "lng": plng,
+            "isOpen": is_open,
+            "type": p.get("primaryTypeDisplayName", {}).get("text", ""),
+            "mapsUrl": (f"https://www.google.com/maps/place/?q=place_id:{p['id']}" if p.get("id") else p.get("googleMapsUri", "")),
+            "overview": overview,
+            "photos": photos,
+            "_score": score,
+            "_rating_ok": (rating or 0) >= MIN_RATING,
+        })
+
+    # Prefer 4.2+ rated places; fall back to lower-rated if not enough
+    good = [r for r in results if r["_rating_ok"]]
+    if len(good) >= MIN_RESULTS:
+        results = good
+    else:
+        # Keep all, but good ones float to top via score
+        pass
+
+    # Sort by composite score (descending)
+    results.sort(key=lambda x: x["_score"], reverse=True)
+    results = results[:max(limit, MIN_RESULTS)]
+
+    # Clean internal fields
+    for r in results:
+        del r["_score"]
+        del r["_rating_ok"]
+
+    if as_json:
+        print(json.dumps({"results": results,
+                          "ranking": "restaurant" if food_rank else "default",
+                          "savedNearby": saved_hits[:SAVED_SHOW],
+                          "savedNearbyTotal": len(saved_hits)}, indent=2))
+        return
+
+    for i, r in enumerate(results):
+        # Header line
+        parts = [f"{i+1}. {r['name']}"]
+        if r["rating"]:
+            stars = f"{r['rating']}"
+            if r["ratingCount"]:
+                stars += f" ({r['ratingCount']} reviews)"
+            parts.append(stars)
+        parts.append(r["distanceText"] + " away")
+        if r["isOpen"] is True:
+            parts.append("OPEN")
+        elif r["isOpen"] is False:
+            parts.append("CLOSED")
+        if r["priceLevel"]:
+            parts.append(r["priceLevel"])
+        print(" | ".join(parts))
+
+        # Overview
+        if r["overview"]:
+            print(f"   {r['overview']}")
+
+        # Address + Maps
+        print(f"   {r['address']}")
+        if r["mapsUrl"]:
+            print(f"   {r['mapsUrl']}")
+
+        # Photos
+        for j, url in enumerate(r["photos"]):
+            print(f"   Photo {j+1}: {url}")
+
+        print()
+
+    # Saved-places cross-reference section (cap the display — dense areas can
+    # have 100+ saved pins within range; show the nearest SAVED_SHOW + a count)
+    if saved_hits:
+        print("── Your saved places nearby ──")
+        for h in saved_hits[:SAVED_SHOW]:
+            print(f"{h['listLabel']}: {h['name']} | {h['distanceText']} away")
+            if h.get("note"):
+                print(f"   {h['note']}")
+        extra = len(saved_hits) - SAVED_SHOW
+        if extra > 0:
+            print(f"…and {extra} more saved place(s) nearby.")
+        print()
+
+
+DETAILS_FIELD_MASK = "id,displayName,formattedAddress,businessStatus,regularOpeningHours,currentOpeningHours"
+
+WEEKDAY_NAMES = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"]
+
+
+def parse_at(at_str):
+    """Parse an ISO-ish datetime string into a naive datetime. Any trailing
+    Z/offset is dropped deliberately — 'check' answers with the venue's own
+    local wall-clock time (business hours are inherently local; the caller
+    means '1pm Tuesday there', not a UTC instant)."""
+    s = at_str.strip()
+    if "T" not in s and " " in s:
+        s = s.replace(" ", "T", 1)
+    if "T" in s:
+        date_part, time_part = s.split("T", 1)
+        if time_part.endswith("Z"):
+            time_part = time_part[:-1]
+        else:
+            for sign in ("+", "-"):
+                idx = time_part.rfind(sign)
+                # Offset is ±HH:MM or ±HHMM at the very end of the time part;
+                # idx>0 so we don't mistake a leading sign (never valid here).
+                if idx > 0:
+                    candidate = time_part[idx:]
+                    if len(candidate) in (5, 6) and candidate[1:].replace(":", "").isdigit():
+                        time_part = time_part[:idx]
+                    break
+        s = f"{date_part}T{time_part}"
+    for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(s, fmt)
+        except ValueError:
+            continue
+    print(f"ERROR: Could not parse --at value '{at_str}'. Use ISO 8601, e.g. 2026-09-29T13:00:00", file=sys.stderr)
+    sys.exit(1)
+
+
+def parse_date_time(date_str, time_str):
+    """--date YYYY-MM-DD [--time HH:MM] -> naive datetime. Time defaults to noon."""
+    try:
+        d = datetime.strptime(date_str, "%Y-%m-%d").date()
+    except ValueError:
+        print(f"ERROR: Could not parse --date value '{date_str}'. Use YYYY-MM-DD", file=sys.stderr)
+        sys.exit(1)
+    t = None
+    for fmt in ("%H:%M:%S", "%H:%M"):
+        try:
+            t = datetime.strptime(time_str or "12:00", fmt).time()
+            break
+        except ValueError:
+            continue
+    if t is None:
+        print(f"ERROR: Could not parse --time value '{time_str}'. Use HH:MM, e.g. 13:00", file=sys.stderr)
+        sys.exit(1)
+    return datetime.combine(d, t)
+
+
+def google_weekday(dt):
+    """0=Sunday..6=Saturday, matching the Places API's opening-hours day
+    numbering (Python's dt.weekday() is Monday=0, so shift by one)."""
+    return (dt.weekday() + 1) % 7
+
+
+def _week_minute(day, hour, minute):
+    return day * 1440 + hour * 60 + minute
+
+
+def match_periods(periods, target_dt):
+    """True/False/None (None = no periods to check against — no published
+    hours) for whether target_dt falls inside one of the opening periods.
+    Handles overnight spans (close wraps past midnight into the next day)
+    and week-boundary wraps (a Saturday-night-into-Sunday period matched
+    against an early-Sunday target) by comparing minute-of-week positions,
+    checking the target both as-is and shifted a full week forward."""
+    if not periods:
+        return None
+    target_day = google_weekday(target_dt)
+    target_min = _week_minute(target_day, target_dt.hour, target_dt.minute)
+    for period in periods:
+        open_ = period.get("open")
+        if not open_:
+            continue
+        close_ = period.get("close")
+        if close_ is None:
+            # No close listed for this period at all -> open 24 hours.
+            return True
+        open_min = _week_minute(open_.get("day", 0), open_.get("hour", 0), open_.get("minute", 0))
+        close_min = _week_minute(close_.get("day", 0), close_.get("hour", 0), close_.get("minute", 0))
+        if close_min <= open_min:
+            close_min += 7 * 1440
+        for t in (target_min, target_min + 7 * 1440):
+            if open_min <= t < close_min:
+                return True
+    return False
+
+
+def hours_line_for_day(weekday_descriptions, target_day):
+    """weekdayDescriptions is Monday-first (index 0 = Monday .. 6 = Sunday,
+    per Google's Place Details convention); target_day is the Places API's
+    period numbering (0 = Sunday .. 6 = Saturday)."""
+    if not weekday_descriptions or len(weekday_descriptions) != 7:
+        return None
+    idx = (target_day + 6) % 7
+    return weekday_descriptions[idx]
+
+
+def resolve_place_for_check(query_or_id, near):
+    """Return a place_id: used directly if query_or_id already looks like one
+    (Google place_ids start 'ChIJ' and never contain whitespace), otherwise
+    resolved via Text Search (top match), location-biased on --near or, if
+    that's absent, the user's current location — same fallback as `nearby`."""
+    q = query_or_id.strip()
+    if q.startswith("ChIJ") and " " not in q:
+        return q
+
+    lat = lng = None
+    if near:
+        lat, lng = near
+    else:
+        lat, lng, _ = get_my_location()
+
+    # A place id for a given name does not change, so this lookup keeps for a
+    # month; the bias point is bucketed coarsely because it only decides which
+    # "Le Coucou" wins.
+    rkey = places_cache.resolve_key(q, (lat, lng) if lat is not None else None)
+    entry = places_cache.get(rkey, places_cache.RESOLVE_TTL_SEC)
+    if entry is not None and entry["payload"].get("place_id"):
+        _places_log("places", "searchText", mask="places.id,places.displayName,places.formattedAddress", cached=True,
+                    query=q, lat=lat, lon=lng)
+        return entry["payload"]["place_id"]
+
+    mask = "places.id,places.displayName,places.formattedAddress"
+    body = {"textQuery": q, "maxResultCount": 1, "languageCode": "en"}
+    if lat is not None:
+        body["locationBias"] = {"circle": {"center": {"latitude": lat, "longitude": lng}, "radius": 20000.0}}
+
+    try:
+        data = places_client.post("places", "places:searchText", body, mask, "searchText", timeout=15,
+                                  api_key=API_KEY, query=q, lat=lat, lon=lng)
+    except places_client.PlacesRefused as e:
+        places_client.refused_exit(e, "places")
+    except urllib.error.HTTPError as e:
+        err_body = e.read().decode() if e.fp else ""
+        print(f"ERROR: Places API {e.code}: {err_body[:300]}", file=sys.stderr)
+        sys.exit(1)
+    except Exception as e:
+        print(f"ERROR: Places API request failed: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    places = data.get("places", [])
+    if not places:
+        print(f"ERROR: No place found matching \"{q}\".", file=sys.stderr)
+        sys.exit(1)
+    places_cache.put(rkey, {"place_id": places[0]["id"]}, ttl_sec=places_cache.RESOLVE_TTL_SEC)
+    return places[0]["id"]
+
+
+def get_place_details(place_id):
+    """Place Details (New) by place_id — regularOpeningHours/currentOpeningHours
+    are Enterprise-tier fields (see lib/places_log.py); this call is
+    logged like every other Places call so places-budget sees it."""
+    dkey = places_cache.details_key(place_id, DETAILS_FIELD_MASK)
+    entry = places_cache.get(dkey, places_cache.DETAILS_TTL_SEC)
+    if entry is not None:
+        _places_log("places", "details", mask=DETAILS_FIELD_MASK, cached=True, place_id=place_id)
+        return entry["payload"]
+
+    try:
+        data = places_client.get("places", f"places/{place_id}", DETAILS_FIELD_MASK, "details", timeout=15,
+                                 api_key=API_KEY, place_id=place_id)
+        places_cache.put(dkey, data, ttl_sec=places_cache.DETAILS_TTL_SEC)
+        return data
+    except places_client.PlacesRefused as e:
+        places_client.refused_exit(e, "places")
+    except urllib.error.HTTPError as e:
+        err_body = e.read().decode() if e.fp else ""
+        print(f"ERROR: Places API {e.code}: {err_body[:300]}", file=sys.stderr)
+        sys.exit(1)
+    except Exception as e:
+        print(f"ERROR: Places API request failed: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+def _normalize_periods_for_diff(periods):
+    """Strip the concrete calendar `date` Google attaches to each open/close
+    in currentOpeningHours (regularOpeningHours never carries it, since it's
+    describing a recurring weekly pattern, not specific upcoming dates) so
+    the two can be compared on the hours pattern alone — day/hour/minute —
+    without every call reporting a difference that isn't really there."""
+    norm = []
+    for p in periods or []:
+        entry = {}
+        for key in ("open", "close"):
+            v = p.get(key)
+            entry[key] = {k: v.get(k) for k in ("day", "hour", "minute")} if v else None
+        norm.append(entry)
+    return norm
+
+
+def run_check(query_or_id, near, target_dt, as_json=False):
+    place_id = resolve_place_for_check(query_or_id, near)
+    details = get_place_details(place_id)
+
+    name = details.get("displayName", {}).get("text", query_or_id)
+    address = details.get("formattedAddress", "")
+    status = details.get("businessStatus", "")
+    regular = details.get("regularOpeningHours", {}) or {}
+    current = details.get("currentOpeningHours", {}) or {}
+
+    target_day = google_weekday(target_dt)
+    day_name = WEEKDAY_NAMES[target_day]
+    hours_line = hours_line_for_day(regular.get("weekdayDescriptions"), target_day)
+
+    # currentOpeningHours reflects any near-term special/holiday override
+    # Google currently has on file; regularOpeningHours is the general weekly
+    # pattern used for the actual future-date match below. A difference
+    # between them is a signal worth surfacing, not the match input itself.
+    special_hours_flag = (
+        "periods" in regular and "periods" in current
+        and _normalize_periods_for_diff(regular.get("periods"))
+        != _normalize_periods_for_diff(current.get("periods"))
+    )
+
+    reason = None
+    if status and status != "OPERATIONAL":
+        verdict = "CLOSED"
+        reason = f"business status is {status}"
+    else:
+        is_open = match_periods(regular.get("periods"), target_dt)
+        if is_open is None:
+            verdict = "UNKNOWN"
+            reason = "no published hours for this place"
+        else:
+            verdict = "OPEN" if is_open else "CLOSED"
+
+    if as_json:
+        print(json.dumps({
+            "placeId": place_id,
+            "name": name,
+            "address": address,
+            "businessStatus": status,
+            "target": target_dt.isoformat(),
+            "targetDay": day_name,
+            "verdict": verdict,
+            "reason": reason,
+            "hoursForDay": hours_line,
+            "specialHoursInEffect": special_hours_flag,
+        }, indent=2))
+        return
+
+    when_str = f"{target_dt.strftime('%a, %b %-d, %Y')} at {target_dt.strftime('%-I:%M %p')}"
+    print(f"Checking \"{name}\" for {when_str} ({day_name})...\n")
+    print(f"Place: {name}")
+    if address:
+        print(f"Address: {address}")
+    if status:
+        print(f"Business status: {status}")
+    if hours_line:
+        print(hours_line)
+    print()
+    if reason:
+        print(f"Verdict: {verdict} — {reason}.")
+    else:
+        print(f"Verdict: {verdict} at {target_dt.strftime('%-I:%M %p')} on {day_name}.")
+    if special_hours_flag:
+        print("\n⚠️  currentOpeningHours differs from the regular weekly pattern — Google has a "
+              "special/holiday-hours override on file right now. Worth a direct check for dates near today.")
+
+
+def parse_check_args(args):
+    """Parse `places check` arguments, return dict."""
+    opts = {"near": None, "at": None, "date": None, "time": None, "as_json": False}
+    positional = []
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == "--near" and i + 1 < len(args):
+            try:
+                lat_s, lng_s = args[i + 1].split(",")
+                opts["near"] = (float(lat_s), float(lng_s))
+            except ValueError:
+                print("ERROR: --near expects lat,lng (e.g. 12.3456,-65.4321)", file=sys.stderr)
+                sys.exit(1)
+            i += 2
+        elif a == "--at" and i + 1 < len(args):
+            opts["at"] = args[i + 1]
+            i += 2
+        elif a == "--date" and i + 1 < len(args):
+            opts["date"] = args[i + 1]
+            i += 2
+        elif a == "--time" and i + 1 < len(args):
+            opts["time"] = args[i + 1]
+            i += 2
+        elif a == "--json":
+            opts["as_json"] = True
+            i += 1
+        elif a == "--lane" and i + 1 < len(args):
+            os.environ["PLACES_LANE"] = args[i + 1]
+            i += 2
+        else:
+            positional.append(a)
+            i += 1
+    return opts, positional
+
+
+def parse_args(args):
+    """Parse CLI arguments, return dict."""
+    opts = {
+        "radius": DEFAULT_RADIUS,
+        "limit": MAX_RESULTS,
+        "open_now": True,  # Default: only open places
+        "as_json": False,
+        "photos": False,
+        "saved": True,
+        "saved_radius": None,  # None → max(radius, SAVED_RADIUS_MIN)
+        "lean": False,
+        "tier": None,
+        "refresh": False,
+        "rank": "auto",
+    }
+    positional = []
+    i = 0
+    while i < len(args):
+        if args[i] == "--radius" and i + 1 < len(args):
+            opts["radius"] = int(args[i + 1])
+            i += 2
+        elif args[i] == "--limit" and i + 1 < len(args):
+            opts["limit"] = max(int(args[i + 1]), MIN_RESULTS)
+            i += 2
+        elif args[i] == "--no-saved":
+            opts["saved"] = False
+            i += 1
+        elif args[i] == "--saved-radius" and i + 1 < len(args):
+            opts["saved_radius"] = int(args[i + 1])
+            i += 2
+        elif args[i] == "--include-closed":
+            opts["open_now"] = False
+        elif args[i] == "--photos":
+            opts["photos"] = True
+            i += 1
+        elif args[i] == "--lean":
+            opts["lean"] = True
+            i += 1
+        elif args[i] == "--tier" and i + 1 < len(args):
+            if args[i + 1] not in TIER_MASKS:
+                print(f"ERROR: --tier takes one of {', '.join(TIER_MASKS)}, not '{args[i + 1]}'.", file=sys.stderr)
+                sys.exit(1)
+            opts["tier"] = args[i + 1]
+            i += 2
+        elif args[i] == "--refresh":
+            opts["refresh"] = True
+            i += 1
+        elif args[i] == "--rank" and i + 1 < len(args):
+            if args[i + 1] not in RANK_MODES:
+                print(f"ERROR: --rank takes one of {', '.join(RANK_MODES)}, not '{args[i + 1]}'.", file=sys.stderr)
+                sys.exit(1)
+            opts["rank"] = args[i + 1]
+            i += 2
+        elif args[i] == "--lane" and i + 1 < len(args):
+            # Tags every call this process logs; also inherited by anything it spawns.
+            os.environ["PLACES_LANE"] = args[i + 1]
+            i += 2
+        elif args[i] == "--open":
+            # Legacy flag, already default — accept silently
+            i += 1
+        elif args[i] == "--json":
+            opts["as_json"] = True
+            i += 1
+        else:
+            positional.append(args[i])
+            i += 1
+    return opts, positional
+
+
+def main():
+    args = sys.argv[1:]
+    if not args or args[0] in ("-h", "--help"):
+        print(USAGE)
+        sys.exit(0)
+
+    cmd = args[0]
+    lat = lng = None
+    device_name = None
+
+    if cmd == "check":
+        opts, positional = parse_check_args(args[1:])
+        if not positional:
+            print("ERROR: Missing place. Usage: places check <place-id-or-query> --at <ISO datetime>", file=sys.stderr)
+            sys.exit(1)
+        query_or_id = " ".join(positional)
+        if opts["at"]:
+            target_dt = parse_at(opts["at"])
+        elif opts["date"]:
+            target_dt = parse_date_time(opts["date"], opts["time"])
+        else:
+            print("ERROR: Provide --at <ISO datetime> or --date YYYY-MM-DD [--time HH:MM]", file=sys.stderr)
+            sys.exit(1)
+        run_check(query_or_id, opts["near"], target_dt, as_json=opts["as_json"])
+        return
+
+    if cmd == "nearby":
+        opts, positional = parse_args(args[1:])
+        if not positional:
+            print("ERROR: Missing search query. Usage: places nearby \"coffee shop\"", file=sys.stderr)
+            sys.exit(1)
+        query = " ".join(positional)
+        lat, lng, device_name = get_my_location()
+
+    elif cmd == "at":
+        if len(args) < 3:
+            print("ERROR: Usage: places at <lat>,<lng> <query>", file=sys.stderr)
+            sys.exit(1)
+        try:
+            coords = args[1].split(",")
+            lat, lng = float(coords[0]), float(coords[1])
+        except (ValueError, IndexError):
+            print("ERROR: Invalid coordinates. Use: lat,lng (e.g., 12.3456,-65.4321)", file=sys.stderr)
+            sys.exit(1)
+        opts, positional = parse_args(args[2:])
+        query = " ".join(positional)
+    else:
+        print(f"ERROR: Unknown command '{cmd}'. Use 'nearby', 'at', or 'check'.", file=sys.stderr)
+        sys.exit(1)
+
+    if not opts["as_json"]:
+        loc_str = f"{lat:.4f},{lng:.4f}"
+        if device_name:
+            loc_str += f" (from {device_name})"
+        print(f"Searching for \"{query}\" near {loc_str}...\n")
+
+    # A full page is fetched (and cached) whatever --limit is; ranking trims it.
+    data = search_places(lat, lng, query, radius=opts["radius"], open_now=opts["open_now"],
+                         lean=opts.get("lean", False), refresh=opts.get("refresh", False),
+                         tier=opts.get("tier"))
+
+    # Cross-reference Google Maps saved places within range (independent of query)
+    saved_hits = []
+    if opts.get("saved", True):
+        sr = opts.get("saved_radius") or max(opts["radius"], SAVED_RADIUS_MIN)
+        saved_hits = saved_nearby(lat, lng, sr)
+
+    process_results(data, lat, lng, opts["limit"], as_json=opts["as_json"], saved_hits=saved_hits,
+                    want_photos=opts.get("photos", False), rank=opts.get("rank", "auto"))
+
+
+if __name__ == "__main__":
+    main()

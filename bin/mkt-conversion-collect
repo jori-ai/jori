@@ -1,0 +1,254 @@
+#!/usr/bin/env node
+// mkt-conversion-collect — nightly paid-funnel conversion collector for the
+// marketing module's app (agent/local/config/marketing.json; OFF without it).
+//
+// Builds the Reddit-ads -> download funnel by READING existing collector state
+// (no new API auth needed for the working half, so it runs even when 1Password
+// is locked):
+//   - data/mkt-reddit-ads-state.json  (per-creative impressions/clicks/spend, by the Reddit-ads monitor)
+//   - data/mkt-metrics-state.json      (ASC first-time installs, by mkt-metrics-collect)
+//
+// GA4 (LP views + app_download_click) and AppsFlyer (installs by pid/c/af_ad)
+// are NO-OP until their creds are present (the app SDK's "no-op until
+// configured" pattern). When configured they fill in the missing
+// funnel stages (LP CTR, per-creative CPI).
+//
+// Output: data/mkt-conversion-state.json  (read by the digest and ideation
+// jobs; the optimizer playbook turns it into proposals).
+
+const fs = require("fs");
+const path = require("path");
+const { localConfig } = require("../lib/instance.cjs");
+const { installTools, toolsPath } = require("../lib/root.cjs");
+
+const CFG = localConfig("marketing", { ios_app_id: "", android_package: "", python: "", venv: "", tz: "" });
+// The interpreter with the GA4 client libraries: `python`, else <venv>/bin/python3.
+const expandHome = (p) => (p && p.startsWith("~/") ? path.join(require("node:os").homedir(), p.slice(2)) : p);
+const PYTHON = expandHome(CFG.python) || (CFG.venv ? path.join(expandHome(CFG.venv), "bin", "python3") : "python3");
+const DATA = installTools("data");
+const SECRETS = installTools("secrets");
+const OUT = path.join(DATA, "mkt-conversion-state.json");
+
+function readJson(p) {
+  try { return JSON.parse(fs.readFileSync(p, "utf8")); } catch { return null; }
+}
+function save(obj) {
+  const tmp = OUT + ".tmp";
+  fs.writeFileSync(tmp, JSON.stringify(obj, null, 2));
+  fs.renameSync(tmp, OUT);
+}
+const round = (n, d = 2) => (n == null || isNaN(n) ? null : Math.round(n * 10 ** d) / 10 ** d);
+
+// ---- Reddit per-creative spend/clicks (from mkt-reddit-ads-state.json) ----
+function redditByCreative() {
+  const s = readJson(path.join(DATA, "mkt-reddit-ads-state.json"));
+  if (!s) return { configured: false, note: "mkt-reddit-ads-state.json missing", creatives: [] };
+  // Map ad_id -> af_ad token parsed from the ad's OneLink click_url (af_ad=...),
+  // falling back to the ad name. Use yesterday.per_ad for the daily window.
+  const adMeta = {};
+  for (const a of s.ads || []) {
+    let afAd = null;
+    const m = /[?&]af_ad=([^&]+)/.exec(a.click_url || "");
+    if (m) afAd = decodeURIComponent(m[1]);
+    adMeta[a.id] = { name: a.name, af_ad: afAd, click_url: a.click_url || null };
+  }
+  const day = (s.yesterday && s.yesterday.per_ad) || [];
+  const creatives = day.map((r) => {
+    const meta = adMeta[r.ad_id] || {};
+    const spend = (r.spend_cents || 0) / 100;
+    return {
+      ad_id: r.ad_id,
+      af_ad: meta.af_ad,
+      name: r.ad_name || meta.name,
+      impressions: r.impressions || 0,
+      clicks: r.clicks || 0,
+      spend: round(spend),
+      ctr_pct: r.ctr_pct != null ? round(r.ctr_pct) : (r.impressions ? round((r.clicks / r.impressions) * 100) : null),
+      cpc: r.clicks ? round(spend / r.clicks) : null,
+      // download-funnel stages (filled by GA4 / AppsFlyer when configured):
+      lp_views: null, download_clicks: null, lp_ctr_pct: null,
+      installs: null, cpi: null,
+    };
+  });
+  return {
+    configured: true,
+    date: s.yesterday && s.yesterday.date,
+    routes_to_onelink: creatives.some((c) => c.af_ad),
+    creatives,
+  };
+}
+
+// ---- ASC first-time installs (from mkt-metrics-state.json) ----
+function ascInstalls(date) {
+  const s = readJson(path.join(DATA, "mkt-metrics-state.json"));
+  if (!s) return { configured: false, first_time_total: null, note: "mkt-metrics-state.json missing" };
+  const daily = s.daily || [];
+  const row = date ? daily.find((d) => d.date === date) : null;
+  const ft = row && row.asc_downloads_breakdown ? row.asc_downloads_breakdown.first_time : (row ? row.asc_downloads : null);
+  return {
+    configured: true,
+    downloads_status: s.asc && s.asc.downloads_status,
+    date,
+    first_time_installs: ft != null ? ft : null,
+    rolling_7d: s.rolling && s.rolling["7d"] ? s.rolling["7d"].asc_downloads : null,
+  };
+}
+
+// ---- GA4 (no-op until configured) ----
+// To enable: drop secrets/ga4-config.json = {"property_id":"123456789",
+// "sa_key_path":"secrets/ga4-sa.json"} and implement the Data API pull
+// (runReport: pageviews + app_download_click events for /lp/* pages).
+function ga4(date) {
+  const cfgPath = path.join(SECRETS, "ga4-config.json");
+  const cfg = readJson(cfgPath);
+  if (!cfg || !cfg.property_id) {
+    return { configured: false, note: "GA4 Data API not configured (need property_id + SA viewer access). LP funnel unavailable." };
+  }
+  if (!date) return { configured: true, property_id: cfg.property_id, lp_views: null, download_clicks: null, note: "no window date" };
+  try {
+    const { execFileSync } = require("child_process");
+    const out = execFileSync(
+      PYTHON,
+      [toolsPath("bin", "mkt-ga4-lp-pull.py"), cfgPath, date],
+      { encoding: "utf8", maxBuffer: 10 * 1024 * 1024 }
+    );
+    const d = JSON.parse(out.trim().split("\n").filter(Boolean).pop());
+    return { configured: true, property_id: cfg.property_id, lp_views: d.lp_views, download_clicks: d.download_clicks, lp_views_by_path: d.lp_views_by_path, download_clicks_by_path: d.download_clicks_by_path };
+  } catch (e) {
+    return { configured: true, property_id: cfg.property_id, error: String((e && e.message) || e).slice(0, 200), lp_views: null, download_clicks: null };
+  }
+}
+
+// Minimal RFC-4180-ish CSV parser (handles quoted fields + BOM).
+function parseCsv(text) {
+  text = text.replace(/^﻿/, "");
+  const rows = []; let row = [], field = "", q = false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (q) {
+      if (c === '"') { if (text[i + 1] === '"') { field += '"'; i++; } else q = false; }
+      else field += c;
+    } else if (c === '"') q = true;
+    else if (c === ",") { row.push(field); field = ""; }
+    else if (c === "\n") { row.push(field); rows.push(row); row = []; field = ""; }
+    else if (c !== "\r") field += c;
+  }
+  if (field.length || row.length) { row.push(field); rows.push(row); }
+  return rows;
+}
+
+// ---- AppsFlyer Pull API — installs grouped by af_ad (per-creative) ----
+// Raw-data installs_report v5 for both platforms; group by the "Ad" column
+// (= af_ad). Token at secrets/appsflyer-pull-token (gitignored). No-op
+// until the token exists.
+async function appsflyer(date) {
+  let token = null;
+  try { token = fs.readFileSync(path.join(SECRETS, "appsflyer-pull-token"), "utf8").trim(); } catch {}
+  if (!token) {
+    return { configured: false, note: "AppsFlyer Pull API token not set. Per-creative installs/CPI unavailable; using ASC totals." };
+  }
+  if (!date) return { configured: true, by_af_ad: {}, total: 0, note: "no window date" };
+  const apps = {};
+  if (CFG.ios_app_id) apps.ios = `id${CFG.ios_app_id}`;
+  if (CFG.android_package) apps.android = CFG.android_package;
+  const tz = encodeURIComponent(CFG.tz || require("../lib/instance.cjs").instance().tz || "UTC");
+  const byAfAd = {}, byPlatform = {}, errors = [];
+  let total = 0;
+  for (const [plat, appId] of Object.entries(apps)) {
+    try {
+      const url = `https://hq1.appsflyer.com/api/raw-data/export/app/${appId}/installs_report/v5?from=${date}&to=${date}&timezone=${tz}`;
+      const res = await fetch(url, { headers: { Authorization: "Bearer " + token, accept: "text/csv" } });
+      if (!res.ok) { errors.push(`${plat}:HTTP${res.status}`); continue; }
+      const rows = parseCsv(await res.text());
+      if (rows.length < 2) { byPlatform[plat] = 0; continue; }
+      const adIdx = rows[0].indexOf("Ad");
+      let n = 0;
+      for (let i = 1; i < rows.length; i++) {
+        const r = rows[i];
+        if (!r.length || (r.length === 1 && r[0] === "")) continue;
+        n++;
+        const af = (adIdx >= 0 && r[adIdx]) ? r[adIdx] : "(none)";
+        byAfAd[af] = (byAfAd[af] || 0) + 1;
+      }
+      byPlatform[plat] = n; total += n;
+    } catch (e) { errors.push(`${plat}:${String((e && e.message) || e).slice(0, 80)}`); }
+  }
+  return { configured: true, total, by_af_ad: byAfAd, by_platform: byPlatform, errors: errors.length ? errors : undefined };
+}
+
+async function main() {
+  if (!CFG.ios_app_id && !CFG.android_package) {
+    console.log("mkt-conversion-collect: not configured (agent/local/config/marketing.json) — nothing to do");
+    return;
+  }
+  const reddit = redditByCreative();
+  const date = reddit.date || null;
+  const asc = ascInstalls(date);
+  const g = ga4(date);
+  const af = await appsflyer(date);
+
+  // Campaign-level rollups from what we have.
+  const totalSpend = reddit.creatives.reduce((s, c) => s + (c.spend || 0), 0);
+  const totalClicks = reddit.creatives.reduce((s, c) => s + (c.clicks || 0), 0);
+  const totalImpr = reddit.creatives.reduce((s, c) => s + (c.impressions || 0), 0);
+
+  // Installs: AppsFlyer = paid/attributed installs (the true paid-funnel number,
+  // can be 0 legitimately). ASC first-time = ALL first installs (organic+paid) —
+  // kept as context. Headline `installs` uses AppsFlyer when configured.
+  const afOn = af.configured && af.by_af_ad;
+  const installs = afOn ? af.total : asc.first_time_installs;
+
+  // Per-creative installs/CPI from AppsFlyer's af_ad grouping.
+  if (afOn) {
+    for (const c of reddit.creatives) {
+      const n = (c.af_ad && af.by_af_ad[c.af_ad]) || 0;
+      c.installs = n;
+      c.cpi = n ? round(c.spend / n) : null;
+    }
+  }
+
+  const lpViews = g.lp_views != null ? g.lp_views : null;
+  const dlClicks = g.download_clicks != null ? g.download_clicks : null;
+  const totals = {
+    impressions: totalImpr,
+    clicks: totalClicks,
+    spend: round(totalSpend),
+    ctr_pct: totalImpr ? round((totalClicks / totalImpr) * 100) : null,
+    cpc: totalClicks ? round(totalSpend / totalClicks) : null,
+    lp_views: lpViews,
+    download_clicks: dlClicks,
+    lp_ctr_pct: lpViews && dlClicks != null ? round((dlClicks / lpViews) * 100) : null,
+    installs_source: afOn ? "appsflyer" : "asc_total_proxy",
+    installs: installs,
+    cpi: installs ? round(totalSpend / installs) : null,
+    asc_first_time_total: asc.first_time_installs, // context: all installs (organic+paid)
+  };
+
+  const notes = [];
+  if (!g.configured) notes.push("GA4 not wired: no LP-view / download-click funnel (LP CTR unavailable).");
+  if (!af.configured) notes.push("AppsFlyer not wired: installs are ASC totals, not per-creative; per-creative CPI unavailable.");
+  else if (af.errors) notes.push("AppsFlyer pull had errors: " + af.errors.join(", "));
+  else if (af.total === 0) notes.push("AppsFlyer: 0 paid-attributed installs for this date (expected until OneLink-routed ads serve).");
+  if (reddit.configured && !reddit.routes_to_onelink) notes.push("Reddit ads not routing through OneLink (state may lag a re-point) — paid attribution blind until it does.");
+
+  save({
+    version: 1,
+    last_run: new Date().toISOString().replace(/\.\d+Z$/, "Z"),
+    last_run_ok: true,
+    window: { date },
+    sources: { reddit: { configured: reddit.configured, routes_to_onelink: reddit.routes_to_onelink },
+               asc, ga4: g, appsflyer: af },
+    funnel: { by_creative: reddit.creatives, totals },
+    notes,
+  });
+  console.log(`mkt-conversion-collect: date=${date} creatives=${reddit.creatives.length} spend=$${round(totalSpend)} installs(${totals.installs_source})=${installs} ga4=${g.configured} appsflyer=${af.configured}`);
+}
+
+main().catch((e) => {
+  // Don't lose the run on an unexpected error — record it in state, exit non-zero.
+  try {
+    save({ version: 1, last_run: new Date().toISOString().replace(/\.\d+Z$/, "Z"), last_run_ok: false, error: String((e && e.message) || e).slice(0, 300) });
+  } catch {}
+  console.error("mkt-conversion-collect FATAL:", (e && e.message) || e);
+  process.exit(1);
+});

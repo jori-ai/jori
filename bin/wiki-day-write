@@ -1,0 +1,376 @@
+#!/usr/bin/env node
+// wiki-day-write — ingest one day's daily_summary into the wiki as a
+// full-narrative `type: day` page, sharing the same backing store
+// (`pages` table) as permanent memories. Episodic ↔ permanent memories
+// now flow through a single mechanism — `type` is the only difference.
+//
+// Source: `daily_summaries.day_json` + `prose_json` when present — the settled
+// day rendered straight to markdown by `daily-summary-render.buildMarkdown`, so
+// the wiki page and the email are two outputs of one set of decisions. Rows
+// predating those columns fall back to converting `daily_summaries.narrative`
+// (email HTML) via `lib/episode-html-to-md.js`. Either way the result is
+// markdown, so wikilinks + FTS + the auto link-audit work as on every other
+// wiki page.
+//
+// Wiki page id: `day_YYYY-MM-DD`, type=`day`. Body:
+//   - Full converted narrative (visit cards → ### headings + paragraphs +
+//     image refs; outer styled div stripped)
+//   - "Key events" bullet list (from row.key_events)
+//   - Photo grid appended if extra photos were curated for the day
+//     beyond what's already inline in the narrative
+//
+// After save, runs `wiki link-audit --apply` in-process so canonical
+// concepts (people, [[travel_*]], restaurants, etc.) become
+// graph edges automatically.
+//
+// Usage:
+//   wiki-day-write <YYYY-MM-DD>          # one day
+//   wiki-day-write yesterday|today
+//   wiki-day-write --backfill            # every daily_summaries date
+//   wiki-day-write --backfill --refresh  # rewrite even unchanged pages
+//   wiki-day-write --max-photos N        # extra-photo cap (default 12)
+//
+// Idempotent: re-running on the same date with unchanged source data is
+// a no-op (savePage skip-on-unchanged-body).
+
+"use strict";
+
+const fs = require("node:fs");
+const path = require("node:path");
+const os = require("node:os");
+const { spawnSync } = require("node:child_process");
+const wiki = require("../lib/wiki-store.js");
+const linker = require("../lib/wiki-linker.js");
+const { htmlToMarkdown } = require("../lib/episode-html-to-md.js");
+// The daily-summary renderer is optional: without it every day converts from
+// the narrative HTML (the fallback narrativeMarkdown already has).
+let buildMarkdown = null;
+try { ({ buildMarkdown } = require("../lib/daily-summary-render.js")); } catch { /* not installed: HTML path */ }  // kernel-closure-ok: the daily-summary renderer is optional; without it the HTML path is used
+const { request } = require("../lib/supabase-rest.js");
+const { instance } = require("../lib/instance.cjs");
+
+// UTC ms of 00:00 on `date` in zone `tz` (the zone's offset read at local noon).
+function localMidnightMs(date, tz) {
+  const noon = new Date(`${date}T12:00:00Z`);
+  const p = Object.fromEntries(new Intl.DateTimeFormat("en-US", {
+    timeZone: tz, hourCycle: "h23", year: "numeric", month: "2-digit", day: "2-digit",
+    hour: "2-digit", minute: "2-digit", second: "2-digit",
+  }).formatToParts(noon).map((x) => [x.type, x.value]));
+  const offset = Date.UTC(+p.year, +p.month - 1, +p.day, +p.hour, +p.minute, +p.second) - noon.getTime();
+  return Date.parse(`${date}T00:00:00Z`) - offset;
+}
+
+const args = process.argv.slice(2);
+const flag = (name) => {
+  const i = args.indexOf(`--${name}`);
+  if (i === -1) return false;
+  const next = args[i + 1];
+  if (next && !next.startsWith("--")) return next;
+  return true;
+};
+const positional = () =>
+  args.filter((a, i) => {
+    if (a.startsWith("--")) return false;
+    const prev = args[i - 1];
+    if (prev && prev.startsWith("--") && prev !== "--backfill" && prev !== "--refresh") return false;
+    return true;
+  });
+
+const BACKFILL = Boolean(flag("backfill"));
+const REFRESH = Boolean(flag("refresh"));
+const MAX_PHOTOS = Number(flag("max-photos") || 12);
+// Photo thumb upload is slow (per-photo Apple Photos export → Supabase
+// upload, often 5–30s each). Default off — write the page with whatever
+// thumbs are already populated. Use --upload-thumbs to force prewarm
+// (good for the nightly cron path on the just-ended day).
+const UPLOAD_THUMBS = Boolean(flag("upload-thumbs"));
+
+function die(msg, code = 1) {
+  console.error(`wiki-day-write: ${msg}`);
+  process.exit(code);
+}
+
+function resolveDate(arg) {
+  if (!arg || arg === "yesterday") {
+    return new Date(Date.now() - 24 * 3600 * 1000).toISOString().slice(0, 10);
+  }
+  if (arg === "today") return new Date().toISOString().slice(0, 10);
+  if (/^\d{4}-\d{2}-\d{2}$/.test(arg)) return arg;
+  die(`unrecognized date "${arg}". Use YYYY-MM-DD or yesterday/today.`);
+}
+
+const DAY_NAMES = [
+  "Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday",
+];
+const MONTH_NAMES = [
+  "January", "February", "March", "April", "May", "June",
+  "July", "August", "September", "October", "November", "December",
+];
+
+function prettyDate(ymd) {
+  const [y, m, d] = ymd.split("-").map(Number);
+  // Use UTC-anchored date for day-of-week calc — drift between UTC midnight
+  // and local midnight only matters for the very first/last hours, which the
+  // locally-anchored daily_summaries already resolves before this runs.
+  const dt = new Date(Date.UTC(y, m - 1, d));
+  return `${DAY_NAMES[dt.getUTCDay()]}, ${MONTH_NAMES[m - 1]} ${d}, ${y}`;
+}
+
+// Pull a one-line description from key_events (first event's title) or
+// fall back to the converted narrative's first sentence (≤100 chars).
+function buildDescription(keyEvents, narrativeMd) {
+  if (Array.isArray(keyEvents) && keyEvents.length) {
+    const first = keyEvents[0];
+    if (typeof first === "string") return first.slice(0, 100);
+    if (first?.title) return String(first.title).slice(0, 100);
+    if (first?.place) return String(first.place).slice(0, 100);
+  }
+  // Strip the leading H1 + headings to find the first body sentence.
+  const text = String(narrativeMd || "")
+    .split("\n")
+    .filter((l) => !l.startsWith("#") && l.trim())
+    .join(" ")
+    .replace(/\*\*?(.+?)\*\*?/g, "$1")
+    .trim();
+  const sentence = text.split(/\.\s/)[0] || "";
+  return sentence.slice(0, 100);
+}
+
+function formatKeyEvents(keyEvents) {
+  if (!Array.isArray(keyEvents) || !keyEvents.length) return "";
+  const lines = keyEvents.slice(0, 10).map((e) => {
+    if (typeof e === "string") return `- ${e}`;
+    const parts = [];
+    // Prefer an explicit time range when both ends are present.
+    if (e.start && e.end) parts.push(`${e.start}–${e.end}`);
+    else if (e.time) parts.push(e.time);
+    else if (e.start) parts.push(e.start);
+    // Title beats place beats reason for the headline label.
+    const label = e.title || e.place || e.reason;
+    if (label) parts.push(label);
+    let line = parts.join(" — ");
+    // Last-resort fallback: drop the line entirely if there's nothing
+    // human-readable. Raw JSON in a "Key events" list is worse than no
+    // line at all.
+    if (!line) return null;
+    if (Array.isArray(e.companions) && e.companions.length) {
+      line += ` (with ${e.companions.join(", ")})`;
+    }
+    return `- ${line}`;
+  }).filter(Boolean);
+  return lines.join("\n");
+}
+
+async function fetchDailySummary(date) {
+  const rows = await request(
+    `/rest/v1/daily_summaries?date=eq.${date}&select=*`,
+  );
+  return rows?.[0] || null;
+}
+
+async function fetchPhotosForDate(date, limit) {
+  // The day in the home zone (instance().tz). The photos.taken_at column is
+  // UTC, so fetch the 28h window [local midnight, next local midnight + 4h)
+  // — the extra hours keep late-night photos with the day they belong to.
+  const midnight = localMidnightMs(date, instance().tz);
+  const start = new Date(midnight).toISOString().slice(0, 19);
+  const next = new Date(midnight + 28 * 3600 * 1000)
+    .toISOString()
+    .slice(0, 19);
+  const url =
+    `/rest/v1/photos?taken_at=gte.${start}&taken_at=lt.${next}` +
+    `&hidden=eq.false&in_trash=eq.false` +
+    `&select=uuid,thumb_url,favorite,taken_at,segment_id,place_name,media_type` +
+    `&order=favorite.desc,taken_at.asc&limit=${limit * 3}`;
+  const rows = await request(url);
+  // Prefer photos linked to a stop (segment_id non-null) and skip videos.
+  const filtered = rows
+    .filter((p) => p.media_type !== "video")
+    .sort((a, b) => {
+      const fa = (a.favorite ? 0 : 1) + (a.segment_id ? 0 : 0.5);
+      const fb = (b.favorite ? 0 : 1) + (b.segment_id ? 0 : 0.5);
+      return fa - fb;
+    })
+    .slice(0, limit);
+  return filtered;
+}
+
+// Pre-warm thumb_url for every photo on a date in ONE shell-out (the
+// `photos backfill-thumbs` command is parallelized internally). Doing
+// this synchronously per-photo from inside Node is too slow — each
+// thumb-url call exports a 900px JPEG from Apple Photos + uploads to
+// Supabase storage and takes 5–10s. The batched command does them in
+// parallel and writes thumb_url back to the photos table; we then
+// re-query to read the populated URLs.
+function prewarmThumbs(date) {
+  const photosBin = path.join(__dirname, "photos");
+  if (!fs.existsSync(photosBin)) return; // no photos integration: the day page has no thumbnails
+  const r = spawnSync(
+    photosBin,
+    ["backfill-thumbs", "--date", date],
+    { encoding: "utf8", timeout: 300_000 },
+  );
+  if (r.status !== 0) {
+    process.stderr.write(
+      `wiki-day-write: photos backfill-thumbs ${date} returned ${r.status} (continuing without photos)\n`,
+    );
+  }
+}
+
+// Prefer the SETTLED day JSON (2026-07-27). Rendering markdown from the same
+// data the email HTML comes from means one set of decisions and two outputs,
+// instead of a wiki page reverse-engineered out of a presentation format —
+// which is what froze every stored day against whichever renderer was live the
+// night it ran. Rows written before day_json existed still convert from HTML,
+// so this is additive; `--backfill --refresh` re-renders anything that has the
+// JSON against today's rules.
+function narrativeMarkdown(row) {
+  if (buildMarkdown && row.day_json && Array.isArray(row.day_json.stops) && row.day_json.stops.length) {
+    try {
+      return { md: buildMarkdown(row.day_json, row.prose_json || {}).trim(), source: "day_json" };
+    } catch (e) {
+      process.stderr.write(`[wiki-day-write] day_json render failed for ${row.date}, falling back to HTML: ${e.message}\n`);
+    }
+  }
+  return { md: htmlToMarkdown(row.narrative || "").trim(), source: "narrative_html" };
+}
+
+function buildBody(row, extraPhotos) {
+  const date = row.date;
+  const fmTitle = prettyDate(date);
+  const rendered = narrativeMarkdown(row);
+  const narrativeMd = rendered.md;
+  const fmDescription = buildDescription(row.key_events, narrativeMd);
+  const keyEventsBlock = formatKeyEvents(row.key_events);
+
+  // The narrative already embeds its own headline (`# Day of …`). Strip
+  // it so we don't duplicate with the wiki page title — the page view
+  // already shows the frontmatter `title` as an `<h1>`.
+  const narrativeNoH1 = narrativeMd.replace(/^#\s+.*\n+/, "").trim();
+
+  // Extra photos that weren't inlined into the narrative — append them
+  // as a small grid at the bottom. The converter already preserves every
+  // `<img>` that was in the narrative HTML, so this only adds photos the
+  // daily-summary email didn't reference.
+  const photoLines = extraPhotos
+    .map((p) => p.thumb_url && `![](${p.thumb_url})`)
+    .filter(Boolean);
+
+  const fm = [
+    "---",
+    "type: day",
+    `date: ${date}`,
+    `title: ${JSON.stringify(fmTitle)}`,
+    `description: ${JSON.stringify(fmDescription)}`,
+    `places: ${row.places_count ?? 0}`,
+    `photos: ${row.photos_count ?? 0}`,
+    row.wake_at ? `wake_at: ${JSON.stringify(row.wake_at)}` : null,
+    row.sleep_at ? `sleep_at: ${JSON.stringify(row.sleep_at)}` : null,
+    "---",
+    "",
+  ].filter((line) => line !== null).join("\n");
+
+  const sections = [];
+  if (narrativeNoH1) sections.push(narrativeNoH1);
+  if (keyEventsBlock) sections.push(`## Key events\n\n${keyEventsBlock}`);
+  if (photoLines.length) sections.push(`## More photos\n\n${photoLines.join("\n")}`);
+
+  return fm + sections.join("\n\n") + "\n";
+}
+
+async function writeOne(date) {
+  const row = await fetchDailySummary(date);
+  if (!row) {
+    console.error(`wiki-day-write: no daily_summaries row for ${date}`);
+    return { date, skipped: true, reason: "no-row" };
+  }
+  let photos = await fetchPhotosForDate(date, MAX_PHOTOS);
+  // Optional prewarm — slow (Apple Photos export + Supabase upload per
+  // photo). Only run when the caller explicitly opts in. The nightly
+  // cron path on the freshly-ended day will pass --upload-thumbs.
+  if (UPLOAD_THUMBS && photos.length) {
+    const missing = photos.filter((p) => !p.thumb_url).length;
+    if (missing) {
+      prewarmThumbs(date);
+      photos = await fetchPhotosForDate(date, MAX_PHOTOS);
+    }
+  }
+  // The narrative already inlines a curated photo set. Anything in
+  // `photos` that's NOT referenced by URL in the narrative HTML is
+  // appended as a "More photos" grid at the bottom.
+  const narrativeHtml = row.narrative || "";
+  const extra = photos
+    .filter((p) => p.thumb_url && !narrativeHtml.includes(p.thumb_url));
+  const body = buildBody(row, extra);
+  const id = `day_${date}`;
+  const result = wiki.savePage(id, body, { editedBy: "wiki-day-write" });
+  // Auto-link canonical concepts (people, pets, trusted restaurants,
+  // travel pages, etc.) — same pass run after every hum-answer / memory
+  // new. Cheap (in-process), idempotent, only links first plain-text
+  // occurrence per concept per page.
+  let linkAddCount = 0;
+  try {
+    const linked = linker.applySuggestions({ id, editedBy: "wiki-day-write:link-audit" });
+    linkAddCount = linked[0]?.added?.length || 0;
+  } catch (err) {
+    process.stderr.write(`wiki-day-write: link-audit ${id} failed: ${err.message}\n`);
+  }
+  const linkNote = linkAddCount ? `, +${linkAddCount} link${linkAddCount === 1 ? "" : "s"}` : "";
+  console.log(
+    `${result.isNew ? "wrote" : result.changed ? "updated" : "unchanged"} ${id}` +
+      ` (${extra.length} extra photos${linkNote}` +
+      `${result.rev ? `, rev ${result.rev}` : ""})`,
+  );
+  return { date, ...result, extraPhotos: extra.length, linkAddCount };
+}
+
+async function backfill() {
+  const rows = await request(
+    `/rest/v1/daily_summaries?select=date&order=date.asc`,
+  );
+  const dates = rows.map((r) => r.date);
+  console.log(`wiki-day-write: backfill ${dates.length} dates`);
+  let written = 0,
+    updated = 0,
+    unchanged = 0,
+    skipped = 0;
+  for (const d of dates) {
+    if (!REFRESH) {
+      // Skip when wiki already has a page AND the body hash hasn't drifted.
+      // Cheap path: just check page existence; savePage handles the rest.
+      const existing = wiki.getPage(`day_${d}`);
+      if (existing) {
+        // Always re-run if --refresh; otherwise let savePage's body_hash
+        // skip do the dedup. Counts are based on result.changed.
+      }
+    }
+    try {
+      const r = await writeOne(d);
+      if (r.skipped) skipped++;
+      else if (r.isNew) written++;
+      else if (r.changed) updated++;
+      else unchanged++;
+    } catch (err) {
+      console.error(`  ${d}: ${err.message}`);
+      skipped++;
+    }
+  }
+  console.log(
+    `\nbackfill: ${written} written, ${updated} updated, ${unchanged} unchanged, ${skipped} skipped`,
+  );
+}
+
+(async () => {
+  if (BACKFILL) {
+    await backfill();
+    wiki.closeDb();
+    return;
+  }
+  const date = resolveDate(positional()[0] || "yesterday");
+  await writeOne(date);
+  wiki.closeDb();
+})().catch((err) => {
+  console.error(`wiki-day-write: ${err.message}`);
+  wiki.closeDb();
+  process.exit(1);
+});

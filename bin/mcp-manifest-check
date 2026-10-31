@@ -1,0 +1,130 @@
+#!/usr/bin/env node
+// mcp-manifest-check — static auditor for the per-job MCP manifest.
+//
+// WHY THIS EXISTS (and what it deliberately does NOT do)
+// The ops supervisor runs ONE long-lived --resume'd claude session per tier
+// (ops / ops-light / ops-haiku), and MCP servers are spawned ONCE per session
+// from that tier's .mcp.json — NOT per dispatch. So "spawn only the servers a
+// job needs" cannot be enforced at dispatch time without moving to ephemeral
+// per-dispatch subprocesses (a real architectural change; see the deferral note
+// in system/changelog.md). Until then, the leanest safe unit is the
+// TIER config, and this tool makes the per-job MCP needs explicit + checkable so
+// that (a) a job never routes to a tier missing a server it needs (fail-closed),
+// and (b) servers a tier loads that no job on it needs are surfaced as trim
+// candidates. It reads the REAL .mcp.json files, so its tier loadout view is
+// exact; job→tier resolution uses the model-default map below plus the manifest
+// itself (a job needing a server only `ops` has must route to ops, which
+// webhook-auth.sh already does via override).
+//
+// Manifest field: each job in job-routing.json MAY carry an optional
+//   "mcp": ["tools","health","chrome-devtools", ...]
+// listing the MCP servers it actually uses. Omitted = "tier default is fine"
+// (no assertion). `tools` + `health` are the universal baseline.
+//
+// Exit non-zero on a HARD error: an unknown server name in a declaration, or a
+// declared need no tier can satisfy. Advisory findings (trim candidates,
+// override-required) print but don't fail.
+
+import fs from "node:fs";
+import path from "node:path";
+import { createRequire } from "node:module";
+import { TOOLS_DIR as ROOT } from "../lib/root.cjs";
+
+const ROUTING = path.join(ROOT, "agent/config/job-routing.json");
+const TIER_CONFIG = {
+  ops: path.join(ROOT, "agent/ops-agent/.mcp.json"),
+  "ops-light": path.join(ROOT, "agent/ops-light-agent/.mcp.json"),
+  "ops-haiku": path.join(ROOT, "agent/ops-haiku-agent/.mcp.json"),
+};
+// Model label (job-routing.json) → default tier. `local` jobs don't run in a
+// claude session, so they have no MCP surface.
+const MODEL_TIER = { opus: "ops", sonnet: "ops-light", haiku: "ops-haiku" };
+const BASELINE = ["tools", "health"]; // every claude session loads these
+
+function loadServers(file) {
+  const j = JSON.parse(fs.readFileSync(file, "utf8"));
+  return new Set(Object.keys(j.mcpServers || j.servers || {}));
+}
+
+function main() {
+  const jsonOut = process.argv.includes("--json");
+  const tierServers = {};
+  const vocab = new Set();
+  for (const [tier, file] of Object.entries(TIER_CONFIG)) {
+    try { tierServers[tier] = loadServers(file); } catch (e) { tierServers[tier] = new Set(); }
+    for (const s of tierServers[tier]) vocab.add(s);
+  }
+
+  // Kernel job-routing.json + this installation's agent/local/job-routing.json.
+  const routing = createRequire(import.meta.url)(path.join(ROOT, "lib/registry.cjs")).loadRegistry("job-routing", { root: ROOT });
+  const jobs = routing.jobs || {};
+
+  const hardErrors = [];
+  const overrideNeeded = []; // job needs servers its default tier lacks (must route elsewhere)
+  const declaredNeedByTier = {}; // tier -> Set(servers some defaulting+declaring job needs)
+  for (const t of Object.keys(TIER_CONFIG)) declaredNeedByTier[t] = new Set(BASELINE.map((x) => x));
+
+  let declaredCount = 0;
+  for (const [name, job] of Object.entries(jobs)) {
+    const need = job.mcp;
+    if (!Array.isArray(need)) continue;
+    declaredCount++;
+    // Vocabulary check — a typo'd server name is a hard error.
+    for (const s of need) {
+      if (!vocab.has(s)) hardErrors.push(`${name}: declares unknown MCP server "${s}" (known: ${[...vocab].join(", ")})`);
+    }
+    // Which tiers can satisfy ALL declared needs?
+    const satisfying = Object.entries(tierServers)
+      .filter(([, servers]) => need.every((s) => servers.has(s)))
+      .map(([t]) => t);
+    if (satisfying.length === 0) {
+      hardErrors.push(`${name}: no tier loads all of [${need.join(", ")}] — declared need is unsatisfiable`);
+      continue;
+    }
+    const defTier = MODEL_TIER[job.model];
+    if (defTier && !satisfying.includes(defTier)) {
+      overrideNeeded.push(`${name} (model=${job.model} → default ${defTier}) needs [${need.join(", ")}] — must route to: ${satisfying.join(" | ")} (webhook-auth override)`);
+    }
+    // Record need against whichever tier this job will actually run on.
+    const runTier = (defTier && satisfying.includes(defTier)) ? defTier : satisfying[0];
+    for (const s of need) declaredNeedByTier[runTier]?.add(s);
+  }
+
+  // Trim candidates: servers a tier loads that NO defaulting+declaring job needs.
+  // Advisory only — a job that doesn't declare `mcp` may still use the server, so
+  // this is a "review for possible removal", not an instruction.
+  const trimCandidates = {};
+  for (const [tier, servers] of Object.entries(tierServers)) {
+    const needed = declaredNeedByTier[tier];
+    const unused = [...servers].filter((s) => !needed.has(s));
+    if (unused.length) trimCandidates[tier] = unused;
+  }
+
+  const report = {
+    tiers: Object.fromEntries(Object.entries(tierServers).map(([t, s]) => [t, [...s]])),
+    jobs_total: Object.keys(jobs).length,
+    jobs_declaring_mcp: declaredCount,
+    hard_errors: hardErrors,
+    override_needed: overrideNeeded,
+    trim_candidates: trimCandidates,
+  };
+
+  if (jsonOut) { console.log(JSON.stringify(report, null, 2)); }
+  else {
+    console.log("MCP manifest audit\n==================");
+    for (const [t, s] of Object.entries(report.tiers)) console.log(`tier ${t.padEnd(10)} loads: ${s.join(", ")}`);
+    console.log(`\njobs: ${report.jobs_total} total, ${report.jobs_declaring_mcp} declare an mcp manifest`);
+    if (overrideNeeded.length) {
+      console.log(`\n⚠ jobs whose declared needs exceed their model-default tier (require a routing override):`);
+      overrideNeeded.forEach((l) => console.log("  - " + l));
+    }
+    for (const [t, unused] of Object.entries(trimCandidates)) {
+      console.log(`\nℹ tier ${t}: servers no declaring job needs (review for trim, if no undeclared job uses them): ${unused.join(", ")}`);
+    }
+    if (hardErrors.length) { console.log("\n✖ HARD ERRORS:"); hardErrors.forEach((l) => console.log("  - " + l)); }
+    else console.log("\n✓ no hard errors (every declared need is satisfiable by some tier)");
+  }
+  process.exit(hardErrors.length ? 1 : 0);
+}
+
+main();

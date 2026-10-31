@@ -1,0 +1,31 @@
+#!/usr/bin/env node
+// app-env — print the environment a web app under apps/ is built with.
+//
+// The sites are built by Vercel from the app directory alone, so their personal
+// settings (Supabase project + public anon key, who may sign in, display zone,
+// per-site settings) live in the Vercel project's env vars. This prints them as
+// dotenv lines, derived from the installation's instance and local config
+// (lib/app-env.cjs), so a deployment is configured from one source:
+//
+//   bin/app-env watch                 NAME=value lines (unset values left out)
+//   bin/app-env watch --all           every name, unset ones empty
+//   bin/app-env --list                the app names
+//
+// Read-only: it never calls Vercel. Feed each line to `vercel env add NAME
+// production` (and preview) from the app directory, or write .env.local for
+// `next dev`. Secrets (TMDB_API_KEY for the watch site's search) are not
+// printed; set those from the secret store.
+
+const { APPS, appEnv, formatEnv } = require("../lib/app-env.cjs");
+
+const args = process.argv.slice(2);
+if (args.includes("--list")) {
+  process.stdout.write(APPS.join("\n") + "\n");
+  process.exit(0);
+}
+const app = args.find((a) => !a.startsWith("--"));
+if (!app || !APPS.includes(app)) {
+  process.stderr.write(`usage: app-env <${APPS.join("|")}> [--all] | --list\n`);
+  process.exit(2);
+}
+process.stdout.write(formatEnv(appEnv(app), { all: args.includes("--all") }));

@@ -1,0 +1,29 @@
+#!/usr/bin/env node
+// photo-companions — who face-tagged in these photos was actually there.
+// CLI over lib/photo-companions.mjs (Jev site `photo-companions`) for
+// bin/findme backfill-companions.
+//
+//   echo '{"photos":[...],"tz":"<IANA zone>","place":"…","id":"<visit>"}' | photo-companions
+//
+// Prints {"present":[…],"dropped":[…],"used":"jev|legacy|none"}. On any error
+// prints every tagged person as present (the behaviour before) and exits 0 —
+// a companion check must never lose a companion to a crash.
+import { presentCompanions, taggedPeople } from "../lib/photo-companions.mjs";
+import fs from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+
+const ENV = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", ".env");
+if (!process.env.TYPESAFE_API_KEY) {
+  try { const m = fs.readFileSync(ENV, "utf8").match(/^TYPESAFE_API_KEY=(.+)$/m); if (m) process.env.TYPESAFE_API_KEY = m[1].trim().replace(/^["']|["']$/g, ""); } catch {}
+}
+
+let input = {};
+try { input = JSON.parse(fs.readFileSync(0, "utf8") || "{}"); } catch {}
+try {
+  const out = await presentCompanions({ photos: input.photos || [], tz: input.tz, place: input.place, id: input.id });
+  process.stdout.write(JSON.stringify(out) + "\n");
+} catch (e) {
+  process.stdout.write(JSON.stringify({ present: [...taggedPeople(input.photos || []).keys()], dropped: [], used: "error",
+    error: String(e?.message || e).slice(0, 200) }) + "\n");
+}

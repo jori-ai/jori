@@ -1,0 +1,1093 @@
+#!/usr/bin/env python3
+"""stop-identify — decide whether a real stop needs asking about at all.
+
+Once a real stop (over 15 minutes) is identified, the most likely places within
+30 metres are shown as a multiple choice in the chat, for the user to TAP (not
+type) — but only when no single place is known with high confidence: a
+repeated place, a saved favorite, or a singular place in a less dense area.
+
+So the question is the FALLBACK, not the default. That inversion is the whole
+point of this tool. The enrichment queue's previous policy was "never silently
+auto-resolve, every stop is queued for the user", which is why 46 asks went out
+in one week and roughly two thirds went unanswered. A question the user has
+already answered — about a café visited weekly, or a place the user saved in
+Google Maps — is not diligence, it is noise.
+
+FIVE WAYS A STOP CAN NAME ITSELF, in descending strength:
+
+  already-resolved — THIS row already carries a resolution: `place_type` is
+              `user-confirmed` (the user answered a pending ask, or `findme
+              resolve` was run directly) or `named` (a verified
+              photo/saved-place writeback). Every other consumer of
+              `location_history` already treats the row's own `place_type` as
+              absolute; classify() didn't check it, so an answered stop could
+              still be re-asked from scratch via a fresh Places lookup (a row
+              already user-confirmed as a restaurant was tapped out as a 4-way
+              choice between unrelated storefronts that didn't even include it).
+  recurring — the user has CONFIRMED this same spot before. The user's own past
+              answer is the strongest signal in the system; re-asking it is the
+              specific failure the original complaint was about.
+  favorite  — a place the user saved (the Google Maps export and any extra
+              saved-places list; place_naming.load_saved merges them), within
+              the same 30m. Saving it is an act of intent; thousands of them
+              exist and they are the user's own labels.
+  calendar  — a calendar event overlapping the stop window whose own `location`
+              lies at the stop. The calendar is a clue the stop finder must use.
+              Correlates on geometry, NOT on city words: an address word test
+              lets a city name match every address in that city, so an unscoped
+              match degrades to "any event overlapping in time."
+  singular  — exactly one plausible venue within 30m. In a thin area distance
+              alone identifies the stop, which is precisely NOT true in the
+              dense case: one city block returned seven venues at an identical
+              14.2m because Google gives one building centroid per address.
+              That tie is what the tap list is for.
+
+High confidence does NOT mean silent: even a singular location is confirmed
+with the user — "Are you at <place>?" with a yes/no tappable result. So the
+rungs above decide the SHAPE of the prompt, not whether there is one: a
+confident stop asks one yes/no, an unclear one offers up to four choices. Both
+are one tap.
+
+A DECISIVE PROMPT CARRIES A DEFAULT, in case the user doesn't respond. Silence
+is the normal case — two thirds of the asks in one week went unanswered. The
+default marks the likeliest option on the card. An expired, unanswered card's
+default is applied as a LOW-CONFIDENCE guess (`choice sweep --apply` → `findme
+guess`): the card's own row only, as `default-applied`, never `user-confirmed`
+(absolute to resolve-day, reserved for what the user actually said), never
+confirmed-stops.json; the summary says "probably X" and any tap or correction
+replaces it. A default must therefore stay decisive-only (`default_id: null`
+otherwise), because silence now applies it.
+
+Under 15 minutes gets nothing — that floor is `findme enrich`'s and shared.
+
+This tool DECIDES and reports. It does not send, and it does not write. Wiring
+the tap UI is a client change; seeing the decisions is worth having first.
+
+Config — agent/local/config/stop-identify.json (optional):
+  lodging_label  the name a one-tap "were you at …?" uses for a place the user
+                 sleeps at that nothing names yet (default "the rental")
+
+Usage:
+  stop-identify <YYYY-MM-DD> [--tz Europe/Paris] [--json]
+  stop-identify --visit <uuid>
+"""
+import argparse
+import json
+import math
+import os
+import re
+import statistics
+import subprocess
+import sys
+import urllib.parse
+import urllib.request
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.join(os.path.dirname(HERE), "lib"))
+import places_local  # noqa: E402
+import place_naming as _place_naming  # noqa: E402
+
+REPO = places_local.install_root()
+ENV_FILE = os.path.join(REPO, ".env")
+SUPABASE_URL = _place_naming.SUPABASE_URL  # SUPABASE_URL, else the instance's supabase_project
+SAVED_PLACES = places_local.data_path("google-saved-places.json")
+CFG = places_local.local_config("stop-identify", {"lodging_label": "the rental"})
+
+# Both numbers deliberate. 15 min is already `findme enrich`'s
+# min_duration_min — a shorter cluster is a red light or a dog's sniff, and the
+# user cannot reliably recall it. 30m is tighter than the 60m used for reporting
+# candidates, because a tap list must be things the user could plausibly have
+# been INSIDE, not things that were merely nearby.
+MIN_STOP_MIN = 15.0
+ASK_RADIUS_M = 30.0
+# How far a past confirmation still counts as "this same spot". Wider than the
+# ask radius on purpose: the anchors of two visits to one café differ by GPS
+# noise, not by the user having gone somewhere else.
+# 25m, not 60m. 60 was chosen to absorb GPS noise between two visits to one
+# venue, but on a dense street it also swallows the NEIGHBOURS: one café's
+# anchor found prior confirmations for two other restaurants inside 60m, so the names disagreed and the rung could never fire — the exact
+# stop it was meant to recognise. 25m is about one shopfront, which is the unit
+# this rung is actually claiming.
+RECUR_RADIUS_M = 25.0
+RECUR_LOOKBACK_DAYS = 180
+MAX_CHOICES = 4
+
+# The far end of a drive out and back: driving to a place and returning without
+# a stop makes the turning-around point a destination worth asking about, if
+# the purpose of the drive is not already known. bin/day-segments §
+# turnaround_stops writes the row and marks its notes with this token — a
+# string WE generate, matched by membership, never read from the user.
+# The floor is findme resolve's own 8 minutes: a window it would refuse to name
+# is one the question could never land on.
+TURNAROUND_TOKEN = "[turnaround]"
+TURNAROUND_MIN_MIN = 8.0
+# The row's position is the mean of the fixes near the far point, and at
+# five-minute cadence in a car those spread over kilometres (an airport run
+# sat 1.7 km from its terminal), so the shortlist reaches wide.
+TURNAROUND_PLACE_RADIUS_M = 2500
+
+# Places will happily return the ADDRESS ITSELF as a result. The tappable
+# options beside a restaurant once included the street address of the stop —
+# offering the user's own coordinates back as an answer to where the user was,
+# which is the question restated, not a choice. Filtered by TYPE rather
+# than by how the string looks: a geocode result is identifiable from its type
+# list, and pattern-matching the text would be guessing at language.
+ADDRESS_TYPES = {
+    "street_address", "route", "premise", "subpremise", "intersection",
+    "postal_code", "postal_code_prefix", "plus_code", "geocode",
+    "neighborhood", "locality", "sublocality", "political", "administrative_area_level_1",
+}
+
+
+# Where a 15-minute stop plausibly happens, and where it plausibly does not.
+# "wholesale"/"warehouse_store": a warehouse club's own OSM tag and Google
+# Places' "New" API type respectively — missing both is why a genuine 49-minute
+# warehouse-club stop ranked no better than "other" (prior 1) instead of the
+# destination prior it obviously deserves.
+# The stored value of every "not one of these" button. A protocol token WE
+# define — never a place — so the tap fast path (lib/choice-reply.mjs) can hand
+# it to the agent and `findme resolve` can refuse it by set membership over our
+# own strings, without reading the user's language.
+OTHER_VALUE = "__other__"
+
+DESTINATION_TYPES = {
+    "restaurant", "cafe", "coffee_shop", "bakery", "bar", "wine_bar", "pub",
+    "meal_takeaway", "food", "ice_cream_shop", "book_store", "clothing_store",
+    "store", "supermarket", "grocery_store", "department_store", "museum",
+    "art_gallery", "tourist_attraction", "park", "movie_theater", "gym",
+    "french_restaurant", "pizza_restaurant", "sandwich_shop",
+    "wholesale", "warehouse_store",
+}
+SERVICE_TYPES = {
+    "laundry", "dry_cleaner", "hair_salon", "beauty_salon", "government_office",
+    "medical_clinic", "doctor", "dentist", "veterinary_care", "health",
+    "insurance_agency", "accounting", "lawyer", "school", "primary_school",
+    "educational_institution", "catering_service", "florist", "pharmacy",
+}
+
+# A default is only applied on silence when the ranking is DECISIVE — the top
+# option must beat the runner-up on the destination prior, or be materially
+# nearer. Otherwise there is no defensible default and silence records nothing.
+# Writing a dry cleaner or a nursery school into the user's day because the
+# user was busy is worse than leaving the stop unresolved: an unresolved stop is
+# visibly unanswered, a wrong one reads as fact.
+
+# Not somewhere the user "stopped" in the sense the question means — mirrors
+# visit-anchor's list, for the same reason: short-let flats are indexed by the
+# dozen on a central street and would fill a tap list with noise.
+DEMOTED_TYPES = {
+    "lodging", "apartment_complex", "apartment_building", "real_estate_agency",
+    "general_contractor", "bus_stop", "transit_station", "subway_station",
+    "train_station", "parking", "atm", "storage", "moving_company",
+    "private_guest_room",
+}
+
+
+def load_key():
+    return _place_naming.load_key() or sys.exit("no SUPABASE_SERVICE_ROLE_KEY")
+
+
+def _get(path, key):
+    if not SUPABASE_URL:
+        sys.exit("no Supabase project configured (SUPABASE_URL or instance supabase_project)")
+    req = urllib.request.Request(f"{SUPABASE_URL}/rest/v1/{path}",
+                                 headers={"apikey": key, "Authorization": f"Bearer {key}"})
+    with urllib.request.urlopen(req, timeout=45) as r:
+        return json.loads(r.read())
+
+
+def meters(la1, lo1, la2, lo2):
+    return math.hypot((la2 - la1) * 111320.0,
+                      (lo2 - lo1) * 111320.0 * math.cos(math.radians((la1 + la2) / 2)))
+
+
+# `load_saved` and `prior_confirmations` live in lib/place_naming.py. They
+# were lifted verbatim, not rewritten: `findme enrich` needs
+# the SAME two rungs to decide what enters the ask queue, and two copies of
+# "have we been here before" would drift the first time either radius was
+# tuned. This file still owns the DECISION -- which rung fires, whether to ask,
+# and what the default is; the module only reports what the history says.
+from place_naming import (  # noqa: E402
+    load_saved, prior_confirmations, match_named_location, NAMED_LOCATION_MATCH_M,
+    scheduled_lodging, repeat_stay_name, match_named_location_by_address,
+    scheduled_lodging_stay, match_booking_by_address,
+)
+
+
+
+
+# A stay past this is not a visit to a business. Set well clear of a long
+# restaurant lunch (around 45 min is typical) so that only somewhere the user
+# stayed the night can trip it.
+SLEEP_STAY_HOURS = 6.0
+SLEEP_MIN_NIGHTS = 2
+
+
+def sleeps_here(lat, lon, key, exclude_id=None):
+    """Nights slept here, and any names confirmed ON those long stays.
+
+    Returns (nights, names). The names matter as much as the count: a name
+    confirmed for a 20-minute coffee says nothing about where the user SLEEPS,
+    and treating it as the lodging's name is how a 65-minute stay at a rented
+    flat was about to be recorded, silently and without a question, as a café
+    the user had once confirmed 25m away.
+    """
+    since = (datetime.now(timezone.utc)
+             - timedelta(days=RECUR_LOOKBACK_DAYS)).isoformat()
+    dlat = RECUR_RADIUS_M / 111320.0
+    dlon = RECUR_RADIUS_M / (111320.0 * max(math.cos(math.radians(lat)), 1e-6))
+    rows = _get(
+        "location_history?segment_type=eq.visit&departed_at=not.is.null"
+        f"&arrived_at=gte.{urllib.parse.quote(since)}"
+        f"&latitude=gte.{lat - dlat}&latitude=lte.{lat + dlat}"
+        f"&longitude=gte.{lon - dlon}&longitude=lte.{lon + dlon}"
+        "&select=id,latitude,longitude,arrived_at,departed_at,place_name,place_type"
+        "&limit=500", key) or []
+    nights, names = set(), []
+    for r in rows:
+        if r["id"] == exclude_id:
+            continue
+        if meters(lat, lon, r["latitude"], r["longitude"]) > RECUR_RADIUS_M:
+            continue
+        a = datetime.fromisoformat(r["arrived_at"].replace("Z", "+00:00"))
+        d = datetime.fromisoformat(r["departed_at"].replace("Z", "+00:00"))
+        if (d - a).total_seconds() / 3600 < SLEEP_STAY_HOURS:
+            continue
+        nights.add(a.date())
+        if r.get("place_type") == "user-confirmed" and r.get("place_name"):
+            names.append(r["place_name"].strip())
+    return len(nights), list(dict.fromkeys(names))
+
+
+# ── A night at the booked lodging ────────────────────────────────────────
+#
+# A night's sleep at the booked rental must never trigger a question, yet one
+# did: "Looking back to this morning, around 02:43 — 02:43–09:56 (433 min) …
+# which of these was it?" (a café, a bike rental). Every lodging fact was on
+# record: the booking (travel_segments, a month-long stay), five nights within
+# 25 m of the visit row, and three answers naming the rental at the same spot.
+# None was read, because rest_anchor had moved the stop 38 m to where the trace
+# rested longest: 53.6 min of fixes at 09:00–09:56, the café, while the six
+# hours of sleep left four fixes. A sleeping phone is silent (location-spine),
+# so on a night the longest rest is the hour he was awake. From the café no
+# night was within 25 m, and the stop fell through to Places.
+#
+# Two changes. A long stay is measured from its row unless its longest rest is
+# at least NIGHT_REST_SHARE of it. And a stay of SLEEP_STAY_HOURS or more, or
+# one covering NIGHT_HOURS, on a booked date is the booking, asked about never,
+# when the user slept within LODGING_MATCH_M of the row OR the rest point on another
+# night of that same booking, or (the first night, when there is no other) when
+# a model reads the stop's street address as the booking's. 150 m is the reach
+# of a home in named-locations (NAMED_LOCATION_MATCH_M): a month's night rows
+# at one flat sit mostly 0–80 m apart, so 25 m was too tight for a bed.
+LODGING_MATCH_M = 150.0
+NIGHT_REST_SHARE = 0.5
+# The small hours, local. Another stay counts as a NIGHT only if it covers part
+# of them: two long days at a friend's or a co-working space 100 m from the flat
+# are not where the user sleeps. A stop that covers them is checked even when
+# the phone split the night into pieces under SLEEP_STAY_HOURS. Sleep is
+# typically ~1–9am.
+NIGHT_HOURS = (2, 6)
+
+
+def overlaps_night(start, end, tz):
+    """Does [start, end) cover any of NIGHT_HOURS in `tz`? None without a tz."""
+    if tz is None:
+        return None
+    day = start.astimezone(tz).date() - timedelta(days=1)
+    while day <= end.astimezone(tz).date():
+        w0 = datetime(day.year, day.month, day.day, NIGHT_HOURS[0], tzinfo=tz)
+        w1 = datetime(day.year, day.month, day.day, NIGHT_HOURS[1], tzinfo=tz)
+        if start < w1 and w0 < end:
+            return True
+        day += timedelta(days=1)
+    return False
+
+
+def booked_nights(key, booking, stay_start, stay_end, tz=None, near=None):
+    """OTHER nights of this booking, as [(date, lat, lon)]. A row overlapping
+    this stay is this stay — the client's duplicate rows carry different ids —
+    so overlap excludes it, not its id. With a tz, a night must also cover
+    NIGHT_HOURS. `near` (a list of points) narrows the query to
+    LODGING_MATCH_M around them; without it, every night of the booking."""
+    since = booking["arrive_at"]
+    until = booking.get("depart_at") or datetime.now(timezone.utc)
+    box = ""
+    if near:
+        lats = [p[0] for p in near]
+        lons = [p[1] for p in near]
+        dlat = LODGING_MATCH_M / 111320.0
+        dlon = LODGING_MATCH_M / (111320.0 * max(math.cos(math.radians(max(abs(x) for x in lats))), 1e-6))
+        box = (f"&latitude=gte.{min(lats) - dlat}&latitude=lte.{max(lats) + dlat}"
+               f"&longitude=gte.{min(lons) - dlon}&longitude=lte.{max(lons) + dlon}")
+    rows = _get(
+        "location_history?segment_type=eq.visit&departed_at=not.is.null"
+        f"&arrived_at=gte.{urllib.parse.quote(since.isoformat())}"
+        f"&arrived_at=lte.{urllib.parse.quote(until.isoformat())}"
+        f"{box}&select=id,latitude,longitude,arrived_at,departed_at&order=arrived_at.desc&limit=1000", key) or []
+    nights = []
+    for r in rows:
+        try:
+            a = datetime.fromisoformat(r["arrived_at"].replace("Z", "+00:00"))
+            d = datetime.fromisoformat(r["departed_at"].replace("Z", "+00:00"))
+        except (KeyError, TypeError, ValueError, AttributeError):
+            continue
+        if r.get("latitude") is None or r.get("longitude") is None:
+            continue
+        if a < stay_end and stay_start < d:
+            continue
+        if (d - a).total_seconds() / 3600 < SLEEP_STAY_HOURS:
+            continue
+        if tz is not None and not overlaps_night(a, d, tz):
+            continue
+        nights.append((a.date(), r["latitude"], r["longitude"]))
+    return nights
+
+
+def booked_nights_near(points, key, booking, stay_start, stay_end, tz=None):
+    """Dates of OTHER nights of this booking the user slept within LODGING_MATCH_M of
+    any of `points`."""
+    return {day for day, la, lo in booked_nights(key, booking, stay_start, stay_end, tz, near=points)
+            if min(meters(pla, plo, la, lo) for pla, plo in points) <= LODGING_MATCH_M}
+
+
+def overnight_at_booking(visit, arr, dep, tz, key, points):
+    """{name, reason} when this night stay is the booked lodging, else None.
+    Any failure returns None, and the ladder carries on as before."""
+    try:
+        booking = scheduled_lodging_stay((arr.astimezone(tz) if tz else arr).date())
+        if not booking:
+            return None
+        hours = (dep - arr).total_seconds() / 3600
+        nights = booked_nights_near(points, key, booking, arr, dep, tz)
+        if nights:
+            return {"name": booking["name"],
+                    "reason": f"a {hours:.1f}h stay within {LODGING_MATCH_M:.0f}m of where the user slept "
+                              f"on {len(nights)} other night(s) of the booking at {booking['name']}"}
+        labels = [visit.get("place_name")] if visit.get("place_type") == "address" else []
+        lat, lon = points[0]
+        if match_booking_by_address(lat, lon, booking["name"], labels):
+            return {"name": booking["name"],
+                    "reason": f"a {hours:.1f}h stay whose street address is the booking's "
+                              f"({booking['name']}); the first night there"}
+    except Exception as e:
+        print(f"[stop-identify] overnight lodging check failed: {e}", file=sys.stderr)
+    return None
+
+
+# ── The booked lodging as an answer to offer ─────────────────────────────
+#
+# On the same question the rental was not even one of the options. No list
+# could have held it. The booking has a label and no coordinates, and Places
+# never returns a private flat (a `lodging` type is demoted when it does), so a
+# stop by the flat that missed every silent rung was offered the café
+# downstairs and a bike rental. Another 41-minute stop 30 m from the flat went
+# out as four unrelated businesses, and the user typed the rental's name.
+#
+# So the booking is placed from the user's own nights there: the median point
+# of the booking's other nights (6 h+, covering NIGHT_HOURS). On the case that
+# built it, that median held 52 of a month's 57 visit rows named for the flat
+# within 45 m (the other five are stray fixes 160 m or more out), with one café
+# at 22 m and another at 62 m: hence LODGING_NEAR_M for a day stop, which GPS
+# cannot separate from the flat, while a night keeps the 150 m of
+# LODGING_MATCH_M. Nights placing it farther away mean the user was not there. With
+# no other night yet, a whole night is the booking's by its dates alone, and a
+# day stop is placed by its street address (address-match --booking, a model).
+#
+# It only joins a question that was going to be asked: a stop the ladder names
+# silently stays silent. The one exception is a night that only the density
+# rung would name (a lone café within 30 m), because a café list is the wrong
+# question about a night: it becomes one tap, "were you at <booking>?",
+# defaulting to yes. The user's own answers and a bed slept in still come first.
+LODGING_NEAR_M = 50.0
+
+
+def booked_lodging_option(visit, arr, dep, tz, key, points, at, night):
+    """{name, reason} when the booked lodging belongs among this stop's
+    answers, else None. `at` is the stop's anchor, `night` whether the stay is
+    one. Any failure returns None, and the question is built as before."""
+    try:
+        booking = scheduled_lodging_stay((arr.astimezone(tz) if tz else arr).date())
+        if not booking:
+            return None
+        # The lookup is by date; the stay must also fall inside the booking's
+        # own window (a night at the airport before check-in is not the flat).
+        if dep <= booking["arrive_at"] or (booking.get("depart_at") and arr >= booking["depart_at"]):
+            return None
+        name = booking["name"]
+        nights = booked_nights(key, booking, arr, dep, tz)
+        if nights:
+            mid = (statistics.median(n[1] for n in nights), statistics.median(n[2] for n in nights))
+            d = min(meters(la, lo, mid[0], mid[1]) for la, lo in points)
+            if d > (LODGING_MATCH_M if night else LODGING_NEAR_M):
+                return None
+            return {"name": name,
+                    "reason": f"{d:.0f}m from the middle of {len(nights)} other night(s) at {name}"}
+        if night:
+            # The night rung has already read the address. With nothing to
+            # place the booking, only a whole night is its by the dates alone:
+            # six hours that cover the small hours. A 01:30 stop at the airport
+            # on arrival, or a long first day elsewhere, is not.
+            if (dep - arr).total_seconds() / 3600 >= SLEEP_STAY_HOURS and overlaps_night(arr, dep, tz) is not False:
+                return {"name": name,
+                        "reason": f"a whole night on the dates booked at {name}, and no other night there yet"}
+            return None
+        labels = [visit.get("place_name")] if visit.get("place_type") == "address" else []
+        if match_booking_by_address(at[0], at[1], name, labels):
+            return {"name": name,
+                    "reason": f"its street address is the booking's ({name}); no night there yet"}
+    except Exception as e:
+        print(f"[stop-identify] lodging option check failed: {e}", file=sys.stderr)
+    return None
+
+
+def _lodging_choice(stay):
+    """The tap option for the booked lodging. The label is the booking's own
+    name, so a tap stores the name the lodging rungs already use."""
+    return {"id": "__lodging__", "label": stay["name"], "sublabel": "where you're staying"}
+
+
+# Above this we do not ask at all: the question is only for a place not known
+# with a very high certainty (>80%). A question whose answer we can already
+# predict four times in five is not diligence, it is interruption — the same
+# complaint that produced 46 asks in one week with two thirds unanswered.
+CERTAINTY_SKIP = 0.80
+
+# What each rung is worth. Deliberately explicit rather than emergent: these are
+# claims about how often each signal is RIGHT, and writing them as numbers is
+# what lets the 80% line mean something.
+CONFIDENCE = {
+    "already-resolved": 0.99,  # this exact row already carries the user's own answer
+    "named_location":  0.97,  # the user's own home/family address — definitional, not inferred
+    "recurring":       0.95,  # the user's own past answer, same spot, no disagreement
+    "repeat-stay":     0.90,  # one past answer about a stay, and this is a stay there too
+    "lodging-booked":  0.92,  # the user sleeps at this spot, and the trip's booking names it
+    "lodging-known":   0.90,  # we already have a confirmed name for where the user sleeps
+    "favorite":        0.85,  # the single place the user saved within 30m
+    "calendar":        0.88,  # a calendar event overlapping the window, address-correlated
+    "singular":        0.82,  # the only venue at all within 30m
+    "lodging-night":   0.75,  # a night on the booked dates; nothing yet places the booking
+    "lodging-inferred": 0.70,  # long stays say the user sleeps here; nothing says what it IS
+}
+
+
+def _resolve(out, name, kind, reason):
+    """Skip or ask, on the 80% line — never a silent write below it.
+
+    A rung firing is not the same as being sure. `recurring` is the user's own
+    word played back and needs no confirmation; `lodging-inferred` knows only
+    that the user sleeps somewhere, not what to call it, so it asks — one tap, defaulting to
+    yes, because the evidence does point that way.
+    """
+    conf = CONFIDENCE[kind]
+    out.update(confidence=kind, certainty=conf, name=name, reason=reason)
+    if conf >= CERTAINTY_SKIP:
+        out.update(verdict="skip-known")
+        return out
+    out.update(verdict="confirm", question=f"Were you at {name}?",
+               prompt=((lambda c: f"{c} — were you at {name}?" if c else f"Were you at {name}?")(out.get("_ctx") or "")),
+               # `value` is what gets STORED; `label` is only what the button
+               # reads. Without the split the tap text itself became the place
+               # name — two rows were literally called "Yes — the rental", and
+               # the confirmed rung then reused that as the name of the user's
+               # home for every later stop there.
+               # The "no" button carries the protocol value OTHER_VALUE, never
+               # its label: when it had no value, a tap reached `findme
+               # resolve` as the text "No, somewhere else" and was saved as a
+               # user-confirmed place name. choice-reply hands OTHER_VALUE to
+               # the agent (the user is asked where, in their own words) and
+               # `findme resolve` refuses to store it.
+               options=[{"id": "__yes__", "label": f"Yes — {name}", "value": name},
+                        {"id": "__no__", "label": "No, somewhere else", "value": OTHER_VALUE}],
+               default_id="__yes__")
+    return out
+
+
+def _context(visit, arr, dep, tz, prev):
+    """The sentence that makes the question answerable.
+
+    A bare "where was this?" is not a question the user can answer: a
+    question must carry the detail — time, where the user was before,
+    approximate location, duration. By the time a prompt lands the user may be
+    two stops further on, and "where was this?" asks the user to reconstruct
+    which unnamed gap we mean before even considering the options. Everything below is already in the row we are asking about — it
+    cost nothing to withhold it, and withholding it made the question useless.
+    """
+    bits = []
+    if tz and dep:
+        t0, t1 = arr.astimezone(tz), dep.astimezone(tz)
+        mins = round((dep - arr).total_seconds() / 60)
+        same_day = t0.date() == datetime.now(tz).date()
+        day = "" if same_day else f"{t0:%a} "
+        bits.append(f"{day}{t0:%H:%M}–{t1:%H:%M} ({mins} min)")
+    addr = (visit.get("address") or "").strip()
+    if addr:
+        # Street-level is the useful grain; the city and country are noise to
+        # someone standing in it.
+        bits.append(f"around {addr.split(',')[0].strip()}")
+    # A previous "name" is only useful as a landmark if it reads like one. Some
+    # confirmations are whole typed sentences ("Stopped for a few minutes to
+    # leave a review, then continued on"), and pasting that into the
+    # next question makes it harder to read, not easier. Judged on LENGTH, which
+    # is a property of the field, not on what the words mean.
+    if prev and len(prev) <= 40:
+        bits.append(f"after {prev}")
+    return ", ".join(bits)
+
+
+def _osm_fallback_candidates(lat, lon, radius_m):
+    """OSM candidates for rung 4, used only when Google's Places lookup came
+    back empty.
+
+    Two separate reasons Google can come back empty: `places_nearby.nearby()`
+    fails CLOSED to `[]` whenever the Jori Places budget is blocked
+    (`lib/places_guard.py`) — which it has been for days at a time — and
+    even unblocked, a
+    large-footprint venue can sit outside ASK_RADIUS_M by centroid distance
+    while the anchor is genuinely inside its real boundary.
+
+    `osm_places.py` (already relied on by `day-segments`) fixes both: it is a
+    second, independent source, and it carries real polygons rather than a
+    pin. Verified against a supermarket and a warehouse-club stop this rung
+    missed: Google returned nothing for either (budget-blocked), but OSM found
+    both, and each one's own polygon CONTAINS the visit anchor — at 44m and
+    83m centroid distance respectively — despite sitting outside the 30m flat
+    radius Google's call uses. Containment is what actually answers "was the
+    user inside this place", not distance to a pin.
+    """
+    try:
+        import osm_places
+    except Exception:
+        return []
+    try:
+        places = osm_places.nearby(lat, lon, radius=max(radius_m, 100))
+    except Exception:
+        return []
+    out = []
+    for p in places:
+        if p["category"] == "demoted":
+            continue
+        inside = osm_places.contains(p, lat, lon)
+        d = osm_places.meters((lat, lon), (p["lat"], p["lon"]))
+        if not inside and d > radius_m:
+            continue
+        out.append({
+            "name": p["name"],
+            "distance_m": 0.0 if inside else d,
+            "types": [p["kind"]] if p["kind"] else [],
+            "primary_type": p["kind"] or "",
+            "type_display": (p["kind"] or "").replace("_", " "),
+            "reviews": 0,
+            "place_id": p["osm_id"],
+        })
+    return out
+
+
+# Calendar as a clue. Every OTHER signal in this file is about GPS density;
+# this is the one signal that comes from the user's own stated intent instead. `jobs/location-enrich.md`'s older
+# free-text ask already does this (Signal 1: Calendar), but that playbook logic
+# only exists for a human agent reading it each run — `stop-identify` runs
+# headless off a cron and had no equivalent.
+#
+# This once correlated shared address WORDS (a stopword set copied
+# from location-confirm-resolve.mjs). It is distance now — see _calendar_hint.
+CALENDAR_AT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "calendar-at")
+
+
+def _calendar_hint(lat, lon, arr, dep):
+    """The calendar event the user was AT during the stop, or None.
+
+    Geometry: the event's own `location` is geocoded (cached) and must lie
+    within 150 m of the stop (lib/calendar-place.mjs). The old test — a shared
+    address WORD between event and stop — missed a print shop on a boulevard
+    named after a city, and would have matched every event in that city to it.
+    Padding stays tight (10 min), for the reason below: an all-day or long
+    block overlapping the stop is not evidence the user was at it. A failed lookup is printed, never read
+    as "nothing on the calendar".
+    """
+    if lat is None or lon is None:
+        return None
+    pad = timedelta(minutes=10)
+    try:
+        res = subprocess.run(
+            [CALENDAR_AT, "--start", (arr - pad).isoformat(), "--end", (dep + pad).isoformat(),
+             "--point", f"{lat},{lon}", "--json"],
+            capture_output=True, text=True, timeout=60)
+        out = json.loads(res.stdout or "{}")
+    except Exception as e:
+        print(f"[stop-identify] calendar-at failed: {e}", file=sys.stderr)
+        return None
+    if out.get("error"):
+        print(f"[stop-identify] calendar lookup failed: {out['error']}", file=sys.stderr)
+    # The venue at the event's LOCATION — never the event title, which is only
+    # a hint (the event was named for the errand; the shop had its own name). A dict:
+    # {name, source, shortlist?}; `calendar_ambiguous` carries no name.
+    return out.get("venue") or None
+
+
+# A long stop at a mealtime is a meal. Places types are machine ids, so this is
+# set membership over Google's vocabulary, not a reading of anything the user
+# said. A 66-minute stop from 14:24, where "store" (a tablecloth shop, 3 m)
+# ranked level with a 3,264-review grill, so distance decided it.
+MEAL_MIN = 30.0
+FOOD_TYPES = {"restaurant", "meal_takeaway", "meal_delivery", "food", "food_court",
+              "diner", "brunch_restaurant", "breakfast_restaurant", "bar_and_grill"}
+CAFE_TYPES = {"cafe", "coffee_shop", "bakery", "breakfast_restaurant", "brunch_restaurant"}
+
+
+def _meal_kinds(arr, mins, tz):
+    if not mins or mins < MEAL_MIN or tz is None:
+        return None
+    local = arr.astimezone(tz)
+    h = local.hour + local.minute / 60
+    if 7 <= h < 10.75:
+        return CAFE_TYPES
+    if 11.5 <= h < 15.5 or 18 <= h < 22.5:
+        return FOOD_TYPES
+    return None
+
+
+def _serves(types, kinds):
+    return bool(types & kinds) or (kinds is FOOD_TYPES and any(t.endswith("_restaurant") for t in types))
+
+
+def rest_anchor(visit, arr, dep):
+    """Where the user SAT, from the raw trace (bin/rest-point), or None.
+
+    The row's lat/lon is a centroid. A 66-minute lunch spread 205 m; its
+    centroid sat 101 m from the table, the 30 m circle around it missed the
+    restaurant 20 m from the rest, and the user was asked to pick between
+    a tablecloth shop and a children's outlet. Every proximity rung below
+    measures from this point when the trace has one."""
+    cmd = [os.path.join(HERE, "rest-point"), "--visit", str(visit["id"]),
+           "--start", arr.isoformat()]
+    if dep:
+        cmd += ["--end", dep.isoformat()]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=40)
+        out = json.loads((r.stdout or "").strip().splitlines()[-1])
+    except Exception as e:
+        print(f"[stop-identify] rest-point failed: {e}", file=sys.stderr)
+        return None
+    if out.get("lat") is None:
+        return None
+    return out
+
+
+# What a drive out and back is most often FOR: somewhere people are taken to or
+# collected from, ahead of the shops and cafés a 15-minute stop usually is. An
+# airport 2 km off the mean of the fixes would otherwise lose to every café.
+TURNAROUND_MAJOR_TYPES = {
+    "airport", "train_station", "transit_station", "subway_station", "bus_station",
+    "shopping_mall", "hospital", "university", "stadium", "tourist_attraction",
+    "museum", "amusement_park", "zoo", "campus", "park",
+}
+# Stations are fine as a destination here; they are only noise for a 15-minute
+# stop on a street.
+TURNAROUND_DEMOTED_TYPES = DEMOTED_TYPES - {"train_station", "transit_station", "subway_station"}
+
+
+def _ask_turnaround(out, lat, lon, ctx):
+    """The question for the far end of a drive the user turned around on.
+
+    No default: an unanswered card's default is applied as a guess, and a guess
+    at where a 2 km-smeared point was is worse than leaving it open.
+    """
+    try:
+        from places_nearby import nearby
+        cands = nearby(lat, lon, radius=TURNAROUND_PLACE_RADIUS_M, max_results=20)
+    except Exception:
+        cands = []
+    if not cands:
+        cands = _osm_fallback_candidates(lat, lon, TURNAROUND_PLACE_RADIUS_M)
+    plausible = [c for c in cands
+                 if not ((set(c.get("types") or []) | {c.get("primary_type") or ""})
+                         & (TURNAROUND_DEMOTED_TYPES | ADDRESS_TYPES))]
+
+    def prior(c):
+        t = set(c.get("types") or []) | {c.get("primary_type") or ""}
+        if t & TURNAROUND_MAJOR_TYPES:
+            return 0
+        return 1 if t & DESTINATION_TYPES else 2
+    plausible.sort(key=lambda c: (prior(c), -(c.get("reviews") or 0), c["distance_m"]))
+    opts = [{"id": c.get("place_id") or c["name"], "label": c["name"],
+             "sublabel": f"{c['distance_m'] / 1000:.1f} km · {c.get('type_display') or c.get('primary_type') or ''}".strip(" ·"),
+             "distance_m": round(c["distance_m"])}
+            for c in plausible[:MAX_CHOICES - 1]]
+    opts.append({"id": "__other__", "label": "Somewhere else", "value": OTHER_VALUE,
+                 "sublabel": "type it instead"})
+    opts.append({"id": "__passing__", "label": "Just driving", "value": "not a stop",
+                 "sublabel": "no destination"})
+    lead = "you drove out this way and turned around without a stop I could see. Where were you headed?"
+    out.update(verdict="choose", question="Where were you headed?",
+               prompt=f"{ctx} — {lead}" if ctx else lead.capitalize(),
+               options=opts, default_id=None,
+               reason="the far end of a drive out and back; the purpose is not on the user's calendar or in their words "
+                      f"(stop-passage checked first); {len(plausible)} place(s) within {TURNAROUND_PLACE_RADIUS_M} m")
+    return out
+
+
+def classify(visit, key, saved, tz=None, prev=None):
+    lat, lon = visit["latitude"], visit["longitude"]
+    arr = datetime.fromisoformat(visit["arrived_at"].replace("Z", "+00:00"))
+    dep = (datetime.fromisoformat(visit["departed_at"].replace("Z", "+00:00"))
+           if visit.get("departed_at") else None)
+    mins = (dep - arr).total_seconds() / 60 if dep else None
+    out = {"id": visit["id"], "arrived_at": visit["arrived_at"],
+           "minutes": round(mins, 1) if mins else None,
+           "stored_name": visit.get("place_name")}
+
+    ctx = _context(visit, arr, dep, tz, prev)
+    out["_ctx"] = ctx
+    # The same context WITHOUT the time, for the client card, which draws the
+    # time itself (relative to when the user reads it) above the map.
+    out["where"] = _context(visit, arr, None, None, prev)
+    out["lat"], out["lon"] = lat, lon
+    out["departed_at"] = visit.get("departed_at")
+
+    turnaround = TURNAROUND_TOKEN in (visit.get("notes") or "")
+    floor = TURNAROUND_MIN_MIN if turnaround else MIN_STOP_MIN
+    if mins is None or mins < floor:
+        out["verdict"] = "below-floor"
+        out["reason"] = f"{mins:.0f} min < {floor:.0f} min floor" if mins else "still open"
+        return out
+
+    # -1. Already resolved on THIS row. `findme enrich`'s older queue refuses
+    # to even queue a visit whose own place_type is already `named` /
+    # `user-confirmed` / `non-stop` (RESOLVED set in `findme`) — this tap flow
+    # had no equivalent, so a row that already carries the user's own answer (or a
+    # verified photo/saved-place writeback) still fell through to a fresh
+    # Places lookup and got asked about again as if nothing were known. Every
+    # other consumer of `location_history` — `resolve-day`, `live-day`,
+    # `stop-name-writeback` — already treats `place_type` on the row itself as
+    # absolute; classify() is the one place that wasn't reading it. (A visit
+    # already user-confirmed as a restaurant was still asked as a 4-way tap
+    # between unrelated storefronts that didn't even include it.)
+    ptype = visit.get("place_type")
+    pname = (visit.get("place_name") or "").strip()
+    if ptype in ("user-confirmed", "named") and pname:
+        return _resolve(out, pname, "already-resolved",
+                        f"row already {ptype} as {pname!r}")
+
+    # 0. Named location — the user's own home or a family address. This has to
+    # come before every other rung, including `recurring`: `recurring` needs two
+    # PAST confirmations at the same spot to fire, so the very first stop this
+    # system ever sees at the user's own home has no history to draw on and
+    # falls straight through to Google-Places density — which is exactly what
+    # put a doctor's office and a media company on the lock screen for a
+    # 20-minute stop that never left the apartment. A home address needs no
+    # evidence; it is definitional.
+    rest = rest_anchor(visit, arr, dep)
+    # Both are positions of this stay; the overnight rung below reads both.
+    points = [(lat, lon)] + ([(rest["lat"], rest["lon"])] if rest else [])
+    long_stay = mins >= SLEEP_STAY_HOURS * 60
+    if rest and long_stay and (rest.get("rest_min") or 0) < mins * NIGHT_REST_SHARE:
+        # A night is not its waking hour (see LODGING_MATCH_M):
+        # a 54-min rest out of 433 min is a slice of the stay, not where it was.
+        out["anchor"] = {"source": "row", "rest_ignored": {
+            "rest_min": rest.get("rest_min"), "moved_from_row_m": rest.get("moved_m")}}
+    elif rest:
+        lat, lon = rest["lat"], rest["lon"]
+        out["lat"], out["lon"] = lat, lon
+        out["anchor"] = {"source": "rest", "rest_min": rest.get("rest_min"),
+                         "moved_from_row_m": rest.get("moved_m")}
+    else:
+        out["anchor"] = {"source": "row"}
+
+    named = match_named_location(lat, lon)
+    if named:
+        loc, d = named
+        return _resolve(out, loc["name"], "named_location",
+                        f"within {NAMED_LOCATION_MATCH_M:.0f}m of {loc['name']} ({d:.0f}m)")
+    # ...or the same home by its street address (a transliterated street name
+    # and a house number a few doors off are still that home). A model reads the
+    # addresses, in bin/address-match; the row's own label goes along only when
+    # the iOS geocoder wrote it (place_type 'address'), never when it is the
+    # user's answer.
+    row_label = [visit.get("place_name")] if visit.get("place_type") == "address" else []
+    by_addr = match_named_location_by_address(lat, lon, row_label)
+    if by_addr:
+        return _resolve(out, by_addr["name"], "named_location",
+                        f"the same home as {by_addr['address']} by its street address")
+    # A home the user drove to is a known destination, so the two checks above come
+    # first; anything else at the far end of a drive is asked about wide.
+    if turnaround:
+        return _ask_turnaround(out, lat, lon, ctx)
+
+    # The booked lodging as an answer to offer, looked up at most once and only
+    # where a question is about to be built (see LODGING_NEAR_M).
+    is_night = long_stay or bool(overlaps_night(arr, dep, tz))
+    _stay = []
+    def lodging():
+        if not _stay:
+            _stay.append(booked_lodging_option(visit, arr, dep, tz, key, points, (lat, lon), is_night))
+        return _stay[0]
+
+    # 0.5. A night at the booked lodging. After the user's own homes — a night
+    # at a family home is theirs, whatever is booked — and before every venue
+    # rung, because no café holds anyone six hours and a café's name at a
+    # waking-hour rest must not name the night. See LODGING_MATCH_M.
+    if is_night:
+        night = overnight_at_booking(visit, arr, dep, tz, key, points)
+        if night:
+            return _resolve(out, night["name"], "lodging-booked", night["reason"])
+
+    # 1. Repeated place — the user's own past answer outranks anything Google says.
+    names = prior_confirmations(lat, lon, key, exclude_id=visit["id"])
+    distinct = list(dict.fromkeys(names))
+    if len(distinct) == 1 and len(names) >= 2:
+        return _resolve(out, distinct[0], "recurring",
+                        f"confirmed {len(names)}x at this spot, always the same name")
+    # A second STAY at a spot named once is remembered, not re-asked: asked
+    # about once and then remembered. Both visits
+    # must be stays; see place_naming.repeat_stay_name for the guards.
+    rep = (repeat_stay_name(lat, lon, key, mins, stop_arrived=visit["arrived_at"], exclude_id=visit["id"])
+           if len(names) == 1 else None)
+    if rep:
+        return _resolve(out, rep["name"], "repeat-stay",
+                        f"named once before, on a {rep['minutes']:.0f}-min stay "
+                        f"{(rep.get('arrived_at') or '')[:10]}; this is a second stay")
+    if len(distinct) > 1:
+        out["conflicting_prior_names"] = distinct[:4]
+
+    # 2. Favorite — the user saved it.
+    near_saved = sorted(
+        ((meters(lat, lon, p["lat"], p["lng"]), p) for p in saved
+         if abs(p["lat"] - lat) < 0.001 and abs(p["lng"] - lon) < 0.002),
+        key=lambda x: x[0])
+    near_saved = [(d, p) for d, p in near_saved if d <= ASK_RADIUS_M]
+    if len(near_saved) == 1:
+        d, p = near_saved[0]
+        return _resolve(out, p["name"], "favorite",
+                        f"the only saved place within {ASK_RADIUS_M:.0f}m "
+                        f"({d:.0f}m, list: {p.get('list') or '?'})")
+
+    # 2.5. Calendar — the user's own calendar says where they'd be. Checked
+    # after favorite (a saved place is still the user's stronger label) and before
+    # lodging/density (where GPS is doing all the work). See `_calendar_hint`
+    # for why this correlates on address tokens rather than trusting any
+    # time-overlapping event.
+    cal = _calendar_hint(lat, lon, arr, dep)
+    if cal and cal.get("source") == "calendar_ambiguous" and cal.get("shortlist"):
+        # The user was at the address on the calendar; more than one business
+        # there fits. Ask with just those — Places ranking would bury them (the
+        # right shop was once one of 18 within 35 m).
+        opts = [{"id": c.get("place_id") or c["name"], "label": c["name"],
+                 "sublabel": f"at {cal.get('address')}"} for c in cal["shortlist"]]
+        if lodging():
+            opts.append(_lodging_choice(lodging()))
+        opts.append({"id": "__other__", "label": "Somewhere else", "value": OTHER_VALUE,
+                     "sublabel": "type it instead"})
+        ctx = out.get("_ctx") or ""
+        out.update(verdict="choose", confidence="calendar-address", certainty=0.7,
+                   question="Which of these was it?",
+                   prompt=(f"{ctx} — which of these was it?" if ctx else "Which of these was it?"),
+                   options=opts, default_id=None,
+                   reason=f"at the address on the user's calendar ({cal.get('address')}); "
+                          f"{len(cal['shortlist'])} businesses there fit")
+        return out
+    cal_name = cal.get("name") if cal else None
+    if cal_name:
+        return _resolve(out, cal_name, "calendar",
+                        f"on the user's calendar at this spot during this window")
+
+    # 3. Lodging — where the user SLEEPS is not a venue, and no Places lookup
+    # can return it. A rented flat produced a design studio, a shop and a linen
+    # store: all real businesses at that address, none of them where the user
+    # was. Offering that list is worse than useless, because the default would
+    # then write a shop into the user's day.
+    #
+    # A six-hour stay is the tell. No café, shop or clinic holds anyone that
+    # long; somewhere that does is somewhere slept in. Timezone-free on purpose
+    # — a duration means the same thing in every zone, and travel changes zones.
+    nights, sleep_names = sleeps_here(lat, lon, key, exclude_id=visit["id"])
+    # The booking is the lodging's name. Without it, eleven confirmations at a
+    # rented flat under four spellings (three variants of "the rental" and a
+    # bakery 8 m off) could never agree, so every return home fell to
+    # `lodging-inferred` and asked "were you at the rental?" — whose own "Yes"
+    # stored a fifth spelling. One night here is enough when travel_schedule
+    # says the user is booked here that date.
+    booked = scheduled_lodging((arr.astimezone(tz) if tz else arr).date()) if nights >= 1 else None
+    if booked:
+        return _resolve(out, booked, "lodging-booked",
+                        f"{nights} stays over {SLEEP_STAY_HOURS:.0f}h here, and the trip is "
+                        f"booked at {booked} for this date")
+    if nights >= SLEEP_MIN_NIGHTS:
+        # A confirmed name only counts as the LODGING'S name if it was confirmed
+        # for a stay long enough to have been the night. Any other confirmation
+        # nearby is a neighbour.
+        if len(sleep_names) == 1:
+            return _resolve(out, sleep_names[0], "lodging-known",
+                            f"confirmed on a stay over {SLEEP_STAY_HOURS:.0f}h here "
+                            f"({nights} such nights)")
+        return _resolve(out, CFG.get("lodging_label") or "the rental", "lodging-inferred",
+                        f"{nights} stays over {SLEEP_STAY_HOURS:.0f}h here — the user sleeps at "
+                        f"this spot, but no long stay carries a confirmed name")
+
+    # 3.5. A night nothing above could name: not the booking by its nights or
+    # its address, not the user's own answers here, not a bed slept in before.
+    # If nothing places the booking elsewhere either, ask about the booking
+    # itself, one tap, rather than offer a café list: no café holds anyone
+    # till morning. See LODGING_NEAR_M.
+    if is_night:
+        stay = lodging()
+        if stay:
+            return _resolve(out, stay["name"], "lodging-night", stay["reason"])
+
+    # 4. Density — one plausible venue, or a tie that only a tap can break.
+    try:
+        from places_nearby import nearby
+        cands = nearby(lat, lon, radius=int(ASK_RADIUS_M), max_results=20)
+    except Exception:
+        cands = []
+    if not cands:
+        cands = _osm_fallback_candidates(lat, lon, ASK_RADIUS_M)
+    plausible = [c for c in cands
+                 if not ((set(c.get("types") or []) | {c.get("primary_type") or ""})
+                         & (DEMOTED_TYPES | ADDRESS_TYPES))]
+    # A destination prior, because distance and review count alone default a
+    # 23-minute morning coffee to a laundry (22m) over a coffee shop (20m). Somewhere you SPEND 15+ minutes is
+    # overwhelmingly somewhere that serves you something or sells you something,
+    # not a government office, a clinic or a dry cleaner sharing the doorway.
+    meal = _meal_kinds(arr, mins, tz)
+    def prior(c):
+        t = set(c.get("types") or []) | {c.get("primary_type") or ""}
+        if meal and _serves(t, meal):
+            return -1
+        if t & DESTINATION_TYPES:
+            return 0
+        if t & SERVICE_TYPES:
+            return 2
+        return 1
+    plausible.sort(key=lambda c: (prior(c), round(c["distance_m"] / 20),
+                                  -(c.get("reviews") or 0)))
+    out["n_candidates"] = len(plausible)
+    if not plausible:
+        # `options`, not `choices` — `segment-ask` (the only consumer) skips
+        # any row where `not r.get("options")`, so this verdict has never
+        # actually reached the user: it claimed "ask" but carried nothing to
+        # ask WITH. A real, if minimal, option restores that — one tap to say
+        # so rather than a silently dropped question.
+        # Where the user is staying is the one named answer left, and with no rival
+        # it is the likeliest.
+        stay = lodging()
+        out.update(verdict="ask", reason=f"no named venue within {ASK_RADIUS_M:.0f}m"
+                                         + (f"; the booking: {stay['reason']}" if stay else ""),
+                   question="Where was this?",
+                   prompt=(f"{ctx} — where was this?" if ctx else "Where was this?"),
+                   options=([_lodging_choice(stay)] if stay else [])
+                   + [{"id": "__other__", "label": "Type it in", "value": OTHER_VALUE,
+                       "sublabel": "no nearby venue found"}],
+                   default_id="__lodging__" if stay else None)
+        return out
+    if len(plausible) == 1:
+        c = plausible[0]
+        return _resolve(out, c["name"], "singular",
+                        f"the only venue within {ASK_RADIUS_M:.0f}m ({c['distance_m']:.0f}m)")
+
+    # Where the user is staying goes first, in place of the fourth venue: within
+    # LODGING_NEAR_M of the flat it is the likelier answer, and no venue is
+    # then decisively ahead of it, so the card carries no default.
+    stay = lodging()
+    opts = ([_lodging_choice(stay)] if stay else []) + [
+        {"id": c.get("place_id") or c["name"], "label": c["name"],
+         "sublabel": f"{round(c['distance_m'])}m · {c.get('type_display') or c.get('primary_type') or ''}".strip(" ·"),
+         "distance_m": round(c["distance_m"])}
+        for c in plausible[:MAX_CHOICES - (1 if stay else 0)]]
+    opts.append({"id": "__other__", "label": "Somewhere else", "value": OTHER_VALUE,
+                 "sublabel": "type it instead"})
+    decisive = not stay and (len(plausible) == 1 or (
+        prior(plausible[0]) < prior(plausible[1])
+        or plausible[1]["distance_m"] - plausible[0]["distance_m"] >= 10))
+    # One tap for "this wasn't a stop at all" — a walk past a café is
+    # otherwise forced into naming it. Its value is what `findme resolve`
+    # already reads as a withdrawal (non-stop), never a place.
+    opts.append({"id": "__passing__", "label": "Just passing through", "value": "not a stop",
+                 "sublabel": "not a stop"})
+    out.update(verdict="choose", question="Which of these was it?",
+               prompt=(f"{ctx} — which of these was it?" if ctx
+                       else "Which of these was it?"),
+               options=opts,
+               # The ranked top is the default when it is decisively ahead — the
+               # same judgement the list already makes. When it is not, no
+               # default: see the note by DESTINATION_TYPES.
+               default_id=opts[0]["id"] if decisive else None,
+               reason=f"{len(plausible)} plausible venues within {ASK_RADIUS_M:.0f}m — distance cannot separate them"
+                      + (f"; and the booking: {stay['reason']}" if stay else ""))
+    return out
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("date", nargs="?")
+    ap.add_argument("--tz", default=places_local.instance().get("tz") or "UTC")
+    ap.add_argument("--visit")
+    ap.add_argument("--json", action="store_true")
+    args = ap.parse_args()
+    key = load_key()
+    saved = load_saved()
+
+    if args.visit:
+        visits = _get(f"location_history?id=eq.{urllib.parse.quote(args.visit)}&select=*", key)
+    else:
+        if not args.date:
+            ap.error("need a date or --visit")
+        tz = ZoneInfo(args.tz)
+        d0 = datetime.strptime(args.date, "%Y-%m-%d").replace(tzinfo=tz)
+        d1 = d0 + timedelta(days=1)
+        visits = _get(
+            "location_history?segment_type=eq.visit&departed_at=not.is.null"
+            f"&arrived_at=gte.{urllib.parse.quote(d0.astimezone(timezone.utc).isoformat())}"
+            f"&arrived_at=lt.{urllib.parse.quote(d1.astimezone(timezone.utc).isoformat())}"
+            "&select=*&order=arrived_at.asc", key)
+
+    disp_tz = ZoneInfo(args.tz)
+    seen, results, prev_name = set(), [], None
+    for v in visits or []:
+        k = (v["arrived_at"], v.get("departed_at"), round(v["latitude"], 5))
+        if k in seen:
+            continue
+        seen.add(k)
+        r = classify(v, key, saved, tz=disp_tz, prev=prev_name)
+        results.append(r)
+        # Carry the last stop we can NAME forward, so the next question can say
+        # "after <the market>" instead of leaving the user to work out which gap.
+        nm = r.get("name") or r.get("stored_name")
+        if nm and r.get("verdict") != "below-floor":
+            prev_name = nm
+
+    if args.json:
+        print(json.dumps(results, indent=2, default=str))
+        return
+    tz = ZoneInfo(args.tz)
+    for r in results:
+        if r["verdict"] == "below-floor":
+            continue
+        t = datetime.fromisoformat(r["arrived_at"].replace("Z", "+00:00")).astimezone(tz)
+        head = f"{t:%H:%M}  {r['minutes']:>5.0f} min  {r['verdict'].upper()}"
+        if r.get("confidence"):
+            head += f" [{r['confidence']}]"
+        print(head)
+        if r.get("prompt"):
+            print(f"          \"{r['prompt']}\"")
+        print(f"          {r['reason']}")
+        for c in r.get("options") or []:
+            star = "  ← default" if c["id"] == r.get("default_id") else ""
+            sub = f"  ({c['sublabel']})" if c.get("sublabel") else ""
+            print(f"            [ {c['label']} ]{sub}{star}")
+        if r.get("conflicting_prior_names"):
+            print(f"          prior names here disagree: {r['conflicting_prior_names']}")
+    shown = [r for r in results if r["verdict"] != "below-floor"]
+    skipped = sum(1 for r in shown if r["verdict"] == "skip-known")
+    conf = sum(1 for r in shown if r["verdict"] == "confirm")
+    defaulted = sum(1 for r in shown if r.get("default_id"))
+    print(f"\n{len(shown)} stop(s) over {MIN_STOP_MIN:.0f} min — "
+          f"{skipped} known (no question), {conf} one-tap confirm, "
+          f"{len(shown) - conf - skipped} multi-choice; "
+          f"{defaulted} have an applicable default")
+
+
+if __name__ == "__main__":
+    main()

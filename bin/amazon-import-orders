@@ -1,0 +1,348 @@
+#!/usr/bin/env node
+// amazon-import-orders — load Amazon's "Request my data" order history, and
+// use it to fill in the receipts that only ever said "1 Electronics item".
+//
+// WHY THIS EXISTS. Amazon anonymised its order mail: the confirmation for an
+// $801.43 purchase says "Ordered: 1 Appliances item", an order number and a
+// total, and no product name anywhere. amazon-order-detail reads the order page
+// to recover it, which is right for new orders and hopeless for history —
+// ~4,950 orders at a paced 16s each is over a day of scraping. The export hands
+// the whole twenty-one years over in one CSV, for free.
+//
+// WHAT IT DOES, in three passes:
+//   1. The export lands in amazon_orders / amazon_order_items, faithfully.
+//   2. Receipts that already exist and share an order id get their line items
+//      REPLACED from the export. Deterministic — an order id is an order id, no
+//      amount matching, no guessing.
+//   3. Orders with no receipt at all are projected into `receipts` as
+//      `amazon:<orderId>`, carrying the card's last 4 and the shipping address,
+//      so reconcile can attach them to a charge that never had an email found.
+//
+// Pass 2 is the one that matters most: it fixes every historical Amazon receipt
+// in the ledger at once, without a single page load.
+//
+// Usage:
+//   amazon-import-orders --dir "~/Downloads/Your Orders"
+//   amazon-import-orders --dir <path> --dry-run     count everything, write nothing
+//   amazon-import-orders --dir <path> --skip-raw    only passes 2 and 3
+//   amazon-import-orders --dir <path> --since 2021-01-01
+//   amazon-import-orders --dir <path> --json
+
+import fs from "node:fs";
+import path from "node:path";
+import supa from "../lib/supabase-rest.js";
+const { request } = supa;
+
+const ARGV = process.argv.slice(2);
+const FLAGS = new Set(ARGV.filter((a) => a.startsWith("--")));
+const flagVal = (n, d) => {
+  const i = ARGV.indexOf(`--${n}`);
+  return i >= 0 && ARGV[i + 1] ? ARGV[i + 1] : d;
+};
+const DRY_RUN = FLAGS.has("--dry-run");
+const JSON_OUT = FLAGS.has("--json");
+const SKIP_RAW = FLAGS.has("--skip-raw");
+const SINCE = flagVal("since", "");
+const DIR = (flagVal("dir", "") || "").replace(/^~/, process.env.HOME);
+
+const log = (...a) => { if (!JSON_OUT) console.log(...a); };
+const CHUNK = 500;
+
+if (!DIR) {
+  console.error('usage: amazon-import-orders --dir "<path to Your Orders>"');
+  process.exit(1);
+}
+
+/**
+ * A CSV reader that copes with Amazon's file: quoted fields containing commas,
+ * doubled quotes, embedded newlines, and a UTF-8 BOM on the header.
+ * Deliberately hand-rolled — this runs once against a known file and pulling a
+ * parser in for it would be the larger risk.
+ */
+function parseCsv(text) {
+  if (text.charCodeAt(0) === 0xfeff) text = text.slice(1);
+  const rows = [];
+  let row = [], field = "", quoted = false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (quoted) {
+      if (c === '"') {
+        if (text[i + 1] === '"') { field += '"'; i++; }
+        else quoted = false;
+      } else field += c;
+      continue;
+    }
+    if (c === '"') quoted = true;
+    else if (c === ",") { row.push(field); field = ""; }
+    else if (c === "\n") { row.push(field); rows.push(row); row = []; field = ""; }
+    else if (c !== "\r") field += c;
+  }
+  if (field || row.length) { row.push(field); rows.push(row); }
+
+  const header = rows.shift().map((h) => h.trim().replace(/^"|"$/g, ""));
+  return rows
+    .filter((r) => r.length > 1)
+    .map((r) => Object.fromEntries(header.map((h, i) => [h, (r[i] ?? "").trim()])));
+}
+
+/** Amazon writes "Not Available" / "Not Applicable" where it means null. */
+const clean = (v) => {
+  const s = (v || "").trim();
+  return !s || s === "Not Available" || s === "Not Applicable" ? null : s;
+};
+const num = (v) => {
+  const s = clean(v);
+  if (s === null) return null;
+  const n = Number(s.replace(/[^0-9.-]/g, "")); // lang-regex-ok: stripping currency punctuation from a printed figure
+  return Number.isFinite(n) ? n : null;
+};
+const iso = (v) => {
+  const s = clean(v);
+  if (!s) return null;
+  const d = new Date(s);
+  return Number.isNaN(d.getTime()) ? null : d.toISOString();
+};
+
+/**
+ * "<Card network> - 1234" → "1234".
+ *
+ * The digits are the whole point: financial_accounts stores the same four for
+ * every card, so this is what tells a charge on one card apart from the same
+ * amount on another card in the same week.
+ */
+function cardLast4(paymentMethod) {
+  const s = clean(paymentMethod);
+  if (!s) return null;
+  const m = s.match(/(\d{4})\s*$/); // lang-regex-ok: trailing card digits in a fixed vendor string
+  return m ? m[1] : null;
+}
+
+/** The recipient is the leading name on Amazon's single-line address. */
+function recipientOf(address) {
+  const s = clean(address);
+  if (!s) return null;
+  const m = s.match(/^(.+?)\s+\d/); // lang-regex-ok: name precedes the street number in a postal address
+  return m ? m[1].trim() : null;
+}
+
+async function post(table, rows, conflict) {
+  for (let i = 0; i < rows.length; i += CHUNK) {
+    await request(`/rest/v1/${table}?on_conflict=${conflict}`, {
+      method: "POST",
+      body: rows.slice(i, i + CHUNK),
+      prefer: "resolution=merge-duplicates,return=minimal",
+      timeoutMs: 60000,
+    });
+  }
+}
+
+async function main() {
+  const csvPath = path.join(DIR, "Your Amazon Orders", "Order History.csv");
+  if (!fs.existsSync(csvPath)) {
+    console.error(`No Order History.csv under ${DIR}`);
+    process.exit(1);
+  }
+
+  let rows = parseCsv(fs.readFileSync(csvPath, "utf8"));
+  if (SINCE) rows = rows.filter((r) => (r["Order Date"] || "") >= SINCE);
+
+  // Group the export's line-item rows into orders.
+  const orders = new Map();
+  for (const r of rows) {
+    const id = clean(r["Order ID"]);
+    if (!id) continue;
+    if (!orders.has(id)) orders.set(id, []);
+    orders.get(id).push(r);
+  }
+
+  const summary = {
+    rows: rows.length,
+    orders: orders.size,
+    ordersWritten: 0,
+    itemsWritten: 0,
+    receiptsFilled: 0,
+    receiptsCreated: 0,
+    lineItemsWritten: 0,
+  };
+  log(`${summary.rows} line items across ${summary.orders} orders.`);
+
+  // ── Pass 1: the export, faithfully ────────────────────────────────────────
+  const orderRows = [];
+  const itemRows = [];
+  for (const [id, rs] of orders) {
+    const first = rs[0];
+    const total = rs.reduce((sum, r) => sum + (num(r["Total Amount"]) ?? 0), 0);
+    orderRows.push({
+      order_id: id,
+      order_date: iso(first["Order Date"]),
+      status: clean(first["Order Status"]),
+      website: clean(first["Website"]),
+      currency: clean(first["Currency"]) ?? "USD",
+      order_total: Number(total.toFixed(2)),
+      payment_method: clean(first["Payment Method Type"]),
+      card_last4: cardLast4(first["Payment Method Type"]),
+      ship_to: clean(first["Shipping Address"]),
+      ship_recipient: recipientOf(first["Shipping Address"]),
+      billing_address: clean(first["Billing Address"]),
+      item_count: rs.length,
+    });
+    rs.forEach((r, i) => {
+      itemRows.push({
+        order_id: id,
+        line_number: i + 1,
+        asin: clean(r["ASIN"]),
+        product_name: clean(r["Product Name"]) ?? "(unnamed item)",
+        product_condition: clean(r["Product Condition"]),
+        quantity: num(r["Original Quantity"]),
+        unit_price: num(r["Unit Price"]),
+        unit_price_tax: num(r["Unit Price Tax"]),
+        item_total: num(r["Total Amount"]),
+        shipment_subtotal: num(r["Shipment Item Subtotal"]),
+        shipment_tax: num(r["Shipment Item Subtotal Tax"]),
+        shipping_charge: num(r["Shipping Charge"]),
+        discounts: num(r["Total Discounts"]),
+        ship_date: iso(r["Ship Date"]),
+        shipment_status: clean(r["Shipment Status"]),
+        tracking: clean(r["Carrier Name & Tracking Number"]),
+      });
+    });
+  }
+
+  if (!SKIP_RAW && !DRY_RUN) {
+    log(`  writing ${orderRows.length} orders…`);
+    await post("amazon_orders", orderRows, "order_id");
+    log(`  writing ${itemRows.length} line items…`);
+    await post("amazon_order_items", itemRows, "order_id,line_number");
+  }
+  summary.ordersWritten = SKIP_RAW || DRY_RUN ? 0 : orderRows.length;
+  summary.itemsWritten = SKIP_RAW || DRY_RUN ? 0 : itemRows.length;
+
+  // ── Pass 2: fill in receipts that already exist ───────────────────────────
+  //
+  // The deterministic half, and the valuable one. A receipt extracted from mail
+  // knows its order id; the export knows what was in that order. No amount
+  // matching, no window, no guessing — the ids either agree or they do not.
+  const existing = await request(
+    "/rest/v1/receipts?select=id,order_id,vendor&order_id=not.is.null&limit=5000"
+  );
+  const byOrderId = new Map();
+  for (const rec of existing) if (rec.order_id) byOrderId.set(rec.order_id, rec);
+
+  const toFill = [...orders.keys()].filter((id) => byOrderId.has(id));
+  log(`  ${toFill.length} existing receipts share an order id with the export.`);
+
+  if (!DRY_RUN) {
+    for (const id of toFill) {
+      const receipt = byOrderId.get(id);
+      const items = itemRows.filter((it) => it.order_id === id);
+      // Replace rather than merge: the placeholder line ("Appliances item")
+      // describes the same purchase as the real ones, so keeping both would
+      // double the receipt and, downstream, double what the classifier reads.
+      await request(`/rest/v1/receipt_line_items?receipt_id=eq.${encodeURIComponent(receipt.id)}`, {
+        method: "DELETE",
+        prefer: "return=minimal",
+      });
+      await request("/rest/v1/receipt_line_items", {
+        method: "POST",
+        prefer: "return=minimal",
+        body: items.map((it) => ({
+          receipt_id: receipt.id,
+          line_number: it.line_number,
+          description: it.product_name,
+          quantity: it.quantity,
+          amount: it.item_total,
+          asin: it.asin,
+          seller: null,
+        })),
+      });
+      const order = orderRows.find((o) => o.order_id === id);
+      await request(`/rest/v1/receipts?id=eq.${encodeURIComponent(receipt.id)}`, {
+        method: "PATCH",
+        prefer: "return=minimal",
+        body: {
+          ship_address: order?.ship_to ?? null,
+          ship_recipient: order?.ship_recipient ?? null,
+          detail_fetched_at: new Date().toISOString(),
+          detail_status: "ok",
+          source_detail: "amazon-export",
+        },
+      });
+      summary.receiptsFilled += 1;
+      summary.lineItemsWritten += items.length;
+    }
+  } else {
+    summary.receiptsFilled = toFill.length;
+  }
+
+  // ── Pass 3: receipts for orders that never had an email ───────────────────
+  //
+  // Opportunistic. These carry the card's last 4 and the shipping address,
+  // which is exactly what reconcile uses to attach a charge and — more
+  // importantly — to DISQUALIFY one: a receipt paid on a different card is not
+  // this charge, however well the amount lines up.
+  const fresh = [...orders.keys()].filter((id) => !byOrderId.has(id));
+  const newReceipts = [];
+  const newItems = [];
+  for (const id of fresh) {
+    const order = orderRows.find((o) => o.order_id === id);
+    if (!order || order.status === "Cancelled") continue;
+    if (order.order_total == null || order.order_total <= 0) continue;
+    const rid = `amazon:${id}`;
+    newReceipts.push({
+      id: rid,
+      source: "amazon-export",
+      source_detail: "amazon-export",
+      account: "amazon-export",
+      vendor: "Amazon.com",
+      date: (order.order_date || "").slice(0, 10),
+      total: order.order_total,
+      currency: order.currency,
+      card_last4: order.card_last4,
+      ship_to: order.ship_to,
+      ship_address: order.ship_to,
+      ship_recipient: order.ship_recipient,
+      order_id: id,
+      confidence: 1,
+      email_subject: null,
+      detail_fetched_at: new Date().toISOString(),
+      detail_status: "ok",
+    });
+    for (const it of itemRows.filter((x) => x.order_id === id)) {
+      newItems.push({
+        receipt_id: rid,
+        line_number: it.line_number,
+        description: it.product_name,
+        quantity: it.quantity,
+        amount: it.item_total,
+        asin: it.asin,
+        seller: null,
+      });
+    }
+  }
+
+  log(`  ${newReceipts.length} orders have no receipt — projecting them.`);
+  if (!DRY_RUN) {
+    await post("receipts", newReceipts, "id");
+    await post("receipt_line_items", newItems, "receipt_id,line_number");
+  }
+  summary.receiptsCreated = newReceipts.length;
+  summary.lineItemsWritten += newItems.length;
+
+  if (JSON_OUT) {
+    console.log(JSON.stringify(summary));
+  } else {
+    log(`
+  orders stored:            ${summary.ordersWritten}
+  line items stored:        ${summary.itemsWritten}
+  receipts filled in:       ${summary.receiptsFilled}
+  receipts created:         ${summary.receiptsCreated}
+  receipt line items:       ${summary.lineItemsWritten}${DRY_RUN ? "\n  (dry run — nothing written)" : ""}`);
+  }
+}
+
+main()
+  .then(() => process.exit(0))
+  .catch((e) => {
+    console.error(e.message);
+    process.exit(1);
+  });

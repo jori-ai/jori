@@ -1,0 +1,366 @@
+#!/usr/bin/env node
+/**
+ * Amazon orders from the mail, into `amazon_orders`.
+ *
+ * WHY THIS EXISTS
+ *
+ * `amazon_orders` had exactly one writer: `amazon-import-orders`, reading a
+ * data export that has to be requested from Amazon by hand and arrives days
+ * later. So the table is not a feed, it is a SNAPSHOT — correct up to its
+ * newest order and silent about everything after, with nothing inside it to
+ * say which is which. It had been frozen since 2026-08-23 while the ledger
+ * carried on, and the hub's order matcher went on offering the only orders it
+ * had for charges it could not possibly explain.
+ *
+ * The order confirmation, though, arrives in the mail the moment the order is
+ * placed. That is the live feed the table was missing.
+ *
+ * WHAT IT COSTS, AND WHY IT IS CHEAP
+ *
+ * An order confirmation carries its order id in plain text, and an order id is
+ * a primary key. So the "have we got this one already?" question is answered by
+ * a regex against a set — no model, no tokens — and the model is asked only
+ * about orders genuinely absent from the table. Re-running costs almost
+ * nothing, which is what makes this safe to schedule.
+ *
+ * Amazon's own mail is the source of truth here, and it lands in ONE mailbox.
+ *
+ * OFF until agent/local/config/amazon-orders.json names that mailbox:
+ *   mailbox      — the address the Amazon account sends its confirmations to
+ *   llm_key_env  — the env var holding the Anthropic key the extraction bills
+ *                  (default ANTHROPIC_API_KEY; a business can bill its own key)
+ *   model        — extraction model (default below)
+ */
+
+const { execFile } = require("node:child_process");
+const { promisify } = require("node:util");
+const run = promisify(execFile);
+const { request } = require("../lib/supabase-rest.js");
+const { localConfig } = require("../lib/instance.cjs");
+const CONFIG = localConfig("amazon-orders", { mailbox: null, llm_key_env: "ANTHROPIC_API_KEY", model: "claude-sonnet-5-5" });
+
+const ARGV = process.argv.slice(2);
+const flag = (name, fallback = null) => {
+  const i = ARGV.indexOf(`--${name}`);
+  if (i === -1) return fallback;
+  const next = ARGV[i + 1];
+  return next === undefined || next.startsWith("--") ? true : next;
+};
+const DRY_RUN = ARGV.includes("--dry-run");
+const VERBOSE = ARGV.includes("--verbose");
+const LIMIT = Number(flag("limit", "400"));
+const SINCE = flag("since");
+
+/**
+ * The mailbox Amazon writes to.
+ *
+ * Not a default to be overridden casually: the household's Amazon account
+ * sends its confirmations to one address (config `mailbox`), so scanning a
+ * second mailbox costs searches and returns forwards at best. `--account`
+ * remains for the day that stops being true.
+ */
+const ACCOUNT = flag("account", CONFIG.mailbox);
+
+const MODEL = CONFIG.model;
+const ORDER_ID = /\b\d{3}-\d{7}-\d{7}\b/;
+
+const SHELL_ENV = process.env;
+async function gog(args) {
+  const { stdout } = await run("gog", args, {
+    maxBuffer: 64 * 1024 * 1024,
+    env: { ...SHELL_ENV, PATH: `/opt/homebrew/bin:${SHELL_ENV.PATH || ""}` },
+  });
+  return stdout;
+}
+
+/**
+ * Every order id the table already holds.
+ *
+ * Paged deliberately: PostgREST caps a response, and a silent truncation here
+ * would make known orders look new and re-extract them at model prices.
+ */
+async function knownOrderIds() {
+  const ids = new Set();
+  const PAGE = 1000;
+  for (let offset = 0; ; offset += PAGE) {
+    const rows = await request(
+      `/rest/v1/amazon_orders?select=order_id&order=order_id.asc&limit=${PAGE}&offset=${offset}`
+    );
+    for (const r of rows) ids.add(r.order_id);
+    if (rows.length < PAGE) break;
+  }
+  return ids;
+}
+
+/** The newest order the table holds — where the snapshot stopped. */
+async function horizon() {
+  const rows = await request("/rest/v1/amazon_orders?select=order_date&order=order_date.desc&limit=1");
+  return rows[0]?.order_date ? String(rows[0].order_date).slice(0, 10) : null;
+}
+
+async function searchOrderMail(since) {
+  const q =
+    `after:${since.replace(/-/g, "/")} from:amazon.com ` +
+    `subject:(Ordered OR "order confirmation") -in:sent -in:trash -in:draft`;
+  for (let attempt = 1; attempt <= 4; attempt++) {
+    try {
+      const out = await gog(["gmail", "search", q, "--account", ACCOUNT, "--max", String(Math.min(LIMIT, 500)), "-p"]);
+      const rows = out
+        .split("\n")
+        .slice(1)
+        .filter((l) => l.trim() && !l.startsWith("#"))
+        .map((l) => l.split("\t"));
+      if (rows.length) return rows.map((c) => c[0].trim()).filter(Boolean);
+    } catch (e) {
+      if (VERBOSE) console.error(`  search failed: ${e.message.slice(0, 90)}`);
+    }
+    if (attempt < 4) await new Promise((r) => setTimeout(r, 5000 * attempt));
+  }
+  return [];
+}
+
+function readPayload(payload, acc = { text: "", html: "" }) {
+  const data = payload.body?.data;
+  if (data) {
+    const decoded = Buffer.from(data, "base64url").toString("utf8");
+    if (payload.mimeType === "text/plain") acc.text += decoded;
+    else if (payload.mimeType === "text/html") acc.html += decoded;
+  }
+  for (const part of payload.parts || []) readPayload(part, acc);
+  return acc;
+}
+
+const stripHtml = (h) =>
+  h.replace(/<style[\s\S]*?<\/style>/gi, " ")
+    .replace(/<script[\s\S]*?<\/script>/gi, " ")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/&nbsp;/g, " ")
+    .replace(/&amp;/g, "&")
+    .replace(/\s+/g, " ")
+    .trim();
+
+async function fetchMessage(messageId) {
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      const parsed = JSON.parse(await gog(["gmail", "read", messageId, "--account", ACCOUNT, "-j"]));
+      const message = parsed?.thread?.messages?.[0];
+      if (!message) return null;
+      const { text, html } = readPayload(message.payload || {});
+      return { message, body: (text || stripHtml(html)).slice(0, 12000) };
+    } catch (e) {
+      if (attempt === 3) throw e;
+      await new Promise((r) => setTimeout(r, 4000 * attempt));
+    }
+  }
+  return null;
+}
+
+const headerOf = (payload, name) =>
+  (payload.headers || []).find((h) => h.name?.toLowerCase() === name.toLowerCase())?.value || "";
+
+const SCHEMA = {
+  type: "object",
+  additionalProperties: false,
+  required: ["isOrder", "orderTotal", "items"],
+  properties: {
+    isOrder: { type: "boolean", description: "True only for a confirmation of a placed retail order." },
+    orderTotal: { type: ["number", "null"], description: "Order total in dollars, the number Amazon calls the order total." },
+    cardLast4: { type: ["string", "null"], description: "Last 4 digits of the card, if the mail names it." },
+    shipTo: { type: ["string", "null"], description: "Shipping address as printed." },
+    items: {
+      type: "array",
+      description: "One entry per distinct product.",
+      items: {
+        type: "object",
+        additionalProperties: false,
+        required: ["productName"],
+        properties: {
+          productName: { type: "string" },
+          quantity: { type: ["number", "null"] },
+          itemTotal: { type: ["number", "null"], description: "Line total in dollars, if stated." },
+        },
+      },
+    },
+  },
+};
+
+const SYSTEM_PROMPT = `You read Amazon order-confirmation emails and report what was ordered.
+
+Report only what the email actually states. Never infer a total from the items,
+and never invent a price the email does not print — a null is correct and useful,
+a guess is neither.
+
+isOrder is false for shipping notices, delivery notices, returns, refunds,
+cancellations, Prime or subscription notices, and anything that is not the
+confirmation of a retail order that was placed.
+
+Amounts are in dollars as numbers: 38.87, never "$38.87".`;
+
+async function extract(document) {
+  const key = process.env[CONFIG.llm_key_env];
+  if (!key) {
+    throw new Error(
+      `${CONFIG.llm_key_env} is not set (config llm_key_env) — set it rather than ` +
+        "falling back to another key: the extraction bills whoever owns that key."
+    );
+  }
+  const res = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: { "x-api-key": key, "anthropic-version": "2023-06-01", "content-type": "application/json" },
+    body: JSON.stringify({
+      model: MODEL,
+      max_tokens: 2048,
+      system: SYSTEM_PROMPT,
+      output_config: { effort: "low", format: { type: "json_schema", schema: SCHEMA } },
+      messages: [{ role: "user", content: document }],
+    }),
+  });
+  if (!res.ok) throw new Error(`Anthropic ${res.status}: ${(await res.text()).slice(0, 200)}`);
+  const body = await res.json();
+  const text = (body.content || []).find((b) => b.type === "text");
+  if (!text) throw new Error(`no text in response (stop: ${body.stop_reason})`);
+  return JSON.parse(text.text);
+}
+
+async function post(table, rows, conflict) {
+  for (let i = 0; i < rows.length; i += 200) {
+    await request(`/rest/v1/${table}?on_conflict=${conflict}`, {
+      method: "POST",
+      body: rows.slice(i, i + 200),
+      prefer: "resolution=merge-duplicates,return=minimal",
+      timeoutMs: 60000,
+    });
+  }
+}
+
+async function main() {
+  if (!ACCOUNT || ACCOUNT === true) {
+    console.log("amazon-mail-orders: off — no mailbox in agent/local/config/amazon-orders.json");
+    return;
+  }
+  if (!process.env[CONFIG.llm_key_env]) {
+    console.log(`amazon-mail-orders: off — ${CONFIG.llm_key_env} is not set`);
+    return;
+  }
+  const known = await knownOrderIds();
+  const edge = await horizon();
+  // Start a fortnight before the snapshot's edge: an order placed just inside it
+  // may still be missing if the export was requested mid-flight, and a known id
+  // costs nothing to see again.
+  const since = SINCE && SINCE !== true
+    ? SINCE
+    : edge
+      ? new Date(Date.parse(`${edge}T00:00:00Z`) - 14 * 86400000).toISOString().slice(0, 10)
+      : "2026-01-01";
+
+  console.log(`amazon_orders holds ${known.size} orders, newest ${edge ?? "(none)"}`);
+  console.log(`Reading ${ACCOUNT} for order confirmations since ${since}${DRY_RUN ? " (dry run)" : ""}`);
+
+  const ids = await searchOrderMail(since);
+  console.log(`${ids.length} order-confirmation email(s) found\n`);
+
+  const orderRows = [];
+  const itemRows = [];
+  let alreadyKnown = 0;
+  let noOrderId = 0;
+  let notAnOrder = 0;
+  let failed = 0;
+
+  for (const messageId of ids) {
+    let fetched;
+    try {
+      fetched = await fetchMessage(messageId);
+    } catch (e) {
+      failed += 1;
+      console.log(`  ! ${messageId}: ${e.message.slice(0, 80)}`);
+      continue;
+    }
+    if (!fetched) continue;
+    const { message, body } = fetched;
+    const payload = message.payload || {};
+    const subject = headerOf(payload, "Subject");
+
+    // The free gate. An order id is a primary key, so "already have it" is a set
+    // lookup — the model is never asked about an order the table holds.
+    const found = `${subject}\n${body}`.match(ORDER_ID);
+    if (!found) { noOrderId += 1; continue; }
+    const orderId = found[0];
+    if (known.has(orderId)) { alreadyKnown += 1; continue; }
+
+    // The confirmation carries no date of its own — Amazon prints the order
+    // total and the items and leaves the date to the envelope. The mail's own
+    // timestamp IS the order date: the confirmation is sent on placement.
+    const orderDate = message.internalDate
+      ? new Date(Number(message.internalDate)).toISOString().slice(0, 10)
+      : null;
+
+    let data;
+    try {
+      data = await extract(`Subject: ${subject}\nDate: ${orderDate}\n\n${body}`);
+    } catch (e) {
+      failed += 1;
+      console.log(`  ! ${orderId}: ${e.message.slice(0, 80)}`);
+      continue;
+    }
+
+    if (!data.isOrder || data.orderTotal == null || !orderDate) { notAnOrder += 1; continue; }
+
+    known.add(orderId);
+    orderRows.push({
+      order_id: orderId,
+      order_date: orderDate,
+      // Truthful, and it doubles as provenance: the export only ever writes
+      // "Closed", because it is a history of completed orders. An order read
+      // from its confirmation has just been placed and has not shipped, which
+      // is exactly why its line items carry no ship date or tracking.
+      status: "Placed",
+      website: "Amazon.com",
+      currency: "USD",
+      order_total: Number(Number(data.orderTotal).toFixed(2)),
+      payment_method: null,
+      card_last4: data.cardLast4 ? String(data.cardLast4).replace(/\D/g, "").slice(-4) || null : null,
+      ship_to: data.shipTo ?? null,
+      ship_recipient: null,
+      billing_address: null,
+      item_count: data.items?.length ?? 0,
+    });
+    (data.items || []).forEach((it, i) => {
+      itemRows.push({
+        order_id: orderId,
+        line_number: i + 1,
+        asin: null,
+        product_name: it.productName || "(unnamed item)",
+        product_condition: null,
+        quantity: it.quantity ?? null,
+        unit_price: null,
+        unit_price_tax: null,
+        item_total: it.itemTotal ?? null,
+        shipment_subtotal: null,
+        shipment_tax: null,
+        shipping_charge: null,
+        discounts: null,
+        // The confirmation predates dispatch, so it cannot know a ship date.
+        ship_date: null,
+        shipment_status: null,
+        tracking: null,
+      });
+    });
+    console.log(`  + ${orderId}  ${orderDate}  $${Number(data.orderTotal).toFixed(2)}  ${(data.items?.[0]?.productName || "").slice(0, 48)}`);
+  }
+
+  if (!DRY_RUN && orderRows.length) {
+    await post("amazon_orders", orderRows, "order_id");
+    if (itemRows.length) await post("amazon_order_items", itemRows, "order_id,line_number");
+  }
+
+  console.log(
+    `\n${orderRows.length} new order(s)${DRY_RUN ? " (not written)" : " written"}, ` +
+      `${itemRows.length} line items · already in the table ${alreadyKnown} · ` +
+      `no order id ${noOrderId} · not an order ${notAnOrder} · failed ${failed}`
+  );
+}
+
+main().catch((e) => {
+  console.error(e);
+  process.exit(1);
+});

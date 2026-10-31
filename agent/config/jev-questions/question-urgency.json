@@ -1,0 +1,14 @@
+{
+  "_doc": "Jev site for question routing (lib/question-route.mjs, called by bin/jori-send-curl for every question bound for the chat channel). true = urgent: the question stays in chat and pushes as usual; false = it goes to the questions channel, written silently for the user to answer when they choose. Location questions never reach this site: they are urgent by rule, decided in code from the sender's structure. Legacy (fallback, and shadow while a shadow window is open) is a toolless Sonnet judgment built from this file's own wording. Kernel definition; an installation's own data/jev-questions/question-urgency.json replaces it.",
+  "threshold": 0.8,
+  "questions": {
+    "urgent": {
+      "type": "boolean",
+      "instructions": "`question` is a question {{owner_name}}'s assistant is about to ask them. `kind` and `lane` say which part of the assistant composed it, and `local_time` is when it would arrive. There are two places it can go: the main chat, which notifies {{owner_name}} at once, and a separate questions inbox they work through when they have a quiet moment, with no notification. Is this question urgent, meaning the answer loses most of its value if it waits until {{owner_name}} next opens the inbox, typically several hours to a day? Urgent: it gates something happening today or within a few hours (an event, a booking, a reservation, a purchase or a reply with a deadline, a calendar change, someone waiting on it), it concerns money, safety or health that needs a decision now, or it can only be answered from fresh memory of something that just happened. Not urgent: preferences, taste, background and context-building, memory or wiki enrichment, plans more than a day out, curiosity, suggestions they may or may not want, and anything that would still be just as answerable tomorrow. When in doubt, not urgent.",
+      "criteria": {
+        "true": "the answer is needed within hours, or the question stops being answerable or useful if it waits until tomorrow",
+        "false": "the question keeps its value if answered later from the questions inbox"
+      }
+    }
+  }
+}

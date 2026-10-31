@@ -1,0 +1,344 @@
+#!/usr/bin/env python3
+# aso-opportunity-scan — orchestrator for the app-store optimization (ASO) jobs
+# of the marketing module (agent/local/config/marketing.json; OFF without it).
+#
+# Reads baseline-state + ranks-state, generates typed opportunities, scores
+# them by confidence × impact, writes mkt-aso-opportunities.json and a digest
+# preamble. The playbook formats + sends the weekly email.
+#
+# Designed to be useful from week 1 (no historical data needed for most types).
+#
+# Exit codes: 0 = ok, 1 = soft failure (state missing/unreadable).
+
+import json, os, sys, time
+from datetime import datetime, timedelta
+
+_BIN = os.path.dirname(os.path.realpath(globals().get("__file__") or sys.argv[0]))
+sys.path.insert(0, os.path.join(os.path.dirname(_BIN), "lib"))
+import mkt_local  # noqa: E402
+
+CFG = mkt_local.config()
+BASELINE = mkt_local.data_path("mkt-aso-baseline-state.json")
+RANKS = mkt_local.data_path("mkt-aso-ranks-state.json")
+TARGET_KW = mkt_local.data_path("mkt-aso-target-keywords.json")
+OPP_PATH = mkt_local.data_path("mkt-aso-opportunities.json")
+TODAY = time.strftime("%Y-%m-%d", time.gmtime())
+
+LOCALES = list((CFG.get("locales") or {}).keys())
+# The baseline's owner tag for the app's own listing (competitor diffs skip it).
+SELF_OWNER = CFG.get("baseline_self_owner") or CFG.get("product") or ""
+
+
+def load(path, default=None):
+    if not os.path.exists(path):
+        return default
+    try:
+        return json.load(open(path))
+    except Exception:
+        return default
+
+
+def save_json(path, data):
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f, indent=2)
+    os.rename(tmp, path)
+
+
+# ===== Opportunity scoring =====
+# score = confidence (0-1) × impact (1-5)
+
+def make_opp(opp_id, type_, store, locale, **kwargs):
+    return {
+        "id": opp_id,
+        "type": type_,
+        "store": store,
+        "locale": locale,
+        "first_seen": TODAY,
+        "status": "open",
+        **kwargs,
+    }
+
+
+# ===== Detection logic =====
+
+# Confirmed-localized iOS subtitles that contain an English loanword token the
+# naive subtitle_not_localized check would otherwise trip on (config
+# `localized_subtitle_ok`: locale -> [lowercased subtitles]).
+LOCALIZED_SUBTITLE_OK = {k: {str(x).lower() for x in v}
+                         for k, v in (CFG.get("localized_subtitle_ok") or {}).items()}
+# Tokens that mark a non-English locale's subtitle as still in English
+# (config `subtitle_english_markers`): a marker with capitals is matched
+# case-sensitively, an all-lowercase one against the lowercased subtitle.
+SUBTITLE_MARKERS = list(CFG.get("subtitle_english_markers") or [])
+
+
+def subtitle_looks_english(subtitle):
+    sub_l = subtitle.strip().lower()
+    return any((m in sub_l) if m == m.lower() else (m in subtitle) for m in SUBTITLE_MARKERS)
+
+
+def detect_empty_listing_fields(baseline):
+    """iOS promotional_text + subtitle empties; Android short summary empties."""
+    out = []
+    snap = (baseline or {}).get("current_snapshot") or {}
+    ios = snap.get("ios") or {}
+    for locale, fields in ios.items():
+        promo = (fields or {}).get("promotional_text", "")
+        if not promo or not promo.strip():
+            out.append(make_opp(
+                f"opp-{TODAY}-empty-ios-promo-{locale}",
+                "empty_listing_field", "ios", locale,
+                field="promotional_text",
+                evidence={"current_value": "", "char_limit": 170, "updateable_without_resubmit": True},
+                proposed_action=f"Fill iOS promotional_text in {locale} (170 char max, updates without resubmission). Focus on a recent product highlight that complements the description.",
+                confidence=1.0,
+                impact=4,
+            ))
+        # Subtitle: not English in non-en locales → effectively under-localized.
+        # The naive token check below trips on English loanwords that are also
+        # valid in the target language (e.g. "host" in an Italian subtitle).
+        # LOCALIZED_SUBTITLE_OK whitelists subtitles that are
+        # confirmed already localized despite carrying such a token, so they
+        # stop padding the open-opportunity count every run. Keyed (locale →
+        # set of lowercased confirmed subtitles); a real English rewrite of
+        # that locale's subtitle would no longer match and would flag again.
+        subtitle = (fields or {}).get("subtitle", "")
+        sub_l = subtitle.strip().lower()
+        localized_ok = sub_l in LOCALIZED_SUBTITLE_OK.get(locale, set())
+        if (locale != "en-US" and subtitle and not localized_ok
+                and subtitle_looks_english(subtitle)):
+            out.append(make_opp(
+                f"opp-{TODAY}-subtitle-not-localized-{locale}",
+                "subtitle_not_localized", "ios", locale,
+                field="subtitle",
+                evidence={"current_value": subtitle, "char_limit": 30, "issue": "English text in non-English locale"},
+                proposed_action=f"Localize iOS subtitle for {locale}. 30 char limit. The current English subtitle wastes localized keyword opportunity (subtitle is the #2 ranking signal after title).",
+                confidence=0.9,
+                impact=4,
+            ))
+    android = snap.get("android") or {}
+    for locale, fields in android.items():
+        summary = (fields or {}).get("summary", "")
+        desc = (fields or {}).get("description", "")
+        if not summary or not summary.strip():
+            out.append(make_opp(
+                f"opp-{TODAY}-empty-android-summary-{locale}",
+                "empty_listing_field", "android", locale,
+                field="summary",
+                evidence={"current_value": "", "char_limit": 80},
+                proposed_action=f"Fill Android short description (summary) for {locale}. 80 char max. Visible in search results.",
+                confidence=1.0,
+                impact=3,
+            ))
+        # Android long description under-used (≤30% of max)
+        if desc and len(desc) < 1500:
+            out.append(make_opp(
+                f"opp-{TODAY}-android-desc-short-{locale}",
+                "listing_field_underused", "android", locale,
+                field="description",
+                evidence={"current_chars": len(desc), "max_chars": 4000, "utilization": round(len(desc)/4000, 2)},
+                proposed_action=f"Expand Android description in {locale} (currently {len(desc)}/4000 chars). Natural-language coverage of target keywords improves indexing.",
+                confidence=0.7,
+                impact=2,
+            ))
+    return out
+
+
+def detect_market_no_visibility(ranks, target_kw):
+    """A (store, locale) has zero Tier 1 keywords ranking → critical gap."""
+    out = []
+    if not ranks or not target_kw:
+        return out
+    snap_ranks = ranks.get("ranks") or {}
+    target = target_kw.get("keywords") or {}
+    for store in ("ios", "android"):
+        store_ranks = snap_ranks.get(store) or {}
+        for locale in LOCALES:
+            tiers = target.get(locale) or {}
+            tier_1 = tiers.get("tier_1", [])
+            if not tier_1:
+                continue
+            locale_ranks = store_ranks.get(locale) or {}
+            ranked = [kw for kw in tier_1 if (locale_ranks.get(kw) or {}).get("current_rank") is not None]
+            if len(ranked) == 0:
+                out.append(make_opp(
+                    f"opp-{TODAY}-no-visibility-{store}-{locale}",
+                    "market_no_visibility", store, locale,
+                    evidence={
+                        "tier_1_keywords": len(tier_1),
+                        "tier_1_ranked": 0,
+                        "tier_1_terms": tier_1,
+                    },
+                    proposed_action=f"{store.upper()} listing in {locale} ranks for ZERO Tier 1 keywords. Review keyword strategy: title + subtitle (iOS) / title + summary + description (Android) should contain at least the top 3 Tier 1 terms in natural form.",
+                    confidence=1.0,
+                    impact=5,
+                ))
+    return out
+
+
+def detect_rank_changes(ranks):
+    """Diffs across runs: drops ≥5 positions (or out of top 50) + climbs ≥5 (or new entries)."""
+    out = []
+    if not ranks:
+        return out
+    changes = ranks.get("rank_changes") or []
+    # Only consider changes from the last 7 days
+    cutoff = (datetime.utcnow() - timedelta(days=7)).strftime("%Y-%m-%d")
+    recent = [c for c in changes if c.get("date", "") >= cutoff]
+    for c in recent:
+        old, new = c.get("old"), c.get("new")
+        keyword = c.get("keyword")
+        store = c.get("store")
+        locale = c.get("locale")
+        # Drop: was in top 50, now not OR dropped ≥5 positions
+        if old is not None and (new is None or (new - old) >= 5):
+            severity = "off_top_50" if new is None else f"dropped_{new - old}"
+            impact = 4 if new is None else min(4, max(2, (new - old) // 5))
+            out.append(make_opp(
+                f"opp-{TODAY}-drop-{store}-{locale}-{keyword[:30].replace(' ','_')}",
+                "rank_drop", store, locale,
+                keyword=keyword,
+                evidence={"old_rank": old, "new_rank": new, "delta": (new - old) if new is not None else None, "severity": severity, "change_date": c.get("date")},
+                proposed_action=f"{store.upper()} rank for '{keyword}' in {locale} dropped from #{old} to {'off-list' if new is None else '#' + str(new)}. Check recent listing edits or competitor metadata changes around {c.get('date')}.",
+                confidence=1.0,
+                impact=impact,
+            ))
+        # Climb: was off-list, now in top 50 OR climbed ≥5 positions OR entered top 10
+        if (old is None and new is not None) or (old is not None and new is not None and (old - new) >= 5) or (old is not None and new is not None and old > 10 and new <= 10):
+            if old is None:
+                desc = f"new entry at #{new}"
+            elif new <= 10 and old > 10:
+                desc = f"entered top 10 (was #{old}, now #{new})"
+            else:
+                desc = f"climbed from #{old} to #{new}"
+            out.append(make_opp(
+                f"opp-{TODAY}-climb-{store}-{locale}-{keyword[:30].replace(' ','_')}",
+                "rank_climb", store, locale,
+                keyword=keyword,
+                evidence={"old_rank": old, "new_rank": new, "change_date": c.get("date"), "summary": desc},
+                proposed_action=f"{store.upper()} rank for '{keyword}' in {locale} {desc}. Investigate what changed in listing or market around {c.get('date')} — may be a pattern worth replicating.",
+                confidence=1.0,
+                impact=2,
+            ))
+    return out
+
+
+def detect_dominance_wins(ranks):
+    """Keywords where the app ranks 1-3 → expansion opportunity (target similar terms)."""
+    out = []
+    if not ranks:
+        return out
+    snap_ranks = ranks.get("ranks") or {}
+    for store in ("ios", "android"):
+        store_ranks = snap_ranks.get(store) or {}
+        for locale, kws in store_ranks.items():
+            top_3 = [(k, v["current_rank"]) for k, v in kws.items() if v.get("current_rank") and v["current_rank"] <= 3]
+            if len(top_3) >= 2:
+                out.append(make_opp(
+                    f"opp-{TODAY}-dominance-{store}-{locale}",
+                    "rank_dominance", store, locale,
+                    evidence={"top_3_count": len(top_3), "examples": [{"keyword": k, "rank": r} for k, r in top_3[:5]]},
+                    proposed_action=f"{store.upper()} {locale} has {len(top_3)} keywords in top 3. Expand the keyword universe in this locale — variations and adjacencies of the winning terms are likely also achievable.",
+                    confidence=0.7,
+                    impact=3,
+                ))
+    return out
+
+
+def detect_competitor_metadata_changes(baseline):
+    """Diffs in competitor listings between snapshots."""
+    out = []
+    diffs = ((baseline or {}).get("weekly_diffs") or [])
+    # Use last diff entry
+    if not diffs:
+        return out
+    last = diffs[-1]
+    cutoff = (datetime.utcnow() - timedelta(days=7)).strftime("%Y-%m-%d")
+    if last.get("date", "") < cutoff:
+        return out
+    for change in last.get("changes", []):
+        owner = change.get("owner", "")
+        if owner and owner != SELF_OWNER:
+            out.append(make_opp(
+                f"opp-{TODAY}-competitor-{owner}-{change.get('store')}-{change.get('locale')}-{change.get('field')}",
+                "competitor_change", change.get("store"), change.get("locale"),
+                evidence={"competitor": owner, "field": change.get("field"), "old": change.get("old"), "new": change.get("new")},
+                proposed_action=f"Competitor {owner} changed {change.get('field')} in {change.get('store')}/{change.get('locale')}. Inspect: is this a keyword we're not targeting, a positioning shift, or a response to something we did?",
+                confidence=1.0,
+                impact=3,
+            ))
+    return out
+
+
+# ===== Main =====
+
+def main():
+    if not mkt_local.configured(CFG):
+        print(json.dumps({"ok": True, "skipped": "not configured (agent/local/config/marketing.json)"}))
+        return 0
+    baseline = load(BASELINE)
+    ranks = load(RANKS)
+    target_kw = load(TARGET_KW)
+    if not (baseline or ranks):
+        print(json.dumps({"ok": False, "error": "no state files (baseline + ranks) — nothing to scan"}))
+        return 1
+
+    opportunities = []
+    opportunities += detect_empty_listing_fields(baseline)
+    opportunities += detect_market_no_visibility(ranks, target_kw)
+    opportunities += detect_rank_changes(ranks)
+    opportunities += detect_dominance_wins(ranks)
+    opportunities += detect_competitor_metadata_changes(baseline)
+
+    # Score = confidence × impact
+    for opp in opportunities:
+        opp["score"] = round(opp.get("confidence", 0.5) * opp.get("impact", 3), 2)
+
+    # Merge with existing opportunities file: preserve `status` on already-known ids.
+    existing = load(OPP_PATH, default={"version": 1, "opportunities": [], "runs": []})
+    by_id = {o["id"]: o for o in existing.get("opportunities", [])}
+    for opp in opportunities:
+        prior = by_id.get(opp["id"])
+        if prior:
+            # Preserve user-set status (won/lost/ignored/in_test) but update evidence
+            if prior.get("status") in ("won", "lost", "ignored", "in_test"):
+                opp["status"] = prior["status"]
+            opp["first_seen"] = prior.get("first_seen", opp["first_seen"])
+        by_id[opp["id"]] = opp
+
+    # Auto-resolve: opportunities not regenerated this run that were `open` → mark `stale`
+    seen_ids = {opp["id"] for opp in opportunities}
+    for opp_id, opp in by_id.items():
+        if opp.get("status") == "open" and opp_id not in seen_ids:
+            # Don't touch ids from older runs; only those from this run window.
+            # For now, leave them — orchestrator might want a config knob later.
+            pass
+
+    out = {
+        "version": 1,
+        "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "opportunities": sorted(by_id.values(), key=lambda o: o.get("score", 0), reverse=True),
+        "runs": (existing.get("runs") or [])[-49:] + [{
+            "date": TODAY,
+            "new_count": len(opportunities),
+            "by_type": {t: sum(1 for o in opportunities if o["type"] == t) for t in {o["type"] for o in opportunities}},
+        }],
+    }
+    save_json(OPP_PATH, out)
+
+    summary = {
+        "ok": True,
+        "new_this_run": len(opportunities),
+        "total_open": sum(1 for o in out["opportunities"] if o.get("status") == "open"),
+        "top_5": [
+            {"id": o["id"], "type": o["type"], "score": o["score"], "summary": o.get("proposed_action", "")[:150]}
+            for o in out["opportunities"][:5] if o.get("status") == "open"
+        ],
+    }
+    print(json.dumps(summary, indent=2))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

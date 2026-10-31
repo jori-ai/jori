@@ -1,0 +1,258 @@
+#!/usr/bin/env node
+// apple-weather — fetch current + daily forecast from Apple WeatherKit REST.
+//
+// Usage:
+//   apple-weather <lat> <lon>                  # human-readable summary
+//   apple-weather <lat> <lon> --json           # raw WeatherKit JSON
+//   apple-weather --findme                     # the user's own phone (findme locate me) for coords
+//
+// Config: env, else agent/local/config/apple-weather.json, else the default:
+//   WEATHERKIT_TEAM_ID       team_id     (Apple developer team id; none: no token can be minted)
+//   WEATHERKIT_KEY_ID        key_id      (the WeatherKit key id)
+//   WEATHERKIT_SERVICE_ID    service_id  (the WeatherKit service id)
+//   WEATHERKIT_KEY_PATH      key_path    (default: ~/.config/jori/weatherkit.p8)
+// No team/key/service id: the tool says WeatherKit is not configured and exits 1.
+
+const crypto = require('crypto');
+const fs = require('fs');
+const path = require('path');
+const os = require('os');
+const { execFileSync } = require('child_process');
+const { installTools } = require('../lib/root.cjs');
+const { localConfig } = require('../lib/instance.cjs');
+
+const CFG = localConfig('apple-weather', { team_id: '', key_id: '', service_id: '', key_path: '' });
+const TEAM_ID = process.env.WEATHERKIT_TEAM_ID || CFG.team_id;
+const KEY_ID = process.env.WEATHERKIT_KEY_ID || CFG.key_id;
+const SERVICE_ID = process.env.WEATHERKIT_SERVICE_ID || CFG.service_id;
+const KEY_PATH = process.env.WEATHERKIT_KEY_PATH || CFG.key_path || path.join(os.homedir(), '.config/jori/weatherkit.p8');
+const USER_TZ_FILE = installTools('data/user-timezone.json');
+
+// Country name (as findme's reverse geocode spells it) -> primary IANA zone,
+// for the fallback below. Public geography; unmatched countries fall through.
+const COUNTRY_TZ = {
+  france: 'Europe/Paris', spain: 'Europe/Madrid', italy: 'Europe/Rome', portugal: 'Europe/Lisbon',
+  greece: 'Europe/Athens', turkey: 'Europe/Istanbul', israel: 'Asia/Jerusalem',
+  'united kingdom': 'Europe/London', uk: 'Europe/London', ireland: 'Europe/Dublin', germany: 'Europe/Berlin',
+  netherlands: 'Europe/Amsterdam', belgium: 'Europe/Brussels', switzerland: 'Europe/Zurich', austria: 'Europe/Vienna',
+  croatia: 'Europe/Zagreb', 'dominican republic': 'America/Santo_Domingo', 'turks and caicos': 'America/Grand_Turk',
+  curacao: 'America/Curacao', 'st. lucia': 'America/St_Lucia', 'st lucia': 'America/St_Lucia', mexico: 'America/Mexico_City',
+  peru: 'America/Lima', brazil: 'America/Sao_Paulo', india: 'Asia/Kolkata', nepal: 'Asia/Kathmandu', japan: 'Asia/Tokyo',
+};
+
+function b64url(buf) {
+  return Buffer.from(buf).toString('base64').replace(/=+$/, '').replace(/\+/g, '-').replace(/\//g, '_');
+}
+
+// ES256 JWT signing via native crypto. Apple returns DER-encoded signatures from
+// crypto.sign; JWT needs raw 64-byte (r||s) concatenation, so we convert.
+function derToJose(der) {
+  // DER: 0x30 len 0x02 rLen r 0x02 sLen s
+  let offset = 2;
+  if (der[1] & 0x80) offset += der[1] & 0x7f;
+  const rLen = der[offset + 1];
+  const rStart = offset + 2;
+  const r = der.slice(rStart, rStart + rLen);
+  const sOffset = rStart + rLen;
+  const sLen = der[sOffset + 1];
+  const sStart = sOffset + 2;
+  const s = der.slice(sStart, sStart + sLen);
+  const pad = (buf) => {
+    if (buf.length === 32) return buf;
+    if (buf.length < 32) return Buffer.concat([Buffer.alloc(32 - buf.length, 0), buf]);
+    return buf.slice(buf.length - 32);
+  };
+  return Buffer.concat([pad(r), pad(s)]);
+}
+
+function mintToken() {
+  if (!TEAM_ID || !KEY_ID || !SERVICE_ID) throw new Error('WeatherKit is not configured (agent/local/config/apple-weather.json team_id / key_id / service_id)');
+  const privateKey = fs.readFileSync(KEY_PATH, 'utf8');
+  const header = {
+    alg: 'ES256',
+    kid: KEY_ID,
+    id: `${TEAM_ID}.${SERVICE_ID}`,
+    typ: 'JWT',
+  };
+  const now = Math.floor(Date.now() / 1000);
+  const payload = {
+    iss: TEAM_ID,
+    iat: now,
+    exp: now + 3600,
+    sub: SERVICE_ID,
+  };
+  const signingInput = `${b64url(JSON.stringify(header))}.${b64url(JSON.stringify(payload))}`;
+  const signer = crypto.createSign('SHA256');
+  signer.update(signingInput);
+  const derSig = signer.sign(privateKey);
+  const joseSig = derToJose(derSig);
+  return `${signingInput}.${b64url(joseSig)}`;
+}
+
+// The phone's own self-reported IANA timezone, refreshed on every inbound
+// Jori message (same file cron-tz-sync trusts as its "confirmed location"
+// signal). Fresh ≤36h, else null. For `--findme` the weather location IS the
+// phone, so this is the location's timezone.
+function confirmedPhoneTz() {
+  try {
+    const raw = JSON.parse(fs.readFileSync(USER_TZ_FILE, 'utf8'));
+    if (!raw || !raw.timezone) return null;
+    const ageMs = Date.now() - new Date(raw.updated_at).getTime();
+    if (ageMs > 36 * 3600 * 1000) return null;
+    return raw.timezone;
+  } catch {
+    return null;
+  }
+}
+
+// WeatherKit's REST response never includes a timezone in its metadata (keys:
+// attributionURL, expireTime, latitude, longitude, readTime, reportedTime,
+// units, version, sourceType). Downstream consumers that read
+// `metadata.timezone` (rain-walk-check, the hum weather lane, formatSummary
+// below) would otherwise silently fall back to the home zone — correct at
+// home, but wrong everywhere the user travels: the location DATA is right (the
+// lat/lon we fetched) while the local-hour WINDOWS get read in the home zone.
+// Resolve a real IANA timezone here and stamp it in, so every consumer gets it for free.
+//   1. --findme means "the user's phone" -> trust the phone's confirmed tz.
+//   2. else, best-effort from the reverse-geocoded country (findme --json).
+//   3. null -> caller keeps its own home-zone default (no home regression).
+function resolveLocationTz(useFindme, findmeLoc) {
+  if (useFindme) {
+    const tz = confirmedPhoneTz();
+    if (tz) return tz;
+  }
+  // findme --json only carries `country` for non-US locations (US is omitted),
+  // which is exactly the case where the home-zone default is wrong. Map it directly.
+  if (findmeLoc && findmeLoc.country) {
+    const tz = COUNTRY_TZ[String(findmeLoc.country).trim().toLowerCase()];
+    if (tz) return tz;
+  }
+  return null;
+}
+
+function stampTimezone(data, tz) {
+  if (!tz || !data) return;
+  for (const ds of ['currentWeather', 'forecastHourly', 'forecastDaily']) {
+    if (data[ds] && data[ds].metadata && !data[ds].metadata.timezone) {
+      data[ds].metadata.timezone = tz;
+    }
+  }
+}
+
+async function fetchWeather(lat, lon) {
+  const token = mintToken();
+  const url = `https://weatherkit.apple.com/api/v1/weather/en_US/${lat}/${lon}?dataSets=currentWeather,forecastDaily,forecastHourly&timezone=auto`;
+  const resp = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
+  if (!resp.ok) {
+    const body = await resp.text();
+    throw new Error(`WeatherKit ${resp.status}: ${body.slice(0, 500)}`);
+  }
+  return resp.json();
+}
+
+function cToF(c) { return (c * 9) / 5 + 32; }
+
+function formatHourLocal(iso, tz) {
+  // Format ISO timestamp as "3pm" in the given timezone.
+  const d = new Date(iso);
+  const parts = new Intl.DateTimeFormat('en-US', { hour: 'numeric', timeZone: tz }).format(d);
+  return parts.toLowerCase().replace(/\s/g, '');
+}
+
+function rainWindows(hours, tz, todayStr) {
+  // Find contiguous hours today where precipitationChance >= 0.3.
+  // Returns array of {start, end, peak} strings like "3pm-5pm (peak 70%)".
+  const todayHours = hours.filter(h => {
+    const localDate = new Intl.DateTimeFormat('en-CA', { timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date(h.forecastStart));
+    return localDate === todayStr;
+  });
+  const windows = [];
+  let cur = null;
+  for (const h of todayHours) {
+    const wet = (h.precipitationChance || 0) >= 0.3;
+    if (wet) {
+      if (!cur) cur = { startISO: h.forecastStart, endISO: h.forecastStart, peak: h.precipitationChance, type: h.precipitationType };
+      else {
+        cur.endISO = h.forecastStart;
+        if (h.precipitationChance > cur.peak) cur.peak = h.precipitationChance;
+      }
+    } else if (cur) {
+      windows.push(cur);
+      cur = null;
+    }
+  }
+  if (cur) windows.push(cur);
+  return windows.map(w => {
+    const start = formatHourLocal(w.startISO, tz);
+    // end is the START of the last wet hour; show +1h as window close
+    const endDate = new Date(w.endISO);
+    endDate.setHours(endDate.getHours() + 1);
+    const end = formatHourLocal(endDate.toISOString(), tz);
+    const type = w.type && w.type !== 'clear' ? w.type.toLowerCase() : 'rain';
+    return `${start}–${end} (${type}, peak ${Math.round(w.peak * 100)}%)`;
+  });
+}
+
+function formatSummary(data) {
+  const cur = data.currentWeather || {};
+  const daily = (data.forecastDaily && data.forecastDaily.days) || [];
+  const hourly = (data.forecastHourly && data.forecastHourly.hours) || [];
+  const tz = (data.currentWeather && data.currentWeather.metadata && data.currentWeather.metadata.timezone)
+    || (data.forecastDaily && data.forecastDaily.metadata && data.forecastDaily.metadata.timezone)
+    || require('../lib/instance.cjs').instance().tz || 'UTC';
+  const today = daily[0] || {};
+  const todayStr = new Intl.DateTimeFormat('en-CA', { timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date());
+  const lines = [];
+  if (cur.temperature != null) {
+    lines.push(`Now: ${Math.round(cToF(cur.temperature))}°F, ${cur.conditionCode || 'n/a'}`);
+  }
+  if (today.temperatureMax != null && today.temperatureMin != null) {
+    lines.push(`Today: ${Math.round(cToF(today.temperatureMax))}°F high / ${Math.round(cToF(today.temperatureMin))}°F low, ${today.conditionCode || ''}`.trim());
+  }
+
+  const windows = rainWindows(hourly, tz, todayStr);
+  const dailyPop = today.precipitationChance != null ? Math.round(today.precipitationChance * 100) : null;
+  if (windows.length > 0) {
+    lines.push(`Rain today: ${windows.join(', ')}`);
+  } else if (dailyPop != null && dailyPop >= 30) {
+    lines.push(`Rain possible today (${dailyPop}% chance, no clear window)`);
+  } else {
+    lines.push(`No rain expected today${dailyPop != null ? ` (${dailyPop}% chance)` : ''}`);
+  }
+  return lines.join('\n');
+}
+
+async function main() {
+  const args = process.argv.slice(2);
+  const jsonOut = args.includes('--json');
+  const useFindme = args.includes('--findme');
+  let lat, lon, findmeLoc = null;
+  if (useFindme) {
+    const findmeBin = installTools('bin/findme');
+    if (!fs.existsSync(findmeBin)) throw new Error('--findme needs bin/findme (the phone locator), which this installation does not have');
+    // `locate me` = the owner's own phone.
+    const out = execFileSync(findmeBin, ['locate', 'me', '--json'], { encoding: 'utf8' });
+    const parsed = JSON.parse(out);
+    const loc = Array.isArray(parsed) ? parsed[0] : parsed;
+    findmeLoc = loc;
+    lat = loc.latitude ?? loc.lat;
+    lon = loc.longitude ?? loc.lon ?? loc.lng;
+    if (lat == null || lon == null) throw new Error(`findme returned no coords: ${out}`);
+  } else {
+    const positional = args.filter(a => !a.startsWith('--'));
+    if (positional.length < 2) {
+      console.error('Usage: apple-weather <lat> <lon> [--json]  OR  apple-weather --findme [--json]');
+      process.exit(1);
+    }
+    [lat, lon] = positional.map(Number);
+  }
+  const data = await fetchWeather(lat, lon);
+  stampTimezone(data, resolveLocationTz(useFindme, findmeLoc));
+  if (jsonOut) {
+    process.stdout.write(JSON.stringify(data));
+  } else {
+    console.log(formatSummary(data));
+  }
+}
+
+main().catch(err => { console.error(err.message || err); process.exit(1); });

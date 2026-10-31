@@ -1,0 +1,73 @@
+#!/bin/bash
+# chrome-close-tabs — close http(s) page tabs in the LaunchAgent-managed
+# automation Chrome at localhost:9222. Leaves a single about:blank tab so the
+# browser keeps a window open (which keeps the CDP debug port responsive — the
+# LaunchAgent respawns Chrome if it exits, but the brief gap is still observable
+# by anything probing right after).
+#
+# Usage:
+#   chrome-close-tabs                # close all http(s) page tabs
+#   chrome-close-tabs <substring>    # close only tabs whose URL contains substring
+#                                    # (repeat to OR multiple substrings)
+#
+# Safe to call from any playbook's cleanup step. The automation Chrome profile
+# (~/.cache/chrome-devtools-mcp/chrome-profile) is separate from any interactive
+# user profile, so closing all http(s) tabs there cannot affect anyone's
+# personal browsing.
+
+set -u
+
+CDP_BASE="${CDP_BASE:-http://localhost:9222}"
+MAX_PASSES=3
+
+if ! curl -sf --max-time 5 "${CDP_BASE}/json/version" > /dev/null 2>&1; then
+  echo "chrome-close-tabs: CDP not reachable at ${CDP_BASE}, skipping" >&2
+  exit 0
+fi
+
+# Ensure at least one about:blank tab exists so closing the last http tab does
+# not collapse the window (and momentarily take the CDP port down with it).
+HAS_BLANK=$(curl -s --max-time 5 "${CDP_BASE}/json/list" | python3 -c "
+import json, sys
+tabs = json.load(sys.stdin)
+print('1' if any(t.get('type')=='page' and t.get('url')=='about:blank' for t in tabs) else '0')
+" 2>/dev/null || echo "0")
+
+if [ "$HAS_BLANK" != "1" ]; then
+  curl -sf --max-time 5 -X PUT "${CDP_BASE}/json/new?about:blank" > /dev/null 2>&1 || true
+fi
+
+PATTERNS_JSON=$(python3 -c "import json,sys; print(json.dumps(sys.argv[1:]))" "$@")
+
+CLOSED_TOTAL=0
+for pass in $(seq 1 $MAX_PASSES); do
+  IDS=$(curl -s --max-time 5 "${CDP_BASE}/json/list" | PATTERNS="$PATTERNS_JSON" python3 -c "
+import json, os, sys
+patterns = json.loads(os.environ.get('PATTERNS','[]'))
+tabs = json.load(sys.stdin)
+for t in tabs:
+    if t.get('type') != 'page':
+        continue
+    url = t.get('url','')
+    if not url.startswith('http'):
+        continue
+    if patterns and not any(p in url for p in patterns):
+        continue
+    print(t['id'])
+" 2>/dev/null)
+
+  if [ -z "$IDS" ]; then
+    break
+  fi
+
+  N=0
+  while IFS= read -r id; do
+    [ -z "$id" ] && continue
+    if curl -sf --max-time 5 "${CDP_BASE}/json/close/$id" > /dev/null 2>&1; then
+      N=$((N+1))
+    fi
+  done <<< "$IDS"
+  CLOSED_TOTAL=$((CLOSED_TOTAL+N))
+done
+
+echo "chrome-close-tabs: closed ${CLOSED_TOTAL} tab(s)"

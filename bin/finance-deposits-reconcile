@@ -1,0 +1,142 @@
+#!/usr/bin/env node
+"use strict";
+// finance-deposits-reconcile — read where every tenant security deposit is,
+// from the hub's own record, and persist it for the reviews.
+//
+//   finance-deposits-reconcile            read, write tables, print the report
+//   finance-deposits-reconcile --json     print the full result as JSON
+//   finance-deposits-reconcile --dry-run  read and print, write nothing
+//
+// Reads (the rental hub's Firestore, lib/rental-ledger.js): billing-deposits
+// (each with `whereabouts`, `outsideAllowed`), leases, billing-payouts +
+// billing-invoices (deposit transfers still in flight),
+// billing-deposit-reports/latest, the account registry. Nothing is worked out
+// here from bank rows any more: which tenant a transfer was is answered in the
+// hub, and this only reports it. Also reads data/finance-deposit-answers.jsonl:
+// the user's answers where the hub's link is wrong or a transfer fits two sets
+// of tenants (the `deposit_answer_command`; the latest line per bank row
+// wins). Writes: fin_deposits (one row per tenant deposit, rewritten each run)
+// and fin_deposit_reconciliations (one row per run). Rules:
+// lib/finance-deposit-reconcile.js. Runs nightly (the finance-model tick's
+// after-hook) and before the weekly review.
+//
+// Config: agent/local/config/rental-finance.json — `deposit_account_mask` (the
+// deposit account's last four, used when the hub's report does not name it)
+// and `deposit_payout_slug` (the hub's slug for deposit payouts). With no
+// rental hub configured (lib/rental-ledger.js) this is off: it says so and
+// exits 0.
+
+const { loadEnv } = require("../lib/load-env.js");
+const { request } = require("../lib/supabase-rest.js");
+const ledger = require("../lib/rental-ledger.js");
+const { depositsFromHub } = require("../lib/finance-deposit-reconcile.js");
+const { localConfig } = require("../lib/instance.cjs");
+const { installTools } = require("../lib/root.cjs");
+loadEnv();
+const CFG = localConfig("rental-finance", { deposit_account_mask: "", deposit_payout_slug: "security-deposits" });
+const ANSWERS = installTools("data", "finance-deposit-answers.jsonl");
+function readAnswers() {
+  let lines;
+  try { lines = require("node:fs").readFileSync(ANSWERS, "utf8").split("\n"); }
+  catch (e) { if (e.code === "ENOENT") return []; throw e; }
+  const byRow = new Map();
+  lines.forEach((l, i) => {
+    if (!l.trim()) return;
+    try { const a = JSON.parse(l); byRow.set(a.row_id, a); }
+    catch (e) { console.error(`finance-deposits-reconcile: ${ANSWERS} line ${i + 1} is not JSON, skipped (${e.message})`); }
+  });
+  return [...byRow.values()];
+}
+
+const JSON_OUT = process.argv.includes("--json");
+const DRY = process.argv.includes("--dry-run");
+const tsIso = (v) => (v && (v._seconds ?? v.seconds) ? new Date((v._seconds ?? v.seconds) * 1000).toISOString() : typeof v === "string" ? v : v instanceof Date ? v.toISOString() : null);
+const stateOf = (a) => (String(a || "").match(/,\s*([A-Z]{2})\s*\d{5}/) || [])[1] || null;
+const usd = (n) => `${n < 0 ? "−" : ""}$${Math.abs(Number(n)).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+
+async function main() {
+  if (!ledger.config().firebase_project) {
+    console.log("finance-deposits-reconcile: no rental hub is configured (agent/local/config/rentals.json) — nothing to reconcile.");
+    return;
+  }
+  const db = ledger.firestore();
+  const [reg, hubDeposits, leases, hubPayouts, hubInvoices, report] = await Promise.all([
+    ledger.registry(), db.list("billing-deposits"), db.list("leases"), db.list("billing-payouts"), db.list("billing-invoices"),
+    db.get("billing-deposit-reports", "latest").catch(() => null),
+  ]);
+  if (!report) console.error("finance-deposits-reconcile: the hub has not written billing-deposit-reports/latest yet; reporting per-tenant records only.");
+  const depositMask = String(report?.account?.mask || CFG.deposit_account_mask || "");
+  if (!depositMask) throw new Error("the deposit account is unknown: the hub's report names none and rental-finance.json has no deposit_account_mask");
+
+  // Deposit transfers the hub has sent and the bank has not shown yet.
+  const invById = new Map(hubInvoices.map((i) => [i.id, i]));
+  const hubTransfers = hubPayouts.filter((p) => p.kind === "deposit" || p.propertySlug === CFG.deposit_payout_slug).map((p) => ({
+    id: p.id, status: p.status,
+    arrival: tsIso(p.arrivalDate)?.slice(0, 10) || tsIso(p.createdAt)?.slice(0, 10),
+    shares: (p.invoiceIds || []).map((iid) => invById.get(iid)).filter(Boolean).map((inv) => ({ deposit_id: inv.accountId })),
+  }));
+
+  const leaseById = new Map(leases.map((l) => [l.id, l]));
+  const propBySlug = new Map(reg.properties.filter((p) => p.publicSlug).map((p) => [String(p.publicSlug).toLowerCase(), p]));
+  const deposits = hubDeposits.map((d) => {
+    const t = leaseById.get(d.leaseId)?.terms || {};
+    const p = propBySlug.get(String(t.propertySlug || "").toLowerCase()) || null;
+    return {
+      id: d.id, lease_number: t.leaseNumber || d.leaseId, property_id: p ? p.id : t.propertySlug || null,
+      property_name: p ? p.name : t.propertySlug || null, state: stateOf(p?.address || t.unitAddress),
+      tenant: String(d.tenantName || "").trim(), amount: Number(d.amount) || 0, hub_status: d.status,
+      paid_via: d.paidVia || null, stripe_payment_intent: d.stripePaymentIntentId || null, hub_paid_at: tsIso(d.createdAt),
+      lease_start: tsIso(t.startDate)?.slice(0, 10) || null, lease_end: tsIso(t.endDate)?.slice(0, 10) || null,
+      whereabouts: d.whereabouts || null, outside_allowed: d.outsideAllowed || null,
+    };
+  });
+
+  const r = depositsFromHub({ deposits, report, depositMask, hubTransfers, answers: readAnswers() });
+  const dep = { name: report?.account?.name || "Security Deposits", mask: depositMask };
+
+  if (!DRY) {
+    const byId = new Map(deposits.map((d) => [d.id, d]));
+    const rows = r.rows.map((x) => {
+      const d = byId.get(x.id);
+      return {
+        id: x.id, lease_number: x.lease_number, property_id: x.property_id, property_name: x.property_name, state: x.state,
+        tenant: x.tenant, amount: x.amount, hub_status: x.hub_status, paid_via: x.paid_via,
+        stripe_payment_intent: d.stripe_payment_intent, hub_paid_at: d.hub_paid_at, lease_start: d.lease_start, lease_end: d.lease_end,
+        expected_location: x.expected_location, exception_reason: x.exception_reason,
+        location: x.location, location_account_mask: x.location_account_mask, location_basis: x.location_basis,
+        amount_in_deposit_account: x.amount_in_deposit_account, candidates: x.candidates, updated_at: new Date().toISOString(),
+      };
+    });
+    await request("/rest/v1/fin_deposits?id=neq.__none__", { method: "DELETE", prefer: "return=minimal" });
+    if (rows.length) await request("/rest/v1/fin_deposits", { method: "POST", body: rows, prefer: "return=minimal" });
+    // Movements live on the hub's bank rows now (depositLink); the old
+    // rule-derived rows here would only disagree with them.
+    await request("/rest/v1/fin_deposit_movements?recorded=eq.false", { method: "DELETE", prefer: "return=minimal" });
+    await request("/rest/v1/fin_deposit_reconciliations", { method: "POST", prefer: "return=minimal", body: [{
+      account_balance: r.proof.deposit_account_balance, located_total: r.proof.located_total,
+      unattributed_total: r.proof.unattributed_total, difference: r.proof.difference, ok: r.proof.ok,
+      report: { deposit_account: `${dep.name} ••${dep.mask}`, proof: r.proof, missing: r.missing, in_transit: r.in_transit, fee_shortfall_total: r.fee_shortfall_total, ambiguities: r.ambiguities, liability: r.liability, rows: r.rows },
+    }] });
+  }
+
+  if (JSON_OUT) return console.log(JSON.stringify(r, null, 2));
+  const p = r.proof;
+  console.log(`Deposit account ${dep.name} ••${dep.mask}: ${usd(p.deposit_account_balance)}  (hub record of ${r.report_at || "never"})`);
+  console.log(`  tenants' deposits ${usd(p.located_total)} + rows that are no tenant's, unanswered, or from before the bank history ${usd(p.unattributed_total)}`);
+  console.log(`\nDeposits owed back (hub held, after recorded corrections): ${usd(r.liability)}`);
+  for (const x of r.rows.filter((x) => !["closed"].includes(x.location)).sort((a, b) => `${a.property_name}${a.lease_number}`.localeCompare(`${b.property_name}${b.lease_number}`))) {
+    console.log(`  ${(x.property_name || "?").padEnd(15)} ${x.lease_number.padEnd(13)} ${x.tenant.padEnd(22)} ${usd(x.amount).padStart(10)}  ${x.location}${x.location_account_mask ? ` ••${x.location_account_mask}` : ""}${x.expected_location === "exception" ? "  (exception)" : ""}  [${x.location_basis}]`);
+  }
+  if (r.in_transit.length) { console.log(`\nIN TRANSIT to the deposit account:`); for (const x of r.in_transit) console.log(`  ${x.property_name} ${x.lease_number} ${x.tenant} ${usd(x.amount)} — expected ${x.expected_arrival}`); }
+  if (r.fee_absorbed_total) console.log(`\nAccepted Stripe fees (≤ $2.50 per deposit, our share): ${usd(r.fee_absorbed_total)}`);
+  if (r.fee_shortfall_total) console.log(`Short BEYOND the accepted fee: ${usd(r.fee_shortfall_total)} (${r.rows.filter((x) => x.fee_shortfall).map((x) => `${x.tenant} ${usd(x.fee_shortfall)}`).join(", ")})`);
+  const held = r.rows.filter((x) => ["unconfirmed", "ambiguous"].includes(x.location));
+  if (held.length) { console.log(`\nNOT CALLED MISSING, NOT LOCATED (the user's answer, or a transfer in question):`); for (const x of held) console.log(`  ${x.property_name} ${x.lease_number} ${x.tenant} ${usd(x.amount)} — ${x.location}: ${x.location_basis}`); }
+  console.log(`\nMISSING from the deposit account (${r.missing.length}):`);
+  for (const x of r.missing) console.log(`  ${x.property_name} ${x.lease_number} ${x.tenant} ${usd(x.amount)} — ${x.location}${x.location_account_mask ? ` ••${x.location_account_mask}` : ""}`);
+  const inHub = r.ambiguities.filter((a) => a.kind !== "transfer-fits-two"), fits = r.ambiguities.filter((a) => a.kind === "transfer-fits-two");
+  if (inHub.length) { console.log("\nNOT ATTRIBUTED TO A TENANT YET (answer in the hub):"); for (const a of inHub) console.log(`  ${a.text}`); }
+  if (fits.length) { console.log("\nONE TRANSFER, TWO READINGS (ask the user; record the answer with the deposit-answer command):"); for (const a of fits) console.log(`  ${a.question}\n    ${a.answer_with}`); }
+}
+
+main().catch((e) => { console.error(`finance-deposits-reconcile error: ${e.stack || e.message}`); process.exit(1); });

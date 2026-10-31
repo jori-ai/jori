@@ -38,6 +38,10 @@ CLOUDFLARED_RESTART_COOLDOWN="$HOME/Dev/jori/data/.cloudflared-restart-cooldown"
 # daily-summary block) because § Max auth outage also needs it: it re-arms the
 # heal when an auth outage ends.
 DS_HEAL_MARKER="$HOME/Dev/jori/data/.daily-summary-heal-cooldown"
+# Touched by the daily-summary block on every tick that sees the ops dispatcher
+# held for the Claude usage limit; its age holds that block's page through the
+# hold and the queue drain after it (see "Usage-limit hold deferral" there).
+DS_USAGE_HOLD_MARKER="${DS_HEAL_MARKER%/*}/.daily-summary-usage-hold-seen"   # beside DS_HEAL_MARKER
 CLOUDFLARED_LABEL="com.cloudflare.cloudflared"
 # The tunnel's public host: JORI_PUSH_HOST, else gmail-push.<instance domain>.
 # Empty (no domain configured) → the tunnel check is skipped.
@@ -262,6 +266,9 @@ incident_clear() {
         # it crossed, never "auto-healed".
         disk-low)        how="free space on the data volume is back above the $(_disk_gib_threshold "$WATCHDOG_DISK_WARN_GIB" 25) GiB warning line" ;;
         disk-critical)   how="free space on the data volume is back above the $(_disk_gib_threshold "$WATCHDOG_DISK_CRIT_GIB" 10) GiB critical line" ;;
+        # stale-code-watch flags only what it cannot fix itself (see "Stale code,
+        # the rest"), so report the flag gone, never "auto-healed".
+        stale-code-flag) how="stale-code-watch no longer flags any daemon or uncommitted code file (this check sees the flag gone, not what cleared it)" ;;
       esac
       notify "✅ Recovered: $(_incident_label "$key") is back to normal — $how, stable for 3 checks."
     elif [ -f "$INCIDENT_DIR/${key}.alerted" ]; then
@@ -2299,6 +2306,25 @@ fi
 # section re-arms the marker once on recovery, so the backfill runs when auth
 # is back. The nightly-review and episode-archive heals below have related
 # shapes but are intentionally out of scope for this fix.
+#
+# Usage-limit hold deferral. While the ops dispatcher holds its queue for a
+# used-up Claude allowance (OPS_HOLD_UNTIL, read from ops /health in the Gmail
+# sweep above; empty when not held or unreachable), the scheduled run and the
+# backfill below are both accepted into the frozen queue, so a "🔴 ... Backfill
+# manually" page would name a remedy that only queues behind the same hold
+# (the supervisor pages the hold itself). So every tick that sees the hold
+# touches DS_USAGE_HOLD_MARKER (whatever the hour), and the page waits until
+# that marker is DS_USAGE_HOLD_GRACE_S old: the hold, then the in-order drain
+# after it. The miss is still recorded (incident, log, ISSUES), and the
+# deferral calls no incident_should_alert (it has side effects).
+# DO NOT drop the dispatch while held: the queued "DAILY SUMMARY <date>" is the
+# only thing that rebuilds that date if the hold crosses midnight (the queued
+# scheduled run builds "yesterday" relative to when it finally runs), and the
+# ops queue survives restarts.
+DS_USAGE_HOLD_GRACE_S=7200
+if [ -n "${OPS_HOLD_UNTIL:-}" ]; then
+  touch "$DS_USAGE_HOLD_MARKER"
+fi
 HOME_HOUR=$(TZ="${JORI_TZ:-UTC}" date +%H); HOME_HOUR=$((10#$HOME_HOUR))
 # tasks registry = kernel system/tasks.json + agent/local/tasks.json (lib/registry.cjs).
 DS_CRON_HOUR=$("$NODE" "$HOME/Dev/jori/lib/registry.cjs" tasks 2>/dev/null \
@@ -2357,7 +2383,15 @@ if [ -n "$SUPABASE_KEY" ] && [ "$DS_LOCAL_HOUR" -ge "$DS_GRACE_HOUR" ]; then
       # missing — avoids paging while a freshly-dispatched backfill is running.
       HEAL_AGE=999999
       [ -f "$DS_HEAL_MARKER" ] && HEAL_AGE=$(( $(date +%s) - $(stat -f%m "$DS_HEAL_MARKER") ))
-      if [ "$HEAL_AGE" -ge 1200 ] && incident_should_alert "daily-summary-missing" 86400 2 86400; then
+      DS_HOLD_AGE=999999
+      [ -f "$DS_USAGE_HOLD_MARKER" ] && DS_HOLD_AGE=$(( $(date +%s) - $(stat -f%m "$DS_USAGE_HOLD_MARKER") ))
+      if [ "$HEAL_AGE" -ge 1200 ] && [ "$DS_HOLD_AGE" -lt "$DS_USAGE_HOLD_GRACE_S" ]; then
+        # Usage-limit hold deferral (see the note above this block): no 🔴.
+        DS_HOLD_WHY="the ops usage-limit hold lifted ${DS_HOLD_AGE}s ago (drain grace ${DS_USAGE_HOLD_GRACE_S}s)"
+        [ -n "${OPS_HOLD_UNTIL:-}" ] && DS_HOLD_WHY="the ops dispatcher is holding for the Claude usage limit until $OPS_HOLD_UNTIL"
+        log_throttled "${DS_HEAL_MARKER%/*}/.daily-summary-usage-hold-log" \
+          "daily-summary page deferred: $DS_HOLD_WHY; the backfill for $DS_TARGET waits in the ops queue"
+      elif [ "$HEAL_AGE" -ge 1200 ] && incident_should_alert "daily-summary-missing" 86400 2 86400; then
         notify "🔴 Daily-summary missing for $DS_TARGET — the ${DS_CRON_HOUR}:xx local-time cron didn't produce a daily_summaries row and a watchdog backfill dispatch didn't recover it. A day of episodic memory is at risk. Backfill manually: dispatch \"DAILY SUMMARY $DS_TARGET\" to the ops webhook, or check the ops supervisor (:9093) health + watchdog.log."
       fi
     fi

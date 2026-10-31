@@ -1,0 +1,201 @@
+#!/usr/bin/env node
+// watch — Jori's standing trigger → action instructions ("watches").
+//
+// A watch = a wiki page (the instruction in the owner's words, linked into memory,
+// with a log of every firing) + a `watch_rules` row in memory-index.db (the
+// compiled form the engine evaluates). Engine: lib/watches.mjs.
+// Design + how to write a spec: system/watch.md.
+//
+// Usage:
+//   watch add --file <spec.json> [--page-body <body.md>] --by <chat|ops|claude-code|...> --request "<the owner's words>"
+//                                                          create/update a watch (+ its wiki page)
+//   watch list [--all] [--json]
+//   watch show <id> [--json]                               rule + every decision/firing
+//   watch pause <id> | resume <id> | retire <id> [--reason "<why>"] [--by <who>]   retire = done for good
+//   watch tick [--dry-run] [--json]                        one engine pass (hum-sense kicks this)
+//   watch emit --type <t> --summary <s> [--key <k>] [--data <json>]   spool an event
+//   watch test <id> --type <t> --summary <s> [--data <json>]          model verdict only, nothing stored
+//   watch trips [--json]                                   travel-timeline trips the anchor rules see
+//   watch confirm <id> <subject_key> | reject <id> <subject_key>      settle a match by hand
+//   watch feedback <id> "<the owner's words>" [--subject <subject_key>]       the user's reaction to a firing
+//   watch miss "<what the owner says was missed>" [--id <watch id>]          a reminder that never came
+//   watch stats [--days 7] [--json] [--no-outcomes]        the scorecard (jobs/watch-review.md)
+
+import fs from "node:fs";
+import { createRequire } from "node:module";
+import * as W from "../lib/watches.mjs";
+
+const require = createRequire(import.meta.url);
+require("../lib/load-env.js").loadEnv();
+
+const argv = process.argv.slice(2);
+const cmd = argv[0];
+const flag = (n) => { const i = argv.indexOf(`--${n}`); return i >= 0 ? (argv[i + 1] ?? true) : null; };
+const has = (n) => argv.includes(`--${n}`);
+const VALUE_FLAGS = new Set(["--file", "--page-body", "--type", "--summary", "--key", "--data", "--by", "--request", "--reason", "--subject", "--id", "--days"]);
+const pos = (i) => argv.filter((a, j) => !a.startsWith("--") && !VALUE_FLAGS.has(argv[j - 1]))[i];
+const die = (m, c = 1) => { process.stderr.write(`watch: ${m}\n`); process.exit(c); };
+const out = (o) => process.stdout.write((typeof o === "string" ? o : JSON.stringify(o, null, 2)) + "\n");
+
+function describe(r) {
+  const tz = W.userTz();
+  let when = "";
+  if (r.trigger_kind === "event") when = `on ${r.listens.join(", ")}`;
+  if (r.trigger_kind === "anchor") when = r.offset_min == null ? "as soon as a matching trip is on the timeline"
+    : `${Math.abs(r.offset_min / 1440)}d ${r.offset_min < 0 ? "before" : "after"} ${r.anchor_field}${r.fire_local_time ? ` at ${r.fire_local_time}` : ""}`;
+  if (r.trigger_kind === "at") when = `at ${W.fmtLocal(Date.parse(r.fire_at), tz)}`;
+  return `${r.id.padEnd(34)} ${r.status.padEnd(8)} ${r.trigger_kind.padEnd(6)} ${when}${r.fire_count ? ` · fired ${r.fire_count}×` : ""}\n    ${r.title}${r.page_id ? `  [[${r.page_id}]]` : ""}`;
+}
+
+function ensurePage(spec, bodyFile) {
+  const ws = require("../lib/wiki-store.js");
+  if (!spec.page_id) return;
+  const fm = { name: spec.title, description: spec.description || spec.title, type: "watch", watch_id: spec.id, status: "active" };
+  if (bodyFile) {
+    const body = fs.readFileSync(bodyFile, "utf8").trim();
+    ws.savePage(spec.page_id, `${ws.renderFrontmatter(fm)}\n${body}\n`, { editedBy: "watch add" });
+  } else if (ws.getPage(spec.page_id)) {
+    ws.patchFrontmatter(spec.page_id, { type: "watch", watch_id: spec.id }, { editedBy: "watch add" });
+  } else {
+    die(`page ${spec.page_id} does not exist; pass --page-body to create it`);
+  }
+}
+
+/** What happened after each firing: the owner's reaction on the chat message, and whether the task got done. */
+async function fetchOutcomes({ message_ids, task_ids }) {
+  const reactions = {}, tasks = {};
+  if (message_ids.length) {
+    const { request } = require("../lib/supabase-rest.js");
+    const rows = await request(`/rest/v1/jori_messages?select=id,reaction&id=in.(${message_ids.map(encodeURIComponent).join(",")})`).catch(() => []);
+    for (const r of rows || []) reactions[r.id] = r.reaction || "no reaction";
+  }
+  const { spawnSync } = await import("node:child_process");
+  for (const id of task_ids) {
+    const r = spawnSync(process.env.GOG_BIN || "/opt/homebrew/bin/gog", ["tasks", "get", "@default", id, "-a", require("../lib/instance.cjs").instance().owner_email, "--json", "--no-input"], { encoding: "utf8", timeout: 20000 });
+    try { const j = JSON.parse(r.stdout); tasks[id] = j?.task?.status || j?.status || "unknown"; } catch { tasks[id] = "unknown"; }
+  }
+  return { reactions, tasks };
+}
+
+async function main() {
+  switch (cmd) {
+    case "add": {
+      const file = flag("file");
+      if (!file) die("add needs --file <spec.json>");
+      const spec = JSON.parse(fs.readFileSync(file, "utf8"));
+      if (flag("by")) spec.origin = flag("by");
+      if (flag("request")) spec.request = flag("request");
+      if (!spec.origin || !spec.request) process.stderr.write("watch: note: pass --by and --request \"<the owner's words>\" so the weekly review can audit this watch\n");
+      W.normalizeSpec(spec); // validate before touching the wiki
+      ensurePage(spec, flag("page-body"));
+      const r = W.upsertRule(spec);
+      out(describe(r));
+      break;
+    }
+    case "list": {
+      const rules = W.listRules({ all: has("all") });
+      if (has("json")) return out(rules);
+      out(rules.length ? rules.map(describe).join("\n") : "no active watches");
+      break;
+    }
+    case "show": {
+      const r = W.getRule(pos(1));
+      if (!r) die("no such watch");
+      const matches = W.listMatches(r.id);
+      if (has("json")) return out({ rule: r, matches });
+      out(describe(r));
+      out(`    condition: ${r.condition || "-"}\n    action: ${JSON.stringify(r.action)}\n    recurrence: ${r.recurrence}${r.expires_at ? ` · expires ${r.expires_at}` : ""}`);
+      for (const m of matches) out(`  - ${m.verdict.padEnd(12)} ${m.subject_key}  ${m.decided_by || ""}${m.fire_at ? ` fire_at=${m.fire_at}` : ""}${m.fired_at ? ` FIRED ${m.fired_at}` : ""}\n      ${(m.summary || "").slice(0, 200)}`);
+      break;
+    }
+    case "pause": case "resume": case "retire": {
+      const id = pos(1);
+      const status = { pause: "paused", resume: "active", retire: "done" }[cmd];
+      if (!W.setStatus(id, status, Date.now(), { reason: flag("reason") || null, by: flag("by") || "manual" })) die("no such watch");
+      out(`${id} → ${status}`);
+      break;
+    }
+    case "confirm": case "reject": {
+      const [id, key] = [pos(1), pos(2)];
+      const m = W.getMatch(id, key);
+      if (!m) die("no such match");
+      W.db().prepare("UPDATE watch_matches SET verdict = ?, decided_by = ?, updated_at = ? WHERE id = ?")
+        .run(cmd === "confirm" ? "confirmed" : "rejected", require("../lib/instance.cjs").instance().owner_id, new Date().toISOString(), m.id);
+      W.logEvent(`manual:${cmd}ed`, { rule_id: id, match_id: m.id, subject_key: key, was: m.verdict, was_fired: Boolean(m.fired_at) });
+      if (cmd === "confirm") {
+        // An event match re-enters the next tick through the retry list.
+        const st = W.readJson(W.PATHS.state, { retry: [] });
+        const d = m.detail ? JSON.parse(m.detail) : {};
+        st.retry = [...(st.retry || []), { type: d.type || "event", subject_key: m.subject_key, summary: m.summary, data: d.data || {}, ts: new Date().toISOString() }];
+        fs.writeFileSync(W.PATHS.state, JSON.stringify(st, null, 2));
+      }
+      out(`${id} ${key} → ${cmd}ed`);
+      break;
+    }
+    case "tick": {
+      if (!W.acquireLock()) { if (has("json")) out({ skipped: "another tick is running" }); return; }
+      try {
+        const s = await W.tick({ dryRun: has("dry-run") });
+        if (has("json") || has("dry-run")) out(s);
+        else if (s.fired.length || s.asked.length || s.errors.length) W.log(`tick: ${s.events} events, ${s.decided} decided, fired ${s.fired.length}, asked ${s.asked.length}${s.errors.length ? `, errors: ${s.errors.join(" | ")}` : ""}`);
+      } finally { W.releaseLock(); }
+      break;
+    }
+    case "emit": {
+      const type = flag("type"), summary = flag("summary");
+      if (!type || !summary) die("emit needs --type and --summary");
+      const n = W.spoolEvents([{ type, summary, subject_key: flag("key") || `${type}:${Date.now()}`, data: flag("data") ? JSON.parse(flag("data")) : {} }]);
+      out(`spooled ${n}`);
+      break;
+    }
+    case "test": {
+      const r = W.getRule(pos(1));
+      if (!r) die("no such watch");
+      const item = { type: flag("type") || "manual", subject_key: `test:${Date.now()}`, summary: flag("summary") || "", data: flag("data") ? JSON.parse(flag("data")) : {} };
+      out(await W.defaultDeps.judgeMatch(r, item, { id: `test:${r.id}` }));
+      break;
+    }
+    case "feedback": {
+      const [id, note] = [pos(1), pos(2)];
+      if (!W.getRule(id) || !note) die("feedback needs <id> \"<the owner's words>\"");
+      W.recordFeedback(id, note, { subjectKey: flag("subject") || null });
+      out(`feedback recorded on ${id}`);
+      break;
+    }
+    case "miss": {
+      const note = pos(1);
+      if (!note) die("miss needs \"<what was missed>\"");
+      W.recordMiss(note, { ruleId: flag("id") || null });
+      out("miss recorded");
+      break;
+    }
+    case "stats": {
+      const s = await W.stats({ days: Number(flag("days") || 7), outcomes: has("no-outcomes") ? null : fetchOutcomes });
+      if (has("json")) return out(s);
+      const f = s.firings, d = s.decisions, q = s.questions;
+      out([
+        `Watches, last ${s.window_days} days — engine last ticked ${s.engine.tick_age_min ?? "?"} min ago`,
+        `  armed ${s.watches.active} · created ${s.watches.created} ${JSON.stringify(s.watches.created_by)}`,
+        `  decisions ${d.total} ${JSON.stringify(d.by_verdict)} by ${JSON.stringify(d.by_decider)}, failed ${d.failed}`,
+        `  questions asked ${q.asked}, answered ${JSON.stringify(q.answered)}, open ${q.still_open}`,
+        `  fired ${f.total} ${JSON.stringify(f.delivery)}, median late ${f.median_late_min ?? "-"} min, never delivered ${f.failed_never_delivered}`,
+        `  reactions ${JSON.stringify(f.reactions)} · tasks ${JSON.stringify(f.tasks)}`,
+        `  feedback ${s.feedback.length} · misses ${s.misses.length} · corrections ${s.corrections.length} · retired ${s.retired.length}`,
+        ...s.per_watch.filter((w) => w.status === "active").map((w) => `  - ${w.id}: fired ${w.fire_count}×${w.next_fire_at ? `, next ${w.next_fire_at}` : ""}`),
+      ].join("\n"));
+      break;
+    }
+    case "trips": {
+      const trips = W.buildTrips(W.defaultDeps.fetchSegments());
+      if (has("json")) return out(trips);
+      const tz = W.userTz();
+      out(trips.map((t) => `${t.subject_key.slice(0, 13)}  ${t.metro.padEnd(10)} leave ${W.fmtLocal(t.leave_ms, tz)}  arrive ${W.fmtLocal(t.arrive_ms, tz)}${t.via ? `  via ${t.via}` : ""}`).join("\n"));
+      break;
+    }
+    default:
+      { const lines = fs.readFileSync(new URL(import.meta.url), "utf8").split("\n"); out(lines.slice(1, lines.findIndex((l) => l.startsWith("import"))).map((l) => l.replace(/^\/\/ ?/, "")).join("\n")); }
+      if (cmd) process.exit(2);
+  }
+}
+
+main().then(() => W.closeDb()).catch((err) => { W.closeDb(); die(err?.stack || String(err)); });

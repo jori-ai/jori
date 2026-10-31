@@ -1,0 +1,65 @@
+#!/usr/bin/env node
+// sleep-night — one night's sleep from the phone's last lock / first unlock and
+// the Apple Watch's sleep stages. See lib/sleep-night.js.
+//
+// Usage:
+//   sleep-night                     the current night (last night before 14:00 local)
+//   sleep-night --night 2026-10-08  a given night (evening date)
+//   sleep-night --save              also upsert into sleep_nights; with no --night,
+//                                   saves the current night AND the one before it
+//                                   (the Watch batch can land many hours late)
+//   sleep-night --json
+//
+// With --save it also writes data/sleep-night-state.json (the current
+// night + written_at), which `jori activity` reads synchronously so hum's
+// quiet-hours gate follows the phone instead of the clock.
+
+const fs = require("node:fs");
+const path = require("node:path");
+const SN = require("../lib/sleep-night.js");
+const { installTools } = require("../lib/root.cjs");
+const STATE = installTools("data/sleep-night-state.json");
+
+(async () => {
+  const argv = process.argv.slice(2);
+  const json = argv.includes("--json");
+  const save = argv.includes("--save");
+  const ni = argv.indexOf("--night");
+  let nights;
+  if (ni >= 0 && argv[ni + 1]) nights = [argv[ni + 1]];
+  else {
+    const cur = SN.currentNightOf(SN.userTz());
+    nights = save ? [SN.addDays(cur, -1), cur] : [cur];
+  }
+
+  const out = [];
+  for (const n of nights) {
+    const night = await SN.fetchNight(n);
+    if (night.fetch_errors) { process.exitCode = 1; console.error(`[sleep-night] ${n}: ${night.fetch_errors.join("; ")}`); }
+    if (save && !night.fetch_errors && (night.phone_down_at || night.watch_onset_at)) {
+      try { await SN.saveNight(night); night.saved = true; }
+      catch (e) { night.save_error = e.message; process.exitCode = 1; }
+    }
+    out.push(night);
+  }
+  if (save && ni < 0) {
+    const cur = out[out.length - 1];
+    if (!cur.fetch_errors) {
+      const tmp = `${STATE}.tmp`;
+      fs.writeFileSync(tmp, JSON.stringify({ ...cur, written_at: new Date().toISOString() }, null, 2));
+      fs.renameSync(tmp, STATE);
+    }
+  }
+
+  if (json) { console.log(JSON.stringify(nights.length === 1 ? out[0] : out, null, 2)); return; }
+  for (const n of out) {
+    const t = (v) => (v ? SN.localHm(Date.parse(v), n.tz) : "—");
+    console.log(`Night of ${n.night_of} (${n.tz})${n.saved ? " [saved]" : ""}${n.save_error ? ` [SAVE FAILED: ${n.save_error}]` : ""}`);
+    console.log(`  Phone down:   ${t(n.phone_down_at)}${n.phone_down_at && !n.phone_down_exact ? " (bounded — app wasn't running at the lock)" : ""}`);
+    console.log(`  Phone up:     ${n.in_bed_now ? "still down" : t(n.phone_up_at)}${n.night_wakes ? `  (${n.night_wakes} brief night check${n.night_wakes > 1 ? "s" : ""})` : ""}`);
+    console.log(`  Watch:        ${n.watch_onset_at ? `asleep ${t(n.watch_onset_at)} → ${t(n.watch_wake_at)} (${n.watch_asleep_min} min asleep)` : "not synced yet"}`);
+    if (n.latency_min != null) console.log(`  Reading time: ${n.latency_min} min from phone down to asleep`);
+    console.log(`  → Sleep ${t(n.sleep_at)} [${n.sleep_source || "—"}]   Wake ${t(n.wake_at)} [${n.wake_source || "—"}]`);
+    if (n.max_silence_min > 90) console.log(`  ! no phone rows for ${n.max_silence_min} min inside the night — an unlock could be missing`);
+  }
+})().catch(e => { console.error(e.message); process.exit(1); });

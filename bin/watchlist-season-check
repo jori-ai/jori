@@ -1,0 +1,60 @@
+#!/usr/bin/env node
+// watchlist-season-check — daily, deterministic, no LLM.
+//
+// Refreshes watch_seasons from TMDB for every show on the list (new seasons,
+// episode counts, premiere/finale dates, fully_dropped). This is the single
+// owner of airing truth: next-show, the hum harvester and the weekly digest all
+// read `fully_dropped` from here instead of guessing.
+//
+// When a season of a show the user has already watched becomes fully dropped,
+// that's the most valuable recommendation the system makes (2026-09-02 rule),
+// so it sends one phone pointer naming the show(s). Silent otherwise.
+//
+//   watchlist-season-check            dry run (prints what changed, no pointer)
+//   DROP=1 watchlist-season-check     commit + phone pointer when something became ready
+//
+// Writes go through watch-db syncShowSeasons, which only touches air facts —
+// viewing state (watched / watching) is never changed by this job.
+
+import { execFileSync } from "node:child_process";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+import { loadAll, syncShowSeasons, watchedThrough, todayEt, hasTmdb } from "../lib/watch-db.mjs";
+
+const COMMIT = process.env.DROP === "1";
+const today = todayEt();
+if (!hasTmdb()) { console.error("TMDB_API_KEY missing"); process.exit(1); }
+
+const { titles } = await loadAll();
+// Rejected/dropped shows don't need air facts; everything else does (queued
+// shows need S1's fully_dropped so next-show never offers a still-airing debut).
+const shows = titles.filter((t) => t.kind === "show" && t.tmdb_id && !["rejected", "dropped"].includes(t.status));
+
+let changed = 0, errors = 0;
+const nowReady = [];
+if (!COMMIT) {
+  console.log(`dry run: would refresh ${shows.length} shows from TMDB (set DROP=1 to commit)`);
+  process.exit(0);
+}
+for (const t of shows) {
+  try {
+    const { added, nowDropped } = await syncShowSeasons(t, today);
+    if (added.length || nowDropped.length) changed++;
+    const through = watchedThrough(t);
+    const following = through > 0 && t.track_seasons;
+    for (const n of nowDropped) if (following && n === through + 1) nowReady.push(`${t.name} S${n}`);
+    if (added.length || nowDropped.length) console.log(`${t.name}: added S${added.join(",S") || "-"}; fully dropped S${nowDropped.join(",S") || "-"}`);
+  } catch (e) {
+    errors++;
+    console.error(`${t.name}: ${e.message}`);
+  }
+}
+
+console.log(`${new Date().toISOString()} checked=${shows.length} changed=${changed} ready=${nowReady.length} errors=${errors}`);
+
+if (nowReady.length) {
+  const msg = `New season${nowReady.length === 1 ? "" : "s"} fully dropped: ${nowReady.join(", ")}. Ask "what should we watch" for the full list.`;
+  try {
+    execFileSync(path.join(path.dirname(fileURLToPath(import.meta.url)), "jori-send-curl"), ["--suppress-hook", "--intent", "watchlist-season", msg], { stdio: "inherit", timeout: 30000 });
+  } catch (e) { console.error(`phone pointer failed: ${e.message}`); }
+}

@@ -14,8 +14,9 @@
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,600&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400&display=swap" rel="stylesheet">
 <style>
-  :root { --bg:#f4efe6; --ink:#141414; --muted:#5e5a52; --line:#d9d1c3; --accent:#c2410c; --us:#f6e3d3; --yes:#1f7a4d; --no:#a3473a; }
-  @media (prefers-color-scheme: dark) { :root { --bg:#121110; --ink:#f1ece3; --muted:#a39d92; --line:#2c2925; --accent:#fb923c; --us:#2a1d14; --yes:#5fc28f; --no:#e08a7c; } }
+  /* Palettes: life = red, work = blue, neutral when a page speaks to both. Each page maps its accent to one. */
+  :root { --bg:#f4efe6; --ink:#141414; --muted:#5e5a52; --line:#d9d1c3; --life:#b42318; --life-tint:#f7e2de; --work:#1d4ed8; --work-tint:#e1e7f4; --neutral:#57534e; --neutral-tint:#ebe4d8; --accent:var(--life); --us:var(--life-tint); --yes:#1f7a4d; --no:#a3473a; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#121110; --ink:#f1ece3; --muted:#a39d92; --line:#2c2925; --life:#f87171; --life-tint:#2d1716; --work:#7aa2f7; --work-tint:#151f36; --neutral:#d6d0c4; --neutral-tint:#24211d; --yes:#5fc28f; --no:#e08a7c; } }
   * { box-sizing:border-box; margin:0; }
   body { background:var(--bg); color:var(--ink); font:16px/1.6 Inter, system-ui, sans-serif; }
   .wrap { width:100%; max-width:1080px; margin:0 auto; padding:0 24px; }
@@ -75,7 +76,7 @@
   .nav .brand img { width:30px; height:30px; }
   .nav .seg { display:flex; gap:4px; background:var(--us); border-radius:999px; padding:4px; }
   .nav .seg a { color:var(--muted); text-decoration:none; font-size:14px; font-weight:500; padding:6px 14px; border-radius:999px; }
-  .nav .seg a[aria-current="page"] { background:var(--ink); color:var(--bg); }
+  .nav .seg a[aria-current="page"] { background:var(--accent); color:var(--bg); }
   .nav .gh { color:var(--muted); font-size:14px; text-decoration:none; }
   @media (max-width:560px) { .nav .gh { display:none; } }
 </style>
@@ -236,7 +237,7 @@
           </tr>
           <tr>
             <th>"Tell me when…" watches<span class="d">Any reminder or condition becomes a watch: when a letter or email arrives, two days before a trip, at 9 tomorrow, or "check whether they replied, then act". A model judges each match and asks when unsure; misses are reviewed weekly.</span></th>
-            <td class="us y">Email, mail, trip-relative or timed; can act<sup>*</sup></td><td class="p">Some</td><td class="p">Script it with cron</td><td class="u">Not documented</td>
+            <td class="us y">Email, mail, trip-relative or timed; can act</td><td class="p">Some</td><td class="p">Script it with cron</td><td class="u">Not documented</td>
           </tr>
           <tr>
             <th>Follows you around the world<span class="d">When you travel, every schedule shifts to your local time, recommendations only cover the city you'll actually be in, and flight times are quoted in each airport's local time.</span></th>
@@ -252,51 +253,51 @@
           </tr>
           <tr>
             <th>People &amp; contacts<span class="d">Builds a page for everyone you meet and email, records who was with you, and looks up or enriches contacts.</span></th>
-            <td class="us y">Person pages from email, contact enrichment<sup>*</sup></td><td class="u">—</td><td class="u">—</td><td class="u">—</td>
+            <td class="us y">Person pages from email, contact enrichment</td><td class="u">—</td><td class="u">—</td><td class="u">—</td>
           </tr>
           <tr>
             <th>Family &amp; household<span class="d">Family members can email it for scoped answers; it accepts your partner's invites, asks before adding them to a booking, enters lotteries for both of you, and brings gift and outing ideas before birthdays and anniversaries.</span></th>
-            <td class="us y">Family Q&amp;A, shared plans, occasion ideas<sup>*</sup></td><td class="u">—</td><td class="u">—</td><td class="u">—</td>
+            <td class="us y">Family Q&amp;A, shared plans, occasion ideas</td><td class="u">—</td><td class="u">—</td><td class="u">—</td>
           </tr>
           <tr>
             <th>Banking &amp; cards<span class="d">Balances and transactions across your banks and cards; alerts on late income, fees, overdraft risk, unusual or duplicate charges and subscription price creep; a weekly review where every number is checked against the data; and a monthly net-worth summary. Read-only: it cannot move money.</span></th>
-            <td class="us y">All banks + cards, verified weekly review<sup>*</sup></td><td class="y">Yes (Plaid)</td><td class="n">Community skills only</td><td class="p">Partial</td>
+            <td class="us y">All banks + cards, verified weekly review</td><td class="y">Yes (Plaid)</td><td class="n">Community skills only</td><td class="p">Partial</td>
           </tr>
           <tr>
             <th>Investments<span class="d">Brokerage positions with as-of times, a weekly risk memo, a monthly rebalance debated by a council of three agents and scored against what happened, IPO and filing watches, and rate sensitivity. It can place trades, but only after you approve each one with Face ID or Touch ID.</span></th>
-            <td class="us y">Risk memo, agent council; trades with Face/Touch ID<sup>*</sup></td><td class="p">Holdings only</td><td class="n">Community skills only</td><td class="u">Not documented</td>
+            <td class="us y">Risk memo, agent council; trades with Face/Touch ID</td><td class="p">Holdings only</td><td class="n">Community skills only</td><td class="u">Not documented</td>
           </tr>
           <tr>
             <th>Receipts, orders, miles &amp; points<span class="d">Turns receipt emails into vendor, total and card; recovers what every Amazon charge actually bought; files contractor quotes; tracks airline and hotel points, status and expirations.</span></th>
-            <td class="us y">Receipts, Amazon orders, points + expirations<sup>*</sup></td><td class="u">—</td><td class="u">—</td><td class="u">—</td>
+            <td class="us y">Receipts, Amazon orders, points + expirations</td><td class="u">—</td><td class="u">—</td><td class="u">—</td>
           </tr>
           <tr>
             <th>Physical mail<span class="d">Reads the scans from your virtual mailbox, says who sent each letter and whether it's junk, and can trigger a watch when a specific letter arrives.</span></th>
-            <td class="us y">Virtual-mailbox scans, junk flagged<sup>*</sup></td><td class="u">—</td><td class="u">—</td><td class="u">—</td>
+            <td class="us y">Virtual-mailbox scans, junk flagged</td><td class="u">—</td><td class="u">—</td><td class="u">—</td>
           </tr>
           <tr>
             <th>Travel<span class="d">Searches live fares (one-way, round trip, open-jaw, cabin, nonstop), Google Flights and Hotels, Booking.com and Airbnb, and books any of them with Face ID or Touch ID. Every confirmation, change and cancellation in your email lands in one travel timeline and your calendar; flights are tracked live.</span></th>
-            <td class="us y">Search &amp; book flights, hotels, Airbnb; timeline<sup>*</sup></td><td class="y">Search & book (Duffel)</td><td class="n">Community skills only</td><td class="y">Books trips</td>
+            <td class="us y">Search &amp; book flights, hotels, Airbnb; timeline</td><td class="y">Search & book (Duffel)</td><td class="n">Community skills only</td><td class="y">Books trips</td>
           </tr>
           <tr>
             <th>Trip planning<span class="d">For every upcoming destination it researches a guide in the local language, verifies each place, crosses off ones you've been to, and builds day plans around air and sea temperature, waves, tides and a beach verdict; publishes an itinerary site and emails a photo itinerary. Watches cruise prices for all-time lows.</span></th>
-            <td class="us y">Local-language guides, day plans, cruise lows<sup>*</sup></td><td class="u">—</td><td class="u">—</td><td class="u">—</td>
+            <td class="us y">Local-language guides, day plans, cruise lows</td><td class="u">—</td><td class="u">—</td><td class="u">—</td>
           </tr>
           <tr>
             <th>Restaurants<span class="d">A restaurant finder ranks the best places where you are, or where your travel timeline says you'll be, on the food itself: local favourites over tourist strips, your own saved places first, walking minutes on every pick. Resy search, booking, cancelling and sniping the second tables open; it asks before suggesting.</span></th>
-            <td class="us y">Best picks where you'll be, Resy book/snipe<sup>*</sup></td><td class="y">OpenTable</td><td class="p">Search only</td><td class="y">Resy + calls</td>
+            <td class="us y">Best picks where you'll be, Resy book/snipe</td><td class="y">OpenTable</td><td class="p">Search only</td><td class="y">Resy + calls</td>
           </tr>
           <tr>
             <th>Shopping<span class="d">"Buy X" on any site: it stays signed in to 20+ merchants (you sign new ones in from your phone), builds the cart and stops at review. You approve the exact items, total, card and address with Face ID or Touch ID; then code places the order.</span></th>
-            <td class="us y">Any site, Face/Touch ID on the exact cart<sup>*</sup></td><td class="y">Stripe checkout</td><td class="p">Browser automation</td><td class="y">Binding purchases</td>
+            <td class="us y">Any site, Face/Touch ID on the exact cart</td><td class="y">Stripe checkout</td><td class="p">Browser automation</td><td class="y">Binding purchases</td>
           </tr>
           <tr>
             <th>Events &amp; tickets<span class="d">Watches for concerts, big names in small comedy rooms, theater, talks, storytelling and festivals up to 90 days ahead in every city you'll be in; enters Broadway lotteries daily; finds the best-value seats with a marked seat map; buys with Face ID or Touch ID.</span></th>
-            <td class="us y">15 watchers, lotteries, best-value seats<sup>*</sup></td><td class="y">Ticketmaster</td><td class="u">Not documented</td><td class="y">Yes</td>
+            <td class="us y">15 watchers, lotteries, best-value seats</td><td class="y">Ticketmaster</td><td class="u">Not documented</td><td class="y">Yes</td>
           </tr>
           <tr>
             <th>Shows &amp; movies<span class="d">A taste model trained on millions of ratings predicts what you'll like, shows where to stream it (at home or abroad), flags new seasons, emails a weekly film pick and learns from your ratings.</span></th>
-            <td class="us y">Taste model, where to stream, new seasons<sup>*</sup></td><td class="u">—</td><td class="u">—</td><td class="u">—</td>
+            <td class="us y">Taste model, where to stream, new seasons</td><td class="u">—</td><td class="u">—</td><td class="u">—</td>
           </tr>
           <tr>
             <th>Works your logged-in web<span class="d">Recipes for sites you're already signed in to: Amazon, Walmart, Target, Booking.com, Airbnb, Resy, Reddit, X, LinkedIn, Facebook Marketplace, Product Hunt; it repairs a broken recipe the same day.</span></th>
@@ -304,19 +305,19 @@
           </tr>
           <tr>
             <th>Smart home<span class="d">Lights, shades, fans, locks, door intercom, TVs, speakers, cameras, printer, spa and pool robot; checks every device every 2 minutes and emails when one drops.</span></th>
-            <td class="us y">Lights to locks to spa; 2-minute health checks<sup>*</sup></td><td class="p">Hue, Tesla, Home Link</td><td class="y">Hue, cameras, Sonos</td><td class="u">Not documented</td>
+            <td class="us y">Lights to locks to spa; 2-minute health checks</td><td class="p">Hue, Tesla, Home Link</td><td class="y">Hue, cameras, Sonos</td><td class="u">Not documented</td>
           </tr>
           <tr>
             <th>Health &amp; fitness<span class="d">Apple Health vitals, workouts, sleep (from phone and Watch) and clinical records like labs and medications; schedules workouts, nudges around them and celebrates logged sessions. It finds patterns, never diagnoses, and health data never leaves your machine.</span></th>
-            <td class="us y">Labs, sleep, workout coaching; stays local<sup>*</sup></td><td class="y">Apple Health, labs</td><td class="p">Eight Sleep only</td><td class="u">Not documented</td>
+            <td class="us y">Labs, sleep, workout coaching; stays local</td><td class="y">Apple Health, labs</td><td class="p">Eight Sleep only</td><td class="u">Not documented</td>
           </tr>
           <tr>
             <th>Location &amp; life log<span class="d">Where you were and when, stops confirmed while you still remember them, who you were with, photos placed on your day, the history of places you pass, and a daily, weekly and monthly story of your life you can correct by replying.</span></th>
-            <td class="us y">Confirmed stops, companions, daily story<sup>*</sup></td><td class="u">Not documented</td><td class="p">Location on demand</td><td class="p">Location only</td>
+            <td class="us y">Confirmed stops, companions, daily story</td><td class="u">Not documented</td><td class="p">Location on demand</td><td class="p">Location only</td>
           </tr>
           <tr>
             <th>Meetings &amp; calls<span class="d">A summary, points and next steps for both sides after every video call you host, filed to each person's page; agendas, reminders and notes for recurring meetings.</span></th>
-            <td class="us y">Call notes for every call, meeting agendas<sup>*</sup></td><td class="u">—</td><td class="u">—</td><td class="u">—</td>
+            <td class="us y">Call notes for every call, meeting agendas</td><td class="u">—</td><td class="u">—</td><td class="u">—</td>
           </tr>
           <tr>
             <th>Documents &amp; research<span class="d">Web research, summaries and drafts; reads PDFs; creates and edits Word, Excel and Apple Notes; hands long work to background sub-agents.</span></th>
@@ -324,7 +325,7 @@
           </tr>
           <tr>
             <th>Security watch<span class="d">Every 3 hours, checks security news, breaches and vulnerable packages against the ~100 services and the code you actually use; weekly summary by email.</span></th>
-            <td class="us y">Breaches + CVEs vs what you use, every 3h<sup>*</sup></td><td class="u">—</td><td class="u">—</td><td class="u">—</td>
+            <td class="us y">Breaches + CVEs vs what you use, every 3h</td><td class="u">—</td><td class="u">—</td><td class="u">—</td>
           </tr>
           <tr>
             <th>Phone calls for you<span class="d">Calls businesses on your behalf.</span></th>
@@ -345,7 +346,7 @@
         </tbody>
       </table>
     </div>
-    <p class="note"><sup>*</sup>Running today on the reference installation; landing in the open-source repo shortly. Competitor cells are from each product's announcements, docs and press coverage as of October 2026: "Not documented" means we found no public source, not that it can't; "—" means not compared.</p>
+    <p class="note">Competitor cells are from each product's announcements, docs and press coverage as of October 2026: "Not documented" means we found no public source, not that it can't; "—" means not compared.</p>
   </section>
 
   <footer>

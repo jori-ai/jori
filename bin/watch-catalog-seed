@@ -1,0 +1,85 @@
+#!/usr/bin/env node
+// watch-catalog-seed — fill watch_catalog with the films the viewers are most
+// likely to have already seen, so the ratings site can ask "seen it? how was it?"
+// one poster at a time (2026-10-10). No LLM. Idempotent: re-running refreshes the
+// TMDB facts and never touches seen / marked_at / title_id once set.
+//
+// Pool: TMDB /discover/movie sorted by vote count (a good proxy for "widely
+// seen") — the all-time top N, plus the top M of every year since 1990 so recent
+// films aren't buried under 1990s blockbusters. Rank = vote count within the
+// pool, highest first.
+//
+//   watch-catalog-seed [--all-time 600] [--per-year 25] [--dry-run]
+
+import { rest, loadAll, hasTmdb } from "../lib/watch-db.mjs";
+
+const arg = (n, d) => { const i = process.argv.indexOf(`--${n}`); return i >= 0 ? parseInt(process.argv[i + 1], 10) : d; };
+const ALL_TIME = arg("all-time", 600);
+const PER_YEAR = arg("per-year", 25);
+const DRY = process.argv.includes("--dry-run");
+if (!hasTmdb()) { console.error("TMDB_API_KEY missing"); process.exit(1); }
+
+async function tmdb(p) {
+  for (let i = 0; i < 3; i++) {
+    const r = await fetch(`https://api.themoviedb.org/3/${p}${p.includes("?") ? "&" : "?"}api_key=${process.env.TMDB_API_KEY}`, { signal: AbortSignal.timeout(15000) });
+    if (r.ok) return r.json();
+    if (r.status !== 429) throw new Error(`TMDB ${r.status} ${p}`);
+    await new Promise((res) => setTimeout(res, 2000));
+  }
+  throw new Error(`TMDB 429 ${p}`);
+}
+async function pool(items, n, fn) {
+  const out = []; let i = 0;
+  await Promise.all(Array.from({ length: n }, async () => { while (i < items.length) { const k = i++; out[k] = await fn(items[k]); } }));
+  return out;
+}
+
+const genreMap = new Map((await tmdb("genre/movie/list")).genres.map((g) => [g.id, g.name]));
+const found = new Map();
+const take = (m) => { if (!found.has(m.id) && m.vote_count > 0) found.set(m.id, m); };
+const base = "discover/movie?sort_by=vote_count.desc&include_adult=false&with_release_type=2|3|4|5|6";
+
+for (let page = 1; page <= Math.ceil(ALL_TIME / 20); page++) (await tmdb(`${base}&page=${page}`)).results.forEach(take);
+const thisYear = new Date().getFullYear();
+for (let y = 1990; y <= thisYear; y++) {
+  for (let page = 1; page <= Math.ceil(PER_YEAR / 20); page++) {
+    (await tmdb(`${base}&primary_release_year=${y}&page=${page}`)).results.slice(0, PER_YEAR - (page - 1) * 20).forEach(take);
+  }
+}
+const films = [...found.values()].sort((a, b) => b.vote_count - a.vote_count);
+console.log(`pool: ${films.length} films`);
+
+const ext = await pool(films, 8, (m) => tmdb(`movie/${m.id}/external_ids`).catch(() => null));
+const { titles } = await loadAll();
+const byImdb = new Map(titles.filter((t) => t.imdb_id).map((t) => [t.imdb_id, t]));
+const byTmdb = new Map(titles.filter((t) => t.kind !== "show" && t.tmdb_id).map((t) => [t.tmdb_id, t]));
+
+const rows = films.map((m, i) => {
+  const imdb = ext[i]?.imdb_id || null;
+  return {
+    kind: "movie", tmdb_id: m.id, imdb_id: imdb, title: m.title,
+    year: m.release_date ? parseInt(m.release_date.slice(0, 4), 10) : null,
+    poster_path: m.poster_path || null, overview: m.overview || null,
+    genres: (m.genre_ids || []).map((g) => genreMap.get(g)).filter(Boolean).join(", ") || null,
+    original_language: m.original_language || null,
+    vote_count: m.vote_count, vote_average: Math.round((m.vote_average || 0) * 10) / 10, rank: i + 1,
+    _onList: byTmdb.get(m.id) || (imdb && byImdb.get(imdb)) || null,
+  };
+});
+if (DRY) { console.log(rows.slice(0, 10).map((r) => `${r.rank}. ${r.title} (${r.year})`).join("\n")); process.exit(0); }
+
+// Upsert the TMDB facts only (seen/marked_at/title_id are left alone on conflict).
+const facts = rows.map(({ _onList, ...r }) => r);
+for (let i = 0; i < facts.length; i += 200) {
+  await rest("watch_catalog?on_conflict=kind,tmdb_id", { method: "POST", body: facts.slice(i, i + 200), prefer: "resolution=merge-duplicates,return=minimal" });
+}
+// Link films already on the list, once: watched → seen; queued/watching → not seen yet.
+let linked = 0;
+for (const r of rows) {
+  const t = r._onList;
+  if (!t) continue;
+  const seen = t.status === "watched" ? true : ["queued", "watching"].includes(t.status) ? false : null;
+  await rest(`watch_catalog?kind=eq.movie&tmdb_id=eq.${r.tmdb_id}&title_id=is.null`, { method: "PATCH", body: { title_id: t.id, seen }, prefer: "return=minimal" });
+  linked++;
+}
+console.log(`upserted ${facts.length}; linked ${linked} already on the list`);

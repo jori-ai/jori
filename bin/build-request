@@ -1,0 +1,62 @@
+#!/bin/bash
+# build-request — queue a "build this in Jori" request for an ephemeral Opus agent.
+#
+# WHY. A build asked for in chat used to be written by the chat agent itself
+# or POSTed to the ops supervisor, both on the lighter model. Builds belong on
+# the strongest model ($JORI_MODEL_OPUS). This is the chat
+# side of that: the chat agent calls it and ends its turn; launchd
+# (ai.claude.chat-build, QueueDirectories on the pending dir) notices the new
+# file and runs agent/scripts/trigger-chat-build.sh, which runs
+# jobs/chat-build.md on $JORI_MODEL_OPUS. The result comes back to the chat
+# channel when the build finishes.
+#
+# A FILE, NOT A DIRECT SPAWN: a `claude -p` has to start inside the GUI login
+# session to unlock the Max keychain (see lib/run-ephemeral-opus.sh), and a
+# queue file is what lets launchd own the run — it outlives a chat supervisor
+# restart, and builds run one at a time.
+#
+# Usage:
+#   build-request "<the full spec, written so it stands alone>"
+#   build-request status            # last 10 requests and where each one is
+#
+# Prints the request id. Exit 64 on bad usage.
+
+set -uo pipefail
+
+source "$(dirname "$0")/../agent/scripts/lib/root.sh"
+Q="$JORI_INSTALL/data/build-queue"
+MAX_CHARS=6000
+
+if [ "${1:-}" = "status" ]; then
+  for state in pending running done failed; do
+    [ -d "$Q/$state" ] || continue
+    for f in "$Q/$state"/*.json; do
+      [ -e "$f" ] || continue
+      id="$(basename "$f" .json)"
+      spec="$(node -e 'try{process.stdout.write(String(JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")).spec).replace(/\s+/g," ").slice(0,90))}catch{}' "$f" 2>/dev/null)"
+      echo "$id [$state] $spec"
+    done
+  done | sort -r | head -10
+  exit 0
+fi
+
+SPEC="${1:-}"
+if [ -z "${SPEC// /}" ]; then
+  echo 'usage: build-request "<spec>" | build-request status' >&2
+  exit 64
+fi
+if [ "${#SPEC}" -gt "$MAX_CHARS" ]; then
+  echo "build-request: spec too long (${#SPEC} > $MAX_CHARS chars) — write a brief, not a document" >&2
+  exit 64
+fi
+
+mkdir -p "$Q/pending" "$Q/running" "$Q/done" "$Q/failed" "$Q/results"
+ID="$(date +%Y%m%d-%H%M%S)-$$"
+TMP="$Q/.$ID.json"
+node -e '
+  const [id, spec] = process.argv.slice(1);
+  process.stdout.write(JSON.stringify({ id, spec, source: "chat", requested_at: new Date().toISOString() }, null, 2));
+' "$ID" "$SPEC" > "$TMP" || { rm -f "$TMP"; echo "build-request: could not write the request" >&2; exit 1; }
+# Rename into place last, so launchd never sees a half-written file.
+mv "$TMP" "$Q/pending/$ID.json"
+echo "$ID"

@@ -1,0 +1,188 @@
+#!/usr/bin/env node
+// meeting-call-reading — did the day's calls of a recurring meeting take place? A model reads it.
+//
+// The daily summary shows each call of a recurring meeting as its own line in
+// the day's timeline (lib/meeting-call.mjs). The calendar says when one was
+// scheduled; code has already left out an instance cancelled on the calendar,
+// declined, or inside a flight. What is left needs reading: the meeting notes
+// ("No call today"), the user's own words about the day (day-statements) and
+// the user's chat messages that day. That is language, so a model decides:
+// Jev first when the meeting's question site is defined
+// (data/jev-questions/<reading_site>.json; lib/jev-shadow.mjs decide()), then
+// tool-less Sonnet, then Opus, climbing only when a rung's answer fails
+// validation. No local rung: a 1B model returns the schema without reading.
+//
+// It runs as its own step and leaves its reading in a file
+// (/tmp/<prefix>-calls-<date>.json). The daily summary's prep runs it when the
+// day has a call and the file does not cover it; with no file there is no
+// interpretation, and the summary words the call as scheduled.
+//
+// It reads the notes to answer held / not held and writes back a label, never
+// what was discussed (only a not_held answer keeps the words that say so).
+//
+// Usage: meeting-call-reading <YYYY-MM-DD> [--meeting <id>] [--tz <IANA>] [--out <path>] [--json]
+// Exit 0 with a reading (or with no call to read, or no meeting configured), 1 when no
+// rung answered, 2 on a usage or calendar read failure. Forks `claude -p` on the Max
+// session, so it must be launched from an authenticated session (as day-statements is).
+
+import fs from "node:fs";
+import path from "node:path";
+import { createRequire } from "node:module";
+import { fileURLToPath } from "node:url";
+import {
+  calendarCandidates, readCalendarDay, readFlights, screenCandidates, notesForDates, noteDates, dayWindow, zoneLabel,
+  userWords, chatLines, readingState, callKey, readingPath, validateReading, VERDICTS,
+} from "../lib/meeting-call.mjs";
+import { meeting, notesPath, knownSeriesId } from "../lib/meetings.mjs";
+import { runHook } from "../lib/ext-hooks.mjs";
+
+const require = createRequire(import.meta.url);
+const LIB = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "lib");
+const { instance } = require("../lib/instance.cjs");
+
+const SCHEMA = `{"calls": [{"id": "c0", "verdict": "held | not_held | no_word", "quote": "<the exact words that say so, copied verbatim from notes, user_words or user_messages_that_day; null for no_word>"}]}`;
+
+function prompt(state, m) {
+  const owner = instance().owner_name, who = m.name;
+  return `${owner} has a recurring video call with ${who}. Each entry in "calls" is one instance that was on the calendar, with its day and time already worked out for you, and "notes_heading": the notes carry one heading per call, dated by the call's ${zoneLabel(m.tz)} date, so that is the heading the notes about this instance would sit under. Decide, for each, whether the notes or ${owner}'s own words show it took place.
+
+- held: notes under that call's notes_heading recording what the two of them discussed, or ${owner}'s words saying the call happened.
+- not_held: a note or ${owner}'s words saying there was no call that day, or that it was cancelled, skipped or moved to another day. A note written on an earlier day can call off a later call ("Thu + Fri calls canceled").
+- no_word: nothing says either way about THIS instance. Notes under another call's heading do not count, even when both calls fall on the same local day. Silence is no_word, never not_held.
+
+For held and not_held, quote the exact words that say so, copied verbatim. Do not summarise or repeat what was discussed anywhere else in your answer.
+
+Return ONLY this JSON, no prose:
+${SCHEMA}
+
+Input:
+${JSON.stringify(state, null, 1)}`;
+}
+
+async function claudeLadder(state, m) {
+  const { runToollessDetailed, parseModelJson } = await import("../lib/jev-claude.mjs");
+  const { MODELS } = require("../lib/models.cjs");
+  const p = prompt(state, m);
+  const tried = [];
+  for (const [tier, model] of [["sonnet", MODELS.sonnet], ["opus", MODELS.opus]]) {
+    const { out, error } = await runToollessDetailed({ model, prompt: p, timeoutMs: 120_000, effort: "medium" });
+    // No login, a timeout, a crash: the next tier would fail the same way.
+    if (error) throw new Error(`meeting-call-reading ${tier}: ${error.kind}: ${error.message}`);
+    const j = parseModelJson(out);
+    const bad = validateReading(j, state);
+    if (!bad) return { tier, byId: Object.fromEntries(j.calls.map((c) => [c.id, { verdict: c.verdict, quote: c.quote || null }])) };
+    tried.push(`${tier}: ${bad}`);
+  }
+  throw new Error(`meeting-call-reading: no tier answered validly (${tried.join("; ")})`);
+}
+
+/**
+ * Jev first (when the meeting's question site is defined), the Claude ladder below
+ * its threshold. Resolves {read_by, byId}.
+ */
+export async function readCalls(state, m, { id = null } = {}) {
+  const { decide } = await import("../lib/jev-shadow.mjs");
+  const { answerConfidence, jevSiteDef } = await import("../lib/jev.mjs");
+  const SITE = m.reading_site;
+  let memo = null;
+  const legacyFull = () => (memo ||= claudeLadder(state, m));
+  const def = (SITE && jevSiteDef(SITE)) || {};
+  const tpl = def.call_template;
+  if (!tpl) { const full = await legacyFull(); return { read_by: full.tier, byId: full.byId }; }
+  const labels = (r) => Object.fromEntries(Object.entries(r.byId).map(([k, v]) => [k, v.verdict]));
+  const fill = (t, c) => String(t).split("{{when}}").join(c.when).split("{{heading}}").join(c.notes_heading)
+    .split("{{who}}").join(m.name).split("{{owner}}").join(instance().owner_name);
+  const questions = Object.fromEntries(state.calls.map((c) => [c.id, {
+    type: tpl.type, criteria: tpl.criteria, instructions: fill(tpl.instructions, c),
+  }]));
+  const r = await decide({
+    site: SITE, id, state, questions,
+    interpret: (answers) => {
+      const value = {};
+      let conf = 1;
+      for (const c of state.calls) {
+        const a = answers && answers[c.id];
+        if (!a || !VERDICTS.includes(a.choice)) return { value: null, confidence: 0 };
+        value[c.id] = a.choice;
+        conf = Math.min(conf, answerConfidence(a));
+      }
+      return { value, confidence: conf };
+    },
+    legacy: async () => labels(await legacyFull()),
+    alwaysShadow: !!(def.shadow_until && Date.now() < Date.parse(def.shadow_until)),
+  });
+  if (r.used === "jev") {
+    const byId = Object.fromEntries(Object.entries(r.value).map(([k, v]) => [k, { verdict: v }]));
+    // While the shadow runs, Claude can veto a Jev "did not happen": dropping a
+    // call is the costly direction, and a Claude not_held must quote its words.
+    if (memo && Object.values(byId).some((v) => v.verdict === "not_held")) {
+      const shadow = await memo.catch(() => null);
+      for (const [k, v] of Object.entries(byId)) {
+        if (v.verdict === "not_held" && shadow && shadow.byId[k] && shadow.byId[k].verdict !== "not_held") byId[k] = { verdict: shadow.byId[k].verdict };
+        else if (v.verdict === "not_held" && shadow && shadow.byId[k]) byId[k] = shadow.byId[k];
+      }
+    }
+    return { read_by: "jev", byId };
+  }
+  const full = await legacyFull();
+  return { read_by: full.tier, byId: full.byId };
+}
+
+async function main() {
+  const argv = process.argv.slice(2);
+  const date = argv[0];
+  const flag = (n) => { const i = argv.indexOf(n); return i >= 0 ? argv[i + 1] : null; };
+  if (!date || !/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+    process.stderr.write("usage: meeting-call-reading <YYYY-MM-DD> [--meeting <id>] [--tz <IANA>] [--out <path>] [--json]\n");
+    process.exit(2);
+  }
+  const m = meeting(flag("--meeting"));
+  if (!m) { process.stdout.write("meeting-call-reading: no recurring meeting configured (agent/local/config/meetings.json); nothing to read\n"); return; }
+  require("../lib/load-env.js").loadEnv();
+  // The day's zone: the installation's hook (its travel timeline) when it has one, else the meeting's.
+  const tz = flag("--tz") || (await runHook(LIB, "meeting-tz", "tzForDate", [date], null)) || m.tz;
+  const outFile = flag("--out") || readingPath(m, date);
+
+  let events;
+  try { events = readCalendarDay(date, tz); }
+  catch (e) { process.stderr.write(`meeting-call-reading: calendar read failed (${String(e.message).split("\n")[0]})\n`); process.exit(2); }
+  const candidates = calendarCandidates(events, { m, date, tz, knownId: knownSeriesId(m) });
+  const { kept } = screenCandidates(candidates, { flights: candidates.length ? readFlights(date) : [] });
+
+  const result = { date, tz, meeting: m.id, generated_at: new Date().toISOString(), read_by: null, calls: [], verdicts: {} };
+  if (kept.length) {
+    let notesText = "";
+    try { notesText = fs.readFileSync(notesPath(m), "utf8"); } catch {}
+    let statements = null;
+    try { statements = JSON.parse(fs.readFileSync(`/tmp/day-statements-${date}.json`, "utf8")); } catch {}
+    // The user's messages that day (user turns only): day-statements keeps only what
+    // was said about WHERE they were, so "the call was cancelled today" would not be in it.
+    let chat = [];
+    try {
+      const { request } = require("../lib/supabase-rest.js");
+      const w = dayWindow(date, tz);
+      const rows = await request(`/rest/v1/jori_messages?select=role,content,created_at&role=eq.user`
+        + `&created_at=gte.${encodeURIComponent(w.start)}&created_at=lt.${encodeURIComponent(w.end)}&order=created_at.asc&limit=500`,
+        { timeoutMs: 30000 });
+      chat = chatLines(rows, tz);
+    } catch (e) { process.stderr.write(`meeting-call-reading: chat not read (${String(e.message).slice(0, 120)})\n`); }
+    const state = readingState(kept, { tz, home: m.tz, notes: notesForDates(notesText, noteDates(kept, tz, m.tz)), words: userWords(statements), chat });
+    let read;
+    try { read = await readCalls(state, m, { id: date }); }
+    catch (e) { process.stderr.write(`${e.message}\n`); process.exit(1); }
+    result.read_by = read.read_by;
+    kept.forEach((c, i) => {
+      const v = read.byId[`c${i}`];
+      const entry = { verdict: v.verdict, ...(v.verdict === "not_held" && v.quote ? { quote: String(v.quote).slice(0, 200) } : {}) };
+      result.verdicts[callKey(c)] = entry;
+      result.calls.push({ key: callKey(c), when: state.calls[i].when, ...entry });
+    });
+  }
+  fs.writeFileSync(outFile, JSON.stringify(result, null, 1) + "\n");
+  if (argv.includes("--json")) process.stdout.write(JSON.stringify(result, null, 1) + "\n");
+  else process.stdout.write(`${kept.length} call(s) of ${m.id} read for ${date}${result.read_by ? ` by ${result.read_by}` : ""} -> ${outFile}\n`);
+}
+
+if (import.meta.url === `file://${process.argv[1]}` || process.argv[1]?.endsWith("meeting-call-reading")) {
+  main().catch((e) => { process.stderr.write(`${(e && e.stack) || e}\n`); process.exit(1); });
+}

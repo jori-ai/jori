@@ -1,0 +1,88 @@
+#!/usr/bin/env node
+// shadow-cutover-check — flips a shadow-mode code path to LIVE once its own
+// cutover bar is met: a path that has proven itself goes live without waiting
+// for a human to flip it.
+//
+// Paths covered (each owns its bar; this script only reads the verdict):
+//   triage-decide  `triage-decide report --json` → verdict.ready
+//                  (email-triage-rules.md § Decide-then-act triage)
+//                  flips data/triage-decide-config.json mode → "live"
+//
+// A flip is announced once on the system channel with its rollback. A path
+// still not ready after STUCK_DAYS of shadow is reported once. Daily cron;
+// idempotent; `--dry-run` decides and prints without writing or sending.
+// State: data/shadow-cutover-state.json. Log: data/logs/shadow-cutover.log.
+
+const fs = require("fs");
+const path = require("path");
+const { spawnSync, execFileSync } = require("child_process");
+
+const ROOT = require("../lib/root.cjs").installTools();
+const BIN = path.join(ROOT, "bin");
+const DATA = path.join(ROOT, "data");
+const STATE = path.join(DATA, "shadow-cutover-state.json");
+const DRY = process.argv.includes("--dry-run");
+const STUCK_DAYS = 21;
+
+const PATHS = [
+  {
+    name: "triage-decide",
+    config: path.join(DATA, "triage-decide-config.json"),
+    verdict: () => {
+      const r = spawnSync(path.join(BIN, "triage-decide"), ["report", "--days", "14", "--json"], { encoding: "utf8", timeout: 120_000 });
+      const j = parse(r.stdout);
+      if (!j) return { error: `report failed (exit ${r.status}): ${String(r.stderr || "").slice(0, 200)}` };
+      return { ready: !!j.verdict?.ready, reasons: j.verdict?.reasons || [], span: j.span_days };
+    },
+    rollback: 'set "mode": "shadow" in data/triage-decide-config.json (read per email, no restart)',
+    what: "email triage now runs decide-then-act in code (one tool-less call + the Step-5 table); agent dispatch only for multi-step actions",
+  },
+];
+
+function parse(s) { try { return JSON.parse(s); } catch { return null; } }
+function readJson(f, d) { try { return JSON.parse(fs.readFileSync(f, "utf8")); } catch { return d; } }
+function writeJson(f, obj) {
+  fs.mkdirSync(path.dirname(f), { recursive: true });
+  const tmp = `${f}.tmp-${process.pid}`;
+  fs.writeFileSync(tmp, JSON.stringify(obj, null, 2) + "\n");
+  fs.renameSync(tmp, f);
+}
+const log = (m) => console.log(`[${new Date().toISOString()}] ${m}`);
+
+function systemNote(msg) {
+  if (DRY) { log(`DRY system note: ${msg}`); return; }
+  try {
+    // --keep-in-tab: a "now live" note carries its rollback, so its ✅ stays in
+    // the System tab instead of the recovery log (jori-send-curl).
+    execFileSync(path.join(BIN, "jori-send-curl"), ["--channel", "system", "--skip-precheck", "--keep-in-tab", "--intent", "shadow-cutover", msg], { stdio: "ignore", timeout: 30_000 });
+  } catch (e) { log(`system note failed: ${e.message}`); }
+}
+
+function main() {
+  const state = readJson(STATE, {});
+  for (const p of PATHS) {
+    const cfg = readJson(p.config, { mode: "shadow" });
+    const st = (state[p.name] ||= {});
+    if (cfg.mode === "live") { log(`${p.name}: already live`); continue; }
+    if (cfg.mode === "off") { log(`${p.name}: off — skipped`); continue; }
+    const v = p.verdict();
+    if (v.error) { log(`${p.name}: ${v.error}`); continue; }
+    if (!v.ready) {
+      log(`${p.name}: not ready (${Number(v.span || 0).toFixed(1)}d) — ${v.reasons.join("; ")}`);
+      if ((v.span || 0) >= STUCK_DAYS && !st.stuck_reported) {
+        systemNote(`shadow-cutover: ${p.name} has been in shadow ${Math.floor(v.span)} days and still misses its cutover bar — ${v.reasons.join("; ")}. Staying in shadow.`);
+        if (!DRY) st.stuck_reported = new Date().toISOString();
+      }
+      continue;
+    }
+    log(`${p.name}: READY — flipping to live`);
+    if (!DRY) {
+      writeJson(p.config, { ...cfg, mode: "live", went_live_at: new Date().toISOString(), went_live_by: "shadow-cutover-check" });
+      st.went_live_at = new Date().toISOString();
+    }
+    systemNote(`✅ ${p.name} is LIVE — its shadow run met the cutover bar. ${p.what}. Rollback: ${p.rollback}.`);
+  }
+  if (!DRY) writeJson(STATE, state);
+}
+
+main();

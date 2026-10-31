@@ -1,0 +1,144 @@
+#!/usr/bin/env node
+"use strict";
+// finance-facts — record the facts the weekly finance review is not allowed to
+// guess (fin_* tables, migration 20261004_finance_facts.sql).
+//
+//   finance-facts questions                         open questions from the latest review run
+//   finance-facts list [txn|income|payment|move|exception] what is recorded
+//   finance-facts txn <transaction_id> --kind capital|expense|income|internal_transfer|card_payment|refund|deposit_in|deposit_refund|tax|transfer_external|ignore --note "..." [--property <id>]
+//   finance-facts income add --id <slug> --label "..." --account <mask|account_id> --contains "<bank text>" [--amount N]
+//                            --cadence monthly|semimonthly|biweekly|quarterly [--day D] --from YYYY-MM-DD --note "..." [--tolerance N] [--grace N] [--to YYYY-MM-DD]
+//   finance-facts payment add --id <slug> --label "..." --kind card_payment|loan|bill|tax|other --funding <mask|account_id>
+//                            --contains "<bank text>" --rule fixed|current_balance|statement_balance|minimum [--amount N]
+//                            --day D --autopay yes|no --note "..." [--target <mask|account_id>]
+//   finance-facts deposits                          the reconciled deposit table (fin_deposits)
+//   finance-facts deposit-answer <bank row id> --whose "Tenant, Tenant" [--unknown "Tenant"] --said "<the user's words>" [--dry-run]
+//       Whose money a transfer into the deposit account was, when the hub links it wrongly or the review asked
+//       (one amount fitting two sets of tenants). Appended to data/finance-deposit-answers.jsonl, read by
+//       finance-deposits-reconcile. Tenants the hub credits the row to who are not --whose become unknown (never flagged).
+//   finance-facts deposit-move / deposit-exception   RETIRED: answered in the hub (Financials -> Security deposits, the tenant's card)
+//   (was) finance-facts deposit-move <deposit_id|"Tenant Name"> --kind received|closing_credit|swept|payout|refunded
+//                            --amount N --date YYYY-MM-DD --evidence "..." [--txn <plaid txn id>] [--from NNNN] [--to NNNN]
+//       A recorded movement: the reconciler (finance-deposits-reconcile) applies it first and never overrides it.
+//   finance-facts deposit-exception <deposit_id|"Tenant Name"> --reason "..."   (not expected in the deposit account)
+//   finance-facts rm txn|income|payment|move|exception <key>
+//
+// Every write is an upsert keyed on the id, so re-running a command corrects it.
+// Every row needs a note/evidence: a fact with no reason recorded is a guess
+// six months later.
+
+const { loadEnv } = require("../lib/load-env.js");
+const { request } = require("../lib/supabase-rest.js");
+loadEnv();
+
+const TABLES = {
+  txn: { table: "fin_txn_override", key: "transaction_id" },
+  income: { table: "fin_expected_income", key: "id" },
+  payment: { table: "fin_scheduled_payments", key: "id" },
+  move: { table: "fin_deposit_movements", key: "id" },
+  exception: { table: "fin_deposit_exceptions", key: "deposit_id" },
+};
+const argv = process.argv.slice(2);
+const opt = (k) => { const i = argv.indexOf(`--${k}`); return i > -1 ? argv[i + 1] : undefined; };
+const need = (k) => { const v = opt(k); if (v == null || v === "") die(`--${k} is required`); return v; };
+const numOpt = (k) => (opt(k) == null ? null : Number(opt(k)));
+function die(msg) { console.error(`finance-facts: ${msg}`); process.exit(2); }
+
+async function accountId(ref) {
+  if (!ref) return null;
+  const rows = await request("/rest/v1/plaid_accounts?select=account_id,name,mask");
+  const hit = rows.filter((a) => a.account_id === ref || String(a.mask) === String(ref));
+  if (hit.length !== 1) die(`account "${ref}" matched ${hit.length} accounts (use the account_id): ${rows.map((a) => `${a.name} ••${a.mask}`).join(", ")}`);
+  return hit[0].account_id;
+}
+const upsert = (t, row) => request(`/rest/v1/${TABLES[t].table}?on_conflict=${TABLES[t].key}`, { method: "POST", body: [row], prefer: "resolution=merge-duplicates,return=representation" });
+
+async function main() {
+  const [cmd, a1, a2] = argv;
+  if (cmd === "questions") {
+    const r = await request("/rest/v1/fin_review_runs?select=id,run_at,packet->questions&order=run_at.desc&limit=1");
+    const qs = r?.[0]?.questions || [];
+    if (!qs.length) return console.log("No open questions in the latest review run.");
+    for (const q of qs) console.log(`• ${q.text}\n    ${q.answer_with}\n`);
+    return;
+  }
+  if (cmd === "list") {
+    for (const t of a1 ? [a1] : Object.keys(TABLES)) {
+      if (!TABLES[t]) die(`unknown table ${t}`);
+      console.log(`── ${t} (${TABLES[t].table})`);
+      console.log(JSON.stringify(await request(`/rest/v1/${TABLES[t].table}?select=*`), null, 2));
+    }
+    return;
+  }
+  if (cmd === "rm") {
+    if (!TABLES[a1] || !a2) die("usage: rm txn|income|payment|move|exception <key>");
+    await request(`/rest/v1/${TABLES[a1].table}?${TABLES[a1].key}=eq.${encodeURIComponent(a2)}`, { method: "DELETE", prefer: "return=minimal" });
+    return console.log(`removed ${a1} ${a2}`);
+  }
+  if (cmd === "txn") {
+    if (!a1) die("usage: txn <transaction_id> --kind K --note N");
+    const t = await request(`/rest/v1/plaid_transactions?select=transaction_id,date,amount,name&transaction_id=eq.${encodeURIComponent(a1)}`);
+    if (!t?.length) die(`no transaction ${a1}`);
+    const r = await upsert("txn", { transaction_id: a1, kind: need("kind"), note: need("note"), property_id: opt("property") || null, set_at: new Date().toISOString() });
+    return console.log(`recorded: ${t[0].date} ${t[0].amount} "${t[0].name}" → ${r[0].kind}`);
+  }
+  if (cmd === "income" && a1 === "add") {
+    const r = await upsert("income", {
+      id: need("id"), label: need("label"), account_id: await accountId(need("account")), payer_contains: need("contains"),
+      // --amount / --day may be omitted for a stream that varies (invoiced by
+      // weeks worked): it is then reported, never called late.
+      amount: numOpt("amount"), tolerance: numOpt("tolerance") ?? 0, cadence: need("cadence"), due_day: numOpt("day"),
+      grace_days: numOpt("grace") ?? 3, active_from: need("from"), active_to: opt("to") || null, note: need("note"), confirmed_at: new Date().toISOString(),
+    });
+    return console.log(`recorded income ${r[0].id}`);
+  }
+  if (cmd === "payment" && a1 === "add") {
+    const rule = need("rule");
+    if (rule === "fixed" && numOpt("amount") == null) die("--amount is required with --rule fixed");
+    const r = await upsert("payment", {
+      id: need("id"), label: need("label"), kind: need("kind"), funding_account_id: await accountId(need("funding")),
+      target_account_id: opt("target") ? await accountId(opt("target")) : null, descriptor_contains: need("contains"),
+      amount_rule: rule, fixed_amount: numOpt("amount"), due_day: Number(need("day")),
+      autopay: /^y/i.test(need("autopay")), active: true, note: need("note"), confirmed_at: new Date().toISOString(),
+    });
+    return console.log(`recorded payment ${r[0].id}`);
+  }
+  if (cmd === "deposits") {
+    const rows = await request("/rest/v1/fin_deposits?select=property_name,lease_number,tenant,amount,location,location_account_mask,location_basis,expected_location&order=property_name.asc,lease_number.asc");
+    for (const r of rows) console.log(`${String(r.property_name).padEnd(15)} ${r.lease_number.padEnd(13)} ${r.tenant.padEnd(22)} ${String(r.amount).padStart(9)}  ${r.location}${r.location_account_mask ? ` ••${r.location_account_mask}` : ""}${r.expected_location === "exception" ? " (exception)" : ""}  [${r.location_basis}]`);
+    return;
+  }
+  if (cmd === "deposit-answer") {
+    // The hub is read-only from here (lib/rental-ledger.js), so an
+    // answer the user gives in chat is kept beside it, attributed to their words,
+    // and covers each deposit only until the hub records something newer.
+    if (!a1) die(`usage: deposit-answer <bank row id> --whose "Tenant, Tenant" [--unknown "Tenant"] --said "<the user's words>" [--dry-run]`);
+    const fs = require("node:fs"), path = require("node:path");
+    const ledger = require("../lib/rental-ledger.js");
+    const { depositAnswer } = require("../lib/finance-deposit-reconcile.js");
+    const names = (k) => (opt(k) || "").split(",").map((x) => x.trim()).filter(Boolean);
+    const db = ledger.firestore();
+    const [hubDeposits, report] = await Promise.all([db.list("billing-deposits"), db.get("billing-deposit-reports", "latest").catch(() => null)]);
+    let entry;
+    try {
+      entry = depositAnswer({ rowId: a1, deposits: hubDeposits, depositMask: String(report?.account?.mask || require("../lib/instance.cjs").localConfig("rental-finance", { deposit_account_mask: "" }).deposit_account_mask || ""), whose: names("whose"), unknown: names("unknown"), said: need("said"), saidOn: ledger.today() });
+    } catch (e) { die(e.message); }
+    console.log(JSON.stringify(entry, null, 2));
+    if (argv.includes("--dry-run")) return console.log("(dry run: nothing written)");
+    // Append-only: the latest line for a row wins, and the earlier ones stay as history.
+    const file = path.join(require("../lib/root.cjs").installTools("data"), "finance-deposit-answers.jsonl");
+    fs.appendFileSync(file, JSON.stringify({ ...entry, recorded_at: new Date().toISOString() }) + "\n");
+    return console.log(`recorded in ${file}; finance-deposits-reconcile applies it (nightly and before each review, or run it now).`);
+  }
+  if (cmd === "deposit-move" || cmd === "deposit-exception") {
+    // Retired 2026-10-17. Whose a deposit transfer was, where a deposit
+    // started and whether it may sit outside the deposit account are answered
+    // in the hub, attributed to a person, and read back from there by
+    // finance-deposits-reconcile. Recording them here would be a second truth.
+    die(`${cmd} is retired: answer it in the rental hub instead. A bank row's tenants: Financials -> Security deposits ("Whose money was this?"). Where a deposit started, or allowing it outside the deposit account: the tenant's card, Security deposit section.`);
+  }
+  console.error(require("node:fs").readFileSync(__filename, "utf8").split("\n").filter((l) => l.startsWith("//")).slice(1, 23).map((l) => l.slice(3)).join("\n"));
+  process.exit(2);
+}
+
+main().catch((e) => { console.error(`finance-facts error: ${e.message}`); process.exit(1); });

@@ -1,0 +1,274 @@
+#!/usr/bin/env bash
+# jori-commit — commit ONLY the files you actually edited.
+#
+# The safe primitive agents and jobs should use instead of raw git in the
+# jori clone. It exists because the clone is shared: the laptop, the mini,
+# the ops-agent and any concurrent session all edit the same working tree, so
+# `git add -A` does not mean "my changes" — it means "everything anyone has in
+# flight right now." See githooks/pre-commit for the three commits that
+# proved this on 2026-07-20.
+#
+# What it does:
+#   - refuses to run without an explicit file list (that's the whole point)
+#   - refuses whole-tree spellings (-A, ., -u, bare tools/) even if you ask
+#   - stages exactly the paths you name, nothing else
+#   - declares them to the pre-commit hook, so a stray `git add` in the same
+#     turn can't ride along
+#   - tells you what OTHER dirty files it deliberately left alone, so a
+#     concurrent session's work is visible rather than silently swept or
+#     silently lost
+#
+# Usage:
+#   jori-commit -m "<message>" -- <path> [<path> ...]
+#   jori-commit -F <msgfile>  -- <path> [<path> ...]
+#   jori-commit -m "msg" --amend -- <path> ...
+#   jori-commit -m "msg" --unstage-foreign -- <path> ...
+#
+# --unstage-foreign: another session has files staged in the shared index that
+# you did not declare. Unstage them (content stays in the working tree) and
+# commit only yours. Without it, that situation is refused rather than swept.
+#
+# Two repos (a switched install: the kernel checkout plus a private overlay
+# checked out over it, lib/overlay.cjs): the named paths are split by
+# the repo that tracks them, and each repo gets its own commit with the same
+# message. A new file goes to the overlay (private by default, so nothing is
+# published by accident) unless --kernel says it is generic.
+#   jori-commit -m "msg" --kernel -- <new generic file> ...
+#
+# --promote moves files from the overlay into the kernel repo (Phase P: a
+# capability made generic): the overlay stops tracking them and the kernel
+# repo commits them, gated like any kernel commit (kernel-guard, sanitize
+# patterns). If the kernel commit is refused, the overlay is put back as it was.
+#   jori-commit -m "msg" --promote -- <overlay file> ...
+#
+# Exit codes: 0 committed · 1 refused/failed · 2 usage error · 3 foreign staged files
+
+set -uo pipefail
+
+MSG=""
+MSGFILE=""
+AMEND=0
+PATHS=()
+SAW_SEP=0
+UNSTAGE_FOREIGN=0
+NEW_KERNEL=0
+PROMOTE=0
+
+die() { echo "jori-commit: $*" >&2; exit 2; }
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -m) shift; [ $# -gt 0 ] || die "-m needs a message"; MSG="$1" ;;
+    -F) shift; [ $# -gt 0 ] || die "-F needs a file"; MSGFILE="$1" ;;
+    --amend) AMEND=1 ;;
+    --unstage-foreign) UNSTAGE_FOREIGN=1 ;;
+    --kernel) NEW_KERNEL=1 ;;
+    --promote) PROMOTE=1 ;;
+    --) SAW_SEP=1; shift; PATHS=("$@"); break ;;
+    -h|--help) sed -n '2,/^$/p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -*) die "unknown flag: $1 (paths go after --)" ;;
+    *) PATHS+=("$1") ;;
+  esac
+  shift
+done
+
+[ -n "$MSG" ] || [ -n "$MSGFILE" ] || die "need -m <message> or -F <file>"
+if [ "${#PATHS[@]}" -eq 0 ]; then
+  die "no paths given. Name the files you edited: jori-commit -m \"...\" -- <path> ...
+This tool will not guess, because guessing is what swept three unrelated
+changes into the wrong commits on 2026-07-20."
+fi
+void=$SAW_SEP  # accepted with or without the separator; kept for clarity
+
+# Reject whole-tree spellings outright. An agent that reaches for these has
+# stopped tracking what it changed, which is the failure this prevents.
+for p in "${PATHS[@]}"; do
+  case "$p" in
+    -A|--all|.|-u|--update|:/|"*")
+      die "refusing '$p' — name the actual files you edited, not the whole tree." ;;
+    tools|tools/|./tools|./tools/)
+      die "refusing '$p' — that is the whole source tree, not your edits." ;;
+  esac
+done
+
+REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null) || die "not a git repo"
+cd "$REPO_ROOT" || exit 1
+
+# A switched install: split the paths by repo and commit each part in its own
+# repo (this script again, once per repo; the overlay pass runs with GIT_DIR on
+# the overlay, so every git call below acts on it).
+OVERLAY_GIT="${JORI_OVERLAY_GIT_DIR:-$REPO_ROOT/.overlay.git}"
+if [ -z "${JORI_COMMIT_PASS:-}" ] && [ -f "$OVERLAY_GIT/HEAD" ]; then
+  in_repo() {  # $1 = path; true when the repo in $GIT_DIR (or the kernel's) tracks it or has it staged as a deletion
+    git ls-files --error-unmatch -- "$1" >/dev/null 2>&1 || [ -n "$(git diff --cached --name-only --diff-filter=D -- "$1")" ]
+  }
+  if [ "$PROMOTE" -eq 1 ]; then
+    ovl() { GIT_DIR="$OVERLAY_GIT" GIT_WORK_TREE="$REPO_ROOT" git "$@"; }
+    for p in "${PATHS[@]}"; do
+      ovl ls-files --error-unmatch -- "$p" >/dev/null 2>&1 || { echo "jori-commit: --promote: $p is not an overlay file" >&2; exit 1; }
+    done
+    pass_args=()
+    if [ -n "$MSGFILE" ]; then pass_args+=(-F "$MSGFILE"); else pass_args+=(-m "$MSG"); fi
+    # The overlay commit below takes its whole index, so nothing else may be staged there.
+    [ -z "$(ovl diff --cached --name-only)" ] || { echo "jori-commit: --promote: the overlay has other staged changes; commit or unstage them first" >&2; exit 1; }
+    ovl rm -q --cached -- "${PATHS[@]}" || exit 1
+    "$REPO_ROOT/bin/jori-overlay" sync-excludes >/dev/null
+    echo "jori-commit: promoting ${#PATHS[@]} path(s) from the overlay to the kernel repo"
+    if ! JORI_COMMIT_PASS=kernel "$0" "${pass_args[@]}" -- "${PATHS[@]}"; then
+      ovl reset -q -- "${PATHS[@]}"
+      "$REPO_ROOT/bin/jori-overlay" sync-excludes >/dev/null
+      echo "jori-commit: --promote: the kernel commit was refused; the overlay still tracks the files" >&2
+      exit 1
+    fi
+    # Declared to the overlay's pre-commit hook like any jori-commit: exactly these removals.
+    pm=$(mktemp "${TMPDIR:-/tmp}/jori-commit-manifest.XXXXXX"); printf '%s\n' "${PATHS[@]}" | sort -u > "$pm"
+    if [ -n "$MSGFILE" ]; then JORI_COMMIT_MANIFEST="$pm" ovl commit -q -F "$MSGFILE"; else JORI_COMMIT_MANIFEST="$pm" ovl commit -q -m "$MSG"; fi || { echo "jori-commit: --promote: kernel committed but the overlay removal commit failed; run: jori-overlay git commit -- <paths>" >&2; exit 1; }
+    "$REPO_ROOT/bin/jori-overlay" sync-excludes >/dev/null
+    echo "jori-commit: overlay no longer tracks them"
+    exit 0
+  fi
+  KP=(); OP=()
+  for p in "${PATHS[@]}"; do
+    if in_repo "$p"; then KP+=("$p")
+    elif GIT_DIR="$OVERLAY_GIT" GIT_WORK_TREE="$REPO_ROOT" in_repo "$p"; then OP+=("$p")
+    elif [ "$NEW_KERNEL" -eq 1 ]; then KP+=("$p")
+    else OP+=("$p")
+    fi
+  done
+  pass_args=()
+  if [ -n "$MSGFILE" ]; then pass_args+=(-F "$MSGFILE"); else pass_args+=(-m "$MSG"); fi
+  [ "$AMEND" -eq 1 ] && pass_args+=(--amend)
+  [ "$UNSTAGE_FOREIGN" -eq 1 ] && pass_args+=(--unstage-foreign)
+  rc=0
+  if [ "${#KP[@]}" -gt 0 ]; then
+    echo "jori-commit: kernel repo (${#KP[@]} path(s))"
+    JORI_COMMIT_PASS=kernel "$0" "${pass_args[@]}" -- "${KP[@]}" || rc=$?
+  fi
+  if [ "${#OP[@]}" -gt 0 ] && [ "$rc" -ne 0 ]; then
+    # The kernel commit was refused: leave the overlay paths uncommitted too, so
+    # the two repos never hold half of one change. Committing the overlay half
+    # anyway meant the caller's retry found it already in the overlay, reported
+    # "nothing to commit" there, and failed even after the kernel half landed.
+    echo "jori-commit: the kernel commit was refused, so the overlay (${#OP[@]} path(s)) is not committed either; fix the refusal and rerun with the same paths" >&2
+  elif [ "${#OP[@]}" -gt 0 ]; then
+    echo "jori-commit: overlay (${#OP[@]} path(s))"
+    JORI_COMMIT_PASS=overlay GIT_DIR="$OVERLAY_GIT" GIT_WORK_TREE="$REPO_ROOT" "$0" "${pass_args[@]}" -- "${OP[@]}" || rc=$?
+    # A new overlay file must leave the kernel repo's view too.
+    "$REPO_ROOT/bin/jori-overlay" sync-excludes >/dev/null 2>&1 || true
+  fi
+  exit "$rc"
+fi
+# The overlay's files sit under paths the kernel repo's .gitignore hides.
+ADD_FLAGS=()
+[ "${JORI_COMMIT_PASS:-}" = "overlay" ] && ADD_FLAGS=(-f)
+
+# Record everything dirty BEFORE we stage, so we can report what we left.
+# -uall expands untracked DIRECTORIES into their files: without it git reports
+# a collapsed "githooks/" entry that never matches a staged file path, so
+# a directory we fully committed gets misreported as "left untouched".
+# The overlay pass sees the kernel's files as untracked: only its own count.
+UNTRACKED_FLAG=-uall
+[ "${JORI_COMMIT_PASS:-}" = "overlay" ] && UNTRACKED_FLAG=-uno
+before_dirty=$(git status --porcelain $UNTRACKED_FLAG | awk '{print $NF}' | sort -u)
+
+# Stage only the named paths. A path with nothing to stage is not an error
+# (it may already be staged, or unchanged) but a path that does not resolve is.
+for p in "${PATHS[@]}"; do
+  if ! git add ${ADD_FLAGS[@]+"${ADD_FLAGS[@]}"} -- "$p" 2>/dev/null; then
+    # A path already removed with `git rm` matches nothing on disk or in the
+    # index; it is staged as a deletion, which is what the caller meant.
+    [ -n "$(git diff --cached --name-only --diff-filter=D -- "$p")" ] ||
+      die "could not stage '$p' (does it exist?)"
+  fi
+done
+
+staged=$(git diff --cached --name-only)
+if [ -z "$staged" ]; then
+  echo "jori-commit: nothing to commit — the named paths have no staged changes." >&2
+  exit 1
+fi
+
+# ── The manifest is the DECLARED paths, never the staged set ────────────────
+#
+# This was the bug (fixed 2026-08-09). The manifest used to be `$staged`, and
+# the pre-commit hook checks "staged ⊆ manifest" — so the check compared the
+# staged set against itself and could never fail. Anything another session had
+# ALREADY staged in the shared index sailed straight into this commit, which is
+# precisely the class of accident this whole tool exists to prevent. It happened
+# twice in one day, once in each direction: each of two concurrent sessions'
+# commits swallowed work the other had staged. Both were pushed.
+#
+# Resolving through `git diff --cached -- <path>` rather than by string
+# comparison means git's own pathspec rules apply, so a declared directory
+# correctly covers the files staged beneath it.
+manifest=$(mktemp "${TMPDIR:-/tmp}/jori-commit-manifest.XXXXXX")
+trap 'rm -f "$manifest"' EXIT
+: > "$manifest"
+for p in "${PATHS[@]}"; do
+  git diff --cached --name-only -- "$p" >> "$manifest"
+done
+sort -u -o "$manifest" "$manifest"
+
+# Anything staged that no declared path accounts for belongs to someone else.
+foreign=$(comm -23 <(printf '%s\n' "$staged" | sort -u) "$manifest")
+
+if [ -n "$foreign" ]; then
+  if [ "$UNSTAGE_FOREIGN" -eq 1 ]; then
+    # Unstage, never discard: the content stays in the working tree exactly as
+    # the other session left it, it simply stops riding along on this commit.
+    echo "jori-commit: unstaging $(printf '%s\n' "$foreign" | grep -c .) file(s) you did not declare:" >&2
+    printf '%s\n' "$foreign" | sed 's/^/    /' >&2
+    printf '%s\n' "$foreign" | while IFS= read -r f; do
+      [ -n "$f" ] && git restore --staged -- "$f" 2>/dev/null
+    done
+    staged=$(git diff --cached --name-only)
+  else
+    echo "jori-commit: REFUSING — the index already holds files you did not declare:" >&2
+    printf '%s\n' "$foreign" | sed 's/^/    /' >&2
+    echo "" >&2
+    echo "Another session staged these. Committing now would file their work under" >&2
+    echo "your message, which is the exact accident this tool exists to prevent —" >&2
+    echo "and it is not fixable after a push." >&2
+    echo "" >&2
+    echo "Either wait for that session to finish, or re-run with --unstage-foreign" >&2
+    echo "to leave their changes in the working tree and out of your commit." >&2
+    exit 3
+  fi
+fi
+
+# The repo's gates (githooks/pre-commit: scoping, the lints, kernel-guard)
+# run only when git is pointed at them via core.hooksPath. jori-sync wires
+# that on every host it runs on; a clone it has not reached yet would commit
+# with no gate at all, so here the hook is run by hand instead.
+hooks_dir=$(git config --get core.hooksPath 2>/dev/null || true)
+hooks_real=""
+[ -n "$hooks_dir" ] && hooks_real=$(cd "$REPO_ROOT" && cd "$hooks_dir" 2>/dev/null && pwd -P)
+repo_hooks=$(cd "$REPO_ROOT/githooks" 2>/dev/null && pwd -P)
+if [ -n "$repo_hooks" ] && [ -x "$repo_hooks/pre-commit" ] && [ "$hooks_real" != "$repo_hooks" ]; then
+  if ! JORI_COMMIT_MANIFEST="$manifest" "$repo_hooks/pre-commit"; then
+    echo "jori-commit: githooks/pre-commit refused (run directly: core.hooksPath does not point at githooks on this clone)" >&2
+    exit 1
+  fi
+fi
+
+args=()
+[ "$AMEND" -eq 1 ] && args+=(--amend)
+if [ -n "$MSGFILE" ]; then args+=(-F "$MSGFILE"); else args+=(-m "$MSG"); fi
+
+if ! JORI_COMMIT_MANIFEST="$manifest" git commit "${args[@]}" --quiet; then
+  echo "jori-commit: commit failed" >&2
+  exit 1
+fi
+
+echo "jori-commit: committed $(printf '%s\n' "$staged" | grep -c .) file(s):"
+printf '%s\n' "$staged" | sed 's/^/    /'
+
+# Surface, never sweep. If another session has work in flight, the operator
+# should know it is still sitting there uncommitted.
+left=$(comm -23 <(printf '%s\n' "$before_dirty" | grep . || true) <(printf '%s\n' "$staged" | sort -u) || true)
+if [ -n "$left" ]; then
+  echo ""
+  echo "jori-commit: left $(printf '%s\n' "$left" | grep -c .) unrelated dirty file(s) untouched:"
+  printf '%s\n' "$left" | sed 's/^/    /'
+  echo "  (not yours to commit — another session may still be working on them)"
+fi

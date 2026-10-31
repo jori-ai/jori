@@ -284,7 +284,8 @@ function loadAgentConfig(configPath, agentName) {
 }
 
 async function importTriageLog() {
-  const mod = await import(path.join(JORI_ROOT, "lib/triage-log.js"));
+  // Code comes from this checkout (a worktree, a CI clone), not the install.
+  const mod = await import(new URL("../../lib/triage-log.js", import.meta.url).href);
   return mod.triageLog;
 }
 
@@ -1105,13 +1106,17 @@ class Supervisor {
       this.eventLog.append({ kind: "dispatcher.error", id: item.id, source: item.source, error });
     });
 
-    // Now that listeners are attached, flush transferred items — this is the
-    // restart recovery path. Without this, queued items sit idle until the
-    // next external webhook arrives.
+    // Now that listeners are attached, flush the queue — transferred items (an
+    // in-process restart) and, on a cold start, the items restore() replayed
+    // from the persisted queue above. Without this, queued items sit idle until
+    // the next external webhook arrives. The cold-start half guards the
+    // watchdog's "Supervisor stale: … queueDepth=N — triggering /restart": a
+    // reload that restored a queue dispatched nothing until some new dispatch
+    // came in. _drain() itself still honours paused, held and in-flight.
     if (pendingItems.length) {
       console.error(`[supervisor] transferred ${pendingItems.length} queued item(s) to new dispatcher`);
-      this.dispatcher._drain();
     }
+    if (this.dispatcher.queue.length) this.dispatcher._drain();
   }
 
   // Per-turn hang recovery (TurnWatchdog onFire). A turn produced no `result`

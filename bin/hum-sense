@@ -45,13 +45,9 @@ import {
 } from "../lib/hum-events.mjs";
 import { checkExpiredLaneDiagnosis, checkPositiveReactionReenable } from "../lib/hum-lane-quiesce.mjs";
 import { humJevGate, applyJevSkip, reconcileHumOutcomes } from "../lib/jev-hum-gate.mjs";
-// The installation's watch engine, when it has one (lib/_ext/watches.mjs,
-// exporting spoolEvents(events)): every event is offered to it (step 2b).
-let spoolWatchEvents = () => {};
-{
-  const watchesLib = path.join(path.dirname(fileURLToPath(import.meta.url)), "../lib/_ext/watches.mjs");
-  if (fs.existsSync(watchesLib)) ({ spoolEvents: spoolWatchEvents } = await import(pathToFileURL(watchesLib).href));
-}
+// The watch engine (lib/watches.mjs, system/watch.md): every event is offered
+// to it (step 2b).
+import { spoolEvents as spoolWatchEvents } from "../lib/watches.mjs";
 import { installRoot } from "../lib/root.cjs";
 
 const HOME = os.homedir();
@@ -325,7 +321,7 @@ async function pass({ dispatchAllowed = true, onlySensor = null, force = false }
 
   const fresh = [...pushed, ...results.flatMap((r) => r.events)];
 
-  // 2b. Watches (lib/_ext/watches.mjs, optional): every event, whatever hum's gate makes
+  // 2b. Watches (lib/watches.mjs): every event, whatever hum's gate makes
   //     of it, is also a candidate trigger for the user's standing instructions.
   //     Tap + detached kick only — the watch engine's model calls and actions
   //     never run inside this tick, so a slow or broken watch cannot stall hum.

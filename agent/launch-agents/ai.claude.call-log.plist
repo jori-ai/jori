@@ -1,0 +1,54 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  call-log — ON-DEMAND launchd user agent (no schedule of its own).
+  Playbook: agent/ops-agent/jobs/call-log.md
+
+  agent/scripts/trigger-call-log.sh (run on a recurring cron tick) checks in
+  code whether a Zoom call waits to be logged and only then does
+  `launchctl kickstart gui/$(id -u)/ai.claude.call-log`. This agent runs the
+  same script with --run: it checks the Max login (lib/max-auth-guard.sh), then
+  bin/call-log sync has a model write each call's log with `claude -p` on the
+  Max subscription. Only the GUI session can unlock the keychain holding that
+  credential (from cron it prints "Not logged in").
+
+  Install:
+    agent/launch-agents/install.sh ai.claude.call-log
+    (renders __JORI_HOME__ / __JORI_TOOLS__ / __HOME__, then launchctl bootstrap;
+    the first kick from lib/launchd-kick.sh also installs it)
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>ai.claude.call-log</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>__JORI_TOOLS__/bin/cron-run</string>
+        <string>--label</string>
+        <string>call-log</string>
+        <string>--</string>
+        <string>/bin/bash</string>
+        <string>__JORI_TOOLS__/agent/scripts/trigger-call-log.sh</string>
+        <string>--run</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>__HOME__</string>
+        <key>PATH</key>
+        <string>__HOME__/.local/bin:__HOME__/.local/node/bin:/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:__JORI_TOOLS__/bin</string>
+        <key>LANG</key>
+        <string>en_US.UTF-8</string>
+    </dict>
+    <key>WorkingDirectory</key>
+    <string>__JORI_HOME__</string>
+    <key>RunAtLoad</key>
+    <false/>
+    <key>KeepAlive</key>
+    <false/>
+    <key>StandardOutPath</key>
+    <string>__JORI_HOME__/data/logs/call-log.log</string>
+    <key>StandardErrorPath</key>
+    <string>__JORI_HOME__/data/logs/call-log.log</string>
+</dict>
+</plist>

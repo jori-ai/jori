@@ -1,0 +1,659 @@
+#!/usr/bin/env node
+"use strict";
+// daily-summary-build — orchestrates the deterministic daily-summary spine.
+//
+//   daily-summary-build prep <date> [--resolved <path>] [--confirmed <path>] [--fresh-harvest]
+//       Also harvests the day's non-location facts (chat, commits, new files,
+//       mail the user sent, notes edited) and anchors them to the settled stops —
+//       manifest.harvest + /tmp/ds-harvest-<date>.json (2026-10-04, was the
+//       forked session's hand work in Steps 2-3). Also settles the day's
+//       calls (day.calls) through the installation's lib/_ext/day-calls.mjs
+//       hook, when it has one.
+//       Settles the day's FACTS as JSON — no HTML. Reads resolve-day output
+//       (default /tmp/resolved-day-<date>.json, runs resolve-day if absent),
+//       runs the iterative settle loop until no stop's title changes, and
+//       writes /tmp/ds-day-<date>.json (canonical) + the manifest, printing the
+//       manifest to stdout. Cheap to re-run: pass --confirmed to fold in what
+//       the agent vetted and settle again.
+//
+//   daily-summary-build render <date>
+//       Formats the SETTLED day JSON into /tmp/ds-skeleton-<date>.html
+//       (photos embedded, headers, travel legs, bottom lists, prose slots).
+//       Makes no identity decisions — run it once the JSON is right.
+//
+//   daily-summary-build assemble <date> --prose <path>
+//       Substitutes the agent's prose JSON into the skeleton, writes
+//       /tmp/daily-summary-<date>.html, prints that path.
+//
+//   daily-summary-build publish <date> --prose <path>
+//       Upserts the SETTLED day JSON + the prose (+ the assembled narrative)
+//       onto daily_summaries, stamping photo thumb_urls into each stop. This is
+//       what lets the wiki render from data, and lets a renderer change be
+//       replayed over stored days. Also stamps the day's commit / message /
+//       sent-mail counts (from the harvest) for the weekly and monthly packets.
+//
+//   daily-summary-build counts <date> [--apply]
+//       Fills a PAST day's commit and message counts onto its row (dry run
+//       unless --apply). For the days before publish wrote them.
+//
+// The location spine (stop headers, per-stop photos, travel, unmatched-calendar
+// + corrections lists) is emitted by code so the agent can never drop photos or
+// merge/rename/relocate stops — it only fills prose into named slots.
+
+const fs = require("fs");
+const path = require("path");
+const { spawnSync } = require("child_process");
+const { buildManifest, buildSkeleton, assemble, photosNotShown, attachNearMissEvents, _internal: { isMainStop } } = require("../lib/daily-summary-render.js");
+const { selectStandouts } = require("../lib/daily-summary-transactions.js");
+const { linkStandoutsToStops, placesBesidePhotos } = require("../lib/standout-stop-link.js");
+const { settleDay } = require("../lib/daily-summary-day.js");
+const { fetchCompletedTasks, localizeTasksToStops } = require("../lib/daily-summary-tasks.js");
+const { dayCommits, routineTags } = require("../lib/daily-summary-commits.js");
+const { request } = require("../lib/supabase-rest.js");
+const { getDisplayTzForDate } = require("../lib/travel-timezone.js");
+const { harvestDay, countColumns } = require("../lib/daily-summary-harvest.js");
+const { dayWindow: dayWindowOf, boundaryTzOf, defaultTz } = require("../lib/day-window.js");
+const { installTools } = require("../lib/root.cjs");
+const { crossesZones } = require("../lib/geo-timezone.js");
+
+const BIN = installTools("bin");
+// /tmp (not $TMPDIR) to match the daily-summary playbook, which reads/writes
+// /tmp/resolved-day-<date>.json and /tmp/daily-summary-<date>.html.
+const TMP = "/tmp";
+
+function die(msg) { process.stderr.write(msg + "\n"); process.exit(1); }
+
+// What the user SAID about the day, read by a model (`day-statements`, Rule #0b), is
+// an input to resolve-day, day-path and the review: the user's names, the people the user was
+// with, "that's all the stops". Nothing ever ran it (2026-07-30 to 2026-10-17),
+// so every summary was built without the user's words; on 2026-10-16 that lost the
+// dinner the user named with two friends. It forks `claude -p`, which this build's
+// own fork can do. Only `prep` runs it (never confirm-venue, which writes to
+// location_history by the stop ids of a manifest already read), before the day is
+// resolved; Step 1 of the playbook runs it too. A resolved day older than the user's
+// words is resolved again. A failure is said out loud (the review reports it).
+// A failed attempt is not retried by every settle pass for an hour (each one
+// would wait out the model ladder again).
+function readDayStatements(date, tz) {
+  const out = path.join(TMP, `day-statements-${date}.json`);
+  const failed = `${out}.failed`;
+  if (fs.existsSync(out) || process.env.JORI_DAY_STATEMENTS === "0") return;
+  try { if (Date.now() - fs.statSync(failed).mtimeMs < 3600_000) return; } catch {}
+  const r = spawnSync(path.join(BIN, "day-statements"), [date, "--tz", tz],
+    { encoding: "utf8", maxBuffer: 16 * 1024 * 1024, timeout: 300_000 });
+  if (r.status !== 0 || !fs.existsSync(out)) {
+    try { fs.writeFileSync(failed, new Date().toISOString() + "\n"); } catch {}
+    process.stderr.write(`[daily-summary-build] day-statements ${date} did not run (exit ${r.status}): `
+      + `${(r.stderr || r.error || "").toString().trim().slice(-300)} — building without his words\n`);
+  }
+}
+
+// True when the resolved day on disk was written before the user's words were read.
+function resolvedOlderThanWords(date, p) {
+  try {
+    return fs.statSync(path.join(TMP, `day-statements-${date}.json`)).mtimeMs > fs.statSync(p).mtimeMs;
+  } catch { return false; }
+}
+
+function loadResolved(date, override, { withWords = false } = {}) {
+  const p = override || path.join(TMP, `resolved-day-${date}.json`);
+  // run resolve-day fresh, displayed in the day's actual local timezone
+  // (per travel timeline) rather than always the home zone — see lib/travel-timezone.js
+  const tz = getDisplayTzForDate(date);
+  if (withWords && !override) readDayStatements(date, tz);
+  const stale = withWords && !override && fs.existsSync(p) && resolvedOlderThanWords(date, p);
+  if (fs.existsSync(p) && !stale) {
+    try { return JSON.parse(fs.readFileSync(p, "utf8")); }
+    catch (e) { die(`bad resolved JSON at ${p}: ${e.message}`); }
+  }
+  if (stale) process.stderr.write(`[daily-summary-build] the resolved day predates his words for ${date}; resolving it again with them\n`);
+  const r = spawnSync(path.join(BIN, "resolve-day"), ["--tz", tz, date], { encoding: "utf8", maxBuffer: 64 * 1024 * 1024 });
+  if (r.status !== 0) die(`resolve-day ${date} failed: ${(r.stderr || "").slice(0, 400)}`);
+  let resolved;
+  try { resolved = JSON.parse(r.stdout); } catch (e) { die(`resolve-day produced bad JSON: ${e.message}`); }
+  try { fs.writeFileSync(p, r.stdout); } catch {}
+  return resolved;
+}
+
+// Returns the stop's photo HTML and the photos it could not show, so a dropped
+// photo is recorded on the manifest (photos_not_shown) instead of vanishing.
+function renderStopPhotos(stop) {
+  const uuids = (stop.photos || []).map(p => p.uuid).filter(Boolean);
+  if (!uuids.length) return { html: "", notShown: [] };
+  const r = spawnSync(path.join(BIN, "photos"), ["embed-uuids", uuids.join(",")],
+    { encoding: "utf8", maxBuffer: 16 * 1024 * 1024, timeout: 300_000 });
+  const notShown = photosNotShown(stop, r);
+  if (notShown.length) {
+    process.stderr.write(`[daily-summary-build] ${stop.id}: ${notShown.length} photo(s) not shown: `
+      + notShown.map(p => `${p.uuid.slice(0, 8)} (${p.reason})`).join("; ") + "\n");
+  }
+  if (r.status !== 0) {
+    process.stderr.write(`[daily-summary-build] embed-uuids failed for ${stop.id}: ${(r.stderr || "").slice(0, 200)}\n`);
+    return { html: "", notShown };
+  }
+  return { html: (r.stdout || "").trim(), notShown };
+}
+
+// Fetch the day's standout purchases from plaid_transactions. Matches on either
+// the posted `date` or the `authorized_date` (in-person charges post a day or
+// two late but authorize same-day). READ-ONLY, service-role REST. Fail-open:
+// any error (Plaid not configured, DB unreachable, no rows) yields no standouts
+// and the spine still builds. BANK-DATA: jori-model-only — these rows feed
+// the self-addressed daily-summary email per the rule-5 carve-out; never relay
+// them to a third-party/external LLM or a claude.ai connector.
+async function fetchTxnRows(date) {
+  try {
+    const cols = "transaction_id,account_id,amount,date,authorized_date,name,merchant_name,category_primary,category_detailed,payment_channel,pending,raw";
+    const rows = await request(
+      `/rest/v1/plaid_transactions?select=${cols}&or=(date.eq.${date},authorized_date.eq.${date})&order=amount.desc&limit=500`
+    );
+    return Array.isArray(rows) ? rows : [];
+  } catch (e) {
+    process.stderr.write(`[daily-summary-build] transaction fetch skipped: ${(e && e.message) || e}\n`);
+    return [];
+  }
+}
+
+// The businesses beside the user's photos at each stop, for the charge linker
+// (standout-stop-link.js placesBesidePhotos). Read-only, fail-open: with no rows
+// the linker reads the stop names alone, as it did before.
+async function photoPlacesByStop(stops) {
+  const uuids = [...new Set((stops || []).flatMap(s => (s.photos || []).map(p => p && p.uuid)).filter(Boolean))];
+  if (!uuids.length) return {};
+  try {
+    const rows = await request(`/rest/v1/photos?select=uuid,device_venue&uuid=in.(${uuids.join(",")})`);
+    return placesBesidePhotos(stops, Array.isArray(rows) ? rows : []);
+  } catch (e) {
+    process.stderr.write(`[daily-summary-build] photo places for the charge link skipped: ${(e && e.message) || e}\n`);
+    return {};
+  }
+}
+
+// The day's USER chat turns (BOTH roles fetched, but only user statements are
+// mined for volunteered venues). Read-only, fail-open. NOTE: this stays inside
+// the jori-model boundary — chat is the user-owned, never relayed externally.
+async function fetchChatMessages(date, tz = defaultTz()) {
+  try {
+    // The day's own window, cut in the zone resolve-day cut the day in. This was
+    // a fixed home-zone offset, so on a day far east of home everything the user
+    // said between local midnight and 07:00 was never read. It is a fetch window, not
+    // a bound: each statement is time-bound to a stop afterwards.
+    //
+    // Through the END OF THE NEXT DAY, not this one. A location-enrich ask about
+    // an evening stop is routinely answered the following morning — the answer
+    // is still an answer, and a day-scoped window made it invisible to a
+    // backfill or re-render that runs after it arrived. Binding is by ASK, and
+    // an ask only stays open 12h, so the extra day can't contaminate anything.
+    const w = dayWindowOf(date, tz, 2);
+    const startIso = encodeURIComponent(w.start);
+    const endIso = encodeURIComponent(w.end);
+    const rows = await request(
+      // `id` + `reply_to` are load-bearing: when the user answers a location-enrich
+      // ask using the app's Reply action, `reply_to` binds the user's answer to that
+      // exact ask — no time-window or keyword guessing needed (see
+      // daily-summary-day.bindAnswerToAsk).
+      `/rest/v1/jori_messages?select=id,role,content,created_at,reply_to&created_at=gte.${startIso}&created_at=lt.${endIso}&order=created_at.asc&limit=500`
+    );
+    return Array.isArray(rows) ? rows : [];
+  } catch (e) {
+    process.stderr.write(`[daily-summary-build] chat fetch skipped: ${(e && e.message) || e}\n`);
+    return [];
+  }
+}
+
+// Settle the day's FACTS (no HTML). Runs the confirmed-fact engine + the
+// iterative settle loop (`daily-summary-day.settleDay`): chat-ask answers,
+// chat-venue mining, in-person/mobility transaction matching, provenance
+// tiering, repeated until no stop's title changes. Attaches `.provenance`
+// (including the settled `title`) and `.needs_review` to each resolved stop in
+// place. `confirmed` is the agent's vetted { stop_id: venue } map — empty on the
+// first prep, filled on a re-prep after it vets what the JSON flagged.
+async function settle(date, resolved, confirmed = {}) {
+  const txns = await fetchTxnRows(date);
+  const messages = await fetchChatMessages(date, boundaryTzOf(resolved));
+  const standoutData = selectStandouts(txns, resolved.stops || []);
+  // ...and an in-store charge whose spelling no stop shares (standout-stop-link.js),
+  // read with the businesses beside the user's photos at each stop and the charge's own
+  // statement line.
+  try {
+    const near = await photoPlacesByStop(resolved.stops || []);
+    const statements = Object.fromEntries(txns.filter(t => t && t.transaction_id && t.name).map(t => [t.transaction_id, t.name]));
+    const linked = await linkStandoutsToStops(standoutData, resolved.stops || [], { date, near, statements });
+    if (linked.length) process.stderr.write(`[daily-summary-build] charges linked to stops by the model: ${linked.length}\n`);
+  } catch (e) {
+    process.stderr.write(`[daily-summary-build] standout link skipped: ${(e && e.message) || e}\n`);
+  }
+  const day = settleDay(resolved, { messages, transactions: txns, confirmed });
+  return {
+    ...standoutData, // standouts + byStopId + total (for prose weaving + 4.5 check)
+    mobility: day.mobility,
+    chat_venue_candidates: day.chat_venue_candidates,
+    ask_answers: day.ask_answers,
+    multi_answer_replies: day.multi_answer_replies,
+    unattributed_replies: day.unattributed_replies,
+    settle_passes: day.passes,
+    resolutions: day.resolutions,
+    _messages: messages,
+  };
+}
+
+// Steps 2-3 of the playbook, in code (2026-10-04): the day's non-location
+// facts (chat, commits, new files, mail the user sent, notes the user edited) harvested and
+// time-anchored to the settled stops. Raw facts are cached per date so a
+// re-prep — which can renumber stops — re-anchors without re-fetching;
+// `--fresh-harvest` forces a refetch. Fail-open per source (`errors`).
+function harvest(date, resolved, messages, fresh) {
+  const cachePath = path.join(TMP, `ds-harvest-raw-${date}.json`);
+  let cached = null;
+  if (!fresh && fs.existsSync(cachePath)) {
+    try { cached = JSON.parse(fs.readFileSync(cachePath, "utf8")); } catch {}
+  }
+  let h;
+  try {
+    h = harvestDay({ date, chatRows: messages, stops: resolved.stops || [], cached, tz: boundaryTzOf(resolved),
+                     tasks: resolved.tasks_completed || [] });
+  } catch (e) {
+    process.stderr.write(`[daily-summary-build] harvest failed: ${e.message}\n`);
+    return { errors: { harvest: String(e.message).slice(0, 200) }, facts_by_stop: {}, facts_by_leg: [], orphan_facts: [] };
+  }
+  const { _cache, ...out } = h;
+  try { fs.writeFileSync(cachePath, JSON.stringify(_cache)); } catch {}
+  try { fs.writeFileSync(path.join(TMP, `ds-harvest-${date}.json`), JSON.stringify(out, null, 2)); } catch {}
+  return out;
+}
+
+// The day's calls (a recurring call, the call log): their own lines in the
+// timeline, never stops. Which calls an installation has, and how it reads
+// whether they happened and what was discussed, is its own: the hook
+// lib/_ext/day-calls.mjs exports attachCalls({ date, tz, resolved, tmp, bin,
+// boundaryTzOf }) and sets resolved.calls (+ calls_left_out, calls_zoom,
+// calls_error). Without the hook a day has no calls.
+async function attachCalls(date, resolved) {
+  const { loadHook } = await import(require("url").pathToFileURL(path.join(__dirname, "..", "lib", "ext-hooks.mjs")).href);
+  const hook = await loadHook(path.join(__dirname, "..", "lib"), "day-calls");
+  if (!hook || typeof hook.attachCalls !== "function") { resolved.calls = resolved.calls || []; return; }
+  await hook.attachCalls({ date, tz: boundaryTzOf(resolved), resolved, tmp: TMP, bin: BIN, boundaryTzOf });
+}
+
+// prep — settle the JSON. NO HTML: photos aren't rendered and no skeleton is
+// written, so a re-prep after vetting costs nothing but the settle loop: the day
+// is settled as JSON, in as many passes as it takes, and only then formatted.
+// Formatting is `render`, below.
+async function cmdPrep(date, resolvedOverride, confirmedPath, freshHarvest = false) {
+  const resolved = loadResolved(date, resolvedOverride, { withWords: true });
+  // Optional agent-vetted overrides: { "<stop_id>": "<confirmed venue>" } — chat
+  // statements the agent confirmed. On a re-prep these settle the matching stops
+  // before the JSON is re-emitted.
+  let confirmed = {};
+  if (confirmedPath) {
+    try { confirmed = JSON.parse(fs.readFileSync(confirmedPath, "utf8")); }
+    catch (e) { process.stderr.write(`[daily-summary-build] bad --confirmed JSON: ${e.message}\n`); }
+  }
+  const { _messages: chatRows, ...txnData } = await settle(date, resolved, confirmed);
+
+  // settleDay settles stop identities in place but resolve-day's original
+  // unknown_stops[] (computed before any chat/txn confirmation) never gets
+  // recomputed — so a stop the settle loop just confirmed (needs_review
+  // cleared) would still show up asking "I didn't capture a label. Tell me?"
+  // in the Corrections section, flatly contradicting its own bolded H3 above
+  // (2026-08-06: Terre de Café + Pradel Bistrot both confirmed via chat, both
+  // still listed as unlabeled below). Drop any entry whose stop settled.
+  if (Array.isArray(resolved.unknown_stops) && resolved.unknown_stops.length) {
+    const stopsById = new Map((resolved.stops || []).map(s => [s.id, s]));
+    resolved.unknown_stops = resolved.unknown_stops.filter(u => {
+      const s = stopsById.get(u.id);
+      return !s || !!s.needs_review;
+    });
+  }
+
+  // The day's CLOSED Google Tasks. Deterministic, like the location spine: the
+  // narrator gets to mention them, but it cannot drop them (when a task was done
+  // matters to the user). Attached
+  // to the day JSON so `publish` stores them and the wiki renders from the same
+  // rows even after a `gog tasks clear` wipes Google's own completed list.
+  const tz = resolved.tz || getDisplayTzForDate(date);
+  const closed = fetchCompletedTasks(date, tz);
+  if (closed.error) {
+    // Never let a read failure masquerade as "nothing was closed today". Keep
+    // whatever a previous prep already settled, and carry the error into the
+    // render so the section says so out loud.
+    process.stderr.write(`[daily-summary-build] google tasks read failed: ${closed.error}\n`);
+    const prevPath = path.join(TMP, `ds-day-${date}.json`);
+    let prev = null;
+    if (fs.existsSync(prevPath)) {
+      try { prev = JSON.parse(fs.readFileSync(prevPath, "utf8")); } catch {}
+    }
+    resolved.tasks_completed = (prev && prev.tasks_completed) || [];
+    resolved.tasks_completed_error = closed.error;
+  } else {
+    resolved.tasks_completed = closed.tasks;
+    delete resolved.tasks_completed_error;
+  }
+  if (crossesZones(resolved.tzs, tz)) {
+    resolved.tasks_completed = localizeTasksToStops(resolved.tasks_completed, resolved.stops, tz);
+  }
+  await attachCalls(date, resolved);
+  // A place-less event that missed every stop by minutes is the stop the person it
+  // names joined the user at ("Pick up Sam"; attachNearMissEvents).
+  const nearMiss = attachNearMissEvents(resolved);
+  if (nearMiss.length) resolved.calendar_near_misses = nearMiss;
+  else delete resolved.calendar_near_misses;
+  // A calendar event with no place that the user's words say the user went to is that stop
+  // (2026-10-21: "hilton hotel for the AI conference" and the place-less "Future
+  // of AI 2026 conference"). A model reads it: lib/calendar-in-words.mjs.
+  try {
+    const { markCalendarInWords } = await import(path.join(__dirname, "../lib/calendar-in-words.mjs"));
+    const marked = await markCalendarInWords(resolved);
+    if (marked.length) resolved.calendar_in_words = marked;
+    else delete resolved.calendar_in_words;
+  } catch (e) {
+    process.stderr.write(`[daily-summary-build] calendar-in-words failed: ${String((e && e.message) || e).split("\n")[0].slice(0, 200)}\n`);
+  }
+  // A place-less event that ends as the user reaches a stop may be the way there
+  // ("Drive to the airport" and the airport stop). A model reads it
+  // (lib/calendar-in-words.mjs markCalendarTrips); a yes leaves "Events not matched".
+  try {
+    const { markCalendarTrips } = await import(path.join(__dirname, "../lib/calendar-in-words.mjs"));
+    const trips = await markCalendarTrips(resolved);
+    if (trips.length) resolved.calendar_trips = trips;
+    else delete resolved.calendar_trips;
+  } catch (e) {
+    process.stderr.write(`[daily-summary-build] calendar-trip failed: ${String((e && e.message) || e).split("\n")[0].slice(0, 200)}\n`);
+  }
+
+  const manifest = buildManifest(resolved, txnData);
+  // Anchored against the SETTLED stops (the ids the prose JSON keys by).
+  manifest.harvest = harvest(date, resolved, chatRows, freshHarvest);
+  // The day's commits: what the user worked on, listed under the stop the user was at
+  // (under each stop where relevant; no work happens while walking). On the day JSON so render, publish and
+  // the wiki carry them; the narrator writes the plain words into
+  // prose.commits (jobs/daily-summary.md 4.2).
+  //
+  // A commit from before the first stop gets its own section
+  // (never a later stop's header), and Jori's own work is described briefly or,
+  // when it happens every day, not at all. `pre` and `omitted` are stamped here;
+  // the narrator sees only what will print.
+  const routine = routineTags(manifest.harvest.prior_commit_tags);
+  resolved.commits = dayCommits(manifest.harvest.commits, resolved.stops, tz, (resolved.stops || []).filter(isMainStop),
+    { night: resolved.night, routineTags: routine });
+  const herr = manifest.harvest.errors || {};
+  if (herr.git || herr.harvest) resolved.commits_error = herr.git || herr.harvest;
+  else delete resolved.commits_error;
+  manifest.commits = resolved.commits.filter(c => !c.omitted)
+    .map(({ sha, local, tz_abbr, stop_id, pre, autonomous, subject }) => ({ sha, local, tz_abbr, stop_id, pre, autonomous, subject }));
+  // Context only: what code left out as routine, so a run that finds nothing can say why.
+  manifest.commits_left_out = resolved.commits.filter(c => c.omitted)
+    .map(({ sha, local, tag, omitted, subject }) => ({ sha, local, tag, why: omitted, subject }));
+  manifest.commits_routine_tags = [...routine];
+  manifest.section_slots.push("commits");
+
+  // The canonical day JSON: resolve-day's output with every stop's identity
+  // settled. `render` reads THIS, never the raw resolved day.
+  fs.writeFileSync(path.join(TMP, `ds-day-${date}.json`), JSON.stringify(resolved, null, 2));
+  fs.writeFileSync(path.join(TMP, `ds-manifest-${date}.json`), JSON.stringify(manifest, null, 2));
+  process.stdout.write(JSON.stringify(manifest, null, 2) + "\n");
+
+  const open = manifest.stops.filter(m => m.needs_review);
+  if (open.length) {
+    process.stderr.write(`[daily-summary-build] ${open.length} stop(s) still need review: `
+      + open.map(m => `${m.id}(${m.needs_review.reason})`).join(", ") + "\n");
+  }
+}
+
+// render — format the settled JSON into the email skeleton. This is the LAST
+// deterministic step and it makes no identity decisions: every title it prints
+// was settled by `prep`. Photo rendering lives here (not in prep) because it is
+// the expensive part and there is no reason to pay it on every settle pass.
+function cmdRender(date) {
+  const dayPath = path.join(TMP, `ds-day-${date}.json`);
+  if (!fs.existsSync(dayPath)) die(`render: no settled day JSON — run prep first (${dayPath})`);
+  let day;
+  try { day = JSON.parse(fs.readFileSync(dayPath, "utf8")); }
+  catch (e) { die(`render: bad day JSON at ${dayPath}: ${e.message}`); }
+
+  const photoHtmlById = {}, notShownById = {};
+  for (const s of day.stops || []) {
+    const p = renderStopPhotos(s);
+    photoHtmlById[s.id] = p.html;
+    notShownById[s.id] = p.notShown;
+  }
+  const skeleton = buildSkeleton(day, photoHtmlById);
+  fs.writeFileSync(path.join(TMP, `ds-skeleton-${date}.html`), skeleton);
+
+  // Keep the manifest's photos_rendered flags honest — they're only knowable
+  // once photos have actually been embedded, which happens here.
+  const manPath = path.join(TMP, `ds-manifest-${date}.json`);
+  if (fs.existsSync(manPath)) {
+    try {
+      const manifest = JSON.parse(fs.readFileSync(manPath, "utf8"));
+      for (const m of manifest.stops) {
+        m.photos_rendered = !!(photoHtmlById[m.id] && photoHtmlById[m.id].trim());
+        m.photos_not_shown = notShownById[m.id] || [];
+      }
+      fs.writeFileSync(manPath, JSON.stringify(manifest, null, 2));
+    } catch (e) {
+      process.stderr.write(`[daily-summary-build] could not stamp photos_rendered: ${e.message}\n`);
+    }
+  }
+  process.stdout.write(path.join(TMP, `ds-skeleton-${date}.html`) + "\n");
+}
+
+// publish — store the SETTLED day JSON + the agent's prose alongside the
+// rendered narrative, so the wiki (and any future re-render) can be produced
+// from data instead of from the email HTML.
+//
+// The resulting JSON is stored in the database and the wiki renders from it. The row's payload used to be
+// `narrative` (HTML), with the wiki page converted back out of it — a
+// presentation format as source of truth, which froze every stored day against
+// the renderer that happened to be live that night.
+//
+// Photo uuids are resolved to thumb_urls HERE and stamped into each stop, so a
+// re-render never has to hit the photos table.
+//
+//   daily-summary-build publish <date> --prose <path>
+async function cmdPublish(date, prosePath, force = false) {
+  const dayPath = path.join(TMP, `ds-day-${date}.json`);
+  if (!fs.existsSync(dayPath)) die(`publish: no settled day JSON — run prep first (${dayPath})`);
+  const day = JSON.parse(fs.readFileSync(dayPath, "utf8"));
+
+  let prose = {};
+  if (prosePath) {
+    try { prose = JSON.parse(fs.readFileSync(prosePath, "utf8")); }
+    catch (e) { die(`publish: bad prose JSON: ${e.message}`); }
+  }
+
+  // Prose is keyed by STOP ID, and stop ids are positional — they renumber
+  // whenever settling merges or drops something. So prose written against an
+  // earlier settling of the same day silently shifts onto the wrong stops:
+  // publishing a re-prepped 2026-07-26 against its original prose put "a short
+  // pause at Le Récif, $44.70" on the Airbnb and the Ars-en-Ré dinner on
+  // Saint-Martin-de-Ré. Nothing errors; the day just becomes fiction.
+  //
+  // Two cheap checks catch it. Every prose key must name a stop that still
+  // exists, and the settled JSON must not be NEWER than the prose — if it is,
+  // the day was re-settled after the prose was written and the pairing is void.
+  const ids = new Set((day.stops || []).map(s => s.id));
+  const orphans = Object.keys(prose.prose || {}).filter(k => !ids.has(k));
+  const daySettledAt = fs.statSync(dayPath).mtimeMs;
+  const proseWrittenAt = prosePath && fs.existsSync(prosePath) ? fs.statSync(prosePath).mtimeMs : Infinity;
+  if (!force && (orphans.length || daySettledAt > proseWrittenAt)) {
+    die(`publish: prose does not belong to this settling of ${date}`
+      + (orphans.length ? ` — ${orphans.length} prose key(s) name stops that no longer exist (${orphans.slice(0, 3).join(", ")})` : "")
+      + (daySettledAt > proseWrittenAt ? ` — ds-day-${date}.json was re-settled AFTER the prose was written` : "")
+      + `\n  Re-run the prose step against the current manifest (or pass --force if you truly mean to publish them together).`);
+  }
+
+  // Stamp each stop's photo thumb_urls into the JSON.
+  const uuids = [...new Set((day.stops || []).flatMap(s => (s.photos || []).map(p => p.uuid)).filter(Boolean))];
+  const urlByUuid = {};
+  if (uuids.length) {
+    try {
+      const rows = await request(`/rest/v1/photos?select=uuid,thumb_url,media_type,favorite,taken_at`
+        + `&uuid=in.(${uuids.join(",")})`);
+      for (const r of rows || []) if (r.thumb_url) urlByUuid[r.uuid] = r;
+    } catch (e) {
+      process.stderr.write(`[daily-summary-build] photo url lookup failed: ${(e && e.message) || e}\n`);
+    }
+  }
+  const DISPLAY = new Set(["photo", "selfie", "live", "panorama", "burst", "video"]);
+  for (const s of day.stops || []) {
+    s.photo_urls = (s.photos || [])
+      .map(p => urlByUuid[p.uuid]).filter(r => r && DISPLAY.has(r.media_type))
+      .sort((a, b) => (a.favorite ? 0 : 1) - (b.favorite ? 0 : 1) || String(a.taken_at).localeCompare(String(b.taken_at)))
+      .map(r => r.thumb_url);
+  }
+
+  const htmlPath = path.join(TMP, `daily-summary-${date}.html`);
+  const narrative = fs.existsSync(htmlPath) ? fs.readFileSync(htmlPath, "utf8") : null;
+
+  // `updated_at` is stamped EXPLICITLY, and must stay that way. The column is
+  // `NOT NULL DEFAULT now` with no trigger on the table, and a column default
+  // fires on INSERT only — never on the UPDATE half of a PostgREST upsert. Omit
+  // it and a re-publish rewrites the row's content while leaving its "last
+  // rendered" stamp frozen at the original insert.
+  //
+  // What that breaks: bin/photos-sync-gaps maps rendered_at :=
+  // daily_summaries.updated_at and flags a date stale when
+  // max(photos.synced_at) > rendered_at ("the photos arrived after the render,
+  // re-render it"). Its prescribed repair is `daily-summary-run <date>`, which
+  // republishes through here, so a frozen stamp leaves the flag set and the same
+  // dates re-fan-out a fresh `claude -p` session the next night.
+  //
+  // The playbook's Step 5.1 SQL (jobs/daily-summary.md) also sets
+  // `updated_at = now`, but that is an agent-executed step and is skipped often
+  // enough to matter: on 2026-08-20 it landed for 3 of 8 re-rendered dates and
+  // the other 5 stayed frozen, so those repeated. Clearing must not depend on it.
+  // Measured 2026-08-19 and 2026-08-20: the identical 8 dates launched in the
+  // same second on both nights, driving the recurring "daily-summary-run did NOT
+  // run" system-channel alert stream.
+  // Regression guard: tests/photos-sync-gaps.test.mjs.
+  const body = { date, day_json: day, prose_json: prose, updated_at: new Date().toISOString() };
+  if (narrative) body.narrative = narrative;
+  // The commit / message / sent-mail counts the weekly and monthly packets sum
+  // (2026-10-19: nothing had written them since April). From the harvest `prep`
+  // just wrote for THIS date; absent or failed sources are simply not written.
+  try {
+    const harvestPath = path.join(TMP, `ds-harvest-${date}.json`);
+    if (fs.existsSync(harvestPath)) Object.assign(body, countColumns(JSON.parse(fs.readFileSync(harvestPath, "utf8")), date));
+  } catch (e) {
+    process.stderr.write(`[daily-summary-build] count columns skipped: ${(e && e.message) || e}\n`);
+  }
+  await request(`/rest/v1/daily_summaries?on_conflict=date`, {
+    method: "POST", body, prefer: "resolution=merge-duplicates,return=minimal",
+  });
+  const photos = (day.stops || []).reduce((t, s) => t + (s.photo_urls || []).length, 0);
+  process.stdout.write(JSON.stringify({ date, stops: (day.stops || []).length, photos,
+                                        prose_slots: Object.keys(prose.prose || {}).length }) + "\n");
+}
+
+function cmdAssemble(date, prosePath) {
+  if (!prosePath) die("assemble: --prose <path> required");
+  const skelPath = path.join(TMP, `ds-skeleton-${date}.html`);
+  if (!fs.existsSync(skelPath)) die(`assemble: no skeleton — run \`prep\` then \`render\` first (${skelPath})`);
+  const skeleton = fs.readFileSync(skelPath, "utf8");
+  let prose;
+  try { prose = JSON.parse(fs.readFileSync(prosePath, "utf8")); }
+  catch (e) { die(`assemble: bad prose JSON: ${e.message}`); }
+  const html = assemble(skeleton, prose);
+  const outPath = path.join(TMP, `daily-summary-${date}.html`);
+  fs.writeFileSync(outPath, html);
+  process.stdout.write(outPath + "\n");
+}
+
+// Haversine in meters (mirrors location-confirm's write-back distance gate).
+function haversineM(lat1, lon1, lat2, lon2) {
+  const R = 6371000, rad = d => d * Math.PI / 180;
+  const dlat = rad(lat2 - lat1), dlon = rad(lon2 - lon1);
+  const a = Math.sin(dlat / 2) ** 2 + Math.cos(rad(lat1)) * Math.cos(rad(lat2)) * Math.sin(dlon / 2) ** 2;
+  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+}
+
+// Write a confirmed venue name back to location_history so the PERMANENT record
+// self-corrects: future resolve-day runs pick it
+// up at user_confirmed weight, and weekly/monthly rollups + episode recall all
+// see the truth instead of re-deriving the wrong guess. Mirrors the patch
+// pattern in bin/location-confirm (_patch_location_history): match the
+// day's visit rows by time window + <=300m centroid, set place_name +
+// place_type='user-confirmed'. Idempotent. READ/WRITE scoped to location_history.
+//   daily-summary-build confirm-venue <date> <stop_id> "<name>" --source chat|txn|vision [--resolved <path>]
+async function cmdConfirmVenue(date, stopId, name, source, resolvedOverride) {
+  if (!stopId || !name) die("confirm-venue: <stop_id> and <name> required");
+  const resolved = loadResolved(date, resolvedOverride);
+  const stop = (resolved.stops || []).find(s => s.id === stopId);
+  if (!stop) die(`confirm-venue: stop ${stopId} not found in resolved day ${date}`);
+  if (stop.lat == null || stop.lon == null) die(`confirm-venue: stop ${stopId} has no centroid`);
+  // ± a 30-min window around the stop covers the visit row whose arrived_at lags
+  // the first GPS sample slightly.
+  const startIso = new Date(stop.start_ts_ms - 30 * 60000).toISOString();
+  const endIso = new Date(stop.end_ts_ms + 30 * 60000).toISOString();
+  const q = `/rest/v1/location_history?select=id,latitude,longitude,arrived_at,place_name,place_type`
+    + `&segment_type=eq.visit`
+    + `&arrived_at=gte.${encodeURIComponent(startIso)}&arrived_at=lte.${encodeURIComponent(endIso)}`;
+  const rows = await request(q);
+  const matches = (Array.isArray(rows) ? rows : []).filter(r =>
+    r.latitude != null && r.longitude != null &&
+    haversineM(stop.lat, stop.lon, r.latitude, r.longitude) <= 300);
+  if (!matches.length) {
+    process.stderr.write(`[confirm-venue] no location_history visit row within window+300m for ${stopId} — nothing written\n`);
+    process.stdout.write(JSON.stringify({ updated: 0, stop_id: stopId, name }) + "\n");
+    return;
+  }
+  let updated = 0;
+  for (const r of matches) {
+    await request(`/rest/v1/location_history?id=eq.${encodeURIComponent(r.id)}`, {
+      method: "PATCH",
+      body: { place_name: name, place_type: "user-confirmed" },
+      prefer: "return=minimal",
+    });
+    updated += 1;
+  }
+  process.stderr.write(`[confirm-venue] ${stopId} -> "${name}" (source=${source || "agent"}): patched ${updated} row(s)\n`);
+  process.stdout.write(JSON.stringify({ updated, stop_id: stopId, name, source: source || "agent" }) + "\n");
+}
+
+// counts — fill a past day's commit / message counts onto its row (the days
+// before `publish` started writing them, 2026-10-19). Git and chat only: it does
+// not re-read mail or notes. Writes only a column that is still 0, so a count a
+// later render stamped is never replaced. Dry run unless --apply.
+//
+//   daily-summary-build counts <date> [--apply]
+async function cmdCounts(date, apply) {
+  const rows = await request(`/rest/v1/daily_summaries?date=eq.${date}&select=date,day_json,commits_count,messages_count`);
+  const row = Array.isArray(rows) ? rows[0] : null;
+  if (!row) return process.stdout.write(JSON.stringify({ date, skipped: "no row" }) + "\n");
+  const tz = boundaryTzOf(row.day_json);
+  const chatRows = await fetchChatMessages(date, tz);
+  const h = harvestDay({ date, chatRows, stops: [], tz, sources: { sentMail: () => [], notes: () => [], messages: () => ({ facts: [], counts: {}, errors: {} }) } });
+  const cols = countColumns({ ...h, errors: { ...h.errors, sent_mail: "not read" } }, date);
+  const patch = {};
+  if ("commits_count" in cols && !row.commits_count) patch.commits_count = cols.commits_count;
+  if ("messages_count" in cols && !row.messages_count) patch.messages_count = cols.messages_count;
+  if (apply && Object.keys(patch).length) {
+    await request(`/rest/v1/daily_summaries?date=eq.${date}`, { method: "PATCH", body: patch, prefer: "return=minimal" });
+  }
+  process.stdout.write(JSON.stringify({ date, tz, found: cols, patch, applied: !!(apply && Object.keys(patch).length) }) + "\n");
+}
+
+function main() {
+  const [cmd, date, ...rest] = process.argv.slice(2);
+  if (!cmd || !date || !/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+    die("usage: daily-summary-build <prep|render|assemble|publish|counts|confirm-venue> <YYYY-MM-DD> [...]");
+  }
+  const flag = n => { const i = rest.indexOf(n); return i >= 0 ? rest[i + 1] : null; };
+  if (cmd === "prep") return cmdPrep(date, flag("--resolved"), flag("--confirmed"), rest.includes("--fresh-harvest"));
+  if (cmd === "render") return cmdRender(date);
+  if (cmd === "publish") return cmdPublish(date, flag("--prose"), rest.includes("--force"));
+  if (cmd === "assemble") return cmdAssemble(date, flag("--prose"));
+  if (cmd === "counts") return cmdCounts(date, rest.includes("--apply"));
+  if (cmd === "confirm-venue") {
+    // positional: <date> <stop_id> <name>  (name may be unquoted multi-word until a --flag)
+    const flagIdx = rest.findIndex(a => a.startsWith("--"));
+    const positional = flagIdx >= 0 ? rest.slice(0, flagIdx) : rest;
+    const stopId = positional[0];
+    const name = positional.slice(1).join(" ");
+    return cmdConfirmVenue(date, stopId, name, flag("--source"), flag("--resolved"));
+  }
+  die(`unknown command: ${cmd}`);
+}
+
+Promise.resolve().then(main).catch((e) => die((e && e.stack) || String(e)));

@@ -39,7 +39,7 @@
 //      (Moon/Green/Kushlev 2025). Fails OPEN — a down embedder disables the gate,
 //      never blocks. See lib/hum-novelty.mjs.
 //  10  refused: retrospective-ask daily cap — this is a "were you at X?" style
-//      confirmation question and HUM_LOCATION_ASK_CAP (default 3) of them have
+//      confirmation question and HUM_LOCATION_ASK_CAP (unset since 2026-10-29: no cap) of them have
 //      already shipped today. No send, no row; the stop stays queued in
 //      location-ask-queue (pending row stays asked:false) and surfaces in the
 //      next morning's daily-summary "Corrections & follow-ups" block via
@@ -90,7 +90,7 @@ import {
   dedupBypassable,
 } from "../lib/hum-vetoes.mjs";
 import { checkPingBudget, isLocalHistoryRow } from "../lib/ping-budget.mjs";
-import { checkQuestionBudget, recordQuestionSend, currentScale } from "../lib/question-pacing.mjs";
+import { recordQuestionSend, currentScale } from "../lib/question-pacing.mjs";
 import { alreadyTold, deliveryVerdict, latestFix, recordTold, rememberPending, PROXIMITY_M } from "../lib/local-history-ledger.mjs";
 import { readSidecar } from "../lib/hum-resolve-first.mjs";
 import { optionalBin } from "../lib/ext-hooks.mjs";
@@ -293,7 +293,12 @@ if (findings && findings.length > 0) {
 //     ("One message per run") is exactly what produced 46 asks in a week — a
 //     per-run limit with no per-day limit is not a limit.
 // ---------------------------------------------------------------------------
-// The ask cap scales with the question backlog (lib/question-pacing.mjs).
+//     RETIRED 2026-10-29 for location asks. The user: "Location questions are
+//     always urgent - I should receive those as soon as they're conceived." A
+//     location ask is no longer capped, budgeted or spaced; it goes the moment
+//     it wins (and the ranker always ships it, jobs/hum.md rule 3a).
+//     HUM_LOCATION_ASK_CAP is kept only as an explicit opt-back-in: set it in
+//     the environment to restore a daily cap (askCap() is 0 without it).
 const ASK_CAP = askCap() * currentScale();
 const headlineIsRetrospectiveAsk = Boolean(findings && findings[0] && isRetrospectiveAsk(findings[0]));
 if (headlineIsRetrospectiveAsk && ASK_CAP > 0) {
@@ -315,8 +320,9 @@ if (headlineIsRetrospectiveAsk && ASK_CAP > 0) {
   let budget = { ok: true };
   try {
     // A location ask is a question: it draws on the question pool, not the shared one.
+    // A location ask is always urgent (2026-10-29): no budget holds it.
     budget = headlineIsRetrospectiveAsk
-      ? (budgetBypass ? { ok: true } : checkQuestionBudget())
+      ? { ok: true }
       : checkPingBudget({ bypass: budgetBypass, feedbackPath: FEEDBACK_PATH, pool: isLocalHistoryPing ? "local_history" : "shared" });
   }
   catch (e) { console.error(`hum-ping: ping-budget check failed (${e.message}) — failing open`); }

@@ -1,0 +1,311 @@
+#!/usr/bin/env node
+// call-log — log every call the user hosts on Zoom: who, when, what was said,
+// next steps for the user and for the others (lib/call-log.mjs).
+//
+//   call-log pending [--days N]        code only (Zoom's list of the user's room(s) +
+//       the Zoom summary emails): exit 0 when a call waits to be logged, 3 when
+//       none (or Zoom has no room to read), 1 when Zoom or Gmail could not be read.
+//       Run from cron by trigger-call-log.sh, which kicks the launchd agent only on exit 0.
+//   call-log sync [--days N] [--dry-run] [--quiet]
+//       logs every waiting call: a model (tool-less Sonnet, then Opus; the Max
+//       login, so launchd or daily-summary prep, never cron) writes the log in
+//       English and names the wiki person page of each participant from the
+//       pages offered; code stores it in data/call-log.json and rewrites
+//       the marked "Calls" block on each matched person page, and on the day
+//       page when that day's summary already ran. --dry-run reads and prints,
+//       writes nothing.
+//   call-log list [--days N] [--json]  the log, newest first
+//   call-log show <uuid|YYYY-MM-DD> [--json]
+//
+// Read-only on Zoom and Gmail. Messages no one. Calls of a recurring meeting are
+// left to that meeting's flow (bin/meeting-notes-from-zoom): recorded as
+// "recurring", nothing more. Playbook: agent/ops-agent/jobs/call-log.md.
+
+import fs from "node:fs";
+import path from "node:path";
+import { execFileSync } from "node:child_process";
+import { createRequire } from "node:module";
+import { fileURLToPath } from "node:url";
+import { loadCredentials, createZoomClient } from "../lib/zoom-client.mjs";
+import { callContent } from "../lib/zoom-content.mjs";
+import { meetings } from "../lib/meetings.mjs";
+import { runHook } from "../lib/ext-hooks.mjs";
+import * as CL from "../lib/call-log.mjs";
+
+const require = createRequire(import.meta.url);
+const { instance } = require("../lib/instance.cjs");
+const LIB = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "lib");
+const GOG = process.env.GOG_BIN || (fs.existsSync("/opt/homebrew/bin/gog") ? "/opt/homebrew/bin/gog" : "gog");
+const ACCOUNT = process.env.JORI_CAL_ACCOUNT || instance().owner_email;
+const LOCK = `${CL.STORE}.lock`;
+
+const argv = process.argv.slice(2);
+const cmd = argv[0];
+const flag = (n, d = null) => { const i = argv.indexOf(n); return i >= 0 ? argv[i + 1] : d; };
+const has = (n) => argv.includes(n);
+const QUIET = has("--quiet");
+const DRY = has("--dry-run");
+const DAYS = Math.max(1, Math.min(30, Number(flag("--days", CL.LOOKBACK_DAYS)) || CL.LOOKBACK_DAYS));
+const say = (s) => { if (!QUIET || s.startsWith("ERROR")) process.stdout.write(`${new Date().toISOString()} ${s}\n`); };
+
+function usage(code = 2) {
+  process.stderr.write("usage: call-log pending|sync|list|show [<uuid|date>] [--days N] [--dry-run] [--quiet] [--json]\n");
+  process.exit(code);
+}
+
+const ymdUtc = (ms) => new Date(ms).toISOString().slice(0, 10);
+
+/** Zoom summary emails of the window → [{id, uuids}]. One gog search, one get per new email. */
+function summaryEmails(store, days) {
+  const q = `from:no-reply@zoom.us subject:"Meeting assets" newer_than:${days + 1}d`;
+  const out = JSON.parse(execFileSync(GOG, ["gmail", "search", q, "--account", ACCOUNT, "--max", "25", "--json"],
+    { encoding: "utf8", timeout: 60_000, maxBuffer: 8 * 1024 * 1024 }));
+  const seen = store.emails || {};
+  const rows = [];
+  for (const t of out.threads || []) {
+    if (!t || !t.id) continue;
+    if (seen[t.id]) { rows.push({ id: t.id, uuids: seen[t.id] }); continue; }
+    try {
+      const m = JSON.parse(execFileSync(GOG, ["gmail", "get", t.id, "--account", ACCOUNT, "--json"],
+        { encoding: "utf8", timeout: 60_000, maxBuffer: 16 * 1024 * 1024 }));
+      rows.push({ id: t.id, uuids: CL.meetingUuidsFromEmail(m.body), fresh: true });
+    } catch (e) { say(`email ${t.id} could not be read: ${String(e.message || e).split("\n")[0].slice(0, 120)}`); }
+  }
+  return rows;
+}
+
+/** Every meeting the window holds: the rooms' ended instances, plus any a summary email points at. */
+async function discover(client, store, days, now = Date.now()) {
+  const since = now - days * 86400_000;
+  const found = new Map();
+  for (const room of CL.rooms()) {
+    const list = await client.pastInstances(room, { from: ymdUtc(since), to: ymdUtc(now + 86400_000) });
+    for (const m of list) if (Date.parse(m.start_time) >= since) found.set(m.uuid, { uuid: m.uuid, email_id: null, room: true });
+  }
+  let emails = [];
+  try { emails = summaryEmails(store, days); } catch (e) { say(`Zoom summary emails not read (${String(e.message || e).split("\n")[0].slice(0, 120)}); the rooms' list stands`); }
+  for (const e of emails) for (const u of e.uuids) {
+    const f = found.get(u) || { uuid: u, email_id: null };
+    f.email_id = f.email_id || e.id;
+    found.set(u, f);
+  }
+  return { meetings: [...found.values()], emails };
+}
+
+const isOpen = (e) => !e || e.status === "waiting";
+
+function withLock(fn) {
+  try {
+    const st = fs.statSync(LOCK);
+    if (Date.now() - st.mtimeMs < 30 * 60_000) { say("another call-log sync is running; nothing to do"); return null; }
+    fs.rmSync(LOCK, { force: true });
+  } catch {}
+  try { fs.writeFileSync(LOCK, String(process.pid), { flag: "wx" }); } catch { say("another call-log sync is running; nothing to do"); return null; }
+  return Promise.resolve().then(fn).finally(() => fs.rmSync(LOCK, { force: true }));
+}
+
+/** Candidate person pages for the guests: the wiki's own search on each name, person pages only. */
+function personCandidates(guests) {
+  const ws = require("../lib/wiki-store.js");
+  const out = new Map();
+  try {
+    for (const g of guests) {
+      for (const q of [g.name, ...String(g.name).split(" ").filter((w) => w.length > 2)]) {
+        for (const r of ws.searchPages(q, { limit: 8, type: "user" })) {
+          if (out.has(r.id) || out.size >= 12) continue;
+          const p = ws.getPage(r.id);
+          let fm = {};
+          try { fm = JSON.parse(p.frontmatter_json || "{}"); } catch {}
+          if (fm.entity === "person") out.set(r.id, { id: r.id, title: p.title, description: p.description || "" });
+        }
+      }
+    }
+  } finally { ws.closeDb(); }
+  return [...out.values()];
+}
+
+async function readLog(prompt, ctx) {
+  const { runToollessDetailed, parseModelJson } = await import("../lib/jev-claude.mjs");
+  const { MODELS } = require("../lib/models.cjs");
+  const tried = [];
+  let answered = false;
+  // No local rung: the job is translating and summarizing, and a fluent but wrong English
+  // log from a 1B local model would pass any schema check (as meeting-call-reading).
+  for (const [tier, model] of [["sonnet", MODELS.sonnet], ["opus", MODELS.opus]]) {
+    const { out, error } = await runToollessDetailed({ model, prompt, timeoutMs: 240_000, effort: "medium" });
+    if (error) { tried.push(`${tier}: ${error.kind}`); continue; }
+    answered = true;
+    let parsed = null;
+    try { parsed = parseModelJson(out); } catch {}
+    const bad = CL.validateLog(parsed, ctx);
+    if (!bad) return { tier, log: CL.cleanLog(parsed, ctx.rec) };
+    tried.push(`${tier}: ${bad}`);
+  }
+  // `transient`: no model answered at all (Max signed out, usage limit, timeout). Not the call's fault,
+  // so it is not counted against it.
+  throw Object.assign(new Error(`no tier gave a usable log (${tried.join("; ")})`), { transient: !answered });
+}
+
+/** Rewrite the marked Calls block on every page these entries touch. */
+function writeWiki(store, entries) {
+  const ws = require("../lib/wiki-store.js");
+  const done = [];
+  try {
+    const pages = new Set(entries.flatMap((e) => (e.log ? e.log.people : []).map((p) => p.wiki_id).filter(Boolean)));
+    for (const id of pages) {
+      const row = ws.getPage(id);
+      if (!row) continue;
+      const next = CL.withBlock(row.raw_md, CL.callsForPage(store, id).map((e) => CL.personLine(e, id)));
+      if (next !== row.raw_md) { ws.savePage(id, next, { editedBy: "call-log" }); done.push(id); }
+    }
+    // The day page, only when that day's summary already ran (a later summary prints the call itself).
+    for (const date of new Set(entries.filter((e) => e.day_block).map((e) => e.local_date))) {
+      const id = `day_${date}`;
+      const row = ws.getPage(id);
+      if (!row) continue;
+      const lines = Object.values(store.calls).filter((e) => e.status === "logged" && e.day_block && e.local_date === date)
+        .sort((a, b) => Date.parse(a.start) - Date.parse(b.start)).map(CL.dayLine);
+      const next = CL.withBlock(row.raw_md, lines);
+      if (next !== row.raw_md) { ws.savePage(id, next, { editedBy: "call-log" }); done.push(id); }
+    }
+  } finally { ws.closeDb(); }
+  return done;
+}
+
+function dayPageExists(date) {
+  const ws = require("../lib/wiki-store.js");
+  try { return !!ws.getPage(`day_${date}`); } finally { ws.closeDb(); }
+}
+
+function client() {
+  const creds = loadCredentials();
+  if (!creds.cfg) throw new Error(creds.problem ? `Zoom keys refused: ${creds.problem}` : "Zoom is not set up (secrets/zoom-s2s.json)");
+  return createZoomClient({ cfg: creds.cfg });
+}
+
+async function cmdPending() {
+  if (!CL.rooms().length) { say("no Zoom room configured (call-log rooms, or a recurring meeting's zoom.room_id); nothing to log"); process.exit(3); }
+  const store = CL.readStore();
+  const { meetings } = await discover(client(), store, DAYS);
+  const open = meetings.filter((m) => isOpen(store.calls[m.uuid]));
+  say(open.length ? `${open.length} call(s) wait to be logged` : "no call waits to be logged");
+  process.exit(open.length ? 0 : 3);
+}
+
+async function cmdSync() {
+  if (!CL.rooms().length) { say("no Zoom room configured (call-log rooms, or a recurring meeting's zoom.room_id); nothing to log"); return; }
+  // The day's zone: the installation's hook (its travel timeline) when it has one, else the home zone.
+  const home = instance().tz;
+  const tzFor = async (date) => (await runHook(LIB, "meeting-tz", "tzForDate", [date], null)) || home;
+  const z = client();
+  const store = CL.readStore();
+  const now = Date.now();
+  const { meetings, emails } = await discover(z, store, DAYS, now);
+  store.emails = store.emails || {};
+  for (const e of emails) store.emails[e.id] = e.uuids;
+  const logged = [];
+  for (const m of meetings) {
+    const prev = store.calls[m.uuid];
+    if (!isOpen(prev)) continue;
+    let rec;
+    try {
+      const meeting = await z.pastMeeting(m.uuid);
+      if (!meeting || !meeting.end_time) continue;
+      rec = CL.callRecord(meeting, await z.pastParticipants(m.uuid));
+    } catch (e) {
+      say(`meeting ${m.uuid} could not be read: ${e.message}`);
+      // Zoom says this app cannot see a meeting only an email named (not in a room's list): settled,
+      // never asked again. A meeting of the user's own room is never given up on this way.
+      if (["not_found", "forbidden"].includes(e.kind) && m.email_id && !m.room) {
+        store.calls[m.uuid] = { uuid: m.uuid, email_id: m.email_id, status: "unreadable", why: e.message, first_seen: new Date(now).toISOString() };
+      }
+      continue;
+    }
+    const tz = await tzFor(CL.ymdIn(rec.start, home));
+    const base = { ...rec, email_id: m.email_id || (prev && prev.email_id) || null, tz, local_date: CL.ymdIn(rec.start, tz),
+      first_seen: (prev && prev.first_seen) || new Date(now).toISOString(), updated: new Date(now).toISOString() };
+    if (rec.recurring) {
+      const rm = meetings().find((x) => x.id === rec.recurring);
+      store.calls[m.uuid] = { ...base, status: "recurring" };
+      say(`${base.local_date} ${CL.clockIn(rec.start, tz)}: the call with ${rm ? rm.name : rec.recurring}, left to its meeting notes`);
+      continue;
+    }
+    // Nobody but the user: settled only an hour after the end (Zoom's participant list can lag the meeting).
+    if (!rec.guests.length) { if (now - Date.parse(rec.end) > 3600_000) store.calls[m.uuid] = { ...base, status: "solo" }; continue; }
+    const who = CL.whoText(rec.guests.map((g) => g.name));
+    // Past this age a call that still cannot be read is logged with who and when only, so it is never missing.
+    const late = now - Date.parse(rec.end) > CL.GIVE_UP_MS;
+    const wait = (why, extra = {}) => {
+      store.calls[m.uuid] = { ...base, status: "waiting", attempts: (prev && prev.attempts) || 0, ...extra };
+      say(`${base.local_date} call with ${who}: ${why}`);
+    };
+    let content = null, readFailed = false;
+    try { content = await callContent(z, [m.uuid], { order: ["summary", "transcript"] }); } catch (e) { readFailed = true; say(`content of ${m.uuid} not read: ${e.message}`); }
+    if (!content && readFailed && !late) { wait("Zoom could not be read; trying again next tick"); continue; }
+    if (!content && now - Date.parse(rec.end) < CL.SUMMARY_WAIT_MS) { wait("waiting for Zoom's summary"); continue; }
+    const candidates = personCandidates(rec.guests);
+    const ctx = { rec, candidates, hasContent: !!content };
+    let got = null;
+    try {
+      got = await readLog(CL.logPrompt(rec, content, candidates, tz), ctx);
+    } catch (e) {
+      const attempts = ((prev && prev.attempts) || 0) + (e.transient ? 0 : 1);
+      say(`ERROR ${base.local_date} call with ${who}: ${e.message} (${e.transient ? "no model answered" : `attempt ${attempts}`})`);
+      if (attempts < CL.MAX_ATTEMPTS && !late) { store.calls[m.uuid] = { ...base, status: "waiting", attempts, error: String(e.message).slice(0, 300) }; continue; }
+      got = { tier: null, log: null }; // logged with who and when only, so the call is never missing
+    }
+    const entry = { ...base, status: "logged", source: content ? content.kind : null, read_by: got.tier, log: got.log,
+      ai_generated: !!content, day_block: dayPageExists(base.local_date), logged_at: new Date().toISOString() };
+    store.calls[m.uuid] = entry;
+    logged.push(entry);
+    say(`${DRY ? "would log" : "logged"} ${base.local_date} ${CL.clockIn(rec.start, tz)} call with ${who} (${content ? content.kind : "no summary"}, ${got.tier || "no model"})`);
+    if (DRY) process.stdout.write(`${JSON.stringify(entry, null, 1)}\n`);
+  }
+  store.synced_at = new Date(now).toISOString();
+  if (DRY) { say("dry run: nothing written"); return; }
+  CL.writeStore(store);
+  if (logged.length) say(`wiki pages updated: ${writeWiki(store, logged).join(", ") || "none"}`);
+}
+
+function entriesFor(store, days) {
+  const since = Date.now() - days * 86400_000;
+  return Object.values(store.calls).filter((e) => e.status === "logged" && Date.parse(e.start) >= since)
+    .sort((a, b) => Date.parse(b.start) - Date.parse(a.start));
+}
+
+function printEntry(e) {
+  const who = CL.whoText(((e.log && e.log.people) || e.guests.map((g) => ({ name: g.name }))).map((p) => p.name));
+  process.stdout.write(`${e.local_date} ${CL.clockIn(e.start, e.tz)}-${CL.clockIn(e.end, e.tz)} (${e.tz}) · ${who} · ${e.minutes} min\n`);
+  if (!e.log || !e.log.summary) { process.stdout.write("  no Zoom summary\n\n"); return; }
+  process.stdout.write(`  ${e.log.title}\n  ${e.log.summary}\n`);
+  for (const s of e.log[CL.selfStepsKey()] || []) process.stdout.write(`  ${instance().owner_name}: ${s}\n`);
+  for (const o of e.log.next_steps_others) process.stdout.write(`  ${o.who}: ${o.step}\n`);
+  process.stdout.write(`  (${CL.noteOf(e)})\n\n`);
+}
+
+async function main() {
+  require("../lib/load-env.js").loadEnv();
+  if (cmd === "pending") return cmdPending();
+  if (cmd === "sync") return withLock(cmdSync);
+  const store = CL.readStore();
+  if (cmd === "list") {
+    const rows = entriesFor(store, Number(flag("--days", 30)) || 30);
+    if (has("--json")) { process.stdout.write(JSON.stringify(rows, null, 1) + "\n"); return; }
+    if (!rows.length) process.stdout.write("no calls logged in that window\n");
+    rows.forEach(printEntry);
+    return;
+  }
+  if (cmd === "show") {
+    const key = argv[1];
+    if (!key) usage();
+    const rows = Object.values(store.calls).filter((e) => e.uuid === key || e.local_date === key);
+    if (has("--json")) { process.stdout.write(JSON.stringify(rows, null, 1) + "\n"); return; }
+    if (!rows.length) process.stdout.write(`nothing logged for ${key}\n`);
+    rows.filter((e) => e.status === "logged").forEach(printEntry);
+    for (const e of rows.filter((x) => x.status !== "logged")) process.stdout.write(`${e.local_date || "?"} ${e.uuid}: ${e.status}\n`);
+    return;
+  }
+  usage();
+}
+
+main().catch((e) => { process.stderr.write(`call-log: ${(e && e.message) || e}\n`); process.exit(1); });

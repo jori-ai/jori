@@ -1,0 +1,192 @@
+#!/usr/bin/env node
+// zestimate — read Zillow's Zestimate for each parcel and record it as an
+// independent valuation source, via the host's own Chrome.
+//
+// WHY A BROWSER. Zillow shut its public API in 2021 and Bridge Interactive is
+// MLS-only, so there is no key to buy. Reading the page in the browser the
+// user already runs is the remaining route. Worth being straight about:
+// automated access is contrary to Zillow's terms of use. This runs at a few
+// pages a month against the user's own properties from their own machine,
+// which is the scale that makes it defensible; it is not a licence to crawl.
+//
+// WHY IT MATTERS. RentCast has valued a house at well under half its
+// Zestimate with a confidence interval wider than its own estimate, where
+// Zillow had dozens of photos and a correct property record behind it. In
+// thin-transaction neighbourhoods Zillow simply has more
+// data, and those are exactly the parcels where the AVM gave up — so this is
+// not a redundant second opinion, it is the one that covers the gap.
+//
+// The number is written to the per-source valuation table as source='zillow' and then
+// competes on equal footing inside `property-values --reconcile`. This tool
+// never decides the portfolio total itself.
+//
+// Usage:
+//   zestimate                    read every owned parcel
+//   zestimate --all              include not-yet-closed parcels
+//   zestimate --only <id,...>    just these parcel ids
+//   zestimate --dry-run          fetch + print, write nothing
+//   zestimate --json             machine-readable summary
+
+import fs from "node:fs";
+import path from "node:path";
+import { createRequire } from "node:module";
+import { connect } from "../lib/cdp.mjs";
+import supa from "../lib/supabase-rest.js";
+const { request } = supa;
+
+const require = createRequire(import.meta.url);
+const { localConfig, instance } = require("../lib/instance.cjs");
+const { installTools } = require("../lib/root.cjs");
+// The same registry bin/property-values values (agent/local/config/property-values.json).
+const CFG = localConfig("property-values", { registry: "data/properties.json" });
+const REGISTRY = path.resolve(installTools(), CFG.registry);
+
+const ARGV = process.argv.slice(2);
+const FLAGS = new Set(ARGV.filter((a) => a.startsWith("--")));
+const flagVal = (n, d) => { const i = ARGV.indexOf(`--${n}`); return i >= 0 && ARGV[i + 1] ? ARGV[i + 1] : d; };
+const DRY_RUN = FLAGS.has("--dry-run");
+const JSON_OUT = FLAGS.has("--json");
+const INCLUDE_UNOWNED = FLAGS.has("--all");
+const ONLY = (flagVal("only", "") || "").split(",").map((s) => s.trim()).filter(Boolean);
+
+// Human-scale pacing between pages. Not politeness theatre — a burst of eight
+// rapid loads is the signature that gets a browser challenged, and a challenged
+// browser costs far more than the 6 seconds saved.
+const DELAY_MS = Number(flagVal("delay", "6000"));
+
+const log = (...a) => { if (!JSON_OUT) console.log(...a); };
+const usd = (n) => (n == null ? "—" : `$${Math.round(n).toLocaleString("en-US")}`);
+const etDate = (d = new Date()) =>
+  new Intl.DateTimeFormat("en-CA", { timeZone: instance().tz, year: "numeric", month: "2-digit", day: "2-digit" }).format(d);
+
+/** Zillow's search URL redirects to the canonical /homedetails/ page. */
+function zillowUrl(address) {
+  return `https://www.zillow.com/homes/${encodeURIComponent(address.replace(/,/g, "").replace(/\s+/g, "-"))}_rb/`; // lang-regex-ok: building a URL slug from a postal address, not interpreting language
+}
+
+// Extraction runs INSIDE the page. Structured data first — Zillow ships a
+// __NEXT_DATA__ blob — and the rendered text only as a fallback, because the
+// visible label is the thing most likely to be reworded in a redesign.
+// Both targets are machine-generated markup, not prose, so pattern-matching
+// here is not the Rule #0b case.
+const EXTRACT_JS = `(() => {
+  const out = { zestimate: null, rent: null, address: null, source: null, url: location.href };
+  try {
+    const el = document.getElementById("__NEXT_DATA__");
+    if (el) {
+      const walk = (o, depth = 0) => {
+        if (!o || depth > 8 || typeof o !== "object") return;
+        if (out.zestimate == null && typeof o.zestimate === "number" && o.zestimate > 1000) out.zestimate = o.zestimate;
+        if (out.rent == null && typeof o.rentZestimate === "number" && o.rentZestimate > 50) out.rent = o.rentZestimate;
+        if (out.address == null && typeof o.streetAddress === "string") out.address = o.streetAddress;
+        for (const k of Object.keys(o)) walk(o[k], depth + 1);
+      };
+      walk(JSON.parse(el.textContent));
+      if (out.zestimate != null) out.source = "next_data";
+    }
+  } catch (e) { /* fall through to text */ }
+  if (out.zestimate == null) {
+    const txt = document.body.innerText || "";
+    const z = txt.match(/\\$([\\d,]+)\\s*Zestimate/i);          // lang-regex-ok: reading a rendered numeric label
+    if (z) out.zestimate = Number(z[1].replace(/,/g, ""));
+    const r = txt.match(/\\$([\\d,]+)\\s*(?:\\/mo\\s*)?Estimated rent/i); // lang-regex-ok: same
+    if (r) out.rent = Number(r[1].replace(/,/g, ""));
+    if (out.zestimate != null) out.source = "rendered_text";
+  }
+  out.blocked = /press and hold|are you a human|unusual traffic/i.test(document.body.innerText || ""); // lang-regex-ok: detecting a bot-challenge interstitial
+  return JSON.stringify(out);
+})()`;
+
+async function main() {
+  let registry;
+  try { registry = JSON.parse(fs.readFileSync(REGISTRY, "utf8")); } catch (e) {
+    if (e.code !== "ENOENT") throw e;
+    // No registry = the capability is off, not broken.
+    log(`zestimate: no property registry at ${REGISTRY} — nothing to read (set \`registry\` in agent/local/config/property-values.json).`);
+    return;
+  }
+  let parcels = (registry.parcels || []).filter((p) => INCLUDE_UNOWNED || p.owned);
+  if (ONLY.length) parcels = parcels.filter((p) => ONLY.includes(p.id));
+  if (!parcels.length) { log("No parcels selected."); return; }
+
+  let page;
+  try {
+    page = await connect();
+  } catch (e) {
+    console.error(`zestimate: cannot reach Chrome on CDP — ${e.message}`);
+    console.error("Chrome must be running with --remote-debugging-port=9222 (chrome-cdp-watch keeps it up).");
+    process.exit(1);
+  }
+
+  const now = new Date();
+  const asOfDate = etDate(now);
+  const rows = [];
+  const results = [];
+  let blocked = 0;
+
+  for (const p of parcels) {
+    let data = null;
+    try {
+      await page.goto(zillowUrl(p.address));
+      data = JSON.parse(await page.evaluate(EXTRACT_JS));
+    } catch (e) {
+      log(`  ${p.address}: page read failed — ${e.message.slice(0, 100)}`);
+      results.push({ parcel: p.id, error: e.message });
+      continue;
+    }
+
+    if (data.blocked) {
+      // Stop rather than grind: once challenged, every further load is both
+      // useless and more likely to harden the block.
+      blocked++;
+      log(`  ${p.address}: bot challenge shown — stopping.`);
+      results.push({ parcel: p.id, blocked: true });
+      break;
+    }
+    if (!data.zestimate) {
+      log(`  ${p.address}: no Zestimate on the page (Zillow does not always publish one).`);
+      results.push({ parcel: p.id, zestimate: null });
+      continue;
+    }
+
+    results.push({ parcel: p.id, zestimate: data.zestimate, rent: data.rent, via: data.source });
+    rows.push({
+      as_of_date: asOfDate,
+      parcel_id: p.id,
+      source: "zillow",
+      estimate: data.zestimate,
+      estimate_low: null,
+      estimate_high: null,
+      low_confidence: false,
+      note: `Zestimate via ${data.source}${data.rent ? `; rent est ${usd(data.rent)}/mo` : ""}`,
+      as_of: now.toISOString(),
+      updated_at: now.toISOString(),
+    });
+    log(`  ${p.address}\n      Zestimate ${usd(data.zestimate)}${data.rent ? `  · rent ~${usd(data.rent)}/mo` : ""}  [${data.source}]`);
+    if (p !== parcels[parcels.length - 1]) await new Promise((r) => setTimeout(r, DELAY_MS));
+  }
+
+  page.close();
+
+  if (rows.length && !DRY_RUN) {
+    await request("/rest/v1/property_value_sources?on_conflict=as_of_date,parcel_id,source", {
+      method: "POST",
+      body: rows,
+      prefer: "resolution=merge-duplicates,return=minimal",
+    });
+  }
+
+  const summary = { as_of_date: asOfDate, read: rows.length, attempted: parcels.length, blocked, results, dry_run: DRY_RUN };
+  if (JSON_OUT) console.log(JSON.stringify(summary, null, 2));
+  else {
+    log(`  ──`);
+    log(`  ${rows.length}/${parcels.length} Zestimate(s) recorded${DRY_RUN ? " (dry-run — nothing written)" : ""}.`);
+    if (blocked) log(`  ⚠ stopped early on a bot challenge — re-run later, don't hammer it.`);
+    if (rows.length && !DRY_RUN) log(`  Now run: property-values --reconcile`);
+  }
+}
+
+main().catch((e) => {
+  console.error(`zestimate: ${e && e.message ? e.message : e}`);
+  process.exit(1);
+});

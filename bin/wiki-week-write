@@ -1,0 +1,188 @@
+#!/usr/bin/env node
+// wiki-week-write — ingest one weekly_summaries row into the wiki as a
+// `type: week` page. Same single-mechanism model as wiki-day-write: the
+// `pages` table is the source of truth; daily/weekly/monthly are just
+// different `type` values. After save, runs link-audit in-process.
+//
+// Wiki page id: `week_YYYY-MM-DD` (the Monday of the ISO week).
+//
+// Usage:
+//   wiki-week-write <YYYY-MM-DD>          # any date in the week — derives Monday
+//   wiki-week-write last-week             # last Monday-ending week
+//   wiki-week-write --backfill            # every weekly_summaries row
+//   wiki-week-write --backfill --refresh  # rewrite even unchanged pages
+//
+// Idempotent.
+
+"use strict";
+
+const wiki = require("../lib/wiki-store.js");
+const linker = require("../lib/wiki-linker.js");
+const { htmlToMarkdown } = require("../lib/episode-html-to-md.js");
+const { request } = require("../lib/supabase-rest.js");
+
+const args = process.argv.slice(2);
+const BACKFILL = args.includes("--backfill");
+const REFRESH = args.includes("--refresh");
+
+function die(msg, code = 1) {
+  console.error(`wiki-week-write: ${msg}`);
+  process.exit(code);
+}
+
+const DAY_NAMES = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
+const MONTH_NAMES = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
+
+function mondayOf(dateStr) {
+  const [y, m, d] = dateStr.split("-").map(Number);
+  const utc = new Date(Date.UTC(y, m - 1, d));
+  const dow = utc.getUTCDay();
+  const offsetToMon = dow === 0 ? -6 : 1 - dow;
+  const mon = new Date(utc.getTime() + offsetToMon * 86400000);
+  return mon.toISOString().slice(0, 10);
+}
+
+function sundayOf(mondayStr) {
+  const [y, m, d] = mondayStr.split("-").map(Number);
+  const sun = new Date(Date.UTC(y, m - 1, d + 6));
+  return sun.toISOString().slice(0, 10);
+}
+
+function prettyRange(monday) {
+  const [y, m, d] = monday.split("-").map(Number);
+  const start = new Date(Date.UTC(y, m - 1, d));
+  const end = new Date(Date.UTC(y, m - 1, d + 6));
+  const sameMonth = start.getUTCMonth() === end.getUTCMonth();
+  const startLabel = `${MONTH_NAMES[start.getUTCMonth()]} ${start.getUTCDate()}`;
+  const endLabel = sameMonth
+    ? `${end.getUTCDate()}`
+    : `${MONTH_NAMES[end.getUTCMonth()]} ${end.getUTCDate()}`;
+  return `Week of ${startLabel}–${endLabel}, ${end.getUTCFullYear()}`;
+}
+
+function resolveArg(arg) {
+  if (!arg || arg === "last-week") {
+    const now = new Date();
+    // Last Sunday's date (most recent completed week).
+    const dow = now.getUTCDay();
+    const offset = dow === 0 ? -7 : -dow;
+    const lastSun = new Date(now.getTime() + offset * 86400000);
+    return mondayOf(lastSun.toISOString().slice(0, 10));
+  }
+  if (/^\d{4}-\d{2}-\d{2}$/.test(arg)) return mondayOf(arg);
+  die(`unrecognized date "${arg}". Use YYYY-MM-DD or last-week.`);
+}
+
+function buildBody(row) {
+  const monday = row.week_start;
+  const sunday = sundayOf(monday);
+  const title = prettyRange(monday);
+  const themes = Array.isArray(row.themes) ? row.themes : [];
+  const narrativeMd = htmlToMarkdown(row.narrative || "").trim();
+  const narrativeNoH1 = narrativeMd.replace(/^#\s+.*\n+/, "").trim();
+
+  const description = themes.length
+    ? themes.slice(0, 3).join(" · ").slice(0, 100)
+    : (narrativeNoH1.split(/\.\s/)[0] || "").slice(0, 100);
+
+  const fm = [
+    "---",
+    "type: week",
+    `week_start: ${monday}`,
+    `week_end: ${sunday}`,
+    `title: ${JSON.stringify(title)}`,
+    `description: ${JSON.stringify(description)}`,
+    themes.length
+      ? `themes:\n${themes.map((t) => `  - ${JSON.stringify(t)}`).join("\n")}`
+      : "themes: []",
+    "---",
+    "",
+  ].join("\n");
+
+  const sections = [];
+  if (narrativeNoH1) sections.push(narrativeNoH1);
+
+  // Backlinks to the seven daily pages so Mon–Sun is reachable by one
+  // click. Resolved lazily by the renderer — pages that haven't been
+  // archived yet show as dangling.
+  const daySpan = [];
+  for (let i = 0; i < 7; i++) {
+    const [y, m, d] = monday.split("-").map(Number);
+    const date = new Date(Date.UTC(y, m - 1, d + i)).toISOString().slice(0, 10);
+    daySpan.push(`- [[day_${date}|${date}]]`);
+  }
+  sections.push(`## Daily pages\n\n${daySpan.join("\n")}`);
+
+  return fm + sections.join("\n\n") + "\n";
+}
+
+async function fetchWeek(monday) {
+  const rows = await request(
+    `/rest/v1/weekly_summaries?week_start=eq.${monday}&select=*`,
+  );
+  return rows?.[0] || null;
+}
+
+async function writeOne(monday) {
+  const row = await fetchWeek(monday);
+  if (!row) {
+    console.error(`wiki-week-write: no weekly_summaries row for ${monday}`);
+    return { monday, skipped: true, reason: "no-row" };
+  }
+  const body = buildBody(row);
+  const id = `week_${monday}`;
+  const result = wiki.savePage(id, body, { editedBy: "wiki-week-write" });
+  let linkAddCount = 0;
+  try {
+    const linked = linker.applySuggestions({ id, editedBy: "wiki-week-write:link-audit" });
+    linkAddCount = linked[0]?.added?.length || 0;
+  } catch (err) {
+    process.stderr.write(`wiki-week-write: link-audit ${id} failed: ${err.message}\n`);
+  }
+  const linkNote = linkAddCount ? `, +${linkAddCount} link${linkAddCount === 1 ? "" : "s"}` : "";
+  console.log(
+    `${result.isNew ? "wrote" : result.changed ? "updated" : "unchanged"} ${id}${linkNote}${result.rev ? `, rev ${result.rev}` : ""}`,
+  );
+  return { monday, ...result, linkAddCount };
+}
+
+async function backfill() {
+  const rows = await request(
+    "/rest/v1/weekly_summaries?select=week_start&order=week_start.asc",
+  );
+  console.log(`wiki-week-write: backfill ${rows.length} weeks`);
+  let written = 0, updated = 0, unchanged = 0, skipped = 0;
+  for (const r of rows) {
+    if (!REFRESH) {
+      const existing = wiki.getPage(`week_${r.week_start}`);
+      if (existing) { unchanged++; continue; }
+    }
+    try {
+      const o = await writeOne(r.week_start);
+      if (o.skipped) skipped++;
+      else if (o.isNew) written++;
+      else if (o.changed) updated++;
+      else unchanged++;
+    } catch (err) {
+      console.error(`  ${r.week_start}: ${err.message}`);
+      skipped++;
+    }
+  }
+  console.log(`\nbackfill: ${written} written, ${updated} updated, ${unchanged} unchanged, ${skipped} skipped`);
+}
+
+(async () => {
+  if (BACKFILL) {
+    await backfill();
+    wiki.closeDb();
+    return;
+  }
+  const arg = args.find((a) => !a.startsWith("--"));
+  const monday = resolveArg(arg);
+  await writeOne(monday);
+  wiki.closeDb();
+})().catch((err) => {
+  console.error(`wiki-week-write: ${err.message}`);
+  wiki.closeDb();
+  process.exit(1);
+});

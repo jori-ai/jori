@@ -1,0 +1,188 @@
+#!/usr/bin/env node
+// wiki-month-write — ingest one monthly_summaries row into the wiki as
+// a `type: month` page. Same unified-store model as wiki-day-write +
+// wiki-week-write.
+//
+// Wiki page id: `month_YYYY-MM`.
+//
+// Usage:
+//   wiki-month-write <YYYY-MM>            # one month
+//   wiki-month-write last-month
+//   wiki-month-write --backfill           # every monthly_summaries row
+//   wiki-month-write --backfill --refresh # rewrite even unchanged pages
+//
+// Idempotent.
+
+"use strict";
+
+const wiki = require("../lib/wiki-store.js");
+const linker = require("../lib/wiki-linker.js");
+const { htmlToMarkdown } = require("../lib/episode-html-to-md.js");
+const { request } = require("../lib/supabase-rest.js");
+
+const args = process.argv.slice(2);
+const BACKFILL = args.includes("--backfill");
+const REFRESH = args.includes("--refresh");
+
+function die(msg, code = 1) {
+  console.error(`wiki-month-write: ${msg}`);
+  process.exit(code);
+}
+
+const MONTH_NAMES = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
+
+function resolveArg(arg) {
+  if (!arg || arg === "last-month") {
+    const now = new Date();
+    const last = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - 1, 1));
+    return last.toISOString().slice(0, 7);
+  }
+  if (/^\d{4}-\d{2}$/.test(arg)) return arg;
+  if (/^\d{4}-\d{2}-\d{2}$/.test(arg)) return arg.slice(0, 7);
+  die(`unrecognized argument "${arg}". Use YYYY-MM or last-month.`);
+}
+
+function prettyMonth(yyyyMm) {
+  const [y, m] = yyyyMm.split("-").map(Number);
+  return `${MONTH_NAMES[m - 1]} ${y}`;
+}
+
+function lastDayOfMonth(yyyyMm) {
+  const [y, m] = yyyyMm.split("-").map(Number);
+  const lastDay = new Date(Date.UTC(y, m, 0)).getUTCDate();
+  return `${yyyyMm}-${String(lastDay).padStart(2, "0")}`;
+}
+
+function weeksInMonth(yyyyMm) {
+  const [y, m] = yyyyMm.split("-").map(Number);
+  const firstDay = new Date(Date.UTC(y, m - 1, 1));
+  const lastDay = new Date(Date.UTC(y, m, 0));
+  // Find every Monday whose week overlaps the month.
+  const dow = firstDay.getUTCDay();
+  // First Monday on or before the 1st.
+  const offset = dow === 0 ? -6 : 1 - dow;
+  let cur = new Date(firstDay.getTime() + offset * 86400000);
+  const mondays = [];
+  while (cur.getTime() <= lastDay.getTime()) {
+    const monday = cur.toISOString().slice(0, 10);
+    // Only include weeks whose Monday is within the month or whose
+    // Sunday spills past the 1st — i.e., any week that touches the month.
+    const sun = new Date(cur.getTime() + 6 * 86400000);
+    if (sun.getTime() >= firstDay.getTime() && cur.getTime() <= lastDay.getTime()) {
+      mondays.push(monday);
+    }
+    cur = new Date(cur.getTime() + 7 * 86400000);
+  }
+  return mondays;
+}
+
+function buildBody(row) {
+  const monthStart = row.month_start;
+  const yyyyMm = monthStart.slice(0, 7);
+  const title = `Month of ${prettyMonth(yyyyMm)}`;
+  const themes = Array.isArray(row.themes) ? row.themes : [];
+  const narrativeMd = htmlToMarkdown(row.narrative || "").trim();
+  const narrativeNoH1 = narrativeMd.replace(/^#\s+.*\n+/, "").trim();
+
+  const description = themes.length
+    ? themes.slice(0, 3).join(" · ").slice(0, 100)
+    : (narrativeNoH1.split(/\.\s/)[0] || "").slice(0, 100);
+
+  const fm = [
+    "---",
+    "type: month",
+    `month_start: ${monthStart}`,
+    `month_end: ${lastDayOfMonth(yyyyMm)}`,
+    `title: ${JSON.stringify(title)}`,
+    `description: ${JSON.stringify(description)}`,
+    themes.length
+      ? `themes:\n${themes.map((t) => `  - ${JSON.stringify(t)}`).join("\n")}`
+      : "themes: []",
+    "---",
+    "",
+  ].join("\n");
+
+  const sections = [];
+  if (narrativeNoH1) sections.push(narrativeNoH1);
+
+  const weekLinks = weeksInMonth(yyyyMm).map(
+    (m) => `- [[week_${m}|Week of ${m}]]`,
+  );
+  if (weekLinks.length) {
+    sections.push(`## Weekly pages\n\n${weekLinks.join("\n")}`);
+  }
+
+  return fm + sections.join("\n\n") + "\n";
+}
+
+async function fetchMonth(yyyyMm) {
+  const rows = await request(
+    `/rest/v1/monthly_summaries?month_start=eq.${yyyyMm}-01&select=*`,
+  );
+  return rows?.[0] || null;
+}
+
+async function writeOne(yyyyMm) {
+  const row = await fetchMonth(yyyyMm);
+  if (!row) {
+    console.error(`wiki-month-write: no monthly_summaries row for ${yyyyMm}`);
+    return { yyyyMm, skipped: true, reason: "no-row" };
+  }
+  const body = buildBody(row);
+  const id = `month_${yyyyMm}`;
+  const result = wiki.savePage(id, body, { editedBy: "wiki-month-write" });
+  let linkAddCount = 0;
+  try {
+    const linked = linker.applySuggestions({ id, editedBy: "wiki-month-write:link-audit" });
+    linkAddCount = linked[0]?.added?.length || 0;
+  } catch (err) {
+    process.stderr.write(`wiki-month-write: link-audit ${id} failed: ${err.message}\n`);
+  }
+  const linkNote = linkAddCount ? `, +${linkAddCount} link${linkAddCount === 1 ? "" : "s"}` : "";
+  console.log(
+    `${result.isNew ? "wrote" : result.changed ? "updated" : "unchanged"} ${id}${linkNote}${result.rev ? `, rev ${result.rev}` : ""}`,
+  );
+  return { yyyyMm, ...result, linkAddCount };
+}
+
+async function backfill() {
+  const rows = await request(
+    "/rest/v1/monthly_summaries?select=month_start&order=month_start.asc",
+  );
+  console.log(`wiki-month-write: backfill ${rows.length} months`);
+  let written = 0, updated = 0, unchanged = 0, skipped = 0;
+  for (const r of rows) {
+    const yyyyMm = r.month_start.slice(0, 7);
+    if (!REFRESH) {
+      const existing = wiki.getPage(`month_${yyyyMm}`);
+      if (existing) { unchanged++; continue; }
+    }
+    try {
+      const o = await writeOne(yyyyMm);
+      if (o.skipped) skipped++;
+      else if (o.isNew) written++;
+      else if (o.changed) updated++;
+      else unchanged++;
+    } catch (err) {
+      console.error(`  ${yyyyMm}: ${err.message}`);
+      skipped++;
+    }
+  }
+  console.log(`\nbackfill: ${written} written, ${updated} updated, ${unchanged} unchanged, ${skipped} skipped`);
+}
+
+(async () => {
+  if (BACKFILL) {
+    await backfill();
+    wiki.closeDb();
+    return;
+  }
+  const arg = args.find((a) => !a.startsWith("--"));
+  const yyyyMm = resolveArg(arg);
+  await writeOne(yyyyMm);
+  wiki.closeDb();
+})().catch((err) => {
+  console.error(`wiki-month-write: ${err.message}`);
+  wiki.closeDb();
+  process.exit(1);
+});

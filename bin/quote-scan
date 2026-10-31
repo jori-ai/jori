@@ -1,0 +1,725 @@
+#!/usr/bin/env node
+"use strict";
+// quote-scan — turn a provider's quotes, estimates and invoices in mail and
+// texts into rows the property-management hub can attach to a repair ticket.
+//
+// A tenant reports a dripping faucet; the admin asks a plumber; the plumber
+// texts "$185 for the cartridge, can do Thursday" or emails a PDF titled
+// "Estimate #4471". The ticket needs that number, and today somebody retypes
+// it. This reads the mailboxes and the message threads, lets a model decide
+// what is a quote, and writes the fields to Supabase `vendor_quotes`, where
+// the hub matches each one to the open ticket at the right property.
+//
+// Modelled on receipt-scan, and it keeps its rules:
+//   - a model reads the document, code only gates and stores (a pattern that
+//     read "$185" would be wrong about the "$0 due" on a paid invoice);
+//   - the model runs on the Max subscription through a tool-less `claude -p`
+//     (lib/max-judge.js), never an API key;
+//   - idempotent by message id, so a daily run costs a handful of model calls.
+//
+// PRIVACY. Mail and texts are private, and other people's mailboxes may be
+// connected too.
+// Only what the model recognises as a quote is persisted, and only its FIELDS.
+// The one exception is `pdf_text` — the text of a recognised quote's own PDF —
+// because the hub shows the admin what they are about to accept. Nothing about
+// a message that is not a quote is written anywhere. Texts are read only from
+// 1:1 chats with numbers that are NOT in the Mac's Contacts (AddressBook), so
+// a friend's "$40 for dinner?" is never even considered — and if Contacts
+// can't be read, texts are skipped entirely rather than read unfiltered.
+//
+// Usage:
+//   quote-scan --since 2026-08-01                  every connected mailbox
+//   quote-scan --since 2026-08-01 --account X      one mailbox
+//   quote-scan --since 2026-08-01 --texts          also iMessage (chat.db) and WhatsApp (inbox jsonl)
+//   quote-scan --since 2026-08-01 --dry-run        extract and print, write nothing
+//   quote-scan --since 2026-08-01 --limit 100      cap messages examined per source
+//   quote-scan --since 2026-08-01 --rescan         re-read what was already extracted
+//   quote-scan --since 2026-08-01 --verbose        show what was gated and why
+//
+// Requires: gog (Gmail, multi-account), pdftotext (poppler), sqlite3 (for
+// --texts), SUPABASE_SERVICE_ROLE_KEY, and a logged-in `claude` (Max), which
+// only authenticates inside the GUI session — on the mini this runs as the
+// launchd agent ai.claude.quote-scan, not from cron.
+
+const { execFile } = require("node:child_process");
+const { promisify } = require("node:util");
+const fs = require("node:fs");
+const os = require("node:os");
+const path = require("node:path");
+const crypto = require("node:crypto");
+
+// The operator's real environment, captured BEFORE .env is merged in by
+// supabase-rest's import. See receipt-scan for why gog must not inherit the
+// mini's GOG_KEYRING_PASSWORD on a Mac.
+const SHELL_ENV = { ...process.env };
+
+const { request } = require("../lib/supabase-rest.js");
+const idb = require("../lib/imessage-db.js");
+const { judge } = require("../lib/max-judge.js");
+
+const run = promisify(execFile);
+const TOOL_PATH = `/opt/homebrew/bin:${SHELL_ENV.PATH || ""}`;
+
+const ARGV = process.argv.slice(2);
+const flag = (name, fallback = null) => {
+  const i = ARGV.indexOf(`--${name}`);
+  if (i === -1) return fallback;
+  const next = ARGV[i + 1];
+  return next === undefined || next.startsWith("--") ? true : next;
+};
+const DRY_RUN = ARGV.includes("--dry-run");
+const SINCE = flag("since");
+const ONLY_ACCOUNT = flag("account");
+const LIMIT = Number(flag("limit", "300"));
+const VERBOSE = ARGV.includes("--verbose");
+const RESCAN = ARGV.includes("--rescan");
+const TEXTS = ARGV.includes("--texts");
+
+const MODEL = "claude-sonnet-5-5";
+const SEARCH_CAP = 500;
+
+// Messages the model already judged NOT a quote. Only quotes reach Supabase,
+// so without this every non-quote in the lookback window would go back to the
+// model on every daily run. Keys are hashes, never message ids or content.
+const SEEN_FILE = path.join(__dirname, "..", "data", "quote-scan-seen.json");
+const SEEN_TTL_DAYS = 60;
+
+// ── What mail to look at ────────────────────────────────────────────────────
+
+/**
+ * Separate searches unioned by id, never one OR group — Gmail silently drops a
+ * clause from a top-level OR (see receipt-scan for the year it cost).
+ */
+function searchQueries(since) {
+  const after = `after:${since.replace(/-/g, "/")}`;
+  const exclude = "-in:sent -in:trash -in:draft";
+  return [
+    `${after} subject:(quote OR estimate OR proposal) ${exclude}`,
+    `${after} subject:(invoice OR bid OR "scope of work") ${exclude}`,
+    `${after} "estimate attached" ${exclude}`,
+    `${after} "please find attached" (quote OR estimate OR invoice) ${exclude}`,
+    // How tradespeople who use a platform send them.
+    `${after} from:(housecallpro.com OR jobber.com OR servicetitan.com OR joist.com OR quickbooks.com OR squareup.com OR invoicesimple.com) ${exclude}`,
+    `${after} has:attachment filename:pdf (quote OR estimate OR invoice OR proposal) ${exclude}`,
+  ];
+}
+
+// ── The model ───────────────────────────────────────────────────────────────
+
+const EXTRACT_SCHEMA = {
+  type: "object",
+  properties: {
+    isQuote: {
+      type: "boolean",
+      description:
+        "True only if a tradesperson, contractor or service company is telling the recipient what a specific job will cost or did cost: a quote, an estimate, a bid, a proposal, or an invoice for work at a property. False for retail order confirmations and receipts for goods (those are receipts, handled elsewhere), utility bills, insurance, subscriptions, marketing, a platform's own billing, someone else's quote forwarded for information, and any message that merely mentions money.",
+    },
+    kind: {
+      type: "string",
+      enum: ["quote", "estimate", "invoice"],
+      description: "quote or estimate before the work; invoice after it.",
+    },
+    vendor: { type: "string", description: "The business or person quoting, as a person would name them." },
+    amount: {
+      type: ["number", "null"],
+      description:
+        "The total for the job, POSITIVE, in the document's currency. For an invoice, the amount charged or due for the work, not a 'paid $0.00' line. Null only if the message genuinely states no figure.",
+    },
+    currency: { type: "string", description: "ISO currency code, e.g. USD." },
+    date: {
+      type: "string",
+      description:
+        "The quote's own date, YYYY-MM-DD. If the document does not state one use the 'Sent' date from the header. Never guess and never leave it blank.",
+    },
+    propertyHint: {
+      type: ["string", "null"],
+      description:
+        "An address, street name, unit, or property name the message names as where the work is — verbatim, as written ('12 Oak Street', '40 Elm Ave unit 2', 'the lake house'). Null if it names none.",
+    },
+    serviceSummary: {
+      type: "string",
+      description:
+        "One line, under 120 characters, saying what the work is: 'replace kitchen faucet cartridge', 'annual boiler service', 'rear gutter cleaning and reseal'. Specific beats generic.",
+    },
+    confidence: {
+      type: "number",
+      description: "0 to 1, how sure you are this is a quote for work at a property and the amount is right. Be honest — a low number means a human looks.",
+    },
+  },
+  required: ["isQuote", "kind", "vendor", "amount", "currency", "date", "propertyHint", "serviceSummary", "confidence"],
+  additionalProperties: false,
+};
+
+const SYSTEM_PROMPT = `You read emails and text messages and pull out quotes, estimates and invoices from tradespeople and service companies for work on a rental property, so a landlord's repair ticket can carry the number the provider actually gave.
+
+Most of what you see will NOT be a quote. Say so plainly rather than forcing a reading — a wrong quote attached to a real ticket is worse than none.
+
+These are NOT quotes: retail order confirmations and receipts for goods (Amazon, Home Depot — those are receipts, extracted by another tool); utility, insurance and subscription bills; a platform's own invoice to the provider; marketing and "book now" mail; someone else's quote forwarded for information; a message that mentions money in passing.
+
+A text like "$185 for the cartridge, can come Thursday 9-11" from a plumber IS a quote. An invoice after the work, with the amount, IS one too (kind: invoice).
+
+Name the property exactly as the message does and do not infer one it does not mention. Summarise the work specifically. When a PDF is attached its text follows the message body and is usually the better source.`;
+
+/** Money in any of the currencies that turn up here; structure, not language. */
+const MONEY =
+  /[$€£₪¥]\s?\d|\d[\d.,]*\s?(usd|eur|gbp|ils|nis|cad|chf|aud)\b|\b\d{1,3}(?:[.,]\d{3})*[.,]\d{2}\b/i;
+
+/**
+ * Whether a candidate is worth a model call. Mail always is: the searches
+ * already asked Gmail for quotes, and a real estimate can carry its number
+ * behind a "view estimate" link or in an image (the first dry run gated
+ * "Wall cut and patch estimate" for having no figure in the text). Texts are
+ * the firehose, so a text needs a figure in it. Structure only — deciding
+ * whether the words describe a quote is the model's job.
+ */
+function worthReading(candidate, document) {
+  return candidate.channel === "email" || MONEY.test(document);
+}
+
+async function extract(document) {
+  // On the Max subscription via a tool-less `claude -p` (lib/max-judge.js),
+  // never an API key — a shared API key once hit its monthly cap and this scan
+  // silently read nothing for weeks. A lost login
+  // or a usage limit throws `fatal` and stops the run.
+  return judge({ model: MODEL, system: SYSTEM_PROMPT, prompt: document, schema: EXTRACT_SCHEMA });
+}
+
+// ── Gmail via gog ───────────────────────────────────────────────────────────
+
+async function gog(args) {
+  const { stdout } = await run("gog", args, {
+    maxBuffer: 64 * 1024 * 1024,
+    env: { ...SHELL_ENV, PATH: TOOL_PATH },
+  });
+  return stdout;
+}
+
+async function listAccounts() {
+  const out = await gog(["auth", "list", "-p"]);
+  return out
+    .split("\n")
+    .map((l) => l.split("\t")[0]?.trim())
+    .filter((a) => a && a.includes("@"));
+}
+
+async function searchMessages(account, since, limit) {
+  const seen = new Set();
+  const warnings = [];
+  const max = Math.min(limit, SEARCH_CAP);
+  for (const query of searchQueries(since)) {
+    let ids = [];
+    let lastError = null;
+    // Retry errors only. Most of these queries legitimately match nothing, and
+    // retrying an empty result cost ~30s of sleeps per query per mailbox.
+    for (let attempt = 1; attempt <= 4; attempt++) {
+      try {
+        const out = await gog(["gmail", "search", query, "--account", account, "--max", String(max), "-p"]);
+        ids = out.split("\n").slice(1).map((l) => l.split("\t")[0]?.trim()).filter(Boolean);
+        lastError = null;
+        break;
+      } catch (e) {
+        lastError = e;
+      }
+      if (attempt < 4) await new Promise((r) => setTimeout(r, 5000 * attempt));
+    }
+    if (lastError) {
+      warnings.push(`FAILED after retries: "${query.slice(0, 70)}…" — ${lastError.message.slice(0, 90)}`);
+      continue;
+    }
+    if (ids.length >= max) {
+      warnings.push(`TRUNCATED at ${max}: "${query.slice(0, 80)}…" — older mail was dropped. Narrow this query or raise --limit.`);
+    }
+    if (VERBOSE) console.log(`    ${ids.length} from: ${query.slice(0, 72)}…`);
+    for (const id of ids) seen.add(id);
+  }
+  for (const warning of warnings) console.warn(`  ! ${warning}`);
+  return [...seen];
+}
+
+function readPayload(payload) {
+  let text = "";
+  let html = "";
+  const attachments = [];
+  const walk = (part) => {
+    const body = part.body || {};
+    const mime = part.mimeType || "";
+    if (body.data) {
+      const decoded = Buffer.from(body.data, "base64url").toString("utf8");
+      if (mime.includes("text/plain")) text += decoded;
+      else if (mime.includes("text/html")) html += decoded;
+    }
+    if (body.attachmentId && part.filename) {
+      attachments.push({ id: body.attachmentId, filename: part.filename, mime, size: body.size ?? null });
+    }
+    for (const child of part.parts || []) walk(child);
+  };
+  walk(payload);
+  return { text, html, attachments };
+}
+
+function htmlToText(html) {
+  return html
+    .replace(/<style[\s\S]*?<\/style>/gi, " ")
+    .replace(/<script[\s\S]*?<\/script>/gi, " ")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/&nbsp;/g, " ")
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&#\d+;/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function headerOf(payload, name) {
+  const h = (payload.headers || []).find((x) => (x.name || "").toLowerCase() === name.toLowerCase());
+  return h ? h.value : null;
+}
+
+/** "Mike Carver <mike@x.com>" → { name, email } */
+function parseFrom(from) {
+  const m = /^\s*"?([^"<]*)"?\s*<([^>]+)>\s*$/.exec(from || "");
+  if (m) return { name: m[1].trim() || null, email: m[2].trim().toLowerCase() };
+  const e = /[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}/i.exec(from || "");
+  return { name: null, email: e ? e[0].toLowerCase() : null };
+}
+
+async function fetchMessage(account, messageId) {
+  let lastError = null;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      const raw = await gog(["gmail", "read", messageId, "--account", account, "-j"]);
+      const parsed = JSON.parse(raw);
+      const message = parsed?.thread?.messages?.[0];
+      if (!message) return null;
+      return { message, ...readPayload(message.payload || {}) };
+    } catch (e) {
+      lastError = e;
+      if (attempt < 3) await new Promise((r) => setTimeout(r, 4000 * attempt));
+    }
+  }
+  throw lastError;
+}
+
+async function attachmentText(account, messageId, attachment) {
+  if (!attachment.filename.toLowerCase().endsWith(".pdf")) return null;
+  try {
+    const out = await gog(["gmail", "attachment", messageId, attachment.id, "--account", account, "-p"]);
+    const line = out.split("\n").find((l) => l.startsWith("path\t"));
+    if (!line) return null;
+    const file = line.split("\t")[1].trim();
+    if (!fs.existsSync(file)) return null;
+    const { stdout } = await run("pdftotext", ["-layout", file, "-"], {
+      maxBuffer: 16 * 1024 * 1024,
+      env: { ...SHELL_ENV, PATH: TOOL_PATH },
+    });
+    return { text: stdout, file };
+  } catch (e) {
+    if (VERBOSE) console.error(`    (attachment ${attachment.filename}: ${e.message})`);
+    return null;
+  }
+}
+
+// ── Texts: iMessage (chat.db) and WhatsApp (inbox jsonl) ────────────────────
+
+const CHAT_DB = path.join(os.homedir(), "Library/Messages/chat.db");
+const WA_INBOX = path.join(require("../lib/root.cjs").installRoot(), "data", "whatsapp-inbox.jsonl");
+const ADDRESS_BOOK = path.join(os.homedir(), "Library/Application Support/AddressBook");
+const APPLE_EPOCH = 978307200;
+/** chat.style for a 1:1 conversation (43 is a group). */
+const CHAT_STYLE_DIRECT = 45;
+
+/**
+ * A handle reduced to what identifies it across spellings: an email
+ * lowercased, a phone as its last 9 digits. Nine, not ten, so "+972 54…" and
+ * "054…" meet; a rare collision only ever EXCLUDES a stranger, never admits a
+ * contact.
+ */
+function handleKey(handle) {
+  const s = String(handle || "").trim().toLowerCase();
+  if (s.includes("@")) return s;
+  const digits = s.replace(/\D/g, "");
+  return digits.length >= 7 ? digits.slice(-9) : null;
+}
+
+/**
+ * Every phone and email in the Mac's Contacts, as handleKeys. chat.db holds
+ * no contact names — a 1:1 chat's display_name is always empty — so this is
+ * the only way to know a number belongs to someone the phone knows.
+ * Returns null when Contacts can't be read; callers must then skip texts.
+ */
+async function savedContactKeys() {
+  const dbs = [path.join(ADDRESS_BOOK, "AddressBook-v22.abcddb")];
+  try {
+    for (const source of fs.readdirSync(path.join(ADDRESS_BOOK, "Sources"))) {
+      dbs.push(path.join(ADDRESS_BOOK, "Sources", source, "AddressBook-v22.abcddb"));
+    }
+  } catch {}
+  const keys = new Set();
+  for (const db of dbs.filter((d) => fs.existsSync(d))) {
+    try {
+      const { stdout } = await run(
+        "sqlite3",
+        ["-readonly", db, "SELECT ZFULLNUMBER FROM ZABCDPHONENUMBER UNION ALL SELECT ZADDRESS FROM ZABCDEMAILADDRESS"],
+        { maxBuffer: 64 * 1024 * 1024, env: { ...SHELL_ENV, PATH: TOOL_PATH } }
+      );
+      for (const line of stdout.split("\n")) {
+        const key = handleKey(line);
+        if (key) keys.add(key);
+      }
+    } catch (e) {
+      if (VERBOSE) console.warn(`    (contacts ${path.basename(path.dirname(db))}: ${e.message.split("\n")[0]})`);
+    }
+  }
+  return keys.size ? keys : null;
+}
+
+/**
+ * Inbound iMessages since a date, from 1:1 chats with a number NOT in
+ * Contacts — a tradesperson texting from a number the phone does not know.
+ * Saved contacts and group chats are left alone on purpose; that is where the
+ * private life is.
+ */
+async function imessageCandidates(since, limit, contacts) {
+  if (!fs.existsSync(CHAT_DB)) {
+    console.warn("  ! chat.db not found; skipping iMessage");
+    return [];
+  }
+  // The body is in attributedBody on nearly every recent row (message.text is
+  // NULL), so read through imessage-db, which decodes it.
+  const sql = `
+    SELECT m.guid AS guid,
+           datetime(${idb.SEC("m.date")} + ${APPLE_EPOCH}, 'unixepoch') AS date_utc,
+           COALESCE(h.id, c.chat_identifier) AS sender,
+           m.text AS text, m.attributedBody AS body
+    FROM message m
+    JOIN chat_message_join cmj ON m.ROWID = cmj.message_id
+    JOIN chat c ON cmj.chat_id = c.ROWID
+    LEFT JOIN handle h ON m.handle_id = h.ROWID
+    WHERE m.is_from_me = 0
+      AND (m.text IS NOT NULL OR m.attributedBody IS NOT NULL)
+      AND (m.associated_message_type IS NULL OR m.associated_message_type = 0)
+      AND c.style = ${CHAT_STYLE_DIRECT}
+      AND m.date >= ?
+    ORDER BY m.date DESC
+    LIMIT ${Math.max(1, Math.min(limit, 2000))}`;
+  try {
+    const sinceMs = Date.parse(/[zZ]|[+-]\d\d:?\d\d$/.test(since) ? since : `${String(since).replace(" ", "T")}${String(since).includes("T") || String(since).includes(" ") ? "" : "T00:00:00"}Z`);
+    const db = idb.openReadOnly(CHAT_DB);
+    let raw;
+    try {
+      raw = db.prepare(sql).all(idb.msToAppleNs(sinceMs));
+    } finally {
+      db.close();
+    }
+    const stdout = JSON.stringify(raw.map((r) => ({ guid: r.guid, date_utc: r.date_utc, sender: r.sender, text: idb.messageText(r.text, r.body) })).filter((r) => r.text));
+    const rows = (stdout.trim() ? JSON.parse(stdout) : []).filter((r) => {
+      const key = handleKey(r.sender);
+      return key && !contacts.has(key);
+    });
+    return rows.map((r) => ({
+      id: `imsg:${r.guid}`,
+      channel: "text",
+      account: "imessage",
+      sender: r.sender,
+      senderName: null,
+      receivedAt: new Date(`${r.date_utc.replace(" ", "T")}Z`).toISOString(),
+      subject: "",
+      text: r.text,
+    }));
+  } catch (e) {
+    console.warn(`  ! chat.db unreadable (${e.message.split("\n")[0]}); grant Full Disk Access or skip --texts`);
+    return [];
+  }
+}
+
+/**
+ * Inbound 1:1 WhatsApp messages since a date, from the gateway's append-only
+ * inbox, from numbers NOT in Contacts — the same line as iMessage.
+ */
+function whatsappCandidates(since, limit, contacts) {
+  if (!fs.existsSync(WA_INBOX)) return [];
+  const floor = new Date(since).getTime();
+  const out = [];
+  const lines = fs.readFileSync(WA_INBOX, "utf8").trim().split("\n");
+  for (let i = lines.length - 1; i >= 0 && out.length < limit; i--) {
+    let m;
+    try {
+      m = JSON.parse(lines[i]);
+    } catch {
+      continue;
+    }
+    if (m.kind !== "message" || !m.text || m.from_me || m.is_from_me) continue;
+    // Groups are conversation, not a provider quoting; a 1:1 chat is what a
+    // tradesperson uses.
+    // Only phone-number chats (`…@s.whatsapp.net`) can be checked against
+    // Contacts. Groups (@g.us), channels (@newsletter) and status updates
+    // (status@broadcast — which come from contacts) are not a provider
+    // quoting, and an `@lid` chat hides the number behind a privacy id, so
+    // there is no telling whether it is a friend: skipped, fail closed.
+    if (m.is_group || typeof m.chat_id !== "string" || !m.chat_id.endsWith("@s.whatsapp.net")) continue;
+    const ts = Date.parse(m.ts || m.timestamp || "");
+    if (!Number.isFinite(ts) || ts < floor) continue;
+    const key = handleKey(String(m.sender || m.chat_id || "").replace(/@.*$/, ""));
+    if (!key || contacts.has(key)) continue;
+    const rawId = m.id || m.message_id || m.key?.id;
+    const id = rawId ? `wa:${rawId}` : `wa:${crypto.createHash("sha1").update(`${m.chat_id}|${m.ts}|${m.text}`).digest("hex").slice(0, 24)}`;
+    out.push({
+      id,
+      channel: "whatsapp",
+      account: "whatsapp",
+      sender: String(m.sender || m.chat_id || "").replace(/@.*$/, ""),
+      senderName: m.sender_name || null,
+      receivedAt: new Date(ts).toISOString(),
+      subject: "",
+      text: m.text,
+    });
+  }
+  return out;
+}
+
+// ── Persistence ─────────────────────────────────────────────────────────────
+
+const seenKey = (id) => crypto.createHash("sha256").update(id).digest("hex").slice(0, 32);
+
+/** { hash: "YYYY-MM-DD" } for messages judged not a quote, pruned past the TTL. */
+function loadSeen() {
+  let seen = {};
+  try {
+    seen = JSON.parse(fs.readFileSync(SEEN_FILE, "utf8"));
+  } catch {}
+  const floor = new Date(Date.now() - SEEN_TTL_DAYS * 86_400_000).toISOString().slice(0, 10);
+  for (const [k, day] of Object.entries(seen)) if (day < floor) delete seen[k];
+  return seen;
+}
+
+function saveSeen(seen) {
+  if (DRY_RUN) return;
+  const tmp = `${SEEN_FILE}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify(seen));
+  fs.renameSync(tmp, SEEN_FILE);
+}
+
+async function alreadyExtracted(account) {
+  const rows =
+    (await request(`/rest/v1/vendor_quotes?select=id&account=eq.${encodeURIComponent(account)}&limit=10000`)) || [];
+  return new Set(rows.map((r) => r.id));
+}
+
+async function saveQuote(quote, files) {
+  await request("/rest/v1/vendor_quotes", { method: "POST", body: [quote], prefer: "resolution=merge-duplicates" });
+  await request(`/rest/v1/vendor_quote_files?quote_id=eq.${encodeURIComponent(quote.id)}`, { method: "DELETE" });
+  if (files.length) await request("/rest/v1/vendor_quote_files", { method: "POST", body: files });
+}
+
+// ── One candidate, whatever channel it came from ────────────────────────────
+
+/**
+ * @param candidate { id, channel, account, sender, senderName, receivedAt, subject, text, pdfs?: [{filename, mime, size, text, file}] }
+ */
+async function consider(candidate, totals, seen) {
+  const sentOn = candidate.receivedAt.slice(0, 10);
+  let document =
+    `Channel: ${candidate.channel}\nFrom: ${candidate.senderName ? `${candidate.senderName} ` : ""}${candidate.sender || ""}\n` +
+    (candidate.subject ? `Subject: ${candidate.subject}\n` : "") +
+    `Sent: ${sentOn}\n\n${candidate.text}`;
+  let pdfText = null;
+  for (const pdf of candidate.pdfs || []) {
+    if (pdf.text && pdf.text.trim()) {
+      document += `\n\n--- attached: ${pdf.filename} ---\n${pdf.text}`;
+      pdfText = (pdfText ? `${pdfText}\n\n` : "") + pdf.text.slice(0, 20000);
+    }
+  }
+
+  if (!worthReading(candidate, document)) {
+    totals.gated += 1;
+    if (VERBOSE) console.log(`  · gated, text with no figure: ${(candidate.subject || candidate.text).slice(0, 54)}`);
+    return;
+  }
+
+  const verdict = await extract(document.slice(0, 60000));
+  if (!verdict.isQuote) {
+    // Discarded in memory. Only a hash of its id is kept, so tomorrow's run
+    // doesn't pay to read it again.
+    totals.notQuotes += 1;
+    seen[seenKey(candidate.id)] = new Date().toISOString().slice(0, 10);
+    if (VERBOSE) console.log(`  – not a quote: ${(candidate.subject || candidate.text).slice(0, 60)}`);
+    return;
+  }
+
+  // The same quote re-sent — a DocuSign reminder every week, a "following up"
+  // with the PDF attached again — is one quote, not six. Exact equality on
+  // who sent it and what it says it costs; the first row found is kept and the
+  // repeat is remembered as read so it isn't paid for again tomorrow.
+  const dup = await existingQuote(candidate, verdict);
+  if (dup) {
+    totals.duplicates += 1;
+    seen[seenKey(candidate.id)] = new Date().toISOString().slice(0, 10);
+    if (VERBOSE) console.log(`  ↺ repeat of ${dup}: ${verdict.vendor} $${verdict.amount}`);
+    return;
+  }
+
+  totals.quotes += 1;
+  const quote = {
+    id: candidate.id,
+    account: candidate.account,
+    channel: candidate.channel,
+    sender: candidate.sender || null,
+    sender_name: candidate.senderName || null,
+    vendor: verdict.vendor,
+    kind: verdict.kind,
+    received_at: candidate.receivedAt,
+    amount: verdict.amount ?? null,
+    currency: verdict.currency || "USD",
+    property_hint: verdict.propertyHint ?? null,
+    service_summary: verdict.serviceSummary,
+    pdf_text: pdfText,
+    subject: candidate.subject || null,
+    confidence: verdict.confidence,
+    updated_at: new Date().toISOString(),
+  };
+  const files = (candidate.pdfs || []).map((p) => ({
+    quote_id: candidate.id,
+    filename: p.filename,
+    content_type: p.mime || null,
+    size: p.size ?? null,
+    storage_note: p.file ? `gog download on ${os.hostname()}: ${p.file}` : null,
+  }));
+
+  console.log(
+    `  ✓ ${verdict.kind} · ${verdict.vendor} · ${verdict.amount == null ? "no amount" : `$${Number(verdict.amount).toFixed(2)}`}` +
+      ` · ${verdict.serviceSummary}${verdict.propertyHint ? ` @ ${verdict.propertyHint}` : ""} [${candidate.channel}]`
+  );
+  if (!DRY_RUN) await saveQuote(quote, files);
+  RUN_QUOTES.set(quoteKey(quote.sender, quote.sender_name, quote.kind, quote.amount), quote.id);
+}
+
+// Quotes seen this run, so a dry run (which writes nothing) dedupes too.
+const RUN_QUOTES = new Map();
+// quote vs estimate is the model's wording for the same pre-work price (the
+// second dry run labelled one reminder "estimate" and its five twins "quote");
+// only invoice-or-not is a real difference.
+const PRE_WORK = ["quote", "estimate"];
+const stage = (kind) => (kind === "invoice" ? "invoice" : "pre-work");
+const quoteKey = (sender, senderName, kind, amount) =>
+  JSON.stringify([sender || null, senderName || null, stage(kind), amount == null ? null : Number(amount)]);
+
+/** Id of an already-stored (or already-seen-this-run) identical quote, or null. */
+async function existingQuote(candidate, verdict) {
+  if (verdict.amount == null) return null; // nothing to recognise a repeat by
+  const key = quoteKey(candidate.sender, candidate.senderName, verdict.kind, verdict.amount);
+  if (RUN_QUOTES.has(key)) return RUN_QUOTES.get(key);
+  const q = (col, v) => (v == null ? `${col}=is.null` : `${col}=eq.${encodeURIComponent(v)}`);
+  const rows =
+    (await request(
+      `/rest/v1/vendor_quotes?select=id&${q("sender", candidate.sender || null)}&${q("sender_name", candidate.senderName || null)}` +
+        `&kind=${stage(verdict.kind) === "invoice" ? "eq.invoice" : `in.(${PRE_WORK.join(",")})`}&amount=eq.${Number(verdict.amount)}&id=neq.${encodeURIComponent(candidate.id)}&limit=1`
+    )) || [];
+  return rows[0]?.id || null;
+}
+
+// ── Main ────────────────────────────────────────────────────────────────────
+
+async function main() {
+  if (!SINCE || SINCE === true || !/^\d{4}-\d{2}-\d{2}$/.test(SINCE)) {
+    console.error("Usage: quote-scan --since YYYY-MM-DD [--account X] [--texts] [--dry-run] [--limit N] [--rescan]");
+    process.exit(1);
+  }
+
+  const totals = { examined: 0, quotes: 0, duplicates: 0, notQuotes: 0, gated: 0, failed: 0, alreadyKnown: 0 };
+  const notQuotes = RESCAN ? {} : loadSeen();
+  const known = (extracted, id) => extracted.has(id) || Boolean(notQuotes[seenKey(id)]);
+
+  // Mail.
+  const accounts = ONLY_ACCOUNT && ONLY_ACCOUNT !== true ? [ONLY_ACCOUNT] : await listAccounts();
+  console.log(`Scanning ${accounts.length} mailbox(es) since ${SINCE}${TEXTS ? " plus texts" : ""}${DRY_RUN ? " (dry run)" : ""}`);
+
+  for (const account of accounts) {
+    const ids = await searchMessages(account, SINCE, LIMIT);
+    const seen = RESCAN ? new Set() : await alreadyExtracted(account);
+    const fresh = ids.filter((id) => !known(seen, `gmail:${id}`));
+    totals.alreadyKnown += ids.length - fresh.length;
+    console.log(`\n${account}: ${ids.length} candidate message(s)${ids.length - fresh.length ? `, ${ids.length - fresh.length} already read` : ""}`);
+
+    for (const id of fresh) {
+      totals.examined += 1;
+      try {
+        const fetched = await fetchMessage(account, id);
+        if (!fetched) continue;
+        const { message, text, html, attachments } = fetched;
+        const payload = message.payload || {};
+        const from = parseFrom(headerOf(payload, "From") || "");
+        const pdfs = [];
+        for (const attachment of attachments.slice(0, 3)) {
+          const got = await attachmentText(account, id, attachment);
+          pdfs.push({ ...attachment, text: got?.text ?? null, file: got?.file ?? null });
+        }
+        await consider(
+          {
+            id: `gmail:${id}`,
+            channel: "email",
+            account,
+            sender: from.email,
+            senderName: from.name,
+            receivedAt: message.internalDate ? new Date(Number(message.internalDate)).toISOString() : new Date().toISOString(),
+            subject: headerOf(payload, "Subject") || "",
+            text: text || htmlToText(html),
+            pdfs,
+          },
+          totals,
+          notQuotes
+        );
+      } catch (e) {
+        if (e.fatal) throw e;
+        totals.failed += 1;
+        console.error(`  ! ${id}: ${e.message}`);
+      }
+    }
+    saveSeen(notQuotes);
+  }
+
+  // Texts. Without a readable Contacts there is no way to tell a plumber from
+  // a friend, so texts are skipped rather than read unfiltered.
+  const contacts = TEXTS ? await savedContactKeys() : null;
+  if (TEXTS && !contacts) {
+    console.warn("\n  ! Contacts (AddressBook) unreadable or empty; skipping texts so saved contacts are never read");
+    // Mail still ran, but texts were asked for and not read — exit non-zero so
+    // cron-run records it red. Usual cause on the mini: Full Disk Access is
+    // granted to a versioned node binary and `brew upgrade node` moved it.
+    process.exitCode = 3;
+  } else if (TEXTS) {
+    if (VERBOSE) console.log(`\n${contacts.size} saved-contact handles excluded`);
+    for (const [label, list] of [
+      ["imessage", await imessageCandidates(SINCE, LIMIT, contacts)],
+      ["whatsapp", whatsappCandidates(SINCE, LIMIT, contacts)],
+    ]) {
+      const seen = RESCAN ? new Set() : await alreadyExtracted(label);
+      const fresh = list.filter((c) => !known(seen, c.id));
+      totals.alreadyKnown += list.length - fresh.length;
+      console.log(`\n${label}: ${list.length} inbound 1:1 message(s) from numbers not in Contacts${list.length - fresh.length ? `, ${list.length - fresh.length} already read` : ""}`);
+      for (const candidate of fresh) {
+        totals.examined += 1;
+        try {
+          await consider(candidate, totals, notQuotes);
+        } catch (e) {
+          if (e.fatal) throw e;
+          totals.failed += 1;
+          console.error(`  ! ${candidate.id}: ${e.message}`);
+        }
+      }
+      saveSeen(notQuotes);
+    }
+  }
+
+  const modelCalls = totals.quotes + totals.duplicates + totals.notQuotes;
+  console.log(
+    `\nAlready read ${totals.alreadyKnown} · examined ${totals.examined} · gated before the model ${totals.gated}` +
+      ` · quotes ${totals.quotes} · repeats ${totals.duplicates} · not quotes ${totals.notQuotes} · failed ${totals.failed}`
+  );
+  console.log(`Model calls: ${modelCalls} of ${totals.examined} messages${totals.examined ? ` (${Math.round((100 * modelCalls) / totals.examined)}%)` : ""}`);
+}
+
+main().catch((e) => {
+  console.error(`quote-scan: ${e.message}`);
+  process.exit(1);
+});

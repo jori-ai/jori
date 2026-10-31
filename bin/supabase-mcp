@@ -1,0 +1,34 @@
+#!/bin/bash
+# supabase-mcp — spawn the Supabase MCP server with a freshly minted OAuth token.
+#
+# WHY THIS WRAPPER EXISTS: the MCP server reads SUPABASE_ACCESS_TOKEN from its
+# environment, and that environment is fixed when process-manager starts the
+# supervisors — it loads .env once and hands it to every child. That was
+# fine for a personal access token (static until it expires), but OAuth access
+# tokens live 24 hours, so a value baked in at supervisor start goes stale by
+# the next day while the supervisor happily keeps running.
+#
+# Minting the token here instead means every MCP spawn gets a fresh one, and
+# supabase-token only calls the network when the cached token is actually near
+# expiry.
+#
+# Absolute paths: MCP servers are spawned with a minimal PATH that may not
+# include node's directory. lib/root.sh resolves node (JORI_NODE) the way the
+# supervisors do; `env: node: No such file or directory` is what you get otherwise.
+set -euo pipefail
+
+HERE="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=../agent/scripts/lib/root.sh
+source "$HERE/../agent/scripts/lib/root.sh"
+[ -n "$JORI_NODE" ] || { echo "supabase-mcp: node not found (set JORI_NODE)" >&2; exit 1; }
+NODE_DIR="$(dirname "$JORI_NODE")"
+
+# PATH, not just absolute paths: npx downloads the MCP server, whose own shebang
+# is `#!/usr/bin/env node`, so node must be findable by name too. Without this
+# the server dies instantly with `env: node: No such file or directory`.
+export PATH="$NODE_DIR:$PATH"
+
+SUPABASE_ACCESS_TOKEN="$("$JORI_NODE" "$HERE/supabase-token")"
+export SUPABASE_ACCESS_TOKEN
+
+exec "$NODE_DIR/npx" -y @supabase/mcp-server-supabase@latest "$@"

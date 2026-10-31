@@ -50,7 +50,7 @@ const { instance, localConfig } = createRequire(import.meta.url)("../../lib/inst
 const HOME_TZ = instance().tz;
 const HUM_LANES = localConfig("hum-lanes", {
   place_bound: [
-    "nearby", "location_context", "dining", "situation", "weather", "exercise",
+    "nearby", "location_context", "dining", "situation", "weather", "exercise", "meal_offer",
   ],
   operational: [
     "watchdog", "secret_failures", "tasks", "calendar", "email_followups", "travel",

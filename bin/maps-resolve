@@ -1,0 +1,234 @@
+#!/usr/bin/env node
+// maps-resolve — resolve an Apple/Google Maps shortlink to structured place data.
+//
+// A chat correction often arrives as a `https://maps.app.goo.gl/<short>` link,
+// which `findme resolve pending` used to interpret heuristically (a Google
+// Places lookup against the redirect-target coords). This helper makes that
+// path deterministic — chase the redirect, extract lat/lon + place name from
+// the canonical Google Maps URL, optionally hit the Google Places API for a
+// full place_id + address.
+//
+// Usage:
+//   maps-resolve <url>                        # JSON to stdout
+//   maps-resolve <url> --no-places            # skip Google Places lookup (faster, less data)
+//
+// Supported input shapes:
+//   - https://maps.app.goo.gl/<short>          (Google Maps app share)
+//   - https://goo.gl/maps/<short>              (legacy Google share)
+//   - https://www.google.com/maps/place/<name>/@<lat>,<lon>,<zoom>z/data=...
+//   - https://maps.apple.com/?ll=<lat>,<lon>&q=<name>
+//   - https://maps.apple.com/place?coordinate=<lat>,<lon>&name=<name>
+//
+// Output JSON:
+//   { url, resolved_url, name, lat, lon, place_id, address, source, raw }
+// Where source ∈ {google_places, google_url_parse, apple_url_parse, redirect_only}.
+
+import { loadEnv } from "../lib/load-env.js";
+import { placesBlockReason } from "../lib/places-guard.js";
+import { createRequire } from "node:module";
+import { fileURLToPath } from "node:url";
+// ESM file (it uses `import`), so CJS globals must be rebuilt for the require() calls below.
+const require = createRequire(import.meta.url);
+const __dirname = fileURLToPath(new URL(".", import.meta.url));
+loadEnv();
+
+const PLACES_KEY = process.env.GOOGLE_PLACES_API_KEY;
+const placesClient = require(require("node:path").join(__dirname, "..", "lib", "places-client.js"));
+const args = process.argv.slice(2);
+// A blown Places budget is the same situation as --no-places: the URL still
+// resolves from its own coordinates and text, it just does not get enriched.
+// Reusing the existing flag means no new code path to get wrong.
+const noPlaces = args.includes("--no-places") || placesBlockReason() !== null;
+const url = args.find((a) => !a.startsWith("--"));
+
+if (!url) {
+  console.error("usage: maps-resolve <url> [--no-places]");
+  process.exit(2);
+}
+
+async function resolveRedirects(start, maxHops = 6) {
+  let current = start;
+  const chain = [start];
+  for (let i = 0; i < maxHops; i++) {
+    const r = await fetch(current, { method: "GET", redirect: "manual", headers: { "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0)" } });
+    if (r.status >= 300 && r.status < 400) {
+      const next = r.headers.get("location");
+      if (!next) break;
+      current = new URL(next, current).toString();
+      chain.push(current);
+      continue;
+    }
+    return { final: current, chain, status: r.status };
+  }
+  return { final: current, chain, status: null };
+}
+
+function parseGoogleMapsUrl(u) {
+  // Pattern A: /maps/place/<name>/@<lat>,<lon>,<zoom>z
+  const placeMatch = u.match(/\/maps\/place\/([^/]+)\/@(-?\d+\.\d+),(-?\d+\.\d+)/);
+  if (placeMatch) {
+    return {
+      name: decodeURIComponent(placeMatch[1].replace(/\+/g, " ")),
+      lat: parseFloat(placeMatch[2]),
+      lon: parseFloat(placeMatch[3]),
+      source: "google_url_parse",
+    };
+  }
+  // Pattern B: /maps/?q=<lat>,<lon> or /maps?q=<name>&ll=<lat>,<lon>
+  const ll = u.match(/[?&](?:ll|center)=(-?\d+\.\d+),(-?\d+\.\d+)/);
+  const q = u.match(/[?&]q=([^&]+)/);
+  if (ll) {
+    return {
+      name: q ? decodeURIComponent(q[1].replace(/\+/g, " ")) : null,
+      lat: parseFloat(ll[1]),
+      lon: parseFloat(ll[2]),
+      source: "google_url_parse",
+    };
+  }
+  // Pattern C: /maps/search/<query>/@<lat>,<lon>
+  const searchMatch = u.match(/\/maps\/search\/([^/]+)\/@(-?\d+\.\d+),(-?\d+\.\d+)/);
+  if (searchMatch) {
+    return {
+      name: decodeURIComponent(searchMatch[1].replace(/\+/g, " ")),
+      lat: parseFloat(searchMatch[2]),
+      lon: parseFloat(searchMatch[3]),
+      source: "google_url_parse",
+    };
+  }
+  // Pattern D: /maps/dir/.../<lat>,<lon> or coordinate path
+  const coords = u.match(/[/=](-?\d+\.\d{4,}),(-?\d+\.\d{4,})/);
+  if (coords) {
+    return { name: null, lat: parseFloat(coords[1]), lon: parseFloat(coords[2]), source: "google_url_parse" };
+  }
+  // Pattern E: ?q=<name+address> with no coords, optional &ftid=<hex:hex>
+  // (typical of `maps.app.goo.gl` shortlink redirects)
+  const qOnly = u.match(/[?&]q=([^&]+)/);
+  if (qOnly) {
+    const decoded = decodeURIComponent(qOnly[1].replace(/\+/g, " "));
+    // First comma-segment is usually the place name; the rest is address
+    const firstSeg = decoded.split(",")[0]?.trim() || decoded;
+    const ftidMatch = u.match(/[?&]ftid=([0-9a-fx:]+)/i);
+    return { name: firstSeg, lat: null, lon: null, source: "google_url_parse", q_text: decoded, ftid: ftidMatch ? ftidMatch[1] : null };
+  }
+  return null;
+}
+
+function parseAppleMapsUrl(u) {
+  if (!u.includes("maps.apple.com")) return null;
+  const parsed = new URL(u);
+  const ll = parsed.searchParams.get("ll") || parsed.searchParams.get("coordinate");
+  const name = parsed.searchParams.get("name") || parsed.searchParams.get("q");
+  if (ll) {
+    const [lat, lon] = ll.split(",").map((s) => parseFloat(s.trim()));
+    return { name: name || null, lat, lon, source: "apple_url_parse" };
+  }
+  return null;
+}
+
+// Uses Places API (New) — the legacy /maps/api/place/* endpoints are
+// disabled on our key.
+async function placesSearchText(q) {
+  if (!PLACES_KEY) return null;
+  // The one guarded door: priced, gated and logged by places-client.
+  let j;
+  try {
+    j = await placesClient.post("maps-resolve", "places:searchText", { textQuery: q },
+      { mask: "places.id,places.displayName,places.formattedAddress,places.location,places.types",
+        method: "searchText", key: PLACES_KEY, query: q });
+  } catch (e) { console.error(`maps-resolve: ${e.reason || e.message}`); return null; }
+  if (!j.places?.length) return null;
+  const hit = j.places[0];
+  return {
+    place_id: hit.id,
+    name: hit.displayName?.text || null,
+    address: hit.formattedAddress || null,
+    lat: hit.location?.latitude ?? null,
+    lon: hit.location?.longitude ?? null,
+    primary_type: hit.types?.[0] || null,
+  };
+}
+
+async function placesNearby(lat, lon, name) {
+  if (!PLACES_KEY) return null;
+  // Places API (New) — searchNearby with rankPreference DISTANCE
+  let j;
+  try {
+    j = await placesClient.post("maps-resolve", "places:searchNearby", {
+      locationRestriction: { circle: { center: { latitude: lat, longitude: lon }, radius: 60.0 } },
+      rankPreference: "DISTANCE",
+      maxResultCount: 5,
+    }, { mask: "places.id,places.displayName,places.formattedAddress,places.types",
+         method: "searchNearby", key: PLACES_KEY, lat, lon, radius: 60 });
+  } catch (e) { console.error(`maps-resolve: ${e.reason || e.message}`); return null; }
+  if (!j.places?.length) return null;
+  const first = name?.toLowerCase().split(" ")[0];
+  const hit = first
+    ? (j.places.find((p) => p.displayName?.text?.toLowerCase().includes(first)) || j.places[0])
+    : j.places[0];
+  return {
+    place_id: hit.id,
+    name: hit.displayName?.text || null,
+    address: hit.formattedAddress || null,
+    primary_type: hit.types?.[0] || null,
+  };
+}
+
+(async () => {
+  const out = { url, resolved_url: null, name: null, lat: null, lon: null, place_id: null, address: null, source: null, raw: {} };
+  try {
+    const redirect = await resolveRedirects(url);
+    out.resolved_url = redirect.final;
+    out.raw.redirect_chain = redirect.chain;
+
+    let parsed = parseAppleMapsUrl(redirect.final) || parseGoogleMapsUrl(redirect.final);
+    if (!parsed) {
+      // Walk the chain in case the final fetch landed somewhere unhelpful (e.g. consent)
+      for (const u of redirect.chain.slice().reverse()) {
+        parsed = parseAppleMapsUrl(u) || parseGoogleMapsUrl(u);
+        if (parsed) break;
+      }
+    }
+
+    if (parsed) {
+      out.name = parsed.name;
+      out.lat = parsed.lat;
+      out.lon = parsed.lon;
+      out.source = parsed.source;
+      if (parsed.q_text) out.raw.q_text = parsed.q_text;
+      if (parsed.ftid) out.raw.ftid = parsed.ftid;
+    } else {
+      out.source = "redirect_only";
+    }
+
+    // If we have a text query but no coords, run a Places text search first
+    if (out.lat == null && parsed?.q_text && !noPlaces && PLACES_KEY) {
+      const geo = await placesSearchText(parsed.q_text);
+      if (geo) {
+        out.lat = geo.lat;
+        out.lon = geo.lon;
+        out.place_id = geo.place_id;
+        out.address = geo.address;
+        if (!out.name && geo.name) out.name = geo.name;
+        out.raw.places_primary_type = geo.primary_type;
+        out.source = "google_places";
+      }
+    }
+
+    if (out.lat != null && out.lon != null && !noPlaces && PLACES_KEY) {
+      const places = await placesNearby(out.lat, out.lon, out.name);
+      if (places) {
+        out.place_id = places.place_id;
+        out.address = places.address;
+        if (!out.name) out.name = places.name;
+        out.raw.places_primary_type = places.primary_type;
+        out.source = "google_places";
+      }
+    }
+
+    console.log(JSON.stringify(out, null, 2));
+  } catch (e) {
+    out.error = String(e?.message || e);
+    console.log(JSON.stringify(out, null, 2));
+    process.exit(1);
+  }
+})();

@@ -1,0 +1,938 @@
+#!/usr/bin/env node
+"use strict";
+
+const fs = require("fs");
+const path = require("path");
+const { execSync } = require("child_process");
+
+// ── Paths ──────────────────────────────────────────────────────────────────
+const { installTools } = require("../lib/root.cjs");
+const { instance } = require("../lib/instance.cjs");
+const STATE_FILE = installTools("data", "flights.json");
+const LOG_FILE = installTools("logs", "flight-monitor.log");
+
+// ── Hooks API (alert delivery) ─────────────────────────────────────────────
+const JORI_SEND = path.join(__dirname, "jori-send-curl");
+
+// ── Time zone ──────────────────────────────────────────────────────────────
+// Departure times are entered and shown in the installation's home zone
+// (instance().tz); each flight stores its zone as departureTZ.
+const HOME_TZ = instance().tz;
+
+/** The zone's short name at an instant ("CET", "GMT+3"), for display. */
+function tzLabel(at = new Date(), tz = HOME_TZ) {
+  try {
+    const p = new Intl.DateTimeFormat("en-US", { timeZone: tz, timeZoneName: "short" }).formatToParts(new Date(at));
+    return (p.find((x) => x.type === "timeZoneName") || {}).value || tz;
+  } catch {
+    return tz;
+  }
+}
+
+// ── OpenSky API ────────────────────────────────────────────────────────────
+const OPENSKY_BASE = "https://opensky-network.org/api";
+const OPENSKY_AUTH_URL =
+  "https://auth.opensky-network.org/auth/realms/opensky-network/protocol/openid-connect/token";
+const CREDIT_SOFT_LIMIT = 300;
+const CREDIT_HARD_LIMIT = 350;
+
+// ── Thresholds ─────────────────────────────────────────────────────────────
+const MONITOR_WINDOW_BEFORE_MS = 2 * 3600_000; // start 2h before departure
+const MONITOR_WINDOW_AFTER_MS = 8 * 3600_000; // stop 8h after departure
+const DELAY_THRESHOLD_MS = 30 * 60_000; // 30 min
+const SIGNIFICANT_DELAY_MS = 90 * 60_000; // 90 min
+const NEAR_AIRPORT_KM = 30;
+const ETA_CHANGE_THRESHOLD_MIN = 15;
+
+// ── Airline IATA → ICAO callsign prefix ────────────────────────────────────
+const AIRLINE_ICAO = {
+  AA: "AAL", UA: "UAL", DL: "DAL", B6: "JBU", NK: "NKS", WN: "SWA",
+  AS: "ASA", F9: "FFT", HA: "HAL", G4: "AAY", SY: "SCX", QR: "QTR",
+  EK: "UAE", BA: "BAW", LH: "DLH", AF: "AFR", AC: "ACA", AM: "AMX",
+  AV: "AVA", CM: "CMP", JL: "JAL", NH: "ANA", TK: "THY", LX: "SWR",
+  IB: "IBE", TP: "TAP", KL: "KLM", SK: "SAS", VS: "VIR", QF: "QFA",
+  NZ: "ANZ", LY: "ELY", EI: "EIN", AZ: "ITY", OS: "AUA", SN: "BEL",
+  FI: "ICE", WS: "WJA", TS: "TSC", MX: "MXA", XP: "CXP", Y4: "VOI",
+  VB: "VIV", JA: "BON", LA: "LAN", AR: "ARG", UX: "AEA",
+};
+
+// ── Airport IATA → ICAO ───────────────────────────────────────────────────
+const AIRPORT_ICAO = {
+  // US
+  JFK: "KJFK", LAX: "KLAX", MIA: "KMIA", EWR: "KEWR", ORD: "KORD", // kernel-guard-ok: public IATA→ICAO airport table
+  ATL: "KATL", SFO: "KSFO", DFW: "KDFW", DEN: "KDEN", SEA: "KSEA",
+  BOS: "KBOS", IAD: "KIAD", DCA: "KDCA", LGA: "KLGA", IAH: "KIAH", // kernel-guard-ok: public IATA→ICAO airport table
+  MCO: "KMCO", FLL: "KFLL", PHL: "KPHL", CLT: "KCLT", PHX: "KPHX", // kernel-guard-ok: public IATA→ICAO airport table
+  MSP: "KMSP", DTW: "KDTW", BWI: "KBWI", SAN: "KSAN", TPA: "KTPA",
+  SLC: "KSLC", PDX: "KPDX", STL: "KSTL", BNA: "KBNA", AUS: "KAUS",
+  RDU: "KRDU", HNL: "PHNL", SJU: "TJSJ", ANC: "PANC", PBI: "KPBI",
+  RSW: "KRSW", JAX: "KJAX", MSY: "KMSY", OAK: "KOAK", SJC: "KSJC",
+  SMF: "KSMF", BUR: "KBUR", IND: "KIND", CMH: "KCMH", PIT: "KPIT",
+  CLE: "KCLE", MKE: "KMKE", SAT: "KSAT", OMA: "KOMA", MCI: "KMCI", // kernel-guard-ok: public IATA→ICAO airport table
+  // Canada
+  YYZ: "CYYZ", YVR: "CYVR", YUL: "CYUL", YOW: "CYOW", YYC: "CYYC",
+  // Mexico / Caribbean / Latin America
+  MEX: "MMMX", CUN: "MMUN", GDL: "MMGL", SJO: "MROC", PTY: "MPTO",
+  BOG: "SKBO", GRU: "SBGR", EZE: "SAEZ", SCL: "SCEL", LIM: "SPJC",
+  // Europe
+  LHR: "EGLL", CDG: "LFPG", FRA: "EDDF", AMS: "EHAM", FCO: "LIRF",
+  MAD: "LEMD", BCN: "LEBL", IST: "LTFM", MUC: "EDDM", ZRH: "LSZH",
+  VIE: "LOWW", CPH: "EKCH", OSL: "ENGM", ARN: "ESSA", HEL: "EFHK",
+  DUB: "EIDW", LIS: "LPPT", ATH: "LGAV", TLV: "LLBG", // kernel-guard-ok: public IATA→ICAO airport table
+  // Middle East / Africa
+  DXB: "OMDB", DOH: "OTHH", AUH: "OMAA", JED: "OEJN", RUH: "OERK",
+  CAI: "HECA", JNB: "FAOR", CPT: "FACT",
+  // Asia / Pacific
+  NRT: "RJAA", HND: "RJTT", ICN: "RKSI", SIN: "WSSS", HKG: "VHHH",
+  BKK: "VTBS", PEK: "ZBAA", PVG: "ZSPD", SYD: "YSSY", MEL: "YMML",
+  AKL: "NZAA", DEL: "VIDP", BOM: "VABB", KUL: "WMKK", MNL: "RPLL",
+};
+
+// ── Airport coordinates (lat, lon) ────────────────────────────────────────
+// Public airport positions to ~1 km (two decimals): plenty for the ETA and
+// NEAR_AIRPORT_KM checks.
+const AIRPORT_COORDS = {
+  KJFK: [40.64, -73.78], KLAX: [33.94, -118.41],
+  KMIA: [25.80, -80.29], KEWR: [40.69, -74.17],
+  KORD: [41.97, -87.91], KATL: [33.64, -84.43],
+  KSFO: [37.62, -122.38], KDFW: [32.90, -97.04],
+  KDEN: [39.86, -104.67], KSEA: [47.45, -122.31],
+  KBOS: [42.37, -71.01], KIAD: [38.95, -77.46],
+  KDCA: [38.85, -77.04], KLGA: [40.78, -73.87],
+  KIAH: [29.99, -95.34], KMCO: [28.43, -81.31],
+  KFLL: [26.07, -80.15], KPHL: [39.87, -75.24],
+  KCLT: [35.21, -80.94], KPHX: [33.44, -112.01],
+  KMSP: [44.88, -93.22], KDTW: [42.21, -83.35],
+  KBWI: [39.18, -76.67], KSAN: [32.73, -117.19],
+  KTPA: [27.98, -82.53], KSLC: [40.79, -111.98],
+  KPDX: [45.59, -122.60], KSTL: [38.75, -90.37],
+  KBNA: [36.13, -86.68], KAUS: [30.20, -97.67],
+  KRDU: [35.88, -78.79], PHNL: [21.32, -157.92],
+  TJSJ: [18.44, -66.00], PANC: [61.17, -150.00],
+  KPBI: [26.68, -80.10], KRSW: [26.54, -81.76],
+  KJAX: [30.49, -81.69], KMSY: [29.99, -90.26],
+  KOAK: [37.72, -122.22], KSJC: [37.36, -121.93],
+  KSMF: [38.70, -121.59], KBUR: [34.20, -118.36],
+  KIND: [39.72, -86.29], KCMH: [40.00, -82.89],
+  KPIT: [40.49, -80.23], KCLE: [41.41, -81.85],
+  KMKE: [42.95, -87.90], KSAT: [29.53, -98.47],
+  KOMA: [41.30, -95.89], KMCI: [39.30, -94.71],
+  CYYZ: [43.68, -79.62], CYVR: [49.20, -123.18],
+  CYUL: [45.47, -73.74], CYOW: [45.32, -75.67],
+  CYYC: [51.12, -114.01],
+  MMMX: [19.44, -99.07], MMUN: [21.04, -86.88],
+  MMGL: [20.52, -103.31], MROC: [9.99, -84.21],
+  MPTO: [9.07, -79.38], SKBO: [4.70, -74.15],
+  SBGR: [-23.44, -46.47], SAEZ: [-34.82, -58.54],
+  SCEL: [-33.39, -70.79], SPJC: [-12.02, -77.11],
+  EGLL: [51.47, -0.45], LFPG: [49.01, 2.55],
+  EDDF: [50.04, 8.56], EHAM: [52.31, 4.77],
+  LIRF: [41.80, 12.24], LEMD: [40.50, -3.57],
+  LEBL: [41.30, 2.08], LTFM: [41.28, 28.75],
+  EDDM: [48.35, 11.79], LSZH: [47.46, 8.55],
+  LOWW: [48.11, 16.57], EKCH: [55.62, 12.66],
+  ENGM: [60.19, 11.10], ESSA: [59.65, 17.92],
+  EFHK: [60.32, 24.96], EIDW: [53.43, -6.25],
+  LPPT: [38.78, -9.14], LGAV: [37.94, 23.94],
+  LLBG: [32.01, 34.89],
+  OMDB: [25.25, 55.37], OTHH: [25.27, 51.61],
+  OMAA: [24.43, 54.65], OEJN: [21.68, 39.16],
+  OERK: [24.96, 46.70], HECA: [30.12, 31.41],
+  FAOR: [-26.14, 28.25], FACT: [-33.97, 18.60],
+  RJAA: [35.76, 140.39], RJTT: [35.55, 139.78],
+  RKSI: [37.46, 126.44], WSSS: [1.35, 103.99],
+  VHHH: [22.31, 113.92], VTBS: [13.69, 100.75],
+  ZBAA: [40.08, 116.60], ZSPD: [31.14, 121.81],
+  YSSY: [-33.95, 151.18], YMML: [-37.67, 144.84],
+  NZAA: [-37.01, 174.79], VIDP: [28.56, 77.10],
+  VABB: [19.09, 72.87], WMKK: [2.75, 101.71],
+  RPLL: [14.51, 121.02],
+};
+
+// ── Utility functions ──────────────────────────────────────────────────────
+
+function haversineKm(lat1, lon1, lat2, lon2) {
+  const R = 6371;
+  const dLat = ((lat2 - lat1) * Math.PI) / 180;
+  const dLon = ((lon2 - lon1) * Math.PI) / 180;
+  const a =
+    Math.sin(dLat / 2) ** 2 +
+    Math.cos((lat1 * Math.PI) / 180) *
+      Math.cos((lat2 * Math.PI) / 180) *
+      Math.sin(dLon / 2) ** 2;
+  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+}
+
+function parseFlightNumber(input) {
+  const m = input.toUpperCase().match(/^([A-Z]{2})(\d+)$/);
+  if (!m) return null;
+  const iata = m[1];
+  const num = m[2];
+  const icaoPrefix = AIRLINE_ICAO[iata];
+  if (!icaoPrefix) return null;
+  return { iata, num, callsign: icaoPrefix + num };
+}
+
+function resolveAirport(code) {
+  const upper = code.toUpperCase();
+  const icao = AIRPORT_ICAO[upper] || upper; // allow raw ICAO input
+  const coords = AIRPORT_COORDS[icao];
+  return { iata: upper, icao, coords };
+}
+
+function flag(args, name) {
+  const i = args.indexOf("--" + name);
+  if (i === -1) return null;
+  return args[i + 1] || null;
+}
+
+function hasFlag(args, name) {
+  return args.includes("--" + name);
+}
+
+function log(msg) {
+  const ts = new Date().toISOString();
+  const line = `${ts} [flight] ${msg}`;
+  try {
+    fs.appendFileSync(LOG_FILE, line + "\n");
+  } catch {}
+  if (process.env.FLIGHT_VERBOSE) console.error(line);
+}
+
+// ── State file I/O ─────────────────────────────────────────────────────────
+
+function loadState() {
+  try {
+    return JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
+  } catch {
+    return { flights: [], creditUsage: { date: today(), used: 0 } };
+  }
+}
+
+function saveState(state) {
+  fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2) + "\n");
+}
+
+function today() {
+  return new Date().toISOString().slice(0, 10);
+}
+
+// ── OpenSky API client ─────────────────────────────────────────────────────
+
+let _oauthToken = null;
+let _oauthExpiry = 0;
+
+async function getOAuthToken() {
+  const clientId = process.env.OPENSKY_CLIENT_ID;
+  const clientSecret = process.env.OPENSKY_CLIENT_SECRET;
+  if (!clientId || !clientSecret) return null;
+  if (_oauthToken && Date.now() < _oauthExpiry - 60_000) return _oauthToken;
+
+  const res = await fetch(OPENSKY_AUTH_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({
+      grant_type: "client_credentials",
+      client_id: clientId,
+      client_secret: clientSecret,
+    }),
+    signal: AbortSignal.timeout(10_000),
+  });
+  if (!res.ok) {
+    log(`OAuth token request failed: ${res.status}`);
+    return null;
+  }
+  const data = await res.json();
+  _oauthToken = data.access_token;
+  _oauthExpiry = Date.now() + data.expires_in * 1000;
+  return _oauthToken;
+}
+
+async function openskyFetch(endpoint, params, state) {
+  // Credit check
+  if (state.creditUsage.date !== today()) {
+    state.creditUsage = { date: today(), used: 0 };
+  }
+  if (state.creditUsage.used >= CREDIT_HARD_LIMIT) {
+    log("Credit hard limit reached, skipping API call");
+    return null;
+  }
+
+  const url = new URL(OPENSKY_BASE + endpoint);
+  for (const [k, v] of Object.entries(params || {})) {
+    url.searchParams.set(k, v);
+  }
+
+  const headers = {};
+  const token = await getOAuthToken();
+  if (token) headers["Authorization"] = `Bearer ${token}`;
+
+  try {
+    const res = await fetch(url.toString(), {
+      headers,
+      signal: AbortSignal.timeout(15_000),
+    });
+
+    if (res.status === 429) {
+      const retry = res.headers.get("X-Rate-Limit-Retry-After-Seconds");
+      log(`Rate limited. Retry after ${retry || "?"}s`);
+      return null;
+    }
+    if (!res.ok) {
+      log(`OpenSky ${endpoint} returned ${res.status}`);
+      return null;
+    }
+
+    state.creditUsage.used++;
+    return await res.json();
+  } catch (err) {
+    log(`OpenSky fetch error: ${err.message}`);
+    return null;
+  }
+}
+
+// ── Alert delivery ─────────────────────────────────────────────────────────
+
+async function sendAlert(text) {
+  log(`ALERT: ${text}`);
+  try {
+    execSync(`${JORI_SEND}`, { input: text, timeout: 10_000 });
+  } catch (err) {
+    log(`Alert delivery failed: ${err.message}`);
+  }
+}
+
+function shouldAlert(flight, alertType, cooldownMs) {
+  if (alertType === "airborne" || alertType === "landed") {
+    // One-shot alerts: check if already sent
+    if (flight.alertsSent && flight.alertsSent.includes(alertType)) return false;
+    return true;
+  }
+  if (!flight.lastAlertAt || !flight.lastAlertType) return true;
+  if (flight.lastAlertType !== alertType) return true;
+  return Date.now() - new Date(flight.lastAlertAt).getTime() > cooldownMs;
+}
+
+function markAlert(flight, alertType) {
+  flight.lastAlertAt = new Date().toISOString();
+  flight.lastAlertType = alertType;
+  if (!flight.alertsSent) flight.alertsSent = [];
+  if (!flight.alertsSent.includes(alertType)) flight.alertsSent.push(alertType);
+}
+
+// ── ETA calculation ────────────────────────────────────────────────────────
+
+function calculateETA(lat, lon, speedMs, destCoords) {
+  if (!destCoords || speedMs < 50) return null; // < ~100 kts, unreliable
+  const distKm = haversineKm(lat, lon, destCoords[0], destCoords[1]);
+  const speedKmh = speedMs * 3.6;
+  const hoursRemaining = distKm / speedKmh;
+  return new Date(Date.now() + hoursRemaining * 3600_000);
+}
+
+// ── Format helpers ─────────────────────────────────────────────────────────
+
+function fmtDate(iso) {
+  const d = new Date(iso);
+  return d.toLocaleDateString("en-US", {
+    month: "short", day: "numeric", year: "numeric",
+    timeZone: HOME_TZ,
+  });
+}
+
+function fmtTime(iso) {
+  const d = new Date(iso);
+  return d.toLocaleTimeString("en-US", {
+    hour: "numeric", minute: "2-digit", timeZone: HOME_TZ,
+  });
+}
+
+function fmtAlt(meters) {
+  if (meters == null) return "N/A";
+  return Math.round(meters * 3.28084).toLocaleString() + " ft";
+}
+
+function fmtSpeed(ms) {
+  if (ms == null) return "N/A";
+  return Math.round(ms * 1.94384) + " kts";
+}
+
+function fmtStatus(s) {
+  const map = {
+    SCHEDULED: "Scheduled",
+    ACTIVE: "Active (on ground at origin)",
+    AIRBORNE: "Airborne",
+    LANDED: "Landed",
+    COMPLETED: "Completed",
+    CANCELLED: "Cancelled",
+    UNKNOWN: "Unknown",
+  };
+  return map[s] || s;
+}
+
+// ── Commands ───────────────────────────────────────────────────────────────
+
+function cmdAdd(args) {
+  const flightInput = args[0];
+  if (!flightInput) {
+    console.error("Usage: flight add <number> --date YYYY-MM-DD --departs HH:MM --from IATA --to IATA");
+    process.exit(1);
+  }
+
+  const parsed = parseFlightNumber(flightInput);
+  if (!parsed) {
+    console.error(`Could not parse flight number: ${flightInput}`);
+    console.error("Expected format: AA123 (IATA airline code + flight number)");
+    console.error("Known airlines: " + Object.keys(AIRLINE_ICAO).join(", "));
+    process.exit(1);
+  }
+
+  const date = flag(args, "date");
+  const departs = flag(args, "departs");
+  const from = flag(args, "from");
+  const to = flag(args, "to");
+
+  if (!date || !departs || !from || !to) {
+    console.error("Required flags: --date YYYY-MM-DD --departs HH:MM --from IATA --to IATA");
+    process.exit(1);
+  }
+
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+    console.error("Invalid date format. Use YYYY-MM-DD");
+    process.exit(1);
+  }
+  if (!/^\d{1,2}:\d{2}$/.test(departs)) {
+    console.error("Invalid time format. Use HH:MM");
+    process.exit(1);
+  }
+
+  const fromAirport = resolveAirport(from);
+  const toAirport = resolveAirport(to);
+
+  if (!fromAirport.coords) {
+    console.error(`Unknown airport: ${from}. Pass ICAO code or add to lookup table.`);
+    process.exit(1);
+  }
+  if (!toAirport.coords) {
+    console.error(`Unknown airport: ${to}. Pass ICAO code or add to lookup table.`);
+    process.exit(1);
+  }
+
+  // Store the home-zone local time string; the monitor interprets it with
+  // departureTZ (parseDepartureTime).
+  const id = `${flightInput.toUpperCase()}-${date}`;
+
+  const state = loadState();
+  if (state.flights.find((f) => f.id === id)) {
+    console.error(`Flight ${id} already being monitored.`);
+    process.exit(1);
+  }
+
+  const flight = {
+    id,
+    flightNumber: flightInput.toUpperCase(),
+    callsign: parsed.callsign,
+    date,
+    departureLocal: `${date}T${departs.padStart(5, "0")}:00`,
+    departureTZ: HOME_TZ,
+    fromIATA: fromAirport.iata,
+    toIATA: toAirport.iata,
+    fromICAO: fromAirport.icao,
+    toICAO: toAirport.icao,
+    fromCoords: fromAirport.coords,
+    toCoords: toAirport.coords,
+    icao24: null,
+    status: "SCHEDULED",
+    statusUpdatedAt: new Date().toISOString(),
+    lastCheckedAt: null,
+    lastAlertAt: null,
+    lastAlertType: null,
+    alertsSent: [],
+    airborneAt: null,
+    landedAt: null,
+    position: null,
+    eta: null,
+    addedAt: new Date().toISOString(),
+  };
+
+  state.flights.push(flight);
+  saveState(state);
+
+  if (hasFlag(args, "json")) {
+    console.log(JSON.stringify(flight, null, 2));
+  } else {
+    console.log(`Added flight ${flight.flightNumber} (${flight.fromIATA} -> ${flight.toIATA})`);
+    console.log(`  Date:      ${fmtDate(flight.departureLocal)}`);
+    console.log(`  Departure: ${departs} ${tzLabel(parseDepartureTime(flight) || Date.now())}`);
+    console.log(`  Callsign:  ${flight.callsign}`);
+    console.log(`  Status:    ${fmtStatus(flight.status)}`);
+    console.log(`  Monitor starts ~2h before departure`);
+  }
+}
+
+function cmdList(args) {
+  const state = loadState();
+  const active = state.flights.filter((f) => f.status !== "COMPLETED");
+
+  if (hasFlag(args, "json")) {
+    console.log(JSON.stringify(active, null, 2));
+    return;
+  }
+
+  if (active.length === 0) {
+    console.log("No monitored flights.");
+    return;
+  }
+
+  console.log("Monitored Flights:");
+  for (const f of active) {
+    const dep = f.departureLocal.slice(11, 16);
+    console.log(
+      `  ${f.flightNumber.padEnd(8)} ${f.fromIATA} -> ${f.toIATA}  ${fmtDate(f.departureLocal)}  ${dep} ${tzLabel()}  ${fmtStatus(f.status)}`
+    );
+  }
+  console.log(`\nCredits used today: ${state.creditUsage.used}`);
+}
+
+function cmdRemove(args) {
+  const flightInput = args[0];
+  if (!flightInput) {
+    console.error("Usage: flight remove <flight_number>");
+    process.exit(1);
+  }
+
+  const state = loadState();
+  const upper = flightInput.toUpperCase();
+  const idx = state.flights.findIndex(
+    (f) => f.flightNumber === upper || f.id === upper || f.id.startsWith(upper + "-")
+  );
+
+  if (idx === -1) {
+    console.error(`Flight not found: ${flightInput}`);
+    process.exit(1);
+  }
+
+  const removed = state.flights.splice(idx, 1)[0];
+  saveState(state);
+
+  if (hasFlag(args, "json")) {
+    console.log(JSON.stringify({ removed: removed.id }));
+  } else {
+    console.log(`Removed flight ${removed.id}`);
+  }
+}
+
+async function cmdStatus(args) {
+  const state = loadState();
+  const flightInput = args[0];
+  const jsonOut = hasFlag(args, "json");
+
+  let flights;
+  if (flightInput) {
+    const upper = flightInput.toUpperCase();
+    flights = state.flights.filter(
+      (f) => f.flightNumber === upper || f.id === upper || f.id.startsWith(upper + "-")
+    );
+    if (flights.length === 0) {
+      console.error(`Flight not found: ${flightInput}`);
+      process.exit(1);
+    }
+  } else {
+    flights = state.flights.filter((f) => !["COMPLETED", "CANCELLED"].includes(f.status));
+  }
+
+  if (flights.length === 0) {
+    console.log("No active flights to show status for.");
+    return;
+  }
+
+  // Refresh live data for each flight
+  for (const f of flights) {
+    if (f.icao24) {
+      const data = await openskyFetch("/states/all", { icao24: f.icao24 }, state);
+      if (data && data.states && data.states.length > 0) {
+        const sv = data.states[0];
+        f.position = {
+          lat: sv[6],
+          lon: sv[5],
+          altitude: sv[7],
+          speed: sv[9],
+          heading: sv[10],
+          verticalRate: sv[11],
+          onGround: sv[8],
+        };
+        f.lastCheckedAt = new Date().toISOString();
+      }
+    }
+  }
+
+  saveState(state);
+
+  if (jsonOut) {
+    console.log(JSON.stringify(flights, null, 2));
+    return;
+  }
+
+  for (const f of flights) {
+    console.log(`\nFlight ${f.flightNumber} (${f.fromIATA} -> ${f.toIATA})`);
+    console.log(`  Date:      ${fmtDate(f.departureLocal)}`);
+    console.log(`  Departure: ${f.departureLocal.slice(11, 16)} ${tzLabel(parseDepartureTime(f) || Date.now(), f.departureTZ || HOME_TZ)} (scheduled)`);
+    console.log(`  Callsign:  ${f.callsign}`);
+    console.log(`  ICAO24:    ${f.icao24 || "not yet discovered"}`);
+    console.log(`  Status:    ${fmtStatus(f.status)}`);
+    if (f.position) {
+      const p = f.position;
+      console.log(
+        `  Position:  ${p.lat?.toFixed(2)}N, ${Math.abs(p.lon)?.toFixed(2)}${p.lon < 0 ? "W" : "E"}  alt ${fmtAlt(p.altitude)}  speed ${fmtSpeed(p.speed)}`
+      );
+    }
+    if (f.eta) {
+      console.log(`  ETA:       ${fmtTime(f.eta)} ${tzLabel(f.eta)}`);
+    }
+    if (f.lastCheckedAt) {
+      const ago = Math.round((Date.now() - new Date(f.lastCheckedAt).getTime()) / 60_000);
+      console.log(`  Last check: ${ago} min ago`);
+    }
+  }
+}
+
+// ── Monitor (one tick) ─────────────────────────────────────────────────────
+
+async function cmdMonitor() {
+  const state = loadState();
+  const now = Date.now();
+
+  // Auto-archive old flights
+  for (const f of state.flights) {
+    if (f.status === "LANDED") {
+      const landedAt = new Date(f.landedAt || f.statusUpdatedAt).getTime();
+      if (now - landedAt > 24 * 3600_000) {
+        f.status = "COMPLETED";
+        f.statusUpdatedAt = new Date().toISOString();
+        log(`${f.id} auto-completed (24h after landing)`);
+      }
+    }
+  }
+
+  // Filter to active flights in monitoring window
+  const active = state.flights.filter((f) => {
+    if (["COMPLETED", "CANCELLED"].includes(f.status)) return false;
+    const deptMs = parseDepartureTime(f);
+    if (!deptMs) return false;
+    const windowStart = deptMs - MONITOR_WINDOW_BEFORE_MS;
+    const windowEnd = deptMs + MONITOR_WINDOW_AFTER_MS;
+    return now >= windowStart && now <= windowEnd;
+  });
+
+  if (active.length === 0) {
+    log("No flights in active monitoring window");
+    saveState(state);
+    return;
+  }
+
+  // Adaptive polling: reduce frequency if credits are low
+  const pollIntervalMin =
+    state.creditUsage.used >= CREDIT_SOFT_LIMIT ? 10 : 5;
+
+  for (const f of active) {
+    // Skip if checked recently (adaptive interval)
+    if (f.lastCheckedAt) {
+      const sinceLastCheck = (now - new Date(f.lastCheckedAt).getTime()) / 60_000;
+      if (sinceLastCheck < pollIntervalMin - 1) continue;
+    }
+
+    log(`Checking ${f.id} (status: ${f.status})`);
+
+    // Phase 1: Discovery — find icao24 from departure data
+    if (!f.icao24) {
+      await discoverICAO24(f, state);
+    }
+
+    // Phase 2: Track position
+    if (f.icao24) {
+      await trackPosition(f, state);
+    }
+
+    // Phase 3: Check for status transitions and alerts
+    await checkAlerts(f, state);
+
+    f.lastCheckedAt = new Date().toISOString();
+  }
+
+  saveState(state);
+}
+
+function parseDepartureTime(f) {
+  // Parse the local time string in the flight's zone (departureTZ, else home).
+  try {
+    // departureLocal is like "2026-03-25T14:30:00"
+    const d = new Date(f.departureLocal);
+    if (isNaN(d.getTime())) return null;
+    // Adjust for the zone's offset (approximate, fine for scheduling)
+    const etStr = d.toLocaleString("en-US", { timeZone: f.departureTZ || HOME_TZ });
+    const etDate = new Date(etStr);
+    const utcStr = d.toLocaleString("en-US", { timeZone: "UTC" });
+    const utcDate = new Date(utcStr);
+    const offsetMs = utcDate.getTime() - etDate.getTime();
+    return d.getTime() + offsetMs;
+  } catch {
+    return null;
+  }
+}
+
+async function discoverICAO24(f, state) {
+  const deptMs = parseDepartureTime(f);
+  if (!deptMs) return;
+
+  const begin = Math.floor((deptMs - 2 * 3600_000) / 1000);
+  const end = Math.floor((deptMs + 2 * 3600_000) / 1000);
+
+  const data = await openskyFetch("/flights/departure", {
+    airport: f.fromICAO,
+    begin,
+    end,
+  }, state);
+
+  if (!data || !Array.isArray(data)) {
+    log(`No departure data for ${f.fromICAO}`);
+    return;
+  }
+
+  const match = data.find(
+    (d) => d.callsign && d.callsign.trim() === f.callsign
+  );
+
+  if (match) {
+    f.icao24 = match.icao24;
+    log(`Discovered icao24 for ${f.id}: ${f.icao24}`);
+  } else {
+    log(`Callsign ${f.callsign} not found in ${data.length} departures from ${f.fromICAO}`);
+  }
+}
+
+async function trackPosition(f, state) {
+  const data = await openskyFetch("/states/all", { icao24: f.icao24 }, state);
+
+  if (!data || !data.states || data.states.length === 0) {
+    log(`No state data for icao24 ${f.icao24}`);
+    // If airborne and suddenly no data, might have landed
+    if (f.status === "AIRBORNE") {
+      // Check arrivals at destination
+      await checkArrival(f, state);
+    }
+    return;
+  }
+
+  const sv = data.states[0];
+  const lat = sv[6];
+  const lon = sv[5];
+  const alt = sv[7];
+  const speed = sv[9];
+  const onGround = sv[8];
+  const heading = sv[10];
+  const vertRate = sv[11];
+
+  f.position = { lat, lon, altitude: alt, speed, heading, verticalRate: vertRate, onGround };
+
+  const oldStatus = f.status;
+
+  if (onGround && f.fromCoords) {
+    const distFromOrigin = haversineKm(lat, lon, f.fromCoords[0], f.fromCoords[1]);
+    if (distFromOrigin < NEAR_AIRPORT_KM && f.status === "SCHEDULED") {
+      f.status = "ACTIVE";
+      f.statusUpdatedAt = new Date().toISOString();
+      log(`${f.id} status → ACTIVE (on ground at ${f.fromIATA})`);
+    }
+
+    // Check if landed at destination
+    if (f.toCoords) {
+      const distToDest = haversineKm(lat, lon, f.toCoords[0], f.toCoords[1]);
+      if (distToDest < NEAR_AIRPORT_KM && ["AIRBORNE", "ACTIVE"].includes(f.status)) {
+        f.status = "LANDED";
+        f.landedAt = new Date().toISOString();
+        f.statusUpdatedAt = new Date().toISOString();
+        log(`${f.id} status → LANDED at ${f.toIATA}`);
+      }
+    }
+  } else if (!onGround && alt > 300) {
+    // 300m ~ 1000ft, clearly airborne
+    if (["SCHEDULED", "ACTIVE"].includes(f.status)) {
+      f.status = "AIRBORNE";
+      f.airborneAt = new Date().toISOString();
+      f.statusUpdatedAt = new Date().toISOString();
+      log(`${f.id} status → AIRBORNE`);
+    }
+
+    // Update ETA
+    if (f.toCoords && speed > 50) {
+      const eta = calculateETA(lat, lon, speed, f.toCoords);
+      if (eta) f.eta = eta.toISOString();
+    }
+  }
+}
+
+async function checkArrival(f, state) {
+  const now = Math.floor(Date.now() / 1000);
+  const data = await openskyFetch("/flights/arrival", {
+    airport: f.toICAO,
+    begin: now - 3600,
+    end: now,
+  }, state);
+
+  if (!data || !Array.isArray(data)) return;
+
+  const match = data.find(
+    (d) => d.callsign && d.callsign.trim() === f.callsign
+  );
+
+  if (match) {
+    f.status = "LANDED";
+    f.landedAt = new Date().toISOString();
+    f.statusUpdatedAt = new Date().toISOString();
+    log(`${f.id} confirmed LANDED at ${f.toIATA} (arrivals endpoint)`);
+  }
+}
+
+async function checkAlerts(f, state) {
+  const deptMs = parseDepartureTime(f);
+  if (!deptMs) return;
+  const now = Date.now();
+
+  // Delay alerts
+  if (["SCHEDULED", "ACTIVE"].includes(f.status)) {
+    if (now > deptMs + SIGNIFICANT_DELAY_MS) {
+      if (shouldAlert(f, "significant-delay", 60 * 60_000)) {
+        const delayMin = Math.round((now - deptMs) / 60_000);
+        await sendAlert(
+          `Flight ${f.flightNumber} (${f.fromIATA} -> ${f.toIATA}, ${fmtDate(f.departureLocal)})\n` +
+          `Status: SIGNIFICANT DELAY — not airborne ${delayMin} min past scheduled departure (${f.departureLocal.slice(11, 16)} ${tzLabel(parseDepartureTime(f) || Date.now(), f.departureTZ || HOME_TZ)}).\n` +
+          `Last seen: ${f.position ? `on ground at ${f.fromIATA}` : "not yet tracked"}.`
+        );
+        markAlert(f, "significant-delay");
+      }
+    } else if (now > deptMs + DELAY_THRESHOLD_MS) {
+      if (shouldAlert(f, "delay", 30 * 60_000)) {
+        const delayMin = Math.round((now - deptMs) / 60_000);
+        await sendAlert(
+          `Flight ${f.flightNumber} (${f.fromIATA} -> ${f.toIATA}, ${fmtDate(f.departureLocal)})\n` +
+          `Status: POSSIBLE DELAY — not airborne ${delayMin} min past scheduled departure (${f.departureLocal.slice(11, 16)} ${tzLabel(parseDepartureTime(f) || Date.now(), f.departureTZ || HOME_TZ)}).\n` +
+          `Last seen: ${f.position ? `on ground at ${f.fromIATA}` : "not yet tracked"}.`
+        );
+        markAlert(f, "delay");
+      }
+    }
+  }
+
+  // Airborne alert
+  if (f.status === "AIRBORNE" && shouldAlert(f, "airborne", 0)) {
+    const actualDeptMin = f.airborneAt
+      ? Math.round((new Date(f.airborneAt).getTime() - deptMs) / 60_000)
+      : null;
+    const delayNote = actualDeptMin && actualDeptMin > 10
+      ? ` (departed ${actualDeptMin} min late)`
+      : "";
+    await sendAlert(
+      `Flight ${f.flightNumber} (${f.fromIATA} -> ${f.toIATA}) is now airborne${delayNote}.\n` +
+      (f.eta ? `ETA: ${fmtTime(f.eta)} ${tzLabel(f.eta)}` : "")
+    );
+    markAlert(f, "airborne");
+  }
+
+  // Landed alert
+  if (f.status === "LANDED" && shouldAlert(f, "landed", 0)) {
+    await sendAlert(
+      `Flight ${f.flightNumber} has landed at ${f.toIATA}.\n` +
+      `Landed: ${fmtTime(f.landedAt)} ${tzLabel(f.landedAt)}`
+    );
+    markAlert(f, "landed");
+  }
+
+  // ETA change alert
+  if (f.status === "AIRBORNE" && f.eta && f.lastReportedETA) {
+    const etaDiff = Math.abs(
+      new Date(f.eta).getTime() - new Date(f.lastReportedETA).getTime()
+    ) / 60_000;
+    if (etaDiff > ETA_CHANGE_THRESHOLD_MIN && shouldAlert(f, "eta-update", 30 * 60_000)) {
+      await sendAlert(
+        `Flight ${f.flightNumber} (${f.fromIATA} -> ${f.toIATA}) ETA updated.\n` +
+        `New ETA: ${fmtTime(f.eta)} ${tzLabel(f.eta)} (was ${fmtTime(f.lastReportedETA)} ${tzLabel(f.lastReportedETA)})`
+      );
+      markAlert(f, "eta-update");
+      f.lastReportedETA = f.eta;
+    }
+  } else if (f.status === "AIRBORNE" && f.eta && !f.lastReportedETA) {
+    f.lastReportedETA = f.eta;
+  }
+}
+
+// ── Help ───────────────────────────────────────────────────────────────────
+
+function cmdHelp() {
+  console.log(`flight — Monitor flights via OpenSky Network
+
+Usage:
+  flight add <number> --date YYYY-MM-DD --departs HH:MM --from IATA --to IATA
+  flight status [number]     Show live status (calls OpenSky API)
+  flight list                List monitored flights
+  flight remove <number>     Stop monitoring a flight
+  flight monitor             Run one monitoring tick (used by LaunchAgent)
+  flight help                Show this help
+
+Options:
+  --json                     Output in JSON format
+  (times are in the home zone: lib/instance.cjs tz, here ${HOME_TZ})
+
+Examples:
+  flight add AA123 --date 2026-04-15 --departs 14:30 --from SEA --to SFO
+  flight status AA123
+  flight list --json
+  flight remove AA123
+
+Known airlines: ${Object.keys(AIRLINE_ICAO).join(", ")}
+Known airports: ${Object.keys(AIRPORT_ICAO).slice(0, 20).join(", ")} ...
+
+OpenSky credits: anonymous 400/day, authenticated 4000/day
+Set OPENSKY_CLIENT_ID and OPENSKY_CLIENT_SECRET for higher limits.`);
+}
+
+// ── Main ───────────────────────────────────────────────────────────────────
+
+async function main() {
+  const args = process.argv.slice(2);
+  const cmd = args[0];
+  const rest = args.slice(1);
+
+  switch (cmd) {
+    case "add":
+      cmdAdd(rest);
+      break;
+    case "status":
+      await cmdStatus(rest);
+      break;
+    case "list":
+      cmdList(rest);
+      break;
+    case "remove":
+      cmdRemove(rest);
+      break;
+    case "monitor":
+      await cmdMonitor();
+      break;
+    case "help":
+    case "--help":
+    case "-h":
+    case undefined:
+      cmdHelp();
+      break;
+    default:
+      console.error(`Unknown command: ${cmd}`);
+      cmdHelp();
+      process.exit(1);
+  }
+}
+
+main().catch((err) => {
+  console.error(`Fatal: ${err.message}`);
+  log(`Fatal: ${err.stack}`);
+  process.exit(1);
+});

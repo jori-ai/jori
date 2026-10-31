@@ -1,0 +1,564 @@
+:root {
+  --accent: #a9773c;
+  --bg: #f3f0ea;
+  --ink: #1a1a1a;
+  --muted: #6b6f76;
+  --line: #e6e1d8;
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  padding: 0;
+  background: var(--bg);
+  color: var(--ink);
+  font-family: "Segoe UI", -apple-system, BlinkMacSystemFont, "Helvetica Neue", sans-serif;
+  -webkit-text-size-adjust: 100%;
+}
+
+a { color: var(--accent); }
+
+/* ---- top bar ---- */
+.topbar {
+  position: sticky;
+  top: 0;
+  z-index: 10;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px 16px;
+  background: rgba(255, 255, 255, 0.92);
+  backdrop-filter: saturate(180%) blur(8px);
+  border-bottom: 1px solid var(--line);
+}
+.topbar .brand {
+  font-weight: 800;
+  letter-spacing: 0.02em;
+  font-size: 16px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.topbar .brand .dot { color: var(--accent); }
+.signout {
+  border: 1px solid var(--line);
+  background: #fff;
+  color: var(--muted);
+  border-radius: 999px;
+  padding: 6px 12px;
+  font-size: 13px;
+  cursor: pointer;
+}
+.signout:hover { color: var(--ink); }
+
+/* ---- date/location nav ---- */
+.datenav {
+  display: flex;
+  gap: 8px;
+  overflow-x: auto;
+  padding: 12px 16px;
+  scrollbar-width: none;
+  -webkit-overflow-scrolling: touch;
+}
+.datenav::-webkit-scrollbar { display: none; }
+.chip {
+  flex: 0 0 auto;
+  display: block;
+  min-width: 92px;
+  padding: 8px 12px;
+  border-radius: 12px;
+  border: 1px solid var(--line);
+  background: #fff;
+  text-decoration: none;
+  color: var(--ink);
+}
+.chip .wd { font-size: 11px; font-weight: 700; letter-spacing: 0.04em; text-transform: uppercase; color: var(--muted); }
+.chip .dt { font-size: 15px; font-weight: 700; margin: 1px 0; }
+.chip .loc { font-size: 12px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 140px; }
+.chip.active { background: var(--accent); border-color: var(--accent); }
+.chip.active .wd, .chip.active .dt, .chip.active .loc { color: #fff; }
+
+/* ---- day content ---- */
+.daywrap { max-width: 700px; margin: 0 auto; padding: 6px 12px 40px; }
+
+/* The area guide is the one page that earns the extra width: on a desktop it
+   puts the map in one vertical pane and the list in the other, which needs
+   room the 700px reading column can't give. Below the two-pane breakpoint it
+   is an ordinary .daywrap. */
+@media (min-width: 1024px) {
+  .daywrap-wide { max-width: 1440px; padding: 6px 24px 40px; }
+}
+
+/* The stored fragment matches the email exactly; give it the same type context
+   the email wrapper provides, and keep everything inside the viewport. */
+.day-frame {
+  font-family: "Segoe UI", -apple-system, BlinkMacSystemFont, sans-serif;
+  font-size: 15px;
+  line-height: 1.5;
+  color: #222;
+}
+.day-frame img { max-width: 100%; }
+
+.prevnext {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  max-width: 700px;
+  margin: 0 auto;
+  padding: 0 12px 32px;
+}
+.prevnext a, .prevnext span {
+  flex: 1;
+  text-align: center;
+  padding: 12px;
+  border-radius: 12px;
+  border: 1px solid var(--line);
+  background: #fff;
+  text-decoration: none;
+  color: var(--accent);
+  font-weight: 600;
+}
+.prevnext span { color: #c8c8c8; background: transparent; border-color: transparent; }
+
+.empty { max-width: 640px; margin: 40px auto; padding: 24px; text-align: center; color: var(--muted); }
+
+/* very narrow phones: shrink the fixed photo cell so rows never overflow */
+@media (max-width: 380px) {
+  .day-frame td[style*="width:112px"] { width: 88px !important; }
+  .day-frame td[style*="width:112px"] img { width: 88px !important; height: 66px !important; }
+}
+
+/* ---- login / not-authorized ---- */
+.login {
+  min-height: 100dvh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+}
+.login-card {
+  width: 100%;
+  max-width: 360px;
+  background: #fff;
+  border: 1px solid var(--line);
+  border-radius: 18px;
+  padding: 36px 28px;
+  text-align: center;
+  box-shadow: 0 8px 30px rgba(0, 0, 0, 0.06);
+}
+.login-mark { font-size: 44px; }
+.login-card h1 { font-size: 24px; margin: 10px 0 4px; }
+.login-card p { color: var(--muted); margin: 0 0 22px; }
+.login-card button {
+  width: 100%;
+  padding: 14px;
+  border: none;
+  border-radius: 12px;
+  background: var(--accent);
+  color: #fff;
+  font-weight: 700;
+  font-size: 15px;
+  cursor: pointer;
+}
+.login-card button:disabled { opacity: 0.7; cursor: default; }
+.login-link { display: inline-block; margin-top: 8px; font-weight: 600; }
+.login-error { color: #c0392b; font-size: 13px; margin-top: 14px; }
+
+/* ---- area guide (reservoir) ----
+   The guide is rendered in React (components/ReservoirList.tsx) rather than from
+   the stored `area_html` fragment, because each entry carries its own
+   done/undone button. These rules mirror the class names that
+   lib/reservoir-render.js emits, so the wiki mirror and this view stay
+   recognisably the same thing — but they are two renderers; changing one does
+   not change the other. */
+.chip .date { font-size: 12px; font-weight: 700; margin-top: 1px; color: var(--muted); }
+.chip.active .date { color: #fff; }
+
+.res-range { color: var(--muted); font-size: 13px; margin-bottom: 14px; }
+.res-progress { font-size: 12px; color: var(--muted); margin: 2px 0 10px; }
+.res-error { font-size: 13px; color: #a33; margin-bottom: 10px; }
+
+.res h2 {
+  font-size: 16px;
+  margin: 22px 0 8px;
+  padding-bottom: 4px;
+  border-bottom: 1px solid var(--line);
+}
+.res ul { list-style: none; padding: 0; margin: 0; }
+.res .res-item { padding: 11px 0; border-bottom: 1px solid var(--line); }
+
+/* Button sits to the right of the content and never shrinks away on mobile. */
+.res .res-row { display: flex; align-items: flex-start; gap: 10px; }
+.res .res-main { flex: 1 1 auto; min-width: 0; }
+.res .res-toggle {
+  flex: 0 0 auto;
+  align-self: center;
+  font: inherit;
+  font-size: 12px;
+  padding: 5px 10px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  background: #fff;
+  color: var(--muted);
+  cursor: pointer;
+  white-space: nowrap;
+}
+.res .res-toggle:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+.res .res-toggle:disabled { opacity: 0.5; cursor: default; }
+.res .res-item.res-done .res-toggle { border-color: rgba(40, 160, 90, 0.5); color: #28a05a; }
+
+/* Photo + overlaid pills. The wrap is the positioning context so the Done/Skip
+   pills can sit in the bottom-right corner of the image. */
+.res .res-photo-wrap { position: relative; margin-bottom: 8px; }
+.res .res-photo-wrap .res-photo { margin-bottom: 0; }
+.res .res-pills {
+  position: absolute;
+  right: 8px;
+  bottom: 8px;
+  display: flex;
+  gap: 6px;
+}
+.res .res-pills-inline { display: flex; gap: 6px; margin-top: 8px; }
+/* No-photo entries flow their pills under the entry. The nested .res-pills is
+   absolute so it can pin to a photo's corner; here there's no photo and no
+   positioned ancestor, so left absolute it escapes to the page's right margin.
+   Pin it back into the normal flow. */
+.res .res-pills-inline .res-pills { position: static; }
+.res .res-pill-btn {
+  font: inherit;
+  font-size: 12px;
+  font-weight: 600;
+  padding: 5px 11px;
+  border-radius: 999px;
+  border: 1px solid rgba(0, 0, 0, 0.12);
+  cursor: pointer;
+  white-space: nowrap;
+  backdrop-filter: blur(4px);
+  -webkit-backdrop-filter: blur(4px);
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.25);
+}
+/* Over-image pills need a translucent light chip so text stays readable on any
+   photo; the inline (no-photo) variant inherits the page background instead. */
+.res .res-photo-wrap .res-pill-btn { background: rgba(255, 255, 255, 0.88); color: #1a1a1a; }
+.res .res-pills-inline .res-pill-btn { background: #fff; color: var(--muted); box-shadow: none; }
+.res .res-pill-done:hover:not(:disabled) { border-color: #28a05a; color: #28a05a; }
+.res .res-pill-done.on { background: #28a05a; color: #fff; border-color: #28a05a; }
+.res .res-pill-skip:hover:not(:disabled) { border-color: #d1453b; color: #d1453b; }
+.res .res-pill-skip.on { background: #d1453b; color: #fff; border-color: #d1453b; }
+.res .res-pill-btn:disabled { opacity: 0.5; cursor: default; }
+
+.res .res-photo-badge {
+  position: absolute;
+  left: 8px;
+  top: 8px;
+  font-size: 11px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: rgba(40, 160, 90, 0.92);
+  color: #fff;
+}
+
+.res .res-name { font-weight: 600; font-size: 15px; }
+.res .res-name a { color: inherit; text-decoration: underline; text-underline-offset: 2px; }
+.res .res-sub { font-size: 14px; margin-top: 2px; }
+.res .res-sub a { color: inherit; }
+.res .res-why { color: var(--muted); font-size: 14px; margin-top: 3px; }
+.res .res-hook, .res .res-when { font-size: 13px; margin-top: 3px; color: var(--muted); }
+.res .res-src { font-size: 12px; margin-top: 2px; }
+.res .res-addr { color: var(--muted); font-size: 12px; margin-top: 3px; }
+.res .res-rating { font-size: 12px; color: var(--muted); font-weight: 400; margin-left: 3px; }
+.res .res-badge {
+  display: inline-block;
+  font-size: 11px;
+  padding: 1px 7px;
+  border-radius: 4px;
+  border: 1px solid var(--line);
+  margin-left: 5px;
+  color: var(--muted);
+  vertical-align: middle;
+}
+
+/* Already been: struck through and dimmed, but still legible and still linked —
+   a place already seen stays part of the guide rather than vanishing from it, and a
+   wrong mark has to stay visible enough to undo. */
+/* Done / skipped: struck through and dimmed, but kept on the list. Dim the
+   CONTENT pieces individually (not the whole row) so the Done/Skip pills stay
+   full-opacity and usable — a child can't be more opaque than a dimmed parent,
+   so dimming .res-main would grey out the buttons too. */
+.res .res-item.res-done .res-name,
+.res .res-item.res-skipped .res-name { text-decoration: line-through; text-decoration-thickness: 1px; }
+.res .res-item.res-done .res-name,
+.res .res-item.res-done .res-photo,
+.res .res-item.res-done .res-why,
+.res .res-item.res-done .res-hook,
+.res .res-item.res-done .res-when,
+.res .res-item.res-done .res-sub,
+.res .res-item.res-done .res-addr,
+.res .res-item.res-skipped .res-name,
+.res .res-item.res-skipped .res-photo,
+.res .res-item.res-skipped .res-why,
+.res .res-item.res-skipped .res-hook,
+.res .res-item.res-skipped .res-when,
+.res .res-item.res-skipped .res-sub,
+.res .res-item.res-skipped .res-addr { opacity: 0.45; }
+.res .res-donebadge { border-color: rgba(40, 160, 90, 0.6); color: #28a05a; }
+
+/* Guide entry photo — re-hosted Google Places image (bin/trip-reservoir-photos).
+   A FIXED height, not max-height: the photos are lazy-loaded, and a box that is
+   0px until its image arrives means every image above the viewport reflows the
+   list as it loads. That silently broke "show in list" — the jump landed on the
+   right row, then ten photos above it finished loading and pushed it 400px
+   down. object-fit:cover was already cropping, so nothing about the framing
+   changes. */
+.res .res-photo {
+  display: block;
+  width: 100%;
+  height: 200px;
+  object-fit: cover;
+  border-radius: 10px;
+  margin-bottom: 8px;
+  background: var(--line);
+}
+.res .res-item.res-done .res-photo { opacity: 0.5; }
+
+/* --- Map + numbering + clusters (2026-07-20) ------------------------------ */
+/* Every entry carries a `seq` assigned by lib/reservoir-cluster.js, so
+   the number on a list row and the number on its map pin are the same value
+   read from one source — they can't drift. */
+
+.res .res-map-wrap { position: relative; margin: 0 0 14px; }
+.res .res-map {
+  height: 340px;
+  border-radius: 12px;
+  border: 1px solid var(--line);
+  background: var(--line);
+  z-index: 0; /* keep tiles under the sheet + the page's own chrome */
+}
+.res .res-map-loading { height: 340px; border-radius: 12px; background: var(--line); }
+@media (max-width: 640px) { .res .res-map, .res .res-map-loading { height: 260px; } }
+
+/* --- Two-pane layout (2026-07-21) ----------------------------------------
+   On a wide page the map takes one vertical pane and the places/restaurants
+   the other. Below the breakpoint this is inert and
+   the panes are just two stacked blocks — map first, list under it, exactly
+   the phone layout that was there before.
+   The breakpoint below MUST stay in step with WIDE in ReservoirList.tsx: that
+   component reads the same query to decide whether a pin tap scrolls the list
+   (two panes) or opens the bottom sheet (one column). */
+@media (min-width: 1024px) {
+  .res-split {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+    gap: 24px;
+    align-items: start;
+  }
+  /* The map holds its own column and stays put while the list scrolls past it
+     — that is the whole point of the split. 64px clears the sticky topbar. */
+  .res-split .res-pane-map {
+    position: sticky;
+    top: 64px;
+    height: calc(100dvh - 96px);
+    display: flex;
+    flex-direction: column;
+  }
+  .res-split .res-pane-map .res-map-wrap {
+    flex: 1 1 auto;
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+    margin-bottom: 0;
+  }
+  .res-split .res-pane-map .res-map,
+  .res-split .res-pane-map .res-map-loading { flex: 1 1 auto; height: auto; min-height: 0; }
+  .res-split .res-pane-list { min-width: 0; }
+}
+
+.res .res-map-legend {
+  display: flex; gap: 14px; align-items: center;
+  font-size: 11px; color: var(--muted); margin-top: 6px;
+}
+.res .res-legend-pin { position: static; width: 16px; height: 16px; }
+
+/* Pins. divIcon content, so these are plain spans, not Leaflet's default img. */
+.leaflet-container .res-pin-wrap { background: none; border: 0; }
+.res-pin {
+  position: relative;
+  display: flex; align-items: center; justify-content: center;
+  width: 26px; height: 26px;
+  border-radius: 50%;
+  font: 600 12px/1 ui-sans-serif, system-ui, sans-serif;
+  color: #fff;
+  border: 2px solid #fff;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.35);
+}
+.res-pin-sight { background: var(--accent); }
+/* Food gets its own shape as well as its own colour — colour alone isn't a
+   distinction for a colour-blind reader. */
+.res-pin-food { background: #2f7d69; border-radius: 50% 50% 50% 4px; }
+.res-pin-done { background: #9aa0a6; }
+.res-pin-star {
+  position: absolute; top: -7px; right: -7px;
+  font-size: 12px; line-height: 1;
+  color: #f0b429;
+  text-shadow: 0 0 2px #fff, 0 0 3px #fff;
+}
+/* Selected pin — the map end of the two-way link with the list. Scaled and
+   ringed rather than recoloured, so it still reads as food/sight/done.
+   NOTE: z-index here is useless — Leaflet stacks the marker ELEMENTS by
+   latitude, so lifting a selected pin out of a pile is done in JS with
+   setZIndexOffset (see applySelection). */
+.res-pin-active {
+  transform: scale(1.32);
+  box-shadow: 0 0 0 3px rgba(169, 119, 60, 0.45), 0 2px 8px rgba(0, 0, 0, 0.4);
+}
+
+/* Callout on the selected pin — a Leaflet permanent tooltip. In a cluster of
+   overlapping pins, "the selected one is bigger" is not findable; a labelled
+   bubble pointing down at it is. Named so you can also tell WHICH place you
+   just tapped in the list without reading the number off the disc. */
+.leaflet-tooltip.res-callout {
+  background: #fff;
+  color: var(--ink);
+  border: 1px solid var(--accent);
+  border-radius: 8px;
+  box-shadow: 0 3px 14px rgba(0, 0, 0, 0.22);
+  padding: 5px 9px;
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1.3;
+  /* width:max-content is load-bearing. Leaflet's tooltip pane is a zero-width
+     absolutely-positioned div, so a shrink-to-fit tooltip resolves against an
+     available width of 0 and collapses to MIN-content — "La Flotte port
+     market" rendered as four stacked words. max-content ignores the container
+     and lays the name out on one line, and max-width still wraps the long
+     ones. */
+  width: max-content;
+  max-width: 210px;
+  white-space: normal;
+  text-align: center;
+}
+/* Leaflet draws the tail with a border triangle; colour it the accent so the
+   bubble reads as a pointer AT the pin rather than a label floating near it. */
+.leaflet-tooltip.res-callout.leaflet-tooltip-top::before { border-top-color: var(--accent); }
+.leaflet-tooltip.res-callout.leaflet-tooltip-bottom::before { border-bottom-color: var(--accent); }
+.leaflet-tooltip.res-callout.leaflet-tooltip-left::before { border-left-color: var(--accent); }
+.leaflet-tooltip.res-callout.leaflet-tooltip-right::before { border-right-color: var(--accent); }
+
+/* The pin sheet. On the narrow layout the list is far below the map, so a pin
+   tap opens this from the bottom edge; on the two-pane layout it never mounts
+   (the list pane beside the map is the detail view). It replaces the old
+   hover card — selection is click-driven now, in both directions. */
+.res .res-sheet-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 900;
+  background: rgba(0, 0, 0, 0.28);
+}
+.res .res-sheet {
+  position: fixed;
+  z-index: 901;
+  left: 0; right: 0; bottom: 0;
+  max-height: 78dvh;
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+  background: #fff;
+  border-top: 1px solid var(--line);
+  border-radius: 16px 16px 0 0;
+  box-shadow: 0 -6px 28px rgba(0, 0, 0, 0.22);
+  padding-bottom: max(12px, env(safe-area-inset-bottom));
+  animation: res-sheet-in 180ms ease-out;
+}
+@keyframes res-sheet-in { from { transform: translateY(100%); } to { transform: none; } }
+@media (prefers-reduced-motion: reduce) { .res .res-sheet { animation: none; } }
+/* The grab handle doubles as a dismiss target — it is where a thumb already
+   goes to close a sheet. */
+.res .res-sheet-grab {
+  display: block;
+  width: 44px; height: 5px;
+  margin: 9px auto 4px;
+  padding: 0;
+  border: 0;
+  border-radius: 999px;
+  background: #d7d2c8;
+  cursor: pointer;
+}
+.res .res-card-photo { display: block; width: 100%; max-height: 190px; object-fit: cover; background: var(--line); }
+.res .res-card-body { padding: 10px 12px 12px; position: relative; }
+.res .res-card-seq {
+  position: absolute; top: -13px; right: 12px;
+  width: 24px; height: 24px; border-radius: 50%;
+  display: flex; align-items: center; justify-content: center;
+  background: var(--ink); color: #fff; font-size: 12px; font-weight: 600;
+  border: 2px solid #fff;
+}
+.res .res-sheet .res-name { font-size: 15px; padding-right: 30px; }
+.res .res-sheet .res-why { font-size: 13px; }
+.res .res-card-also { margin-top: 8px; padding-top: 8px; border-top: 1px dashed var(--line); }
+.res .res-card-also-label {
+  font-size: 10px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted);
+}
+.res .res-card-actions { display: flex; gap: 6px; margin-top: 10px; }
+.res .res-card-btn {
+  flex: 1; padding: 5px 8px; font-size: 12px; cursor: pointer;
+  border: 1px solid var(--line); border-radius: 999px; background: #fff; color: var(--ink);
+}
+.res .res-card-btn:hover { border-color: var(--accent); color: var(--accent); }
+
+/* List numbering + must-see star */
+.res .res-item-head { display: flex; align-items: center; gap: 8px; margin-bottom: 4px; }
+.res .res-seq {
+  display: inline-flex; align-items: center; justify-content: center;
+  min-width: 22px; height: 22px; padding: 0 5px;
+  border-radius: 999px; background: var(--ink); color: #fff;
+  font-size: 11px; font-weight: 600;
+}
+.res .res-item.res-done .res-seq, .res .res-item.res-skipped .res-seq { background: #9aa0a6; }
+.res .res-star { color: #f0b429; margin-right: 4px; }
+.res .res-typechip {
+  font-size: 10px; text-transform: uppercase; letter-spacing: 0.05em;
+  color: var(--muted); border: 1px solid var(--line); border-radius: 999px; padding: 2px 7px;
+}
+
+/* Cluster chips */
+.res .res-cluster {
+  display: inline-block; margin-top: 5px;
+  font-size: 11px; font-weight: 500; color: var(--muted);
+  border: 1px solid var(--line); border-radius: 999px; padding: 2px 8px;
+}
+.res .res-cluster-walk { color: #2f7d69; border-color: rgba(47, 125, 105, 0.35); }
+.res .res-cluster-drive { color: var(--accent); border-color: rgba(169, 119, 60, 0.35); }
+.res h2 .res-cluster { font-weight: 500; vertical-align: middle; margin-left: 6px; }
+
+/* Toolbar: progress + the type/cluster toggle */
+.res .res-toolbar {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 10px; flex-wrap: wrap; margin-bottom: 10px;
+}
+.res .res-toolbar .res-progress { margin: 0; }
+.res .res-viewtoggle { display: flex; border: 1px solid var(--line); border-radius: 999px; overflow: hidden; }
+.res .res-viewtoggle button {
+  padding: 5px 12px; font-size: 12px; cursor: pointer;
+  background: #fff; color: var(--muted); border: 0;
+}
+.res .res-viewtoggle button.on { background: var(--accent); color: #fff; }
+
+/* Selection link between the list and the map, both directions. Driven by
+   clicks, not hover: tapping a row selects its pin, tapping a pin selects (and
+   on the two-pane layout scrolls to) its row. */
+.res .res-item { cursor: pointer; }
+/* Only the row itself selects — the controls inside it keep their own cursor,
+   and the Maps link keeps reading as a link. */
+.res .res-item button, .res .res-item a { cursor: pointer; }
+.res .res-item.res-active {
+  background: rgba(169, 119, 60, 0.09);
+  box-shadow: inset 3px 0 0 var(--accent);
+  border-radius: 0 8px 8px 0;
+  padding-left: 10px;
+}
+.res .res-item.res-active .res-seq { background: var(--accent); }
+
+@media (prefers-reduced-motion: reduce) {
+  .res .res-item { transition: none; }
+}
