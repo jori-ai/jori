@@ -67,6 +67,8 @@ The shipped workflows (`.github/workflows/ios-testflight.yml`, `.github/workflow
 - Builds are 3-5× faster than GitHub-hosted `macos-latest` runners.
 - Self-hosted has stable signing keychains; hosted runners frequently lose them between jobs.
 
+**Where builds run is per installation:** `agent/local/config/app-builds.json` names the repo, workflow, ref and dispatch inputs for each platform (`lib/app-builds.cjs`). Set a platform to `false` to skip it. Start builds with `bin/app-build ios|macos|all [--watch]`; with no config it dispatches the two workflows above in this repo on `install`. An installation whose runner and signing secrets live in a private repo (an overlay) points the config there.
+
 **If you don't have a self-hosted runner**, you can either:
 
 - **Use GitHub-hosted runners**: change `runs-on:` to `macos-latest` in both workflow files. Slower; you may need to add a `setup-xcode` step depending on which Xcode version you target.

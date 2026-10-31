@@ -335,10 +335,11 @@ Full text: `docs/agent-rules-detail.md` § Health; skill `health-support`.
 The Jori app is `apps/companion/` (one source tree; an installation's identity — bundle id, team, backend, stored-name prefixes, signing contexts, features — is `Config/Installation.xcconfig`, kept in the installation's overlay at `.overlay/app/` and copied in by its build). **Releasing is a self-service agent task — never tell the user to "archive in Xcode."** Land the change (kernel `apps/companion/` and/or overlay `.overlay/app/`), optionally compile-check, then dispatch the installation's TestFlight workflow and watch it:
 
 ```bash
-gh workflow run <ios workflow> -R <installation repo> --ref main     # names: docs/ios-releases.md
-gh workflow run <macos workflow> -R <installation repo> --ref main
-gh run watch <run id> -R <installation repo> --exit-status
+bin/app-build where            # where this installation builds (agent/local/config/app-builds.json)
+bin/app-build all --watch      # or ios|macos; --input kernel_ref=<branch> to build another kernel ref
 ```
+
+**Never pick the repo or workflow yourself.** Where builds run is set in `agent/local/config/app-builds.json` (`lib/app-builds.cjs`); with no config, the targets are this repo's own `{ios,macos}-testflight.yml`. Running `gh workflow run` against a repo with no runner leaves the build queued forever.
 
 **Do NOT hand-bump `CURRENT_PROJECT_VERSION`** (CI sets it from the workflow's run number). Git push and `gh` need the sandbox disabled. Full procedure (workflow names, compile-check, secrets): `docs/ios-releases.md`.
 
