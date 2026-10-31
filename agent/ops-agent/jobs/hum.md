@@ -393,7 +393,8 @@ You do not run this; it runs inside the send. Every info ping (`hum-ping`) and e
 - **a question the records can't answer** → asked as the specific unknown, with one line on what was checked (or as you wrote it, if the model offers no rewrite);
 - **partly answerable** → rewritten to ask only the remaining gap, with one line on what was checked;
 - **answerable, and worth them knowing** → a short FYI goes out instead (the fact + what was checked);
-- **answerable, and saying it adds nothing** → nothing is sent: `hum-ping` / `hum-ask` exit **12**.
+- **answerable, and saying it adds nothing** → nothing is sent: `hum-ping` / `hum-ask` exit **12**;
+- **already covered by a standing review** (a report Jori already wrote for the user, e.g. a weekly market report, which the installation adds as a review source) → nothing is sent (exit **12**), or, when your message adds something the review did not have, it goes out with one line saying what the review found and when it was current. Jori never tells the user to look at something "with the review in mind" that the review already looked at.
 
 It fails open (any error sends your text unchanged) and adds 10–30 s, sometimes up to 90 s. **Run `hum-ping` and `hum-ask` with a Bash `timeout` of 300000.** Do not try to pre-empt it by second-guessing your own wording, and do not re-send something it dropped or rewrote. The answers it settles are kept (`data/hum-resolve-first.jsonl`) and vetoed pre-rank as `resolved_first`; the decision log is `data/hum-resolve-first-log.jsonl` (`hum-resolve-first stats` / `tail`). Design: `docs/hum-resolve-first.md`.
 
@@ -664,7 +665,7 @@ Full descriptions: hum-detail.md § State files.
 | `data/hum-runs.jsonl` | append-only decision log |
 | `data/hum-pending-question.json` | single **delivered** pending question (tick: 15min TTL; lane-diagnosis: 24h). Needs `id`/`question` + parseable `expires_at`; clear by writing `null`, never `{}` |
 | `data/hum-qual-delivery-queue.json` | queued lane-diagnosis question awaiting delivery by `hum-deliver-qual` |
-| `data/hum-resolve-first.jsonl` | answers the resolve-first gate worked out from Jori's records (`lib/hum-resolve-first-store.mjs`); a fully answered `dedup_key` is vetoed pre-rank for 7 days as `resolved_first`. Jori's conclusions, never rendered as the user's words. `hum-resolve-first forget <id\|key>` withdraws one |
+| `data/hum-resolve-first.jsonl` | answers the resolve-first gate worked out from Jori's records (`lib/hum-resolve-first-store.mjs`); a fully answered (or review-covered) `dedup_key` is vetoed pre-rank for 7 days as `resolved_first`. Jori's conclusions, never rendered as the user's words. `hum-resolve-first forget <id\|key>` withdraws one |
 | `data/hum-resolve-first-log.jsonl` | one row per resolve-first decision (verdict, action, sources, latency); finance/stocks/health rows carry a hash instead of text. `hum-resolve-first stats` / `tail` |
 | `data/hum-learnings.jsonl` | append-only answer log (questions) |
 | `data/hum-responses.jsonl` | every reply to a ping (any lane); read by `hum-consolidate` and `hum-wiki-recall` |

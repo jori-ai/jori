@@ -8,15 +8,20 @@
 # appointments, location history — without the kernel knowing they exist.
 #
 # Contract: one `<id>.mjs` per source, default-exporting
-#   { id: "<id>", live: true|false,
+#   { id: "<id>", live: true|false, review: true|false,
 #     async read({ run, nowMs, message, fetchFn, storeFile }) {
 #       return { title: "<what this is + its source>", text: "<bounded text>", as_of?: "<when read>" }
 #           || { error: "<why empty>" };
 #     } }
 # `run(bin, args, opts)` resolves {ok, out, error} and never rejects.
 # `live: true` marks a source of record for changeable status (bookings,
-# reservations). A kernel source id wins over an overlay one. A module that fails to
-# load is skipped.
+# reservations). `review: true` marks a standing review: a report Jori already
+# wrote for the user (a weekly market report, a digest); its `as_of` says when
+# the report was current, and a message whose point it already covered gets the
+# verdict "covered" (dropped, or sent with a caveat naming what the review found
+# and when). A review source must not pass the user's holdings, balances or health
+# rows into the bundle. A kernel source id wins over an overlay one. A module that
+# fails to load is skipped.
 #
 # Order and wording: agent/local/config/hum-resolve-first.json may set
 #   source_order  — the section order of the whole bundle (kernel + overlay ids);
