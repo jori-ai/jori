@@ -314,24 +314,79 @@ async function runIntakeCascade(messageId, fromHeader, subject, toJori = false) 
   // them exactly as a stamped P1 does on the live path, and let it dispatch.
   // Defaults to false, so a caller that cannot know stays on today's behaviour.
   if (toJori) return { skip: false, kind: "command-channel", detail: "addressed to Jori -> always dispatch" };
-  const fp = intakeFastPathCheck(messageId, fromHeader, subject);
+  const gate = bookingGateFor(messageId, fromHeader, subject);
+  const fp = await intakeFastPathCheck(messageId, fromHeader, subject, gate);
   if (fp.matched) return { skip: true, kind: "fastpath", detail: `intake-skip rule=${fp.rule} -> label=${fp.label}${fp.starred ? "+star(P2)" : ""} applied=${fp.applied}` };
-  const cl = await intakeClassifyP3(messageId, fromHeader, subject);
+  if (fp.booking) return { skip: false, kind: "booking", booking: fp.booking, detail: `booking-check ${fp.booking.kind || "booking"} (${fp.booking.used}) withheld intake-skip rule=${fp.rule}` };
+  const cl = await intakeClassifyP3(messageId, fromHeader, subject, gate);
   if (cl.handled) return { skip: true, kind: cl.kind, detail: cl.detail };
+  if (cl.booking) return { skip: false, kind: "booking", booking: cl.booking, detail: `booking-check ${cl.booking.kind || "booking"} (${cl.booking.used}) withheld the auto-P3` };
   return { skip: false };
+}
+
+// Confirmed bookings are never filed without an agent turn (email-triage-rules.md
+// § Bookings and Appointments). Only an agent turn writes the calendar, and the
+// two filters that end in "label it and skip the dispatch" (an intake-skip
+// fast-path, a confident P3 from Jev or the sender-history consensus) used to
+// file a service-appointment confirmation from a vendor whose routine mail is
+// all P3 with no turn at all, so no calendar event was ever made. Whether a
+// message is a booking is language, so a model answers it
+// (bin/jev-email-classify --booking → lib/jev-email-triage.mjs
+// checkEmailBooking → lib/message-alert.mjs checkBooking: Jev, then the Sonnet
+// rung), asked only at the moment one of those filters is ABOUT to file it. A yes withholds the filing
+// and the message dispatches with the `booking` stamp; a no, an error or a
+// timeout leaves today's behaviour untouched. Jori's own mail is never asked
+// about (its digests name bookings Jori already put on the calendar), and
+// neither is mail on its way to Spam: a scam dressed as a reservation must not
+// be pulled out of the Spam path by it.
+// Off switch: `touch data/.booking-check-off` (read by the CLI).
+const BOOKING_CHECK_TIMEOUT_MS = 60000;
+// = lib/message-alert.mjs BOOKING_RULES_SLUG (tests/message-alert.test.mjs holds them equal).
+const BOOKING_RULES_SLUG = "bookings-and-appointments-always-on-the-calendar";
+async function intakeBookingCheck(messageId, fromHeader, subject) {
+  if (AGENT_EMAILS.includes(extractEmailAddr(fromHeader))) return { booking: false, skipped: "own-mail" };
+  const r = await new Promise((resolve) => {
+    try {
+      execFile(process.execPath, [JEV_CLASSIFY_BIN, "--booking", messageId, "--from", fromHeader || "", "--subject", subject || ""],
+        { encoding: "utf8", timeout: BOOKING_CHECK_TIMEOUT_MS, maxBuffer: 64 * 1024 },
+        (err, stdout) => resolve({ err, stdout: stdout || "" }));
+    } catch (err) { resolve({ err, stdout: "" }); }
+  });
+  try {
+    const v = JSON.parse(String(r.stdout).trim().split("\n").pop());
+    return { booking: v.booking === true, kind: v.kind || null, used: v.used || null, error: v.error || null };
+  } catch {
+    return { booking: false, error: r.err ? (r.err.killed ? "timeout" : String(r.err.message || r.err).slice(0, 120)) : "no output" };
+  }
+}
+// One answer per message, however many filters ask.
+function bookingGateFor(messageId, fromHeader, subject) {
+  let p = null;
+  return () => (p ||= intakeBookingCheck(messageId, fromHeader, subject));
+}
+
+// One line of a catchup dispatch's survivor list; a booking says so.
+export function catchupLine(m) {
+  const base = `  - MessageId: ${m.messageId} | From: ${m.from} | Subject: ${m.subject}`;
+  if (!m.booking) return base;
+  return `${base} | BOOKING (intake's booking check: ${m.booking.kind || "booking"}) — whatever its label and priority, make the calendar match: \`${installTools("bin/triage-rules")} section ${BOOKING_RULES_SLUG}\``;
 }
 
 // The confident-P3 step shared by BOTH intake paths (live push in _flushBatch
 // and the catchups via runIntakeCascade): Jev first, falling back to the old
 // local-classify only when the Jev CLI itself failed. Both paths must share it,
 // or Jev only ever sees catchup mail.
-async function intakeClassifyP3(messageId, fromHeader, subject) {
-  const jc = await intakeJevClassify(messageId, fromHeader, subject);
+// `bookingGate` (bookingGateFor) is asked right before either branch files a
+// message; a booking is withheld and returned as `booking` instead.
+async function intakeClassifyP3(messageId, fromHeader, subject, bookingGate = null) {
+  const jc = await intakeJevClassify(messageId, fromHeader, subject, bookingGate);
   const tag = jc.via === "jev" ? "jev" : "local-classify";
   if (jc.handled) return { handled: true, kind: jc.via === "jev" ? "jev-classify" : "local-classify", detail: `${tag} -> ${jc.label}/P3 (${jc.source})`, label: jc.label, source: jc.source, via: jc.via };
+  if (jc.booking) return { handled: false, jev: jc.verdict || null, booking: jc.booking };
   if (jc.decided || jc.timedOut) return { handled: false, jev: jc.verdict || null };
-  const lc = intakeLocalClassify(messageId, fromHeader, subject);
+  const lc = await intakeLocalClassify(messageId, fromHeader, subject, bookingGate);
   if (lc.handled) return { handled: true, kind: "local-classify", detail: `local-classify -> ${lc.label}/P3 (${lc.source})`, label: lc.label, source: lc.source, via: "local" };
+  if (lc.booking) return { handled: false, booking: lc.booking };
   return { handled: false };
 }
 
@@ -357,7 +412,7 @@ function runJevCli(args, timeoutMs) {
       (err, stdout) => resolve({ status: err ? (err.killed ? "timeout" : (err.code ?? 1)) : 0, stdout: stdout || "" }));
   });
 }
-async function intakeJevClassify(messageId, fromHeader, subject) {
+async function intakeJevClassify(messageId, fromHeader, subject, bookingGate = null) {
   try {
     if (fs.existsSync(LOCAL_CLASSIFY_OFF)) return { handled: false, decided: true };
     const r = await runJevCli([messageId, "--from", fromHeader || "", "--subject", subject || ""], 20000);
@@ -368,6 +423,11 @@ async function intakeJevClassify(messageId, fromHeader, subject) {
     // Not auto-handled: keep Jev's own verdict so the dispatch can carry it
     // instead of the agent re-deriving the same facts from scratch.
     if (!v.auto || v.priority !== "P3" || !v.label) return { handled: false, decided: true, verdict: v.jev || null };
+    // About to file it with no turn: a booking is withheld (see intakeBookingCheck).
+    if (bookingGate && v.label !== "spam") {
+      const bk = await bookingGate();
+      if (bk.booking) return { handled: false, decided: true, verdict: v.jev || null, booking: bk };
+    }
     const lab = spawnSync(GMAIL_ACTION_BIN, ["label", messageId, v.label], GA_OPTS);
     if (lab.status !== 0) return { handled: false, decided: true }; // labeling failed → dispatch normally
     spawnSync(GMAIL_ACTION_BIN, ["mark-read", messageId], GA_OPTS);
@@ -393,7 +453,9 @@ async function intakeJevClassify(messageId, fromHeader, subject) {
   } catch { return { handled: false, decided: false }; }
 }
 
-function intakeFastPathCheck(messageId, fromHeader, subject) {
+// `bookingGate` (bookingGateFor) is asked once a rule has matched and before it
+// is applied: a booking is never filed by a fast-path (returned as `booking`).
+async function intakeFastPathCheck(messageId, fromHeader, subject, bookingGate = null) {
   const sender = extractEmailAddr(fromHeader);
   if (!sender) return { matched: false };
   const rules = loadIntakeSkipRules();
@@ -416,6 +478,11 @@ function intakeFastPathCheck(messageId, fromHeader, subject) {
         rtm = spawnSync(GMAIL_ACTION_BIN, ["reply-to-me", messageId], GA_OPTS);
       } catch {}
       if (!rtm || rtm.status !== 3) continue;
+    }
+    const ruleLabels = Array.isArray(rule.labels) ? rule.labels : rule.label ? [rule.label] : [];
+    if (bookingGate && !ruleLabels.includes("spam")) {
+      const bk = await bookingGate();
+      if (bk.booking) return { matched: false, booking: bk, rule: rule.id, sender };
     }
     // Apply: label(s) + optional star + mark-read. Best-effort; failure leaves
     // the message available for the LLM-side fast-path (defense in depth).
@@ -451,7 +518,7 @@ function intakeFastPathCheck(messageId, fromHeader, subject) {
 const LOCAL_CLASSIFY_BIN = installTools("bin/local-classify");
 const LOCAL_CLASSIFY_OFF = installTools("data/.local-classify-off");
 const LOCAL_CLASSIFY_LOG = installTools("data/local-classify-live.jsonl");
-function intakeLocalClassify(messageId, fromHeader, subject) {
+async function intakeLocalClassify(messageId, fromHeader, subject, bookingGate = null) {
   try {
     if (fs.existsSync(LOCAL_CLASSIFY_OFF)) return { handled: false };
     const r = spawnSync(process.execPath,
@@ -461,6 +528,10 @@ function intakeLocalClassify(messageId, fromHeader, subject) {
     const v = JSON.parse(r.stdout.trim());
     // Only auto-handle a confident, NON-escalated P3 with a label (rules / mem-consensus).
     if (!v || v.escalate !== false || v.priority !== "P3" || !v.label) return { handled: false };
+    if (bookingGate && v.label !== "spam") {
+      const bk = await bookingGate();
+      if (bk.booking) return { handled: false, booking: bk };
+    }
     const lab = spawnSync(GMAIL_ACTION_BIN, ["label", messageId, v.label], GA_OPTS);
     if (lab.status !== 0) return { handled: false }; // labeling failed → dispatch normally
     spawnSync(GMAIL_ACTION_BIN, ["mark-read", messageId], GA_OPTS);
@@ -620,6 +691,7 @@ const STAMP_TEXT = {
   "reply-to-me-p1": `reply-to-me-p1 (this answers something ${OWNER_NAME} sent — \`p1\` + star ALREADY applied, left unread; Step 4a)`,
   "meeting-request-p1": "meeting-request-p1 (a calendar invitation to attend — `p1` + star ALREADY applied, left unread; always P1)",
   "command-channel": `command-channel (addressed to ${JORI_INBOUND_ADDRESSES[0] || "the agent's address"} — ${OWNER_NAME}'s instruction channel)`,
+  "booking": `booking (intake's booking check read this as a confirmed booking, appointment, reservation, meeting or show, or a change, cancellation or reminder of one, so it was NOT filed silently. Whatever label and priority you give it, make the calendar match: \`${installTools("bin/triage-rules")} section ${BOOKING_RULES_SLUG}\`)`,
 };
 
 export function buildTriageDispatch(p, rulesIdx = "") {
@@ -908,6 +980,10 @@ export class GmailSource {
         this.triageLog(`${label} intake-skip (${cascade.kind}) ${m.messageId}: ${cascade.detail}`);
         continue;
       }
+      if (cascade.kind === "booking") {
+        m.booking = cascade.booking;
+        this.triageLog(`${label} ${cascade.detail} ${m.messageId}`);
+      }
       survivors.push(m);
     }
     return survivors;
@@ -1016,13 +1092,15 @@ export class GmailSource {
   //   live       — `triage-decide live` decides + executes Step 5 in code; the
   //                agent is dispatched only if it declines (failure, invalid
   //                output, or an action tag that needs an agent).
-  // The command channel (mail addressed to Jori) always goes to the agent.
+  // The command channel (mail addressed to Jori) always goes to the agent, and
+  // so does a booking (the `booking` stamp): its calendar write needs a turn.
   async _routeForTriage(p) {
     const body = await this._fetchBodyText(p.messageId);
     const packet = { ...p, body, history: this._historyLine(p.from) };
     const content = buildTriageDispatch(packet, await rulesIndex());
     const m = triageDecideMode();
-    const eligible = !(p.stamps || []).includes("command-channel");
+    const commandChannel = (p.stamps || []).includes("command-channel");
+    const eligible = !commandChannel && !(p.stamps || []).includes("booking");
     const args = [p.messageId, "--from", p.from || "", "--subject", p.subject || "", "--date", p.date || "", "--to", p.to || "", "--stamps", (p.stamps || []).join(",")];
     if (p.jev) args.push("--jev-json", JSON.stringify(p.jev));
     if (m === "live" && eligible) {
@@ -1033,11 +1111,11 @@ export class GmailSource {
         try { r = JSON.parse(String(stdout || "").trim().split("\n").pop()); } catch {}
         if (r && r.handled === true) { this.triageLog(`triage-decide live ${p.messageId} → executed in code, no dispatch`); return; }
         this.triageLog(`triage-decide live ${p.messageId} → agent (${r?.reason || err?.message || "no result"})`);
-        this._dispatchTriage(content, p.messageId, { commandChannel: !eligible });
+        this._dispatchTriage(content, p.messageId, { commandChannel });
       });
       return;
     }
-    this._dispatchTriage(content, p.messageId, { commandChannel: !eligible });
+    this._dispatchTriage(content, p.messageId, { commandChannel });
     if (m === "shadow" && eligible) {
       try {
         const c = spawn(process.execPath, [TRIAGE_DECIDE_BIN, "shadow", ...args], { detached: true, stdio: "ignore" });
@@ -1213,19 +1291,28 @@ export class GmailSource {
           if (m.toJori === true && !stampedP1) {
             this.triageLog(`command-channel ${m.messageId} from ${extractEmailAddr(m.from)} → addressed to Jori, auto-handling skipped`);
           }
-          const fp = skipAutoHandle ? { matched: false } : intakeFastPathCheck(m.messageId, m.from, m.subject);
+          // A booking is never filed by either filter (see intakeBookingCheck):
+          // the gate is asked only when one of them is about to file it.
+          const gate = skipAutoHandle ? null : bookingGateFor(m.messageId, m.from, m.subject);
+          const fp = skipAutoHandle ? { matched: false } : await intakeFastPathCheck(m.messageId, m.from, m.subject, gate);
           if (fp.matched) {
             this.triageLog(`intake-skip rule=${fp.rule} ${m.messageId} from ${fp.sender} → label=${fp.label} applied=${fp.applied}`);
             continue;
           }
+          let booking = fp.booking || null;
           // Confident-P3 intake filter — Jev primary (docs/jev.md),
           // local-classify when the Jev CLI fails. A confident P3 is handled here
           // (label + mark-read) and the LLM dispatch is skipped; everything else
           // falls through to full triage below. Fail-open.
-          const lc = skipAutoHandle ? { handled: false } : await intakeClassifyP3(m.messageId, m.from, m.subject);
+          const lc = (skipAutoHandle || booking) ? { handled: false } : await intakeClassifyP3(m.messageId, m.from, m.subject, gate);
           if (lc.handled) {
             this.triageLog(`${lc.kind} intake ${m.messageId} from ${extractEmailAddr(m.from)} → ${lc.label}/P3 (${lc.source}) — dispatch skipped`);
             continue;
+          }
+          if (lc.booking) booking = lc.booking;
+          if (booking) {
+            stamps.push("booking");
+            this.triageLog(`booking-check ${m.messageId} from ${extractEmailAddr(m.from)} → ${booking.kind || "booking"} (${booking.used}) — ${fp.booking ? `intake-skip rule=${fp.rule}` : "auto-P3"} withheld, dispatching`);
           }
           const packet = { ...m, stamps: m.toJori === true ? [...stamps, "command-channel"] : stamps, jev: lc.jev || null };
           await this._routeForTriage(packet);
@@ -1362,7 +1449,7 @@ export class GmailSource {
               console.error(`[gmail-source] storm detected (${stormCounter} pushes) — all ${metas.length} resolved by intake-skip cascade, no dispatch needed`);
               return;
             }
-            const lines = survivors.map(m => `  - MessageId: ${m.messageId} | From: ${m.from} | Subject: ${m.subject}`);
+            const lines = survivors.map(catchupLine);
             const content = `STORM CATCHUP: Gmail notification storm detected (${stormCounter}+ pushes in ${STORM_WINDOW_MS / 1000}s). ${survivors.length} message(s) NOT resolved by the deterministic intake-skip cascade (spam-filter / intake-skip-rules.json / local-classify):\n\n${lines.join("\n")}\n\nFetch and triage each one using the Gmail connector, following the Email Triage Rules. FIRST read the decision core: \`~/Dev/jori/bin/triage-rules core\`, then only the category rules that apply (\`triage-rules index\`, \`triage-rules section <slug>\`) — not email-triage-rules.md whole.`;
             console.error(`[gmail-source] storm detected (${stormCounter} pushes) — ${survivors.length}/${metas.length} need real triage`);
             this._dispatchFn(content, `gmail-storm:${historyId}`);
@@ -1404,7 +1491,7 @@ export class GmailSource {
         console.error(`[gmail-source] startup catchup: ${metas.length} message(s) since last activity, all resolved by intake-skip cascade — no dispatch needed`);
         return null;
       }
-      const lines = survivors.map(m => `  - MessageId: ${m.messageId} | From: ${m.from} | Subject: ${m.subject}`);
+      const lines = survivors.map(catchupLine);
       return `STARTUP CATCHUP: Supervisor just (re)started. ${survivors.length} message(s) since ${last.ts} (historyId ${last.historyId}) were NOT resolved by the deterministic intake-skip cascade (spam-filter / intake-skip-rules.json / local-classify) and need real triage:\n\n${lines.join("\n")}\n\nFetch and triage each one using the Gmail connector, following the Email Triage Rules. FIRST read the decision core: \`~/Dev/jori/bin/triage-rules core\`, then only the category rules that apply (\`triage-rules index\`, \`triage-rules section <slug>\`) — not email-triage-rules.md whole.`;
     }
 
@@ -1454,7 +1541,7 @@ export class GmailSource {
         console.error(`[gmail-source] periodic catchup: ${metas.length} message(s) since gap, all resolved by intake-skip cascade — no dispatch needed`);
         return;
       }
-      const lines = survivors.map(m => `  - MessageId: ${m.messageId} | From: ${m.from} | Subject: ${m.subject}`);
+      const lines = survivors.map(catchupLine);
       const content = `PERIODIC CATCHUP: No Gmail push received in ${gapMin} minutes. ${survivors.length} message(s) since history ID ${last.historyId} were NOT resolved by the deterministic intake-skip cascade (spam-filter / intake-skip-rules.json / local-classify) and need real triage:\n\n${lines.join("\n")}\n\nFetch and triage each one using the Gmail connector, following the Email Triage Rules. FIRST read the decision core: \`~/Dev/jori/bin/triage-rules core\`, then only the category rules that apply (\`triage-rules index\`, \`triage-rules section <slug>\`) — not email-triage-rules.md whole.`;
       console.error(`[gmail-source] push gap detected (${gapMin}min) — ${survivors.length}/${metas.length} need real triage`);
       this._dispatchFn(content, "periodic-catchup");

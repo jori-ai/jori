@@ -450,3 +450,49 @@ test("withConsensus: a gmail stranger is told the decisions are other senders', 
   const head = lib.withConsensus(hist, STRANGER.from).split("\n")[0];
   assert.match(head, /none\. The decisions below are about OTHER senders/);
 });
+
+// ---- the booking check at intake (checkEmailBooking) ---------------------------
+
+const b64url = (s) => Buffer.from(s, "utf8").toString("base64").replace(/\+/g, "-").replace(/\//g, "_");
+
+test("bookingText: a placeholder plain part loses to the real HTML", () => {
+  const payload = { mimeType: "multipart/alternative", parts: [
+    { mimeType: "text/plain", body: { data: b64url("undefined") } },
+    { mimeType: "text/html", body: { data: b64url("<html><style>x{}</style><p>Your appointment is confirmed</p><p>Arrival 11/01 10:00am&nbsp;&amp; noon</p></html>") } },
+  ] };
+  const t = lib.bookingText(payload);
+  assert.match(t, /appointment is confirmed/);
+  assert.match(t, /10:00am & noon/);
+  assert.doesNotMatch(t, /undefined|<p>|x\{\}/);
+  // A real plain part is kept when it is the fuller one.
+  const plainFirst = { mimeType: "multipart/alternative", parts: [
+    { mimeType: "text/plain", body: { data: b64url("Table for 2 at 7pm Friday, confirmation ABC123. See you then!") } },
+    { mimeType: "text/html", body: { data: b64url("<p>Table</p>") } },
+  ] };
+  assert.match(lib.bookingText(plainFirst), /confirmation ABC123/);
+});
+
+test("checkEmailBooking: asks the shared judge with the email's state, logs, never throws", async () => {
+  const seen = [];
+  const logged = [];
+  const ma = {
+    bookingOff: () => false,
+    logBooking: (r) => logged.push(r),
+    checkBooking: async ({ id, state }) => { seen.push({ id, state }); return { booking: true, kind: "new", used: "jev", confidence: 0.98 }; },
+  };
+  const out = await lib.checkEmailBooking({ messageId: "m1", from: "Cable Co <x@cable.example>", subject: "Your service appointment is confirmed" },
+    { messageAlert: ma, fetchBookingEmail: async () => ({ text: "Arrival 10am-12pm", snippet: "Your appointment has been scheduled" }) });
+  assert.deepEqual(out, { booking: true, kind: "new", used: "jev", confidence: 0.98 });
+  assert.equal(seen[0].id, "m1");
+  assert.equal(seen[0].state.source, "email");
+  assert.equal(seen[0].state.snippet, "Your appointment has been scheduled");
+  assert.equal(logged[0].booking, true);
+  // Both rungs failing → no answer, logged, not thrown.
+  const failing = { ...ma, checkBooking: async () => { throw new Error("legacy failed"); } };
+  const r2 = await lib.checkEmailBooking({ messageId: "m2", from: "a@b.example", subject: "s" }, { messageAlert: failing, fetchBookingEmail: async () => { throw new Error("gmail down"); } });
+  assert.equal(r2.booking, null);
+  assert.match(r2.error, /legacy failed/);
+  // Off switch.
+  const off = await lib.checkEmailBooking({ messageId: "m3" }, { messageAlert: { ...ma, bookingOff: () => true } });
+  assert.deepEqual(off, { booking: null, skipped: "off" });
+});
