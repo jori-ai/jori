@@ -105,6 +105,7 @@ function makeSandbox() {
   return {
     root, bin, home, logs, config, send, incidents,
     marker: path.join(data, ".daily-summary-heal-cooldown"),
+    holdMarker: path.join(data, ".daily-summary-usage-hold-seen"),
     probeFile: path.join(data, "max-auth-probe.json"),
     sent: () => lines("sent"),
     dispatched: () => lines("dispatched"),
@@ -150,8 +151,9 @@ function markAuthPaged(sb) {
 
 // One watchdog tick over the chosen sections. `held` (if given) presets
 // AUTH_OUTAGE_HELD for a DS-only run; with `auth: true` the real auth section
-// computes it.
-function tick(sb, { auth = false, ds = true, held, health = '{"authAlertSent":false}', keychainHealed = "0", dsRow = "[]" } = {}) {
+// computes it. `opsHold` (if given) presets OPS_HOLD_UNTIL, which the real
+// script reads from ops /health in the Gmail sweep, outside these sections.
+function tick(sb, { auth = false, ds = true, held, opsHold, health = '{"authAlertSent":false}', keychainHealed = "0", dsRow = "[]" } = {}) {
   const script = [
     'INCIDENT_DIR="$HOME/Dev/jori/data/watchdog-incidents"',
     `CONFIG_DIR=${JSON.stringify(sb.config)}`,
@@ -163,8 +165,11 @@ function tick(sb, { auth = false, ds = true, held, health = '{"authAlertSent":fa
     'SUPABASE_URL="https://example.invalid"',
     'SUPABASE_KEY="test-key"',
     assignSrc("DS_HEAL_MARKER"),
+    assignSrc("DS_USAGE_HOLD_MARKER"),
     held === undefined ? "" : `AUTH_OUTAGE_HELD=${held}`,
+    opsHold === undefined ? "" : `OPS_HOLD_UNTIL=${JSON.stringify(opsHold)}`,
     'log() { printf "%s\\n" "$*" >> "$STUB_LOG_DIR/log"; }',
+    fnSrc("log_throttled"),
     `source ${JSON.stringify(PROBE_LIB)}`,
     fnSrc("_incident_label"), fnSrc("incident_seen"), fnSrc("incident_clear"),
     fnSrc("incident_should_alert"), fnSrc("notify"),
@@ -496,4 +501,109 @@ test("(d) AUTH_RECOVERY_PENDING: initialised to 0, set only on the clearing bran
   assert.ok(set > clearing, "set only after incident_clear on the clearing branch");
   assert.equal(sec.indexOf("AUTH_RECOVERY_PENDING=1", set + 1), -1, "set in exactly one place");
   assert.match(codeOnly(dsSection()), /"\$\{AUTH_RECOVERY_PENDING:-0\}" = "1"/);
+});
+
+// ---- the ops usage-limit hold (cluster sic-20261021-daily-summary-missing-auth-outage, recurrence 2026-10-28)
+// THE ALERT THIS DEFENDS: the same "🔴 Daily-summary missing for <date> ...
+// Backfill manually" page, sent 20 min after the backfill was dispatched into
+// an ops queue frozen for the Claude usage limit, naming a remedy that only
+// queues behind the same hold. Fix: keep the dispatch, hold the page through
+// the hold plus a drain grace (data/.daily-summary-usage-hold-seen).
+
+const OPS_HOLD = "2099-01-01T00:00:00.000Z";
+const HOLD_DEFER_LOG = /daily-summary page deferred: the ops dispatcher is holding for the Claude usage limit/;
+const LIFT_DEFER_LOG = /daily-summary page deferred: the ops usage-limit hold lifted/;
+
+function touchHold(sb, ageSec) {
+  fs.writeFileSync(sb.holdMarker, "");
+  setMtime(sb.holdMarker, ageSec);
+}
+
+test("(f) DS_USAGE_HOLD_MARKER is assigned once at top level; the hold is noted before the hour gate; the dispatch is not gated on the hold", () => {
+  const defs = SRC.split("\n").filter((l) => l.startsWith("DS_USAGE_HOLD_MARKER="));
+  assert.equal(defs.length, 1, "one top-level definition");
+  assert.ok(SRC.indexOf("\nDS_USAGE_HOLD_MARKER=") < SRC.indexOf(DS_HEADER));
+  const sec = codeOnly(dsSection());
+  const touch = sec.indexOf('touch "$DS_USAGE_HOLD_MARKER"');
+  assert.ok(touch !== -1 && touch < sec.indexOf('if [ -n "$SUPABASE_KEY" ]'), "a hold seen earlier in the day still counts");
+  assert.ok(sec.indexOf("log_throttled") < sec.indexOf("incident_should_alert"), "the deferral is checked before incident_should_alert");
+  const dispatch = sec.slice(sec.indexOf('if [ "$SHOULD_HEAL" -eq 1 ]'), sec.indexOf("DS_HOLD_AGE=999999"));
+  assert.doesNotMatch(dispatch, /OPS_HOLD_UNTIL/, "DO NOT drop the dispatch while held");
+});
+
+test("(usage a) ops held, no markers: dispatches the backfill once, touches both markers, no page", () => {
+  const sb = makeSandbox();
+  try {
+    const t = tick(sb, { opsHold: OPS_HOLD });
+    assert.equal(t.dispatches.length, 1, "the dated backfill still goes into the persisted queue");
+    assert.match(t.dispatches[0], new RegExp(`DAILY SUMMARY ${TARGET}`));
+    assert.ok(fs.existsSync(sb.marker), "heal marker touched");
+    assert.ok(fs.existsSync(sb.holdMarker), "hold marker touched");
+    assert.deepEqual(t.pages, []);
+  } finally { sb.cleanup(); }
+});
+
+test("(usage b) ops held, heal spent 30 min ago, row still missing: no page, deferral logged once, miss still recorded", () => {
+  const sb = makeSandbox();
+  try {
+    touchMarker(sb, 1800);
+    const t = tick(sb, { opsHold: OPS_HOLD });
+    assert.deepEqual(t.pages, [], "no 🔴 while the backfill sits in the held queue");
+    assert.deepEqual(t.dispatches, []);
+    assert.equal(t.logs.filter((l) => HOLD_DEFER_LOG.test(l)).length, 1);
+    assert.match(t.issues, new RegExp(`daily-summary\\(missing:${TARGET}\\)`));
+    assert.equal(fs.readFileSync(path.join(sb.incidents, "daily-summary-missing"), "utf8").trim(), "1");
+    assert.equal(fs.existsSync(path.join(sb.incidents, "daily-summary-missing.alerted")), false, "incident_should_alert not called");
+    const t2 = tick(sb, { opsHold: OPS_HOLD });
+    assert.deepEqual(t2.pages, []);
+    assert.ok(!t2.logs.some((l) => HOLD_DEFER_LOG.test(l)), "throttled on the next tick");
+  } finally { sb.cleanup(); }
+});
+
+test("(usage c) hold lifted 30 min ago, heal spent 30 min ago: no page while the queue drains", () => {
+  const sb = makeSandbox();
+  try {
+    touchMarker(sb, 1800);
+    touchHold(sb, 1800);
+    for (const opsHold of [undefined, ""]) {
+      const t = tick(sb, { opsHold });
+      assert.deepEqual(t.pages, []);
+    }
+    assert.ok(sb.log().some((l) => LIFT_DEFER_LOG.test(l)));
+  } finally { sb.cleanup(); }
+});
+
+test("(usage d) hold lifted longer ago than the grace, heal spent 30 min ago: pages 🔴 once, as before", () => {
+  const sb = makeSandbox();
+  try {
+    touchMarker(sb, 1800);
+    touchHold(sb, 7200 + 600);
+    const t = tick(sb, { opsHold: "" });
+    assert.equal(t.pages.length, 1);
+    assert.match(t.pages[0], new RegExp(`^🔴 Daily-summary missing for ${TARGET}`));
+    assert.ok(!t.logs.some((l) => LIFT_DEFER_LOG.test(l) || HOLD_DEFER_LOG.test(l)));
+    assert.deepEqual(tick(sb, { opsHold: "" }).pages, [], "once, not every tick");
+  } finally { sb.cleanup(); }
+});
+
+test("(usage e) OPS_HOLD_UNTIL empty and no hold marker: today's page, no hold marker written", () => {
+  const sb = makeSandbox();
+  try {
+    touchMarker(sb, 1800);
+    const t = tick(sb, { opsHold: "" });
+    assert.equal(t.pages.length, 1);
+    assert.equal(fs.existsSync(sb.holdMarker), false);
+  } finally { sb.cleanup(); }
+});
+
+test("(usage) auth outage and ops hold together: the auth deferral is unchanged (no dispatch, heal marker untouched)", () => {
+  const sb = makeSandbox();
+  try {
+    const t = tick(sb, { held: 1, opsHold: OPS_HOLD });
+    assert.deepEqual(t.dispatches, []);
+    assert.deepEqual(t.pages, []);
+    assert.ok(t.logs.some((l) => DEFER_LOG.test(l)));
+    assert.equal(fs.existsSync(sb.marker), false);
+    assert.ok(fs.existsSync(sb.holdMarker), "the hold is still noted for the drain grace");
+  } finally { sb.cleanup(); }
 });
