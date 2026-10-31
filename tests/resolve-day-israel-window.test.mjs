@@ -277,3 +277,84 @@ test("only an unnamed stop that reaches the day's end is touched", async () => {
   assert.equal(await nameDayEndFromNight(earlier, DAY_END, confirmedFlat, async () => { asked = true; return []; }), null);
   assert.equal(asked, false, "does not even look past midnight");
 });
+
+// ---- home for the night, cut short by midnight ------------------------------
+//
+// The day ended at a dinner 25 km away (until 22:55), a drop-off on the way
+// home, and the flat from 23:50 with a photo at 23:56: seven minutes before
+// midnight, under the spine's 10-minute marker, so no stop was built, the email
+// ended at the dinner and the drive back was never shown. The day's last dwell,
+// back where he slept, is the arrival home: a stop to the day's end.
+
+{
+const DAY_START = iso("2026-10-29T22:00:00Z");   // 00:00 in Portside (UTC+2)
+const END = iso("2026-10-30T22:00:00Z");
+const DINNER = { ...LL(20000, 15000) };
+const DROP = { ...LL(-3000, -8000) };
+const nightStop = () => ({ id: "s-1", start: "00:39", end: "09:04", start_ts_ms: iso("2026-10-29T22:39:00Z"),
+  end_ts_ms: iso("2026-10-30T07:04:00Z"), duration_min: 505, lat: FLAT.lat, lon: FLAT.lon,
+  place: { name: "The Harbor Flat", source: "confirmed_stop", confidence: 0.9 } });
+const dinnerStop = () => ({ id: "s-6", start: "19:27", end: "22:55", start_ts_ms: iso("2026-10-30T17:27:00Z"),
+  end_ts_ms: iso("2026-10-30T20:55:00Z"), duration_min: 208, lat: DINNER.lat, lon: DINNER.lon,
+  place: { name: "Example Home", source: "user_confirmed", confidence: 1 } });
+const node = (id, from, to, where, name, tier = "recorded") => ({ type: "dwell", id, major: false,
+  start_ms: iso(from), end_ms: iso(to), place: { name, tier, lat: where.lat, lon: where.lon } });
+const leg = (id, from, to) => ({ type: "leg", id, mode: "driving", start_ms: iso(from), end_ms: iso(to) });
+const evening = (last = node("d7", "2026-10-30T21:50:00Z", "2026-10-30T21:56:00Z", FLAT, "The Harbor Flat")) => ({ spine: [
+  leg("l3", "2026-10-30T20:55:00Z", "2026-10-30T21:16:00Z"),
+  node("d6", "2026-10-30T21:16:00Z", "2026-10-30T21:24:00Z", DROP, "2 Example Street", "corroborated"),
+  leg("l4", "2026-10-30T21:24:00Z", "2026-10-30T21:50:00Z"),
+  last,
+] });
+const dayEnd = (sleptAt = []) => ({ start_ms: DAY_START, end_ms: END, sleptAt });
+
+test("the day's last dwell back where he slept is a stop to midnight; the drop-off on the way is not", () => {
+  const stops = [nightStop(), dinnerStop()];
+  const added = addSpineDwells(stops, evening(), null, [], [], dayEnd());
+  assert.equal(stops.length, 3);
+  const home = stops[2];
+  assert.equal(home.place.name, "The Harbor Flat");
+  assert.equal(home.place.source, "confirmed_stop");
+  assert.equal(home.start_ts_ms, iso("2026-10-30T21:50:00Z"));
+  assert.equal(home.end_ts_ms, END);
+  assert.equal(home.day_end_arrival, true);
+  assert.equal(home.from_spine, true);
+  assert.deepEqual(added.map((a) => [a.spine_id, a.day_end_arrival]), [["d7", "s-1"]]);
+});
+
+test("with no stop at the flat that morning, a place he confirmed sleeping at names it", () => {
+  const stops = [dinnerStop()];
+  addSpineDwells(stops, evening(), null, [], [], dayEnd([{ name: "The Harbor Flat", lat: FLAT.lat, lon: FLAT.lon }]));
+  assert.equal(stops.length, 2);
+  assert.equal(stops[1].place.name, "The Harbor Flat");
+  assert.equal(stops[1].place.source, "confirmed_stop");
+  assert.equal(stops[1].end_ts_ms, END);
+});
+
+test("no arrival stop: somewhere else, not the last node, ended well before midnight, or switched off", () => {
+  const elsewhere = [nightStop(), dinnerStop()];
+  addSpineDwells(elsewhere, evening(node("d7", "2026-10-30T21:50:00Z", "2026-10-30T21:56:00Z", DROP, "A bar")),
+    null, [], [], dayEnd());
+  assert.equal(elsewhere.length, 2, "not where he slept");
+  const outAgain = [nightStop(), dinnerStop()];
+  const sp = evening();
+  sp.spine.push(leg("l5", "2026-10-30T21:56:00Z", "2026-10-30T21:59:00Z"));
+  addSpineDwells(outAgain, sp, null, [], [], dayEnd());
+  assert.equal(outAgain.length, 2, "he went out again");
+  const early = [nightStop(), dinnerStop()];
+  addSpineDwells(early, evening(node("d7", "2026-10-30T20:59:00Z", "2026-10-30T21:05:00Z", FLAT, "The Harbor Flat")),
+    null, [], [], dayEnd());
+  assert.equal(early.length, 2, "ended 55 minutes before midnight");
+  const noDayEnd = [nightStop(), dinnerStop()];
+  addSpineDwells(noDayEnd, evening());
+  assert.equal(noDayEnd.length, 2, "no day end given");
+  process.env.JORI_DAY_END_ARRIVAL = "0";
+  try {
+    const off = [nightStop(), dinnerStop()];
+    addSpineDwells(off, evening(), null, [], [], dayEnd());
+    assert.equal(off.length, 2);
+  } finally {
+    delete process.env.JORI_DAY_END_ARRIVAL;
+  }
+});
+}
