@@ -233,3 +233,71 @@ test("JORI_LATE_CALENDAR=0 leaves the stops and the list alone", () => {
   }
 });
 }
+
+// ── an event a final stop no longer overlaps comes off it ───────────────────
+//
+// A long stop cut on its rests hands its event to every piece. A home cluster
+// from just after midnight to 7pm carried a 4pm call and was cut into five
+// stops; the café piece of the late morning kept the call, and since an event
+// already on a stop outranks a longer one, the 90-minute breakfast the café held
+// was listed as not matched to a location right under it.
+
+{
+const { attachCalendarToFinalStops } = _internal;
+const UL = (iso) => Date.parse(iso);
+const piece = (id, from, to, cal) => ({ id, start: from.slice(11, 16), end: to.slice(11, 16),
+  start_ts_ms: UL(from), end_ts_ms: UL(to), place: { name: "Example Place", source: "confirmed_stop" },
+  calendar_event: cal });
+const CALL = { summary: "A call", location: "https://example.com/j/1", location_match: false,
+  start: "2026-05-04T16:00:00+02:00", end: "2026-05-04T16:30:00+02:00", duration_min: 30,
+  physical: false, event_share: 1 };
+const BREAKFAST = { summary: "Breakfast with two friends", location: null, physical: "",
+  start: "2026-05-04T10:30:00+02:00", end: "2026-05-04T12:00:00+02:00", duration_min: 90 };
+
+test("a cut stop's pieces drop the event they do not overlap, and the café takes the breakfast", () => {
+  const morning = piece("s-1", "2026-05-04T00:39:00+02:00", "2026-05-04T10:44:00+02:00", CALL);
+  const cafe = piece("s-2", "2026-05-04T10:46:00+02:00", "2026-05-04T13:29:00+02:00", CALL);
+  const afternoon = piece("s-3", "2026-05-04T13:31:00+02:00", "2026-05-04T19:01:00+02:00", CALL);
+  const { unmatched, attached, released } = attachCalendarToFinalStops([morning, cafe, afternoon], [BREAKFAST]);
+  assert.equal(cafe.calendar_event.summary, "Breakfast with two friends");
+  assert.ok(Math.abs(cafe.calendar_event.event_share - 74 / 90) < 0.01);
+  assert.equal(afternoon.calendar_event.summary, "A call");
+  // The morning piece overlaps 14 minutes of the breakfast and takes it, as the raw pass would.
+  assert.equal(morning.calendar_event.summary, "Breakfast with two friends");
+  assert.ok(morning.calendar_event.event_share < 0.2);
+  assert.deepEqual(unmatched, []);
+  assert.deepEqual(released.map(r => r.id).sort(), ["s-1", "s-2"]);
+  assert.deepEqual(attached.map(a => a.id).sort(), ["s-1", "s-2"]);
+});
+
+test("an event released from every stop goes back to the unmatched list", () => {
+  const cafe = piece("s-2", "2026-05-04T10:46:00+02:00", "2026-05-04T13:29:00+02:00", CALL);
+  const { unmatched, released } = attachCalendarToFinalStops([cafe], []);
+  assert.equal(cafe.calendar_event, null);
+  assert.deepEqual(unmatched.map(e => e.summary), ["A call"]);
+  assert.equal(unmatched[0].start, CALL.start);
+  assert.equal(released.length, 1);
+});
+
+test("a kept event's share is measured on the piece, and the pieces stop sharing one object", () => {
+  const LONG = { ...CALL, summary: "A long block", start: "2026-05-04T09:00:00+02:00",
+    end: "2026-05-04T13:00:00+02:00", duration_min: 240, event_share: 1 };
+  const a = piece("s-1", "2026-05-04T09:00:00+02:00", "2026-05-04T10:00:00+02:00", LONG);
+  const b = piece("s-2", "2026-05-04T10:00:00+02:00", "2026-05-04T13:00:00+02:00", LONG);
+  attachCalendarToFinalStops([a, b], []);
+  assert.equal(a.calendar_event.event_share, 0.25);
+  assert.equal(b.calendar_event.event_share, 0.75);
+  assert.equal(LONG.event_share, 1);
+});
+
+test("JORI_LATE_CALENDAR=0 leaves a stale event where it is", () => {
+  process.env.JORI_LATE_CALENDAR = "0";
+  try {
+    const cafe = piece("s-2", "2026-05-04T10:46:00+02:00", "2026-05-04T13:29:00+02:00", CALL);
+    attachCalendarToFinalStops([cafe], [BREAKFAST]);
+    assert.equal(cafe.calendar_event.summary, "A call");
+  } finally {
+    delete process.env.JORI_LATE_CALENDAR;
+  }
+});
+}
