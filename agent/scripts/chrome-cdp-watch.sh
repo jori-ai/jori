@@ -57,6 +57,13 @@ else
   CURR="down"
 fi
 
+# --- Clone hygiene: delete Chrome code-sign clones left by dead Chromes ---
+# Every Chrome launch clones its ~2 GB app bundle into
+# $TMPDIR/../X/com.google.Chrome.code_sign_clone and removes it only on a
+# graceful quit; launchd restarts (SIGTERM), SIGKILLs and crashes leak it
+# (196 had piled up by 2026-10-31). Clones of a running Chrome are kept.
+"$(dirname "$0")/../../bin/chrome-clone-sweep" --quiet >> "$LOG" 2>&1 || true
+
 # --- Tab hygiene: reap leaked page tabs (two-strike, ≥1 tick ≈15min age) ---
 # Chrome-automation jobs (event watchers, outreach jobs, …)
 # open http(s) page tabs but don't reliably close them. They pile up — dozens of

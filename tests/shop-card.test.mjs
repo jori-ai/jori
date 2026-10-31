@@ -143,7 +143,22 @@ async function startChrome() {
   for (let i = 0; i < 100 && !fs.existsSync(portFile); i++) await B.sleep(100);
   if (!fs.existsSync(portFile)) { proc.kill("SIGKILL"); return null; }
   const port = fs.readFileSync(portFile, "utf8").split("\n")[0];
-  return { port, proc, dir, stop: () => { proc.kill("SIGKILL"); try { fs.rmSync(dir, { recursive: true, force: true }); } catch {} } };
+  // stop: CDP Browser.close first — on macOS a signalled Chrome leaks its ~2 GB
+  // code_sign_clone in $TMPDIR/../X (see lib/cruise/cdp.mjs); SIGKILL only if it hangs.
+  const stop = async () => {
+    if (proc.exitCode === null && proc.signalCode === null) {
+      const exited = new Promise((r) => proc.once("exit", r));
+      try {
+        const v = await (await fetch(`http://127.0.0.1:${port}/json/version`)).json();
+        const ws = new WebSocket(v.webSocketDebuggerUrl);
+        await new Promise((res, rej) => { ws.onopen = res; ws.onerror = rej; });
+        ws.send(JSON.stringify({ id: 1, method: "Browser.close" }));
+      } catch {}
+      if (!(await Promise.race([exited.then(() => true), B.sleep(5000).then(() => false)]))) proc.kill("SIGKILL");
+    }
+    try { fs.rmSync(dir, { recursive: true, force: true }); } catch {}
+  };
+  return { port, proc, dir, stop };
 }
 
 function serve(handler) {
@@ -181,7 +196,7 @@ test("end to end: fills a processor's cross-origin frame with real keys, clicks 
     res.setHeader("content-type", "text/html");
     res.end(req.url.startsWith("/inner") ? `<input id="innercard" autocomplete="cc-number" style="width:200px">` : MERCHANT(procPort));
   });
-  t.after(() => { chrome.stop(); proc.close(); merchant.close(); });
+  t.after(async () => { await chrome.stop(); proc.close(); merchant.close(); });
 
   const tab = await openTab(chrome.port, `http://merchant.test:${merchant.address().port}/checkout`);
   const values = { number: "4111111111111111", expMonth: 3, expYear: 2029, cvv: "737", given: "Ada", family: "Lovelace" };
