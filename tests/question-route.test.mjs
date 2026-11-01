@@ -7,8 +7,13 @@
 //   2. routeQuestion: not a question → chat untouched; location → chat, urgent,
 //      no judgment; judged urgent → chat; judged not urgent → questions;
 //      judge failure and the off switch → chat.
-//   3. jori-send-curl applies the route: the row's channel, no push for the
-//      questions channel, the `.route` sidecar for a capturing caller.
+//   3. The words check: a message whose label says "not a question" is read by
+//      a model (Jev site `message-asks`) and, when it asks something, routed
+//      like any question; a private-data intent, the off switches and a
+//      labelled question never reach it; a failed check keeps chat.
+//   4. jori-send-curl applies the route: the row's channel, no push for the
+//      questions channel, the `.route` sidecar for a capturing caller, and the
+//      router is told about tappable choices and private-data intents.
 //
 // Run: node --test tests/question-route.test.mjs
 
@@ -24,7 +29,8 @@ import { fileURLToPath } from "node:url";
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "question-route-"));
 process.env.QUESTION_ROUTE_LOG = path.join(tmp, "log.jsonl");
 process.env.QUESTION_ROUTE_OFF = path.join(tmp, ".off");
-const { isQuestion, isLocationQuestion, routeQuestion, rubricPrompt } = await import("../lib/question-route.mjs");
+process.env.QUESTION_TEXT_CHECK_OFF = path.join(tmp, ".text-off");
+const { isQuestion, isLocationQuestion, routeQuestion, rubricPrompt, asksPrompt, ASKS_DEF } = await import("../lib/question-route.mjs");
 
 const KERNEL = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const require = createRequire(import.meta.url);
@@ -32,6 +38,9 @@ const { underTestRunner } = require("../lib/load-env.js");
 const { KERNEL_SUBDIR } = require("../lib/root.cjs");
 
 const never = async () => { throw new Error("the judge must not run"); };
+// The words check's stand-ins: every routeQuestion call below names one, so no
+// test can reach a real model.
+const says = (asks) => async () => ({ asks, reason: "test" });
 
 test("a question is recognised from structure only", () => {
   assert.equal(isQuestion({ intent: "hum:dream_asks:question" }), true);
@@ -57,8 +66,84 @@ test("a location question is recognised from structure only", () => {
 });
 
 test("a message that is not a question stays in chat and is never judged", async () => {
-  const r = await routeQuestion({ text: "The museum opens at 10.", intent: "hum:nearby:fact", judge: never });
+  const r = await routeQuestion({ text: "The museum opens at 10.", intent: "hum:nearby:fact", judge: never, detector: says(false) });
   assert.deepEqual([r.channel, r.urgent, r.question], ["chat", false, false]);
+});
+
+// An info ping that closes with a question (the shape of the ping that prompted
+// this check: labelled info, so structure alone sent it to chat).
+const INFO_PING_ASKING = "Cancelling the spare phone line and choosing the order of the next three trips are both due Friday. "
+  + "Your timeline has nothing yet on when the second trip comes. Want to settle the trip order first and cancel only if that trip is late or off?";
+const INFO_CONTEXT = { kind: "ping", lane: "ideas", dedup_key: "idea-x", finding: { topic: "ideas", supporting_data: { confidence: "medium", verify_question: null } } };
+
+test("a message labelled info that asks something is found from its words and routed as a question", async () => {
+  assert.equal(isQuestion({ intent: "hum:ideas:idea-x", context: INFO_CONTEXT }), false, "structure alone does not see it");
+  let read = null;
+  const r = await routeQuestion({ text: INFO_PING_ASKING, intent: "hum:ideas:idea-x", context: INFO_CONTEXT,
+    detector: async (s) => { read = s; return { asks: true }; }, judge: async () => ({ urgent: false }) });
+  assert.deepEqual([r.channel, r.urgent, r.question, r.detected], ["questions", false, true, "text"]);
+  assert.equal(read.message, INFO_PING_ASKING, "the model reads the whole message");
+  assert.equal(read.intent, "hum:ideas:idea-x");
+  assert.equal(read.lane, "ideas");
+  const urgent = await routeQuestion({ text: INFO_PING_ASKING, intent: "hum:ideas:idea-x", context: INFO_CONTEXT,
+    detector: says(true), judge: async () => ({ urgent: true }) });
+  assert.deepEqual([urgent.channel, urgent.urgent, urgent.detected], ["chat", true, "text"], "an urgent one stays in chat");
+});
+
+test("the words check and the urgency judgment it leads to run on a tight budget", async () => {
+  process.env.QUESTION_TEXT_CHECK_MS = "60";
+  const hang = () => new Promise(() => {});
+  try {
+    const slowCheck = await routeQuestion({ text: INFO_PING_ASKING, intent: "hum:ideas:idea-x", context: INFO_CONTEXT, detector: hang, judge: never });
+    assert.deepEqual([slowCheck.channel, slowCheck.question], ["chat", null]);
+    assert.match(slowCheck.reason, /timed out/);
+    const slowJudge = await routeQuestion({ text: INFO_PING_ASKING, intent: "hum:ideas:idea-x", context: INFO_CONTEXT, detector: says(true), judge: hang });
+    assert.deepEqual([slowJudge.channel, slowJudge.question, slowJudge.detected], ["chat", true, "text"]);
+    assert.match(slowJudge.reason, /timed out/);
+    // A labelled question keeps the router's own (longer) deadline.
+    const labelled = await routeQuestion({ text: "Q?", intent: "decision:ask", detector: never,
+      judge: () => new Promise((resolve) => setTimeout(() => resolve({ urgent: false }), 120)) });
+    assert.equal(labelled.channel, "questions");
+  } finally { delete process.env.QUESTION_TEXT_CHECK_MS; }
+});
+
+test("the words check: a no stays in chat, a labelled question skips it, choices are passed on", async () => {
+  const no = await routeQuestion({ text: "Your table is booked for 8.", intent: "booking-confirmation", detector: says(false), judge: never });
+  assert.deepEqual([no.channel, no.question], ["chat", false]);
+  const labelled = await routeQuestion({ text: "Q?", intent: "decision:ask", detector: never, judge: async () => ({ urgent: false }) });
+  assert.equal(labelled.channel, "questions");
+  assert.equal(labelled.detected, undefined, "a labelled question is not marked as found from its words");
+  let seen = null;
+  await routeQuestion({ text: "Pick one.", intent: "invite", choices: true, detector: async (s) => { seen = s; return { asks: false }; }, judge: never });
+  assert.equal(seen.has_choices, true);
+});
+
+test("a private-data intent and the off switches are never read for an ask", async () => {
+  const priv = await routeQuestion({ text: "A charge posted. Was it you?", intent: "bank-alert", privateData: true, detector: never, judge: never });
+  assert.deepEqual([priv.channel, priv.question], ["chat", false]);
+  for (const sw of [process.env.QUESTION_TEXT_CHECK_OFF, process.env.QUESTION_ROUTE_OFF]) {
+    fs.writeFileSync(sw, "");
+    try {
+      const r = await routeQuestion({ text: INFO_PING_ASKING, intent: "hum:ideas:idea-x", context: INFO_CONTEXT, detector: never, judge: never });
+      assert.deepEqual([r.channel, r.question], ["chat", false]);
+    } finally { fs.unlinkSync(sw); }
+  }
+});
+
+test("a failed words check keeps the message in chat and is logged", async () => {
+  const r = await routeQuestion({ text: "Want me to?", intent: "hum:ideas:idea-y", detector: async () => { throw new Error("down"); }, judge: never });
+  assert.deepEqual([r.channel, r.question], ["chat", null]);
+  assert.match(r.reason, /text check failed/);
+  const rows = fs.readFileSync(process.env.QUESTION_ROUTE_LOG, "utf8").split("\n").filter(Boolean).map((l) => JSON.parse(l));
+  assert.ok(rows.some((x) => x.intent === "hum:ideas:idea-y" && x.question === null && x.detected === "text"));
+});
+
+test("the words check's Sonnet rung reads the site's own wording", () => {
+  const p = asksPrompt({ message: "Want me to book it?" });
+  assert.match(p, /asks=true/);
+  assert.ok(p.includes('"message":"Want me to book it?"'));
+  assert.ok(!p.includes("{{owner_name}}"), "the owner's name is filled in");
+  assert.equal(ASKS_DEF.questions.asks.type, "boolean");
 });
 
 test("a location question is urgent and stays in chat without a judgment", async () => {
@@ -150,8 +235,29 @@ test("jori-send-curl keeps an urgent question in chat", needsRunner, () => {
   const box = sandbox({ channel: "chat", urgent: true, question: true });
   const r = box.run(["--skip-precheck", "--location-question", "Where are you off to?"]);
   assert.equal(r.status, 0, r.stderr);
-  assert.match(box.calls(), /"channel":"chat"/);
+  assert.match(box.calls(), /"channel":"chat"/); // lang-regex-ok: the recorded insert's channel field, not the user's words
   assert.ok(box.argsSeen().includes("--location"));
+});
+
+test("jori-send-curl tells the router about tappable choices and private-data intents", needsRunner, () => {
+  const box = sandbox({ channel: "chat", urgent: false, question: false });
+  let r = box.run(["--skip-precheck", "--choices-json", '{"options":[]}', "Which one?"]);
+  assert.equal(r.status, 0, r.stderr);
+  assert.ok(box.argsSeen().includes("--choices"));
+  assert.ok(!box.argsSeen().includes("--private-data"));
+  r = box.run(["--intent", "bank-alert", "A charge posted."]);
+  assert.equal(r.status, 0, r.stderr);
+  assert.ok(box.argsSeen().includes("--private-data"), "a bank intent is never read for an ask");
+});
+
+test("question-route (the CLI) passes --private-data through and stays in chat", () => {
+  const out = spawnSync(process.execPath, [path.join(KERNEL, "bin/question-route"), "--intent", "bank-alert", "--private-data"], {
+    input: "A charge posted. Was it you?", encoding: "utf8", timeout: 20_000,
+    env: { ...process.env, QUESTION_ROUTE_LOG: path.join(tmp, "cli-log.jsonl") },
+  });
+  assert.equal(out.status, 0, out.stderr);
+  const r = JSON.parse(out.stdout.trim());
+  assert.deepEqual([r.channel, r.question], ["chat", false]);
 });
 
 test("jori-send-curl never routes a message for another channel", needsRunner, () => {

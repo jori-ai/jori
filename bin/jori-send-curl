@@ -913,8 +913,13 @@ fi
 # ones stay in chat; location questions are always urgent and arrive at once.
 # AFTER every gate above (precheck, resolve-first, freshness) has decided the
 # message goes out at all, bin/question-route decides where. A message is a
-# question by structure only: --question, an intent ending `:question` or
-# `:ask`, or hum context whose finding is a question candidate. Then:
+# question by structure (--question, an intent ending `:question` or `:ask`,
+# hum context whose finding is a question candidate) or, when structure says
+# no, by its words: a model reads them (Jev site `message-asks`, Rule #0b), so
+# an info ping that closes with a question is routed as one. A private-data
+# intent (bank, brokerage, health: see the precheck exemption above) is never
+# read for an ask and stays in chat as before. One found from its words takes
+# the same route below, except that staying in chat keeps its normal push. Then:
 #   location question → stays in chat, pushed time-sensitive (URGENT_PUSH), so
 #                       the motion gate does not park it.
 #   other question    → Jev site `question-urgency`: urgent stays in chat as
@@ -932,13 +937,17 @@ if [ "$CHANNEL" = "chat" ] && [ -f "$QUESTION_ROUTE" ] \
   [ -n "${HUM_CONTEXT_FILE:-}" ] && [ -f "$HUM_CONTEXT_FILE" ] && QR_ARGS+=(--hum-context "$HUM_CONTEXT_FILE")
   [ "$IS_QUESTION" = true ] && QR_ARGS+=(--question)
   [ "$IS_LOCATION_QUESTION" = true ] && QR_ARGS+=(--location)
+  [ -n "${CHOICES_JSON:-}" ] && QR_ARGS+=(--choices)
+  if [ -n "${INTENT:-}" ]; then
+    _load_send_intents
+    _intent_in "$INTENT" "$PRIVATE_DATA_INTENTS $PRIVATE_HUM_INTENTS" && QR_ARGS+=(--private-data)
+  fi
   QR_OUT=$(printf '%s' "$MESSAGE" | node "$QUESTION_ROUTE" "${QR_ARGS[@]}" 2>/dev/null)
   QR_FIELDS=$(printf '%s' "$QR_OUT" | python3 -c 'import json,sys
 try:
-  r=json.load(sys.stdin); print(r.get("channel","chat"), "true" if r.get("urgent") else "false")
-except Exception: print("chat false")' 2>/dev/null)
-  QR_CHANNEL="${QR_FIELDS%% *}"
-  QR_URGENT="${QR_FIELDS##* }"
+  r=json.load(sys.stdin); print(r.get("channel","chat"), "true" if r.get("urgent") else "false", r.get("detected") or "label")
+except Exception: print("chat false label")' 2>/dev/null)
+  read -r QR_CHANNEL QR_URGENT QR_DETECTED <<< "$QR_FIELDS"
   # Where it went, for a caller that captures the id (hum-ask: a question in the
   # Questions tab does not hold hum's single pending-question slot).
   if [ -n "$CAPTURE_ID_FILE" ] && [ -n "$QR_OUT" ]; then
@@ -947,7 +956,11 @@ except Exception: print("chat false")' 2>/dev/null)
   if [ "$QR_CHANNEL" = "questions" ]; then
     CHANNEL="questions"
     [ "$FORCE_PUSH" = false ] && NO_PUSH=true
-  elif [ "$QR_URGENT" = "true" ]; then
+  # An urgent question pushes time-sensitive, except one found only from its
+  # words: its sender did not label it a question, so it stays in chat exactly
+  # as it was going, normal push (the motion gate's `urgent` is narrower than
+  # "needed within hours").
+  elif [ "$QR_URGENT" = "true" ] && [ "$QR_DETECTED" != "text" ]; then
     URGENT_PUSH=true
   fi
 fi
