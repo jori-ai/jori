@@ -13,7 +13,7 @@ Historically this job edited the `.md` files in the auto-memory dir (`node lib/i
 3. **Preserve provenance.** Never delete the only record of a fact. A merge keeps the canonical page (higher-signal type, or pinned, or more backlinks) and folds the orphan's unique lines into it BEFORE deleting the orphan. Never drop information in a merge — only duplication.
 4. **Never touch health/financial pages or the episodic day/week/month pages.** `type=day|week|month` are an immutable episodic record (regenerated from `daily_summaries`) — do not merge/retire them. Anything sourced from health/bank data stays untouched (those live in their own jori-model-only stores; the wiki shouldn't hold specifics anyway).
 5. **Never restructure a page wholesale or rewrite unrelated content.** Fold/append/supersede specific facts; leave the rest byte-for-byte.
-6. **Silent-on-empty week.** If no active page changed in the last 7 days AND nothing clusters, send a one-line "nothing to consolidate this week" email and exit.
+6. **Silent-on-empty week.** If nothing was applied (no active page changed in the last 7 days, or nothing clustered, or every candidate failed the conservative bar), send **no email, no phone pointer, no push** — nothing at all to the owner. Do only Step 6 (persist run state, with `proposals_applied: 0`) and exit. A "nothing to consolidate" email is itself noise: the owner told the job to stay quiet when there is nothing to report.
 7. **One HTML email + one phone pointer + one push** (universal long-form delivery rule). No per-proposal messages.
 8. **The user can dispute** — see the revert flow below (native `wiki history`, not email reconstruction).
 
@@ -86,11 +86,11 @@ Deliver per the universal long-form rule (`ops-agent/CLAUDE.md`) with ONE comman
   --push "Memory Consolidation — Sun <DATE> is in your inbox"
 ```
 
-On a silent-empty week, a single one-line "nothing to consolidate" email is enough: omit `--pointer` and `--push`. Exit 1 = the email did not send and nothing else ran — report it. Exit 2 = sent but unlabeled — note it.
+Only run this step when at least one change was applied (Critical rule 6). On a silent-empty week skip it entirely and go straight to Step 6. Exit 1 = the email did not send and nothing else ran — report it. Exit 2 = sent but unlabeled — note it.
 
 ## Step 6 — Persist run state
 
-After send, write `~/Dev/jori/data/memory-consolidation-prev.json`:
+After send (or, on a silent-empty week, instead of sending), write `~/Dev/jori/data/memory-consolidation-prev.json` so the run still leaves its record:
 ```json
 { "ran_at": "<ISO>", "proposals_applied": N, "pages_touched": ["id", ...], "pending_reconsider": ["id", ...] }
 ```
@@ -108,7 +108,7 @@ If the user replies `revert <ID>` / `revert all`, `email-inbound.md` dispatches 
 
 ## Guardrails
 
-- Wiki `pages` writes only (via `wiki` CLI). Never money/calendar/tasks/outbound (beyond the one report email/pointer/push). Never edit memory `.md` files (clobbered no-op).
+- Wiki `pages` writes only (via `wiki` CLI). Never money/calendar/tasks/outbound (beyond the one report email/pointer/push, sent only when something was applied). Never edit memory `.md` files (clobbered no-op).
 - Never merge/retire `day|week|month` episodic pages, health/financial-derived pages, or `pin_locked` identity-core pages (superseding the load-bearing identity core needs a human — flag it, don't auto-apply).
 - **Never merge or retire an `entity: person` page for being thin, and never fold one back into a hub** (every person the user knows has their own page; content builds over time). Two person pages are mergeable only when they are the same human, and a shared name alone doesn't show that. Don't "expand" a person page's `## Email` block; `email-people write-section` owns it. See `system/wiki-architecture.md` § People pages.
 - Never drop information in a merge; only duplication. Never invent content in an expand.
