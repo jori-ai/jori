@@ -93,6 +93,38 @@ test("an event titled with a three-letter name on the stop is that stop", () => 
   assert.deepEqual(eventsNotMatched(other).map(e => e.summary), ["Ari"], "not when Ari is not on the stop");
 });
 
+// A place-less block the stop holds from start to end was listed as not matched
+// to a location right below the evening at home that held it.
+const PACK = { summary: "Pack", location: "", physical: "", location_match: false,
+  start: "2026-10-20T19:30:00+03:00", end: "2026-10-20T20:30:00+03:00", duration_min: 60, event_share: 1 };
+const home = (cal, from = "19:07", to = "20:57") => ({ id: "h", calendar_event: cal,
+  start_ts_ms: Date.parse(`2026-10-20T${from}:00+03:00`), end_ts_ms: Date.parse(`2026-10-20T${to}:00+03:00`),
+  place: { name: "The Example Flat", source: "confirmed_stop" },
+  provenance: { tier: "CONFIRMED", confirmed_name: "The Example Flat", display_name: "The Example Flat" } });
+
+test("a place-less event a drawn stop holds from start to end goes under that stop, not in the unmatched list", () => {
+  const day = { date: "2026-10-20", unmatched_calendar_events: [], stops: [home(PACK)] };
+  assert.deepEqual(eventsNotMatched(day), []);
+  assert.equal(render._internal.heldCalendarEvent(day, day.stops[0]).summary, "Pack");
+  assert.equal(render._internal.calendarCorroborated(day.stops[0]), false, "held is not corroboration");
+});
+
+test("an event with a place, or one the stop only partly covers, stays in the unmatched list", () => {
+  const placed = { date: "2026-10-20", unmatched_calendar_events: [], stops: [home({ ...PACK, location: "Seaside City Port" })] };
+  assert.deepEqual(eventsNotMatched(placed).map(e => e.summary), ["Pack"]);
+  const partly = { date: "2026-10-20", unmatched_calendar_events: [], stops: [home(PACK, "19:45", "20:57")] };
+  assert.deepEqual(eventsNotMatched(partly).map(e => e.summary), ["Pack"]);
+  assert.equal(render._internal.heldCalendarEvent(partly, partly.stops[0]), null);
+});
+
+test("JORI_CAL_HELD=0 keeps a held event in the unmatched list", () => {
+  process.env.JORI_CAL_HELD = "0";
+  try {
+    const day = { date: "2026-10-20", unmatched_calendar_events: [], stops: [home(PACK)] };
+    assert.deepEqual(eventsNotMatched(day).map(e => e.summary), ["Pack"]);
+  } finally { delete process.env.JORI_CAL_HELD; }
+});
+
 test("the manifest splits events the same way the email does", () => {
   const day = { date: "2026-10-20", stops: [
       { id: "s-3", start: "16:19", end: "18:02", place: { name: "Visiting Nana", source: "user_confirmed" },
