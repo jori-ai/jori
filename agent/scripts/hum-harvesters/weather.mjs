@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { execSync } from "node:child_process";
@@ -6,6 +7,41 @@ import { readStdinJson, readCache, writeCache, emit, emitNull, stampRun } from "
 
 import { installTools } from "../../../lib/root.cjs";
 const { situation: sit, context } = await readStdinJson();
+
+// Keyless fallback (Open-Meteo): same shape as the WeatherKit snapshot.
+async function openMeteo(lat, lon) {
+  try {
+    const url = `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}` +
+      `&current=temperature_2m,weather_code,uv_index&hourly=precipitation_probability` +
+      `&temperature_unit=fahrenheit&forecast_hours=6&timezone=auto`;
+    const r = await fetch(url, { signal: AbortSignal.timeout(8000) });
+    if (!r.ok) return null;
+    const j = await r.json();
+    const c = j?.current;
+    if (!c || c.temperature_2m == null) return null;
+    const probs = (j?.hourly?.precipitation_probability || []).filter((n) => typeof n === "number");
+    return {
+      temp_f: c.temperature_2m,
+      condition: `wmo${c.weather_code}`,
+      precip_chance: probs.length ? Math.max(...probs) / 100 : 0,
+      uv: c.uv_index || 0,
+      source: "open-meteo",
+    };
+  } catch { return null; }
+}
+
+// One line per local day in the log, not one per tick.
+function noteFallbackOnce(msg) {
+  try {
+    const f = installTools("data/hum-cache/weather-fallback-noted.txt");
+    const day = new Date().toISOString().slice(0, 10);
+    if (fs.existsSync(f) && fs.readFileSync(f, "utf8").trim() === day) return;
+    fs.mkdirSync(path.dirname(f), { recursive: true });
+    fs.writeFileSync(f, day);
+    process.stderr.write(`weather: weatherkit_unavailable (${String(msg).split("\n")[0].slice(0, 120)}); using open-meteo\n`);
+  } catch { /* logging only */ }
+}
+
 
 // Use cached weather if fresh (60m TTL); otherwise fetch
 const TTL_MIN = 60;
@@ -27,8 +63,17 @@ if (!cur || cur._age_min >= TTL_MIN) {
     };
     writeCache("weather", cur);
   } catch (e) {
-    emitNull(`weather fetch: ${e.message}`);
-    process.exit(0);
+    // WeatherKit not enabled for the service id (401 NOT_ENABLED) or otherwise
+    // down: fall back to the keyless Open-Meteo forecast for the same fix, and
+    // note the fallback at most once a day instead of one error per tick.
+    const lat = sit?.where?.lat, lon = sit?.where?.lon;
+    cur = lat != null && lon != null ? await openMeteo(lat, lon) : null;
+    if (!cur) {
+      emitNull(`weather fetch: ${e.message}`);
+      process.exit(0);
+    }
+    noteFallbackOnce(e.message);
+    writeCache("weather", cur);
   }
 }
 
