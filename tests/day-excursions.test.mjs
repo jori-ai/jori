@@ -354,6 +354,22 @@ test("a feature the path only brushed past does not name the walk", () => {
   assert.equal(dominantFeature(points, [river]), null);
 });
 
+test("a feature tagged in the local script is named by its English tag when it has one", () => {
+  const { featureName } = _internal;
+  assert.equal(featureName({ name: "Plage du Nord", "name:en": "North Beach" }), "North Beach");
+  assert.equal(featureName({ name: "Plage du Nord", int_name: "North Beach" }), "North Beach");
+  assert.equal(featureName({ name: "Plage du Nord", "name:en": "  " }), "Plage du Nord");
+  assert.equal(featureName({ name: "Plage du Nord" }), "Plage du Nord");
+  assert.equal(featureName({}), null);
+  assert.equal(featureName(null), null);
+});
+
+test("a walk named for a beach runs along it, as one named for a river does", () => {
+  const { titleFor } = _internal;
+  assert.equal(titleFor({ feature: { name: "North Beach", kind: "beach" } }), "Walk along North Beach");
+  assert.equal(titleFor({ feature: { name: "Example Park", kind: "green" } }), "Walk in Example Park");
+});
+
 test("with no feature and no neighborhood the walk is still a walk", () => {
   const { titleFor } = _internal;
   assert.equal(titleFor({}), "Walk");
