@@ -195,13 +195,22 @@ test("an event no final stop overlaps stays unmatched", () => {
   assert.deepEqual(unmatched, [SHOW]);
 });
 
-test("a more specific event already on the stop keeps it", () => {
-  const OWN = { summary: "Soundcheck", start: "2026-05-04T20:45:00+02:00", end: "2026-05-04T21:15:00+02:00",
-    duration_min: 30, event_share: 1, location_match: false };
+test("an event already on the stop that fits its window better keeps it", () => {
+  const OWN = { summary: "Evening at the venue", start: "2026-05-04T20:40:00+02:00", end: "2026-05-04T22:55:00+02:00",
+    duration_min: 135, event_share: 1, location_match: false };
   const evening = lateStop("s-9", "2026-05-04T18:41:00Z", "2026-05-04T20:55:00Z", { calendar_event: OWN });
   const { unmatched } = attachCalendarToFinalStops([evening], [SHOW]);
-  assert.equal(evening.calendar_event.summary, "Soundcheck");
+  assert.equal(evening.calendar_event.summary, "Evening at the venue");
   assert.deepEqual(unmatched.map(e => e.summary), ["An Example Band"]);
+});
+
+test("a short event covering a sliver of the stop gives it to the show the stop held, and is listed", () => {
+  const OWN = { summary: "Soundcheck", start: "2026-05-04T20:45:00+02:00", end: "2026-05-04T21:15:00+02:00",
+    duration_min: 30, event_share: 1, location_match: false, location: null, physical: "" };
+  const evening = lateStop("s-9", "2026-05-04T18:41:00Z", "2026-05-04T20:55:00Z", { calendar_event: OWN });
+  const { unmatched } = attachCalendarToFinalStops([evening], [SHOW]);
+  assert.equal(evening.calendar_event.summary, "An Example Band");
+  assert.deepEqual(unmatched.map(e => e.summary), ["Soundcheck"]);
 });
 
 test("a longer event it displaces is listed as unmatched, never dropped", () => {

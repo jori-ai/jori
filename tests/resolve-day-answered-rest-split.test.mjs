@@ -93,3 +93,55 @@ test("a rest whose past answer is the stop's own name does not cut it", () => {
   const { splits } = splitWideStopsOnRests([b], PINGS, c);
   assert.equal(splits[0].kept_whole, true, JSON.stringify(splits[0]));
 });
+
+// A stop cut on its rests keeps its own start when nothing before the first rest
+// puts the user anywhere else. A night at the flat began before midnight, the
+// phone lay silent until 1:00, and the morning café sat 148 m away in the same
+// cluster: the first rest began at its first fix, so the day opened at 1:00am
+// with its first hour belonging to no stop. Synthetic places and date.
+const HT = (hms) => Date.parse(`2099-05-07T${hms}+02:00`);
+const H_FLAT = fakeAt(0, 0), H_CAFE = fakeAt(148, 0), H_ELSEWHERE = fakeAt(600, 0);
+const hfix = (hms, p) => ({ ts: HT(hms), lat: p.lat, lon: p.lon, acc: 10, kind: "fix", activity: "stationary" });
+const H_NIGHT = ["01:00:07", "03:00:00", "05:00:00", "07:28:00", "08:30:00"].map(h => hfix(h, H_FLAT));
+const H_MORNING = ["09:00:59", "09:10:00", "09:20:00", "09:30:00"].map(h => hfix(h, H_CAFE));
+const nightBlend = () => {
+  const mid = fakeAt(74, 0);
+  return {
+    id: "s-20990507-1", start: "00:00", end: "09:38",
+    start_ts_ms: HT("00:00:00"), end_ts_ms: HT("09:38:00"), duration_min: 578,
+    lat: mid.lat, lon: mid.lon, cluster_radius_km: 0.136, sample_count: 9,
+    place: { name: "Café Example", address: null, source: "confirmed_stop", confidence: 0.95, distance_m: 20 },
+    photos: [], companions: [],
+  };
+};
+const headCtx = () => ({ date: "2099-05-07", knownStopsEntries: [], companionRows: [], confirmedStopsEntries: [
+  { name: "The Example Flat", centroid: { lat: H_FLAT.lat, lon: H_FLAT.lon } },
+  { name: "Café Example", centroid: { lat: H_CAFE.lat, lon: H_CAFE.lon } },
+] });
+
+test("the first piece keeps the stop's start when the phone was silent before the first rest", () => {
+  const { stops, splits } = splitWideStopsOnRests([nightBlend()], [...H_NIGHT, ...H_MORNING], headCtx());
+  assert.equal(splits.length, 1);
+  assert.ok(!splits[0].kept_whole, JSON.stringify(splits[0]));
+  const flat = stops.find(s => s.place.name === "The Example Flat");
+  assert.ok(flat, JSON.stringify(stops.map(s => s.place.name)));
+  assert.equal(flat.start_ts_ms, HT("00:00:00"));
+  assert.equal(flat.end_ts_ms, HT("09:00:59"));
+  const cafe = stops.find(s => s.place.name === "Café Example");
+  assert.equal(cafe.start_ts_ms, HT("09:00:59"), "the second piece is untouched");
+});
+
+test("a fix elsewhere before the first rest leaves the rest's own start", () => {
+  const { stops } = splitWideStopsOnRests([nightBlend()], [hfix("00:30:00", H_ELSEWHERE), ...H_NIGHT, ...H_MORNING], headCtx());
+  const flat = stops.find(s => s.place.name === "The Example Flat");
+  assert.ok(flat, JSON.stringify(stops.map(s => s.place.name)));
+  assert.equal(flat.start_ts_ms, HT("01:00:07"));
+});
+
+test("JORI_SPLIT_KEEPS_HEAD=0 leaves the rest's own start", () => {
+  process.env.JORI_SPLIT_KEEPS_HEAD = "0";
+  try {
+    const { stops } = splitWideStopsOnRests([nightBlend()], [...H_NIGHT, ...H_MORNING], headCtx());
+    assert.equal(stops.find(s => s.place.name === "The Example Flat").start_ts_ms, HT("01:00:07"));
+  } finally { delete process.env.JORI_SPLIT_KEEPS_HEAD; }
+});

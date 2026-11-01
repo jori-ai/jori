@@ -1,10 +1,11 @@
 // resolve-day-calendar-tie.test.mjs — which calendar event a stop carries when
 // two overlap it, and what happens to the one that loses.
 //
-// enrichStopsWithCalendar keeps the most specific (shortest) event per stop. On
-// a tie in length the event that covers more of the stop wins (never the
-// calendar's listing order), and the losing event is listed as unmatched rather
-// than recorded nowhere. Synthetic day and place; the calendar CLI is a stub.
+// enrichStopsWithCalendar keeps, per stop, the timed event whose window best fits
+// the stop's (overlap over union; an all-day block only when no timed event
+// overlaps). On a tie the shorter event, then the one covering more of the stop,
+// wins (never the calendar's listing order), and the losing event is listed as
+// unmatched rather than recorded nowhere. Synthetic day and place; the calendar CLI is a stub.
 //
 // Run: node --test tests/resolve-day-calendar-tie.test.mjs
 
@@ -55,12 +56,41 @@ test("the listing order does not decide a tie", async () => {
   assert.deepEqual(r.unmatched_calendar_events.map((e) => e.summary), ["Errand elsewhere"]);
 });
 
-test("a shorter event still wins over a longer one, and the longer one is listed, not lost", async () => {
+test("inside one stop, the event that fills more of it wins, and the other one is listed, not lost", async () => {
   fakeGog([timed("Drinks", "18:00", "19:00"), timed("Dinner", "19:00", "22:00")]);
   const s = stop("18:00", "23:00");
   const r = await enrichStopsWithCalendar([s], DATE);
-  assert.equal(s.calendar_event.summary, "Drinks");
-  assert.deepEqual(r.unmatched_calendar_events.map((e) => e.summary), ["Dinner"]);
+  assert.equal(s.calendar_event.summary, "Dinner");
+  assert.deepEqual(r.unmatched_calendar_events.map((e) => e.summary), ["Drinks"]);
+});
+
+// The half-hour drive planned for the end of a visit used to win the stop for
+// being shorter, and the hour-long visit itself was listed as not matched under it.
+test("a short event that only clips the end of a visit does not take the stop from the visit", async () => {
+  fakeGog([timed("Visit with Alex", "16:00", "17:00"), timed("Drive to Example Town", "17:00", "17:30")]);
+  const s = stop("16:20", "17:23");
+  const r = await enrichStopsWithCalendar([s], DATE);
+  assert.equal(s.calendar_event.summary, "Visit with Alex");
+  assert.deepEqual(r.unmatched_calendar_events.map((e) => e.summary), ["Drive to Example Town"]);
+});
+
+test("a multi-day timed stay block still loses to a short event inside the stop", async () => {
+  fakeGog([{ summary: "Stay at Example Inn", start: { dateTime: "2099-05-06T15:00:00+02:00" },
+             end: { dateTime: "2099-05-09T11:00:00+02:00" } }, timed("Coffee", "10:30", "11:00")]);
+  const s = stop("10:00", "12:00");
+  const r = await enrichStopsWithCalendar([s], DATE);
+  assert.equal(s.calendar_event.summary, "Coffee");
+  assert.deepEqual(r.unmatched_calendar_events.map((e) => e.summary), ["Stay at Example Inn"]);
+});
+
+test("JORI_CALENDAR_FIT=0 restores shortest-wins between timed events", async () => {
+  process.env.JORI_CALENDAR_FIT = "0";
+  try {
+    fakeGog([timed("Visit with Alex", "16:00", "17:00"), timed("Drive to Example Town", "17:00", "17:30")]);
+    const s = stop("16:20", "17:23");
+    await enrichStopsWithCalendar([s], DATE);
+    assert.equal(s.calendar_event.summary, "Drive to Example Town");
+  } finally { delete process.env.JORI_CALENDAR_FIT; }
 });
 
 test("an event that a stop still carries is not also listed as unmatched; a losing all-day block is not listed", async () => {
