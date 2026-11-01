@@ -431,15 +431,9 @@ function structural(html) {
 }
 
 // ---- judgment: hand the report to a model ------------------------------------
-// The report as readable lines: block ends become newlines before the markup is
-// stripped, so the reviewer sees paragraphs, not one run-on.
+// The report as readable lines, our escapes decoded (R.reportTextOf).
 function reportText(html) {
-  return html
-    .replace(/<\/(p|h[1-6]|li|div|tr|ul)>|<br\s*\/?>/gi, "\n")      // lang-regex-ok: our own block markup
-    .replace(/<[^>]*>/g, " ")                                         // lang-regex-ok: strips our own markup
-    .replace(/&nbsp;/g, " ").replace(/&amp;/g, "&")                   // lang-regex-ok: decodes our own HTML escapes
-    .split("\n").map((l) => l.replace(/\s+/g, " ").trim()).filter(Boolean).join("\n")  // lang-regex-ok: whitespace of our own markup
-    .slice(0, 40000);
+  return R.reportTextOf(html);
 }
 
 let versionLogged = false;

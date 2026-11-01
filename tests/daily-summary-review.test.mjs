@@ -1043,3 +1043,12 @@ test("CLI: a 'present' that quotes an unlabeled stop's heading does not clear th
     assert.equal(out.confirmed, false);
   } finally { CLEAN(); try { fs.unlinkSync(stmts); } catch {} fs.rmSync(dir, { recursive: true, force: true }); }
 });
+
+test("the reviewer reads our escapes as a mail client shows them, so a task with quote marks is not reported garbled", () => {
+  const html = `<h3>2:00pm · Example Café</h3><ul><li><b>2:23pm</b> Open source new &quot;Example&quot; as a co-worker. it&#39;s &lt;fine&gt; &amp; done</li></ul>`;
+  assert.equal(R.reportTextOf(html), `2:00pm · Example Café\n2:23pm Open source new "Example" as a co-worker. it's <fine> & done`);
+  // A text that really was escaped twice still reads escaped: &amp; is decoded last.
+  assert.equal(R.reportTextOf("<p>A &amp;quot;B&amp;quot;</p>"), "A &quot;B&quot;");
+  assert.equal(R.reportTextOf("<p>" + "x".repeat(50) + "</p>", 10), "x".repeat(10));
+  assert.equal(R.headingTextOf("<h3>1:00pm · A &amp; B&#39;s</h3>"), "1:00pm · A & B's");
+});
