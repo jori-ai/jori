@@ -1,10 +1,11 @@
 // Item 2 of the 2026-10-20 review (2026-10-22): stale-code-watch restarts the
 // small daemons nothing else restarted (heartbeat-sender, minibeat, dashboard,
 // the wiki servers) once their committed code is newer than the process, and
-// flags what it must not restart (whatsapp-channel, phone-channel,
-// process-manager on old code 6h+; a restart that did not take; code left
-// uncommitted 12h+). Every machine touch is an injected fake over a throwaway
-// tree: nothing real is restarted or signalled.
+// flags what it must not restart (phone-channel, process-manager on old code
+// 6h+; a restart that did not take; code left uncommitted 12h+).
+// whatsapp-channel is restarted the same way once WhatsApp has been quiet, and
+// flagged only when it never was. Every machine touch is an injected fake over
+// a throwaway tree: nothing real is restarted or signalled.
 
 import test from "node:test";
 import assert from "node:assert/strict";
@@ -63,7 +64,7 @@ function harness(o = {}) {
     ps: () => (o.psNull ? null : ps),
     pmHealth: async () => (o.pmDown ? null : { children: [
       { name: "wiki-server", pid: 24132, alive: true }, { name: "wiki-server-public", pid: 24133, alive: true },
-      { name: "whatsapp-channel", pid: 24134, alive: true }] }),
+      { name: "whatsapp-channel", pid: 24134, alive: !o.waDown }] }),
     launchdPid: (label) => ({ [m.SMALL[0].label]: 797, "com.jori.minibeat": 815, "com.jori.dashboard": 47267, "ai.claude.session": 24125 })[label] ?? null,
     git: (args) => {
       if (args[0] === "status") return (o.dirty || []).map((p) => ` M ${p}`).join("\0");
@@ -72,6 +73,8 @@ function harness(o = {}) {
     statMs: (f) => fs.statSync(f).mtimeMs,
     syntaxOk: () => o.syntaxOk ?? true,
     gitBusy: () => o.gitBusy ?? null,
+    // WhatsApp's message log / key store: written a minute ago unless a test says it went quiet
+    lastWriteMs: () => o.waLastWrite ?? (o.now ?? NOW) - 1 * MIN,
     kickstart: (label) => calls.push(["kickstart", label]),
     kill: (pid, sig) => calls.push(["kill", pid, sig]),
     readState: () => state,
@@ -121,7 +124,7 @@ test("a restart that did not take is flagged", async () => {
   touch("heartbeat-sender.sh", OLD);
 });
 
-test("big daemons are never restarted, only flagged after 6h on old code", async () => {
+test("big daemons are never restarted, only flagged after 6h on old code (whatsapp-channel: while WhatsApp is never quiet)", async () => {
   touch("agent/whatsapp-channel/index.mjs", NOW - 2 * H);
   let h = harness();
   assert.equal(await m.main([], h.io, ROOT), 0, "2h: not yet");
@@ -134,6 +137,80 @@ test("big daemons are never restarted, only flagged after 6h on old code", async
   assert.match(h.state()._flag, /phone-channel: on code older than committed for 8h/);
   assert.match(h.state()._flag, /^⚠️ /);
   touch("agent/whatsapp-channel/index.mjs", OLD); touch("agent/phone-channel/index.mjs", OLD);
+});
+
+// Regression guard for the stale-code-flag alert ("Code on disk isn't fully
+// live or saved: whatsapp-channel: on code older than committed"): with
+// whatsapp-channel flag-only, every commit to code it loads left that fix inert
+// and the alert re-posting until someone restarted it by hand. It now restarts
+// itself once its message log and key store have been still for QUIET_MS.
+test("whatsapp-channel restarts onto committed code once WhatsApp has been quiet, once per code stamp", async () => {
+  const WA = "agent/whatsapp-channel/index.mjs";
+  touch(WA, NOW - 30 * MIN);
+  const h = harness({ waLastWrite: NOW - 15 * MIN });
+  assert.equal(await m.main([], h.io, ROOT), 0);
+  assert.deepEqual(h.calls, [["kill", 24134, "SIGTERM"]]);
+  assert.equal(h.state()["whatsapp-channel"].stampMs, NOW - 30 * MIN);
+  assert.equal(h.state()._flag, undefined);
+  const after = () => JSON.parse(JSON.stringify(h.state()));   // each later tick starts from this one's state
+
+  // next tick, still the old process: no second signal for the same code
+  const h2 = harness({ state: after(), now: NOW + 2 * MIN, waLastWrite: NOW - 15 * MIN });
+  assert.equal(await m.main([], h2.io, ROOT), 0);
+  assert.deepEqual(h2.calls, []);
+
+  // the old process is still there 15 minutes on: the restart did not take
+  const h3 = harness({ state: after(), now: NOW + 15 * MIN, waLastWrite: NOW - 15 * MIN });
+  assert.equal(await m.main([], h3.io, ROOT), 6);
+  assert.match(h3.state()._flag, /whatsapp-channel: restarted for new code but still runs the old \(pid 24134\)/);
+
+  // it came back on a new process: current, nothing flagged, nothing to restart
+  const h4 = harness({ state: after(), now: NOW + 3 * MIN, startOf: { 24134: NOW + 1 * MIN }, waLastWrite: NOW - 15 * MIN });
+  assert.equal(await m.main([], h4.io, ROOT), 0);
+  assert.deepEqual(h4.calls, []);
+  assert.equal(h4.state()["whatsapp-channel"].back, true);
+  assert.equal(h4.state()._missed_since?.["whatsapp-channel"], undefined);
+
+  // it never came back: that restart is the suspect
+  const h5 = harness({ state: after(), now: NOW + 15 * MIN, waDown: true });
+  assert.equal(await m.main([], h5.io, ROOT), 6);
+  assert.match(h5.state()._flag, /whatsapp-channel: restarted at \d\d:\d\dZ for new code and not running since/);
+  touch(WA, OLD);
+});
+
+test("whatsapp-channel holds while WhatsApp is busy or its code is not committed, and is flagged if no quiet window came in 6h", async () => {
+  const WA = "agent/whatsapp-channel/index.mjs";
+  touch(WA, NOW - 30 * MIN);
+  for (const o of [{ waLastWrite: NOW - 2 * MIN }, { waLastWrite: NOW - 15 * MIN, dirty: [WA] }, { waLastWrite: NOW - 15 * MIN, syntaxOk: false }, { waLastWrite: NOW - 15 * MIN, gitBusy: "git operation in progress" }]) {
+    const h = harness(o);
+    assert.equal(await m.main([], h.io, ROOT), 0, JSON.stringify(o));
+    assert.deepEqual(h.calls, [], JSON.stringify(o));
+  }
+  touch(WA, NOW - 1 * MIN);                       // code still settling
+  const hs = harness({ waLastWrite: NOW - 15 * MIN });
+  await m.main([], hs.io, ROOT);
+  assert.deepEqual(hs.calls, []);
+  touch(WA, NOW - 7 * H);                         // busy all along: flagged as before, still not signalled
+  const h7 = harness({ waLastWrite: NOW - 1 * MIN });
+  assert.equal(await m.main([], h7.io, ROOT), 6);
+  assert.deepEqual(h7.calls, []);
+  assert.match(h7.state()._flag, /whatsapp-channel: on code older than committed for 7h \(jori restart whatsapp-channel\)/);
+  // --dry-run names it and signals nothing
+  const hd = harness({ waLastWrite: NOW - 15 * MIN });
+  await m.main(["--dry-run"], hd.io, ROOT);
+  assert.deepEqual(hd.calls, []);
+  touch(WA, OLD);
+});
+
+test("phone-channel and process-manager stay flag-only even when WhatsApp is quiet", async () => {
+  touch("agent/phone-channel/index.mjs", NOW - 7 * H);
+  touch("agent/bin/process-manager.mjs", NOW - 7 * H);
+  const h = harness({ waLastWrite: NOW - 60 * MIN });
+  assert.equal(await m.main([], h.io, ROOT), 6);
+  assert.deepEqual(h.calls, []);
+  assert.match(h.state()._flag, /phone-channel: on code older than committed for 7h/);
+  assert.match(h.state()._flag, /process-manager: on code older than committed for 7h/);
+  touch("agent/phone-channel/index.mjs", OLD); touch("agent/bin/process-manager.mjs", OLD);
 });
 
 // Regression guard for the stale-code-flag alert: missedSince sees only a

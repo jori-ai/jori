@@ -879,7 +879,7 @@
         "uncommitted files",
         "restart stale daemons"
       ],
-      "description": "Item 2 of the 2026-10-20 review. Restarts the small long-running daemons whose committed code is newer than the process (heartbeat-sender, minibeat, dashboard via launchctl kickstart -k; the two wiki servers via SIGTERM, process-manager respawns), and flags through watchdog.sh's system-channel alert (exit 6, text in data/stale-code-watch-state.json) whatsapp-channel / phone-channel / process-manager on old code for 6h+, a restart that did not take, and tracked code files uncommitted for 12h+. The supervisors and hum-sense are supervisor-code-reload's. Kill switch data/.stale-code-watch-off.",
+      "description": "Item 2 of the 2026-10-20 review. Restarts the small long-running daemons whose committed code is newer than the process (heartbeat-sender, minibeat, dashboard via launchctl kickstart -k; the two wiki servers via SIGTERM, process-manager respawns), restarts whatsapp-channel the same way (SIGTERM, process-manager respawns) once its message log and session key store have been still for 10 minutes, and flags through watchdog.sh's system-channel alert (exit 6, text in data/stale-code-watch-state.json) phone-channel / process-manager on old code for 6h+ (whatsapp-channel too when no quiet window came), a restart that did not take, and tracked code files uncommitted for 12h+. The supervisors and hum-sense are supervisor-code-reload's. Kill switch data/.stale-code-watch-off.",
       "job": null
     },
     {
