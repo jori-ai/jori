@@ -83,6 +83,16 @@ test("people never match an event placed somewhere else, or one the stop barely 
   assert.deepEqual(eventsNotMatched(day).map(e => e.summary), ["Dana and Lior", "Dana and Lior again"]);
 });
 
+test("an event titled with a three-letter name on the stop is that stop", () => {
+  const ARI = { ...RANI, summary: "Ari" };
+  const day = { date: "2026-10-20", unmatched_calendar_events: [],
+    stops: [withPeople(stop("c", "Ari's place", ARI), ["Ari", "Dana"])] };
+  assert.deepEqual(eventsNotMatched(day), []);
+  const other = { date: "2026-10-20", unmatched_calendar_events: [],
+    stops: [withPeople(stop("c", "Bistro Example", ARI), ["Dana"])] };
+  assert.deepEqual(eventsNotMatched(other).map(e => e.summary), ["Ari"], "not when Ari is not on the stop");
+});
+
 test("the manifest splits events the same way the email does", () => {
   const day = { date: "2026-10-20", stops: [
       { id: "s-3", start: "16:19", end: "18:02", place: { name: "Visiting Nana", source: "user_confirmed" },
