@@ -44,3 +44,33 @@ test("a later closing on the same thread keeps its own line", () => {
     done("morning", "2026-10-16T06:00:00Z"), done("evening", "2026-10-16T18:00:00Z")] }], "2026-10-16", "Asia/Jerusalem");
   assert.deepEqual(out.map(t => t.id), ["morning", "evening"]);
 });
+
+test("a task created twice without our marker is listed once when both copies are closed together", () => {
+  const copy = (id, at) => ({ id, title: "Send the letter to the bank", status: "completed", completed: at,
+                              notes: "Both offices need the signed copy", due: "2026-10-14T00:00:00.000Z" });
+  const out = selectCompletedTasks([{ title: "My Tasks", tasks: [
+    copy("one", "2026-10-16T12:23:10Z"), copy("two", "2026-10-16T12:23:31Z")] }], "2026-10-16", "Asia/Jerusalem");
+  assert.deepEqual(out.map(t => t.id), ["one"]);
+  assert.deepEqual(out[0].also_ids, ["two"]);
+});
+
+test("same title without our marker but different notes, or closed hours apart, keeps both lines", () => {
+  const t = (id, at, notes) => ({ id, title: "Call the plumber", status: "completed", completed: at, notes });
+  const differ = selectCompletedTasks([{ title: "My Tasks", tasks: [
+    t("a", "2026-10-16T12:00:00Z", "about the boiler"), t("b", "2026-10-16T12:01:00Z", "about the sink")] }],
+    "2026-10-16", "Asia/Jerusalem");
+  assert.deepEqual(differ.map(x => x.id), ["a", "b"]);
+  const apart = selectCompletedTasks([{ title: "My Tasks", tasks: [
+    t("a", "2026-10-16T06:00:00Z", "x"), t("b", "2026-10-16T15:00:00Z", "x")] }], "2026-10-16", "Asia/Jerusalem");
+  assert.deepEqual(apart.map(x => x.id), ["a", "b"]);
+});
+
+test("JORI_TASK_COPIES_MERGE=0 never merges a task without our marker", () => {
+  process.env.JORI_TASK_COPIES_MERGE = "0";
+  try {
+    const copy = (id, at) => ({ id, title: "Send the letter to the bank", status: "completed", completed: at, notes: "n" });
+    const out = selectCompletedTasks([{ title: "My Tasks", tasks: [
+      copy("one", "2026-10-16T12:23:10Z"), copy("two", "2026-10-16T12:23:31Z")] }], "2026-10-16", "Asia/Jerusalem");
+    assert.deepEqual(out.map(t => t.id), ["one", "two"]);
+  } finally { delete process.env.JORI_TASK_COPIES_MERGE; }
+});
