@@ -136,3 +136,18 @@ test("a call's printed points are in the fact sheet, and an in-stop call drops i
   assert.ok(text.includes("prints those as sub-bullets instead of the paragraph"), text);
   assert.equal((text.match(/POINTS \(same record\)/g) || []).length, 1, text);   // lang-regex-ok: counts our own fact label
 });
+
+// A place-less calendar block a stop held from start to end is printed under the
+// stop as "on your calendar" (manifest `calendar_held`). The fact sheet left it
+// out, so the reviewer saw the line with no event behind it and called it invented.
+test("a calendar block held inside a stop is on the stop's fact line", () => {
+  const text = pack({ stops: [
+    { id: "s-1", start: "19:07", end: "20:57", title: "The Flat", companions: ["Sam"],
+      calendar_event: null, calendar_held: { summary: "Pack", start: "2026-10-20T19:30:00+03:00", end: "2026-10-20T20:30:00+03:00" } },
+    { id: "s-2", start: "21:00", end: "22:00", title: "Elsewhere", companions: [], calendar_event: null, calendar_held: null },
+  ] });
+  const line1 = text.split("\n").find((l) => l.startsWith("- s-1:"));
+  const line2 = text.split("\n").find((l) => l.startsWith("- s-2:"));
+  assert.ok(line1.includes('calendar block held inside this stop') && line1.includes('"Pack" 2026-10-20T19:30:00+03:00 to 2026-10-20T20:30:00+03:00'), line1);
+  assert.ok(!line2.includes("calendar block held"), line2);
+});
