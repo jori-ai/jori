@@ -971,19 +971,24 @@ def cmd_withdraw(args) -> int:
 # ONE writer of confirmed-stops.json (location-confirm-ask.md's rule).
 NIGHTLY_STATE_FILE = os.path.join(DATA_DIR, "nightly-review-state.json")
 USER_TZ_FILE = os.path.join(DATA_DIR, "user-timezone.json")
-# A confirmed stop auto-names everything within 30 m, so its name has to read
-# as a place. An answer longer than this is a sentence the user typed
-# ("Breakfast at <café> in the flea market, not <the café you guessed>") —
-# right for the user's own row and the drift ledger, wrong as the label for every future visit.
-# The length test is a property of the field (the stop-identify `_context`
-# precedent), never a reading of the words. Since 2026-10-13 a longer answer is
-# promoted under the confident place name a model reads out of it (_place_label).
+# A confirmed stop auto-names everything within 30 m, so its name has to be a
+# place. EVERY answer is read by a model (_place_label) before it can become a
+# saved place, whatever its length: what the words mean is a language judgment
+# (Rule #0b), and length does not make it. A short answer can name no place at
+# all: a denial ("driving home, didn't stop anywhere"), an activity ("returning
+# the car"), a walk ("walk in the market"). Trusted as a name by length, such an
+# answer became the title of every later visit within 30 m. A long one is a
+# sentence ("Breakfast at <café> in the flea market, not <the café you
+# guessed>"). Either way the user's words stay on their own row and in the drift
+# ledger; only the confident place name the model reads out of them is saved,
+# and when the model reads none (unsure, other, failed, timed out) nothing is.
+# PROMOTE_MAX_NAME_CHARS caps the label the model may return.
 PROMOTE_MAX_NAME_CHARS = 60
 LABEL_READER = os.path.join(os.path.dirname(BIN_DIR), "lib", "location-answer-name.mjs")
 
 
 def _place_label(answer: str, stop: str | None = None, guess: str | None = None) -> str | None:
-    """The confident place name in a sentence answer (lib/location-answer-
+    """The confident place name in an answer of any length (lib/location-answer-
     name.mjs, Rule #0b). `stop` ("Mon 12 Oct, 09:02–09:18") and `guess` only let
     the model tell which of several places he named was this stop. None if he
     hedged, asked, named another or an unclear stop, or the model failed or timed
@@ -1123,12 +1128,15 @@ def cmd_save_visit(args) -> int:
     confirmed = _load_json(CONFIRMED_FILE, [])
     if isinstance(confirmed, dict):
         confirmed = confirmed.get("entries", [])
-    # `answer`: a sentence promoted under the name read out of it (below).
+    # `answer`: an answer promoted under a different name read out of it (below).
     already = any(e.get("ask_id") == ask_id and venue in (e.get("name"), e.get("answer"))
                   for e in confirmed)
     label = venue
-    if not already and len(venue) > PROMOTE_MAX_NAME_CHARS:
-        # Before any write: a failed read writes nothing.
+    if not already:
+        # Every answer, short ones too: a short answer that names no place (a
+        # denial, an activity, a walk) must never become the saved place that
+        # titles every later visit within 30 m. Read before any write: a failed
+        # read writes nothing.
         label = _place_label(venue, _stop_window_label(arrived, departed),
                              (args.guess or "").strip() or None)
 
@@ -1137,7 +1145,7 @@ def cmd_save_visit(args) -> int:
         why = "already promoted"
         promoted = True
     elif not label:
-        why = f"answer is {len(venue)} chars, no confident place name read from it; row only"
+        why = "no confident place name read from the answer; row only"
     else:
         chosen = {"name": label, "source": args.source or "user_answer",
                   "address": None, "place_id": None, "primary_type": None}
@@ -1334,7 +1342,7 @@ def main(argv=None) -> int:
              "confirmed-stops.json, and record the correction in the drift ledger",
     )
     sp_save_visit.add_argument("visit_id")
-    sp_save_visit.add_argument("venue", help="the name he gave")
+    sp_save_visit.add_argument("venue", help="the user's answer; saved only under the place name a model reads out of it")
     sp_save_visit.add_argument("--guess", help="what Jori had guessed (records a drift row)")
     sp_save_visit.add_argument("--signal", default="chat_correction",
                                help="drift signal: chat_correction | unknown_answered | late_confirm")

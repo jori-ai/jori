@@ -41,9 +41,10 @@
 //                the place (read by a Claude rung), the row is saved through the confirm path —
 //                `location-confirm save-visit`, the write the user's answer to the
 //                card would have made (`user-confirmed` + confirmed-stops.json);
-//                layer `stated`. Named from the calendar alone, or by the
-//                on-device rung, it is `named` as above. Either way the verdict is `evidence`, so neither
-//                path asks.
+//                layer `stated`. Named from the calendar alone, by the
+//                on-device rung, or when that confirm path saves nothing (its own
+//                place-name reader reads no confident place), it is `named` as
+//                above. Either way the verdict is `evidence`, so neither path asks.
 //
 // Before any of it, the PHONE is asked for its photos of the window
 // (lib/photo-probe.mjs: a probe row + silent push; the app reads its
@@ -370,11 +371,14 @@ async function main() {
       let applied = false, confirmed = null;
       if (has("--apply") && !has("--evidence-dry") && !has("--audit") && !settledRow && visit.segment_type === "visit") {
         // The user's own words: the confirm path, exactly as if the user had answered the
-        // card. If that writer fails, the row is still named so the user isn't asked.
+        // card. If that writer fails, or saves nothing (its place-name reader read no
+        // confident place, or the centroid guard refused: it then patches no row), the
+        // row is still named so the user isn't asked.
         if (evidence.confirm) {
           confirmed = confirmVisit(visitId, v.name);
-          applied = confirmed.ok;
+          applied = confirmed.ok && confirmed.promoted;
           if (!confirmed.ok) console.error(`[stop-passage] confirm path failed for ${visitId.slice(0, 8)}: ${confirmed.error} — naming the row instead`);
+          else if (!confirmed.promoted) console.error(`[stop-passage] confirm path saved nothing for ${visitId.slice(0, 8)}: ${confirmed.reason} — naming the row instead`);
         }
         if (!applied) {
           const note = `[stop-evidence] ${v.name} (${v.by} ${(v.confidence ?? 0).toFixed(2)}): ${evidence.reason}`
@@ -390,7 +394,7 @@ async function main() {
         protected: protectedRow, name: v.name, ...(confirmed ? { confirmed } : {}), evidence, probe, features: l1.features, geometry_verdict: l1.verdict, jev };
       log(out);
       if (has("--json")) process.stdout.write(JSON.stringify(out) + "\n");
-      else console.log(`evidence — ${reason}${applied ? (confirmed && confirmed.ok ? "  [confirmed]" : "  [named]") : ""}`);
+      else console.log(`evidence — ${reason}${applied ? (confirmed && confirmed.ok && confirmed.promoted ? "  [confirmed]" : "  [named]") : ""}`);
       return;
     }
   }

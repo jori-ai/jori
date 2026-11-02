@@ -197,19 +197,28 @@ class AnswersReachTheDurableStores(unittest.TestCase):
         self.lc._fetch_visit = lambda vid: {**fake_row(0, 0),
                                             "arrived_at": "2026-10-03T07:21:45+00:00",
                                             "departed_at": "2026-10-03T07:40:03+00:00"}
-        written = []
+        written, read = [], []
         self.lc._write_confirmation = lambda ask, chosen, ask_id, **k: written.append((chosen, ask_id)) or {"ok": True}
+        # A short name is read too (never trusted by length): the reader says place.
+        self.lc._place_label = lambda answer, *ctx: read.append(answer) or answer
         args = type("A", (), {"visit_id": "6aec5c60", "venue": "Bread And Co", "guess": None,
                               "signal": None, "source": None})()
         with redirect_stdout(io.StringIO()):
             self.assertEqual(self.lc.cmd_save_visit(args), 0)
+        self.assertEqual(read, ["Bread And Co"])
         self.assertEqual(written[0][0]["name"], "Bread And Co")
+        self.assertNotIn("answer", written[0][0])           # the name IS the answer
         self.assertEqual(written[0][1], "lc-visit-6aec5c60")
 
 
 def put(path, data):
     with open(path, "w") as fh:
         fh.write(data if isinstance(data, str) else json.dumps(data))
+
+
+def read_json(path):
+    with open(path) as fh:
+        return json.load(fh)
 
 
 class SentenceAnswersArePromotedUnderTheirName(unittest.TestCase):
@@ -261,7 +270,7 @@ class SentenceAnswersArePromotedUnderTheirName(unittest.TestCase):
         res, drift = self._save(self.FRIENDS)
         self.assertEqual((res["promoted"], self.written, drift[0]["fix_status"]), (False, [], "open"))
 
-    def test_replays_and_short_names_never_reach_the_model(self):
+    def test_replays_of_the_sentence_or_its_saved_name_never_reach_the_model(self):
         put(self.lc.CONFIRMED_FILE, [{"ask_id": "lc-visit-" + self.VISIT, "name": "Sam and Kim's house",
                                       "answer": self.FRIENDS}])
         self.assertEqual(self._save(self.FRIENDS)[0]["reason"], "already promoted")
@@ -306,6 +315,96 @@ class SentenceAnswersArePromotedUnderTheirName(unittest.TestCase):
             self.assertIsNone(label(bad))
         lc.LABEL_READER = os.path.join(self.tmp, "missing.mjs")
         self.assertIsNone(lc._place_label(self.FRIENDS))
+
+
+class ShortAnswersAreReadBeforeTheyBecomePlaces(unittest.TestCase):
+    """Failure class: a short answer that names no place (a denial, an activity,
+    a walk) was promoted verbatim as a place name because it fit in
+    PROMOTE_MAX_NAME_CHARS, and the saved place then titled every later visit
+    within 30 m. Every answer now goes through the place-name reader; only a
+    confident place is saved. The reader here is a stand-in script (no model),
+    driven through the real _place_label subprocess and the real
+    _write_confirmation against a temp confirmed-stops.json."""
+    VISIT = "0b1c2d3e"
+
+    def setUp(self):
+        self.lc = lc = load("location-confirm", "location_confirm_mod")
+        self.tmp = tempfile.mkdtemp()
+        lc.NIGHTLY_STATE_FILE, lc.CONFIRMED_FILE, lc.USER_TZ_FILE, lc.PENDING_FILE = (
+            os.path.join(self.tmp, f) for f in ("state.json", "confirmed.json", "tz.json", "pending.json"))
+        put(lc.USER_TZ_FILE, {"timezone": "Asia/Jerusalem"})
+        put(lc.NIGHTLY_STATE_FILE, {"daily_log_drift": []})
+        lc._fetch_visit = lambda vid: {**fake_row(120, 80),
+                                       "arrived_at": "2026-10-20T14:05:00+00:00",
+                                       "departed_at": "2026-10-20T14:31:00+00:00"}
+        lc._patch_location_history = lambda *a, **k: False   # no Supabase; also no re-render
+        lc.LABEL_READER = self.reader = os.path.join(self.tmp, "reader.mjs")
+        self.seen = os.path.join(self.tmp, "seen.jsonl")
+
+    def _reader(self, body):
+        """A stand-in reader that logs what it was asked, then runs `body`."""
+        put(self.reader, "import fs from 'node:fs'; let i = '';"
+            "for await (const c of process.stdin) i += c;"
+            f"fs.appendFileSync({json.dumps(self.seen)}, i + '\\n');" + body)
+
+    def _save(self, venue, guess=None):
+        args = type("A", (), {"visit_id": self.VISIT, "venue": venue, "guess": guess,
+                              "signal": "chat_correction", "source": "findme_resolve"})()
+        out = io.StringIO()
+        with redirect_stdout(out):
+            self.assertEqual(self.lc.cmd_save_visit(args), 0)
+        confirmed = read_json(self.lc.CONFIRMED_FILE) if os.path.exists(self.lc.CONFIRMED_FILE) else []
+        return json.loads(out.getvalue()), confirmed, read_json(self.lc.NIGHTLY_STATE_FILE)["daily_log_drift"]
+
+    def _asked(self):
+        with open(self.seen) as fh:
+            return [json.loads(l) for l in fh if l.strip()]
+
+    def test_a_short_answer_that_names_no_place_is_not_saved(self):
+        self._reader("process.stdout.write('{\"answer\":\"other\",\"place_name\":null}');")
+        for words in ("driving home. didn't stop anywhere.", "Returning the car", "Walk in the market"):
+            self.assertLessEqual(len(words), self.lc.PROMOTE_MAX_NAME_CHARS)   # short: once trusted by length
+            res, confirmed, drift = self._save(words, guess="Corner Garage")
+            self.assertEqual((res["promoted"], confirmed), (False, []))
+            self.assertIn("row only", res["reason"])
+            self.assertIsNone(res["saved"])
+        # Every one was read, with the stop's local window and Jori's guess.
+        self.assertEqual([a["text"] for a in self._asked()],
+                         ["driving home. didn't stop anywhere.", "Returning the car", "Walk in the market"])
+        self.assertEqual(self._asked()[0]["stop"], "Tue 20 Oct, 17:05–17:31")
+        self.assertEqual(self._asked()[0]["guess"], "Corner Garage")
+        # The correction is still kept in the drift ledger, left open.
+        self.assertEqual([(d["expected_name"], d["fix_status"]) for d in drift],
+                         [(w, "open") for w in ("driving home. didn't stop anywhere.",
+                                                "Returning the car", "Walk in the market")])
+
+    def test_a_short_place_name_the_reader_confirms_is_saved_under_it(self):
+        self._reader("process.stdout.write('{\"answer\":\"place\",\"place_name\":\"Bread And Co\"}');")
+        res, confirmed, drift = self._save("Bread And Co", guess="The Corner Cafe")
+        self.assertTrue(res["promoted"])
+        self.assertEqual([(e["name"], e["ask_id"], e.get("answer")) for e in confirmed],
+                         [("Bread And Co", "lc-visit-" + self.VISIT, None)])
+        self.assertEqual(drift[0]["fix_status"], "auto_resolved")
+        self.assertNotIn("promoted_from_sentence_at", drift[0])   # the name is the answer itself
+        # The same answer again is a replay: no second read, no second entry.
+        res, confirmed, _ = self._save("Bread And Co", guess="The Corner Cafe")
+        self.assertEqual((res["reason"], len(confirmed), len(self._asked())), ("already promoted", 1, 1))
+
+    def test_a_reader_failure_on_a_short_answer_writes_nothing(self):
+        for body in ("throw new Error('model down');", "process.stdout.write('not json');",
+                     "process.stdout.write('{\"answer\":\"unsure\",\"place_name\":\"Bread And Co\"}');"):
+            self._reader(body)
+            res, confirmed, _ = self._save("Bread And Co")
+            self.assertEqual((res["promoted"], confirmed), (False, []), body)
+        self.lc.LABEL_READER = os.path.join(self.tmp, "missing.mjs")
+        res, confirmed, _ = self._save("Bread And Co")
+        self.assertEqual((res["promoted"], confirmed), (False, []))
+
+    def test_stop_passage_names_the_row_itself_when_the_confirm_path_saves_nothing(self):
+        # stop-passage hands a stated name to save-visit; a run that saved nothing
+        # patched no row, so it must not count as applied (the row would stay unnamed).
+        with open(os.path.join(REPO, "bin", "stop-passage")) as fh:
+            self.assertIn("applied = confirmed.ok && confirmed.promoted;", fh.read())
 
 
 class LateQuestionsSayTheyAreLate(unittest.TestCase):
