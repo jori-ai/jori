@@ -106,6 +106,30 @@ async function skill(site, action, url, params, cdpHost = OWNER_CDP) {
   }
 }
 
+// ── Auto sign-in ───────────────────────────────────────────────────────────
+// The user's standing rule (2026-11-02): sign back in automatically; tell the
+// user only when the saved login is refused/missing (they will send the right
+// one) or something else blocks it (so a way around can be found). bin/site-login
+// does the sign-in with the saved password; this turns its outcome into the
+// blocker line, or null when the session is back.
+async function autoLogin(P, cdpHost, credItem, who = "your") {
+  const loginSite = P.login_site || new URL(P.url).hostname;
+  const args = [loginSite, "--login-url", P.login_url || P.url, "--check-url", P.url, "--port", portOf(cdpHost)];
+  if (credItem) args.push("--cred-item", credItem);
+  let res;
+  try {
+    const { stdout } = await pexec(path.join(BIN, "site-login"), args, { timeout: 180000 });
+    res = JSON.parse(stdout.trim().split("\n").pop());
+  } catch (e) {
+    try { res = JSON.parse(String(e.stdout || "").trim().split("\n").pop()); } catch { res = { status: "error", detail: String(e.message || e).slice(0, 200) }; }
+  }
+  log(`auto sign-in ${loginSite} :${portOf(cdpHost)} → ${res.status}${res.detail ? ` (${res.detail})` : ""}`);
+  if (["signed_in", "already_signed_in"].includes(res.status)) return null;
+  if (["bad_credentials", "no_credentials"].includes(res.status))
+    return `${P.label} signed out and the saved login for ${who} ${loginSite} account didn't work${res.status === "no_credentials" ? " (none saved)" : ""} — send me the right email/password and I'll update it`;
+  return `${P.label} signed out and the automatic sign-in for ${who} account was blocked (${res.status.replace(/_/g, " ")}${res.detail ? `: ${res.detail}` : ""}) — let's find a way around it`;
+}
+
 // ── Gates ──────────────────────────────────────────────────────────────────
 
 const presenceCache = new Map();
@@ -324,10 +348,15 @@ async function main() {
 
 async function listEnter(P, { target, gateDate, blockers, guestNote }) {
   const enterParams = (eventId) => ({ eventId: String(eventId), ticketCount: TICKETS, dryRun: false, confirm: true });
-  const list = await skill(P.site, "lottery-list-active", P.url, {});
+  let list = await skill(P.site, "lottery-list-active", P.url, {});
+  if (list.error === "not_logged_in") {
+    const blocked = await autoLogin(P, OWNER_CDP, P.cred_item, "your");
+    if (blocked) { skillLog(`${P.site}/lottery-list-active`, "lottery-list-active", "not_logged_in", { showCount: 0 }); blockers.push(blocked); return; }
+    list = await skill(P.site, "lottery-list-active", P.url, {});
+  }
   skillLog(`${P.site}/lottery-list-active`, "lottery-list-active", list.error === "not_logged_in" ? "not_logged_in" : (list.ok === false ? list.error : null), { showCount: list.shows?.length || 0 });
   if (list.error === "not_logged_in") {
-    blockers.push(`${P.label} session is signed out on the automation Chrome (port ${portOf(OWNER_CDP)}) — it needs a one-time manual login`);
+    blockers.push(`${P.label} still shows signed out right after an automatic sign-in that reported success — let's find a way around it`);
     return;
   }
   if (list.ok === false && !list.shows) { blockers.push(`${P.label} list failed (${list.error})`); return; }
@@ -376,11 +405,16 @@ async function mirrorPass(P, M, ownerRows, blockers) {
   const who = M.label || M.entrant;
   const enterParams = (eventId) => ({ eventId: String(eventId), ticketCount: TICKETS, dryRun: false, confirm: true });
   if (!host || !(await cdpUp(host))) { blockers.push(`${who}'s Chrome (port ${portOf(host)}) isn't answering — ${who}'s ${P.label} entries were skipped`); return; }
-  const list = await skill(P.site, "lottery-list-active", P.url, {}, host);
+  let list = await skill(P.site, "lottery-list-active", P.url, {}, host);
+  let blocked = null;
+  if (list.error === "not_logged_in") {
+    blocked = await autoLogin(P, host, M.cred_item, `${who}'s`);
+    if (!blocked) list = await skill(P.site, "lottery-list-active", P.url, {}, host);
+  }
   skillLog(`${P.site}/lottery-list-active`, "lottery-list-active", list.error === "not_logged_in" ? "not_logged_in" : null, { entrant: M.entrant, showCount: list.shows?.length || 0 });
   if (list.error === "not_logged_in") {
     record({ show: ownerRows[0].show, entrant: M.entrant, platform: P.key, date: ownerRows[0].date, status: "blocked", note: `session signed out on port ${portOf(host)}` });
-    blockers.push(`${who}'s ${P.label} session is signed out (port ${portOf(host)}) — it needs a one-time manual login; your own entries still went in`);
+    blockers.push(`${blocked || `${who}'s ${P.label} still shows signed out after an automatic sign-in that reported success — let's find a way around it`}; your own entries still went in`);
     return;
   }
   if (list.state === "no_drawings_yet") return;

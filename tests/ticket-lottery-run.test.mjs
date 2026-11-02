@@ -60,7 +60,14 @@ export async function runActionCdp({ actionBlock, cdpHost }) {
   const key = path.basename(path.dirname(path.dirname(actionBlock))) + "/" + path.basename(actionBlock, ".md");
   fs.appendFileSync(dir + "/skills.log", key + " " + cdpHost + "\\n");
   const fx = JSON.parse(fs.readFileSync(dir + "/skills.json", "utf8"));
-  return { ok: true, result: { content: [{ type: "text", text: JSON.stringify(fx[key] ?? { ok: false, error: "no_fixture" }) }] } };
+  // An array fixture answers call by call (the last answer repeats): signed out, then in after site-login.
+  let v = fx[key];
+  if (Array.isArray(v)) {
+    const cf = dir + "/calls.json"; const calls = fs.existsSync(cf) ? JSON.parse(fs.readFileSync(cf, "utf8")) : {};
+    const i = calls[key] = (calls[key] || 0) + 1; fs.writeFileSync(cf, JSON.stringify(calls));
+    v = v[Math.min(i, v.length) - 1];
+  }
+  return { ok: true, result: { content: [{ type: "text", text: JSON.stringify(v ?? { ok: false, error: "no_fixture" }) }] } };
 }
 `;
 
@@ -79,6 +86,13 @@ echo '{"conflict":false,"events":[]}'
 printf '%s\\n---\\n' "\${@: -1}" >> "$BW_TEST_DIR/sends.log"
 `,
   "chrome-close-tabs": "#!/bin/bash\nexit 0\n",
+  // outcome from login-status (default bad_credentials); args logged for assertions
+  "site-login": `#!/bin/bash
+echo "$*" >> "$BW_TEST_DIR/login.log"
+st=bad_credentials; [ -f "$BW_TEST_DIR/login-status" ] && st="$(cat "$BW_TEST_DIR/login-status")"
+echo "{\\"site\\":\\"$1\\",\\"status\\":\\"$st\\",\\"detail\\":\\"\\"}"
+case "$st" in signed_in|already_signed_in) exit 0;; bad_credentials) exit 10;; *) exit 20;; esac
+`,
 };
 
 // The config's zone is UTC, so "today" here and in the script agree.
@@ -106,7 +120,7 @@ const tcStamp = (iso) =>
   new Date(`${iso}T12:00:00Z`).toLocaleDateString("en-US", { weekday: "long", month: "long", day: "numeric", year: "numeric", timeZone: "UTC" }) + " at 7:30PM";
 
 /** Run the script once in a fresh sandbox. presence: {default, [date]: exitCode}. */
-function run({ skills, presence = { default: 1 }, cdpUp = true, guest = null, platform = "alpha" }) {
+function run({ skills, presence = { default: 1 }, cdpUp = true, guest = null, platform = "alpha", login = null }) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bw-lottery-run-"));
   const root = path.join(dir, "install");
   const bin = path.join(root, "bin");
@@ -121,6 +135,7 @@ function run({ skills, presence = { default: 1 }, cdpUp = true, guest = null, pl
   fs.writeFileSync(path.join(local, "config", "ticket-lottery.json"), JSON.stringify(CONFIG));
   fs.writeFileSync(path.join(data, "shows.json"), JSON.stringify({ shows: [{ title: "The Test Play!" }], retired: [] }));
   if (guest) fs.writeFileSync(path.join(data, "guest-mode.json"), JSON.stringify(guest));
+  if (login) fs.writeFileSync(path.join(dir, "login-status"), login);
   fs.writeFileSync(path.join(dir, "skills.json"), JSON.stringify(skills));
   fs.writeFileSync(path.join(dir, "fake-cdp-runner.mjs"), FAKE_RUNNER);
   fs.writeFileSync(path.join(dir, "preload.mjs"), PRELOAD);
@@ -136,6 +151,7 @@ function run({ skills, presence = { default: 1 }, cdpUp = true, guest = null, pl
     status: r.status, stdout: r.stdout, stderr: r.stderr, sends,
     presenceAsked: read("presence.log").split("\n").filter(Boolean),
     skillCalls: read("skills.log").split("\n").filter(Boolean),
+    loginCalls: read("login.log").split("\n").filter(Boolean),
     fetches: read("fetch.log").split("\n").filter(Boolean),
     state: JSON.parse(fs.readFileSync(path.join(data, "lottery-state.json"), "utf8")),
   };
@@ -155,7 +171,7 @@ test("signed-out list-enter session + every lookahead date AWAY → nothing sent
   const r = run({ skills: { "alpha.example/lottery-list-active": SIGNED_OUT } });
   assert.deepEqual(r.sends, [], "no message while the user is away for every date the lottery could enter");
   assert.equal(suppressedLines(r.stdout).length, 1, r.stdout);
-  assert.match(suppressedLines(r.stdout)[0], /Alpha Tix session is signed out/);
+  assert.match(suppressedLines(r.stdout)[0], /Alpha Tix signed out/);
   assert.deepEqual(r.presenceAsked, lookahead(), "presence is judged per lookahead date, today..today+3");
   assert.equal(r.state.last_run_status, "blocked", "the state file still records the blocker");
   assert.equal(r.state.last_run_by_platform.alpha, etToday());
@@ -170,7 +186,7 @@ test("signed-out session + one in-town date in the lookahead → blocker reporte
   const r = run({ skills: { "alpha.example/lottery-list-active": SIGNED_OUT }, presence: { default: 1, [plusDays(etToday(), 2)]: 0 } });
   assert.equal(r.sends.length, 1);
   assert.equal(r.sends[0],
-    "🎟️ Test lottery — nothing got entered today.\n\nNeeds a look: Alpha Tix session is signed out on the automation Chrome (port 9222) — it needs a one-time manual login.");
+    "🎟️ Test lottery — nothing got entered today.\n\nNeeds a look: Alpha Tix signed out and the saved login for your alpha.example account didn't work — send me the right email/password and I'll update it.");
   assert.equal(suppressedLines(r.stdout).length, 0);
   assert.deepEqual(quietMarkers(r.stdout), [], "a reported blocker leaves skill-health free to alert");
 });
@@ -178,7 +194,7 @@ test("signed-out session + one in-town date in the lookahead → blocker reporte
 test("presence check erroring → fail open, the blocker is still reported", () => {
   const r = run({ skills: { "alpha.example/lottery-list-active": SIGNED_OUT }, presence: { default: 2 } });
   assert.equal(r.sends.length, 1);
-  assert.match(r.sends[0], /Alpha Tix session is signed out/);
+  assert.match(r.sends[0], /Alpha Tix signed out/);
 });
 
 test("away for every date but a guest-mode date in the lookahead → blocker reported", () => {
@@ -187,7 +203,7 @@ test("away for every date but a guest-mode date in the lookahead → blocker rep
     guest: { active: true, for: "a friend", dates: [plusDays(etToday(), 1)] },
   });
   assert.equal(r.sends.length, 1);
-  assert.match(r.sends[0], /Alpha Tix session is signed out/);
+  assert.match(r.sends[0], /Alpha Tix signed out/);
 });
 
 test("automation Chrome down: quiet while away for the lookahead, reported when a date is in town", () => {
@@ -244,6 +260,39 @@ test("in town: a list-enter drawing is entered for the owner, then mirrored for 
   assert.ok(r.skillCalls.includes("alpha.example/lottery-enter localhost:9333"), "the mirror entry ran on the mirror's own Chrome");
   assert.deepEqual(r.sends, ["🎟️ Test lottery entries for today:\n• The Test Play! — Alpha Tix 1 date (+1 for Friend)"]);
   assert.equal(r.state.last_run_status, "submitted");
+});
+
+const POPULATED = (date) => ({ ok: true, state: "populated", shows: [{ eventId: 4242, title: "THE TEST PLAY!", performanceDate: tcStamp(date), status: "open" }] });
+
+test("signed out → signed back in automatically with the saved login, then entered as usual", () => {
+  const date = plusDays(etToday(), 1);
+  const r = run({
+    presence: { default: 0 }, login: "signed_in",
+    skills: { "alpha.example/lottery-list-active": [SIGNED_OUT, POPULATED(date)], "alpha.example/lottery-enter": { ok: true, entered: true } },
+  });
+  assert.equal(r.loginCalls.length, 1, "one sign-in, for the owner");
+  assert.match(r.loginCalls[0], /^alpha\.example --login-url https:\/\/alpha\.example\/lottery .*--port 9222/);
+  assert.deepEqual(r.state.entries.map((e) => [e.entrant, e.status]), [["user", "submitted"], ["friend", "submitted"]]);
+  assert.deepEqual(r.sends, ["🎟️ Test lottery entries for today:\n• The Test Play! — Alpha Tix 1 date (+1 for Friend)"], "nothing about the sign-in reaches the user");
+});
+
+test("automatic sign-in blocked by something other than the password → says so, asks to find a way around", () => {
+  const r = run({ presence: { default: 0 }, login: "captcha", skills: { "alpha.example/lottery-list-active": SIGNED_OUT } });
+  assert.equal(r.sends.length, 1);
+  assert.match(r.sends[0], /Alpha Tix signed out and the automatic sign-in for your account was blocked \(captcha\) — let's find a way around it/);
+});
+
+test("mirror entrant signed out and their saved login refused → asks for their login; owner entries stand", () => {
+  const date = plusDays(etToday(), 1);
+  const r = run({
+    presence: { default: 0 }, login: "bad_credentials",
+    skills: { "alpha.example/lottery-list-active": [POPULATED(date), SIGNED_OUT], "alpha.example/lottery-enter": { ok: true, entered: true } },
+  });
+  assert.equal(r.loginCalls.length, 1);
+  assert.match(r.loginCalls[0], /--port 9333/, "signed in on the mirror's own Chrome");
+  assert.deepEqual(r.state.entries.filter((e) => e.status === "submitted").map((e) => e.entrant), ["user"]);
+  assert.equal(r.sends.length, 1);
+  assert.match(r.sends[0], /Friend's alpha\.example account didn't work — send me the right email\/password and I'll update it; your own entries still went in/);
 });
 
 test("no lottery config: off — exits 0, drives nothing, writes nothing", () => {

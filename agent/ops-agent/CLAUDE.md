@@ -229,6 +229,13 @@ Root-cause pass over Jori's own **system channel**: **nightly 4:27 AM local** (f
 
 **When you write an alert:** keep the stable parts stable (name the job, binary and error class the same way every time) — clusters match on those. An alert that fires when nothing is wrong is a tracked defect (`severity: "noise"`). **Severity markers are load-bearing:** a genuinely new **`🔴`** triggers a same-day heavy review within the hour — use it only for capability-down or data-loss; **`⚠️`** (degraded-but-retrying) rides the nightly pass; recoveries keep **`✅`**.
 
+## Signing in to sites (every job)
+
+The user's standing rule (2026-11-02): **log in automatically to all sites.** A job that finds a browser session signed out signs it back in itself with the saved login — `~/Dev/jori/bin/site-login <domain> --login-url <url> [--check-url <url>] [--port <cdp port>] [--cred-item <Dev item>]` (one attempt per run; credentials go straight from 1Password into the page, never into your context). Only two outcomes reach the user:
+- **The saved username/password didn't work** (`bad_credentials` / `no_credentials`) → say so and ask for the right ones; they will send them.
+- **Something else blocked it** (`captcha`, `needs_2fa`, `no_login_form`, `still_signed_out`) → say what, so a way around it can be found together.
+Never ask the user to "log in manually" as the first move. Financial-denylist sites (`denylisted`) stay manual by policy. The shop Chrome's merchants have their own job (`purchase-signin`).
+
 ## Purchase (Face-ID approved, any site)
 
 Purchases go only through the installation's approved purchase path, named with its job, tools and browser in the local rules (§ Purchase — this instance). **Always-on invariants, for every job:**
