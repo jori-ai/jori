@@ -117,3 +117,79 @@ test("a gap with a fix every five minutes is travel he was seen doing", () => {
   assert.equal(leaveRoomToTravel([f2, a2], holes).length, 1);
   assert.ok(f2.end_ts_ms < T("03:40:47"));
 });
+
+// A stop's START never runs back into the trip from the previous place
+// (extendThroughSilence). Lunch 3.3 km from the flat, last fix at the restaurant at
+// 13:00, nothing usable until the flat's arrival at 13:20: lunch's end ran on to
+// 13:10 and the flat's start back to "last fix at lunch + the ride", 13:10 too, so
+// the summary had lunch end and the afternoon at home begin in the same minute, the
+// ride gone. leaveRoomToTravel could not give it back: lunch's end then sat seconds
+// after its own last fix plus the ride. The start's lower bound is now the previous
+// end plus the trip's minutes (travelRoomMs, the formula leaveRoomToTravel uses).
+const { extendThroughSilence } = require(path.join(ROOT, "lib/resolve-day.js"))._internal;
+const LLP = (e, n) => { const q = fakeAt(e, n); return { lat: q.lat, lon: q.lon }; };
+const UM = (hms) => Date.parse(`2026-03-10T${hms}Z`);
+const LUNCH = LLP(0, 0);
+const FLAT_M = LLP(-1100, 3130);            // ~3.3 km away
+const pm = (hms, at, acc = 15, activity = "unknown") => ({ ts: UM(hms), lat: at.lat, lon: at.lon, acc, activity });
+
+const PINGS_M = [
+  pm("12:28:30", LUNCH), pm("12:45:00", LUNCH), pm("13:00:57", LUNCH, 13),
+  pm("13:10:47", LLP(400, 520), 84),       // too loose to place him
+  pm("13:20:39", FLAT_M, 10),               // the flat's arrival
+  pm("13:22:34", LLP(-1090, 3120), 20, "walking"),
+  pm("14:30:00", FLAT_M), pm("17:10:00", FLAT_M),
+];
+
+const stopm = (id, name, at, from, to) => ({
+  id, start: from, end: to, start_ts_ms: UM(from), end_ts_ms: UM(to),
+  duration_min: Math.round((UM(to) - UM(from)) / 60000), lat: at.lat, lon: at.lon,
+  place: { name, source: "user_confirmed" },
+});
+
+function run(env) {
+  const old = process.env.JORI_SILENCE_TRAVEL_ROOM;
+  if (env == null) delete process.env.JORI_SILENCE_TRAVEL_ROOM; else process.env.JORI_SILENCE_TRAVEL_ROOM = env;
+  try {
+    const lunch = stopm("s-3", "The Restaurant", LUNCH, "12:28:00", "13:09:00");
+    const flat = stopm("s-4", "Home", FLAT_M, "13:20:39", "17:13:00");
+    extendThroughSilence([lunch, flat], PINGS_M);
+    leaveRoomToTravel([lunch, flat], PINGS_M);
+    return { lunch, flat };
+  } finally {
+    if (old == null) delete process.env.JORI_SILENCE_TRAVEL_ROOM; else process.env.JORI_SILENCE_TRAVEL_ROOM = old;
+  }
+}
+
+test("the ride home keeps its minutes between lunch and the flat", () => {
+  const { lunch, flat } = run(null);
+  const gapMin = (flat.start_ts_ms - lunch.end_ts_ms) / 60000;
+  assert.ok(gapMin >= 9, `about ten minutes for a 3.3 km ride, got ${gapMin.toFixed(1)}`);
+  assert.ok(flat.start_ts_ms >= UM("13:19:39"), "the flat starts no earlier than its own row");
+  assert.ok(lunch.end_ts_ms >= UM("13:00:57"), "lunch runs at least to its last fix");
+  assert.equal(flat.duration_min, Math.round((flat.end_ts_ms - flat.start_ts_ms) / 60000));
+});
+
+test("JORI_SILENCE_TRAVEL_ROOM=0 restores the old bound (the two touch)", () => {
+  const { lunch, flat } = run("0");
+  assert.ok(flat.start_ts_ms - lunch.end_ts_ms < 60_000, "the old pass let the flat start where lunch ended");
+});
+
+test("within one place there is no trip, so a start still runs back to the previous end", () => {
+  const A = LLP(0, 0);
+  const pings = [pm("09:00:00", A), pm("09:40:00", A), pm("10:40:00", LLP(30, 20))];
+  const first = stopm("s-1", "Home", A, "09:00:00", "09:41:00");
+  const second = stopm("s-2", "Home", LLP(30, 20), "10:41:00", "12:00:00");
+  extendThroughSilence([first, second], pings);
+  assert.ok(second.start_ts_ms - first.end_ts_ms <= 60_000, "the quiet hour is stillness at the same place, no trip left between");
+});
+
+test("a start still runs back through silence after a far place when the gap holds the trip", () => {
+  const far = LLP(0, 0), home = LLP(-1100, 3130);
+  const pings = [pm("09:00:00", far), pm("09:30:00", far), pm("11:00:00", home), pm("12:00:00", home)];
+  const a = stopm("s-1", "Somewhere", far, "09:00:00", "09:31:00");
+  const b = stopm("s-2", "Home", home, "11:20:00", "13:00:00");
+  extendThroughSilence([a, b], pings);
+  assert.ok(b.start_ts_ms <= UM("11:00:00"), "the fix at home at 11:00 is direct evidence");
+  assert.ok(b.start_ts_ms - a.end_ts_ms >= 9 * 60_000, "and the trip keeps its minutes");
+});
