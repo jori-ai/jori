@@ -90,6 +90,10 @@ struct ContentView: View {
     /// the jump button instead of yanking the scroll position.
     @State private var isScrolledUp = false
     @State private var unseenCount = 0
+    /// Open questions whose bubble is on screen right now. The tray leaves
+    /// those out — it exists for questions the stream has scrolled away —
+    /// and disappears when every open question is already in view.
+    @State private var onScreenQuestionIds: Set<UUID> = []
     @State private var isDropTargeted = false
 
     // Trade-approval second factor (only when the build sets a trading app)
@@ -129,6 +133,7 @@ struct ContentView: View {
         activeReactionMessageId = nil
         isScrolledUp = false
         unseenCount = 0
+        onScreenQuestionIds = []
     }
 
     private var commandActions: JoriActions {
@@ -708,6 +713,7 @@ struct ContentView: View {
                 .equatable()
             }
             .padding(.top, place.startsGroup && place.separator == nil ? 10 : 0)
+            .modifier(OnScreenReader(id: message.id, tracked: viewModel.isOpenQuestion(message), onScreen: $onScreenQuestionIds))
             .id(message.id)
             .zIndex(activeReactionMessageId == message.id ? 1 : 0)
         }
@@ -890,7 +896,7 @@ struct ContentView: View {
             }
             if viewModel.currentChannel == .chat || viewModel.currentChannel == .questions {
                 OpenQuestionsTray(
-                    questions: viewModel.openQuestions,
+                    questions: viewModel.openQuestions.filter { !onScreenQuestionIds.contains($0.id) },
                     reveal: { quoteJumpTarget = $0.id },
                     answer: { beginReply(to: $0) },
                     dismiss: { viewModel.dismissQuestion($0) }
@@ -1446,6 +1452,28 @@ private struct ScrolledUpReader: ViewModifier {
             } action: { _, scrolledUp in
                 if scrolledUp != isScrolledUp { isScrolledUp = scrolledUp }
             }
+        } else {
+            content
+        }
+    }
+}
+
+/// Keeps `onScreen` in step with whether this row is visible in its scroll
+/// view (at least half of it), for rows that are `tracked`. Needs the scroll-
+/// visibility API (iOS 18 / macOS 15); before that nothing is ever reported
+/// on screen, so the open-questions tray keeps listing every question.
+private struct OnScreenReader: ViewModifier {
+    let id: UUID
+    let tracked: Bool
+    @Binding var onScreen: Set<UUID>
+
+    func body(content: Content) -> some View {
+        if tracked, #available(iOS 18.0, macOS 15.0, *) {
+            content
+                .onScrollVisibilityChange(threshold: 0.5) { visible in
+                    if visible { onScreen.insert(id) } else { onScreen.remove(id) }
+                }
+                .onDisappear { onScreen.remove(id) }
         } else {
             content
         }
