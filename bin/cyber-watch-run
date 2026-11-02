@@ -149,11 +149,15 @@ function osvFindings(inv) {
 const VERDICT_SCHEMA = {
   type: "object", additionalProperties: false, required: ["verdicts"],
   properties: { verdicts: { type: "array", items: {
-    type: "object", additionalProperties: false, required: ["id", "applies", "analysis", "urgency", "action"],
+    type: "object", additionalProperties: false, required: ["id", "analysis", "applies", "urgency", "action"],
+    // analysis BEFORE applies: the model must reason, then decide. With applies
+    // first, the Nov 2 2026 weekly committed "no" on the CoreGraphics zero-day
+    // and its own analysis then concluded "that makes this a yes, not a no" —
+    // an affected mini filed under "doesn't affect you".
     properties: {
       id: { type: "string", description: "candidate id exactly as given" },
-      applies: { type: "string", enum: ["yes", "no", "unclear"] },
       analysis: { type: "string", description: "2-4 plain sentences to the user as 'you': the issue in one clause, exactly what the inventory shows (machine, repos, versions, or that it is absent), and why that does or does not put the user at risk" },
+      applies: { type: "string", enum: ["yes", "no", "unclear"], description: "must agree with the analysis just written" },
       urgency: { type: "string", enum: ["now", "this_week", "routine", "none"] },
       action: { type: "string", description: "concrete steps with versions or a command; 'Nothing to do.' when none" },
     } } } },
@@ -165,6 +169,7 @@ const verdictSystem = () => `You check whether a security issue actually affects
 - applies "unclear": the evidence cannot settle it — ${OTHER_DEVICES()} (not inventoried), device firmware, a version the article does not give. Say exactly what to check, with one command if possible.
 - urgency "now": applies AND (actively exploited, or a malicious package, or credentials known stolen). "this_week": applies, serious, not known exploited; or a provider breach where rotating a password/key is prudent. "routine": applies but low risk — dev-only dependency, no exposure path, low severity, an unused/stale repo. "none": does not apply.
 - Dependency findings (OSV): a devDependency or a package only in a stale repo is at most "routine" unless malicious. A malicious package is always "now". Name the repos and the fixed version.
+- Write the analysis first, then set applies to match it. An inventory version inside the affected range (below the fixed version) is "yes", never "no".
 - Never invent versions, repos or facts. If a lookup came back empty, the software is not in the inventory — say "not found in your repos or on the ${HOST()}", not "you are safe" for ${OTHER_DEVICES()}.`;
 
 // Small batches, then a one-at-a-time retry for any candidate the model skipped:

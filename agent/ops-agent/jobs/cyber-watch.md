@@ -45,8 +45,8 @@ Requirement: an item is sent only after checking whether it applies to the user'
 - the NVD record (affected version ranges) for each CVE id in the story.
 
 A second tool-less Sonnet call gets that evidence plus the inventory summary and returns, per item:
-- **applies:** `yes`, `no` or `unclear`;
 - **analysis:** 2–4 sentences on what was checked and found (machine, repos, versions) and why that does or doesn't put the user at risk;
+- **applies:** `yes`, `no` or `unclear`, decided after the analysis and matching it (the schema orders analysis first: with applies first, the 2026-11-02 weekly filed the affected CoreGraphics zero-day under "doesn't affect you" while its own analysis said yes);
 - **urgency:** `now` (applies and is actively exploited, a malicious package, or stolen credentials), `this_week`, `routine` (dev-only, stale repo or low risk) or `none`;
 - **action:** concrete steps.
 
