@@ -50,6 +50,8 @@ Separate launchd agent (NOT under process-manager):
 
 Both wrappers spawn `claude` with `--resume <session-id>` and stream-json transport so transcripts are persistent across restarts. Sessions are stored at `agent/supervisor/state/{chat,ops}/session.json`; chat's also holds a usage-limit outage in progress (`quotaOutage`: the hold and which notices went out), so a restarted chat supervisor keeps holding without announcing it again (`agent/supervisor/README.md`).
 
+**Allowance brake.** The weekly Claude allowance is a cliff (past 1.0 every agent stops until the reset), so the heaviest optional jobs ask `bin/allowance-brake check <job>` in their trigger right before launching: it reads the seven-day utilization and reset time from the `rate_limit_event` samples in `agent/logs/supervisor-*/events.ndjson`, projects the week to the reset at the last 24h's pace, and exits 3 (hold) when the week is at or on pace past the threshold. Which jobs and the threshold are `agent/local/config/allowance-brake.json` (no file: off). Wired into `trigger-improvement-plan.sh`, the nightly `trigger-system-issue-review.sh` (never the hourly critical lane) and `trigger-dream-deep.sh`. Fail-open on any missing, stale or too-young reading. A held weekly-slot job (one with a `release_label`) is recorded in `data/allowance-brake-state.json` and relaunched by `allowance-brake release`, which the nightly system-issue-review trigger runs every day, once its window has reset; recurring jobs simply run on their next tick. Decisions log to `data/logs/allowance-brake.log`. Test: `tests/allowance-brake.test.mjs`.
+
 ## Components
 
 | Component | Role | Where it runs |

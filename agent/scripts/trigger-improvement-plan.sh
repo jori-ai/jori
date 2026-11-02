@@ -57,6 +57,24 @@ if [ "${IMPROVEMENT_PLAN_FORCE:-0}" != "1" ]; then
     echo "$(date '+%Y-%m-%d %H:%M:%S') [improvement-plan] skip: last_run is newer than the review's, this week is already planned" >> "$DATA/logs/improvement-plan.log"
     exit 0
   fi
+
+  # The allowance brake (bin/allowance-brake; which jobs and the threshold are
+  # agent/local/config/allowance-brake.json): when the weekly Claude allowance
+  # is on pace to run out before it resets, the planner waits for the reset.
+  # A hold is recorded, and `allowance-brake release` relaunches this agent
+  # after the reset. Fail-open: any brake error runs the planner.
+  BRAKE="$("$JORI_INSTALL_TOOLS/bin/allowance-brake" check improvement-plan --json 2>/dev/null)"
+  BRAKE_RC=$?
+  brake_field() { printf '%s' "$BRAKE" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{process.stdout.write(String(JSON.parse(s)[process.argv[1]]||""))}catch{}})' "$1" 2>/dev/null; }
+  if [ "$BRAKE_RC" -eq 3 ]; then
+    mkdir -p "$DATA/logs"
+    echo "$(date '+%Y-%m-%d %H:%M:%S') [improvement-plan] skip: allowance brake: $(brake_field reason)" >> "$DATA/logs/improvement-plan.log"
+    exit 0
+  fi
+  HELD_SINCE="$(brake_field held_since)"
+  if [ -n "$HELD_SINCE" ]; then
+    TASK="$TASK This run was held by the allowance brake at $HELD_SINCE (the weekly Claude allowance was on pace to run out before it reset) and released after the reset. The review was not missed: it finished before the hold began, so measure Step 1's 24-hour freshness check from $HELD_SINCE, not from now."
+  fi
 fi
 
 exec "$SCRIPTS/lib/run-ephemeral-opus.sh" improvement-plan "$JOB_MD" --task "$TASK" --timeout-min 180

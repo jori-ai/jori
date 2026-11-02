@@ -77,6 +77,16 @@ fi
 
 log() { echo "$(date '+%Y-%m-%d %H:%M:%S') [system-issue-review${MODE:+/$MODE}] $1" >> "$LOGFILE"; }
 
+# The allowance brake's daily release (bin/allowance-brake): a weekly-slot job
+# held while the week was on pace to run out (the improvement planner) is
+# relaunched here once its window has reset. This nightly slot is the one
+# trigger that fires every day, so it carries the release whatever its own gate
+# decides below. Never blocks this job.
+if [ "$MODE" = "nightly" ]; then
+  RELEASED="$("$JORI_INSTALL_TOOLS/bin/allowance-brake" release 2>/dev/null)"
+  [ -n "$RELEASED" ] && log "allowance brake: $RELEASED"
+fi
+
 # --- fetch the last 14d of system-channel rows → local batch; print "<new>:<due>:<crit>:<sig>" ---
 # new  = assistant alerts newer than the state cursor (the work signal)
 # due  = clusters in verifying/awaiting_approval whose verify_after has passed
@@ -160,6 +170,12 @@ else
     log "skip: no new system alerts and nothing due for verification"
     exit 0
   fi
+  # The allowance brake: while the weekly Claude allowance is on pace to run
+  # out before it resets, the nightly pass waits; nothing is lost, the first
+  # pass after the reset reads the same 14-day window from the same cursor.
+  # The hourly critical lane above is never held. Fail-open.
+  BRAKE="$("$JORI_INSTALL_TOOLS/bin/allowance-brake" check system-issue-review 2>/dev/null)"
+  if [ $? -eq 3 ]; then log "skip: held by the allowance brake: ${BRAKE#hold: }"; exit 0; fi
 fi
 
 # Record the escalated signature so the next hourly run doesn't re-dispatch the
