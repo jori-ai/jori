@@ -495,3 +495,88 @@ test("a walk is still emitted when the map-matcher returns nothing", async () =>
     `distance is a floor: ${walk.excursion.routed_m} m vs 2235 m matched`);
   assert.equal(excursions[0].emitted, true);
 });
+
+// ---------------------------------------------------------------------------
+// A walk keeps its map feature when Overpass is down on a later rebuild.
+// ---------------------------------------------------------------------------
+//
+// nearbyFeatures had no memory: one build of a day read the beach the walk ran
+// along, a rebuild during an Overpass outage got nothing and titled the walk by
+// the turnaround's neighbourhood instead. The last real answer for the same area
+// is kept on disk and used when the service fails.
+
+import fs from "node:fs";
+import os from "node:os";
+
+test("a real Overpass answer is kept and used when a later lookup fails", async () => {
+  const { nearbyFeatures, FEATURE_CACHE_FRESH_MS } = _internal;
+  const cacheDir = fs.mkdtempSync(path.join(os.tmpdir(), "ovp-features-"));
+  try {
+    const pts = [at(0, 0), at(400, 300), at(0, 0)];
+    const BEACH = { type: "way", tags: { natural: "beach", name: "Example Beach" },
+      geometry: [at(380, 290), at(420, 310)] };
+    let asked = 0;
+    const up = async () => { asked += 1; return { elements: [BEACH] }; };
+    const down = async () => { asked += 1; return null; };
+
+    const first = await nearbyFeatures(pts, { query: up, cacheDir });
+    assert.deepEqual(first.map(f => [f.name, f.kind]), [["Example Beach", "beach"]]);
+    assert.equal(fs.readdirSync(cacheDir).length, 1, "the answer is written");
+
+    asked = 0;
+    const fresh = await nearbyFeatures(pts, { query: down, cacheDir });
+    assert.deepEqual(fresh.map(f => f.name), ["Example Beach"], "a fresh answer is used without asking");
+    assert.equal(asked, 0);
+
+    const later = Date.now() + FEATURE_CACHE_FRESH_MS + 1000;
+    const stale = await nearbyFeatures(pts, { query: down, cacheDir, now: later });
+    assert.equal(asked, 1, "an old answer is asked again");
+    assert.deepEqual(stale.map(f => f.name), ["Example Beach"], "and still used when the asking fails");
+
+    const nudged = [at(3, 2), at(402, 301), at(3, 2)];
+    const again = await nearbyFeatures(nudged, { query: down, cacheDir });
+    assert.deepEqual(again.map(f => f.name), ["Example Beach"], "points a few metres off ask the same question");
+  } finally {
+    fs.rmSync(cacheDir, { recursive: true, force: true });
+  }
+});
+
+test("an answer Overpass cut short, or one that found nothing, is never kept and never replaces one", async () => {
+  const { nearbyFeatures, FEATURE_CACHE_FRESH_MS } = _internal;
+  const cacheDir = fs.mkdtempSync(path.join(os.tmpdir(), "ovp-features-"));
+  try {
+    const pts = [at(0, 0), at(400, 300), at(0, 0)];
+    const cut = async () => ({ remark: "runtime error: Query timed out", elements: [] });
+    const nothing = async () => ({ elements: [] });
+    assert.deepEqual(await nearbyFeatures(pts, { query: cut, cacheDir }), []);
+    assert.deepEqual(await nearbyFeatures(pts, { query: nothing, cacheDir }), []);
+    assert.equal(fs.readdirSync(cacheDir).length, 0, "neither is written");
+
+    const BEACH = { type: "way", tags: { natural: "beach", name: "Example Beach" },
+      geometry: [at(380, 290), at(420, 310)] };
+    let asked = 0;
+    await nearbyFeatures(pts, { query: async () => ({ elements: [BEACH] }), cacheDir });
+    const later = Date.now() + FEATURE_CACHE_FRESH_MS + 1000;
+    for (const q of [cut, nothing]) {
+      const out = await nearbyFeatures(pts, { query: async (x) => { asked += 1; return q(x); }, cacheDir, now: later });
+      assert.deepEqual(out.map(f => f.name), ["Example Beach"], "the kept answer is used instead");
+    }
+    assert.equal(asked, 2);
+    const again = await nearbyFeatures(pts, { query: async () => null, cacheDir, now: later });
+    assert.deepEqual(again.map(f => f.name), ["Example Beach"], "and it was not replaced");
+  } finally {
+    fs.rmSync(cacheDir, { recursive: true, force: true });
+  }
+});
+
+test("a failed lookup with nothing kept returns no features and writes nothing", async () => {
+  const { nearbyFeatures } = _internal;
+  const cacheDir = fs.mkdtempSync(path.join(os.tmpdir(), "ovp-features-"));
+  try {
+    const out = await nearbyFeatures([at(0, 0), at(400, 300)], { query: async () => null, cacheDir });
+    assert.deepEqual(out, []);
+    assert.equal(fs.readdirSync(cacheDir).length, 0);
+  } finally {
+    fs.rmSync(cacheDir, { recursive: true, force: true });
+  }
+});
