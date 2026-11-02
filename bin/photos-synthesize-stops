@@ -11,7 +11,9 @@
 //   - require at least one photo with GPS coords (use centroid of those)
 //   - require persons (face tags) OR a calendar event covering the window
 //   - require NO existing visit row in location_history overlapping the
-//     cluster window within 300m of centroid
+//     cluster window within 300m of centroid (an open visit, departed_at
+//     null because the user is still there, overlaps everything from its
+//     arrival on)
 // If satisfied, INSERT a synthetic visit with:
 //   place_name = calendar event title (if matched) or "(photo-inferred)"
 //   place_type = "photo-synthesized"
@@ -143,7 +145,10 @@ const candidates = clusters.filter((c) => {
   const endMs = new Date(c.photos[c.photos.length - 1].taken_at).getTime();
   for (const v of visits || []) {
     const vStart = new Date(v.arrived_at).getTime();
-    const vEnd = v.departed_at ? new Date(v.departed_at).getTime() : vStart;
+    // An open visit is still going on, so it covers every photo from its
+    // arrival on. Treating it as zero-length let a photo taken inside an
+    // ongoing stay synthesize a duplicate visit nested in the real one.
+    const vEnd = v.departed_at ? new Date(v.departed_at).getTime() : Infinity;
     if (vEnd < startMs || vStart > endMs) continue;
     if (v.latitude == null || v.longitude == null) continue;
     const d = haversineMeters(c.centroid.lat, c.centroid.lon, v.latitude, v.longitude);
