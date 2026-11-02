@@ -54,13 +54,13 @@ test("no override -> the deterministic default renders unchanged (HTML)", () => 
   const skeleton = buildSkeleton(bareStopsDay(), {});
   assert.match(skeleton, /\{\{QUESTION:s-20260914-3:/);
   const html = assemble(skeleton, {});
-  assert.match(html, /~18:31-19:06 near 12\.346, -65\.432, but I didn't capture a label\. Tell me\?/);
-  assert.match(html, /Mughlai Curry Cuisine<\/b> \(57m\), or somewhere else\?/);
+  assert.match(html, /Around 6:31 to 7:06pm you were near 12\.346, -65\.432, but I didn't capture a label\. Tell me\?/);
+  assert.match(html, /Around 6:14 to 6:21pm, were you at <b>Mughlai Curry Cuisine<\/b>, or somewhere else\?/);
 });
 
 test("no override -> the deterministic default renders unchanged (markdown)", () => {
   const md = buildMarkdown(bareStopsDay(), {});
-  assert.match(md, /~18:31-19:06 near 12\.346, -65\.432, but I didn't capture a label\./);
+  assert.match(md, /Around 6:31 to 7:06pm you were near 12\.346, -65\.432, but I didn't capture a label\./);
 });
 
 test("a questions[] override replaces the default (HTML), other stops untouched", () => {
@@ -71,7 +71,7 @@ test("a questions[] override replaces the default (HTML), other stops untouched"
   assert.match(html, /did you visit Dominick again at Bellevue hospital before the show\?/);
   assert.doesNotMatch(html, /didn't capture a label/);
   // the other unknown_stops entry had no override and keeps its own default
-  assert.match(html, /Mughlai Curry Cuisine<\/b> \(57m\), or somewhere else\?/);
+  assert.match(html, /Around 6:14 to 6:21pm, were you at <b>Mughlai Curry Cuisine<\/b>, or somewhere else\?/);
 });
 
 test("a questions[] override replaces the default (markdown)", () => {
@@ -80,7 +80,7 @@ test("a questions[] override replaces the default (markdown)", () => {
   });
   assert.match(md, /did you visit Dominick again at Bellevue hospital before the show\?/);
   assert.doesNotMatch(md, /didn't capture a label\./);
-  assert.match(md, /Mughlai Curry Cuisine \(57m\), or somewhere else\?/);
+  assert.match(md, /Around 6:14 to 6:21pm, were you at Mughlai Curry Cuisine, or somewhere else\?/);
 });
 
 test("an override is HTML-escaped, not interpreted as markup", () => {
@@ -89,4 +89,18 @@ test("an override is HTML-escaped, not interpreted as markup", () => {
     questions: { "s-20260914-3": "were you at <b>Bellevue</b> & ok?" },
   });
   assert.match(html, /were you at &lt;b&gt;Bellevue&lt;\/b&gt; &amp; ok\?/);
+});
+
+// The default reads like the rest of the email: 12-hour times, names without
+// metres, a short list joined the way a person would say it (it used to be
+// "~17:21-17:31 — <a bar> (21m), <a café> (37m), ... or somewhere else?").
+test("the default question uses 12-hour times and names only", () => {
+  const d = bareStopsDay();
+  d.unknown_stops = [{ id: "pending-enrich-x", start: "11:51", end: "12:31", lat: 12.3456, lon: -65.4321, hint: null,
+    candidates: [{ name: "Cafe One", distance_m: 21 }, { name: "Bar Two", distance_m: 37 }, { name: "Shop Three", distance_m: 7 }] }];
+  const html = assemble(buildSkeleton(d, {}), {});
+  assert.match(html, /Around 11:51am to 12:31pm, were you at <b>Cafe One<\/b>, <b>Bar Two<\/b> or <b>Shop Three<\/b>, or somewhere else\?/);
+  assert.doesNotMatch(html, /\(\d+m\)|~11:51/);
+  const md = buildMarkdown(d, {});
+  assert.match(md, /- Around 11:51am to 12:31pm, were you at Cafe One, Bar Two or Shop Three, or somewhere else\?/);
 });

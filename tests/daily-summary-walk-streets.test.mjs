@@ -96,3 +96,51 @@ test("kill switch: JORI_WALK_GAP_STRAIGHT=0 keeps the route", () => {
   } finally { delete process.env.JORI_WALK_GAP_STRAIGHT; }
 });
 }
+
+// ── a pause too short for a block still takes its minutes ───────────────────
+//
+// A 26-minute unnamed pause between the dog run and home sat under the 30-minute
+// bar, so it got no block, and the walk line spanning it said "about 43 min" of
+// walking while the follow-ups asked where the user had paused. The pause's
+// minutes come off the walk and are said; JORI_WALK_PAUSES=0 restores the old line.
+{
+const run = { id: "s-5", end: "18:04", start_ts_ms: U("15:49:00"), end_ts_ms: U("16:04:00"), tz: TZ,
+  duration_min: 15, place: { name: "The Dog Run", source: "confirmed_stop" } };
+const pause = { id: "s-p3", start: "18:04", end: "18:30", start_ts_ms: U("16:04:00"), end_ts_ms: U("16:30:00"),
+  duration_min: 26, place: { name: null, source: "spine_dwell" }, tz: TZ };
+const home = { id: "s-6", start: "18:47", start_ts_ms: U("16:47:00"), end_ts_ms: U("22:00:00"), tz: TZ,
+  duration_min: 313, place: { name: "Home", source: "user_confirmed" } };
+const pauseDay = (stops) => ({ date: "2099-03-08", tz: TZ, stops, path: { segments: [], spine: [
+  { type: "dwell", id: "d7", start_ms: U("15:49:00"), end_ms: U("16:04:00") },
+  { type: "leg", id: "l5", mode: "walking", geometry: "map_matched", start_ms: U("16:04:00"), end_ms: U("16:04:00"),
+    routed_m: 320, straight_m: 300, walked_m: 320, fixes: 2, streets: ["Rua Primeira", "Rua Segunda"] },
+  { type: "dwell", id: "d8", start_ms: U("16:04:00"), end_ms: U("16:30:00") },
+  { type: "leg", id: "l6", mode: "walking", geometry: "map_matched", start_ms: U("16:30:00"), end_ms: U("16:47:00"),
+    routed_m: 800, straight_m: 700, walked_m: 800, fixes: 4, streets: ["Rua Primeira"] },
+  { type: "dwell", id: "d10", start_ms: U("16:47:00"), end_ms: U("22:00:00") },
+] } });
+
+test("a hidden pause between two stops comes off the walk and is said", () => {
+  const line = text(movementHtml(pauseDay([run, pause, home]), run, home));
+  assert.match(line, /Walked 0\.7 miles along Rua Primeira and Rua Segunda, about 17 min, plus a 26-minute pause on the way\./);
+  const acc = { m: 0 };
+  movementHtml(pauseDay([run, pause, home]), run, home, acc);
+  assert.equal(acc.m, 1120, "the distance is unchanged");
+});
+
+test("a stop under ten minutes, a walk block or a stop the user said wasn't one is not a pause", () => {
+  for (const extra of [{ end_ts_ms: U("16:12:00"), duration_min: 8 }, { is_movement: true }, { user_non_stop: true }]) {
+    const line = text(movementHtml(pauseDay([run, { ...pause, ...extra }, home]), run, home));
+    assert.match(line, /about 43 min\./);
+    assert.doesNotMatch(line, /pause/);
+  }
+});
+
+test("kill switch: JORI_WALK_PAUSES=0 keeps the old line", () => {
+  process.env.JORI_WALK_PAUSES = "0";
+  try {
+    const line = text(movementHtml(pauseDay([run, pause, home]), run, home));
+    assert.match(line, /about 43 min\./);
+  } finally { delete process.env.JORI_WALK_PAUSES; }
+});
+}
