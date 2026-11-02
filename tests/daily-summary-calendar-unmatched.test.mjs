@@ -125,6 +125,25 @@ test("JORI_CAL_HELD=0 keeps a held event in the unmatched list", () => {
   } finally { delete process.env.JORI_CAL_HELD; }
 });
 
+// The calendar spells times in the home offset. A day cut in another zone owns
+// the events that start inside its own midnight-to-midnight, whatever date
+// those digits spell: a flight leaving 00:05 local the next morning is not this
+// day's, and one that left at 02:00 local is.
+test("a day cut abroad lists the events that start inside its own window", () => {
+  const ev = (summary, start, end) => ({ summary, location: "", physical: true, start, end, duration_min: 60 });
+  const NEXT_MORNING = ev("Flight EX1, AAA → BBB", "2026-10-20T18:05:00-04:00", "2026-10-21T04:55:00-04:00");
+  const EARLY = ev("Early ferry", "2026-10-19T19:00:00-04:00", "2026-10-19T20:00:00-04:00");
+  const NOON = ev("Meeting with Example", "2026-10-20T06:00:00-04:00", "2026-10-20T07:00:00-04:00");
+  const day = { date: "2026-10-20", tz: "Asia/Tokyo", stops: [],
+    unmatched_calendar_events: [NEXT_MORNING, EARLY, NOON] };
+  assert.deepEqual(eventsNotMatched(day).map(e => e.summary), ["Early ferry", "Meeting with Example"]);
+  const viaPath = { ...day, tz: undefined, path: { tz: "Asia/Tokyo" } };
+  assert.deepEqual(eventsNotMatched(viaPath).map(e => e.summary), ["Early ferry", "Meeting with Example"]);
+  const noZone = { ...day, tz: undefined };
+  assert.deepEqual(eventsNotMatched(noZone).map(e => e.summary), ["Meeting with Example", "Flight EX1, AAA → BBB"],
+    "a day with no zone keeps the date the event's string spells");
+});
+
 test("the manifest splits events the same way the email does", () => {
   const day = { date: "2026-10-20", stops: [
       { id: "s-3", start: "16:19", end: "18:02", place: { name: "Visiting Nana", source: "user_confirmed" },
