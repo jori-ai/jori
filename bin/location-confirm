@@ -266,8 +266,16 @@ def _patch_location_history(ask: dict, place_name: str | None, source: str,
         # not this one. 2026-10-07: the user's "מילק בייקרי" for the 08:39–09:23 café
         # was written onto the Airbnb rows that opened at 09:41, 250 m away,
         # because their arrival sat inside the +30 min tail of the ask window.
+        # ...and the mirror (2026-11-02): a closed row that ENDED before the stop began,
+        # away from it, is the place the user came from. The user's name for an 18:04-18:30
+        # shop visit also renamed the 17:49-18:04 dog-park row 261 m away and a 4-minute
+        # 17:40 row 187 m away, both arriving inside the -30 min arrival window. One stay
+        # split into consecutive rows on the same point still takes the answer.
+        ended_before = (bool(row.get("departed_at")) and d >= SAME_START_APART_M
+                        and r_end <= stop_start + PROXIMITY_AFTER_END_S
+                        and os.environ.get("LC_PLACE_BEFORE") != "0")
         by_proximity = (d <= 300 and window_start <= r_start <= window_end
-                        and r_start <= stop_end + PROXIMITY_AFTER_END_S)
+                        and r_start <= stop_end + PROXIMITY_AFTER_END_S and not ended_before)
         overlap_s = max(0.0, min(stop_end, r_end) - max(stop_start, r_start))
         # One visit, not a stop inside a stay (2026-10-17): the user's "Café Antilia" (38 min)
         # renamed the flat's 05:39-14:20 row it sat inside, so the morning at the flat
@@ -503,6 +511,11 @@ def _write_confirmation(ask: dict, chosen: dict, ask_id: str, remove_pending: bo
     # pointer already fired). Best-effort; failure here doesn't undo the save.
     if patched:
         rerender_dates = _ask_dates_to_rerender(ask)
+        held = [d for d in rerender_dates if _fix_loop_holds(d)]
+        if held:
+            # The daily-summary fix loop rebuilds and sends these days itself.
+            entry["silent_rerender_left_to_fix_loop"] = held
+            rerender_dates = [d for d in rerender_dates if d not in held]
         if rerender_dates:
             entry["silent_rerender_dispatched"] = _dispatch_silent_rerender(rerender_dates)
             entry["silent_rerender_dates"] = rerender_dates
@@ -1210,6 +1223,30 @@ def _ask_dates_to_rerender(ask: dict) -> list[str]:
             out.append(cur.isoformat())
         cur = cur + timedelta(days=1)
     return out
+
+
+FIX_LOOP_DIR = os.path.join(DATA_DIR, "daily-summary-fix")
+FIX_LOOP_DONE = ("confirmed", "gave_up")
+FIX_LOOP_FRESH_S = 48 * 3600
+
+
+def _fix_loop_holds(date: str) -> bool:
+    """True while the daily-summary fix loop is still working `date` (its state is
+    open and touched in the last 48 h). That loop rebuilds the day from the corrected
+    records and sends it itself; a SILENT re-render dispatched alongside writes the
+    same /tmp working files, so the two runs overwrite each other mid-build
+    (2026-11-02: the fix loop's own `findme resolve` started one). A closed or stale
+    state, or none, leaves the re-render as it was. LC_RERENDER_IGNORE_FIX_LOOP=1 restores it.
+    """
+    if os.environ.get("LC_RERENDER_IGNORE_FIX_LOOP") == "1":
+        return False
+    state = _load_json(os.path.join(FIX_LOOP_DIR, f"{date}.json"), None)
+    if not isinstance(state, dict) or state.get("status") in FIX_LOOP_DONE:
+        return False
+    touched = _parse_iso(state.get("updated_at") or state.get("created_at") or "")
+    if touched is None:
+        return False
+    return (datetime.now(tz=timezone.utc) - touched).total_seconds() < FIX_LOOP_FRESH_S
 
 
 def _dispatch_silent_rerender(dates: list[str]) -> int:

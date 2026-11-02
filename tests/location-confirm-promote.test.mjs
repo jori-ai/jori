@@ -369,3 +369,69 @@ test("the live confirmed-stops.json is never touched by this test file", () => {
   assert.ok(Array.isArray(live) && live.length > 0);
   assert.ok(!live.some((e) => e && e.name === "Example Bistro"), "test data must never reach the live store");
 });
+
+// ---------------------------------------------------------------------------
+// The other write-back of a confirmed name, `daily-summary-build confirm-venue`,
+// names only the visit rows that are the stop (2026-11-02). It matched every row
+// arriving within +-30 min and 300 m, so a name for a 26-minute shop stop would also
+// rename the dog-park row 261 m away that ended the minute the shop visit began, and a
+// 4-minute row 187 m away before it. The place the user came from or went on to keeps
+// its own name; rows on the stop's own point (one stay split in two) and a row that
+// overlaps the stop still take it.
+import { createRequire as cvCreateRequire } from "node:module";
+import cvPath from "node:path";
+import { fileURLToPath as cvFileURLToPath } from "node:url";
+const cvRequire = cvCreateRequire(import.meta.url);
+const { confirmVenueRows } = cvRequire(cvPath.join(cvPath.dirname(cvFileURLToPath(import.meta.url)), "..", "bin", "daily-summary-build"));
+
+// Synthetic coordinates: metres east/north of an obviously fake origin.
+const CV_ORIGIN = [12.3456, -65.4321];
+const CV_M_PER_DEG = 6371000 * Math.PI / 180;
+function cvPt(e, n) {
+  const lat = CV_ORIGIN[0] + n / CV_M_PER_DEG;
+  return { latitude: lat, longitude: CV_ORIGIN[1] + e / (CV_M_PER_DEG * Math.cos(lat * Math.PI / 180)) };
+}
+
+const CV_STOP = {
+  lat: CV_ORIGIN[0], lon: CV_ORIGIN[1],
+  start_ts_ms: Date.parse("2026-11-01T23:04:31Z"), end_ts_ms: Date.parse("2026-11-01T23:30:34Z"),
+};
+const CV_ROWS = [
+  { id: "the-stop", ...cvPt(0, 0), arrived_at: "2026-11-01T23:04:31Z", departed_at: "2026-11-01T23:30:34Z" },
+  { id: "park-before", ...cvPt(118, -233), arrived_at: "2026-11-01T22:49:56Z", departed_at: "2026-11-01T23:04:31Z" },
+  { id: "street-before", ...cvPt(-104, -156), arrived_at: "2026-11-01T22:40:49Z", departed_at: "2026-11-01T22:45:03Z" },
+  { id: "next-place", ...cvPt(-80, 250), arrived_at: "2026-11-01T23:30:40Z", departed_at: "2026-11-01T23:40:00Z" },
+  { id: "same-point-earlier-half", ...cvPt(10, 12), arrived_at: "2026-11-01T22:58:00Z", departed_at: "2026-11-01T23:04:31Z" },
+  { id: "overlapping-smeared", ...cvPt(150, 150), arrived_at: "2026-11-01T23:00:00Z", departed_at: "2026-11-01T23:25:00Z" },
+  { id: "too-far", ...cvPt(400, 0), arrived_at: "2026-11-01T23:05:00Z", departed_at: "2026-11-01T23:29:00Z" },
+];
+
+test("the places before and after the stop keep their own names", () => {
+  const ids = confirmVenueRows(CV_STOP, CV_ROWS).map((r) => r.id);
+  assert.ok(ids.includes("the-stop"));
+  assert.ok(!ids.includes("park-before"), "the dog park that ended as the stop began is not the stop");
+  assert.ok(!ids.includes("street-before"), "a row that ended 20 minutes earlier, 187 m away, is not the stop");
+  assert.ok(!ids.includes("next-place"), "a row that began after the stop ended is the next place");
+  assert.ok(!ids.includes("too-far"));
+});
+
+test("the stop's own split row and a row overlapping it still match", () => {
+  const ids = confirmVenueRows(CV_STOP, CV_ROWS).map((r) => r.id);
+  assert.ok(ids.includes("same-point-earlier-half"), "one stay split into two rows on the same point");
+  assert.ok(ids.includes("overlapping-smeared"), "a row overlapping most of the stop is the stop");
+});
+
+test("an open row on the stop is still named", () => {
+  const open = [{ id: "open", ...cvPt(5, 5), arrived_at: "2026-11-01T23:06:00Z", departed_at: null }];
+  assert.deepEqual(confirmVenueRows(CV_STOP, open).map((r) => r.id), ["open"]);
+});
+
+test("the kill switch restores the distance-only match", () => {
+  process.env.JORI_CONFIRM_VENUE_NEIGHBOURS = "1";
+  try {
+    const ids = confirmVenueRows(CV_STOP, CV_ROWS).map((r) => r.id);
+    assert.ok(ids.includes("park-before") && ids.includes("street-before") && ids.includes("next-place"));
+  } finally {
+    delete process.env.JORI_CONFIRM_VENUE_NEIGHBOURS;
+  }
+});

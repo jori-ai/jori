@@ -576,6 +576,29 @@ function haversineM(lat1, lon1, lat2, lon2) {
 // day's visit rows by time window + <=300m centroid, set place_name +
 // place_type='user-confirmed'. Idempotent. READ/WRITE scoped to location_history.
 //   daily-summary-build confirm-venue <date> <stop_id> "<name>" --source chat|txn|vision [--resolved <path>]
+// The visit rows that ARE this stop: within 300 m, minus a closed row that ended
+// before the stop began or a row that began after it ended, 50 m or more away --
+// the place the user came from or went on to, whose arrival only happens to fall
+// inside the +-30 min window (2026-11-02: a name for an 18:04-18:30 stop would also
+// rename the dog-park row 261 m away that ended at 18:04). Rows on the stop's own
+// point (one stay split into consecutive rows) still match.
+// JORI_CONFIRM_VENUE_NEIGHBOURS=1 restores the distance-only match.
+const CONFIRM_VENUE_EDGE_MS = 120_000;
+const CONFIRM_VENUE_APART_M = 50;
+function confirmVenueRows(stop, rows) {
+  return rows.filter((r) => {
+    if (r.latitude == null || r.longitude == null) return false;
+    const d = haversineM(stop.lat, stop.lon, r.latitude, r.longitude);
+    if (d > 300) return false;
+    if (process.env.JORI_CONFIRM_VENUE_NEIGHBOURS === "1" || d < CONFIRM_VENUE_APART_M) return true;
+    const arrived = Date.parse(r.arrived_at);
+    const departed = r.departed_at ? Date.parse(r.departed_at) : NaN;
+    if (Number.isFinite(departed) && departed <= stop.start_ts_ms + CONFIRM_VENUE_EDGE_MS) return false;
+    if (Number.isFinite(arrived) && arrived >= stop.end_ts_ms - CONFIRM_VENUE_EDGE_MS) return false;
+    return true;
+  });
+}
+
 async function cmdConfirmVenue(date, stopId, name, source, resolvedOverride) {
   if (!stopId || !name) die("confirm-venue: <stop_id> and <name> required");
   const resolved = loadResolved(date, resolvedOverride);
@@ -586,13 +609,11 @@ async function cmdConfirmVenue(date, stopId, name, source, resolvedOverride) {
   // the first GPS sample slightly.
   const startIso = new Date(stop.start_ts_ms - 30 * 60000).toISOString();
   const endIso = new Date(stop.end_ts_ms + 30 * 60000).toISOString();
-  const q = `/rest/v1/location_history?select=id,latitude,longitude,arrived_at,place_name,place_type`
+  const q = `/rest/v1/location_history?select=id,latitude,longitude,arrived_at,departed_at,place_name,place_type`
     + `&segment_type=eq.visit`
     + `&arrived_at=gte.${encodeURIComponent(startIso)}&arrived_at=lte.${encodeURIComponent(endIso)}`;
   const rows = await request(q);
-  const matches = (Array.isArray(rows) ? rows : []).filter(r =>
-    r.latitude != null && r.longitude != null &&
-    haversineM(stop.lat, stop.lon, r.latitude, r.longitude) <= 300);
+  const matches = confirmVenueRows(stop, Array.isArray(rows) ? rows : []);
   if (!matches.length) {
     process.stderr.write(`[confirm-venue] no location_history visit row within window+300m for ${stopId} — nothing written\n`);
     process.stdout.write(JSON.stringify({ updated: 0, stop_id: stopId, name }) + "\n");
@@ -656,4 +677,6 @@ function main() {
   die(`unknown command: ${cmd}`);
 }
 
-Promise.resolve().then(main).catch((e) => die((e && e.stack) || String(e)));
+// Run as the CLI; a test requires the file for its pure helpers.
+if (require.main === module) Promise.resolve().then(main).catch((e) => die((e && e.stack) || String(e)));
+else module.exports = { confirmVenueRows };

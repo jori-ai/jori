@@ -217,6 +217,44 @@ class StopInStay(unittest.TestCase):
         finally:
             ROWS = keep
 
+    def test_the_place_he_came_from_keeps_its_own_name(self):
+        """2026-11-02: the user's name for an 18:04-18:30 shop visit also renamed the
+        17:49-18:04 dog-park row 261 m away (it ended the second the shop row began)
+        and a 4-minute 17:40 row 187 m away: both arrived inside the -30 min window
+        the proximity clause trusts. The same stay split into two rows on one point
+        still takes the answer."""
+        global ROWS
+        keep = ROWS
+        ROWS = [
+            {"id": "shop-row", **fake_row(0, 0),
+             "arrived_at": "2026-11-01T23:04:31+00:00", "departed_at": "2026-11-01T23:30:34+00:00"},
+            {"id": "park-before", **fake_row(118, -233),
+             "arrived_at": "2026-11-01T22:49:56+00:00", "departed_at": "2026-11-01T23:04:31+00:00"},
+            {"id": "street-before", **fake_row(-104, -156),
+             "arrived_at": "2026-11-01T22:40:49+00:00", "departed_at": "2026-11-01T22:45:03+00:00"},
+            {"id": "same-stay-first-half", **fake_row(8, 10),
+             "arrived_at": "2026-11-01T22:58:00+00:00", "departed_at": "2026-11-01T23:04:31+00:00"},
+        ]
+        try:
+            ask = {"ask_id": "lc-visit-shop-row", "centroid": {**fake_at(0, 0)}, "exact_window": True,
+                   "first_sample_ts": "2026-11-01T23:04:31+00:00", "last_sample_ts": "2026-11-01T23:30:34+00:00"}
+            with redirect_stderr(io.StringIO()):
+                self.lc._patch_location_history(ask, "Corner Market", "findme_resolve")
+            self.assertIn("shop-row", self.patched)
+            self.assertNotIn("park-before", self.patched, "the dog park before is not the shop")
+            self.assertNotIn("street-before", self.patched, "the street before is not the shop")
+            self.assertIn("same-stay-first-half", self.patched, "one stay split on the same point takes the answer")
+            self.patched.clear()
+            os.environ["LC_PLACE_BEFORE"] = "0"
+            try:
+                with redirect_stderr(io.StringIO()):
+                    self.lc._patch_location_history(ask, "Corner Market", "findme_resolve")
+                self.assertIn("park-before", self.patched, "the kill switch restores the old reach")
+            finally:
+                del os.environ["LC_PLACE_BEFORE"]
+        finally:
+            ROWS = keep
+
     def test_kill_switch_restores_the_old_reach(self):
         os.environ["LC_OVERLAP_SHARE"] = "0"
         try:
@@ -224,6 +262,60 @@ class StopInStay(unittest.TestCase):
             self.assertIn("7af07d6a", self.patched)
         finally:
             del os.environ["LC_OVERLAP_SHARE"]
+
+
+class LateRerenderLeavesFixLoopDays(unittest.TestCase):
+    """2026-11-02: the fix loop's own `findme resolve` for a day it was rebuilding
+    dispatched a SILENT re-render of that day, and the two runs wrote the same /tmp
+    working files over each other. A day whose fix-loop state is open is left to it."""
+
+    def setUp(self):
+        import tempfile
+        lc = self.lc = type(sys)("lc")
+        lc.__dict__["__file__"] = SCRIPT
+        exec(compile(open(SCRIPT).read(), "location-confirm", "exec"), lc.__dict__)
+        self.tmp = tempfile.mkdtemp()
+        lc.FIX_LOOP_DIR = self.tmp
+        lc.CONFIRMED_FILE = os.path.join(self.tmp, "confirmed.json")
+        lc.PENDING_FILE = os.path.join(self.tmp, "pending.json")
+        lc._patch_location_history = lambda *a, **k: True
+        lc._ask_dates_to_rerender = lambda ask: ["2026-11-01", "2026-10-30"]
+        self.dispatched = []
+        lc._dispatch_silent_rerender = lambda dates: (self.dispatched.extend(dates), len(dates))[1]
+
+    def state(self, date, status, hours_ago=1):
+        from datetime import datetime, timedelta, timezone
+        at = (datetime.now(tz=timezone.utc) - timedelta(hours=hours_ago)).isoformat()
+        with open(os.path.join(self.tmp, f"{date}.json"), "w") as f:
+            json.dump({"date": date, "status": status, "updated_at": at}, f)
+
+    def confirm(self):
+        ask = {"centroid": fake_at(0, 0), "first_sample_ts": "2026-11-01T23:04:31+00:00",
+               "last_sample_ts": "2026-11-01T23:30:34+00:00"}
+        with redirect_stderr(io.StringIO()):
+            return self.lc._write_confirmation(ask, {"name": "Corner Market", "source": "user_answer"},
+                                               "lc-visit-x", remove_pending=False)
+
+    def test_an_open_fix_loop_day_is_not_rerendered(self):
+        self.state("2026-11-01", "queued")
+        entry = self.confirm()
+        self.assertEqual(self.dispatched, ["2026-10-30"])
+        self.assertEqual(entry["silent_rerender_left_to_fix_loop"], ["2026-11-01"])
+
+    def test_a_closed_or_stale_fix_loop_day_is_rerendered(self):
+        self.state("2026-11-01", "confirmed")
+        self.state("2026-10-30", "awaiting_owner", hours_ago=72)
+        self.confirm()
+        self.assertEqual(sorted(self.dispatched), ["2026-10-30", "2026-11-01"])
+
+    def test_the_kill_switch_rerenders_regardless(self):
+        self.state("2026-11-01", "awaiting_owner")
+        os.environ["LC_RERENDER_IGNORE_FIX_LOOP"] = "1"
+        try:
+            self.confirm()
+        finally:
+            del os.environ["LC_RERENDER_IGNORE_FIX_LOOP"]
+        self.assertIn("2026-11-01", self.dispatched)
 
 
 if __name__ == "__main__":
