@@ -70,6 +70,33 @@ test("findBaseContent finds an older committed version by its sha256", async () 
   assert.equal(b.toString(), BASE);
 });
 
+// Regression: after the switch to kernel + overlay, system/changelog.md is
+// tracked only by the overlay (<root>/.overlay.git), so a base looked up in the
+// kernel repo alone was "no longer in git history" for every card, and every
+// approved card touching the changelog was rebuilt and re-asked for Face ID.
+test("a file tracked by the install's overlay repo is found and merged", async () => {
+  const { dir, git } = repo(BASE);                          // the kernel repo
+  const ov = path.join(dir, ".overlay.git");
+  const og = (...a) => execFileSync("git", ["--git-dir", ov, "--work-tree", dir, ...a], { cwd: dir, stdio: "pipe" });
+  execFileSync("git", ["init", "-q", "--bare", ov]);
+  og("config", "core.bare", "false"); og("config", "user.email", "t@t"); og("config", "user.name", "t"); og("config", "commit.gpgsign", "false");
+  const log = "# Recent changes\n- old entry\n";
+  fs.mkdirSync(path.join(dir, "system"));
+  fs.writeFileSync(path.join(dir, "system/changelog.md"), log);
+  og("add", "system/changelog.md"); og("commit", "-qm", "changelog");
+  const current = "# Recent changes\n- landed entry\n- old entry\n";
+  fs.writeFileSync(path.join(dir, "system/changelog.md"), current); og("commit", "-qam", "drift");
+  const card = "# Recent changes\n- card entry\n- old entry\n";
+  const prev = process.env.JORI_OVERLAY_GIT_DIR; delete process.env.JORI_OVERLAY_GIT_DIR;
+  try {
+    assert.equal((await findBaseContent(dir, "system/changelog.md", sha256(Buffer.from(log)))).toString(), log);
+    const r = await rebaseDrifted(dir, [{ rel: "system/changelog.md", want: sha256(Buffer.from(log)), current: Buffer.from(current), card }]);
+    assert.equal(r.ok, true, r.error);
+    const out = r.merged["system/changelog.md"].toString();
+    assert.match(out, /card entry/); assert.match(out, /landed entry/);
+  } finally { if (prev !== undefined) process.env.JORI_OVERLAY_GIT_DIR = prev; }
+});
+
 test("two changelog entries at the same spot in a .md doc keep both, code still refuses", async () => {
   const doc = "# Recent changes\n- old entry\n";
   const { dir, git } = repo(doc);
