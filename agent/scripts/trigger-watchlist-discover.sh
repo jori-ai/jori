@@ -1,5 +1,5 @@
 #!/bin/bash
-# Monthly watchlist discovery trigger (cron, 1st @ 10:17). Hands off to the ops
+# Monthly watchlist discovery trigger (cron, 11th @ 10:17). Hands off to the ops
 # agent, which launches agent/scripts/watchlist-discover-run.sh via
 # job-run — the run forks `claude -p`, and that only authenticates from inside
 # the Max-authenticated supervisor session, not from cron.

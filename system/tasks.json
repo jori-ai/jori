@@ -581,8 +581,8 @@
     },
     {
       "name": "watchlist-discover",
-      "schedule": "17 10 1 * *",
-      "schedule_human": "1st of each month at 10:17 AM",
+      "schedule": "17 10 11 * *",
+      "schedule_human": "11th of each month at 10:17 AM",
       "trigger_script": "agent/scripts/trigger-watchlist-discover.sh",
       "webhook_url": null,
       "webhook_task": null,
@@ -977,8 +977,8 @@
     },
     {
       "name": "spa-heating-model",
-      "schedule": "37 9 1 * *",
-      "schedule_human": "Monthly on the 1st at 9:37 AM local",
+      "schedule": "37 9 8 * *",
+      "schedule_human": "Monthly on the 8th at 9:37 AM local",
       "trigger_script": "agent/scripts/trigger-spa-heating-model.sh",
       "webhook_url": null,
       "webhook_task": "SPA HEATING MODEL",

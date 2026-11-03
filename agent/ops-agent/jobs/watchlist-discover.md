@@ -1,7 +1,7 @@
 # WATCHLIST DISCOVER (monthly)
 
 Monthly wide pass of the shows & movies discovery pipeline (60-day window, up to 12 adds).
-Dispatched by `agent/scripts/trigger-watchlist-discover.sh` (cron, 1st of the month 10:17 local)
+Dispatched by `agent/scripts/trigger-watchlist-discover.sh` (cron, 11th of the month 10:17 local)
 to the ops-light tier (job-routing.json: sonnet).
 
 ## Step 1 — launch it detached, then end your turn
