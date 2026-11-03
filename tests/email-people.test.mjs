@@ -97,6 +97,10 @@ test("merge groups addresses; link + newer mail drives staleness", () => {
   dana = ep.candidates({ selfEmails: SELF }).find((x) => x.person_key === "danalevi71@example.net");
   assert.equal(dana.wiki_id, "user_dana_levi");
   assert.equal(dana.stale, false);
+  // every merged address, in any case, finds the same person page
+  assert.equal(ep.wikiIdForEmail("DaLevi@rideco.example"), "user_dana_levi");
+  assert.equal(ep.wikiIdForEmail("danalevi71@example.net"), "user_dana_levi");
+  assert.equal(ep.wikiIdForEmail("nobody@example.org"), null);
 
   // An inbound-only email from her later makes the summary stale again.
   ep.ingestThread({ id: "t9", messages: [msg("m9", t0 + 400 * DAY, { from: "danalevi71@example.net", to: SYNTHETIC.owner_email })] }, { selfEmails: SELF });
