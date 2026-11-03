@@ -7,7 +7,7 @@ PEOPLE WATCH — staying in touch with the people the user knows. Code finds who
 The person pages (`jobs/people-email.md`) say who someone is and what the user and they talk about. This job keeps the relationships themselves alive:
 
 1. **Slipping away.** From the contact dates the email and texts ledgers already hold, `people-watch` finds people the user used to be in regular touch with who have gone quiet for well past their usual rhythm, and asks (a hum decision card) whether the user wants to stay in touch.
-2. **Following their news.** For the people the user works with (asked one by one) and anyone the user says yes to, this turn looks them up on LinkedIn, X, company pages and the news, records a snapshot, and writes their public background on their page, linked to their Google Contacts card (never a copy of their details). Code diffs each monthly snapshot against the last: a job change, a move or a life event becomes a question ("Dana is now CTO at Beta. Want to reach out?").
+2. **Following their news.** For the people the user works with and anyone the user says yes to, this turn looks them up on LinkedIn, X, company pages and the news, records a snapshot, and writes their public background on their page, linked to their Google Contacts card (never a copy of their details). Code diffs each monthly snapshot against the last: a job change, a move or a life event becomes a question ("Dana is now CTO at Beta. Want to reach out?"). **People the user works with** (pages whose `scope` is in `work_scopes`) are asked one by one, unless the installation sets `auto_follow_work: true` in `agent/local/config/people-watch.json`: then `propose` follows them without a question (research on, nudges off, an open "follow their news" card withdrawn) and they reach Step 3 like anyone the user said yes to. A decline or a snooze always stands.
 3. **Keeping in touch.** For someone the user wants nudges for, a question goes out when the silence runs past the cadence the user chose. "Draft a note I could send" gets a draft back in chat. The user sends it, or tells Jori to.
 
 ## Pipeline
@@ -74,7 +74,7 @@ If the user then says to send it, that is an explicit on-behalf-of request and t
 
 ## Step 3 — Research (nightly, ≤8 people)
 
-Each `research` row is a person the user said yes to following, due a monthly look-up: `{wiki_id, name, contact, snapshot}` (`snapshot` is the last one, or null).
+Each `research` row is a person the user follows (said yes to, or someone they work with followed automatically under `auto_follow_work`), due a monthly look-up: `{wiki_id, name, contact, snapshot}` (`snapshot` is the last one, or null).
 
 ### 3a. Link their Google Contacts card
 
