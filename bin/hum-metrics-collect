@@ -364,6 +364,32 @@ def pings_delivered_for_day(feedback, start, end):
     return count
 
 
+def ping_lanes_for_day(feedback, start, end):
+    """Per-lane delivered pings for the local day, from the same hum-feedback
+    rows (and the same ping_id dedup) as pings_delivered_for_day.
+    lane -> {"pings", "reacted", "negative"}; negative = a "skip" tapback.
+    Additive (hum-i-20261101-02): lets global_decay_drop name its lane."""
+    seen = set()
+    out = {}
+    for r in feedback:
+        r = as_dict(r)
+        if not in_window(r.get("sent_at"), start, end):
+            continue
+        key = r.get("ping_id") or r.get("message_id")
+        if key is not None:
+            if key in seen:
+                continue
+            seen.add(key)
+        d = out.setdefault(r.get("lane") or "unknown",
+                           {"pings": 0, "reacted": 0, "negative": 0})
+        d["pings"] += 1
+        if r.get("reaction"):
+            d["reacted"] += 1
+        if r.get("reaction") == "skip":
+            d["negative"] += 1
+    return out
+
+
 def collect_for_day(target_date, tz, runs, feedback, history):
     start, end = et_day_window(target_date, tz)
     iso_start, iso_end = start.isoformat(), end.isoformat()
@@ -596,6 +622,7 @@ def collect_for_day(target_date, tz, runs, feedback, history):
         "candidates_total": candidates_total,
         "surfaced": surfaced_count,
         "pings_delivered": _pings_day,
+        "lane_pings": ping_lanes_for_day(feedback, start, end),
         "reactions": {k: by_token[k] for k in
                       ("love", "up", "down", "snooze", "freeform_pos", "freeform_neg")},
         "signal_score_raw": round(signal_raw, 3),
@@ -1014,7 +1041,20 @@ def detect_decay(state, today_row):
             and spp_3 is not None and spp_7 is not None and spp_7 > 0.0:
         delta = spp_3 - spp_7
         if delta < 0 and abs(delta) / max(0.01, spp_7) >= DECAY_DROP_PCT:
+            # hum-i-20261101-02: per-lane view of the 3-day window. Old rows
+            # without lane_pings contribute nothing.
+            lane_breakdown_3d = {}
+            for r in ([today_row] + list(reversed(daily)))[:DECAY_DROP_WINDOW]:
+                for ln, d in as_dict(r.get("lane_pings")).items():
+                    agg = lane_breakdown_3d.setdefault(
+                        ln, {"pings": 0, "reacted": 0, "negative": 0})
+                    for k in agg:
+                        agg[k] += as_dict(d).get(k, 0)
             events.append({
+                "lane_breakdown_3d": lane_breakdown_3d,
+                "dominant_lane": (max(lane_breakdown_3d,
+                                      key=lambda k: lane_breakdown_3d[k]["pings"])
+                                  if lane_breakdown_3d else None),
                 "type": "global_decay_drop",
                 "metric": "signal_per_ping",
                 "today_3d": spp_3,
