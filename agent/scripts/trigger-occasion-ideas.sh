@@ -4,8 +4,7 @@ set -uo pipefail
 #
 # For each configured occasion (an anniversary, a birthday), one email a day
 # from `window_days` before the date through the day itself, every year:
-# restaurant suggestions, events and shows for where the user will be that day,
-# written by Opus.
+# restaurant suggestions, events and shows for where the user will be that day.
 #
 # Date-gated here, logic in the playbook. Fires daily (slot from
 # jori-cron-slots) whenever today, in the instance time zone, is within
@@ -14,7 +13,10 @@ set -uo pipefail
 #     "since": <start year>, "kind": "anniversary"|"birthday" }] }
 # Silent (no model spend at all) on the other days, and always with no file.
 #
-# EPHEMERAL OPUS, LAUNCHED BY LAUNCHD (ai.claude.occasion-ideas), not cron
+# MODEL: Sonnet (JORI_MODEL_SONNET) at xhigh since 2026-11-03, the user's call
+# (it was Opus); JORI_OCCASION_MODEL in the environment overrides.
+#
+# EPHEMERAL, LAUNCHED BY LAUNCHD (ai.claude.occasion-ideas), not cron
 # and not a webhook dispatch: `"model": "opus"` in job-routing.json is only a
 # tier label, and a cron-launched `claude -p` can't unlock the keychain holding
 # the Max credentials. Same shape as trigger-cost-efficiency-review.sh.
@@ -85,7 +87,9 @@ $ACTIVE
 Follow the playbook below end-to-end for EACH active occasion, including sending the email. Read data/occasion-ideas-state.json first so today's email adds what yesterday's did not."
 
 log "dispatching: $(echo "$ACTIVE" | tr '\n' ';')"
-"$ROOT/agent/scripts/lib/run-ephemeral-opus.sh" occasion-ideas "$JOB_MD" --task "$TASK" --timeout-min 50
+[ -n "${JORI_MODEL_SONNET:-}" ] || { [ -f "$ROOT/agent/config/models.env" ] && source "$ROOT/agent/config/models.env"; }
+OCCASION_MODEL="${JORI_OCCASION_MODEL:-${JORI_MODEL_SONNET:-}}"
+"$ROOT/agent/scripts/lib/run-ephemeral-opus.sh" occasion-ideas "$JOB_MD" --task "$TASK" --timeout-min 50 ${OCCASION_MODEL:+--model "$OCCASION_MODEL"} --effort xhigh
 RC=$?
 if [ "$RC" -eq 0 ]; then
   echo "$TODAY" > "$MARKER"

@@ -7,7 +7,7 @@ OCCASION IDEAS — one email a day, for the weeks before each configured occasio
 The shape of every day's plan is: **a great meal** (always) + **an evening bar** (usually) + **one fun activity or show** (usually). The emails build toward that plan: early ones cast wide, later ones narrow, the last few propose the day.
 
 - **Occasions:** `agent/local/occasion-ideas/occasions.json` (private): `{ "window_days": 21, "occasions": [{ "id", "label", "month_day": "MM-DD", "since": <start year>, "kind": "anniversary"|"birthday" }] }`. Add an occasion there, not here. No file → the job never fires.
-- **Launch:** the `ai.claude.occasion-ideas` launchd agent → `trigger-occasion-ideas.sh` (date-gates T-`window_days`…T-0 in the install time zone) → ephemeral `claude -p` on the Opus tier via `agent/scripts/lib/run-ephemeral-opus.sh`. The task line names today's active occasion(s): `id|label|date|days_out|nth|kind` (`nth` = which anniversary, or the age turning).
+- **Launch:** the `ai.claude.occasion-ideas` launchd agent → `trigger-occasion-ideas.sh` (date-gates T-`window_days`…T-0 in the install time zone) → ephemeral `claude -p` on `$JORI_MODEL_SONNET` at xhigh (Opus until 2026-11-03; `JORI_OCCASION_MODEL` overrides) via `agent/scripts/lib/run-ephemeral-opus.sh`. The task line names today's active occasion(s): `id|label|date|days_out|nth|kind` (`nth` = which anniversary, or the age turning).
 - **Reader:** the user only. **This is a planning email to the user, never to anyone it is about**, and nothing here ever contacts them (a birthday plan may be a surprise).
 - **Not this job:** gift ideas belong to `birthday-brainstorm`. This job plans the *day itself*. Do not duplicate that memo.
 
