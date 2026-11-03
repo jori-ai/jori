@@ -21,9 +21,10 @@ const home = path.join(dir, "home");
 fs.mkdirSync(path.join(home, ".local/bin"), { recursive: true });
 fs.mkdirSync(path.join(dir, "memory"), { recursive: true });
 const PROMPT_LOG = path.join(dir, "prompt.txt");
+const CALL_LOG = path.join(dir, "model-calls.txt");
 fs.writeFileSync(
   path.join(home, ".local/bin/claude"),
-  `#!/bin/bash\ncat > "${PROMPT_LOG}"\necho '{"answer":"Lunch with Victor <script>x</script> [1], see also [9]."}'\n`,
+  `#!/bin/bash\ncat > "${PROMPT_LOG}"\necho call >> "${CALL_LOG}"\necho '{"answer":"Lunch with Victor <script>x</script> [1], see also [9]."}'\n`,
   { mode: 0o755 },
 );
 process.env.HOME = home;
@@ -200,6 +201,17 @@ test("a scoped viewer's search and the model's prompt hold only pages they may r
   assert.ok(!prompt.includes("Victor") && !prompt.includes("Monday in Northport") && !prompt.includes("Bistro"),
     "no out-of-scope page reaches the model");
   assert.ok(prompt.includes("Sam is asking"));
+});
+
+test("a search starts the answer and the page's /api/ask joins it: one model call", async () => {
+  fs.rmSync(CALL_LOG, { force: true });
+  const q = "victor bistro lunch prefetch";
+  const page = await get("/search?q=" + encodeURIComponent(q));
+  assert.equal(page.status, 200);
+  const ask = await get("/api/ask?q=" + encodeURIComponent(q));
+  assert.equal(ask.status, 200);
+  assert.ok(JSON.parse(ask.body).html.includes('class="cite"'));
+  assert.equal(fs.readFileSync(CALL_LOG, "utf8").trim().split("\n").length, 1, "the model ran once");
 });
 
 test("the ask API refuses an empty question", async () => {
