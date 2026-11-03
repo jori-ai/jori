@@ -15,7 +15,7 @@
 
 "use strict";
 
-const { localLlmEmbed, LOCAL_EMBED_DEFAULT_MODEL } = require("../lib/local-llm.mjs");
+const { localLlmEmbed, LOCAL_EMBED_DEFAULT_MODEL, LOCAL_EMBED_LABEL } = require("../lib/local-llm.mjs");
 const { loadEnv } = require("../lib/load-env.js");
 loadEnv();
 
@@ -56,7 +56,10 @@ function filterClause() {
   // Order oldest→newest within the selection so progressive runs embed in
   // time-order (helps when tailing logs).
   const base = "select=id,content&order=created_at.asc&limit=" + BATCH;
-  if (REEMBED) return base;
+  // --reembed: every row whose vector was not made with today's model + text
+  // normalisation (LOCAL_EMBED_LABEL). A rewritten row leaves the filter, so
+  // repeated batches walk the whole table and then stop.
+  if (REEMBED) return `or=(embedding_model.is.null,embedding_model.neq.${encodeURIComponent(LOCAL_EMBED_LABEL)})&` + base;
   return "embedding=is.null&" + base;
 }
 
@@ -111,7 +114,7 @@ async function main() {
       // Skip empty rows but mark them so we don't re-scan forever.
       await sb(`/rest/v1/jori_messages?id=eq.${r.id}`, {
         method: "PATCH",
-        body: { embedding_model: LOCAL_EMBED_DEFAULT_MODEL, embedded_at: new Date().toISOString() },
+        body: { embedding_model: LOCAL_EMBED_LABEL, embedded_at: new Date().toISOString() },
       });
       continue;
     }
@@ -124,7 +127,7 @@ async function main() {
         method: "PATCH",
         body: {
           embedding: vecLit,
-          embedding_model: LOCAL_EMBED_DEFAULT_MODEL,
+          embedding_model: LOCAL_EMBED_LABEL,
           embedded_at: new Date().toISOString(),
         },
       });

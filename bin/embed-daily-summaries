@@ -14,9 +14,9 @@
 import { createRequire } from "node:module";
 const require = createRequire(import.meta.url);
 const { request } = require("../lib/supabase-rest.js");
-const { localLlmEmbed } = await import("../lib/local-llm.mjs");
+const { localLlmEmbed, LOCAL_EMBED_LABEL } = await import("../lib/local-llm.mjs");
 
-const EMBED_MODEL = "nomic-embed-text";
+const EMBED_MODEL = LOCAL_EMBED_LABEL; // model + text-normalisation revision
 const DEFAULT_LIMIT = 50;
 const PATCH_CONCURRENCY = 3;
 
