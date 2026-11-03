@@ -92,7 +92,7 @@ New sources: spool an event with `spoolEvents()` (`{type, subject_key, summary, 
 
 `condition` is read by a model, so write it the way the user said it, specific enough to reject near-misses. `watch test <id> --type T --summary S` shows the verdict for a hypothetical candidate without storing anything; `watch trips` shows what anchor rules see.
 
-Manage: `watch list [--all]`, `watch show <id>` (every decision + firing), `watch pause|resume|retire <id> [--reason] [--by]`, `watch confirm|reject <id> <subject_key>` (settle a match by hand).
+Manage: `watch list [--all]`, `watch show <id>` (every decision + firing; a watch that is no longer active also shows its last status change, who made it and why, and an unfired match on it reads `never fired (<status> first)`: `retire` and a once-watch's own firing both leave status `done`, so without that line a watch retired before its time looks like one whose firing went missing), `watch pause|resume|retire <id> [--reason] [--by]`, `watch confirm|reject <id> <subject_key>` (settle a match by hand).
 
 ## Tracking — how well it works
 

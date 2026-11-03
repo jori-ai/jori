@@ -102,10 +102,18 @@ async function main() {
       const r = W.getRule(pos(1));
       if (!r) die("no such watch");
       const matches = W.listMatches(r.id);
-      if (has("json")) return out({ rule: r, matches });
+      // Why it stopped. `retire` and a once-watch's own firing both leave status `done`;
+      // only the status event (who, why) tells a watch closed before its time from one
+      // that fired, so a retired match reads "never fired" instead of a missing FIRED.
+      const stopped = r.status === "active" ? null : W.listEvents({ ruleId: r.id }).filter((e) => e.kind === `status:${r.status}`).pop() || null;
+      if (has("json")) return out({ rule: r, matches, status_event: stopped });
       out(describe(r));
+      if (stopped) {
+        const what = { done: "retired", paused: "paused", expired: "expired" }[stopped.kind.slice(7)] || stopped.kind.slice(7);
+        out(`    ${what} ${W.fmtLocal(Date.parse(stopped.ts), W.userTz())}${stopped.detail.by ? ` by ${stopped.detail.by}` : ""}${stopped.detail.reason ? `: ${stopped.detail.reason}` : ""}`);
+      }
       out(`    condition: ${r.condition || "-"}\n    action: ${JSON.stringify(r.action)}\n    recurrence: ${r.recurrence}${r.expires_at ? ` · expires ${r.expires_at}` : ""}`);
-      for (const m of matches) out(`  - ${m.verdict.padEnd(12)} ${m.subject_key}  ${m.decided_by || ""}${m.fire_at ? ` fire_at=${m.fire_at}` : ""}${m.fired_at ? ` FIRED ${m.fired_at}` : ""}\n      ${(m.summary || "").slice(0, 200)}`);
+      for (const m of matches) out(`  - ${m.verdict.padEnd(12)} ${m.subject_key}  ${m.decided_by || ""}${m.fire_at ? ` fire_at=${m.fire_at}` : ""}${m.fired_at ? ` FIRED ${m.fired_at}` : stopped ? ` · never fired (${stopped.kind.slice(7)} first)` : ""}\n      ${(m.summary || "").slice(0, 200)}`);
       break;
     }
     case "pause": case "resume": case "retire": {

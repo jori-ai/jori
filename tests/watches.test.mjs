@@ -242,3 +242,20 @@ test("quiet hours: next awake moment is 08:00 local", () => {
   assert.equal(new Date(W.nextAwake(Date.parse("2026-10-27T07:00:00Z"), "America/New_York")).toISOString(), "2026-10-27T12:00:00.000Z");
   assert.equal(new Date(W.nextAwake(Date.parse("2026-10-28T03:30:00Z"), "America/New_York")).toISOString(), "2026-10-28T12:00:00.000Z");
 });
+
+test("watch show says why a watch stopped: a retired match reads 'never fired', not a missing FIRED", async () => {
+  const { spawnSync } = await import("node:child_process");
+  const { fileURLToPath } = await import("node:url");
+  const at = { id: "call-check-retired", title: "Check the 4:30 call", trigger: { kind: "at", at: "2026-11-02T21:30:00Z" }, action: { notify: "Time for the call check." }, recurrence: "once" };
+  W.upsertRule(at);
+  await W.tick({ nowMs: Date.parse("2026-10-30T21:10:00Z"), deps: fakeDeps().deps });
+  W.setStatus(at.id, "done", Date.parse("2026-10-30T21:12:19Z"), { reason: "replaced by the noon check", by: "email" });
+  const bin = fileURLToPath(new URL("../bin/watch", import.meta.url));
+  const r = spawnSync(process.execPath, [bin, "show", at.id], { encoding: "utf8", env: process.env });
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(r.stdout, /retired Fri, Oct 30, 5:12 PM by email: replaced by the noon check/);
+  assert.match(r.stdout, /never fired \(done first\)/);
+  assert.doesNotMatch(r.stdout, /FIRED/);
+  const j = JSON.parse(spawnSync(process.execPath, [bin, "show", at.id, "--json"], { encoding: "utf8", env: process.env }).stdout);
+  assert.equal(j.status_event.detail.reason, "replaced by the noon check");
+});
