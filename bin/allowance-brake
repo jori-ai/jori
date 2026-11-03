@@ -305,7 +305,7 @@ function ask(st, job, entry, key, r, est, cfg) {
   const fitsFull = after < 1;
   const fitsCheap = cheaper && (r.projected ?? r.utilization) + est.share * 0.5 < 1;
   const recommended = fitsFull && !fitsCheap ? OPT_RUN : fitsCheap ? OPT_CHEAPER : OPT_DELAY;
-  const share = est.share > 0 ? `about ${Math.max(1, Math.round(est.share * 100))}% of the week per run` : "an unknown share of the week (no run history yet)";
+  const share = est.share > 0 ? `about ${Math.max(1, Math.round(est.share * 100))}% of the week` : "an unknown share of the week (no run history yet)";
   const q = {
     id,
     job,
