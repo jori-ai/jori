@@ -1,0 +1,507 @@
+#!/usr/bin/env node
+// allowance-brake — the allowance governor: decide, right before a heavy job
+// starts, whether it runs, runs on a cheaper model, waits for the weekly
+// reset, or waits for the user to choose.
+//
+// The weekly allowance is a cliff, not a slope: past 1.0, chat, triage and
+// every job stop until the reset, and routing around it is forbidden
+// (agent/CLAUDE.md § Auth Model). So when the week is on pace to run out
+// before it resets, the jobs that matter least give way first.
+//
+// THE READING is Anthropic's own metering, not an estimate: the seven_day
+// utilization and resetsAt carried by the rate_limit_event every supervisor
+// turn logs to agent/logs/supervisor-*/events.ndjson. Pace is the growth over
+// the last 24h of the current window:
+//
+//   projected = utilization + pace_per_day * days_until_reset
+//
+// THE COST ESTIMATE of one run of a job, as a share of the week, is learned
+// from the job's own history: the median total_cost_usd of its last runs in
+// the job-costs ledgers, divided by what one whole allowance cost in the same
+// unit over the pace span (every ledger's spend / the utilization it moved).
+// When the span moved too little to rate, `usd_per_allowance` from the config
+// stands in. A per-job `cost_estimate` (share of the week) overrides both.
+//
+// A job is OVER when the week is already past the threshold, or when
+// projected + this run's estimate reaches it. What happens then is the job's
+// IMPORTANCE, set by the installation:
+//
+//   essential   always runs (never listed = essential too: fail-open)
+//   optional    held, no question asked; runs again on its next tick, or is
+//               relaunched by `release` after the reset when it has a
+//               release_label (a weekly-slot job)
+//   important   the user is asked, once per job per hold, on a decision card
+//               (lib/decision-queue.mjs source "budget"): run it now, run it on
+//               a cheaper model (when the job names one), or wait for the
+//               reset. The job is held until the answer; `apply` (called by
+//               bin/decision-answer once the answer is filed) relaunches it
+//               through its release_label the way the user chose. A question
+//               still open at the reset is closed and the job just runs.
+//
+// Config, the installation's decision: agent/local/config/allowance-brake.json
+//   { "threshold": 0.95, "usd_per_allowance": 1400,
+//     "jobs": { "<job>": { "importance": "optional|important|essential",
+//                          "release_label": "<launchd label>",
+//                          "cost_estimate": 0.02,
+//                          "cheaper": { "model": "sonnet", "effort": "high" },
+//                          "label": "<what the user calls it>" } } }
+// A listed job without `importance` is optional (the brake's original meaning).
+// No config file = the governor is off.
+//
+// FAIL-OPEN. No sample, a sample older than MAX_SAMPLE_AGE_H, a window younger
+// than MIN_RATE_SPAN_H, a window that has already reset, an unreadable log or
+// any error answers RUN. The governor may delay a job; it must never be the
+// reason one silently stops for good.
+//
+// Usage:
+//   allowance-brake check <job> [--key <id>] [--json] [--no-ask]
+//        exit 0 = run · 3 = hold · 4 = run on the cheaper model
+//        (--json carries `model` and `effort` for exit 4)
+//   allowance-brake apply <ref>              act on an answered budget card
+//   allowance-brake release [--dry-run]      relaunch held jobs whose window reset
+//   allowance-brake status [--json]          the reading + each job's estimate
+// Test hooks: --events-dir <dir> --state <file> --now <iso>; JORI_LOCAL_DIR for
+// the config. With --state, no card is sent and launchctl is never called.
+
+import fs from "node:fs";
+import path from "node:path";
+import crypto from "node:crypto";
+import { execFileSync, spawnSync } from "node:child_process";
+import { createRequire } from "node:module";
+
+const require = createRequire(import.meta.url);
+const { installTools } = require("../lib/root.cjs");
+const { localConfig } = require("../lib/instance.cjs");
+
+const HOLD = 3;
+const CHEAPER = 4;
+const MAX_SAMPLE_AGE_H = 6;     // older than this, the reading says nothing about now
+const MIN_RATE_SPAN_H = 12;     // a younger window is too short to rate (an overnight burst x the whole week): run
+const PACE_LOOKBACK_H = 24;     // pace = growth over the last day of the window
+const TAIL_BYTES = 24 * 1024 * 1024; // the logs run to 100+ MB; a day of samples sits in the tail
+const RESET_DROP = 0.02;        // utilization is reported to 2dp; only a real drop is a reset
+const KEEP_HELD_DAYS = 9;       // a held record no trigger consumed is dropped after this
+const HELD_NOTE_DAYS = 2;       // a released hold older than this is not reported to the run
+const EST_RUNS = 10;            // the estimate is the median of this many recent runs
+const MIN_RATE_DELTA = 0.03;    // a span that moved the week less than this cannot price an allowance
+const DEFAULT_USD_PER_ALLOWANCE = 1400;
+const IMPORTANCE = new Set(["essential", "important", "optional"]);
+
+// The card's options. Fixed text: `apply` maps an answer back by exact match.
+const OPT_RUN = "Run it now on the usual model";
+const OPT_CHEAPER = "Run it now on a cheaper model";
+const OPT_DELAY = "Wait until the weekly allowance resets";
+
+function arg(name) { const i = process.argv.indexOf("--" + name); return i > 0 ? process.argv[i + 1] : null; }
+const flag = (name) => process.argv.includes("--" + name);
+
+const NOW = arg("now") ? Date.parse(arg("now")) : Date.now();
+const EVENTS_DIR = arg("events-dir") || installTools("agent/logs");
+const TESTING = !!arg("state");
+const STATE_FILE = arg("state") || installTools("data/allowance-brake-state.json");
+const LOG_FILE = TESTING ? null : installTools("data/logs/allowance-brake.log");
+
+function logLine(s) {
+  if (!LOG_FILE) return;
+  try {
+    fs.mkdirSync(path.dirname(LOG_FILE), { recursive: true });
+    fs.appendFileSync(LOG_FILE, `${new Date(NOW).toISOString()} ${s}\n`);
+  } catch { /* logging never blocks a decision */ }
+}
+
+function readTail(file) {
+  const fd = fs.openSync(file, "r");
+  try {
+    const size = fs.fstatSync(fd).size;
+    const start = Math.max(0, size - TAIL_BYTES);
+    const buf = Buffer.alloc(size - start);
+    fs.readSync(fd, buf, 0, buf.length, start);
+    const text = buf.toString("utf8");
+    return start > 0 ? text.slice(text.indexOf("\n") + 1) : text; // drop a cut first line
+  } finally { fs.closeSync(fd); }
+}
+
+/** Every seven-day sample in the supervisor event logs' tails, oldest first. */
+function samples() {
+  const out = [];
+  for (const d of fs.readdirSync(EVENTS_DIR)) {
+    if (!d.startsWith("supervisor-") || d.startsWith("supervisor-test")) continue;
+    const f = path.join(EVENTS_DIR, d, "events.ndjson");
+    if (!fs.existsSync(f)) continue;
+    for (const line of readTail(f).split("\n")) {
+      if (!line.includes("rate_limit_event")) continue;
+      let e; try { e = JSON.parse(line); } catch { continue; }
+      if (e.kind !== "rate_limit_event" || !e.ts) continue;
+      const w = (e.rate_limit_info && e.rate_limit_info.unifiedWindows && e.rate_limit_info.unifiedWindows.seven_day) || null;
+      const t = Date.parse(e.ts);
+      if (!w || typeof w.utilization !== "number" || !Number.isFinite(t) || t > NOW) continue;
+      out.push({ t, u: w.utilization, resetsAt: typeof w.resetsAt === "number" ? w.resetsAt : null });
+    }
+  }
+  return out.sort((a, b) => a.t - b.t);
+}
+
+/** Every job-costs row (supervisor ledgers + ephemeral forks), unsorted. */
+function ledgerRows() {
+  const files = [];
+  try {
+    for (const d of fs.readdirSync(EVENTS_DIR)) {
+      if (d.startsWith("supervisor-test")) continue;
+      if (d.startsWith("supervisor-") || d === "ephemeral-forks") files.push(path.join(EVENTS_DIR, d, "job-costs.ndjson"));
+    }
+  } catch { return []; }
+  const out = [];
+  for (const f of files) {
+    if (!fs.existsSync(f)) continue;
+    let text; try { text = readTail(f); } catch { continue; }
+    for (const line of text.split("\n")) {
+      if (!line) continue;
+      let r; try { r = JSON.parse(line); } catch { continue; }
+      const t = Date.parse(r.ts || "");
+      const c = Number(r.total_cost_usd);
+      if (!Number.isFinite(t) || !Number.isFinite(c) || t > NOW) continue;
+      out.push({ t, job: r.source || null, usd: c });
+    }
+  }
+  return out;
+}
+
+const pct = (x) => `${Math.round(x * 100)}%`;
+
+/** { hold, reason, utilization, projected, pace_per_day, resets_at, span } — hold is false on any doubt. */
+function reading(threshold) {
+  const open = (reason, extra = {}) => ({ hold: false, reason, ...extra });
+  let s;
+  try { s = samples(); } catch (e) { return open(`no reading (${e.message.slice(0, 80)})`); }
+  if (!s.length) return open("no allowance sample in the event logs");
+  const last = s[s.length - 1];
+  const ageH = (NOW - last.t) / 3600e3;
+  if (ageH > MAX_SAMPLE_AGE_H) return open(`newest allowance sample is ${ageH.toFixed(1)}h old`);
+  if (!last.resetsAt) return open("newest sample carries no reset time");
+  const resetMs = last.resetsAt * 1000;
+  if (resetMs <= NOW) return open("the window has reset since the newest sample");
+  // The current window: samples sharing the newest reset time, after the last drop.
+  let from = 0;
+  for (let i = 1; i < s.length; i++) if (s[i].u < s[i - 1].u - RESET_DROP) from = i;
+  const win = s.slice(from).filter((x) => x.resetsAt === last.resetsAt);
+  const base = win.find((x) => x.t >= last.t - PACE_LOOKBACK_H * 3600e3) || win[0];
+  const spanH = (last.t - base.t) / 3600e3;
+  const util = last.u;
+  const resets_at = new Date(resetMs).toISOString();
+  const daysLeft = (resetMs - NOW) / 864e5;
+  const span = { from: base.t, to: last.t, delta: last.u - base.u };
+  if (util >= threshold) {
+    return { hold: true, reason: `the week is at ${pct(util)}, past the ${pct(threshold)} brake; waits for the reset at ${resets_at}`, utilization: util, projected: util, pace_per_day: null, resets_at, span };
+  }
+  if (spanH < MIN_RATE_SPAN_H) return open(`only ${spanH.toFixed(1)}h of this window to rate; week at ${pct(util)}`, { utilization: util, resets_at });
+  const pace = Math.max(0, (last.u - base.u) / (spanH / 24));
+  const projected = util + pace * daysLeft;
+  const facts = { utilization: util, projected: +projected.toFixed(3), pace_per_day: +pace.toFixed(3), resets_at, span };
+  if (projected >= threshold) {
+    return { hold: true, reason: `the week is at ${pct(util)} and on pace for ${pct(projected)} by the reset at ${resets_at} (${pct(pace)}/day), past the ${pct(threshold)} brake`, ...facts };
+  }
+  return open(`the week is at ${pct(util)}, on pace for ${pct(projected)} by the reset; under the ${pct(threshold)} brake`, facts);
+}
+
+const median = (xs) => { const s = [...xs].sort((a, b) => a - b); const n = s.length; return n ? (n % 2 ? s[(n - 1) / 2] : (s[n / 2 - 1] + s[n / 2]) / 2) : null; };
+
+/** What one whole allowance cost (in ledger USD), from the pace span, or the config's stand-in. */
+function usdPerAllowance(cfg, r, rows) {
+  if (r && r.span && r.span.delta >= MIN_RATE_DELTA) {
+    const spent = rows.filter((x) => x.t > r.span.from && x.t <= r.span.to).reduce((a, x) => a + x.usd, 0);
+    if (spent > 0) return { usd: spent / r.span.delta, basis: "measured" };
+  }
+  return { usd: cfg.usd_per_allowance, basis: "config" };
+}
+
+/** One run of `job` as a share of the week: {share, usd, runs, basis} (share 0 when unknown). */
+function estimate(job, cfg, r, rows) {
+  const entry = cfg.jobs[job] || {};
+  const fixed = Number(entry.cost_estimate);
+  if (fixed > 0 && fixed < 1) return { share: fixed, usd: null, runs: 0, basis: "config" };
+  const mine = rows.filter((x) => x.job === job).sort((a, b) => b.t - a.t).slice(0, EST_RUNS);
+  if (!mine.length) return { share: 0, usd: null, runs: 0, basis: "no history" };
+  const usd = median(mine.map((x) => x.usd));
+  const per = usdPerAllowance(cfg, r, rows);
+  return { share: +(usd / per.usd).toFixed(4), usd: +usd.toFixed(2), runs: mine.length, basis: per.basis };
+}
+
+function readState() {
+  try { const s = JSON.parse(fs.readFileSync(STATE_FILE, "utf8")); return s && typeof s === "object" ? s : {}; } catch { return {}; }
+}
+function writeState(st) {
+  st.held = st.held || {};
+  for (const [job, h] of Object.entries(st.held)) {
+    if (!h || NOW - Date.parse(h.held_since || 0) > KEEP_HELD_DAYS * 864e5) delete st.held[job];
+  }
+  st.answers = st.answers || {};
+  for (const [job, a] of Object.entries(st.answers)) {
+    if (!a || Date.parse(a.resets_at || 0) <= NOW || a.consumed_at) delete st.answers[job];
+  }
+  st.questions = (st.questions || []).filter((q) => q && NOW - Date.parse(q.asked_at || 0) <= KEEP_HELD_DAYS * 864e5);
+  st.released = (st.released || []).slice(-20);
+  fs.mkdirSync(path.dirname(STATE_FILE), { recursive: true });
+  const tmp = STATE_FILE + ".tmp." + process.pid;
+  fs.writeFileSync(tmp, JSON.stringify(st, null, 2) + "\n");
+  fs.renameSync(tmp, STATE_FILE);
+}
+
+function config() {
+  try {
+    const c = localConfig("allowance-brake", {});
+    const threshold = Number(c.threshold);
+    const usd = Number(c.usd_per_allowance);
+    return {
+      threshold: threshold > 0 && threshold <= 1 ? threshold : 0.95,
+      usd_per_allowance: usd > 0 ? usd : DEFAULT_USD_PER_ALLOWANCE,
+      jobs: c.jobs && typeof c.jobs === "object" ? c.jobs : {},
+    };
+  } catch { return { threshold: 0.95, usd_per_allowance: DEFAULT_USD_PER_ALLOWANCE, jobs: {} }; }
+}
+
+const importanceOf = (entry) => (entry && IMPORTANCE.has(entry.importance) ? entry.importance : "optional");
+
+function emit(obj, line) { process.stdout.write((flag("json") ? JSON.stringify(obj) : line) + "\n"); }
+
+function recordHeld(st, job, label, r) {
+  if (!label) return;
+  st.held = st.held || {};
+  const prev = st.held[job];
+  // Keep the first hold of THIS window; a record left from an earlier window starts over.
+  const same = prev && !prev.released_at && Date.parse(prev.resets_at || "") > NOW;
+  st.held[job] = { held_since: (same && prev.held_since) || new Date(NOW).toISOString(), resets_at: r.resets_at, release_label: label, utilization: r.utilization, projected: r.projected ?? null };
+}
+
+/** Close a job's open budget questions (the hold they asked about is over). */
+function closeQuestions(st, job, why) {
+  let n = 0;
+  for (const q of st.questions || []) {
+    if (q.job === job && q.status === "open") { q.status = `closed:${why}`; q.closed_at = new Date(NOW).toISOString(); n++; }
+  }
+  if (st.asks) delete st.asks[job];
+  return n;
+}
+
+function when(iso) {
+  try {
+    const tz = require("../lib/instance.cjs").instance().tz;
+    return new Date(iso).toLocaleString("en-US", { timeZone: tz, weekday: "long", hour: "numeric", minute: "2-digit" });
+  } catch { return iso; }
+}
+
+/** Build the budget question for `job` and send it as a decision card. */
+function ask(st, job, entry, key, r, est, cfg) {
+  const id = `${job}-${crypto.createHash("sha1").update(`${job}\n${key || ""}\n${NOW}`).digest("hex").slice(0, 8)}`;
+  const name = entry.label || job;
+  const cheaper = entry.cheaper && entry.cheaper.model ? entry.cheaper : null;
+  const options = cheaper ? [OPT_RUN, OPT_CHEAPER, OPT_DELAY] : [OPT_RUN, OPT_DELAY];
+  const after = (r.projected ?? r.utilization) + est.share;
+  // Recommend the cheapest choice that still gets the user through the week.
+  const fitsFull = after < 1;
+  const fitsCheap = cheaper && (r.projected ?? r.utilization) + est.share * 0.5 < 1;
+  const recommended = fitsFull && !fitsCheap ? OPT_RUN : fitsCheap ? OPT_CHEAPER : OPT_DELAY;
+  const share = est.share > 0 ? `about ${Math.max(1, Math.round(est.share * 100))}% of the week per run` : "an unknown share of the week (no run history yet)";
+  const q = {
+    id,
+    job,
+    key: key || null,
+    asked_at: new Date(NOW).toISOString(),
+    time_sensitive: true,
+    status: "open",
+    question: `${name} is ready to start, but your weekly Claude allowance is at ${pct(r.utilization)} and on pace for ${pct(r.projected ?? r.utilization)} before it resets ${when(r.resets_at)}. A run usually costs ${share}. Run it now, run it on a cheaper model, or wait for the reset?`,
+    options,
+    recommended,
+    recommendation: `${recommended}: ${fitsFull ? "the week has room for it" : fitsCheap ? "on the cheaper model it fits; on the usual one it would likely run the week out" : "running it now would likely run the week out, and at 100% everything (chat included) stops until the reset"}.`,
+    why_it_matters: "At 100% of the weekly allowance every agent stops, chat included, until the reset; there is no slower mode.",
+    estimate: est,
+    resets_at: r.resets_at,
+  };
+  st.questions = [...(st.questions || []), q];
+  st.asks = { ...(st.asks || {}), [job]: { id, ref: `bud:${id}`, key: key || null, asked_at: q.asked_at, resets_at: r.resets_at } };
+  return q;
+}
+
+function sendCard(ref) {
+  if (TESTING || flag("no-send")) return "not sent (test)";
+  const r = spawnSync(installTools("bin/decision-ask"), ["--ref", ref], { encoding: "utf8", timeout: 240_000 });
+  return r.status === 0 ? "sent" : `send failed (exit ${r.status}: ${String(r.stderr || "").trim().slice(0, 160)})`;
+}
+
+function check(job) {
+  const cfg = config();
+  if (!job) { process.stderr.write("usage: allowance-brake check <job>\n"); return 64; }
+  const key = arg("key");
+  if (!Object.prototype.hasOwnProperty.call(cfg.jobs, job)) {
+    emit({ decision: "run", job, reason: "not under the governor" }, `run: ${job} is not under the governor`);
+    return 0;
+  }
+  const entry = cfg.jobs[job] || {};
+  const importance = importanceOf(entry);
+  if (importance === "essential") {
+    emit({ decision: "run", job, importance, reason: "essential" }, `run: ${job} is essential`);
+    return 0;
+  }
+  const r = reading(cfg.threshold);
+  const rows = ledgerRows();
+  const est = estimate(job, cfg, r, rows);
+  const label = entry.release_label || null;
+  const over = r.hold || (typeof r.projected === "number" && r.projected + est.share >= cfg.threshold);
+  const facts = { job, importance, estimate: est, ...r };
+  delete facts.span;
+
+  const st = readState();
+  const before = JSON.stringify(st);
+  const save = () => { if (JSON.stringify(st) !== before) writeState(st); };
+  const runNow = (decision, why, extra = {}) => {
+    let held_since = null;
+    const h = st.held && st.held[job];
+    if (h) {
+      if (h.released_at && NOW - Date.parse(h.released_at) <= HELD_NOTE_DAYS * 864e5) held_since = h.held_since || null;
+      delete st.held[job];
+    }
+    try { save(); } catch { /* a stale record only costs a redundant kick */ }
+    logLine(`${decision} ${job}${key ? ` [${key}]` : ""}${held_since ? ` (held since ${held_since})` : ""}: ${why}`);
+    emit({ decision, held_since, ...facts, ...extra, reason: why }, `${decision}${held_since ? ` (held since ${held_since})` : ""}: ${why}`);
+    return decision === "cheaper" ? CHEAPER : 0;
+  };
+  const hold = (why) => {
+    try { save(); } catch { /* the hold stands; only its release would be lost */ }
+    logLine(`hold ${job}${key ? ` [${key}]` : ""}: ${why}`);
+    emit({ decision: "hold", ...facts, reason: why }, `hold: ${why}`);
+    return HOLD;
+  };
+
+  if (!over) {
+    if (closeQuestions(st, job, "no longer over budget")) logLine(`closed open budget question(s) for ${job}: no longer over budget`);
+    return runNow("run", r.reason + (est.share ? `; this run ~${pct(est.share)}` : ""));
+  }
+  const why = r.hold ? r.reason : `the week is at ${pct(r.utilization)}, on pace for ${pct(r.projected)} by the reset, and this run adds ~${pct(est.share)}: past the ${pct(cfg.threshold)} brake`;
+
+  if (importance === "optional") {
+    recordHeld(st, job, label, r);
+    return hold(why);
+  }
+
+  // important: the user decides.
+  const a = st.answers && st.answers[job];
+  const answerFits = a && !a.consumed_at && Date.parse(a.resets_at || "") > NOW && (!a.key || !key || a.key === key);
+  if (answerFits) {
+    if (a.choice === "delay") { recordHeld(st, job, label, r); return hold(`${why}; you chose to wait for the reset`); }
+    a.consumed_at = new Date(NOW).toISOString();
+    if (a.choice === "cheaper" && entry.cheaper && entry.cheaper.model) {
+      return runNow("cheaper", `you chose the cheaper model (${entry.cheaper.model}) for this run`, { model: entry.cheaper.model, effort: entry.cheaper.effort || null });
+    }
+    return runNow("run", "you chose to run it now");
+  }
+  recordHeld(st, job, label, r);
+  const pending = st.asks && st.asks[job];
+  if (pending && Date.parse(pending.resets_at || "") > NOW && (st.questions || []).some((q) => q.id === pending.id && q.status === "open")) {
+    return hold(`${why}; waiting for your answer (${pending.ref})`);
+  }
+  if (flag("no-ask")) return hold(`${why}; not asked (--no-ask)`);
+  const q = ask(st, job, entry, key, r, est, cfg);
+  try { writeState(st); } catch (e) { return hold(`${why}; could not record the question (${String(e.message).slice(0, 60)})`); }
+  const sent = sendCard(`bud:${q.id}`);
+  logLine(`asked about ${job}${key ? ` [${key}]` : ""} (bud:${q.id}): ${sent}`);
+  return hold(`${why}; asked you (bud:${q.id}, ${sent})`);
+}
+
+function kick(label) {
+  if (TESTING || flag("dry-run")) return `would kick ${label}`;
+  execFileSync("launchctl", ["kickstart", `gui/${process.getuid()}/${label}`], { stdio: "ignore", timeout: 15000 });
+  return `kicked ${label}`;
+}
+
+/** Act on an answered budget card: record the choice, relaunch the job if it should run now. */
+function apply(ref) {
+  const id = String(ref || "").replace(/^bud:/, "");
+  const st = readState();
+  const q = (st.questions || []).find((x) => x.id === id);
+  if (!q) { process.stdout.write(`apply: no budget question ${ref}\n`); return 0; }
+  if (!String(q.status).startsWith("answered")) { process.stdout.write(`apply: ${ref} is ${q.status}, not answered\n`); return 0; }
+  const choice = q.answer === OPT_RUN ? "run" : q.answer === OPT_CHEAPER ? "cheaper" : q.answer === OPT_DELAY ? "delay" : null;
+  if (!choice) {
+    logLine(`apply ${ref}: answer "${String(q.answer).slice(0, 80)}" is none of the options; ${q.job} stays held`);
+    process.stdout.write(`apply: the answer is not one of the options; ${q.job} stays held until an option is chosen or the reset\n`);
+    q.status = "open"; // the chat agent maps words to an option; until then the question stands
+    writeState(st);
+    return 0;
+  }
+  st.answers = { ...(st.answers || {}), [q.job]: { choice, key: q.key, at: new Date(NOW).toISOString(), resets_at: q.resets_at, ref: `bud:${id}` } };
+  if (st.asks) delete st.asks[q.job];
+  writeState(st);
+  const label = (config().jobs[q.job] || {}).release_label;
+  let did = "recorded";
+  if (choice !== "delay" && label) {
+    try { did = kick(label); } catch (e) { did = `kick failed (${String(e.message).slice(0, 80)}); runs on its next tick`; }
+  }
+  logLine(`apply ${ref}: ${q.job} -> ${choice}; ${did}`);
+  process.stdout.write(`${q.job}: ${choice}; ${did}\n`);
+  return 0;
+}
+
+function release() {
+  const st = readState();
+  const cfg = config();
+  const r = reading(cfg.threshold);
+  let changed = false;
+  // A budget question still open after its window reset is moot: close it.
+  for (const q of st.questions || []) {
+    if (q.status === "open" && Date.parse(q.resets_at || "") <= NOW) { q.status = "closed:window reset"; changed = true; }
+  }
+  for (const [job, h] of Object.entries(st.held || {})) {
+    if (!h || !h.release_label || h.released_at) continue;
+    if (Date.parse(h.resets_at || "") > NOW) continue; // the window it was held in has not reset
+    if (r.hold) continue;
+    if (flag("dry-run")) { process.stdout.write(`would release ${job}: launchctl kickstart gui/${process.getuid()}/${h.release_label}\n`); continue; }
+    try {
+      kick(h.release_label);
+      h.released_at = new Date(NOW).toISOString();
+      (st.released = st.released || []).push({ job, at: h.released_at, held_since: h.held_since });
+      changed = true;
+      logLine(`released ${job} (${h.release_label}), held since ${h.held_since}`);
+      process.stdout.write(`released ${job}, held since ${h.held_since}\n`);
+    } catch (e) {
+      logLine(`release ${job} failed: ${String(e.message).slice(0, 120)}`);
+      process.stdout.write(`release ${job} failed (${h.release_label}); will retry on the next run\n`);
+    }
+  }
+  if (changed) { try { writeState(st); } catch { /* kicked anyway */ } }
+  return 0;
+}
+
+function status() {
+  const cfg = config();
+  const r = reading(cfg.threshold);
+  const rows = ledgerRows();
+  const per = usdPerAllowance(cfg, r, rows);
+  const jobs = Object.fromEntries(Object.keys(cfg.jobs).map((j) => [j, { importance: importanceOf(cfg.jobs[j]), estimate: estimate(j, cfg, r, rows) }]));
+  const st = readState();
+  const open = (st.questions || []).filter((q) => q.status === "open").map((q) => `bud:${q.id}`);
+  if (flag("json")) {
+    const out = { threshold: cfg.threshold, usd_per_allowance: per, jobs, held: st.held || {}, open_questions: open, ...r };
+    delete out.span;
+    process.stdout.write(JSON.stringify(out) + "\n");
+    return 0;
+  }
+  process.stdout.write(`${r.hold ? "HOLD" : "clear"}: ${r.reason}\n`);
+  process.stdout.write(`one allowance ~ $${Math.round(per.usd)} of ledger spend (${per.basis})\n`);
+  for (const [j, v] of Object.entries(jobs)) {
+    process.stdout.write(`  ${j.padEnd(28)} ${v.importance.padEnd(10)} ${v.estimate.share ? `~${(v.estimate.share * 100).toFixed(1)}%/run` : "no estimate"}${v.estimate.usd != null ? ` ($${v.estimate.usd} median of ${v.estimate.runs})` : ""}${st.held && st.held[j] ? "  [held]" : ""}\n`);
+  }
+  if (open.length) process.stdout.write(`open questions: ${open.join(", ")}\n`);
+  return 0;
+}
+
+const cmd = process.argv[2];
+let rc;
+try {
+  rc = cmd === "check" ? check(process.argv[3]) : cmd === "apply" ? apply(process.argv[3])
+    : cmd === "release" ? release() : cmd === "status" ? status()
+    : (process.stderr.write("usage: allowance-brake check <job> [--key <id>] | apply <ref> | release | status\n"), 64);
+} catch (e) {
+  // Fail-open: an unexpected error never holds a job.
+  process.stdout.write(`run: allowance-brake error (${String(e && e.message).slice(0, 80)})\n`);
+  rc = 0;
+}
+process.exit(rc);
