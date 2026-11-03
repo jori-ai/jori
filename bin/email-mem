@@ -22,6 +22,18 @@ function flag(name) {
   return args[i + 1];
 }
 
+// Every value of a repeatable flag, comma lists split: `--add-tag a --add-tag b,c`
+// → ["a","b","c"]. flag() alone returns only the first occurrence, which is how
+// `supersede --add-tag x --add-tag y` silently dropped y (2026-11-03).
+function flagAll(name) {
+  const out = [];
+  for (let i = 0; i < args.length - 1; i++) {
+    if (args[i] !== `--${name}`) continue;
+    for (const v of args[i + 1].split(",")) if (v.trim()) out.push(v.trim());
+  }
+  return out;
+}
+
 // The memory body. Historically this was `args[1]` and nothing else, so a
 // caller writing the flag form — `email-mem add --text "..." --tags "..."` —
 // silently stored the literal string "--text" as the memory, and a caller
@@ -51,7 +63,7 @@ Commands:
   remove <id>                                          Remove a memory by ID
   repair [--apply]                                     Find (and remove) rows whose body is a flag name
   test --from <f> --subject <s> [--snippet <sn>]       Test what memories match an email
-  supersede <id> --by <id> [--add-tag tag] [--remove-tag tag]   Mark row superseded
+  supersede <id> --by <id> [--add-tag t1,t2]... [--remove-tag t]...   Mark row superseded (tag flags repeat)
 `);
 }
 
@@ -128,14 +140,14 @@ switch (cmd) {
       console.error("Usage: email-mem supersede <id> --by <id> [--add-tag tag] [--remove-tag tag]");
       process.exit(1);
     }
-    const addTag = flag("add-tag");
-    const removeTag = flag("remove-tag");
+    const addTags = flagAll("add-tag");
+    const removeTags = flagAll("remove-tag");
     const all = em.list({ limit: 100000 });
     const row = all.find((r) => r.id === id);
     if (!row) { console.error(`No memory with id=${id}`); process.exit(2); }
     let tags = (row.tags || "").split(",").map((t) => t.trim()).filter(Boolean);
-    if (removeTag) tags = tags.filter((t) => t !== removeTag);
-    if (addTag && !tags.includes(addTag)) tags.push(addTag);
+    tags = tags.filter((t) => !removeTags.includes(t));
+    for (const t of addTags) if (!tags.includes(t)) tags.push(t);
     if (!tags.includes(`superseded-by-#${byId}`)) tags.push(`superseded-by-#${byId}`);
     em.update(id, { tags: tags.join(",") });
     console.log(`Superseded memory #${id} (now tagged: ${tags.join(",")})`);
