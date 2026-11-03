@@ -95,3 +95,39 @@ test("spine stops are still re-merged; a saved-at stop keeps only the people his
   const cluster = { id: "s-2", start_ts_ms: at("10:00"), end_ts_ms: at("11:00"), centroid: AIRBNB, companions: [] };
   assert.deepEqual(stopsBuiltAfterCompanionMerge([spine, savedAt, cluster]).map(s => s.id), ["s-p1"]);
 });
+
+// A row still open when the day is resolved (no departed_at: the user had not
+// left yet) is the instant it began. As a zero-length span it overlapped no stop
+// that began at that instant, and the stop an open row confirms begins exactly
+// there, so the evening at home read alone though the partner was on its row.
+const { pieceCompanions } = _internal;
+const openVisit = (start, companions, pos = AIRBNB) => ({
+  arrived_at: new Date(at(start)).toISOString(), departed_at: null,
+  latitude: pos.lat, longitude: pos.lon, companions,
+});
+
+test("an open row's companions reach the stop that begins at its arrival", () => {
+  const stop = spineStop("s-7", "14:03", "23:59");
+  applyVisitCompanions([stop], [openVisit("14:03", ["Paige"])]);
+  assert.deepEqual(stop.companions, ["Paige"]);
+});
+
+test("an open row belongs to the one stop that holds its arrival, not the one ending there", () => {
+  const before = spineStop("s-6", "12:30", "14:03");
+  const after = spineStop("s-7", "14:03", "23:59");
+  const later = spineStop("s-8", "15:00", "16:00");
+  applyVisitCompanions([before, after, later], [openVisit("14:03", ["Paige"])]);
+  assert.deepEqual(before.companions, [], "the stop that ended at the instant");
+  assert.deepEqual(after.companions, ["Paige"]);
+  assert.deepEqual(later.companions, [], "an open row does not spread past its own arrival");
+});
+
+test("a cut piece that begins at an open row's arrival keeps the row's people", () => {
+  const blend = { start_ts_ms: at("12:30"), end_ts_ms: at("23:59"), lat: AIRBNB.lat, lon: AIRBNB.lon,
+    companions: ["Paige"] };
+  const rows = [openVisit("14:03", ["Paige"])];
+  const first = { start_ts_ms: at("12:30"), end_ts_ms: at("14:03"), lat: AIRBNB.lat, lon: AIRBNB.lon };
+  const second = { start_ts_ms: at("14:03"), end_ts_ms: at("23:59"), lat: AIRBNB.lat, lon: AIRBNB.lon };
+  assert.deepEqual(pieceCompanions(blend, first, rows), []);
+  assert.deepEqual(pieceCompanions(blend, second, rows), ["Paige"]);
+});
