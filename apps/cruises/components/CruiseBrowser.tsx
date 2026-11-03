@@ -234,6 +234,15 @@ function money(n: number): string {
 const MONTHS = MONTH_LABELS;
 
 /** "Dec 7 – 11, 2026", collapsing the month when both ends share it. */
+/** Ports of call; on a back-to-back, how often each is visited ("twice" when every port repeats on every leg). */
+function portsLine(s: Sailing): string {
+  const sep = s.callsOrdered ? " → " : " · ";
+  const v = s.callVisits;
+  if (!s.legs || v.every((n) => n <= 1)) return s.calls.join(sep);
+  if (v.every((n) => n === v[0])) return `${s.calls.join(sep)} (${v[0] === 2 ? "twice" : `${v[0]} times`})`;
+  return s.calls.map((c, i) => (v[i] > 1 ? `${c} ×${v[i]}` : c)).join(sep);
+}
+
 function dateRange(depart: string, ret: string): string {
   const [dy, dm, dd] = depart.split("-").map(Number);
   const [ry, rm, rd] = ret.split("-").map(Number);
@@ -998,7 +1007,9 @@ function SailingCard({ s, starred, onStar }: { s: Row; starred: boolean; onStar:
         )}
 
         <div className="facts">
-          <div className="fact"><CalendarIcon />{dateRange(s.depart, s.ret)} · {s.nights} night{s.nights === 1 ? "" : "s"}</div>
+          <div className="fact"><CalendarIcon />{dateRange(s.depart, s.ret)} · {s.nights} night{s.nights === 1 ? "" : "s"}
+            {s.legs && <span className="legs" title="Shorter sailings of this ship sold as one booking; you stay aboard between them"> ({s.legs.join(" + ")}, back-to-back)</span>}
+          </div>
           {/* The route, not just the departure port: a one-way sailing ends
               somewhere else and that is the single most decision-changing fact
               on the card, so it sits on the same line as where it leaves. */}
@@ -1009,7 +1020,7 @@ function SailingCard({ s, starred, onStar }: { s: Row; starred: boolean; onStar:
           {s.calls.length > 0 && (
             <div className="fact ports" title={s.callsOrdered ? undefined : "This line publishes the ports but not their order"}>
               <RouteIcon />
-              <span>{s.calls.join(s.callsOrdered ? " → " : " · ")}</span>
+              <span>{portsLine(s)}</span>
             </div>
           )}
         </div>

@@ -182,6 +182,15 @@ export type Sailing = {
    * not been confirmed lately says when it was.
    */
   lastSeen: string | null;
+  /**
+   * Night counts of the shorter sailings this one is made of, when it is a
+   * back-to-back: MSC sells Seaside's Mon→Fri 4-night and Fri→Mon 3-night out of
+   * Miami as one 7-night booking, so the same ship shows a 4-night and a 7-night
+   * leaving on the same morning. null for an ordinary sailing.
+   */
+  legs: number[] | null;
+  /** Aligned with `calls`: how many of the legs call at that port (1 when not a back-to-back). */
+  callVisits: number[];
   /** Cruise Critic member rating, 1–5, and how many reviews back it. */
   rating: number | null;
   reviews: number | null;
@@ -376,7 +385,7 @@ export function decodeSailings(ix: SailingIndex): Sailing[] {
   const at = (dict: string[], i: unknown): string | null =>
     typeof i === "number" && i >= 0 ? dict[i] ?? null : null;
 
-  return ix.rows.map((r) => {
+  const out: Sailing[] = ix.rows.map((r) => {
     const depart = String(r[ROW.DEPART]);
     const shipIdx = typeof r[ROW.SHIP] === "number" ? (r[ROW.SHIP] as number) : -1;
     return {
@@ -419,8 +428,44 @@ export function decodeSailings(ix: SailingIndex): Sailing[] {
       reviews: shipIdx >= 0 ? ix.shipRatings[shipIdx]?.[1] ?? null : null,
       lastSeen: (r[ROW.SEEN] as string | null) ?? null,
       book: (r[ROW.BOOK] as string | null) ?? null,
+      legs: null,
+      callVisits: [],
     };
   });
+  for (const s of out) s.callVisits = s.calls.map(() => 1);
+  linkBackToBack(out);
+  return out;
+}
+
+/**
+ * Mark sailings that are two or more shorter sailings of the same ship sold as
+ * one: a chain of sailings that starts on this one's departure day, each leaving
+ * the day the last returned, ending on this one's return day. Found across the
+ * whole corpus, so it holds whatever the page is filtered to.
+ */
+export function linkBackToBack(sailings: Sailing[]): void {
+  const byStart = new Map<string, Sailing[]>();
+  for (const s of sailings) {
+    const k = `${s.line}|${s.ship}|${s.depart}`;
+    const list = byStart.get(k);
+    if (list) list.push(s); else byStart.set(k, [s]);
+  }
+  const chain = (whole: Sailing, from: string, depth: number): Sailing[] | null => {
+    if (depth > 4) return null;
+    for (const leg of byStart.get(`${whole.line}|${whole.ship}|${from}`) ?? []) {
+      if (leg === whole || leg.nights >= whole.nights || leg.ret > whole.ret) continue;
+      if (leg.ret === whole.ret) return depth > 0 ? [leg] : null;
+      const rest = chain(whole, leg.ret, depth + 1);
+      if (rest) return [leg, ...rest];
+    }
+    return null;
+  };
+  for (const s of sailings) {
+    const legs = chain(s, s.depart, 0);
+    if (!legs) continue;
+    s.legs = legs.map((l) => l.nights);
+    s.callVisits = s.calls.map((port) => Math.max(1, legs.filter((l) => l.calls.includes(port)).length));
+  }
 }
 
 /**

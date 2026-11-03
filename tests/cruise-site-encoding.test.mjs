@@ -288,3 +288,24 @@ test("a row that has never been dated says so rather than guessing", () => {
   assert.equal(out.lastSeen, null);
 });
 
+
+// 2026-11-03: MSC Seaside showed a 4-night and a 7-night leaving Miami on
+// Nov 30. The 7-night is the 4-night plus the Dec 4 3-night, sold as one.
+test("a sailing made of two shorter sailings of the same ship is marked back-to-back", () => {
+  const calls = [{ code: "NAS", name: "Nassau" }, { code: "1SC", name: "Ocean Cay MSC Marine Reserve" }];
+  const seaside = (id, depart, ret, nights) => dbRow({
+    sailing_id: id, source: "msc", ship_name: "MSC Seaside", departure_port: "Miami, Florida",
+    disembark_port: "Miami", depart_date: depart, return_date: ret, nights, ports_of_call: calls, ports_ordered: false,
+  });
+  const out = roundTrip([
+    seaside("msc:SE20261130MIAMIA", "2026-11-30", "2026-12-04", 4),
+    seaside("msc:SE20261204MIAMIA", "2026-12-04", "2026-12-07", 3),
+    seaside("msc:SE20261130MIAMI1", "2026-11-30", "2026-12-07", 7),
+    dbRow({ sailing_id: "msc:OTHER", source: "msc", ship_name: "MSC Grandioso", depart_date: "2026-11-30", return_date: "2026-12-07", nights: 7 }),
+  ]);
+  const byId = Object.fromEntries(out.map((s) => [s.id, s]));
+  assert.deepEqual(byId["msc:SE20261130MIAMI1"].legs, [4, 3]);
+  assert.deepEqual(byId["msc:SE20261130MIAMI1"].callVisits, [2, 2]);
+  assert.equal(byId["msc:SE20261130MIAMIA"].legs, null);
+  assert.equal(byId["msc:OTHER"].legs, null);
+});
