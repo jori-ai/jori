@@ -25,6 +25,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { installTools } from "../lib/root.cjs";
 import { resolveGroupBySubject } from "../agent/whatsapp-channel/core.mjs";
+import { linkGate } from "../lib/link-check.mjs";
 const require = createRequire(import.meta.url);
 const { loadEnv } = require("../lib/load-env.js");
 const { localConfig } = require("../lib/instance.cjs");
@@ -152,6 +153,9 @@ async function resolveRecipient(to) {
 async function cmdSend(a) {
   if (!a.to || !a.text) { printUsage(); process.exit(2); }
   emDashGate({ to: a.to, text: a.text });
+  // A dead or moved link to someone else is refused (lib/link-check.mjs).
+  const toOwner = OWNER_WA && String(a.to).replace(/[^\d]/g, "") === OWNER_WA.replace(/[^\d]/g, "");
+  if (!toOwner) await linkGate(a.text, "whatsapp-send");
   const { to: target, groupName } = await resolveRecipient(a.to);
 
   let res;
