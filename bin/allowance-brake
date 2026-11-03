@@ -58,7 +58,8 @@
 //        exit 0 = run · 3 = hold · 4 = run on the cheaper model
 //        (--json carries `model` and `effort` for exit 4)
 //   allowance-brake apply <ref>              act on an answered budget card
-//   allowance-brake release [--dry-run]      relaunch held jobs whose window reset
+//   allowance-brake release [--dry-run]      relaunch held jobs the week has room for again
+//                                            (run hourly by trigger-system-issue-review.sh)
 //   allowance-brake status [--json]          the reading + each job's estimate
 // Test hooks: --events-dir <dir> --state <file> --now <iso>; JORI_LOCAL_DIR for
 // the config. With --state, no card is sent and launchctl is never called.
@@ -264,6 +265,11 @@ function config() {
   } catch { return { threshold: 0.95, usd_per_allowance: DEFAULT_USD_PER_ALLOWANCE, jobs: {} }; }
 }
 
+/** The one test `check` and `release` share: past the threshold, or this run would take the week there. */
+function isOver(r, est, cfg) {
+  return !!(r.hold || (typeof r.projected === "number" && r.projected + est.share >= cfg.threshold));
+}
+
 const importanceOf = (entry) => (entry && IMPORTANCE.has(entry.importance) ? entry.importance : "optional");
 
 function emit(obj, line) { process.stdout.write((flag("json") ? JSON.stringify(obj) : line) + "\n"); }
@@ -350,7 +356,7 @@ function check(job) {
   const rows = ledgerRows();
   const est = estimate(job, cfg, r, rows);
   const label = entry.release_label || null;
-  const over = r.hold || (typeof r.projected === "number" && r.projected + est.share >= cfg.threshold);
+  const over = isOver(r, est, cfg);
   const facts = { job, importance, estimate: est, ...r };
   delete facts.span;
 
@@ -454,10 +460,18 @@ function release() {
   for (const q of st.questions || []) {
     if (q.status === "open" && Date.parse(q.resets_at || "") <= NOW) { q.status = "closed:window reset"; changed = true; }
   }
+  // A held job is relaunched as soon as the week has room for it again: after
+  // the reset, or earlier when the pace has dropped enough. Same test as
+  // `check`, so a relaunched job is not simply held again. The one exception is
+  // the user's own "wait for the reset", honoured until the reset.
+  let rows = null;
   for (const [job, h] of Object.entries(st.held || {})) {
     if (!h || !h.release_label || h.released_at) continue;
-    if (Date.parse(h.resets_at || "") > NOW) continue; // the window it was held in has not reset
-    if (r.hold) continue;
+    const reset = Date.parse(h.resets_at || "") <= NOW;
+    const a = st.answers && st.answers[job];
+    if (!reset && a && a.choice === "delay" && !a.consumed_at && Date.parse(a.resets_at || "") > NOW) continue;
+    rows = rows || ledgerRows();
+    if (isOver(r, estimate(job, cfg, r, rows), cfg)) continue;
     if (flag("dry-run")) { process.stdout.write(`would release ${job}: launchctl kickstart gui/${process.getuid()}/${h.release_label}\n`); continue; }
     try {
       kick(h.release_label);

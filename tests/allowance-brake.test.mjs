@@ -282,3 +282,24 @@ it("prices a job from its runs of the last month, not months-old ones", () => {
   assert.equal(r.json.jobs.dream.estimate.runs, 2);
   assert.equal(r.json.jobs.dream.estimate.usd, 21);
 });
+
+it("relaunches a held job before the reset once the pace leaves room for it, but not one the user chose to hold until the reset", () => {
+  const cfg = { threshold: 0.95, jobs: { "nightly": { importance: "optional", release_label: "ai.test.nightly" }, "chat-build": GOV.jobs["chat-build"] } };
+  const hot = fixture({ points: HOT, config: cfg });
+  assert.equal(run(hot, ["check", "nightly"]).rc, 3);
+  assert.equal(run(hot, ["release", "--dry-run"]).out, "", "still over: nothing released");
+  // The same held record, a week that has cooled down (reset still ahead).
+  const cool = fixture({ points: COOL, config: cfg });
+  fs.copyFileSync(hot.state, cool.state);
+  assert.match(run(cool, ["release", "--dry-run"]).out, /would release nightly: launchctl kickstart gui\/\d+\/ai\.test\.nightly/); // lang-regex-ok: asserts the governor's own output
+
+  // "Wait for the reset" holds even when the week cools.
+  run(hot, ["check", "chat-build"]);
+  const st = JSON.parse(fs.readFileSync(hot.state, "utf8"));
+  const id = st.questions.find((q) => q.job === "chat-build").id;
+  answer(hot, id, OPT_DELAY);
+  run(hot, ["apply", `bud:${id}`]);
+  fs.copyFileSync(hot.state, cool.state);
+  const out = run(cool, ["release", "--dry-run"]).out;
+  assert.ok(!out.includes("chat-build"), out);
+});

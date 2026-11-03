@@ -77,15 +77,13 @@ fi
 
 log() { echo "$(date '+%Y-%m-%d %H:%M:%S') [system-issue-review${MODE:+/$MODE}] $1" >> "$LOGFILE"; }
 
-# The allowance brake's daily release (bin/allowance-brake): a weekly-slot job
-# held while the week was on pace to run out (the improvement planner) is
-# relaunched here once its window has reset. This nightly slot is the one
-# trigger that fires every day, so it carries the release whatever its own gate
-# decides below. Never blocks this job.
-if [ "$MODE" = "nightly" ]; then
-  RELEASED="$("$JORI_INSTALL_TOOLS/bin/allowance-brake" release 2>/dev/null)"
-  [ -n "$RELEASED" ] && log "allowance brake: $RELEASED"
-fi
+# The allowance governor's release (bin/allowance-brake): every job it held
+# while the week was on pace to run out is relaunched (launchctl kickstart of its
+# release_label) as soon as the week has room for it again, after the reset or
+# earlier. Both lanes carry it, so it runs every hour (the critical lane fires
+# hourly), whatever this job's own gate decides below. Never blocks this job.
+RELEASED="$("$JORI_INSTALL_TOOLS/bin/allowance-brake" release 2>/dev/null)"
+[ -n "$RELEASED" ] && log "allowance governor: $RELEASED"
 
 # --- fetch the last 14d of system-channel rows → local batch; print "<new>:<due>:<crit>:<sig>" ---
 # new  = assistant alerts newer than the state cursor (the work signal)
