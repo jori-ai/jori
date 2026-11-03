@@ -603,6 +603,9 @@ class Supervisor {
       // own events land here; dispatcher.* bookkeeping never touches.
       this.turnWatchdog.touch(ev);
       this.eventLog.append({ kind: ev.type, ...ev });
+      // The CLI compacted the conversation on its own: the playbooks this
+      // session was sent may be gone, so the next dispatch of each goes in full.
+      if (ev.type === "system" && ev.subtype === "compact_boundary") this.dispatcher?.forgetSent();
       this.instrumentation.observe(ev);
       // Track approx current context size from per-assistant-call usage, for the
       // context-size guard (compact-before-nuke). The last assistant call in a
@@ -853,6 +856,10 @@ class Supervisor {
       // is fully fail-soft. Toggle off with OPS_DISPATCH_PREAMBLE_DISABLED=1.
       // A staged session-handoff digest rides on the first real dispatch of the
       // fresh session, once (it used to cost a dedicated turn).
+      // A playbook already sent to this session in full goes as a short
+      // pointer to that copy (dispatcher.mjs repeat-playbook dedupe). Off with
+      // OPS_REPEAT_DEDUPE_DISABLED=1.
+      repeatMinChars: process.env.OPS_REPEAT_DEDUPE_DISABLED === "1" ? 0 : 8000,
       preamble: (item) => {
         if (!shouldPreamble(item)) return null;
         const handoff = this._takeHandoffBlock(item);
@@ -885,6 +892,9 @@ class Supervisor {
     // Wire gmail batch dispatch to the new dispatcher.
     this.gmailSource._dispatchFn = (content, source) => this.dispatcher.dispatch(content, source);
 
+    this.dispatcher.on("repeat_pointer", ({ item, of, savedChars }) => {
+      this.eventLog.append({ kind: "dispatcher.repeat_pointer", itemId: item.id, source: item.source, of, savedChars });
+    });
     this.dispatcher.on("enqueued", (item) => {
       this.eventLog.append({ kind: "dispatcher.enqueued", item });
       this._checkQueueAlarm();
