@@ -61,6 +61,12 @@ if [ -e "$Q/$RELEASE" ]; then
   fi
 fi
 
+# Days the allowance governor held wait in held/ (outside the queue directory
+# launchd watches); they go first, and a run that goes ahead hands the rest back.
+HELD="$ROOT/data/daily-summary-fix/held"
+mkdir -p "$HELD"
+M="$(ls -1 "$HELD" 2>/dev/null | grep -E '^[0-9]{4}-[0-9]{2}-[0-9]{2}$' | sort | head -n1)"
+[ -n "$M" ] && mv "$HELD/$M" "$Q/$M"
 M="$(ls -1 "$Q" 2>/dev/null | grep -E '^[0-9]{4}-[0-9]{2}-[0-9]{2}$' | sort | head -n1)"
 if [ -z "$M" ]; then
   # Clear stray files, but not a release marker the sweep dropped meanwhile (launchd
@@ -68,6 +74,25 @@ if [ -z "$M" ]; then
   for x in "$Q"/*; do [ -e "$x" ] && [ "$(basename "$x")" != "$RELEASE" ] && rm -f "$x"; done
   exit 0
 fi
+# The allowance governor (bin/allowance-brake via lib/allowance-gate.sh),
+# decided before the marker is consumed: the fixer is important, so while the
+# week is on pace to run out the user is asked (run now, run cheaper, wait for
+# the reset) and every queued day waits in held/ (left in the queue, launchd
+# would relaunch this runner in a loop that only holds again).
+source "$SCRIPTS/lib/allowance-gate.sh"
+allowance_gate daily-summary-fix "$M"
+if [ "$BRAKE_RC" -eq 3 ]; then
+  for x in "$Q"/*; do b="$(basename "$x")"; [[ "$b" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] && mv "$x" "$HELD/$b"; done
+  log "$M: held by the allowance governor: $BRAKE_REASON"
+  exit 0
+fi
+RUN_ARGS=()
+if [ "$BRAKE_RC" -eq 4 ]; then
+  RUN_ARGS=(--model "$BRAKE_MODEL" ${BRAKE_EFFORT:+--effort "$BRAKE_EFFORT"})
+  log "$M: cheaper model for this fix ($BRAKE_MODEL${BRAKE_EFFORT:+, $BRAKE_EFFORT}): $BRAKE_REASON"
+fi
+export JORI_BRAKE_DECIDED=1
+
 rm -f "$Q/$M"
 DATE="$M"
 log "$DATE: start"
@@ -79,7 +104,7 @@ TASK="Run the DAILY SUMMARY FIX job for $DATE. The state file for this date (dat
 $STATE
 ----- END STATE -----"
 
-"$SCRIPTS/lib/run-ephemeral-opus.sh" daily-summary-fix "$JOB_MD" --task "$TASK" --timeout-min "$TIMEOUT_MIN"
+"$SCRIPTS/lib/run-ephemeral-opus.sh" daily-summary-fix "$JOB_MD" --task "$TASK" --timeout-min "$TIMEOUT_MIN" ${RUN_ARGS[@]+"${RUN_ARGS[@]}"}
 RC=$?
 log "$DATE: runner exit $RC"
 if [ "$RC" -eq 78 ]; then
@@ -87,4 +112,6 @@ if [ "$RC" -eq 78 ]; then
   # successful sign-in rather than looping now; the sweep re-queues it.
   log "$DATE: Max sign-in missing — not run"
 fi
+# Days still held waited behind this one: back into the queue for the next run.
+for x in "$HELD"/*; do [ -e "$x" ] && mv "$x" "$Q/"; done
 exit 0

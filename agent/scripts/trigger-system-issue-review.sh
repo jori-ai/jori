@@ -177,6 +177,9 @@ else
   BRAKE="$("$JORI_INSTALL_TOOLS/bin/allowance-brake" check system-issue-review 2>/dev/null)"
   if [ $? -eq 3 ]; then log "skip: held by the allowance brake: ${BRAKE#hold: }"; exit 0; fi
 fi
+# Decided above (nightly) or exempt (the critical lane is never held): the
+# runner's own allowance check (lib/allowance-gate.sh) must not ask again.
+export JORI_BRAKE_DECIDED=1
 
 # Record the escalated signature so the next hourly run doesn't re-dispatch the
 # same condition. Called only AFTER a confirmed dispatch — a webhook failure

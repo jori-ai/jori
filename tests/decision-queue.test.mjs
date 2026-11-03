@@ -278,3 +278,14 @@ test("a tapped decision answers in code with the job, the time and the option's 
   seed();
   assert.equal((await tap("Keep it a week")).reply, "Okay, we'll leave it as it is, so nothing changes.");
 });
+
+test("reads the allowance governor's budget questions as their own unpaced source", () => {
+  const q = { id: "chat-build-abc", job: "chat-build", status: "open", question: "Run it?", options: ["a", "b"], time_sensitive: true, asked_at: "2026-11-03T12:00:00Z" };
+  const items = dq.loadOpen({ improvement: {}, cost: {}, people: {}, budget: { questions: [q] } });
+  assert.equal(items.length, 1);
+  assert.equal(items[0].ref, "bud:chat-build-abc");
+  assert.equal(items[0].source, "budget");
+  assert.equal(dq.groupOf("budget"), "budget");
+  assert.ok(dq.UNPACED.has("budget"));
+  assert.equal(dq.followUp("bud:chat-build-abc").who, "the allowance governor");
+});

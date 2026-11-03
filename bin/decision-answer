@@ -70,4 +70,15 @@ if (!r.already) {
   try { next = followUp(ref, { tz: userTz() }); } catch { next = null; }
   if (next) next.changes_nothing = changesNothing;
 }
-console.log(JSON.stringify({ recorded: !r.already, already_answered: !!r.already, ref, source: r.source, answer, next }));
+// A budget card has a job waiting on it: hand the answer to the allowance
+// governor now, which relaunches the job the way the user chose (or keeps it
+// waiting for the reset). Its own output is the line the user reads.
+let applied = null;
+if (r.source === "budget" && !r.already) {
+  const { spawnSync } = await import("node:child_process");
+  const { createRequire } = await import("node:module");
+  const brake = createRequire(import.meta.url)("../lib/root.cjs").installTools("bin/allowance-brake");
+  const a = spawnSync(brake, ["apply", ref], { encoding: "utf8", timeout: 30_000 });
+  applied = String(a.stdout || "").trim() || `allowance-brake apply exit ${a.status}`;
+}
+console.log(JSON.stringify({ recorded: !r.already, already_answered: !!r.already, ref, source: r.source, answer, next, ...(applied ? { applied } : {}) }));

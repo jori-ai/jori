@@ -35,7 +35,7 @@ SEND="$JORI_INSTALL_TOOLS/bin/jori-send-curl"
 REPORT=(--agent ops --channel chat --intent chat-build-result --evidence-as-of live)
 TIMEOUT_MIN=120
 
-mkdir -p "$Q/pending" "$Q/running" "$Q/done" "$Q/failed" "$Q/results" "$(dirname "$LOG")"
+mkdir -p "$Q/pending" "$Q/held" "$Q/running" "$Q/done" "$Q/failed" "$Q/results" "$(dirname "$LOG")"
 log() { echo "$(date '+%Y-%m-%d %H:%M:%S') [chat-build] $1" >> "$LOG"; }
 # A few words of the request, so a message names the build the way the user asked for it.
 label() { node -e 'try{const s=String(JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")).spec).replace(/\s+/g," ").trim();process.stdout.write(s.length>70?s.slice(0,70)+"…":s)}catch{process.stdout.write("a request")}' "$1" 2>/dev/null; }
@@ -50,9 +50,34 @@ for f in "$Q/running"/*.json; do
   "$SEND" "${REPORT[@]}" "🛠️ The build you asked for ($(label "$Q/failed/$id.json")) got cut off before it finished — $HOST restarted or the run was killed. Nothing from it landed unless you see it in Improvements. Just say the word and I'll start it again." >> "$LOG" 2>&1 || true
 done
 
-REQ="$(ls -1 "$Q/pending"/*.json 2>/dev/null | sort | head -n1)"
+# A request the allowance governor held (held/) goes first: it is older than
+# anything in pending/, and its release (the user's answer, or the weekly reset)
+# kickstarts this agent without touching pending/.
+REQ="$(ls -1 "$Q/held"/*.json 2>/dev/null | sort | head -n1)"
+[ -n "$REQ" ] || REQ="$(ls -1 "$Q/pending"/*.json 2>/dev/null | sort | head -n1)"
 [ -n "$REQ" ] || exit 0
 ID="$(basename "$REQ" .json)"
+
+# The allowance governor (bin/allowance-brake via lib/allowance-gate.sh),
+# decided HERE, before the claim: a build is important, so while the week is on
+# pace to run out the user is asked on a decision card (run now, run cheaper,
+# wait for the reset) and the request waits in held/. Every pending request
+# moves there too: launchd relaunches this agent while pending/ is non-empty,
+# and each relaunch would only hold again.
+source "$SCRIPTS/lib/allowance-gate.sh"
+allowance_gate chat-build "$ID"
+if [ "$BRAKE_RC" -eq 3 ]; then
+  for f in "$Q/pending"/*.json; do [ -e "$f" ] && mv "$f" "$Q/held/"; done
+  log "$ID: held by the allowance governor: $BRAKE_REASON"
+  exit 0
+fi
+RUN_ARGS=()
+if [ "$BRAKE_RC" -eq 4 ]; then
+  RUN_ARGS=(--model "$BRAKE_MODEL" ${BRAKE_EFFORT:+--effort "$BRAKE_EFFORT"})
+  log "$ID: cheaper model for this build ($BRAKE_MODEL${BRAKE_EFFORT:+, $BRAKE_EFFORT}): $BRAKE_REASON"
+fi
+export JORI_BRAKE_DECIDED=1
+
 mv "$REQ" "$Q/running/$ID.json" || { log "$ID: could not claim request"; exit 1; }
 
 SPEC="$(node -e 'process.stdout.write(String(JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")).spec||""))' "$Q/running/$ID.json" 2>/dev/null)"
@@ -73,7 +98,7 @@ Write your report to $RESULT (Step 6). ultrathink.
 $SPEC
 ----- END REQUEST -----"
 
-"$SCRIPTS/lib/run-ephemeral-opus.sh" chat-build "$JOB_MD" --task "$TASK" --timeout-min "$TIMEOUT_MIN"
+"$SCRIPTS/lib/run-ephemeral-opus.sh" chat-build "$JOB_MD" --task "$TASK" --timeout-min "$TIMEOUT_MIN" ${RUN_ARGS[@]+"${RUN_ARGS[@]}"}
 RC=$?
 log "$ID: runner exit $RC"
 
@@ -90,4 +115,7 @@ else
   mv "$Q/running/$ID.json" "$Q/failed/$ID.json"
   "$SEND" "${REPORT[@]}" "🛠️ The build you asked for ($(label "$Q/failed/$ID.json")) stopped without telling me how it went, so I can't vouch that anything landed — anything that did will be in Improvements. I've kept the details in chat-build.log if you want me to dig in." >> "$LOG" 2>&1 || true
 fi
+# Anything still held waited behind this one: hand it back to pending/ so
+# launchd starts the next run, which asks the governor again for it.
+for f in "$Q/held"/*.json; do [ -e "$f" ] && mv "$f" "$Q/pending/"; done
 exit 0
