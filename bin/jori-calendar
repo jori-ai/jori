@@ -47,6 +47,22 @@
 // the target window back from Google before writing, and refuses when an opaque
 // (busy) event already occupies it, pointing the caller at `update` instead.
 //
+// WHY CREATE ALSO GUARDS A BOOKING REFERENCE (2026-11-03). A branch
+// appointment was confirmed for six days out and triage put it on the calendar.
+// Minutes later the user moved it to that same afternoon and the provider sent
+// a "details have changed" email with the same confirmation number. The
+// triage turn that read it was a fresh session (the tier had rotated), looked
+// for the booking "a day either side" of the NEW date, did not find the Nov 9
+// event, and created a second event. The overlap guard could not help: the old
+// event sat six days away. Whether two events are the same booking is decided
+// by an identifier the provider issued, which is a fact, not a judgment — so
+// `--booking-ref <confirmation number>` makes `create` search the calendar
+// (from yesterday through the next ~18 months) for that reference, in an event
+// this wrapper stamped (private property jori_booking_ref) or anywhere in an
+// event's title, notes or location (events made by hand, or before the stamp),
+// and refuse, naming the event to `update` instead. Fails open on a read error,
+// like the overlap guard.
+//
 // WHAT THIS DOES NOT CLOSE. Bash is open to every agent, so a determined turn
 // can call `gog calendar` directly. Three further layers cover that: the MCP
 // write tools are removed from every agent's grant (agent/config/
@@ -64,6 +80,9 @@
 //     --attendee-authorized "invite Sam to dinner Friday"
 //   …and, only when a create's window genuinely should overlap an existing event:
 //     --overlap-ok "<why this really is a second, separate event>"
+//   …and for any booking with a confirmation number (create or update):
+//     --booking-ref <confirmation number>   create refuses if an event already carries it; stamps it
+//     --booking-dup-ok "<why>"               only when one booking really needs two separate events
 //   …and on update of an event the user made (see below):
 //     --from-confirmation <gmail messageId>   the booking's confirmation email licenses changing time/name/details
 //     --jori-event <job>                   this id came from <job>'s own earlier create
@@ -188,6 +207,17 @@ const dryRun = flag("--dry-run", false);
 const overlapOk = flag("--overlap-ok") || "";
 const fromConfirmation = flag("--from-confirmation") || "";
 const joriEventClaim = flag("--jori-event") || "";
+const bookingRefRaw = flag("--booking-ref") || "";
+const bookingDupOk = flag("--booking-dup-ok") || "";
+
+// A provider's confirmation number, as printed ("#40017733", "ABC-123").
+// lang-regex-ok: the shape of a machine identifier, never anything a person wrote.
+const BOOKING_REF_RE = /^[A-Za-z0-9][A-Za-z0-9-]{3,63}$/;
+const bookingRef = bookingRefRaw.trim().replace(/^#/, "");
+if (bookingRefRaw && !BOOKING_REF_RE.test(bookingRef)) {
+  die([`jori-calendar: --booking-ref takes the provider's confirmation number (letters, digits, dashes; 4+ characters), got "${bookingRefRaw}".`]);
+}
+if (bookingRef && cmd === "delete") die(["jori-calendar delete: --booking-ref only applies to create and update."]);
 
 // ── Positional sanity, before anything is logged ──────────────────────────
 // `jori-calendar update --help` used to shift "--help" in as the eventId and
@@ -271,6 +301,56 @@ if (attendees.length && authorization.trim().length < MIN_AUTHORIZATION_CHARS) {
     "",
     "See agent/CLAUDE.md § Calendar Invitations.",
   ], 4);
+}
+
+// ── The booking-reference guard (create only) ───────────────────────────────
+// See the booking note in the header. Runs before the overlap guard so a
+// rescheduled booking gets the message that names the real fix (move the
+// existing event), not a generic slot clash.
+function eventCarriesRef(e, ref) {
+  if (!e || e.status === "cancelled") return false;
+  const priv = (e.extendedProperties && e.extendedProperties.private) || {};
+  if (priv.jori_booking_ref === ref) return true;
+  // Google's free-text --query is fuzzy; keep only events that hold the
+  // identifier itself, bounded so 40017733 does not match 140017733.
+  const hay = [e.summary, e.description, e.location].filter(Boolean).join("\n");
+  const esc = ref.replace(/[-]/g, "\\-");
+  // lang-regex-ok: locating a machine identifier inside event text.
+  return new RegExp(`(^|[^A-Za-z0-9])${esc}([^A-Za-z0-9]|$)`, "i").test(hay);
+}
+if (cmd === "create" && bookingRef) {
+  const now = Date.now();
+  const winFrom = new Date(now - 86400e3).toISOString();
+  const winTo = new Date(now + 550 * 86400e3).toISOString();
+  const base = ["calendar", "events", calendar, ...ACCOUNT_ARGS, "--no-input", "-j", "--from", winFrom, "--to", winTo, "--max", "50"];
+  const found = new Map();
+  for (const extra of [["--private-prop-filter", `jori_booking_ref=${bookingRef}`], ["--query", bookingRef]]) {
+    const probe = spawnSync(GOG, [...base, ...extra], { encoding: "utf8" });
+    if (probe.status !== 0 || !probe.stdout) continue; // fail open, like the overlap guard
+    let items = [];
+    try { items = JSON.parse(probe.stdout).items || []; } catch { items = []; }
+    for (const e of items) if (e && e.id && eventCarriesRef(e, bookingRef)) found.set(e.id, e);
+  }
+  if (found.size && bookingDupOk.trim().length < MIN_OVERLAP_OK_CHARS) {
+    die([
+      `REFUSED: booking ${bookingRef} is already on "${calendar}":`,
+      "",
+      ...[...found.values()].map((e) => {
+        const start = e.start?.dateTime || e.start?.date || "?";
+        const end = e.end?.dateTime || e.end?.date || "?";
+        return `  · "${e.summary || "(untitled)"}"  ${start} → ${end}  (id: ${e.id})`;
+      }),
+      "",
+      "Same confirmation number = same booking. If the email you are handling",
+      "changes it (new date, time, place), MOVE that event — do not add a second:",
+      `  jori-calendar update <eventId> --calendar ${calendar} --from-confirmation <gmail messageId> --booking-ref ${bookingRef} --from <new start> --to <new end> [--location/--description …]`,
+      "If it is a reminder or a repeat of the same confirmation, the event is already right.",
+      "",
+      "Only if this one booking genuinely needs two separate events (e.g. two",
+      "visits under one reference), say why:",
+      '  --booking-dup-ok "<why this booking needs a second event>"',
+    ], 9);
+  }
 }
 
 // ── The overlap guard (create only) ─────────────────────────────────────────
@@ -385,7 +465,9 @@ if (cmd === "update") {
     const readFailed = !ev || !ev.id;
     const organizerSelf = ev && ev.organizer && (ev.organizer.self || SELF.has(String(ev.organizer.email || "").toLowerCase()));
     const priv = (ev && ev.extendedProperties && ev.extendedProperties.private) || {};
-    const joriMade = priv.gandalf_created === "1" || Object.keys(priv).length > 0;
+    // jori_booking_ref is stamped on the user's own events too (update
+    // --booking-ref), so it never marks an event as Jori's.
+    const joriMade = priv.gandalf_created === "1" || Object.keys(priv).some((k) => k !== "jori_booking_ref");
     ownerEvent = readFailed ? null : Boolean(organizerSelf && !joriMade);
     if (readFailed || ownerEvent) {
       const refusals = [];
@@ -434,6 +516,8 @@ gogArgs.push("--send-updates", sendUpdates || (attendees.length ? "all" : "none"
 // Stamp every event Jori creates, so the owner-event rule above can tell
 // Jori's events from the ones the user made.
 if (cmd === "create") gogArgs.push("--private-prop", "gandalf_created=1");
+// The booking's confirmation number, so the guard above finds it by its stamp.
+if (bookingRef) gogArgs.push("--private-prop", `jori_booking_ref=${bookingRef}`);
 gogArgs.push(...argv);
 if (dryRun) gogArgs.push("--dry-run");
 
@@ -465,6 +549,8 @@ try {
     from_confirmation: fromConfirmation || null,
     owner_event: ownerEvent,
     jori_event_claim: joriEventClaim || null,
+    booking_ref: bookingRef || null,
+    booking_dup_override: bookingDupOk || null,
     dry_run: Boolean(dryRun),
   }) + "\n");
 } catch (e) {
