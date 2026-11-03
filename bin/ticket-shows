@@ -9,20 +9,43 @@
 //   ticket-shows retire "<title>" --reason "<why>"     e.g. --reason "won + attended"
 //   ticket-shows unretire "<title>"
 //
+//   ticket-shows booked "<title>" --kind purchase|lottery_purchase|attended|won
+//                [--date <performance YYYY-MM-DD>] [--message <Gmail id>] [--source "<who>"]
+//   ticket-shows tickets [--json]          the ticket ledger
+//   ticket-shows scan [--dry-run] [--days N] [--max-calls N] [--query "<Gmail query>"]
+//
 // Titles resolve the same way the scripts match platform listings (case,
 // punctuation, a leading "The", whole-word prefix), so "outsiders" finds "The
 // Outsiders". An ambiguous name is refused rather than guessed. Retiring also
 // drops the show's entry from the per-show pauses file — a permanent
-// retirement supersedes a temporary pause (email triage retires a show once
-// the user has seen it).
+// retirement supersedes a temporary pause.
+//
+// A show the user bought tickets for, or has seen, leaves the list by itself:
+// `booked` records one piece of evidence (an email-triage turn that read a
+// ticket confirmation), `scan` reads the configured senders' recent mail itself
+// (one tool-less model call per batch of emails, on Max, so it must run in the
+// GUI session — an installation starts it from its Gmail intake when mail from
+// one of `confirmations.senders` arrives, never from cron; one at a time), and
+// code decides what each record does — bought (lottery tickets paid for included) or
+// attended retires the show at once, a win alone changes nothing
+// (lib/ticket-lottery.mjs § Tickets).
 
-import { lotteryConfig, readJson, writeJson, localDate, sameTitle } from "../lib/ticket-lottery.mjs";
+import fs from "node:fs";
+import path from "node:path";
+import { createRequire } from "node:module";
+import {
+  lotteryConfig, readJson, writeJson, localDate, sameTitle, TICKET_KINDS, openStore, recordTicket,
+  performanceDate, SCAN_SYSTEM, scanSchema, scanPrompt, validateScan, pruneSeen, clipText,
+} from "../lib/ticket-lottery.mjs";
 
+const require = createRequire(import.meta.url);
 const CFG = lotteryConfig();
 const SHOWS_FILE = CFG.shows_file;
 const [cmd, title, ...rest] = process.argv.slice(2);
 const opt = (n) => { const i = rest.indexOf(n); return i >= 0 ? rest[i + 1] : null; };
 const die = (m, code = 1) => { process.stderr.write(`ticket-shows: ${m}\n`); process.exit(code); };
+const today = localDate(CFG.tz);
+const log = (...a) => console.log(`[${new Date().toISOString()}]`, ...a);
 
 const j = readJson(SHOWS_FILE, null) || (cmd === "add" ? {} : cmd === "list" ? {} : die(`no curated list at ${SHOWS_FILE}`));
 j.shows ||= []; j.retired ||= [];
@@ -32,6 +55,129 @@ function find(list, t) {
   if (hits.length > 1) die(`"${t}" matches several: ${hits.map((h) => h.title).join(", ")} — be more specific`, 2);
   return hits[0] || null;
 }
+
+// ── scan: read the ticket senders' mail, record what it shows ──────────────
+
+const BATCH = 12;
+
+// One scan at a time. Ticket mail tends to arrive in bursts (an entry run sends
+// several emails within minutes) and each can start a scan, so a scan that finds
+// another one running leaves a note and exits; the running one goes round once
+// more when it finishes, which reads whatever arrived meanwhile.
+const LOCK = `${CFG.files.tickets}.lock`;
+const AGAIN = `${LOCK}.again`;
+const LOCK_MAX_MS = 45 * 60_000; // longer than any scan runs; an older lock is a dead one whose pid was reused
+const alive = (pid) => { try { process.kill(pid, 0); return true; } catch { return false; } };
+function takeLock() {
+  fs.mkdirSync(path.dirname(LOCK), { recursive: true });
+  for (let i = 0; i < 3; i++) {
+    try { fs.writeFileSync(LOCK, String(process.pid), { flag: "wx" }); return true; }
+    catch {
+      let pid = 0, age = 0;
+      try { pid = Number(String(fs.readFileSync(LOCK, "utf8")).trim()) || 0; age = Date.now() - fs.statSync(LOCK).mtimeMs; }
+      catch { continue; } // the holder finished between the two calls: try again
+      if (!pid && age < 5000) break; // just created, its pid not written yet
+      if (pid && pid !== process.pid && alive(pid) && age < LOCK_MAX_MS) break;
+      fs.rmSync(LOCK, { force: true }); // a scan that died without cleaning up
+    }
+  }
+  fs.writeFileSync(AGAIN, String(process.pid));
+  return false;
+}
+
+async function scanOnce(args) {
+  if (args.includes("--dry-run")) return scan(args);
+  if (!takeLock()) { log("a scan is already running — it will read this mail when it goes round again"); return 0; }
+  try {
+    let code = await scan(args);
+    if (fs.existsSync(AGAIN)) { fs.rmSync(AGAIN, { force: true }); log("more ticket mail arrived during the scan — once more"); code = await scan(args); }
+    return code;
+  } finally { fs.rmSync(LOCK, { force: true }); }
+}
+
+async function scan(args) {
+  const flagVal = (n) => { const i = args.indexOf(n); return i >= 0 ? args[i + 1] : null; };
+  const dry = args.includes("--dry-run");
+  const C = CFG.confirmations || {};
+  const senders = (Array.isArray(C.senders) ? C.senders : []).filter(Boolean);
+  const where = flagVal("--query") || C.query || (senders.length ? `from:(${senders.join(" OR ")})` : "");
+  if (!where) { log("no ticket senders configured (ticket-lottery `confirmations`) — scan off"); return 0; }
+  const days = Number(flagVal("--days")) || Number(C.lookback_days) || 21;
+  const maxCalls = Number(flagVal("--max-calls")) || 4;
+
+  // The model calls below can take minutes, so the answers are applied at the end
+  // to the files as they are THEN (a retire or a booked from chat or triage in the
+  // meantime is kept, not overwritten).
+  const store = openStore(CFG);
+  const titles = (store.list?.shows || []).map((s) => s.title);
+  const answers = [], seen = {}, retries = {};
+  const finish = () => {
+    const st = dry ? store : openStore(CFG);
+    for (const it of answers) {
+      const r = recordTicket(st, { show: it.show, kind: it.kind, date: it.date, message_id: it.id, source: "mail scan", evidence: it.evidence }, today);
+      log(`${it.kind} · ${it.show}${it.date ? ` · ${it.date}` : ""} (${it.id}): ${r.result} — ${r.detail}`);
+    }
+    for (const [id, v] of Object.entries(seen)) { st.ledger.seen[id] = v; delete st.ledger.retries[id]; }
+    for (const [id, n] of Object.entries(retries)) {
+      const tries = (Number(st.ledger.retries[id]) || 0) + n;
+      if (tries >= 3) { st.ledger.seen[id] = { at: today, kind: "unverified" }; delete st.ledger.retries[id]; }
+      else st.ledger.retries[id] = tries;
+    }
+    st.ledger.last_scan = new Date().toISOString();
+    pruneSeen(st.ledger, today);
+    st.dirty.add("ledger");
+    if (dry) log("dry run — nothing written"); else st.save();
+  };
+  if (!titles.length) { log("no shows on the curated list — nothing to scan for"); finish(); return 0; }
+
+  const gmail = await import("../lib/gmail-parsed.mjs");
+  const q = `(${where}) newer_than:${days}d`;
+  let ids;
+  try { ids = await gmail.search(q, 200); }
+  catch (e) { log(`gmail search failed: ${e.message}`); return 1; }
+  const fresh = ids.filter((id) => !store.ledger.seen[id]).reverse(); // oldest first
+  log(`${ids.length} email(s) from the ticket senders in ${days} days, ${fresh.length} not read yet`);
+
+  const mails = [];
+  for (const id of fresh) {
+    try {
+      const m = await gmail.getMessage(id);
+      mails.push({ id, from: m.from, date: m.date, subject: m.subject, text: clipText(m.text) });
+    } catch (e) { log(`could not read ${id}: ${e.message}`); }
+  }
+
+  const { judge } = require("../lib/max-judge.js");
+  const { MODELS } = require("../lib/models.cjs");
+  const cost = (result) => { try { require("../lib/fork-cost-ledger.cjs").recordForkCost({ job: "ticket-shows-scan", result, model: MODELS.sonnet }); } catch { /* never fails the scan */ } };
+  let calls = 0, failed = false, judged = 0;
+  for (let i = 0; i < mails.length; i += BATCH) {
+    if (calls >= maxCalls) { log(`call budget spent — ${mails.length - i} email(s) left for the next run`); break; }
+    const batch = mails.slice(i, i + BATCH);
+    calls++;
+    let ans;
+    try {
+      ans = await judge({ model: MODELS.sonnet, appendSystem: SCAN_SYSTEM, prompt: scanPrompt(batch, titles, today), schema: scanSchema(titles), effort: "low", timeoutMs: 240_000, onResult: cost });
+    } catch (e) {
+      log(`model call failed: ${e.message}`);
+      failed = true;
+      if (e.fatal) break;
+      continue;
+    }
+    const { ok, bad } = validateScan(ans, batch, titles, today);
+    judged += ok.length;
+    for (const it of ok) {
+      seen[it.id] = { at: today, kind: it.kind };
+      if (it.kind !== "none") answers.push(it);
+    }
+    // An answer that names a show the email does not, or quotes words it does not
+    // contain, changes nothing. The email is read again next run, three times at most.
+    for (const id of bad) { retries[id] = 1; log(`unverified answer for ${id} — nothing changed`); }
+  }
+  finish();
+  return failed && !judged ? 1 : 0; // every model call failed: say so to cron-run
+}
+
+// ── commands ───────────────────────────────────────────────────────────────
 
 switch (cmd) {
   case "list": {
@@ -61,7 +207,7 @@ switch (cmd) {
       die(`"${title}" is not on the active list`, 3);
     }
     j.shows = j.shows.filter((e) => e !== s);
-    j.retired.push({ title: s.title, reason, date: localDate(CFG.tz) });
+    j.retired.push({ title: s.title, reason, date: today });
     writeJson(SHOWS_FILE, j);
     const pf = CFG.files.pauses;
     const p = readJson(pf, null);
@@ -81,6 +227,36 @@ switch (cmd) {
     console.log(`back on the list: ${s.title}`);
     break;
   }
+  case "booked": {
+    const kind = String(opt("--kind") || "").split("-").join("_");
+    const date = opt("--date");
+    if (!title || !TICKET_KINDS.includes(kind) || kind === "none") {
+      die("usage: ticket-shows booked \"<title>\" --kind purchase|lottery_purchase|attended|won [--date <YYYY-MM-DD>] [--message <Gmail id>] [--source \"<who>\"]", 2);
+    }
+    if (date && !performanceDate(date, today)) die(`--date ${date} is not a YYYY-MM-DD within a year of today`, 2);
+    const s = find(j.shows, title) || find(j.retired, title);
+    if (!s) die(`"${title}" is not on the curated list`, 3);
+    const store = openStore(CFG);
+    const r = recordTicket(store, { show: s.title, kind, date: date || null, message_id: opt("--message"), source: opt("--source") || "email triage" }, today);
+    store.save();
+    const word = { retired: "retired", noted: "noted", "already-retired": "already retired", duplicate: "already recorded" }[r.result] || r.result;
+    console.log(`${word}: ${r.title} — ${r.detail}`);
+    break;
+  }
+  case "tickets": {
+    const L = openStore(CFG).ledger;
+    if (rest.includes("--json") || title === "--json") { console.log(JSON.stringify(L, null, 2)); break; }
+    if (!L.records.length) console.log("no ticket records yet");
+    for (const r of L.records) {
+      console.log(`  • ${r.recorded} ${r.show} — ${r.kind}${r.date ? ` for ${r.date}` : ""} → ${r.result}${r.source ? ` (${r.source})` : ""}`);
+    }
+    console.log(`last scan: ${L.last_scan || "never"}`);
+    break;
+  }
+  case "scan": {
+    process.exitCode = await scanOnce(process.argv.slice(3));
+    break;
+  }
   default:
-    die("usage: ticket-shows list|add|retire|unretire …", 2);
+    die("usage: ticket-shows list|add|retire|unretire|booked|tickets|scan …", 2);
 }
