@@ -11,7 +11,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { toSailing, balconyFare, portsOfCall, lineKeyFor } from "../lib/cruise/cruisefeed.mjs";
+import { toSailing, balconyFare, portsOfCall, lineKeyFor, sailingKey, foldIntoDirect } from "../lib/cruise/cruisefeed.mjs";
 
 const record = (over = {}) => ({
   id: "rec_1",
@@ -176,4 +176,30 @@ test("malformed or inverted windows are dropped, not guessed at", () => {
     { start: "2027-05-01", end: "2027-05-10" },
   ]);
   assert.deepEqual(merged, [{ start: "2027-05-01", end: "2027-05-10" }]);
+});
+
+
+// 2026-11-03: MSC Seaside 2026-11-30 showed twice on the site — our scraped
+// row at $573 and a cf: row at "$709" that was really EUR from msccruises.ie.
+test("a CruiseFeed record we already scrape folds into the scraped row, not a second row", () => {
+  const cf = toSailing(record({ sailing_id: "sail_twin" }));
+  const other = toSailing(record({ sailing_id: "sail_new", departure_date: "2027-04-01" }));
+  const direct = new Map([[sailingKey({ source: "royal", ship_name: "harmony of the seas ", depart_date: "2027-03-14", nights: 7 }), "royal:HM20270314"]]);
+  const { rows, prices, foreign } = foldIntoDirect([cf, other], direct);
+  assert.deepEqual(rows.map((r) => r.sailing_id), ["cf:sail_new"]);
+  assert.deepEqual(prices, [{ sailing_id: "royal:HM20270314", lowest_balcony_per_person_usd: 1400 }]);
+  assert.equal(foreign, 0);
+});
+
+test("same ship and date but a different length is a different cruise", () => {
+  const cf = toSailing(record({ nights: 4, return_date: "2027-03-18" }));
+  const direct = new Map([[sailingKey({ source: "royal", ship_name: "Harmony of the Seas", depart_date: "2027-03-14", nights: 7 }), "royal:X"]]);
+  assert.equal(foldIntoDirect([cf], direct).rows.length, 1);
+});
+
+test("a non-USD CruiseFeed fare is never written as dollars", () => {
+  const eur = toSailing(record({ cruise_line: "MSC Cruises", price_currency: "EUR" }));
+  const { rows, prices, foreign } = foldIntoDirect([eur], new Map());
+  assert.equal(rows.length + prices.length, 0);
+  assert.equal(foreign, 1);
 });

@@ -326,10 +326,10 @@ async function main() {
 
   // PRIMARY SOURCE. CruiseFeed covers 61 lines under one schema where our own
   // extractors cover seven under seven, so from 2026-09-01 it leads and the
-  // per-line scrapes verify and complement it. It is additive
-  // here rather than exclusive: its rows carry `cf:` ids and
-  // `data_source=cruisefeed`, ours keep theirs, and nothing is thrown away
-  // until the two have been compared on real data.
+  // per-line scrapes verify and complement it. A sailing we scrape keeps ONE
+  // row (ours) and CruiseFeed's price lands in its cf_* series; only sailings
+  // we do not scrape get `cf:` rows (`data_source=cruisefeed`). Until
+  // 2026-11-03 both were written and every twin showed on the site twice.
   //
   // No key configured is not an error — the run simply proceeds on the
   // per-line scrapes, which is exactly what it did before.
@@ -338,6 +338,7 @@ async function main() {
   // run weekly and carry the price watch; CruiseFeed refreshes the wider
   // corpus once a month. `--cruisefeed` forces it regardless.
   const cfMonth = new Date().toISOString().slice(0, 7);
+  let cfTwinPrices = [];
   const cfDue = args.forceCruisefeed || state.cruisefeed_last_month !== cfMonth;
   if (!args.noCruisefeed && !cfDue) {
     console.error(`[cruisefeed] skipped — already pulled in ${cfMonth} (monthly cadence; --cruisefeed to force)`);
@@ -366,7 +367,31 @@ async function main() {
       if (cf.skipped) {
         console.error(`[cruisefeed] skipped — ${cf.skipped}`);
       } else {
-        allSailings.push(...cf.sailings);
+        // Fold records we already scrape into their twin's cf_* series rather
+        // than writing a second row for the same cruise — see foldIntoDirect.
+        // Twins come from this run's scrapes AND the table, because a line's
+        // result set churns and this week's scrape can miss a sailing it has.
+        const directIds = new Map();
+        const addDirect = (s) => {
+          if (!s?.sailing_id || String(s.sailing_id).startsWith("cf:")) return;
+          if (s.data_source && s.data_source !== "direct") return;
+          const k = cruisefeed.sailingKey(s);
+          if (k && !directIds.has(k)) directIds.set(k, s.sailing_id);
+        };
+        for (const s of allSailings) addDirect(s);
+        try {
+          for (const r of (await loadFutureSailingsForRegate(
+            ["sailing_id", "source", "data_source", "ship_name", "depart_date", "nights"])) || []) addDirect(r);
+        } catch (err) {
+          console.error(`[cruisefeed] could not read scraped rows for twin matching: ${err?.message || err}`);
+        }
+        const fold = cruisefeed.foldIntoDirect(cf.sailings, directIds);
+        allSailings.push(...fold.rows);
+        cfTwinPrices = fold.prices;
+        console.error(
+          `[cruisefeed] ${fold.rows.length} new rows, ${fold.prices.length} folded into scraped twins, ` +
+            `${fold.foreign} non-USD dropped`,
+        );
         const a = cf.allowance;
         console.error(
           `[cruisefeed] ${cf.sailings.length} sailings from ${cf.pages} pages ` +
@@ -412,6 +437,16 @@ async function main() {
   } catch (err) {
     dbResult = { error: String(err?.message || err) };
     console.error(`[db] FAILED: ${dbResult.error}`);
+  }
+  // CruiseFeed's price for sailings we scrape goes into their cf_* series —
+  // after the upsert, so a twin first seen this run already has its row.
+  if (cfTwinPrices.length && !args.dryRun && !dbResult?.skipped) {
+    try {
+      const moved = await recordCruisefeedPrices(cfTwinPrices);
+      console.error(`[cruisefeed] recorded ${cfTwinPrices.length} twin prices (${moved.size} moved)`);
+    } catch (err) {
+      console.error(`[cruisefeed] twin price write FAILED: ${err?.message || err}`);
+    }
   }
   // The upsert only re-flags what this run saw; lines that failed, CruiseFeed's
   // off-months and unscraped ports would otherwise keep an old plan's flags.

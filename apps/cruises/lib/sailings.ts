@@ -98,6 +98,14 @@ export async function getSailingIndex(): Promise<SailingIndex> {
 
   // Only inventory the lines are still returning — see STALE_HOURS.
 
+  // One cruise, one card. A CruiseFeed row (`cf:` id) whose sailing we also
+  // scrape is the same cruise twice — the writer stopped producing these on
+  // 2026-11-03 (foldIntoDirect), but a twin can still arise when a scrape
+  // misses a sailing the month CruiseFeed is pulled and finds it again later.
+  // Our scraped row wins: it is the operator's own USD fare.
+  const rows: Record<string, unknown>[] = [];
+  const scraped = new Set<string>();
+
   // PostgREST hard-caps a response at 1000 rows, so page until short.
   for (let offset = 0; offset < MAX_ROWS; offset += SUPABASE_PAGE) {
     const { data, error } = await supabase
@@ -105,6 +113,9 @@ export async function getSailingIndex(): Promise<SailingIndex> {
       .select(SAILING_COLUMNS.join(","))
       .gte("depart_date", today)
       .not("lowest_balcony_per_person_usd", "is", null)
+      // Every card prints "$". CruiseFeed sources MSC/AIDA from European sites,
+      // and a EUR fare shown as dollars is simply a wrong price.
+      .eq("currency", "USD")
       .order("depart_date", { ascending: true })
       .order("sailing_id", { ascending: true })
       .range(offset, offset + SUPABASE_PAGE - 1);
@@ -113,16 +124,40 @@ export async function getSailingIndex(): Promise<SailingIndex> {
     // supabase-js types a string-literal select as GenericStringError[]; the
     // runtime value is rows, so go through unknown rather than fight it.
     const page = (data ?? []) as unknown as Record<string, unknown>[];
-    for (const r of page) enc.add(r);
+    for (const r of page) {
+      rows.push(r);
+      if (!String(r.sailing_id).startsWith("cf:")) {
+        const k = twinKey(r);
+        if (k) scraped.add(k);
+      }
+    }
 
     if (page.length < SUPABASE_PAGE) break;
-    if (enc.rows.length >= MAX_ROWS) {
+    if (rows.length >= MAX_ROWS) {
       truncated = true;
       break;
     }
   }
 
+  for (const r of rows) {
+    if (String(r.sailing_id).startsWith("cf:")) {
+      const k = twinKey(r);
+      if (k && scraped.has(k)) continue;
+    }
+    enc.add(r);
+  }
+
   return enc.finish(truncated);
+}
+
+/** Line + ship + departure date + nights: the same cruise whichever source wrote it.
+ *  Mirrors sailingKey in lib/cruise/cruisefeed.mjs. */
+function twinKey(r: Record<string, unknown>): string | null {
+  const ship = String(r.ship_name ?? "").trim().toLowerCase();
+  const date = String(r.depart_date ?? "").slice(0, 10);
+  const nights = Number(r.nights);
+  if (!r.source || !ship || !date || !Number.isFinite(nights)) return null;
+  return `${r.source}|${ship}|${date}|${nights}`;
 }
 
 
