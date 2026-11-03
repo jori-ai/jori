@@ -1,10 +1,12 @@
-CHAT BUILD — build something the user asked for in chat, on Opus, and land it through the self-improvement pipeline.
+CHAT BUILD — build something the user asked for in chat, on the tier its size calls for, and land it through the self-improvement pipeline.
 
 ## Purpose
 
 When the user asks Jori in chat to build new functionality or change how Jori behaves ("make the hum skip weekends", "add a CLI that lists my open leases"), the chat agent does **not** write the code. It hands the request to `bin/build-request` and ends its turn. This job is the part that builds it.
 
-**Why it exists.** Builds requested through Jori in chat must run on the strongest model tier. They didn't: the chat agent wrote the code itself on its own model, or POSTed it to the ops supervisor (also Sonnet). Now every chat-requested build runs here, as an ephemeral `claude -p --model $JORI_MODEL_OPUS --effort xhigh` (`claude-opus-5-5`, pinned in `agent/config/models.env`), the same runtime as the rest of the improvement family.
+**Size and model.** The chat agent sizes each request (`build-request --size`): a **large** build (the default) runs on `$JORI_MODEL_OPUS` at xhigh; a **small** one (a contained change to existing behaviour: a schedule, threshold, wording, config value, one- or two-file fix) on `$JORI_MODEL_SONNET` at high. The size is in your opening message. While the weekly allowance is running low, the allowance governor (`bin/allowance-brake`) may also have asked the user and moved this run to a cheaper model. A small build that turns out to need more than its size (a new capability, a cross-component change) builds nothing and says so in the report, so it can be re-queued as large.
+
+**Why it exists.** Builds requested through Jori in chat must run on the strongest model tier the change needs. They didn't: the chat agent wrote the code itself on its own model, or POSTed it to the ops supervisor (also Sonnet). Now every chat-requested build runs here, as an ephemeral `claude -p --model $JORI_MODEL_OPUS --effort xhigh` (`claude-opus-5-5`, pinned in `agent/config/models.env`), the same runtime as the rest of the improvement family.
 
 **Runtime.** launchd agent `ai.claude.chat-build` watches `data/build-queue/pending/` (`QueueDirectories`). Its trigger is `agent/scripts/trigger-chat-build.sh`, which takes the oldest request, runs this playbook through `lib/run-ephemeral-opus.sh` with a **120-minute cap**, and posts your report (Step 6) to the chat channel. Builds run one at a time. The request text arrives in the opening message between `----- REQUEST <id> -----` markers.
 
@@ -48,7 +50,7 @@ A request that opens with `REBUILD OF AN APPROVED CARD — approval <id>` did no
 
 ## Step 1 — Understand
 
-Read `system/architecture.md` first, then the code the request touches. Use `recall` / `wiki_search` if the request leans on something the user said before ("like the cruise one"). Check whether it already exists: grep the tree and `git log --oneline --since="30 days ago" --grep=<keyword>`. **If it already exists, the build is the report**: tell him where it is and how to use it.
+Find the parts of `system/architecture.md` the request touches and read only those: `grep -n '^#\|<keyword>' system/architecture.md`, then `Read` with `offset`/`limit`. Do **not** read it whole: it is ~170 KB (~42k tokens), and everything you read is re-sent on every later turn of the build, so a whole read costs millions of tokens over a 100-turn run. Then read the code the request touches. Use `recall` / `wiki_search` if the request leans on something the user said before ("like the cruise one"). Check whether it already exists: grep the tree and `git log --oneline --since="30 days ago" --grep=<keyword>`. **If it already exists, the build is the report**: tell him where it is and how to use it.
 
 ## Step 2 — Snapshot
 

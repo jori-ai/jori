@@ -83,6 +83,7 @@ const RESET_DROP = 0.02;        // utilization is reported to 2dp; only a real d
 const KEEP_HELD_DAYS = 9;       // a held record no trigger consumed is dropped after this
 const HELD_NOTE_DAYS = 2;       // a released hold older than this is not reported to the run
 const EST_RUNS = 10;            // the estimate is the median of this many recent runs
+const EST_WINDOW_DAYS = 30;     // ... taken from the last month when the job ran in it
 const MIN_RATE_DELTA = 0.03;    // a span that moved the week less than this cannot price an allowance
 const DEFAULT_USD_PER_ALLOWANCE = 1400;
 const IMPORTANCE = new Set(["essential", "important", "optional"]);
@@ -219,7 +220,11 @@ function estimate(job, cfg, r, rows) {
   const entry = cfg.jobs[job] || {};
   const fixed = Number(entry.cost_estimate);
   if (fixed > 0 && fixed < 1) return { share: fixed, usd: null, runs: 0, basis: "config" };
-  const mine = rows.filter((x) => x.job === job).sort((a, b) => b.t - a.t).slice(0, EST_RUNS);
+  // Recent runs only when there are any: a job's cost moves with its playbook,
+  // and months-old runs drag the median away from what a run costs today.
+  const all = rows.filter((x) => x.job === job).sort((a, b) => b.t - a.t);
+  const recent = all.filter((x) => NOW - x.t <= EST_WINDOW_DAYS * 864e5);
+  const mine = (recent.length ? recent : all).slice(0, EST_RUNS);
   if (!mine.length) return { share: 0, usd: null, runs: 0, basis: "no history" };
   const usd = median(mine.map((x) => x.usd));
   const per = usdPerAllowance(cfg, r, rows);

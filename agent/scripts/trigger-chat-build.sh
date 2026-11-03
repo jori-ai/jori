@@ -71,7 +71,17 @@ if [ "$BRAKE_RC" -eq 3 ]; then
   log "$ID: held by the allowance governor: $BRAKE_REASON"
   exit 0
 fi
+# Size, the chat agent's judgment when it queued the request (bin/build-request
+# --size): a small, contained change builds on Sonnet at high effort, anything
+# else on Opus at xhigh (the runner's default). A request with no size is large.
+SIZE="$(node -e 'try{process.stdout.write(String(JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")).size||"large"))}catch{process.stdout.write("large")}' "$REQ" 2>/dev/null)"
 RUN_ARGS=()
+THINK="ultrathink."
+if [ "$SIZE" = "small" ]; then
+  [ -f "$JORI_INSTALL_TOOLS/agent/config/models.env" ] && source "$JORI_INSTALL_TOOLS/agent/config/models.env"
+  [ -n "${JORI_MODEL_SONNET:-}" ] && RUN_ARGS=(--model "$JORI_MODEL_SONNET" --effort high)
+  THINK=""
+fi
 if [ "$BRAKE_RC" -eq 4 ]; then
   RUN_ARGS=(--model "$BRAKE_MODEL" ${BRAKE_EFFORT:+--effort "$BRAKE_EFFORT"})
   log "$ID: cheaper model for this build ($BRAKE_MODEL${BRAKE_EFFORT:+, $BRAKE_EFFORT}): $BRAKE_REASON"
@@ -89,10 +99,10 @@ fi
 
 RESULT="$Q/results/$ID.md"
 rm -f "$RESULT"
-log "$ID: start"
+log "$ID: start (size $SIZE${RUN_ARGS[1]:+, ${RUN_ARGS[1]}})"
 
 TASK="Run the CHAT BUILD job for request $ID. The user asked for this in chat; the request, verbatim, is between the markers.
-Write your report to $RESULT (Step 6). ultrathink.
+Write your report to $RESULT (Step 6). Build size: $SIZE. $THINK
 
 ----- REQUEST $ID -----
 $SPEC

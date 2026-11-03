@@ -267,3 +267,18 @@ it("learns a job's cost from its ledger, priced by what the pace span cost", () 
   assert.equal(r.json.jobs.dream.estimate.share, 0.01);
   assert.equal(r.json.jobs.dream.estimate.runs, 2);
 });
+
+it("prices a job from its runs of the last month, not months-old ones", () => {
+  const fx = fixture({ points: HOT, config: { ...GOV, usd_per_allowance: 1000 } });
+  const dir = path.join(fx.logs, "ephemeral-forks");
+  fs.mkdirSync(dir, { recursive: true });
+  const rows = [
+    ...[1, 2, 3, 4, 5, 6].map((d) => ({ ts: `2026-07-0${d}T10:00:00Z`, source: "dream", total_cost_usd: 1 })),
+    { ts: "2026-10-27T10:00:00Z", source: "dream", total_cost_usd: 20 },
+    { ts: "2026-11-02T01:00:00Z", source: "dream", total_cost_usd: 22 },
+  ];
+  fs.writeFileSync(path.join(dir, "job-costs.ndjson"), rows.map((x) => JSON.stringify(x)).join("\n") + "\n");
+  const r = run(fx, ["status", "--json"]);
+  assert.equal(r.json.jobs.dream.estimate.runs, 2);
+  assert.equal(r.json.jobs.dream.estimate.usd, 21);
+});
