@@ -23,3 +23,23 @@ test("cased or unknown models get the text unchanged", () => {
   assert.equal(embedText("Dana Levi", "my-nomic-embed-text"), "Dana Levi");
   assert.equal(embedText(null, "nomic-embed-text"), "");
 });
+
+test("an over-long input is halved and retried instead of failing", async () => {
+  const { localLlmEmbed } = await import("../lib/local-llm.mjs");
+  const real = globalThis.fetch;
+  const seen = [];
+  globalThis.fetch = async (_url, init) => {
+    const { prompt } = JSON.parse(init.body);
+    seen.push(prompt.length);
+    if (prompt.length > 1000) return new Response('{"error":"the input length exceeds the context length"}', { status: 500 });
+    return new Response(JSON.stringify({ embedding: [0.1, 0.2] }), { status: 200 });
+  };
+  try {
+    assert.deepEqual(await localLlmEmbed("x".repeat(4000)), [0.1, 0.2]);
+    assert.deepEqual(seen, [4000, 2000, 1000]);
+    globalThis.fetch = async () => new Response("boom", { status: 500 });
+    await assert.rejects(localLlmEmbed("short"), /500/);
+  } finally {
+    globalThis.fetch = real;
+  }
+});
