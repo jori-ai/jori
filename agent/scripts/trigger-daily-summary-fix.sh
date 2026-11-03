@@ -86,9 +86,22 @@ if [ "$BRAKE_RC" -eq 3 ]; then
   log "$M: held by the allowance governor: $BRAKE_REASON"
   exit 0
 fi
+# Model tier (the user's choice, 2026-11-03): Sonnet first, Opus once a Sonnet
+# run for this date got stuck (`daily-summary-fix tier`, pickTier). The
+# allowance governor's "cheaper model" answer overrides an Opus tier.
+TIER_JSON="$("$FIX" tier "$M" 2>/dev/null)"
+TIER="$(printf '%s' "$TIER_JSON" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{process.stdout.write(JSON.parse(s).tier||"opus")}catch{process.stdout.write("opus")}})' 2>/dev/null)"
+[ -n "$TIER" ] || TIER="opus"
 RUN_ARGS=()
+if [ "$TIER" = "sonnet" ] && [ -n "${JORI_MODEL_SONNET:-}" ]; then
+  RUN_ARGS=(--model "$JORI_MODEL_SONNET" --effort xhigh)
+else
+  TIER="opus"
+fi
+log "$M: tier $TIER ($TIER_JSON)"
 if [ "$BRAKE_RC" -eq 4 ]; then
   RUN_ARGS=(--model "$BRAKE_MODEL" ${BRAKE_EFFORT:+--effort "$BRAKE_EFFORT"})
+  TIER="sonnet"
   log "$M: cheaper model for this fix ($BRAKE_MODEL${BRAKE_EFFORT:+, $BRAKE_EFFORT}): $BRAKE_REASON"
 fi
 export JORI_BRAKE_DECIDED=1
@@ -107,6 +120,9 @@ $STATE
 "$SCRIPTS/lib/run-ephemeral-opus.sh" daily-summary-fix "$JOB_MD" --task "$TASK" --timeout-min "$TIMEOUT_MIN" ${RUN_ARGS[@]+"${RUN_ARGS[@]}"}
 RC=$?
 log "$DATE: runner exit $RC"
+# What this run left behind decides the next run's tier (a held or refused run
+# did nothing, so it is not recorded).
+if [ "$RC" -ne 78 ] && [ "$RC" -ne 75 ]; then "$FIX" tier-done "$DATE" "$TIER" >> "$LOG" 2>&1; fi
 if [ "$RC" -eq 78 ]; then
   # Max-only guard refused (not signed in). Leave the day queued for the next
   # successful sign-in rather than looping now; the sweep re-queues it.

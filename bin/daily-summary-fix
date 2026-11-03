@@ -43,10 +43,15 @@
 // (trigger-daily-summary-fix.sh, keychain session) confirms the Max sign-in and runs
 // `release-held`, which sends through the full check.
 //
-//   daily-summary-fix request <date> [--reason R] [--answer "<the user's words>"] [--no-kick]
+//   daily-summary-fix request <date> [--reason R] [--answer "<the user's words>"] [--from-review] [--no-kick]
+//       (--from-review: the daily summary's reviewer did not confirm the day; read by pickTier)
 //       queue a fix run (the daily-summary fork on a non-confirmed review; the
 //       chat agent with the user's answer to a fixer question; the hourly sweep)
 //   daily-summary-fix status <date>                  the state JSON
+//   daily-summary-fix tier <date>                    which model this date's next fix run uses:
+//       {"tier":"sonnet"|"opus","reason":...}. Sonnet first; Opus once a Sonnet run for the
+//       date got stuck (see pickTier). Read by trigger-daily-summary-fix.sh.
+//   daily-summary-fix tier-done <date> <sonnet|opus>  record a finished run and the state it left
 //   daily-summary-fix log <date> --finding F --action A --outcome fixed|data-corrected|code-landed|asked|unresolved [--commit SHA]
 //       record one finding and what was done about it (feeds the email section); prints the entry's log index
 //   daily-summary-fix ask <date> --question "<plain question>"
@@ -125,6 +130,36 @@ const die = (m, code = 64) => { console.error(`daily-summary-fix: ${m}`); proces
 const isDate = (d) => /^\d{4}-\d{2}-\d{2}$/.test(String(d || "")); // lang-regex-ok: machine date argument
 
 const stateFile = (d) => path.join(DIR, `${d}.json`);
+
+// ---- model tier: Sonnet first, Opus once Sonnet is stuck (2026-11-03) --------
+// The user chose this over all-Opus (D5, 2026-10-22) when the fixer was ~15% of
+// the weekly allowance. What a run left behind, recorded by `tier-done`:
+function snapshot(s) {
+  const openQs = (s.questions || []).filter((q) => !q.answered_at && !q.dropped_at).length;
+  return { status_after: s.status, requests_after: (s.requests || []).length, open_questions_after: openQs };
+}
+// A date escalates to Opus, and stays there, when its last Sonnet run
+//   - gave up, or
+//   - ended neither confirmed nor waiting on the user's answers (it fixed
+//     nothing and asked nothing), or
+//   - was followed by a new request from the reviewer ("review not confirmed"):
+//     the day it fixed did not pass.
+// A run queued only to apply the user's answers is not stuck: it stays Sonnet.
+export function pickTier(s) {
+  const runs = s.tier_runs || [];
+  const last = runs[runs.length - 1];
+  if (!last) return { tier: "sonnet", reason: "first fix run for this date" };
+  if (runs.some((r) => r.tier === "opus")) return { tier: "opus", reason: "this date already escalated to Opus" };
+  if (last.status_after === "gave_up") return { tier: "opus", reason: "the Sonnet run gave up" };
+  if (last.status_after !== "confirmed" && last.status_after !== AWAITING && !last.open_questions_after) {
+    return { tier: "opus", reason: `the Sonnet run ended ${last.status_after} without confirming the day or asking anything` };
+  }
+  const newer = (s.requests || []).slice(last.requests_after || 0);
+  if (newer.some((r) => r.from === "review")) {
+    return { tier: "opus", reason: "the reviewer rejected the day again after the Sonnet run" };
+  }
+  return { tier: "sonnet", reason: "follow-up run (answers or a new request) after a Sonnet run that did its job" };
+}
 function load(d) {
   try { return JSON.parse(fs.readFileSync(stateFile(d), "utf8")); }
   catch { return { date: d, status: "new", created_at: now(), requests: [], answers: [], questions: [], log: [], rounds: 0 }; }
@@ -358,18 +393,29 @@ export function verdict(s, nowMs = clock().getTime()) {
 }
 
 if (cmd === "request") {
-  if (!isDate(date)) die("usage: request <YYYY-MM-DD> [--reason R] [--answer TEXT] [--no-kick]");
+  if (!isDate(date)) die("usage: request <YYYY-MM-DD> [--reason R] [--answer TEXT] [--from-review] [--no-kick]");
   const s = load(date);
   if (s.status === "confirmed") {
     // A confirmed day can still be reopened by the user's answer or a new reason.
     if (!opt("--answer") && !opt("--reason")) { console.log(`${date} already ${s.status}`); process.exit(0); }
   }
-  s.requests.push({ at: now(), reason: opt("--reason") || (opt("--answer") ? "his answer" : "unspecified") });
+  s.requests.push({ at: now(), reason: opt("--reason") || (opt("--answer") ? "his answer" : "unspecified"), ...(has("--from-review") ? { from: "review" } : {}) });
   if (opt("--answer")) s.answers.push({ at: now(), text: String(opt("--answer")).slice(0, 2000) });
   s.status = "queued";
   save(s);
   if (!has("--no-kick")) kick(date);
   console.log(`queued ${date}`);
+} else if (cmd === "tier") {
+  if (!isDate(date)) die("usage: tier <YYYY-MM-DD>");
+  console.log(JSON.stringify(pickTier(load(date))));
+} else if (cmd === "tier-done") {
+  if (!isDate(date)) die("usage: tier-done <YYYY-MM-DD> <sonnet|opus>");
+  const tier = argv[2];
+  if (!["sonnet", "opus"].includes(tier)) die("usage: tier-done <YYYY-MM-DD> <sonnet|opus>");
+  const s = load(date);
+  s.tier_runs = [...(s.tier_runs || []), { at: now(), tier, ...snapshot(s) }].slice(-20);
+  save(s);
+  console.log(JSON.stringify(s.tier_runs[s.tier_runs.length - 1]));
 } else if (cmd === "status") {
   if (!isDate(date)) die("usage: status <YYYY-MM-DD>");
   console.log(JSON.stringify(load(date), null, 2));
