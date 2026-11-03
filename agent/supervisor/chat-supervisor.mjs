@@ -22,6 +22,7 @@ import http from "node:http";
 import { spawn } from "node:child_process";
 import { ClaudeSession, buildLocalRulesFile, watchLocalRules } from "./claude-session.mjs";
 import { gitGuardHooks } from "../../lib/rollback-guard-settings.mjs";
+import { supervisorSkillOverrides } from "../../lib/hidden-skills.cjs";
 import { PriorityDispatcher } from "../lib/priority-dispatcher.mjs";
 import { isPhantomResult } from "../lib/phantom-result.mjs";
 import { TurnWatchdog, TURN_WATCHDOG_MS_DEFAULT, hangReasonClause } from "./turn-watchdog.mjs";
@@ -400,7 +401,9 @@ class ChatSupervisor {
       // own context guard; this is per supervisor session, so the user's own
       // sessions keep the default. Same setting as the ops tiers in index.mjs,
       // as is the git-rollback guard hook (D2, lib/rollback-guard.mjs).
-      settings: JSON.stringify({ idleCompaction: false, hooks: gitGuardHooks() }),
+      // + the skills a Jori agent never calls, hidden from its skill listing
+      // (lib/hidden-skills.cjs; `hideUnusedSkills: false` in agents.json opts out).
+      settings: JSON.stringify({ idleCompaction: false, hooks: gitGuardHooks(), ...(cfg.hideUnusedSkills !== false ? { skillOverrides: supervisorSkillOverrides() } : {}) }),
       // The operator's local rules (agent/local/shared.md + chat.md),
       // appended to the system prompt; omitted when there are none.
       appendSystemPromptFile: localRulesFile || undefined,

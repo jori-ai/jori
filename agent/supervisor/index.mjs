@@ -30,6 +30,7 @@ import { createRequire } from "node:module";
 import { ClaudeSession, supportsCliFlag, buildLocalRulesFile, watchLocalRules } from "./claude-session.mjs";
 import { writeFileAtomic } from "../../lib/atomic-write.js";
 import { gitGuardHooks } from "../../lib/rollback-guard-settings.mjs";
+import { supervisorSkillOverrides } from "../../lib/hidden-skills.cjs";
 import { makeTriageRouter, triageTargetFromConfig } from "./triage-route.mjs";
 import { authFailureText } from "./auth-result.mjs";
 
@@ -565,7 +566,9 @@ class Supervisor {
       // hooks — the git-rollback guard (D2): a PreToolUse hook that snapshots
       // uncommitted work to refs/jori/pre-destructive/* before any
       // destructive git command, or blocks it. lib/rollback-guard.mjs.
-      settings: JSON.stringify({ sandbox: { enabled: false }, idleCompaction: false, hooks: gitGuardHooks() }),
+      // + the skills a Jori agent never calls, hidden from its skill listing
+      // (lib/hidden-skills.cjs; `hideUnusedSkills: false` in agents.json opts out).
+      settings: JSON.stringify({ sandbox: { enabled: false }, idleCompaction: false, hooks: gitGuardHooks(), ...(cfg.hideUnusedSkills !== false ? { skillOverrides: supervisorSkillOverrides() } : {}) }),
       // The other half of the stable prefix: the default system prompt also
       // carries per-day/per-machine sections (today's date, cwd, env info).
       // The date changes daily, so the first session of each day re-wrote the
