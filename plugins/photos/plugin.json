@@ -1,0 +1,35 @@
+{
+  "name": "photos",
+  "title": "Photos",
+  "description": "Reads the day's photos into memory and keeps thumbnails.",
+  "version": "1.0.0",
+  "default": "disabled",
+  "schedules": [
+    {
+      "label": "trigger-photos-daily",
+      "cron": "0 3 * * *",
+      "command": "{root}/bin/cron-run --label trigger-photos-daily -- {root}/agent/scripts/trigger-photos-daily.sh"
+    },
+    {
+      "label": "trigger-photos-backfill-thumbs",
+      "cron": "15 3 * * *",
+      "command": "{root}/bin/cron-run --label trigger-photos-backfill-thumbs -- {root}/agent/scripts/trigger-photos-backfill-thumbs.sh"
+    },
+    {
+      "label": "trigger-photos-intraday",
+      "cron": "15,45 * * * *",
+      "command": "{root}/bin/cron-run --label trigger-photos-intraday -- {root}/agent/scripts/trigger-photos-intraday.sh"
+    }
+  ],
+  "adopted_jobs": [
+    "photos-daily",
+    "photos-intraday"
+  ],
+  "files": [
+    "agent/ops-agent/jobs/photos-daily.md",
+    "agent/ops-agent/jobs/photos-intraday.md",
+    "agent/scripts/trigger-photos-backfill-thumbs.sh",
+    "agent/scripts/trigger-photos-daily.sh",
+    "agent/scripts/trigger-photos-intraday.sh"
+  ]
+}

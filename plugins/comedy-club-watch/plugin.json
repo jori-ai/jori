@@ -1,0 +1,21 @@
+{
+  "name": "comedy-club-watch",
+  "title": "Comedy club watch",
+  "description": "Watches comedy club line-ups for the comedians you follow.",
+  "version": "1.0.0",
+  "default": "disabled",
+  "schedules": [
+    {
+      "label": "trigger-comedy-club-watch",
+      "cron": "12 8,11,14,17,20,23 * * *",
+      "command": "{root}/bin/cron-run --label trigger-comedy-club-watch -- bash -c '{root}/agent/scripts/trigger-comedy-club-watch.sh >> {root}/data/logs/comedy-club-watch.log 2>&1'"
+    }
+  ],
+  "adopted_jobs": [
+    "comedy-club-watch"
+  ],
+  "files": [
+    "agent/ops-agent/jobs/comedy-club-watch.md",
+    "agent/scripts/trigger-comedy-club-watch.sh"
+  ]
+}

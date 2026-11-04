@@ -20,7 +20,7 @@ Before scraping any of the sites listed below, **load the matching site SKILL.md
 |---|---|---|
 | Reddit | `external/skills/reddit.com/SKILL.md` | subreddit-feed, search, post-thread, user-profile, current-user-list, **submit-comment** *(write, our fork addition)* |
 | X (Twitter) | `external/skills/x.com/SKILL.md` | search, post-data, profile-data |
-| LinkedIn | `external/skills/linkedin.com/SKILL.md` | post-data |
+| LinkedIn | `external/skills/linkedin.com/SKILL.md` | post-data; people search + profile reads go through `bin/linkedin-lookup search|profile` (signed-in automation Chrome) |
 | TikTok | `external/skills/tiktok.com/SKILL.md` | get-post-analytics, get-posts-list, download-post-video |
 | Facebook | `external/skills/facebook.com/SKILL.md` | marketplace-search, marketplace-listing-data, marketplace-seller-data ⚠️ *avoid private-group scraping* |
 | Amazon | `external/skills/amazon.com/SKILL.md` | search, product-data, grocery-storefront, cart-data, add-to-cart |

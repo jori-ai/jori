@@ -1,0 +1,29 @@
+{
+  "name": "morning-digest",
+  "title": "Morning digest",
+  "description": "A morning brief with today's calendar, tasks, weather and headlines.",
+  "version": "1.0.0",
+  "default": "disabled",
+  "schedules": [
+    {
+      "label": "trigger-morning-digest",
+      "cron": "0 8 * * *",
+      "command": "{root}/bin/cron-run --label trigger-morning-digest -- {root}/agent/scripts/trigger-morning-digest.sh"
+    }
+  ],
+  "launchd": [
+    {
+      "label": "ai.claude.morning-digest",
+      "adopt": true
+    }
+  ],
+  "adopted_jobs": [
+    "morning-digest"
+  ],
+  "files": [
+    "agent/launch-agents/ai.claude.morning-digest.plist",
+    "agent/ops-agent/jobs/morning-digest.md",
+    "agent/scripts/trigger-morning-digest.sh",
+    "bin/morning-digest-run"
+  ]
+}

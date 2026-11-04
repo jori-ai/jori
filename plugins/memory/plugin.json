@@ -1,0 +1,112 @@
+{
+  "name": "memory",
+  "title": "Memory upkeep",
+  "description": "Keeps long-term memory healthy: consolidation, snapshots, embeddings, the association graph, link audits and weaving, the cloud mirror of the memory site, and folding chat facts into the wiki.",
+  "version": "1.0.0",
+  "default": "disabled",
+  "schedules": [
+    {
+      "label": "trigger-embed-messages",
+      "cron": "*/15 * * * *",
+      "command": "{root}/bin/cron-run --label trigger-embed-messages -- {root}/agent/scripts/trigger-embed-messages.sh"
+    },
+    {
+      "label": "trigger-context-sync",
+      "cron": "*/30 * * * *",
+      "command": "{root}/bin/cron-run --label trigger-context-sync -- {root}/agent/scripts/trigger-context-sync.sh"
+    },
+    {
+      "label": "trigger-memory-snapshot",
+      "cron": "*/30 * * * *",
+      "command": "{root}/bin/cron-run --label trigger-memory-snapshot -- {root}/agent/scripts/trigger-memory-snapshot.sh"
+    },
+    {
+      "label": "trigger-memory-consolidation",
+      "cron": "45 9 * * 0",
+      "command": "{root}/bin/cron-run --label trigger-memory-consolidation -- {root}/agent/scripts/trigger-memory-consolidation.sh"
+    },
+    {
+      "label": "trigger-wiki-audit",
+      "cron": "30 3 * * *",
+      "command": "{root}/bin/cron-run --label trigger-wiki-audit -- {root}/agent/scripts/trigger-wiki-audit.sh"
+    },
+    {
+      "label": "trigger-wiki-link-audit",
+      "cron": "45 3 * * *",
+      "command": "{root}/bin/cron-run --label trigger-wiki-link-audit -- {root}/agent/scripts/trigger-wiki-link-audit.sh"
+    },
+    {
+      "label": "trigger-wiki-db-snapshot",
+      "cron": "7 * * * *",
+      "command": "{root}/bin/cron-run --label trigger-wiki-db-snapshot -- {root}/agent/scripts/trigger-wiki-db-snapshot.sh"
+    },
+    {
+      "label": "trigger-recall-events-embed",
+      "cron": "35 2 * * *",
+      "command": "{root}/bin/cron-run --label trigger-recall-events-embed -- {root}/agent/scripts/trigger-recall-events-embed.sh"
+    },
+    {
+      "label": "trigger-wiki-embed",
+      "cron": "8 4 * * *",
+      "command": "{root}/bin/cron-run --label trigger-wiki-embed -- {root}/agent/scripts/trigger-wiki-embed.sh"
+    },
+    {
+      "label": "trigger-chat-consolidate",
+      "cron": "20 3 * * *",
+      "command": "{root}/bin/cron-run --label trigger-chat-consolidate -- {root}/agent/scripts/trigger-chat-consolidate.sh"
+    },
+    {
+      "label": "trigger-wiki-cloud-sync",
+      "cron": "*/5 * * * *",
+      "command": "{root}/bin/cron-run --label trigger-wiki-cloud-sync -- {root}/agent/scripts/trigger-wiki-cloud-sync.sh"
+    },
+    {
+      "label": "trigger-wiki-link-weave",
+      "cron": "1 3 * * 1",
+      "command": "{root}/bin/cron-run --label trigger-wiki-link-weave -- {root}/agent/scripts/trigger-wiki-link-weave.sh"
+    },
+    {
+      "label": "trigger-wiki-assoc",
+      "cron": "20 4 * * *",
+      "command": "{root}/bin/cron-run --label trigger-wiki-assoc -- {root}/agent/scripts/trigger-wiki-assoc.sh"
+    }
+  ],
+  "launchd": [
+    {
+      "label": "ai.claude.wiki-assoc-llm",
+      "adopt": true
+    },
+    {
+      "label": "ai.claude.wiki-dedup-sweep",
+      "adopt": true
+    }
+  ],
+  "adopted_jobs": [
+    "chat-consolidate",
+    "memory-consolidation",
+    "wiki-dedup-sweep",
+    "wiki-link-weave"
+  ],
+  "files": [
+    "agent/launch-agents/ai.claude.wiki-assoc-llm.plist",
+    "agent/ops-agent/jobs/chat-consolidate.md",
+    "agent/ops-agent/jobs/memory-consolidation.md",
+    "agent/ops-agent/jobs/wiki-dedup-sweep.md",
+    "agent/ops-agent/jobs/wiki-link-weave.md",
+    "agent/scripts/run-wiki-assoc-llm.sh",
+    "agent/scripts/trigger-chat-consolidate.sh",
+    "agent/scripts/trigger-context-sync.sh",
+    "agent/scripts/trigger-embed-messages.sh",
+    "agent/scripts/trigger-memory-consolidation.sh",
+    "agent/scripts/trigger-memory-snapshot.sh",
+    "agent/scripts/trigger-recall-events-embed.sh",
+    "agent/scripts/trigger-wiki-assoc.sh",
+    "agent/scripts/trigger-wiki-audit.sh",
+    "agent/scripts/trigger-wiki-cloud-sync.sh",
+    "agent/scripts/trigger-wiki-db-snapshot.sh",
+    "agent/scripts/trigger-wiki-embed.sh",
+    "agent/scripts/trigger-wiki-link-audit.sh",
+    "agent/scripts/trigger-wiki-link-weave.sh",
+    "bin/wiki-dedup-sweep"
+  ]
+}

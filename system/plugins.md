@@ -42,6 +42,20 @@ agent/local/plugins/<name>/     this installation's own plugin (private overlay)
 }
 ```
 
+- A schedule has `run` (built into a `cron-run` line, relative to the plugin)
+  or `command` (used verbatim: an adopted line's exact command, with `{root}`,
+  `{home}`, `{node}`, `{sysnode}` and `{sysbin}` filled in). `paused` keeps a
+  `#XPAUSE#` prefix on a line the manager adds.
+- `cron_tags`: lines another tool writes for this plugin (a daily reminder
+  scheduler); the manager never adds them, and removes them while the plugin is off.
+- `launchd` entries are rendered from `file`, or `adopt: true` for an agent
+  already installed: off boots it out and parks the plist
+  (`<label>.plist.plugin-off`), on restores it.
+- `files`: files the plugin owns where they already are (not yet moved into its
+  directory); `remove --with-files` deletes them. `adopted_jobs`: playbooks in
+  the core jobs directory that belong to it; while it is off they are refused
+  and leave the registries.
+- `core: true`: always on; cannot be turned off or removed.
 - `run` is relative to the plugin directory; `{root}` is the install
   (`~/Dev/jori`) and `{node}` the node binary. A schedule line is installed as
   `<cron> <root>/bin/cron-run --label <label> -- <command> # jori-plugin:<name>`;
@@ -104,7 +118,11 @@ change history with an undo.
 
 ## Migration
 
-Features move into plugins one at a time; until a feature is a plugin it keeps
-working as before. `rain-walk` was the first (2026-11-04). The control room's
-Plugins page lists scheduled jobs that no plugin owns yet ("Not a plugin yet"),
-the same way "Not configurable yet" lists hardcoded values.
+Done for schedules on 2026-11-04: every crontab line and launchd agent on the
+host belongs to a plugin (53: 22 generic in `plugins/`, 31 this installation's
+own in `agent/local/plugins/`, `core-upkeep` marked core). Each line was adopted
+byte-for-byte (only the marker added; verified against a backup of the crontab),
+paused lines stayed paused. Generic plugins default to off; this installation's
+state turns them on. What remains is moving each plugin's `files` from the core
+folders into its own directory, one plugin at a time; the control room's
+Plugins page lists any schedule no plugin owns ("Not a plugin yet").

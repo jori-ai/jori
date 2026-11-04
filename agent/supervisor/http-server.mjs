@@ -62,8 +62,10 @@ const PUBSUB_OIDC_CONFIG_PATH = installTools("secrets/pubsub-oidc.json");
 // An enabled plugin's playbook (plugins/<name>/jobs/<job>.md, system/plugins.md)
 // comes after those two; a disabled plugin's never resolves, so its job is
 // refused like any unknown job.
-export function resolveJobFile(jobName, { jobsDir = JOBS_DIR, extDir = JOBS_EXT_DIR, pluginDirs = pluginJobDirs() } = {}) {
+export function resolveJobFile(jobName, { jobsDir = JOBS_DIR, extDir = JOBS_EXT_DIR, pluginDirs = pluginJobDirs(), disabled = pluginDisabledJobs() } = {}) {
   const kernel = path.join(jobsDir, `${jobName}.md`);
+  // A job whose plugin is off is refused like an unknown one: a path that does not exist.
+  if (disabled.has(jobName)) return path.join(jobsDir, "_disabled-by-plugin", `${jobName}.md`);
   if (fs.existsSync(kernel)) return kernel;
   const overlay = path.join(extDir, `${jobName}.md`);
   if (fs.existsSync(overlay)) return overlay;
@@ -72,6 +74,10 @@ export function resolveJobFile(jobName, { jobsDir = JOBS_DIR, extDir = JOBS_EXT_
     if (fs.existsSync(f)) return f;
   }
   return kernel;
+}
+
+function pluginDisabledJobs() {
+  try { return require("../../lib/plugins.cjs").disabledJobs(); } catch { return new Set(); }
 }
 
 function pluginJobDirs() {

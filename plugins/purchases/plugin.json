@@ -1,0 +1,38 @@
+{
+  "name": "purchases",
+  "title": "Purchases",
+  "description": "Face-ID approved purchases: the approval poll, merchant sign-ins, the shop view and its browser.",
+  "version": "1.0.0",
+  "default": "disabled",
+  "schedules": [
+    {
+      "label": "purchase-approval-poll",
+      "cron": "* * * * *",
+      "command": "{sysnode} {root}/bin/purchase-approval-poll >> {root}/data/logs/purchase-approval-poll.log 2>&1  # PURCHASE_APPROVAL_POLL"
+    },
+    {
+      "label": "purchase-signin",
+      "cron": "23 11 * * 0",
+      "command": "{root}/agent/scripts/trigger-purchase-signin.sh >> {root}/data/logs/purchase-signin.log 2>&1"
+    }
+  ],
+  "launchd": [
+    {
+      "label": "com.jori.chrome-cdp-shop",
+      "adopt": true
+    },
+    {
+      "label": "com.jori.shop-view",
+      "adopt": true
+    }
+  ],
+  "adopted_jobs": [
+    "purchase-signin"
+  ],
+  "files": [
+    "agent/ops-agent/jobs/purchase-signin.md",
+    "agent/scripts/trigger-purchase-signin.sh",
+    "agent/shop-view/server.mjs",
+    "bin/purchase-approval-poll"
+  ]
+}

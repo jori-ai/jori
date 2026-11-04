@@ -1,0 +1,29 @@
+{
+  "name": "flights",
+  "title": "Flights",
+  "description": "Scans trips and flights and watches fares.",
+  "version": "1.0.0",
+  "default": "disabled",
+  "schedules": [
+    {
+      "label": "trigger-flights-scan",
+      "cron": "20 7 * * *",
+      "command": "{root}/bin/cron-run --label trigger-flights-scan -- bash -c '{root}/agent/scripts/trigger-flights-scan.sh >> {root}/data/logs/flights-scan.log 2>&1'"
+    }
+  ],
+  "launchd": [
+    {
+      "label": "ai.claude.flights-scan",
+      "adopt": true
+    }
+  ],
+  "adopted_jobs": [
+    "flights-scan"
+  ],
+  "files": [
+    "agent/launch-agents/ai.claude.flights-scan.plist",
+    "agent/ops-agent/jobs/flights-scan.md",
+    "agent/scripts/trigger-flights-scan.sh",
+    "bin/flights-scan-run"
+  ]
+}

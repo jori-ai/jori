@@ -1,0 +1,21 @@
+{
+  "name": "weekend-events",
+  "title": "Weekend picks",
+  "description": "Friday picks of things to do this weekend.",
+  "version": "1.0.0",
+  "default": "disabled",
+  "schedules": [
+    {
+      "label": "trigger-weekend-events",
+      "cron": "50 8 * * 5",
+      "command": "{root}/bin/cron-run --label trigger-weekend-events -- {root}/agent/scripts/trigger-weekend-events.sh"
+    }
+  ],
+  "adopted_jobs": [
+    "weekend-events"
+  ],
+  "files": [
+    "agent/ops-agent/jobs/weekend-events.md",
+    "agent/scripts/trigger-weekend-events.sh"
+  ]
+}

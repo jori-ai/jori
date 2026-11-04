@@ -1,0 +1,33 @@
+{
+  "name": "browsing-skills",
+  "title": "Browsing skills",
+  "description": "Syncs the browsing skills, checks their health and repairs a broken one the same day.",
+  "version": "1.0.0",
+  "default": "disabled",
+  "schedules": [
+    {
+      "label": "browsing-skills-sync",
+      "cron": "0 10 * * *",
+      "command": "{root}/bin/cron-run --label browsing-skills-sync -- bash -c '{root}/bin/browsing-skills-sync >> {root}/data/logs/browsing-skills-sync.log 2>&1'"
+    },
+    {
+      "label": "skill-health",
+      "cron": "0 23 * * *",
+      "command": "{root}/bin/cron-run --label skill-health -- bash -c '{sysnode} {root}/browsing-skills/tools/skill-health.js >> {root}/data/logs/skill-health.log 2>&1'"
+    },
+    {
+      "label": "trigger-skill-repair",
+      "cron": "47 * * * *",
+      "command": "{root}/bin/cron-run --label trigger-skill-repair -- bash -c '{root}/agent/scripts/trigger-skill-repair.sh >> {root}/data/logs/skill-repair.log 2>&1'"
+    }
+  ],
+  "adopted_jobs": [
+    "skill-repair"
+  ],
+  "files": [
+    "agent/ops-agent/jobs/skill-repair.md",
+    "agent/scripts/trigger-skill-repair.sh",
+    "bin/browsing-skills-sync",
+    "browsing-skills/tools/skill-health.js"
+  ]
+}

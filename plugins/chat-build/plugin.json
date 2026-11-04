@@ -1,0 +1,22 @@
+{
+  "name": "chat-build",
+  "title": "Builds from chat",
+  "description": "Builds what you ask for in chat on an ephemeral Opus session.",
+  "version": "1.0.0",
+  "default": "disabled",
+  "schedules": [],
+  "launchd": [
+    {
+      "label": "ai.claude.chat-build",
+      "adopt": true
+    }
+  ],
+  "adopted_jobs": [
+    "chat-build"
+  ],
+  "files": [
+    "agent/launch-agents/ai.claude.chat-build.plist",
+    "agent/ops-agent/jobs/chat-build.md",
+    "agent/scripts/trigger-chat-build.sh"
+  ]
+}

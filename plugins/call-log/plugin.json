@@ -1,0 +1,22 @@
+{
+  "name": "call-log",
+  "title": "Call log",
+  "description": "Logs every call you host: who, when, a summary and next steps.",
+  "version": "1.0.0",
+  "default": "disabled",
+  "schedules": [],
+  "launchd": [
+    {
+      "label": "ai.claude.call-log",
+      "adopt": true
+    }
+  ],
+  "adopted_jobs": [
+    "call-log"
+  ],
+  "files": [
+    "agent/launch-agents/ai.claude.call-log.plist",
+    "agent/ops-agent/jobs/call-log.md",
+    "agent/scripts/trigger-call-log.sh"
+  ]
+}

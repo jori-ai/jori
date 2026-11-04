@@ -1,0 +1,23 @@
+{
+  "name": "amazon-orders",
+  "title": "Amazon orders",
+  "description": "Reads order mail and order details.",
+  "version": "1.0.0",
+  "default": "disabled",
+  "schedules": [
+    {
+      "label": "amazon-order-detail",
+      "cron": "30 6 * * *",
+      "command": "{root}/bin/cron-run --label amazon-order-detail -- bash -c '{sysnode} {root}/bin/amazon-order-detail >> {root}/logs/amazon-order-detail.log 2>&1'"
+    },
+    {
+      "label": "amazon-mail-orders",
+      "cron": "50 5 * * *",
+      "command": "{root}/bin/cron-run --label amazon-mail-orders -- bash -c 'PATH={sysbin}:$PATH {root}/bin/amazon-mail-orders >> {root}/logs/amazon-mail-orders.log 2>&1'"
+    }
+  ],
+  "files": [
+    "bin/amazon-mail-orders",
+    "bin/amazon-order-detail"
+  ]
+}

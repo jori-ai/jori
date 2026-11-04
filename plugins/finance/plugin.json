@@ -1,0 +1,39 @@
+{
+  "name": "finance",
+  "title": "Finance",
+  "description": "Bank and card sync (read-only), the finance review, the finance model and the monthly net worth.",
+  "version": "1.0.0",
+  "default": "disabled",
+  "schedules": [
+    {
+      "label": "trigger-plaid-sync",
+      "cron": "15 0,10 * * *",
+      "command": "{root}/bin/cron-run --label trigger-plaid-sync -- {root}/agent/scripts/trigger-plaid-sync.sh"
+    },
+    {
+      "label": "trigger-finance-model",
+      "cron": "45 0 * * *",
+      "command": "{root}/bin/cron-run --label trigger-finance-model -- {root}/agent/scripts/trigger-finance-model.sh"
+    },
+    {
+      "label": "trigger-finance-review",
+      "cron": "0 8 * * 0",
+      "command": "{root}/bin/cron-run --label trigger-finance-review -- {root}/agent/scripts/trigger-finance-review.sh"
+    },
+    {
+      "label": "trigger-net-worth-monthly",
+      "cron": "20 7 1 * *",
+      "command": "{root}/bin/cron-run --label trigger-net-worth-monthly -- {root}/agent/scripts/trigger-net-worth-monthly.sh"
+    }
+  ],
+  "adopted_jobs": [
+    "finance-review"
+  ],
+  "files": [
+    "agent/ops-agent/jobs/finance-review.md",
+    "agent/scripts/trigger-finance-model.sh",
+    "agent/scripts/trigger-finance-review.sh",
+    "agent/scripts/trigger-net-worth-monthly.sh",
+    "agent/scripts/trigger-plaid-sync.sh"
+  ]
+}

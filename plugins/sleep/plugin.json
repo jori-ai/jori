@@ -1,0 +1,17 @@
+{
+  "name": "sleep",
+  "title": "Sleep",
+  "description": "Nightly sleep summary.",
+  "version": "1.0.0",
+  "default": "disabled",
+  "schedules": [
+    {
+      "label": "trigger-sleep-night",
+      "cron": "*/5 * * * *",
+      "command": "{root}/bin/cron-run --label trigger-sleep-night -- {root}/agent/scripts/trigger-sleep-night.sh"
+    }
+  ],
+  "files": [
+    "agent/scripts/trigger-sleep-night.sh"
+  ]
+}

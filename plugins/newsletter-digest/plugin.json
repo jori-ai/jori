@@ -1,0 +1,29 @@
+{
+  "name": "newsletter-digest",
+  "title": "Newsletter digest",
+  "description": "Reads the day's newsletters and sends one digest of what is worth your time.",
+  "version": "1.0.0",
+  "default": "disabled",
+  "schedules": [
+    {
+      "label": "trigger-newsletter-digest",
+      "cron": "0 19 * * *",
+      "command": "{root}/bin/cron-run --label trigger-newsletter-digest -- {root}/agent/scripts/trigger-newsletter-digest.sh"
+    }
+  ],
+  "launchd": [
+    {
+      "label": "ai.claude.newsletter-digest",
+      "adopt": true
+    }
+  ],
+  "adopted_jobs": [
+    "newsletter-digest"
+  ],
+  "files": [
+    "agent/launch-agents/ai.claude.newsletter-digest.plist",
+    "agent/ops-agent/jobs/newsletter-digest.md",
+    "agent/scripts/trigger-newsletter-digest.sh",
+    "bin/newsletter-digest-run"
+  ]
+}
