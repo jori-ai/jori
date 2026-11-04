@@ -345,7 +345,10 @@ async function counterLeg(t, runAdded, consumed, accountTypes) {
     const m = Math.abs(t.amount);
     const band = (v) => `and(amount.gte.${(v - 0.005).toFixed(3)},amount.lte.${(v + 0.005).toFixed(3)})`;
     const qs = new URLSearchParams({
-      select: "transaction_id,account_id,amount,date,category_primary,category_detailed",
+      // name/pending/merchant_name also feed the bank-alert judge's
+      // `nearby_same_amount`; pending_transaction_id lets findCounterLeg drop
+      // a pending copy of a posted row.
+      select: "transaction_id,account_id,amount,date,category_primary,category_detailed,name,merchant_name,pending,pending_transaction_id:raw->>pending_transaction_id",
       or: `(${band(-m)},${band(m)})`,
       limit: "100",
     });
@@ -358,7 +361,7 @@ async function counterLeg(t, runAdded, consumed, accountTypes) {
       log(`    (counter-leg lookup failed: ${e.message} — judging on this run's transactions only)`);
     }
   }
-  return findCounterLeg(t, pool, consumed, accountTypes);
+  return { leg: findCounterLeg(t, pool, consumed, accountTypes), pool };
 }
 
 /**
@@ -376,8 +379,8 @@ async function counterLeg(t, runAdded, consumed, accountTypes) {
  * Deposits, low balances, and re-auth failures are unchanged — those are
  * inherently exceptional.
  */
-async function buildAlerts(institutionName, addedTxns, accounts, runAdded = [], consumed = new Set(), accountTypes = {}) {
-  const alerts = [];
+async function buildCandidates(institutionName, addedTxns, accounts, runAdded = [], consumed = new Set(), accountTypes = {}) {
+  const out = [];
   for (const t of addedTxns) {
     if (t.pending) continue; // wait until posted
     const label = t.merchant_name || t.name || "transaction";
@@ -386,57 +389,153 @@ async function buildAlerts(institutionName, addedTxns, accounts, runAdded = [], 
     if (mag < (inflow ? LARGE_DEPOSIT : LARGE_TXN)) continue;
     // Already paired as the other leg of a transfer judged earlier this run.
     if (consumed.has(t.transaction_id)) continue;
-    const leg = await counterLeg(t, runAdded, consumed, accountTypes);
+    const { leg, pool } = await counterLeg(t, runAdded, consumed, accountTypes);
     if (leg) {
       consumed.add(t.transaction_id);
       consumed.add(leg.transaction_id);
       log(`    (not alerting ${usd(mag)} ${label} — the matching ${usd(mag)} ${inflow ? "debit" : "credit"} is in another of your linked accounts on ${leg.date}; your own money moving)`);
       continue;
     }
+    const base = { kind: "transaction", institution: institutionName, t, inflow, mag, pool };
     if (inflow) {
-      alerts.push(`Deposit: ${usd(mag)} — ${label} (${t.date}).`);
-    } else {
-      const hist = await merchantHistory(t.merchant_name, t);
-      // Paid this merchant before, and this is in line with it (within 25% of
-      // the user's own high-water mark) → expected, not news.
-      //
-      // This used to also require TWO prior charges. With exactly one, every
-      // large charge fell through to the alert below and was told it was "well
-      // above" the earlier payment whatever its size: on 2026-10-17 a charge
-      // about a fifth of the earlier one was called well above it. One earlier
-      // payment is a fine yardstick for "bigger than before", and the alert may
-      // only make that claim when it is true — so the wording and the decision
-      // read the same predicate. (The two-charge rule had also been masking a
-      // charge counting its own pending copy as that one prior charge;
-      // merchantHistory() now excludes it, so a first charge stays a first.)
-      const wellAbove = hist ? mag > hist.max * 1.25 : false;
-      if (hist && !wellAbove) {
-        log(`    (not alerting ${usd(mag)} at ${label} — ${hist.count} prior charge${hist.count === 1 ? "" : "s"}, max ${usd(hist.max)}; expected, goes to the daily digest)`);
-        continue;
-      }
-      const category = categoryOf(t).primary;
-      // "First charge from this merchant" is only a claim we can make when
-      // there IS a merchant — a transfer or card payment has none, so
-      // merchantHistory() returns null for it and every one used to be called
-      // a first charge. What is true of those is that no linked account
-      // received the money.
-      const why = wellAbove
-        ? ` — well above the ${usd(hist.max)} you've paid them before`
-        : t.merchant_name
-          ? ` — first charge from this merchant`
-          : OWN_MOVEMENT_OUT.has(category)
-            ? ` — no matching credit in any of your linked accounts`
-            : "";
-      alerts.push(`${outflowVerb(category, categoryOf(t).detailed)}: ${usd(mag)} at ${label} (${t.date})${why}.`);
+      out.push({ ...base, hist: null, rule: { alert: true, line: `Deposit: ${usd(mag)} — ${label} (${t.date}).` } });
+      continue;
     }
+    const hist = await merchantHistory(t.merchant_name, t);
+    // Paid this merchant before, and this is in line with it (within 25% of
+    // the user's own high-water mark) → expected, not news.
+    //
+    // This used to also require TWO prior charges. With exactly one, every
+    // large charge fell through to the alert below and was told it was "well
+    // above" the earlier payment whatever its size: on 2026-10-17 a charge
+    // about a fifth of the earlier one was called well above it. One earlier
+    // payment is a fine yardstick for "bigger than before", and the alert may
+    // only make that claim when it is true — so the wording and the decision
+    // read the same predicate. (The two-charge rule had also been masking a
+    // charge counting its own pending copy as that one prior charge;
+    // merchantHistory() now excludes it, so a first charge stays a first.)
+    const wellAbove = hist ? mag > hist.max * 1.25 : false;
+    if (hist && !wellAbove) {
+      log(`    (old rule: ${usd(mag)} at ${label} — ${hist.count} prior charge${hist.count === 1 ? "" : "s"}, max ${usd(hist.max)}; expected)`);
+      out.push({ ...base, hist, rule: { alert: false, line: null } });
+      continue;
+    }
+    const category = categoryOf(t).primary;
+    // "First charge from this merchant" is only a claim we can make when
+    // there IS a merchant — a transfer or card payment has none, so
+    // merchantHistory() returns null for it and every one used to be called
+    // a first charge. What is true of those is that no linked account
+    // received the money.
+    const why = wellAbove
+      ? ` — well above the ${usd(hist.max)} you've paid them before`
+      : t.merchant_name
+        ? ` — first charge from this merchant`
+        : OWN_MOVEMENT_OUT.has(category)
+          ? ` — no matching credit in any of your linked accounts`
+          : "";
+    out.push({ ...base, hist, rule: { alert: true, line: `${outflowVerb(category, categoryOf(t).detailed)}: ${usd(mag)} at ${label} (${t.date})${why}.` } });
   }
   for (const a of accounts) {
     const avail = a.balances && a.balances.available;
     if (typeof avail === "number" && a.type === "depository" && avail < LOW_BALANCE) {
-      alerts.push(`Low balance: ${a.name || a.subtype} is at ${usd(avail)}.`);
+      out.push({ kind: "low_balance", institution: institutionName, account: a, available: avail, rule: { alert: true, line: `Low balance: ${a.name || a.subtype} is at ${usd(avail)}.` } });
     }
   }
-  return alerts.map((line) => `${institutionName ? institutionName + ": " : ""}${line}`);
+  return out;
+}
+
+/**
+ * The old fixed rule's verdict, as lines. No longer what reaches chat (that is
+ * lib/bank-alert-judge.mjs, since 2026-11-04): it is one of the facts the judge
+ * reads (`old_rule`), the --dry-run log, and what the tests pin.
+ */
+async function buildAlerts(institutionName, addedTxns, accounts, runAdded = [], consumed = new Set(), accountTypes = {}) {
+  const c = await buildCandidates(institutionName, addedTxns, accounts, runAdded, consumed, accountTypes);
+  return c.filter((x) => x.rule.alert).map((x) => `${institutionName ? institutionName + ": " : ""}${x.rule.line}`);
+}
+
+// ── Bank-alert judge context ────────────────────────────────────────────────
+
+/**
+ * Earlier posted transactions in the same account, same direction, within
+ * ~20% of this amount, over the past ~13 months. Structure only (account,
+ * sign, amount, date): what they MEAN — "rent from the same payer every month"
+ * — is the judge's reading of the descriptions, not code's (Rule #0b).
+ */
+async function similarHistory(t) {
+  try {
+    const mag = Math.abs(t.amount);
+    const sign = t.amount < 0 ? -1 : 1;
+    const lo = sign > 0 ? mag * 0.8 : -mag * 1.2;
+    const hi = sign > 0 ? mag * 1.2 : -mag * 0.8;
+    const since = new Date(Date.now() - 400 * 86_400_000).toISOString().slice(0, 10);
+    const qs = new URLSearchParams({
+      select: "date,amount,name,merchant_name",
+      account_id: `eq.${t.account_id}`,
+      pending: "is.false",
+      order: "date.desc",
+      limit: "12",
+    });
+    qs.append("amount", `gte.${lo.toFixed(2)}`);
+    qs.append("amount", `lte.${hi.toFixed(2)}`);
+    qs.append("date", `gte.${since}`);
+    for (const id of new Set([t.transaction_id, t.pending_transaction_id].filter(Boolean))) qs.append("transaction_id", `neq.${id}`);
+    const rows = await request(`/rest/v1/plaid_transactions?${qs}`, { method: "GET" });
+    return Array.isArray(rows)
+      ? rows.map((r) => ({ date: r.date, amount_usd: Math.abs(Number(r.amount)), description: r.merchant_name || r.name }))
+      : [];
+  } catch (e) {
+    log(`    (similar-history lookup failed: ${e.message})`);
+    return null;
+  }
+}
+
+function acctFacts(info = {}) {
+  return { name: info.name || info.official_name || info.subtype || null, mask: info.mask || null, type: info.type || null, subtype: info.subtype || null, institution: info.institution_name || null };
+}
+
+/** One candidate as the judge sees it: the transaction plus everything around it. */
+async function judgeItem(c, accountInfo) {
+  if (c.kind === "low_balance") {
+    const a = c.account;
+    return { id: `low:${a.account_id}`, kind: "low_balance", account: acctFacts({ ...accountInfo[a.account_id], name: a.name, mask: a.mask, type: a.type, subtype: a.subtype }), available_usd: c.available };
+  }
+  const t = c.t;
+  const cat = categoryOf(t);
+  const day = Date.parse(`${String(t.date).slice(0, 10)}T00:00:00Z`);
+  const nearby = (c.pool || [])
+    .filter((r) => r.transaction_id !== t.transaction_id && Math.abs(Math.abs(Number(r.amount)) - c.mag) < 0.005)
+    .filter((r) => Math.abs(Date.parse(`${String(r.date).slice(0, 10)}T00:00:00Z`) - day) <= LEG_WINDOW_DAYS * 86_400_000)
+    .slice(0, 10)
+    .map((r) => ({
+      date: r.date,
+      direction: Number(r.amount) < 0 ? "in" : "out",
+      amount_usd: Math.abs(Number(r.amount)),
+      account: acctFacts(accountInfo[r.account_id]),
+      same_account: r.account_id === t.account_id,
+      pending: r.pending === true,
+      description: r.merchant_name || r.name || null,
+    }));
+  return {
+    id: t.transaction_id,
+    kind: "transaction",
+    account: acctFacts(accountInfo[t.account_id] || { institution_name: c.institution }),
+    transaction: {
+      date: t.date,
+      direction: c.inflow ? "in" : "out",
+      amount_usd: c.mag,
+      description: t.name || null,
+      merchant: t.merchant_name || null,
+      category: cat.primary,
+      category_detailed: cat.detailed,
+      payment_channel: t.payment_channel || null,
+    },
+    own_transfer_match: false,
+    merchant_history: c.hist ? { prior_charges: c.hist.count, largest_usd: c.hist.max } : null,
+    similar_history: await similarHistory(t),
+    nearby_same_amount: nearby,
+    old_rule: c.rule.alert ? { would_alert: true, said: c.rule.line } : { would_alert: false, said: "expected: in line with earlier charges at this merchant" },
+  };
 }
 
 // ── Per-item sync ───────────────────────────────────────────────────────────
@@ -646,31 +745,45 @@ async function syncItem(item, summary) {
 // Filled by syncItem(), drained by sendQueuedAlerts() after the Item loop.
 const ALERT_QUEUE = [];
 
-// Plaid account type per account id ("depository", "credit", …) — the pairing
-// rules treat a credit into a card differently from one into checking. This
-// run's Items come from the balance call; the rest (a webhook run syncs one
-// Item) from the stored rows. Unknown = not a card, the stricter reading.
-async function accountTypeMap() {
-  const types = {};
+// Every linked account (id -> {name, mask, type, subtype, institution_name}).
+// The pairing rules need the type (a credit into a card is read differently
+// from one into checking); the judge needs the rest. This run's Items come
+// from the balance call; the others (a webhook run syncs one Item) from the
+// stored rows. Unknown type = not a card, the stricter reading.
+async function accountInfoMap() {
+  const info = {};
   try {
-    const rows = await request("/rest/v1/plaid_accounts?select=account_id,type", { method: "GET" });
-    if (Array.isArray(rows)) for (const r of rows) if (r.account_id && r.type) types[r.account_id] = r.type;
+    const rows = await request("/rest/v1/plaid_accounts?select=account_id,name,official_name,mask,type,subtype,institution_name", { method: "GET" });
+    if (Array.isArray(rows)) for (const r of rows) if (r.account_id) info[r.account_id] = r;
   } catch (e) {
-    log(`  (account-type lookup failed: ${e.message} — using this run's accounts only)`);
+    log(`  (account lookup failed: ${e.message} — using this run's accounts only)`);
   }
-  for (const q of ALERT_QUEUE) for (const a of q.accounts || []) if (a.account_id && a.type) types[a.account_id] = a.type;
-  return types;
+  for (const q of ALERT_QUEUE) {
+    for (const a of q.accounts || []) {
+      if (a.account_id) info[a.account_id] = { ...(info[a.account_id] || {}), account_id: a.account_id, name: a.name, official_name: a.official_name, mask: a.mask, type: a.type, subtype: a.subtype, institution_name: q.institution };
+    }
+  }
+  return info;
 }
 
+/**
+ * Judge this run's candidates and send ONE plain-words message for the ones
+ * worth it (lib/bank-alert-judge.mjs, Jev site `bank-alert`). Built after
+ * every Item has synced, so the two legs of a transfer between banks pair
+ * whichever bank came first.
+ */
 async function sendQueuedAlerts(summary) {
   if (!ALERT_QUEUE.length) return;
   const runAdded = ALERT_QUEUE.flatMap((q) => q.added);
   const consumed = new Set();
-  const accountTypes = await accountTypeMap();
+  const accountInfo = await accountInfoMap();
+  const accountTypes = Object.fromEntries(Object.entries(accountInfo).filter(([, a]) => a.type).map(([id, a]) => [id, a.type]));
+  const candidates = [];
   for (const q of ALERT_QUEUE) {
-    let alerts = [];
     try {
-      alerts = await buildAlerts(q.institution, q.added, q.accounts, runAdded, consumed, accountTypes);
+      const c = await buildCandidates(q.institution, q.added, q.accounts, runAdded, consumed, accountTypes);
+      for (const x of c) x.summaryItem = q.summaryItem;
+      candidates.push(...c);
     } catch (e) {
       // Fail loudly: this bank's new transactions went unchecked, which is the
       // one thing this path must never do silently. Same shape as a sync
@@ -678,15 +791,25 @@ async function sendQueuedAlerts(summary) {
       const tag = q.institution || "bank";
       console.error(`  ✗ ${tag}: alert build failed: ${e.message}`);
       summary.failed.push({ item: tag, code: "alert_build_failed", message: e.message });
-      await notify(`${tag}: couldn't check this run's new transactions for alerts (${e.message}). They're saved, but nothing was flagged.`);
-      continue;
-    }
-    q.summaryItem.alerts = alerts.length;
-    for (const line of alerts) {
-      log(`  🔔 ${line}`);
-      await notify(line);
+      await notify(`I couldn't check the newest ${tag} transactions for anything unusual this time (${e.message}). They're saved; I just didn't get to look at them.`);
     }
   }
+  if (!candidates.length) return;
+
+  const items = [];
+  for (const c of candidates) items.push(await judgeItem(c, accountInfo));
+  const linked = Object.values(accountInfo).map(acctFacts);
+  const { judgeBankAlerts } = await import("../lib/bank-alert-judge.mjs");
+  log(`\n  bank-alert judge: ${items.length} candidate(s)`);
+  const r = await judgeBankAlerts(items, linked, { log });
+  const flaggedIds = new Set(r.flagged.map((f) => f.id));
+  candidates.forEach((c, i) => { if (flaggedIds.has(items[i].id) && c.summaryItem) c.summaryItem.alerts += 1; });
+  if (!r.message) {
+    log("  bank-alert judge: nothing worth an alert");
+    return;
+  }
+  log(`  🔔 (${r.writer}) ${r.message.split("\n").join("\n     ")}`);
+  await notify(r.message);
 }
 
 /**
@@ -827,4 +950,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { buildAlerts, isInflow, outflowVerb };
+module.exports = { buildAlerts, buildCandidates, judgeItem, acctFacts, accountInfoMap, isInflow, outflowVerb };

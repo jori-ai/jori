@@ -190,3 +190,22 @@ test("through buildAlerts, a Zelle payment and a same-amount rent credit both st
   const alerts = await buildAlerts("Bank", run, [], run, new Set(), TYPES);
   assert.equal(alerts.length, 2, alerts.join(" | "));
 });
+
+// 2026-11-04: a savings-to-checking move alerted from both ends because the
+// checking side still held the pending copy of the credit next to the posted
+// row (no pending_transaction_id linking them). Two possible credits read as
+// ambiguous, and ambiguous alerts. A pending copy is the same money.
+test("a pending copy of a posted leg is not a rival: the transfer still pairs", () => {
+  const pendingCopy = { ...XFER_IN, transaction_id: "t-in-pending", pending: true, name: "TRANSFER FROM ACCT ON 09/14 VIA WEB" };
+  assert.equal(findCounterLeg(XFER_OUT, [XFER_IN, pendingCopy], new Set(), TYPES)?.transaction_id, "t-in");
+  assert.equal(findCounterLeg(XFER_IN, [XFER_OUT, pendingCopy], new Set(), TYPES)?.transaction_id, "t-out");
+  // Linked by id, even on a different date inside the window.
+  const linked = { ...XFER_IN, transaction_id: "t-in-p2", pending: true, date: "2026-09-13" };
+  const posted = { ...XFER_IN, pending_transaction_id: "t-in-p2" };
+  assert.equal(findCounterLeg(XFER_OUT, [posted, linked], new Set(), TYPES)?.transaction_id, "t-in");
+});
+
+test("two POSTED equal credits stay ambiguous (the pending rule does not loosen that)", () => {
+  const second = { ...XFER_IN, transaction_id: "t-in-2", account_id: "chk2" };
+  assert.equal(findCounterLeg(XFER_OUT, [XFER_IN, second], new Set(), { ...TYPES, chk2: "depository" }), null);
+});
