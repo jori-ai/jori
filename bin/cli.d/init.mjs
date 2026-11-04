@@ -115,7 +115,6 @@ export default {
         anonKey = await ask("Supabase anon (public) key", "");
       }
       env.OLLAMA_URL = await ask("OLLAMA_URL", "http://127.0.0.1:11434");
-      env.LOCAL_LLM_MODEL = await ask("LOCAL_LLM_MODEL", "gemma3:1b");
       env.LOCAL_EMBED_MODEL = await ask("LOCAL_EMBED_MODEL", "nomic-embed-text");
 
       let telemetry = "off";
