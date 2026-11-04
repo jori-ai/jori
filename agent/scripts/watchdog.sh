@@ -2752,7 +2752,7 @@ fi
 # (system/plugins.md): a plugin pulled in by jori-sync gets its schedules, a
 # disabled or removed one loses them. Only lines tagged `# jori-plugin:` are
 # touched, through crontab-safe. Kill switch: data/.plugin-sync-off.
-if [ ! -f "$JORI_INSTALL_TOOLS/data/.plugin-sync-off" ] && [ "10#$(date +%M)" -lt 2 ] 2>/dev/null; then
+if [ ! -f "$JORI_INSTALL_TOOLS/data/.plugin-sync-off" ] && [ $(( 10#$(date +%M) )) -lt 2 ]; then
   "$JORI_NODE" "$JORI_INSTALL_TOOLS/bin/jori" plugin sync >> "$LOG" 2>&1 || log "plugin sync exited $?"
 fi
 

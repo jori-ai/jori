@@ -125,3 +125,14 @@ test("install copies a plugin in and enables it; remove deletes the directory an
   assert.equal(fs.existsSync(path.join(KDIR, "zeta")), false);
   assert.equal("zeta" in (P.state().enabled || {}), false);
 });
+
+test("the CLI's flags reach the manager (--dry-run changes nothing)", async () => {
+  const calls = [];
+  M._setIo({ readCrontab: () => "", crontabSafe: (a) => calls.push(a), launchctl: () => "", dryRun: false });
+  const cli = (await import("../bin/cli.d/plugin.mjs")).default;
+  const log = console.log; console.log = () => {};
+  try {
+    await cli.run(["sync", "--dry-run"], { c: new Proxy({}, { get: () => (s) => s }), die: (m) => { throw new Error(m); }, hasFlag: (args, ...n) => n.some((x) => args.includes(x)), table: () => "" });
+  } finally { console.log = log; M._setIo({ dryRun: false }); }
+  assert.equal(calls.length, 0, "a dry run wrote nothing");
+});

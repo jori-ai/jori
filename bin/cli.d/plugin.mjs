@@ -27,7 +27,7 @@ export default {
   async run(args, ctx) {
     const { c, die, hasFlag } = ctx;
     const [cmd = "list", name] = args;
-    if (hasFlag("--dry-run")) M._setIo({ dryRun: true });
+    if (hasFlag(args, "--dry-run")) M._setIo({ dryRun: true });
     switch (cmd) {
       case "list": {
         const all = P.plugins();
@@ -54,7 +54,7 @@ export default {
       }
       case "enable": {
         if (!name) die("usage: jori plugin enable <name>");
-        const r = M.enable(name, { force: hasFlag("--force") });
+        const r = M.enable(name, { force: hasFlag(args, "--force") });
         record({ who: who(), page: "plugins", what: `Turned on the ${name} plugin`, target: `plugin:${name}`, undo: { action: "plugin.disable", args: { name } } });
         console.log(c.green(`✓ ${name} is on`) + (r.seeded ? c.dim(`  (settings seeded: ${r.seeded})`) : ""));
         console.log(describeSync(r, c));
@@ -70,7 +70,7 @@ export default {
       }
       case "install": {
         if (!name) die("usage: jori plugin install <path|git-url> [--local]");
-        const r = M.install(name, { local: hasFlag("--local") });
+        const r = M.install(name, { local: hasFlag(args, "--local") });
         record({ who: who(), page: "plugins", what: `Installed the ${r.name} plugin`, target: `plugin:${r.name}`, undo: { action: "plugin.remove", args: { name: r.name } } });
         console.log(c.green(`✓ installed ${r.name}`) + c.dim(` at ${r.dir}`));
         console.log(describeSync(r, c));
@@ -78,7 +78,7 @@ export default {
       }
       case "remove": {
         if (!name) die("usage: jori plugin remove <name> [--purge-config]");
-        const r = M.remove(name, { purgeConfig: hasFlag("--purge-config") });
+        const r = M.remove(name, { purgeConfig: hasFlag(args, "--purge-config") });
         record({ who: who(), page: "plugins", what: `Removed the ${name} plugin`, target: `plugin:${name}` });
         console.log(c.green(`✓ removed ${name}`) + c.dim(` (${r.removed})`));
         console.log(describeSync(r, c));
