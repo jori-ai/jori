@@ -15,7 +15,7 @@ const { installTools } = require("../../../lib/root.cjs");
 const { situation: sit, context } = await readStdinJson(); void sit; void context;
 const API = "https://gmail.googleapis.com/gmail/v1/users/me";
 const MAX_THREADS = 40;
-const STALE_DAYS = 14;
+const STALE_DAYS = 7;
 const ASKED_FILE = installTools("data/hum-email-followups-stale-asked.json");
 
 function readAsked() {
@@ -41,7 +41,7 @@ try {
     threads.push(await gmail(`/threads/${t.id}?format=metadata&metadataHeaders=Subject&metadataHeaders=From`, token));
   }
   const { open: allOpen } = pickTopOpenP1(threads, p1.id);
-  // A P1 open 14+ days is asked about once ("still need it?"), then left alone so
+  // A P1 open 7+ days is asked about once ("still need it?"), then left alone so
   // younger P1s surface instead of the same stale one re-emitting every hour.
   const asked = readAsked();
   const open = allOpen.filter((m) => m.ageDays < STALE_DAYS || !asked[m.messageId]);
