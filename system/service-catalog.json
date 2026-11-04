@@ -306,6 +306,28 @@
       "config": [
         "api-fallback"
       ]
+    },
+    {
+      "name": "Spa control",
+      "does": "A hot tub or spa controller (bin/spa)",
+      "group": "Home",
+      "env": [
+        "SPA_SERVER_"
+      ],
+      "config": [
+        "spa"
+      ]
+    },
+    {
+      "name": "Virtual mailbox",
+      "does": "Scanned postal mail (bin/anytime-mail-check)",
+      "group": "Home",
+      "env": [
+        "ANYTIME_"
+      ],
+      "config": [
+        "anytime-mail"
+      ]
     }
   ]
 }

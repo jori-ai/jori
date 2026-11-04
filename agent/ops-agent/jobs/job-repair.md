@@ -25,6 +25,8 @@ To reproduce, run the job's command by hand **only if it is read-only** (it fetc
 
 **Step 4 — fix, smallest change.** Edit only what causes the failure. Keep behaviour and output the same. Run the tests that cover the file (`grep -l <module> tests/*.test.mjs`, `node --test …`), `node --check` / `bash -n` / `python3 -m py_compile`, `node bin/lint-no-language-regex <files>` and `bin/kernel-guard` for kernel files. Personal values go to `agent/local/`, never into kernel files. If the job is read-only, run it once and see it exit 0. A failed check is a revert (`git checkout -- <file>`) and `--outcome failed --note "<why>"`.
 
+**A file neither repo tracks** (a git-excluded, instance-local script): the fix cannot go through `self-improve-auto-apply`, so edit it in place, but still run Step 5's critic first, keep a copy of the original under `data/backups/job-repair/`, and say in the `done` note that the file is untracked. Never skip the critic for it.
+
 **Step 5 — critic.** Spawn an `Agent` with the diff, the error and a two-line rationale, using the critic contract from `self-improvement-executor.md` § Critic subagent (`SAFE` / `REVERT: …` / `DEFER_TO_OPERATOR: …`). Anything but `SAFE` → revert, `--outcome failed --note "<critic's line>"`.
 
 **Step 6 — land.** `BASE_REV=$(git -C ~/Dev/jori rev-parse HEAD)` taken before you read the files you change. Bundle each changed file with `~/Dev/jori/bin/self-improve-bundle --out /tmp/job-repair-<id>.json --base-rev "$BASE_REV" <files>`, revert the working tree, then:
