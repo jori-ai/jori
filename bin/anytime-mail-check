@@ -44,6 +44,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { spawnSync, execFile } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import { port } from "../lib/ports.cjs";
 import { createRequire } from "node:module";
 import { judgeEnvelope } from "../lib/anytime-mail-jev.mjs";
 
@@ -65,7 +66,7 @@ export const DEFAULTS = Object.freeze({ base_url: null, label: "the virtual mail
 export function loadConfig() { return localConfig("anytime-mail", DEFAULTS); }
 const CFG = loadConfig();
 const BASE = String(CFG.base_url || "").replace(/\/+$/, ""); // lang-regex-ok: URL trailing slash
-const CDP = `http://localhost:${process.env.CDP_PORT || "9222"}`;
+const CDP = `http://localhost:${process.env.CDP_PORT || port("chrome_cdp")}`;
 const SETTLE_S = Number(process.env.ANYTIME_MAIL_SETTLE_S || 90);
 // Which scan rendition to OCR: "" = full size, ".s1000" = 1000 px wide.
 const SCAN_SIZE = process.env.ANYTIME_MAIL_SCAN_SIZE ?? "";

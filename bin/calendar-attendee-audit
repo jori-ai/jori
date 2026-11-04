@@ -47,6 +47,7 @@ import { seriesKey, collapseFindings, formatFindingLine, inAuditScope } from "..
 
 const require = createRequire(import.meta.url);
 const { instance, localConfig } = require("../lib/instance.cjs");
+const ASSISTANT = require("../lib/instance.cjs").assistantName(); // the assistant's configured name (lib/instance.cjs)
 const { installTools } = require("../lib/root.cjs");
 
 // gog: $GOG_BIN, else a package-manager install (cron's PATH has neither), else PATH.
@@ -356,7 +357,7 @@ if (!fresh.length) {
 // and let the tells below carry the reading.
 const lines = fresh.map(formatFindingLine);
 const msg = [
-  `⚠️ ${fresh.length} calendar event(s) with attendees Jori cannot account for:`,
+  `⚠️ ${fresh.length} calendar event(s) with attendees ${ASSISTANT} cannot account for:`,
   "",
   ...lines,
   "",

@@ -22,13 +22,15 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { createRouteRegistry, createStreamHub, SSE_HEADERS } from "../core/app-screens.mjs";
 import { allTelemetry } from "../core/telemetry.mjs";
+import { assistantName } from "../../lib/instance.cjs";
+import { port, localUrl } from "../../lib/ports.cjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
-const PORT = Number(process.env.DASHBOARD_PORT) || 9098;
+const PORT = Number(process.env.DASHBOARD_PORT) || port("dashboard");
 const POLL_MS = Number(process.env.DASHBOARD_POLL_MS) || 3000;
 const SUPERVISORS = {
-  ops: process.env.OPS_HEALTH_URL || "http://127.0.0.1:9093/health",
-  chat: process.env.CHAT_HEALTH_URL || "http://127.0.0.1:9094/health",
+  ops: process.env.OPS_HEALTH_URL || localUrl("ops_health", "/health"),
+  chat: process.env.CHAT_HEALTH_URL || localUrl("chat_health", "/health"),
 };
 
 const registry = createRouteRegistry();
@@ -62,6 +64,9 @@ registry.registerRoute("/", () => {
   let body;
   try { body = fs.readFileSync(path.join(HERE, "dashboard.html"), "utf8"); }
   catch { return { status: 500, body: "dashboard.html missing" }; }
+  // The page names the assistant by its configured name (lib/instance.cjs).
+  const name = assistantName().replace(/[&<>"]/g, (ch) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[ch]);
+  body = body.replaceAll("Jori · Live", `${name} · Live`);
   return { status: 200, headers: { "Content-Type": "text/html; charset=utf-8" }, body };
 });
 
@@ -77,7 +82,7 @@ registry.registerRoute("/api/health", async () => ({
   body: JSON.stringify(await snapshot()),
 }));
 
-registry.registerAppScreen("Jori Live", "/", { icon: "gauge", order: 1 });
+registry.registerAppScreen(`${assistantName()} Live`, "/", { id: "jori-live", icon: "gauge", order: 1 });
 
 // ---- HTTP server ----------------------------------------------------------
 

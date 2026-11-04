@@ -30,6 +30,7 @@ const { getAccessToken, fetchWithRetry, describeError } = require("../lib/google
 // This installation's own addresses (agent/local/instance.json): the
 // user's mailbox and the agent's sending address.
 const { instance, agentAddresses } = require("../lib/instance.cjs");
+const ASSISTANT = require("../lib/instance.cjs").assistantName(); // the assistant's configured name (lib/instance.cjs)
 const OWNER_ADDR = String(instance().owner_email || "").toLowerCase();
 // Every address that is the agent's own (its sending address and any aliases).
 const AGENT_ADDRS = agentAddresses();
@@ -192,7 +193,7 @@ async function spamRefusal(messageId) {
   const h = (n) => (m.payload?.headers || []).find((x) => x.name.toLowerCase() === n)?.value || "";
   const addr = (h("from").match(/<([^>]+)>/)?.[1] || h("from")).trim().toLowerCase();
   const labelIds = m.labelIds || [];
-  if (AGENT_ADDRS.includes(addr)) return "Jori's own email";
+  if (AGENT_ADDRS.includes(addr)) return ASSISTANT + "'s own email";
   if ((OWNER_ADDR && addr === OWNER_ADDR) || labelIds.includes("SENT")) return `${OWNER_NAME} sent it`;
   if (labelIds.includes("STARRED")) return "it is starred (P1/P2)";
   const { spawnSync } = await import("node:child_process");

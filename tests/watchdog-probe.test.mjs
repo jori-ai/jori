@@ -378,7 +378,7 @@ test("watchdog.sh is valid bash", () => {
 test("RECLASSIFY dispatch checks whether the POST actually landed", () => {
   assert.match(
     SRC,
-    /if curl -sf --max-time 5 -X POST "http:\/\/localhost:9092"/,
+    /if curl -sf --max-time 5 -X POST "http:\/\/localhost:(?:9092|\$JORI_PORT_OPS_WEBHOOK)"/,
     "the stuck-email RECLASSIFY dispatch must branch on curl's exit status, not discard it",
   );
   assert.match(
@@ -986,6 +986,8 @@ PUSH_GAP_MS=1800000
 CLOUDFLARED_HOST=gmail-push.example.com
 CURL_AUTH=()
 ISSUES=""
+JORI_PORT_OPS_WEBHOOK=9092 # set by lib/webhook-auth.sh from lib/ports.cjs in the real script
+JORI_PORT_OPS_HEALTH=9093
 HEALTH=${shq(health)}
 log() { echo "$1" >> "$LOG"; }
 ${fnSrc("log_throttled")}

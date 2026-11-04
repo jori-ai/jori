@@ -2980,7 +2980,7 @@ def _haiku_toolless(prompt, timeout=30):
     lib/local-llm.mjs). Raises on any failure; from cron/SSH the Max login is
     unreadable, the fork prints "Not logged in", and the caller fails open."""
     import subprocess, tempfile
-    model = "claude-haiku-5-5"
+    model = None  # no fallback id: agent/config/models.env is the one place
     try:
         env_file = os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "agent", "config", "models.env")
         for line in open(env_file, encoding="utf-8"):
@@ -2988,6 +2988,8 @@ def _haiku_toolless(prompt, timeout=30):
                 model = line.split("=", 1)[1].strip()
     except OSError:
         pass
+    if not model:
+        raise RuntimeError("JORI_MODEL_HAIKU missing from agent/config/models.env")
     env = {k: v for k, v in os.environ.items() if k not in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN")}
     r = subprocess.run(
         [os.path.expanduser("~/.local/bin/claude"), "-p", "--model", model, "--effort", "low",

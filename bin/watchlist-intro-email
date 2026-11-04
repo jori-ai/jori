@@ -45,6 +45,7 @@ import { tasteProfile } from "../lib/watch-fit.mjs";
 import { PARTNER, whoFor } from "../lib/watch-config.mjs";
 
 const require = createRequire(import.meta.url);
+const ASSISTANT = require("../lib/instance.cjs").assistantName(); // the assistant's configured name (lib/instance.cjs)
 const { MODELS } = require("../lib/models.cjs");
 
 const DRY = process.argv.includes("--dry-run");
@@ -194,7 +195,7 @@ if (!NO_PROSE && prose.size < items.length) log(`prose for ${prose.size}/${items
 
 const subject = MOVIES ? moviesSubject(batch, fresh.length) : subjectFor(batch);
 const intro = MOVIES
-  ? (batch.length ? `This week's new movies on ${whoFor("together")}'s list, the ones Jori thinks they'll like most first, with where to watch each.` : `Nothing new on the list this week, but these just arrived in theaters or on streaming and look like ${whoFor("together")}'s kind of film.`)
+  ? (batch.length ? `This week's new movies on ${whoFor("together")}'s list, the ones ${ASSISTANT} thinks they'll like most first, with where to watch each.` : `Nothing new on the list this week, but these just arrived in theaters or on streaming and look like ${whoFor("together")}'s kind of film.`)
   : batch.length === 1
     ? `${batch[0].name} just landed on your list. Here's what it is and why it's there.`
     : `${batch.length} new titles on your lists. Here's what each one is and why it's there.`;

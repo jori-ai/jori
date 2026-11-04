@@ -36,8 +36,10 @@ Ticketmaster only, today. Exit 0 ok, 2 usage / page not understood, 3 no listing
 import base64, json, math, os, re, subprocess, sys, time, urllib.parse, urllib.request
 import websocket
 
-PORT = 9224
 REPO = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+sys.path.insert(0, os.path.join(REPO, "lib"))
+from ports import port as _registry_port  # noqa: E402  (lib/ports.cjs: the shop Chrome's CDP port)
+PORT = _registry_port("chrome_cdp_shop")
 
 
 def upload(out):

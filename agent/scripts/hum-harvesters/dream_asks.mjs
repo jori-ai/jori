@@ -27,6 +27,8 @@ import { spawnSync } from "node:child_process";
 import { readStdinJson, emit, emitNull, stampRun, OWNER_NAME, HOME_TZ } from "./_common.mjs";
 
 import { installTools } from "../../../lib/root.cjs";
+import { assistantName, localConfig } from "../../../lib/instance.cjs";
+const ASSISTANT = assistantName(); // the assistant's configured name (lib/instance.cjs)
 import { reportBacklog, scaledLanePacing, recentlyOffered, rotateOffered } from "../../../lib/question-pacing.mjs";
 await readStdinJson();
 
@@ -35,8 +37,10 @@ const IDEAS = path.join(DATA, "hum-ideas.jsonl");
 const RUNS = process.env.HUM_RUNS_FILE || path.join(DATA, "hum-runs.jsonl");
 const LOCAL_DAY = path.join(path.dirname(new URL(import.meta.url).pathname), "../../../bin/local-day");
 
-export const DREAM_ASK_MAX_PER_DAY = 3;
-export const DREAM_ASK_SPACING_H = 2;
+// Ask pacing (agent/local/config/dream.json; these are the defaults).
+const DREAM_PACE = localConfig("dream", { ask_max_per_day: 3, ask_spacing_h: 2 });
+export const DREAM_ASK_MAX_PER_DAY = Number(DREAM_PACE.ask_max_per_day);
+export const DREAM_ASK_SPACING_H = Number(DREAM_PACE.ask_spacing_h);
 
 function readJsonl(p) {
   try {
@@ -106,7 +110,7 @@ try {
   const i = rotateOffered(waiting, (x) => x.id, recentlyOffered("dream_asks", { now }))[0];
 
   const signal = [
-    `The dream (Jori's nightly whole-day review) had a question it could not settle from the evidence, and ${OWNER_NAME} asked for these to be floated the day after. Ask it as ONE warm, specific question — the wording below is a draft; keep its meaning and any open-endedness, freshen relative time words to today, and never assert its premise as fact.`,
+    `The dream (${ASSISTANT}'s nightly whole-day review) had a question it could not settle from the evidence, and ${OWNER_NAME} asked for these to be floated the day after. Ask it as ONE warm, specific question — the wording below is a draft; keep its meaning and any open-endedness, freshen relative time words to today, and never assert its premise as fact.`,
     `Question: ${i.verify_question.trim().slice(0, 600)}`,
     `Why it came up (from the dream of ${dreamDate(i)}): ${String(i.rationale || i.subject).slice(0, 500)}`,
   ].join("\n");

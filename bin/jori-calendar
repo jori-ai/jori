@@ -95,6 +95,7 @@ import { createRequire } from "node:module";
 
 const require = createRequire(import.meta.url);
 const { instance, localConfig, localDir } = require("../lib/instance.cjs");
+const ASSISTANT = require("../lib/instance.cjs").assistantName(); // the assistant's configured name (lib/instance.cjs)
 const { installRoot } = require("../lib/root.cjs");
 
 // gog: an explicit override, else a package-manager install (launchd's PATH
@@ -282,7 +283,7 @@ if (attendees.length && authorization.trim().length < MIN_AUTHORIZATION_CHARS) {
   die([
     `REFUSED: this would invite ${attendees.length} person(s) other than the user: ${attendees.join(", ")}`,
     "",
-    "Every calendar event Jori creates has zero attendees other than the user,",
+    "Every calendar event " + ASSISTANT + " creates has zero attendees other than the user,",
     "unless the user explicitly asked for someone to be added — in this conversation or",
     "in the dispatched task. This is a top-tier rule and an irreversible action:",
     "an unwanted invite reaches a real person and cannot be recalled.",
@@ -484,7 +485,7 @@ if (cmd === "update") {
             ? `REFUSED: could not read event ${eventId} to check who made it, and ${refusals.join("; ")}.`
             : `REFUSED: "${ev.summary || "(untitled)"}" is an event the user made, and this update ${refusals.join("; ")}.`,
           "",
-          "The rule: on an event the user created, Jori may change anything",
+          "The rule: on an event the user created, " + ASSISTANT + " may change anything",
           "(time, name, details) ONLY when the new details come from a confirmation",
           "email for the same booking. Otherwise it may only ADD details: a location",
           "where there is none, notes and ticket links (appended to the description),",

@@ -23,6 +23,7 @@
 // --effort low` inline.
 
 import { spawnSync, spawn } from "node:child_process";
+import { MODELS } from "../lib/models.cjs";
 import { runToollessDetailed, parseModelJson } from "../lib/jev-claude.mjs";
 import { readFileSync, appendFileSync, mkdirSync, writeFileSync, renameSync } from "node:fs";
 import { fileURLToPath } from "node:url";
@@ -36,6 +37,7 @@ const CLAUDE_BIN = process.env.OUTBOUND_PRECHECK_CLAUDE_BIN || path.join(os.home
 const ENV_FILE = process.env.OUTBOUND_PRECHECK_ENV_FILE || path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", ".env");
 const LOG_FILE = process.env.OUTBOUND_PRECHECK_LOG || path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "data", "outbound-precheck-log.jsonl");
 const { instance, localConfig } = createRequire(import.meta.url)("../lib/instance.cjs");
+const ASSISTANT = createRequire(import.meta.url)("../lib/instance.cjs").assistantName(); // the assistant's configured name (lib/instance.cjs)
 const SUPABASE_URL = `https://${instance().supabase_project}.supabase.co`;
 // Who the gate protects (agent/local/instance.json owner_name) and this
 // installation's own examples in the prompt below
@@ -686,7 +688,7 @@ const sameDayPingsBlock = sameDayPingsText
   : "";
 
 const claimFactsBlock = claimFactsText
-  ? `\nAUTHORITATIVE FACTS (Jori's live travel timeline — GROUND TRUTH, outranks the message's wording and outranks any wiki page, which can lag).\nEach line was resolved by code against the timeline. "SAME METRO: YES" is the verdict and it is ALREADY CORRECT — trust it over your own reading of the place names, and do NOT suppress a message for a location mismatch when it says YES. A neighbourhood, borough, airport or suburb of the same metro reads YES by design:\n${claimFactsText}\n`
+  ? `\nAUTHORITATIVE FACTS (${ASSISTANT}'s live travel timeline — GROUND TRUTH, outranks the message's wording and outranks any wiki page, which can lag).\nEach line was resolved by code against the timeline. "SAME METRO: YES" is the verdict and it is ALREADY CORRECT — trust it over your own reading of the place names, and do NOT suppress a message for a location mismatch when it says YES. A neighbourhood, borough, airport or suburb of the same metro reads YES by design:\n${claimFactsText}\n`
   : "";
 
 const utterancesBlock = utterancesText
@@ -738,7 +740,7 @@ const utterancesBlock = utterancesText
 // threshold (jev-shadow-report, 7d). The other ~75% are
 // decided by this prompt, and after the shadow window closes it still decides
 // the whole sub-threshold band.
-const prompt = `You are the outbound gate for ${OWNER}'s personal agent ("Jori"). A programmatic job is about to push a message to ${OWNER}'s phone. Your job is to decide whether the message should go through, be suppressed, or be modified.
+const prompt = `You are the outbound gate for ${OWNER}'s personal agent ("${ASSISTANT}"). A programmatic job is about to push a message to ${OWNER}'s phone. Your job is to decide whether the message should go through, be suppressed, or be modified.
 
 Default to "send". Suppress when ANY of these apply:
 (a) The recent phone-channel transcript shows the message is wrong, redundant, or rude — e.g., it asks them to do something they just said they're doing; it nags about a slot they explained they're skipping; it contradicts something they just told the agent.
@@ -753,7 +755,7 @@ The long-term memory context is the authoritative source for facts about ${P.mem
 
 QUESTIONS ARE FIRST-CLASS (2026-07-19 false-suppression fix). If the proposed message is a QUESTION to ${OWNER} (asks a preference, verifies a premise, captures their intent — typically phrased with "?"), its whole purpose is to grow memory. Do NOT suppress a question under criterion (c) or (e) merely because it shares a person/pet/place/topic word with an earlier info ping or a resolved topic. Only suppress a question if the SAME question — the same subject being asked — was already asked today (same-day pings) or was explicitly answered/settled (resolved-topics or transcript). A question about a genuinely NEW angle on a familiar subject${P.questions_new_angle_example} MUST send.
 
-REPORTING ON JORI'S OWN STATE IS NOT NEWS (2026-09-27). A message whose only NEW content is JORI'S OWN INTERNAL STATE, and which asks ${OWNER} for nothing and tells them nothing from inside the email, is a SUPPRESS — it belongs in the Improvements channel, not their chat (agent/CLAUDE.md: "Chat is the channel for things about ${OWNER}'s life; a repair story is about Jori's"; and the Long-form delivery rule: a pointer carries the standout fact or is not sent at all). This is not criterion (a)–(e) territory — such a message contradicts nothing and duplicates nothing, which is exactly why it keeps slipping through. Two shapes carry it. One is a DIGEST POINTER reporting only delivery mechanics: "<job> emailed", "N newsletter(s)/item(s)", "labeled p1", "starred in your inbox" — nothing the push notification did not already say. The other is a RUN REPORT on Jori's own plumbing: how many pings went out, how many went unreacted, which lane was busiest, which gate misfired or dropped something, that a job fired on schedule, why a bug happened. Suppressing either costs them nothing — the email itself and its APNs push are separate commands in the same job and are untouched.
+REPORTING ON ${ASSISTANT.toUpperCase()}'S OWN STATE IS NOT NEWS (2026-09-27). A message whose only NEW content is ${ASSISTANT.toUpperCase()}'S OWN INTERNAL STATE, and which asks ${OWNER} for nothing and tells them nothing from inside the email, is a SUPPRESS — it belongs in the Improvements channel, not their chat (agent/CLAUDE.md: "Chat is the channel for things about ${OWNER}'s life; a repair story is about ${ASSISTANT}'s"; and the Long-form delivery rule: a pointer carries the standout fact or is not sent at all). This is not criterion (a)–(e) territory — such a message contradicts nothing and duplicates nothing, which is exactly why it keeps slipping through. Two shapes carry it. One is a DIGEST POINTER reporting only delivery mechanics: "<job> emailed", "N newsletter(s)/item(s)", "labeled p1", "starred in your inbox" — nothing the push notification did not already say. The other is a RUN REPORT on ${ASSISTANT}'s own plumbing: how many pings went out, how many went unreacted, which lane was busiest, which gate misfired or dropped something, that a job fired on schedule, why a bug happened. Suppressing either costs them nothing — the email itself and its APNs push are separate commands in the same job and are untouched.
 
 EITHER OF TWO THINGS TAKES A MESSAGE OUT OF THIS PARAGRAPH ALTOGETHER, AND EACH ONE IS SUFFICIENT BY ITSELF — AN ASK, OR A HOOK. Check for both before you suppress anything under this paragraph; if either is present, the message SENDS. They are not ranked and neither requires the other.
 
@@ -820,7 +822,7 @@ function emitSend(reason) {
 // fail-open reason, which becomes an emitSend below — unchanged behavior.
 // Tool-less, Max-only, off the jori tree's settings: lib/jev-claude.mjs.
 async function sonnetDecision() {
-  const { out: sonnetOut, error } = await runToollessDetailed({ bin: CLAUDE_BIN, model: "claude-sonnet-5-5", prompt, timeoutMs: 60000 });
+  const { out: sonnetOut, error } = await runToollessDetailed({ bin: CLAUDE_BIN, model: MODELS.sonnet, prompt, timeoutMs: 60000 });
   if (!sonnetOut) {
     sonnetFailure = `precheck_sonnet_unavailable${error?.kind ? `:${error.kind}` : ""}`;
     throw new Error(sonnetFailure);

@@ -16,13 +16,13 @@ require("../lib/load-env.js").loadEnv();
 
 // This installation's Supabase project (agent/local/instance.json) and
 // its public anon key (agent/local/config/supabase.json anon_key).
-const { instance, supabaseAnonKey } = require("../lib/instance.cjs");
+const { instance, supabaseAnonKey, assistantName } = require("../lib/instance.cjs");
 const SUPABASE_URL = `https://${instance().supabase_project}.supabase.co`;
 const SUPABASE_ANON_KEY = supabaseAnonKey();
 
 const args = process.argv.slice(2);
 let messageId = null;
-let title = "Jori";
+let title = assistantName();
 let channel = "chat";
 let urgent = false;
 const positional = [];

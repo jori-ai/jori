@@ -59,7 +59,7 @@ const INSTANCE = instance();
 const AGENT_ADDRESS = INSTANCE.agent_email;
 const OWNER_ADDRESS = INSTANCE.owner_email;
 const DEFAULT_FROM_ADDRESS = process.env.EMAIL_FROM_ADDRESS || AGENT_ADDRESS;
-const DEFAULT_FROM_NAME = process.env.EMAIL_FROM_NAME || "Jori";
+const DEFAULT_FROM_NAME = process.env.EMAIL_FROM_NAME || INSTANCE.sender_name;
 const DEFAULT_REPLY_TO = process.env.EMAIL_REPLY_TO || AGENT_ADDRESS;
 const SENT_LOG = installTools("data/jori-sent-mail.jsonl");
 
@@ -106,7 +106,7 @@ function looksLikeHtml(body) {
 }
 
 function printUsage() {
-  console.log(`email-send — send mail via smtp2go as Jori
+  console.log(`email-send — send mail via smtp2go as ${DEFAULT_FROM_NAME}
 Usage:
   email-send --to <addr> --subject <s> (--body <text> | --body-file <path>)
              [--html] [--attach <file>]...

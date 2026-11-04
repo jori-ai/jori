@@ -33,9 +33,12 @@ import websocket  # websocket-client
 # profile on another port (a second Chrome with its own profile). Each port
 # keeps its own working-tab state file so the two drivers never steal each
 # other's tab.
-CDP_PORT = os.environ.get("CDP_PORT", "9222")
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "lib"))
+from ports import port as _registry_port  # noqa: E402  (lib/ports.cjs defaults + overrides)
+_DEFAULT_CDP_PORT = str(_registry_port("chrome_cdp"))
+CDP_PORT = os.environ.get("CDP_PORT", _DEFAULT_CDP_PORT)
 CDP_HOST = "http://localhost:%s" % CDP_PORT
-_STATE_SUFFIX = "" if CDP_PORT == "9222" else "-%s" % CDP_PORT
+_STATE_SUFFIX = "" if CDP_PORT == _DEFAULT_CDP_PORT else "-%s" % CDP_PORT
 STATE = os.path.expanduser(
     "~/Dev/jori/data/.cdp-driver-state%s.json" % _STATE_SUFFIX
 )

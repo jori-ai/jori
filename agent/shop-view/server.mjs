@@ -33,6 +33,8 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { REPO_ROOT } from "../../lib/root.cjs";
+import { assistantName } from "../../lib/instance.cjs";
+import { port as registryPort } from "../../lib/ports.cjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = REPO_ROOT;
@@ -43,7 +45,7 @@ for (const l of (() => { try { return fs.readFileSync(path.join(ROOT, ".env"), "
 const V = await import(path.join(ROOT, "lib/shop-view.mjs"));
 const B = await import(path.join(ROOT, "lib/shop-browser.mjs"));
 
-const PORT = Number(process.env.SHOP_VIEW_PORT) || 9086;
+const PORT = Number(process.env.SHOP_VIEW_PORT) || registryPort("shop_view");
 const HOST = "127.0.0.1";
 const IDLE_MS = 20_000;
 const HOLD_MS = 5 * 60_000;
@@ -56,7 +58,7 @@ const PAGE = path.join(HERE, "page.html");
 // belong to OUR CDP session and vanish when it closes, so the shop tab can
 // never be left stuck in it.
 
-if (B.SHOP_PORT === "9222") throw new Error("shop-view must never drive the 9222 automation Chrome");
+if (B.SHOP_PORT === String(registryPort("chrome_cdp"))) throw new Error(`shop-view must never drive the ${registryPort("chrome_cdp")} automation Chrome`);
 
 function log(line) {
   try { fs.appendFileSync(LOG, `${new Date().toISOString()} ${line}\n`); } catch {}
@@ -259,7 +261,10 @@ async function handle(req, res) {
   }
 
   if (req.method === "GET" && url.pathname === "/") {
-    return send(res, 200, fs.readFileSync(PAGE), {
+    // The page names the assistant by its configured name (lib/instance.cjs).
+    const name = assistantName().replace(/[&<>"]/g, (ch) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[ch]);
+    const page = fs.readFileSync(PAGE, "utf8").replace('<html lang="en">', `<html lang="en" data-assistant="${name}">`);
+    return send(res, 200, page, {
       "Content-Type": "text/html; charset=utf-8",
       "Content-Security-Policy": "default-src 'self'; img-src 'self' blob:; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'; frame-ancestors 'none'",
     });

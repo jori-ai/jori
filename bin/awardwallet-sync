@@ -62,8 +62,8 @@ const SEND_BIN = path.join(__dirname, "jori-send-curl");
 const DATA_DIR = installTools("data");
 const OFF_SWITCH = path.join(DATA_DIR, ".awardwallet-sync-off");
 const STATE_FILE = path.join(DATA_DIR, "awardwallet-sync-state.json");
-const EXPIRY_WINDOW_DAYS = 60;
-const CONFIG = localConfig("loyalty", { alert_intent: "loyalty-alert" });
+const CONFIG = localConfig("loyalty", { alert_intent: "loyalty-alert", expiry_window_days: 60 });
+const EXPIRY_WINDOW_DAYS = Number(CONFIG.expiry_window_days);
 const TZ = instance().tz;
 
 function log(...a) { if (!JSON_OUT) console.log(...a); }

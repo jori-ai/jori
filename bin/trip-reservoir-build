@@ -36,6 +36,7 @@
 // no-op (nothing verified for any bucket).
 
 const fs = require("node:fs");
+const { MODELS } = require("../lib/models.cjs");
 const path = require("node:path");
 const { execFileSync, spawnSync } = require("node:child_process");
 const { loadEnv } = require("../lib/load-env.js");
@@ -266,7 +267,7 @@ function runResearch(prompt, timeoutMs = 600000) {
       // (agent/scripts/lib/local-rules.sh), as the agents do.
       out = execFileSync("/bin/bash", ["-c",
         `source "$2"; lr="$(mktemp)"; jori_local_rules_file "$(jori_local_rules_role "$PWD")" "$lr" || lr=""
-${CLAUDE_BIN} -p --model claude-sonnet-5-5 --effort medium --allowedTools WebSearch --output-format text \${lr:+--append-system-prompt-file "$lr"} "$1"
+${CLAUDE_BIN} -p --model ${MODELS.sonnet} --effort medium --allowedTools WebSearch --output-format text \${lr:+--append-system-prompt-file "$lr"} "$1"
 rc=$?; [ -n "$lr" ] && rm -f "$lr"; exit $rc`, "_", prompt, LOCAL_RULES_SH],
         { encoding: "utf8", maxBuffer: 20 * 1024 * 1024, timeout: timeoutMs });
     } catch (e) { lastErr = e; continue; }

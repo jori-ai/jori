@@ -258,7 +258,7 @@ if [[ -n "${SSH_CONNECTION:-}${SSH_CLIENT:-}" && "${DAILY_SUMMARY_ALLOW_SSH:-}" 
       printf 'in the GUI session (the recipe in agent/ops-agent/jobs/daily-summary.md\n'
       printf '§ Manual recovery):\n\n'
       printf '  TOKEN=$(cat %s/secrets/webhook-token)\n' "$JORI_INSTALL"
-      printf '  curl -s -X POST http://localhost:9092 \\\n'
+      printf '  curl -s -X POST http://localhost:%s \\\n' "$("$JORI_NODE" "$JORI_TOOLS/lib/ports.cjs" ops_webhook)"
       printf '    -H "Authorization: Bearer $TOKEN" \\\n'
       printf '    -H "Content-Type: application/json" \\\n'
       printf '    -d '\''{"task": "%s", "source": "manual-backfill"}'\''\n\n' "$TASK_LINE"
@@ -420,6 +420,7 @@ DS_SKILL_SETTINGS="$(jori_fork_settings "$DS_SKILL_SETTINGS")"
 # ops.md as --append-system-prompt-file — what the ops CLAUDE.md files used to
 # carry for this cwd.
 source "$JORI_INSTALL_TOOLS/agent/scripts/lib/local-rules.sh"
+source "$JORI_TOOLS/agent/config/models.env"   # JORI_MODEL_SONNET
 LOCAL_COMPANION="$(jori_job_companion "$JOB_MD")"
 LOCAL_RULES_FILE="$OUT_TMP.local-rules"
 jori_local_rules_file "$(jori_local_rules_role "$CWD")" "$LOCAL_RULES_FILE" || LOCAL_RULES_FILE=""
@@ -438,7 +439,7 @@ PLAYBOOK_BODY=$(awk '
   [[ -n "$LOCAL_COMPANION" ]] && printf '\n%s\n' "$(cat "$LOCAL_COMPANION")"
   printf '\n---\n\nDispatch instruction for this run (the target date is always given; it supersedes any default in Step 1): %s\n' "$TASK_LINE"
 } | ( cd "$CWD" && "$CLAUDE" -p \
-      --model claude-sonnet-5-5 \
+      --model "$JORI_MODEL_SONNET" \
       --effort "$EFFORT" \
       $( (( DRY_RUN )) && echo "--output-format json" ) \
       --permission-mode bypassPermissions \

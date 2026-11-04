@@ -33,11 +33,12 @@
  */
 
 const { execFile } = require("node:child_process");
+const { MODELS } = require("../lib/models.cjs");
 const { promisify } = require("node:util");
 const run = promisify(execFile);
 const { request } = require("../lib/supabase-rest.js");
 const { localConfig } = require("../lib/instance.cjs");
-const CONFIG = localConfig("amazon-orders", { mailbox: null, llm_key_env: "ANTHROPIC_API_KEY", model: "claude-sonnet-5-5" });
+const CONFIG = localConfig("amazon-orders", { mailbox: null, llm_key_env: "ANTHROPIC_API_KEY", model: MODELS.sonnet });
 
 const ARGV = process.argv.slice(2);
 const flag = (name, fallback = null) => {

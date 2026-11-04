@@ -35,7 +35,7 @@ if (flag("-h") || flag("--help")) {
   console.log(fs.readFileSync(new URL(import.meta.url), "utf8").split("\n").slice(1, 22).map((l) => l.replace(/^\/\/ ?/, "")).join("\n"));
   process.exit(0);
 }
-const CDP_HOST = process.env.CDP_HOST || "localhost:9222";
+const CDP_HOST = process.env.CDP_HOST || `localhost:${require("../lib/ports.cjs").port("chrome_cdp")}`;
 const CHECK = flag("--check");
 const DRY = flag("--dry-run");
 const NO_OPEN = flag("--no-open");

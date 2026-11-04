@@ -38,6 +38,7 @@ import {
   verifyLink, quantityRequested, receivedMatches, RECEIVED_MARKER, entryKey, doneKeys,
 } from "../lib/ticket-lottery.mjs";
 import { isMeetingEvent } from "../lib/meeting-event.mjs";
+import { port as registryPort } from "../lib/ports.cjs";
 import { meeting, knownSeriesId } from "../lib/meetings.mjs";
 import * as gmail from "../lib/gmail-parsed.mjs";
 import { createTriager, isUnknown } from "../lib/ticket-lottery-error-triage.mjs";
@@ -52,7 +53,7 @@ const SKILLS = installPath("browsing-skills/skills");
 const F = CFG.files;
 const STATE_FILE = F.state;
 const OWNER = ownerEntrant();
-const OWNER_CDP = CFG.cdp_host || "localhost:9222";
+const OWNER_CDP = CFG.cdp_host || `localhost:${registryPort("chrome_cdp")}`;
 const TICKETS = Number(CFG.tickets) || 2;
 const portOf = (host) => String(host).split(":").pop();
 const HOST_LABEL = instance().host_label || "the host";

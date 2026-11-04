@@ -33,6 +33,8 @@ CHROME_PROFILE="$HOME/.cache/chrome-devtools-mcp/chrome-profile"
 USER_TZ_FILE="$HOME/Dev/jori/data/user-timezone.json"
 # Fallback: the home timezone (lib/instance.cjs tz, as JORI_TZ).
 source "$(dirname "$0")/lib/instance.sh"
+source "$(dirname "$0")/lib/root.sh"   # JORI_TOOLS, JORI_NODE
+CDP_PORT_N=$("$JORI_NODE" "$JORI_TOOLS/lib/ports.cjs" chrome_cdp)   # lib/ports.cjs
 USER_TZ="${JORI_TZ:-UTC}"
 if [ -f "$USER_TZ_FILE" ]; then
   PARSED_TZ=$(jq -r '.timezone // empty' "$USER_TZ_FILE" 2>/dev/null)
@@ -50,7 +52,7 @@ if [ "$HOUR_LOCAL" -lt 9 ]; then IN_QUIET_HOURS=1; fi
 # to :9222 from the user's interactive profile that 404s on every CDP path.
 # `localhost` resolves to ::1 first on macOS, hitting the LaunchAgent-managed
 # automation Chrome (com.jori.chrome-cdp) which binds IPv6 :9222.
-HTTP_CODE=$(curl -s --max-time 5 -o /dev/null -w "%{http_code}" http://localhost:9222/json/version 2>/dev/null || echo "000")
+HTTP_CODE=$(curl -s --max-time 5 -o /dev/null -w "%{http_code}" http://localhost:$CDP_PORT_N/json/version 2>/dev/null || echo "000")
 if [ "$HTTP_CODE" = "200" ]; then
   CURR="up"
 else
@@ -78,7 +80,7 @@ fi
 # always kept so the window (and the CDP port) stays alive.
 if [ "$CURR" = "up" ]; then
   TAB_SNAP="$HOME/Dev/jori/data/chrome-tab-snapshot.json"
-  CLOSE_IDS=$(curl -s --max-time 5 "http://localhost:9222/json/list" | TAB_SNAP="$TAB_SNAP" python3 -c '
+  CLOSE_IDS=$(curl -s --max-time 5 "http://localhost:$CDP_PORT_N/json/list" | TAB_SNAP="$TAB_SNAP" python3 -c '
 import json, os, sys
 try:
     tabs = json.load(sys.stdin)
@@ -104,7 +106,7 @@ for tid in sorted(set(cur) & prev):
     HYG_N=0
     while IFS= read -r id; do
       [ -z "$id" ] && continue
-      curl -sf --max-time 5 "http://localhost:9222/json/close/$id" >/dev/null 2>&1 && HYG_N=$((HYG_N+1))
+      curl -sf --max-time 5 "http://localhost:$CDP_PORT_N/json/close/$id" >/dev/null 2>&1 && HYG_N=$((HYG_N+1))
     done <<< "$CLOSE_IDS"
     [ "$HYG_N" -gt 0 ] && echo "$(date '+%Y-%m-%d %H:%M:%S') [chrome-cdp-watch] tab-hygiene: reaped $HYG_N leaked page tab(s)" >> "$LOG"
   fi
@@ -173,7 +175,7 @@ self_heal_chrome_cdp() {
     return 0
   fi
   echo "$(date '+%Y-%m-%d %H:%M:%S') [chrome-cdp-watch] heal tier3: bootstrap failed — direct-launching chrome" >> "$LOG"
-  nohup "$CHROME_BIN" --remote-debugging-port=9222 --user-data-dir="$CHROME_PROFILE" \
+  nohup "$CHROME_BIN" --remote-debugging-port=$CDP_PORT_N --user-data-dir="$CHROME_PROFILE" \
     --no-first-run --no-default-browser-check --disable-features=ChromeWhatsNewUI about:blank \
     >> "$LOG" 2>&1 &
   return 0
@@ -225,7 +227,7 @@ if [ "$PREV" = "down" ] && [ "$CURR" = "down" ] && [ -z "$PREV_NOTIFIED" ]; then
     # JORI_INFRA_PROBE=1 — cron-run, un-sandboxed HTTP probe of :9222, so
     # it may make a machine-health claim (see jori-send-curl's gate).
     JORI_INFRA_PROBE=1 "$HOME/Dev/jori/bin/jori-send-curl" --suppress-hook --skip-precheck --intent chrome-cdp-down --channel system \
-      "🔌 Chrome DevTools port 9222 unreachable (HTTP $HTTP_CODE) — auto-restart of com.jori.chrome-cdp didn't recover it. Likely TCC permission prompt (Screen Recording / Accessibility / Automation) or chrome-devtools-mcp re-signed. Browser-automation jobs will skip until this clears. Manual intervention needed." \
+      "🔌 Chrome DevTools port $CDP_PORT_N unreachable (HTTP $HTTP_CODE) — auto-restart of com.jori.chrome-cdp didn't recover it. Likely TCC permission prompt (Screen Recording / Accessibility / Automation) or chrome-devtools-mcp re-signed. Browser-automation jobs will skip until this clears. Manual intervention needed." \
       > /dev/null 2>&1
     write_state "down" "$NOW_ISO" "keep"
   fi

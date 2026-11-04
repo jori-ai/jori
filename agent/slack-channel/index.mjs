@@ -29,6 +29,7 @@ import {
 const require = createRequire(import.meta.url);
 const { loadEnv, DEFAULT_ENV_PATH } = require("../../lib/load-env.js");
 const { localConfig } = require("../../lib/instance.cjs");
+const { port: registryPort } = require("../../lib/ports.cjs");
 
 loadEnv();
 
@@ -41,7 +42,7 @@ const UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (
 function config() {
   return localConfig("slack-channel", DEFAULTS);
 }
-const PORT = Number(process.env.SLACK_CHANNEL_PORT || config().port || 9108);
+const PORT = Number(process.env.SLACK_CHANNEL_PORT || config().port || registryPort("slack"));
 
 function log(msg) {
   console.error(`[slack-channel] ${new Date().toISOString()} ${msg}`);

@@ -19,10 +19,11 @@
 import fs from "node:fs";
 import path from "node:path";
 import { installTools } from "../lib/root.cjs";
+import { localUrl } from "../lib/ports.cjs";
 import { linkGate } from "../lib/link-check.mjs";
 import { parseSendArgs, parseTarget, findDash } from "../agent/slack-channel/core.mjs";
 
-const RUNNER = process.env.SLACK_RUNNER_URL || "http://127.0.0.1:9108";
+const RUNNER = process.env.SLACK_RUNNER_URL || localUrl("slack");
 const INBOX = installTools("data/slack-inbox.jsonl");
 
 function usage() {

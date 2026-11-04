@@ -29,6 +29,7 @@ const SYSTEM = path.join(TOOLS, 'system');
 // doctor --repair) go to the local file only.
 const registry = require(path.join(__dirname, '..', 'lib', 'registry.cjs'));
 const { instance } = require(path.join(__dirname, '..', 'lib', 'instance.cjs'));
+const { port: portOf } = require(path.join(__dirname, '..', 'lib', 'ports.cjs'));
 const OWNER = instance().owner_name;
 const OWNER_EMAIL = instance().owner_email;
 const ARCH_MD = path.join(SYSTEM, 'architecture.md');
@@ -403,7 +404,7 @@ function cmdStatus(args) {
       console.log(`  ${mark} ${ch.name.padEnd(20)} ${c.dim(`pid=${ch.pid || '-'} restarts=${ch.restarts} up=${up}`)}`);
     }
   } else {
-    console.log(c.bold('Process Manager:') + '  ' + c.red('unreachable on :9095'));
+    console.log(c.bold('Process Manager:') + '  ' + c.red(`unreachable on :${portOf('process_manager')}`));
   }
 
   // Chat Agent
@@ -424,7 +425,7 @@ function cmdStatus(args) {
     const inf = ch.inFlight ? 'in-flight' : 'idle';
     console.log(`  ${c.dim('○')} queue${c.dim(`             ${qd} queued, ${inf}`)}`);
   } else {
-    console.log('\n' + c.bold('Chat Agent:') + '  ' + c.red('unreachable on :9094'));
+    console.log('\n' + c.bold('Chat Agent:') + '  ' + c.red(`unreachable on :${portOf('chat_health')}`));
   }
 
   // Ops Agent
@@ -438,7 +439,7 @@ function cmdStatus(args) {
     const inf = op.inFlight ? 'in-flight' : 'idle';
     console.log(`  ${c.dim('○')} queue${c.dim(`             ${qd} queued, ${inf}`)}`);
   } else {
-    console.log('\n' + c.bold('Ops Agent:') + '  ' + c.red('unreachable on :9093'));
+    console.log('\n' + c.bold('Ops Agent:') + '  ' + c.red(`unreachable on :${portOf('ops_health')}`));
   }
 
   // Services
@@ -483,11 +484,11 @@ function collectStatus() {
   const status = { processManager: null, chat: null, ops: null, services: [], heartbeat_age_seconds: null, triage: { received: 0, actions: 0, paused: fs.existsSync(PAUSE_FLAG) }, next_task: null };
 
   // process-manager health
-  status.processManager = fetchJson('http://127.0.0.1:9095/health');
+  status.processManager = fetchJson(`http://127.0.0.1:${portOf('process_manager')}/health`);
 
   // supervisor health
-  status.chat = fetchJson('http://127.0.0.1:9094/health');
-  status.ops = fetchJson('http://127.0.0.1:9093/health');
+  status.chat = fetchJson(`http://127.0.0.1:${portOf('chat_health')}/health`);
+  status.ops = fetchJson(`http://127.0.0.1:${portOf('ops_health')}/health`);
 
   // services from launchctl
   const lc = shSafe('launchctl list') || '';
@@ -726,7 +727,7 @@ function cmdTriageStatus(args) {
     last_event_age_seconds: null,
   };
   // Check supervisor health
-  const health = shSafe('curl -s --max-time 3 http://127.0.0.1:9093/health');
+  const health = shSafe(`curl -s --max-time 3 http://127.0.0.1:${portOf('ops_health')}/health`);
   if (health) {
     s.supervisor_up = true;
     try { s.supervisor_health = JSON.parse(health); } catch {}
@@ -757,7 +758,7 @@ function cmdTriageStatus(args) {
   const h = s.supervisor_health;
   console.log(c.bold('Email Triage Status') + '\n');
   console.log(`  ${s.paused ? c.yellow('⏸ PAUSED') : c.green('▶ active')}`);
-  console.log(`  supervisor (HTTP 9093):     ${s.supervisor_up ? c.green('up') : c.red('down')}`);
+  console.log(`  supervisor (HTTP ${portOf('ops_health')}):     ${s.supervisor_up ? c.green('up') : c.red('down')}`);
   console.log(`  ops-agent (pane 1):         ${s.ops_agent_running ? c.green('running') : c.red('not running')}`);
   if (h) {
     console.log(`  model:                      ${h.model || 'unknown'}`);
@@ -942,7 +943,7 @@ function cmdTriageResume() {
   console.log(c.green('▶ triage resumed') + c.dim(` (was paused since ${since})`));
   // Dispatch CATCH UP task so ops-agent processes emails missed during pause
   const body = JSON.stringify({ task: `CATCH UP: Triage was paused since ${since}. Fetch all emails received since the last saved historyId and triage each one.` });
-  const { code, stderr } = postWebhook('http://localhost:9092', body);
+  const { code, stderr } = postWebhook(`http://localhost:${portOf('ops_webhook')}`, body);
   if (code.startsWith('2')) console.log(c.green('  ✓ dispatched CATCH UP to ops-agent'));
   else {
     console.log(c.yellow(`  catch-up dispatch failed (HTTP ${code}) — ops-agent may not be listening`));
@@ -956,7 +957,7 @@ function cmdTriageReclassify(args) {
   // messageId validation: Gmail IDs are hex, 14-20 chars typically
   if (!/^[a-zA-Z0-9_-]{8,40}$/.test(msgId)) die(`reclassify: messageId looks invalid (got "${msgId}")`);
   const body = JSON.stringify({ task: `RECLASSIFY: ${msgId}` });
-  const { code, stderr } = postWebhook('http://localhost:9092', body);
+  const { code, stderr } = postWebhook(`http://localhost:${portOf('ops_webhook')}`, body);
   if (code.startsWith('2')) console.log(c.green('✓ dispatched: ') + c.bold(`RECLASSIFY ${msgId}`));
   else {
     console.error(c.red(`✗ dispatch failed (HTTP ${code})`));
@@ -970,7 +971,7 @@ function cmdTriageResolve(args) {
   if (!topic) die('resolve: missing <topic>. Usage: jori triage resolve "<topic text>"');
   if (topic.length > 300) die('resolve: topic too long (>300 chars)');
   const body = JSON.stringify({ task: `RESOLVE P1: ${topic}`, source: 'jori-triage-resolve' });
-  const { code, stderr } = postWebhook('http://localhost:9092', body);
+  const { code, stderr } = postWebhook(`http://localhost:${portOf('ops_webhook')}`, body);
   if (code.startsWith('2')) console.log(c.green('✓ dispatched: ') + c.bold(`RESOLVE P1: ${topic}`));
   else {
     console.error(c.red(`✗ dispatch failed (HTTP ${code})`));
@@ -1012,7 +1013,7 @@ function cmdRestart(args) {
   const target = ALIASES[raw];
   if (!target) die(`restart: unknown target '${raw}'. Use: ops, chat, whatsapp-channel, imessage-channel, slack-channel, wiki-server, session.`);
 
-  const PM = 'http://127.0.0.1:9095/health';
+  const PM = `http://127.0.0.1:${portOf('process_manager')}/health`;
 
   // session: restart the whole stack. process-manager is booted by the
   // ai.claude.session LaunchAgent; kickstart -k kills + relaunches it, tearing
@@ -1032,7 +1033,7 @@ function cmdRestart(args) {
   // POST behind a bearer token (secrets/webhook-token); chat :9094 does
   // not — sending the header is harmless either way. The session warm-resumes
   // (same sessionId), so success is verified by restartCount advancing.
-  const SUPERVISOR_PORT = { ops: 9093, chat: 9094 };
+  const SUPERVISOR_PORT = { ops: portOf('ops_health'), chat: portOf('chat_health') };
   if (SUPERVISOR_PORT[target]) {
     const port = SUPERVISOR_PORT[target];
     const before = fetchJson(`http://127.0.0.1:${port}/health`);
@@ -1066,16 +1067,16 @@ function cmdRestart(args) {
   // inner session. SIGTERM the child; process-manager (ManagedProcess) sees the
   // exit (stopping=false → _scheduleRestart) and respawns it.
   const CHILD = {
-    'whatsapp-channel': { verify: 'http://127.0.0.1:9100/health', verifyNote: 'paired + listening' },
-    'imessage-channel': { verify: 'http://127.0.0.1:9107/health', verifyNote: 'tailing chat.db' },
-    'slack-channel':    { verify: 'http://127.0.0.1:9108/health', verifyNote: 'runner up' },
-    'wiki-server':      { verify: 'http://127.0.0.1:9096/',       verifyNote: 'serving' },
+    'whatsapp-channel': { verify: `http://127.0.0.1:${portOf('whatsapp')}/health`, verifyNote: 'paired + listening' },
+    'imessage-channel': { verify: `http://127.0.0.1:${portOf('imessage')}/health`, verifyNote: 'tailing chat.db' },
+    'slack-channel':    { verify: `http://127.0.0.1:${portOf('slack')}/health`, verifyNote: 'runner up' },
+    'wiki-server':      { verify: `http://127.0.0.1:${portOf('wiki')}/`,       verifyNote: 'serving' },
   };
   const spec = CHILD[target];
 
   const pm = fetchJson(PM);
   if (!pm) {
-    die(`restart: process-manager unreachable on :9095 — it supervises ${target}, so a kill would NOT auto-respawn. Bring the stack up first: jori restart session`);
+    die(`restart: process-manager unreachable on :${portOf('process_manager')} — it supervises ${target}, so a kill would NOT auto-respawn. Bring the stack up first: jori restart session`);
   }
   const before = (pm.children || []).find((ch) => ch.name === target);
   if (!before) {
@@ -1512,26 +1513,26 @@ function cmdDoctor(args) {
   } catch (e) { if (e.code !== 'ENOENT') add('cron runs not stuck-failing', false, `cron-runs.jsonl read failed: ${e.message}`); }
 
   // 9. process-manager running (check HTTP health endpoint — pgrep can't see cross-session processes on macOS)
-  const pmHealth = shSafe('curl -sf --max-time 3 http://127.0.0.1:9095/health');
-  add('process-manager running', !!pmHealth, pmHealth ? 'HTTP 200' : 'unreachable on :9095 — check launchd');
+  const pmHealth = shSafe(`curl -sf --max-time 3 http://127.0.0.1:${portOf('process_manager')}/health`);
+  add('process-manager running', !!pmHealth, pmHealth ? 'HTTP 200' : `unreachable on :${portOf('process_manager')} — check launchd`);
 
   // 10. supervisor health endpoints reachable
-  const chatHealth = fetchJson('http://127.0.0.1:9094/health');
-  add('chat supervisor reachable', !!chatHealth, chatHealth ? 'HTTP 200' : 'unreachable on :9094');
-  const opsHealth = fetchJson('http://127.0.0.1:9093/health');
-  add('ops supervisor reachable', !!opsHealth, opsHealth ? 'HTTP 200' : 'unreachable on :9093');
+  const chatHealth = fetchJson(`http://127.0.0.1:${portOf('chat_health')}/health`);
+  add('chat supervisor reachable', !!chatHealth, chatHealth ? 'HTTP 200' : `unreachable on :${portOf('chat_health')}`);
+  const opsHealth = fetchJson(`http://127.0.0.1:${portOf('ops_health')}/health`);
+  add('ops supervisor reachable', !!opsHealth, opsHealth ? 'HTTP 200' : `unreachable on :${portOf('ops_health')}`);
 
   // 10b. WhatsApp channel reachable + paired. Runs as the 5th process-manager
   // child (Baileys gateway). If the process is up but unpaired, the host_jid
   // field is null and we need to re-run the pair flow.
-  const waHealth = fetchJson('http://127.0.0.1:9100/health');
+  const waHealth = fetchJson(`http://127.0.0.1:${portOf('whatsapp')}/health`);
   const waPaired = waHealth && waHealth.host_jid;
   add('whatsapp-channel reachable + paired', !!waPaired,
     waPaired
       ? `paired as ${waHealth.host_jid} (${waHealth.host_name || 'unknown'})`
       : waHealth
         ? 'up but unpaired — wa-auth missing or session revoked; re-pair via `npm run pair -- --phone <E164>` in agent/whatsapp-channel'
-        : 'unreachable on :9100 — process-manager should be supervising it; check whatsapp-channel.log');
+        : `unreachable on :${portOf('whatsapp')} — process-manager should be supervising it; check whatsapp-channel.log`);
 
   // 11. MCP configs are valid JSON
   for (const name of ['chat-mcp-config.json', 'mcp-config.json']) {
@@ -1551,8 +1552,8 @@ function cmdDoctor(args) {
   // was changed long ago and the supervisor was never bounced to pick it up.
   const CLAUDE_MD_GRACE_MIN = 10;
   for (const [name, port, relPath] of [
-    ['chat', 9094, 'agent/chat-agent/CLAUDE.md'],
-    ['ops', 9093, 'agent/ops-agent/CLAUDE.md'],
+    ['chat', portOf('chat_health'), 'agent/chat-agent/CLAUDE.md'],
+    ['ops', portOf('ops_health'), 'agent/ops-agent/CLAUDE.md'],
   ]) {
     const cmdPath = path.join(TOOLS, relPath);
     let ok = false;
@@ -1619,11 +1620,11 @@ function cmdDoctor(args) {
   // stub on :9222 from the user's interactive profile that 404s on every CDP
   // path. `localhost` resolves to ::1 first on macOS and hits the LaunchAgent
   // automation Chrome (com.jori.chrome-cdp) which binds IPv6 :9222.
-  const cdpProbe = shSafe('curl -s --max-time 5 -o /dev/null -w "%{http_code}" http://localhost:9222/json/version 2>/dev/null') || '000';
+  const cdpProbe = shSafe(`curl -s --max-time 5 -o /dev/null -w "%{http_code}" http://localhost:${portOf('chrome_cdp')}/json/version 2>/dev/null`) || '000';
   const cdpUp = cdpProbe === '200';
   add('chrome CDP port reachable', cdpUp, cdpUp
-    ? 'HTTP 200 on :9222/json/version'
-    : `HTTP ${cdpProbe} on :9222 — automation Chrome not running. Check LaunchAgent: launchctl list | grep com.jori.chrome-cdp. Browser-automation jobs will skip until this clears.`);
+    ? `HTTP 200 on :${portOf('chrome_cdp')}/json/version`
+    : `HTTP ${cdpProbe} on :${portOf('chrome_cdp')} — automation Chrome not running. Check LaunchAgent: launchctl list | grep com.jori.chrome-cdp. Browser-automation jobs will skip until this clears.`);
 
   // 15. gog tasks CLI reachable. The 2026-04-29 review documented memories
   // #914/#920 falsely flagging "gog CLI unavailable" because the symlink
@@ -1752,7 +1753,7 @@ function cmdDoctor(args) {
         schedule: newSched,
         schedule_human: newSched,
         trigger_script: `agent/scripts/${bname}`,
-        webhook_url: 'http://localhost:9092',
+        webhook_url: `http://localhost:${portOf('ops_webhook')}`,
         webhook_task: taskName.toUpperCase().replace(/-/g, ' '),
         ops_playbook_section: null,
         delivers_to: 'unknown',
@@ -2230,8 +2231,8 @@ function cmdHumReview(args) {
 function cmdHumTest(args) {
   const lane = getFlag(args, '--lane', null);
   const payload = lane ? JSON.stringify({ job: 'hum', force_lane: lane }) : JSON.stringify({ job: 'hum' });
-  console.log(c.dim(`Dispatching hum to http://localhost:9092 (bypasses jitter)...`));
-  const res = shSafe(`curl -sf --max-time 5 -X POST http://localhost:9092 -H "Content-Type: application/json" -d '${payload}'`);
+  console.log(c.dim(`Dispatching hum to http://localhost:${portOf('ops_webhook')} (bypasses jitter)...`));
+  const res = shSafe(`curl -sf --max-time 5 -X POST http://localhost:${portOf('ops_webhook')} -H "Content-Type: application/json" -d '${payload}'`);
   if (res === null) die('dispatch failed — is the ops supervisor running? Check: jori status');
   console.log(c.green('Dispatched.') + ' Tail progress: ' + c.dim('jori hum runs --tail 5'));
 }
@@ -2258,8 +2259,8 @@ function cmdHumTune(args) {
 
 // --- cost ---
 function cmdCost(args) {
-  const data = shSafe('curl -sf --max-time 3 http://127.0.0.1:9093/cost');
-  if (!data) { die('supervisor not reachable on :9093. Is the ops-supervisor running?'); return; }
+  const data = shSafe(`curl -sf --max-time 3 http://127.0.0.1:${portOf('ops_health')}/cost`);
+  if (!data) { die(`supervisor not reachable on :${portOf('ops_health')}. Is the ops-supervisor running?`); return; }
   const j = JSON.parse(data);
   if (hasFlag(args, '--json')) { console.log(JSON.stringify(j, null, 2)); return; }
   console.log(c.bold('Ops Agent Cost') + '\n');

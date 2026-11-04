@@ -20,6 +20,7 @@ const require = createRequire(import.meta.url);
 // This installation's identity (lib/instance.cjs): the agent's own
 // address and the operator's name, from agent/local/instance.json.
 const { instance, agentAddresses, localConfig } = require("../../lib/instance.cjs");
+const ASSISTANT = require("../../lib/instance.cjs").assistantName(); // the assistant's configured name (lib/instance.cjs)
 const INSTANCE = instance();
 // A label an installation's own Gmail filter applies to every inbound message
 // server-side (email-triage-rules.md Step 4 "Pre-applied label mismatch"), which
@@ -728,7 +729,7 @@ export function buildTriageDispatch(p, rulesIdx = "") {
     const subj = /^\s*re:/i.test(p.subject || "") ? p.subject : `Re: ${p.subject || ""}`;
     const refs = [p.rfcReferences, p.rfcMessageId].filter(Boolean).join(" ");
     lines.push(
-      "REPLY ON THIS THREAD WHEN DONE. The user asked by email, so the result goes back as a reply on this email thread — that reply IS the confirmation (a chat ping is optional, never a substitute). Send it once the instruction is carried out (or blocked, saying why); one short plain-text paragraph in their words, signed \"Jori\". This is a substantive result, not an acknowledgment, so the no-ack rule does not apply; still no \"on it\" reply before the work. If you hand the work off as its own dispatched task, copy these reply details into that task so the turn that finishes the work sends the reply.",
+      "REPLY ON THIS THREAD WHEN DONE. The user asked by email, so the result goes back as a reply on this email thread — that reply IS the confirmation (a chat ping is optional, never a substitute). Send it once the instruction is carried out (or blocked, saying why); one short plain-text paragraph in their words, signed \"" + ASSISTANT + "\". This is a substantive result, not an acknowledgment, so the no-ack rule does not apply; still no \"on it\" reply before the work. If you hand the work off as its own dispatched task, copy these reply details into that task so the turn that finishes the work sends the reply.",
       `  To: ${extractEmailAddr(p.from) || p.from}`,
       `  Subject: ${subj}`,
       `  In-Reply-To: ${p.rfcMessageId}`,

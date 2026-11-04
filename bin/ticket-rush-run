@@ -20,6 +20,7 @@ import path from "node:path";
 import { promisify } from "node:util";
 import { runActionCdp, extractActionBlock } from "../browsing-skills/tools/cdp-runner.mjs";
 import { lotteryConfig, installPath, readJson, writeJson, localDate, loadShows, matchShow } from "../lib/ticket-lottery.mjs";
+import { port } from "../lib/ports.cjs";
 
 const pexec = promisify(execFile);
 const log = (...a) => console.log(`[${new Date().toISOString()}]`, ...a);
@@ -57,7 +58,7 @@ async function main() {
   const STATE = installPath(R.state_file || "data/ticket-rush-state.json");
   const PAUSE = installPath(R.pause_file || "data/ticket-rush-pause.json");
   const SKILL = installPath(path.join("browsing-skills", "skills", R.site, "references", `${R.action || "rush-availability"}.md`));
-  const cdp = cfg.cdp_host || "localhost:9222";
+  const cdp = cfg.cdp_host || `localhost:${port("chrome_cdp")}`;
   const today = localDate(cfg.tz);
 
   const pause = readJson(PAUSE, null);

@@ -139,7 +139,7 @@ async function createDoc(filePath, data) {
 
   const doc = new Document({
     sections: [{ children }],
-    creator: data.author || "Jori",
+    creator: data.author || require("../lib/instance.cjs").assistantName(),
     title: data.title || "",
     description: data.description || "",
   });
@@ -201,7 +201,7 @@ function readDoc(filePath) {
 async function createSheet(filePath, data) {
   const ExcelJS = require("exceljs");
   const workbook = new ExcelJS.Workbook();
-  workbook.creator = data.author || "Jori";
+  workbook.creator = data.author || require("../lib/instance.cjs").assistantName();
   workbook.created = new Date();
 
   for (const sheetData of (data.sheets || [])) {

@@ -39,6 +39,7 @@
 //           run one in chunks (--since/--limit), not in one go.
 
 const { execFile } = require("node:child_process");
+const { MODELS } = require("../lib/models.cjs");
 const { promisify } = require("node:util");
 const fs = require("node:fs");
 
@@ -109,7 +110,7 @@ const EXPLICIT_IDS = (() => {
 const RESCAN = ARGV.includes("--rescan");
 
 /** Cheap and fast — each judgement is one short document. */
-const MODEL = "claude-sonnet-5-5";
+const MODEL = MODELS.sonnet;
 
 /**
  * Mail worth looking at, as SEPARATE searches whose results are unioned.

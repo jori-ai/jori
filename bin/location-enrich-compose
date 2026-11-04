@@ -17,6 +17,7 @@
 // Prints a JSON summary; `.residue` is the count the runner dispatches on.
 
 import fs from "node:fs";
+import { MODELS } from "../lib/models.cjs";
 import path from "node:path";
 import { installTools } from "../lib/root.cjs";
 import { spawnSync } from "node:child_process";
@@ -88,7 +89,7 @@ async function sonnetRung(items) {
   const { judge } = require("../lib/max-judge.js");
   try {
     return await judge({
-      model: "claude-sonnet-5-5", effort: "low",
+      model: MODELS.sonnet, effort: "low",
       system: SYSTEM_PROMPT, prompt: userPrompt(items), schema: ASK_SCHEMA, timeoutMs: 120000,
     });
   } catch (e) {

@@ -17,6 +17,7 @@
 // Max invariant: the executor strips ANTHROPIC_API_KEY; never a raw SDK/API key.
 
 import fs from "node:fs";
+import { MODELS } from "../lib/models.cjs";
 import { runOneShot } from "../agent/core/one-shot.mjs";
 
 function parse(argv) {
@@ -48,7 +49,7 @@ async function main() {
     process.exit(2);
   }
   const { id, text } = await runOneShot(o.task, {
-    model: o.model || "claude-sonnet-5-5",
+    model: o.model || MODELS.sonnet,
     system: o.system || "",
     allowedTools: o.allowedTools || null,
     cwd: o.cwd || null,

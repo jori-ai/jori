@@ -37,6 +37,7 @@ import { openTab, goto, clickElement as clickVisible, sleep } from "../lib/cdp-t
 import { createRequire } from "node:module";
 const require = createRequire(import.meta.url);
 const aw = require("../lib/awardwallet-api.js");
+const { port } = require("../lib/ports.cjs");
 const { LOCKOUT_RISK_CODES } = require("../lib/awardwallet-map.js");
 
 const LIST_URL = "https://awardwallet.com/account/list/";
@@ -84,7 +85,7 @@ async function main() {
 
     const href = await tab.evaluate("location.href");
     if (/\/login/.test(href)) {
-      const e = new Error("AwardWallet is signed out in the automation Chrome (:9222) — sign in at awardwallet.com there");
+      const e = new Error(`AwardWallet is signed out in the automation Chrome (:${port("chrome_cdp")}) — sign in at awardwallet.com there`);
       e.code = "SIGNED_OUT";
       throw e;
     }

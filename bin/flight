@@ -33,8 +33,10 @@ function tzLabel(at = new Date(), tz = HOME_TZ) {
 const OPENSKY_BASE = "https://opensky-network.org/api";
 const OPENSKY_AUTH_URL =
   "https://auth.opensky-network.org/auth/realms/opensky-network/protocol/openid-connect/token";
-const CREDIT_SOFT_LIMIT = 300;
-const CREDIT_HARD_LIMIT = 350;
+// OpenSky daily credit budget (agent/local/config/flight.json; these are the defaults).
+const CREDITS = require("../lib/instance.cjs").localConfig("flight", { credit_soft_limit: 300, credit_hard_limit: 350 });
+const CREDIT_SOFT_LIMIT = Number(CREDITS.credit_soft_limit);
+const CREDIT_HARD_LIMIT = Number(CREDITS.credit_hard_limit);
 
 // ── Thresholds ─────────────────────────────────────────────────────────────
 const MONITOR_WINDOW_BEFORE_MS = 2 * 3600_000; // start 2h before departure

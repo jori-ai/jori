@@ -31,13 +31,17 @@ import { dueForReask } from "../../../lib/open-questions.mjs";
 import { reportBacklog, scaledLanePacing } from "../../../lib/question-pacing.mjs";
 
 import { installTools } from "../../../lib/root.cjs";
+import { assistantName, localConfig } from "../../../lib/instance.cjs";
+const ASSISTANT = assistantName(); // the assistant's configured name (lib/instance.cjs)
 await readStdinJson();
 
 const DATA = process.env.JORI_DATA_DIR || installTools("data");
 const RUNS = process.env.HUM_RUNS_FILE || path.join(DATA, "hum-runs.jsonl");
 
-export const REASK_MAX_PER_DAY = 2;
-export const REASK_SPACING_H = 3;
+// Re-ask pacing (agent/local/config/hum-open-questions.json; these are the defaults).
+const REASK = localConfig("hum-open-questions", { reask_max_per_day: 2, reask_spacing_h: 3 });
+export const REASK_MAX_PER_DAY = Number(REASK.reask_max_per_day);
+export const REASK_SPACING_H = Number(REASK.reask_spacing_h);
 
 function readJsonl(p) {
   try {
@@ -81,7 +85,7 @@ try {
   const q = due[0];
 
   const signal = [
-    `An unanswered Jori question. It was first asked ${fmtAgo(q.first_asked_at, now)} and has gone out ${q.asks} time${q.asks === 1 ? "" : "s"} with no answer; ${OWNER_NAME} asked that questions be repeated until answered, because they can arrive when the user can't reply and get buried.`,
+    `An unanswered ${ASSISTANT} question. It was first asked ${fmtAgo(q.first_asked_at, now)} and has gone out ${q.asks} time${q.asks === 1 ? "" : "s"} with no answer; ${OWNER_NAME} asked that questions be repeated until answered, because they can arrive when the user can't reply and get buried.`,
     "Ask it again as ONE short, warm question in fresh words. Say lightly that you're coming back to it (never guilt, never \"you didn't answer\"). Keep its meaning and any open-endedness; freshen relative time words (\"today\" asked yesterday is now \"yesterday\").",
     "If it is NO LONGER RELEVANT — its moment passed, a later chat message or memory already answers it, or what it asks about is settled — do not ask: list it in retire_questions with why, and pick another candidate or stay silent.",
     `Last asked as: ${String(q.question || "").slice(0, 600)}`,

@@ -26,6 +26,7 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { createHash } from "node:crypto";
 import { installRoot } from "../lib/root.cjs";
+import { port as registryPort } from "../lib/ports.cjs";
 const exec = promisify(execFile);
 
 const ROOT = installRoot();
@@ -253,7 +254,7 @@ const inert = Object.keys(item.files).filter((f) => BOOT_LOADED.some((re) => re.
 let rationaleOut = rationale;
 if (inert.length) {
   const which = inert.length === 1 ? inert[0] : `${inert.length} files, including ${inert[0]}`;
-  rationaleOut = `${rationale}${rationale ? "\n\n" : ""}\u23f3 Heads up: this one needs a restart before it does anything. It changes ${which}, which the supervisors read once when they start up — so approving it writes the file, but the running processes keep the old code until they come back. \`launchctl kickstart -k gui/$(id -u)/ai.claude.session\` is what brings them back. Restarting just the claude child (POST :9093/restart) will not do it — that leaves the same node process holding the same old code.`;
+  rationaleOut = `${rationale}${rationale ? "\n\n" : ""}\u23f3 Heads up: this one needs a restart before it does anything. It changes ${which}, which the supervisors read once when they start up — so approving it writes the file, but the running processes keep the old code until they come back. \`launchctl kickstart -k gui/$(id -u)/ai.claude.session\` is what brings them back. Restarting just the claude child (POST :${registryPort("ops_health")}/restart) will not do it — that leaves the same node process holding the same old code.`;
 }
 
 // A declared large removal is shown on the card, so the signature is given knowing it.

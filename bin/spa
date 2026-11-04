@@ -49,7 +49,7 @@ const API_KEY = process.env.SPA_SERVER_API_KEY;
 // An installation whose SpaServer already knows another name pins it in
 // spa.json `device_id`.
 const DEVICE_ID = String(CFG.device_id || "jori-cli");
-const DEVICE_NAME = "Jori";
+const DEVICE_NAME = require("../lib/instance.cjs").assistantName();
 
 // /spaOn and /spaOff each sleep ~10s server-side waiting for iAqualink to
 // settle, on top of two refreshes against an API that is routinely slow.

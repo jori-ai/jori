@@ -44,6 +44,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
 import { connect } from "../lib/cdp.mjs";
+import { port } from "../lib/ports.cjs";
 import supa from "../lib/supabase-rest.js";
 import rootLib from "../lib/root.cjs";
 const { request } = supa;
@@ -239,17 +240,17 @@ async function main() {
   try {
     browser = await connect();
   } catch (e) {
-    const detail = `connect() to localhost:9222 failed: ${e.message}`;
+    const detail = `connect() to localhost:${port("chrome_cdp")} failed: ${e.message}`;
     console.error(
       `Cannot reach the automation Chrome (${e.message}).\n` +
-        `It is the LaunchAgent com.jori.chrome-cdp, port 9222.`
+        `It is the LaunchAgent com.jori.chrome-cdp, port ${port("chrome_cdp")}.`
     );
     // chrome-cdp-watch also notices a dead port, but it cannot know this job
     // needed it — and this one failing silently means receipts stop improving.
     if (!DRY_RUN) {
       alert(
         "amazon-order-detail could not reach the automation Chrome " +
-          "(com.jori.chrome-cdp, port 9222), so no Amazon orders were read.",
+          `(com.jori.chrome-cdp, port ${port("chrome_cdp")}), so no Amazon orders were read.`,
         detail
       );
     }

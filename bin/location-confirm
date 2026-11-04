@@ -81,6 +81,7 @@ from datetime import datetime, timedelta, timezone
 # sit directly under it since the 2026-10-28 move off ~/Dev/gandalf/tools.
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "lib"))
 import places_local  # noqa: E402  (kernel: install root, instance, local config)
+import ports  # noqa: E402  (lib/ports.cjs registry)
 INSTALL_ROOT = places_local.install_root()
 DATA_DIR = os.path.join(INSTALL_ROOT, "data")
 CONFIRMED_FILE = os.path.join(DATA_DIR, "confirmed-stops.json")
@@ -1274,7 +1275,7 @@ def _dispatch_silent_rerender(dates: list[str]) -> int:
             "source": "late-correction-rerender",
         }).encode("utf-8")
         req = urllib.request.Request(
-            "http://localhost:9093/dispatch",
+            f"http://localhost:{ports.port('ops_health')}/dispatch",
             data=body,
             method="POST",
             headers={

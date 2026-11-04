@@ -31,6 +31,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { createRequire } from "node:module";
 import { connect } from "../lib/cdp.mjs";
+import { port as registryPort } from "../lib/ports.cjs";
 import supa from "../lib/supabase-rest.js";
 const { request } = supa;
 
@@ -114,7 +115,7 @@ async function main() {
     page = await connect();
   } catch (e) {
     console.error(`zestimate: cannot reach Chrome on CDP — ${e.message}`);
-    console.error("Chrome must be running with --remote-debugging-port=9222 (chrome-cdp-watch keeps it up).");
+    console.error(`Chrome must be running with --remote-debugging-port=${registryPort("chrome_cdp")} (chrome-cdp-watch keeps it up).`);
     process.exit(1);
   }
 

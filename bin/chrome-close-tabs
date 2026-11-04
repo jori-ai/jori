@@ -17,7 +17,8 @@
 
 set -u
 
-CDP_BASE="${CDP_BASE:-http://localhost:9222}"
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../agent/scripts/lib/root.sh"   # JORI_TOOLS, JORI_NODE
+CDP_BASE="${CDP_BASE:-http://localhost:$("$JORI_NODE" "$JORI_TOOLS/lib/ports.cjs" chrome_cdp)}"
 MAX_PASSES=3
 
 if ! curl -sf --max-time 5 "${CDP_BASE}/json/version" > /dev/null 2>&1; then

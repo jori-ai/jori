@@ -58,6 +58,8 @@
   <button id="up">&#9650;</button><button id="down">&#9660;</button>
 </div>
 <script>
+// The assistant's configured name, set on <html data-assistant> by server.mjs.
+const ASSISTANT = document.documentElement.dataset.assistant || "Jori";
 const $ = (id) => document.getElementById(id);
 const img = $("screen"), status = $("status");
 let seq = 0, alive = true, looping = false, stale = false, phone = false, zoom = 1, lastUrl = null, noteUntil = 0;
@@ -239,14 +241,14 @@ $("zin").onclick = () => setView(true, [...ZOOMS].reverse().find((z) => z > zoom
 $("done").onclick = async () => {
   await post({ type: "done" }).catch(() => {});
   alive = false;
-  note("Thanks — Jori will take it from here. You can close this page.", 864e5);
+  note("Thanks — " + ASSISTANT + " will take it from here. You can close this page.", 864e5);
 };
 
 // A link from Jori can suggest a sign-in page; it is opened only when tapped.
 const q = new URLSearchParams(location.search);
 if (q.get("open")) {
   $("offer").style.display = "block";
-  $("offerText").textContent = "Jori needs you signed in to " + (q.get("site") || new URL(q.get("open")).host) + ".";
+  $("offerText").textContent = ASSISTANT + " needs you signed in to " + (q.get("site") || new URL(q.get("open")).host) + ".";
   $("offerGo").onclick = () => post({ type: "navigate", url: q.get("open") }).then(() => ($("offer").style.display = "none")).catch(() => {});
 }
 

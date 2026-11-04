@@ -15,10 +15,12 @@ import { KERNEL, webhookToken, isHelp } from "./_common.mjs";
 
 const require = createRequire(import.meta.url);
 
+const { port } = require("../../lib/ports.cjs");
+const tier = (agent) => { const p = agent.replace("-", "_"); return [agent, port(`${p}_webhook`), port(`${p}_health`)]; };
 const TIERS = {
-  haiku: [["ops-haiku", 9072, 9073], ["ops-light", 9082, 9083], ["ops", 9092, 9093]],
-  light: [["ops-light", 9082, 9083], ["ops", 9092, 9093]],
-  heavy: [["ops", 9092, 9093]],
+  haiku: [tier("ops-haiku"), tier("ops-light"), tier("ops")],
+  light: [tier("ops-light"), tier("ops")],
+  heavy: [tier("ops")],
 };
 
 function resolveTier(job) {

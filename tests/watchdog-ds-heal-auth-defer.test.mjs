@@ -115,6 +115,9 @@ function makeSandbox() {
 }
 
 const env = (sb, extra = {}) => ({
+  // The real script gets these from lib/webhook-auth.sh (lib/ports.cjs).
+  JORI_PORT_OPS_WEBHOOK: "9092",
+  JORI_PORT_OPS_HEALTH: "9093",
   PATH: `${sb.bin}:/opt/homebrew/bin:/usr/bin:/bin`,
   HOME: sb.home,
   STUB_LOG_DIR: sb.root,

@@ -13,6 +13,7 @@
 // and lib/jev-p1-gate.mjs; resolved once via lib/jev-pending.mjs.
 
 import fs from "node:fs";
+import { MODELS } from "../lib/models.cjs";
 import os from "node:os";
 import path from "node:path";
 import { createRequire } from "node:module";
@@ -76,7 +77,7 @@ if (!p || p.kind !== "skipped") { process.stdout.write("null\n"); process.exit(0
 
 let legacyValue = null, agree = null;
 if (site === "hum-ping-gate") {
-  const v = firstJson(await runClaude("claude-sonnet-5-5", humPrompt(p.state)));
+  const v = firstJson(await runClaude(MODELS.sonnet, humPrompt(p.state)));
   if (v && typeof v.ping === "boolean") { legacyValue = { ping: v.ping, why: String(v.why || "").slice(0, 200), via: "sonnet-shadow" }; agree = v.ping === false; }
 } else if (site === "p1-resolution") {
   const v = firstJson(await runClaude("haiku", p1Prompt(p.state, p.ids)));

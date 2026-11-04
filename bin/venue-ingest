@@ -34,6 +34,7 @@
 
 import path from "node:path";
 import { execFileSync } from "node:child_process";
+import { port } from "../lib/ports.cjs";
 import { loadFetchers, BROWSER_KINDS, REPO, sourceCodeRef } from "../lib/venue-events/fetchers.mjs";
 import { loadStore, mergeSource, prune, writeJsonAtomic, venueHealthNote, repairSignal, sourceHealthVerdict, STORE_PATH } from "../lib/venue-events/store.mjs";
 import { requestRepair } from "../lib/skill-repair.mjs";
@@ -54,7 +55,7 @@ const CONFIG = venueConfig();
 
 async function cdpUp() {
   try {
-    const r = await fetch(`http://${process.env.CDP_HOST || "localhost:9222"}/json/version`, { signal: AbortSignal.timeout(3000) });
+    const r = await fetch(`http://${process.env.CDP_HOST || `localhost:${port("chrome_cdp")}`}/json/version`, { signal: AbortSignal.timeout(3000) });
     return r.ok;
   } catch { return false; }
 }

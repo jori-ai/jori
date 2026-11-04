@@ -36,6 +36,7 @@
 // lunch,coffee}]} — see the schema at the end of buildPrompt.
 
 import { execFileSync } from "node:child_process";
+import { MODELS } from "../lib/models.cjs";
 import { createRequire } from "node:module";
 import os from "node:os";
 import path from "node:path";
@@ -442,7 +443,7 @@ async function main() {
     let out;
     try {
       out = execFileSync("/bin/bash", ["-c",
-        `${CLAUDE_BIN} -p --model claude-sonnet-5-5 --effort medium --output-format text "${escaped}"`],
+        `${CLAUDE_BIN} -p --model ${MODELS.sonnet} --effort medium --output-format text "${escaped}"`],
         { encoding: "utf8", maxBuffer: 10 * 1024 * 1024, timeout: 300000 });
     } catch (e) { lastErr = e; continue; }
     const parsed = extractJson(out);

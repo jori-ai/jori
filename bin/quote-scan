@@ -42,6 +42,7 @@
 // launchd agent ai.claude.quote-scan, not from cron.
 
 const { execFile } = require("node:child_process");
+const { MODELS } = require("../lib/models.cjs");
 const { promisify } = require("node:util");
 const fs = require("node:fs");
 const os = require("node:os");
@@ -75,7 +76,7 @@ const VERBOSE = ARGV.includes("--verbose");
 const RESCAN = ARGV.includes("--rescan");
 const TEXTS = ARGV.includes("--texts");
 
-const MODEL = "claude-sonnet-5-5";
+const MODEL = MODELS.sonnet;
 const SEARCH_CAP = 500;
 
 // Messages the model already judged NOT a quote. Only quotes reach Supabase,

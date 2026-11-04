@@ -69,6 +69,7 @@
 //
 
 import { spawnSync } from "node:child_process";
+import { MODELS } from "../lib/models.cjs";
 import { runToolless, parseModelJson } from "../lib/jev-claude.mjs";
 import { createHash } from "node:crypto";
 import fs from "node:fs";
@@ -84,6 +85,7 @@ import { installTools } from "../lib/root.cjs";
 const HOME = os.homedir();
 // Who the candidate is for (agent/local/instance.json owner_name).
 const { owner_name: OWNER, owner_id: OWNER_ID } = createRequire(import.meta.url)("../lib/instance.cjs").instance();
+const ASSISTANT = createRequire(import.meta.url)("../lib/instance.cjs").assistantName(); // the assistant's configured name (lib/instance.cjs)
 const OWNER_UP = OWNER.toUpperCase();
 // The Jev state key for the owner's own dated words: `<owner_id>_said`
 // (user_said by default). The site's question text in
@@ -312,12 +314,12 @@ const recallLines = recallHits.length
   ? recallHits.map((r) => `  - [${r.source}${r.created_at ? " " + String(r.created_at).slice(0, 10) : ""}] ${r.title ? r.title + " — " : ""}${(r.snippet || "").slice(0, 200)}`).join("\n")
   : "  (no memory hits)";
 
-const prompt = `You are Jori's claim-check adjudicator. A candidate message is about to be sent to ${OWNER}. Decide whether it should be sent as-is, rewritten, or dropped — based ONLY on whether it contradicts known facts or something ${OWNER} already told us.
+const prompt = `You are ${ASSISTANT}'s claim-check adjudicator. A candidate message is about to be sent to ${OWNER}. Decide whether it should be sent as-is, rewritten, or dropped — based ONLY on whether it contradicts known facts or something ${OWNER} already told us.
 
 CANDIDATE (what would be sent):
 ${workingText.slice(0, 1200)}
 
-AUTHORITATIVE FACTS (from Jori's own live data — these are GROUND TRUTH, they outrank the candidate's wording).
+AUTHORITATIVE FACTS (from ${ASSISTANT}'s own live data — these are GROUND TRUTH, they outrank the candidate's wording).
 Each line was resolved by code against the timeline. "SAME METRO: YES" is the verdict and it is ALREADY CORRECT — trust it over your own reading of the place names, and do NOT drop or rewrite a candidate for a location mismatch when it says YES. A neighbourhood, borough, airport or suburb of the same metro reads YES by design:
 ${factLines}
 
@@ -351,7 +353,7 @@ Reply with ONE LINE of compact JSON, no prose, no markdown fence:
 // It resolves the parsed verdict or THROWS the old fail-open reason.
 // Tool-less, Max-only — lib/jev-claude.mjs.
 async function sonnetAdjudicate() {
-  const out = await runToolless({ bin: CLAUDE_BIN, model: "claude-sonnet-5-5", prompt, timeoutMs: 60000 });
+  const out = await runToolless({ bin: CLAUDE_BIN, model: MODELS.sonnet, prompt, timeoutMs: 60000 });
   if (!out) throw new Error("adjudicator_unavailable");
   const p = parseModelJson(out);
   if (!p || !["pass", "rewrite", "drop"].includes(p.verdict)) throw new Error("adjudicator_bad_json");

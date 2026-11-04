@@ -5,8 +5,9 @@ import {
   CallToolRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 import { createServer } from "http";
+import { port } from "../../lib/ports.cjs";
 
-const PORT = 9092;
+const PORT = port("ops_webhook");
 
 const mcp = new Server(
   { name: "webhook-channel", version: "1.0.0" },

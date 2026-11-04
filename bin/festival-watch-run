@@ -20,6 +20,7 @@
 // trigger-festival-watch.sh): its one call runs on the Max subscription.
 
 import fs from "node:fs";
+import { MODELS } from "../lib/models.cjs";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { createRequire } from "node:module";
@@ -114,7 +115,7 @@ async function main() {
     const { judge } = require("../lib/max-judge.js");
     try {
       const res = await judge({
-        model: "claude-sonnet-5-5", effort: "medium", webSearch: true, timeoutMs: 1500000, schema: SCHEMA,
+        model: MODELS.sonnet, effort: "medium", webSearch: true, timeoutMs: 1500000, schema: SCHEMA,
         system: `You find festivals and major public events for ${cfg.audience || "the user"} in the cities they will be in, inside each window's exact dates. Categories: music-food (music festivals, food/drink/wine/beer festivals), art-culture (art fairs, design weeks, film and cultural festivals), street-market (street fairs, maker markets, parades, seasonal markets), sports-outdoor (marathons, major games, notable outdoor events).
 Rules:
 - Never return anything in a window's already_known list, and do not spend a search on it.

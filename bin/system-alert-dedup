@@ -47,9 +47,13 @@ const { installTools } = createRequire(import.meta.url)("../lib/root.cjs");
 
 const STATE = process.env.JORI_ALERT_DEDUP_STATE
   || installTools("data/system-alert-dedup.json");
-const ESCALATE_ON_DAY = 3;   // distinct days before one summary page
-const FORGET_AFTER_DAYS = 14; // a condition quiet this long starts over
-const REARM_AFTER_QUIET_HOURS = 48; // a condition quiet this long has CLEARED
+// Settings: agent/local/config/system-alert-dedup.json (these are the defaults).
+const CFG = createRequire(import.meta.url)("../lib/instance.cjs").localConfig("system-alert-dedup", {
+  escalate_on_day: 3, forget_after_days: 14, rearm_after_quiet_hours: 48,
+});
+const ESCALATE_ON_DAY = Number(CFG.escalate_on_day);   // distinct days before one summary page
+const FORGET_AFTER_DAYS = Number(CFG.forget_after_days); // a condition quiet this long starts over
+const REARM_AFTER_QUIET_HOURS = Number(CFG.rearm_after_quiet_hours); // a condition quiet this long has CLEARED
 
 const argv = process.argv.slice(2);
 function flag(name, hasValue = true) {

@@ -26,6 +26,8 @@ set -euo pipefail
 # Defaults: this installation's gcp_project and gmail-push.<domain>
 # (lib/instance.cjs; JORI_PUSH_HOST overrides the host).
 source "$(dirname "${BASH_SOURCE[0]}")/lib/instance.sh"
+source "$(dirname "${BASH_SOURCE[0]}")/lib/root.sh"   # JORI_TOOLS, JORI_NODE
+eval "$("$JORI_NODE" "$JORI_TOOLS/lib/ports.cjs" --env)"   # JORI_PORT_* (lib/ports.cjs)
 PROJECT_ID="${1:-${JORI_GCP_PROJECT:-}}"
 PUSH_HOST="${2:-${JORI_PUSH_HOST:-${JORI_DOMAIN:+gmail-push.$JORI_DOMAIN}}}"
 if [ -z "$PROJECT_ID" ] || [ -z "$PUSH_HOST" ]; then
@@ -105,11 +107,11 @@ JSON
 echo
 echo "Done. Pipeline:"
 echo "  Gmail -> topic:$TOPIC -> sub:$SUBSCRIPTION -> $PUSH_ENDPOINT (OIDC: $SA_EMAIL)"
-echo "                                              -> Cloudflare Tunnel -> localhost:9090"
+echo "                                              -> Cloudflare Tunnel -> localhost:$JORI_PORT_GMAIL_PUBSUB"
 echo
 echo "Next steps:"
 echo "  1. Restart the ops-supervisor so it reads the new OIDC config:"
-echo "       curl -X POST http://localhost:9093/restart -H \"Authorization: Bearer \$(cat ~/Dev/jori/secrets/webhook-token)\""
+echo "       curl -X POST http://localhost:$JORI_PORT_OPS_HEALTH/restart -H \"Authorization: Bearer \$(cat ~/Dev/jori/secrets/webhook-token)\""
 echo "     (or: launchctl kickstart -k gui/\$(id -u)/ai.claude.session)"
 echo "  2. Ensure the Gmail watch is active: node scripts/setup-gmail-watch.mjs"
 echo "  3. Send a test email and confirm a dispatch in agent/logs/ops-supervisor.log"

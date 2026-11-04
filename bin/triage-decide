@@ -24,6 +24,7 @@ import {
 import { installRoot } from "../lib/root.cjs";
 
 const require = createRequire(import.meta.url);
+const { port } = require("../lib/ports.cjs");
 const ROOT = installRoot();
 const BIN = path.join(ROOT, "bin");
 
@@ -79,7 +80,7 @@ function execute(plan) {
     else if (a.kind === "webhook") {
       let token = "";
       try { token = require("node:fs").readFileSync(path.join(ROOT, "secrets/webhook-token"), "utf8").trim(); } catch {}
-      r = spawnSync("curl", ["-s", "-m", "10", "-X", "POST", "http://localhost:9092", "-H", `Authorization: Bearer ${token}`, "-H", "Content-Type: application/json", "-d", JSON.stringify(a.payload)], { timeout: 15000 });
+      r = spawnSync("curl", ["-s", "-m", "10", "-X", "POST", `http://localhost:${port("ops_webhook")}`, "-H", `Authorization: Bearer ${token}`, "-H", "Content-Type: application/json", "-d", JSON.stringify(a.payload)], { timeout: 15000 });
     }
     results.push({ kind: a.kind, argv: a.argv?.slice(0, 3), status: r ? r.status : null });
     // A failed label/star is the one failure that leaves the email visibly wrong —

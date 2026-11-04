@@ -42,7 +42,8 @@ const H = { apikey: K, Authorization: "Bearer " + K, "Content-Type": "applicatio
 const { isApprovalRowPending } = await import(path.join(ROOT, "lib/apns-push.mjs"));
 const { createUnifiedApproval, approvalExpiresAtMs } = await import(path.join(ROOT, "agent/core/self-improve-unified.mjs"));
 
-const CARD_CAP = 5;   // improvement-plan.md Critical Rule 4
+// improvement-plan.md Critical Rule 4; setting: agent/local/config/self-improve-queue.json `card_cap`.
+const CARD_CAP = Number(createRequire(import.meta.url)("../lib/instance.cjs").localConfig("self-improve-queue", { card_cap: 5 }).card_cap);
 
 async function unsignedPending() {
   const r = await fetch(`${BASE}/rest/v1/self_improve_approvals?select=id,summary,status,signature,skipped,risk,created_at,expires_at,expires_at_ms&status=eq.pending&skipped=is.false&order=created_at.desc`, { headers: H });

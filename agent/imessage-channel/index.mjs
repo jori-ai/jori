@@ -31,7 +31,7 @@ const require = createRequire(import.meta.url);
 const idb = require("../../lib/imessage-db.js");
 const { localConfig } = require("../../lib/instance.cjs");
 
-const PORT = Number(process.env.IMESSAGE_CHANNEL_PORT || 9107);
+const PORT = Number(process.env.IMESSAGE_CHANNEL_PORT || require("../../lib/ports.cjs").port("imessage"));
 const POLL_MS = Number(process.env.IMESSAGE_CHANNEL_POLL_MS || 3000);
 const NAMES_REFRESH_MS = 10 * 60 * 1000;
 const INBOX = installTools("data/imessage-inbox.jsonl");

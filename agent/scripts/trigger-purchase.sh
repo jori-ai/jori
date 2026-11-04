@@ -7,8 +7,8 @@ source "$(dirname "$0")/lib/root.sh"
 
 export PATH="/opt/homebrew/bin:$PATH"
 
-HEALTH_PORT=9093
-WEBHOOK_PORT=9092
+HEALTH_PORT=$JORI_PORT_OPS_HEALTH     # lib/ports.cjs, via webhook-auth.sh
+WEBHOOK_PORT=$JORI_PORT_OPS_WEBHOOK
 LOGFILE="$JORI_INSTALL_TOOLS/agent/logs/watchdog.log"
 PAYLOAD='{"job": "purchase"}'
 

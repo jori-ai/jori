@@ -8,6 +8,7 @@
 # NOTE: legacy launcher; the live supervision path is process-manager.mjs.
 
 CLAUDE="$HOME/.local/bin/claude"
+source "$(dirname "$0")/../config/models.env"   # JORI_MODEL_SONNET
 SESSION="claude"
 ALLOWED_TOOLS='Bash Read Edit Write WebFetch WebSearch Glob Grep Agent "mcp__tools__*" "mcp__claude_ai_Gmail__*" "mcp__claude_ai_Google_Calendar__*" "mcp__claude_ai_Slack__*" "mcp__supabase-jori__*" "mcp__gtasks__*"'
 
@@ -18,7 +19,7 @@ sleep 1
 # Create session with chat agent (pane 0)
 tmux new-session -d -s "$SESSION" -c "$HOME/Dev/jori/agent/chat-agent"
 tmux send-keys -t "$SESSION:0.0" \
-  "$CLAUDE --model claude-sonnet-5-5 --dangerously-load-development-channels server:phone-channel --permission-mode auto --remote-control-session-name-prefix chat-agent --allowedTools $ALLOWED_TOOLS" Enter
+  "$CLAUDE --model $JORI_MODEL_SONNET --dangerously-load-development-channels server:phone-channel --permission-mode auto --remote-control-session-name-prefix chat-agent --allowedTools $ALLOWED_TOOLS" Enter
 
 # Split for ops agent (pane 1)
 tmux split-window -t "$SESSION" -v -c "$HOME/Dev/jori/agent/ops-agent"

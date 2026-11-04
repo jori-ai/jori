@@ -19,6 +19,7 @@
 // Max invariant: the executor strips ANTHROPIC_API_KEY; never a raw SDK/API key.
 
 import os from "node:os";
+import { MODELS } from "../../lib/models.cjs";
 import path from "node:path";
 import { Agent } from "./agent.mjs";
 import { makeStatelessExecutor } from "./stateless-executor.mjs";
@@ -44,7 +45,7 @@ let _seq = 0;
 
 export async function runOneShot(task, {
   system = "",
-  model = "claude-sonnet-5-5",
+  model = MODELS.sonnet,
   claudeBin = null,
   cwd = null,
   effort = null,         // "low" for high-volume fan-out; see CLAUDE.md § Effort Policy

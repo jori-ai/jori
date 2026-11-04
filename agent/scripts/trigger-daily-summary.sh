@@ -23,8 +23,8 @@ source "$(dirname "$0")/lib/webhook-auth.sh"
 source "$(dirname "$0")/lib/root.sh"   # JORI_INSTALL_TOOLS
 export PATH="/opt/homebrew/bin:$PATH"
 
-HEALTH_PORT=9093
-WEBHOOK_PORT=9092
+HEALTH_PORT=$JORI_PORT_OPS_HEALTH     # lib/ports.cjs, via webhook-auth.sh
+WEBHOOK_PORT=$JORI_PORT_OPS_WEBHOOK
 LOGFILE="$JORI_INSTALL_TOOLS/agent/logs/watchdog.log"
 TASK="DAILY SUMMARY (scheduled). Launch the build and end your turn with a one-line ack (daily-summary job launched, id <id>). The forked session reads agent/ops-agent/jobs/daily-summary.md itself and does the whole build, email and push, so do not read that file, do not build anything inline, do not compose or send any message, and do not check another job's status first. Run exactly this one command, nothing else, nothing appended: $JORI_INSTALL_TOOLS/bin/job-run --name daily-summary -- $JORI_INSTALL_TOOLS/bin/daily-summary-run"
 PAYLOAD="{\"task\": \"$TASK\", \"source\": \"daily-summary\"}"

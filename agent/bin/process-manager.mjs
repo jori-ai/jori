@@ -23,6 +23,7 @@ import { createRequire } from "node:module";
 import { ManagedProcess } from "../lib/managed-process.mjs";
 import { listJobs, updateRegistry, isPidAlive, registryPath, logPath } from "../../lib/job-runner.mjs";
 import { installRoot, installTools, nodeBin } from "../../lib/root.cjs";
+import { port as registryPort } from "../../lib/ports.cjs";
 const { instance } = createRequire(import.meta.url)("../../lib/instance.cjs");
 
 const HOME = process.env.HOME;
@@ -127,7 +128,7 @@ function createProcesses() {
     new ManagedProcess({
       name: "wiki-server",
       command: NODE,
-      args: [path.join(JORI, "bin/wiki"), "serve", "--port", "9096", "--host", "0.0.0.0"],
+      args: [path.join(JORI, "bin/wiki"), "serve", "--port", String(registryPort("wiki")), "--host", "0.0.0.0"],
       cwd: JORI,
       logFile: path.join(LOG_DIR, "wiki-server.log"),
       log,
@@ -151,7 +152,7 @@ function createProcesses() {
     new ManagedProcess({
       name: "wiki-server-public",
       command: NODE,
-      args: [path.join(JORI, "bin/wiki"), "serve", "--port", "9097", "--host", "127.0.0.1"],
+      args: [path.join(JORI, "bin/wiki"), "serve", "--port", String(registryPort("wiki_public")), "--host", "127.0.0.1"],
       cwd: JORI,
       env: { WIKI_PUBLIC: "1" },
       logFile: path.join(LOG_DIR, "wiki-server-public.log"),
@@ -237,7 +238,7 @@ for (const child of children) {
 }
 
 // HTTP health endpoint — consumed by jori status, heartbeat-sender, watchdog.
-const HEALTH_PORT = 9095;
+const HEALTH_PORT = registryPort("process_manager");
 const healthServer = http.createServer((req, res) => {
   if (req.method === "GET" && req.url === "/health") {
     const status = {
@@ -276,9 +277,9 @@ statusTimer.unref();
 // (Heartbeats alone can miss a silent hang of hours.)
 
 const DISPATCH_HEALTH_PORTS = {
-  "ops-supervisor": 9093,
-  "ops-light-supervisor": 9083,
-  "ops-haiku-supervisor": 9073,
+  "ops-supervisor": registryPort("ops_health"),
+  "ops-light-supervisor": registryPort("ops_light_health"),
+  "ops-haiku-supervisor": registryPort("ops_haiku_health"),
 };
 const DISPATCH_POLL_INTERVAL = 2 * 60_000;
 const DISPATCH_STUCK_MS = 15 * 60_000;
@@ -380,7 +381,7 @@ dispatchWatchdogTimer.unref();
 const JOB_POLL_INTERVAL = 20_000;
 const JOB_NOTIFY_MAX_ATTEMPTS = 10;
 const JOB_PRUNE_AGE_MS = 7 * 24 * 60 * 60_000; // 7 days past finished_at
-const JOB_TIER_PORTS = { ops: 9092, "ops-light": 9082, "ops-haiku": 9072 };
+const JOB_TIER_PORTS = { ops: registryPort("ops_webhook"), "ops-light": registryPort("ops_light_webhook"), "ops-haiku": registryPort("ops_haiku_webhook") };
 
 // pid observed dead but registry still says "running" — debounced across two
 // consecutive sweeps before declaring the job lost, so we don't race the

@@ -26,6 +26,7 @@ import { createRequire } from "node:module";
 import { installRoot, KERNEL_SUBDIR } from "../../lib/root.cjs";
 
 const { localConfig } = createRequire(import.meta.url)("../../lib/instance.cjs");
+const ASSISTANT = createRequire(import.meta.url)("../../lib/instance.cjs").assistantName(); // the assistant's configured name (lib/instance.cjs)
 
 // ---- static rails: what a self-authored module may NEVER reference ----------
 // Mirrors the spirit of data/self-improvement-risk-rubric.md §2 FORBIDDEN.
@@ -194,7 +195,7 @@ export function createSelfImprove({
     // injected notify — email/phone/etc). notify gets (summary, code, meta) so the
     // channel can render the full code + the unguessable approval id (the shared
     // secret an owner reply must echo).
-    const summary = `Jori wrote a module: "${name}" — ${rationale || "(no rationale given)"}`;
+    const summary = `${ASSISTANT} wrote a module: "${name}" — ${rationale || "(no rationale given)"}`;
     const code = renderDiff(name, files);
     try { await notify?.(summary, code, { approvalId: pend.approval_id, name, rationale }); }
     catch (e) { audit("self_improve.notify_failed", { name, error: e.message }); }

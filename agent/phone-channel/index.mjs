@@ -1,4 +1,5 @@
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
+import { MODELS } from "../../lib/models.cjs";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import {
   ListToolsRequestSchema,
@@ -23,6 +24,7 @@ import { installTools } from "../../lib/root.cjs";
 const require = createRequire(import.meta.url);
 const { loadEnv } = require("../../lib/load-env.js");
 const { instance, localConfig } = require("../../lib/instance.cjs");
+const ASSISTANT = require("../../lib/instance.cjs").assistantName(); // the assistant's configured name (lib/instance.cjs)
 
 // Who this installation serves (lib/instance.cjs).
 const INSTANCE = instance();
@@ -155,7 +157,7 @@ async function replyExchange(rowId, repliedTo, channel = "chat") {
       .slice(0, REPLY_EXCHANGE_ROWS)
       .reverse();
     if (!rows.length) return fallback;
-    return rows.map((m) => `${m.role === "user" ? OWNER_LABEL : "Jori"}: ${m.content.slice(0, 500)}`).join("\n");
+    return rows.map((m) => `${m.role === "user" ? OWNER_LABEL : ASSISTANT}: ${m.content.slice(0, 500)}`).join("\n");
   } catch {
     return fallback;
   }
@@ -201,7 +203,7 @@ const mcp = new Server(
 
 CRITICAL: \`mcp__phone-channel__reply\` is the ONLY way to deliver text to ${OWNER}. Plain assistant text — anything you "say" without calling the reply tool — is silently dropped; ${OWNER} never sees it. Every Jori message you receive MUST end with at least one reply tool call. One exception: the supervisor's own "Session started" line, sent after every restart, is not from ${OWNER}. If a message of theirs is still unanswered because the restart cut you off, answer that message now; otherwise end the turn without calling reply. If you produce ANY substantive answer text, that text must be the \`message\` argument to a reply tool call, NOT a plain text content block in your turn.
 
-THREADED REPLIES: ${OWNER_LABEL} often reads Jori in between other things, so several messages stack up before they answer. When they tap Reply on a specific bubble, the message you receive opens with a \`[Threaded reply]\` block quoting the message they answered. Treat that quoted message as the subject — NOT the most recent exchange in the "Recent conversation" tail, which is usually about something else by then. Say enough in your reply to make clear which thread you're answering.
+THREADED REPLIES: ${OWNER_LABEL} often reads ${ASSISTANT} in between other things, so several messages stack up before they answer. When they tap Reply on a specific bubble, the message you receive opens with a \`[Threaded reply]\` block quoting the message they answered. Treat that quoted message as the subject — NOT the most recent exchange in the "Recent conversation" tail, which is usually about something else by then. Say enough in your reply to make clear which thread you're answering.
 
 If you have nothing to say (e.g. a tool failed), still call reply with a one-line acknowledgement rather than ending the turn silently. The chat-supervisor has a safety net that auto-posts orphaned text — but that's a recovery path for bugs, not the design; never rely on it.
 
@@ -614,7 +616,7 @@ function decisionReplyHint(parent) {
     if (typeof extHint === "function") return extHint(p) || "";
     if (p?.kind !== "decision" || !p.ref) return "";
     const opts = (p.options || []).map((o, i) => `${i + 1}. ${o.label}`).join("; ");
-    return `[Decision card ${p.ref}] That message was a decision Jori asked them (options: ${opts}). Once you know their answer — an option (by number or meaning) or their own words — file it with \`~/Dev/jori/bin/decision-answer --ref ${p.ref} --option "<that option's label, exactly>"\` or \`--text "<their answer>"\`, then confirm in one short line. If they are asking about it rather than answering, answer and leave it open.\n\n`;
+    return `[Decision card ${p.ref}] That message was a decision ${ASSISTANT} asked them (options: ${opts}). Once you know their answer — an option (by number or meaning) or their own words — file it with \`~/Dev/jori/bin/decision-answer --ref ${p.ref} --option "<that option's label, exactly>"\` or \`--text "<their answer>"\`, then confirm in one short line. If they are asking about it rather than answering, answer and leave it open.\n\n`;
   } catch {
     return "";
   }
@@ -1570,7 +1572,7 @@ if (process.env.JORI_DISPATCH_URL) {
   // message costs API latency, not CLI startup. Prewarmed here so the first
   // message after a restart is already warm. Kill switch: CHAT_WARM_JUDGE=0.
   if (process.env.CHAT_WARM_JUDGE !== "0") {
-    const warm = new WarmClaude({ model: "claude-sonnet-5-5" });
+    const warm = new WarmClaude({ model: MODELS.sonnet });
     warm.prewarm();
     useWarmJudge(warm);
     process.on("exit", () => warm.close());

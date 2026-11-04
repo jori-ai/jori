@@ -31,6 +31,7 @@ import { createRequire } from "node:module";
 const require = createRequire(import.meta.url);
 const { MODELS } = require("../../../lib/models.cjs");
 const { textSync } = require("../../../lib/max-judge.js");
+const ASSISTANT = require("../../../lib/instance.cjs").assistantName(); // the assistant's configured name (lib/instance.cjs)
 const DATA = path.join(require("../../../lib/root.cjs").installRoot(), "data");
 const LEARNINGS = path.join(DATA, "hum-learnings.jsonl");
 const LIVE_DAY = path.join(DATA, "live-day.json");
@@ -163,7 +164,7 @@ Output a strict JSON object — pick exactly one shape, no prose, no markdown:
 
   {"emit":true,
    "class":"NOW"|"NEXT"|"SHOULD",
-   "signal":"<≤2 lines, Jori voice; lead with the anchor + the timely ask>",
+   "signal":"<≤2 lines, ${ASSISTANT} voice; lead with the anchor + the timely ask>",
    "urgency":0.55-0.95,
    "anchor":"<event-id or commitment phrase or HH:MM window>",
    "dedup_key":"situation:<class>:<short anchor>:<YYYY-MM-DD>",

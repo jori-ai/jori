@@ -311,6 +311,10 @@ Central registry of browser actions used by cron jobs, hum, and ad-hoc agent wor
 
 **See also:** [`docs/browsing-skills.md`](../docs/browsing-skills.md) for the full architecture, design decisions, and the playbook-integration pattern.
 
+## Control room — every setting, one place
+
+The **Control** tab on the memory site (`/control` on the wiki server, :9096 tailnet and :9097 behind Cloudflare Access; the Worker passes `/control*` through to the host) shows and changes how the installation is set up: the schedule (crontab + launchd, with run history from `data/cron-runs.jsonl`), watches, agents and model pins, the allowance brake, channels and awake hours, every `agent/local/config/*.json`, identity (`instance.json`), outside services and which of their `.env` keys are set (never values), ports (`lib/ports.cjs`), values still hardcoded in code (`bin/control-scan` → `data/control-hardcoded.json`, hourly), and the change history (`data/config-audit.jsonl`, each entry undoable). Owner only: the verified Access email must be `owner_email` (or `control.json` `admins`); without Access, loopback or tailnet callers only; writes carry a per-process HMAC token. Code: `lib/control/` (`schedule.mjs`, `state.mjs`, `actions.mjs`, `audit.mjs`, `http.mjs`, `app.js`, `app.css`). Crontab writes go only through `bin/crontab-safe`; launchd edits rewrite both the installed plist and the `agent/launch-agents/` template, then reload. Plan and the "make everything configurable" batches: `system/control-room.md`.
+
 ## Hum — the always-on ambient-awareness loop
 
 Hum is the single largest subsystem; it deserves its own section because it spans data / playbook / scripts / iOS / memory.

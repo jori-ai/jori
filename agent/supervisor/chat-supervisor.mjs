@@ -16,6 +16,7 @@
 //   --claude-bin <path>   override claude binary path
 
 import fs from "node:fs";
+import { MODELS } from "../../lib/models.cjs";
 import { createRequire } from "node:module";
 import path from "node:path";
 import http from "node:http";
@@ -56,8 +57,10 @@ import { makeStatelessExecutor } from "../core/stateless-executor.mjs";
 import * as forkQueue from "../core/fork-queue.mjs";
 import { ReplyDraftTracker } from "../../lib/reply-stream.mjs";
 import { installRoot, installTools } from "../../lib/root.cjs";
+import { port as registryPort } from "../../lib/ports.cjs";
 import { underTestRunner } from "../../lib/load-env.js";
 const { instanceValue } = createRequire(import.meta.url)("../../lib/instance.cjs");
+const ASSISTANT = createRequire(import.meta.url)("../../lib/instance.cjs").assistantName(); // the assistant's configured name (lib/instance.cjs)
 
 // Conway-substrate integration (WP4/WP0), flag-gated + additive. CHAT_SUBSTRATE:
 //   off (default) — no substrate code runs; behavior is byte-identical to before.
@@ -310,11 +313,11 @@ class ChatSupervisor {
       onHigh: (depth) => {
         console.error(`[chat-supervisor] QUEUE ALARM: depth=${depth} — chat dispatch backing up`);
         this.eventLog.append({ kind: "queue_alarm.high", depth });
-        this._sendSystemAlert(`⚠️ Jori chat queue depth=${depth} — the turn engine may be stuck and messages are piling up. Check \`jori status\`.`);
+        this._sendSystemAlert(`⚠️ ${ASSISTANT} chat queue depth=${depth} — the turn engine may be stuck and messages are piling up. Check \`jori status\`.`);
       },
       onClear: (depth) => {
         this.eventLog.append({ kind: "queue_alarm.clear", depth });
-        this._sendSystemAlert(`✅ Jori chat recovered: queue drained (depth=${depth}) — dispatch caught up.`);
+        this._sendSystemAlert(`✅ ${ASSISTANT} chat recovered: queue drained (depth=${depth}) — dispatch caught up.`);
       },
     });
     this.activeToolMap = new Map(); // tool_use_id → tool name
@@ -369,7 +372,7 @@ class ChatSupervisor {
   async startSession({ resume }) {
     this.sessionStartedAt = Date.now();
     const cfg = this.cfg;
-    const healthPort = cfg.supervisor?.healthPort || 9094;
+    const healthPort = cfg.supervisor?.healthPort || registryPort("chat_health");
     const mcpConfigPath = path.join(JORI_ROOT, "agent/supervisor/chat-mcp-config.json");
     const localRulesFile = this._buildLocalRules();
 
@@ -425,7 +428,7 @@ class ChatSupervisor {
       ? new Agent("chat", {
           executor: makeClaudeSessionExecutor(this.session),
           forkExecutor: makeStatelessExecutor({
-            model: this.cfg.model || "claude-sonnet-5-5",
+            model: this.cfg.model || MODELS.sonnet,
             effort: "low",
             tools: FORK_TOOLS,
             // Without this the fork auto-discovers .mcp.json from its cwd and
@@ -820,7 +823,7 @@ class ChatSupervisor {
   }
 
   startHttp() {
-    const port = this.cfg.supervisor?.healthPort || 9094;
+    const port = this.cfg.supervisor?.healthPort || registryPort("chat_health");
     this.server = http.createServer(async (req, res) => {
       const url = new URL(req.url, `http://localhost:${port}`);
 

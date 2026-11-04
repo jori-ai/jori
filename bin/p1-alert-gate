@@ -95,8 +95,10 @@ function probeResolver() {
 // required because the dispatch is change-gated (bin/p1-scan-gate), so
 // consecutive runs are NOT reliably 15 minutes apart — three failures could
 // span ten minutes or ten hours, and only one of those is worth a page.
-const STREAK_THRESHOLD = 3;
-const ELAPSED_THRESHOLD_MS = 45 * 60 * 1000;
+// Settings: agent/local/config/p1-alert-gate.json (these are the defaults).
+const GATE = require("../lib/instance.cjs").localConfig("p1-alert-gate", { streak_threshold: 3, elapsed_threshold_min: 45 });
+const STREAK_THRESHOLD = Number(GATE.streak_threshold);
+const ELAPSED_THRESHOLD_MS = Number(GATE.elapsed_threshold_min) * 60 * 1000;
 
 function readState() {
   try {

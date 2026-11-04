@@ -47,6 +47,7 @@
 // Exit 0 on success (check `warnings[]`), 2 on bad usage, 1 on a hard failure.
 
 const fs = require("node:fs");
+const { MODELS } = require("../lib/models.cjs");
 const path = require("node:path");
 const { execFileSync } = require("node:child_process");
 // gog reads its keyring password from GOG_KEYRING_PASSWORD and has no TTY here,
@@ -212,7 +213,7 @@ function pickPhoto(stop, place, files) {
   let out;
   try {
     out = execFileSync("/bin/bash", ["-c",
-      `${CLAUDE_BIN} -p --model claude-sonnet-5-5 --effort low --output-format text "${escaped}"`],
+      `${CLAUDE_BIN} -p --model ${MODELS.sonnet} --effort low --output-format text "${escaped}"`],
       { encoding: "utf8", maxBuffer: 4 * 1024 * 1024, timeout: 180000 });
   } catch (e) {
     // Most common cause by far: the Claude CLI reads its Max token from the

@@ -10,7 +10,7 @@ source "$(dirname "$0")/lib/root.sh"
 # yet listening when the 5s timer fires.
 
 LOG="$JORI_INSTALL_TOOLS/agent/logs/webhooks.log"
-WEBHOOK_URL="http://localhost:9092"
+WEBHOOK_URL="http://localhost:$JORI_PORT_OPS_WEBHOOK"   # lib/ports.cjs, via webhook-auth.sh
 MAX_WAIT=120  # seconds to wait for webhook-channel to come up
 
 # Wait for webhook-channel HTTP server to accept connections
