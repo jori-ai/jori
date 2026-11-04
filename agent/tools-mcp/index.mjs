@@ -840,6 +840,26 @@ try {
   if (res.failed?.length) console.error(`[tools-mcp] ext/ load failures: ${JSON.stringify(res.failed)}`);
 } catch (e) { console.error(`[tools-mcp] ext/ load error: ${e.message}`); }
 
+// Enabled feature plugins' runtime tools and skills (plugins/<name>/runtime/,
+// a WP5 plugin dir; system/plugins.md). A disabled plugin's tools are never
+// served; one plugin failing to load leaves the others.
+try {
+  const PLUG = require("../../lib/plugins.cjs");
+  const before = new Set(siRegistry.list().map((t) => t.name));
+  const loaded = [];
+  for (const p of PLUG.enabledPlugins()) {
+    const rt = `${p.dir}/runtime`;
+    if (!require("node:fs").existsSync(`${rt}/manifest.json`)) continue;
+    try { await siLoader.loadPlugin(rt); loaded.push(p.name); }
+    catch (e) { console.error(`[tools-mcp] plugin ${p.name} runtime failed: ${e.message}`); }
+  }
+  for (const t of [...siRegistry.list()].filter((x) => !before.has(x.name)).sort((a, b) => String(a.name).localeCompare(String(b.name)))) {
+    if (TOOLS.some((x) => x.name === t.name)) continue;
+    TOOLS.push({ name: t.name, description: t.description, schema: t.schema, run: async (a) => JSON.stringify(await siRegistry.executeTool(t.name, a)) });
+  }
+  if (loaded.length) console.error(`[tools-mcp] serving plugin runtime(s): ${loaded.join(", ")}`);
+} catch (e) { console.error(`[tools-mcp] plugin runtime load error: ${e.message}`); }
+
 // Only the chat agent may author + propose new modules (never ops/cron/inbound).
 if (process.env.JORI_AGENT_ID === "chat") {
   TOOLS.push(

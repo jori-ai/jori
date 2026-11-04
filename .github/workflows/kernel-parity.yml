@@ -110,7 +110,7 @@ jobs:
       - name: Node tests
         if: ${{ !cancelled() }}
         run: |
-          files=$(ls tests/*.test.mjs agent/test/*.test.mjs agent/scripts/lib/*.test.mjs | grep -v -- '-local\.test\.')
+          files=$(ls tests/*.test.mjs agent/test/*.test.mjs agent/scripts/lib/*.test.mjs plugins/*/tests/*.test.mjs 2>/dev/null | grep -v -- '-local\.test\.')
           # shellcheck disable=SC2086
           node --test --test-timeout=180000 --test-reporter=spec $files
 

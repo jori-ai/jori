@@ -47,6 +47,10 @@ Retire stale docs in the same change. No capability/architecture change ships wi
 
 The files listed in `system/kernel-manifest.json` are the generic kernel, shared beyond this installation. **They hold no personal data:** no names of the user or anyone they know, no places, businesses, accounts, health or money facts, routines, dated life events, quotes or real IDs (say "the user"). When you change one, the personal part moves to its own home, never dropped, and a new file under a kernel directory is classified in the manifest in the same change. Run `bin/kernel-guard` and `kernel-guard --closure` before committing; the pre-commit hook, CI and `self-improve-auto-apply` (exit 8) refuse what it finds. Where each kind of content goes, closure and portability: `system/architecture.md` § Kernel boundary and its enforcement.
 
+## Plugins — a new feature ships as a plugin
+
+A new feature is a plugin (`plugins/<name>/`, or `agent/local/plugins/<name>/` when it is this installation's own): a `plugin.json` manifest plus its commands, playbooks, schedules and settings in that directory. Never add a plugin's cron line by hand (`jori plugin sync` writes it), and never name a plugin's files from outside it: ask `lib/plugins.cjs`. Turn features on and off with `jori plugin enable|disable`. Design: `system/plugins.md`.
+
 ## Calendar Invitations — Never invite anyone else unless the user explicitly asks
 
 Top-tier rule. **Default: every calendar event Jori creates or updates has zero attendees other than the user (the organizer).** Applies to every path that ends in a calendar write: email-triage auto-created events, webhook/cron calendar tasks, chat-agent calendar tools, and updates (never add attendees to an existing event unless the user said to).

@@ -30,6 +30,8 @@ import path from "node:path";
 import crypto from "node:crypto";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import { createRequire } from "node:module";
+const require = createRequire(import.meta.url);
 import { verifyGoogleIdToken } from "./oidc-verify.mjs";
 import { readTailLines } from "../../lib/tail-file.mjs";
 import { isHighPriority, isHumSource } from "./dispatcher.mjs";
@@ -57,12 +59,23 @@ const PUBSUB_OIDC_CONFIG_PATH = installTools("secrets/pubsub-oidc.json");
 // The playbook file for a webhook-dispatched job: jobs/<job>.md, else
 // jobs/_ext/<job>.md. Neither → the kernel path, so the not-found message
 // names where a playbook belongs.
-export function resolveJobFile(jobName, { jobsDir = JOBS_DIR, extDir = JOBS_EXT_DIR } = {}) {
+// An enabled plugin's playbook (plugins/<name>/jobs/<job>.md, system/plugins.md)
+// comes after those two; a disabled plugin's never resolves, so its job is
+// refused like any unknown job.
+export function resolveJobFile(jobName, { jobsDir = JOBS_DIR, extDir = JOBS_EXT_DIR, pluginDirs = pluginJobDirs() } = {}) {
   const kernel = path.join(jobsDir, `${jobName}.md`);
   if (fs.existsSync(kernel)) return kernel;
   const overlay = path.join(extDir, `${jobName}.md`);
   if (fs.existsSync(overlay)) return overlay;
+  for (const d of pluginDirs) {
+    const f = path.join(d, `${jobName}.md`);
+    if (fs.existsSync(f)) return f;
+  }
   return kernel;
+}
+
+function pluginJobDirs() {
+  try { return require("../../lib/plugins.cjs").jobDirs(); } catch { return []; }
 }
 
 const _secretCache = new Map();

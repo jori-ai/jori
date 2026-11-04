@@ -1,0 +1,14 @@
+{
+  "name": "rain-walk",
+  "title": "Rain on your walks",
+  "description": "Checks the forecast shortly before each of your regular outdoor walks and tells you when rain is likely to overlap it, plus one morning summary for the whole day.",
+  "version": "1.0.0",
+  "default": "enabled",
+  "requires": { "bins": ["bin/apple-weather"] },
+  "config": { "name": "rain-walk", "schedules": true },
+  "schedules": [],
+  "provides_bins": ["rain-walk-check"],
+  "services": [
+    { "name": "Apple WeatherKit", "does": "Forecasts for rain-walk", "group": "Places and travel", "config": ["apple-weather"] }
+  ]
+}

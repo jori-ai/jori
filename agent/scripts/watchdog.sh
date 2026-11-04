@@ -2747,6 +2747,15 @@ fi
 # when the owner must act or the repair gave up. Every 10 minutes; it sends its
 # own messages from this out-of-sandbox context (JORI_INFRA_PROBE=1). Settings:
 # agent/local/config/job-failure-watch.json. Kill switch: data/.job-failure-watch-off.
+# ── Plugins ──────────────────────────────────────────────────────────────────
+# Once an hour, make the crontab and launchd match the enabled plugins
+# (system/plugins.md): a plugin pulled in by jori-sync gets its schedules, a
+# disabled or removed one loses them. Only lines tagged `# jori-plugin:` are
+# touched, through crontab-safe. Kill switch: data/.plugin-sync-off.
+if [ ! -f "$JORI_INSTALL_TOOLS/data/.plugin-sync-off" ] && [ "10#$(date +%M)" -lt 2 ] 2>/dev/null; then
+  "$JORI_NODE" "$JORI_INSTALL_TOOLS/bin/jori" plugin sync >> "$LOG" 2>&1 || log "plugin sync exited $?"
+fi
+
 if [ ! -f "$JORI_INSTALL_TOOLS/data/.job-failure-watch-off" ] && [ $(( 10#$(date +%M) % 10 )) -lt 2 ]; then
   JORI_INFRA_PROBE=1 "$JORI_NODE" "$JORI_INSTALL_TOOLS/bin/job-failure-watch" --quiet >> "$LOG" 2>&1 || log "job-failure-watch exited $?"
 fi
