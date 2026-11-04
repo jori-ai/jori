@@ -8,7 +8,7 @@ Every cron and launchd job started through `bin/cron-run` records its exit code 
 
 ## Pipeline
 
-**Step 0 — claim.** `~/Dev/jori/bin/job-failure-watch next`. Exit 3 means the queue is empty: `rm -f ~/Dev/jori/data/job-repair.lock` and stop silently. Otherwise you hold one item: `id, label, cmd, log_file, exit, since, error, log_tail`. Process items one at a time until `next` exits 3, at most 3 per dispatch.
+**Step 0 — claim.** `~/Dev/jori/bin/job-failure-watch next`. Exit 3 means the queue is empty: `rm -f ~/Dev/jori/data/job-repair.lock` and stop silently. Otherwise you hold one item: `id, label, also, cmd, log_file, exit, since, error, log_tail`. `also` lists other jobs that fail with the same error: one cause, one fix; check after the fix that it covers them too. Process items one at a time until `next` exits 3, at most 3 per dispatch.
 
 **Step 1 — is it still failing?** Read the job's latest runs: `grep '"label":"<label>"' ~/Dev/jori/data/cron-runs.jsonl | tail -5`. If the newest run exited 0, close it: `job-failure-watch done <id> --outcome transient --note "ran fine at <time>"`.
 

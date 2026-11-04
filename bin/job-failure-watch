@@ -86,18 +86,32 @@ function scan() {
   const { open, closed, state } = JF.evaluate({ runs, state: JF.loadState(), logs: launchdLogs(noRedirect), cfg });
   const q = JF.loadQueue();
   let queued = 0;
+  // Jobs failing with the same error share one cause: one message, one repair
+  // (the item lists the others in `also`), so five jobs on one dead API key do
+  // not spend the day's repair budget five times.
+  const groups = new Map();
   for (const inc of open) {
+    const key = inc.error ? inc.error.replace(/\s+/g, " ").trim() : `label:${inc.label}`; // lang-regex-ok: whitespace in a log line
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(inc);
+  }
+  for (const incs of groups.values()) {
+    const [first, ...rest] = incs;
     let repair = "";
     if (cfg.repair) {
-      const r = JF.enqueue(q, inc, { cfg });
+      const r = JF.enqueue(q, { ...first, also: rest.map((x) => x.label) }, { cfg });
       if (r.ok) { queued++; repair = "\n- A repair is queued"; } else repair = `\n- Not queued for repair: ${r.reason}`;
     }
-    send(`⚠️ Failing job: ${nice(inc.label)}\n- Failed its last ${inc.streak} runs, since ${when(inc.since)}\n- ${inc.error ? `Error: ${inc.error}` : `Exit code ${inc.exit}`}${repair}`, { push: !repair.includes("is queued") });
-    say(`open   ${inc.label} (${inc.streak} failed runs)`);
+    const names = incs.map((x) => nice(x.label));
+    const since = incs.map((x) => x.since).sort()[0];
+    const head = names.length === 1 ? `⚠️ Failing job: ${names[0]}\n- Failed its last ${first.streak} runs, since ${when(since)}`
+      : `⚠️ ${names.length} jobs failing the same way: ${names.join(", ")}\n- Each failed its last ${Math.min(...incs.map((x) => x.streak))}+ runs, since ${when(since)}`;
+    send(`${head}\n- ${first.error ? `Error: ${first.error.trim()}` : `Exit code ${first.exit}`}${repair}`, { push: !repair.includes("is queued") });
+    for (const x of incs) say(`open   ${x.label} (${x.streak} failed runs)`);
   }
   for (const c of closed) {
     send(`✅ ${nice(c.label)} works again (it had failed since ${when(c.since)})`);
-    for (const p of q.pending) if (p.label === c.label && p.status === "pending") JF.finish(q, p.id, { outcome: "transient", note: "ran successfully before a repair started" });
+    for (const p of [...q.pending]) if (p.label === c.label && p.status === "pending") JF.finish(q, p.id, { outcome: "transient", note: "ran successfully before a repair started" });
     say(`closed ${c.label}`);
   }
   if (!DRY) { JF.saveState(state); JF.saveQueue(q); }
