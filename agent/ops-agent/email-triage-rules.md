@@ -305,14 +305,14 @@ When an email is a ticket confirmation / "your tickets are here" / "you won the 
      --from <YYYY-MM-DDTHH:MM:00±HH:MM> --to <YYYY-MM-DDTHH:MM:00±HH:MM> \
      --location "<Venue>" \
      --description "<N> guests. Confirmation: <link if present>" \
-     --colorId 5 -j
+     --event-color 5 -j
    ```
    (`-j` makes gog print the created event as JSON; its `id` (or `event.id`) is what step 3b needs.)
    - **Title:** `Dinner at <Venue>` (or `Lunch at <Venue>` / `Brunch at <Venue>` if the email's own time-of-day language says otherwise — check the user's own meal habits in memory before naming a late-morning booking). Use `Reservation at <Venue>` for a non-dining venue (bar, lounge) if "Dinner"/"Lunch" doesn't fit.
    - **Date/time:** parsed from the email, in the venue's local time (see § Timezone Rule above). **End time:** use the email's explicit end time / duration if given; otherwise default to **start + 1h15m** (a reservation, not a show — shorter default than the 2.5–3h ticket-confirmation default above).
    - **Location:** venue name (full address if the email includes one).
    - **Description:** guest count, and the confirmation/manage-reservation link if the email includes one.
-   - **`colorId 5` (yellow/Banana) always** — restaurant reservations are entertainment per the pinned `feedback_calendar_event_colors` rule, same as ticket confirmations.
+   - **`--event-color 5` (yellow/Banana) always** (gog has no `--colorId` flag; it fails with "unknown flag") — restaurant reservations are entertainment per the pinned `feedback_calendar_event_colors` rule, same as ticket confirmations.
    - **No attendees.** Do not pass `--attendees` / `--add-attendee`; any standing per-category invite rule is in the local additions under this heading.
 4. **Classify P2:** label `personal` (or the topical label if the reservation is clearly tied to one of the user's business threads), star, mark read. **No `p1`.** This is the existing P2 handling — visible via the star, no interrupt.
 5. **No separate Jori notification and no task** (beyond any one question the local additions add to this path) — P2 doesn't page (see § Phone-channel notification policy at the top of this file), and the calendar event itself is the durable record; a reminder job (default calendar notification) covers day-of awareness. This mirrors how the Ticket Confirmation rule's own P1 path already folds the calendar write into normal Step 5 handling, minus the P1 ping since this is P2, not P1.
