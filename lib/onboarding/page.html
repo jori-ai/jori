@@ -141,6 +141,9 @@ details.jobs ul { margin: 10px 0 0; padding-left: 18px; columns: 2; column-gap: 
 .way h3 { margin: 0; font-size: 16px; font-weight: 600; }
 .way p { margin: 3px 0 0; color: var(--muted); font-size: 14px; max-width: 46ch; }
 
+form.code { margin-top: 24px; max-width: 520px; }
+.code-row { display: flex; gap: 10px; }
+.code-row input { flex: 1; font-family: ui-monospace, Menlo, monospace; font-size: 14px; }
 .sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }
 
 @media (max-width: 860px) {
@@ -207,6 +210,10 @@ details.jobs ul { margin: 10px 0 0; padding-left: 18px; columns: 2; column-gap: 
       <ul class="rows" id="claudeRows"></ul>
       <div class="actions" id="claudeActions"></div>
       <p class="hint" id="claudeHint" hidden></p>
+      <form class="code" id="codeForm" hidden>
+        <label>Did Claude show you a code? Paste it here.<span class="code-row"><input type="text" name="code" autocomplete="one-time-code" spellcheck="false"><button class="btn small" type="submit">Finish sign-in</button></span></label>
+        <p class="err" id="codeErr" hidden></p>
+      </form>
     </section>
 
     <section class="step" data-step="you" hidden>
@@ -360,6 +367,7 @@ function render() {
   const url = login?.url;
   $("claudeHint").hidden = !(login?.state === "running" && url);
   if (url) $("claudeHint").replaceChildren("No page opened? ", el("a", { href: url, target: "_blank", rel: "noopener" }, "Open the sign-in page"), ".");
+  $("codeForm").hidden = login?.state !== "running";
 
   // About you (fill once; never overwrite what the person is typing)
   const f = $("aboutForm");
@@ -420,6 +428,14 @@ async function startJori() {
 }
 
 $("macNext").addEventListener("click", next);
+$("codeForm").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const f = $("codeForm"), err = $("codeErr");
+  const r = await api("/api/claude/code", { code: f.elements.code.value });
+  err.hidden = !!r.ok; err.textContent = r.ok ? "" : r.message;
+  if (r.ok) f.elements.code.value = "";
+  await poll();
+});
 $("aboutSave").addEventListener("click", async () => {
   const f = $("aboutForm"), b = {};
   for (const k of ["owner_name", "owner_email", "home_city", "tz", "assistant_name", "partner_name"]) b[k] = f.elements[k].value.trim();

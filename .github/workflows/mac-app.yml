@@ -55,7 +55,7 @@ jobs:
         env:
           NOTARY_KEY_ID: ${{ env.HAS_DEVID == 'true' && secrets.ASC_KEY_ID || '' }}
           NOTARY_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
-        run: apps/mac/build.sh --version "${{ steps.v.outputs.version }}" --build "${{ github.run_number }}" --out "$RUNNER_TEMP/out"
+        run: bash apps/mac/build.sh --version "${{ steps.v.outputs.version }}" --build "${{ github.run_number }}" --out "$RUNNER_TEMP/out"
       - uses: actions/upload-artifact@v4
         with:
           name: Jori-${{ steps.v.outputs.version }}
