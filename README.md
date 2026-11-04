@@ -63,7 +63,7 @@ On a Mac, one line installs everything and opens a setup page in your browser:
 curl -fsSL https://getjori.ai/install.sh | bash
 ```
 
-Sign in with Claude, confirm a few details it already filled in, press **Start Jori**. Or `brew install jori-ai/tap/jori`, `npm create jori`, or the Mac app from [releases](https://github.com/jori-ai/jori/releases). Details: [docs/quickstart.md](docs/quickstart.md). Later, `jori update` keeps it current.
+Sign in with Claude, confirm a few details it already filled in, press **Start Jori**. Or `brew trust jori-ai/tap && brew install jori-ai/tap/jori`, `npm create jori`, or the Mac app from [releases](https://github.com/jori-ai/jori/releases). Details: [docs/quickstart.md](docs/quickstart.md). Later, `jori update` keeps it current.
 
 Or step by step in the terminal:
 
