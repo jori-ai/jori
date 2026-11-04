@@ -1,0 +1,36 @@
+{
+  "name": "cyber-watch",
+  "title": "Security watch",
+  "description": "Watches for exposure and security issues and sends a weekly report.",
+  "version": "1.0.0",
+  "default": "disabled",
+  "schedules": [
+    {
+      "label": "trigger-cyber-watch-alert",
+      "cron": "26 1-22/3 * * *",
+      "command": "{root}/bin/cron-run --label trigger-cyber-watch-alert -- {root}/agent/scripts/trigger-cyber-watch-alert.sh"
+    },
+    {
+      "label": "trigger-cyber-watch-weekly",
+      "cron": "39 6 * * 1",
+      "command": "{root}/bin/cron-run --label trigger-cyber-watch-weekly -- {root}/agent/scripts/trigger-cyber-watch-weekly.sh"
+    }
+  ],
+  "launchd": [
+    {
+      "label": "ai.claude.cyber-watch-alert",
+      "adopt": true
+    },
+    {
+      "label": "ai.claude.cyber-watch-weekly",
+      "adopt": true
+    }
+  ],
+  "files": [
+    "agent/launch-agents/ai.claude.cyber-watch-alert.plist",
+    "agent/launch-agents/ai.claude.cyber-watch-weekly.plist",
+    "agent/scripts/trigger-cyber-watch-alert.sh",
+    "agent/scripts/trigger-cyber-watch-weekly.sh",
+    "bin/cyber-watch-run"
+  ]
+}

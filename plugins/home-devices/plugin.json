@@ -1,0 +1,17 @@
+{
+  "name": "home-devices",
+  "title": "Home devices",
+  "description": "Sweeps the home devices and reports what is offline.",
+  "version": "1.0.0",
+  "default": "disabled",
+  "schedules": [
+    {
+      "label": "home-devices",
+      "cron": "*/2 * * * *",
+      "command": "{root}/bin/cron-run --label home-devices -- bash -c '{root}/bin/home-devices sweep >> {root}/logs/home-devices.log 2>&1'"
+    }
+  ],
+  "files": [
+    "bin/home-devices"
+  ]
+}

@@ -87,8 +87,13 @@ test("crontab plan: add a missing line, adopt an unmarked one keeping its time, 
   // nothing there yet → add at the manifest's time
   const fresh = M.planCrontab({ lines: [] });
   assert.ok(fresh.find((c) => c.op === "add" && c.label === "alpha-tick").line.startsWith("*/15 * * * * "));
-  // two unmarked lines with one label → a conflict, never a guess
-  const two = M.planCrontab({ lines: ["1 1 * * * a --label beta-daily -- x", "# 1 1 * * * a --label beta-daily -- old"] });
+  // a commented-out copy is left alone: the adopted line is named by its whole text
+  const withComment = M.planCrontab({ lines: ["1 1 * * * a --label beta-daily -- x", "# 1 1 * * * a --label beta-daily -- old"] });
+  const a = withComment.find((c) => c.label === "beta-daily");
+  assert.equal(a.op, "adopt");
+  assert.equal(a.tag, "1 1 * * * a --label beta-daily -- x");
+  // two live lines for one label → a conflict, never a guess
+  const two = M.planCrontab({ lines: ["1 1 * * * a --label beta-daily -- x", "2 2 * * * a --label beta-daily -- y"] });
   assert.equal(two.find((c) => c.label === "beta-daily").op, "conflict");
 });
 
@@ -136,3 +141,37 @@ test("the CLI's flags reach the manager (--dry-run changes nothing)", async () =
   } finally { console.log = log; M._setIo({ dryRun: false }); }
   assert.equal(calls.length, 0, "a dry run wrote nothing");
 });
+
+test("verbatim schedules: adopted by exact command, pause prefix kept, other tools' tagged lines removed when off", () => {
+  mk("theta", { default: "disabled", cron_tags: ["# THETA_REMINDER"], schedules: [{ label: "theta-poll", cron: "*/2 * * * *", command: "{root}/bin/poll >> {root}/x.log 2>&1  # POLL" }] });
+  const st = P.state(); st.enabled = { ...(st.enabled || {}), theta: true }; fs.writeFileSync(P.stateFile(), JSON.stringify(st));
+  const root = (await_root());
+  const lines = [`#MKTPAUSE# */2 * * * * ${root}/bin/poll >> ${root}/x.log 2>&1  # POLL`, `5 5 4 11 * ${root}/bin/remind pre # THETA_REMINDER`];
+  const plan = M.planCrontab({ lines });
+  const ad = plan.find((c) => c.label === "theta-poll");
+  assert.equal(ad.op, "adopt");
+  assert.equal(ad.line, `${lines[0]} # jori-plugin:theta:theta-poll`, "the line is unchanged apart from the marker");
+  assert.equal(plan.some((c) => c.op === "untag"), false, "an enabled plugin's tagged lines are its tool's business");
+  st.enabled.theta = false; fs.writeFileSync(P.stateFile(), JSON.stringify(st));
+  const off = M.planCrontab({ lines: [ad.line, lines[1]] });
+  assert.ok(off.find((c) => c.op === "remove" && c.label === "theta-poll"));
+  assert.ok(off.find((c) => c.op === "untag" && c.tag === "# THETA_REMINDER"));
+  delete st.enabled.theta; fs.writeFileSync(P.stateFile(), JSON.stringify(st));
+  fs.rmSync(path.join(KDIR, "theta"), { recursive: true });
+});
+
+test("a core plugin is always on and cannot be turned off or removed; a disabled plugin's adopted jobs are hidden", () => {
+  mk("kappa", { core: true, default: "disabled" });
+  mk("lambda", { default: "disabled", adopted_jobs: ["lambda-job"] });
+  assert.equal(P.isEnabled("kappa"), true);
+  assert.throws(() => M.disable("kappa"), /core/);
+  assert.throws(() => M.remove("kappa"), /core/);
+  assert.ok(P.disabledJobs().has("lambda-job"));
+  assert.equal(P.ownerOf({ job: "lambda-job" }), "lambda");
+  fs.rmSync(path.join(KDIR, "kappa"), { recursive: true });
+  fs.rmSync(path.join(KDIR, "lambda"), { recursive: true });
+});
+
+function await_root() { return require_root(); }
+import { createRequire as _cr } from "node:module";
+function require_root() { return _cr(import.meta.url)("../lib/root.cjs").installTools(); }

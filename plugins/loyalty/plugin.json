@@ -1,0 +1,17 @@
+{
+  "name": "loyalty",
+  "title": "Loyalty points",
+  "description": "Syncs loyalty program balances.",
+  "version": "1.0.0",
+  "default": "disabled",
+  "schedules": [
+    {
+      "label": "trigger-awardwallet-sync",
+      "cron": "1 7 * * 0",
+      "command": "{root}/bin/cron-run --label trigger-awardwallet-sync -- {root}/agent/scripts/trigger-awardwallet-sync.sh"
+    }
+  ],
+  "files": [
+    "agent/scripts/trigger-awardwallet-sync.sh"
+  ]
+}

@@ -1,0 +1,21 @@
+{
+  "name": "exercise",
+  "title": "Exercise",
+  "description": "Plans exercise around your calendar.",
+  "version": "1.0.0",
+  "default": "disabled",
+  "schedules": [
+    {
+      "label": "trigger-exercise-schedule",
+      "cron": "30 7 * * *",
+      "command": "{root}/bin/cron-run --label trigger-exercise-schedule -- bash -c '{root}/agent/scripts/trigger-exercise-schedule.sh >> {root}/data/logs/exercise-schedule.log 2>&1'"
+    }
+  ],
+  "adopted_jobs": [
+    "exercise-schedule"
+  ],
+  "files": [
+    "agent/ops-agent/jobs/exercise-schedule.md",
+    "agent/scripts/trigger-exercise-schedule.sh"
+  ]
+}

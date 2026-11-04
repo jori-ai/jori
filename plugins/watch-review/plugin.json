@@ -1,0 +1,21 @@
+{
+  "name": "watch-review",
+  "title": "Watch review",
+  "description": "Weekly scorecard of the standing reminders and watches: what fired, what was missed.",
+  "version": "1.0.0",
+  "default": "disabled",
+  "schedules": [
+    {
+      "label": "trigger-watch-review",
+      "cron": "29 8 * * 1",
+      "command": "{root}/bin/cron-run --label trigger-watch-review -- {root}/agent/scripts/trigger-watch-review.sh"
+    }
+  ],
+  "adopted_jobs": [
+    "watch-review"
+  ],
+  "files": [
+    "agent/ops-agent/jobs/watch-review.md",
+    "agent/scripts/trigger-watch-review.sh"
+  ]
+}

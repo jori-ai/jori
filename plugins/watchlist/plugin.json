@@ -1,0 +1,75 @@
+{
+  "name": "watchlist",
+  "title": "Watchlist: TV and movies",
+  "description": "Finds shows and movies you would like, says where to watch them, and sends new-season and new-title emails.",
+  "version": "1.0.0",
+  "default": "disabled",
+  "schedules": [
+    {
+      "label": "tmdb-watch-providers",
+      "cron": "0 6 * * 1",
+      "command": "{root}/bin/cron-run --label tmdb-watch-providers -- bash -c 'PATH={sysbin}:/usr/local/bin:/usr/bin:/bin DROP=1 {sysnode} {root}/bin/tmdb-watch-providers >> {root}/agent/logs/tmdb-providers.log 2>&1'"
+    },
+    {
+      "label": "trigger-watchlist-discover",
+      "cron": "17 10 11 * *",
+      "command": "{root}/bin/cron-run --label trigger-watchlist-discover -- {root}/agent/scripts/trigger-watchlist-discover.sh"
+    },
+    {
+      "label": "watchlist-season-check",
+      "cron": "37 9 * * *",
+      "command": "{root}/bin/cron-run --label watchlist-season-check -- bash -c 'PATH={sysbin}:/usr/local/bin:/usr/bin:/bin DROP=1 {sysnode} {root}/bin/watchlist-season-check >> {root}/agent/logs/watchlist-season-check.log 2>&1'"
+    },
+    {
+      "label": "watchlist-intro-email",
+      "cron": "27 2 * * *",
+      "command": "{root}/agent/scripts/trigger-watchlist-intro-email.sh >> {root}/agent/logs/watchlist-intro-email.log 2>&1"
+    },
+    {
+      "label": "movie-discover",
+      "cron": "27 8 * * 6",
+      "command": "{root}/agent/scripts/trigger-movie-discover.sh >> {root}/agent/logs/movie-discover.log 2>&1"
+    },
+    {
+      "label": "watch-catalog-enrich",
+      "cron": "40 9 * * *",
+      "command": "{root}/bin/cron-run --label watch-catalog-enrich -- bash -c 'PATH={sysbin}:/usr/local/bin:/usr/bin:/bin {home}/.local/node/bin/node {root}/bin/watch-catalog-enrich >> {root}/agent/logs/watch-catalog-enrich.log 2>&1'"
+    },
+    {
+      "label": "movie-db-refresh",
+      "cron": "40 10 * * *",
+      "command": "{root}/bin/cron-run --label movie-db-refresh -- bash -c 'PATH={sysbin}:/usr/local/bin:/usr/bin:/bin {home}/.local/node/bin/node {root}/bin/movie-db-refresh >> {root}/agent/logs/movie-db-refresh.log 2>&1'"
+    },
+    {
+      "label": "watchlist-movies-email",
+      "cron": "56 4 * * 0",
+      "command": "{root}/agent/scripts/trigger-watchlist-movies-email.sh >> {root}/agent/logs/watchlist-movies-email.log 2>&1"
+    }
+  ],
+  "adopted_jobs": [
+    "movie-db-refresh",
+    "movie-discover",
+    "watch-catalog-enrich",
+    "watchlist-discover",
+    "watchlist-intro-email",
+    "watchlist-movies-email",
+    "watchlist-season-check"
+  ],
+  "files": [
+    "agent/ops-agent/jobs/movie-db-refresh.md",
+    "agent/ops-agent/jobs/movie-discover.md",
+    "agent/ops-agent/jobs/watch-catalog-enrich.md",
+    "agent/ops-agent/jobs/watchlist-discover.md",
+    "agent/ops-agent/jobs/watchlist-intro-email.md",
+    "agent/ops-agent/jobs/watchlist-movies-email.md",
+    "agent/ops-agent/jobs/watchlist-season-check.md",
+    "agent/scripts/trigger-movie-discover.sh",
+    "agent/scripts/trigger-watchlist-discover.sh",
+    "agent/scripts/trigger-watchlist-intro-email.sh",
+    "agent/scripts/trigger-watchlist-movies-email.sh",
+    "bin/movie-db-refresh",
+    "bin/tmdb-watch-providers",
+    "bin/watch-catalog-enrich",
+    "bin/watchlist-season-check"
+  ]
+}

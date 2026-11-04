@@ -1,0 +1,61 @@
+{
+  "name": "daily-summary",
+  "title": "Day, week and month summaries",
+  "description": "Writes the daily summary and its weekly and monthly roll-ups, checks and fixes them, and archives each day as an episode in memory.",
+  "version": "1.0.0",
+  "default": "disabled",
+  "schedules": [
+    {
+      "label": "trigger-episode-archive",
+      "cron": "25 7 * * *",
+      "command": "{root}/bin/cron-run --label trigger-episode-archive -- {root}/agent/scripts/trigger-episode-archive.sh"
+    },
+    {
+      "label": "trigger-daily-summary",
+      "cron": "0 4 * * *",
+      "command": "{root}/bin/cron-run --label trigger-daily-summary -- {root}/agent/scripts/trigger-daily-summary.sh"
+    },
+    {
+      "label": "trigger-weekly-summary",
+      "cron": "20 0 * * 1",
+      "command": "{root}/bin/cron-run --label trigger-weekly-summary -- {root}/agent/scripts/trigger-weekly-summary.sh"
+    },
+    {
+      "label": "trigger-monthly-summary",
+      "cron": "30 0 1 * *",
+      "command": "{root}/bin/cron-run --label trigger-monthly-summary -- {root}/agent/scripts/trigger-monthly-summary.sh"
+    },
+    {
+      "label": "daily-summary-fix-sweep",
+      "cron": "52 * * * *",
+      "command": "{root}/bin/cron-run --label daily-summary-fix-sweep -- bash -c '{home}/.local/node/bin/node {root}/bin/daily-summary-fix sweep >> {root}/data/logs/daily-summary-fix-sweep.log 2>&1'"
+    }
+  ],
+  "launchd": [
+    {
+      "label": "ai.claude.daily-summary-fix",
+      "adopt": true
+    }
+  ],
+  "adopted_jobs": [
+    "daily-summary",
+    "daily-summary-fix",
+    "episode-archive",
+    "monthly-summary",
+    "weekly-summary"
+  ],
+  "files": [
+    "agent/launch-agents/ai.claude.daily-summary-fix.plist",
+    "agent/ops-agent/jobs/daily-summary-fix.md",
+    "agent/ops-agent/jobs/daily-summary.md",
+    "agent/ops-agent/jobs/episode-archive.md",
+    "agent/ops-agent/jobs/monthly-summary.md",
+    "agent/ops-agent/jobs/weekly-summary.md",
+    "agent/scripts/trigger-daily-summary-fix.sh",
+    "agent/scripts/trigger-daily-summary.sh",
+    "agent/scripts/trigger-episode-archive.sh",
+    "agent/scripts/trigger-monthly-summary.sh",
+    "agent/scripts/trigger-weekly-summary.sh",
+    "bin/daily-summary-fix"
+  ]
+}
