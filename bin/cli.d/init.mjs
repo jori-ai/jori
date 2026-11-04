@@ -31,7 +31,6 @@ const RUNTIME_DIRS = [
 const SEEDS = [
   ["examples/hum-interests.example.json", "data/hum-interests.json"],
   ["examples/hum-intent.example.md", "data/hum-intent.md"],
-  ["examples/user-timezone.example.json", "data/user-timezone.json"],
 ];
 
 function hostTz() {
@@ -161,6 +160,12 @@ export default {
       if (!fs.existsSync(tokenPath) || force) fs.writeFileSync(tokenPath, token + "\n", { mode: 0o600 });
 
       const seeded = [];
+      // The time zone the owner just gave, not the example file's.
+      const tzPath = path.join(base, "data", "user-timezone.json");
+      if (!fs.existsSync(tzPath) || force) {
+        fs.writeFileSync(tzPath, JSON.stringify({ timezone: inst.tz, updated_at: new Date().toISOString() }, null, 2) + "\n");
+        seeded.push("data/user-timezone.json");
+      }
       for (const [src, dst] of SEEDS) {
         const from = path.join(base, src);
         const to = path.join(base, dst);
@@ -177,7 +182,7 @@ export default {
         console.log(c.green(`  ✓ seeded ${seeded.length} file(s) from examples/:`));
         for (const s of seeded) console.log(c.dim("      " + s));
       }
-      console.log(c.dim("\nNext: ") + c.bold("./bin/jori doctor") + c.dim(", then ") + c.bold("./bin/jori up"));
+      console.log(c.dim("\nNext: ") + c.bold("./bin/jori setup start") + c.dim(" (runs Jori in the background and schedules the starter jobs), or ") + c.bold("./bin/jori up") + c.dim(" in the foreground"));
       console.log(c.dim("Then open the control room's Setup page, which lists what each feature still needs:"));
       console.log("  " + c.bold(`http://127.0.0.1:${registryPort("wiki")}/control#setup`) + c.dim(" (or this machine's tailnet name instead of 127.0.0.1)"));
       console.log(c.dim("Per-installation rules and config: docs/architecture-public-private.md."));

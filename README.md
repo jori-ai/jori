@@ -57,7 +57,15 @@ Five things most AI assistants miss.
 
 ## Quickstart
 
-For the technically inclined:
+On a Mac, one line installs everything and opens a setup page in your browser:
+
+```bash
+curl -fsSL https://getjori.ai/install.sh | bash
+```
+
+Sign in with Claude, confirm a few details it already filled in, press **Start Jori**. Details: [docs/quickstart.md](docs/quickstart.md).
+
+Or step by step in the terminal:
 
 ```bash
 # Clone this repository — copy its URL from the green "Code" button on GitHub

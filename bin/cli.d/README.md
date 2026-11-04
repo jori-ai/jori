@@ -33,5 +33,5 @@ export default {
 This directory's modules belong to the installation, not to the kernel: a new
 one is classified in `system/kernel-manifest.json` like any other file
 (`personal_globs` for this installation's own). Jori tracks its own
-subcommands here (`init`, `overlay`, `up`, `review-pr`, `telemetry`); the
+subcommands here (`init`, `setup`, `overlay`, `up`, `review-pr`, `telemetry`); the
 Jori sync copies only this README.
