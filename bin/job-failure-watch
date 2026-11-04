@@ -1,0 +1,135 @@
+#!/usr/bin/env node
+// job-failure-watch — find recurring jobs that keep failing; alert once, queue a repair.
+//
+//   job-failure-watch [--dry-run] [--quiet]   scan data/cron-runs.jsonl (cron, every 30 min)
+//   job-failure-watch list [--json]           open incidents and the repair queue
+//   job-failure-watch next                    claim the next repair item (prints JSON; exit 3 = none)
+//   job-failure-watch done <id> --outcome repaired|needs_owner|transient|failed
+//                          [--note "…"] [--commit <sha>] [--owner-action "<what the owner must do>"]
+//
+// A scan opens an incident when a job's last N runs (job-failure-watch.json
+// `streak`, default 3) all failed: one system-channel message with the error
+// line from the job's log, and a repair item that agent/scripts/trigger-job-repair.sh
+// dispatches to the job-repair playbook. The first good run closes it with
+// one "works again" message. `done --outcome needs_owner` sends the owner the
+// one thing they have to do (a portal setting, a re-login). Logic and
+// settings: lib/job-failures.mjs. From cron, call it with an absolute node.
+
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { spawn, execFileSync } from "node:child_process";
+import { createRequire } from "node:module";
+import * as JF from "../lib/job-failures.mjs";
+
+const require = createRequire(import.meta.url);
+const { TOOLS_DIR, installTools } = require("../lib/root.cjs");
+const inst = require("../lib/instance.cjs");
+
+const argv = process.argv.slice(2);
+const flag = (n) => argv.includes(n);
+const opt = (n) => { const i = argv.indexOf(n); return i >= 0 ? argv[i + 1] : undefined; };
+const DRY = flag("--dry-run");
+const QUIET = flag("--quiet");
+const say = (s) => { if (!QUIET) console.log(s); };
+
+function nice(label) {
+  const s = label.replace(/^trigger-/, "").replace(/-/g, " ");
+  return s[0].toUpperCase() + s.slice(1);
+}
+function when(iso) {
+  return new Date(iso).toLocaleString("en-US", { timeZone: inst.instanceValue("tz"), month: "short", day: "numeric", hour: "numeric", minute: "2-digit" });
+}
+
+// System channel, a job reporting failures (agent/CLAUDE.md § Outbound
+// Precheck class 5). Silent rows unless `push`: a repair starts on its own,
+// so the phone only buzzes when the owner has to act or the repair gave up.
+function send(text, { push = false } = {}) {
+  if (DRY) { say(`[dry-run] would send${push ? " (push)" : ""}:\n${text}`); return; }
+  try {
+    execFileSync(path.join(TOOLS_DIR, "bin", "jori-send-curl"), ["--skip-precheck", "--intent", "job-failure", "--channel", "system", ...(push ? ["--push"] : []), text], { stdio: "ignore", timeout: 60_000 });
+  } catch (e) {
+    console.error(`job-failure-watch: send failed: ${e.message}`);
+  }
+}
+
+// launchd jobs log to their plist's StandardErrorPath, not a redirect.
+function launchdLogs(labels) {
+  const out = {};
+  const dir = path.join(os.homedir(), "Library", "LaunchAgents");
+  const prefixes = inst.localConfig("control", { launchd_prefixes: ["com.jori.", "ai.jori.", "ai.claude."] }).launchd_prefixes;
+  for (const label of labels) {
+    for (const p of prefixes) {
+      const f = path.join(dir, `${p}${label}.plist`);
+      if (!fs.existsSync(f)) continue;
+      try {
+        const j = JSON.parse(execFileSync("plutil", ["-convert", "json", "-o", "-", f], { encoding: "utf8" }));
+        if (j.StandardErrorPath) out[label] = j.StandardErrorPath;
+      } catch {}
+      break;
+    }
+  }
+  return out;
+}
+
+function kickRepair() {
+  if (DRY) return;
+  const trig = path.join(TOOLS_DIR, "agent", "scripts", "trigger-job-repair.sh");
+  if (!fs.existsSync(trig)) return;
+  spawn("/bin/bash", [trig], { detached: true, stdio: "ignore" }).unref();
+}
+
+function scan() {
+  const cfg = JF.settings();
+  const runs = JF.runsByLabel();
+  const noRedirect = Object.entries(runs).filter(([, rs]) => !JF.logFileOf(rs.at(-1).cmd)).map(([l]) => l);
+  const { open, closed, state } = JF.evaluate({ runs, state: JF.loadState(), logs: launchdLogs(noRedirect), cfg });
+  const q = JF.loadQueue();
+  let queued = 0;
+  for (const inc of open) {
+    let repair = "";
+    if (cfg.repair) {
+      const r = JF.enqueue(q, inc, { cfg });
+      if (r.ok) { queued++; repair = "\n- A repair is queued"; } else repair = `\n- Not queued for repair: ${r.reason}`;
+    }
+    send(`⚠️ Failing job: ${nice(inc.label)}\n- Failed its last ${inc.streak} runs, since ${when(inc.since)}\n- ${inc.error ? `Error: ${inc.error}` : `Exit code ${inc.exit}`}${repair}`, { push: !repair.includes("is queued") });
+    say(`open   ${inc.label} (${inc.streak} failed runs)`);
+  }
+  for (const c of closed) {
+    send(`✅ ${nice(c.label)} works again (it had failed since ${when(c.since)})`);
+    for (const p of q.pending) if (p.label === c.label && p.status === "pending") JF.finish(q, p.id, { outcome: "transient", note: "ran successfully before a repair started" });
+    say(`closed ${c.label}`);
+  }
+  if (!DRY) { JF.saveState(state); JF.saveQueue(q); }
+  if (queued) kickRepair();
+  say(`${Object.keys(state.incidents).length} open incident(s); ${open.length} new, ${closed.length} closed, ${queued} repair(s) queued`);
+}
+
+const cmd = argv[0] && !argv[0].startsWith("--") ? argv[0] : "scan";
+if (cmd === "scan") scan();
+else if (cmd === "list") {
+  const out = { incidents: JF.loadState().incidents || {}, queue: JF.loadQueue() };
+  if (flag("--json")) console.log(JSON.stringify(out, null, 2));
+  else {
+    for (const [l, i] of Object.entries(out.incidents)) console.log(`failing  ${l.padEnd(32)} since ${i.since}  ${i.error || `exit ${i.exit}`}`);
+    for (const p of out.queue.pending) console.log(`queued   ${p.id} ${p.label.padEnd(28)} ${p.status}`);
+    for (const h of (out.queue.history || []).slice(-10)) console.log(`done     ${h.id} ${h.label.padEnd(28)} ${h.outcome}  ${h.note || ""}`);
+  }
+} else if (cmd === "next") {
+  const q = JF.loadQueue();
+  const item = JF.claimNext(q);
+  if (!item) process.exit(3);
+  JF.saveQueue(q);
+  console.log(JSON.stringify(item, null, 2));
+} else if (cmd === "done") {
+  const id = argv[1];
+  const q = JF.loadQueue();
+  const d = JF.finish(q, id, { outcome: opt("--outcome"), note: opt("--note") || "", commit: opt("--commit") || null, owner_action: opt("--owner-action") || null });
+  JF.saveQueue(q);
+  if (d.outcome === "needs_owner") send(`🔴 ${nice(d.label)} keeps failing and needs you\n- ${d.owner_action || d.note || "See its log"}`, { push: true });
+  if (d.outcome === "failed") send(`🔴 ${nice(d.label)} keeps failing and the repair could not fix it\n- ${d.note || "See its log"}`, { push: true });
+  console.log(`${id}: ${d.outcome}`);
+} else {
+  console.error("usage: job-failure-watch [scan] [--dry-run] | list [--json] | next | done <id> --outcome …");
+  process.exit(2);
+}

@@ -13,6 +13,8 @@ It answers in about 70–500 ms. Input costs $0.042 per million tokens and outpu
 
 Known weak spots are numbers, dates and adversarial content. Its confidence is calibrated, which is not the same as correct.
 
+**Settings in the control room:** the memory site's Control tab → Agents and models → Jev: turn it on or off (`data/.jev-off`), change the default threshold, a site's threshold or on/off (`sites.<site>` in `data/jev-config.json`), the privacy setting and the budget, and see each site's last 7 days.
+
 ## Transport
 
 - **TypeSafe direct, ONLY** (by the user's decision, not via a gateway). `lib/jev.mjs` calls `POST https://api.typesafe.ai/v1/systemone`, model `jev-latest` (overrides: `JEV_ENDPOINT`, `JEV_MODEL`), `Bearer TYPESAFE_API_KEY` from the production host's `.env` (canonical copy in the password manager). There is no Vercel AI Gateway path any more: the gateway 403'd every call from 2026-09-27 ("Free tier users do not have access to this model") and Jev silently ran 0% for nine days.

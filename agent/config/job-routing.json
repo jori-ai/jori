@@ -137,6 +137,13 @@
       "effort": "xhigh",
       "runtime": "ephemeral-opus",
       "rationale": "Daily ideas email for the weeks before each configured occasion. Opus tier, run as a dedicated ephemeral `claude -p` on $JORI_MODEL_OPUS via launchd (ai.claude.occasion-ideas); `model: opus` here is only a tier label. Date-gated in trigger-occasion-ideas.sh from agent/local/occasion-ideas/occasions.json, so it spends nothing outside a window."
+    },
+    "job-repair": {
+      "disposition": "on-demand",
+      "target": "ops",
+      "model": "sonnet",
+      "effort": null,
+      "rationale": "Same-day repair of a recurring job that failed its last 3 runs (jobs/job-repair.md). Queued by bin/job-failure-watch from the watchdog, dispatched by trigger-job-repair.sh. Needs ops: reads logs and code, edits and lands fixes through self-improve-auto-apply. Runs only when something keeps failing; capped at 4/day."
     }
   }
 }

@@ -2738,3 +2738,15 @@ if [ ! -f "$HOME/Dev/jori/data/.stale-code-watch-off" ]; then
     incident_clear "stale-code-flag"
   fi
 fi
+
+# ── Failing jobs ─────────────────────────────────────────────────────────────
+# bin/job-failure-watch reads every job's exit codes in data/cron-runs.jsonl:
+# a job whose last 3 runs failed gets one quiet ⚠️ System note with the error
+# from its log and a same-day repair (jobs/job-repair.md, via
+# trigger-job-repair.sh); its first good run closes it with ✅. Pushes only
+# when the owner must act or the repair gave up. Every 10 minutes; it sends its
+# own messages from this out-of-sandbox context (JORI_INFRA_PROBE=1). Settings:
+# agent/local/config/job-failure-watch.json. Kill switch: data/.job-failure-watch-off.
+if [ ! -f "$JORI_INSTALL_TOOLS/data/.job-failure-watch-off" ] && [ $(( 10#$(date +%M) % 10 )) -lt 2 ]; then
+  JORI_INFRA_PROBE=1 "$JORI_NODE" "$JORI_INSTALL_TOOLS/bin/job-failure-watch" --quiet >> "$LOG" 2>&1 || log "job-failure-watch exited $?"
+fi

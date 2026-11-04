@@ -59,6 +59,24 @@
       "job": "skill-repair"
     },
     {
+      "name": "job-repair",
+      "schedule": "52 * * * *",
+      "schedule_human": "On demand the moment job-failure-watch opens an incident (watchdog, every 10 min); hourly at :52 as a safety net",
+      "trigger_script": "agent/scripts/trigger-job-repair.sh",
+      "webhook_url": "http://localhost:9092",
+      "webhook_task": "job-repair",
+      "ops_playbook_section": null,
+      "delivers_to": "none",
+      "phrases": [
+        "job repair",
+        "failing job",
+        "job keeps failing",
+        "cron job failing",
+        "fix failing jobs"
+      ],
+      "description": "Same-day repair of a recurring job whose last 3 runs failed (bin/job-failure-watch, run by watchdog.sh every 10 minutes, reads exit codes in data/cron-runs.jsonl). Finds the cause in the job's log and code; fixes a repo bug or a wrong setting through self-improve-auto-apply; for an outside cause (an API not enabled, a revoked sign-in) sends the owner one push with the action. Queue: bin/job-failure-watch list. See ops-agent/jobs/job-repair.md."
+    },
+    {
       "name": "hum",
       "schedule": "*/20 * * * *",
       "schedule_human": "Every 20 minutes — the always-on hum of ambient awareness",

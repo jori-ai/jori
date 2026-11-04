@@ -82,3 +82,19 @@ test("ports.save and quiet.save validate", async () => {
 test("unknown actions are refused", async () => {
   await assert.rejects(perform("shell.exec", {}, "t"), /unknown action/);
 });
+
+test("Jev settings: thresholds validated, a site override set and cleared, blanks left alone", async () => {
+  const { applyJevChange } = await import("../lib/control/jev.mjs");
+  const base = { default_threshold: 0.85, budget: { usd: 10, since: "2026-10-05" }, sites: {} };
+  assert.throws(() => applyJevChange(base, { default_threshold: 1.5 }), /at most 1/);
+  assert.throws(() => applyJevChange(base, { site: "../x", enabled: false }), /bad site/);
+  const off = applyJevChange(base, { site: "email-triage", enabled: "false", threshold: "0.9" });
+  assert.deepEqual(off.sites["email-triage"], { enabled: false, threshold: 0.9 });
+  const back = applyJevChange(off, { site: "email-triage", enabled: "true", threshold: "" });
+  assert.equal(back.sites["email-triage"], undefined);
+  const form = applyJevChange(base, { default_threshold: "0.8", privacy_exclusions: "true", budget_usd: "25", budget_since: "" });
+  assert.equal(form.default_threshold, 0.8);
+  assert.equal(form.privacy_exclusions, true);
+  assert.deepEqual(form.budget, { usd: 25, since: "2026-10-05" });
+  assert.equal(base.default_threshold, 0.85, "input not mutated");
+});
