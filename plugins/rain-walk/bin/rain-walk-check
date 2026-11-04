@@ -25,8 +25,8 @@
 const { execFileSync } = require('child_process');
 const fs = require('fs');
 const path = require('path');
-const { installTools } = require('../lib/root.cjs');
-const { localConfig, localDir, instance } = require('../lib/instance.cjs');
+const { installTools } = require('../../../lib/root.cjs');
+const { localConfig, localDir, instance } = require('../../../lib/instance.cjs');
 
 // cron's PATH may lack node's directory, so execFileSync children that use a
 // `#!/usr/bin/env node` shebang (jori-send-curl, etc.) would die with 127.

@@ -1,0 +1,15 @@
+{
+  "_comment": "The recurring jobs a fresh installation gets from `jori setup` (lib/onboarding/core.mjs installStarterSchedule). Only jobs that work with the core alone: a Claude sign-in, the local memory and the watchdog. Every other job in system/tasks.json waits until its integration is set up and is then turned on from the control room's Schedule page. A name is a task in system/tasks.json (schedule and trigger_script come from there); an entry with its own `script` is a crontab line with no task of its own. Lines are tagged `# jori-starter` and a job whose `--label` is already in the crontab is never added twice.",
+  "jobs": [
+    { "name": "watchdog", "schedule": "*/2 * * * *", "script": "agent/scripts/watchdog.sh", "label": "watchdog", "why": "Keeps the agents healthy and notices failing jobs" },
+    { "name": "morning-digest", "why": "A brief each morning" },
+    { "name": "hum", "why": "Notices things worth telling you" },
+    { "name": "hum-daily", "why": "Writes down what it noticed each day" },
+    { "name": "hum-consolidate", "why": "Learns from how you answered" },
+    { "name": "chat-consolidate", "why": "Remembers what you told it in chat" },
+    { "name": "wiki-embed", "why": "Keeps memory search up to date" },
+    { "name": "wiki-db-snapshot", "why": "Backs up memory every hour" },
+    { "name": "job-repair", "why": "Repairs a job that keeps failing" },
+    { "name": "skill-repair", "why": "Repairs a website reader that stopped working" }
+  ]
+}

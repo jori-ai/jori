@@ -1,0 +1,468 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Set up Jori</title>
+<link rel="icon" href="/icon.png">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,560&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+:root {
+  --night: #16285c;
+  --night-deep: #0f1c44;
+  --visor: #0d1631;
+  --glow: #43e0c4;
+  --amber: #f0b54a;
+  --paper: #f7f6f2;
+  --ink: #1a2034;
+  --muted: #5b6377;
+  --rule: #dedbd2;
+  --ok: #17806a;
+  --warn: #9a6512;
+  --bad: #b23f2a;
+  --field: #ffffff;
+  --focus: #2f6fe0;
+  --btn: #16285c; --btn-hover: #0f1c44; --btn-ink: #ffffff;
+  --serif: "Fraunces", Georgia, "Times New Roman", serif;
+  --sans: "Inter", system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --night: #0f1d47; --night-deep: #0a1434; --paper: #121a30; --ink: #e9ebf3; --muted: #9aa2b8;
+    --rule: #28314f; --ok: #4fd3b5; --warn: #f0b54a; --bad: #f08a74; --field: #182240; --focus: #7aa7ff;
+    --btn: #43e0c4; --btn-hover: #74eed8; --btn-ink: #0d1631;
+  }
+}
+:root[data-theme="dark"] {
+  --night: #0f1d47; --night-deep: #0a1434; --paper: #121a30; --ink: #e9ebf3; --muted: #9aa2b8;
+  --rule: #28314f; --ok: #4fd3b5; --warn: #f0b54a; --bad: #f08a74; --field: #182240; --focus: #7aa7ff;
+    --btn: #43e0c4; --btn-hover: #74eed8; --btn-ink: #0d1631;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; height: 100%; }
+body { background: var(--paper); color: var(--ink); font: 16px/1.5 var(--sans); -webkit-font-smoothing: antialiased; }
+a { color: inherit; }
+:focus-visible { outline: 2px solid var(--focus); outline-offset: 3px; border-radius: 6px; }
+h1:focus, h1:focus-visible { outline: none; }
+
+.shell { display: grid; grid-template-columns: minmax(300px, 38%) 1fr; min-height: 100vh; }
+
+/* ── the panel: Jori's face and the way through ─────────────────────── */
+.panel {
+  background: radial-gradient(120% 80% at 30% 0%, var(--night) 0%, var(--night-deep) 100%);
+  color: #e6ebfb; padding: 48px 40px; display: flex; flex-direction: column; gap: 40px;
+}
+.face { width: 188px; height: 188px; }
+.face .head { fill: #eef1f8; }
+.face .ear { fill: #d5dbea; }
+.face .visor { fill: var(--visor); }
+.face .eye { fill: var(--glow); transform-box: fill-box; transform-origin: center; transition: transform .5s cubic-bezier(.3,1.4,.5,1), fill .4s; filter: url(#glow); }
+.face .mouth { stroke: var(--glow); stroke-width: 7; stroke-linecap: round; fill: none; transition: d .5s, stroke .4s; filter: url(#glow); }
+.face.sleep .eye { transform: scaleY(.14); }
+.face.busy .eye, .face.busy .mouth { fill: var(--amber); }
+.face.busy .mouth { stroke: var(--amber); fill: none; }
+.face.awake .eye { animation: blink 7s 2s infinite; }
+@keyframes blink { 0%, 96%, 100% { transform: scaleY(1); } 98% { transform: scaleY(.1); } }
+.face-name { font: 560 28px/1.1 var(--serif); letter-spacing: -.01em; margin: 0; }
+.face-line { color: #b9c3e2; margin: 6px 0 0; max-width: 30ch; }
+
+.steps { list-style: none; margin: 0; padding: 0; display: grid; gap: 2px; counter-reset: s; }
+.steps li { counter-increment: s; }
+.steps button {
+  all: unset; box-sizing: border-box; width: 100%; display: grid; grid-template-columns: 28px 1fr; gap: 12px; align-items: center;
+  padding: 9px 12px; border-radius: 10px; color: #9fabd0; cursor: default;
+}
+.steps button::before {
+  content: counter(s); width: 26px; height: 26px; border-radius: 50%; display: grid; place-items: center;
+  font: 600 13px/1 var(--sans); border: 1.5px solid #3b4d86; color: #9fabd0;
+}
+.steps .done button { color: #dfe6fb; cursor: pointer; }
+.steps .done button::before { content: "✓"; background: var(--glow); border-color: var(--glow); color: var(--visor); }
+.steps .done button:hover { background: rgba(255,255,255,.05); }
+.steps .current button { color: #fff; background: rgba(255,255,255,.08); }
+.steps .current button::before { border-color: var(--glow); color: #fff; }
+.panel-foot { margin-top: auto; color: #7f8bb3; font-size: 13px; }
+.panel-foot code { color: #b9c3e2; }
+
+/* ── the page ───────────────────────────────────────────────────────── */
+main { padding: 72px 64px 64px; max-width: 720px; }
+.step[hidden] { display: none; }
+h1 { font: 400 clamp(32px, 4.2vw, 46px)/1.08 var(--serif); letter-spacing: -.02em; margin: 0 0 16px; max-width: 18ch; }
+.lede { color: var(--muted); font-size: 17px; margin: 0 0 36px; max-width: 54ch; }
+
+.rows { list-style: none; margin: 0 0 36px; padding: 0; border-top: 1px solid var(--rule); }
+.row { display: grid; grid-template-columns: 22px 1fr auto; gap: 14px; align-items: start; padding: 16px 0; border-bottom: 1px solid var(--rule); }
+.dot { width: 12px; height: 12px; border-radius: 50%; margin-top: 6px; border: 1.5px solid var(--muted); }
+.row[data-s="ok"] .dot { background: var(--ok); border-color: var(--ok); }
+.row[data-s="work"] .dot { border-color: var(--warn); background: var(--amber); animation: pulse 1.2s ease-in-out infinite; }
+.row[data-s="need"] .dot { border-color: var(--bad); background: transparent; box-shadow: inset 0 0 0 3px var(--paper), inset 0 0 0 6px var(--bad); }
+.row[data-s="warn"] .dot { border-color: var(--warn); background: var(--warn); }
+@keyframes pulse { 50% { opacity: .35; } }
+.row-name { font-weight: 500; }
+.row-detail { color: var(--muted); font-size: 14px; margin-top: 2px; overflow-wrap: anywhere; }
+.row-detail code, .lede code, .hint code { font-size: 13px; background: color-mix(in srgb, var(--rule) 55%, transparent); padding: 1px 6px; border-radius: 5px; }
+.row-act { align-self: center; }
+
+.actions { display: flex; gap: 16px; align-items: center; flex-wrap: wrap; }
+.btn {
+  font: 600 15px/1 var(--sans); border: 0; border-radius: 10px; padding: 14px 22px; cursor: pointer;
+  background: var(--btn); color: var(--btn-ink); transition: transform .08s, background .2s; text-decoration: none; display: inline-block;
+}
+.btn:hover { background: var(--btn-hover); }
+.btn:active { transform: translateY(1px); }
+.btn:disabled { opacity: .45; cursor: not-allowed; }
+.btn.small { padding: 9px 14px; font-size: 14px; border-radius: 8px; }
+.btn.quiet { background: transparent; color: var(--ink); box-shadow: inset 0 0 0 1.5px var(--rule); }
+.btn.quiet:hover { box-shadow: inset 0 0 0 1.5px var(--muted); background: transparent; }
+.link { background: none; border: 0; padding: 0; color: var(--muted); font: inherit; text-decoration: underline; text-underline-offset: 3px; cursor: pointer; }
+.hint { color: var(--muted); font-size: 14px; margin: 18px 0 0; max-width: 60ch; }
+.err { color: var(--bad); font-size: 14px; margin: 14px 0 0; }
+
+form.about { display: grid; grid-template-columns: 1fr 1fr; gap: 20px 24px; margin: 0 0 32px; }
+form.about .wide { grid-column: 1 / -1; }
+label { display: grid; gap: 7px; align-content: start; font-weight: 500; font-size: 14px; }
+label small { color: var(--muted); font-weight: 400; }
+input[type="text"], input[type="email"] {
+  font: 16px/1.3 var(--sans); color: var(--ink); background: var(--field); border: 1.5px solid var(--rule);
+  border-radius: 9px; padding: 11px 13px; width: 100%;
+}
+input:focus { outline: none; border-color: var(--focus); }
+.check { display: flex; gap: 10px; align-items: flex-start; font-weight: 400; color: var(--muted); }
+.check input { margin-top: 4px; accent-color: var(--night); }
+
+details.jobs { margin: -16px 0 32px; color: var(--muted); font-size: 14px; }
+details.jobs summary { cursor: pointer; }
+details.jobs ul { margin: 10px 0 0; padding-left: 18px; columns: 2; column-gap: 28px; }
+
+.ways { list-style: none; margin: 0 0 36px; padding: 0; display: grid; gap: 0; border-top: 1px solid var(--rule); }
+.way { display: grid; grid-template-columns: 1fr auto; gap: 16px; align-items: center; padding: 18px 0; border-bottom: 1px solid var(--rule); }
+.way h3 { margin: 0; font-size: 16px; font-weight: 600; }
+.way p { margin: 3px 0 0; color: var(--muted); font-size: 14px; max-width: 46ch; }
+
+.sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }
+
+@media (max-width: 860px) {
+  .shell { grid-template-columns: 1fr; }
+  .panel { padding: 24px 16px; gap: 20px; flex-direction: row; flex-wrap: wrap; align-items: center; }
+  .face { width: 72px; height: 72px; }
+  .face-name { font-size: 22px; }
+  .face-line { display: none; }
+  .steps { display: none; }
+  .panel-foot { display: none; }
+  main { padding: 32px 16px 48px; }
+  form.about { grid-template-columns: 1fr; }
+  details.jobs ul { columns: 1; }
+}
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation: none !important; transition: none !important; }
+}
+</style>
+</head>
+<body>
+<div class="shell">
+  <aside class="panel">
+    <div>
+      <svg class="face sleep" id="face" viewBox="0 0 200 200" role="img" aria-label="Jori">
+        <defs>
+          <filter id="glow" x="-50%" y="-50%" width="200%" height="200%">
+            <feGaussianBlur stdDeviation="3" result="b"/><feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+          </filter>
+        </defs>
+        <rect class="ear" x="14" y="78" width="22" height="50" rx="10"/>
+        <rect class="ear" x="164" y="78" width="22" height="50" rx="10"/>
+        <rect class="head" x="28" y="32" width="144" height="140" rx="44"/>
+        <rect class="visor" x="44" y="50" width="112" height="104" rx="30"/>
+        <rect class="eye" x="72" y="80" width="16" height="30" rx="8"/>
+        <rect class="eye" x="112" y="80" width="16" height="30" rx="8"/>
+        <path class="mouth" id="mouth" d="M86 128 Q100 134 114 128"/>
+      </svg>
+    </div>
+    <div>
+      <p class="face-name" id="faceName">Jori</p>
+      <p class="face-line" id="faceLine">Getting ready on this Mac.</p>
+    </div>
+    <ol class="steps" id="steps" aria-label="Setup steps">
+      <li data-step="mac"><button type="button">Your Mac</button></li>
+      <li data-step="claude"><button type="button">Claude sign-in</button></li>
+      <li data-step="you"><button type="button">About you</button></li>
+      <li data-step="on"><button type="button">Keep it running</button></li>
+      <li data-step="reach"><button type="button">Ways to reach you</button></li>
+    </ol>
+    <p class="panel-foot">Prefer the terminal? Close this tab and run <code>jori init</code>.</p>
+  </aside>
+
+  <main id="main" aria-live="polite">
+    <section class="step" data-step="mac">
+      <h1>Let me look around your Mac.</h1>
+      <p class="lede">I check what I need and install anything that’s missing. You’ll only be asked when I can’t do it myself.</p>
+      <ul class="rows" id="macRows"></ul>
+      <div class="actions"><button class="btn" id="macNext" disabled>Continue</button></div>
+    </section>
+
+    <section class="step" data-step="claude" hidden>
+      <h1>I run on your Claude subscription.</h1>
+      <p class="lede">Sign in once with the Claude account you already use. There’s no API key and no per-message bill: I stop and tell you if the subscription isn’t available.</p>
+      <ul class="rows" id="claudeRows"></ul>
+      <div class="actions" id="claudeActions"></div>
+      <p class="hint" id="claudeHint" hidden></p>
+    </section>
+
+    <section class="step" data-step="you" hidden>
+      <h1>What should I call you?</h1>
+      <p class="lede">I filled in what I could find on this Mac. Fix anything that’s wrong; you can change it later in the control room.</p>
+      <form class="about" id="aboutForm" novalidate>
+        <label>Your first name<input type="text" name="owner_name" autocomplete="given-name" required></label>
+        <label>Your email<input type="email" name="owner_email" autocomplete="email" required></label>
+        <label>Home city<input type="text" name="home_city" autocomplete="address-level2"><small>For weather, nearby places and events</small></label>
+        <label>Time zone<input type="text" name="tz" list="tzList" required></label>
+        <label>Call the assistant<input type="text" name="assistant_name" required></label>
+        <label>A partner I also help<input type="text" name="partner_name"><small>Optional, first name</small></label>
+        <label class="check wide"><input type="checkbox" name="telemetry" checked> Count this install: one anonymous ping, no personal data, sent once.</label>
+        <datalist id="tzList"></datalist>
+      </form>
+      <div class="actions"><button class="btn" id="aboutSave">Save and continue</button></div>
+      <p class="err" id="aboutErr" hidden></p>
+    </section>
+
+    <section class="step" data-step="on" hidden>
+      <h1>Keep me running.</h1>
+      <p class="lede" id="onLede">I’ll start now and again whenever this Mac starts, then do a small set of jobs on a schedule. More jobs switch on as you connect things.</p>
+      <ul class="rows" id="onRows"></ul>
+      <details class="jobs" id="jobsList"><summary>Which jobs</summary><ul></ul></details>
+      <div class="actions" id="onActions"></div>
+      <p class="hint" id="onHint" hidden></p>
+    </section>
+
+    <section class="step" data-step="reach" hidden>
+      <h1 id="reachTitle">How should I reach you?</h1>
+      <p class="lede">Pick at least one way to talk to me. Each one takes a few minutes and is set up from the control room, where you can also see and change everything I do.</p>
+      <ul class="ways" id="ways"></ul>
+      <div class="actions"><button class="btn" id="openControl">Open the control room</button><button class="link" id="finishLater">I’ll do this later</button></div>
+      <p class="hint" id="doneHint" hidden></p>
+    </section>
+  </main>
+</div>
+
+<script>
+const TOKEN = "__SETUP_TOKEN__";
+const ORDER = ["mac", "claude", "you", "on", "reach"];
+let S = null;            // last /api/state
+let current = "mac";
+let polling = null;
+const $ = (id) => document.getElementById(id);
+
+async function api(pathname, body) {
+  const opt = { headers: { "x-setup-token": TOKEN } };
+  if (body !== undefined) { opt.method = "POST"; opt.headers["content-type"] = "application/json"; opt.body = JSON.stringify(body); }
+  const r = await fetch(pathname, opt);
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok && !j.message) j.message = j.error || `The setup server answered ${r.status}`;
+  return j;
+}
+
+function el(tag, attrs = {}, ...kids) {
+  const n = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs)) {
+    if (k === "class") n.className = v; else if (k.startsWith("on")) n.addEventListener(k.slice(2), v); else if (v != null) n.setAttribute(k, v);
+  }
+  for (const k of kids.flat()) if (k != null) n.append(k.nodeType ? k : document.createTextNode(String(k)));
+  return n;
+}
+// Text with `code` spans, built as nodes (never innerHTML).
+function rich(text) {
+  const out = []; String(text).split(/(`[^`]+`)/).forEach((p) => out.push(p.startsWith("`") ? el("code", {}, p.slice(1, -1)) : p));
+  return out;
+}
+function row(state, name, detail, action) {
+  return el("li", { class: "row", "data-s": state }, el("span", { class: "dot", "aria-hidden": "true" }),
+    el("div", {}, el("div", { class: "row-name" }, name, el("span", { class: "sr" }, ` (${({ ok: "done", work: "working", need: "needs you", warn: "check", todo: "not yet" })[state]})`)), detail ? el("div", { class: "row-detail" }, ...rich(detail)) : null),
+    el("div", { class: "row-act" }, action || null));
+}
+function setRows(id, rows) { $(id).replaceChildren(...rows); }
+
+function setFace(mood, line) {
+  const f = $("face");
+  f.classList.remove("sleep", "awake", "busy", "happy");
+  f.classList.add(mood);
+  $("mouth").setAttribute("d", mood === "happy" ? "M80 124 Q100 142 120 124" : mood === "sleep" ? "M88 130 L112 130" : "M86 128 Q100 134 114 128");
+  if (line) $("faceLine").textContent = line;
+}
+
+// ── which steps are done ──────────────────────────────────────────────
+function doneMap(s) {
+  return {
+    mac: s.node.ok && s.claude.installed,
+    claude: s.claude.loggedIn,
+    you: s.identity.saved,
+    on: s.service.chat && s.service.ops && s.schedule.ok && s.schedule.missing === 0,
+    reach: false,
+  };
+}
+
+function show(step) {
+  current = step;
+  for (const sec of document.querySelectorAll(".step")) sec.hidden = sec.dataset.step !== step;
+  render();
+  const h = document.querySelector(`.step[data-step="${step}"] h1`);
+  if (h) { h.tabIndex = -1; h.focus({ preventScroll: true }); }
+  window.scrollTo({ top: 0 });
+}
+function next() { show(ORDER[Math.min(ORDER.indexOf(current) + 1, ORDER.length - 1)]); }
+
+$("steps").addEventListener("click", (e) => {
+  const li = e.target.closest("li");
+  if (li && (li.classList.contains("done") || li.classList.contains("current"))) show(li.dataset.step);
+});
+
+// ── render each step from the state ───────────────────────────────────
+function render() {
+  if (!S) return;
+  const d = doneMap(S);
+  for (const li of $("steps").children) {
+    li.classList.toggle("done", !!d[li.dataset.step] && li.dataset.step !== current);
+    li.classList.toggle("current", li.dataset.step === current);
+  }
+  $("faceName").textContent = S.identity.assistant_name || "Jori";
+  const jobs = S.jobs || {};
+
+  // Mac
+  const ci = jobs.claudeInstall, mem = jobs.memory;
+  setRows("macRows", [
+    row(S.node.ok ? "ok" : "need", "Node.js", S.node.ok ? `Version ${S.node.version}` : `Version ${S.node.version} is too old. Install 22.5 or newer: \`brew install node\``),
+    row(S.claude.installed ? "ok" : ci?.state === "running" ? "work" : "need", "Claude Code",
+      S.claude.installed ? `Version ${S.claude.version || "installed"}` : ci?.state === "running" ? "Installing…" : ci?.state === "error" ? `That didn’t work: ${tail(ci.out)}` : "I need it to think. It installs in about a minute.",
+      !S.claude.installed && ci?.state !== "running" && S.npm ? el("button", { class: "btn small", onclick: () => api("/api/claude/install", {}).then(poll) }, "Install") : null),
+    row(S.ollama.running && S.ollama.model ? "ok" : mem?.state === "running" ? "work" : mem?.state === "error" ? "warn" : "todo", "Memory search",
+      S.ollama.running && S.ollama.model ? "Running on this Mac" : mem?.state === "running" ? "Setting up a small local model (about 270 MB)…" : mem?.state === "error" ? `That didn’t finish: ${tail(mem.out)}` : "Optional. Lets me find things you told me by meaning, not just exact words.",
+      !(S.ollama.running && S.ollama.model) && mem?.state !== "running" ? el("button", { class: "btn small quiet", onclick: () => api("/api/memory", {}).then(poll) }, "Set up") : null),
+  ]);
+  $("macNext").disabled = !d.mac;
+
+  // Claude
+  const cl = S.claude, login = jobs.claudeLogin;
+  const plan = cl.plan ? cl.plan[0].toUpperCase() + cl.plan.slice(1) : null;
+  setRows("claudeRows", [
+    !cl.installed ? row("need", "Claude Code isn’t installed", "Go back one step and install it first.")
+      : cl.loggedIn && cl.planOk ? row("ok", `Signed in as ${cl.email}`, `${plan} plan, which is what I’m built for.`)
+      : cl.loggedIn && !cl.viaSubscription ? row("warn", `Signed in with an API account${cl.email ? ` (${cl.email})` : ""}`, "I only run on a Claude subscription. Sign in again and choose your Claude.ai account.")
+      : cl.loggedIn ? row("warn", `Signed in as ${cl.email}`, `${plan || "This"} plan. I work best on Max; on smaller plans I’ll hit the usage limit within hours of a normal day.`)
+      : login?.state === "running" ? row("work", "Waiting for you in the browser", "Finish signing in on the Claude page that opened, then come back here.")
+      : login?.state === "error" ? row("need", "Sign-in didn’t finish", tail(login.out) || "Try again, or run `claude auth login` in Terminal.")
+      : row("todo", "Not signed in yet", "A Claude page opens in your browser. It takes about thirty seconds."),
+  ]);
+  const ca = [];
+  if (cl.installed && !cl.loggedIn && login?.state !== "running") ca.push(el("button", { class: "btn", onclick: () => api("/api/claude/login", {}).then(poll) }, "Sign in with Claude"));
+  if (cl.installed && cl.loggedIn && !cl.planOk) ca.push(el("button", { class: "btn quiet", onclick: () => api("/api/claude/login", {}).then(poll) }, "Sign in with another account"));
+  if (cl.loggedIn) ca.push(el("button", { class: "btn", onclick: next }, "Continue"));
+  $("claudeActions").replaceChildren(...ca);
+  const url = login?.url;
+  $("claudeHint").hidden = !(login?.state === "running" && url);
+  if (url) $("claudeHint").replaceChildren("No page opened? ", el("a", { href: url, target: "_blank", rel: "noopener" }, "Open the sign-in page"), ".");
+
+  // About you (fill once; never overwrite what the person is typing)
+  const f = $("aboutForm");
+  if (!f.dataset.filled) {
+    for (const k of ["owner_name", "owner_email", "home_city", "tz", "assistant_name", "partner_name"]) if (f.elements[k]) f.elements[k].value = S.identity[k] || "";
+    f.dataset.filled = "1";
+  }
+
+  // Keep it running
+  const sv = S.service, sc = S.schedule, starting = starting_;
+  setRows("onRows", [
+    row(sv.running ? "ok" : starting ? "work" : "todo", "Background service", sv.running ? "Running, and starts again with this Mac" : starting ? "Starting…" : "Starts with this Mac and restarts itself if anything crashes"),
+    row(sv.chat ? "ok" : sv.running || starting ? "work" : "todo", "Chat", sv.chat ? "Answering" : sv.running ? "Waking up… the first start takes a minute" : "Where your messages go"),
+    row(sv.ops ? "ok" : sv.running || starting ? "work" : "todo", "Background work", sv.ops ? "Answering" : sv.running ? "Waking up…" : "Where scheduled jobs run"),
+    row(!sc.ok ? "need" : sc.missing === 0 ? "ok" : starting ? "work" : "todo", "Scheduled jobs", !sc.ok ? `I couldn’t read this Mac’s schedule: ${sc.error}` : sc.missing === 0 ? `${sc.total} jobs scheduled` : `${sc.total} jobs, from a morning brief to keeping memory backed up`),
+  ]);
+  const jl = $("jobsList").querySelector("ul");
+  if (!jl.children.length) jl.replaceChildren(...(sc.jobs || []).map((j) => el("li", {}, j.why)));
+  const oa = [];
+  if (!d.on) oa.push(el("button", { class: "btn", disabled: starting || !d.claude ? "" : null, onclick: startJori }, sv.running ? "Finish setting up" : "Start " + (S.identity.assistant_name || "Jori")));
+  if (d.on || (sv.running && sc.missing === 0)) oa.push(el("button", { class: "btn", onclick: next }, "Continue"));
+  $("onActions").replaceChildren(...oa);
+  const r = S.results || {};
+  const bad = [r.service, r.schedule].find((x) => x && !x.ok);
+  $("onHint").hidden = !(bad || (!d.claude) || (sv.running && !(sv.chat && sv.ops) && slow()));
+  $("onHint").replaceChildren(...rich(bad ? bad.message : !d.claude ? "Sign in with Claude first; the agents need it to start." : "Still waking up. If this lasts more than a few minutes, run `jori logs ops-agent` in Terminal to see why."));
+
+  // Reach
+  $("reachTitle").textContent = d.on ? "I’m on. How should I reach you?" : "How should I reach you?";
+  const ctl = S.controlUrl.replace(/#.*$/, "");
+  const ways = [
+    ["The Jori app", "Chat and notifications on iPhone and Mac. Needs a free Supabase project.", "#services"],
+    ["iMessage", "Text me from the Messages app. Needs Full Disk Access for this Mac.", "#channels"],
+    ["WhatsApp", "Message me from your phone, paired with a QR code.", "#channels"],
+    ["Slack", "Talk to me in your workspace, as a teammate.", "#channels"],
+    ["Gmail", "I sort your inbox and tell you about the urgent mail.", "#services"],
+  ];
+  if (!$("ways").children.length) $("ways").replaceChildren(...ways.map(([h, p, hash]) =>
+    el("li", { class: "way" }, el("div", {}, el("h3", {}, h), el("p", {}, p)), el("a", { class: "btn small quiet", href: ctl + hash, target: "_blank", rel: "noopener" }, "Set up"))));
+
+  // Face
+  if (current === "reach" && d.on) setFace("happy", "All set. I’ll be here.");
+  else if (Object.values(jobs).some((j) => j.state === "running") || starting) setFace("busy", "Working on it…");
+  else if (d.mac) setFace("awake", current === "you" ? "Nice to meet you." : current === "on" ? "Almost there." : "Awake and listening.");
+  else setFace("sleep", "Getting ready on this Mac.");
+}
+
+const tail = (s) => String(s || "").trim().split("\n").filter(Boolean).slice(-1)[0] || "";
+let starting_ = false, startedAt = 0;
+const slow = () => startedAt && Date.now() - startedAt > 120000;
+
+async function startJori() {
+  starting_ = true; startedAt = Date.now(); render();
+  const r = await api("/api/start", {});
+  starting_ = false;
+  if (!r.ok) S.results = { service: r.service || { ok: false, message: r.message }, schedule: r.schedule };
+  await poll();
+}
+
+$("macNext").addEventListener("click", next);
+$("aboutSave").addEventListener("click", async () => {
+  const f = $("aboutForm"), b = {};
+  for (const k of ["owner_name", "owner_email", "home_city", "tz", "assistant_name", "partner_name"]) b[k] = f.elements[k].value.trim();
+  b.telemetry = f.elements.telemetry.checked;
+  const missing = ["owner_name", "owner_email", "tz", "assistant_name"].filter((k) => !b[k]);
+  const err = $("aboutErr");
+  if (missing.length) { err.hidden = false; err.textContent = "Fill in your name, email, time zone and what to call the assistant."; f.elements[missing[0]].focus(); return; }
+  const r = await api("/api/identity", b);
+  if (!r.ok) { err.hidden = false; err.textContent = r.message; return; }
+  err.hidden = true;
+  await poll();
+  next();
+});
+async function finish(goControl) {
+  await api("/api/finish", {});
+  $("doneHint").hidden = false;
+  $("doneHint").replaceChildren(...rich("Setup is closed. Run `jori setup` any time to come back."));
+  if (goControl) location.href = S.controlUrl;
+}
+$("openControl").addEventListener("click", () => finish(true));
+$("finishLater").addEventListener("click", () => finish(false));
+
+async function poll() {
+  try {
+    const s = await api("/api/state");
+    if (s.error) throw new Error(s.error);
+    S = s;
+    render();
+  } catch {
+    $("faceLine").textContent = "Setup stopped. Run `jori setup` in Terminal to start it again.";
+    clearInterval(polling); polling = null;
+  }
+}
+
+(async function boot() {
+  try { $("tzList").replaceChildren(...Intl.supportedValuesOf("timeZone").map((z) => el("option", { value: z }))); } catch {}
+  await poll();
+  if (!S) return;
+  // Open where the person left off: the first step not done yet.
+  const d = doneMap(S);
+  show(ORDER.find((k) => !d[k]) || "reach");
+  polling = setInterval(poll, 2500);
+})();
+</script>
+</body>
+</html>

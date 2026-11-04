@@ -45,7 +45,7 @@ page until it is gone.
 | Not configurable yet | `data/control-hardcoded.json` from `bin/control-scan` | — |
 | Change history | `data/config-audit.jsonl` | "Put back" reapplies the recorded `before` |
 | Jev (on Agents) | `data/jev-config.json`, question files, `data/jev-shadow/` (7 days), `data/.jev-off`, `TYPESAFE_API_KEY` set or not | `data/jev-config.json` (thresholds, per-site on/off, privacy, budget); `data/.jev-off` |
-| Setup | every part above, plus Ollama, webhook token, Supabase, Cloudflare Access | — (each item links the page that fixes it) |
+| Setup | every part above, plus Ollama, webhook token, Supabase, Cloudflare Access | — (each item links the page that fixes it; a fresh install's schedule and service come from `jori setup start`) |
 | Failing jobs (on Schedule and Today) | `data/job-failure-state.json`, `data/job-repair-queue.json` | — (`bin/job-failure-watch`, run by the watchdog) |
 
 Every file write is atomic (`lib/atomic-write.js`), keeps the previous copy in

@@ -1,6 +1,28 @@
 # Quickstart
 
-Five commands and a few prompts. Result: Jori's supervisors running on your host, a webhook you can dispatch jobs to, and an event stream in your terminal.
+## The one-line install (macOS)
+
+```bash
+curl -fsSL https://getjori.ai/install.sh | bash
+```
+
+That installs what is missing (Homebrew, Node.js 22.5+, git, Claude Code, Ollama with its embedding model), puts Jori in `~/Dev/jori`, and opens the **setup page** in your browser. The page needs about two minutes and a few clicks:
+
+1. **Your Mac** — checks Node, Claude Code and memory search, and installs what is missing.
+2. **Claude sign-in** — signs in with your Claude subscription (`claude auth login` underneath) and checks the plan. Jori is built for Max.
+3. **About you** — your name, email, home city, time zone and the assistant's name, filled in from this Mac (macOS account name, the Claude sign-in's email, the system time zone). Fix what is wrong and save.
+4. **Keep it running** — one button. It installs the `ai.jori.session` launch agent (Jori starts now and at every login, and restarts after a crash) and schedules the starter jobs in `system/starter-jobs.json`: the watchdog, the morning brief, hum, memory upkeep and the two repair loops. Other jobs switch on from the control room as you connect what they need.
+5. **Ways to reach you** — the Jori app, iMessage, WhatsApp, Slack and Gmail, each set up from the control room.
+
+Already cloned? Run `./bin/jori setup` from the checkout. It is safe to re-run: it fills only what is missing, never restarts a running service and never adds a job that is already in the crontab. `jori setup status` gives the same checks in the terminal, and `jori setup start` does step 4 without a browser.
+
+Installer options (environment): `JORI_HOME` (default `~/Dev/jori`), `JORI_REPO`, `JORI_NO_OLLAMA=1`, `JORI_NO_SETUP=1`. The script is [`site/install.sh`](../site/install.sh); read it before piping it to a shell.
+
+---
+
+## The manual install
+
+Five commands and a few prompts, for when you want each step in the terminal. Result: Jori's supervisors running on your host, a webhook you can dispatch jobs to, and an event stream in your terminal.
 
 ## Before you start
 

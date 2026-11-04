@@ -9,6 +9,8 @@ Jori is built and run on macOS. Two conventions are assumed throughout the kerne
 
 ## macOS — launchd
 
+**The short way:** `jori setup start` (or the **Start Jori** button on the `jori setup` page) does steps 1 and 2 below for this checkout: it writes `~/Library/LaunchAgents/ai.jori.session.plist` with this machine's node and paths, bootstraps it, and adds the starter jobs from `system/starter-jobs.json` to the crontab (tagged `# jori-starter`, each through `bin/cron-run`). It leaves a running service alone and skips any job whose `--label` is already scheduled. The rest of this section is what it does, by hand.
+
 ### 1. The process manager
 
 The kernel ships launchd templates for its scheduled jobs (below) but not for the process manager itself, because its environment is host-specific. Save this as `~/Library/LaunchAgents/ai.jori.session.plist`, replacing `YOUR_JORI_HOME` with the absolute path of your checkout:

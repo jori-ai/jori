@@ -1,0 +1,6 @@
+{
+  "_doc": "Rain on your walks (plugins/rain-walk). windows_file: a JSON file under agent/local/ with { heading, order, windows: { <key>: { label, start_h, end_h } } }. threshold: the chance of rain that counts as wet. schedules: one line per check, e.g. { \"label\": \"rain-walk-morning\", \"cron\": \"30 7 * * *\", \"run\": \"{node} bin/rain-walk-check --window morning --prewalk\", \"log\": \"agent/logs/rain-walk.log\" }, and a --summary line. Times are the host's local time.",
+  "windows_file": "rain-walk/windows.json",
+  "threshold": 0.3,
+  "schedules": []
+}
