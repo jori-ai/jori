@@ -369,11 +369,12 @@ function render() {
   if (url) $("claudeHint").replaceChildren("No page opened? ", el("a", { href: url, target: "_blank", rel: "noopener" }, "Open the sign-in page"), ".");
   $("codeForm").hidden = login?.state !== "running";
 
-  // About you (fill once; never overwrite what the person is typing)
+  // About you: a field takes the detected value until the person types in it,
+  // so the email found by the Claude sign-in still arrives after the page loaded.
   const f = $("aboutForm");
-  if (!f.dataset.filled) {
-    for (const k of ["owner_name", "owner_email", "home_city", "tz", "assistant_name", "partner_name"]) if (f.elements[k]) f.elements[k].value = S.identity[k] || "";
-    f.dataset.filled = "1";
+  for (const k of ["owner_name", "owner_email", "home_city", "tz", "assistant_name", "partner_name"]) {
+    const input = f.elements[k];
+    if (input && !input.dataset.touched && input !== document.activeElement) input.value = S.identity[k] || "";
   }
 
   // Keep it running
@@ -428,6 +429,7 @@ async function startJori() {
 }
 
 $("macNext").addEventListener("click", next);
+$("aboutForm").addEventListener("input", (e) => { if (e.target.name) e.target.dataset.touched = "1"; });
 $("codeForm").addEventListener("submit", async (e) => {
   e.preventDefault();
   const f = $("codeForm"), err = $("codeErr");
