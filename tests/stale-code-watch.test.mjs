@@ -74,7 +74,11 @@ function harness(o = {}) {
     syntaxOk: () => o.syntaxOk ?? true,
     gitBusy: () => o.gitBusy ?? null,
     // WhatsApp's message log / key store: written a minute ago unless a test says it went quiet
-    lastWriteMs: () => o.waLastWrite ?? (o.now ?? NOW) - 1 * MIN,
+    // (o.waWrites: per-path last write, keyed by a suffix of the path, for tests that need them apart)
+    lastWriteMs: (files) => {
+      if (!o.waWrites) return o.waLastWrite ?? (o.now ?? NOW) - 1 * MIN;
+      return Math.max(0, ...files.map((f) => Object.entries(o.waWrites).find(([k]) => f.endsWith(k))?.[1] ?? 0));
+    },
     kickstart: (label) => calls.push(["kickstart", label]),
     kill: (pid, sig) => calls.push(["kill", pid, sig]),
     readState: () => state,
@@ -200,6 +204,41 @@ test("whatsapp-channel holds while WhatsApp is busy or its code is not committed
   await m.main(["--dry-run"], hd.io, ROOT);
   assert.deepEqual(hd.calls, []);
   touch(WA, OLD);
+});
+
+// Regression guard for the stale-code-flag alert re-posting for whatsapp-channel
+// after the quiet restart shipped: the running client rewrites creds.json about
+// every 10 minutes with no traffic at all, so with the key store held to the
+// message log's 10-minute window no tick ever saw it still and the restart never
+// fired (12h flagged overnight with the message log quiet for hours). The key
+// store now only has to be still for KEY_QUIET_MS.
+test("whatsapp-channel restarts when the message log is quiet even though the key store is rewritten every 10 minutes", async () => {
+  const WA = "agent/whatsapp-channel/index.mjs";
+  touch(WA, NOW - 30 * MIN);
+  const timer = { "whatsapp-inbox.jsonl": NOW - 3 * H, "wa-auth/baileys": NOW - 9 * H, "creds.json": NOW - 3 * MIN };
+  try {
+  const h = harness({ waWrites: timer });
+  assert.equal(await m.main([], h.io, ROOT), 0);
+  assert.deepEqual(h.calls, [["kill", 24134, "SIGTERM"]]);
+  // a key write in the last minute still holds it
+  const hk = harness({ waWrites: { ...timer, "creds.json": NOW - 20 * 1000 } });
+  await m.main([], hk.io, ROOT);
+  assert.deepEqual(hk.calls, []);
+  assert.equal(hk.state()._held["whatsapp-channel"], "session keys written in the last minute");
+  // a message in the last 10 minutes still holds it
+  const hm = harness({ waWrites: { ...timer, "whatsapp-inbox.jsonl": NOW - 5 * MIN } });
+  await m.main([], hm.io, ROOT);
+  assert.deepEqual(hm.calls, []);
+  assert.equal(hm.state()._held["whatsapp-channel"], "written to in the last 10 minutes");
+  } finally { touch(WA, OLD); }
+});
+
+test("quietHold: each path against its own window, first one written too recently wins", () => {
+  const q = [{ path: "log", ms: 10 * MIN, what: "log" }, { path: "keys", ms: MIN, what: "keys" }];
+  const at = (w) => (p) => w[p];
+  assert.deepEqual(m.quietHold(q, NOW, at({ log: NOW - 11 * MIN, keys: NOW - 2 * MIN })), { hold: null, stillMs: 11 * MIN });
+  assert.equal(m.quietHold(q, NOW, at({ log: NOW - 11 * MIN, keys: NOW - 30 * 1000 })).hold, "keys");
+  assert.equal(m.quietHold(q, NOW, at({ log: NOW - 9 * MIN, keys: NOW - 30 * 1000 })).hold, "log");
 });
 
 test("phone-channel and process-manager stay flag-only even when WhatsApp is quiet", async () => {
