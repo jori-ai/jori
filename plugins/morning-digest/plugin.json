@@ -25,5 +25,8 @@
     "agent/ops-agent/jobs/morning-digest.md",
     "agent/scripts/trigger-morning-digest.sh",
     "bin/morning-digest-run"
+  ],
+  "settings": [
+    "news-headlines"
   ]
 }

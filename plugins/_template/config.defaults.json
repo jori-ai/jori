@@ -1,0 +1,4 @@
+{
+  "_doc": "__TITLE__ (plugins/__NAME__). Each setting with a sentence on what it changes. Copied to agent/local/config/__NAME__.json the first time the plugin is turned on; code reads it with localConfig(\"__NAME__\", defaults), so every key also needs a default in code.",
+  "enabled_example": true
+}

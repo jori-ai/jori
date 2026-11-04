@@ -34,5 +34,8 @@
     "agent/scripts/trigger-purchase-signin.sh",
     "agent/shop-view/server.mjs",
     "bin/purchase-approval-poll"
+  ],
+  "settings": [
+    "purchase"
   ]
 }

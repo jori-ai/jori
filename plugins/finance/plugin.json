@@ -35,5 +35,8 @@
     "agent/scripts/trigger-finance-review.sh",
     "agent/scripts/trigger-net-worth-monthly.sh",
     "agent/scripts/trigger-plaid-sync.sh"
+  ],
+  "settings": [
+    "money-quantity"
   ]
 }

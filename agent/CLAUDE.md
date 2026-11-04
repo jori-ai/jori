@@ -49,7 +49,7 @@ The files listed in `system/kernel-manifest.json` are the generic kernel, shared
 
 ## Plugins — a new feature ships as a plugin
 
-A new feature is a plugin (`plugins/<name>/`, or `agent/local/plugins/<name>/` when it is this installation's own): a `plugin.json` manifest plus its commands, playbooks, schedules and settings in that directory. Never add a plugin's cron line by hand (`jori plugin sync` writes it), and never name a plugin's files from outside it: ask `lib/plugins.cjs`. Turn features on and off with `jori plugin enable|disable`. Design: `system/plugins.md`.
+A new feature is a plugin (`plugins/<name>/`, or `agent/local/plugins/<name>/` when it is this installation's own): a `plugin.json` manifest plus its commands, playbooks, schedules and settings in that directory. Start it with `jori plugin new <name> [--schedule CRON] [--job] [--local]`; the how-to is `docs/writing-a-plugin.md`. Never add a plugin's cron line by hand (`jori plugin sync` writes it), and never name a plugin's files from outside it: ask `lib/plugins.cjs`. Turn features on and off with `jori plugin enable|disable`. Design: `system/plugins.md`.
 
 ## Calendar Invitations — Never invite anyone else unless the user explicitly asks
 

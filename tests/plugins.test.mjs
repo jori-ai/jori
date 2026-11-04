@@ -175,3 +175,26 @@ test("a core plugin is always on and cannot be turned off or removed; a disabled
 function await_root() { return require_root(); }
 import { createRequire as _cr } from "node:module";
 function require_root() { return _cr(import.meta.url)("../lib/root.cjs").installTools(); }
+
+test("plugin new: the template becomes a valid, off-by-default plugin with its schedule and job", () => {
+  fs.cpSync(path.resolve(path.dirname(new URL(import.meta.url).pathname), "..", "plugins", "_template"), path.join(KDIR, "_template"), { recursive: true });
+  const r = M.create("mu-check", { title: "Mu check", schedule: "10 6 * * *", job: true });
+  const m = JSON.parse(fs.readFileSync(path.join(r.dir, "plugin.json"), "utf8"));
+  assert.equal(m.name, "mu-check");
+  assert.equal(m.title, "Mu check");
+  assert.equal(m.default, "disabled");
+  assert.deepEqual(m.schedules[0], { label: "mu-check", cron: "10 6 * * *", run: "{node} bin/mu-check", log: "agent/logs/mu-check.log" });
+  assert.ok(m.jobs["mu-check"]);
+  assert.ok(fs.existsSync(path.join(r.dir, "bin", "mu-check")));
+  assert.ok(fs.existsSync(path.join(r.dir, "jobs", "mu-check.md")));
+  assert.equal(fs.readFileSync(path.join(r.dir, "README.md"), "utf8").includes("__NAME__"), false);
+  assert.deepEqual(P.plugin("mu-check").errors, []);
+  assert.equal(P.isEnabled("mu-check"), false);
+  assert.throws(() => M.create("mu-check"), /already exists/);
+  assert.throws(() => M.create("Bad Name"), /lowercase/);
+  assert.throws(() => M.create("nu", { schedule: "daily" }), /five-field/);
+  const plain = M.create("nu-check");
+  assert.equal(fs.existsSync(path.join(plain.dir, "jobs")), false, "no playbook without --job");
+  fs.rmSync(path.join(KDIR, "mu-check"), { recursive: true });
+  fs.rmSync(path.join(KDIR, "nu-check"), { recursive: true });
+});

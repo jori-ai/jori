@@ -1,5 +1,7 @@
 # Plugins — every feature is a module you can install and remove
 
+How to write one: **`docs/writing-a-plugin.md`** (`jori plugin new <name>` scaffolds it from `plugins/_template/`).
+
 A **plugin** is one feature of Jori packaged as a directory: its commands, code,
 job playbooks, schedules, settings, the keys and tools it needs, and its tests.
 Turning a plugin off stops everything it runs and hides everything it

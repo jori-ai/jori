@@ -25,5 +25,8 @@
     "agent/ops-agent/jobs/flights-scan.md",
     "agent/scripts/trigger-flights-scan.sh",
     "bin/flights-scan-run"
+  ],
+  "settings": [
+    "flight-search"
   ]
 }

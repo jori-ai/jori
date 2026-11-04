@@ -1,0 +1,25 @@
+#!/usr/bin/env node
+// __NAME__ — __TITLE__ (plugins/__NAME__, system/plugins.md).
+//
+// Usage: __NAME__ [--dry-run]
+// Settings: agent/local/config/__NAME__.json, read with localConfig and the
+// defaults below (every key needs one). Kernel helpers are reached by path
+// from the install (../../../lib); nothing outside this plugin names its files.
+
+const path = require("node:path");
+const LIB = path.join(__dirname, "..", "..", "..", "lib");
+const { localConfig, instance } = require(path.join(LIB, "instance.cjs"));
+
+const DEFAULTS = { enabled_example: true };
+
+function main(argv) {
+  const dry = argv.includes("--dry-run");
+  const cfg = localConfig("__NAME__", DEFAULTS);
+  const who = instance().owner_name;
+  const result = { ok: true, dry, settings: cfg, for: who };
+  process.stdout.write(JSON.stringify(result) + "\n");
+  return 0;
+}
+
+if (require.main === module) process.exit(main(process.argv.slice(2)));
+module.exports = { main, DEFAULTS };
