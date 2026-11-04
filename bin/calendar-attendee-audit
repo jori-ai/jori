@@ -157,17 +157,26 @@ function saveSeen(seen) {
 }
 
 // ── What Jori believes it wrote ───────────────────────────────────────
+// Every row in the log, not only the last DAYS. An event enters the audit on
+// its `updated` stamp (recentEvents), and a guest's RSVP moves that stamp long
+// after the create row that authorized the invite was written: with both
+// windows at DAYS, an authorized invite answered a day later was reported as
+// "attendees Jori cannot account for". Matching stays exact (event id, or a
+// create row within CREATE_MATCH_WINDOW_MS of `created` sharing a guest), so an
+// old row can only ever cover its own event.
+// The pre-ATTENDEE_LOG_EPOCH blanket branch below still reads only rows inside
+// the DAYS window (ROW_WINDOW_SINCE), so that branch keeps aging out as its
+// comment promises.
+const ROW_WINDOW_SINCE = Date.now() - DAYS * 24 * 3600_000;
 function auditRows() {
-  const since = Date.now() - DAYS * 24 * 3600_000;
   const rows = [];
   try {
     for (const line of fs.readFileSync(LOG, "utf8").split("\n")) {
       if (!line.trim()) continue;
       let r; try { r = JSON.parse(line); } catch { continue; }
-      const t = Date.parse(r?.ts || "");
-      if (Number.isFinite(t) && t >= since) rows.push(r);
+      if (Number.isFinite(Date.parse(r?.ts || ""))) rows.push(r);
     }
-  } catch { /* no rows in the window — every invite will read as unexplained, which is correct */ }
+  } catch { /* no log — every invite will read as unexplained, which is correct */ }
   return rows;
 }
 
@@ -273,7 +282,7 @@ for (const ev of events) {
       continue;
     }
     const rowTs = Date.parse(r.ts || "");
-    if (!Number.isFinite(rowTs) || rowTs < ATTENDEE_LOG_EPOCH) {
+    if (Number.isFinite(rowTs) && rowTs >= ROW_WINDOW_SINCE && rowTs < ATTENDEE_LOG_EPOCH) {
       for (const a of foreign) covered.add(a);   // see ATTENDEE_LOG_EPOCH
     }
   }

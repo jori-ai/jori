@@ -12,10 +12,17 @@
 // check: a guest present on only one instance must still be named.
 //
 // Pure functions over literal objects — no network, no calendar, no ledger, no
-// side effects of any kind.
+// side effects of any kind — except the rsvp-window block at the end, which runs
+// the audit script itself against a temp JORI_HOME and a fake gog (still no
+// network and no real calendar).
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { execFileSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
 import { seriesKey, collapseFindings, formatFindingLine, inAuditScope } from "../lib/calendar-audit-group.js";
 
 const SERIES = "_8ksk8e9n64pk4ba58h1j0b9k8co46ba2610jab9j8cpjac266gr3gdpj6g";
@@ -216,4 +223,91 @@ test("private-copy scope: address-only matches are unchanged when no self flag i
   assert.equal(inAuditScope({ organizer: { email: "user@example.invalid" } }, USER_ADDRS), true);
   assert.equal(inAuditScope({}, USER_ADDRS), false);
   assert.equal(inAuditScope(null, USER_ADDRS), false);
+});
+
+// ── rsvp-window ─────────────────────────────────────────────────────────────
+// An invite Jori created with an authorization quote stays accounted for when a
+// guest's RSVP brings the event back into the audit window after the create row
+// is older than that window. Defends the "calendar event(s) with attendees Jori
+// cannot account for" alert against reporting an authorized invite: the event
+// enters on `updated`, and the create row used to be read only for the same DAYS.
+// The pre-attendee_log_epoch blanket branch must keep its DAYS bound.
+
+const AUDIT = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "bin", "calendar-attendee-audit");
+const H = 3600_000;
+
+function run({ rows, events, config = null }) {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "cal-audit-rsvp-"));
+  fs.mkdirSync(path.join(home, "data/logs"), { recursive: true });
+  fs.writeFileSync(path.join(home, "data/logs/calendar-writes.jsonl"), rows.map((r) => JSON.stringify(r)).join("\n") + "\n");
+  if (config) {
+    fs.mkdirSync(path.join(home, "agent/local/config"), { recursive: true });
+    fs.writeFileSync(path.join(home, "agent/local/config/calendar-audit.json"), JSON.stringify(config));
+  }
+  const evFile = path.join(home, "events.json");
+  fs.writeFileSync(evFile, JSON.stringify({ events }));
+  const gog = path.join(home, "fake-gog");
+  fs.writeFileSync(gog, `#!/bin/sh\ncat ${JSON.stringify(evFile)}\n`);
+  fs.chmodSync(gog, 0o755);
+  try {
+    const out = execFileSync(process.execPath, [AUDIT, "--json"], {
+      encoding: "utf8",
+      env: { ...process.env, JORI_HOME: home, GOG_BIN: gog },
+    });
+    return JSON.parse(out);
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+}
+
+const now = Date.now();
+const created = new Date(now - 30 * H).toISOString();
+const rsvp = new Date(now - 18 * H).toISOString();
+const event = {
+  id: "evt-show-1",
+  summary: "A show",
+  created,
+  updated: rsvp,                                   // the guest's RSVP, inside the 1-day window
+  organizer: { self: true },
+  creator: { self: true },
+  attendees: [{ email: "guest@example.com", responseStatus: "accepted" }],
+};
+const olderRow = { ts: new Date(now - 72 * H).toISOString(), action: "create", event_id: null, attendees: [], authorization: null, dry_run: false };
+const createRow = {
+  ts: new Date(Date.parse(created) + 4_000).toISOString(),
+  action: "create", event_id: null,
+  attendees: ["guest@example.com"], attendees_replace: ["guest@example.com"], attendees_add: [],
+  authorization: "standing: invite the guest to confirmed shows", dry_run: false,
+};
+
+test("rsvp-window: an RSVP a day after an authorized create does not report the invite", () => {
+  const out = run({ rows: [olderRow, createRow], events: [event] });
+  assert.equal(out.events_checked, 1);
+  assert.equal(out.findings.length, 0);
+});
+
+test("rsvp-window: the same event with no create row is still reported", () => {
+  const out = run({ rows: [olderRow], events: [event] });
+  assert.equal(out.findings.length, 1);
+  assert.deepEqual(out.findings[0].uncovered, ["guest@example.com"]);
+});
+
+test("rsvp-window: a create row for a different guest does not cover this one", () => {
+  const other = { ...createRow, attendees: ["someone-else@example.com"], attendees_replace: ["someone-else@example.com"] };
+  const out = run({ rows: [olderRow, other], events: [event] });
+  assert.equal(out.findings.length, 1);
+});
+
+test("rsvp-window: an old pre-attendee-log row with a quote and no guest list does not blanket-cover a later invite", () => {
+  // attendee_log_epoch in the future makes every row "pre-epoch"; the blanket
+  // branch must still only read rows inside the DAYS window.
+  const blanket = { ts: new Date(now - 40 * H).toISOString(), action: "update", event_id: "evt-show-1", attendees: [], authorization: "an old quote", dry_run: false };
+  const out = run({ rows: [olderRow, blanket], events: [event], config: { attendee_log_epoch: new Date(now + 24 * H).toISOString() } });
+  assert.equal(out.findings.length, 1);
+});
+
+test("rsvp-window: the same pre-attendee-log row inside the window still covers it (unchanged)", () => {
+  const blanket = { ts: new Date(now - 6 * H).toISOString(), action: "update", event_id: "evt-show-1", attendees: [], authorization: "an old quote", dry_run: false };
+  const out = run({ rows: [olderRow, blanket], events: [event], config: { attendee_log_epoch: new Date(now + 24 * H).toISOString() } });
+  assert.equal(out.findings.length, 0);
 });
