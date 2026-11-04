@@ -1,0 +1,155 @@
+#!/usr/bin/env node
+// linkedin-lookup — read LinkedIn through the host's signed-in automation
+// Chrome (CDP, the same browser lib/cdp.mjs drives for every other page read).
+//
+// WHY THE BROWSER. Public search snippets carry a stale headline at best, and
+// linkedin.com refuses a plain fetch. The automation Chrome on the host holds
+// the user's own LinkedIn session, so a lookup reads the current page exactly
+// as the user would see it, including the full experience list.
+//
+// READ-ONLY. This never clicks anything: no Connect, Follow, Message, Like or
+// endorse. It only navigates and reads text. Note that an opened profile
+// counts as a profile view by the user's account, and LinkedIn may show the
+// person that the user viewed them (that follows the account's own
+// profile-viewing privacy setting).
+//
+// Usage:
+//   linkedin-lookup search "<full name>" [<company or keywords>] [--limit N]
+//   linkedin-lookup profile <profile url | /in/slug | slug> [--no-experience]
+//   add --json for machine-readable output
+//
+// Exit codes: 0 ok · 1 Chrome unreachable / page error · 2 usage ·
+//             3 LinkedIn session signed out or challenged (sign back in with
+//               bin/site-login linkedin.com, see ops-agent CLAUDE.md
+//               § Signing in to sites)
+
+import { connect } from "../lib/cdp.mjs";
+import { port as registryPort } from "../lib/ports.cjs";
+
+const ARGV = process.argv.slice(2);
+const FLAGS = new Set(ARGV.filter((a) => a.startsWith("--")));
+const flagVal = (n, d) => { const i = ARGV.indexOf(`--${n}`); return i >= 0 && ARGV[i + 1] ? ARGV[i + 1] : d; };
+const POS = ARGV.filter((a, i) => !a.startsWith("--") && ARGV[i - 1] !== "--limit");
+const JSON_OUT = FLAGS.has("--json");
+const LIMIT = Math.max(1, Math.min(20, Number(flagVal("limit", "8")) || 8));
+// Human-scale pacing between the two page loads of a profile read: a burst of
+// rapid loads is what gets a session challenged.
+const DELAY_MS = 3000;
+
+const usage = () => {
+  console.error('usage: linkedin-lookup search "<name>" [<company>] [--limit N] [--json]\n       linkedin-lookup profile <url|slug> [--no-experience] [--json]');
+  process.exit(2);
+};
+
+const [cmd, ...rest] = POS;
+if (!cmd || !["search", "profile"].includes(cmd) || !rest.length) usage();
+
+// A signed-out or challenged session lands on one of these paths.
+const WALL_JS = `/\\/(login|authwall|checkpoint|uas\\/login|signup)/.test(location.pathname)`;
+
+const SEARCH_JS = `(() => {
+  const lines = (el) => el.innerText.split("\\n").map((s) => s.trim()).filter(Boolean);
+  const out = []; const seen = new Set();
+  for (const card of document.querySelectorAll('main [role="listitem"]')) {
+    const a = card.querySelector('a[href*="/in/"]');
+    if (!a) continue;
+    const url = a.href.split("?")[0];
+    if (seen.has(url)) continue; seen.add(url);
+    const L = lines(card).filter((s) => !/^(Connect|Follow|Message|Pending)$/.test(s));
+    // First line is the name, sometimes with the degree glued on ("Name • 2nd").
+    const name = (L[0] || "").split(" • ")[0].trim();
+    const rest = L.slice(1).filter((s) => !/^[•·]\\s*(1st|2nd|3rd\\+?)$/.test(s));
+    out.push({ url, name, headline: rest[0] || null, location: rest[1] || null,
+      detail: rest.slice(2).filter((s) => !/mutual connection|followers$/.test(s)).slice(0, 2),
+      mutual: rest.find((s) => /mutual connection/.test(s)) || null });
+  }
+  return JSON.stringify(out);
+})()`;
+
+const TOPCARD_JS = `(() => {
+  const lines = (el) => el.innerText.split("\\n").map((s) => s.trim()).filter(Boolean);
+  const top = [...document.querySelectorAll("section")].find((s) => /topcard/i.test((s.querySelector("[id]") || {}).id || ""))
+    || [...document.querySelectorAll("main section")].find((s) => s.querySelector("h1, h2"));
+  const L = top ? lines(top) : [];
+  const stop = L.findIndex((s) => /^(Activity|About)$/.test(s));
+  const T = (stop > 0 ? L.slice(0, stop) : L.slice(0, 16))
+    .filter((s) => !/^[·•]\\s*(1st|2nd|3rd\\+?)$/.test(s) && !/^[·•]$/.test(s)
+      && !/^(Contact info|Connect|Follow|Message|More|Profile enhanced with Premium)$/.test(s));
+  const about = [...document.querySelectorAll("main section")].find((s) => /^About$/.test((lines(s)[0] || "")));
+  return JSON.stringify({ title: document.title, name: T[0] || null, headline: T[1] || null, location: T[2] || null,
+    topcard: T.slice(3, 10), about: about ? lines(about).slice(1).join(" ").slice(0, 600) : null });
+})()`;
+
+const EXPERIENCE_JS = `(() => {
+  const L = (document.querySelector("main") || document.body).innerText.split("\\n").map((s) => s.trim()).filter(Boolean);
+  const start = L.indexOf("Experience");
+  const end = L.findIndex((s) => /^(More profiles for you|People also viewed|Explore Premium profiles)$/.test(s));
+  return JSON.stringify(L.slice(start >= 0 ? start + 1 : 0, end > 0 ? end : undefined).slice(0, 60));
+})()`;
+
+function profileUrl(arg) {
+  if (/^https?:\/\//.test(arg)) { // lang-regex-ok: URL scheme on a CLI argument
+    const u = new URL(arg);
+    const m = u.pathname.match(/\/in\/([^/]+)/); // lang-regex-ok: URL path
+    if (!m) throw new Error(`not a LinkedIn profile URL: ${arg}`);
+    return `https://www.linkedin.com/in/${m[1]}/`;
+  }
+  const slug = arg.replace(/^\/?(in\/)?/, "").replace(/\/.*$/, ""); // lang-regex-ok: URL path
+  return `https://www.linkedin.com/in/${slug}/`;
+}
+
+async function guard(page) {
+  if (await page.evaluate(WALL_JS)) {
+    console.error("linkedin-lookup: LinkedIn session is signed out or challenged in the automation Chrome. Sign back in: bin/site-login linkedin.com --login-url https://www.linkedin.com/login");
+    page.close();
+    process.exit(3);
+  }
+}
+
+let page;
+try {
+  page = await connect();
+} catch (e) {
+  console.error(`linkedin-lookup: cannot reach Chrome on CDP — ${e.message}`);
+  console.error(`Chrome must be running with --remote-debugging-port=${registryPort("chrome_cdp")} (chrome-cdp-watch keeps it up).`);
+  process.exit(1);
+}
+
+try {
+  if (cmd === "search") {
+    const q = rest.join(" ");
+    await page.goto(`https://www.linkedin.com/search/results/people/?keywords=${encodeURIComponent(q)}`, { settleMs: 6000 });
+    await guard(page);
+    const results = JSON.parse(await page.evaluate(SEARCH_JS)).slice(0, LIMIT);
+    if (JSON_OUT) console.log(JSON.stringify({ query: q, results }, null, 2));
+    else if (!results.length) console.log(`No LinkedIn people results for "${q}".`);
+    else for (const r of results) {
+      console.log(`${r.name}\n  ${r.headline || ""}${r.location ? `\n  ${r.location}` : ""}${r.detail.length ? `\n  ${r.detail.join(" · ")}` : ""}\n  ${r.url}`);
+    }
+  } else {
+    const url = profileUrl(rest[0]);
+    await page.goto(url, { settleMs: 7000 });
+    await guard(page);
+    const top = JSON.parse(await page.evaluate(TOPCARD_JS));
+    let experience = null;
+    if (!FLAGS.has("--no-experience")) {
+      await new Promise((r) => setTimeout(r, DELAY_MS));
+      await page.goto(`${url}details/experience/`, { settleMs: 6000 });
+      await guard(page);
+      experience = JSON.parse(await page.evaluate(EXPERIENCE_JS));
+    }
+    const out = { url, name: top.name, headline: top.headline, location: top.location, topcard: top.topcard, about: top.about, experience };
+    if (JSON_OUT) console.log(JSON.stringify(out, null, 2));
+    else {
+      console.log(`${out.name}\n  ${out.headline || ""}\n  ${out.location || ""}\n  ${url}`);
+      if (out.topcard.length) console.log(`  ${out.topcard.join(" · ")}`);
+      if (out.about) console.log(`\nAbout: ${out.about}`);
+      if (experience && experience.length) console.log(`\nExperience:\n  ${experience.join("\n  ")}`);
+    }
+  }
+} catch (e) {
+  console.error(`linkedin-lookup: ${e.message}`);
+  page.close();
+  process.exit(1);
+}
+page.close();
