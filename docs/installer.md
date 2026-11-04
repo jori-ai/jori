@@ -135,6 +135,13 @@ A `connection refused` or "no healthy supervisor" means the process manager did 
 ## Updating
 
 ```bash
+jori update            # pull (fast-forward only), install packages, restart the service
+jori update --check    # just say how far behind this checkout is
+```
+
+The Mac app's **Update now** item runs the same command. By hand, it is:
+
+```bash
 cd ~/Dev/jori
 git pull
 ./scripts/bootstrap.sh                                  # npm install + any new dirs

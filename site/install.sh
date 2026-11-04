@@ -15,6 +15,7 @@
 #   JORI_REPO=<git url>   what to clone (default https://github.com/jori-ai/jori.git)
 #   JORI_NO_OLLAMA=1      skip Ollama (memory search stays off until you add it)
 #   JORI_NO_SETUP=1       install only; run `jori setup` yourself later
+#   JORI_NO_LINK=1        don't put a `jori` symlink in Homebrew's bin
 
 set -euo pipefail
 
@@ -30,8 +31,9 @@ warn() { printf '  %s!%s %s\n' "$Y" "$N" "$*"; }
 die()  { printf '\n  %s✘ %s%s\n\n' "$R" "$*" "$N" >&2; exit 1; }
 
 # Piped through `curl | bash`, stdin is this script: prompts read the terminal.
+# From the Mac app or CI there is no terminal at all: test that it opens.
 TTY=/dev/tty
-[[ -r $TTY ]] || TTY=/dev/null
+{ : < "$TTY"; } 2>/dev/null || TTY=/dev/null
 
 printf '\n%sInstalling Jori%s %s→ %s%s\n' "$B" "$N" "$D" "$JORI_HOME" "$N"
 
@@ -51,6 +53,7 @@ if [[ $(uname -s) == Darwin ]]; then
   if command -v brew >/dev/null 2>&1 || brew_env; then
     ok "installed"
   else
+    [[ $TTY == /dev/tty ]] || die "Homebrew needs your Mac password, so install it from Terminal: curl -fsSL https://getjori.ai/install.sh | bash"
     note "Homebrew installs the tools below. It asks for your Mac password once."
     /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)" < "$TTY"
     brew_env || die "Homebrew didn't finish installing. Run this installer again."
@@ -121,7 +124,7 @@ note "installing its packages (a minute or two)…"
 ok "packages installed"
 
 # `jori` on PATH, when a Homebrew bin dir is writable and nothing is there yet.
-for d in /opt/homebrew/bin /usr/local/bin; do
+[[ ${JORI_NO_LINK:-} == 1 ]] || for d in /opt/homebrew/bin /usr/local/bin; do
   if [[ -d $d && -w $d ]]; then
     if [[ ! -e $d/jori ]]; then ln -s "$JORI_HOME/bin/jori" "$d/jori" && ok "the jori command is ready"; fi
     break

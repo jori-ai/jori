@@ -1,0 +1,71 @@
+name: mac app
+
+# Builds the Jori menu bar app (apps/mac) into Jori.dmg.
+# - Every run uploads the .dmg as a workflow artifact.
+# - A tag mac-vX.Y.Z also publishes it as a GitHub release (getjori.ai links
+#   to the latest one).
+# Signing: with MAC_DEVID_P12 (+ MAC_DEVID_PASSWORD) — a base64 .p12 of a
+# "Developer ID Application" certificate — the app is signed with the
+# hardened runtime and notarized with the App Store Connect key already used
+# for TestFlight (ASC_KEY_ID, ASC_ISSUER_ID, ASC_PRIVATE_KEY). Without it the
+# build is ad-hoc signed and macOS asks people to right-click → Open.
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["mac-v*"]
+  pull_request:
+    paths: [apps/mac/**, site/install.sh, .github/workflows/mac-app.yml]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-15
+    env:
+      HAS_DEVID: ${{ secrets.MAC_DEVID_P12 != '' }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Version
+        id: v
+        run: |
+          v="${GITHUB_REF_NAME#mac-v}"; [[ $GITHUB_REF == refs/tags/mac-v* ]] || v=0.0.0-dev
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+      - name: Signing keychain
+        if: env.HAS_DEVID == 'true'
+        env:
+          MAC_DEVID_P12: ${{ secrets.MAC_DEVID_P12 }}
+          MAC_DEVID_PASSWORD: ${{ secrets.MAC_DEVID_PASSWORD }}
+          ASC_PRIVATE_KEY: ${{ secrets.ASC_PRIVATE_KEY }}
+        run: |
+          KC="$RUNNER_TEMP/sign.keychain-db"; PW=$(uuidgen)
+          security create-keychain -p "$PW" "$KC"
+          security set-keychain-settings -lut 3600 "$KC"
+          security unlock-keychain -p "$PW" "$KC"
+          echo "$MAC_DEVID_P12" | base64 --decode > "$RUNNER_TEMP/devid.p12"
+          security import "$RUNNER_TEMP/devid.p12" -k "$KC" -P "$MAC_DEVID_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$PW" "$KC" >/dev/null
+          security list-keychains -d user -s "$KC" $(security list-keychains -d user | tr -d '"')
+          id=$(security find-identity -v -p codesigning "$KC" | grep -o '"Developer ID Application[^"]*"' | head -1 | tr -d '"')
+          echo "MAC_DEVID_IDENTITY=$id" >> "$GITHUB_ENV"
+          printf '%s' "$ASC_PRIVATE_KEY" > "$RUNNER_TEMP/notary.p8"
+          echo "NOTARY_KEY_PATH=$RUNNER_TEMP/notary.p8" >> "$GITHUB_ENV"
+      - name: Build
+        env:
+          NOTARY_KEY_ID: ${{ env.HAS_DEVID == 'true' && secrets.ASC_KEY_ID || '' }}
+          NOTARY_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+        run: apps/mac/build.sh --version "${{ steps.v.outputs.version }}" --build "${{ github.run_number }}" --out "$RUNNER_TEMP/out"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Jori-${{ steps.v.outputs.version }}
+          path: ${{ runner.temp }}/out/Jori.dmg
+      - name: Release
+        if: startsWith(github.ref, 'refs/tags/mac-v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" "$RUNNER_TEMP/out/Jori.dmg" \
+            --title "Jori for Mac ${{ steps.v.outputs.version }}" \
+            --notes "Download Jori.dmg, open it and drag Jori to Applications. On first launch it installs Jori and opens the setup page." \
+            --latest

@@ -16,7 +16,17 @@ That installs what is missing (Homebrew, Node.js 22.5+, git, Claude Code, Ollama
 
 Already cloned? Run `./bin/jori setup` from the checkout. It is safe to re-run: it fills only what is missing, never restarts a running service and never adds a job that is already in the crontab. `jori setup status` gives the same checks in the terminal, and `jori setup start` does step 4 without a browser.
 
-Installer options (environment): `JORI_HOME` (default `~/Dev/jori`), `JORI_REPO`, `JORI_NO_OLLAMA=1`, `JORI_NO_SETUP=1`. The script is [`site/install.sh`](../site/install.sh); read it before piping it to a shell.
+The same installer, other ways:
+
+| | |
+|---|---|
+| **Mac app** | `Jori.dmg` from [releases](https://github.com/jori-ai/jori/releases): drag to Applications and open it. It installs Jori, opens the setup page, then lives in the menu bar (running or not, control room, update, restart, logs). Source: `apps/mac/`. |
+| **Homebrew** | `brew install jori-ai/tap/jori`, then `jori setup`. Installs a `jori` launcher that installs the checkout on first use; `jori update` updates Jori, `brew upgrade jori` only the launcher. |
+| **npm** | `npm create jori` (or `npx create-jori`). Source: `packages/create-jori/`. |
+
+Keep it current with `jori update` (fast-forward pull, packages, restart).
+
+Installer options (environment): `JORI_HOME` (default `~/Dev/jori`), `JORI_REPO`, `JORI_NO_OLLAMA=1`, `JORI_NO_SETUP=1`, `JORI_NO_LINK=1`. The script is [`site/install.sh`](../site/install.sh); read it before piping it to a shell.
 
 ---
 

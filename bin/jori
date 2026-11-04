@@ -1020,9 +1020,12 @@ function cmdRestart(args) {
   // down and respawning every supervised child.
   if (target === 'session') {
     const uid = process.getuid();
-    console.log(c.dim('kickstarting launchd ai.claude.session — restarts process-manager + all supervised children...'));
-    const out = shSafe(`launchctl kickstart -k gui/${uid}/ai.claude.session 2>&1`);
-    if (out === null) die('restart: launchctl kickstart failed. Try manually: launchctl kickstart -k gui/$(id -u)/ai.claude.session');
+    // ai.jori.session (jori setup, docs/installer.md) or, on installations
+    // from before the rename, ai.claude.session — whichever is loaded.
+    const label = ['ai.jori.session', 'ai.claude.session'].find(l => (shSafe(`launchctl print gui/${uid}/${l} >/dev/null 2>&1 && echo y`) || '').trim() === 'y') || 'ai.jori.session';
+    console.log(c.dim(`kickstarting launchd ${label} — restarts process-manager + all supervised children...`));
+    const out = shSafe(`launchctl kickstart -k gui/${uid}/${label} 2>&1`);
+    if (out === null) die(`restart: launchctl kickstart failed. Try manually: launchctl kickstart -k gui/$(id -u)/${label}`);
     console.log(c.green('✓ kickstart sent. Wait ~30s, then: jori status'));
     return;
   }
