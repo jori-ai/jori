@@ -14,6 +14,16 @@ Same day, the beach walk 17:11-17:28: 4.7 km/h over its 8 fixes, but the pace wa
 read over the 4 thinned routing waypoints (8.6 km/h), so the leg was "riding" and
 the header's miles walked left out the mile printed as "Walk on the beach · 1.0 mi".
 
+Same day, the overnight row at the flat is an unnamed stay labelled by its street
+address (`address`). The café's arrival tag (`named`, 42 m away) came after the
+night ended and overlapped none of it, yet it joined the night's place under
+PLACE_M, outranked the address, and renamed the whole place: the night, the
+morning back at the flat (every fix 10:44-13:26 sits at the flat) and the early
+afternoon there all came out "Café Example" -- the daily-summary-fix finding "the
+mapping step renames the flat's overnight stay after a café". A verdict name that
+is not AT an unnamed place, overlaps none of its visits and holds less time than
+they do is now its own place.
+
 Run: python3 tests/day-path-nearest-place.test.py
 """
 import json, os, sys, unittest
@@ -74,9 +84,27 @@ class NearestPlaceWins(unittest.TestCase):
         self.assertIn(("20:22", "21:14", "The Harbor Flat"), self.d)
 
     def test_the_rest_of_the_day_is_unchanged(self):
-        for want in [("10:05", "13:29", "Café Example"), ("13:29", "14:16", "pita place"),
+        for want in [("13:29", "14:16", "pita place"),
                      ("17:43", "19:04", "The Harbor Flat"), ("19:04", "20:18", "Example Bakery")]:
             self.assertIn(want, self.d)
+
+
+class ACafeTagDoesNotRenameTheNight(unittest.TestCase):
+    def setUp(self):
+        self.d = dwells()
+
+    def test_the_overnight_stay_is_the_flat(self):
+        self.assertIn(("00:00", "09:48", "The Harbor Flat"), self.d)
+
+    def test_the_morning_back_at_the_flat_is_the_flat(self):
+        self.assertIn(("10:05", "13:26", "The Harbor Flat"), self.d)
+
+    def test_the_early_afternoon_at_the_flat_is_the_flat(self):
+        self.assertIn(("14:41", "16:01", "The Harbor Flat"), self.d)
+
+    def test_the_cafe_keeps_only_its_own_tag(self):
+        cafe = [d for d in self.d if d[2] == "Café Example"]
+        self.assertEqual(cafe, [("13:26", "13:29", "Café Example")], self.d)
 
 
 class PaceFromEveryFix(unittest.TestCase):
@@ -91,7 +119,14 @@ class PaceFromEveryFix(unittest.TestCase):
 
 class SwitchRestoresTheOldOrder(unittest.TestCase):
     def test_first_built_order(self):
-        self.assertIn(("20:22", "21:14", "Café Example"), dwells(JORI_NEAREST_PLACE="0"))
+        self.assertIn(("20:22", "21:14", "Café Example"),
+                      dwells(JORI_NEAREST_PLACE="0", JORI_VERDICT_OWN_PLACE="0"))
+
+    def test_verdict_own_place_off_renames_the_night(self):
+        d = dwells(JORI_VERDICT_OWN_PLACE="0")
+        self.assertIn(("00:00", "09:48", "Café Example"), d)
+        self.assertIn(("10:05", "13:29", "Café Example"), d)
+        self.assertIn(("20:22", "21:14", "The Harbor Flat"), d)
 
 
 if __name__ == "__main__":

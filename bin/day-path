@@ -1274,6 +1274,19 @@ def build(date_str, tzname, rows, do_match=True, verbose=False, statements=None)
                                   mins=visit_minutes(v), ptype=v["ptype"])
                     break
                 continue
+            # A verdict name that is not AT an unnamed place (an address, a stay point),
+            # overlaps none of its visits and holds less time than they do is its own
+            # place: joining would outrank the place and rename every visit in it, stays
+            # the name never touched. Guards the daily-summary-fix finding "the mapping
+            # step renames the flat's overnight stay after a café": a café's arrival tag
+            # 42 m from the flat's address-labelled overnight stay renamed the whole night
+            # and the morning after it. JORI_VERDICT_OWN_PLACE=0 restores the join.
+            if v.get("ptype") in VERDICT_PTYPES and pl.get("ptype") not in VERDICT_PTYPES \
+                    and not same_name(v, pl) and dd >= CONFIRMED_PLACE_M \
+                    and os.environ.get("JORI_VERDICT_OWN_PLACE") != "0" \
+                    and not any(m["start"] < v["end"] and v["start"] < m["end"] for m in pl["members"]) \
+                    and visit_minutes(v) < sum(visit_minutes(m) for m in pl["members"]):
+                continue
             if dd < PLACE_M or (dd < PLACE_M_FUZZY and same_name(v, pl)):
                 pl["members"].append(v)
                 if outranks(v, pl):
