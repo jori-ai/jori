@@ -516,9 +516,20 @@ async function judgeItem(c, accountInfo) {
       pending: r.pending === true,
       description: r.merchant_name || r.name || null,
     }));
+  const acctInfo = accountInfo[t.account_id] || {};
   return {
     id: t.transaction_id,
     kind: "transaction",
+    // Selects the research rows (lib/bank-alert-research.mjs); never shown to the judge.
+    ref: {
+      transaction_id: t.transaction_id,
+      pending_transaction_id: t.pending_transaction_id || null,
+      account_id: t.account_id,
+      account_mask: acctInfo.mask || null,
+      amount: c.mag,
+      date: t.date,
+      query: t.merchant_name || t.name || "",
+    },
     account: acctFacts(accountInfo[t.account_id] || { institution_name: c.institution }),
     transaction: {
       date: t.date,
