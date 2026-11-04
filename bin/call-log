@@ -28,7 +28,7 @@ import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
 import { loadCredentials, createZoomClient } from "../lib/zoom-client.mjs";
 import { callContent } from "../lib/zoom-content.mjs";
-import { meetings } from "../lib/meetings.mjs";
+import { meetings as recurringMeetings } from "../lib/meetings.mjs";
 import { runHook } from "../lib/ext-hooks.mjs";
 import * as CL from "../lib/call-log.mjs";
 
@@ -225,7 +225,7 @@ async function cmdSync() {
     const base = { ...rec, email_id: m.email_id || (prev && prev.email_id) || null, tz, local_date: CL.ymdIn(rec.start, tz),
       first_seen: (prev && prev.first_seen) || new Date(now).toISOString(), updated: new Date(now).toISOString() };
     if (rec.recurring) {
-      const rm = meetings().find((x) => x.id === rec.recurring);
+      const rm = recurringMeetings().find((x) => x.id === rec.recurring);
       store.calls[m.uuid] = { ...base, status: "recurring" };
       say(`${base.local_date} ${CL.clockIn(rec.start, tz)}: the call with ${rm ? rm.name : rec.recurring}, left to its meeting notes`);
       continue;
