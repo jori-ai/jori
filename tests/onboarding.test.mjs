@@ -39,12 +39,13 @@ test("a city is guessed from the time zone, never from a zone that is not a plac
 });
 
 test("prepareCheckout fills what is missing and keeps what is there", () => {
-  fs.writeFileSync(path.join(tmp, ".env"), "OLLAMA_URL=http://10.0.0.2:11434\nSECRET=keep\n");
+  fs.writeFileSync(path.join(tmp, ".env"), "# copied from .env.example\nJORI_HOME=\nOLLAMA_URL=http://10.0.0.2:11434\nSECRET=keep\n");
   const done = core.prepareCheckout(tmp, { tz: "Europe/Paris" });
   const env = core.readDotEnv(path.join(tmp, ".env"));
   assert.equal(env.OLLAMA_URL, "http://10.0.0.2:11434", "an existing value is never replaced");
   assert.equal(env.SECRET, "keep");
-  assert.equal(env.JORI_HOME, tmp);
+  assert.equal(env.JORI_HOME, tmp, "an empty line from .env.example is filled in");
+  assert.equal(fs.readFileSync(path.join(tmp, ".env"), "utf8").match(/^JORI_HOME=/gm).length, 1, "filled in place, not duplicated");
   assert.equal(env.LOCAL_EMBED_MODEL, "nomic-embed-text");
   assert.ok(fs.existsSync(path.join(tmp, "secrets", "webhook-token")));
   assert.equal(JSON.parse(fs.readFileSync(path.join(tmp, "data", "user-timezone.json"), "utf8")).timezone, "Europe/Paris");

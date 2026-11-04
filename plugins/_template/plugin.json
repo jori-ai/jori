@@ -1,0 +1,13 @@
+{
+  "name": "__NAME__",
+  "title": "__TITLE__",
+  "description": "One or two sentences, from the user's side: what this does for them and when they hear from it.",
+  "version": "0.1.0",
+  "default": "disabled",
+  "requires": { "plugins": [], "bins": [], "commands": [], "env": [] },
+  "config": { "name": "__NAME__", "schedules": false },
+  "settings": [],
+  "schedules": [],
+  "provides_bins": ["__NAME__"],
+  "jobs": {}
+}

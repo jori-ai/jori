@@ -1,3 +1,5 @@
+> **A new job ships inside a plugin.** Create the plugin with `jori plugin new <name> --job` and follow [`docs/writing-a-plugin.md`](writing-a-plugin.md); this page covers writing the playbook itself.
+
 # Writing a job
 
 A **job** in Jori is a markdown playbook the agent reads and executes when its trigger fires. Three pieces:

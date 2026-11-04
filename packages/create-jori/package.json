@@ -1,0 +1,19 @@
+{
+  "name": "create-jori",
+  "version": "0.1.0",
+  "description": "Install Jori, the always-on assistant that runs on your Claude subscription: npm create jori",
+  "keywords": ["jori", "assistant", "claude", "claude-code", "agent", "installer"],
+  "homepage": "https://getjori.ai",
+  "repository": { "type": "git", "url": "git+https://github.com/jori-ai/jori.git", "directory": "packages/create-jori" },
+  "bugs": "https://github.com/jori-ai/jori/issues",
+  "license": "Apache-2.0",
+  "type": "module",
+  "bin": { "create-jori": "bin.mjs" },
+  "files": ["bin.mjs", "install.sh", "README.md"],
+  "engines": { "node": ">=18" },
+  "os": ["darwin", "linux"],
+  "scripts": {
+    "prepack": "cp ../../site/install.sh install.sh && chmod +x install.sh",
+    "test": "node --test ../../tests/create-jori.test.mjs"
+  }
+}

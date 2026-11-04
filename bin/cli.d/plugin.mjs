@@ -22,8 +22,8 @@ function describeSync(r, c) {
 
 export default {
   name: "plugin",
-  summary: "feature plugins: list, info, enable, disable, install, remove, sync, check",
-  usage: "plugin [list|info <name>|enable <name> [--force]|disable <name>|install <path|git-url> [--local]|remove <name> [--purge-config]|sync [--dry-run]|check]",
+  summary: "feature plugins: list, info, new, enable, disable, install, remove, sync, check",
+  usage: "plugin [list|info <name>|new <name> [--title T] [--local] [--schedule CRON] [--job]|enable <name> [--force]|disable <name>|install <path|git-url> [--local]|remove <name> [--purge-config]|sync [--dry-run]|check]",
   async run(args, ctx) {
     const { c, die, hasFlag } = ctx;
     const [cmd = "list", name] = args;
@@ -82,6 +82,16 @@ export default {
         record({ who: who(), page: "plugins", what: `Removed the ${name} plugin`, target: `plugin:${name}` });
         console.log(c.green(`✓ removed ${name}`) + c.dim(` (${r.removed})`));
         console.log(describeSync(r, c));
+        return;
+      }
+      case "new": {
+        if (!name) die('usage: jori plugin new <name> [--title "Title"] [--local] [--schedule "15 8 * * *"] [--job]');
+        const r = M.create(name, { local: hasFlag(args, "--local"), title: ctx.getFlag(args, "--title"), schedule: ctx.getFlag(args, "--schedule"), job: hasFlag(args, "--job") });
+        record({ who: who(), page: "plugins", what: `Created the ${name} plugin`, target: `plugin:${name}` });
+        console.log(c.green(`✓ created ${name}`) + c.dim(` at ${r.dir}`));
+        for (const f of r.files) console.log(c.dim(`  ${f}`));
+        console.log(`Next: fill in plugin.json and the command, run ${c.bold(`node --test ${r.dir}/tests/`)}, then ${c.bold(`jori plugin enable ${name}`)}.`);
+        console.log(c.dim("Guide: docs/writing-a-plugin.md"));
         return;
       }
       case "sync": {

@@ -1,0 +1,41 @@
+name: publish create-jori
+
+# Publishes packages/create-jori to npm (`npm create jori`). Run it by hand
+# after bumping the package version, or it runs when site/install.sh changes
+# on main with a version not yet on npm. Needs the NPM_TOKEN repository
+# secret (an npm automation token for the account that owns create-jori).
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: [packages/create-jori/**, site/install.sh]
+
+permissions:
+  contents: read
+  id-token: write   # npm provenance
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: packages/create-jori
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+      - name: Test
+        run: node --test ../../tests/create-jori.test.mjs
+      - name: Skip a version that is already published
+        id: v
+        run: |
+          v=$(node -p 'require("./package.json").version')
+          if npm view "create-jori@$v" version >/dev/null 2>&1; then echo "skip=1" >> "$GITHUB_OUTPUT"; echo "create-jori@$v is already on npm"; fi
+      - name: Publish
+        if: steps.v.outputs.skip != '1'
+        run: npm publish --provenance --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

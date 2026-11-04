@@ -63,7 +63,7 @@ On a Mac, one line installs everything and opens a setup page in your browser:
 curl -fsSL https://getjori.ai/install.sh | bash
 ```
 
-Sign in with Claude, confirm a few details it already filled in, press **Start Jori**. Details: [docs/quickstart.md](docs/quickstart.md).
+Sign in with Claude, confirm a few details it already filled in, press **Start Jori**. Or `brew install jori-ai/tap/jori`, `npm create jori`, or the Mac app from [releases](https://github.com/jori-ai/jori/releases). Details: [docs/quickstart.md](docs/quickstart.md). Later, `jori update` keeps it current.
 
 Or step by step in the terminal:
 
@@ -111,7 +111,7 @@ Jori is deliberately a small, opinionated kernel — not a turnkey product. The 
 - **Populate Hum's awareness loop.** Empty on day 1. See [`docs/hum.md`](docs/hum.md).
 - **Populate your memory corpus.** Empty on day 1. See [`docs/memory.md`](docs/memory.md).
 - **Wire up integrations** — Gmail ([guide](docs/integrations/gmail.md)), Supabase ([guide](docs/integrations/supabase.md)), SMTP ([guide](docs/integrations/smtp.md)), or your own.
-- **Write your own jobs.** Markdown playbooks. See [`docs/writing-a-job.md`](docs/writing-a-job.md).
+- **Write your own plugins.** Every feature is a plugin you can turn on, off or remove: `jori plugin new <name>`. See [`docs/writing-a-plugin.md`](docs/writing-a-plugin.md) (and [`docs/writing-a-job.md`](docs/writing-a-job.md) for playbooks).
 - **Set your Apple signing identity** — for the companion apps. See [`apps/companion/CODE-SIGNING.md`](apps/companion/CODE-SIGNING.md).
 
 ---
