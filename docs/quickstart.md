@@ -21,7 +21,7 @@ The same installer, other ways:
 | | |
 |---|---|
 | **Mac app** | `Jori.dmg` from [releases](https://github.com/jori-ai/jori/releases): drag to Applications and open it. It installs Jori, opens the setup page, then lives in the menu bar (running or not, control room, update, restart, logs). Source: `apps/mac/`. |
-| **Homebrew** | `brew install jori-ai/tap/jori`, then `jori setup`. Installs a `jori` launcher that installs the checkout on first use; `jori update` updates Jori, `brew upgrade jori` only the launcher. |
+| **Homebrew** | `brew trust jori-ai/tap && brew install jori-ai/tap/jori`, then `jori setup` (Homebrew asks you to trust a tap before installing from it). Installs a `jori` launcher that installs the checkout on first use; `jori update` updates Jori, `brew upgrade jori` only the launcher. |
 | **npm** | `npm create jori` (or `npx create-jori`). Source: `packages/create-jori/`. |
 
 Keep it current with `jori update` (fast-forward pull, packages, restart).
