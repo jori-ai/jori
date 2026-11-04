@@ -25,6 +25,9 @@
 //   gog_account     the Google account that can read the sheet (default: the
 //                   owner's email)
 //   due_day, grace_days
+//   combined_payments  true = one larger client payment may settle an invoice
+//                   together with another payee's (rule 2b in
+//                   lib/finance-invoice-reconcile.js); default false
 // The payer column stores the owner id (lib/instance.cjs `owner_id`). No
 // `invoices` config = off: it says so and exits 0.
 
@@ -73,7 +76,7 @@ async function main() {
   const payments = txns.filter((t) => !t.pending && Number(t.amount) < 0).map((t) => ({ transaction_id: t.transaction_id, date: t.date, amount: -Number(t.amount), name: t.name }));
   const recorded = await request("/rest/v1/fin_invoice_matches?select=*&recorded=eq.true");
 
-  const r = reconcileInvoices({ invoices, payments, recorded, today, dueDay: INV.due_day ?? 6, graceDays: INV.grace_days ?? 3 });
+  const r = reconcileInvoices({ invoices, payments, recorded, today, dueDay: INV.due_day ?? 6, graceDays: INV.grace_days ?? 3, combinedPayments: INV.combined_payments === true });
 
   if (!DRY) {
     await request(`/rest/v1/fin_invoices?payer=eq.${encodeURIComponent(PAYER)}`, { method: "DELETE", prefer: "return=minimal" });

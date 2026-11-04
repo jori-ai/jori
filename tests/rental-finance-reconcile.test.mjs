@@ -180,6 +180,58 @@ test("invoices: a two-part payment settles one invoice, a later lump does not st
   assert.equal(late.rows[0].status, "late");
 });
 
+// 2026-11-04: one client ACH paid the user's invoice together with another
+// payee's (12,000 + 25,000 = 37,000), and the exact-sum rule could only call
+// the invoice unpaid. Rule 2b (combinedPayments) settles it from the larger
+// payment and leaves the remainder as the other payee's share.
+test("invoices: a combined payment settles the invoice, the remainder stays another payee's", () => {
+  const I = (number, invoice_date, amount = 12000) => ({ number, invoice_date, amount, voided: false, in_scope: true });
+  const P = (id, date, amount, name = "CLIENT ACH") => ({ transaction_id: id, date, amount, name });
+  const invoices = [I("164", "2026-09-22"), I("165", "2026-10-22")];
+  const payments = [P("oct", "2026-10-02", 12000, "CLIENT ACH PMT INFO:164"), P("nov", "2026-11-02", 37000)];
+
+  // Off by default: exactly as before, the invoice is open and the whole payment unmatched.
+  const off = reconcileInvoices({ invoices, payments, today: "2026-11-04" });
+  assert.equal(off.rows.find((x) => x.number === "165").status, "open");
+  assert.equal(off.unmatched[0].amount, 37000);
+
+  const r = reconcileInvoices({ invoices, payments, today: "2026-11-04", combinedPayments: true });
+  const by = Object.fromEntries(r.rows.map((x) => [x.number, x]));
+  assert.equal(by["164"].status, "paid");
+  assert.equal(r.matches.find((m) => m.invoice_number === "164").basis, "rule:exact-payment-fifo"); // exact still first
+  assert.equal(by["165"].status, "paid");
+  const m = r.matches.find((x) => x.invoice_number === "165");
+  assert.equal(m.basis, "rule:combined-payment");
+  assert.equal(m.amount, 12000);
+  assert.ok(m.evidence.startsWith("$12,000.00 of a $37,000.00 payment; the other $25,000.00"), m.evidence);
+  assert.deepEqual(r.unmatched, [{ transaction_id: "nov", date: "2026-11-02", amount: 25000, name: "CLIENT ACH" }]);
+  assert.ok(r.proof.ok);
+});
+
+test("invoices: combined payments — an exact match wins, the invoice number decides, same-day rivals are ambiguous", () => {
+  const I = (number, invoice_date, amount = 12000) => ({ number, invoice_date, amount, voided: false, in_scope: true });
+  const P = (id, date, amount, name = "CLIENT ACH") => ({ transaction_id: id, date, amount, name });
+  // A later exact payment is preferred over an earlier larger one.
+  let r = reconcileInvoices({ invoices: [I("1", "2026-10-22")], payments: [P("big", "2026-10-25", 30000), P("exact", "2026-11-03", 12000)], today: "2026-11-10", combinedPayments: true });
+  assert.equal(r.matches[0].plaid_transaction_id, "exact");
+  // The bank line naming the invoice beats an earlier larger payment.
+  r = reconcileInvoices({ invoices: [I("777", "2026-10-22")], payments: [P("early", "2026-10-25", 30000), P("named", "2026-11-03", 20000, "CLIENT ACH PMT INFO:777")], today: "2026-11-10", combinedPayments: true });
+  assert.equal(r.matches[0].plaid_transaction_id, "named");
+  assert.equal(r.matches[0].basis, "rule:combined-payment-named");
+  // Two larger payments on the same day, neither named: ambiguous, nothing picked.
+  r = reconcileInvoices({ invoices: [I("2", "2026-10-22")], payments: [P("x", "2026-11-02", 20000), P("y", "2026-11-02", 25000)], today: "2026-11-04", combinedPayments: true });
+  assert.equal(r.matches.length, 0);
+  assert.equal(r.ambiguities.length, 1);
+  assert.equal(r.rows[0].status, "open");
+  // A smaller payment never settles an invoice under this rule.
+  r = reconcileInvoices({ invoices: [I("3", "2026-10-22")], payments: [P("small", "2026-11-02", 5000)], today: "2026-11-04", combinedPayments: true });
+  assert.equal(r.matches.length, 0);
+  // One payment is never split across two of the user's invoices by this rule.
+  r = reconcileInvoices({ invoices: [I("4", "2026-09-22"), I("5", "2026-10-22")], payments: [P("one", "2026-10-30", 30000)], today: "2026-11-04", combinedPayments: true });
+  assert.equal(r.matches.length, 1);
+  assert.equal(r.matches[0].invoice_number, "4");
+});
+
 test("invoices: flags name the configured label, else the run's, else a plain one", () => {
   const run = { run_at: "2026-07-10T00:00:00Z", report: { proof: { ok: true, invoiced: 5000, paid: 0, outstanding: 5000 }, rows: [{ number: "3", invoice_date: "2026-06-22", amount: 5000, open_amount: 5000, due_date: "2026-07-06", status: "late" }], ambiguities: [] } };
   assert.match(invoiceSection(run, "2026-07-10").flags[0].text, /^Client invoice 3/);
