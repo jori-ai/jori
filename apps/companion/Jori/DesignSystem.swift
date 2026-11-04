@@ -11,7 +11,7 @@
 //              that need Face ID, the thinking indicator). Because nothing
 //              else is gold, gold always means "look here".
 //    slate   — the hat itself. Jori's voice: the assistant bubble.
-//    icon*, eye — the Jori icon's blue background and the cyan of its eyes, used
+//    icon*, eye — the Jori icon's navy background and the mint of its eyes, used
 //              only by the opening screens (launch, splash, sign-in, lock)
 //              so the app opens on the icon itself.
 //
@@ -40,13 +40,13 @@ enum JoriTheme {
     static let deny = dynamic(light: 0xD93A33, dark: 0xFF5F57)
 
     // The Jori icon's own colours, the same in light and dark: the diagonal
-    // blue it sits on (cyan top-left, deep blue bottom-right) and the cyan of
-    // its eyes. Only the opening screens (splash, sign-in, lock) use them, so
-    // they open on the icon itself.
-    static let iconCyan = Color(red: 0x00 / 255, green: 0xDE / 255, blue: 0xFE / 255)
-    static let iconBlue = Color(red: 0x00 / 255, green: 0x44 / 255, blue: 0xF6 / 255)   // = JoriBlue, the launch screen
-    static let iconDeep = Color(red: 0x01 / 255, green: 0x0A / 255, blue: 0x6D / 255)
-    static let eye = Color(red: 0x00 / 255, green: 0xD8 / 255, blue: 0xFA / 255)
+    // navy it sits on (lighter blue top-left, deep navy bottom-right) and the
+    // mint-cyan of its eyes. Only the opening screens (splash, sign-in, lock)
+    // use them, so they open on the icon itself.
+    static let iconLight = Color(red: 0x2B / 255, green: 0x54 / 255, blue: 0xB8 / 255)
+    static let iconBlue = Color(red: 0x1A / 255, green: 0x35 / 255, blue: 0x7C / 255)   // = JoriBlue, the launch screen
+    static let iconDeep = Color(red: 0x0A / 255, green: 0x16 / 255, blue: 0x40 / 255)
+    static let eye = Color(red: 0x2A / 255, green: 0xF2 / 255, blue: 0xD4 / 255)
 
     static var canvas: Color {
         #if os(macOS)
@@ -364,12 +364,12 @@ struct JoriMark: View {
 }
 
 /// The icon's background under every opening screen: the same diagonal from
-/// cyan at the top-left to deep blue at the bottom-right. Its middle is the
+/// lighter blue at the top-left to deep navy at the bottom-right. Its middle is the
 /// launch screen's flat JoriBlue, so the system launch image hands over to the
 /// splash without a seam behind the mark.
 struct JoriBackdrop: View {
     var body: some View {
-        LinearGradient(colors: [JoriTheme.iconCyan, JoriTheme.iconBlue, JoriTheme.iconDeep],
+        LinearGradient(colors: [JoriTheme.iconLight, JoriTheme.iconBlue, JoriTheme.iconDeep],
                        startPoint: .topLeading,
                        endPoint: .bottomTrailing)
             .ignoresSafeArea()
