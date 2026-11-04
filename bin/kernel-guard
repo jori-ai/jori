@@ -1,0 +1,428 @@
+#!/usr/bin/env node
+// kernel-guard — report personal data in kernel files.
+//
+// The kernel is the generic agent system published as Jori: what the kernel
+// repo tracks (in the old single-repo layout, the files listed in
+// system/kernel-manifest.json). Those files must hold no personal data. This
+// scans them line by line with the installation's private pattern list (never
+// published; see --patterns below) plus the shape and derived detectors, and
+// prints every hit with its line number. An installation with no pattern list
+// gets the shape and derived detectors only, and --write-baseline refuses.
+//
+// Usage:
+//   kernel-guard                      scan every file in the manifest
+//   kernel-guard <path> ...           scan these files / directories instead
+//   kernel-guard --staged             scan the staged copies of staged manifest files (the
+//                                     pattern list, and the registries and config the derived
+//                                     detectors come from, are the index copies too)
+//   kernel-guard --summary            counts by file and by pattern, not every line
+//   kernel-guard --json               machine-readable result
+//   kernel-guard --report             never exit 1 (report only)
+//   kernel-guard --new                only hits NOT in the baseline count as hard
+//   kernel-guard --write-baseline     record the current hard hits as the baseline
+//   kernel-guard --list-patterns      print the pattern names, groups and severities (static
+//                                     patterns, shape detectors, derived detectors)
+//   kernel-guard --explain            under each hit, the rule or personal registry that produced
+//                                     it (with --json: a `source` field); with --list-patterns,
+//                                     every derived token and its sources, and the derived_allow
+//                                     entries in use
+//   kernel-guard --unclassified       tracked files in a kernel area that are neither in the
+//                                     manifest nor matched by its personal_globs (exit 1 if any)
+//   kernel-guard --unclassified --staged
+//                                     the same, for files this commit ADDS (judged against the
+//                                     staged manifest) — what githooks/pre-commit runs
+//   kernel-guard --closure            every kernel code file only leans on the kernel: its
+//                                     imports resolve to kernel files, and its other repo paths
+//                                     are kernel files, allowed runtime paths
+//                                     (`closure_runtime_paths`) or guarded (exit 1 if not)
+//   kernel-guard --closure --staged   the same, for the staged copies of staged kernel files
+//   kernel-guard --closure --write-install-allowance
+//                                     record each kernel code file's count of lines that spell
+//                                     the install path or Homebrew's node in the manifest's
+//                                     `install_path_allowance` (the portability ratchet; run it
+//                                     after converting lines so the allowance only shrinks)
+//
+//   --root <dir>        repo root (default: two levels above this script)
+//   --manifest <file>   default <root>/system/kernel-manifest.json (absent in a
+//                       switched install: built from the kernel and overlay repos;
+//                       in a plain clone of the kernel repo, from its files alone)
+//   --patterns <file>   default: $KERNEL_GUARD_PATTERNS, else
+//                       agent/local/config/kernel-guard.json `patterns_file`, else
+//                       <root>/system/personal-patterns.json (paths relative to the root)
+//   --baseline <file>   default <root>/system/kernel-guard-baseline.json
+//
+// Severity: a pattern is "hard" (personal data; exit 1) or "report" (shown for
+// review, e.g. he/him/his or a hard-coded IANA zone; never fails).
+//
+// Beyond the static list (lib/kernel-guard.cjs § derived patterns and
+// shape detectors):
+//   derived_*  built per run from this installation's own registries and
+//              config — personal task / job / service / bin / browsing-site names,
+//              the identity values in agent/local/instance.json, and the
+//              proper nouns, emails, domains, addresses, ids and wiki page ids in
+//              agent/local/config/*.json. Registering something personal makes
+//              it a pattern. A token that is generic in kernel text anyway goes in
+//              personal-patterns.json `derived_allow` with its reason.
+//   shapes     hex ids next to approval/decision/disagreement/cluster words, dated
+//              si-/sic- ids, commit SHAs in docs and comments, real mailboxes,
+//              tenant subdomains (<team>.cloudflareaccess.com), the home time zone
+//              (the instance zone and any `home_zones` in the pattern list, with
+//              their abbreviations and names; a line about market
+//              hours is exempt), coordinates, street addresses. Placeholders never
+//              hit; `shape_placeholders` extends the built-in lists.
+//
+// Allow marker: a line containing `kernel-guard-ok: <reason>` is exempt from
+// every detector (static, shape and derived alike); its hits are counted as
+// "allowed". The reason is required, so the exemption says why.
+//
+// Baseline: system/kernel-guard-baseline.json holds, per file and
+// pattern, a short hash of each hard-hit line (never the line itself), so
+// `--new` can enforce "no NEW personal data" while the existing hits are being
+// cleaned up. Line numbers are not part of the key: moving a line does not make
+// it new. With paths, --write-baseline updates only those files' entries.
+//
+// Classification: system/kernel-manifest.json `files` is the kernel;
+// `personal_globs` (repo-relative globs: `*` within a directory, `**` across)
+// names this installation's personal files. A kernel area is a directory that
+// holds manifest files plus everything below it (the repo root: only its own
+// files). A tracked file in a kernel area that is in neither list has not been
+// decided — it is not published and not scanned — so a new one blocks the
+// commit until it is added to one of them.
+//
+// --staged reads the manifest from the index, so a commit that adds a file and
+// its manifest entry together is judged as it will land.
+//
+// Closure: Jori is a mechanical copy of the manifest's files, so a kernel
+// file must not need a personal one. The rules and what counts as a reference
+// are in lib/kernel-closure.cjs; `kernel-closure-ok: <reason>` on the
+// line (or the line above) exempts one.
+//
+// Exit codes: 0 clean (or --report), 1 hard hits / unclassified files /
+// closure violations, 2 usage / config error. No dependencies beyond node. The logic lives in
+// lib/kernel-guard.cjs (shared with the self-improvement landing hook).
+
+"use strict";
+const fs = require("node:fs");
+const path = require("node:path");
+const { execFileSync } = require("node:child_process");
+const kg = require("../lib/kernel-guard.cjs");
+const kc = require("../lib/kernel-closure.cjs");
+
+function usage(msg) {
+  if (msg) process.stderr.write(`kernel-guard: ${msg}\n`);
+  process.stderr.write("usage: kernel-guard [paths...] [--staged] [--unclassified] [--closure] [--summary] [--json] [--report] [--new] [--write-baseline] [--list-patterns] [--explain] [--root DIR] [--manifest F] [--patterns F] [--baseline F]\n");
+  process.exit(2);
+}
+
+function parseArgs(argv) {
+  const o = { paths: [], staged: false, unclassified: false, closure: false, writeInstallAllowance: false, summary: false, json: false, report: false, onlyNew: false, writeBaseline: false, listPatterns: false, explain: false };
+  const valued = { "--root": "root", "--manifest": "manifest", "--patterns": "patterns", "--baseline": "baseline" };
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a in valued) { if (i + 1 >= argv.length) usage(`${a} needs a value`); o[valued[a]] = argv[++i]; }
+    else if (a === "--staged") o.staged = true;
+    else if (a === "--unclassified") o.unclassified = true;
+    else if (a === "--closure") o.closure = true;
+    else if (a === "--write-install-allowance") o.writeInstallAllowance = true;
+    else if (a === "--summary") o.summary = true;
+    else if (a === "--json") o.json = true;
+    else if (a === "--report") o.report = true;
+    else if (a === "--new") o.onlyNew = true;
+    else if (a === "--write-baseline") o.writeBaseline = true;
+    else if (a === "--list-patterns") o.listPatterns = true;
+    else if (a === "--explain") o.explain = true;
+    else if (a === "-h" || a === "--help") { const head = []; for (const l of fs.readFileSync(__filename, "utf8").split("\n").slice(1)) { if (!l.startsWith("//")) break; head.push(l.replace(/^\/\/ ?/, "")); } process.stdout.write(head.join("\n") + "\n"); process.exit(0); }
+    else if (a.startsWith("--")) usage(`unknown option ${a}`);
+    else o.paths.push(a);
+  }
+  if (o.staged && o.paths.length) usage("--staged and explicit paths are exclusive");
+  if (o.unclassified && (o.paths.length || o.writeBaseline || o.onlyNew || o.listPatterns)) usage("--unclassified takes only --staged, --json, --report and --root/--manifest");
+  if (o.closure && (o.unclassified || o.writeBaseline || o.onlyNew || o.listPatterns)) usage("--closure takes only paths or --staged, --json, --report and --root/--manifest");
+  if (o.writeInstallAllowance && (!o.closure || o.staged || o.paths.length)) usage("--write-install-allowance goes with --closure alone");
+  o.root = path.resolve(o.root || path.join(__dirname, ".."));
+  o.manifestRel = o.manifest ? null : "system/kernel-manifest.json";
+  o.manifest = path.resolve(o.root, o.manifest || "system/kernel-manifest.json");
+  // The private pattern list: --patterns, else the installation's own
+  // (lib/kernel-guard.cjs patternsFile). Null when the installation has none.
+  if (o.patterns) { o.patternsRel = null; o.patterns = path.resolve(o.root, o.patterns); o.patternsSource = "--patterns"; }
+  else {
+    const pf = kg.patternsFile(o.root);
+    o.patterns = pf ? pf.file : null;
+    o.patternsRel = pf ? pf.rel : null;
+    o.patternsSource = pf ? pf.source : null;
+  }
+  o.baseline = path.resolve(o.root, o.baseline || "system/kernel-guard-baseline.json");
+  return o;
+}
+
+function readJson(file, what) {
+  try { return JSON.parse(fs.readFileSync(file, "utf8")); }
+  catch (e) { process.stderr.write(`kernel-guard: cannot read ${what} ${file}: ${e.message}\n`); process.exit(2); }
+}
+
+// The static list plus the shape and derived detectors (derived from the repo
+// at o.root, judged against the manifest the scan uses).
+// With --staged everything is judged as the commit will land: the pattern
+// list, and the registries and config the derived detectors are built from,
+// are read from the index (falling back to the working tree for a pattern file
+// that is not tracked).
+function loadPatterns(o) {
+  let raw = null;
+  if (o.staged && o.patternsRel) {
+    try { raw = JSON.parse(git(o.root, ["show", `:${o.patternsRel}`]).toString()); } catch { /* not in the index: disk */ }
+  }
+  if (!raw && o.patterns) raw = readJson(o.patterns, "patterns");
+  if (!raw) {
+    // No pattern list in this installation: the shape and derived detectors
+    // still run; the static list is empty.
+    if (!o.json) process.stderr.write("kernel-guard: no private pattern list (set $KERNEL_GUARD_PATTERNS, agent/local/config/kernel-guard.json `patterns_file`, or add system/personal-patterns.json); running the shape and derived detectors only\n");
+    raw = kg.NO_PATTERNS;
+  }
+  try { return { raw, patterns: kg.allPatterns(o.root, raw, loadManifest(o), o.patterns || "no pattern list", { staged: o.staged }) }; }
+  catch (e) { process.stderr.write(`kernel-guard: ${e.message}\n`); process.exit(2); }
+}
+
+function git(root, args, opts = {}) {
+  return execFileSync("git", args, { cwd: root, maxBuffer: 256 * 1024 * 1024, stdio: ["ignore", "pipe", "pipe"], ...opts });
+}
+
+function gitLines(root, args, what) {
+  try { return git(root, args).toString().split("\n").filter(Boolean); }
+  catch (e) { process.stderr.write(`kernel-guard: ${what} needs a git repo: ${e.message}\n`); process.exit(2); }
+}
+
+// The manifest a check is judged against: with --staged, the index copy (a
+// commit that adds a file and its manifest entry together lands consistent);
+// otherwise the working tree.
+function loadManifest(o) {
+  if (o.staged && o.manifestRel) {
+    try { return JSON.parse(git(o.root, ["show", `:${o.manifestRel}`]).toString()); } catch { /* not in the index: fall back to disk */ }
+  }
+  if (!fs.existsSync(o.manifest)) {
+    // A switched install: no manifest file, its kernel and overlay repos instead.
+    const synth = kg.synthManifest(o.root);
+    if (synth) return synth;
+    // A plain clone of the kernel repo (CI): every tracked file is kernel.
+    const kernelOnly = kg.kernelOnlyManifest(o.root);
+    if (kernelOnly) return kernelOnly;
+  }
+  return readJson(o.manifest, "manifest");
+}
+
+function walk(abs, out) {
+  let st;
+  try { st = fs.statSync(abs); } catch { return; }
+  if (st.isDirectory()) {
+    for (const e of fs.readdirSync(abs)) {
+      if (e === ".git" || e === "node_modules") continue;
+      walk(path.join(abs, e), out);
+    }
+  } else if (st.isFile()) out.push(abs);
+}
+
+// [{ rel, read: () => Buffer|null }]
+function selectFiles(o) {
+  const rel = (abs) => path.relative(o.root, abs).split(path.sep).join("/");
+  const fromDisk = (r) => () => { try { return fs.readFileSync(path.join(o.root, r)); } catch { return null; } };
+  if (o.paths.length) {
+    const abs = [];
+    for (const p of o.paths) walk(path.resolve(process.cwd(), p), abs);
+    return { files: abs.map((a) => ({ rel: rel(a), read: () => { try { return fs.readFileSync(a); } catch { return null; } } })), missing: [] };
+  }
+  const listed = kg.manifestFiles(loadManifest(o));
+  if (o.staged) {
+    const staged = gitLines(o.root, ["diff", "--cached", "--name-only", "--diff-filter=ACMR"], "--staged");
+    const set = new Set(listed);
+    return { files: staged.filter((f) => set.has(f)).map((f) => ({ rel: f, read: () => { try { return git(o.root, ["show", `:${f}`]); } catch { return null; } } })), missing: [] };
+  }
+  const files = [], missing = [];
+  for (const r of listed) {
+    if (fs.existsSync(path.join(o.root, r))) files.push({ rel: r, read: fromDisk(r) });
+    else missing.push(r);
+  }
+  return { files, missing };
+}
+
+const scanFile = (rel, buf, patterns) => kg.scanContent(rel, buf, patterns);
+
+// --unclassified: every tracked file (or, with --staged, every file the commit
+// adds) in a kernel area must be in the manifest or match personal_globs.
+function runUnclassified(o) {
+  const manifest = loadManifest(o);
+  const paths = o.staged
+    ? gitLines(o.root, ["diff", "--cached", "--name-only", "--diff-filter=AC"], "--staged")
+        .concat(gitLines(o.root, ["diff", "--cached", "--name-status", "--diff-filter=R"], "--staged").map((l) => l.split("\t").pop()))
+    : gitLines(o.root, ["ls-files"], "--unclassified");
+  const found = kg.unclassified(paths, manifest);
+  const unused = o.staged ? [] : kg.unusedGlobs(paths, manifest);
+  if (o.json) {
+    process.stdout.write(JSON.stringify({ root: o.root, mode: o.staged ? "staged" : "tracked", checked: paths.length, unclassified: found, unused_globs: unused }, null, 1) + "\n");
+  } else {
+    for (const f of found) process.stdout.write(`unclassified  ${f}\n`);
+    for (const g of unused) process.stdout.write(`unused glob   ${g}   (matches no tracked file; remove it when its files are gone)\n`);
+    process.stdout.write(`\nkernel-guard: ${found.length} unclassified ${o.staged ? "new " : ""}file(s) in kernel areas — ${paths.length} ${o.staged ? "added" : "tracked"} files checked\n`);
+    if (found.length) process.stderr.write(`\n${kg.CLASSIFY_HELP}\n`);
+  }
+  return found.length && !o.report ? 1 : 0;
+}
+
+// --closure: kernel code files lean only on the kernel (lib/kernel-closure.cjs).
+function runClosure(o) {
+  const manifest = loadManifest(o);
+  const c = kg.classifier(manifest);
+  const tracked = new Set(gitLines(o.root, ["ls-files"], "--closure"));
+  if (o.staged) for (const f of gitLines(o.root, ["diff", "--cached", "--name-only", "--diff-filter=ACMR"], "--staged")) tracked.add(f);
+  const exists = (rel) => tracked.has(rel) || fs.existsSync(path.join(o.root, rel));
+  let picked;
+  if (o.staged) {
+    picked = gitLines(o.root, ["diff", "--cached", "--name-only", "--diff-filter=ACMR"], "--staged").filter((f) => c.kernel(f))
+      .map((f) => { try { return { rel: f, text: git(o.root, ["show", `:${f}`]).toString("utf8") }; } catch { return null; } });
+  } else {
+    const rels = o.paths.length
+      ? o.paths.flatMap((p) => { const abs = []; walk(path.resolve(process.cwd(), p), abs); return abs.map((a) => path.relative(o.root, a).split(path.sep).join("/")); }).filter((f) => c.kernel(f))
+      : c.files;
+    picked = rels.map((f) => { try { return { rel: f, text: fs.readFileSync(path.join(o.root, f), "utf8") }; } catch { return null; } });
+  }
+  const files = picked.filter((f) => f && kc.isCode(f.rel, f.text.slice(0, 200)));
+  if (o.writeInstallAllowance) {
+    const allowance = {};
+    for (const f of files) { const n = kc.installPathRefs(f.rel, f.text).length; if (n) allowance[f.rel] = n; }
+    // A switched install has no manifest file: its allowance lives in
+    // agent/local/config/kernel-guard.json (lib/kernel-guard.cjs synthManifest).
+    const target = manifest._synthesized ? path.join(o.root, "agent/local/config/kernel-guard.json") : o.manifest;
+    if (!fs.existsSync(target)) { process.stderr.write(`kernel-guard: ${path.relative(o.root, target)} not found, nothing written\n`); return 2; }
+    const raw = JSON.parse(fs.readFileSync(target, "utf8"));
+    // kernel-closure-ok: describes the rule, does not locate the install
+    raw._install_path_allowance_comment = "install_path_allowance: per kernel code file, how many code lines still spell the install path (~/Dev/jori) or Homebrew's node (/opt/homebrew/bin/node) instead of asking lib/root.cjs / scripts/lib/root.sh. kernel-guard --closure fails a file over its count (a file not listed: over zero), so the number only goes down. Regenerate with `kernel-guard --closure --write-install-allowance` after converting lines.";
+    raw.install_path_allowance = Object.fromEntries(Object.keys(allowance).sort().map((k) => [k, allowance[k]]));
+    fs.writeFileSync(target, JSON.stringify(raw, null, 1) + "\n");
+    const total = Object.values(allowance).reduce((a, b) => a + b, 0);
+    process.stderr.write(`kernel-guard: wrote install_path_allowance (${Object.keys(allowance).length} files, ${total} lines) to ${path.relative(o.root, target)}\n`);
+    return 0;
+  }
+  const found = kc.closureViolations({ manifest, classifier: kg.classifier, exists, files });
+  if (o.json) {
+    process.stdout.write(JSON.stringify({ root: o.root, mode: o.staged ? "staged" : o.paths.length ? "paths" : "manifest", checked: files.length, violations: found }, null, 1) + "\n");
+  } else {
+    let cur = null;
+    for (const v of found) {
+      if (v.file !== cur) { cur = v.file; process.stdout.write(`\n${v.file}\n`); }
+      process.stdout.write(`  ${String(v.line).padStart(5)}  ${v.target}  (${v.reason})\n         ${v.text}\n`);
+    }
+    process.stdout.write(`\nkernel-guard: ${found.length} closure violation(s) — ${files.length} kernel code file(s) checked\n`);
+    if (found.length) process.stderr.write(`\n${kc.CLOSURE_HELP}\n`);
+  }
+  return found.length && !o.report ? 1 : 0;
+}
+
+function main() {
+  const o = parseArgs(process.argv.slice(2));
+  if (o.unclassified) return runUnclassified(o);
+  if (o.closure) return runClosure(o);
+  const { raw, patterns } = loadPatterns(o);
+  if (o.listPatterns) {
+    const w = Math.max(...patterns.map((p) => p.name.length));
+    for (const p of patterns) process.stdout.write(`${p.name.padEnd(w)}  ${p.severity.padEnd(6)}  ${p.group}${p.describe ? `  — ${p.describe}` : ""}\n`);
+    if (o.explain) {
+      const t = kg.derivedTable(o.root, loadManifest(o), raw, { staged: o.staged });
+      process.stdout.write(`\nderived tokens (${t.tokens.size}):\n`);
+      for (const [norm, tok] of [...t.tokens.entries()].sort((a, b) => a[1].category.localeCompare(b[1].category) || a[0].localeCompare(b[0]))) {
+        process.stdout.write(`  ${tok.category.padEnd(8)} ${JSON.stringify(tok.display)}${tok.cs ? " (case-sensitive)" : ""}  <- ${[...tok.sources].join("; ")}\n`);
+      }
+      process.stdout.write(`\nderived_allow in use (${t.allowed.size}):\n`);
+      for (const a of t.allowed.values()) process.stdout.write(`  ${JSON.stringify(a.display)}: ${a.reason}  <- ${[...a.sources].join("; ")}\n`);
+    }
+    return 0;
+  }
+  const { files, missing } = selectFiles(o);
+  const hits = [];
+  let scanned = 0, skipped = 0;
+  for (const f of files) {
+    const r = scanFile(f.rel, f.read(), patterns);
+    if (r.skipped) { skipped++; continue; }
+    scanned++;
+    hits.push(...r.hits);
+  }
+
+  if (o.writeBaseline) {
+    // A baseline recorded without the static list would bless every hit it
+    // cannot see; refuse rather than write one.
+    if (raw._none) { process.stderr.write("kernel-guard: --write-baseline needs the private pattern list; none found, nothing written\n"); return 2; }
+    const prev = o.paths.length && fs.existsSync(o.baseline) ? readJson(o.baseline, "baseline") : null;
+    const out = { _comment: "Generated by bin/kernel-guard --write-baseline: per kernel file and pattern, a short hash of each hard-hit line (never the line). `kernel-guard --new` fails only on hits not listed here. Regenerate after removing personal data so the list only shrinks.", version: 1, files: prev?.files || {} };
+    for (const f of files) delete out.files[f.rel];
+    for (const h of hits) {
+      if (h.status !== "hard") continue;
+      const byPat = (out.files[h.file] ||= {});
+      (byPat[h.pattern] ||= []).push(h.key);
+    }
+    const sorted = {};
+    for (const k of Object.keys(out.files).sort()) {
+      const byPat = {};
+      for (const p of Object.keys(out.files[k]).sort()) byPat[p] = out.files[k][p].slice().sort();
+      sorted[k] = byPat;
+    }
+    out.files = sorted;
+    fs.writeFileSync(o.baseline, JSON.stringify(out, null, 1) + "\n");
+    const n = Object.values(sorted).reduce((a, bp) => a + Object.values(bp).reduce((b, l) => b + l.length, 0), 0);
+    process.stderr.write(`kernel-guard: wrote baseline ${path.relative(o.root, o.baseline)} (${Object.keys(sorted).length} files, ${n} hard hits)\n`);
+    return 0;
+  }
+
+  if (o.onlyNew) {
+    const base = fs.existsSync(o.baseline) ? readJson(o.baseline, "baseline").files || {} : {};
+    const budget = new Map();
+    for (const [file, byPat] of Object.entries(base)) for (const [pat, keys] of Object.entries(byPat)) for (const k of keys) {
+      const id = `${file}\0${pat}\0${k}`;
+      budget.set(id, (budget.get(id) || 0) + 1);
+    }
+    for (const h of hits) {
+      if (h.status !== "hard") continue;
+      const id = `${h.file}\0${h.pattern}\0${h.key}`;
+      const left = budget.get(id) || 0;
+      if (left > 0) { budget.set(id, left - 1); h.status = "baselined"; }
+    }
+  }
+
+  const totals = { files_scanned: scanned, files_skipped: skipped, files_missing: missing.length, hard: 0, report: 0, allowed: 0, baselined: 0 };
+  const byFile = {}, byPattern = {};
+  for (const h of hits) {
+    totals[h.status]++;
+    const f = (byFile[h.file] ||= { hard: 0, report: 0, allowed: 0, baselined: 0 });
+    f[h.status]++;
+    const p = (byPattern[h.pattern] ||= { group: h.group, severity: h.severity, hard: 0, report: 0, allowed: 0, baselined: 0, files: 0 });
+    p[h.status]++;
+  }
+  for (const name of Object.keys(byPattern)) byPattern[name].files = new Set(hits.filter((h) => h.pattern === name).map((h) => h.file)).size;
+
+  if (o.json) {
+    const res = { root: o.root, mode: o.paths.length ? "paths" : o.staged ? "staged" : "manifest", only_new: o.onlyNew, totals, by_file: byFile, by_pattern: byPattern, missing };
+    if (!o.summary) res.hits = hits.map(({ key, source, ...h }) => (o.explain && source ? { ...h, source } : h));
+    process.stdout.write(JSON.stringify(res, null, 1) + "\n");
+  } else if (o.summary) {
+    const rows = Object.entries(byFile).sort((a, b) => (b[1].hard - a[1].hard) || (b[1].report - a[1].report) || a[0].localeCompare(b[0]));
+    process.stdout.write("hard  report  allowed  baselined  file\n");
+    for (const [file, c] of rows) process.stdout.write(`${String(c.hard).padStart(4)}  ${String(c.report).padStart(6)}  ${String(c.allowed).padStart(7)}  ${String(c.baselined).padStart(9)}  ${file}\n`);
+    process.stdout.write("\nby pattern (hits / files):\n");
+    for (const [name, c] of Object.entries(byPattern).sort((a, b) => (b[1].hard + b[1].report) - (a[1].hard + a[1].report))) {
+      process.stdout.write(`  ${name.padEnd(20)} ${c.severity.padEnd(6)} hard=${c.hard} report=${c.report} allowed=${c.allowed} baselined=${c.baselined} files=${c.files}\n`);
+    }
+  } else {
+    let cur = null;
+    for (const h of hits) {
+      if (h.status === "allowed" || h.status === "baselined") continue;
+      if (h.file !== cur) { cur = h.file; process.stdout.write(`\n${h.file}\n`); }
+      process.stdout.write(`  ${String(h.line).padStart(5)}  [${h.pattern}]${h.status === "report" ? " (report)" : ""} ${h.text}\n`);
+      if (o.explain && h.source) process.stdout.write(`         \u21b3 ${h.source}\n`);
+    }
+  }
+  if (!o.json) {
+    process.stdout.write(`\nkernel-guard: ${totals.hard} hard, ${totals.report} report-only, ${totals.allowed} allowed, ${totals.baselined} baselined — ${scanned} files scanned${missing.length ? `, ${missing.length} manifest files missing` : ""}\n`);
+    if (totals.hard > 0 && !o.report) process.stderr.write(`\n${kg.DESTINATIONS}\n`);
+  }
+  return totals.hard > 0 && !o.report ? 1 : 0;
+}
+
+// exitCode, not exit(): a large --json report written to a pipe is flushed
+// before the process ends.
+process.exitCode = main();

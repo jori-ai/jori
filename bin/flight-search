@@ -1,0 +1,403 @@
+#!/usr/bin/env node
+import { execSync } from "node:child_process";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { createRequire } from "node:module";
+
+const require = createRequire(import.meta.url);
+const { installRoot } = require("../lib/root.cjs");
+const { localConfig } = require("../lib/instance.cjs");
+// Where a non-interactive `op read` bootstraps the token from (optional):
+// agent/local/config/flight-search.json { "op_ref": "<a 1Password secret reference>" }.
+const OP_REF = localConfig("flight-search", { op_ref: "" }).op_ref || "";
+const ENV_FILE = path.join(installRoot(), ".env");
+const DUFFEL_URL =
+  "https://api.duffel.com/air/offer_requests?return_offers=true&supplier_timeout=15000";
+const DUFFEL_VERSION = "v2";
+const VALID_CABINS = new Set(["economy", "premium_economy", "business", "first"]);
+const VALID_SORTS = new Set(["price", "duration", "depart"]);
+
+function usage() {
+  return `flight-search — search live flight fares via Duffel
+
+Usage:
+  flight-search <ORIGIN> <DEST> --date YYYY-MM-DD [options]
+
+Required:
+  ORIGIN, DEST              IATA airport codes (3 letters)
+  --date YYYY-MM-DD         Outbound departure date
+
+Optional:
+  --return YYYY-MM-DD       Return date → round trip
+  --return-to IATA          Open-jaw: end the return at a different airport than ORIGIN
+                            (e.g. fly LHR→NRT outbound, return NRT→CDG). Requires --return.
+  --adults N                Adult passenger count (default 1)
+  --cabin CLASS             economy | premium_economy | business | first (default economy)
+  --max N                   Max offers to return (default 10, cap 100)
+  --currency CCY            Display currency hint, ISO 4217 (default USD; Duffel may return others)
+  --direct                  Force nonstop only (sent as max_connections=0 server-side)
+  --carrier IATA            Strict carrier filter — every segment's marketing carrier must match
+                            (no codeshare slips through). 2-letter IATA, e.g. BA for British Airways.
+  --sort KEY                price | duration | depart (default price)
+  --json                    Output flattened JSON instead of table
+  --debug                   Echo request + response to stderr (token redacted)
+  --help, -h                Show this help
+
+Exit codes: 0 ok, 1 runtime/API error, 2 usage error.
+Secret source: DUFFEL_API_TOKEN in the environment or .env${OP_REF ? ` (bootstrap: ${OP_REF})` : ""}
+`;
+}
+
+function fail(msg, code = 1) {
+  process.stderr.write(`flight-search: ${msg}\n`);
+  process.exit(code);
+}
+
+function flag(args, name) {
+  const i = args.indexOf(`--${name}`);
+  if (i === -1 || i === args.length - 1) return null;
+  return args[i + 1];
+}
+
+function hasFlag(args, name) {
+  return args.includes(`--${name}`);
+}
+
+function parseArgs(argv) {
+  const args = argv.slice(2);
+  if (args.length === 0 || hasFlag(args, "help") || args.includes("-h")) {
+    process.stdout.write(usage());
+    process.exit(0);
+  }
+
+  const positionals = args.filter((a) => !a.startsWith("--"));
+  const flagged = new Set();
+  for (let i = 0; i < args.length; i++) {
+    if (args[i].startsWith("--")) {
+      flagged.add(i);
+      if (i + 1 < args.length && !args[i + 1].startsWith("--")) flagged.add(i + 1);
+    }
+  }
+  const realPositionals = [];
+  for (let i = 0; i < args.length; i++) {
+    if (!args[i].startsWith("--") && !flagged.has(i)) realPositionals.push(args[i]);
+  }
+
+  if (realPositionals.length < 2) {
+    fail("missing ORIGIN and/or DEST (e.g. LHR CDG)", 2);
+  }
+  const [origin, dest] = realPositionals.map((s) => s.toUpperCase());
+  if (!/^[A-Z]{3}$/.test(origin) || !/^[A-Z]{3}$/.test(dest)) {
+    fail(`ORIGIN/DEST must be 3-letter IATA codes (got "${origin}" "${dest}")`, 2);
+  }
+
+  const departDate = flag(args, "date");
+  if (!departDate) fail("missing --date YYYY-MM-DD", 2);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(departDate)) {
+    fail(`--date must be YYYY-MM-DD (got "${departDate}")`, 2);
+  }
+  const returnDate = flag(args, "return");
+  if (returnDate && !/^\d{4}-\d{2}-\d{2}$/.test(returnDate)) {
+    fail(`--return must be YYYY-MM-DD (got "${returnDate}")`, 2);
+  }
+  const returnTo = (flag(args, "return-to") || "").toUpperCase();
+  if (returnTo && !/^[A-Z]{3}$/.test(returnTo)) {
+    fail(`--return-to must be a 3-letter IATA code (got "${returnTo}")`, 2);
+  }
+  if (returnTo && !returnDate) {
+    fail("--return-to requires --return", 2);
+  }
+
+  const adults = parseInt(flag(args, "adults") || "1", 10);
+  if (!Number.isFinite(adults) || adults < 1 || adults > 9) {
+    fail("--adults must be 1..9", 2);
+  }
+
+  const cabin = (flag(args, "cabin") || "economy").toLowerCase();
+  if (!VALID_CABINS.has(cabin)) {
+    fail(`--cabin must be one of: ${[...VALID_CABINS].join(", ")}`, 2);
+  }
+
+  let max = parseInt(flag(args, "max") || "10", 10);
+  if (!Number.isFinite(max) || max < 1) fail("--max must be a positive integer", 2);
+  if (max > 100) max = 100;
+
+  const carrier = (flag(args, "carrier") || "").toUpperCase();
+  if (carrier && !/^[A-Z0-9]{2}$/.test(carrier)) {
+    fail(`--carrier must be a 2-character IATA code (got "${carrier}")`, 2);
+  }
+
+  const currency = (flag(args, "currency") || "USD").toUpperCase();
+  if (!/^[A-Z]{3}$/.test(currency)) fail("--currency must be a 3-letter code", 2);
+
+  const sortKey = (flag(args, "sort") || "price").toLowerCase();
+  if (!VALID_SORTS.has(sortKey)) {
+    fail(`--sort must be one of: ${[...VALID_SORTS].join(", ")}`, 2);
+  }
+
+  return {
+    origin,
+    dest,
+    departDate,
+    returnDate,
+    returnTo,
+    adults,
+    cabin,
+    max,
+    currency,
+    direct: hasFlag(args, "direct"),
+    carrier,
+    sortKey,
+    json: hasFlag(args, "json"),
+    debug: hasFlag(args, "debug"),
+  };
+}
+
+function readEnvFile(name) {
+  try {
+    for (const line of fs.readFileSync(ENV_FILE, "utf8").split("\n")) {
+      const m = line.match(/^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$/);
+      if (m && m[1] === name) return m[2].trim();
+    }
+  } catch {}
+  return null;
+}
+
+// .env is the runtime source; `op` is bootstrap/rotation only. Calling `op read`
+// on every search costs a Touch ID prompt per invocation on the laptop (the
+// desktop-app integration keys authorization to a TTY, and agent shells have
+// none), and on the Mac mini it would block on an interactive prompt no cron
+// tick can answer. Only reach for op when a service-account token makes the
+// read non-interactive.
+function readToken() {
+  const token =
+    process.env.DUFFEL_API_TOKEN?.trim() || readEnvFile("DUFFEL_API_TOKEN");
+  if (token) return token;
+
+  if (OP_REF && process.env.OP_SERVICE_ACCOUNT_TOKEN) {
+    try {
+      const out = execSync(`op read ${JSON.stringify(OP_REF)}`, {
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "pipe"],
+      }).trim();
+      if (out) return out;
+    } catch {}
+  }
+
+  fail(
+    `no Duffel token: set DUFFEL_API_TOKEN in ${ENV_FILE}` +
+      (OP_REF ? ` (bootstrap once with: op read ${JSON.stringify(OP_REF)}).` : "."),
+    1,
+  );
+}
+
+function buildBody(opts) {
+  const mkSlice = (origin, destination, departure_date) => {
+    const s = { origin, destination, departure_date };
+    if (opts.direct) s.max_connections = 0;
+    return s;
+  };
+  const slices = [mkSlice(opts.origin, opts.dest, opts.departDate)];
+  if (opts.returnDate) {
+    const retTo = opts.returnTo || opts.origin;
+    slices.push(mkSlice(opts.dest, retTo, opts.returnDate));
+  }
+  const passengers = Array.from({ length: opts.adults }, () => ({ type: "adult" }));
+  return { data: { slices, passengers, cabin_class: opts.cabin } };
+}
+
+async function callDuffel(token, body, debug) {
+  const controller = new AbortController();
+  const t = setTimeout(() => controller.abort(), 30_000);
+  let res;
+  try {
+    res = await fetch(DUFFEL_URL, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Duffel-Version": DUFFEL_VERSION,
+        Accept: "application/json",
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(body),
+      signal: controller.signal,
+    });
+  } catch (e) {
+    clearTimeout(t);
+    if (e.name === "AbortError") fail("Duffel request timed out after 30s");
+    fail(`network error talking to Duffel: ${e.message}`);
+  }
+  clearTimeout(t);
+  const text = await res.text();
+  if (debug) {
+    process.stderr.write(`--- duffel response (HTTP ${res.status}) ---\n`);
+    process.stderr.write(text + "\n");
+    process.stderr.write(`--- end ---\n`);
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    fail(`Duffel returned non-JSON (HTTP ${res.status}): ${text.slice(0, 200)}`);
+  }
+  if (!res.ok) {
+    if (res.status === 401 || res.status === 403) {
+      fail(`Duffel auth failed (HTTP ${res.status}). Check the token in ${OP_REF}.`);
+    }
+    const errMsg =
+      parsed.errors?.[0]?.message || parsed.errors?.[0]?.title || `HTTP ${res.status}`;
+    fail(`Duffel error: ${errMsg}`);
+  }
+  return parsed;
+}
+
+function isoDurationToMinutes(d) {
+  if (!d) return 0;
+  const m = d.match(/^PT(?:(\d+)H)?(?:(\d+)M)?/);
+  if (!m) return 0;
+  return (parseInt(m[1] || "0", 10) * 60) + parseInt(m[2] || "0", 10);
+}
+
+function fmtDuration(minutes) {
+  const h = Math.floor(minutes / 60);
+  const m = minutes % 60;
+  return `${h}h${String(m).padStart(2, "0")}m`;
+}
+
+function fmtDateTime(iso) {
+  if (!iso) return "";
+  return iso.replace("T", " ").slice(0, 16);
+}
+
+function summarizeSlice(slice) {
+  const segments = slice.segments || [];
+  if (segments.length === 0) return null;
+  const first = segments[0];
+  const last = segments[segments.length - 1];
+  const carrierCodes = [...new Set(segments.map((s) => s.marketing_carrier?.iata_code).filter(Boolean))];
+  return {
+    carrier: carrierCodes.join("/"),
+    flight_no: `${first.marketing_carrier?.iata_code || ""} ${first.marketing_carrier_flight_number || ""}`.trim(),
+    depart: first.departing_at,
+    arrive: last.arriving_at,
+    duration_min: isoDurationToMinutes(slice.duration),
+    stops: Math.max(0, segments.length - 1),
+    segments: segments.map((s) => ({
+      from: s.origin?.iata_code,
+      to: s.destination?.iata_code,
+      depart: s.departing_at,
+      arrive: s.arriving_at,
+      carrier: s.marketing_carrier?.iata_code,
+      flight_no: s.marketing_carrier_flight_number,
+      aircraft: s.aircraft?.name,
+    })),
+  };
+}
+
+function flattenOffers(offers) {
+  return offers.map((o) => {
+    const out = summarizeSlice(o.slices?.[0]);
+    const ret = o.slices?.[1] ? summarizeSlice(o.slices[1]) : null;
+    return {
+      offer_id: o.id,
+      total_amount: o.total_amount,
+      currency: o.total_currency,
+      outbound: out,
+      return: ret,
+    };
+  });
+}
+
+function filterAndSort(flat, opts) {
+  let rows = flat;
+  const beforeCarrier = rows.length;
+  if (opts.direct) {
+    rows = rows.filter(
+      (r) => r.outbound?.stops === 0 && (!r.return || r.return.stops === 0),
+    );
+  }
+  if (opts.carrier) {
+    rows = rows.filter((r) => {
+      const allSegs = [
+        ...(r.outbound?.segments || []),
+        ...(r.return?.segments || []),
+      ];
+      return (
+        allSegs.length > 0 &&
+        allSegs.every((s) => s.carrier === opts.carrier)
+      );
+    });
+  }
+  if (opts.debug && opts.carrier) {
+    process.stderr.write(
+      `--- carrier filter: ${beforeCarrier} → ${rows.length} after --carrier=${opts.carrier}${opts.direct ? " --direct" : ""} ---\n`,
+    );
+  }
+  const totalDuration = (r) => (r.outbound?.duration_min || 0) + (r.return?.duration_min || 0);
+  const departTs = (r) => Date.parse(r.outbound?.depart || 0) || 0;
+  rows.sort((a, b) => {
+    if (opts.sortKey === "price") return parseFloat(a.total_amount) - parseFloat(b.total_amount);
+    if (opts.sortKey === "duration") return totalDuration(a) - totalDuration(b);
+    if (opts.sortKey === "depart") return departTs(a) - departTs(b);
+    return 0;
+  });
+  return rows.slice(0, opts.max);
+}
+
+function renderTable(rows, opts) {
+  if (rows.length === 0) {
+    process.stdout.write("No offers matched the criteria.\n");
+    return;
+  }
+  const header = `${"#".padEnd(3)} ${"PRICE".padEnd(12)} ${"AIRLINE".padEnd(8)} ${"STOPS".padEnd(5)} ${"DEPART".padEnd(17)} ${"ARRIVE".padEnd(17)} ${"DURATION".padEnd(8)} OFFER`;
+  const sep = "─".repeat(header.length);
+  const lines = [header, sep];
+  rows.forEach((r, idx) => {
+    const num = String(idx + 1).padEnd(3);
+    const price = `${r.currency} ${r.total_amount}`.padEnd(12);
+    const out = r.outbound;
+    const ret = r.return;
+    const carrierOut = (out?.carrier || "").padEnd(8);
+    const stopsOut = String(out?.stops ?? "").padEnd(5);
+    const depOut = fmtDateTime(out?.depart).padEnd(17);
+    const arrOut = fmtDateTime(out?.arrive).padEnd(17);
+    const durOut = fmtDuration(out?.duration_min || 0).padEnd(8);
+    const offerId = r.offer_id;
+    lines.push(`${num} ${price} ${carrierOut} ${stopsOut} ${depOut} ${arrOut} ${durOut} ${offerId}`);
+    if (ret) {
+      const indent = "    ".padEnd(3 + 1 + 12 + 1);
+      const carrierR = (ret.carrier || "").padEnd(8);
+      const stopsR = String(ret.stops ?? "").padEnd(5);
+      const depR = fmtDateTime(ret.depart).padEnd(17);
+      const arrR = fmtDateTime(ret.arrive).padEnd(17);
+      const durR = fmtDuration(ret.duration_min || 0).padEnd(8);
+      lines.push(`${indent}↩ ${carrierR} ${stopsR} ${depR} ${arrR} ${durR}`);
+    }
+  });
+  process.stdout.write(lines.join("\n") + "\n");
+}
+
+async function main() {
+  const opts = parseArgs(process.argv);
+  const token = readToken();
+  const body = buildBody(opts);
+  if (opts.debug) {
+    process.stderr.write(`--- duffel request ---\n${JSON.stringify(body, null, 2)}\n--- end ---\n`);
+  }
+  const resp = await callDuffel(token, body, opts.debug);
+  const offers = resp.data?.offers || [];
+  const flat = flattenOffers(offers);
+  const final = filterAndSort(flat, opts);
+
+  if (opts.json) {
+    process.stdout.write(JSON.stringify(final, null, 2) + "\n");
+  } else {
+    renderTable(final, opts);
+  }
+}
+
+main().catch((e) => {
+  process.stderr.write(`flight-search: unexpected error: ${e.stack || e.message || e}\n`);
+  process.exit(1);
+});

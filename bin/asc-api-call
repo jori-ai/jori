@@ -1,0 +1,146 @@
+#!/usr/bin/env python3
+# asc-api-call — deterministic ASC API caller for Jori jobs.
+#
+# Why: agents that hand-write JWT+retry logic per dispatch sometimes skip the
+# retry, causing a single transient 401 to flip auth_broken=true. This script
+# does the JWT + retry + error handling deterministically so the agent just
+# invokes it via bash, parses the JSON it prints, and trusts the auth_status.
+#
+# Usage:
+#   asc-api-call <relative-path>
+#   asc-api-call "/v1/apps/<app id>/appInfos"
+#   asc-api-call "/v1/apps/<app id>/appStoreVersions?limit=1"
+#
+# Credentials: agent/local/config/asc-api-call.json
+#   {"meta_path": "<file with key_id + issuer_id>", "key_path": "<.p8>",
+#    "venv_dir": "<a virtualenv directory with PyJWT, when the default python lacks it>"}
+# (paths relative to the installation). Not configured = usage error (exit 3).
+#
+# Output: JSON written to stdout.
+# {
+#   "ok": true,
+#   "status": 200,
+#   "body": {...parsed JSON...},
+#   "attempts": 1,
+#   "url": "..."
+# }
+# or on hard auth failure (3 consecutive 401/403):
+# {
+#   "ok": false,
+#   "error": "auth_broken",
+#   "status": 401,
+#   "attempts": 3,
+#   "last_body": "..."
+# }
+#
+# Exit codes:
+#   0   ok=true
+#   1   ok=false, transient (network/timeout/5xx) — caller should retry later
+#   2   ok=false, auth_broken — caller should set auth_broken=true and exit silent
+#   3   ok=false, usage error
+#
+# The "3 consecutive 401" guard exists because we've seen ASC return one-off
+# 401s during cron bursts even when creds are valid.
+
+import json, os, sys, time
+import urllib.request, urllib.error
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "lib"))
+import places_local  # noqa: E402
+
+CFG = places_local.local_config("asc-api-call", {"meta_path": "", "key_path": "", "venv_dir": ""})
+
+try:
+    import jwt
+except ImportError:
+    # PyJWT lives in a venv on some hosts: re-run under the configured python.
+    venv = CFG.get("venv_dir") or ""
+    py = os.path.join(os.path.expanduser(venv), "bin", "python3") if venv else ""
+    if py and os.path.realpath(py) != os.path.realpath(sys.executable) and os.path.exists(py):
+        os.execv(py, [py] + sys.argv)
+    print(json.dumps({"ok": False, "error": "usage", "msg": "asc-api-call needs PyJWT (pip install pyjwt cryptography, or set `venv_dir` in agent/local/config/asc-api-call.json)"}))
+    sys.exit(3)
+
+ASC_API = "https://api.appstoreconnect.apple.com"
+_root = places_local.install_root()
+META_PATH = os.path.join(_root, CFG["meta_path"]) if CFG.get("meta_path") else ""
+KEY_PATH = os.path.join(_root, CFG["key_path"]) if CFG.get("key_path") else ""
+
+MAX_ATTEMPTS = 3
+RETRY_BACKOFF_S = [10, 30]  # sleep between attempts 1→2 and 2→3
+TIMEOUT_S = 20
+
+
+def make_jwt():
+    meta = json.load(open(META_PATH))
+    pem = open(KEY_PATH).read()
+    now = int(time.time())
+    token = jwt.encode(
+        {"iss": meta["issuer_id"], "iat": now, "exp": now + 1200, "aud": "appstoreconnect-v1"},
+        pem,
+        algorithm="ES256",
+        headers={"alg": "ES256", "kid": meta["key_id"], "typ": "JWT"},
+    )
+    return token
+
+
+def call(path):
+    url = ASC_API + path if path.startswith("/") else ASC_API + "/" + path
+    last_err = None
+    last_body = None
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        token = make_jwt()
+        req = urllib.request.Request(url, headers={"Authorization": "Bearer " + token})
+        try:
+            resp = urllib.request.urlopen(req, timeout=TIMEOUT_S)
+            body = resp.read()
+            try:
+                parsed = json.loads(body)
+            except Exception:
+                parsed = {"raw": body[:1000].decode("utf-8", errors="replace")}
+            return {"ok": True, "status": resp.status, "body": parsed, "attempts": attempt, "url": url}
+        except urllib.error.HTTPError as e:
+            body_bytes = e.read()
+            last_body = body_bytes[:1000].decode("utf-8", errors="replace")
+            last_err = ("http", e.code)
+            if e.code in (401, 403):
+                if attempt < MAX_ATTEMPTS:
+                    time.sleep(RETRY_BACKOFF_S[attempt - 1])
+                    continue
+                return {"ok": False, "error": "auth_broken", "status": e.code, "attempts": attempt, "last_body": last_body, "url": url}
+            if 500 <= e.code < 600:
+                if attempt < MAX_ATTEMPTS:
+                    time.sleep(RETRY_BACKOFF_S[attempt - 1])
+                    continue
+                return {"ok": False, "error": "server_error", "status": e.code, "attempts": attempt, "last_body": last_body, "url": url}
+            # 4xx other than 401/403 → fatal, no retry
+            return {"ok": False, "error": "client_error", "status": e.code, "attempts": attempt, "last_body": last_body, "url": url}
+        except (urllib.error.URLError, TimeoutError) as e:
+            last_err = ("network", str(e))
+            if attempt < MAX_ATTEMPTS:
+                time.sleep(RETRY_BACKOFF_S[attempt - 1])
+                continue
+            return {"ok": False, "error": "network", "status": None, "attempts": attempt, "last_body": str(e), "url": url}
+    # Should not reach here
+    return {"ok": False, "error": "unknown", "status": None, "attempts": MAX_ATTEMPTS, "last_body": last_body, "url": url}
+
+
+def main():
+    if len(sys.argv) < 2:
+        print(json.dumps({"ok": False, "error": "usage", "msg": "asc-api-call <path>"}))
+        sys.exit(3)
+    if not META_PATH or not KEY_PATH:
+        print(json.dumps({"ok": False, "error": "usage", "msg": "no App Store Connect key configured (agent/local/config/asc-api-call.json meta_path, key_path)"}))
+        sys.exit(3)
+    path = sys.argv[1]
+    result = call(path)
+    print(json.dumps(result, indent=2))
+    if result["ok"]:
+        sys.exit(0)
+    if result.get("error") == "auth_broken":
+        sys.exit(2)
+    sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

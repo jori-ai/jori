@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- IntentPhrases intentionally empty. The previous INSendMessageIntent
+	     example phrases ("Tell Jori…", "Message Jori…") triggered
+	     ITMS-90626 once we dropped SiriKit messaging support: a vocabulary
+	     phrase for an intent the app no longer supports is rejected at
+	     processing. Hands-free input is now the "Summon Jori" App Shortcut
+	     (App Intents), which registers its own phrases — no AppIntentVocabulary
+	     entry needed. -->
+	<key>IntentPhrases</key>
+	<array/>
+</dict>
+</plist>

@@ -1,0 +1,456 @@
+#!/usr/bin/env node
+// travel-airlines-sync — expand airline codes in trip pages and build
+// one airline page per carrier with backlinks to trips and flight dates.
+
+"use strict";
+
+const ws = require("../lib/wiki-store.js");
+const { localConfig } = require("../lib/instance.cjs");
+
+// A service animal that travels with the user, from
+// agent/local/config/travel-wiki.json `service_animal`:
+//   { name, wiki_ids: [page ids a trip's "Shared with" line links it by], page }
+// Absent, no flight is marked.
+const ANIMAL = localConfig("travel-wiki", { service_animal: null }).service_animal || null;
+const ANIMAL_NAME = ANIMAL && ANIMAL.name ? String(ANIMAL.name) : "";
+const ANIMAL_IDS = ANIMAL && Array.isArray(ANIMAL.wiki_ids) ? ANIMAL.wiki_ids.map(String) : [];
+const reEsc = (t) => t.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+const AIRLINES = {
+  "4C": { name: "Aires, Aerovias de Integracion Regional, S.A.", icao: "ARE" },
+  "4O": { name: "Interjet", icao: "AIJ" },
+  "6E": { name: "IndiGo", icao: "IGO" },
+  A3: { name: "Aegean Airlines", icao: "AEE" },
+  AA: { name: "American Airlines", icao: "AAL" }, // kernel-guard-ok: public IATA airline table
+  AC: { name: "Air Canada", icao: "ACA" },
+  AD: { name: "Azul Linhas Aereas Brasileiras", icao: "AZU" },
+  AF: { name: "Air France", icao: "AFR" },
+  AI: { name: "Air India", icao: "AIC" },
+  AK: { name: "AirAsia", icao: "AXM" },
+  AR: { name: "Aerolineas Argentinas", icao: "ARG" },
+  AS: { name: "Alaska Airlines", icao: "ASA" },
+  AT: { name: "Royal Air Maroc", icao: "RAM" },
+  AY: { name: "Finnair", icao: "FIN" },
+  AZ: { name: "ITA Airways", icao: "ITY" },
+  B6: { name: "JetBlue Airways", icao: "JBU" }, // kernel-guard-ok: public IATA airline table
+  BA: { name: "British Airways", icao: "BAW" },
+  BR: { name: "EVA Air", icao: "EVA" },
+  CI: { name: "China Airlines", icao: "CAL" },
+  CM: { name: "Copa Airlines", icao: "CMP" },
+  CO: { name: "Continental Airlines", icao: "COA" }, // merged into United 2012
+  DI: { name: "Norwegian Air UK", icao: "NRS" },
+  DL: { name: "Delta Air Lines", icao: "DAL" },
+  DY: { name: "Norwegian Air Shuttle", icao: "NAX" },
+  EI: { name: "Aer Lingus", icao: "EIN" },
+  EN: { name: "Air Dolomiti", icao: "DLA" },
+  F9: { name: "Frontier Airlines", icao: "FFT" },
+  FD: { name: "Thai AirAsia", icao: "AIQ" },
+  FL: { name: "AirTran Airways", icao: "TRS" }, // merged into Southwest 2014
+  FR: { name: "Ryanair", icao: "RYR" },
+  HG: { name: "Niki", icao: "NLY" },
+  HV: { name: "Transavia", icao: "TRA" },
+  IB: { name: "Iberia", icao: "IBE" }, // kernel-guard-ok: public IATA airline table
+  JJ: { name: "TAM Linhas Aéreas", icao: "TAM" }, // now part of LATAM Brasil
+  LA: { name: "LATAM Airlines", icao: "LAN" },
+  LH: { name: "Lufthansa", icao: "DLH" }, // kernel-guard-ok: public IATA airline table
+  LX: { name: "Swiss International Air Lines", icao: "SWR" },
+  LY: { name: "El Al", icao: "ELY" },
+  NH: { name: "All Nippon Airways", icao: "ANA" },
+  NK: { name: "Spirit Airlines", icao: "NKS" },
+  OA: { name: "Olympic Air", icao: "OAL" },
+  PC: { name: "Pegasus Airlines", icao: "PGT" },
+  PG: { name: "Bangkok Airways", icao: "BKP" },
+  QZ: { name: "Indonesia AirAsia", icao: "AWQ" },
+  SK: { name: "Scandinavian Airlines", icao: "SAS" },
+  SQ: { name: "Singapore Airlines", icao: "SIA" },
+  SU: { name: "Aeroflot", icao: "AFL" },
+  TK: { name: "Turkish Airlines", icao: "THY" },
+  TO: { name: "Transavia France", icao: "TVF" },
+  TP: { name: "TAP Air Portugal", icao: "TAP" },
+  U2: { name: "easyJet", icao: "EZY" },
+  U4: { name: "Buddha Air", icao: "BHA" },
+  UA: { name: "United Airlines", icao: "UAL" },
+  UX: { name: "Air Europa", icao: "AEA" },
+  VN: { name: "Vietnam Airlines", icao: "HVN" },
+  VY: { name: "Vueling", icao: "VLG" },
+  W6: { name: "Wizz Air", icao: "WZZ" },
+  WN: { name: "Southwest Airlines", icao: "SWA" },
+  WW: { name: "WOW air", icao: "WOW" },
+  XP: { name: "Avelo Airlines", icao: "VXP" },
+  XT: { name: "Air Exel", icao: "AXL" },
+  Y4: { name: "Volaris", icao: "VOI" },
+  YT: { name: "Yeti Airlines", icao: "NYT" },
+};
+
+const args = process.argv.slice(2);
+const dryRun = !args.includes("--apply");
+
+function slugify(text) {
+  return String(text || "")
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "")
+    .replace(/_{2,}/g, "_");
+}
+
+function unescapeHtml(text) {
+  return String(text || "")
+    .replace(/&amp;/gi, "&")
+    .replace(/&lt;/gi, "<")
+    .replace(/&gt;/gi, ">")
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;/gi, "'")
+    .replace(/&apos;/gi, "'")
+    .replace(/&nbsp;/gi, " ");
+}
+
+function airlineMeta(code) {
+  const meta = AIRLINES[code];
+  if (meta) return meta;
+  return { name: `Unknown airline ${code}`, icao: null };
+}
+
+function airlinePageId(code) {
+  const meta = airlineMeta(code);
+  return `travel_airline_${slugify(meta.name)}_${code.toLowerCase()}`;
+}
+
+function pageTitle(code) {
+  return `${airlineMeta(code).name} (${code})`;
+}
+
+function extractTripSummary(raw) {
+  const lines = String(raw || "").split(/\r?\n/);
+  const take = (label) => {
+    const line = lines.find((l) => l.startsWith(`- ${label}: `));
+    return line ? unescapeHtml(line.slice(label.length + 4).trim()) : "";
+  };
+  const sharedLine = lines.find((l) => l.startsWith("- Shared with: "));
+  // The animal's wikilink target may be any of its configured page ids
+  // (pages were written at different times); every form is scanned.
+  const hasAnimal = sharedLine && ANIMAL_NAME ? animalLinkRe().test(sharedLine) : false;
+  return {
+    title: take("Title") || "",
+    location: take("Location") || "",
+    dateText: take("TripIt date text") || "",
+    start: take("Start") || "",
+    end: take("End") || "",
+    hasAnimal,
+  };
+}
+
+function animalLinkRe() {
+  const ids = ANIMAL_IDS.map(reEsc);
+  const alts = [...ids.map((id) => `\\[\\[${id}\\b`), `\\|${reEsc(ANIMAL_NAME)}\\]\\]`];
+  return new RegExp(alts.join("|"), "i");
+}
+
+// Per-flight marker that overrides the trip-level animal flag — used when the
+// animal was on the trip generally but stayed behind for a specific leg:
+// `(<name> did not fly)` or `<!-- <name>: no -->` / `<!-- service-animal: no -->`.
+const ANIMAL_OPT_OUT_RE = ANIMAL_NAME
+  ? new RegExp(`\\(${reEsc(ANIMAL_NAME)} did not fly\\)|<!--\\s*(?:${reEsc(ANIMAL_NAME)}|service-animal):\\s*no\\s*-->`, "i")
+  : /<!--\s*service-animal:\s*no\s*-->/i;
+
+// Route line written by `expand-routes` — `City (XXX) → City (YYY)`. Captured
+// from the 3 lines preceding the Flight Number bullet.
+const ROUTE_LINE_RE = /^\s*-\s*(.+\([A-Z]{3}\)\s*→\s*.+\([A-Z]{3}\))\s*$/;
+
+function findRouteAbove(lines, idx) {
+  for (let k = idx - 1; k >= Math.max(0, idx - 3); k--) {
+    const m = lines[k].match(ROUTE_LINE_RE);
+    if (m) return m[1].trim();
+  }
+  return "";
+}
+
+function extractFlights(raw) {
+  const out = [];
+  let currentDate = "";
+  const lines = String(raw || "").split(/\r?\n/);
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    const heading = line.match(/^###\s+(.+)$/);
+    if (heading) {
+      currentDate = heading[1].trim();
+      continue;
+    }
+    const animalOptOut = ANIMAL_OPT_OUT_RE.test(line);
+    const route = findRouteAbove(lines, i);
+    // Optional 🐕‍🦺 between the airline link and the flight number — the
+    // service-animal marker, not part of the airline data.
+    const linked = /Flight Number\s+\[\[([^\]|]+)\|([^\]]+)\]\](?:\s+🐕‍🦺)?\s+(\d+)/g;
+    for (const match of line.matchAll(linked)) {
+      const pageId = match[1];
+      const code = pageId.slice(pageId.lastIndexOf("_") + 1).toUpperCase();
+      out.push({
+        code,
+        number: match[3],
+        date: currentDate || "",
+        rawLine: line.trim(),
+        animalOptOut,
+        route,
+      });
+    }
+    const plain = /Flight Number\s+([A-Z0-9]{2})\s+(\d+)/g;
+    for (const match of line.matchAll(plain)) {
+      out.push({
+        code: match[1],
+        number: match[2],
+        date: currentDate || "",
+        rawLine: line.trim(),
+        animalOptOut,
+        route,
+      });
+    }
+  }
+  return out;
+}
+
+function collectTrips() {
+  return ws
+    .listPages({ type: "reference" })
+    .filter((r) => /^travel_trip_\d{4}/.test(r.id))
+    .map((r) => {
+      const row = ws.getPage(r.id);
+      const summary = extractTripSummary(row.body_md || row.raw_md || "");
+      const flights = extractFlights(row.body_md || row.raw_md || "");
+      return {
+        id: r.id,
+        title: row.title || summary.title || r.id,
+        summary,
+        flights,
+        row,
+      };
+    })
+    .filter((trip) => trip.flights.length > 0);
+}
+
+function tripOrderKey(trip) {
+  const id = String(trip?.id || "");
+  const m = id.match(/^travel_trip_(\d{4}-\d{2}-\d{2})/);
+  if (m) return m[1];
+  return String(trip?.summary?.start || trip?.summary?.dateText || trip?.title || "");
+}
+
+function buildAirlineRecords(trips) {
+  const records = new Map();
+  for (const trip of trips) {
+    for (const flight of trip.flights) {
+      const code = flight.code;
+      if (!records.has(code)) {
+        const meta = airlineMeta(code);
+        records.set(code, {
+          code,
+          meta,
+          pageId: airlinePageId(code),
+          title: pageTitle(code),
+          flights: [],
+          tripSet: new Set(),
+        });
+      }
+      const record = records.get(code);
+      const flightHasAnimal = !!trip.summary.hasAnimal && !flight.animalOptOut;
+      record.flights.push({
+        code,
+        tripId: trip.id,
+        tripTitle: trip.title,
+        tripDateText: trip.summary.dateText,
+        tripStart: trip.summary.start,
+        tripEnd: trip.summary.end,
+        date: flight.date,
+        number: flight.number,
+        rawLine: flight.rawLine,
+        hasAnimal: flightHasAnimal,
+        route: flight.route || "",
+      });
+      record.tripSet.add(trip.id);
+      if (flightHasAnimal) {
+        record.animalTripSet ??= new Set();
+        record.animalTripSet.add(trip.id);
+      }
+    }
+  }
+  return [...records.values()].sort((a, b) => a.code.localeCompare(b.code));
+}
+
+function compareTripStartDesc(a, b) {
+  const aKey = tripOrderKey({ id: a?.tripId || "" });
+  const bKey = tripOrderKey({ id: b?.tripId || "" });
+  return bKey.localeCompare(aKey);
+}
+
+function replaceFlightLinks(raw, hasAnimal = false) {
+  // Strip stray HTML entities at the same time so the trip body never carries
+  // `&amp;` etc. through to downstream readers.
+  const out = unescapeHtml(String(raw || ""));
+  const tripSuffix = hasAnimal ? " 🐕‍🦺" : "";
+  // Process line-by-line so per-flight opt-out markers can suppress the icon
+  // on individual legs even when the animal was otherwise on the trip.
+  return out
+    .split(/\r?\n/)
+    .map((line) => {
+      const localSuffix = ANIMAL_OPT_OUT_RE.test(line) ? "" : tripSuffix;
+      // Plain-text form.
+      let next = line.replace(/Flight Number\s+([A-Z0-9]{2})\s+(\d+)/g, (_, code, number) => {
+        const meta = airlineMeta(code);
+        const label = `${meta.name} (${code})`;
+        return `Flight Number [[${airlinePageId(code)}|${label}]]${localSuffix} ${number}`;
+      });
+      // Already-linked form: `Flight Number [[airline_id|Name (XX)]] [🐕‍🦺]? 1234`.
+      // Idempotent — also rewrites stale links (e.g. `unknown_airline_af_af`)
+      // to the canonical airline page, and strips a stale 🐕‍🦺 when the line
+      // now carries an opt-out marker (or the trip itself dropped the animal).
+      next = next.replace(
+        /Flight Number\s+\[\[(travel_airline_[^\]|]+)\|([^\]]+)\]\](\s+🐕‍🦺)?(\s+\d+)/g,
+        (_, oldId, oldLabel, _existingIcon, rest) => {
+          const code = (oldId.match(/_([a-z0-9]{2})$/i) || [])[1];
+          if (!code) {
+            return `Flight Number [[${oldId}|${oldLabel}]]${localSuffix}${rest}`;
+          }
+          const upper = code.toUpperCase();
+          const meta = airlineMeta(upper);
+          const newId = airlinePageId(upper);
+          const newLabel = `${meta.name} (${upper})`;
+          return `Flight Number [[${newId}|${newLabel}]]${localSuffix}${rest}`;
+        },
+      );
+      return next;
+    })
+    .join("\n");
+}
+
+function renderAirlinePage(record) {
+  const animalTripCount = record.animalTripSet ? record.animalTripSet.size : 0;
+  const animalFriendly = animalTripCount > 0;
+  // 🐕‍🦺 = service dog emoji. Decorates the airline title and individual
+  // flight bullets where the service animal was on board. Icon goes to the RIGHT of the
+  // name so screen readers and lexicographic sorts treat the bare title as
+  // primary.
+  const serviceDogIcon = "🐕‍🦺";
+  const titleWithIcon = animalFriendly ? `${record.title} ${serviceDogIcon}` : record.title;
+
+  const lines = [];
+  lines.push("---");
+  lines.push(`name: "${titleWithIcon}"`);
+  lines.push(`description: "Trip references and flight history for ${record.meta.name}."`);
+  lines.push("type: reference");
+  lines.push("status: active");
+  lines.push("scope: [travel, airline, flight, trip_history]");
+  lines.push("confidence: high");
+  lines.push("last_verified_at: 2026-05-03");
+  lines.push(`iata_code: ${record.code}`);
+  if (record.meta.icao) lines.push(`icao_code: ${record.meta.icao}`);
+  if (animalFriendly) lines.push("service_dog_friendly: true");
+  lines.push("related: [travel.md, travel_trip_history_log.md, travel_trip_history_audit.md]");
+  lines.push("---");
+  lines.push(`This is the airline page for [[${record.pageId}|${titleWithIcon}]].`);
+  lines.push("Use [[travel_trip_history_log]] for the full trip index and [[travel]] for the travel hub.");
+  lines.push("");
+  lines.push("## Summary");
+  lines.push(`- Airline: ${record.meta.name}`);
+  lines.push(`- IATA code: ${record.code}`);
+  if (record.meta.icao) lines.push(`- ICAO code: ${record.meta.icao}`);
+  lines.push(`- Trips referenced: ${record.tripSet.size}`);
+  lines.push(`- Flight instances: ${record.flights.length}`);
+  if (animalFriendly) {
+    const who = ANIMAL_IDS.length ? `[[${ANIMAL_IDS[0]}|${ANIMAL_NAME}]]` : ANIMAL_NAME || "the service animal";
+    const see = ANIMAL && ANIMAL.page ? ` — see [[${ANIMAL.page}]]` : "";
+    lines.push(`- ${serviceDogIcon} Service-dog friendly: accepted ${who} on ${animalTripCount} trip${animalTripCount === 1 ? "" : "s"}${see}`);
+  }
+  lines.push("");
+  lines.push("## Flights");
+
+  const byTrip = new Map();
+  for (const flight of record.flights) {
+    if (!byTrip.has(flight.tripId)) byTrip.set(flight.tripId, []);
+    byTrip.get(flight.tripId).push(flight);
+  }
+
+  const trips = [...byTrip.entries()].sort((a, b) => compareTripStartDesc(a[1][0], b[1][0]));
+
+  for (const [tripId, flights] of trips) {
+    const first = flights[0];
+    const title = first.tripTitle || tripId;
+    const dateText = first.tripDateText || "";
+    const tripHasAnimal = flights.some((f) => f.hasAnimal);
+    const tripIcon = tripHasAnimal ? ` ${serviceDogIcon}` : "";
+    lines.push(`### [[${tripId}|${title}]]${tripIcon}`); // icon already on the right
+    if (dateText) lines.push(`- Trip dates: ${dateText}`);
+    for (const flight of [...flights].sort((a, b) => String(b.date || "").localeCompare(String(a.date || "")) || Number(b.number || 0) - Number(a.number || 0))) {
+      const date = flight.date ? `${flight.date} — ` : "";
+      const flightIcon = flight.hasAnimal ? ` ${serviceDogIcon}` : "";
+      const route = flight.route ? ` — ${flight.route}` : "";
+      lines.push(`- ${date}${record.code} ${flight.number}${route}${flightIcon}`);
+    }
+    lines.push("");
+  }
+
+  lines.push("## Navigation");
+  lines.push("- Travel hub: [[travel]]");
+  lines.push("- Trip index: [[travel_trip_history_log]]");
+  return lines.join("\n");
+}
+
+function main() {
+  const trips = collectTrips();
+  const records = buildAirlineRecords(trips);
+
+  let tripUpdates = 0;
+  for (const trip of trips) {
+    const current = trip.row.raw_md;
+    const updated = replaceFlightLinks(current, !!trip.summary.hasAnimal);
+    if (updated !== current) {
+      tripUpdates++;
+      if (!dryRun) {
+        ws.savePage(trip.id, updated, { editedBy: "travel-airlines-sync" });
+      }
+    }
+  }
+
+  let airlineCreates = 0;
+  for (const record of records) {
+    const raw = renderAirlinePage(record);
+    const existing = ws.getPage(record.pageId);
+    if (!existing || existing.raw_md !== raw) {
+      airlineCreates++;
+      if (!dryRun) {
+        ws.savePage(record.pageId, raw, { editedBy: "travel-airlines-sync" });
+      }
+    }
+  }
+
+  const currentIds = new Set(records.map((r) => r.pageId));
+  const staleAirlines = ws
+    .listPages({ type: "reference" })
+    .filter((r) => r.id.startsWith("travel_airline_") && !currentIds.has(r.id));
+  let airlineDeletes = 0;
+  if (!dryRun) {
+    for (const stale of staleAirlines) {
+      ws.deletePage(stale.id, { editedBy: "travel-airlines-sync" });
+      airlineDeletes++;
+    }
+  } else {
+    airlineDeletes = staleAirlines.length;
+  }
+
+  console.log(
+    JSON.stringify(
+      {
+        dryRun,
+        tripUpdates,
+        airlines: records.length,
+        airlineWrites: airlineCreates,
+        airlineDeletes,
+      },
+      null,
+      2,
+    ),
+  );
+}
+
+if (require.main === module) main();
+
+module.exports = { extractTripSummary, extractFlights, replaceFlightLinks, renderAirlinePage, buildAirlineRecords };

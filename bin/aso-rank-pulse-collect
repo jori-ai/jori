@@ -1,0 +1,265 @@
+#!/usr/bin/env python3
+# aso-rank-pulse-collect — deterministic daily keyword-rank pulse for the
+# installation's app (agent/local/config/marketing.json; OFF without it).
+#
+# For each (store, locale, keyword) in data/mkt-aso-target-keywords.json, search
+# the public App Store / Play Store and find the app's position (1-50 or None).
+# Updates mkt-aso-ranks-state.json with the current snapshot + a rolling
+# history per keyword + a list of notable changes since the last run.
+#
+# Silent collector: prints summary to stdout, exits 0 on success or 1/2 on
+# transient/hard failure (same exit codes as asc-api-call).
+#
+# Sources:
+#   iOS:     iTunes Search API (public, no auth) — itunes.apple.com/search
+#   Android: google-play-scraper Python package (in the configured `python` venv)
+
+import json, os, sys, time
+import urllib.parse, urllib.request, urllib.error
+
+_BIN = os.path.dirname(os.path.realpath(globals().get("__file__") or sys.argv[0]))
+sys.path.insert(0, os.path.join(os.path.dirname(_BIN), "lib"))
+import mkt_local  # noqa: E402
+
+CFG = mkt_local.config()
+TARGET_KW = mkt_local.data_path("mkt-aso-target-keywords.json")
+STATE_PATH = mkt_local.data_path("mkt-aso-ranks-state.json")
+LOCK_PATH = mkt_local.data_path("mkt-aso-rank-pulse.lock")
+PAUSE_PATH = mkt_local.data_path("mkt-aso-rank-pulse-pause.json")
+
+IOS_APP_ID = str(CFG.get("ios_app_id") or "")
+IOS_BUNDLE_ID = CFG.get("ios_bundle_id") or ""
+ANDROID_PACKAGE = CFG.get("android_package") or ""
+
+# Locale → (iOS country code, Play lang, Play country), from config.
+LOCALE_MAP = {k: tuple(v) for k, v in (CFG.get("locales") or {}).items()}
+
+# Throttle to be polite to free APIs. iTunes Search rate-limited at 0.6s
+# spacing on a first run (429 on the last locale after ~75 calls);
+# 1.2s held up. Play Store: 1.5s spacing is fine.
+ITUNES_DELAY_S = 1.2
+PLAY_DELAY_S = 1.5
+ITUNES_TIMEOUT_S = 15
+SEARCH_LIMIT = 50  # how deep to look for the app before declaring "not in top 50"
+
+UA = CFG.get("user_agent") or "aso-rank-pulse/1.0"
+TODAY = time.strftime("%Y-%m-%d", time.gmtime())
+
+# ---------- I/O ----------
+
+def acquire_lock():
+    if os.path.exists(LOCK_PATH):
+        # Stale lock? Check PID.
+        try:
+            pid = int(open(LOCK_PATH).read().strip())
+            os.kill(pid, 0)  # raises if dead
+            return False  # lock held by live PID
+        except (OSError, ValueError):
+            pass  # stale → take it
+    with open(LOCK_PATH, "w") as f:
+        f.write(str(os.getpid()))
+    return True
+
+
+def release_lock():
+    try:
+        os.unlink(LOCK_PATH)
+    except FileNotFoundError:
+        pass
+
+
+def load_state():
+    if os.path.exists(STATE_PATH):
+        try:
+            return json.load(open(STATE_PATH))
+        except Exception:
+            pass
+    return {
+        "version": 1,
+        "last_run": None,
+        "last_run_ok": None,
+        "ranks": {"ios": {}, "android": {}},
+        "rank_changes": [],
+        "errors": [],
+    }
+
+
+def save_state(state):
+    state["last_run"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    tmp = STATE_PATH + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(state, f, indent=2)
+    os.rename(tmp, STATE_PATH)
+
+
+# ---------- iOS rank ----------
+
+def itunes_search(term, country):
+    params = urllib.parse.urlencode({
+        "term": term,
+        "entity": "software",
+        "country": country,
+        "limit": SEARCH_LIMIT,
+        "media": "software",
+    })
+    url = "https://itunes.apple.com/search?" + params
+    req = urllib.request.Request(url, headers={"User-Agent": UA})
+    with urllib.request.urlopen(req, timeout=ITUNES_TIMEOUT_S) as resp:
+        return json.load(resp)
+
+
+def find_app_ios(results):
+    # Apple returns "results": [{trackId, bundleId, trackName, ...}, ...]
+    for i, r in enumerate(results.get("results", []), 1):
+        if (IOS_APP_ID and str(r.get("trackId")) == IOS_APP_ID) or (IOS_BUNDLE_ID and r.get("bundleId") == IOS_BUNDLE_ID):
+            return i
+    return None
+
+
+# ---------- Android rank ----------
+
+def play_search(term, lang, country):
+    # google_play_scraper.search returns a list of dicts with appId, title, score, ...
+    # KNOWN LIBRARY BUG: when Play Store returns no top result, the library
+    # raises `TypeError: 'NoneType' object is not subscriptable` from
+    # features/search.py line 41 instead of returning []. We swallow that
+    # specific error as "no results" so it's not counted as a real failure.
+    from google_play_scraper import search as gps_search
+    try:
+        return gps_search(term, lang=lang, country=country, n_hits=SEARCH_LIMIT)
+    except TypeError as e:
+        if "NoneType" in str(e) and "subscriptable" in str(e):
+            return []
+        raise
+
+
+def find_app_android(results):
+    for i, r in enumerate(results, 1):
+        if ANDROID_PACKAGE and r.get("appId") == ANDROID_PACKAGE:
+            return i
+    return None
+
+
+# ---------- diffing ----------
+
+def diff_and_update_rank(state, store, locale, keyword, new_rank):
+    bucket = state["ranks"].setdefault(store, {}).setdefault(locale, {})
+    entry = bucket.get(keyword)
+    if not entry:
+        entry = {"history": [], "first_seen_rank": new_rank, "first_seen_date": TODAY}
+        bucket[keyword] = entry
+    old_rank = entry.get("current_rank")
+    entry["current_rank"] = new_rank
+    # Cap history at 90 days (~3 months of daily samples)
+    entry["history"].append({"date": TODAY, "rank": new_rank})
+    if len(entry["history"]) > 90:
+        entry["history"] = entry["history"][-90:]
+    if old_rank != new_rank:
+        state["rank_changes"].append({
+            "date": TODAY,
+            "store": store,
+            "locale": locale,
+            "keyword": keyword,
+            "old": old_rank,
+            "new": new_rank,
+        })
+        # Cap rank_changes at last 500 (~1 month worth of churn)
+        if len(state["rank_changes"]) > 500:
+            state["rank_changes"] = state["rank_changes"][-500:]
+
+
+# ---------- main ----------
+
+def all_keywords(target):
+    out = []  # [(locale, keyword)]
+    for locale, tiers in target["keywords"].items():
+        for tier_name, kws in tiers.items():
+            for kw in kws:
+                out.append((locale, kw))
+    return out
+
+
+def main():
+    if not mkt_local.configured(CFG):
+        print(json.dumps({"ok": True, "skipped": "not configured (agent/local/config/marketing.json)"}))
+        return 0
+    if os.path.exists(PAUSE_PATH):
+        print(json.dumps({"ok": True, "skipped": "paused"}))
+        return 0
+    if ANDROID_PACKAGE:
+        mkt_local.ensure_modules("google_play_scraper")
+    if not acquire_lock():
+        print(json.dumps({"ok": False, "error": "locked"}))
+        return 1
+    try:
+        target = json.load(open(TARGET_KW))
+        state = load_state()
+        pairs = all_keywords(target)
+        ios_total = android_total = 0
+        ios_found = android_found = 0
+        ios_errs = android_errs = 0
+
+        # iOS
+        for locale, kw in (pairs if (IOS_APP_ID or IOS_BUNDLE_ID) else []):
+            if locale not in LOCALE_MAP:
+                continue
+            country, _, _ = LOCALE_MAP[locale]
+            ios_total += 1
+            try:
+                res = itunes_search(kw, country)
+                rank = find_app_ios(res)
+                diff_and_update_rank(state, "ios", locale, kw, rank)
+                if rank is not None:
+                    ios_found += 1
+            except Exception as e:
+                ios_errs += 1
+                state["errors"].append({
+                    "date": TODAY, "store": "ios", "locale": locale,
+                    "keyword": kw, "error": str(e)[:200],
+                })
+            time.sleep(ITUNES_DELAY_S)
+
+        # Android
+        for locale, kw in (pairs if ANDROID_PACKAGE else []):
+            if locale not in LOCALE_MAP:
+                continue
+            _, lang, country = LOCALE_MAP[locale]
+            android_total += 1
+            try:
+                res = play_search(kw, lang, country)
+                rank = find_app_android(res)
+                # Persist under iOS-style locale key for consistency
+                diff_and_update_rank(state, "android", locale, kw, rank)
+                if rank is not None:
+                    android_found += 1
+            except Exception as e:
+                android_errs += 1
+                state["errors"].append({
+                    "date": TODAY, "store": "android", "locale": locale,
+                    "keyword": kw, "error": str(e)[:200],
+                })
+            time.sleep(PLAY_DELAY_S)
+
+        # Trim errors to last 200
+        if len(state.get("errors", [])) > 200:
+            state["errors"] = state["errors"][-200:]
+
+        # ok if at least 80% of probes succeeded
+        success_rate = (ios_total + android_total - ios_errs - android_errs) / max(1, ios_total + android_total)
+        state["last_run_ok"] = success_rate >= 0.8
+
+        save_state(state)
+        summary = {
+            "ok": state["last_run_ok"],
+            "ios": {"total": ios_total, "found": ios_found, "errors": ios_errs},
+            "android": {"total": android_total, "found": android_found, "errors": android_errs},
+            "changes_this_run": sum(1 for c in state["rank_changes"] if c["date"] == TODAY),
+        }
+        print(json.dumps(summary, indent=2))
+        return 0 if state["last_run_ok"] else 1
+    finally:
+        release_lock()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

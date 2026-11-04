@@ -1,0 +1,118 @@
+#!/bin/bash
+# meeting-remind — the reminders around a recurring meeting's call, run from the
+# crontab lines bin/meeting-update schedules (tagged with the meeting's cron_tag).
+#
+# Usage: meeting-remind pre  "16:00" [--meeting <id>] [--dry-run] [--tz <IANA>] [--now <ISO>]
+#        meeting-remind prep "16:00" [--meeting <id>]
+#        meeting-remind post "16:00" [--meeting <id>] [--dry-run]
+#   pre   (T-15) the agenda: lib/meeting-reminder.mjs, sent with a tappable checklist.
+#   prep  (T-40) kicks the meeting's topics_agent (when it has one), whose topics the T-15 lists.
+#   post  (T+60..T+240) with Zoom set up, kicks the meeting's notes_agent
+#         (bin/meeting-notes-from-zoom, which sends the post-call message itself);
+#         without Zoom, or if the kick fails, sends the plain "anything to remember?" ask.
+# The meeting: --meeting, else $MEETING_ID, else the first in agent/local/config/meetings.json.
+# --dry-run prints instead of sending (no state/crontab change).
+
+source "$(dirname "$0")/../agent/scripts/lib/root.sh"
+KDIR="$(cd "$(dirname "$0")/.." && pwd)"
+
+TYPE="$1"
+MEETING_TIME="$2"
+shift; shift
+ARGS=(); MID="${MEETING_ID:-}"
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --meeting) MID="$2"; shift 2 ;;
+    *) ARGS+=("$1"); shift ;;
+  esac
+done
+set -- "${ARGS[@]}"
+
+eval "$("$JORI_NODE" "$KDIR/lib/meetings.mjs" env "$MID")"
+if [ "${MEETING_OK:-0}" != 1 ]; then
+  echo "meeting-remind: no recurring meeting configured${MID:+ as $MID} (agent/local/config/meetings.json); nothing to do" >&2
+  exit 0
+fi
+
+STATE_FILE="$MEETING_STATE"
+NOTES_FILE="$MEETING_NOTES"
+SEND="$JORI_INSTALL_TOOLS/bin/jori-send-curl"
+CRON_TAG="$MEETING_CRON_TAG"
+
+DRY_RUN=""; case " $* " in *" --dry-run "*) DRY_RUN=1 ;; esac
+deliver() { if [ -n "$DRY_RUN" ]; then cat; echo; else "$SEND"; fi; }
+LOG="$MEETING_LOG"; mkdir -p "$(dirname "$LOG")"; [ -n "$DRY_RUN" ] && LOG=/dev/stderr
+note() { echo "$(date -u +%FT%TZ) $*" >> "$LOG"; }
+
+# Remove this meeting's reminder lines (one-shot), installing only the crontab it read in full minus its tagged
+# lines: a failed or hung `crontab -l` piped into `crontab -` would wipe every job.
+cleanup_self() {
+  local old new n t m
+  old=$(/usr/bin/perl -e 'alarm shift; exec @ARGV' "${MEETING_CRONTAB_TIMEOUT:-20}" crontab -l 2>/dev/null) || { note "cleanup skipped: crontab -l failed"; return; }
+  new=$(printf '%s\n' "$old" | grep -vF -- "$CRON_TAG")
+  n=$(printf '%s\n' "$old" | grep -c ''); t=$(printf '%s\n' "$old" | grep -cF -- "$CRON_TAG"); m=$(printf '%s\n' "$new" | grep -c '')
+  if [ "$t" -eq 0 ] || [ -z "$new" ] || [ "$m" -ne $((n - t)) ]; then note "cleanup skipped: read $n lines, $t tagged, $m left"; return; fi
+  printf '%s\n' "$new" | crontab - || note "cleanup: crontab install failed"
+}
+
+mark_sent() {  # mark_sent <key>
+  "$JORI_NODE" -e '
+const fs = require("fs"); const [f, k] = process.argv.slice(1);
+const d = JSON.parse(fs.readFileSync(f, "utf8")); d[k] = true;
+fs.writeFileSync(f, JSON.stringify(d, null, 2) + "\n");' "$STATE_FILE" "$1" 2>/dev/null
+}
+
+case "$TYPE" in
+  pre)
+    # The agenda also rides as a tappable checklist (metadata.checklist) the app draws as boxes.
+    CHECKLIST=$(mktemp -t meeting-checklist.XXXXXX); trap 'rm -f "$CHECKLIST"' EXIT
+    MSG=$("$JORI_NODE" "$KDIR/lib/meeting-reminder.mjs" pre "$MEETING_TIME" --state "$STATE_FILE" --notes "$NOTES_FILE" \
+      --labels "$MEETING_LABELS" --topics "$MEETING_TOPICS" --name "$MEETING_NAME" --kind "$MEETING_CHECKLIST_KIND" \
+      --checklist-out "$CHECKLIST" "$@" 2>>"$LOG")
+    [ -n "$MSG" ] || MSG="📞 $MEETING_NAME in 15 min · $MEETING_TIME"
+    META=""
+    [ -s "$CHECKLIST" ] && META=$("$JORI_NODE" -e 'process.stdout.write(JSON.stringify({ checklist: require("fs").readFileSync(process.argv[1], "utf8") }))' "$CHECKLIST" 2>/dev/null)
+
+    if [ -n "$DRY_RUN" ]; then printf '%s' "$MSG" | deliver
+    elif [ -n "$META" ]; then printf '%s' "$MSG" | "$SEND" --metadata-json "$META"
+    else printf '%s' "$MSG" | deliver; fi
+    [ -n "$DRY_RUN" ] && exit 0
+    mark_sent pre_reminder_sent
+    ;;
+
+  prep)
+    # Group-chat topics for this call, read by the T-15 reminder: only when the meeting has a topics agent.
+    [ -n "$DRY_RUN" ] && { note "prep: dry run, no kick"; exit 0; }
+    [ -n "$MEETING_TOPICS_AGENT" ] || { note "prep: no topics agent for $MEETING_ID"; exit 0; }
+    source "$JORI_TOOLS/agent/scripts/lib/launchd-kick.sh"
+    if launchd_kick "$MEETING_TOPICS_AGENT" "$MEETING_ID-topics"; then note "prep: kicked $MEETING_TOPICS_AGENT"; else note "prep: $MEETING_TOPICS_AGENT kick failed"; fi
+    exit 0
+    ;;
+
+  post)
+    # Already sent for this call (Zoom's summary was folded in on an earlier run): just tidy up.
+    if [ -z "$DRY_RUN" ] && "$JORI_NODE" -e 'process.exit(JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")).post_reminder_sent ? 0 : 1)' "$STATE_FILE" 2>/dev/null; then
+      cleanup_self; exit 0
+    fi
+    # With Zoom set up, the post-call step is bin/meeting-notes-from-zoom, which folds Zoom's summary
+    # of the call into the notes and sends the message itself. It forks `claude -p`, so it runs as a
+    # launchd agent (cron cannot read the Max login). A kick that fails falls through to the plain ask.
+    ZOOM_SECRETS="$JORI_INSTALL/secrets/zoom-s2s.json"
+    if [ -z "$DRY_RUN" ] && [ -n "$MEETING_NOTES_AGENT" ] && { [ -f "$ZOOM_SECRETS" ] || grep -q '^ZOOM_CLIENT_SECRET=.' "$JORI_INSTALL/.env" 2>/dev/null; }; then
+      # shellcheck source=/dev/null
+      source "$JORI_TOOLS/agent/scripts/lib/launchd-kick.sh"
+      if launchd_kick "$MEETING_NOTES_AGENT" "$MEETING_ID-notes-zoom"; then note "post: kicked $MEETING_NOTES_AGENT"; exit 0; fi
+      note "post: $MEETING_NOTES_AGENT kick failed; sending the plain ask"
+    fi
+    printf '📝 %s call done\n\nAnything to remember from the call? Reply and I'\''ll add it to the notes.' "$MEETING_NAME" | deliver
+    [ -n "$DRY_RUN" ] && exit 0
+    mark_sent post_reminder_sent
+    # Both reminders done — clean up all of this meeting's cron entries
+    cleanup_self
+    ;;
+
+  *)
+    echo "usage: meeting-remind {pre|prep|post} <HH:MM> [--meeting <id>] [--dry-run]" >&2
+    exit 1
+    ;;
+esac

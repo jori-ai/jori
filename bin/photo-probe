@@ -1,0 +1,52 @@
+#!/usr/bin/env node
+// photo-probe — ask the phone for the photos it took during a window, instead
+// of waiting for iCloud to carry them to the host. Logic: lib/photo-probe.mjs.
+//
+// Usage:
+//   photo-probe request --visit <id> --start ISO --end ISO [--wait SEC] [--json]
+//   photo-probe status <probe-id> [--json]
+//   photo-probe list [--hours 24] [--json]
+// Log: data/photo-probe-log.jsonl (one row per request).
+
+import { probeForWindow, log, envValue, SUPABASE_URL } from "../lib/photo-probe.mjs";
+const argv = process.argv.slice(2);
+const arg = (n) => { const i = argv.indexOf(n); return i >= 0 ? argv[i + 1] : null; };
+const has = (n) => argv.includes(n);
+
+const key = () => envValue("SUPABASE_SERVICE_ROLE_KEY");
+async function get(pathQs) {
+  const k = key();
+  const r = await fetch(`${SUPABASE_URL}/rest/v1/${pathQs}`, { headers: { apikey: k, Authorization: `Bearer ${k}` } });
+  if (!r.ok) throw new Error(`supabase ${r.status}: ${(await r.text()).slice(0, 200)}`);
+  return r.json();
+}
+const print = (o) => process.stdout.write((has("--json") ? JSON.stringify(o) : JSON.stringify(o, null, 2)) + "\n");
+
+async function main() {
+  const cmd = argv[0];
+  if (cmd === "request") {
+    const visitId = arg("--visit"), start = arg("--start"), end = arg("--end");
+    if (!start || !end) throw new Error("request needs --start and --end");
+    const waitMs = Math.round(Number(arg("--wait") ?? 45) * 1000);
+    print(await probeForWindow({ visitId, start, end, waitMs }));
+  } else if (cmd === "status") {
+    const id = argv[1];
+    if (!id) throw new Error("status needs a probe id");
+    const [row] = await get(`photo_probes?id=eq.${encodeURIComponent(id)}&select=*`);
+    print(row || { error: "no such probe" });
+  } else if (cmd === "list") {
+    const hours = Number(arg("--hours") || 24);
+    const since = new Date(Date.now() - hours * 3600000).toISOString();
+    const rows = await get(`photo_probes?requested_at=gte.${encodeURIComponent(since)}&select=*&order=requested_at.desc&limit=200`);
+    if (has("--json")) return print(rows);
+    for (const r of rows)
+      console.log(`${r.requested_at}  ${r.status.padEnd(7)}  ${(r.visit_id || "-").slice(0, 8)}  `
+        + `${r.window_start}→${r.window_end}  photos=${r.photo_count ?? "-"}${r.error ? `  error=${r.error}` : ""}`);
+  } else {
+    console.error("usage: photo-probe request --visit <id> --start ISO --end ISO [--wait SEC] [--json]\n"
+      + "       photo-probe status <probe-id>\n       photo-probe list [--hours 24]");
+    process.exit(2);
+  }
+}
+
+main().catch((e) => { log({ cli_error: String(e.message || e) }); console.error(String(e.message || e)); process.exit(1); });

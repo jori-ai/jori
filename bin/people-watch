@@ -1,0 +1,157 @@
+#!/usr/bin/env node
+// people-watch — staying in touch with the people the user knows.
+//
+// Code side of jobs/people-watch.md: who is slipping away (from the email and
+// texts ledgers' contact dates), who is overdue a nudge, research snapshots
+// and the changes between them, the questions to the user (hum decision
+// cards, never acting on its own), and the `## Background` block on a person
+// page. See lib/people-watch.js.
+
+"use strict";
+
+const fs = require("node:fs");
+const pw = require("../lib/people-watch.js");
+
+const args = process.argv.slice(2);
+const cmd = args[0];
+
+function flag(name, def = undefined) {
+  const i = args.indexOf(`--${name}`);
+  if (i === -1) return def;
+  const next = args[i + 1];
+  if (next === undefined || next.startsWith("--")) return true;
+  return next;
+}
+
+function readArg(v) {
+  if (typeof v !== "string") return null;
+  return v.startsWith("@") ? fs.readFileSync(v.slice(1), "utf8") : v;
+}
+
+const day = (ms) => (ms ? new Date(ms).toISOString().slice(0, 10) : "-");
+const out = (x) => console.log(JSON.stringify(x, null, 2));
+
+function usage() {
+  console.log(`people-watch — stay in touch with people, asked first
+
+Read:
+  scan [--slipping] [--work] [--limit N] [--json]   contact rhythm per person page
+  show <wiki_id>                                    our row, open asks, latest snapshot, changes
+  stats
+  due-research [--limit N]                          tracked people due a web lookup (JSON)
+  words                                             answers given in the user's own words, to interpret (JSON)
+  drafts                                            "draft a note" picks waiting for a draft (JSON)
+
+Questions (hum decision cards, source "people"):
+  propose [--dry-run]       enqueue the due questions (≤${pw.MAX_OPEN} open), refresh the card file
+  apply                     import answers from the card file; exact option picks take effect
+
+Write:
+  decide <wiki_id> --note "<the user's words>" [--status tracking|declined|snoozed|unasked]
+         [--nudges 0|1] [--research 0|1] [--cadence DAYS] [--snooze-days N] [--ask <ask_id>] [--draft]
+  observe <wiki_id> --facts @file.json        record a research snapshot; prints the changes
+  write-section <wiki_id> [--summary @file]   replace the page's ## Background block
+  contact <wiki_id> --resource people/c<id>   link their Google Contacts card
+  drafted <ask_id>                            the draft for this pick was sent to the user`);
+}
+
+function main() {
+  switch (cmd) {
+    case "scan": {
+      let rows = pw.scan();
+      if (flag("slipping")) rows = rows.filter((r) => r.slipping);
+      if (flag("work")) rows = rows.filter((r) => r.works_with);
+      rows.sort((a, b) => (b.contact_days || 0) - (a.contact_days || 0));
+      const lim = Number(flag("limit", 0));
+      if (lim) rows = rows.slice(0, lim);
+      if (flag("json")) return out(rows);
+      for (const r of rows) {
+        console.log(
+          `${r.wiki_id.padEnd(34)} ${String(r.contact_days).padStart(4)}d  gap≈${r.typical_gap_days ?? "-"}  last ${day(r.last_at)}  quiet ${r.silence_days ?? "-"}d${r.slipping ? "  SLIPPING" : ""}${r.works_with ? "  work" : ""}  [${r.state.status}${r.state.nudges ? " nudges" : ""}${r.state.research ? " news" : ""}]`,
+        );
+      }
+      return;
+    }
+    case "show": {
+      const id = args[1];
+      if (!id) return usage();
+      const d = pw.db();
+      return out({
+        person: pw.getPerson(id),
+        contact: pw.contactUrl(pw.resolveContact(id)),
+        asks: d.prepare("SELECT id, kind, status, question, answer, asked_at, answered_at, action FROM asks WHERE wiki_id = ? ORDER BY asked_at DESC LIMIT 20").all(id),
+        snapshot: pw.latestSnapshot(id),
+        changes: d.prepare("SELECT * FROM changes WHERE wiki_id = ? ORDER BY observed_at DESC LIMIT 20").all(id),
+      });
+    }
+    case "stats":
+      return out(pw.stats());
+    case "due-research":
+      return out(pw.dueResearch({ limit: Number(flag("limit", 8)) }).map((p) => ({ ...p, contact: pw.contactUrl(pw.resolveContact(p.wiki_id)), snapshot: pw.latestSnapshot(p.wiki_id) })));
+    case "words":
+      pw.importAnswers();
+      return out(pw.wordsPending());
+    case "drafts":
+      return out(pw.draftsPending());
+    case "propose":
+      return out(pw.propose({ dryRun: Boolean(flag("dry-run")) }));
+    case "apply": {
+      const r = pw.importAnswers();
+      pw.exportAsks();
+      return out(r);
+    }
+    case "decide": {
+      const id = args[1];
+      if (!id || id.startsWith("--")) return usage();
+      const num = (n) => (flag(n) === undefined ? null : Number(flag(n)));
+      return out(
+        pw.decide(id, {
+          status: flag("status", null),
+          nudges: num("nudges"),
+          research: num("research"),
+          cadenceDays: num("cadence"),
+          snoozeDays: num("snooze-days"),
+          askId: flag("ask", null),
+          action: flag("draft") ? "draft" : null,
+          note: readArg(flag("note")),
+        }),
+      );
+    }
+    case "observe": {
+      const id = args[1];
+      const raw = readArg(flag("facts"));
+      if (!id || !raw) return usage();
+      return out(pw.observe(id, JSON.parse(raw)));
+    }
+    case "write-section": {
+      const id = args[1];
+      if (!id) return usage();
+      return out(pw.writeSection(id, readArg(flag("summary")) || ""));
+    }
+    case "contact": {
+      const id = args[1];
+      const res = flag("resource");
+      if (!id || typeof res !== "string" || !pw.contactUrl(res)) {
+        console.error("contact needs <wiki_id> --resource people/c<digits>");
+        process.exit(2);
+      }
+      pw.upsertPerson(id, { contact_resource: res });
+      return out({ wiki_id: id, contact: pw.contactUrl(res) });
+    }
+    case "drafted":
+      if (!args[1]) return usage();
+      return out({ updated: pw.markDrafted(args[1]) });
+    default:
+      usage();
+      process.exit(cmd ? 2 : 0);
+  }
+}
+
+try {
+  main();
+} catch (e) {
+  console.error(`people-watch: ${e?.message || e}`);
+  process.exit(1);
+} finally {
+  pw.closeDb();
+}

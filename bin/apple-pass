@@ -1,0 +1,115 @@
+#!/usr/bin/env bash
+# apple-pass <domain> [--stdout|--user|--user-stdout]
+#
+# Fetches a password (or username) from the Apple Passwords app for the
+# given domain. Defaults to placing the password on the clipboard.
+#
+#   --stdout         print password to stdout, then auto-clear clipboard
+#   --user           copy username to clipboard (instead of password)
+#   --user-stdout    print username to stdout, then auto-clear clipboard
+#
+# Requires: Passwords.app already unlocked.
+#
+# Safety: this script only sends keystrokes that target the search field
+# (Cmd+F focus, then text typing) and the Edit menu's Copy items. It
+# never sends Delete/Backspace or destructive keystrokes — accidentally
+# clearing or removing any password entry is not possible.
+# Side effect: the search field accumulates text across consecutive calls
+# (no clearing), so callers should clear the search themselves between
+# unrelated lookups by pressing Escape in the Passwords UI, or only call
+# apple-pass once per session.
+
+set -euo pipefail
+
+DOMAIN="${1:-}"
+MODE="${2:-clipboard}"
+if [[ -z "$DOMAIN" ]]; then
+  echo "usage: apple-pass <domain> [--stdout|--user|--user-stdout]" >&2
+  exit 64
+fi
+
+case "$MODE" in
+  --stdout)         FIELD="password"; OUT="stdout" ;;
+  --user)           FIELD="username"; OUT="clipboard" ;;
+  --user-stdout)    FIELD="username"; OUT="stdout" ;;
+  clipboard)        FIELD="password"; OUT="clipboard" ;;
+  *) echo "apple-pass: unknown flag '$MODE'" >&2; exit 64 ;;
+esac
+
+if [[ "$FIELD" == "username" ]]; then
+  MENU_ITEM="Copy User Name"
+else
+  MENU_ITEM="Copy Password"
+fi
+
+printf '' | pbcopy
+
+osascript - "$DOMAIN" "$MENU_ITEM" >/dev/null <<'AS'
+on run argv
+  set theDomain to item 1 of argv
+  set theMenuItem to item 2 of argv
+  tell application "Passwords" to activate
+  delay 1.0
+  tell application "System Events"
+    tell process "Passwords"
+      keystroke "f" using {command down}
+      delay 0.5
+      keystroke "a" using {command down} -- replace any stale search text
+      keystroke theDomain
+      delay 1.8
+      -- Select the first match. Down arrow from the search field stopped
+      -- selecting anything in the 2026 Passwords app (seen 2026-10-21), so try
+      -- several ways in turn until the Edit menu's Copy item is enabled.
+      set mi to menu item theMenuItem of menu "Edit" of menu bar 1
+      key code 125 -- Down arrow: step into filtered list
+      delay 0.6
+      if not (enabled of mi) then
+        key code 48 -- Tab into the list
+        delay 0.4
+        key code 125
+        delay 0.6
+      end if
+      if not (enabled of mi) then
+        try
+          set r to first row of (first outline of (first scroll area of (first splitter group of window 1)))
+          set selected of r to true
+          delay 0.6
+        end try
+      end if
+      if not (enabled of mi) then
+        try
+          set r to first row of (first table of (first scroll area of (first splitter group of window 1)))
+          set selected of r to true
+          delay 0.6
+        end try
+      end if
+      if not (enabled of mi) then
+        try
+          set c to first UI element of (first list of (first scroll area of (first splitter group of window 1)))
+          perform action "AXPress" of c
+          delay 0.6
+        end try
+      end if
+      click menu item theMenuItem of menu "Edit" of menu bar 1
+      delay 0.5
+    end tell
+  end tell
+end run
+AS
+
+VAL="$(pbpaste)"
+if [[ -z "$VAL" ]]; then
+  echo "apple-pass: clipboard empty — Passwords app may be locked, no entry matched '$DOMAIN', or the search field had stale text. Press Escape in Passwords.app and retry." >&2
+  exit 1
+fi
+
+case "$OUT" in
+  stdout)
+    printf '%s' "$VAL"
+    printf '' | pbcopy
+    ;;
+  clipboard)
+    LEN=${#VAL}
+    echo "apple-pass: ${LEN}-char ${FIELD} for '$DOMAIN' on clipboard" >&2
+    ;;
+esac

@@ -1,0 +1,53 @@
+#!/usr/bin/env node
+// reclassification-digest-gate — decides whether the weekly reclassification
+// digest needs an agent turn at all.
+//
+// The digest only proposes policy edits from PATTERNS, and a pattern needs at
+// least 2 corrections on one axis; the playbook's floor is 3 corrections in
+// the week. Below that the whole turn ended in a fixed one-line ping, so the
+// count — a COUNT of rows tagged `reclassified` (a machine tag ops-agent writes
+// with `email-mem add`) — is done here and the ping is sent from code.
+//
+// Exit 0 → dispatch the digest (≥ THRESHOLD corrections). Prints the count.
+// Exit 3 → below threshold. Prints the count and the window.
+// Exit 0 on ANY error → FAIL-OPEN (the agent turn decides as before).
+//
+// Usage: reclassification-digest-gate [--json]
+
+"use strict";
+
+const fs = require("node:fs");
+const path = require("node:path");
+const { DatabaseSync } = require("node:sqlite");
+
+const DB = process.env.RECLASS_GATE_DB || require("../lib/root.cjs").installTools("data/email-memory.db");
+const THRESHOLD = 3;
+const WINDOW_DAYS = 7;
+
+function failOpen(reason) {
+  console.error(`reclassification-digest-gate: fail-open (${reason})`);
+  process.exit(0);
+}
+
+function main() {
+  if (!fs.existsSync(DB)) failOpen(`no db at ${DB}`);
+  let count;
+  try {
+    const db = new DatabaseSync(DB, { readOnly: true });
+    // Tags are a comma-separated list; match the exact tag, not a substring.
+    const row = db.prepare(
+      `SELECT COUNT(*) AS n FROM memories
+        WHERE (',' || REPLACE(tags, ' ', '') || ',') LIKE '%,reclassified,%'
+          AND created_at >= datetime('now', ?)`
+    ).get(`-${WINDOW_DAYS} days`);
+    db.close();
+    count = Number(row && row.n) || 0;
+  } catch (e) { failOpen(e.message); }
+
+  const json = process.argv.includes("--json");
+  const out = { count, threshold: THRESHOLD, window_days: WINDOW_DAYS };
+  console.log(json ? JSON.stringify(out) : String(count));
+  process.exit(count >= THRESHOLD ? 0 : 3);
+}
+
+main();

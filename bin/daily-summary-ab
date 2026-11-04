@@ -1,0 +1,139 @@
+#!/usr/bin/env node
+"use strict";
+// daily-summary-ab — run the daily-summary fork at several effort levels on the
+// same date, side by side, without publishing anything, and report the
+// difference.
+//
+// Why: the fork runs `claude-sonnet-5 --effort xhigh`. Since Steps 2-3 and the
+// Step 4.5 checks moved into code, the session's remaining work is vetting chat
+// candidates, writing prose and the review rounds — plausibly fine at a lower
+// effort. That is a quality judgment, so it is measured before it is changed:
+// never lower the production effort blind.
+//
+//   daily-summary-ab run <YYYY-MM-DD> [--efforts xhigh,medium] [--out DIR]
+//       Sequentially runs `daily-summary-run <date> --dry-run --effort E
+//       --out DIR/E` for each effort (Steps 0-4.6 only: no confirm-venue
+//       write-back, no publish, no email/push), then writes the report.
+//       Default DIR: <install>/data/daily-summary-ab/<date>-<stamp>.
+//   daily-summary-ab report <DIR>
+//       (Re)builds DIR/report.md + DIR/report.json from the per-effort dirs.
+//
+// MUST run inside the GUI session (the fork is `claude -p` on the Max
+// subscription; from ssh/cron it prints "Not logged in"): launch it with
+//   job-run --name ds-ab -- <install>/bin/daily-summary-ab run YYYY-MM-DD
+// from an agent turn (or ask Jori in chat to run that command).
+// Each run takes the date's per-date lock, so it never overlaps a real build.
+//
+// The report is deterministic: cost/turns/duration, review verdict and finding
+// counts, stop headers, how many stops got confirmed/asked about, and every
+// stop's prose side by side. Reading the prose is the judgment — the report
+// puts it next to each other so a person can make it in two minutes.
+
+const fs = require("fs");
+const os = require("os");
+const path = require("path");
+const { spawnSync } = require("child_process");
+
+const RUN = path.join(__dirname, "daily-summary-run");
+
+const readJson = (p) => { try { return JSON.parse(fs.readFileSync(p, "utf8")); } catch { return null; } };
+const read = (p) => { try { return fs.readFileSync(p, "utf8"); } catch { return null; } };
+
+function headersOf(html) {
+  if (!html) return [];
+  return [...html.matchAll(/<h3[^>]*>([\s\S]*?)<\/h3>/g)]            // lang-regex-ok: parses our own generated HTML
+    .map((m) => m[1].replace(/<[^>]*>/g, "").replace(/\s+/g, " ").trim()); // lang-regex-ok: our own markup
+}
+
+const words = (s) => String(s || "").split(/\s+/).filter(Boolean).length; // lang-regex-ok: whitespace word count of our own output
+
+function summarize(dir, effort) {
+  const files = fs.existsSync(dir) ? fs.readdirSync(dir) : [];
+  const pick = (prefix) => files.find((f) => f.startsWith(prefix));
+  const metrics = readJson(path.join(dir, "metrics.json")) || {};
+  const prose = readJson(path.join(dir, pick("ds-prose-") || "_")) || {};
+  const confirmed = readJson(path.join(dir, pick("ds-confirmed-") || "_")) || {};
+  const review = readJson(path.join(dir, pick("ds-review-") || "_")) || {};
+  const manifest = readJson(path.join(dir, pick("ds-manifest-") || "_")) || {};
+  const html = read(path.join(dir, pick("daily-summary-") || "_"));
+  const sev = (s) => (review.findings || []).filter((f) => f.severity === s).length;
+  const proseMap = prose.prose || {};
+  return {
+    effort,
+    produced_report: !!html,
+    cost_usd: metrics.total_cost_usd ?? null,
+    turns: metrics.num_turns ?? null,
+    duration_min: metrics.duration_ms != null ? +(metrics.duration_ms / 60000).toFixed(1) : null,
+    is_error: !!metrics.is_error,
+    review_verdict: review.verdict || null,
+    findings_high: sev("high"), findings_medium: sev("medium"), findings_low: sev("low"),
+    confirmed_stops: Object.keys(confirmed).length,
+    questions: Object.keys(prose.questions || {}).length,
+    still_needs_review: (manifest.stops || []).filter((s) => s.needs_review).length,
+    prose_words: Object.values(proseMap).reduce((n, s) => n + words(s), 0),
+    headers: headersOf(html),
+    prose: proseMap,
+    asides: prose.asides || {},
+  };
+}
+
+function report(dir) {
+  const efforts = fs.readdirSync(dir).filter((d) => fs.statSync(path.join(dir, d)).isDirectory()).sort();
+  const runs = efforts.map((e) => summarize(path.join(dir, e), e));
+  const ids = [...new Set(runs.flatMap((r) => Object.keys(r.prose)))].sort((a, b) =>
+    String(a).localeCompare(String(b), undefined, { numeric: true }));
+  const cols = ["produced_report", "cost_usd", "turns", "duration_min", "review_verdict", "findings_high",
+    "findings_medium", "findings_low", "confirmed_stops", "questions", "still_needs_review", "prose_words"];
+  const lines = [];
+  lines.push(`# Daily-summary effort A/B — ${path.basename(dir)}`, "");
+  lines.push(`| metric | ${runs.map((r) => r.effort).join(" | ")} |`, `|---|${runs.map(() => "---").join("|")}|`);
+  for (const c of cols) lines.push(`| ${c} | ${runs.map((r) => (r[c] === null || r[c] === undefined ? "—" : String(r[c]))).join(" | ")} |`);
+  lines.push("", "## Stop headers", "");
+  const maxH = Math.max(0, ...runs.map((r) => r.headers.length));
+  lines.push(`| # | ${runs.map((r) => r.effort).join(" | ")} |`, `|---|${runs.map(() => "---").join("|")}|`);
+  for (let i = 0; i < maxH; i++) {
+    const cells = runs.map((r) => r.headers[i] || "—");
+    const same = cells.every((c) => c === cells[0]);
+    lines.push(`| ${i + 1}${same ? "" : " ≠"} | ${cells.map((c) => c.replace(/\|/g, "\\|")).join(" | ")} |`); // lang-regex-ok: escapes markdown table pipes in our own headers
+  }
+  lines.push("", "## Prose, stop by stop", "");
+  for (const id of ids) {
+    lines.push(`### ${id}`, "");
+    for (const r of runs) {
+      lines.push(`- **${r.effort}:** ${r.prose[id] || "_(none)_"}`);
+      if (r.asides[id]) lines.push(`  - aside: ${r.asides[id]}`);
+    }
+    lines.push("");
+  }
+  lines.push("## How to decide", "",
+    "Lower the production effort (`--effort` in `bin/daily-summary-run`) only if, over several dates, the lower effort",
+    "produces a report every time, its review verdict is no worse, it confirms about as many stops, and the prose reads as",
+    "well side by side. Cost and turns are the payoff; headers that differ (≠) are where to look first.");
+  fs.writeFileSync(path.join(dir, "report.md"), lines.join("\n") + "\n");
+  fs.writeFileSync(path.join(dir, "report.json"), JSON.stringify(runs.map(({ prose, asides, ...r }) => r), null, 2));
+  return path.join(dir, "report.md");
+}
+
+function main() {
+  const [cmd, a1, ...rest] = process.argv.slice(2);
+  const flag = (n, d) => { const i = rest.indexOf(n); return i >= 0 ? rest[i + 1] : d; };
+  if (cmd === "report" && a1) { process.stdout.write(report(a1) + "\n"); return; }
+  if (cmd === "run" && a1 && /^\d{4}-\d{2}-\d{2}$/.test(a1)) {  // lang-regex-ok: validates a YYYY-MM-DD argument
+    const efforts = flag("--efforts", "xhigh,medium").split(",").map((s) => s.trim()).filter(Boolean);
+    const stamp = new Date().toISOString().slice(0, 16).replace(/[:T]/g, ""); // lang-regex-ok: formats our own timestamp
+    const dir = flag("--out", path.join(require("../lib/root.cjs").installRoot(), "data/daily-summary-ab", `${a1}-${stamp}`));
+    fs.mkdirSync(dir, { recursive: true });
+    for (const e of efforts) {
+      process.stderr.write(`[daily-summary-ab] ${a1} effort=${e} …\n`);
+      const r = spawnSync(RUN, [a1, "--dry-run", "--effort", e, "--out", path.join(dir, e)],
+        { stdio: "inherit", timeout: 60 * 60 * 1000 });
+      if (r.status !== 0) process.stderr.write(`[daily-summary-ab] effort=${e} exited ${r.status}\n`);
+    }
+    process.stdout.write(report(dir) + "\n");
+    return;
+  }
+  process.stderr.write("usage: daily-summary-ab run <YYYY-MM-DD> [--efforts xhigh,medium] [--out DIR] | report <DIR>\n");
+  process.exit(2);
+}
+
+main();

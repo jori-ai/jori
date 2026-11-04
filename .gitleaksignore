@@ -2,3 +2,6 @@
 # Password is slated for rotation once the new build verifies; leaving this fingerprint
 # here so future scans don't re-flag the historical revision of SupabaseManager.swift.
 # The new HEAD does not contain the password (commit 583becb).
+
+# False positive: Google Calendar event id in a test fixture (`key: "4jeg1r…"`) trips generic-api-key.
+6224772e5ad20d035e9eefe63b5d4cb874ab59b3:tests/calendar-audit-group.test.mjs:generic-api-key:69

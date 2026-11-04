@@ -1,0 +1,550 @@
+#!/usr/bin/env node
+"use strict";
+// property-values — value the real-estate portfolio via the RentCast AVM and
+// write it to the property valuation tables (current, history, daily totals).
+//
+// WHY THIS EXISTS. Real estate is often the largest asset class a household
+// holds, and it never reports itself the way a brokerage or bank account does,
+// so its value has to be estimated before it can count in net worth. The
+// estimate is gross value; any mortgage debt is the net-worth reader's to
+// subtract.
+//
+// PARCELS, NOT UNITS. An AVM prices a parcel. The registry (`registry` in
+// agent/local/config/property-values.json, default data/properties.json) lists
+// `holdings` and `parcels`; a parcel's `units` never carry a value of their
+// own: summing per-unit estimates would overstate a multi-family.
+// No registry = nothing to value: the tool says so and exits 0.
+//
+// METERED, AND THAT SHAPES THE DESIGN. The free tier is 50 requests/month and a
+// request is spent whether or not the answer is useful. So:
+//   - one run costs at most `--max-calls` (default 20) and refuses to start a
+//     call that would exceed it;
+//   - usage is tracked per calendar month in data/rentcast-usage.json and
+//     the run stops rather than silently spending into a paid tier;
+//   - there is NO retry. A failed call has already been paid for.
+// Value-only is one call per owned parcel per run; with --rent it is two.
+//
+// JORI-MODEL-ONLY, same tier as the rest of the money stack.
+//
+// Usage:
+//   property-values                  value every owned parcel
+//   property-values --rent           also fetch long-term rent estimates (2x cost)
+//   property-values --all            include not-yet-closed parcels (awareness)
+//   property-values --only <id,...>  just these parcel ids
+//   property-values --dry-run        show what WOULD be called; spends nothing
+//   property-values --json           machine-readable summary
+//   property-values --max-calls N    hard ceiling for this run (default 20)
+//
+//   property-values --set <parcel_id>=<value> [--set ...] --source zillow
+//                                    record an externally-read valuation (e.g. a
+//                                    Zestimate read off the page by hand) as an
+//                                    independent source. Spends no API calls.
+//
+// MULTIPLE SOURCES, RECONCILED. Every opinion of value lands in the
+// per-source valuation table as its own row — rentcast, zillow, purchase — and the
+// holding's number is chosen from them (see reconcile()). Keeping them separate
+// is what makes the final figure auditable instead of a number of unknown
+// parentage.
+
+const fs = require("node:fs");
+const path = require("node:path");
+const rentcast = require("../lib/rentcast-api.js");
+const { request } = require("../lib/supabase-rest.js");
+const { localConfig, instance } = require("../lib/instance.cjs");
+const { installTools } = require("../lib/root.cjs");
+
+const CFG = localConfig("property-values", { registry: "data/properties.json", usage_file: "data/rentcast-usage.json", free_tier_monthly: 50 });
+
+const ARGV = process.argv.slice(2);
+const FLAGS = new Set(ARGV.filter((a) => a.startsWith("--")));
+const flagVal = (name, dflt) => {
+  const i = ARGV.indexOf(`--${name}`);
+  return i >= 0 && ARGV[i + 1] ? ARGV[i + 1] : dflt;
+};
+const DRY_RUN = FLAGS.has("--dry-run");
+const JSON_OUT = FLAGS.has("--json");
+const WANT_RENT = FLAGS.has("--rent");
+const INCLUDE_UNOWNED = FLAGS.has("--all");
+const ONLY = (flagVal("only", "") || "").split(",").map((s) => s.trim()).filter(Boolean);
+const MAX_CALLS = Number(flagVal("max-calls", "20"));
+// --set may repeat, so collect every occurrence rather than the first.
+const SETS = ARGV.reduce((acc, a, i) => {
+  if (a === "--set" && ARGV[i + 1]) {
+    const [id, raw] = ARGV[i + 1].split("=");
+    const v = Number(String(raw || "").replace(/[$,]/g, "")); // lang-regex-ok: stripping currency punctuation from a CLI number
+    if (id && Number.isFinite(v)) acc.push({ id, value: v });
+  }
+  return acc;
+}, []);
+const SET_SOURCE = flagVal("source", "zillow");
+
+const REGISTRY = path.resolve(installTools(), CFG.registry);
+const USAGE_FILE = path.resolve(installTools(), CFG.usage_file);
+const FREE_TIER_MONTHLY = Number(CFG.free_tier_monthly) || 50;
+
+function log(...a) { if (!JSON_OUT) console.log(...a); }
+const usd = (n) => (n == null || !Number.isFinite(Number(n)) ? "—" : `$${Math.round(Number(n)).toLocaleString("en-US")}`);
+const etDate = (d = new Date()) =>
+  new Intl.DateTimeFormat("en-CA", { timeZone: instance().tz, year: "numeric", month: "2-digit", day: "2-digit" }).format(d);
+
+// ── metered-usage ledger ────────────────────────────────────────────────────
+// Keyed by calendar month because that is how RentCast resets. Deliberately a
+// plain file rather than a DB table: the budget check must work even when
+// Supabase is unreachable, or the guard fails open into spending money.
+function readUsage() {
+  try { return JSON.parse(fs.readFileSync(USAGE_FILE, "utf8")); } catch { return {}; }
+}
+function monthKey(d = new Date()) { return etDate(d).slice(0, 7); }
+function usedThisMonth() { return Number(readUsage()[monthKey()] || 0); }
+function recordCalls(n) {
+  if (DRY_RUN || !n) return;
+  const u = readUsage();
+  u[monthKey()] = usedThisMonth() + n;
+  try { fs.writeFileSync(USAGE_FILE, JSON.stringify(u, null, 2)); }
+  catch (e) { console.error(`  (warning: could not record RentCast usage: ${e.message})`); }
+}
+
+function num(v) {
+  // The null guard is load-bearing: Number(null) is 0 and Number.isFinite(0) is
+  // true, so the first version stored every unknown acquisition price as $0 —
+  // which reads as "bought for nothing" and silently poisons any vs-paid
+  // comparison and the portfolio's total_acquisition.
+  if (v === null || v === undefined || v === "") return null;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
+}
+
+/**
+ * Is this AVM answer worth believing?
+ *
+ * RentCast publishes a confidence interval and it is the honest signal. In
+ * thin-transaction neighbourhoods it has served one record for several
+ * adjacent parcels (byte-identical estimates), or valued a unit as the whole
+ * building at a fraction of a recent arm's-length price with a low bound near
+ * zero. Those answers had interval widths over 100% of the estimate, while
+ * credible ones sat around 45–55%.
+ *
+ * So: an interval wider than 80% of the estimate is not a valuation, it is the
+ * model saying it does not know. Thin-transaction neighbourhoods do this.
+ */
+function isLowConfidence(value) {
+  const est = num(value && value.price);
+  const lo = num(value && value.priceRangeLow);
+  const hi = num(value && value.priceRangeHigh);
+  if (!est || lo == null || hi == null) return true;
+  return (hi - lo) / est > 0.8;
+}
+
+async function upsert(table, rows, conflict) {
+  if (DRY_RUN || !rows.length) return;
+  await request(`/rest/v1/${table}?on_conflict=${conflict}`, {
+    method: "POST",
+    body: rows,
+    prefer: "resolution=merge-duplicates,return=minimal",
+  });
+}
+
+/**
+ * Reconcile several opinions of value for ONE holding into a number plus a
+ * defensible reason for it.
+ *
+ * The rule, in order:
+ *   1. Discard sources that disqualified themselves (a RentCast interval wider
+ *      than 80% of its own estimate is the model saying it does not know).
+ *   2. If two or more credible sources survive, take the MEDIAN — not the mean,
+ *      because with three sources one wild outlier should not drag the answer,
+ *      and that is exactly the failure mode an AVM has in a thin market.
+ *   3. One credible source: use it, and say it stood alone.
+ *   4. None: fall back to what was actually paid. An arm's-length purchase IS a
+ *      market valuation, and for a recent one it beats any model.
+ *
+ * `spread` is reported whenever sources disagree, because two estimates $200k
+ * apart averaged into one number look far more confident than they are.
+ */
+function reconcile(sources, paid) {
+  const credible = sources.filter((x) => !x.low_confidence && num(x.estimate));
+  const vals = credible.map((x) => Number(x.estimate)).sort((a, b) => a - b);
+
+  if (vals.length >= 2) {
+    const mid = Math.floor(vals.length / 2);
+    const median = vals.length % 2 ? vals[mid] : Math.round((vals[mid - 1] + vals[mid]) / 2);
+    const spread = vals[vals.length - 1] - vals[0];
+    return {
+      value: median,
+      basis: `median_of_${vals.length}`,
+      contributors: credible.map((x) => x.source),
+      spread,
+      note: spread / median > 0.25 ? `sources disagree by ${usd(spread)}` : null,
+    };
+  }
+  if (vals.length === 1) {
+    return { value: vals[0], basis: `${credible[0].source}_only`, contributors: [credible[0].source], spread: 0, note: "single credible source" };
+  }
+  if (paid) {
+    return { value: paid, basis: "purchase_price", contributors: ["purchase"], spread: 0, note: "no credible estimate — held at cost" };
+  }
+  const anyEstimate = sources.map((x) => num(x.estimate)).filter((v) => v != null);
+  return anyEstimate.length
+    ? { value: Math.max(...anyEstimate), basis: "low_confidence_only", contributors: sources.map((x) => x.source), spread: 0, note: "no credible source and no purchase price" }
+    : { value: 0, basis: "none", contributors: [], spread: 0, note: "no valuation at all" };
+}
+
+/**
+ * Fold every recorded source into a per-holding number and write the totals.
+ *
+ * Reads sources back from the DB rather than using what this run just computed,
+ * so a Zestimate recorded hours earlier by `--set` counts exactly as much as a
+ * RentCast call made a second ago. Holding-level because the acquisition totals
+ * are per closing: one closing can cover several parcels without the
+ * settlement statement splitting the price between them.
+ */
+const SOURCE_MAX_AGE_DAYS = 45;
+
+async function computeTotals(registry, asOfDate, nowIso, writeTotals = true) {
+  const owned = registry.parcels.filter((p) => p.owned);
+  const ownedIds = new Set(owned.map((p) => p.id));
+  // The latest opinion from EACH source within SOURCE_MAX_AGE_DAYS, not just
+  // today's. Reading only today's rows made any reconcile on a day without
+  // fresh calls (net worth runs one on every invocation) find no sources and
+  // price the whole portfolio at cost: a large phantom "loss" that was only a
+  // missing join. Valuations refresh monthly, so 45 days always spans the
+  // latest run and never reaches back two.
+  const since = new Date(Date.parse(`${asOfDate}T00:00:00Z`) - SOURCE_MAX_AGE_DAYS * 86400000).toISOString().slice(0, 10);
+  const rows = (await request(
+    `/rest/v1/property_value_sources?select=parcel_id,source,estimate,low_confidence,as_of_date&as_of_date=gte.${since}&as_of_date=lte.${asOfDate}&order=as_of_date.desc`
+  ).catch(() => [])) || [];
+  const latest = new Map();
+  for (const r of rows) {
+    const k = `${r.parcel_id}|${r.source}`;
+    if (!latest.has(k)) latest.set(k, r); // rows arrive newest first
+  }
+  const all = [...latest.values()];
+  const sourcesFor = (id) => all.filter((x) => x.parcel_id === id);
+
+  const totals = registry.holding_acquisition_totals || {};
+  const byHolding = new Map();
+  for (const p of owned) {
+    if (!byHolding.has(p.holding)) byHolding.set(p.holding, []);
+    byHolding.get(p.holding).push(p);
+  }
+
+  const holdingValues = [];
+  for (const [holding, hp] of byHolding) {
+    // Reconcile per PARCEL, then sum — a holding's parcels are separate
+    // properties and one may have a good Zestimate while another does not.
+    const parts = hp.map((p) => {
+      const perParcelPaid = num(p.acquisition_price);
+      return { parcel: p.id, ...reconcile(sourcesFor(p.id), perParcelPaid) };
+    });
+    const anyFellBack = parts.some((x) => x.basis === "purchase_price" || x.basis === "low_confidence_only" || x.basis === "none");
+    const holdingPaid = num(totals[holding] && totals[holding].total);
+
+    // If ANY parcel of a holding had to fall back and the closing price is only
+    // known for the holding as a whole, price the whole holding at cost. Mixing
+    // a credible per-parcel estimate with a share of a closing total invented
+    // here would be a number nobody could defend.
+    if (anyFellBack && holdingPaid) {
+      holdingValues.push({
+        holding, value: holdingPaid, basis: "purchase_price",
+        contributors: ["purchase"], parts,
+        note: "at least one parcel had no credible estimate; holding priced at its closing total",
+      });
+    } else {
+      holdingValues.push({
+        holding,
+        value: parts.reduce((s2, x) => s2 + x.value, 0),
+        basis: parts.length === 1 ? parts[0].basis : "sum_of_parcels",
+        contributors: [...new Set(parts.flatMap((x) => x.contributors))],
+        parts,
+        note: parts.map((x) => x.note).filter(Boolean).join("; ") || null,
+      });
+    }
+  }
+
+  // Contracted-but-not-closed parcels are REPORTED and never counted: no
+  // current value before closing. They are a commitment, not an asset: the
+  // money is owed, the deed is not held, and a valuation before closing would
+  // be an opinion about something the user does not yet own. Carrying the contract price keeps the obligation visible without
+  // letting it inflate net worth.
+  const pending = registry.parcels
+    .filter((p) => !p.owned)
+    .map((p) => ({
+      parcel: p.id,
+      holding: p.holding,
+      address: p.address,
+      contract_price: num(p.acquisition_price),
+      note: p.note || null,
+    }));
+
+  const totalEstimate = holdingValues.reduce((s2, h) => s2 + h.value, 0);
+  const avmOnly = all
+    .filter((x) => x.source === "rentcast" && ownedIds.has(x.parcel_id))
+    .reduce((s2, x) => s2 + (Number(x.estimate) || 0), 0);
+
+  if (writeTotals && holdingValues.length) {
+    await upsert("property_value_totals", [{
+      as_of_date: asOfDate,
+      total_estimate: totalEstimate,
+      total_avm_only: avmOnly,
+      num_parcels: owned.length,
+      total_acquisition: Object.entries(totals).reduce((s2, [h, t]) => s2 + (byHolding.has(h) ? Number(t.total) || 0 : 0), 0)
+        + owned.reduce((s2, p) => s2 + (totals[p.holding] ? 0 : num(p.acquisition_price) || 0), 0),
+      basis_note: holdingValues.map((h) => `${h.holding}:${h.basis}`).join(","),
+      as_of: nowIso,
+      updated_at: nowIso,
+    }], "as_of_date");
+    // The per-parcel reconciled figure, so every reader prices a property with
+    // the SAME number the total is made of (a review that priced properties
+    // from RentCast alone while net worth used this total showed two very
+    // different figures for the same buildings). A holding priced at its
+    // closing total cannot be split honestly, so it is written once, under
+    // `holding:<name>`, and readers must not apportion it.
+    const reconciledRows = holdingValues.flatMap((h) => (h.basis === "purchase_price" && h.parts.length > 1
+      ? [{ parcel_id: `holding:${h.holding}`, holding: h.holding, value: h.value, basis: h.basis, contributors: h.contributors, note: h.note }]
+      : h.parts.map((x) => ({ parcel_id: x.parcel, holding: h.holding, value: x.value, basis: x.basis, contributors: x.contributors, note: x.note || null }))
+    )).map((r) => ({ as_of_date: asOfDate, ...r }));
+    await upsert("property_value_reconciled", reconciledRows, "as_of_date,parcel_id");
+  }
+  return { holdingValues, totalEstimate, avmOnly, pending };
+}
+
+function readRegistry() {
+  let raw;
+  try { raw = fs.readFileSync(REGISTRY, "utf8"); } catch { return null; }
+  const reg = JSON.parse(raw);
+  return { ...reg, parcels: Array.isArray(reg.parcels) ? reg.parcels : [] };
+}
+
+async function main() {
+  const registry = readRegistry();
+  if (!registry) {
+    // A capability with no registry is off, not broken.
+    log(`property-values: no property registry at ${REGISTRY} — nothing to value (set \`registry\` in agent/local/config/property-values.json).`);
+    if (JSON_OUT) console.log(JSON.stringify({ off: true, reason: "no registry", registry: REGISTRY }));
+    return;
+  }
+
+  // --set records an externally-read valuation (a Zestimate, a broker's number)
+  // and exits. Deliberately before the budget check: it spends no API call, so
+  // it must stay usable even when the RentCast quota is exhausted.
+  if (SETS.length) {
+    const known = new Set(registry.parcels.map((p) => p.id));
+    const bad = SETS.filter((x) => !known.has(x.id));
+    if (bad.length) {
+      console.error(`Unknown parcel id(s): ${bad.map((b) => b.id).join(", ")}`);
+      console.error(`Known: ${[...known].join(", ")}`);
+      process.exit(2);
+    }
+    const now = new Date();
+    const rows = SETS.map((x) => ({
+      as_of_date: etDate(now),
+      parcel_id: x.id,
+      source: SET_SOURCE,
+      estimate: x.value,
+      estimate_low: null,
+      estimate_high: null,
+      low_confidence: false,
+      note: "recorded by hand",
+      as_of: now.toISOString(),
+      updated_at: now.toISOString(),
+    }));
+    await upsert("property_value_sources", rows, "as_of_date,parcel_id,source");
+    for (const r of rows) log(`  recorded ${r.source}: ${r.parcel_id} = ${usd(r.estimate)}`);
+    log(`
+Re-run \`property-values --reconcile\` to fold these into the portfolio total.`);
+    return;
+  }
+
+  // --reconcile re-folds today's recorded sources without spending a call.
+  // The point of the split: recording a Zestimate must never cost RentCast quota.
+  if (FLAGS.has("--reconcile")) {
+    const now = new Date();
+    const { holdingValues, totalEstimate, avmOnly, pending } = await computeTotals(registry, etDate(now), now.toISOString(), !DRY_RUN);
+    for (const h of holdingValues) {
+      log(`  ${h.holding.padEnd(16)} ${usd(h.value).padStart(12)}  [${h.basis}${h.contributors.length ? " via " + h.contributors.join("+") : ""}]${h.note ? ` — ${h.note}` : ""}`);
+    }
+    log(`  ──\n  portfolio ${usd(totalEstimate)}  (pure-AVM would be ${usd(avmOnly)})`);
+    for (const q of pending) {
+      log(`\n  PENDING (not counted): ${q.address}`);
+      log(`      contracted at ${usd(q.contract_price)} — no valuation until it closes.`);
+    }
+    if (JSON_OUT) console.log(JSON.stringify({ holdings: holdingValues, total: totalEstimate, avm_only: avmOnly, pending }, null, 2));
+    return;
+  }
+
+  let parcels = registry.parcels.filter((p) => INCLUDE_UNOWNED || p.owned);
+  if (ONLY.length) parcels = parcels.filter((p) => ONLY.includes(p.id));
+  if (!parcels.length) {
+    log("No parcels selected.");
+    return;
+  }
+
+  const perParcel = WANT_RENT ? 2 : 1;
+  const planned = parcels.length * perParcel;
+  const used = usedThisMonth();
+
+  log(`RentCast budget: ${used}/${FREE_TIER_MONTHLY} used this month (${monthKey()}); this run plans ${planned} call(s).`);
+
+  if (planned > MAX_CALLS) {
+    console.error(
+      `Refusing: ${planned} calls exceeds --max-calls ${MAX_CALLS}. ` +
+        `Narrow with --only, drop --rent, or raise the ceiling deliberately.`
+    );
+    process.exit(1);
+  }
+  if (used + planned > FREE_TIER_MONTHLY) {
+    console.error(
+      `Refusing: ${used} + ${planned} would exceed the ${FREE_TIER_MONTHLY}/month free tier. ` +
+        `Wait for the reset, or run with --only for the parcels that matter.`
+    );
+    process.exit(1);
+  }
+
+  const rows = [];
+  const historyRows = [];
+  const now = new Date();
+  const nowIso = now.toISOString();
+  const asOfDate = etDate(now);
+  let calls = 0;
+  let failures = 0;
+
+  for (const p of parcels) {
+    if (DRY_RUN) {
+      log(`  would value: ${p.address}${WANT_RENT ? " (+ rent)" : ""}`);
+      continue;
+    }
+    let value = null;
+    let rent = null;
+    try {
+      value = await rentcast.valueEstimate({ address: p.address, propertyType: p.property_type });
+      calls++;
+    } catch (e) {
+      calls++; // a failed call is still a spent call
+      failures++;
+      if (rentcast.isQuotaOrAuthError(e)) {
+        recordCalls(calls);
+        console.error(`  ${p.address}: ${e.message}`);
+        console.error("  Stopping — key or quota problem, and retrying would spend more.");
+        process.exit(1);
+      }
+      // No retry, by design. Record what this parcel could not be valued for and
+      // keep going: one bad address must not cost the whole portfolio a month.
+      log(`  ${p.address}: value lookup failed — ${e.message.slice(0, 120)}`);
+      continue;
+    }
+
+    if (WANT_RENT) {
+      try {
+        rent = await rentcast.rentEstimate({ address: p.address, propertyType: p.property_type });
+        calls++;
+      } catch (e) {
+        calls++;
+        log(`  ${p.address}: rent lookup failed — ${e.message.slice(0, 100)}`);
+      }
+    }
+
+    const subj = (value && value.subjectProperty) || {};
+    rows.push({
+      parcel_id: p.id,
+      holding: p.holding,
+      address: p.address,
+      property_type: p.property_type || null,
+      owned: p.owned !== false,
+      estimate: num(value && value.price),
+      estimate_low: num(value && value.priceRangeLow),
+      estimate_high: num(value && value.priceRangeHigh),
+      rent_estimate: num(rent && rent.rent),
+      acquisition_price: num(p.acquisition_price),
+      acquisition_date: p.acquisition_date || null,
+      bedrooms: num(subj.bedrooms),
+      bathrooms: num(subj.bathrooms),
+      square_footage: num(subj.squareFootage),
+      comparable_count: Array.isArray(value && value.comparables) ? value.comparables.length : null,
+      low_confidence: isLowConfidence(value),
+      as_of: nowIso,
+      updated_at: nowIso,
+    });
+    historyRows.push({
+      as_of_date: asOfDate,
+      parcel_id: p.id,
+      estimate: num(value && value.price),
+      rent_estimate: num(rent && rent.rent),
+      as_of: nowIso,
+      updated_at: nowIso,
+    });
+
+    const delta =
+      p.acquisition_price && value && value.price
+        ? ` (${value.price >= p.acquisition_price ? "+" : "−"}${usd(Math.abs(value.price - p.acquisition_price))} vs paid)`
+        : "";
+    log(`  ${p.address}\n      ${usd(value && value.price)}  [${usd(value && value.priceRangeLow)}–${usd(value && value.priceRangeHigh)}]${delta}${rent && rent.rent ? `  · rent ~${usd(rent.rent)}/mo` : ""}`);
+  }
+
+  recordCalls(calls);
+
+  if (DRY_RUN) {
+    log(`\n(dry-run — ${planned} call(s) would have been spent, nothing written)`);
+    return;
+  }
+
+  // Never write a total from a partial run: a failed parcel would silently make
+  // the portfolio look smaller, and that number feeds net worth.
+  const ownedRows = rows.filter((r) => r.owned);
+  const complete = failures === 0;
+  if (rows.length) {
+    await upsert("property_values", rows, "parcel_id");
+    await upsert("property_value_history", historyRows, "as_of_date,parcel_id");
+  }
+
+  // Every opinion of value becomes its own row first, so the reconciliation
+  // below reads from ONE place and a Zestimate recorded by hand competes on
+  // equal footing with the AVM.
+  const sourceRows = rows.map((r) => ({
+    as_of_date: asOfDate,
+    parcel_id: r.parcel_id,
+    source: "rentcast",
+    estimate: r.estimate,
+    estimate_low: r.estimate_low,
+    estimate_high: r.estimate_high,
+    low_confidence: r.low_confidence,
+    note: r.low_confidence ? "confidence interval wider than 80% of the estimate" : null,
+    as_of: nowIso,
+    updated_at: nowIso,
+  }));
+  await upsert("property_value_sources", sourceRows, "as_of_date,parcel_id,source");
+
+  const { holdingValues, totalEstimate } = await computeTotals(registry, asOfDate, nowIso, complete);
+
+  const summary = {
+    as_of: nowIso,
+    as_of_date: asOfDate,
+    parcels_valued: rows.length,
+    parcels_failed: failures,
+    owned_total_estimate: totalEstimate,
+    holdings: holdingValues,
+    total_rent_estimate: ownedRows.reduce((s, r) => s + (r.rent_estimate || 0), 0),
+    calls_spent: calls,
+    calls_used_this_month: usedThisMonth(),
+    totals_written: complete,
+  };
+
+  if (JSON_OUT) console.log(JSON.stringify(summary, null, 2));
+  else {
+    log(`  ──`);
+    for (const h of holdingValues) {
+      log(`  ${h.holding.padEnd(16)} ${usd(h.value).padStart(12)}  [${h.basis}${h.contributors.length ? " via " + h.contributors.join("+") : ""}]${h.note ? ` — ${h.note}` : ""}`);
+    }
+    log(`  ${ownedRows.length} owned parcel(s), portfolio ${usd(totalEstimate)}`);
+    if (!complete) log(`  ⚠ ${failures} parcel(s) failed — portfolio total NOT written (a partial total would understate net worth).`);
+    log(`  ${calls} call(s) spent; ${usedThisMonth()}/${FREE_TIER_MONTHLY} used this month.`);
+  }
+}
+
+module.exports = { reconcile, isLowConfidence, num };
+
+if (require.main === module) {
+  main().catch((e) => {
+    console.error(`property-values: ${e && e.message ? e.message : e}`);
+    process.exit(1);
+  });
+}

@@ -1,0 +1,160 @@
+#!/usr/bin/env node
+// act-watch — weekly watch for named touring acts near home, as code, no model.
+//
+// Sources (agent/local/config/act-watch.json, or its private acts_file):
+//   - Ticketmaster Discovery attractions (`tm.attractions[]`: act slug, label,
+//     attraction id) within `tm.radius_mi` of `tm.latlong`;
+//   - schedule pages (`sources[]`: {kind, ...}), each read by a hook module in
+//     lib/act-watch/_ext/ (a site's own markup is private code, not the kernel's).
+// Then: horizon window, merge one item per act+venue+date, dedup against the
+// seen file, the travel gate on every date, ONE email, and a phone pointer +
+// push only while the user is in the watch's metro today.
+//
+//   act-watch [--dry-run [--html-out <file>]]
+//
+// Config keys: acts_file (repo-relative private JSON holding any of the keys
+// below), tm {latlong, radius_mi, attractions[]}, sources[], horizon_days,
+// metro (the travel metro dates are gated on; none = no gate), seen_file,
+// subject ("<subject>: N new"), intent, gmail_label. No sources configured:
+// nothing runs (off, not broken).
+//
+// geo-gate-ok: every candidate date goes through `travel in-city <metro> <date>`
+// (fails open) before it can be delivered. The watch runs while the user is
+// away too; away TODAY, the email goes out but the phone pointer/push does not.
+
+import fs from "node:fs";
+import path from "node:path";
+import { createRequire } from "node:module";
+import { tmRow, inWindow, mergeRows, groupRuns, renderEmail, hookText, cityDate, loadKinds } from "../lib/act-watch.mjs";
+import { sendHtmlEmail, labelDigest, pointerAndPush, ogCards, escapeHtml, inCity, todayLocal } from "../lib/digest-deliver.mjs";
+import { loadEnv } from "../lib/tickets/config.mjs";
+
+const require = createRequire(import.meta.url);
+const { localConfig } = require("../lib/instance.cjs");
+const { REPO_ROOT } = require("../lib/root.cjs");
+
+const UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0 Safari/537.36";
+const DRY = process.argv.includes("--dry-run");
+const log = (...a) => console.log(`[${new Date().toISOString()}]`, ...a);
+const readJson = (f, d) => { try { return JSON.parse(fs.readFileSync(f, "utf8")); } catch { return d; } };
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const repoPath = (p) => (path.isAbsolute(p) ? p : path.join(REPO_ROOT, p));
+
+/** The watch config: local config over its private acts_file. */
+export function actConfig(cfg = localConfig("act-watch", { acts_file: null })) {
+  const file = cfg.acts_file ? readJson(repoPath(cfg.acts_file), {}) || {} : {};
+  const pick = (k, d) => cfg[k] ?? file[k] ?? d;
+  return {
+    tm: pick("tm", null), sources: pick("sources", []), horizon_days: pick("horizon_days", 120),
+    metro: pick("metro", null), seen_file: pick("seen_file", "data/act-watch-seen.json"),
+    subject: pick("subject", "Acts near you"), intent: pick("intent", "act-watch"), gmail_label: pick("gmail_label", "personal"),
+  };
+}
+
+// A source failure is logged in the skill-health convention so the nightly
+// check (and the same-day repair loop) can attribute it.
+const sourceFail = (skill, action, error, diagnostic) =>
+  console.log(JSON.stringify({ ts: new Date().toISOString(), skill, action, error, diagnostic }));
+
+async function getText(url) {
+  const r = await fetch(url, { headers: { "User-Agent": UA, Accept: "text/html" }, signal: AbortSignal.timeout(30_000) });
+  if (!r.ok) throw new Error(`HTTP ${r.status}`);
+  return r.text();
+}
+
+async function ticketmaster(cfg, today, horizonDays) {
+  if (!cfg?.attractions?.length) return [];
+  loadEnv();
+  const key = process.env.TICKETMASTER_CONSUMER_KEY || process.env.TICKETMASTER_API_KEY;
+  if (!key) { sourceFail("ticketmaster", "discovery", "no_api_key", "TICKETMASTER_CONSUMER_KEY missing from .env"); return []; }
+  const out = [];
+  for (const act of cfg.attractions) {
+    try {
+      const url = new URL("https://app.ticketmaster.com/discovery/v2/events.json");
+      url.search = new URLSearchParams({ apikey: key, attractionId: act.attraction_id, latlong: cfg.latlong, radius: String(cfg.radius_mi), unit: "miles", size: "200", sort: "date,asc" }).toString();
+      const r = await fetch(url, { signal: AbortSignal.timeout(30_000) });
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      const evs = (await r.json())._embedded?.events || [];
+      const rows = inWindow(evs.map((e) => tmRow(e, act)), { today, horizonDays }).filter((x) => x.status !== "cancelled");
+      log(`ticketmaster ${act.act}: ${evs.length} events in radius, ${rows.length} in window`);
+      out.push(...rows);
+    } catch (e) {
+      sourceFail("ticketmaster", "discovery", "fetch_failed", `${act.act}: ${e.message}`);
+    }
+    await sleep(250); // TM allows 5 req/s
+  }
+  return out;
+}
+
+async function schedulePages(sources, today, horizonDays) {
+  if (!sources.length) return { rows: [], banners: [] };
+  const kinds = await loadKinds({ log });
+  const ctx = { today, horizonDays, log, sourceFail, inWindow, getText };
+  const rows = [], banners = [];
+  await Promise.all(sources.map(async (src) => {
+    const fn = kinds[src.kind];
+    if (!fn) { sourceFail("act-watch", src.kind, "unknown_kind", `no hook module exports kind ${src.kind}`); return; }
+    try {
+      const res = (await fn(src, ctx)) || {};
+      rows.push(...(res.rows || []));
+      if (res.banner) banners.push(res.banner);
+    } catch (e) { sourceFail("act-watch", src.kind, "fetch_failed", e.message); }
+  }));
+  return { rows, banners };
+}
+
+async function main() {
+  const cfg = actConfig();
+  if (!cfg.tm?.attractions?.length && !cfg.sources.length) { log("no acts configured (agent/local/config/act-watch.json) — off"); return; }
+  const STATE = repoPath(cfg.seen_file);
+  const today = todayLocal();
+  const here = (date) => !cfg.metro || inCity(cfg.metro, date);
+  const state = readJson(STATE, { last_run: "", seen: [] });
+  state.seen ||= [];
+  const seenIds = new Set(state.seen.map((s) => s.id));
+  const seenCd = new Set(state.seen.filter((s) => s.date).map((s) => cityDate(s.city, s.date)));
+
+  const [tm, pages] = await Promise.all([ticketmaster(cfg.tm, today, cfg.horizon_days), schedulePages(cfg.sources, today, cfg.horizon_days)]);
+  const fresh = mergeRows([...tm, ...pages.rows]).filter((r) => !seenIds.has(r.id) && !seenCd.has(cityDate(r.city, r.date)));
+  const kept = fresh.filter((r) => here(r.date));
+  if (kept.length < fresh.length) log(`travel gate dropped ${fresh.length - kept.length} date(s)`);
+  const banner = pages.banners.find((b) => b.id && !seenIds.has(b.id)) || null;
+
+  state.last_run = new Date().toISOString();
+  if (!kept.length && !banner) {
+    log("nothing new — silent");
+    if (!DRY) fs.writeFileSync(STATE, JSON.stringify(state, null, 2) + "\n");
+    return;
+  }
+
+  const groups = groupRuns(kept);
+  const urls = [...new Set(groups.map((g) => g[0].url).filter(Boolean))];
+  const cardHtml = DRY ? [] : ogCards(urls);
+  const cards = new Map(urls.map((u, i) => [u, cardHtml[i] || ""]));
+  const html = renderEmail({ groups, banner, cards, escapeHtml });
+  const n = groups.length + (banner ? 1 : 0);
+  const subject = `${cfg.subject}: ${n} new`;
+  const hook = hookText(groups, banner);
+
+  if (DRY) {
+    const out = process.argv.includes("--html-out") ? process.argv[process.argv.indexOf("--html-out") + 1] : null;
+    if (out) { fs.writeFileSync(out, html); log(`DRY: email HTML written to ${out}`); }
+    log(`DRY: would send "${subject}" — ${hook}`);
+    for (const g of groups) log(`  ${g[0].act} | ${g[0].venue}, ${g[0].city} ${g[0].state} | ${g.map((x) => x.date).join(", ")}`);
+    return;
+  }
+
+  try { sendHtmlEmail({ subject, html }); } catch (e) { log(`email send failed: ${e.message} — nothing marked seen`); process.exitCode = 1; return; }
+  const id = await labelDigest(subject, { label: cfg.gmail_label, log });
+  if (!id) log("sent but not found in Gmail to label");
+  if (here(today)) pointerAndPush({ pointer: hook, push: `${subject} — check email`, intent: cfg.intent });
+  else log("away from the watch's metro today — email only, no pointer/push");
+
+  const now = new Date().toISOString();
+  for (const r of kept) state.seen.push({ id: r.id, act: r.act, venue: r.venue, city: r.city, date: r.date, mechanism: r.mechanism || "on-sale", url: r.url, first_seen: now });
+  if (banner) state.seen.push({ id: banner.id, act: banner.act || null, mechanism: banner.mechanism || "notice", url: banner.url, first_seen: now });
+  fs.writeFileSync(STATE, JSON.stringify(state, null, 2) + "\n");
+  log(`delivered ${n} item(s)`);
+}
+
+if (process.argv[1]?.endsWith("act-watch")) main().catch((e) => { log(`fatal: ${e.stack || e.message}`); process.exitCode = 1; });

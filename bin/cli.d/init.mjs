@@ -16,6 +16,8 @@ import crypto from "node:crypto";
 import readline from "node:readline";
 import { CHECKOUT, readJson, isHelp } from "./_common.mjs";
 import { sendInstallPing } from "./_telemetry.mjs";
+import { createRequire } from "node:module";
+const { port: registryPort } = createRequire(import.meta.url)("../../lib/ports.cjs");
 
 const RUNTIME_DIRS = [
   "data", "data/hum-cache", "data/logs", "data/watchdog-incidents", "logs",
@@ -101,6 +103,10 @@ export default {
       inst.agent_email = await ask("From: address for mail the agent sends (optional)", existing.agent_email || "");
       inst.tz = await ask("Home time zone (IANA)", existing.tz || hostTz());
       inst.github_owner = await ask("GitHub user or org that owns your fork (optional)", existing.github_owner || "");
+      inst.home_city = await ask("Your home city, in words (optional)", existing.home_city || "");
+      inst.partner_name = await ask("A partner the assistant also acts for, first name (optional)", existing.partner_name || "");
+      inst.assistant_name = await ask("What should the assistant be called?", existing.assistant_name || "Jori");
+      for (const k of ["home_city", "partner_name"]) if (!inst[k]) delete inst[k];
 
       console.log(c.bold("\n  Webhook channel"));
       const token = crypto.randomBytes(32).toString("hex");
@@ -115,7 +121,6 @@ export default {
         anonKey = await ask("Supabase anon (public) key", "");
       }
       env.OLLAMA_URL = await ask("OLLAMA_URL", "http://127.0.0.1:11434");
-      env.LOCAL_LLM_MODEL = await ask("LOCAL_LLM_MODEL", "gemma3:1b");
       env.LOCAL_EMBED_MODEL = await ask("LOCAL_EMBED_MODEL", "nomic-embed-text");
 
       let telemetry = "off";
@@ -173,6 +178,8 @@ export default {
         for (const s of seeded) console.log(c.dim("      " + s));
       }
       console.log(c.dim("\nNext: ") + c.bold("./bin/jori doctor") + c.dim(", then ") + c.bold("./bin/jori up"));
+      console.log(c.dim("Then open the control room's Setup page, which lists what each feature still needs:"));
+      console.log("  " + c.bold(`http://127.0.0.1:${registryPort("wiki")}/control#setup`) + c.dim(" (or this machine's tailnet name instead of 127.0.0.1)"));
       console.log(c.dim("Per-installation rules and config: docs/architecture-public-private.md."));
 
       if (telemetry === "on") {

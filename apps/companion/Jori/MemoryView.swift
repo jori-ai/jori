@@ -1,50 +1,87 @@
 import SwiftUI
 import WebKit
 
-/// Embedded browser for the Jori memory wiki served at
-/// `http://${JORI_HOST}:9096` (reachable over Tailscale or home LAN).
+/// Embedded browser for the Jori memory wiki served from the host at the
+/// build's JORI_WIKI_URL (reachable over Tailscale or the home LAN).
 /// Designed to swap into the chat window's main content area — the parent
 /// owns the surrounding NavigationStack/title/toolbar so the user can switch
 /// back to a chat channel from the same menu that opened Memory.
 struct MemoryView: View {
-    let url: URL
+    let url: URL?
     @ObservedObject var state: WebViewState
 
     var body: some View {
+        if let url {
+            browser(url)
+        } else {
+            VStack(spacing: 12) {
+                Image(systemName: "book.closed")
+                    .font(.system(size: 34, weight: .light))
+                    .foregroundStyle(.secondary)
+                Text("No wiki configured")
+                    .font(JoriTheme.display(22))
+                Text("This build has no wiki address (JORI_WIKI_URL in the installation's build configuration).")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+                    .frame(maxWidth: 360)
+            }
+            .padding(24)
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
+    }
+
+    private func browser(_ url: URL) -> some View {
         ZStack(alignment: .top) {
             WebView(initialURL: url, state: state)
             if state.isLoading {
                 ProgressView()
                     .progressViewStyle(.linear)
+                    .tint(JoriTheme.cobalt)
                     .frame(maxWidth: .infinity)
+                    .transition(.opacity)
             }
             if let err = state.loadError {
                 errorOverlay(err)
+                    .transition(.opacity)
             }
         }
+        .animation(.easeOut(duration: 0.2), value: state.isLoading)
+        .animation(.easeOut(duration: 0.25), value: state.loadError)
     }
 
     @ViewBuilder
     private func errorOverlay(_ message: String) -> some View {
         VStack(spacing: 12) {
             Image(systemName: "wifi.exclamationmark")
-                .font(.largeTitle)
+                .font(.system(size: 34, weight: .light))
                 .foregroundStyle(.secondary)
-            Text("Can't reach the wiki")
-                .font(.headline)
+                .symbolEffect(.pulse, options: .repeating)
+            Text("Can’t reach the wiki")
+                .font(JoriTheme.display(22))
+            Text("Connect Tailscale or join the home network, then try again.")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+                .frame(maxWidth: 360)
             Text(message)
                 .font(.caption)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(.tertiary)
                 .multilineTextAlignment(.center)
-                .padding(.horizontal, 24)
-            Text("Make sure Tailscale is connected or you're on the home network.")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .multilineTextAlignment(.center)
-                .padding(.horizontal, 24)
-            Button("Retry") { state.reload() }
-                .buttonStyle(.borderedProminent)
+                .frame(maxWidth: 360)
+            Button {
+                state.reload()
+            } label: {
+                Label("Try Again", systemImage: "arrow.clockwise")
+                    .padding(.horizontal, 6)
+            }
+            .controlSize(.large)
+            .prominentButtonStyle()
+            .buttonBorderShape(.capsule)
+            .keyboardShortcut(.defaultAction)
+            .padding(.top, 6)
         }
+        .padding(24)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(.regularMaterial)
     }
@@ -149,5 +186,15 @@ private class WebViewCoordinator: NSObject, WKNavigationDelegate {
 
     func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
         Task { @MainActor in state.loadError = error.localizedDescription }
+    }
+
+    /// The out-of-process WebKit renderer was killed (iOS reaps it under
+    /// memory pressure, or after the app sits backgrounded for a while).
+    /// None of the other delegate methods above fire when this happens, so
+    /// without an explicit reload the view is left permanently blank —
+    /// no error card, no spinner, nothing — because `loadError`/`isLoading`
+    /// just keep whatever value they had before the process died.
+    func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
+        Task { @MainActor in webView.reload() }
     }
 }

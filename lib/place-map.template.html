@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>place map</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<style>
+  /* EVERYTHING IS SIZED IN vw, DELIBERATELY.
+
+     This is rendered by headless Chrome and shown in a chat bubble at a fixed
+     ~260pt, so what matters is not "how many pixels" but "what fraction of the
+     frame" — 14px type is legible in a 400px frame and unreadable in an 800px
+     one. Sizing in vw makes the design identical at any capture size.
+
+     It is also the only thing that survives Chrome's window sizing. Measured:
+     `--window-size=400,320 --force-device-scale-factor=3` lays the page out at
+     500 CSS px and captures 1200 px. Neither number is the one you asked for,
+     and a px-sized footer laid out at 500 and displayed at 260 loses its
+     right-hand column off the edge. vw is indifferent to all of it.
+
+     Single light style on purpose: it ships as a PNG, so it cannot respond to
+     the viewer's theme. The CARTO light basemap reads fine on both. */
+  *{box-sizing:border-box}
+  html,body{margin:0;height:100%;width:100%;overflow:hidden;background:#fff}
+  body{font:1em/1.4 ui-sans-serif,-apple-system,"Segoe UI",Roboto,sans-serif;
+    color:#17160f;display:flex;flex-direction:column;height:100vh}
+  #map{flex:1;min-height:0;background:#eeece6}
+  footer{flex:none;display:flex;align-items:baseline;gap:2vw;
+    padding:2.2vw 3vw 2.6vw;border-top:0.25vw solid #e3e1d9;background:#fff}
+  /* The name yields, the distance never does. min-width:0 is what actually lets
+     a flex item shrink — without it a long title pushes the distance out of
+     frame instead of ellipsising itself. */
+  footer b{font-size:4.2vw;font-weight:650;letter-spacing:-.01em;flex:1;min-width:0;
+    white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  footer span{font-size:3.6vw;color:#6d6b61;font-variant-numeric:tabular-nums;
+    flex:none;white-space:nowrap}
+  /* The subject pin. A teardrop rather than a dot, so it never reads as a
+     second "you are here". */
+  .pin{width:6.5vw;height:6.5vw;border-radius:50% 50% 50% 0;transform:rotate(-45deg);
+    background:#c2622c;border:0.7vw solid #fff;box-shadow:0 0.2vw 1vw rgba(0,0,0,.35)}
+  /* The user's position: the familiar blue dot with a soft accuracy halo. */
+  .me{width:4vw;height:4vw;border-radius:50%;background:#3b5f9e;border:0.7vw solid #fff;
+    box-shadow:0 0 0 2.2vw rgba(59,95,158,.17),0 0.2vw 0.8vw rgba(0,0,0,.3)}
+  .leaflet-container{font:inherit;background:#eeece6}
+  .leaflet-control-attribution{font-size:2.2vw;background:rgba(255,255,255,.72)}
+</style>
+</head>
+<body>
+<div id="map"></div>
+<footer><b>__LABEL__</b><span>__DISTANCE__</span></footer>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+  const FROM = __FROM__, TO = __TO__;
+  // The vw-sized markers need their icon boxes to match, and Leaflet takes
+  // those in pixels — so resolve one vw here rather than hard-coding a size
+  // that would be wrong at any other capture width.
+  const VW = document.documentElement.clientWidth / 100;
+  const px = (n) => Math.round(n * VW);
+
+  const map = L.map('map', {zoomControl:false, attributionControl:true});
+  // Esri's Light Gray canvas: keyless, the same quiet grey the CARTO light
+  // basemap used to be before basemaps.cartocdn.com started stamping every
+  // tile "API KEY REQUIRED" (2026-09-07). Base + reference layer so streets
+  // keep their names. Native tiles stop at 16; Leaflet upscales past that.
+  const ESRI='https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/';
+  const ESRI_ATTR='&copy; Esri, HERE, Garmin, &copy; OpenStreetMap contributors';
+  L.tileLayer(ESRI+'World_Light_Gray_Base/MapServer/tile/{z}/{y}/{x}',
+    {maxNativeZoom:16,maxZoom:20,attribution:ESRI_ATTR}).addTo(map);
+  L.tileLayer(ESRI+'World_Light_Gray_Reference/MapServer/tile/{z}/{y}/{x}',
+    {maxNativeZoom:16,maxZoom:20,opacity:.9}).addTo(map);
+
+  // Straight dashed connector, not a route. Claiming a walking route would mean
+  // asserting a path we did not compute; a bearing-and-distance line says only
+  // what is true — it is that way, and about that far.
+  L.polyline([FROM, TO], {color:'#8d3f6d', weight:px(0.8), opacity:.75,
+    dashArray:`${px(0.5)} ${px(1.8)}`, lineCap:'round'}).addTo(map);
+
+  L.marker(TO, {icon: L.divIcon({className:'', html:'<div class="pin"></div>',
+    iconSize:[px(6.5), px(6.5)], iconAnchor:[px(3.25), px(6.5)]})}).addTo(map);
+  L.marker(FROM, {icon: L.divIcon({className:'', html:'<div class="me"></div>',
+    iconSize:[px(4), px(4)], iconAnchor:[px(2), px(2)]})}).addTo(map);
+
+  // Fit both, then refuse to zoom in past street level. Two points 30m apart
+  // would otherwise fill the frame with a single building and no context —
+  // and context (which street, which corner) is the entire point of the map.
+  map.fitBounds([FROM, TO], {padding:[px(9), px(9)], maxZoom:18});
+  if (map.getZoom() < 13) map.setZoom(13);
+</script>
+</body>
+</html>

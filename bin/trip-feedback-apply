@@ -1,0 +1,200 @@
+#!/usr/bin/env node
+"use strict";
+// trip-feedback-apply — write the user's answers about places they visited back
+// onto the reservoir entries themselves.
+//
+// The pair to `trip-reservoir-mark-done`. mark-done records that the user WENT
+// somewhere (GPS + daily summary + travel path). This records what they THOUGHT
+// of it — which is the half that actually improves the next plan. Phase-2
+// selection (see the `itinerary-planning` skill) can then weight the reservoir:
+// loved raises similar picks, "not worth it" suppresses the type, and
+// loved-but-rushed becomes a return rather than a closed item.
+//
+// Where the answers come from: the `trip_feedback` hum harvester asks about a
+// struck-but-unreviewed entry; hum's normal capture writes the reply to
+// hum-responses.jsonl with `lane: "trip_feedback"` and a `ping_id`. That
+// ping_id points at the hum-runs.jsonl row whose winning candidate carries
+// `supporting_data.feedback_target` — the area/bucket/entry_key to write to.
+// So no separate pending-state file is needed; the existing logs are the join.
+//
+// Deliberately NOT its own cron job: it is appended to the nightly
+// trigger-reservoir-mark-done.sh run, right after the strike pass, so the two
+// halves of the loop stay together and there is no ghost cron to forget.
+//
+// Idempotent: an entry that already carries `feedback` is skipped, and every
+// write records the raw reply as evidence so a bad classification is auditable
+// rather than a silent rewrite. Re-running is safe.
+//
+// Usage:
+//   trip-feedback-apply                 # apply all unconsumed answers
+//   trip-feedback-apply --since 2026-07-01
+//   trip-feedback-apply --dry-run       # print what would be written
+
+const fs = require("node:fs");
+const path = require("node:path");
+const { installTools } = require("../lib/root.cjs");
+
+const DATA = installTools("data");
+const RESPONSES = path.join(DATA, "hum-responses.jsonl");
+const RUNS = path.join(DATA, "hum-runs.jsonl");
+const { pullReservoir, saveReservoir } = require("../lib/reservoir-store.js");
+
+const argv = process.argv.slice(2);
+const DRY = argv.includes("--dry-run");
+const argOf = (flag) => { const i = argv.indexOf(flag); return i >= 0 ? argv[i + 1] : null; };
+// Default window matches mark-done's spirit: a cost bound on history, not a
+// correctness gate. Entries already carrying feedback are skipped regardless.
+const SINCE = argOf("--since") || new Date(Date.now() - 60 * 86400000).toISOString().slice(0, 10);
+
+function readJsonl(file) {
+  let raw;
+  try { raw = fs.readFileSync(file, "utf8"); } catch { return []; }
+  const out = [];
+  for (const line of raw.split("\n")) {
+    if (!line.trim()) continue;
+    try { out.push(JSON.parse(line)); } catch { /* skip malformed */ }
+  }
+  return out;
+}
+
+// Turn a free-text reply into the three things that change the next plan:
+// how it landed, whether to return, and whether to suppress its type.
+// Deliberately transparent keyword logic rather than an LLM call — this runs
+// nightly on a handful of rows, and a wrong guess here quietly skews future
+// itineraries, so it must be auditable. `disposition` (already computed by
+// hum's own capture) is the prior; the text only sharpens it.
+function classify(replyText, disposition) {
+  const t = String(replyText || "").toLowerCase();
+  const has = (...words) => words.some((w) => t.includes(w));
+
+  let sentiment = null;
+  if (has("loved", "amazing", "fantastic", "incredible", "best", "superb", "excellent", "wonderful")) sentiment = "loved";
+  else if (has("not worth", "waste", "skip it", "disappointing", "overrated", "touristy", "meh", "avoid")) sentiment = "disliked";
+  else if (has("fine", "ok", "okay", "alright", "decent", "nothing special")) sentiment = "neutral";
+  else if (disposition === "positive") sentiment = "liked";
+  else if (disposition === "negative") sentiment = "disliked";
+
+  // "would go back" / "want more time" is the signal that turns a done entry
+  // into a live one again — the single most actionable thing in the answer.
+  let wants_return = null;
+  if (has("go back", "again", "return", "more time", "rushed", "not enough time", "next time", "revisit")) wants_return = true;
+  else if (has("once was enough", "once is enough", "no need to go back", "done with it", "wouldn't go back", "would not go back")) wants_return = false;
+
+  return { sentiment, wants_return };
+}
+
+const responses = readJsonl(RESPONSES).filter((r) => {
+  if (r?.lane !== "trip_feedback") return false;
+  if (!r?.reply_text) return false;
+  return String(r.ts || "").slice(0, 10) >= SINCE;
+});
+
+if (responses.length === 0) {
+  console.log("0 trip-feedback answers to apply");
+  process.exit(0);
+}
+
+// ping_id -> feedback_target, resolved from the run that produced the ping.
+const runs = readJsonl(RUNS);
+const targetByPing = new Map();
+for (const run of runs) {
+  const pingId = run?.outcome?.ping_id;
+  if (!pingId) continue;
+  const cands = run?.harvest?.candidates || [];
+  for (const c of cands) {
+    const target = c?.supporting_data?.feedback_target;
+    if (!target) continue;
+    if (String(c.topic || "") !== "trip_feedback") continue;
+    // Later runs win — a re-ask should point at the entry most recently asked about.
+    targetByPing.set(pingId, { ...target, entry_label: c?.supporting_data?.entry_label || null });
+  }
+}
+
+// Group by area so each reservoir is pulled and saved once.
+const byArea = new Map();
+let unresolved = 0;
+for (const r of responses) {
+  const target = targetByPing.get(r.ping_id);
+  if (!target) { unresolved++; continue; }
+  if (!byArea.has(target.area)) byArea.set(target.area, []);
+  byArea.get(target.area).push({ response: r, target });
+}
+
+if (unresolved > 0) {
+  // Not fatal: hum-runs rotates, so an old answer can outlive its run row.
+  console.log(`note: ${unresolved} answer(s) had no resolvable reservoir target (run row rotated out)`);
+}
+
+const BUCKETS = ["must_see", "optional", "food_specialties", "unique_experiences", "time_sensitive"];
+
+function entryKey(area, bucket, e) {
+  const label = e?.name || e?.dish || e?.best_place || "";
+  const slug = label.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 60);
+  return `${area}:${bucket}:${slug}`;
+}
+
+let applied = 0;
+let skipped = 0;
+
+(async () => {
+  for (const [area, items] of byArea) {
+    let res;
+    try {
+      res = await pullReservoir(area);
+    } catch (err) {
+      console.error(`trip-feedback-apply: pullReservoir(${area}) failed: ${err?.message || err}`);
+      continue;
+    }
+    const buckets = res?.buckets || {};
+    let dirty = false;
+
+    for (const { response, target } of items) {
+      const list = Array.isArray(buckets[target.bucket]) ? buckets[target.bucket] : [];
+      const entry = list.find((e) => entryKey(area, target.bucket, e) === target.entry_key);
+      if (!entry) {
+        console.log(`  ? ${area}/${target.bucket}: no entry matching ${target.entry_key}`);
+        skipped++;
+        continue;
+      }
+      if (entry.feedback) { skipped++; continue; } // idempotent
+
+      const { sentiment, wants_return } = classify(response.reply_text, response.disposition);
+      const feedback = {
+        sentiment,
+        wants_return,
+        // Raw reply kept verbatim: the classification above is a heuristic, and
+        // the durable "why" belongs to the user's own words, not our bucketing.
+        reply_text: response.reply_text,
+        disposition: response.disposition || null,
+        answered_at: response.ts || new Date().toISOString(),
+        ping_id: response.ping_id || null,
+        source: "hum:trip_feedback",
+      };
+
+      const label = entry.name || entry.dish || target.entry_label || target.entry_key;
+      console.log(`  ${DRY ? "would set" : "set"} ${area}/${target.bucket}: ${label} -> ${sentiment || "unclassified"}${wants_return === true ? " (wants return)" : wants_return === false ? " (once was enough)" : ""}`);
+
+      if (!DRY) {
+        entry.feedback = feedback;
+        // A place the user wants to return to is not finished. Reopening it lets the
+        // daily planner draw it again instead of treating done as terminal.
+        if (wants_return === true) entry.state = "revisit";
+        dirty = true;
+      }
+      applied++;
+    }
+
+    if (dirty && !DRY) {
+      try {
+        await saveReservoir(area, res, { wikiSave: true });
+      } catch (err) {
+        console.error(`trip-feedback-apply: saveReservoir(${area}) failed: ${err?.message || err}`);
+      }
+    }
+  }
+
+  console.log(`${DRY ? "[dry-run] " : ""}${applied} feedback mark(s) applied, ${skipped} skipped`);
+})().catch((err) => {
+  console.error(`trip-feedback-apply: ${err?.stack || err}`);
+  process.exit(1);
+});

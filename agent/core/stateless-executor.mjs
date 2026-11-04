@@ -27,6 +27,7 @@
 // without spawning a real `claude -p` (tests pass a fake spawnFn).
 
 import { spawn as nodeSpawn } from "node:child_process";
+import { MODELS } from "../../lib/models.cjs";
 import os from "node:os";
 
 function resolveClaudeBin(claudeBin) {
@@ -88,7 +89,7 @@ export function parseClaudeJson(stdout) {
 }
 
 export function makeStatelessExecutor({
-  model = "claude-sonnet-5-5",
+  model = MODELS.sonnet,
   claudeBin = null,
   cwd = null,
   // Reasoning effort for this spawn. Effort is session-scoped and can only be

@@ -1,0 +1,87 @@
+#!/usr/bin/env node
+// self-report-noise-rate — "how often is Jori wrong about Jori?" for the
+// weekly Self Improvement Review (nightly-review.md Step 2, item 12).
+//
+// Recomputed from existing state every time; there is no running counter
+// (a design choice: a counter can drift from the truth). Arithmetic lives in
+// lib/self-report-noise.mjs; this file only reads:
+//   - data/system-issue-review-state.json   (cluster severities)
+//   - self_improve_approvals                      (fixes applied in the window)
+//   - an optional labels file                     (the model's reading)
+//
+// Whether a fix's SUBJECT was Jori misdescribing its own state is a language
+// judgment, so this script never makes it (Rule #0b). Two-pass use:
+//
+//   1. self-report-noise-rate --json
+//        → `fixes.unlabelled[]` lists every applied fix with no structural
+//          link to a noise cluster. The review reads each summary and decides.
+//   2. self-report-noise-rate --json --labels /tmp/self-report-labels.json
+//        where the file is {"<card id>": true|false, ...}
+//        → the final numbers, `fixes.complete: true` once nothing is left
+//          unlabelled.
+//
+// Usage:
+//   self-report-noise-rate [--days 7] [--labels <file>] [--json]
+//
+// Read-only. Exit 0 even when Supabase is unreachable (the alert half still
+// computes, and `fixes.error` says why the other half is empty).
+
+import fs from "node:fs";
+import { createRequire } from "node:module";
+import { computeSelfReportNoise } from "../lib/self-report-noise.mjs";
+
+const require = createRequire(import.meta.url);
+const { installTools } = require("../lib/root.cjs");
+const { supabaseUrl } = require("../lib/instance.cjs");
+require("../lib/load-env.js").loadEnv();
+const BASE = process.env.SUPABASE_URL || supabaseUrl();
+const K = process.env.SUPABASE_SERVICE_ROLE_KEY;
+const SIC_STATE = process.env.SIC_STATE_PATH || installTools("data/system-issue-review-state.json");
+
+function arg(name) { const i = process.argv.indexOf("--" + name); return i > 0 ? process.argv[i + 1] : null; }
+const days = Number(arg("days") || 7);
+if (!Number.isFinite(days) || days <= 0) { console.error("usage: self-report-noise-rate [--days 7] [--labels <file>] [--json]"); process.exit(64); }
+const asJson = process.argv.includes("--json");
+const labelsPath = arg("labels");
+
+const nowMs = Date.now();
+const sinceMs = nowMs - days * 864e5;
+
+let clusters = [];
+let clustersError = null;
+try { clusters = JSON.parse(fs.readFileSync(SIC_STATE, "utf8")).clusters || []; }
+catch (e) { clustersError = `could not read ${SIC_STATE}: ${e?.message || e}`; }
+
+let labels = {};
+if (labelsPath) {
+  try { labels = JSON.parse(fs.readFileSync(labelsPath, "utf8")) || {}; }
+  catch (e) { console.error(`self-report-noise-rate: bad labels file ${labelsPath}: ${e?.message || e}`); process.exit(64); }
+}
+
+let cards = [];
+let cardsError = null;
+if (!BASE) cardsError = "no Supabase configured";
+else if (!K) cardsError = "no SUPABASE_SERVICE_ROLE_KEY";
+else {
+  try {
+    const since = new Date(sinceMs).toISOString();
+    const r = await fetch(`${BASE}/rest/v1/self_improve_approvals?select=id,summary,risk,applied_at&status=eq.applied&applied_at=gte.${encodeURIComponent(since)}&order=applied_at.asc`, {
+      headers: { apikey: K, Authorization: "Bearer " + K },
+    });
+    if (!r.ok) cardsError = `query ${r.status}: ${(await r.text()).slice(0, 200)}`;
+    else cards = await r.json();
+  } catch (e) { cardsError = e?.message || String(e); }
+}
+
+const out = computeSelfReportNoise({ clusters, cards, labels, sinceMs, nowMs });
+if (clustersError) out.alerts.error = clustersError;
+if (cardsError) out.fixes.error = cardsError;
+
+if (asJson) { console.log(JSON.stringify(out, null, 2)); process.exit(0); }
+
+const pct = (x) => (x == null ? "n/a" : `${Math.round(x * 100)}%`);
+const a = out.alerts, f = out.fixes;
+console.log(`Window ${out.window.since} → ${out.window.until}`);
+console.log(`Alerts: ${a.noise_active} of ${a.clusters_active} clusters active this window were noise (${pct(a.noise_rate)}); all time ${a.noise_all_time} of ${a.clusters_all_time} (${pct(a.noise_rate_all_time)}).${a.error ? `  [${a.error}]` : ""}`);
+console.log(`Fixes:  ${f.self_misreport} of ${f.applied} applied fixes were Jori misdescribing its own state (${pct(f.self_misreport_rate)})${f.complete ? "" : ` — NOT FINAL, ${f.unlabelled.length} unlabelled`}.${f.error ? `  [${f.error}]` : ""}`);
+for (const u of f.unlabelled) console.log(`  unlabelled ${u.id}  ${u.summary}`);

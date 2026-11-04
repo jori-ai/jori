@@ -30,6 +30,7 @@ import { createRequire } from "node:module";
 import { ClaudeSession, supportsCliFlag, buildLocalRulesFile, watchLocalRules } from "./claude-session.mjs";
 import { writeFileAtomic } from "../../lib/atomic-write.js";
 import { gitGuardHooks } from "../../lib/rollback-guard-settings.mjs";
+import { supervisorSkillOverrides } from "../../lib/hidden-skills.cjs";
 import { makeTriageRouter, triageTargetFromConfig } from "./triage-route.mjs";
 import { authFailureText } from "./auth-result.mjs";
 
@@ -241,6 +242,7 @@ const AUTH_FAIL_THRESHOLD = 3;
 // "Tue, Oct 13, 3:01 AM <zone>" — for alert text the user reads on their phone,
 // in the home timezone (lib/instance.cjs tz) with its generic short name.
 const HOME_TZ = createRequire(import.meta.url)("../../lib/instance.cjs").instance().tz;
+const ASSISTANT = createRequire(import.meta.url)("../../lib/instance.cjs").assistantName(); // the assistant's configured name (lib/instance.cjs)
 // How alerts name the machine the agents run on ("the host" unless the instance says otherwise).
 const HOST_LABEL = createRequire(import.meta.url)("../../lib/instance.cjs").instance().host_label;
 function fmtHome(ms) {
@@ -284,7 +286,8 @@ function loadAgentConfig(configPath, agentName) {
 }
 
 async function importTriageLog() {
-  const mod = await import(path.join(JORI_ROOT, "lib/triage-log.js"));
+  // Code comes from this checkout (a worktree, a CI clone), not the install.
+  const mod = await import(new URL("../../lib/triage-log.js", import.meta.url).href);
   return mod.triageLog;
 }
 
@@ -423,14 +426,14 @@ class Supervisor {
         // A quota hold is the same shape, and it already paged once when it
         // began (rate_limited below), so its arm is written without a push.
         this._sendPush(quotaHeld
-          ? `⚠️ Jori ${this.args.agent} queue depth=${depth} — dispatch is on hold until ${fmtHome(this.dispatcher.holdUntil)} because the Max allowance is used up; the queue runs then.`
+          ? `⚠️ ${ASSISTANT} ${this.args.agent} queue depth=${depth} — dispatch is on hold until ${fmtHome(this.dispatcher.holdUntil)} because the Max allowance is used up; the queue runs then.`
           : this.authAlertSent
-          ? `⚠️ Jori ${this.args.agent} queue depth=${depth} — dispatch is paused for the Max-auth outage, so nothing will drain until auth is back.`
-          : `⚠️ Jori ${this.args.agent} queue depth=${depth}. That supervisor may be stuck — check \`jori status\`.`, { push: !quotaHeld });
+          ? `⚠️ ${ASSISTANT} ${this.args.agent} queue depth=${depth} — dispatch is paused for the Max-auth outage, so nothing will drain until auth is back.`
+          : `⚠️ ${ASSISTANT} ${this.args.agent} queue depth=${depth}. That supervisor may be stuck — check \`jori status\`.`, { push: !quotaHeld });
       },
       onClear: (depth) => {
         this.eventLog.append({ kind: "queue_alarm.clear", depth });
-        this._sendPush(`✅ Jori ${this.args.agent} recovered: queue drained (depth=${depth}) — dispatch caught up.`);
+        this._sendPush(`✅ ${ASSISTANT} ${this.args.agent} recovered: queue drained (depth=${depth}) — dispatch caught up.`);
       },
     });
     attachClaudeMdWatcher(this, {
@@ -564,7 +567,9 @@ class Supervisor {
       // hooks — the git-rollback guard (D2): a PreToolUse hook that snapshots
       // uncommitted work to refs/jori/pre-destructive/* before any
       // destructive git command, or blocks it. lib/rollback-guard.mjs.
-      settings: JSON.stringify({ sandbox: { enabled: false }, idleCompaction: false, hooks: gitGuardHooks() }),
+      // + the skills a Jori agent never calls, hidden from its skill listing
+      // (lib/hidden-skills.cjs; `hideUnusedSkills: false` in agents.json opts out).
+      settings: JSON.stringify({ sandbox: { enabled: false }, idleCompaction: false, hooks: gitGuardHooks(), ...(cfg.hideUnusedSkills !== false ? { skillOverrides: supervisorSkillOverrides() } : {}) }),
       // The other half of the stable prefix: the default system prompt also
       // carries per-day/per-machine sections (today's date, cwd, env info).
       // The date changes daily, so the first session of each day re-wrote the
@@ -599,6 +604,9 @@ class Supervisor {
       // own events land here; dispatcher.* bookkeeping never touches.
       this.turnWatchdog.touch(ev);
       this.eventLog.append({ kind: ev.type, ...ev });
+      // The CLI compacted the conversation on its own: the playbooks this
+      // session was sent may be gone, so the next dispatch of each goes in full.
+      if (ev.type === "system" && ev.subtype === "compact_boundary") this.dispatcher?.forgetSent();
       this.instrumentation.observe(ev);
       // Track approx current context size from per-assistant-call usage, for the
       // context-size guard (compact-before-nuke). The last assistant call in a
@@ -697,7 +705,7 @@ class Supervisor {
         // fresh session is processing real turns again — parity with the alert
         // (§ System Channel: a self-heal that fixes an issue is reported too).
         if (this.crashLoopAlerted) {
-          this._sendPush(`✅ Jori ${this.args.agent} recovered: the fresh session is processing turns again after the crash-loop.`);
+          this._sendPush(`✅ ${ASSISTANT} ${this.args.agent} recovered: the fresh session is processing turns again after the crash-loop.`);
           this.crashLoopAlerted = false;
         }
       }
@@ -849,6 +857,10 @@ class Supervisor {
       // is fully fail-soft. Toggle off with OPS_DISPATCH_PREAMBLE_DISABLED=1.
       // A staged session-handoff digest rides on the first real dispatch of the
       // fresh session, once (it used to cost a dedicated turn).
+      // A playbook already sent to this session in full goes as a short
+      // pointer to that copy (dispatcher.mjs repeat-playbook dedupe). Off with
+      // OPS_REPEAT_DEDUPE_DISABLED=1.
+      repeatMinChars: process.env.OPS_REPEAT_DEDUPE_DISABLED === "1" ? 0 : 8000,
       preamble: (item) => {
         if (!shouldPreamble(item)) return null;
         const handoff = this._takeHandoffBlock(item);
@@ -881,6 +893,9 @@ class Supervisor {
     // Wire gmail batch dispatch to the new dispatcher.
     this.gmailSource._dispatchFn = (content, source) => this.dispatcher.dispatch(content, source);
 
+    this.dispatcher.on("repeat_pointer", ({ item, of, savedChars }) => {
+      this.eventLog.append({ kind: "dispatcher.repeat_pointer", itemId: item.id, source: item.source, of, savedChars });
+    });
     this.dispatcher.on("enqueued", (item) => {
       this.eventLog.append({ kind: "dispatcher.enqueued", item });
       this._checkQueueAlarm();
@@ -941,7 +956,7 @@ class Supervisor {
       const kept = requeued
         ? "The job that was refused is back at the front of the queue"
         : `The job that was running (${item.source}) got partway before the limit hit and won't be repeated`;
-      this._sendPush(`⚠️ Jori has hit its Max ${which}, so background jobs are on hold ${when}. ${kept}, queued jobs will run once the limit clears, and hum check-ins pause until then.`, { push: true });
+      this._sendPush(`⚠️ ${ASSISTANT} has hit its Max ${which}, so background jobs are on hold ${when}. ${kept}, queued jobs will run once the limit clears, and hum check-ins pause until then.`, { push: true });
     });
     this.dispatcher.on("hold_released", () => {
       console.error(`[supervisor] quota hold released — resuming dispatch (queue=${this.dispatcher.queue.length})`);
@@ -960,7 +975,7 @@ class Supervisor {
       if (this.rateLimitAlerted && !this.dispatcher.isHeld() && info.message && info.message.source !== "context-guard") {
         this.rateLimitAlerted = false;
         this.rateLimitHoldUntil = 0;
-        this._sendPush(`✅ Jori's Max allowance is back — queued background jobs are running again.`);
+        this._sendPush(`✅ ${ASSISTANT}'s Max allowance is back — queued background jobs are running again.`);
       }
       const shortId = info.message?.id ? info.message.id.slice(0, 6) : "------";
       // A result with no in-flight item is a background-wake turn; charge it
@@ -1105,13 +1120,17 @@ class Supervisor {
       this.eventLog.append({ kind: "dispatcher.error", id: item.id, source: item.source, error });
     });
 
-    // Now that listeners are attached, flush transferred items — this is the
-    // restart recovery path. Without this, queued items sit idle until the
-    // next external webhook arrives.
+    // Now that listeners are attached, flush the queue — transferred items (an
+    // in-process restart) and, on a cold start, the items restore() replayed
+    // from the persisted queue above. Without this, queued items sit idle until
+    // the next external webhook arrives. The cold-start half guards the
+    // watchdog's "Supervisor stale: … queueDepth=N — triggering /restart": a
+    // reload that restored a queue dispatched nothing until some new dispatch
+    // came in. _drain() itself still honours paused, held and in-flight.
     if (pendingItems.length) {
       console.error(`[supervisor] transferred ${pendingItems.length} queued item(s) to new dispatcher`);
-      this.dispatcher._drain();
     }
+    if (this.dispatcher.queue.length) this.dispatcher._drain();
   }
 
   // Per-turn hang recovery (TurnWatchdog onFire). A turn produced no `result`
@@ -1330,7 +1349,7 @@ class Supervisor {
     // / "authentication_error" (expired/invalid creds, no keychain issue at all),
     // which the old fixed wording misdiagnosed every time it fired.
     const errText = this.lastAuthError ? `Captured error: "${this.lastAuthError}". ` : "";
-    this._sendPush(`⚠️ Jori down: Max auth broken on ${HOST_LABEL} for the ${this.args.agent} supervisor (no valid login). ${errText}If it mentions a keychain, check \`security default-keychain\` + \`security list-keychains\` and restore login.keychain-db if renamed; otherwise it's likely just expired/invalid creds. Either way: \`claude /login\`. See changelog.md 2026-06-17.`, { push: true });
+    this._sendPush(`⚠️ ${ASSISTANT} down: Max auth broken on ${HOST_LABEL} for the ${this.args.agent} supervisor (no valid login). ${errText}If it mentions a keychain, check \`security default-keychain\` + \`security list-keychains\` and restore login.keychain-db if renamed; otherwise it's likely just expired/invalid creds. Either way: \`claude /login\`. See changelog.md 2026-06-17.`, { push: true });
     this._startAuthWatcher();
     // Kill the current child so it stops burning through the queue on 401s.
     try { this.session?.child?.kill("SIGKILL"); } catch {}
@@ -1392,7 +1411,7 @@ class Supervisor {
         this.authWatcher = null;
         this.authErrorCount = 0;
         this.authAlertSent = false;
-        this._sendPush(`✅ Jori back up: Max auth restored on ${HOST_LABEL} — ${this.args.agent} is resuming.`);
+        this._sendPush(`✅ ${ASSISTANT} back up: Max auth restored on ${HOST_LABEL} — ${this.args.agent} is resuming.`);
         if (this.dispatcher) this.dispatcher.setPaused(false);
         // Force a clean session so the new creds are used from a fresh state.
         this.state.data.everInitialized = false;
@@ -1548,7 +1567,7 @@ class Supervisor {
     if (this.consecutiveZeroTurns >= CRASH_LOOP_THRESHOLD) {
       console.error(`[supervisor] CRASH LOOP DETECTED: ${this.consecutiveZeroTurns} consecutive zero-turn exits — rotating to fresh session`);
       if (!this.crashLoopAlerted) {
-        this._sendPush(`⚠️ Jori ${this.args.agent} crash-loop: ${this.consecutiveZeroTurns} consecutive zero-turn child exits — rotated to a fresh session. If the review/digests look late, check the spawn path + MCP init.`);
+        this._sendPush(`⚠️ ${ASSISTANT} ${this.args.agent} crash-loop: ${this.consecutiveZeroTurns} consecutive zero-turn child exits — rotated to a fresh session. If the review/digests look late, check the spawn path + MCP init.`);
         this.crashLoopAlerted = true;
       }
       this.state.data.everInitialized = false;

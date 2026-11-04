@@ -1,0 +1,119 @@
+#!/usr/bin/env node
+// meeting-call-talk — per call of a recurring meeting, short one-line points (and
+// a paragraph) on what was talked about, for the daily summary.
+//
+// The daily summary includes what the user and the counterpart talked about.
+// Its prep settles the day's calls (lib/meeting-call.mjs) and, for each one that
+// took place, runs this when /tmp/<prefix>-call-talk-<date>.json does not cover
+// it yet. The source, best first: Zoom's transcript or AI Companion summary of
+// the call (lib/zoom-content.mjs; a Zoom call's instance UUIDs are in its
+// evidence), else the dated sections of the meeting notes for the call's home
+// and local dates (sliced by heading, notesForDates). No source → no paragraph.
+// Writing it is language, so a model does: tool-less Sonnet, then Opus. The
+// render prints it under the call's line; nothing in code reads it.
+//
+// Usage: meeting-call-talk <YYYY-MM-DD> --calls <file.json> [--meeting <id>] [--tz <IANA>] [--out <path>]
+//   <file.json> = the settled calls ([{start, end, minutes, source, status, evidence}]).
+// Exit 0 (even when a call has no source, or no meeting is configured), 1 when the
+// model step failed, 2 usage. Forks `claude -p` on the Max session, so it runs from
+// an authenticated session.
+
+import fs from "node:fs";
+import path from "node:path";
+import { createRequire } from "node:module";
+import { notesForDates, talkPath } from "../lib/meeting-call.mjs";
+import { meeting, notesPath } from "../lib/meetings.mjs";
+
+const require = createRequire(import.meta.url);
+const { instance } = require("../lib/instance.cjs");
+const ymd = (ms, tz) => new Intl.DateTimeFormat("en-CA", { timeZone: tz }).format(new Date(ms));
+
+function prompt(src, who) {
+  const owner = instance().owner_name;
+  return `${owner} had a call with ${who}. Below is ${src.kind === "notes" ? `${owner}'s own notes from it` : `Zoom's ${src.kind} of it`}. Write two things for ${owner}'s daily summary on what the two of them talked about. Use only what the source says; never add names, numbers or decisions that are not in it. Plain text, no markdown.
+1. "points": one very short line per topic discussed, 3 to 6 of them, each at most 8 words, topic first then the outcome or next step (e.g. "Billing gap: August bookings missing", "Hiring: decision by Friday"). No full sentences, no "you and ${who}".
+2. "paragraph": ONE short paragraph (2 to 4 sentences) covering the same ground, addressing ${owner} as "you" ("You and ${who} went over ...").
+
+Return ONLY this JSON, no prose:
+{"points": ["<line>", "..."], "paragraph": "<the paragraph>"}
+
+Source:
+${src.text}`;
+}
+
+async function write(src, who) {
+  const { runToollessDetailed, parseModelJson } = await import("../lib/jev-claude.mjs");
+  const { MODELS } = require("../lib/models.cjs");
+  const tried = [];
+  for (const [tier, model] of [["sonnet", MODELS.sonnet], ["opus", MODELS.opus]]) {
+    const { out, error } = await runToollessDetailed({ model, prompt: prompt(src, who), timeoutMs: 180_000, effort: "low" });
+    if (error) throw new Error(`${tier}: ${error.kind}: ${error.message}`);
+    const j = parseModelJson(out);
+    const p = j && typeof j.paragraph === "string" ? j.paragraph.trim() : "";
+    const points = (j && Array.isArray(j.points) ? j.points : [])
+      .filter((t) => typeof t === "string").map((t) => t.trim()).filter((t) => t && t.length <= 80).slice(0, 8);
+    if (p.length >= 40 && p.length <= 1200) return { tier, paragraph: p, points };
+    tried.push(`${tier}: ${p ? `paragraph of ${p.length} chars` : "no paragraph"}`);
+  }
+  throw new Error(`no tier wrote a usable paragraph (${tried.join("; ")})`);
+}
+
+async function zoomSource(call) {
+  const uuids = (((call.evidence || {}).zoom || {}).instances || []).map((i) => i.uuid).filter(Boolean);
+  if (!uuids.length) return null;
+  try {
+    const { loadCredentials, createZoomClient } = await import("../lib/zoom-client.mjs");
+    const { callContent } = await import("../lib/zoom-content.mjs");
+    const creds = loadCredentials();
+    if (!creds.cfg) return null;
+    return await callContent(createZoomClient({ cfg: creds.cfg }), uuids);
+  } catch (e) {
+    process.stderr.write(`meeting-call-talk: Zoom content not read (${String(e.message).slice(0, 120)}); using the notes\n`);
+    return null;
+  }
+}
+
+async function main() {
+  const argv = process.argv.slice(2);
+  const date = argv[0];
+  const flag = (n) => { const i = argv.indexOf(n); return i >= 0 ? argv[i + 1] : null; };
+  if (!date || date.length !== 10 || !flag("--calls")) {
+    process.stderr.write("usage: meeting-call-talk <YYYY-MM-DD> --calls <file.json> [--meeting <id>] [--tz <IANA>] [--out <path>]\n");
+    process.exit(2);
+  }
+  const m = meeting(flag("--meeting"));
+  if (!m) { process.stdout.write("meeting-call-talk: no recurring meeting configured (agent/local/config/meetings.json)\n"); return; }
+  require("../lib/load-env.js").loadEnv();
+  const tz = flag("--tz") || m.tz;
+  const out = flag("--out") || talkPath(m, date);
+  const calls = JSON.parse(fs.readFileSync(flag("--calls"), "utf8"));
+  let notesText = "";
+  try { notesText = fs.readFileSync(notesPath(m), "utf8"); } catch {}
+  const prev = (() => { try { return JSON.parse(fs.readFileSync(out, "utf8")); } catch { return null; } })();
+  const result = { date, generated_at: new Date().toISOString(), talk: { ...((prev && prev.talk) || {}) } };
+  let failed = null;
+  for (const c of calls) {
+    if (c.status !== "held") continue;
+    const s = Date.parse(c.start);
+    let src = await zoomSource(c);
+    if (!src) {
+      const text = notesForDates(notesText, [...new Set([ymd(s, m.tz), ymd(s, tz)])]);
+      src = text ? { kind: "notes", text } : null;
+    }
+    if (!src) { result.talk[c.start] = { paragraph: null, source: null }; continue; }
+    const have = result.talk[c.start];
+    // an entry without points (an older format) is written again
+    if (have && have.paragraph && Array.isArray(have.points) && have.source === src.kind && have.chars === src.text.length) continue;
+    try {
+      const w = await write(src, m.name);
+      result.talk[c.start] = { paragraph: w.paragraph, points: w.points, source: src.kind, chars: src.text.length, read_by: w.tier };
+    } catch (e) { failed = e.message; }
+  }
+  fs.writeFileSync(out, JSON.stringify(result, null, 1) + "\n");
+  process.stdout.write(`${Object.values(result.talk).filter((t) => t.paragraph).length} paragraph(s) for ${date} -> ${out}\n`);
+  if (failed) { process.stderr.write(`meeting-call-talk: ${failed}\n`); process.exit(1); }
+}
+
+if (import.meta.url === `file://${process.argv[1]}` || process.argv[1]?.endsWith("meeting-call-talk")) {
+  main().catch((e) => { process.stderr.write(`${(e && e.stack) || e}\n`); process.exit(1); });
+}

@@ -39,7 +39,7 @@ const { loadEnv } = require("../../lib/load-env.js");
 loadEnv();
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const PORT = Number(process.env.WHATSAPP_CHANNEL_PORT || 9100);
+const PORT = Number(process.env.WHATSAPP_CHANNEL_PORT || require("../../lib/ports.cjs").port("whatsapp"));
 const SESSION_DIR = path.join(__dirname, "wa-auth", "baileys");
 const INBOX = installTools("data/whatsapp-inbox.jsonl");
 const NOTIFY_BIN = installTools("bin/jori-notify");

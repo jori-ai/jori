@@ -1,0 +1,975 @@
+#!/usr/bin/env python3
+"""Location Stops CLI — extract and resolve where you stopped during a time period.
+
+Takes a time period (yesterday, today, or explicit --start/--end) and returns JSON with:
+  - detected stops (clusters of low-movement location samples)
+  - each stop labeled with primary place + alternatives if uncertain
+  - confidence scores and metadata for downstream agent use
+
+Data sources:
+  - Supabase location_history table (raw location samples)
+  - Named locations from known places
+  - Nominatim reverse geocoding as fallback
+
+Usage:
+  location-stops yesterday
+  location-stops today
+  location-stops --start 2026-04-15 --end 2026-04-16
+"""
+
+import sys
+import os
+import json
+import math
+import subprocess
+import urllib.request
+import urllib.parse
+from zoneinfo import ZoneInfo
+from datetime import datetime, timedelta, timezone
+from dataclasses import dataclass, asdict
+from typing import Optional, List, Dict, Tuple, Any
+
+# Constants
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "lib"))
+import places_local  # noqa: E402
+import place_naming  # noqa: E402
+
+ENV_FILE = os.path.join(places_local.install_root(), ".env")
+SUPABASE_URL = place_naming.SUPABASE_URL  # SUPABASE_URL, else the instance's supabase_project
+
+# Named locations — the installation's one list (data/named-locations.json, via
+# lib/place_naming.py), matched by proximity (within NAMED_LOCATION_MATCH_KM).
+NAMED_LOCATIONS = place_naming.load_named_locations()
+
+
+def _home_tz():
+    """The installation's home zone (instance tz), else the host's."""
+    tz = places_local.instance().get("tz")
+    try:
+        return ZoneInfo(tz) if tz else datetime.now().astimezone().tzinfo
+    except Exception:
+        return datetime.now().astimezone().tzinfo
+
+
+# Stop detection parameters
+MIN_STOP_DURATION_MINUTES = 5  # Minimum time spent at a stop
+MIN_SAMPLES_PER_STOP = 3  # Minimum location samples to form a stop
+CLUSTER_RADIUS_KM = 0.1  # Max distance between samples in a cluster
+MERGE_GAP_MINUTES = 10  # Merge stops if gap is less than this
+MERGE_RADIUS_KM = 0.2  # Merge stops if centroids are within this distance
+
+# Place matching parameters
+NAMED_LOCATION_MATCH_KM = 0.15  # Within this distance = exact match to named location
+CONFIDENCE_THRESHOLD = 0.8  # Above this = no alternatives shown
+
+
+@dataclass
+class LocationSample:
+    """Raw location sample from client."""
+    timestamp_ms: int
+    lat: float
+    lon: float
+    accuracy_m: Optional[float] = None
+
+
+@dataclass
+class LocationStop:
+    """Detected stop: cluster of location samples over time."""
+    start_ts_ms: int
+    end_ts_ms: int
+    centroid_lat: float
+    centroid_lon: float
+    samples: List[LocationSample]
+    
+    @property
+    def duration_minutes(self) -> float:
+        return (self.end_ts_ms - self.start_ts_ms) / (1000 * 60)
+    
+    @property
+    def cluster_radius_km(self) -> float:
+        """Compute max distance from centroid to any sample."""
+        if not self.samples:
+            return 0
+        max_dist = 0
+        for s in self.samples:
+            dist = haversine_km(self.centroid_lat, self.centroid_lon, s.lat, s.lon)
+            max_dist = max(max_dist, dist)
+        return max_dist
+
+
+@dataclass
+class PlaceCandidate:
+    """Candidate place for a stop."""
+    name: str
+    address: Optional[str] = None
+    lat: Optional[float] = None
+    lon: Optional[float] = None
+    confidence: float = 0.5
+    source: str = "unknown"  # "named_location", "reverse_geocode", "coordinate"
+    distance_km: Optional[float] = None
+
+
+@dataclass
+class ResolvedStop:
+    """Stop with resolved place(s)."""
+    start_ts_ms: int
+    end_ts_ms: int
+    duration_minutes: float
+    centroid_lat: float
+    centroid_lon: float
+    cluster_radius_km: float
+    sample_count: int
+    primary: PlaceCandidate
+    alternatives: List[PlaceCandidate]
+    
+    def to_json_dict(self) -> Dict[str, Any]:
+        """Convert to JSON-serializable dict."""
+        return {
+            "start_ts_ms": self.start_ts_ms,
+            "end_ts_ms": self.end_ts_ms,
+            "duration_minutes": round(self.duration_minutes, 1),
+            "centroid": {
+                "lat": round(self.centroid_lat, 6),
+                "lon": round(self.centroid_lon, 6),
+            },
+            "cluster_radius_km": round(self.cluster_radius_km, 4),
+            "sample_count": self.sample_count,
+            "primary": {
+                "name": self.primary.name,
+                "address": self.primary.address,
+                "confidence": round(self.primary.confidence, 2),
+                "source": self.primary.source,
+                "distance_km": round(self.primary.distance_km, 4) if self.primary.distance_km is not None else None,
+            },
+            "alternatives": [
+                {
+                    "name": alt.name,
+                    "address": alt.address,
+                    "confidence": round(alt.confidence, 2),
+                    "source": alt.source,
+                    "distance_km": round(alt.distance_km, 4) if alt.distance_km is not None else None,
+                }
+                for alt in self.alternatives
+            ] if self.alternatives else [],
+        }
+
+
+# ============================================================================
+# Utility functions
+# ============================================================================
+
+def get_supabase_key() -> Optional[str]:
+    """Get Supabase service role key from .env."""
+    if os.path.exists(ENV_FILE):
+        with open(ENV_FILE) as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith("SUPABASE_SERVICE_ROLE_KEY="):
+                    return line.split("=", 1)[1]
+    return None
+
+
+def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Distance in km between two coordinates."""
+    R = 6371  # Earth radius in km
+    dlat = math.radians(lat2 - lat1)
+    dlon = math.radians(lon2 - lon1)
+    a = math.sin(dlat / 2) ** 2 + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.sin(dlon / 2) ** 2
+    return R * 2 * math.asin(math.sqrt(a))
+
+
+def parse_timestamp(iso_str: str) -> int:
+    """Parse ISO 8601 timestamp to milliseconds since epoch."""
+    try:
+        dt = datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
+        return int(dt.timestamp() * 1000)
+    except Exception:
+        return 0
+
+
+def format_timestamp_iso(ts_ms: int) -> str:
+    """Format ms timestamp as ISO 8601."""
+    dt = datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc)
+    return dt.isoformat()
+
+
+def reverse_geocode(lat: float, lon: float) -> Optional[Tuple[str, Optional[str]]]:
+    """Reverse geocode via Nominatim. Returns (display_name, address_line) or None."""
+    try:
+        url = f"https://nominatim.openstreetmap.org/reverse?lat={lat}&lon={lon}&format=json&zoom=18&addressdetails=1"
+        req = urllib.request.Request(url, headers={"User-Agent": "location-stops-cli/1.0"})
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read())
+            addr = data.get("address", {})
+
+            road = addr.get("road") or addr.get("pedestrian") or addr.get("footway")
+            house = addr.get("house_number")
+            neighbourhood = addr.get("neighbourhood") or addr.get("suburb") or addr.get("quarter")
+            city = addr.get("city") or addr.get("town") or addr.get("village")
+            state = addr.get("state")
+            country = addr.get("country")
+
+            address_parts = []
+            if house and road:
+                address_parts.append(f"{house} {road}")
+            elif road:
+                address_parts.append(road)
+            if neighbourhood:
+                address_parts.append(neighbourhood)
+            if city:
+                address_parts.append(city)
+            if state:
+                address_parts.append(state)
+            address_line = ", ".join(address_parts) if address_parts else None
+
+            name = neighbourhood or road or city
+            if name and city and name != city:
+                name = f"{name}, {city}"
+            elif not name:
+                name_parts = []
+                if city:
+                    name_parts.append(city)
+                if state:
+                    name_parts.append(state)
+                if country and country not in ("United States", "United States of America"):
+                    name_parts.append(country)
+                name = ", ".join(name_parts) if name_parts else None
+
+            if name:
+                return name, address_line
+            return None
+    except Exception:
+        return None
+
+
+# ============================================================================
+# Stop detection
+# ============================================================================
+
+def cluster_samples(samples: List[LocationSample]) -> List[List[LocationSample]]:
+    """Group location samples into clusters based on proximity and time gaps."""
+    if not samples:
+        return []
+    
+    # Sort by timestamp
+    sorted_samples = sorted(samples, key=lambda s: s.timestamp_ms)
+    clusters = []
+    current_cluster = [sorted_samples[0]]
+    
+    for sample in sorted_samples[1:]:
+        # Check distance from first sample in cluster
+        first = current_cluster[0]
+        dist = haversine_km(first.lat, first.lon, sample.lat, sample.lon)
+        
+        # Check time gap
+        time_gap_minutes = (sample.timestamp_ms - current_cluster[-1].timestamp_ms) / (1000 * 60)
+        
+        if dist <= CLUSTER_RADIUS_KM and time_gap_minutes < 30:  # 30min max gap within cluster
+            current_cluster.append(sample)
+        else:
+            if len(current_cluster) >= MIN_SAMPLES_PER_STOP:
+                clusters.append(current_cluster)
+            current_cluster = [sample]
+    
+    # Add last cluster
+    if len(current_cluster) >= MIN_SAMPLES_PER_STOP:
+        clusters.append(current_cluster)
+    
+    return clusters
+
+
+def samples_to_stop(samples: List[LocationSample]) -> Optional[LocationStop]:
+    """Convert a cluster of samples into a stop."""
+    if not samples or len(samples) < MIN_SAMPLES_PER_STOP:
+        return None
+    
+    sorted_samples = sorted(samples, key=lambda s: s.timestamp_ms)
+    start_ts = sorted_samples[0].timestamp_ms
+    end_ts = sorted_samples[-1].timestamp_ms
+    
+    # Check minimum duration
+    duration_minutes = (end_ts - start_ts) / (1000 * 60)
+    if duration_minutes < MIN_STOP_DURATION_MINUTES:
+        return None
+    
+    # Compute centroid
+    avg_lat = sum(s.lat for s in samples) / len(samples)
+    avg_lon = sum(s.lon for s in samples) / len(samples)
+    
+    return LocationStop(
+        start_ts_ms=start_ts,
+        end_ts_ms=end_ts,
+        centroid_lat=avg_lat,
+        centroid_lon=avg_lon,
+        samples=sorted_samples,
+    )
+
+
+def _merge_stop_pair(a: LocationStop, b: LocationStop) -> LocationStop:
+    """Merge two stops into one."""
+    all_samples = a.samples + b.samples
+    avg_lat = sum(s.lat for s in all_samples) / len(all_samples)
+    avg_lon = sum(s.lon for s in all_samples) / len(all_samples)
+    return LocationStop(
+        start_ts_ms=min(a.start_ts_ms, b.start_ts_ms),
+        end_ts_ms=max(a.end_ts_ms, b.end_ts_ms),
+        centroid_lat=avg_lat,
+        centroid_lon=avg_lon,
+        samples=all_samples,
+    )
+
+
+def merge_nearby_stops(stops: List[LocationStop]) -> List[LocationStop]:
+    """Merge stops that are close in time and space."""
+    if len(stops) <= 1:
+        return stops
+
+    merged = []
+    current_stop = stops[0]
+
+    for next_stop in stops[1:]:
+        gap_minutes = (next_stop.start_ts_ms - current_stop.end_ts_ms) / (1000 * 60)
+        dist = haversine_km(
+            current_stop.centroid_lat, current_stop.centroid_lon,
+            next_stop.centroid_lat, next_stop.centroid_lon,
+        )
+
+        if gap_minutes <= MERGE_GAP_MINUTES and dist <= MERGE_RADIUS_KM:
+            current_stop = _merge_stop_pair(current_stop, next_stop)
+        else:
+            merged.append(current_stop)
+            current_stop = next_stop
+
+    merged.append(current_stop)
+    return merged
+
+
+def merge_same_place_stops(stops: List[LocationStop]) -> List[LocationStop]:
+    """Collapse consecutive stops at the same location regardless of time gap.
+
+    With sparse location data, long gaps between samples at the same place
+    shouldn't produce separate stops — you were there the whole time.
+    """
+    if len(stops) <= 1:
+        return stops
+
+    merged = []
+    current_stop = stops[0]
+
+    for next_stop in stops[1:]:
+        dist = haversine_km(
+            current_stop.centroid_lat, current_stop.centroid_lon,
+            next_stop.centroid_lat, next_stop.centroid_lon,
+        )
+
+        if dist <= MERGE_RADIUS_KM:
+            current_stop = _merge_stop_pair(current_stop, next_stop)
+        else:
+            merged.append(current_stop)
+            current_stop = next_stop
+
+    merged.append(current_stop)
+    return merged
+
+
+def detect_stops(samples: List[LocationSample]) -> List[LocationStop]:
+    """Detect stops from raw location samples."""
+    if not samples:
+        return []
+    
+    clusters = cluster_samples(samples)
+    stops = [s for s in (samples_to_stop(c) for c in clusters) if s is not None]
+    stops = merge_nearby_stops(stops)
+    stops = merge_same_place_stops(stops)
+    
+    return stops
+
+
+# ============================================================================
+# Place resolution
+# ============================================================================
+
+def match_named_location(lat: float, lon: float) -> Optional[Dict[str, Any]]:
+    """Check if coordinates match a named location."""
+    for loc in NAMED_LOCATIONS:
+        dist = haversine_km(lat, lon, loc["lat"], loc["lon"])
+        if dist <= NAMED_LOCATION_MATCH_KM:
+            return loc
+    return None
+
+
+def resolve_place_for_stop(stop: LocationStop) -> Tuple[PlaceCandidate, List[PlaceCandidate]]:
+    """Resolve place(s) for a stop. Returns primary + alternatives."""
+    candidates = []
+    
+    # 1. Check named locations
+    named_loc = match_named_location(stop.centroid_lat, stop.centroid_lon)
+    if named_loc:
+        dist = haversine_km(
+            stop.centroid_lat, stop.centroid_lon,
+            named_loc["lat"], named_loc["lon"]
+        )
+        candidates.append(PlaceCandidate(
+            name=named_loc["name"],
+            address=named_loc.get("address"),
+            lat=named_loc["lat"],
+            lon=named_loc["lon"],
+            confidence=0.95,  # Very high confidence for named location
+            source="named_location",
+            distance_km=dist,
+        ))
+    
+    # 2. Reverse geocode (skip if named location already matched)
+    if candidates and candidates[0].confidence >= CONFIDENCE_THRESHOLD:
+        geo_result = None
+    else:
+        geo_result = reverse_geocode(stop.centroid_lat, stop.centroid_lon)
+    if geo_result and (not candidates or candidates[0].name != geo_result[0]):
+        geo_name, geo_address = geo_result
+        candidates.append(PlaceCandidate(
+            name=geo_name,
+            address=geo_address,
+            lat=stop.centroid_lat,
+            lon=stop.centroid_lon,
+            confidence=0.6,  # Medium confidence for reverse geocoding
+            source="reverse_geocode",
+            distance_km=0,
+        ))
+    
+    # 3. Fallback: coordinates only
+    if not candidates:
+        candidates.append(PlaceCandidate(
+            name=f"{stop.centroid_lat:.4f}, {stop.centroid_lon:.4f}",
+            address=None,
+            lat=stop.centroid_lat,
+            lon=stop.centroid_lon,
+            confidence=0.3,
+            source="coordinate",
+            distance_km=0,
+        ))
+    
+    # Sort by confidence
+    candidates.sort(key=lambda c: c.confidence, reverse=True)
+    
+    primary = candidates[0]
+    alternatives = [c for c in candidates[1:] if c.confidence >= (1 - CONFIDENCE_THRESHOLD)] if primary.confidence < CONFIDENCE_THRESHOLD else []
+    
+    return primary, alternatives
+
+
+# ============================================================================
+# Supabase queries
+# ============================================================================
+
+def fetch_location_samples(start_ts_ms: int, end_ts_ms: int) -> List[LocationSample]:
+    """Fetch location samples from Supabase for a time range."""
+    key = get_supabase_key()
+    if not key:
+        print("ERROR: SUPABASE_SERVICE_ROLE_KEY not found in .env", file=sys.stderr)
+        sys.exit(1)
+    
+    start_iso = format_timestamp_iso(start_ts_ms)
+    end_iso = format_timestamp_iso(end_ts_ms)
+    
+    # Query location_history table
+    qs = urllib.parse.urlencode([
+        ("arrived_at", f"gte.{start_iso}"),
+        ("arrived_at", f"lte.{end_iso}"),
+        ("order", "arrived_at.asc"),
+        ("limit", "10000"),
+        ("select", "latitude,longitude,arrived_at,accuracy_m"),
+    ])
+    url = f"{SUPABASE_URL}/rest/v1/location_history?{qs}"
+    
+    try:
+        req = urllib.request.Request(
+            url,
+            headers={
+                "apikey": key,
+                "Authorization": f"Bearer {key}",
+                "User-Agent": "location-stops-cli/1.0",
+            }
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            rows = json.loads(resp.read())
+            
+            samples = []
+            for row in rows:
+                ts_ms = parse_timestamp(row.get("arrived_at", ""))
+                lat = row.get("latitude")
+                lon = row.get("longitude")
+                acc = row.get("accuracy_m")
+                
+                if ts_ms and lat is not None and lon is not None:
+                    samples.append(LocationSample(
+                        timestamp_ms=ts_ms,
+                        lat=float(lat),
+                        lon=float(lon),
+                        accuracy_m=float(acc) if acc is not None else None,
+                    ))
+            
+            return samples
+    except Exception as e:
+        print(f"ERROR: Failed to fetch location data: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+# ============================================================================
+# Period parsing
+# ============================================================================
+
+def parse_period(arg: Optional[str], start_arg: Optional[str], end_arg: Optional[str]) -> Tuple[int, int]:
+    """Parse period from args. Returns (start_ts_ms, end_ts_ms) in UTC.
+    'today'/'yesterday' use the home zone's day boundaries."""
+    HZ = _home_tz()
+
+    if start_arg and end_arg:
+        try:
+            start_dt = datetime.fromisoformat(start_arg)
+            end_dt = datetime.fromisoformat(end_arg)
+            # Bare dates (no tz) → the home zone
+            if start_dt.tzinfo is None:
+                start_dt = start_dt.replace(tzinfo=HZ)
+            if end_dt.tzinfo is None:
+                end_dt = end_dt.replace(tzinfo=HZ)
+            return int(start_dt.timestamp() * 1000), int(end_dt.timestamp() * 1000)
+        except Exception:
+            print(f"ERROR: Invalid date format. Use YYYY-MM-DD or ISO 8601.", file=sys.stderr)
+            sys.exit(1)
+
+    if not arg:
+        print("ERROR: Specify period: 'yesterday', 'today', or use --start and --end", file=sys.stderr)
+        sys.exit(1)
+
+    arg = arg.lower()
+    now_home = datetime.now(HZ)
+
+    if arg == "yesterday":
+        start_dt = (now_home - timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+        end_dt = start_dt + timedelta(days=1)
+    elif arg == "today":
+        start_dt = now_home.replace(hour=0, minute=0, second=0, microsecond=0)
+        end_dt = start_dt + timedelta(days=1)
+    else:
+        print(f"ERROR: Unknown period '{arg}'. Use 'yesterday', 'today', or --start/--end", file=sys.stderr)
+        sys.exit(1)
+
+    return int(start_dt.timestamp() * 1000), int(end_dt.timestamp() * 1000)
+
+
+# ============================================================================
+# Enrichment: photos + calendar
+# ============================================================================
+
+def fetch_photos_for_period(start_ts_ms: int, end_ts_ms: int) -> List[Dict[str, Any]]:
+    """Fetch photos with GPS from Supabase for the period."""
+    key = get_supabase_key()
+    if not key:
+        return []
+    start_iso = format_timestamp_iso(start_ts_ms)
+    end_iso = format_timestamp_iso(end_ts_ms)
+    qs = urllib.parse.urlencode([
+        ("taken_at", f"gte.{start_iso}"),
+        ("taken_at", f"lte.{end_iso}"),
+        ("latitude", "not.is.null"),
+        ("order", "taken_at.asc"),
+        ("limit", "500"),
+        ("select", "uuid,taken_at,latitude,longitude,original_filename"),
+    ])
+    url = f"{SUPABASE_URL}/rest/v1/photos?{qs}"
+    try:
+        req = urllib.request.Request(url, headers={
+            "apikey": key, "Authorization": f"Bearer {key}",
+        })
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return json.loads(resp.read())
+    except Exception:
+        return []
+
+
+def fetch_location_visits_for_period(start_ts_ms: int, end_ts_ms: int) -> List[Dict[str, Any]]:
+    """Fetch iOS-detected visits for the period, carrying companion annotations.
+
+    findme enrich writes companions to location_visits.companions at enrich
+    time (_detect_companions_nearby, see bin/findme). location-stops
+    detects its own GPS clusters, so those companion annotations are only
+    reachable if we pull location_visits alongside and match by time window.
+    """
+    key = get_supabase_key()
+    if not key:
+        return []
+    start_iso = format_timestamp_iso(start_ts_ms)
+    end_iso = format_timestamp_iso(end_ts_ms)
+    qs = urllib.parse.urlencode([
+        ("arrived_at", f"lte.{end_iso}"),
+        ("or", f"(departed_at.gte.{start_iso},departed_at.is.null)"),
+        ("order", "arrived_at.asc"),
+        ("limit", "500"),
+        ("select", "id,latitude,longitude,arrived_at,departed_at,companions,place_name"),
+    ])
+    url = f"{SUPABASE_URL}/rest/v1/location_visits?{qs}"
+    try:
+        req = urllib.request.Request(url, headers={
+            "apikey": key, "Authorization": f"Bearer {key}",
+        })
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return json.loads(resp.read())
+    except Exception:
+        return []
+
+
+def enrich_stops_with_companions(resolved_stops: list, visits: List[Dict[str, Any]]) -> None:
+    """Copy companions from matching iOS location_visits rows onto detected stops.
+
+    A visit matches a stop when their time windows overlap and their centroids
+    are within 300m (generous to absorb cluster-vs-visit coordinate drift).
+    If a stop matches multiple visits, union their companion sets.
+    """
+    for stop in resolved_stops:
+        found = set()
+        for v in visits:
+            comp = v.get("companions") or []
+            if not comp:
+                continue
+            arr = parse_timestamp(v.get("arrived_at", ""))
+            dep = parse_timestamp(v.get("departed_at", "")) if v.get("departed_at") else stop.end_ts_ms
+            if not arr:
+                continue
+            # Time window overlap
+            if dep < stop.start_ts_ms or arr > stop.end_ts_ms:
+                continue
+            lat, lon = v.get("latitude"), v.get("longitude")
+            if lat is None or lon is None:
+                continue
+            if haversine_km(stop.centroid_lat, stop.centroid_lon, float(lat), float(lon)) > 0.3:
+                continue
+            for name in comp:
+                if name:
+                    found.add(name)
+        if found:
+            stop._companions = sorted(found)
+
+
+def enrich_stops_with_photos(
+    resolved_stops: list, photos: List[Dict[str, Any]]
+) -> None:
+    """Add photo evidence to stops. Creates inferred stops for unmatched photos."""
+    matched_photo_ids = set()
+
+    for stop in resolved_stops:
+        matched = []
+        for p in photos:
+            ts = parse_timestamp(p.get("taken_at", ""))
+            if not (stop.start_ts_ms <= ts <= stop.end_ts_ms):
+                continue
+            lat, lon = p.get("latitude"), p.get("longitude")
+            if lat is None:
+                continue
+            dist = haversine_km(stop.centroid_lat, stop.centroid_lon, lat, lon)
+            if dist <= 0.5:
+                matched.append({
+                    "filename": p.get("original_filename"),
+                    "taken_at": p.get("taken_at"),
+                    "distance_km": round(dist, 4),
+                })
+                matched_photo_ids.add(p.get("uuid"))
+        if matched:
+            stop._photos = matched
+            if stop.primary.confidence < 0.9:
+                stop.primary.confidence = min(stop.primary.confidence + 0.1, 0.95)
+
+    # Group unmatched photos by location cluster to create inferred stops
+    unmatched = [p for p in photos if p.get("uuid") not in matched_photo_ids
+                 and p.get("latitude") is not None]
+    if not unmatched:
+        return
+
+    # Simple clustering: group photos within 200m of each other
+    clusters: List[List[Dict]] = []
+    for p in sorted(unmatched, key=lambda x: x.get("taken_at", "")):
+        placed = False
+        for cluster in clusters:
+            ref = cluster[0]
+            if haversine_km(p["latitude"], p["longitude"],
+                           ref["latitude"], ref["longitude"]) <= 0.2:
+                cluster.append(p)
+                placed = True
+                break
+        if not placed:
+            clusters.append([p])
+
+    for cluster in clusters:
+        lats = [p["latitude"] for p in cluster]
+        lons = [p["longitude"] for p in cluster]
+        avg_lat = sum(lats) / len(lats)
+        avg_lon = sum(lons) / len(lons)
+        timestamps = [parse_timestamp(p.get("taken_at", "")) for p in cluster]
+        start_ts = min(timestamps)
+        end_ts = max(timestamps)
+        if end_ts == start_ts:
+            end_ts = start_ts + 5 * 60 * 1000
+
+        # Resolve place for this photo cluster
+        named = match_named_location(avg_lat, avg_lon)
+        if named:
+            name = named["name"]
+            address = named.get("address")
+        else:
+            geo = reverse_geocode(avg_lat, avg_lon)
+            if geo:
+                name, address = geo
+            else:
+                name = f"{avg_lat:.4f}, {avg_lon:.4f}"
+                address = None
+
+        inferred = ResolvedStop(
+            start_ts_ms=start_ts,
+            end_ts_ms=end_ts,
+            duration_minutes=(end_ts - start_ts) / (1000 * 60),
+            centroid_lat=avg_lat,
+            centroid_lon=avg_lon,
+            cluster_radius_km=0,
+            sample_count=0,
+            primary=PlaceCandidate(
+                name=name,
+                address=address,
+                confidence=0.7,
+                source="photo_gps",
+                distance_km=0,
+            ),
+            alternatives=[],
+        )
+        inferred._photos = [
+            {"filename": p.get("original_filename"), "taken_at": p.get("taken_at")}
+            for p in cluster
+        ]
+        resolved_stops.append(inferred)
+
+    resolved_stops.sort(key=lambda s: s.start_ts_ms)
+
+
+def parse_calendar_events(calendar_json: str) -> List[Dict[str, Any]]:
+    """Parse calendar events JSON (Google Calendar API format)."""
+    try:
+        data = json.loads(calendar_json)
+        events = data if isinstance(data, list) else data.get("events", [])
+        result = []
+        for ev in events:
+            location = ev.get("location")
+            if not location:
+                continue
+            start = ev.get("start", {})
+            end = ev.get("end", {})
+            start_dt = start.get("dateTime") or start.get("date")
+            end_dt = end.get("dateTime") or end.get("date")
+            if not start_dt:
+                continue
+            result.append({
+                "summary": ev.get("summary", ""),
+                "location": location,
+                "start": start_dt,
+                "end": end_dt,
+                "start_ts_ms": parse_timestamp(start_dt),
+                "end_ts_ms": parse_timestamp(end_dt) if end_dt else 0,
+            })
+        return result
+    except Exception:
+        return []
+
+
+def is_physical_location(location: str) -> bool:
+    """Check if a calendar location is a physical address (not a URL)."""
+    if not location:
+        return False
+    return not any(location.startswith(p) for p in ("http://", "https://", "zoom.", "meet.google"))
+
+
+def _geocode_address_to_coords(address: str) -> Optional[Tuple[float, float]]:
+    """Best-effort forward geocode via Nominatim. Returns (lat, lon) or None."""
+    # Check named locations first
+    for loc in NAMED_LOCATIONS:
+        street = (loc.get("address") or "").split(",")[0].lower()
+        if loc["name"].lower() in address.lower() or (street and street in address.lower()):
+            return loc["lat"], loc["lon"]
+    try:
+        q = urllib.parse.quote(address)
+        url = f"https://nominatim.openstreetmap.org/search?q={q}&format=json&limit=1"
+        req = urllib.request.Request(url, headers={"User-Agent": "location-stops-cli/1.0"})
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            results = json.loads(resp.read())
+            if results:
+                return float(results[0]["lat"]), float(results[0]["lon"])
+    except Exception:
+        pass
+    return None
+
+
+# Max distance from any confirmed stop for a calendar event to be plausible
+CALENDAR_PLAUSIBILITY_KM = 50
+
+
+def enrich_stops_with_calendar(
+    resolved_stops: list, cal_events: List[Dict[str, Any]]
+) -> None:
+    """Add inferred stops from calendar events with physical locations.
+    Filters out events that are implausibly far from confirmed stops."""
+    # Collect confirmed locations (GPS + photo-based stops)
+    confirmed_coords = [
+        (s.centroid_lat, s.centroid_lon)
+        for s in resolved_stops
+        if s.centroid_lat != 0 and s.sample_count > 0
+    ]
+    # Include photo-inferred stops too
+    confirmed_coords += [
+        (s.centroid_lat, s.centroid_lon)
+        for s in resolved_stops
+        if s.centroid_lat != 0 and s.primary.source == "photo_gps"
+    ]
+
+    for ev in cal_events:
+        if not is_physical_location(ev.get("location", "")):
+            continue
+        if not ev["start_ts_ms"] or not ev["end_ts_ms"]:
+            continue
+        duration = (ev["end_ts_ms"] - ev["start_ts_ms"]) / (1000 * 60)
+        if duration < 5:
+            continue
+
+        # Plausibility check: geocode the event and compare to confirmed stops
+        if confirmed_coords:
+            ev_coords = _geocode_address_to_coords(ev["location"])
+            if ev_coords:
+                min_dist = min(
+                    haversine_km(ev_coords[0], ev_coords[1], c[0], c[1])
+                    for c in confirmed_coords
+                )
+                if min_dist > CALENDAR_PLAUSIBILITY_KM:
+                    continue
+
+        inferred = ResolvedStop(
+            start_ts_ms=ev["start_ts_ms"],
+            end_ts_ms=ev["end_ts_ms"],
+            duration_minutes=duration,
+            centroid_lat=0,
+            centroid_lon=0,
+            cluster_radius_km=0,
+            sample_count=0,
+            primary=PlaceCandidate(
+                name=ev["summary"] or ev["location"],
+                address=ev["location"],
+                confidence=0.75,
+                source="calendar",
+                distance_km=None,
+            ),
+            alternatives=[],
+        )
+        inferred._calendar_event = {
+            "summary": ev["summary"],
+            "location": ev["location"],
+        }
+        resolved_stops.append(inferred)
+
+    resolved_stops.sort(key=lambda s: s.start_ts_ms)
+
+
+# ============================================================================
+# Main
+# ============================================================================
+
+def main():
+    import argparse
+    
+    parser = argparse.ArgumentParser(
+        description="Extract and resolve location stops for a time period.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  location-stops yesterday
+  location-stops today
+  location-stops --start 2026-04-14 --end 2026-04-15
+        """
+    )
+    parser.add_argument("period", nargs="?", help="'yesterday' or 'today'")
+    parser.add_argument("--start", help="Start date (YYYY-MM-DD or ISO 8601)")
+    parser.add_argument("--end", help="End date (YYYY-MM-DD or ISO 8601)")
+    parser.add_argument("--calendar", help="Calendar events JSON file (Google Calendar API format)")
+    parser.add_argument("--no-photos", action="store_true", help="Skip photo enrichment")
+    parser.add_argument("--json", action="store_true", default=True, help=argparse.SUPPRESS)
+    
+    args = parser.parse_args()
+    
+    # Parse period
+    start_ts_ms, end_ts_ms = parse_period(args.period, args.start, args.end)
+    
+    # Fetch location samples
+    samples = fetch_location_samples(start_ts_ms, end_ts_ms)
+    
+    # Detect stops
+    stops = detect_stops(samples)
+    
+    # Resolve places
+    resolved_stops = []
+    for stop in stops:
+        primary, alternatives = resolve_place_for_stop(stop)
+        resolved_stops.append(ResolvedStop(
+            start_ts_ms=stop.start_ts_ms,
+            end_ts_ms=stop.end_ts_ms,
+            duration_minutes=stop.duration_minutes,
+            centroid_lat=stop.centroid_lat,
+            centroid_lon=stop.centroid_lon,
+            cluster_radius_km=stop.cluster_radius_km,
+            sample_count=len(stop.samples),
+            primary=primary,
+            alternatives=alternatives,
+        ))
+
+    # Enrich with photos
+    if not args.no_photos:
+        photos = fetch_photos_for_period(start_ts_ms, end_ts_ms)
+        if photos:
+            enrich_stops_with_photos(resolved_stops, photos)
+
+    # Enrich with companions from iOS location_visits (populated by findme enrich)
+    visits = fetch_location_visits_for_period(start_ts_ms, end_ts_ms)
+    if visits:
+        enrich_stops_with_companions(resolved_stops, visits)
+
+    # Enrich with calendar
+    if args.calendar:
+        try:
+            cal_json = open(args.calendar).read()
+        except Exception:
+            cal_json = args.calendar
+        cal_events = parse_calendar_events(cal_json)
+        if cal_events:
+            enrich_stops_with_calendar(resolved_stops, cal_events)
+
+    # Output
+    out_stops = []
+    for s in resolved_stops:
+        d = s.to_json_dict()
+        if hasattr(s, "_photos"):
+            d["photos"] = s._photos
+        if hasattr(s, "_calendar_event"):
+            d["calendar_event"] = s._calendar_event
+        if hasattr(s, "_companions"):
+            d["companions"] = s._companions
+        out_stops.append(d)
+
+    result = {
+        "period": {
+            "start_ts_ms": start_ts_ms,
+            "end_ts_ms": end_ts_ms,
+            "start_iso": format_timestamp_iso(start_ts_ms),
+            "end_iso": format_timestamp_iso(end_ts_ms),
+        },
+        "sample_count": len(samples),
+        "stop_count": len(resolved_stops),
+        "stops": out_stops,
+    }
+
+    print(json.dumps(result, indent=2))
+
+
+if __name__ == "__main__":
+    main()

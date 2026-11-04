@@ -16,7 +16,7 @@
 //
 // Search is memory retrieval plus a model, and both live only on the host
 // (local embeddings, the association graph, the Max-authenticated Claude). So
-// /search and /api/* are passed through to the origin — `fetch(req)` from a
+// /search, /api/* and /control* are passed through to the origin — `fetch(req)` from a
 // route Worker goes to the zone's origin, the host's tunnel (wiki serve :9097),
 // which verifies the same Access JWT itself. If the host cannot be reached,
 // /search falls back to the mirror's full-text search with a notice saying so.
@@ -144,7 +144,9 @@ async function verifyAccessJwt(env, token) {
 // ── Rendering (shared with wiki-serve.js via wiki-portal.js / wiki-render.js)
 
 const byTitle = (a, b) => (a.title || a.id).localeCompare(b.title || b.id);
-const page = (who, title, body, opts) => shell(title, body, who, opts);
+// The Control tab (the control room) shows for an unrestricted viewer; the
+// origin decides who may actually use it.
+const page = (who, title, body, opts) => shell(title, body, who, { control: !who.scoped, ...opts });
 
 async function renderPageView(env, id, pages, canRead, who, fullView) {
   // Out of scope renders exactly like missing — a 403 would confirm the page exists.
@@ -236,6 +238,12 @@ export default {
       if (u.pathname === "/search") {
         if (!String(u.searchParams.get("q") || "").trim()) return html(200, page(who, "Ask", portalLib.searchBody({ query: "" })));
         return (await viaOrigin(req, 15000)) || html(200, await renderSearchFallback(env, u.searchParams.get("q"), canRead, who));
+      }
+      // The control room reads and changes live state on the host: always the origin.
+      if (u.pathname === "/control" || u.pathname.startsWith("/control/")) {
+        if (!scope.unrestricted) return html(404, page(who, "Not found", portalLib.notFoundBody(u.pathname)));
+        const res = await viaOrigin(req, u.pathname === "/control/api/action" ? 90000 : 30000);
+        return res || html(503, page(who, "Control", `<div class="page-head"><h1>Control</h1><p class="dek">The host is not answering, so the control room cannot read its live state. It comes back when the host does.</p></div>`, { active: "control" }));
       }
       if (u.pathname.startsWith("/api/")) {
         const res = await viaOrigin(req, u.pathname === "/api/ask" ? 75000 : 12000);

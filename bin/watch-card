@@ -1,0 +1,28 @@
+#!/usr/bin/env node
+// watch-card — one show or film as it should appear in the Jori chat: poster, headline,
+// blurb, IMDb + Rotten Tomatoes links (lib/watch-chat-card.mjs). For any title mentioned
+// outside the next-show / film-recommendation answers. 2026-10-11: a chat answer about shows
+// or films comes with images and links.
+//
+//   watch-card "<title>" [--year 2019] [--tv|--movie]
+// Prints the lines to paste into the reply. Exit 2 when TMDB has no match.
+
+import { hasTmdb } from "../lib/watch-db.mjs";
+import { cardLines } from "../lib/watch-chat-card.mjs";
+
+const args = process.argv.slice(2);
+const flag = (n) => { const i = args.indexOf(`--${n}`); return i >= 0 ? args[i + 1] : null; };
+const title = args.find((a, i) => !a.startsWith("--") && args[i - 1] !== "--year");
+if (!title || !hasTmdb()) { console.error("usage: watch-card \"<title>\" [--year N] [--tv|--movie] (needs TMDB_API_KEY)"); process.exit(1); }
+const year = flag("year");
+const media = args.includes("--tv") ? "tv" : args.includes("--movie") ? "movie" : "multi";
+const tmdb = async (p) => { const r = await fetch(`https://api.themoviedb.org/3/${p}&api_key=${process.env.TMDB_API_KEY}`, { signal: AbortSignal.timeout(10000) }); return r.ok ? r.json() : null; };
+const s = await tmdb(`search/${media}?query=${encodeURIComponent(title)}${year ? `&${media === "tv" ? "first_air_date_year" : "year"}=${year}` : ""}`);
+const hit = (s?.results || []).find((x) => x.media_type !== "person");
+if (!hit) { console.error(`no TMDB match for "${title}"`); process.exit(2); }
+const kind = hit.media_type || (media === "tv" ? "tv" : "movie");
+const d = await tmdb(`${kind}/${hit.id}?append_to_response=external_ids`);
+const name = d?.title || d?.name || title;
+const yr = (d?.release_date || d?.first_air_date || "").slice(0, 4);
+const blurb = (d?.overview || "").split(". ")[0].slice(0, 220);
+console.log(cardLines({ poster_path: d?.poster_path, name, imdb_id: d?.imdb_id || d?.external_ids?.imdb_id, headline: `**${name}**${yr ? ` (${yr})` : ""}${kind === "tv" ? " · series" : ""}`, blurb: blurb && !blurb.endsWith(".") ? `${blurb}.` : blurb }).join("\n"));

@@ -1,0 +1,85 @@
+#!/usr/bin/env node
+// db-retention — light retention for the high-churn raw tables. Keeps the last
+// N days (default 30) of location_history + health_samples; older rows are pruned.
+//
+// Context (2026-06-08): the jori Supabase DB is TINY (~37k rows total across
+// all tables), so this is data-minimization / growth-capping hygiene, NOT a fix
+// for compute. The 2026-06-07 outage was query/write-RATE saturating a weak
+// compute tier (amplified by a rogue duplicate phone-channel), addressed by the
+// compute upgrade + killing the rogue + the dispatch gates — not by data volume.
+// Day-page summaries, health_aggregates, and on-phone HealthKit retain the
+// long-term history; this only trims the raw working copies.
+//
+// Targets:
+//   - location_history: rows where arrived_at AND departed_at are both older than
+//     the cutoff (open visits — departed_at NULL — are always kept).
+//   - health_samples: rows where start_date (measurement time) is older.
+//
+// Safety: kill switch data/.db-retention-off; --dry-run shows counts without
+// deleting; uses the service_role key via PostgREST DELETE; logs to
+// data/db-retention.jsonl. Run daily via cron.
+
+import fs from "node:fs";
+import path from "node:path";
+import { createRequire } from "node:module";
+import { installRoot } from "../lib/root.cjs";
+
+const JORI = installRoot();
+if (fs.existsSync(path.join(JORI, "data/.db-retention-off"))) {
+  console.log("db-retention: kill switch present — skip");
+  process.exit(0);
+}
+
+const argv = process.argv.slice(2);
+const dryRun = argv.includes("--dry-run");
+const di = argv.indexOf("--days");
+const DAYS = di >= 0 ? parseInt(argv[di + 1], 10) : 30;
+if (!Number.isFinite(DAYS) || DAYS < 1) { console.error("db-retention: invalid --days"); process.exit(2); }
+
+let env = "";
+try { env = fs.readFileSync(path.join(JORI, ".env"), "utf8"); } catch { /* no .env: not configured */ }
+const key = (process.env.SUPABASE_SERVICE_ROLE_KEY || (env.match(/^SUPABASE_SERVICE_ROLE_KEY=(.+)$/m) || [])[1] || "").trim().replace(/^["']|["']$/g, "");
+const BASE = process.env.SUPABASE_URL || createRequire(import.meta.url)("../lib/instance.cjs").supabaseUrl();
+if (!key || !BASE) {
+  console.log("db-retention: no Supabase project or service key configured — skip");
+  process.exit(0);
+}
+const SB = BASE + "/rest/v1";
+const H = { apikey: key, Authorization: "Bearer " + key };
+const cutoff = new Date(Date.now() - DAYS * 864e5).toISOString();
+const LOG = path.join(JORI, "data/db-retention.jsonl");
+
+const targets = [
+  { table: "location_history", filter: `arrived_at=lt.${cutoff}&departed_at=lt.${cutoff}` },
+  { table: "health_samples", filter: `start_date=lt.${cutoff}` },
+];
+
+async function matchCount(t) {
+  const r = await fetch(`${SB}/${t.table}?${t.filter}`, { headers: { ...H, Prefer: "count=exact", Range: "0-0" }, signal: AbortSignal.timeout(30000) });
+  if (!r.ok) throw new Error(`count ${t.table} -> HTTP ${r.status}`);
+  return parseInt((r.headers.get("content-range") || "").split("/")[1] || "0", 10) || 0;
+}
+async function doDelete(t) {
+  const r = await fetch(`${SB}/${t.table}?${t.filter}`, { method: "DELETE", headers: H, signal: AbortSignal.timeout(120000) });
+  if (r.status !== 200 && r.status !== 204) throw new Error(`DELETE ${t.table} -> HTTP ${r.status}`);
+}
+
+const results = [];
+let anyError = false;
+for (const t of targets) {
+  try {
+    const matched = await matchCount(t);
+    if (!dryRun && matched > 0) await doDelete(t);
+    results.push({ table: t.table, pruned: matched });
+    console.log(`${t.table}: ${dryRun ? "would prune" : "pruned"} ${matched} rows older than ${DAYS}d`);
+  } catch (e) {
+    anyError = true;
+    results.push({ table: t.table, error: e.message });
+    console.error(`${t.table}: ERROR ${e.message}`);
+  }
+}
+
+if (!dryRun) {
+  try { fs.appendFileSync(LOG, JSON.stringify({ ts: new Date().toISOString(), days: DAYS, cutoff, results }) + "\n"); } catch {}
+}
+process.exit(anyError ? 1 : 0);

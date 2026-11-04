@@ -18,6 +18,7 @@ import { spawn } from "node:child_process";
 import { DatabaseSync } from "node:sqlite";
 
 import { installTools } from "../../lib/root.cjs";
+import { assistantName } from "../../lib/instance.cjs";
 const DB_PATH =
   process.env.MEMORY_INDEX_DB ||
   installTools("data/memory-index.db");
@@ -142,7 +143,7 @@ export function mobilePush(title, body, { dedupeKey = null, dedupeWindowMs = DEF
   if (last != null && t - last < dedupeWindowMs) {
     return { sent: false, reason: "deduped" };
   }
-  const ok = pusher(title || "Jori", body || "");
+  const ok = pusher(title || assistantName(), body || "");
   if (ok) _lastPush.set(key, t);
   return { sent: !!ok, reason: ok ? "sent" : "push-failed" };
 }

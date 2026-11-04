@@ -1,0 +1,256 @@
+#!/usr/bin/env node
+// tickets — Event discovery and purchase CLI for Jori.
+//
+// Usage:
+//   tickets search <query> [--city <city>] [--limit 20]
+//   tickets for-artist <name> [--limit 25]
+//   tickets event <id>               (prefix tm- or sg- to pick source)
+//   tickets buy <event-url> --party N [--max-price N] [--section X] [--person NAME] [--pick "<section, row, seats, total>"] [--asked "<the user's words>"]
+//   tickets status
+//
+// Data:
+//   Real-time event data from Ticketmaster Discovery + SeatGeek Platform APIs (free self-serve).
+//   Keys in .env as TICKETMASTER_API_KEY and SEATGEEK_CLIENT_ID.
+//
+// Purchase flow:
+//   There is one purchase path: the Face-ID flow (agent/ops-agent/jobs/purchase.md).
+//   `tickets buy` only phrases the request and hands it to `purchase-queue add`; the ops
+//   `purchase` job signs in on the shop Chrome (CDP :9224), picks the seats, stops at the
+//   review page and files a Face-ID approval. No other checkout path exists (a typed-YES
+//   path on the user's everyday Chrome was retired); `tickets buy` never buys by itself.
+
+import fs from "node:fs";
+import path from "node:path";
+import { execFileSync } from "node:child_process";
+import * as tm from "../lib/tickets/tm-api.mjs";
+import * as sg from "../lib/tickets/sg-api.mjs";
+import { JORI_ROOT } from "../lib/tickets/config.mjs";
+
+const PURCHASE_QUEUE = path.join(JORI_ROOT, "bin/purchase-queue");
+
+const args = process.argv.slice(2);
+const cmd = args[0];
+
+function flag(name, def = null) {
+  const i = args.indexOf(`--${name}`);
+  if (i < 0) return def;
+  return args[i + 1] ?? def;
+}
+function hasFlag(name) { return args.includes(`--${name}`); }
+function positional(n) { return args[n]; }
+
+function usage(exitCode = 0) {
+  console.log(`tickets — event discovery + purchase CLI
+
+  tickets search <query> [--city <city>] [--limit 20]
+  tickets for-artist <name> [--limit 25]
+  tickets event <id>                        (id prefix tm- or sg-)
+  tickets buy <event-url> --party N [--max-price N] [--section X] [--person NAME] [--pick "<section, row, seats, total>"] [--asked "<the user's words>"]
+  tickets status
+
+Event data: Ticketmaster Discovery + SeatGeek Platform (keys in .env).
+Purchase:   purchase-queue → ops \`purchase\` job (shop Chrome, signs in itself) → Face ID on the iPhone.
+`);
+  process.exit(exitCode);
+}
+
+function formatEvent(e) {
+  if (!e) return "(no result)";
+  const price = e.price_min != null
+    ? `$${e.price_min}${e.price_max != null && e.price_max !== e.price_min ? `–${e.price_max}` : ""}`
+    : "price ?";
+  const when = [e.date, e.time].filter(Boolean).join(" ");
+  const where = [e.venue, e.city, e.state].filter(Boolean).join(", ");
+  const lines = [
+    `[${e.source}] ${e.name}`,
+    `  ${when} — ${where}`,
+    `  ${price}  id:${e.id}`,
+  ];
+  if (e.url) lines.push(`  ${e.url}`);
+  return lines.join("\n");
+}
+
+async function cmdSearch() {
+  const q = positional(1);
+  if (!q) return usage(1);
+  const city = flag("city") || undefined;
+  const limit = Number(flag("limit") || 20);
+  const tasks = [];
+  if (tm.isConfigured()) tasks.push(["tm", tm.searchEvents({ q, city, size: limit })]);
+  if (sg.isConfigured()) tasks.push(["sg", sg.searchEvents({ q, city, perPage: limit })]);
+  if (!tasks.length) {
+    console.error("No event sources configured. Add TICKETMASTER_CONSUMER_KEY and/or SEATGEEK_CLIENT_ID to .env.");
+    process.exit(2);
+  }
+  const results = await Promise.allSettled(tasks.map(([, p]) => p));
+  const all = [];
+  results.forEach((r, i) => {
+    const src = tasks[i][0];
+    if (r.status === "fulfilled") all.push(...r.value);
+    else console.error(`[${src}] ${r.reason.message}`);
+  });
+  all.sort((a, b) => (a.date || "").localeCompare(b.date || ""));
+  if (!all.length) { console.log("No events found."); return; }
+  for (const e of all.slice(0, limit)) console.log(formatEvent(e) + "\n");
+}
+
+async function cmdForArtist() {
+  const name = positional(1);
+  if (!name) return usage(1);
+  const limit = Number(flag("limit") || 25);
+  if (!tm.isConfigured() && !sg.isConfigured()) {
+    console.error("No event sources configured. Add TICKETMASTER_CONSUMER_KEY and/or SEATGEEK_CLIENT_ID to .env.");
+    process.exit(2);
+  }
+  const [tmAtt, sgPerf] = await Promise.allSettled([
+    tm.isConfigured() ? tm.attractionsByName(name, 3) : Promise.resolve([]),
+    sg.isConfigured() ? sg.performersByName(name, 3) : Promise.resolve([]),
+  ]);
+  const all = [];
+  if (tmAtt.status === "fulfilled") {
+    for (const a of tmAtt.value) {
+      try {
+        const events = await tm.eventsByAttractionId(a.id, limit);
+        all.push(...events);
+      } catch (err) { console.error(`[tm] ${err.message}`); }
+    }
+  } else console.error(`[tm] ${tmAtt.reason.message}`);
+  if (sgPerf.status === "fulfilled") {
+    for (const p of sgPerf.value) {
+      try {
+        // SG uses slug when available; fall back to id-based search via /events?performers.id=...
+        const url = new URL("https://api.seatgeek.com/2/events");
+        url.searchParams.set("client_id", process.env.SEATGEEK_CLIENT_ID || "");
+        url.searchParams.set("performers.id", String(p.id));
+        url.searchParams.set("per_page", String(limit));
+        const res = await fetch(url);
+        if (res.ok) {
+          const data = await res.json();
+          for (const ev of data.events || []) {
+            all.push({
+              source: "seatgeek",
+              id: `sg-${ev.id}`,
+              raw_id: ev.id,
+              name: ev.title || ev.short_title,
+              url: ev.url,
+              date: ev.datetime_local?.slice(0, 10),
+              time: ev.datetime_local?.slice(11, 16),
+              venue: ev.venue?.name,
+              city: ev.venue?.city,
+              state: ev.venue?.state,
+              price_min: ev.stats?.lowest_price ?? null,
+              price_max: ev.stats?.highest_price ?? null,
+              price_currency: "USD",
+              attractions: (ev.performers || []).map((pp) => pp.name),
+            });
+          }
+        }
+      } catch (err) { console.error(`[sg] ${err.message}`); }
+    }
+  } else console.error(`[sg] ${sgPerf.reason.message}`);
+  all.sort((a, b) => (a.date || "").localeCompare(b.date || ""));
+  if (!all.length) { console.log(`No upcoming events found for "${name}".`); return; }
+  for (const e of all.slice(0, limit)) console.log(formatEvent(e) + "\n");
+}
+
+async function cmdEvent() {
+  const id = positional(1);
+  if (!id) return usage(1);
+  if (id.startsWith("tm-")) {
+    const e = await tm.eventById(id.slice(3));
+    console.log(formatEvent(e));
+  } else if (id.startsWith("sg-")) {
+    const e = await sg.eventById(id.slice(3));
+    console.log(formatEvent(e));
+  } else {
+    console.error("Event id must start with 'tm-' or 'sg-'");
+    process.exit(2);
+  }
+}
+
+// Phrase the ticket request for the Face-ID purchase job and queue it. No cap
+// here: Face ID is the gate (agent/CLAUDE.md § Financial Operations
+// rule 3). --max-price is the user's own ceiling for this buy, carried in the
+// request text; the job stops if the review-page total is above it.
+// Without --pick the job scans every listing once (ticket-scan), recommends one
+// pair with a marked seat map, and files Face ID for it; --pick names other seats
+// the user chose instead.
+function ticketRequest({ eventUrl, party, maxPrice, section, person, pick, asked }) {
+  // Discovery links come wrapped in an affiliate redirect
+  // (ticketmaster.evyy.net/...?u=<real url>); the purchase site must be the real host.
+  const wrapped = new URL(eventUrl).searchParams.get("u");
+  if (wrapped && /^https?:\/\//.test(wrapped)) eventUrl = wrapped;
+  const site = new URL(eventUrl).hostname.replace(/^www\./, "");
+  const parts = [
+    `${party} ticket${party === 1 ? "" : "s"}, seated together`,
+    maxPrice ? `total at most $${maxPrice} including fees` : null,
+    section ? `section: ${section}` : null,
+    person ? `for ${person}` : null,
+    pick ? `pick: ${pick}` : null,
+    `event: ${eventUrl}`,
+  ].filter(Boolean);
+  const text = asked ? `${asked} [tickets: ${parts.join("; ")}]` : `Buy tickets: ${parts.join("; ")}`;
+  return { site, text };
+}
+
+function cmdBuy() {
+  const eventUrl = positional(1);
+  if (!eventUrl) return usage(1);
+  const maxPrice = flag("max-price") == null ? null : Number(flag("max-price"));
+  const party = Number(flag("party") || 2);
+  if (maxPrice != null && (!Number.isFinite(maxPrice) || maxPrice <= 0)) {
+    console.error("--max-price must be > 0");
+    process.exit(2);
+  }
+  if (!Number.isInteger(party) || party < 1 || party > 8) {
+    console.error("--party must be an integer 1–8");
+    process.exit(2);
+  }
+  let req;
+  try { req = ticketRequest({ eventUrl, party, maxPrice, section: flag("section"), person: flag("person"), pick: flag("pick"), asked: flag("asked") }); }
+  catch { console.error(`Not a URL: ${eventUrl}`); process.exit(2); }
+  if (!fs.existsSync(PURCHASE_QUEUE)) { console.error("tickets buy needs bin/purchase-queue (the Face-ID purchase flow), which this installation does not have"); process.exit(1); }
+  try {
+    execFileSync(PURCHASE_QUEUE, ["add", req.text, "--site", req.site], { stdio: "inherit", timeout: 160_000 });
+  } catch (err) {
+    process.exit(err.status ?? 1);
+  }
+}
+
+function cmdStatus() {
+  console.log(`Sources:  tm=${tm.isConfigured() ? "configured" : "missing"}  sg=${sg.isConfigured() ? "configured" : "missing"}`);
+  if (!fs.existsSync(PURCHASE_QUEUE)) { console.log("Purchases: no purchase flow installed (bin/purchase-queue)"); return; }
+  console.log("Purchases (purchase-queue list):");
+  execFileSync(PURCHASE_QUEUE, ["list"], { stdio: "inherit" });
+}
+
+const RETIRED = {
+  cancel: "Retired with the old ticket flow. Withdraw a pending approval with `purchase cancel <id>`.",
+  login: "Retired. The purchase job signs in on the shop Chrome itself (jobs/purchase-signin.md).",
+  audit: "Retired. See `purchase-queue list` and `purchase status <id>`.",
+};
+
+(async () => {
+  try {
+    switch (cmd) {
+      case "search":      await cmdSearch(); break;
+      case "for-artist":  await cmdForArtist(); break;
+      case "event":       await cmdEvent(); break;
+      case "buy":         cmdBuy(); break;
+      case "status":      cmdStatus(); break;
+      case "cancel":
+      case "audit":
+      case "login":       console.error(RETIRED[cmd]); process.exit(2);
+      case "help":
+      case "--help":
+      case "-h":
+      case undefined:     usage(0); break;
+      default:
+        console.error(`Unknown command: ${cmd}`);
+        usage(2);
+    }
+  } catch (err) {
+    console.error(err.message);
+    process.exit(1);
+  }
+})();

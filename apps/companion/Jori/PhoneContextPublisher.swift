@@ -12,7 +12,7 @@ enum PhoneContextPublisher {
     enum Trigger: String { case foreground, visit }
 
     private static let foregroundMinIntervalSeconds: TimeInterval = 5 * 60
-    private static let lastForegroundKey = "jori.lastAudioPublishAt.foreground"
+    private static let lastForegroundKey = Install.key("lastAudioPublishAt.foreground")
 
     /// Debounced foreground publisher; skips if the previous publish fired in
     /// the last 5 minutes.
@@ -37,7 +37,7 @@ enum PhoneContextPublisher {
         fmt.timeZone = .current
         let today = fmt.string(from: Date())
 
-        let lastKey = "jori.firstUnlockDate"
+        let lastKey = Install.key("firstUnlockDate")
         if UserDefaults.standard.string(forKey: lastKey) == today { return }
 
         guard let deviceId = await currentDeviceId() else { return }
@@ -106,7 +106,7 @@ enum PhoneContextPublisher {
     /// `device_tokens`) so all server-side keys agree. Falls back to
     /// `identifierForVendor` when APNs hasn't yet registered.
     private static func currentDeviceId() async -> String? {
-        if let token = UserDefaults.standard.string(forKey: "jori.apnsDeviceToken"),
+        if let token = UserDefaults.standard.string(forKey: Install.key("apnsDeviceToken")),
            !token.isEmpty {
             return token
         }

@@ -1,0 +1,53 @@
+#!/usr/bin/env node
+// location-ambient-geom — code-owned geometry for jobs/location-ambient.md.
+// See lib/ambient-geometry.mjs.
+//
+//   location-ambient-geom wander --lat <n> --lon <n> --arrived <iso>
+//       Step 1c: routine-walk-at-home check (lib/ambient-geometry.mjs), then wandering-vs-transit over the
+//       20-40 min of location_history fixes before `arrived`. Prints JSON
+//       {verdict: "dispatch"|"skip", reason, ...}. Errors print
+//       {verdict:"dispatch", reason:"geom-error ..."} — fail open.
+//   location-ambient-geom proximity --lat <n> --lon <n> --candidates <file.json>
+//       Step 2.5: candidates [{name, lat, lon, ...}] → {ranked[], fire, radius_m}.
+
+import fs from "node:fs";
+import { createRequire } from "node:module";
+import { classifyWander, routineWalk, proximity } from "../lib/ambient-geometry.mjs";
+
+const require = createRequire(import.meta.url);
+const argv = process.argv.slice(2);
+const flag = (n) => { const i = argv.indexOf(n); return i >= 0 ? argv[i + 1] : undefined; };
+const out = (o) => console.log(JSON.stringify(o));
+
+async function wander() {
+  const lat = Number(flag("--lat")), lon = Number(flag("--lon"));
+  const arrivedMs = Date.parse(flag("--arrived") || "");
+  if (!Number.isFinite(lat) || !Number.isFinite(lon) || !Number.isFinite(arrivedMs)) {
+    return out({ verdict: "dispatch", reason: "geom-error: missing --lat/--lon/--arrived (fail open)" });
+  }
+  const home = routineWalk(lat, lon, Date.now());
+  if (home) return out({ verdict: "skip", reason: `routine-walk (at ${home} inside a walk window)` });
+  const { request } = require("../lib/supabase-rest.js");
+  const from = new Date(arrivedMs - 40 * 60000).toISOString();
+  const to = new Date(arrivedMs).toISOString();
+  const rows = (await request(`/rest/v1/location_history?created_at=gte.${from}&created_at=lte.${to}&select=latitude,longitude,created_at&order=created_at.asc&limit=500`)) || [];
+  const c = classifyWander(rows.map((r) => ({ lat: Number(r.latitude), lon: Number(r.longitude) })));
+  if (c.kind === "no-data") return out({ verdict: "skip", reason: `no-gps-before-stop (${c.points} fixes)`, ...c });
+  if (c.kind === "transit") return out({ verdict: "skip", reason: `transit (${c.why})`, ...c });
+  return out({ verdict: "dispatch", reason: c.kind, ...c });
+}
+
+function prox() {
+  const lat = Number(flag("--lat")), lon = Number(flag("--lon"));
+  const cands = JSON.parse(fs.readFileSync(flag("--candidates"), "utf8"));
+  out(proximity(Array.isArray(cands) ? cands : cands.candidates || [], lat, lon));
+}
+
+try {
+  if (argv[0] === "wander") await wander();
+  else if (argv[0] === "proximity") prox();
+  else { process.stderr.write("usage: location-ambient-geom <wander|proximity> ...\n"); process.exit(2); }
+} catch (e) {
+  if (argv[0] === "wander") out({ verdict: "dispatch", reason: `geom-error: ${e.message || e} (fail open)` });
+  else { process.stderr.write(`location-ambient-geom: ${e.message || e}\n`); process.exit(1); }
+}

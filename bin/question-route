@@ -1,0 +1,49 @@
+#!/usr/bin/env node
+// question-route — CLI over lib/question-route.mjs, for bin/jori-send-curl.
+//
+// Prints one JSON line: {"channel":"chat"|"questions","urgent":bool,"question":bool,"reason":...}
+// Always exits 0; any failure prints the chat route, so a broken router can
+// never lose a message. A message not labelled a question is read by a model
+// first (lib/question-route.mjs asksQuestion), on its own ~12 s budget.
+//
+// Usage:
+//   question-route [--intent <i>] [--hum-context <file>] [--question] [--location]
+//                  [--choices] [--private-data] < message
+//
+// --choices: tappable answers ride on the message. --private-data: the intent
+// carries jori-model-only content, so the words are never read for an ask.
+
+import fs from "node:fs";
+
+const args = process.argv.slice(2);
+function flag(name, hasValue = true) {
+  const i = args.indexOf(name);
+  if (i < 0) return undefined;
+  if (!hasValue) { args.splice(i, 1); return true; }
+  const v = args[i + 1];
+  args.splice(i, 2);
+  return v;
+}
+
+const DEADLINE_MS = Number(process.env.QUESTION_ROUTE_DEADLINE_MS) || 90000;
+const FALLBACK = { channel: "chat", urgent: false, question: false, reason: "router unavailable" };
+
+try {
+  const intent = flag("--intent") || "";
+  const ctxFile = flag("--hum-context");
+  const explicit = Boolean(flag("--question", false));
+  const location = Boolean(flag("--location", false));
+  const choices = Boolean(flag("--choices", false));
+  const privateData = Boolean(flag("--private-data", false));
+  let context = null;
+  if (ctxFile) { try { context = JSON.parse(fs.readFileSync(ctxFile, "utf8")); } catch { /* route without it */ } }
+  const text = fs.readFileSync(0, "utf8");
+  const { routeQuestion } = await import("../lib/question-route.mjs");
+  // Bounded: the send waits on this. Past the deadline the message stays in chat.
+  const deadline = new Promise((resolve) => setTimeout(() => resolve({ ...FALLBACK, reason: "router timeout" }), DEADLINE_MS).unref());
+  const r = await Promise.race([routeQuestion({ text, intent, context, explicit, location, choices, privateData }), deadline]);
+  console.log(JSON.stringify(r));
+  process.exit(0);
+} catch (e) {
+  console.log(JSON.stringify({ ...FALLBACK, reason: `router error: ${String(e?.message || e).slice(0, 120)}` }));
+}

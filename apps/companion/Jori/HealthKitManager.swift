@@ -29,7 +29,7 @@ final class HealthKitManager {
 
     private let store = HKHealthStore()
     private let batchSize = 500
-    private let anchorKeyPrefix = "jori.health.anchor."
+    private let anchorKeyPrefix = Install.key("health.anchor.")
 
     // MARK: - Type catalog
 
@@ -225,7 +225,68 @@ final class HealthKitManager {
         for type in clinicalSampleTypes {
             await syncClinicalType(type, reason: reason, deviceId: deviceId)
         }
+        await syncRecentSleepWindow(deviceId: deviceId)
         await startProgressiveBackfillIfNeeded(deviceId: deviceId)
+    }
+
+    // MARK: - Sleep, belt and braces (2026-10-08)
+
+    /// Sleep stopped reaching `health_samples` after 2026-09-20 while the
+    /// Watch's overnight vitals kept arriving. Whatever the anchored path is
+    /// doing, the last 72 h of sleep is re-read directly on every sync and
+    /// upserted by hk_uuid (idempotent), so a stuck anchor or a missed observer
+    /// wake can never again hide a night. The count is kept for `diagnose()`.
+    private let sleepWindowS: TimeInterval = 72 * 3600
+    private let lastSleepWindowKey = Install.key("health.sleepWindow.last")
+
+    private func syncRecentSleepWindow(deviceId: String) async {
+        guard let type = HKCategoryType.categoryType(forIdentifier: .sleepAnalysis) else { return }
+        let samples = (try? await recentSamples(type: type, seconds: sleepWindowS)) ?? []
+        var note = "count=\(samples.count)"
+        if !samples.isEmpty {
+            do { try await uploadSamples(samples, type: type, deviceId: deviceId) }
+            catch { note += " upload_error=\(error.localizedDescription)" }
+        }
+        UserDefaults.standard.set("\(iso.string(from: Date())) \(note)", forKey: lastSleepWindowKey)
+        print("[Health] sleep window: \(note)")
+    }
+
+    private func recentSamples(type: HKSampleType, seconds: TimeInterval) async throws -> [HKSample] {
+        try await withCheckedThrowingContinuation { cont in
+            let pred = HKQuery.predicateForSamples(withStart: Date().addingTimeInterval(-seconds), end: nil)
+            let q = HKSampleQuery(sampleType: type, predicate: pred, limit: HKObjectQueryNoLimit,
+                                  sortDescriptors: nil) { _, samples, error in
+                if let error = error { cont.resume(throwing: error); return }
+                cont.resume(returning: samples ?? [])
+            }
+            store.execute(q)
+        }
+    }
+
+    /// Phone-side facts for the `health_diagnose` remote command. Read
+    /// authorization is private in HealthKit (a denied read looks exactly like
+    /// "no data"), so the evidence is: how many sleep samples this phone can
+    /// read for the last 7 days and from which sources, vs the overnight
+    /// vitals it CAN read for the same nights.
+    func diagnose() async -> [String: String] {
+        var out: [String: String] = ["device_id": currentDeviceId() ?? "unknown",
+                                     "health_available": "\(HKHealthStore.isHealthDataAvailable())"]
+        let week: TimeInterval = 7 * 24 * 3600
+        if let sleep = HKCategoryType.categoryType(forIdentifier: .sleepAnalysis) {
+            do {
+                let s = try await recentSamples(type: sleep, seconds: week)
+                out["sleep_7d_count"] = "\(s.count)"
+                out["sleep_7d_sources"] = Set(s.map { $0.sourceRevision.source.name }).sorted().joined(separator: ", ")
+                out["sleep_7d_latest_end"] = s.map(\.endDate).max().map { iso.string(from: $0) } ?? "none"
+            } catch { out["sleep_7d_error"] = error.localizedDescription }
+            out["sleep_anchor_present"] = "\(loadAnchor(anchorKeyPrefix + sleep.identifier) != nil)"
+        }
+        if let rr = HKQuantityType.quantityType(forIdentifier: .respiratoryRate) {
+            let s = (try? await recentSamples(type: rr, seconds: week)) ?? []
+            out["respiratory_7d_count"] = "\(s.count)"
+        }
+        out["last_sleep_window"] = UserDefaults.standard.string(forKey: lastSleepWindowKey) ?? "never"
+        return out
     }
 
     // MARK: - Aggregate path
@@ -342,7 +403,7 @@ final class HealthKitManager {
 
     private enum StatGranularity: String { case daily, weekly, yearly }
 
-    private let backfillDoneKey = "jori.health.backfill.done"
+    private let backfillDoneKey = Install.key("health.backfill.done")
     private let backfillCycleDelay: UInt64 = 8 * 1_000_000_000 // 8s between chunks
     private var backfillTask: Task<Void, Never>?
 
@@ -760,7 +821,7 @@ final class HealthKitManager {
     }
 
     private func currentDeviceId() -> String? {
-        if let token = UserDefaults.standard.string(forKey: "jori.apnsDeviceToken"),
+        if let token = UserDefaults.standard.string(forKey: Install.key("apnsDeviceToken")),
            !token.isEmpty {
             return token
         }

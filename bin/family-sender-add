@@ -1,0 +1,229 @@
+#!/usr/bin/env node
+// family-sender-add — add a family member's new email address, and ONLY one
+// whose mail Jori is holding.
+//
+// Why it exists. A family member who emails the agent from a second address
+// used to be dropped as not-allowlisted, unheard. The inbound gate now HOLDS
+// mail from an unknown person (lib/email-inbound-gate.mjs § Held mail) and
+// tells the user in chat with the exact address. Only the user's explicit
+// "add <address>" adds it, through one small guarded command. This is that
+// command.
+//
+// Why it is guarded, and how (the reviewer's two objections to the first
+// version):
+//   1. Adding an address extends the family finance access the user set up
+//      (docs/financial-carveouts.md § Family Q&A). That access is the user's
+//      to grant, so nothing here runs on Jori's own initiative: the chat
+//      agent runs it only on the user's explicit "add <address>" (chat-agent CLAUDE.md
+//      § Held family email), and the finance-access rule names this command as
+//      the one path.
+//   2. A stray "yes" meant for another question must never count. So the
+//      command itself checks two facts, both identifiers, never wording:
+//        - the address is EXACTLY one the gate is holding mail from (pending,
+//          under 30 days old). Anything else is refused.
+//        - a message the user typed in chat since that email was held contains
+//          that exact address. A bare "yes", "add it" or "sure" contains no
+//          address, so it can never satisfy this, whatever the chat agent
+//          believed was meant. Whether the user meant "add" is the chat agent's
+//          (model) reading; that the address is in the user's own words is
+//          this check's.
+//   It also never invents a scope: --as must name an existing family member
+//   who already has email Q&A, and the new address gets exactly that member's
+//   view (same `inherits`, same `email_deny_ids`).
+//
+// What it does, in order: adds the identity to data/wiki-share-scopes.json
+// (written atomically), adds the address to data/p1-senders.json when the
+// member's other addresses are there, marks the hold "added", pushes the scopes
+// to the cloud copy the shared memory site reads (wiki-cloud-sync push), and replays the
+// held email to bin/family-qa so the sender gets the answer they asked for.
+//
+// Usage:
+//   family-sender-add <address> --as <Name>        (e.g. --as Sam)
+//   family-sender-add list                          (pending holds)
+//   family-sender-add dismiss <address>             (drop a hold; adds nothing)
+//   flags: --dry-run (check everything, write nothing), --no-replay
+// Exit: 0 added/listed · 2 usage · 3 refused (the guard) · 1 error.
+
+import fs from "node:fs";
+import path from "node:path";
+import { spawn } from "node:child_process";
+import { createRequire } from "node:module";
+import { readHolds, pendingHoldsFor, normAddress, HELD_FILE, HELD_DIR } from "../lib/email-inbound-gate.mjs";
+
+const require = createRequire(import.meta.url);
+const owner = () => require("../lib/instance.cjs").instance().owner_name;
+const ROOT = process.env.FAMILY_SENDER_ADD_ROOT || path.resolve(path.dirname(new URL(import.meta.url).pathname), "..");
+const DATA = path.join(ROOT, "data");
+const SCOPES = path.join(DATA, "wiki-share-scopes.json");
+const P1 = path.join(DATA, "p1-senders.json");
+const LOG = path.join(DATA, "family-sender-add-log.jsonl");
+const NO_SIDE_EFFECTS = process.env.FAMILY_SENDER_ADD_NO_SIDE_EFFECTS === "1";
+// lang-regex-ok: shape check of an email ADDRESS (an identifier), not language.
+const ADDRESS_SHAPE = /^[^\s@<>"]+@[^\s@<>"]+\.[^\s@<>"]+$/;
+
+const args = process.argv.slice(2);
+const has = (f) => args.includes(f);
+const opt = (f) => { const i = args.indexOf(f); return i >= 0 ? args[i + 1] : undefined; };
+const positional = args.filter((a, i) => !a.startsWith("--") && !(i > 0 && ["--as"].includes(args[i - 1])));
+
+function out(code, msg) { (code === 0 ? console.log : console.error)(msg); process.exit(code); }
+function log(row) { try { fs.appendFileSync(LOG, JSON.stringify({ ts: new Date().toISOString(), ...row }) + "\n"); } catch {} }
+function readJson(file, empty) {
+  try { return JSON.parse(fs.readFileSync(file, "utf8")); }
+  catch (e) { if (e.code === "ENOENT") return empty; throw e; }
+}
+function writeJsonAtomic(file, obj) {
+  const tmp = `${file}.tmp.${process.pid}`;
+  fs.writeFileSync(tmp, JSON.stringify(obj, null, 2) + "\n");
+  fs.renameSync(tmp, file);
+}
+const today = () => new Date().toISOString().slice(0, 10);
+
+// The user's own chat messages since `sinceIso`. Test fixture via env; otherwise
+// Supabase jori_messages (role=user). Returns null when unreadable.
+async function hisMessagesSince(sinceIso) {
+  const fixture = process.env.FAMILY_SENDER_ADD_MESSAGES_FILE;
+  if (fixture) {
+    try { return JSON.parse(fs.readFileSync(fixture, "utf8")).filter((m) => m.role === "user" && m.created_at >= sinceIso); }
+    catch { return null; }
+  }
+  const { fetchJson } = require("../lib/supabase-rest.js");
+  const q = `/rest/v1/jori_messages?role=eq.user&created_at=gte.${encodeURIComponent(sinceIso)}&select=content,created_at&order=created_at.desc&limit=200`;
+  const rows = await fetchJson(q, { timeoutMs: 10000 });
+  return Array.isArray(rows) ? rows : null;
+}
+
+// Exact-identifier containment: does this message of the user's carry the
+// address? Not an interpretation of what was said — whether the user meant
+// "add" is the chat agent's reading; this only proves the address came from
+// the user.
+// Token-exact, so "x@example.co" is not found inside "x@example.com".
+const EDGE = new Set(["<", ">", ",", ".", ";", ":", "\"", "'", "(", ")", "[", "]", "!", "?", "`", "*"]);
+function addressTokens(s) {
+  const toks = [];
+  let cur = "";
+  for (const ch of String(s || "").toLowerCase() + " ") {
+    if (ch.trim() === "") { if (cur) toks.push(cur); cur = ""; } else cur += ch;
+  }
+  return toks.map((t) => {
+    let a = 0, b = t.length;
+    while (a < b && EDGE.has(t[a])) a++;
+    while (b > a && EDGE.has(t[b - 1])) b--;
+    return t.slice(a, b);
+  });
+}
+const carriesAddress = (row, address) => addressTokens(row && row.content).includes(address);
+
+function familyTemplates(scopes) {
+  const out = new Map();
+  for (const [addr, e] of Object.entries(scopes.identities || {})) {
+    if (!e || e.unrestricted || !e.email_qa || !e.label) continue;
+    const key = e.label.toLowerCase();
+    if (!out.has(key)) out.set(key, { label: e.label, addresses: [], template: e });
+    out.get(key).addresses.push(addr);
+  }
+  return out;
+}
+
+async function main() {
+  const cmd = positional[0];
+  if (!cmd || has("--help")) out(2, "Usage: family-sender-add <address> --as <Name> | list | dismiss <address>  [--dry-run] [--no-replay]");
+
+  if (cmd === "list") {
+    const pending = readHolds(DATA).filter((h) => h.status === "held");
+    out(0, pending.length ? pending.map((h) => `${h.ts}  ${h.from}  "${h.subject || ""}"  (${h.hold_id})`).join("\n") : "No held emails.");
+  }
+
+  if (cmd === "dismiss") {
+    const address = normAddress(positional[1]);
+    const holds = pendingHoldsFor(address, DATA);
+    if (!holds.length) out(3, `REFUSED: no held email from ${address}.`);
+    for (const h of holds) fs.appendFileSync(path.join(DATA, HELD_FILE), JSON.stringify({ ts: new Date().toISOString(), hold_id: h.hold_id, status: "dismissed" }) + "\n");
+    log({ action: "dismiss", address, holds: holds.map((h) => h.hold_id) });
+    out(0, `Dismissed ${holds.length} held email(s) from ${address}. Nothing was added.`);
+  }
+
+  const address = normAddress(cmd);
+  const asName = String(opt("--as") || "").trim();
+  if (!ADDRESS_SHAPE.test(address)) out(2, `"${cmd}" is not an email address.`);
+  if (!asName) out(2, "Name the family member this address belongs to: --as <Name> (e.g. --as Sam).");
+
+  // Guard 1 — exactly an address the gate is holding mail from.
+  const holds = pendingHoldsFor(address, DATA);
+  if (!holds.length) {
+    log({ action: "refused", reason: "not-held", address, as: asName });
+    out(3, `REFUSED: Jori is not holding any email from ${address}. This command only adds an address whose email is held (family-sender-add list).`);
+  }
+  const hold = holds[holds.length - 1]; // the oldest pending one: the "add" came after it
+
+  const scopes = readJson(SCOPES, { identities: {} });
+  if (scopes.identities && scopes.identities[address]) out(3, `REFUSED: ${address} is already in the family share scopes.`);
+
+  // Guard 2 — the user typed this exact address in chat after it was held.
+  const msgs = await hisMessagesSince(hold.ts);
+  if (msgs === null) {
+    log({ action: "refused", reason: "chat-unreadable", address, as: asName });
+    out(3, "REFUSED: could not read your chat messages to confirm you typed the address, so nothing was added. Try again in a minute.");
+  }
+  const said = msgs.find((m) => carriesAddress(m, address));
+  if (!said) {
+    log({ action: "refused", reason: "address-not-in-his-words", address, as: asName });
+    out(3, `REFUSED: no message from ${owner()} since the email was held contains ${address}. A "yes" is not enough — the address itself has to be written ("add ${address}").`);
+  }
+
+  // Scope — an existing family member with email Q&A; copy their view exactly.
+  const fam = familyTemplates(scopes).get(asName.toLowerCase());
+  if (!fam) {
+    const names = [...familyTemplates(scopes).values()].map((f) => f.label).join(", ");
+    out(3, `REFUSED: "${asName}" is not a family member with email access. Choose one of: ${names}. (Full-access addresses are not added here.)`);
+  }
+  const t = fam.template;
+  const quote = String(said.content || "").trim().slice(0, 200);
+  const entry = {
+    label: fam.label,
+    ...(t.inherits ? { inherits: t.inherits } : {}),
+    email_qa: true,
+    ...(t.email_deny_ids ? { email_deny_ids: [...t.email_deny_ids] } : {}),
+    note: `${fam.label}'s address ${address}, added ${today()} by family-sender-add on ${owner()}'s word in chat ("${quote}"), after Jori held "${hold.subject || ""}" from it. Same view as ${fam.label}'s other address(es): ${fam.addresses.join(", ")}.`,
+  };
+
+  // P1 sender list: only when the member's other addresses are on it.
+  const p1 = readJson(P1, { senders: [] });
+  const sibling = (p1.senders || []).find((s) => s.pattern && fam.addresses.includes(String(s.pattern).toLowerCase()));
+  const p1Add = sibling && !(p1.senders || []).some((s) => String(s.pattern || "").toLowerCase() === address)
+    ? { pattern: address, added: today(), label: sibling.label || "personal", reason: `${sibling.reason || "family"} (added by family-sender-add on ${owner()}'s "add ${address}")` }
+    : null;
+
+  if (has("--dry-run")) {
+    out(0, `Would add ${address} as ${fam.label}${p1Add ? " (and to the P1 sender list)" : ""}, then replay "${hold.subject || ""}". Nothing written (--dry-run).`);
+  }
+
+  // Insert right after the member's last existing address, keeping file order.
+  const ids = Object.entries(scopes.identities);
+  const lastIdx = Math.max(...ids.map(([a], i) => (fam.addresses.includes(a) ? i : -1)));
+  ids.splice(lastIdx + 1, 0, [address, entry]);
+  scopes.identities = Object.fromEntries(ids);
+  writeJsonAtomic(SCOPES, scopes);
+  if (p1Add) { p1.senders.push(p1Add); writeJsonAtomic(P1, p1); }
+  for (const h of holds) fs.appendFileSync(path.join(DATA, HELD_FILE), JSON.stringify({ ts: new Date().toISOString(), hold_id: h.hold_id, status: "added", as: fam.label }) + "\n");
+  log({ action: "added", address, as: fam.label, holds: holds.map((h) => h.hold_id), p1: Boolean(p1Add), his_words: quote });
+
+  if (!NO_SIDE_EFFECTS) {
+    // The cloud copy the shared memory site reads (Supabase wiki_config.share_scopes).
+    try { spawn(path.join(ROOT, "bin/wiki-cloud-sync"), ["push", "--quiet"], { detached: true, stdio: "ignore" }).unref(); } catch {}
+    // Answer what was asked: replay each held email to family-qa.
+    if (!has("--no-replay")) {
+      for (const h of holds) {
+        try {
+          const email = fs.readFileSync(path.join(DATA, HELD_DIR, `${h.hold_id}.json`), "utf8");
+          const child = spawn(path.join(ROOT, "bin/family-qa"), [], { detached: true, stdio: ["pipe", "ignore", "ignore"], env: { ...process.env, ANTHROPIC_API_KEY: "" } });
+          child.stdin.end(email);
+          child.unref();
+        } catch {}
+      }
+    }
+  }
+  out(0, `Added ${address} as ${fam.label} (same view as ${fam.addresses.join(", ")})${p1Add ? ", and to the P1 sender list" : ""}. ${has("--no-replay") ? "" : `Answering the held email "${hold.subject || ""}" now.`} Commit data/wiki-share-scopes.json${p1Add ? " and data/p1-senders.json" : ""} with jori-commit.`);
+}
+
+main().catch((e) => out(1, `family-sender-add: ${e.message}`));

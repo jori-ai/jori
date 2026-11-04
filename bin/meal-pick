@@ -1,0 +1,149 @@
+#!/usr/bin/env node
+// meal-pick — the search behind a YES to hum's meal offer.
+//
+//   meal-pick --ping-id <p-...>            (position + meal from the offer ping)
+//   meal-pick --at <lat>,<lon> --meal lunch
+//
+// Prints JSON: {meal, from:{lat,lon,source}, picks:[...], rules:[...]}. The
+// chat-agent reads it and replies with one to three picks in Jori's voice.
+//
+// This is the only hum path that searches Google Places for picks: the
+// requirement is to search for a venue only after the user says yes to an
+// offer; tests/hum-no-places.test.mjs enforces that no harvester or sensor
+// does. (The one other hum-side Places caller is not a search for picks: a
+// venue-existence check when an idea is stored, Pro tier, cached.) One
+// standard-tier text search (no reviews/overview — not the Atmosphere tier),
+// cached, through the guarded client under lane `hum-meal-offer` with its own
+// daily cap (lib/places-tier-policy.json). The user's own tagged places within
+// walking distance come first and cost nothing, when the installation has a
+// source for them (agent/local/config/meals.json `tagged_places_cmd`).
+//
+// Code does geometry and filtering: walking distance (lib/walking.mjs), open
+// now, local-interest ranking. Taste and the user's own rules (meals.json
+// `rules`) are the replying model's job and are printed with the picks so they
+// travel with them.
+//
+// Not set up (no Places key, no tagged-places source): prints empty picks and a
+// note; never fails for a missing integration.
+
+import { execFileSync } from "node:child_process";
+import fs from "node:fs";
+import path from "node:path";
+import { createRequire } from "node:module";
+import { fileURLToPath } from "node:url";
+import { WALK_MAX_M } from "../lib/walking.mjs";
+import { rankLocalInterest } from "../lib/local-interest-rank.mjs";
+import { latestFix } from "../lib/local-history-ledger.mjs";
+import { loadEnv } from "../lib/load-env.js";
+
+const require = createRequire(import.meta.url);
+const { localConfig } = require("../lib/instance.cjs");
+const { installTools } = require("../lib/root.cjs");
+
+loadEnv();
+const BIN = path.dirname(fileURLToPath(import.meta.url));
+const FEEDBACK = installTools("data", "hum-feedback.jsonl");
+
+// Per-installation meal config (agent/local/config/meals.json):
+//   queries:           the Places text query per meal
+//   rules:             the user's own rules for choosing (taste, dietary, party)
+//   tagged_places_cmd: a command (one line, split on spaces, or an argv list)
+//                      listing the user's own tagged places,
+//                      called as <cmd…> near <lat> <lon> --km <km> --json and
+//                      printing [{name, km, address, statuses, maps_url, lat, lng}]
+//                      (a bare name is resolved next to this script)
+const CFG = localConfig("meals", {
+  queries: { breakfast: "breakfast cafe bakery", lunch: "lunch restaurant", dinner: "dinner restaurant" },
+  rules: [],
+  tagged_places_cmd: "",
+});
+const QUERIES = CFG.queries || {};
+
+const args = process.argv.slice(2);
+const flag = (n) => { const i = args.indexOf(n); return i >= 0 ? args[i + 1] : undefined; };
+const pingId = flag("--ping-id");
+let meal = flag("--meal");
+let at = flag("--at");
+
+let from = null;
+if (pingId) {
+  let lines = [];
+  try { lines = fs.readFileSync(FEEDBACK, "utf8").trim().split("\n").reverse(); } catch { /* no hum feedback yet */ }
+  for (const ln of lines) {
+    let r; try { r = JSON.parse(ln); } catch { continue; }
+    if (r.ping_id !== pingId) continue;
+    const sd = r.findings?.[0]?.supporting_data || {};
+    meal = meal || sd.meal;
+    if (Number.isFinite(Number(sd.lat))) from = { lat: Number(sd.lat), lon: Number(sd.lon), source: "offer", at: r.sent_at };
+    break;
+  }
+  if (!from && !at) { console.error(`meal-pick: no offer ping ${pingId} in hum-feedback`); process.exit(2); }
+}
+if (at) {
+  const [la, lo] = at.split(",").map(Number);
+  from = { lat: la, lon: lo, source: "--at" };
+}
+// The user may have walked since the offer. A fresher fix wins.
+const fix = await latestFix().catch(() => null);
+if (fix && (!from?.at || Date.parse(fix.at) > Date.parse(from.at)) && (Date.now() - Date.parse(fix.at)) < 30 * 60000) {
+  from = { lat: fix.lat, lon: fix.lon, source: "latest fix", at: fix.at };
+}
+if (!from) { console.error("meal-pick: no position"); process.exit(2); }
+meal = QUERIES[meal] ? meal : "lunch";
+
+const notes = [];
+const picks = [];
+// 1. The user's own tagged places — free, and their own judgement.
+const tagged = Array.isArray(CFG.tagged_places_cmd) ? [...CFG.tagged_places_cmd]
+  : String(CFG.tagged_places_cmd || "").split(/\s+/).filter(Boolean);
+if (tagged.length) {
+  if (!tagged[0].includes("/") && fs.existsSync(path.join(BIN, tagged[0]))) tagged[0] = path.join(BIN, tagged[0]);
+  try {
+    const rows = JSON.parse(execFileSync(tagged[0],
+      [...tagged.slice(1), "near", String(from.lat), String(from.lon), "--km", String(WALK_MAX_M / 1000), "--json"],
+      { encoding: "utf8", timeout: 10000 }));
+    for (const r of Array.isArray(rows) ? rows : []) {
+      if (!r?.name) continue;
+      picks.push({ name: r.name, distance: Number.isFinite(Number(r.km)) ? Math.round(Number(r.km) * 1000) : null,
+        address: r.address || null, marker: (r.statuses || [])[0] || "tagged", mapsUrl: r.maps_url || null,
+        lat: r.lat ?? null, lng: r.lng ?? null, source: "tagged" });
+    }
+  } catch { /* none tagged nearby */ }
+}
+
+// 2. One search, standard tier, walking radius.
+try {
+  const raw = execFileSync(path.join(BIN, "places"), [
+    "at", `${from.lat},${from.lon}`, QUERIES[meal], "--radius", String(WALK_MAX_M), "--limit", "20", "--json",
+    "--tier", "standard", "--lane", "hum-meal-offer",
+  ], { encoding: "utf8", timeout: 25000, maxBuffer: 4 * 1024 * 1024, stdio: ["ignore", "pipe", "pipe"] });
+  const rows = JSON.parse(raw)?.results || [];
+  for (const { photos, ...r } of rows) {
+    void photos; // carry the API key in their URLs — never forward
+    const d = Number(r.distance);
+    if (!Number.isFinite(d) || d > WALK_MAX_M) continue; // the API widens its own net
+    if (r.isOpen === false) continue;
+    if (picks.some((p) => p.name === r.name)) continue;
+    picks.push({ ...r, source: "places" });
+  }
+} catch (e) {
+  notes.push(e?.status ? `places refused (exit ${e.status}) — not set up, budget or policy` : `places failed: ${e.message}`);
+}
+
+const ranked = rankLocalInterest(picks).slice(0, 6).map((p) => ({
+  name: p.name, distance_m: p.distance ?? null,
+  walk_min: p.distance == null ? null : Math.round((p.distance * 1.25) / 80),
+  type: p.type || null, rating: p.rating ?? null, reviews: p.ratingCount ?? null,
+  price: p.priceLevel || null, open_now: p.isOpen ?? null, tagged_by_user: p.marker || null,
+  maps_url: p.mapsUrl || null, address: p.address || null,
+}));
+
+console.log(JSON.stringify({
+  meal, from: { lat: from.lat, lon: from.lon, source: from.source }, walk_max_m: WALK_MAX_M,
+  picks: ranked, note: notes.length ? notes.join("; ") : null,
+  rules: [
+    "Reply with ONE to THREE picks, warmest first, each with walking minutes and one specific reason.",
+    "Prefer neighbourhood places over heavy-review tourist spots; the user's own tagged places first.",
+    ...(Array.isArray(CFG.rules) ? CFG.rules : []),
+  ],
+}, null, 2));

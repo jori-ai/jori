@@ -1,0 +1,4 @@
+# The installation's own resources (NamedLocations.json, …) are copied here
+# before a build; the kernel ships this folder empty. See Config/Jori.xcconfig.
+*
+!.gitignore

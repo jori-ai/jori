@@ -1,0 +1,164 @@
+#!/usr/bin/env python3
+"""geofence-check — is the user currently at a given place?
+
+Checks the latest GPS against a named location (data/named-locations.json, by
+name or alias), coordinates, or a geocoded address. Returns inside/outside +
+distance.
+
+Usage:
+  geofence-check home                          # named location (name or alias)
+  geofence-check "<named place>"               # named location
+  geofence-check --coords 12.3456,-65.4321     # raw coordinates
+  geofence-check --address "<street address>"  # geocoded
+  geofence-check --all                         # show distance to all named locations
+  geofence-check home --radius 0.3             # custom radius (km, default 0.15)
+"""
+
+import sys
+import os
+import json
+import urllib.request
+import urllib.parse
+from datetime import datetime, timezone
+from typing import Optional, Tuple, Dict, Any
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "lib"))
+import named_places  # noqa: E402
+import supabase_local  # noqa: E402
+
+DEFAULT_RADIUS_KM = 0.15
+haversine_km = named_places.haversine_km
+
+
+def latest_location() -> Optional[Dict[str, Any]]:
+    if not supabase_local.service_key() or not supabase_local.supabase_url():
+        return None
+    qs = urllib.parse.urlencode([
+        ("order", "arrived_at.desc"),
+        ("limit", "1"),
+        ("select", "arrived_at,latitude,longitude,accuracy_m"),
+    ])
+    rows = supabase_local.rest_get(f"location_history?{qs}", timeout=10)
+    return rows[0] if rows else None
+
+
+def resolve_named(target: str) -> Optional[Dict[str, Any]]:
+    return named_places.resolve(target)
+
+
+def geocode_address(address: str) -> Optional[Tuple[float, float]]:
+    try:
+        q = urllib.parse.quote(address)
+        url = f"https://nominatim.openstreetmap.org/search?q={q}&format=json&limit=1"
+        req = urllib.request.Request(url, headers={"User-Agent": "geofence-check/1.0"})
+        with urllib.request.urlopen(req, timeout=5) as r:
+            data = json.loads(r.read())
+            if data:
+                return float(data[0]["lat"]), float(data[0]["lon"])
+    except Exception:
+        return None
+    return None
+
+
+def main():
+    import argparse
+    p = argparse.ArgumentParser(description="Is the user currently at a given place?")
+    p.add_argument("target", nargs="?", help="Named location (a name or alias from data/named-locations.json)")
+    p.add_argument("--coords", help="lat,lon as target")
+    p.add_argument("--address", help="Address to geocode as target")
+    p.add_argument("--radius", type=float, default=DEFAULT_RADIUS_KM, help="Match radius in km (default 0.15)")
+    p.add_argument("--all", action="store_true", help="Distance to all named locations")
+    args = p.parse_args()
+
+    current = latest_location()
+    if not current or current.get("latitude") is None:
+        print(json.dumps({"ok": False, "error": "no recent location data"}, indent=2))
+        sys.exit(1)
+
+    cur_lat = float(current["latitude"])
+    cur_lon = float(current["longitude"])
+    age_min = (datetime.now(timezone.utc) - datetime.fromisoformat(current["arrived_at"].replace("Z", "+00:00"))).total_seconds() / 60
+
+    if args.all:
+        ranked = []
+        for loc in named_places.load():
+            d = haversine_km(cur_lat, cur_lon, loc["lat"], loc["lon"])
+            ranked.append({
+                "name": loc["name"],
+                "distance_km": round(d, 4),
+                "distance_m": round(d * 1000),
+                "inside": d <= args.radius,
+            })
+        ranked.sort(key=lambda x: x["distance_km"])
+        print(json.dumps({
+            "current": {"lat": cur_lat, "lon": cur_lon, "age_minutes": round(age_min, 1)},
+            "locations": ranked,
+        }, indent=2))
+        return
+
+    # Resolve target
+    target_name = None
+    target_lat = None
+    target_lon = None
+    target_address = None
+
+    if args.coords:
+        try:
+            lat, lon = [float(x) for x in args.coords.split(",")]
+            target_lat, target_lon = lat, lon
+            target_name = f"{lat:.4f}, {lon:.4f}"
+        except Exception:
+            print("ERROR: bad --coords format, expected 'lat,lon'", file=sys.stderr)
+            sys.exit(1)
+    elif args.address:
+        result = geocode_address(args.address)
+        if not result:
+            print(json.dumps({"ok": False, "error": f"could not geocode: {args.address}"}, indent=2))
+            sys.exit(1)
+        target_lat, target_lon = result
+        target_name = args.address
+        target_address = args.address
+    elif args.target:
+        named = resolve_named(args.target)
+        if named:
+            target_lat = named["lat"]
+            target_lon = named["lon"]
+            target_name = named["name"]
+            target_address = named.get("address")
+        else:
+            # Try geocoding
+            result = geocode_address(args.target)
+            if not result:
+                print(json.dumps({"ok": False, "error": f"unknown target: {args.target}"}, indent=2))
+                sys.exit(1)
+            target_lat, target_lon = result
+            target_name = args.target
+            target_address = args.target
+    else:
+        print("ERROR: specify target name, --coords, --address, or --all", file=sys.stderr)
+        sys.exit(1)
+
+    distance = haversine_km(cur_lat, cur_lon, target_lat, target_lon)
+    inside = distance <= args.radius
+    print(json.dumps({
+        "target": {
+            "name": target_name,
+            "address": target_address,
+            "lat": target_lat,
+            "lon": target_lon,
+        },
+        "current": {
+            "lat": cur_lat,
+            "lon": cur_lon,
+            "accuracy_m": current.get("accuracy_m"),
+            "age_minutes": round(age_min, 1),
+        },
+        "distance_km": round(distance, 4),
+        "distance_m": round(distance * 1000),
+        "radius_km": args.radius,
+        "inside": inside,
+    }, indent=2))
+
+
+if __name__ == "__main__":
+    main()

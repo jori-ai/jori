@@ -1,0 +1,117 @@
+#!/usr/bin/env node
+/**
+ * lint-no-language-regex — fail a commit that pattern-matches the user's words.
+ *
+ * THE RULE (absolute): never use a regex for a language-based answer; always
+ * use a model. Code owns geometry — GPS, distance, pace, time windows. A model
+ * owns language — what the user meant.
+ *
+ * WHY THIS IS A HOOK AND NOT A PARAGRAPH. The rule was already written down and
+ * had already been broken four times when it was raised; it was broken a fifth
+ * time by an agent that had read the rule at the start of that very session (`ALL_STOPS_RE`, matching "I already mentioned all our stops" —
+ * correct for that sentence, silently wrong for "that's everything"). Prose does
+ * not hold. The same conclusion is recorded elsewhere in this repo, in the
+ * fabricated-outage gate: "Prose did not hold; the hook does."
+ *
+ * It recurs because a regex is locally cheap and locally correct, and because
+ * the failure is silent and delayed — it matches the example in front of you and
+ * fails weeks later on a paraphrase, inside a nightly job nobody is watching,
+ * by dropping data rather than raising an error.
+ *
+ * WHAT IS FLAGGED: a regex operation on a line that also references a source of
+ * the user's language — chat content, a message, a reply, an answer, a transcript, a
+ * user-supplied place name.
+ *
+ * WHAT IS NOT: regex on machine-generated strings. Parsing "HH:MM", pulling a
+ * URL, escaping HTML, splitting a CSV, matching a filename are all structure,
+ * not meaning. The test is not "does a regex touch text" — it is "does a regex
+ * decide what the user MEANT".
+ *
+ * ESCAPE HATCH: `// lang-regex-ok: <reason>` on the line or the one above. It
+ * exists to force the reason to be written down, which is exactly the step that
+ * gets skipped at 2am — not to make the rule optional.
+ *
+ * Usage: lint-no-language-regex [file ...]        (default: staged files)
+ */
+const { execSync } = require("node:child_process");
+const fs = require("node:fs");
+
+// identifiers that hold something the user said
+const LANGUAGE_SOURCES = [
+  "jori_messages", "content", "message", "messages", "msg", "reply", "replies",
+  "answer", "answers", "transcript", "chat", "utterance", "said", "text_body",
+  "place_name", "user_text", "free_text", "freetext", "body_text", "imsg",
+];
+// NOTE: the location-confirm-resolve.mjs incident (a regex
+// checked `body`, a variable holding a phone-channel message's text) exposed
+// a gap here — "body" isn't in the list above. It's deliberately NOT added:
+// "body" is also the generic name for an HTML document body, an HTTP request
+// body, a markdown body, etc. throughout this codebase, and adding it as a
+// blanket identifier turns dozens of structural-parsing regexes (e.g.
+// lib/episode-html-to-md.js stripping <head>/<style>/<script> tags)
+// into false positives — exactly the noise that makes an escape-hatch rule
+// stop getting read. Catching this class precisely needs the identifier
+// check to also confirm the value came from a message/chat source (e.g. a
+// nearby `.role`/`msgs`/`messages` reference), not just a bare variable
+// name — left as a follow-up rather than shipped half-working.
+const REGEX_OPS = [
+  /\bnew RegExp\s*\(/, /\.test\s*\(/, /\.match\s*\(/, /\.matchAll\s*\(/,
+  /\.exec\s*\(/,   // the venue miner used .exec(text) and slipped the first pass
+  /\.replace\s*\(\s*\//, /\.search\s*\(\s*\//, /\.split\s*\(\s*\//,
+  /\bre\.(search|match|fullmatch|findall|finditer|sub|compile)\s*\(/,
+  /=~/, /\bgrep\s+-E/,
+];
+const ALLOW = /lang-regex-ok:/;
+
+function stagedFiles() {
+  try {
+    return execSync("git diff --cached --name-only --diff-filter=ACM", { encoding: "utf8" })
+      .split("\n").map(s => s.trim()).filter(Boolean);
+  } catch { return []; }
+}
+
+const exts = /\.(js|mjs|cjs|ts|py|sh|bash|zsh)$/;
+const files = (process.argv.slice(2).length ? process.argv.slice(2) : stagedFiles())
+  .filter(f => exts.test(f) && fs.existsSync(f))
+  // the linter necessarily contains the patterns it hunts for
+  .filter(f => !f.endsWith("lint-no-language-regex"));
+
+const hits = [];
+for (const f of files) {
+  const lines = fs.readFileSync(f, "utf8").split("\n");
+  lines.forEach((line, i) => {
+    // Permission comes from THIS line, or from a comment-ONLY line above it.
+    // Accepting any previous line let a trailing `lang-regex-ok` on one
+    // statement silently exempt the next one — which hid a venue-mining regex
+    // in this linter's own test fixture.
+    const prev = (lines[i - 1] || "").trim();
+    const prevIsCommentOnly = /^(\/\/|#)/.test(prev);   // lang-regex-ok: matches source syntax, not the user's words
+    if (ALLOW.test(line) || (prevIsCommentOnly && ALLOW.test(prev))) return;
+    if (!REGEX_OPS.some(rx => rx.test(line))) return;
+    const lower = line.toLowerCase();
+    const src = LANGUAGE_SOURCES.find(s => new RegExp(`\\b${s}\\b`).test(lower));
+    if (!src) return;
+    hits.push({ file: f, line: i + 1, src, text: line.trim().slice(0, 120) });
+  });
+}
+
+if (!hits.length) process.exit(0);
+
+console.error("\n✗ regex applied to the user's language — this is never allowed.\n");
+for (const h of hits) {
+  console.error(`  ${h.file}:${h.line}  (matches on "${h.src}")`);
+  console.error(`      ${h.text}`);
+}
+console.error(`
+  Code owns geometry. A model owns language.
+
+  Use a model instead — bin/day-statements is the worked example, and it
+  climbs local -> sonnet -> opus so the cheap tier is tried first. For a single
+  short judgment, localLlmChat() in lib/local-llm.mjs is usually enough.
+
+  If this regex parses STRUCTURE and not meaning (an HH:MM stamp, a URL, an
+  HTML escape), say so on the line:
+
+      // lang-regex-ok: extracts a URL, does not interpret meaning
+`);
+process.exit(1);

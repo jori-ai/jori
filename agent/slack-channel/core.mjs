@@ -7,7 +7,7 @@
 // mention markup), never on what a message says.
 
 export const DEFAULTS = {
-  port: 9108,
+  port: null, // null → lib/ports.cjs "slack" (index.mjs resolves it; this module does no I/O)
   api_base: "https://slack.com/api",
   // The web client's websocket gateway, used only when rtm.connect refuses the token.
   ws_gateway: "wss://wss-primary.slack.com", // kernel-guard-ok: Slack's public gateway host, not a workspace

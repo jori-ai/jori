@@ -1,0 +1,222 @@
+#!/usr/bin/env node
+"use strict";
+// trip-reservoir-photos — give every area-guide entry a representative photo.
+//
+// The guide builder (trip-reservoir-build) verifies each place against Google
+// Places but doesn't fetch an image; the daily itinerary did that per-day at
+// send time. Now that the guides ARE the site, each entry should carry its own
+// photo, added by the guide builder after the initial research (and
+// retroactively for guides built before this existed).
+//
+// This is the "after the initial research" pass: it reads each reservoir, and
+// for every entry without a photo yet, re-hosts one via trip-place-photo
+// (Google Places photo of that exact place -> Supabase storage, so the stored
+// URL is never a Google URL with a live API key in it). The resulting public
+// URL is written to `entry.photo_url`, carried forward on rebuild by
+// carryAnnotations, and rendered by both the site and the wiki mirror.
+//
+// Idempotent: an entry that already has photo_url is skipped, so re-runs only
+// fill gaps. Food specialties use their best_place for the lookup; a dish with
+// no best_place is skipped (nothing to photograph).
+//
+// Cost: one Places call + one upload per new entry, so a full backfill of a
+// fresh trip is a few hundred calls. Runs on the mini (needs
+// GOOGLE_PLACES_API_KEY + SUPABASE_SERVICE_ROLE_KEY).
+//
+// Usage:
+//   trip-reservoir-photos                 # all areas, fill missing photos
+//   trip-reservoir-photos --area <area>
+//   trip-reservoir-photos --limit 20      # stop after N fetches (testing)
+//   trip-reservoir-photos --refresh       # re-fetch even entries that have one
+//   trip-reservoir-photos --retry-failed  # revive entries that gave up
+//   trip-reservoir-photos --dry-run       # list what would be fetched, no calls
+
+const path = require("node:path");
+const { spawnSync } = require("node:child_process");
+const { pullReservoir, saveReservoir, listAreas } = require(path.join(__dirname, "..", "lib", "reservoir-store.js"));
+const { MAX_PHOTO_ATTEMPTS, photoAction, recordPhotoFailure, clearPhotoFailures } =
+  require(path.join(__dirname, "..", "lib", "reservoir-photo-policy.js"));
+
+const BIN = __dirname;
+const argv = process.argv.slice(2);
+const DRY = argv.includes("--dry-run");
+const REFRESH = argv.includes("--refresh");
+// Re-fetch food dishes even if they already have a dish photo — used to migrate
+// the food section onto the wiki-first source (the earlier Unsplash dish shots
+// were often wrong/generic).
+const REFRESH_FOOD = argv.includes("--refresh-food");
+// Revive entries that gave up after MAX_PHOTO_ATTEMPTS misses (see
+// reservoir-photo-policy.js) — for when a lookup query or source is fixed.
+const RETRY_FAILED = argv.includes("--retry-failed");
+const arg = (f) => { const i = argv.indexOf(f); return i >= 0 ? argv[i + 1] : null; };
+const areaArg = arg("--area");
+const limit = arg("--limit") ? parseInt(arg("--limit"), 10) : Infinity;
+
+// What to photograph for an entry.
+//   food_specialties -> the DISH itself, not the restaurant: the local food
+//     section shows a photo of the food, never the restaurant. A dish isn't a place with a Google Places photo, so we key
+//     Unsplash food photography on the dish name (--unsplash-only). The entry's
+//     lat/lon are passed through but ignored by Unsplash.
+//   everything else -> the place, via its Google Places photo.
+function lookupFor(entry, bucket) {
+  if (bucket === "food_specialties") {
+    // Two kinds of food entry, and they photograph differently (schema split
+    // 2026-07-21). A "table" is a restaurant recommended for itself, so its
+    // picture is the RESTAURANT — it has no dish to photograph, and pretending
+    // otherwise is what produced the wrong images: its old `dish` field held a
+    // menu blurb ("cuisine bistrot / navarins, ..."), which no image source can
+    // answer, so every source returned its nearest coincidence instead.
+    const isTable = entry.kind === "table" || !entry.dish;
+    if (isTable) {
+      const name = entry.best_place;
+      if (!name || entry.lat == null || entry.lon == null) return null;
+      const slug = "table-" + (entry.id || name).toString().toLowerCase().replace(/[^a-z0-9]+/g, "-").slice(0, 56);
+      return {
+        name, query: entry.search_query || name, lat: entry.lat, lon: entry.lon,
+        slug, photoName: entry.photoName || null, photoKind: "restaurant",
+      };
+    }
+    const dish = entry.dish;
+    // Try the full dish name first, then a cleaned fallback with the
+    // parenthetical qualifier stripped ("Muscadet (Sèvre-et-Maine, sur lie)" ->
+    // "Muscadet") which catches the niche ones.
+    const cleaned = dish.replace(/\s*\(.*?\)\s*/g, " ").trim();
+    const queries = cleaned && cleaned !== dish ? [dish, cleaned] : [dish];
+    // Encyclopedias title dishes in the SINGULAR ("Huître de Marennes-Oléron"),
+    // menus name them in the plural ("Huîtres de Marennes-Oléron"). Searching
+    // the plural ranks the bassin, the island and three communes above the
+    // oyster — all correctly refused by the gate, leaving no photo for a real
+    // dish. A singular retry is a re-phrasing, not a guess about meaning.
+    const singular = queries[queries.length - 1].replace(/^(\S+?)s\b/, "$1");
+    if (singular !== queries[queries.length - 1]) queries.push(singular);
+    const slug = "food-" + dish.toLowerCase().replace(/[^a-z0-9]+/g, "-").slice(0, 56);
+    // Gated Wikipedia ONLY — no Unsplash. A dish we can't find gets no photo,
+    // which beats a stock shot of a different food entirely.
+    return { queries, lat: entry.lat ?? 0, lon: entry.lon ?? 0, slug, wikiOnly: true, photoKind: "dish" };
+  }
+  const name = entry.name || entry.best_place;
+  if (!name) return null;
+  const query = entry.search_query || name;
+  const lat = entry.lat, lon = entry.lon;
+  if (lat == null || lon == null) return null;
+  const slug = (entry.id || name).toString().toLowerCase().replace(/[^a-z0-9]+/g, "-").slice(0, 60);
+  return { name, query, lat, lon, slug, photoName: entry.photoName || null };
+}
+
+// trip-place-photo prints a JSON object on success ({url, mapsUri,
+// address, ...}); take .url. The bare-URL fallback is just belt-and-braces in
+// case the output format ever changes back.
+function fetchOne(query, lk) {
+  const args = [query, String(lk.lat), String(lk.lon), lk.slug];
+  if (lk.wikiOnly) args.push("--wiki-only");
+  else if (lk.wikiFirst) args.push("--wiki-first");
+  else if (lk.unsplashOnly) args.push("--unsplash-only");
+  if (lk.photoName) args.push("--photo-name", lk.photoName);
+  const r = spawnSync(path.join(BIN, "trip-place-photo"), args, { encoding: "utf8", timeout: 60000 });
+  if (r.status !== 0) return null; // "no photo found / upload failed" — skip, not a job error
+  const out = (r.stdout || "").trim();
+  if (!out) return null;
+  try {
+    const obj = JSON.parse(out);
+    if (obj && typeof obj.url === "string" && obj.url.startsWith("http")) {
+      return { url: obj.url, source: obj.source || null };
+    }
+  } catch {
+    if (out.startsWith("http")) return { url: out, source: null };
+  }
+  return null;
+}
+
+function fetchPhoto(lk) {
+  // Places lookups use a single query; food dishes try a small cascade.
+  for (const q of lk.queries || [lk.query]) {
+    const hit = fetchOne(q, lk);
+    if (hit) return hit;
+  }
+  return null;
+}
+
+(async () => {
+  const areas = areaArg ? [areaArg] : await listAreas();
+  if (!areas.length) { console.error("no reservoirs in Supabase"); process.exit(1); }
+
+  let fetched = 0, skipped = 0, failed = 0, gaveUp = 0, budget = limit;
+  for (const area of areas) {
+    if (budget <= 0) break;
+    const reservoir = await pullReservoir(area);
+    if (!reservoir) { console.error(`skip ${area} — no structured reservoir`); continue; }
+
+    let changed = false, areaFetched = 0;
+
+    // Dedup is NOT done here anymore. Pass 2 of the build (reservoir-dedup.js)
+    // owns it: it's non-destructive (a repeat keeps its row as
+    // state:"duplicate" so carryAnnotations can still carry its done marks and
+    // a wrong merge is recoverable), keys on the dish HEAD phrase, and keeps
+    // the best-rated instance. This pass used to run its OWN destructive
+    // first-occurrence splice with weaker matching — two dedupers that
+    // disagreed. Now it just skips whatever pass 2 marked.
+
+    for (const [bucket, arr] of Object.entries(reservoir.buckets || {})) {
+      if (!Array.isArray(arr)) continue;
+      const isFood = bucket === "food_specialties";
+      for (const entry of arr) {
+        if (!entry) continue;
+        // A pass-2 duplicate is hidden by every renderer — never spend a photo
+        // lookup on it.
+        if (entry.state === "duplicate") continue;
+        const forceRefresh = REFRESH || (isFood && REFRESH_FOOD);
+        const action = photoAction(entry, { isFood, forceRefresh, retryFailed: RETRY_FAILED });
+        // "dead" entries are counted apart from live failures so the failure
+        // count stays a signal that something is NEWLY broken.
+        if (action === "have") { skipped++; continue; }
+        if (action === "dead") { gaveUp++; continue; }
+        const lk = lookupFor(entry, bucket);
+        if (!lk) { skipped++; continue; }
+        if (budget <= 0) break;
+
+        if (DRY) {
+          console.log(`   would fetch: ${area}/${lk.slug} "${(lk.queries || [lk.query]).join(" | ")}"${lk.unsplashOnly ? " [dish]" : ""}`);
+          fetched++; budget--; areaFetched++;
+          continue;
+        }
+        const hit = fetchPhoto(lk);
+        budget--;
+        if (hit) {
+          entry.photo_url = hit.url;
+          if (lk.photoKind) entry.photo_kind = lk.photoKind;
+          // Reported by the fetcher, not guessed here — the dish ladder can end
+          // on wiki, commons or google-images and we want to know which.
+          entry.photo_source = hit.source || (lk.wikiOnly ? "wiki" : "places");
+          clearPhotoFailures(entry);
+          changed = true; fetched++; areaFetched++;
+          console.log(`   ✓ ${area}/${lk.slug} [${entry.photo_source}]`);
+        } else {
+          failed++;
+          const nowDead = recordPhotoFailure(entry);
+          changed = true;
+          const why = nowDead
+            ? ` — giving up after ${MAX_PHOTO_ATTEMPTS} attempts`
+            : `, attempt ${entry.photo_attempts}/${MAX_PHOTO_ATTEMPTS}`;
+          // A DISH entry must never fall back to a restaurant photo (the food
+          // section shows the food, not the restaurant). So if the dish shot can't be found, strip any
+          // non-dish photo it's carrying and show nothing. A "table" entry is
+          // exempt: a restaurant photo is exactly what it should have.
+          if (lk.photoKind === "dish" && entry.photo_url && entry.photo_kind !== "dish") {
+            delete entry.photo_url;
+            console.log(`   ✗ ${area}/${lk.slug} (no dish photo — cleared restaurant photo${why})`);
+          } else {
+            console.log(`   ✗ ${area}/${lk.slug} (no photo${why})`);
+          }
+        }
+      }
+    }
+    if (changed && !DRY) await saveReservoir(area, reservoir, { wikiSave: true });
+    if (areaFetched) console.log(`${area}: ${areaFetched} photo(s) added`);
+  }
+
+  console.log(
+    `\n${DRY ? "DRY RUN — no calls. " : ""}` +
+    `${fetched} fetched, ${skipped} already had one / skipped, ${failed} failed, ` +
+    `${gaveUp} gave up (dead-lettered).`,
+  );
+})().catch((e) => { console.error(`trip-reservoir-photos failed: ${e.message}`); process.exit(1); });

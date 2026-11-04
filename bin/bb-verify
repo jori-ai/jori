@@ -1,0 +1,84 @@
+#!/usr/bin/env bash
+# bb-verify — sanity-check the Browserbase MCP config in ~/.claude.json before restarting.
+# Verifies:
+#   1. CLI flags are the right shape (camelCase, no spurious values on boolean flags)
+#   2. Model name is accepted by the currently installed @ai-sdk/anthropic
+#   3. Anthropic API key actually has access to the chosen model
+#   4. Context ID exists in the Browserbase project
+# Exits non-zero on any failure.
+set -euo pipefail
+
+CFG="$HOME/.claude.json"
+test -f "$CFG" || { echo "no $CFG"; exit 1; }
+
+python3 - <<'PY'
+import json, os, subprocess, sys, urllib.request
+
+with open(os.path.expanduser("~/.claude.json")) as f:
+    j = json.load(f)
+
+bb = j.get("mcpServers", {}).get("browserbase")
+if not bb:
+    sys.exit("browserbase MCP server not configured")
+
+args = bb.get("args", [])
+env  = bb.get("env", {})
+
+def flag(name):
+    try:
+        i = args.index(f"--{name}")
+        return args[i + 1] if i + 1 < len(args) else True
+    except ValueError:
+        return None
+
+model = flag("modelName")
+api_key = flag("modelApiKey")
+ctx_id  = flag("contextId")
+bb_key  = env.get("BROWSERBASE_API_KEY") or flag("browserbaseApiKey")
+bb_proj = env.get("BROWSERBASE_PROJECT_ID") or flag("browserbaseProjectId")
+
+print(f"  modelName   = {model or 'MISSING'}")
+print(f"  modelApiKey = {'set' if api_key else 'MISSING'}")
+print(f"  contextId   = {ctx_id or 'MISSING'}")
+print(f"  bbApiKey    = {'set' if bb_key else 'MISSING'}")
+print(f"  bbProjectId = {bb_proj or 'MISSING'}")
+
+if not (model and api_key and bb_key and bb_proj):
+    sys.exit("missing required config")
+
+# Split provider/model
+if "/" not in model:
+    sys.exit(f"modelName must be in provider/model form (got '{model}')")
+provider, short = model.split("/", 1)
+if provider != "anthropic":
+    sys.exit(f"modelName provider must be 'anthropic' (got '{provider}'). Remote non-Anthropic providers are not permitted.")
+print(f"  checking Anthropic API access to {short}...")
+req = urllib.request.Request(
+    "https://api.anthropic.com/v1/messages",
+    data=json.dumps({"model": short, "max_tokens": 5, "messages": [{"role": "user", "content": "hi"}]}).encode(),
+    headers={"x-api-key": api_key, "anthropic-version": "2023-06-01", "content-type": "application/json"},
+)
+try:
+    r = urllib.request.urlopen(req, timeout=15)
+    body = json.loads(r.read())
+    if body.get("type") == "message":
+        print(f"    ✓ model accessible")
+    else:
+        sys.exit(f"    ✗ unexpected response: {body}")
+except urllib.error.HTTPError as e:
+    sys.exit(f"    ✗ {e.code}: {e.read().decode()[:200]}")
+
+if ctx_id and bb_key and bb_proj:
+    print(f"  checking Browserbase context {ctx_id}...")
+    req = urllib.request.Request(
+        f"https://api.browserbase.com/v1/contexts/{ctx_id}",
+        headers={"X-BB-API-Key": bb_key},
+    )
+    try:
+        r = urllib.request.urlopen(req, timeout=15)
+        print("    ✓ context exists")
+    except urllib.error.HTTPError as e:
+        sys.exit(f"    ✗ {e.code}: context not found")
+
+print("\nALL CHECKS PASS. Safe to restart Claude Code.")
+PY

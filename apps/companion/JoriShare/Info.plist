@@ -1,0 +1,68 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- What this build is (SupabaseConfig.swift, `Install`): each value is a
+	     build setting from Config/Jori.xcconfig, overridden by an
+	     installation's Config/Installation.xcconfig. -->
+	<key>JoriStoragePrefix</key>
+	<string>$(JORI_STORAGE_PREFIX)</string>
+	<key>JoriKeyTagPrefix</key>
+	<string>$(JORI_KEY_TAG_PREFIX)</string>
+	<key>JoriURLScheme</key>
+	<string>$(JORI_URL_SCHEME)</string>
+	<key>JoriAppGroup</key>
+	<string>$(JORI_APP_GROUP)</string>
+	<key>JoriKeychainGroup</key>
+	<string>$(JORI_KEYCHAIN_GROUP)</string>
+	<key>JoriSupabaseURL</key>
+	<string>$(JORI_SUPABASE_URL)</string>
+	<key>JoriSupabaseAnonKey</key>
+	<string>$(JORI_SUPABASE_ANON_KEY)</string>
+	<key>JoriAttachmentsBucket</key>
+	<string>$(JORI_ATTACHMENTS_BUCKET)</string>
+	<key>JoriLegacyName</key>
+	<string>$(JORI_LEGACY_NAME)</string>
+	<key>JoriSigningPurchase</key>
+	<string>$(JORI_SIGNING_PURCHASE)</string>
+	<key>JoriSigningApprove</key>
+	<string>$(JORI_SIGNING_APPROVE)</string>
+	<key>JoriWikiURL</key>
+	<string>$(JORI_WIKI_URL)</string>
+	<key>JoriTradeApprovalURL</key>
+	<string>$(JORI_TRADE_APPROVAL_URL)</string>
+	<key>JoriTradeApprovalNamespace</key>
+	<string>$(JORI_TRADE_APPROVAL_NAMESPACE)</string>
+	<key>JoriTradeApprovalLabel</key>
+	<string>$(JORI_TRADE_APPROVAL_LABEL)</string>
+	<key>JoriLocationDeviceId</key>
+	<string>$(JORI_LOCATION_DEVICE_ID)</string>
+	<key>JoriFeatures</key>
+	<string>$(JORI_FEATURES)</string>
+	<key>NSExtension</key>
+	<dict>
+		<key>NSExtensionAttributes</key>
+		<dict>
+			<!-- What makes "Jori" appear in the share sheet: text, a web
+			     page/link, photos and files — the things worth asking about. -->
+			<key>NSExtensionActivationRule</key>
+			<dict>
+				<key>NSExtensionActivationSupportsText</key>
+				<true/>
+				<key>NSExtensionActivationSupportsWebURLWithMaxCount</key>
+				<integer>1</integer>
+				<key>NSExtensionActivationSupportsWebPageWithMaxCount</key>
+				<integer>1</integer>
+				<key>NSExtensionActivationSupportsImageWithMaxCount</key>
+				<integer>10</integer>
+				<key>NSExtensionActivationSupportsFileWithMaxCount</key>
+				<integer>10</integer>
+			</dict>
+		</dict>
+		<key>NSExtensionPointIdentifier</key>
+		<string>com.apple.share-services</string>
+		<key>NSExtensionPrincipalClass</key>
+		<string>$(PRODUCT_MODULE_NAME).ShareViewController</string>
+	</dict>
+</dict>
+</plist>

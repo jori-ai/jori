@@ -1,0 +1,65 @@
+#!/bin/bash
+# hum-debug-line — temporary 48h debug visibility into hum's per-tick decisions.
+#
+# Requested by the user live in chat 2026-08-04 (~09:58 UTC), right after
+# approving a card (the claim-freshness/hum-ping fix that stopped the
+# truthfulness gate from mistaking undated evidence for two-week-old evidence
+# and silently killing outbound messages). The user wants to watch the pipeline
+# directly rather than trust reports secondhand: for every hum tick, what did
+# the ranker propose, and did it actually publish or get hidden.
+#
+# Self-expiring by design — no manual follow-up required to turn this off:
+#   1. Hard-coded 48h window below (2026-08-04T09:58Z -> 2026-08-06T09:58Z).
+#      Every call after expiry is a silent no-op.
+#   2. data/hum-debug-mode-off — an empty sentinel file for an early
+#      manual stop, checked before the expiry math.
+# To fully remove: delete this file and the one call site in
+# agent/ops-agent/jobs/hum.md Step 4.
+#
+# Uses --skip-precheck deliberately (see agent/CLAUDE.md § Outbound
+# Precheck, diagnostic-harness carve-out) — a debug line about what the
+# outbound-precheck/claim-freshness gate just did to a ping must not itself be
+# subject to that same gate, or a still-broken gate could hide its own debug
+# output exactly like it hid the ping it's being watched for.
+#
+# Usage:
+#   hum-debug-line --lane <lane> --subject <subject-or-none> --decision <published|hidden> [--reason <text>]
+
+set -u
+
+EXPIRES_AT="2026-08-06T09:58:00Z"
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../agent/scripts/lib/root.sh"
+KILL_SWITCH="$JORI_INSTALL/data/hum-debug-mode-off"
+SEND_BIN="$JORI_INSTALL_TOOLS/bin/jori-send-curl"
+
+if [ -f "$KILL_SWITCH" ]; then
+  exit 0
+fi
+
+now_epoch=$(date -u +%s)
+expires_epoch=$(date -u -j -f "%Y-%m-%dT%H:%M:%SZ" "$EXPIRES_AT" "+%s" 2>/dev/null)
+if [ -z "$expires_epoch" ] || [ "$now_epoch" -ge "$expires_epoch" ]; then
+  exit 0
+fi
+
+LANE="unknown"
+SUBJECT="none"
+DECISION="unknown"
+REASON=""
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --lane)     LANE="$2"; shift 2 ;;
+    --subject)  SUBJECT="$2"; shift 2 ;;
+    --decision) DECISION="$2"; shift 2 ;;
+    --reason)   REASON="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+
+LINE="[hum debug] ${LANE}: \"${SUBJECT}\" -> ${DECISION}"
+if [ -n "$REASON" ]; then
+  LINE="${LINE} (${REASON})"
+fi
+
+"$SEND_BIN" --skip-precheck --intent hum-debug --channel system "$LINE" >/dev/null 2>&1

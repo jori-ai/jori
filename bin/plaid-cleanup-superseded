@@ -1,0 +1,182 @@
+#!/usr/bin/env node
+"use strict";
+// plaid-cleanup-superseded — delete the Supabase rows left behind by a relink.
+//
+// Replacing an Item (see `plaid-connect relink`) is the only way to widen its
+// transaction-history window, and it has one nasty side effect: the replacement
+// issues BRAND-NEW account ids for the same cards. Every balance and transaction
+// already synced is keyed to the old ids, so after a relink the same card exists
+// twice in `plaid_accounts` and its recent transactions exist twice in
+// `plaid_transactions` under two different transaction_ids. Nothing notices —
+// spend totals and net worth simply double for the overlapping window.
+//
+// The stale rows are deliberately NOT removed at relink time: until the
+// replacement has actually delivered its history, they are the only copy of the
+// data. This runs afterwards, once the new Item is verified.
+//
+// It MERGES rather than deletes, because "the replacement always has more" is
+// false. Capital One's replacement Item came back reaching only 2026-05-28
+// where the old one reached 2026-03-30 — deleting on the strength of "a live
+// Item covers this mask" would have silently thrown away two months that exist
+// nowhere else. So per account:
+//
+//   • rows on or after the replacement's earliest date  → duplicates, deleted
+//   • rows before it                                    → unique, re-pointed to
+//                                                         the live account
+//
+// Re-pointing keeps that history reachable: everything downstream reads by
+// account id, so an orphaned row is data nobody can see. transaction_id stays
+// unique, so nothing collides.
+//
+// Usage:
+//   plaid-cleanup-superseded              show what would happen (default)
+//   plaid-cleanup-superseded --apply      do it
+//   plaid-cleanup-superseded --item <id>  limit to one superseded Item
+//
+// Safety: an old account whose mask no LIVE Item covers is left completely
+// alone. That is the check distinguishing "the replacement worked" from "the
+// relink failed, or picked a different card, and this is the only copy" — which
+// is not hypothetical: a Chase relink selected the personal card instead of the
+// property one, leaving the property card's rows as the sole record.
+
+const store = require("../lib/plaid-store.js");
+const { request } = require("../lib/supabase-rest.js");
+
+const ARGV = process.argv.slice(2);
+const APPLY = ARGV.includes("--apply");
+const ONLY_ITEM = (() => {
+  const i = ARGV.indexOf("--item");
+  return i !== -1 ? ARGV[i + 1] : null;
+})();
+
+async function accountsForItem(itemId) {
+  return (
+    (await request(
+      `/rest/v1/plaid_accounts?select=account_id,mask,name&item_id=eq.${encodeURIComponent(itemId)}`
+    )) || []
+  );
+}
+
+async function countTransactions(accountIds) {
+  if (!accountIds.length) return 0;
+  const list = accountIds.map(encodeURIComponent).join(",");
+  const rows =
+    (await request(`/rest/v1/plaid_transactions?select=transaction_id&account_id=in.(${list})`)) || [];
+  return rows.length;
+}
+
+/** Oldest transaction date on an account, or null if it has none. */
+async function earliestDate(accountId) {
+  const rows =
+    (await request(
+      `/rest/v1/plaid_transactions?select=date&account_id=eq.${encodeURIComponent(accountId)}&order=date.asc&limit=1`
+    )) || [];
+  return rows.length ? rows[0].date : null;
+}
+
+/** Every account on a live Item, keyed by mask. */
+async function liveAccountsByMask(items) {
+  const byMask = new Map();
+  for (const item of items) {
+    for (const account of await accountsForItem(item.item_id)) {
+      if (!account.mask) continue;
+      // If two live Items carry the same mask, prefer the one reaching further
+      // back — that is the copy worth merging into.
+      const existing = byMask.get(account.mask);
+      const earliest = await earliestDate(account.account_id);
+      if (!existing || (earliest && (!existing.earliest || earliest < existing.earliest))) {
+        byMask.set(account.mask, { ...account, item_id: item.item_id, earliest });
+      }
+    }
+  }
+  return byMask;
+}
+
+async function main() {
+  let superseded = store.getSuperseded();
+  if (ONLY_ITEM) superseded = superseded.filter((s) => s.item_id === ONLY_ITEM);
+
+  if (!superseded.length) {
+    console.log("Nothing superseded awaiting cleanup.");
+    return;
+  }
+
+  const live = await liveAccountsByMask(store.getItems());
+
+  for (const entry of superseded) {
+    const stale = await accountsForItem(entry.item_id);
+    const label = `${entry.institution_name || "?"} (${entry.item_id})`;
+    console.log(`\n${label}`);
+
+    if (!stale.length) {
+      console.log("  no rows left — marking cleaned.");
+      if (APPLY) store.markSupersededCleaned(entry.item_id);
+      continue;
+    }
+
+    let blocked = 0;
+
+    for (const old of stale) {
+      const name = `••${old.mask} ${(old.name || "").slice(0, 24)}`;
+      const replacement = old.mask ? live.get(old.mask) : null;
+      const oldCount = await countTransactions([old.account_id]);
+
+      if (!replacement) {
+        // Not duplicate data — the only data. Leaving it is the whole point of
+        // deferring cleanup.
+        console.log(`  ${name}: NO LIVE REPLACEMENT — leaving ${oldCount} row(s) untouched`);
+        blocked++;
+        continue;
+      }
+
+      const cut = replacement.earliest;
+      const encOld = encodeURIComponent(old.account_id);
+
+      // With no cut-off the replacement has nothing at all, so every old row is
+      // unique history and moves across.
+      const dupFilter = cut ? `&date=gte.${cut}` : null;
+      const dupCount = dupFilter
+        ? (
+            (await request(
+              `/rest/v1/plaid_transactions?select=transaction_id&account_id=eq.${encOld}${dupFilter}`
+            )) || []
+          ).length
+        : 0;
+      const moveCount = oldCount - dupCount;
+
+      console.log(
+        `  ${name}: ${dupCount} duplicate(s) to delete, ${moveCount} older row(s) to merge` +
+          (cut ? ` (replacement starts ${cut})` : " (replacement is empty)")
+      );
+
+      if (!APPLY) continue;
+
+      if (dupFilter && dupCount) {
+        await request(`/rest/v1/plaid_transactions?account_id=eq.${encOld}${dupFilter}`, {
+          method: "DELETE",
+        });
+      }
+      if (moveCount) {
+        await request(`/rest/v1/plaid_transactions?account_id=eq.${encOld}`, {
+          method: "PATCH",
+          body: { account_id: replacement.account_id, item_id: replacement.item_id },
+        });
+      }
+      await request(`/rest/v1/plaid_accounts?account_id=eq.${encOld}`, { method: "DELETE" });
+    }
+
+    if (APPLY && !blocked) {
+      store.markSupersededCleaned(entry.item_id);
+      console.log("  done.");
+    } else if (blocked) {
+      console.log(`  kept open: ${blocked} account(s) still have no replacement.`);
+    }
+  }
+
+  if (!APPLY) console.log("\nDry run. Nothing changed. Re-run with --apply.");
+}
+
+main().catch((e) => {
+  console.error(`plaid-cleanup-superseded: ${e.message}`);
+  process.exit(1);
+});

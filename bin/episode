@@ -1,0 +1,205 @@
+#!/usr/bin/env node
+// episode — episodic memory CLI. Backed by the wiki `pages` table
+// (single mechanism for permanent + episodic memory). The episode/week/
+// month wiki pages are written by `wiki-day-write`, `wiki-week-write`,
+// `wiki-month-write`. The `data/episodes/` directory is now a
+// render-on-demand derived artifact (rebuilt by the `memory-snapshot`
+// cron via `wiki render-all`), not a parallel store.
+//
+// IDs:
+//   day_YYYY-MM-DD     — daily page    (type=day,   one per daily_summaries row)
+//   week_YYYY-MM-DD    — weekly page   (type=week,  Monday-keyed)
+//   month_YYYY-MM      — monthly page  (type=month, calendar-month-keyed)
+//
+// Usage:
+//   episode <YYYY-MM-DD>            print that day's page body
+//   episode yesterday | today       date shortcut (the home time zone)
+//   episode last-week               concat the last 7 daily pages
+//   episode list [--since DATE]     list dates with a day_* page
+//   episode search "<query>"        FTS across day pages (uses pages_fts)
+//   episode write <YYYY-MM-DD>      (re)ingest from daily_summaries via wiki-day-write
+//   episode refresh <date>          alias for write
+//   episode backfill                ingest every daily_summaries row missing a wiki page
+//   episode week-of <YYYY-MM-DD>    (re)ingest the weekly_summaries row that covers DATE
+//   episode month <YYYY-MM>         (re)ingest the monthly_summaries row
+
+"use strict";
+
+const path = require("node:path");
+const { spawnSync } = require("node:child_process");
+const wiki = require("../lib/wiki-store.js");
+
+const { instance } = require("../lib/instance.cjs");
+
+const BIN = __dirname;
+
+function die(msg, code = 1) {
+  console.error(`episode: ${msg}`);
+  process.exit(code);
+}
+
+function homeDate(offsetDays = 0) {
+  const fmt = new Intl.DateTimeFormat("en-CA", {
+    timeZone: instance().tz,
+    year: "numeric", month: "2-digit", day: "2-digit",
+  });
+  const d = new Date(Date.now() + offsetDays * 86400000);
+  return fmt.format(d);
+}
+
+function resolveDateArg(arg) {
+  if (!arg) return null;
+  if (arg === "today") return homeDate(0);
+  if (arg === "yesterday") return homeDate(-1);
+  if (/^\d{4}-\d{2}-\d{2}$/.test(arg)) return arg;
+  return null;
+}
+
+function mondayOf(dateStr) {
+  const [y, m, d] = dateStr.split("-").map(Number);
+  const utc = new Date(Date.UTC(y, m - 1, d));
+  const dow = utc.getUTCDay();
+  const offsetToMon = dow === 0 ? -6 : 1 - dow;
+  const mon = new Date(utc.getTime() + offsetToMon * 86400000);
+  return mon.toISOString().slice(0, 10);
+}
+
+// All day-page ids in the wiki, sorted ascending.
+function listDayDates() {
+  const all = wiki.listPages({ status: "active" });
+  return all
+    .filter((p) => p.type === "day" && /^day_\d{4}-\d{2}-\d{2}$/.test(p.id))
+    .map((p) => p.id.slice(4))
+    .sort();
+}
+
+function spawnNode(script, args) {
+  const r = spawnSync("node", [path.join(BIN, script), ...args], {
+    stdio: "inherit",
+    encoding: "utf8",
+  });
+  process.exit(r.status ?? 1);
+}
+
+function cmdRead(date) {
+  const id = `day_${date}`;
+  const page = wiki.getPage(id);
+  if (!page) {
+    die(`no episode for ${date} (no ${id} in wiki). Try: episode write ${date}`);
+  }
+  process.stdout.write(page.raw_md);
+}
+
+function cmdList(args) {
+  const sinceIdx = args.indexOf("--since");
+  const since = sinceIdx >= 0 ? args[sinceIdx + 1] : null;
+  const dates = listDayDates().filter((d) => !since || d >= since);
+  if (!dates.length) { console.log("(no episodes)"); return; }
+  for (const d of dates) console.log(d);
+}
+
+function cmdSearch(args) {
+  const semanticIdx = args.indexOf("--semantic");
+  const semantic = semanticIdx >= 0;
+  const limitIdx = args.indexOf("--limit");
+  const limit = limitIdx >= 0 ? parseInt(args[limitIdx + 1], 10) || 8 : 8;
+  const queryParts = args.filter((a, i) => {
+    if (a === "--semantic") return false;
+    if (a === "--limit") return false;
+    if (limitIdx >= 0 && i === limitIdx + 1) return false;
+    return true;
+  });
+  const query = queryParts.join(" ").trim();
+  if (!query) die("search: need a query string. Flags: --semantic, --limit N");
+  if (semantic) return cmdSearchSemantic(query, limit);
+
+  // FTS5 page-level search restricted to type=day. Same path the wiki
+  // `/search` route and the `wiki_search` MCP tool use, so the agent
+  // and the user see the same hits.
+  const hits = wiki.searchPages(query, { mode: "fts", limit: limit * 2, type: "day" });
+  if (!hits.length) { console.log("(no results)"); return; }
+  for (const h of hits.slice(0, limit)) {
+    const date = h.id.slice(4);
+    const snippet = (h.snippet || h.body_md || "").slice(0, 240).replace(/\s+/g, " ");
+    console.log(`\n=== ${date} === (${h.id})`);
+    console.log(`  ${snippet}${snippet.length >= 240 ? "…" : ""}`);
+  }
+  console.log(`\n${hits.length} day page${hits.length === 1 ? "" : "s"} matched "${query}"`);
+}
+
+async function cmdSearchSemantic(query, limit) {
+  const { localLlmEmbed } = await import("../lib/local-llm.mjs");
+  const { request } = require("../lib/supabase-rest.js");
+  const embedding = await localLlmEmbed(query).catch((err) => {
+    die(`ollama embed failed: ${err.message}. Is Ollama running on :11434?`);
+  });
+  const rows = await request(`/rest/v1/rpc/daily_summaries_semantic_search`, {
+    method: "POST",
+    body: { query_embedding: embedding, match_count: limit },
+  });
+  if (!rows.length) { console.log("(no results)"); return; }
+  for (const r of rows) {
+    const snippet = (r.narrative || "").slice(0, 200).replace(/\n/g, " ");
+    console.log(`\n=== ${r.date} === (similarity ${r.similarity.toFixed(3)})`);
+    console.log(`  ${snippet}${r.narrative?.length > 200 ? "…" : ""}`);
+  }
+  console.log(`\n${rows.length} result${rows.length === 1 ? "" : "s"} (semantic, daily_summaries.embedding)`);
+}
+
+function cmdWrite(date) {
+  if (!date) die("write: need YYYY-MM-DD");
+  return spawnNode("wiki-day-write", [date]);
+}
+
+function cmdBackfill(args = []) {
+  return spawnNode("wiki-day-write", ["--backfill", ...args]);
+}
+
+function cmdWeekOf(arg) {
+  const date = resolveDateArg(arg) || arg;
+  if (!date || !/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+    die("week-of: need YYYY-MM-DD (or today/yesterday)");
+  }
+  return spawnNode("wiki-week-write", [mondayOf(date)]);
+}
+
+function cmdMonth(arg) {
+  if (!arg || !/^\d{4}-\d{2}$/.test(arg)) die("month: need YYYY-MM");
+  return spawnNode("wiki-month-write", [arg]);
+}
+
+function cmdLastWeek() {
+  const out = [];
+  for (let i = 1; i <= 7; i++) {
+    const d = homeDate(-i);
+    const page = wiki.getPage(`day_${d}`);
+    if (page) {
+      out.push(page.raw_md);
+      out.push("\n\n---\n\n");
+    }
+  }
+  if (!out.length) { console.log("(no episodes in last 7 days)"); return; }
+  process.stdout.write(out.join(""));
+}
+
+async function main() {
+  const [cmd, ...rest] = process.argv.slice(2);
+  if (!cmd || cmd === "--help" || cmd === "-h") {
+    console.log("usage: episode <YYYY-MM-DD|yesterday|today|last-week|list|search|write|refresh|backfill|week-of|month>");
+    return;
+  }
+  if (cmd === "list") return cmdList(rest);
+  if (cmd === "search") return cmdSearch(rest);
+  if (cmd === "write" || cmd === "refresh") {
+    return cmdWrite(resolveDateArg(rest[0]) || rest[0]);
+  }
+  if (cmd === "backfill") return cmdBackfill(rest);
+  if (cmd === "last-week") return cmdLastWeek();
+  if (cmd === "week-of") return cmdWeekOf(rest[0]);
+  if (cmd === "month") return cmdMonth(rest[0]);
+  const date = resolveDateArg(cmd);
+  if (date) return cmdRead(date);
+  die(`unknown command: ${cmd}`);
+}
+
+main().catch((err) => die(err.message));

@@ -1,0 +1,496 @@
+/* The cruise site — the same house style as the travel-guide site (same neutral
+   ground and type) with a sea-blue accent so the two tabs are distinguishable
+   at a glance. */
+
+:root {
+  --accent: #17607d;
+  --accent-soft: #e4eff3;
+  --bg: #f3f0ea;
+  --card: #ffffff;
+  --ink: #1a1a1a;
+  --muted: #6b6f76;
+  --line: #e6e1d8;
+  --drop: #1f7a4d;
+  --drop-soft: #e5f2ea;
+  --match: #a9773c;
+  --match-soft: #f6efe3;
+  --match-line: #e0cca8;
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  padding: 0;
+  background: var(--bg);
+  color: var(--ink);
+  font-family: "Segoe UI", -apple-system, BlinkMacSystemFont, "Helvetica Neue", sans-serif;
+  -webkit-text-size-adjust: 100%;
+}
+
+a { color: var(--accent); }
+
+/* ---- top bar ---- */
+.topbar {
+  position: sticky;
+  top: 0;
+  z-index: 20;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px 16px;
+  background: rgba(255, 255, 255, 0.94);
+  backdrop-filter: saturate(180%) blur(8px);
+  border-bottom: 1px solid var(--line);
+}
+.topbar .brand {
+  font-weight: 800;
+  letter-spacing: 0.02em;
+  font-size: 16px;
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  flex-wrap: wrap;
+  min-width: 0;
+}
+.topbar .asof { font-size: 12px; font-weight: 400; color: var(--muted); }
+.signout {
+  flex: 0 0 auto;
+  border: 1px solid var(--line);
+  background: #fff;
+  color: var(--muted);
+  border-radius: 999px;
+  padding: 6px 12px;
+  font-size: 13px;
+  cursor: pointer;
+}
+.signout:hover { color: var(--ink); }
+
+/* ---- layout ----
+   One fluid column on a phone; the filter rail joins as a second track once
+   there is room for it AND for a card beside it. */
+.wrap { max-width: 1680px; margin: 0 auto; padding: 16px; }
+.split { display: block; }
+
+/* ---- search + sort ---- */
+.toolbar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 12px; }
+/* One box shape for every control on the toolbar row. The padding + font-size
+   + line-height below are what make them all exactly 44px tall; change one and
+   change all three, or the row goes ragged again. */
+.search, .sortsel, .filters-toggle {
+  padding: 11px 13px;
+  font-size: 15px;
+  line-height: 20px;
+  font-family: inherit;
+  color: var(--ink);
+  background: #fff;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+}
+.search { flex: 1 1 220px; min-width: 0; }
+.sortsel, .filters-toggle { cursor: pointer; }
+.filters-toggle { display: inline-flex; align-items: center; gap: 7px; }
+/* A <select> ignores padding, border-radius and height under the native
+   `menulist` appearance — macOS drew its own short pill and system focus ring
+   next to the full-height search box. Stripping the appearance is what lets the
+   shared rule above actually apply; the chevron then has to be drawn by hand. */
+.sortsel {
+  appearance: none;
+  -webkit-appearance: none;
+  padding-right: 34px;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='11' height='7' viewBox='0 0 11 7'%3E%3Cpath d='M1 1l4.5 4.5L10 1' fill='none' stroke='%236b6f76' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 12px center;
+}
+.search:focus-visible, .sortsel:focus-visible, .filters-toggle:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -1px;
+}
+/* A phone taps this to reach every filter, so it gets a real hit target. */
+.filters-toggle { min-height: 44px; }
+/* The pill inherits the toolbar's 20px line-height, which made it 22px tall
+   and stretched the button 2px past the search box. Pin its own line-height
+   so the count badge can never drive the button's height. */
+.filters-toggle .pill {
+  background: var(--accent);
+  color: #fff;
+  border-radius: 999px;
+  padding: 0 7px;
+  font-size: 12px;
+  line-height: 18px;
+  font-weight: 700;
+}
+.count { font-size: 13px; color: var(--muted); flex-basis: 100%; }
+.count b { color: var(--ink); }
+
+/* ---- filter rail ----
+   Hidden behind the "Filters" button on a phone, always present on a desktop.
+   Driven by a class rather than the `hidden` attribute so the desktop media
+   query can override it — `hidden` would win over any display rule. */
+.rail { display: none; flex-direction: column; gap: 12px; margin-bottom: 20px; }
+.rail.open { display: flex; }
+
+/* Desktop overrides live HERE, after every base rule they override, because
+   they win on source order and not on specificity — `.rail` and
+   `.filters-toggle` are single class selectors on both sides. Sitting above
+   the base rules (where this block started) meant the mobile defaults won at
+   every width: the rail stayed `display: none` and the Filters button stayed
+   visible on a 1512px display, so the filters were collapsed on the one screen
+   with room for them. Keep this block last. */
+@media (min-width: 900px) {
+  .wrap { padding: 18px 28px 40px; }
+  .split {
+    display: grid;
+    grid-template-columns: 280px minmax(0, 1fr);
+    gap: 22px;
+    align-items: start;
+  }
+  /* The rail sticks; only the results scroll. Scanning thousands of sailings
+     means changing a filter repeatedly, and a rail that scrolls away turns
+     every adjustment into a scroll-back-up. */
+  .rail {
+    display: flex;
+    position: sticky;
+    top: 61px;
+    max-height: calc(100dvh - 77px);
+    overflow-y: auto;
+    padding-right: 4px;
+  }
+  .filters-toggle { display: none; }
+}
+
+.fgroup {
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 12px 14px;
+}
+.fgroup h3 {
+  margin: 0 0 9px;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+.fgroup .hint {
+  margin: 9px 0 0;
+  font-size: 11.5px;
+  line-height: 1.4;
+  color: var(--muted);
+}
+.frow { display: flex; align-items: center; gap: 8px; padding: 4px 0; font-size: 13.5px; cursor: pointer; }
+.frow input { accent-color: var(--accent); width: 16px; height: 16px; flex: 0 0 auto; }
+.frow .lbl { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.frow .n { font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }
+.frow.off .lbl, .frow.off .n { color: #b3b0aa; }
+.range { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--muted); }
+.range input[type="range"] { flex: 1; accent-color: var(--accent); min-width: 0; }
+.range .val { font-variant-numeric: tabular-nums; color: var(--ink); font-weight: 600; white-space: nowrap; }
+
+.daterow { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.daterow label { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: var(--muted); min-width: 0; }
+.daterow input[type="date"] {
+  font: inherit; font-size: 13px; color: var(--ink); background: transparent;
+  border: 1px solid var(--line); border-radius: 6px; padding: 5px 6px; min-width: 0; width: 100%;
+  accent-color: var(--accent);
+}
+.daterow + .linkbtn { margin-top: 6px; font-size: 12px; }
+
+/* A rail group that is narrowing the list says so in its own header. */
+.fgroup h3.on { color: var(--accent); }
+.fgroup h3.on::after {
+  content: ""; display: inline-block; width: 6px; height: 6px; margin-left: 6px;
+  border-radius: 50%; background: var(--accent); vertical-align: middle;
+}
+.portq {
+  width: 100%; margin-bottom: 6px; padding: 6px 8px;
+  font: inherit; font-size: 13px; color: var(--ink); background: #fff;
+  border: 1px solid var(--line); border-radius: 6px;
+}
+
+/* ---- active filters ----
+   One removable chip per filter in force, above the results at every width —
+   the only place a phone user (rail closed) can see why the list is short. */
+.activebar { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-bottom: 14px; }
+.activelbl { font-size: 12px; font-weight: 600; color: var(--muted); margin-right: 2px; }
+.activechip {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 5px 9px 5px 11px; font: inherit; font-size: 12.5px;
+  background: var(--accent-soft); color: #124e64;
+  border: 1px solid #bcd8e1; border-radius: 999px; cursor: pointer;
+}
+.activechip > span[aria-hidden] { font-size: 14px; line-height: 1; opacity: 0.7; }
+.activechip:hover > span[aria-hidden] { opacity: 1; }
+
+.chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.stack { display: flex; flex-direction: column; gap: 6px; }
+.stack.tight { gap: 0; }
+.chipbtn {
+  padding: 6px 11px;
+  font-size: 12.5px;
+  font-family: inherit;
+  border: 1px solid var(--line);
+  background: #fff;
+  color: var(--ink);
+  border-radius: 999px;
+  cursor: pointer;
+}
+.chipbtn.wide { display: flex; justify-content: space-between; align-items: center; gap: 10px; text-align: left; }
+.chipbtn .cn { font-size: 11.5px; color: var(--muted); font-variant-numeric: tabular-nums; }
+.chipbtn[aria-pressed="true"] { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; }
+.chipbtn[aria-pressed="true"] .cn { color: rgba(255, 255, 255, 0.8); }
+.chipbtn:disabled { opacity: 0.4; cursor: default; }
+
+/* ---- tri-state row (Repositioning: Any / Only / Hide) ----
+   Three options over one question, so they share a segmented row rather than
+   becoming three unrelated checkboxes — "hide" is a real answer here, not the
+   absence of one, which is why this is not a checkbox like the rows above it. */
+.trirow { margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--line); }
+.trilbl {
+  display: block; margin-bottom: 7px;
+  font-size: 11px; font-weight: 700; letter-spacing: .07em;
+  text-transform: uppercase; color: var(--muted);
+}
+.tri { display: flex; flex-wrap: wrap; gap: 6px; }
+.tri .chipbtn { flex: 1 1 auto; display: flex; align-items: center; justify-content: center; gap: 6px; }
+.trirow .hint { margin-top: 7px; font-size: 11.5px; line-height: 1.4; color: var(--muted); }
+.linkbtn {
+  background: none;
+  border: none;
+  padding: 0;
+  font: inherit;
+  font-size: 12px;
+  color: var(--accent);
+  cursor: pointer;
+  text-decoration: underline;
+}
+
+/* A link from the email lands in focus mode; this says so and offers the way out. */
+.focusbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  background: var(--accent-soft);
+  border: 1px solid #bcd8e1;
+  color: #124e64;
+  border-radius: 10px;
+  padding: 11px 14px;
+  margin-bottom: 14px;
+  font-size: 13.5px;
+}
+
+/* ---- the card grid ----
+   auto-fill against a 300px floor is what makes this responsive without a
+   breakpoint per width: 3 up on a 1512px display, 2 on a laptop or tablet,
+   1 on a phone, and 4 on something very wide — all from the same rule. */
+.cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+  gap: 18px;
+}
+@media (max-width: 420px) {
+  /* Below this a 300px floor would overflow a 390px viewport once padding is
+     taken out, so let the single column go fully fluid. */
+  .cards { grid-template-columns: minmax(0, 1fr); }
+}
+
+.card {
+  display: flex;
+  flex-direction: column;
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  overflow: hidden;
+}
+.card.match { border-color: var(--match-line); }
+
+.card .hero {
+  position: relative;
+  aspect-ratio: 16 / 9;
+  background: var(--accent-soft);
+  overflow: hidden;
+}
+.card .hero img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+.card .hero-fallback {
+  width: 100%;
+  height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 40px;
+}
+.card .hero-badge { position: absolute; top: 11px; left: 11px; }
+/* The line name over the photo's bottom-right, on a scrim so it survives a
+   light image — the body repeats it, but on a wall of cards the photo is what
+   the eye lands on first. */
+.card .hero-line {
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  padding: 14px 12px 8px 18px;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: #fff;
+  background: linear-gradient(to top left, rgba(0, 0, 0, 0.55), rgba(0, 0, 0, 0));
+}
+
+.card .body { padding: 14px 16px 16px; display: flex; flex-direction: column; flex: 1; }
+.card h2 { margin: 0; font-size: 18px; font-weight: 700; line-height: 1.22; }
+.card .sub { font-size: 12.5px; color: var(--muted); margin-top: 3px; }
+/* Rating sits directly under the line/built line — it is a property of the
+   ship, like those, not of this sailing. */
+.card .rating { display: flex; align-items: center; gap: 7px; margin-top: 7px; font-size: 12.5px; }
+.card .rating .stars { display: inline-flex; gap: 1px; color: #d8d2c6; line-height: 0; }
+.card .rating .stars .on { color: #d69a2d; }
+.card .rating b { font-variant-numeric: tabular-nums; font-size: 13px; }
+.card .rating .rc { color: var(--muted); }
+
+.card .facts { display: flex; flex-direction: column; gap: 5px; margin-top: 12px; font-size: 13.5px; }
+.card .fact { display: flex; align-items: center; gap: 7px; }
+.card .fact svg { flex: 0 0 auto; color: var(--muted); }
+/* The port list is the one fact that runs long — a 14-night itinerary names a
+   dozen places — so it wraps under its own icon instead of forcing the card
+   wide, and the icon stays pinned to the first line. */
+.card .fact.ports { align-items: flex-start; color: var(--muted); }
+.card .fact.ports svg { margin-top: 3px; }
+.card .fact.ports span { min-width: 0; }
+
+.card .price { display: flex; align-items: baseline; gap: 7px; margin-top: 13px; }
+.card .price .pn {
+  font-size: 27px;
+  font-weight: 700;
+  color: var(--accent);
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.01em;
+}
+.card .price .per { font-size: 13px; color: var(--muted); }
+.card .asof {
+  margin-top: 4px;
+  font-size: 11.5px;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+.card .total { font-size: 12.5px; color: var(--muted); margin-top: 1px; }
+
+.badges { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 11px; }
+.badge {
+  font-size: 11.5px;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  padding: 4px 9px;
+  border-radius: 999px;
+  white-space: nowrap;
+}
+.badge.match { background: var(--match-soft); color: var(--match); }
+.badge.drop { background: var(--drop-soft); color: var(--drop); }
+.badge.atl { background: var(--accent-soft); color: var(--accent); }
+
+/* ---- watchlist star ----
+   Sits opposite the line badge on the hero. Unstarred it is a hollow outline on
+   a scrim so it reads on any photo; starred it fills with the match gold, the
+   one colour on the card that already means "this one is for you". */
+.card .star {
+  position: absolute; top: 10px; right: 10px;
+  width: 34px; height: 34px; padding: 0;
+  display: flex; align-items: center; justify-content: center;
+  border: 0; border-radius: 999px; cursor: pointer;
+  color: #fff; background: rgba(26, 26, 26, 0.42);
+  backdrop-filter: blur(2px);
+  transition: background .15s ease, color .15s ease, transform .12s ease;
+}
+.card .star:hover { background: rgba(26, 26, 26, 0.62); transform: scale(1.06); }
+.card .star.on { color: var(--match); background: #fff; }
+.card .star.on:hover { background: #fff; }
+.card .star:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+.starerr {
+  margin-bottom: 10px; padding: 9px 12px; border-radius: 8px;
+  background: var(--match-soft); border: 1px solid var(--match-line);
+  color: var(--match); font-size: 13.5px;
+}
+@media (prefers-reduced-motion: reduce) { .card .star, .card .star:hover { transition: none; transform: none; } }
+/* Repositioning is a shape-of-trip warning, not a deal — it borrows the
+   match palette's sand tones so it never reads as a price badge. */
+.badge.repo { background: var(--match-soft); color: var(--match); border: 1px solid var(--match-line); }
+.badge.rise { background: #f5eaea; color: #9a3b3b; }
+
+/* Pushed to the card's bottom edge so the button line agrees across a row of
+   cards whose text runs to different lengths. The auto margin lives on the
+   WRAPPER, not the anchor: on the anchor it resolves to 0 in a card with no
+   spare height and the button would hug the text, and padding there would
+   fatten the button instead of separating it. */
+.card .actions { margin-top: auto; padding-top: 14px; }
+.card a.book {
+  display: block;
+  padding: 12px;
+  border-radius: 10px;
+  background: var(--accent);
+  color: #fff;
+  font-size: 14px;
+  font-weight: 700;
+  text-align: center;
+  text-decoration: none;
+}
+.card a.book:hover { filter: brightness(1.08); }
+
+.more {
+  display: block;
+  width: 100%;
+  margin-top: 16px;
+  padding: 13px;
+  border-radius: 12px;
+  border: 1px solid var(--line);
+  background: #fff;
+  font: inherit;
+  font-weight: 600;
+  color: var(--accent);
+  cursor: pointer;
+}
+.empty-state {
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 32px 16px;
+  text-align: center;
+  color: var(--muted);
+}
+.empty-state b { display: block; color: var(--ink); margin-bottom: 4px; }
+
+/* ---- login / not-authorized ---- */
+.login { min-height: 100dvh; display: flex; align-items: center; justify-content: center; padding: 24px; }
+.login-card {
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  padding: 32px 28px;
+  text-align: center;
+  max-width: 360px;
+  width: 100%;
+}
+.login-mark { font-size: 34px; }
+.login-card h1 { margin: 10px 0 4px; font-size: 20px; }
+.login-card p { margin: 0 0 20px; color: var(--muted); font-size: 14px; }
+.login-card button {
+  width: 100%;
+  padding: 12px;
+  border-radius: 10px;
+  border: none;
+  background: var(--accent);
+  color: #fff;
+  font: inherit;
+  font-weight: 700;
+  cursor: pointer;
+}
+.login-card button:disabled { opacity: 0.6; cursor: default; }
+.login-error { margin-top: 12px; color: #9a3b3b; font-size: 13px; }
+.login-link { display: inline-block; margin-top: 6px; font-size: 14px; }

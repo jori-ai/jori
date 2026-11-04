@@ -1,0 +1,77 @@
+#!/usr/bin/env node
+// rest-point — where the user actually SAT during a visit window: the longest rest
+// in the raw trace (fixes + self-captured photos), judged by the same
+// classifyWindow stop-passage uses. Prints JSON {lat, lon, rest_min, row_lat,
+// row_lon, moved_m} or {lat: null} when the trace holds no rest.
+//
+// Why a separate point: a visit row's lat/lon is the centroid of everything
+// iOS lumped into the visit. A 66-minute lunch once spread 205 m and its
+// centroid sat 101 m from the table, so stop-identify's 30 m search circle
+// missed the restaurant (20 m from the rest, 80 m from the centroid) and
+// offered a neighbouring shop instead. The centroid is a summary statistic, not
+// a place the user was (see the location-spine skill).
+//
+// Usage: rest-point --visit <id> [--start ISO --end ISO]
+
+import fs from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+import { createRequire } from "node:module";
+import { pointsFrom, classifyWindow } from "../lib/stop-passage.mjs";
+const require = createRequire(import.meta.url);
+const { haversineMeters } = require("../lib/stop-rests.js");
+const { supabaseUrl } = require("../lib/instance.cjs");
+
+const HERE = path.dirname(fileURLToPath(import.meta.url));
+const ENV_FILE = path.join(HERE, "..", ".env");
+const SUPABASE_URL = process.env.SUPABASE_URL || supabaseUrl();
+const PAD_MIN = 45; // same context pad as stop-passage, so a silence crossing the edge is read the same way
+// A rest shorter than this is a pause, not where the visit happened.
+const MIN_REST_MIN = 5;
+
+function arg(n) { const i = process.argv.indexOf(n); return i > 0 ? process.argv[i + 1] : null; }
+function envValue(k) {
+  if (process.env[k]) return process.env[k];
+  try {
+    const m = fs.readFileSync(ENV_FILE, "utf8").match(new RegExp(`^${k}=(.+)$`, "m"));
+    return m ? m[1].trim().replace(/^["']|["']$/g, "") : null;
+  } catch { return null; }
+}
+async function sb(pathQs) {
+  if (!SUPABASE_URL) throw new Error("no Supabase project configured (agent/local/instance.json supabase_project)");
+  const key = envValue("SUPABASE_SERVICE_ROLE_KEY");
+  if (!key) throw new Error("no SUPABASE_SERVICE_ROLE_KEY");
+  const r = await fetch(`${SUPABASE_URL}/rest/v1/${pathQs}`, {
+    headers: { apikey: key, Authorization: `Bearer ${key}` }, signal: AbortSignal.timeout(15000),
+  });
+  if (!r.ok) throw new Error(`supabase ${r.status}: ${(await r.text()).slice(0, 200)}`);
+  return r.json();
+}
+const iso = (t) => new Date(t).toISOString();
+const q = encodeURIComponent;
+
+async function main() {
+  const id = arg("--visit");
+  if (!id) { console.error("usage: rest-point --visit <id> [--start ISO --end ISO]"); process.exit(2); }
+  const [v] = await sb(`location_history?id=eq.${q(id)}&select=latitude,longitude,arrived_at,departed_at&limit=1`);
+  if (!v) throw new Error(`no row ${id}`);
+  const start = Date.parse(arg("--start") || v.arrived_at);
+  const end = Date.parse(arg("--end") || v.departed_at || v.arrived_at);
+  const pad = PAD_MIN * 60000;
+  const [fixes, photos] = await Promise.all([
+    sb(`location_history?segment_type=eq.transit&arrived_at=gte.${q(iso(start - pad))}&arrived_at=lte.${q(iso(end + pad))}`
+      + `&select=latitude,longitude,accuracy_m,activity,arrived_at&order=arrived_at.asc&limit=2000`),
+    sb(`photos?taken_at=gte.${q(iso(start - pad))}&taken_at=lte.${q(iso(end + pad))}&in_trash=is.false`
+      + `&select=taken_at,latitude,longitude,self_captured&order=taken_at.asc&limit=200`).catch(() => []),
+  ]);
+  const f = classifyWindow({ points: pointsFrom({ fixes, photos }), start, end }).features || {};
+  const at = f.longest_rest_at;
+  const rowLat = Number(v.latitude), rowLon = Number(v.longitude);
+  const out = (at && (f.longest_rest_min || 0) >= MIN_REST_MIN)
+    ? { lat: at.lat, lon: at.lon, rest_min: f.longest_rest_min, row_lat: rowLat, row_lon: rowLon,
+        moved_m: Math.round(haversineMeters(rowLat, rowLon, at.lat, at.lon)) }
+    : { lat: null, rest_min: f.longest_rest_min ?? null, row_lat: rowLat, row_lon: rowLon };
+  process.stdout.write(JSON.stringify(out) + "\n");
+}
+
+main().catch((e) => { process.stdout.write(JSON.stringify({ lat: null, error: String(e.message || e) }) + "\n"); process.exit(1); });

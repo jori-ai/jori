@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  flights-scan — ON-DEMAND launchd user agent (no schedule of its own).
+  Playbook: agent/ops-agent/jobs/flights-scan.md
+
+  The schedule stays in cron: agent/scripts/trigger-flights-scan.sh runs
+  `launchctl kickstart gui/$(id -u)/ai.claude.flights-scan`, handing the run to the GUI
+  session, because `bin/flights-scan-run` makes a tool-less `claude -p` call on the Max
+  subscription (lib/max-judge.js) and only the GUI session can unlock the
+  keychain holding that credential — from cron it prints "Not logged in"
+  (agent/CLAUDE.md § Effort Policy). cron-run loads .env, strips any
+  Anthropic API key, and records the run to data/cron-runs.jsonl.
+
+  Install:
+    agent/launch-agents/install.sh ai.claude.flights-scan
+    (renders __JORI_HOME__ / __JORI_TOOLS__ / __HOME__, then launchctl bootstrap)
+  Run once, now:
+    launchctl kickstart gui/$(id -u)/ai.claude.flights-scan
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>ai.claude.flights-scan</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>__JORI_TOOLS__/bin/cron-run</string>
+        <string>--label</string>
+        <string>flights-scan</string>
+        <string>--</string>
+        <string>/bin/bash</string>
+        <string>-c</string>
+        <string>__JORI_TOOLS__/bin/flights-scan-run &gt;&gt; __JORI_HOME__/logs/flights-scan.log 2&gt;&amp;1</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>__HOME__</string>
+        <key>PATH</key>
+        <string>__HOME__/.local/bin:/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:__JORI_TOOLS__/bin</string>
+        <key>LANG</key>
+        <string>en_US.UTF-8</string>
+    </dict>
+    <key>WorkingDirectory</key>
+    <string>__JORI_HOME__</string>
+    <key>RunAtLoad</key>
+    <false/>
+    <key>KeepAlive</key>
+    <false/>
+    <key>StandardOutPath</key>
+    <string>__JORI_HOME__/data/logs/flights-scan-launchd.log</string>
+    <key>StandardErrorPath</key>
+    <string>__JORI_HOME__/data/logs/flights-scan-launchd.log</string>
+</dict>
+</plist>

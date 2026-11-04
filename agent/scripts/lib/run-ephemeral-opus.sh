@@ -109,6 +109,24 @@ if [ -z "$MODEL" ]; then
   exit 1
 fi
 
+# The allowance governor (bin/allowance-brake, lib/allowance-gate.sh): while
+# the weekly allowance is on pace to run out before it resets, an optional job
+# waits, and an important one waits for the user's answer (run now, run
+# cheaper, wait for the reset). A job the config does not list always runs.
+# Exit 75 = held: nothing ran, nothing failed. A trigger that already asked
+# (it had to decide before claiming a queued request) sets JORI_BRAKE_DECIDED=1.
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/allowance-gate.sh"
+if [ -z "${JORI_BRAKE_DECIDED:-}" ]; then
+  allowance_gate "$JOB" "${JORI_BRAKE_KEY:-}"
+  if [ "$BRAKE_RC" -eq 3 ]; then
+    log "held by the allowance governor: $BRAKE_REASON"
+    exit "$ALLOWANCE_HELD_RC"
+  elif [ "$BRAKE_RC" -eq 4 ]; then
+    log "allowance governor: cheaper model for this run ($BRAKE_MODEL${BRAKE_EFFORT:+, $BRAKE_EFFORT}): $BRAKE_REASON"
+    MODEL="$BRAKE_MODEL"; [ -n "$BRAKE_EFFORT" ] && EFFORT="$BRAKE_EFFORT"
+  fi
+fi
+
 # MCP service secrets (SUPABASE_ACCESS_TOKEN et al — without it the supabase MCP
 # returns Unauthorized), then force the Max session: never let a stray
 # ANTHROPIC_* credential silently move this onto the metered API.

@@ -30,6 +30,8 @@ import { loadLatest, pickAsk } from "../../../lib/hum-ideas.mjs";
 import { reportBacklog, currentScale, recentlyOffered } from "../../../lib/question-pacing.mjs";
 
 import { installTools } from "../../../lib/root.cjs";
+import { assistantName } from "../../../lib/instance.cjs";
+const ASSISTANT = assistantName(); // the assistant's configured name (lib/instance.cjs)
 await readStdinJson();
 
 const RUNS_FILE = process.env.HUM_RUNS_FILE || installTools("data/hum-runs.jsonl");
@@ -76,7 +78,7 @@ const signal = [
   "That is how things looked THEN. Never present it or its numbers as current (\"lately\", \"these days\"): say when it was seen, or ask without it.",
   `The change: ${String(i.proposed_change || i.title).slice(0, 360)}`,
   predicted ? `What it should do: ${predicted.slice(0, 220)}` : null,
-  `Once they have answered, Jori builds it the way they described${i.risk === "high" ? " and files it as one Improvements card to sign (it is high-risk)" : " and applies it on its own"}.`,
+  `Once they have answered, ${ASSISTANT} builds it the way they described${i.risk === "high" ? " and files it as one Improvements card to sign (it is high-risk)" : " and applies it on its own"}.`,
 ].filter(Boolean).join("\n");
 
 stampRun("hum_asks", true);

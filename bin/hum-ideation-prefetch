@@ -1,0 +1,228 @@
+#!/usr/bin/env node
+// hum-ideation-prefetch — run by trigger-hum-ideation.sh (unsandboxed, under
+// cron-run, so `gog` works) before it decides whether to dispatch at all.
+//
+// 1. PREFETCH (jobs/hum-ideation.md Step 4). Writes everything the ideation
+//    turn used to fetch itself into data/hum-ideation-context.json:
+//    calendar (next 14 days), starred P1 threads (30 days), flights.json,
+//    trip-history.json and `jori context --json`. Each source is
+//    best-effort — a failed one is recorded as {error} and the turn treats it
+//    as unavailable, never as an outage to report (playbook Critical rule 8).
+//    Tasks keep their own file (hum-ideation-tasks.txt), written by the trigger.
+//    Unanswered invites of attendees who never answer FYI invites are scrubbed
+//    from calendar_14d on the way in (quietRsvp, playbook Critical rule 10). Tasks the P1 reply sweep
+//    closed are marked `closed-by-reply` in the tasks file and listed in
+//    `reply_closed_tasks` (markReplyClosed, playbook Step 4.2).
+//
+// 2. SLOT GATE. Four slots a day ran whether or not anything had changed. A
+//    slot is skipped when BOTH hold:
+//      - inventory is healthy: >= MIN_LIVE live unconsumed ideas spread over
+//        >= MIN_CATEGORIES categories with >= 2 each (from hum-ideas-digest.json);
+//      - nothing NEW arrived since the last dispatched run (materialKeys: a
+//        one-off calendar event or its new time, a P1 thread that is new or got
+//        a reply, a changed task, flights, trip history, a reply-closed task).
+//    Either condition failing → dispatch. The seen set is recorded only when a
+//    run is dispatched, so a skipped slot can never mask a change.
+//
+// Usage: hum-ideation-prefetch [--force]     prints {decision:"run"|"skip", reason, ...}
+// Env: JORI_DATA_DIR (tests), HUM_IDEATION_MIN_LIVE, HUM_IDEATION_MIN_CATEGORIES,
+//      HUM_IDEATION_NO_FETCH=1 (tests: skip gog/jori calls).
+
+import fs from "node:fs";
+import path from "node:path";
+import { createRequire } from "node:module";
+import crypto from "node:crypto";
+import { spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
+
+const HERE = path.dirname(fileURLToPath(import.meta.url));
+const { instance, agentAddresses, localConfig } = createRequire(import.meta.url)("../lib/instance.cjs");
+const { installRoot } = createRequire(import.meta.url)("../lib/root.cjs");
+// quiet_rsvp_emails: attendees (lowercase emails) whose unanswered invite is
+// not a signal — they are added to events as an FYI and never RSVP.
+const CFG = localConfig("hum-ideation", { quiet_rsvp_emails: [] });
+const DIR = process.env.JORI_DATA_DIR || path.join(installRoot(), "data");
+const OUT = path.join(DIR, "hum-ideation-context.json");
+const STATE = path.join(DIR, "hum-ideation-last-input.json");
+const MIN_LIVE = Number(process.env.HUM_IDEATION_MIN_LIVE || 25);
+const MIN_CATEGORIES = Number(process.env.HUM_IDEATION_MIN_CATEGORIES || 5);
+const GOG = fs.existsSync("/opt/homebrew/bin/gog") ? "/opt/homebrew/bin/gog" : "gog";
+const ACCOUNT = instance().owner_email;
+
+function readJson(p) { try { return JSON.parse(fs.readFileSync(p, "utf8")); } catch { return null; } }
+function run(cmd, args) {
+  const r = spawnSync(cmd, args, { encoding: "utf8", timeout: 60000, maxBuffer: 32 * 1024 * 1024 });
+  if (r.status !== 0) return { error: (r.stderr || r.error?.message || `exit ${r.status}`).trim().slice(0, 300) };
+  try { return JSON.parse(r.stdout); } catch { return { error: "non-JSON output" }; }
+}
+
+// An FYI attendee's pending response is not information (playbook Critical
+// rule 10). Some attendees are added to confirmed plans as an FYI and leave
+// those invites unanswered by habit, yet ideation kept reading `needsAction`
+// as "hasn't RSVP'd" and proposing chases. The non-answer is removed before
+// the turn sees it; an accept or decline actually sent is left alone.
+export const QUIET_RSVP_EMAILS = (Array.isArray(CFG.quiet_rsvp_emails) ? CFG.quiet_rsvp_emails : [])
+  .map((e) => String(e || "").trim().toLowerCase()).filter(Boolean);
+export function quietRsvp(cal, emails = QUIET_RSVP_EMAILS) {
+  const quiet = new Set((emails || []).map((e) => String(e).toLowerCase()));
+  const events = Array.isArray(cal?.events) ? cal.events : Array.isArray(cal) ? cal : null;
+  if (!events || !quiet.size) return cal;
+  for (const e of events) {
+    for (const a of e?.attendees || []) {
+      if (!quiet.has(String(a?.email || "").toLowerCase()) || a.responseStatus !== "needsAction") continue;
+      delete a.responseStatus;
+      a.rsvp = "not a signal: this attendee leaves FYI invites unanswered (Critical rule 10)";
+    }
+  }
+  return cal;
+}
+
+// A task the reply sweep closed is not a task that got done (found in a Jev
+// disagreement review). p1-reply-sweep closes a P1's linked Google Task as soon
+// as the user replies on the email thread (p1-resolutions.jsonl, source
+// "reply"), and that reply is often a question back. The tasks file carries
+// only STATUS, so ideation read "completed" as "done": a "send missing docs"
+// task closed on a reply asking how to send them, and three ideas that day
+// built on "the docs went in" while they were still outstanding. The status is
+// rewritten on the way in. A task closed
+// any other way, or reopened since, is left alone.
+export const REPLY_CLOSED_STATUS = "closed-by-reply";
+export function replyClosedTasks(lines, nowMs = Date.now(), days = 14) {
+  const out = new Map();
+  for (const line of lines) {
+    let r;
+    try { r = JSON.parse(line); } catch { continue; }
+    if (r?.source !== "reply" || r.success === false) continue;
+    const at = Date.parse(r.ts);
+    if (!Number.isFinite(at) || nowMs - at > days * 86400e3) continue;
+    for (const t of r.task?.closed || []) {
+      if (t?.id) out.set(t.id, { task_id: t.id, title: t.title || "", closed_at: r.ts, thread_subject: r.subject || "", from: r.from || "" });
+    }
+  }
+  return [...out.values()];
+}
+export function markReplyClosed(tsv, ids) {
+  if (!tsv || !ids?.size) return tsv;
+  const lines = tsv.split("\n");
+  const head = lines[0].split("\t");
+  const iId = head.indexOf("ID"), iStatus = head.indexOf("STATUS");
+  if (iId < 0 || iStatus < 0) return tsv;
+  return lines.map((l, n) => {
+    const cells = l.split("\t");
+    if (n === 0 || !ids.has(cells[iId]) || cells[iStatus] !== "completed") return l;
+    cells[iStatus] = REPLY_CLOSED_STATUS;
+    return cells.join("\t");
+  }).join("\n");
+}
+
+// What counts as new for the slot gate (2026-10-20). The gate used to hash every
+// byte it prefetched, and from 2026-10-05 to 10-19 it read "inputs changed" in
+// 57 of 57 slots while the reservoir held 75-111 live ideas (3-4x MIN_LIVE):
+// events ending out of the window, etags and attendee replies, read/unread
+// labels, recurring instances entering the 14-day horizon, Jori's own P1
+// digests and the reservoir's own churn changed the hash every 3-5 hours, so
+// the skip never happened. These are identity strings only; nothing here reads
+// what an email or event says. The reservoir itself is not an input: depletion
+// is what inventoryHealthy() watches.
+// The agent's own addresses (instance agent_email plus agent_email_aliases).
+export const JORI_SENDERS = new Set(agentAddresses());
+// "Jori <agent@example.com>" -> "agent@example.com" (the header's address part, not its display name).
+function senderAddress(from) {
+  const s = String(from || "").trim().toLowerCase();
+  const lt = s.lastIndexOf("<"), gt = s.lastIndexOf(">");
+  return lt >= 0 && gt > lt ? s.slice(lt + 1, gt).trim() : s;
+}
+function digestOf(v) { return crypto.createHash("sha256").update(JSON.stringify(v ?? null)).digest("hex").slice(0, 16); }
+export function materialKeys(ctx, tasks) {
+  const keys = new Set();
+  const cal = ctx?.calendar_14d;
+  const events = Array.isArray(cal?.events) ? cal.events : Array.isArray(cal) ? cal : [];
+  for (const e of events) {
+    if (!e) continue;
+    // A recurring instance entering the horizon is not news; a one-off event, a new time or place
+    // for one, or a recurring instance moved off its slot, is.
+    const start = e.start?.dateTime || e.start?.date || "";
+    const one = `cal:${e.id}|${start}|${e.summary || ""}|${e.location || ""}`;
+    if (!e.recurringEventId) { keys.add(one); continue; }
+    keys.add(`cal-series:${e.recurringEventId}|${e.summary || ""}`);
+    const orig = e.originalStartTime?.dateTime || e.originalStartTime?.date || "";
+    if (orig && start && Date.parse(orig) !== Date.parse(start)) keys.add(one);
+  }
+  const p1 = ctx?.p1_threads;
+  const threads = Array.isArray(p1) ? p1 : Array.isArray(p1?.threads) ? p1.threads : [];
+  for (const t of threads) {
+    if (!t?.id) continue;
+    // A Jori email nobody has answered is something Jori already told the user.
+    if (JORI_SENDERS.has(senderAddress(t.from)) && Number(t.messageCount || 1) <= 1) continue;
+    keys.add(`p1:${t.id}|${t.messageCount ?? ""}`);
+  }
+  const lines = String(tasks || "").split("\n").filter((l) => l.trim());
+  const head = (lines[0] || "").split("\t");
+  const iUpd = head.indexOf("UPDATED");
+  for (const l of head.includes("ID") ? lines.slice(1) : lines) {
+    const cells = l.split("\t");
+    if (iUpd >= 0) cells.splice(iUpd, 1);
+    keys.add(`task:${cells.join("|")}`);
+  }
+  for (const t of ctx?.reply_closed_tasks || []) if (t?.task_id) keys.add(`reply-closed:${t.task_id}`);
+  if (ctx?.flights != null) keys.add(`flights:${digestOf(ctx.flights)}`);
+  if (ctx?.trip_history != null) keys.add(`trips:${digestOf(ctx.trip_history)}`);
+  if (ctx?.context && !ctx.context.error) keys.add(`context-shape:${Object.keys(ctx.context).sort().join(",")}`);
+  return [...keys].sort();
+}
+
+export function inventoryHealthy(digest) {
+  const live = digest?.unconsumed || [];
+  const perCat = {};
+  for (const u of live) perCat[u.category || "?"] = (perCat[u.category || "?"] || 0) + 1;
+  const deep = Object.values(perCat).filter((n) => n >= 2).length;
+  return { healthy: live.length >= MIN_LIVE && deep >= MIN_CATEGORIES, live: live.length, categories_with_2plus: deep };
+}
+
+function main() {
+  const force = process.argv.includes("--force");
+  const noFetch = process.env.HUM_IDEATION_NO_FETCH === "1";
+  let resolutions = [];
+  try { resolutions = fs.readFileSync(path.join(DIR, "p1-resolutions.jsonl"), "utf8").split("\n"); } catch { /* none */ }
+  const replyClosed = replyClosedTasks(resolutions);
+  const ctx = {
+    generated_at: new Date().toISOString(),
+    calendar_14d: noFetch ? null : !ACCOUNT ? { error: "no owner_email configured" } : quietRsvp(run(GOG, ["calendar", "list", "--account", ACCOUNT, "--days", "14", "--max", "150", "--json"])),
+    p1_threads: noFetch ? null : !ACCOUNT ? { error: "no owner_email configured" } : run(GOG, ["gmail", "search", "label:p1 is:starred newer_than:30d", "--account", ACCOUNT, "--json", "--results-only"]),
+    flights: readJson(path.join(DIR, "flights.json")),
+    trip_history: readJson(path.join(DIR, "trip-history.json")),
+    context: noFetch ? null : run(path.join(HERE, "jori"), ["context", "--json"]),
+    reply_closed_tasks: replyClosed,
+  };
+  fs.writeFileSync(OUT + ".tmp", JSON.stringify(ctx, null, 2) + "\n");
+  fs.renameSync(OUT + ".tmp", OUT);
+
+  const digest = readJson(path.join(DIR, "hum-ideas-digest.json"));
+  const tasksFile = path.join(DIR, "hum-ideation-tasks.txt");
+  let tasks = "";
+  try { tasks = fs.readFileSync(tasksFile, "utf8"); } catch { /* none */ }
+  const marked = markReplyClosed(tasks, new Set(replyClosed.map((t) => t.task_id)));
+  if (marked !== tasks) { fs.writeFileSync(tasksFile, marked); tasks = marked; }
+  const keys = materialKeys(ctx, tasks);
+  const hash = crypto.createHash("sha256").update(JSON.stringify(keys)).digest("hex");
+  const inv = inventoryHealthy(digest);
+  const last = readJson(STATE);
+  // A state file from before 2026-10-20 has no seen set: treat it as changed once.
+  const seen = Array.isArray(last?.seen) ? new Set(last.seen) : null;
+  const fresh = seen ? keys.filter((k) => !seen.has(k)) : keys;
+  const freshBy = {};
+  for (const k of fresh) { const kind = k.slice(0, k.indexOf(":")); freshBy[kind] = (freshBy[kind] || 0) + 1; }
+
+  let decision = "run", reason;
+  if (force) reason = "forced";
+  else if (!digest) reason = "no digest";
+  else if (!inv.healthy) reason = `inventory thin (${inv.live} live, ${inv.categories_with_2plus} categories with 2+)`;
+  else if (!seen) reason = "no seen set from the last run";
+  else if (fresh.length) reason = `new since last run: ${Object.entries(freshBy).map(([k, n]) => `${k} ${n}`).join(", ")}`;
+  else { decision = "skip"; reason = `inventory healthy (${inv.live} live) and nothing new since ${last.at}`; }
+
+  if (decision === "run") fs.writeFileSync(STATE, JSON.stringify({ hash, at: new Date().toISOString(), seen: keys }) + "\n");
+  process.stdout.write(JSON.stringify({ decision, reason, ...inv, hash: hash.slice(0, 12) }) + "\n");
+}
+
+if (process.argv[1] && fs.realpathSync(process.argv[1]) === fileURLToPath(import.meta.url)) main();

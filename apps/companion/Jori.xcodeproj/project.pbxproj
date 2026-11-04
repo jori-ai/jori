@@ -9,6 +9,16 @@
 /* Begin PBXBuildFile section */
 		1728CFE72F835409008F8BD7 /* Supabase in Frameworks */ = {isa = PBXBuildFile; productRef = 99000001 /* Supabase */; };
 		1728CFE82F835409008F8BD7 /* MarkdownUI in Frameworks */ = {isa = PBXBuildFile; productRef = 99000002 /* MarkdownUI */; };
+		3F27B96416D060AF08ACA6D9 /* TradeApproval.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1B6BC1E802B543B03BFF2296 /* TradeApproval.swift */; };
+		AA000200 /* SelfImproveApproval.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB000200 /* SelfImproveApproval.swift */; };
+		AA000F10 /* PurchaseApproval.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB000F10 /* PurchaseApproval.swift */; };
+		AA000F11 /* PurchaseApprovalReviewView.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB000F11 /* PurchaseApprovalReviewView.swift */; };
+		AA000202 /* ChannelBadges.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB000202 /* ChannelBadges.swift */; };
+		AA000E01 /* DesignSystem.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB000E01 /* DesignSystem.swift */; };
+		AA000E02 /* Responsiveness.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB000E02 /* Responsiveness.swift */; };
+		AA000201 /* SelfImproveApprovalView.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB000201 /* SelfImproveApprovalView.swift */; };
+		AA000299 /* ChoicePrompt.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB000299 /* ChoicePrompt.swift */; };
+		54E9FFBF941875F43A30CE18 /* TradeApprovalPairingView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6BB776C284508F7ADFFA58CE /* TradeApprovalPairingView.swift */; };
 		AA000001 /* JoriApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB000001 /* JoriApp.swift */; };
 		AA000002 /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB000002 /* ContentView.swift */; };
 		AA000003 /* ChatViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB000003 /* ChatViewModel.swift */; };
@@ -16,23 +26,53 @@
 		AA000005 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = BB000005 /* Assets.xcassets */; };
 		AA000006 /* LockScreen.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB000007 /* LockScreen.swift */; };
 		AA000007 /* LocationManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB000008 /* LocationManager.swift */; };
-		AA000030 /* LocationTracker.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB000030 /* LocationTracker.swift */; };
-		AA000041 /* PhoneContextPublisher.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB000041 /* PhoneContextPublisher.swift */; };
-		AA000042 /* WiFiContext.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB000042 /* WiFiContext.swift */; };
-		AA000050 /* HealthKitManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB000050 /* HealthKitManager.swift */; };
 		AA000008 /* CloudBackup.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB000009 /* CloudBackup.swift */; };
-		AA000018 /* MessageStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB000020 /* MessageStore.swift */; };
 		AA000010 /* MessageContentParser.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB000010 /* MessageContentParser.swift */; };
 		AA000011 /* RichMessageView.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB000011 /* RichMessageView.swift */; };
 		AA000012 /* InlineImageView.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB000012 /* InlineImageView.swift */; };
 		AA000013 /* LinkPreviewCard.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB000013 /* LinkPreviewCard.swift */; };
 		AA000014 /* SupabaseManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB000015 /* SupabaseManager.swift */; };
 		AA000015 /* JoriIntents.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB000016 /* JoriIntents.swift */; };
+		AA000016 /* NotificationService.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB000017 /* NotificationService.swift */; };
+		AA000017 /* JoriNotificationService.appex in Embed App Extensions */ = {isa = PBXBuildFile; fileRef = CC000002 /* JoriNotificationService.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
+		AA000018 /* MessageStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB000020 /* MessageStore.swift */; };
+		AA000030 /* LocationTracker.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB000030 /* LocationTracker.swift */; };
+		AA000041 /* PhoneContextPublisher.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB000041 /* PhoneContextPublisher.swift */; };
+		AA000042 /* WiFiContext.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB000042 /* WiFiContext.swift */; };
+		AA000050 /* HealthKitManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB000050 /* HealthKitManager.swift */; };
 		AA000060 /* SignInView.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB000060 /* SignInView.swift */; };
 		AA000070 /* MacKeychainStorage.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB000070 /* MacKeychainStorage.swift */; };
 		AA000080 /* MemoryView.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB000080 /* MemoryView.swift */; };
-		AA000016 /* NotificationService.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB000017 /* NotificationService.swift */; };
-		AA000017 /* JoriNotificationService.appex in Embed App Extensions */ = {isa = PBXBuildFile; fileRef = CC000002 /* JoriNotificationService.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
+		CAF3B695C1ACD69D04A5691F /* TradeApprovalReviewView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 863C2965C2FEB4DF738868EC /* TradeApprovalReviewView.swift */; };
+		AA000090 /* SupabaseConfig.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB000093 /* SupabaseConfig.swift */; };
+		AA000091 /* SharedKeychainStorage.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB000094 /* SharedKeychainStorage.swift */; };
+		AA000092 /* IntentHandler.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB000090 /* IntentHandler.swift */; };
+		AA000093 /* SupabaseConfig.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB000093 /* SupabaseConfig.swift */; };
+		AA000094 /* SharedKeychainStorage.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB000094 /* SharedKeychainStorage.swift */; };
+		AA000095 /* Message.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB000004 /* Message.swift */; };
+		AA000096 /* Supabase in Frameworks */ = {isa = PBXBuildFile; productRef = 99000003 /* Supabase */; };
+		AA000097 /* AppIntentVocabulary.plist in Resources */ = {isa = PBXBuildFile; fileRef = BB000095 /* AppIntentVocabulary.plist */; };
+		AA000500 /* Installation in Resources */ = {isa = PBXBuildFile; fileRef = BB000501 /* Installation */; };
+		AA000098 /* SharedSession.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB000096 /* SharedSession.swift */; };
+		AA000099 /* SharedSession.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB000096 /* SharedSession.swift */; };
+		AA000100 /* MessageReply.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB000097 /* MessageReply.swift */; };
+		AA000300 /* PhoneLockMonitor.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB000300 /* PhoneLockMonitor.swift */; };
+		AA000301 /* PhoneUsageMonitor.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB000301 /* PhoneUsageMonitor.swift */; };
+		AA000302 /* PhotoProbeResponder.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB000302 /* PhotoProbeResponder.swift */; };
+		AA000303 /* DeviceActivity.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB000303 /* DeviceActivity.swift */; };
+		AA000310 /* UsageMonitor.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB000310 /* UsageMonitor.swift */; };
+		AA000311 /* SupabaseConfig.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB000093 /* SupabaseConfig.swift */; };
+		AA000400 /* ShareViewController.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB000400 /* ShareViewController.swift */; };
+		AA000401 /* ShareComposeView.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB000401 /* ShareComposeView.swift */; };
+		AA000402 /* SharedContent.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB000402 /* SharedContent.swift */; };
+		AA000403 /* ShareOutbox.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB000406 /* ShareOutbox.swift */; };
+		AA000404 /* ShareOutbox.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB000406 /* ShareOutbox.swift */; };
+		AA000405 /* SupabaseConfig.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB000093 /* SupabaseConfig.swift */; };
+		AA000406 /* SharedKeychainStorage.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB000094 /* SharedKeychainStorage.swift */; };
+		AA000407 /* SharedSession.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB000096 /* SharedSession.swift */; };
+		AA000408 /* Supabase in Frameworks */ = {isa = PBXBuildFile; productRef = 99000004 /* Supabase */; };
+		AA000409 /* JoriShare.appex in Embed App Extensions */ = {isa = PBXBuildFile; fileRef = CC000005 /* JoriShare.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
+		AA00040A /* JoriUsageMonitor.appex in Embed App Extensions */ = {isa = PBXBuildFile; fileRef = CC000004 /* JoriUsageMonitor.appex */; platformFilter = ios; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -42,6 +82,27 @@
 			proxyType = 1;
 			remoteGlobalIDString = FF000003;
 			remoteInfo = JoriNotificationService;
+		};
+		33000002 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = FF000002 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = FF000004;
+			remoteInfo = JoriIntents;
+		};
+		33000003 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = FF000002 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = FF000006;
+			remoteInfo = JoriShare;
+		};
+		33000004 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = FF000002 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = FF000005;
+			remoteInfo = JoriUsageMonitor;
 		};
 /* End PBXContainerItemProxy section */
 
@@ -53,6 +114,8 @@
 			dstSubfolderSpec = 13;
 			files = (
 				AA000017 /* JoriNotificationService.appex in Embed App Extensions */,
+				AA000409 /* JoriShare.appex in Embed App Extensions */,
+				AA00040A /* JoriUsageMonitor.appex in Embed App Extensions */,
 			);
 			name = "Embed App Extensions";
 			runOnlyForDeploymentPostprocessing = 0;
@@ -60,6 +123,19 @@
 /* End PBXCopyFilesBuildPhase section */
 
 /* Begin PBXFileReference section */
+		BB000500 /* Jori.xcconfig */ = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; path = Jori.xcconfig; sourceTree = "<group>"; };
+		BB000501 /* Installation */ = {isa = PBXFileReference; lastKnownFileType = folder; path = Installation; sourceTree = "<group>"; };
+		1B6BC1E802B543B03BFF2296 /* TradeApproval.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = TradeApproval.swift; sourceTree = "<group>"; };
+		BB000200 /* SelfImproveApproval.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SelfImproveApproval.swift; sourceTree = "<group>"; };
+		BB000F10 /* PurchaseApproval.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PurchaseApproval.swift; sourceTree = "<group>"; };
+		BB000F11 /* PurchaseApprovalReviewView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PurchaseApprovalReviewView.swift; sourceTree = "<group>"; };
+		BB000202 /* ChannelBadges.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChannelBadges.swift; sourceTree = "<group>"; };
+		BB000E01 /* DesignSystem.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DesignSystem.swift; sourceTree = "<group>"; };
+		BB000E02 /* Responsiveness.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Responsiveness.swift; sourceTree = "<group>"; };
+		BB000201 /* SelfImproveApprovalView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SelfImproveApprovalView.swift; sourceTree = "<group>"; };
+		BB000299 /* ChoicePrompt.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChoicePrompt.swift; sourceTree = "<group>"; };
+		6BB776C284508F7ADFFA58CE /* TradeApprovalPairingView.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = TradeApprovalPairingView.swift; sourceTree = "<group>"; };
+		863C2965C2FEB4DF738868EC /* TradeApprovalReviewView.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = TradeApprovalReviewView.swift; sourceTree = "<group>"; };
 		BB000001 /* JoriApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = JoriApp.swift; sourceTree = "<group>"; };
 		BB000002 /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
 		BB000003 /* ChatViewModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChatViewModel.swift; sourceTree = "<group>"; };
@@ -68,27 +144,52 @@
 		BB000006 /* Jori.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = Jori.entitlements; sourceTree = "<group>"; };
 		BB000007 /* LockScreen.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LockScreen.swift; sourceTree = "<group>"; };
 		BB000008 /* LocationManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LocationManager.swift; sourceTree = "<group>"; };
-		BB000030 /* LocationTracker.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LocationTracker.swift; sourceTree = "<group>"; };
-		BB000041 /* PhoneContextPublisher.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PhoneContextPublisher.swift; sourceTree = "<group>"; };
-		BB000042 /* WiFiContext.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WiFiContext.swift; sourceTree = "<group>"; };
-		BB000050 /* HealthKitManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HealthKitManager.swift; sourceTree = "<group>"; };
 		BB000009 /* CloudBackup.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CloudBackup.swift; sourceTree = "<group>"; };
-		BB000020 /* MessageStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MessageStore.swift; sourceTree = "<group>"; };
 		BB000010 /* MessageContentParser.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MessageContentParser.swift; sourceTree = "<group>"; };
 		BB000011 /* RichMessageView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RichMessageView.swift; sourceTree = "<group>"; };
 		BB000012 /* InlineImageView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = InlineImageView.swift; sourceTree = "<group>"; };
 		BB000013 /* LinkPreviewCard.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LinkPreviewCard.swift; sourceTree = "<group>"; };
 		BB000014 /* Jori-macOS.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = "Jori-macOS.entitlements"; sourceTree = "<group>"; };
 		BB000015 /* SupabaseManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SupabaseManager.swift; sourceTree = "<group>"; };
-		BB000060 /* SignInView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SignInView.swift; sourceTree = "<group>"; };
-		BB000070 /* MacKeychainStorage.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MacKeychainStorage.swift; sourceTree = "<group>"; };
-		BB000080 /* MemoryView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MemoryView.swift; sourceTree = "<group>"; };
 		BB000016 /* JoriIntents.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = JoriIntents.swift; sourceTree = "<group>"; };
 		BB000017 /* NotificationService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NotificationService.swift; sourceTree = "<group>"; };
 		BB000018 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
 		BB000019 /* JoriNotificationService.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = JoriNotificationService.entitlements; sourceTree = "<group>"; };
+		BB000020 /* MessageStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MessageStore.swift; sourceTree = "<group>"; };
+		BB000030 /* LocationTracker.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LocationTracker.swift; sourceTree = "<group>"; };
+		BB000041 /* PhoneContextPublisher.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PhoneContextPublisher.swift; sourceTree = "<group>"; };
+		BB000042 /* WiFiContext.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WiFiContext.swift; sourceTree = "<group>"; };
+		BB000050 /* HealthKitManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HealthKitManager.swift; sourceTree = "<group>"; };
+		BB000060 /* SignInView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SignInView.swift; sourceTree = "<group>"; };
+		BB000070 /* MacKeychainStorage.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MacKeychainStorage.swift; sourceTree = "<group>"; };
+		BB000080 /* MemoryView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MemoryView.swift; sourceTree = "<group>"; };
 		CC000001 /* Jori.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Jori.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		CC000002 /* JoriNotificationService.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = JoriNotificationService.appex; sourceTree = BUILT_PRODUCTS_DIR; };
+		CC000003 /* JoriIntents.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = JoriIntents.appex; sourceTree = BUILT_PRODUCTS_DIR; };
+		BB000090 /* IntentHandler.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IntentHandler.swift; sourceTree = "<group>"; };
+		BB000091 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
+		BB000092 /* JoriIntents.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = JoriIntents.entitlements; sourceTree = "<group>"; };
+		BB000093 /* SupabaseConfig.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SupabaseConfig.swift; sourceTree = "<group>"; };
+		BB000094 /* SharedKeychainStorage.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SharedKeychainStorage.swift; sourceTree = "<group>"; };
+		BB000095 /* AppIntentVocabulary.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = AppIntentVocabulary.plist; sourceTree = "<group>"; };
+		BB000096 /* SharedSession.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SharedSession.swift; sourceTree = "<group>"; };
+		BB000097 /* MessageReply.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MessageReply.swift; sourceTree = "<group>"; };
+		BB000300 /* PhoneLockMonitor.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PhoneLockMonitor.swift; sourceTree = "<group>"; };
+		BB000301 /* PhoneUsageMonitor.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PhoneUsageMonitor.swift; sourceTree = "<group>"; };
+		BB000302 /* PhotoProbeResponder.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PhotoProbeResponder.swift; sourceTree = "<group>"; };
+		BB000303 /* DeviceActivity.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DeviceActivity.swift; sourceTree = "<group>"; };
+		BB000310 /* UsageMonitor.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = UsageMonitor.swift; sourceTree = "<group>"; };
+		BB000311 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
+		BB000312 /* JoriUsageMonitor.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = JoriUsageMonitor.entitlements; sourceTree = "<group>"; };
+		CC000004 /* JoriUsageMonitor.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = JoriUsageMonitor.appex; sourceTree = BUILT_PRODUCTS_DIR; };
+		BB000400 /* ShareViewController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ShareViewController.swift; sourceTree = "<group>"; };
+		BB000401 /* ShareComposeView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ShareComposeView.swift; sourceTree = "<group>"; };
+		BB000402 /* SharedContent.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SharedContent.swift; sourceTree = "<group>"; };
+		BB000403 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
+		BB000404 /* JoriShare.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = JoriShare.entitlements; sourceTree = "<group>"; };
+		BB000405 /* JoriShare-macOS.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = "JoriShare-macOS.entitlements"; sourceTree = "<group>"; };
+		BB000406 /* ShareOutbox.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ShareOutbox.swift; sourceTree = "<group>"; };
+		CC000005 /* JoriShare.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = JoriShare.appex; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -108,6 +209,29 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		DD000009 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				AA000096 /* Supabase in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		DD000012 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		DD000015 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				AA000408 /* Supabase in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXFrameworksBuildPhase section */
 
 /* Begin PBXGroup section */
@@ -116,8 +240,20 @@
 			children = (
 				EE000002 /* Jori */,
 				EE000004 /* JoriNotificationService */,
+				EE000005 /* JoriIntents */,
+				EE000006 /* JoriUsageMonitor */,
+				EE000007 /* JoriShare */,
+				EE000008 /* Config */,
 				EE000003 /* Products */,
 			);
+			sourceTree = "<group>";
+		};
+		EE000008 /* Config */ = {
+			isa = PBXGroup;
+			children = (
+				BB000500 /* Jori.xcconfig */,
+			);
+			path = Config;
 			sourceTree = "<group>";
 		};
 		EE000002 /* Jori */ = {
@@ -128,6 +264,8 @@
 				BB000003 /* ChatViewModel.swift */,
 				BB000004 /* Message.swift */,
 				BB000005 /* Assets.xcassets */,
+				BB000095 /* AppIntentVocabulary.plist */,
+				BB000501 /* Installation */,
 				BB000006 /* Jori.entitlements */,
 				BB000014 /* Jori-macOS.entitlements */,
 				BB000007 /* LockScreen.swift */,
@@ -136,6 +274,10 @@
 				BB000041 /* PhoneContextPublisher.swift */,
 				BB000042 /* WiFiContext.swift */,
 				BB000050 /* HealthKitManager.swift */,
+				BB000300 /* PhoneLockMonitor.swift */,
+				BB000301 /* PhoneUsageMonitor.swift */,
+				BB000302 /* PhotoProbeResponder.swift */,
+				BB000303 /* DeviceActivity.swift */,
 				BB000009 /* CloudBackup.swift */,
 				BB000020 /* MessageStore.swift */,
 				BB000010 /* MessageContentParser.swift */,
@@ -143,10 +285,26 @@
 				BB000012 /* InlineImageView.swift */,
 				BB000013 /* LinkPreviewCard.swift */,
 				BB000015 /* SupabaseManager.swift */,
+				BB000093 /* SupabaseConfig.swift */,
+				BB000094 /* SharedKeychainStorage.swift */,
+				BB000096 /* SharedSession.swift */,
+				BB000406 /* ShareOutbox.swift */,
+				BB000097 /* MessageReply.swift */,
 				BB000016 /* JoriIntents.swift */,
 				BB000060 /* SignInView.swift */,
 				BB000070 /* MacKeychainStorage.swift */,
 				BB000080 /* MemoryView.swift */,
+				1B6BC1E802B543B03BFF2296 /* TradeApproval.swift */,
+				6BB776C284508F7ADFFA58CE /* TradeApprovalPairingView.swift */,
+				863C2965C2FEB4DF738868EC /* TradeApprovalReviewView.swift */,
+				BB000200 /* SelfImproveApproval.swift */,
+				BB000F10 /* PurchaseApproval.swift */,
+				BB000F11 /* PurchaseApprovalReviewView.swift */,
+				BB000202 /* ChannelBadges.swift */,
+				BB000E01 /* DesignSystem.swift */,
+				BB000E02 /* Responsiveness.swift */,
+				BB000201 /* SelfImproveApprovalView.swift */,
+				BB000299 /* ChoicePrompt.swift */,
 			);
 			path = Jori;
 			sourceTree = "<group>";
@@ -156,6 +314,9 @@
 			children = (
 				CC000001 /* Jori.app */,
 				CC000002 /* JoriNotificationService.appex */,
+				CC000003 /* JoriIntents.appex */,
+				CC000004 /* JoriUsageMonitor.appex */,
+				CC000005 /* JoriShare.appex */,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -168,6 +329,39 @@
 				BB000019 /* JoriNotificationService.entitlements */,
 			);
 			path = JoriNotificationService;
+			sourceTree = "<group>";
+		};
+		EE000005 /* JoriIntents */ = {
+			isa = PBXGroup;
+			children = (
+				BB000090 /* IntentHandler.swift */,
+				BB000091 /* Info.plist */,
+				BB000092 /* JoriIntents.entitlements */,
+			);
+			path = JoriIntents;
+			sourceTree = "<group>";
+		};
+		EE000006 /* JoriUsageMonitor */ = {
+			isa = PBXGroup;
+			children = (
+				BB000310 /* UsageMonitor.swift */,
+				BB000311 /* Info.plist */,
+				BB000312 /* JoriUsageMonitor.entitlements */,
+			);
+			path = JoriUsageMonitor;
+			sourceTree = "<group>";
+		};
+		EE000007 /* JoriShare */ = {
+			isa = PBXGroup;
+			children = (
+				BB000400 /* ShareViewController.swift */,
+				BB000401 /* ShareComposeView.swift */,
+				BB000402 /* SharedContent.swift */,
+				BB000403 /* Info.plist */,
+				BB000404 /* JoriShare.entitlements */,
+				BB000405 /* JoriShare-macOS.entitlements */,
+			);
+			path = JoriShare;
 			sourceTree = "<group>";
 		};
 /* End PBXGroup section */
@@ -186,6 +380,9 @@
 			);
 			dependencies = (
 				22000001 /* PBXTargetDependency */,
+				22000002 /* PBXTargetDependency */,
+				22000003 /* PBXTargetDependency */,
+				22000004 /* PBXTargetDependency */,
 			);
 			name = Jori;
 			packageProductDependencies = (
@@ -211,6 +408,63 @@
 			name = JoriNotificationService;
 			productName = JoriNotificationService;
 			productReference = CC000002 /* JoriNotificationService.appex */;
+			productType = "com.apple.product-type.app-extension";
+		};
+		FF000004 /* JoriIntents */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 11000013 /* Build configuration list for PBXNativeTarget "JoriIntents" */;
+			buildPhases = (
+				DD000008 /* Sources */,
+				DD000009 /* Frameworks */,
+				DD000010 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = JoriIntents;
+			packageProductDependencies = (
+				99000003 /* Supabase */,
+			);
+			productName = JoriIntents;
+			productReference = CC000003 /* JoriIntents.appex */;
+			productType = "com.apple.product-type.app-extension";
+		};
+		FF000005 /* JoriUsageMonitor */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 11000016 /* Build configuration list for PBXNativeTarget "JoriUsageMonitor" */;
+			buildPhases = (
+				DD000011 /* Sources */,
+				DD000012 /* Frameworks */,
+				DD000013 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = JoriUsageMonitor;
+			productName = JoriUsageMonitor;
+			productReference = CC000004 /* JoriUsageMonitor.appex */;
+			productType = "com.apple.product-type.app-extension";
+		};
+		FF000006 /* JoriShare */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 11000019 /* Build configuration list for PBXNativeTarget "JoriShare" */;
+			buildPhases = (
+				DD000014 /* Sources */,
+				DD000015 /* Frameworks */,
+				DD000016 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = JoriShare;
+			packageProductDependencies = (
+				99000004 /* Supabase */,
+			);
+			productName = JoriShare;
+			productReference = CC000005 /* JoriShare.appex */;
 			productType = "com.apple.product-type.app-extension";
 		};
 /* End PBXNativeTarget section */
@@ -242,6 +496,9 @@
 			targets = (
 				FF000001 /* Jori */,
 				FF000003 /* JoriNotificationService */,
+				FF000004 /* JoriIntents */,
+				FF000005 /* JoriUsageMonitor */,
+				FF000006 /* JoriShare */,
 			);
 		};
 /* End PBXProject section */
@@ -252,10 +509,33 @@
 			buildActionMask = 2147483647;
 			files = (
 				AA000005 /* Assets.xcassets in Resources */,
+				AA000097 /* AppIntentVocabulary.plist in Resources */,
+				AA000500 /* Installation in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
 		DD000006 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		DD000010 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		DD000013 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		DD000016 /* Resources */ = {
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
@@ -286,10 +566,30 @@
 				AA000012 /* InlineImageView.swift in Sources */,
 				AA000013 /* LinkPreviewCard.swift in Sources */,
 				AA000014 /* SupabaseManager.swift in Sources */,
+				AA000090 /* SupabaseConfig.swift in Sources */,
+				AA000091 /* SharedKeychainStorage.swift in Sources */,
+				AA000098 /* SharedSession.swift in Sources */,
+				AA000100 /* MessageReply.swift in Sources */,
 				AA000015 /* JoriIntents.swift in Sources */,
 				AA000060 /* SignInView.swift in Sources */,
 				AA000070 /* MacKeychainStorage.swift in Sources */,
 				AA000080 /* MemoryView.swift in Sources */,
+				3F27B96416D060AF08ACA6D9 /* TradeApproval.swift in Sources */,
+				54E9FFBF941875F43A30CE18 /* TradeApprovalPairingView.swift in Sources */,
+				CAF3B695C1ACD69D04A5691F /* TradeApprovalReviewView.swift in Sources */,
+				AA000200 /* SelfImproveApproval.swift in Sources */,
+				AA000F10 /* PurchaseApproval.swift in Sources */,
+				AA000F11 /* PurchaseApprovalReviewView.swift in Sources */,
+				AA000202 /* ChannelBadges.swift in Sources */,
+				AA000E01 /* DesignSystem.swift in Sources */,
+				AA000E02 /* Responsiveness.swift in Sources */,
+				AA000201 /* SelfImproveApprovalView.swift in Sources */,
+				AA000299 /* ChoicePrompt.swift in Sources */,
+				AA000300 /* PhoneLockMonitor.swift in Sources */,
+				AA000301 /* PhoneUsageMonitor.swift in Sources */,
+				AA000302 /* PhotoProbeResponder.swift in Sources */,
+				AA000303 /* DeviceActivity.swift in Sources */,
+				AA000403 /* ShareOutbox.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -301,6 +601,41 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		DD000008 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				AA000092 /* IntentHandler.swift in Sources */,
+				AA000093 /* SupabaseConfig.swift in Sources */,
+				AA000094 /* SharedKeychainStorage.swift in Sources */,
+				AA000099 /* SharedSession.swift in Sources */,
+				AA000095 /* Message.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		DD000011 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				AA000310 /* UsageMonitor.swift in Sources */,
+				AA000311 /* SupabaseConfig.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		DD000014 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				AA000400 /* ShareViewController.swift in Sources */,
+				AA000401 /* ShareComposeView.swift in Sources */,
+				AA000402 /* SharedContent.swift in Sources */,
+				AA000404 /* ShareOutbox.swift in Sources */,
+				AA000405 /* SupabaseConfig.swift in Sources */,
+				AA000406 /* SharedKeychainStorage.swift in Sources */,
+				AA000407 /* SharedSession.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXSourcesBuildPhase section */
 
 /* Begin PBXTargetDependency section */
@@ -309,11 +644,29 @@
 			target = FF000003 /* JoriNotificationService */;
 			targetProxy = 33000001 /* PBXContainerItemProxy */;
 		};
+		22000002 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			platformFilter = ios;
+			target = FF000004 /* JoriIntents */;
+			targetProxy = 33000002 /* PBXContainerItemProxy */;
+		};
+		22000003 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = FF000006 /* JoriShare */;
+			targetProxy = 33000003 /* PBXContainerItemProxy */;
+		};
+		22000004 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			platformFilter = ios;
+			target = FF000005 /* JoriUsageMonitor */;
+			targetProxy = 33000004 /* PBXContainerItemProxy */;
+		};
 /* End PBXTargetDependency section */
 
 /* Begin XCBuildConfiguration section */
 		11000004 /* Debug */ = {
 			isa = XCBuildConfiguration;
+			baseConfigurationReference = BB000500 /* Jori.xcconfig */;
 			buildSettings = {
 				ALWAYS_SEARCH_USER_PATHS = NO;
 				ASSETCATALOG_COMPILER_GENERATE_SWIFT_ASSET_SYMBOL_EXTENSIONS = YES;
@@ -342,6 +695,7 @@
 		};
 		11000005 /* Release */ = {
 			isa = XCBuildConfiguration;
+			baseConfigurationReference = BB000500 /* Jori.xcconfig */;
 			buildSettings = {
 				ALWAYS_SEARCH_USER_PATHS = NO;
 				ASSETCATALOG_COMPILER_GENERATE_SWIFT_ASSET_SYMBOL_EXTENSIONS = YES;
@@ -366,31 +720,34 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
-				CODE_SIGN_ENTITLEMENTS = Jori/Jori.entitlements;
+				CODE_SIGN_ENTITLEMENTS = "$(JORI_APP_ENTITLEMENTS)";
 				"CODE_SIGN_ENTITLEMENTS[sdk=macosx*]" = "Jori/Jori-macOS.entitlements";
-				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 27;
-				DEVELOPMENT_TEAM = TEAMID_PLACEHOLDER;
+				CODE_SIGN_IDENTITY = "$(JORI_CODE_SIGN_IDENTITY)";
+				CODE_SIGN_STYLE = "$(JORI_CODE_SIGN_STYLE)";
+				CURRENT_PROJECT_VERSION = 28;
+				DEVELOPMENT_TEAM = "$(JORI_TEAM_ID)";
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = Jori/Info.plist;
 				INFOPLIST_KEY_ITSAppUsesNonExemptEncryption = NO;
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.productivity";
 				INFOPLIST_KEY_NSFaceIDUsageDescription = "Unlock Jori with Face ID";
+				INFOPLIST_KEY_NSHealthClinicalHealthRecordsShareUsageDescription = "Jori reads your clinical records — lab results, medications, allergies, conditions, immunizations, procedures, vitals — so your assistant can reason about your medical history alongside everything else it knows.";
+				INFOPLIST_KEY_NSHealthShareUsageDescription = "Jori reads your health metrics — heart rate, sleep, workouts, activity — so your assistant can reason about your activity, recovery, and wellbeing.";
+				INFOPLIST_KEY_NSHealthUpdateUsageDescription = "Jori does not write to Health. This string is present only because Apple requires it whenever HealthKit is linked.";
 				INFOPLIST_KEY_NSLocationAlwaysAndWhenInUseUsageDescription = "Jori tracks your location in the background to build a timeline of where you've been throughout the day.";
 				INFOPLIST_KEY_NSLocationWhenInUseUsageDescription = "Share your location when requested by the assistant";
 				INFOPLIST_KEY_NSMotionUsageDescription = "Jori uses motion data to detect whether you're walking, driving, or stationary.";
-				INFOPLIST_KEY_NSHealthShareUsageDescription = "Jori reads your health metrics — heart rate, sleep, workouts, activity — so your assistant can reason about your activity, recovery, and wellbeing.";
-				INFOPLIST_KEY_NSHealthUpdateUsageDescription = "Jori does not write to Health. This string is present only because Apple requires it whenever HealthKit is linked.";
-				INFOPLIST_KEY_NSHealthClinicalHealthRecordsShareUsageDescription = "Jori reads your clinical records — lab results, medications, allergies, conditions, immunizations, procedures, vitals — so your assistant can reason about your medical history alongside everything else it knows.";
-				INFOPLIST_KEY_UIBackgroundModes = "location remote-notification";
+				INFOPLIST_KEY_NSPhotoLibraryUsageDescription = "Jori looks at photos you took during a stop to work out where you were, so it doesn't have to ask you.";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
+				INFOPLIST_KEY_UIBackgroundModes = "location remote-notification";
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
 				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad = "UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
-				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone = "UIInterfaceOrientationPortrait";
+				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone = UIInterfaceOrientationPortrait;
 				MACOSX_DEPLOYMENT_TARGET = 14.0;
-				MARKETING_VERSION = 1.1;
-				PRODUCT_BUNDLE_IDENTIFIER = com.example.Jori;
+				MARKETING_VERSION = "$(JORI_MARKETING_VERSION)";
+				PRODUCT_BUNDLE_IDENTIFIER = "$(JORI_BUNDLE_ID)";
+				PROVISIONING_PROFILE_SPECIFIER = "$(JORI_PROFILE_APP)";
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator macosx";
 				SUPPORTS_MACCATALYST = NO;
@@ -405,33 +762,35 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
-				CODE_SIGN_ENTITLEMENTS = Jori/Jori.entitlements;
+				CODE_SIGN_ENTITLEMENTS = "$(JORI_APP_ENTITLEMENTS)";
 				"CODE_SIGN_ENTITLEMENTS[sdk=macosx*]" = "Jori/Jori-macOS.entitlements";
-				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 27;
-				DEVELOPMENT_TEAM = TEAMID_PLACEHOLDER;
+				CODE_SIGN_IDENTITY = "$(JORI_CODE_SIGN_IDENTITY)";
+				CODE_SIGN_STYLE = "$(JORI_CODE_SIGN_STYLE)";
+				CURRENT_PROJECT_VERSION = 28;
+				DEVELOPMENT_TEAM = "$(JORI_TEAM_ID)";
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = Jori/Info.plist;
 				INFOPLIST_KEY_ITSAppUsesNonExemptEncryption = NO;
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.productivity";
 				INFOPLIST_KEY_NSFaceIDUsageDescription = "Unlock Jori with Face ID";
+				INFOPLIST_KEY_NSHealthClinicalHealthRecordsShareUsageDescription = "Jori reads your clinical records — lab results, medications, allergies, conditions, immunizations, procedures, vitals — so your assistant can reason about your medical history alongside everything else it knows.";
+				INFOPLIST_KEY_NSHealthShareUsageDescription = "Jori reads your health metrics — heart rate, sleep, workouts, activity — so your assistant can reason about your activity, recovery, and wellbeing.";
+				INFOPLIST_KEY_NSHealthUpdateUsageDescription = "Jori does not write to Health. This string is present only because Apple requires it whenever HealthKit is linked.";
 				INFOPLIST_KEY_NSLocationAlwaysAndWhenInUseUsageDescription = "Jori tracks your location in the background to build a timeline of where you've been throughout the day.";
 				INFOPLIST_KEY_NSLocationWhenInUseUsageDescription = "Share your location when requested by the assistant";
 				INFOPLIST_KEY_NSMotionUsageDescription = "Jori uses motion data to detect whether you're walking, driving, or stationary.";
-				INFOPLIST_KEY_NSHealthShareUsageDescription = "Jori reads your health metrics — heart rate, sleep, workouts, activity — so your assistant can reason about your activity, recovery, and wellbeing.";
-				INFOPLIST_KEY_NSHealthUpdateUsageDescription = "Jori does not write to Health. This string is present only because Apple requires it whenever HealthKit is linked.";
-				INFOPLIST_KEY_NSHealthClinicalHealthRecordsShareUsageDescription = "Jori reads your clinical records — lab results, medications, allergies, conditions, immunizations, procedures, vitals — so your assistant can reason about your medical history alongside everything else it knows.";
-				INFOPLIST_KEY_UIBackgroundModes = "location remote-notification";
+				INFOPLIST_KEY_NSPhotoLibraryUsageDescription = "Jori looks at photos you took during a stop to work out where you were, so it doesn't have to ask you.";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
+				INFOPLIST_KEY_UIBackgroundModes = "location remote-notification";
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
 				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad = "UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
-				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone = "UIInterfaceOrientationPortrait";
+				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone = UIInterfaceOrientationPortrait;
 				MACOSX_DEPLOYMENT_TARGET = 14.0;
-				MARKETING_VERSION = 1.1;
-				PRODUCT_BUNDLE_IDENTIFIER = com.example.Jori;
+				MARKETING_VERSION = "$(JORI_MARKETING_VERSION)";
+				PRODUCT_BUNDLE_IDENTIFIER = "$(JORI_BUNDLE_ID)";
+				PROVISIONING_PROFILE_SPECIFIER = "$(JORI_PROFILE_APP)";
 				PRODUCT_NAME = "$(TARGET_NAME)";
-				PROVISIONING_PROFILE_SPECIFIER = "";
 				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator macosx";
 				SUPPORTS_MACCATALYST = NO;
 				SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD = NO;
@@ -445,9 +804,11 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				CODE_SIGN_ENTITLEMENTS = JoriNotificationService/JoriNotificationService.entitlements;
-				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 27;
-				DEVELOPMENT_TEAM = TEAMID_PLACEHOLDER;
+				"CODE_SIGN_ENTITLEMENTS[sdk=macosx*]" = "JoriNotificationService/JoriNotificationService-macOS.entitlements";
+				CODE_SIGN_IDENTITY = "$(JORI_CODE_SIGN_IDENTITY)";
+				CODE_SIGN_STYLE = "$(JORI_CODE_SIGN_STYLE)";
+				CURRENT_PROJECT_VERSION = 28;
+				DEVELOPMENT_TEAM = "$(JORI_TEAM_ID)";
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = JoriNotificationService/Info.plist;
 				INFOPLIST_KEY_CFBundleDisplayName = JoriNotificationService;
@@ -459,8 +820,9 @@
 					"@executable_path/../../Frameworks",
 				);
 				MACOSX_DEPLOYMENT_TARGET = 14.0;
-				MARKETING_VERSION = 1.1;
-				PRODUCT_BUNDLE_IDENTIFIER = com.example.Jori.NotificationService;
+				MARKETING_VERSION = "$(JORI_MARKETING_VERSION)";
+				PRODUCT_BUNDLE_IDENTIFIER = "$(JORI_BUNDLE_ID).NotificationService";
+				PROVISIONING_PROFILE_SPECIFIER = "$(JORI_PROFILE_NOTIFICATION_SERVICE)";
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SKIP_INSTALL = YES;
 				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator macosx";
@@ -475,9 +837,11 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				CODE_SIGN_ENTITLEMENTS = JoriNotificationService/JoriNotificationService.entitlements;
-				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 27;
-				DEVELOPMENT_TEAM = TEAMID_PLACEHOLDER;
+				"CODE_SIGN_ENTITLEMENTS[sdk=macosx*]" = "JoriNotificationService/JoriNotificationService-macOS.entitlements";
+				CODE_SIGN_IDENTITY = "$(JORI_CODE_SIGN_IDENTITY)";
+				CODE_SIGN_STYLE = "$(JORI_CODE_SIGN_STYLE)";
+				CURRENT_PROJECT_VERSION = 28;
+				DEVELOPMENT_TEAM = "$(JORI_TEAM_ID)";
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = JoriNotificationService/Info.plist;
 				INFOPLIST_KEY_CFBundleDisplayName = JoriNotificationService;
@@ -489,8 +853,215 @@
 					"@executable_path/../../Frameworks",
 				);
 				MACOSX_DEPLOYMENT_TARGET = 14.0;
-				MARKETING_VERSION = 1.1;
-				PRODUCT_BUNDLE_IDENTIFIER = com.example.Jori.NotificationService;
+				MARKETING_VERSION = "$(JORI_MARKETING_VERSION)";
+				PRODUCT_BUNDLE_IDENTIFIER = "$(JORI_BUNDLE_ID).NotificationService";
+				PROVISIONING_PROFILE_SPECIFIER = "$(JORI_PROFILE_NOTIFICATION_SERVICE)";
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SKIP_INSTALL = YES;
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator macosx";
+				SUPPORTS_MACCATALYST = NO;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Release;
+		};
+		11000011 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_ENTITLEMENTS = JoriIntents/JoriIntents.entitlements;
+				CODE_SIGN_IDENTITY = "$(JORI_CODE_SIGN_IDENTITY)";
+				CODE_SIGN_STYLE = "$(JORI_CODE_SIGN_STYLE)";
+				CURRENT_PROJECT_VERSION = 28;
+				DEVELOPMENT_TEAM = "$(JORI_TEAM_ID)";
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = JoriIntents/Info.plist;
+				INFOPLIST_KEY_CFBundleDisplayName = JoriIntents;
+				INFOPLIST_KEY_NSHumanReadableCopyright = "";
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@executable_path/../../Frameworks",
+				);
+				MACOSX_DEPLOYMENT_TARGET = 14.0;
+				MARKETING_VERSION = "$(JORI_MARKETING_VERSION)";
+				PRODUCT_BUNDLE_IDENTIFIER = "$(JORI_BUNDLE_ID).Intents";
+				PROVISIONING_PROFILE_SPECIFIER = "$(JORI_PROFILE_INTENTS)";
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SKIP_INSTALL = YES;
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+				SUPPORTS_MACCATALYST = NO;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Debug;
+		};
+		11000012 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_ENTITLEMENTS = JoriIntents/JoriIntents.entitlements;
+				CODE_SIGN_IDENTITY = "$(JORI_CODE_SIGN_IDENTITY)";
+				CODE_SIGN_STYLE = "$(JORI_CODE_SIGN_STYLE)";
+				CURRENT_PROJECT_VERSION = 28;
+				DEVELOPMENT_TEAM = "$(JORI_TEAM_ID)";
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = JoriIntents/Info.plist;
+				INFOPLIST_KEY_CFBundleDisplayName = JoriIntents;
+				INFOPLIST_KEY_NSHumanReadableCopyright = "";
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@executable_path/../../Frameworks",
+				);
+				MACOSX_DEPLOYMENT_TARGET = 14.0;
+				MARKETING_VERSION = "$(JORI_MARKETING_VERSION)";
+				PRODUCT_BUNDLE_IDENTIFIER = "$(JORI_BUNDLE_ID).Intents";
+				PROVISIONING_PROFILE_SPECIFIER = "$(JORI_PROFILE_INTENTS)";
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SKIP_INSTALL = YES;
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+				SUPPORTS_MACCATALYST = NO;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Release;
+		};
+		11000014 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_ENTITLEMENTS = "$(JORI_USAGE_MONITOR_ENTITLEMENTS)";
+				CODE_SIGN_IDENTITY = "$(JORI_CODE_SIGN_IDENTITY)";
+				CODE_SIGN_STYLE = "$(JORI_CODE_SIGN_STYLE)";
+				CURRENT_PROJECT_VERSION = 28;
+				DEVELOPMENT_TEAM = "$(JORI_TEAM_ID)";
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = JoriUsageMonitor/Info.plist;
+				INFOPLIST_KEY_CFBundleDisplayName = JoriUsageMonitor;
+				INFOPLIST_KEY_NSHumanReadableCopyright = "";
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@executable_path/../../Frameworks",
+				);
+				MARKETING_VERSION = "$(JORI_MARKETING_VERSION)";
+				PRODUCT_BUNDLE_IDENTIFIER = "$(JORI_BUNDLE_ID).UsageMonitor";
+				PROVISIONING_PROFILE_SPECIFIER = "$(JORI_PROFILE_USAGE_MONITOR)";
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = iphoneos;
+				SKIP_INSTALL = YES;
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+				SUPPORTS_MACCATALYST = NO;
+				SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD = NO;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Debug;
+		};
+		11000015 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_ENTITLEMENTS = "$(JORI_USAGE_MONITOR_ENTITLEMENTS)";
+				CODE_SIGN_IDENTITY = "$(JORI_CODE_SIGN_IDENTITY)";
+				CODE_SIGN_STYLE = "$(JORI_CODE_SIGN_STYLE)";
+				CURRENT_PROJECT_VERSION = 28;
+				DEVELOPMENT_TEAM = "$(JORI_TEAM_ID)";
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = JoriUsageMonitor/Info.plist;
+				INFOPLIST_KEY_CFBundleDisplayName = JoriUsageMonitor;
+				INFOPLIST_KEY_NSHumanReadableCopyright = "";
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@executable_path/../../Frameworks",
+				);
+				MARKETING_VERSION = "$(JORI_MARKETING_VERSION)";
+				PRODUCT_BUNDLE_IDENTIFIER = "$(JORI_BUNDLE_ID).UsageMonitor";
+				PROVISIONING_PROFILE_SPECIFIER = "$(JORI_PROFILE_USAGE_MONITOR)";
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = iphoneos;
+				SKIP_INSTALL = YES;
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+				SUPPORTS_MACCATALYST = NO;
+				SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD = NO;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Release;
+		};
+		11000017 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_ENTITLEMENTS = JoriShare/JoriShare.entitlements;
+				"CODE_SIGN_ENTITLEMENTS[sdk=macosx*]" = "JoriShare/JoriShare-macOS.entitlements";
+				CODE_SIGN_IDENTITY = "$(JORI_CODE_SIGN_IDENTITY)";
+				CODE_SIGN_STYLE = "$(JORI_CODE_SIGN_STYLE)";
+				CURRENT_PROJECT_VERSION = 28;
+				DEVELOPMENT_TEAM = "$(JORI_TEAM_ID)";
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = JoriShare/Info.plist;
+				INFOPLIST_KEY_CFBundleDisplayName = "$(JORI_DISPLAY_NAME)";
+				INFOPLIST_KEY_NSHumanReadableCopyright = "";
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@executable_path/../../Frameworks",
+				);
+				"LD_RUNPATH_SEARCH_PATHS[sdk=macosx*]" = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+					"@executable_path/../../../../Frameworks",
+				);
+				MACOSX_DEPLOYMENT_TARGET = 14.0;
+				MARKETING_VERSION = "$(JORI_MARKETING_VERSION)";
+				PRODUCT_BUNDLE_IDENTIFIER = "$(JORI_BUNDLE_ID).Share";
+				PROVISIONING_PROFILE_SPECIFIER = "$(JORI_PROFILE_SHARE)";
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SKIP_INSTALL = YES;
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator macosx";
+				SUPPORTS_MACCATALYST = NO;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Debug;
+		};
+		11000018 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_ENTITLEMENTS = JoriShare/JoriShare.entitlements;
+				"CODE_SIGN_ENTITLEMENTS[sdk=macosx*]" = "JoriShare/JoriShare-macOS.entitlements";
+				CODE_SIGN_IDENTITY = "$(JORI_CODE_SIGN_IDENTITY)";
+				CODE_SIGN_STYLE = "$(JORI_CODE_SIGN_STYLE)";
+				CURRENT_PROJECT_VERSION = 28;
+				DEVELOPMENT_TEAM = "$(JORI_TEAM_ID)";
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = JoriShare/Info.plist;
+				INFOPLIST_KEY_CFBundleDisplayName = "$(JORI_DISPLAY_NAME)";
+				INFOPLIST_KEY_NSHumanReadableCopyright = "";
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@executable_path/../../Frameworks",
+				);
+				"LD_RUNPATH_SEARCH_PATHS[sdk=macosx*]" = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+					"@executable_path/../../../../Frameworks",
+				);
+				MACOSX_DEPLOYMENT_TARGET = 14.0;
+				MARKETING_VERSION = "$(JORI_MARKETING_VERSION)";
+				PRODUCT_BUNDLE_IDENTIFIER = "$(JORI_BUNDLE_ID).Share";
+				PROVISIONING_PROFILE_SPECIFIER = "$(JORI_PROFILE_SHARE)";
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SKIP_INSTALL = YES;
 				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator macosx";
@@ -531,6 +1102,33 @@
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;
 		};
+		11000013 /* Build configuration list for PBXNativeTarget "JoriIntents" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				11000011 /* Debug */,
+				11000012 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		11000016 /* Build configuration list for PBXNativeTarget "JoriUsageMonitor" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				11000014 /* Debug */,
+				11000015 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		11000019 /* Build configuration list for PBXNativeTarget "JoriShare" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				11000017 /* Debug */,
+				11000018 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
 /* End XCConfigurationList section */
 
 /* Begin XCRemoteSwiftPackageReference section */
@@ -539,7 +1137,7 @@
 			repositoryURL = "https://github.com/supabase-community/supabase-swift.git";
 			requirement = {
 				kind = upToNextMajorVersion;
-				minimumVersion = 2.0.0;
+				minimumVersion = 2.55.1;
 			};
 		};
 		88000002 /* XCRemoteSwiftPackageReference "swift-markdown-ui" */ = {
@@ -562,6 +1160,16 @@
 			isa = XCSwiftPackageProductDependency;
 			package = 88000002 /* XCRemoteSwiftPackageReference "swift-markdown-ui" */;
 			productName = MarkdownUI;
+		};
+		99000003 /* Supabase */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 88000001 /* XCRemoteSwiftPackageReference "supabase-swift" */;
+			productName = Supabase;
+		};
+		99000004 /* Supabase */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 88000001 /* XCRemoteSwiftPackageReference "supabase-swift" */;
+			productName = Supabase;
 		};
 /* End XCSwiftPackageProductDependency section */
 	};

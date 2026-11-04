@@ -1,4 +1,5 @@
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
+import { MODELS } from "../../lib/models.cjs";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import {
   ListToolsRequestSchema,
@@ -23,6 +24,7 @@ import { installTools } from "../../lib/root.cjs";
 const require = createRequire(import.meta.url);
 const { loadEnv } = require("../../lib/load-env.js");
 const { instance, localConfig } = require("../../lib/instance.cjs");
+const ASSISTANT = require("../../lib/instance.cjs").assistantName(); // the assistant's configured name (lib/instance.cjs)
 
 // Who this installation serves (lib/instance.cjs).
 const INSTANCE = instance();
@@ -139,13 +141,13 @@ const REPLY_GATE_DEADLINE_MS = 45_000;
 // just the user's message, or nothing.
 const REPLY_EXCHANGE_ROWS = 4;
 
-async function replyExchange(rowId, repliedTo) {
+async function replyExchange(rowId, repliedTo, channel = "chat") {
   const fallback = repliedTo ? `${OWNER_LABEL}: ${String(repliedTo).slice(0, 500)}` : "";
   try {
     const { data, error } = await supabase
       .from("jori_messages")
       .select("id, role, content, metadata")
-      .eq("channel", "chat")
+      .eq("channel", channel)
       .neq("id", rowId)
       .order("created_at", { ascending: false })
       .limit(REPLY_EXCHANGE_ROWS * 2);
@@ -155,16 +157,16 @@ async function replyExchange(rowId, repliedTo) {
       .slice(0, REPLY_EXCHANGE_ROWS)
       .reverse();
     if (!rows.length) return fallback;
-    return rows.map((m) => `${m.role === "user" ? OWNER_LABEL : "Jori"}: ${m.content.slice(0, 500)}`).join("\n");
+    return rows.map((m) => `${m.role === "user" ? OWNER_LABEL : ASSISTANT}: ${m.content.slice(0, 500)}`).join("\n");
   } catch {
     return fallback;
   }
 }
 
-async function correctReplyInPlace(rowId, text, repliedTo = null) {
+async function correctReplyInPlace(rowId, text, repliedTo = null, channel = "chat") {
   try {
     const { checkFreshness } = await import("../../lib/claim-freshness.mjs");
-    const conversation = await replyExchange(rowId, repliedTo);
+    const conversation = await replyExchange(rowId, repliedTo, channel);
     const fresh = await checkFreshness(
       { text, solicited: true, conversation },
       { deadlineMs: REPLY_GATE_DEADLINE_MS },
@@ -201,7 +203,7 @@ const mcp = new Server(
 
 CRITICAL: \`mcp__phone-channel__reply\` is the ONLY way to deliver text to ${OWNER}. Plain assistant text — anything you "say" without calling the reply tool — is silently dropped; ${OWNER} never sees it. Every Jori message you receive MUST end with at least one reply tool call. One exception: the supervisor's own "Session started" line, sent after every restart, is not from ${OWNER}. If a message of theirs is still unanswered because the restart cut you off, answer that message now; otherwise end the turn without calling reply. If you produce ANY substantive answer text, that text must be the \`message\` argument to a reply tool call, NOT a plain text content block in your turn.
 
-THREADED REPLIES: ${OWNER_LABEL} often reads Jori in between other things, so several messages stack up before they answer. When they tap Reply on a specific bubble, the message you receive opens with a \`[Threaded reply]\` block quoting the message they answered. Treat that quoted message as the subject — NOT the most recent exchange in the "Recent conversation" tail, which is usually about something else by then. Say enough in your reply to make clear which thread you're answering.
+THREADED REPLIES: ${OWNER_LABEL} often reads ${ASSISTANT} in between other things, so several messages stack up before they answer. When they tap Reply on a specific bubble, the message you receive opens with a \`[Threaded reply]\` block quoting the message they answered. Treat that quoted message as the subject — NOT the most recent exchange in the "Recent conversation" tail, which is usually about something else by then. Say enough in your reply to make clear which thread you're answering.
 
 If you have nothing to say (e.g. a tool failed), still call reply with a one-line acknowledgement rather than ending the turn silently. The chat-supervisor has a safety net that auto-posts orphaned text — but that's a recovery path for bugs, not the design; never rely on it.
 
@@ -299,6 +301,9 @@ mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
     // with the real reply — that keeps a single stable message row in the
     // chat UI (ack → real reply) instead of a delete+insert flicker.
     const pendingEntry = profMsgId ? pendingMessages.get(profMsgId) : null;
+    // The answer goes where the user wrote: a reply typed in the Questions or
+    // System tab is answered there, not in chat.
+    const replyChannel = pendingEntry?.channel || "chat";
     // Tells a still-in-flight ack (generated off the critical path, see
     // startAck) that the reply beat it, so it must not land after the answer.
     if (pendingEntry) pendingEntry.replied = true;
@@ -351,6 +356,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
           role: "assistant",
           content: deliveredMessage,
           read: false,
+          channel: replyChannel,
         }).select("id").single());
       }
 
@@ -373,7 +379,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
       // of record seconds ago — it IS the live evidence, so the freshness gate has nothing to
       // re-check; and a rewrite would replace the whole row with prose (e.g. a poster list cut
       // to 1,200 chars, with "as of when I looked" hedges on live data).
-      if (msgId && !request.params.arguments?.message_file) correctReplyInPlace(msgId, message, pendingEntry?.text || null);
+      if (msgId && !request.params.arguments?.message_file) correctReplyInPlace(msgId, message, pendingEntry?.text || null, replyChannel);
       setTimeout(async () => {
         try {
           if (msgId) {
@@ -398,7 +404,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
           // is separate from `urgent`: that still decides whether the reply
           // pierces Focus and gets read aloud, and stays narrow by design.
           await sendApnsPush(supabase, {
-            body, messageId: msgId, urgent: timeSensitive, skipMotionGate: true,
+            body, messageId: msgId, channel: replyChannel, urgent: timeSensitive, skipMotionGate: true,
           });
         } catch (err) {
           console.error(`[phone-channel] Push failed: ${err.message}`);
@@ -610,7 +616,7 @@ function decisionReplyHint(parent) {
     if (typeof extHint === "function") return extHint(p) || "";
     if (p?.kind !== "decision" || !p.ref) return "";
     const opts = (p.options || []).map((o, i) => `${i + 1}. ${o.label}`).join("; ");
-    return `[Decision card ${p.ref}] That message was a decision Jori asked them (options: ${opts}). Once you know their answer — an option (by number or meaning) or their own words — file it with \`~/Dev/jori/bin/decision-answer --ref ${p.ref} --option "<that option's label, exactly>"\` or \`--text "<their answer>"\`, then confirm in one short line. If they are asking about it rather than answering, answer and leave it open.\n\n`;
+    return `[Decision card ${p.ref}] That message was a decision ${ASSISTANT} asked them (options: ${opts}). Once you know their answer — an option (by number or meaning) or their own words — file it with \`~/Dev/jori/bin/decision-answer --ref ${p.ref} --option "<that option's label, exactly>"\` or \`--text "<their answer>"\`, then confirm in one short line. If they are asking about it rather than answering, answer and leave it open.\n\n`;
   } catch {
     return "";
   }
@@ -691,7 +697,7 @@ async function handleIncomingMessage(row) {
   if (pendingMessages.has(msgId)) return; // already processing
   // Anything new the user sends goes after a share still being collected.
   if (!row.shareBundleIds) shareBundler.flush();
-  pendingMessages.set(msgId, { text, t0_created: createdAt });
+  pendingMessages.set(msgId, { text, t0_created: createdAt, channel: row.channel || "chat" });
   ensureStreamPoll();
 
   // Persist the user's current timezone for trigger scripts (pulse sleep-window check).
@@ -828,7 +834,7 @@ async function handleIncomingMessage(row) {
       locationLine = `\n[Location: ${metadata.latitude}, ${metadata.longitude} (accuracy: ${metadata.location_accuracy || "unknown"}m)]`;
     }
 
-    // Sent from the iOS/macOS share sheet (client/JoriShare), not typed: a
+    // Sent from the iOS/macOS share sheet (apps/companion/JoriShare), not typed: a
     // photo arrives as its own bare jori-attachments URL row, the note and
     // shared text/links as the following row; shareBundler has already joined
     // them into this one message, photos first.
@@ -917,7 +923,7 @@ async function startAck(msgId, row, text) {
         .from("jori_messages")
         // is_ack marks this row as placeholder copy so the next message's ack
         // history skips it. Cleared when the real reply overwrites the row.
-        .insert({ role: "assistant", content: ackMsg, read: false, metadata: { is_ack: "1" } })
+        .insert({ role: "assistant", content: ackMsg, read: false, channel: pending.channel || "chat", metadata: { is_ack: "1" } })
         .select("id")
         .single();
       if (ackErr) {
@@ -1063,7 +1069,7 @@ async function streamTick() {
             })
           : supabase.from("jori_messages")
               // is_ack keeps it out of the next ack's history until it's final.
-              .insert({ role: "assistant", content: shown, read: false, metadata: { is_ack: "1" } })
+              .insert({ role: "assistant", content: shown, read: false, channel: pending?.channel || "chat", metadata: { is_ack: "1" } })
               .select("id").single().then(({ data, error }) => {
                 if (error) throw error;
                 entry.rowId = data?.id || null;
@@ -1566,7 +1572,7 @@ if (process.env.JORI_DISPATCH_URL) {
   // message costs API latency, not CLI startup. Prewarmed here so the first
   // message after a restart is already warm. Kill switch: CHAT_WARM_JUDGE=0.
   if (process.env.CHAT_WARM_JUDGE !== "0") {
-    const warm = new WarmClaude({ model: "claude-sonnet-5-5" });
+    const warm = new WarmClaude({ model: MODELS.sonnet });
     warm.prewarm();
     useWarmJudge(warm);
     process.on("exit", () => warm.close());

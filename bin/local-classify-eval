@@ -1,0 +1,88 @@
+#!/usr/bin/env node
+// local-classify-eval — accuracy harness for local-classify over real past-month email.
+// Ground truth = the ops-agent's own triage records in email-memory.db (sender + subject in
+// the text, label + p1/p2/p3 in the tags). Scores: correct (auto-handled & matches) /
+// escalated (deferred to remote = safe) / MISS (auto-handled but wrong). The smoke test PASSES
+// at 0 misses (escalations are the safe valve); auto-handle rate is the efficiency metric.
+// Runs with noMem (no email-mem context) so we measure standalone judgment, not memory recall.
+//
+// Usage: local-classify-eval [--days 30] [--limit N] [--misses] [--json]
+
+import { classifyEmail } from "../lib/local-triage.mjs";
+import { execFileSync } from "node:child_process";
+import path from "node:path";
+import { createRequire } from "node:module";
+
+const require = createRequire(import.meta.url);
+const JORI = require("../lib/root.cjs").installTools();
+const args = process.argv.slice(2);
+const flag = (n, d) => { const i = args.indexOf(n); return i >= 0 ? args[i + 1] : d; };
+const has = (n) => args.includes(n);
+const days = +flag("--days", "30");
+const limit = +flag("--limit", "0");
+const useMem = has("--mem"); // run WITH email-mem sender-history (excluding each row's own record)
+
+// This installation's triage labels (agent/local/config/triage-labels.json).
+const { LABELS } = require("../lib/triage-labels.cjs");
+const SQLITE = "/usr/bin/sqlite3";
+const db = path.join(JORI, "data/email-memory.db");
+const q = `SELECT text, tags, created_at FROM memories WHERE created_at > datetime('now','-${days} days') ORDER BY created_at DESC`;
+let rows = [];
+try { rows = JSON.parse(execFileSync(SQLITE, ["-json", db, q], { encoding: "utf8", maxBuffer: 2e8, stdio: ["ignore", "pipe", "ignore"] }) || "[]"); }
+catch { console.error(`local-classify-eval: no readable email memory at ${db}`); process.exit(2); }
+
+function parseRow(r) {
+  const text = r.text || "", tags = (r.tags || "").toLowerCase();
+  const id = (text.match(/^(?:triaged|reclassify)\s+([0-9a-f]{8,})/i) || [])[1];
+  const from = (text.match(/\(([^()\s]+@[^()\s]+)\)/) || text.match(/\b([\w.+-]+@[\w.-]+\.\w{2,})\b/) || [])[1];
+  const subject = (text.match(/'([^']{2,250})'/) || text.match(/[“"]([^”"]{2,250})[”"]/) || [])[1];
+  const label = tags.split(/[\s,]+/).find((t) => LABELS.includes(t));
+  const pm = tags.match(/\bp([123])\b/);
+  const priority = pm ? "P" + pm[1] : null;
+  return { id, from, subject, label, priority };
+}
+
+const seen = new Set(), corpus = [];
+for (const r of rows) {
+  const e = parseRow(r);
+  if (!e.from || !e.label || !e.priority || !e.subject) continue;
+  if (e.id) { if (seen.has(e.id)) continue; seen.add(e.id); }
+  corpus.push(e);
+}
+const sample = limit > 0 ? corpus.slice(0, limit) : corpus;
+
+const CONC = 4; let idx = 0; const results = [];
+async function worker() {
+  while (idx < sample.length) {
+    const i = idx++; const e = sample[i];
+    results[i] = { e, v: await classifyEmail({ from: e.from, subject: e.subject }, { noMem: !useMem, excludeId: e.id }) };
+  }
+}
+await Promise.all(Array.from({ length: CONC }, worker));
+
+let correct = 0, escalated = 0, miss = 0, labelMiss = 0, prioMiss = 0;
+const misses = [];
+for (const { e, v } of results) {
+  if (v.escalate) { escalated++; continue; }
+  const lo = (v.label || "").toLowerCase() === e.label, po = (v.priority || "") === e.priority;
+  if (lo && po) { correct++; continue; }
+  miss++; if (!lo) labelMiss++; if (!po) prioMiss++;
+  misses.push({ from: e.from, subject: (e.subject || "").slice(0, 56), actual: `${e.label}/${e.priority}`, pred: `${v.label}/${v.priority}`, src: v.source });
+}
+const total = results.length, pct = (n) => total ? ((n / total) * 100).toFixed(1) : "0";
+console.log(`EVAL past ${days}d — corpus=${corpus.length} sample=${total}`);
+console.log(`  correct (auto):   ${correct} (${pct(correct)}%)`);
+console.log(`  escalated (safe): ${escalated} (${pct(escalated)}%)`);
+console.log(`  MISS:             ${miss} (${pct(miss)}%)  [label ${labelMiss}, prio ${prioMiss}]`);
+console.log(`  ==> ${miss === 0 ? "PASS (0 confident-wrong)" : "FAIL — " + miss + " misses"} | auto-handle ${pct(correct + miss)}%`);
+if ((has("--misses") || has("--json")) && misses.length) {
+  // group misses by (actual->pred) signature to see systematic patterns
+  const sig = {};
+  for (const m of misses) { const k = `${m.actual} -> ${m.pred} [${m.src.split(":")[0]}]`; (sig[k] = sig[k] || []).push(m); }
+  console.log("--- miss patterns (most common first) ---");
+  for (const [k, ms] of Object.entries(sig).sort((a, b) => b[1].length - a[1].length)) {
+    console.log(`  x${ms.length}  ${k}`);
+    for (const m of ms.slice(0, 4)) console.log(`         <${m.from}> ${m.subject}`);
+  }
+  if (has("--json")) console.log("JSON:" + JSON.stringify(misses));
+}

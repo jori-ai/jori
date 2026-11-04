@@ -25,13 +25,15 @@ import fs from "node:fs";
 import path from "node:path";
 import { installTools } from "../lib/root.cjs";
 import { resolveGroupBySubject } from "../agent/whatsapp-channel/core.mjs";
+import { linkGate } from "../lib/link-check.mjs";
 const require = createRequire(import.meta.url);
+const { port } = require("../lib/ports.cjs");
 const { loadEnv } = require("../lib/load-env.js");
 const { localConfig } = require("../lib/instance.cjs");
 
 loadEnv();
 
-const RUNNER = process.env.WHATSAPP_RUNNER_URL || "http://localhost:9100";
+const RUNNER = process.env.WHATSAPP_RUNNER_URL || `http://localhost:${port("whatsapp")}`;
 // The user's own WhatsApp number, from the first of these env vars that is set:
 // WHATSAPP_OWNER_NUMBER, then any an installation lists in
 // agent/local/config/whatsapp-send.json `extend_owner_number_env` (an
@@ -57,7 +59,7 @@ A group can be named by its subject: an exact match first, then a unique
 case-insensitive match. A name that fits more than one group is refused;
 use the <id>@g.us from --list-groups instead.
 
-The runner runs at WHATSAPP_RUNNER_URL (default http://localhost:9100).
+The runner runs at WHATSAPP_RUNNER_URL (default http://localhost:${port("whatsapp")}).
 If WHATSAPP_OWNER_NUMBER (the user's own number) is set in .env, the em-dash gate
 fires on messages to that number.`);
 }
@@ -152,6 +154,9 @@ async function resolveRecipient(to) {
 async function cmdSend(a) {
   if (!a.to || !a.text) { printUsage(); process.exit(2); }
   emDashGate({ to: a.to, text: a.text });
+  // A dead or moved link to someone else is refused (lib/link-check.mjs).
+  const toOwner = OWNER_WA && String(a.to).replace(/[^\d]/g, "") === OWNER_WA.replace(/[^\d]/g, "");
+  if (!toOwner) await linkGate(a.text, "whatsapp-send");
   const { to: target, groupName } = await resolveRecipient(a.to);
 
   let res;

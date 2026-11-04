@@ -1,0 +1,363 @@
+#!/usr/bin/env node
+"use strict";
+// broker-snapshot — capture a READ-ONLY snapshot of brokerage positions into
+// Supabase (the accounts / positions / value-history tables named in
+// agent/local/config/investments.json `broker.tables`).
+//
+// Trade boundary: this calls ONLY the read-only /api/portfolio route on the
+// user's broker bridge (see lib/broker-config.cjs for the contract),
+// authenticated with a READ-ONLY API key. That key is rejected by every
+// trade/mutation route on the bridge, so this tool — and therefore the agent —
+// physically cannot place a trade. Trade-capable OAuth tokens never reach the
+// host; they live only in the bridge.
+//
+// The snapshot is point-in-time. Every row carries `as_of`; downstream
+// reporting MUST say "as of <as_of>, not real-time".
+//
+// No bridge configured (no `broker.api_url`, no URL env override) = OFF: exits 0.
+//
+// Usage:
+//   broker-snapshot              fetch + upsert snapshot + value-history row
+//   broker-snapshot --dry-run    fetch + print summary; NO DB writes
+//   broker-snapshot --json       machine-readable summary to stdout
+//   broker-snapshot --accept-account-drop
+//                                accept a smaller account set as the new
+//                                baseline (see the partial-fetch guard below);
+//                                for use ONLY after a genuine account closure
+//
+// Env (.env): the URL override and read-only key named by `broker.url_env` /
+// `broker.key_env` (defaults BROKER_API_URL / BROKER_RO_API_KEY).
+
+const fs = require("node:fs");
+const path = require("node:path");
+const { execFileSync } = require("node:child_process");
+const { loadEnv } = require("../lib/load-env.js");
+loadEnv();
+const { request } = require("../lib/supabase-rest.js");
+const { brokerConfig, brokerFile, localDate } = require("../lib/broker-config.cjs");
+const { isPartialFetch, missingAccountNames } = require("../lib/broker-partial-fetch.js");
+const { lapsedTokenSlots } = require("../lib/broker-token-clock.js");
+const { buildRows, emptyMessage, partialMessage } = require("../lib/broker-snapshot-core.js");
+
+const CFG = brokerConfig();
+const T = CFG.tables;
+const SEND = process.env.JORI_SEND_BIN || path.join(__dirname, "jori-send-curl");
+
+const FLAGS = new Set(process.argv.slice(2).filter((a) => a.startsWith("--")));
+const DRY_RUN = FLAGS.has("--dry-run");
+const JSON_OUT = FLAGS.has("--json");
+// Operator override for the partial-fetch guard: accept the smaller account set
+// as the new baseline. There is deliberately NO auto-accept-after-N-runs — a
+// lapsed grant can persist for days, so any patience threshold low enough to be
+// useful would wave it through anyway. A genuine account closure is rare and is
+// the user's own action; re-running with this flag once is the honest way to
+// tell the guard about it.
+const ACCEPT_ACCOUNT_DROP = FLAGS.has("--accept-account-drop");
+
+function log(...a) {
+  if (!JSON_OUT) console.log(...a);
+}
+function usd(n) {
+  if (n === null || n === undefined) return "—";
+  return `$${Number(n).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+}
+
+// Human-readable timestamp in the installation's zone, for DISPLAY (storage
+// stays UTC).
+function localStamp(d) {
+  return new Intl.DateTimeFormat("en-US", {
+    timeZone: CFG.tz, year: "numeric", month: "short", day: "numeric",
+    hour: "numeric", minute: "2-digit", hour12: true, timeZoneName: "short",
+  }).format(d);
+}
+
+// ── Streak files ─────────────────────────────────────────────────────────────
+// An empty /api/portfolio is NOT self-evidently an expired token, so the alert
+// escalates on persistence rather than asserting a cause on the first run.
+function readStreak(key) {
+  try {
+    const j = JSON.parse(fs.readFileSync(brokerFile(key, CFG), "utf8"));
+    const count = Number(j.count);
+    return {
+      count: Number.isFinite(count) ? count : 0,
+      since: j.since || null,
+      observed: Number.isFinite(Number(j.observed)) ? Number(j.observed) : null,
+    };
+  } catch { return { count: 0, since: null, observed: null }; }
+}
+
+// For the partial streak a DIFFERENT observed count restarts it: two distinct
+// degradations are two separate conditions, and the alert's day-count should
+// not silently merge them into one long-running story.
+function bumpStreak(key, nowIso, observed) {
+  const prev = readStreak(key);
+  const same = observed === undefined || prev.observed === observed;
+  const next = {
+    count: same ? prev.count + 1 : 1,
+    since: same && prev.since ? prev.since : nowIso,
+    last: nowIso,
+    ...(observed === undefined ? {} : { observed }),
+  };
+  try { fs.writeFileSync(brokerFile(key, CFG), JSON.stringify(next, null, 2) + "\n"); } catch {}
+  return next;
+}
+
+function clearStreak(key) {
+  try { fs.rmSync(brokerFile(key, CFG), { force: true }); } catch {}
+}
+
+function alert(msg) {
+  try {
+    execFileSync(SEND, ["--skip-precheck", "--channel", "system", "--intent", CFG.intents.holdings, msg], { stdio: "ignore" });
+  } catch { /* alerting is best-effort; the non-zero exit is the durable signal */ }
+}
+
+async function fetchPortfolio() {
+  if (!CFG.ro_key) {
+    throw new Error(`${CFG.key_env} missing — set it in .env (the bridge's read-only key).`);
+  }
+  const res = await fetch(`${CFG.api_url}/api/portfolio`, {
+    headers: { "x-api-key": CFG.ro_key },
+    signal: AbortSignal.timeout(45000),
+  });
+  const text = await res.text();
+  if (!res.ok) throw new Error(`GET /api/portfolio: HTTP ${res.status} ${text.slice(0, 200)}`);
+  return JSON.parse(text);
+}
+
+// Most recent written snapshot, the partial-fetch guard's baseline. The value
+// history already records num_accounts and total_value on every row, so this
+// is a read, not new bookkeeping. Throws (via request()) if Supabase is
+// unreachable — the conservative direction, since the writes below need the
+// same connection. Returns null when the table is empty (first ever run).
+async function fetchLastGoodSnapshot() {
+  const rows = await request(
+    `/rest/v1/${T.value_history}?select=as_of_date,num_accounts,total_value&order=as_of.desc&limit=1`
+  );
+  if (!Array.isArray(rows) || !rows.length) return null;
+  const r = rows[0];
+  const count = Number(r.num_accounts);
+  const total = Number(r.total_value);
+  if (!Number.isFinite(count) || !Number.isFinite(total)) return null;
+  return { as_of_date: r.as_of_date, num_accounts: count, total_value: total };
+}
+
+// The last good ACCOUNT ROSTER, for naming what a partial fetch dropped.
+// Best-effort on purpose, and the one place in this file that swallows a
+// request() failure: its only consumer is alert WORDING. A Supabase hiccup
+// here must degrade the message to counts-only, never turn an alert into no
+// alert — the whole point of the partial guard is that silence is the failure.
+async function fetchLastGoodAccountNames() {
+  try {
+    const rows = await request(`/rest/v1/${T.accounts}?select=account_hash,account_name`);
+    if (!Array.isArray(rows)) return [];
+    return rows.filter((r) => r && r.account_hash).map((r) => ({ hash: r.account_hash, name: r.account_name || null }));
+  } catch {
+    return [];
+  }
+}
+
+async function upsert(table, rows, conflict) {
+  if (DRY_RUN || !rows.length) return;
+  await request(`/rest/v1/${table}?on_conflict=${conflict}`, {
+    method: "POST",
+    body: rows,
+    prefer: "resolution=merge-duplicates,return=minimal",
+  });
+}
+
+// Delete rows that weren't refreshed this run (closed accounts / sold-out
+// positions). All current rows share `as_of=nowIso`.
+async function deleteStale(table, nowIso) {
+  if (DRY_RUN) return;
+  await request(`/rest/v1/${table}?as_of=lt.${encodeURIComponent(nowIso)}`, {
+    method: "DELETE",
+    prefer: "return=minimal",
+  });
+}
+
+async function main() {
+  if (!CFG.api_url) {
+    log(`broker-snapshot: no broker bridge configured (investments.json broker.api_url / $${CFG.url_env}) — nothing to do.`);
+    if (JSON_OUT) console.log(JSON.stringify({ configured: false }));
+    return;
+  }
+  const now = new Date();
+  const nowIso = now.toISOString();
+  const asOfDate = localDate(now, CFG.tz);
+
+  const portfolio = await fetchPortfolio();
+  const accounts = portfolio.accounts || [];
+
+  // Guard: an EMPTY portfolio. Two halves, both load-bearing.
+  //
+  // PRESERVE. Without this guard deleteStale() would wipe the last good
+  // positions snapshot on an empty fetch, and add a bogus $0 value-history row.
+  //
+  // ALERT, without guessing a cause. fetchPortfolio() THROWS on a network error
+  // and on any non-2xx, so reaching here means the bridge answered HTTP 200 with
+  // an empty accounts array: healthy, simply holding no broker data at that
+  // moment. A transient broker outage, a rate limit, or a lost token-refresh
+  // race all land here, and none is an expired refresh token — empty fetches
+  // are usually single weekdays bracketed by good runs. So run 1 reports only
+  // what was observed and run 2 names the remedy; the user asked to be told
+  // once when a connection needs them, not nagged.
+  //
+  // ⚠️ and not 🔴, deliberately: system-alert-dedup never suppresses 🔴, so a
+  // token doing what broker tokens do would page every weekday close.
+  if (accounts.length === 0) {
+    const streak = DRY_RUN ? readStreak("empty_streak") : bumpStreak("empty_streak", nowIso);
+    log(`broker-snapshot: 0 accounts from the bridge (HTTP 200, empty accounts array) — consecutive empty runs: ${streak.count}. Preserving last good snapshot; nothing written.`);
+    if (!DRY_RUN) {
+      // Run 1 still refuses to assert a cause it has not observed — but it must
+      // not REASSURE past one either: when broker-token-watch has already seen
+      // the sign-in window run out, "there's nothing to do yet" is falsified by
+      // a fact on disk. A lapse changes the WORDING of run 1, never its threshold.
+      const lapsed = lapsedTokenSlots(Date.parse(nowIso) || Date.now());
+      alert(emptyMessage({ streak, lapsed, cfg: CFG }));
+      process.exit(1);
+    }
+    return;
+  }
+
+  // A run that saw real accounts ends any empty streak.
+  if (!DRY_RUN) clearStreak("empty_streak");
+
+  // Guard: a PARTIAL fetch — SOME accounts came back, not none. A bridge that
+  // aggregates several OAuth grants answers HTTP 200 with just the surviving
+  // grants' accounts when one lapses (see lib/broker-partial-fetch.js). Same
+  // three moves as the empty guard: preserve, alert, exit non-zero. A paused
+  // feed is loud; a silently wrong one is not.
+  const incomingCount = accounts.length;
+  const incomingTotal = accounts.reduce((sum, a) => sum + (Number(a.totalValue) || 0), 0);
+  const baseline = ACCEPT_ACCOUNT_DROP ? null : await fetchLastGoodSnapshot();
+  const verdict = isPartialFetch(baseline, incomingCount, incomingTotal);
+
+  if (ACCEPT_ACCOUNT_DROP) {
+    log("broker-snapshot: --accept-account-drop set — partial-fetch guard skipped; this run becomes the new baseline.");
+    if (!DRY_RUN) clearStreak("partial_streak");
+  } else if (verdict.partial) {
+    const pct = Math.round(verdict.valueDropPct * 100);
+    const streak = DRY_RUN ? readStreak("partial_streak") : bumpStreak("partial_streak", nowIso, incomingCount);
+    log(
+      `broker-snapshot: PARTIAL fetch — ${incomingCount} accounts / ${usd(incomingTotal)} against ` +
+      `${baseline.num_accounts} / ${usd(baseline.total_value)} on ${baseline.as_of_date} (${pct}% lower). ` +
+      `Consecutive partial runs: ${streak.count}. Preserving last good snapshot; nothing written.`
+    );
+    if (!DRY_RUN) {
+      // Name the accounts, and only name a CAUSE that is already on disk: a
+      // count alone leaves the user guessing, and blaming a connection on a
+      // guess sends them to re-authorize for what may be a minutes-long blip.
+      const missingNames = missingAccountNames(await fetchLastGoodAccountNames(), accounts);
+      const lapsed = lapsedTokenSlots(Date.parse(nowIso) || Date.now());
+      alert(partialMessage({ streak, lapsed, cfg: CFG, incomingCount, baseline, pct, missingNames }));
+      process.exit(1);
+    }
+    return;
+  } else if (!DRY_RUN) {
+    clearStreak("partial_streak");
+  }
+
+  const { accountRows, positionRows, totalValue, cashTotal, positionsValue } = buildRows(accounts, nowIso);
+
+  // Write order: accounts first (positions FK them), then positions, then prune
+  // stale, then the daily value-history row.
+  await upsert(T.accounts, accountRows, "account_hash");
+  await upsert(T.positions, positionRows, "account_hash,ticker");
+  await deleteStale(T.positions, nowIso);
+  await deleteStale(T.accounts, nowIso);
+  await upsert(T.value_history, [{
+    as_of_date: asOfDate,
+    total_value: totalValue,
+    cash_total: cashTotal,
+    positions_value: positionsValue,
+    num_accounts: accountRows.length,
+    num_positions: positionRows.length,
+    as_of: nowIso,
+    updated_at: nowIso,
+  }], "as_of_date");
+
+  // Append-only per-position / per-account HISTORY — the time-based accounting
+  // a portfolio scoring loop reads. Unlike the positions table (a pruned mirror
+  // of "now"), these rows are never deleted: one row per (day, account, ticker),
+  // idempotent within a day via on_conflict merge. Tolerant on purpose: if the
+  // tables don't exist yet, the mirror and value-history writes above stand.
+  try {
+    const nameByHash = new Map(accountRows.map((a) => [a.account_hash, a.account_name]));
+    await upsert(T.position_history, positionRows.map((p) => ({
+      as_of_date: asOfDate,
+      account_hash: p.account_hash,
+      account_name: nameByHash.get(p.account_hash) || null,
+      ticker: p.ticker,
+      shares: p.shares,
+      market_value: p.market_value,
+      cost_basis: p.cost_basis,
+      current_price: p.current_price,
+      day_change: p.day_change,
+      day_change_percent: p.day_change_percent,
+      asset_type: p.asset_type,
+      as_of: nowIso,
+    })), "as_of_date,account_hash,ticker");
+    await upsert(T.account_history, accountRows.map((a) => ({
+      as_of_date: asOfDate,
+      account_hash: a.account_hash,
+      account_name: a.account_name,
+      cash_balance: a.cash_balance,
+      total_value: a.total_value,
+      as_of: nowIso,
+    })), "as_of_date,account_hash");
+  } catch (e) {
+    console.error(`  (warning: history append failed — mirror still written: ${e.message})`);
+  }
+
+  // Positions cache for the stocks hum harvester (skip on dry-run).
+  if (!DRY_RUN) {
+    const cache = {
+      as_of: nowIso,
+      as_of_local: localStamp(now),
+      positions: positionRows.map((p) => ({
+        ticker: p.ticker,
+        day_change_pct: p.day_change_percent,
+        market_value: p.market_value,
+        current_price: p.current_price,
+        shares: p.shares,
+      })),
+    };
+    // The harvester's older key name, kept so an existing reader keeps working.
+    cache.as_of_et = cache.as_of_local;
+    try {
+      fs.writeFileSync(brokerFile("positions_cache", CFG), JSON.stringify(cache, null, 2));
+    } catch (e) {
+      console.error(`  (warning: could not write positions cache: ${e.message})`);
+    }
+  }
+
+  const summary = {
+    as_of: nowIso,
+    as_of_local: localStamp(now),
+    as_of_date: asOfDate,
+    num_accounts: accountRows.length,
+    num_positions: positionRows.length,
+    total_value: totalValue,
+    cash_total: cashTotal,
+    positions_value: positionsValue,
+    dry_run: DRY_RUN,
+  };
+
+  if (JSON_OUT) {
+    console.log(JSON.stringify(summary, null, 2));
+  } else {
+    log(`${CFG.label} snapshot — as of ${localStamp(now)} (NOT real-time)`);
+    for (const a of accountRows) {
+      log(`  ${a.account_name || a.account_hash}: ${usd(a.total_value)}  (cash ${usd(a.cash_balance)})`);
+    }
+    log(`  ──`);
+    log(`  ${accountRows.length} accounts, ${positionRows.length} positions, total ${usd(totalValue)}`);
+    log(DRY_RUN ? "  (dry-run — nothing written)" : `  written to ${T.accounts}/${T.positions}/${T.value_history}`);
+  }
+}
+
+main().catch((e) => {
+  console.error(`Error: ${e.message}`);
+  process.exit(1);
+});

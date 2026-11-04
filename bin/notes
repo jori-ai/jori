@@ -1,0 +1,388 @@
+#!/bin/bash
+# notes - CLI wrapper for Apple Notes app via AppleScript
+# Usage: notes <command> [args]
+
+set -euo pipefail
+
+CMD="${1:-help}"
+shift 2>/dev/null || true
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+LIB_DIR="$SCRIPT_DIR/../lib"
+NOTES_HTML="$LIB_DIR/notes-html.js"
+
+strip_html() {
+  sed -e 's/<[^>]*>//g' -e 's/&amp;/\&/g' -e 's/&lt;/</g' -e 's/&gt;/>/g' -e 's/&nbsp;/ /g' -e 's/&quot;/"/g' | sed '/^$/d'
+}
+
+html2md() {
+  node "$NOTES_HTML" html2md
+}
+
+md2html() {
+  node "$NOTES_HTML" md2html
+}
+
+escape_for_applescript() {
+  local text="$1"
+  text="${text//\\/\\\\}"
+  text="${text//\"/\\\"}"
+  printf '%s' "$text"
+}
+
+case "$CMD" in
+
+  list|ls)
+    # notes list [folder]
+    # List note titles. Optionally filter by folder.
+    FOLDER="${1:-}"
+    if [ -n "$FOLDER" ]; then
+      osascript -e "
+        tell application \"Notes\"
+          set f to folder \"$FOLDER\"
+          -- One Apple Event for all names; a per-note \`name of n\` loop took ~10s.
+          set output to (get name of every note of f)
+          set AppleScript's text item delimiters to linefeed
+          return output as text
+        end tell"
+    else
+      osascript -e '
+        tell application "Notes"
+          set output to {}
+          -- Fetch each folder'"'"'s names in ONE Apple Event. The per-note
+          -- `name of n` loop sent ~2 events per note: 9.75s for 285 notes vs
+          -- 0.25s this way (measured on the mini, 2026-10-04), and it ran
+          -- inside live chat turns.
+          repeat with f in every folder
+            set fname to name of f
+            if fname is not "Recently Deleted" then
+              set names to (get name of every note of f)
+              repeat with t in names
+                set end of output to fname & " | " & (contents of t)
+              end repeat
+            end if
+          end repeat
+          set AppleScript'"'"'s text item delimiters to linefeed
+          return output as text
+        end tell'
+    fi
+    ;;
+
+  read|get|show)
+    # notes read <title> [--html|--plain]
+    # Read a note by title. Returns structured markdown by default.
+    # --html for raw Apple Notes HTML, --plain for stripped plaintext.
+    TITLE="${1:?Usage: notes read <title> [--html|--plain]}"
+    FORMAT="${2:-}"
+    if [ "$FORMAT" = "--plain" ]; then
+      osascript -e "
+        tell application \"Notes\"
+          set n to note \"$(escape_for_applescript "$TITLE")\"
+          return plaintext of n
+        end tell"
+    elif [ "$FORMAT" = "--html" ]; then
+      osascript -e "
+        tell application \"Notes\"
+          set n to note \"$(escape_for_applescript "$TITLE")\"
+          return body of n
+        end tell"
+    else
+      # Default: fetch HTML and convert to structured markdown (preserves tables)
+      osascript -e "
+        tell application \"Notes\"
+          set n to note \"$(escape_for_applescript "$TITLE")\"
+          return body of n
+        end tell" | html2md
+    fi
+    ;;
+
+  search|find)
+    # notes search <query>
+    # Search notes by title or body content.
+    QUERY="${1:?Usage: notes search <query>}"
+    osascript -e "
+      tell application \"Notes\"
+        set output to name of every note whose name contains \"$(escape_for_applescript "$QUERY")\" or plaintext contains \"$(escape_for_applescript "$QUERY")\"
+        set AppleScript's text item delimiters to linefeed
+        return output as text
+      end tell"
+    ;;
+
+  create|new)
+    # notes create <title> [body] [--folder <name>] [--html]
+    # Create a new note. Body can be markdown (tables supported) or raw HTML with --html.
+    TITLE="${1:?Usage: notes create <title> [body] [--folder <name>] [--html]}"
+    shift
+    BODY=""
+    FOLDER="Notes"
+    RAW_HTML=false
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --folder) FOLDER="$2"; shift 2 ;;
+        --html) RAW_HTML=true; shift ;;
+        *) BODY="$1"; shift ;;
+      esac
+    done
+    if [ -z "$BODY" ]; then
+      HTML_BODY=""
+    elif [ "$RAW_HTML" = true ]; then
+      HTML_BODY="$BODY"
+    else
+      # Convert markdown body (with tables, bold, links) to Apple Notes HTML
+      HTML_BODY=$(printf '%s' "$BODY" | md2html)
+    fi
+    ESCAPED_HTML=$(escape_for_applescript "$HTML_BODY")
+    osascript -e "
+      tell application \"Notes\"
+        set n to make new note at folder \"$(escape_for_applescript "$FOLDER")\" with properties {name:\"$(escape_for_applescript "$TITLE")\", body:\"<h1>$(escape_for_applescript "$TITLE")</h1>$ESCAPED_HTML\"}
+        return name of n
+      end tell"
+    echo " -> created in folder: $FOLDER"
+    ;;
+
+  append|add)
+    # notes append <title> <text>
+    # Append text to an existing note using UI scripting to preserve formatting (checklists, etc).
+    TITLE="${1:?Usage: notes append <title> <text>}"
+    TEXT="${2:?Usage: notes append <title> <text>}"
+    # Shopping List always uses checklist format
+    if [[ "$TITLE" == "Shopping List" ]]; then
+      exec "$0" checklist-append "$TITLE" "$TEXT"
+    fi
+    ESCAPED_TITLE=$(escape_for_applescript "$TITLE")
+    ESCAPED_TEXT=$(escape_for_applescript "$TEXT")
+    osascript -e "
+      -- Show the note in Notes.app
+      tell application \"Notes\"
+        set n to note \"$ESCAPED_TITLE\"
+        show n
+        activate
+      end tell
+
+      delay 1
+
+      -- Navigate to end of note and type the new text
+      tell application \"System Events\"
+        tell process \"Notes\"
+          -- Tab twice to move focus from sidebar to note editor
+          keystroke tab
+          delay 0.2
+          keystroke tab
+          delay 0.3
+
+          -- Move to end of document
+          key code 125 using command down -- Cmd+Down to end
+          -- Add a new line and type the text
+          keystroke return
+          keystroke \"$ESCAPED_TEXT\"
+        end tell
+      end tell
+
+      delay 0.3
+
+      return \"appended to: $ESCAPED_TITLE\"
+    "
+    ;;
+
+  checklist-append|cl-append)
+    # notes checklist-append <title> <items>
+    # Append items as checklist (radio button) entries. Items separated by newlines or commas.
+    TITLE="${1:?Usage: notes checklist-append <title> <items>}"
+    TEXT="${2:?Usage: notes checklist-append <title> <items>}"
+    ESCAPED_TITLE=$(escape_for_applescript "$TITLE")
+    # Normalize: split on commas or newlines, trim whitespace
+    ITEMS=()
+    while IFS= read -r line; do
+      line="${line#"${line%%[![:space:]]*}"}"  # trim leading
+      line="${line%"${line##*[![:space:]]}"}"  # trim trailing
+      [ -n "$line" ] && ITEMS+=("$line")
+    done <<< "$(echo "$TEXT" | tr ',' '\n')"
+
+    if [ ${#ITEMS[@]} -eq 0 ]; then
+      echo "No items to append" >&2
+      exit 1
+    fi
+
+    # Build keystroke sequence: first item, then return+item for the rest
+    KEYSTROKE_SCRIPT=""
+    for i in "${!ITEMS[@]}"; do
+      ESCAPED_ITEM=$(escape_for_applescript "${ITEMS[$i]}")
+      if [ "$i" -gt 0 ]; then
+        KEYSTROKE_SCRIPT="${KEYSTROKE_SCRIPT}
+        keystroke return"
+      fi
+      KEYSTROKE_SCRIPT="${KEYSTROKE_SCRIPT}
+        keystroke \"$ESCAPED_ITEM\""
+    done
+
+    osascript -e "
+      tell application \"Notes\"
+        set n to note \"$ESCAPED_TITLE\"
+        show n
+        activate
+      end tell
+
+      delay 1
+
+      tell application \"System Events\"
+        tell process \"Notes\"
+          -- Tab twice to move focus from sidebar to note editor
+          keystroke tab
+          delay 0.2
+          keystroke tab
+          delay 0.3
+
+          -- Go to end of note
+          key code 125 using command down
+          delay 0.2
+
+          -- New line and always enable checklist format.
+          -- At end-of-note the cursor is after any existing checklist,
+          -- so this is a fresh paragraph — Cmd+Shift+L always turns ON.
+          keystroke return
+          delay 0.2
+          keystroke \"l\" using {command down, shift down}
+          delay 0.3
+
+          -- Type checklist items
+          $KEYSTROKE_SCRIPT
+        end tell
+      end tell
+
+      delay 0.3
+
+      return \"appended ${#ITEMS[@]} checklist items to: $ESCAPED_TITLE\"
+    "
+    ;;
+
+  edit|update)
+    # notes edit <title> <new_body> [--html]
+    # Replace the entire body of a note. Body is markdown by default (tables supported).
+    # Use --html to pass raw HTML body.
+    TITLE="${1:?Usage: notes edit <title> <new_body> [--html]}"
+    BODY="${2:?Usage: notes edit <title> <new_body> [--html]}"
+    RAW_HTML=false
+    [ "${3:-}" = "--html" ] && RAW_HTML=true
+    ESCAPED_TITLE=$(escape_for_applescript "$TITLE")
+    if [ "$RAW_HTML" = true ]; then
+      HTML_BODY="$BODY"
+    else
+      # Convert markdown body (with tables, bold, links) to Apple Notes HTML
+      HTML_BODY=$(printf '%s' "$BODY" | md2html)
+    fi
+    ESCAPED_HTML=$(escape_for_applescript "$HTML_BODY")
+    osascript -e "
+      tell application \"Notes\"
+        set n to note \"$ESCAPED_TITLE\"
+        set body of n to \"<h1>$ESCAPED_TITLE</h1>$ESCAPED_HTML\"
+        return \"updated: \" & name of n
+      end tell"
+    ;;
+
+  delete|rm)
+    # notes delete <title>
+    # Delete a note by title.
+    TITLE="${1:?Usage: notes delete <title>}"
+    osascript -e "
+      tell application \"Notes\"
+        delete note \"$(escape_for_applescript "$TITLE")\"
+      end tell"
+    echo "deleted: $TITLE"
+    ;;
+
+  folders)
+    # notes folders
+    # List all folders.
+    osascript -e '
+      tell application "Notes"
+        set output to {}
+        repeat with f in every folder
+          set end of output to name of f
+        end repeat
+        set AppleScript'"'"'s text item delimiters to linefeed
+        return output as text
+      end tell'
+    ;;
+
+  mkdir)
+    # notes mkdir <folder_name>
+    # Create a new folder.
+    NAME="${1:?Usage: notes mkdir <folder_name>}"
+    osascript -e "
+      tell application \"Notes\"
+        make new folder with properties {name:\"$(escape_for_applescript "$NAME")\"}
+        return \"created folder: $NAME\"
+      end tell"
+    ;;
+
+  move)
+    # notes move <title> <dest_folder>
+    # Move a note to a different folder.
+    TITLE="${1:?Usage: notes move <title> <dest_folder>}"
+    DEST="${2:?Usage: notes move <title> <dest_folder>}"
+    osascript -e "
+      tell application \"Notes\"
+        set n to note \"$(escape_for_applescript "$TITLE")\"
+        move n to folder \"$(escape_for_applescript "$DEST")\"
+        return \"moved '\" & name of n & \"' to folder: $DEST\"
+      end tell"
+    ;;
+
+  count)
+    # notes count [folder]
+    # Count notes, optionally in a specific folder.
+    FOLDER="${1:-}"
+    if [ -n "$FOLDER" ]; then
+      osascript -e "
+        tell application \"Notes\"
+          return count of every note of folder \"$(escape_for_applescript "$FOLDER")\"
+        end tell"
+    else
+      osascript -e '
+        tell application "Notes"
+          return count of every note
+        end tell'
+    fi
+    ;;
+
+  help|--help|-h)
+    cat <<'HELP'
+notes - CLI for Apple Notes (with table & rich text support)
+
+Commands:
+  list [folder]                   List all notes (optionally by folder)
+  read <title> [--html|--plain]   Read a note (markdown default, --html raw, --plain stripped)
+  search <query>                  Search notes by title or content
+  create <title> [body] [--folder <name>] [--html]  Create a note (markdown body, or --html)
+  append <title> <text>           Append text to a note
+  checklist-append <title> <items>  Append items as checklist (radio buttons)
+  edit <title> <new_body> [--html]  Replace note body (markdown, or --html for raw)
+  delete <title>                  Delete a note
+  folders                         List all folders
+  mkdir <folder_name>             Create a folder
+  move <title> <dest_folder>      Move note to folder
+  count [folder]                  Count notes
+
+Markdown body supports: **bold**, *italic*, [links](url), headings (#),
+bullet lists (-), checklists (- [x]), and tables:
+
+  | Header1 | Header2 |
+  | ------- | ------- |
+  | Cell1   | Cell2   |
+
+Examples:
+  notes list
+  notes read "Shopping List"
+  notes read "Door Codes" --html
+  notes create "Meeting" "## Agenda\n- Item 1\n- Item 2" --folder "Work"
+  notes edit "Inventory" "| Item | Qty |\n|------|-----|\n| Desk | 2 |"
+  notes checklist-append "Shopping List" "Milk, Eggs, Bread"
+HELP
+    ;;
+
+  *)
+    echo "Unknown command: $CMD" >&2
+    echo "Run 'notes help' for usage." >&2
+    exit 1
+    ;;
+esac

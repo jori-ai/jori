@@ -1,0 +1,99 @@
+#!/usr/bin/env python3
+"""location-wake — force a fresh GPS fix from the phone.
+
+Inserts a `get_location` command into jori_commands, polls for the
+response, returns the fresh location. Use when the latest Supabase sample
+is too stale for a real-time query.
+
+Usage:
+  location-wake                # fresh GPS, default 15s timeout
+  location-wake --timeout 30   # wait up to 30s
+"""
+
+import sys
+import os
+import json
+import time
+import urllib.request
+import urllib.parse
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "lib"))
+import supabase_local  # noqa: E402
+
+
+def _req(path, method="GET", body=None, qs=None):
+    key, base = supabase_local.service_key(), supabase_local.supabase_url()
+    if not key or not base:
+        print("ERROR: no Supabase configured (supabase_project / SUPABASE_SERVICE_ROLE_KEY)", file=sys.stderr)
+        sys.exit(1)
+    url = f"{base}{path}"
+    if qs:
+        url += "?" + urllib.parse.urlencode(qs)
+    data = json.dumps(body).encode() if body is not None else None
+    headers = {"apikey": key, "Authorization": f"Bearer {key}"}
+    if body is not None:
+        headers["Content-Type"] = "application/json"
+        headers["Prefer"] = "return=representation"
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+    with urllib.request.urlopen(req, timeout=10) as r:
+        body = r.read()
+        if not body:
+            return None
+        return json.loads(body)
+
+
+def main():
+    import argparse
+    p = argparse.ArgumentParser(description="Force fresh GPS from phone.")
+    p.add_argument("--timeout", type=int, default=15, help="Seconds to wait for response")
+    args = p.parse_args()
+
+    # Insert command
+    inserted = _req("/rest/v1/jori_commands", method="POST", body=[{
+        "command": "get_location",
+        "status": "pending",
+    }])
+    if not inserted or not isinstance(inserted, list) or not inserted:
+        print("ERROR: failed to insert command", file=sys.stderr)
+        sys.exit(1)
+    cmd_id = inserted[0].get("id")
+    if not cmd_id:
+        print("ERROR: no id returned from insert", file=sys.stderr)
+        sys.exit(1)
+
+    # Poll — tolerate transient network errors
+    deadline = time.time() + args.timeout
+    while time.time() < deadline:
+        try:
+            rows = _req("/rest/v1/jori_commands", qs=[
+                ("id", f"eq.{cmd_id}"),
+                ("select", "status,response,completed_at"),
+            ])
+        except Exception:
+            rows = None
+        if rows and rows[0].get("status") == "completed":
+            print(json.dumps({
+                "ok": True,
+                "response": rows[0].get("response"),
+                "completed_at": rows[0].get("completed_at"),
+            }, indent=2))
+            return
+        if rows and rows[0].get("status") == "failed":
+            print(json.dumps({
+                "ok": False,
+                "error": rows[0].get("response"),
+            }, indent=2))
+            sys.exit(1)
+        time.sleep(1)
+
+    print(json.dumps({
+        "ok": False,
+        "error": "timeout",
+        "timeout_s": args.timeout,
+        "command_id": cmd_id,
+    }, indent=2))
+    sys.exit(2)
+
+
+if __name__ == "__main__":
+    main()

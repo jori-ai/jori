@@ -11,7 +11,7 @@ This is a hard architectural invariant. It is NOT a fallback chain; it is the on
 - **No component is permitted to make API-key-billed Anthropic calls** — with exactly one exception, the wiki fallback below. `ANTHROPIC_API_KEY` is not read from `.env`, not passed to children, and not used as a fallback anywhere. Adding an `Anthropic` import or `fetch(api.anthropic.com)` outside the agent supervisors and `lib/api-fallback.mjs` violates this rule.
 - **No chat→ops rerouting, no alternate-key fallback, no cross-model retry.** Any code that tries to keep Jori "working" when Max is unavailable must be removed on sight. The design intent is: agents up on Max, or agents down; no in-between.
 
-The local LLM helper (`lib/local-llm.mjs`) is intentionally generic — it defaults to `gemma3:1b` but accepts `{model, system, messages, maxTokens, ...}` so other low-stakes, non-agent tasks (quick classifications, one-shot rewrites, offline summarization) can reuse it without reaching for the API key. Anything routed through it must still work when Ollama is unreachable.
+The cheap-model helper (`lib/local-llm.mjs` `localLlmChat()`) is intentionally generic: it accepts `{system, messages, user, timeoutMs, ...}` so low-stakes, non-agent tasks (quick classifications, one-shot rewrites) can reuse it without reaching for an API key. Since 2026-11-04 it runs Claude Haiku 5.5 as a tool-less `claude -p` fork on Max (it replaced `gemma3:1b`; the user chose Max only), so it throws wherever Max is unreadable (cron, SSH). Anything routed through it must still work when it throws. Gemma stays available behind `data/.local-llm-ollama`.
 
 ## The wiki's API fallback (the one exception)
 

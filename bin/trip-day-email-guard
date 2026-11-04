@@ -1,0 +1,147 @@
+#!/usr/bin/env node
+"use strict";
+// trip-day-email-guard — idempotency gate for the trip-day-email SEND step.
+//
+// WHY THIS EXISTS. Once, one day-plan was sent 4 separate
+// visible times within an hour before landing clean — each attempt looked like
+// a fresh send to its recipients because `gog gmail send` has no memory of
+// prior attempts and the SEND step (the `trip-day-email` skill) has no state
+// of its own. Unlike the day renderer's calendar writes, which are already
+// idempotent via a hidden `[jori:trip:<date>:<stop id>]` marker matched on
+// re-run (see the renderer's header comment), nothing plays that role for
+// the email send itself.
+//
+// This is the enforcement primitive: a persistent, local record of "already
+// sent" per (date, area), checked BEFORE any `gog gmail send` call and updated
+// AFTER a successful one. It does not itself call `gog` or send anything —
+// wiring it into the actual send step is a follow-up (see NOTE below).
+//
+// NOTE (2026-07-28): the `trip-day-email` skill file this guard is meant to be
+// called from is currently ABSENT from ~/.claude/skills — confirmed missing
+// despite system/changelog.md's 2026-07-23 entry documenting its
+// creation. Recreating a Claude Code skill file is out of scope for this
+// tool (skills are harness-loaded and explicitly excluded from autonomous
+// edits per the self-improvement risk rubric) — this guard ships the
+// reusable, testable enforcement piece so wiring it in is a one-line addition
+// once the skill exists again.
+//
+// Usage:
+//   trip-day-email-guard check  --date YYYY-MM-DD --area <area> [--window-hours N]
+//     exit 0  -> clear to send (nothing recorded in the window)
+//     exit 1  -> BLOCKED, prints the prior send's timestamp + message id
+//   trip-day-email-guard record --date YYYY-MM-DD --area <area> [--message-id <id>]
+//     records a successful send (idempotent — re-recording the same date+area
+//     just updates the timestamp, it does not error)
+//   trip-day-email-guard list [--date YYYY-MM-DD] [--area <area>]
+//     prints matching records as JSON (debugging / audit)
+//
+// State: data/trip-day-email-sent.json — {"<date>::<area>": {sent_at, message_id}}
+// Default window: 6 hours (covers same-session retries and same-morning
+// re-dispatch without permanently blocking a genuinely-later resend, e.g. if
+// the user explicitly asks to resend the next day).
+
+const fs = require("node:fs");
+const path = require("node:path");
+
+const { installTools } = require("../lib/root.cjs");
+
+const STATE_PATH = installTools("data/trip-day-email-sent.json");
+const DEFAULT_WINDOW_HOURS = 6;
+
+function loadState() {
+  try {
+    return JSON.parse(fs.readFileSync(STATE_PATH, "utf8"));
+  } catch {
+    return {};
+  }
+}
+
+function saveState(state) {
+  const tmp = STATE_PATH + ".tmp." + process.pid;
+  fs.writeFileSync(tmp, JSON.stringify(state, null, 2) + "\n");
+  fs.renameSync(tmp, STATE_PATH); // atomic on the same filesystem
+}
+
+function arg(name) {
+  const i = process.argv.indexOf("--" + name);
+  return i > 0 && i + 1 < process.argv.length ? process.argv[i + 1] : null;
+}
+
+function key(date, area) {
+  if (!date || !/^\d{4}-\d{2}-\d{2}$/.test(date)) throw new Error("bad or missing --date (expected YYYY-MM-DD)");
+  if (!area) throw new Error("missing --area");
+  return `${date}::${area}`;
+}
+
+function usage() {
+  console.error(
+    "usage:\n" +
+    "  trip-day-email-guard check  --date YYYY-MM-DD --area <area> [--window-hours N]\n" +
+    "  trip-day-email-guard record --date YYYY-MM-DD --area <area> [--message-id <id>]\n" +
+    "  trip-day-email-guard list [--date YYYY-MM-DD] [--area <area>]"
+  );
+}
+
+function cmdCheck() {
+  const date = arg("date");
+  const area = arg("area");
+  const windowHours = arg("window-hours") ? Number(arg("window-hours")) : DEFAULT_WINDOW_HOURS;
+  const k = key(date, area);
+  const state = loadState();
+  const rec = state[k];
+  if (!rec) {
+    console.log(`clear — no prior send recorded for ${k}`);
+    process.exit(0);
+  }
+  const ageMs = Date.now() - new Date(rec.sent_at).getTime();
+  const ageHours = ageMs / 3600000;
+  if (ageHours < windowHours) {
+    console.error(
+      `BLOCKED — ${k} was already sent ${ageHours.toFixed(2)}h ago (${rec.sent_at}` +
+      (rec.message_id ? `, message id ${rec.message_id}` : "") +
+      `), within the ${windowHours}h dedup window. If this is a genuine intentional resend, ` +
+      `pass --window-hours 0 to override, or delete the record with a manual edit to ${STATE_PATH}.`
+    );
+    process.exit(1);
+  }
+  console.log(`clear — prior send for ${k} was ${ageHours.toFixed(2)}h ago, outside the ${windowHours}h window`);
+  process.exit(0);
+}
+
+function cmdRecord() {
+  const date = arg("date");
+  const area = arg("area");
+  const messageId = arg("message-id");
+  const k = key(date, area);
+  const state = loadState();
+  state[k] = { sent_at: new Date().toISOString(), message_id: messageId || null };
+  saveState(state);
+  console.log(`recorded send for ${k} at ${state[k].sent_at}`);
+  process.exit(0);
+}
+
+function cmdList() {
+  const date = arg("date");
+  const area = arg("area");
+  const state = loadState();
+  const out = {};
+  for (const [k, v] of Object.entries(state)) {
+    const [d, a] = k.split("::");
+    if (date && d !== date) continue;
+    if (area && a !== area) continue;
+    out[k] = v;
+  }
+  console.log(JSON.stringify(out, null, 2));
+  process.exit(0);
+}
+
+const cmd = process.argv[2];
+try {
+  if (cmd === "check") cmdCheck();
+  else if (cmd === "record") cmdRecord();
+  else if (cmd === "list") cmdList();
+  else { usage(); process.exit(64); }
+} catch (e) {
+  console.error(e.message);
+  process.exit(64);
+}

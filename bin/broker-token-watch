@@ -1,0 +1,245 @@
+#!/usr/bin/env node
+"use strict";
+// broker-token-watch — warn the user BEFORE the broker's re-auth window
+// closes, instead of finding out because something broke.
+//
+// Brokers that issue a refresh token with a hard life (often ~7 days) offer no
+// API to renew it; only a browser authorization can. So the goal is not to
+// eliminate the sign-in but to make it cost ~15 seconds and never be a
+// surprise: one push a couple of days ahead, with a link that lands on the
+// broker's consent screen directly.
+//
+// READ-ONLY. It calls exactly one route on the broker bridge,
+// /api/token-health, with the read-only key. That route returns clocks and a
+// truncated fingerprint — never a token — and the host still holds no
+// trade-capable credential (see lib/broker-config.cjs).
+//
+// A direct script — no webhook, no agent, no LLM. "Is a number below a
+// threshold" does not need a model, and a deterministic script is the thing you
+// want standing between you and a deadline.
+//
+// ─── On not nagging ────────────────────────────────────────────────────────
+// An alert that fires every week AFTER the token has already broken is noise
+// reporting a fact the user could not have acted on any earlier. The lesson is
+// not "never alert about broker tokens", it is "alert once, before it matters,
+// with the fix attached".
+//
+// So the dedup is strict. Each (token slot, refresh-token fingerprint, state)
+// pages at most once, ever. In a normal window that is a single push. If it is
+// ignored, one more when the window actually lapses — a genuinely new fact —
+// and then silence. Re-linking changes the fingerprint, which clears the
+// slot's history and re-arms the whole thing for the next window. Nothing
+// repeats on a timer. A token left dead after both pings goes quiet here by
+// design; broker-snapshot's consecutive-empty-fetch alert is the backstop.
+//
+// It also persists each slot's observed clock (state, daysRemaining,
+// observedAt): broker-snapshot reads it through lib/broker-token-clock.js to
+// tell a transient empty fetch from a window that has run out, without a
+// second network dependency of its own.
+//
+// No bridge configured = OFF: exits 0.
+//
+// Usage:
+//   broker-token-watch              check + notify if warranted
+//   broker-token-watch --dry-run    check + print what would be sent; no state
+//                                   writes, no notifications
+//   broker-token-watch --json       machine-readable summary to stdout
+
+const fs = require("node:fs");
+const path = require("node:path");
+const { spawnSync } = require("node:child_process");
+const { loadEnv } = require("../lib/load-env.js");
+loadEnv();
+const { brokerConfig, brokerFile } = require("../lib/broker-config.cjs");
+
+const CFG = brokerConfig();
+const STATE_FILE = process.env.BROKER_TOKEN_WATCH_STATE || brokerFile("token_watch_state", CFG);
+// Overridable so the dedup logic can be exercised end-to-end without sending
+// real pushes. Nothing in production sets it.
+const SEND = process.env.JORI_SEND_BIN || path.join(__dirname, "jori-send-curl");
+
+const WARN_WITHIN_DAYS = Number(CFG.warn_within_days) || 2;
+
+// How many consecutive unreachable runs before saying so. A single failed poll
+// is a blip; three (three days, at a daily cadence) is a watcher that has
+// stopped watching — and a silently broken deadline-watcher is worse than none.
+const API_FAILURE_ESCALATE = 3;
+
+const FLAGS = new Set(process.argv.slice(2).filter((a) => a.startsWith("--")));
+const DRY_RUN = FLAGS.has("--dry-run");
+const JSON_OUT = FLAGS.has("--json");
+
+const Label = CFG.label.charAt(0).toUpperCase() + CFG.label.slice(1);
+
+function log(...a) {
+  if (!JSON_OUT) console.log(...a);
+}
+
+function readState() {
+  try {
+    const j = JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
+    return {
+      tokens: j.tokens && typeof j.tokens === "object" ? j.tokens : {},
+      apiFailure: j.apiFailure && typeof j.apiFailure === "object" ? j.apiFailure : { count: 0, since: null },
+    };
+  } catch {
+    return { tokens: {}, apiFailure: { count: 0, since: null } };
+  }
+}
+
+function writeState(state) {
+  if (DRY_RUN) return;
+  try {
+    fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2) + "\n");
+  } catch (err) {
+    console.error(`broker-token-watch: could not write state: ${err.message}`);
+  }
+}
+
+function notify(msg, extraArgs = []) {
+  if (DRY_RUN) {
+    log(`[dry-run] would send: ${msg}`);
+    return;
+  }
+  // System channel: this is plumbing about a connection, and the chat channel
+  // stays clear of it. ⚠️ not 🔴 on purpose — system-alert-dedup never
+  // suppresses 🔴, and a token doing what broker tokens do is a chore, not an
+  // incident.
+  const res = spawnSync(
+    SEND,
+    ["--skip-precheck", "--channel", "system", "--intent", CFG.intents.token, ...extraArgs, msg],
+    { encoding: "utf8" }
+  );
+  if (res.status !== 0) {
+    console.error(`broker-token-watch: notify failed (${res.status}): ${res.stderr || res.stdout}`);
+  }
+}
+
+function humanRemaining(days) {
+  if (days === null || days === undefined) return "unknown";
+  if (days <= 0) return "already lapsed";
+  if (days < 1) return `${Math.round(days * 24)} hours`;
+  return `${days.toFixed(1)} days`;
+}
+
+async function main() {
+  if (!CFG.api_url) {
+    log(`broker-token-watch: no broker bridge configured (investments.json broker.api_url / $${CFG.url_env}) — nothing to do.`);
+    if (JSON_OUT) console.log(JSON.stringify({ ok: true, configured: false }));
+    return;
+  }
+  if (!CFG.ro_key) {
+    console.error(`broker-token-watch: ${CFG.key_env} not set in .env`);
+    process.exit(1);
+  }
+
+  const state = readState();
+
+  let payload;
+  try {
+    const resp = await fetch(`${CFG.api_url}/api/token-health?warnWithinDays=${WARN_WITHIN_DAYS}`, {
+      headers: { "x-api-key": CFG.ro_key },
+    });
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}: ${(await resp.text()).slice(0, 200)}`);
+    payload = await resp.json();
+  } catch (err) {
+    const streak = {
+      count: (state.apiFailure.count || 0) + 1,
+      since: state.apiFailure.since || new Date().toISOString(),
+      last: new Date().toISOString(),
+      error: err.message,
+    };
+    state.apiFailure = streak;
+    writeState(state);
+    log(`broker-token-watch: /api/token-health unreachable (${err.message}) — consecutive failures: ${streak.count}`);
+    if (streak.count === API_FAILURE_ESCALATE) {
+      // --observed-error: jori-send-curl's mechanism-attestation gate wants
+      // the captured text behind any message naming a specific failure.
+      notify(
+        `⚠️ I've been unable to read ${CFG.label} token health from ${CFG.api_url} for ${streak.count} runs (since ${streak.since.slice(0, 10)}). That's the check that warns you before the ${CFG.label} re-link is due, so until it's fixed you won't get that warning. Last error: ${err.message}`,
+        ["--observed-error", err.message]
+      );
+    }
+    if (JSON_OUT) console.log(JSON.stringify({ ok: false, error: err.message, streak: streak.count }));
+    process.exit(1);
+  }
+
+  if (state.apiFailure.count) {
+    log(`broker-token-watch: endpoint reachable again after ${state.apiFailure.count} failures`);
+    state.apiFailure = { count: 0, since: null };
+  }
+
+  const reauthBase = payload.reauthUrlBase || CFG.reauth_base;
+  const windowDays = Number(CFG.refresh_window_days) || 7;
+  const summary = [];
+  const pending = [];
+
+  for (const t of payload.tokens || []) {
+    const prev = state.tokens[t.tokenId] || {};
+    // A changed fingerprint means the broker handed back a different refresh
+    // token — the user re-linked (or the broker rotates on refresh). Either way
+    // the clock restarted, so forget everything said about the old one.
+    const rearmed = Boolean(prev.fingerprint && prev.fingerprint !== t.refreshFingerprint);
+    const notified = rearmed ? {} : prev.notified || {};
+
+    summary.push({ tokenId: t.tokenId, state: t.state, daysRemaining: t.refreshDaysRemaining, rearmed });
+    const remaining =
+      t.refreshDaysRemaining === null || t.refreshDaysRemaining === undefined
+        ? ""
+        : t.refreshDaysRemaining <= 0
+          ? " (window already lapsed)"
+          : ` (${humanRemaining(t.refreshDaysRemaining)} left)`;
+    log(`  ${t.tokenId}: ${t.state}${remaining}` + (rearmed ? " — re-linked since last run, warnings re-armed" : ""));
+
+    let msg = null;
+    if (t.state === "expiring") {
+      msg =
+        `⚠️ ${Label} "${t.tokenId}" needs re-linking in ${humanRemaining(t.refreshDaysRemaining)} — ` +
+        `the ${windowDays}-day window can't be renewed from the API, only by a browser sign-in. ` +
+        `Tap to go straight to the consent screen: ${reauthBase}${t.tokenId} ` +
+        `(~15 seconds; nothing breaks until it lapses, and I won't mention it again unless it does).`;
+    } else if (t.state === "expired") {
+      msg =
+        `⚠️ ${Label} "${t.tokenId}" has lapsed — ${CFG.app_label} can't read positions or place trades until it's re-linked. ` +
+        `Tap for the consent screen: ${reauthBase}${t.tokenId}`;
+    } else if (t.state === "unknown") {
+      // Tokens minted before the bridge recorded when they were authorized.
+      // Their true age is unmeasurable, so one re-link arms the clock
+      // permanently — worth saying once, and never worth repeating.
+      msg =
+        `⚠️ I can't tell how much of the ${CFG.label} "${t.tokenId}" ${windowDays}-day window is left — it was linked before ${CFG.app_label} ` +
+        `started recording that. Re-link once and I'll warn you ${WARN_WITHIN_DAYS} days ahead of every future expiry: ${reauthBase}${t.tokenId}`;
+    }
+
+    if (msg && !notified[t.state]) {
+      pending.push(msg);
+      notified[t.state] = new Date().toISOString();
+    }
+
+    // Persist the observed re-link clock, not just the dedup bookkeeping
+    // (the hand-off to broker-snapshot). Additive and backward-compatible: a
+    // state file without an observation simply makes the reader fall back to
+    // its previous wording.
+    state.tokens[t.tokenId] = {
+      fingerprint: t.refreshFingerprint,
+      notified,
+      state: t.state,
+      daysRemaining: t.refreshDaysRemaining,
+      observedAt: new Date().toISOString(),
+    };
+  }
+
+  // One message per run, never one per slot: slots authorized in the same
+  // sitting come due within days of each other, and two pushes saying the same
+  // thing is the shape that gets an alert retired.
+  if (pending.length === 1) notify(pending[0]);
+  else if (pending.length > 1) notify(pending.join("\n\n"));
+
+  writeState(state);
+  if (JSON_OUT) console.log(JSON.stringify({ ok: true, tokens: summary }, null, 2));
+}
+
+main().catch((err) => {
+  console.error(`broker-token-watch: ${err.stack || err.message}`);
+  process.exit(1);
+});

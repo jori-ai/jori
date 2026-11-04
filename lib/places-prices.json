@@ -1,0 +1,32 @@
+{
+  "notes": "Google Places API (New) list prices, USD per 1,000 billable requests, by method and the tier its field mask buys (lib/places-log.js tierForMask). Shared by places-log.js and places_log.py: every call-log line carries est_usd = list price, before free allowances. The free allowance is per SKU per month and per BILLING ACCOUNT, not per project: another project on the same billing account can use it up, after which every call bills at list price. `places-budget audit` (where installed) reconciles these estimates against the billing export. Update from https://developers.google.com/maps/billing-and-pricing/pricing when Google reprices.",
+  "per_1000_usd": {
+    "searchText":   { "essentials": 0,  "pro": 32, "enterprise": 35, "enterprise_atmosphere": 40 },
+    "searchNearby": { "essentials": 32, "pro": 32, "enterprise": 35, "enterprise_atmosphere": 40 },
+    "details":      { "essentials": 5,  "pro": 17, "enterprise": 20, "enterprise_atmosphere": 25 },
+    "getPlace":     { "essentials": 5,  "pro": 17, "enterprise": 20, "enterprise_atmosphere": 25 },
+    "photoMedia":   { "photo": 7 },
+    "autocomplete": { "essentials": 2.83 }
+  },
+  "free_per_month_per_billing_account": {
+    "essentials": 10000,
+    "pro": 5000,
+    "enterprise": 1000,
+    "enterprise_atmosphere": 1000,
+    "photo": 1000
+  },
+  "sku_method": {
+    "searchText": "Text Search",
+    "searchNearby": "Nearby Search",
+    "details": "Place Details",
+    "getPlace": "Place Details",
+    "photoMedia": "Place Details Photos",
+    "autocomplete": "Autocomplete Requests"
+  },
+  "sku_tier": {
+    "essentials": "Essentials",
+    "pro": "Pro",
+    "enterprise": "Enterprise",
+    "enterprise_atmosphere": "Enterprise + Atmosphere"
+  }
+}

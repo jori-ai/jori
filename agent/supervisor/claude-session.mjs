@@ -17,6 +17,7 @@ import readline from "node:readline";
 import { createRequire } from "node:module";
 
 const { instance, localDir } = createRequire(import.meta.url)("../../lib/instance.cjs");
+const { REPO_ROOT } = createRequire(import.meta.url)("../../lib/root.cjs");
 
 const DEFAULT_CLAUDE = process.env.CLAUDE_BIN || `${process.env.HOME}/.local/bin/claude`;
 
@@ -263,6 +264,10 @@ export class ClaudeSession extends EventEmitter {
         const project = instance().supabase_project;
         if (project) env.JORI_SUPABASE_PROJECT = project;
       }
+      // They also name their servers' scripts as ${JORI_HOME}/agent/…; with
+      // it unset the CLI leaves the literal in the path and the server (the
+      // chat agent's phone-channel among them) never starts.
+      if (!env.JORI_HOME) env.JORI_HOME = REPO_ROOT;
       const child = spawn(bin, args, {
         cwd: this.opts.cwd,
         stdio: ["pipe", "pipe", "pipe"],

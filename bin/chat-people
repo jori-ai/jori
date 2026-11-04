@@ -1,0 +1,147 @@
+#!/usr/bin/env node
+// chat-people — who the user texts with (iMessage, WhatsApp), and when.
+//
+// Code side of the messaging half of the people pipeline: matches already-
+// identified people (wiki person pages) to their numbers via Contacts, counts
+// their messages per channel, and writes the `## Texts` block onto their page.
+// The model side is jobs/people-email.md Part B. See lib/chat-people.js.
+// Message text is never stored; `person` reads a bounded sample live.
+
+"use strict";
+
+const cp = require("../lib/chat-people.js");
+
+const args = process.argv.slice(2);
+const cmd = args[0];
+
+function flag(name, def = undefined) {
+  const i = args.indexOf(`--${name}`);
+  if (i === -1) return def;
+  const next = args[i + 1];
+  if (!next || next.startsWith("--")) return true;
+  return next;
+}
+
+function usage() {
+  console.log(`chat-people — iMessage + WhatsApp ledger for person pages
+
+Ingest (code only, no model; needs Full Disk Access for chat.db and Contacts):
+  sync                                     match people to handles, recount messages
+  doctor                                   can chat.db and Contacts be read? (exit 3 if not)
+
+Read:
+  stats
+  candidates [--stale] [--limit N] [--json]   identified people with text history, newest first
+  person <wiki_id> [--sample N] [--json]      counts, groups, years and a bounded live sample
+
+Write (used by jobs/people-email.md Part B):
+  reject <wiki_id> <handle_key> [--note ".."] this number is not that person
+  write-section --person <wiki_id> --summary @file
+                                              replace the page's ## Texts block, mark summarized
+
+DB: ${cp.DB_PATH}
+`);
+}
+
+function day(ms) {
+  return ms ? new Date(ms).toISOString().slice(0, 10) : "—";
+}
+
+function doctor() {
+  const fs = require("node:fs");
+  let ok = true;
+  try {
+    cp.readAddressBook();
+    console.log("contacts: ok");
+  } catch (err) {
+    ok = false;
+    console.log(`contacts: ${err.message}`);
+  }
+  try {
+    cp.scanImessage(new Set(["000000000"]));
+    console.log("chat.db: ok");
+  } catch (err) {
+    ok = false;
+    console.log(`chat.db: ${err.message}`);
+  }
+  console.log(`whatsapp inbox: ${fs.existsSync(process.env.CHAT_PEOPLE_WA_INBOX || require("../lib/root.cjs").installTools("data/whatsapp-inbox.jsonl")) ? "ok" : "missing"}`);
+  if (!ok) process.exitCode = 3;
+}
+
+function stats() {
+  const d = cp.db();
+  const n = (sql) => d.prepare(sql).get().n;
+  const c = cp.candidates();
+  console.log(
+    JSON.stringify(
+      {
+        people: n("SELECT COUNT(*) n FROM people"),
+        people_with_handles: n("SELECT COUNT(DISTINCT wiki_id) n FROM handles"),
+        people_with_messages: n("SELECT COUNT(DISTINCT wiki_id) n FROM stats"),
+        locked_pages_skipped: n("SELECT COUNT(*) n FROM people WHERE locked = 1 AND wiki_id IN (SELECT wiki_id FROM stats)"),
+        qualified: c.length,
+        stale: c.filter((x) => x.stale).length,
+        summarized: n("SELECT COUNT(*) n FROM links WHERE summarized_at IS NOT NULL"),
+        rejected_handles: n("SELECT COUNT(*) n FROM rejected"),
+        handle_conflicts: JSON.parse(cp.getMeta("conflicts") || "[]").length,
+        synced_at: cp.getMeta("synced_at"),
+      },
+      null,
+      2,
+    ),
+  );
+}
+
+async function main() {
+  const asJson = Boolean(flag("json", false));
+  switch (cmd) {
+    case "sync":
+      return console.log(JSON.stringify(cp.sync()));
+    case "doctor":
+      return doctor();
+    case "stats":
+      return stats();
+    case "candidates": {
+      const rows = cp.candidates({ staleOnly: Boolean(flag("stale", false)), limit: flag("limit") ? Number(flag("limit")) : null });
+      if (asJson) return console.log(JSON.stringify(rows, null, 2));
+      for (const r of rows) {
+        console.log(`${String(r.direct_messages).padStart(6)} ${String(r.group_messages).padStart(5)}  ${day(r.last_at)}  ${r.stale ? "*" : " "} ${r.wiki_id}  ${r.name}  [${r.channels.join(",")}]`);
+      }
+      return console.log(`\n${rows.length} people (columns: direct, group; * = summary due)`);
+    }
+    case "person": {
+      if (!args[1]) throw new Error("person <wiki_id>");
+      const r = cp.personDigest(args[1], { sample: Number(flag("sample", 60)) });
+      if (asJson) return console.log(JSON.stringify(r, null, 2));
+      console.log(`${r.name} (${r.wiki_id})`);
+      console.log(`handles: ${r.handles.map((h) => `${h.card} ${h.handle} [${h.via}]`).join("; ")}`);
+      console.log(`direct: ${JSON.stringify(r.direct)}`);
+      console.log(`by year: ${JSON.stringify(r.direct_by_year)}`);
+      console.log(`groups: ${r.groups.length}`);
+      for (const m of r.sample) console.log(`  ${m.date} ${m.channel} ${m.from}: ${m.text}`);
+      return;
+    }
+    case "reject": {
+      if (!args[1] || !args[2]) throw new Error("reject <wiki_id> <handle_key>");
+      cp.rejectHandle(args[1], args[2], typeof flag("note") === "string" ? flag("note") : null);
+      return console.log(`rejected ${args[2]} for ${args[1]} (takes effect at the next sync)`);
+    }
+    case "write-section": {
+      const person = flag("person");
+      const summaryArg = flag("summary");
+      if (typeof person !== "string" || typeof summaryArg !== "string") throw new Error("write-section needs --person and --summary @file");
+      const summary = summaryArg.startsWith("@") ? require("node:fs").readFileSync(summaryArg.slice(1), "utf8") : summaryArg;
+      return console.log(JSON.stringify(cp.writeSection(person, summary)));
+    }
+    default:
+      usage();
+      if (cmd && cmd !== "-h" && cmd !== "--help") process.exitCode = 2;
+  }
+}
+
+main()
+  .catch((err) => {
+    console.error(`chat-people: ${err.message}`);
+    process.exitCode = /unreadable|authorization|not authorized|unable to open/i.test(err.message) ? 3 : 1;
+  })
+  .finally(() => cp.closeDb());

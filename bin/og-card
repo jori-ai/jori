@@ -1,0 +1,99 @@
+#!/usr/bin/env node
+// og-card — render an email-safe HTML link card (image + title + description)
+// for a URL, using Open Graph / Twitter / fallback meta tags. Designed for use
+// inside playbook bash heredocs that compose HTML email bodies.
+//
+// Usage:
+//   og-card <url>                 # print HTML card for one URL
+//   og-card --json <url>          # print extracted meta as JSON
+//   og-card --plain <url>         # print a plain <a> link (no fetch)
+//   og-card --batch < urls.txt    # one URL per stdin line → cards to stdout,
+//                                 # each separated by "<!-- og-card-sep -->"
+//   og-card --timeout <ms> <url>  # override default 5000ms
+//
+// Exit codes:
+//   0  any render succeeded (including plain-link floor on fetch failure)
+//   2  argument/usage error
+//
+// The rule: any outbound agent email that references a URL should render it
+// through og-card — see agent/ops-agent/CLAUDE.md.
+
+"use strict";
+
+const { createRequire } = require("node:module");
+const require_ = createRequire(__filename);
+const {
+  fetchMeta,
+  renderCard,
+  renderPlainLink,
+  cardsForMany,
+} = require_("../lib/og-card.js");
+
+function usage(exitCode = 2) {
+  const msg =
+    "Usage:\n" +
+    "  og-card <url>                   print HTML card\n" +
+    "  og-card --json <url>            print meta as JSON\n" +
+    "  og-card --plain <url>           print plain <a> link (no fetch)\n" +
+    "  og-card --batch < urls.txt      one URL per stdin line → HTML cards\n" +
+    "  og-card --timeout <ms> <url>    override fetch timeout (default 5000)\n";
+  process.stdout.write(msg);
+  process.exit(exitCode);
+}
+
+async function main(argv) {
+  const args = { url: null, json: false, plain: false, batch: false, timeoutMs: undefined };
+  for (let i = 2; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === "--json") args.json = true;
+    else if (a === "--plain") args.plain = true;
+    else if (a === "--batch") args.batch = true;
+    else if (a === "--timeout") args.timeoutMs = Number(argv[++i]);
+    else if (a === "-h" || a === "--help") usage(0);
+    else if (a.startsWith("--")) { process.stderr.write(`og-card: unknown flag: ${a}\n`); usage(2); }
+    else if (!args.url) args.url = a;
+    else { process.stderr.write(`og-card: unexpected arg: ${a}\n`); usage(2); }
+  }
+
+  if (args.batch) {
+    const stdinText = await new Promise((resolve) => {
+      let buf = "";
+      process.stdin.setEncoding("utf8");
+      process.stdin.on("data", (c) => (buf += c));
+      process.stdin.on("end", () => resolve(buf));
+    });
+    const urls = stdinText.split("\n").map(s => s.trim()).filter(Boolean);
+    if (urls.length === 0) process.exit(0);
+    const cards = await cardsForMany(urls, { timeoutMs: args.timeoutMs });
+    process.stdout.write(cards.join("\n<!-- og-card-sep -->\n") + "\n");
+    process.exit(0);
+  }
+
+  if (!args.url) usage(2);
+
+  if (args.plain) {
+    process.stdout.write(renderPlainLink(args.url) + "\n");
+    process.exit(0);
+  }
+
+  const meta = await fetchMeta(args.url, { timeoutMs: args.timeoutMs });
+
+  if (args.json) {
+    process.stdout.write(JSON.stringify(meta, null, 2) + "\n");
+    process.exit(0);
+  }
+
+  const html = renderCard(meta, { url: args.url });
+  process.stdout.write(html + "\n");
+  process.exit(0);
+}
+
+main(process.argv).catch((err) => {
+  // Fetch failures inside the helper already resolve to a plain-link floor,
+  // so reaching here means something structural broke. Still emit a floor
+  // rather than leaving the email builder with nothing.
+  const url = process.argv.slice(2).find((s) => !s.startsWith("--")) || "";
+  if (url) process.stdout.write(renderPlainLink(url) + "\n");
+  process.stderr.write(`og-card: ${err && err.message || err}\n`);
+  process.exit(0);
+});

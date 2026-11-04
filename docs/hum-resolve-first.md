@@ -29,9 +29,10 @@ Not covered, by design: `hum-debug` (a system-channel diagnostic, not hum conten
 `bin/hum-resolve-first` → `lib/hum-resolve-first.mjs`:
 
 1. **Code reads a bounded bundle**, in parallel, 12 s per source, each stamped with when it was read. The kernel's own sources: `calendar` (all calendars, −2/+35 days), `tasks` (Google Tasks), `recent_chat` (24 h of the chat channel), `recall` (wiki, inbox, the user's dated replies, chat — retrieved by the message itself), `email_memory` (`context-search`), `resolved_before` (this gate's own answers, 14 days). An installation adds its own sources as overlay modules in `agent/scripts/hum-resolve-first-sources/_ext/` (one `.mjs` per source, default-exporting `{ id, live?, read() }`; contract in that dir's `.gitkeep`; a kernel id always wins over an overlay one) — for example a travel timeline, a flights file, a reservations store, location history. `agent/local/config/hum-resolve-first.json` sets the bundle's section order (`source_order`; unlisted sources follow, kernel first) and the live sources of record the prompt names (`live_sources`; default the kernel's `calendar` and `tasks` plus any overlay source marked `live`).
-   It never reads bank, brokerage or health rows: no source reads them, and an overlay source must not.
-2. **One Opus call** (`JORI_MODEL_OPUS` from `agent/config/models.env`, effort `medium`, tool-less, Max session only via `lib/jev-claude.mjs` — no API key) reads the message, the finding it came from, and the bundle, and returns a verdict: `resolved` / `partial` / `unresolved` / `nothing_to_resolve`, the answer, the sections it relied on, one plain line on what it checked, and the replacement text.
-3. **Code checks it**: a resolution must cite at least one section that was actually in the bundle (a citation of a section that failed to load does not count), must carry an answer, and its text must be under 600 characters. A failed check is retried once with the errors; a second failure sends the message unchanged.
+   An overlay source may be marked `review: true`: a **standing review**, a report Jori already wrote for the user (a weekly market report, a digest), whose `as_of` says when the report was current. Section ids of reviews are named in the prompt's rule 8 (below); a bundle with none gets the prompt without that rule.
+   It never reads bank, brokerage or health rows: no source reads them, and an overlay source must not. A review built on such data passes only what it found about the world (a market move, a company's results), never the user's holdings, balances or amounts.
+2. **One Opus call** (`JORI_MODEL_OPUS` from `agent/config/models.env`, effort `medium`, tool-less, Max session only via `lib/jev-claude.mjs` — no API key) reads the message, the finding it came from, and the bundle, and returns a verdict: `resolved` / `partial` / `unresolved` / `covered` (only when a standing review is in the bundle) / `nothing_to_resolve`, the answer, the sections it relied on, one plain line on what it checked, and the replacement text.
+3. **Code checks it**: a resolution must cite at least one section that was actually in the bundle (a citation of a section that failed to load does not count), must carry an answer, and its text must be under 600 characters. `covered` must cite a standing review that was in the bundle and say what that review found. A failed check is retried once with the errors; a second failure sends the message unchanged.
 4. **Code owns the action table:**
 
 | verdict | action | what the user gets |
@@ -40,6 +41,8 @@ Not covered, by design: `hum-debug` (a system-channel diagnostic, not hum conten
 | `resolved`, adds nothing | `drop` | nothing |
 | `partial` | `rewrite` | only the remaining gap, asked specifically, + what was checked |
 | `unresolved`, and it asks the user something | `rewrite` | the same question, phrased as the specific unknown, + one line on what was checked and not found; sent as written if the model offers no rewrite |
+| `covered`, and the review covered everything the message says | `drop` | nothing |
+| `covered`, and the message adds something the review did not have | `rewrite` | the new point + one line on what the review already found, when it was current, and that it is a snapshot, not real-time (the link kept on its own last line) |
 | `nothing_to_resolve`, any error | `send` | the message as written |
 
 Tappable answer choices survive a rewrite only when the model says they still answer the new question.
@@ -51,6 +54,7 @@ Tappable answer choices survive a rewrite only when the model says they still an
 - The user's own words outrank everything, including the gate's earlier conclusions.
 - **Rule #0 (voice):** warm, specific, plain, under 300 characters, no jargon, no ids, no menus, no mention that anything was held back.
 - Every lane: add no money amount, balance, account number or health figure that was not already in the message (the bundle's email and chat can carry figures, and a rewrite goes on to the outbound precheck).
+- **Standing reviews (rule 8, added 2026-10-30):** a message whose point a review in the bundle already covered (a market or news move, a signal, a company's results or spending), or that suggests the user look at something "with the review in mind" when the review already looked at it, is `covered`. Jori never tells the user to look at something a review of its own already looked at. A caveat names only the review's finding, its level or verdict and when it was current, never the user's own holdings, positions, weights or amounts. A topic no review covered is judged as before. The installation's wording for this rule's two examples is `prompt.review_example` / `prompt.caveat_example`.
 
 ## What the senders do with the outcome
 
@@ -65,6 +69,8 @@ The gate tells the sender through the `--capture-id` file `jori-send-curl` alrea
 | `hum-ask` | exit **12**, no slot; retires an idea | exit **13**, no slot (nothing to answer) | exit 0, slot holds the gap text the user saw |
 | `hum-deliver-qual` | queue dropped, no slot | queue dropped, no slot | slot holds the gap text |
 
+A `covered` drop is handled like any drop (exit **12**), and a `covered` caveat like a rewrite to FYI (not a question).
+
 `hum-ask` also fixes an older bug: a precheck hold used to write the pending slot with the sentinel JSON as its message id; it is now exit **14**, no slot. `hum-deliver-qual` had the same bug and the same fix.
 
 `silent_root_cause: "resolved_first"` covers exit 12 in the tick trace (`jobs/hum.md`, `lib/hum-tick-core.mjs`), and `hum-explore` treats it as a structural silence.
@@ -73,7 +79,7 @@ The gate tells the sender through the `--capture-id` file `jori-send-curl` alrea
 
 Settled answers go to `data/hum-resolve-first.jsonl` (`lib/hum-resolve-first-store.mjs`):
 
-- the pre-rank filter (`lib/hum-vetoes.mjs`) vetoes a candidate whose `dedup_key` was **fully** resolved in the last 7 days (`HUM_RESOLVED_WINDOW_D`) as `resolved_first` — a key match, cheap, before the ranker. Same carve-outs as dedup: a protected lane or urgency ≥ 0.9 passes, because a key can stay the same while the situation changes (`travel:<flight>:<depart>`), and the send-time gate re-judges it against fresh records anyway;
+- the pre-rank filter (`lib/hum-vetoes.mjs`) vetoes a candidate whose `dedup_key` was **fully** resolved, or `covered` by a standing review, in the last 7 days (`HUM_RESOLVED_WINDOW_D`) as `resolved_first` — a key match, cheap, before the ranker. Same carve-outs as dedup: a protected lane or urgency ≥ 0.9 passes, because a key can stay the same while the situation changes (`travel:<flight>:<depart>`), and the send-time gate re-judges it against fresh records anyway;
 - the gate shows its last 14 days of answers to the model, which catches a reworded re-ask.
 
 These are Jori's conclusions, so they are deliberately **not** written to `hum-responses.jsonl`, whose rows are rendered as *"<user> said: …"* (`lib/utterance-store.mjs`). When the user says one is wrong, the chat agent records the correction as usual and runs `hum-resolve-first forget <decision_id|dedup_key>` (`jobs/hum-operations.md` § Step 0c).

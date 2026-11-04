@@ -68,3 +68,22 @@ test("searchForEmail drops superseded rows and promotes live ones", () => {
   // History is untouched: `search` still sees every row.
   assert.equal(em.search("reply-echo jori", 30).length, 6, "search still returns superseded rows");
 });
+
+// `--add-tag` / `--remove-tag` repeat, and take comma lists. Before 2026-11-03
+// the CLI read only the first occurrence, so `--add-tag a --add-tag b` kept a
+// and silently dropped b.
+test("supersede CLI applies every --add-tag / --remove-tag value", async () => {
+  const { execFileSync } = await import("node:child_process");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "email-mem-cli-"));
+  for (const d of ["lib", "data", "bin"]) fs.mkdirSync(path.join(dir, d));
+  fs.copyFileSync(path.join(ROOT, "lib", "email-memory.js"), path.join(dir, "lib", "email-memory.js"));
+  fs.copyFileSync(path.join(ROOT, "bin", "email-mem"), path.join(dir, "bin", "email-mem.mjs"));
+  const run = (...a) => execFileSync(process.execPath, [path.join(dir, "bin", "email-mem.mjs"), ...a], { encoding: "utf8" });
+
+  const old = Number(run("add", "old row", "--tags", "keep,drop1,drop2").match(/#(\d+)/)[1]);
+  const pol = Number(run("add", "policy row", "--tags", "policy").match(/#(\d+)/)[1]);
+  const out = run("supersede", String(old), "--by", String(pol),
+    "--add-tag", "a", "--add-tag", "b,c", "--remove-tag", "drop1", "--remove-tag", "drop2");
+  const tags = out.match(/now tagged: (.*)\)/)[1].split(",");
+  assert.deepEqual(tags.sort(), ["a", "b", "c", "keep", `superseded-by-#${pol}`].sort());
+});

@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+# browsing-skills-sync — pull the latest content from this installation's
+# browsing-skills fork (a fork of browsing-skills/browsing-skills that tracks
+# upstream) into browsing-skills/external/.
+#
+# Which fork and branch: agent/local/config/browsing-skills.json
+#   {"fork_url": "https://github.com/<owner>/browsing-skills.git", "branch": "main"}
+# (BROWSING_SKILLS_FORK_URL / BROWSING_SKILLS_BRANCH override). No fork
+# configured = nothing to sync (exit 0).
+#
+# Idempotent. Safe to run daily. Logs what changed.
+#
+# Strategy: maintain a shallow clone under ~/.cache/jori/browsing-skills-fork
+# and rsync the skills/ subtree into external/skills/ + SKILL.md into
+# external/SKILL.md. We don't submodule because (a) we never edit external/
+# locally and (b) submodules add deploy/git friction Jori doesn't need.
+
+set -euo pipefail
+
+# Self-locate so cron-bare paths work.
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+source "$SCRIPT_DIR/../agent/scripts/lib/root.sh"
+TARGET_DIR="$JORI_TOOLS/browsing-skills/external"
+
+_cfg() {
+  "${JORI_NODE:-node}" -e 'const c=require(process.argv[1]).localConfig("browsing-skills",{fork_url:"",branch:"main"});process.stdout.write(String(c[process.argv[2]]||""))' "$JORI_TOOLS/lib/instance.cjs" "$1" 2>/dev/null || true
+}
+FORK_URL="${BROWSING_SKILLS_FORK_URL:-$(_cfg fork_url)}"
+FORK_BRANCH="${BROWSING_SKILLS_BRANCH:-$(_cfg branch)}"
+FORK_BRANCH="${FORK_BRANCH:-main}"
+CACHE_DIR="$HOME/.cache/jori/browsing-skills-fork"
+
+if [ -z "$FORK_URL" ]; then
+  echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] no browsing-skills fork configured (agent/local/config/browsing-skills.json fork_url) — nothing to sync"
+  exit 0
+fi
+
+mkdir -p "$CACHE_DIR" "$TARGET_DIR"
+
+if [ ! -d "$CACHE_DIR/.git" ]; then
+  echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] cloning fork ($FORK_BRANCH) into $CACHE_DIR"
+  git clone --depth 1 --branch "$FORK_BRANCH" "$FORK_URL" "$CACHE_DIR"
+else
+  cd "$CACHE_DIR"
+  prior_sha="$(git rev-parse HEAD)"
+  git fetch --depth 1 origin "$FORK_BRANCH" --quiet
+  git reset --hard "origin/$FORK_BRANCH" --quiet
+  new_sha="$(git rev-parse HEAD)"
+  if [ "$prior_sha" = "$new_sha" ]; then
+    echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] up to date at $new_sha (branch=$FORK_BRANCH)"
+    exit 0
+  fi
+  echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] fork branch $FORK_BRANCH advanced $prior_sha -> $new_sha"
+  git log --oneline "$prior_sha..$new_sha" | head -10
+fi
+
+cd "$CACHE_DIR"
+mkdir -p "$TARGET_DIR/skills"
+# Sync skills subtree + top-level umbrella, nothing else.
+rsync -a --delete skills/ "$TARGET_DIR/skills/"
+cp SKILL.md "$TARGET_DIR/SKILL.md"
+cp README.md "$TARGET_DIR/README.md" 2>/dev/null || true
+
+# Track the source SHA so we can debug provenance.
+echo "{\"source\":\"$FORK_URL\",\"sha\":\"$(git rev-parse HEAD)\",\"synced_at\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}" > "$TARGET_DIR/.sync-meta.json"
+
+echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] synced $(find "$TARGET_DIR/skills" -name 'SKILL.md' | wc -l | tr -d ' ') sites to $TARGET_DIR"

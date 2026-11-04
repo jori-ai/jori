@@ -1,0 +1,268 @@
+#!/usr/bin/env node
+// contact-lookup — CLI for searching Apollo.io and managing local contacts.
+// Usage:
+//   contact-lookup search --name "Jon Barr" [--company "Acme"] [--domain "acme.com"] [--title "CEO"]
+//   contact-lookup enrich --name "Jon Barr" --domain "acme.com" [--email "jon@acme.com"]
+//   contact-lookup save --data '{"name":"Jon Barr","company":"Acme","email":"jon@acme.com"}'
+//   contact-lookup find "Jon Barr"
+//   contact-lookup get --name "Jon Barr"
+//   contact-lookup get --id 1
+//   contact-lookup list
+
+import { createRequire } from "node:module";
+import { readFileSync } from "node:fs";
+import { join, dirname } from "node:path";
+import { fileURLToPath } from "node:url";
+
+const require = createRequire(import.meta.url);
+const contacts = require("../lib/contacts");
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const args = process.argv.slice(2);
+const cmd = args[0];
+
+function flag(name) {
+  const i = args.indexOf(`--${name}`);
+  if (i === -1 || i + 1 >= args.length) return undefined;
+  return args[i + 1];
+}
+
+// Load Apollo API key from .env
+function getApolloKey() {
+  if (process.env.APOLLO_API_KEY) return process.env.APOLLO_API_KEY;
+  try {
+    const envFile = readFileSync(join(__dirname, "..", ".env"), "utf8");
+    const match = envFile.match(/^APOLLO_API_KEY=(.+)$/m);
+    if (match) return match[1].trim();
+  } catch {}
+  console.error("Error: APOLLO_API_KEY not found in environment or .env");
+  process.exit(1);
+}
+
+function formatContact(c) {
+  const lines = [`${c.name}${c.title ? ` — ${c.title}` : ""}${c.company ? ` @ ${c.company}` : ""}`];
+  if (c.email) lines.push(`  Email: ${c.email}`);
+  if (c.phone) lines.push(`  Phone: ${c.phone}`);
+  if (c.linkedin_url) lines.push(`  LinkedIn: ${c.linkedin_url}`);
+  if (c.apollo_id) lines.push(`  Apollo ID: ${c.apollo_id}`);
+  if (c.tags) lines.push(`  Tags: ${c.tags}`);
+  if (c.notes) lines.push(`  Notes: ${c.notes}`);
+  if (c.metadata_json && c.metadata_json !== "{}") {
+    try {
+      const meta = JSON.parse(c.metadata_json);
+      for (const [k, v] of Object.entries(meta)) {
+        if (v) lines.push(`  ${k}: ${typeof v === "object" ? JSON.stringify(v) : v}`);
+      }
+    } catch {}
+  }
+  if (c.id) lines.push(`  [id:${c.id} updated:${c.updated_at}]`);
+  return lines.join("\n");
+}
+
+function usage() {
+  console.log(`contact-lookup — search Apollo.io and manage local contacts
+
+Commands:
+  search --name <name> [--company X] [--domain X] [--title X]   Search Apollo for a person
+  enrich --name <name> --domain <domain> [--email X]             Enrich via Apollo match
+  save --data '<json>'                                            Save/update a contact locally
+  find <query>                                                    Search local contacts (FTS5)
+  get --name <name> | --id <id>                                   Get a specific contact
+  list                                                            List all contacts
+`);
+}
+
+(async () => {
+  switch (cmd) {
+    case "search": {
+      const name = flag("name");
+      if (!name) { console.error("Usage: contact-lookup search --name <name>"); process.exit(1); }
+      const apiKey = getApolloKey();
+      const body = {
+        q_person_name: name,
+        per_page: 10,
+      };
+      const company = flag("company");
+      const domain = flag("domain");
+      const title = flag("title");
+      if (company) body.q_organization_name = company;
+      if (domain) body.organization_domains = [domain];
+      if (title) body.person_titles = [title];
+
+      try {
+        const res = await fetch("https://api.apollo.io/api/v1/mixed_people/api_search", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "X-Api-Key": apiKey },
+          body: JSON.stringify(body),
+          signal: AbortSignal.timeout(15000),
+        });
+        if (!res.ok) {
+          const text = await res.text();
+          console.error(`Apollo API error (${res.status}): ${text}`);
+          process.exit(1);
+        }
+        const data = await res.json();
+        const people = data.people || [];
+        if (people.length === 0) { console.log("No results found."); break; }
+
+        console.log(`Found ${people.length} result(s):\n`);
+        for (const p of people) {
+          const displayName = p.name || [p.first_name, p.last_name || p.last_name_obfuscated].filter(Boolean).join(" ") || "?";
+          const lines = [`${displayName}${p.title ? ` — ${p.title}` : ""}${p.organization?.name ? ` @ ${p.organization.name}` : ""}`];
+          if (p.email) lines.push(`  Email: ${p.email}`);
+          if (p.has_email) lines.push(`  Has email: yes (use contact_enrich to reveal)`);
+          if (p.phone_numbers?.length) lines.push(`  Phone: ${p.phone_numbers.map(pn => pn.sanitized_number || pn.raw_number).join(", ")}`);
+          if (p.linkedin_url) lines.push(`  LinkedIn: ${p.linkedin_url}`);
+          if (p.id) lines.push(`  Apollo ID: ${p.id}`);
+          if (p.headline) lines.push(`  Headline: ${p.headline}`);
+          if (p.city || p.state || p.country) lines.push(`  Location: ${[p.city, p.state, p.country].filter(Boolean).join(", ")}`);
+          else if (p.has_city || p.has_country) lines.push(`  Has location: yes`);
+          if (p.organization?.website_url) lines.push(`  Company URL: ${p.organization.website_url}`);
+          console.log(lines.join("\n"));
+          console.log();
+        }
+        console.log("Tip: Use contact_enrich with name + company domain to get full details (email, phone, etc.).");
+      } catch (err) {
+        console.error(`Error searching Apollo: ${err.message}`);
+        process.exit(1);
+      }
+      break;
+    }
+
+    case "enrich": {
+      const name = flag("name");
+      const domain = flag("domain");
+      if (!name || !domain) { console.error("Usage: contact-lookup enrich --name <name> --domain <domain>"); process.exit(1); }
+      const apiKey = getApolloKey();
+
+      const nameParts = name.split(" ");
+      const firstName = nameParts[0];
+      const lastName = nameParts.slice(1).join(" ");
+
+      const body = {
+        first_name: firstName,
+        last_name: lastName,
+        organization_domain: domain,
+      };
+      const email = flag("email");
+      if (email) body.email = email;
+
+      try {
+        const res = await fetch("https://api.apollo.io/api/v1/people/match", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "X-Api-Key": apiKey },
+          body: JSON.stringify(body),
+          signal: AbortSignal.timeout(15000),
+        });
+        if (!res.ok) {
+          const text = await res.text();
+          console.error(`Apollo API error (${res.status}): ${text}`);
+          process.exit(1);
+        }
+        const data = await res.json();
+        const p = data.person;
+        if (!p) { console.log("No match found."); break; }
+
+        const lines = [`${p.name || "?"}${p.title ? ` — ${p.title}` : ""}${p.organization?.name ? ` @ ${p.organization.name}` : ""}`];
+        if (p.email) lines.push(`Email: ${p.email}`);
+        if (p.phone_numbers?.length) lines.push(`Phone: ${p.phone_numbers.map(pn => pn.sanitized_number || pn.raw_number).join(", ")}`);
+        if (p.linkedin_url) lines.push(`LinkedIn: ${p.linkedin_url}`);
+        if (p.id) lines.push(`Apollo ID: ${p.id}`);
+        if (p.headline) lines.push(`Headline: ${p.headline}`);
+        if (p.city || p.state || p.country) lines.push(`Location: ${[p.city, p.state, p.country].filter(Boolean).join(", ")}`);
+        if (p.organization?.website_url) lines.push(`Company URL: ${p.organization.website_url}`);
+        if (p.organization?.estimated_num_employees) lines.push(`Company Size: ~${p.organization.estimated_num_employees} employees`);
+        if (p.departments?.length) lines.push(`Departments: ${p.departments.join(", ")}`);
+        if (p.seniority) lines.push(`Seniority: ${p.seniority}`);
+        console.log(lines.join("\n"));
+
+        // Output as save-ready JSON for the agent
+        console.log("\n--- Save-ready JSON ---");
+        const saveData = {
+          name: p.name,
+          email: p.email || "",
+          phone: p.phone_numbers?.length ? p.phone_numbers[0].sanitized_number || p.phone_numbers[0].raw_number : "",
+          company: p.organization?.name || "",
+          title: p.title || "",
+          linkedin_url: p.linkedin_url || "",
+          apollo_id: p.id || "",
+          metadata: {
+            headline: p.headline || "",
+            location: [p.city, p.state, p.country].filter(Boolean).join(", "),
+            seniority: p.seniority || "",
+            company_url: p.organization?.website_url || "",
+            company_size: p.organization?.estimated_num_employees || "",
+            departments: p.departments || [],
+          },
+        };
+        console.log(JSON.stringify(saveData));
+      } catch (err) {
+        console.error(`Error enriching via Apollo: ${err.message}`);
+        process.exit(1);
+      }
+      break;
+    }
+
+    case "save": {
+      const dataStr = flag("data");
+      if (!dataStr) { console.error("Usage: contact-lookup save --data '<json>'"); process.exit(1); }
+      let data;
+      try { data = JSON.parse(dataStr); } catch {
+        console.error("Error: invalid JSON for --data");
+        process.exit(1);
+      }
+      const id = contacts.upsert({
+        name: data.name,
+        email: data.email,
+        phone: data.phone,
+        company: data.company,
+        title: data.title,
+        linkedinUrl: data.linkedin_url,
+        apolloId: data.apollo_id,
+        notes: data.notes,
+        tags: data.tags,
+        metadata: data.metadata,
+      });
+      const saved = contacts.get({ id });
+      console.log(`Saved contact #${id}:`);
+      console.log(formatContact(saved));
+      break;
+    }
+
+    case "find": {
+      const query = args[1];
+      if (!query) { console.error("Usage: contact-lookup find <query>"); process.exit(1); }
+      const results = contacts.search(query);
+      if (results.length === 0) { console.log("No matches."); break; }
+      console.log(`${results.length} result(s):\n`);
+      for (const c of results) {
+        console.log(formatContact(c));
+        console.log();
+      }
+      break;
+    }
+
+    case "get": {
+      const name = flag("name");
+      const id = flag("id");
+      const contact = contacts.get({ name, id: id ? parseInt(id, 10) : undefined });
+      if (!contact) { console.log("Contact not found."); break; }
+      console.log(formatContact(contact));
+      break;
+    }
+
+    case "list": {
+      const all = contacts.list();
+      if (all.length === 0) { console.log("No contacts saved."); break; }
+      console.log(`${all.length} contact(s):\n`);
+      for (const c of all) {
+        console.log(formatContact(c));
+        console.log();
+      }
+      break;
+    }
+
+    default:
+      usage();
+  }
+})();

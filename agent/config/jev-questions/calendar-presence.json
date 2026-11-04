@@ -1,0 +1,22 @@
+{
+  "_doc": "Calendar beats the travel database (lib/calendar-presence.js, producer lib/calendar-presence-refresh.mjs). One question set per (home-zone day, timeline city): the day-level `away` boolean from away_question, plus one boolean per event (keys e0..eN, {{n}} = the event's n in state.events) from event_question. Code takes the flagged events' earliest start and latest end, clipped to the day, as the away window, and applies it WEAKEN-ONLY: it can turn an 'in {{city}}' into 'away', never the reverse. Below threshold (or no Jev) there is no override and presence is exactly the timeline's. Confidence = the day-level answer's. An installation whose calendar holds entries that never place the user anywhere (guest stays at a property the user lets out, its upkeep, a partner's own entries) replaces this file with its own data/jev-questions/calendar-presence.json that names them.",
+  "threshold": 0.8,
+  "notes": "The motivating kind of day: timeline in the home city all day; calendar 'Train to <town>' 15:00-17:10, 'Walk to <bar>' 18:15, 'Dinner with <friends>' 18:45-20:15, 'Train back' 20:45-23:00, every location null. Expected: away=true, e0..e3 true, window 15:00-23:00 local, so a 10am home-city item that day still reads IN. A day of ordinary home-city errands, meals and calls must be away=false.",
+  "away_question": {
+    "type": "boolean",
+    "instructions": "`state` is one day ({{date}}) of {{owner_name}}'s calendar. The travel timeline says {{owner_name}} is in `timeline_city` ({{city}}) that day. Do these calendar events show that {{owner_name}} is physically OUTSIDE {{city}} for part of this day — travelling to, or spending time in, a different city or town (a train or flight out, a visit, a stay, a day trip)? Meals, errands, meetings, calls, appointments and shows that could be inside {{city}} do NOT count, and neither does an event that only mentions another place without {{owner_name}} going there (a call with someone abroad, a delivery, a video meeting). Guest reservations at a property {{owner_name}} lets out ('Stay at …' with a booking-platform confirmation and a guest count in the note) and its upkeep (cleaning, pool service, trash, repairs, contractor visits) happen without {{owner_name}} and never place {{owner_name}} anywhere. When the titles do not make it clear that {{owner_name}} leaves {{city}}, the answer is false.",
+    "criteria": {
+      "true": "at least one event clearly puts {{owner_name}} in, or on the way to or back from, a city or town other than {{city}} during this day",
+      "false": "nothing clearly takes {{owner_name}} out of {{city}} this day"
+    }
+  },
+  "event_question": {
+    "type": "boolean",
+    "instructions": "`state` is one day ({{date}}) of {{owner_name}}'s calendar; the travel timeline says {{owner_name}} is in {{city}}. Read the whole day for context. During event number {{n}} (the entry with n = {{n}}), is {{owner_name}} outside {{city}} or travelling to or from somewhere outside it? An event in the middle of a day trip (a dinner in the other city, the walk there) counts, as do the trips out and back. An event that takes place in {{city}}, or one that does not involve {{owner_name}} being anywhere else, does not. Guest stays at a property {{owner_name}} lets out, and its upkeep, are always false.",
+    "criteria": {
+      "true": "during this event {{owner_name}} is away from {{city}} or travelling to or from somewhere else",
+      "false": "during this event {{owner_name}} is in {{city}}, or the event does not place {{owner_name}} anywhere else"
+    }
+  },
+  "questions": {}
+}

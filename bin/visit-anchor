@@ -1,0 +1,604 @@
+#!/usr/bin/env python3
+"""visit-anchor — recompute a visit's coordinate from the fixes it actually contains.
+
+THE BUG THIS EXISTS FOR. A visit row's latitude/longitude is
+whatever `CLVisit.coordinate` said, stored verbatim by the iOS client
+(LocationTracker.swift `didVisit`), and its address is Apple's CLGeocoder run on
+that same single point. Nothing ever looks at the breadcrumb fixes recorded
+DURING the stay. So the stored anchor is one iOS-supplied guess, carrying
+whatever error `visit.horizontalAccuracy` admits to — and the address inherits
+all of it.
+
+In the case that motivated it, a home visit row was geocoded to the building
+one block over, from an anchor 100m away whose own accuracy_m was 106, while
+the 27 good fixes recorded around home that day had a median point 28m from the
+real door. The data knew; the row threw it away. A cafe stop showed the same:
+stored anchor 38m out and geocoded two street numbers off, median of the 13
+dwell fixes 16m out.
+
+Reverse-geocoding a +/-106m point to a street NUMBER is the compounding error:
+you get whichever building happens to be nearest the noise. So when the anchor
+moves far enough that the old address describes a different building, this drops
+the address rather than leaving a confident-looking wrong one in place — venue
+identity belongs to the enrichment pipeline, which asks the user. The old values
+are preserved in `notes` so nothing is lost.
+
+WHY A GEOMETRIC MEDIAN, NOT A MEAN. A visit window's fixes are not symmetric
+noise around the venue: they include the approach and the departure, which are
+one-sided and can be hundreds of metres out. A mean is dragged by exactly those.
+The geometric median (Weiszfeld) is the point minimising total distance to all
+fixes; it ignores a minority of far-flung samples entirely. Coordinate-wise
+medians were rejected because in 2D they can land off the cluster when the fixes
+lie along a diagonal — a street, which is the common case here.
+
+WHY IT REFUSES SOME ROWS. If the contributing fixes are spread wider than
+DWELL_MAX_SPREAD_M, the window is not a dwell at all — it is a walk that iOS
+labelled a visit, and the "centre" of a walk is a point the user never stood at. Those
+are reported and left alone; recentring them would invent precision.
+
+Usage:
+  visit-anchor <YYYY-MM-DD> [--tz <IANA zone>] [--apply] [--json]
+  visit-anchor --visit <uuid> [--apply]
+
+Dry-run by default. --apply writes.
+"""
+import argparse
+import json
+import math
+import os
+import sys
+import urllib.parse
+import urllib.request
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+sys.path.insert(0, os.path.join(HERE, "..", "lib"))
+import places_local  # noqa: E402
+import supabase_local  # noqa: E402
+
+SUPABASE_URL = supabase_local.supabase_url()
+
+# A fix worse than this is a cell/WiFi fallback (Apple reports 1414 m for those),
+# not a GPS observation. Letting one into the median drags the anchor across a
+# whole district.
+ACC_MAX_M = 60.0
+# Below this many contributing fixes the median has no more authority than the
+# CLVisit guess it would replace, so the row is left alone.
+MIN_FIXES = 3
+# Median distance from the fitted anchor. Past this the window is a walk, not a
+# stay — see WHY IT REFUSES SOME ROWS above.
+DWELL_MAX_SPREAD_M = 150.0
+# Don't rewrite a row for a change smaller than the fixes' own resolution.
+MOVE_APPLY_MIN_M = 10.0
+# Coverage (how much of the stay we actually observed) is RECORDED but is not a
+# refusal, because low coverage is ambiguous in a way spread is not. A phone
+# stops reporting when it stops moving, so silence mid-stay is usually evidence
+# OF stillness: one observed stay was 68 minutes with 11 fixes agreeing inside
+# 2.5m and then 51 minutes of quiet, and refusing that threw away the
+# best-determined anchor of the day. What actually distinguishes a stay we can
+# locate from one we cannot is whether its own fixes AGREE — which is `spread`,
+# below. The 2026-08-10 home stay (six fixes, all edges, all `walking`) is
+# caught there on 205m of disagreement, not by any coverage rule.
+# Any move we bothered to apply invalidates a reverse-geocoded street address:
+# a street NUMBER claims ~10m of precision, so a point we have just shifted by
+# tens of metres no longer supports it. The exception is `user-confirmed` rows —
+# that address is the user's own words, not a geocode of the anchor, so moving
+# the anchor makes it MORE right, not less. Clearing it once deleted a correct
+# user-given address at the exact moment the anchor moved to within 19m of that
+# door.
+PROTECTED_ADDRESS_TYPES = {"user-confirmed", "non-stop"}
+
+
+# Not "somewhere the user stopped" in the sense the question means. Short-let
+# flats are indexed by the dozen on any dense city street and carry no opening
+# hours, no shopfront and no reason to be entered; transit nodes and trade
+# offices are things passed, not visited. Demoted, never dropped — on a travel
+# day a hotel is exactly the answer.
+DEMOTED_PLACE_TYPES = {
+    "lodging", "apartment_complex", "apartment_building", "real_estate_agency",
+    "general_contractor", "bus_stop", "transit_station", "subway_station",
+    "train_station", "parking", "atm", "storage", "moving_company",
+}
+
+
+def candidates_for(lat, lon, accuracy_m=10.0, radius=60, top=4):
+    """What Google says is AT this point. Every stop we judge stable gets this.
+
+    Requirement: always use the Places API to find the most likely places near
+    an identified stop. It belongs HERE rather than only
+    in the enrichment queue because a candidate list is only as good as the
+    coordinate it was queried at, and this tool MOVES coordinates — one stop
+    shifted 118m, so its queued candidates described the old point. The venue
+    it actually was sat 16m from the fitted anchor and was never confirmed
+    because nothing re-asked.
+
+    Returns [] on a spent Places budget or a missing key — an anchor fit is
+    still worth having without names.
+    """
+    try:
+        from places_nearby import nearby
+    except Exception:
+        return []
+    out = nearby(lat, lon, radius=radius, max_results=20)
+    # Rank, don't just measure. Sorting on raw distance let Google's indexed
+    # short-let listings bury the answer: one stop came back as a
+    # short-let flat (7m), two back offices (11m, 17m) and a second flat, with
+    # the cafe itself off the list entirely. A dense city street has dozens of
+    # these and they are never what the user means by a stop.
+    # Demoted rather than dropped — a hotel IS a stop on a travel day, it just
+    # must not outrank an open venue a few metres further away.
+    # Inside a distance TIE, popularity decides. Google returns one building
+    # centroid for every business at an address, so a dense block hands back
+    # seven venues at an identical 14.2m and distance stops carrying any
+    # information between them. Ranking on it alone pushed a bakery (16.2m,
+    # one the user had actually been to) below an unrated back office, a
+    # caterer and a vet that merely shared a doorway. Distance is therefore
+    # banded to 10m — the resolution it genuinely has — and reviews break the
+    # tie, because a place with hundreds of them is a destination and a place
+    # with none is a back office.
+    def rank(p):
+        t = set(p.get("types") or []) | {p.get("primary_type") or ""}
+        # Band width is the ANCHOR'S OWN UNCERTAINTY, not a tuned constant.
+        # Two candidates whose distances differ by less than that are not
+        # distinguishable by distance, so ordering them on it is noise. Picking
+        # the number any other way would be fitting it to the two labelled
+        # examples on hand, which is how you get a
+        # ranker that works on exactly those two.
+        band = max(10.0, 2.0 * (accuracy_m or 10.0))
+        return (1 if t & DEMOTED_PLACE_TYPES else 0,
+                int(p.get("distance_m", 1e9) // band),
+                -(p.get("reviews") or 0))
+    return sorted(out, key=rank)[:top]
+
+
+def load_key():
+    k = supabase_local.service_key()
+    if k and SUPABASE_URL:
+        return k
+    sys.exit("Supabase not configured (supabase_project in instance.json, SUPABASE_SERVICE_ROLE_KEY in env or .env)")
+
+
+def _req(path, method="GET", body=None, key=None):
+    headers = {"apikey": key, "Authorization": f"Bearer {key}",
+               "Accept": "application/json"}
+    data = None
+    if body is not None:
+        headers["Content-Type"] = "application/json"
+        headers["Prefer"] = "return=minimal"
+        data = json.dumps(body).encode()
+    req = urllib.request.Request(f"{SUPABASE_URL}/rest/v1/{path}",
+                                 data=data, headers=headers, method=method)
+    with urllib.request.urlopen(req, timeout=45) as r:
+        raw = r.read()
+        return json.loads(raw) if raw else None
+
+
+def meters(lat1, lon1, lat2, lon2):
+    """Planar approximation. Exact enough at the scale of one stop (<2 km)."""
+    dlat = (lat2 - lat1) * 111320.0
+    dlon = (lon2 - lon1) * 111320.0 * math.cos(math.radians((lat1 + lat2) / 2))
+    return math.hypot(dlat, dlon)
+
+
+def geometric_median(points, weights, iters=64, tol=1e-9):
+    """Weiszfeld's algorithm, in degrees, weighted by 1/accuracy**2.
+
+    The epsilon in the denominator is not cosmetic: when the estimate lands
+    exactly on a sample (common once several fixes share a coordinate, which
+    happens whenever the phone sits still) the unguarded update divides by zero.
+    """
+    lat = sum(p[0] * w for p, w in zip(points, weights)) / sum(weights)
+    lon = sum(p[1] * w for p, w in zip(points, weights)) / sum(weights)
+    coslat = math.cos(math.radians(lat)) or 1e-6
+    for _ in range(iters):
+        num_lat = num_lon = den = 0.0
+        for (plat, plon), w in zip(points, weights):
+            d = math.hypot((plat - lat), (plon - lon) * coslat)
+            inv = w / max(d, 1e-9)
+            num_lat += plat * inv
+            num_lon += plon * inv
+            den += inv
+        nlat, nlon = num_lat / den, num_lon / den
+        if math.hypot(nlat - lat, (nlon - lon) * coslat) < tol:
+            lat, lon = nlat, nlon
+            break
+        lat, lon = nlat, nlon
+    return lat, lon
+
+
+def analyse(visit, fixes):
+    """Fit an anchor to one visit. Returns a verdict dict — never writes."""
+    usable = [f for f in fixes
+              if f.get("latitude") is not None
+              and f.get("accuracy_m") is not None
+              and f["accuracy_m"] < ACC_MAX_M]
+    out = {
+        "id": visit["id"],
+        "arrived_at": visit["arrived_at"],
+        "place_name": visit.get("place_name"),
+        "address": visit.get("address"),
+        "old_lat": visit["latitude"],
+        "old_lon": visit["longitude"],
+        "old_accuracy_m": visit.get("accuracy_m"),
+        "n_fixes": len(usable),
+    }
+    if len(usable) < MIN_FIXES:
+        out["action"] = "skip"
+        out["reason"] = f"only {len(usable)} usable fix(es), need {MIN_FIXES}"
+        return out
+
+    def _t(row):
+        return datetime.fromisoformat(row["arrived_at"].replace("Z", "+00:00"))
+
+    usable.sort(key=_t)
+    arr, dep = _t(visit), datetime.fromisoformat(
+        visit["departed_at"].replace("Z", "+00:00"))
+    stay_s = max((dep - arr).total_seconds(), 1.0)
+    times = [_t(f) for f in usable]
+
+    # Largest stretch of the stay we never observed, including the run-in from
+    # the arrival and the run-out to the departure.
+    edges = [arr] + times + [dep]
+    gap_s = max((edges[i + 1] - edges[i]).total_seconds()
+                for i in range(len(edges) - 1))
+    out["max_gap_min"] = round(gap_s / 60, 1)
+    out["coverage"] = round(1.0 - gap_s / stay_s, 2)
+
+    # TIME weight, not sample count. Fixes arrive in bursts when the phone is
+    # moving and stop entirely when it is still, so counting samples lets a
+    # 14-second departure burst outvote an hour of sitting — it drags the anchor
+    # to precisely the edge the geometric median was chosen to resist. Each fix
+    # instead carries the span of time it represents (half the gap either side).
+    # ZERO-ORDER HOLD, not trapezoidal. A gap inside a stay means the phone
+    # stopped reporting, and a phone stops reporting when it stops moving — so
+    # the unobserved stretch belongs to the fix BEFORE it, not split with the
+    # one after. Splitting hands half of every gap to the fix on the far side,
+    # which is the departure: one stay (68 min, 11 fixes clustered inside
+    # 6m, then a 51-minute silence, then one fix 168m away on the way out) fitted to that departure fix and wanted to move the anchor 168m off a
+    # stop it had previously called correct to within 4m.
+    pts, wts = [], []
+    for i, f in enumerate(usable):
+        hold = ((times[i + 1] if i + 1 < len(times) else dep) - times[i]).total_seconds()
+        if i == 0:
+            hold += (times[0] - arr).total_seconds()   # lead-in belongs to the first fix
+        # Floored so duplicate rows sharing a stamp still count for something,
+        # but never for more than a moment.
+        pts.append((f["latitude"], f["longitude"]))
+        wts.append(max(hold, 1.0) / max(f["accuracy_m"], 5.0) ** 2)
+
+    lat, lon = geometric_median(pts, wts)
+
+    dists = sorted(meters(lat, lon, p[0], p[1]) for p in pts)
+    spread = dists[len(dists) // 2]          # median offset of contributing fixes
+    moved = meters(visit["latitude"], visit["longitude"], lat, lon)
+
+    out.update({
+        "new_lat": lat, "new_lon": lon,
+        "moved_m": round(moved, 1),
+        "spread_m": round(spread, 1),
+        # Uncertainty OF THE MEDIAN, which shrinks with sample count — not the
+        # spread itself. Floored at 10m: no phone-derived anchor is better.
+        "new_accuracy_m": round(max(10.0, spread / math.sqrt(len(pts))), 1),
+    })
+    if spread > DWELL_MAX_SPREAD_M:
+        out["action"] = "refuse"
+        out["reason"] = (f"fixes spread {spread:.0f}m (>{DWELL_MAX_SPREAD_M:.0f}m) "
+                         f"— this window is movement, not a stay")
+        return out
+    if moved < MOVE_APPLY_MIN_M:
+        out["action"] = "unchanged"
+        out["reason"] = f"anchor already within {moved:.0f}m of the fitted median"
+        return out
+    out["action"] = "update"
+    out["invalidate_address"] = (
+        bool(visit.get("address"))
+        and visit.get("place_type") not in PROTECTED_ADDRESS_TYPES
+    )
+    return out
+
+
+def apply(verdict, visit, key):
+    patch = {
+        "latitude": verdict["new_lat"],
+        "longitude": verdict["new_lon"],
+        "accuracy_m": verdict["new_accuracy_m"],
+    }
+    note_bits = [
+        f"anchor recomputed {verdict['moved_m']:.0f}m from CLVisit point "
+        f"({verdict['n_fixes']} fixes, spread {verdict['spread_m']:.0f}m) by visit-anchor",
+        f"was {verdict['old_lat']:.6f},{verdict['old_lon']:.6f} "
+        f"acc={verdict['old_accuracy_m']}",
+    ]
+    if verdict.get("invalidate_address"):
+        # Preserve before dropping — this is the only copy once the column is null.
+        note_bits.append(f"address cleared (was: {visit.get('address')!r}"
+                         f"{', ' + repr(visit.get('neighborhood')) if visit.get('neighborhood') else ''})")
+        patch["address"] = None
+        patch["neighborhood"] = None
+    existing = (visit.get("notes") or "").strip()
+    patch["notes"] = ((existing + " | ") if existing else "") + "; ".join(note_bits)
+    _req(f"location_history?id=eq.{urllib.parse.quote(visit['id'])}",
+         method="PATCH", body=patch, key=key)
+
+
+# --- cross-visit place anchors -------------------------------------------
+#
+# A single stay often cannot locate itself. One home stay ran 65
+# minutes and every one of its six in-window fixes was classified `walking` —
+# they are the approach and the departure, because the phone samples when it
+# moves and goes quiet when it does not. Fitting that window yields the
+# pavement, not the door, which is how a home was recorded as the building one
+# block over.
+#
+# But the user sleeps there. Pooled across nights, the STATIONARY fixes near that
+# address put the door within ~28m — the information exists, just never inside
+# any one visit window. So a place is fitted from every fix at rest near it,
+# across all of them.
+#
+# MOVING FIXES ARE EXCLUDED, and that is the whole trick. A fix labelled
+# walking/driving is by construction not where the user settled; including them is
+# what drags an anchor onto the street. `unknown` is kept — it is the phone
+# declining to classify, not evidence of motion, and it is most of what a
+# stationary phone reports.
+MOVING_ACTIVITIES = {"walking", "running", "cycling", "scooting", "driving", "automotive"}
+# Two visit anchors this close seed the same place. 60m, not the 100m first
+# tried: on a dense central street 100m spans several buildings, and the first
+# 90-day fit duly pooled three neighbouring street numbers and a dog-walk route
+# into single clusters whose centre was nowhere in particular. The wide-fit
+# guard caught those, but catching a bad cluster is worse than not forming it —
+# a pooled cluster also drags its members' snap radius out with it. Overridable
+# with --cluster-radius so the tradeoff can be re-measured rather than re-argued.
+CLUSTER_RADIUS_M = 60.0
+PLACE_FIX_RADIUS_M = 150.0   # fixes this near the estimate inform it
+MEAN_SHIFT_ITERS = 4
+# Past this the "place" is several distinct stops along one street pooled into
+# a centre that is nowhere in particular — see the apply guard in run_places.
+PLACE_MAX_SPREAD_M = 50.0
+
+
+def cluster_visits(visits, radius_m=CLUSTER_RADIUS_M):
+    """Greedy single-link clustering of visit anchors. Order-dependent by
+    design: seeded from the longest stays first, so a place is defined by where
+    the user actually spent time rather than by whichever row happened to sort first.
+    """
+    ordered = sorted(
+        visits,
+        key=lambda v: -(datetime.fromisoformat(v["departed_at"].replace("Z", "+00:00"))
+                        - datetime.fromisoformat(v["arrived_at"].replace("Z", "+00:00"))
+                        ).total_seconds() if v.get("departed_at") else 0)
+    clusters = []
+    for v in ordered:
+        for c in clusters:
+            if meters(c["lat"], c["lon"], v["latitude"], v["longitude"]) <= radius_m:
+                c["visits"].append(v)
+                break
+        else:
+            clusters.append({"lat": v["latitude"], "lon": v["longitude"], "visits": [v]})
+    return clusters
+
+
+def fit_place(lat, lon, since_iso, key):
+    """Mean-shift to the local mode of at-rest fixes. Returns None if too few.
+
+    Iterating matters: the seed is a cluster of CLVisit guesses, each carrying
+    its own error, so the first gather is centred slightly off and pulls in a
+    lop-sided set of fixes. Re-gathering around each new estimate walks it onto
+    the density peak.
+    """
+    for _ in range(MEAN_SHIFT_ITERS):
+        dlat = PLACE_FIX_RADIUS_M / 111320.0
+        dlon = PLACE_FIX_RADIUS_M / (111320.0 * max(math.cos(math.radians(lat)), 1e-6))
+        rows = _req(
+            "location_history?select=latitude,longitude,accuracy_m,activity,arrived_at"
+            f"&arrived_at=gte.{urllib.parse.quote(since_iso)}"
+            f"&latitude=gte.{lat - dlat}&latitude=lte.{lat + dlat}"
+            f"&longitude=gte.{lon - dlon}&longitude=lte.{lon + dlon}"
+            "&order=arrived_at.asc&limit=5000", key=key) or []
+        at_rest = [r for r in rows
+                   if r.get("accuracy_m") is not None and r["accuracy_m"] < ACC_MAX_M
+                   and (r.get("activity") or "unknown") not in MOVING_ACTIVITIES
+                   and meters(lat, lon, r["latitude"], r["longitude"]) <= PLACE_FIX_RADIUS_M]
+        if len(at_rest) < MIN_FIXES:
+            return None
+        pts = [(r["latitude"], r["longitude"]) for r in at_rest]
+        wts = [1.0 / max(r["accuracy_m"], 5.0) ** 2 for r in at_rest]
+        nlat, nlon = geometric_median(pts, wts)
+        if meters(lat, lon, nlat, nlon) < 1.0:
+            lat, lon = nlat, nlon
+            break
+        lat, lon = nlat, nlon
+
+    d = sorted(meters(lat, lon, p[0], p[1]) for p in pts)
+    return {"lat": lat, "lon": lon, "n_fixes": len(pts),
+            "spread_m": round(d[len(d) // 2], 1)}
+
+
+def run_places(args, key):
+    since = (datetime.now(timezone.utc) - timedelta(days=args.days))
+    since_iso = since.isoformat()
+    visits = _req(
+        "location_history?segment_type=eq.visit&departed_at=not.is.null"
+        f"&arrived_at=gte.{urllib.parse.quote(since_iso)}"
+        "&select=id,latitude,longitude,arrived_at,departed_at,place_name,place_type"
+        "&order=arrived_at.asc&limit=5000", key=key) or []
+
+    out = []
+    for c in cluster_visits(visits, radius_m=args.cluster_radius):
+        days = {v["arrived_at"][:10] for v in c["visits"]}
+        if len(c["visits"]) < args.min_visits or len(days) < 2:
+            continue
+        fit = fit_place(c["lat"], c["lon"], since_iso, key)
+        if not fit:
+            continue
+        fit.update({
+            "n_visits": len(c["visits"]), "n_days": len(days),
+            "seed_lat": c["lat"], "seed_lon": c["lon"],
+            "moved_from_seed_m": round(meters(c["lat"], c["lon"], fit["lat"], fit["lon"]), 1),
+            "labels": sorted({v.get("place_name") for v in c["visits"] if v.get("place_name")})[:3],
+            "member_ids": [v["id"] for v in c["visits"]],
+        })
+        out.append(fit)
+    # Mean-shift converges to the density mode, so two seed clusters either side
+    # of one place walk onto the SAME point and would then be reported — and
+    # snapped — as two places. In one 90-day fit the home cluster (18 visits)
+    # and a cluster of neighbouring street numbers (7 visits) both fitted to within 37m of the same door. Merge on the fitted
+    # anchors, which is the only place that convergence is visible.
+    merged = []
+    for p in sorted(out, key=lambda p: -p["n_visits"]):
+        for q in merged:
+            if meters(q["lat"], q["lon"], p["lat"], p["lon"]) <= args.cluster_radius:
+                q["n_visits"] += p["n_visits"]
+                q["n_days"] = max(q["n_days"], p["n_days"])
+                q["member_ids"] = list(dict.fromkeys(q["member_ids"] + p["member_ids"]))
+                q["labels"] = sorted(set(q["labels"]) | set(p["labels"]))[:3]
+                break
+        else:
+            merged.append(p)
+    out = sorted(merged, key=lambda p: -p["n_visits"])
+
+    if args.apply:
+        for p in out:
+            # A wide fit is not a place. 10 of the 35 clusters found in one
+            # run spread past 50m — those pool several distinct stops along one
+            # street (neighbouring street numbers, a dog-walk route) into a centre that is nowhere in particular.
+            # Snapping to it would move correct anchors onto a fiction.
+            if p["spread_m"] > PLACE_MAX_SPREAD_M:
+                p["skipped_wide"] = True
+                continue
+            # Membership is recomputed against the FITTED anchor, not inherited
+            # from the seed cluster. Seed clusters exist to FIND places; the
+            # visits that most need a place anchor are exactly the ones whose
+            # own coordinate is furthest off, so they are the first to fall out
+            # of a tight seed radius. At 60m the 2026-08-10 home stay never
+            # joined the home cluster at all — its anchor sits ~100m from the
+            # door — and inheriting seed membership left it unsnapped, which is
+            # the one row the whole exercise was for. Nearest place wins, so a
+            # visit cannot be claimed by two.
+            for v in visits:
+                if v.get("place_type") in PROTECTED_ADDRESS_TYPES:
+                    continue
+                d = meters(v["latitude"], v["longitude"], p["lat"], p["lon"])
+                if any(meters(v["latitude"], v["longitude"], o["lat"], o["lon"]) < d
+                       for o in out if o is not p and o["spread_m"] <= PLACE_MAX_SPREAD_M):
+                    continue
+                # Bounded by the radius that INFORMED the fit, not by the seed
+                # radius. Membership was already settled by clustering + merging;
+                # re-deciding it here on a tighter number silently drops exactly
+                # the rows that need the place anchor most. Tightening the seed
+                # radius to 60m stopped the 2026-08-10 home stay from snapping —
+                # its CLVisit anchor sits ~100m from the fitted door, which is
+                # the whole reason that row is wrong.
+                if d < MOVE_APPLY_MIN_M or d > PLACE_FIX_RADIUS_M:
+                    continue
+                _req(f"location_history?id=eq.{urllib.parse.quote(v['id'])}", method="PATCH",
+                     body={"latitude": p["lat"], "longitude": p["lon"],
+                           "accuracy_m": max(10.0, p["spread_m"] / math.sqrt(p["n_fixes"])),
+                           "address": None, "neighborhood": None,
+                           "notes": ((v.get("notes") or "") + " | " if v.get("notes") else "")
+                                    + f"snapped {d:.0f}m to cross-visit place anchor "
+                                      f"({p['n_visits']} visits/{p['n_days']} days, "
+                                      f"{p['n_fixes']} at-rest fixes)"},
+                     key=key)
+                p["applied"] = p.get("applied", 0) + 1
+
+    if args.json:
+        print(json.dumps(out, indent=2, default=str))
+        return
+    print(f"{'visits':>6} {'days':>5} {'fixes':>6} {'spread':>7} {'seed→fit':>9}  label")
+    for p in out:
+        lbl = ", ".join(p["labels"]) or "(unnamed)"
+        print(f"{p['n_visits']:>6} {p['n_days']:>5} {p['n_fixes']:>6} "
+              f"{str(p['spread_m'])+'m':>7} {str(p['moved_from_seed_m'])+'m':>9}  {lbl}"
+              + (f"   [{p['applied']} snapped]" if p.get("applied") else "")
+              + ("   [too wide — not a place]" if p.get("skipped_wide") else ""))
+    print(f"\n{len(out)} recurring place(s) over {args.days}d"
+          f"{'' if args.apply else '  (dry-run; pass --apply to snap member visits)'}")
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("date", nargs="?", help="YYYY-MM-DD")
+    ap.add_argument("--tz", default="UTC", help="timezone the date is expressed in")
+    ap.add_argument("--visit", help="operate on a single visit id")
+    ap.add_argument("--apply", action="store_true", help="write (default: dry-run)")
+    ap.add_argument("--json", action="store_true")
+    ap.add_argument("--places", action="store_true",
+                    help="fit cross-visit anchors for recurring places")
+    ap.add_argument("--days", type=int, default=90, help="--places lookback")
+    ap.add_argument("--min-visits", type=int, default=3, dest="min_visits")
+    ap.add_argument("--cluster-radius", type=float, default=CLUSTER_RADIUS_M,
+                    dest="cluster_radius", help="--places seed/merge radius in metres")
+    args = ap.parse_args()
+    key = load_key()
+
+    if args.places:
+        run_places(args, key)
+        return
+
+    if args.visit:
+        visits = _req(f"location_history?id=eq.{urllib.parse.quote(args.visit)}"
+                      f"&select=*", key=key)
+    else:
+        if not args.date:
+            ap.error("need a date or --visit")
+        tz = ZoneInfo(args.tz)
+        d0 = datetime.strptime(args.date, "%Y-%m-%d").replace(tzinfo=tz)
+        d1 = d0 + timedelta(days=1)
+        visits = _req(
+            "location_history?segment_type=eq.visit&departed_at=not.is.null"
+            f"&arrived_at=gte.{urllib.parse.quote(d0.astimezone(timezone.utc).isoformat())}"
+            f"&arrived_at=lt.{urllib.parse.quote(d1.astimezone(timezone.utc).isoformat())}"
+            "&select=*&order=arrived_at.asc", key=key)
+
+    results = []
+    for v in visits or []:
+        if not v.get("departed_at"):
+            continue
+        fixes = _req(
+            "location_history?segment_type=eq.transit"
+            f"&arrived_at=gte.{urllib.parse.quote(v['arrived_at'])}"
+            f"&arrived_at=lte.{urllib.parse.quote(v['departed_at'])}"
+            "&select=latitude,longitude,accuracy_m,arrived_at", key=key) or []
+        verdict = analyse(v, fixes)
+        if args.apply and verdict["action"] == "update":
+            apply(verdict, v, key)
+            verdict["applied"] = True
+        # A stop we could fit is a stop worth naming. `refuse`/`skip` rows are
+        # movement or unlocatable, so asking Google what is there would spend a
+        # metered call to describe a point the user never stood at.
+        if verdict["action"] in ("update", "unchanged"):
+            verdict["candidates"] = candidates_for(
+                verdict.get("new_lat", v["latitude"]),
+                verdict.get("new_lon", v["longitude"]),
+                accuracy_m=verdict.get("new_accuracy_m") or v.get("accuracy_m") or 10.0)
+        results.append(verdict)
+
+    if args.json:
+        print(json.dumps(results, indent=2, default=str))
+        return
+    tzname = args.tz
+    print(f"{'time':>8}  {'act':<9} {'n':>3} {'moved':>7} {'spread':>7}  {'acc':>11}  label")
+    for r in results:
+        t = datetime.fromisoformat(r["arrived_at"].replace("Z", "+00:00")) \
+            .astimezone(ZoneInfo(tzname)).strftime("%H:%M:%S")
+        acc = (f"{r['old_accuracy_m']:.0f}→{r['new_accuracy_m']:.0f}m"
+               if r.get("new_accuracy_m") else f"{r.get('old_accuracy_m') or 0:.0f}m")
+        label = r.get("place_name") or r.get("address") or "-"
+        if r.get("invalidate_address"):
+            label += "  [address cleared]"
+        print(f"{t:>8}  {r['action']:<9} {r['n_fixes']:>3} "
+              f"{(str(r.get('moved_m','-'))+'m'):>7} {(str(r.get('spread_m','-'))+'m'):>7}  "
+              f"{acc:>11}  {label}")
+        if r.get("reason"):
+            print(f"{'':>8}  └─ {r['reason']}")
+        for c in r.get("candidates") or []:
+            print(f"{'':>8}     · {c['distance_m']:4.0f}m  {c['name']}"
+                  f"  ({c.get('type_display') or c.get('primary_type') or '?'})")
+    n_up = sum(1 for r in results if r["action"] == "update")
+    print(f"\n{len(results)} visit(s); {n_up} would move"
+          f"{' — APPLIED' if args.apply else ' (dry-run; pass --apply to write)'}")
+
+
+if __name__ == "__main__":
+    main()

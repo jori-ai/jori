@@ -1,0 +1,269 @@
+#!/usr/bin/env node
+// imsg — read, search and send iMessage (chat.db + Messages.app).
+//
+// Reads go through lib/imessage-db.js, which decodes attributedBody (on
+// current macOS message.text is NULL for nearly every row, so a text-column
+// reader sees almost nothing). Sends use AppleScript via Messages.app, with
+// the message and address passed as argv so nothing is string-spliced into
+// the script.
+//
+// The realtime inbound stream is the imessage-channel watcher
+// (agent/imessage-channel/), which logs to data/imessage-inbox.jsonl.
+
+"use strict";
+
+const { execFileSync } = require("node:child_process");
+const idb = require("../lib/imessage-db.js");
+
+const argv = process.argv.slice(2);
+const cmd = argv[0] || "help";
+const rest = argv.slice(1);
+
+function opt(name, def) {
+  const i = rest.indexOf(name);
+  if (i === -1) return def;
+  const v = rest[i + 1];
+  rest.splice(i, 2);
+  return v;
+}
+function bool(name) {
+  const i = rest.indexOf(name);
+  if (i === -1) return false;
+  rest.splice(i, 1);
+  return true;
+}
+
+const pad = (n) => String(n).padStart(2, "0");
+function localStamp(iso) {
+  const d = new Date(iso);
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+}
+// `sent --since/--until` take UTC wall-clock strings ("2026-10-26 04:00:00" or
+// "2026-10-26"), as the SQLite strftime of the shell version read them;
+// resolve-day passes the day window's instants this way. An explicit offset
+// or Z is honored.
+function parseUtcClock(s) {
+  if (!s) return null;
+  let v = String(s).trim().replace(" ", "T");
+  if (!v.includes("T")) v += "T00:00:00";
+  if (!/[zZ]|[+-]\d\d:?\d\d$/.test(v)) v += "Z";
+  const ms = new Date(v).getTime();
+  if (Number.isNaN(ms)) throw new Error(`bad date: ${s}`);
+  return ms;
+}
+
+function open() {
+  try {
+    return idb.openChatDb();
+  } catch (err) {
+    console.error(`imsg: cannot open ${idb.CHAT_DB}: ${err.message} (Full Disk Access?)`);
+    process.exit(1);
+  }
+}
+
+function who(m) {
+  return m.from_me ? "Me" : m.sender_name || m.sender;
+}
+
+function osa(lines, args) {
+  const flat = [];
+  for (const l of lines) flat.push("-e", l);
+  return execFileSync("osascript", [...flat, ...args], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
+}
+
+function sendToChat(guid, text) {
+  // Messages' chat ids match chat.guid ("any;+;chat…" / "iMessage;+;chat…").
+  const ids = [guid];
+  const tail = guid.split(";").slice(1).join(";");
+  for (const svc of ["iMessage", "any", "SMS"]) if (!ids.includes(`${svc};${tail}`)) ids.push(`${svc};${tail}`);
+  let lastErr;
+  for (const id of ids) {
+    try {
+      osa(["on run argv", 'tell application "Messages" to send (item 1 of argv) to chat id (item 2 of argv)', "end run"], [text, id]);
+      return id;
+    } catch (err) {
+      lastErr = err;
+    }
+  }
+  throw new Error(`Messages refused every id for ${guid}: ${String(lastErr?.stderr || lastErr?.message || "").trim()}`);
+}
+
+function sendToAddress(addr, text) {
+  osa(
+    [
+      "on run argv",
+      'tell application "Messages"',
+      "set targetService to 1st account whose service type = iMessage",
+      "set targetBuddy to buddy (item 2 of argv) of targetService",
+      "send (item 1 of argv) to targetBuddy",
+      "end tell",
+      "end run",
+    ],
+    [text, addr],
+  );
+}
+
+function contactsLookup(name) {
+  return osa(
+    [
+      "on run argv",
+      'tell application "Contacts"',
+      "set matches to every person whose name contains (item 1 of argv)",
+      'if (count of matches) = 0 then error "No contact found"',
+      "set p to item 1 of matches",
+      "if (count of phones of p) > 0 then return value of item 1 of phones of p",
+      "if (count of emails of p) > 0 then return value of item 1 of emails of p",
+      'error "Contact has no phone or email"',
+      "end tell",
+      "end run",
+    ],
+    [name],
+  );
+}
+
+// The group chat a --chat argument names: a guid, or a unique name/participant match.
+function resolveGroup(db, query) {
+  const groups = db.findChats(query).filter((c) => c.is_group);
+  const exact = groups.filter((g) => g.chat_guid === query || (g.display_name || "").toLowerCase() === query.toLowerCase());
+  const pick = exact.length === 1 ? exact : groups;
+  if (pick.length === 1) return pick[0];
+  if (!pick.length) throw new Error(`no group chat matches '${query}' (try: imsg groups)`);
+  const list = pick.slice(0, 10).map((g) => `  ${g.chat_guid}  ${g.name}`).join("\n");
+  throw new Error(`'${query}' matches ${pick.length} group chats; pass the guid:\n${list}`);
+}
+
+function main() {
+  switch (cmd) {
+    case "chats":
+    case "conversations":
+    case "ls": {
+      const limit = Number(opt("--limit", opt("-n", 25)));
+      const db = open();
+      for (const c of db.recentChats(limit)) {
+        console.log(`${c.name}  (${c.count} msgs, last: ${localStamp(c.last_ts)})`);
+      }
+      return;
+    }
+
+    case "groups": {
+      const limit = Number(opt("--limit", opt("-n", 25)));
+      const db = open();
+      for (const c of db.recentChats(limit * 4).filter((c) => c.is_group).slice(0, limit)) {
+        console.log(`${c.chat_id}  ${c.name}  (${c.count} msgs, last: ${localStamp(c.last_ts)})`);
+      }
+      return;
+    }
+
+    case "read":
+    case "get":
+    case "show": {
+      const limit = Number(opt("--limit", opt("-n", 30)));
+      const days = opt("--days", opt("-d", null));
+      const json = bool("--json");
+      const directOnly = bool("--direct");
+      const contact = rest[0];
+      if (!contact) throw new Error("Usage: imsg read <contact|group> [--limit N] [--days N] [--direct] [--json]");
+      const db = open();
+      const msgs = db.read(contact, { limit, days: days ? Number(days) : null, groups: !directOnly });
+      if (json) return console.log(JSON.stringify(msgs, null, 2));
+      for (const m of msgs) {
+        const where = m.is_group ? ` (${m.chat_name})` : "";
+        console.log(`[${localStamp(m.ts)}]${where} ${who(m)}: ${m.text}`);
+      }
+      return;
+    }
+
+    case "sent": {
+      const since = parseUtcClock(opt("--since", null));
+      const until = parseUtcClock(opt("--until", null));
+      const limit = Number(opt("--limit", opt("-n", 500)));
+      const json = bool("--json");
+      const db = open();
+      const msgs = db.sent({ sinceMs: since, untilMs: until, limit });
+      if (json) {
+        return console.log(JSON.stringify(msgs.map((m) => ({ date: localStamp(m.ts), contact: m.chat_name, is_group: m.is_group, text: m.text }))));
+      }
+      for (const m of msgs) console.log(`[${localStamp(m.ts)}] → ${m.chat_name}: ${m.text}`);
+      return;
+    }
+
+    case "search":
+    case "find": {
+      const limit = Number(opt("--limit", opt("-n", 20)));
+      const query = rest[0];
+      if (!query) throw new Error("Usage: imsg search <query> [--limit N]");
+      const db = open();
+      for (const m of db.search(query, { limit })) {
+        console.log(`[${localStamp(m.ts)}] (${m.chat_name}) ${who(m)}: ${m.text}`);
+      }
+      return;
+    }
+
+    case "send": {
+      const chat = opt("--chat", null);
+      if (chat) {
+        const text = rest[0];
+        if (!text) throw new Error('Usage: imsg send --chat <group name|guid> "<message>"');
+        const db = open();
+        const g = resolveGroup(db, chat);
+        const id = sendToChat(g.chat_guid, text);
+        console.log(`Sent to group ${g.name} (${id}) via iMessage`);
+        return;
+      }
+      const [contact, text] = rest;
+      if (!contact || !text) throw new Error('Usage: imsg send <contact> "<message>"  |  imsg send --chat <group> "<message>"');
+      let addr = contact;
+      if (!(/^[+0-9]/.test(contact) || contact.includes("@"))) {
+        const db = open();
+        const direct = db.findChats(contact).filter((c) => !c.is_group && c.chat_identifier && !c.chat_identifier.startsWith("chat"));
+        addr = direct.length ? direct[direct.length - 1].chat_identifier : null;
+        if (!addr) {
+          try {
+            addr = contactsLookup(contact);
+          } catch (err) {
+            throw new Error(`No contact found for '${contact}': ${String(err.stderr || err.message).trim()}`);
+          }
+        }
+        console.error(`Resolved '${contact}' → ${addr}`);
+      }
+      try {
+        sendToAddress(addr, text);
+      } catch (err) {
+        throw new Error(`Failed to send via iMessage: ${String(err.stderr || err.message).trim()}`);
+      }
+      console.log(`Sent to ${contact} (${addr}) via iMessage`);
+      return;
+    }
+
+    case "help":
+    case "--help":
+    case "-h":
+      console.log(`imsg — CLI for iMessage (read, search, send; 1:1 and groups)
+
+Commands:
+  chats [--limit N]                         Recent conversations (default 25)
+  groups [--limit N]                        Recent group chats with their guid
+  read <contact|group> [--limit N] [--days N] [--direct] [--json]
+                                            Messages in the matching chats (default 30)
+  sent [--since T] [--until T] [--json]     Messages sent by me in a date range
+  search <query> [--limit N]                Search all messages (default 20)
+  send <contact> <message>                  Send a 1:1 iMessage
+  send --chat <group name|guid> <message>   Send into a group chat
+
+Matching: phone, email, chat id, group name, or a Contacts name (also a
+group participant's). Partial match supported. Realtime inbound:
+data/imessage-inbox.jsonl (imessage-channel watcher).`);
+      return;
+
+    default:
+      console.error(`Unknown command: ${cmd}\nRun 'imsg help' for usage.`);
+      process.exit(1);
+  }
+}
+
+try {
+  main();
+} catch (err) {
+  console.error(`imsg: ${err.message}`);
+  process.exit(1);
+}

@@ -1,0 +1,194 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["requests"]
+# ///
+"""
+location-route — Google Routes API for arbitrary origin/destination.
+
+Usage:
+  location-route --from "<street address>" --to "<venue>, <city>" [options]
+
+Options:
+  --from        Origin address or "lat,lon"
+  --to          Destination address or "lat,lon"
+  --mode        DRIVE | TRANSIT | WALK | BICYCLE  (default: TRANSIT)
+  --depart-at   ISO datetime, e.g. 2026-05-07T18:15:00 (default: now; a
+                time without a zone is the home zone's, instance tz)
+  --json        Output raw JSON
+"""
+
+import argparse
+import json
+import os
+import sys
+from datetime import datetime, timezone, timedelta
+from pathlib import Path
+from zoneinfo import ZoneInfo
+
+import requests
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "lib"))
+import supabase_local  # noqa: E402
+
+def load_env():
+    env_path = Path(supabase_local.env_file())
+    if env_path.exists():
+        for line in env_path.read_text().splitlines():
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                k, _, v = line.partition("=")
+                os.environ.setdefault(k.strip(), v.strip())
+
+load_env()
+
+ROUTES_API = "https://routes.googleapis.com/directions/v2:computeRoutes"
+
+MODE_MAP = {
+    "transit": "TRANSIT", "drive": "DRIVE", "driving": "DRIVE",
+    "walk": "WALK", "walking": "WALK", "bicycle": "BICYCLE", "bicycling": "BICYCLE",
+    "TRANSIT": "TRANSIT", "DRIVE": "DRIVE", "WALK": "WALK", "BICYCLE": "BICYCLE",
+}
+
+def parse_args():
+    p = argparse.ArgumentParser(description="Google Routes API lookup")
+    p.add_argument("--from", dest="origin", required=True)
+    p.add_argument("--to", dest="destination", required=True)
+    p.add_argument("--mode", default="TRANSIT")
+    p.add_argument("--depart-at", dest="depart_at", default=None,
+                   help="ISO datetime, e.g. 2026-05-07T18:15:00")
+    p.add_argument("--json", action="store_true")
+    return p.parse_args()
+
+def addr_waypoint(addr):
+    # Try parsing as lat,lon
+    parts = addr.split(",")
+    if len(parts) == 2:
+        try:
+            lat, lon = float(parts[0]), float(parts[1])
+            return {"location": {"latLng": {"latitude": lat, "longitude": lon}}}
+        except ValueError:
+            pass
+    return {"address": addr}
+
+def fmt_duration(seconds):
+    m = round(seconds / 60)
+    if m < 60:
+        return f"{m} min"
+    return f"{m // 60}h {m % 60}min"
+
+def fmt_steps(steps, mode):
+    lines = []
+    for s in steps:
+        travel_mode = s.get("travelMode", "")
+        nav = s.get("navigationInstruction", {})
+        instr = nav.get("instructions", "")
+        dur_s = int(s.get("staticDuration", "0s").rstrip("s"))
+        dist_m = s.get("distanceMeters", 0)
+
+        if travel_mode == "TRANSIT":
+            td = s.get("transitDetails", {})
+            stop_details = td.get("stopDetails", {})
+            dep_stop = stop_details.get("departureStop", {}).get("name", "")
+            arr_stop = stop_details.get("arrivalStop", {}).get("name", "")
+            dep_time = stop_details.get("departureTime", "")
+            arr_time = stop_details.get("arrivalTime", "")
+            transit_line = td.get("transitLine", {})
+            line_name = transit_line.get("nameShort") or transit_line.get("name", "")
+            vehicle = transit_line.get("vehicle", {}).get("type", "")
+            lines.append(f"  [{vehicle} {line_name}] {dep_stop} → {arr_stop}  {fmt_duration(dur_s)}")
+            if dep_time or arr_time:
+                lines.append(f"    depart {dep_time}  arrive {arr_time}")
+        elif travel_mode == "WALK":
+            dist_text = f"{dist_m}m" if dist_m < 1000 else f"{dist_m/1000:.1f}km"
+            lines.append(f"  Walk {dist_text} — {fmt_duration(dur_s)}")
+        else:
+            lines.append(f"  {instr} — {fmt_duration(dur_s)}")
+    return lines
+
+def main():
+    args = parse_args()
+    api_key = os.environ.get("GOOGLE_PLACES_API_KEY") or os.environ.get("GOOGLE_MAPS_API_KEY")
+    if not api_key:
+        print("ERROR: GOOGLE_PLACES_API_KEY not set", file=sys.stderr)
+        sys.exit(1)
+
+    travel_mode = MODE_MAP.get(args.mode.lower(), args.mode.upper())
+
+    # Build departure time in RFC3339 UTC
+    if args.depart_at:
+        dt = datetime.fromisoformat(args.depart_at)
+        if dt.tzinfo is None:
+            # A zone-less time is the home zone's (DST-correct).
+            dt = dt.replace(tzinfo=ZoneInfo(supabase_local.home_tz()))
+    else:
+        # A few seconds' buffer — the API rejects a departureTime that has
+        # already passed by the time the request is received.
+        dt = datetime.now(tz=timezone.utc) + timedelta(seconds=30)
+
+    depart_rfc3339 = dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    body = {
+        "origin": addr_waypoint(args.origin),
+        "destination": addr_waypoint(args.destination),
+        "travelMode": travel_mode,
+        "departureTime": depart_rfc3339,
+        "computeAlternativeRoutes": False,
+        "languageCode": "en-US",
+    }
+
+    if travel_mode == "TRANSIT":
+        body["transitPreferences"] = {"routingPreference": "FEWER_TRANSFERS"}
+    elif travel_mode == "DRIVE":
+        # departureTime is only valid alongside a traffic-aware preference —
+        # the API default (TRAFFIC_UNAWARE) rejects it outright.
+        body["routingPreference"] = "TRAFFIC_AWARE"
+
+    field_mask = "routes.duration,routes.distanceMeters,routes.legs"
+
+    resp = requests.post(
+        ROUTES_API,
+        json=body,
+        headers={
+            "X-Goog-Api-Key": api_key,
+            "X-Goog-FieldMask": field_mask,
+            "Content-Type": "application/json",
+        },
+        timeout=15,
+    )
+
+    if not resp.ok:
+        print(f"ERROR {resp.status_code}: {resp.text}", file=sys.stderr)
+        sys.exit(1)
+
+    data = resp.json()
+
+    if args.json:
+        print(json.dumps(data, indent=2))
+        return
+
+    routes = data.get("routes", [])
+    if not routes:
+        print("No route found.", file=sys.stderr)
+        sys.exit(1)
+
+    route = routes[0]
+    dur_s = int(route.get("duration", "0s").rstrip("s"))
+    dist_m = route.get("distanceMeters", 0)
+    dist_text = f"{dist_m}m" if dist_m < 1000 else f"{dist_m/1000:.1f}km"
+
+    print(f"Route: {args.origin}  →  {args.destination}")
+    print(f"Mode: {travel_mode}  |  Distance: {dist_text}  |  Duration: {fmt_duration(dur_s)}")
+    if args.depart_at:
+        arr = dt + timedelta(seconds=dur_s)
+        print(f"Depart: {dt.strftime('%H:%M')}  →  Arrive: {arr.strftime('%H:%M')}")
+    print()
+
+    legs = route.get("legs", [])
+    for leg in legs:
+        steps = leg.get("steps", [])
+        for line in fmt_steps(steps, travel_mode):
+            print(line)
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,38 @@
+#!/usr/bin/env node
+// meeting-agenda-check — tick a recurring meeting's To Discuss item off (or back on)
+// from the T-15 reminder's checklist.
+//
+//   meeting-agenda-check [--meeting <id>] --item "<the To Discuss line's text, exactly>" (--done | --open)
+//
+// Who calls it: the checklist handler for the meeting's checklist kind
+// (lib/choice-reply.mjs), when the user taps an item on the reminder, so items
+// that are completed or no longer relevant can be marked off. The item text
+// comes from the checklist WE attached to the message, never from the user's
+// words. The line flips in place ("- [ ]" ↔ "- [x]", setItemDone) after a
+// backup; nothing else changes.
+//
+// Exit: 0 done (or already in that state, or no meeting configured) · 4 no such To Discuss line · 2 usage.
+import fs from "node:fs";
+import path from "node:path";
+import { setItemDone } from "../lib/meeting-notes-update.mjs";
+import { meeting, notesPath, backupsDir } from "../lib/meetings.mjs";
+
+const arg = (n) => { const i = process.argv.indexOf(`--${n}`); return i >= 0 ? process.argv[i + 1] : null; };
+const item = arg("item"), done = process.argv.includes("--done"), open = process.argv.includes("--open");
+if (!item || done === open) { console.error("usage: meeting-agenda-check [--meeting <id>] --item <text> (--done | --open)"); process.exit(2); }
+
+const m = meeting(arg("meeting"));
+if (!m) { console.error("meeting-agenda-check: no recurring meeting configured (agent/local/config/meetings.json)"); process.exit(0); }
+const NOTES = notesPath(m);
+const text = fs.readFileSync(NOTES, "utf8");
+const next = setItemDone(text, item, done);
+if (next == null) { console.error(`meeting-agenda-check: not a To Discuss line: ${item.slice(0, 80)}`); process.exit(4); }
+if (next !== text) {
+  const backups = backupsDir(m);
+  fs.mkdirSync(backups, { recursive: true });
+  fs.copyFileSync(NOTES, path.join(backups, `${m.backup_prefix}-${new Date().toISOString().replace(/[:.]/g, "-")}.md`)); // lang-regex-ok: ISO timestamp punctuation
+  const tmp = `${NOTES}.tmp.${process.pid}`;
+  fs.writeFileSync(tmp, next);
+  fs.renameSync(tmp, NOTES);
+}
+console.log(JSON.stringify({ meeting: m.id, item, done, changed: next !== text }));

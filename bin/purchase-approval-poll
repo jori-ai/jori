@@ -1,0 +1,158 @@
+#!/usr/bin/env node
+// purchase-approval-poll — DETERMINISTIC executor for Face-ID-approved purchases.
+// No LLM. Cron runs it every minute; each run polls for ~55 s so an approval is
+// acted on within seconds of Face ID, not on the next minute boundary.
+//
+// For each `purchase_approvals` row the app has SIGNED:
+//   1. claim it (signed → executing, conditional PATCH: exactly one runner wins)
+//   2. verify the signature against the PAIRED purchase key for row.signed_by
+//      (purchase_device_keys, written only by the pairing RPC) and that the item
+//      still hashes to what was signed (lib/purchase-approval.mjs)
+//   3. re-read the live shop tab (CDP :9224): still on the approved site, still
+//      showing the approved total + card (+ ship-to ZIP), Place Order still there
+//   4. click the Place Order element recorded at request time, watch the page
+//      move, and report the outcome to the user.
+// Any miss before the click → `failed` / `stale`, nothing is clicked, and the user is
+// told why. Pending rows past their window are marked `expired`.
+
+import fs from "node:fs";
+import path from "node:path";
+import { execFileSync } from "node:child_process";
+import { createRequire } from "node:module";
+import { installRoot } from "../lib/root.cjs";
+
+const ROOT = installRoot();
+for (const l of (() => { try { return fs.readFileSync(path.join(ROOT, ".env"), "utf8").split("\n"); } catch { return []; } })()) {
+  const m = l.match(/^([A-Z_]+)=(.*)$/); if (m && !process.env[m[1]]) process.env[m[1]] = m[2];
+}
+const BASE = process.env.SUPABASE_URL || createRequire(import.meta.url)("../lib/instance.cjs").supabaseUrl();
+const K = process.env.SUPABASE_SERVICE_ROLE_KEY;
+const H = { apikey: K, Authorization: "Bearer " + K, "Content-Type": "application/json" };
+const LOCK = path.join(ROOT, "data/.purchase-approval-poll.lock");
+const LOG = path.join(ROOT, "data/logs/purchase.log");
+
+const P = await import(path.join(ROOT, "lib/purchase-approval.mjs"));
+const B = await import(path.join(ROOT, "lib/shop-browser.mjs"));
+
+function log(msg) {
+  try { fs.mkdirSync(path.dirname(LOG), { recursive: true }); fs.appendFileSync(LOG, `${new Date().toISOString()} ${msg}\n`); } catch {}
+}
+
+async function rest(pathq, { method = "GET", body, prefer } = {}) {
+  const r = await fetch(`${BASE}/rest/v1/${pathq}`, {
+    method, headers: { ...H, ...(prefer ? { Prefer: prefer } : {}) }, body: body ? JSON.stringify(body) : undefined,
+  });
+  if (!r.ok) throw new Error(`supabase ${method} ${pathq.split("?")[0]}: HTTP ${r.status}`);
+  const t = await r.text(); return t ? JSON.parse(t) : null;
+}
+
+const patch = (id, body, extra = "") =>
+  rest(`purchase_approvals?id=eq.${encodeURIComponent(id)}${extra}`, { method: "PATCH", prefer: "return=representation", body });
+
+function tell(text, meta = null) {
+  try {
+    // meta (card=purchase, status=placed) makes the app draw a highlighted green
+    // "Purchase confirmed" card: an approved purchase that goes through gets a
+    // highlighted confirmation in the chat.
+    execFileSync(path.join(ROOT, "bin/jori-send-curl"),
+      ["--skip-precheck", "--intent", "purchase-result", "--agent", "ops",
+       ...(meta ? ["--metadata-json", JSON.stringify(meta)] : []), text], { stdio: "ignore", timeout: 60000 });
+  } catch (e) { log(`notify failed: ${e.message}`); }
+}
+
+async function finish(row, status, result, message) {
+  await patch(row.id, { status, result, executed_at: new Date().toISOString() });
+  log(`${row.id} ${status} ${JSON.stringify(result)}`);
+  if (message) tell(message, status === "placed" ? { card: "purchase", status: "placed", purchase_id: row.id } : null);
+}
+
+async function execute(row) {
+  const item = row.item_json;
+  const what = `the ${item.merchant} order (${P.formatMoney(item.total_cents, item.currency)})`;
+
+  const keys = await rest(`purchase_device_keys?device_id=eq.${encodeURIComponent(row.signed_by)}&select=public_key_raw&limit=1`);
+  const v = P.verifyPurchaseRow(row, keys[0]?.public_key_raw);
+  if (!v.ok) {
+    return finish(row, "failed", { reason: v.reason },
+      `I didn't place ${what}. Your approval didn't check out (${v.reason}), so nothing was clicked and nothing was charged.`);
+  }
+
+  let tab, s;
+  try {
+    tab = await B.workingTab(row.tab_id);
+    s = await B.connect(tab);
+  } catch (e) {
+    return finish(row, "stale", { reason: e.message },
+      `I couldn't place ${what}: the checkout tab is gone (${e.message}). Nothing was charged — ask me again and I'll rebuild the cart.`);
+  }
+  try {
+    const before = await B.pageState(s);
+    if (!P.hostMatchesSite(before.url, item.site)) {
+      return finish(row, "stale", { reason: `tab moved to ${before.url}` },
+        `I didn't place ${what}: the checkout tab had moved off ${item.site}. Nothing was charged.`);
+    }
+    const match = P.pageMatchesItem(before.text, item);
+    if (!match.ok) {
+      return finish(row, "stale", { reason: "page changed", missing: match.missing },
+        `I didn't place ${what}: the checkout page changed after you approved — it no longer shows ${match.missing.join(", ")}. Nothing was charged. Want me to take another look?`);
+    }
+    const btn = await B.describeSelector(s, row.place_selector);
+    if (!btn?.ok) {
+      return finish(row, "stale", { reason: "place-order button gone", count: btn?.count ?? 0 },
+        `I didn't place ${what}: the Place Order button is no longer on the page. Nothing was charged.`);
+    }
+
+    await B.click(s, row.place_selector);
+    log(`${row.id} clicked ${row.place_selector} (${btn.label})`);
+    // Watch for the order to go through: the URL moves, or the button leaves the page.
+    let after = before, moved = false;
+    for (let i = 0; i < 15 && !moved; i++) {
+      await B.sleep(2000);
+      try {
+        after = await B.pageState(s);
+        const still = await B.describeSelector(s, row.place_selector);
+        moved = after.url !== before.url || !still?.ok;
+      } catch {
+        // The tab navigated under our session; reconnect and read the new page.
+        s.close(); s = await B.connect(await B.workingTab(row.tab_id));
+        after = await B.pageState(s); moved = true;
+      }
+    }
+    const result = { clicked: btn.label, before_url: before.url, after_url: after.url, after_title: after.title };
+    if (moved) {
+      return finish(row, "placed", result, P.placedMessage(item, after.title));
+    }
+    return finish(row, "clicked", result,
+      `I clicked Place Order for ${what}, but the page didn't change, so I can't confirm it went through. Worth a look at your ${item.merchant} orders before I try anything else.`);
+  } finally { s?.close(); }
+}
+
+async function tick() {
+  // Expire pending rows past their window (+grace for a signature in flight).
+  const pending = await rest(`purchase_approvals?status=eq.pending&select=id,expires_at_ms`);
+  for (const r of pending) {
+    if (Number(r.expires_at_ms) + P.EXECUTE_GRACE_MS < Date.now()) await patch(r.id, { status: "expired" }, "&status=eq.pending");
+  }
+  const signed = await rest(`purchase_approvals?status=eq.signed&select=*`);
+  for (const r of signed) {
+    const claimed = await patch(r.id, { status: "executing" }, "&status=eq.signed");
+    if (claimed?.length !== 1) continue;
+    try { await execute(claimed[0]); }
+    catch (e) { await finish(claimed[0], "failed", { reason: e.message },
+      `Something went wrong placing the ${claimed[0].item_json?.merchant} order (${e.message}). Check the order page before retrying — I can't tell whether it went through.`); }
+  }
+}
+
+// One runner at a time (cron fires every minute; a run lasts ~55 s).
+try {
+  const st = fs.statSync(LOCK);
+  if (Date.now() - st.mtimeMs < 120000) process.exit(0);
+} catch {}
+fs.writeFileSync(LOCK, String(process.pid));
+try {
+  const until = Date.now() + Number(process.env.PURCHASE_POLL_SECONDS || 55) * 1000;
+  do {
+    await tick().catch((e) => log(`tick error: ${e.message}`));
+    await B.sleep(3000);
+  } while (Date.now() < until);
+} finally { try { fs.unlinkSync(LOCK); } catch {} }

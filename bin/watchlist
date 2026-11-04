@@ -1,0 +1,591 @@
+#!/usr/bin/env node
+// watchlist — manage the shows & movies list (v2: watch_titles / watch_seasons /
+// watch_feedback, see data/migrations/20261004_watch_titles.sql and
+// agent/watchlist-rules.md).
+//
+// Every write resolves the title to exactly ONE row first and stops with the
+// candidate list when the text is ambiguous — no more `ilike %title%` writes.
+
+import {
+  loadAll, insertTitle, patchTitle, patchSeason, upsertSeason, addFeedback, rest,
+  resolveTitle, parseSeasonRef, findExisting, lookupMeta, syncShowSeasons, omdbRating,
+  audienceFrom, kindFrom, normName, todayEt, watchedThrough, hasTmdb,
+  AUDIENCES, VERDICTS,
+} from "../lib/watch-db.mjs";
+import { whereToWatch, regionsToShow, formatWhere, mediaOf, countryName, longAvailability } from "../lib/watch-where.mjs";
+import { PARTNER, PARTNER_NAME, whoFor } from "../lib/watch-config.mjs";
+
+const args = process.argv.slice(2);
+const cmd = args[0];
+
+function flag(name) {
+  const i = args.indexOf(`--${name}`);
+  return i < 0 ? null : (args[i + 1] ?? null);
+}
+const hasFlag = (name) => args.includes(`--${name}`);
+/** Positional words after the command, up to the first --flag. */
+function positionals() {
+  const out = [];
+  for (const a of args.slice(1)) { if (a.startsWith("--")) break; out.push(a); }
+  return out;
+}
+const die = (msg) => { console.error(msg); process.exit(1); };
+const nowIso = () => new Date().toISOString();
+
+// ---------------------------------------------------------------------------
+// formatting
+
+function seasonSummary(t) {
+  if (t.kind !== "show" || !t.seasons?.length) return "";
+  const through = watchedThrough(t);
+  const watching = t.seasons.find((s) => s.status === "watching");
+  const next = t.seasons.find((s) => s.n > through && s.status === "unwatched");
+  const parts = [];
+  if (watching) parts.push(`watching S${watching.n} (${watching.episodes_watched}/${watching.episodes_total ?? "?"})`);
+  else if (through) parts.push(`seen S1${through > 1 ? `–${through}` : ""}`);
+  if (next && (through || watching)) parts.push(next.fully_dropped ? `S${next.n} ready` : `S${next.n} airing${next.finale_date ? ` (finale ${next.finale_date})` : ""}`);
+  if (!through && !watching) {
+    const first = t.seasons.find((s) => s.n >= 1);
+    parts.push(`${t.seasons.length} season${t.seasons.length === 1 ? "" : "s"}${first && !first.fully_dropped ? ", S1 still airing" : ""}`);
+  }
+  return parts.join(", ");
+}
+
+const MARK = { queued: "[ ]", watching: "[▶]", watched: "[x]", dropped: "[-]", rejected: "[✗]" };
+
+function formatEntry(t) {
+  const r = t.imdb_rating ? ` (${t.imdb_rating})` : "";
+  const y = t.year_start ? ` [${t.year_start}${t.year_end && t.year_end !== t.year_start ? "-" + t.year_end : ""}]` : "";
+  const p = t.platform ? ` — ${t.platform}` : "";
+  const ss = seasonSummary(t);
+  const link = t.imdb_id ? `\n   https://www.imdb.com/title/${t.imdb_id}/` : "";
+  return `${MARK[t.status] || "[?]"} ${t.name}${r}${y}${p}${ss ? ` · ${ss}` : ""}${link}`;
+}
+
+function formatFull(t, feedback = []) {
+  const lines = [formatEntry(t)];
+  lines.push(`   ${t.kind} · ${t.audience} · ${t.status}${t.track_seasons ? " · tracking new seasons" : ""}`);
+  if (t.genres) lines.push(`   Genre: ${t.genres}`);
+  if (t.description) lines.push(`   ${t.description}`);
+  for (const s of t.seasons || []) {
+    lines.push(`   S${s.n}: ${s.status}${s.status === "watching" ? ` ${s.episodes_watched}/${s.episodes_total ?? "?"}` : ""}` +
+      ` · ${s.episodes_total ?? "?"} eps · ${s.premiere_date || "?"} → ${s.finale_date || "?"}${s.fully_dropped ? "" : " (still airing)"}`);
+  }
+  const fb = feedback.filter((f) => f.title_id === t.id);
+  for (const f of fb) lines.push(`   Verdict: ${f.verdict}${f.season_n ? ` (S${f.season_n})` : ""}${f.note ? ` — ${f.note}` : ""} [${f.created_at.slice(0, 10)}]`);
+  if (t.source && t.source !== "manual") lines.push(`   Added by ${t.source}${t.source_reason ? `: ${t.source_reason}` : ""}`);
+  return lines.join("\n");
+}
+
+// ---------------------------------------------------------------------------
+// resolution helpers
+
+/** Resolve "<title>" or "<title> Season N" to {title, season}; exits on miss/ambiguity. */
+function resolveRef(titles, text, { seasonFlag = flag("season") } = {}) {
+  if (!text) die("Missing title.");
+  let r = resolveTitle(titles, text);
+  let season = seasonFlag ? parseInt(seasonFlag, 10) : null;
+  if (!r.title) {
+    const ref = parseSeasonRef(text);
+    if (ref.season != null) {
+      const r2 = resolveTitle(titles, ref.base);
+      if (r2.title && r2.title.kind === "show") { r = r2; season = season ?? ref.season; }
+      else if (r2.ambiguous) r = r2;
+    }
+  }
+  if (r.ambiguous) {
+    console.error(`Ambiguous — "${text}" matches ${r.ambiguous.length} titles. Use the exact name or IMDb id:`);
+    for (const t of r.ambiguous) console.error(`  ${t.name} [${t.kind}, ${t.audience}, ${t.status}]${t.imdb_id ? ` ${t.imdb_id}` : ""}`);
+    process.exit(1);
+  }
+  if (!r.title) die(`Not found: "${text}". (Add it with \`watchlist add\`.)`);
+  return { title: r.title, season };
+}
+
+async function ensureSeasons(t) {
+  if (t.kind !== "show") return t;
+  if (t.tmdb_id && hasTmdb()) {
+    try { await syncShowSeasons(t); } catch (e) { console.error(`  (season sync failed: ${e.message})`); }
+    const { titles } = await loadAll();
+    return titles.find((x) => x.id === t.id);
+  }
+  return t;
+}
+
+// ---------------------------------------------------------------------------
+// read commands
+
+async function list() {
+  const { titles } = await loadAll();
+  let rows = titles;
+  const cat = flag("category");
+  const aud = audienceFrom(flag("audience") || (["movies", "documentaries"].includes(cat) ? null : cat));
+  const kind = kindFrom(flag("type") || flag("kind"), cat);
+  if (aud) rows = rows.filter((t) => t.audience === aud);
+  if (kind) rows = rows.filter((t) => t.kind === kind);
+  if (cat === "rejected") rows = rows.filter((t) => t.status === "rejected");
+  if (flag("status")) rows = rows.filter((t) => t.status === flag("status"));
+  if (hasFlag("unwatched")) rows = rows.filter((t) => t.status === "queued");
+  if (hasFlag("watched")) rows = rows.filter((t) => t.status === "watched");
+  if (hasFlag("watching")) rows = rows.filter((t) => t.status === "watching");
+  if (!flag("status") && cat !== "rejected" && !hasFlag("all")) rows = rows.filter((t) => t.status !== "rejected");
+  if (hasFlag("json")) { console.log(JSON.stringify(rows, null, 2)); return; }
+  if (!rows.length) { console.log("No entries found."); return; }
+  const groups = {};
+  for (const t of rows) {
+    const key = t.kind === "show" ? `${t.audience} shows` : t.kind === "movie" ? "movies" : "documentaries";
+    (groups[key] ||= []).push(t);
+  }
+  for (const [g, ts] of Object.entries(groups)) {
+    console.log(`\n${g.toUpperCase()} (${ts.length})`);
+    for (const t of ts) console.log(`  ${formatEntry(t)}`);
+  }
+}
+
+async function search() {
+  const q = positionals().join(" ");
+  if (!q) die("Usage: watchlist search <query>");
+  const { titles, feedback } = await loadAll();
+  const n = normName(q);
+  const hits = titles.filter((t) => [t.name, t.description, t.genres, t.platform].some((f) => normName(f).includes(n)));
+  if (!hits.length) { console.log("No matches."); return; }
+  for (const t of hits) console.log(formatFull(t, feedback) + "\n");
+}
+
+async function info() {
+  const q = positionals().join(" ");
+  if (!q) die("Usage: watchlist info <title>");
+  const { titles, feedback } = await loadAll();
+  const r = resolveTitle(titles, q);
+  const hits = r.title ? [r.title] : r.ambiguous || [];
+  if (!hits.length) {
+    const ref = parseSeasonRef(q);
+    const r2 = ref.season != null ? resolveTitle(titles, ref.base) : {};
+    if (r2.title) hits.push(r2.title);
+  }
+  if (!hits.length) { console.log("Not found."); return; }
+  if (hasFlag("json")) { console.log(JSON.stringify(hits.map((t) => ({ ...t, feedback: feedback.filter((f) => f.title_id === t.id) })), null, 2)); return; }
+  // One title → also say where to press play (live, 7-day cache). Several
+  // ambiguous hits → skip it; the caller has to pick one first anyway.
+  const where = hits.length === 1 ? await whereLines(hits[0]) : null;
+  for (const t of hits) console.log(formatFull(t, feedback) + (where ? `\n${where}` : "") + "\n");
+}
+
+/** "   Where (US): stream: Netflix" lines for formatFull, or null. Never throws. */
+async function whereLines(t) {
+  if (!t.tmdb_id || !hasTmdb()) return null;
+  try {
+    const { regions, local } = await regionsToShow({ override: regionFlag() });
+    const w = await whereToWatch({ media: mediaOf(t), id: t.tmdb_id }, regions);
+    return regions.map((r) => `   Where (${countryName(r)}${r === local ? ", where you are now" : ""}): ${longAvailability(w.regions[r])}`).join("\n");
+  } catch (e) { return `   Where: lookup failed (${e.message})`; }
+}
+
+function regionFlag() {
+  const r = flag("region");
+  return r ? r.split(",").map((x) => x.trim().toUpperCase()).filter((x) => x.length === 2) : null;
+}
+
+/**
+ * where <title> — every way to watch a title in the US, plus the local country
+ * when the travel timeline puts the user abroad. Works for titles that aren't on
+ * the list too (TMDB search), because "where can I watch X" doesn't require X
+ * to be queued.
+ */
+async function where() {
+  const q = positionals().join(" ");
+  if (!q) die("Usage: watchlist where <title> [--region US,IL] [--type show|movie] [--refresh] [--json]");
+  if (!hasTmdb()) die("TMDB_API_KEY missing (.env)");
+  const { titles } = await loadAll();
+  let r = resolveTitle(titles, q);
+  if (r.none) {
+    // "Fauda S4" → Fauda; availability is per title, not per season.
+    const ref = parseSeasonRef(q);
+    if (ref.season != null) { const r2 = resolveTitle(titles, ref.base); if (!r2.none) r = r2; }
+  }
+  if (r.ambiguous) { resolveRef(titles, q); return; }
+  let target = r.title ? { name: r.title.name, media: mediaOf(r.title), id: r.title.tmdb_id, on_list: true } : null;
+  if (r.title && !r.title.tmdb_id) target = null;
+  if (!target) {
+    const base = r.title ? { imdb_id: r.title.imdb_id, name: r.title.name, kind: r.title.kind } : { name: q, kind: kindFrom(flag("type")) };
+    const meta = await lookupMeta(base);
+    if (!meta) die(`No TMDB match for "${q}".`);
+    target = { name: meta.name, media: meta.kind === "show" ? "tv" : "movie", id: meta.tmdb_id, on_list: !!r.title };
+  }
+  const { regions, local, presence } = await regionsToShow({ override: regionFlag() });
+  const w = await whereToWatch({ media: target.media, id: target.id }, regions, { refresh: hasFlag("refresh") });
+  if (hasFlag("json")) {
+    console.log(JSON.stringify({ title: target.name, tmdb: { media: target.media, id: target.id }, on_list: target.on_list, local_region: local, presence_label: presence?.label || null, ...w }, null, 2));
+    return;
+  }
+  console.log(formatWhere(target.name, w, { local }) + (target.on_list ? "" : "\n  (not on the watchlist)"));
+}
+
+async function watching() {
+  const { titles } = await loadAll();
+  const { createRequire } = await import("node:module");
+  const { projectFinaleDate } = createRequire(import.meta.url)("../lib/watching-projection.js");
+  const rows = [];
+  for (const t of titles) for (const s of t.seasons) if (s.status === "watching") rows.push({ t, s });
+  for (const t of titles) if (t.status === "watching" && !t.seasons.some((s) => s.status === "watching")) rows.push({ t, s: null });
+  if (!rows.length) { console.log("Nothing currently in progress."); return; }
+  for (const { t, s } of rows) {
+    console.log(`\n▶ ${t.name}${s ? ` S${s.n}` : ""}  [${t.audience}]`);
+    if (!s) continue;
+    console.log(`   ${s.episodes_watched}/${s.episodes_total || "?"} episodes` + (s.last_watched_date ? `, last on ${s.last_watched_date}` : " (not started yet)"));
+    if (s.episodes_total && s.episodes_watched < s.episodes_total) {
+      try {
+        const p = await projectFinaleDate({
+          last_watched_date: s.last_watched_date || s.started_at,
+          started_at: s.started_at,
+          episodes_remaining: s.episodes_total - s.episodes_watched,
+        });
+        if (p.projected_finale_date) console.log(`   projected finale: ${p.projected_finale_date}`);
+      } catch (e) { console.log(`   [projection failed: ${e.message}]`); }
+    }
+  }
+}
+
+async function notifyList() {
+  const { titles } = await loadAll();
+  const rows = titles.filter((t) => t.track_seasons && t.status !== "rejected" && t.status !== "dropped");
+  if (!rows.length) { console.log("No shows tracked for new seasons."); return; }
+  console.log(`Tracking new seasons for ${rows.length} shows:\n`);
+  for (const t of rows) console.log(`  ${t.name}${t.imdb_rating ? ` — ${t.imdb_rating}` : ""}${t.platform ? ` (${t.platform})` : ""} [${t.audience}]${seasonSummary(t) ? ` · ${seasonSummary(t)}` : ""}`);
+}
+
+async function stats() {
+  const { titles, feedback } = await loadAll();
+  const by = {};
+  for (const t of titles) {
+    const k = t.kind === "show" ? `${t.audience} shows` : `${t.kind}s`;
+    by[k] ||= { total: 0 };
+    by[k].total++;
+    by[k][t.status] = (by[k][t.status] || 0) + 1;
+  }
+  console.log(`Total: ${titles.length} titles, ${feedback.length} verdicts\n`);
+  for (const [k, s] of Object.entries(by)) {
+    const parts = ["queued", "watching", "watched", "dropped", "rejected"].filter((x) => s[x]).map((x) => `${s[x]} ${x}`);
+    console.log(`  ${k}: ${s.total} (${parts.join(", ")})`);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// write commands
+
+async function add() {
+  const name = positionals().join(" ").trim();
+  if (!name) die(`Usage: watchlist add <title> [--type show|movie|documentary] [--audience ${AUDIENCES.join("|")}] ...`);
+  const cat = flag("category");
+  let kind = kindFrom(flag("type"), cat);
+  const audience = audienceFrom(flag("audience") || cat) || "together";
+  const status = cat === "rejected" || flag("status") === "rejected" ? "rejected" : "queued";
+  const imdbFlag = /^tt\d+$/.test(flag("imdb-id") || "") ? flag("imdb-id") : null;
+
+  const { titles } = await loadAll();
+  let meta = null;
+  try { meta = await lookupMeta({ imdb_id: imdbFlag, name, kind, year: flag("year") ? parseInt(flag("year"), 10) : null }); }
+  catch (e) { console.error(`  (TMDB lookup failed: ${e.message})`); }
+  if (meta) kind = kind === "documentary" ? "documentary" : meta.kind;
+  if (!kind) die("--type is required (no TMDB match to infer it from)");
+
+  const dup = findExisting(titles, { imdb_id: meta?.imdb_id || imdbFlag, tmdb_id: meta?.tmdb_id, name: meta?.name || name, kind });
+  if (dup) {
+    console.log(`Already on the list: ${dup.name} [${dup.kind}, ${dup.audience}, ${dup.status}] (id: ${dup.id})`);
+    return;
+  }
+
+  const imdb_id = meta?.imdb_id || imdbFlag;
+  const row = {
+    kind,
+    name: meta?.name || name,
+    imdb_id,
+    tmdb_id: meta?.tmdb_id || null,
+    audience,
+    status,
+    year_start: meta?.year_start || (flag("year") ? parseInt(flag("year"), 10) : null),
+    year_end: meta?.year_end || null,
+    genres: meta?.genres || flag("genre") || null,
+    original_language: meta?.original_language || null,
+    keywords: meta?.keywords || null,
+    platform: flag("platform") || null,
+    imdb_rating: flag("rating") ? parseFloat(flag("rating")) : await omdbRating(imdb_id),
+    description: meta?.description || flag("description") || null, // TMDB overview first: it is the blurb next-show shows
+    source: flag("source") || flag("suggested-by") || "manual",
+    source_reason: (flag("reason") || flag("suggestion-reason") || "").replace(/^\[target=[a-z_]+\]\s*/, "") || null,
+    track_seasons: false,
+  };
+  const t = await insertTitle(row);
+  console.log(`Added: ${t.name} [${t.kind}, ${t.audience}${t.status === "rejected" ? ", rejected" : ""}] (id: ${t.id})`);
+  if (kind === "show" && t.tmdb_id) {
+    const { added } = await syncShowSeasons({ ...t, seasons: [] });
+    if (added.length) console.log(`  ${added.length} season${added.length === 1 ? "" : "s"} from TMDB`);
+  }
+  if (hasFlag("watched")) {
+    const { titles: all } = await loadAll();
+    await doMarkWatched(all.find((x) => x.id === t.id), null, { quiet: false, askFeedback: false });
+  }
+}
+
+/**
+ * Mark a title watched. Shows: through season N (or every fully-dropped season
+ * when N is omitted — "we're caught up"). Only the last season finished gets a
+ * feedback ask; earlier ones are stamped as already-asked.
+ */
+async function doMarkWatched(t, throughN, { askFeedback = true } = {}) {
+  const today = todayEt();
+  if (t.kind !== "show") {
+    await patchTitle(t.id, { status: "watched", ...(askFeedback ? {} : { feedback_requested_at: nowIso() }) });
+    console.log(`${t.name} → watched`);
+    return;
+  }
+  t = await ensureSeasons(t);
+  let seasons = t.seasons;
+  let n = throughN;
+  if (n == null) {
+    const done = seasons.filter((s) => s.fully_dropped || s.status === "watching");
+    n = done.reduce((m, s) => Math.max(m, s.n), 0);
+    if (!n && !seasons.length) n = 1;
+  }
+  if (!n) die(`${t.name}: no fully-dropped season to mark — pass --season N`);
+  for (let i = 1; i <= n; i++) {
+    const s = seasons.find((x) => x.n === i);
+    if (s && s.status === "watched") continue;
+    const patch = { status: "watched", finished_at: today, ...(i === n && askFeedback ? {} : { feedback_requested_at: nowIso() }) };
+    if (s) await patchSeason(s.id, { ...patch, episodes_watched: s.episodes_total ?? s.episodes_watched });
+    else await upsertSeason(t.id, i, { ...patch, fully_dropped: true });
+  }
+  await patchTitle(t.id, { status: "watched", track_seasons: true });
+  const later = seasons.filter((s) => s.n > n);
+  console.log(`${t.name} → watched through S${n}${later.length ? ` (S${later.map((s) => s.n).join(", S")} still unwatched)` : ", caught up"}; tracking new seasons`);
+}
+
+async function markWatched() {
+  const { titles } = await loadAll();
+  const { title, season } = resolveRef(titles, positionals().join(" "), { seasonFlag: flag("season") || flag("through-season") });
+  await doMarkWatched(title, season);
+}
+
+async function markUnwatched() {
+  const { titles } = await loadAll();
+  const { title: t, season } = resolveRef(titles, positionals().join(" "));
+  if (t.kind !== "show") { await patchTitle(t.id, { status: "queued" }); console.log(`${t.name} → unwatched`); return; }
+  for (const s of t.seasons) {
+    if (season != null && s.n !== season) continue;
+    await patchSeason(s.id, { status: "unwatched", episodes_watched: 0, finished_at: null, started_at: null, last_watched_date: null });
+  }
+  const left = t.seasons.filter((s) => s.status === "watched" && season != null && s.n !== season);
+  await patchTitle(t.id, { status: left.length ? "watched" : "queued" });
+  console.log(`${t.name}${season != null ? ` S${season}` : ""} → unwatched`);
+}
+
+async function markWatching() {
+  const { titles } = await loadAll();
+  let { title: t, season } = resolveRef(titles, positionals().join(" "));
+  if (t.kind !== "show") { await patchTitle(t.id, { status: "watching" }); console.log(`${t.name} → watching`); return; }
+  t = await ensureSeasons(t);
+  const today = todayEt();
+  if (season == null) {
+    const through = watchedThrough(t);
+    season = (t.seasons.find((s) => s.n > through && s.status !== "watched" && (!s.premiere_date || s.premiere_date <= today)) || {}).n
+      ?? through + 1;
+  }
+  // Only one season of a show is "watching" at a time.
+  for (const s of t.seasons) if (s.status === "watching" && s.n !== season) await patchSeason(s.id, { status: "unwatched" });
+  const cur = t.seasons.find((s) => s.n === season);
+  if (cur) await patchSeason(cur.id, { status: "watching", started_at: cur.started_at || today });
+  else await upsertSeason(t.id, season, { status: "watching", started_at: today, fully_dropped: true });
+  await patchTitle(t.id, { status: "watching", track_seasons: true });
+  console.log(`${t.name} → watching S${season} (${cur?.episodes_total ? cur.episodes_total + " eps" : "episode count unknown"})`);
+}
+
+async function markNotWatching() {
+  const { titles } = await loadAll();
+  const { title: t } = resolveRef(titles, positionals().join(" "));
+  for (const s of t.seasons) if (s.status === "watching") await patchSeason(s.id, { status: "unwatched" });
+  await patchTitle(t.id, { status: watchedThrough(t) ? "watched" : "queued" });
+  console.log(`${t.name} → not watching`);
+}
+
+async function episodeWatched() {
+  const { titles } = await loadAll();
+  const { title: t } = resolveRef(titles, positionals().join(" "));
+  const s = t.seasons.find((x) => x.status === "watching");
+  if (!s) die(`${t.name} isn't marked as watching. Run \`watchlist mark-watching "${t.name}"\` first.`);
+  const count = flag("count") ? parseInt(flag("count"), 10) : 1;
+  const date = flag("date") || todayEt();
+  const watched = s.episodes_watched + count;
+  if (s.episodes_total && watched >= s.episodes_total) {
+    await patchSeason(s.id, { status: "watched", episodes_watched: s.episodes_total, last_watched_date: date, finished_at: date });
+    await patchTitle(t.id, { status: "watched" });
+    console.log(`  ✓ ${t.name} S${s.n} finished (${s.episodes_total}/${s.episodes_total}) — marked watched`);
+    return;
+  }
+  await patchSeason(s.id, { episodes_watched: watched, last_watched_date: date });
+  console.log(`  ${t.name} S${s.n}: ${watched}/${s.episodes_total || "?"} eps — last ${date}`);
+}
+
+async function rate() {
+  const pos = positionals();
+  const verdict = pos[pos.length - 1];
+  if (!VERDICTS.includes(verdict)) die(`Usage: watchlist rate <title> <${VERDICTS.join("|")}> [--season N] [--note "..."]`);
+  const { titles } = await loadAll();
+  const { title: t, season } = resolveRef(titles, pos.slice(0, -1).join(" "));
+  const sn = season ?? (t.kind === "show" ? watchedThrough(t) || null : null);
+  await addFeedback(t.id, verdict, { season: sn, note: flag("note"), source: flag("source") || "chat" });
+  if (verdict === "dropped") {
+    for (const s of t.seasons) if (s.status === "watching") await patchSeason(s.id, { status: "unwatched" });
+    await patchTitle(t.id, { status: "dropped", track_seasons: false });
+  }
+  if (verdict === "not_interested" && t.status === "queued") await patchTitle(t.id, { status: "rejected" });
+  console.log(`${t.name}${sn ? ` S${sn}` : ""} → ${verdict}${verdict === "dropped" ? " (stopped tracking)" : verdict === "not_interested" && t.status === "queued" ? " (rejected, won't resurface)" : ""}`);
+}
+
+async function reject() {
+  const name = positionals().join(" ");
+  if (!name) die("Usage: watchlist reject <title> [--note \"why\"]");
+  const { titles } = await loadAll();
+  const r = resolveTitle(titles, name);
+  if (r.ambiguous) { resolveRef(titles, name); return; }
+  let t = r.title;
+  if (!t) {
+    // Not on the list — record it anyway so discovery never adds it.
+    let meta = null;
+    try { meta = await lookupMeta({ name, kind: kindFrom(flag("type")) }); } catch {}
+    const dup = meta && findExisting(titles, { imdb_id: meta.imdb_id, tmdb_id: meta.tmdb_id, name: meta.name, kind: meta.kind });
+    t = dup || await insertTitle({
+      kind: meta?.kind || kindFrom(flag("type")) || "show",
+      name: meta?.name || name, imdb_id: meta?.imdb_id || null, tmdb_id: meta?.tmdb_id || null,
+      audience: audienceFrom(flag("audience")) || "together", status: "rejected",
+      year_start: meta?.year_start || null, genres: meta?.genres || null, description: meta?.description || null,
+      source: "manual",
+    });
+  }
+  await patchTitle(t.id, { status: "rejected", track_seasons: false });
+  await addFeedback(t.id, "not_interested", { note: flag("note"), source: flag("source") || "chat" });
+  console.log(`Rejected: ${t.name} — won't resurface`);
+}
+
+async function requeue() {
+  const { titles } = await loadAll();
+  const { title: t } = resolveRef(titles, positionals().join(" "));
+  const patch = { status: watchedThrough(t) ? "watched" : "queued" };
+  const aud = audienceFrom(flag("category") || flag("audience"));
+  if (aud) patch.audience = aud;
+  await patchTitle(t.id, patch);
+  console.log(`${t.name} → ${patch.status}${aud ? ` (${aud})` : ""}`);
+}
+
+async function setAudience() {
+  const pos = positionals();
+  const aud = audienceFrom(pos[pos.length - 1]);
+  if (!aud) die(`Usage: watchlist set-audience <title> <${AUDIENCES.join("|")}>`);
+  const { titles } = await loadAll();
+  const { title: t } = resolveRef(titles, pos.slice(0, -1).join(" "));
+  await patchTitle(t.id, { audience: aud });
+  console.log(`${t.name} → ${aud}`);
+}
+
+async function setAiring(forceDropped = false) {
+  const { titles } = await loadAll();
+  const { title: t, season } = resolveRef(titles, positionals().join(" "));
+  if (t.kind !== "show") die("Airing dates apply to show seasons.");
+  const n = season ?? t.seasons.reduce((m, s) => Math.max(m, s.n), 0);
+  if (!n) die("Pass --season N.");
+  const patch = {};
+  if (flag("premiere-date")) patch.premiere_date = flag("premiere-date");
+  if (flag("finale-date")) patch.finale_date = flag("finale-date");
+  if (hasFlag("airing")) patch.fully_dropped = false;
+  if (hasFlag("fully-dropped") || forceDropped) patch.fully_dropped = true;
+  if (!Object.keys(patch).length) die("Nothing to set — pass --premiere-date / --finale-date / --airing / --fully-dropped");
+  const s = await upsertSeason(t.id, n, patch);
+  console.log(`${t.name} S${n} → premiere=${s.premiere_date || "?"} finale=${s.finale_date || "?"} fully_dropped=${s.fully_dropped}`);
+}
+
+async function sync() {
+  const { titles } = await loadAll();
+  const targets = hasFlag("all")
+    ? titles.filter((t) => t.tmdb_id && t.status !== "rejected")
+    : [resolveRef(titles, positionals().join(" ")).title];
+  for (const t of targets) {
+    if (t.kind !== "show") {
+      // Movies/docs have no seasons; just backfill metadata we rank on.
+      if ((t.original_language && t.keywords) || !t.tmdb_id) continue;
+      try {
+        const m = await lookupMeta({ imdb_id: t.imdb_id, name: t.name, kind: t.kind });
+        if (m) await patchTitle(t.id, { original_language: m.original_language || t.original_language, keywords: m.keywords || t.keywords });
+      } catch (e) { console.error(`${t.name}: ${e.message}`); }
+      continue;
+    }
+    try {
+      const { added, nowDropped } = await syncShowSeasons(t);
+      if (added.length || nowDropped.length) console.log(`${t.name}: +S${added.join(",S") || "-"} dropped:S${nowDropped.join(",S") || "-"}`);
+    } catch (e) { console.error(`${t.name}: ${e.message}`); }
+  }
+}
+
+async function remove() {
+  const { titles } = await loadAll();
+  const name = positionals().join(" ");
+  const r = resolveTitle(titles, name);
+  // Deletion needs an exact name or IMDb id — never a partial match.
+  if (!r.title || (normName(r.title.name) !== normName(name) && r.title.imdb_id !== name)) {
+    die(`remove needs the exact title or IMDb id${r.title ? ` (did you mean "${r.title.name}"?)` : ""}. To keep it from coming back, use \`watchlist reject\` instead.`);
+  }
+  await rest(`watch_titles?id=eq.${r.title.id}`, { method: "DELETE" });
+  console.log(`Removed: ${r.title.name}`);
+}
+
+function usage() {
+  console.log(`watchlist — shows & movies list (Supabase watch_titles / watch_seasons / watch_feedback)
+
+Titles resolve to exactly one row (exact name → prefix → word match, or an IMDb id).
+"<Show> Season N" / "<Show> S2" / --season N target one season.
+Audiences: solo (${whoFor("solo")}'s list) · together (with ${PARTNER_NAME}) · ${PARTNER} (${PARTNER_NAME}'s list).  Old category names still work.
+
+Read:
+  list [--audience A] [--type show|movie|documentary] [--status S] [--unwatched|--watched|--watching] [--all] [--json]
+  search <query>                info <title> [--json]   (info also says where to watch it)
+  where <title> [--region US,IL] [--type show|movie] [--refresh] [--json]
+                                every way to watch it (stream/free/ads/rent/buy) in the US, plus the
+                                local country when the travel timeline has the user abroad; any title,
+                                on the list or not. TMDB/JustWatch, cached 7 days per title.
+  watching                      notify-list                   stats
+
+Viewing state:
+  mark-watched <title> [--season N]     shows: through S<N>, or every fully-dropped season ("caught up")
+  caught-up <title> [--through-season N]  alias of mark-watched
+  mark-watching <title> [--season N]    start a season (episode count from TMDB)
+  episode-watched <title> [--count N] [--date YYYY-MM-DD]   auto-finishes the season at the last episode
+  mark-not-watching <title>             mark-unwatched <title> [--season N]
+
+Feedback (what recommendations learn from):
+  rate <title> <loved|liked|meh|disliked|dropped|not_interested> [--season N] [--note "..."]
+  reject <title> [--note "..."]         not interested — kept so it never resurfaces (adds the row if missing)
+  requeue <title> [--audience A]        undo a reject/drop   (alias: approve)
+
+Editing:
+  add <title> [--type T] [--audience A] [--platform X] [--rating N] [--year N] [--imdb-id tt..] [--source X] [--reason "..."] [--watched]
+                                        dedups on IMDb/TMDB id; metadata + seasons from TMDB
+  set-audience <title> <${AUDIENCES.join("|")}>
+  set-airing <title> [--season N] [--premiere-date D] [--finale-date D] [--airing|--fully-dropped]
+  mark-fully-dropped <title> [--season N]
+  sync <title> | --all                  refresh seasons/air dates from TMDB
+  remove <exact title>                  hard delete (prefer reject)
+`);
+}
+
+const COMMANDS = {
+  list, search, info, where, watching, "notify-list": notifyList, stats,
+  "mark-watched": markWatched, "caught-up": markWatched,
+  "mark-unwatched": markUnwatched, "mark-watching": markWatching, "mark-not-watching": markNotWatching,
+  "episode-watched": episodeWatched,
+  rate, reject, requeue, approve: requeue, "set-audience": setAudience,
+  add, "set-airing": () => setAiring(false), "mark-fully-dropped": () => setAiring(true),
+  sync, remove,
+};
+
+if (COMMANDS[cmd]) {
+  try { await COMMANDS[cmd](); }
+  catch (e) { die(`watchlist ${cmd}: ${e.message}`); }
+} else usage();

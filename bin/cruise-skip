@@ -1,0 +1,92 @@
+#!/usr/bin/env node
+// cruise-skip — manage the cruise-watch skip list (sailings the user has
+// opted out of having surfaced in the weekly digest).
+//
+// Usage:
+//   cruise-skip add <sailing_id> [reason]   # add to skip list
+//   cruise-skip remove <sailing_id>         # un-skip
+//   cruise-skip list                        # show current skip list
+//   cruise-skip clear                       # remove all skips
+//
+// sailing_id examples:
+//   msc:SE20261214AAABBB          MSC: ship code + date + embark/disembark codes
+//   celebrity:RF4BH328_2026-11-30 Celebrity: package code + depart date
+//   royal:WN4BH349_2026-09-14     Royal: package code + depart date
+
+import { readFile, writeFile, mkdir } from "node:fs/promises";
+import { existsSync } from "node:fs";
+import { dirname } from "node:path";
+import { dataPath } from "../lib/cruise/config.mjs";
+
+const STATE_PATH = dataPath("cruise-watch-state.json");
+
+async function loadState() {
+  if (!existsSync(STATE_PATH)) {
+    return { skipped_sailing_ids: [], skip_reasons: {}, per_line_status: {} };
+  }
+  const raw = await readFile(STATE_PATH, "utf8");
+  const parsed = JSON.parse(raw);
+  if (!Array.isArray(parsed.skipped_sailing_ids)) parsed.skipped_sailing_ids = [];
+  if (!parsed.skip_reasons || typeof parsed.skip_reasons !== "object") parsed.skip_reasons = {};
+  return parsed;
+}
+
+async function saveState(state) {
+  await mkdir(dirname(STATE_PATH), { recursive: true });
+  await writeFile(STATE_PATH, JSON.stringify(state, null, 2) + "\n", "utf8");
+}
+
+function usage() {
+  process.stderr.write(
+    "Usage:\n" +
+      "  cruise-skip add <sailing_id> [reason]\n" +
+      "  cruise-skip remove <sailing_id>\n" +
+      "  cruise-skip list\n" +
+      "  cruise-skip clear\n",
+  );
+  process.exit(2);
+}
+
+async function main() {
+  const [, , cmd, ...rest] = process.argv;
+  if (!cmd) usage();
+  const state = await loadState();
+
+  if (cmd === "add") {
+    const id = rest[0];
+    const reason = rest.slice(1).join(" ") || null;
+    if (!id) usage();
+    if (!state.skipped_sailing_ids.includes(id)) state.skipped_sailing_ids.push(id);
+    if (reason) state.skip_reasons[id] = { reason, at: new Date().toISOString() };
+    await saveState(state);
+    console.log(`skipped ${id}${reason ? ` (${reason})` : ""}`);
+  } else if (cmd === "remove") {
+    const id = rest[0];
+    if (!id) usage();
+    state.skipped_sailing_ids = state.skipped_sailing_ids.filter((x) => x !== id);
+    delete state.skip_reasons[id];
+    await saveState(state);
+    console.log(`unskipped ${id}`);
+  } else if (cmd === "list") {
+    if (state.skipped_sailing_ids.length === 0) {
+      console.log("(no sailings skipped)");
+    } else {
+      for (const id of state.skipped_sailing_ids) {
+        const r = state.skip_reasons[id];
+        console.log(`${id}${r ? `  — ${r.reason}` : ""}`);
+      }
+    }
+  } else if (cmd === "clear") {
+    state.skipped_sailing_ids = [];
+    state.skip_reasons = {};
+    await saveState(state);
+    console.log("skip list cleared");
+  } else {
+    usage();
+  }
+}
+
+main().catch((err) => {
+  console.error(`fatal: ${err?.stack || err}`);
+  process.exit(1);
+});

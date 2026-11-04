@@ -2,7 +2,7 @@
 // app-perf — how responsive the Jori app has been on the user's devices.
 //
 // Reads app_perf_events (data/migrations/20261024_app_perf_events.sql),
-// written by client/Jori/Responsiveness.swift:
+// written by apps/companion/Jori/Responsiveness.swift:
 //   hang        main thread blocked >= 250 ms (in-app watchdog), with the screen
 //   metrics     Apple's daily MetricKit report (hang-time histogram, launch,
 //               scroll hitch ratio on iOS)

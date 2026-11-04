@@ -1,0 +1,254 @@
+#!/usr/bin/env node
+// p1-downgrade — mark a P1 email as resolved: unlabel p1, unstar, label p3,
+// add audit label `p1-resolved`, append a row to data/p1-resolutions.jsonl.
+//
+// Called by:
+//   - agent/scripts/trigger-p1-resolution-scan.sh (signal A, unstar scan)
+//   - agent/ops-agent/jobs/p1-resolve.md          (signal B, text resolution)
+//   - agent/ops-agent/jobs/email-triage.*         (signal C, paired follow-up)
+//   - bin/p1-reply-sweep                           (signal D, the user replied)
+//   - manual one-shots for backfill
+//
+// Every downgrade also closes the Google Task the P1 spawned (lib/p1-task.js:
+// marker match, else one clear subject match). Task outcome is recorded in the
+// audit row under `task` and never changes `success`, which is about Gmail state.
+// --keep-task skips the task step.
+//
+// Usage:
+//   p1-downgrade <messageId> [--reason "<text>"] [--source <tag>]
+//   p1-downgrade --query "<gmail-query>" [--reason "<text>"] [--source <tag>] [--limit N]
+//
+// Idempotent: if the message already lacks the p1 label, the Gmail API call is
+// a no-op and we still append an audit row so the reason chain is preserved.
+
+"use strict";
+
+const { spawnSync } = require("node:child_process");
+const fs = require("node:fs");
+const path = require("node:path");
+const os = require("node:os");
+
+const { installTools } = require("../lib/root.cjs");
+const GMAIL_ACTION = process.env.P1_DOWNGRADE_GMAIL_ACTION || installTools("bin/gmail-action");
+const AUDIT_LOG = process.env.P1_DOWNGRADE_AUDIT_LOG || installTools("data/p1-resolutions.jsonl");
+const GOOGLE_AUTH = path.join(__dirname, "..", "lib", "google-auth.js");
+
+// Pacing between messages in a batch.
+// Each message costs 5 sequential subprocess spawns (1 metadata fetch + 4
+// gmail-action mutations), and a 20-message batch (the unstar-scan's typical
+// size) ran all ~100 of those back-to-back with zero delay. gmail-action has
+// no 429/RESOURCE_EXHAUSTED handling of its own, so a burst that trips
+// Gmail's per-user rate limit currently just fails outright with no backoff.
+// This is the leading (unconfirmed at authoring time) hypothesis for why
+// batches of unlabel/label calls fail together after two prior fixes (bare
+// fetch -> fetchWithRetry; false-success audit rows) closed different,
+// confirmed bugs in the same cluster but didn't stop the recurrence.
+const INTER_MESSAGE_DELAY_MS = 300;
+
+function sleepMs(ms) {
+  spawnSync("sleep", [String(ms / 1000)]);
+}
+
+function die(msg, code = 1) {
+  console.error(`p1-downgrade: ${msg}`);
+  process.exit(code);
+}
+
+function parseArgs() {
+  const argv = process.argv.slice(2);
+  const out = { positional: [], reason: null, source: "manual", query: null, limit: 20, keepTask: false };
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === "--reason") out.reason = argv[++i];
+    else if (a === "--source") out.source = argv[++i];
+    else if (a === "--query") out.query = argv[++i];
+    else if (a === "--limit") out.limit = Number(argv[++i]) || 20;
+    else if (a === "--keep-task") out.keepTask = true;
+    else if (a === "--help" || a === "-h") {
+      console.log(`p1-downgrade — mark P1 email(s) as resolved
+
+Usage:
+  p1-downgrade <messageId> [--reason "<text>"] [--source <tag>]
+  p1-downgrade --query "<gmail-query>" [--reason "<text>"] [--source <tag>] [--limit N]
+  (add --keep-task to leave the linked Google Task open)
+
+Actions per message:
+  1. unlabel p1
+  2. unstar
+  3. label p3
+  4. label p1-resolved (audit trail)
+  5. close the linked Google Task (lib/p1-task.js) unless --keep-task
+  6. append row to ${AUDIT_LOG}
+
+Sources (convention):
+  unstar-scan, text-resolve, paired-followup, reply, manual, backfill`);
+      process.exit(0);
+    } else out.positional.push(a);
+  }
+  return out;
+}
+
+function run(cmd, args) {
+  const r = spawnSync(cmd, args, { encoding: "utf8" });
+  if (r.status !== 0) {
+    const stderr = (r.stderr || "").trim();
+    throw new Error(`${path.basename(cmd)} ${args.join(" ")} failed: ${stderr || `exit ${r.status}`}`);
+  }
+  return (r.stdout || "").trim();
+}
+
+function fetchMetadata(messageId) {
+  const script = `
+    const { getAccessToken, fetchWithRetry, describeError } = require(${JSON.stringify(GOOGLE_AUTH)});
+    (async () => {
+      const token = await getAccessToken();
+      // fetchWithRetry: a bare fetch() had zero retry, causing false "Gmail unreachable" alerts on transient network blips
+      const r = await fetchWithRetry("https://gmail.googleapis.com/gmail/v1/users/me/messages/${messageId}?format=metadata&metadataHeaders=Subject&metadataHeaders=From", { headers: { Authorization: "Bearer " + token } });
+      const data = await r.json();
+      if (data.error) { console.error(JSON.stringify({ error: data.error.message, status: r.status })); process.exit(1); }
+      const headers = (data.payload && data.payload.headers) || [];
+      const subject = (headers.find(h => h.name === "Subject") || {}).value || "";
+      const from = (headers.find(h => h.name === "From") || {}).value || "";
+      console.log(JSON.stringify({ subject, from, threadId: data.threadId || null, internalDate: data.internalDate, labelIds: data.labelIds || [] }));
+    })().catch(err => { console.error(JSON.stringify({ error: describeError(err) })); process.exit(1); });
+  `;
+  const r = spawnSync(process.execPath, ["-e", script], { encoding: "utf8" });
+  if (r.status !== 0) {
+    // Previously silently discarded on failure — returned a blank object with
+    // no trace of why, even though fetchMetadata is the FIRST of 5 sequential
+    // Gmail calls downgradeOne makes per message and often the earliest real
+    // signal. Now parsed and surfaced. See jobs/p1-resolve.md § Reliability
+    // notes, 2026-08-07.
+    let detail = (r.stderr || "").trim();
+    try {
+      const parsed = JSON.parse(detail);
+      if (parsed && parsed.error) detail = parsed.error + (parsed.status ? ` (http ${parsed.status})` : "");
+    } catch {}
+    console.error(`  fetchMetadata(${messageId}) failed: ${detail || `exit ${r.status}`}`);
+    return { subject: "", from: "", labelIds: [], _fetchError: detail || `exit ${r.status}` };
+  }
+  try { return JSON.parse(r.stdout.trim()); } catch { return { subject: "", from: "", labelIds: [] }; }
+}
+
+function searchQuery(query, limit) {
+  const script = `
+    const { getAccessToken, fetchWithRetry, describeError } = require(${JSON.stringify(GOOGLE_AUTH)});
+    (async () => {
+      const token = await getAccessToken();
+      const q = encodeURIComponent(${JSON.stringify(query)});
+      // fetchWithRetry: a bare fetch() had zero retry, causing false "Gmail unreachable" alerts on transient network blips
+      const r = await fetchWithRetry("https://gmail.googleapis.com/gmail/v1/users/me/messages?q=" + q + "&maxResults=${limit}", { headers: { Authorization: "Bearer " + token } });
+      const data = await r.json();
+      if (data.error) { console.error(JSON.stringify({ error: data.error.message, status: r.status })); process.exit(1); }
+      console.log(JSON.stringify((data.messages || []).map(m => m.id)));
+    })().catch(err => { console.error(JSON.stringify({ error: describeError(err) })); process.exit(1); });
+  `;
+  const r = spawnSync(process.execPath, ["-e", script], { encoding: "utf8" });
+  if (r.status !== 0) {
+    let detail = (r.stderr || "").trim();
+    try {
+      const parsed = JSON.parse(detail);
+      if (parsed && parsed.error) detail = parsed.error + (parsed.status ? ` (http ${parsed.status})` : "");
+    } catch {}
+    throw new Error(`search failed: ${detail || `exit ${r.status}`}`);
+  }
+  return JSON.parse(r.stdout.trim());
+}
+
+// Each Gmail mutation is attempted independently (one failing step shouldn't
+// skip the others), but — unlike the old version — failures are tracked and
+// surfaced instead of being swallowed into a false "✓ downgraded" audit row.
+// An earlier version's audit log unconditionally claimed
+// success even when every one of the 4 gmail-action calls failed, which let
+// the same stuck-P1 batch (still label:p1 -is:starred hours/days later)
+// silently re-report as "downgraded" on every retry with no trace of the
+// real failure in data/p1-resolutions.jsonl.
+function closeLinkedTask(messageId, meta) {
+  try {
+    const { closeTasksFor } = require(path.join(__dirname, "..", "lib", "p1-task.js"));
+    const res = closeTasksFor({ threadId: meta.threadId || null, messageId, subject: meta.subject || "" });
+    for (const c of res.closed) console.log(`  ✓ task closed (${c.via}): ${c.title}`);
+    for (const a of res.ambiguous) console.log(`  ? task left open (ambiguous match): ${a.title}`);
+    if (res.error) console.error(`  task: ${res.error}`);
+    return res;
+  } catch (e) {
+    console.error(`  task: ${e.message}`);
+    return { closed: [], ambiguous: [], error: e.message };
+  }
+}
+
+function downgradeOne(messageId, { reason, source, keepTask = false }) {
+  const meta = fetchMetadata(messageId);
+  const wasStarred = (meta.labelIds || []).includes("STARRED");
+
+  const errors = {};
+  const steps = [
+    ["unlabel_p1", ["unlabel", messageId, "p1"]],
+    ["unstar", ["unstar", messageId]],
+    ["label_p3", ["label", messageId, "p3"]],
+    ["label_p1_resolved", ["label", messageId, "p1-resolved"]],
+  ];
+  for (const [key, cmdArgs] of steps) {
+    try { run(GMAIL_ACTION, cmdArgs); }
+    catch (e) { errors[key] = e.message; console.error(`  ${key}: ${e.message}`); }
+  }
+  const success = Object.keys(errors).length === 0;
+  const task = keepTask ? { skipped: true } : closeLinkedTask(messageId, meta);
+
+  const row = {
+    ts: new Date().toISOString(),
+    messageId,
+    source,
+    reason: reason || null,
+    subject: meta.subject || null,
+    from: meta.from || null,
+    was_starred: wasStarred,
+    success,
+    ...(success ? {} : { errors }),
+    task,
+    // Diagnostic only — does NOT affect `success`. A metadata-fetch failure
+    // means subject/from are unknown, not that the label mutations (tracked
+    // above) failed. See jobs/p1-resolve.md § Reliability notes, 2026-08-07.
+    ...(meta._fetchError ? { meta_fetch_error: meta._fetchError } : {}),
+  };
+  fs.appendFileSync(AUDIT_LOG, JSON.stringify(row) + "\n");
+  if (success) {
+    console.log(`✓ downgraded ${messageId} — ${meta.subject ? meta.subject.slice(0, 80) : "(no subject)"}`);
+  } else {
+    console.error(`✗ FAILED to fully downgrade ${messageId} (${Object.keys(errors).length}/${steps.length} steps failed) — ${meta.subject ? meta.subject.slice(0, 80) : "(no subject)"}`);
+  }
+  return row;
+}
+
+async function main() {
+  const args = parseArgs();
+  let ids = [];
+  if (args.query) {
+    ids = searchQuery(args.query, args.limit);
+    if (ids.length === 0) { console.log("(no matches for query)"); return; }
+    console.log(`query matched ${ids.length} message${ids.length === 1 ? "" : "s"}`);
+  } else if (args.positional.length > 0) {
+    ids = args.positional;
+  } else {
+    die("need <messageId> or --query");
+  }
+  let failCount = 0;
+  let attempted = 0;
+  let first = true;
+  for (const id of ids) {
+    if (!/^[a-zA-Z0-9_-]{8,40}$/.test(id)) { console.error(`skip invalid id: ${id}`); continue; }
+    if (!first) sleepMs(INTER_MESSAGE_DELAY_MS);
+    first = false;
+    attempted++;
+    try {
+      const row = downgradeOne(id, { reason: args.reason, source: args.source, keepTask: args.keepTask });
+      if (!row.success) failCount++;
+    } catch (e) { console.error(`fail ${id}: ${e.message}`); failCount++; }
+  }
+  if (failCount > 0) {
+    console.error(`p1-downgrade: ${failCount}/${attempted} message(s) did not fully downgrade — see errors above and data/p1-resolutions.jsonl`);
+    process.exitCode = 1;
+  }
+}
+
+main().catch(e => { console.error(`p1-downgrade: ${e.message}`); process.exit(1); });

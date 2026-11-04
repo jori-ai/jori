@@ -52,7 +52,7 @@ function run(text, id, extraEnv) {
         JEV_TEST_ANSWERS: JSON.stringify(answers), JEV_TEST_CALLS: CALLS,
         JEV_DRY_RUN: "1", JEV_PRIVATE_SCREEN: "off", ...(extraEnv || {}),
         // Gemma unreachable: the legacy path's fallback returns "unavailable" fast.
-        OLLAMA_URL: "http://127.0.0.1:9" },
+        OLLAMA_URL: "http://127.0.0.1:9", LOCAL_LLM_BACKEND: "ollama" },
     });
     let out = ""; c.stdout.on("data", (d) => (out += d));
     c.on("close", (status) => { let json = null; try { json = JSON.parse(out); } catch {} resolve({ status, json }); });

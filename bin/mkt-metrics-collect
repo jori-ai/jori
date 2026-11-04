@@ -1,0 +1,426 @@
+#!/usr/bin/env node
+// mkt-metrics-collect — Daily collector for the marketing module's
+// improvement harness. Pulls Search Console daily clicks/impressions for the
+// product's site and App Store Connect daily downloads for its app, both named
+// in agent/local/config/marketing.json (`gsc_site`, `ios_app_id`,
+// `asc_report_requests`). OFF (exit 0, nothing written) without them.
+// Writes data/mkt-metrics-state.json (rolling 7d/30d + week-over-week deltas).
+// Silent state-only producer — read by the digest and ideation jobs.
+
+import crypto from "node:crypto";
+import fs from "node:fs";
+import path from "node:path";
+import zlib from "node:zlib";
+import { execFileSync } from "node:child_process";
+import { createRequire } from "node:module";
+
+const require = createRequire(import.meta.url);
+const { localConfig } = require("../lib/instance.cjs");
+const { installTools, toolsPath } = require("../lib/root.cjs");
+
+const CFG = localConfig("marketing", {
+  gsc_site: "",
+  gsc_credentials_file: "gsc-credentials.json",
+  ios_app_id: "",
+  asc_app_name: "",
+  asc_report_requests: { ongoing: "", snapshot: "" },
+});
+const STATE = installTools("data", "mkt-metrics-state.json");
+const GSC_CREDS = installTools("secrets", CFG.gsc_credentials_file || "gsc-credentials.json");
+const ASC_BIN = toolsPath("bin", "asc-api");
+
+const SITE_URL = CFG.gsc_site || "";
+const APP_ID = String(CFG.ios_app_id || "");
+const APP_NAME = CFG.asc_app_name || "";
+
+const ONGOING_REQUEST_ID = (CFG.asc_report_requests || {}).ongoing || "";
+const SNAPSHOT_REQUEST_ID = (CFG.asc_report_requests || {}).snapshot || "";
+
+// ---------- state ----------
+
+function loadState() {
+  if (!fs.existsSync(STATE)) {
+    return {
+      version: 1,
+      last_run: null,
+      last_run_ok: false,
+      asc: {
+        ongoing_report_request_id: ONGOING_REQUEST_ID,
+        snapshot_report_request_id: SNAPSHOT_REQUEST_ID,
+        app_id: APP_ID,
+        app_name: APP_NAME,
+        downloads_status: "pending_first_report",
+      },
+      gsc: { site_url: SITE_URL },
+      daily: [],
+      rolling: { "7d": null, "30d": null },
+      wow: null,
+      run_errors: [],
+    };
+  }
+  return JSON.parse(fs.readFileSync(STATE, "utf8"));
+}
+
+function saveState(state) {
+  const tmp = STATE + ".tmp." + process.pid;
+  fs.writeFileSync(tmp, JSON.stringify(state, null, 2));
+  fs.renameSync(tmp, STATE);
+}
+
+function fmtDate(d) {
+  return d.toISOString().slice(0, 10);
+}
+
+// ---------- GSC service-account JWT → access token ----------
+
+async function getGscAccessToken() {
+  const creds = JSON.parse(fs.readFileSync(GSC_CREDS, "utf8"));
+  const now = Math.floor(Date.now() / 1000);
+  const header = { alg: "RS256", typ: "JWT" };
+  const payload = {
+    iss: creds.client_email,
+    scope: "https://www.googleapis.com/auth/webmasters.readonly",
+    aud: "https://oauth2.googleapis.com/token",
+    iat: now,
+    exp: now + 3600,
+  };
+  const b64 = (o) => Buffer.from(JSON.stringify(o)).toString("base64url");
+  const signing = `${b64(header)}.${b64(payload)}`;
+  const sig = crypto.sign("RSA-SHA256", Buffer.from(signing), creds.private_key);
+  const jwt = `${signing}.${sig.toString("base64url")}`;
+
+  const res = await fetch("https://oauth2.googleapis.com/token", {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({
+      grant_type: "urn:ietf:params:oauth:grant-type:jwt-bearer",
+      assertion: jwt,
+    }),
+  });
+  if (!res.ok) {
+    throw new Error(`GSC token exchange failed: ${res.status} ${await res.text()}`);
+  }
+  const data = await res.json();
+  return data.access_token;
+}
+
+async function fetchGscDaily(startDate, endDate) {
+  const token = await getGscAccessToken();
+  const url = `https://www.googleapis.com/webmasters/v3/sites/${encodeURIComponent(SITE_URL)}/searchAnalytics/query`;
+  const res = await fetch(url, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      startDate,
+      endDate,
+      dimensions: ["date"],
+      rowLimit: 5000,
+    }),
+  });
+  if (!res.ok) {
+    throw new Error(`GSC query failed: ${res.status} ${await res.text()}`);
+  }
+  const data = await res.json();
+  return (data.rows || []).map((r) => ({
+    date: r.keys[0],
+    clicks: r.clicks || 0,
+    impressions: r.impressions || 0,
+    ctr: r.ctr || 0,
+    position: r.position || 0,
+  }));
+}
+
+// ---------- ASC analytics ----------
+
+function ascRaw(method, apiPath) {
+  const out = execFileSync(ASC_BIN, ["raw", method, apiPath], {
+    encoding: "utf8",
+    maxBuffer: 100 * 1024 * 1024,
+  });
+  return JSON.parse(out);
+}
+
+async function fetchAscDailyDownloads(reportRequestId) {
+  const reports = ascRaw(
+    "GET",
+    `/analyticsReportRequests/${reportRequestId}/reports?limit=200`,
+  );
+  const downloads = (reports.data || []).find(
+    (r) => r.attributes.name === "App Downloads Standard",
+  );
+  if (!downloads) return { status: "report_not_found", daily: [] };
+
+  const instances = ascRaw(
+    "GET",
+    `/analyticsReports/${downloads.id}/instances?filter[granularity]=DAILY&limit=100`,
+  );
+  if (!instances.data || instances.data.length === 0) {
+    return { status: "no_instances_yet", daily: [] };
+  }
+
+  // The "App Downloads Standard" TSV has a `Download Type` dimension
+  // ("First-time download", "Redownload", "Auto-update", "Manual update",
+  // "Restore", ...) and a `Counts` measure — NOT a column literally named
+  // "...downloads". Each row carries its own activity `Date`, and Apple
+  // restates the same date across multiple daily instances, so we dedupe
+  // per activity date and let the latest instance (by processingDate) win
+  // rather than summing across instances (which would double-count).
+  const emptyBreakdown = () => ({
+    first_time: 0,
+    redownload: 0,
+    update: 0,
+    restore: 0,
+    other: 0,
+    total: 0,
+  });
+  function classify(downloadType) {
+    const t = (downloadType || "").toLowerCase();
+    if (t.includes("first")) return "first_time";
+    if (t.includes("redownload")) return "redownload";
+    if (t.includes("update")) return "update"; // auto-update / manual update
+    if (t.includes("restore")) return "restore";
+    return "other";
+  }
+
+  // activity date -> breakdown, taken from the latest instance covering it
+  const byActivityDate = new Map();
+
+  // Process instances oldest-first so later (more-settled) restatements
+  // overwrite earlier partial data for the same activity date.
+  const sortedInstances = [...instances.data].sort((a, b) =>
+    (a.attributes.processingDate || "").localeCompare(
+      b.attributes.processingDate || "",
+    ),
+  );
+
+  for (const inst of sortedInstances) {
+    try {
+      const segments = ascRaw(
+        "GET",
+        `/analyticsReportInstances/${inst.id}/segments?limit=20`,
+      );
+      // Per-instance accumulation, so a full restatement replaces prior data
+      // for every date this instance reports.
+      const instanceDates = new Map();
+      for (const seg of segments.data || []) {
+        const url = seg.attributes?.url;
+        if (!url) continue;
+        const res = await fetch(url);
+        if (!res.ok) continue;
+        const buf = Buffer.from(await res.arrayBuffer());
+        let text;
+        try {
+          text = zlib.gunzipSync(buf).toString("utf8");
+        } catch {
+          text = buf.toString("utf8");
+        }
+        const lines = text.split("\n");
+        if (lines.length < 2) continue;
+        const headers = lines[0].split("\t").map((h) => h.trim());
+        const dateIdx = headers.findIndex((h) => /^date$/i.test(h));
+        const typeIdx = headers.findIndex((h) => /download\s*type/i.test(h));
+        const countIdx = headers.findIndex((h) => /^counts$/i.test(h));
+        // Backward-compat: an older schema with a directly-named column.
+        const legacyIdx = headers.findIndex((h) =>
+          /(first[-\s_]?time\s*download|total\s*download|^downloads$)/i.test(h),
+        );
+        if (dateIdx < 0 || (countIdx < 0 && legacyIdx < 0)) continue;
+        for (let i = 1; i < lines.length; i++) {
+          if (!lines[i].trim()) continue;
+          const cells = lines[i].split("\t");
+          const rowDate = (cells[dateIdx] || "").trim();
+          if (!rowDate) continue;
+          const v = parseInt(cells[countIdx >= 0 ? countIdx : legacyIdx], 10);
+          if (isNaN(v)) continue;
+          if (!instanceDates.has(rowDate))
+            instanceDates.set(rowDate, emptyBreakdown());
+          const bd = instanceDates.get(rowDate);
+          const cat = typeIdx >= 0 ? classify(cells[typeIdx]) : "first_time";
+          bd[cat] += v;
+          bd.total += v;
+        }
+      }
+      // Latest instance wins per activity date.
+      for (const [d, bd] of instanceDates) byActivityDate.set(d, bd);
+    } catch {
+      // Per-instance error — continue
+    }
+  }
+
+  // Headline `downloads` = genuine first-time installs (acquisition signal).
+  // Full breakdown retained for transparency / debugging.
+  const daily = [...byActivityDate.entries()]
+    .map(([date, bd]) => ({ date, downloads: bd.first_time, breakdown: bd }))
+    .sort((a, b) => a.date.localeCompare(b.date));
+
+  return {
+    status: daily.length > 0 ? "ok" : "no_data_in_segments",
+    daily,
+  };
+}
+
+// ---------- rollups ----------
+
+function rangeFor(days, today) {
+  const to = new Date(today);
+  const from = new Date(today);
+  from.setUTCDate(from.getUTCDate() - days + 1);
+  return { from: fmtDate(from), to: fmtDate(to) };
+}
+
+function sumRange(daily, from, to, key) {
+  return daily
+    .filter((d) => d.date >= from && d.date <= to)
+    .reduce((s, d) => s + (d[key] || 0), 0);
+}
+
+function pctDelta(now, prev) {
+  if (prev === 0) return now > 0 ? null : 0;
+  return Math.round(((now - prev) / prev) * 1000) / 10;
+}
+
+function computeRolling(daily, todayUTC) {
+  const r7 = rangeFor(7, todayUTC);
+  const r30 = rangeFor(30, todayUTC);
+  return {
+    "7d": {
+      ...r7,
+      gsc_clicks: sumRange(daily, r7.from, r7.to, "gsc_clicks"),
+      gsc_impressions: sumRange(daily, r7.from, r7.to, "gsc_impressions"),
+      asc_downloads: sumRange(daily, r7.from, r7.to, "asc_downloads"),
+    },
+    "30d": {
+      ...r30,
+      gsc_clicks: sumRange(daily, r30.from, r30.to, "gsc_clicks"),
+      gsc_impressions: sumRange(daily, r30.from, r30.to, "gsc_impressions"),
+      asc_downloads: sumRange(daily, r30.from, r30.to, "asc_downloads"),
+    },
+  };
+}
+
+function computeWow(daily, todayUTC) {
+  // GSC has ~3d lag, so this_week = D-9 to D-3, last_week = D-16 to D-10
+  const thisEnd = new Date(todayUTC);
+  thisEnd.setUTCDate(thisEnd.getUTCDate() - 3);
+  const thisStart = new Date(thisEnd);
+  thisStart.setUTCDate(thisStart.getUTCDate() - 6);
+
+  const lastEnd = new Date(thisStart);
+  lastEnd.setUTCDate(lastEnd.getUTCDate() - 1);
+  const lastStart = new Date(lastEnd);
+  lastStart.setUTCDate(lastStart.getUTCDate() - 6);
+
+  const tw = { from: fmtDate(thisStart), to: fmtDate(thisEnd) };
+  const lw = { from: fmtDate(lastStart), to: fmtDate(lastEnd) };
+
+  const tClicks = sumRange(daily, tw.from, tw.to, "gsc_clicks");
+  const tImps = sumRange(daily, tw.from, tw.to, "gsc_impressions");
+  const tDl = sumRange(daily, tw.from, tw.to, "asc_downloads");
+  const lClicks = sumRange(daily, lw.from, lw.to, "gsc_clicks");
+  const lImps = sumRange(daily, lw.from, lw.to, "gsc_impressions");
+  const lDl = sumRange(daily, lw.from, lw.to, "asc_downloads");
+
+  return {
+    this_week: { ...tw, gsc_clicks: tClicks, gsc_impressions: tImps, asc_downloads: tDl },
+    last_week: { ...lw, gsc_clicks: lClicks, gsc_impressions: lImps, asc_downloads: lDl },
+    delta_clicks_pct: pctDelta(tClicks, lClicks),
+    delta_impressions_pct: pctDelta(tImps, lImps),
+    delta_downloads_pct: pctDelta(tDl, lDl),
+  };
+}
+
+// ---------- main ----------
+
+async function main() {
+  if (!SITE_URL && !(APP_ID && ONGOING_REQUEST_ID)) {
+    console.log("mkt-metrics-collect: not configured (agent/local/config/marketing.json gsc_site / ios_app_id + asc_report_requests) — nothing to do");
+    return;
+  }
+  const state = loadState();
+  const errors = [];
+  const today = new Date();
+  const todayUTC = fmtDate(today);
+  const from = new Date();
+  from.setUTCDate(from.getUTCDate() - 45);
+
+  let gscDaily = [];
+  if (SITE_URL) {
+    try {
+      gscDaily = await fetchGscDaily(fmtDate(from), todayUTC);
+    } catch (e) {
+      errors.push({ source: "gsc", message: e.message });
+    }
+  }
+
+  let ascResult = { status: APP_ID ? "unknown" : "not_configured", daily: [] };
+  if (APP_ID && state.asc.ongoing_report_request_id) try {
+    ascResult = await fetchAscDailyDownloads(state.asc.ongoing_report_request_id);
+    if (ascResult.daily.length === 0 && state.asc.snapshot_report_request_id) {
+      const snap = await fetchAscDailyDownloads(state.asc.snapshot_report_request_id);
+      if (snap.daily.length > 0) ascResult = snap;
+      else if (ascResult.status === "no_instances_yet")
+        ascResult.status = "snapshot_pending";
+    }
+  } catch (e) {
+    errors.push({ source: "asc", message: e.message });
+  }
+
+  const byDate = new Map();
+  for (const d of gscDaily) {
+    byDate.set(d.date, {
+      date: d.date,
+      gsc_clicks: d.clicks,
+      gsc_impressions: d.impressions,
+      gsc_ctr: d.ctr,
+      gsc_position: d.position,
+      asc_downloads: null,
+    });
+  }
+  for (const d of ascResult.daily) {
+    const entry = byDate.get(d.date) || {
+      date: d.date,
+      gsc_clicks: 0,
+      gsc_impressions: 0,
+      gsc_ctr: 0,
+      gsc_position: 0,
+      asc_downloads: null,
+    };
+    entry.asc_downloads = d.downloads;
+    if (d.breakdown) entry.asc_downloads_breakdown = d.breakdown;
+    byDate.set(d.date, entry);
+  }
+
+  const daily = Array.from(byDate.values()).sort((a, b) =>
+    a.date.localeCompare(b.date),
+  );
+  const cutoff = new Date();
+  cutoff.setUTCDate(cutoff.getUTCDate() - 60);
+  const cutoffStr = fmtDate(cutoff);
+  const trimmed = daily.filter((d) => d.date >= cutoffStr);
+
+  state.daily = trimmed;
+  state.rolling = computeRolling(trimmed, todayUTC);
+  state.wow = computeWow(trimmed, todayUTC);
+  state.asc.downloads_status = ascResult.status;
+  state.last_run = new Date().toISOString();
+  state.last_run_ok = errors.length === 0;
+  state.run_errors = errors;
+
+  saveState(state);
+
+  console.log(
+    `mkt-metrics-collect: gsc=${gscDaily.length}d asc=${ascResult.daily.length}d (status=${ascResult.status}) errors=${errors.length}`,
+  );
+  if (errors.length > 0) {
+    for (const e of errors) console.error(`  ${e.source}: ${e.message}`);
+    process.exit(2);
+  }
+}
+
+main().catch((e) => {
+  console.error("FATAL:", e.message);
+  process.exit(1);
+});

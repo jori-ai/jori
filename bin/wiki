@@ -20,6 +20,7 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 const { spawnSync } = require("node:child_process");
+const { port: registryPort } = require("../lib/ports.cjs");
 const ws = require("../lib/wiki-store.js");
 
 const args = process.argv.slice(2);
@@ -620,7 +621,7 @@ async function cmdServe() {
   // Mark BEFORE awaiting so the outer try/finally skips closeDb. The DB
   // handle is owned by the server for its full lifetime.
   cmdServe.keepOpen = true;
-  const port = Number(flag("port", 9096));
+  const port = Number(flag("port", registryPort("wiki")));
   const host = String(flag("host", "127.0.0.1"));
   const { serve } = require("../lib/wiki-serve.js");
   const server = await serve({ port, host });

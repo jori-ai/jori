@@ -1,0 +1,150 @@
+#!/usr/bin/env node
+// watch-catalog-enrich — give every watch_catalog film the features the recommendation
+// model learns from, and record TMDB's recommendation graph as item-item edges
+// (2026-10-10, apps/watch/lib/recsys.mjs). No LLM.
+//
+// One TMDB call per film (details + keywords + credits + recommendations):
+//   genres, keywords (top 15), directors, top-6 cast, popularity, imdb_id → watch_catalog
+//   recommendations → watch_film_edges (src → dst, weight 1 − rank/20)
+// Recommended films not yet in the catalog (vote_count ≥ 300) are added (rank 50000,
+// features pending) so the graph grows toward their taste; they are enriched on a later run.
+//
+// Everything already on the list feeds the model too (use the data already collected):
+// every watch_titles row with a TMDB id — shows included — is synced into
+// the catalog (kind movie|show, linked by title_id) and enriched the same way, so a show
+// they loved teaches the model about its genres, keywords, creators and cast. Shows get
+// content features only (no edges: TMDB's TV recommendations point at TV, not films).
+//
+// Critic scores: IMDb rating (the model's quality signal), Rotten Tomatoes and Metacritic
+// (display only) from OMDb, at most --omdb-max films a day (the OMDb quota is shared with the
+// harvesters): list and marked films first, then askable films newest first; refreshed after
+// --omdb-days (scores of new releases move).
+//
+//   watch-catalog-enrich [--max 1000] [--refresh-days 120] [--omdb-max 700] [--omdb-days 60]
+// Daily 09:40 via cron-run (--max 1000); idempotent. Playbook: agent/ops-agent/jobs/watch-catalog-enrich.md
+
+import { rest, hasTmdb, omdbRecord } from "../lib/watch-db.mjs";
+
+const arg = (n, d) => { const i = process.argv.indexOf(`--${n}`); return i >= 0 ? parseInt(process.argv[i + 1], 10) : d; };
+const MAX = arg("max", 1000);
+const REFRESH_DAYS = arg("refresh-days", 120);
+const OMDB_MAX = arg("omdb-max", 700);
+const OMDB_DAYS = arg("omdb-days", 60);
+// Graph growth is capped: only films widely seen enough to be marked (≥ 1,500 votes), and only
+// recommended FROM a seed or list film — on 2026-10-10 uncapped growth (≥ 300 votes, from any
+// film) snowballed the catalog from 1k to 7k films in minutes, mostly obscure.
+const MIN_VOTES = 1500;
+if (!hasTmdb()) { console.error("TMDB_API_KEY missing"); process.exit(1); }
+
+async function tmdb(p) {
+  for (let i = 0; i < 3; i++) {
+    const r = await fetch(`https://api.themoviedb.org/3/${p}${p.includes("?") ? "&" : "?"}api_key=${process.env.TMDB_API_KEY}`, { signal: AbortSignal.timeout(15000) });
+    if (r.ok) return r.json();
+    if (r.status === 404) return null;
+    await new Promise((res) => setTimeout(res, 1500 * (i + 1)));
+  }
+  return null;
+}
+async function pool(items, n, fn) {
+  let i = 0;
+  await Promise.all(Array.from({ length: n }, async () => { while (i < items.length) await fn(items[i++]); }));
+}
+
+// 1. Sync every title on the list (any status) into the catalog so its features get learned.
+const titles = await rest("watch_titles?select=id,kind,tmdb_id,name,year_start,description,original_language,status&tmdb_id=not.is.null");
+// Paged: PostgREST caps a response at 1,000 rows (an unpaged read here re-"synced" ~500
+// titles every run and let the graph re-add films it already had).
+async function allRows(q) {
+  const out = [];
+  for (let off = 0; ; off += 1000) { const p = await rest(`${q}&order=id&limit=1000&offset=${off}`); out.push(...p); if (p.length < 1000) return out; }
+}
+const catRows = await allRows("watch_catalog?select=kind,tmdb_id");
+const inCat = new Set(catRows.map((r) => `${r.kind}:${r.tmdb_id}`));
+const missing = titles.filter((t) => !inCat.has(`${t.kind === "show" ? "show" : "movie"}:${t.tmdb_id}`));
+if (missing.length) {
+  await rest("watch_catalog?on_conflict=kind,tmdb_id", { method: "POST", prefer: "resolution=ignore-duplicates,return=minimal", body: missing.map((t) => ({
+    kind: t.kind === "show" ? "show" : "movie", tmdb_id: t.tmdb_id, title: t.name, year: t.year_start, overview: t.description,
+    original_language: t.original_language, title_id: t.id, rank: 90000,
+    // Already decided on the list: not something to ask about in a batch.
+    // queued/watching = on the list, not seen yet → never offered in a batch either.
+    seen: t.status === "watched", not_for_us: t.status === "rejected",
+  })) });
+}
+console.log(`synced ${missing.length} list titles into the catalog`);
+
+const genreMap = new Map((await tmdb("genre/movie/list"))?.genres?.map((g) => [g.id, g.name]) || []);
+const stale = new Date(Date.now() - REFRESH_DAYS * 86400000).toISOString();
+const pending = await rest(`watch_catalog?select=id,tmdb_id,kind,rank,title_id&or=(features_at.is.null,features_at.lt.${stale})&order=title_id.nullslast,rank&limit=${MAX}`); // list titles first — they carry the labels
+const known = new Set(catRows.filter((r) => r.kind === "movie").map((r) => r.tmdb_id));
+
+let done = 0, edges = 0, added = 0, failed = 0;
+await pool(pending, 6, async ({ id, tmdb_id, kind, rank, title_id }) => {
+  if (kind === "show") return enrichShow(id, tmdb_id);
+  const d = await tmdb(`movie/${tmdb_id}?append_to_response=keywords,credits,recommendations,external_ids`);
+  if (!d) { failed++; await rest(`watch_catalog?id=eq.${id}`, { method: "PATCH", body: { features_at: new Date().toISOString() }, prefer: "return=minimal" }); return; }
+  const crew = d.credits?.crew || [];
+  await rest(`watch_catalog?id=eq.${id}`, { method: "PATCH", prefer: "return=minimal", body: {
+    // Display facts too: MovieLens-seeded rows arrive as bare TMDB ids.
+    title: d.title, year: d.release_date ? parseInt(d.release_date.slice(0, 4), 10) : null,
+    poster_path: d.poster_path || null, overview: d.overview || null, original_language: d.original_language || null,
+    genres: (d.genres || []).map((g) => g.name).join(", ") || null,
+    keywords: (d.keywords?.keywords || []).slice(0, 15).map((k) => k.name).join("|") || null,
+    directors: crew.filter((c) => c.job === "Director").map((c) => c.name).slice(0, 3).join("|") || null,
+    cast_names: (d.credits?.cast || []).slice(0, 6).map((c) => c.name).join("|") || null,
+    popularity: d.popularity ?? null,
+    collection: d.belongs_to_collection?.name || null, // franchise — a model feature + a batch rule
+    imdb_id: d.imdb_id || d.external_ids?.imdb_id || null,
+    vote_count: d.vote_count ?? null,
+    vote_average: d.vote_average != null ? Math.round(d.vote_average * 10) / 10 : null,
+    features_at: new Date().toISOString(),
+  } });
+  const recs = (d.recommendations?.results || []).slice(0, 20);
+  if (recs.length) {
+    await rest("watch_film_edges?on_conflict=src_tmdb,dst_tmdb", { method: "POST", prefer: "resolution=merge-duplicates,return=minimal",
+      body: recs.map((m, i) => ({ src_tmdb: tmdb_id, dst_tmdb: m.id, weight: Math.round((1 - i / 20) * 100) / 100 })) });
+    edges += recs.length;
+    const grows = title_id != null || (rank != null && rank <= 1100);
+    const fresh = grows ? recs.filter((m) => !known.has(m.id) && (m.vote_count || 0) >= MIN_VOTES && m.title) : [];
+    for (const m of fresh) known.add(m.id);
+    if (fresh.length) {
+      await rest("watch_catalog?on_conflict=kind,tmdb_id", { method: "POST", prefer: "resolution=ignore-duplicates,return=minimal", body: fresh.map((m) => ({
+        kind: "movie", tmdb_id: m.id, title: m.title, year: m.release_date ? parseInt(m.release_date.slice(0, 4), 10) : null,
+        poster_path: m.poster_path || null, overview: m.overview || null, original_language: m.original_language || null,
+        genres: (m.genre_ids || []).map((g) => genreMap.get(g)).filter(Boolean).join(", ") || null,
+        vote_count: m.vote_count || 0, vote_average: Math.round((m.vote_average || 0) * 10) / 10, rank: 50000,
+      })) });
+      added += fresh.length;
+    }
+  }
+  done++;
+});
+async function enrichShow(id, tmdbId) {
+  const d = await tmdb(`tv/${tmdbId}?append_to_response=keywords,aggregate_credits`);
+  await rest(`watch_catalog?id=eq.${id}`, { method: "PATCH", prefer: "return=minimal", body: d ? {
+    genres: (d.genres || []).map((g) => g.name).join(", ") || null,
+    keywords: (d.keywords?.results || []).slice(0, 15).map((k) => k.name).join("|") || null,
+    directors: (d.created_by || []).map((c) => c.name).slice(0, 3).join("|") || null, // creators play the director's part
+    cast_names: (d.aggregate_credits?.cast || []).slice(0, 6).map((c) => c.name).join("|") || null,
+    popularity: d.popularity ?? null, vote_count: d.vote_count ?? null,
+    vote_average: d.vote_average != null ? Math.round(d.vote_average * 10) / 10 : null,
+    poster_path: d.poster_path || null, features_at: new Date().toISOString(),
+  } : { features_at: new Date().toISOString() } });
+  if (d) done++; else failed++;
+}
+
+// Critic scores (OMDb). Labelled films first (they teach the model), then the newest.
+let scored = 0;
+if (OMDB_MAX > 0 && process.env.OMDB_API_KEY) {
+  const due = new Date(Date.now() - OMDB_DAYS * 86400000).toISOString();
+  const q = `select=id,imdb_id&kind=eq.movie&imdb_id=not.is.null&or=(omdb_at.is.null,omdb_at.lt.${due})`;
+  const first = await rest(`watch_catalog?${q}&or=(title_id.not.is.null,seen.not.is.null)&order=year.desc.nullslast&limit=${OMDB_MAX}`);
+  const more = first.length < OMDB_MAX ? await rest(`watch_catalog?${q}&title_id=is.null&seen=is.null&order=year.desc.nullslast,vote_count.desc.nullslast&limit=${OMDB_MAX - first.length}`) : [];
+  await pool([...first, ...more], 4, async ({ id, imdb_id }) => {
+    const o = await omdbRecord(imdb_id);
+    await rest(`watch_catalog?id=eq.${id}`, { method: "PATCH", prefer: "return=minimal", body: {
+      imdb_rating: o.imdb, rt_score: o.rt, metacritic: o.metacritic, omdb_at: new Date().toISOString() } });
+    scored++;
+  });
+}
+
+console.log(`${new Date().toISOString()} enriched=${done} failed=${failed} edges=${edges} new_films=${added} pending_was=${pending.length} omdb_scored=${scored}`);

@@ -1,0 +1,346 @@
+#!/usr/bin/env python3
+"""choice — send a tappable multiple-choice question, and report the unanswered ones.
+
+The server half of the contract the iOS client renders (apps/companion/Jori/
+ChoicePrompt.swift). Generic on purpose: `kind` is a free-form routing tag and
+nothing here knows what a location stop is.
+
+THE TAP IS A PRE-COMPOSED REPLY. Tapping inserts an ordinary `role:user` message
+carrying the option's label with `reply_to` pointing at the question, so
+phone-channel and the chat-agent handle it exactly as typed text. That is why
+this file only has to SEND — there is no answer-side protocol to implement.
+
+A DEFAULT IS A GUESS, NEVER AN ANSWER. `default_id` marks the most likely
+option on the card. `sweep` once posted "(no answer — recorded X)" under every
+expired prompt, but nothing anywhere stored X, and several of those defaults
+sat under stops the user had named differently, once by an unthreaded typed
+reply the sweep never saw. A line saying something was saved when nothing was
+is false (Rule #2).
+
+The requirement now: a default is applied only as a low-confidence guess that
+never names nearby future stops and that any later tap or correction
+overrides. `sweep --apply` hands an expired, unanswered `location_stop`
+card's default to `findme guess <visit_id> <default>`. That writes ONLY the
+card's own visit row, as `place_type='default-applied'` (resolve-day reads it
+at confidence 0.4 for that one stop; the summary says "probably X"), never
+`user-confirmed`, and never confirmed-stops.json, so it cannot name another
+stop. findme refuses a row that already carries a verdict and a window that
+overlaps a row the user answered (the wrong guesses above). Nothing is posted
+in the chat: the card stays as it was, and a late tap still resolves it through
+the normal reply path, replacing the guess. Other kinds of card are still only
+reported. Replies carrying `metadata.choice_default` come only from the old
+sweep line.
+
+Usage:
+  choice send --kind location_stop --ref <visit_id> --prompt "Where was this?" \\
+              --option "Cafe One|16m · Restaurant" --option "Cafe Two|23m" \\
+              --default 1 [--expires-h 12] [--channel chat]
+  choice sweep [--apply]     # reports expired prompts; --apply guesses location_stop defaults
+  choice list
+"""
+import argparse
+import json
+import os
+import subprocess
+import sys
+import urllib.parse
+import urllib.request
+import uuid
+from datetime import datetime, timedelta, timezone
+
+# The kernel tree this file runs from (bin/jori-notify, bin/findme sit beside it).
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(REPO, "lib"))
+import supabase_local  # noqa: E402  SUPABASE_URL / instance supabase_project, service key from env or .env
+
+CONTRACT_VERSION = 1
+DEFAULT_EXPIRES_H = 12
+
+
+def key():
+    k = supabase_local.service_key()
+    if k:
+        return k
+    sys.exit("no SUPABASE_SERVICE_ROLE_KEY")
+
+
+def req(path, method="GET", body=None):
+    base = supabase_local.supabase_url()
+    if not base:
+        sys.exit("choice: no Supabase project configured (SUPABASE_URL or instance supabase_project)")
+    k = key()
+    headers = {"apikey": k, "Authorization": f"Bearer {k}", "Accept": "application/json"}
+    data = None
+    if body is not None:
+        headers["Content-Type"] = "application/json"
+        headers["Prefer"] = "return=representation"
+        data = json.dumps(body).encode()
+    r = urllib.request.Request(f"{base}/rest/v1/{path}", data=data,
+                               headers=headers, method=method)
+    with urllib.request.urlopen(r, timeout=45) as resp:
+        raw = resp.read()
+        return json.loads(raw) if raw else None
+
+
+def cmd_send(a):
+    opts = []
+    for i, spec in enumerate(a.option):
+        label, _, sub = spec.partition("|")
+        # "Label=value|sublabel" — `value` is what a handler STORES, `label` is
+        # only what the button reads. Without it, "Yes — the airbnb" was stored
+        # verbatim as a place name. Optional: no `=`, and value follows label.
+        lbl, eq, val = label.partition("=")
+        opt = {"id": f"o{i+1}", "label": lbl.strip() if eq else label.strip()}
+        if eq and val.strip():
+            opt["value"] = val.strip()
+        if sub.strip():
+            opt["sublabel"] = sub.strip()
+        opts.append(opt)
+    if not opts and not getattr(a, "subject_json", None):
+        # A card with a subject may have no buttons: the user answers by typing.
+        sys.exit("need at least one --option (or a --subject-json card)")
+    default_id = None
+    if a.default:
+        # 1-based so the CLI matches what the list looks like on screen.
+        idx = int(a.default) - 1
+        if not 0 <= idx < len(opts):
+            sys.exit(f"--default {a.default} out of range (1..{len(opts)})")
+        default_id = opts[idx]["id"]
+
+    prompt = {
+        "v": CONTRACT_VERSION,
+        "id": str(uuid.uuid4()),
+        "kind": a.kind,
+        "options": opts,
+        "expires_at": (datetime.now(timezone.utc)
+                       + timedelta(hours=a.expires_h)).isoformat(),
+    }
+    if a.ref:
+        prompt["ref"] = a.ref
+    # The card the client draws (ChoicePrompt.swift § subject): what kind of
+    # thing is asked about, when, where, and the bare question. Optional — a
+    # prompt without it renders exactly as before.
+    if getattr(a, "subject_json", None):
+        try:
+            prompt["subject"] = json.loads(a.subject_json)
+        except ValueError:
+            print("choice: ignoring unparseable --subject-json", file=sys.stderr)
+    if a.prompt:
+        prompt["prompt"] = a.prompt
+    if default_id:
+        prompt["default_id"] = default_id
+
+    # The message TEXT must stand on its own: a build that has never heard of
+    # choices renders only this, and it still has to be answerable by typing.
+    body = a.text or a.prompt or "Quick question:"
+    # The picture rides in the BODY, on its own line: the client renders a
+    # standalone image URL as an inline image (MessageContentParser), and an
+    # older build still shows a tappable link. Nothing else to version.
+    if getattr(a, "image_url", None):
+        body = f"{body}\n\n{a.image_url}"
+    row = req("jori_messages", "POST", {
+        "role": "assistant", "content": body, "read": False,
+        "channel": a.channel,
+        "metadata": {"choices": json.dumps(prompt, ensure_ascii=False)},
+    })
+    mid = (row or [{}])[0].get("id")
+
+    # PUSH IT. Inserting the row is not sending the message: a question sitting
+    # unseen in the app is not a question. `choice send` originally wrote
+    # straight to jori_messages over REST and fired nothing, so the first
+    # live prompts reached the user silently, found only by opening the app.
+    # `jori-notify` is the right hook rather than a raw APNs call because it goes through sendApnsPush, which carries the MOTION GATE: a
+    # non-urgent ping while the user is walking is parked and flushed once they
+    # stop, and a push that lands in a pocket is not a quieter push, it is a lost
+    # one. --message-id makes the notification deep-link to this exact prompt.
+    #
+    # NOT routed through jori-send-curl, and that is a real gap worth naming:
+    # this skips the outbound precheck. The message is composed from a decision
+    # `stop-identify` already made deterministically, which is the same shape as
+    # the documented location-confirm exemption — but that exemption is written
+    # for an LLM resolver, and this is not one. Revisit if choice prompts ever
+    # start being composed from something less certain than a GPS fix.
+    #
+    # A location card (kind location_*) is always urgent (location questions
+    # must reach the user as soon as they are conceived): a time-sensitive
+    # push, which the motion gate does not park. Decided from the kind, never from the text.
+    if mid and not a.no_push:
+        notify = [os.path.join(REPO, "bin/jori-notify"), "--message-id", str(mid)]
+        if a.kind.startswith("location") or a.urgent:
+            notify.append("--urgent")
+        try:
+            subprocess.run(
+                notify + [a.push or a.prompt or "Quick question"],
+                timeout=30, check=False)
+        except Exception as e:  # a failed push must not lose the message
+            print(f"[choice] push failed (message still in app): {e}", file=sys.stderr)
+
+    print(json.dumps({"message_id": mid, "prompt_id": prompt["id"],
+                      "options": [o["label"] for o in opts],
+                      "default": default_id, "expires_at": prompt["expires_at"]},
+                     indent=2, ensure_ascii=False))
+
+
+def _prompts(since_h=72):
+    since = (datetime.now(timezone.utc) - timedelta(hours=since_h)).isoformat()
+    rows = req("jori_messages?role=eq.assistant"
+               f"&created_at=gte.{urllib.parse.quote(since)}"
+               "&metadata=not.is.null"
+               "&select=id,content,created_at,metadata&order=created_at.desc&limit=200") or []
+    out = []
+    for r in rows:
+        raw = (r.get("metadata") or {}).get("choices")
+        if not raw:
+            continue
+        try:
+            p = json.loads(raw)
+        except ValueError:
+            continue
+        if p.get("v") == CONTRACT_VERSION:
+            out.append((r, p))
+    return out
+
+
+def _replies(message_ids):
+    """Every reply to these prompts — the user's taps AND prior default applications."""
+    if not message_ids:
+        return {}
+    ids = ",".join(message_ids)
+    rows = req(f"jori_messages?reply_to=in.({ids})"
+               "&select=id,role,content,reply_to,metadata,created_at"
+               "&order=created_at.asc&limit=500") or []
+    by = {}
+    for r in rows:
+        by.setdefault(str(r["reply_to"]), []).append(r)
+    return by
+
+
+GUESS_KINDS = {"location_stop"}  # cards whose default `findme guess` knows how to apply
+
+
+def _apply_guess(visit_id, value, message_id):
+    """`findme guess` for one card. Returns (applied, reason)."""
+    try:
+        r = subprocess.run([os.path.join(REPO, "bin/findme"), "guess", visit_id, value,
+                            "--source", message_id, "--json"],
+                           capture_output=True, text=True, timeout=60)
+    except Exception as e:  # a failed guess leaves the card open, as before
+        return False, f"findme guess failed: {e}"
+    try:
+        out = json.loads((r.stdout or "").strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        out = {}
+    if r.returncode == 0 and out.get("applied"):
+        return True, None
+    return False, out.get("reason") or (r.stderr or "").strip()[-200:] or f"exit {r.returncode}"
+
+
+def cmd_sweep(a):
+    """Expired, unanswered prompts. Report-only without --apply.
+
+    With --apply, an expired `location_stop` card with a default and a visit
+    ref gets that default applied as a low-confidence guess on its own row
+    (`findme guess`, see the module docstring). Every other card is reported
+    and left open. Nothing is ever posted in the chat: a reply line claiming
+    something was recorded is what this used to get wrong.
+    """
+    items = _prompts()
+    replies = _replies([str(r["id"]) for r, _ in items])
+    now = datetime.now(timezone.utc)
+    # A ref the user answered on ANY card (a re-asked stop is two cards) is answered.
+    answered_refs = {p.get("ref") for row, p in items if p.get("ref")
+                     and any(r.get("role") == "user" for r in replies.get(str(row["id"]), []))}
+    expired, skipped = [], []
+    for row, p in items:
+        mid = str(row["id"])
+        rs = replies.get(mid, [])
+        if any(r.get("role") == "user" for r in rs):
+            skipped.append((mid, "answered by tap"))
+            continue
+        if any((r.get("metadata") or {}).get("choice_default") for r in rs):
+            skipped.append((mid, "old sweep line (nothing was recorded)"))
+            continue
+        exp = p.get("expires_at")
+        if exp and datetime.fromisoformat(exp.replace("Z", "+00:00")) > now:
+            skipped.append((mid, "not expired yet"))
+            continue
+        dflt = next((o for o in p.get("options", []) if o["id"] == p.get("default_id")), None)
+        expired.append((mid, dflt, p))
+    guessed = 0
+    for mid, dflt, p in expired:
+        guess = dflt["label"] if dflt else None
+        if not (a.apply and dflt and p.get("kind") in GUESS_KINDS and p.get("ref")):
+            hint = f"; best guess was {guess}, not applied" if guess else ""
+            print(f"expired  {mid[:8]}  {p.get('kind')}  left open{hint}")
+            continue
+        if p.get("ref") in answered_refs:
+            print(f"expired  {mid[:8]}  {p.get('kind')}  left open; the user answered another card for this stop")
+            continue
+        ok, why = _apply_guess(str(p["ref"]), dflt.get("value") or dflt["label"], mid)
+        if ok:
+            guessed += 1
+            print(f"guessed  {mid[:8]}  {p.get('kind')}  probably {guess} (low confidence; a tap replaces it)")
+        else:
+            print(f"expired  {mid[:8]}  {p.get('kind')}  left open; not guessed: {why}")
+    for mid, why in skipped:
+        print(f"  skip     {mid[:8]}  {why}")
+    print(f"\n{len(expired)} expired unanswered ({guessed} guessed, the rest left open), "
+          f"{len(skipped)} skipped")
+
+
+def cmd_list(a):
+    items = _prompts()
+    replies = _replies([str(r["id"]) for r, _ in items])
+    for row, p in items:
+        mid = str(row["id"])
+        rs = replies.get(mid, [])
+        tap = next((r["content"] for r in rs if r.get("role") == "user"), None)
+        dflt = next(((r.get("metadata") or {}).get("choice_default") for r in rs
+                     if (r.get("metadata") or {}).get("choice_default")), None)
+        state = (f"tapped: {tap}" if tap else
+                 (f"open (old sweep line claimed {dflt}; nothing was recorded)" if dflt else "open"))
+        print(f"{row['created_at'][:19]}  {mid[:8]}  {p.get('kind'):<16} {state}")
+        for o in p["options"]:
+            mark = " ←default" if o["id"] == p.get("default_id") else ""
+            print(f"      [ {o['label']} ]{mark}")
+    print(f"\n{len(items)} prompt(s) in the last 72h")
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    s = sub.add_parser("send")
+    s.add_argument("--kind", required=True)
+    s.add_argument("--ref")
+    s.add_argument("--prompt")
+    s.add_argument("--text", help="message body; defaults to --prompt")
+    s.add_argument("--subject-json", dest="subject_json",
+                   help="what the question is ABOUT, for the client card: "
+                        "{kind: place|route|event, mode?, start, end, tz, lat?, lon?, "
+                        "map_url?, context?, question?, title?}")
+    s.add_argument("--image-url", dest="image_url",
+                   help="image shown under the question (e.g. a stop-map PNG)")
+    s.add_argument("--option", action="append", default=[],
+                   help='"Label|sublabel", repeatable')
+    s.add_argument("--default", help="1-based index of the default option")
+    s.add_argument("--expires-h", type=float, default=DEFAULT_EXPIRES_H, dest="expires_h")
+    s.add_argument("--channel", default="chat")
+    s.add_argument("--push", help="push body; defaults to --prompt")
+    s.add_argument("--no-push", action="store_true", dest="no_push",
+                   help="insert without notifying (tests, backfills)")
+    s.add_argument("--urgent", action="store_true",
+                   help="time-sensitive push (always on for a location_* kind)")
+    s.set_defaults(fn=cmd_send)
+    w = sub.add_parser("sweep")
+    w.add_argument("--apply", action="store_true",
+                   help="apply expired location_stop defaults as low-confidence guesses "
+                        "(findme guess); without it the sweep only reports")
+    w.set_defaults(fn=cmd_sweep)
+    l = sub.add_parser("list")
+    l.set_defaults(fn=cmd_list)
+    a = ap.parse_args()
+    a.fn(a)
+
+
+if __name__ == "__main__":
+    main()

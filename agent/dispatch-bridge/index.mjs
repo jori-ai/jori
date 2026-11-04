@@ -10,7 +10,7 @@ import { createRequire } from "node:module";
 // Who the notifications are for (lib/instance.cjs; "the user" in a fresh install).
 const OWNER = createRequire(import.meta.url)("../../lib/instance.cjs").instance().owner_name;
 
-const PORT = 9093;
+const PORT = createRequire(import.meta.url)("../../lib/ports.cjs").port("ops_health");
 
 const mcp = new Server(
   { name: "dispatch-bridge", version: "1.0.0" },

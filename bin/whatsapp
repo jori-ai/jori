@@ -1,0 +1,358 @@
+#!/bin/bash
+# whatsapp — CLI for reading/searching WhatsApp via AppleScript UI automation
+#
+# Usage:
+#   whatsapp read <contact> [--limit N]  — Read recent messages from a chat
+#   whatsapp search <query>              — Search chats via WhatsApp's search
+#   whatsapp send <contact> <message>    — Send a message to a contact
+#   whatsapp chats                       — List visible/recent chats
+#
+# WhatsApp Desktop stores messages in encrypted SQLite — no direct DB access.
+# This tool automates WhatsApp Desktop via AppleScript/accessibility.
+# Requires: Accessibility permission for the calling process.
+# WhatsApp Desktop must be running and logged in.
+
+set -euo pipefail
+
+CMD="${1:-help}"
+shift 2>/dev/null || true
+
+ensure_running() {
+  if ! pgrep -q "WhatsApp"; then
+    echo "Error: WhatsApp Desktop is not running. Please open it first." >&2
+    exit 1
+  fi
+}
+
+
+_WA_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+. "$_WA_DIR/../agent/scripts/lib/root.sh"       # JORI_INSTALL_TOOLS
+. "$_WA_DIR/../agent/scripts/lib/instance.sh"   # exports JORI_TZ (times are shown in it)
+INBOX="${WHATSAPP_INBOX:-$JORI_INSTALL_TOOLS/data/whatsapp-inbox.jsonl}"
+
+# Shared reader over the Baileys inbox log. Rows: kind "message" (from_me true
+# for the user's own messages typed on their phone) and kind "sent" (sent by
+# Jori through the runner). Inputs come in through the environment, never
+# spliced into the script, so quotes in a name cannot break it.
+WA_JS_COMMON='
+const fs = require("fs");
+const rows = fs.readFileSync(process.env.WA_INBOX, "utf8").split("\n").filter(Boolean)
+  .map((l) => { try { return JSON.parse(l); } catch { return null; } })
+  .filter((m) => m && (m.kind === "message" || m.kind === "sent") && m.text && m.chat_id);
+const mine = (m) => m.kind === "sent" || m.from_me === true;
+const label = (m) => mine(m) ? "You" : (m.sender_name || m.sender || "?");
+const when = (m) => new Date(m.ts).toLocaleString("en-US", { timeZone: process.env.JORI_TZ || undefined });
+// The newest group subject seen for each group chat.
+const groupNames = new Map();
+for (const m of rows) if (m.group_name) groupNames.set(m.chat_id, m.group_name);
+const isGroupChat = (m) => m.is_group === true || String(m.chat_id).endsWith("@g.us");
+const where = (m) => isGroupChat(m) ? "[" + (groupNames.get(m.chat_id) || "group") + "] " : "";
+'
+
+case "$CMD" in
+
+  chats|ls|list)
+    # The inbox log is the reliable source; UI automation only when it is missing.
+    if [ -f "$INBOX" ]; then
+      WA_INBOX="$INBOX" node -e "$WA_JS_COMMON"'
+        // One line per chat, newest activity first. A group shows its subject; a
+        // 1:1 chat the other person (their newest name seen, never the user).
+        const chats = new Map();
+        for (const m of rows) {
+          const c = chats.get(m.chat_id) || { name: null, last: null };
+          if (!isGroupChat(m) && !mine(m) && m.sender_name) c.name = m.sender_name;
+          if (!c.last || m.ts >= c.last.ts) c.last = m;
+          chats.set(m.chat_id, c);
+        }
+        const list = [...chats].sort((a, b) => b[1].last.ts.localeCompare(a[1].last.ts)).slice(0, 25);
+        for (const [id, c] of list) {
+          const name = isGroupChat(c.last) ? (groupNames.get(id) || "group " + id) : (c.name || id.split("@")[0]);
+          console.log(when(c.last) + "  " + name + "  " + label(c.last) + ": " + c.last.text.slice(0, 60));
+        }
+      '
+      exit 0
+    fi
+
+    ensure_running
+    osascript <<'EOF'
+tell application "WhatsApp" to activate
+delay 0.5
+
+tell application "System Events"
+    tell process "WhatsApp"
+        set frontmost to true
+        delay 0.3
+
+        -- Get the main window
+        set mainWin to window 1
+
+        -- Try to read chat list from the sidebar
+        -- WhatsApp uses web views, so we access via accessibility
+        try
+            set chatList to {}
+            set allGroups to every group of mainWin
+            repeat with g in allGroups
+                try
+                    set groupRole to value of attribute "AXRole" of g
+                    if groupRole is "AXGroup" then
+                        set groupTexts to every static text of g
+                        repeat with elem in groupTexts
+                            try
+                                set txtVal to value of elem
+                                if txtVal is not "" and txtVal is not missing value then
+                                    set end of chatList to txtVal
+                                end if
+                            end try
+                        end repeat
+                    end if
+                end try
+            end repeat
+
+            if (count of chatList) > 0 then
+                set AppleScript's text item delimiters to linefeed
+                return chatList as text
+            end if
+        end try
+
+        -- Fallback: try getting all static text elements
+        try
+            set allTexts to {}
+            set staticTexts to every static text of mainWin
+            repeat with elem in staticTexts
+                try
+                    set txtVal to value of elem
+                    if txtVal is not "" and txtVal is not missing value then
+                        set end of allTexts to txtVal
+                    end if
+                end try
+            end repeat
+            set AppleScript's text item delimiters to linefeed
+            return allTexts as text
+        end try
+
+        return "Could not read chat list — WhatsApp UI may have changed"
+    end tell
+end tell
+EOF
+    ;;
+
+  read|get|show)
+    CONTACT="${1:?Usage: whatsapp read <contact> [--limit N]}"
+    shift
+    LIMIT=20
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --limit|-n) LIMIT="$2"; shift 2 ;;
+        *) shift ;;
+      esac
+    done
+
+    # WhatsApp Desktop uses Electron — its window content isn't accessible via AppleScript.
+    # Always read from the Baileys inbox log (reliable), fall back to UI automation only if log missing.
+    if [ -f "$INBOX" ]; then
+      WA_INBOX="$INBOX" WA_CONTACT="$CONTACT" WA_LIMIT="$LIMIT" node -e "$WA_JS_COMMON"'
+        const contact = process.env.WA_CONTACT;
+        const q = contact.toLowerCase();
+        const limit = Number(process.env.WA_LIMIT) || 20;
+        // A contact is a person or group name, or a phone number / chat id. Inbound
+        // 1:1 chats may be logged under a privacy id (chat_lid / sender_lid).
+        const digits = contact.replace(/[^0-9]/g, "");
+        const byNumber = (m) => digits.length >= 7 && [m.sender, m.sender_lid, m.chat_id, m.chat_lid].some((v) => v && String(v).split("@")[0] === digits);
+        const byName = (m) => !mine(m) && (m.sender_name || "").toLowerCase().includes(q);
+        const byGroup = (m) => (groupNames.get(m.chat_id) || m.group_name || "").toLowerCase().includes(q);
+        // A named group or a 1:1 chat is read whole, both sides; a person named
+        // also brings their own posts in groups.
+        const chatIds = new Set();
+        for (const m of rows) {
+          if (byGroup(m) || (byNumber(m) && !isGroupChat(m)) || (byName(m) && !isGroupChat(m))) chatIds.add(m.chat_id);
+          if (m.chat_id === contact) chatIds.add(m.chat_id); // a group id passed as is
+        }
+        const msgs = rows.filter((m) => chatIds.has(m.chat_id) || byName(m) || (byNumber(m) && !mine(m))).slice(-limit);
+        if (!msgs.length) {
+          console.log("No messages found for contact: " + contact + " in inbox log");
+          process.exit(0);
+        }
+        for (const m of msgs) console.log("[" + when(m) + "] " + where(m) + label(m) + ": " + m.text);
+      '
+      exit 0
+    fi
+
+    # Fallback: try AppleScript UI automation (unlikely to work on Electron)
+    ensure_running
+    CONTACT_ESC="${CONTACT//\"/\\\"}"
+    osascript << ASCRIPT
+      set targetContact to "$CONTACT_ESC"
+      set msgLimit to $LIMIT
+
+      tell application "WhatsApp" to activate
+      delay 0.5
+
+      tell application "System Events"
+          tell process "WhatsApp"
+              set frontmost to true
+              delay 0.3
+
+              keystroke "f" using command down
+              delay 0.5
+              keystroke targetContact
+              delay 1.5
+              keystroke return
+              delay 1
+
+              set mainWin to window 1
+              set allTexts to {}
+              try
+                  set staticTexts to every static text of mainWin
+                  set msgCount to 0
+                  repeat with elem in staticTexts
+                      try
+                          set txtVal to value of elem
+                          if txtVal is not "" and txtVal is not missing value then
+                              set end of allTexts to txtVal
+                              set msgCount to msgCount + 1
+                              if msgCount >= msgLimit then exit repeat
+                          end if
+                      end try
+                  end repeat
+              end try
+
+              key code 53
+              delay 0.3
+
+              if (count of allTexts) > 0 then
+                  set AppleScript's text item delimiters to linefeed
+                  return allTexts as text
+              end if
+
+              return "Could not read messages — chat may not exist or UI changed"
+          end tell
+      end tell
+ASCRIPT
+    ;;
+
+  search|find)
+    QUERY="${1:?Usage: whatsapp search <query>}"
+
+    if [ -f "$INBOX" ]; then
+      WA_INBOX="$INBOX" WA_QUERY="$QUERY" node -e "$WA_JS_COMMON"'
+        const q = process.env.WA_QUERY.toLowerCase();
+        const msgs = rows.filter((m) => m.text.toLowerCase().includes(q));
+        if (!msgs.length) { console.log("No results for: " + q); process.exit(0); }
+        for (const m of msgs.slice(-30)) console.log("[" + when(m) + "] " + where(m) + label(m) + ": " + m.text);
+      '
+      exit 0
+    fi
+
+    ensure_running
+    QUERY_ESC="${QUERY//\"/\\\"}"
+    osascript << ASCRIPT
+      set searchQuery to "$QUERY_ESC"
+
+      tell application "WhatsApp" to activate
+      delay 0.5
+
+      tell application "System Events"
+          tell process "WhatsApp"
+              set frontmost to true
+              delay 0.3
+
+              keystroke "f" using command down
+              delay 0.5
+              keystroke searchQuery
+              delay 2
+
+              set mainWin to window 1
+              set allTexts to {}
+              try
+                  set staticTexts to every static text of mainWin
+                  repeat with elem in staticTexts
+                      try
+                          set txtVal to value of elem
+                          if txtVal is not "" and txtVal is not missing value then
+                              set end of allTexts to txtVal
+                          end if
+                      end try
+                  end repeat
+              end try
+
+              key code 53
+              delay 0.3
+
+              if (count of allTexts) > 0 then
+                  set AppleScript's text item delimiters to linefeed
+                  return allTexts as text
+              end if
+
+              return "No results found"
+          end tell
+      end tell
+ASCRIPT
+    ;;
+
+  send)
+    CONTACT="${1:?Usage: whatsapp send <contact> <message>}"
+    MESSAGE="${2:?Usage: whatsapp send <contact> <message>}"
+    ensure_running
+
+    osascript -e "
+      set targetContact to \"$CONTACT\"
+      set msgText to \"$MESSAGE\"
+
+      tell application \"WhatsApp\" to activate
+      delay 0.5
+
+      tell application \"System Events\"
+          tell process \"WhatsApp\"
+              set frontmost to true
+              delay 0.3
+
+              -- Search for the contact
+              keystroke \"f\" using command down
+              delay 0.5
+              keystroke targetContact
+              delay 1.5
+              keystroke return
+              delay 1
+
+              -- Close search and focus message input
+              key code 53
+              delay 0.3
+
+              -- Type and send message
+              keystroke msgText
+              delay 0.3
+              keystroke return
+
+              return \"Sent to \" & targetContact
+          end tell
+      end tell
+    "
+    ;;
+
+  help|--help|-h)
+    cat <<'HELP'
+whatsapp — CLI for WhatsApp Desktop (read, search, send)
+
+NOTE: Uses UI automation — WhatsApp Desktop must be running and logged in.
+      Results may vary depending on WhatsApp Desktop version.
+
+Commands:
+  chats                                  List visible/recent chats
+  read <contact> [--limit N]             Read recent messages from a chat
+  search <query>                         Search across chats
+  send <contact> <message>               Send a message
+
+Examples:
+  whatsapp chats
+  whatsapp read "John Smith"
+  whatsapp search "dinner plans"
+  whatsapp send "John Smith" "Hey, are we still on for tonight?"
+HELP
+    ;;
+
+  *)
+    echo "Unknown command: $CMD" >&2
+    echo "Run 'whatsapp help' for usage." >&2
+    exit 1
+    ;;
+esac

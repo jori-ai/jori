@@ -1,0 +1,12 @@
+#!/usr/bin/env node
+// supervisor-code-reload [--dry-run | --report] — restart a supervisor (or
+// hum-sense) whose code on disk is newer than the running process, only when it
+// is idle and safe; --report is the read-only view `jori doctor` reads. Run by
+// watchdog.sh every tick; logic and rationale in lib/supervisor-code-reload.mjs.
+const path = require("node:path");
+const { pathToFileURL } = require("node:url");
+import(pathToFileURL(path.join(__dirname, "../lib/supervisor-code-reload.mjs")).href)
+  .then(async (m) => { process.exitCode = await m.main(process.argv.slice(2)); })
+  // A crash says nothing about anyone's code: 5 (watchdog.sh neither pages nor
+  // clears), never 0, which means "every target is on the code on disk".
+  .catch((e) => { console.log(`supervisor-code-reload: ${e.message}`); process.exitCode = 5; });

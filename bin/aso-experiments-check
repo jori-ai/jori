@@ -1,0 +1,147 @@
+#!/usr/bin/env python3
+# aso-experiments-check — daily monitor for active iOS PPO (Product Page Optimization)
+# experiments on the installation's app (agent/local/config/marketing.json
+# `ios_app_id`; OFF without it). Skeleton handles "no active experiments" gracefully so the job is
+# safe to run before any experiment exists.
+#
+# Reads ASC API via asc-api-call helper (deterministic JWT + retry).
+#
+# Output: data/mkt-aso-experiments-state.json with current experiment
+# status. Significant deltas (e.g. statistical significance reached) are
+# flagged to mkt-aso-opportunity-scan for surfacing.
+#
+# Apple endpoints:
+#   /v1/apps/{id}/customerReviews            (already used by mkt-reviews-pulse)
+#   /v1/apps/{id}/inAppPurchases             (no relation to ASO experiments)
+#   /v1/apps/{id}/appStoreVersionExperimentsV2  → the V2 PPO endpoint we want
+#
+# Google Play Console doesn't expose Store Listing Experiments via API — that
+# data has to be checked in the console UI. For now, this job is iOS-only.
+
+import json, os, subprocess, sys, time
+
+_BIN = os.path.dirname(os.path.realpath(globals().get("__file__") or sys.argv[0]))
+sys.path.insert(0, os.path.join(os.path.dirname(_BIN), "lib"))
+import mkt_local  # noqa: E402
+
+CFG = mkt_local.config()
+STATE_PATH = mkt_local.data_path("mkt-aso-experiments-state.json")
+TODAY = time.strftime("%Y-%m-%d", time.gmtime())
+
+IOS_APP_ID = str(CFG.get("ios_app_id") or "")
+ASC_HELPER = mkt_local.bin_path("asc-api-call")
+
+
+def load(path, default=None):
+    if not os.path.exists(path):
+        return default
+    try:
+        return json.load(open(path))
+    except Exception:
+        return default
+
+
+def save_json(path, data):
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f, indent=2)
+    os.rename(tmp, path)
+
+
+def asc_call(path):
+    """Invoke asc-api-call. Returns (ok, body|error_msg)."""
+    try:
+        result = subprocess.run(
+            [ASC_HELPER, path],
+            capture_output=True, text=True, timeout=120,
+        )
+        if result.returncode == 0:
+            return True, json.loads(result.stdout)
+        # exit code 1 = transient, 2 = auth_broken
+        return False, {"exit_code": result.returncode, "stdout": result.stdout, "stderr": result.stderr[:500]}
+    except Exception as e:
+        return False, {"error": str(e)}
+
+
+def find_experiments():
+    """Walk apps → appStoreVersions → experimentsV2. Returns list of experiments with status."""
+    # Get latest appStoreVersion
+    ok, asv = asc_call(f"/v1/apps/{IOS_APP_ID}/appStoreVersions?limit=1")
+    if not ok:
+        return None, {"error": "asv_fetch_failed", "detail": asv}
+    asv_data = asv.get("body", {}).get("data", [])
+    if not asv_data:
+        return [], {"note": "no app store versions"}
+    asv_id = asv_data[0]["id"]
+    # Get experiments under that version
+    ok, exp = asc_call(f"/v1/appStoreVersions/{asv_id}/appStoreVersionExperimentsV2")
+    if not ok:
+        # The endpoint returns 200 with empty data when no experiments. A real
+        # error here means the endpoint shape changed OR auth issue.
+        return None, {"error": "experiments_fetch_failed", "detail": exp}
+    experiments = []
+    for e in exp.get("body", {}).get("data", []):
+        attrs = e.get("attributes", {})
+        experiments.append({
+            "id": e["id"],
+            "name": attrs.get("name"),
+            "state": attrs.get("state"),
+            "started_at": attrs.get("startedAt"),
+            "ended_at": attrs.get("endedAt"),
+            "trafficProportion": attrs.get("trafficProportion"),
+        })
+    return experiments, None
+
+
+def main():
+    if not IOS_APP_ID:
+        print(json.dumps({"ok": True, "skipped": "not configured (marketing.json ios_app_id)"}))
+        return 0
+    prior = load(STATE_PATH, default={"version": 1, "experiments": [], "history": []})
+    experiments, err = find_experiments()
+    if err and experiments is None:
+        # Hard failure — log and exit silent
+        prior["last_run"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        prior["last_run_ok"] = False
+        prior["last_error"] = err
+        save_json(STATE_PATH, prior)
+        print(json.dumps({"ok": False, "error": err}, indent=2))
+        return 1
+
+    out = {
+        "version": 1,
+        "last_run": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "last_run_ok": True,
+        "experiments": experiments,
+        "history": (prior.get("history") or [])[-89:] + [{
+            "date": TODAY,
+            "active_count": sum(1 for e in experiments if e.get("state") in ("PROCESSING", "READY_FOR_REVIEW", "ACCEPTED")),
+            "total_count": len(experiments),
+        }],
+    }
+
+    # Detect state changes vs prior run
+    prior_by_id = {e["id"]: e for e in prior.get("experiments", [])}
+    state_changes = []
+    for e in experiments:
+        prev = prior_by_id.get(e["id"])
+        if not prev:
+            state_changes.append({"id": e["id"], "name": e.get("name"), "kind": "new", "state": e.get("state")})
+        elif prev.get("state") != e.get("state"):
+            state_changes.append({
+                "id": e["id"], "name": e.get("name"), "kind": "state_change",
+                "from": prev.get("state"), "to": e.get("state"),
+            })
+    out["state_changes_this_run"] = state_changes
+    save_json(STATE_PATH, out)
+    print(json.dumps({
+        "ok": True,
+        "experiments_found": len(experiments),
+        "state_changes": len(state_changes),
+        "note": "no active experiments — surface a guidance opp via opportunity-scan" if not experiments else None,
+    }, indent=2))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,257 @@
+#!/usr/bin/env python3
+"""location-current-stop — detect if the user is currently dwelling at a stop.
+
+Pulls the last ~25 min of GPS samples from Supabase `location_history`, runs the
+same Li/Zheng anchor-walk used by `location-segment`, and prints a JSON record
+that the live confirmation cron consumes:
+
+    {
+      "is_stop": true,
+      "duration_min": 24.5,
+      "centroid": {"lat": 12.3456, "lon": -65.4321},
+      "cluster_radius_m": 38.0,
+      "primary": {"name": "Example Noodle Bar", "confidence": 0.85, "source": "osm_overpass", ...},
+      "alternatives": [...],
+      "photo_count": 0,
+      "needs_confirm": true,
+      "skip_reason": null
+    }
+
+`needs_confirm` is true when the primary's source is osm_overpass /
+google_places / reverse_geocode / coordinate AND no photo evidence pushes
+confidence ≥ PHOTO_CONFIRM_THRESHOLD AND raw confidence < HIGH_CONFIDENCE_SKIP.
+"""
+
+from __future__ import annotations
+import argparse
+import json
+import os
+import runpy
+import sys
+from datetime import datetime, timedelta, timezone
+
+# Tunables for the ask gate.
+HIGH_CONFIDENCE_SKIP = 0.90       # ≥ this and we don't ask, regardless of photos
+PHOTO_CONF_BUMP = 0.04            # each in-window photo bumps confidence
+PHOTO_CONFIRM_THRESHOLD = 0.90    # post-bump confidence ≥ this → don't ask
+LOOKBACK_MIN = 60.0               # how far back to query GPS (a 15-min dwell must fit with its approach)
+MIN_DWELL_MIN = 15.0              # ask once the user has been here this long: 15-20 minutes, not hours
+MIN_PACE_SPAN_MIN = 8.0           # pace test needs at least this much fix-covered time
+DWELL_RADIUS_M = 100.0            # current-stop cluster radius
+# Same threshold resolve-day uses for the nightly pace test, measured on a
+# real day: real dwells 0.00-1.31 km/h, walk-throughs 2.40-4.36 km/h.
+MOVING_KMH = 1.8
+MIN_SAMPLES = 3                   # need at least this many points to call it a dwell
+
+# Inferred current-dwell — when GPS dies indoors there are no recent samples,
+# so the regular cluster walk sees nothing. We extend the lookback, take the
+# most recent sample as the user's last known position, and call it a dwell if
+# the prior samples around it were stationary.
+EXTENDED_LOOKBACK_MIN = 180.0     # silence beyond this is considered too stale
+INFERRED_TAIL_SAMPLES = 3         # how many samples just before the silence to inspect
+INFERRED_TAIL_RADIUS_M = 400.0    # they should cluster within this — generous so a brief
+                                  # walk-into-venue (200-300 m of settling-in) still counts
+
+LOC_SEG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "location-segment")
+
+def main(argv=None) -> int:
+    p = argparse.ArgumentParser(description="Detect current dwell + confirmation candidates")
+    p.add_argument("--lookback-min", type=float, default=LOOKBACK_MIN)
+    p.add_argument("--min-dwell-min", type=float, default=MIN_DWELL_MIN)
+    p.add_argument("--dwell-radius-m", type=float, default=DWELL_RADIUS_M)
+    p.add_argument("--at", type=str, default=None,
+                   help="ISO timestamp to anchor the lookback (default: now). For replay/testing.")
+    args = p.parse_args(argv if argv is not None else sys.argv[1:])
+
+    mod = runpy.run_path(LOC_SEG, run_name="location_current_stop")
+
+    if args.at:
+        anchor_dt = datetime.fromisoformat(args.at)
+        if anchor_dt.tzinfo is None:
+            anchor_dt = anchor_dt.replace(tzinfo=timezone.utc)
+        now_ms = int(anchor_dt.timestamp() * 1000)
+    else:
+        now_ms = int(datetime.now(tz=timezone.utc).timestamp() * 1000)
+    start_ms = now_ms - int(args.lookback_min * 60_000)
+
+    samples = mod["fetch_samples"](start_ms, now_ms)
+    haversine_m = mod["haversine_m"]
+    StopCandidate = mod["StopCandidate"]
+    Sample = mod["Sample"]
+
+    inferred = False
+
+    # A still phone stops emitting (location-spine: silence is evidence OF
+    # stillness), so a dwell lasts from its first fix until NOW, not until its
+    # last fix. Measuring to the last fix is what kept a 56-minute stop at
+    # "below_min_dwell" (12-20 min) for 50 minutes and asked about it as the
+    # user was leaving. With fewer than MIN_SAMPLES recent fixes, the
+    # cluster is walked back through the extended window instead.
+    pool = samples
+    if len(samples) < MIN_SAMPLES:
+        ext_start = now_ms - int(EXTENDED_LOOKBACK_MIN * 60_000)
+        pool = mod["fetch_samples"](ext_start, now_ms)
+        if not pool:
+            return _emit({"is_stop": False, "reason": "no_samples_in_extended_window",
+                          "sample_count": 0})
+        inferred = True
+        # If the last few fixes before the silence were spread out (driving),
+        # the user was mid-route when GPS died. One prior fix gives no movement signal.
+        tail = pool[-INFERRED_TAIL_SAMPLES:]
+        if len(tail) >= 2:
+            tlat = sum(x.lat for x in tail) / len(tail)
+            tlon = sum(x.lon for x in tail) / len(tail)
+            spread = max(haversine_m(tlat, tlon, x.lat, x.lon) for x in tail)
+            if spread > INFERRED_TAIL_RADIUS_M:
+                return _emit({
+                    "is_stop": False,
+                    "reason": "prior_samples_in_motion",
+                    "spread_m": round(spread, 1),
+                    "last_sample_age_min": round((now_ms - pool[-1].ts_ms) / 60_000, 1),
+                })
+
+    # Greedy current-cluster: walk back from the latest sample as long as we stay
+    # within DWELL_RADIUS_M of the running centroid. The last contiguous cluster
+    # is the "current stop".
+    anchor = pool[-1]
+    cluster_idx = [len(pool) - 1]
+    sum_lat, sum_lon = anchor.lat, anchor.lon
+    for i in range(len(pool) - 2, -1, -1):
+        clat = sum_lat / len(cluster_idx)
+        clon = sum_lon / len(cluster_idx)
+        if haversine_m(clat, clon, pool[i].lat, pool[i].lon) <= args.dwell_radius_m:
+            cluster_idx.append(i)
+            sum_lat += pool[i].lat
+            sum_lon += pool[i].lon
+        else:
+            break
+
+    cluster_idx.sort()
+    cluster = [pool[i] for i in cluster_idx]
+    sampled_min = (cluster[-1].ts_ms - cluster[0].ts_ms) / 60_000
+    silence_min = (now_ms - cluster[-1].ts_ms) / 60_000
+    duration_min = (now_ms - cluster[0].ts_ms) / 60_000
+
+    if len(cluster) == 1:
+        # One fix then silence: synthesize the span so the resolver has a window.
+        cluster = [cluster[0], Sample(ts_ms=now_ms, lat=cluster[0].lat, lon=cluster[0].lon)]
+    sc = StopCandidate(samples=cluster, inferred=inferred)
+    centroid = sc.centroid()
+    cluster_radius_m = sc.cluster_radius_m()
+
+    # Deterministic movement test, before we consider asking anything.
+    # One day this job asked 8 times; at least four were about windows its
+    # OWN ask text described as walking ("GPS shows you walking the whole
+    # stretch (~7km/h)"). Cluster RADIUS cannot tell a long sit from a brisk
+    # walk through a wide area — path length over time can. If the average
+    # speed between points is walking speed, there were no other stops. So a
+    # window that measures as walking is not a stop and must never become a
+    # question.
+    path_m = 0.0
+    for a, b in zip(cluster, cluster[1:]):
+        path_m += haversine_m(a.lat, a.lon, b.lat, b.lon)
+    # Pace over the span the fixes saw (silence adds time but no path). Under
+    # MIN_PACE_SPAN_MIN of fixes, GPS jitter dominates and the 100 m cluster
+    # radius is the movement test.
+    pace_kmh = (path_m / 1000.0) / (sampled_min / 60.0) if sampled_min > 0 else 0.0
+    if sampled_min >= MIN_PACE_SPAN_MIN and pace_kmh >= MOVING_KMH:
+        return _emit({
+            "is_stop": False,
+            "reason": "moving",
+            "skip_reason": f"moving:{pace_kmh:.1f}kmh",
+            "pace_kmh": round(pace_kmh, 2),
+            "path_m": round(path_m),
+            "duration_min": round(duration_min, 1),
+            "centroid": {"lat": round(centroid[0], 6), "lon": round(centroid[1], 6)},
+            "cluster_radius_m": round(cluster_radius_m, 1),
+            "sample_count": len(cluster),
+        })
+
+    if duration_min < args.min_dwell_min:
+        return _emit({
+            "is_stop": False,
+            "reason": "below_min_dwell",
+            "duration_min": round(duration_min, 1),
+            "centroid": {"lat": round(centroid[0], 6), "lon": round(centroid[1], 6)},
+            "cluster_radius_m": round(cluster_radius_m, 1),
+            "sample_count": len(cluster),
+        })
+
+    # Resolve via the same tier ladder as location-segment.
+    Options = mod["Options"]
+    opts = Options(
+        min_stop_min=15.0, stop_radius_m=200.0, merge_gap_min=15.0,
+        snap="none", no_places=False, no_overpass=False,
+        no_photos=False, no_audio=False, debug=False, saved_places=True,
+    )
+    recurring = mod["load_known_recurring_stops"]()
+    wifi_entries = mod["load_wifi_map"]()
+    confirmed = mod["load_confirmed_stops"]()
+    primary, alts = mod["resolve_place"](sc, opts, recurring, wifi_entries, confirmed)
+
+    # Photo evidence — count photos whose ts is in the cluster window.
+    photos = mod["fetch_photos"](cluster[0].ts_ms, cluster[-1].ts_ms)
+    photo_count = sum(
+        1 for ph in photos
+        if haversine_m(centroid[0], centroid[1], ph["lat"], ph["lon"]) <= 50
+    )
+
+    # Decide whether to ask. Already-named sources are auto-skip.
+    AUTO_SKIP_SOURCES = {"named_location", "confirmed_stop", "known_recurring", "wifi_ssid"}
+    skip_reason = None
+    if primary.source in AUTO_SKIP_SOURCES:
+        skip_reason = f"already_known:{primary.source}"
+    elif inferred:
+        # Inferred dwells have no GPS evidence during the dwell window — the
+        # resolver scores from one stale sample. Multiple OSM candidates often
+        # all land at the 0.92 cap (a pizzeria, a barbecue place and a bagel
+        # shop all in the same 30 m radius), and the system's "winner" is essentially
+        # a coin flip. Always ask.
+        pass
+    elif primary.confidence >= HIGH_CONFIDENCE_SKIP:
+        skip_reason = "high_confidence"
+    else:
+        bumped = primary.confidence + PHOTO_CONF_BUMP * photo_count
+        if bumped >= PHOTO_CONFIRM_THRESHOLD and photo_count >= 1:
+            skip_reason = f"photo_supported(bumped={bumped:.2f},photos={photo_count})"
+
+    needs_confirm = skip_reason is None
+
+    return _emit({
+        "is_stop": True,
+        "inferred": inferred,
+        "duration_min": round(duration_min, 1),
+        "centroid": {"lat": round(centroid[0], 6), "lon": round(centroid[1], 6)},
+        "cluster_radius_m": round(cluster_radius_m, 1),
+        "sample_count": len(cluster),
+        "silence_min": round(silence_min, 1),
+        "first_sample_ts": mod["ms_to_iso"](cluster[0].ts_ms),
+        "last_sample_ts": mod["ms_to_iso"](cluster[-1].ts_ms),
+        "primary": _candidate(primary, mod),
+        "alternatives": [_candidate(a, mod) for a in alts],
+        "photo_count": photo_count,
+        "needs_confirm": needs_confirm,
+        "skip_reason": skip_reason,
+    })
+
+def _candidate(c, mod):
+    out = {
+        "name": c.name,
+        "address": c.address,
+        "source": c.source,
+        "confidence": round(c.confidence, 2),
+    }
+    if c.distance_m is not None:
+        out["distance_m"] = round(c.distance_m, 1)
+    if c.place_id:
+        out["place_id"] = c.place_id
+    if c.primary_type:
+        out["primary_type"] = c.primary_type
+    return out
+
+def _emit(payload) -> int:
+    print(json.dumps(payload, indent=2))
+    return 0
+
+if __name__ == "__main__":
+    sys.exit(main())

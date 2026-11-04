@@ -1,0 +1,84 @@
+#!/usr/bin/env node
+// omdb-verify — look up a show/movie title on OMDb before chat-agent states
+// facts about it. Prevents confident wrong country / year / platform claims
+// about a title reasoned from memory.
+//
+// Usage:
+//   omdb-verify "<Title>"              verify by title (both types)
+//   omdb-verify "<Title>" --type movie     restrict to movie|series
+//   omdb-verify --imdb tt12345678         verify by IMDb id
+//   omdb-verify "<Title>" --format json    raw JSON payload
+//
+// Exit codes: 0 = found, 2 = not found, 1 = error.
+//
+// Does NOT return platform/streaming — OMDb has no reliable current-platform
+// field. Chat-agent must not assert platform unless it's in next-show output
+// or the watchlist row's description.
+
+import { loadEnv } from "../lib/load-env.js";
+
+loadEnv();
+
+const OMDB = process.env.OMDB_API_KEY;
+if (!OMDB) {
+  console.error("omdb-verify: OMDB_API_KEY not set in .env (free key at omdbapi.com) — title facts can't be verified");
+  process.exit(1);
+}
+
+function argVal(flag) {
+  const i = process.argv.indexOf(flag);
+  return i >= 0 ? process.argv[i + 1] : null;
+}
+
+const imdbId = argVal("--imdb");
+const type = argVal("--type"); // movie | series | episode
+const format = argVal("--format") || "text";
+const title = process.argv.slice(2).find(a => !a.startsWith("--") && process.argv[process.argv.indexOf(a) - 1] !== "--imdb" && process.argv[process.argv.indexOf(a) - 1] !== "--type" && process.argv[process.argv.indexOf(a) - 1] !== "--format");
+
+if (!imdbId && !title) {
+  console.error("usage: omdb-verify \"<title>\" [--type movie|series] [--format text|json]");
+  console.error("       omdb-verify --imdb tt12345678 [--format text|json]");
+  process.exit(1);
+}
+
+async function omdb(params) {
+  const url = `https://www.omdbapi.com/?apikey=${OMDB}&${params}&plot=short`;
+  try {
+    const res = await fetch(url);
+    return await res.json();
+  } catch (err) {
+    console.error(`omdb-verify: fetch failed: ${err.message}`);
+    process.exit(1);
+  }
+}
+
+function formatText(m) {
+  const lines = [
+    `${m.Title} (${m.Year})`,
+    `type: ${m.Type}${m.totalSeasons ? ` · ${m.totalSeasons} seasons` : ""}`,
+    `country: ${m.Country}`,
+    `genre: ${m.Genre}`,
+    `imdb: ${m.imdbRating} · ${m.imdbID}`,
+    `director: ${m.Director}`,
+    `cast: ${m.Actors}`,
+    `plot: ${m.Plot}`,
+    `https://www.imdb.com/title/${m.imdbID}/`,
+  ];
+  return lines.join("\n");
+}
+
+async function main() {
+  const params = imdbId
+    ? `i=${encodeURIComponent(imdbId)}`
+    : `t=${encodeURIComponent(title)}${type ? `&type=${type}` : ""}`;
+  const m = await omdb(params);
+  if (!m || m.Response !== "True") {
+    if (format === "json") console.log(JSON.stringify({ found: false, query: title || imdbId, error: m?.Error || "not found" }));
+    else console.error(`not found: ${title || imdbId}${m?.Error ? ` (${m.Error})` : ""}`);
+    process.exit(2);
+  }
+  if (format === "json") console.log(JSON.stringify({ found: true, ...m }));
+  else console.log(formatText(m));
+}
+
+main();

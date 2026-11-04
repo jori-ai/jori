@@ -1,0 +1,149 @@
+#!/usr/bin/env node
+// asc-api — Apple App Store Connect API CLI
+// Usage:
+//   asc-api list-bundle-ids
+//   asc-api get-bundle-id <identifier>
+//   asc-api list-capabilities <bundleIdResourceId>
+//   asc-api enable-capability <bundleIdResourceId> <capabilityType>
+//   asc-api register-bundle-id <identifier> <name> <platform>
+//   asc-api raw <method> <path> [jsonBody]
+
+import crypto from "node:crypto";
+import fs from "node:fs";
+import { createRequire } from "node:module";
+import { installTools } from "../lib/root.cjs";
+
+// This installation's App Store Connect API key: agent/local/config/asc-api.json
+// { key_id, issuer_id, key_path } (key_path relative to the install). Env
+// ASC_KEY_ID / ASC_ISSUER_ID / ASC_KEY_PATH override. Unset → not configured.
+const CFG = createRequire(import.meta.url)("../lib/instance.cjs").localConfig("asc-api", { key_id: "", issuer_id: "", key_path: "credentials/asc-key.p8" });
+const KEY_ID = process.env.ASC_KEY_ID || CFG.key_id;
+const ISSUER_ID = process.env.ASC_ISSUER_ID || CFG.issuer_id;
+const KEY_PATH = process.env.ASC_KEY_PATH || installTools(CFG.key_path);
+const BASE = "https://api.appstoreconnect.apple.com/v1";
+
+function generateJWT() {
+  if (!KEY_ID || !ISSUER_ID) {
+    console.error("asc-api: no App Store Connect key configured (agent/local/config/asc-api.json key_id, issuer_id)");
+    process.exit(2);
+  }
+  const key = fs.readFileSync(KEY_PATH, "utf8");
+  const now = Math.floor(Date.now() / 1000);
+  const header = Buffer.from(JSON.stringify({ alg: "ES256", kid: KEY_ID, typ: "JWT" })).toString("base64url");
+  const payload = Buffer.from(JSON.stringify({
+    iss: ISSUER_ID,
+    iat: now,
+    exp: now + 1200,
+    aud: "appstoreconnect-v1",
+  })).toString("base64url");
+  const sig = crypto.sign("sha256", Buffer.from(`${header}.${payload}`), { key, dsaEncoding: "ieee-p1363" });
+  return `${header}.${payload}.${sig.toString("base64url")}`;
+}
+
+async function request(method, apiPath, body) {
+  const token = generateJWT();
+  const opts = {
+    method,
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "Content-Type": "application/json",
+    },
+  };
+  if (body) opts.body = JSON.stringify(body);
+  const url = apiPath.startsWith("http") ? apiPath : `${BASE}${apiPath}`;
+  const res = await fetch(url, opts);
+  const text = await res.text();
+  if (!res.ok) {
+    console.error(`HTTP ${res.status}: ${text}`);
+    process.exit(1);
+  }
+  return text ? JSON.parse(text) : null;
+}
+
+const [cmd, ...args] = process.argv.slice(2);
+
+switch (cmd) {
+  case "list-bundle-ids": {
+    const data = await request("GET", "/bundleIds?limit=200");
+    for (const b of data.data) {
+      console.log(`${b.id}\t${b.attributes.identifier}\t${b.attributes.name}\t${b.attributes.platform}`);
+    }
+    break;
+  }
+  case "get-bundle-id": {
+    const [identifier] = args;
+    if (!identifier) { console.error("Usage: asc-api get-bundle-id <identifier>"); process.exit(1); }
+    const data = await request("GET", `/bundleIds?filter[identifier]=${identifier}`);
+    if (data.data.length === 0) { console.error("Not found"); process.exit(1); }
+    const b = data.data[0];
+    console.log(JSON.stringify(b, null, 2));
+    break;
+  }
+  case "list-capabilities": {
+    const [bundleIdResourceId] = args;
+    if (!bundleIdResourceId) { console.error("Usage: asc-api list-capabilities <bundleIdResourceId>"); process.exit(1); }
+    const data = await request("GET", `/bundleIds/${bundleIdResourceId}/bundleIdCapabilities`);
+    for (const c of data.data) {
+      console.log(`${c.id}\t${c.attributes.capabilityType}`);
+    }
+    break;
+  }
+  case "enable-capability": {
+    const [bundleIdResourceId, capabilityType] = args;
+    if (!bundleIdResourceId || !capabilityType) {
+      console.error("Usage: asc-api enable-capability <bundleIdResourceId> <capabilityType>");
+      console.error("\nCapability types: PUSH_NOTIFICATIONS, ICLOUD, ACCESS_WIFI_INFORMATION,");
+      console.error("  APPLE_PAY, ASSOCIATED_DOMAINS, AUTOFILL_CREDENTIAL_PROVIDER,");
+      console.error("  CLASSKIT, COREMEDIA_HLS_LOW_LATENCY, GAME_CENTER, HEALTHKIT,");
+      console.error("  HOMEKIT, IN_APP_PURCHASE, INTER_APP_AUDIO, MAPS, MULTIPATH,");
+      console.error("  NETWORK_EXTENSIONS, NFC_TAG_READING, PERSONAL_VPN, SIRIKIT,");
+      console.error("  WALLET, APPLE_ID_AUTH, USERNOTIFICATIONS_TIMESENSITIVE");
+      process.exit(1);
+    }
+    const body = {
+      data: {
+        type: "bundleIdCapabilities",
+        attributes: { capabilityType },
+        relationships: {
+          bundleId: { data: { type: "bundleIds", id: bundleIdResourceId } },
+        },
+      },
+    };
+    // iCloud needs CloudKit setting
+    if (capabilityType === "ICLOUD") {
+      body.data.attributes.settings = [{
+        key: "ICLOUD_VERSION",
+        options: [{ key: "XCODE_6" }],
+      }];
+    }
+    const data = await request("POST", "/bundleIdCapabilities", body);
+    console.log(`Enabled ${capabilityType} on ${bundleIdResourceId}`);
+    break;
+  }
+  case "register-bundle-id": {
+    const [identifier, name, platform = "IOS"] = args;
+    if (!identifier || !name) {
+      console.error("Usage: asc-api register-bundle-id <identifier> <name> [platform]");
+      process.exit(1);
+    }
+    const body = {
+      data: {
+        type: "bundleIds",
+        attributes: { identifier, name, platform: platform.toUpperCase() },
+      },
+    };
+    const data = await request("POST", "/bundleIds", body);
+    console.log(`Registered: ${data.data.id}\t${data.data.attributes.identifier}`);
+    break;
+  }
+  case "raw": {
+    const [method, apiPath, jsonBody] = args;
+    if (!method || !apiPath) { console.error("Usage: asc-api raw <method> <path> [jsonBody]"); process.exit(1); }
+    const data = await request(method.toUpperCase(), apiPath, jsonBody ? JSON.parse(jsonBody) : undefined);
+    console.log(JSON.stringify(data, null, 2));
+    break;
+  }
+  default:
+    console.error("Commands: list-bundle-ids, get-bundle-id, list-capabilities, enable-capability, register-bundle-id, raw");
+    process.exit(1);
+}

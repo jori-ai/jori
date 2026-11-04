@@ -1,0 +1,62 @@
+#!/usr/bin/env node
+"use strict";
+/**
+ * local-day — today / yesterday / current hour in the user's CURRENT local
+ * timezone, resolved exactly the way cron-tz-sync resolves it (clock-jobs.js
+ * resolveTz: phone-confirmed tz → travel plan → the home zone).
+ *
+ * Why this exists. The clock-anchored nightly pipeline (photos at 03:00,
+ * daily-summary at 04:00 local) FIRES at the user's local time, but each job
+ * used to pick its target day as "yesterday in the home zone". East of home
+ * those disagree: at UTC+3, 04:00 local Saturday is 21:00 Friday in a UTC-4
+ * home zone, so "yesterday at home" was Thursday — Thursday was rebuilt (a
+ * no-op duplicate) and Friday's summary never shipped. A job that fires on the
+ * local clock must name its day on the local clock.
+ *
+ * Usage:
+ *   local-day [yesterday]   YYYY-MM-DD of yesterday in the local tz (default)
+ *   local-day today         YYYY-MM-DD of today in the local tz
+ *   local-day hour          current local hour, 0-23
+ *   local-day tz            the resolved IANA tz
+ *   local-day --json        {tz, source, today, yesterday, hour}
+ *
+ * Never fails silently into a wrong day: any error exits 1 with nothing on
+ * stdout, so shell callers can fall back explicitly.
+ */
+
+const { resolveTz } = require("../lib/clock-jobs.js");
+
+function partsIn(tz, at = new Date()) {
+  const fmt = new Intl.DateTimeFormat("en-CA", {
+    timeZone: tz, year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", hourCycle: "h23",
+  });
+  const p = Object.fromEntries(fmt.formatToParts(at).map((x) => [x.type, x.value]));
+  return { today: `${p.year}-${p.month}-${p.day}`, hour: Number(p.hour) };
+}
+
+function minusOneDay(iso) {
+  const d = new Date(`${iso}T12:00:00Z`);
+  d.setUTCDate(d.getUTCDate() - 1);
+  return d.toISOString().slice(0, 10);
+}
+
+function localDay(at = new Date()) {
+  const { tz, source } = resolveTz();
+  const { today, hour } = partsIn(tz, at);
+  return { tz, source, today, yesterday: minusOneDay(today), hour };
+}
+
+module.exports = { localDay, partsIn, minusOneDay };
+
+if (require.main === module) {
+  try {
+    const arg = process.argv[2] || "yesterday";
+    const r = localDay();
+    if (arg === "--json") console.log(JSON.stringify(r));
+    else if (arg in r) console.log(r[arg]);
+    else throw new Error(`unknown arg '${arg}' (yesterday|today|hour|tz|--json)`);
+  } catch (e) {
+    process.stderr.write(`local-day: ${e.message || e}\n`);
+    process.exit(1);
+  }
+}

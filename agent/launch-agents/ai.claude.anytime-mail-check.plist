@@ -1,0 +1,54 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  anytime-mail-check — ON-DEMAND launchd user agent (no schedule of its own).
+  Playbook: agent/ops-agent/jobs/anytime-mail-check.md
+
+  Kicked by agent/scripts/trigger-anytime-mail-check.sh, which the
+  supervisor's Gmail intake runs when an Anytime Mailbox new-mail notice
+  arrives. Runs in the GUI session because bin/anytime-mail-check's
+  fallback judge is a tool-less `claude -p` on the Max subscription, and only
+  the GUI session can read that credential. cron-run loads .env (the
+  Jev key, the portal login) and records the run.
+
+  Install (launchd-kick.sh also self-installs it on the first failed kick):
+    agent/launch-agents/install.sh ai.claude.anytime-mail-check
+    (renders __JORI_HOME__ / __JORI_TOOLS__ / __HOME__, then launchctl bootstrap)
+  Run once, now:
+    launchctl kickstart gui/$(id -u)/ai.claude.anytime-mail-check
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>ai.claude.anytime-mail-check</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>__JORI_TOOLS__/bin/cron-run</string>
+        <string>--label</string>
+        <string>anytime-mail-check</string>
+        <string>--</string>
+        <string>/bin/bash</string>
+        <string>-c</string>
+        <string>__JORI_TOOLS__/bin/anytime-mail-check &gt;&gt; __JORI_TOOLS__/data/logs/anytime-mail-check.log 2&gt;&amp;1</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>__HOME__</string>
+        <key>PATH</key>
+        <string>__HOME__/.local/node/bin:__HOME__/.local/bin:/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:__JORI_TOOLS__/bin</string>
+        <key>LANG</key>
+        <string>en_US.UTF-8</string>
+    </dict>
+    <key>WorkingDirectory</key>
+    <string>__JORI_TOOLS__</string>
+    <key>RunAtLoad</key>
+    <false/>
+    <key>KeepAlive</key>
+    <false/>
+    <key>StandardOutPath</key>
+    <string>__JORI_TOOLS__/data/logs/anytime-mail-check-launchd.log</string>
+    <key>StandardErrorPath</key>
+    <string>__JORI_TOOLS__/data/logs/anytime-mail-check-launchd.log</string>
+</dict>
+</plist>

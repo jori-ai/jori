@@ -1,0 +1,177 @@
+#!/usr/bin/env node
+// launch-watch-run — keep the user's calendar holding a FREE (transparent)
+// event for every announced launch matching a configured search, as code.
+//
+// Source: Launch Library 2 (structured JSON; NET in UTC with a precision
+// field; anonymous limit ~15 req/h, one call per run). Diff against state,
+// size the hold by NET precision, create/update/delete via jori-calendar, one
+// ping on material change. None of it needs a model.
+//
+// geo-gate-ok: a launch hold is a free calendar marker for watching a livestream,
+// not a recommendation to be somewhere; it reaches the user wherever they are.
+//
+// CONFIG — agent/local/config/launch-watch.json. Without a `search` the watch is
+// OFF and every run exits 0 having done nothing.
+//   search         Launch Library search term (e.g. a vehicle name)    required
+//   label          the vehicle label in titles and the ping header      default = search
+//   limit          results per call                                     10
+//   horizon_days   farthest NET that gets a calendar hold               180
+//   calendar       jori-calendar calendar id                            "primary"
+//   event_tag      --jori-event tag on updates                          "launch-watch-run"
+//   intent         jori-send-curl --intent                              "launch-watch"
+//   state_file     state path under the install                         "data/launch-watch-state.json"
+// Holds are rendered in the home zone (instance().tz).
+//
+// Usage: launch-watch-run [--dry-run]
+// Cadence gate (daily when a launch is ≤7d out, else weekly) lives in
+// agent/scripts/trigger-launch-watch.sh (shouldRun in lib/launch-watch.mjs).
+
+import { execFileSync, spawnSync } from "node:child_process";
+import { createRequire } from "node:module";
+import fs from "node:fs";
+import path from "node:path";
+import { apiUrl, sourceLabel, normalize, reconcile, calendarWorthy, holdWindow, pingLines, launchKey, shouldRun } from "../lib/launch-watch.mjs";
+
+const require = createRequire(import.meta.url);
+const { instance, localConfig } = require("../lib/instance.cjs");
+const { installTools, toolsPath } = require("../lib/root.cjs");
+
+const CFG = localConfig("launch-watch", {
+  search: "",
+  label: "",
+  limit: 10,
+  horizon_days: 180,
+  calendar: "primary",
+  event_tag: "launch-watch-run",
+  intent: "launch-watch",
+  state_file: "data/launch-watch-state.json",
+});
+const LABEL = CFG.label || CFG.search;
+const TZ = instance().tz || "UTC";
+const BIN = toolsPath("bin");
+const STATE = path.isAbsolute(CFG.state_file) ? CFG.state_file : installTools(CFG.state_file);
+const DRY = process.argv.includes("--dry-run");
+const GATE = process.argv.includes("--gate");
+const now = Date.now();
+const log = (...a) => console.log(`[${new Date().toISOString()}]`, ...a);
+
+function readState() {
+  try { return JSON.parse(fs.readFileSync(STATE, "utf8")); } catch { return null; }
+}
+
+function writeState(s) {
+  fs.mkdirSync(path.dirname(STATE), { recursive: true });
+  const tmp = `${STATE}.tmp-${process.pid}`;
+  fs.writeFileSync(tmp, JSON.stringify(s, null, 2) + "\n");
+  fs.renameSync(tmp, STATE);
+}
+
+function cal(args) {
+  if (DRY) { log(`DRY jori-calendar ${args.join(" ")}`); return { ok: true, id: "dry-run" }; }
+  const r = spawnSync(path.join(BIN, "jori-calendar"), args, { encoding: "utf8", timeout: 60_000 });
+  if (r.status !== 0) { log(`jori-calendar ${args[0]} failed (${r.status}): ${(r.stderr || "").slice(0, 300)}`); return { ok: false }; }
+  let id = null;
+  try { const j = JSON.parse(r.stdout); id = j.id || j.event?.id || j.items?.[0]?.id || null; } catch {}
+  return { ok: true, id };
+}
+
+function eventArgs(l) {
+  const w = holdWindow(l, TZ);
+  const desc = [
+    l.mission,
+    l.net_precision === "day" ? "NET — TBD time, slips often" : "NET — slips often",
+    l.site || "",
+    l.source_url ? `<a href="${l.source_url}">Launch Library</a>` : "",
+  ].filter(Boolean).join("<br>");
+  return [
+    "--summary", `🚀 ${l.mission} (${LABEL})`,
+    "--from", w.from, "--to", w.to,
+    ...(l.site ? ["--location", l.site] : []),
+    "--description", desc,
+    "--transparency", "transparent",
+    "--event-color", "9",
+  ];
+}
+
+async function main() {
+  if (!CFG.search) { if (GATE) { process.stdout.write("0"); return; } log("launch-watch: not configured (no `search` in agent/local/config/launch-watch.json) — nothing to do"); return; }
+  const prior = readState();
+  // --gate: print 1 when a run is due (the trigger's cadence check), else 0.
+  if (GATE) { process.stdout.write(shouldRun(prior, now) ? "1" : "0"); return; }
+  const state = prior || { last_check_at: null, source: sourceLabel(CFG.search), launches: {} };
+  state.launches ||= {};
+  let results;
+  try {
+    const r = await fetch(apiUrl(CFG.search, CFG.limit), { signal: AbortSignal.timeout(25_000) });
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    results = (await r.json()).results;
+    if (!Array.isArray(results)) throw new Error("no results[]");
+  } catch (e) {
+    log(`Launch Library fetch failed (${e.message}) — retry next run`);
+    if (!DRY) { state.last_check_at = new Date().toISOString(); writeState(state); }
+    return;
+  }
+
+  const fetched = normalize(results, now, { vehicle: LABEL });
+  const actions = reconcile(state.launches, fetched, now, CFG.horizon_days);
+  const done = [];
+  for (const a of actions) {
+    const l = a.launch;
+    if (a.action === "create" || a.action === "update") {
+      const prevId = a.prev?.calendar_event_id || null;
+      let eventId = prevId, failed = false;
+      if (calendarWorthy(l, now, CFG.horizon_days)) {
+        const r = prevId
+          ? cal(["update", prevId, "--calendar", CFG.calendar, "--jori-event", CFG.event_tag, ...eventArgs(l)])
+          : cal(["create", "--calendar", CFG.calendar, "-j", ...eventArgs(l),
+            "--overlap-ok", "Launch hold is a transparent (free) awareness event; overlapping busy time is intended"]);
+        failed = !r.ok;
+        if (r.ok && !prevId) eventId = r.id;
+      }
+      const entry = {
+        ...(a.prev || {}),
+        ...l,
+        calendar_event_id: eventId,
+        first_seen_at: a.prev?.first_seen_at || new Date(now).toISOString(),
+        last_seen_at: new Date(now).toISOString(),
+        status: "scheduled",
+        missing_runs: 0,
+      };
+      if (a.prev) delete state.launches[a.key];
+      state.launches[launchKey(l)] = entry;
+      done.push({ ...a, calendarFailed: failed });
+    } else if (a.action === "touch") {
+      Object.assign(state.launches[a.key], { last_seen_at: new Date(now).toISOString(), missing_runs: 0, api_status: l.api_status });
+    } else if (a.action === "miss") {
+      state.launches[a.key].missing_runs = (state.launches[a.key].missing_runs || 0) + 1;
+    } else if (a.action === "archive") {
+      state.launches[a.key].status = "launched";
+    } else if (a.action === "cancel") {
+      if (a.prev.calendar_event_id) cal(["delete", a.prev.calendar_event_id, "--calendar", CFG.calendar, "-y"]);
+      state.launches[a.key].status = "removed";
+      done.push(a);
+    }
+  }
+  // Prune: launched/removed, or 14+ days past NET.
+  for (const [k, l] of Object.entries(state.launches)) {
+    if (["launched", "removed"].includes(l.status) || Date.parse(l.net_iso) < now - 14 * 86400_000) delete state.launches[k];
+  }
+  state.last_check_at = new Date().toISOString();
+  state.source = sourceLabel(CFG.search);
+
+  const counts = actions.reduce((m, a) => ((m[a.action] = (m[a.action] || 0) + 1), m), {});
+  log(`fetched=${fetched.length} ${Object.entries(counts).map(([k, v]) => `${k}=${v}`).join(" ")}`);
+  if (DRY) { console.log(JSON.stringify(done, null, 2)); return; }
+  writeState(state);
+
+  const lines = pingLines(done, TZ);
+  if (lines.length) {
+    try {
+      execFileSync(path.join(BIN, "jori-send-curl"), ["--no-push", "--evidence-as-of", "live", "--intent", CFG.intent,
+        `🚀 ${LABEL} calendar updated:\n${lines.join("\n")}`], { stdio: "inherit", timeout: 120_000 });
+      execFileSync(path.join(BIN, "jori-notify"), [`${LABEL}: ${lines.length} change${lines.length > 1 ? "s" : ""}`], { stdio: "ignore", timeout: 60_000 });
+    } catch (e) { log(`notify failed: ${e.message}`); }
+  }
+}
+
+main().catch((e) => { log(`FATAL ${e.stack || e}`); process.exit(1); });

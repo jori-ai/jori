@@ -38,6 +38,10 @@ CLOUDFLARED_RESTART_COOLDOWN="$HOME/Dev/jori/data/.cloudflared-restart-cooldown"
 # daily-summary block) because § Max auth outage also needs it: it re-arms the
 # heal when an auth outage ends.
 DS_HEAL_MARKER="$HOME/Dev/jori/data/.daily-summary-heal-cooldown"
+# Touched by the daily-summary block on every tick that sees the ops dispatcher
+# held for the Claude usage limit; its age holds that block's page through the
+# hold and the queue drain after it (see "Usage-limit hold deferral" there).
+DS_USAGE_HOLD_MARKER="${DS_HEAL_MARKER%/*}/.daily-summary-usage-hold-seen"   # beside DS_HEAL_MARKER
 CLOUDFLARED_LABEL="com.cloudflare.cloudflared"
 # The tunnel's public host: JORI_PUSH_HOST, else gmail-push.<instance domain>.
 # Empty (no domain configured) → the tunnel check is skipped.
@@ -262,6 +266,9 @@ incident_clear() {
         # it crossed, never "auto-healed".
         disk-low)        how="free space on the data volume is back above the $(_disk_gib_threshold "$WATCHDOG_DISK_WARN_GIB" 25) GiB warning line" ;;
         disk-critical)   how="free space on the data volume is back above the $(_disk_gib_threshold "$WATCHDOG_DISK_CRIT_GIB" 10) GiB critical line" ;;
+        # stale-code-watch flags only what it cannot fix itself (see "Stale code,
+        # the rest"), so report the flag gone, never "auto-healed".
+        stale-code-flag) how="stale-code-watch no longer flags any daemon or uncommitted code file (this check sees the flag gone, not what cleared it)" ;;
       esac
       notify "✅ Recovered: $(_incident_label "$key") is back to normal — $how, stable for 3 checks."
     elif [ -f "$INCIDENT_DIR/${key}.alerted" ]; then
@@ -1009,14 +1016,14 @@ elif [ "$STUCK_COUNT" -gt 0 ]; then
     # which would discard the DISPATCH_OK/DISPATCH_FAIL tallies.
     while read -r MSGID; do
       [ -z "$MSGID" ] && continue
-      if curl -sf --max-time 5 -X POST "http://localhost:9092" \
+      if curl -sf --max-time 5 -X POST "http://localhost:$JORI_PORT_OPS_WEBHOOK" \
         -H "Content-Type: application/json" "${CURL_AUTH[@]}" \
         -d "{\"task\": \"RECLASSIFY: $MSGID\"}" > /dev/null 2>&1; then
         DISPATCH_OK=$((DISPATCH_OK + 1))
         log "  Dispatched RECLASSIFY for $MSGID"
       else
         DISPATCH_FAIL=$((DISPATCH_FAIL + 1))
-        log "  RECLASSIFY dispatch FAILED for $MSGID — ops webhook :9092 unreachable or rejected"
+        log "  RECLASSIFY dispatch FAILED for $MSGID — ops webhook :$JORI_PORT_OPS_WEBHOOK unreachable or rejected"
       fi
     done <<< "$(echo "$STUCK_EMAILS" | jq -r '.[].id' 2>/dev/null)"
     if [ "$DISPATCH_OK" -gt 0 ]; then
@@ -1044,7 +1051,7 @@ elif [ "$STUCK_COUNT" -gt 0 ]; then
     if [ -n "$GAP_MS" ] && [ "$GAP_MS" -gt "$PUSH_GAP_MS" ]; then
       notify "🔴 Pub/Sub delivery failure — $STUCK_COUNT unread inbox message(s) not pushed for $((GAP_MS / 60000))+ min, persisting after $LANDED_ROUNDS delivered RECLASSIFY round(s). Watch-renewal already attempted. Manual inspection of Pub/Sub topic + Cloudflare Tunnel ($CLOUDFLARED_HOST) needed."
     elif [ "$DISPATCH_FAIL" -gt 0 ] || [ "$LANDED_ROUNDS" -lt 2 ]; then
-      notify "🔴 Email triage sweep: $STUCK_COUNT message(s) stuck in inbox and the RECLASSIFY self-heal is not landing — $DISPATCH_FAIL dispatch(es) to the ops webhook (:9092) failed on this tick, and only $LANDED_ROUNDS round(s) have actually reached the agent. Triage itself may be healthy; the dispatch path is the suspect."
+      notify "🔴 Email triage sweep: $STUCK_COUNT message(s) stuck in inbox and the RECLASSIFY self-heal is not landing — $DISPATCH_FAIL dispatch(es) to the ops webhook (:$JORI_PORT_OPS_WEBHOOK) failed on this tick, and only $LANDED_ROUNDS round(s) have actually reached the agent. Triage itself may be healthy; the dispatch path is the suspect."
     else
       notify "🔴 Email triage sweep: $STUCK_COUNT stuck message(s) still in inbox after $LANDED_ROUNDS delivered RECLASSIFY rounds. Manual triage needed."
     fi
@@ -1673,9 +1680,9 @@ fi
 # `wiki serve` process so process-manager respawns it. Alert only after a
 # self-heal cycle has demonstrably failed (next-tick parity with other
 # incidents).
-if ! curl -sf --max-time 3 http://127.0.0.1:9096/healthz > /dev/null 2>&1; then
+if ! curl -sf --max-time 3 http://127.0.0.1:$JORI_PORT_WIKI/healthz > /dev/null 2>&1; then
   ATTEMPT=$(incident_seen "wiki-server-down")
-  log "Wiki server unreachable on :9096 (attempt $ATTEMPT)"
+  log "Wiki server unreachable on :$JORI_PORT_WIKI (attempt $ATTEMPT)"
   ISSUES="$ISSUES wiki-server(down)"
 
   # Match the :9096 server EXACTLY, by port. A SECOND `wiki serve` runs the
@@ -1684,14 +1691,14 @@ if ! curl -sf --max-time 3 http://127.0.0.1:9096/healthz > /dev/null 2>&1; then
   # could kill the healthy public server while the wedged :9096 one survives,
   # and the next tick would page "Manual intervention needed" for a failure the
   # heal itself caused. Never widen this pattern back to the bare binary name.
-  WIKI_PID=$(pgrep -f "bin/wiki serve --port 9096" | head -1)
+  WIKI_PID=$(pgrep -f "bin/wiki serve --port $JORI_PORT_WIKI" | head -1)
   if [ -n "$WIKI_PID" ]; then
-    log "Killing wedged wiki serve pid $WIKI_PID (:9096) — process-manager will respawn"
+    log "Killing wedged wiki serve pid $WIKI_PID (:$JORI_PORT_WIKI) — process-manager will respawn"
     kill "$WIKI_PID" 2>/dev/null
   fi
 
   if [ "$ATTEMPT" -ge 2 ] && incident_should_alert "wiki-server-down"; then
-    notify "🔴 Wiki server (:9096) down and not recovering after $ATTEMPT consecutive ticks. Manual intervention needed on ${JORI_HOST_LABEL:-the host}."
+    notify "🔴 Wiki server (:$JORI_PORT_WIKI) down and not recovering after $ATTEMPT consecutive ticks. Manual intervention needed on ${JORI_HOST_LABEL:-the host}."
   fi
 else
   incident_clear "wiki-server-down"
@@ -2299,6 +2306,25 @@ fi
 # section re-arms the marker once on recovery, so the backfill runs when auth
 # is back. The nightly-review and episode-archive heals below have related
 # shapes but are intentionally out of scope for this fix.
+#
+# Usage-limit hold deferral. While the ops dispatcher holds its queue for a
+# used-up Claude allowance (OPS_HOLD_UNTIL, read from ops /health in the Gmail
+# sweep above; empty when not held or unreachable), the scheduled run and the
+# backfill below are both accepted into the frozen queue, so a "🔴 ... Backfill
+# manually" page would name a remedy that only queues behind the same hold
+# (the supervisor pages the hold itself). So every tick that sees the hold
+# touches DS_USAGE_HOLD_MARKER (whatever the hour), and the page waits until
+# that marker is DS_USAGE_HOLD_GRACE_S old: the hold, then the in-order drain
+# after it. The miss is still recorded (incident, log, ISSUES), and the
+# deferral calls no incident_should_alert (it has side effects).
+# DO NOT drop the dispatch while held: the queued "DAILY SUMMARY <date>" is the
+# only thing that rebuilds that date if the hold crosses midnight (the queued
+# scheduled run builds "yesterday" relative to when it finally runs), and the
+# ops queue survives restarts.
+DS_USAGE_HOLD_GRACE_S=7200
+if [ -n "${OPS_HOLD_UNTIL:-}" ]; then
+  touch "$DS_USAGE_HOLD_MARKER"
+fi
 HOME_HOUR=$(TZ="${JORI_TZ:-UTC}" date +%H); HOME_HOUR=$((10#$HOME_HOUR))
 # tasks registry = kernel system/tasks.json + agent/local/tasks.json (lib/registry.cjs).
 DS_CRON_HOUR=$("$NODE" "$HOME/Dev/jori/lib/registry.cjs" tasks 2>/dev/null \
@@ -2345,7 +2371,7 @@ if [ -n "$SUPABASE_KEY" ] && [ "$DS_LOCAL_HOUR" -ge "$DS_GRACE_HOUR" ]; then
       fi
       if [ "$SHOULD_HEAL" -eq 1 ]; then
         DS_TOKEN=$(cat "$HOME/Dev/jori/secrets/webhook-token" 2>/dev/null)
-        curl -s --max-time 10 -X POST "http://localhost:9092" \
+        curl -s --max-time 10 -X POST "http://localhost:$JORI_PORT_OPS_WEBHOOK" \
           -H "Content-Type: application/json" \
           ${DS_TOKEN:+-H "Authorization: Bearer $DS_TOKEN"} \
           -d "{\"task\":\"DAILY SUMMARY ${DS_TARGET}\",\"source\":\"watchdog-backfill\"}" > /dev/null 2>&1
@@ -2357,8 +2383,16 @@ if [ -n "$SUPABASE_KEY" ] && [ "$DS_LOCAL_HOUR" -ge "$DS_GRACE_HOUR" ]; then
       # missing — avoids paging while a freshly-dispatched backfill is running.
       HEAL_AGE=999999
       [ -f "$DS_HEAL_MARKER" ] && HEAL_AGE=$(( $(date +%s) - $(stat -f%m "$DS_HEAL_MARKER") ))
-      if [ "$HEAL_AGE" -ge 1200 ] && incident_should_alert "daily-summary-missing" 86400 2 86400; then
-        notify "🔴 Daily-summary missing for $DS_TARGET — the ${DS_CRON_HOUR}:xx local-time cron didn't produce a daily_summaries row and a watchdog backfill dispatch didn't recover it. A day of episodic memory is at risk. Backfill manually: dispatch \"DAILY SUMMARY $DS_TARGET\" to the ops webhook, or check the ops supervisor (:9093) health + watchdog.log."
+      DS_HOLD_AGE=999999
+      [ -f "$DS_USAGE_HOLD_MARKER" ] && DS_HOLD_AGE=$(( $(date +%s) - $(stat -f%m "$DS_USAGE_HOLD_MARKER") ))
+      if [ "$HEAL_AGE" -ge 1200 ] && [ "$DS_HOLD_AGE" -lt "$DS_USAGE_HOLD_GRACE_S" ]; then
+        # Usage-limit hold deferral (see the note above this block): no 🔴.
+        DS_HOLD_WHY="the ops usage-limit hold lifted ${DS_HOLD_AGE}s ago (drain grace ${DS_USAGE_HOLD_GRACE_S}s)"
+        [ -n "${OPS_HOLD_UNTIL:-}" ] && DS_HOLD_WHY="the ops dispatcher is holding for the Claude usage limit until $OPS_HOLD_UNTIL"
+        log_throttled "${DS_HEAL_MARKER%/*}/.daily-summary-usage-hold-log" \
+          "daily-summary page deferred: $DS_HOLD_WHY; the backfill for $DS_TARGET waits in the ops queue"
+      elif [ "$HEAL_AGE" -ge 1200 ] && incident_should_alert "daily-summary-missing" 86400 2 86400; then
+        notify "🔴 Daily-summary missing for $DS_TARGET — the ${DS_CRON_HOUR}:xx local-time cron didn't produce a daily_summaries row and a watchdog backfill dispatch didn't recover it. A day of episodic memory is at risk. Backfill manually: dispatch \"DAILY SUMMARY $DS_TARGET\" to the ops webhook, or check the ops supervisor (:$JORI_PORT_OPS_HEALTH) health + watchdog.log."
       fi
     fi
   fi
@@ -2433,7 +2467,7 @@ if [ "$HOME_HOUR" -ge "$EA_GATE_HOUR" ]; then
     HEAL_AGE=999999
     [ -f "$EA_HEAL_MARKER" ] && HEAL_AGE=$(( $(date +%s) - $(stat -f%m "$EA_HEAL_MARKER") ))
     if [ "$HEAL_AGE" -ge 1200 ] && incident_should_alert "episode-archive-missing" 86400 2 86400; then
-      notify "🔴 Episode-archive missing for $EA_TARGET — the ${EA_CRON_HOUR}:xx $(home_tz_label) cron didn't produce a day_${EA_TARGET} wiki page and a watchdog backfill dispatch didn't recover it. A day of episodic memory is at risk. Backfill manually: ~/Dev/jori/bin/wiki-day-write $EA_TARGET, or check the ops supervisor (:9093) health + watchdog.log."
+      notify "🔴 Episode-archive missing for $EA_TARGET — the ${EA_CRON_HOUR}:xx $(home_tz_label) cron didn't produce a day_${EA_TARGET} wiki page and a watchdog backfill dispatch didn't recover it. A day of episodic memory is at risk. Backfill manually: ~/Dev/jori/bin/wiki-day-write $EA_TARGET, or check the ops supervisor (:$JORI_PORT_OPS_HEALTH) health + watchdog.log."
     fi
 
     # ── Row-exists-but-no-wiki-page refinement.
@@ -2454,7 +2488,7 @@ if [ "$HOME_HOUR" -ge "$EA_GATE_HOUR" ]; then
     if echo "$DS_ROW_FOR_EA" | grep -q '"narrative":"'; then
       ISSUES="$ISSUES daily-summary-orphan-row:$EA_TARGET"
       if [ "$HEAL_AGE" -ge 1200 ] && incident_should_alert "daily-summary-orphan-row" 86400 2 86400; then
-        notify "🔴 daily_summaries has a published row for $EA_TARGET but day_${EA_TARGET} is still missing from the wiki — this is NOT a missing build (the row has a narrative). episode-archive itself is failing to render it. Run ~/Dev/jori/bin/wiki-day-write $EA_TARGET directly and check its output, or check the ops supervisor (:9093) health + watchdog.log."
+        notify "🔴 daily_summaries has a published row for $EA_TARGET but day_${EA_TARGET} is still missing from the wiki — this is NOT a missing build (the row has a narrative). episode-archive itself is failing to render it. Run ~/Dev/jori/bin/wiki-day-write $EA_TARGET directly and check its output, or check the ops supervisor (:$JORI_PORT_OPS_HEALTH) health + watchdog.log."
       fi
     else
       incident_clear "daily-summary-orphan-row"
@@ -2465,7 +2499,7 @@ if [ "$HOME_HOUR" -ge "$EA_GATE_HOUR" ]; then
     # incident key so it isn't swallowed by the 24h cooldown on the 🔴 above.
     if [ "$ATTEMPT" -ge 90 ] && incident_should_alert "episode-archive-escalation" 86400 1 86400; then
       # kernel-closure-ok: advice text in a page, not a call
-      notify "🚨 ESCALATION: day_${EA_TARGET} wiki page STILL missing after 3h and $ATTEMPT watchdog checks. Automated backfill has failed — this needs hands. Run ~/Dev/jori/bin/wiki-day-write $EA_TARGET, and check whether the ops supervisor (:9093) is dropping dispatches at /compact boundaries."
+      notify "🚨 ESCALATION: day_${EA_TARGET} wiki page STILL missing after 3h and $ATTEMPT watchdog checks. Automated backfill has failed — this needs hands. Run ~/Dev/jori/bin/wiki-day-write $EA_TARGET, and check whether the ops supervisor (:$JORI_PORT_OPS_HEALTH) is dropping dispatches at /compact boundaries."
     fi
   fi
 fi
@@ -2703,4 +2737,16 @@ if [ ! -f "$HOME/Dev/jori/data/.stale-code-watch-off" ]; then
   elif [ "$SCW_RC" -eq 0 ]; then
     incident_clear "stale-code-flag"
   fi
+fi
+
+# ── Failing jobs ─────────────────────────────────────────────────────────────
+# bin/job-failure-watch reads every job's exit codes in data/cron-runs.jsonl:
+# a job whose last 3 runs failed gets one quiet ⚠️ System note with the error
+# from its log and a same-day repair (jobs/job-repair.md, via
+# trigger-job-repair.sh); its first good run closes it with ✅. Pushes only
+# when the owner must act or the repair gave up. Every 10 minutes; it sends its
+# own messages from this out-of-sandbox context (JORI_INFRA_PROBE=1). Settings:
+# agent/local/config/job-failure-watch.json. Kill switch: data/.job-failure-watch-off.
+if [ ! -f "$JORI_INSTALL_TOOLS/data/.job-failure-watch-off" ] && [ $(( 10#$(date +%M) % 10 )) -lt 2 ]; then
+  JORI_INFRA_PROBE=1 "$JORI_NODE" "$JORI_INSTALL_TOOLS/bin/job-failure-watch" --quiet >> "$LOG" 2>&1 || log "job-failure-watch exited $?"
 fi

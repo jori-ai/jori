@@ -1,0 +1,190 @@
+#!/usr/bin/env node
+"use strict";
+// plaid-holdings-sync — pull investment positions for every Plaid Item that has
+// them, into plaid_holdings, with a point-in-time total.
+//
+// WHY THIS EXISTS. A broker bridge that reads positions on an OAuth refresh
+// token with a hard ~weekly life fails on that cadence, and each failure asks
+// the user to re-authorize by hand. A Plaid Item refreshes without a human, so
+// holdings through Plaid are the feed that does not page.
+//
+// READ-ONLY, structurally. This calls `/investments/holdings/get` and nothing
+// else; lib/plaid-api.js implements no order or transfer endpoint and must
+// never gain one (agent/CLAUDE.md § Financial Operations, asserted by
+// tests/jori-model-only-data.test.mjs).
+//
+// JORI-MODEL-ONLY. Holdings are the same tier as bank and health data: they
+// may be reasoned over by Jori's own model and pushed to the user's phone, and
+// must never reach an external LLM, an outbound email to anyone else, or
+// outbound-precheck's log. Alerts go out under the brokerage holdings intent
+// (agent/local/config/investments.json `broker.intents.holdings`), which
+// send-intents.json lists as private data so jori-send-curl implies
+// --skip-precheck for it.
+//
+// Usage:
+//   plaid-holdings-sync                 sync all investment Items
+//   plaid-holdings-sync --dry-run       fetch + print; no writes, no alerts
+//   plaid-holdings-sync --json          machine-readable summary
+//   plaid-holdings-sync --item <id>     sync one Item only. What the HOLDINGS
+//                                       webhook passes, so an event refreshes
+//                                       the Item that actually changed instead
+//                                       of walking every card to be told again
+//                                       that it has no investments product.
+
+const path = require("path");
+const { execFile } = require("child_process");
+const plaid = require("../lib/plaid-api.js");
+const store = require("../lib/plaid-store.js");
+const { request } = require("../lib/supabase-rest.js");
+const { brokerConfig } = require("../lib/broker-config.cjs");
+
+const FLAGS = new Set(process.argv.slice(2).filter((a) => a.startsWith("--")));
+const DRY_RUN = FLAGS.has("--dry-run");
+const JSON_OUT = FLAGS.has("--json");
+const ONLY_ITEM = (() => {
+  const argv = process.argv.slice(2);
+  const i = argv.indexOf("--item");
+  return i !== -1 ? argv[i + 1] : null;
+})();
+const SEND_BIN = path.join(__dirname, "jori-send-curl");
+
+function log(...a) { if (!JSON_OUT) console.log(...a); }
+
+function usd(n) {
+  if (n == null || !Number.isFinite(Number(n))) return "—";
+  return `$${Number(n).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+}
+
+async function notify(body) {
+  if (DRY_RUN) { log(`  (notify suppressed) ${body}`); return; }
+  await new Promise((resolve) => {
+    execFile(SEND_BIN, ["--channel", "system", "--skip-precheck", "--intent", brokerConfig().intents.holdings, body],
+      (err) => { if (err) console.error(`  notify failed: ${err.message}`); resolve(); });
+  });
+}
+
+async function upsertHoldings(rows) {
+  if (DRY_RUN || !rows.length) return;
+  for (let i = 0; i < rows.length; i += 500) {
+    await request("/rest/v1/plaid_holdings?on_conflict=account_id,security_id", {
+      method: "POST",
+      body: rows.slice(i, i + 500),
+      prefer: "resolution=merge-duplicates,return=minimal",
+    });
+  }
+}
+
+/**
+ * Drop positions that are no longer held.
+ *
+ * Scoped per ACCOUNT rather than run globally because a fetch that returns
+ * nothing must never cause a delete: a global prune on an empty response wipes
+ * the last good snapshot and leaves the portfolio memo unable to verify
+ * concentration. Here an account with zero rows returned is simply not
+ * reconciled — we never delete on the strength of an empty response.
+ */
+async function pruneSold(accountId, keptSecurityIds) {
+  if (DRY_RUN || !keptSecurityIds.length) return;
+  const list = keptSecurityIds.map((id) => `"${id}"`).join(",");
+  await request(
+    `/rest/v1/plaid_holdings?account_id=eq.${encodeURIComponent(accountId)}&security_id=not.in.(${list})`,
+    { method: "DELETE", prefer: "return=minimal" },
+  );
+}
+
+(async function main() {
+  let items = store.getItems();
+  if (ONLY_ITEM) {
+    items = items.filter((i) => i.item_id === ONLY_ITEM);
+    if (!items.length) {
+      console.error(`No connected Item with id ${ONLY_ITEM}.`);
+      process.exit(1);
+    }
+  }
+  const summary = { env: plaid.env(), items: [], holdings: 0, total_value: 0, cash_value: 0, dry_run: DRY_RUN };
+  const now = new Date().toISOString();
+
+  for (const item of items) {
+    let joined;
+    try {
+      joined = await plaid.holdingsJoined(item.access_token);
+    } catch (err) {
+      // An Item without the investments product simply does not have holdings;
+      // that is the normal case for the credit cards and is not a failure.
+      const msg = String(err && err.message || err);
+      if (/PRODUCT_NOT_READY|INVALID_PRODUCT|products_not_supported|NO_INVESTMENT/i.test(msg)) {
+        continue;
+      }
+      if (plaid.isLoginRequired && plaid.isLoginRequired(err)) {
+        // Name the feed that is actually broken, and the command that actually
+        // fixes it. This alert got both wrong, and the second one does damage.
+        // (a) An Item that reaches ITEM_LOGIN_REQUIRED *here* is typically a
+        // CARD with no investments product at all (a card issuer can answer
+        // ADDITIONAL_CONSENT_REQUIRED on this endpoint for days before it
+        // flips), so "investment sync" would name the one feed that was never
+        // going to work for it, while the feed genuinely broken by a login
+        // lapse is balances/transactions, over in plaid-sync.
+        // (b) It said `plaid-connect link`, but link mints a SECOND Item for
+        // the same login, duplicating rows and burning a slot against the
+        // 10-Item cap; `update` is the re-auth path — see plaid-sync own note
+        // in the getBalances catch.
+        const inst = String(item.institution_name || "").split(" ")[0].toLowerCase();
+        log(`  ${item.institution_name}: re-authentication required`);
+        await notify(`⚠️ ${item.institution_name}: Plaid connection needs re-authentication — balance and transaction syncing has stopped. Run \`plaid-connect update --institution ${inst}\` to reconnect.`);
+        continue;
+      }
+      log(`  ${item.institution_name}: holdings fetch failed — ${msg}`);
+      continue;
+    }
+
+    const rows = (joined.rows || []).filter((r) => r.shares != null || r.market_value != null);
+    if (!rows.length) continue;
+
+    const stamped = rows.map((r) => ({ ...r, item_id: item.item_id, as_of: now, updated_at: now }));
+    await upsertHoldings(stamped);
+
+    const byAccount = new Map();
+    for (const r of stamped) {
+      if (!byAccount.has(r.account_id)) byAccount.set(r.account_id, []);
+      byAccount.get(r.account_id).push(r.security_id);
+    }
+    for (const [acct, ids] of byAccount) await pruneSold(acct, ids);
+
+    const value = stamped.reduce((s, r) => s + (Number(r.market_value) || 0), 0);
+    // Uninvested cash, tracked separately: the portfolio memo reasons about
+    // concentration, and cash sitting in the account is not a position.
+    const cash = stamped
+      .filter((r) => r.asset_type === "cash" || r.ticker === "CASH")
+      .reduce((s, r) => s + (Number(r.market_value) || 0), 0);
+    summary.cash_value += cash;
+    summary.items.push({ institution: item.institution_name, positions: stamped.length, value });
+    summary.holdings += stamped.length;
+    summary.total_value += value;
+    log(`  ${item.institution_name}: ${stamped.length} position(s), ${usd(value)}`);
+  }
+
+  if (summary.holdings > 0 && !DRY_RUN) {
+    await request("/rest/v1/plaid_holdings_value_history?on_conflict=as_of", {
+      method: "POST",
+      body: [{
+        as_of: now,
+        total_value: summary.total_value,
+        cash_value: summary.cash_value,
+        positions: summary.holdings,
+        accounts: summary.items.length,
+      }],
+      prefer: "resolution=merge-duplicates,return=minimal",
+    });
+  }
+
+  if (JSON_OUT) console.log(JSON.stringify(summary, null, 2));
+  else log(`\nTotal: ${summary.holdings} position(s), ${usd(summary.total_value)} as of ${now}`);
+
+  // No holdings anywhere is not an error while a brokerage is still being connected.
+  // It becomes one only once an investment Item exists — and even then the
+  // response is a silent non-write, never a delete (see pruneSold).
+  process.exit(0);
+})().catch((err) => {
+  console.error(`plaid-holdings-sync: ${err && err.message || err}`);
+  process.exit(1);
+});

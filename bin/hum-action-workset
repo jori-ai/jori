@@ -1,0 +1,61 @@
+#!/usr/bin/env node
+// hum-action-workset — Step 1 of jobs/hum-action-executor.md, in code.
+//
+// Candidates (hum improvements apply automatically where possible, higher
+// risk via the Improvements channel): every idea whose route in
+// lib/hum-ideas.mjs is build_auto (autonomous, low/moderate), build_card
+// (autonomous, high) or build (the user said yes in chat), with effort in
+// {quick, half-day}; oldest proposed_at first. Each idea carries its `route`.
+// These are field comparisons, so the trigger runs them and skips the dispatch
+// entirely on an empty backlog. The playbook still owns the per-idea freshness
+// re-check (reading the cited code) and the 3-idea/45-turn/20-min ceilings —
+// the work set is ordered and capped at WORKSET_MAX so supersessions can be
+// skipped without running out of candidates.
+//
+// The ledger is append-style JSONL where a later row for the same id carries
+// the newer status, so the LAST row per id wins.
+//
+// Usage:
+//   hum-action-workset [--json]             print the work set
+//   hum-action-workset --write <path>       write {generated_at, ids, ideas} and print the count
+// Env (tests): HUM_IDEAS_FILE.
+
+import fs from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+import { latestById, routeFor } from "../lib/hum-ideas.mjs";
+
+const HERE = path.dirname(fileURLToPath(import.meta.url));
+const FILE = process.env.HUM_IDEAS_FILE || path.resolve(HERE, "../data/hum-improvement-ideas.jsonl");
+const WORKSET_MAX = 8;
+const BUILD_ROUTES = new Set(["build_auto", "build_card", "build"]);
+
+export function selectWorkset(rows) {
+  return [...latestById(rows).values()]
+    .map((r) => ({ ...r, route: routeFor(r) }))
+    .filter((r) => BUILD_ROUTES.has(r.route))
+    .sort((a, b) => String(a.proposed_at || "").localeCompare(String(b.proposed_at || "")))
+    .slice(0, WORKSET_MAX);
+}
+
+function main() {
+  const args = process.argv.slice(2);
+  let raw;
+  try { raw = fs.readFileSync(FILE, "utf8"); }
+  catch (e) { process.stderr.write(`hum-action-workset: cannot read ${FILE}: ${e.message}\n`); process.exit(1); }
+  const rows = raw.split("\n").filter(Boolean).map((l) => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+  const set = selectWorkset(rows);
+  const wi = args.indexOf("--write");
+  if (wi >= 0) {
+    const out = args[wi + 1];
+    if (!out) { process.stderr.write("usage: hum-action-workset --write <path>\n"); process.exit(2); }
+    const doc = { generated_at: new Date().toISOString(), ids: set.map((r) => r.id), ideas: set };
+    fs.writeFileSync(out + ".tmp", JSON.stringify(doc, null, 2) + "\n");
+    fs.renameSync(out + ".tmp", out);
+    process.stdout.write(String(set.length));
+    return;
+  }
+  process.stdout.write(args.includes("--json") ? JSON.stringify(set) + "\n" : set.map((r) => `${r.id}\t${r.proposed_at || "?"}\t${r.title || ""}`).join("\n") + (set.length ? "\n" : ""));
+}
+
+if (process.argv[1] && fs.realpathSync(process.argv[1]) === fileURLToPath(import.meta.url)) main();

@@ -16,7 +16,7 @@ const HERE = path.dirname(fileURLToPath(import.meta.url));
 const dirs = [];
 after(() => dirs.forEach((d) => fs.rmSync(d, { recursive: true, force: true })));
 const jl = (rows) => rows.map((r) => JSON.stringify(r)).join("\n") + "\n";
-const DEAD = { OLLAMA_URL: "http://127.0.0.1:9" };
+const DEAD = { OLLAMA_URL: "http://127.0.0.1:9", LOCAL_LLM_BACKEND: "ollama" };
 const bin = (name, args, dir, extra = {}) => spawnSync(process.execPath, [path.join(HERE, "../bin", name), ...args], { encoding: "utf8", env: { ...process.env, JORI_DATA_DIR: dir, ...extra }, input: extra.__input });
 
 // unit vectors at a given angle from [1,0] → cosine = cos(angle)

@@ -1,0 +1,130 @@
+:root {
+  --bg: #f6f5f2; --card: #ffffff; --ink: #1d1f24; --muted: #6b6f78; --line: #e4e2dc;
+  --accent: #2f4f9e; --accent-ink: #ffffff; --chip: #f0efe9; --chip-on: #2f4f9e; --error: #b3261e;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #14161b; --card: #1d2027; --ink: #eceef2; --muted: #9aa0ab; --line: #2c3039;
+    --accent: #7d9cf0; --accent-ink: #0f1320; --chip: #272b34; --chip-on: #7d9cf0; --error: #f2b8b5;
+  }
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; background: var(--bg); color: var(--ink); font: 15px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; }
+button { font: inherit; cursor: pointer; border-radius: 8px; border: 1px solid var(--line); padding: 8px 14px; background: var(--card); color: var(--ink); }
+button:disabled { opacity: .5; cursor: default; }
+button.primary { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); font-weight: 600; }
+button.ghost { background: transparent; }
+button.link { border: 0; background: none; padding: 0; color: var(--accent); text-decoration: underline; }
+
+.topbar { display: flex; justify-content: space-between; align-items: center; padding: 12px 16px; border-bottom: 1px solid var(--line); background: var(--card); position: sticky; top: 0; z-index: 2; }
+.brand { font-weight: 700; font-size: 17px; }
+.signout { padding: 6px 12px; font-size: 13px; }
+.wrap { max-width: 760px; margin: 0 auto; padding: 16px; }
+.intro { color: var(--muted); margin: 0 0 6px; }
+.stats { font-size: 13px; color: var(--muted); margin-bottom: 14px; }
+.tabs { display: flex; gap: 6px; margin-bottom: 16px; flex-wrap: wrap; }
+.tabs a { padding: 7px 14px; border-radius: 999px; text-decoration: none; color: var(--ink); background: var(--chip); font-size: 14px; }
+.tabs a.on { background: var(--accent); color: var(--accent-ink); font-weight: 600; }
+
+.list { display: grid; gap: 14px; }
+.card { display: flex; gap: 14px; background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 12px; }
+.poster { width: 110px; height: 165px; object-fit: cover; border-radius: 8px; flex: none; background: var(--chip); }
+.poster.none { display: grid; place-items: center; font-size: 32px; }
+.body { flex: 1; min-width: 0; }
+.body h3 { margin: 0 0 2px; font-size: 17px; }
+.year { color: var(--muted); font-weight: 400; }
+.genres { font-size: 12px; color: var(--muted); margin-bottom: 6px; }
+.overview { margin: 0 0 10px; font-size: 14px; display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
+.tag { font-size: 12px; color: var(--muted); margin-bottom: 8px; }
+.actions { display: flex; gap: 8px; flex-wrap: wrap; }
+.error { color: var(--error); font-size: 13px; }
+.empty { color: var(--muted); text-align: center; padding: 30px 0; }
+
+.rate { display: grid; gap: 10px; }
+.rate-row { display: grid; gap: 4px; }
+.rate-who { font-weight: 600; font-size: 13px; }
+.chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.chip { padding: 5px 10px; font-size: 13px; background: var(--chip); border-color: transparent; border-radius: 999px; }
+.chip.on { background: var(--chip-on); color: var(--accent-ink); font-weight: 600; }
+.rate-actions { display: flex; gap: 8px; justify-content: flex-end; }
+
+.search { display: flex; gap: 8px; margin-bottom: 14px; }
+.search input { flex: 1; min-width: 0; font: inherit; padding: 9px 12px; border-radius: 8px; border: 1px solid var(--line); background: var(--card); color: var(--ink); }
+
+.rated-list { list-style: none; margin: 0; padding: 0; display: grid; gap: 10px; }
+.rated { display: flex; gap: 12px; background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 10px; }
+.rated img, .thumb { width: 54px; height: 81px; object-fit: cover; border-radius: 6px; flex: none; }
+.thumb.none { display: grid; place-items: center; background: var(--chip); }
+.rated-body { flex: 1; min-width: 0; }
+.rated-title { font-weight: 600; }
+.rated-who { display: flex; flex-wrap: wrap; gap: 4px 14px; font-size: 13px; margin-top: 4px; }
+
+.login { min-height: 100vh; display: grid; place-items: center; padding: 16px; }
+.login-card { background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 28px; text-align: center; max-width: 340px; width: 100%; }
+.login-mark { font-size: 40px; }
+.login-card h1 { margin: 8px 0 4px; font-size: 22px; }
+.login-card p { color: var(--muted); }
+.login-card button { width: 100%; background: var(--accent); color: var(--accent-ink); border-color: var(--accent); font-weight: 600; padding: 10px; }
+.login-error { color: var(--error); }
+.login-link { color: var(--accent); }
+
+.hint { font-size: 13px; color: var(--muted); margin: 0 0 12px; }
+/* Five across. The page widens on the Mark tab. */
+.wrap.wide { max-width: 1120px; }
+.five { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 14px; }
+.tile { display: flex; flex-direction: column; background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 8px; min-width: 0; }
+.tile-poster { width: 100%; aspect-ratio: 2 / 3; object-fit: cover; border-radius: 8px; background: var(--chip); display: block; }
+.tile-poster.none { display: grid; place-items: center; font-size: 32px; }
+.tile-title { font-weight: 600; font-size: 14px; line-height: 1.3; margin: 8px 2px 2px; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+.tile-face { position: relative; padding: 0; border: 0; background: none; border-radius: 8px; overflow: hidden; display: block; width: 100%; text-align: left; }
+.tile-info { position: absolute; inset: 0; background: rgba(12, 14, 20, .88); color: #f2f3f5; padding: 10px; overflow-y: auto; font-size: 12px; line-height: 1.45; }
+.tile-info p { margin: 6px 0 0; }
+.tile-meta { font-size: 11px; color: #c9ccd3; }
+.tile-title { margin-bottom: 8px; }
+.tile .thumbs { margin-top: auto; justify-content: center; }
+.tile.marked-up { border-color: #2e8b57; box-shadow: 0 0 0 2px #2e8b5733; }
+.tile.marked-down { border-color: #c0392b; box-shadow: 0 0 0 2px #c0392b33; }
+.tile.marked-down .tile-poster { opacity: .55; }
+.thumbs { display: flex; gap: 8px; }
+.thumb { font-size: 18px; padding: 5px 0; flex: 1; border-radius: 999px; background: var(--chip); border-color: transparent; }
+.thumb span { display: inline-block; }
+.thumb.meh span { transform: rotate(-90deg); }
+.thumb.down span { transform: rotate(180deg); }
+.thumb.up.on { background: #2e8b57; }
+.thumb.meh.on { background: #b08a2e; }
+.tile.marked-meh { border-color: #b08a2e; box-shadow: 0 0 0 2px #b08a2e33; }
+.tile-why { font-size: 11px; color: #ffd27a; margin-top: 6px; }
+.model-line { font-size: 12px; color: var(--muted); margin: -6px 0 10px; }
+.thumb.down.on { background: #c0392b; }
+.batch-footer { position: sticky; bottom: 0; padding: 12px 0 16px; background: linear-gradient(transparent, var(--bg) 30%); display: grid; justify-items: end; }
+.next { padding: 11px 26px; font-size: 16px; }
+
+/* Phones: still five across, just tighter. */
+@media (max-width: 640px) {
+  .five { gap: 6px; }
+  .tile { padding: 4px; border-radius: 8px; }
+  .tile-title { font-size: 11px; margin: 5px 1px 1px; }
+  .tile .thumbs { flex-direction: column; gap: 4px; margin-top: 6px; }
+  .thumb { font-size: 16px; padding: 3px 0; }
+}
+
+@media (max-width: 480px) {
+  .poster { width: 84px; height: 126px; }
+  .card { padding: 10px; gap: 10px; }
+}
+
+/* Watch now — the movie database, best first, with where to watch. */
+.chips { display: flex; flex-wrap: wrap; gap: 6px; margin: 4px 0 14px; }
+.chip { border: 1px solid var(--line, #d0d0d0); background: transparent; color: inherit; border-radius: 999px; padding: 5px 11px; font-size: 13px; cursor: pointer; }
+.chip.on { background: var(--accent, #2563eb); border-color: var(--accent, #2563eb); color: #fff; }
+.watch-list { list-style: none; padding: 0; margin: 0; display: grid; gap: 10px; }
+.watch-row { display: flex; gap: 12px; align-items: flex-start; }
+.watch-row img, .watch-row .thumb { width: 64px; flex: 0 0 64px; border-radius: 6px; }
+.watch-body { min-width: 0; flex: 1; }
+.watch-body a { color: inherit; }
+.watch-meta { display: flex; flex-wrap: wrap; gap: 10px; font-size: 13px; opacity: .8; margin: 2px 0 4px; }
+.watch-meta .match { font-weight: 600; opacity: 1; }
+.where { display: flex; flex-wrap: wrap; gap: 5px; }
+.badge { font-size: 12px; padding: 2px 8px; border-radius: 6px; background: rgba(127,127,127,.15); }
+.muted { font-size: 12px; opacity: .6; }
+.watch-actions { margin-top: 4px; display: flex; gap: 12px; }

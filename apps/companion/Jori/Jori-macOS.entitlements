@@ -2,7 +2,10 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-	<key>aps-environment</key>
+	<!-- macOS spells the push entitlement with the com.apple.developer prefix;
+	     the bare iOS key "aps-environment" is ignored here, so the Mac app never
+	     got an APNs token (trade-approval pairing: "No APNs token yet"). -->
+	<key>com.apple.developer.aps-environment</key>
 	<string>production</string>
 	<key>com.apple.developer.siri</key>
 	<true/>
@@ -14,5 +17,14 @@
 	<true/>
 	<key>com.apple.security.personal-information.location</key>
 	<true/>
+	<!-- The app's OWN group comes first so it stays the default for items
+	     written without an explicit group (MacKeychainStorage's Supabase
+	     session, already living there). The .shared group carries only the
+	     token mirror + share outbox the JoriShare extension reads. -->
+	<key>keychain-access-groups</key>
+	<array>
+		<string>$(AppIdentifierPrefix)$(JORI_BUNDLE_ID)</string>
+		<string>$(AppIdentifierPrefix)$(JORI_BUNDLE_ID).shared</string>
+	</array>
 </dict>
 </plist>

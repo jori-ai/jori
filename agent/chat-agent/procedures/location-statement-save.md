@@ -1,0 +1,26 @@
+# Location Statement Direct-Save
+
+On-demand procedure for the chat agent, moved verbatim out of `agent/chat-agent/CLAUDE.md` (which keeps the trigger and hard rules inline). When this file and CLAUDE.md seem to disagree, CLAUDE.md's inline rule wins.
+
+## Location Statement Direct-Save (2026-09-25)
+
+Sometimes the user just tells you where the user is or where the user's headed — not answering a `location-confirm` card, just saying it in an ordinary message ("grabbing coffee at Fruit Vanity", "heading to Pho Grand now"). Until now the only way a confirmation could be written was through a card's `ask_id` (the flow above), so a stated location with no card yet in flight had nowhere to land — it could be silently overwritten by a later automated guess. Root cause of the gap that motivated this: the user named a place at 8:52pm and an unrelated automated guess for the same dwell landed at 9:30pm with nothing to stop it, because nothing had captured the 8:52 statement.
+
+`location-confirm save-current "<venue>"` closes that gap. It looks up the stop that's open right now (or the one that just closed, if the user'd already left) and writes the confirmation directly, through the exact same code path a card answer uses — same patch to `location_history`, same entry in `confirmed-stops.json`. Once it lands, the next check-in sees the spot is already known and never asks about it.
+
+**This is a language judgment (Rule #0b) — use your own reading of the message, not a keyword list.** Fire it only when ALL of these hold:
+
+- The message names a SPECIFIC place — a venue, restaurant, shop, address. Not a vague area ("downtown", "the neighborhood") unless that vague phrase genuinely IS the specific place meant (rare).
+- It's stated as the user's CURRENT location or the user's IMMEDIATE next stop — not a future plan ("thinking about going to X Friday"), not conditional ("might stop by X"), and not someone else's whereabouts ("my partner's at X" is not the user's location).
+- It is NOT itself a reply to a pending `location-confirm` ask — that's the flow above (§ Location Confirm Reply); don't double-handle the same message under both rules.
+
+**A photo can name the place (2026-10-08).** "Having lunch here today" + a photo of the counter names no venue in words, so the rule above stayed silent. You identified it as the restaurant, the user replied "Yes! It's great" and kept talking about the food, and 59 minutes later the stop-identify card still asked the user which of four nearby shops it was. When the user says "here" / "this place" with a photo and you identify a specific venue in it, that venue counts as named. Fire `save-current` with the name you gave once the user accepts it or keeps treating it as where the user is. If the user corrects you, use the user's name instead.
+
+**Action:** `bin/location-confirm save-current "<venue name>"`. This is a silent side-effect — do not narrate it, do not ask for confirmation, and do not let it change the substance of your actual reply to whatever else the user said in the same message.
+
+**It will not rename the user's lodging (2026-10-28).** When the spot the user is at is already confirmed as another place on two or more other days (the flat the user is staying in), `save-current` writes nothing and exits 5, naming that place. Read the user's message again: an answer to a stop Jori asked about ("15:03–15:23 … which of these was it?", a Maps link to where the user had been) goes to `findme resolve <visit_id> "<name>"` (§ Location Enrichment Replies), a place the user names elsewhere to `save-at`. Only when the user really is at a new place on that same spot, re-run with `--new-place-here`. Three times a café, a bakery and a shop the user had left were saved onto the rental flat this way, and the summary then called the user's evenings at home by their names.
+
+**When in doubt, don't fire it.** Silence is the safe default: a missed save-current just means the existing card-based ask flow (or `location-enrich`, afterward) asks the user about the stop later, same as it already does today. A wrongly-fired one writes a false confirmation into a durable record that future days will be built on. Exit codes from the CLI: 0 with `"saved": null` means it recognized a likely duplicate and skipped (not an error); a non-zero exit (no open-or-recently-closed stop to attach it to) means there was nothing to write against — in either case there is nothing for you to say to the user about it.
+
+**Related issue, now fixed separately (2026-09-25).** Jori had separately flagged a possible race where an automated guess could mark itself "confirmed" without having that authority; this direct-save path only narrowed the window that bug could exploit. The actual fix is in `location-confirm-resolve.mjs`'s `promoteSafely()`: a model-judgment guess (Jev, Gemma extraction, the kill-switch fallback classifier) can still skip asking about today's dwell, but can no longer write itself into the durable `confirmed-stops.json` store the way a real confirmation or a deterministic calendar/message match can. Detail: `agent/ops-agent/jobs/location-confirm-ask.md` § Automated guesses cannot self-confirm. If the user asks about it, say it's resolved, not still open.
+

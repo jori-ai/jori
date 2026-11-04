@@ -1,0 +1,333 @@
+#!/usr/bin/env python3
+"""whereami — current context snapshot for the user.
+
+Aggregates signals from GPS, phone_context, calendar, photos, and named
+locations into a single JSON response. Designed for the chat-agent to call
+when the user asks "where am I?" / "what am I doing?" / "what's my schedule?"
+etc. — one call instead of coordinating many.
+
+Usage:
+  whereami                    # full snapshot
+  whereami --brief            # one-line human summary only
+  whereami --no-calendar      # skip calendar (faster)
+"""
+
+import sys
+import os
+import json
+import math
+import urllib.request
+import urllib.parse
+from zoneinfo import ZoneInfo
+from datetime import datetime, timedelta, timezone
+from typing import Optional, Dict, Any, List, Tuple
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "lib"))
+import places_local  # noqa: E402
+import supabase_local  # noqa: E402
+
+SUPABASE_URL = supabase_local.supabase_url()
+HOME_TZ = ZoneInfo(supabase_local.home_tz())
+
+# Homes and family homes: data/named-locations.json, the list place_naming,
+# findme and resolve-day read too (one list, never a literal copy here).
+def _load_named_locations() -> List[Dict[str, Any]]:
+    path = places_local.data_path("named-locations.json")
+    try:
+        with open(path) as f:
+            d = json.load(f)
+    except FileNotFoundError:
+        return []
+    except (OSError, ValueError) as e:
+        print(f"whereami: named-locations.json unreadable: {e}", file=sys.stderr)
+        return []
+    items = d.get("entries") if isinstance(d, dict) else d
+    return [e for e in (items or []) if isinstance(e, dict) and e.get("name")
+            and isinstance(e.get("lat"), (int, float)) and isinstance(e.get("lon"), (int, float))]
+
+
+NAMED_LOCATIONS = _load_named_locations()
+
+NAMED_MATCH_KM = 0.15
+
+WIFI_MAP_PATH = places_local.data_path("wifi-ssid-map.json")
+
+
+def load_wifi_map() -> List[Dict[str, Any]]:
+    """Load the SSID → place mapping. Returns [] when missing or malformed."""
+    try:
+        with open(WIFI_MAP_PATH) as f:
+            data = json.load(f)
+        return data.get("entries") or []
+    except Exception:
+        return []
+
+
+def match_wifi(ssid: Optional[str], bssid: Optional[str]) -> Optional[Dict[str, Any]]:
+    """Resolve SSID (+ optional BSSID) to a named place via wifi-ssid-map.json.
+    Returns the entry dict or None. Only `ssid` matches require a non-empty
+    string; `bssid` is used to disambiguate when present in the entry."""
+    if not ssid:
+        return None
+    for entry in load_wifi_map():
+        if entry.get("ssid") != ssid:
+            continue
+        ent_bssid = entry.get("bssid")
+        if ent_bssid and bssid and ent_bssid.lower() != bssid.lower():
+            continue
+        return entry
+    return None
+
+
+def get_supabase_key() -> Optional[str]:
+    if not SUPABASE_URL:
+        return None
+    return supabase_local.service_key()
+
+
+def haversine_km(lat1, lon1, lat2, lon2):
+    R = 6371
+    dlat = math.radians(lat2 - lat1)
+    dlon = math.radians(lon2 - lon1)
+    a = math.sin(dlat/2)**2 + math.cos(math.radians(lat1))*math.cos(math.radians(lat2))*math.sin(dlon/2)**2
+    return R * 2 * math.asin(math.sqrt(a))
+
+
+def match_named(lat: float, lon: float) -> Optional[Dict[str, Any]]:
+    for loc in NAMED_LOCATIONS:
+        d = haversine_km(lat, lon, loc["lat"], loc["lon"])
+        if d <= NAMED_MATCH_KM:
+            return {**loc, "distance_km": round(d, 4)}
+    return None
+
+
+def reverse_geocode(lat: float, lon: float) -> Optional[Dict[str, Any]]:
+    try:
+        url = f"https://nominatim.openstreetmap.org/reverse?lat={lat}&lon={lon}&format=json&zoom=18&addressdetails=1"
+        req = urllib.request.Request(url, headers={"User-Agent": "whereami-cli/1.0"})
+        with urllib.request.urlopen(req, timeout=4) as r:
+            data = json.loads(r.read())
+            addr = data.get("address", {})
+            road = addr.get("road") or addr.get("pedestrian")
+            house = addr.get("house_number")
+            street = f"{house} {road}" if house and road else road
+            nb = addr.get("neighbourhood") or addr.get("suburb")
+            city = addr.get("city") or addr.get("town")
+            parts = [p for p in [street, nb, city] if p]
+            return {"address": ", ".join(parts) if parts else None,
+                    "neighborhood": nb, "city": city}
+    except Exception:
+        return None
+
+
+def _sb_get(path: str, qs: List[Tuple[str, str]]) -> Any:
+    key = get_supabase_key()
+    if not key:
+        return None
+    url = f"{SUPABASE_URL}{path}?{urllib.parse.urlencode(qs)}"
+    try:
+        req = urllib.request.Request(url, headers={"apikey": key, "Authorization": f"Bearer {key}"})
+        with urllib.request.urlopen(req, timeout=5) as r:
+            return json.loads(r.read())
+    except Exception:
+        return None
+
+
+def fetch_latest_location() -> Optional[Dict[str, Any]]:
+    rows = _sb_get("/rest/v1/location_history", [
+        ("order", "arrived_at.desc"),
+        ("limit", "1"),
+        ("select", "arrived_at,latitude,longitude,accuracy_m,activity,segment_type"),
+    ])
+    return rows[0] if rows else None
+
+
+def fetch_recent_stops(hours: int = 6) -> List[Dict[str, Any]]:
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
+    rows = _sb_get("/rest/v1/location_history", [
+        ("arrived_at", f"gte.{cutoff}"),
+        ("segment_type", "eq.visit"),
+        ("departed_at", "not.is.null"),
+        ("order", "arrived_at.desc"),
+        ("select", "arrived_at,departed_at,latitude,longitude,place_name"),
+    ])
+    return rows or []
+
+
+def fetch_phone_context() -> Optional[Dict[str, Any]]:
+    rows = _sb_get("/rest/v1/phone_context", [
+        ("order", "ts.desc"),
+        ("limit", "1"),
+        ("select", "*"),
+    ])
+    return rows[0] if rows else None
+
+
+def fetch_recent_photos(hours: int = 1) -> List[Dict[str, Any]]:
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
+    rows = _sb_get("/rest/v1/photos", [
+        ("taken_at", f"gte.{cutoff}"),
+        ("latitude", "not.is.null"),
+        ("order", "taken_at.desc"),
+        ("limit", "20"),
+        ("select", "taken_at,latitude,longitude,original_filename"),
+    ])
+    return rows or []
+
+
+def age_minutes(iso_str: str) -> float:
+    dt = datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
+    return (datetime.now(timezone.utc) - dt).total_seconds() / 60
+
+
+def resolve_place(lat: float, lon: float, skip_reverse: bool = False) -> Dict[str, Any]:
+    named = match_named(lat, lon)
+    if named:
+        return {
+            "name": named["name"],
+            "address": named.get("address"),
+            "source": "named_location",
+            "distance_km": named["distance_km"],
+        }
+    if skip_reverse:
+        return {"name": f"{lat:.4f}, {lon:.4f}", "source": "coordinate"}
+    geo = reverse_geocode(lat, lon)
+    if geo and geo.get("address"):
+        return {
+            "name": geo.get("neighborhood") or geo.get("city") or geo["address"],
+            "address": geo["address"],
+            "source": "reverse_geocode",
+        }
+    return {"name": f"{lat:.4f}, {lon:.4f}", "source": "coordinate"}
+
+
+def build_summary(snap: Dict[str, Any]) -> str:
+    loc = snap.get("location")
+    act = snap.get("activity", {})
+    cal = snap.get("calendar", {})
+
+    parts = []
+    if loc and loc.get("place"):
+        place = loc["place"]["name"]
+        age = loc.get("age_minutes", 0)
+        staleness = f" (GPS {age:.0f}m old)" if age > 15 else ""
+        parts.append(f"at {place}{staleness}")
+
+    if act.get("type") and act["type"] not in ("unknown", "stationary"):
+        parts.append(f"{act['type']}")
+    elif act.get("type") == "stationary":
+        parts.append("stationary")
+
+    if cal.get("current"):
+        parts.append(f"— calendar: {cal['current']['summary']}")
+    elif cal.get("next"):
+        nxt = cal["next"]
+        parts.append(f"— next: {nxt['summary']} at {nxt['start_local']}")
+
+    if snap.get("recent", {}).get("photos_last_hour", 0) > 0:
+        parts.append(f"({snap['recent']['photos_last_hour']} photo(s) in last hour)")
+
+    return " ".join(parts) if parts else "no signal"
+
+
+def build_snapshot(skip_calendar: bool = False, skip_reverse: bool = False) -> Dict[str, Any]:
+    now_utc = datetime.now(timezone.utc)
+    snap: Dict[str, Any] = {
+        "timestamp_utc": now_utc.isoformat(),
+        "timestamp_local": now_utc.astimezone(HOME_TZ).isoformat(),
+    }
+
+    loc = fetch_latest_location()
+    if loc and loc.get("latitude") is not None:
+        age_min = age_minutes(loc["arrived_at"])
+        place = resolve_place(float(loc["latitude"]), float(loc["longitude"]), skip_reverse=skip_reverse)
+        snap["location"] = {
+            "lat": loc["latitude"],
+            "lon": loc["longitude"],
+            "accuracy_m": loc.get("accuracy_m"),
+            "age_minutes": round(age_min, 1),
+            "timestamp": loc["arrived_at"],
+            "place": place,
+            "stale": age_min > 15,
+        }
+        snap["activity"] = {
+            "type": loc.get("activity") or "unknown",
+            "source": "location_history",
+            "age_minutes": round(age_min, 1),
+        }
+    else:
+        snap["location"] = None
+        snap["activity"] = {"type": "unknown"}
+
+    ctx = fetch_phone_context()
+    if ctx and ctx.get("ts"):
+        ctx_age = age_minutes(ctx["ts"])
+        snap["phone_context"] = {
+            "motion_class": ctx.get("motion_class"),
+            "audio_class": ctx.get("audio_class"),
+            "ambient_db_bucket": ctx.get("ambient_db_bucket"),
+            "wifi_ssid": ctx.get("wifi_ssid"),
+            "wifi_bssid": ctx.get("wifi_bssid"),
+            "trigger": ctx.get("trigger"),
+            "age_minutes": round(ctx_age, 1),
+            "fresh": ctx_age <= 10,
+        }
+        if ctx_age <= 10 and ctx.get("motion_class"):
+            snap["activity"]["type"] = ctx["motion_class"]
+            snap["activity"]["source"] = "phone_context"
+
+        # SSID-based place override — far more reliable than GPS indoors. When
+        # the phone is associated to a mapped network and the snapshot is
+        # fresh, replace the GPS-derived place with the SSID-mapped one.
+        if ctx_age <= 10 and ctx.get("wifi_ssid"):
+            wifi_match = match_wifi(ctx.get("wifi_ssid"), ctx.get("wifi_bssid"))
+            if wifi_match and snap.get("location"):
+                snap["location"]["place"] = {
+                    "name": wifi_match["place"],
+                    "source": "wifi_ssid",
+                    "ssid": ctx["wifi_ssid"],
+                    "confidence": wifi_match.get("confidence", "authoritative"),
+                }
+
+    recent_stops = fetch_recent_stops(hours=6)
+    photos = fetch_recent_photos(hours=1)
+    snap["recent"] = {
+        "photos_last_hour": len(photos),
+        "last_completed_visit": None,
+    }
+    if recent_stops:
+        last = recent_stops[0]
+        snap["recent"]["last_completed_visit"] = {
+            "place_name": last.get("place_name"),
+            "lat": last.get("latitude"),
+            "lon": last.get("longitude"),
+            "arrived_at": last.get("arrived_at"),
+            "departed_at": last.get("departed_at"),
+        }
+
+    snap["calendar"] = {"current": None, "next": None}
+    if not skip_calendar:
+        snap["calendar"]["_note"] = "Calendar fetch not implemented in tool — caller should enrich via Google Calendar MCP (list_events around now_utc ± 2h) and set current/next based on time overlap."
+
+    snap["summary"] = build_summary(snap)
+    return snap
+
+
+def main():
+    import argparse
+    p = argparse.ArgumentParser(description="Current context snapshot.")
+    p.add_argument("--brief", action="store_true", help="Print one-line summary only")
+    p.add_argument("--no-calendar", action="store_true", help="Skip calendar placeholder")
+    p.add_argument("--no-reverse", action="store_true", help="Skip reverse geocode (faster, named locations only)")
+    args = p.parse_args()
+
+    snap = build_snapshot(skip_calendar=args.no_calendar, skip_reverse=args.no_reverse)
+
+    if args.brief:
+        print(snap["summary"])
+    else:
+        print(json.dumps(snap, indent=2, default=str))
+
+
+if __name__ == "__main__":
+    main()

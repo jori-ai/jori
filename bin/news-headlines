@@ -1,0 +1,184 @@
+#!/usr/bin/env node
+"use strict";
+/**
+ * news-headlines — today's headlines straight from publisher RSS feeds, for the
+ * morning brief's NEWS section.
+ *
+ * Why this exists (2026-10-02): the brief built NEWS from WebSearch queries like
+ * `top world news today October 2 2026 site:nytimes.com OR site:bbc.com`. The
+ * search backend answered those with SEO spam and years-old tag pages, the
+ * agent (correctly) couldn't tie any of it to today, and every section shipped
+ * "No headlines available" (Oct 1 had only Business; Oct 2 had nothing). A
+ * publisher's own feed IS the primary source and carries a pubDate, so there is
+ * nothing left to "confirm" — the only judgement left to the agent is which 2-3
+ * items matter.
+ *
+ * Usage:
+ *   news-headlines [--city "<city>"] [--hours 24] [--per-feed 8]
+ *
+ * Prints JSON: { generated_at, hours, sections: { world, business, <extra…>,
+ * local }, local_city, errors[] }. Optional sections (a country the user
+ * follows) are off unless agent/local/config/news-headlines.json turns them on:
+ * `sections: { "<name>": true }` picks one from SECTION_FEEDS below, and
+ * `custom_sections: { "<name>": [[label, rss url], …] }` adds any other. Each item: { title, summary, url, source,
+ * published }. Items are newest-first, deduped by title, and limited to the
+ * last --hours (default 24). A feed that fails lands in errors[] — the others
+ * still return.
+ */
+
+const FEEDS = {
+  world: [
+    ["BBC", "https://feeds.bbci.co.uk/news/world/rss.xml"],
+    ["NYT", "https://rss.nytimes.com/services/xml/rss/nyt/World.xml"],
+  ],
+  business: [
+    ["NYT", "https://rss.nytimes.com/services/xml/rss/nyt/Business.xml"],
+    ["CNBC", "https://www.cnbc.com/id/100003114/device/rss/rss.html"],
+    ["BBC", "https://feeds.bbci.co.uk/news/business/rss.xml"],
+  ],
+};
+
+// Optional sections, each off until the local config turns it on.
+const SECTION_FEEDS = {
+  israel: [
+    ["Times of Israel", "https://www.timesofisrael.com/feed/"],
+    ["Ynet", "https://www.ynetnews.com/Integration/StoryRss3082.xml"],
+    ["Haaretz", "https://www.haaretz.com/srv/haaretz-latest-headlines"],
+  ],
+};
+
+const CFG = require("../lib/instance.cjs").localConfig("news-headlines", { sections: {}, custom_sections: {}, local_feeds: {} });
+// Cities with a dedicated publisher feed (`local_feeds`: lowercase city →
+// [[label, rss url], …]); every other city uses a Google News search for the
+// city name.
+const LOCAL_FEEDS = CFG.local_feeds || {};
+const EXTRA = {};
+for (const [name, on] of Object.entries(CFG.sections || {})) if (on && SECTION_FEEDS[name]) EXTRA[name] = SECTION_FEEDS[name];
+Object.assign(EXTRA, CFG.custom_sections || {});
+
+function arg(name, dflt) {
+  const i = process.argv.indexOf(name);
+  return i >= 0 && process.argv[i + 1] ? process.argv[i + 1] : dflt;
+}
+
+const NAMED_ENTITIES = { lt: "<", gt: ">", quot: '"', apos: "'", nbsp: " ", amp: "&", ndash: "-", mdash: "-", lsquo: "'", rsquo: "'", ldquo: '"', rdquo: '"' };
+
+// One pass over every entity form feeds use: named, decimal (&#39;) and hex (&#x27;).
+function unescapeEntities(s) {
+  // lang-regex-ok: HTML entity references in feed markup, not language
+  return s.replace(/&(?:#x([0-9a-f]+)|#(\d+)|([a-z]+));/gi, (whole, hex, dec, name) => {
+    if (name) return NAMED_ENTITIES[name.toLowerCase()] ?? whole;
+    const cp = hex ? parseInt(hex, 16) : parseInt(dec, 10);
+    if (cp === 0x2013 || cp === 0x2014) return "-";
+    if (cp === 0x2018 || cp === 0x2019) return "'";
+    if (cp === 0x201c || cp === 0x201d) return '"';
+    try { return String.fromCodePoint(cp); } catch { return whole; }
+  });
+}
+
+// Feeds escape in two layers: an element body can be entity-escaped HTML
+// (Google News <description> is `&lt;a href=…&gt;Title&lt;/a&gt;&nbsp;…`).
+// Unescape first so that markup becomes real tags, strip them, then unescape
+// again for text that was escaped inside that markup. Stripping before
+// unescaping (the pre-2026-10-07 order) left raw `<a href=…` in the summary.
+function decode(s) {
+  const unwrapped = String(s || "").replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, "$1"); // lang-regex-ok: XML CDATA wrapper, feed structure
+  return unescapeEntities(unescapeEntities(unwrapped).replace(/<\/?[a-z][^>]*>/gi, " ")) // lang-regex-ok: strip HTML tags from feed markup
+    .replace(/\s+/g, " ").trim(); // lang-regex-ok: collapse whitespace in feed text
+}
+
+function tag(block, name) {
+  // lang-regex-ok: reads an XML element out of RSS markup, not language
+  const m = new RegExp(`<${name}(?:\\s[^>]*)?>([\\s\\S]*?)</${name}>`, "i").exec(block);
+  return m ? decode(m[1]) : "";
+}
+
+function parseItems(xml, source) {
+  const blocks = xml.match(/<item[\s>][\s\S]*?<\/item>/gi) || []; // lang-regex-ok: RSS <item> elements
+  return blocks.map(b => {
+    const pub = tag(b, "pubDate") || tag(b, "dc:date");
+    const ms = Date.parse(pub);
+    // Google News titles end in " - <Publisher>"; its <source> names the outlet.
+    const outlet = tag(b, "source");
+    const title = tag(b, "title");
+    // Google News' description is only the headline again plus the outlet name —
+    // not a summary, so it is dropped rather than printed as a second copy.
+    let summary = tag(b, "description").slice(0, 300);
+    const head = title.toLowerCase().slice(0, 40);
+    if (summary.toLowerCase().startsWith(head)) summary = "";
+    return {
+      title,
+      summary,
+      url: tag(b, "link"),
+      source: outlet || source,
+      published: Number.isFinite(ms) ? new Date(ms).toISOString() : null,
+    };
+  }).filter(it => it.title && it.url);
+}
+
+async function fetchFeed(source, url) {
+  const r = await fetch(url, {
+    headers: { "User-Agent": "Mozilla/5.0 (Macintosh) jori-news-headlines" },
+    signal: AbortSignal.timeout(15_000),
+  });
+  if (!r.ok) throw new Error(`HTTP ${r.status}`);
+  return parseItems(await r.text(), source);
+}
+
+async function section(feeds, sinceMs, perFeed, errors) {
+  const lists = await Promise.all(feeds.map(async ([source, url]) => {
+    try {
+      return (await fetchFeed(source, url))
+        .filter(it => it.published && Date.parse(it.published) >= sinceMs)
+        .slice(0, perFeed);
+    } catch (e) {
+      errors.push({ source, url, error: e.message });
+      return [];
+    }
+  }));
+  const seen = new Set();
+  return lists.flat()
+    .sort((a, b) => Date.parse(b.published) - Date.parse(a.published))
+    .filter(it => {
+      const k = it.title.toLowerCase();
+      if (seen.has(k)) return false;
+      seen.add(k);
+      return true;
+    });
+}
+
+(async () => {
+  const hours = Number(arg("--hours", "24"));
+  const perFeed = Number(arg("--per-feed", "8"));
+  const city = arg("--city", "");
+  const sinceMs = Date.now() - hours * 3600_000;
+  const errors = [];
+
+  const cityKey = city.toLowerCase().replace(/\s+city$/, "").trim();
+  const localFeeds = city
+    ? (LOCAL_FEEDS[cityKey] || [["Google News",
+        `https://news.google.com/rss/search?q=${encodeURIComponent(`"${city}" when:1d`)}&hl=en-US&gl=US&ceid=US:en`]])
+    : [];
+
+  const extraNames = Object.keys(EXTRA);
+  const [world, business, local, ...extra] = await Promise.all([
+    section(FEEDS.world, sinceMs, perFeed, errors),
+    section(FEEDS.business, sinceMs, perFeed, errors),
+    section(localFeeds, sinceMs, perFeed, errors),
+    ...extraNames.map((n) => section(EXTRA[n], sinceMs, perFeed, errors)),
+  ]);
+  const sections = { world };
+  extraNames.forEach((n, i) => { sections[n] = extra[i]; });
+  Object.assign(sections, { business, local });
+
+  process.stdout.write(JSON.stringify({
+    generated_at: new Date().toISOString(),
+    hours,
+    local_city: city || null,
+    sections,
+    errors,
+  }, null, 2) + "\n");
+})().catch(e => {
+  process.stderr.write(`news-headlines: ${e.message}\n`);
+  process.exit(1);
+});

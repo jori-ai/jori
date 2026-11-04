@@ -28,6 +28,7 @@
 // agent/CLAUDE.md § Long-Running Jobs and the job playbook.
 
 import fs from "node:fs";
+import { MODELS } from "../lib/models.cjs";
 import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
@@ -109,7 +110,7 @@ const threshold = Number(flag("threshold", dedup.DEFAULT_THRESHOLD));
 const rareJaccard = Number(flag("rare-jaccard", dedup.DEFAULT_RARE_JACCARD));
 const maxClusters = Number(flag("max-clusters", dedup.DEFAULT_MAX_CLUSTERS));
 const concurrency = Number(flag("concurrency", 3));
-const model = flag("model", "claude-sonnet-5-5");
+const model = flag("model", MODELS.sonnet);
 const dryRun = has("dry-run");
 
 const state = dedup.loadState(fs);

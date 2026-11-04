@@ -1,0 +1,234 @@
+#!/bin/bash
+# jori-sync — keep laptop + mac mini clones in sync via origin (GitHub).
+#
+# What it does (since 2026-09-08 — see the block comment before the update
+# logic for the failure that motivated it):
+#   - fetches always (read-only)
+#   - remote ahead: stashes runtime drift, fast-forwards, restores the drift
+#   - both ahead: stashes drift, REBASES local commits onto origin, restores
+#   - local ahead: pushes (a dirty tree never blocks a push)
+#   - both hosts prepending a "Recent changes" bullet to system/changelog.md is
+#     merged by bin/merge-changelog (keep both), not treated as a conflict
+#   - a rebase conflict is aborted and the tree put back exactly as it was;
+#     a drift file that no longer applies is set to the incoming version and
+#     the agents' copy kept in the stash. Both exit 1 and name what to do.
+#     Conflict markers are never left in the working tree.
+#
+# Exit codes:
+#   0  in sync, or advanced cleanly (pulled/pushed)
+#   1  requires human attention (rebase conflict, drift conflict, push failed)
+#   2  not a git repo / misconfigured
+#
+# Usage:
+#   jori-sync                 # run once, print status
+#   jori-sync --quiet         # suppress output when nothing changed
+#   jori-sync --no-push       # fetch/pull only, never push (safer for cron on a host that shouldn't auto-push)
+#
+# Recommended cron (any host — script self-locates from its own path):
+#   */15 * * * * <install>/bin/jori-sync --quiet >> $HOME/.jori-sync.log 2>&1
+# (substitute the path you actually cloned into; no `cd` needed)
+
+set -u
+QUIET=0
+NO_PUSH=0
+for a in "$@"; do
+  case "$a" in
+    --quiet)   QUIET=1 ;;
+    --no-push) NO_PUSH=1 ;;
+    -h|--help)
+      sed -n '2,/^$/p' "$0" | sed 's/^# \{0,1\}//'
+      exit 0
+      ;;
+    *) echo "unknown arg: $a" >&2; exit 2 ;;
+  esac
+done
+
+# Self-locate so cron entries can invoke us as a bare absolute path (no `cd`
+# required by the caller). Script lives at <repo>/bin/jori-sync, so
+# the repo root is two directories up. We then ask git to canonicalize it,
+# which both validates the .git tree and resolves any symlinks.
+SELF=$(cd "$(dirname "$0")" && pwd -P)/$(basename "$0")
+SCRIPT_REPO_GUESS=$(cd "$(dirname "$SELF")/.." && pwd -P)
+# The passes run a copy of this script: a pass can move bin/jori-sync itself
+# between the repos (the overlay pull deletes it, the kernel pull adds it back),
+# and the next pass must not exec a path that is briefly gone.
+[ -n "${JORI_SYNC_REPO:-}" ] && SCRIPT_REPO_GUESS="$JORI_SYNC_REPO"
+REPO_ROOT=$(git -C "$SCRIPT_REPO_GUESS" rev-parse --show-toplevel 2>/dev/null) \
+  || { echo "jori-sync: $SCRIPT_REPO_GUESS is not a git repo (script self-located from $SELF)" >&2; exit 2; }
+cd "$REPO_ROOT" || exit 2
+
+HOST=$(hostname -s)
+TS=$(date '+%Y-%m-%dT%H:%M:%S%z')
+
+say() { [ "$QUIET" -eq 0 ] && echo "[$TS $HOST] $*"; }
+loud() { echo "[$TS $HOST] $*"; }
+
+# A switched install (the kernel checkout plus a private overlay checked out
+# over it, lib/overlay.cjs): sync each repo with the same steps — this
+# script again, once for the kernel checkout (its `install` branch) and once
+# for the overlay (GIT_DIR on the overlay) — then refresh the kernel repo's
+# exclude block for whatever the overlay pulled in. The overlay goes first: a
+# promotion (Phase P) deletes files from the overlay and adds the same paths to
+# the kernel repo, and pulling the kernel first left the overlay seeing them as
+# local edits (a false drift conflict and a stash on every promotion).
+OVERLAY_GIT="${JORI_OVERLAY_GIT_DIR:-$REPO_ROOT/.overlay.git}"
+if [ -z "${JORI_SYNC_PASS:-}" ] && [ -f "$OVERLAY_GIT/HEAD" ]; then
+  rc=0
+  RUN=$(mktemp "${TMPDIR:-/tmp}/jori-sync.XXXXXX") && cp "$SELF" "$RUN" && chmod +x "$RUN" || RUN="$SELF"
+  JORI_SYNC_REPO="$REPO_ROOT" JORI_SYNC_PASS=overlay GIT_DIR="$OVERLAY_GIT" GIT_WORK_TREE="$REPO_ROOT" "$RUN" "$@" || rc=$?
+  JORI_SYNC_REPO="$REPO_ROOT" JORI_SYNC_PASS=kernel "$RUN" "$@" || { r=$?; [ "$r" -gt "$rc" ] && rc=$r; }
+  [ "$RUN" != "$SELF" ] && rm -f "$RUN"
+  "$REPO_ROOT/bin/jori-overlay" sync-excludes >/dev/null 2>&1 || true
+  exit "$rc"
+fi
+[ -n "${JORI_SYNC_PASS:-}" ] && HOST="$HOST/${JORI_SYNC_PASS}"
+
+BRANCH=$(git symbolic-ref --short HEAD 2>/dev/null) || { loud "jori-sync: detached HEAD — refusing to sync"; exit 1; }
+# main; in a switched install the kernel checkout runs on `install` (its fixes
+# reach Jori main through a pull request).
+case "${JORI_SYNC_PASS:-}:$BRANCH" in
+  :main|overlay:main|kernel:install) ;;
+  *) loud "jori-sync: on branch '$BRANCH' — refusing to sync (expected ${JORI_SYNC_PASS:+the $JORI_SYNC_PASS repo on }$([ "${JORI_SYNC_PASS:-}" = kernel ] && echo install || echo main))"; exit 1 ;;
+esac
+
+if ! git remote get-url origin >/dev/null 2>&1; then
+  loud "jori-sync: no origin remote configured"
+  exit 2
+fi
+
+# The changelog merge driver (bin/merge-changelog, selected by
+# .gitattributes for system/changelog.md): two hosts each prepending a
+# dated bullet is not a conflict a human needs to see. Local repo config, set
+# idempotently here so manual rebases on this host get it too.
+git config merge.changelog.name "append-only changelog: keep both sides' bullets" 2>/dev/null
+git config merge.changelog.driver "$REPO_ROOT/bin/merge-changelog %O %A %B" 2>/dev/null
+
+# The commit gates (githooks/pre-commit: commit scoping, the lints,
+# kernel-guard) run only where git is pointed at them. Wire a host that is not
+# (a fresh clone); never override a deliberately different value, only say so.
+# jori-commit runs the hook by hand on a clone that is not wired either way.
+HOOKS_PATH=$(git config --get core.hooksPath 2>/dev/null || true)
+if [ -z "$HOOKS_PATH" ]; then
+  git config core.hooksPath githooks 2>/dev/null && say "wired core.hooksPath=githooks (commit gates)"
+elif [ "$HOOKS_PATH" != "githooks" ] \
+     && [ "$(cd "$REPO_ROOT" && cd "$HOOKS_PATH" 2>/dev/null && pwd -P || echo "$HOOKS_PATH")" != "$(cd "$REPO_ROOT/githooks" 2>/dev/null && pwd -P || echo "$REPO_ROOT/githooks")" ]; then
+  say "note: core.hooksPath is '$HOOKS_PATH', not githooks — the commit gates run only through jori-commit here"
+fi
+
+# Fetch is always safe.
+git fetch origin --quiet 2>&1 || { loud "jori-sync: git fetch failed"; exit 1; }
+
+LOCAL=$(git rev-parse HEAD)
+REMOTE=$(git rev-parse "origin/$BRANCH")
+
+if [ "$LOCAL" = "$REMOTE" ]; then
+  say "in sync @ ${LOCAL:0:7}"
+  exit 0
+fi
+
+# Counts: behind = remote has commits local doesn't; ahead = local has commits remote doesn't.
+BEHIND=$(git rev-list --count "HEAD..origin/$BRANCH")
+AHEAD=$(git rev-list --count "origin/$BRANCH..HEAD")
+
+# Working-tree state. Untracked files ("??") never block anything; MODIFIED
+# tracked files are the mini's runtime drift (playbooks and config the agents
+# edit in place) and are carried across the update in a stash.
+DIRTY=$(git status --porcelain | grep -v '^??' | wc -l | tr -d ' ')
+UNTRACKED=$(git status --porcelain | grep -c '^??' | tr -d ' ')
+
+# ---------------------------------------------------------------------------
+# Until 2026-09-08 this script pushed only when local was ahead AND remote was
+# not, and pulled only when the tree was clean. On the mini neither holds for
+# long: self-improve commits owner-approved fixes locally, the laptop pushes
+# its own work first, and from then on every run said "DIVERGED — human
+# intervention required" (94 in a row) while six approved fixes sat unpushed
+# and the mini fell four commits behind. Runtime drift (the agents editing
+# playbooks in place) blocked the plain pull the same way.
+#
+# Now: stash the drift, put local commits on top of origin (a rebase — these
+# are small, independent self-improve commits; a plain ff when there are
+# none), restore the drift, push. Every step that can conflict has a defined
+# retreat that never leaves conflict markers in a live tree:
+#   - a rebase conflict aborts the rebase and restores the drift; exit 1;
+#   - a drift file that no longer applies is set to the INCOMING version
+#     (checked-in code wins on a running host), the drift copy stays in the
+#     stash for a human to fold in; exit 1, with the file names.
+# ---------------------------------------------------------------------------
+
+STASHED=0
+stash_drift() {
+  [ "$DIRTY" -eq 0 ] && return 0
+  if git stash push --quiet -m "jori-sync $TS drift ($DIRTY files)"; then
+    STASHED=1
+    say "stashed $DIRTY drifted file(s)"
+    return 0
+  fi
+  loud "BLOCKED: could not stash $DIRTY uncommitted change(s)"
+  return 1
+}
+
+# Put the drift back. Files that conflict with what just arrived are reset to
+# the incoming version; the stash is KEPT so nothing the agents wrote is lost.
+restore_drift() {
+  [ "$STASHED" -eq 1 ] || return 0
+  if git stash pop --quiet 2>/dev/null; then
+    STASHED=0
+    return 0
+  fi
+  local conflicted
+  conflicted=$(git diff --name-only --diff-filter=U)
+  if [ -n "$conflicted" ]; then
+    # shellcheck disable=SC2086
+    git checkout --quiet HEAD -- $conflicted
+  fi
+  git reset --quiet                       # the pop stages what it applied; drift is unstaged by convention
+  loud "DRIFT CONFLICT: incoming version kept for: $(echo "$conflicted" | tr '\n' ' ')"
+  loud "  the agents' edits to those files are in $(git stash list | head -1 | cut -d: -f1) — fold them into the repo, then 'git stash drop'"
+  return 1
+}
+
+PREV_HEAD=$LOCAL
+DRIFT_RC=0
+
+if [ "$BEHIND" -gt 0 ]; then
+  stash_drift || exit 1
+  if [ "$AHEAD" -eq 0 ]; then
+    if git pull --ff-only --quiet; then
+      loud "pulled $BEHIND commit(s) from origin → $(git rev-parse --short HEAD)"
+    else
+      restore_drift
+      loud "BLOCKED: git pull --ff-only failed (unexpected — fetch said we were behind cleanly)"
+      exit 1
+    fi
+  else
+    # Divergence: our commits go on top of theirs.
+    if git rebase --quiet "origin/$BRANCH" >/dev/null 2>&1; then
+      loud "rebased $AHEAD local commit(s) onto origin ($BEHIND new) → $(git rev-parse --short HEAD)"
+    else
+      git rebase --abort >/dev/null 2>&1
+      git reset --quiet --hard "$PREV_HEAD"
+      restore_drift
+      loud "DIVERGED: rebase of $AHEAD local commit(s) onto origin/$BRANCH conflicts. Human intervention required:"
+      loud "  git log origin/$BRANCH..HEAD --oneline   # unpushed commits"
+      loud "  git rebase origin/$BRANCH                # and resolve"
+      exit 1
+    fi
+  fi
+  restore_drift || DRIFT_RC=1
+fi
+
+AHEAD=$(git rev-list --count "origin/$BRANCH..HEAD")
+if [ "$AHEAD" -gt 0 ]; then
+  if [ "$NO_PUSH" -eq 1 ]; then
+    say "local is $AHEAD commit(s) ahead but --no-push set; skipping"
+    exit $DRIFT_RC
+  fi
+  if git push origin "$BRANCH" --quiet; then
+    loud "pushed $AHEAD commit(s) to origin → $(git rev-parse --short HEAD)"
+  else
+    loud "BLOCKED: git push failed (auth? network? — or origin moved again; next run will rebase)"
+    exit 1
+  fi
+fi
+
+exit $DRIFT_RC

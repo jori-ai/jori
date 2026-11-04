@@ -1,0 +1,125 @@
+{
+  "accounts": [
+    {
+      "accountId": 1000001,
+      "code": "cardpoints",
+      "displayName": "Example Card (Rewards)",
+      "kind": "Credit Cards",
+      "login": "REDACTED",
+      "login2": "United States",
+      "autologinUrl": "n/a",
+      "updateUrl": "n/a",
+      "editURL": "n/a",
+      "balance": "123,456",
+      "balanceRaw": 123456,
+      "isBalanceVerified": true,
+      "owner": "Test Owner",
+      "errorCode": 1,
+      "lastDetectedChange": "+12,000",
+      "lastRetrieveDate": "2026-10-18T19:35:02+00:00",
+      "lastChangeDate": "2026-10-18T19:35:02+00:00",
+      "properties": [],
+      "subAccounts": [
+        {
+          "subAccountId": 2000001,
+          "displayName": "Example Card (Rewards) - Travel Credit *00000",
+          "balance": "$200",
+          "balanceRaw": 200,
+          "expirationDate": "2026-12-31T00:00:00+00:00",
+          "properties": [
+            { "name": "Total Earned This Year", "value": "$0" },
+            { "name": "Credit Remaining", "value": "$0 of $200" }
+          ]
+        },
+        {
+          "subAccountId": 2000002,
+          "displayName": "Example Card (Rewards) - Lounge Access *00000",
+          "balance": "n/a",
+          "balanceRaw": null,
+          "properties": [
+            { "name": "Status", "value": "Locked" },
+            { "name": "Access Through", "value": "Jan 31, 2028" }
+          ]
+        }
+      ]
+    },
+    {
+      "accountId": 1000002,
+      "code": "airclub",
+      "displayName": "Example Air (Club)",
+      "kind": "Airlines",
+      "login": "REDACTED",
+      "login2": "US",
+      "autologinUrl": "n/a",
+      "updateUrl": "n/a",
+      "editURL": "n/a",
+      "balance": "0",
+      "balanceRaw": 0,
+      "isBalanceVerified": true,
+      "owner": "Test Owner",
+      "errorCode": 4,
+      "errorMessage": "We could not recognize captcha. Please try again later.",
+      "lastRetrieveDate": "2026-03-13T17:43:19+00:00",
+      "properties": [
+        { "name": "Level", "value": "Blue", "rank": 0, "kind": 3, "isValueVerified": true }
+      ],
+      "subAccounts": []
+    },
+    {
+      "accountId": 1000003,
+      "code": "hotelrewards",
+      "displayName": "Example Hotels (Rewards)",
+      "kind": "Hotels",
+      "login": "REDACTED",
+      "login2": "hotel",
+      "autologinUrl": "n/a",
+      "updateUrl": "n/a",
+      "editURL": "n/a",
+      "balance": "98,765",
+      "balanceRaw": 98765,
+      "isBalanceVerified": true,
+      "owner": "Test Owner",
+      "errorCode": 8,
+      "errorMessage": "To prevent your account from being locked out by the provider please change the password or the user name you entered on AwardWallet.com as these credentials appear to be invalid.",
+      "lastDetectedChange": "+50,000",
+      "expirationDate": "2286-11-20T17:46:40+00:00",
+      "lastRetrieveDate": "2025-06-27T23:42:04+00:00",
+      "lastChangeDate": "2025-06-27T23:42:09+00:00",
+      "properties": [
+        { "name": "Membership Level", "value": "Platinum Elite", "rank": 3, "kind": 3, "isValueVerified": true }
+      ],
+      "subAccounts": [
+        {
+          "subAccountId": 2000003,
+          "displayName": "Example Hotels (Rewards) - Certificate: free night up to 35k points.",
+          "balance": "",
+          "balanceRaw": null,
+          "expirationDate": "2023-03-06T00:00:00+00:00"
+        }
+      ]
+    },
+    {
+      "accountId": 1000004,
+      "code": "milesgo",
+      "displayName": "Example Airways (Miles&amp;Go)",
+      "kind": "Airlines",
+      "login": "REDACTED",
+      "login2": "",
+      "autologinUrl": "n/a",
+      "updateUrl": "n/a",
+      "editURL": "n/a",
+      "balance": "-200",
+      "balanceRaw": -200,
+      "isBalanceVerified": true,
+      "owner": "Test Owner",
+      "errorCode": 1,
+      "lastRetrieveDate": "2026-10-18T19:35:02+00:00",
+      "properties": [
+        { "name": "Status Miles", "value": "0", "kind": 9 },
+        { "name": "Member Since", "value": "2019", "kind": 19 },
+        { "name": "Tier", "value": "Miles&amp;Go", "kind": 3 }
+      ],
+      "subAccounts": []
+    }
+  ]
+}

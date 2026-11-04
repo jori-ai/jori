@@ -1,0 +1,186 @@
+#!/usr/bin/env node
+// stop-evidence — did we ask the user about a stop the user had already told us about?
+// The step itself lives in lib/stop-evidence.mjs and runs inside
+// bin/stop-passage before every location question. This CLI audits it.
+//
+//   stop-evidence audit [YYYY-MM-DD] [--tz Area/City] [--json]
+//     Every stop the user was actually asked about that day is re-run through
+//     stop-passage with --audit (no probe, nothing written, settled rows
+//     included) and listed when the evidence would have named it — i.e. a
+//     question that never needed asking.
+//     nightly-review Step 3 Daily Log item 8 runs this for each day of the week.
+//
+// "Asked" means a question naming the visit REACHED CHAT, as an assistant row
+// in jori_messages carrying either
+//   - a choice card (metadata.choices) of kind location_stop / location_ask
+//     whose `ref` is the visit: segment-ask's card, and the one hum-ping
+//     attaches to a location ask; or
+//   - for a hum-ask question, which has NO card: metadata.finding_key
+//     `location_ask:<visit id>` (stamped since 2026-10-27), counted only when
+//     the open-questions ledger recorded that row as a question that landed
+//     (an FYI the resolve-first gate sent instead has the same metadata).
+// A location-lane hum question with no finding_key (hum-ask, 2026-10-15 until
+// the stamp) cannot be tied to a stop — no record links its id to a visit — and
+// a question whose ref is not a visit row id (the location-confirm flow's
+// synthetic `lc-<date>-<hhmm>-<lat>-<lon>`) cannot be re-run: both are reported
+// as `unlinked` (not audited), never silently dropped.
+// (Until 2026-10-27 an ask:true ask-gate row counted, though most never became
+// a question: 2026-10-20..25, 14 reported needless, 2 ever asked.) The gate row
+// gives the stop's window, else the card's subject. Unreadable chat → exit 1.
+
+import fs from "node:fs";
+import path from "node:path";
+import { spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
+import { createRequire } from "node:module";
+import { readLedger, TIME_BOUND_LANES } from "../lib/open-questions.mjs";
+import { installTools } from "../lib/root.cjs";
+import { instance } from "../lib/instance.cjs";
+
+const HERE = path.dirname(fileURLToPath(import.meta.url));
+const ROOT = path.resolve(HERE, "..");
+const DATA = installTools("data");
+const GATE_LOG = path.join(DATA, "ask-gate-log.jsonl");
+
+const argv = process.argv.slice(2);
+const arg = (n) => { const i = argv.indexOf(n); return i >= 0 ? argv[i + 1] : null; };
+const has = (n) => argv.includes(n);
+
+function defaultTz() {
+  try { return JSON.parse(fs.readFileSync(path.join(DATA, "user-timezone.json"), "utf8")).timezone || instance().tz; }
+  catch { return instance().tz; }
+}
+const localDate = (t, tz) => new Intl.DateTimeFormat("en-CA", { timeZone: tz }).format(new Date(t));
+
+// Choice-card kinds that are a question to the user about one stop (`ref` = visit id).
+const STOP_CARD_KINDS = new Set(["location_stop", "location_ask"]);
+// The finding key of a hum stop question (agent/scripts/hum-harvesters/location_context.mjs).
+const LOCATION_ASK_PREFIX = "location_ask:";
+// A visit is a location_history row, keyed by uuid; stop-passage can re-run nothing else.
+const VISIT_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i; // lang-regex-ok: shape of a machine row id
+
+/** Pure. message id → {question_id, lane} for every hum question that landed
+ *  (the open-questions ledger's `asked` events). */
+export function landedQuestions(ledgerEvents) {
+  const byMsg = new Map();
+  for (const e of ledgerEvents || []) {
+    if (e && e.ev === "asked" && e.msg_id && e.id) byMsg.set(String(e.msg_id), { question_id: e.id, lane: e.lane || null });
+  }
+  return byMsg;
+}
+
+/** Pure. The stop questions that reached chat on `date` (local to `tz`):
+ *  { asked: visit_id → {asked_at, subject}, unlinked: [{question_id, message_id, lane, asked_at, ref}] }.
+ *  The FIRST message about a visit is when the question went out. */
+export function stopQuestions(messages, date, tz, landed = new Map()) {
+  const asked = new Map(), unlinked = [];
+  const unlink = (m, q, ref) => unlinked.push({ question_id: q ? q.question_id : null, message_id: m.id || null,
+    lane: q ? q.lane : null, asked_at: m.created_at, ref });
+  const note = (m, q, vid, subject) => {
+    if (!VISIT_ID.test(vid)) return unlink(m, q, vid);
+    const prev = asked.get(vid);
+    if (!prev || Date.parse(m.created_at) < Date.parse(prev.asked_at)) asked.set(vid, { asked_at: m.created_at, subject: subject || null });
+  };
+  for (const m of messages || []) {
+    if (!m || (m.role && m.role !== "assistant") || !m.created_at) continue;
+    if (localDate(m.created_at, tz) !== date) continue;
+    const meta = m.metadata || {};
+    let card = null;
+    try { card = typeof meta.choices === "string" ? JSON.parse(meta.choices) : meta.choices || null; } catch { card = null; }
+    if (card && STOP_CARD_KINDS.has(card.kind) && card.ref) { note(m, null, String(card.ref), card.subject); continue; }
+    if (!meta.question_id) continue;
+    const q = landed.get(String(m.id));
+    if (!q) continue; // not a hum question that landed as one (an FYI instead, another job's question)
+    const key = typeof meta.finding_key === "string" ? meta.finding_key : "";
+    if (key.startsWith(LOCATION_ASK_PREFIX) && key.length > LOCATION_ASK_PREFIX.length) {
+      note(m, q, key.slice(LOCATION_ASK_PREFIX.length), null);
+    } else if (!key && TIME_BOUND_LANES.has(q.lane)) {
+      unlink(m, q, null);
+    }
+  }
+  return { asked, unlinked };
+}
+
+/** Pure. The stops to audit: the ones a question reached chat about, each with
+ *  its window (the latest ask-gate window for the visit, else the card's own)
+ *  and when the question went out; plus the location questions that name no stop. */
+export function askedStops(gateRows, messages, date, tz, landed = new Map()) {
+  const windows = new Map();
+  for (const r of gateRows || []) {
+    if (!r || r.mode !== "ask" || r.ask !== true || !r.visit_id || !r.window) continue;
+    windows.set(r.visit_id, r.window); // the log is in time order: the latest window wins
+  }
+  const { asked: questions, unlinked } = stopQuestions(messages, date, tz, landed);
+  const asked = new Map();
+  for (const [vid, q] of questions) {
+    const s = q.subject || {};
+    const w = windows.get(vid) || (s.start && s.end ? { start: s.start, end: s.end } : null);
+    asked.set(vid, w ? { ...w, asked_at: q.asked_at } : { asked_at: q.asked_at, start: null, end: null });
+  }
+  return { asked, unlinked };
+}
+
+function readGateRows() {
+  let text = "";
+  try { text = fs.readFileSync(GATE_LOG, "utf8"); } catch {}
+  return text.split("\n").filter(Boolean).map((l) => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+}
+
+/** The day's assistant rows that carry a choice card or a question id, or null when chat could not be read. */
+async function readQuestionRows(date) {
+  const { fetchJson } = createRequire(import.meta.url)("../lib/supabase-rest.js");
+  // The UTC day padded by the widest zone offsets (14 h) covers the local day
+  // in any zone; stopQuestions keeps only the local day.
+  const day = Date.parse(`${date}T00:00:00Z`), pad = 14 * 3600e3;
+  const from = new Date(day - pad).toISOString(), to = new Date(day + 864e5 + pad).toISOString();
+  const rows = await fetchJson("/rest/v1/jori_messages?role=eq.assistant"
+    + `&created_at=gte.${encodeURIComponent(from)}&created_at=lt.${encodeURIComponent(to)}`
+    + "&or=(metadata->>choices.not.is.null,metadata->>question_id.not.is.null)"
+    + "&select=id,role,created_at,metadata&order=created_at.asc&limit=1000", { timeoutMs: 20000 });
+  return Array.isArray(rows) ? rows : null;
+}
+
+async function audit(date, tz) {
+  const messages = await readQuestionRows(date);
+  if (!messages) {
+    return { date, tz, asked: null, error: "could not read chat (jori_messages) — which stops were asked about is unknown",
+      would_have_named: [], others: [], unlinked: [] };
+  }
+  const { asked, unlinked } = askedStops(readGateRows(), messages, date, tz, landedQuestions(readLedger()));
+  const hits = [], rest = [];
+  for (const [vid, w] of asked) {
+    if (!w.start || !w.end) {
+      rest.push({ visit_id: vid, window: w, verdict: "error", name: null, reason: "no window recorded for this stop" });
+      continue;
+    }
+    const p = spawnSync(path.join(HERE, "stop-passage"), ["--visit", vid, "--start", w.start, "--end", w.end,
+      "--tz", tz, "--audit", "--evidence-asof", w.asked_at, "--json"], { encoding: "utf8", timeout: 180000 });
+    let res = {};
+    try { res = JSON.parse((p.stdout || "").trim().split("\n").pop() || "{}"); } catch {}
+    const row = { visit_id: vid, window: w, verdict: res.verdict || "error", name: res.name || null,
+      reason: res.reason || res.error || (p.stderr || "").slice(-200) };
+    (res.verdict === "evidence" ? hits : rest).push(row);
+  }
+  return { date, tz, asked: asked.size, would_have_named: hits, others: rest, unlinked };
+}
+
+async function main() {
+  const cmd = argv[0];
+  if (cmd !== "audit") {
+    console.error("usage: stop-evidence audit [YYYY-MM-DD] [--tz Area/City] [--json]");
+    process.exit(2);
+  }
+  const tz = arg("--tz") || defaultTz();
+  const date = argv[1] && !argv[1].startsWith("--") ? argv[1] : localDate(Date.now() - 864e5, tz);
+  const out = await audit(date, tz);
+  if (has("--json")) { process.stdout.write(JSON.stringify(out) + "\n"); process.exit(out.error ? 1 : 0); }
+  if (out.error) { console.error(`${out.date}: ${out.error}`); process.exit(1); }
+  console.log(`${out.date}: ${out.asked} stop(s) asked about; ${out.would_have_named.length} already answered by chat/photos`
+    + (out.unlinked.length ? `; ${out.unlinked.length} location question(s) not tied to a stop (not audited)` : ""));
+  for (const h of out.would_have_named) console.log(`  NEEDLESS  ${h.window.start}  ${h.name} — ${h.reason}`);
+  for (const o of out.others) console.log(`  ${o.verdict.padEnd(9)} ${o.window.start || "(no window)"}  ${String(o.reason || "").slice(0, 140)}`);
+  for (const u of out.unlinked) console.log(`  UNLINKED  ${u.asked_at}  ${u.question_id || "card"} (${u.lane || "location"}) — `
+    + (u.ref ? `about ${u.ref}, which is not a recorded visit` : "sent with no record of which stop it was about"));
+}
+
+if (process.argv[1] && fs.realpathSync(process.argv[1]) === fileURLToPath(import.meta.url)) await main();

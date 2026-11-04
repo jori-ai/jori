@@ -1,0 +1,474 @@
+#!/usr/bin/env python3
+"""photos-sync-gaps — re-attempt days whose photo sync never landed.
+
+Why this exists (2026-08-11). `bin/photos` syncs exactly one day, and
+every caller derives that day from *today*: `photos sync` defaults to yesterday
+and `trigger-photos-backfill-thumbs.sh` computes its DATE as a fixed offset
+from today. So when the underlying `osxphotos query` fails, no code path ever
+goes back for that day. 2026-08-07 sat at zero rows for days between two
+healthy days because nobody happened to read the alert.
+
+This walks a short window of recent days, finds the ones with no rows at all,
+and re-runs `photos sync --date` for them. A day that comes back genuinely
+empty is retried a bounded number of times and then left alone, so a
+photo-free day does not cost an osxphotos scan every night forever.
+
+ROWS LANDING IS NOT THE SAME AS THE DAY BEING RENDERED (2026-08-18). The sweep
+above asks one question — "are there photo rows for this date?" — and once the
+answer is yes it drops the date and moves on. That is how 2026-08-07/09/11/12/13
+ended up holding 96 photo rows between them while every one of those day records
+still reports zero photos: the sandbox bug that lost the original syncs was
+fixed on 2026-08-14 and the rows arrived afterwards, but `daily_summaries` had
+already been written for those dates and nothing ever went back to re-render
+them. So a second question is asked here: the rows are in, did the day record
+actually pick them up?
+
+That check REPORTS, it does not repair, and the distinction is deliberate:
+
+  * It READS `daily_summaries.photos_count` and never writes it, and never
+    re-derives it either. The column counts photos matched to a stop, so it is
+    legitimately lower than the row count (08-10: 13 rows, 9 counted) — but do
+    not try to reconstruct it from `resolved_day_json.stops[].photos`. That sum
+    is not the column: the corpus disagrees in both directions (07-04 counts 9
+    against 19 summed; 05-16 35 against 4), and whole days carry stops with no
+    `photos` key at all (08-04, 07-21), which a sum reads as zero and flags as
+    broken. Patching the column would be worse still: `photos_count == 0` is
+    the exact signal the user noticed, so overwriting it converts a
+    visible failure into an invisible one.
+  * It never re-syncs those dates either — they already have rows, so a scan
+    would be a no-op that costs minutes of osxphotos.
+  * It does not dispatch the re-render. Re-rendering a day means
+    `daily-summary-run`, which forks a whole `claude -p` session to rewrite the
+    narrative. That is not a decision a silent cron-side sweep should make five
+    times unattended.
+
+What it does is name the dates, in the ledger and in the JSON summary, so the
+condition stops being invisible. Re-rendering stays a human/agent call.
+
+An ERROR is not an empty day (2026-08-14). The give-up budget originally
+counted every attempt, so a date whose sync kept *failing* was blacklisted
+after two tries and never attempted again — which is backwards: a failing date
+is exactly the one worth retrying, and an erroring sweep silently retired
+2026-08-07/09/11/12 in that state. `--tries` now only counts attempts that ran
+cleanly and found nothing. Failures are recorded in `fail_tries` and keep the
+date a candidate; the per-run `--max` is what bounds their cost.
+
+Run me OUTSIDE the Claude Code Bash sandbox. `osxphotos` drives Photos.app over
+Apple events, which the sandbox blocks — it surfaces as `applescript.ScriptError:
+Expected "," but found class name. (-2741)`, deterministically, on every date.
+That is a sandbox verdict, never a transient library problem.
+
+Usage:
+  photos-sync-gaps [--days N] [--max M] [--tries T] [--render-days R]
+                   [--dry-run] [--json]
+
+  --days N        size of the re-sync look-back window, ending yesterday
+                  (default 8)
+  --render-days R how far back the (much cheaper) stale-render check looks
+                  (default 45). Never adds a re-sync candidate.
+  --max M     most days to actually re-sync in one invocation (default 2)
+  --tries T   give up on a date after T clean attempts that found nothing
+              (default 2); attempts that errored do not count
+  --dry-run   report what would be re-synced, run nothing
+  --json      machine-readable summary only
+
+Test hooks (not for normal use):
+  --ledger PATH        override the ledger location
+  --counts-json PATH   supply {"YYYY-MM-DD": <row count>} instead of querying
+  --rendered-json PATH supply {"YYYY-MM-DD": {"stops": N, "photos_count": M,
+                       "synced_after_render": true|false}} instead of querying
+                       daily_summaries. `photos_count` is the field that decides;
+                       a wrong key reads as null, which is "unknown" and never
+                       flags. When --counts-json is given and this is not, the
+                       render check is skipped entirely, so offline tests never
+                       reach the network.
+  --photos-bin PATH    override the `photos` binary invoked for a re-sync
+
+Always exits 0 unless its own arguments are unusable: this is a best-effort
+catch-up that runs after the real sync, and it must never fail the job around
+it. Silent by design — it has no outbound channel of any kind.
+"""
+import sys, os, json, subprocess, urllib.request, urllib.parse
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
+
+_BIN = os.path.dirname(os.path.realpath(__file__))
+sys.path.insert(0, os.path.join(os.path.dirname(_BIN), "lib"))
+import places_local  # noqa: E402
+import supabase_local  # noqa: E402
+
+REPO = places_local.install_root()
+SUPABASE_URL = supabase_local.supabase_url()
+DEFAULT_LEDGER = places_local.data_path("photos-sync-gaps.json")
+DEFAULT_PHOTOS_BIN = os.path.join(REPO, "bin", "photos")
+# The home zone, a real zone, not a fixed offset. A fixed summer offset is
+# correct exactly half the year: after DST ends it buckets every photo taken
+# in the 23:00 hour into the following day (23:30 standard time read back with
+# the summer offset is 00:30).
+HOME_TZ = ZoneInfo(supabase_local.home_tz())
+# PostgREST caps a page at 1000 rows no matter what `limit` asks for, and
+# without an explicit order the page it returns is not even stable. An 8-day
+# window is ~200 photos today, so this is headroom rather than a live bug — but
+# the failure is silent undercounting, which this sweep would read as "the day
+# is missing" and answer with a pointless osxphotos scan.
+PAGE_ROWS = 1000
+# ...and a hard stop, so a paging bug can never spin cron forever. A month of
+# photos is ~600 rows; this is four orders of magnitude of headroom.
+MAX_ROWS = 100000
+
+# A single osxphotos pass opens and parses the whole Photos library, so one day
+# can legitimately take minutes. 600s is what bin/photos allows itself
+# per attempt; leave headroom above it rather than racing its own timeout.
+SYNC_TIMEOUT_S = 900
+
+
+def _env_key():
+    return supabase_local.service_key()
+
+
+def _day_bounds(start, end):
+    """ISO instants for [start 00:00, end 23:59:59.999999] in the home zone."""
+    s = datetime.fromisoformat(start).replace(tzinfo=HOME_TZ)
+    e = datetime.fromisoformat(end).replace(
+        hour=23, minute=59, second=59, microsecond=999999, tzinfo=HOME_TZ)
+    return s.isoformat(), e.isoformat()
+
+
+def _get(url, key, timeout=30):
+    req = urllib.request.Request(url, method="GET", headers={
+        "apikey": key, "Authorization": f"Bearer {key}"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read().decode() or "[]")
+
+
+def _qs(table, pairs):
+    return f"{SUPABASE_URL}/rest/v1/{table}?" + "&".join(
+        f"{urllib.parse.quote(k, safe='')}={urllib.parse.quote(str(v), safe='.,():*-')}"
+        for k, v in pairs)
+
+
+def _et_date(ts):
+    """Home-zone calendar date for a stored timestamp, or None if unparseable."""
+    if not ts:
+        return None
+    try:
+        return datetime.fromisoformat(str(ts).replace("Z", "+00:00")).astimezone(HOME_TZ).date().isoformat()
+    except ValueError:
+        return None
+
+
+def _counts_from_supabase(start, end):
+    """({date: rows}, {date: newest synced_at}) across [start, end].
+
+    Paged, because PostgREST caps a page at 1000 however large `limit` is.
+    """
+    key = _env_key()
+    if not key:
+        raise RuntimeError("SUPABASE_SERVICE_ROLE_KEY not in .env")
+    lo, hi = _day_bounds(start, end)
+    counts, synced, offset = {}, {}, 0
+    while True:
+        rows = _get(_qs("photos", [
+            ("select", "taken_at,synced_at"),
+            ("taken_at", f"gte.{lo}"),
+            ("taken_at", f"lte.{hi}"),
+            ("order", "taken_at.asc"),
+            ("limit", str(PAGE_ROWS)),
+            ("offset", str(offset)),
+        ]), key)
+        for row in rows:
+            d = _et_date(row.get("taken_at"))
+            if not d:
+                continue
+            counts[d] = counts.get(d, 0) + 1
+            s = str(row.get("synced_at") or "")
+            if s and s > synced.get(d, ""):
+                synced[d] = s
+        if len(rows) < PAGE_ROWS or offset >= MAX_ROWS:
+            return counts, synced
+        offset += PAGE_ROWS
+
+
+def _stop_count(resolved):
+    """How many stops the day record has. Used only to tell a rendered day from
+    one that was never built at all — never to count photos."""
+    return len(((resolved or {}).get("stops") or []))
+
+
+def _rendered_from_supabase(start, end):
+    """{date: {"stops": N, "photos_count": M}} for day records in the window.
+
+    READS `photos_count`; does not re-derive it. An earlier version of this
+    summed `resolved_day_json.stops[].photos` on the theory that the two are
+    equal — they are not, and the corpus refutes it in both directions
+    (2026-07-04 photos_count 9 vs 19 summed; 05-16 35 vs 4). Worse, whole days
+    carry stop objects with no `photos` key at all (2026-08-04, 07-21), which a
+    sum reads as zero — so the proxy flagged days whose own record reports 11
+    and 7 photos. The column is the signal the user actually noticed; use it
+    directly.
+    """
+    key = _env_key()
+    if not key:
+        raise RuntimeError("SUPABASE_SERVICE_ROLE_KEY not in .env")
+    out, offset = {}, 0
+    while True:
+        rows = _get(_qs("daily_summaries", [
+            ("select", "date,photos_count,updated_at,resolved_day_json"),
+            ("date", f"gte.{start}"),
+            ("date", f"lte.{end}"),
+            ("order", "date.asc"),
+            ("limit", str(PAGE_ROWS)),
+            ("offset", str(offset)),
+        ]), key)
+        for row in rows:
+            d = row.get("date")
+            if not d:
+                continue
+            pc = row.get("photos_count")
+            out[str(d)[:10]] = {
+                "stops": _stop_count(row.get("resolved_day_json")),
+                "photos_count": int(pc) if isinstance(pc, (int, float)) else None,
+                "rendered_at": str(row.get("updated_at") or ""),
+            }
+        if len(rows) < PAGE_ROWS:
+            return out
+        offset += PAGE_ROWS
+        if offset >= MAX_ROWS:
+            return out
+
+
+def _load_ledger(path):
+    if not os.path.exists(path):
+        return {"schema_version": 1, "dates": {}}
+    try:
+        d = json.load(open(path))
+    except (ValueError, OSError):
+        # A corrupt ledger must not wedge the catch-up: start over rather than
+        # raise. Worst case a settled empty day gets one more attempt.
+        return {"schema_version": 1, "dates": {}}
+    d.setdefault("dates", {})
+    return d
+
+
+def _save_ledger(path, ledger):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(ledger, f, indent=2, sort_keys=True)
+    os.replace(tmp, path)
+
+
+def _window(days, today=None):
+    today = today or datetime.now(HOME_TZ).date()
+    return [(today - timedelta(days=n)).isoformat() for n in range(days, 0, -1)]
+
+
+def _resync(photos_bin, date):
+    """Run `photos sync --date <date>`. Returns (ok, count, detail)."""
+    try:
+        r = subprocess.run([photos_bin, "sync", "--date", date],
+                           capture_output=True, text=True, timeout=SYNC_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        return False, 0, f"timed out after {SYNC_TIMEOUT_S}s"
+    except OSError as e:
+        return False, 0, f"could not run {photos_bin}: {e}"
+    if r.returncode != 0:
+        return False, 0, (r.stderr or "").strip()[-300:] or f"exit {r.returncode}"
+    # THE PRODUCER PRETTY-PRINTS (fixed 2026-09-30). This read only the LAST
+    # LINE of stdout, but `cmd_sync`'s success-with-photos path ends in
+    # `json.dumps({...}, indent=2)` — so the last line is just "}", json.loads
+    # raised, and every genuinely successful recovery was banked as
+    # `result: "failed"` / "unparseable output from photos sync" with fail_tries
+    # climbing, making the `recovered` branch unreachable since 2026-08-11. Only
+    # the zero-photos path is single-line, which is why empty days parsed fine
+    # and recovered days never did. Parse the WHOLE of stdout; fall back to
+    # decoding from the first "{" so leading noise degrades gracefully instead of
+    # reintroducing another line-shaped guess. `photos` writes progress to
+    # stderr, so that fallback should stay unused in practice.
+    text = r.stdout.strip()
+    out = {}
+    if text:
+        try:
+            out = json.loads(text)
+        except ValueError:
+            brace = text.find("{")
+            if brace < 0:
+                return False, 0, "unparseable output from photos sync"
+            try:
+                out, _ = json.JSONDecoder().raw_decode(text, brace)
+            except ValueError:
+                return False, 0, "unparseable output from photos sync"
+    if not isinstance(out, dict):
+        return False, 0, "unparseable output from photos sync"
+    return True, int(out.get("count") or 0), ""
+
+
+def main(argv):
+    days, max_days, max_tries = 8, 2, 2
+    # The render check looks back much further than the re-sync half, and can
+    # afford to: it is two cheap REST reads, where a re-sync is minutes of
+    # osxphotos. At the shipped `--days 8` the two dates that motivated this
+    # (2026-08-07 and 08-09, 51 of the 96 photos) had already aged out of the
+    # window and could never have been reported.
+    render_days = 45
+    dry_run = as_json = False
+    ledger_path, counts_json, photos_bin = DEFAULT_LEDGER, None, DEFAULT_PHOTOS_BIN
+    rendered_json = None
+
+    it = iter(range(len(argv)))
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "--days": i += 1; days = int(argv[i])
+        elif a == "--max": i += 1; max_days = int(argv[i])
+        elif a == "--tries": i += 1; max_tries = int(argv[i])
+        elif a == "--ledger": i += 1; ledger_path = argv[i]
+        elif a == "--counts-json": i += 1; counts_json = argv[i]
+        elif a == "--rendered-json": i += 1; rendered_json = argv[i]
+        elif a == "--render-days": i += 1; render_days = int(argv[i])
+        elif a == "--photos-bin": i += 1; photos_bin = argv[i]
+        elif a == "--dry-run": dry_run = True
+        elif a == "--json": as_json = True
+        elif a in ("-h", "--help"):
+            print(__doc__); return 0
+        else:
+            print(f"unknown argument: {a}", file=sys.stderr); return 2
+        i += 1
+
+    window = _window(days)
+    # A superset used ONLY for the render check. Re-sync candidates still come
+    # from `window`, so widening this can never cause an extra osxphotos scan.
+    render_window = _window(max(days, render_days))
+    synced = {}
+    if counts_json:
+        counts = json.load(open(counts_json))
+    else:
+        try:
+            counts, synced = _counts_from_supabase(render_window[0], render_window[-1])
+        except Exception as e:  # network, auth, schema — never fail the job
+            summary = {"ok": False, "error": str(e)[:200], "resynced": [],
+                       "candidates": [], "stale_render": []}
+            print(json.dumps(summary, indent=None if as_json else 2))
+            return 0
+
+    # The render check is strictly additional information. It must never be able
+    # to stop the re-sync half from running, so its failure degrades to "no
+    # render info" rather than propagating. Offline (--counts-json without
+    # --rendered-json) it is skipped, so tests never reach the network.
+    if rendered_json:
+        rendered = json.load(open(rendered_json))
+    elif counts_json:
+        rendered = {}
+    else:
+        try:
+            rendered = _rendered_from_supabase(render_window[0], render_window[-1])
+        except Exception:
+            rendered = {}
+
+    ledger = _load_ledger(ledger_path)
+    dates = ledger["dates"]
+
+    # Landing in `photos` is not the same as reaching the day page. A record that
+    # HAS stops but reports zero photos was rendered before the rows arrived.
+    # Requiring stops > 0 keeps this off days that were never rendered at all —
+    # that is the blank-day failure, which has its own watchdog. A null
+    # photos_count is unknown, not zero, and is left alone.
+    #
+    # AND the photos must have arrived AFTER the render, which is the actual
+    # mechanism rather than a symptom of it. Without this, `photos_count == 0`
+    # also catches days that rendered correctly and simply had nothing to place:
+    # a photo with no coordinates can never match a stop, so days whose photos
+    # are all ungeotagged sit at zero forever and re-rendering changes nothing.
+    # Ten such days (05-13, 05-18, 05-19, 05-27, 06-01, 06-04, 06-18, 06-22,
+    # 06-23, 06-29) are outside the 45-day window today purely by calendar luck.
+    # max(photos.synced_at) > daily_summaries.updated_at separates them exactly:
+    # true for all 8 genuinely stale days, false for all 10 of these.
+    stale_render = []
+    for d in render_window:
+        rec = rendered.get(d)
+        if not rec or counts.get(d, 0) <= 0:
+            continue
+        if not (int(rec.get("stops") or 0) > 0 and rec.get("photos_count") == 0):
+            continue
+        if "synced_after_render" in rec:
+            after = bool(rec.get("synced_after_render"))   # test hook
+        else:
+            s, r = synced.get(d, ""), str(rec.get("rendered_at") or "")
+            # Unknown either way means we cannot show the photos arrived late,
+            # and this flag tells a reader to re-render. Stay quiet.
+            after = bool(s and r and s > r)
+        if after:
+            stale_render.append({"date": d, "photo_rows": int(counts.get(d, 0)),
+                                 "stops": int(rec.get("stops") or 0)})
+
+    candidates = []
+    for d in window:
+        if counts.get(d, 0) > 0:
+            # It landed. Drop any history so a future failure on the same date
+            # starts from a clean slate rather than an exhausted try count.
+            dates.pop(d, None)
+            continue
+        # Only clean-but-empty attempts retire a date. A date whose sync keeps
+        # erroring stays a candidate forever — that is the case this sweep
+        # exists for, and `--max` already caps what it costs per night.
+        if int((dates.get(d) or {}).get("tries", 0)) >= max_tries:
+            continue
+        candidates.append(d)
+
+    picked = candidates[:max_days]
+    resynced = []
+
+    # Recorded so the condition survives a night nobody reads the log. Rewritten
+    # wholesale, but ONLY when the check actually ran: `rendered` is {} both when
+    # the day-record read failed and when we are offline, and clearing on that
+    # would delete every finding on one flaky night — the exact case the line
+    # above claims to protect against.
+    if rendered:
+        if stale_render:
+            ledger["stale_render"] = stale_render
+        else:
+            ledger.pop("stale_render", None)
+
+    if dry_run:
+        _save_ledger(ledger_path, ledger)
+        summary = {"ok": True, "dry_run": True, "window": [window[0], window[-1]],
+                   "candidates": candidates, "would_resync": picked, "resynced": [],
+                   "stale_render": stale_render}
+        print(json.dumps(summary, indent=None if as_json else 2))
+        return 0
+
+    for d in picked:
+        ok, count, detail = _resync(photos_bin, d)
+        entry = dates.setdefault(d, {"tries": 0})
+        entry["last_attempt"] = datetime.now(timezone.utc).isoformat()
+        if ok and count > 0:
+            entry["result"] = "recovered"
+            dates.pop(d, None)
+        elif ok:
+            # A clean scan that found nothing — this is what `--tries` bounds.
+            entry["tries"] = int(entry.get("tries", 0)) + 1
+            entry["result"] = "empty"
+            entry.pop("detail", None)
+        else:
+            # An error tells us nothing about whether the day has photos, so it
+            # must not spend the give-up budget.
+            entry["fail_tries"] = int(entry.get("fail_tries", 0)) + 1
+            entry["result"] = "failed"
+            entry["detail"] = detail
+        resynced.append({"date": d, "ok": ok, "count": count, "detail": detail})
+        _save_ledger(ledger_path, ledger)  # persist per date, not at the end
+
+    _save_ledger(ledger_path, ledger)
+    summary = {"ok": True, "window": [window[0], window[-1]],
+               "candidates": candidates, "resynced": resynced,
+               "stale_render": stale_render,
+               "recovered": sum(1 for r in resynced if r["count"] > 0)}
+    print(json.dumps(summary, indent=None if as_json else 2))
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except KeyboardInterrupt:
+        sys.exit(130)

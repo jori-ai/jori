@@ -1,0 +1,94 @@
+#!/usr/bin/env node
+/**
+ * lint-unguarded-calendar-write — fail a commit that writes to the user's
+ * calendar without going through `jori-calendar`.
+ *
+ * THE RULE (agent/CLAUDE.md § Calendar Invitations, top-tier): every
+ * event Jori creates or updates has zero attendees other than the user unless
+ * the user explicitly asked. The harm is irreversible in a way almost nothing else
+ * here is — an unwanted invite reaches a real person's calendar and inbox, and
+ * cannot be recalled.
+ *
+ * WHY A HOOK. The rule failed for weeks despite being written down: events
+ * auto-invited a household member by default until the user reversed it by
+ * hand. The guard now lives in `bin/jori-calendar`; this lint is
+ * what stops new code from being written around it, which is the failure mode
+ * the geo-gate suffered twice in one week.
+ *
+ * WHAT IS FLAGGED: staged code or playbooks that call `gog calendar
+ * create|update|delete`, or reference the MCP calendar WRITE tools, anywhere
+ * other than the wrapper itself.
+ *
+ * NOT flagged: read operations (`gog calendar list|show`, the MCP list/get/
+ * search/respond tools). Reading the calendar is unrestricted and always was.
+ *
+ * DECLARING AN EXCEPTION: `calendar-write-ok: <reason>` in a nearby comment.
+ * There is one real case — the wrapper's own implementation — and it is already
+ * excluded by path. Reach for the marker only if a second genuinely appears.
+ */
+
+import { execFileSync } from "node:child_process";
+import fs from "node:fs";
+
+function staged() {
+  try {
+    const out = execFileSync("git", ["diff", "--cached", "--name-only", "--diff-filter=ACM"], { encoding: "utf8" });
+    return out.split("\n").map((s) => s.trim()).filter(Boolean);
+  } catch { return []; }
+}
+
+// lang-regex-ok: matching our own CLI/tool invocation syntax, never user language.
+const GOG_WRITE = /\bgog["'`\s]+calendar\s+(create|update|delete|add|new|rm|remove)\b/;
+// lang-regex-ok: MCP tool identifiers — machine names, not prose.
+const MCP_WRITE = /mcp__claude_ai_Google_Calendar__(create_event|update_event|delete_event)\b/;
+// lang-regex-ok: our own declared-exception marker.
+const EXEMPTION = /calendar-write-ok:/;
+
+const offenders = [];
+for (const file of staged()) {
+  if (!/\.(md|sh|mjs|js|py|json)$/.test(file)) continue;
+  // The wrapper itself, this lint, the tests, and the docs that describe the
+  // rule all legitimately name the forbidden calls.
+  if (/bin\/(jori-calendar|lint-unguarded-calendar-write|calendar-attendee-audit)$/.test(file)) continue;
+  if (/tests\//.test(file)) continue;
+  // changelog.md holds the history that used to sit in architecture.md.
+  if (/CLAUDE\.md$|architecture\.md$|changelog\.md$|-plan\.md$/.test(file)) continue;
+  // agents.json lists the READ tools it grants; it must be free to name them.
+  if (/agent\/config\/agents\.json$/.test(file)) continue;
+
+  let src;
+  try { src = fs.readFileSync(file, "utf8"); } catch { continue; }
+  if (EXEMPTION.test(src)) continue;
+
+  const hits = [];
+  if (GOG_WRITE.test(src)) hits.push("gog calendar create|update|delete");
+  if (MCP_WRITE.test(src)) hits.push("mcp__claude_ai_Google_Calendar__{create,update,delete}_event");
+  if (hits.length) offenders.push({ file, hits });
+}
+
+if (!offenders.length) process.exit(0);
+
+console.error("");
+console.error("pre-commit: refusing this commit — a calendar write outside jori-calendar.");
+console.error("");
+for (const { file, hits } of offenders) console.error(`  ${file}  →  ${hits.join(", ")}`);
+console.error("");
+console.error("Calendar writes go through bin/jori-calendar, which enforces");
+console.error("the attendee rule: zero attendees other than the user unless the user explicitly asked,");
+console.error("with the user's actual words passed as --attendee-authorized \"<quote>\".");
+console.error("");
+console.error("That rule is top-tier and its harm is irreversible — an unwanted invite reaches a");
+console.error("real person and cannot be recalled. It once failed for weeks (a household member");
+console.error("was auto-invited to events by default) while written down the whole time, which is");
+console.error("why it is now a binary rather than a paragraph.");
+console.error("");
+console.error("Fix:");
+console.error("  jori-calendar create --calendar primary --summary \"…\" --from <RFC3339> --to <RFC3339>");
+console.error("  jori-calendar update <eventId> --calendar primary --from … --to …");
+console.error("");
+console.error("Reads are unrestricted — `gog calendar list|show` and the MCP list/get/search tools");
+console.error("are untouched. Only writes are routed.");
+console.error("");
+console.error("See agent/CLAUDE.md § Calendar Invitations.");
+console.error("");
+process.exit(1);

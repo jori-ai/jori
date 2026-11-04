@@ -1,0 +1,93 @@
+#!/usr/bin/env node
+// jev-email-reconcile — late shadow comparison for email triage (cron */15).
+//
+// When Jev's verdict on an email was NOT acted on at intake (Jev said P1/P2 or
+// needs-the-user, or was below threshold) the email went to the ops-agent dispatch
+// — the current mechanism — which records its own triage decision in
+// email-memory.db ("triaged <messageId> ...", tags carry label + p1/p2/p3).
+// This compares the two and hands the result to jev-shadow's
+// recordLateComparison (daily log, disagreements.jsonl).
+//
+// Reads data/jev-shadow/email-triage-pending.jsonl rows with
+// compare:"reconcile"; each messageId is compared once (state file
+// email-reconcile-state.json). Rows older than 48h with no ops verdict are
+// retired as "no-verdict" (ops may have been paused, or the mail was handled by
+// a fast-path downstream). See lib/jev-email-triage.mjs, docs/jev.md.
+//
+// Usage: jev-email-reconcile [--dry-run] [--json]
+
+import fs from "node:fs";
+import path from "node:path";
+import { createRequire } from "node:module";
+import { execFileSync } from "node:child_process";
+import { recordLateComparison } from "../lib/jev-shadow.mjs";
+import { PENDING_FILE, LABELS, SITE } from "../lib/jev-email-triage.mjs";
+
+const ROOT = createRequire(import.meta.url)("../lib/root.cjs").installTools();
+const DB = process.env.EMAIL_MEMORY_DB || path.join(ROOT, "data/email-memory.db");
+const STATE = path.join(path.dirname(PENDING_FILE), "email-reconcile-state.json");
+const SQLITE = "/usr/bin/sqlite3";
+const MAX_AGE_MS = 48 * 3600e3;
+const dry = process.argv.includes("--dry-run");
+
+export function opsVerdict(messageId, db = DB) {
+  if (!/^[0-9a-zA-Z_-]{6,64}$/.test(messageId)) return null;
+  const q = `SELECT text, tags, created_at FROM memories WHERE (text LIKE 'triaged ${messageId}%' OR text LIKE 'reclassify ${messageId}%') ORDER BY created_at DESC LIMIT 1`;
+  let rows = [];
+  try { rows = JSON.parse(execFileSync(SQLITE, ["-json", db, q], { encoding: "utf8", timeout: 10000 }) || "[]"); } catch { return null; }
+  if (!rows.length) return null;
+  const tags = String(rows[0].tags || "").toLowerCase().split(/[\s,]+/);
+  const label = tags.find((t) => LABELS.includes(t));
+  const p = tags.find((t) => /^p[123]$/.test(t));
+  if (!label || !p) return null;
+  return { label, priority: p.toUpperCase(), via: "ops-dispatch", at: rows[0].created_at };
+}
+
+let state = { done: {} };
+try { state = JSON.parse(fs.readFileSync(STATE, "utf8")); } catch {}
+state.done ||= {};
+
+let pending = [];
+try { pending = fs.readFileSync(PENDING_FILE, "utf8").split("\n").filter(Boolean).map((l) => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean); } catch {}
+
+const out = { compared: 0, agree: 0, disagree: 0, waiting: 0, retired: 0 };
+for (const p of pending) {
+  if (p.compare !== "reconcile" || !p.messageId || state.done[p.messageId]) continue;
+  const v = opsVerdict(p.messageId);
+  if (!v) {
+    if (Date.now() - Date.parse(p.ts) > MAX_AGE_MS) { state.done[p.messageId] = "no-verdict"; out.retired++; }
+    else out.waiting++;
+    continue;
+  }
+  const agree = p.jev?.label === v.label && p.jev?.priority === v.priority;
+  out.compared++; agree ? out.agree++ : out.disagree++;
+  if (!dry) {
+    recordLateComparison({
+      site: SITE, id: p.messageId,
+      jevRow: { used: p.jev_used === false ? "legacy" : "legacy-dispatch", reason: p.jev_used === false ? "jev-low-confidence" : "jev-escalated-to-ops", input: { from: p.from, subject: p.subject }, jev: { value: p.jev, confidence: p.jev?.confidence } },
+      legacyValue: v, agree,
+    });
+    state.done[p.messageId] = new Date().toISOString();
+  }
+}
+// Compact the pending file: drop rows that are finished (compared / retired) or
+// were never reconcile rows and are past MAX_AGE. Only then may their `done`
+// entries be forgotten — forgetting a done id while its row is still pending
+// re-compared and RE-PAGED the same disagreement every week (code review
+// 2026-09-23). Lines appended by jev-email-classify while this ran are kept:
+// the file is re-read just before the swap and any line we never saw survives.
+if (!dry) {
+  const seen = new Set(pending.map((p) => JSON.stringify(p)));
+  const keep = pending.filter((p) => !(p.messageId && state.done[p.messageId]) && !(Date.now() - Date.parse(p.ts) > MAX_AGE_MS));
+  try {
+    const now = fs.readFileSync(PENDING_FILE, "utf8").split("\n").filter(Boolean);
+    const fresh = now.filter((l) => { try { return !seen.has(JSON.stringify(JSON.parse(l))); } catch { return true; } });
+    const tmp = `${PENDING_FILE}.tmp-${process.pid}`;
+    fs.writeFileSync(tmp, [...keep.map((p) => JSON.stringify(p)), ...fresh].map((l) => l + "\n").join(""));
+    fs.renameSync(tmp, PENDING_FILE);
+  } catch {}
+  const live = new Set(keep.map((p) => p.messageId));
+  for (const k of Object.keys(state.done)) if (!live.has(k)) delete state.done[k];
+  try { fs.writeFileSync(STATE, JSON.stringify(state)); } catch {}
+}
+console.log(process.argv.includes("--json") ? JSON.stringify(out) : `jev-email-reconcile: ${JSON.stringify(out)}`);

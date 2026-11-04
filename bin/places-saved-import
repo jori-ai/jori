@@ -1,0 +1,428 @@
+#!/usr/bin/env python3
+"""places-saved-import — import Google Maps saved places from a Google Takeout
+export into the local store that `places nearby` cross-references.
+
+Google provides NO live API for a user's saved lists (Favorites / Want to go /
+Starred / custom). The supported path is a Takeout export:
+  takeout.google.com -> deselect all -> select "Maps" (and "Maps (your places)")
+  -> export -> download the .zip.
+
+This importer accepts the .zip, the unzipped folder, or individual files, and
+handles both shapes Takeout produces:
+  - Per-list CSVs under  .../Maps/Saved/<List Name>.csv   (cols: Title,Note,URL)
+    The list name (filename) becomes the tag: "Favourite places"->favorites,
+    "Want to go"->want_to_go, "Starred places"->starred, others->slug.
+  - GeoJSON  .../Maps (your places)/Saved Places.json  (FeatureCollection with
+    geometry.coordinates [lng,lat]).
+
+CSV rows carry only Title/Note/URL (no coordinates), so we geocode each: first
+by regexing coordinates out of the Maps URL, then — if absent — via a Google
+Places Text Search on the title (reusing the same GOOGLE_PLACES_API_KEY as
+`places`). Unresolvable rows are written with lat/lng=null and reported so the
+count is honest; `places nearby` skips them.
+
+Output: data/google-saved-places.json
+  { "updated_at": ISO, "source": "google-takeout",
+    "places": [ {name, lat, lng, list, note, url, place_id, address} ] }
+
+Usage:
+  places-saved-import <path-to-takeout.zip | folder | file> [--dry-run] [--quiet]
+  places-saved-import --stats        # show the current store summary
+"""
+
+import sys
+import os
+import io
+import csv
+import json
+import re
+import zipfile
+import urllib.request
+import urllib.error
+import time
+
+_SELF = os.path.realpath(globals().get("__file__") or sys.argv[0])
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(_SELF)), "lib"))
+import places_local  # noqa: E402
+ENV_FILE = os.path.join(places_local.install_root(), ".env")
+STORE = places_local.data_path("google-saved-places.json")
+
+from places_guard import assert_places_allowed  # noqa: E402
+try:
+    from places_log import log_call as _places_log, timed as _places_timed
+except Exception:  # never let the logger break a caller
+    def _places_log(*a, **k): pass
+    class _places_timed:
+        ms = None
+        def __enter__(self): return self
+        def __exit__(self, *e): return False
+
+# A partial import would look like places disappeared from the saved set, so
+# stop cleanly rather than resolve half of them.
+assert_places_allowed("places-saved-import")
+
+
+def _load_places_key():
+    k = os.environ.get("GOOGLE_PLACES_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+    if k:
+        return k
+    if os.path.exists(ENV_FILE):
+        with open(ENV_FILE) as fh:
+            for line in fh:
+                line = line.strip()
+                if line.startswith("GOOGLE_PLACES_API_KEY="):
+                    return line.split("=", 1)[1].strip().strip('"').strip("'")
+    return ""
+
+
+API_KEY = _load_places_key()
+
+
+def now_iso():
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+# ── tag normalization ────────────────────────────────────────────────────────
+def list_tag(filename):
+    """Map a Takeout CSV filename to a canonical list tag."""
+    stem = os.path.splitext(os.path.basename(filename))[0].strip().lower()
+    if "favourite" in stem or "favorite" in stem:
+        return "favorites"
+    if "want to go" in stem or "want_to_go" in stem:
+        return "want_to_go"
+    if "starred" in stem:
+        return "starred"
+    if stem in ("labeled places", "labelled places"):
+        return "labeled"
+    # custom list → slug
+    return re.sub(r"[^a-z0-9]+", "_", stem).strip("_") or "custom"
+
+
+# ── coordinate extraction from a Maps URL ────────────────────────────────────
+_COORD_PATTERNS = [
+    re.compile(r"@(-?\d+\.\d+),(-?\d+\.\d+)"),            # /@lat,lng,zoom
+    re.compile(r"!3d(-?\d+\.\d+)!4d(-?\d+\.\d+)"),        # !3dlat!4dlng
+    re.compile(r"[?&]q=(-?\d+\.\d+),(-?\d+\.\d+)"),       # ?q=lat,lng
+    re.compile(r"[?&]ll=(-?\d+\.\d+),(-?\d+\.\d+)"),      # ?ll=lat,lng
+    re.compile(r"[?&]query=(-?\d+\.\d+),(-?\d+\.\d+)"),   # ?query=lat,lng
+    re.compile(r"/search/(-?\d+\.\d+),\+?(-?\d+\.\d+)"),  # /search/lat,+lng
+]
+
+
+def coords_from_url(url):
+    if not url:
+        return None
+    for pat in _COORD_PATTERNS:
+        m = pat.search(url)
+        if m:
+            try:
+                lat, lng = float(m.group(1)), float(m.group(2))
+                if -90 <= lat <= 90 and -180 <= lng <= 180:
+                    return lat, lng
+            except ValueError:
+                pass
+    return None
+
+
+def place_id_from_url(url):
+    if not url:
+        return None
+    m = re.search(r"query_place_id=([A-Za-z0-9_\-]+)", url)
+    return m.group(1) if m else None
+
+
+# ── Places Text Search fallback geocoder ─────────────────────────────────────
+def geocode_by_text(title, note=""):
+    """Resolve a saved title to coords + place_id via Google Places searchText.
+    Returns (lat, lng, place_id, address) or None."""
+    if not API_KEY or not title:
+        return None
+    q = title if not note else f"{title} {note}"[:200]
+    body = {"textQuery": q, "maxResultCount": 1, "languageCode": "en"}
+    try:
+        import places_client  # the one guarded door: prices, gates, logs
+        data = places_client.post("places-saved-import", "places:searchText", body,
+                                  "places.id,places.location,places.formattedAddress,places.displayName",
+                                  "searchText", timeout=15, api_key=API_KEY, query=q)
+        places = data.get("places") or []
+        if not places:
+            return None
+        p = places[0]
+        loc = p.get("location") or {}
+        lat, lng = loc.get("latitude"), loc.get("longitude")
+        if lat is None or lng is None:
+            return None
+        return lat, lng, p.get("id"), p.get("formattedAddress", "")
+    except (urllib.error.HTTPError, urllib.error.URLError, Exception):
+        return None
+
+
+# ── source readers ───────────────────────────────────────────────────────────
+def ftid_from_url(url):
+    """Extract a Google feature-id (0x...:0x...) from a Maps URL — the canonical
+    place key Takeout puts in the saved-list URL (`...!1s0x..:0x..`)."""
+    if not url:
+        return None
+    m = re.search(r"!1s(0x[0-9a-fA-F]+:0x[0-9a-fA-F]+)", url) or re.search(r"\b(0x[0-9a-fA-F]+:0x[0-9a-fA-F]+)\b", url)
+    return m.group(1) if m else None
+
+
+def read_csv_text(text, source_name):
+    """Parse a Takeout saved-list CSV. The list name = the file's own name (e.g.
+    'Want to go', 'Coffee in Lisbon'). Takeout CSVs begin with a display-name
+    line + blank line BEFORE the real `Title,Note,URL,Tags,Comment` header, so
+    skip to that header before parsing."""
+    out = []
+    list_name = os.path.splitext(os.path.basename(source_name))[0].strip()
+    lines = text.splitlines()
+    hdr = next((i for i, l in enumerate(lines) if l.lower().lstrip().startswith("title,")), None)
+    if hdr is None:
+        return out
+    reader = csv.DictReader(io.StringIO("\n".join(lines[hdr:])))
+    for row in reader:
+        low = {k.lower().strip(): (v or "").strip() for k, v in row.items() if k}
+        title = low.get("title") or low.get("name") or ""
+        if not title:
+            continue
+        url = low.get("url") or ""
+        out.append({
+            "name": title,
+            "list": list_name,
+            "note": low.get("note") or low.get("comment") or "",
+            "url": url,
+            "address": low.get("address") or low.get("formatted_address") or "",
+            "ftid": ftid_from_url(url),
+        })
+    return out
+
+
+def read_geojson(obj):
+    """Parse a Takeout 'Saved Places.json' GeoJSON FeatureCollection."""
+    out = []
+    for feat in (obj.get("features") or []):
+        geom = feat.get("geometry") or {}
+        props = feat.get("properties") or {}
+        coords = geom.get("coordinates") or []
+        lat = lng = None
+        if isinstance(coords, list) and len(coords) >= 2:
+            lng, lat = coords[0], coords[1]  # GeoJSON is [lng, lat]
+        loc = props.get("Location") or {}
+        out.append({
+            "name": props.get("Title") or loc.get("Business Name") or loc.get("Address") or "Saved place",
+            "list": "labeled",
+            "note": "",
+            "url": props.get("Google Maps URL") or "",
+            "lat": lat,
+            "lng": lng,
+            "address": loc.get("Address", ""),
+        })
+    return out
+
+
+def collect_entries(path):
+    """Walk a zip / folder / file and return raw entries from all sources found."""
+    entries = []
+    sources = []  # (name, kind, payload)
+
+    def add_file(name, data_bytes):
+        low = name.lower()
+        if low.endswith(".csv") and "/saved/" in low.replace("\\", "/") or (low.endswith(".csv") and "saved" in low):
+            sources.append((name, "csv", data_bytes))
+        elif low.endswith(".csv"):
+            # any CSV under a Maps export — treat as a saved list
+            sources.append((name, "csv", data_bytes))
+        elif low.endswith(".json") and ("saved" in low or "places" in low):
+            sources.append((name, "geojson", data_bytes))
+
+    if os.path.isfile(path) and path.lower().endswith(".zip"):
+        with zipfile.ZipFile(path) as zf:
+            for info in zf.infolist():
+                if info.is_dir():
+                    continue
+                add_file(info.filename, zf.read(info))
+    elif os.path.isdir(path):
+        for root, _dirs, files in os.walk(path):
+            for f in files:
+                fp = os.path.join(root, f)
+                try:
+                    with open(fp, "rb") as fh:
+                        add_file(fp, fh.read())
+                except OSError:
+                    pass
+    elif os.path.isfile(path):
+        with open(path, "rb") as fh:
+            add_file(path, fh.read())
+    else:
+        print(f"ERROR: path not found: {path}", file=sys.stderr)
+        sys.exit(1)
+
+    for name, kind, payload in sources:
+        try:
+            if kind == "csv":
+                entries.extend(read_csv_text(payload.decode("utf-8-sig", errors="replace"), name))
+            elif kind == "geojson":
+                entries.extend(read_geojson(json.loads(payload.decode("utf-8", errors="replace"))))
+        except Exception as e:
+            print(f"  ! skipped {os.path.basename(name)}: {e}", file=sys.stderr)
+    return entries, [os.path.basename(s[0]) for s in sources]
+
+
+# ── store ────────────────────────────────────────────────────────────────────
+def dedup_key(e):
+    # ftid is the canonical per-place key; a place saved to multiple lists
+    # collapses to one entry (first list processed — alphabetical — wins).
+    if e.get("ftid"):
+        return ("ftid", e["ftid"])
+    if e.get("place_id"):
+        return ("pid", e["place_id"])
+    if e.get("lat") is not None and e.get("lng") is not None:
+        return ("geo", round(e["lat"], 5), round(e["lng"], 5))
+    return ("name", e["name"].strip().lower(), e.get("list"))
+
+
+def show_stats():
+    if not os.path.exists(STORE):
+        print("No store yet at", STORE)
+        return
+    with open(STORE) as fh:
+        d = json.load(fh)
+    places = d.get("places", [])
+    by_list = {}
+    geocoded = 0
+    for p in places:
+        by_list[p.get("list", "?")] = by_list.get(p.get("list", "?"), 0) + 1
+        if p.get("lat") is not None:
+            geocoded += 1
+    print(f"Store: {STORE}")
+    print(f"  updated_at: {d.get('updated_at')}")
+    print(f"  total: {len(places)}  ({geocoded} geocoded, {len(places)-geocoded} unresolved)")
+    for k, v in sorted(by_list.items(), key=lambda x: -x[1]):
+        print(f"    {k}: {v}")
+
+
+def main():
+    args = sys.argv[1:]
+    if not args or args[0] in ("-h", "--help"):
+        print(__doc__)
+        sys.exit(0)
+    if args[0] == "--stats":
+        show_stats()
+        sys.exit(0)
+
+    dry_run = "--dry-run" in args
+    quiet = "--quiet" in args
+    paths = [a for a in args if not a.startswith("--")]
+    if not paths:
+        print("ERROR: provide a Takeout .zip / folder / file path", file=sys.stderr)
+        sys.exit(1)
+
+    raw = []
+    all_sources = []
+    for p in paths:
+        e, srcs = collect_entries(os.path.expanduser(p))
+        raw.extend(e)
+        all_sources.extend(srcs)
+
+    if not raw:
+        print("ERROR: no saved-place entries found. Expected Takeout Maps 'Saved/*.csv' "
+              "or 'Saved Places.json'. Sources scanned: " + (", ".join(all_sources) or "none"),
+              file=sys.stderr)
+        sys.exit(1)
+
+    if not quiet:
+        print(f"Found {len(raw)} raw entries across {len(all_sources)} source file(s).")
+
+    # Delta-cheap: reuse coords for any ftid already geocoded in the existing
+    # store, so a monthly full-snapshot re-import only geocodes NEW places.
+    known_by_ftid = {}
+    if os.path.exists(STORE):
+        try:
+            for p in json.load(open(STORE)).get("places", []):
+                if p.get("ftid") and p.get("lat") is not None:
+                    known_by_ftid[p["ftid"]] = p
+        except Exception:
+            pass
+
+    unresolved, api_calls, reused, skipped_nonplace = 0, 0, 0, 0
+    seen = {}
+    for e in raw:
+        # Real Google Maps places carry an ftid in their Takeout URL; saved
+        # articles/links (e.g. a "Saved for later" read-list) do not. Skip those
+        # — they aren't places, and geocoding their titles yields garbage coords.
+        # GeoJSON-sourced entries already have coords, so they pass regardless.
+        if not e.get("ftid") and e.get("lat") is None:
+            skipped_nonplace += 1
+            continue
+        if e.get("lat") is None or e.get("lng") is None:
+            prev = known_by_ftid.get(e.get("ftid"))
+            if prev:
+                e["lat"], e["lng"] = prev["lat"], prev["lng"]
+                e["place_id"] = prev.get("place_id")
+                e["address"] = prev.get("address", "")
+                reused += 1
+        if e.get("lat") is None or e.get("lng") is None:
+            c = coords_from_url(e.get("url"))
+            if c:
+                e["lat"], e["lng"] = c
+            pid = place_id_from_url(e.get("url"))
+            if pid:
+                e["place_id"] = pid
+        if (e.get("lat") is None or e.get("lng") is None) and not dry_run:
+            # address disambiguates far better than note (e.g. chains, generic
+            # names); fall back to note when the CSV carries no address column.
+            hint = e.get("address") or e.get("note", "")
+            g = geocode_by_text(e["name"], hint)
+            api_calls += 1
+            if g:
+                e["lat"], e["lng"], e["place_id"], e["address"] = g
+            time.sleep(0.05)  # be gentle on the API
+        if e.get("lat") is None or e.get("lng") is None:
+            unresolved += 1
+        # dedup (prefer a geocoded copy over an unresolved dup)
+        k = dedup_key(e)
+        if k not in seen or (seen[k].get("lat") is None and e.get("lat") is not None):
+            seen[k] = e
+
+    places = list(seen.values())
+    geocoded = sum(1 for p in places if p.get("lat") is not None)
+
+    # normalize output shape
+    out_places = [{
+        "name": p["name"],
+        "lat": p.get("lat"),
+        "lng": p.get("lng"),
+        "list": p.get("list", "custom"),
+        "note": p.get("note", ""),
+        "url": p.get("url", ""),
+        "place_id": p.get("place_id"),
+        "address": p.get("address", ""),
+        "ftid": p.get("ftid"),
+    } for p in places]
+
+    if not quiet:
+        print(f"Deduped to {len(out_places)} places — {geocoded} geocoded "
+              f"({reused} reused by ftid, {api_calls} new Places API lookups), "
+              f"{len(out_places)-geocoded} unresolved; skipped {skipped_nonplace} non-place (no ftid).")
+
+    if dry_run:
+        print("[dry-run] not writing store. Sample:")
+        for p in out_places[:8]:
+            loc = f"{p['lat']:.4f},{p['lng']:.4f}" if p["lat"] is not None else "UNRESOLVED"
+            print(f"  [{p['list']}] {p['name']} — {loc}")
+        return
+
+    os.makedirs(os.path.dirname(STORE), exist_ok=True)
+    with open(STORE, "w") as fh:
+        json.dump({
+            "updated_at": now_iso(),
+            "source": "google-takeout",
+            "places": out_places,
+        }, fh, indent=2)
+    print(f"Wrote {len(out_places)} saved places to {STORE}")
+    if unresolved:
+        print(f"  Note: {unresolved} could not be geocoded (kept with null coords; "
+              f"`places nearby` skips them). Re-run after a fresh export or add coords manually.")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,210 @@
+#!/usr/bin/env node
+// p1-unstar-sweep — Signal A of the P1 resolution system: the user UNSTARRED a
+// P1. Pure code, no agent turn (2026-10-04; replaces the ops-haiku
+// "UNSTAR SCAN P1" dispatch and its p1-scan-gate / jev-p1-gate pre-gates).
+//
+// Every 30 min (trigger-p1-resolution-scan.sh, after p1-reply-sweep) this reads
+// Gmail history since the last tick, keeps only messages whose STARRED label
+// was REMOVED, drops removals Jori made itself (the self-unstar ledger
+// gmail-action writes), confirms each survivor is still `p1` and still
+// unstarred, and hands the whole list to unstar-scan-run — which downgrades via
+// p1-downgrade (closing the linked Google Task) and reports through
+// p1-alert-gate. Decision core: lib/p1-unstar.js.
+//
+// Why history and not `label:p1 -is:starred`: that query also returns
+// messages that were NEVER starred (a fresh inbound reply that inherited the
+// p1 label), and telling the two apart was the agent judgment this job used
+// to pay a turn for. A STARRED-removed event is structural proof of an unstar.
+//
+// State: data/p1-unstar-sweep.json { historyId, p1LabelId, updatedAt }.
+// First run (no state) seeds historyId from the mailbox profile and acts on
+// nothing. A historyId Gmail no longer has (HTTP 404 — history is kept ~1
+// week) re-seeds the same way and logs it.
+//
+// Exit 0 always — a sweep, never a reason to fail the cron tick. Errors are
+// logged with the real cause chain (describeError); the watermark does not
+// advance, so the next tick re-reads the same history.
+//
+// Usage: p1-unstar-sweep [--dry-run]
+
+"use strict";
+
+const { spawnSync } = require("node:child_process");
+const fs = require("node:fs");
+const path = require("node:path");
+const os = require("node:os");
+
+const LIB = path.join(__dirname, "..", "lib");
+const { getAccessToken, fetchWithRetry, describeError } = require(path.join(LIB, "google-auth.js"));
+const { unstarredIds, decide, recentSelfUnstars } = require(path.join(LIB, "p1-unstar.js"));
+
+const { installTools } = require(path.join(LIB, "root.cjs"));
+const GMAIL_API = "https://gmail.googleapis.com/gmail/v1/users/me";
+const DATA = installTools("data");
+const STATE = process.env.P1_UNSTAR_SWEEP_STATE || path.join(DATA, "p1-unstar-sweep.json");
+const LEDGER = process.env.GMAIL_SELF_UNSTARS || path.join(DATA, "gmail-self-unstars.jsonl");
+const RUNNER = process.env.P1_UNSTAR_SWEEP_RUNNER || installTools("bin/unstar-scan-run");
+const SELF_WINDOW_MS = 2 * 3600 * 1000;   // a self-unstar's history event lands within a tick or two
+const LEDGER_KEEP_MS = 7 * 86400 * 1000;
+const BULK_WARN = 5;
+const MAX_RETRIES = 6;
+
+function ts() { return new Date().toISOString(); }
+function log(msg) { console.error(`${ts()} p1-unstar-sweep: ${msg}`); }
+
+async function gmail(endpoint, token) {
+  const r = await fetchWithRetry(`${GMAIL_API}${endpoint}`, { headers: { Authorization: `Bearer ${token}` } });
+  const data = await r.json();
+  if (data.error) {
+    const e = new Error(`${data.error.message} (http ${r.status})`);
+    e.status = r.status;
+    throw e;
+  }
+  return data;
+}
+
+function loadState() {
+  try { return JSON.parse(fs.readFileSync(STATE, "utf8")); } catch { return {}; }
+}
+function saveState(s) {
+  const tmp = STATE + ".tmp";
+  fs.writeFileSync(tmp, JSON.stringify({ ...s, updatedAt: ts() }, null, 2));
+  fs.renameSync(tmp, STATE);
+}
+
+function readLedger() {
+  try {
+    return fs.readFileSync(LEDGER, "utf8").split("\n").filter(Boolean)
+      .map((l) => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+  } catch { return []; }
+}
+// Drop rows older than a week. A row appended between the read and the rename
+// is lost, which is harmless: p1-downgrade (the main self-unstarrer) removes
+// the p1 label before it unstars, so its messages fail the "still p1" check anyway.
+function pruneLedger(rows, now) {
+  const keep = rows.filter((r) => now - Date.parse(r.at) <= LEDGER_KEEP_MS);
+  if (keep.length === rows.length) return;
+  try {
+    const tmp = LEDGER + ".tmp";
+    fs.writeFileSync(tmp, keep.map((r) => JSON.stringify(r)).join("\n") + (keep.length ? "\n" : ""));
+    fs.renameSync(tmp, LEDGER);
+  } catch (e) { log(`ledger prune failed: ${e.message}`); }
+}
+
+async function resolveP1LabelId(token) {
+  const res = await gmail("/labels", token);
+  const hit = (res.labels || []).find((l) => (l.name || "").toLowerCase() === "p1");
+  if (!hit) throw new Error('no Gmail label named "p1"');
+  return hit.id;
+}
+
+async function readHistory(startHistoryId, token) {
+  const records = [];
+  let page = null;
+  let latest = startHistoryId;
+  do {
+    const res = await gmail(`/history?startHistoryId=${startHistoryId}&historyTypes=labelRemoved&maxResults=500${page ? `&pageToken=${page}` : ""}`, token);
+    for (const h of res.history || []) records.push(h);
+    if (res.historyId) latest = String(res.historyId);
+    page = res.nextPageToken || null;
+  } while (page);
+  return { records, latest };
+}
+
+async function currentLabels(ids, token) {
+  const out = {};
+  for (const id of ids) {
+    try {
+      const m = await gmail(`/messages/${id}?format=minimal`, token);
+      out[id] = m.labelIds || [];
+    } catch (e) {
+      if (e.status === 404) out[id] = null;      // deleted — nothing to downgrade
+      else throw e;
+    }
+  }
+  return out;
+}
+
+async function main() {
+  const dryRun = process.argv.includes("--dry-run");
+  const state = loadState();
+  let token;
+  try { token = await getAccessToken(); }
+  catch (e) { log(`skip tick — token: ${describeError(e)}`); return; }
+
+  try { if (!state.p1LabelId) state.p1LabelId = await resolveP1LabelId(token); }
+  catch (e) { log(`skip tick — labels: ${describeError(e)}`); return; }
+
+  if (!state.historyId) {
+    try {
+      const prof = await gmail("/profile", token);
+      if (!dryRun) saveState({ historyId: String(prof.historyId), p1LabelId: state.p1LabelId, retry: state.retry || {} });
+      log(`seeded historyId ${prof.historyId} — acting from the next tick`);
+    } catch (e) { log(`skip tick — profile: ${describeError(e)}`); }
+    return;
+  }
+
+  let hist;
+  try { hist = await readHistory(state.historyId, token); }
+  catch (e) {
+    if (e.status === 404) {
+      log(`historyId ${state.historyId} expired — re-seeding; unstars since then are not replayed`);
+      if (!dryRun) saveState({ p1LabelId: state.p1LabelId, retry: state.retry || {} });   // next tick seeds
+      return;
+    }
+    log(`skip tick — history: ${describeError(e)}`);
+    return;
+  }
+
+  // Ids whose downgrade failed on an earlier tick are retried here: their
+  // history event has already been consumed by the watermark.
+  const retry = state.retry && typeof state.retry === "object" ? state.retry : {};
+  const ids = [...new Set([...unstarredIds(hist.records), ...Object.keys(retry)])];
+  let current = {};
+  try { current = await currentLabels(ids, token); }
+  catch (e) { log(`skip tick — messages.get: ${describeError(e)}`); return; }
+
+  const now = Date.now();
+  const ledger = readLedger();
+  const { downgrade, skipped } = decide({
+    ids, current, p1LabelId: state.p1LabelId,
+    // A retry id is already a confirmed user-unstar; p1-downgrade's own unstar
+    // call (a no-op on an unstarred message) must not disqualify it.
+    selfUnstarred: new Set([...recentSelfUnstars(ledger, now, SELF_WINDOW_MS)].filter((id) => !(id in retry))),
+  });
+  const skipNote = skipped.length ? ` (skipped: ${skipped.map((s) => `${s.id}=${s.reason}`).join(", ")})` : "";
+
+  if (dryRun) {
+    console.log(JSON.stringify({ unstarred: ids, downgrade, skipped }, null, 2));
+    return;
+  }
+
+  if (downgrade.length > BULK_WARN) log(`bulk cleanup: ${downgrade.length} P1s unstarred in one tick`);
+  // unstar-scan-run owns the downgrade + p1-alert-gate reporting, and always
+  // exits 0. --none still records a healthy cycle so a failure streak clears.
+  const r = spawnSync(RUNNER, downgrade.length ? downgrade : ["--none"], { encoding: "utf8" });
+  if (r.stdout) process.stdout.write(r.stdout);
+  if (r.stderr) process.stderr.write(r.stderr);
+
+  // The watermark always advances; a downgrade that did not land (the message
+  // still carries p1) goes on the retry list instead, up to MAX_RETRIES ticks.
+  // The failure itself is already in p1-resolutions.jsonl and p1-alert-gate.
+  const nextRetry = {};
+  if (downgrade.length) {
+    let after = {};
+    try { after = await currentLabels(downgrade, token); } catch (e) { log(`post-check failed: ${describeError(e)}`); }
+    for (const id of downgrade) {
+      const labels = after[id];
+      if (!Array.isArray(labels) || !labels.includes(state.p1LabelId)) continue;   // landed (or gone)
+      const n = (retry[id] || 0) + 1;
+      if (n > MAX_RETRIES) log(`giving up on ${id} after ${MAX_RETRIES} failed downgrades`);
+      else nextRetry[id] = n;
+    }
+  }
+  try { saveState({ historyId: hist.latest, p1LabelId: state.p1LabelId, retry: nextRetry }); }
+  catch (e) { log(`state write failed: ${e.message}`); }
+  pruneLedger(ledger, now);
+  log(`${hist.records.length} history record(s), ${ids.length} unstar event(s), ${downgrade.length} downgraded${skipNote}`);
+}
+
+main().catch((e) => { log(`unexpected: ${describeError(e)}`); process.exitCode = 0; });

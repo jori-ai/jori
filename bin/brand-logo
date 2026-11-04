@@ -1,0 +1,142 @@
+#!/usr/bin/env node
+// brand-logo — resolve an airline / car-rental company logo for the itinerary's
+// flight and car-pickup rows, building a durable local library so each brand is
+// fetched from the web only ONCE (requirement: use the company's own logo, and
+// keep a local library so a logo is never fetched twice). Source: Wikimedia Commons File-namespace search for
+// "<brand> logo" (keyless, reliable, real logo SVG/PNG — not a plane photo like
+// Wikipedia's article lead image). The winning logo is re-hosted in Supabase
+// storage (same bucket as the photos) and indexed in data/brand-logos.json
+// so it's served from cache next time. Prints {"url":...,"brand":...} on
+// success; exits 1 on no-match / fetch failure so the caller falls back to an
+// icon.
+//
+// Usage: brand-logo "<hint — a flight or car-pickup summary/brand name>"
+
+import fs from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+import { createRequire } from "node:module";
+import { loadEnv } from "../lib/load-env.js";
+loadEnv();
+
+const { instance, localDir, supabaseUrl } = createRequire(import.meta.url)("../lib/instance.cjs");
+const SUPABASE_URL = process.env.SUPABASE_URL || supabaseUrl();
+const SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
+const BUCKET = "daily-photos";
+const PREFIX = "brand-logos";
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const MANIFEST = path.join(__dirname, "..", "data", "brand-logos.json");
+
+// The carriers this installation flies: agent/local/brand-logo/airlines.json
+//   {"airlines": {"<iata code, lower>": "<Commons search name>"},
+//    "airline_names": {"<name keyword, lower>": "<iata code>"}}
+// (extend as new carriers appear). No file = car-rental brands only.
+const CFG = (() => {
+  try { return JSON.parse(fs.readFileSync(path.join(localDir(), "brand-logo", "airlines.json"), "utf8")); }
+  catch { return {}; }
+})();
+// Airline IATA code → Commons search name.
+const AIRLINES = CFG.airlines || {};
+// Airline name keyword → IATA key (for summaries that spell the name out).
+const AIRLINE_NAMES = CFG.airline_names || {};
+// Wikimedia asks API clients to identify themselves with a contact.
+const CONTACT = instance().agent_email || instance().owner_email || "";
+const UA = `jori-trip-planner/1.0${CONTACT ? ` (${CONTACT})` : ""}`;
+// Car-rental name keyword → Commons search name.
+const RENTALS = {
+  alamo: "Alamo Rent a Car", hertz: "Hertz", avis: "Avis", budget: "Budget Rent a Car",
+  sixt: "Sixt", enterprise: "Enterprise Rent-A-Car", europcar: "Europcar",
+  national: "National Car Rental", dollar: "Dollar Rent A Car", thrifty: "Thrifty Car Rental",
+};
+
+// Wikimedia hosts (commons.wikimedia.org + upload.wikimedia.org) intermittently
+// ETIMEDOUT/EHOSTUNREACH from some networks; retry a couple of times with a hard
+// per-attempt timeout so one blip neither drops a logo nor stalls the whole
+// itinerary run waiting on a hung socket.
+async function fetchRetry(url, opts = {}, tries = 3) {
+  let lastErr;
+  for (let i = 0; i < tries; i++) {
+    try {
+      return await fetch(url, { ...opts, signal: AbortSignal.timeout(12000) });
+    } catch (e) {
+      lastErr = e;
+    }
+  }
+  throw lastErr || new Error("fetch failed");
+}
+
+function resolveBrand(hint) {
+  const s = ` ${(hint || "").toLowerCase().replace(/[^a-z0-9 ]/g, " ")} `;
+  for (const [kw, name] of Object.entries(RENTALS)) if (s.includes(` ${kw} `) || s.includes(`${kw} `)) return { key: kw, search: name };
+  for (const [kw, code] of Object.entries(AIRLINE_NAMES)) if (s.includes(kw)) return { key: code, search: AIRLINES[code] };
+  // Airline IATA code as the token before a flight number: "B6 0033" / "AA123".
+  const m = s.match(/\b([a-z]\d|[a-z]{2})\s?\d{2,4}\b/);
+  if (m && AIRLINES[m[1]]) return { key: m[1], search: AIRLINES[m[1]] };
+  return null;
+}
+
+// Prefer a clean current logo: title must look like a logo, de-rank "old",
+// explicit year-ranges, and sub-brands (Express/Eagle/Holdings).
+function scoreTitle(title, brandName) {
+  const t = title.toLowerCase();
+  let s = 0;
+  if (t.includes("logo")) s += 5;
+  if (brandName.toLowerCase().split(" ").every((w) => t.includes(w))) s += 3;
+  if (/\bold\b|\b19\d\d\b|\b20\d\d\b|\d{4}[-–]\d{2,4}/.test(t)) s -= 4;
+  if (/express|eagle|holdings|group|cargo/.test(t)) s -= 3;
+  if (/\.svg$/.test(t)) s += 1; // vector renders crisp
+  return s;
+}
+
+async function findLogoUrl(brandName) {
+  const q = encodeURIComponent(`${brandName} logo`);
+  const api = `https://commons.wikimedia.org/w/api.php?action=query&generator=search&gsrsearch=${q}&gsrnamespace=6&gsrlimit=8&prop=imageinfo&iiprop=url%7Cmime&iiurlwidth=400&format=json`;
+  const res = await fetchRetry(api, { headers: { "User-Agent": UA } });
+  if (!res.ok) return null;
+  const data = await res.json();
+  const pages = Object.values(data?.query?.pages || {});
+  const ranked = pages
+    .map((p) => ({ title: p.title || "", thumb: (p.imageinfo || [])[0]?.thumburl || null }))
+    .filter((p) => p.thumb)
+    .map((p) => ({ ...p, score: scoreTitle(p.title, brandName) }))
+    .sort((a, b) => b.score - a.score);
+  return ranked[0]?.thumb || null;
+}
+
+async function main() {
+  const hint = process.argv[2];
+  if (!hint) { console.error("usage: brand-logo \"<hint>\""); process.exit(2); }
+  const brand = resolveBrand(hint);
+  if (!brand) { console.error(`brand-logo: no known brand in "${hint}"`); process.exit(1); }
+
+  let manifest = {};
+  try { manifest = JSON.parse(fs.readFileSync(MANIFEST, "utf8")); } catch { /* fresh */ }
+  if (manifest[brand.key]) { process.stdout.write(JSON.stringify({ url: manifest[brand.key], brand: brand.search })); return; }
+
+  if (!SUPABASE_URL || !SUPABASE_KEY) { console.error("brand-logo: no Supabase project / SUPABASE_SERVICE_ROLE_KEY configured"); process.exit(1); }
+  let thumb;
+  try { thumb = await findLogoUrl(brand.search); } catch (e) { console.error(`brand-logo: Commons search error — ${e.message}`); process.exit(1); }
+  if (!thumb) { console.error(`brand-logo: no logo file found for "${brand.search}"`); process.exit(1); }
+
+  let buf;
+  try {
+    const imgRes = await fetchRetry(thumb, { headers: { "User-Agent": UA } });
+    if (!imgRes.ok) { console.error(`brand-logo: logo fetch failed: ${imgRes.status}`); process.exit(1); }
+    buf = Buffer.from(await imgRes.arrayBuffer());
+  } catch (e) { console.error(`brand-logo: logo download error — ${e.message}`); process.exit(1); }
+  const contentType = /\.jpe?g$/i.test(thumb) ? "image/jpeg" : "image/png";
+  const objectKey = `${PREFIX}/${brand.key}.${contentType === "image/jpeg" ? "jpg" : "png"}`;
+  const up = await fetch(`${SUPABASE_URL}/storage/v1/object/${BUCKET}/${objectKey}`, {
+    method: "POST",
+    headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}`, "Content-Type": contentType, "x-upsert": "true", "cache-control": "public, max-age=31536000" },
+    body: buf,
+  });
+  if (!up.ok) { console.error(`brand-logo: upload failed: ${up.status} ${await up.text()}`); process.exit(1); }
+
+  const url = `${SUPABASE_URL}/storage/v1/object/public/${BUCKET}/${objectKey}`;
+  manifest[brand.key] = url;
+  try { fs.mkdirSync(path.dirname(MANIFEST), { recursive: true }); fs.writeFileSync(MANIFEST, JSON.stringify(manifest, null, 2) + "\n"); } catch { /* cache best-effort */ }
+  process.stdout.write(JSON.stringify({ url, brand: brand.search }));
+}
+
+main().catch((e) => { console.error(`brand-logo: ${e.message}`); process.exit(1); });

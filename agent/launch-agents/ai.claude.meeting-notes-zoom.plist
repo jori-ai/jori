@@ -1,0 +1,52 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  meeting-notes-zoom — ON-DEMAND launchd user agent (no schedule of its own).
+  Playbook: agent/ops-agent/jobs/meetings.md
+
+  The post-call cron lines bin/meeting-update schedules run
+  `meeting-remind post`, which only does
+  `launchctl kickstart gui/$(id -u)/<the meeting's notes_agent>` (this agent by
+  default). It runs bin/meeting-notes-from-zoom with no meeting named, so every
+  configured meeting with a call waiting for its post-call step is handled. A
+  model reads Zoom's summary or transcript with `claude -p` on the Max
+  subscription, and only the GUI session can unlock the keychain holding that
+  credential (from cron it prints "Not logged in").
+
+  Install:
+    agent/launch-agents/install.sh ai.claude.meeting-notes-zoom
+    (the first kick from lib/launchd-kick.sh also installs it)
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>ai.claude.meeting-notes-zoom</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>__JORI_TOOLS__/bin/cron-run</string>
+        <string>--label</string>
+        <string>meeting-notes-zoom</string>
+        <string>--</string>
+        <string>__JORI_TOOLS__/bin/meeting-notes-from-zoom</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>__HOME__</string>
+        <key>PATH</key>
+        <string>__HOME__/.local/bin:__HOME__/.local/node/bin:/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:__JORI_TOOLS__/bin</string>
+        <key>LANG</key>
+        <string>en_US.UTF-8</string>
+    </dict>
+    <key>WorkingDirectory</key>
+    <string>__JORI_HOME__</string>
+    <key>RunAtLoad</key>
+    <false/>
+    <key>KeepAlive</key>
+    <false/>
+    <key>StandardOutPath</key>
+    <string>__JORI_HOME__/data/logs/meeting-notes-zoom.log</string>
+    <key>StandardErrorPath</key>
+    <string>__JORI_HOME__/data/logs/meeting-notes-zoom.log</string>
+</dict>
+</plist>

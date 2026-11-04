@@ -1,0 +1,119 @@
+#!/usr/bin/env node
+// control-scan — find this installation's own values written straight into code.
+// From cron, call it with an absolute node (cron's PATH has none).
+//
+// The control room's "Not configurable yet" page lists what this finds. The
+// patterns come from the settings themselves (instance.json, lib/ports.cjs,
+// models.env), so the scan follows the installation rather than a fixed list,
+// and a value that has been moved onto a setting stops being found.
+//
+// Usage: control-scan [--json] [--quiet]     writes data/control-hardcoded.json
+//
+// Scanned: code under bin/, lib/, agent/, cf-email-worker/, wiki-worker/
+// (js/mjs/cjs/ts/sh/py/plist and extensionless scripts). Skipped: markdown,
+// JSON (that is configuration), tests, agent/local/ (the installation's own
+// files), node_modules, logs, and the files that ARE the settings
+// (lib/instance.cjs, lib/ports.cjs, lib/models.cjs, agent/config/models.env).
+// Comment-only lines are skipped.
+
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { createRequire } from "node:module";
+
+const require = createRequire(import.meta.url);
+const { TOOLS_DIR, installTools } = require("../lib/root.cjs");
+const inst = require("../lib/instance.cjs");
+const ports = require("../lib/ports.cjs");
+const { parseModelsEnv, MODELS_ENV } = require("../lib/models.cjs");
+
+const args = process.argv.slice(2);
+const DIRS = ["bin", "lib", "agent", "cf-email-worker", "wiki-worker"];
+const SKIP_DIRS = new Set(["node_modules", "logs", ".git", "local", "test", "tests", "data", "build", "DerivedData"]);
+const SKIP_FILES = new Set(["lib/instance.cjs", "lib/ports.cjs", "lib/models.cjs", "agent/config/models.env", "bin/control-scan"].map((p) => path.join(TOOLS_DIR, p)));
+const CODE_EXT = new Set([".js", ".mjs", ".cjs", ".ts", ".sh", ".py", ".plist", ".toml", ".html", ".env"]);
+
+function files() {
+  const out = [];
+  const walk = (dir) => {
+    let ents = [];
+    try { ents = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
+    for (const e of ents) {
+      const p = path.join(dir, e.name);
+      if (e.isDirectory()) { if (!SKIP_DIRS.has(e.name) && !e.name.startsWith(".")) walk(p); continue; }
+      if (!e.isFile() || SKIP_FILES.has(p)) continue;
+      const ext = path.extname(e.name);
+      if (CODE_EXT.has(ext) || (!ext && path.basename(dir) === "bin")) out.push(p);
+    }
+  };
+  for (const d of DIRS) walk(path.join(TOOLS_DIR, d));
+  return out;
+}
+
+const escRe = (s) => String(s).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+const word = (s) => new RegExp(`(?<![A-Za-z0-9_])${escRe(s)}(?![A-Za-z0-9_])`);
+
+function rules() {
+  const I = inst.instance();
+  const out = [];
+  const add = (key, label, setting, re, { inString = false } = {}) => out.push({ key, label, setting, re, inString });
+  const quoted = (s) => new RegExp(`["'\`][^"'\`\\n]*(?<![A-Za-z0-9_])${escRe(s)}(?![A-Za-z0-9_])[^"'\`\\n]*["'\`]`);
+  if (I.assistant_name) add("assistant_name", `The name "${I.assistant_name}" in text`, "Identity: Name", quoted(I.assistant_name), { inString: true });
+  if (I.owner_name && I.owner_name !== "the user") add("owner_name", `"${I.owner_name}"`, "Identity: Owner", word(I.owner_name));
+  if (I.partner_name) add("partner_name", `"${I.partner_name}"`, "Identity: Partner", word(I.partner_name));
+  if (I.owner_email) add("owner_email", I.owner_email, "Identity: Owner's email", new RegExp(escRe(I.owner_email), "i"));
+  if (I.agent_email) add("agent_email", I.agent_email, "Identity: Sends mail as", new RegExp(escRe(I.agent_email), "i"));
+  if (I.tz) add("tz", I.tz, "Identity: Home time zone", new RegExp(escRe(I.tz)));
+  if (I.home_city) add("home_city", I.home_city, "Identity: Home city", word(I.home_city));
+  if (I.domain) add("sites", `Sites on ${I.domain}`, "Feature settings: sites", new RegExp(`[a-z0-9-]+\\.${escRe(I.domain)}`, "i"));
+  if (I.host) add("host", I.host, "Identity: Host name", new RegExp(escRe(I.host), "i"));
+  add("install_path", `${os.homedir()}/…`, "The machine: install folder ($HOME)", new RegExp(escRe(os.homedir()) + "/"));
+  for (const [name, row] of Object.entries(ports.table())) {
+    add(`port:${row.port}`, `Port ${row.port} (${row.label})`, `The machine: ${name}`, new RegExp(`(?:127\\.0\\.0\\.1|localhost|0\\.0\\.0\\.0)?:${row.port}(?![0-9])|(?<![0-9.])${row.port}(?![0-9])(?=\\s*[,)};]|\\s*\\|\\|)|PORT[A-Z_]*\\s*[=:]\\s*["']?${row.port}(?![0-9])`));
+  }
+  try {
+    const env = parseModelsEnv(fs.readFileSync(MODELS_ENV, "utf8"));
+    for (const [k, v] of Object.entries(env)) if (k.startsWith("JORI_MODEL_") && v) add(`model:${v}`, `Model id ${v}`, `Agents: model pins (${k})`, new RegExp(escRe(v)));
+  } catch {}
+  return out;
+}
+
+function isComment(line) {
+  const t = line.trim();
+  return t.startsWith("//") || t.startsWith("#") || t.startsWith("*") || t.startsWith("/*") || t.startsWith("<!--");
+}
+
+function scan() {
+  const R = rules();
+  const hits = new Map(R.map((r) => [r.key, { ...r, re: undefined, count: 0, files: [] }]));
+  for (const f of files()) {
+    let text;
+    try { text = fs.readFileSync(f, "utf8"); } catch { continue; }
+    if (text.length > 2_000_000 || text.includes("\u0000")) continue;
+    const rel = path.relative(TOOLS_DIR, f);
+    const lines = text.split("\n");
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+      if (!line || isComment(line) || line.includes("control-scan-ok")) continue;
+      for (const r of R) {
+        if (r.re.test(line)) {
+          const h = hits.get(r.key);
+          h.count++;
+          if (h.files.length < 60) h.files.push(`${rel}:${i + 1}`);
+        }
+      }
+    }
+  }
+  return [...hits.values()].map(({ inString, ...h }) => h).sort((a, b) => b.count - a.count);
+}
+
+const findings = scan();
+const out = { scannedAt: new Date().toISOString(), findings };
+const file = installTools("data", "control-hardcoded.json");
+fs.mkdirSync(path.dirname(file), { recursive: true });
+fs.writeFileSync(file, JSON.stringify(out, null, 2) + "\n");
+if (args.includes("--json")) console.log(JSON.stringify(out, null, 2));
+else if (!args.includes("--quiet")) {
+  for (const f of findings.filter((x) => x.count)) console.log(`${String(f.count).padStart(5)}  ${f.label}  → ${f.setting}`);
+  console.log(`wrote ${path.relative(TOOLS_DIR, file)}`);
+}

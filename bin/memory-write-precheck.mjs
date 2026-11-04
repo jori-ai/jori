@@ -29,6 +29,7 @@
 //   # → {"decision":"conflict","conflicts":[...],"resolution":"...","reason":"..."}
 
 import { spawnSync } from "node:child_process";
+import { MODELS } from "../lib/models.cjs";
 import { readFileSync, appendFileSync, mkdirSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
@@ -185,7 +186,7 @@ const JEV_SITE = "memory-write-precheck";
 // the Jev request was even sent.
 // Tool-less, Max-only, off the jori tree's settings — lib/jev-claude.mjs.
 async function sonnetCheck() {
-  const sonnetOut = await runToolless({ bin: CLAUDE_BIN, model: "claude-sonnet-5-5", prompt, timeoutMs: 60000 });
+  const sonnetOut = await runToolless({ bin: CLAUDE_BIN, model: MODELS.sonnet, prompt, timeoutMs: 60000 });
   if (!sonnetOut) throw new Error("precheck_sonnet_unavailable");
   const parsed = parseModelJson(sonnetOut);
   if (!parsed) throw new Error("precheck_sonnet_no_json");

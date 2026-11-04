@@ -1,0 +1,169 @@
+#!/usr/bin/env node
+// hum-interventions-reconcile — backfills hum-interventions.jsonl rows staged
+// by hum-action-executor's approval-gated path (2026-08-23) once their
+// self_improve_approvals Face-ID card has actually landed. Closes
+// hum-i-20260823-04: a row filed with commit:null + approval_id:<uuid> has no
+// commit sha of its own, and hum-metrics-collect --measure's own guard
+// (`commit in (None, "pending")` -> skip) leaves it stuck forever — the
+// 7-day before/after attribution measurement never runs for anything
+// approved through this path. See lib/hum-interventions-reconcile.mjs
+// for the full incident writeup and data/hum-improvement-loop.md
+// § Attribution for the mechanism this restores.
+//
+// Reads self_improve_approvals (service-role key, same as
+// self-improve-approval-poll) and the local git history — self_improve_
+// approvals has no commit-sha column at all, so the sha is recovered by
+// reconstructing applyItem()'s own deterministic commit-message template and
+// looking it up in `git log`. Writes only data/hum-interventions.jsonl,
+// and only the rows it can actually resolve; anything unresolved is left
+// alone for the next run.
+//
+// Usage: hum-interventions-reconcile [--dry-run]
+// Wired into jobs/hum-metrics-collect.md Step 1, ahead of the --measure run,
+// per hum-i-20260823-04 option (b) — a small reconciliation pass, not a
+// change to the generic self-improve approval machinery on behalf of one
+// caller.
+
+import path from "node:path";
+import fs from "node:fs";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+const exec = promisify(execFile);
+
+import { createRequire } from "node:module";
+const require = createRequire(import.meta.url);
+const ROOT = require("../lib/root.cjs").installRoot();
+const { expectedCommitMessage, approvalFiles, pickCommit, reconcileRows } = await import(
+  path.join(ROOT, "lib/hum-interventions-reconcile.mjs")
+);
+
+for (const l of (() => { try { return fs.readFileSync(path.join(ROOT, ".env"), "utf8").split("\n"); } catch { return []; } })()) {
+  const m = l.match(/^([A-Z_]+)=(.*)$/); if (m && !process.env[m[1]]) process.env[m[1]] = m[2];
+}
+const BASE = process.env.SUPABASE_URL || require("../lib/instance.cjs").supabaseUrl();
+const K = process.env.SUPABASE_SERVICE_ROLE_KEY;
+const H = { apikey: K, Authorization: "Bearer " + K, "Content-Type": "application/json" };
+const INTERVENTIONS = path.join(ROOT, "data/hum-interventions.jsonl");
+const DRY_RUN = process.argv.includes("--dry-run");
+
+function readRows() {
+  try {
+    return fs
+      .readFileSync(INTERVENTIONS, "utf8")
+      .split("\n")
+      .filter((l) => l.trim())
+      .map((l) => JSON.parse(l));
+  } catch (e) {
+    if (e.code === "ENOENT") return [];
+    throw e;
+  }
+}
+
+async function getApproval(id) {
+  const r = await fetch(`${BASE}/rest/v1/self_improve_approvals?id=eq.${encodeURIComponent(id)}&select=*&limit=1`, { headers: H });
+  if (!r.ok) return null;
+  const d = await r.json();
+  return d[0] || null;
+}
+
+// Every commit on the current branch whose message matches EXACTLY (`-F` =
+// fixed-string, not a regex — this is a machine-generated template compared
+// byte-for-byte, not language interpretation; Rule 0b). jori-commit always
+// commits directly to whatever's checked out, which on this mini is always
+// main, so plain `git log` (no --all) is the right scope.
+async function findCandidates(message) {
+  let stdout;
+  try {
+    ({ stdout } = await exec("git", ["log", "--format=%H%x1f%aI", "-F", "--grep=" + message], {
+      cwd: ROOT,
+      maxBuffer: 8 * 1024 * 1024,
+    }));
+  } catch {
+    return [];
+  }
+  return stdout
+    .split("\n")
+    .filter(Boolean)
+    .map((line) => {
+      const [sha, iso] = line.split("\x1f");
+      return { sha, iso };
+    });
+}
+
+async function filesForCommit(sha) {
+  try {
+    const { stdout } = await exec("git", ["show", "--name-only", "--format=", sha], { cwd: ROOT });
+    return stdout.split("\n").filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
+// Resolve one approval id to { commitSha, appliedAt }, or null if it isn't
+// applied yet, or the commit can't be found (not yet synced to this clone,
+// a supersede, whatever — next run tries again).
+async function resolveApprovalId(approvalId) {
+  const approval = await getApproval(approvalId);
+  if (!approval || approval.status !== "applied" || !approval.applied_at) return null;
+
+  const message = expectedCommitMessage(approval);
+  let candidates = await findCandidates(message);
+  if (candidates.length > 1 && approvalFiles(approval).length) {
+    candidates = await Promise.all(candidates.map(async (c) => ({ ...c, files: await filesForCommit(c.sha) })));
+  }
+  const commitSha = pickCommit(candidates, approval);
+  if (!commitSha) return null;
+  return { commitSha, appliedAt: approval.applied_at };
+}
+
+async function main() {
+  if (!K) {
+    console.error("[hum-interventions-reconcile] no service key");
+    return;
+  }
+  const rows = readRows();
+  const pending = rows.filter((r) => r && r.commit == null && typeof r.approval_id === "string" && r.approval_id);
+  if (!pending.length) return; // cheap exit — nothing staged via this path is waiting on a backfill
+
+  const resolved = new Map();
+  for (const row of pending) {
+    if (resolved.has(row.approval_id)) continue;
+    try {
+      const res = await resolveApprovalId(row.approval_id);
+      if (res) resolved.set(row.approval_id, res);
+    } catch (e) {
+      console.error(`[hum-interventions-reconcile] ${row.id} (${row.approval_id}) lookup failed: ${e?.message || e}`);
+    }
+  }
+  if (!resolved.size) return;
+
+  const { rows: patched, changed, updates } = reconcileRows(rows, resolved);
+  if (!changed) return;
+  for (const u of updates) {
+    console.error(`[hum-interventions-reconcile] backfilled ${u.id}: commit ${u.commit.slice(0, 7)} (approval ${u.approval_id.slice(0, 8)})`);
+  }
+  if (DRY_RUN) {
+    console.error(`[hum-interventions-reconcile] --dry-run: ${updates.length} row(s) would be updated, nothing written`);
+    return;
+  }
+
+  // Atomic write, same pattern as lib/system-issue-writeback.mjs — this
+  // file is the intervention attribution history and is also read by
+  // hum-metrics-collect --measure; a torn write must never be visible.
+  const dir = path.dirname(INTERVENTIONS);
+  const tmp = path.join(dir, `.${path.basename(INTERVENTIONS)}.reconcile.${process.pid}.tmp`);
+  const body = patched.map((r) => JSON.stringify(r)).join("\n") + "\n";
+  try {
+    fs.writeFileSync(tmp, body);
+    fs.renameSync(tmp, INTERVENTIONS);
+  } catch (e) {
+    try {
+      fs.rmSync(tmp, { force: true });
+    } catch {
+      /* best effort */
+    }
+    console.error(`[hum-interventions-reconcile] write failed: ${e?.message || e}`);
+  }
+}
+
+await main();

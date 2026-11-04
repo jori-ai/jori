@@ -31,6 +31,7 @@ jobs:
           MAC_CERTIFICATE_PASSWORD: ${{ secrets.MAC_CERTIFICATE_PASSWORD }}
           MAC_PROVISIONING_PROFILE: ${{ secrets.MAC_PROVISIONING_PROFILE }}
           MAC_NOTIFSERVICE_PROFILE: ${{ secrets.MAC_NOTIFSERVICE_PROFILE }}
+          MAC_SHARE_PROFILE: ${{ secrets.MAC_SHARE_PROFILE }}
         run: |
           KEYCHAIN_PATH="$RUNNER_TEMP/app-signing.keychain-db"
           KEYCHAIN_PASSWORD="$(openssl rand -hex 16)"
@@ -85,6 +86,13 @@ jobs:
           cp "$EXT_PATH" ~/Library/MobileDevice/Provisioning\ Profiles/"$EXT_UUID".provisionprofile
           rm "$EXT_PATH"
 
+          # Install share extension profile
+          SHARE_PATH="$RUNNER_TEMP/share-profile.provisionprofile"
+          echo "$MAC_SHARE_PROFILE" | base64 --decode > "$SHARE_PATH"
+          read -r SHARE_UUID SHARE_NAME <<< "$(sa_install_profile "$SHARE_PATH" provisionprofile)"
+          rm "$SHARE_PATH"
+          echo "share_profile_name=$SHARE_NAME" >> "$GITHUB_ENV"
+
           echo "keychain_path=$KEYCHAIN_PATH" >> "$GITHUB_ENV"
           echo "mac_profile_uuid=$PROFILE_UUID" >> "$GITHUB_ENV"
           echo "mac_profile_name=$PROFILE_NAME" >> "$GITHUB_ENV"
@@ -107,26 +115,17 @@ jobs:
             -project Jori.xcodeproj \
             -scheme Jori
 
-      - name: Configure macOS signing
+      # See ios-testflight.yml: this build's identity is Config/Installation.xcconfig.
+      - name: Installation build configuration
+        env:
+          JORI_INSTALLATION_XCCONFIG: ${{ secrets.JORI_INSTALLATION_XCCONFIG }}
         run: |
-          python3 - "$mac_profile_name" "$ext_profile_name" <<'PYEOF'
-          import sys
-          app_profile = sys.argv[1]
-          ext_profile = sys.argv[2]
-          with open('Jori.xcodeproj/project.pbxproj', 'r') as f:
-              content = f.read()
-          content = content.replace('CODE_SIGN_STYLE = Automatic;',
-              'CODE_SIGN_STYLE = Manual; "CODE_SIGN_IDENTITY[sdk=macosx*]" = "Apple Distribution";')
-          content = content.replace('PROVISIONING_PROFILE_SPECIFIER = "";', '')
-          content = content.replace(
-              'PRODUCT_BUNDLE_IDENTIFIER = com.example.Jori.NotificationService;',
-              f'PRODUCT_BUNDLE_IDENTIFIER = com.example.Jori.NotificationService; PROVISIONING_PROFILE_SPECIFIER = "{ext_profile}";')
-          content = content.replace(
-              'PRODUCT_BUNDLE_IDENTIFIER = com.example.Jori;',
-              f'PRODUCT_BUNDLE_IDENTIFIER = com.example.Jori; PROVISIONING_PROFILE_SPECIFIER = "{app_profile}";')
-          with open('Jori.xcodeproj/project.pbxproj', 'w') as f:
-              f.write(content)
-          PYEOF
+          if [ -n "$JORI_INSTALLATION_XCCONFIG" ]; then
+            printf '%s\n' "$JORI_INSTALLATION_XCCONFIG" > Config/Installation.xcconfig
+          fi
+          get() { sed -n "s/^$1 *= *//p" Config/Jori.xcconfig Config/Installation.xcconfig 2>/dev/null | tail -1; }
+          echo "JORI_TEAM_ID=$(get JORI_TEAM_ID)" >> "$GITHUB_ENV"
+          echo "JORI_BUNDLE_ID=$(get JORI_BUNDLE_ID)" >> "$GITHUB_ENV"
 
       - name: Archive macOS (native)
         run: |
@@ -136,7 +135,12 @@ jobs:
             -configuration Release \
             -archivePath $RUNNER_TEMP/Jori-macOS.xcarchive \
             -destination 'generic/platform=macOS' \
-            DEVELOPMENT_TEAM=TEAMID_PLACEHOLDER
+            DEVELOPMENT_TEAM="$JORI_TEAM_ID" \
+            JORI_CODE_SIGN_STYLE=Manual \
+            JORI_CODE_SIGN_IDENTITY="Apple Distribution" \
+            JORI_PROFILE_APP="$mac_profile_name" \
+            JORI_PROFILE_NOTIFICATION_SERVICE="$ext_profile_name" \
+            JORI_PROFILE_SHARE="$share_profile_name"
 
       - name: Export macOS pkg
         run: |
@@ -148,7 +152,7 @@ jobs:
               <key>method</key>
               <string>app-store-connect</string>
               <key>teamID</key>
-              <string>TEAMID_PLACEHOLDER</string>
+              <string>${JORI_TEAM_ID}</string>
               <key>signingStyle</key>
               <string>manual</string>
               <key>uploadSymbols</key>
@@ -159,10 +163,12 @@ jobs:
               <string>3rd Party Mac Developer Installer</string>
               <key>provisioningProfiles</key>
               <dict>
-                  <key>com.example.Jori</key>
+                  <key>${JORI_BUNDLE_ID}</key>
                   <string>${mac_profile_name}</string>
-                  <key>com.example.Jori.NotificationService</key>
+                  <key>${JORI_BUNDLE_ID}.NotificationService</key>
                   <string>${ext_profile_name}</string>
+                  <key>${JORI_BUNDLE_ID}.Share</key>
+                  <string>${share_profile_name}</string>
               </dict>
           </dict>
           </plist>

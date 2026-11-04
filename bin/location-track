@@ -1,0 +1,144 @@
+#!/usr/bin/env python3
+"""location-track — raw GPS breadcrumbs for a time range.
+
+Returns the sequence of location samples (not clustered into stops).
+Useful for "show me my path this afternoon" or debugging sparse data.
+
+Usage:
+  location-track today
+  location-track yesterday
+  location-track --last 2h
+  location-track --start 2026-04-15T14:00 --end 2026-04-15T18:00
+  location-track today --min-accuracy 100   # drop samples with acc > 100m
+"""
+
+import sys
+import os
+import json
+import math
+import re
+import urllib.request
+import urllib.parse
+from zoneinfo import ZoneInfo
+from datetime import datetime, timedelta, timezone
+from typing import List, Dict, Any, Optional
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "lib"))
+import supabase_local  # noqa: E402
+
+# Dates and zone-less times are the home zone's (instance tz).
+HOME_TZ = ZoneInfo(supabase_local.home_tz())
+
+
+def haversine_km(lat1, lon1, lat2, lon2):
+    R = 6371
+    dlat = math.radians(lat2 - lat1)
+    dlon = math.radians(lon2 - lon1)
+    a = math.sin(dlat/2)**2 + math.cos(math.radians(lat1))*math.cos(math.radians(lat2))*math.sin(dlon/2)**2
+    return R * 2 * math.asin(math.sqrt(a))
+
+
+def parse_last(s: str) -> timedelta:
+    m = re.fullmatch(r"(\d+)([hm])", s.lower())
+    if not m:
+        raise ValueError(f"bad --last value: {s}")
+    n, unit = int(m.group(1)), m.group(2)
+    return timedelta(hours=n) if unit == "h" else timedelta(minutes=n)
+
+
+def parse_period(args) -> tuple:
+    if args.last:
+        delta = parse_last(args.last)
+        end = datetime.now(timezone.utc)
+        start = end - delta
+        return start, end
+    if args.start and args.end:
+        start = datetime.fromisoformat(args.start)
+        end = datetime.fromisoformat(args.end)
+        if start.tzinfo is None:
+            start = start.replace(tzinfo=HOME_TZ)
+        if end.tzinfo is None:
+            end = end.replace(tzinfo=HOME_TZ)
+        return start.astimezone(timezone.utc), end.astimezone(timezone.utc)
+    now_home = datetime.now(HOME_TZ)
+    if args.period == "yesterday":
+        s = (now_home - timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+        return s.astimezone(timezone.utc), (s + timedelta(days=1)).astimezone(timezone.utc)
+    if args.period == "today":
+        s = now_home.replace(hour=0, minute=0, second=0, microsecond=0)
+        return s.astimezone(timezone.utc), (s + timedelta(days=1)).astimezone(timezone.utc)
+    raise ValueError("specify period or --last or --start/--end")
+
+
+def fetch_samples(start: datetime, end: datetime) -> List[Dict[str, Any]]:
+    if not supabase_local.service_key() or not supabase_local.supabase_url():
+        print("ERROR: no Supabase configured (supabase_project / SUPABASE_SERVICE_ROLE_KEY)", file=sys.stderr)
+        sys.exit(1)
+    qs = urllib.parse.urlencode([
+        ("arrived_at", f"gte.{start.isoformat()}"),
+        ("arrived_at", f"lte.{end.isoformat()}"),
+        ("order", "arrived_at.asc"),
+        ("limit", "10000"),
+        ("select", "arrived_at,latitude,longitude,accuracy_m,activity,segment_type"),
+    ])
+    return supabase_local.rest_get(f"location_history?{qs}", timeout=10)
+
+
+def main():
+    import argparse
+    p = argparse.ArgumentParser(description="Raw GPS breadcrumbs for a time range.")
+    p.add_argument("period", nargs="?", help="'yesterday' or 'today'")
+    p.add_argument("--start", help="ISO 8601 or YYYY-MM-DD")
+    p.add_argument("--end", help="ISO 8601 or YYYY-MM-DD")
+    p.add_argument("--last", help="e.g. '2h' or '90m'")
+    p.add_argument("--min-accuracy", type=float, default=500, help="Drop samples with accuracy_m > this (default 500)")
+    args = p.parse_args()
+
+    try:
+        start, end = parse_period(args)
+    except ValueError as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    samples = fetch_samples(start, end)
+    samples = [s for s in samples
+               if s.get("latitude") is not None
+               and (s.get("accuracy_m") is None or s["accuracy_m"] <= args.min_accuracy)]
+
+    # Compute movement stats
+    total_km = 0.0
+    prev = None
+    enriched = []
+    for s in samples:
+        entry = {
+            "ts": s["arrived_at"],
+            "lat": s["latitude"],
+            "lon": s["longitude"],
+            "accuracy_m": s.get("accuracy_m"),
+            "activity": s.get("activity"),
+        }
+        if prev:
+            dist = haversine_km(prev["latitude"], prev["longitude"], s["latitude"], s["longitude"])
+            total_km += dist
+            entry["segment_km"] = round(dist, 4)
+            dt = (datetime.fromisoformat(s["arrived_at"].replace("Z", "+00:00"))
+                  - datetime.fromisoformat(prev["arrived_at"].replace("Z", "+00:00"))).total_seconds()
+            entry["gap_s"] = round(dt)
+            if dt > 0:
+                entry["speed_kmh"] = round(dist / dt * 3600, 1)
+        enriched.append(entry)
+        prev = s
+
+    print(json.dumps({
+        "period": {
+            "start": start.isoformat(),
+            "end": end.isoformat(),
+        },
+        "sample_count": len(enriched),
+        "total_distance_km": round(total_km, 3),
+        "samples": enriched,
+    }, indent=2))
+
+
+if __name__ == "__main__":
+    main()

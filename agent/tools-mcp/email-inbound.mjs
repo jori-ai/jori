@@ -42,6 +42,7 @@ import { escalationTask, mktApplyTask, postToOps } from "../../lib/email-inbound
 const require = createRequire(import.meta.url);
 const ws = require("../../lib/wiki-store.js");
 const { instance, localConfig } = require("../../lib/instance.cjs");
+const ASSISTANT = require("../../lib/instance.cjs").assistantName(); // the assistant's configured name (lib/instance.cjs)
 const INSTANCE = instance();
 const OWNER = INSTANCE.owner_name;
 const exec = promisify(execFile);
@@ -72,7 +73,7 @@ async function cli(bin, args, timeout = 60_000) {
 export const TOOLS = [
   {
     name: "wiki_search",
-    description: "Search Jori's long-term wiki (people, places, preferences, projects, trips, past days). Returns page ids, titles and a snippet.",
+    description: "Search " + ASSISTANT + "'s long-term wiki (people, places, preferences, projects, trips, past days). Returns page ids, titles and a snippet.",
     schema: { type: "object", properties: { query: { type: "string" } }, required: ["query"] },
     run: ({ query }) => ({
       query,
@@ -102,7 +103,7 @@ export const TOOLS = [
   },
   {
     name: "recall",
-    description: "One search across recent chat with " + OWNER + ", their dated answers to Jori's questions, and the wiki. Use before concluding Jori knows nothing about a topic.",
+    description: "One search across recent chat with " + OWNER + ", their dated answers to " + ASSISTANT + "'s questions, and the wiki. Use before concluding " + ASSISTANT + " knows nothing about a topic.",
     schema: { type: "object", properties: { query: { type: "string" } }, required: ["query"] },
     run: async ({ query }) => JSON.parse(await cli("recall", [String(query || ""), "--json", "-k", "8"])),
   },
@@ -133,7 +134,7 @@ export const TOOLS = [
   },
   {
     name: "escalate_to_ops",
-    description: "Hand this email to the ops agent (the full assistant with every tool) when the sender asks Jori to DO something — send, book, buy, change, schedule, remember, contact someone — or asks about money, health, or anything your read tools can't answer. The ops agent acts and replies to the sender itself, so after calling this do NOT write a reply. Call at most once.",
+    description: "Hand this email to the ops agent (the full assistant with every tool) when the sender asks " + ASSISTANT + " to DO something — send, book, buy, change, schedule, remember, contact someone — or asks about money, health, or anything your read tools can't answer. The ops agent acts and replies to the sender itself, so after calling this do NOT write a reply. Call at most once.",
     schema: {
       type: "object",
       properties: {

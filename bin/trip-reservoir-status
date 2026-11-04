@@ -1,0 +1,250 @@
+#!/usr/bin/env node
+"use strict";
+// trip-reservoir-status — "what's left" in an area reservoir.
+//
+// The reservoir is the trip's standing inventory; trip-reservoir-mark-done
+// strikes entries as they're visited. Nothing reported the remaining pool, so
+// a day planner had to hand-parse 90KB of JSON to answer "what haven't we done
+// in this town yet?". This is that report.
+//
+// Selection contract (matches trip-day-select's prompt rules):
+//   open      -> selectable
+//   revisit   -> selectable AND a strong pick (the user said they'd go back)
+//   done      -> not selectable, EXCEPT see the gps-transit caveat below
+//   duplicate -> never selectable, never counted as a real entry
+//
+// The gps-transit caveat matters. lib/reservoir-done.js matches at 300m
+// with NO dwell requirement, and done_source "gps-transit" means the user merely
+// drove past. That looseness is deliberate (over-striking is preferred to
+// under-striking) but it means a strictly-open plan silently drops places
+// never actually stopped at. So transit-only strikes are reported separately
+// under `soft_done` — re-offerable, not seen.
+//
+// Usage:
+//   trip-reservoir-status --area old_town
+//   trip-reservoir-status --area old_town --json
+//   trip-reservoir-status --area old_town --bucket food_specialties
+//   trip-reservoir-status --area old_town --include-done
+//   trip-reservoir-status --area old_town --on 2026-07-24   # planning a future day
+//   trip-reservoir-status --list                  # areas that have a reservoir
+//
+// Dated one-offs are judged against --on (default today), so a festival that
+// ended last week reports as `expired` rather than sitting in the drawable pool.
+
+const path = require("node:path");
+const { pullReservoir, listAreas } = require(path.join(__dirname, "..", "lib", "reservoir-store.js"));
+
+const argv = process.argv.slice(2);
+const has = (f) => argv.includes(f);
+const arg = (f) => { const i = argv.indexOf(f); return i >= 0 ? argv[i + 1] : null; };
+
+const AREA = arg("--area");
+const BUCKET = arg("--bucket");
+const JSON_OUT = has("--json");
+const INCLUDE_DONE = has("--include-done");
+// Local date, not UTC: at 01:00 in Paris a UTC "today" is still yesterday, which
+// would resurrect an event that finished hours ago.
+const ON_DATE = arg("--on") || new Date().toLocaleDateString("en-CA");
+
+const BUCKETS = ["must_see", "optional", "food_specialties", "unique_experiences", "time_sensitive"];
+const LABELS = {
+  must_see: "must_see",
+  optional: "optional",
+  food_specialties: "food_specialties",
+  unique_experiences: "unique_exp",
+  time_sensitive: "time_sensitive",
+};
+
+// food_specialties key on `dish`/`best_place`, everything else on `name`.
+function entryName(e) {
+  return e.name || e.best_place || e.dish || "(unnamed)";
+}
+
+// A strike whose only evidence is driving past is not a visit. Anything with a
+// summary-stop or a real GPS visit behind it is.
+function isSoftDone(e) {
+  return e.state === "done" && e.done_source === "gps-transit";
+}
+
+// A dated one-off that has already happened is not drawable, however "open" the
+// entry still says it is. Observed live: one area kept offering "the
+// summer music festival ... on 2026-07-10" as open twelve days after the
+// festival ended. `date` comes in two shapes — a single "YYYY-MM-DD" and a
+// "YYYY-MM-DD to YYYY-MM-DD" run — so take the LAST date mentioned and compare
+// that: a run is live until its final day.
+function lastDateIn(raw) {
+  const found = String(raw || "").match(/\d{4}-\d{2}-\d{2}/g);
+  return found?.length ? found[found.length - 1] : null;
+}
+
+function isExpired(e, onDate) {
+  const end = lastDateIn(e.date);
+  return !!end && end < onDate;
+}
+
+function classify(e, onDate) {
+  const state = e.state || "open";
+  if (state === "duplicate") return "duplicate";
+  if (state === "done") return isSoftDone(e) ? "soft_done" : "done";
+  if (isExpired(e, onDate)) return "expired";
+  if (state === "revisit") return "revisit";
+  return "open";
+}
+
+function summarize(entry, dontMiss) {
+  const e = entry;
+  const out = {
+    id: e.id,
+    name: entryName(e),
+    state: classify(e),
+    seq: e.seq ?? null,
+    dog_ok: typeof e.dog_ok === "boolean" ? e.dog_ok : null,
+    dont_miss: dontMiss.has(e.id),
+  };
+  if (e.cluster) {
+    out.cluster = e.cluster.label || e.cluster.id || null;
+    out.cluster_mode = e.cluster.mode || null;
+    out.km_from_center = e.cluster.km_from_center ?? null;
+  }
+  // Timing constraints — what makes an entry a day-anchor rather than filler.
+  if (e.window) out.window = e.window;
+  if (Array.isArray(e.days) && e.days.length) out.days = e.days;
+  if (e.hours) out.hours = e.hours;
+  if (e.date) out.date = e.date;
+  if (e.iconic_detour) out.iconic_detour = true;
+  if (e.dish) out.dish = e.dish;
+  if (e.kind) out.kind = e.kind;
+  // Feedback outranks research — carry it so the caller can weight it.
+  if (e.feedback && typeof e.feedback === "object") {
+    out.feedback = {
+      sentiment: e.feedback.sentiment || null,
+      wants_return: e.feedback.wants_return ?? null,
+    };
+  }
+  if (out.state === "done" || out.state === "soft_done") {
+    out.done_date = e.done_date || null;
+    out.done_source = e.done_source || null;
+    out.done_evidence = e.done_evidence || null;
+  }
+  return out;
+}
+
+function pad(s, n) {
+  s = String(s);
+  return s.length >= n ? s : s + " ".repeat(n - s.length);
+}
+
+async function main() {
+  if (has("--list")) {
+    const areas = await listAreas();
+    if (JSON_OUT) { process.stdout.write(JSON.stringify(areas)); return; }
+    for (const a of areas) console.log(a);
+    return;
+  }
+
+  if (!AREA) {
+    console.error("trip-reservoir-status: --area <key> is required (or --list). See --help in the header.");
+    process.exit(2);
+  }
+  if (BUCKET && !BUCKETS.includes(BUCKET)) {
+    console.error(`trip-reservoir-status: unknown --bucket "${BUCKET}". One of: ${BUCKETS.join(", ")}`);
+    process.exit(2);
+  }
+
+  const res = await pullReservoir(AREA);
+  if (!res || !res.buckets) {
+    console.error(`trip-reservoir-status: no reservoir for area "${AREA}". Build one with trip-reservoir-build --area ${AREA}.`);
+    process.exit(1);
+  }
+
+  const dontMiss = new Set(res.dont_miss || []);
+  const wanted = BUCKET ? [BUCKET] : BUCKETS;
+
+  const report = {
+    area: res.area || AREA,
+    label: res.label || null,
+    lat: res.lat ?? null,
+    lon: res.lon ?? null,
+    date_range: res.date_range || null,
+    built_at: res.built_at || null,
+    as_of: ON_DATE,
+    totals: { open: 0, revisit: 0, soft_done: 0, done: 0, expired: 0, duplicate: 0 },
+    buckets: {},
+  };
+
+  for (const b of wanted) {
+    const entries = res.buckets[b] || [];
+    const counts = { open: 0, revisit: 0, soft_done: 0, done: 0, expired: 0, duplicate: 0 };
+    const available = [];
+    const done = [];
+    const expired = [];
+    for (const e of entries) {
+      const state = classify(e, ON_DATE);
+      counts[state] += 1;
+      report.totals[state] += 1;
+      if (state === "duplicate") continue;
+      const s = summarize(e, dontMiss);
+      // open + revisit + soft_done are all drawable; done and expired are not.
+      if (state === "done") done.push(s);
+      else if (state === "expired") expired.push(s);
+      else available.push(s);
+    }
+    // seq is the shared ordering the site, map and wiki all read — keep it.
+    available.sort((a, b2) => (a.seq ?? 1e9) - (b2.seq ?? 1e9));
+    report.buckets[b] = { counts, available, expired };
+    if (INCLUDE_DONE) report.buckets[b].done = done;
+  }
+
+  if (JSON_OUT) { process.stdout.write(JSON.stringify(report)); return; }
+
+  // Human render
+  console.log(`${report.area}${report.label ? ` — ${report.label}` : ""}`);
+  if (report.date_range) console.log(`stay: ${report.date_range.start} → ${report.date_range.end}`);
+  console.log("");
+  console.log(`${pad("bucket", 18)}${pad("open", 7)}${pad("revisit", 9)}${pad("transit?", 10)}${pad("done", 6)}${pad("gone", 6)}dup`);
+  for (const b of wanted) {
+    const c = report.buckets[b].counts;
+    console.log(`${pad(LABELS[b], 18)}${pad(c.open, 7)}${pad(c.revisit, 9)}${pad(c.soft_done, 10)}${pad(c.done, 6)}${pad(c.expired, 6)}${c.duplicate}`);
+  }
+  const t = report.totals;
+  console.log(`${pad("TOTAL", 18)}${pad(t.open, 7)}${pad(t.revisit, 9)}${pad(t.soft_done, 10)}${pad(t.done, 6)}${pad(t.expired, 6)}${t.duplicate}`);
+  console.log("");
+
+  for (const b of wanted) {
+    const { available } = report.buckets[b];
+    if (!available.length) continue;
+    console.log(`## ${b} — ${available.length} still drawable`);
+    for (const e of available) {
+      const tags = [];
+      if (e.dont_miss) tags.push("DON'T-MISS");
+      if (e.state === "revisit") tags.push("REVISIT");
+      if (e.state === "soft_done") tags.push(`drove-past only (${e.done_date || "?"})`);
+      if (e.iconic_detour) tags.push("worth-a-detour");
+      if (e.dog_ok === false) tags.push("NO DOGS");
+      if (e.window) tags.push(e.window);
+      if (e.days) tags.push(e.days.join("/"));
+      if (e.hours) tags.push(e.hours);
+      if (e.date) tags.push(`on ${e.date}`);
+      if (e.feedback?.sentiment) tags.push(`felt: ${e.feedback.sentiment}`);
+      const seq = e.seq != null ? `${e.seq}. ` : "   ";
+      const where = e.cluster ? `  [${e.cluster}${e.cluster_mode ? `, ${e.cluster_mode}` : ""}]` : "";
+      console.log(`  ${seq}${e.name}${where}${tags.length ? `  (${tags.join("; ")})` : ""}`);
+    }
+    console.log("");
+  }
+
+  if (t.expired > 0) {
+    const gone = wanted.flatMap((b) => report.buckets[b].expired);
+    console.log(`note: ${t.expired} dated entr${t.expired === 1 ? "y has" : "ies have"} already passed as of ${ON_DATE} — not drawable:`);
+    for (const e of gone) console.log(`  - ${e.name} (${e.date})`);
+    console.log("");
+  }
+  if (t.soft_done > 0) {
+    console.log(`note: ${t.soft_done} entr${t.soft_done === 1 ? "y is" : "ies are"} struck on drive-past GPS evidence alone — treat as still offerable.`);
+  }
+}
+
+main().catch((e) => {
+  console.error(`trip-reservoir-status: ${e.message}`);
+  process.exit(1);
+});

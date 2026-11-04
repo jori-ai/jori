@@ -9,3 +9,5 @@ build/
 .swiftpm/
 Pods/
 *.p8
+# An installation's build configuration (Config/Jori.xcconfig includes it when present).
+Config/Installation.xcconfig

@@ -31,61 +31,9 @@ For the MCP server's Management-API access (creating/inspecting projects via the
 SUPABASE_ACCESS_TOKEN=sbp_...    # generate at supabase.com/dashboard/account/tokens
 ```
 
-## 2. Tables Jori expects
+## 2. Create the schema
 
-The phone-channel + companion-app pipeline expects these tables. Apply via the Supabase SQL editor or by adding migration files to your fork:
-
-```sql
--- Messages between the user (via companion app) and the agent
-create table jori_messages (
-  id uuid primary key default gen_random_uuid(),
-  role text not null check (role in ('user','assistant','system')),
-  content text not null,
-  read boolean default false,
-  ack boolean default false,
-  reaction text,
-  device_token text,
-  parent_id uuid references jori_messages(id),
-  created_at timestamptz not null default now()
-);
-alter table jori_messages enable row level security;
-
--- Commands from the agent to the phone (e.g. get_location requests)
-create table jori_commands (
-  id uuid primary key default gen_random_uuid(),
-  command text not null,
-  payload jsonb,
-  status text default 'pending',
-  response jsonb,
-  created_at timestamptz not null default now()
-);
-alter table jori_commands enable row level security;
-
--- Phone context (motion + Wi-Fi + audio class) — one row per device
-create table phone_context (
-  device_id text primary key,
-  motion_class text,
-  wifi_ssid text,
-  audio_class text,
-  battery_pct int,
-  charging boolean,
-  updated_at timestamptz not null default now()
-);
-alter table phone_context enable row level security;
-
--- APNs device tokens (registered by the companion app)
-create table device_tokens (
-  device_id text primary key,
-  apns_token text not null,
-  environment text default 'production',
-  updated_at timestamptz not null default now()
-);
-alter table device_tokens enable row level security;
-```
-
-Enable Realtime on `jori_messages` (Database → Replication → toggle on for the jori_messages table). Without this, the phone-channel can't subscribe.
-
-If you also want location/health/photos sync (the companion app's full feature set), add the corresponding tables — see the iOS app's `SupabaseManager.swift` for the exact schemas. For a minimal setup, the four tables above are enough.
+The schema is in the kernel at `system/migrations/` (one idempotent file per capability). Run `bin/jori-migrate` for a dry run of the plan, then `bin/jori-migrate --apply --project <ref> --allow-user <email>`. [schema.md](../schema.md) says which capability needs which tables and how the allowlist works.
 
 ## 3. Verify
 
@@ -110,21 +58,7 @@ For the iOS/macOS companion app at `apps/companion/`:
 
 ## RLS policies
 
-The above schema enables Row Level Security but doesn't define any policies — that means no client can read/write through the anon key. The agent uses the **service-role** key (which bypasses RLS) so it works either way. If you want the companion app to be the ONLY client that reads/writes (which is the right security posture), add policies that scope to the authenticated user's UID.
-
-A reasonable starting policy:
-
-```sql
-create policy "users can see their own messages"
-  on jori_messages for select
-  to authenticated
-  using (auth.uid() is not null);
-
-create policy "users can insert their own messages"
-  on jori_messages for insert
-  to authenticated
-  with check (role = 'user');
-```
+Every table has Row Level Security on. The agent uses the **service-role** key, which bypasses RLS. The companion app and the sites sign in as `authenticated` users and reach a table only when their email is in `jori_allowed_users` (`jori_is_allowed_user()`); `anon` has no row policy anywhere. See [schema.md](../schema.md).
 
 ## Cost
 

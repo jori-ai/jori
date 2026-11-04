@@ -1,0 +1,930 @@
+#!/usr/bin/env node
+/**
+ * places-budget — meter month-to-date Google Places API spend and stop it.
+ *
+ * Spend is metered per SCOPE: a named set of GCP projects with a warn line, a
+ * cap and an enforcement mode. Scopes come from agent/local/config/places-budget.json
+ * (see CONFIG below); with no config there is one scope, `jori`, covering
+ * this installation's own GCP project (instance().gcp_project), and with no
+ * billing export configured `check` logs that metering is off and exits 0.
+ *
+ *   enforcement "local-guard"          a local kill switch the Places callers
+ *                                      consult (lib/places-guard.js reads the
+ *                                      `jori` scope). Nothing user-facing breaks.
+ *   enforcement "gcp-service-disable"  disables places.googleapis.com on the
+ *                                      scope's projects at the cap.
+ *   enforcement "notify-only"          meters and alerts; a human pulls the plug
+ *                                      (`places-budget block <scope>`), for a
+ *                                      project where disabling the API is an outage.
+ *
+ * Spend comes from the BigQuery billing export, which is the only source that
+ * sees every project on the billing account. It lags a few hours, so this
+ * over-runs slightly by design. Nothing here is a substitute for GCP budget
+ * alerts or per-day quota overrides — it is the layer that pulls the plug.
+ *
+ * Usage:
+ *   places-budget check            meter, notify, enforce   (the cron entry)
+ *   places-budget status [--json]  print current state, touch nothing
+ *   places-budget guard <scope>    exit 3 if that scope is blocked
+ *   places-budget block <scope>    pull the plug by hand
+ *   places-budget unblock <scope>  lift a block and re-enable the API
+ *   places-budget switch on|off [reason]
+ *                                  a proxy's Firestore kill switch (config `proxy_project`)
+ *   places-budget audit [--month YYYY-MM] [--by job|lane|day|query|tool|sku] [--no-bq] [--json]
+ *                                  who spent the month: the call log grouped by
+ *                                  caller, reconciled per SKU against the bill
+ */
+
+const fs = require("fs");
+const path = require("path");
+const os = require("os");
+const { execFileSync } = require("child_process");
+
+const { installTools } = require("../lib/root.cjs");
+const { instance, localConfig } = require("../lib/instance.cjs");
+
+const ROOT = installTools();
+const STATE_FILE = path.join(ROOT, "data/places-budget-state.json");
+const LOG_FILE = path.join(ROOT, "data/logs/places-budget.log");
+
+/*
+ * CONFIG — agent/local/config/places-budget.json:
+ *   bq_project          the project bq queries run in (default instance().gcp_project)
+ *   billing_table       `project.dataset.gcp_billing_export_v1_…`; no table, no metering
+ *   monitoring_project  the project whose key Cloud Monitoring attributes (default bq_project)
+ *   proxy_project       Firebase project holding a `config/places` kill switch, for `switch`
+ *   unattributed_alert  calls on our key in 24h this repo did not log, before `check` says so
+ *   scopes              { name: { projects[], warn_usd, limit_usd, enforcement, label, manual_block? } }
+ * Editing the config is the supported way to change a threshold; the state
+ * file is regenerated from it every run.
+ */
+const CONFIG = localConfig("places-budget", {});
+const BQ_PROJECT = CONFIG.bq_project || instance().gcp_project || "";
+const { readPlacesLog, summarize, attribution, GOOGLE_METHOD, LOG_FILE: CALL_LOG, auditRows, skuFor } =
+  require("../lib/places-log.js");
+// Calls on our key that this repo did not make. Above this many in the
+// window, `check` says so on the phone — another project holding the same key
+// shows up here before it shows up on the bill.
+const UNATTRIBUTED_ALERT = Number(CONFIG.unattributed_alert) || 300;
+
+const BILLING_TABLE = CONFIG.billing_table || "";
+
+const SCOPES = CONFIG.scopes || {
+  jori: {
+    projects: BQ_PROJECT ? [BQ_PROJECT] : [],
+    warn_usd: 10,
+    limit_usd: 20,
+    enforcement: "local-guard",
+    label: "this installation's Places callers",
+  },
+};
+
+// Projects billed to this account that belong to neither scope are still
+// reported, so a new consumer cannot appear and go unnoticed.
+const UNSCOPED_LABEL = "unscoped";
+
+function log(line) {
+  const stamp = new Date().toISOString();
+  try {
+    fs.mkdirSync(path.dirname(LOG_FILE), { recursive: true });
+    fs.appendFileSync(LOG_FILE, `${stamp} ${line}\n`);
+  } catch (_) {
+    /* logging must never fail the run */
+  }
+}
+
+function monthKey(d = new Date()) {
+  return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, "0")}`;
+}
+
+function readState() {
+  try {
+    return JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
+  } catch (_) {
+    return null;
+  }
+}
+
+function writeState(state) {
+  fs.mkdirSync(path.dirname(STATE_FILE), { recursive: true });
+  const tmp = `${STATE_FILE}.tmp`;
+  fs.writeFileSync(tmp, `${JSON.stringify(state, null, 2)}\n`);
+  fs.renameSync(tmp, STATE_FILE); // atomic: a reader never sees a half file
+}
+
+/** Month-to-date Places API cost and call count, per project. */
+function fetchSpend(month) {
+  const sql = `
+    SELECT project.id AS proj,
+           ROUND(SUM(cost), 4) AS cost,
+           CAST(ROUND(SUM(usage.amount)) AS INT64) AS calls
+    FROM \`${BILLING_TABLE}\`
+    WHERE service.description = "Places API (New)"
+      AND FORMAT_DATE("%Y-%m", DATE(usage_start_time)) = "${month}"
+    GROUP BY 1`;
+
+  const out = execFileSync(
+    "bq",
+    [
+      "query",
+      `--project_id=${BQ_PROJECT}`,
+      "--use_legacy_sql=false",
+      "--format=json",
+      "--quiet",
+      sql,
+    ],
+    { encoding: "utf8", timeout: 120_000, env: withGcloudPath() }
+  );
+
+  const rows = JSON.parse(out || "[]");
+  const byProject = {};
+  for (const r of rows) {
+    byProject[r.proj] = {
+      cost: Number(r.cost) || 0,
+      calls: Number(r.calls) || 0,
+    };
+  }
+  return byProject;
+}
+
+/** cron and non-interactive ssh do not inherit the Homebrew/gcloud PATH. */
+function withGcloudPath() {
+  const extra = ["/opt/homebrew/bin", "/opt/homebrew/share/google-cloud-sdk/bin", path.join(os.homedir(), "google-cloud-sdk/bin")];
+  return { ...process.env, PATH: `${extra.join(":")}:${process.env.PATH || ""}` };
+}
+
+/** The Firebase project a placesProxy's callables run in (config `proxy_project`).
+ *  Not necessarily the project the app's device-side Places key belongs to. */
+const PROXY_PROJECT = CONFIG.proxy_project || "";
+
+/**
+ * Throw the proxy's kill switch — `config/places.enabled` in Firestore.
+ *
+ * The gentle lever, and the reason the proxy was built: it stops browse within
+ * a minute without an App Store release and without touching GCP service
+ * enablement. It only reaches users running a build that goes through the
+ * proxy, though, so while most of the installed base still calls Places
+ * directly this is a partial stop, not a full one.
+ *
+ * Written over the REST API rather than firebase-admin so this stays a
+ * dependency-free script; the host's gcloud identity needs access.
+ */
+function setProxyKillSwitch(enabled, reason) {
+  const token = execFileSync("gcloud", ["auth", "print-access-token"], {
+    encoding: "utf8",
+    timeout: 60_000,
+    env: withGcloudPath(),
+  }).trim();
+
+  const url =
+    `https://firestore.googleapis.com/v1/projects/${PROXY_PROJECT}` +
+    "/databases/(default)/documents/config/places" +
+    "?updateMask.fieldPaths=enabled&updateMask.fieldPaths=reason";
+
+  const body = JSON.stringify({
+    fields: {
+      enabled: { booleanValue: !!enabled },
+      reason: { stringValue: reason || "" },
+    },
+  });
+
+  execFileSync(
+    "curl",
+    ["-sS", "-X", "PATCH", url, "-H", `Authorization: Bearer ${token}`,
+     "-H", "Content-Type: application/json", "-d", body, "--fail"],
+    { encoding: "utf8", timeout: 60_000, env: withGcloudPath() }
+  );
+}
+
+function setPlacesApiEnabled(project, enabled) {
+  const verb = enabled ? "enable" : "disable";
+  const args = ["services", verb, "places.googleapis.com", `--project=${project}`, "--quiet"];
+  execFileSync("gcloud", args, {
+    encoding: "utf8",
+    timeout: 180_000,
+    env: withGcloudPath(),
+  });
+}
+
+function notify(subject, pointer) {
+  // Short alert, so the phone push + APNs pair is the whole delivery; no email.
+  // Both are best effort — a notification failure must not stop enforcement,
+  // which is the part that actually protects the card.
+  for (const [bin, args] of [
+    [path.join(__dirname, "jori-notify"), [subject]],
+    [path.join(__dirname, "jori-send-curl"), ["--suppress-hook", pointer]],
+  ]) {
+    try {
+      execFileSync(bin, args, { encoding: "utf8", timeout: 30_000 });
+    } catch (e) {
+      log(`notify failed via ${path.basename(bin)}: ${e.message}`);
+    }
+  }
+}
+
+function usd(n) {
+  return `$${n.toFixed(2)}`;
+}
+
+/**
+ * How a level reads to a human.
+ *
+ * `blocked` means "past the cap" internally, but on a notify-only scope
+ * nothing was blocked, and printing that word would claim an enforcement that
+ * did not happen.
+ */
+function levelText(s) {
+  if (s.level !== "blocked") return s.level;
+  if (s.enforcement === "notify-only" && !s.manually_blocked) return "OVER CAP (running)";
+  return "blocked";
+}
+
+/** The alert for a scope whose level rose: its subject verb and the phone pointer. */
+function alertText(name, s) {
+  const over = s.level === "blocked";
+  // A notify-only scope is "over", never "STOPPED" — saying stopped when
+  // nothing stopped is the kind of message that gets believed once and
+  // distrusted forever.
+  const verb = over ? (s.enforcement === "notify-only" ? "OVER CAP" : "STOPPED") : "warning";
+  let pointer;
+  if (over && s.enforcement === "notify-only") {
+    // The lever comes from the scope's config; without one, point at the
+    // runbook rather than print a blank (or "undefined") instruction.
+    const how = s.manual_block || SCOPES[name]?.manual_block;
+    pointer =
+      `Places API ${usd(s.spend_usd)} this month for ${s.label}, over the ${usd(s.limit_usd)} cap ` +
+      `(${s.calls.toLocaleString()} calls). Still running — stopping it disables the API for ` +
+      `everything on that project, so it is your call` +
+      (how ? `: ${how}` : `: places-budget block ${name}`);
+  } else if (over) {
+    pointer =
+      `Places API STOPPED for ${s.label} — ${usd(s.spend_usd)} this month ` +
+      `(${s.calls.toLocaleString()} calls). Lift with: places-budget unblock ${name}`;
+  } else {
+    pointer =
+      `Places API at ${usd(s.spend_usd)} of ${usd(s.limit_usd)} for ${s.label} ` +
+      `(${s.calls.toLocaleString()} calls).`;
+  }
+  return { verb, pointer };
+}
+
+function evaluate(spend, prev, month) {
+  const scopes = {};
+  const claimed = new Set();
+
+  for (const [name, cfg] of Object.entries(SCOPES)) {
+    let cost = 0;
+    let calls = 0;
+    for (const p of cfg.projects) {
+      claimed.add(p);
+      cost += spend[p]?.cost || 0;
+      calls += spend[p]?.calls || 0;
+    }
+    const bySpend = cost >= cfg.limit_usd ? "blocked" : cost >= cfg.warn_usd ? "warned" : "ok";
+    const before = prev?.month === month ? prev.scopes?.[name] : null;
+    // A hand-thrown block outranks the spend figure. Without this the scope
+    // object is rebuilt from spend alone every hour, so `places-budget block`
+    // would be forgotten within the hour — the API still off, the state saying
+    // "ok", and nothing left to tell anyone why the app was empty.
+    const manually_blocked = !!before?.manually_blocked;
+    const level = manually_blocked ? "blocked" : bySpend;
+    scopes[name] = {
+      label: cfg.label,
+      projects: cfg.projects,
+      warn_usd: cfg.warn_usd,
+      limit_usd: cfg.limit_usd,
+      enforcement: cfg.enforcement,
+      // How to stop a notify-only scope by hand; the over-cap alert quotes it.
+      // Missing here, that alert ended "so it is your call: undefined" (2026-10-20).
+      manual_block: cfg.manual_block || null,
+      spend_usd: Number(cost.toFixed(4)),
+      calls,
+      level,
+      manually_blocked,
+      // Blocks do not un-block themselves inside a month: spend only rises, and
+      // a flapping switch would thrash the iOS app. A new month, or an explicit
+      // `unblock`, is what clears it.
+      blocked_at: level === "blocked" ? before?.blocked_at || new Date().toISOString() : null,
+      notified_level: before?.notified_level || "ok",
+    };
+  }
+
+  const unscoped = Object.entries(spend)
+    .filter(([p]) => !claimed.has(p))
+    .map(([p, v]) => ({ project: p, spend_usd: v.cost, calls: v.calls }));
+
+  return { scopes, unscoped };
+}
+
+const LEVEL_RANK = { ok: 0, warned: 1, blocked: 2 };
+
+function cmdCheck() {
+  // No billing export configured: metering is off, not broken.
+  if (!BILLING_TABLE || !BQ_PROJECT) {
+    log("places-budget: no billing_table / bq_project configured (agent/local/config/places-budget.json); metering off");
+    return;
+  }
+  const month = monthKey();
+  const prev = readState();
+  let spend;
+  try {
+    spend = fetchSpend(month);
+  } catch (e) {
+    // Fail OPEN. Without spend data we cannot know we are over, and guessing
+    // "blocked" would stop every caller over a BigQuery hiccup. Loud in the
+    // log, quiet on the phone — a transient bq failure is not worth a ping.
+    log(`ERROR bq query failed, leaving enforcement untouched: ${e.message}`);
+    process.exitCode = 1;
+    return;
+  }
+
+  const { scopes, unscoped } = evaluate(spend, prev, month);
+  const actions = [];
+
+  // A block never expired on its own. `check` only ever disabled; the sole way
+  // back was someone remembering to run `unblock`. So a cap hit in August left
+  // the API off through September and every month after, while the meter — now
+  // looking at a fresh counter with no spend on it — cheerfully reported "ok"
+  // and had nothing to alert about. Silence that means "fine" and silence that
+  // means "still switched off" were indistinguishable.
+  //
+  // Rolling into a new month under the cap now lifts it. Deliberately keyed on
+  // the month CHANGING rather than on spend alone, so an in-month block is
+  // never undone by the lag in the billing export.
+  if (prev && prev.month !== month) {
+    for (const [name, s] of Object.entries(scopes)) {
+      const before = prev.scopes?.[name];
+      const wasStopped = before && (before.level === "blocked" || before.manually_blocked);
+      if (!wasStopped || s.level === "blocked") continue;
+
+      if (s.enforcement !== "local-guard") {
+        try {
+          for (const p of s.projects) setPlacesApiEnabled(p, true);
+          actions.push(`re-enabled places.googleapis.com on ${s.projects.join(", ")}`);
+        } catch (e) {
+          // Say so rather than let the state claim a recovery that did not
+          // happen — a wrong "it's back" is worse than no message.
+          log(`ERROR could not re-enable Places on ${s.projects.join(", ")}: ${e.message}`);
+          actions.push(`FAILED to re-enable Places on ${s.projects.join(", ")} — do it by hand`);
+          continue;
+        }
+      }
+      s.manually_blocked = false;
+      s.blocked_at = null;
+      s.notified_level = "ok";
+      log(`${name} recovered on month rollover (${prev.month} → ${month})`);
+      notify(
+        `Places back on: ${s.label} — new month`,
+        `${s.label} was stopped on budget in ${prev.month}. New month, ${usd(s.spend_usd)} spent so ` +
+          `far against a ${usd(s.limit_usd)} cap, so Places is enabled again.`
+      );
+    }
+  }
+
+  for (const [name, s] of Object.entries(scopes)) {
+    const rose = LEVEL_RANK[s.level] > LEVEL_RANK[s.notified_level];
+    if (!rose) continue; // silent unless things got worse
+
+    if (s.level === "blocked" && s.enforcement === "gcp-service-disable") {
+      try {
+        for (const p of s.projects) setPlacesApiEnabled(p, false);
+        actions.push(`disabled places.googleapis.com on ${s.projects.join(", ")}`);
+      } catch (e) {
+        log(`ERROR could not disable Places on ${s.projects.join(", ")}: ${e.message}`);
+        actions.push(`FAILED to disable Places on ${s.projects.join(", ")} — do it by hand`);
+      }
+    }
+
+    const alert = alertText(name, s);
+    const verb = alert.verb;
+    let pointer = alert.pointer;
+    // The alert says who spent it, so a breach explains itself (2026-10-20:
+    // October's cap took a day of burst-vs-tick forensics to attribute).
+    if (name === "jori") {
+      const top = topCallersText(month);
+      if (top) pointer += ` Top callers: ${top}. Detail: places-budget audit`;
+    }
+    notify(`Places ${verb}: ${s.label} ${usd(s.spend_usd)} of ${usd(s.limit_usd)}`, pointer);
+    s.notified_level = s.level;
+    log(`${name} ${s.notified_level} spend=${usd(s.spend_usd)} calls=${s.calls}`);
+  }
+
+  // Attribution for the jori scope: the bill says what was bought, this
+  // says whether WE bought it. Best effort — Monitoring being down must not
+  // stop the meter.
+  let attributionState = prev && prev.attribution ? prev.attribution : null;
+  try {
+    const until = new Date();
+    const since = new Date(until.getTime() - 24 * 3600_000);
+    const google = fetchGoogleCounts(since.toISOString(), until.toISOString());
+    const ours = summarize(readPlacesLog(since.toISOString())).byMethod;
+    const a = attribution(google.byMethod, ours);
+    const today = until.toISOString().slice(0, 10);
+    const alreadyToday = attributionState && attributionState.alerted_on === today;
+    attributionState = {
+      window_h: 24, as_of: until.toISOString(), google: a.google, ours: a.ours,
+      unattributed: a.unattributed, unattributed_share: a.unattributed_share,
+      by_method: a.rows, credentials: google.credentials,
+      alerted_on: attributionState ? attributionState.alerted_on : null,
+    };
+    if (a.unattributed >= UNATTRIBUTED_ALERT && !alreadyToday) {
+      const top = a.rows.filter(r => r.unattributed > 0).sort((x, y) => y.unattributed - x.unattributed)
+        .slice(0, 3).map(r => `${r.method} ${r.unattributed}`).join(", ");
+      notify(`Places: ${a.unattributed} calls on our key are not ours (24h)`,
+        `Google counted ${a.google} Places calls on the jori key in the last 24h; this repo logged ${a.ours}. ` +
+        `The other ${a.unattributed} (${top}) came from something else holding the key. ` +
+        `places-budget attribution --since 7d`);
+      attributionState.alerted_on = today;
+      log(`attribution: ${a.unattributed} of ${a.google} calls unattributed in 24h (${top})`);
+    }
+  } catch (e) {
+    log(`attribution skipped: ${e.message}`);
+  }
+
+  // What the other projects left of each shared free pool (read by
+  // places_client before every call). Keep last run's view if bq fails now.
+  let pools = prev && prev.month === month ? prev.free_pool_remaining || {} : {};
+  try { pools = freePoolRemaining(fetchSkuSpend(month)); }
+  catch (e) { log(`free-pool view skipped: ${e.message}`); }
+
+  writeState({
+    updated_at: new Date().toISOString(),
+    month,
+    source: `bq ${BILLING_TABLE} (lags a few hours)`,
+    scopes,
+    unscoped,
+    attribution: attributionState,
+    free_pool_remaining: pools,
+    last_actions: actions,
+  });
+
+  for (const [name, s] of Object.entries(scopes)) {
+    console.log(
+      `${name.padEnd(11)} ${usd(s.spend_usd).padStart(8)} / ${usd(s.limit_usd).padStart(7)}  ` +
+        `${String(s.calls).padStart(7)} calls  ${levelText(s)}`
+    );
+  }
+  for (const u of unscoped) {
+    console.log(
+      `${UNSCOPED_LABEL.padEnd(11)} ${usd(u.spend_usd).padStart(8)} /       —  ` +
+        `${String(u.calls).padStart(7)} calls  ${u.project}`
+    );
+  }
+}
+
+function cmdStatus(json) {
+  const state = readState();
+  if (!json && state && state.attribution) {
+    const a = state.attribution;
+    process.on("exit", () => {
+      console.log(`  not ours     ${String(a.unattributed).padStart(7)} of ${a.google} calls in the last ${a.window_h}h were made on our key by something outside this repo (places-budget attribution)`);
+    });
+  }
+  if (!state) {
+    console.error("places-budget: no state yet — run `places-budget check`");
+    process.exit(1);
+  }
+  if (json) {
+    console.log(JSON.stringify(state, null, 2));
+    return;
+  }
+  console.log(`Places API spend — ${state.month} (as of ${state.updated_at})`);
+  for (const [name, s] of Object.entries(state.scopes)) {
+    console.log(
+      `  ${name.padEnd(11)} ${usd(s.spend_usd).padStart(8)} / ${usd(s.limit_usd).padStart(7)}  ` +
+        `${String(s.calls).padStart(7)} calls  ${levelText(s)}` +
+        (s.blocked_at && levelText(s) === "blocked" ? `  (blocked ${s.blocked_at})` : "")
+    );
+  }
+  for (const u of state.unscoped || []) {
+    console.log(`  ${"unscoped".padEnd(11)} ${usd(u.spend_usd).padStart(8)}            ${u.project}`);
+  }
+}
+
+/** Exit 3 when the scope is blocked. Callers gate on this. */
+function cmdGuard(scope) {
+  const state = readState();
+  // No state, stale month, or an unknown scope all mean "we do not know" — and
+  // an unknown must not block work. The cron run is what makes this real.
+  if (!state || state.month !== monthKey()) process.exit(0);
+  const s = state.scopes?.[scope];
+  if (!s || s.level !== "blocked") process.exit(0);
+  console.error(
+    `places-budget: ${scope} is over its ${usd(s.limit_usd)}/month Places cap ` +
+      `(${usd(s.spend_usd)} spent). Calls are stopped until the month rolls over ` +
+      `or you run: places-budget unblock ${scope}`
+  );
+  process.exit(3);
+}
+
+/**
+ * Pull the plug by hand on a notify-only scope.
+ *
+ * Separate from `check` on purpose: on a notify-only scope this disables Places
+ * for the whole project, which can be an outage of a shipped app, not a paused
+ * job. That belongs to a human who has decided the spend is worse than the downtime.
+ */
+function cmdBlock(scope) {
+  const state = readState();
+  const s = state?.scopes?.[scope];
+  if (!s) {
+    console.error(`places-budget: unknown scope "${scope}" — run \`places-budget check\` first`);
+    process.exit(1);
+  }
+  if (s.projects?.length && s.enforcement !== "local-guard") {
+    for (const p of s.projects) {
+      setPlacesApiEnabled(p, false);
+      console.log(`disabled places.googleapis.com on ${p}`);
+    }
+  }
+  s.level = "blocked";
+  s.blocked_at = new Date().toISOString();
+  s.notified_level = "blocked";
+  s.manually_blocked = true;
+  state.updated_at = new Date().toISOString();
+  writeState(state);
+  log(`${scope} manually blocked at ${usd(s.spend_usd)}`);
+  console.log(`${scope} blocked. Reverse with: places-budget unblock ${scope}`);
+}
+
+/**
+ * Turn the proxy's Places calls on or off.
+ *
+ * Separate from `block`, and narrower: this only reaches builds that go through
+ * the proxy. Until the proxied release is the installed base, `block <scope>`
+ * — which disables the API project-wide — is still the only lever that stops
+ * everyone. Once it is, this replaces it and the scope can stop itself.
+ */
+function cmdSwitch(enabled, reason) {
+  if (!PROXY_PROJECT) {
+    console.error("places-budget: no proxy_project configured (agent/local/config/places-budget.json)");
+    process.exit(1);
+  }
+  const why = reason || (enabled ? "" : "Places spend over the monthly cap.");
+  setProxyKillSwitch(enabled, why);
+  log(`proxy kill switch -> ${enabled ? "on" : "off"}${why ? ` (${why})` : ""}`);
+  console.log(
+    `placesProxy is now ${enabled ? "ENABLED" : "DISABLED"} on ${PROXY_PROJECT}` +
+      `${why ? `\n  reason: ${why}` : ""}` +
+      "\n  Takes effect within ~60s (the functions cache the flag).\n" +
+      "  NOTE: only affects builds that use the proxy; anyone on an older " +
+      "release still calls Places directly."
+  );
+}
+
+function cmdUnblock(scope) {
+  const state = readState();
+  if (!state?.scopes?.[scope]) {
+    console.error(`places-budget: unknown scope "${scope}"`);
+    process.exit(1);
+  }
+  const s = state.scopes[scope];
+  // Re-enable whenever the scope owns a GCP project, however it came to be
+  // blocked — `unblock` has to undo a hand-thrown switch as readily as an
+  // automatic one, including a scope that has since become notify-only.
+  if (s.enforcement !== "local-guard") {
+    for (const p of s.projects) {
+      setPlacesApiEnabled(p, true);
+      console.log(`re-enabled places.googleapis.com on ${p}`);
+    }
+  }
+  s.manually_blocked = false;
+  s.level = "ok";
+  s.blocked_at = null;
+  // Left at its old notified_level on purpose: spend has not gone down, so the
+  // next check would otherwise re-block and re-ping within the hour. It will
+  // block again only if spend climbs past the cap *again*.
+  s.notified_level = "blocked";
+  state.updated_at = new Date().toISOString();
+  writeState(state);
+  log(`${scope} manually unblocked at ${usd(s.spend_usd)}`);
+  console.log(`${scope} unblocked (spend ${usd(s.spend_usd)} this month, cap ${usd(s.limit_usd)})`);
+}
+
+// ---------------------------------------------------------------------------
+// Attribution — what Google saw for the key vs what this repo logged
+// ---------------------------------------------------------------------------
+//
+// The billing export names the SKU; it never names the caller. Cloud
+// Monitoring's `serviceruntime.googleapis.com/api/request_count` names the
+// METHOD and the CREDENTIAL, per hour, with no lag to speak of. Setting that
+// against data/logs/places-calls.jsonl gives the one number the bill
+// cannot: how many calls on our key were made by something that is not us.
+const JORI_PROJECT = CONFIG.monitoring_project || BQ_PROJECT;
+
+function accessToken() {
+  return execFileSync("gcloud", ["auth", "print-access-token"], { encoding: "utf8", timeout: 30_000, env: withGcloudPath() }).trim();
+}
+
+/** { method(short): count } for places.googleapis.com on the project, in [since, until]. */
+function fetchGoogleCounts(sinceIso, untilIso) {
+  const token = accessToken();
+  const params = new URLSearchParams();
+  params.append("filter", 'metric.type="serviceruntime.googleapis.com/api/request_count" AND resource.type="consumed_api" AND resource.labels.service="places.googleapis.com"');
+  params.append("interval.startTime", sinceIso);
+  params.append("interval.endTime", untilIso);
+  // Hourly buckets, then only those that END inside the window. One bucket the
+  // size of the window let Monitoring align it to its own boundary and reach
+  // back past `since`: on 2026-10-20 `--since 7d` reported 983 "unattributed"
+  // calls when the key had seen none since Oct 14.
+  params.append("aggregation.alignmentPeriod", "3600s");
+  params.append("aggregation.perSeriesAligner", "ALIGN_SUM");
+  params.append("aggregation.crossSeriesReducer", "REDUCE_SUM");
+  params.append("aggregation.groupByFields", "resource.labels.method");
+  params.append("aggregation.groupByFields", "resource.labels.credential_id");
+  const out = execFileSync("curl", ["-sS", "-m", "30", "-H", `Authorization: Bearer ${token}`,
+    `https://monitoring.googleapis.com/v3/projects/${JORI_PROJECT}/timeSeries?${params}`],
+    { encoding: "utf8", timeout: 40_000 });
+  const j = JSON.parse(out || "{}");
+  if (j.error) throw new Error(j.error.message || "monitoring error");
+  const byMethod = {};
+  const credentials = new Set();
+  for (const t of j.timeSeries || []) {
+    const m = GOOGLE_METHOD[t.resource.labels.method] || t.resource.labels.method;
+    const n = (t.points || [])
+      .filter((p) => !p.interval?.endTime || (p.interval.endTime > sinceIso && p.interval.endTime <= untilIso))
+      .reduce((a, p) => a + Number(p.value.int64Value || p.value.doubleValue || 0), 0);
+    byMethod[m] = (byMethod[m] || 0) + n;
+    if (t.resource.labels.credential_id) credentials.add(t.resource.labels.credential_id.slice(-8));
+  }
+  return { byMethod, credentials: [...credentials] };
+}
+
+function windowArg(defaultHours) {
+  const i = process.argv.indexOf("--since");
+  const raw = i > 0 ? process.argv[i + 1] : null;
+  let hours = defaultHours;
+  if (raw) {
+    const m = /^(\d+)([hd])$/.exec(raw);
+    if (!m) { console.error(`--since wants e.g. 24h or 7d, got ${raw}`); process.exit(2); }
+    hours = Number(m[1]) * (m[2] === "d" ? 24 : 1);
+  }
+  const until = new Date();
+  const since = new Date(until.getTime() - hours * 3600_000);
+  return { sinceIso: since.toISOString(), untilIso: until.toISOString(), hours };
+}
+
+function cmdCalls() {
+  const { sinceIso, hours } = windowArg(24);
+  const sum = summarize(readPlacesLog(sinceIso));
+  if (process.argv.includes("--json")) { console.log(JSON.stringify({ since: sinceIso, ...sum }, null, 2)); return; }
+  console.log(`Places calls logged by this repo — last ${hours}h (${path.relative(ROOT, CALL_LOG)})`);
+  console.log(`  live ${sum.live}   cache hits ${sum.cachedHits}   photo URLs handed out ${sum.photoUrlsIssued}`);
+  const tools = Object.entries(sum.byTool).sort((a, b) => Object.values(b[1]).reduce((x, y) => x + y, 0) - Object.values(a[1]).reduce((x, y) => x + y, 0));
+  for (const [tool, methods] of tools) {
+    console.log(`  ${tool.padEnd(22)} ${Object.entries(methods).map(([m, n]) => `${m} ${n}`).join("  ")}`);
+  }
+  if (!tools.length) console.log("  (nothing logged in the window)");
+  // Per lane: the number that answers "who is spending" and "is the cache working".
+  const lanes = Object.entries(sum.byLane || {}).sort((a, b) => (b[1].live + b[1].cached) - (a[1].live + a[1].cached));
+  if (lanes.length) {
+    console.log("  by lane (live = went to Google, cached = a local cache answered):");
+    for (const [lane, c] of lanes) {
+      const total = c.live + c.cached;
+      console.log(`    ${lane.padEnd(20)} live ${String(c.live).padStart(5)}   cached ${String(c.cached).padStart(5)}   hit rate ${total ? Math.round((c.cached / total) * 100) : 0}%`);
+    }
+  }
+}
+
+function cmdAttribution() {
+  const { sinceIso, untilIso, hours } = windowArg(24);
+  let google;
+  try { google = fetchGoogleCounts(sinceIso, untilIso); }
+  catch (e) { console.error(`attribution: Cloud Monitoring unavailable: ${e.message}`); process.exit(1); }
+  const ours = summarize(readPlacesLog(sinceIso)).byMethod;
+  const a = attribution(google.byMethod, ours);
+  if (process.argv.includes("--json")) { console.log(JSON.stringify({ since: sinceIso, credentials: google.credentials, ...a }, null, 2)); return; }
+  console.log(`Places calls on the jori key — last ${hours}h (Google: Cloud Monitoring; ours: ${path.relative(ROOT, CALL_LOG)})`);
+  console.log(`  ${"method".padEnd(14)} ${"google".padStart(7)} ${"ours".padStart(7)} ${"unattrib".padStart(9)}`);
+  for (const r of a.rows) console.log(`  ${r.method.padEnd(14)} ${String(r.google).padStart(7)} ${String(r.ours).padStart(7)} ${String(r.unattributed).padStart(9)}`);
+  console.log(`  ${"total".padEnd(14)} ${String(a.google).padStart(7)} ${String(a.ours).padStart(7)} ${String(a.unattributed).padStart(9)}   (${Math.round(a.unattributed_share * 100)}% not this repo; key(s) …${google.credentials.join(", …")})`);
+  if (a.unattributed >= UNATTRIBUTED_ALERT) {
+    console.log(`  !! ${a.unattributed} calls in ${hours}h were made on our key by something outside this repo.`);
+  }
+}
+
+/**
+ * Pure: how much of each SKU's monthly free allowance the OTHER projects on the
+ * billing account have left for this installation. The allowance is per billing
+ * account, so another project spending a SKU's free calls early in the month
+ * makes every one of our calls of that SKU bill from then on. places_client reads this
+ * (state.free_pool_remaining) and never assumes more free calls than are left.
+ */
+function freePoolRemaining(bill, ourProject = BQ_PROJECT) {
+  const prices = require("../lib/places-prices.json");
+  const freeByTier = prices.free_per_month_per_billing_account || {};
+  const tierOf = (sku) => {
+    if (/Photos$/.test(sku)) return "photo";
+    for (const [t, label] of Object.entries(prices.sku_tier || {}).sort((a, b) => b[1].length - a[1].length)) {
+      if (sku.endsWith(` ${label}`)) return t;
+    }
+    return null;
+  };
+  const others = {};
+  for (const b of bill || []) {
+    if (b.proj === ourProject) continue;
+    others[b.sku] = (others[b.sku] || 0) + b.calls;
+  }
+  const out = {};
+  for (const [sku, used] of Object.entries(others)) {
+    const t = tierOf(sku);
+    if (t && freeByTier[t] != null) out[sku] = Math.max(0, freeByTier[t] - used);
+  }
+  return out;
+}
+
+/** "hum/nearby $12.40 (310 calls), …" — this month's top estimated spenders. */
+function topCallersText(month, n = 3, bill = undefined) {
+  try {
+    const entries = monthEntries(month);
+    const rows = auditRows(entries, "job");
+    // Prefer the actual charge (a call inside the free pool costs $0); fall
+    // back to list-price estimates when the export is unreachable.
+    let billed = null;
+    try { billed = attributeBill(entries, bill === undefined ? fetchSkuSpend(month) : bill, "job"); } catch { billed = null; }
+    if (billed) {
+      return Object.entries(billed).sort((x, y) => y[1] - x[1]).filter(([, v]) => v > 0).slice(0, n)
+        .map(([k, v]) => `${k} ${usd(v)} (${rows.find((r) => r.key === k)?.live ?? 0} calls)`).join(", ");
+    }
+    return rows.filter((r) => r.est_usd > 0).slice(0, n)
+      .map((r) => `${r.key} ~${usd(r.est_usd)} list (${r.live} calls)`).join(", ");
+  } catch { return ""; }
+}
+
+function monthEntries(month) {
+  return readPlacesLog(`${month}-01T00:00:00`).filter((e) => String(e.ts).startsWith(month));
+}
+
+/** Billing export for the month, per SKU, for every project on the account. */
+function fetchSkuSpend(month) {
+  if (!BILLING_TABLE || !BQ_PROJECT) throw new Error("no billing export configured");
+  const sql = `
+    SELECT CAST(DATE(usage_start_time) AS STRING) AS day, project.id AS proj, sku.description AS sku,
+           ROUND(SUM(cost), 4) AS cost,
+           CAST(ROUND(SUM(usage.amount)) AS INT64) AS calls
+    FROM \`${BILLING_TABLE}\`
+    WHERE service.description = "Places API (New)"
+      AND FORMAT_DATE("%Y-%m", DATE(usage_start_time)) = "${month}"
+    GROUP BY 1, 2, 3`;
+  const out = execFileSync("bq", ["query", `--project_id=${BQ_PROJECT}`, "--use_legacy_sql=false",
+    "--format=json", "--quiet", "--max_rows=1000", sql],
+    { encoding: "utf8", timeout: 120_000, env: withGcloudPath() });
+  return JSON.parse(out || "[]").map((r) => ({ day: r.day, proj: r.proj, sku: r.sku, cost: Number(r.cost), calls: Number(r.calls) }));
+}
+
+/**
+ * Pure: set the log's per-SKU live calls + list-price estimate against the
+ * bill. `bill` rows are {proj, sku, cost, calls} for the whole account;
+ * `ourProject` is the project our key bills to. Free allowances are per
+ * billing account, so `account_calls` says who else drew on the same pool.
+ */
+function reconcile(entries, bill, ourProject = BQ_PROJECT) {
+  const bySku = new Map();
+  const row = (sku) => bySku.get(sku) || bySku.set(sku, {
+    sku, logged_calls: 0, logged_est_usd: 0, billed_calls: 0, billed_usd: 0, account_calls: 0, other_projects: {},
+  }).get(sku);
+  for (const r of auditRows(entries, "sku")) {
+    const x = row(r.key);
+    x.logged_calls += r.live; x.logged_est_usd += r.est_usd;
+  }
+  for (const b of bill || []) {
+    const x = row(b.sku);
+    x.account_calls += b.calls;
+    if (b.proj === ourProject) { x.billed_calls += b.calls; x.billed_usd += b.cost; }
+    else if (b.calls) x.other_projects[b.proj] = (x.other_projects[b.proj] || 0) + b.calls;
+  }
+  return [...bySku.values()]
+    .map((x) => ({ ...x, logged_est_usd: Math.round(x.logged_est_usd * 100) / 100, billed_usd: Math.round(x.billed_usd * 100) / 100,
+                   unlogged_calls: Math.max(0, x.billed_calls - x.logged_calls) }))
+    .sort((a, b) => b.billed_usd - a.billed_usd || b.logged_est_usd - a.logged_est_usd);
+}
+
+/**
+ * Pure: what each audit row actually COST. Each (day, SKU) the bill charged our
+ * project is spread over that day's logged live calls of that SKU, by count.
+ * Exact to the day: a call made while the account's free pool lasted costs $0,
+ * one made after it ran out carries its share of the charge. Returns
+ * { key → usd } for the rows of auditRows(entries, by).
+ */
+function attributeBill(entries, bill, by = "job", ourProject = BQ_PROJECT) {
+  const live = entries.filter((e) => !e.cached && !e.blocked && e.method !== "photoUrlIssued");
+  const skuOf = (e) => e.sku || skuFor(e.method, e.tier) || `${e.method}/${e.tier}`;
+  const dayOf = (e) => String(e.ts).slice(0, 10);
+  const bucket = new Map(); // day|sku → [entries]
+  for (const e of live) {
+    const k = `${dayOf(e)}|${skuOf(e)}`;
+    (bucket.get(k) || bucket.set(k, []).get(k)).push(e);
+  }
+  const out = {};
+  for (const b of bill || []) {
+    if (b.proj !== ourProject || !b.cost) continue;
+    const es = bucket.get(`${b.day}|${b.sku}`) || [];
+    const total = es.reduce((t, e) => t + (Number(e.n) || 1), 0);
+    if (!total) { out["(billed, no log line)"] = (out["(billed, no log line)"] || 0) + b.cost; continue; }
+    for (const e of es) {
+      const key = auditRows([e], by)[0].key;
+      out[key] = (out[key] || 0) + b.cost * (Number(e.n) || 1) / total;
+    }
+  }
+  for (const k of Object.keys(out)) out[k] = Math.round(out[k] * 100) / 100;
+  return out;
+}
+
+function argVal(flag) {
+  const i = process.argv.indexOf(flag);
+  return i > 0 ? process.argv[i + 1] : null;
+}
+
+function cmdAudit() {
+  const month = argVal("--month") || monthKey();
+  if (!/^\d{4}-\d{2}$/.test(month)) { console.error(`--month wants YYYY-MM, got ${month}`); process.exit(2); }
+  const by = argVal("--by") || "job";
+  const entries = monthEntries(month);
+  const rows = auditRows(entries, by);
+  let bill = null, billErr = null;
+  if (!process.argv.includes("--no-bq")) {
+    try { bill = fetchSkuSpend(month); } catch (e) { billErr = e.message.split("\n")[0]; }
+  }
+  const rec = bill ? reconcile(entries, bill) : null;
+  const billed = bill ? attributeBill(entries, bill, by) : null;
+  if (billed) {
+    for (const r of rows) r.billed_usd = billed[r.key] || 0;
+    if (billed["(billed, no log line)"]) rows.push({ key: "(billed, no log line)", live: 0, cached: 0, blocked: 0, est_usd: 0, billed_usd: billed["(billed, no log line)"] });
+    rows.sort((a, b) => b.billed_usd - a.billed_usd || b.est_usd - a.est_usd);
+  }
+  if (process.argv.includes("--json")) {
+    console.log(JSON.stringify({ month, by, rows, reconciliation: rec, bill_error: billErr }, null, 2));
+    return;
+  }
+  console.log(`Places spend ${month} by ${by} — call log (${path.relative(ROOT, CALL_LOG)})`);
+  console.log(`  est $ = list price before free allowances; bill $ = the actual charge, each day's per-SKU cost spread over that day's calls`);
+  console.log(`  ${by.padEnd(44)} ${"live".padStart(6)} ${"cached".padStart(7)} ${"blocked".padStart(8)} ${"est $".padStart(8)} ${"bill $".padStart(8)}`);
+  for (const r of rows.slice(0, 40)) {
+    const b = r.billed_usd == null ? "—" : r.billed_usd.toFixed(2);
+    console.log(`  ${String(r.key).slice(0, 44).padEnd(44)} ${String(r.live).padStart(6)} ${String(r.cached).padStart(7)} ${String(r.blocked).padStart(8)} ${r.est_usd.toFixed(2).padStart(8)} ${b.padStart(8)}`);
+  }
+  if (rows.length > 40) console.log(`  … ${rows.length - 40} more (use --json)`);
+  if (!rows.length) console.log("  (nothing logged this month)");
+  if (billErr) console.log(`\n  billing export unavailable: ${billErr}`);
+  if (rec) {
+    console.log(`\nAgainst the bill (BigQuery export, lags a few hours) — ${BQ_PROJECT}:`);
+    console.log(`  ${"sku".padEnd(48)} ${"logged".padStart(7)} ${"est $".padStart(7)} ${"billed".padStart(7)} ${"bill $".padStart(7)}  account pool`);
+    for (const x of rec.filter((x) => x.billed_calls || x.logged_calls || x.billed_usd)) {
+      const others = Object.entries(x.other_projects).map(([p, c]) => `${p} ${c}`).join(", ");
+      console.log(`  ${x.sku.slice(0, 48).padEnd(48)} ${String(x.logged_calls).padStart(7)} ${x.logged_est_usd.toFixed(2).padStart(7)} ${String(x.billed_calls).padStart(7)} ${x.billed_usd.toFixed(2).padStart(7)}  ${x.account_calls}${others ? ` (others: ${others})` : ""}`);
+      if (x.unlogged_calls > 0) console.log(`    !! ${x.unlogged_calls} billed calls with no log line — something outside this repo, or a caller that does not log`);
+    }
+    console.log("  Free allowances are per SKU per BILLING ACCOUNT: another project's calls spend the same pool (lib/places-prices.json).");
+  }
+}
+
+function main() {
+  const [cmd, arg] = process.argv.slice(2);
+  switch (cmd) {
+    case "check":
+      return cmdCheck();
+    case "status":
+      return cmdStatus(process.argv.includes("--json"));
+    case "calls":
+      return cmdCalls();
+    case "attribution":
+      return cmdAttribution();
+    case "audit":
+      return cmdAudit();
+    case "guard":
+      if (!arg) {
+        console.error("places-budget guard <scope>");
+        process.exit(1);
+      }
+      return cmdGuard(arg);
+    case "block":
+      if (!arg) {
+        console.error("places-budget block <scope>");
+        process.exit(1);
+      }
+      return cmdBlock(arg);
+    case "switch":
+      if (arg !== "on" && arg !== "off") {
+        console.error("places-budget switch on|off [reason]");
+        process.exit(1);
+      }
+      return cmdSwitch(arg === "on", process.argv[4]);
+    case "unblock":
+      if (!arg) {
+        console.error("places-budget unblock <scope>");
+        process.exit(1);
+      }
+      return cmdUnblock(arg);
+    default:
+      console.error(
+        "usage: places-budget check | status [--json] | calls | attribution | " +
+          "audit [--month YYYY-MM] [--by job|lane|day|query|tool|sku] [--no-bq] [--json] | " +
+          "guard <scope> | block <scope> | unblock <scope>"
+      );
+      process.exit(1);
+  }
+}
+
+if (require.main === module) main();
+
+module.exports = { reconcile, attributeBill, topCallersText, monthEntries, freePoolRemaining, evaluate, alertText, SCOPES };

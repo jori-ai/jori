@@ -1,0 +1,70 @@
+{
+  "Response": {
+    "timestamp": "1791200000",
+    "num_bytes": "4096",
+    "page_num": "1",
+    "page_size": "25",
+    "max_page": "1",
+    "Trip": {
+      "id": "331000001",
+      "display_name": "Athens, Greece, October 2026",
+      "start_date": "2026-10-14",
+      "end_date": "2026-10-28",
+      "primary_location": "Athens, Greece"
+    },
+    "AirObject": {
+      "id": "2200000001",
+      "trip_id": "331000001",
+      "last_modified": "1790800000",
+      "supplier_name": "Example Air",
+      "supplier_conf_num": "K7QX2M",
+      "booking_site_conf_num": "",
+      "Traveler": [
+        { "first_name": "Jane", "last_name": "Doe" },
+        { "first_name": "John", "last_name": "Doe" }
+      ],
+      "Segment": [
+        {
+          "id": "seg-out",
+          "StartDateTime": { "date": "2026-10-14", "time": "22:30:00", "timezone": "Europe/London", "utc_offset": "+01:00" },
+          "EndDateTime": { "date": "2026-10-15", "time": "16:05:00", "timezone": "Europe/Athens", "utc_offset": "+03:00" },
+          "start_airport_code": "LHR", "start_city_name": "London",
+          "end_airport_code": "ATH", "end_city_name": "Athens",
+          "marketing_airline": "Example Air", "marketing_airline_code": "XY", "marketing_flight_number": "8",
+          "seats": "32A, 32B"
+        },
+        {
+          "id": "seg-back",
+          "StartDateTime": { "date": "2026-10-28", "time": "00:50:00", "timezone": "Europe/Athens", "utc_offset": "+02:00" },
+          "EndDateTime": { "date": "2026-10-28", "time": "05:55:00", "timezone": "Europe/London", "utc_offset": "+00:00" },
+          "start_airport_code": "ATH", "start_city_name": "Athens",
+          "end_airport_code": "LHR", "end_city_name": "London",
+          "marketing_airline": "Example Air", "marketing_airline_code": "XY", "marketing_flight_number": "1"
+        }
+      ]
+    },
+    "LodgingObject": {
+      "id": "2200000002",
+      "trip_id": "331000001",
+      "last_modified": "1790700000",
+      "supplier_name": "The Example Hotel",
+      "supplier_conf_num": "NRM88123",
+      "number_guests": "2",
+      "StartDateTime": { "date": "2026-10-15", "time": "15:00:00", "utc_offset": "+03:00" },
+      "EndDateTime": { "date": "2026-10-20", "time": "11:00:00", "utc_offset": "+03:00" },
+      "Address": { "address": "1 Example St, Athens", "city": "Athens", "country": "GR" }
+    },
+    "CarObject": {
+      "id": "2200000003",
+      "trip_id": "331000001",
+      "last_modified": "1790750000",
+      "supplier_name": "Sixt",
+      "supplier_conf_num": "SX9912345",
+      "StartDateTime": { "date": "2026-10-20", "time": "10:00:00", "utc_offset": "+03:00" },
+      "EndDateTime": { "date": "2026-10-23", "utc_offset": "+03:00" },
+      "start_location_name": "Athens Airport",
+      "end_location_name": "Athens Airport",
+      "car_type": "Compact"
+    }
+  }
+}

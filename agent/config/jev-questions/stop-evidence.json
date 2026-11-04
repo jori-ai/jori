@@ -1,0 +1,13 @@
+{
+  "notes": "lib/stop-evidence.mjs decideVenue — reached from bin/stop-passage just before a location question would go out (segment-ask card, findme enrich → hum). Does what the user SAID in chat or SHOWED in photos during the stop already name the place? The case: the user sent a photo + 'Having lunch here today', Jori named the place, the user said 'Yes! It's great' — and an hour later a card asked which of four shops it was. Candidates are businesses near where the user RESTED (Google + the phone's Apple Maps POIs), built per call. `unlisted` and anything below threshold go to a Sonnet fallback that can spell a name the user gave; `none` asks as before. Legacy = the Sonnet read. A wrong confident name is worse than a question, so the threshold is high. (The state keys `where_he_rested` / `photos_he_took` are the module's own field names.)",
+  "threshold": 0.85,
+  "questions": {},
+  "venue_template": {
+    "type": "choice",
+    "instructions": "{{owner_name}}'s phone recorded a stop during `window`. `chat` is the conversation around it — {{owner_name}}'s messages and Jori's replies, including photos {{owner_name}} sent and whether each was taken where {{owner_name}} rested. `photos_he_took` are photos from {{owner_name}}'s camera during the stop: what they show, sign text, and the phone's own on-device guess (`phone_guess`, one witness, never enough alone). `places_nearby` are businesses near where {{owner_name}} rested. Which ONE of these places was {{owner_name}} at? Pick it only if {{owner_name}}'s own words name it, or Jori named it from {{owner_name}}'s photo and {{owner_name}} went along with it, or a sign in {{owner_name}}'s photo spells it. The place must be where {{owner_name}} was during the window — not a plan, not somewhere mentioned. Pick unlisted if the chat or a sign clearly names a place that is not on the list. Pick none if nothing clearly says where {{owner_name}} was.",
+    "fixed_criteria": {
+      "unlisted": "the chat or a sign in {{owner_name}}'s photo clearly names where {{owner_name}} was, but it is not one of the listed places",
+      "none": "the chat and photos do not clearly say where {{owner_name}} was"
+    }
+  }
+}

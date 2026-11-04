@@ -1,0 +1,148 @@
+#!/usr/bin/env node
+// p1-reply-sweep — Signal D of the P1 resolution system: the user REPLIED.
+//
+// Every 30 min (same cron tick as the unstar scan, before its dispatch gate —
+// agent/scripts/trigger-p1-resolution-scan.sh) this walks the live P1
+// threads and, wherever the newest message is one the user SENT, downgrades the
+// starred p1 message(s) that reply answers via bin/p1-downgrade, which in
+// turn closes the linked Google Task (lib/p1-task.js). Pure code, no
+// agent turn: thread structure is a machine fact.
+//
+// Cost: one threads.list per tick plus one threads.get per thread whose
+// historyId moved since the last tick (state: data/p1-reply-sweep-seen.json).
+// A quiet inbox costs one REST call every 30 minutes.
+//
+// Exit 0 always — this is a sweep, never a reason to fail the cron tick. Any
+// error is logged to stderr with the real cause chain (describeError) and the
+// tick is skipped; the next tick starts from the same state.
+//
+// Usage: p1-reply-sweep [--dry-run] [--query "<gmail query>"]
+
+"use strict";
+
+const { spawnSync } = require("node:child_process");
+const fs = require("node:fs");
+const path = require("node:path");
+const os = require("node:os");
+
+const LIB = path.join(__dirname, "..", "lib");
+const { getAccessToken, fetchWithRetry, describeError } = require(path.join(LIB, "google-auth.js"));
+const { decideThread } = require(path.join(LIB, "p1-reply.js"));
+
+const { installTools } = require(path.join(LIB, "root.cjs"));
+const GMAIL_API = "https://gmail.googleapis.com/gmail/v1/users/me";
+const P1_DOWNGRADE = process.env.P1_REPLY_SWEEP_DOWNGRADE || installTools("bin/p1-downgrade");
+const STATE = process.env.P1_REPLY_SWEEP_STATE || installTools("data/p1-reply-sweep-seen.json");
+const DEFAULT_QUERY = "label:p1 is:starred newer_than:30d";
+const P1_LABEL_NAME = "p1";
+
+function ts() { return new Date().toISOString(); }
+function log(msg) { console.error(`${ts()} p1-reply-sweep: ${msg}`); }
+
+function parseArgs() {
+  const out = { dryRun: false, query: DEFAULT_QUERY };
+  const argv = process.argv.slice(2);
+  for (let i = 0; i < argv.length; i++) {
+    if (argv[i] === "--dry-run") out.dryRun = true;
+    else if (argv[i] === "--query") out.query = argv[++i];
+    else if (argv[i] === "--help" || argv[i] === "-h") {
+      console.log("Usage: p1-reply-sweep [--dry-run] [--query \"<gmail query>\"]\nDowngrades starred P1s whose thread's newest message the user sent; closes their Google Task.");
+      process.exit(0);
+    }
+  }
+  return out;
+}
+
+async function gmail(endpoint, token) {
+  const r = await fetchWithRetry(`${GMAIL_API}${endpoint}`, { headers: { Authorization: `Bearer ${token}` } });
+  const data = await r.json();
+  if (data.error) throw new Error(`${data.error.message} (http ${r.status})`);
+  return data;
+}
+
+function loadState() {
+  try {
+    const s = JSON.parse(fs.readFileSync(STATE, "utf8"));
+    return { threads: s.threads && typeof s.threads === "object" ? s.threads : {}, p1LabelId: s.p1LabelId || null };
+  } catch { return { threads: {}, p1LabelId: null }; }
+}
+
+function saveState(state) {
+  const tmp = STATE + ".tmp";
+  fs.writeFileSync(tmp, JSON.stringify({ ...state, updatedAt: ts() }, null, 2));
+  fs.renameSync(tmp, STATE);
+}
+
+async function listThreads(query, token) {
+  const q = encodeURIComponent(query);
+  const out = [];
+  let page = null;
+  do {
+    const res = await gmail(`/threads?q=${q}&maxResults=100${page ? `&pageToken=${page}` : ""}`, token);
+    for (const t of res.threads || []) out.push({ id: t.id, historyId: String(t.historyId || "") });
+    page = res.nextPageToken || null;
+  } while (page);
+  return out;
+}
+
+async function resolveP1LabelId(token) {
+  const res = await gmail("/labels", token);
+  const hit = (res.labels || []).find((l) => (l.name || "").toLowerCase() === P1_LABEL_NAME);
+  if (!hit) throw new Error(`no Gmail label named "${P1_LABEL_NAME}"`);
+  return hit.id;
+}
+
+function downgrade(messageId, reason, dryRun) {
+  if (dryRun) return { ok: true, dryRun: true };
+  const r = spawnSync(P1_DOWNGRADE, [messageId, "--source", "reply", "--reason", reason], { encoding: "utf8" });
+  if (r.stdout) process.stdout.write(r.stdout);
+  if (r.stderr) process.stderr.write(r.stderr);
+  return { ok: r.status === 0 };
+}
+
+async function main() {
+  const args = parseArgs();
+  const state = loadState();
+  let token;
+  try { token = await getAccessToken(); }
+  catch (e) { log(`skip tick — token: ${describeError(e)}`); return; }
+
+  let threads;
+  try { threads = await listThreads(args.query, token); }
+  catch (e) { log(`skip tick — threads.list: ${describeError(e)}`); return; }
+
+  if (!state.p1LabelId) {
+    try { state.p1LabelId = await resolveP1LabelId(token); }
+    catch (e) { log(`skip tick — labels: ${describeError(e)}`); return; }
+  }
+
+  const changed = threads.filter((t) => state.threads[t.id] !== t.historyId);
+  const nextThreads = {};
+  for (const t of threads) nextThreads[t.id] = state.threads[t.id] || null;
+
+  let resolvedCount = 0, failed = 0, fetched = 0;
+  for (const t of changed) {
+    let thread;
+    try { thread = await gmail(`/threads/${t.id}?format=minimal`, token); fetched++; }
+    catch (e) { log(`thread ${t.id}: ${describeError(e)} — will retry next tick`); continue; }
+    const decision = decideThread(thread.messages || [], state.p1LabelId);
+    let allOk = true;
+    for (const id of decision.resolved) {
+      const reason = `the user replied on the thread (${decision.replyAt}, reply ${decision.replyId})`;
+      const r = downgrade(id, reason, args.dryRun);
+      if (r.ok) { resolvedCount++; console.log(`${args.dryRun ? "[dry-run] " : ""}reply → downgraded ${id} (thread ${t.id})`); }
+      else { failed++; allOk = false; }
+    }
+    // Only advance the watermark for a thread once everything it needed is done,
+    // so a failed downgrade is retried on the next tick instead of forgotten.
+    // A dry run never advances a thread it WOULD have acted on, so the next
+    // real tick still sees it.
+    if (allOk && !(args.dryRun && decision.resolved.length)) nextThreads[t.id] = t.historyId;
+  }
+
+  try { saveState({ threads: nextThreads, p1LabelId: state.p1LabelId }); }
+  catch (e) { log(`state write failed: ${e.message}`); }
+  log(`${threads.length} live P1 thread(s), ${changed.length} changed, ${fetched} fetched, ${resolvedCount} resolved by reply${failed ? `, ${failed} FAILED` : ""}`);
+}
+
+main().catch((e) => { log(`unexpected: ${describeError(e)}`); process.exitCode = 0; });

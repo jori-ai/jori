@@ -7,58 +7,76 @@ struct SignInView: View {
     @State private var error: String?
 
     var body: some View {
-        VStack(spacing: 24) {
-            Spacer()
+        VStack(spacing: 0) {
+            Spacer(minLength: 40)
 
-            Image(systemName: "bubble.left.and.bubble.right.fill")
-                .font(.system(size: 56))
-                .foregroundStyle(.secondary)
+            JoriMark(size: 136)
 
             Text("Jori")
-                .font(.largeTitle.bold())
+                .font(JoriTheme.display(46))
+                .padding(.top, 36)
 
-            Text("Sign in to continue.")
+            Text("Sign in with the Google account Jori works for.")
                 .font(.body)
                 .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+                .padding(.top, 8)
+                .padding(.horizontal, 32)
 
-            Spacer()
+            Spacer(minLength: 40)
 
             Button(action: signIn) {
                 HStack(spacing: 10) {
                     if signingIn {
-                        ProgressView().controlSize(.small)
+                        ProgressView().controlSize(.small).tint(JoriTheme.iconDeep)
                     } else {
                         Image(systemName: "person.crop.circle.fill")
+                            .contentTransition(.symbolEffect(.replace))
                     }
-                    Text(signingIn ? "Opening Google…" : "Sign in with Google")
+                    Text(signingIn ? "Opening Google…" : "Continue with Google")
                         .fontWeight(.semibold)
+                        .contentTransition(.opacity)
                 }
-                .frame(maxWidth: .infinity)
-                .padding(.vertical, 14)
-                .background(
-                    RoundedRectangle(cornerRadius: 12)
-                        .fill(Color.accentColor)
-                )
-                .foregroundStyle(.white)
+                .frame(maxWidth: 360)
+                .padding(.vertical, 8)
+                .foregroundStyle(JoriTheme.iconDeep)
             }
-            .buttonStyle(.plain)
+            .controlSize(.large)
+            .prominentButtonStyle()
+            .buttonBorderShape(.capsule)
             .disabled(signingIn)
-            .padding(.horizontal, 40)
+            .keyboardShortcut(.defaultAction)
+            .padding(.horizontal, 32)
+            .animation(.snappy, value: signingIn)
 
             if let error {
-                Text(error)
+                Label(error, systemImage: "exclamationmark.triangle.fill")
                     .font(.footnote)
-                    .foregroundStyle(.red)
+                    .foregroundStyle(JoriTheme.deny)
                     .multilineTextAlignment(.center)
-                    .padding(.horizontal, 40)
+                    .padding(.horizontal, 32)
+                    .padding(.top, 14)
+                    .transition(.opacity.combined(with: .move(edge: .top)))
             }
 
-            Spacer().frame(height: 60)
+            Spacer().frame(height: 56)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .foregroundStyle(.white)
+        .background(JoriBackdrop())
+        .tint(JoriTheme.eye)
+        .environment(\.colorScheme, .dark)
+        .animation(.snappy, value: error)
+        .sensoryFeedback(.error, trigger: error) { _, new in new != nil }
     }
 
     private func signIn() {
+        // A build without a backend (the public defaults) can't sign in; say
+        // which settings it needs rather than fail inside the web sheet.
+        guard Install.isConfigured else {
+            error = "This build has no server: set JORI_SUPABASE_URL and JORI_SUPABASE_ANON_KEY in Config/Installation.xcconfig."
+            return
+        }
         signingIn = true
         error = nil
         Task {

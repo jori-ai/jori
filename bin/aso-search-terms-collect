@@ -1,0 +1,217 @@
+#!/usr/bin/env python3
+# aso-search-terms-collect — weekly Apple Search Ads Search Terms report pull.
+#
+# Auth: ES256 JWT signed with the ASA private key (secrets/<asa_key_file>, named
+# in agent/local/config/marketing.json) → OAuth2 client_credentials
+# at appleid.apple.com → access_token → api.searchads.apple.com with the
+# X-AP-Context: orgId=<org_id> header.
+#
+# Returns search terms users searched on the App Store before encountering the app
+# via paid ASA campaigns OR organic discoverability (the report aggregates both
+# when "TermSource" filter omitted).
+#
+# Output: data/mkt-aso-search-terms-state.json
+#
+# Note: report data only flows once the app runs at least one ASA campaign or
+# has organic impressions from broad-match keywords. New accounts with no
+# campaigns will get empty data — that's expected, not an error.
+
+import json, os, sys, time
+import urllib.parse, urllib.request, urllib.error
+from datetime import datetime, timedelta
+
+_BIN = os.path.dirname(os.path.realpath(globals().get("__file__") or sys.argv[0]))
+sys.path.insert(0, os.path.join(os.path.dirname(_BIN), "lib"))
+import mkt_local  # noqa: E402
+
+CFG = mkt_local.config()
+STATE_PATH = mkt_local.data_path("mkt-aso-search-terms-state.json")
+META_NAME = CFG.get("asa_meta_file") or "asa-meta.json"
+KEY_NAME = CFG.get("asa_key_file") or "asa-private.pem"
+META_PATH = mkt_local.secrets_path(META_NAME)
+KEY_PATH = mkt_local.secrets_path(KEY_NAME)
+
+TOKEN_URL = "https://appleid.apple.com/auth/oauth2/token"
+API_BASE = "https://api.searchads.apple.com/api/v5"
+TODAY = datetime.utcnow().strftime("%Y-%m-%d")
+LOOKBACK_DAYS = 7  # weekly job, weekly window
+
+
+def save_json(path, data):
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f, indent=2)
+    os.rename(tmp, path)
+
+
+def asa_configured():
+    return os.path.exists(META_PATH) and os.path.exists(KEY_PATH)
+
+
+def get_access_token(meta, pem):
+    import jwt
+    now = int(time.time())
+    assertion = jwt.encode(
+        {
+            "sub": meta["client_id"],
+            "iss": meta["team_id"],
+            "aud": "https://appleid.apple.com",
+            "iat": now,
+            "exp": now + 86400 * 60,
+        },
+        pem,
+        algorithm="ES256",
+        headers={"alg": "ES256", "kid": meta["key_id"], "typ": "JWT"},
+    )
+    body = urllib.parse.urlencode({
+        "grant_type": "client_credentials",
+        "client_id": meta["client_id"],
+        "client_secret": assertion,
+        "scope": "searchadsorg",
+    }).encode()
+    req = urllib.request.Request(TOKEN_URL, data=body, headers={
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Host": "appleid.apple.com",
+    })
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        return json.load(resp)["access_token"]
+
+
+def asa_post(path, access_token, org_id, body):
+    req = urllib.request.Request(
+        API_BASE + path,
+        data=json.dumps(body).encode(),
+        headers={
+            "Authorization": "Bearer " + access_token,
+            "X-AP-Context": "orgId=" + str(org_id),
+            "Content-Type": "application/json",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        return json.load(resp)
+
+
+def fetch_search_terms_for_campaign(access_token, org_id, campaign_id, start_date, end_date):
+    """Pull the Search Terms report for a specific campaign. ASA's search-terms
+    endpoint is campaign-scoped — there is no org-level aggregate (org-level
+    returns RESOURCE_NOT_FOUND)."""
+    body = {
+        "startTime": start_date,
+        "endTime": end_date,
+        "selector": {
+            "orderBy": [{"field": "impressions", "sortOrder": "DESCENDING"}],
+            "pagination": {"offset": 0, "limit": 1000},
+        },
+        "timeZone": "ORTZ",  # searchterms dimension rejects UTC
+        "returnRowTotals": True,  # required for searchterms dimension
+        "returnRecordsWithNoMetrics": False,
+    }
+    return asa_post(f"/reports/campaigns/{campaign_id}/searchterms", access_token, org_id, body)
+
+
+def main():
+    if not mkt_local.configured(CFG):
+        print(json.dumps({"ok": True, "skipped": "not configured (agent/local/config/marketing.json)"}))
+        return 0
+    if not asa_configured():
+        out = {
+            "version": 1,
+            "last_run": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "last_run_ok": False,
+            "auth_broken": True,
+            "auth_broken_reason": f"ASA creds missing at secrets/{META_NAME} + secrets/{KEY_NAME}.",
+            "search_terms": [],
+        }
+        save_json(STATE_PATH, out)
+        print(json.dumps({"ok": False, "skipped": "asa_not_configured"}))
+        return 0
+    mkt_local.ensure_modules("jwt")
+    meta = json.load(open(META_PATH))
+    pem = open(KEY_PATH).read()
+    if not meta.get("org_id"):
+        out = {
+            "version": 1,
+            "last_run": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "last_run_ok": False,
+            "auth_broken": True,
+            "auth_broken_reason": f"{META_NAME} has no org_id. First-time setup: call /api/v5/acls to retrieve.",
+            "search_terms": [],
+        }
+        save_json(STATE_PATH, out)
+        print(json.dumps({"ok": False, "skipped": "no_org_id"}))
+        return 0
+    try:
+        access_token = get_access_token(meta, pem)
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", errors="replace")[:500]
+        out = {
+            "version": 1,
+            "last_run": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "last_run_ok": False,
+            "auth_broken": True,
+            "auth_broken_reason": f"OAuth token endpoint returned HTTP {e.code}: {body}",
+            "search_terms": [],
+        }
+        save_json(STATE_PATH, out)
+        print(json.dumps({"ok": False, "error": "auth", "code": e.code}, indent=2))
+        return 1
+    # Build date window
+    end = datetime.utcnow().date()
+    start = end - timedelta(days=LOOKBACK_DAYS)
+    campaigns = meta.get("campaigns") or []
+    if not campaigns:
+        out = {
+            "version": 1,
+            "last_run": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "last_run_ok": False,
+            "auth_broken": False,
+            "skipped_reason": "no_campaigns_configured",
+            "note": f"{META_NAME} has no `campaigns` entries. ASA search-terms is campaign-scoped. Add at least one campaign id.",
+            "search_terms": [],
+        }
+        save_json(STATE_PATH, out)
+        print(json.dumps({"ok": False, "skipped": "no_campaigns"}, indent=2))
+        return 0
+    all_rows = []
+    errors = []
+    for c in campaigns:
+        cid = c["id"]
+        try:
+            report = fetch_search_terms_for_campaign(access_token, meta["org_id"], cid, start.isoformat(), end.isoformat())
+            for entry in (report.get("data", {}).get("reportingDataResponse", {}).get("row", []) or []):
+                entry["_campaign_id"] = cid
+                entry["_campaign_name"] = c.get("name")
+                all_rows.append(entry)
+        except urllib.error.HTTPError as e:
+            body = e.read().decode("utf-8", errors="replace")[:500]
+            # 404 with RESOURCE_NOT_FOUND from /reports/searchterms is Apple's
+            # response when the campaign has no impressions yet (ON_HOLD or
+            # serving but pre-data). Treat as a soft empty state, not an error.
+            if e.code == 404 and "RESOURCE_NOT_FOUND" in body:
+                continue
+            errors.append({"campaign_id": cid, "code": e.code, "body": body})
+    out = {
+        "version": 1,
+        "last_run": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "last_run_ok": len(errors) == 0,
+        "auth_broken": False,
+        "window": {"start": start.isoformat(), "end": end.isoformat()},
+        "campaigns_queried": len(campaigns),
+        "search_terms": all_rows,
+        "row_count": len(all_rows),
+        "errors": errors,
+    }
+    save_json(STATE_PATH, out)
+    print(json.dumps({
+        "ok": len(errors) == 0,
+        "window": f"{start} → {end}",
+        "campaigns_queried": len(campaigns),
+        "rows_returned": len(all_rows),
+        "errors": len(errors),
+        "note": "0 rows is expected while Apple is still categorizing the app (campaign servingStatus=NOT_RUNNING). Data flows once campaign starts serving." if len(all_rows) == 0 else None,
+    }, indent=2))
+    return 0 if len(errors) == 0 else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

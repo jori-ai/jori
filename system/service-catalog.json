@@ -1,0 +1,333 @@
+{
+  "_comment": "Outside services the kernel knows how to use, for the control room's Services & keys page (lib/control/state.mjs). `env` is a list of .env key-name prefixes; the page shows which of those keys are set, never their values. `config` names the agent/local/config/<name>.json files that hold the service's non-secret settings. An installation adds its own services with `extend_services` in agent/local/config/service-catalog.json.",
+  "services": [
+    {
+      "name": "Supabase",
+      "does": "Database, messages and the memory mirror",
+      "group": "Core",
+      "env": [
+        "SUPABASE_"
+      ],
+      "config": [
+        "supabase"
+      ]
+    },
+    {
+      "name": "Gmail",
+      "does": "Reading and sending mail through gog",
+      "group": "Core",
+      "env": [
+        "GMAIL_",
+        "GOG_"
+      ],
+      "config": [
+        "gmail-auth",
+        "gmail-intake"
+      ]
+    },
+    {
+      "name": "1Password",
+      "does": "Secrets and saved logins",
+      "group": "Core",
+      "env": [
+        "OP_"
+      ]
+    },
+    {
+      "name": "Cloudflare Access",
+      "does": "Sign-in in front of the memory site and private pages",
+      "group": "Core",
+      "env": [
+        "CF_ACCESS_"
+      ]
+    },
+    {
+      "name": "iCloud",
+      "does": "Calendar, contacts and photos",
+      "group": "Core",
+      "env": [
+        "ICLOUD_"
+      ],
+      "config": [
+        "calendar"
+      ]
+    },
+    {
+      "name": "Jori internal",
+      "does": "Webhook, wiki and usage tokens",
+      "group": "Core",
+      "env": [
+        "HOOKS_",
+        "JORI_",
+        "GATEWAY_",
+        "CACHE_",
+        "WEBHOOK_"
+      ]
+    },
+    {
+      "name": "Slack",
+      "does": "Workspace channel",
+      "group": "Messaging",
+      "env": [
+        "SLACK_"
+      ],
+      "config": [
+        "slack-channel",
+        "slack-inbox"
+      ]
+    },
+    {
+      "name": "SMTP2GO",
+      "does": "Outbound mail relay",
+      "group": "Messaging",
+      "env": [
+        "SMTP2GO_"
+      ]
+    },
+    {
+      "name": "Twilio",
+      "does": "Text messages",
+      "group": "Messaging",
+      "env": [
+        "TWILIO_"
+      ],
+      "config": [
+        "sms-send"
+      ]
+    },
+    {
+      "name": "Apple Push",
+      "does": "Notifications to the app",
+      "group": "Messaging",
+      "env": [
+        "APNS_"
+      ],
+      "config": [
+        "apns"
+      ]
+    },
+    {
+      "name": "Google Places",
+      "does": "Places, restaurants and venues",
+      "group": "Places and travel",
+      "env": [
+        "GOOGLE_PLACES_"
+      ],
+      "config": [
+        "places",
+        "places-budget"
+      ]
+    },
+    {
+      "name": "Duffel",
+      "does": "Flight search",
+      "group": "Places and travel",
+      "env": [
+        "DUFFEL_"
+      ],
+      "config": [
+        "flight-search"
+      ]
+    },
+    {
+      "name": "AwardWallet",
+      "does": "Loyalty balances",
+      "group": "Places and travel",
+      "env": [
+        "AWARDWALLET_"
+      ],
+      "config": [
+        "loyalty"
+      ]
+    },
+    {
+      "name": "CruiseFeed",
+      "does": "Cruise prices",
+      "group": "Places and travel",
+      "env": [
+        "CRUISEFEED_"
+      ],
+      "config": [
+        "cruise-watch"
+      ]
+    },
+    {
+      "name": "Apple WeatherKit",
+      "does": "Weather",
+      "group": "Places and travel",
+      "config": [
+        "apple-weather"
+      ]
+    },
+    {
+      "name": "Ticketmaster",
+      "does": "Event search",
+      "group": "Events",
+      "env": [
+        "TICKETMASTER_"
+      ]
+    },
+    {
+      "name": "TMDB",
+      "does": "Movies and TV",
+      "group": "Watchlist",
+      "env": [
+        "TMDB_"
+      ]
+    },
+    {
+      "name": "OMDb",
+      "does": "Movie ratings",
+      "group": "Watchlist",
+      "env": [
+        "OMDB_"
+      ]
+    },
+    {
+      "name": "Plaid",
+      "does": "Bank and card accounts",
+      "group": "Money",
+      "env": [
+        "PLAID_"
+      ],
+      "config": [
+        "finance"
+      ]
+    },
+    {
+      "name": "Stripe",
+      "does": "Revenue (read only)",
+      "group": "Money",
+      "env": [
+        "STRIPE_"
+      ]
+    },
+    {
+      "name": "RentCast",
+      "does": "Property values",
+      "group": "Money",
+      "env": [
+        "RENTCAST_"
+      ],
+      "config": [
+        "rentals"
+      ]
+    },
+    {
+      "name": "Google Search",
+      "does": "Custom search",
+      "group": "Research",
+      "env": [
+        "GOOGLE_CSE_"
+      ]
+    },
+    {
+      "name": "SerpApi",
+      "does": "Search results",
+      "group": "Research",
+      "env": [
+        "SERPAPI_"
+      ]
+    },
+    {
+      "name": "Gemini",
+      "does": "Second-opinion model",
+      "group": "Research",
+      "env": [
+        "GEMINI_"
+      ]
+    },
+    {
+      "name": "Unsplash",
+      "does": "Photos for pages",
+      "group": "Research",
+      "env": [
+        "UNSPLASH_"
+      ]
+    },
+    {
+      "name": "TypeSafe",
+      "does": "Jev gateway",
+      "group": "Research",
+      "env": [
+        "TYPESAFE_"
+      ]
+    },
+    {
+      "name": "Apollo",
+      "does": "Contact lookup",
+      "group": "Research",
+      "env": [
+        "APOLLO_"
+      ]
+    },
+    {
+      "name": "Reddit Ads",
+      "does": "Ad accounts",
+      "group": "Marketing",
+      "env": [
+        "REDDIT_ADS_"
+      ],
+      "config": [
+        "marketing"
+      ]
+    },
+    {
+      "name": "Google Ads",
+      "does": "Ad account",
+      "group": "Marketing",
+      "env": [
+        "GOOGLE_ADS_"
+      ]
+    },
+    {
+      "name": "Product Hunt",
+      "does": "Launch tracking",
+      "group": "Marketing",
+      "env": [
+        "PH_DEV_"
+      ]
+    },
+    {
+      "name": "Resend",
+      "does": "Mail for sites",
+      "group": "Messaging",
+      "env": [
+        "RESEND_"
+      ]
+    },
+    {
+      "name": "Anthropic API",
+      "does": "Fallback when the Claude subscription is down, and developer tools",
+      "group": "Core",
+      "env": [
+        "ANTHROPIC_"
+      ],
+      "config": [
+        "api-fallback"
+      ]
+    },
+    {
+      "name": "Spa control",
+      "does": "A hot tub or spa controller (bin/spa)",
+      "group": "Home",
+      "env": [
+        "SPA_SERVER_"
+      ],
+      "config": [
+        "spa"
+      ]
+    },
+    {
+      "name": "Virtual mailbox",
+      "does": "Scanned postal mail (bin/anytime-mail-check)",
+      "group": "Home",
+      "env": [
+        "ANYTIME_"
+      ],
+      "config": [
+        "anytime-mail"
+      ]
+    }
+  ]
+}

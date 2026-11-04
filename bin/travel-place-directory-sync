@@ -1,0 +1,1485 @@
+#!/usr/bin/env node
+// travel-place-directory-sync — build country/city directories for travel
+// history and link trips / Airbnb stays back to those pages.
+
+"use strict";
+
+const ws = require("../lib/wiki-store.js");
+
+const args = process.argv.slice(2);
+const dryRun = !args.includes("--apply");
+
+// Deletion cap for UNATTENDED runs. This tool prunes any generated travel page
+// that the current parse no longer produces — which is correct, and is how the
+// 8 bad pages from 2026-07-29 were cleaned up. But once it runs weekly on a
+// timer, that same logic is a standing risk: if an upstream source degrades (a
+// trip page mangled, wiki-store returning a partial list, a parser regression),
+// the tool cannot tell "these pages are garbage" from "I can no longer see the
+// data that justified them" — and would quietly delete real travel history.
+//
+// Steady state is 0 deletions. A legitimate cleanup after a parser fix was 8.
+// So: above the cap, skip the deletions entirely, print the full list, and exit
+// non-zero. Writes still happen (they are additive and safe). Pass
+// --max-deletions <n> to raise it for a deliberate, attended cleanup.
+const MAX_DELETIONS_DEFAULT = 10;
+const maxDeletions = (() => {
+  const i = args.indexOf("--max-deletions");
+  const v = i === -1 ? NaN : Number(args[i + 1]);
+  return Number.isFinite(v) && v >= 0 ? v : MAX_DELETIONS_DEFAULT;
+})();
+let deletionCapTripped = false;
+
+const US_STATE_CODES = new Set([
+  "AL","AK","AZ","AR","CA","CO","CT","DE","FL","GA","HI","ID","IL","IN","IA","KS","KY","LA",
+  "ME","MD","MA","MI","MN","MS","MO","MT","NE","NV","NH","NJ","NM","NY","NC","ND","OH","OK",
+  "OR","PA","RI","SC","SD","TN","TX","UT","VT","VA","WA","WV","WI","WY","DC",
+]);
+
+const COUNTRY_ALIASES = new Map([
+  ["usa", "United States"],
+  ["u.s.", "United States"],
+  ["us", "United States"],
+  ["united states of america", "United States"],
+  ["united states", "United States"],
+  ["uk", "United Kingdom"],
+  ["great britain", "United Kingdom"],
+  ["england", "United Kingdom"],
+  ["scotland", "United Kingdom"],
+  ["wales", "United Kingdom"],
+  ["northern ireland", "United Kingdom"],
+  ["pr", "Puerto Rico"], // kernel-guard-ok: public country-name table
+  ["puerto rico", "Puerto Rico"], // kernel-guard-ok: public country-name table
+  ["morocco", "Morocco"],
+  // Türkiye is the modern canonical form; the existing country page is
+  // travel_country_turkiye, so coerce "Turkey" → "Türkiye" too.
+  ["turkey", "Türkiye"],
+  ["türkiye", "Türkiye"],
+  // Czech Republic ↔ Czechia (existing page uses Czechia).
+  ["czech republic", "Czechia"],
+  ["czechia", "Czechia"],
+  // Other common alt-spellings.
+  ["holland", "Netherlands"],
+  ["the netherlands", "Netherlands"],
+  ["myanmar (burma)", "Myanmar"],
+  ["burma", "Myanmar"],
+  ["côte d'ivoire", "Ivory Coast"], // kernel-guard-ok: public country-name table
+  ["cote d'ivoire", "Ivory Coast"],
+  // Caribbean dependent territories visited as cruise ports — modeled as
+  // separate "country" pages even though they're not sovereign ISO-3166
+  // states, since the travel directory groups by passport-stamp/locale.
+  ["sint maarten", "Sint Maarten"],
+  ["st. maarten", "Sint Maarten"],
+  ["st maarten", "Sint Maarten"],
+  ["saint maarten", "Sint Maarten"],
+  ["saint martin", "Sint Maarten"],
+  ["us virgin islands", "U.S. Virgin Islands"],
+  ["u.s. virgin islands", "U.S. Virgin Islands"],
+  ["united states virgin islands", "U.S. Virgin Islands"],
+  ["usvi", "U.S. Virgin Islands"],
+  ["virgin islands", "U.S. Virgin Islands"],
+  ["cayman islands", "Cayman Islands"],
+  ["grand cayman", "Cayman Islands"],
+]);
+
+// Canonical-country dictionary (ISO 3166 superset). Keys are lowercased
+// names; values are the canonical display form used as the
+// travel_country_<slug> title. Used so plain-text country mentions in
+// trip bodies (e.g. "Hotel ..., Copenhagen, 1553, Denmark") and titles
+// (e.g. "Brazil & Peru Summer '25") get recognized even when no
+// travel_country_<slug> page exists yet — closes the chicken-and-egg
+// loop where countries only got linked if a page already existed.
+const CANONICAL_COUNTRIES = new Map([
+  // Europe
+  ["albania", "Albania"], ["andorra", "Andorra"], ["austria", "Austria"],
+  ["belarus", "Belarus"], ["belgium", "Belgium"],
+  ["bosnia and herzegovina", "Bosnia and Herzegovina"], ["bulgaria", "Bulgaria"],
+  ["croatia", "Croatia"], ["cyprus", "Cyprus"], ["czechia", "Czechia"],
+  ["denmark", "Denmark"], ["estonia", "Estonia"], ["finland", "Finland"],
+  ["france", "France"], ["germany", "Germany"], ["greece", "Greece"],
+  ["hungary", "Hungary"], ["iceland", "Iceland"], ["ireland", "Ireland"],
+  ["italy", "Italy"], ["kosovo", "Kosovo"], ["latvia", "Latvia"],
+  ["liechtenstein", "Liechtenstein"], ["lithuania", "Lithuania"],
+  ["luxembourg", "Luxembourg"], ["malta", "Malta"], ["moldova", "Moldova"],
+  ["monaco", "Monaco"], ["montenegro", "Montenegro"], ["netherlands", "Netherlands"],
+  ["north macedonia", "North Macedonia"], ["norway", "Norway"], ["poland", "Poland"],
+  ["portugal", "Portugal"], ["romania", "Romania"], ["russia", "Russia"],
+  ["san marino", "San Marino"], ["serbia", "Serbia"], ["slovakia", "Slovakia"],
+  ["slovenia", "Slovenia"], ["spain", "Spain"], ["sweden", "Sweden"],
+  ["switzerland", "Switzerland"], ["türkiye", "Türkiye"], ["ukraine", "Ukraine"],
+  ["united kingdom", "United Kingdom"], ["vatican city", "Vatican City"],
+  // Americas (incl. dependent territories visited as cruise ports —
+  // Sint Maarten, U.S. Virgin Islands, Cayman Islands aren't sovereign
+  // ISO-3166 states but are modeled as country-level entries here).
+  ["antigua and barbuda", "Antigua and Barbuda"], ["argentina", "Argentina"],
+  ["bahamas", "Bahamas"], ["barbados", "Barbados"], ["belize", "Belize"],
+  ["cayman islands", "Cayman Islands"],
+  ["sint maarten", "Sint Maarten"],
+  ["u.s. virgin islands", "U.S. Virgin Islands"],
+  ["bolivia", "Bolivia"], ["brazil", "Brazil"], ["canada", "Canada"],
+  ["chile", "Chile"], ["colombia", "Colombia"], ["costa rica", "Costa Rica"],
+  ["cuba", "Cuba"], ["dominica", "Dominica"], ["dominican republic", "Dominican Republic"],
+  ["ecuador", "Ecuador"], ["el salvador", "El Salvador"], ["grenada", "Grenada"],
+  ["guatemala", "Guatemala"], ["guyana", "Guyana"], ["haiti", "Haiti"],
+  ["honduras", "Honduras"], ["jamaica", "Jamaica"], ["mexico", "Mexico"],
+  ["nicaragua", "Nicaragua"], ["panama", "Panama"], ["paraguay", "Paraguay"],
+  ["peru", "Peru"], ["puerto rico", "Puerto Rico"], // kernel-guard-ok: public country-name table
+  ["saint kitts and nevis", "Saint Kitts and Nevis"], ["saint lucia", "Saint Lucia"],
+  ["saint vincent and the grenadines", "Saint Vincent and the Grenadines"],
+  ["suriname", "Suriname"], ["trinidad and tobago", "Trinidad and Tobago"],
+  ["united states", "United States"], ["uruguay", "Uruguay"], ["venezuela", "Venezuela"],
+  // Africa
+  ["algeria", "Algeria"], ["angola", "Angola"], ["benin", "Benin"],
+  ["botswana", "Botswana"], ["burkina faso", "Burkina Faso"], ["burundi", "Burundi"],
+  ["cameroon", "Cameroon"], ["cape verde", "Cape Verde"],
+  ["central african republic", "Central African Republic"], ["chad", "Chad"],
+  ["comoros", "Comoros"], ["democratic republic of the congo", "Democratic Republic of the Congo"],
+  ["djibouti", "Djibouti"], ["egypt", "Egypt"], ["equatorial guinea", "Equatorial Guinea"],
+  ["eritrea", "Eritrea"], ["eswatini", "Eswatini"], ["ethiopia", "Ethiopia"],
+  ["gabon", "Gabon"], ["gambia", "Gambia"], ["ghana", "Ghana"],
+  ["guinea", "Guinea"], ["guinea-bissau", "Guinea-Bissau"], ["ivory coast", "Ivory Coast"],
+  ["kenya", "Kenya"], ["lesotho", "Lesotho"], ["liberia", "Liberia"],
+  ["libya", "Libya"], ["madagascar", "Madagascar"], ["malawi", "Malawi"],
+  ["mali", "Mali"], ["mauritania", "Mauritania"], ["mauritius", "Mauritius"],
+  ["morocco", "Morocco"], ["mozambique", "Mozambique"], ["namibia", "Namibia"],
+  ["niger", "Niger"], ["nigeria", "Nigeria"], ["rwanda", "Rwanda"],
+  ["senegal", "Senegal"], ["seychelles", "Seychelles"], ["sierra leone", "Sierra Leone"],
+  ["somalia", "Somalia"], ["south africa", "South Africa"], ["south sudan", "South Sudan"],
+  ["sudan", "Sudan"], ["tanzania", "Tanzania"], ["togo", "Togo"],
+  ["tunisia", "Tunisia"], ["uganda", "Uganda"], ["zambia", "Zambia"],
+  ["zimbabwe", "Zimbabwe"],
+  // Asia
+  ["afghanistan", "Afghanistan"], ["armenia", "Armenia"], ["azerbaijan", "Azerbaijan"],
+  ["bahrain", "Bahrain"], ["bangladesh", "Bangladesh"], ["bhutan", "Bhutan"],
+  ["brunei", "Brunei"], ["cambodia", "Cambodia"], ["china", "China"],
+  ["georgia", "Georgia"], ["hong kong", "Hong Kong"], ["india", "India"],
+  ["indonesia", "Indonesia"], ["iran", "Iran"], ["iraq", "Iraq"],
+  ["israel", "Israel"], ["japan", "Japan"], ["jordan", "Jordan"],
+  ["kazakhstan", "Kazakhstan"], ["kuwait", "Kuwait"], ["kyrgyzstan", "Kyrgyzstan"],
+  ["laos", "Laos"], ["lebanon", "Lebanon"], ["macau", "Macau"],
+  ["malaysia", "Malaysia"], ["maldives", "Maldives"], ["mongolia", "Mongolia"],
+  ["myanmar", "Myanmar"], ["nepal", "Nepal"], ["north korea", "North Korea"],
+  ["oman", "Oman"], ["pakistan", "Pakistan"], ["palestine", "Palestine"],
+  ["philippines", "Philippines"], ["qatar", "Qatar"], ["saudi arabia", "Saudi Arabia"],
+  ["singapore", "Singapore"], ["south korea", "South Korea"], ["sri lanka", "Sri Lanka"],
+  ["syria", "Syria"], ["taiwan", "Taiwan"], ["tajikistan", "Tajikistan"],
+  ["thailand", "Thailand"], ["timor-leste", "Timor-Leste"], ["turkmenistan", "Turkmenistan"],
+  ["united arab emirates", "United Arab Emirates"], ["uzbekistan", "Uzbekistan"],
+  ["vietnam", "Vietnam"], ["yemen", "Yemen"],
+  // Oceania
+  ["australia", "Australia"], ["fiji", "Fiji"], ["kiribati", "Kiribati"],
+  ["marshall islands", "Marshall Islands"], ["micronesia", "Micronesia"],
+  ["nauru", "Nauru"], ["new zealand", "New Zealand"], ["palau", "Palau"],
+  ["papua new guinea", "Papua New Guinea"], ["samoa", "Samoa"],
+  ["solomon islands", "Solomon Islands"], ["tonga", "Tonga"],
+  ["tuvalu", "Tuvalu"], ["vanuatu", "Vanuatu"],
+]);
+
+// City aliases collapse variants of the same city to one canonical name so
+// the directory doesn't end up with sibling pages for one city under two
+// spellings (`travel_city_<country>_<city>` and `…_<city>_<district>`).
+// Keys are `${countryCanonical}|${cityNormalized}` (diacritics dropped,
+// lowercased, hyphens and underscores as spaces). Values are the canonical city display
+// name. The normalizer in `normalizeCityKey` produces the lookup key.
+//
+// Country overrides: when a (country, city) pair is known to be in a
+// different country (a parser error in the source), force the canonical
+// country — e.g. a city filed under the wrong neighbour.
+//
+// Beyond the few built in below, both maps are hand-curated corrections for one
+// installation's corpus (the monthly wiki dedup sweep is what finds new gaps),
+// so they live in a private data file: agent/local/travel-wiki/place-aliases.json
+//   { "city_aliases": { "<Country>|<city key>": "<City>" },
+//     "country_overrides": { "<Country>|<city key>": "<Country>" } }
+// Absent, only the built-in corrections apply.
+const PLACE_ALIASES = (() => {
+  try {
+    const { localDir } = require("../lib/instance.cjs");
+    return JSON.parse(require("fs").readFileSync(require("path").join(localDir(), "travel-wiki", "place-aliases.json"), "utf8"));
+  } catch {
+    return {};
+  }
+})();
+// Built in: spellings any corpus can hit (the data file adds to these).
+const CITY_ALIASES = new Map([
+  // Same city under two spellings, both seen as separate live pages.
+  ["Colombia|cartagena de indias", "Cartagena"],
+  ["Vietnam|ho chi minh", "Ho Chi Minh City"],
+  ...Object.entries(PLACE_ALIASES.city_aliases || {}),
+]);
+const PLACE_COUNTRY_OVERRIDE = new Map([
+  // A US city filed under Canada, from a trip line that paired a Vancouver leg
+  // with an SF leg.
+  ["Canada|san francisco", "United States"],
+  ...Object.entries(PLACE_ALIASES.country_overrides || {}),
+]);
+
+// Which spelling of the same city name to keep. Both reach us from different
+// sources — a wikilink display, a parsed trip line, an Airbnb address — and they
+// disagree on accents and on the case of connector words.
+//
+// Prefer the accented form: "Medellín", "Jardín", "Puerto Iguazú" are the real
+// names, and stripping accents to satisfy a slug would degrade the travel
+// record. Then prefer lowercase connectors, so "Rio de Janeiro" beats "Rio De
+// Janeiro". Deterministic and total: given the same pair in either order it
+// returns the same answer, which is what stops the flip-flop.
+function preferCityDisplay(a, b) {
+  const A = String(a || ""), B = String(b || "");
+  if (!A) return B;
+  if (!B) return A;
+  if (A === B) return A;
+
+  // Count COMBINING MARKS after decomposition. Comparing raw length against
+  // stripped length returns 0 for both spellings, because a precomposed "í" is
+  // one char and decomposing-then-stripping puts it back to one.
+  const diacritics = (t) => {
+    const d = t.normalize("NFKD");
+    return d.length - d.replace(/[\u0300-\u036f]/g, "").length;
+  };
+  const dA = diacritics(A), dB = diacritics(B);
+  if (dA !== dB) return dA > dB ? A : B;
+
+  const CONNECTORS = new Set(["de", "del", "da", "do", "dos", "das", "la", "las", "los", "el", "of", "the", "y", "van", "der"]);
+  const shouty = (t) => t.split(/\s+/).filter((w, i) => i > 0 && CONNECTORS.has(w.toLowerCase()) && w !== w.toLowerCase()).length;
+  const sA = shouty(A), sB = shouty(B);
+  if (sA !== sB) return sA < sB ? A : B;
+
+  return A <= B ? A : B;   // total order, so the result never depends on argument order
+}
+
+function normalizeCityKey(city) {
+  return String(city || "")
+    .normalize("NFKD")
+    .replace(/[̀-ͯ]/g, "")
+    .toLowerCase()
+    .replace(/[\-_]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+// Apply country override + city alias. Returns a fresh place object; never
+// mutates input. Returns null if the input has no country.
+function canonicalizePlace(place) {
+  if (!place || !place.country) return null;
+  let country = place.country;
+  let city = place.city || null;
+  if (city) {
+    const overrideKey = `${country}|${normalizeCityKey(city)}`;
+    const overrideCountry = PLACE_COUNTRY_OVERRIDE.get(overrideKey);
+    if (overrideCountry) country = overrideCountry;
+    const aliasKey = `${country}|${normalizeCityKey(city)}`;
+    const aliasCity = CITY_ALIASES.get(aliasKey);
+    if (aliasCity) city = aliasCity;
+  }
+  return { city, country };
+}
+
+function slugify(text) {
+  return String(text || "")
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "")
+    .replace(/_{2,}/g, "_");
+}
+
+function unescapeHtml(text) {
+  return String(text || "")
+    .replace(/&amp;/gi, "&")
+    .replace(/&lt;/gi, "<")
+    .replace(/&gt;/gi, ">")
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;/gi, "'")
+    .replace(/&apos;/gi, "'")
+    .replace(/&nbsp;/gi, " ");
+}
+
+function escapeRegExp(text) {
+  return String(text).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function stripWikiLinks(text) {
+  return unescapeHtml(String(text || ""))
+    .replace(/\[\[([^\]|]+)\|([^\]]+)\]\]/g, "$2")
+    .replace(/\[\[([^\]]+)\]\]/g, "$1");
+}
+
+function extractWikilinkParts(text, prefix) {
+  const re = prefix
+    ? new RegExp(`\\[\\[(${prefix}[^\\]|]+?)(?:\\|([^\\]]+?))?\\]\\]`, "g")
+    : /\[\[([^\]|]+?)(?:\|([^\]]+?))?\]\]/g;
+  const out = [];
+  let m;
+  while ((m = re.exec(String(text || "")))) {
+    out.push({
+      target: String(m[1] || "").trim(),
+      display: String(m[2] || m[1] || "").trim(),
+    });
+  }
+  return out;
+}
+
+function tripSummary(raw, meta = {}) {
+  const lines = String(raw || "").split(/\r?\n/);
+  const take = (label) => {
+    const line = lines.find((l) => l.startsWith(`- ${label}: `));
+    return line ? stripWikiLinks(line.slice(label.length + 4).trim()) : "";
+  };
+  return {
+    title: meta.title || take("Title") || "",
+    location: take("Location") || "",
+    dateText: take("TripIt date text") || "",
+    start: take("Start") || "",
+    end: take("End") || "",
+    days: take("Days") || "",
+    sharedWith: take("Shared with") || "",
+    description: meta.description || "",
+  };
+}
+
+function normalizeCountry(raw) {
+  const v = String(raw || "").trim();
+  if (!v) return "";
+  if (/\d/.test(v) || /[()]/.test(v)) return "";
+  const lower = v.toLowerCase();
+  // Only return canonical hits. Falling back to the raw input lets junk
+  // like "Costa Rica family vacation" survive parsePlace's checks (since
+  // the city/country plausibility tests don't reject "vacation"), creating
+  // phantom country entries in the directory.
+  return COUNTRY_ALIASES.get(lower) || CANONICAL_COUNTRIES.get(lower) || null;
+}
+
+// True iff the input matches a known ISO-3166 country (after alias
+// canonicalization). Used to gate plain-text country detection in trip
+// bodies + titles so we don't accept arbitrary capitalized words.
+function isKnownCountry(name) {
+  if (!name) return false;
+  const lower = String(name).trim().toLowerCase();
+  return COUNTRY_ALIASES.has(lower) || CANONICAL_COUNTRIES.has(lower);
+}
+
+function looksLikeDateish(text) {
+  const v = String(text || "").trim();
+  if (!v) return true;
+  if (/\bday\b/i.test(v)) return true;
+  if (/^\d{4}(\s*\(.*\))?$/.test(v)) return true;
+  if (/^(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\s+\d{1,2}$/i.test(v)) return true;
+  if (/^\d{1,2}\s+(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*$/i.test(v)) return true;
+  return false;
+}
+
+function parsePlace(location) {
+  let cleaned = stripWikiLinks(location)
+    .replace(/^(Title|Location|Primary location|Display name)\s*:\s*/i, "")
+    .trim();
+  let parts = cleaned
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+  if (!parts.length) return null;
+
+  while (parts.length > 1 && looksLikeDateish(parts[parts.length - 1])) {
+    parts = parts.slice(0, -1);
+  }
+  if (!parts.length) return null;
+
+  const last = parts[parts.length - 1];
+  if (looksLikeDateish(last)) return null;
+  if (/\d/.test(last) || /[()]/.test(last)) {
+    if (!US_STATE_CODES.has(last.toUpperCase())) return null;
+  }
+  let country = normalizeCountry(last);
+  let city = parts[0];
+
+  if (US_STATE_CODES.has(last.toUpperCase())) {
+    country = "United States";
+    city = parts[0];
+  }
+
+  if (!country) return null;
+  // Reject parses where city or country fragments contain digits, month
+  // abbreviations, time labels ("am/pm"), postal-code-like tokens, or
+  // structural prose ("Title:", "Display name:", "This is the canonical
+  // page for"). These produce garbage pages like
+  // travel_city_brazil_feb_10_22_rio_de_janeiro that pollute the directory
+  // and create dangling wikilinks. Caller should treat null as "skip this
+  // line — not a real place".
+  if (!isPlausibleCityName(city) || !isPlausiblePlace(country)) return null;
+  return canonicalizePlace({ city, country });
+}
+
+function isPlausiblePlace(text) {
+  const v = String(text || "").trim();
+  if (!v) return false;
+  // Token-level rejection: any digit, month abbrev, time-of-day, or
+  // structural-prose token disqualifies the parse. Strip surrounding
+  // punctuation off each token so "Title:" is checked as "title".
+  const tokens = v
+    .toLowerCase()
+    .split(/[\s,_\-]+/)
+    .map((t) => t.replace(/^[^a-z0-9]+|[^a-z0-9]+$/g, ""))
+    .filter(Boolean);
+  const months = new Set([
+    "jan", "feb", "mar", "apr", "may", "jun",
+    "jul", "aug", "sep", "oct", "nov", "dec",
+    "january", "february", "march", "april", "june",
+    "july", "august", "september", "october", "november", "december",
+  ]);
+  const proseStop = new Set([
+    "title", "location", "display", "name", "this", "canonical", "page",
+    "for", "the", "primary", "summary", "description", "am", "pm",
+    "unknown", "none", "tbd", "n/a", "your", "trip",
+    // Trip-title words. A location string that describes an OCCASION is a trip
+    // name that leaked into the location field, not a place — the live corpus
+    // had `travel_city_thailand_first_family_vacation_to` from exactly this.
+    // Deliberately only occasion words, never words that appear in real place
+    // names (no "first", no "to" — "Trinidad and Tobago" must survive).
+    "vacation", "holiday", "getaway", "honeymoon", "anniversary", "birthday",
+  ]);
+  for (const tok of tokens) {
+    if (/^\d/.test(tok)) return false;
+    if (months.has(tok)) return false;
+    if (proseStop.has(tok)) return false;
+    if (/^\d{4,}$/.test(tok)) return false;
+    if (/^\d{2}[:.\d]/.test(tok)) return false;
+    // Letter+digit mixes are postal codes, not place names. The original guard
+    // only rejected tokens STARTING with a digit, so an Argentine postcode
+    // ("X5009DYJ") sailed through and became travel_city_argentina_x5009dyj.
+    // No real city name mixes letters and digits within one token.
+    if (/[a-z]/.test(tok) && /\d/.test(tok)) return false;
+  }
+  return true;
+}
+
+// Subdivisions (states/provinces) are not cities. "Vancouver, BC" parses to
+// city="Vancouver" correctly, but a bare "BC, Canada" or "B.C., Mexico" yields
+// city="BC" — which is how travel_city_canada_bc and travel_city_mexico_b_c
+// got created. Checked only on the CITY side; a subdivision is a perfectly good
+// thing to see, just never a city name.
+//
+// NOTE ON THE TWO PLAUSIBILITY CHECKS. `plausibleCityCandidate` (below) already
+// rejects postal codes and bare region codes — but it guards only the THIRD
+// pass of collectPlacesFromText, while the main `parsePlace` path is guarded by
+// the weaker `isPlausiblePlace`. That asymmetry is why the postcode and the
+// province codes reached the corpus at all. Rather than merge two checks with
+// genuinely different jobs (one parses a "City, Country" pair, the other vets a
+// free-text fragment), the weaker one is brought up to the same bar for the
+// specific classes that leaked. CA_PROV_CODES is reused, not re-declared — it
+// is defined later at module scope, which is fine because this only runs at
+// call time, long after evaluation.
+// The single city-side gate. Every path that produces a CITY name routes
+// through this; country-side callers keep the plain isPlausiblePlace, because a
+// country is never a two-letter subdivision code.
+//
+// Applying it in only ONE place is why travel_city_canada_bc outlived the first
+// version of this fix: parsePlace was guarded, but placeFromCityLink reseeds the
+// directory from wikilinks already in trip bodies, so the bad page kept
+// recreating itself from its own dangling link. A guard that a bad page can
+// route around is not a guard.
+function isPlausibleCityName(city) {
+  return isPlausiblePlace(city) && !isSubdivisionCode(city);
+}
+
+function isSubdivisionCode(city) {
+  const compact = String(city || "").replace(/[^a-z]/gi, "").toUpperCase();
+  if (compact.length !== 2) return false;
+  return US_STATE_CODES.has(compact) || CA_PROV_CODES.has(compact);
+}
+
+function parsePlaceFromSummaryText(text) {
+  const raw = String(text || "").trim();
+  if (!raw) return null;
+  const inIdx = raw.lastIndexOf(" in ");
+  if (inIdx !== -1) {
+    let after = raw.slice(inIdx + 4).trim();
+    while (/\s*\([^()]*\)\s*$/.test(after)) {
+      after = after.replace(/\s*\([^()]*\)\s*$/, "").trim();
+    }
+    const place = parsePlace(after);
+    if (place) return place;
+  }
+  let cleaned = raw.trim();
+  while (/\s*\([^()]*\)\s*$/.test(cleaned)) {
+    cleaned = cleaned.replace(/\s*\([^()]*\)\s*$/, "").trim();
+  }
+  return parsePlace(cleaned);
+}
+
+function stripLeadingLabel(text) {
+  return String(text || "")
+    .replace(/^[-•]\s*/, "")
+    .replace(/^(Stay|Airbnb|Hotel|Lodging|Car|Flight|Train|Localiza|Hertz|Avis|Europcar|National Car Rental)\s*[:\-]?\s*/i, "")
+    .trim();
+}
+
+function extractCityFromPrefix(prefix) {
+  const cleaned = stripLeadingLabel(prefix)
+    .replace(/\b(check in|check out|drop off|pick up)\b.*$/i, "")
+    .trim();
+  if (!cleaned) return "";
+  const parts = cleaned
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+  while (parts.length) {
+    const candidate = parts[parts.length - 1];
+    if (/^\d+([.\-]\d+)?$/.test(candidate)) {
+      parts.pop();
+      continue;
+    }
+    if (/^(suite|room|apt|apartment|unit)\b/i.test(candidate)) {
+      parts.pop();
+      continue;
+    }
+    return candidate;
+  }
+  return "";
+}
+
+let countrySlugLookup = null;
+function buildCountrySlugLookup() {
+  if (countrySlugLookup) return countrySlugLookup;
+  const out = new Map();
+  for (const country of COUNTRY_ALIASES.values()) out.set(slugify(country), country);
+  for (const country of CANONICAL_COUNTRIES.values()) out.set(slugify(country), country);
+  for (const row of ws.listPages({ type: "reference" })) {
+    if (!row.id.startsWith("travel_country_")) continue;
+    const page = ws.getPage(row.id);
+    const title = String(page?.title || row.title || "").trim();
+    if (title && isPlausiblePlace(title)) out.set(slugify(title), title);
+  }
+  countrySlugLookup = [...out.entries()].sort((a, b) => b[0].length - a[0].length);
+  return countrySlugLookup;
+}
+
+function placeFromCityLink(target, display) {
+  const rest = String(target || "").replace(/^travel_city_/, "");
+  if (!rest || rest === target) return null;
+  for (const [countrySlug, country] of buildCountrySlugLookup()) {
+    if (!rest.startsWith(`${countrySlug}_`)) continue;
+    const city = stripWikiLinks(display || "")
+      .split(",")[0]
+      .trim();
+    if (!city || !isPlausibleCityName(city)) return null;
+    return canonicalizePlace({ city, country });
+  }
+  return null;
+}
+
+function collectPlacesFromText(text) {
+  const places = [];
+  const seen = new Set();
+  const raw = String(text || "");
+  const body = raw.split("\n## Navigation\n")[0];
+
+  for (const cityLink of extractWikilinkParts(body, "travel_city_")) {
+    const place = placeFromCityLink(cityLink.target, cityLink.display);
+    if (!place || !place.city || !place.country) continue;
+    const key = `${place.country}|${place.city}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    places.push(place);
+  }
+
+  const lines = body.split(/\r?\n/);
+  for (const line of lines) {
+    const countryLink = line.match(/\[\[travel_country_[^\]|]+\|([^\]]+)\]\]/);
+    const plainCountry = countryLink ? countryLink[1] : "";
+    const country = normalizeCountry(plainCountry);
+    if (!country) continue;
+
+    if (!isPlausiblePlace(country)) continue;
+    const beforeCountry = countryLink ? line.slice(0, countryLink.index) : line;
+    const cityLinksInLine = extractWikilinkParts(beforeCountry, "travel_city_");
+    if (cityLinksInLine.length) {
+      for (const cityLink of cityLinksInLine) {
+        const display = cityLink.display || cityLink.target;
+        // Trust-but-verify: the line might already contain a stale bad
+        // wikilink like `[[travel_city_canada_location|Location:]]` from a
+        // prior run. Reject any "city" whose display text has prose tokens
+        // / dates / digits — same guard as parsePlace.
+        if (!isPlausibleCityName(display)) continue;
+        const canon = canonicalizePlace({ city: display, country });
+        if (!canon) continue;
+        const key = `${canon.country}|${canon.city}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        places.push(canon);
+      }
+      continue;
+    }
+
+    const fragment = extractCityFromPrefix(beforeCountry);
+    if (!fragment) continue;
+    if (!isPlausibleCityName(fragment)) continue;
+    const canon = canonicalizePlace({ city: fragment, country });
+    if (!canon) continue;
+    const key = `${canon.country}|${canon.city}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    places.push(canon);
+  }
+
+  // Third pass — plain-text country mentions in address-shaped lines.
+  // Without this, multi-country trips drop all but the primary country
+  // because the secondary stop never gets a [[travel_country_*]] wikilink
+  // (chicken-and-egg: page doesn't exist yet, so nothing links to it).
+  // Match `..., COUNTRY` at end of line where COUNTRY is in the canonical
+  // ISO list. City extraction is deliberately conservative — only use
+  // parts[length-2] (the segment immediately before the country) and
+  // reject anything that looks like an address fragment, postal code, or
+  // hotel name. Better to add the country with no city than to pollute
+  // the directory with junk; cities get filled in later when wikilinks
+  // form.
+  for (const rawLine of lines) {
+    if (!rawLine.includes(",")) continue;
+    if (/\[\[travel_country_/.test(rawLine)) continue; // already handled above
+    const stripped = stripWikiLinks(rawLine).trim()
+      .replace(/^[-–—•]\s*/, "") // bullet markers
+      .replace(/^(Stay|Airbnb|Hotel|Lodging|Stop|Activity|Address|Disembark)\s*[:\-]?\s*/i, "");
+    if (!stripped) continue;
+    const parts = stripped.split(",").map((s) => s.trim()).filter(Boolean);
+    if (parts.length < 2) continue;
+    const lastRaw = parts[parts.length - 1];
+    // Strip a trailing parenthetical like "1553 (zone B)" → "1553".
+    const last = lastRaw.replace(/\s*\([^()]*\)\s*$/, "").trim();
+    if (!last || !isKnownCountry(last)) continue;
+    const country = normalizeCountry(last);
+    if (!country || !isPlausiblePlace(country)) continue;
+    // Walk backward from the country looking for a clean city — skip
+    // postal/state segments. Stop at the first plausible candidate; if
+    // none found, add the country with no city.
+    let city = null;
+    for (let i = parts.length - 2; i >= 0; i--) {
+      const candidate = parts[i].replace(/\s*\([^()]*\)\s*$/, "").trim();
+      if (!candidate) continue;
+      if (US_STATE_CODES.has(candidate.toUpperCase())) continue;
+      if (CA_PROV_CODES.has(candidate.toUpperCase())) continue;
+      if (/^\d/.test(candidate)) continue; // postal codes, street numbers
+      if (/^[A-Z][0-9]|^[0-9][A-Z]/.test(candidate)) continue; // alphanum postal (X5009DYJ)
+      const cleaned = plausibleCityCandidate(candidate);
+      if (!cleaned) continue;
+      city = cleaned;
+      break;
+    }
+    const canon = canonicalizePlace({ city, country });
+    if (!canon) continue;
+    const key = `${canon.country}|${canon.city || ""}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    places.push(canon);
+  }
+
+  return places;
+}
+
+// Canadian-province two-letter codes — same role as US_STATE_CODES,
+// avoids "ON"/"BC" being treated as a city.
+const CA_PROV_CODES = new Set([
+  "AB", "BC", "MB", "NB", "NL", "NS", "NT", "NU", "ON", "PE", "QC", "SK", "YT",
+]);
+
+// Strict city-name plausibility check used by the third pass in
+// collectPlacesFromText. Rejects address fragments (street suffixes,
+// hotel/homestay names), URLs, all-caps cruise destinations,
+// alphanumeric postal codes, and overly long strings. Returns the
+// trimmed city name, or null. Does NOT mutate input.
+function plausibleCityCandidate(text) {
+  const trimmed = String(text || "").trim();
+  if (!trimmed) return null;
+  if (trimmed.length > 30) return null;
+  if (/https?:\/\/|www\./i.test(trimmed)) return null;
+  // Strip leading punctuation / bullet artifacts.
+  let cleaned = trimmed
+    .replace(/^[-–—•·\s]+/, "")
+    .replace(/^["'`]+|["'`]+$/g, "")
+    .trim();
+  if (!cleaned) return null;
+  // Strip trailing " - XX" / " – XX" where XX is a 2-letter region code
+  // (e.g. Brazilian state: "Recife - PE", "Olinda - PE"). We don't want
+  // both "Recife" and "Recife - PE" to land as separate cities.
+  cleaned = cleaned.replace(/\s+[-–—]\s+[A-Z]{2,3}$/u, "").trim();
+  if (!cleaned) return null;
+  if (/^\d/.test(cleaned)) return null;
+  const tokens = cleaned.split(/\s+/);
+  if (tokens.length > 3) return null;
+  // All-caps multi-token (cruise destination format like
+  // "BAHAMAS BIMINI" / "GRENADA ST GEORGES GRENADA"): reject — too
+  // ambiguous to use as a city name.
+  if (tokens.length >= 2 && cleaned === cleaned.toUpperCase()) return null;
+  // Address-suffix / hotel-name tokens never appear in real city names.
+  // Note: we don't include "casa" (Casablanca is a real city) or "san"
+  // (San Francisco etc.) — those are too ambiguous.
+  const addressStops = new Set([
+    "st", "street", "ave", "avenue", "blvd", "boulevard",
+    "rd", "road", "ln", "lane", "way", "drive", "dr",
+    "ct", "court", "plaza", "square", "highway", "hwy",
+    "homestay", "hotel", "hostel", "guesthouse", "guest",
+    "apartment", "apartments", "suite", "suites", "room",
+    "apt", "unit", "floor", "fl", "resort", "lodge", "inn",
+    "marg", "rua", "via", "avenida", "calle",
+    "aeroporto", "airport", "international", "intl",
+    "maison", "palazzo", "chateau", "château",
+  ]);
+  for (const tok of tokens) {
+    const norm = tok.toLowerCase().replace(/[^a-z]/g, "");
+    if (addressStops.has(norm)) return null;
+  }
+  // Reuse the existing prose-token rejection (months, "title", etc.).
+  if (!isPlausibleCityName(cleaned)) return null;
+  return cleaned;
+}
+
+// Match a leading country-name prefix in a text fragment. Used on title
+// segments like "Peru Summer '25" so the country is harvested even when
+// the rest is junk (year, punctuation) that parsePlace correctly rejects.
+// Returns the canonical country name, or null.
+function extractLeadingCountry(fragment) {
+  const text = String(fragment || "").trim();
+  if (!text) return null;
+  const tokens = text.split(/\s+/);
+  // Try longest prefix first (up to 4 tokens — "Bosnia and Herzegovina",
+  // "Saint Vincent and the Grenadines" sit at 4).
+  for (let n = Math.min(tokens.length, 5); n >= 1; n--) {
+    const candidate = tokens.slice(0, n).join(" ").replace(/[^\p{L}\p{M} '-]+/gu, "").trim();
+    if (!candidate) continue;
+    if (!isKnownCountry(candidate)) continue;
+    return normalizeCountry(candidate);
+  }
+  return null;
+}
+
+function isTripPageId(id) {
+  return /^travel_trip_\d{4}/.test(id);
+}
+
+function isAirbnbPageId(id) {
+  return /^travel_airbnb_/.test(id);
+}
+
+function cityPageId(country, city) {
+  return `travel_city_${slugify(country)}_${slugify(city)}`;
+}
+
+function countryPageId(country) {
+  return `travel_country_${slugify(country)}`;
+}
+
+function buildCityLookup() {
+  const lookup = new Map();
+  for (const row of ws.listPages({ type: "reference" })) {
+    if (!row.id.startsWith("travel_city_")) continue;
+    const page = ws.getPage(row.id);
+    const title = String(page?.title || row.title || "").trim();
+    if (!title) continue;
+    const city = title.split(",")[0].trim();
+    if (!city) continue;
+    const key = slugify(city);
+    const current = lookup.get(key) || [];
+    current.push({
+      city,
+      country: title.includes(",") ? title.split(",").slice(1).join(",").trim() : "",
+      pageId: row.id,
+    });
+    lookup.set(key, current);
+  }
+  return lookup;
+}
+
+function buildCountryLookup() {
+  const countries = new Set([
+    ...COUNTRY_ALIASES.values(),
+    ...CANONICAL_COUNTRIES.values(),
+  ]);
+  for (const row of ws.listPages({ type: "reference" })) {
+    if (!row.id.startsWith("travel_country_")) continue;
+    const page = ws.getPage(row.id);
+    const title = String(page?.title || "").trim();
+    if (title && isPlausiblePlace(title)) countries.add(title);
+  }
+  return countries;
+}
+
+function extractPlacesFromTitle(title, cityLookup, countryLookup) {
+  const raw = String(title || "").trim();
+  if (!raw) return [];
+  const parts = raw
+    .split(/\s*(?:&| and )\s*/i)
+    .map((part) => part.trim())
+    .filter(Boolean);
+  const places = [];
+  const seen = new Set();
+
+  const add = (place) => {
+    const canon = canonicalizePlace(place);
+    if (!canon || !canon.country) return;
+    const key = `${canon.country}|${canon.city || ""}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    places.push(canon);
+  };
+
+  for (let part of parts) {
+    part = part.replace(/,\s*(?:[A-Z][a-z]{2,}\s+\d{4}|\d{4}\s*\(?\d*\)?|[A-Z][a-z]{2,}\s+\d{1,2}\s*,?\s*\d{4}.*)$/u, "").trim();
+    if (!part) continue;
+
+    const cityMatches = cityLookup.get(slugify(part)) || [];
+    if (cityMatches.length === 1) {
+      add(cityMatches[0]);
+      continue;
+    }
+
+    const country = normalizeCountry(part);
+    if (country && countryLookup.has(country)) {
+      add({ country, city: null });
+      continue;
+    }
+
+    // parsePlace is permissive — it accepts any non-digit single token as
+    // a "country", which is fine for the body-line case (last comma
+    // segment in an address-shaped line) but wrong for free-form trip
+    // titles where parts are arbitrary words ("Cox", "Roz", "Cashew").
+    // Gate on isKnownCountry so only ISO-3166 hits land in the directory.
+    const place = parsePlace(part) || parsePlaceFromSummaryText(part);
+    if (place && isKnownCountry(place.country)) {
+      add(place);
+      continue;
+    }
+
+    // Last resort — try matching just the leading word(s) against the
+    // canonical country list. Catches "Peru Summer '25" → Peru.
+    const leadingCountry = extractLeadingCountry(part);
+    if (leadingCountry) add({ country: leadingCountry, city: null });
+  }
+
+  return places;
+}
+
+function prettyTripLabel(summary) {
+  return `${summary.title || "Trip"} — ${summary.dateText || ""}`.trim();
+}
+
+function tripOrderKey(trip) {
+  const id = String(trip?.id || "");
+  const m = id.match(/^travel_trip_(\d{4}-\d{2}-\d{2})/);
+  if (m) return m[1];
+  return String(trip?.summary?.start || trip?.summary?.dateText || trip?.summary?.title || "");
+}
+
+function insertNavLinks(raw, links) {
+  const body = String(raw || "");
+  if (!links.length) return body;
+  const navIdx = body.indexOf("## Navigation\n");
+  if (navIdx === -1) return body;
+  const before = body.slice(0, navIdx + "## Navigation\n".length);
+  const after = body.slice(navIdx + "## Navigation\n".length);
+  let insert = "";
+  for (const line of links) {
+    if (!after.includes(line) && !before.includes(line)) insert += `${line}\n`;
+  }
+  if (!insert) return body;
+  return `${before}${insert}${after}`;
+}
+
+function rewriteNavPlaceLines(raw, placeLines) {
+  const body = String(raw || "");
+  const navIdx = body.indexOf("## Navigation\n");
+  if (navIdx === -1) return body;
+  const before = body.slice(0, navIdx + "## Navigation\n".length);
+  const after = body.slice(navIdx + "## Navigation\n".length);
+  const filtered = after.split(/\r?\n/).filter((line) => !/^- (Country|City): /.test(line));
+  const insert = [...placeLines, ...filtered].join("\n");
+  return `${before}${insert}`;
+}
+
+function extractFirstTripIdFromAirbnb(raw) {
+  const lines = String(raw || "").split(/\r?\n/);
+  for (const line of lines) {
+    const m = line.match(/^###\s+\[\[([^\]|]+)\|([^\]]+)\]\]/);
+    if (m) return m[1];
+  }
+  return null;
+}
+
+function collectTrips() {
+  return ws
+    .listPages({ type: "reference" })
+    .filter((r) => isTripPageId(r.id))
+    .map((r) => {
+      const row = ws.getPage(r.id);
+      const meta = (() => {
+        try {
+          return JSON.parse(row.frontmatter_json || "{}") || {};
+        } catch {
+          return {};
+        }
+      })();
+      const summary = tripSummary(row.body_md || row.raw_md || "", meta);
+      const bodyPlaces = collectPlacesFromText(row.body_md || row.raw_md || "");
+      const summaryPlace =
+        parsePlace(summary.location) ||
+        parsePlaceFromSummaryText(summary.description) ||
+        parsePlace(summary.title) ||
+        parsePlace(summary.location || summary.description || "");
+      const places = [];
+      const seen = new Set();
+      const addPlace = (place) => {
+        if (!place || !place.city || !place.country) return;
+        const key = `${place.country}|${place.city}`;
+        if (seen.has(key)) return;
+        seen.add(key);
+        places.push(place);
+      };
+      addPlace(summaryPlace);
+      for (const place of bodyPlaces) addPlace(place);
+      return {
+        id: r.id,
+        row,
+        summary,
+        place: places[0] || null,
+        places,
+      };
+    })
+    .filter((trip) => trip.places.length > 0);
+}
+
+function collectTripPages() {
+  const cityLookup = buildCityLookup();
+  const countryLookup = buildCountryLookup();
+  return ws
+    .listPages({ type: "reference" })
+    .filter((r) => isTripPageId(r.id))
+    .map((r) => {
+      const row = ws.getPage(r.id);
+      const meta = (() => {
+        try {
+          return JSON.parse(row.frontmatter_json || "{}") || {};
+        } catch {
+          return {};
+        }
+      })();
+      const summary = tripSummary(row.body_md || row.raw_md || "", meta);
+      const bodyPlaces = collectPlacesFromText(row.body_md || row.raw_md || "");
+      const summaryPlace =
+        parsePlace(summary.location) ||
+        parsePlaceFromSummaryText(summary.description) ||
+        parsePlace(summary.title) ||
+        parsePlace(summary.location || summary.description || "");
+      // Always harvest from the title — a multi-country title like
+      // "Brazil & Peru Summer '25" was previously dropped because the
+      // primary location parsed cleanly to "Rio de Janeiro, Brazil" and
+      // this fallback never ran. Dedup via the seen-set in addPlace.
+      const inferredPlaces = extractPlacesFromTitle(
+        summary.title,
+        cityLookup,
+        countryLookup,
+      );
+      const places = [];
+      const seen = new Set();
+      const addPlace = (place) => {
+        if (!place || !place.country) return;
+        const key = `${place.country}|${place.city || ""}`;
+        if (seen.has(key)) return;
+        seen.add(key);
+        places.push(place);
+      };
+      addPlace(summaryPlace);
+      for (const place of bodyPlaces) addPlace(place);
+      for (const place of inferredPlaces) addPlace(place);
+      return {
+        id: r.id,
+        row,
+        summary,
+        place: places.find((p) => p.city) || places[0] || null,
+        places,
+      };
+    });
+}
+
+function collectAirbnbs(tripById) {
+  return ws
+    .listPages({ type: "reference" })
+    .filter((r) => isAirbnbPageId(r.id))
+    .map((r) => {
+      const row = ws.getPage(r.id);
+      const firstTripId = extractFirstTripIdFromAirbnb(row.body_md || row.raw_md || "");
+      const trip = firstTripId ? tripById.get(firstTripId) || null : null;
+      const place = trip?.place || null;
+      const stayInstances = String(row.body_md || row.raw_md || "").match(/^\-\s+Trip dates:/gm)?.length || 0;
+      return {
+        id: r.id,
+        row,
+        title: row.title || r.id,
+        firstTripId,
+        place,
+        stayInstances,
+      };
+    })
+    .filter((airbnb) => airbnb.place);
+}
+
+function buildDirectory(trips, airbnbs) {
+  const countries = new Map();
+  const cities = new Map();
+
+  const ensureCountry = (country) => {
+    if (!countries.has(country)) {
+      countries.set(country, {
+        country,
+        pageId: countryPageId(country),
+        cities: new Map(),
+        trips: [],
+        tripIds: new Set(),
+        airbnbs: [],
+        airbnbIds: new Set(),
+      });
+    }
+    return countries.get(country);
+  };
+
+  const ensureCity = (country, city) => {
+    // Key on the NORMALIZED name, not the raw string. "Medellín" and "Medellin"
+    // are the same city and slug to the same pageId, but keying on the raw text
+    // made them two records that both rendered to that one page — so whichever
+    // happened to render last won, and the winner changed between runs. That is
+    // the churn: 16 pages rewriting on every single run (230 city records for
+    // 214 pages), each rewrite a new revision and a re-embed of an unchanged
+    // page. Collapsing the records also picks a stable display name.
+    const key = `${country}|${normalizeCityKey(city)}`;
+    const existing = cities.get(key);
+    if (existing) {
+      existing.city = preferCityDisplay(existing.city, city);
+      return existing;
+    }
+    if (!cities.has(key)) {
+      cities.set(key, {
+        country,
+        city,
+        key,
+        pageId: cityPageId(country, city),
+        trips: [],
+        tripIds: new Set(),
+        airbnbs: [],
+        airbnbIds: new Set(),
+      });
+    }
+    return cities.get(key);
+  };
+
+  for (const trip of trips) {
+    for (const place of trip.places) {
+      const { country, city } = place;
+      const c = ensureCountry(country);
+      if (!c.tripIds.has(trip.id)) {
+        c.tripIds.add(trip.id);
+        c.trips.push(trip);
+      }
+      if (city) {
+        const ci = ensureCity(country, city);
+        c.cities.set(ci.key, ci);
+        if (!ci.tripIds.has(trip.id)) {
+          ci.tripIds.add(trip.id);
+          ci.trips.push(trip);
+        }
+      }
+    }
+  }
+
+  for (const airbnb of airbnbs) {
+    const { country, city } = airbnb.place;
+    const c = ensureCountry(country);
+    const ci = ensureCity(country, city);
+    if (!c.airbnbIds.has(airbnb.id)) {
+      c.airbnbIds.add(airbnb.id);
+      c.airbnbs.push(airbnb);
+    }
+    c.cities.set(ci.key, ci);
+    if (!ci.airbnbIds.has(airbnb.id)) {
+      ci.airbnbIds.add(airbnb.id);
+      ci.airbnbs.push(airbnb);
+    }
+  }
+
+  return {
+    countries: [...countries.values()].sort((a, b) => a.country.localeCompare(b.country)),
+    cities: [...cities.values()].sort((a, b) => {
+      if (a.country !== b.country) return a.country.localeCompare(b.country);
+      return a.city.localeCompare(b.city);
+    }),
+  };
+}
+
+function renderTopPage(directory) {
+  const lines = [];
+  lines.push("---");
+  lines.push('name: "Travel Places"');
+  lines.push('description: "Country and city directory for all travel history."');
+  lines.push("type: reference");
+  lines.push("status: active");
+  lines.push("scope: [travel, directory, geography, trip_history]");
+  lines.push("confidence: high");
+  lines.push("last_verified_at: 2026-05-03");
+  lines.push("related: [travel.md, travel_trip_history_log.md, travel_trip_history_audit.md]");
+  lines.push("---");
+  lines.push("This is the directory of every country and city in the travel record.");
+  lines.push("Use [[travel]] for the travel hub and [[travel_trip_history_log]] for the trip index.");
+  lines.push("");
+  lines.push("## Countries");
+  for (const country of directory.countries) {
+    lines.push(`- [[${country.pageId}|${country.country}]] — ${country.cities.size} cities, ${country.tripIds.size} trips, ${country.airbnbIds.size} Airbnb properties`);
+  }
+  return lines.join("\n");
+}
+
+function renderCountryPage(country, cityRecords) {
+  const lines = [];
+  lines.push("---");
+  lines.push(`name: "${country.country}"`);
+  lines.push(`description: "Travel directory for ${country.country}."`);
+  lines.push("type: reference");
+  lines.push("status: active");
+  lines.push("scope: [travel, country, directory, trip_history]");
+  lines.push("confidence: high");
+  lines.push("last_verified_at: 2026-05-03");
+  lines.push("related: [travel.md, travel_places.md, travel_trip_history_log.md]");
+  lines.push("---");
+  lines.push(`This is the country directory page for [[${country.pageId}|${country.country}]].`);
+  lines.push("Use [[travel_places]] for the full country list and [[travel]] for the travel hub.");
+  lines.push("");
+  lines.push("## Summary");
+  lines.push(`- Country: ${country.country}`);
+  lines.push(`- Cities: ${cityRecords.length}`);
+  lines.push(`- Trips: ${country.tripIds.size}`);
+  lines.push(`- Airbnb properties: ${country.airbnbIds.size}`);
+  lines.push(`- Airbnb stay instances: ${country.airbnbs.reduce((n, a) => n + a.stayInstances, 0)}`);
+  lines.push("");
+  lines.push("## Trips");
+  for (const trip of country.trips
+    .slice()
+    .sort((a, b) => tripOrderKey(b).localeCompare(tripOrderKey(a)))) {
+    const label = prettyTripLabel(trip.summary);
+    const placeLabel = trip.place?.city
+      ? `${trip.place.city}, ${trip.place.country}`
+      : trip.place?.country || "Unknown";
+    lines.push(`- [[${trip.id}|${label}]] — ${placeLabel}`);
+  }
+  lines.push("");
+  lines.push("## Cities");
+  if (cityRecords.length) {
+    for (const city of cityRecords) {
+      lines.push(`- [[${city.pageId}|${city.city}, ${country.country}]] — ${city.tripIds.size} trips, ${city.airbnbIds.size} Airbnb properties`);
+    }
+  } else {
+    lines.push("- No city-level detail recovered from TripIt.");
+  }
+  lines.push("");
+  lines.push("## Navigation");
+  lines.push("- Travel places: [[travel_places]]");
+  lines.push("- Travel hub: [[travel]]");
+  return lines.join("\n");
+}
+
+function renderCityPage(city, country) {
+  const lines = [];
+  lines.push("---");
+  lines.push(`name: "${city.city}, ${country.country}"`);
+  lines.push(`description: "Travel directory for ${city.city}, ${country.country}."`);
+  lines.push("type: reference");
+  lines.push("status: active");
+  lines.push("scope: [travel, city, directory, trip_history]");
+  lines.push("confidence: high");
+  lines.push("last_verified_at: 2026-05-03");
+  lines.push("related: [travel.md, travel_places.md, travel_trip_history_log.md]");
+  lines.push("---");
+  lines.push(`This is the city directory page for [[${city.pageId}|${city.city}, ${country.country}]].`);
+  lines.push("Use [[travel_places]] for the full country list and [[travel]] for the travel hub.");
+  lines.push("");
+  lines.push("## Summary");
+  lines.push(`- City: ${city.city}`);
+  lines.push(`- Country: ${country.country}`);
+  lines.push(`- Trips: ${city.tripIds.size}`);
+  lines.push(`- Airbnb properties: ${city.airbnbIds.size}`);
+  lines.push(`- Airbnb stay instances: ${city.airbnbs.reduce((n, a) => n + a.stayInstances, 0)}`);
+  lines.push("");
+  lines.push("## Trips");
+  for (const trip of city.trips
+    .slice()
+    .sort((a, b) => tripOrderKey(b).localeCompare(tripOrderKey(a)))) {
+    const label = prettyTripLabel(trip.summary);
+    lines.push(`- [[${trip.id}|${label}]] — ${trip.summary.location || ""}`);
+  }
+  lines.push("");
+  lines.push("## Airbnb");
+  for (const airbnb of city.airbnbs.sort((a, b) => String(a.title).localeCompare(String(b.title)))) {
+    const dates = [];
+    const tripLines = String(airbnb.row.body_md || airbnb.row.raw_md || "").split(/\r?\n/);
+    let currentTrip = null;
+    let currentDates = [];
+    for (const line of tripLines) {
+      const hd = line.match(/^###\s+\[\[([^\]|]+)\|([^\]]+)\]\]/);
+      if (hd) {
+        if (currentTrip && currentDates.length) {
+          dates.push(`${currentTrip} — ${currentDates.join("; ")}`);
+        }
+        currentTrip = hd[2];
+        currentDates = [];
+        continue;
+      }
+      const d = line.match(/^\-\s+Trip dates:\s*(.+)$/);
+      if (d) currentDates.push(d[1].trim());
+    }
+    if (currentTrip && currentDates.length) {
+      dates.push(`${currentTrip} — ${currentDates.join("; ")}`);
+    }
+    const suffix = dates.length ? ` — ${dates.join(" · ")}` : "";
+    lines.push(`- [[${airbnb.id}|${airbnb.title}]]${suffix}`);
+  }
+  lines.push("");
+  lines.push("## Navigation");
+  lines.push(`- Country: [[${country.pageId}|${country.country}]]`);
+  lines.push("- Travel places: [[travel_places]]");
+  lines.push("- Travel hub: [[travel]]");
+  return lines.join("\n");
+}
+
+function updateTravelPage() {
+  const page = ws.getPage("travel");
+  if (!page) return false;
+  // The marker check has to match what we INSERT below (it didn't pre-fix,
+  // which is how the pinned travel page accumulated 5 duplicate lines).
+  if (page.body_md.includes("[[travel_places]]")) return false;
+  const raw = page.raw_md.replace(
+    // The hub's opening line ("This is the pinned travel surface for …"),
+    // whoever it names: the directory pointer goes right under it.
+    /^This is the pinned travel surface\b.*$/m,
+    "$&\n\nUse [[travel_places]] for the country/city directory.",
+  );
+  if (raw === page.raw_md) return false;
+  if (dryRun) return true;
+  ws.savePage("travel", raw, { editedBy: "travel-place-directory-sync" });
+  return true;
+}
+
+function updateTripPages(trips) {
+  let changed = 0;
+  for (const trip of trips) {
+    const placeLines = [];
+    const seen = new Set();
+    for (const place of trip.places) {
+      if (!place || !place.country) continue;
+      const countryLine = `- Country: [[${countryPageId(place.country)}|${place.country}]]`;
+      if (!seen.has(countryLine)) {
+        seen.add(countryLine);
+        placeLines.push(countryLine);
+      }
+      if (place.city) {
+        const cityLine = `- City: [[${cityPageId(place.country, place.city)}|${place.city}, ${place.country}]]`;
+        if (!seen.has(cityLine)) {
+          seen.add(cityLine);
+          placeLines.push(cityLine);
+        }
+      }
+    }
+    const current = trip.row.raw_md;
+    const updated = rewriteNavPlaceLines(current, placeLines);
+    if (updated !== current) {
+      changed++;
+      if (!dryRun) {
+        ws.savePage(trip.id, updated, { editedBy: "travel-place-directory-sync" });
+      }
+    }
+  }
+  return changed;
+}
+
+function updateAirbnbPages(airbnbs) {
+  let changed = 0;
+  for (const airbnb of airbnbs) {
+    const { country, city } = airbnb.place;
+    const countryLine = `- Country: [[${countryPageId(country)}|${country}]]`;
+    const cityLine = `- City: [[${cityPageId(country, city)}|${city}, ${country}]]`;
+    const current = airbnb.row.raw_md;
+    const updated = rewriteNavPlaceLines(current, [countryLine, cityLine]);
+    if (updated !== current) {
+      changed++;
+      if (!dryRun) {
+        ws.savePage(airbnb.id, updated, { editedBy: "travel-place-directory-sync" });
+      }
+    }
+  }
+  return changed;
+}
+
+function upsertPage(pageId, raw) {
+  const current = ws.getPage(pageId);
+  if (current && current.raw_md === raw) return false;
+  // Name what changed. A weekly unattended run that reports "pagesWritten: 16"
+  // without saying which is unreviewable, and it is how a churn bug hides: 16
+  // pages rewriting on EVERY run looks identical to 16 pages legitimately
+  // changing. Set TRAVEL_SYNC_DIFF=1 to also dump the first differing line.
+  if (current && process.env.TRAVEL_SYNC_VERBOSE) {
+    console.error(`[travel-place-directory-sync] changed: ${pageId}`);
+    if (process.env.TRAVEL_SYNC_DIFF) {
+      const a = String(current.raw_md || "").split("\n");
+      const b = String(raw).split("\n");
+      for (let i = 0; i < Math.max(a.length, b.length); i++) {
+        if (a[i] !== b[i]) {
+          console.error(`    line ${i + 1}\n      stored: ${JSON.stringify(a[i])}\n      fresh : ${JSON.stringify(b[i])}`);
+          break;
+        }
+      }
+    }
+  }
+  if (!dryRun) {
+    ws.savePage(pageId, raw, { editedBy: "travel-place-directory-sync" });
+  }
+  return true;
+}
+
+function cleanupGeneratedPages(directory) {
+  const desired = new Set([
+    "travel_places",
+    ...directory.countries.map((c) => c.pageId),
+    ...directory.cities.map((c) => c.pageId),
+  ]);
+  const toDelete = ws
+    .listPages({ type: "reference" })
+    .map((r) => r.id)
+    .filter((id) => (id === "travel_places" || id.startsWith("travel_country_") || id.startsWith("travel_city_")) && !desired.has(id));
+
+  // A dry run that reports "pagesDeleted: 5" without naming them is not
+  // reviewable, and this deletes pages from the user's memory. Enumerate them so
+  // the run can actually be checked before --apply.
+  if (toDelete.length) {
+    console.error(`[travel-place-directory-sync] ${dryRun ? "would delete" : "deleting"} ${toDelete.length} generated page(s):`);
+    for (const id of toDelete) console.error(`    ${id}`);
+  }
+  if (dryRun) return toDelete.length;
+
+  if (toDelete.length > maxDeletions) {
+    deletionCapTripped = true;
+    console.error(
+      `[travel-place-directory-sync] REFUSING to delete ${toDelete.length} page(s) — over the safety cap of ${maxDeletions}.\n` +
+      `    Nothing was deleted. A jump this size usually means an upstream source degraded, not that ${toDelete.length} pages went bad at once.\n` +
+      `    Check the trip pages the missing cities came from, then re-run with --max-deletions ${toDelete.length} if the list above is genuinely all garbage.`
+    );
+    return 0;
+  }
+
+  for (const id of toDelete) {
+    ws.deletePage(id, { editedBy: "travel-place-directory-sync" });
+  }
+  repairDanglingTravelLinks(desired);
+  return toDelete.length;
+}
+
+// Deleting a generated city page leaves every [[travel_city_x|Display]] link
+// that pointed at it dangling in a trip body. The 2026-07-29 cleanup removed 8
+// pages and left 4 broken links behind — in real travel history, where a broken
+// link costs a backlink and a recall path.
+//
+// This scans for ALL unresolved travel_city_* / travel_country_* links, not
+// just ones this run deleted, so it also heals damage from earlier runs (which
+// is how the 4 above get fixed — they were already orphaned by the time the
+// repair existed). For each, re-run the SAME canonicalization the directory
+// build uses, against the link's own display text:
+//   - resolves to a live page (an aliased duplicate, e.g. "Ho Chi Minh" ->
+//     travel_city_vietnam_ho_chi_minh_city) -> repoint the link there;
+//   - resolves to nothing (garbage, e.g. "X5009DYJ" or "B.C.") -> unwrap the
+//     link, leaving the display text as plain prose.
+// Never deletes words, only brackets.
+function repairDanglingTravelLinks(desired) {
+  const countrySlugs = buildCountrySlugLookup();
+  let repaired = 0;
+
+  for (const row of ws.listPages({})) {
+    const dead = (ws.getForwardLinks(row.id) || []).filter(
+      (l) => !l.resolved && typeof l.dst_id === "string" &&
+             (l.dst_id.startsWith("travel_city_") || l.dst_id.startsWith("travel_country_"))
+    );
+    if (!dead.length) continue;
+
+    const page = ws.getPage(row.id);
+    const raw = page && (page.raw_md ?? page.raw ?? "");
+    if (!raw) continue;
+
+    let updated = raw;
+    for (const link of dead) {
+      const deadId = link.dst_id;
+      const rest = deadId.replace(/^travel_(city|country)_/, "");
+      let country = null;
+      for (const [slug, name] of countrySlugs) {
+        if (rest.startsWith(`${slug}_`) || rest === slug) { country = name; break; }
+      }
+      const pattern = new RegExp(`\\[\\[${escapeRegExp(deadId)}(\\|([^\\]]*))?\\]\\]`, "g");
+      updated = updated.replace(pattern, (_m, _p, display) => {
+        const text = (display || "").trim() || rest.replace(/_/g, " ");
+        const place = country ? canonicalizePlace({ city: text, country }) : null;
+        if (place && place.city && isPlausibleCityName(place.city)) {
+          const targetId = `travel_city_${slugify(place.country)}_${slugify(place.city)}`;
+          if (desired.has(targetId)) return `[[${targetId}|${place.city}]]`;
+        }
+        return text;   // unwrap — keep the words, drop the dead link
+      });
+    }
+
+    if (updated !== raw) {
+      ws.savePage(row.id, updated, { editedBy: "travel-place-directory-sync" });
+      repaired++;
+      console.error(`[travel-place-directory-sync] repaired ${dead.length} dangling travel link(s) in ${row.id}`);
+    }
+  }
+  return repaired;
+}
+
+function main() {
+  const allTrips = collectTripPages();
+  const trips = allTrips.filter((trip) => trip.places.length > 0);
+  const tripById = new Map(trips.map((t) => [t.id, t]));
+  const airbnbs = collectAirbnbs(tripById);
+  const directory = buildDirectory(trips, airbnbs);
+
+  const tripUpdates = updateTripPages(allTrips);
+  const airbnbUpdates = updateAirbnbPages(airbnbs);
+  const travelUpdated = updateTravelPage();
+
+  let writes = 0;
+  if (upsertPage("travel_places", renderTopPage(directory))) writes++;
+
+  for (const country of directory.countries) {
+    const cityRecords = directory.cities.filter((city) => city.country === country.country);
+    if (upsertPage(country.pageId, renderCountryPage(country, cityRecords))) writes++;
+    for (const city of cityRecords) {
+      if (upsertPage(city.pageId, renderCityPage(city, country))) writes++;
+    }
+  }
+  const deletedPages = cleanupGeneratedPages(directory);
+
+  console.log(
+    JSON.stringify(
+      {
+        dryRun,
+        trips: trips.length,
+        airbnbs: airbnbs.length,
+        tripUpdates,
+        airbnbUpdates,
+        travelUpdated,
+        pagesWritten: writes,
+        pagesDeleted: deletedPages,
+        deletionCapTripped,
+        countries: directory.countries.length,
+        cities: directory.cities.length,
+      },
+      null,
+      2,
+    ),
+  );
+
+  // Non-zero so an unattended (launchd) run records a failure instead of a
+  // successful no-op. The pages that WOULD have been deleted are named above.
+  if (deletionCapTripped) process.exitCode = 4;
+}
+
+if (require.main === module) main();
+
+module.exports = { canonicalizePlace, normalizeCityKey };

@@ -1,0 +1,21 @@
+#!/usr/bin/env node
+// photos-rerender-plan — for each stale_render date, print "<date> <mode>"
+// (normal | silent | give-up | skip) and record the attempt in
+// data/photos-rerender-ledger.json. See lib/photos-rerender-ledger.mjs.
+//
+// Usage: photos-rerender-plan YYYY-MM-DD [YYYY-MM-DD ...]
+
+import fs from "node:fs";
+import { createRequire } from "node:module";
+import { plan } from "../lib/photos-rerender-ledger.mjs";
+
+const { installTools } = createRequire(import.meta.url)("../lib/root.cjs");
+const LEDGER = installTools("data", "photos-rerender-ledger.json");
+let ledger = {};
+try { ledger = JSON.parse(fs.readFileSync(LEDGER, "utf8")); } catch {}
+const dates = process.argv.slice(2).filter((d) => /^\d{4}-\d{2}-\d{2}$/.test(d)); // lang-regex-ok: ISO date argv
+const r = plan(ledger, dates);
+const tmp = `${LEDGER}.tmp.${process.pid}`;
+fs.writeFileSync(tmp, JSON.stringify(r.ledger, null, 2) + "\n");
+fs.renameSync(tmp, LEDGER);
+for (const p of r.plan) console.log(`${p.date} ${p.mode}`);

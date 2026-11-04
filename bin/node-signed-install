@@ -1,0 +1,66 @@
+#!/bin/bash
+# node-signed-install — install the official, Developer-ID-signed node from
+# nodejs.org at a fixed path and point /opt/homebrew/bin/node at it.
+#
+# Why: macOS privacy grants (Full Disk Access, Photos, Documents, Apple Events,
+# Local Network, …) for a bare binary are keyed on its path + code signature.
+# Homebrew's node is ad-hoc signed AND lives at a versioned Cellar path, so every
+# `brew upgrade node` looked like a brand-new app: grants silently lapsed and
+# unanswerable prompts piled up on the mini. The nodejs.org binary is signed by
+# the Node.js Foundation (team HX7739G8FX) and lives at ~/.local/node, so an
+# upgrade replaces it in place and every grant carries over.
+#
+# /opt/homebrew/bin/node is hardcoded in ~40 places (crontab, LaunchAgents,
+# shebangs), so it stays the canonical path — it just symlinks here now. TCC
+# resolves symlinks, so it sees the signed binary. npm/npx stay Homebrew's
+# (global prefix /opt/homebrew); they run under whatever `node` is on PATH.
+# Homebrew's node keg stays installed but PINNED so brew never relinks it.
+#
+# Usage: node-signed-install <version>     e.g. node-signed-install 26.10.0
+# Keep the same MAJOR as the current node unless you also rebuild native addons.
+# After an upgrade, re-check that node's macOS privacy (TCC) grants survived.
+
+set -euo pipefail
+
+VER="${1:?usage: node-signed-install <version, e.g. 26.10.0>}"
+VER="v${VER#v}"
+TEAM="HX7739G8FX"
+DEST="$HOME/.local/node"
+# kernel-closure-ok: this tool's whole job is to repoint Homebrew's node symlink
+LINK="/opt/homebrew/bin/node"
+ARCH="darwin-$(uname -m | sed 's/x86_64/x64/')"
+T="node-$VER-$ARCH"
+
+tmp="$(mktemp -d)"
+trap 'rm -rf "$tmp"' EXIT
+cd "$tmp"
+
+curl -fsSLO "https://nodejs.org/dist/$VER/$T.tar.gz"
+curl -fsSL "https://nodejs.org/dist/$VER/SHASUMS256.txt" | grep " $T.tar.gz\$" | shasum -a 256 -c -
+tar xzf "$T.tar.gz"
+
+codesign --verify --strict "$T/bin/node"
+if ! codesign -dv "$T/bin/node" 2>&1 | grep -q "^TeamIdentifier=$TEAM\$"; then
+  echo "refusing: $T/bin/node is not signed by team $TEAM" >&2
+  exit 1
+fi
+
+old_mods=""
+[ -x "$DEST/bin/node" ] && old_mods="$("$DEST/bin/node" -p process.versions.modules)"
+new_mods="$("$T/bin/node" -p process.versions.modules)"
+if [ -n "$old_mods" ] && [ "$old_mods" != "$new_mods" ]; then
+  echo "warning: module ABI changes $old_mods -> $new_mods; rebuild native addons (npm rebuild) after this" >&2
+fi
+
+# Swap in place: same path => the existing TCC grants still match.
+mkdir -p "$(dirname "$DEST")"
+rm -rf "$DEST.prev"
+[ -e "$DEST" ] && mv "$DEST" "$DEST.prev"
+mv "$T" "$DEST"
+
+ln -sfn "$DEST/bin/node" "$LINK"
+brew pin node 2>/dev/null || true
+
+echo "node $("$LINK" -v) at $DEST (via $LINK)"
+[ -e "$DEST.prev" ] && echo "previous build kept at $DEST.prev"
+exit 0

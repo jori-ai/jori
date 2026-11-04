@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Daily Summary Fix — the fix loop for a day the reviewer did not confirm
+  (jobs/daily-summary-fix.md), on ephemeral Opus. No schedule: QueueDirectories
+  starts it whenever data/daily-summary-fix/queue/ is non-empty
+  (`bin/daily-summary-fix request <date>` writes there) and keeps
+  restarting it until the directory is empty. The trigger removes each marker
+  before running, so a failed run cannot loop. One instance per label: serial.
+  launchd USER agent, not crontab (keychain / Max auth — see lib/run-ephemeral-opus.sh).
+  Install: mkdir -p <install>/data/daily-summary-fix/queue, then
+    agent/launch-agents/install.sh ai.claude.daily-summary-fix
+    (renders __JORI_HOME__ / __JORI_TOOLS__ / __HOME__, then launchctl bootstrap)
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>ai.claude.daily-summary-fix</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>__JORI_TOOLS__/agent/scripts/trigger-daily-summary-fix.sh</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>__HOME__</string>
+        <key>PATH</key>
+        <string>__HOME__/.local/node/bin:__HOME__/.local/bin:/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:__JORI_TOOLS__/bin</string>
+        <key>LANG</key>
+        <string>en_US.UTF-8</string>
+    </dict>
+    <key>WorkingDirectory</key>
+    <string>__JORI_TOOLS__/agent/ops-agent</string>
+    <key>QueueDirectories</key>
+    <array>
+        <string>__JORI_TOOLS__/data/daily-summary-fix/queue</string>
+    </array>
+    <key>RunAtLoad</key>
+    <false/>
+    <key>KeepAlive</key>
+    <false/>
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+    <key>StandardOutPath</key>
+    <string>__JORI_TOOLS__/agent/logs/daily-summary-fix-launchd.log</string>
+    <key>StandardErrorPath</key>
+    <string>__JORI_TOOLS__/agent/logs/daily-summary-fix-launchd.log</string>
+</dict>
+</plist>

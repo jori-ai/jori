@@ -40,7 +40,7 @@ Read this before adding anything that knows about a specific person, place, busi
 
 ### Identity — `agent/local/instance.json`
 
-Read by `lib/instance.cjs` (`instance()`, `instanceValue(key)`; shell: `agent/scripts/lib/instance.sh`). Keys: `owner_name` (default "the user"), `owner_id`, `owner_email`, `agent_email`, `domain`, `tz` (default: the host's zone), `host`, `supabase_project`, `gcp_project`, `github_owner`. Each has a `JORI_*` environment override (`.env.example`). `jori init` writes the file; template: `examples/local/instance.example.json`. A fresh install has none and runs on the defaults.
+Read by `lib/instance.cjs` (`instance()`, `instanceValue(key)`; shell: `agent/scripts/lib/instance.sh`). Keys: `owner_name` (default "the user"), `owner_id`, `owner_email`, `agent_email`, `agent_email_aliases` (earlier addresses that still count as the agent's own; `agentAddresses()`), `domain`, `tz` (default: the host's zone), `host`, `supabase_project`, `gcp_project`, `github_owner`. Each has a `JORI_*` environment override (`.env.example`). `jori init` writes the file; template: `examples/local/instance.example.json`. A fresh install has none and runs on the defaults.
 
 ### Values — `agent/local/config/<name>.json`
 
@@ -64,7 +64,6 @@ Optional; a missing hook means the generic path, and each dir's `.gitkeep` docum
 | Hook | Loaded by | For |
 |---|---|---|
 | `lib/_ext/choice-handlers.mjs` | `lib/choice-reply.mjs` | tap handlers for your own card kinds |
-| `lib/_ext/watches.mjs` | `bin/hum-sense` | a watch engine offered every event |
 | `lib/_ext/context-sources/*.mjs` | `bin/context-sync` | extra indexed sources |
 | `lib/_ext/jori-context.cjs` | `lib/jori-context.js` | extra context tables (tastes, profile, projects) |
 | `lib/_ext/presence.mjs` | `lib/claim-facts.mjs`, hum locality | where you are on a date (travel timeline) |

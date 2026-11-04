@@ -1,0 +1,149 @@
+#!/usr/bin/env node
+"use strict";
+// trip-reservoir-mark-done — nightly pass that strikes out area-reservoir places
+// the user has already been to.
+//
+// The area guides (the travel site) are the trip's standing "what's worth doing
+// here" inventory. Without this they keep suggesting places already seen, so
+// the user has to remember what's done and mentally filter the list every time.
+// This marks them done — struck through on the site, never removed.
+//
+// Evidence + tuning live in lib/reservoir-done.js. Summary of the deal:
+// the daily summary is the primary signal (already vetted against chat +
+// transactions + Places, and it catches "we went to the sub base" visits that
+// never became a stop), backed by GPS visits and the travel path. Deliberately
+// loose: over-striking is preferred to under-striking.
+//
+// Marks are additive and idempotent: a done entry is never un-done here, so a
+// manual mark survives, and re-running is safe. Every mark records the evidence
+// that produced it (`done_source`, `done_evidence`) so a wrong one is auditable
+// rather than a silent rewrite.
+//
+// Usage:
+//   trip-reservoir-mark-done                 # all areas, last 60d of evidence
+//   trip-reservoir-mark-done --area <area>
+//   trip-reservoir-mark-done --since 2026-07-09
+//   trip-reservoir-mark-done --dry-run       # print what would be struck
+//
+// No trip-start date is needed: an entry only matches if the user was physically near
+// it, so days on another continent can't strike a French place. --since is only
+// a cost bound on how much history to scan.
+
+const path = require("node:path");
+const { fetchJson } = require(path.join(__dirname, "..", "lib", "supabase-rest.js"));
+const { pullReservoir, saveReservoir, listAreas } = require(path.join(__dirname, "..", "lib", "reservoir-store.js"));
+const { markReservoir, norm } = require(path.join(__dirname, "..", "lib", "reservoir-done.js"));
+const { areaDateRanges } = require(path.join(__dirname, "..", "lib", "reservoir-dates.js"));
+
+const argv = process.argv.slice(2);
+const DRY = argv.includes("--dry-run");
+const arg = (flag) => { const i = argv.indexOf(flag); return i >= 0 ? argv[i + 1] : null; };
+const areaArg = arg("--area");
+const sinceArg = arg("--since") || (() => {
+  const d = new Date(Date.now() - 60 * 86400000);
+  return d.toISOString().slice(0, 10);
+})();
+
+async function pageAll(base) {
+  let out = [], offset = 0;
+  for (;;) {
+    const rows = await fetchJson(`${base}&offset=${offset}&limit=1000`, { timeoutMs: 20000 });
+    if (!rows || !rows.length) break;
+    out = out.concat(rows);
+    if (rows.length < 1000) break;
+    offset += 1000;
+  }
+  return out;
+}
+
+async function loadEvidence(since) {
+  const sums = await fetchJson(
+    `/rest/v1/daily_summaries?select=date,narrative,resolved_day_json&date=gte.${since}&order=date.asc`,
+    { timeoutMs: 20000 },
+  ) || [];
+
+  // Narrative + the day's own chat/corrections: the vetted prose naming places.
+  const summaryText = norm(
+    sums.map((s) => {
+      const rd = s.resolved_day_json || {};
+      return [
+        s.narrative || "",
+        JSON.stringify(rd.declarative_self_messages || []),
+        JSON.stringify(rd.corrections || []),
+      ].join(" ");
+    }).join(" "),
+  );
+
+  const summaryStops = sums.flatMap((s) =>
+    ((s.resolved_day_json || {}).stops || []).map((st) => ({
+      name: (st.place && st.place.name) || "",
+      lat: st.lat, lon: st.lon, date: s.date,
+    })),
+  );
+
+  const loc = await pageAll(
+    `/rest/v1/location_history?select=arrived_at,latitude,longitude,place_name,segment_type` +
+    `&arrived_at=gte.${since}T00:00:00Z&order=arrived_at.asc`,
+  );
+  const gpsVisits = loc.filter((r) => r.segment_type === "visit" && r.latitude);
+  const gpsTransit = loc.filter((r) => r.segment_type === "transit" && r.latitude);
+
+  return { summaryText, summaryStops, gpsVisits, gpsTransit, _days: sums.length };
+}
+
+(async () => {
+  const areas = areaArg ? [areaArg] : await listAreas();
+  if (!areas.length) {
+    console.error("no reservoirs found in Supabase (trip_reservoirs is empty)");
+    process.exit(1);
+  }
+
+  const ev = await loadEvidence(sinceArg);
+  console.log(
+    `evidence since ${sinceArg}: ${ev._days} daily summaries, ${ev.summaryStops.length} stops, ` +
+    `${ev.gpsVisits.length} GPS visits, ${ev.gpsTransit.length} transit points`,
+  );
+
+  // Keep each area's dates in step with the travel timeline on the same nightly
+  // pass — a re-booked leg shifts the guide's dates (and its order on the site)
+  // without anyone re-running a publish by hand.
+  const ranges = await areaDateRanges();
+
+  let totalMarked = 0, totalAlready = 0;
+  for (const area of areas) {
+    const reservoir = await pullReservoir(area);
+    if (!reservoir) { console.error(`skip ${area} — no structured reservoir in Supabase`); continue; }
+
+    const { marked, already } = markReservoir(reservoir, ev);
+    totalMarked += marked.length;
+    totalAlready += already;
+
+    const range = ranges[area] || null;
+    const rangeChanged = JSON.stringify(reservoir.date_range || null) !== JSON.stringify(range);
+    if (range) reservoir.date_range = range;
+
+    if (!marked.length && !rangeChanged) {
+      console.log(`${area}: nothing new (${already} already done)`);
+      continue;
+    }
+    if (marked.length) {
+      console.log(`\n${area}: ${marked.length} newly done (${already} already)`);
+      for (const m of marked) {
+        console.log(`   ✓ ${m.name.slice(0, 46).padEnd(46)} [${m.via}] ${m.evidence}`);
+      }
+    }
+    if (rangeChanged && range) console.log(`   dates: ${range.start} → ${range.end}`);
+    // No wikiSave override — saveReservoir's default writes the mirror. This
+    // used to pass `{ wikiSave: true }`, a boolean where a function belongs,
+    // which threw into a non-fatal catch and left the wiki mirror stale.
+    if (!DRY) await saveReservoir(area, reservoir);
+  }
+
+  console.log(
+    `\n${DRY ? "DRY RUN — no writes. " : ""}` +
+    `${totalMarked} newly marked done, ${totalAlready} already done.`,
+  );
+})().catch((e) => {
+  console.error(`trip-reservoir-mark-done failed: ${e.message}`);
+  process.exit(1);
+});

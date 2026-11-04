@@ -1,0 +1,68 @@
+#!/usr/bin/env node
+"use strict";
+// place-photo-store — the CLI over lib/place-photo-store.js.
+//
+//   place-photo-store ensure-schema                     # create public.place_photos (management API; the mini)
+//   place-photo-store ensure <placeId> <slot> <ref>     # stored URL, fetching from Google only the first time → JSON
+//   place-photo-store get <placeId> [slot]              # what is stored, no fetching
+//   place-photo-store stats                             # rows, and how many were fetched in the last 7 days
+//
+// `ensure` is what the Python `places` CLI shells out to for `--photos`.
+
+const fs = require("node:fs");
+const path = require("node:path");
+const { loadEnv } = require(path.join(__dirname, "..", "lib", "load-env.js"));
+loadEnv();
+const { ensurePlacePhoto, _liveDeps } = require(path.join(__dirname, "..", "lib", "place-photo-store.js"));
+const { request } = require(path.join(__dirname, "..", "lib", "supabase-rest.js"));
+
+const { instance } = require(path.join(__dirname, "..", "lib", "instance.cjs"));
+const PROJECT_REF = process.env.JORI_SUPABASE_PROJECT || instance().supabase_project;
+const MIGRATION = path.join(__dirname, "..", "data", "migrations", "20260910_place_photos.sql");
+
+async function ensureSchema() {
+  let token;
+  if (!PROJECT_REF) { console.error("no Supabase project (supabase_project in agent/local/instance.json)"); process.exit(1); }
+  // The installation's own management-token helper when it has one, else the env.
+  try { token = require("./supabase-token").current().access_token; } // kernel-closure-ok: optional, absent in a fresh install (SUPABASE_ACCESS_TOKEN then)
+  catch (e) { token = process.env.SUPABASE_ACCESS_TOKEN; }
+  if (!token) { console.error("no Supabase management token (supabase-token / SUPABASE_ACCESS_TOKEN) — run this on the host"); process.exit(1); }
+  const res = await fetch(`https://api.supabase.com/v1/projects/${PROJECT_REF}/database/query`, {
+    method: "POST", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+    body: JSON.stringify({ query: fs.readFileSync(MIGRATION, "utf8") }), signal: AbortSignal.timeout(30_000),
+  });
+  const text = await res.text();
+  if (!res.ok) { console.error(`management API ${res.status}: ${text.slice(0, 300)}`); process.exit(1); }
+  console.log("place_photos: schema ensured");
+}
+
+async function main() {
+  const [cmd, a, b, c] = process.argv.slice(2);
+  if (cmd === "ensure-schema") return ensureSchema();
+  if (cmd === "ensure") {
+    if (!a || b == null || !c) { console.error("usage: place-photo-store ensure <placeId> <slot> <ref>"); process.exit(2); }
+    const r = await ensurePlacePhoto(a, Number(b), c, { tool: process.env.PLACE_PHOTO_TOOL || "place-photo-store" });
+    if (!r) { console.error("no photo"); process.exit(1); }
+    process.stdout.write(JSON.stringify({ url: r.url, fetched: r.fetched }) + "\n");
+    return;
+  }
+  if (cmd === "get") {
+    const row = await _liveDeps.read(`${a}:${Number(b || 0)}`);
+    process.stdout.write(JSON.stringify(row) + "\n");
+    return;
+  }
+  if (cmd === "stats") {
+    const all = await request(`/rest/v1/place_photos?select=key,fetched_at,fetched_by,source&limit=5000`);
+    const rows = Array.isArray(all) ? all : [];
+    const since = Date.now() - 7 * 86400_000;
+    const recent = rows.filter(r => Date.parse(r.fetched_at) >= since);
+    const byTool = {};
+    for (const r of recent) byTool[r.fetched_by || "?"] = (byTool[r.fetched_by || "?"] || 0) + 1;
+    console.log(`place_photos: ${rows.length} stored; ${recent.length} fetched in the last 7 days ${JSON.stringify(byTool)}`);
+    return;
+  }
+  console.error("usage: place-photo-store ensure-schema | ensure <placeId> <slot> <ref> | get <placeId> [slot] | stats");
+  process.exit(2);
+}
+
+main().catch(e => { console.error(e.message || e); process.exit(1); });

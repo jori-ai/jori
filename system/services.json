@@ -47,6 +47,15 @@
       "path": "/health",
       "description": "Process-manager HTTP health endpoint. Returns child process status.",
       "expected_running": true
+    },
+    {
+      "name": "occasion-ideas",
+      "label": "ai.claude.occasion-ideas",
+      "type": "launchagent",
+      "plist": "~/Library/LaunchAgents/ai.claude.occasion-ideas.plist",
+      "script": "agent/scripts/trigger-occasion-ideas.sh",
+      "expected_running": false,
+      "description": "Daily 05:25 local; emails only inside an occasion's window. launchd NOT cron — Opus via claude -p needs the in-session Max keychain. Plist template tracked at agent/launch-agents/ai.claude.occasion-ideas.plist."
     }
   ]
 }

@@ -1,0 +1,119 @@
+#!/usr/bin/env node
+// unstar-scan-run — the ENTIRE execute+alert step of the unstar-scan job,
+// collapsed into one deterministic call so no agent turn ever composes its
+// own alert text again.
+//
+// Why this exists (jobs/p1-resolve.md § Reliability notes): the playbook told
+// the agent turn to report failures through p1-alert-gate and never call
+// jori-send-curl directly, and it did not hold — every alert of that era was
+// uniquely freeform-worded and narrated a mechanism the caller never observed, several of them provably
+// impossible (an OSStatus x509 cert error this pure-Node fetch pipeline
+// cannot produce; "MCP Gmail write tools unauthorized" for a pipeline that
+// never calls MCP at all — see gmail-action, pure REST + OAuth token).
+// Prose instructions on the cheapest agent tier (ops-haiku, this job's tier
+// per job-routing.json) are not holding. This script removes the decision
+// point: the agent turn still selects WHICH message ids to downgrade (that
+// step needs judgment — see the stale-digest-vs-live-thread rule in
+// jobs/p1-resolve.md), but never again decides what to SAY about the outcome.
+//
+// Usage:
+//   unstar-scan-run <messageId> [messageId ...] [--reason "<text>"]
+//   unstar-scan-run --none                          # nothing to downgrade this cycle
+//
+// Always exits 0 — this is an alerting/execution wrapper, not a reason to
+// fail the caller's job (mirrors p1-alert-gate's own contract).
+
+"use strict";
+
+const { execFileSync } = require("node:child_process");
+const fs = require("node:fs");
+const { installTools } = require("../lib/root.cjs");
+
+const P1_DOWNGRADE = process.env.UNSTAR_SCAN_P1_DOWNGRADE || installTools("bin/p1-downgrade");
+const P1_ALERT_GATE = process.env.UNSTAR_SCAN_P1_ALERT_GATE || installTools("bin/p1-alert-gate");
+const AUDIT_LOG = process.env.UNSTAR_SCAN_AUDIT_LOG || installTools("data/p1-resolutions.jsonl");
+
+function parseArgs() {
+  const argv = process.argv.slice(2);
+  const ids = [];
+  let reason = "user unstarred";
+  let none = false;
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === "--reason") reason = argv[++i];
+    else if (a === "--none") none = true;
+    else if (a === "--help" || a === "-h") {
+      console.log(`unstar-scan-run — downgrade unstarred P1s and report the real outcome, in one call
+
+Usage:
+  unstar-scan-run <messageId> [messageId ...] [--reason "<text>"]
+  unstar-scan-run --none
+
+There is no way to pass a custom alert message — that is the point. On
+failure, p1-alert-gate is fed only what p1-downgrade's own audit log
+recorded for this run.`);
+      process.exit(0);
+    } else ids.push(a);
+  }
+  return { ids, reason, none };
+}
+
+function countLines(p) {
+  try { return fs.readFileSync(p, "utf8").split("\n").filter(Boolean).length; } catch { return 0; }
+}
+
+function tailRows(p, n) {
+  try {
+    const lines = fs.readFileSync(p, "utf8").split("\n").filter(Boolean);
+    return lines.slice(-n).map((l) => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+  } catch { return []; }
+}
+
+function callGate(args) {
+  try { execFileSync(P1_ALERT_GATE, args, { stdio: "inherit" }); } catch { /* the gate never fails the caller */ }
+}
+
+function main() {
+  const { ids, reason, none } = parseArgs();
+
+  if (none || ids.length === 0) {
+    callGate(["--ok"]);
+    console.log("unstar-scan-run: nothing to downgrade this cycle");
+    return;
+  }
+
+  const before = countLines(AUDIT_LOG);
+  let downgradeFailed = false;
+  try {
+    execFileSync(P1_DOWNGRADE, [...ids, "--source", "unstar-scan", "--reason", reason], { stdio: "inherit" });
+  } catch {
+    downgradeFailed = true; // p1-downgrade exits 1 when any message didn't fully downgrade
+  }
+
+  if (!downgradeFailed) {
+    callGate(["--ok"]);
+    console.log(`unstar-scan-run: ${ids.length} message(s) downgraded`);
+    return;
+  }
+
+  // Build the captured-error string from what p1-downgrade ACTUALLY wrote to
+  // its own audit log for this run — never from anything this wrapper infers
+  // or guesses. Mirrors "pass the error exactly as the tool reported it"
+  // (jobs/p1-resolve.md § Unstar scan).
+  const after = countLines(AUDIT_LOG);
+  const rows = tailRows(AUDIT_LOG, Math.max(after - before, ids.length));
+  const failedRows = rows.filter((r) => r && r.success === false);
+  const uniqueErrors = new Set();
+  for (const r of failedRows) {
+    if (r.errors) for (const [step, msg] of Object.entries(r.errors)) uniqueErrors.add(`${step}: ${msg}`);
+    if (r.meta_fetch_error) uniqueErrors.add(`fetchMetadata: ${r.meta_fetch_error}`);
+  }
+  const captured = uniqueErrors.size
+    ? Array.from(uniqueErrors).slice(0, 3).join(" | ")
+    : `${failedRows.length || ids.length} of ${ids.length} message(s) did not fully downgrade (no per-step error captured — see ${AUDIT_LOG})`;
+
+  callGate(["--failed", captured]);
+  console.log(`unstar-scan-run: ${failedRows.length || ids.length}/${ids.length} failed — ${captured}`);
+}
+
+main();

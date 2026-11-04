@@ -1,0 +1,433 @@
+#!/usr/bin/env node
+// purchase — the deterministic half of Face-ID-approved purchases.
+// Playbook: agent/ops-agent/jobs/purchase.md. Core: lib/purchase-approval.mjs.
+//
+//   purchase request --file <item.json> --place-selector '<css>' [--asked "<the user's words>"] [--note "<why this pick>"] [--image <storage url>]
+//       Check the live shop tab (CDP :9224) shows the item's total + card, screenshot
+//       it, and file a Face-ID approval. Prints {id, expires_at}. Exit 3 = the page
+//       does not match what you wrote; fix your reading, do not loosen it.
+//   purchase status <id>            row status + result (no screenshot)
+//   purchase wait <id> [--timeout 660]
+//       Block until the approval is decided and executed; prints the final row.
+//   purchase cancel <id>            withdraw a pending request (status: cancelled)
+//   purchase fill <site> --field username|password --selector '<css>'
+//       Type the 1Password login for <site> into a field of the shop tab.
+//       Refuses unless the tab is on <site>. The value is never printed.
+//   purchase card <site> --last4 NNNN [--add] [--shot <png>]
+//       When checkout offers no saved card, type the 1Password card ending NNNN
+//       (card-pass) and its billing details (data/purchase-cards.json) into
+//       the merchant's card form: the page itself, a same-site frame, or a known
+//       payment processor's frame the merchant embedded (Cybersource, Stripe,
+//       Braintree, Adyen... — lib/shop-card.mjs). Real clicks and keys at the
+//       browser level. Refuses unless the tab is on <site>. Values are never
+//       printed: it reports which fields took. --add then clicks the form's own
+//       "Add Card"/"Continue" button (never Pay / Place Order). --shot writes a
+//       screenshot with the card hidden.
+//   purchase shot <png|jpg>
+//       Screenshot of the shop tab with every card field and payment frame
+//       covered. Use it instead of `cdp.py shot` once a card has been typed.
+//   purchase otp <site> --since <unix-seconds> [--wait 120]
+//       2FA codes that arrived by SMS or Gmail after --since. Prints candidates.
+//   purchase pair                   mint a one-time code to pair the phone's purchase key
+//   purchase click '<css>'          real mouse click (trusted events) in the shop tab
+//   purchase type '<css>' --text '<text>'
+//       Real per-key typing of NON-secret text (an email address, a search, a
+//       2FA code) into the shop tab. Credentials go through `fill`, never this.
+//
+// No LLM anywhere in here. The agent decides what to buy and reads the page;
+// this tool decides nothing except whether what it was told matches the page.
+
+import fs from "node:fs";
+import path from "node:path";
+import crypto from "node:crypto";
+import { execFileSync } from "node:child_process";
+import { createRequire } from "node:module";
+import { installRoot } from "../lib/root.cjs";
+
+const ROOT = installRoot();
+for (const l of (() => { try { return fs.readFileSync(path.join(ROOT, ".env"), "utf8").split("\n"); } catch { return []; } })()) {
+  const m = l.match(/^([A-Z_]+)=(.*)$/); if (m && !process.env[m[1]]) process.env[m[1]] = m[2];
+}
+const { supabaseUrl } = createRequire(import.meta.url)("../lib/instance.cjs");
+const BASE = process.env.SUPABASE_URL || supabaseUrl();
+// --image may only point at this installation's own public Storage.
+const STORAGE_PUBLIC = supabaseUrl() ? `${supabaseUrl()}/storage/v1/object/public/` : null;
+const K = process.env.SUPABASE_SERVICE_ROLE_KEY;
+const H = { apikey: K, Authorization: "Bearer " + K, "Content-Type": "application/json" };
+
+const P = await import(path.join(ROOT, "lib/purchase-approval.mjs"));
+const B = await import(path.join(ROOT, "lib/shop-browser.mjs"));
+const C = await import(path.join(ROOT, "lib/shop-card.mjs"));
+
+const argv = process.argv.slice(2);
+const cmd = argv[0];
+const flag = (n, d = null) => { const i = argv.indexOf(`--${n}`); return i > -1 ? argv[i + 1] : d; };
+const out = (o) => console.log(JSON.stringify(o, null, 2));
+const die = (msg, code = 1) => { console.error(`purchase: ${msg}`); process.exit(code); };
+
+async function rest(pathq, { method = "GET", body, prefer } = {}) {
+  const r = await fetch(`${BASE}/rest/v1/${pathq}`, {
+    method, headers: { ...H, ...(prefer ? { Prefer: prefer } : {}) },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  if (!r.ok) throw new Error(`supabase ${method} ${pathq.split("?")[0]}: HTTP ${r.status} ${await r.text()}`);
+  const t = await r.text();
+  return t ? JSON.parse(t) : null;
+}
+
+const COLS = "id,status,item_json,expires_at_ms,created_at,decided_at,executed_at,result,request_text";
+
+async function getRow(id) {
+  const d = await rest(`purchase_approvals?id=eq.${encodeURIComponent(id)}&select=${COLS}&limit=1`);
+  return d[0] || null;
+}
+
+// ── request ────────────────────────────────────────────────────────────────
+async function request() {
+  const file = flag("file");
+  const selector = flag("place-selector");
+  if (!file || !selector) die("usage: purchase request --file <item.json> --place-selector '<css>' [--asked \"...\"] [--note \"<why>\"] [--image <url>]", 64);
+  // The recommendation shown in the approval sheet (advisory, not signed): why this
+  // pick, and a picture (e.g. the ticket seat map). Only our own Storage URLs.
+  const note = flag("note"), image = flag("image");
+  if (note && note.length > 1200) die("--note is longer than 1200 characters", 64);
+  if (image && !(STORAGE_PUBLIC && image.startsWith(STORAGE_PUBLIC))) die("--image must be a jori Supabase Storage public URL (shop-snap / ticket-scan map --upload)", 64);
+  const context = note || image ? { note: note || null, image_url: image || null } : null;
+  const raw = JSON.parse(fs.readFileSync(file, "utf8"));
+  // Validate everything except the screenshot hash, which this tool supplies.
+  const draft = P.normalizePurchaseItem({ ...raw, screenshot_sha256: "0".repeat(64) });
+
+  const busy = await rest(`purchase_approvals?status=in.(pending,signed,executing)&select=id,status,expires_at_ms`);
+  const live = busy.filter((r) => r.status !== "pending" || Number(r.expires_at_ms) > Date.now());
+  if (live.length) die(`another purchase is in flight (${live.map((r) => `${r.id}:${r.status}`).join(", ")}); one at a time`, 4);
+
+  const tab = await B.workingTab();
+  const s = await B.connect(tab);
+  let shot, page;
+  try {
+    page = await B.pageState(s);
+    if (!P.hostMatchesSite(page.url, draft.site)) die(`shop tab is on ${page.url}, not ${draft.site}`, 3);
+    const match = P.pageMatchesItem(page.text, draft);
+    if (!match.ok) die(`the review page does not show: ${match.missing.join("; ")}. Re-read the page; do not loosen the item.`, 3);
+    const btn = await B.describeSelector(s, selector);
+    if (!btn?.ok) die(`--place-selector must match exactly one visible, enabled element (matched ${btn?.count ?? 0})`, 3);
+    // The picture on the user's phone never shows a card number: card fields and
+    // payment frames are covered first, or nothing is filed.
+    try { shot = (await C.maskedScreenshot(s)).data; }
+    catch (e) { die(`could not hide the card fields for the screenshot (${e.message}); nothing filed`); }
+  } finally { s.close(); }
+
+  const item = { ...draft, screenshot_sha256: crypto.createHash("sha256").update(shot).digest("hex") };
+  const id = `pur_${new Date().toISOString().slice(0, 10).replace(/-/g, "")}_${crypto.randomBytes(4).toString("hex")}`;
+  const req = P.buildPurchaseRequest(id, item);
+  await rest("purchase_approvals", {
+    method: "POST", prefer: "return=minimal",
+    body: {
+      id, status: "pending", item_json: req.item, item_hash: req.hash, nonce: req.nonce,
+      expires_at_ms: req.expiresAt, expires_at: new Date(req.expiresAt).toISOString(),
+      screenshot_b64: shot.toString("base64"), place_selector: selector,
+      tab_id: tab.id, page_url: page.url, request_text: flag("asked"), context_json: context,
+    },
+  });
+
+  const { sendPurchaseApprovalPush } = await import(path.join(ROOT, "lib/apns-push.mjs"));
+  const supa = { from: () => ({ select: async () => {
+    try { return { data: await rest("device_tokens?select=token,platform,active_until"), error: null }; }
+    catch (e) { return { data: null, error: e }; }
+  } }) };
+  const push = await sendPurchaseApprovalPush(supa, { purchaseId: id, body: P.summarize(req.item) });
+  out({ id, status: "pending", summary: P.summarize(req.item), expires_at: new Date(req.expiresAt).toISOString(), push });
+}
+
+// ── status / wait / cancel ─────────────────────────────────────────────────
+async function status() {
+  const row = await getRow(argv[1] || die("usage: purchase status <id>", 64));
+  if (!row) die("no such purchase", 2);
+  out(row);
+}
+
+const FINAL = new Set(["placed", "clicked", "failed", "stale", "denied", "expired", "cancelled"]);
+async function wait() {
+  const id = argv[1] || die("usage: purchase wait <id> [--timeout 660]", 64);
+  const deadline = Date.now() + Number(flag("timeout", "660")) * 1000;
+  for (;;) {
+    const row = await getRow(id);
+    if (!row) die("no such purchase", 2);
+    if (row.status === "pending" && Number(row.expires_at_ms) + P.EXECUTE_GRACE_MS < Date.now()) row.status = "expired";
+    if (FINAL.has(row.status) || Date.now() > deadline) return out(row);
+    await B.sleep(4000);
+  }
+}
+
+async function cancel() {
+  const id = argv[1] || die("usage: purchase cancel <id>", 64);
+  const d = await rest(`purchase_approvals?id=eq.${encodeURIComponent(id)}&status=eq.pending`, {
+    method: "PATCH", prefer: "return=representation", body: { status: "cancelled", decided_at: new Date().toISOString() },
+  });
+  out({ id, cancelled: d.length === 1 });
+}
+
+// ── fill (1Password → shop tab) ───────────────────────────────────────────
+async function fill() {
+  const site = P.siteHost(argv[1] || die("usage: purchase fill <site> --field username|password --selector '<css>'", 64));
+  const field = flag("field");
+  const selector = flag("selector");
+  if (!["username", "password"].includes(field) || !selector) die("--field username|password and --selector are required", 64);
+  const tab = await B.workingTab();
+  // The one check that matters: a page can lure the agent anywhere, but the
+  // credential for <site> is only ever typed into a tab that IS <site>.
+  if (!P.hostMatchesSite(tab.url, site)) die(`refusing: shop tab is on ${tab.url}, not ${site}`, 3);
+  let value;
+  // 1Password only: every password lives in 1Password.
+  // Headless service-account reads, no biometrics, never locks: the user's website
+  // logins in the "Logins" vault via site-pass, then Jori's own
+  // `site:<domain>` items in Dev via dev-pass. Apple Passwords is no longer
+  // consulted: on the mini it is locked and a miss there hung >2 min.
+  let source;
+  const errs = [];
+  for (const [tool, name] of [["site-pass", "1password-logins"], ["dev-pass", "1password-dev"]]) {
+    try {
+      value = execFileSync(path.join(ROOT, "bin", tool), [site, field === "username" ? "--user" : "--stdout"],
+        { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], timeout: 30000 }).replace(/\n$/, "");
+    } catch (e) { errs.push(`${tool}: ${String(e.stderr || e.message).trim().split("\n").pop()}`); }
+    if (value) { source = name; break; }
+  }
+  if (!value) die(`no ${field} for ${site} — ${errs.join("; ")}. Save the ${site} login in the 1Password Logins vault.`, 5);
+  const s = await B.connect(tab);
+  try { await B.typeInto(s, selector, value); } finally { s.close(); value = null; }
+  out({ site, field, filled: true, source });
+}
+
+// ── card (requirement: enter the user's card details when no card is saved at
+// checkout, including into a payment processor's frame, so a person never has
+// to type the card) ──────────────────────────────────────────────────────────
+// Finding the fields, which frames qualify and the real input live in
+// lib/shop-card.mjs. This part only supplies the values, lazily: a value
+// is read from 1Password only when its field is on the form.
+async function card() {
+  const site = P.siteHost(argv[1] || die("usage: purchase card <site> --last4 NNNN [--add] [--shot <png>]", 64));
+  const last4 = flag("last4");
+  if (!/^[0-9]{4}$/.test(last4 || "")) die("--last4 must be 4 digits", 64);
+  const shotPath = flag("shot");
+  const tab = await B.workingTab();
+  if (!P.hostMatchesSite(tab.url, site)) die(`refusing: shop tab is on ${tab.url}, not ${site}`, 3);
+  let billing = null;
+  try {
+    const cfg = JSON.parse(fs.readFileSync(path.join(ROOT, "data/purchase-cards.json"), "utf8"));
+    billing = ((cfg.cards || []).find((c) => c.last4 === last4) || {}).billing || cfg.billing || null;
+  } catch {}
+  const names = C.nameParts(billing);
+  const read = {};
+  const cp = (field) => (read[field] ??= cardPass(last4, field));
+  const exp = () => C.parseExpiry(cp("expiry"));
+  const value = (kind) => {
+    switch (kind) {
+      case "number": return cp("number");
+      case "cvv": return cp("cvv");
+      case "name": return cp("name");
+      case "expiry": return exp()?.mmyy ?? null;
+      case "expMonth": return exp()?.month ?? null;
+      case "expYear": return exp()?.year ?? null;
+      case "given": return names.given || null;
+      case "family": return names.family || null;
+      default: return (billing && billing[kind]) || null;
+    }
+  };
+
+  // A processor's own "Card payment" button inside its frame opens the form first.
+  let opened;
+  const s0 = await B.connect(tab);
+  try { opened = await C.openCardForm(s0, { site }); }
+  catch (e) { if (e instanceof C.Refusal) die(e.message, 3); throw e; }
+  finally { s0.close(); }
+  if (opened.opened) await B.sleep(2000);
+
+  let r;
+  const s = await B.connect(tab);
+  try { r = await C.fillCard(s, { site, value, add: argv.includes("--add") }); }
+  catch (e) { if (e instanceof C.Refusal) die(e.message, 3); throw e; }
+  finally { s.close(); for (const k of Object.keys(read)) read[k] = null; }
+
+  let shot;
+  if (shotPath) {
+    if (r.added) await B.sleep(1500);
+    const s2 = await B.connect(await B.workingTab());
+    try { const m = await C.maskedScreenshot(s2, { format: shotPath.endsWith(".png") ? "png" : "jpeg" }); fs.writeFileSync(shotPath, m.data); shot = shotPath; }
+    finally { s2.close(); }
+  }
+  const short = [...r.missing, ...r.skipped, ...r.unconfirmed, ...r.invalid];
+  out({ site, last4, opened: opened.opened ? opened.button : undefined, frame: r.frame, processor: r.processor, filled: r.filled, missing: r.missing, skipped: r.skipped,
+        unconfirmed: r.unconfirmed, invalid: r.invalid,
+        added: argv.includes("--add") ? r.added : undefined, button: argv.includes("--add") ? r.button : undefined, shot,
+        note: r.missing.length ? "add the missing billing fields to data/purchase-cards.json (or ask the user)"
+          : short.length ? "some fields did not take; look with `purchase shot`, never cdp.py shot"
+          : argv.includes("--add") && !r.added ? "no Add Card / Continue clicked inside the card form; if the form's button is on the merchant's own page, click it with `purchase click`, otherwise send the user the shop-view link" : undefined });
+}
+
+// ── shot (the shop tab, card hidden) ───────────────────────────────────────
+async function shotCmd() {
+  const file = argv[1] || die("usage: purchase shot <file.png|file.jpg>", 64);
+  const tab = await B.workingTab();
+  const s = await B.connect(tab);
+  try {
+    const m = await C.maskedScreenshot(s, { format: file.endsWith(".png") ? "png" : "jpeg" });
+    fs.writeFileSync(file, m.data);
+    out({ path: file, url: tab.url, covered: m.masked });
+  } finally { s.close(); }
+}
+
+function cardPass(last4, field) {
+  try {
+    return execFileSync(path.join(ROOT, "bin/card-pass"), [last4, "--field", field],
+      { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], timeout: 30000 });
+  } catch (e) { die(`card-pass ${field}: ${String(e.stderr || e.message).trim().split("\n").pop()}`, 5); }
+}
+
+// ── otp (SMS via chat.db, email via Gmail) ─────────────────────────────────
+// The codes are machine-generated by the merchant ("Your Example Store code is
+// 123456"), not anything the user wrote; extracting the digits is structure.
+const CODE_RE = /(?<![\d$.,])(\d{4,8})(?![\d.,]?\d)/g; // lang-regex-ok: digits in a merchant's machine-sent OTP, not the user's words
+
+function codesIn(s) {
+  // lang-regex-ok: digits in a merchant's machine-sent OTP, not the user's words
+  return [...new Set([...String(s || "").matchAll(CODE_RE)].map((m) => m[1]).filter((c) => !/^(19|20)\d\d$/.test(c)))];
+}
+
+// Recent macOS leaves message.text NULL and keeps the body only in
+// attributedBody (an NSArchiver typedstream): the string follows the
+// "NSString" class name, after 5 header bytes and a length prefix
+// (one byte, or 0x81 + uint16 LE, or 0x82 + uint32 LE).
+function typedstreamText(hex) {
+  if (!hex) return "";
+  const buf = Buffer.from(hex, "hex");
+  const at = buf.indexOf("NSString");
+  if (at < 0) return "";
+  let i = at + "NSString".length + 5;
+  let len = buf[i++];
+  if (len === 0x81) { len = buf.readUInt16LE(i); i += 2; }
+  else if (len === 0x82) { len = buf.readUInt32LE(i); i += 4; }
+  return buf.subarray(i, i + len).toString("utf8");
+}
+
+function smsSince(sinceSec) {
+  const db = path.join(process.env.HOME, "Library/Messages/chat.db");
+  const since = (sinceSec - 978307200) * 1e9;
+  const q = `select m.date, coalesce(h.id,''), coalesce(m.text,''), coalesce(hex(m.attributedBody),'')
+             from message m left join handle h on h.ROWID=m.handle_id
+             where m.is_from_me=0 and m.date > ${Math.floor(since)} order by m.date desc limit 40`;
+  let rows;
+  try { rows = execFileSync("sqlite3", ["-readonly", "-separator", "\u001f", db, q], { encoding: "utf8", maxBuffer: 16 << 20 }); }
+  catch { return []; }
+  return rows.split("\n").filter(Boolean).map((l) => {
+    const [d, from, text, body] = l.split("\u001f");
+    return { source: "sms", from, at: new Date((Number(d) / 1e9 + 978307200) * 1000).toISOString(), text: text || typedstreamText(body) };
+  });
+}
+
+async function gmailSince(sinceSec) {
+  const require = createRequire(import.meta.url);
+  const { getAccessToken } = require(path.join(ROOT, "lib/google-auth.js"));
+  const token = await getAccessToken();
+  const api = "https://gmail.googleapis.com/gmail/v1/users/me/messages";
+  const list = await (await fetch(`${api}?maxResults=15&q=${encodeURIComponent(`after:${sinceSec - 60}`)}`,
+    { headers: { Authorization: `Bearer ${token}` } })).json();
+  const out = [];
+  for (const { id } of list.messages || []) {
+    const m = await (await fetch(`${api}/${id}?format=metadata&metadataHeaders=From&metadataHeaders=Subject`,
+      { headers: { Authorization: `Bearer ${token}` } })).json();
+    const hdr = (n) => (m.payload?.headers || []).find((h) => h.name.toLowerCase() === n)?.value || "";
+    if (Number(m.internalDate) / 1000 < sinceSec - 5) continue;
+    out.push({ source: "email", from: hdr("from"), at: new Date(Number(m.internalDate)).toISOString(),
+      text: `${hdr("subject")} — ${m.snippet || ""}` });
+  }
+  return out;
+}
+
+async function otp() {
+  const site = P.siteHost(argv[1] || die("usage: purchase otp <site> --since <unix-seconds> [--wait 120]", 64));
+  const since = Number(flag("since"));
+  if (!Number.isFinite(since) || since < Date.now() / 1000 - 30 * 60) die("--since must be the unix time you triggered the code (within the last 30 min)", 64);
+  const brand = site.split(".").slice(-2)[0];
+  const deadline = Date.now() + Number(flag("wait", "120")) * 1000;
+  for (;;) {
+    const msgs = [...smsSince(since), ...(await gmailSince(since).catch(() => []))];
+    const candidates = msgs.map((m) => ({ ...m, codes: codesIn(m.text),
+      mentions_site: (m.text + " " + m.from).toLowerCase().includes(brand) }))
+      // A message from the merchant counts even without a digit code: some send
+      // letters (some send 8 letters, others an alphanumeric code in the
+      // subject), so the caller reads the code from the excerpt.
+      .filter((m) => m.codes.length || m.mentions_site)
+      .map(({ text, ...m }) => ({ ...m, excerpt: text.slice(0, 400) }));
+    const forSite = candidates.filter((c) => c.mentions_site);
+    if (forSite.length || (candidates.length && Date.now() > deadline)) return out({ site, candidates: forSite.length ? forSite : candidates });
+    if (Date.now() > deadline) return out({ site, candidates: [] });
+    await B.sleep(5000);
+  }
+}
+
+// ── pair ───────────────────────────────────────────────────────────────────
+async function pair() {
+  const code = Array.from(crypto.randomBytes(8), (b) => "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"[b % 32]).join("");
+  const expires = new Date(Date.now() + 15 * 60 * 1000).toISOString();
+  await rest("purchase_pairing_codes", { method: "POST", prefer: "return=minimal",
+    body: { code_hash: crypto.createHash("sha256").update(code).digest("hex"), expires_at: expires } });
+  out({ code: `${code.slice(0, 4)}-${code.slice(4)}`, expires_at: expires,
+    how: "Jori app → menu → Pair Purchase Approval → enter this code (Face ID)." });
+}
+
+// ── session (which merchants the shop Chrome is signed in to) ───────────────
+// jobs/purchase-signin.md keeps the shop Chrome signed in to the merchants in
+// data/purchase-merchants.json and records each one's state here.
+const SESSIONS = path.join(ROOT, "data/purchases/sessions.json");
+const SESSION_STATES = ["signed_in", "needs_password", "needs_2fa", "blocked", "failed"];
+function session() {
+  const load = () => { try { return JSON.parse(fs.readFileSync(SESSIONS, "utf8")); } catch { return {}; } };
+  const sub = argv[1];
+  if (sub === "set") {
+    const site = P.siteHost(argv[2] || die("usage: purchase session set <site> <state> [--note '...']", 64));
+    const state = argv[3];
+    if (!SESSION_STATES.includes(state)) die(`state must be one of ${SESSION_STATES.join("|")}`, 64);
+    const all = load();
+    all[site] = { state, note: flag("note"), at: new Date().toISOString() };
+    fs.mkdirSync(path.dirname(SESSIONS), { recursive: true });
+    fs.writeFileSync(SESSIONS, JSON.stringify(all, null, 2));
+    return out({ site, ...all[site] });
+  }
+  if (sub === "list") {
+    const all = load();
+    // No merchant list (a fresh install) lists only the sites with a recorded state.
+    let merchants;
+    try { merchants = JSON.parse(fs.readFileSync(path.join(ROOT, "data/purchase-merchants.json"), "utf8")).merchants || []; }
+    catch { merchants = Object.keys(all).map((site) => ({ site, name: null })); }
+    return out(merchants.map((m) => ({ site: m.site, name: m.name, ...(all[m.site] || { state: "unknown" }) })));
+  }
+  die("usage: purchase session set <site> <state> [--note] | purchase session list", 64);
+}
+
+// ── click / type (trusted input for login forms) ────────────────────────────
+// Bot sensors refuse JS clicks and insertText; these send real mouse/key events.
+async function clickCmd() {
+  const selector = argv[1] || die("usage: purchase click '<css>'", 64);
+  const tab = await B.workingTab();
+  const s = await B.connect(tab);
+  try { if (!(await B.click(s, selector))) die(`not found or not visible: ${selector}`, 3); } finally { s.close(); }
+  out({ clicked: selector });
+}
+
+async function typeCmd() {
+  const selector = argv[1] || die("usage: purchase type '<css>' --text '<text>'", 64);
+  const text = flag("text");
+  if (text == null) die("--text is required", 64);
+  const tab = await B.workingTab();
+  const s = await B.connect(tab);
+  try { await B.typeInto(s, selector, text); } finally { s.close(); }
+  out({ typed: selector, chars: [...text].length });
+}
+
+const CMDS = { request, status, wait, cancel, fill, card, shot: shotCmd, otp, pair, session, click: clickCmd, type: typeCmd };
+if (!CMDS[cmd]) {
+  const lines = fs.readFileSync(new URL(import.meta.url), "utf8").split("\n").slice(1);
+  console.error(lines.slice(0, lines.findIndex((l) => !l.startsWith("//"))).map((l) => l.replace(/^\/\/ ?/, "")).join("\n"));
+  process.exit(cmd ? 64 : 0);
+}
+try { await CMDS[cmd](); } catch (e) { die(e.message); }

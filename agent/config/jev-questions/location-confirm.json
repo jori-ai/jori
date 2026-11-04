@@ -1,0 +1,14 @@
+{
+  "notes": "bin/location-confirm-resolve.mjs, after the deterministic tiers (1 memory radius, 2/2b calendar containment + address overlap, 3 the stated-place model ladder over the whole day's chat and calendar, lib/stated-place.mjs) found nothing. Jev picks which candidate the evidence clearly names, 'named_other' (the user's own message names a venue that is NOT a candidate — the on-device model then extracts the name), or 'ask'. A wrong auto-confirm writes a wrong stop into the location spine and confirmed-stops.json, so the threshold is conservative and 'ask' is the default. Candidate options c1..c5 are added in code from the ask (their criteria = name, type, address). Legacy = the old tail: the on-device messageVenueViaModel (tier 3b) then ask (tier 4). Asks with a medical candidate never reach Jev (health rule). `earlier_today` carries the user's own messages from earlier the same day, before the dwell window: a plan stated there for this dwell's time may pick a candidate (never named_other).",
+  "threshold": 0.9,
+  "questions": {
+    "venue": {
+      "type": "choice",
+      "instructions": "{{owner_name}}'s phone stopped (dwelled) at the GPS spot in `dwell`. `candidates` are nearby places from maps, and `calendar`, `messages` ({{owner_name}}'s own phone messages around the dwell, role=user), `earlier_today` ({{owner_name}}'s own messages from earlier the same day, before the dwell) and `wiki` are the only evidence. Which place does the evidence CLEARLY show {{owner_name}} was at? Pick a candidate only when a calendar event or {{owner_name}}'s own message explicitly names or unmistakably refers to it. A plan in `earlier_today` counts only when it is for THIS dwell's time (e.g. 'meeting them for lunch at X' before a dwell over lunchtime) and names one of the candidates; a place mentioned for another time, another stop, or as a recommendation does not. Proximity alone is NOT evidence. If a message of {{owner_name}}'s in `messages` states, in {{owner_name}}'s own words, a specific venue {{owner_name}} is/was at that is not among the candidates, pick named_other (never from `earlier_today`). If the evidence is silent, ambiguous, or conflicting, pick ask.",
+      "criteria": {
+        "ask": "the evidence does not clearly name where {{owner_name}} was — silent, ambiguous, several plausible places, or only GPS proximity",
+        "named_other": "one of {{owner_name}}'s own messages in the dwell window (`messages`, not `earlier_today`) names a specific restaurant, cafe, shop or other venue {{owner_name}} is/was at, and that venue is not in the candidate list"
+      }
+    }
+  }
+}

@@ -1,0 +1,12 @@
+{
+  "notes": "lib/calendar-place.mjs venueForCalendarMatch — a calendar event whose LOCATION field geocoded to a bare street address within 150 m of where the user was. Which business at that address (≤30 m of the geocode, built per call) was the user at? The event TITLE is only a hint (locations are only in the meeting location field; everything else is a hint); the photos the user took there are evidence. `none` → the stop is named by the address. Legacy = no pick (the address). Agreement deferred: the user's corrections are the ground truth. (The state key `photos_he_took_there` is the module's own field name.)",
+  "threshold": 0.8,
+  "questions": {},
+  "venue_template": {
+    "type": "choice",
+    "instructions": "{{owner_name}} had a calendar event whose location was a street address, and GPS puts {{owner_name}} at that address during the event. `businesses_at_that_address` are the businesses Google lists there. `calendar_event_title_hint` is what {{owner_name}} called the event — a hint about what was done there, never a place name — and `photos_he_took_there` describe {{owner_name}}'s photos from the visit. Which ONE of these businesses was {{owner_name}} at? Pick none if the hint and photos don't clearly point to one of them.",
+    "fixed_criteria": {
+      "none": "the title hint and the photos do not clearly point to one of these businesses"
+    }
+  }
+}

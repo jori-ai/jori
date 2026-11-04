@@ -5,15 +5,11 @@ import CryptoKit
 #if os(macOS)
 import AppKit
 typealias PlatformImage = NSImage
-private let previewFill = Color(nsColor: NSColor(name: nil) { appearance in
-    appearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
-    ? NSColor(red: 58/255, green: 58/255, blue: 60/255, alpha: 1)
-    : NSColor(red: 209/255, green: 209/255, blue: 214/255, alpha: 1)
-})
+private let previewFill = Color.primary.opacity(0.07)
 #else
 import UIKit
 typealias PlatformImage = UIImage
-private let previewFill = Color(UIColor.systemGray4)
+private let previewFill = Color.primary.opacity(0.07)
 #endif
 
 private func openExternalURL(_ url: URL) {
@@ -51,9 +47,10 @@ struct LinkPreviewCard: View {
                         .resizable()
                         .scaledToFill()
                         .frame(width: 48, height: 48)
-                        .clipShape(RoundedRectangle(cornerRadius: 8))
+                        .clipShape(RoundedRectangle(cornerRadius: Radius.thumb, style: .continuous))
+                        .transition(.opacity)
                 } else if !loaded {
-                    RoundedRectangle(cornerRadius: 8)
+                    RoundedRectangle(cornerRadius: Radius.thumb, style: .continuous)
                         .fill(previewFill)
                         .frame(width: 48, height: 48)
                         .overlay(ProgressView().scaleEffect(0.6))
@@ -73,12 +70,19 @@ struct LinkPreviewCard: View {
                 }
 
                 Spacer(minLength: 0)
+
+                Image(systemName: "arrow.up.right")
+                    .font(.caption.weight(.bold))
+                    .foregroundStyle(.tertiary)
             }
             .padding(10)
             .background(previewFill)
-            .clipShape(RoundedRectangle(cornerRadius: 12))
+            .clipShape(RoundedRectangle(cornerRadius: Radius.row, style: .continuous))
+            .contentShape(RoundedRectangle(cornerRadius: Radius.row, style: .continuous))
+            .animation(.easeOut(duration: 0.2), value: loaded)
         }
-        .buttonStyle(.plain)
+        .buttonStyle(PressableStyle())
+        .help(url.absoluteString)
         .task {
             guard !loaded else { return }
             await fetchMetadata()

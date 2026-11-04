@@ -1,0 +1,189 @@
+#!/usr/bin/env node
+// alert-provenance-audit — measure how many system-channel alerts were OBSERVED
+// versus COMPOSED.
+//
+// Why this exists (a system-issue review of fabricated mechanisms):
+// Across one two-week window, roughly 50 system-channel alerts spanning four
+// separate issue clusters narrated a specific technical failure mechanism that the
+// job turn never observed. Several were provably impossible for the code path named
+// (an OSStatus x509 error from a pure-Node fetch pipeline; "MCP Gmail write tools
+// unauthorized" from a pipeline that never calls MCP; "flights.json all nulls,
+// travel CLI unavailable" while the CLI answered correctly from Supabase and the
+// file held 18KB of real data).
+//
+// The cost of this is not the alerts. It is that root-cause analysis then builds on
+// fiction: seven fix attempts and four Face-ID cards were spent widening retry
+// envelopes and pacing Gmail writes, for a network fault the evidence says never
+// happened. Two of those fixes (in p1-alert-gate and unstar-scan-run)
+// were specifically designed to stop the fabrication and BOTH achieved 0%
+// compliance, because both were delivered as prose instructions to the same
+// ops-haiku tier that is not following prose instructions.
+//
+// This tool does not fix that. It measures it, so the fix can be chosen against a
+// number instead of an intuition — and so the chosen fix can be shown to work.
+// It is read-only: it queries jori_messages and prints. It sends nothing,
+// writes nothing outside its own report, and touches no outbound path.
+//
+// Usage:
+//   alert-provenance-audit [--days N] [--json] [--composed-only]
+//
+// Exit code is always 0. This is a reporting tool; it is never a reason to fail a
+// caller.
+
+"use strict";
+
+const fs = require("node:fs");
+const path = require("node:path");
+
+const { installRoot, installTools } = require("../lib/root.cjs");
+const { supabaseUrl } = require("../lib/instance.cjs");
+const ENV_FILE = path.join(installRoot(), ".env");
+const SUPABASE_URL = process.env.SUPABASE_URL || supabaseUrl();
+
+function serviceRoleKey() {
+  let raw = "";
+  try { raw = fs.readFileSync(ENV_FILE, "utf8"); } catch { return null; }
+  for (const line of raw.split("\n")) {
+    const eq = line.indexOf("=");
+    if (eq > 0 && line.slice(0, eq).trim() === "SUPABASE_SERVICE_ROLE_KEY") {
+      return line.slice(eq + 1).trim();
+    }
+  }
+  return null;
+}
+
+// ── Emitter fingerprints ────────────────────────────────────────────────────
+// lang-regex-ok: these patterns are matched against Jori's OWN generated alert
+// text to identify WHICH PROGRAM EMITTED IT. They decide provenance (machine
+// structure), never what the user meant — no user language is read here. Each entry
+// is the fixed opening shape of a deterministic emitter, so an alert that matches
+// one demonstrably came from that program rather than from an agent turn's prose.
+const DETERMINISTIC_EMITTERS = [
+  { name: "p1-alert-gate", re: /unstar-scan has been blocked for \d+ runs in a row/i },
+  { name: "p1-alert-gate(passthrough)", re: /unstar-scan reported a failure and p1-alert-gate could not decide/i },
+  { name: "watchdog.sh(recovery)", re: /^✅ recovered: .+ (is )?back to normal — auto-healed, stable for \d+ checks/im },
+  { name: "watchdog.sh(incident)", re: /not recovering after \d+ consecutive ticks/i },
+  { name: "supervisor(_sendPush)", re: /(max auth restored|crash-loop: \d+ consecutive zero-turn)/i },
+  { name: "hum(debug)", re: /^\[hum debug\]/im },
+];
+
+// lang-regex-ok: same rationale — this matches Jori's own machine-generated
+// alert text for the presence of a SPECIFIC TECHNICAL FAILURE MECHANISM (an error
+// code, or a named subsystem declared unavailable). It classifies the shape of a
+// claim Jori made about itself; it never interprets anything the user wrote.
+//
+// Extracted from bin/jori-send-curl rather than hand-duplicated here.
+// jori-send-curl's mechanism-attestation gate
+// enforces the SAME pattern at send time — this classifier was its origin (it
+// measured the fabrication rate that motivated the gate) and now reuses the
+// gate's copy as the single source of truth, so the two cannot drift apart the
+// way this file's old hardcoded duplicate could have. Falls back to the
+// original literal pattern if the script is ever unreadable or restructured,
+// so this audit degrades rather than crashes.
+const FALLBACK_MECHANISM_CLAIM_SRC =
+  "enotfound|getaddrinfo|econnrefused|etimedout|econnreset|dns (resolution )?(fail|error)|osstatus|x509|cert(ificate)? error|smtp2go (unreachable|down|error)|api unreachable|unreachable \\(|oauth[^.]{0,40}(expired|unauthorized|revoked)|tools? unauthorized|cli unavailable|cli unreachable|data corrupted|all nulls";
+
+function loadMechanismClaimSource() {
+  try {
+    const scriptPath = installTools("bin", "jori-send-curl");
+    const src = fs.readFileSync(scriptPath, "utf8");
+    const m = src.match(/^MECHANISM_CLAIM_RE='(.+)'$/m);
+    if (m) return m[1];
+  } catch {
+    /* fall through to the literal below */
+  }
+  return FALLBACK_MECHANISM_CLAIM_SRC;
+}
+
+const MECHANISM_CLAIM = new RegExp(loadMechanismClaimSource(), "i");
+
+function classify(content) {
+  for (const e of DETERMINISTIC_EMITTERS) {
+    if (e.re.test(content)) return { provenance: "observed", emitter: e.name };
+  }
+  if (MECHANISM_CLAIM.test(content)) {
+    return { provenance: "composed-mechanism-claim", emitter: null };
+  }
+  return { provenance: "narrative", emitter: null };
+}
+
+async function main() {
+  const argv = process.argv.slice(2);
+  const days = Number(argv[argv.indexOf("--days") + 1]) || 14;
+  const asJson = argv.includes("--json");
+  const composedOnly = argv.includes("--composed-only");
+
+  if (!SUPABASE_URL) {
+    console.error("alert-provenance-audit: no Supabase project configured (agent/local/instance.json supabase_project)");
+    process.exit(0);
+  }
+  const key = serviceRoleKey();
+  if (!key) {
+    console.error("alert-provenance-audit: SUPABASE_SERVICE_ROLE_KEY not found in " + ENV_FILE);
+    process.exit(0);
+  }
+
+  const since = new Date(Date.now() - days * 86400000).toISOString();
+  const url =
+    `${SUPABASE_URL}/rest/v1/jori_messages` +
+    `?select=id,role,content,created_at&channel=eq.system&role=eq.assistant` +
+    `&created_at=gte.${encodeURIComponent(since)}&order=created_at.asc&limit=2000`;
+
+  let rows = [];
+  try {
+    const res = await fetch(url, {
+      headers: { apikey: key, Authorization: `Bearer ${key}` },
+      signal: AbortSignal.timeout(20000),
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    rows = await res.json();
+  } catch (err) {
+    console.error(`alert-provenance-audit: fetch failed (${err.message}) — no report produced.`);
+    process.exit(0);
+  }
+
+  const tally = { observed: 0, narrative: 0, "composed-mechanism-claim": 0 };
+  const composed = [];
+  const byEmitter = {};
+
+  for (const r of rows) {
+    const content = String(r.content || "");
+    const { provenance, emitter } = classify(content);
+    tally[provenance]++;
+    if (emitter) byEmitter[emitter] = (byEmitter[emitter] || 0) + 1;
+    if (provenance === "composed-mechanism-claim") {
+      composed.push({ created_at: r.created_at, id: r.id, excerpt: content.slice(0, 160) });
+    }
+  }
+
+  const total = rows.length;
+  const pct = (n) => (total ? ((n / total) * 100).toFixed(1) : "0.0");
+
+  if (asJson) {
+    console.log(JSON.stringify({ days, total, tally, byEmitter, composed }, null, 2));
+    process.exit(0);
+  }
+
+  if (!composedOnly) {
+    console.log(`alert-provenance-audit — system channel, last ${days} days (${total} alerts)`);
+    console.log(``);
+    console.log(`  observed (matched a deterministic emitter)   ${String(tally.observed).padStart(4)}  ${pct(tally.observed)}%`);
+    console.log(`  narrative (no mechanism asserted)            ${String(tally.narrative).padStart(4)}  ${pct(tally.narrative)}%`);
+    console.log(`  COMPOSED mechanism claim (unverified)        ${String(tally["composed-mechanism-claim"]).padStart(4)}  ${pct(tally["composed-mechanism-claim"])}%`);
+    console.log(``);
+    for (const [name, n] of Object.entries(byEmitter).sort((a, b) => b[1] - a[1])) {
+      console.log(`    via ${name}: ${n}`);
+    }
+    console.log(``);
+  }
+
+  if (composed.length) {
+    console.log(`Unverified mechanism claims (${composed.length}):`);
+    for (const c of composed) console.log(`  ${c.created_at.slice(0, 16)}  ${c.excerpt.replace(/\s+/g, " ")}`);
+  } else {
+    console.log(`No unverified mechanism claims in the window.`);
+  }
+  process.exit(0);
+}
+
+main();

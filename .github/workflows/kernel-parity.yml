@@ -1,0 +1,143 @@
+name: Kernel parity
+
+# Weekly check that the published kernel stands on its own.
+#
+# Jori ships as this repo alone; an installation keeps its private overlay
+# (agent/local/, personal bins, registries, the pattern list) checked out over
+# the same folder. The risk this catches is drift the installation never sees:
+# a kernel file that quietly needs an overlay file, or personal data that slipped
+# into the kernel. So this runs on a plain clone with no overlay and an empty
+# agent/local, laid out like a fresh install (~/Dev/jori is the checkout):
+#
+#   1. kernel-guard: personal data in kernel files (any hard hit fails)
+#   2. kernel-guard --closure: kernel code leans only on kernel files
+#   3. sanitize-guard, when the JORI_SANITIZE_PATTERNS_JSON secret is set
+#   4. the kernel test suites (node, python, shell), *-local tests excluded
+#
+# Every check runs even when an earlier one failed, so one run lists them all.
+
+on:
+  schedule:
+    - cron: "17 7 * * 1" # Mondays 07:17 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: kernel-parity
+  cancel-in-progress: true
+
+jobs:
+  parity:
+    # The kernel targets macOS (launchd, osascript, /usr/sbin tools); several
+    # tests need it.
+    runs-on: macos-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "26"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Lay out a fresh install
+        # The install path (lib/root.cjs installRoot()) is the checkout, as in a
+        # fresh install; JORI_LOCAL_DIR is an empty agent/local, so every
+        # capability that needs local config is off. Tests that commit need a
+        # git identity.
+        run: |
+          test ! -e .overlay.git || { echo "::error::an overlay is checked out"; exit 1; }
+          mkdir -p "$HOME/Dev"
+          ln -sfn "$GITHUB_WORKSPACE" "$HOME/Dev/jori"
+          mkdir -p "$RUNNER_TEMP/jori-local"
+          echo "JORI_LOCAL_DIR=$RUNNER_TEMP/jori-local" >> "$GITHUB_ENV"
+          git config --global user.name "kernel-parity"
+          git config --global user.email "kernel-parity@example.com"
+          git config --global init.defaultBranch main
+
+      - name: kernel-guard (personal data)
+        if: ${{ !cancelled() }}
+        run: |
+          node bin/kernel-guard --report --summary
+          hard=$(node bin/kernel-guard --report --summary --json | jq '.totals.hard')
+          if [ "$hard" != "0" ]; then
+            echo "::error title=kernel-guard::$hard hard hit(s) in kernel files"
+            exit 1
+          fi
+
+      - name: kernel-guard --closure (kernel leans only on the kernel)
+        if: ${{ !cancelled() }}
+        # Imports of, and paths to, files that are not in the kernel fail. The
+        # install-path ratchet (lines that spell ~/Dev/jori or Homebrew's node)
+        # keeps its per-file allowance in the installation's private config, so
+        # here it is reported, not enforced.
+        run: |
+          node bin/kernel-guard --closure --report --json > "$RUNNER_TEMP/closure.json"
+          jq -r '.violations[] | select(.kind != "install-path") | "\(.file):\(.line)  \(.target)  (\(.reason))"' "$RUNNER_TEMP/closure.json"
+          bad=$(jq '[.violations[] | select(.kind != "install-path")] | length' "$RUNNER_TEMP/closure.json")
+          ipath=$(jq '[.violations[] | select(.kind == "install-path")] | length' "$RUNNER_TEMP/closure.json")
+          echo "::notice title=install-path lines::$ipath kernel code line(s) spell the install path or Homebrew's node (ratchet enforced by the installation)"
+          if [ "$bad" != "0" ]; then
+            echo "::error title=closure::$bad kernel file reference(s) outside the kernel"
+            exit 1
+          fi
+
+      - name: sanitize-guard
+        if: ${{ !cancelled() }}
+        env:
+          JORI_SANITIZE_PATTERNS_JSON: ${{ secrets.JORI_SANITIZE_PATTERNS_JSON }}
+        run: |
+          if [ -z "$JORI_SANITIZE_PATTERNS_JSON" ]; then
+            echo "::notice title=sanitize-guard skipped::the JORI_SANITIZE_PATTERNS_JSON secret is not set"
+            exit 0
+          fi
+          python3 .tools/sanitize-guard.py --all
+
+      - name: Install dependencies
+        if: ${{ !cancelled() }}
+        run: |
+          for d in . agent bin agent/tools-mcp agent/supervisor agent/dispatch-bridge agent/health-mcp agent/phone-channel agent/webhook-channel agent/whatsapp-channel; do
+            [ -f "$d/package-lock.json" ] || continue
+            echo "== $d"
+            (cd "$d" && npm ci --ignore-scripts --no-audit --no-fund --loglevel=error)
+          done
+
+      - name: Node tests
+        if: ${{ !cancelled() }}
+        run: |
+          files=$(ls tests/*.test.mjs agent/test/*.test.mjs agent/scripts/lib/*.test.mjs | grep -v -- '-local\.test\.')
+          # shellcheck disable=SC2086
+          node --test --test-timeout=180000 --test-reporter=spec $files
+
+      - name: Python tests
+        if: ${{ !cancelled() }}
+        run: |
+          failed=()
+          for f in tests/*.test.py; do
+            case "$f" in *-local.test.py) continue ;; esac
+            echo "== $f"
+            python3 "$f" || failed+=("$f")
+          done
+          if [ ${#failed[@]} -gt 0 ]; then
+            printf '::error title=python tests::%s\n' "${failed[@]}"
+            exit 1
+          fi
+
+      - name: Shell tests
+        if: ${{ !cancelled() }}
+        run: |
+          failed=()
+          for f in tests/*.test.sh; do
+            case "$f" in *-local.test.sh) continue ;; esac
+            echo "== $f"
+            bash "$f" || failed+=("$f")
+          done
+          if [ ${#failed[@]} -gt 0 ]; then
+            printf '::error title=shell tests::%s\n' "${failed[@]}"
+            exit 1
+          fi

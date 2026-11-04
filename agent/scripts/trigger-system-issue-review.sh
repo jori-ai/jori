@@ -77,6 +77,14 @@ fi
 
 log() { echo "$(date '+%Y-%m-%d %H:%M:%S') [system-issue-review${MODE:+/$MODE}] $1" >> "$LOGFILE"; }
 
+# The allowance governor's release (bin/allowance-brake): every job it held
+# while the week was on pace to run out is relaunched (launchctl kickstart of its
+# release_label) as soon as the week has room for it again, after the reset or
+# earlier. Both lanes carry it, so it runs every hour (the critical lane fires
+# hourly), whatever this job's own gate decides below. Never blocks this job.
+RELEASED="$("$JORI_INSTALL_TOOLS/bin/allowance-brake" release 2>/dev/null)"
+[ -n "$RELEASED" ] && log "allowance governor: $RELEASED"
+
 # --- fetch the last 14d of system-channel rows → local batch; print "<new>:<due>:<crit>:<sig>" ---
 # new  = assistant alerts newer than the state cursor (the work signal)
 # due  = clusters in verifying/awaiting_approval whose verify_after has passed
@@ -160,7 +168,16 @@ else
     log "skip: no new system alerts and nothing due for verification"
     exit 0
   fi
+  # The allowance brake: while the weekly Claude allowance is on pace to run
+  # out before it resets, the nightly pass waits; nothing is lost, the first
+  # pass after the reset reads the same 14-day window from the same cursor.
+  # The hourly critical lane above is never held. Fail-open.
+  BRAKE="$("$JORI_INSTALL_TOOLS/bin/allowance-brake" check system-issue-review 2>/dev/null)"
+  if [ $? -eq 3 ]; then log "skip: held by the allowance brake: ${BRAKE#hold: }"; exit 0; fi
 fi
+# Decided above (nightly) or exempt (the critical lane is never held): the
+# runner's own allowance check (lib/allowance-gate.sh) must not ask again.
+export JORI_BRAKE_DECIDED=1
 
 # Record the escalated signature so the next hourly run doesn't re-dispatch the
 # same condition. Called only AFTER a confirmed dispatch — a webhook failure

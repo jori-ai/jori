@@ -1,0 +1,115 @@
+#!/usr/bin/env node
+/**
+ * day-correction — record what the user told us about a PAST day outside chat.
+ *
+ * The daily summary reads what the user says from jori_messages. An emailed reply
+ * to "Day of Saturday, October 10" is not in there, so a fact it carried (2026-10-10:
+ * "The 7am also had a coffee stop and a bagel run at Abulafia") had no way to
+ * reach the next render. This file is that way. The harvest reads it
+ * (lib/daily-summary-harvest.js) and hands each entry to the narrator,
+ * anchored by time to the stop(s) its window touches.
+ *
+ * Since 2026-10-22 (the user: keep the original day, the user's corrections on top,
+ * readers see the corrected version first) this file is also THE corrected
+ * layer for every reader of a past day: `location-day` and `live-day day`
+ * attach these entries (lib/day-overlay.js), and the daily-summary fix
+ * loop and chat record the user's chat corrections here too (`--channel chat`). The
+ * stored day (the live-day archive) is never rewritten.
+ *
+ * It stores the user's WORDS and a window; it interprets nothing (Rule #0b). The turn
+ * that records it — a model reading the whole email — decides which window the
+ * sentence is about, and may add a `--reading`: its own disambiguation, kept
+ * apart from the user's words (one "at" joining two activities that the map puts 140 m
+ * apart is exactly the case). The narrator decides what it establishes.
+ *
+ * Usage:
+ *   day-correction add <YYYY-MM-DD> --text "<the user's words, verbatim>"
+ *       [--from <ISO with offset> --to <ISO with offset>]   the stretch it is about
+ *       [--channel email] [--said-at <ISO>] [--source <message id>]
+ *       [--reading "<your reading of it, one or two sentences>"]
+ *   day-correction list <YYYY-MM-DD>
+ *   day-correction rm <YYYY-MM-DD> <n>                       1-based, as `list` numbers them
+ *
+ * `add` is idempotent on (date, text): the same sentence recorded twice is one
+ * entry, so a re-dispatched email turn cannot double it.
+ * After recording, re-render with `daily-summary-run <date>` (or `SILENT`).
+ */
+"use strict";
+const fs = require("node:fs");
+const path = require("node:path");
+
+const DIR = process.env.JORI_DAY_CORRECTIONS_DIR
+  || require("../lib/root.cjs").installTools("data", "day-corrections");
+
+function die(msg, code = 2) { process.stderr.write(`day-correction: ${msg}\n`); process.exit(code); }
+
+function arg(argv, name) {
+  const i = argv.indexOf(name);
+  return i > -1 ? argv[i + 1] : undefined;
+}
+
+function isDate(s) { return /^\d{4}-\d{2}-\d{2}$/.test(s || ""); } // lang-regex-ok: validating a YYYY-MM-DD argument, not language
+
+function readAll(date) {
+  try {
+    return fs.readFileSync(path.join(DIR, `${date}.jsonl`), "utf8")
+      .split("\n").filter((l) => l.trim()).map((l) => JSON.parse(l));
+  } catch (e) {
+    if (e.code === "ENOENT") return [];
+    throw e;
+  }
+}
+
+function writeAll(date, rows) {
+  fs.mkdirSync(DIR, { recursive: true });
+  const file = path.join(DIR, `${date}.jsonl`);
+  const tmp = `${file}.${process.pid}.tmp`;
+  fs.writeFileSync(tmp, rows.map((r) => JSON.stringify(r)).join("\n") + (rows.length ? "\n" : ""));
+  fs.renameSync(tmp, file);
+}
+
+function validIso(s) { return Number.isFinite(Date.parse(s)) && /(Z|[+-]\d{2}:?\d{2})$/.test(s); } // lang-regex-ok: checking an ISO timestamp carries an offset
+
+const [cmd, date, ...rest] = process.argv.slice(2);
+if (!cmd || !["add", "list", "rm"].includes(cmd)) die("usage: day-correction add|list|rm <YYYY-MM-DD> ...");
+if (!isDate(date)) die("second argument must be a YYYY-MM-DD date");
+
+if (cmd === "list") {
+  const rows = readAll(date);
+  if (!rows.length) { console.log(`(no corrections recorded for ${date})`); process.exit(0); }
+  rows.forEach((r, i) => console.log(`${i + 1}. [${r.channel}] ${r.applies_from ? `${r.applies_from} → ${r.applies_to}` : "no window"} — ${r.text}`));
+  process.exit(0);
+}
+
+if (cmd === "rm") {
+  const n = Number(rest[0]);
+  const rows = readAll(date);
+  if (!Number.isInteger(n) || n < 1 || n > rows.length) die(`rm needs a number between 1 and ${rows.length}`);
+  const [gone] = rows.splice(n - 1, 1);
+  writeAll(date, rows);
+  console.log(`removed: ${gone.text}`);
+  process.exit(0);
+}
+
+const text = (arg(rest, "--text") || "").trim();
+if (!text) die("add needs --text \"<his words>\"");
+const from = arg(rest, "--from");
+const to = arg(rest, "--to");
+if ((from && !to) || (to && !from)) die("--from and --to go together");
+if (from && (!validIso(from) || !validIso(to))) die("--from/--to must be ISO timestamps with an offset, e.g. 2026-10-10T07:00:00+03:00");
+if (from && Date.parse(to) <= Date.parse(from)) die("--to must be after --from");
+const saidAt = arg(rest, "--said-at");
+if (saidAt && !validIso(saidAt)) die("--said-at must be an ISO timestamp with an offset");
+
+const rows = readAll(date);
+if (rows.some((r) => r.text === text)) { console.log("already recorded — nothing to do"); process.exit(0); }
+rows.push({
+  said_at: saidAt || new Date().toISOString(),
+  channel: arg(rest, "--channel") || "email",
+  text,
+  ...(from ? { applies_from: from, applies_to: to } : {}),
+  ...(arg(rest, "--source") ? { source: arg(rest, "--source") } : {}),
+  ...(arg(rest, "--reading") ? { reading: arg(rest, "--reading").trim() } : {}),
+});
+writeAll(date, rows);
+console.log(`recorded for ${date} (${rows.length} total)`);

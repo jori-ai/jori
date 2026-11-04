@@ -1,0 +1,158 @@
+#!/usr/bin/env node
+// mkt-actions — track + retire marketing actions in mkt-actions-state.json.
+//
+// The deterministic primitive layer for the action ledger: agents and the user use
+// this instead of hand-editing JSON (which is how the ledger drifted from reality —
+// "proposed" rows that were actually done, dead premises, duplicates).
+//
+// The SEMANTIC reconciliation (is this open action actually already done on the live
+// site?) is the mkt-actions-audit job's responsibility — it runs in the agent's LLM
+// session, reads `mkt-actions list --open --json` here, verifies against the live
+// site with judgment, and calls `retire` / `complete` below for the clear-cut cases.
+//
+// Scopes: "jori_autonomous" (the agent may do it; an older spelling a ledger
+// still holds goes in agent/local/config/marketing.json
+// extend_autonomous_scopes) and "manual_<owner_id>" (the user's own;
+// instance().owner_id, so rows written before keep matching).
+//
+// Usage:
+//   mkt-actions list [--open|--done|--abandoned|--all] [--auto|--manual] [--json]
+//   mkt-actions show <id>
+//   mkt-actions stats
+//   mkt-actions stale [--days N] [--json]        # open rows untouched > N days (default 14)
+//   mkt-actions retire <id> <reason...>          # -> abandoned, audit-noted, atomic
+//   mkt-actions complete <id> <note...>          # -> completed, completed_at set
+//
+// State-only; never sends anything. Atomic tmp+rename on every mutation.
+
+import { readFileSync, writeFileSync, renameSync, existsSync } from "node:fs";
+import { createRequire } from "node:module";
+
+const require = createRequire(import.meta.url);
+const { instance, localConfig } = require("../lib/instance.cjs");
+const { installTools } = require("../lib/root.cjs");
+
+const P = installTools("data", "mkt-actions-state.json");
+const MANUAL = `manual_${instance().owner_id || "user"}`;
+const AUTO = new Set([].concat(localConfig("marketing", { autonomous_scopes: ["jori_autonomous"] }).autonomous_scopes));
+const isAuto = (a) => AUTO.has(a.scope);
+const OPEN = new Set(["proposed", "in_progress"]);
+const nowISO = () => new Date().toISOString();
+
+function load() {
+  if (!existsSync(P)) return { actions: [] }; // no ledger yet: the module is off
+  return JSON.parse(readFileSync(P, "utf8"));
+}
+function save(d) {
+  const tmp = `${P}.tmp`;
+  writeFileSync(tmp, JSON.stringify(d, null, 2));
+  renameSync(tmp, P);
+}
+function find(d, id) {
+  const a = d.actions.find((x) => x.id === id);
+  if (!a) { console.error(`mkt-actions: no action with id ${id}`); process.exit(1); }
+  return a;
+}
+function ageDays(a) {
+  const t = Date.parse(a.updated_at || a.created_at || "");
+  if (Number.isNaN(t)) return null;
+  return Math.floor((Date.now() - t) / 86400000);
+}
+const impactRank = (i) => ({ high: 0, medium: 1, low: 2 }[i] ?? 3);
+
+function rows(d, { status, scope } = {}) {
+  let r = d.actions.slice();
+  if (status === "open") r = r.filter((a) => OPEN.has(a.status));
+  else if (status) r = r.filter((a) => a.status === status);
+  if (scope === "auto") r = r.filter(isAuto);
+  else if (scope) r = r.filter((a) => a.scope === scope);
+  return r.sort((a, b) => impactRank(a.estimated_impact) - impactRank(b.estimated_impact) || a.id.localeCompare(b.id));
+}
+
+const args = process.argv.slice(2);
+const cmd = args[0];
+const has = (f) => args.includes(f);
+const flagVal = (f, dflt) => { const i = args.indexOf(f); return i >= 0 && args[i + 1] ? args[i + 1] : dflt; };
+
+function scopeFilter() { return has("--auto") ? "auto" : has("--manual") ? MANUAL : null; }
+
+function printRow(a) {
+  const age = ageDays(a);
+  const agetag = OPEN.has(a.status) && age != null ? ` ${age}d` : "";
+  console.log(`  ${a.id}  [${a.status}/${a.estimated_impact ?? "?"}${agetag}] (${isAuto(a) ? "auto" : "manual"}/${a.category ?? "?"})`);
+  console.log(`      ${(a.title || "").slice(0, 96)}`);
+}
+
+switch (cmd) {
+  case "list": {
+    const d = load();
+    const status = has("--all") ? null : has("--done") ? "completed" : has("--abandoned") ? "abandoned" : "open";
+    const r = rows(d, { status, scope: scopeFilter() });
+    if (has("--json")) { console.log(JSON.stringify(r, null, 2)); break; }
+    const label = status ? status.toUpperCase() : "ALL";
+    console.log(`\n${label} actions${scopeFilter() ? ` (${scopeFilter()})` : ""}: ${r.length}\n`);
+    r.forEach(printRow);
+    break;
+  }
+  case "show": {
+    const a = find(load(), args[1]);
+    console.log(JSON.stringify(a, null, 2));
+    break;
+  }
+  case "stats": {
+    const d = load();
+    const by = {};
+    for (const a of d.actions) {
+      const k = `${isAuto(a) ? "auto" : "manual"}/${a.status}`;
+      by[k] = (by[k] || 0) + 1;
+    }
+    console.log(`\nLedger: ${d.actions.length} actions total\n`);
+    Object.entries(by).sort().forEach(([k, n]) => console.log(`  ${k.padEnd(28)} ${n}`));
+    const open = d.actions.filter((a) => OPEN.has(a.status));
+    console.log(`\n  OPEN total: ${open.length}  (auto ${open.filter(isAuto).length} / manual ${open.filter(a=>a.scope===MANUAL).length})`);
+    break;
+  }
+  case "stale": {
+    const d = load();
+    const days = parseInt(flagVal("--days", "14"), 10);
+    const r = rows(d, { status: "open" }).filter((a) => (ageDays(a) ?? 0) >= days);
+    if (has("--json")) { console.log(JSON.stringify(r, null, 2)); break; }
+    console.log(`\nSTALE — open & untouched >= ${days} days: ${r.length}\n`);
+    r.forEach(printRow);
+    if (!r.length) console.log("  (none)");
+    break;
+  }
+  case "retire": {
+    const id = args[1];
+    const reason = args.slice(2).join(" ").trim();
+    if (!id || !reason) { console.error("usage: mkt-actions retire <id> <reason...>"); process.exit(2); }
+    const d = load(); const a = find(d, id);
+    if (!OPEN.has(a.status)) { console.error(`mkt-actions: ${id} is already ${a.status} — not retiring`); process.exit(1); }
+    a.status = "abandoned"; a.updated_at = nowISO();
+    a.execution_notes = `${a.execution_notes ? a.execution_notes + " | " : ""}RETIRED ${nowISO().slice(0,10)}: ${reason}`;
+    save(d);
+    console.log(`retired ${id} -> abandoned`);
+    break;
+  }
+  case "complete": {
+    const id = args[1];
+    const note = args.slice(2).join(" ").trim();
+    if (!id || !note) { console.error("usage: mkt-actions complete <id> <note...>"); process.exit(2); }
+    const d = load(); const a = find(d, id);
+    a.status = "completed"; a.updated_at = nowISO(); a.completed_at = nowISO();
+    a.execution_notes = `${a.execution_notes ? a.execution_notes + " | " : ""}COMPLETED ${nowISO().slice(0,10)}: ${note}`;
+    save(d);
+    console.log(`completed ${id}`);
+    break;
+  }
+  default:
+    console.log(`mkt-actions — track + retire marketing actions
+
+  list [--open|--done|--abandoned|--all] [--auto|--manual] [--json]   default: --open
+  show <id>
+  stats
+  stale [--days N] [--json]            open rows untouched >= N days (default 14)
+  retire <id> <reason...>              -> abandoned (audit-noted, atomic)
+  complete <id> <note...>              -> completed`);
+    if (cmd && cmd !== "help" && cmd !== "--help") process.exit(2);
+}

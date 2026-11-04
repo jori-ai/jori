@@ -1,0 +1,221 @@
+#!/usr/bin/env node
+/**
+ * domain-allocation — current portfolio weight per investment domain, versus a
+ * fixed dated reference, with over/under flags.
+ *
+ * WHY THIS IS CODE AND NOT A PROMPT. A portfolio review that is asked to
+ * "indicate over/under investment in any domain" against the allocation the
+ * user approved is pure arithmetic over rows already held — and money math is
+ * done in code, with the agent quoting the result. A weight typed out of a memo
+ * is the drift this tool exists to catch.
+ *
+ * THE REFERENCE IS FROZEN, NOT ROLLING. It is a dated snapshot inside the map
+ * file, re-based only when the user says so. If it re-based every week, drift
+ * would always read zero and the whole check would be decorative.
+ * `weeks_since_rebase` is printed so a stale reference is visible.
+ *
+ * PRIMARY WEIGHTS SUM TO 100. Every ticker has exactly one primary domain.
+ * Adjacency is reported separately and never summed into a domain total — its
+ * job is to stop the book telling itself a false diversification story: a
+ * position whose business rides the same cycle as the concentration domain is
+ * ADDING to that concentration, not spreading it. That is why the
+ * concentration domain "incl. adjacent" prints as its own line.
+ *
+ * MODEL-ONLY DATA. Position values are the same tier as health and bank data
+ * (agent/CLAUDE.md § Financial Operations). Output goes to the terminal, the
+ * memo, and the user's own inbox — never into a web search, an external LLM,
+ * or outbound-precheck.
+ *
+ * Config: agent/local/config/domain-allocation.json
+ *   map_file              the ticker → domain map + reference (relative to the
+ *                         install's kernel tree); missing file = OFF
+ *   concentration_domain  the domain whose adjacent exposure is the
+ *                         concentration-risk number ("" = no such line)
+ *   thresholds            { note_pp, note_rel, flag_pp, flag_rel }
+ * Map file shape: { domains: { <id>: { display, primary: [tickers] } },
+ *   adjacent: { <ticker>: [<domain id>, …] },
+ *   reference_allocation: { as_of, weights: { <id>: pct }, … } }
+ * Positions come from the brokerage snapshot's positions table
+ * (agent/local/config/investments.json `broker.tables.positions`).
+ *
+ * Usage:
+ *   domain-allocation                 # table
+ *   domain-allocation --json          # machine-readable
+ *   domain-allocation --rebase        # rewrite the reference to today's actuals
+ *                                     #   (only on the user's explicit say-so)
+ */
+
+const fs = require("fs");
+const { localConfig } = require("../lib/instance.cjs");
+const { installTools } = require("../lib/root.cjs");
+
+// Flag thresholds. Two-tier and dual-basis so the same rule works for a domain
+// at 58% and one at 1.2%: absolute points matter for the big ones, relative
+// change for the small ones, and whichever trips first wins.
+const DEFAULT_THRESHOLDS = { note_pp: 1.0, note_rel: 0.10, flag_pp: 2.5, flag_rel: 0.25 };
+
+function config() {
+  const cfg = localConfig("domain-allocation", { map_file: "", concentration_domain: "", thresholds: {} });
+  cfg.thresholds = { ...DEFAULT_THRESHOLDS, ...(cfg.thresholds || {}) };
+  return cfg;
+}
+
+function pct(n) { return `${n.toFixed(2)}%`; }
+// Avoid rendering "-0.00" on a zero delta — it reads as movement when there is none.
+function sgn(n) { return Math.abs(n) < 0.005 ? " " : n > 0 ? "+" : "-"; }
+
+/** Pure: positions rows ({ticker,name,market_value,as_of}) + map → allocation. */
+function allocate(map, rows, { concentrationDomain = "", thresholds = DEFAULT_THRESHOLDS } = {}) {
+  const { note_pp: NOTE_PP, note_rel: NOTE_REL, flag_pp: FLAG_PP, flag_rel: FLAG_REL } = thresholds;
+  const asOf = rows.map((r) => r.as_of).sort().pop();
+  const current = rows.filter((r) => r.as_of === asOf);
+
+  // Aggregate across accounts — a ticker held in six accounts is one exposure.
+  const byTicker = {};
+  for (const r of current) {
+    const t = r.ticker;
+    byTicker[t] = byTicker[t] || { mv: 0, name: r.name };
+    byTicker[t].mv += Number(r.market_value) || 0;
+  }
+  const total = Object.values(byTicker).reduce((a, b) => a + b.mv, 0);
+
+  const primaryOf = {};
+  for (const [dom, cfg] of Object.entries(map.domains || {})) {
+    for (const t of cfg.primary || []) primaryOf[t] = dom;
+  }
+
+  const domainMv = {};
+  for (const d of Object.keys(map.domains || {})) domainMv[d] = 0;
+  const unclassified = [];
+  for (const [t, v] of Object.entries(byTicker)) {
+    const d = primaryOf[t];
+    if (!d) { unclassified.push({ ticker: t, name: v.name, pct: (100 * v.mv) / total }); continue; }
+    domainMv[d] += v.mv;
+  }
+
+  // Adjacent exposure: reported, never summed into a domain total.
+  const adj = map.adjacent || {};
+  const adjacentMv = concentrationDomain
+    ? Object.entries(byTicker)
+      .filter(([t]) => primaryOf[t] !== concentrationDomain && (adj[t] || []).includes(concentrationDomain))
+      .reduce((a, [, v]) => a + v.mv, 0)
+    : 0;
+
+  const ref = map.reference_allocation || {};
+  const refWeights = ref.weights || {};
+
+  const out = [];
+  for (const [d, cfg] of Object.entries(map.domains || {})) {
+    const actual = (100 * domainMv[d]) / total;
+    const r = refWeights[d];
+    const dpp = r == null ? null : actual - r;
+    const drel = r == null || r === 0 ? null : (actual - r) / r;
+    let status = "—";
+    if (dpp != null) {
+      const hitFlag = Math.abs(dpp) >= FLAG_PP || (drel != null && Math.abs(drel) >= FLAG_REL);
+      const hitNote = Math.abs(dpp) >= NOTE_PP || (drel != null && Math.abs(drel) >= NOTE_REL);
+      status = hitFlag ? (dpp > 0 ? "OVER (flag)" : "UNDER (flag)")
+             : hitNote ? (dpp > 0 ? "over (note)" : "under (note)")
+             : "in line";
+    }
+    out.push({ domain: d, display: cfg.display || d, actual, reference: r, delta_pp: dpp, delta_rel: drel, status });
+  }
+  out.sort((a, b) => b.actual - a.actual);
+
+  const primary = concentrationDomain ? out.find((o) => o.domain === concentrationDomain) : null;
+  const inclusive = concentrationDomain ? (primary ? primary.actual : 0) + (100 * adjacentMv) / total : null;
+
+  let weeksSince = null;
+  if (ref.as_of) weeksSince = Math.floor((Date.parse(asOf) - Date.parse(ref.as_of)) / (7 * 864e5));
+
+  return { asOf, total, ref, weeksSince, out, inclusive, unclassified };
+}
+
+async function main() {
+  const args = process.argv.slice(2);
+  const asJson = args.includes("--json");
+  const doRebase = args.includes("--rebase");
+  const cfg = config();
+  const mapPath = cfg.map_file ? (cfg.map_file.startsWith("/") ? cfg.map_file : installTools(cfg.map_file)) : "";
+  if (!mapPath || !fs.existsSync(mapPath)) {
+    console.log("domain-allocation: not configured (agent/local/config/domain-allocation.json map_file) — nothing to do");
+    return;
+  }
+  const { brokerConfig } = require("../lib/broker-config.cjs");
+  const broker = brokerConfig();
+  const map = JSON.parse(fs.readFileSync(mapPath, "utf8"));
+  const conc = cfg.concentration_domain || "";
+  const T = cfg.thresholds;
+
+  const { request } = require("../lib/supabase-rest.js");
+  const rows = await request(`/rest/v1/${broker.tables.positions}?select=ticker,name,market_value,as_of`);
+  if (!rows || !rows.length) {
+    console.error("domain-allocation: no positions returned");
+    process.exit(1);
+  }
+  const { asOf, total, ref, weeksSince, out, inclusive, unclassified } =
+    allocate(map, rows, { concentrationDomain: conc, thresholds: T });
+  const concDisplay = conc ? ((map.domains[conc] || {}).display || conc) : "";
+
+  if (doRebase) {
+    const weights = {};
+    for (const o of out) weights[o.domain] = Number(o.actual.toFixed(3));
+    map.reference_allocation = {
+      _comment: map.reference_allocation?._comment,
+      approved: true,
+      // Carry attribution across a rebase. Losing who approved the reference
+      // would quietly turn an authorised number into an anonymous one.
+      approved_by: map.reference_allocation?.approved_by || null,
+      approved_date: map.reference_allocation?.approved_date || null,
+      basis: "current allocation as observed on the as_of below",
+      as_of: asOf,
+      rebased_on: new Date(Date.parse(asOf)).toISOString().slice(0, 10),
+      weights,
+      ...(conc ? { [`${conc}_inclusive_of_adjacent`]: Number(inclusive.toFixed(3)) } : {}),
+      thresholds: T,
+    };
+    fs.writeFileSync(mapPath, JSON.stringify(map, null, 2) + "\n");
+    console.log(`rebased reference to ${asOf}`);
+  }
+
+  if (asJson) {
+    console.log(JSON.stringify({
+      as_of: asOf, total, reference_as_of: ref.as_of || null, weeks_since_rebase: weeksSince,
+      domains: out,
+      ...(conc ? { concentration_domain: conc, [`${conc}_inclusive_of_adjacent`]: inclusive } : {}),
+      unclassified,
+      thresholds: { NOTE_PP: T.note_pp, NOTE_REL: T.note_rel, FLAG_PP: T.flag_pp, FLAG_REL: T.flag_rel },
+    }, null, 2));
+    return;
+  }
+
+  console.log(`Domain allocation — positions as of ${asOf}`);
+  console.log(`Reference: ${ref.as_of ? `${ref.as_of.slice(0, 10)} (${weeksSince} week(s) ago)` : "NOT SET"}`);
+  console.log("");
+  console.log("Domain                        actual      ref     Δpp    Δrel   status");
+  for (const o of out) {
+    console.log(
+      o.display.padEnd(28) +
+      pct(o.actual).padStart(8) +
+      (o.reference == null ? "     —" : pct(o.reference).padStart(9)) +
+      (o.delta_pp == null ? "      —" : sgn(o.delta_pp) + Math.abs(o.delta_pp).toFixed(2)).padStart(8) +
+      (o.delta_rel == null ? "      —" : sgn(o.delta_rel) + Math.abs(100 * o.delta_rel).toFixed(0) + "%").padStart(8) +
+      "   " + o.status
+    );
+  }
+  if (conc) {
+    console.log("");
+    console.log(`${`${concDisplay} incl. adjacent`.padEnd(28)} ${pct(inclusive).padStart(8)}   <- the concentration-risk number, never summed into a domain`);
+  }
+  if (unclassified.length) {
+    console.log("");
+    console.log("UNCLASSIFIED (named, never folded into 'other'):");
+    for (const u of unclassified) console.log(`  ${u.ticker.padEnd(7)} ${pct(u.pct).padStart(7)}  ${u.name}`);
+  }
+}
+
+module.exports = { allocate, DEFAULT_THRESHOLDS };
+
+if (require.main === module) {
+  main().catch((e) => { console.error("domain-allocation:", e.message); process.exit(1); });
+}

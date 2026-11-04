@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  wiki-assoc-llm — ON-DEMAND launchd user agent (no schedule of its own).
+  Design: system/wiki-architecture.md § Associative recall.
+  Cron keeps the schedule (tasks.json "wiki-assoc", daily 04:20 local):
+  agent/scripts/trigger-wiki-assoc.sh runs the no-model writers itself,
+  then `launchctl kickstart gui/$(id -u)/ai.claude.wiki-assoc-llm`. This run
+  (run-wiki-assoc-llm.sh) extracts typed facts and writes trigger cues; their
+  Sonnet rung is `claude -p` on the Max subscription, and only the GUI session
+  can unlock the keychain holding that credential.
+  Install (launchd_kick also self-installs it on the first failed kick):
+    agent/launch-agents/install.sh ai.claude.wiki-assoc-llm
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>ai.claude.wiki-assoc-llm</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>__JORI_TOOLS__/bin/cron-run</string>
+        <string>--label</string>
+        <string>wiki-assoc-llm</string>
+        <string>--</string>
+        <string>/bin/bash</string>
+        <string>__JORI_TOOLS__/agent/scripts/run-wiki-assoc-llm.sh</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>__HOME__</string>
+        <key>PATH</key>
+        <string>__HOME__/.local/bin:__HOME__/.local/node/bin:/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:__JORI_TOOLS__/bin</string>
+        <key>LANG</key>
+        <string>en_US.UTF-8</string>
+    </dict>
+    <key>WorkingDirectory</key>
+    <string>__JORI_TOOLS__</string>
+    <key>RunAtLoad</key>
+    <false/>
+    <key>KeepAlive</key>
+    <false/>
+    <key>StandardOutPath</key>
+    <string>__JORI_TOOLS__/data/logs/wiki-assoc-llm-launchd.log</string>
+    <key>StandardErrorPath</key>
+    <string>__JORI_TOOLS__/data/logs/wiki-assoc-llm-launchd.log</string>
+</dict>
+</plist>

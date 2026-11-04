@@ -19,9 +19,11 @@
 import fs from "node:fs";
 import path from "node:path";
 import { installTools } from "../lib/root.cjs";
+import { localUrl } from "../lib/ports.cjs";
+import { linkGate } from "../lib/link-check.mjs";
 import { parseSendArgs, parseTarget, findDash } from "../agent/slack-channel/core.mjs";
 
-const RUNNER = process.env.SLACK_RUNNER_URL || "http://127.0.0.1:9108";
+const RUNNER = process.env.SLACK_RUNNER_URL || localUrl("slack");
 const INBOX = installTools("data/slack-inbox.jsonl");
 
 function usage() {
@@ -76,6 +78,7 @@ async function main() {
     process.exit(1);
   }
 
+  await linkGate(a.text, "slack-send"); // a dead or moved link is refused (lib/link-check.mjs)
   const t = parseTarget(a.to);
   const body = {
     ...(t.channel || t.channel_name ? { channel: a.to } : { user: a.to }),

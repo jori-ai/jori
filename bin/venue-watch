@@ -1,0 +1,62 @@
+#!/usr/bin/env node
+// venue-watch — run one venue watch lane end to end, with no agent turn.
+//
+//   venue-watch <lane> [--dry-run] [--solo]
+//
+// Lanes are this installation's, from agent/local/config/venue-watch.json
+// `lanes` (lib/venue-events/lanes.mjs). A lane that is not configured is off:
+// exit 0, nothing run.
+//
+// A lane with `ride_along_with: <lane>` runs straight after that lane, in the
+// same run, so it needs no schedule of its own. `--solo` skips them; each
+// still runs on its own by name.
+//
+// Reads the shared store `venue-ingest` writes, shows ONE tool-less model call
+// only the candidates this lane has never evaluated, gates each pick in code
+// (travel in-city + headliner bypass, calendar-conflict-check, availability),
+// then emails / pings and records what it evaluated. Silent when nothing new
+// survives. --dry-run prints the picks and writes/sends nothing.
+//
+// Runs on the Max subscription through lib/max-judge.js, so it must be
+// launched inside the GUI session (a launchd user agent kickstarted from cron:
+// cron itself cannot unlock the keychain — see agent/CLAUDE.md § Effort Policy).
+//
+// Design: lib/venue-events/{watch,lanes}.mjs
+
+import { LANES } from "../lib/venue-events/lanes.mjs";
+import { runLane } from "../lib/venue-events/watch.mjs";
+
+const [laneName, ...rest] = process.argv.slice(2);
+const lane = LANES[laneName];
+if (!laneName || laneName.startsWith("--")) {
+  console.error(`usage: venue-watch <${Object.keys(LANES).join("|") || "lane"}> [--dry-run] [--solo]`);
+  process.exit(2);
+}
+if (!lane) {
+  // Not configured here: the lane is off, which is not an error.
+  console.log(JSON.stringify({ lane: laneName, reason: "lane not configured (agent/local/config/venue-watch.json lanes)" }));
+  process.exit(0);
+}
+const dryRun = rest.includes("--dry-run");
+const stamp = () => new Date().toISOString();
+const riders = rest.includes("--solo") ? [] : Object.values(LANES).filter((l) => l.rideAlongWith === laneName);
+
+async function runOne(l) {
+  const t0 = Date.now();
+  const res = await runLane(l, { dryRun, log: (m) => console.error(`${stamp()} ${m}`) });
+  console.log(JSON.stringify({ lane: l.name, ...res, ms: Date.now() - t0 }, null, dryRun ? 2 : 0));
+}
+
+(async () => {
+  let code = 0;
+  for (const l of [lane, ...riders]) {
+    // One lane failing must not cost the next its run; the exit code still says so.
+    try { await runOne(l); }
+    catch (e) {
+      console.error(`${stamp()} [${l.name}] FAILED: ${e?.stack || e}`);
+      code = Math.max(code, e?.fatal ? 3 : 1);
+      if (e?.fatal) break; // not on Max: every later lane would fail the same way
+    }
+  }
+  process.exit(code);
+})();

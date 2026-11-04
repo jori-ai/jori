@@ -1,0 +1,61 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Occasion Ideas — daily at 05:25 local.
+
+  For the weeks before (and the day of) each occasion in
+  agent/local/occasion-ideas/occasions.json (an anniversary, a birthday), every
+  year: one Opus email a day with dinner, bar, show and activity ideas for that
+  date, in the city the user will be in (jobs/occasion-ideas.md). The trigger
+  exits immediately (no model spend) outside a window, and always with no file.
+
+  05:25 is registered in data/cron-slots.json (`jori-cron-slots
+  register occasion-ideas`). It clears the night's Opus jobs and lands the
+  email before the day starts.
+
+  launchd USER agent, not crontab — a `claude -p` under cron cannot unlock the
+  login keychain holding the Max credentials, prints "Not logged in", exits 0.
+
+  Install:
+    agent/launch-agents/install.sh ai.claude.occasion-ideas
+    (renders __JORI_HOME__ / __JORI_TOOLS__ / __HOME__, then launchctl bootstrap)
+  Pause without uninstalling:
+    touch <install>/data/.occasion-ideas-pause
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>ai.claude.occasion-ideas</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>__JORI_TOOLS__/agent/scripts/trigger-occasion-ideas.sh</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>__HOME__</string>
+        <key>PATH</key>
+        <string>__HOME__/.local/bin:/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:__JORI_TOOLS__/bin</string>
+        <key>LANG</key>
+        <string>en_US.UTF-8</string>
+    </dict>
+    <key>WorkingDirectory</key>
+    <string>__JORI_TOOLS__/agent/ops-agent</string>
+    <key>RunAtLoad</key>
+    <false/>
+    <key>KeepAlive</key>
+    <false/>
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>5</integer>
+        <key>Minute</key>
+        <integer>25</integer>
+    </dict>
+    <key>StandardOutPath</key>
+    <string>__JORI_TOOLS__/agent/logs/occasion-ideas-launchd.log</string>
+    <key>StandardErrorPath</key>
+    <string>__JORI_TOOLS__/agent/logs/occasion-ideas-launchd.log</string>
+</dict>
+</plist>

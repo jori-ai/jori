@@ -1,0 +1,28 @@
+# Travel Schedule
+
+On-demand procedure for the chat agent, moved verbatim out of `agent/chat-agent/CLAUDE.md` (which keeps the trigger and hard rules inline). When this file and CLAUDE.md seem to disagree, CLAUDE.md's inline rule wins.
+
+## Travel Schedule (where the user is / will be)
+
+The user's canonical presence timeline lives in a Supabase table of stays, driven through `bin/travel`. It is the **single source of truth** for where the user will be, with date AND time. Invoke the `travel-schedule` skill for the full reference when the installation has one; the essentials:
+
+- **Consult** for any "where will I be / am I in X on date" question — and before reasoning about whether a future city event is reachable. **Last-known GPS is for SAME-DAY only; for any future date use `travel where`/`travel in-city`, never GPS.** If the timeline is ambiguous or conflicts with a booking/stated plan, **ask the user** rather than guess.
+  - `travel where <when>` → the metro the user will be in (`when` = `now` | `YYYY-MM-DD` | `YYYY-MM-DDTHH:MM`, home time = `instance().tz`).
+  - `travel in-city <metro> <when>` → exit 0 if in that metro, 1 if not.
+  - **The calendar supersedes the travel DB when they conflict**: the timeline is maintained by the assistant and can go stale — a long flight-backbone row can span weeks with no sub-entry for a same-day side trip (the DB says the home city all evening while the calendar has "Train to <town>" / "Dinner in <town>" / "Train back" for that same evening). Before trusting an in-city (true) presence read for anything same-day-or-near, check the live calendar for that date too — an event whose title/description names a different city wins over the DB. The same applies to any presence-gated job's geo-gate.
+    - **Built in.** `travel where`/`in-city`/`check-picks` apply `data/calendar-presence-overrides.json`: a model reads each day's calendar (yesterday → +60 days) and says whether it shows the user away from the timeline's city and which events prove it; code turns those events' start/end into an away window. Inside it the answer is `elsewhere` / `AWAY` with `[calendar]` and the evidence titles. It only ever turns an IN into an AWAY. The file refreshes itself on read when older than 30 minutes; `travel calendar` shows the current windows, `travel calendar-refresh --force` rebuilds now. A same-day event created minutes ago may not be in it yet, so for "right now" questions still glance at the calendar.
+- **Event picks in an answer.** Only suggest events on dates the timeline puts the user in that city. Before a reply that recommends dated, place-bound events goes out, check every pick in one call:
+  ```bash
+  bin/travel check-picks "Lyon@2026-10-29" "Lisbon@2026-11-07T20:00"
+  # DROP Lyon@2026-10-29 — AWAY, resolved paris (Rue Example 4, Paris) [db]
+  # OK   Lisbon@2026-11-07T20:00 — IN, resolved lisbon (Lisbon) [db]
+  ```
+  Exit 0 = every pick reachable, 1 = at least one `DROP`. Drop every `DROP` pick from the reply. The judgment that stays yours: a city is a metro key, so a day trip from where the user is staying reads `DROP`; keep such a pick only when it really is an easy trip from the resolved base, and say so ("a day trip from <base>"). A different country, a travel day, or a date after the user flies home never stays (headliners aside, below). An `UNKNOWN(fail-open)` line is OK (nothing on the timeline). If the user asked about a city or dates they will not be in, answer anyway and say they are elsewhere then. Installation headliners ("worth the trip") may stay wherever the user is, as in the lanes.
+- **Flight times.** The stored timeline is the only source for a flight time: `travel flights [--from D] [--to D]` prints every live leg with **each airport's own wall clock and offset** (flights-scan Step 3.5 zones them per airport, on that date):
+  ```
+  XY991    AAA 2026-11-01 00:05 (+02:00, Origin City time) → BBB 2026-11-01 04:55 (-05:00, Destination City time)  Example Air [confirmed]
+  ```
+  Quote these. **Never re-derive a time from the booking email** — emails print check-in / report times next to departures (a "report 20:05" line is not the 00:05 departure), and that is how one flight once got described four ways. Never convert with an offset from another date (clocks change); the stored time is already right for that airport that day. A leg marked `⚠ time zone unverified`, or one that disagrees with what the user says, is a question for the user or a `flights-scan` re-read — not a fix from the email.
+- **Maintain.** The assistant owns this list. The flights backbone self-updates (flights-scan → `travel sync`). When the user states a plan conversationally — "we're in <city> till the 5th", "staying an extra day", "drove up to <town> Friday" — record it as a `manual` row: `travel add <metro> --arrive <when> [--depart <when>] [--label] [--note]`, or `travel edit <id> --depart …`. Confirm with a short ack + a `travel where` sanity check. (This is a state edit the user asked for, not an outbound action — no approval needed.)
+- **Reconcile (`travel_audit` hum reply).** When the user answers a `travel_audit` reconcile question (ask_kind `travel_reconcile`): if a booking is wrong/canceled → `travel rm <id>` the stale row then `travel sync`; if the timeline is wrong → `travel add`/`edit` the correct stay; "re-pull" → `travel sync`.
+- **Review page.** The full timeline + any discrepancies render to the `travel_schedule` wiki page (auto-refreshed; `wiki read travel_schedule`). Point the user there to eyeball the whole schedule. It updates in real time — triage fires `flights-scan` → `travel sync` on every travel receipt/confirmation/change.

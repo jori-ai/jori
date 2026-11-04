@@ -1,0 +1,150 @@
+#!/usr/bin/env node
+"use strict";
+/**
+ * launchd-tz-sync — sibling of cron-tz-sync for the handful of jobs that
+ * must be launchd (StartCalendarInterval) rather than cron because they fork
+ * a keychain-authenticated `claude -p` (see agent/CLAUDE.md § Auth
+ * Model). cron-tz-sync rewrites crontab MM/HH/DOW fields nightly so
+ * local-time-anchored cron jobs fire at the user's actual clock time instead
+ * of a fixed home-zone time; launchd jobs need the identical retiming, but
+ * crontab's "edit the text, it's live immediately" model doesn't apply —
+ * launchd caches a plist's StartCalendarInterval at load time, so a changed
+ * value only takes effect after an unload+reload (`launchctl bootout` +
+ * `bootstrap`).
+ *
+ * Requirement: a launchd job registered as "1am local" must run at 1am where
+ * the user is at the moment, not at a fixed home-zone hour, so its values
+ * move every time the user changes time zone. Registry:
+ * data/launchd-clock-jobs.json ({name, label, local_time, dow}) — same shape
+ * as data/clock-jobs.json, minus the cron-only `label` crontab-grep field.
+ * No registry (a fresh install) means nothing to do.
+ *
+ * Timezone resolution is identical to cron-tz-sync (lib/clock-jobs.js
+ * resolveTz/localToHomeZone): confirmed phone-reported tz (data/
+ * user-timezone.json, <36h old) wins, else the travel plan, else the
+ * instance's home zone. localToHomeZone() converts "local HH:MM on local
+ * weekday N" into the home-zone {hour, minute, dow} the host's own system
+ * clock (which drives both cron and launchd) needs to see — including the
+ * cross-weekday shift (a Monday 1am in a zone ahead of home is Sunday evening
+ * at home).
+ *
+ * Operates ONLY on the installed copy (~/Library/LaunchAgents/<label>.plist)
+ * — never the git-tracked template in agent/launch-agents/, which stays the
+ * nominal when-home baseline, exactly as tasks.json's `schedule` field stays
+ * the nominal cron spec for clock-anchored cron jobs while cron-tz-sync
+ * rewrites the live crontab underneath it. Skips (and retries next night)
+ * any job that's currently mid-run, so a retime can never kill an
+ * in-progress chain — bootout mid-run would do exactly that.
+ *
+ * Run nightly via cron, 1 minute after cron-tz-sync — see the crontab entry.
+ * Manual run: node bin/launchd-tz-sync
+ */
+
+const fs = require("fs");
+const os = require("os");
+const path = require("path");
+const { execFileSync } = require("child_process");
+const { resolveTz, localToHomeZone } = require("../lib/clock-jobs.js");
+const { installRoot } = require("../lib/root.cjs");
+
+const HOME = os.homedir();
+const JORI = installRoot();
+const JOBS_FILE = path.join(JORI, "data/launchd-clock-jobs.json");
+const LOG_FILE = path.join(JORI, "data/logs/launchd-tz-sync.log");
+const LAUNCH_AGENTS_DIR = path.join(HOME, "Library/LaunchAgents");
+const UID = execFileSync("id", ["-u"], { encoding: "utf8" }).trim();
+const PLISTBUDDY = "/usr/libexec/PlistBuddy";
+
+function log(line) {
+  const ts = new Date().toISOString();
+  try { fs.mkdirSync(path.dirname(LOG_FILE), { recursive: true }); } catch {}
+  fs.appendFileSync(LOG_FILE, `${ts} ${line}\n`);
+}
+
+function loadJobs() {
+  try { return JSON.parse(fs.readFileSync(JOBS_FILE, "utf8")); } catch { return []; }
+}
+
+/** Current StartCalendarInterval {hour, minute, dow}, or null if unreadable
+ *  (plist missing, key missing/malformed — never throws). */
+function readCurrent(plistPath) {
+  try {
+    const get = (key) => execFileSync(PLISTBUDDY, ["-c", `Print :StartCalendarInterval:${key}`, plistPath], { encoding: "utf8" }).trim();
+    return { hour: Number(get("Hour")), minute: Number(get("Minute")), dow: Number(get("Weekday")) };
+  } catch {
+    return null;
+  }
+}
+
+/** True if the job is currently running (launchctl list's PID column is not
+ *  "-"). Tab-separated "PID\tLastExit\tLabel"; unparseable/not-loaded -> not
+ *  running (fail toward "safe to touch" is wrong here, so default false only
+ *  means "we didn't find it loaded," not "it's definitely idle" — callers
+ *  still treat a readCurrent() miss as its own skip reason). */
+function isRunning(label) {
+  try {
+    const out = execFileSync("launchctl", ["list"], { encoding: "utf8" });
+    for (const line of out.split("\n")) {
+      const cols = line.split("\t");
+      if (cols[2] === label) return cols[0] !== "-";
+    }
+    return false;
+  } catch {
+    return false;
+  }
+}
+
+function applyAndReload(plistPath, label, hour, minute, dow) {
+  execFileSync(PLISTBUDDY, [
+    "-c", `Set :StartCalendarInterval:Hour ${hour}`,
+    "-c", `Set :StartCalendarInterval:Minute ${minute}`,
+    "-c", `Set :StartCalendarInterval:Weekday ${dow}`,
+    plistPath,
+  ]);
+  try { execFileSync("launchctl", ["bootout", `gui/${UID}/${label}`], { stdio: "ignore" }); } catch {}
+  execFileSync("launchctl", ["bootstrap", `gui/${UID}`, plistPath]);
+}
+
+function main() {
+  const jobs = loadJobs();
+  if (!jobs.length) { log("no launchd clock jobs registered — nothing to do"); return; }
+
+  const { tz, source } = resolveTz((confirmed, planned) => {
+    log(`discrepancy: confirmed=${confirmed} planned=${planned} — using confirmed`);
+  });
+
+  const changed = [];
+  const skipped = [];
+  for (const job of jobs) {
+    const plistPath = path.join(LAUNCH_AGENTS_DIR, `${job.label}.plist`);
+    if (!fs.existsSync(plistPath)) { skipped.push(`${job.name} (plist not installed)`); continue; }
+
+    // localToHomeZone returns zero-padded HOUR/MINUTE STRINGS ("01", "09") — Number()
+    // them before comparing against PlistBuddy's numeric read, or the
+    // comparison never matches and every nightly run looks like a change.
+    const raw = localToHomeZone(tz, job.local_time, job.dow);
+    const hour = Number(raw.hour), minute = Number(raw.minute), dow = raw.dow;
+    const current = readCurrent(plistPath);
+    if (current && current.hour === hour && current.minute === minute && current.dow === dow) continue; // already correct
+
+    if (isRunning(job.label)) { skipped.push(`${job.name} (mid-run, retry tonight)`); continue; }
+
+    try {
+      applyAndReload(plistPath, job.label, hour, minute, dow);
+      const from = current ? `${current.dow}/${current.hour}:${String(current.minute).padStart(2, "0")}` : "unknown";
+      changed.push(`${job.name}: home ${from} -> ${dow}/${hour}:${String(minute).padStart(2, "0")} (local ${job.local_time} dow=${job.dow} in ${tz})`);
+    } catch (e) {
+      skipped.push(`${job.name} (reload failed: ${e.message.split("\n")[0]})`);
+    }
+  }
+
+  if (changed.length) log(`resolved tz=${tz} (${source}); retimed ${changed.length} job(s): ${changed.join("; ")}`);
+  else log(`resolved tz=${tz} (${source}); no changes needed`);
+  if (skipped.length) log(`skipped ${skipped.length}: ${skipped.join(", ")}`);
+
+  console.log(JSON.stringify({ tz, source, changed, skipped }, null, 2));
+}
+
+if (require.main === module) main();
+
+module.exports = { readCurrent, isRunning };

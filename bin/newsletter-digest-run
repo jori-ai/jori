@@ -1,0 +1,126 @@
+#!/usr/bin/env node
+// newsletter-digest-run — the daily newsletter digest, with no agent turn.
+//
+// Was: a Sonnet ops turn that pulled whole newsletter bodies through the Gmail
+// MCP into the shared session, hand-built HTML, and polled Gmail once after a
+// `sleep 30` (silently skipping the label when Gmail had not indexed yet).
+// Now: code fetches (Gmail REST, sender list in the local config
+// agent/local/config/newsletter-digest.json), strips HTML, extracts story
+// links; ONE tool-less model call summarizes every newsletter at once and
+// cites links by index (grounding is structural — an index we did not hand
+// out is ignored); code renders, og-cards, sends, labels with a bounded wait,
+// and pings. Zero newsletters → nothing at all.
+//
+//   newsletter-digest-run [--dry-run]
+//
+// Runs in the GUI session (launchd ai.claude.newsletter-digest, kicked by
+// trigger-newsletter-digest.sh) because the model call is `claude -p` on Max.
+// Playbook: agent/ops-agent/jobs/newsletter-digest.md
+//
+// OFF until configured: with no `from` and no `delivered_to` in the local
+// config there is nothing to search for, and the run exits 0 silently.
+
+import fs from "node:fs";
+import { createRequire } from "node:module";
+import { pathToFileURL } from "node:url";
+import { searchIds, getMessage, header, bodies, htmlToText, storyLinks, gmailLink } from "../lib/gmail-read.mjs";
+import { sendHtmlEmail, labelDigest, pointerAndPush, ogCards, escapeHtml } from "../lib/digest-deliver.mjs";
+
+const require = createRequire(import.meta.url);
+const { instance, agentAddresses, localConfig } = require("../lib/instance.cjs");
+const { MODELS } = require("../lib/models.cjs");
+const DRY = process.argv.includes("--dry-run");
+const log = (m) => console.error(`${new Date().toISOString()} [newsletter-digest] ${m}`);
+
+// Which mail is a newsletter: `from` = Gmail from: terms (a domain or an
+// address), `delivered_to` = addresses (e.g. a +newsletters alias) whose mail
+// is all newsletters. A sender intake-skip-rules files as `spam` is excluded
+// by the -label:spam clause.
+export const DEFAULTS = Object.freeze({ from: [], delivered_to: [], window: "1d", max_messages: 25, max_chars_per_message: 7000 });
+export function loadConfig() { return localConfig("newsletter-digest", DEFAULTS); }
+
+/** The Gmail query, or null when nothing is configured (the job is off). */
+export function buildQuery(cfg, { own = agentAddresses() } = {}) {
+  const terms = [...(cfg.from || []).map((f) => `from:${f}`), ...(cfg.delivered_to || []).map((d) => `deliveredto:${d}`)];
+  if (!terms.length) return null;
+  const notOwn = own.map((a) => ` -from:${a}`).join("");
+  return `newer_than:${cfg.window || "1d"} -in:spam -label:spam${notOwn} (${terms.join(" OR ")})`;
+}
+
+const SCHEMA = {
+  type: "object", additionalProperties: false, required: ["items", "standout"],
+  properties: {
+    items: { type: "array", items: {
+      type: "object", additionalProperties: false, required: ["id", "name", "summary", "links"],
+      properties: {
+        id: { type: "string", description: "newsletter id exactly as given (n1, n2, ...)" },
+        name: { type: "string", description: "the newsletter's name" },
+        summary: { type: "string", description: "1-2 short paragraphs: the key takeaway only" },
+        links: { type: "array", items: { type: "integer" }, description: "indexes into that newsletter's links[] for stories the summary mentions (0-3)" },
+      } } },
+    standout: { type: ["string", "null"], description: "ONE line naming the single most useful finding across all of them, or null if nothing stands out" },
+  },
+};
+
+async function main() {
+  const CFG = loadConfig();
+  const q = buildQuery(CFG);
+  if (!q) { log("no newsletter senders configured (agent/local/config/newsletter-digest.json) — off"); return; }
+  const ids = await searchIds(q, { max: CFG.max_messages });
+  if (!ids.length) { log("no newsletters in window — silent"); return; }
+  const letters = [];
+  for (const id of ids) {
+    const m = await getMessage(id);
+    const { html, plain } = bodies(m);
+    const text = (plain && plain.length > 200 ? plain : htmlToText(html)).slice(0, CFG.max_chars_per_message);
+    letters.push({ id, from: header(m, "From"), subject: header(m, "Subject"), date: header(m, "Date"), text, links: storyLinks(html) });
+  }
+  log(`${letters.length} newsletter(s)`);
+
+  const rows = letters.map((l, i) => ({ id: `n${i + 1}`, from: l.from, subject: l.subject, text: l.text, links: l.links.map((k, j) => ({ i: j, text: k.text })) }));
+  const { judge } = require("../lib/max-judge.js");
+  const res = await judge({
+    model: MODELS.sonnet, effort: "low", timeoutMs: 300000, schema: SCHEMA,
+    system: "You write the user's daily newsletter digest. For EACH newsletter given, return its name and a 1-2 paragraph summary of the key takeaway only, in plain warm prose (no hype, no emojis, no exclamation marks). Cite up to 3 story links by index when the summary mentions that story. Use only what the newsletter text says. Then name the single most useful finding across all of them in one line, or null if nothing genuinely stands out.",
+    prompt: JSON.stringify({ newsletters: rows }),
+  });
+
+  const byId = new Map(rows.map((r, i) => [r.id, letters[i]]));
+  const sections = [];
+  for (const it of res.items || []) {
+    const l = byId.get(it.id);
+    if (!l) continue;
+    const links = (it.links || []).map((i) => l.links[i]).filter(Boolean).slice(0, 3);
+    sections.push({ name: it.name, summary: it.summary, gmail: gmailLink(l.id), links });
+  }
+  if (!sections.length) { log("model returned no usable items — silent"); return; }
+
+  const dateHuman = new Intl.DateTimeFormat("en-US", { timeZone: instance().tz || "UTC", weekday: "short", month: "short", day: "numeric" }).format(new Date());
+  const subject = `Newsletter Digest — ${dateHuman}`;
+  const urls = sections.flatMap((s) => [s.gmail, ...s.links.map((k) => k.url)]);
+  const cards = ogCards(urls);
+  let ci = 0;
+  const F = "font-family:-apple-system,Segoe UI,Arial,sans-serif";
+  const html = [`<div style="${F};max-width:640px">`, ...sections.flatMap((s) => [
+    `<h2 style="${F};font-size:16px;margin:20px 0 6px 0">${escapeHtml(s.name)}</h2>`,
+    `<div style="${F};font-size:14px;color:#222;line-height:1.5">${escapeHtml(s.summary).replace(/\n\n+/g, "</p><p>")}</div>`, // lang-regex-ok: paragraph breaks in our own model output for HTML layout
+    cards[ci++] || "",
+    ...s.links.map(() => cards[ci++] || ""),
+  ]), "</div>"].join("\n");
+
+  if (DRY) { console.log(JSON.stringify({ subject, sections: sections.map((s) => ({ name: s.name, links: s.links.length })), standout: res.standout }, null, 2)); return; }
+  sendHtmlEmail({ subject, html });
+  if (!(await labelDigest(subject))) log("WARN: sent but Gmail had not indexed it after the bounded wait — left unlabeled");
+  const n = sections.length;
+  pointerAndPush({
+    // Chat pointer only when there is a real hook (Long-form delivery rule); the push always goes.
+    pointer: res.standout ? `Newsletter digest emailed — ${n} today; the standout is ${res.standout}` : null,
+    push: `Newsletter digest: ${n} newsletter${n === 1 ? "" : "s"} ready in your inbox`,
+    intent: "newsletter-digest",
+  });
+  log(`sent (${n} sections${res.standout ? ", pointer" : ""})`);
+}
+
+if (process.argv[1] && import.meta.url === pathToFileURL(fs.realpathSync(process.argv[1])).href) {
+  main().catch((e) => { log(`FAILED: ${e?.stack || e}`); process.exit(e?.fatal ? 3 : 1); });
+}

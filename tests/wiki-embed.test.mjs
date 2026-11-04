@@ -137,6 +137,21 @@ Updated: Alex now also loves tapas and dining at wine bars.
   assert.equal(res.remaining, 0);
 });
 
+test("a vector embedded before the text normalisation is re-embedded (2026-11-03)", async () => {
+  // Rows written before embedText lowercased for uncased models carry the
+  // bare model label; their capitalised words were [UNK]. They must not count
+  // as fresh just because the body is unchanged.
+  const d = embedMod._dbForTest ? embedMod._dbForTest() : null;
+  const { DatabaseSync } = await import("node:sqlite");
+  const h = d || new DatabaseSync(fixtureDb);
+  h.prepare("UPDATE page_embeddings SET model = 'nomic-embed-text' WHERE page_id = 'user_food_prefs'").run();
+  if (!d) h.close();
+  assert.equal(embeddingStats().pending, 1, "the old-label page is pending");
+  const res = await embedPendingPages({ embedFn: toyEmbed, limit: 100 });
+  assert.equal(res.embedded, 1, "only the old-label page re-embedded");
+  assert.equal(embeddingStats().pending, 0);
+});
+
 test("searchPagesHybrid returns hybrid-tagged rows and finds the relevant page", async () => {
   const rows = await searchPagesHybrid("where does he like dining and restaurants", {
     limit: 5,

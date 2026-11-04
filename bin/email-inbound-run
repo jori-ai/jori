@@ -24,6 +24,7 @@
 // Log: data/email-inbound-oneshot-log.jsonl (metadata + outcome, no body).
 
 import fs from "node:fs";
+import { MODELS } from "../lib/models.cjs";
 import os from "node:os";
 import path from "node:path";
 import { execFile } from "node:child_process";
@@ -84,7 +85,7 @@ async function main() {
   try {
     const grant = DRY ? DRY_TOOL_NAMES : TOOL_NAMES;
     const run = makeStatelessExecutor({
-      model: "claude-sonnet-5-5",
+      model: MODELS.sonnet,
       effort: "medium",
       cwd: tmp,                // no CLAUDE.md / .mcp.json / project settings to auto-discover
       tools: "",               // no built-in tools at all

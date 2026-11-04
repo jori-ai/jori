@@ -1,0 +1,52 @@
+#!/usr/bin/env node
+// movie-recs — the films the together audience is likeliest to love, best first, with where to
+// watch, posters and links, from the movie database (watch_catalog; bin/movie-db-refresh).
+// 2026-10-11: the films the model rates highest come first, and every chat answer about shows
+// or films comes with images and links.
+//
+//   movie-recs [--n 5] [--theaters] [--service "Netflix"] [--format phone|text|json]
+//
+// --format phone prints {message_file, summary, message} for chat-agent's reply (sent verbatim).
+// "Relevant" = past 10 years, not seen, not "not our thing" (on the list or not).
+
+import { rest } from "../lib/watch-db.mjs";
+import { whoFor } from "../lib/watch-config.mjs";
+import { writeReplyFile } from "../lib/reply-file.mjs";
+import { cardLines, whereShort } from "../lib/watch-chat-card.mjs";
+
+const arg = (n, d) => { const i = process.argv.indexOf(`--${n}`); return i >= 0 ? process.argv[i + 1] : d; };
+const N = parseInt(arg("n", "5"), 10);
+const THEATERS = process.argv.includes("--theaters");
+const SERVICE = arg("service", null);
+const fmt = arg("format", "text");
+const minYear = new Date().getFullYear() - 10;
+
+let q = `watch_catalog?select=id,tmdb_id,imdb_id,title,year,poster_path,overview,genres,model_p,imdb_rating,in_theaters,providers,title_id&kind=eq.movie&not_for_us=eq.false&or=(seen.is.null,seen.eq.false)&year=gte.${minYear}&model_p=not.is.null&order=model_p.desc&limit=${SERVICE ? 300 : N * 3}`;
+if (THEATERS) q += "&in_theaters=eq.true";
+let rows = await rest(q);
+if (SERVICE) rows = rows.filter((r) => (r.providers?.stream || []).some((s) => s.toLowerCase() === SERVICE.toLowerCase()));
+rows = rows.slice(0, N);
+
+const pct = (p) => `${Math.min(99, Math.round(p * 100))}% match`;
+const firstSentence = (t) => { const d = (t || "").replace(/\s+/g, " ").trim(); const i = d.indexOf(". "); return i > 0 && i < 220 ? d.slice(0, i + 1) : d.slice(0, 200); };
+
+if (fmt === "json") { console.log(JSON.stringify(rows, null, 2)); process.exit(0); }
+const lead = THEATERS ? "**In theaters, best first**" : SERVICE ? `**On ${SERVICE}, best first**` : `**Top movie picks for ${whoFor("together")}**`;
+const L = [lead, ""];
+if (!rows.length) L.push("Nothing in the movie database matches that right now.");
+for (const [i, r] of rows.entries()) {
+  const where = whereShort(r) || "not available in the US yet";
+  const showtimes = r.in_theaters ? `https://www.google.com/search?q=${encodeURIComponent(`${r.title} ${r.year} showtimes`)}` : null;
+  L.push(...cardLines({
+    poster_path: r.poster_path, name: r.title, imdb_id: r.imdb_id,
+    headline: `**${i + 1}. ${r.title}** (${r.year}) — ${pct(r.model_p)}${r.imdb_rating ? `, IMDb ${r.imdb_rating}` : ""} · ${where}${r.title_id ? " · on your list" : ""}`,
+    blurb: firstSentence(r.overview),
+    extra: [["Showtimes nearby", showtimes]],
+  }), "");
+}
+const message = L.join("\n").trim();
+if (fmt === "phone") {
+  let message_file = null;
+  try { message_file = writeReplyFile(message); } catch {}
+  console.log(JSON.stringify({ message_file, summary: rows.length ? `${THEATERS ? "In theaters" : "Movie picks"}: ${rows.slice(0, 2).map((r) => r.title).join(", ")}${rows.length > 2 ? "…" : ""}` : "No matching films", message }, null, 2));
+} else console.log(message);

@@ -1,0 +1,25 @@
+{
+  "id": 65495,
+  "results": {
+    "US": {
+      "link": "https://www.themoviedb.org/tv/65495-fauda/watch?locale=US",
+      "flatrate": [
+        { "logo_path": "/n.jpg", "provider_id": 8, "provider_name": "Netflix", "display_priority": 0 },
+        { "logo_path": "/a.jpg", "provider_id": 1796, "provider_name": "Netflix Standard with Ads", "display_priority": 1 }
+      ]
+    },
+    "IL": {
+      "link": "https://www.themoviedb.org/tv/65495-fauda/watch?locale=IL",
+      "flatrate": [
+        { "logo_path": "/y.jpg", "provider_id": 1000, "provider_name": "yes+", "display_priority": 3 },
+        { "logo_path": "/n.jpg", "provider_id": 8, "provider_name": "Netflix", "display_priority": 0 }
+      ]
+    },
+    "GB": {
+      "link": "https://www.themoviedb.org/tv/65495-fauda/watch?locale=GB",
+      "flatrate": [
+        { "logo_path": "/n.jpg", "provider_id": 8, "provider_name": "Netflix", "display_priority": 0 }
+      ]
+    }
+  }
+}

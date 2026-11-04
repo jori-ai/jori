@@ -1,0 +1,75 @@
+#!/usr/bin/env bash
+# site-pass <domain> --user|--stdout|--id
+#
+# Reads the user's website login for <domain> from the 1Password "Logins" vault
+# (JORI_OP_LOGINS_VAULT; the user's Apple Passwords import, kept apart from the
+# agent's own credentials vault on purpose) with a read-only
+# service account scoped to that vault alone: OP_LOGINS_SERVICE_ACCOUNT_TOKEN,
+# from the environment or .env. Headless — never prompts for biometrics.
+#
+# Items are matched by their website URL (host == domain or a subdomain of it),
+# not by title. When several match (amazon.com has one per account), the pick
+# is: a pinned item id in data/purchase-merchants.json (`op_item`, which
+# may point at another domain's login), else
+# the user's own address (instance owner_email), else the most recently edited.
+#
+# Exit codes: 0 ok, 5 no matching item, 64 usage, 77 financial denylist,
+# 78 no token.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+source "$SCRIPT_DIR/../agent/scripts/lib/root.sh"
+source "$SCRIPT_DIR/../agent/scripts/lib/instance.sh"
+source "$SCRIPT_DIR/../agent/scripts/lib/credential-denylist.sh"
+ROOT="$JORI_INSTALL"
+LOGINS_VAULT="${JORI_OP_LOGINS_VAULT:-Logins}"
+DOMAIN="${1:-}"
+case "${2:-}" in
+  --user)   FIELD="username" ;;
+  --stdout) FIELD="password" ;;
+  --id)     FIELD="" ;;
+  *) echo "usage: site-pass <domain> --user|--stdout|--id" >&2; exit 64 ;;
+esac
+[[ -n "$DOMAIN" ]] || { echo "usage: site-pass <domain> --user|--stdout|--id" >&2; exit 64; }
+
+# Same denylist as dev-pass: money-movement sites stay manual.
+if jori_financial_domain "$DOMAIN"; then
+  echo "site-pass: '$DOMAIN' is on the financial denylist." >&2; exit 77
+fi
+
+TOKEN="${OP_LOGINS_SERVICE_ACCOUNT_TOKEN:-}"
+if [[ -z "$TOKEN" && -f "$ROOT/.env" ]]; then
+  TOKEN="$(sed -n 's/^OP_LOGINS_SERVICE_ACCOUNT_TOKEN=//p' "$ROOT/.env" | head -1)"
+fi
+[[ -n "$TOKEN" ]] || { echo "site-pass: OP_LOGINS_SERVICE_ACCOUNT_TOKEN is not set." >&2; exit 78; }
+export OP_SERVICE_ACCOUNT_TOKEN="$TOKEN"
+
+ID="$(op item list --vault "$LOGINS_VAULT" --categories Login --format=json | /usr/bin/python3 -c '
+import json, sys
+from urllib.parse import urlparse
+domain, merchants, owner = sys.argv[1], sys.argv[2], sys.argv[3].lower()
+pinned = None
+try:
+    for m in json.load(open(merchants))["merchants"]:
+        if m["site"] == domain: pinned = m.get("op_item")
+except Exception: pass
+def host(u):
+    u = u.get("href", "")
+    return (urlparse(u if "://" in u else "https://" + u).hostname or "").lower()
+items = json.load(sys.stdin)
+# A pin wins even when its URL is another domain (Vrbo signs in with the
+# Expedia Group account).
+if pinned and any(i["id"] == pinned for i in items): print(pinned); sys.exit()
+hits = [i for i in items
+        if any(h == domain or h.endswith("." + domain) for h in map(host, i.get("urls", [])))]
+# Saved masked usernames ("*****488") are useless to type.
+hits = [i for i in hits if "*" not in i.get("additional_information", "")] or hits
+own = [i for i in hits if owner and owner in i.get("additional_information", "").lower()]
+pool = own or hits
+if pool: print(max(pool, key=lambda i: i.get("updated_at", ""))["id"])
+' "$DOMAIN" "$JORI_INSTALL_TOOLS/data/purchase-merchants.json" "${JORI_OWNER_EMAIL:-}")"
+
+[[ -n "$ID" ]] || { echo "site-pass: no login for $DOMAIN in the $LOGINS_VAULT vault." >&2; exit 5; }
+[[ -n "$FIELD" ]] || { echo "$ID"; exit 0; }
+op item get "$ID" --vault "$LOGINS_VAULT" --fields "label=$FIELD" --reveal

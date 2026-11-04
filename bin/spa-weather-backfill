@@ -1,0 +1,41 @@
+#!/usr/bin/env node
+"use strict";
+// spa-weather-backfill (CLI) — one-off/standalone catch-up over sessions
+// missing weather_*. See lib/spa-weather-backfill.js for the logic;
+// spa-heating-sync calls the same function automatically after every daily
+// sync, so this CLI is mainly for a manual re-run or a first-time backfill.
+//
+// Usage:
+//   spa-weather-backfill              backfill every unfetched session
+//   spa-weather-backfill --dry-run    fetch + summarise, no DB writes
+//   spa-weather-backfill --json       machine-readable summary
+
+const { loadEnv } = require("../lib/load-env.js");
+loadEnv();
+const { runWeatherBackfill } = require("../lib/spa-weather-backfill.js");
+
+const FLAGS = new Set(process.argv.slice(2).filter((a) => a.startsWith("--")));
+const DRY_RUN = FLAGS.has("--dry-run");
+const JSON_OUT = FLAGS.has("--json");
+
+async function main() {
+  const summary = await runWeatherBackfill({ dryRun: DRY_RUN });
+  if (JSON_OUT) {
+    console.log(JSON.stringify({ ...summary, dry_run: DRY_RUN }));
+  } else if (summary.off) {
+    console.log(`spa-weather-backfill: off — ${summary.off}`);
+  } else if (summary.pending === 0) {
+    console.log("spa-weather-backfill: nothing pending");
+  } else {
+    console.log(
+      `spa-weather-backfill: ${summary.filled} filled, ${summary.deferred} deferred (of ${summary.pending} pending)${DRY_RUN ? " [dry run]" : ""}`
+    );
+  }
+}
+
+main().catch((err) => {
+  const msg = err.message || String(err);
+  if (JSON_OUT) console.log(JSON.stringify({ ok: false, error: msg }));
+  else console.error(`spa-weather-backfill: ${msg}`);
+  process.exit(1);
+});

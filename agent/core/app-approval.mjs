@@ -1,5 +1,5 @@
 // app-approval.mjs — verify Face-ID / Secure-Enclave-signed owner approvals,
-// reusing the exact security model as the client's TradeApproval (client/Jori/
+// reusing the exact security model as the client's TradeApproval (apps/companion/Jori/
 // TradeApproval.swift). The paired device holds a P-256 key in the Secure
 // Enclave; signing is gated by Face ID; the app signs a canonical message and we
 // verify the DER-ECDSA signature here against the device's REGISTERED raw public

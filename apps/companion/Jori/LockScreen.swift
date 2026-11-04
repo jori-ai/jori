@@ -1,43 +1,77 @@
 import SwiftUI
 import LocalAuthentication
 
-#if os(macOS)
-import AppKit
-private let lockBackground = Color(nsColor: NSColor(name: nil) { appearance in
-    appearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
-    ? NSColor(red: 0, green: 0, blue: 0, alpha: 1)
-    : NSColor(red: 1, green: 1, blue: 1, alpha: 1)
-})
-#else
-import UIKit
-private let lockBackground = Color(UIColor.systemBackground)
-#endif
-
 struct LockScreen: View {
     @Binding var isUnlocked: Bool
     @Environment(\.scenePhase) private var scenePhase
     @State private var authFailed = false
     @State private var authenticating = false
 
+    private var biometryName: String {
+        let context = LAContext()
+        _ = context.canEvaluatePolicy(.deviceOwnerAuthenticationWithBiometrics, error: nil)
+        switch context.biometryType {
+        case .faceID: return "Face ID"
+        case .touchID: return "Touch ID"
+        case .opticID: return "Optic ID"
+        default: return "Passcode"
+        }
+    }
+
+    private var biometrySymbol: String {
+        switch biometryName {
+        case "Face ID": return "faceid"
+        case "Touch ID": return "touchid"
+        case "Optic ID": return "opticid"
+        default: return "lock.fill"
+        }
+    }
+
     var body: some View {
-        VStack(spacing: 24) {
+        VStack(spacing: 0) {
             Spacer()
 
-            Image(systemName: "lock.fill")
-                .font(.system(size: 48))
-                .foregroundStyle(.secondary)
+            JoriMark(size: 112)
 
             Text("Jori")
-                .font(.largeTitle.bold())
+                .font(JoriTheme.display(40))
+                .padding(.top, 32)
 
-            if authenticating {
-                ProgressView()
+            Group {
+                if authenticating {
+                    ProgressView()
+                        .controlSize(.regular)
+                } else if authFailed {
+                    // Without this the only way back in was to leave the app
+                    // and come back, which re-armed the prompt.
+                    Button(action: authenticate) {
+                        Label("Unlock with \(biometryName)", systemImage: biometrySymbol)
+                            .fontWeight(.semibold)
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 4)
+                            .foregroundStyle(JoriTheme.iconDeep)
+                    }
+                    .controlSize(.large)
+                    .prominentButtonStyle()
+                    .buttonBorderShape(.capsule)
+                    .keyboardShortcut(.defaultAction)
+                    .transition(.scale(scale: 0.9).combined(with: .opacity))
+                }
             }
+            .frame(height: 56)
+            .padding(.top, 24)
+            .animation(.snappy, value: authenticating)
+            .animation(.snappy, value: authFailed)
 
+            Spacer()
             Spacer()
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background(lockBackground)
+        .foregroundStyle(.white)
+        .background(JoriBackdrop())
+        .tint(JoriTheme.eye)
+        .environment(\.colorScheme, .dark)
+        .sensoryFeedback(.error, trigger: authFailed) { _, failed in failed }
         .onAppear {
             authenticate()
         }

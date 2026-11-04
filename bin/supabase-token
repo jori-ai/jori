@@ -1,0 +1,189 @@
+#!/usr/bin/env node
+"use strict";
+// supabase-token — prints a valid Supabase Management API access token.
+//
+// WHY THIS EXISTS: Supabase has no API for personal access tokens, so a PAT can
+// only be rotated by hand in the dashboard — and the last one expired 30 days
+// out, which is a silent-breakage shape. This uses an OAuth app registered
+// by the installation instead, whose refresh token renews itself forever
+// without a human.
+//
+// THE OAUTH APP IS THE INSTALLATION'S. Its client id and where its secrets are
+// kept are read from agent/local/supabase-oauth/app.json (private data):
+//   { "client_id": "<uuid>", "op_item": "<1Password item reference>" }
+// SUPABASE_OAUTH_CLIENT_ID / SUPABASE_OAUTH_CLIENT_SECRET in the environment
+// win. With neither the script says it is not configured and exits 1 (the
+// capability is off; nothing is called).
+//
+// TWO PROPERTIES OF SUPABASE'S OAUTH THAT DICTATE THIS DESIGN:
+//
+//   1. Access tokens live 24h. Anything that caches one in an env var at
+//      process start (the supervisors do exactly that) goes stale inside a day.
+//      So callers must ASK THIS SCRIPT each time rather than read a variable.
+//
+//   2. Refresh tokens ROTATE — each refresh invalidates the one used and
+//      returns a new one. That makes the store the single point of failure: if
+//      we refresh and then fail to persist, access is gone for good and only a
+//      browser re-authorization brings it back. Hence: write to a temp file and
+//      rename (atomic), and hold an exclusive lock so two callers can never
+//      refresh concurrently and race each other into an invalid token.
+//
+// Cloudflare fronts api.supabase.com and answers 403 (error 1010) to some
+// non-browser user agents — node's fetch included, python-urllib observed. We
+// shell out to curl, which it accepts. That failure looks like an auth error
+// and is not one, so do not "simplify" this back to fetch.
+//
+// Usage:  supabase-token            # prints token, refreshing if needed
+//         supabase-token --force    # refresh even if the cache looks fresh
+//         supabase-token --status   # human-readable, prints NO secret
+
+const { execFileSync } = require("child_process");
+const fs = require("fs");
+const path = require("path");
+const os = require("os");
+
+const { localDir } = require("../lib/instance.cjs");
+const JORI = path.resolve(__dirname, "..");
+const APP_FILE = path.join(localDir(), "supabase-oauth", "app.json");
+const STORE = path.join(JORI, "data/.supabase-oauth.json");
+const LOCK = STORE + ".lock";
+const SKEW_MS = 10 * 60 * 1000; // refresh when under 10 min remains
+
+function app() {
+  let cfg = {};
+  try { cfg = JSON.parse(fs.readFileSync(APP_FILE, "utf8")); } catch { /* not configured */ }
+  return {
+    clientId: process.env.SUPABASE_OAUTH_CLIENT_ID || cfg.client_id || "",
+    opItem: cfg.op_item || "",
+  };
+}
+
+function clientId() {
+  const id = app().clientId;
+  if (!id) throw new Error(`supabase-token: not configured — no OAuth app in ${APP_FILE} (client_id) or SUPABASE_OAUTH_CLIENT_ID`);
+  return id;
+}
+
+// A secret the environment does not carry is read from the installation's
+// 1Password item, when one is configured.
+function op(field) {
+  const item = app().opItem;
+  if (!item) throw new Error(`supabase-token: no ${field} — set it in the environment or op_item in ${APP_FILE}`);
+  return execFileSync("op", ["read", `${item}/${field}`], {
+    encoding: "utf8",
+  }).trim();
+}
+
+function readStore() {
+  try {
+    return JSON.parse(fs.readFileSync(STORE, "utf8"));
+  } catch {
+    return null;
+  }
+}
+
+// Atomic: a torn write here costs us the refresh token permanently.
+function writeStore(obj) {
+  fs.mkdirSync(path.dirname(STORE), { recursive: true });
+  const tmp = `${STORE}.${process.pid}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify(obj, null, 2), { mode: 0o600 });
+  fs.renameSync(tmp, STORE);
+}
+
+// mkdir is atomic on POSIX, so it doubles as a lock with no extra dependency.
+function withLock(fn) {
+  const deadline = Date.now() + 30000;
+  for (;;) {
+    try {
+      fs.mkdirSync(LOCK);
+      break;
+    } catch (e) {
+      if (e.code !== "EEXIST") throw e;
+      // Reap a lock orphaned by a crash rather than blocking forever.
+      try {
+        if (Date.now() - fs.statSync(LOCK).mtimeMs > 60000) fs.rmdirSync(LOCK);
+      } catch {}
+      if (Date.now() > deadline) throw new Error("supabase-token: lock timeout");
+      execFileSync("sleep", ["0.25"]);
+    }
+  }
+  try {
+    return fn();
+  } finally {
+    try { fs.rmdirSync(LOCK); } catch {}
+  }
+}
+
+function post(form) {
+  const args = ["-s", "-X", "POST", "https://api.supabase.com/v1/oauth/token",
+                "-H", "Content-Type: application/x-www-form-urlencoded"];
+  for (const [k, v] of Object.entries(form)) args.push("--data-urlencode", `${k}=${v}`);
+  const raw = execFileSync("curl", args, { encoding: "utf8", maxBuffer: 1 << 20 });
+  let j;
+  try {
+    j = JSON.parse(raw);
+  } catch {
+    throw new Error(`supabase-token: non-JSON from token endpoint: ${raw.slice(0, 200)}`);
+  }
+  if (!j.access_token) {
+    throw new Error(`supabase-token: refresh rejected: ${JSON.stringify(j).slice(0, 300)}`);
+  }
+  return j;
+}
+
+function refresh(store) {
+  // The refresh token in the store is authoritative — 1Password holds only the
+  // bootstrap copy, which goes stale the first time we rotate.
+  const id = clientId(); // not configured: stop before touching any secret
+  const refreshToken = (store && store.refresh_token) || op("refresh_token");
+  if (!refreshToken) throw new Error("supabase-token: no refresh token");
+  const r = post({
+    grant_type: "refresh_token",
+    client_id: id,
+    // .env first: `op` must not run on an unattended host at runtime (it can hang waiting for an unlock).
+    client_secret: process.env.SUPABASE_OAUTH_CLIENT_SECRET || op("credential"),
+    refresh_token: refreshToken,
+  });
+  const next = {
+    access_token: r.access_token,
+    expires_at: Date.now() + r.expires_in * 1000,
+    refresh_token: r.refresh_token || refreshToken,
+    rotated_at: new Date().toISOString(),
+  };
+  writeStore(next);
+  return next;
+}
+
+function current({ force = false } = {}) {
+  return withLock(() => {
+    const store = readStore();
+    const fresh = store && store.access_token && store.expires_at - Date.now() > SKEW_MS;
+    if (fresh && !force) return store;
+    return refresh(store);
+  });
+}
+
+function main() {
+  const arg = process.argv[2];
+  if (arg === "--status") {
+    const s = readStore();
+    if (!s) return console.log("no cached token yet — next call will mint one");
+    const mins = Math.round((s.expires_at - Date.now()) / 60000);
+    console.log(`access token ${mins > 0 ? `valid ${mins} min` : `EXPIRED ${-mins} min ago`}`);
+    console.log(`last rotated: ${s.rotated_at}`);
+    console.log(`store: ${STORE}`);
+    return;
+  }
+  process.stdout.write(current({ force: arg === "--force" }).access_token + "\n");
+}
+
+if (require.main === module) {
+  try {
+    main();
+  } catch (e) {
+    console.error(String(e.message || e));
+    process.exit(1);
+  }
+}
+
+module.exports = { current };

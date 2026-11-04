@@ -1,0 +1,62 @@
+#!/bin/bash
+# minibeat — the host's fast "still alive" beat, every 30s, to Firebase RTDB
+# /heartbeat/minibeat. Watched off-box by the checkMinibeat Cloud Function
+# (firebase/functions/index.js), which emails + pushes once the beat is
+# 3 minutes stale and again when it returns.
+#
+# Deliberately tiny and separate from heartbeat-sender.sh: that one gathers a
+# dozen metrics every 2 min and has broken its own delivery before (see its
+# header). This writes ONE server timestamp and nothing else, so the only way
+# it goes quiet is the host, its network, or Firebase actually being down.
+# Runs under launchd KeepAlive (com.jori.minibeat); paces itself.
+
+# Where it posts: agent/local/config/heartbeat.json {"firebase_url": ...} —
+# the same database heartbeat-sender.sh uses (JORI_HEARTBEAT_FIREBASE_URL
+# overrides). No URL configured = no beat; exits 0.
+source "$(cd "$(dirname "$0")" && pwd)/../agent/scripts/lib/root.sh"
+source "$JORI_TOOLS/agent/scripts/lib/instance.sh"
+FIREBASE_URL="${JORI_HEARTBEAT_FIREBASE_URL:-$("${JORI_NODE:-node}" -e 'process.stdout.write(String(require(process.argv[1]).localConfig("heartbeat",{firebase_url:""}).firebase_url||""))' "$JORI_TOOLS/lib/instance.cjs" 2>/dev/null)}"
+if [ -z "$FIREBASE_URL" ]; then
+  echo "$(date '+%F %T') [minibeat] no Firebase URL configured (agent/local/config/heartbeat.json firebase_url) — not beating"
+  exit 0
+fi
+BEAT_HOST="${JORI_HOST:-$(hostname -s)}"
+GCLOUD="$(command -v gcloud 2>/dev/null || echo /opt/homebrew/bin/gcloud)"
+# Shared with heartbeat-sender.sh — gcloud tokens last 60 min, refresh at 50.
+TOKEN_CACHE="$JORI_INSTALL/data/.firebase-token-cache"
+
+get_token() {
+  if [ -f "$TOKEN_CACHE" ]; then
+    local age=$(( $(date +%s) - $(stat -f%m "$TOKEN_CACHE") ))
+    if [ "$age" -lt 3000 ]; then cat "$TOKEN_CACHE"; return; fi
+  fi
+  local token
+  token=$($GCLOUD auth print-access-token 2>/dev/null)
+  if [ -n "$token" ]; then echo "$token" > "$TOKEN_CACHE"; echo "$token"; fi
+}
+
+put_beat() {
+  curl -s -o /dev/null -w '%{http_code}' --max-time 10 \
+    -X PUT "${FIREBASE_URL}/heartbeat/minibeat.json?access_token=$1" \
+    -H "Content-Type: application/json" \
+    -d "{\"ts\":{\".sv\":\"timestamp\"},\"host\":\"${BEAT_HOST}\"}" 2>/dev/null
+}
+
+FAILS=0
+while true; do
+  TOKEN=$(get_token)
+  CODE=000
+  if [ -n "$TOKEN" ]; then
+    CODE=$(put_beat "$TOKEN")
+    if [ "$CODE" = "401" ]; then rm -f "$TOKEN_CACHE"; TOKEN=$(get_token); [ -n "$TOKEN" ] && CODE=$(put_beat "$TOKEN"); fi
+  fi
+  if [ "$CODE" = "200" ]; then
+    # Log only transitions so the log doesn't grow by 2,880 lines a day.
+    [ "$FAILS" -gt 0 ] && echo "$(date '+%F %T') [minibeat] OK again after $FAILS failed beats"
+    FAILS=0
+  else
+    FAILS=$((FAILS + 1))
+    [ "$FAILS" -eq 1 ] && echo "$(date '+%F %T') [minibeat] PUT failed (HTTP $CODE)" >&2
+  fi
+  sleep 30
+done

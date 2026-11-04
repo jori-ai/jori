@@ -10,6 +10,11 @@
 //         Exit 2 on internal error (caller falls back to local-classify).
 //   jev-email-classify --shadow-sonnet <messageId> --from ... --subject ... --jev-json '<json>'
 //       → detached side-effect-free Sonnet classification for the shadow comparison.
+//   jev-email-classify --booking <messageId> --from ... --subject ...
+//       → is it a confirmed booking (appointment, reservation, show, meeting) or a
+//         change/cancellation/reminder of one? One JSON line {booking, kind, used,
+//         confidence} ({booking:null, error} on failure), exit 0. Asked by
+//         gmail-source right before intake would file a message with no agent turn.
 
 const args = process.argv.slice(2);
 const flag = (n) => { const i = args.indexOf(n); return i >= 0 ? args[i + 1] : null; };
@@ -19,6 +24,13 @@ const lib = await import("../lib/jev-email-triage.mjs");
 if (args[0] === "--shadow-sonnet") {
   let jev = null; try { jev = JSON.parse(flag("--jev-json") || "null"); } catch {}
   const v = await lib.runSonnetShadow({ messageId: args[1], from: flag("--from") || "", subject: flag("--subject") || "", jev }).catch(() => null);
+  process.stdout.write(JSON.stringify(v) + "\n");
+  process.exit(0);
+}
+
+if (args[0] === "--booking") {
+  const v = await lib.checkEmailBooking({ messageId: args[1], from: flag("--from") || "", subject: flag("--subject") || "" })
+    .catch((err) => ({ booking: null, error: String(err?.message || err).slice(0, 200) }));
   process.stdout.write(JSON.stringify(v) + "\n");
   process.exit(0);
 }

@@ -1,0 +1,201 @@
+#!/usr/bin/env node
+// calendar-conflict-check — flag when a candidate event's date/time overlaps
+// something already on the user's calendar, so an event-recommending lane can
+// say "heads up, this overlaps with X" instead of handing over two same-night
+// ideas as if both were wide open (a candidate once collided with a show the
+// user had already booked and nothing caught it). Shared check every event lane
+// runs right before delivery, alongside the city-on-date travel gate
+// (`travel in-city`) and the headliner bypass — see ops-agent/CLAUDE.md
+// § Travel Timeline & Event Geo-Gating, and its sibling § Event Pre-Send Checks.
+//
+// This is a pure date/time-overlap computation (code owns geometry, Rule 0b)
+// — no language judgment involved, so no model call here. The companion
+// "is this still available" question (reading a ticket page for sold-out
+// language) is a model judgment and is handled inline by the job's own turn,
+// documented alongside this tool rather than wrapped in a second binary.
+//
+// Usage:
+//   calendar-conflict-check <YYYY-MM-DD> [--time HH:MM] [--duration-hours N] [--tz <IANA>] [--json]
+//
+// <date> and --time are wall-clock values in --tz, the zone the event itself
+// is in (default: the installation's home zone, instance().tz, so every
+// home-city caller passes nothing). A lane abroad once passed local show times
+// that this tool read in the home zone, so a 21:00 show was checked at 04:00
+// local time, flagged an airport pickup and missed the show the user held
+// tickets for. The date is the event's own local date, so a 01:00 show listed
+// on the 16th is checked at 01:00 on the 16th in that zone.
+//
+// <date> required. --time is the candidate event's local start time (24h
+// HH:MM) if known. When omitted, the check falls back to a typical
+// evening-show window (18:00-23:00 in --tz) rather than the whole day — most
+// discovery-stage candidates (a concert, a comedy set, a theater booking)
+// don't carry a showtime yet, but a whole-day check would flag every routine
+// daytime meeting as a "conflict" and drown the one that matters. --duration-
+// hours defaults to 2.5 (matches the ticket-confirmation calendar sizing
+// convention in email-triage-rules.md § Ticket Confirmation Emails) and only
+// applies when --time is given.
+//
+// Exit: 0 = clear (no overlapping event), 1 = conflict found, 2 = usage error.
+// On a lookup/API failure: FAIL OPEN (exit 0, warning to stderr) — same
+// posture as every other gate in this system (travel, headliner). A missed
+// conflict costs a redundant suggestion; a false one costs a wrongly
+// suppressed item, which is the worse failure for a check this new.
+//
+// Only checks gog's default (primary) calendar — the same reading the presence
+// checks use; imported Weather/Holiday calendars are noise here, not
+// commitments. All-day/transparent ("free") events never count as a conflict —
+// matches the busy/free convention in the calendar-scheduling skill: a
+// transparent event is deliberately not a commitment. An all-day event's date
+// is read as a day in --tz too (Google's all-day dates carry no zone; it is
+// "that day wherever the user is").
+//
+// Node builtins only, on purpose (plus the instance zone, read inside a
+// try): any uncaught throw exits 1, which callers that read only the exit
+// status (some venue lanes) take as "conflict" and drop the pick, so a
+// broken import of some shared helper would silently drop every candidate there.
+
+import { execFileSync } from 'node:child_process';
+import { createRequire } from 'node:module';
+
+const DEFAULT_DURATION_HOURS = 2.5;
+const PAD_HOURS = 3; // query window padding so an event straddling the edge is never missed
+
+const argv = process.argv.slice(2);
+const jsonOut = argv.includes('--json');
+const date = argv.find(a => /^\d{4}-\d{2}-\d{2}$/.test(a));
+
+function flag(name) {
+  const i = argv.indexOf(name);
+  return i >= 0 ? argv[i + 1] : null;
+}
+
+function usage(msg) {
+  if (msg) process.stderr.write(msg + '\n');
+  process.stderr.write('usage: calendar-conflict-check <YYYY-MM-DD> [--time HH:MM] [--duration-hours N] [--tz <IANA>] [--json]\n');
+  process.exit(2);
+}
+
+if (!date) usage('missing <YYYY-MM-DD>');
+
+// The installation's home zone; any failure reading it falls back to the host's zone.
+function homeTz() {
+  try { return createRequire(import.meta.url)('../lib/instance.cjs').instance().tz; }
+  catch { try { return Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC'; } catch { return 'UTC'; } }
+}
+const DEFAULT_TZ = homeTz();
+const tz = flag('--tz') || DEFAULT_TZ;
+try { new Intl.DateTimeFormat('en-US', { timeZone: tz }); } catch { usage(`--tz must be an IANA zone (e.g. Europe/Paris), got "${tz}"`); }
+
+const timeArg = flag('--time');
+// 24:00 stays legal (next day 00:00), as it was when this parsed an ISO string.
+if (timeArg && !/^(([01]\d|2[0-3]):[0-5]\d|24:00)$/.test(timeArg)) usage(`--time must be HH:MM (24h, in --tz), got "${timeArg}"`);
+
+const durationArg = flag('--duration-hours');
+const durationHours = durationArg ? Number(durationArg) : DEFAULT_DURATION_HOURS;
+if (!Number.isFinite(durationHours) || durationHours <= 0) usage(`--duration-hours must be a positive number, got "${durationArg}"`);
+
+// Wall clock -> instant, DST-correct for any zone (Intl; no fixed offsets).
+// This was once a fixed -04:00 for March-November and -05:00 otherwise: an
+// hour off in early March and in November around the daylight-saving changes.
+function zoneOffsetMs(ms) {
+  const p = Object.fromEntries(new Intl.DateTimeFormat('en-US', {
+    timeZone: tz, hourCycle: 'h23', year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', second: '2-digit',
+  }).formatToParts(new Date(ms)).filter(x => x.type !== 'literal').map(x => [x.type, Number(x.value)]));
+  return Date.UTC(p.year, p.month - 1, p.day, p.hour, p.minute, p.second) - Math.floor(ms / 1000) * 1000;
+}
+
+/** `ymd` (YYYY-MM-DD) at `hhmm` on the wall clock of --tz -> epoch ms, or NaN for an impossible date. */
+function wallMs(ymd, hhmm) {
+  const [y, m, d] = String(ymd).split('-').map(Number);
+  const [hh, mm] = hhmm.split(':').map(Number);
+  const guess = Date.UTC(y, m - 1, d, hh, mm);
+  if (!Number.isFinite(guess) || new Date(Date.UTC(y, m - 1, d)).toISOString().slice(0, 10) !== ymd) return NaN;
+  let ms = guess - zoneOffsetMs(guess);
+  ms = guess - zoneOffsetMs(ms); // second pass settles a DST edge
+  return ms;
+}
+
+const EVENING_START = '18:00';
+const EVENING_END = '23:00';
+
+let checkStart, checkEnd;
+if (!Number.isFinite(wallMs(date, '00:00'))) usage(`invalid date "${date}"`);
+if (timeArg) {
+  checkStart = new Date(wallMs(date, timeArg));
+  checkEnd = new Date(checkStart.getTime() + durationHours * 3600 * 1000);
+} else {
+  checkStart = new Date(wallMs(date, EVENING_START));
+  checkEnd = new Date(wallMs(date, EVENING_END));
+}
+
+function isoPad(ms) { return new Date(ms).toISOString(); }
+const queryFrom = isoPad(checkStart.getTime() - PAD_HOURS * 3600 * 1000);
+const queryTo = isoPad(checkEnd.getTime() + PAD_HOURS * 3600 * 1000);
+
+function eventBounds(part, fallbackMs) {
+  if (!part) return fallbackMs;
+  if (part.dateTime) return new Date(part.dateTime).getTime();
+  if (part.date) { const ms = wallMs(part.date, '00:00'); return Number.isFinite(ms) ? ms : fallbackMs; }
+  return fallbackMs;
+}
+
+function failOpen(reason) {
+  process.stderr.write(`calendar-conflict-check: ${reason} — failing open (no conflict)\n`);
+  if (jsonOut) console.log(JSON.stringify({ date, time: timeArg, tz, conflict: false, error: reason }));
+  else console.log(`NO_CONFLICT ${date}${timeArg ? ' ' + timeArg : ''} — check failed, failing open: ${reason}`);
+  process.exit(0);
+}
+
+let events;
+try {
+  const out = execFileSync('gog', ['calendar', 'list',
+    '--from', queryFrom, '--to', queryTo, '--max=250', '--json'],
+    { encoding: 'utf8', maxBuffer: 16 * 1024 * 1024, timeout: 20_000 });
+  events = (JSON.parse(out).events || []);
+} catch (e) {
+  failOpen(`calendar query failed: ${e.message}`);
+}
+
+const conflicts = [];
+for (const e of events) {
+  if (e.transparency === 'transparent') continue; // deliberately not a commitment
+  const startMs = eventBounds(e.start, null);
+  const endMs = eventBounds(e.end, startMs);
+  if (startMs == null) continue;
+  const overlaps = startMs < checkEnd.getTime() && endMs > checkStart.getTime();
+  if (overlaps) {
+    conflicts.push({
+      summary: e.summary || '(untitled)',
+      start: e.start?.dateTime || e.start?.date,
+      end: e.end?.dateTime || e.end?.date,
+      location: e.location || null,
+      // Identity + shape fields, so a caller with its own soft-block rule (a
+      // movable recurring call, all-day/tentative placeholders) can apply
+      // it without a second calendar read.
+      id: e.id || null,
+      recurringEventId: e.recurringEventId || null,
+      status: e.status || null,
+      all_day: !e.start?.dateTime,
+      attendees: (e.attendees || []).map((a) => ({ email: a.email || null, displayName: a.displayName || null })),
+    });
+  }
+}
+
+const result = {
+  date,
+  time: timeArg,
+  tz,
+  window: { from: checkStart.toISOString(), to: checkEnd.toISOString() },
+  conflict: conflicts.length > 0,
+  events: conflicts,
+};
+
+if (jsonOut) {
+  console.log(JSON.stringify(result));
+} else if (conflicts.length > 0) {
+  console.log(`CONFLICT ${date}${timeArg ? ' ' + timeArg : ''} — overlaps: ${conflicts.map(c => `"${c.summary}" (${c.start})`).join('; ')}`);
+} else {
+  console.log(`NO_CONFLICT ${date}${timeArg ? ' ' + timeArg : ''}`);
+}
+process.exit(conflicts.length > 0 ? 1 : 0);

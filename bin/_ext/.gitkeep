@@ -12,7 +12,6 @@
 # check, `<cli> in-city <city> <date>` (JORI_TRAVEL_BIN), and a
 # must-see-performer check that bypasses the gate, `<cli> check <name>`
 # (JORI_HEADLINER_BIN); point those variables at copies kept here.
-# bin/hum-sense kicks bin/watch when it exists (with lib/_ext/watches.mjs).
 #
 # Everything here except this file is gitignored — see .gitignore and
 # docs/architecture-public-private.md.

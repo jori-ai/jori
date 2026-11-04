@@ -1,0 +1,218 @@
+#!/usr/bin/env node
+"use strict";
+// finance-model — build the slow-moving reference model the `finance` hum
+// harvester reasons against. Heavy(ish) full-history pass; runs nightly. The
+// harvester reads this file + LIVE recent transactions each tick (cheap), so
+// time-sensitive detection (fees, anomalies, rent arrivals) stays current
+// without rebuilding the model.
+//
+// READ-ONLY over the jori Supabase plaid_* tables. Bank data is
+// jori-model-only (health-data tier) — this file stays on the host, never
+// leaves to a third-party LLM. No transactions (a fresh install) → an empty
+// model, which the harvester reads as "nothing to say".
+//
+// Output: data/finance-model.json
+//   {
+//     built_at, history_span_months,
+//     subscriptions:        [{merchant, account_id, cadence, amount, prior_amount, amounts, last_date, next_expected, count}],
+//     income_streams:       [{account_id, account_name, source, cadence, amount, typical_day, last_date, next_expected, count}],  // regular credits only — see lib/finance-income-streams.js
+//     income_streams_rejected: [{account_id, source, count, reason}],
+//     recurring_obligations:[{merchant, account_id, amount, cadence, last_date, next_expected}],   // mortgages, big monthly debits
+//     merchant_stats:       { "<merchant>": {count, median, max, p90, mean, stdev} },
+//     category_baselines:   { "<category>": {monthly_avg, months} },
+//     accounts:             [{account_id, name, mask, subtype, type, balance_current, balance_available}]
+//   }
+//
+// Usage: finance-model [--json]   (--json prints the model to stdout too)
+
+const fs = require("node:fs");
+const { loadEnv } = require("../lib/load-env.js");
+const { request, requestAll } = require("../lib/supabase-rest.js");
+const { inferIncomeStreams, normMerchant } = require("../lib/finance-income-streams.js");
+const { installTools } = require("../lib/root.cjs");
+loadEnv();
+
+const OUT = process.env.FINANCE_MODEL_FILE || installTools("data/finance-model.json");
+const JSON_OUT = process.argv.includes("--json");
+
+// ── helpers ─────────────────────────────────────────────────────────────────
+const DAY = 86400000;
+const toDate = (s) => new Date(`${s}T00:00:00Z`);
+const daysBetween = (a, b) => Math.round((toDate(b) - toDate(a)) / DAY);
+
+function median(xs) {
+  if (!xs.length) return null;
+  const s = [...xs].sort((a, b) => a - b);
+  const m = Math.floor(s.length / 2);
+  return s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2;
+}
+function mean(xs) {
+  return xs.length ? xs.reduce((a, b) => a + b, 0) / xs.length : null;
+}
+function stdev(xs) {
+  if (xs.length < 2) return 0;
+  const m = mean(xs);
+  return Math.sqrt(xs.reduce((a, b) => a + (b - m) ** 2, 0) / (xs.length - 1));
+}
+function p90(xs) {
+  if (!xs.length) return null;
+  const s = [...xs].sort((a, b) => a - b);
+  return s[Math.min(s.length - 1, Math.floor(0.9 * s.length))];
+}
+// normMerchant comes from lib/finance-income-streams.js (shared).
+// Classify cadence from a sorted list of dates. Precision over recall: each
+// cadence needs enough occurrences to be trustworthy on sparse history, so a
+// 3-charge monthly series can't be mislabeled "weekly" (which needs density).
+function classifyCadence(ds) {
+  if (ds.length < 2) return null;
+  const gaps = ds.slice(1).map((d, i) => daysBetween(ds[i], d));
+  const g = median(gaps);
+  const n = ds.length;
+  if (g >= 6 && g <= 8 && n >= 8) return { cadence: "weekly", gap: g };
+  if (g >= 12 && g <= 16 && n >= 5) return { cadence: "biweekly", gap: g };
+  if (g >= 26 && g <= 34 && n >= 3) return { cadence: "monthly", gap: g };
+  if (g >= 85 && g <= 100 && n >= 2) return { cadence: "quarterly", gap: g };
+  if (g >= 350 && g <= 385 && n >= 2) return { cadence: "annual", gap: g };
+  return null;
+}
+
+const TRANSFER_CATS = new Set(["TRANSFER_OUT", "TRANSFER_IN"]);
+
+async function main() {
+  // Pull all transactions + accounts (service-role; RLS bypassed).
+  // Paged: a single GET is capped at 1000 rows server-side, which silently
+  // truncated this to the newest ~2.5 months. See requestAll.
+  const txns = await requestAll(
+    "/rest/v1/plaid_transactions?select=transaction_id,account_id,amount,date,name,merchant_name,category_primary,category_detailed,pending&order=date.desc,transaction_id.asc"
+  );
+  const accts =
+    (await request(
+      "/rest/v1/plaid_accounts?select=account_id,name,official_name,mask,subtype,type,balance_current,balance_available,institution_name"
+    )) || [];
+
+  const posted = txns.filter((t) => !t.pending);
+  const dates = posted.map((t) => t.date).sort();
+  const spanMonths = dates.length ? +(daysBetween(dates[0], dates[dates.length - 1]) / 30).toFixed(1) : 0;
+
+  // ── group OUTFLOW spend by merchant (exclude transfers; loans handled separately) ──
+  const outflows = posted.filter((t) => Number(t.amount) > 0 && !TRANSFER_CATS.has(t.category_primary));
+  const byMerchant = new Map();
+  for (const t of outflows) {
+    const k = normMerchant(t);
+    if (!byMerchant.has(k)) byMerchant.set(k, []);
+    byMerchant.get(k).push(t);
+  }
+
+  const subscriptions = [];
+  const recurring_obligations = [];
+  const merchant_stats = {};
+
+  for (const [merchant, ts] of byMerchant) {
+    const amounts = ts.map((t) => Math.abs(Number(t.amount)));
+    merchant_stats[merchant] = {
+      count: ts.length,
+      median: round2(median(amounts)),
+      max: round2(Math.max(...amounts)),
+      p90: round2(p90(amounts)),
+      mean: round2(mean(amounts)),
+      stdev: round2(stdev(amounts)),
+    };
+
+    if (ts.length < 2) continue;
+    const ds = ts.map((t) => t.date).sort();
+    const cad = classifyCadence(ds);
+    if (!cad || cad.cadence === "weekly" || cad.cadence === "biweekly") continue; // spend recurs monthly+
+
+    const lastDate = ds[ds.length - 1];
+    const lastAmt = Math.abs(Number(ts[ts.length - 1].amount));
+    const priorAmt = ts.length >= 2 ? Math.abs(Number(ts[ts.length - 2].amount)) : null;
+    const stable = stdev(amounts) / (mean(amounts) || 1) < 0.15 || Math.max(...amounts) - Math.min(...amounts) <= 2;
+    const rec = {
+      merchant,
+      account_id: ts[ts.length - 1].account_id,
+      cadence: cad.cadence,
+      amount: round2(lastAmt),
+      prior_amount: priorAmt != null ? round2(priorAmt) : null,
+      amounts: amounts.map(round2),
+      last_date: lastDate,
+      next_expected: addDays(lastDate, cad.gap),
+      count: ts.length,
+      category: ts[ts.length - 1].category_primary,
+    };
+    // Big recurring debits (mortgage/loan/tax) → obligations, not "subscriptions".
+    const isObligation =
+      ["LOAN_PAYMENTS", "RENT_AND_UTILITIES", "GOVERNMENT_AND_NON_PROFIT"].includes(rec.category) || lastAmt >= 1500;
+    if (isObligation) recurring_obligations.push(rec);
+    else if (stable) subscriptions.push(rec);
+  }
+
+  // ── income streams (recurring CREDITS on cash accounts; rent/payroll) ──
+  // The bar lives in lib/finance-income-streams.js: credits only, on a
+  // depository account, >=3 occurrences, consistent cadence AND amount. Until
+  // 2026-10-06 any inflow seen twice at a median ~monthly gap qualified, which
+  // turned a household member's irregular card autopay into a fake "$1,516
+  // monthly deposit".
+  // Nothing alerts on this list (late income reads fin_expected_income only).
+  const { streams: income_streams, rejected: income_rejected } = inferIncomeStreams(posted, accts);
+
+  // ── category baselines (monthly avg spend per category; for pacing) ──
+  const category_baselines = {};
+  const catMonth = new Map(); // cat -> month -> sum
+  for (const t of outflows) {
+    if (["LOAN_PAYMENTS"].includes(t.category_primary)) continue;
+    const cat = t.category_primary || "OTHER";
+    const mo = t.date.slice(0, 7);
+    if (!catMonth.has(cat)) catMonth.set(cat, new Map());
+    const mm = catMonth.get(cat);
+    mm.set(mo, (mm.get(mo) || 0) + Math.abs(Number(t.amount)));
+  }
+  for (const [cat, mm] of catMonth) {
+    const totals = [...mm.values()];
+    category_baselines[cat] = { monthly_avg: round2(mean(totals)), months: totals.length };
+  }
+
+  const model = {
+    built_at: new Date().toISOString(),
+    history_span_months: spanMonths,
+    subscriptions: subscriptions.sort((a, b) => b.amount - a.amount),
+    income_streams,          // already sorted; see lib/finance-income-streams.js
+    income_streams_rejected: income_rejected, // why each repeating inflow did NOT qualify
+    recurring_obligations: recurring_obligations.sort((a, b) => b.amount - a.amount),
+    merchant_stats,
+    category_baselines,
+    accounts: accts.map((a) => ({
+      account_id: a.account_id,
+      name: a.name,
+      mask: a.mask,
+      subtype: a.subtype,
+      type: a.type,
+      balance_current: a.balance_current,
+      balance_available: a.balance_available,
+    })),
+  };
+
+  fs.mkdirSync(require("node:path").dirname(OUT), { recursive: true });
+  const tmp = `${OUT}.tmp.${process.pid}`;
+  fs.writeFileSync(tmp, JSON.stringify(model, null, 2));
+  fs.renameSync(tmp, OUT);
+
+  if (JSON_OUT) console.log(JSON.stringify(model, null, 2));
+  else
+    console.log(
+      `finance-model built: ${model.history_span_months}mo, ${subscriptions.length} subscriptions, ` +
+        `${income_streams.length} income streams, ${recurring_obligations.length} obligations, ` +
+        `${Object.keys(merchant_stats).length} merchants → ${OUT}`
+    );
+}
+
+function round2(n) {
+  return n == null ? null : Math.round(Number(n) * 100) / 100;
+}
+function addDays(dateStr, n) {
+  return new Date(toDate(dateStr).getTime() + n * DAY).toISOString().slice(0, 10);
+}
+
+main().catch((e) => {
+  console.error(`finance-model error: ${e.message}`);
+  process.exit(1);
+});

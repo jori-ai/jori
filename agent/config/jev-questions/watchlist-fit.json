@@ -1,0 +1,15 @@
+{
+  "_doc": "Jev fit gate for every watchlist harvester (lib/watch-fit.mjs judgeFit, called by bin/watch-discover and the back-catalog film harvester). One boolean per candidate; true = add it. Legacy (shadow + fallback) = one batched tool-less Sonnet judgement over all candidates in the run. Agreement = same keep/drop. Kernel definition; an installation's own data/jev-questions/watchlist-fit.json replaces it (lib/jev.mjs jevSiteDef) and is where its own dislikes (and the exceptions to them) belong.",
+  "notes": "Threshold 0.85. A false keep puts a mediocre title on the list; a false drop costs one candidate out of many, so a sub-threshold Jev answer falls to Sonnet rather than being acted on.",
+  "threshold": 0.85,
+  "questions": {
+    "truly_enjoy": {
+      "type": "boolean",
+      "instructions": "{{owner_name}} keeps watch lists, alone and with one other viewer: `for` says who this candidate is for — one of them alone, or both together. `taste` is what they like and avoid (stated preferences carry the user's own caveats in parentheses), `ratings` is how EACH of them rated titles they have already watched (their own words, strongest signal), and `taste.learned_from_their_marks` (when present) is what a model trained on every mark and verdict they've given has learned they like and dislike, and `model_prediction.p_like` is that model's estimate for this candidate — strong evidence, but not the answer on its own. `candidate` is a film or series a scout proposed, with its genres, synopsis and critic scores. Should it go on their list? Answer true only when it is a clear, confident match for whoever `for` names — a title you would bet they will truly enjoy, close to things they loved. Answer false for a stretch or a gamble, mixed or polarizing reviews, a network procedural or case-of-the-week, soapy, teen-centred, campy or gory material, romance or relationship-centred stories, children's/family fare, anything resembling titles they rated meh or disliked, a genre their stated preferences weigh negatively unless the title meets the exception their note names, or a match that rests only on a broad genre label. When `for` names both together, BOTH must be likely to enjoy it. If in doubt, false.",
+      "criteria": {
+        "true": "a confident match they will truly enjoy, close to titles they loved, strong reviews",
+        "false": "a stretch, mixed reviews, an avoided format or theme, close to titles they disliked, a negatively weighted genre without the exception its note names, or only a loose genre match"
+      }
+    }
+  }
+}

@@ -28,6 +28,9 @@ fi
 # scheduled job is never dropped just because a cheaper sibling is flaky.
 # Fail safe: anything the router can't classify defaults to ops.
 NODE_BIN="${NODE_BIN:-$JORI_NODE}"
+# The supervisors' local ports (lib/ports.cjs, the one registry): sets
+# JORI_PORT_OPS_WEBHOOK, JORI_PORT_OPS_HEALTH, JORI_PORT_OPS_LIGHT_WEBHOOK, …
+eval "$("$NODE_BIN" "$JORI_INSTALL_TOOLS/lib/ports.cjs" --env)"
 # Both registries are the kernel's file (config/job-routing.json,
 # config/chrome-jobs.json) plus this installation's agent/local/<name>.json,
 # merged by lib/registry.cjs.
@@ -75,9 +78,9 @@ _is_healthy() {
 # cron retries); use dispatch_or_skip if you want the fallback chain.
 resolve_tier_ports() {
   case "$(_resolve_tier "$1")" in
-    haiku) WEBHOOK_PORT=9072; HEALTH_PORT=9073 ;;
-    light) WEBHOOK_PORT=9082; HEALTH_PORT=9083 ;;
-    *)     WEBHOOK_PORT=9092; HEALTH_PORT=9093 ;;
+    haiku) WEBHOOK_PORT=$JORI_PORT_OPS_HAIKU_WEBHOOK; HEALTH_PORT=$JORI_PORT_OPS_HAIKU_HEALTH ;;
+    light) WEBHOOK_PORT=$JORI_PORT_OPS_LIGHT_WEBHOOK; HEALTH_PORT=$JORI_PORT_OPS_LIGHT_HEALTH ;;
+    *)     WEBHOOK_PORT=$JORI_PORT_OPS_WEBHOOK; HEALTH_PORT=$JORI_PORT_OPS_HEALTH ;;
   esac
 }
 
@@ -96,9 +99,9 @@ dispatch_or_skip() {
   # webhook:health port pairs, cheapest first.
   local -a chain
   case "$tier" in
-    haiku) chain=("9072:9073" "9082:9083" "9092:9093") ;; # haiku → sonnet → opus
-    light) chain=("9082:9083" "9092:9093") ;;             # sonnet → opus
-    *)     chain=("9092:9093") ;;                          # opus
+    haiku) chain=("$JORI_PORT_OPS_HAIKU_WEBHOOK:$JORI_PORT_OPS_HAIKU_HEALTH" "$JORI_PORT_OPS_LIGHT_WEBHOOK:$JORI_PORT_OPS_LIGHT_HEALTH" "$JORI_PORT_OPS_WEBHOOK:$JORI_PORT_OPS_HEALTH") ;; # haiku → sonnet → opus
+    light) chain=("$JORI_PORT_OPS_LIGHT_WEBHOOK:$JORI_PORT_OPS_LIGHT_HEALTH" "$JORI_PORT_OPS_WEBHOOK:$JORI_PORT_OPS_HEALTH") ;; # sonnet → opus
+    *)     chain=("$JORI_PORT_OPS_WEBHOOK:$JORI_PORT_OPS_HEALTH") ;; # opus
   esac
 
   local pair wport hport chosen="" idx=0

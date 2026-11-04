@@ -221,9 +221,12 @@ describe("chat-supervisor end-to-end", { skip: !canChildListen() && "child proce
     await sleep(2000);
 
     const health = await httpGet(port, "/health");
-    // Init + 3 messages = 4.
-    assert.ok(health.body.completed >= 4, `Expected >=4 completed, got ${health.body.completed}`);
+    // `completed` counts turns, and the dispatcher coalesces same-source normal
+    // messages that queue behind a turn into one: init + msg-0 + (msg-1, msg-2)
+    // is 3 turns. All three delivered = nothing left queued or in flight.
+    assert.ok(health.body.completed >= 3, `Expected >=3 completed turns, got ${health.body.completed}`);
     assert.equal(health.body.queueDepth, 0);
+    assert.equal(health.body.inFlight, null);
   });
 
   // ── Priority ordering ─────────────────────────────────────────────
@@ -400,8 +403,10 @@ describe("chat-supervisor end-to-end", { skip: !canChildListen() && "child proce
     const health = await httpGet(port, "/health");
     assert.equal(health.body.queueDepth, 0);
     assert.equal(health.body.inFlight, null);
-    // Init + 10 messages = 11.
-    assert.ok(health.body.completed >= 11, `Expected >=11 completed, got ${health.body.completed}`);
+    // Init + at least the high-priority one; the normal ones coalesce into
+    // fewer turns (`completed` counts turns). queueDepth 0 and nothing in
+    // flight above say every message was delivered.
+    assert.ok(health.body.completed >= 3, `Expected >=3 completed turns, got ${health.body.completed}`);
   });
 
   // ── Malformed requests ────────────────────────────────────────────

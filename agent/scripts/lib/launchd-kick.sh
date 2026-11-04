@@ -31,15 +31,17 @@
 # The kernel's repo plists are templates (__JORI_HOME__ / __JORI_TOOLS__ / __HOME__): an install
 # renders them (lib/launchd-render.sh), never copies them verbatim.
 source "$(dirname "${BASH_SOURCE[0]}")/launchd-render.sh"
+# The installation's kernel tree (root.sh, in a subshell: nothing leaks).
+_LAUNCHD_KICK_TOOLS="$(source "$(dirname "${BASH_SOURCE[0]}")/root.sh" && printf '%s' "$JORI_INSTALL_TOOLS")"
 
 # launchd_ensure_installed <label> [job] — 0 if the agent is loaded on return.
 # Sets LAUNCHD_INSTALL_ERR (why an install failed) and LAUNCHD_INSTALLED (1 when
 # this call installed it) for the caller.
 launchd_ensure_installed() {
   local label="$1" job="${2:-$1}"
-  local logfile="$HOME/Dev/jori/agent/logs/watchdog.log"
+  local logfile="$_LAUNCHD_KICK_TOOLS/agent/logs/watchdog.log"
   local domain="gui/$(id -u)"
-  local src="$HOME/Dev/jori/agent/launch-agents/$label.plist"
+  local src="$_LAUNCHD_KICK_TOOLS/agent/launch-agents/$label.plist"
   local dst="$HOME/Library/LaunchAgents/$label.plist"
   local out
   LAUNCHD_INSTALL_ERR="" LAUNCHD_INSTALLED=""
@@ -80,7 +82,7 @@ launchd_ensure_installed() {
 
 launchd_kick() {
   local label="$1" job="${2:-$1}"
-  local logfile="$HOME/Dev/jori/agent/logs/watchdog.log"
+  local logfile="$_LAUNCHD_KICK_TOOLS/agent/logs/watchdog.log"
   local out note=""
   if out=$(launchctl kickstart "gui/$(id -u)/$label" 2>&1); then
     echo "$(date '+%Y-%m-%d %H:%M:%S') [$job] kicked launchd agent $label" >> "$logfile"
@@ -102,8 +104,8 @@ launchd_kick() {
   [ -n "${JORI_HOST_LABEL:-}" ] || source "$(dirname "${BASH_SOURCE[0]}")/instance.sh"
   # A job reporting its own failure (class 5, agent/CLAUDE.md § Outbound Precheck).
   # geo-gate-ok: system-channel infra note about a missing launchd agent, not an event recommendation.
-  "$HOME/Dev/jori/bin/jori-send-curl" --channel system --skip-precheck --intent "$job" \
-    "$job did not run: its launchd agent $label is not loaded on ${JORI_HOST_LABEL:-the host}. Install it with: ~/Dev/jori/agent/launch-agents/install.sh $label (renders agent/launch-agents/$label.plist into ~/Library/LaunchAgents and bootstraps it)$note" \
+  "$_LAUNCHD_KICK_TOOLS/bin/jori-send-curl" --channel system --skip-precheck --intent "$job" \
+    "$job did not run: its launchd agent $label is not loaded on ${JORI_HOST_LABEL:-the host}. Install it with: ${_LAUNCHD_KICK_TOOLS/#$HOME/~}/agent/launch-agents/install.sh $label (renders agent/launch-agents/$label.plist into ~/Library/LaunchAgents and bootstraps it)$note" \
     > /dev/null 2>&1 || true
   return 1
 }

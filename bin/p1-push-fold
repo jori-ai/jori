@@ -1,0 +1,59 @@
+#!/usr/bin/env node
+// p1-push-fold — fold a second P1 push about the same email (or the same
+// near-simultaneous thread burst from one sender) into the first one.
+//
+//   p1-push-fold claim --message <messageId>   exit 0 = send (recorded)
+//                                              exit 3 = fold (do not send)
+//                                              anything else = error → send
+//   p1-push-fold release --message <messageId> forget a claim whose post failed
+//   p1-push-fold tail [N]                      the last N decisions (default 20)
+//
+// Called by jori-send-curl for any message carrying --p1-message, after the
+// precheck has decided to send. Rules, rationale and the 2026-10-21 incident:
+// lib/p1-push-fold.mjs. Off switch: data/.p1-push-fold-off.
+
+import fs from "node:fs";
+import { claim, release, LOG } from "../lib/p1-push-fold.mjs";
+
+const [cmd, ...rest] = process.argv.slice(2);
+const arg = (name) => { const i = rest.indexOf(`--${name}`); return i >= 0 ? rest[i + 1] : null; };
+const USAGE = "usage: p1-push-fold claim --message <messageId> | release --message <messageId> | tail [N]";
+
+// Never hold a send hostage: past this, the answer is "send".
+const guard = setTimeout(() => {
+  process.stdout.write(JSON.stringify({ action: "send", reason: "timeout" }) + "\n");
+  process.exit(1);
+}, 20_000);
+guard.unref();
+
+try {
+  switch (cmd) {
+    case "claim": {
+      const id = arg("message");
+      if (!id) { console.error(USAGE); process.exit(2); }
+      const r = await claim(id);
+      process.stdout.write(JSON.stringify(r) + "\n");
+      process.exit(r.action === "fold" ? 3 : 0);
+    }
+    case "release": {
+      const id = arg("message");
+      if (!id) { console.error(USAGE); process.exit(2); }
+      process.stdout.write(JSON.stringify({ released: release(id) }) + "\n");
+      process.exit(0);
+    }
+    case "tail": {
+      const n = Number(rest[0]) > 0 ? Number(rest[0]) : 20;
+      let lines = [];
+      try { lines = fs.readFileSync(LOG, "utf8").split("\n").filter(Boolean); } catch {}
+      process.stdout.write(lines.slice(-n).join("\n") + (lines.length ? "\n" : ""));
+      process.exit(0);
+    }
+    default:
+      console.error(USAGE);
+      process.exit(2);
+  }
+} catch (e) {
+  console.error(`p1-push-fold: ${e?.message || e}`);
+  process.stdout.write(JSON.stringify({ action: "send", reason: "error" }) + "\n");
+  process.exit(1);
+}

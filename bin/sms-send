@@ -39,6 +39,7 @@ import { createRequire } from "node:module";
 import fs from "node:fs";
 import path from "node:path";
 import { installTools } from "../lib/root.cjs";
+import { linkGate } from "../lib/link-check.mjs";
 import { parseArgs, isE164, isMessageSid, hasIdentityOpener, twilioForm, describe, FINAL_STATUSES, MAX_TEXT } from "../lib/sms-core.mjs";
 
 const require = createRequire(import.meta.url);
@@ -56,6 +57,7 @@ const CONFIG = localConfig("sms-send", {
 const FIELD_DEFAULTS = { account_sid: "account sid", auth_token: "auth token", from: "from number" };
 
 function usage() {
+  const A = require("../lib/instance.cjs").assistantName();
   console.log(`sms-send: send one SMS through Twilio, on the user's explicit ask only
 
 Usage:
@@ -64,8 +66,8 @@ Usage:
   sms-send --to <+E164> --text "..." --authorized "..." --dry-run
   sms-send status <message sid> [--json]
 
-The text must open with the Jori identity line ("Hi <Name>, this is Jori,
-<owner>'s AI assistant. ..." or "This is Jori on behalf of <owner> ...").
+The text must open with the ${A} identity line ("Hi <Name>, this is ${A},
+<owner>'s AI assistant. ..." or "This is ${A} on behalf of <owner> ...").
 --wait polls Twilio until the message is delivered or fails (at most 300 s).
 Sends are logged to data/sms-sent.jsonl. See docs/sms-send.md.`);
 }
@@ -188,10 +190,12 @@ async function cmdSend(a) {
     fail(3, "refused: --authorized is required, with what the user actually said when they asked for this text. SMS goes out only on their explicit ask.");
   }
   const owner = instance().owner_name;
+  const A = require("../lib/instance.cjs").assistantName();
   if (!hasIdentityOpener(a.text, owner)) {
-    fail(3, `refused: the text must open with the Jori identity line, e.g. "Hi <Name>, this is Jori, ${owner}'s AI assistant. ${owner} asked me to ..." or "This is Jori on behalf of ${owner} ...".`);
+    fail(3, `refused: the text must open with the ${A} identity line, e.g. "Hi <Name>, this is ${A}, ${owner}'s AI assistant. ${owner} asked me to ..." or "This is ${A} on behalf of ${owner} ...".`);
   }
   if (a.text.length > MAX_TEXT) fail(3, `the text is ${a.text.length} characters; Twilio takes at most ${MAX_TEXT}.`);
+  await linkGate(a.text, "sms-send"); // a dead or moved link is refused (lib/link-check.mjs)
 
   if (a.dryRun) {
     const out = { dry_run: true, to: a.to, text: a.text, authorized: a.authorized, credentials: CONFIG.onepassword?.item ? "1password" : "env" };

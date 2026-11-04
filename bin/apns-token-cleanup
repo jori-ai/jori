@@ -1,0 +1,98 @@
+#!/usr/bin/env node
+// apns-token-cleanup — drop device_tokens that have repeatedly failed APNs
+// delivery with terminal errors (410 Unregistered / BadDeviceToken). Read
+// failure history from data/apns-token-failures.json (written by
+// lib/apns-push.mjs on every non-200 response), DELETE matching rows
+// from Supabase, then prune the failure log.
+//
+// Eligibility:
+//   fail_count >= 3 AND (last_status === 410 OR last_failure_reason in
+//   {"Unregistered", "BadDeviceToken"}).
+//
+// Usage:
+//   apns-token-cleanup            # dry-run unless DROP=1
+//   DROP=1 apns-token-cleanup     # actually delete
+
+import fs from "node:fs";
+import path from "node:path";
+import os from "node:os";
+import { createRequire } from "node:module";
+import { loadEnv } from "../lib/load-env.js";
+import { installTools } from "../lib/root.cjs";
+
+loadEnv();
+
+const FAILURE_FILE = installTools("data/apns-token-failures.json");
+const SUPABASE_URL = process.env.SUPABASE_URL || createRequire(import.meta.url)("../lib/instance.cjs").supabaseUrl();
+const KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
+// Only PERMANENT failures are ever dropped. Apple documents these two reasons
+// (and status 410) as terminal: the token is not, and will never again be,
+// valid for this topic, so retrying is guaranteed to fail. Ambiguous failures
+// (timeouts, 5xx, status 0) are deliberately never dropped — a flaky push says
+// nothing about whether the device is still there.
+//
+// Terminal failures used to also have to clear a 3-strike threshold, which for
+// a once-a-day sender like daily-summary meant three days of known-doomed
+// pushes before cleanup. Since the condition is definitionally permanent, one
+// strike is enough (2026-07-20).
+const TERMINAL_REASONS = new Set(["Unregistered", "BadDeviceToken"]);
+const TERMINAL_THRESHOLD = 1;
+
+if (!KEY) {
+  console.error("apns-token-cleanup: SUPABASE_SERVICE_ROLE_KEY not set");
+  process.exit(1);
+}
+
+let log = {};
+try { log = JSON.parse(fs.readFileSync(FAILURE_FILE, "utf8")); } catch { log = {}; }
+const tokens = Object.values(log);
+const eligible = tokens.filter((t) => {
+  if (!t || !t.token) return false;
+  const fails = t.fail_count || 0;
+  // 410 is APNs' "Unregistered" status, i.e. the same permanent condition.
+  const terminal = t.last_status === 410 || TERMINAL_REASONS.has(t.last_failure_reason);
+  if (terminal) return fails >= TERMINAL_THRESHOLD;
+  return false;
+});
+
+console.log(`apns-token-cleanup: ${tokens.length} tracked failures, ${eligible.length} eligible for drop`);
+if (eligible.length === 0) process.exit(0);
+
+const drop = process.env.DROP === "1";
+if (!drop) {
+  for (const t of eligible) {
+    console.log(`  [dry-run] ${t.token.slice(0, 12)}… fails=${t.fail_count} status=${t.last_status} reason=${t.last_failure_reason || "(none)"}`);
+  }
+  console.log("re-run with DROP=1 to actually delete");
+  process.exit(0);
+}
+
+let deleted = 0;
+for (const t of eligible) {
+  const url = `${SUPABASE_URL}/rest/v1/device_tokens?token=eq.${encodeURIComponent(t.token)}`;
+  const res = await fetch(url, {
+    method: "DELETE",
+    headers: {
+      apikey: KEY,
+      Authorization: `Bearer ${KEY}`,
+      "Content-Type": "application/json",
+      Prefer: "return=representation",
+    },
+  });
+  if (res.ok) {
+    deleted++;
+    delete log[t.token];
+    console.log(`  dropped ${t.token.slice(0, 12)}… (fails=${t.fail_count}, status=${t.last_status})`);
+  } else {
+    const body = await res.text();
+    console.error(`  delete failed ${t.token.slice(0, 12)}…: ${res.status} ${body.slice(0, 120)}`);
+  }
+}
+
+try {
+  fs.writeFileSync(FAILURE_FILE, JSON.stringify(log, null, 2));
+} catch (err) {
+  console.error(`apns-token-cleanup: failed to rewrite failure log: ${err.message}`);
+}
+
+console.log(`apns-token-cleanup: dropped ${deleted}/${eligible.length} dead tokens`);

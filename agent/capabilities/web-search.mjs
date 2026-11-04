@@ -12,6 +12,7 @@
 // capped short — no full-article reproduction, minimal context cost.
 
 import { execFile } from "node:child_process";
+import { MODELS } from "../../lib/models.cjs";
 
 const MAX_RESULTS = 5;
 const SNIPPET_CAP = 400;
@@ -51,7 +52,7 @@ export function parseResults(text) {
 // metered API even if a caller's environment carries the key.
 export function makeClaudeWebSearch({
   claudeBin,
-  model = "claude-sonnet-5-5",
+  model = MODELS.sonnet,
   effort = "low",
   timeoutMs = 120000,
 } = {}) {

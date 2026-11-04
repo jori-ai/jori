@@ -52,6 +52,15 @@
       "cache_ttl_min": 60,
       "active_window": "sat-sun 09:00-18:00",
       "_note": "deferred — needs a richer places-scoring backend. Disabled by default."
+    },
+    {
+      "name": "meal_offer",
+      "enabled": false,
+      "script": "meal_offer.mjs",
+      "cadence_min": 30,
+      "cache_ttl_min": 0,
+      "active_window": null,
+      "urgency_rule": "ask before recommending a place to eat; a yes runs bin/meal-pick (needs GOOGLE_PLACES_API_KEY)"
     }
   ]
 }

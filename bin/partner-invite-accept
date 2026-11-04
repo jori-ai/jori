@@ -1,0 +1,102 @@
+#!/usr/bin/env node
+// partner-invite-accept — accept every calendar invitation the user's partner
+// has sent the user that is still waiting for an answer.
+//
+// The user's standing rule: accept all the partner's invites. Without this,
+// each invitation reaches the user as a P1 email ping (the meeting-request
+// intake stamp) and sits on the calendar as "needs action".
+//
+// What it does. Lists the user's primary calendar from now to --days ahead,
+// keeps the events whose ORGANIZER is one of the partner's addresses
+// (agent/local/config/partner-invite.json `partner_emails`) and whose `self`
+// attendee (the user) is still `needsAction`, and answers `accepted` with
+// `gog calendar respond`. A recurring series is answered once, on the series.
+// Answers the user already gave (accepted, declined, tentative) are never
+// touched: this only fills in a missing answer, it never overrides one.
+// No partner addresses configured = nothing is read or accepted.
+//
+// Pure structure: organizer address, attendee response status, event ids. No
+// event title or description is read to decide anything.
+//
+// Callers: the Gmail intake runs it when an invitation email from the partner
+// arrives, then files that email (no ping). It is idempotent and safe to run
+// by hand or on a schedule.
+//
+// Usage: partner-invite-accept [--days 400] [--dry-run] [--json]
+// Exit: 0 ok (even if nothing needed accepting) · 1 calendar read failed.
+// Log: data/logs/partner-invite-accept.jsonl
+
+import fs from "node:fs";
+import path from "node:path";
+import { spawnSync } from "node:child_process";
+import { createRequire } from "node:module";
+import { config } from "../lib/partner-invite-ask.mjs";
+
+const require = createRequire(import.meta.url);
+const { instance } = require("../lib/instance.cjs");
+const { installTools } = require("../lib/root.cjs");
+const GOG = process.env.PARTNER_INVITE_ACCEPT_GOG_BIN || process.env.GOG_BIN
+  || ["/opt/homebrew/bin/gog", "/usr/local/bin/gog"].find((p) => fs.existsSync(p)) || "gog";
+const LOG = process.env.PARTNER_INVITE_ACCEPT_LOG || path.join(installTools(), "data/logs/partner-invite-accept.jsonl");
+const ACCOUNT = String(process.env.JORI_CAL_ACCOUNT || instance().owner_email || "").toLowerCase();
+export const partnerAddresses = () => config().partner_emails;
+
+const args = process.argv.slice(2);
+const has = (f) => args.includes(f);
+const days = Number(args[args.indexOf("--days") + 1]) || 400;
+const DRY = has("--dry-run");
+
+function log(row) {
+  try { fs.mkdirSync(path.dirname(LOG), { recursive: true }); fs.appendFileSync(LOG, JSON.stringify({ ts: new Date().toISOString(), ...row }) + "\n"); } catch {}
+}
+
+export function pendingFromPartner(items, addresses = partnerAddresses()) {
+  const seen = new Set();
+  const out = [];
+  for (const e of items || []) {
+    if (!e || e.status === "cancelled") continue;
+    const org = String((e.organizer && e.organizer.email) || "").toLowerCase();
+    if (!addresses.includes(org)) continue;
+    const me = (e.attendees || []).find((a) => a && (a.self || String(a.email || "").toLowerCase() === ACCOUNT));
+    if (!me || me.responseStatus !== "needsAction") continue;
+    const target = e.recurringEventId || e.id;
+    if (!target || seen.has(target)) continue;
+    seen.add(target);
+    out.push({ id: target, series: Boolean(e.recurringEventId), summary: e.summary || "", start: (e.start && (e.start.dateTime || e.start.date)) || null });
+  }
+  return out;
+}
+
+function main() {
+  if (!partnerAddresses().length || !ACCOUNT) {
+    const summary = { checked: 0, pending: 0, accepted: 0, failed: 0, results: [], configured: false };
+    if (has("--json")) console.log(JSON.stringify(summary));
+    else console.log("partner-invite-accept: no partner addresses configured (agent/local/config/partner-invite.json); nothing to do.");
+    process.exit(0);
+  }
+  const list = spawnSync(GOG, ["calendar", "events", "primary", "--account", ACCOUNT, "--no-input", "-j",
+    "--days", String(days), "--all-pages", "--max", "250"], { encoding: "utf8", timeout: 60000 });
+  let items = null;
+  if (list.status === 0) { try { const j = JSON.parse(list.stdout); items = j.items || j.events || []; } catch {} }
+  if (!items) {
+    log({ action: "list-failed", status: list.status, err: String(list.stderr || "").slice(0, 300) });
+    console.error(`partner-invite-accept: could not read the calendar (${String(list.stderr || "").trim().slice(0, 200)})`);
+    process.exit(1);
+  }
+  const pending = pendingFromPartner(items);
+  const results = [];
+  for (const p of pending) {
+    if (DRY) { results.push({ ...p, accepted: false, dry_run: true }); continue; }
+    const r = spawnSync(GOG, ["calendar", "respond", "primary", p.id, "--status", "accepted", "--account", ACCOUNT, "--no-input"],
+      { encoding: "utf8", timeout: 30000 });
+    const ok = r.status === 0;
+    results.push({ ...p, accepted: ok, ...(ok ? {} : { err: String(r.stderr || "").trim().slice(0, 200) }) });
+    log({ action: ok ? "accepted" : "accept-failed", id: p.id, series: p.series, start: p.start, ...(ok ? {} : { err: String(r.stderr || "").slice(0, 200) }) });
+  }
+  const summary = { checked: items.length, pending: pending.length, accepted: results.filter((r) => r.accepted).length, failed: results.filter((r) => !r.accepted && !r.dry_run).length, results };
+  if (has("--json")) console.log(JSON.stringify(summary));
+  else console.log(`partner-invite-accept: ${summary.accepted} accepted, ${summary.failed} failed, of ${summary.pending} waiting${DRY ? " (dry run)" : ""}.`);
+  process.exit(0);
+}
+
+if (import.meta.url === `file://${process.argv[1]}` || process.argv[1].endsWith("partner-invite-accept")) main();

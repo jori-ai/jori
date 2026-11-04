@@ -8,8 +8,10 @@
 # Assumes callers export PATH to include /opt/homebrew/bin so node is
 # reachable under cron.
 
-HEALTH_PORT=${HEALTH_PORT:-9093}
-WEBHOOK_PORT=${WEBHOOK_PORT:-9092}
+# Defaults: the ops supervisor's ports from lib/ports.cjs (node runs only when unset).
+_trigger_ports_cjs="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)/lib/ports.cjs"
+HEALTH_PORT=${HEALTH_PORT:-$(node "$_trigger_ports_cjs" ops_health)}
+WEBHOOK_PORT=${WEBHOOK_PORT:-$(node "$_trigger_ports_cjs" ops_webhook)}
 LOGFILE="$HOME/Dev/jori/agent/logs/watchdog.log"
 
 trigger_log() { echo "$(date '+%Y-%m-%d %H:%M:%S') [$TRIGGER_JOB] $1" >> "$LOGFILE"; }

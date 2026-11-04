@@ -25,7 +25,7 @@
 # The checks read the CLI's own JSON keys (machine structure, not language).
 #
 # Usage:
-#   source "$ROOT/tools/agent/scripts/lib/max-auth-guard.sh"
+#   source "$ROOT/agent/scripts/lib/max-auth-guard.sh"
 #   max_auth_scrub
 #   if ! max_auth_check "$CLAUDE"; then
 #     log REFUSED …"$MAX_AUTH_SUMMARY"…

@@ -1,0 +1,29 @@
+{
+  "name": "watch-site",
+  "version": "1.0.0",
+  "private": true,
+  "description": "The watch-list ratings site — the viewers mark which films they've already seen and how much each of them liked it; the movie harvester (bin/movie-discover) learns from it.",
+  "scripts": {
+    "dev": "next dev",
+    "sync-model": "if [ -f ../../lib/watch-recsys.mjs ]; then cp ../../lib/watch-recsys.mjs lib/recsys.mjs; fi",
+    "prebuild": "npm run sync-model",
+    "build": "next build",
+    "start": "next start"
+  },
+  "dependencies": {
+    "@supabase/ssr": "^0.5.2",
+    "@supabase/supabase-js": "^2.45.4",
+    "next": "^15.5.28",
+    "react": "19.0.0",
+    "react-dom": "19.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "typescript": "^5.7.0"
+  },
+  "overrides": {
+    "postcss": "^8.5.23"
+  }
+}

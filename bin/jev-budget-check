@@ -1,0 +1,66 @@
+#!/usr/bin/env node
+// jev-budget-check — Jev spend vs the TypeSafe prepaid budget (jev-config.json
+// `budget`). Sums row.jev.cost over data/jev-shadow/*.jsonl since
+// budget.since, projects the run-out date from the last 7 days, and pages the
+// system channel ONCE per crossed threshold (budget.alert_pcts). Daily cron.
+//   jev-budget-check [--json] [--dry-run]
+// State (which thresholds already paged): data/jev-shadow/budget-state.json.
+const fs = require("fs");
+const path = require("path");
+const { execFileSync } = require("child_process");
+
+const ROOT = require("../lib/root.cjs").installTools();
+const DIR = path.join(ROOT, "data/jev-shadow");
+const CFG = path.join(ROOT, "data/jev-config.json");
+const STATE = path.join(DIR, "budget-state.json");
+const argv = process.argv.slice(2);
+const JSON_OUT = argv.includes("--json");
+const DRY = argv.includes("--dry-run");
+
+const readJson = (f, d) => { try { return JSON.parse(fs.readFileSync(f, "utf8")); } catch { return d; } };
+
+function spend(since) {
+  const byDay = {};
+  let files = [];
+  try { files = fs.readdirSync(DIR).filter((f) => /^\d{4}-\d{2}-\d{2}\.jsonl$/.test(f) && f.slice(0, 10) >= since); } catch {}
+  for (const f of files) {
+    const day = f.slice(0, 10);
+    for (const line of fs.readFileSync(path.join(DIR, f), "utf8").split("\n")) {
+      if (!line) continue;
+      let r; try { r = JSON.parse(line); } catch { continue; }
+      const c = Number(r?.jev?.cost);
+      if (Number.isFinite(c) && c > 0) byDay[day] = (byDay[day] || 0) + c;
+    }
+  }
+  return byDay;
+}
+
+function main() {
+  const b = readJson(CFG, {}).budget;
+  if (!b || !b.usd) { console.log("jev-budget-check: no budget configured"); return; }
+  const byDay = spend(b.since);
+  const total = Object.values(byDay).reduce((a, x) => a + x, 0);
+  const days = Object.keys(byDay).sort();
+  const last7 = days.slice(-7);
+  const perDay = last7.length ? last7.reduce((a, d) => a + byDay[d], 0) / last7.length : 0;
+  const left = Math.max(0, b.usd - total);
+  const runOut = perDay > 0 ? new Date(Date.now() + (left / perDay) * 86400e3).toISOString().slice(0, 10) : null;
+  const pct = (total / b.usd) * 100;
+  const out = { provider: b.provider, budget_usd: b.usd, since: b.since, spent_usd: +total.toFixed(4), pct_used: +pct.toFixed(1), per_day_usd: +perDay.toFixed(4), run_out: runOut };
+  if (JSON_OUT) console.log(JSON.stringify(out));
+  else console.log(`Jev budget (${b.provider}): $${total.toFixed(3)} of $${b.usd} used (${pct.toFixed(1)}%) since ${b.since}; ~$${perDay.toFixed(3)}/day → runs out ${runOut || "n/a"}`);
+
+  const st = readJson(STATE, { paged: [] });
+  const due = (b.alert_pcts || [50, 80, 95]).filter((t) => pct >= t && !st.paged.includes(t));
+  if (!due.length) return;
+  const t = Math.max(...due);
+  const msg = `💳 Jev ${b.provider} budget ${t}% used: $${total.toFixed(2)} of $${b.usd} (~$${perDay.toFixed(3)}/day, runs out ~${runOut || "?"}). Top up at console.typesafe.ai, then raise budget.usd in data/jev-config.json. If it runs dry every site falls back to legacy automatically.`;
+  if (DRY) { console.log(`DRY page: ${msg}`); return; }
+  try {
+    execFileSync(path.join(ROOT, "bin/jori-send-curl"), ["--channel", "system", "--skip-precheck", "--intent", "jev-budget", msg], { stdio: "ignore", timeout: 30_000 });
+    st.paged = [...new Set([...st.paged, ...due])];
+    fs.writeFileSync(STATE, JSON.stringify(st, null, 2) + "\n");
+  } catch (e) { console.error(`page failed: ${e.message}`); }
+}
+
+main();

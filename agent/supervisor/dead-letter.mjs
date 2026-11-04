@@ -38,6 +38,7 @@ import { inboundLedgerFile, normalizeRfcMessageId } from "./gmail-source.mjs";
 import { installTools } from "../../lib/root.cjs";
 // The operator's own address and name (lib/instance.cjs).
 const { instance } = createRequire(import.meta.url)("../../lib/instance.cjs");
+const ASSISTANT = createRequire(import.meta.url)("../../lib/instance.cjs").assistantName(); // the assistant's configured name (lib/instance.cjs)
 const INSTANCE = instance();
 export const OWNER_ADDRESS = String(INSTANCE.owner_email || "").trim().toLowerCase();
 const OWNER_NAME = INSTANCE.owner_name;
@@ -156,11 +157,11 @@ export function buildRetryItem(item, { own = null, sent = [], replyState = "unkn
   if (own?.kind === "email") {
     if (own.subject) lines.push(`Their email's subject: "${own.subject}".`);
     if (sent.length) {
-      lines.push(`Jori's sent-mail log since ${first} (data/jori-sent-mail.jsonl):`);
+      lines.push(`${ASSISTANT}'s sent-mail log since ${first} (data/jori-sent-mail.jsonl):`);
       for (const s of sent.slice(-12)) lines.push(`  - ${s.ts} "${s.subject}"${s.replyToThis ? " (a reply on THIS email's thread)" : ""}`);
     }
     if (replyState === "unknown") lines.push("Whether a reply on the user's thread already went out could NOT be determined from the sent-mail log; check the thread before replying.");
-    else if (!sent.length) lines.push(`Jori's sent-mail log shows nothing sent since ${first}.`);
+    else if (!sent.length) lines.push(`${ASSISTANT}'s sent-mail log shows nothing sent since ${first}.`);
   }
   if (noticeQueued) lines.push(`A short note to ${OWNER_NAME} saying this got stuck was queued and may have been held back; don't refer to it.`);
   lines.push("--- original task ---");

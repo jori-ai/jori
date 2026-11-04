@@ -1,0 +1,137 @@
+#!/usr/bin/env node
+// partner-invite-ask — ask the user once whether to invite their partner to a
+// restaurant reservation Jori put on the user's calendar, and invite the
+// partner only on a yes.
+//
+// Shows and entertainment can invite the partner automatically (agent/CLAUDE.md
+// § Calendar Invitations); a reservation is created with no attendees and this
+// sends one tappable question. Logic, config and state:
+// lib/partner-invite-ask.mjs. No partner configured = nothing is asked.
+//
+//   partner-invite-ask ask --event-id <id> --title "<restaurant>" --start <RFC3339>
+//                       [--tz <IANA zone>] [--calendar primary] [--dry-run]
+//   partner-invite-ask answer (--ref <eventId> | --latest) (--yes | --no)
+//                       [--words "<the user's words>"] [--message-id <id>]
+//   partner-invite-ask list
+//
+// Who calls `answer`: choice-reply.mjs on an exact tap (no agent turn), and the
+// chat agent when the user answers in words — the agent judges yes/no (a
+// model); this file never reads language.
+//
+// Exit: 0 sent / filed (or already answered) · 4 refused (unknown ref, already
+// started, calendar write refused) · 5 nothing to send (already asked, past,
+// no partner configured) · 6 outbound precheck held it · 3 send failed · 2 usage.
+
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { spawnSync } from "node:child_process";
+import { createRequire } from "node:module";
+import {
+  config, buildAsk, canAsk, recordAsk, readState, writeState,
+  latestOpenAsk, planAnswer, markAnswered,
+} from "../lib/partner-invite-ask.mjs";
+import { userTz } from "../lib/hum-events.mjs";
+
+const require = createRequire(import.meta.url);
+const { installTools } = require("../lib/root.cjs");
+const BIN = process.env.PARTNER_INVITE_BIN_DIR || path.join(installTools(), "bin");
+const argv = process.argv.slice(2);
+const cmd = argv[0];
+const arg = (n) => { const i = argv.indexOf(`--${n}`); return i >= 0 ? argv[i + 1] : null; };
+const has = (n) => argv.includes(`--${n}`);
+
+function ask() {
+  const eventId = arg("event-id");
+  const title = arg("title");
+  const start = arg("start");
+  const calendar = arg("calendar") || "primary";
+  const tz = arg("tz") || userTz() || "UTC";
+  if (!eventId || !title || !start) {
+    console.error('usage: partner-invite-ask ask --event-id <id> --title "<restaurant>" --start <RFC3339> [--tz <zone>] [--calendar primary] [--dry-run]');
+    return 2;
+  }
+  const cfg = config();
+  const state = readState();
+  const gate = canAsk({ eventId, start, state });
+  if (!gate.ok) { console.error(`partner-invite-ask: not asking — ${gate.reason}`); return 5; }
+  const built = buildAsk({ eventId, title, start, tz });
+  if (has("dry-run")) { console.log(JSON.stringify(built, null, 2)); return 0; }
+
+  const capture = path.join(os.tmpdir(), `partner-invite-ask-capture.${process.pid}`);
+  const r = spawnSync(path.join(BIN, "jori-send-curl"), [
+    "--capture-id", capture,
+    "--intent", cfg.intent,
+    "--choices-json", JSON.stringify(built.choices),
+    "--metadata-json", JSON.stringify({ [cfg.metadata_key]: eventId }),
+    "--push-body", built.question,
+    built.text,
+  ], { encoding: "utf8", timeout: 180_000 });
+  let captured = "";
+  try { captured = fs.readFileSync(capture, "utf8").trim(); fs.unlinkSync(capture); } catch {}
+  if (r.status !== 0) { console.error(`partner-invite-ask: send failed (exit ${r.status}): ${String(r.stderr || "").slice(0, 300)}`); return 3; }
+  if (!captured || captured.startsWith("{")) { console.error(`partner-invite-ask: held before sending (${captured || "no message id"}); nothing recorded`); return 6; }
+
+  const fresh = readState();
+  recordAsk({ eventId, calendar, title, start, tz, when: built.when, messageId: captured, promptId: built.choices.id, state: fresh });
+  writeState(fresh);
+  console.log(JSON.stringify({ asked: true, ref: eventId, message_id: captured, question: built.question }));
+  return 0;
+}
+
+function answer() {
+  const yes = has("yes");
+  const no = has("no");
+  let ref = arg("ref");
+  if (!ref && has("latest")) ref = latestOpenAsk()?.ref || null;
+  if (!ref || yes === no) {
+    console.error('usage: partner-invite-ask answer (--ref <eventId> | --latest) (--yes | --no) [--words "<the user\'s words>"] [--message-id <id>]');
+    return ref || !has("latest") ? 2 : 4;
+  }
+  const words = arg("words") || "";
+  const messageId = arg("message-id");
+  const state = readState();
+  const plan = planAnswer({ ref, answer: yes ? "yes" : "no", words, state });
+  if (!plan.ok) { console.error(`partner-invite-ask: ${plan.error}`); return 4; }
+  if (plan.already) {
+    console.log(JSON.stringify({ already_answered: true, ref, answer: plan.ask.answer }));
+    return 0;
+  }
+  if (plan.invite) {
+    // The guarded calendar writer; an install without it cannot invite.
+    const calendarBin = path.join(BIN, "jori-calendar");
+    if (!fs.existsSync(calendarBin)) {
+      console.error(`partner-invite-ask: ${calendarBin} is not installed; not inviting (the ask stays open)`);
+      return 4;
+    }
+    const r = spawnSync(calendarBin, [
+      "update", ref, "--calendar", plan.ask.calendar || "primary",
+      "--add-attendee", config().invite_email,
+      "--attendee-authorized", plan.authorization,
+    ], { encoding: "utf8", timeout: 60_000 });
+    if (r.status !== 0) {
+      // Leave the ask open so a retry (or the agent) can file it again.
+      console.error(`partner-invite-ask: calendar update failed (exit ${r.status}): ${String(r.stderr || r.stdout || "").slice(0, 400)}`);
+      return 4;
+    }
+  }
+  const fresh = readState();
+  markAnswered({ ref, answer: yes ? "yes" : "no", words, invited: !!plan.invite, messageId, state: fresh });
+  writeState(fresh);
+  console.log(JSON.stringify({ recorded: true, ref, answer: yes ? "yes" : "no", invited: !!plan.invite, title: plan.ask.title, when: plan.ask.when }));
+  return 0;
+}
+
+function list() {
+  for (const a of readState().asks) {
+    console.log(`${a.status.padEnd(9)} ${a.answer ? a.answer.padEnd(4) : "    "} ${a.when}  ${a.title}  (${a.ref})`);
+  }
+  return 0;
+}
+
+const handlers = { ask, answer, list };
+if (!handlers[cmd]) {
+  console.error("usage: partner-invite-ask ask|answer|list …");
+  process.exit(2);
+}
+process.exit(handlers[cmd]());

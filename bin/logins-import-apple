@@ -1,0 +1,72 @@
+#!/usr/bin/env bash
+# logins-import-apple <domain>...
+#
+# Copies the user's login for each <domain> from Apple Passwords (their main
+# store) into the 1Password "Logins" vault (JORI_OP_LOGINS_VAULT), which is what
+# the host reads headlessly (site-pass). Runs ON THE HOST, from its GUI session
+# (the ops agent), with Passwords.app already unlocked there — apple-pass
+# drives it.
+#
+# The credential goes straight from apple-pass into `op`; nothing is printed
+# but one status line per domain:
+#   created   no Logins item existed; one was made (title "<domain> (<user>)")
+#   updated   the Logins item's username/password now match Apple Passwords
+#   same      Apple Passwords holds the same password as Logins already
+#   missing   Apple Passwords has no login for <domain> (or is locked)
+#
+# Writes need OP_LOGINS_WRITER_TOKEN (read+write on Logins only), from the
+# environment or .env. Financial-denylist domains are refused.
+
+set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+source "$SCRIPT_DIR/../agent/scripts/lib/root.sh"
+source "$SCRIPT_DIR/../agent/scripts/lib/credential-denylist.sh"
+ROOT="$JORI_INSTALL"
+LOGINS_VAULT="${JORI_OP_LOGINS_VAULT:-Logins}"
+[[ $# -gt 0 ]] || { echo "usage: logins-import-apple <domain>..." >&2; exit 64; }
+
+TOKEN="${OP_LOGINS_WRITER_TOKEN:-}"
+if [[ -z "$TOKEN" && -f "$ROOT/.env" ]]; then
+  TOKEN="$(sed -n 's/^OP_LOGINS_WRITER_TOKEN=//p' "$ROOT/.env" | head -1)"
+fi
+[[ -n "$TOKEN" ]] || { echo "logins-import-apple: OP_LOGINS_WRITER_TOKEN is not set." >&2; exit 78; }
+
+clear_search() {
+  osascript -e 'tell application "Passwords" to activate' -e 'delay 0.5' \
+    -e 'tell application "System Events" to key code 53' >/dev/null 2>&1 || true
+}
+
+for DOMAIN in "$@"; do
+  if jori_financial_domain "$DOMAIN"; then echo "$DOMAIN: refused (financial denylist)"; continue; fi
+  clear_search
+  U="$("$JORI_INSTALL_TOOLS/bin/apple-pass" "$DOMAIN" --user-stdout 2>/dev/null)" || U=""
+  clear_search
+  P="$("$JORI_INSTALL_TOOLS/bin/apple-pass" "$DOMAIN" --stdout 2>/dev/null)" || P=""
+  if [[ -z "$P" ]]; then echo "$DOMAIN: missing"; continue; fi
+  # Passwords.app can leave the previous match selected while the new search
+  # is still filtering, and the Copy item then copies THAT entry (one domain
+  # once got the previous domain's username this way). Never write a value that
+  # repeats the previous domain's.
+  if [[ -n "$U" && "$U" == "${PREV_U:-}" ]]; then echo "$DOMAIN: skipped (username matched the previous domain's — selection lag; rerun this domain alone)"; continue; fi
+  if [[ "$P" == "${PREV_P:-}" ]]; then echo "$DOMAIN: skipped (password matched the previous domain's — selection lag; rerun this domain alone)"; continue; fi
+  PREV_U="$U"; PREV_P="$P"
+
+  ID="$("$JORI_INSTALL_TOOLS/bin/site-pass" "$DOMAIN" --id 2>/dev/null)" || ID=""
+  if [[ -n "$ID" ]]; then
+    OLD="$("$JORI_INSTALL_TOOLS/bin/site-pass" "$DOMAIN" --stdout 2>/dev/null)" || OLD=""
+    if [[ "$OLD" == "$P" ]]; then echo "$DOMAIN: same"; else
+      args=("password=$P"); [[ -n "$U" ]] && args+=("username=$U")
+      if OP_SERVICE_ACCOUNT_TOKEN="$TOKEN" op item edit "$ID" --vault "$LOGINS_VAULT" "${args[@]}" >/dev/null 2>&1
+      then echo "$DOMAIN: updated"; else echo "$DOMAIN: write failed"; fi
+    fi
+  else
+    if OP_SERVICE_ACCOUNT_TOKEN="$TOKEN" op item create --vault "$LOGINS_VAULT" --category Login \
+         --title "$DOMAIN (${U:-login})" --url "https://$DOMAIN" \
+         "username=$U" "password=$P" </dev/null >/dev/null 2>&1
+    then echo "$DOMAIN: created"; else echo "$DOMAIN: write failed"; fi
+  fi
+  unset U P OLD
+done
+unset PREV_U PREV_P
+clear_search

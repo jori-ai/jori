@@ -1,0 +1,275 @@
+#!/usr/bin/env python3
+"""place-map — a small "you are here, it is there" map, rendered to a PNG URL.
+
+WHY THIS EXISTS. The hum `nearby` lane's pings are often read after the fact,
+when it is no longer clear what they referred to: a ping about a place should
+carry a map of where it is relative to where the user was.
+
+That is a rendering problem, not a judgment one, so it is entirely code (Rule
+#0b). The lane's model still decides WHAT to say; this decides nothing at all —
+given two coordinates it draws them, and it draws the same picture every time.
+
+WHY IT IS BAKED AT SEND TIME, not resolved live in the client. These are read
+late — that is the whole complaint. A map centred on where the user is *now*
+would be confidently wrong an hour later, and worse than no map: it would answer
+a question nobody is asking. This freezes the moment the ping was about — the
+user's position then, the subject, the distance between them — so opening it at
+midnight still shows what it meant at six.
+
+WHY HEADLESS CHROME + LEAFLET rather than stitching tiles here: `day-path`
+already made this call, and its reasoning holds — "keeping a second
+tile-stitching renderer would mean two map styles drifting apart." One map
+definition, one look.
+
+Usage:
+  place-map --from <lat,lon> --to <lat,lon> [--label "Passage du Maure"]
+            [--out FILE] [--upload] [--json]
+
+With --upload, prints the public Supabase Storage URL (and does nothing but
+print the local path without it). Renders are content-addressed and cached:
+the same two points and label resolve to the same object, so a lane that fires
+twice on one corner costs one render.
+"""
+import argparse
+import hashlib
+import json
+import math
+import os
+import subprocess
+import sys
+import tempfile
+import urllib.error
+import urllib.request
+
+HERE = os.path.dirname(os.path.realpath(globals().get("__file__") or sys.argv[0]))
+sys.path.insert(0, os.path.join(HERE, "..", "lib"))
+import places_local  # noqa: E402
+
+REPO = places_local.install_root()
+ENV_FILE = os.path.join(REPO, ".env")
+TEMPLATE = os.path.join(HERE, "..", "lib", "place-map.template.html")
+CHROME = os.environ.get("JORI_CHROME_BIN") or "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+
+
+def supabase_url():
+    """SUPABASE_URL, else https://<instance supabase_project>.supabase.co, else ""."""
+    if os.environ.get("SUPABASE_URL"):
+        return os.environ["SUPABASE_URL"].rstrip("/")
+    inst = places_local._read(os.path.join(places_local.local_dir(), "instance.json")) or {}
+    proj = os.environ.get("JORI_SUPABASE_PROJECT") or inst.get("supabase_project") or ""
+    return f"https://{proj}.supabase.co" if proj else ""
+
+
+SUPABASE_URL = supabase_url()
+# Same bucket day-path's maps land in — public-read, already used for imagery
+# that ends up in the user's chat and email.
+MAP_BUCKET, MAP_PREFIX = "daily-photos", "place-maps"
+CACHE_DIR = os.path.join(REPO, "data", "place-maps")
+
+# Capture size, and NO --force-device-scale-factor. Both halves are load-bearing.
+#
+# The template sizes everything in `vw`, so the design is identical at any
+# capture width. What this number actually trades is sharpness against BASEMAP
+# LEGIBILITY: the tiles' own street labels are a fixed pixel size, so a wider
+# capture means more map crammed into the same 260pt bubble and smaller type.
+# Compared side by side at display size, 520 reads and 900 does not — so it is
+# tuned for the label, and 2x downscale is sharp enough.
+#
+# The scale factor is omitted because it desynchronises the layout viewport from
+# the capture. Measured directly: `--window-size=400,320` alone lays out at 400
+# CSS px, but add `--force-device-scale-factor=3` and the page lays out at 500
+# while the screenshot still covers 400 — so the right 20% of the design, which
+# is where the distance sits, is simply cropped away. Without the flag the
+# viewport equals the window size exactly, which is the only property this
+# actually needs.
+WIDTH, HEIGHT = 520, 416
+
+# Coordinate rounding for the cache key. 5 decimal places is ~1.1m — finer than
+# any GPS fix this will ever be handed, so it never collapses two genuinely
+# different vantage points, and it still lets a repeat fix at the same corner
+# hit the same object.
+COORD_DP = 5
+
+
+def load_env():
+    out = {}
+    if os.path.exists(ENV_FILE):
+        for line in open(ENV_FILE):
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                k, v = line.split("=", 1)
+                out[k.strip()] = v.strip()
+    return out
+
+
+def parse_pair(s, what):
+    try:
+        lat, lon = [float(x) for x in str(s).split(",", 1)]
+    except Exception:
+        sys.exit(f"place-map: --{what} must be 'lat,lon' (got {s!r})")
+    if not (-90 <= lat <= 90 and -180 <= lon <= 180):
+        sys.exit(f"place-map: --{what} out of range: {lat},{lon}")
+    return lat, lon
+
+
+def haversine_m(a, b):
+    r = 6371000.0
+    p1, p2 = math.radians(a[0]), math.radians(b[0])
+    dp = math.radians(b[0] - a[0])
+    dl = math.radians(b[1] - a[1])
+    h = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
+    return 2 * r * math.asin(math.sqrt(h))
+
+
+def format_distance(m):
+    """Distance the way a person would say it, plus the walk when the walk is the point.
+
+    Under a kilometre a walking time is the useful number ("4 min" decides
+    whether to go); past that it stops being a walk and the time would be a
+    fiction, so only the distance survives. 80 m/min is an unhurried city pace.
+    """
+    if m < 1000:
+        mins = max(1, round(m / 80.0))
+        return f"{int(round(m / 5.0) * 5)} m · {mins} min walk"
+    return f"{m / 1000:.1f} km"
+
+
+def escape_html(s):
+    return (str(s).replace("&", "&amp;").replace("<", "&lt;")
+            .replace(">", "&gt;").replace('"', "&quot;"))
+
+
+def object_key(frm, to, label):
+    """Content address. Same inputs → same object → one render, one upload."""
+    basis = "|".join([
+        f"{frm[0]:.{COORD_DP}f},{frm[1]:.{COORD_DP}f}",
+        f"{to[0]:.{COORD_DP}f},{to[1]:.{COORD_DP}f}",
+        str(label or ""),
+        f"{WIDTH}x{HEIGHT}",
+    ])
+    return hashlib.sha256(basis.encode("utf-8")).hexdigest()[:16]
+
+
+def build_html(frm, to, label, dist_text, path):
+    src = open(TEMPLATE).read()
+    for token, value in (
+        ("__FROM__", json.dumps([frm[0], frm[1]])),
+        ("__TO__", json.dumps([to[0], to[1]])),
+        ("__LABEL__", escape_html(label or "Nearby")),
+        ("__DISTANCE__", escape_html(dist_text)),
+    ):
+        src = src.replace(token, value)
+    open(path, "w").write(src)
+    return path
+
+
+def render_png(html_path, out_png):
+    if not os.path.exists(CHROME):
+        raise RuntimeError(f"Chrome not found at {CHROME}")
+    # Without an explicit profile, headless Chrome invents a scoped_dir profile
+    # under ~/Library and never removes it (~20MB of cache per render, every
+    # 10 min). A throwaway profile with the cache inside it dies with the run.
+    with tempfile.TemporaryDirectory(prefix="place-map-chrome-", ignore_cleanup_errors=True) as profile:
+        subprocess.run(
+            [CHROME, "--headless=new", "--use-mock-keychain", "--disable-gpu", "--hide-scrollbars",
+             f"--user-data-dir={profile}", f"--disk-cache-dir={profile}/cache",
+             f"--window-size={WIDTH},{HEIGHT}",
+             "--virtual-time-budget=15000", f"--screenshot={out_png}",
+             f"file://{html_path}"],
+            check=True, capture_output=True, timeout=90)
+    # A blank or tile-less frame compresses to almost nothing. Anything under
+    # ~15KB at this size means the basemap never arrived, and a map with no map
+    # on it is worse than no image at all.
+    if not os.path.exists(out_png) or os.path.getsize(out_png) < 15000:
+        raise RuntimeError("chrome produced no usable screenshot (tiles missing?)")
+    return out_png
+
+
+def public_url(key):
+    return f"{SUPABASE_URL}/storage/v1/object/public/{MAP_BUCKET}/{MAP_PREFIX}/{key}.png"
+
+
+def already_uploaded(key):
+    """Cheap HEAD against the public URL — skips a re-render AND a re-upload."""
+    req = urllib.request.Request(public_url(key), method="HEAD")
+    try:
+        with urllib.request.urlopen(req, timeout=8) as r:
+            return r.status == 200
+    except Exception:
+        return False
+
+
+def upload_png(png_path, key):
+    api_key = (load_env().get("SUPABASE_SERVICE_ROLE_KEY")
+               or os.environ.get("SUPABASE_SERVICE_ROLE_KEY"))
+    if not api_key:
+        raise RuntimeError("no SUPABASE_SERVICE_ROLE_KEY in .env")
+    if not SUPABASE_URL:
+        raise RuntimeError("no Supabase project configured (instance supabase_project)")
+    obj = f"{MAP_PREFIX}/{key}.png"
+    url = f"{SUPABASE_URL}/storage/v1/object/{MAP_BUCKET}/{obj}"
+    data = open(png_path, "rb").read()
+    req = urllib.request.Request(url, data=data, method="POST", headers={
+        "apikey": api_key, "Authorization": f"Bearer {api_key}",
+        "Content-Type": "image/png", "x-upsert": "true",
+        # A map of a fixed pair of points never changes. Cache it for a year.
+        "cache-control": "public, max-age=31536000, immutable"})
+    with urllib.request.urlopen(req, timeout=60) as r:
+        if r.status not in (200, 201):
+            raise RuntimeError(f"upload failed: {r.status}")
+    return public_url(key)
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--from", dest="frm", required=True, metavar="LAT,LON",
+                    help="where the user was when the ping was composed")
+    ap.add_argument("--to", required=True, metavar="LAT,LON",
+                    help="the place the ping is about")
+    ap.add_argument("--label", default="", help="what to caption the pin")
+    ap.add_argument("--out", default=None, help="local PNG path (default: cache dir)")
+    ap.add_argument("--upload", action="store_true",
+                    help="upload to Supabase storage and print the public URL")
+    ap.add_argument("--json", action="store_true")
+    a = ap.parse_args()
+
+    frm = parse_pair(a.frm, "from")
+    to = parse_pair(a.to, "to")
+    dist_m = haversine_m(frm, to)
+    key = object_key(frm, to, a.label)
+    result = {"key": key, "distance_m": round(dist_m)}
+
+    # Nothing to draw. Two points a few metres apart are the same point as far
+    # as a map is concerned, and a pin sitting on the dot explains nothing.
+    if dist_m < 15:
+        result["skipped"] = "subject is effectively at the user's position (<15m)"
+        print(json.dumps(result) if a.json else "")
+        return 0
+
+    if a.upload and not a.out and already_uploaded(key):
+        result["url"] = public_url(key)
+        result["cached"] = True
+        print(json.dumps(result) if a.json else result["url"])
+        return 0
+
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    png = a.out or os.path.join(CACHE_DIR, f"{key}.png")
+    html = os.path.join(CACHE_DIR, f"{key}.html")
+    build_html(frm, to, a.label, format_distance(dist_m), html)
+    render_png(html, png)
+    try:
+        os.unlink(html)
+    except OSError:
+        pass
+    result["png"] = png
+
+    if a.upload:
+        result["url"] = upload_png(png, key)
+        result["cached"] = False
+
+    print(json.dumps(result) if a.json else (result.get("url") or png))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

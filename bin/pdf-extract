@@ -1,0 +1,128 @@
+#!/usr/bin/env bash
+# pdf-extract — thin wrapper around `pdftotext` (poppler) for extracting text
+# from PDF attachments / files.
+#
+# Usage:
+#   pdf-extract <path.pdf>                       # print extracted text to stdout
+#   pdf-extract <path.pdf> --layout              # preserve original layout
+#   pdf-extract <path.pdf> --pages N-M           # restrict to a page range
+#   pdf-extract <path.pdf> --json                # {file, pages, chars, text}
+#   pdf-extract --help
+#
+# Exit codes:
+#   0 — text extracted successfully
+#   1 — usage error
+#   2 — input file missing or not a PDF
+#   3 — pdftotext failure (corrupt PDF, password-protected, etc.)
+#
+# Notes:
+#   - pdftotext (poppler) must be on PATH. On the Mac Mini it ships via brew.
+#   - Output is stdout text (or JSON with --json); errors go to stderr.
+
+set -euo pipefail
+
+usage() {
+  sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'
+}
+
+if [[ $# -eq 0 || "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+  usage
+  exit 0
+fi
+
+PDF=""
+LAYOUT=0
+JSON_OUT=0
+PAGES=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --layout) LAYOUT=1; shift ;;
+    --json) JSON_OUT=1; shift ;;
+    --pages)
+      PAGES="${2:-}"
+      if [[ -z "$PAGES" ]]; then
+        echo "pdf-extract: --pages requires a value (e.g. 1-5 or 3)" >&2
+        exit 1
+      fi
+      shift 2
+      ;;
+    --pages=*)
+      PAGES="${1#--pages=}"
+      shift
+      ;;
+    --*)
+      echo "pdf-extract: unknown flag: $1" >&2
+      exit 1
+      ;;
+    *)
+      if [[ -z "$PDF" ]]; then
+        PDF="$1"
+        shift
+      else
+        echo "pdf-extract: unexpected extra arg: $1" >&2
+        exit 1
+      fi
+      ;;
+  esac
+done
+
+if [[ -z "$PDF" ]]; then
+  echo "pdf-extract: missing PDF path" >&2
+  exit 1
+fi
+
+if [[ ! -f "$PDF" ]]; then
+  echo "pdf-extract: not a file: $PDF" >&2
+  exit 2
+fi
+
+# Cheap PDF sniff — first 5 bytes should be "%PDF-".
+head -c 5 "$PDF" | grep -q '^%PDF-' || {
+  echo "pdf-extract: not a PDF (missing %PDF- header): $PDF" >&2
+  exit 2
+}
+
+if ! command -v pdftotext >/dev/null 2>&1; then
+  echo "pdf-extract: pdftotext not found on PATH (install poppler: brew install poppler)" >&2
+  exit 3
+fi
+
+ARGS=()
+[[ "$LAYOUT" -eq 1 ]] && ARGS+=( -layout )
+if [[ -n "$PAGES" ]]; then
+  FIRST="${PAGES%-*}"
+  LAST="${PAGES#*-}"
+  if [[ -z "$FIRST" || -z "$LAST" || ! "$FIRST" =~ ^[0-9]+$ || ! "$LAST" =~ ^[0-9]+$ ]]; then
+    echo "pdf-extract: invalid --pages '$PAGES' (use N or N-M)" >&2
+    exit 1
+  fi
+  ARGS+=( -f "$FIRST" -l "$LAST" )
+fi
+
+if [[ ${#ARGS[@]} -gt 0 ]]; then
+  TEXT="$(pdftotext "${ARGS[@]}" "$PDF" - 2>/dev/null)" || {
+    echo "pdf-extract: pdftotext failed on $PDF (corrupt, encrypted, or unsupported)" >&2
+    exit 3
+  }
+else
+  TEXT="$(pdftotext "$PDF" - 2>/dev/null)" || {
+    echo "pdf-extract: pdftotext failed on $PDF (corrupt, encrypted, or unsupported)" >&2
+    exit 3
+  }
+fi
+
+if [[ "$JSON_OUT" -eq 1 ]]; then
+  PAGECOUNT="$(pdfinfo "$PDF" 2>/dev/null | awk -F: '/^Pages:/ {gsub(/ /,"",$2); print $2}')"
+  PAGECOUNT="${PAGECOUNT:-null}"
+  TEXT="$TEXT" PDF="$PDF" PAGECOUNT="$PAGECOUNT" python3 -c '
+import json, os
+text = os.environ.get("TEXT", "")
+path = os.environ["PDF"]
+pc = os.environ.get("PAGECOUNT", "null")
+pages = None if pc == "null" else int(pc)
+print(json.dumps({"file": path, "pages": pages, "chars": len(text), "text": text}, ensure_ascii=False))
+'
+else
+  printf '%s' "$TEXT"
+fi

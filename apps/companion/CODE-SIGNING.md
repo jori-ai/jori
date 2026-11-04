@@ -1,66 +1,75 @@
-# Code signing — set this up before your first build
+# Code signing and your own build — set this up before your first build
 
-The companion app ships with placeholder values where personal identifiers used to live. You need to replace four things with your own Apple Developer credentials before either of the CI workflows (`ios-testflight.yml` / `macos-testflight.yml`) will work.
+The companion app builds from one source tree for everyone. What makes a
+build *yours* — bundle id, team, display name, backend, signing contexts,
+optional features — is build configuration, not code:
 
-## What to change
+- `Config/Jori.xcconfig` holds the public defaults (placeholders such as
+  `TEAMID_PLACEHOLDER` and `com.example.Jori`).
+- `Config/Installation.xcconfig`, when present, overrides any of them. It is
+  git-ignored: keep it in your own private repo (or a CI secret) and copy it in
+  before building.
 
-| Token | Replace with | Where it appears |
-|---|---|---|
-| `TEAMID_PLACEHOLDER` | Your 10-character Apple Team ID | 11 places across `Jori.xcodeproj`, fastlane configs, ExportOptions plists, and both workflow YAMLs |
-| `com.example.Jori` | Your reverse-DNS bundle ID for the app | xcodeproj, Info.plist, fastlane, ExportOptions |
-| `com.example.Jori.NotificationService` | Bundle ID for the notification-service extension | xcodeproj, ExportOptions |
-| `com.example.jori` (lowercase) | The URL-scheme variant | `Jori/Info.plist` (`CFBundleURLSchemes` + `CFBundleURLName`) |
-| `<Developer Name>` | The display name on your "Apple Distribution" certificate | `ios-testflight.yml` (used in a `grep` against `security find-identity` output) |
+## Minimal Installation.xcconfig
 
-Find your Team ID at https://developer.apple.com/account → Membership.
-
-## One-shot helper
-
-Replace `ABCDEFGHIJ` with your Team ID and `com.yourname.Jori` with your bundle ID, then run from the repo root:
-
-```bash
-TEAM=ABCDEFGHIJ
-BUNDLE=com.yourname.Jori
-NAME="Your Name"
-
-git ls-files apps/companion | xargs sed -i '' \
-  -e "s/TEAMID_PLACEHOLDER/$TEAM/g" \
-  -e "s/com\\.example\\.Jori\\.NotificationService/$BUNDLE.NotificationService/g" \
-  -e "s/com\\.example\\.Jori/$BUNDLE/g" \
-  -e "s/com\\.example\\.jori/$(echo $BUNDLE | tr A-Z a-z)/g" \
-  -e "s/<Developer Name>/$NAME/g"
-
-git ls-files .github/workflows | xargs sed -i '' \
-  -e "s/TEAMID_PLACEHOLDER/$TEAM/g" \
-  -e "s/com\\.example\\.Jori\\.NotificationService/$BUNDLE.NotificationService/g" \
-  -e "s/com\\.example\\.Jori/$BUNDLE/g" \
-  -e "s/<Developer Name>/$NAME/g"
-
-# Verify
-git ls-files | xargs grep -lE "TEAMID_PLACEHOLDER|com\\.example\\.Jori|<Developer Name>"
-# Above should print nothing — anything that prints is something the script missed.
+```
+JORI_BUNDLE_ID = com.yourname.Jori
+JORI_TEAM_ID = ABCDEFGHIJ
+JORI_URL_SCHEME = com.yourname.jori
+JORI_SUPABASE_URL = https:/$()/<project-ref>.supabase.co
+JORI_SUPABASE_ANON_KEY = <the project's anon key>
 ```
 
-Then commit those changes in your fork. **Do not push them upstream** if you're contributing to the public Jori repo — keep your signing identity local.
+(xcconfig reads `//` as a comment, hence `https:/$()/…`.) Find your Team ID at
+https://developer.apple.com/account → Membership. Add the URL scheme's
+`<scheme>://auth-callback` to the Supabase Auth redirect URLs.
+
+Every setting, with its default and meaning, is documented in
+`Config/Jori.xcconfig`. The ones to know:
+
+| Setting | What it is |
+|---|---|
+| `JORI_BUNDLE_ID`, `JORI_TEAM_ID`, `JORI_DISPLAY_NAME`, `JORI_MARKETING_VERSION` | The app's identity; the extensions are `<bundle id>.NotificationService`, `.Share`, `.Intents`, `.UsageMonitor` |
+| `JORI_APP_GROUP`, `JORI_KEYCHAIN_GROUP` | Shared with the extensions (defaults derive from the bundle id) |
+| `JORI_SUPABASE_URL`, `JORI_SUPABASE_ANON_KEY`, `JORI_ATTACHMENTS_BUCKET` | The backend |
+| `JORI_SIGNING_PURCHASE`, `JORI_SIGNING_APPROVE` | Face ID signing contexts; must equal the server's, never change once a device is paired |
+| `JORI_STORAGE_PREFIX`, `JORI_KEY_TAG_PREFIX`, `JORI_LEGACY_NAME` | Only for an app that already shipped under other names (keeps its stored data and paired keys) |
+| `JORI_WIKI_URL`, `JORI_TRADE_APPROVAL_*`, `JORI_FEATURES` | Optional surfaces, off until set |
+| `JORI_APP_ENTITLEMENTS`, `JORI_USAGE_MONITOR_ENTITLEMENTS` | Point at the `-ScreenTime` variants once Apple has granted your team Family Controls |
+
+Named places the location tracker should recognize go in
+`Jori/Installation/NamedLocations.json` (git-ignored; an array of
+`{"name", "lat", "lon", "address", "city"}`).
+
+## CI
+
+Both workflows (`ios-testflight.yml` / `macos-testflight.yml`) write
+`Config/Installation.xcconfig` from the `JORI_INSTALLATION_XCCONFIG` secret when
+it is set, read the team from it, and sign manually by passing
+`JORI_CODE_SIGN_STYLE=Manual`, `JORI_CODE_SIGN_IDENTITY` and the profile names
+(`JORI_PROFILE_*`) on the xcodebuild command line — nothing rewrites the
+project file. Edit the profile names there, and the bundle ids in
+`ExportOptions.plist`, to match your App Store Connect setup.
 
 ## GitHub Actions secrets you also need
 
-The workflows authenticate with App Store Connect via API key + import a `.p12` distribution certificate. Set these as **GitHub Secrets** (Settings → Secrets and variables → Actions):
-
 | Secret | What |
 |---|---|
+| `JORI_INSTALLATION_XCCONFIG` | The contents of your `Installation.xcconfig` |
 | `IOS_CERTIFICATE_P12` | Base64-encoded `.p12` of your Apple Distribution certificate |
 | `IOS_CERTIFICATE_PASSWORD` | Password for the `.p12` |
 | `MAC_CERTIFICATE_P12` | Same, but for the Mac Installer Distribution certificate |
 | `MAC_CERTIFICATE_PASSWORD` | Password for the mac `.p12` |
 | `MAC_PROVISIONING_PROFILE` | Base64-encoded mac app `.provisionprofile` |
-| `MAC_NOTIFSERVICE_PROFILE` | Base64-encoded notification-service `.provisionprofile` (if you use the extension) |
-| `ASC_KEY_ID`, `ASC_ISSUER_ID`, `ASC_KEY_P8` | App Store Connect API key (see [Apple docs](https://developer.apple.com/documentation/appstoreconnectapi/creating_api_keys_for_app_store_connect_api)) |
+| `MAC_NOTIFSERVICE_PROFILE` | Base64-encoded notification-service `.provisionprofile` |
+| `MAC_SHARE_PROFILE` | Base64-encoded share-extension `.provisionprofile` |
+| `MAC_INSTALLER_IDENTITY` | Full name of your "3rd Party Mac Developer Installer: …" identity |
+| `ASC_KEY_ID`, `ASC_ISSUER_ID`, `ASC_PRIVATE_KEY` | App Store Connect API key (see [Apple docs](https://developer.apple.com/documentation/appstoreconnectapi/creating_api_keys_for_app_store_connect_api)) |
 
 ## What the workflows do
 
-- **`ios-testflight.yml`** — iOS build, archive via xcodebuild, upload to TestFlight via `xcrun altool`. Runs on a self-hosted macOS runner (label `[self-hosted, macos, ios]`).
-- **`macos-testflight.yml`** — Mac Catalyst build, archive, `productbuild` into a `.pkg`, upload to TestFlight. Same runner labels.
+- **`ios-testflight.yml`** — iOS archive via xcodebuild, export, upload to TestFlight via `xcrun altool`. Runs on a self-hosted macOS runner (label `[self-hosted, macos, ios]`).
+- **`macos-testflight.yml`** — native macOS archive, `productbuild` into a `.pkg`, upload to TestFlight. Same runner labels.
 
 Trigger both manually via the Actions tab → workflow → "Run workflow".
 

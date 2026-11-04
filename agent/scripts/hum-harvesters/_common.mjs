@@ -31,7 +31,8 @@ const CACHE_DIR = installTools("data/hum-cache");
 const STATE_FILE = installTools("data/hum-interests-state.json");
 const RUNS_FILE = installTools("data/hum-runs.jsonl");
 
-const SILENCE_LIMIT_PER_DAY = 3;
+// agent/local/config/hum-harvesters.json `silence_limit_per_day` (default 3).
+const SILENCE_LIMIT_PER_DAY = Number(localConfig("hum-harvesters", { silence_limit_per_day: 3 }).silence_limit_per_day);
 
 // ─── Preview mode ───────────────────────────────────────────────────────────
 //

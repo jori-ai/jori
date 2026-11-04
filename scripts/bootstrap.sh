@@ -57,10 +57,6 @@ ok "npm $(npm --version)"
 if command -v ollama >/dev/null 2>&1; then
   ok "Ollama $(ollama --version 2>&1 | head -1)"
   # Models — non-fatal if missing
-  if ! ollama list 2>/dev/null | grep -q "gemma3:1b"; then
-    warn "Ollama model 'gemma3:1b' not pulled. Local classification needs it:"
-    warn "    ollama pull gemma3:1b"
-  fi
   if ! ollama list 2>/dev/null | grep -q "nomic-embed-text"; then
     warn "Ollama model 'nomic-embed-text' not pulled. Memory embeddings need it:"
     warn "    ollama pull nomic-embed-text"

@@ -44,14 +44,14 @@ test("no supervisor alert hardcodes an agent name", () => {
 test("every process-naming supervisor alert interpolates this.args.agent", () => {
   const src = fs.readFileSync(SRC, "utf8");
   for (const frag of [
-    "⚠️ Jori ${this.args.agent} queue depth=",
-    "✅ Jori ${this.args.agent} recovered: queue drained",
-    "✅ Jori ${this.args.agent} recovered: the fresh session",
+    "⚠️ ${ASSISTANT} ${this.args.agent} queue depth=",
+    "✅ ${ASSISTANT} ${this.args.agent} recovered: queue drained",
+    "✅ ${ASSISTANT} ${this.args.agent} recovered: the fresh session",
     "⚠️ ${this.args.agent} turn from ${src} hung ${mins}min again",
     "⚠️ ${this.args.agent} turn from ${src} hung for ${mins}min",
     "Max auth broken on ${HOST_LABEL} for the ${this.args.agent} supervisor",
     "Max auth restored on ${HOST_LABEL} — ${this.args.agent} is resuming.",
-    "⚠️ Jori ${this.args.agent} crash-loop:",
+    "⚠️ ${ASSISTANT} ${this.args.agent} crash-loop:",
   ]) {
     assert.ok(src.includes(frag), `missing agent-attributed alert: ${frag}`);
   }

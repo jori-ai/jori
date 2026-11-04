@@ -1,0 +1,1256 @@
+#!/usr/bin/env python3
+"""day-segments — rebuild a day as segments, where a stop is CONTAINMENT, not stillness.
+
+The requirement: look beyond physical stops. A stop at a park is not captured
+by stillness when the user walked through it, because walking in the park IS
+the visit. So the day is read as short segments too — if they resolve to a
+single place, they are a stop even if the GPS moved around.
+
+TWO CASES FROM ONE DAY, both invisible to the stillness model:
+
+  A Roman amphitheatre — inside it 12:41-13:02, walking around
+  it. Every fix but the first reads `walking`, and the pin is 170m from where
+  the visit landed because Google pins the CENTRE of a large site while a
+  visitor stands at the perimeter. Recorded: 9 minutes at a street shopfront.
+  Actual: 21 minutes at a monument.
+
+  The chocolate shop — a ~10 minute stop INSIDE a 43-minute walk home, one fix
+  9m from the door. Recorded: the whole span as "Walking home".
+
+So a stop is a RUN of fixes that all sit inside ONE place, and a window is not
+atomic: a walk can contain a stop, so segmentation must carve one out of the
+middle rather than labelling the whole span.
+
+WHY THE LOOP RUNS PLACE-FIRST. The obvious construction — extend a run while
+consecutive fixes SHARE a candidate — was built first and failed outright: it
+shattered the day into 44 single-fix fragments and invented a pharmacy visit.
+Two reasons, both fatal. The fixes are sparse (often 5-10 min and 100m+ apart),
+so consecutive candidate sets frequently do not overlap at all; and Places
+returns only the 20 NEAREST, so two fixes 100m apart get disjoint lists even
+when one large venue spans both. The amphitheatre could never appear at all —
+for a fix 170m away in a dense old quarter it is nowhere near the nearest twenty.
+
+Inverting fixes both. Build the candidate pool ONCE, then ask of each place:
+"which fixes are inside it, and over what span?" A sparse gap no longer breaks a
+run, and truncation cannot hide a place that any single probe found.
+
+LARGE VENUES NEED THEIR OWN PROBE. Distance-ranked search will never surface a
+monument from the perimeter, so parks/monuments/museums are queried separately
+by TYPE on a coarse grid along the path. Their footprint is approximated by a
+type-scaled radius — a real polygon (OSM) is the honest answer and the next step;
+this is enough to test whether the segmentation model itself holds up.
+
+DRY-RUN ONLY. Reports; writes nothing.
+
+Usage:
+  day-segments <YYYY-MM-DD> [--tz Europe/Paris] [--json]
+"""
+import argparse
+import json
+import math
+import os
+import sys
+import time
+import urllib.parse
+import urllib.request
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
+
+# This file's directory (a test that exec()s the file has no __file__: then the
+# test's own path, which sits beside bin/ as well).
+HERE = os.path.dirname(os.path.realpath(globals().get("__file__") or sys.argv[0]))
+sys.path.insert(0, os.path.join(HERE, "..", "lib"))
+import places_local  # noqa: E402
+
+REPO = places_local.install_root()
+ENV_FILE = os.path.join(REPO, ".env")
+
+
+def supabase_url():
+    """SUPABASE_URL, else https://<instance supabase_project>.supabase.co, else ""."""
+    if os.environ.get("SUPABASE_URL"):
+        return os.environ["SUPABASE_URL"].rstrip("/")
+    inst = places_local._read(os.path.join(places_local.local_dir(), "instance.json")) or {}
+    proj = os.environ.get("JORI_SUPABASE_PROJECT") or inst.get("supabase_project") or ""
+    return f"https://{proj}.supabase.co" if proj else ""
+
+
+SUPABASE_URL = supabase_url()
+# The phone's device_id on rows this writes: JORI_DEVICE_ID, else "<owner_id>-iphone"
+# (the id the iOS client writes, so rows written here sit with its own).
+DEVICE_ID = os.environ.get("JORI_DEVICE_ID") or f"{places_local.instance()['owner_id']}-iphone"
+
+import osm_places as osm  # noqa: E402  kernel-guard-ok: the OSM places module (lib/osm_places.py), not a bin
+from place_naming import scheduled_lodging  # noqa: E402  (shared with stop-identify)
+
+ACC_MAX_M = 60.0
+# 15-minute segments. Also the floor `findme enrich` already uses — a shorter
+# run is a cut-through, and the user cannot reliably recall it either way.
+MIN_STOP_MIN = 15.0
+# A gap longer than this is unobserved time; a run may not span it, because
+# staying put and leaving-and-returning look identical across a silence.
+MAX_GAP_MIN = 25.0
+# Fraction of the fixes inside a run's span that must actually be contained.
+# Below this the place is something passed repeatedly, not somewhere the user was.
+MIN_CONTAINMENT = 0.7
+
+# Each segment checks location and time to determine speed (near 0 is sitting
+# down, 5-6 kph is walking, then driving, etc.).
+#
+# Speed says what KIND of segment it is, which the containment test alone cannot:
+# 20 minutes at 0 km/h is sitting somewhere; 20 minutes at 2 km/h is wandering
+# INSIDE a place (a park, a market, a monument); 20 minutes at 5-6 km/h in a
+# straight line is walking THROUGH and not a stop at all. The last case is the
+# one that most needs rejecting — a footprint big enough to hold a park is also
+# big enough to hold the pavement beside it.
+SIT_KMH = 1.0          # below this the user is not going anywhere
+BROWSE_KMH = 3.5       # wandering inside somewhere
+WALK_KMH = 7.0         # purposeful walking
+# A run at walking pace that also runs STRAIGHT is a route, not a visit. Both
+# conditions are required: wandering a market averages walking pace too, but it
+# doubles back, and straightness is what separates them.
+THROUGH_STRAIGHTNESS = 0.7
+# GPS error at a boundary. Standing at a park railing is being at the park.
+EDGE_PAD_M = 25.0
+
+# Footprint radius by kind. A shopfront is its doorway; a monument or park is a
+# site you walk around inside. Crude next to a real polygon, and the reason the
+# large bucket exists at all: 60m would have missed the amphitheatre from every
+# fix. `art_gallery` is deliberately NOT here. A gallery is a shopfront, and
+# giving a gallery district's very many of them a 180m footprint let them swallow every window in
+# the first run — every stop came back named after one.
+BIG_TYPES = {"park", "tourist_attraction", "historical_landmark", "museum",
+             "stadium", "zoo", "amusement_park", "campus",
+             "university", "cemetery", "botanical_garden", "national_park",
+             "hiking_area", "marina", "beach", "plaza", "monument"}
+BIG_RADIUS_M = 180.0
+SMALL_RADIUS_M = 55.0
+
+# Ladder scoping. A known place is a POINT we fitted from the user's own fixes, so its
+# footprint is small on purpose — it is a doorway, not a district.
+# Longest string still treated as a place NAME rather than a note.
+NAME_MAX_CHARS = 40
+KNOWN_RADIUS_M = 45.0
+LODGING_RADIUS_M = 60.0
+RECUR_LOOKBACK_DAYS = 180
+SLEEP_STAY_HOURS = 6.0
+SLEEP_MIN_NIGHTS = 2
+SAVED_PLACES = places_local.data_path("google-saved-places.json")
+# Overpass is queried on a fixed lat/lon grid so that different days over the
+# same ground reuse one cached fetch. ~1.11km of latitude per cell.
+GRID_DEG = 0.01
+GRID_RADIUS_M = 1500
+# A feature further than this from every fix cannot have held a segment.
+OSM_PRUNE_M = 150.0
+# Biggest thing we will accept as a FOOTPRINT — and the limit depends on whether
+# the outline is REAL. Relations whose rings we could not assemble degrade to a
+# bounding box, and some are absurd as places: a university relation arrived as
+# a 2.6km rectangle covering half a district, at distance zero from seven
+# fixes. But a flat cap cannot tell that rectangle from a genuinely large park,
+# and it threw out a real 522m park ring — losing the
+# afternoon walk that is exactly this model's reason to exist. Vertex count is
+# the tell: a traced boundary has 138 points, a bounding box has 4.
+MAX_FOOTPRINT_M = 400.0        # approximated outlines: rectangles, degenerate rings
+MAX_REAL_FOOTPRINT_M = 1200.0  # genuinely traced boundaries
+MIN_REAL_RING_VERTS = 6
+# How far a confirmed point may sit from a boundary and still be judged the same
+# place. Wide enough for standing at a monument's edge, narrow enough that a
+# flat does not adopt the park across the street.
+ADOPT_RADIUS_M = 120.0
+
+DEMOTED = {"lodging", "apartment_complex", "real_estate_agency", "general_contractor",
+           "bus_stop", "transit_station", "subway_station", "train_station",
+           "parking", "atm", "private_guest_room", "moving_company"}
+SERVICE = {"laundry", "hair_salon", "government_office", "medical_clinic", "doctor",
+           "dentist", "veterinary_care", "health", "pharmacy", "florist",
+           "catering_service", "school", "educational_institution", "insurance_agency"}
+DESTINATION = {"restaurant", "cafe", "coffee_shop", "bakery", "bar", "wine_bar", "pub",
+               "meal_takeaway", "food", "ice_cream_shop", "book_store", "store",
+               "supermarket", "grocery_store", "clothing_store", "department_store",
+               "museum", "art_gallery", "tourist_attraction", "park",
+               "historical_landmark", "movie_theater", "gym", "french_restaurant",
+               "pizza_restaurant", "thai_restaurant", "sandwich_shop",
+               "chocolate_shop", "confectionery", "candy_store"}
+
+
+def key():
+    k = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
+    if k:
+        return k
+    with open(ENV_FILE) as fh:
+        for line in fh:
+            if line.startswith("SUPABASE_SERVICE_ROLE_KEY="):
+                return line.split("=", 1)[1].strip().strip('"').strip("'")
+    sys.exit("no SUPABASE_SERVICE_ROLE_KEY")
+
+
+def get(path, tries=3):
+    """A read that survives a truncated response.
+
+    Supabase returned `IncompleteRead` four times in one session here — the
+    chunked body stops mid-stream — and an unretried read turns that into a
+    crash partway through a day. Retried because it is a plain GET: no writes,
+    nothing to make idempotent.
+    """
+    k = key()
+    last = None
+    for attempt in range(tries):
+        if attempt:
+            time.sleep(2 * attempt)
+        try:
+            r = urllib.request.Request(
+                f"{SUPABASE_URL}/rest/v1/{path}",
+                headers={"apikey": k, "Authorization": f"Bearer {k}"})
+            with urllib.request.urlopen(r, timeout=45) as resp:
+                return json.loads(resp.read())
+        except Exception as e:
+            last = e
+    raise RuntimeError(f"supabase read failed after {tries} tries: {last}")
+
+
+def write_req(path, method, body=None):
+    k = key()
+    headers = {"apikey": k, "Authorization": f"Bearer {k}"}
+    data = None
+    if body is not None:
+        headers["Content-Type"] = "application/json"
+        headers["Prefer"] = "return=representation"
+        data = json.dumps(body).encode()
+    r = urllib.request.Request(f"{SUPABASE_URL}/rest/v1/{path}", data=data,
+                               headers=headers, method=method)
+    with urllib.request.urlopen(r, timeout=45) as resp:
+        raw = resp.read()
+        return json.loads(raw) if raw else None
+
+
+# What a written row says about itself. `segment-derived` is DELIBERATELY not
+# `user-confirmed` and must never become it: this whole session began with names
+# that had been attached by a mechanism nobody could audit, and the fix is that a
+# guess is labelled a guess. `resolve-day` treats `user-confirmed` as absolute;
+# this sits below it, and a later tap can always overwrite it.
+WRITE_PLACE_TYPE = "segment-derived"
+WRITE_SOURCE = "day-segments"
+# Confidence tracks the RUNG, not the fit. A name he confirmed at this spot is a
+# different kind of claim from the nearest thing on a map, however tightly the
+# map's suggestion fits the fixes.
+RUNG_CONFIDENCE = {"confirmed": "high", "lodging": "high", "saved": "medium",
+                   "osm": "low", "google": "low"}
+
+
+def reconcile(chosen, tz, apply):
+    """Write segments back as visit rows — additively, and never over the user's words.
+
+    Exists because the segment model finds stops the CLVisit model misses
+    entirely: a 45.7-minute café stop had 46 fixes and NO `location_history`
+    row at all, so when the user supplied the name there was nothing to attach
+    it to.
+
+    Three rules, each protecting something learned the hard way:
+      1. A `user-confirmed` row in the span is left completely alone. His answer
+         outranks every inference, and the point of writing is to give future
+         answers somewhere to land, not to overwrite past ones.
+      2. Re-running a day UPDATES its own previous output rather than stacking
+         duplicates — matched on `source`, since 24.7% of visit rows in one
+         14-day window were already exact duplicates from a client-side re-entry
+         bug and this must not add to that.
+      3. An existing unnamed/address row is enriched in place rather than
+         shadowed by a second row describing the same stop.
+    """
+    acted = []
+    claimed = set()   # a row may be spoken for once per run, never twice
+    for r in chosen:
+        start, end = r["start"], r["end"]
+        # Strict inequalities: consecutive segments share an endpoint by
+        # construction, and an inclusive compare calls every adjacent pair an
+        # overlap (the same bug already fixed once in `findme resolve`).
+        rows = get("location_history?segment_type=eq.visit"
+                   f"&arrived_at=lt.{urllib.parse.quote(end.isoformat())}"
+                   # `or` keeps OPEN rows: `departed_at=gt.` alone drops a
+                   # NULL departure, so a stay still in progress was invisible
+                   # and its quiet stretch was inserted as a stop he "left".
+                   f"&or=(departed_at.gt.{urllib.parse.quote(start.isoformat())},"
+                   "departed_at.is.null)"
+                   "&select=id,place_name,place_type,source,latitude,longitude,"
+                   "arrived_at,departed_at,notes"
+                   "&limit=50") or []
+        if r.get("turnaround"):
+            reconcile_turnaround(r, rows, acted, apply)
+            continue
+        name = r["place"]["name"]
+        rung = r["place"].get("_rung", "google")
+        conf = RUNG_CONFIDENCE.get(rung, "low")
+        note = (f"day-segments: {rung} rung, {r['n_in']}/{r['n']} fixes contained, "
+                f"within {round(r['worst_m'])}m, {r['motion']['mode']} "
+                f"{r['motion']['kmh']:.1f}km/h")
+
+        confirmed = [x for x in rows if x.get("place_type") == "user-confirmed"]
+        if confirmed:
+            acted.append((r, "skip", "user-confirmed row in span"))
+            continue
+        # A segment sitting inside a much longer recorded visit is a FRAGMENT of
+        # it, not a description of it: a sparse-fix day breaks a 5.5-hour
+        # evening at home into a handful of short runs, and letting a 16-minute
+        # run rename an 11.6-hour overnight stay would be the same
+        # attach-it-to-whatever-overlaps mistake this tool was cleaning up.
+        seg_min = r["minutes"]
+        def much_longer(x):
+            if not (x.get("arrived_at") and x.get("departed_at")):
+                return False
+            xa = datetime.fromisoformat(x["arrived_at"].replace("Z", "+00:00"))
+            xd = datetime.fromisoformat(x["departed_at"].replace("Z", "+00:00"))
+            return (xd - xa).total_seconds() / 60 > max(2.5 * seg_min, seg_min + 20)
+
+        # A `non-stop` verdict covering most of the segment is settled the same
+        # way: his "not a stop", or stop-passage's walk verdict (2026-10-06).
+        # Without this the next run re-PATCHed its own row back to
+        # segment-derived — or inserted a fresh one beside it — and the walk
+        # was asked about after all.
+        def covers_half(x):
+            try:
+                xa = datetime.fromisoformat(x["arrived_at"].replace("Z", "+00:00"))
+                xd = datetime.fromisoformat(x["departed_at"].replace("Z", "+00:00"))
+            except (KeyError, TypeError, ValueError, AttributeError):
+                return False
+            ov = (min(xd, end) - max(xa, start)).total_seconds()
+            return ov >= 0.5 * (end - start).total_seconds()
+        # Not a much-longer row: a sweeper-stretched departure (2026-10-06's
+        # 14:52 walk row ran to 17:48) must not hide the stops after it.
+        if any(x.get("place_type") == "non-stop" and covers_half(x) and not much_longer(x)
+               for x in rows):
+            acted.append((r, "skip", "non-stop row covers the span"))
+            continue
+
+        # A segment inside a visit that is still OPEN at the same place is
+        # that visit, not a new stop. Once a still phone's 4 fixes at the
+        # rented flat (21:29-21:53) became their own row ending at the last
+        # fix, which read as a departure, and the user was asked "were you at
+        # the flat?" without having moved all evening.
+        holding = open_visit_holding(rows, start, r["centroid"])
+        if holding:
+            acted.append((r, "skip", f"inside open visit {holding['id'][:8]}"))
+            continue
+
+        rows = [x for x in rows if x["id"] not in claimed]
+        mine = [x for x in rows if x.get("source") == WRITE_SOURCE]
+        covering = [x for x in rows if much_longer(x) and x not in mine]
+        if covering and not mine:
+            acted.append((r, "skip", f"fragment of longer visit {covering[0]['id'][:8]}"))
+            continue
+        enrich = [x for x in rows
+                  if x.get("place_type") in (None, "address", "poi")
+                  and x.get("departed_at")  # never rename an open stay elsewhere
+                  and x not in mine and not much_longer(x)]
+        body = {"place_name": name, "place_type": WRITE_PLACE_TYPE,
+                "source": WRITE_SOURCE, "confidence": conf, "notes": note}
+        if mine:
+            claimed.add(mine[0]["id"])
+            acted.append((r, "update", f"own row {mine[0]['id'][:8]}"))
+            if apply:
+                write_req(f"location_history?id=eq.{mine[0]['id']}", "PATCH", body)
+        elif enrich:
+            claimed.add(enrich[0]["id"])
+            acted.append((r, "enrich", f"{enrich[0].get('place_type')} row "
+                                       f"{enrich[0]['id'][:8]}"))
+            if apply:
+                write_req(f"location_history?id=eq.{enrich[0]['id']}", "PATCH", body)
+        else:
+            acted.append((r, "insert", "no visit row existed"))
+            if apply:
+                write_req("location_history", "POST", {
+                    **body, "segment_type": "visit",
+                    "arrived_at": start.isoformat(), "departed_at": end.isoformat(),
+                    "latitude": r["centroid"][0], "longitude": r["centroid"][1],
+                    "device_id": DEVICE_ID})
+    print("\nwrite plan:" if not apply else "\nwrote:")
+    for r, what, why in acted:
+        print(f"  {what:<7} {r['start'].astimezone(tz):%H:%M}-{r['end'].astimezone(tz):%H:%M}  "
+              f"{r['place']['name'][:34]:<34} ({why})")
+    counts = {}
+    for _, what, _ in acted:
+        counts[what] = counts.get(what, 0) + 1
+    print(f"  -> {counts}" + ("" if apply else "   (dry run; --write to apply)"))
+
+
+# Rows that already settle what a window was: his word, a name a check earned,
+# his "not a stop", or an unanswered card's default.
+SETTLED_TYPES = ("user-confirmed", "named", "non-stop", "default-applied")
+
+
+def reconcile_turnaround(r, rows, acted, apply):
+    """Write the far end of a drive as a visit row for the question to land on.
+
+    Only rows near the destination matter: the stay at the flat, stretched by
+    the phone's late departure, overlaps the whole drive and says nothing about
+    where it went. Any other row there already records the stop — it is asked
+    through its own flow — and a settled one means the purpose is known. Only
+    the row this wrote (still `segment-derived`, carrying the token) is updated.
+    """
+    start, end = r["start"], r["end"]
+    near = [x for x in rows if x.get("latitude") is not None
+            and meters((x["latitude"], x["longitude"]), r["centroid"]) <= TURN_RADIUS_M]
+    mine = [x for x in near if x.get("source") == WRITE_SOURCE
+            and x.get("place_type") == WRITE_PLACE_TYPE
+            and TURNAROUND_TOKEN in (x.get("notes") or "")]
+    if any(x.get("place_type") in SETTLED_TYPES for x in near):
+        acted.append((r, "skip", "a settled row already covers the destination"))
+        return
+    if [x for x in near if x not in mine]:
+        acted.append((r, "skip", "a visit row already records a stop there"))
+        return
+    note = (f"{TURNAROUND_TOKEN} drove {r['away_m'] / 1000:.1f} km out and back to where it began; "
+            f"{r['n_in']}/{r['n']} fixes within {TURN_RADIUS_M / 1000:.0f} km of the far point "
+            f"over {r['minutes']:.0f} min, no stop seen there. Purpose unknown.")
+    body = {"place_name": r["place"]["name"], "place_type": WRITE_PLACE_TYPE,
+            "source": WRITE_SOURCE, "confidence": "low", "notes": note}
+    if mine:
+        acted.append((r, "update", f"own row {mine[0]['id'][:8]}"))
+        if apply:
+            write_req(f"location_history?id=eq.{mine[0]['id']}", "PATCH", body)
+        return
+    acted.append((r, "insert", "far end of a drive out and back"))
+    if apply:
+        write_req("location_history", "POST", {
+            **body, "segment_type": "visit",
+            "arrived_at": start.isoformat(), "departed_at": end.isoformat(),
+            "latitude": r["centroid"][0], "longitude": r["centroid"][1],
+            "device_id": DEVICE_ID})
+
+
+# How near and how recent an open (no departure yet) visit row must be to count
+# as the stay a segment sits inside. The age bound keeps a row the phone never
+# closed days ago from swallowing every later stop.
+OPEN_VISIT_RADIUS_M = 150
+OPEN_VISIT_MAX_AGE_H = 24
+
+
+def open_visit_holding(rows, start, centroid):
+    """The open visit row this span sits inside, or None."""
+    for x in rows:
+        if x.get("departed_at") or x.get("latitude") is None:
+            continue
+        try:
+            xa = datetime.fromisoformat(x["arrived_at"].replace("Z", "+00:00"))
+        except (KeyError, TypeError, ValueError, AttributeError):
+            continue
+        if not (start - timedelta(hours=OPEN_VISIT_MAX_AGE_H) <= xa <= start):
+            continue
+        if meters((x["latitude"], x["longitude"]), centroid) <= OPEN_VISIT_RADIUS_M:
+            return x
+    return None
+
+
+def meters(a, b):
+    return math.hypot((b[0] - a[0]) * 111320.0,
+                      (b[1] - a[1]) * 111320.0 * math.cos(math.radians(a[0])))
+
+
+def types_of(p):
+    return set(p.get("types") or []) | {p.get("primary_type") or ""}
+
+
+def radius_for(p):
+    """Footprint for a place that has no polygon. Polygons never come here."""
+    if p.get("_radius_m"):
+        return p["_radius_m"]
+    return BIG_RADIUS_M if types_of(p) & BIG_TYPES else SMALL_RADIUS_M
+
+
+def place_distance(p, lat, lon):
+    """How far outside this place the fix is — ZERO if it is inside.
+
+    The whole reason for carrying polygons. Measuring to a centroid is what let
+    a 170m-wide monument look 170m away from someone standing in the middle of
+    it, and made every big place lose to whatever shopfront happened to be
+    nearest the centre of the run.
+    """
+    best = float("inf")
+    poly = p.get("polygon")
+    if poly:
+        best = (0.0 if osm.point_in_polygon(lat, lon, poly)
+                else min(meters((lat, lon), pt) for pt in poly))
+    if p.get("_radius_m") or not poly:
+        best = min(best, meters((lat, lon), (p["lat"], p["lon"])))
+    return best
+
+
+def contains_fix(p, lat, lon):
+    """Is the fix within this place's footprint — EITHER shape of it?
+
+    A known place carries both a dot (where he stood) and, once adopted, a
+    boundary (what he was in). Testing the UNION rather than replacing one with
+    the other is not a nicety: replacing them regressed his flat to a sports
+    centre 21m away, because the flat adopted a nearby boundary that did not
+    cover its own fixes, produced no candidate at all, and lost to whatever else
+    was near. A union can only ever add coverage, never remove it.
+    """
+    poly = p.get("polygon")
+    if poly:
+        if osm.point_in_polygon(lat, lon, poly):
+            return True
+        if min(meters((lat, lon), pt) for pt in poly) <= EDGE_PAD_M:
+            return True
+    if p.get("_radius_m") or not poly:
+        return meters((lat, lon), (p["lat"], p["lon"])) <= radius_for(p)
+    return False
+
+
+# PRECEDENCE, not preference. The ladder: something the user CONFIRMED here beats
+# where the user sleeps, which beats a place the user saved, which beats whatever the map
+# says. The segmenter had reinvented only the bottom rung — it ranked map
+# candidates while `stop-identify` already knew this stop by name — which is why
+# the user's own flat kept coming back named after a museum.
+RUNG = {"confirmed": -3, "lodging": -2, "saved": -1}
+OSM_CATEGORY_PRIOR = {"destination": 0, "other": 1, "service": 2, "demoted": 3}
+
+
+def rung_rank(p):
+    """Which rung of the ladder — and NOTHING about what kind of place it is."""
+    return RUNG.get(p.get("_rung"), 0)
+
+
+def prior(p):
+    """Category rank, used only to separate places on the SAME rung."""
+    if p.get("_rung") == "osm":
+        return OSM_CATEGORY_PRIOR.get(p.get("_category"), 1)
+    t = types_of(p)
+    if t & DEMOTED:
+        return 3
+    if t & DESTINATION:
+        return 0
+    if t & SERVICE:
+        return 2
+    return 1
+
+
+def footprint_extent(p):
+    """Half-diagonal of a polygon — how big this place claims to be."""
+    poly = p.get("polygon")
+    if not poly:
+        return 0.0
+    clat = sum(c[0] for c in poly) / len(poly)
+    clon = sum(c[1] for c in poly) / len(poly)
+    return max(meters((clat, clon), c) for c in poly)
+
+
+def footprint_ok(p):
+    """Is this outline usable as a place's boundary?"""
+    poly = p.get("polygon")
+    if not poly:
+        return True
+    approximated = p.get("bbox_only") or len(poly) < MIN_REAL_RING_VERTS
+    cap = MAX_FOOTPRINT_M if approximated else MAX_REAL_FOOTPRINT_M
+    return footprint_extent(p) <= cap
+
+
+def adopt_footprints(known, pool):
+    """Give a place the user NAMED the real boundary of the thing it sits inside.
+
+    The ladder is about names, but an earlier version let it carry geometry too,
+    and that quietly broke the case the segment model exists for. The
+    amphitheatre is confirmed, so it outranked every map candidate — but as a
+    CONFIRMED POINT it is a 45m dot, so 21 minutes walking around a Roman
+    amphitheatre came to 12 minutes inside the dot, fell under the 15-minute
+    floor, and disappeared from the day entirely. The name was right and the
+    shape was wrong.
+
+    So: take the name and rank from what the user confirmed, and the boundary from the
+    SMALLEST sane polygon containing it. Smallest matters — the same point also
+    sits inside a university relation covering half the arrondissement.
+    """
+    NEAR, INSIDE = ADOPT_RADIUS_M, 0.0
+    polys = [p for p in pool.values()
+             if p.get("polygon") and footprint_extent(p) <= MAX_FOOTPRINT_M
+             # DESTINATIONS ONLY — parks, monuments, museums. Adoption exists for
+             # the large-site case, where the user stands at a perimeter and the dot
+             # understates the place. Left open to any category, the user's flat adopted
+             # the boundary of the lycée next door: harmless to containment,
+             # since the union only adds, but it is not a place the user was at, and a
+             # footprint that big attached to a home is an invitation to swallow
+             # the street.
+             and p.get("_category") == "destination"]
+    for k in known:
+        # NEARNESS, not containment. The confirmed point is a sample of where the
+        # user STOOD, fitted from the user's own fixes — and a visitor to a large
+        # site stands at its perimeter, so the anchor for the amphitheatre landed 90m outside
+        # the square's boundary and no containment test could ever have matched
+        # it. Ranking by distance still prefers containment, because a point
+        # inside a polygon is at distance zero.
+        ranked = sorted(((place_distance(p, k["lat"], k["lon"]), footprint_extent(p), p)
+                         for p in polys), key=lambda x: (x[0] > INSIDE, x[0], x[1]))
+        # First candidate that PASSES, not the nearest one and then a test —
+        # testing only the top match meant a nearer but too-small boundary
+        # vetoed adoption entirely, which is why the amphitheatre stayed a 45m dot.
+        for dist, ext, p in ranked:
+            if dist > NEAR:
+                break
+            # Only adopt a boundary bigger than the dot we already have.
+            if ext > k.get("_radius_m", KNOWN_RADIUS_M):
+                k["polygon"] = p["polygon"]
+                k["type_display"] = f"{k['type_display']} · {p['name']} footprint"
+                break
+    return known
+
+
+def known_places(fixes, day=None):
+    """Rungs 1-3 — what we already know, scoped to the DAY'S OWN AREA.
+
+    Scoping is the entire correctness argument here, not an optimisation. An
+    earlier attempt looked up lodging globally and would happily have named a
+    segment abroad after the user's home apartment, because that is where the
+    user has slept most. One bounding-box query per day, filtered by real distance after.
+    """
+    if not fixes:
+        return []
+    lats = [f["lat"] for f in fixes]
+    lons = [f["lon"] for f in fixes]
+    pad = 300.0 / 111320.0
+    lat0, lat1 = min(lats) - pad, max(lats) + pad
+    lon0, lon1 = min(lons) - pad * 1.6, max(lons) + pad * 1.6
+    since = (datetime.now(timezone.utc) - timedelta(days=RECUR_LOOKBACK_DAYS)).isoformat()
+    rows = get("location_history?segment_type=eq.visit"
+               f"&arrived_at=gte.{urllib.parse.quote(since)}"
+               f"&latitude=gte.{lat0}&latitude=lte.{lat1}"
+               f"&longitude=gte.{lon0}&longitude=lte.{lon1}"
+               "&select=id,place_name,place_type,latitude,longitude,arrived_at,departed_at"
+               "&order=arrived_at.desc&limit=1000") or []
+
+    confirmed, sleep_pts = {}, []
+    for r in rows:
+        name = (r.get("place_name") or "").strip()
+        # A SENTENCE IS NOT A VENUE LABEL. Some confirmations are descriptions
+        # the user typed — "went for a quick walk with the dog outside" — and one
+        # of those became a `user-confirmed` row at the user's own front door. The confirmed rung then reused it to name EVERY home stop
+        # that day: one misattributed confirmation names a location forever.
+        # Judged on LENGTH, a property of the field; deciding whether the words
+        # describe or denote would be Rule #0b's job for a model, not a guess
+        # here. The real fix is upstream, where `findme`'s NON_STOP_DESCRIBED
+        # regexes failed to recognise this as movement at all.
+        if r.get("place_type") == "user-confirmed" and name and len(name) <= NAME_MAX_CHARS:
+            # Collapse repeat visits to one place — keyed by name plus a coarse
+            # cell so two branches of the same chain stay distinct.
+            k = (name, round(r["latitude"], 4), round(r["longitude"], 4))
+            confirmed.setdefault(k, {"name": name, "lat": r["latitude"],
+                                     "lon": r["longitude"], "_rung": "confirmed",
+                                     "_radius_m": KNOWN_RADIUS_M, "types": [],
+                                     "type_display": "confirmed here before"})
+        if r.get("departed_at"):
+            a = datetime.fromisoformat(r["arrived_at"].replace("Z", "+00:00"))
+            d = datetime.fromisoformat(r["departed_at"].replace("Z", "+00:00"))
+            if (d - a).total_seconds() / 3600 >= SLEEP_STAY_HOURS:
+                sleep_pts.append((r["latitude"], r["longitude"], a.date(),
+                                  name if r.get("place_type") == "user-confirmed" else ""))
+
+    out = list(confirmed.values())
+
+    # Lodging: somewhere in THIS area he has slept at least two nights. The name
+    # only counts if he confirmed it ON a long stay — a café confirmed 25m away
+    # once nearly became the name of his flat.
+    used = [False] * len(sleep_pts)
+    for i, (la, lo, _, _) in enumerate(sleep_pts):
+        if used[i]:
+            continue
+        group = [j for j in range(len(sleep_pts))
+                 if not used[j] and meters((la, lo), sleep_pts[j][:2]) <= LODGING_RADIUS_M]
+        for j in group:
+            used[j] = True
+        nights = {sleep_pts[j][2] for j in group}
+        if len(nights) < SLEEP_MIN_NIGHTS:
+            continue
+        names = [sleep_pts[j][3] for j in group if sleep_pts[j][3]]
+        booked = scheduled_lodging(day) if day else None
+        out.append({"name": booked or (names[0] if names else "the apartment"),
+                    "lat": sum(sleep_pts[j][0] for j in group) / len(group),
+                    "lon": sum(sleep_pts[j][1] for j in group) / len(group),
+                    "_rung": "lodging", "_radius_m": LODGING_RADIUS_M, "types": [],
+                    "type_display": f"where he sleeps · {len(nights)} nights"})
+
+    # Saved places, filtered to the same box. Missing file is not an error.
+    try:
+        with open(SAVED_PLACES) as fh:
+            d = json.load(fh)
+        items = d if isinstance(d, list) else (d.get("places") or d.get("items") or [])
+    except (OSError, ValueError):
+        items = []
+    for p in items:
+        # The export says `lng`; this code said `lon`. That mismatch survived
+        # because the file does not exist on the laptop, so the whole saved rung
+        # silently did nothing there and only exploded on the mini — where the
+        # file holds 2328 places. Accept the spellings rather than trust one.
+        plat = p.get("lat")
+        plon = p.get("lng", p.get("lon", p.get("longitude")))
+        if plat is None or plon is None or not p.get("name"):
+            continue
+        if not (lat0 <= plat <= lat1 and lon0 <= plon <= lon1):
+            continue
+        out.append({"name": p["name"], "lat": plat, "lon": plon,
+                    "_rung": "saved", "_radius_m": KNOWN_RADIUS_M, "types": [],
+                    "type_display": "saved in Google Maps"})
+    return out
+
+
+def osm_pool(fixes):
+    """Rung 4 — named features WITH FOOTPRINTS, from OpenStreetMap.
+
+    ONE WIDE QUERY PER CLUSTER, and that shape is the fix for a real failure:
+    querying a ~110m grid cell per fix meant dozens of Overpass calls and the
+    run never finished. A 1000m radius returns ~5000 features in about three
+    seconds, so a day's walking is one or two calls. Results are pruned to what
+    is actually near the path, because most of those 5000 are streets away.
+    """
+    # QUERY ON A FIXED GRID, not around wherever today's fixes happened to
+    # cluster. Clustering produced fewer calls per day but a DIFFERENT centre
+    # every day, so the cache — keyed on centre and radius — never hit across
+    # days and each new day paid full price against a public, rate-limited
+    # service. Running a week that way, Overpass throttled us from 3 seconds a
+    # query to roughly eight MINUTES. Snapped cells are identical between days,
+    # so the second run over the same neighbourhood is free.
+    #
+    # Coverage is guaranteed rather than estimated: a fix is at most a
+    # half-diagonal (~640m) from its own cell centre, plus OSM_PRUNE_M, which
+    # leaves a wide margin inside GRID_RADIUS_M.
+    cells = {}
+    for f in fixes:
+        k = (round(f["lat"] / GRID_DEG), round(f["lon"] / GRID_DEG))
+        cells.setdefault(k, []).append(f)
+
+    pool, failures = {}, 0
+    for (gy, gx) in sorted(cells):
+        clat, clon = gy * GRID_DEG, gx * GRID_DEG
+        radius = GRID_RADIUS_M
+        try:
+            found = osm.nearby(clat, clon, radius=radius)
+        except Exception as e:
+            print(f"[day-segments] OSM query failed: {e}", file=sys.stderr)
+            found = []
+        # An empty answer from a live area is Overpass refusing, not an empty
+        # city. Say so — silently naming nothing looks identical to success.
+        if not found:
+            failures += 1
+        for p in found:
+            if not footprint_ok(p):
+                continue
+            near = min(place_distance(p, f["lat"], f["lon"]) for f in fixes)
+            if near > OSM_PRUNE_M:
+                continue
+            pool[p["osm_id"]] = {"name": p["name"], "lat": p["lat"], "lon": p["lon"],
+                                 "polygon": p.get("polygon"),
+                                 "bbox_only": p.get("bbox_only", False),
+                                 "_rung": "osm",
+                                 "_category": p.get("category"), "types": [],
+                                 "type_display": p.get("kind", "")}
+    if failures:
+        print(f"[day-segments] {failures}/{len(cells)} OSM grid cell(s) returned "
+              f"nothing — names may be missing", file=sys.stderr)
+    return pool
+
+
+def big_venues_near(lat, lon, radius=400):
+    """Type-filtered probe. Distance ranking will never surface a monument from
+    its perimeter in a dense city — asking for the type directly will."""
+    try:
+        from places_nearby import api_key, FIELD_MASK, _haversine_m, places_locale
+        from places_log import log_call as _places_log
+    except Exception:
+        return []
+    k = api_key()
+    if not k:
+        return []
+    body = {
+        "locationRestriction": {"circle": {"center": {"latitude": lat, "longitude": lon},
+                                           "radius": radius}},
+        "includedTypes": ["park", "tourist_attraction", "historical_landmark",
+                          "museum", "art_gallery"],
+        "rankPreference": "POPULARITY", "maxResultCount": 10,
+        # Hebrew names in Israel — places_nearby.places_locale (2026-10-06).
+        **places_locale(lat, lon),
+    }
+    try:
+        import places_client  # the one guarded door: prices, gates, logs
+        data = places_client.post("day-segments", "places:searchNearby", body, FIELD_MASK, "searchNearby",
+                                  timeout=12, api_key=k, lat=lat, lon=lon, radius=radius)
+    except Exception as e:
+        print(f"[day-segments] big-venue probe failed: {e}", file=sys.stderr)
+        return []
+    out = []
+    for p in data.get("places", []):
+        out.append({"name": p.get("displayName", {}).get("text", "?"),
+                    "lat": p["location"]["latitude"], "lon": p["location"]["longitude"],
+                    "types": p.get("types", []), "primary_type": p.get("primaryType", ""),
+                    "type_display": (p.get("primaryTypeDisplayName") or {}).get("text", ""),
+                    "reviews": p.get("userRatingCount", 0),
+                    "place_id": p.get("id", "")})
+    return out
+
+
+def build_pool(fixes):
+    """One candidate pool for the whole day. Built once, so no intersection and
+    no truncation can hide a place that any probe found."""
+    from places_nearby import nearby
+    pool, seen_small, seen_big = {}, set(), set()
+    for f in fixes:
+        gk = (round(f["lat"], 4), round(f["lon"], 4))
+        if gk not in seen_small:
+            seen_small.add(gk)
+            for p in nearby(f["lat"], f["lon"], radius=80, max_results=20):
+                pid = p.get("place_id") or p.get("name")
+                if pid and pid not in pool:
+                    pool[pid] = {"name": p["name"], "lat": p["lat"], "lon": p["lon"],
+                                 "types": p.get("types", []),
+                                 "primary_type": p.get("primary_type", ""),
+                                 "type_display": p.get("type_display", ""),
+                                 "reviews": p.get("reviews", 0)}
+        bk = (round(f["lat"], 3), round(f["lon"], 3))   # ~110m grid
+        if bk not in seen_big:
+            seen_big.add(bk)
+            for p in big_venues_near(f["lat"], f["lon"]):
+                pid = p.get("place_id") or p["name"]
+                if pid and pid not in pool:
+                    pool[pid] = p
+    return pool
+
+
+def motion(span):
+    """Path, speed and straightness for one run of fixes."""
+    path = sum(meters((span[i - 1]["lat"], span[i - 1]["lon"]),
+                      (span[i]["lat"], span[i]["lon"])) for i in range(1, len(span)))
+    mins = (span[-1]["t"] - span[0]["t"]).total_seconds() / 60
+    kmh = (path / 1000) / (mins / 60) if mins > 0 else 0.0
+    net = meters((span[0]["lat"], span[0]["lon"]), (span[-1]["lat"], span[-1]["lon"]))
+    # How far he ranged from his own centre — the segment's real extent, which is
+    # what a candidate place's distance has to be judged against.
+    clat = sum(f["lat"] for f in span) / len(span)
+    clon = sum(f["lon"] for f in span) / len(span)
+    extent = max(meters((clat, clon), (f["lat"], f["lon"])) for f in span)
+    return {"path_m": path, "kmh": kmh, "extent_m": extent,
+            "straightness": (net / path) if path > 1 else 0.0,
+            "mode": ("sitting" if kmh < SIT_KMH else
+                     "browsing" if kmh < BROWSE_KMH else
+                     "walking" if kmh < WALK_KMH else "vehicle")}
+
+
+def runs_for_place(p, fixes):
+    """Maximal spans of consecutive contained fixes, tolerating brief excursions
+    (a fix at the edge of a park is still the park) but never a long silence."""
+    # A polygon is judged by containment (with a small pad for GPS error at the
+    # boundary); a point still needs a type-scaled radius. A known place has both.
+    dist = [place_distance(p, f["lat"], f["lon"]) for f in fixes]
+    inside = [contains_fix(p, f["lat"], f["lon"]) for f in fixes]
+    out, i = [], 0
+    while i < len(fixes):
+        if not inside[i]:
+            i += 1
+            continue
+        j = i
+        last_in = i
+        while j + 1 < len(fixes):
+            gap = (fixes[j + 1]["t"] - fixes[j]["t"]).total_seconds() / 60
+            if gap > MAX_GAP_MIN:
+                break
+            # allow one stray outside fix, but stop on two in a row
+            if not inside[j + 1] and (j + 2 >= len(fixes) or not inside[j + 2]):
+                break
+            j += 1
+            if inside[j]:
+                last_in = j
+        span_fixes = fixes[i:last_in + 1]
+        mins = (span_fixes[-1]["t"] - span_fixes[0]["t"]).total_seconds() / 60
+        n_in = sum(1 for k in range(i, last_in + 1) if inside[k])
+        m = motion(span_fixes) if len(span_fixes) > 1 else {
+            "path_m": 0.0, "kmh": 0.0, "extent_m": 0.0, "straightness": 0.0, "mode": "sitting"}
+        # Walking straight through is not being somewhere.
+        through = (m["kmh"] >= BROWSE_KMH and m["straightness"] >= THROUGH_STRAIGHTNESS)
+        # RANGING BEYOND A PIN IS NOT BEING AT IT. Browsing inside a POLYGON is
+        # exactly right — wandering a park is visiting the park. But a place
+        # with only a point has no interior to wander, so an extent larger than
+        # its own footprint means the user was moving AROUND it, not in it. Without
+        # this, the first leg of a Sunday evening walk (ranging 93m from
+        # a 60m lodging pin at 1.5km/h) was recorded as a 16-minute stop at
+        # home, which both invented a stop and swallowed the start of the walk.
+        ranged = (not p.get("polygon")) and m["extent_m"] > max(radius_for(p), SMALL_RADIUS_M)
+        if mins >= MIN_STOP_MIN and not through and not ranged \
+           and n_in / max(len(span_fixes), 1) >= MIN_CONTAINMENT:
+            out.append({"start": span_fixes[0]["t"], "end": span_fixes[-1]["t"],
+                        "minutes": mins, "n": len(span_fixes), "n_in": n_in, "place": p,
+                        "motion": m,
+                        # Mean of the CONTAINED fixes only — a stray at the edge
+                        # of the span is what dragged anchors before, which is
+                        # why visit-anchor exists at all.
+                        "centroid": (
+                            sum(f["lat"] for f, ok in zip(span_fixes, inside[i:last_in + 1]) if ok)
+                            / max(n_in, 1),
+                            sum(f["lon"] for f, ok in zip(span_fixes, inside[i:last_in + 1]) if ok)
+                            / max(n_in, 1)),
+                        "worst_m": max(dist[i:last_in + 1])})
+        i = last_in + 1
+    return out
+
+
+# A move worth reporting. Below these it is GPS jitter around a stationary
+# phone, or a walk to the corner that he will not recall and cannot use.
+MOVE_MIN_MIN = 5.0
+MOVE_MIN_PATH_M = 250.0
+# A leg is a RIDE only if it is both fast and long. Fast alone is jitter: a
+# stationary phone throws 200m bursts at 16-24 km/h.
+RIDE_KMH = 10.0
+RIDE_LEG_M = 500.0
+
+
+def move_runs(fixes, chosen, close=False):
+    """Every maximal run of fixes outside the chosen stops, split at silences.
+
+    The previous stop's last fix opens the run. With `close`, the next stop's
+    first fix ends it too: without it a run stops at the last fix OUTSIDE the
+    stop, which at five-minute cadence can be a kilometre short of the door
+    (the 2026-10-28 airport run ended 170 m out), and "began and ended at one
+    place" could not be asked of it. `turnaround_stops` asks; `moves_between`
+    keeps reporting moves exactly as before.
+    """
+    spans = sorted((r["start"], r["end"]) for r in chosen)
+
+    def in_stop(t):
+        return any(s <= t <= e for s, e in spans)
+
+    runs, cur = [], []
+    for f in fixes:
+        if in_stop(f["t"]):
+            if len(cur) >= 2:
+                runs.append(cur + [f] if close else cur)
+            cur = [f]          # the move begins where the stop ended
+        else:
+            cur.append(f)
+    if len(cur) >= 2:
+        runs.append(cur)
+
+    # SPLIT AT SILENCE, for the same reason a stop may not span one: what
+    # happened across an unobserved hour is unknown, and stitching over it
+    # invents a journey. On a day where nothing cleared the stop threshold this
+    # was not subtle — 2026-08-01 came back as ONE move from 00:33 to 22:58,
+    # "8.98 km, out and back", which describes a whole day as a single walk.
+    split = []
+    for run in runs:
+        piece = [run[0]]
+        for a, b in zip(run, run[1:]):
+            if (b["t"] - a["t"]).total_seconds() / 60 > MAX_GAP_MIN:
+                split.append(piece)
+                piece = [b]
+            else:
+                piece.append(b)
+        split.append(piece)
+    runs = [p for p in split if len(p) >= 2]
+    return runs
+
+
+def moves_between(fixes, chosen):
+    """The day BETWEEN the stops — because a day is not a list of places.
+
+    The question that built it: why was a long evening walk not registered?
+    It was in the data the whole time — 2.34km on 2026-08-09,
+    21:00-21:56, reaching 419m from home across 80 transit rows — but
+    `day-segments` is a stop finder by construction, so movement was the one
+    thing it could never report. A day that lists only where the user sat omits
+    the part most worth remembering.
+
+    A move is the complement of the stops: every maximal run of fixes not inside
+    one. The bracketing stop's last fix is kept as the move's first, so a walk
+    starts at the door it left rather than wherever the phone next reported.
+    """
+    runs = move_runs(fixes, chosen)
+
+    # SPLIT WALK-RIDE-WALK, because one averaged mode describes neither half.
+    # A move reported as `walking 6.3 km/h, 6.10 km` was in fact a subway ride.
+    # It was — 3.97km of it in 16.6 minutes
+    # at 14.4 km/h, with walks at both ends averaging the whole thing down to
+    # something no part of the trip actually did.
+    #
+    # A leg counts as a ride only if it is BOTH fast and long: the same day
+    # carries 1-minute, 200m bursts at 16-24 km/h that are plainly GPS jitter
+    # beside a stationary phone, and treating those as journeys would shred
+    # every walk into confetti.
+    legs = []
+    for run in runs:
+        piece, cls = [run[0]], None
+        for a, b in zip(run, run[1:]):
+            mins = (b["t"] - a["t"]).total_seconds() / 60
+            d = meters((a["lat"], a["lon"]), (b["lat"], b["lon"]))
+            kmh = (d / 1000) / (mins / 60) if mins > 0 else 0.0
+            c = "ride" if (kmh >= RIDE_KMH and d >= RIDE_LEG_M) else "foot"
+            if cls is not None and c != cls:
+                legs.append(piece)
+                piece = [a]
+            cls = c
+            piece.append(b)
+        legs.append(piece)
+    runs = [p for p in legs if len(p) >= 2]
+
+    def stop_named(t, before):
+        """Name a move's endpoint only if a stop is ACTUALLY adjacent to it.
+
+        Taking the nearest stop in either direction reads plausibly and lies:
+        once moves split at silences, several in a row fall between the same two
+        stops and every one of them was labelled `Jardin des Tuileries →
+        Land&Monkeys Beaubourg`, including a 13:49 move an hour after leaving
+        and a 18:47 one that evening. A move whose neighbours are unobserved has
+        no known endpoint, and should say so rather than borrow one.
+        """
+        for r in chosen:
+            if before and abs((r["end"] - t).total_seconds()) <= 1:
+                return r["place"]["name"]
+            if not before:
+                delta = (r["start"] - t).total_seconds() / 60
+                if 0 <= delta <= MAX_GAP_MIN:
+                    return r["place"]["name"]
+        return None
+
+    out = []
+    for span in runs:
+        mins = (span[-1]["t"] - span[0]["t"]).total_seconds() / 60
+        m = motion(span)
+        if mins < MOVE_MIN_MIN or m["path_m"] < MOVE_MIN_PATH_M:
+            continue
+        # SPEED OVER OBSERVED TIME ONLY. Averaging across a silence describes
+        # nobody's afternoon: a 4.03km journey containing an 80-minute gap came
+        # out at 1.0 km/h and was labelled `sitting`, which is both wrong and
+        # the exact opposite of what happened. Distance still counts every step
+        # (it is a lower bound on ground covered); the RATE counts only the
+        # intervals we actually watched.
+        obs_m = obs_s = 0.0
+        for i in range(1, len(span)):
+            gap = (span[i]["t"] - span[i - 1]["t"]).total_seconds()
+            if gap / 60 > MAX_GAP_MIN:
+                continue
+            obs_m += meters((span[i - 1]["lat"], span[i - 1]["lon"]),
+                            (span[i]["lat"], span[i]["lon"]))
+            obs_s += gap
+        kmh = (obs_m / 1000) / (obs_s / 3600) if obs_s > 60 else m["kmh"]
+        m = {**m, "kmh": kmh,
+             "mode": ("sitting" if kmh < SIT_KMH else
+                      "browsing" if kmh < BROWSE_KMH else
+                      "walking" if kmh < WALK_KMH else "vehicle")}
+        # A move that ends where it began is an outing, not a journey — worth
+        # saying so, because "walk from home and back" is what he actually did.
+        origin = (span[0]["lat"], span[0]["lon"])
+        far = max(meters(origin, (f["lat"], f["lon"])) for f in span)
+        home_again = meters(origin, (span[-1]["lat"], span[-1]["lon"])) < 120.0
+        frm = stop_named(span[0]["t"], True)
+        to = stop_named(span[-1]["t"], False)
+        gap = max(((span[i + 1]["t"] - span[i]["t"]).total_seconds() / 60
+                   for i in range(len(span) - 1)), default=0.0)
+        out.append({"start": span[0]["t"], "end": span[-1]["t"], "minutes": mins,
+                    "motion": m, "n": len(span), "loop": home_again,
+                    "farthest_m": far, "from": frm, "to": to, "max_gap_min": gap})
+    return out
+
+
+# THE TURNAROUND OF A DRIVE. Driving to a place and returning without a stop
+# makes that turning-around point a destination worth asking about, when the
+# purpose of the drive is not already known.
+#
+# The case: an airport drop-off run. The phone logged a fix every five
+# minutes, every one tagged `driving`, and never rested, so the whole trip was
+# one out-and-back move and the airport was nowhere in the day until the user
+# asked why. It was the third such run saved by hand.
+#
+# A stop here is CONTAINMENT, not stillness, and a drive you turn around on has
+# a far end that is a place by construction: nobody drives 15 km to come back
+# without having been somewhere. So a vehicle run that starts and ends at one
+# spot gets a stop at its far point — the fixes that stayed near it — written
+# as a visit row the question can attach to. Whether the PURPOSE is already
+# known (the user's calendar, what the user said in chat) is judged downstream, where those
+# are read: bin/stop-passage runs the calendar and evidence checks on the row
+# and names it instead of asking.
+TURNAROUND_TOKEN = "[turnaround]"   # in the row's notes; stop-passage, stop-identify, resolve-day read it
+# A run ends this near where it began: an out-and-back. Wide because a phone
+# asleep at home leaves no fix there, so the run's first fix is the first one
+# after the silence, already down the road: 792 m out on the 2026-10-16 airport
+# run, with five-minute cadence making a kilometre ordinary. The far point has to
+# be at least twice that out, so the slack can never turn a one-way hop into a loop.
+TURN_CLOSE_M = 1500.0
+TURN_MIN_AWAY_M = 3000.0  # a drive, not a walk to the corner (day-excursions owns walks)
+# Fixes this near the farthest point are "at" the destination. Wide on purpose:
+# at 5-minute cadence a car covers 5 km between fixes, and the airport run's
+# own fixes sat 0.9, 1.5 and 2.7 km from its farthest one — the terminal 2 km
+# from where the phone happened to be furthest out.
+TURN_RADIUS_M = 3000.0
+# findme resolve refuses to name a visit shorter than this, so a turnaround
+# shorter than it could be asked about and never answered.
+TURN_MIN_DWELL_MIN = 8.0
+TURN_NAME = "Far end of a drive out and back"
+
+
+def turnaround_stops(fixes, chosen):
+    """Stops at the far end of vehicle runs that came back to where they began.
+
+    Pure geometry: a run from move_runs that opens and closes within
+    TURN_CLOSE_M, includes a ride leg, and reaches TURN_MIN_AWAY_M. The window
+    is first-to-last fix within TURN_RADIUS_M of its farthest point and must
+    last TURN_MIN_DWELL_MIN. A silence of MAX_GAP_MIN or more splits a run, so a
+    phone that went quiet mid-trip yields nothing rather than a guess.
+    """
+    out = []
+    for run in move_runs(fixes, chosen, close=True):
+        origin = (run[0]["lat"], run[0]["lon"])
+        if meters(origin, (run[-1]["lat"], run[-1]["lon"])) > TURN_CLOSE_M:
+            continue
+        rides = any(
+            meters((a["lat"], a["lon"]), (b["lat"], b["lon"])) >= RIDE_LEG_M
+            and (meters((a["lat"], a["lon"]), (b["lat"], b["lon"])) / 1000)
+            / max((b["t"] - a["t"]).total_seconds() / 3600, 1e-9) >= RIDE_KMH
+            for a, b in zip(run, run[1:]))
+        if not rides:
+            continue
+        apex = max(run, key=lambda f: meters(origin, (f["lat"], f["lon"])))
+        away = meters(origin, (apex["lat"], apex["lon"]))
+        if away < TURN_MIN_AWAY_M:
+            continue
+        near = [f for f in run if meters((apex["lat"], apex["lon"]), (f["lat"], f["lon"])) <= TURN_RADIUS_M]
+        start, end = near[0]["t"], near[-1]["t"]
+        mins = (end - start).total_seconds() / 60
+        if mins < TURN_MIN_DWELL_MIN:
+            continue
+        span = [f for f in run if start <= f["t"] <= end]
+        clat = sum(f["lat"] for f in span) / len(span)
+        clon = sum(f["lon"] for f in span) / len(span)
+        out.append({"start": start, "end": end, "minutes": mins, "n": len(span), "n_in": len(near),
+                    "place": {"name": TURN_NAME, "_rung": "turnaround", "type_display": "turnaround"},
+                    "motion": motion(span), "centroid": (clat, clon),
+                    "worst_m": max(meters((clat, clon), (f["lat"], f["lon"])) for f in span),
+                    "turnaround": True, "away_m": away})
+    return out
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("date")
+    ap.add_argument("--tz", default="UTC")
+    ap.add_argument("--json", action="store_true")
+    ap.add_argument("--google", action="store_true",
+                    help="also query Google Places (billed) for what OSM lacks")
+    ap.add_argument("--plan", action="store_true",
+                    help="show what writing these segments back would do")
+    ap.add_argument("--write", action="store_true",
+                    help="write segments back to location_history (implies --plan)")
+    a = ap.parse_args()
+    tz = ZoneInfo(a.tz)
+    d0 = datetime.strptime(a.date, "%Y-%m-%d").replace(tzinfo=tz)
+    d1 = d0 + timedelta(days=1)
+    rows = get("location_history?"
+               f"arrived_at=gte.{urllib.parse.quote(d0.astimezone(timezone.utc).isoformat())}"
+               f"&arrived_at=lt.{urllib.parse.quote(d1.astimezone(timezone.utc).isoformat())}"
+               "&select=latitude,longitude,accuracy_m,arrived_at&order=arrived_at.asc&limit=5000")
+    seen, fixes = set(), []
+    for r in rows:
+        if r.get("accuracy_m") is None or r["accuracy_m"] >= ACC_MAX_M:
+            continue
+        t = datetime.fromisoformat(r["arrived_at"].replace("Z", "+00:00"))
+        k = (t, round(r["latitude"], 6), round(r["longitude"], 6))
+        if k in seen:
+            continue
+        seen.add(k)
+        fixes.append({"t": t, "lat": r["latitude"], "lon": r["longitude"]})
+
+    # THE LADDER. Confirmed → lodging → saved → OSM, and Google only if asked:
+    # it is billed per field and cannot sell a footprint at any price, so it is
+    # a fallback for what OSM has not mapped, not the default source.
+    pool = osm_pool(fixes)
+    known = adopt_footprints(known_places(fixes, d0.date()), pool)
+    if a.google:
+        for pid, p in build_pool(fixes).items():
+            p["_rung"] = "google"
+            pool.setdefault(f"g/{pid}", p)
+    cands = []
+    for p in list(pool.values()) + known:
+        cands.extend(runs_for_place(p, fixes))
+
+    # Resolve overlaps. CONTAINMENT IS THE PRIMARY KEY, and getting that wrong is
+    # what produced a day named entirely after art galleries: ranking by category
+    # first let a place that barely reached the window ("within 339m") beat one
+    # that held it tightly, even though tight containment is the entire premise
+    # of the model. Fit is measured against the place's OWN footprint so a
+    # monument and a shopfront compare fairly, and banded so GPS noise does not
+    # reorder two places that both plainly contain the run.
+    def fit(r):
+        # Judged against how far he ACTUALLY ranged, not just the place's type.
+        # Sitting still for 20 minutes within a 20m scatter cannot be a monument
+        # 170m away, however large that monument's footprint is — and wandering
+        # 200m inside a park makes a 170m-distant pin entirely reasonable. Using
+        # the segment's own extent is what stopped every window being won by
+        # whichever big-footprint place merely overlapped it.
+        allow = max(SMALL_RADIUS_M, r["motion"]["extent_m"] + 40.0)
+        return r["worst_m"] / allow
+    # Rung first, then fit, then category — and that ORDER is load-bearing twice
+    # over. Rung leads because a name he confirmed here beats any guess from a
+    # map, however tidily the map's guess fits. But category stays BELOW fit, so
+    # that among map candidates the old failure cannot return: ranking category
+    # first is what let a place that barely reached the window beat one that
+    # held it tightly, and named a whole day after art galleries.
+    cands.sort(key=lambda r: (rung_rank(r["place"]), round(fit(r), 1),
+                              prior(r["place"]), -r["minutes"]))
+    chosen = []
+    for r in cands:
+        if any(r["start"] < c["end"] and c["start"] < r["end"] for c in chosen):
+            continue
+        chosen.append(r)
+    chosen.sort(key=lambda r: r["start"])
+    # A drive he turned around on has a destination; see turnaround_stops. Added
+    # after the overlap pass so no named place can lose its window to one, and
+    # before moves_between so the loop is reported as the two legs either side.
+    chosen = sorted(chosen + turnaround_stops(fixes, chosen), key=lambda r: r["start"])
+
+    out = [{"from": r["start"].astimezone(tz).strftime("%H:%M"),
+            "to": r["end"].astimezone(tz).strftime("%H:%M"),
+            "minutes": round(r["minutes"], 1), "place": r["place"]["name"],
+            "type": r["place"].get("type_display") or r["place"].get("primary_type") or "",
+            "fixes": f"{r['n_in']}/{r['n']}", "within_m": round(r["worst_m"]),
+            "kmh": round(r["motion"]["kmh"], 1), "mode": r["motion"]["mode"],
+            "extent_m": round(r["motion"]["extent_m"]),
+            "rung": r["place"].get("_rung", "google")}
+           for r in chosen]
+
+    moves = moves_between(fixes, chosen)
+    for mv in moves:
+        where = ("out and back" if mv["loop"]
+                 else " → ".join(x for x in (mv["from"], mv["to"]) if x) or "moving")
+        out.append({"kind": "move", "from": mv["start"].astimezone(tz).strftime("%H:%M"),
+                    "to": mv["end"].astimezone(tz).strftime("%H:%M"),
+                    "minutes": round(mv["minutes"], 1), "place": where,
+                    "km": round(mv["motion"]["path_m"] / 1000, 2),
+                    "farthest_m": round(mv["farthest_m"]),
+                    "kmh": round(mv["motion"]["kmh"], 1),
+                    "mode": mv["motion"]["mode"], "max_gap_min": round(mv["max_gap_min"])})
+    for o in out:
+        o.setdefault("kind", "stop")
+    out.sort(key=lambda o: o["from"])
+    if a.json:
+        print(json.dumps(out, indent=2, ensure_ascii=False))
+        return
+    print(f"pool: {len(pool)} places, {len(fixes)} fixes\n")
+    for r in out:
+        if r["kind"] == "move":
+            gap = f"  [{r['max_gap_min']}m unobserved]" if r["max_gap_min"] > MAX_GAP_MIN else ""
+            print(f"{r['from']}-{r['to']}  {r['minutes']:>5.1f}m  {'':>6}  "
+                  f"{r['mode']:<8} {r['kmh']:>4.1f}km/h  {r['km']:>5.2f} km  "
+                  f"({r['place']}){gap}")
+        else:
+            print(f"{r['from']}-{r['to']}  {r['minutes']:>5.1f}m  {r['fixes']:>6}  "
+                  f"{r['mode']:<8} {r['kmh']:>4.1f}km/h ext={r['extent_m']:>3}m  "
+                  f"{r['place']}  [{r['rung']}] (within {r['within_m']}m · {r['type']})")
+    n_stop = sum(1 for r in out if r["kind"] == "stop")
+    mv = [r for r in out if r["kind"] == "move"]
+    # DISTANCE TRAVELLED, deliberately not "walked". Splitting foot from riding
+    # would need the mode classifier to be trustworthy and it is not — 7.4 km/h,
+    # a brisk walk, already lands in `vehicle` — so the honest total is the one
+    # that makes no claim about how he covered the ground.
+    km = sum(r["km"] for r in mv)
+    unobs = sum(r["max_gap_min"] for r in mv if r["max_gap_min"] > MAX_GAP_MIN)
+    line = f"\n{n_stop} stop(s), {len(mv)} move(s), {km:.1f} km travelled"
+    # Always a LOWER BOUND, and worth saying so rather than implying a pedometer:
+    # the path is straight lines between sparse fixes, so every corner is cut,
+    # and time nobody observed can hide an arbitrary detour.
+    line += f" — lower bound; {round(unobs)} min unobserved" if unobs else " — lower bound"
+    print(line)
+    if a.plan or a.write:
+        reconcile(chosen, tz, a.write)
+
+
+if __name__ == "__main__":
+    main()

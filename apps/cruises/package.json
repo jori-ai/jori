@@ -1,0 +1,27 @@
+{
+  "name": "cruises-site",
+  "version": "1.0.0",
+  "private": true,
+  "description": "The cruise site — authenticated browser for the full cruise_sailings corpus (filter/search/sort). The weekly cruise-watch email carries only significant price drops; this is where the whole list lives.",
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start"
+  },
+  "dependencies": {
+    "@supabase/ssr": "^0.5.2",
+    "@supabase/supabase-js": "^2.45.4",
+    "next": "^15.5.28",
+    "react": "19.0.0",
+    "react-dom": "19.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "typescript": "^5.7.0"
+  },
+  "overrides": {
+    "postcss": "^8.5.23"
+  }
+}

@@ -1,0 +1,76 @@
+#!/usr/bin/env node
+"use strict";
+// trip-reservoir-publish — reconcile every reservoir VIEW from the single source
+// of truth (Supabase `trip_reservoirs.structured`). For each area it pulls the
+// canonical structured reservoir from Supabase and regenerates all views:
+//   - the travel site fragment (`area_html`, written back to Supabase),
+//   - the wiki page `trip_reservoir_<area>` (a mirror of the same data),
+//   - the local JSON read-through cache the itinerary builder uses.
+//
+// Normal builds already do this in one step (trip-reservoir-build -> saveReservoir).
+// Run this when you change a renderer, or to force the wiki/site to re-mirror the
+// current Supabase data.
+//
+// --refine additionally re-runs pass 2 (dedup) and pass 3 (clusters + numbering)
+// over the stored reservoir before re-rendering. That's the BACKFILL path: areas
+// built before those passes existed have no clusters, no seq and no dont_miss,
+// and re-researching them would cost a full model fork each. Refining reuses the
+// research already on disk; the only model call is the bounded fuzzy-dedup
+// resolver, which --no-resolve skips entirely.
+//
+// Usage:
+//   trip-reservoir-publish                     # resync every area in Supabase
+//   trip-reservoir-publish --area <area>
+//   trip-reservoir-publish --dry-run           # list what would resync, no writes
+//   trip-reservoir-publish --refine            # backfill dedup + clusters, then resync
+//   trip-reservoir-publish --refine --no-resolve --dry-run   # offline preview
+
+const path = require("node:path");
+const ws = require(path.join(__dirname, "..", "lib", "wiki-store.js"));
+const { pullReservoir, saveReservoir, listAreas } = require(path.join(__dirname, "..", "lib", "reservoir-store.js"));
+const { refinePasses, resolveFuzzy } = require(path.join(__dirname, "..", "lib", "reservoir-refine.js"));
+
+const argv = process.argv.slice(2);
+const DRY = argv.includes("--dry-run");
+const REFINE = argv.includes("--refine");
+const NO_RESOLVE = argv.includes("--no-resolve");
+const areaArg = (() => {
+  const i = argv.indexOf("--area");
+  return i >= 0 ? argv[i + 1] : null;
+})();
+
+(async () => {
+  const areas = areaArg ? [areaArg] : await listAreas();
+  if (!areas.length) {
+    console.error("no reservoirs found in Supabase (trip_reservoirs is empty)");
+    process.exit(1);
+  }
+  const done = [];
+  for (const area of areas) {
+    const reservoir = await pullReservoir(area); // Supabase -> structured (+ refresh cache)
+    if (!reservoir) {
+      console.error(`skip ${area} — no structured reservoir in Supabase`);
+      continue;
+    }
+    const total = Object.values(reservoir.buckets || {}).reduce((a, b) => a + (Array.isArray(b) ? b.length : 0), 0);
+    if (REFINE) {
+      // Same two passes a fresh build runs, from lib/reservoir-refine.js,
+      // so a backfilled area is indistinguishable from a rebuilt one.
+      refinePasses(reservoir, {
+        resolve: NO_RESOLVE || DRY ? null : resolveFuzzy,
+        log: (m) => console.log(`   ${area}: ${m}`),
+      });
+    }
+    if (DRY) {
+      console.log(`[dry-run] ${area} (${reservoir.label}) — ${total} items would re-render (site + wiki + cache)`);
+      done.push(area);
+      continue;
+    }
+    await saveReservoir(area, reservoir, {
+      wikiSave: (id, body) => ws.savePage(id, body, { editedBy: "trip-reservoir-publish" }),
+    });
+    console.log(`resynced ${area} (${reservoir.label}) — ${total} items → site + wiki + cache`);
+    done.push(area);
+  }
+  console.log(`\n${DRY ? "would resync" : "resynced"} ${done.length} reservoir(s): ${done.join(", ")}`);
+})().catch((e) => { console.error(e.message); process.exit(1); });

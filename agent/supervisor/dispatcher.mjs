@@ -3,7 +3,7 @@
 // Each enqueued message gets {id, source, content, enqueuedAt}.
 
 import { EventEmitter } from "node:events";
-import { randomUUID } from "node:crypto";
+import { randomUUID, createHash } from "node:crypto";
 import { isPhantomResult } from "../lib/phantom-result.mjs";
 import { recordAttempt, reclassifyMessageId, WINDOW_MS as ATTEMPT_WINDOW_MS } from "../../lib/dispatch-attempts.mjs";
 import { createRequire } from "node:module";
@@ -177,6 +177,18 @@ export class Dispatcher extends EventEmitter {
     // NOT at enqueue, so the stored item.content stays clean — dedup keys,
     // persistence, and event-log records are unaffected. Default: no preamble.
     this.preamble = options.preamble || (() => null);
+    // Repeat-playbook dedupe (opt-in: `repeatMinChars` > 0). A job's playbook
+    // is dispatched in full every time (the hum one is ~85 KB, ~21k tokens, and
+    // runs ~60 times a day), and on a long-lived session every copy stays in
+    // the context: two hums filled ops-light's working window and forced a
+    // rotation, a full cache rewrite, every 20-40 minutes. When a dispatch's
+    // content is BYTE-IDENTICAL to one already sent to THIS session, a short
+    // pointer to the earlier copy is sent instead. A Dispatcher lives exactly as
+    // long as its session (startSession builds a new one), so a new session or
+    // a rotation always gets the full text; forgetSent() (on /compact and on the
+    // CLI's own compact_boundary) clears it once the earlier copy may be gone.
+    this.repeatMinChars = options.repeatMinChars || 0;
+    this._sent = new Map();   // sha1(content) -> { id, source, at }
     this.queue = [];
     this.inFlight = null;
     this.completed = 0;
@@ -392,6 +404,27 @@ export class Dispatcher extends EventEmitter {
     return true;
   }
 
+  /** The pointer to send instead of `item.content`, when this session already has that exact text; else null. */
+  _repeatOf(item) {
+    const c = item.content;
+    if (!(this.repeatMinChars > 0) || typeof c !== "string" || c.length < this.repeatMinChars) return null;
+    const prev = this._sent.get(createHash("sha1").update(c).digest("hex"));
+    if (!prev) return null;
+    const at = new Date(prev.at).toISOString().slice(11, 16);
+    const pointer = `Run the \`${item.source}\` job again now. Its instructions are the exact text dispatched earlier in this session (dispatch ${String(prev.id).slice(0, 6)}, ${at} UTC), unchanged byte for byte, so they are not repeated here to save context. Follow them end-to-end as a fresh run: re-read every live source and state file, and do not reuse an earlier run's findings, rankings or decisions.`;
+    return { pointer, of: prev.id };
+  }
+
+  _rememberSent(item) {
+    const c = item.content;
+    if (!(this.repeatMinChars > 0) || typeof c !== "string" || c.length < this.repeatMinChars) return;
+    const h = createHash("sha1").update(c).digest("hex");
+    if (!this._sent.has(h)) this._sent.set(h, { id: item.id, source: item.source, at: Date.now() });
+  }
+
+  /** Forget what this session was sent: after a compaction the earlier copies may be gone. */
+  forgetSent() { this._sent.clear(); }
+
   _drain() {
     if (this.inFlight) return;
     if (this.paused) return;
@@ -405,11 +438,16 @@ export class Dispatcher extends EventEmitter {
       // Prepend the live-state preamble at send time only (item.content stays
       // clean). Fail-soft: a throwing/empty preamble sends the bare content.
       let content = next.content;
+      if (typeof content === "string" && content.startsWith("/compact")) this.forgetSent();
+      const repeat = this._repeatOf(next);
+      if (repeat) content = repeat.pointer;
       try {
         const pre = this.preamble(next);
         if (pre) content = pre + content;
       } catch { /* preamble is best-effort — never block a dispatch */ }
       this.session.send(content);
+      if (repeat) this.emit("repeat_pointer", { item: next, of: repeat.of, savedChars: next.content.length - repeat.pointer.length });
+      else this._rememberSent(next);
     } catch (err) {
       // Session went away between shift() and send(). Put the item back at
       // the head so it isn't lost — the supervisor's exit handler will

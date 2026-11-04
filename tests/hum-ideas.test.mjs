@@ -5,7 +5,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, writeFileSync, readFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -44,6 +44,23 @@ test("manualScope: manual_user by default, manual_<owner_id> per installation", 
   assert.equal(scopeWith(null), "manual_user ask_in_chat ask_in_chat");
   assert.equal(scopeWith({ owner_name: "Alex" }), "manual_alex ask_in_chat none");
   assert.equal(scopeWith({ owner_name: "Alex", owner_id: "legacy" }), "manual_legacy ask_in_chat none");
+});
+
+// The autonomous scope is jori_autonomous; an installation whose ledger holds
+// an older spelling adds it with extend_autonomous_scopes and those ideas keep
+// their lane.
+test("autonomousScopes: jori_autonomous, plus an installation's older spelling", () => {
+  const routesWith = (cfg) => {
+    const dir = mkdtempSync(join(tmpdir(), "hum-ideas-auto-"));
+    if (cfg) { mkdirSync(join(dir, "config")); writeFileSync(join(dir, "config", "hum-ideas.json"), JSON.stringify(cfg)); }
+    const env = { ...process.env, JORI_LOCAL_DIR: dir };
+    const lib = new URL("../lib/hum-ideas.mjs", import.meta.url).href;
+    const r = spawnSync(process.execPath, ["--input-type=module", "-e",
+      `const m = await import(${JSON.stringify(lib)}); const q = { status: "proposed", effort: "quick", risk: "low" }; process.stdout.write(m.routeFor({ ...q, scope: "jori_autonomous" }) + " " + m.routeFor({ ...q, scope: "old_autonomous" }));`], { env, encoding: "utf8" });
+    return r.stdout;
+  };
+  assert.equal(routesWith(null), "build_auto none");
+  assert.equal(routesWith({ extend_autonomous_scopes: ["old_autonomous"] }), "build_auto build_auto");
 });
 
 const NOW = Date.parse("2026-10-10T12:00:00Z");
