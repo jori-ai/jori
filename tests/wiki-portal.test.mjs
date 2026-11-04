@@ -32,6 +32,7 @@ process.env.MEMORY_INDEX_DIR = path.join(dir, "memory");
 process.env.MEMORY_INDEX_DB = path.join(dir, "memory-index.db");
 process.env.MEMORY_DB_AUTHORITATIVE = "1";
 process.env.OLLAMA_URL = "http://127.0.0.1:9";
+process.env.LOCAL_LLM_BACKEND = "ollama"; // the fake/dead Ollama is the cheap rung under test, not a real Haiku fork
 process.env.WIKI_ACCESS_LOG = path.join(dir, "access.jsonl");
 process.env.AUTO_RECALL_JUDGE_LOG = path.join(dir, "judge.jsonl");
 process.env.WIKI_PORTAL_FILE = path.join(dir, "portal.json");

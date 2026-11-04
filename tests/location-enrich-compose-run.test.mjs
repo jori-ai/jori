@@ -64,7 +64,7 @@ test("queues the local rung's valid ask, templates identify, and leaves the inva
   ] });
   const srv = await fakeOllama(`Sure! ${reply}`);
   try {
-    const s = await run({ JORI_HOME: home, GOG_BIN: gog, OLLAMA_URL: `http://127.0.0.1:${srv.address().port}` });
+    const s = await run({ JORI_HOME: home, GOG_BIN: gog, OLLAMA_URL: `http://127.0.0.1:${srv.address().port}`, LOCAL_LLM_BACKEND: "ollama" });
     assert.equal(s.residue, 1);
     assert.deepEqual(s.residue_visits.map((r) => r.visit_id), ["v2"]);
     const q = JSON.parse(fs.readFileSync(path.join(data, "location-ask-queue.json"), "utf8")).queue;
@@ -78,7 +78,7 @@ test("a calendar event in the window sends the stop to the agent untouched", asy
   const { home, data, gog } = setup({ events: [{ summary: "Show", start: { dateTime: "2099-02-04T16:30:00Z" }, end: { dateTime: "2099-02-04T18:00:00Z" } }] });
   const srv = await fakeOllama("{}");
   try {
-    const s = await run({ JORI_HOME: home, GOG_BIN: gog, OLLAMA_URL: `http://127.0.0.1:${srv.address().port}` });
+    const s = await run({ JORI_HOME: home, GOG_BIN: gog, OLLAMA_URL: `http://127.0.0.1:${srv.address().port}`, LOCAL_LLM_BACKEND: "ollama" });
     assert.equal(s.residue, 3);
     assert.equal(fs.existsSync(path.join(data, "location-ask-queue.json")), false);
   } finally { srv.close(); }
@@ -86,6 +86,6 @@ test("a calendar event in the window sends the stop to the agent untouched", asy
 
 test("a failed calendar lookup fails open to the agent", async () => {
   const { home } = setup();
-  const s = await run({ JORI_HOME: home, GOG_BIN: "/nonexistent/gog", OLLAMA_URL: "http://127.0.0.1:9" });
+  const s = await run({ JORI_HOME: home, GOG_BIN: "/nonexistent/gog", OLLAMA_URL: "http://127.0.0.1:9", LOCAL_LLM_BACKEND: "ollama" });
   assert.equal(s.residue, 3);
 });

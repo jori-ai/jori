@@ -79,7 +79,11 @@ test("models.env stays plain KEY=value — sourceable by zsh and bash without ex
     if (!l || l.startsWith("#")) continue;
     assert.ok(/^[A-Z_]+=[a-z0-9.-]+$/.test(l), `not a plain KEY=value line: ${l}`);
   }
-  assert.deepEqual(Object.keys(parseModelsEnv(text)).sort(), ["JORI_MODEL_OPUS", "JORI_MODEL_SONNET"]);
+  assert.deepEqual(Object.keys(parseModelsEnv(text)).sort(), ["JORI_MODEL_HAIKU", "JORI_MODEL_OPUS", "JORI_MODEL_SONNET"]);
+});
+
+test("the ladder's first rung (localLlmChat) is on Haiku 5.5", () => {
+  assert.equal(MODELS.haiku, "claude-haiku-5-5");
 });
 
 // Every site that used to carry its own Opus id. Comment lines are ignored —

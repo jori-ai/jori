@@ -2972,8 +2972,37 @@ def cmd_pending(args, as_json=False):
             print(f"  {i}. {c['name']}{rating}{reviews} — {c['type']} · {c['distance_m']}m")
         print()
 
+def _haiku_toolless(prompt, timeout=30):
+    """One tool-less Claude Haiku judgment on the Max session — the same flags
+    as lib/jev-claude.mjs toollessArgs (no tools, no MCP, no user settings, no
+    session file) with ANTHROPIC_API_KEY/AUTH_TOKEN stripped (Auth Model: Max
+    only). Replaced the direct gemma3:1b Ollama call on 2026-11-04 (see
+    lib/local-llm.mjs). Raises on any failure; from cron/SSH the Max login is
+    unreadable, the fork prints "Not logged in", and the caller fails open."""
+    import subprocess, tempfile
+    model = "claude-haiku-5-5"
+    try:
+        env_file = os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "agent", "config", "models.env")
+        for line in open(env_file, encoding="utf-8"):
+            if line.strip().startswith("JORI_MODEL_HAIKU="):
+                model = line.split("=", 1)[1].strip()
+    except OSError:
+        pass
+    env = {k: v for k, v in os.environ.items() if k not in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN")}
+    r = subprocess.run(
+        [os.path.expanduser("~/.local/bin/claude"), "-p", "--model", model, "--effort", "low",
+         "--tools", "", "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}',
+         "--setting-sources", "project", "--no-session-persistence", "--output-format", "text"],
+        input=prompt, capture_output=True, text=True, timeout=timeout, env=env, cwd=tempfile.gettempdir(),
+    )
+    out = (r.stdout or "").strip()
+    if r.returncode != 0 or not out or out.startswith("Not logged in"):
+        raise RuntimeError(f"haiku fork failed rc={r.returncode}: {out[:80]}")
+    return out
+
+
 def _local_llm_phrase_area(geo):
-    """Ask the local model (gemma3:1b via Ollama) to phrase a short
+    """Ask the cheap model (Claude Haiku, _haiku_toolless) to phrase a short
     location-context clause from reverse-geocoded address parts.
 
     Code owns the geometry (lat/lon -> structured address via Nominatim,
@@ -2981,7 +3010,7 @@ def _local_llm_phrase_area(geo):
     language decision, so a model makes it, per Rule 0b ("code owns
     geometry, a model owns language") — deciding how to phrase "near X" vs
     "in Y" from raw address components is exactly the kind of judgment call
-    that must not be a hardcoded string join. Runs local/free, tight
+    that must not be a hardcoded string join. Bounded
     timeout, and fails open to "" (caller falls back to a plain join) on
     any error — never blocks composing the ask.
     """
@@ -2991,32 +3020,16 @@ def _local_llm_phrase_area(geo):
              if k in ("address", "neighbourhood", "city", "state", "country") and v}
     if not parts:
         return ""
+    system = (
+        "You phrase a short location-context clause for a sentence shaped "
+        "like '<time> <clause> — which of these was it?'. Given structured "
+        "address parts as JSON, reply with ONLY a short lowercase clause "
+        "starting with 'near' or 'in' (e.g. 'near Rue des Arquebusiers, "
+        "Paris' or 'in the 11th arrondissement'). One line, no punctuation "
+        "at the end, no extra words, no explanation."
+    )
     try:
-        req = urllib.request.Request(
-            "http://127.0.0.1:11434/api/chat",
-            data=json.dumps({
-                "model": "gemma3:1b",
-                "stream": False,
-                "keep_alive": "15m",
-                "think": False,
-                "messages": [
-                    {"role": "system", "content": (
-                        "You phrase a short location-context clause for a sentence shaped "
-                        "like '<time> <clause> — which of these was it?'. Given structured "
-                        "address parts as JSON, reply with ONLY a short lowercase clause "
-                        "starting with 'near' or 'in' (e.g. 'near Rue des Arquebusiers, "
-                        "Paris' or 'in the 11th arrondissement'). One line, no punctuation "
-                        "at the end, no extra words, no explanation."
-                    )},
-                    {"role": "user", "content": json.dumps(parts)},
-                ],
-                "options": {"num_predict": 40, "temperature": 0.3},
-            }).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
-        )
-        with urllib.request.urlopen(req, timeout=5) as resp:
-            data = json.loads(resp.read())
-        phrase = ((data.get("message") or {}).get("content") or "").strip()
+        phrase = _haiku_toolless(system + "\n\n" + json.dumps(parts), timeout=30)
     except Exception:
         return ""
     # Guard rails on the model's own output — same spirit as the phone-channel
