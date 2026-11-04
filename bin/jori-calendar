@@ -365,7 +365,11 @@ if (cmd === "create" && bookingRef) {
 // because a single read call hiccuped would be a worse regression than the bug
 // this fixes. Only the irreversible-harm guard (inviting a third party) fails
 // closed in this file.
-if (cmd === "create") {
+// A create that is itself FREE (transparent) is never a double-booking either:
+// an awareness event such as a delivery's arrival window (email-triage-rules.md
+// § Shipping) is allowed to sit on top of a busy meeting (2026-11-04).
+const createIsFree = ["transparent", "free"].includes(String(peekFlag("--transparency") || "").toLowerCase());
+if (cmd === "create" && !createIsFree) {
   const from = peekFlag("--from");
   const to = peekFlag("--to");
   if (from && to) {

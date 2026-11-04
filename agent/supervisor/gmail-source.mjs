@@ -343,6 +343,11 @@ async function runIntakeCascade(messageId, fromHeader, subject, toJori = false) 
 const BOOKING_CHECK_TIMEOUT_MS = 60000;
 // = lib/message-alert.mjs BOOKING_RULES_SLUG (tests/message-alert.test.mjs holds them equal).
 const BOOKING_RULES_SLUG = "bookings-and-appointments-always-on-the-calendar";
+// A `delivery` answer (a package coming to the user, any carrier or seller) is
+// withheld the same way and dispatched with the `delivery` stamp instead; its
+// rules are the shipping section (= lib/message-alert.mjs SHIPPING_RULES_SLUG).
+const SHIPPING_RULES_SLUG = "shipping-delivery-notifications-carrier-agnostic";
+const isDelivery = (b) => b?.kind === "delivery";
 async function intakeBookingCheck(messageId, fromHeader, subject) {
   if (AGENT_EMAILS.includes(extractEmailAddr(fromHeader))) return { booking: false, skipped: "own-mail" };
   const r = await new Promise((resolve) => {
@@ -369,6 +374,7 @@ function bookingGateFor(messageId, fromHeader, subject) {
 export function catchupLine(m) {
   const base = `  - MessageId: ${m.messageId} | From: ${m.from} | Subject: ${m.subject}`;
   if (!m.booking) return base;
+  if (isDelivery(m.booking)) return `${base} | DELIVERY (intake's booking check read it as a delivery notice) — whatever its label and priority, make the delivery task and calendar match: \`${installTools("bin/triage-rules")} section ${SHIPPING_RULES_SLUG}\``;
   return `${base} | BOOKING (intake's booking check: ${m.booking.kind || "booking"}) — whatever its label and priority, make the calendar match: \`${installTools("bin/triage-rules")} section ${BOOKING_RULES_SLUG}\``;
 }
 
@@ -691,6 +697,7 @@ const STAMP_TEXT = {
   "reply-to-me-p1": `reply-to-me-p1 (this answers something ${OWNER_NAME} sent — \`p1\` + star ALREADY applied, left unread; Step 4a)`,
   "meeting-request-p1": "meeting-request-p1 (a calendar invitation to attend — `p1` + star ALREADY applied, left unread; always P1)",
   "command-channel": `command-channel (addressed to ${JORI_INBOUND_ADDRESSES[0] || "the agent's address"} — ${OWNER_NAME}'s instruction channel)`,
+  "delivery": `delivery (intake's booking check read this as a shipping or delivery notice for a package coming to ${OWNER_NAME}, from whatever carrier or seller, so it was NOT filed silently. Whatever label and priority you give it, make the delivery task and calendar match: \`${installTools("bin/triage-rules")} section ${SHIPPING_RULES_SLUG}\`)`,
   "booking": `booking (intake's booking check read this as a confirmed booking, appointment, reservation, meeting or show, or a change, cancellation or reminder of one, so it was NOT filed silently. Whatever label and priority you give it, make the calendar match: \`${installTools("bin/triage-rules")} section ${BOOKING_RULES_SLUG}\`)`,
 };
 
@@ -1093,14 +1100,14 @@ export class GmailSource {
   //                agent is dispatched only if it declines (failure, invalid
   //                output, or an action tag that needs an agent).
   // The command channel (mail addressed to Jori) always goes to the agent, and
-  // so does a booking (the `booking` stamp): its calendar write needs a turn.
+  // so does a booking or a delivery (the `booking` / `delivery` stamps): their task and calendar writes need a turn.
   async _routeForTriage(p) {
     const body = await this._fetchBodyText(p.messageId);
     const packet = { ...p, body, history: this._historyLine(p.from) };
     const content = buildTriageDispatch(packet, await rulesIndex());
     const m = triageDecideMode();
     const commandChannel = (p.stamps || []).includes("command-channel");
-    const eligible = !commandChannel && !(p.stamps || []).includes("booking");
+    const eligible = !commandChannel && !(p.stamps || []).some((x) => x === "booking" || x === "delivery");
     const args = [p.messageId, "--from", p.from || "", "--subject", p.subject || "", "--date", p.date || "", "--to", p.to || "", "--stamps", (p.stamps || []).join(",")];
     if (p.jev) args.push("--jev-json", JSON.stringify(p.jev));
     if (m === "live" && eligible) {
@@ -1311,7 +1318,7 @@ export class GmailSource {
           }
           if (lc.booking) booking = lc.booking;
           if (booking) {
-            stamps.push("booking");
+            stamps.push(isDelivery(booking) ? "delivery" : "booking");
             this.triageLog(`booking-check ${m.messageId} from ${extractEmailAddr(m.from)} → ${booking.kind || "booking"} (${booking.used}) — ${fp.booking ? `intake-skip rule=${fp.rule}` : "auto-P3"} withheld, dispatching`);
           }
           const packet = { ...m, stamps: m.toJori === true ? [...stamps, "command-channel"] : stamps, jev: lc.jev || null };
