@@ -32,7 +32,7 @@ const path = require("node:path");
 const plaid = require("../lib/plaid-api.js");
 const store = require("../lib/plaid-store.js");
 const { request } = require("../lib/supabase-rest.js");
-const { categoryOf, findCounterLeg, OWN_MOVEMENT_OUT, LEG_WINDOW_DAYS } = require("../lib/plaid-alert-rules.js");
+const { categoryOf, findCounterLeg, accountRefsOf, OWN_MOVEMENT_OUT, LEG_WINDOW_DAYS } = require("../lib/plaid-alert-rules.js");
 const { instance, localConfig } = require("../lib/instance.cjs");
 
 const FINANCE = localConfig("finance", { alerts: {}, recurring_refresh_url: "" });
@@ -542,6 +542,14 @@ async function judgeItem(c, accountInfo) {
       payment_channel: t.payment_channel || null,
     },
     own_transfer_match: false,
+    // Accounts the bank's own line names ("to CHK 2255"), checked against the
+    // linked accounts by code: a judge must not infer "linked" (2026-11-04).
+    other_accounts_named: accountRefsOf(t)
+      .filter((m) => m !== acctInfo.mask)
+      .map((m) => {
+        const hit = Object.values(accountInfo).find((a) => a.mask === m);
+        return { last4: m, linked: Boolean(hit), name: hit ? (hit.name || hit.official_name || null) : null };
+      }),
     merchant_history: c.hist ? { prior_charges: c.hist.count, largest_usd: c.hist.max } : null,
     similar_history: await similarHistory(t),
     nearby_same_amount: nearby,

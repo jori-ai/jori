@@ -209,3 +209,15 @@ test("two POSTED equal credits stay ambiguous (the pending rule does not loosen 
   const second = { ...XFER_IN, transaction_id: "t-in-2", account_id: "chk2" };
   assert.equal(findCounterLeg(XFER_OUT, [XFER_IN, second], new Set(), { ...TYPES, chk2: "depository" }), null);
 });
+
+// 2026-11-04: the bank-alert judge's model rung called a $3,000 transfer to an
+// unlinked account "linked" and silenced it. Code now reads the account the
+// bank's own line names and says whether it is linked.
+test("accountRefsOf reads the bank-stamped other account, nothing else", () => {
+  const { accountRefsOf } = require("../lib/plaid-alert-rules.js");
+  assert.deepEqual(accountRefsOf({ name: "Online Banking transfer to CHK 2255 Confirmation# XXXXX30639" }), ["2255"]);
+  assert.deepEqual(accountRefsOf({ name: "TRANSFER TO ACCT #1815 ON 11/03 VIA WEB" }), ["1815"]);
+  assert.deepEqual(accountRefsOf({ name: "CHK XXXX1234 payment" }), ["1234"]);
+  assert.deepEqual(accountRefsOf({ name: "AMAZON MARKETPLACE" }), []);
+  assert.deepEqual(accountRefsOf({ name: "Confirmation# 12345678" }), []);
+});
