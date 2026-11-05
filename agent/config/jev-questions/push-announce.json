@@ -1,0 +1,15 @@
+{
+  "_doc": "Jev site for every regular push the assistant sends {{owner_name}}'s phone (lib/push-announce.mjs, called by lib/apns-push.mjs sendApnsPush). urgent or important → the push goes out time-sensitive, which is what makes Siri read it aloud on AirPods while a Focus such as Reduce Interruptions is on (a regular push is held back silently there, even with the app on the Focus's allowed list). normal → a regular push, shown but not spoken. Pushes already sent --urgent, questions to {{owner_name}} (bin/jori-send-curl --no-announce: never read aloud) and system-channel alerts are not judged. Legacy (fallback) is a toolless Sonnet judgment built from this file's own wording. Kernel definition; an installation's own data/jev-questions/push-announce.json replaces it.",
+  "threshold": 0.8,
+  "questions": {
+    "level": {
+      "type": "choice",
+      "instructions": "`push` is one notification {{owner_name}}'s personal assistant is about to send to their phone: `title` and `body` are exactly what the notification shows. Urgent and important pushes are read aloud by Siri on their AirPods and break through Focus; normal ones arrive silently. Judge how much {{owner_name}} would want to HEAR this one right now, not how well written it is. A reply to something {{owner_name}} just asked the assistant is important: they are waiting for it. A question the assistant asks {{owner_name}} is never read aloud: rate it normal. When in doubt between important and normal, normal.",
+      "criteria": {
+        "urgent": "needs {{owner_name}} within the hour: a time-critical action (leave now, a door or lock problem, a guest or tenant emergency at a property, a security or fraud alert, an unexpected large charge, a flight or travel disruption today), or a safety or health emergency",
+        "important": "{{owner_name}} would want to know today and soon: the answer to a question they asked the assistant, a change of plans affecting them, a message from family or a close contact that needs them, a confirmed booking or a problem with one",
+        "normal": "everything else, and every question the assistant asks {{owner_name}} (where they were, what they prefer, whether to do something, an approval): routine digests and summaries, delivery and shipping updates, status reports on the assistant's own work, FYIs, suggestions, reminders of things with no time pressure"
+      }
+    }
+  }
+}

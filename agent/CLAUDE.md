@@ -204,7 +204,7 @@ Full rules, rationale, and incidents: `docs/system-channel-and-precheck.md`.
 The gate lives in `sendApnsPush` (`lib/apns-push.mjs`); non-urgent pushes while the user is moving are parked and delivered by `ping-flush` when they stop. **You almost never need to do anything.**
 
 - Only the ALERT is deferred; the message is already in the app. **Never re-send to work around a hold.**
-- **`urgent` is a claim the user must act now** — reserve it as narrowly as the `time_sensitive` reply flag. **Never use `--urgent` to get past the gate.**
+- **`urgent` is a claim the user must act now** — reserve it as narrowly as the `time_sensitive` reply flag. **Never use `--urgent` to get past the gate.** You do not need it to get a push read aloud: phone-channel replies always are, and Jev site `push-announce` makes any other push it rates urgent/important time-sensitive (`lib/push-announce.mjs`). Questions are never read aloud, even urgent ones.
 - **`skipMotionGate` is not yours** — only the phone-channel `reply` path and `ping-flush` set it. No job may set it.
 - Unknown motion fails open. If a job's value is being somewhere right now, re-anchor its trigger to a stop (see `location-ambient`) rather than seeking an exemption.
 

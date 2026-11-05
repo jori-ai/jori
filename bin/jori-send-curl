@@ -1259,6 +1259,16 @@ except Exception:
     # Pass --channel so system/infra alerts never touch the app icon badge.
     NOTIFY_ARGS=(--channel "$CHANNEL")
     [ "$URGENT_PUSH" = true ] && NOTIFY_ARGS+=(--urgent)
+    # A question to the user is never read aloud (the user's decision of
+    # 2026-11-05): --no-announce keeps it a regular push, even an urgent or
+    # location one (those still skip the motion gate). Same structural test as
+    # the question hold above. lib/push-announce.mjs judges the rest.
+    PUSH_IS_QUESTION=false
+    [ "$IS_QUESTION" = true ] && PUSH_IS_QUESTION=true
+    [ "${QR_QUESTION:-false}" = true ] && PUSH_IS_QUESTION=true
+    [ -n "${ORIG_CHOICES_JSON:-}${CHOICES_JSON:-}" ] && PUSH_IS_QUESTION=true
+    case "${INTENT##*:}" in question|ask) PUSH_IS_QUESTION=true ;; esac
+    [ "$PUSH_IS_QUESTION" = true ] && NOTIFY_ARGS+=(--no-announce)
     if [ -n "$PUSH_BODY" ]; then
       "$NOTIFY" "${NOTIFY_ARGS[@]}" "$PUSH_BODY" > /dev/null 2>&1 &
     else

@@ -400,11 +400,12 @@ mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
           // A reply is SOLICITED — the user asked and is waiting. The motion
           // gate (which parks non-urgent alerts while the user is walking or driving)
           // is for proactive traffic only; holding an answer the user is waiting on
-          // would be the same failure Rule #2 forbids, one layer down. Note this
-          // is separate from `urgent`: that still decides whether the reply
-          // pierces Focus and gets read aloud, and stays narrow by design.
+          // would be the same failure Rule #2 forbids, one layer down. For the
+          // same reason a reply is always read aloud (announce "always": sent
+          // time-sensitive, the user's decision 2026-11-05), with no Jev call;
+          // `urgent` additionally marks the NSE's urgent flag.
           await sendApnsPush(supabase, {
-            body, messageId: msgId, channel: replyChannel, urgent: timeSensitive, skipMotionGate: true,
+            body, messageId: msgId, channel: replyChannel, urgent: timeSensitive, skipMotionGate: true, announce: "always",
           });
         } catch (err) {
           console.error(`[phone-channel] Push failed: ${err.message}`);
