@@ -24,7 +24,9 @@
 //   3. With the tab closed, each new envelope is downloaded from S3 and OCR'd
 //      on-device (lib/photo-ocr.swift, Apple Vision), in parallel.
 //   4. Jev judges important/junk, the recipient and which OCR line is the
-//      sender (lib/anytime-mail-jev.mjs); Haiku is the fallback.
+//      sender (lib/anytime-mail-jev.mjs); Haiku is the fallback. If the
+//      sender is still unknown, Sonnet looks at the scan image and reads it
+//      (readSenderFromImage).
 //   5. One chat message, important first. Silent when nothing is new.
 //   6. If another notice landed while this ran (the supervisor touches
 //      KICK_FILE), go round once more.
@@ -46,7 +48,7 @@ import { spawnSync, execFile } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { port } from "../lib/ports.cjs";
 import { createRequire } from "node:module";
-import { judgeEnvelope } from "../lib/anytime-mail-jev.mjs";
+import { judgeEnvelope, readSenderFromImage } from "../lib/anytime-mail-jev.mjs";
 
 const require = createRequire(import.meta.url);
 const { localConfig } = require("../lib/instance.cjs");
@@ -292,14 +294,23 @@ async function runOnce(state) {
   // Browser is closed; downloads, OCR and Jev run in parallel per envelope.
   ensureOcrBin();
   const results = await Promise.all(feed.fresh.map(async (it) => {
-    let lines = [];
+    let lines = [], file = null;
     try {
       if (!it.scan) throw new Error("no scan link");
-      lines = await ocr(await download(it.malId, it.scan));
+      file = await download(it.malId, it.scan);
+      lines = await ocr(file);
     } catch (e) { log(`item ${it.malId}: ${e.message}`); }
     const j = await judgeEnvelope({ id: it.malId, lines, mailbox: MAILBOX });
-    log(`item ${it.malId}: ${j.verdict} sender=${j.sender ?? "-"} recipient=${j.recipient} via ${j.source}${j.confidence != null ? ` @${j.confidence.toFixed(2)}` : ""}`);
-    state.seen[it.malId] = { arrived: it.arrived, verdict: j.verdict, sender: j.sender, recipient: j.recipient, source: j.source, ocr: lines.slice(0, 40) };
+    // The OCR-line pick left the sender unknown: let a model look at the scan
+    // itself (lib/anytime-mail-jev.mjs readSenderFromImage) rather than tell
+    // the user "Sender unidentified" and make them ask which letter it was.
+    if (!j.sender && file) {
+      const seen = await readSenderFromImage({ file, mailbox: MAILBOX });
+      if (seen) { j.sender = seen.sender; j.return_address = seen.return_address; j.sender_from = "image"; }
+    }
+    log(`item ${it.malId}: ${j.verdict} sender=${j.sender ?? "-"}${j.sender_from ? ` (${j.sender_from})` : ""} recipient=${j.recipient} via ${j.source}${j.confidence != null ? ` @${j.confidence.toFixed(2)}` : ""}`);
+    state.seen[it.malId] = { arrived: it.arrived, verdict: j.verdict, sender: j.sender, recipient: j.recipient, source: j.source,
+      ...(j.sender_from ? { sender_from: j.sender_from, return_address: j.return_address } : {}), ocr: lines.slice(0, 40) };
     return { malId: it.malId, ...j };
   }));
   send(composeMessage(results));
