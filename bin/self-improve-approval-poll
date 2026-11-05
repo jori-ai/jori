@@ -34,6 +34,7 @@ const { createUnifiedApproval } = await import(path.join(ROOT, "agent/core/self-
 const { writebackApprovalOutcome } = await import(path.join(ROOT, "lib/system-issue-writeback.mjs"));
 const { rebaseDrifted, isLegacyArchCard } = await import(path.join(ROOT, "lib/self-improve-rebase.mjs"));
 const { contentRefusals } = await import(path.join(ROOT, "lib/self-improve-content-check.mjs"));
+const { railsFor, isVerifiedOwnerRequest } = await import(path.join(ROOT, "lib/self-improve-landing.mjs"));
 // The installation's rebuild queue for a card whose apply hit a conflict
 // (optional: without it the "ask me in chat to rebuild it" notice stands).
 const REBUILD_LIB = path.join(ROOT, "lib/self-improve-rebuild.mjs");
@@ -240,6 +241,43 @@ function ensureExecIfScript(fp, content) {
   }
 }
 
+// ---- locked files (rubric schema v6) ----------------------------------------
+// A signature is not enough to write a locked file. The card must be one
+// self-improve-request filed for the owner's own chat request: item_json carries
+// the verified request (which the signature covers), the chat build it names is
+// in the build queue as the owner's, and the quote is still, word for word, in
+// that user-role message. The lock's own machinery (LOCK_CORE) and FORBIDDEN
+// paths are refused whatever the card says. Checked before anything is written,
+// on a retry too. Returns null when the files may be written, else the reason.
+async function lockedFileRefusal(item, rels) {
+  const rails = railsFor(rels);
+  if (rails.forbidden.length) return `forbidden path (secrets, credentials): ${rails.forbidden.join(", ")}. Nothing was written.`;
+  if (rails.lockCore.length) return `${rails.lockCore.join(", ")} is the lock's own machinery, which no card may change. Nothing was written.`;
+  if (!rails.recursion.length) return null;
+  const o = item.owner_request;
+  const which = rails.recursion.join(", ");
+  if (!isVerifiedOwnerRequest(o)) return `${which} is a locked file, and this card was not filed for your own request in chat. Nothing was written.`;
+  const queue = path.join(ROOT, "data/build-queue");
+  const reqFile = ["running", "done", "failed"].map((d) => path.join(queue, d, `${o.build_request}.json`)).find((f) => fs.existsSync(f));
+  let req = null;
+  try { req = reqFile ? JSON.parse(fs.readFileSync(reqFile, "utf8")) : null; } catch {}
+  if (!req || req.id !== o.build_request || !["chat", "approval-rebuild"].includes(String(req.source))) {
+    return `${which} is a locked file, and the chat request this card names (${o.build_request}) is not in the build queue as yours. Nothing was written.`;
+  }
+  let msg = null;
+  try {
+    const r = await fetch(`${BASE}/rest/v1/jori_messages?id=eq.${encodeURIComponent(o.message_id)}&select=id,role,content&limit=1`, { headers: H, signal: AbortSignal.timeout(15000) });
+    if (!r.ok) return `could not read your message to check the quote on this locked-file card (${r.status}). Nothing was written; tap Retry.`;
+    msg = (await r.json())[0] || null;
+  } catch (e) {
+    return `could not read your message to check the quote on this locked-file card (${e?.message || e}). Nothing was written; tap Retry.`;
+  }
+  if (!msg || msg.role !== "user" || typeof msg.content !== "string" || !msg.content.includes(o.quote)) {
+    return `${which} is a locked file, and the quote on this card is no longer in your message. Nothing was written.`;
+  }
+  return null;
+}
+
 async function applyItem(row) {
   const item = row.item_json || {};
   if (row.item_type === "new-capability") {
@@ -266,6 +304,10 @@ async function applyItem(row) {
     const files = item.files || {};
     if (!files || typeof files !== "object" || Object.keys(files).length === 0) {
       return { ok: false, error: "code-fix item_json has no files — nothing to write" };
+    }
+    {
+      const locked = await lockedFileRefusal(item, Object.keys(files));
+      if (locked) return { ok: false, error: locked };
     }
     // The content checks (lib/self-improve-content-check.mjs), against the
     // files as they are now. A signature does not make a truncated file right: on
