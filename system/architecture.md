@@ -655,7 +655,7 @@ wiki-audit [--dry-run] [--no-log] [--json] [--window-days N] [--pin-threshold N]
 jori activity [--json]        # winding_down / active / sleeping / waking
 jori doctor                   # drift checks (run before any digest)
 jori logs ops-agent --tail N  # log tail
-jori restart {ops|chat|whatsapp-channel|wiki-server|session}  # process-manager-aware: ops/chat POST supervisor /restart; whatsapp-channel/wiki-server SIGTERM the PM child (respawns); session kickstarts launchd
+jori restart <target> [...]   # ops|ops-light|ops-haiku|chat POST supervisor /restart; whatsapp/imessage/slack-channel and wiki-server SIGTERM the PM child (respawns); session kickstarts launchd (always last). Run by the chat agent itself (JORI_DISPATCH_URL on chat health), a chat/session restart goes to a detached job-run job that starts when that chat turn ends, checks the result and has ops-light post it in the chat
 jori git                      # repo state
 jori ci                       # recent GitHub Actions runs
 kernel-guard [--summary|--json] [--new] [--staged] [paths]  # personal-data scan of the kernel files (system/kernel-manifest.json) against the private pattern list; --new = only hits not in system/kernel-guard-baseline.json
