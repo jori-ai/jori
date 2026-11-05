@@ -976,3 +976,207 @@ test("the launchd runner sends held questions only after the Max sign-in check, 
     } finally { fs.rmSync(home, { recursive: true, force: true }); }
   }
 });
+
+// ── The evening pass ──────────────────────────────────────────────────────
+// the user, 2026-10-21: on a Tuesday the calendar had two friends at 8pm and at 10:20pm
+// the user wrote where they had dinner; the fix loop asked whether the friends were there
+// at 4:37am Wednesday. "Why wait until 4:37am to ask this?" Once a day, from 22:00 the
+// user's time, the sweep starts the fixer for today in its before_summary phase, on a day
+// whose calendar has something that has begun (code looks first). Times here are UTC
+// (tz "UTC"), so 22:52Z is 22:52 his time. The calendar is stubbed (DS_FIX_EVENING_EVENTS).
+const EV_DAY = "2099-01-06"; // a Tuesday
+const dinner = { summary: "dinner", start: { dateTime: `${EV_DAY}T20:00:00Z` }, end: { dateTime: `${EV_DAY}T22:00:00Z` } };
+const evAt = (s, iso, events = [dinner], extra = {}) => s.at(iso, "UTC", { DS_FIX_EVENING_EVENTS: JSON.stringify(events), ...extra });
+const lastLines = (r) => r.stdout.trim().split("\n");
+
+test("the evening pass starts once for today at the first sweep at or after 22:00, in the before_summary phase", () => {
+  const s = sandbox();
+  try {
+    let r = evAt(s, `${EV_DAY}T21:52:00Z`)("sweep");
+    assert.equal(r.status, 0, r.stderr);
+    assert.ok(!fs.existsSync(path.join(s.dir, "state", `${EV_DAY}.json`)), "not before 22:00");
+    r = evAt(s, `${EV_DAY}T22:52:00Z`)("sweep");
+    assert.ok(lastLines(r).includes(`evening pass: started for ${EV_DAY}`), r.stdout);
+    assert.ok(s.queued(EV_DAY), "the fixer is kicked");
+    const st = s.state(EV_DAY);
+    assert.equal(st.requests[0].from, "evening");
+    assert.equal(st.status, "queued");
+    assert.equal(evAt(s, `${EV_DAY}T22:55:00Z`)("phase", EV_DAY).stdout.trim(), "before_summary");
+    assert.equal(JSON.parse(evAt(s, `${EV_DAY}T22:55:00Z`)("status", EV_DAY).stdout).phase, "before_summary");
+    s.unqueue(EV_DAY);
+    r = evAt(s, `${EV_DAY}T23:52:00Z`)("sweep");
+    assert.equal(s.state(EV_DAY).requests.length, 1, "once a day");
+    assert.ok(!s.queued(EV_DAY));
+    assert.ok(!lastLines(r).some((l) => l.startsWith("evening pass: started")));
+    // A run that died before the 4am build is not "a summary never sent": the sweep leaves it.
+    evAt(s, "2099-01-07T02:52:00Z")("sweep");
+    assert.ok(!s.queued(EV_DAY), "a before_summary day is never re-queued as stranded");
+  } finally { s.done(); }
+});
+
+test("the evening pass skips a day with nothing on the calendar to check, and honours its kill switch", () => {
+  const s = sandbox();
+  try {
+    const video = { ...dinner, summary: "call", hangoutLink: "https://meet.google.com/x" };
+    const zoomLoc = { ...dinner, summary: "sync", location: "https://acme.zoom.us/j/1" };
+    const declined = { ...dinner, attendees: [{ self: true, responseStatus: "declined" }] };
+    const cancelled = { ...dinner, status: "cancelled" };
+    const later = { ...dinner, start: { dateTime: `${EV_DAY}T23:30:00Z` } };
+    const allDay = { summary: "trip", start: { date: EV_DAY }, end: { date: "2099-01-07" } };
+    let r = evAt(s, `${EV_DAY}T22:52:00Z`, [video, zoomLoc, declined, cancelled, later, allDay])("sweep");
+    assert.ok(lastLines(r).includes("evening pass: skipped: nothing on the calendar to check"), r.stdout);
+    assert.ok(!fs.existsSync(path.join(s.dir, "state", `${EV_DAY}.json`)), "no day state for a skipped evening");
+    r = evAt(s, `${EV_DAY}T23:52:00Z`)("sweep");
+    assert.ok(!lastLines(r).some((l) => l.startsWith("evening pass")), "it does not look again that night");
+    // A dinner whose location is a maps link is not a video meeting.
+    const D2 = "2099-01-07";
+    const maps = { ...dinner, start: { dateTime: `${D2}T20:00:00Z` }, location: "https://maps.google.com/?q=bistro" };
+    fs.writeFileSync(path.join(s.dir, "state", ".evening-off"), "");
+    r = evAt(s, `${D2}T22:52:00Z`, [maps])("sweep");
+    assert.ok(lastLines(r).includes("evening pass: off (kill switch)"));
+    fs.rmSync(path.join(s.dir, "state", ".evening-off"));
+    r = evAt(s, `${D2}T23:52:00Z`, [maps])("sweep");
+    assert.ok(lastLines(r).includes(`evening pass: started for ${D2}`), "the switch removed, the same evening still runs it");
+  } finally { s.done(); }
+});
+
+test("an evening question opens with 'Before I write up', holds no email, carries moot_after, and at most two are asked", () => {
+  const s = sandbox();
+  try {
+    evAt(s, `${EV_DAY}T22:52:00Z`)("sweep");
+    const ask = (q, extra = {}) => evAt(s, `${EV_DAY}T23:05:00Z`, [dinner], extra)("ask", EV_DAY, "--question", q);
+    let r = ask("Your calendar had Alex and Sam at 8. Were they at dinner with you?", { DS_FIX_PHASE: "before_summary" });
+    assert.equal(r.status, 0, r.stderr);
+    const sent = s.sends()[0];
+    assert.ok(sent.includes("📝 Before I write up your Tuesday, January 6: Your calendar had Alex and Sam at 8."), sent);
+    assert.ok(!sent.includes("holding the summary"), "no answer window");
+    const meta = JSON.parse(sent.slice(sent.indexOf("--metadata-json ") + 16, sent.indexOf(" --channel")));
+    assert.equal(meta.moot_after, "2099-01-07T04:00:00.000Z", "it stops mattering at the 4am build");
+    const st = s.state(EV_DAY);
+    assert.equal(st.questions[0].evening, true, "the runner's DS_FIX_PHASE makes it an evening question without the flag");
+    assert.equal(st.hold, undefined);
+    assert.equal(evAt(s, `${EV_DAY}T23:06:00Z`)("gate", EV_DAY, "--peek").status, 0, "the gate never waits on it");
+    // Without the flag or the runner's env it is an ordinary question (the 4am build's, or
+    // the fix loop's): not an evening one.
+    assert.equal(ask("Was the 9pm stop the bistro?", {}).status, 0);
+    assert.equal(s.state(EV_DAY).questions[1].evening, undefined);
+  } finally { s.done(); }
+  const t = sandbox();
+  try {
+    evAt(t, `${EV_DAY}T22:52:00Z`)("sweep");
+    const ask = (q) => evAt(t, `${EV_DAY}T23:05:00Z`)("ask", EV_DAY, "--evening", "--question", q);
+    assert.equal(ask("One?").status, 0);
+    assert.equal(ask("Two?").status, 0);
+    const r = ask("Three?");
+    assert.equal(r.status, 3, "at most two in the evening");
+    assert.equal(t.sends().length, 2);
+  } finally { t.done(); }
+});
+
+test("an answer before the 4am build stays before_summary; the build's send retires an unanswered evening question and the day is not left waiting", () => {
+  const s = sandbox();
+  try {
+    evAt(s, `${EV_DAY}T22:52:00Z`)("sweep");
+    s.unqueue(EV_DAY);
+    evAt(s, `${EV_DAY}T23:05:00Z`)("ask", EV_DAY, "--evening", "--question", "Were Alex and Sam at dinner?");
+    evAt(s, `${EV_DAY}T23:06:00Z`)("ask", EV_DAY, "--evening", "--question", "Was the 9pm stop the bistro?");
+    assert.ok(s.state(EV_DAY).status.startsWith("awaiting_"));
+    // His reply at 23:40 (the chat agent passes it): still before the summary.
+    evAt(s, `${EV_DAY}T23:40:00Z`)("request", EV_DAY, "--answer", "Yes, both were there");
+    assert.equal(evAt(s, `${EV_DAY}T23:41:00Z`)("phase", EV_DAY).stdout.trim(), "before_summary");
+    s.unqueue(EV_DAY);
+    evAt(s, `${EV_DAY}T23:50:00Z`)("answered", EV_DAY, "1");
+    // The runner after that run: a day it left queued waits for the build.
+    evAt(s, "2099-01-07T00:10:00Z")("request", EV_DAY, "--answer", "and we left at 11", "--no-kick");
+    evAt(s, "2099-01-07T00:30:00Z")("idle", EV_DAY);
+    assert.equal(s.state(EV_DAY).status, "waiting_for_summary");
+    assert.equal(evAt(s, "2099-01-07T03:00:00Z")("phase", EV_DAY).stdout.trim(), "before_summary", "yesterday, before the build");
+    // The 4am build: confirmed, the gate says send (nothing of the evening holds it).
+    assert.equal(evAt(s, "2099-01-07T04:20:00Z")("gate", EV_DAY).status, 0);
+    evAt(s, "2099-01-07T04:30:00Z")("mark-sent", EV_DAY);
+    let st = s.state(EV_DAY);
+    assert.equal(st.questions[1].dropped_why, "the summary was built without it");
+    assert.ok(!st.questions[0].dropped_at, "an answered one stays as it was");
+    assert.equal(st.status, "sent", "an unanswered evening question no longer keeps the day waiting on him");
+    assert.equal(evAt(s, "2099-01-07T04:31:00Z")("phase", EV_DAY).stdout.trim(), "after_summary");
+    evAt(s, "2099-01-07T04:32:00Z")("done", EV_DAY, "--status", "confirmed");
+    assert.equal(s.state(EV_DAY).status, "confirmed");
+    // He writes later in the day: the sweep has nothing to chase.
+    evAt(s, "2099-01-07T15:52:00Z", [dinner], { DS_FIX_LAST_USER_MSG: "2099-01-07T15:00:00Z" })("sweep");
+    assert.ok(!s.queued(EV_DAY));
+    // His answer after the send is a correction to a built day.
+    evAt(s, "2099-01-07T16:00:00Z")("request", EV_DAY, "--answer", "Actually the 9pm stop was the bar next door");
+    assert.equal(evAt(s, "2099-01-07T16:01:00Z")("phase", EV_DAY).stdout.trim(), "after_summary");
+  } finally { s.done(); }
+});
+
+test("an evening question composed in his quiet hours opens no window and is dropped unasked once the summary is built", () => {
+  const s = sandbox({ quiet: QUIET });
+  try {
+    evAt(s, `${EV_DAY}T22:52:00Z`)("sweep");
+    s.unqueue(EV_DAY);
+    // The run ran late (behind other days): it asks at 01:20 his time.
+    const r = evAt(s, "2099-01-07T01:20:00Z")("ask", EV_DAY, "--evening", "--question", "Were Alex and Sam at dinner?");
+    assert.equal(r.status, 0, r.stderr);
+    assert.ok(r.stdout.includes("dropped unasked if the summary is built first"), r.stdout);
+    let st = s.state(EV_DAY);
+    assert.ok(st.questions[0].held_until && st.questions[0].evening);
+    assert.equal(st.hold, undefined, "no provisional window: the 4am email never waits for it");
+    assert.equal(evAt(s, "2099-01-07T04:20:00Z")("gate", EV_DAY).status, 0);
+    evAt(s, "2099-01-07T04:30:00Z")("mark-sent", EV_DAY);
+    evAt(s, "2099-01-07T09:52:00Z")("sweep");
+    st = s.state(EV_DAY);
+    assert.equal(st.questions[0].dropped_why, "the summary was built without it");
+    assert.ok(!releaseQueued(s), "nothing to release");
+    evAt(s, "2099-01-07T09:55:00Z")("release-held");
+    assert.equal(s.sends().length, 0, "never sent");
+  } finally { s.done(); }
+  // No build at all (it failed): past the build's hour it is moot anyway.
+  const t = sandbox({ quiet: QUIET });
+  try {
+    evAt(t, `${EV_DAY}T22:52:00Z`)("sweep");
+    evAt(t, "2099-01-07T01:20:00Z")("ask", EV_DAY, "--evening", "--question", "Were Alex and Sam at dinner?");
+    evAt(t, "2099-01-07T09:52:00Z")("sweep");
+    assert.equal(t.state(EV_DAY).questions[0].dropped_why, "the summary was built without it");
+    assert.equal(t.sends().length, 0);
+  } finally { t.done(); }
+});
+
+test("the 4am build's own question ends the before_summary phase and opens its window; an evening question is refused after it", () => {
+  const s = sandbox();
+  try {
+    evAt(s, `${EV_DAY}T22:52:00Z`)("sweep");
+    s.unqueue(EV_DAY);
+    const r = evAt(s, "2099-01-07T04:20:00Z")("ask", EV_DAY, "--question", "Was the 6pm stop the gym?");
+    assert.equal(r.status, 0, r.stderr);
+    assert.ok(s.sends()[0].includes("📝 Fixing your Tuesday, January 6 summary:"));
+    assert.ok(s.state(EV_DAY).hold, "a build question opens the answer window as before");
+    assert.equal(evAt(s, "2099-01-07T04:21:00Z")("phase", EV_DAY).stdout.trim(), "after_summary");
+    assert.equal(evAt(s, "2099-01-07T04:22:00Z")("ask", EV_DAY, "--evening", "--question", "Late?").status, 3);
+    assert.equal(evAt(s, "2099-01-07T04:22:00Z")("request", EV_DAY, "--evening", "--no-kick").stdout.trim(), `${EV_DAY}: its summary is already built; no evening pass`);
+  } finally { s.done(); }
+});
+
+test("phase: no evening pass is the old behaviour, and past noon the next day a correction is to a built day", () => {
+  const s = sandbox();
+  try {
+    evAt(s, `${EV_DAY}T23:00:00Z`)("request", EV_DAY, "--answer", "that was the bistro", "--no-kick");
+    assert.equal(evAt(s, `${EV_DAY}T23:01:00Z`)("phase", EV_DAY).stdout.trim(), "after_summary", "no evening pass, no before_summary");
+  } finally { s.done(); }
+  const t = sandbox();
+  try {
+    evAt(t, `${EV_DAY}T22:52:00Z`)("sweep");
+    assert.equal(evAt(t, "2099-01-07T11:59:00Z")("phase", EV_DAY).stdout.trim(), "before_summary");
+    assert.equal(evAt(t, "2099-01-07T12:00:00Z")("phase", EV_DAY).stdout.trim(), "after_summary", "the build's record went missing: rebuild and send");
+  } finally { t.done(); }
+});
+
+test("done retires what is still open of the evening pass", () => {
+  const s = sandbox();
+  try {
+    evAt(s, `${EV_DAY}T22:52:00Z`)("sweep");
+    evAt(s, `${EV_DAY}T23:05:00Z`)("ask", EV_DAY, "--evening", "--question", "Were Alex and Sam at dinner?");
+    evAt(s, "2099-01-07T04:30:00Z")("done", EV_DAY, "--status", "confirmed");
+    assert.equal(s.state(EV_DAY).questions[0].dropped_why, "the day was closed");
+  } finally { s.done(); }
+});

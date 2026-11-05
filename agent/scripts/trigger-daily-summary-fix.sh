@@ -5,7 +5,8 @@
 # Launched by launchd (ai.claude.daily-summary-fix), whose QueueDirectories key
 # is data/daily-summary-fix/queue: `daily-summary-fix request <date>` drops
 # a marker there (the daily-summary fork when the review did not confirm the day,
-# the chat agent with the user's answer to a fixer question, the hourly sweep).
+# the chat agent with the user's answer to a fixer question, the hourly sweep, and
+# the sweep's evening pass for today).
 # Each run takes the OLDEST marker, removes it before anything slow (a marker
 # left behind would relaunch forever), and runs the fixer for that date. launchd
 # runs one instance per label, so fix runs are serial.
@@ -98,6 +99,19 @@ if [ "$BRAKE_RC" -eq 3 ]; then
   log "$M: held by the allowance governor: $BRAKE_REASON"
   exit 0
 fi
+# The day's phase (2026-11-04, the evening pass): before_summary is a day the
+# evening pass started whose summary the 4am build has not made yet (the pass
+# itself, or the user's answer to one of its questions). That run settles and asks;
+# it never rebuilds, reviews or sends. No phase, no run: guessing "after" could
+# build and send half a day's summary. The marker is consumed either way (left
+# behind, launchd would relaunch this runner forever); the next request retries.
+PHASE="$("$FIX" phase "$M" 2>/dev/null)"
+case "$PHASE" in
+  before_summary|after_summary) ;;
+  *) rm -f "$Q/$M"; log "$M: could not read the day's phase — not run (the next request retries)"
+     for x in "$HELD"/*; do [ -e "$x" ] && mv "$x" "$Q/"; done
+     exit 0 ;;
+esac
 # Model tier (the user's choice, 2026-11-03): Sonnet first, Opus once a Sonnet
 # run for this date got stuck (`daily-summary-fix tier`, pickTier). The
 # allowance governor's "cheaper model" answer overrides an Opus tier.
@@ -109,6 +123,16 @@ if [ "$TIER" = "sonnet" ] && [ -n "${JORI_MODEL_SONNET:-}" ]; then
   RUN_ARGS=(--model "$JORI_MODEL_SONNET" --effort xhigh)
 else
   TIER="opus"
+fi
+if [ "$PHASE" = "before_summary" ]; then
+  # A short reading of the day so far, not the fix loop: Sonnet at high effort, a
+  # 40-minute cap, and no tier record (an evening run that asked nothing must not
+  # count as a stuck Sonnet run and send the morning's fix loop to Opus).
+  TIMEOUT_MIN=40
+  TIER="sonnet"
+  RUN_ARGS=()
+  [ -n "${JORI_MODEL_SONNET:-}" ] && RUN_ARGS=(--model "$JORI_MODEL_SONNET" --effort high)
+  TIER_JSON='{"tier":"sonnet","reason":"before_summary: the evening pass"}'
 fi
 log "$M: tier $TIER ($TIER_JSON)"
 if [ "$BRAKE_RC" -eq 4 ]; then
@@ -123,18 +147,33 @@ DATE="$M"
 log "$DATE: start"
 
 STATE="$("$FIX" status "$DATE" 2>/dev/null | head -c 12000)"
-TASK="Run the DAILY SUMMARY FIX job for $DATE. The state file for this date (data/daily-summary-fix/$DATE.json) is below; any answers from the user are in it. ultrathink.
+log "$DATE: phase $PHASE"
+if [ "$PHASE" = "before_summary" ]; then
+  # `daily-summary-fix ask` reads this: a question from this run is an evening one
+  # (no answer window, so it can never hold the 4am email), even without --evening.
+  export DS_FIX_PHASE=before_summary
+  TASK="Run the DAILY SUMMARY FIX job for $DATE in PHASE before_summary: this day's summary has not been built yet, so follow § Before the summary only (read the day so far, settle what the user's calendar and words settle, ask at most two questions with \`ask --evening\`, record the user's answers, stop). No rebuild, no review, no send. The state file for this date (data/daily-summary-fix/$DATE.json) is below; any answers from the user are in it.
 
 ----- STATE $DATE -----
 $STATE
 ----- END STATE -----"
+else
+  TASK="Run the DAILY SUMMARY FIX job for $DATE. The state file for this date (data/daily-summary-fix/$DATE.json) is below; any answers from the user are in it. ultrathink.
+
+----- STATE $DATE -----
+$STATE
+----- END STATE -----"
+fi
 
 "$SCRIPTS/lib/run-ephemeral-opus.sh" daily-summary-fix "$JOB_MD" --task "$TASK" --timeout-min "$TIMEOUT_MIN" ${RUN_ARGS[@]+"${RUN_ARGS[@]}"}
 RC=$?
 log "$DATE: runner exit $RC"
 # What this run left behind decides the next run's tier (a held or refused run
 # did nothing, so it is not recorded).
-if [ "$RC" -ne 78 ] && [ "$RC" -ne 75 ]; then "$FIX" tier-done "$DATE" "$TIER" >> "$LOG" 2>&1; fi
+if [ "$PHASE" = "before_summary" ]; then
+  # A run that needed nothing from the user leaves the day waiting for the 4am build.
+  "$FIX" idle "$DATE" >> "$LOG" 2>&1
+elif [ "$RC" -ne 78 ] && [ "$RC" -ne 75 ]; then "$FIX" tier-done "$DATE" "$TIER" >> "$LOG" 2>&1; fi
 # A correction this run staged (or one waiting on this run) goes now if its quiet
 # window has passed; otherwise this arms its wake.
 "$FIX" send-due >> "$LOG" 2>&1

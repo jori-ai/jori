@@ -513,6 +513,7 @@ Runs only for a confirmed day in NORMAL mode, never in SILENT or a dry run (an u
    ~/Dev/jori/bin/daily-summary-fix status $DATE        # a re-run: skip what was already asked
    ~/Dev/jori/bin/daily-summary-fix ask $DATE --question "<question>"     # exit 5: held back by the outbound check, not asked
    ```
+   The evening pass may already have asked about this day the evening before (`status` shows those questions with `evening: true`, opening "Before I write up your <Weekday>"), and recorded what the user answered: do not ask them again. An unanswered one holds nothing (`gate` never waits on it); the send retires it.
    Inside the user's quiet hours (`agent/local/config/daily-summary-fix.json`, the user's current timezone; this run usually falls in them) `ask` does not send: it prints `held (question n): …`, exits 0 and keeps the question until the user is up (*"Why wait until 4:37am to ask this?"*). It is asked from the launchd runner then, never by you, and the email waits for it. Carry on exactly as if it had been asked.
 3. **The gate** (code decides, also on a re-run of a day already held):
    ```bash
@@ -590,7 +591,7 @@ Runs only for a confirmed day in NORMAL mode, never in SILENT or a dry run (an u
      --push "Day of $DAY_NAME, $MONTH_DAY_SHORT is in your inbox"
    ```
 
-   Then record the send: `~/Dev/jori/bin/daily-summary-fix mark-sent $DATE` (the fixer reads it to know whether a later fix is a first send or a correction).
+   Then record the send: `~/Dev/jori/bin/daily-summary-fix mark-sent $DATE` (the fixer reads it to know whether a later fix is a first send or a correction). **This 4am build only, in NORMAL mode, when its own Step 4.6 review returned `confirmed: true` and its Step 4.7 gate exited 0**, also close the day: `~/Dev/jori/bin/daily-summary-fix done $DATE --status confirmed`, so a question from the evening pass the user never answered stops holding it open (the user's later answer still reopens it as a correction). The fix loop never runs this line, even when it runs Step 5: it closes a day with its own `done`, and a best-version send of an unconfirmed day must stay open.
 
    Exit 0 = done. Exit 1 = the email did not send and nothing else ran — report the failure, do not retry by hand-running the pieces. Exit 2 = sent, but Gmail had not indexed it in time so it is unlabeled (pointer + push still went) — note it in your final output; no further action.
 

@@ -174,6 +174,22 @@ test("release sends what is still worth asking and drops what is not, oldest fir
   assert.ok(logRows().some((l) => l.event === "dropped" && l.text === "Q0?" && l.reason === "answered in chat"));
 });
 
+test("a question past its sender's moot_after is dropped at release without the judge, logged", async () => {
+  // The daily-summary fixer's evening questions carry the time the morning's summary is
+  // built: one still held then is about a summary that already exists.
+  const file = fresh("store.json");
+  const past = new Date(NOW - 60_000).toISOString(), later = new Date(NOW + 3600_000).toISOString();
+  await QH.gate(entry({ message: "Moot?", metadata: { question_id: "dsf:a:1", moot_after: past } }), { live: notLive, file, now: new Date(NOW - 7200_000) });
+  await QH.gate(entry({ message: "Still open?", metadata: { question_id: "dsf:b:1", moot_after: later } }), { live: notLive, file, now: new Date(NOW - 3600_000) });
+  const judged = [], sent = [];
+  const s = await QH.releaseHeld({ live: isLive, judge: async ({ entry: e }) => { judged.push(e.message); return { ask: true }; },
+    send: async (e) => { sent.push(e.message); return { ok: true }; }, file, fetchJson: noRows, tz: "UTC", now: new Date(NOW) });
+  assert.deepEqual([s.released, s.dropped], [1, 1]);
+  assert.deepEqual(judged, ["Still open?"], "the judge never sees the moot one");
+  assert.deepEqual(sent, ["Still open?"]);
+  assert.ok(logRows().some((l) => l.event === "dropped" && l.text === "Moot?" && l.moot_after === past));
+});
+
 test("the judge sees the chat since the question and what went out ahead of it this round", async () => {
   const file = await seeded(2);
   const seen = [];
