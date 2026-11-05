@@ -12,6 +12,9 @@ import path from "node:path";
 import { execFile } from "node:child_process";
 
 export function makeFixture(site, { copyQuestions = [site] } = {}) {
+  // The privacy-screen stubs fake the Ollama API; since 2026-11-04 the local model defaults to
+  // Haiku via `claude -p`, so pin the backend these stubs simulate.
+  process.env.LOCAL_LLM_BACKEND ||= "ollama";
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), `jev-${site}-`));
   const qdir = path.join(tmp, "questions");
   fs.mkdirSync(qdir, { recursive: true });
