@@ -65,6 +65,9 @@ class IntentHandler: INExtension, INSendMessageIntentHandling, INSearchForMessag
     /// messages" names none: read the newest few. Never the whole backlog for an
     /// announce: answering with the backlog makes Siri re-read every earlier
     /// message on each new one (Telegram-iOS hit this).
+    /// A push the NSE recorded this recently is the one Siri is announcing.
+    static let freshAnnounceWindow: TimeInterval = 120
+
     static func messagesToRead(for intent: INSearchForMessagesIntent,
                                from cached: [AnnouncedMessage]) -> [AnnouncedMessage] {
         let notificationIds = intent.notificationIdentifiers ?? []
@@ -81,6 +84,15 @@ class IntentHandler: INExtension, INSendMessageIntentHandling, INSearchForMessag
         let ids = intent.identifiers ?? []
         if !ids.isEmpty {
             return cached.filter { m in ids.contains(m.messageId ?? "") || ids.contains(m.requestId) }
+        }
+        // iOS 27 announce names no notification: it asks for unread messages
+        // (attributes = .unread, no ids) the instant the push lands. Answer with
+        // just the message that arrived. Answering with the newest three put
+        // two already-shown messages ahead of it and Siri said nothing
+        // (2026-11-05, build 247: every announce silent once the cache filled;
+        // it only "worked" right after install, while the cache held 1-2).
+        if let newest = cached.last, Date().timeIntervalSince(newest.date) < Self.freshAnnounceWindow {
+            return [newest]
         }
         return Array(cached.suffix(3))
     }
