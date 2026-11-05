@@ -127,3 +127,20 @@ test("a walk that outlasts its GPS leg gives the leg the whole walk's steps", ()
   assert.equal(d.path.spine[0].walk_steps, w.steps);
   assert.ok(d.path.spine[0].walk_steps > d.path.spine[0].steps);
 });
+
+test("a walk line whose walk outlasts the stretch states the walk's own clock and minutes", () => {
+  const d = {
+    date: "2026-03-02", tz: "America/New_York",
+    stops: [
+      { id: "h", start: "00:00", end: "17:36", start_ts_ms: at(0), end_ts_ms: at(17, 36), duration_min: 1056, place: { name: "Home" } },
+      { id: "v", start: "17:50", end: "19:45", start_ts_ms: at(17, 50), end_ts_ms: at(19, 45), duration_min: 115, place: { name: "Venue" } },
+    ],
+    path: { spine: [{ type: "leg", id: "l0", mode: "walking", median_kmh: 4.2, start_ms: at(17, 36), end_ms: at(17, 45), mins: 9,
+      routed_m: 700, straight_m: 650, walked_m: 700, geometry: "map_matched", fixes: 3, streets: ["Main Street"] }] },
+  };
+  annotateDaySteps(d, [...readings(at(0, 5), at(0, 10), 2), ...readings(at(17, 27), at(17, 57), 95), ...readings(at(23, 50), at(23, 55), 2)],
+    null, { startMs: at(0), endMs: at(24) });
+  const html = buildSkeleton(d);
+  assert.match(html, /on foot 5:27 to 5:57pm, 30 min, 2,850 steps\./);
+  assert.doesNotMatch(html, /about 14 min/);
+});
