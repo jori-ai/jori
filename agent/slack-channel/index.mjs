@@ -20,6 +20,7 @@ import { spawn } from "node:child_process";
 import { createRequire } from "node:module";
 import { installTools } from "../../lib/root.cjs";
 import { alertCandidate, queueAlert, recentFromInbox } from "../../lib/message-alert.mjs";
+import { handleMention } from "../../lib/jori-mention.mjs";
 import {
   DEFAULTS, AUTH_ERRORS, SESSION_DEAD, cookieHeader, parseEnv, backoffSeconds, channelTypeOf,
   eventToEntry, classifyForPush, pushBody, renderMentions, mentionedUserIds, parseTarget,
@@ -258,7 +259,7 @@ function pageOfficialFallbackOnce(error) {
   if (st.official_alert) return;
   st.official_alert = { at: new Date().toISOString(), error };
   writeState(st);
-  systemPost(`⚠️ Slack official app tokens rejected (${error}); the Slack channel fell back to the browser session. Reinstall the Jori app and update SLACK_USER_TOKEN / SLACK_APP_TOKEN in .env.`);
+  systemPost(`⚠️ Slack official app tokens rejected (${error}); the Slack channel fell back to the browser session. Reinstall the Jori app and update SLACK_USER_TOKEN / SLACK_APP_TOKEN in .env.`); // control-scan-ok: the software's name
 }
 
 function clearAuthAlert() {
@@ -307,6 +308,14 @@ async function onMessageEvent(ev) {
     kind: entry.kind, push: decision.push, reason: decision.reason,
   });
   log(`${entry.kind} ch=${entry.channel_id}(${entry.channel_type}) from=${entry.user_id}${entry.from_me ? "(me)" : ""} push=${decision.push} reason=${decision.reason}`);
+  // "@jori …" in the user's own message is an instruction (lib/jori-mention.mjs).
+  if (entry.from_me && entry.kind === "message") {
+    handleMention({
+      channel: "slack", message_id: entry.slack_ts, chat_id: entry.channel_id,
+      chat_name: entry.channel_type === "im" ? null : entry.channel_name ? (entry.channel_type === "mpim" ? entry.channel_name : `#${entry.channel_name}`) : null,
+      thread_id: entry.thread_ts || entry.slack_ts || null, is_group: entry.channel_type !== "im", from_me: true, ts: entry.ts, text: entry.text,
+    }, recentFromInbox(INBOX, "channel_id", entry.channel_id), { log });
+  }
   if (!decision.push) {
     // Not pushed by the configured senders: a model still judges whether it
     // is important or urgent (lib/message-alert.mjs). Ordinary channel
