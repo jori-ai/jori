@@ -2,8 +2,11 @@ name: publish create-jori
 
 # Publishes packages/create-jori to npm (`npm create jori`). Run it by hand
 # after bumping the package version, or it runs when site/install.sh changes
-# on main with a version not yet on npm. Needs the NPM_TOKEN repository
-# secret (an npm automation token for the account that owns create-jori).
+# on main with a version not yet on npm.
+# Auth: npm trusted publishing (OIDC from this workflow, configured on the
+# package's npm settings page: jori-ai/jori, publish-create-jori.yml), so no
+# stored token. NPM_TOKEN, when set, is used instead (only for the very first
+# publish of a new package, before trusted publishing can be configured).
 
 on:
   workflow_dispatch:
@@ -27,6 +30,8 @@ jobs:
         with:
           node-version: 22
           registry-url: https://registry.npmjs.org
+      - name: npm with trusted publishing (11.5+)
+        run: npm install -g npm@latest
       - name: Test
         run: node --test ../../tests/create-jori.test.mjs
       - name: Skip a version that is already published
