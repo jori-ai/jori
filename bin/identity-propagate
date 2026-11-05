@@ -60,7 +60,13 @@ if (flag("--force")) prev = { assistant_name: prev.assistant_name === cur.assist
 
 const env = environment(TOOLS_DIR, { serviceLoaded: svc.loaded });
 const steps = plan(prev, cur, env);
-if (!steps.length) { say("identity-propagate: nothing changed"); process.exit(0); }
+if (!steps.length) {
+  // A value the state file doesn't hold yet (a key added later, e.g.
+  // assistant_pronouns) is recorded now, so its next change is noticed.
+  if (!flag("--dry-run") && Object.keys(cur).some((k) => !(k in prev))) writeState(file, { ...prev, ...cur });
+  say("identity-propagate: nothing changed");
+  process.exit(0);
+}
 
 if (flag("--dry-run")) {
   for (const s of steps) console.log(`${s.kind === "run" ? "run   " : "manual"}  ${s.what}`);
