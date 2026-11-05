@@ -93,3 +93,15 @@ test("gather records a failing source under errors and keeps the rest", () => {
   assert.deepEqual(b.calendar.events, []);
   assert.deepEqual(b.wiki.projects, []);
 });
+
+test("listProjects splits project pages from type:project pages that are not one yet; list prints both", () => {
+  const rows = {
+    project_a: { id: "project_a", type: "project", raw_md: `x\n${pr.SECTION_START}\ny\n${pr.SECTION_END}`, frontmatter_json: JSON.stringify({ entity: "project", name: "A", project_status: "active" }) },
+    decision_b: { id: "decision_b", type: "project", raw_md: "z", frontmatter_json: JSON.stringify({ name: "B" }) },
+    user_c: { id: "user_c", type: "user", raw_md: "w", frontmatter_json: JSON.stringify({ entity: "person" }) },
+  };
+  const ws = { listPages: () => Object.values(rows).map(({ id, type }) => ({ id, type, status: "active" })), getPage: (id) => rows[id] };
+  const r = pr.listProjects(ws);
+  assert.deepEqual(r.projects.map((p) => [p.id, p.project_status, p.has_block]), [["project_a", "active", true]]);
+  assert.deepEqual(r.candidates.map((p) => p.id), ["decision_b"]);
+});
