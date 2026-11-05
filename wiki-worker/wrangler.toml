@@ -14,7 +14,8 @@
 # installation keeps its filled-in copy at agent/local/wiki-worker/wrangler.toml
 # (`main` pointing back at this directory's src/index.js) and deploys that one.
 #
-# Deploy:  cd wiki-worker && wrangler deploy --config ../agent/local/wiki-worker/wrangler.toml
+# Deploy:  bin/wiki-worker-deploy   (wrangler deploy --config ../agent/local/wiki-worker/wrangler.toml,
+#          plus the vars it reads from instance.json)
 #          (set both secrets FIRST — without them every viewer gets 403)
 # Secrets (wrangler secret put):
 #   SUPABASE_SERVICE_ROLE_KEY — jori project service role (.env)
@@ -37,8 +38,8 @@ routes = [{ pattern = "wiki.example.com/*", zone_name = "example.com" }]
 [vars]
 SUPABASE_URL = "https://<your-project-ref>.supabase.co"
 CF_ACCESS_TEAM_DOMAIN = "<your-team>.cloudflareaccess.com"
-# What the assistant is called on the pages (instance.json `assistant_name`).
-ASSISTANT_NAME = "Jori"  # control-scan-ok: the setting's default
+# ASSISTANT_NAME (what the pages call the assistant) is not set here: bin/wiki-worker-deploy
+# passes instance.json `assistant_name` as a var at deploy time.
 
 # The site icon (src/index.js imports "wiki-favicon"). The kernel default has
 # none (/favicon.* is a 404); an installation's copy points the alias (a path
