@@ -38,8 +38,21 @@ cap=""; prev=""
 for a in "$@"; do [ "$prev" = "--capture-id" ] && cap="$a"; prev="$a"; done
 case "$*" in *"[held]"*) [ -n "$cap" ] && printf '{"suppressed":true,"reason":"test"}\\n' > "$cap" ;; *) [ -n "$cap" ] && printf 'row-1\\n' > "$cap" ;; esac
 `, { mode: 0o755 });
+  // Like digest-deliver: logs what it sent (args, then the body it read) and says
+  // `sent` on stderr; a body marked "[fail]" fails (exit 1) without sending.
+  const delivered = path.join(dir, "delivered.log");
+  const deliver = path.join(dir, "deliver");
+  fs.writeFileSync(deliver, `#!/bin/sh
+body=""; prev=""
+for a in "$@"; do [ "$prev" = "--body-file" ] && body="$a"; prev="$a"; done
+if grep -q 'fail]' "$body"; then echo "digest-deliver: email-send failed" >&2; exit 1; fi
+printf '%s | %s\\n---\\n' "$*" "$(cat "$body")" >> ${delivered}
+echo 'digest-deliver: sent "x"' >&2
+`, { mode: 0o755 });
   // DS_FIX_LAST_USER_MSG: when the user last wrote in chat ("" = not since), never Supabase.
-  const env = { ...process.env, DS_FIX_DIR: path.join(dir, "state"), DS_FIX_SEND_BIN: sender, DS_FIX_TMP: dir, JORI_ROOT: dir, JORI_LOCAL_DIR: local, DS_FIX_LAST_USER_MSG: "" };
+  // DS_FIX_WAKE_LOG: a staged correction's wake is logged, never a real sleep.
+  const env = { ...process.env, DS_FIX_DIR: path.join(dir, "state"), DS_FIX_SEND_BIN: sender, DS_FIX_TMP: dir, JORI_ROOT: dir, JORI_LOCAL_DIR: local, DS_FIX_LAST_USER_MSG: "",
+    DS_FIX_DELIVER_BIN: deliver, DS_FIX_WAKE_LOG: path.join(dir, "wake.log") };
   delete env.DS_FIX_NOW; delete env.DS_FIX_TZ;
   const run = (...args) => spawnSync(process.execPath, [BIN, ...args], { encoding: "utf8", env, timeout: 30000 });
   // `at(iso, tz)` runs the CLI with its clock and the user's timezone pinned.
@@ -57,7 +70,10 @@ case "$*" in *"[held]"*) [ -n "$cap" ] && printf '{"suppressed":true,"reason":"t
       night_of: "2026-10-26", tz: "Asia/Jerusalem", phone_down_at: ago(500), in_bed_now: inBed,
       phone_up_at: upMinAgo === null ? null : ago(upMinAgo), written_at: ago(writtenMinAgo) }));
   };
-  return { dir, run, at, state, sends, queued, unqueue, sleep, done: () => fs.rmSync(dir, { recursive: true, force: true }) };
+  const lines = (f, sep) => (fs.existsSync(f) ? fs.readFileSync(f, "utf8").split(sep).filter(Boolean) : []);
+  const emails = () => lines(delivered, "\n---\n");
+  const wakes = () => lines(path.join(dir, "wake.log"), "\n");
+  return { dir, run, at, state, sends, queued, unqueue, sleep, emails, wakes, done: () => fs.rmSync(dir, { recursive: true, force: true }) };
 }
 
 test("request queues the day for launchd and records why; an answer is kept verbatim", () => {
@@ -431,6 +447,138 @@ test("mark-sent records first sends and corrections; bad arguments are refused",
   } finally { s.done(); }
 });
 
+// Each reply the user emails about a sent summary gets its own short answer in the
+// thread at once (the email-inbound turn, not this CLI) and queues a fix run with
+// `request`. Every run used to send the whole summary again as "(corrected)"; now it
+// stages its version, and code sends the newest once the corrections have stopped for
+// 20 minutes. Nothing here delays the request or its reply.
+const SENT = "2099-01-03";
+const SUBJ = "Day of Saturday, January 3, 2099 (corrected)";
+function sentDay(s) {
+  s.at("2099-01-04T10:45:00Z")("mark-sent", SENT);
+  return (v) => { const f = path.join(s.dir, `v${v}.html`); fs.writeFileSync(f, `<h1>Day of Saturday</h1><p>version ${v}</p>`); return f; };
+}
+const stage = (s, iso, file) => s.at(iso)("stage", SENT, "--subject", SUBJ, "--body-file", file, "--push", "Saturday's summary, corrected");
+const correction = (s, iso) => { const r = s.at(iso)("request", SENT, "--reason", "emailed correction"); s.unqueue(SENT); return r; };
+
+test("two corrections five minutes apart: two runs, one corrected email with the latest version, 20 minutes after the last", () => {
+  const s = sandbox();
+  try {
+    const html = sentDay(s);
+    const r = s.at("2099-01-04T12:32:00Z")("request", SENT, "--reason", "emailed correction 1");
+    assert.equal(r.status, 0);
+    assert.ok(s.queued(SENT), "the correction's run is queued at once");
+    s.unqueue(SENT);
+    assert.equal(stage(s, "2099-01-04T12:35:00Z", html(1)).status, 0);
+    correction(s, "2099-01-04T12:37:00Z");
+    assert.equal(stage(s, "2099-01-04T12:41:00Z", html(2)).status, 0);
+    assert.deepEqual(s.wakes(), ["2099-01-04T12:52:00.000Z", "2099-01-04T12:57:00.000Z"]);
+    s.at("2099-01-04T12:52:05Z")("send-due"); // the first wake: a correction came in since
+    s.at("2099-01-04T12:52:30Z")("sweep");
+    assert.equal(s.emails().length, 0, "nothing goes inside the quiet window");
+    assert.ok(!s.queued("send-due"));
+    assert.equal(s.at("2099-01-04T12:57:05Z")("send-due").status, 0);
+    s.at("2099-01-04T13:30:00Z")("send-due");
+    s.at("2099-01-04T13:52:00Z")("sweep");
+    assert.equal(s.emails().length, 1, "one corrected email");
+    const [email] = s.emails();
+    assert.ok(email.includes(`--subject ${SUBJ}`) && email.includes("--push Saturday's summary, corrected") && email.includes("version 2"), email);
+    const st = s.state(SENT);
+    assert.deepEqual(st.sends.map((x) => [x.corrected, x.versions]), [[false, undefined], [true, 2]]);
+    assert.equal(st.pending_correction, undefined);
+    assert.ok(!fs.existsSync(path.join(s.dir, "state", "pending", `${SENT}.html`)));
+  } finally { s.done(); }
+});
+
+test("a single correction sends exactly one corrected email, 20 minutes after it", () => {
+  const s = sandbox();
+  try {
+    const html = sentDay(s);
+    correction(s, "2099-01-04T12:00:00Z");
+    stage(s, "2099-01-04T12:05:00Z", html(1));
+    assert.deepEqual(s.wakes(), ["2099-01-04T12:20:00.000Z"]);
+    s.at("2099-01-04T12:19:59Z")("send-due");
+    assert.equal(s.emails().length, 0);
+    s.at("2099-01-04T12:20:05Z")("send-due");
+    s.at("2099-01-04T12:21:00Z")("send-due");
+    s.at("2099-01-04T12:52:00Z")("sweep");
+    assert.equal(s.emails().length, 1);
+    assert.ok(!s.queued("send-due"));
+  } finally { s.done(); }
+});
+
+test("a staged copy waits for a newer correction's run; goes when that run ends, or after 3 hours; the sweep queues it if the wake was lost", () => {
+  const s = sandbox();
+  try {
+    const html = sentDay(s);
+    correction(s, "2099-01-04T12:00:00Z");
+    stage(s, "2099-01-04T12:05:00Z", html(1));
+    s.at("2099-01-04T12:10:00Z")("request", SENT, "--reason", "emailed correction 2"); // its run is queued
+    s.at("2099-01-04T12:31:00Z")("send-due");
+    s.at("2099-01-04T12:31:00Z")("sweep");
+    s.unqueue(SENT); // the run starts
+    s.at("2099-01-04T12:40:00Z")("send-due");
+    assert.equal(s.emails().length, 0, "not while the newer correction's run is still to come or under way");
+    assert.ok(!s.queued("send-due"));
+    s.at("2099-01-04T12:45:00Z")("tier-done", SENT, "sonnet"); // it ended without staging a new version
+    s.at("2099-01-04T12:52:00Z")("sweep");
+    assert.ok(s.queued("send-due"), "the sweep queues it for the launchd runner (it never sends)");
+    assert.equal(s.emails().length, 0);
+    s.at("2099-01-04T12:52:40Z")("send-due");
+    assert.equal(s.emails().length, 1);
+    assert.ok(s.emails()[0].includes("version 1"));
+    // A newer correction whose run never comes: the newest copy goes after 3 hours.
+    correction(s, "2099-01-04T13:00:00Z");
+    stage(s, "2099-01-04T13:05:00Z", html(2));
+    s.at("2099-01-04T13:06:00Z")("request", SENT, "--reason", "emailed correction 4");
+    s.at("2099-01-04T15:52:00Z")("send-due");
+    assert.equal(s.emails().length, 1);
+    s.at("2099-01-04T16:07:00Z")("send-due");
+    assert.equal(s.emails().length, 2);
+    assert.ok(s.emails()[1].includes("version 2"));
+  } finally { s.done(); }
+});
+
+test("stage refuses a day never sent; with no correction waiting it goes at once; 'send it now' ends the wait", () => {
+  const s = sandbox();
+  try {
+    const f = path.join(s.dir, "x.html"); fs.writeFileSync(f, "<p>x</p>");
+    assert.equal(s.run("stage", D, "--subject", "s", "--body-file", f).status, 3, "a first send is never deferred");
+    assert.ok(!fs.existsSync(path.join(s.dir, "state", `${D}.json`)), "nothing recorded");
+    const html = sentDay(s);
+    stage(s, "2099-01-04T11:00:00Z", html(1)); // e.g. the run the sweep starts when a correction's answer window closes
+    assert.ok(s.queued("send-due"), "due at once: the runner is started now");
+    s.at("2099-01-04T11:00:30Z")("send-due");
+    assert.equal(s.emails().length, 1);
+    correction(s, "2099-01-04T12:00:00Z");
+    stage(s, "2099-01-04T12:05:00Z", html(2));
+    s.at("2099-01-04T12:06:00Z")("release", SENT); s.unqueue(SENT);
+    s.at("2099-01-04T12:09:00Z")("tier-done", SENT, "sonnet");
+    s.at("2099-01-04T12:10:00Z")("send-due");
+    assert.equal(s.emails().length, 2, "released: it goes before 12:20");
+  } finally { s.done(); }
+});
+
+test("a staged correction that fails to send is kept and retried, never dropped; the third failure is said once on the system channel", () => {
+  const s = sandbox();
+  try {
+    const html = sentDay(s);
+    const f = html(1);
+    fs.writeFileSync(f, "<p>[fail]</p>");
+    stage(s, "2099-01-04T11:00:00Z", f);
+    for (const t of ["11:00:30", "11:52:00", "12:52:00", "13:52:00"]) assert.equal(s.at(`2099-01-04T${t}Z`)("send-due").status, 1);
+    assert.equal(s.emails().length, 0);
+    assert.equal(s.state(SENT).pending_correction.attempts, 4);
+    assert.equal(s.sends().filter((m) => m.includes("failed to send 3 times")).length, 1);
+    s.at("2099-01-04T14:52:00Z")("sweep");
+    assert.ok(s.queued("send-due"), "still due: the sweep keeps queueing it");
+    fs.writeFileSync(path.join(s.dir, "state", "pending", `${SENT}.html`), "<p>version 1</p>"); // the mail path recovers
+    assert.equal(s.at("2099-01-04T14:52:40Z")("send-due").status, 0);
+    assert.equal(s.emails().length, 1);
+    assert.equal(s.state(SENT).pending_correction, undefined);
+  } finally { s.done(); }
+});
+
 // The closing section is built from the append-only fix log. A finding logged
 // `unresolved` and fixed by a later run, or a question whose answer a later entry
 // applied, used to read "not fixed yet" / "waiting on your answer" beside the
@@ -787,20 +935,31 @@ test("the launchd runner sends held questions only after the Max sign-in check, 
       fs.writeFileSync(path.join(home, "local", "config", "daily-summary-fix.json"), JSON.stringify({ quiet_hours: QUIET }));
       const sent = path.join(home, "sent.log");
       fs.writeFileSync(path.join(home, "send"), `#!/bin/sh\nprintf '%s\\n---\\n' "$*" >> ${sent}\n`, { mode: 0o755 });
-      const env = { ...process.env, HOME: home, JORI_ROOT: root, JORI_LOCAL_DIR: path.join(home, "local"), DS_FIX_SEND_BIN: path.join(home, "send"), DS_FIX_TZ: "Asia/Jerusalem", DS_FIX_LAST_USER_MSG: "" };
+      fs.writeFileSync(path.join(home, "deliver"), `#!/bin/sh\necho "$*" >> ${home}/delivered.log\n`, { mode: 0o755 });
+      const env = { ...process.env, HOME: home, JORI_ROOT: root, JORI_LOCAL_DIR: path.join(home, "local"), DS_FIX_SEND_BIN: path.join(home, "send"), DS_FIX_TZ: "Asia/Jerusalem", DS_FIX_LAST_USER_MSG: "",
+        DS_FIX_DELIVER_BIN: path.join(home, "deliver"), DS_FIX_WAKE_LOG: path.join(home, "wake.log") };
       delete env.DS_FIX_DIR; delete env.CLAUDE_BIN;
       const cli = (iso, ...args) => spawnSync(process.execPath, [BIN, ...args], { encoding: "utf8", env: { ...env, DS_FIX_NOW: iso } });
       const sends = () => (fs.existsSync(sent) ? fs.readFileSync(sent, "utf8").split("\n---\n").filter(Boolean) : []);
       const queue = path.join(root, "data", "daily-summary-fix", "queue");
 
       cli("2026-10-27T02:19:18Z", "ask", OCT26, "--question", "Was Sam with you at dinner?");
+      // A corrected summary staged earlier, due since 07:30 (its wake was lost): the sweep
+      // queues `send-due`, and the runner sends it, signed in or not (code, no model).
+      fs.writeFileSync(path.join(home, "c.html"), "<p>corrected</p>");
+      cli("2026-10-27T07:00:00Z", "mark-sent", "2026-10-25");
+      cli("2026-10-27T07:10:00Z", "request", "2026-10-25", "--reason", "emailed correction", "--no-kick");
+      cli("2026-10-27T07:12:00Z", "stage", "2026-10-25", "--subject", "S (corrected)", "--body-file", path.join(home, "c.html"));
       cli("2026-10-27T07:52:02Z", "sweep");
+      assert.ok(fs.existsSync(path.join(queue, "send-due")));
       assert.equal(sends().length, 0, "the cron sweep sends nothing");
       assert.ok(fs.existsSync(path.join(queue, "release-held")));
 
       const r = spawnSync("/bin/bash", [path.join(scripts, "trigger-daily-summary-fix.sh")], { encoding: "utf8", env: { ...env, DS_FIX_NOW: "2026-10-27T07:52:40Z" }, timeout: 30000 });
       assert.equal(r.status, 0, r.stderr);
       assert.ok(!fs.existsSync(path.join(queue, "release-held")), "the marker is consumed either way, so launchd does not loop");
+      assert.ok(!fs.existsSync(path.join(queue, "send-due")));
+      assert.equal(fs.readFileSync(path.join(home, "delivered.log"), "utf8").split("\n").filter(Boolean).length, 1, "the corrected summary went once");
       assert.ok(!fs.existsSync(path.join(home, "fork.log")), "a release starts no fixer run");
       const st = JSON.parse(fs.readFileSync(path.join(root, "data", "daily-summary-fix", `${OCT26}.json`), "utf8"));
       const log = fs.readFileSync(path.join(root, "agent", "logs", "daily-summary-fix.log"), "utf8");

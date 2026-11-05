@@ -43,6 +43,16 @@
 // (trigger-daily-summary-fix.sh, keychain session) confirms the Max sign-in and runs
 // `release-held`, which sends through the full check.
 //
+// A correction is sent once per burst, not once per correction. Each reply the user
+// emails about a sent summary gets its own short answer in the thread at once (the
+// email-inbound turn), and queues a fix run; every run used to send the whole
+// summary again as "(corrected)", so a few replies in a row meant as many full
+// copies, each an unread starred email. Now a run that corrects a sent day stages
+// its version, and code sends the newest one once no correction has come in for
+// the quiet window. The staged copy is kept on disk with the day's state, so a
+// restart loses nothing: the runner's wake fires at the due time, and the hourly
+// sweep queues anything past due.
+//
 //   daily-summary-fix request <date> [--reason R] [--answer "<the user's words>"] [--from-review] [--no-kick]
 //       (--from-review: the daily summary's reviewer did not confirm the day; read by pickTier)
 //       queue a fix run (the daily-summary fork on a non-confirmed review; the
@@ -68,6 +78,12 @@
 //   daily-summary-fix answered <date> <n> [<n> ...]  mark the questions the user's words settle (the fixer's reading)
 //   daily-summary-fix release <date> [--reason R]    the user asked for the summary now: end the wait, queue a run
 //   daily-summary-fix mark-sent <date> [--corrected]   record that the email went out (first send or a correction)
+//   daily-summary-fix stage <date> --subject S --body-file F [--push P]
+//       a correction (the day already went out): keep this version, to go once the user's
+//       corrections have stopped for 20 minutes (`correction_quiet_min`); a later stage
+//       replaces it. Sends nothing itself. Exit 3: the day was never sent (send it at once).
+//   daily-summary-fix send-due                       (launchd runner only) send each staged correction
+//       whose quiet window has passed, record the send; arm the wake for one not yet due
 //   daily-summary-fix done <date> --status confirmed|gave_up [--note N] [--still-open <i,j,...|none>]
 //       close the loop; gave_up files the remaining code-owned defects to the system channel:
 //       with --still-open only those log entries (0-based indices, as `log` prints them; none = nothing),
@@ -87,7 +103,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { createRequire } from "node:module";
 
 const INST = createRequire(import.meta.url)("../lib/instance.cjs");
@@ -118,6 +134,18 @@ const RELEASE_MARKER = "release-held";
 const RELEASE_ANCHOR_MS = 10 * 60e3;
 // The sweep's due mark is honoured this long (the next sweep renews it).
 const RELEASE_DUE_MAX_MS = 6 * 3600e3;
+// A staged correction goes once the user's corrections have stopped this long
+// (agent/local/config/daily-summary-fix.json `correction_quiet_min`, default 20).
+const CORRECTION_QUIET_MS = (() => {
+  const m = Number(INST.localConfig("daily-summary-fix", { correction_quiet_min: 20 }).correction_quiet_min);
+  return (Number.isFinite(m) && m >= 0 ? m : 20) * 60e3;
+})();
+const CORRECTION_STALE_MS = 3 * 3600e3;  // a newer correction whose run never finished: the newest copy goes anyway
+const SENDING_CLAIM_MS = 15 * 60e3;      // a send in flight (or one that died mid-way) is left alone this long
+const SEND_PAGE_AFTER = 3;               // failed sends of a staged correction before the system channel hears of it
+const SEND_DUE_MARKER = "send-due";      // the launchd queue marker for `send-due`
+const PENDING = path.join(DIR, "pending");
+const DELIVER = process.env.DS_FIX_DELIVER_BIN || path.join(ROOT, "bin", "digest-deliver");
 
 const argv = process.argv.slice(2);
 const cmd = argv[0];
@@ -181,6 +209,26 @@ const escapeHtml = (t) => String(t ?? "").replace(/&/g, "&amp;").replace(/</g, "
 function kick(d) {
   fs.mkdirSync(QUEUE, { recursive: true });
   fs.writeFileSync(path.join(QUEUE, d), now() + "\n"); // launchd QueueDirectories starts the runner
+}
+// A fix run for the day is still to come (queued, or waiting on the allowance governor in held/).
+const isQueued = (d) => fs.existsSync(path.join(QUEUE, d)) || fs.existsSync(path.join(DIR, "held", d));
+
+/**
+ * Start the launchd runner when a staged correction comes due: at once (the marker),
+ * or from a detached sleep that drops it then. The sleep does not survive a restart;
+ * the hourly sweep drops the same marker for anything past due, so a lost wake
+ * delays the email, never loses it. DS_FIX_WAKE_LOG (tests) records the wake instead.
+ */
+function armSendDue(dueMs) {
+  if (!Number.isFinite(dueMs)) return;
+  const marker = path.join(QUEUE, SEND_DUE_MARKER);
+  const secs = Math.ceil((dueMs - clock().getTime()) / 1000);
+  fs.mkdirSync(QUEUE, { recursive: true });
+  if (secs <= 0) { fs.writeFileSync(marker, now() + "\n"); return; }
+  if (process.env.DS_FIX_WAKE_LOG) { fs.appendFileSync(process.env.DS_FIX_WAKE_LOG, `${new Date(dueMs).toISOString()}\n`); return; }
+  try {
+    spawn("/bin/sh", ["-c", 'sleep "$1" && date -u > "$2"', "sh", String(secs + 5), marker], { detached: true, stdio: "ignore" }).unref();
+  } catch (e) { console.error(`daily-summary-fix: could not arm the wake (${e.message}); the hourly sweep sends it instead`); }
 }
 
 // ── The answer window ──────────────────────────────────────────────────────
@@ -392,6 +440,43 @@ export function verdict(s, nowMs = clock().getTime()) {
   return { send: true, reason: "window_closed", ...base };
 }
 
+/**
+ * May the staged correction go now? It goes once no correction has come in since the
+ * last send for the quiet window (the user's own `request`s; the sweep's do not count,
+ * and the user asking for it now, `release`, ends the wait), never before it was staged.
+ * While a request newer than the staged copy still has a fix run to come (`queued`, or
+ * none finished since), it waits for that run, so the email carries every correction;
+ * past CORRECTION_STALE_MS the newest copy goes anyway. Questions asked since the send
+ * hold it as they hold any correction (`verdict`). Pure: state, clock and `queued` in.
+ */
+export function correctionDue(s, nowMs, { queued = false } = {}) {
+  const p = s.pending_correction;
+  const sent = lastSendAt(s) || "";
+  if (!p) return { send: false, reason: "nothing_staged" };
+  if (p.staged_at <= sent) return { send: false, reason: "superseded" }; // a send since made it moot
+  const since = (s.requests || []).filter((r) => r.at > sent);
+  const lastBy = (rs) => rs.map((r) => r.at).sort().pop() || "";
+  const lastCorrection = lastBy(since.filter((r) => r.from !== "sweep" && r.from !== "release"));
+  const released = since.some((r) => r.from === "release" && r.at >= lastCorrection);
+  const dueMs = Math.max(Date.parse(p.staged_at), released || !lastCorrection ? 0 : Date.parse(lastCorrection) + CORRECTION_QUIET_MS);
+  const lastReq = lastBy(since);
+  const current = !queued && (p.staged_at >= lastReq || lastBy(s.tier_runs || []) >= lastReq);
+  const base = { due_at: new Date(dueMs).toISOString(), staged_at: p.staged_at };
+  const v = verdict(s, nowMs);
+  if (!v.send) return { send: false, reason: v.reason, ...base };
+  if (nowMs < dueMs) return { send: false, reason: "quiet_window", ...base };
+  if (!current && nowMs - Date.parse(lastReq) < CORRECTION_STALE_MS) return { send: false, reason: "newer_correction_pending", ...base };
+  return { send: true, reason: current ? "quiet" : "stale_run", ...base };
+}
+
+// Record that the email went out (mark-sent, send-due). Sent with questions still open
+// (the window closed): keep the day parked on the user, so a late answer the chat agent
+// misses is still picked up by the sweep.
+function recordSend(t, entry) {
+  (t.sends = t.sends || []).push({ at: now(), ...entry });
+  if (t.questions.some((q) => !q.answered_at && !q.dropped_at) && !["confirmed", "gave_up"].includes(t.status)) t.status = AWAITING;
+}
+
 if (cmd === "request") {
   if (!isDate(date)) die("usage: request <YYYY-MM-DD> [--reason R] [--answer TEXT] [--from-review] [--no-kick]");
   const s = load(date);
@@ -504,7 +589,7 @@ if (cmd === "request") {
   const s = load(date);
   const t = now();
   for (const h of [s.hold, s.correction_hold]) if (h && h.until > t) { h.until = t; h.released_at = t; }
-  s.requests.push({ at: t, reason: opt("--reason") || "he asked for the summary now" });
+  s.requests.push({ at: t, reason: opt("--reason") || "he asked for the summary now", from: "release" });
   s.status = "queued";
   save(s);
   if (!has("--no-kick")) kick(date);
@@ -540,14 +625,86 @@ if (cmd === "request") {
   console.log(`${date} ${st}`);
 } else if (cmd === "mark-sent") {
   if (!isDate(date)) die("usage: mark-sent <date> [--corrected]");
-  const s = load(date);
-  s.sends = s.sends || [];
-  s.sends.push({ at: now(), corrected: has("--corrected") });
-  // Sent with questions still open (the window closed): keep the day parked on the user,
-  // so a late answer the chat agent misses is still picked up by the sweep.
-  if (s.questions.some((q) => !q.answered_at && !q.dropped_at) && !["confirmed", "gave_up"].includes(s.status)) s.status = AWAITING;
-  save(s);
+  mutate(date, (t) => recordSend(t, { corrected: has("--corrected") }));
   console.log(`${date} send recorded`);
+} else if (cmd === "stage") {
+  if (!isDate(date)) die("usage: stage <date> --subject S --body-file F [--push P]");
+  const subject = opt("--subject"), body = opt("--body-file");
+  if (!subject || !body || subject.startsWith("--") || body.startsWith("--")) die("stage: --subject and --body-file are required");
+  let html;
+  try { html = fs.readFileSync(body, "utf8"); } catch (e) { die(`stage: cannot read ${body}: ${e.message}`); }
+  if (!lastSendAt(load(date))) die(`stage: ${date} has not been sent yet; a first send goes out at once (digest-deliver), only a correction is staged`, 3);
+  // The copy that will go, kept beside the state (the fixer's /tmp file is rebuilt by the next run).
+  fs.mkdirSync(PENDING, { recursive: true });
+  const file = path.join(PENDING, `${date}.html`);
+  fs.writeFileSync(`${file}.tmp-${process.pid}`, html);
+  fs.renameSync(`${file}.tmp-${process.pid}`, file);
+  const s = mutate(date, (t) => {
+    const prev = t.pending_correction;
+    t.pending_correction = { staged_at: now(), subject, push: opt("--push") || null, body_file: file, versions: (prev ? prev.versions || 1 : 0) + 1 };
+  });
+  const nowMs = clock().getTime();
+  const c = correctionDue(s, nowMs, { queued: isQueued(date) });
+  const dueMs = Date.parse(c.due_at);
+  armSendDue(dueMs);
+  mutate(date, (t) => { if (t.pending_correction) t.pending_correction.wake_at = c.due_at; });
+  console.log(dueMs <= nowMs ? `staged: the corrected summary goes out in a moment` : `staged: the corrected summary goes out at ${clockLabel(dueMs, localTz(), nowMs)} if no other correction comes in`);
+} else if (cmd === "send-due") {
+  // The launchd runner only (after each fix run, and on the send-due marker), so it
+  // never runs beside a fix run. Code sends: digest-deliver, then the record. It looks
+  // at every day, so a marker already queued is answered by this run.
+  fs.rmSync(path.join(QUEUE, SEND_DUE_MARKER), { force: true });
+  const nowMs = clock().getTime();
+  let sentN = 0, waiting = 0, failed = 0;
+  for (const f of (fs.existsSync(DIR) ? fs.readdirSync(DIR) : [])) {
+    const d = f.slice(0, 10);
+    if (f !== `${d}.json` || !isDate(d)) continue;
+    const s = load(d);
+    const p = s.pending_correction;
+    if (!p || (p.sending_at && nowMs - Date.parse(p.sending_at) < SENDING_CLAIM_MS)) continue;
+    const c = correctionDue(s, nowMs, { queued: isQueued(d) });
+    if (c.reason === "superseded") { mutate(d, (t) => { if (t.pending_correction && t.pending_correction.staged_at === p.staged_at) delete t.pending_correction; }); continue; }
+    if (!c.send) {
+      waiting++;
+      if (c.reason === "quiet_window" && p.wake_at !== c.due_at) {
+        armSendDue(Date.parse(c.due_at));
+        mutate(d, (t) => { if (t.pending_correction) t.pending_correction.wake_at = c.due_at; });
+      }
+      console.log(`${d}: the corrected summary waits (${c.reason}${c.due_at ? `, due ${c.due_at}` : ""})`);
+      continue;
+    }
+    const claimAt = now(); // the send's time: a copy staged after it is newer than this send
+    mutate(d, (t) => { if (t.pending_correction) t.pending_correction.sending_at = claimAt; });
+    const r = spawnSync(DELIVER, ["--subject", p.subject, "--body-file", p.body_file, "--intent", "daily-summary", ...(p.push ? ["--push", p.push] : [])],
+      { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], timeout: 300000 });
+    process.stderr.write(r.stderr || "");
+    // Exit 0 sent, 2 sent but unlabeled, 1 nothing sent. digest-deliver logs `sent "<subject>"`
+    // the moment the email is out, so a crash after that still counts as sent (never twice).
+    const out = r.status === 0 || r.status === 2 || String(r.stderr || "").includes(`digest-deliver: sent "`);
+    if (!out) {
+      failed++;
+      const t = mutate(d, (x) => {
+        const q = x.pending_correction;
+        if (q) { delete q.sending_at; q.attempts = (q.attempts || 0) + 1; q.error = { at: now(), exit: r.status, ...(r.error ? { code: r.error.code } : {}) }; }
+      });
+      const n = t.pending_correction ? t.pending_correction.attempts : 0;
+      console.error(`daily-summary-fix: send-due ${d}: the corrected summary did not send (exit ${r.status}); kept, the sweep retries it`);
+      if (n === SEND_PAGE_AFTER) {
+        try { send(["--channel", "system", "--skip-precheck", "--intent", "daily-summary-fix", `⚠️ daily-summary-fix: the corrected ${d} summary failed to send ${n} times; it stays staged and is retried hourly — see agent/logs/daily-summary-fix.log.`]); } catch {}
+      }
+      continue;
+    }
+    mutate(d, (t) => {
+      recordSend(t, { at: claimAt, corrected: true, versions: p.versions || 1 });
+      const x = t.pending_correction;
+      if (x && x.staged_at === p.staged_at) delete t.pending_correction; // a copy staged meanwhile stays for its own send
+    });
+    if (!load(d).pending_correction) fs.rmSync(p.body_file, { force: true });
+    sentN++;
+    console.log(`${d}: sent the corrected summary (${p.versions || 1} version(s) staged)`);
+  }
+  console.log(`send-due: sent ${sentN}, waiting ${waiting}${failed ? `, ${failed} failed` : ""}`);
+  process.exit(failed ? 1 : 0);
 } else if (cmd === "sweep") {
   // (0) Questions held through the user's quiet hours: once the user is up (the user's phone, else the user's
   //     chat, from `awake_from`; at the latest when they end), mark the day due and
@@ -571,7 +728,10 @@ if (cmd === "request") {
   // (4) A day still waiting on the user after its window (sent with questions open):
   //     re-queue when the user has written since the question, at most every 6 hours.
   //     Whether it IS the answer is the fixer model's call (it reads the user's messages).
-  let n = 0, dueDays = 0, dropped = 0;
+  // (5) A staged correction past its quiet window: drop the `send-due` marker for the
+  //     launchd runner, which sends it. Its own wake normally does this first; this is
+  //     the backstop when the wake was lost (a restart). The sweep never sends it.
+  let n = 0, dueDays = 0, dropped = 0, dueSends = 0;
   const nowMs = clock().getTime();
   let tz = null, quietEnd; // resolved once, and only when a held question is waiting
   for (const f of (fs.existsSync(DIR) ? fs.readdirSync(DIR) : [])) {
@@ -594,6 +754,8 @@ if (cmd === "request") {
       if (changed) save(s);
       if (held.some((q) => q.dropped_at) && startIfNothingOpen(d, "sweep: the question held through his quiet hours was not asked after all; nothing is waiting on him, send it")) { n++; continue; }
     }
+    const pc = s.pending_correction;
+    if (pc && !(pc.sending_at && nowMs - Date.parse(pc.sending_at) < SENDING_CLAIM_MS) && correctionDue(s, nowMs, { queued: isQueued(d) }).send) dueSends++;
     if (s.status !== AWAITING && s.status !== "queued") continue;
     const sent = lastSendAt(s);
     const hold = sent ? (s.correction_hold && s.correction_hold.set_at > sent ? s.correction_hold : null) : (s.hold || null);
@@ -614,7 +776,7 @@ if (cmd === "request") {
         try { send(["--channel", "system", "--skip-precheck", "--intent", "daily-summary-fix", `⚠️ daily-summary-fix: the ${d} summary is still unsent after ${DEADLINE_MAX_RUNS} fix runs ${windowClosed ? "past its answer window" : "that ended without sending it"} — see agent/logs/daily-summary-fix.log.`]); } catch {}
         continue;
       }
-      s.requests.push({ at: now(), reason: windowClosed
+      s.requests.push({ at: now(), from: "sweep", reason: windowClosed
         ? `sweep: the answer window closed at ${hold.label}; send the best version now, the open question(s) listed`
         : "sweep: the last fix run ended without sending the summary; run it again" });
       s.deadline_queued_at = now();
@@ -630,13 +792,18 @@ if (cmd === "request") {
     if (ageDays > 3) { s.status = "gave_up"; s.note = "no answer within 3 days"; save(s); continue; }
     if (s.sweep_seen_at && nowMs - Date.parse(s.sweep_seen_at) < 6 * 3600e3) continue;
     const since = [lastQ, s.sweep_seen_at || "", sent || ""].sort().pop(); // the send's run already read what came before it
-    if (newUserMessageSince(since)) { s.requests.push({ at: now(), reason: "sweep: he wrote since the question" }); s.sweep_seen_at = now(); s.status = "queued"; save(s); kick(s.date); n++; }
+    if (newUserMessageSince(since)) { s.requests.push({ at: now(), from: "sweep", reason: "sweep: he wrote since the question" }); s.sweep_seen_at = now(); s.status = "queued"; save(s); kick(s.date); n++; }
   }
   if (dueDays) {
     fs.mkdirSync(QUEUE, { recursive: true });
     fs.writeFileSync(path.join(QUEUE, RELEASE_MARKER), now() + "\n"); // launchd sends them, after its Max check
   }
   if (dueDays || dropped) console.log(`held questions: ${dueDays} day(s) due to ask (queued for launchd), ${dropped} dropped`);
+  if (dueSends) {
+    fs.mkdirSync(QUEUE, { recursive: true });
+    fs.writeFileSync(path.join(QUEUE, SEND_DUE_MARKER), now() + "\n"); // launchd sends them
+    console.log(`corrected summaries: ${dueSends} due to send (queued for launchd)`);
+  }
   console.log(`re-queued ${n}`);
 } else if (cmd === "release-held") {
   // Launchd only (trigger-daily-summary-fix.sh runs it after confirming the Max
@@ -730,7 +897,7 @@ if (cmd === "request") {
   fs.writeFileSync(into, doc);
   console.log(html ? "section inserted" : "no review notes; nothing inserted");
 } else {
-  die("usage: request|status|log|ask|gate|answered|release|mark-sent|done|sweep|release-held|section — see the header");
+  die("usage: request|status|log|ask|gate|answered|release|mark-sent|stage|send-due|done|sweep|release-held|section — see the header");
 }
 
 /**

@@ -21,6 +21,11 @@
 # so they would go out unchecked. This runner sends them first, and only after the
 # same Max sign-in check the fork runner makes; signed out, they stay held and the
 # next sweep queues them again.
+#
+# The `send-due` marker is not a date either: a corrected summary a fix run staged
+# (`daily-summary-fix stage`) is due, past its quiet window. Its wake or the hourly
+# sweep drops it; `daily-summary-fix send-due` sends it (code, no model, so no Max
+# check). The same command runs after every fix run, for what that run staged or settled.
 
 export PATH="$HOME/.local/node/bin:/opt/homebrew/bin:$PATH"
 SCRIPTS="$(cd "$(dirname "$0")" && pwd)"
@@ -32,6 +37,7 @@ LOG="$ROOT/agent/logs/daily-summary-fix.log"
 FIX="$ROOT/bin/daily-summary-fix"
 CLAUDE="${CLAUDE_BIN:-$HOME/.local/bin/claude}"
 RELEASE="release-held"
+SEND_DUE="send-due"
 TIMEOUT_MIN=120
 
 # Helpers on Sonnet: the repair loop's cost is kept down with lower-effort
@@ -61,6 +67,12 @@ if [ -e "$Q/$RELEASE" ]; then
   fi
 fi
 
+if [ -e "$Q/$SEND_DUE" ]; then
+  rm -f "$Q/$SEND_DUE"   # before anything slow, as above
+  "$FIX" send-due >> "$LOG" 2>&1
+  log "send-due: exit $?"
+fi
+
 # Days the allowance governor held wait in held/ (outside the queue directory
 # launchd watches); they go first, and a run that goes ahead hands the rest back.
 HELD="$ROOT/data/daily-summary-fix/held"
@@ -69,9 +81,9 @@ M="$(ls -1 "$HELD" 2>/dev/null | grep -E '^[0-9]{4}-[0-9]{2}-[0-9]{2}$' | sort |
 [ -n "$M" ] && mv "$HELD/$M" "$Q/$M"
 M="$(ls -1 "$Q" 2>/dev/null | grep -E '^[0-9]{4}-[0-9]{2}-[0-9]{2}$' | sort | head -n1)"
 if [ -z "$M" ]; then
-  # Clear stray files, but not a release marker the sweep dropped meanwhile (launchd
+  # Clear stray files, but not a release or send-due marker dropped meanwhile (launchd
   # starts this runner again for it).
-  for x in "$Q"/*; do [ -e "$x" ] && [ "$(basename "$x")" != "$RELEASE" ] && rm -f "$x"; done
+  for x in "$Q"/*; do [ -e "$x" ] && [ "$(basename "$x")" != "$RELEASE" ] && [ "$(basename "$x")" != "$SEND_DUE" ] && rm -f "$x"; done
   exit 0
 fi
 # The allowance governor (bin/allowance-brake via lib/allowance-gate.sh),
@@ -123,6 +135,9 @@ log "$DATE: runner exit $RC"
 # What this run left behind decides the next run's tier (a held or refused run
 # did nothing, so it is not recorded).
 if [ "$RC" -ne 78 ] && [ "$RC" -ne 75 ]; then "$FIX" tier-done "$DATE" "$TIER" >> "$LOG" 2>&1; fi
+# A correction this run staged (or one waiting on this run) goes now if its quiet
+# window has passed; otherwise this arms its wake.
+"$FIX" send-due >> "$LOG" 2>&1
 if [ "$RC" -eq 78 ]; then
   # Max-only guard refused (not signed in). Leave the day queued for the next
   # successful sign-in rather than looping now; the sweep re-queues it.
