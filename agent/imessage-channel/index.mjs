@@ -26,6 +26,7 @@ import path from "node:path";
 import { createRequire } from "node:module";
 import { installTools } from "../../lib/root.cjs";
 import { queueAlert, recentFromInbox } from "../../lib/message-alert.mjs";
+import { handleMention } from "../../lib/jori-mention.mjs";
 
 const require = createRequire(import.meta.url);
 const idb = require("../../lib/imessage-db.js");
@@ -169,6 +170,13 @@ function start() {
           appendInbox(entry);
           const d = pushDecision(entry, config);
           if (!entry.from_me) log(`message chat=${entry.chat_id} group=${entry.is_group} push=${d.push} reason=${d.reason}`);
+          // "@jori …" in the user's own message is an instruction (lib/jori-mention.mjs).
+          if (entry.from_me && entry.kind === "message" && !backlog) {
+            handleMention({
+              channel: "imessage", message_id: entry.message_id, chat_id: entry.chat_id, chat_name: entry.chat_name,
+              reply_to_handle: entry.chat_identifier, is_group: entry.is_group, from_me: true, ts: entry.ts, text: entry.text,
+            }, recentFromInbox(INBOX, "chat_id", entry.chat_id), { log });
+          }
           if (d.push) {
             const who = entry.sender_name || entry.sender;
             const ctx = entry.is_group ? ` (in ${entry.chat_name})` : "";

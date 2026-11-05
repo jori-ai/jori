@@ -47,6 +47,7 @@ import { QueuePersist } from "./queue-persist.mjs";
 import { EventLog } from "./event-log.mjs";
 import { State } from "./state.mjs";
 import { GmailSource } from "./gmail-source.mjs";
+import { SentMailWatch } from "./sent-mail-watch.mjs";
 import { startServers } from "./http-server.mjs";
 import { Instrumentation } from "./instrumentation.mjs";
 import { attachClaudeMdWatcher } from "./graceful-restart.mjs";
@@ -1992,6 +1993,10 @@ async function main() {
       console.error(`[supervisor] triage-route wiring failed (${err.message}) — triage stays on ${args.agent}`);
     }
     supervisor.fireStartupCatchup().catch(err => console.error(`[supervisor] fireStartupCatchup failed: ${err.message}`));
+    // The user's outgoing mail: logged to data/email-sent.jsonl, "@jori" in it
+    // is an instruction (sent-mail-watch.mjs, lib/jori-mention.mjs).
+    supervisor.sentMailWatch = new SentMailWatch({ getToken: () => supervisor.gmailSource._getAccessToken() });
+    supervisor.sentMailWatch.start();
   } else {
     console.error(`[supervisor] agent=${args.agent} has no gmailPubsubPort — gmail catchup disabled (webhook-only)`);
   }

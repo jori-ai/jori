@@ -25,6 +25,7 @@ import qrcode from "qrcode-terminal";
 import pino from "pino";
 import { createServer } from "node:http";
 import { classifyForPush } from "./filter.mjs";
+import { handleMention } from "../../lib/jori-mention.mjs";
 import { queueAlert, recentFromInbox } from "../../lib/message-alert.mjs";
 import { acceptUpsert, isOwnMachinery, messageType, extractText, createRecentIds, createGroupCache, summarizeGroups } from "./core.mjs";
 import { appendFileSync, mkdirSync, existsSync } from "node:fs";
@@ -251,6 +252,11 @@ async function onMessagesUpsert(socketRef, groupCache, { messages, type: upsertT
 
     if (fromMe) {
       log(`own message chat=${chatJid} upsert=${upsertType}`);
+      // "@jori …" in the user's own message is an instruction (lib/jori-mention.mjs).
+      handleMention({
+        channel: "whatsapp", message_id: entry.message_id, chat_id: entry.chat_id, chat_name: groupName,
+        is_group: isGroup, from_me: true, ts: entry.ts, text,
+      }, recentFromInbox(INBOX, "chat_id", entry.chat_id), { log });
       continue; // the user's own words are never pushed back to them
     }
 
