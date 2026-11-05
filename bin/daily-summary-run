@@ -572,5 +572,21 @@ if auth_or_empty_run "$OUT_TMP"; then
   exit 1
 fi
 rm -f "$OUT_TMP"
+
+# Reviewer A/B (data/daily-summary-review-ab.json; bin/daily-summary-review
+# header): the day's first production review left a snapshot of what it read;
+# review the same snapshot with the other model, as a shadow -- no repair, no
+# defects ledger, its own output file, nothing published or sent. Runs after the
+# summary is out, so it can never delay or change it; a failure only logs.
+AB_DIR="$JORI_INSTALL_TOOLS/data/daily-summary-review-ab/$DATE_ARG"
+AB_CFG="$JORI_INSTALL_TOOLS/data/daily-summary-review-ab.json"
+if (( RC == 0 )) && [[ -f "$AB_CFG" && -f "$AB_DIR/primary.json" && ! -f "$AB_DIR/shadow.json" ]]; then
+  AB_MODEL="$("$JORI_NODE" -e 'try{process.stdout.write(JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")).model||"sonnet")}catch{process.stdout.write("sonnet")}' "$AB_CFG")"
+  AB_EFFORT="$("$JORI_NODE" -e 'try{process.stdout.write(JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")).effort||"high")}catch{process.stdout.write("high")}' "$AB_CFG")"
+  log "reviewer A/B: shadow review on $AB_MODEL/$AB_EFFORT"
+  "$JORI_INSTALL_TOOLS/bin/daily-summary-review" "$DATE_ARG" --shadow --model "$AB_MODEL" --effort "$AB_EFFORT" \
+    --input-dir "$AB_DIR/input" --out "$AB_DIR/shadow.json" > /dev/null 2>> "$LOG" \
+    && log "reviewer A/B: shadow done" || log "reviewer A/B: shadow review failed (exit $?)"
+fi
 log "exit $RC"
 exit "$RC"

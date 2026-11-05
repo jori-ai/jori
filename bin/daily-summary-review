@@ -65,6 +65,14 @@
  *
  * Usage: daily-summary-review <YYYY-MM-DD> [--model opus|sonnet] [--effort E]
  *          [--repair] [--max-repairs N] [--budget-sec S] [--no-model]
+ *          [--shadow --input-dir D --out F]
+ *
+ * Reviewer A/B (data/daily-summary-review-ab.json, `{until, model, effort}`):
+ * while it is on, the FIRST review of a date snapshots everything it read into
+ * data/daily-summary-review-ab/<date>/input/ and writes its first-round and final
+ * findings to primary.json; daily-summary-run then reviews that same snapshot with
+ * the other model as a --shadow run (no repair, no defects ledger, its own --out,
+ * nothing published or sent) and bin/daily-summary-review-ab compares the two.
  */
 const fs = require("node:fs");
 const path = require("node:path");
@@ -94,28 +102,46 @@ const modelName = arg("--model", "opus");
 const model = MODELS[modelName] || MODELS.opus;
 const effort = arg("--effort", "high");
 const noModel = flag("--no-model");
-const repair = flag("--repair") && !noModel;
+const repair = flag("--repair") && !noModel && !flag("--shadow");
 const maxRepairs = Math.max(0, parseInt(arg("--max-repairs", "2"), 10) || 0);
 const budgetMs = Math.max(30, parseInt(arg("--budget-sec", "570"), 10) || 570) * 1000;
+const shadow = flag("--shadow");
+const IN = arg("--input-dir", "/tmp");
+const OUT = arg("--out", `/tmp/ds-review-${date}.json`);
 const startedAt = Date.now();
 const deadline = startedAt + budgetMs;
 
 const CALL_CAP_MS = 200000;   // one Opus judgment; typical is 40-120 s
 const CALL_MIN_MS = 45000;    // don't start a call there is no time to finish
 
-const REPORT = `/tmp/daily-summary-${date}.html`;
-const PROSE = `/tmp/ds-prose-${date}.json`;
-const SKELETON = `/tmp/ds-skeleton-${date}.html`;
+const REPORT = `${IN}/daily-summary-${date}.html`;
+const PROSE = `${IN}/ds-prose-${date}.json`;
+const SKELETON = `${IN}/ds-skeleton-${date}.html`;
+const AB_INPUTS = [`daily-summary-${date}.html`, `ds-prose-${date}.json`, `ds-skeleton-${date}.html`,
+  `resolved-day-${date}.json`, `day-statements-${date}.json`, `ds-day-${date}.json`, `ds-manifest-${date}.json`];
 
 const read = (f) => { try { return fs.readFileSync(f, "utf8"); } catch { return null; } };
 const readJson = (f) => { try { return JSON.parse(fs.readFileSync(f, "utf8")); } catch { return null; } };
 const log = (m) => process.stderr.write(`[daily-summary-review] ${m}\n`);
 
 if (!read(REPORT)) { console.error(`no report at ${REPORT}`); process.exit(2); }
-const resolved = readJson(`/tmp/resolved-day-${date}.json`) || {};
-const statements = readJson(`/tmp/day-statements-${date}.json`) || {};
-const day = readJson(`/tmp/ds-day-${date}.json`) || {};
-const manifest = readJson(`/tmp/ds-manifest-${date}.json`) || {};
+const resolved = readJson(`${IN}/resolved-day-${date}.json`) || {};
+const statements = readJson(`${IN}/day-statements-${date}.json`) || {};
+const day = readJson(`${IN}/ds-day-${date}.json`) || {};
+const manifest = readJson(`${IN}/ds-manifest-${date}.json`) || {};
+
+// Reviewer A/B snapshot: the first production review of a date, while the A/B
+// is on, keeps a copy of exactly what it read (see the header).
+const AB_DIR = path.join(__dirname, "..", "data", "daily-summary-review-ab", date);
+const abCfg = readJson(path.join(__dirname, "..", "data", "daily-summary-review-ab.json"));
+const abOn = !shadow && !noModel && abCfg && abCfg.until && date <= abCfg.until && !fs.existsSync(path.join(AB_DIR, "primary.json"));
+if (abOn) {
+  try {
+    fs.mkdirSync(path.join(AB_DIR, "input"), { recursive: true });
+    for (const f of AB_INPUTS) if (fs.existsSync(`${IN}/${f}`)) fs.copyFileSync(`${IN}/${f}`, path.join(AB_DIR, "input", f));
+  } catch (e) { process.stderr.write(`[daily-summary-review] A/B snapshot failed: ${e.message}\n`); }
+}
+let costUsd = 0;
 
 // "&" is the word "and" (2026-10-20: the user said "the old man and the sea", the stop
 // carries the venue's own "The Old Man & The Sea", and the word test called the user's
@@ -453,7 +479,8 @@ async function ask(kind, prompt, schema, appendSystem = null) {
       return await judge({
         model, effort, prompt, schema, appendSystem,
         timeoutMs: Math.min(CALL_CAP_MS, remaining - 5000),
-        onResult: (out) => recordForkCost({ job: `daily-summary-review:${kind}`, result: out, model }),
+        onResult: (out) => { costUsd += Number(out && out.total_cost_usd) || 0;
+          recordForkCost({ job: `daily-summary-review${shadow ? "-shadow" : ""}:${kind}`, result: out, model }); },
       });
     } catch (e) {
       log(`${kind} failed: ${e.message}`);
@@ -642,6 +669,7 @@ function recordCodeDefects(findings) {
 (async () => {
   if (!noModel) { await loadPhotos(); await loadPriorCalls(); await loadRoutine(); }
   let cur = await review(read(REPORT));
+  const firstFindings = cur.findings;
   let repairs = [];
   if (repair) ({ cur, repairs } = await repairLoop(cur));
 
@@ -662,9 +690,15 @@ function recordCodeDefects(findings) {
     ...(cur.candidates && cur.candidates.length ? { candidates: cur.candidates } : {}),
     ...(repair ? { repairs } : {}),
     elapsed_sec: Math.round((Date.now() - startedAt) / 1000),
+    cost_usd: Math.round(costUsd * 100) / 100,
+    ...(shadow ? { shadow: true, first_findings: firstFindings } : {}),
   };
   process.stdout.write(JSON.stringify(result, null, 1) + "\n");
-  fs.writeFileSync(`/tmp/ds-review-${date}.json`, JSON.stringify(result, null, 1));
-  recordCodeDefects(findings);
+  fs.writeFileSync(OUT, JSON.stringify(result, null, 1));
+  if (abOn) {
+    try { fs.writeFileSync(path.join(AB_DIR, "primary.json"), JSON.stringify({ ...result, first_findings: firstFindings }, null, 1)); }
+    catch (e) { log(`A/B primary write failed: ${e.message}`); }
+  }
+  if (!shadow) recordCodeDefects(findings);
   process.exit(blocking > 0 ? 3 : 0);
 })().catch((e) => { console.error(e && e.stack || e); process.exit(1); });
