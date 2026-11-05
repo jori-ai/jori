@@ -361,6 +361,22 @@ async function cmdPrep(date, resolvedOverride, confirmedPath, freshHarvest = fal
     process.stderr.write(`[daily-summary-build] calendar-trip failed: ${String((e && e.message) || e).split("\n")[0].slice(0, 200)}\n`);
   }
 
+  // The day's raw step readings (lib/day-steps.js, 2026-11-05): leg modes the
+  // steps contradict are corrected, walks GPS never saw (the evening walk while
+  // the spine says "Home") are found, and every walk carries its count. Before
+  // buildManifest, so the manifest, render and review all read the same legs.
+  try {
+    const { attachDaySteps } = require("../lib/day-steps.js");
+    const st = await attachDaySteps(resolved, dayWindowOf(date, boundaryTzOf(resolved, tz)), request);
+    if (st.legs_remoded.length) {
+      process.stderr.write(`[daily-summary-build] steps re-moded ${st.legs_remoded.length} leg(s): `
+        + st.legs_remoded.map(l => `${l.id} ${l.from}->${l.to} (${l.steps_per_min}/min)`).join(", ") + "\n");
+    }
+  } catch (e) {
+    resolved.steps = { error: String((e && e.message) || e).split("\n")[0].slice(0, 200) };
+    process.stderr.write(`[daily-summary-build] steps failed: ${resolved.steps.error}\n`);
+  }
+
   const manifest = buildManifest(resolved, txnData);
   // Anchored against the SETTLED stops (the ids the prose JSON keys by).
   manifest.harvest = harvest(date, resolved, chatRows, freshHarvest);
