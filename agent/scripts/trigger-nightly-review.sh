@@ -38,6 +38,7 @@ set -uo pipefail
 #
 # Flags:
 #   --no-chain   run the review only, skip the plan pass (manual / debug runs)
+#   --force      run even if a review ran in the last 5 days (see the gap guard below)
 
 export PATH="/opt/homebrew/bin:$PATH"
 # The operator's name for the task text (lib/instance.cjs).
@@ -49,11 +50,27 @@ JOB_MD="$JORI_INSTALL_TOOLS/agent/ops-agent/jobs/nightly-review.md"
 LOG="$JORI_INSTALL_TOOLS/agent/logs/nightly-review.log"
 
 CHAIN=1
+FORCE=0
 for arg in "$@"; do
   case "$arg" in
     --no-chain) CHAIN=0 ;;
+    --force) FORCE=1 ;;
   esac
 done
+
+# Gap guard: a weekly review never runs twice within 5 days. A schedule change
+# (Tuesday to Thursday on 2026-11-04) would otherwise fire a second review two
+# days after the last one, re-covering most of the same week and chaining a
+# second planner pass. Reads the state file's own `last_run` (UTC ISO); a
+# missing or unreadable file runs the review (fail open).
+MIN_GAP_DAYS=5
+if [ "$FORCE" -eq 0 ]; then
+  AGE_DAYS="$(node -e 'try{const s=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8"));const t=Date.parse(s.last_run);if(Number.isFinite(t))process.stdout.write(String(Math.floor((Date.now()-t)/86400e3)))}catch{}' "$JORI_INSTALL_TOOLS/data/nightly-review-state.json" 2>/dev/null)"
+  if [ -n "$AGE_DAYS" ] && [ "$AGE_DAYS" -lt "$MIN_GAP_DAYS" ]; then
+    echo "$(date '+%Y-%m-%d %H:%M:%S') [nightly-review] skipped: the last review ran ${AGE_DAYS}d ago (< ${MIN_GAP_DAYS}d); --force runs it anyway" >> "$LOG"
+    exit 0
+  fi
+fi
 
 # `ultrathink` must appear in the OPENING message — a thinking hint inside a file
 # the agent later reads as a tool result does not allocate the budget.
