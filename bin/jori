@@ -88,7 +88,7 @@ function loadRegistryOrHint(name) {
   try { return registry.loadRegistryList(name, { root: ROOT }); }
   catch (e) {
     if (e && e.code === 'ENOENT' && !fs.existsSync(SYSTEM)) {
-      die(`no Jori install at ${ROOT} (${SYSTEM} is missing). Set JORI_HOME to the repo root, e.g. JORI_HOME=${path.resolve(__dirname, '..', '..')} jori ${process.argv.slice(2).join(' ')}`, 2);
+      die(`no Jori install at ${ROOT} (${SYSTEM} is missing). Set JORI_HOME to the repo root, e.g. JORI_HOME=${path.resolve(__dirname, '..', '..')} jori ${process.argv.slice(2).join(' ')}`, 2);  // control-scan-ok: the software's name
     }
     throw e;
   }
@@ -123,7 +123,7 @@ function table(rows, headers) {
 // ========================================================================
 
 function cmdHelp(extensions = []) {
-  console.log(c.bold('jori') + ' — Jori system self-awareness CLI\n');
+  console.log(c.bold('jori') + ' — Jori system self-awareness CLI\n');  // control-scan-ok: the software's name
   console.log('Usage: jori <subcommand> [args...] [--flags]\n');
   console.log(c.bold('TASKS'));
   console.log('  tasks [list] [--json]         list automated tasks');
@@ -158,7 +158,7 @@ function cmdHelp(extensions = []) {
   console.log('  ci [--limit N]                GitHub Actions runs\n');
   console.log(c.bold('CONTROL'));
   console.log('  restart <target>            bounce a supervised process; target:');
-  console.log('     ops | chat                 rotate the agent\'s claude session (POST supervisor /restart)');
+  console.log('     ops | ops-light | ops-haiku | chat   rotate the agent\'s claude session (POST supervisor /restart)');
   console.log('     whatsapp-channel | imessage-channel | slack-channel | wiki-server  SIGTERM the process-manager child; it respawns');
   console.log('     session                    kickstart launchd — restart the whole stack\n');
   console.log(c.bold('DISCOVERY'));
@@ -1001,23 +1001,31 @@ function readWebhookToken() {
 //                       process-manager + every child)
 function cmdRestart(args) {
   const raw = args.find(a => !a.startsWith('--'));
-  if (!raw) die('restart: usage: jori restart <ops|chat|whatsapp-channel|imessage-channel|slack-channel|wiki-server|session>');
+  if (!raw) die('restart: usage: jori restart <ops|ops-light|ops-haiku|chat|whatsapp-channel|imessage-channel|slack-channel|wiki-server|session>');
 
   const ALIASES = {
     ops: 'ops', chat: 'chat', session: 'session',
+    'ops-light': 'ops-light', light: 'ops-light', 'ops-haiku': 'ops-haiku', haiku: 'ops-haiku',
     whatsapp: 'whatsapp-channel', wa: 'whatsapp-channel', 'whatsapp-channel': 'whatsapp-channel',
     imessage: 'imessage-channel', imsg: 'imessage-channel', 'imessage-channel': 'imessage-channel',
     slack: 'slack-channel', 'slack-channel': 'slack-channel',
     wiki: 'wiki-server', 'wiki-server': 'wiki-server',
   };
   const target = ALIASES[raw];
-  if (!target) die(`restart: unknown target '${raw}'. Use: ops, chat, whatsapp-channel, imessage-channel, slack-channel, wiki-server, session.`);
+  if (!target) die(`restart: unknown target '${raw}'. Use: ops, ops-light, ops-haiku, chat, whatsapp-channel, imessage-channel, slack-channel, wiki-server, session.`);
 
   const PM = `http://127.0.0.1:${portOf('process_manager')}/health`;
 
   // session: restart the whole stack. process-manager is booted by the
   // ai.claude.session LaunchAgent; kickstart -k kills + relaunches it, tearing
   // down and respawning every supervised child.
+  if (target === 'session' && process.platform !== 'darwin') {
+    // Linux: the systemd user unit jori setup installs (docs/installer.md § Linux).
+    const out = shSafe('systemctl --user restart jori.service 2>&1');
+    if (out === null) die('restart: systemctl --user restart jori.service failed. Is the unit installed? jori setup start');
+    console.log(c.green('✓ restarted jori.service. Wait ~30s, then: jori status'));
+    return;
+  }
   if (target === 'session') {
     const uid = process.getuid();
     // ai.jori.session (jori setup, docs/installer.md) or, on installations
@@ -1030,13 +1038,13 @@ function cmdRestart(args) {
     return;
   }
 
-  // ops / chat: graceful — the supervisor's own /restart endpoint rotates the
+  // ops / ops-light / ops-haiku / chat: graceful — the supervisor's own /restart endpoint rotates the
   // inner `claude -p` session (and re-reads agents.json) without killing the
   // supervisor. Documented path: CLAUDE.md § Effort Policy. ops :9093 gates the
   // POST behind a bearer token (secrets/webhook-token); chat :9094 does
   // not — sending the header is harmless either way. The session warm-resumes
   // (same sessionId), so success is verified by restartCount advancing.
-  const SUPERVISOR_PORT = { ops: portOf('ops_health'), chat: portOf('chat_health') };
+  const SUPERVISOR_PORT = { ops: portOf('ops_health'), 'ops-light': portOf('ops_light_health'), 'ops-haiku': portOf('ops_haiku_health'), chat: portOf('chat_health') };
   if (SUPERVISOR_PORT[target]) {
     const port = SUPERVISOR_PORT[target];
     const before = fetchJson(`http://127.0.0.1:${port}/health`);
@@ -3264,7 +3272,7 @@ function cmdContext(args) {
   const skipCache = hasFlag(args, '--fresh');
   const ctx = ctxBuilder.build({ skipCache });
   if (hasFlag(args, '--json')) { console.log(JSON.stringify(ctx, null, 2)); return; }
-  console.log(c.bold('Jori Context') + '\n');
+  console.log(c.bold('Jori Context') + '\n');  // control-scan-ok: the software's name
   console.log(`  built_at: ${ctx.built_at}`);
   console.log(`\n  ${c.bold('Profile')}      ${Object.keys(ctx.profile).join(', ')}`);
   console.log(`  ${c.bold('Tastes')}       ${Object.keys(ctx.tastes).join(', ')}`);
@@ -3370,9 +3378,9 @@ function cmdWhereami(args) {
   console.log(c.dim('uuid:     ') + (h.uuid || 'n/a'));
   if (h.notes) console.log(c.dim('notes:    ') + h.notes);
   if (!h.known) {
-    console.log(c.yellow('\nUnregistered host — not the production Jori host. Add it to system/hosts.json (hostname + uuid + role) so sessions self-identify.'));
+    console.log(c.yellow('\nUnregistered host — not the production Jori host. Add it to system/hosts.json (hostname + uuid + role) so sessions self-identify.'));  // control-scan-ok: the software's name
   }
-  console.log(c.dim('\n⚠ The default Bash-tool sandbox masks localhost + process lists (pgrep/launchctl/curl); run unsandboxed to verify Jori service health.'));
+  console.log(c.dim('\n⚠ The default Bash-tool sandbox masks localhost + process lists (pgrep/launchctl/curl); run unsandboxed to verify Jori service health.'));  // control-scan-ok: the software's name
 }
 
 const dispatch = {
@@ -3408,7 +3416,7 @@ const dispatch = {
 // and examples: bin/cli.d/README.md.
 const CLI_D = path.join(__dirname, 'cli.d');
 function cliExtensionFiles() {
-  try { return fs.readdirSync(CLI_D).filter((f) => f.endsWith('.mjs') && !f.startsWith('_')).sort(); }
+  try { return fs.readdirSync(CLI_D).filter((f) => f.endsWith('.mjs') && !f.startsWith('_') && !f.startsWith('.')).sort(); }
   catch { return []; }
 }
 async function loadCliExtensions() {

@@ -85,7 +85,7 @@ Scheduled work is registered in `system/tasks.json` (plus your own `agent/local/
 ### Stop / restart
 
 ```bash
-./bin/jori restart ops                               # rotate one agent's claude session
+./bin/jori restart ops                               # rotate one agent's claude session (ops, ops-light, ops-haiku, chat)
 ./bin/jori restart chat
 launchctl kickstart -k gui/$(id -u)/ai.jori.session  # restart the whole tree
 ```

@@ -410,3 +410,22 @@ test("watchdog.sh incident_clear: the stale-code-flag recovery says what it saw,
   assert.ok(!fs.existsSync(path.join(dir, "stale-code-flag.alerted")), "the incident is closed after the recovery");
   fs.rmSync(home, { recursive: true, force: true });
 });
+
+test("--dry-run reports every daemon every time, up to date or not, and writes no state", async () => {
+  const said = [];
+  const h = harness();
+  let writes = 0;
+  h.io.say = (s) => said.push(s);
+  h.io.writeState = () => { writes++; };
+  assert.equal(await m.main(["--dry-run"], h.io, ROOT), 0);
+  assert.deepEqual(h.calls, []);
+  for (const t of [...m.SMALL]) assert.ok(said.some((s) => s.startsWith(`${t.name}: `)), `${t.name} reported: ${said.join(" / ")}`);
+  assert.ok(said.some((s) => / up to date \(pid \d+\)$/.test(s))); // lang-regex-ok: the tool's own output line
+  assert.ok(said.includes("no flag: nothing to page about"));
+  assert.equal(writes, 0, "a dry run writes no state");
+  // a second dry run says it all again (no once-per-hold silence)
+  const again = [];
+  h.io.say = (s) => again.push(s);
+  await m.main(["--dry-run"], h.io, ROOT);
+  assert.equal(again.length, said.length);
+});
