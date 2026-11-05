@@ -498,11 +498,28 @@ async function loadPriorCalls() {
   } catch { priorCalls = null; }
 }
 
+// The user's usual day (lib/routine-summary.js): rebuilt here when its sources
+// changed or it is a week old, since this is a daily model-heavy step anyway;
+// the cheaper naming steps (stop-evidence) read the cache this keeps fresh.
+let routine = null;
+async function loadRoutine() {
+  if (process.env.DS_REVIEW_ROUTINE_FILE) {
+    try { routine = fs.readFileSync(process.env.DS_REVIEW_ROUTINE_FILE, "utf8").trim() || null; } catch { routine = null; }
+    return;
+  }
+  try {
+    const r = await require(path.join(__dirname, "../lib/routine-summary.js")).ensureRoutineSummary();
+    routine = r.text || null;
+    if (r.status !== "fresh" && r.status !== "none") log(`usual day: ${r.status}${r.error ? ` (${r.error})` : ""}`);
+  } catch { routine = null; }
+}
+
 const factsText = () => R.factPack({
   date, manifest, day, statements,
   corrections: readCorrections(date),
   photos: dayPhotos,
   priorCalls,
+  routine,
 });
 
 // The static rubric rides as an appended system prompt (cached between calls);
@@ -623,7 +640,7 @@ function recordCodeDefects(findings) {
 
 // ---- main --------------------------------------------------------------------
 (async () => {
-  if (!noModel) { await loadPhotos(); await loadPriorCalls(); }
+  if (!noModel) { await loadPhotos(); await loadPriorCalls(); await loadRoutine(); }
   let cur = await review(read(REPORT));
   let repairs = [];
   if (repair) ({ cur, repairs } = await repairLoop(cur));

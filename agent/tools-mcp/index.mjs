@@ -28,6 +28,7 @@ import { searchEvents as recallSearchEvents, searchEventsHybrid as recallSearchE
 import { searchPagesHybrid, associatePages, searchDaysAssociative } from "../../lib/wiki-embed.mjs";
 import { inDateWindow, isIsoDate } from "../../lib/wiki-assoc.mjs";
 import { factsForPage } from "../../lib/wiki-facts.mjs";
+import { branchLine } from "../../lib/wiki-family-branch.mjs";
 import { recall as unifiedRecall } from "../../lib/unified-recall.mjs";
 import { getReplSandbox } from "../runtime/repl-runner.mjs";
 import { localLlmEmbed } from "../../lib/local-llm.mjs";
@@ -421,6 +422,18 @@ const TOOLS = [
           const src = f.source_page !== row.id ? `  [from ${f.source_page}]` : "";
           lines.push(`  ${f.src_id} ${f.rel}${obj}: ${f.fact_text}${when}${src}`);
         }
+      }
+      // Which side of the family a person is on (lib/wiki-family-branch.mjs),
+      // walked from the typed relations, so a who's-who for one side's
+      // gathering does not mix in the other side (2026-10-29: "Can't mix these
+      // meetups"). Person pages only; "unknown" when no relation reaches a side.
+      let entity = null;
+      try { entity = JSON.parse(row.frontmatter_json || "{}").entity || null; } catch {}
+      if (entity === "person") {
+        let line = null;
+        try { line = branchLine(row.id); } catch {}
+        lines.push("\n=== family branch ===");
+        lines.push(`  ${line || "unknown (no family relations recorded that reach either side)"}`);
       }
       return lines.join("\n");
     },
