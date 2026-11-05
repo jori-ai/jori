@@ -1,0 +1,107 @@
+#!/usr/bin/env node
+// question-hold — hold chat questions while chat is not reading; release them
+// once it is, each re-checked first. CLI over lib/question-hold.mjs (the why
+// and the rules are there).
+//
+// Usage:
+//   question-hold gate < entry.json     (bin/jori-send-curl, bin/choice) prints
+//        {"action":"send"|"hold","id":...,"reason":...}; always exits 0, and any
+//        failure prints "send" (a broken gate never loses a question)
+//   question-hold check [--json]        is chat reading? exit 0 live, 3 not live
+//                                       (a check that cannot run says live, exit 0)
+//   question-hold release [--dry-run]   (launchd, after the Max sign-in check:
+//        agent/scripts/trigger-question-hold-release.sh) re-judge and send what
+//        chat can read again
+//   question-hold list                  the held questions
+//   question-hold tail [N]              the last N log rows (default 20)
+//
+// The entry (gate): {sender: "jori-send-curl"|"choice", args: [...],
+//   message, intent, channel, metadata, hum_context, evidence_as_of,
+//   card_kind, card_ref} — `args` are the sender's flags to replay with.
+//
+// Test seams (env): QUESTION_HOLD_STORE, QUESTION_HOLD_LOG, QUESTION_HOLD_OFF,
+// QUESTION_HOLD_CHAT_STATE, QUESTION_HOLD_CURSOR, QUESTION_HOLD_FAKE_ROWS (a
+// JSON file of jori_messages rows standing in for Supabase), QUESTION_HOLD_BIN_DIR,
+// QUESTION_HOLD_FAKE_JUDGE (a JSON verdict, {"ask":bool,"reason":..}).
+
+import fs from "node:fs";
+
+const args = process.argv.slice(2);
+const cmd = args[0];
+const has = (f) => args.includes(f);
+
+const FALLBACK = { action: "send", reason: "gate unavailable" };
+
+/** A stand-in for Supabase in tests: filters the fixture rows the way the queries ask. */
+function fakeFetch(file) {
+  const all = JSON.parse(fs.readFileSync(file, "utf8"));
+  return async (q) => {
+    const u = new URL(q, "http://x");
+    let rows = all.slice();
+    const role = u.searchParams.get("role");
+    if (role) rows = rows.filter((r) => r.role === role.slice(3));
+    const ch = u.searchParams.get("channel");
+    if (ch?.startsWith("eq.")) rows = rows.filter((r) => (r.channel || "chat") === ch.slice(3));
+    if (ch?.startsWith("in.(")) { const set = ch.slice(4, -1).split(","); rows = rows.filter((r) => set.includes(r.channel || "chat")); }
+    const gt = u.searchParams.get("created_at");
+    if (gt?.startsWith("gt.")) rows = rows.filter((r) => Date.parse(r.created_at) > Date.parse(gt.slice(3)));
+    const order = u.searchParams.get("order") || "";
+    rows.sort((a, b) => Date.parse(a.created_at) - Date.parse(b.created_at));
+    if (order.endsWith(".desc")) rows.reverse();
+    const limit = Number(u.searchParams.get("limit")) || rows.length;
+    return rows.slice(0, limit);
+  };
+}
+
+async function main() {
+  const lib = await import("../lib/question-hold.mjs");
+  const fetchJson = process.env.QUESTION_HOLD_FAKE_ROWS ? fakeFetch(process.env.QUESTION_HOLD_FAKE_ROWS) : null;
+  const live = (o) => lib.chatLive({ ...o, fetchJson });
+
+  if (cmd === "gate") {
+    let entry;
+    try { entry = JSON.parse(fs.readFileSync(0, "utf8")); } catch (e) {
+      console.log(JSON.stringify({ ...FALLBACK, reason: `unreadable entry: ${String(e?.message || e).slice(0, 120)}` }));
+      return 0;
+    }
+    const r = await lib.gate(entry, { live });
+    console.log(JSON.stringify(r));
+    return 0;
+  }
+  if (cmd === "check") {
+    const v = await live({ now: Date.now() });
+    console.log(has("--json") ? JSON.stringify(v) : `${v.live ? "live" : "NOT live"}: ${v.reason}`);
+    return v.live ? 0 : 3;
+  }
+  if (cmd === "release") {
+    let judge;
+    if (process.env.QUESTION_HOLD_FAKE_JUDGE) {
+      const verdict = JSON.parse(process.env.QUESTION_HOLD_FAKE_JUDGE);
+      judge = async () => verdict;
+    }
+    const s = await lib.releaseHeld({ live, fetchJson, dryRun: has("--dry-run"), ...(judge ? { judge } : {}) });
+    console.log(JSON.stringify(s));
+    return s.failed ? 1 : 0;
+  }
+  if (cmd === "list") {
+    for (const e of lib.readStore()) {
+      console.log(`${e.held_at}  ${e.id}  ${e.intent || e.card_kind || "-"}  x${e.times_held}  ${String(e.message || "").split("\n").join(" ").slice(0, 100)}`);
+    }
+    return 0;
+  }
+  if (cmd === "tail") {
+    const n = Number(args[1]) || 20;
+    let lines = [];
+    try { lines = fs.readFileSync(lib.LOG(), "utf8").trim().split("\n"); } catch {}
+    console.log(lines.slice(-n).join("\n"));
+    return 0;
+  }
+  console.error("usage: question-hold gate|check [--json]|release [--dry-run]|list|tail [N]");
+  return 2;
+}
+
+main().then((c) => process.exit(c ?? 0), (e) => {
+  if (cmd === "gate") { console.log(JSON.stringify({ ...FALLBACK, reason: `gate error: ${String(e?.message || e).slice(0, 120)}` })); process.exit(0); }
+  console.error(`question-hold: ${e?.message || e}`);
+  process.exit(1);
+});
