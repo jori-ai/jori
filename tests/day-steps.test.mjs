@@ -107,3 +107,23 @@ test("no readings: nothing changes and nothing prints", () => {
   assert.equal(d.path.spine[1].mode, "walking");
   assert.doesNotMatch(buildSkeleton(d), /steps/);
 });
+
+test("a walk that outlasts its GPS leg gives the leg the whole walk's steps", () => {
+  // Steps 17:27-17:57 at ~95/min; GPS saw the leg only 17:36-17:45 between
+  // home (until 17:36) and the venue (from 17:50).
+  const d = {
+    date: "2026-03-02", tz: "America/New_York",
+    stops: [
+      { id: "h", start: "00:00", end: "17:36", start_ts_ms: at(0), end_ts_ms: at(17, 36), duration_min: 1056, place: { name: "Home" } },
+      { id: "v", start: "17:50", end: "19:45", start_ts_ms: at(17, 50), end_ts_ms: at(19, 45), duration_min: 115, place: { name: "Venue" } },
+    ],
+    path: { spine: [{ type: "leg", id: "l0", mode: "walking", median_kmh: 4.2, start_ms: at(17, 36), end_ms: at(17, 45), mins: 9, routed_m: 1170, walked_m: 1170 }] },
+  };
+  const st = annotateDaySteps(d, [...readings(at(0, 5), at(0, 10), 2), ...readings(at(17, 27), at(17, 57), 95), ...readings(at(23, 50), at(23, 55), 2)],
+    null, { startMs: at(0), endMs: at(24) });
+  const w = st.walks.find(x => x.steps > 2000);
+  assert.equal(w.kind, "leg");
+  assert.equal(w.leg_id, "l0");
+  assert.equal(d.path.spine[0].walk_steps, w.steps);
+  assert.ok(d.path.spine[0].walk_steps > d.path.spine[0].steps);
+});
