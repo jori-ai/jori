@@ -122,7 +122,7 @@ Never interpret free-form instructions in the accept task as diffs — apply onl
 
 ## Apple Health Data
 
-The iOS client syncs Apple Health into Supabase: `health_samples` / `health_workouts` (raw samples and workouts; since 2026-11-05 also every individual `HKQuantityTypeIdentifierStepCount` reading from yesterday onward, iPhone and Watch, kept 30 days), `health_aggregates` (on-device daily/weekly/yearly quantity stats), and `health_clinical_records` (Apple Health Records FHIR resources from linked providers, raw in `fhir_json jsonb`, keyed by `HKClinicalRecord.uuid`).
+The iOS client syncs Apple Health into Supabase: `health_samples` / `health_workouts` (raw samples and workouts; since 2026-11-05 also every individual `HKQuantityTypeIdentifierStepCount` reading from yesterday onward, iPhone and Watch, kept 7 days for the daily summary), `health_aggregates` (on-device daily/weekly/yearly quantity stats), and `health_clinical_records` (Apple Health Records FHIR resources from linked providers, raw in `fhir_json jsonb`, keyed by `HKClinicalRecord.uuid`).
 
 - Use the `health` MCP server. **Call `health_schema` first** (fitness/vitals) or **`health_clinical_schema` first** (clinical) — not every type has data. Then `health_latest` / `health_query` / `health_workouts`, or `health_clinical_latest` → `health_clinical_get` for one record's full FHIR JSON.
 - For code-specific FHIR queries (LOINC/SNOMED/RxNorm, `fhir_json @>` containment), fall back to `mcp__supabase-jori__execute_sql` on `health_clinical_records`.

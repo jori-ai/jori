@@ -14,6 +14,9 @@
 //   - location_history: rows where arrived_at AND departed_at are both older than
 //     the cutoff (open visits — departed_at NULL — are always kept).
 //   - health_samples: rows where start_date (measurement time) is older.
+//   - raw step readings (health_samples, hk_type StepCount, 2026-11-05): kept
+//     only STEP_DAYS (7) — they exist to build the daily summary, and the
+//     long-term step history lives in health_aggregates.
 //
 // Safety: kill switch data/.db-retention-off; --dry-run shows counts without
 // deleting; uses the service_role key via PostgREST DELETE; logs to
@@ -47,11 +50,15 @@ if (!key || !BASE) {
 const SB = BASE + "/rest/v1";
 const H = { apikey: key, Authorization: "Bearer " + key };
 const cutoff = new Date(Date.now() - DAYS * 864e5).toISOString();
+const STEP_DAYS = Math.min(7, DAYS);
+const stepCutoff = new Date(Date.now() - STEP_DAYS * 864e5).toISOString();
 const LOG = path.join(JORI, "data/db-retention.jsonl");
 
 const targets = [
   { table: "location_history", filter: `arrived_at=lt.${cutoff}&departed_at=lt.${cutoff}` },
   { table: "health_samples", filter: `start_date=lt.${cutoff}` },
+  { table: "health_samples", label: `health_samples(steps>${STEP_DAYS}d)`,
+    filter: `hk_type=eq.HKQuantityTypeIdentifierStepCount&start_date=lt.${stepCutoff}` },
 ];
 
 async function matchCount(t) {
@@ -70,11 +77,11 @@ for (const t of targets) {
   try {
     const matched = await matchCount(t);
     if (!dryRun && matched > 0) await doDelete(t);
-    results.push({ table: t.table, pruned: matched });
-    console.log(`${t.table}: ${dryRun ? "would prune" : "pruned"} ${matched} rows older than ${DAYS}d`);
+    results.push({ table: t.label || t.table, pruned: matched });
+    console.log(`${t.label || t.table}: ${dryRun ? "would prune" : "pruned"} ${matched} rows older than ${t.label ? STEP_DAYS : DAYS}d`);
   } catch (e) {
     anyError = true;
-    results.push({ table: t.table, error: e.message });
+    results.push({ table: t.label || t.table, error: e.message });
     console.error(`${t.table}: ERROR ${e.message}`);
   }
 }

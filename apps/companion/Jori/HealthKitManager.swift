@@ -21,7 +21,7 @@ import Supabase
 ///   start of yesterday, pulled by an anchored query so each sync only sends
 ///   readings that are new since the last one. Hourly background delivery
 ///   wakes the app, so the previous day is complete shortly after midnight.
-///   No history backfill — the server's 30-day `db-retention` keeps the window.
+///   No history backfill — `db-retention` keeps 7 days (they feed the daily summary).
 /// - **Clinical records** (`health_clinical_records`): labs, meds, allergies,
 ///   conditions, immunizations, procedures, vitals, coverage, notes — the
 ///   FHIR resources Apple Health Records pulls from connected providers.
