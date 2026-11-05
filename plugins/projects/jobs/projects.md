@@ -31,7 +31,7 @@ $P list --json
 | Key | What it is |
 |---|---|
 | `calendar.events[]` | Every event in the window (`settings.calendar_past_days` back, `calendar_future_days` ahead) across the user's calendars, holidays and excluded calendars left out: `start`, `end`, `title`, `calendar`, `location`, `description` (clipped), `attendees` (other people's names). A recurring series appears once, with `occurrences` and `last_start`. |
-| `tasks.tasks[]` | Google Tasks: every open task and those completed in the last `tasks_completed_days`: `title`, `notes`, `list`, `status`, `due`, `completed`. |
+| `tasks.tasks[]` | Google Tasks: every open task (`title`, `notes`, `due`, `updated`) and those completed in the last `tasks_completed_days` (`title`, `completed` only). `list` when there is more than one list. |
 | `wiki.projects[]` | The project pages that exist: `id`, `name`, `description`, `project_status`, `has_block`. |
 | `wiki.project_type_pages[]` | `type: project` pages that are not project pages yet: older project memories and decision notes. Some are a project (adopt them, Step 3); many are not. |
 | `wiki.recently_changed[]` | Pages changed in the last `wiki_recent_days`: where the user's attention has been. |

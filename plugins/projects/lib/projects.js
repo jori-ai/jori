@@ -121,7 +121,7 @@ function readCalendar(cfg, now = Date.now(), gog = gogJson) {
         title: clip(ev.summary, 160) || "(no title)",
         calendar: c.summary || c.id,
         location: clip(ev.location, 120),
-        description: clip(ev.description, 300),
+        description: clip(ev.description, 200),
         attendees: others.map((a) => a.displayName || a.email).slice(0, 12),
         recurring: !!ev.recurringEventId,
       });
@@ -157,13 +157,20 @@ function readTasks(cfg, now = Date.now(), gog = gogJson) {
     for (const t of rows) {
       if (!t || t.deleted) continue;
       if (t.status === "completed" && t.completed && Date.parse(t.completed) < cutoff) continue;
+      const list = lists.length > 1 ? (l.title || l.id) : undefined;
+      if (t.status === "completed") {
+        // Done tasks are history: what was done and when is enough (hundreds of
+        // them otherwise crowd the bundle out of one turn's reading).
+        tasks.push({ title: clip(t.title, 160) || "(untitled)", list, status: "completed",
+          completed: t.completed ? String(t.completed).slice(0, 10) : null });
+        continue;
+      }
       tasks.push({
         title: clip(t.title, 200) || "(untitled)",
         notes: clip(t.notes, 300),
-        list: l.title || l.id,
-        status: t.status === "completed" ? "completed" : "open",
+        list,
+        status: "open",
         due: t.due ? String(t.due).slice(0, 10) : null,
-        completed: t.completed ? String(t.completed).slice(0, 10) : null,
         updated: t.updated ? String(t.updated).slice(0, 10) : null,
       });
     }

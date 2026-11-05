@@ -81,6 +81,7 @@ test("readTasks keeps open tasks and recently completed ones only", () => {
   const r = pr.readTasks(pr.DEFAULTS, DAY, fake);
   assert.deepEqual(r.tasks.map((t) => `${t.title}:${t.status}`), ["Book hotel:open", "Sent deposit:completed"]);
   assert.equal(r.tasks[0].due, "2026-11-20");
+  assert.deepEqual(Object.keys(r.tasks[1]).filter((k) => r.tasks[1][k] !== undefined).sort(), ["completed", "status", "title"], "a done task carries only what and when");
 });
 
 test("gather records a failing source under errors and keeps the rest", () => {

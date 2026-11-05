@@ -57,7 +57,7 @@ function main() {
     const b = pr.gather();
     fs.mkdirSync(path.dirname(out), { recursive: true });
     const tmp = `${out}.tmp.${process.pid}`;
-    fs.writeFileSync(tmp, JSON.stringify(b, null, 1) + "\n");
+    fs.writeFileSync(tmp, JSON.stringify(b) + "\n"); // compact: one turn reads it whole
     fs.renameSync(tmp, out);
     console.log(JSON.stringify({
       out,
