@@ -1,5 +1,10 @@
 import UserNotifications
 import Intents
+#if canImport(UIKit)
+import UIKit
+#else
+import AppKit
+#endif
 
 /// Upcasts Jori pushes into communication notifications so iOS shows a sender
 /// avatar, Siri announces them on AirPods, and the user can reply by voice.
@@ -45,7 +50,7 @@ class NotificationService: UNNotificationServiceExtension {
             personHandle: INPersonHandle(value: "jori-assistant", type: .unknown),
             nameComponents: nil,
             displayName: "Jori",
-            image: nil,
+            image: Self.senderAvatar(),
             contactIdentifier: nil,
             customIdentifier: nil
         )
@@ -79,6 +84,26 @@ class NotificationService: UNNotificationServiceExtension {
                 self.deliver(bestAttemptContent)
             }
         }
+    }
+
+    /// Jori's face as the sender photo (without one iOS draws a grey "J"). The
+    /// image is the containing app's `JoriAvatar` asset, so this extension needs
+    /// no resources of its own: the .appex sits in the app's PlugIns folder
+    /// (Jori.app/PlugIns on iOS, Jori.app/Contents/PlugIns on macOS).
+    private static func senderAvatar() -> INImage? {
+        var url = Bundle.main.bundleURL
+        while url.pathExtension != "app" && url.pathComponents.count > 1 {
+            url.deleteLastPathComponent()
+        }
+        guard url.pathExtension == "app", let app = Bundle(url: url) else { return nil }
+        #if canImport(UIKit)
+        guard let data = UIImage(named: "JoriAvatar", in: app, compatibleWith: nil)?.pngData() else { return nil }
+        #else
+        guard let image = app.image(forResource: "JoriAvatar"),
+              let tiff = image.tiffRepresentation,
+              let data = NSBitmapImageRep(data: tiff)?.representation(using: .png, properties: [:]) else { return nil }
+        #endif
+        return INImage(imageData: data)
     }
 
     override func serviceExtensionTimeWillExpire() {
