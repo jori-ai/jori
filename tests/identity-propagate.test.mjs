@@ -8,6 +8,7 @@ const prev = { assistant_name: "Jori", agent_email: "jori@example.com" };
 const env = {
   serviceLoaded: true,
   wikiConfigured: true,
+  wranglerReady: true,
   appTargets: { ios: { repo: "o/r" }, macos: { repo: "o/r" } },
   emailRouting: {},
   aliases: { assistant: ["Jori"], email: ["jori@example.com"] },
@@ -21,6 +22,11 @@ test("no change, no steps; first run (no state) is no change", () => {
 test("a rename sets the repo variable once, rebuilds the apps, redeploys the wiki, restarts last", () => {
   const ids = plan(prev, { ...prev, assistant_name: "Claudette" }, env).map((s) => s.id);
   assert.deepEqual(ids, ["gh-var:o/r", "apps", "wiki", "restart"]);
+});
+
+test("no wrangler on the host: the wiki redeploy becomes a to-do", () => {
+  const wiki = plan(prev, { ...prev, assistant_name: "Claudette" }, { ...env, wranglerReady: false }).find((s) => s.id === "wiki");
+  assert.equal(wiki.kind, "manual");
 });
 
 test("no build target: the owner is told the apps keep the old name", () => {
