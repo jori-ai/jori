@@ -36,6 +36,9 @@
 		AA000014 /* SupabaseManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB000015 /* SupabaseManager.swift */; };
 		AA000015 /* JoriIntents.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB000016 /* JoriIntents.swift */; };
 		AA000016 /* NotificationService.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB000017 /* NotificationService.swift */; };
+		AA0000C1 /* AnnounceCache.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB0000C1 /* AnnounceCache.swift */; };
+		AA0000C2 /* AnnounceCache.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB0000C1 /* AnnounceCache.swift */; };
+		AA0000C3 /* JoriIntents.appex in Embed App Extensions */ = {isa = PBXBuildFile; fileRef = CC000003 /* JoriIntents.appex */; platformFilter = ios; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
 		AA000017 /* JoriNotificationService.appex in Embed App Extensions */ = {isa = PBXBuildFile; fileRef = CC000002 /* JoriNotificationService.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
 		AA000018 /* MessageStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB000020 /* MessageStore.swift */; };
 		AA000030 /* LocationTracker.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB000030 /* LocationTracker.swift */; };
@@ -116,6 +119,7 @@
 			dstSubfolderSpec = 13;
 			files = (
 				AA000017 /* JoriNotificationService.appex in Embed App Extensions */,
+				AA0000C3 /* JoriIntents.appex in Embed App Extensions */,
 				AA000409 /* JoriShare.appex in Embed App Extensions */,
 				AA00040A /* JoriUsageMonitor.appex in Embed App Extensions */,
 			);
@@ -156,6 +160,7 @@
 		BB000014 /* Jori-macOS.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = "Jori-macOS.entitlements"; sourceTree = "<group>"; };
 		BB000015 /* SupabaseManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SupabaseManager.swift; sourceTree = "<group>"; };
 		BB000016 /* JoriIntents.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = JoriIntents.swift; sourceTree = "<group>"; };
+		BB0000C1 /* AnnounceCache.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AnnounceCache.swift; sourceTree = "<group>"; };
 		BB000017 /* NotificationService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NotificationService.swift; sourceTree = "<group>"; };
 		BB000018 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
 		BB000019 /* JoriNotificationService.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = JoriNotificationService.entitlements; sourceTree = "<group>"; };
@@ -331,6 +336,7 @@
 			isa = PBXGroup;
 			children = (
 				BB000017 /* NotificationService.swift */,
+				BB0000C1 /* AnnounceCache.swift */,
 				BB000018 /* Info.plist */,
 				BB000019 /* JoriNotificationService.entitlements */,
 			);
@@ -606,6 +612,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				AA000016 /* NotificationService.swift in Sources */,
+				AA0000C1 /* AnnounceCache.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -618,6 +625,7 @@
 				AA000094 /* SharedKeychainStorage.swift in Sources */,
 				AA000099 /* SharedSession.swift in Sources */,
 				AA000095 /* Message.swift in Sources */,
+				AA0000C2 /* AnnounceCache.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

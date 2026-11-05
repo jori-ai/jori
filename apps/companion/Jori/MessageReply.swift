@@ -1,17 +1,15 @@
 #if os(iOS)
 import Foundation
+import Intents
 import UserNotifications
 
-/// Lets Siri offer "reply" after announcing a Jori message on AirPods, and
-/// routes the dictated reply back into the chat.
-///
-/// Plain push notifications get announced on AirPods; the communication-
-/// notification upcast in the NSE actually SUPPRESSED the announcement. The
-/// piece that makes Siri say "…you can reply" is a text-input action on the
-/// notification's category — not the comm-notification machinery. Pushes for the
-/// chat channel carry `category = JORI_MESSAGE` (set in apns-push.mjs); this
-/// registers that category and handles the reply as a `role:user` insert, which
-/// the phone-channel then acks and answers — same round-trip as the app/Siri.
+/// The category every assistant message arrives in (the NotificationService
+/// extension sets it; apns-push.mjs sends it too). INSearchForMessagesIntent as
+/// the category's intent ties the notification to SiriKit messaging, so Siri
+/// asks the JoriIntents extension what to read aloud and where a spoken reply
+/// goes; `.allowInCarPlay` shows it in CarPlay. Same shape as Telegram-iOS's
+/// repliable categories. (`.allowAnnouncement` is deprecated and ignored since
+/// iOS 15.) The text-input Reply action handles a typed reply in-app.
 enum MessageReply {
     static let category = "JORI_MESSAGE"
     static let replyAction = "JORI_REPLY"
@@ -28,8 +26,8 @@ enum MessageReply {
         let cat = UNNotificationCategory(
             identifier: category,
             actions: [reply],
-            intentIdentifiers: [],
-            options: [])
+            intentIdentifiers: [INSearchForMessagesIntentIdentifier],
+            options: [.allowInCarPlay])
         let center = UNUserNotificationCenter.current()
         center.getNotificationCategories { existing in
             var merged = existing.filter { $0.identifier != category }

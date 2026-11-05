@@ -7,7 +7,8 @@ import AppKit
 #endif
 
 /// Upcasts Jori pushes into communication notifications so iOS shows a sender
-/// avatar, Siri announces them on AirPods, and the user can reply by voice.
+/// avatar and treats them as messages, and records each one in AnnounceCache
+/// so the Intents extension can tell Siri what to read aloud.
 ///
 /// Three things must line up or the upcast silently fails and we fall back to a
 /// plain (non-announced) notification:
@@ -45,14 +46,33 @@ class NotificationService: UNNotificationServiceExtension {
             bestAttemptContent.interruptionLevel = .timeSensitive
         }
 
+        // What Siri reads aloud for this notification: the Intents extension
+        // answers Siri's INSearchForMessagesIntent (keyed by this request id)
+        // from this cache. See AnnounceCache.swift.
+        AnnounceCache.record(AnnouncedMessage(
+            requestId: request.identifier,
+            messageId: request.content.userInfo["message_id"] as? String,
+            title: bestAttemptContent.title,
+            body: bestAttemptContent.body,
+            date: Date()))
+
+        #if os(iOS)
+        // The message category: Reply action, CarPlay, and
+        // INSearchForMessagesIntent as its intent (MessageReply.swift).
+        if bestAttemptContent.categoryIdentifier.isEmpty {
+            bestAttemptContent.categoryIdentifier = "JORI_MESSAGE"
+        }
+        #endif
+
         // Synthetic sender — no real contact needed (confirmed by Apple's sample).
+        let avatar = Self.senderAvatar()
         let sender = INPerson(
             personHandle: INPersonHandle(value: "jori-assistant", type: .unknown),
             nameComponents: nil,
             displayName: Self.assistantName,
-            image: Self.senderAvatar(),
+            image: avatar,
             contactIdentifier: nil,
-            customIdentifier: nil
+            customIdentifier: "jori-assistant"   // same person as JoriIntents' IntentHandler
         )
 
         let intent = INSendMessageIntent(
@@ -65,6 +85,10 @@ class NotificationService: UNNotificationServiceExtension {
             sender: sender,
             attachments: nil
         )
+
+        if #available(iOS 15.0, macOS 12.0, *), let avatar {
+            intent.setImage(avatar, forParameterNamed: \.sender)
+        }
 
         // Donate FIRST, then update inside the completion (Apple's order).
         let interaction = INInteraction(intent: intent, response: nil)
