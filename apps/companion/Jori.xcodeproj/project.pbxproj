@@ -16,6 +16,8 @@
 		AA000202 /* ChannelBadges.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB000202 /* ChannelBadges.swift */; };
 		AA000E01 /* DesignSystem.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB000E01 /* DesignSystem.swift */; };
 		AA000E02 /* Responsiveness.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB000E02 /* Responsiveness.swift */; };
+		AA000E03 /* PickupRules.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB000E03 /* PickupRules.swift */; };
+		AA000E04 /* PickupWatch.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB000E04 /* PickupWatch.swift */; };
 		AA000201 /* SelfImproveApprovalView.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB000201 /* SelfImproveApprovalView.swift */; };
 		AA000299 /* ChoicePrompt.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB000299 /* ChoicePrompt.swift */; };
 		54E9FFBF941875F43A30CE18 /* TradeApprovalPairingView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6BB776C284508F7ADFFA58CE /* TradeApprovalPairingView.swift */; };
@@ -132,6 +134,8 @@
 		BB000202 /* ChannelBadges.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChannelBadges.swift; sourceTree = "<group>"; };
 		BB000E01 /* DesignSystem.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DesignSystem.swift; sourceTree = "<group>"; };
 		BB000E02 /* Responsiveness.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Responsiveness.swift; sourceTree = "<group>"; };
+		BB000E03 /* PickupRules.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PickupRules.swift; sourceTree = "<group>"; };
+		BB000E04 /* PickupWatch.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PickupWatch.swift; sourceTree = "<group>"; };
 		BB000201 /* SelfImproveApprovalView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SelfImproveApprovalView.swift; sourceTree = "<group>"; };
 		BB000299 /* ChoicePrompt.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChoicePrompt.swift; sourceTree = "<group>"; };
 		6BB776C284508F7ADFFA58CE /* TradeApprovalPairingView.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = TradeApprovalPairingView.swift; sourceTree = "<group>"; };
@@ -303,6 +307,8 @@
 				BB000202 /* ChannelBadges.swift */,
 				BB000E01 /* DesignSystem.swift */,
 				BB000E02 /* Responsiveness.swift */,
+				BB000E03 /* PickupRules.swift */,
+				BB000E04 /* PickupWatch.swift */,
 				BB000201 /* SelfImproveApprovalView.swift */,
 				BB000299 /* ChoicePrompt.swift */,
 			);
@@ -583,6 +589,8 @@
 				AA000202 /* ChannelBadges.swift in Sources */,
 				AA000E01 /* DesignSystem.swift in Sources */,
 				AA000E02 /* Responsiveness.swift in Sources */,
+				AA000E03 /* PickupRules.swift in Sources */,
+				AA000E04 /* PickupWatch.swift in Sources */,
 				AA000201 /* SelfImproveApprovalView.swift in Sources */,
 				AA000299 /* ChoicePrompt.swift in Sources */,
 				AA000300 /* PhoneLockMonitor.swift in Sources */,
