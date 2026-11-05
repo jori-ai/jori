@@ -88,6 +88,9 @@ TOKEN_WEIGHTS = {
     # Neutral / deferred contribute 0 — present so .get() doesn't KeyError.
     "deferred": 0.0,
     "visited": 0.0,
+    # A free-text reply to a ping whose valence nothing has judged: it is
+    # engagement (being told a fact is not silence), scored 0.
+    "freeform": 0.0,
     None: 0.0,
 }
 
@@ -519,7 +522,12 @@ def collect_for_day(target_date, tz, runs, feedback, history):
     }
     for r in feedback:
         r = as_dict(r)
-        tok = FEEDBACK_TOKEN_MAP.get(r.get("reaction"))
+        reaction = r.get("reaction")
+        tok = FEEDBACK_TOKEN_MAP.get(reaction)
+        if not tok and isinstance(reaction, str) and reaction.strip():
+            # Free text: no regex and no model reading here (Rule #0b), so
+            # its valence stays unjudged; it still counts as a reply.
+            tok = "freeform"
         if not tok:
             continue
         if not in_window(r.get("reaction_at"), start, end):
