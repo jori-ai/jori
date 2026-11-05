@@ -16,6 +16,12 @@ import Supabase
 ///   stages, heart events, audio-exposure events, fall count, workouts. These
 ///   are sparse and per-occurrence meaningful, so we keep them as-is with
 ///   anchored queries + observer-driven sync.
+/// - **Raw step readings** (`health_samples`, 2026-11-05): every individual
+///   StepCount sample (iPhone and Watch) whose start falls on or after the
+///   start of yesterday, pulled by an anchored query so each sync only sends
+///   readings that are new since the last one. Hourly background delivery
+///   wakes the app, so the previous day is complete shortly after midnight.
+///   No history backfill — the server's 30-day `db-retention` keeps the window.
 /// - **Clinical records** (`health_clinical_records`): labs, meds, allergies,
 ///   conditions, immunizations, procedures, vitals, coverage, notes — the
 ///   FHIR resources Apple Health Records pulls from connected providers.
@@ -205,6 +211,61 @@ final class HealthKitManager {
             }
             store.execute(obs)
         }
+        installStepObserver()
+    }
+
+    // MARK: - Raw step readings (2026-11-05)
+
+    /// HealthKit caps step-count background delivery at `.hourly`, which is
+    /// what gets yesterday's last readings up shortly after midnight even when
+    /// the app is never opened.
+    private func installStepObserver() {
+        guard let steps = HKQuantityType.quantityType(forIdentifier: .stepCount) else { return }
+        store.enableBackgroundDelivery(for: steps, frequency: .hourly) { _, err in
+            if let err = err { print("[Health] bg-delivery steps failed: \(err.localizedDescription)") }
+        }
+        let obs = HKObserverQuery(sampleType: steps, predicate: nil) { [weak self] _, completion, err in
+            if let err = err {
+                print("[Health] observer steps err: \(err.localizedDescription)")
+                completion(); return
+            }
+            Task {
+                await self?.syncRawSteps(reason: "observer")
+                completion()
+            }
+        }
+        store.execute(obs)
+    }
+
+    /// Uploads step readings that started on or after the start of yesterday
+    /// and are new since the last anchor. The date floor keeps the first run
+    /// from pulling 12 years of history; the anchor keeps every later run to
+    /// just the readings that landed since (the Watch syncs to the phone late,
+    /// so a reading for 23:50 may only appear at 00:30 — the anchor still
+    /// catches it because it is new to the store, not new in time).
+    private func syncRawSteps(reason: String) async {
+        guard let type = HKQuantityType.quantityType(forIdentifier: .stepCount) else { return }
+        let anchorKey = anchorKeyPrefix + "rawSteps." + type.identifier
+        var anchor = loadAnchor(anchorKey)
+        let deviceId = currentDeviceId() ?? "unknown"
+        let cal = calendar()
+        let floor = cal.date(byAdding: .day, value: -1, to: cal.startOfDay(for: Date()))!
+        let pred = HKQuery.predicateForSamples(withStart: floor, end: nil)
+        var total = 0
+        do {
+            while true {
+                let (samples, newAnchor) = try await runAnchoredQuery(
+                    type: type, anchor: anchor, limit: queryChunkSize, predicate: pred
+                )
+                if !samples.isEmpty { try await uploadSamples(samples, type: type, deviceId: deviceId) }
+                if let newAnchor = newAnchor { saveAnchor(anchorKey, newAnchor); anchor = newAnchor }
+                total += samples.count
+                if samples.count < queryChunkSize { break }
+            }
+            if total > 0 { print("[Health] raw steps: +\(total) (reason=\(reason))") }
+        } catch {
+            print("[Health] raw steps failed: \(error.localizedDescription)")
+        }
     }
 
     // MARK: - Top-level sync
@@ -226,6 +287,7 @@ final class HealthKitManager {
             await syncClinicalType(type, reason: reason, deviceId: deviceId)
         }
         await syncRecentSleepWindow(deviceId: deviceId)
+        await syncRawSteps(reason: reason)
         await startProgressiveBackfillIfNeeded(deviceId: deviceId)
     }
 
@@ -562,11 +624,12 @@ final class HealthKitManager {
     private func runAnchoredQuery(
         type: HKSampleType,
         anchor: HKQueryAnchor?,
-        limit: Int
+        limit: Int,
+        predicate: NSPredicate? = nil
     ) async throws -> ([HKSample], HKQueryAnchor?) {
         try await withCheckedThrowingContinuation { cont in
             let q = HKAnchoredObjectQuery(
-                type: type, predicate: nil, anchor: anchor,
+                type: type, predicate: predicate, anchor: anchor,
                 limit: limit
             ) { _, samples, _, newAnchor, error in
                 if let error = error { cont.resume(throwing: error); return }
