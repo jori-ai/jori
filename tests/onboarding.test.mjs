@@ -76,7 +76,8 @@ test("the starter jobs resolve from tasks.json and are added only when missing",
   assert.ok(jobs.find((j) => j.name === "watchdog"), "the watchdog has no task of its own but is scheduled");
   for (const j of jobs) assert.ok(fs.existsSync(path.join(REPO, j.script)), `${j.script} exists`);
 
-  const line = core.cronLine(md, { base: "/x/jori", node: "/opt/homebrew/bin/node" });
+  const line = core.cronLine(md, { base: "/x/jori", node: "/opt/homebrew/bin/node", home: "/home/sam" });
+  assert.ok(line.includes(":/home/sam/.local/bin:"), "claude's install dir is on cron's PATH");
   assert.match(line, /^0 8 \* \* \* PATH=\S+ JORI_HOME=\/x\/jori \/x\/jori\/bin\/cron-run --label trigger-morning-digest -- \/x\/jori\/agent\/scripts\/trigger-morning-digest\.sh # jori-starter$/);
 
   const existing = "*/20 * * * * /y/bin/cron-run --label trigger-hum -- /y/agent/scripts/trigger-hum.sh\n";
@@ -137,5 +138,50 @@ test("the setup server: loopback Host, the page token, JSON writes", async () =>
     assert.equal(bad.status, 400);
   } finally {
     server.close();
+  }
+});
+
+// ── always-on Macs and VMs (lib/onboarding/host.mjs) ──────────────────────
+const host = await import("../lib/onboarding/host.mjs");
+const { isTailnetAddress, isLoopback } = await import("../lib/onboarding/server.mjs");
+
+test("host facts parse from the commands that report them", () => {
+  assert.equal(host.parseModelName("Hardware Overview:\n\n      Model Name: Mac mini\n      Model Identifier: Mac16,10\n"), "Mac mini");
+  assert.equal(host.parseModelName("nothing"), null);
+  const pm = host.parsePmset("System-wide power settings:\nCurrently in use:\n standby              0\n sleep                0 (sleep prevented by powerd)\n autorestart          1\n disksleep            10\n");
+  assert.deepEqual([pm.sleep, pm.autorestart, pm.disksleep], [0, 1, 10]);
+  assert.equal(host.parseLinger("Linger=yes\n"), true);
+  assert.equal(host.parseLinger("Linger=no\n"), false);
+  assert.equal(host.overSsh({ SSH_CONNECTION: "100.94.0.1 50000 100.108.0.1 22" }), true);
+  assert.equal(host.overSsh({}), false);
+});
+
+test("the systemd unit runs the process manager from the checkout", () => {
+  const unit = host.renderSystemdUnit({ base: "/home/sam/Dev/jori", node: "/home/sam/.local/node/bin/node", claudeBin: "/home/sam/.local/bin/claude", home: "/home/sam" });
+  assert.match(unit, /^ExecStart=\/home\/sam\/\.local\/node\/bin\/node \/home\/sam\/Dev\/jori\/agent\/bin\/process-manager\.mjs$/m);
+  assert.match(unit, /^Environment=JORI_HOME=\/home\/sam\/Dev\/jori$/m);
+  assert.match(unit, /^Restart=always$/m);
+  assert.match(unit, /^WantedBy=default\.target$/m);
+});
+
+test("tailnet addresses are 100.64.0.0/10 only", () => {
+  for (const a of ["100.64.0.1", "100.108.95.34", "::ffff:100.127.255.254"]) assert.ok(isTailnetAddress(a), a);
+  for (const a of ["100.63.255.255", "100.128.0.1", "10.0.0.5", "192.168.1.2", "", undefined]) assert.ok(!isTailnetAddress(a), String(a));
+  assert.ok(isLoopback("127.0.0.1") && isLoopback("::1") && !isLoopback("10.0.0.1"));
+});
+
+test("over Tailscale the page answers to the tailnet name; otherwise loopback only", async () => {
+  const ts = createSetupServer({ base: tmp, token: "t1", tailnetHosts: ["mini.example.ts.net", "100.108.95.34"] });
+  const plain = createSetupServer({ base: tmp, token: "t2" });
+  await new Promise((r) => ts.server.listen(0, "127.0.0.1", r));
+  await new Promise((r) => plain.server.listen(0, "127.0.0.1", r));
+  try {
+    // From loopback (an SSH tunnel), the tailnet Host is accepted on the tailnet server only.
+    assert.equal((await req(ts.server.address().port, { p: "/?t=t1", headers: { host: "mini.example.ts.net:9087" } })).status, 200);
+    assert.equal((await req(plain.server.address().port, { p: "/?t=t2", headers: { host: "mini.example.ts.net:9087" } })).status, 403);
+    assert.equal((await req(ts.server.address().port, { p: "/?t=t1", headers: { host: "evil.example" } })).status, 403);
+  } finally {
+    ts.server.close();
+    plain.server.close();
   }
 });

@@ -7,6 +7,17 @@ Jori is built and run on macOS. Two conventions are assumed throughout the kerne
 - the installation lives at **`~/Dev/jori`** (or wherever `JORI_HOME` points — set it in the service environment *and* in `.env`);
 - Node is at **`/opt/homebrew/bin/node`** (Homebrew on Apple Silicon): the process manager starts its children with that path, and the cron-facing bins use it as their shebang because cron's `PATH` has no Homebrew. On another layout, symlink your `node` there.
 
+## Which machine
+
+| | Setup opens | Service | Stays on by itself when |
+|---|---|---|---|
+| Your Mac (laptop/desktop) | in its browser | launch agent `ai.jori.session` | — (a laptop sleeps) |
+| Always-on Mac (Mac mini, cloud Mac) | from your computer, over Tailscale or an SSH tunnel | launch agent, in the auto-login desktop session | automatic login, `pmset sleep 0`, `pmset autorestart 1`, FileVault off |
+| macOS VM | same | same | automatic login, sleep off |
+| Linux VM | same | systemd user unit `jori.service` | `loginctl enable-linger`, cron |
+
+`jori setup` detects which one it is on (`lib/onboarding/host.mjs`: `system_profiler` model name and battery, `kern.hv_vmm_present` / `systemd-detect-virt`, `SSH_CONNECTION`, `tailscale status`), and the setup page's **Keep it running** step lists the checks with the command that fixes each. A launch agent needs a desktop session, so an always-on Mac must sign in by itself: over SSH alone, `launchctl bootstrap gui/<uid>` has no session to run in and setup says so instead of failing.
+
 ## macOS — launchd
 
 **The short way:** `jori setup start` (or the **Start Jori** button on the `jori setup` page) does steps 1 and 2 below for this checkout: it writes `~/Library/LaunchAgents/ai.jori.session.plist` with this machine's node and paths, bootstraps it, and adds the starter jobs from `system/starter-jobs.json` to the crontab (tagged `# jori-starter`, each through `bin/cron-run`). It leaves a running service alone and skips any job whose `--label` is already scheduled. The rest of this section is what it does, by hand.
@@ -91,6 +102,8 @@ launchctl kickstart -k gui/$(id -u)/ai.jori.session  # restart the whole tree
 ```
 
 ## Linux — systemd (user unit)
+
+The installer handles a Linux VM end to end without root where it can: Node 22 from nodejs.org (checksum-verified) into `~/.local/node`, Claude Code into `~/.local`, the `jori` command in `~/.local/bin`; with sudo it also installs git, cron and Ollama, links `/opt/homebrew/bin/node` and turns on lingering. `jori setup start` (or **Start** on the setup page) writes and enables the unit below. Tested on Ubuntu 26.04 (x86_64).
 
 Linux is not a primary target: the macOS-only pieces (launchd jobs, Keychain auth, `ioreg`, AppleScript tools) stay off, and the Node path convention above still applies (`sudo ln -s "$(command -v node)" /opt/homebrew/bin/node`). A user unit for the process manager:
 

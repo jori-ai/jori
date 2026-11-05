@@ -104,6 +104,10 @@ h1 { font: 400 clamp(32px, 4.2vw, 46px)/1.08 var(--serif); letter-spacing: -.02e
 .row-detail { color: var(--muted); font-size: 14px; margin-top: 2px; overflow-wrap: anywhere; }
 .row-detail code, .lede code, .hint code { font-size: 13px; background: color-mix(in srgb, var(--rule) 55%, transparent); padding: 1px 6px; border-radius: 5px; }
 .row-act { align-self: center; }
+h2.sub { font: 600 15px/1.3 var(--sans); margin: -12px 0 12px; }
+.fix { display: flex; gap: 8px; align-items: flex-start; margin-top: 8px; }
+.fix code { display: block; flex: 1; white-space: pre-wrap; word-break: break-all; padding: 8px 10px !important; }
+.fix button { flex: none; }
 
 .actions { display: flex; gap: 16px; align-items: center; flex-wrap: wrap; }
 .btn {
@@ -167,7 +171,7 @@ form.code { margin-top: 24px; max-width: 520px; }
 <div class="shell">
   <aside class="panel">
     <div>
-      <svg class="face sleep" id="face" viewBox="0 0 200 200" role="img" aria-label="Jori">
+      <svg class="face sleep" id="face" viewBox="0 0 200 200" role="img" aria-label="Jori"> <!-- control-scan-ok: the setting's default -->
         <defs>
           <filter id="glow" x="-50%" y="-50%" width="200%" height="200%">
             <feGaussianBlur stdDeviation="3" result="b"/><feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
@@ -198,7 +202,7 @@ form.code { margin-top: 24px; max-width: 520px; }
 
   <main id="main" aria-live="polite">
     <section class="step" data-step="mac">
-      <h1>Let me look around your Mac.</h1>
+      <h1 id="macTitle">Let me look around your Mac.</h1>
       <p class="lede">I check what I need and install anything that’s missing. You’ll only be asked when I can’t do it myself.</p>
       <ul class="rows" id="macRows"></ul>
       <div class="actions"><button class="btn" id="macNext" disabled>Continue</button></div>
@@ -237,6 +241,10 @@ form.code { margin-top: 24px; max-width: 520px; }
       <h1>Keep me running.</h1>
       <p class="lede" id="onLede">I’ll start now and again whenever this Mac starts, then do a small set of jobs on a schedule. More jobs switch on as you connect things.</p>
       <ul class="rows" id="onRows"></ul>
+      <div id="stayOn" hidden>
+        <h2 class="sub" id="stayOnTitle">Staying on by itself</h2>
+        <ul class="rows" id="stayOnRows"></ul>
+      </div>
       <details class="jobs" id="jobsList"><summary>Which jobs</summary><ul></ul></details>
       <div class="actions" id="onActions"></div>
       <p class="hint" id="onHint" hidden></p>
@@ -287,6 +295,11 @@ function row(state, name, detail, action) {
     el("div", {}, el("div", { class: "row-name" }, name, el("span", { class: "sr" }, ` (${({ ok: "done", work: "working", need: "needs you", warn: "check", todo: "not yet" })[state]})`)), detail ? el("div", { class: "row-detail" }, ...rich(detail)) : null),
     el("div", { class: "row-act" }, action || null));
 }
+function fixBox(cmd) {
+  const b = el("button", { class: "btn small quiet", type: "button" }, "Copy");
+  b.addEventListener("click", async () => { try { await navigator.clipboard.writeText(cmd); b.textContent = "Copied"; setTimeout(() => (b.textContent = "Copy"), 1500); } catch { b.textContent = "Select and copy"; } });
+  return el("div", { class: "fix" }, el("code", {}, cmd), b);
+}
 function setRows(id, rows) { $(id).replaceChildren(...rows); }
 
 function setFace(mood, line) {
@@ -326,12 +339,14 @@ $("steps").addEventListener("click", (e) => {
 // ── render each step from the state ───────────────────────────────────
 function render() {
   if (!S) return;
+  const H = S.host || {};
+  const thisOne = H.os === "darwin" ? `this ${H.kind || "Mac"}` : "this machine";
   const d = doneMap(S);
   for (const li of $("steps").children) {
     li.classList.toggle("done", !!d[li.dataset.step] && li.dataset.step !== current);
     li.classList.toggle("current", li.dataset.step === current);
   }
-  $("faceName").textContent = S.identity.assistant_name || "Jori";
+  $("faceName").textContent = S.identity.assistant_name || "Jori"; // control-scan-ok: the setting's default
   const jobs = S.jobs || {};
 
   // Mac
@@ -365,6 +380,10 @@ function render() {
   if (cl.loggedIn) ca.push(el("button", { class: "btn", onclick: next }, "Continue"));
   $("claudeActions").replaceChildren(...ca);
   const url = login?.url;
+  if (H.remote && cl.installed && !cl.loggedIn && login?.state !== "running") {
+    $("claudeHint").hidden = false;
+    $("claudeHint").replaceChildren(`You’re setting up ${thisOne} from another computer. Press Sign in, open the sign-in page link that appears, then paste the code Claude shows.`);
+  }
   $("claudeHint").hidden = !(login?.state === "running" && url);
   if (url) $("claudeHint").replaceChildren("No page opened? ", el("a", { href: url, target: "_blank", rel: "noopener" }, "Open the sign-in page"), ".");
   $("codeForm").hidden = login?.state !== "running";
@@ -377,6 +396,18 @@ function render() {
     if (input && !input.dataset.touched && input !== document.activeElement) input.value = S.identity[k] || "";
   }
 
+  // Which machine this is: an always-on Mac or a VM is set up from another computer.
+  $("macTitle").textContent = H.os === "darwin" && !H.laptop && H.kind ? `Let me look around this ${H.kind}.` : H.os && H.os !== "darwin" ? "Let me look around this machine." : "Let me look around your Mac.";
+  $("onLede").textContent = `I’ll start now and again whenever ${thisOne} starts, then do a small set of jobs on a schedule. More jobs switch on as you connect things.`;
+  const stay = S.alwaysOn || [];
+  $("stayOn").hidden = !stay.length;
+  $("stayOnTitle").textContent = H.laptop ? "Running in the background" : `Keeping ${thisOne} on by itself`;
+  setRows("stayOnRows", stay.map((k) => {
+    const li = row(k.ok ? "ok" : k.warn ? "warn" : "need", k.name, k.detail);
+    if (!k.ok && k.fix) li.querySelector(".row-detail")?.after(fixBox(k.fix));
+    return li;
+  }));
+
   // Keep it running
   const sv = S.service, sc = S.schedule, starting = starting_;
   setRows("onRows", [
@@ -388,7 +419,7 @@ function render() {
   const jl = $("jobsList").querySelector("ul");
   if (!jl.children.length) jl.replaceChildren(...(sc.jobs || []).map((j) => el("li", {}, j.why)));
   const oa = [];
-  if (!d.on) oa.push(el("button", { class: "btn", disabled: starting || !d.claude ? "" : null, onclick: startJori }, sv.running ? "Finish setting up" : "Start " + (S.identity.assistant_name || "Jori")));
+  if (!d.on) oa.push(el("button", { class: "btn", disabled: starting || !d.claude ? "" : null, onclick: startJori }, sv.running ? "Finish setting up" : "Start " + (S.identity.assistant_name || "Jori"))); // control-scan-ok: the setting's default
   if (d.on || (sv.running && sc.missing === 0)) oa.push(el("button", { class: "btn", onclick: next }, "Continue"));
   $("onActions").replaceChildren(...oa);
   const r = S.results || {};
@@ -400,7 +431,7 @@ function render() {
   $("reachTitle").textContent = d.on ? "I’m on. How should I reach you?" : "How should I reach you?";
   const ctl = S.controlUrl.replace(/#.*$/, "");
   const ways = [
-    ["The Jori app", "Chat and notifications on iPhone and Mac. Needs a free Supabase project.", "#services"],
+    ["The Jori app", "Chat and notifications on iPhone and Mac. Needs a free Supabase project.", "#services"], // control-scan-ok: the software's name
     ["iMessage", "Text me from the Messages app. Needs Full Disk Access for this Mac.", "#channels"],
     ["WhatsApp", "Message me from your phone, paired with a QR code.", "#channels"],
     ["Slack", "Talk to me in your workspace, as a teammate.", "#channels"],

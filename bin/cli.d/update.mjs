@@ -36,12 +36,12 @@ export async function updateStatus() {
 }
 
 export default {
-  summary: "pull the latest Jori, install packages, restart it",
+  summary: "pull the latest Jori, install packages, restart it",  // control-scan-ok: the software's name
   usage: "update [--check] [--no-restart]",
   async run(args, ctx) {
     const { c, hasFlag, die } = ctx;
     if (isHelp(args)) {
-      console.log(c.bold("jori update") + " — bring this checkout up to date and restart Jori\n");
+      console.log(c.bold("jori update") + " — bring this checkout up to date and restart Jori\n");  // control-scan-ok: the software's name
       console.log("  jori update              pull (fast-forward only), install packages, restart");
       console.log("  jori update --check      say how far behind this checkout is");
       console.log("  jori update --no-restart pull and install, leave the running service alone\n");
@@ -57,7 +57,7 @@ export default {
       if (st.ahead) console.log(c.dim(`  ${st.ahead} local commit(s) not upstream`));
       return;
     }
-    console.log(c.bold("Updating Jori") + " " + where);
+    console.log(c.bold("Updating Jori") + " " + where);  // control-scan-ok: the software's name
     let pulled = false;
     if (!st.behind) {
       console.log(`  ${c.green("✓")} already up to date`);
@@ -91,9 +91,14 @@ export default {
       console.log(c.dim("  not restarted (--no-restart)"));
       return;
     }
+    if (process.platform !== "darwin") {
+      const r = await core.run("systemctl", ["--user", "restart", "jori.service"]);
+      console.log(`  ${r.ok ? c.green("✓") : c.yellow("!")} ${r.ok ? "restarted jori.service" : "jori.service isn't installed here; start it with `jori setup start` or `jori up`."}`);
+      return;
+    }
     const svc = await core.loadedServiceLabel();
     if (!svc) {
-      console.log(c.dim("  Jori isn't running as a service here; start it with `jori setup start` or `jori up`."));
+      console.log(c.dim("  Jori isn't running as a service here; start it with `jori setup start` or `jori up`."));  // control-scan-ok: the software's name
       return;
     }
     const k = await core.run("launchctl", ["kickstart", "-k", `gui/${process.getuid()}/${svc.label}`]);

@@ -26,6 +26,28 @@ The same installer, other ways:
 
 Keep it current with `jori update` (fast-forward pull, packages, restart).
 
+### On a Mac mini or a virtual machine
+
+Jori is happiest on a machine that never sleeps. Run the same one-liner **over SSH** on the host:
+
+```bash
+ssh you@mac-mini.local          # or your VM
+curl -fsSL https://getjori.ai/install.sh | bash
+```
+
+`jori setup` notices the SSH session and, instead of opening a browser on a screen nobody is looking at, prints where to open the setup page from your own computer: the host's **Tailscale** address when it is on a tailnet (the page answers there only to tailnet addresses, and only with the token in the URL), or an `ssh -N -L 9087:127.0.0.1:9087 …` tunnel otherwise. Claude's sign-in works the same way from afar: open the sign-in link the page shows, then paste the code Claude gives you.
+
+The **Keep it running** step then checks that the host stays on by itself and shows the command for anything that isn't set:
+
+| Host | Checks |
+|---|---|
+| Mac mini / always-on Mac | signed in to the desktop, automatic login, never sleeps, restarts after a power cut, FileVault off (so a restart needs nobody at the keyboard) |
+| macOS VM (Tart, UTM, Parallels, cloud Mac) | signed in to the desktop, automatic login, never sleeps |
+| Linux VM | systemd lingering (keeps running after you log out), cron, `node` at `/opt/homebrew/bin/node` |
+| Laptop | none: it sleeps, and Jori runs while it is awake |
+
+`jori setup status` shows the same checks in the terminal. On Linux the service is a systemd user unit (`jori.service`); the Mac-only features (Messages, Photos, Find My, AppleScript) stay off. A machine without systemd (a container) runs `jori up` under its own supervisor; the starter jobs still go into cron.
+
 Installer options (environment): `JORI_HOME` (default `~/Dev/jori`), `JORI_REPO`, `JORI_NO_OLLAMA=1`, `JORI_NO_SETUP=1`, `JORI_NO_LINK=1`. The script is [`site/install.sh`](../site/install.sh); read it before piping it to a shell.
 
 ---
