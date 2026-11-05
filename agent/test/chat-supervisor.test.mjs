@@ -477,6 +477,14 @@ describe("chat-supervisor end-to-end", { skip: !canChildListen() && "child proce
     assert.ok("phoneChannelHeartbeatAgeMs" in body, "health should include phoneChannelHeartbeatAgeMs");
   });
 
+  it("health reports phoneChannelStale, false while no first heartbeat is overdue", async () => {
+    await setup();
+    const { body } = await httpGet(port, "/health");
+    assert.equal(body.phoneChannelStale, false, "a session just started is inside the first-heartbeat grace");
+    await httpPost(port, "/heartbeat", { source: "phone-channel", pid: 12345 });
+    assert.equal((await httpGet(port, "/health")).body.phoneChannelStale, false);
+  });
+
   // ── sendInit called after restart ─────────────────────────────────
 
   it("sendInit is called after restart so session initializes", async () => {

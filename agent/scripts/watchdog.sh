@@ -790,78 +790,94 @@ if [ -n "$CHAT_HEALTH_PORT" ]; then
 
     # Phone-channel heartbeat staleness
     HEARTBEAT_AGE=$(echo "$CHAT_HEALTH" | jq -r '.phoneChannelHeartbeatAgeMs // 0')
+    # A phone-channel that never sent a first heartbeat has no age (null): the
+    # supervisor's phoneChannelStale covers it once its grace has passed. A
+    # supervisor without the field is judged on the age alone, as before.
+    PC_NO_BEAT=$(echo "$CHAT_HEALTH" | jq -r 'if .phoneChannelStale == true and .phoneChannelHeartbeatAgeMs == null then "yes" else "no" end')
     if [ "$HEARTBEAT_AGE" -gt 300000 ]; then
       log "Phone-channel heartbeat stale: ${HEARTBEAT_AGE}ms — supervisor should auto-restart"
       ISSUES="$ISSUES phone-channel(heartbeat-stale)"
+    elif [ "$PC_NO_BEAT" = "yes" ]; then
+      log "Phone-channel sent no heartbeat since the chat session started — it is not running (the supervisor restarts the session for it a bounded number of times)"
+      ISSUES="$ISSUES phone-channel(no-heartbeat)"
     fi
   fi
 fi
 
 # --- Chat message delivery check (catches silent phone-channel failures) ---
-# Query Supabase for unread user messages older than 3 minutes.
-# If any exist, the phone-channel realtime subscription likely dropped.
+# The phone-channel acknowledges a user message by moving its cursor
+# (data/phone-channel-cursor.json: lastSeenAt = created_at of the newest message
+# it has handed to the chat supervisor; a failed hand-over leaves it for its own
+# sweep to retry). So a user message created after the cursor and more than
+# STALE_MSG_THRESHOLD ago is one the chat never received. `read` says nothing
+# about delivery (the app sets it on rows it displays) and is not consulted.
 # The instance's Supabase project (JORI_SUPABASE_PROJECT). With none
 # configured SUPABASE_KEY stays empty, which skips every Supabase check below.
 SUPABASE_URL="${JORI_SUPABASE_PROJECT:+https://$JORI_SUPABASE_PROJECT.supabase.co}"
 SUPABASE_KEY=""
 [ -n "$SUPABASE_URL" ] && SUPABASE_KEY=$(grep '^SUPABASE_SERVICE_ROLE_KEY=' "$HOME/Dev/jori/.env" 2>/dev/null | cut -d= -f2-)
-STALE_MSG_THRESHOLD=180  # 3 minutes
+STALE_MSG_THRESHOLD=600     # 10 minutes: realtime delivers in seconds, the phone-channel's sweep within 2
+STALE_MSG_LOOKBACK=604800   # 7 days: never look further back, whatever the cursor says
+PC_CURSOR_FILE="$JORI_INSTALL_TOOLS/data/phone-channel-cursor.json"
+# The cursor as the last tick saw it during an incident. Beside INCIDENT_DIR,
+# not in it: `jori watchdog` lists every file there as an incident.
+CHAT_DELIVERY_CURSOR_MEMO="${INCIDENT_DIR%/*}/.watchdog-chat-delivery-cursor"
 
-CUTOFF=$(date -u -v-${STALE_MSG_THRESHOLD}S '+%Y-%m-%dT%H:%M:%S+00:00' 2>/dev/null || date -u -d "${STALE_MSG_THRESHOLD} seconds ago" '+%Y-%m-%dT%H:%M:%S+00:00' 2>/dev/null)
-if [ -n "$CUTOFF" ] && [ -n "$SUPABASE_URL" ]; then
+# chat_delivery_query <after> <floor> <before> — the PostgREST query string for
+# the oldest user messages created after both <after> and <floor> and before
+# <before>. A "+" in a timestamp ("…+00:00", the cursor's form) is sent as %2B:
+# bare, the query string reads it as a space and PostgREST answers 400.
+chat_delivery_query() {
+  printf 'select=id,created_at&role=eq.user&created_at=gt.%s&created_at=gt.%s&created_at=lt.%s&order=created_at.asc&limit=50' \
+    "${1//+/%2B}" "${2//+/%2B}" "${3//+/%2B}"
+}
+
+CUTOFF=$(date -u -v-${STALE_MSG_THRESHOLD}S '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date -u -d "${STALE_MSG_THRESHOLD} seconds ago" '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null)
+LOOKBACK_FLOOR=$(date -u -v-${STALE_MSG_LOOKBACK}S '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date -u -d "${STALE_MSG_LOOKBACK} seconds ago" '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null)
+# No cursor file: the phone-channel has never handed a message over on this
+# install, so there is no line to measure from.
+PC_CURSOR=$(jq -r '.lastSeenAt // empty' "$PC_CURSOR_FILE" 2>/dev/null)
+if [ -n "$CUTOFF" ] && [ -n "$LOOKBACK_FLOOR" ] && [ -n "$SUPABASE_URL" ] && [ -n "$PC_CURSOR" ]; then
   STALE_MSGS=$(curl -sf --max-time 5 \
-    "${SUPABASE_URL}/rest/v1/jori_messages?role=eq.user&read=eq.false&created_at=lt.${CUTOFF}&order=created_at.asc&limit=5" \
+    "${SUPABASE_URL}/rest/v1/jori_messages?$(chat_delivery_query "$PC_CURSOR" "$LOOKBACK_FLOOR" "$CUTOFF")" \
     -H "apikey: ${SUPABASE_KEY}" \
     -H "Authorization: Bearer ${SUPABASE_KEY}" 2>/dev/null)
+  # A failed query is no reading at all, never "0 stuck": it neither counts
+  # toward a page nor clears one.
+  STALE_COUNT=$(printf '%s' "$STALE_MSGS" | jq -r 'if type == "array" then length else empty end' 2>/dev/null)
 
-  STALE_COUNT=$(echo "$STALE_MSGS" | jq -r 'if type == "array" then length else 0 end' 2>/dev/null || echo 0)
-  STALE_COUNT=${STALE_COUNT:-0}
-
-  if [ "$STALE_COUNT" -gt 0 ]; then
+  if [ -z "$STALE_COUNT" ]; then
+    log_throttled "$JORI_INSTALL_TOOLS/data/.watchdog-chat-delivery-query-log" "Chat delivery check: the Supabase query failed — no reading this tick"
+  elif [ "$STALE_COUNT" -gt 0 ] && [ -n "$CHAT_HOLD_UNTIL" ]; then
+    # Chat holds for the Claude usage limit: the session starts its MCP servers
+    # (the phone-channel among them) only with a turn, and the hold queues every
+    # turn, so after a restart nothing picks messages up until the reset; the
+    # phone-channel's startup sweep then does. Neither counted nor cleared.
+    log_throttled "$JORI_INSTALL_TOOLS/data/.watchdog-chat-delivery-hold-log" "Chat delivery waiting: $STALE_COUNT user message(s) past the phone-channel cursor while chat holds for the Claude usage limit until $CHAT_HOLD_UNTIL"
+  elif [ "$STALE_COUNT" -gt 0 ]; then
     ATTEMPT=$(incident_seen "chat-delivery-stuck")
-    log "Chat delivery stuck: $STALE_COUNT unread user message(s) older than ${STALE_MSG_THRESHOLD}s (attempt $ATTEMPT)"
+    log "Chat delivery stuck: $STALE_COUNT user message(s) older than ${STALE_MSG_THRESHOLD}s not received by the chat (phone-channel cursor $PC_CURSOR, attempt $ATTEMPT)"
     ISSUES="$ISSUES chat-delivery-stuck(${STALE_COUNT}msg)"
 
-    # Self-heal: restart chat supervisor + redispatch every tick the
-    # condition holds. Idempotent — RECOVERED MESSAGE prefix dedups in chat.
-    if [ -n "$CHAT_HEALTH_PORT" ]; then
+    # Self-heal, once per incident: restart the chat session, which respawns the
+    # phone-channel; its startup sweep hands over what is past the cursor.
+    # Restarting every tick would kill each turn the recovery starts.
+    if [ "$ATTEMPT" -eq 1 ] && [ -n "$CHAT_HEALTH_PORT" ]; then
       log "Restarting chat supervisor to recover message delivery"
       curl -sf -X POST "http://127.0.0.1:$CHAT_HEALTH_PORT/restart" > /dev/null 2>&1
-      sleep 10  # Wait for session to restart and phone-channel to reconnect
-
-      # Dispatch each missed message directly to the chat supervisor
-      echo "$STALE_MSGS" | $NODE -e '
-        let d="";
-        process.stdin.on("data",c=>d+=c);
-        process.stdin.on("end",async()=>{
-          try {
-            const msgs = JSON.parse(d);
-            if (!Array.isArray(msgs)) return;
-            for (const m of msgs) {
-              const body = JSON.stringify({
-                content: "RECOVERED MESSAGE (was stuck):\n\nNew message from " + (process.env.JORI_OWNER_NAME || "the user") + ":\n\n" + m.content,
-                source: "jori",
-                priority: "high",
-                msgId: m.id
-              });
-              const resp = await fetch("http://127.0.0.1:'"$CHAT_HEALTH_PORT"'/dispatch", {
-                method: "POST",
-                headers: {"content-type":"application/json"},
-                body
-              });
-              console.error("dispatched recovered msg " + m.id + " status=" + resp.status);
-            }
-          } catch(e) { console.error("dispatch error: " + e.message); }
-        });
-      ' 2>> "$LOG"
     fi
 
-    # Alert only if recovery has demonstrably failed (still stuck on next tick).
-    if [ "$ATTEMPT" -ge 2 ] && incident_should_alert "chat-delivery-stuck"; then
-      notify "🔴 Chat delivery still stuck after self-heal — $STALE_COUNT message(s) sitting unread across $ATTEMPT consecutive ticks. Phone-channel realtime subscription needs manual reconnect."
+    # Page once the restart has demonstrably not helped: still stuck on a later
+    # tick and the cursor has not moved since the last one (a moving cursor is a
+    # backlog being handed over).
+    PREV_PC_CURSOR=$(cat "$CHAT_DELIVERY_CURSOR_MEMO" 2>/dev/null)
+    printf '%s' "$PC_CURSOR" > "$CHAT_DELIVERY_CURSOR_MEMO"
+    if [ "$ATTEMPT" -ge 2 ] && [ "$PC_CURSOR" = "$PREV_PC_CURSOR" ] && incident_should_alert "chat-delivery-stuck"; then
+      notify "🔴 Chat delivery still stuck after self-heal — $STALE_COUNT message(s) sent in the app have not reached the chat for over $((STALE_MSG_THRESHOLD / 60)) min, across $ATTEMPT consecutive checks, and restarting the chat session did not hand them over."
     fi
   else
     incident_clear "chat-delivery-stuck"
+    rm -f "$CHAT_DELIVERY_CURSOR_MEMO" 2>/dev/null
   fi
 fi
 

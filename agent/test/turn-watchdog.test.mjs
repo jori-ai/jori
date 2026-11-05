@@ -6,6 +6,9 @@
 
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 import {
   TurnWatchdog,
   watchdogMsFor,
@@ -13,6 +16,9 @@ import {
   TURN_WATCHDOG_MS_DEFAULT,
   TURN_WATCHDOG_MS_JOB_DEFAULT,
   INTERACTIVE_SOURCES,
+  phoneChannelLiveness,
+  PHONE_CHANNEL_STALE_MS,
+  PHONE_CHANNEL_FIRST_BEAT_GRACE_MS,
 } from "../supervisor/turn-watchdog.mjs";
 
 // A fake timer scheduler: setTimer records {fn, ms}; fire(handle) advances the
@@ -150,5 +156,70 @@ describe("TurnWatchdog", () => {
     wd.arm({ id: "t1", source: "x" });
     assert.doesNotThrow(() => clock.fire([...clock.pending][0]));
     assert.equal(wd.armed, false);
+  });
+});
+
+// ── Phone-channel liveness (chat supervisor) ──────────────────────────────────
+// A phone-channel that crashed at launch never sends a heartbeat, so judged on
+// the last heartbeat's age alone it read as healthy forever while every message
+// from the app went unreceived.
+describe("phoneChannelLiveness", () => {
+  const MIN = 60_000;
+  const T0 = Date.parse("2026-01-01T12:00:00Z");
+
+  it("a session whose phone-channel never heartbeats reads stale once the grace has passed", () => {
+    const within = phoneChannelLiveness({ lastHeartbeatAt: null, waitingSince: T0, now: T0 + 4 * MIN });
+    assert.deepEqual(within, { ageMs: null, firstBeatPending: true, stale: false });
+    const past = phoneChannelLiveness({ lastHeartbeatAt: null, waitingSince: T0, now: T0 + PHONE_CHANNEL_FIRST_BEAT_GRACE_MS + 1 });
+    assert.deepEqual(past, { ageMs: null, firstBeatPending: true, stale: true });
+    const hours = phoneChannelLiveness({ lastHeartbeatAt: null, waitingSince: T0, now: T0 + 17 * 60 * MIN });
+    assert.equal(hours.stale, true, "it stays stale; it does not age back into healthy");
+  });
+
+  it("the grace is five minutes, strictly over, and longer than the 3-minute heartbeat staleness", () => {
+    assert.equal(PHONE_CHANNEL_FIRST_BEAT_GRACE_MS, 5 * MIN);
+    assert.equal(PHONE_CHANNEL_STALE_MS, 3 * MIN);
+    assert.equal(phoneChannelLiveness({ waitingSince: T0, now: T0 + PHONE_CHANNEL_FIRST_BEAT_GRACE_MS }).stale, false);
+  });
+
+  it("no wait to judge (mid-restart, usage-limit hold, no phone channel configured) is never stale", () => {
+    for (const now of [T0, T0 + 10 * MIN, T0 + 24 * 60 * MIN]) {
+      assert.deepEqual(phoneChannelLiveness({ lastHeartbeatAt: null, waitingSince: null, now }),
+        { ageMs: null, firstBeatPending: true, stale: false });
+    }
+  });
+
+  it("a heartbeat is judged on its age, whatever the session start", () => {
+    const fresh = phoneChannelLiveness({ lastHeartbeatAt: T0 + 30 * MIN, waitingSince: T0, now: T0 + 31 * MIN });
+    assert.deepEqual(fresh, { ageMs: MIN, firstBeatPending: false, stale: false });
+    const old = phoneChannelLiveness({ lastHeartbeatAt: T0, waitingSince: null, now: T0 + PHONE_CHANNEL_STALE_MS + 1 });
+    assert.deepEqual(old, { ageMs: PHONE_CHANNEL_STALE_MS + 1, firstBeatPending: false, stale: true });
+  });
+
+  // The supervisor wiring, string-level: chat-supervisor.mjs starts itself on import.
+  const SUP = fs.readFileSync(path.join(path.dirname(fileURLToPath(import.meta.url)), "../supervisor/chat-supervisor.mjs"), "utf8");
+
+  it("chat /health reports phoneChannelStale from the same judgment its restart check uses", () => {
+    assert.match(SUP, /phoneChannelStale: this\._phoneChannelLiveness\(now\)\.stale,/);
+    assert.match(SUP, /phoneChannelHeartbeatAgeMs: this\.lastPhoneChannelHeartbeat \? now - this\.lastPhoneChannelHeartbeat : null,/,
+      "the age field keeps its meaning for readers that predate phoneChannelStale");
+    const interval = SUP.slice(SUP.indexOf("// Monitor phone-channel heartbeat"), SUP.indexOf("this.startContextGuard();"));
+    assert.match(interval, /const pc = this\._phoneChannelLiveness\(\);/);
+    assert.ok(!/if \(this\.lastPhoneChannelHeartbeat &&/.test(interval),
+      "the restart check must not require a first heartbeat to have arrived");
+  });
+
+  it("restarts for a phone-channel that never heartbeats are bounded and re-armed by a heartbeat", () => {
+    assert.match(SUP, /const FIRST_BEAT_RESTARTS = \d+;/);
+    assert.match(SUP, /if \(n >= FIRST_BEAT_RESTARTS\) \{/);
+    const hb = SUP.slice(SUP.indexOf('url.pathname === "/heartbeat"'), SUP.indexOf('url.pathname === "/restart"'));
+    assert.match(hb, /this\._phoneChannelNoBeatRestarts = 0;/);
+  });
+
+  it("the first-heartbeat wait restarts after a usage-limit hold and pauses mid-restart", () => {
+    const fn = SUP.slice(SUP.indexOf("  _phoneChannelLiveness(now = Date.now()) {"), SUP.indexOf("  // Context-size guard"));
+    assert.match(fn, /if \(this\.dispatcher\?\.isHeld\(\)\) this\._phoneChannelHeldAt = now;/);
+    assert.match(fn, /this\.restarting \|\| !this\._phoneChannelExpected \? null/);
+    assert.match(fn, /Math\.max\(this\.sessionStartedAt \|\| 0, this\._phoneChannelHeldAt\)/);
   });
 });

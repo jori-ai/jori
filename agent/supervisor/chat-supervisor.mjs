@@ -43,6 +43,7 @@ import {
 } from "./context-guard.mjs";
 import { State } from "./state.mjs";
 import { Instrumentation } from "./instrumentation.mjs";
+import { phoneChannelLiveness, PHONE_CHANNEL_FIRST_BEAT_GRACE_MS } from "./turn-watchdog.mjs";
 import { attachClaudeMdWatcher } from "./graceful-restart.mjs";
 import { authFailureText, CHAT_AUTH_OFFLINE_REPLY } from "./auth-result.mjs";
 import { isQuotaRefusal, rateLimitHoldUntil, RATE_LIMIT_REPROBE_MS } from "./dispatcher.mjs";
@@ -293,6 +294,8 @@ class ChatSupervisor {
     this.liveBackgroundTasks = new Map();
     this.interrupting = false;
     this.lastPhoneChannelHeartbeat = null;
+    this._phoneChannelHeldAt = 0;          // last time dispatch was seen held (see _phoneChannelLiveness)
+    this._phoneChannelNoBeatRestarts = 0;  // restarts for a phone-channel that never sent a heartbeat
     // Per-turn hang watchdog (parity with ops index.mjs, which has had one since
     // 2026-04-18). Chat previously relied only on the 15-min process-level SIGKILL
     // in process-manager.mjs; this recovers a hung chat turn faster and per-turn.
@@ -860,6 +863,7 @@ class ChatSupervisor {
 
       if (req.method === "POST" && url.pathname === "/heartbeat") {
         this.lastPhoneChannelHeartbeat = Date.now();
+        this._phoneChannelNoBeatRestarts = 0;
         json(res, 200, { ok: true });
         return;
       }
@@ -887,20 +891,47 @@ class ChatSupervisor {
     });
     this.server.listen(port, "127.0.0.1", () => console.error(`[chat-supervisor] HTTP on :${port}`));
 
-    // Monitor phone-channel heartbeat — restart if stale >3 minutes.
-    const HEARTBEAT_STALE_MS = 3 * 60 * 1000;
+    // Monitor phone-channel heartbeat — restart if stale >3 minutes, or if this
+    // session's phone-channel has sent none within the first-heartbeat grace
+    // (it crashed at launch). A launch crash usually repeats, so that cause gets
+    // FIRST_BEAT_RESTARTS restarts until a heartbeat arrives; after that /health
+    // keeps reporting it stale and the watchdog's delivery check pages if
+    // messages go unreceived.
+    const FIRST_BEAT_RESTARTS = 2;
     setInterval(() => {
-      if (this.lastPhoneChannelHeartbeat &&
-          Date.now() - this.lastPhoneChannelHeartbeat > HEARTBEAT_STALE_MS &&
-          !this.restarting) {
+      if (this.restarting) return;
+      const pc = this._phoneChannelLiveness();
+      if (!pc.stale) return;
+      if (pc.firstBeatPending) {
+        const n = this._phoneChannelNoBeatRestarts++;
+        if (n >= FIRST_BEAT_RESTARTS) {
+          if (n === FIRST_BEAT_RESTARTS) console.error(`[chat-supervisor] phone-channel still sent no heartbeat after ${n} restarts — not restarting for it again until one arrives`);
+          return;
+        }
+        console.error(`[chat-supervisor] phone-channel sent no heartbeat within ${PHONE_CHANNEL_FIRST_BEAT_GRACE_MS / 60_000} min of session start — restarting session (${n + 1}/${FIRST_BEAT_RESTARTS})`);
+      } else {
         console.error("[chat-supervisor] phone-channel heartbeat stale — restarting session");
-        this.restart().catch((e) => console.error(`[chat-supervisor] heartbeat restart failed: ${e.message}`));
       }
+      this.restart().catch((e) => console.error(`[chat-supervisor] heartbeat restart failed: ${e.message}`));
     }, 60_000);
 
     this.startContextGuard();
     this.startCheckLaterTick();
     this.startForkTick();
+  }
+
+  // Phone-channel liveness for the restart check and /health
+  // (phoneChannelLiveness in turn-watchdog.mjs). The first-heartbeat grace runs
+  // from the later of the session's start and the last tick that saw dispatch
+  // held for the usage limit (a hold keeps the init turn that starts the MCP
+  // servers queued). Nothing is judged mid-restart, or when no Supabase project
+  // is configured (the phone-channel exits at launch by design then).
+  _phoneChannelLiveness(now = Date.now()) {
+    if (this.dispatcher?.isHeld()) this._phoneChannelHeldAt = now;
+    this._phoneChannelExpected ??= !!(instanceValue("supabase_project") || process.env.SUPABASE_URL);
+    const waitingSince = this.restarting || !this._phoneChannelExpected ? null
+      : Math.max(this.sessionStartedAt || 0, this._phoneChannelHeldAt) || null;
+    return phoneChannelLiveness({ lastHeartbeatAt: this.lastPhoneChannelHeartbeat, waitingSince, now });
   }
 
   // Context-size guard: keep the chat session under the 200k standard window so it
@@ -1125,6 +1156,7 @@ class ChatSupervisor {
       consecutiveNoOpTurns: this.consecutiveNoOpTurns,
       childAlive: !!(this.session?.child && this.session.child.exitCode === null && this.session.child.signalCode === null),
       phoneChannelHeartbeatAgeMs: this.lastPhoneChannelHeartbeat ? now - this.lastPhoneChannelHeartbeat : null,
+      phoneChannelStale: this._phoneChannelLiveness(now).stale,
       activeTools: [...this.activeToolMap.values()],
       safetyNetFireCount: this.safetyNetFireCount,
       authErrorCount: this.authErrorCount,
