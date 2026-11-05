@@ -201,7 +201,7 @@ const mcp = new Server(
     },
     instructions: `You are monitoring mobile messages from ${OWNER} via the Jori app.
 
-CRITICAL: \`mcp__phone-channel__reply\` is the ONLY way to deliver text to ${OWNER}. Plain assistant text — anything you "say" without calling the reply tool — is silently dropped; ${OWNER} never sees it. Every Jori message you receive MUST end with at least one reply tool call. One exception: the supervisor's own "Session started" line, sent after every restart, is not from ${OWNER}. If a message of theirs is still unanswered because the restart cut you off, answer that message now; otherwise end the turn without calling reply. If you produce ANY substantive answer text, that text must be the \`message\` argument to a reply tool call, NOT a plain text content block in your turn.
+CRITICAL: \`mcp__phone-channel__reply\` is the ONLY way to deliver text to ${OWNER}. Plain assistant text — anything you "say" without calling the reply tool — is silently dropped; ${OWNER} never sees it. Every app message you receive MUST end with at least one reply tool call. One exception: the supervisor's own "Session started" line, sent after every restart, is not from ${OWNER}. If a message of theirs is still unanswered because the restart cut you off, answer that message now; otherwise end the turn without calling reply. If you produce ANY substantive answer text, that text must be the \`message\` argument to a reply tool call, NOT a plain text content block in your turn.
 
 THREADED REPLIES: ${OWNER_LABEL} often reads ${ASSISTANT} in between other things, so several messages stack up before they answer. When they tap Reply on a specific bubble, the message you receive opens with a \`[Threaded reply]\` block quoting the message they answered. Treat that quoted message as the subject — NOT the most recent exchange in the "Recent conversation" tail, which is usually about something else by then. Say enough in your reply to make clear which thread you're answering.
 
@@ -220,7 +220,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: "reply",
       description:
-        "Send a response back to " + OWNER + " via the Jori mobile app. " +
+        "Send a response back to " + OWNER + " via the Jori mobile app. " + // control-scan-ok: the software's name
         "For any reply longer than ~80 characters, or that contains structured/multi-section content " +
         "(digests, briefings, lists), you MUST provide a short `summary` — this becomes the push " +
         "notification body (e.g. 'Weekend events ready', 'P1 email: draft ready'). " +
@@ -230,7 +230,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
         properties: {
           message: {
             type: "string",
-            description: "The full message body to insert into the Jori chat. With `message_file`, an optional short lead-in placed above the file's text.",
+            description: "The full message body to insert into the Jori chat. With `message_file`, an optional short lead-in placed above the file's text.", // control-scan-ok: the software's name
           },
           message_file: {
             type: "string",
@@ -249,7 +249,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
           time_sensitive: {
             type: "boolean",
             description:
-              "Default false. Set TRUE only when this is a direct answer " + OWNER + " is ACTIVELY WAITING FOR and likely can't look at the screen — above all when they voice-summoned Jori hands-free (\"Hey Siri, Summon Jori\") or is otherwise driving. True marks the push time-sensitive so it pierces Driving/DND Focus and gets read aloud over AirPods/CarPlay. NEVER set true for anything proactive or ambient (digests, hum pings, ideas, suggestions, FYIs, reminders they didn't just ask about) — those must not interrupt them while driving. Rare genuine urgency (a real P1 they need now) may also use true.",
+              "Default false. Set TRUE only when this is a direct answer " + OWNER + " is ACTIVELY WAITING FOR and likely can't look at the screen — above all when they voice-summoned Jori hands-free (\"Hey Siri, Summon Jori\") or is otherwise driving. True marks the push time-sensitive so it pierces Driving/DND Focus and gets read aloud over AirPods/CarPlay. NEVER set true for anything proactive or ambient (digests, hum pings, ideas, suggestions, FYIs, reminders they didn't just ask about) — those must not interrupt them while driving. Rare genuine urgency (a real P1 they need now) may also use true.", // control-scan-ok: the software's name
           },
         },
         // One of message / message_file — checked in the handler.
@@ -412,7 +412,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
       }, 1500);
 
       return {
-        content: [{ type: "text", text: "Reply sent to Jori app" }],
+        content: [{ type: "text", text: "Reply sent to Jori app" }], // control-scan-ok: the software's name
       };
     } catch (err) {
       console.error(`[phone-channel] Error: ${err.message}`);
@@ -838,7 +838,7 @@ async function handleIncomingMessage(row) {
     // photo arrives as its own bare jori-attachments URL row, the note and
     // shared text/links as the following row; shareBundler has already joined
     // them into this one message, photos first.
-    const shareLine = metadata.source === "share" ? "\n[Shared into Jori from another app via the share sheet]" : "";
+    const shareLine = metadata.source === "share" ? "\n[Shared into Jori from another app via the share sheet]" : ""; // control-scan-ok: the software's name
 
     const [recallBlock, replyBlock, humBlock, improvementBlock] =
       await Promise.all([recallP, replyBlockP, humBlockP, improvementBlockP]);

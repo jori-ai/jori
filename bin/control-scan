@@ -14,7 +14,11 @@
 // JSON (that is configuration), tests, agent/local/ (the installation's own
 // files), node_modules, logs, and the files that ARE the settings
 // (lib/instance.cjs, lib/ports.cjs, lib/models.cjs, agent/config/models.env).
-// Comment-only lines are skipped.
+// Comments are not code: comment-only lines, block comments and docstrings
+// (/* */, <!-- -->, Python """ """) and a trailing ` // note` / ` # note` are
+// skipped. A line that names a value on purpose (the software's own name, a
+// price per model id, the US market's fixed zone) carries
+// `control-scan-ok: <reason>`; `kernel-guard-ok: <reason>` counts too.
 
 import fs from "node:fs";
 import os from "node:os";
@@ -83,6 +87,36 @@ function isComment(line) {
   return t.startsWith("//") || t.startsWith("#") || t.startsWith("*") || t.startsWith("/*") || t.startsWith("<!--");
 }
 
+// The code part of a line: a trailing ` // note` or ` # note` is a comment, not
+// a value the program uses. (A space before the marker keeps URLs and `#!`.)
+function codePart(line, ext) {
+  let s = line;
+  const js = /^\.(js|mjs|cjs|ts|html)$/.test(ext) || !ext;
+  if (js) { const i = s.search(/\s\/\/\s/); if (i >= 0) s = s.slice(0, i); } // lang-regex-ok: source-code syntax
+  if (ext === ".sh" || ext === ".py" || !ext) { const i = s.search(/\s#\s/); if (i >= 0) s = s.slice(0, i); } // lang-regex-ok: source-code syntax
+  return s;
+}
+
+// Block comments and docstrings span lines: /* … */, <!-- … -->, Python """ … """.
+function blockTracker(ext) {
+  let open = null; // the closing marker we are waiting for
+  return (line) => {
+    const t = line.trim();
+    if (open) { if (t.includes(open)) open = null; return true; }
+    for (const [a, b] of [["/*", "*/"], ["<!--", "-->"], ...(ext === ".py" || !ext ? [['"""', '"""'], ["'''", "'''"]] : [])]) {
+      if (!t.startsWith(a)) continue;
+      const rest = t.slice(a.length);
+      if (!rest.includes(b)) open = b;
+      return true;
+    }
+    return false;
+  };
+}
+
+// A line marked as deliberately not a setting: `control-scan-ok: <reason>`, or
+// the kernel guard's own `kernel-guard-ok: <reason>` (already judged generic).
+const isExempt = (line) => line.includes("control-scan-ok") || line.includes("kernel-guard-ok");
+
 function scan() {
   const R = rules();
   const hits = new Map(R.map((r) => [r.key, { ...r, re: undefined, count: 0, files: [] }]));
@@ -92,14 +126,17 @@ function scan() {
     if (text.length > 2_000_000 || text.includes("\u0000")) continue;
     const rel = path.relative(TOOLS_DIR, f);
     const lines = text.split("\n");
+    const ext = path.extname(f);
+    const inBlock = blockTracker(ext);
     for (let i = 0; i < lines.length; i++) {
-      const line = lines[i];
-      if (!line || isComment(line) || line.includes("control-scan-ok")) continue;
+      const raw = lines[i];
+      if (!raw || inBlock(raw) || isComment(raw) || isExempt(raw)) continue;
+      const line = codePart(raw, ext);
       for (const r of R) {
         if (r.re.test(line)) {
           const h = hits.get(r.key);
           h.count++;
-          if (h.files.length < 60) h.files.push(`${rel}:${i + 1}`);
+          if (h.files.length < 500) h.files.push(`${rel}:${i + 1}`);
         }
       }
     }

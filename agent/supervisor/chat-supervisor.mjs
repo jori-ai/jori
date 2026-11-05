@@ -1096,7 +1096,7 @@ class ChatSupervisor {
       // and the watchdog restarts a supervisor whose queue waits.
       if (this.dispatcher && !this.dispatcher.queue.some((i) => i.source === "init")) {
         this.dispatcher.dispatch(
-          "Session started. Standing by for Jori messages.",
+          "Session started. Standing by for Jori messages.", // control-scan-ok: the software's name
           "init",
           { priority: "low" }
         );

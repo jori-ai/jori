@@ -124,7 +124,7 @@ def _block_reason():
         raise PlacesRefused(6, f"places-budget state unreadable ({e}) — refusing (fail closed).")
     g = (st.get("scopes") or {}).get("jori") or {}
     if st.get("month") == _month() and (g.get("level") == "blocked" or g.get("manually_blocked")):
-        return (f"Jori's Places spend is ${float(g.get('spend_usd') or 0):.2f} this month, over the "
+        return (f"{places_local.assistant_name()}'s Places spend is ${float(g.get('spend_usd') or 0):.2f} this month, over the "
                 f"${float(g.get('limit_usd') or 0):.2f} cap. Places calls are stopped.")
     return None
 

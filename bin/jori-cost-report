@@ -165,12 +165,12 @@ function modelTier(models) {
 //     ($0.50/$2.50/$0.05/$0.625) for the whole request.
 const M = 1e6;
 const MODEL_RATES = {
-  'claude-opus-5-5': [{ in: 4 / M, out: 20 / M, cr: 0.20 / M, cw: 5 / M }],
-  'claude-sonnet-5-5': [
+  'claude-opus-5-5': [{ in: 4 / M, out: 20 / M, cr: 0.20 / M, cw: 5 / M }], // control-scan-ok: a price per model id, not a model choice
+  'claude-sonnet-5-5': [ // control-scan-ok: a price per model id, not a model choice
     { until: '2026-10-07T00:00:00Z', in: 2 / M, out: 10 / M, cr: 0.20 / M, cw: 2.50 / M },
     { in: 2 / M, out: 10 / M, cr: 0.10 / M, cw: 2.50 / M },
   ],
-  'claude-haiku-5-5': [{ in: 0.10 / M, out: 0.50 / M, cr: 0.01 / M, cw: 0.125 / M,
+  'claude-haiku-5-5': [{ in: 0.10 / M, out: 0.50 / M, cr: 0.01 / M, cw: 0.125 / M, // control-scan-ok: a price per model id, not a model choice
     long: { over: 100000, in: 0.50 / M, out: 2.50 / M, cr: 0.05 / M, cw: 0.625 / M } }],
   'claude-sonnet-4-6': [{ in: 3 / M, out: 15 / M, cr: 0.30 / M, cw: 3.75 / M }],
 };

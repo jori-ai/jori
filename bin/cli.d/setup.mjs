@@ -46,7 +46,7 @@ async function status(ctx, args) {
   for (const [ok, warn, name, detail] of lines) console.log(`  ${mark(ok, warn)} ${name.padEnd(16)} ${c.dim(detail)}`);
   const h = s.host;
   console.log(c.bold(`\n  This machine`) + c.dim(` — ${h.kind}${h.remote ? ", over SSH" : ""}${h.tailscale ? `, ${h.tailscale.dns || h.tailscale.ip} on Tailscale` : ""}`));
-  if (!s.alwaysOn.length) console.log(c.dim("    a laptop: it sleeps, and Jori runs while it's awake"));
+  if (!s.alwaysOn.length) console.log(c.dim("    a laptop: it sleeps, and Jori runs while it's awake")); // control-scan-ok: the software's name
   for (const k of s.alwaysOn) {
     console.log(`  ${mark(k.ok, k.warn)} ${k.name}`);
     if (!k.ok && k.fix) console.log(c.dim(`      ${k.fix}`));

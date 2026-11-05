@@ -37,6 +37,8 @@ routes = [{ pattern = "wiki.example.com/*", zone_name = "example.com" }]
 [vars]
 SUPABASE_URL = "https://<your-project-ref>.supabase.co"
 CF_ACCESS_TEAM_DOMAIN = "<your-team>.cloudflareaccess.com"
+# What the assistant is called on the pages (instance.json `assistant_name`).
+ASSISTANT_NAME = "Jori"  # control-scan-ok: the setting's default
 
 # The site icon (src/index.js imports "wiki-favicon"). The kernel default has
 # none (/favicon.* is a 404); an installation's copy points the alias (a path

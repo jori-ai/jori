@@ -26,6 +26,8 @@ import { judgeFit } from "../lib/watch-fit.mjs";
 import { loadModel } from "../lib/watch-model.mjs";
 import * as recsys from "../lib/watch-recsys.mjs";
 import { HOME_REGION } from "../lib/watch-where.mjs";
+import { createRequire } from "node:module";
+const ASSISTANT = createRequire(import.meta.url)("../lib/instance.cjs").assistantName(); // the assistant's configured name (lib/instance.cjs)
 
 const arg = (n, d) => { const i = process.argv.indexOf(`--${n}`); return i >= 0 ? parseInt(process.argv[i + 1], 10) : d; };
 const MAX = arg("max", 5);
@@ -85,7 +87,7 @@ const M = await loadModel();
 const catRow = new Map(M.catalog.filter((r) => r.kind === "movie").map((r) => [r.tmdb_id, r]));
 const unseen = M.catalog.filter((r) => r.kind === "movie" && r.seen !== true && !r.not_for_us && r.features_at && !r.title_id && (r.year ?? 0) >= MIN_YEAR);
 for (const r of unseen.map((r) => ({ r, p: recsys.predict(M.model, r).p })).sort((a, b) => b.p - a.p).slice(0, 40)) {
-  addC({ id: r.r.tmdb_id, title: r.r.title, vote_average: r.r.vote_average, year: r.r.year }, "Jori's taste model");
+  addC({ id: r.r.tmdb_id, title: r.r.title, vote_average: r.r.vote_average, year: r.r.year }, `${ASSISTANT}'s taste model`);
 }
 for (const c of pool.values()) { const r = catRow.get(c.tmdb_id); c.p = r?.features_at ? recsys.predict(M.model, r).p : null; }
 // Highest predicted like first; unenriched candidates rank by how many loved films point at them.

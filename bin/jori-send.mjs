@@ -73,7 +73,7 @@ if (error) {
   process.exit(1);
 }
 
-console.log("Message sent to Jori.");
+console.log(`Message sent to ${createRequire(import.meta.url)("../lib/instance.cjs").assistantName()}.`);
 
 if (silent) process.exit(0);
 

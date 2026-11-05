@@ -8,6 +8,8 @@
 # Usage: runs via launchd on a schedule, auto-removes itself after 2 days.
 
 set -euo pipefail
+# The assistant's name (JORI_ASSISTANT_NAME) from lib/instance.cjs; env wins.
+source "$(dirname "$0")/../scripts/lib/instance.sh"
 
 TMUX=/opt/homebrew/bin/tmux
 SESSION=claude
@@ -38,7 +40,7 @@ notify() {
   local msg="$1"
   # --skip-precheck: diagnostic notification, must not be modified/suppressed
   # by recent chat context — we're verifying the channel itself.
-  "$JORI" --skip-precheck --intent resilience-test "$msg" 2>/dev/null || log "Jori notification failed, result logged only"
+  "$JORI" --skip-precheck --intent resilience-test "$msg" 2>/dev/null || log "${JORI_ASSISTANT_NAME:-Jori} notification failed, result logged only"  # control-scan-ok: the setting's default
 }
 
 log "=== Resilience test starting ==="

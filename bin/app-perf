@@ -72,7 +72,7 @@ if (cmd === "diagnostics") {
 // summary
 const hs = await rows("hang", "occurred_at,platform,build,duration_ms,context");
 const ms = await rows("metrics", "occurred_at,platform,build,payload");
-console.log(`Jori app responsiveness, last ${days} day(s)\n`);
+console.log(`Jori app responsiveness, last ${days} day(s)\n`);  // control-scan-ok: the software's name
 const groups = new Map();
 for (const h of hs) {
   const k = `${h.platform} build ${h.build}`;

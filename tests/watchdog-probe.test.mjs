@@ -32,6 +32,15 @@ const WATCHDOG_PATH =
 
 const SRC = fs.readFileSync(WATCHDOG_PATH, "utf8");
 
+// The header is spelled once, in JORI_PROBE_HEADER, and the probes send it by
+// that name; either the literal or the variable counts, and the variable must
+// hold exactly the header.
+const PROBE_HEADER = /X-Jori-Probe:\s*watchdog|-H "\$JORI_PROBE_HEADER"/;
+
+test("JORI_PROBE_HEADER is the watchdog probe header", () => {
+  assert.match(SRC, /^JORI_PROBE_HEADER="X-Jori-Probe: watchdog"/m);
+});
+
 test("cloudflared_tunnel_probe function is defined", () => {
   const defRe = /^\s*(?:function\s+)?cloudflared_tunnel_probe\s*\(\s*\)\s*\{/m;
   assert.match(
@@ -82,7 +91,7 @@ test("probe curls the public tunnel hostname over https", () => {
   );
   assert.match(
     body,
-    /X-Jori-Probe:\s*watchdog/,
+    PROBE_HEADER,
     "probe must set `X-Jori-Probe: watchdog` header for log correlation",
   );
 });
@@ -134,7 +143,7 @@ test("github_api_reachable probes the unauthenticated api.github.com root", () =
   );
   assert.match(
     body,
-    /X-Jori-Probe:\s*watchdog/,
+    PROBE_HEADER,
     "probe must set `X-Jori-Probe: watchdog` header for log correlation",
   );
 });

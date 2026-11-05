@@ -46,7 +46,7 @@ def places_block_reason():
     if not scope or scope.get("level") != "blocked":
         return None
     return (
-        f"Jori's Places API spend is ${float(scope['spend_usd']):.2f} this month, "
+        f"{places_local.assistant_name()}'s Places API spend is ${float(scope['spend_usd']):.2f} this month, "
         f"over the ${float(scope['limit_usd']):.2f} cap. Places calls are stopped.\n"
         f"Lift with: places-budget unblock {SCOPE}"
     )

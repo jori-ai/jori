@@ -447,18 +447,18 @@ guard('mcp_tool_listing', () => {
 // (input + cache reads + cache writes) is over `over` tokens. A transcript
 // line is one request, so both are exact here.
 const MODEL_RATES = {
-  'claude-opus-5-5': [4, 20, 5, 0.2], // 2026-10-06 — the improvement family's model since then
+  'claude-opus-5-5': [4, 20, 5, 0.2], // 2026-10-06 — the improvement family's model since then — control-scan-ok: a price per model id, not a model choice
   'claude-opus-5': [5, 25, 6.25, 0.5], 'claude-opus-4-8': [5, 25, 6.25, 0.5],
   'claude-sonnet-5': [2, 10, 2.5, 0.2],
-  'claude-sonnet-5-5': [2, 10, 2.5, 0.1], // cache read $0.20 before 2026-10-07
+  'claude-sonnet-5-5': [2, 10, 2.5, 0.1], // cache read $0.20 before 2026-10-07 — control-scan-ok: a price per model id, not a model choice
   'claude-haiku-4-5-20251001': [1, 5, 1.25, 0.1],
-  'claude-haiku-5-5': [0.1, 0.5, 0.125, 0.01], // prompt up to 100k tokens
+  'claude-haiku-5-5': [0.1, 0.5, 0.125, 0.01], // prompt up to 100k tokens — control-scan-ok: a price per model id, not a model choice
 };
 const RATES_BEFORE = {
-  'claude-sonnet-5-5': { until: Date.parse('2026-10-07T00:00:00Z'), rate: [2, 10, 2.5, 0.2] },
+  'claude-sonnet-5-5': { until: Date.parse('2026-10-07T00:00:00Z'), rate: [2, 10, 2.5, 0.2] }, // control-scan-ok: a price per model id, not a model choice
 };
 const LONG_PROMPT = {
-  'claude-haiku-5-5': { over: 100000, rate: [0.5, 2.5, 0.625, 0.05] },
+  'claude-haiku-5-5': { over: 100000, rate: [0.5, 2.5, 0.625, 0.05] }, // control-scan-ok: a price per model id, not a model choice
 };
 // USD for one assistant message, or null when its model has no rate.
 function messageUsd(model, ts, usage) {

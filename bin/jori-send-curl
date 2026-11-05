@@ -13,6 +13,7 @@ _GSC_TOOLS="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # where its data, logs, secrets and bins live.
 . "$_GSC_TOOLS/agent/scripts/lib/root.sh"
 OWNER_NAME="${JORI_OWNER_NAME:-the user}"
+ASSISTANT="${JORI_ASSISTANT_NAME:-Jori}"  # control-scan-ok: the setting's default
 OWNER_NAME_LC=$(printf '%s' "$OWNER_NAME" | tr '[:upper:]' '[:lower:]')
 SUPABASE_URL="https://${JORI_SUPABASE_PROJECT}.supabase.co"
 
@@ -655,7 +656,7 @@ try: print(json.load(sys.stdin).get("action") or "send")
 except Exception: print("send")' 2>/dev/null)
         case "$RESOLVE_ACTION" in
           drop)
-            echo "hum-resolve-first: not sent — Jori's records already answer it (see \`hum-resolve-first tail\`)" >&2
+            echo "hum-resolve-first: not sent — ${ASSISTANT}'s records already answer it (see \`hum-resolve-first tail\`)" >&2
             exit 0
             ;;
           rewrite)
@@ -1112,7 +1113,7 @@ else
 fi
 
 if [ "$HTTP_CODE" = "201" ]; then
-  echo "Message sent to Jori."
+  echo "Message sent to $ASSISTANT."
 
   # Write the inserted row id when requested. PostgREST returns a JSON array
   # ([{...row...}]) under return=representation, so extract data[0].id.
@@ -1190,15 +1191,15 @@ else
   # A test run's stand-in insert "failed": nothing to park or replay later
   # (a parked row would be flushed into the real system channel), no email.
   if [ "$TEST_RUN" = true ]; then
-    echo "Jori push failed (HTTP $HTTP_CODE) — test run, nothing parked, no fallback email" >&2
+    echo "$ASSISTANT push failed (HTTP $HTTP_CODE) — test run, nothing parked, no fallback email" >&2
     exit 1
   fi
   _spool_append "$HTTP_CODE"
-  echo "Jori push failed (HTTP $HTTP_CODE) — falling back to email" >&2
+  echo "$ASSISTANT push failed (HTTP $HTTP_CODE) — falling back to email" >&2
   EMAIL_SEND="$JORI_INSTALL_TOOLS/bin/email-send"
   if [ -x "$EMAIL_SEND" ]; then
     "$EMAIL_SEND" --to "$JORI_OWNER_EMAIL" \
-      --subject "${JORI_SENDER_NAME:-${JORI_ASSISTANT_NAME:-Jori}} notification (push failed)" \
+      --subject "${JORI_SENDER_NAME:-$ASSISTANT} notification (push failed)" \
       --body "$MESSAGE" 2>/dev/null
     if [ $? -eq 0 ]; then
       echo "Fallback email sent." >&2

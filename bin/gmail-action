@@ -241,7 +241,7 @@ async function markUnread(messageId) {
 async function markRead(messageId, { force = false } = {}) {
   if (!force && (await isJoriP1(messageId))) {
     triageLog("MARK-READ-REFUSED", { messageId, reason: "jori-p1" });
-    console.log(`Left ${messageId} unread — Jori email is P1 (p1-senders.json); use --force to override`);
+    console.log(`Left ${messageId} unread — ${ASSISTANT}'s email is P1 (p1-senders.json); use --force to override`);
     return;
   }
   await gmailRequest(`/messages/${messageId}/modify`, "POST", {

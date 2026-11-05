@@ -464,7 +464,7 @@ def get_devices(api):
 def _owner_device_from_app(app_loc):
     """Convert Jori app location to a device-like dict for unified output."""
     return {
-        "name": "Jori App (iPhone)",
+        "name": "Jori App (iPhone)",  # control-scan-ok: the software's name
         "model": "iPhone",
         "class": "iPhone",
         "owner": OWNER_NAME,
@@ -568,7 +568,7 @@ def _print_devices(matched, as_json=False):
             loc_str = reverse_geocode(d["lat"], d["lon"])
             bat = f" ({d['battery']:.0%} battery)" if d["battery"] >= 0 else ""
             age = format_time(d["ts"])
-            source = " [via Jori app]" if d.get("_source") == "gandalf-app" else ""
+            source = " [via Jori app]" if d.get("_source") == "gandalf-app" else ""  # control-scan-ok: the software's name
             label = device_label(d)
             print(f"{label} ({d['model']})")
             print(f"  {loc_str} — {age}{bat}{source}")

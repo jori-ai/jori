@@ -8,6 +8,8 @@ source "$(dirname "$0")/lib/max-auth-probe.sh"   # launchd sign-in check, see §
 # This installation's identity (JORI_OWNER_EMAIL, JORI_DOMAIN,
 # JORI_SUPABASE_PROJECT, …) from lib/instance.cjs; env wins.
 source "$(dirname "$0")/lib/instance.sh"
+# The header that marks the watchdog's own HTTP probes in remote logs.
+JORI_PROBE_HEADER="X-Jori-Probe: watchdog"  # control-scan-ok: the software's name
 # The instance's own checks (optional): _ext/watchdog-checks.sh defines
 # _ext_incident_label and _ext_watchdog_checks, run below where they belong.
 [ -f "$(dirname "$0")/_ext/watchdog-checks.sh" ] && source "$(dirname "$0")/_ext/watchdog-checks.sh"
@@ -121,7 +123,7 @@ notify() {
   PENDING_ALERT_KEY=""
 
   if JORI_INFRA_PROBE=1 "$SEND" --skip-precheck --intent watchdog-alert --channel system "$1" > /dev/null 2>&1; then
-    log "Notified via Jori: $1"
+    log "Notified via ${JORI_ASSISTANT_NAME:-Jori}: $1"  # control-scan-ok: the setting's default
     [ -n "$key" ] && touch "$INCIDENT_DIR/${key}.delivered" 2>/dev/null
     return 0
   fi
@@ -135,7 +137,7 @@ notify() {
   # pings with no preceding warning anywhere in the channel.
   if [ -x "$EMAIL_SEND" ] && [ -n "${JORI_OWNER_EMAIL:-}" ] \
      && "$EMAIL_SEND" --to "$JORI_OWNER_EMAIL" --subject "🔴 ${JORI_HOST_TITLE:-Host} Watchdog" --body "$1" > /dev/null 2>&1; then
-    log "Notified via email (Jori channel unavailable): $1"
+    log "Notified via email (${JORI_ASSISTANT_NAME:-Jori} channel unavailable): $1"  # control-scan-ok: the setting's default
     [ -n "$key" ] && touch "$INCIDENT_DIR/${key}.delivered" 2>/dev/null
     return 0
   fi
@@ -377,7 +379,7 @@ cloudflared_tunnel_probe() {
   [ -n "$CLOUDFLARED_HOST" ] || return 0
   out=$(curl -s -o /dev/null --max-time 8 \
     -w "%{http_code} dns=%{time_namelookup}s connect=%{time_connect}s tls=%{time_appconnect}s total=%{time_total}s" \
-    -H "X-Jori-Probe: watchdog" \
+    -H "$JORI_PROBE_HEADER" \
     "https://${CLOUDFLARED_HOST}/" 2>/dev/null)
   rc=$?
   code="${out%% *}"
@@ -470,7 +472,7 @@ host_network_reachable() {
   local host code
   for host in "https://api.github.com/" "https://aws.amazon.com/"; do
     code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 8 \
-      -H "X-Jori-Probe: watchdog" "$host" 2>/dev/null)
+      -H "$JORI_PROBE_HEADER" "$host" 2>/dev/null)
     [ -n "$code" ] && [ "$code" != "000" ] && return 0
   done
   return 1
@@ -906,7 +908,7 @@ if ! cloudflared_tunnel_probe; then
 
     # Alert only if the kickstart didn't bring the tunnel back by the next tick.
     if [ "$ATTEMPT" -ge 2 ] && incident_should_alert "cloudflared-tunnel"; then
-      notify "🔴 Cloudflare Tunnel ($CLOUDFLARED_HOST) is down and didn't recover after launchctl kickstart ($ATTEMPT consecutive ticks): $TUNNEL_PROBE_EVIDENCE. While it is down, Gmail pushes and inbound email to ${JORI_AGENT_FROM_EMAIL:-the agent address} cannot reach Jori. Manual intervention needed on ${JORI_HOST_LABEL:-the host}: launchctl kickstart -k gui/\$(id -u)/$CLOUDFLARED_LABEL"
+      notify "🔴 Cloudflare Tunnel ($CLOUDFLARED_HOST) is down and didn't recover after launchctl kickstart ($ATTEMPT consecutive ticks): $TUNNEL_PROBE_EVIDENCE. While it is down, Gmail pushes and inbound email to ${JORI_AGENT_FROM_EMAIL:-the agent address} cannot reach ${JORI_ASSISTANT_NAME:-Jori}. Manual intervention needed on ${JORI_HOST_LABEL:-the host}: launchctl kickstart -k gui/\$(id -u)/$CLOUDFLARED_LABEL"  # control-scan-ok: the setting's default
     fi
   fi
 else
@@ -1849,7 +1851,7 @@ GH_MIN_TICKS=3   # ~6 min of sustained failure at the 2-min watchdog cadence
 github_api_reachable() {
   local code
   code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 8 \
-    -H "X-Jori-Probe: watchdog" \
+    -H "$JORI_PROBE_HEADER" \
     "https://api.github.com/" 2>/dev/null)
   [ -n "$code" ] && [ "$code" != "000" ]
 }
@@ -2100,7 +2102,7 @@ if [ -n "$SUPABASE_KEY" ]; then
       ISSUES="$ISSUES supabase(unreachable)"
       log "Supabase unreachable after in-tick re-probe (attempt $ATTEMPT), host network is fine"
       if [ "$ATTEMPT" -ge 2 ] && incident_should_alert "supabase-unreachable" 1800 4 21600; then
-        notify "🔴 Supabase DB unreachable — the Jori app + phone channel are down (queries to jori_messages failing). Failing $ATTEMPT checks running. Check Supabase compute/dashboard for project ${JORI_SUPABASE_PROJECT} (likely compute saturation)."
+        notify "🔴 Supabase DB unreachable — the Jori app + phone channel are down (queries to jori_messages failing). Failing $ATTEMPT checks running. Check Supabase compute/dashboard for project ${JORI_SUPABASE_PROJECT} (likely compute saturation)."  # control-scan-ok: the software's name
       fi
     fi
   fi
