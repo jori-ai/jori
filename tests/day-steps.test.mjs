@@ -193,6 +193,39 @@ test("stop edges move to the walk the steps found, so the travel line carries th
   assert.match(html, /5:27pm · Walked [\d.]+ miles along Main Street, about 30 min, 2,850 steps\./);
 });
 
+// A walk of 17:27-17:57 whose middle three minutes the phone did not see: the
+// router bridged them (519 m) faster than a walker goes, so day-path left them
+// out of walked_m (588 of 1,170 m).
+function walkWithHole() {
+  return {
+    date: "2026-03-02", tz: day().tz,
+    stops: [
+      { id: "h", start: "00:00", end: "17:27", start_ts_ms: at(0), end_ts_ms: at(17, 27), duration_min: 1047, place: { name: "Home" } },
+      { id: "v", start: "17:57", end: "19:45", start_ts_ms: at(17, 57), end_ts_ms: at(19, 45), duration_min: 108, place: { name: "Venue" } },
+    ],
+    path: { spine: [{ type: "leg", id: "l0", mode: "walking", median_kmh: 4.2, start_ms: at(17, 27), end_ms: at(17, 57), mins: 30,
+      routed_m: 1170, straight_m: 1078, walked_m: 588, hole_m: 519, geometry: "map_matched", fixes: 3, streets: ["Main Street"],
+      holes: [{ t0: "17:42", t1: "17:45", m: 519, min: 3, start_ms: at(17, 42), end_ms: at(17, 45) }] }] },
+  };
+}
+
+test("a hole bridged faster than a walk is walked ground when the steps in it are a walker's", () => {
+  const d = walkWithHole();
+  const samples = [...readings(at(0, 5), at(0, 10), 2), ...readings(at(17, 27), at(17, 57), 95), ...readings(at(23, 50), at(23, 55), 2)];
+  annotateDaySteps(d, samples, null, { startMs: at(0), endMs: at(24) });
+  assert.equal(d.path.spine[0].walked_m, 1107);
+  assert.match(buildSkeleton(d), /Walked 0\.7 miles along Main Street, about 30 min, 2,850 steps\./);
+  annotateDaySteps(d, samples, null, { startMs: at(0), endMs: at(24) });
+  assert.equal(d.path.spine[0].walked_m, 1107, "a second pass recomputes rather than adds");
+});
+
+test("a hole the steps show was not walked stays out of the walked metres", () => {
+  const d = walkWithHole();
+  annotateDaySteps(d, [...readings(at(0, 5), at(0, 10), 2), ...readings(at(17, 27), at(17, 42), 95), ...readings(at(17, 42), at(17, 45), 2),
+    ...readings(at(17, 45), at(17, 57), 95), ...readings(at(23, 50), at(23, 55), 2)], null, { startMs: at(0), endMs: at(24) });
+  assert.equal(d.path.spine[0].walked_m, 588);
+});
+
 test("an edge is never moved further than 20 minutes, nor past a stop's own start", () => {
   const d = day();
   // A walk starting 40 min before the leg: the home stop's edge stays put.
