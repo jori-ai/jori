@@ -43,16 +43,6 @@
 	<string>$(JORI_FEATURES)</string>
 	<key>NSExtension</key>
 	<dict>
-		<!-- Without this, content.updating(from: INSendMessageIntent) throws and
-		     the push stays a plain notification (separate from the app's own
-		     NSUserActivityTypes; both are required). -->
-		<key>NSExtensionAttributes</key>
-		<dict>
-			<key>IntentsSupported</key>
-			<array>
-				<string>INSendMessageIntent</string>
-			</array>
-		</dict>
 		<key>NSExtensionPointIdentifier</key>
 		<string>com.apple.usernotifications.service</string>
 		<key>NSExtensionPrincipalClass</key>

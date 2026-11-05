@@ -6,15 +6,12 @@
 	<string>production</string>
 	<key>com.apple.developer.siri</key>
 	<true/>
-	<!-- Communication notifications (restored 2026-11-05): with this, the
-	     NotificationService extension's INSendMessageIntent upcast turns a push
-	     into a message from the assistant, which Siri announces on AirPods and
-	     CarPlay like iMessage. Requires NSUserActivityTypes = INSendMessageIntent
-	     in Info.plist (ITMS-90894) and the Communication Notifications capability
-	     on the App ID. History: removed 2026-06-27 when announce stopped working
-	     with it; see apps/companion/CODE-SIGNING.md. -->
-	<key>com.apple.developer.usernotifications.communication</key>
-	<true/>
+	<!-- NOTE: com.apple.developer.usernotifications.communication was REMOVED
+	     (2026-06-27). It requires NSUserActivityTypes=INSendMessageIntent in
+	     Info.plist (ITMS-90894) and reclassified the app as a SiriKit messaging
+	     provider, which broke the plain AirPods announce. We ship plain
+	     notifications now; the profile may still carry the capability (a
+	     superset is fine), but the binary must not claim it. -->
 	<!-- Lets urgent proactive pings break through Driving/DND Focus. Gated:
 	     only pushes sent with --urgent carry interruption-level time-sensitive. -->
 	<key>com.apple.developer.usernotifications.time-sensitive</key>
