@@ -128,7 +128,7 @@ test("a walk that outlasts its GPS leg gives the leg the whole walk's steps", ()
   assert.ok(d.path.spine[0].walk_steps > d.path.spine[0].steps);
 });
 
-test("a walk line whose walk outlasts the stretch states the walk's own clock and minutes", () => {
+test("a walk line whose walk runs well past the stretch keeps the leg's own steps and never prints a clock that overlaps the stops beside it", () => {
   const d = {
     date: "2026-03-02", tz: "America/New_York",
     stops: [
@@ -141,6 +141,23 @@ test("a walk line whose walk outlasts the stretch states the walk's own clock an
   annotateDaySteps(d, [...readings(at(0, 5), at(0, 10), 2), ...readings(at(17, 27), at(17, 57), 95), ...readings(at(23, 50), at(23, 55), 2)],
     null, { startMs: at(0), endMs: at(24) });
   const html = buildSkeleton(d);
-  assert.match(html, /on foot 5:27 to 5:57pm, 30 min, 2,850 steps\./);
-  assert.doesNotMatch(html, /about 14 min/);
+  assert.doesNotMatch(html, /on foot/);
+  assert.doesNotMatch(html, /2,850 steps/);
+  assert.match(html, /Walked [\d.]+ miles[^<]*, [\d,]+ steps\./);
+});
+
+test("a walk line whose walk sits inside the stretch carries the whole walk's steps", () => {
+  const d = {
+    date: "2026-03-02", tz: "America/New_York",
+    stops: [
+      { id: "h", start: "00:00", end: "17:30", start_ts_ms: at(0), end_ts_ms: at(17, 30), duration_min: 1050, place: { name: "Home" } },
+      { id: "v", start: "17:58", end: "19:45", start_ts_ms: at(17, 58), end_ts_ms: at(19, 45), duration_min: 107, place: { name: "Venue" } },
+    ],
+    path: { spine: [{ type: "leg", id: "l0", mode: "walking", median_kmh: 4.2, start_ms: at(17, 36), end_ms: at(17, 45), mins: 9,
+      routed_m: 1900, straight_m: 1700, walked_m: 1900, geometry: "map_matched", fixes: 3, streets: ["Main Street"] }] },
+  };
+  annotateDaySteps(d, [...readings(at(0, 5), at(0, 10), 2), ...readings(at(17, 31), at(17, 57), 95), ...readings(at(23, 50), at(23, 55), 2)],
+    null, { startMs: at(0), endMs: at(24) });
+  const html = buildSkeleton(d);
+  assert.match(html, /2,4\d\d steps\./);
 });
