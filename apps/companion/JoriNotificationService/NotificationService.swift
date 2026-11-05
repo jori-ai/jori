@@ -88,9 +88,13 @@ class NotificationService: UNNotificationServiceExtension {
             attachments: nil
         )
 
-        if #available(iOS 15.0, macOS 12.0, *), let avatar {
+        // setImage(_:forParameterNamed:) is unavailable on macOS (it broke the
+        // macOS archive on 2026-11-05); the avatar only matters for iOS announcements.
+        #if os(iOS)
+        if #available(iOS 15.0, *), let avatar {
             intent.setImage(avatar, forParameterNamed: \.sender)
         }
+        #endif
 
         // Donate FIRST, then update inside the completion (Apple's order).
         let interaction = INInteraction(intent: intent, response: nil)
