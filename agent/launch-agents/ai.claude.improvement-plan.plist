@@ -49,7 +49,7 @@
     <key>StartCalendarInterval</key>
     <dict>
         <key>Weekday</key>
-        <integer>2</integer>
+        <integer>4</integer>
         <key>Hour</key>
         <integer>10</integer>
         <key>Minute</key>

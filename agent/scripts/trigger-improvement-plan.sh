@@ -6,7 +6,7 @@ set -uo pipefail
 #
 # Normally CHAINED by trigger-nightly-review.sh the moment the review exits
 # clean, so it always reads a fresh report. Also installed on its own launchd
-# slot (Tuesdays 10:30 local, after the 05:00 review's worst case) as a
+# slot (Thursdays 10:30 local, after the 05:00 review's worst case) as a
 # SAFETY NET: if the review died, or the chain
 # never fired, this catches it. Two guards make the double-trigger harmless:
 # the job's own Step 1 exits when `nightly-review-state.json` is older than

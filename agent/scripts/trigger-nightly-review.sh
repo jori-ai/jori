@@ -2,7 +2,9 @@
 set -uo pipefail
 # Trigger the weekly Self Improvement Review, then chain the plan pass.
 #
-# Runs weekly Tuesday 05:00 local. Analyzes the prior 7 days of activity, ecosystem
+# Runs weekly Thursday 05:00 local (Tuesday until 2026-11-04: moved to the morning
+# after the weekly Claude allowance resets, so the heaviest weekly work starts the
+# allowance week instead of ending it). Analyzes the prior 7 days of activity, ecosystem
 # developments, and research, and emails a prioritized improvement memo — as it
 # always has. Job/script/state-file names keep the historical "nightly-review"
 # label for repo-stability; the cadence is weekly.
@@ -55,7 +57,7 @@ done
 
 # `ultrathink` must appear in the OPENING message — a thinking hint inside a file
 # the agent later reads as a tool result does not allocate the budget.
-TASK="Run the Self Improvement Review job (cadence: weekly Tuesday, scope: prior 7 days). Follow the playbook below end-to-end, including sending the review email — that memo is the analysis of record and ${JORI_OWNER_NAME:-the user} reads it. ultrathink — this is a holistic system self-assessment that warrants the maximum reasoning budget for pattern-spotting across the week and prioritizing improvements. No tool-call budget on this job: it is one of the two most important things the system runs (the other is named in this instance's additions to the playbook). Take as many tool calls as the analysis genuinely needs — re-query, cross-check, dig into anomalies, iterate until the picture is honest. Quality of insight is the only thing that matters; throughput and cost are not constraints. NOTE: when you finish, a separate improvement-plan pass reads your state file and turns your ACTION ITEMS into approvable Face-ID cards — so write each item concretely enough to be built from (what is wrong, which files, how you would verify it)."
+TASK="Run the Self Improvement Review job (cadence: weekly Thursday, scope: prior 7 days). Follow the playbook below end-to-end, including sending the review email — that memo is the analysis of record and ${JORI_OWNER_NAME:-the user} reads it. ultrathink — this is a holistic system self-assessment that warrants the maximum reasoning budget for pattern-spotting across the week and prioritizing improvements. No tool-call budget on this job: it is one of the two most important things the system runs (the other is named in this instance's additions to the playbook). Take as many tool calls as the analysis genuinely needs — re-query, cross-check, dig into anomalies, iterate until the picture is honest. Quality of insight is the only thing that matters; throughput and cost are not constraints. NOTE: when you finish, a separate improvement-plan pass reads your state file and turns your ACTION ITEMS into approvable Face-ID cards — so write each item concretely enough to be built from (what is wrong, which files, how you would verify it)."
 
 "$SCRIPTS/lib/run-ephemeral-opus.sh" nightly-review "$JOB_MD" --task "$TASK" --timeout-min 90
 RC=$?
