@@ -1,0 +1,140 @@
+#!/usr/bin/env node
+// projects — project pages (plugins/projects, jobs/projects.md).
+//
+// Usage:
+//   projects gather [--out <file>]       Calendar + Google Tasks + wiki + repo activity
+//                                        → one bundle (default data/projects/bundle.json).
+//                                        Prints the counts. Network: run it un-sandboxed.
+//   projects list [--json]               Every project page (entity: project) and the
+//                                        type:project pages that are not one yet.
+//   projects show <id>                   The page's managed block (empty when it has none).
+//   projects write-section --wiki <id> --section @<file> --status <active|upcoming|paused|done>
+//                          [--by <who>]  Replace (or append) the managed block on an
+//                                        existing page and mark it a project page.
+//   projects create --id project_<x> --name "<Name>" --description "<one line>"
+//                   --intro @<file> --section @<file> --status <…> [--scope <area>] [--by <who>]
+//                                        A new project page. Refuses an id that exists.
+//
+// The block holds `## Goal` and `## What you might need` (both required) and
+// whatever else the playbook asks for. Everything outside the block is left as it is.
+
+"use strict";
+
+const fs = require("node:fs");
+const path = require("node:path");
+const LIB = path.join(__dirname, "..", "..", "..", "lib");
+const { installTools } = require(path.join(LIB, "root.cjs"));
+const pr = require(path.join(__dirname, "..", "lib", "projects.js"));
+
+const args = process.argv.slice(2);
+const cmd = args[0];
+
+function flag(name, def = undefined) {
+  const i = args.indexOf(`--${name}`);
+  if (i === -1) return def;
+  const next = args[i + 1];
+  if (next === undefined || next.startsWith("--")) return true;
+  return next;
+}
+
+function readArg(v, what) {
+  if (typeof v !== "string") throw new Error(`${what} is required`);
+  return v.startsWith("@") ? fs.readFileSync(v.slice(1), "utf8") : v;
+}
+
+function die(msg, code = 1) {
+  console.error(`projects: ${msg}`);
+  process.exit(code);
+}
+
+function ws() {
+  return require(path.join(LIB, "wiki-store.js"));
+}
+
+function main() {
+  if (cmd === "gather") {
+    const out = flag("out") || path.join(installTools(), "data", "projects", "bundle.json");
+    const b = pr.gather();
+    fs.mkdirSync(path.dirname(out), { recursive: true });
+    const tmp = `${out}.tmp.${process.pid}`;
+    fs.writeFileSync(tmp, JSON.stringify(b, null, 1) + "\n");
+    fs.renameSync(tmp, out);
+    console.log(JSON.stringify({
+      out,
+      events: b.calendar ? b.calendar.events.length : null,
+      tasks: b.tasks ? b.tasks.tasks.length : null,
+      project_pages: b.wiki ? b.wiki.projects.length : null,
+      repos: b.repos ? b.repos.repos.length : null,
+      errors: Object.keys(b.errors),
+    }));
+    // Exit 2 when every source failed: nothing to work from tonight.
+    const sources = ["calendar", "tasks", "wiki", "repos"];
+    return sources.every((s) => b[s] == null) ? 2 : 0;
+  }
+
+  if (cmd === "list") {
+    const r = pr.listProjects();
+    if (flag("json")) { console.log(JSON.stringify(r, null, 1)); return 0; }
+    for (const p of r.projects) console.log(`${(p.project_status || "?").padEnd(9)} ${p.has_block ? "■" : "□"} ${p.id.padEnd(44)} ${p.name}`);
+    if (r.project_type_pages.length) {
+      console.log(`\nNot yet project pages (type: project): ${r.project_type_pages.length}`);
+      for (const p of r.project_type_pages) console.log(`          ${p.id.padEnd(44)} ${p.name}`);
+    }
+    return 0;
+  }
+
+  if (cmd === "show") {
+    const id = args[1];
+    if (!id) die("show needs a page id");
+    const row = ws().getPage(id);
+    if (!row) die(`no wiki page ${id}`);
+    const block = pr.currentBlock(row.raw_md);
+    if (block) console.log(block);
+    return 0;
+  }
+
+  if (cmd === "write-section") {
+    const id = flag("wiki");
+    const status = flag("status");
+    const section = readArg(flag("section"), "--section");
+    if (typeof id !== "string") die("write-section needs --wiki <id>");
+    const store = ws();
+    const row = store.getPage(id);
+    if (!row) die(`no wiki page ${id}`);
+    if (row.pin_locked) die(`${id} is pin_locked; ask through the hum instead`, 3);
+    if (["day", "week", "month"].includes(row.type)) die(`${id} is an episodic page`, 3);
+    const withBlock = pr.renderBlock(row.raw_md, { section, status });
+    const { frontmatterText, body } = store.splitFrontmatter(withBlock);
+    const fm = { ...store.parseFrontmatterText(frontmatterText), entity: "project", project_status: status };
+    const next = store.renderFrontmatter(fm) + body;
+    const out = store.savePage(row.basename, next, { editedBy: flag("by") || "projects" });
+    console.log(JSON.stringify({ wiki_id: id, rev: out.rev, changed: out.changed, status }));
+    return 0;
+  }
+
+  if (cmd === "create") {
+    const id = flag("id");
+    const store = ws();
+    if (typeof id !== "string") die("create needs --id project_<x>");
+    if (store.getPage(id)) die(`${id} already exists; use write-section`, 3);
+    const raw = pr.newPage({
+      id,
+      name: flag("name"),
+      description: flag("description"),
+      scope: typeof flag("scope") === "string" ? flag("scope") : null,
+      intro: readArg(flag("intro"), "--intro"),
+      section: readArg(flag("section"), "--section"),
+      status: flag("status"),
+    });
+    const out = store.savePage(id, raw, { editedBy: flag("by") || "projects" });
+    console.log(JSON.stringify({ wiki_id: id, rev: out.rev, created: out.isNew }));
+    return 0;
+  }
+
+  console.error("usage: projects gather|list|show|write-section|create (see the header of this file)");
+  return 1;
+}
+
+if (require.main === module) {
+  try { process.exit(main()); } catch (e) { die(e.message); }
+}

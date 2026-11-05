@@ -1,0 +1,41 @@
+{
+  "name": "projects",
+  "title": "Projects",
+  "description": "Keeps a page for every project you're working on, from a trip you're planning to something you're building: its goal and what you might need to finish it. Kept current every night from your memory, calendar and tasks, and corrected by the dream. You get an email when a project is added or finished.",
+  "version": "1.0.0",
+  "default": "disabled",
+  "requires": {
+    "plugins": [],
+    "bins": ["bin/wiki", "bin/wiki-people", "bin/hum-ideas-append", "bin/digest-deliver"],
+    "commands": ["gog", "git"],
+    "env": []
+  },
+  "config": {
+    "name": "projects",
+    "schedules": true
+  },
+  "settings": [],
+  "schedules": [
+    {
+      "label": "projects",
+      "cron": "37 4 * * *",
+      "run": "bin/projects-trigger",
+      "log": "agent/logs/projects.log"
+    }
+  ],
+  "provides_bins": [
+    "projects"
+  ],
+  "jobs": {
+    "projects": {
+      "routing": {
+        "target": "ops-light",
+        "model": "sonnet",
+        "effort": "high"
+      },
+      "task": {
+        "description": "Nightly: keep a wiki page for each project the user is working on (goal, what they might need, coming up, lately) from memory, calendar and tasks."
+      }
+    }
+  }
+}

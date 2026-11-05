@@ -1,0 +1,11 @@
+{
+  "_doc": "Projects (plugins/projects). calendar_past_days / calendar_future_days: how far back and ahead the calendar is read. exclude_calendars: calendars to leave out, by id or name (holiday calendars are always left out). tasks_completed_days: completed tasks older than this are not read. repo_roots: folders whose sub-folders are git repositories to read commit activity from ([] = none). repo_days: how far back commits are read. wiki_recent_days: how many days of recently changed wiki pages the bundle lists. max_new_pages_per_run: the most project pages one night may create. schedules: this installation's own schedule time, if not the manifest's.",
+  "calendar_past_days": 90,
+  "calendar_future_days": 180,
+  "exclude_calendars": [],
+  "tasks_completed_days": 120,
+  "repo_roots": [],
+  "repo_days": 60,
+  "wiki_recent_days": 30,
+  "max_new_pages_per_run": 25
+}

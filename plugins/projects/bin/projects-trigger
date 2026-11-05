@@ -1,0 +1,30 @@
+#!/bin/bash
+# projects-trigger — nightly: gather the evidence, then dispatch the projects
+# job (plugins/projects/jobs/projects.md) to its supervisor tier.
+#
+# Calendar and Google Tasks are network, so this un-sandboxed cron does every
+# fetch (`projects gather` → data/projects/bundle.json); the agent turn only
+# reads the bundle and writes wiki pages. It dispatches every night: keeping
+# the pages current is the job, even on a night with no new evidence (a date
+# that passed moves an item from "Coming up" to done).
+
+PLUGIN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+KERNEL_TOOLS="$(cd "$PLUGIN_DIR/../.." && pwd)"
+source "$KERNEL_TOOLS/agent/scripts/lib/script-job-env.sh"   # PATH, GOG_KEYRING_PASSWORD, JORI_INSTALL_TOOLS
+source "$KERNEL_TOOLS/agent/scripts/lib/webhook-auth.sh"     # dispatch_or_skip
+
+JOBLOG="$JORI_INSTALL_TOOLS/agent/logs/projects.log"
+log() { echo "$(date '+%Y-%m-%d %H:%M:%S') [projects] $1" >> "$JOBLOG"; }
+
+OUT="$("$JORI_NODE" "$PLUGIN_DIR/bin/projects" gather 2>>"$JOBLOG")"
+RC=$?
+log "gather (rc $RC): $OUT"
+if [ "$RC" -eq 2 ]; then log "skip: every source failed"; exit 1; fi
+if [ "$RC" -ne 0 ]; then log "skip: gather failed"; exit 1; fi
+
+if dispatch_or_skip '{"job": "projects"}' projects; then
+  log "dispatched projects"
+  exit 0
+fi
+log "projects not dispatched: no healthy supervisor"
+exit 1
