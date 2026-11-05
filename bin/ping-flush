@@ -1,7 +1,8 @@
 #!/usr/bin/env node
-// ping-flush — deliver the alerts that lib/apns-push.mjs parked while
-// the user was moving. Cron runs this every 5 minutes; it is silent and cheap
-// when the queue is empty, which is almost always.
+// ping-flush — when the user stops moving, re-ping (once) the pushes
+// lib/apns-push.mjs sent while they walked or drove whose message is still
+// unread, and deliver any alert the old gate parked. Cron runs this every 5
+// minutes; it is silent and cheap when the queue is empty, which is most runs.
 //
 // Usage:
 //   ping-flush              flush if the user is stationary
@@ -15,7 +16,7 @@ import { createClient } from "@supabase/supabase-js";
 import { createRequire } from "node:module";
 import { sendApnsPush } from "../lib/apns-push.mjs";
 import { getMotionState } from "../lib/motion-state.mjs";
-import { readQueue, writeQueue, partitionQueue, coalesce, QUEUE_FILE } from "../lib/ping-hold.mjs";
+import { readQueue, writeQueue, partitionQueue, coalesce, selectRepings, QUEUE_FILE } from "../lib/ping-hold.mjs";
 import { loadEnv } from "../lib/load-env.js";
 import { readPending, forgetPending, splitWithdrawn, latestFix, retractTold } from "../lib/local-history-ledger.mjs";
 
@@ -44,7 +45,7 @@ if (statusOnly) {
   console.log(`motion:  ${motion.state} (${motion.reason})`);
   console.log(`queued:  ${queue.length}  due: ${due.length}  expired: ${expired.length}`);
   console.log(`file:    ${QUEUE_FILE}`);
-  for (const e of queue) console.log(`  [${e.channel}] ${e.held_at} — ${e.body.slice(0, 70)}`);
+  for (const e of queue) console.log(`  [${e.channel}] ${e.held_at}${e.sent_at ? " (sent, re-ping if unread)" : ""} — ${e.body.slice(0, 70)}`);
   process.exit(0);
 }
 
@@ -55,16 +56,45 @@ if (motion.state === "mobile" && !force) {
   process.exit(0);
 }
 
-// Local explanations (hum `nearby` factoids) are only worth having within
-// 300 m of the subject. One that waited out a walk here is re-checked against
-// the newest fix; if the user has moved on, it is WITHDRAWN — alert dropped
-// and the message removed before the app is opened — and taken off the
-// told-ledger so the subject can be told properly on the next visit. Everything else flushes as before.
+// Pushes sent while moving (`sent_at`) already buzzed once. Each gets one more
+// only if its message is still unread; a local explanation additionally only
+// if the user is still within 300 m of its subject (its moment was the walk).
+// It was delivered, so it is never withdrawn — that would delete words the
+// user may already have heard read aloud.
 const pending = readPending();
-let flushable = queue;
-if (queue.some((e) => e.messageId && pending[e.messageId])) {
+const sentWhileMoving = queue.filter((e) => e.sent_at);
+const parked = queue.filter((e) => !e.sent_at);
+let repings = [];
+if (sentWhileMoving.length) {
+  const ids = [...new Set(sentWhileMoving.map((e) => e.messageId).filter(Boolean))];
+  let readById = null;
+  try {
+    const { data, error } = await supabase.from("jori_messages").select("id,read").in("id", ids);
+    if (error) console.error(`Read-state lookup failed: ${error.message}`);
+    else readById = new Map((data || []).map((r) => [r.id, r.read === true]));
+  } catch (e) {
+    console.error(`Read-state lookup threw: ${e?.message || e}`);
+  }
+  const { reping, skipped } = selectRepings(sentWhileMoving, readById);
+  for (const s of skipped) console.log(`No re-ping (${s.reason}): ${s.entry.body.slice(0, 70)}`);
+  repings = reping;
+  if (repings.some((e) => e.messageId && pending[e.messageId])) {
+    const { keep, withdraw } = splitWithdrawn(repings, pending, await latestFix());
+    for (const w of withdraw) console.log(`No re-ping for local explanation "${w.pending.title}" — ${w.reason}`);
+    repings = keep;
+  }
+  forgetPending(sentWhileMoving.map((e) => e.messageId).filter((id) => id && pending[id]));
+}
+
+// Local explanations (hum `nearby` factoids) are only worth having within
+// 300 m of the subject. One that the OLD gate parked through a walk is
+// re-checked against the newest fix; if the user has moved on, it is WITHDRAWN —
+// alert dropped and the message removed before the app is opened — and taken
+// off the told-ledger so the subject can be told properly on the next visit.
+let flushable = parked;
+if (parked.some((e) => e.messageId && pending[e.messageId])) {
   const fix = await latestFix();
-  const { keep, withdraw } = splitWithdrawn(queue, pending, fix);
+  const { keep, withdraw } = splitWithdrawn(parked, pending, fix);
   for (const w of withdraw) {
     try {
       await supabase.from("jori_messages").delete().eq("id", w.entry.messageId);
@@ -74,14 +104,15 @@ if (queue.some((e) => e.messageId && pending[e.messageId])) {
       console.error(`Withdraw failed for ${w.entry.messageId}: ${e?.message || e}`);
     }
   }
-  forgetPending(queue.filter((e) => e.messageId && pending[e.messageId]).map((e) => e.messageId));
+  forgetPending(parked.filter((e) => e.messageId && pending[e.messageId]).map((e) => e.messageId));
   flushable = keep;
 }
+flushable = [...flushable, ...repings];
 
 const { due, expired } = partitionQueue(flushable);
 
 for (const e of expired) {
-  console.log(`Expired (>90m held), alert dropped — message still in app: ${e.body.slice(0, 70)}`);
+  console.log(`Expired (>90m ${e.sent_at ? "since sent" : "held"}), alert dropped — message still in app: ${e.body.slice(0, 70)}`);
 }
 
 if (due.length === 0) {

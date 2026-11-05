@@ -193,9 +193,9 @@ def cmd_send(a):
     # straight to jori_messages over REST and fired nothing, so the first
     # live prompts reached the user silently, found only by opening the app.
     # `jori-notify` is the right hook rather than a raw APNs call because it goes through sendApnsPush, which carries the MOTION GATE: a
-    # non-urgent ping while the user is walking is parked and flushed once they
-    # stop, and a push that lands in a pocket is not a quieter push, it is a lost
-    # one. --message-id makes the notification deep-link to this exact prompt.
+    # non-urgent ping while the user is walking goes out at once (AirPods/CarPlay
+    # read it aloud) and is re-pinged once when they stop if still unread, because
+    # a push that lands in a pocket is not a quieter push, it is a lost one. --message-id makes the notification deep-link to this exact prompt.
     #
     # NOT routed through jori-send-curl, and that is a real gap worth naming:
     # this skips the outbound precheck. The message is composed from a decision

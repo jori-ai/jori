@@ -98,10 +98,9 @@ const body = notifySummary
 
 try {
   const res = await sendApnsPush(supabase, { body, messageId: msgId });
-  // The motion gate may have parked the alert until the user stops moving. The
-  // message itself already landed above, so this is a deferred buzz, not a
-  // failed send — say which, so a log reader is not misled.
-  if (res?.held) console.log(`Push held (${res.reason}) — ping-flush will deliver it.`);
+  // Sent while the user was moving: ping-flush re-pings it once when they stop,
+  // if it is still unread. Say so, so a log reader knows a second buzz may follow.
+  if (res?.repingIfUnread) console.log(`Push notification sent while moving (${res.reason}) — ping-flush re-pings it once on stopping if still unread.`);
   else console.log("Push notification sent.");
 } catch (e) {
   console.error(`Push skipped: ${e.message}`);

@@ -53,7 +53,7 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 
 try {
   const res = await sendApnsPush(supabase, { body, title, messageId, channel, urgent });
-  if (res?.held) console.log(`Push held (${res.reason}) — ping-flush will deliver it.`);
+  if (res?.repingIfUnread) console.log(`Push notification sent while moving (${res.reason}) — ping-flush re-pings it once on stopping if still unread.`);
   else console.log("Push notification sent.");
 } catch (e) {
   console.error(`Push failed: ${e.message}`);
