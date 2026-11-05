@@ -67,11 +67,16 @@
 		<key>NSAllowsLocalNetworking</key>
 		<true/>
 	</dict>
-	<!-- Siri usage description retained for the "Summon Jori" App Shortcut
-	     (App Intents). The SiriKit messaging declarations (NSUserActivityTypes =
-	     INSendMessageIntent) were removed: they reclassified the app as a
-	     messaging provider once Siri was authorized, which broke the plain
-	     AirPods announcement. -->
+	<!-- The app declares INSendMessageIntent so iOS treats it as a messaging
+	     app: the NotificationService extension upcasts each push into a
+	     communication notification (sender name + face), which Siri announces
+	     like iMessage. Required by the usernotifications.communication
+	     entitlement (ITMS-90894). Restored 2026-11-05. -->
+	<key>NSUserActivityTypes</key>
+	<array>
+		<string>INSendMessageIntent</string>
+	</array>
+	<!-- Siri usage description for the "Summon" App Shortcut (App Intents). -->
 	<key>NSSiriUsageDescription</key>
 	<string>Lets you talk to $(JORI_DISPLAY_NAME) with Siri — "Hey Siri, Summon $(JORI_DISPLAY_NAME)".</string>
 	<!-- iOS launch screen: the Jori face on its navy, centred at 160 pt, the
