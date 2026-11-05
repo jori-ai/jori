@@ -97,7 +97,7 @@ class IntentHandler: INExtension, INSendMessageIntentHandling, INSearchForMessag
     private static let joriPerson = INPerson(
         personHandle: INPersonHandle(value: "jori@assistant", type: .unknown),
         nameComponents: nil,
-        displayName: "Jori",
+        displayName: Install.displayName,
         image: nil,
         contactIdentifier: nil,
         customIdentifier: "jori-assistant"
@@ -112,7 +112,7 @@ class IntentHandler: INExtension, INSendMessageIntentHandling, INSearchForMessag
     private static func insertUserMessage(_ content: String) async throws {
         guard let tokens = SharedSession.tokens() else {
             throw NSError(domain: "JoriIntents", code: 401,
-                          userInfo: [NSLocalizedDescriptionKey: "Open Jori and sign in first."])
+                          userInfo: [NSLocalizedDescriptionKey: "Open \(Install.displayName) and sign in first."])
         }
 
         let tz = TimeZone.current

@@ -320,7 +320,7 @@ enum PurchaseApproval {
         case mismatch, notPaired, expired
         var errorDescription: String? {
             switch self {
-            case .mismatch: return "This request doesn't match what's shown, so it can't be approved. Deny it and ask Jori again."
+            case .mismatch: return "This request doesn't match what's shown, so it can't be approved. Deny it and ask \(Install.displayName) again."
             case .notPaired: return "This \(PurchaseApproval.deviceNoun) isn't paired for purchases yet (menu → Pair Purchase Approval)."
             case .expired: return "This request has expired."
             }

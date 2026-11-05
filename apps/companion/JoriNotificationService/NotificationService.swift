@@ -49,7 +49,7 @@ class NotificationService: UNNotificationServiceExtension {
         let sender = INPerson(
             personHandle: INPersonHandle(value: "jori-assistant", type: .unknown),
             nameComponents: nil,
-            displayName: "Jori",
+            displayName: Self.assistantName,
             image: Self.senderAvatar(),
             contactIdentifier: nil,
             customIdentifier: nil
@@ -90,6 +90,15 @@ class NotificationService: UNNotificationServiceExtension {
     /// image is the containing app's `JoriAvatar` asset, so this extension needs
     /// no resources of its own: the .appex sits in the app's PlugIns folder
     /// (Jori.app/PlugIns on iOS, Jori.app/Contents/PlugIns on macOS).
+    /// What the assistant is called: this extension's own Info.plist key
+    /// (JoriDisplayName ← JORI_DISPLAY_NAME), the same one `Install.displayName`
+    /// reads in the targets that compile SupabaseConfig.swift.
+    private static var assistantName: String {
+        let v = ((Bundle.main.object(forInfoDictionaryKey: "JoriDisplayName") as? String) ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return v.isEmpty || v.contains("$(") ? "Jori" : v // control-scan-ok: the setting's default
+    }
+
     private static func senderAvatar() -> INImage? {
         var url = Bundle.main.bundleURL
         while url.pathExtension != "app" && url.pathComponents.count > 1 {

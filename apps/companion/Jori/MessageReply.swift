@@ -24,7 +24,7 @@ enum MessageReply {
             title: "Reply",
             options: [],
             textInputButtonTitle: "Send",
-            textInputPlaceholder: "Message Jori")
+            textInputPlaceholder: "Message \(Install.displayName)")
         let cat = UNNotificationCategory(
             identifier: category,
             actions: [reply],

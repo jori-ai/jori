@@ -20,6 +20,8 @@
 	<!-- What this build is (SupabaseConfig.swift, `Install`): each value is a
 	     build setting from Config/Jori.xcconfig, overridden by an
 	     installation's Config/Installation.xcconfig. -->
+	<key>JoriDisplayName</key>
+	<string>$(JORI_DISPLAY_NAME)</string>
 	<key>JoriStoragePrefix</key>
 	<string>$(JORI_STORAGE_PREFIX)</string>
 	<key>JoriKeyTagPrefix</key>
@@ -71,7 +73,7 @@
 	     messaging provider once Siri was authorized, which broke the plain
 	     AirPods announcement. -->
 	<key>NSSiriUsageDescription</key>
-	<string>Lets you talk to Jori with Siri — "Hey Siri, Summon Jori".</string>
+	<string>Lets you talk to $(JORI_DISPLAY_NAME) with Siri — "Hey Siri, Summon $(JORI_DISPLAY_NAME)".</string>
 	<!-- iOS launch screen: the Jori face on its navy, centred at 160 pt, the
 	     same place SplashView (DesignSystem.swift) draws it, so the hand-over
 	     from the system launch image has no seam. macOS ignores the key. -->

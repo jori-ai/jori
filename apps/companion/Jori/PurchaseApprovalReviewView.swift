@@ -258,7 +258,7 @@ struct PurchaseApprovalPairingView: View {
                         Label("Not paired", systemImage: "exclamationmark.triangle").foregroundStyle(.secondary)
                     }
                 } footer: {
-                    Text("Jori never places an order until you approve it with \(PurchaseApproval.biometryName). The approval key lives in this \(PurchaseApproval.deviceNoun)'s Secure Enclave and works only here — pair each device you want to approve from.")
+                    Text("\(Install.displayName) never places an order until you approve it with \(PurchaseApproval.biometryName). The approval key lives in this \(PurchaseApproval.deviceNoun)'s Secure Enclave and works only here — pair each device you want to approve from.")
                 }
                 Section {
                     // An explicit prompt with the label hidden: on the Mac a Form puts a
@@ -279,7 +279,7 @@ struct PurchaseApprovalPairingView: View {
                 } header: {
                     Text("Pairing code")
                 } footer: {
-                    Text("Ask Jori for a purchase pairing code (it runs `purchase pair` on the host). Codes expire after 15 minutes and work once.")
+                    Text("Ask \(Install.displayName) for a purchase pairing code (it runs `purchase pair` on the host). Codes expire after 15 minutes and work once.")
                 }
                 if let message {
                     Section { Text(message).foregroundStyle(isError ? .red : .green) }

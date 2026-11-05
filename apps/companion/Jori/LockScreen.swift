@@ -33,7 +33,7 @@ struct LockScreen: View {
 
             JoriMark(size: 112)
 
-            Text("Jori")
+            Text(Install.displayName)
                 .font(JoriTheme.display(40))
                 .padding(.top, 32)
 
@@ -93,7 +93,7 @@ struct LockScreen: View {
             ? .deviceOwnerAuthenticationWithBiometrics
             : .deviceOwnerAuthentication
 
-        context.evaluatePolicy(policy, localizedReason: "Unlock Jori") { success, _ in
+        context.evaluatePolicy(policy, localizedReason: "Unlock \(Install.displayName)") { success, _ in
             DispatchQueue.main.async {
                 authenticating = false
                 if success {

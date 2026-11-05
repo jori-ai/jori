@@ -29,7 +29,7 @@ Every setting, with its default and meaning, is documented in
 
 | Setting | What it is |
 |---|---|
-| `JORI_BUNDLE_ID`, `JORI_TEAM_ID`, `JORI_DISPLAY_NAME`, `JORI_MARKETING_VERSION` | The app's identity; the extensions are `<bundle id>.NotificationService`, `.Share`, `.Intents`, `.UsageMonitor` |
+| `JORI_BUNDLE_ID`, `JORI_TEAM_ID`, `JORI_DISPLAY_NAME`, `JORI_MARKETING_VERSION` | The app's identity; the extensions are `<bundle id>.NotificationService`, `.Share`, `.Intents`, `.UsageMonitor`. `JORI_DISPLAY_NAME` is the name under the icon and on every screen (splash, sign-in, lock, composer, share sheet, Siri), read in code as `Install.displayName`. Leave it unset: the build appends it from the assistant's name (`assistant_name` in `agent/local/instance.json` for an installation's own workflows, the `JORI_ASSISTANT_NAME` repository variable for this repo's), so renaming the assistant renames the app at its next build |
 | `JORI_APP_GROUP`, `JORI_KEYCHAIN_GROUP` | Shared with the extensions (defaults derive from the bundle id) |
 | `JORI_SUPABASE_URL`, `JORI_SUPABASE_ANON_KEY`, `JORI_ATTACHMENTS_BUCKET` | The backend |
 | `JORI_SIGNING_PURCHASE`, `JORI_SIGNING_APPROVE` | Face ID signing contexts; must equal the server's, never change once a device is paired |

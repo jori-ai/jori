@@ -9,8 +9,9 @@
 //
 // Usage: control-scan [--json] [--quiet]     writes data/control-hardcoded.json
 //
-// Scanned: code under bin/, lib/, agent/, cf-email-worker/, wiki-worker/
-// (js/mjs/cjs/ts/sh/py/plist and extensionless scripts). Skipped: markdown,
+// Scanned: code under bin/, lib/, agent/, cf-email-worker/, wiki-worker/ and
+// the companion app (apps/companion: js/mjs/cjs/ts/sh/py/plist/swift/xcconfig
+// and extensionless scripts). Skipped: markdown,
 // JSON (that is configuration), tests, agent/local/ (the installation's own
 // files), node_modules, logs, and the files that ARE the settings
 // (lib/instance.cjs, lib/ports.cjs, lib/models.cjs, agent/config/models.env).
@@ -32,10 +33,10 @@ const ports = require("../lib/ports.cjs");
 const { parseModelsEnv, MODELS_ENV } = require("../lib/models.cjs");
 
 const args = process.argv.slice(2);
-const DIRS = ["bin", "lib", "agent", "cf-email-worker", "wiki-worker"];
+const DIRS = ["bin", "lib", "agent", "cf-email-worker", "wiki-worker", "apps/companion"];
 const SKIP_DIRS = new Set(["node_modules", "logs", ".git", "local", "test", "tests", "data", "build", "DerivedData"]);
 const SKIP_FILES = new Set(["lib/instance.cjs", "lib/ports.cjs", "lib/models.cjs", "agent/config/models.env", "bin/control-scan"].map((p) => path.join(TOOLS_DIR, p)));
-const CODE_EXT = new Set([".js", ".mjs", ".cjs", ".ts", ".sh", ".py", ".plist", ".toml", ".html", ".env"]);
+const CODE_EXT = new Set([".js", ".mjs", ".cjs", ".ts", ".sh", ".py", ".plist", ".toml", ".html", ".env", ".swift", ".xcconfig"]);
 
 function files() {
   const out = [];
@@ -91,7 +92,7 @@ function isComment(line) {
 // a value the program uses. (A space before the marker keeps URLs and `#!`.)
 function codePart(line, ext) {
   let s = line;
-  const js = /^\.(js|mjs|cjs|ts|html)$/.test(ext) || !ext;
+  const js = /^\.(js|mjs|cjs|ts|html|swift)$/.test(ext) || !ext;
   if (js) { const i = s.search(/\s\/\/\s/); if (i >= 0) s = s.slice(0, i); } // lang-regex-ok: source-code syntax
   if (ext === ".sh" || ext === ".py" || !ext) { const i = s.search(/\s#\s/); if (i >= 0) s = s.slice(0, i); } // lang-regex-ok: source-code syntax
   return s;

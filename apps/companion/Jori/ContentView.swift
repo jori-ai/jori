@@ -174,7 +174,7 @@ struct ContentView: View {
                 // Hangs are filed under the screen they happened on.
                 Responsiveness.setContext(new.title.lowercased())
             }
-            .confirmationDialog("Sign out of Jori?",
+            .confirmationDialog("Sign out of \(Install.displayName)?",
                                 isPresented: $confirmSignOut,
                                 titleVisibility: .visible) {
                 Button("Sign Out", role: .destructive) { onSignOut() }
@@ -404,7 +404,7 @@ struct ContentView: View {
             }
         }
         .listStyle(.sidebar)
-        .navigationTitle("Jori")
+        .navigationTitle(Install.displayName)
         .sensoryFeedback(.selection, trigger: destination)
     }
 
@@ -1146,11 +1146,11 @@ struct ContentView: View {
     /// redraws only the field, not the whole conversation above it.
     private var composerField: some View {
         #if os(macOS)
-        ComposerField(placeholder: replyTarget == nil ? "Message Jori" : "Reply",
+        ComposerField(placeholder: replyTarget == nil ? "Message \(Install.displayName)" : "Reply",
                       isActive: $inputActive,
                       onSend: send)
         #else
-        ComposerField(placeholder: replyTarget == nil ? "Message Jori" : "Reply",
+        ComposerField(placeholder: replyTarget == nil ? "Message \(Install.displayName)" : "Reply",
                       focus: $isInputFocused,
                       isActive: $inputActive,
                       onSend: send)
@@ -1167,7 +1167,7 @@ struct ContentView: View {
                 .fill(JoriTheme.cobalt.opacity(0.06))
                 .overlay(shape.strokeBorder(JoriTheme.cobalt.opacity(0.7), style: StrokeStyle(lineWidth: 2, dash: [8, 6])))
                 .overlay {
-                    Label("Drop to send to Jori", systemImage: "arrow.down.doc")
+                    Label("Drop to send to \(Install.displayName)", systemImage: "arrow.down.doc")
                         .font(.headline)
                         .foregroundStyle(JoriTheme.cobalt)
                         .padding(.horizontal, 18)

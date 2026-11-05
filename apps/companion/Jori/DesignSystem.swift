@@ -223,7 +223,7 @@ struct StaffLightDots: View {
             }
         }
         .accessibilityElement()
-        .accessibilityLabel("Jori is thinking")
+        .accessibilityLabel("\(Install.displayName) is thinking")
     }
 }
 
@@ -298,7 +298,7 @@ struct JoriCommands: Commands {
             Button("New Message") { actions?.focusComposer() }
                 .keyboardShortcut("l", modifiers: .command)
                 .disabled(!inChat)
-            Button("Reply to Latest from Jori") { actions?.replyToLatest() }
+            Button("Reply to Latest from \(Install.displayName)") { actions?.replyToLatest() }
                 .keyboardShortcut("r", modifiers: .command)
                 .disabled(!inChat)
             Button("Attach File…") { actions?.attachFile() }
@@ -389,7 +389,7 @@ struct SplashView: View {
             JoriBackdrop()
             JoriMark(size: Self.markSize)
                 .overlay(alignment: .bottom) {
-                    Text("Jori")
+                    Text(Install.displayName)
                         .font(JoriTheme.display(44))
                         .foregroundStyle(.white)
                         .fixedSize()
@@ -400,7 +400,7 @@ struct SplashView: View {
         }
         .environment(\.colorScheme, .dark)
         .accessibilityElement(children: .ignore)
-        .accessibilityLabel("Jori")
+        .accessibilityLabel(Install.displayName)
         .onAppear {
             withAnimation(.easeOut(duration: 0.5).delay(0.12)) { shown = true }
         }

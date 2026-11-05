@@ -22,8 +22,11 @@ enum Install {
         return v.isEmpty ? fallback : v
     }
 
-    /// The name the user sees (CFBundleDisplayName ← JORI_DISPLAY_NAME).
-    static let displayName = string("CFBundleDisplayName", default: "Jori")
+    /// The name the user sees: what the assistant is called (JoriDisplayName ←
+    /// JORI_DISPLAY_NAME, which an installation's build sets from its
+    /// `assistant_name`). Every bundle carries the key, so an extension answers
+    /// with the app's name rather than its own target name.
+    static let displayName = string("JoriDisplayName", default: string("CFBundleDisplayName", default: "Jori")) // control-scan-ok: the setting's default
 
     // MARK: Device-local names
 

@@ -67,7 +67,7 @@ final class PhoneUsageMonitor: ObservableObject {
             print("[Usage] requestAuthorization failed: \(error)")
             let ns = error as NSError
             status = ns.domain == NSCocoaErrorDomain && ns.code == 4099
-                ? "This build can't use Screen Time — it was built without the Family Controls entitlement. Update Jori from TestFlight."
+                ? "This build can't use Screen Time — it was built without the Family Controls entitlement. Update \(Install.displayName) from TestFlight."
                 : "Couldn't get Screen Time access: \(error.localizedDescription)"
         }
     }
@@ -197,7 +197,7 @@ struct PhoneUsageSetupView: View {
         NavigationStack {
             Form {
                 Section {
-                    Text("Lets Jori see WHEN the phone is used overnight (20:00–12:00, in hourly windows) — not which apps — so the daily summary knows when you went to sleep and woke up.")
+                    Text("Lets \(Install.displayName) see WHEN the phone is used overnight (20:00–12:00, in hourly windows) — not which apps — so the daily summary knows when you went to sleep and woke up.")
                         .font(.callout)
                 }
                 Section {
