@@ -167,7 +167,7 @@ test("every view renders, with the new shell and no internal stack on errors", a
     assert.ok(r.body.includes('class="bar"') && r.body.includes("Ask your memory"), `${url} uses the shell`);
   }
   const home = await get("/");
-  assert.ok(home.body.includes("What would you like to remember?"));
+  assert.ok(home.body.includes("What would you like to ask Jori?"));
   assert.ok(home.body.includes('href="/t/people"') && home.body.includes("Days remembered"));
   const pageView = await get("/p/user_victor_hale");
   assert.ok(pageView.body.includes(">Le Petit Bistro</a>"), "a bare wikilink shows its page title");

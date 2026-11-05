@@ -117,7 +117,18 @@ function tzOffsetMs(tz, ms) {
 // nothing was parsed, so nothing is claimed.
 let logContext = {};
 
+// Intents that are ANSWERS to something the user asked outside this chat (an
+// "@jori ..." in their own iMessage/WhatsApp/Slack/email, lib/jori-mention.mjs).
+// The request is not in the app transcript the relevance check reads, so it can
+// mistake the answer for an unsolicited run report. Rule #2: solicited replies
+// are never dropped, only corrected, so a "suppress" becomes a "send".
+const SOLICITED_INTENTS = new Set(["mention-reply"]);
+let solicitedSend = false;
+
 function emit(obj) {
+  if (solicitedSend && obj.decision === "suppress") {
+    obj = { decision: "send", reason: `solicited (never dropped); check said: ${obj.reason || "suppress"}`.slice(0, 300) };
+  }
   process.stdout.write(JSON.stringify(obj));
   try {
     mkdirSync(path.dirname(LOG_FILE), { recursive: true });
@@ -242,6 +253,7 @@ if (!input || typeof input !== "object" || typeof input.message !== "string" || 
 
 const proposedMessage = input.message.trim();
 const intent = (input.intent || "unknown").toString().slice(0, 80);
+solicitedSend = SOLICITED_INTENTS.has(intent) || input.solicited === true;
 // Sender/agent label. Identifies which caller is gating
 // the message so the reasoner can apply origin-aware heuristics:
 //   - "ops"     — ops-agent autonomous push (harvester, digest, cron job).
@@ -641,7 +653,7 @@ try {
     // A jori-send-curl push is proactive by definition — the user did not ask
     // for it — so "drop" is available here. The chat reply path, where the user IS
     // waiting for an answer, passes solicited:true and loses that power.
-    solicited: input.solicited === true,
+    solicited: solicitedSend,
   });
   if (fresh.verdict === "drop") {
     emit({
@@ -759,11 +771,11 @@ REPORTING ON ${ASSISTANT.toUpperCase()}'S OWN STATE IS NOT NEWS (2026-09-27). A 
 
 EITHER OF TWO THINGS TAKES A MESSAGE OUT OF THIS PARAGRAPH ALTOGETHER, AND EACH ONE IS SUFFICIENT BY ITSELF — AN ASK, OR A HOOK. Check for both before you suppress anything under this paragraph; if either is present, the message SENDS. They are not ranked and neither requires the other.
 
-THE ASK. Does the message put ANYTHING to them — to answer, decide, label, confirm, or simply LOOK AT? "needs your eyes", "see email", "details in your inbox", "reply to label", "want me to", or any question at all, however small, counts. If so the message SENDS, even when everything else in it is Jori's own plumbing, even when it offers no hook whatsoever, and even when it says nothing beyond the fact that a job produced something. An ask does NOT additionally have to be about their own affairs. A run report ending "the situation gate misfired twice today — want me to file an improvement for it?" SENDS, because they were asked something.
+THE ASK. Does the message put ANYTHING to them — to answer, decide, label, confirm, or simply LOOK AT? "needs your eyes", "see email", "details in your inbox", "reply to label", "want me to", or any question at all, however small, counts. If so the message SENDS, even when everything else in it is ${ASSISTANT}'s own plumbing, even when it offers no hook whatsoever, and even when it says nothing beyond the fact that a job produced something. An ask does NOT additionally have to be about their own affairs. A run report ending "the situation gate misfired twice today — want me to file an improvement for it?" SENDS, because they were asked something.
 
 THE HOOK — equally sufficient, and it does NOT need an ask alongside it. A pointer whose whole merit is naming the one thing worth opening the email for SENDS. A hook is one substantive finding, number or decision from INSIDE the email — the thing that would make them open it now rather than later. Most often it is their own affairs: ${P.hook_affairs}, something they can act on or that changes what they believe about their own life ${P.hook_examples}. But an email whose whole content is OUTSIDE READING they asked to be kept across — a newsletter digest, a press or research roundup, an event or listings scan — hooks on its standout ITEM, and that is a full hook even though the subject is the world rather than them: ${P.outside_reading_hook_example} SENDS, because naming which piece is worth their time is exactly the judgement they wanted from the digest. What is NOT a hook: a bare COUNT of items, and a detail about JORI ITSELF however specific — which gate misfired, how long something took to resolve, how many pings went unreacted, what a job got wrong. That IS the run-report shape told at greater length; narrating it in more detail never promotes it to a hook. This paragraph never applies to a PROTECTED INTENT (listed below), and when you are unsure whether the message's new content is really about Jori rather than about them, SEND.
 
-A RESULT THEY ASKED FOR, OR A CHANGE THEY WILL NOTICE, IS NOT THIS PARAGRAPH'S MESSAGE AT ALL (2026-10-07). agent/CLAUDE.md sends repair stories to Improvements "unless ${OWNER} asked for it, or they can observe the difference", and both halves apply here. FIRST: if the transcript shows ${OWNER} asking for this very change or raising this very problem ${P.asked_for_examples}, the account of what was done IS the answer they are waiting for, and it SENDS however much of it is about Jori. They do not always ask in this chat: a reply to one of Jori's emails, or a word on the System tab, never appears in the transcript below, so a message that plainly reports back on a change made at their request ("Done — the retime you asked for is live", "Done: the pin audit won't email you anymore") counts on its own word. SECOND: a message telling them about a change they will SEE — an email that stops or starts arriving, a delivery time that moves, something they receive (a daily summary, a digest, a memo) coming back after it failed, anything that will look different on their phone or in their inbox — SENDS, because otherwise the change reaches them as a surprise. Older copies of that email in their inbox, or older pages describing the old behaviour, are the BEFORE of the change, not a contradiction of it. Neither reaches a run report on anything ELSE: a count of pings, a gate that misfired, a job that ran on schedule, a digest delivered as usual, or a bug story whose only effect stays inside Jori is still SUPPRESS, even in the same evening as their request.
+A RESULT THEY ASKED FOR, OR A CHANGE THEY WILL NOTICE, IS NOT THIS PARAGRAPH'S MESSAGE AT ALL (2026-10-07). agent/CLAUDE.md sends repair stories to Improvements "unless ${OWNER} asked for it, or they can observe the difference", and both halves apply here. FIRST: if the transcript shows ${OWNER} asking for this very change or raising this very problem ${P.asked_for_examples}, the account of what was done IS the answer they are waiting for, and it SENDS however much of it is about ${ASSISTANT}. They do not always ask in this chat: a reply to one of ${ASSISTANT}'s emails, or a word on the System tab, never appears in the transcript below, so a message that plainly reports back on a change made at their request ("Done — the retime you asked for is live", "Done: the pin audit won't email you anymore") counts on its own word. SECOND: a message telling them about a change they will SEE — an email that stops or starts arriving, a delivery time that moves, something they receive (a daily summary, a digest, a memo) coming back after it failed, anything that will look different on their phone or in their inbox — SENDS, because otherwise the change reaches them as a surprise. Older copies of that email in their inbox, or older pages describing the old behaviour, are the BEFORE of the change, not a contradiction of it. Neither reaches a run report on anything ELSE: a count of pings, a gate that misfired, a job that ran on schedule, a digest delivered as usual, or a bug story whose only effect stays inside ${ASSISTANT} is still SUPPRESS, even in the same evening as their request.
 
 Proposed message:
 """${workingMessage}"""

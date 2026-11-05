@@ -108,3 +108,11 @@ test("the decision object overrides attribution on a key collision", async () =>
   assert.match(src, /\.\.\.logContext,\s*\.\.\.obj/,
     "attribution must be spread BEFORE the decision object, never after");
 });
+
+test("an @mention answer is solicited: a suppress verdict still sends", async () => {
+  await run({ intent: "mention-reply", agent: "chat", jev: choice("suppress", 0.97, OPTS), sonnet: JSON.stringify({ decision: "suppress", reason: "run report" }) });
+  const rows = logRows();
+  assert.equal(rows.at(-1).decision, "send");
+  assert.equal(rows.at(-1).intent, "mention-reply");
+  assert.ok(rows.at(-1).reason.startsWith("solicited"));
+});
