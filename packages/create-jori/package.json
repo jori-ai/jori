@@ -1,6 +1,6 @@
 {
   "name": "create-jori",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Install Jori, the always-on assistant that runs on your Claude subscription: npm create jori",
   "keywords": ["jori", "assistant", "claude", "claude-code", "agent", "installer"],
   "homepage": "https://getjori.ai",
