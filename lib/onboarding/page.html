@@ -436,6 +436,7 @@ function render() {
     ["WhatsApp", "Message me from your phone, paired with a QR code.", "#channels"],
     ["Slack", "Talk to me in your workspace, as a teammate.", "#channels"],
     ["Gmail", "I sort your inbox and tell you about the urgent mail.", "#services"],
+    ["My own email address", "Optional. People email me directly and my mail comes from that address. Needs a domain on Cloudflare; without one I use your mailbox.", "#email"],
   ];
   if (!$("ways").children.length) $("ways").replaceChildren(...ways.map(([h, p, hash]) =>
     el("li", { class: "way" }, el("div", {}, el("h3", {}, h), el("p", {}, p)), el("a", { class: "btn small quiet", href: ctl + hash, target: "_blank", rel: "noopener" }, "Set up"))));

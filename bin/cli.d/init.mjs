@@ -100,6 +100,7 @@ export default {
       inst.owner_name = await ask("Your name, as the agents should address you", existing.owner_name || "the user");
       inst.owner_email = await ask("Your primary email", existing.owner_email || "");
       inst.agent_email = await ask("From: address for mail the agent sends (optional)", existing.agent_email || "");
+      if (inst.agent_email && inst.agent_email !== existing.agent_email) console.log("  Mail to and from that address needs its routing and sending set up: open the control room → Email address once Jori is running.");  // control-scan-ok: the software's name
       inst.tz = await ask("Home time zone (IANA)", existing.tz || hostTz());
       inst.github_owner = await ask("GitHub user or org that owns your fork (optional)", existing.github_owner || "");
       inst.home_city = await ask("Your home city, in words (optional)", existing.home_city || "");
