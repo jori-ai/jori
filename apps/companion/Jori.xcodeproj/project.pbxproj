@@ -60,6 +60,8 @@
 		AA000500 /* Installation in Resources */ = {isa = PBXBuildFile; fileRef = BB000501 /* Installation */; };
 		AA000098 /* SharedSession.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB000096 /* SharedSession.swift */; };
 		AA000099 /* SharedSession.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB000096 /* SharedSession.swift */; };
+		AA0000C4 /* AnnounceDiagnostics.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB0000C2 /* AnnounceDiagnostics.swift */; };
+		AA0000C5 /* AnnounceCache.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB0000C1 /* AnnounceCache.swift */; };
 		AA000100 /* MessageReply.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB000097 /* MessageReply.swift */; };
 		AA000300 /* PhoneLockMonitor.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB000300 /* PhoneLockMonitor.swift */; };
 		AA000301 /* PhoneUsageMonitor.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB000301 /* PhoneUsageMonitor.swift */; };
@@ -182,6 +184,7 @@
 		BB000094 /* SharedKeychainStorage.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SharedKeychainStorage.swift; sourceTree = "<group>"; };
 		BB000095 /* AppIntentVocabulary.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = AppIntentVocabulary.plist; sourceTree = "<group>"; };
 		BB000096 /* SharedSession.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SharedSession.swift; sourceTree = "<group>"; };
+		BB0000C2 /* AnnounceDiagnostics.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AnnounceDiagnostics.swift; sourceTree = "<group>"; };
 		BB000097 /* MessageReply.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MessageReply.swift; sourceTree = "<group>"; };
 		BB000300 /* PhoneLockMonitor.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PhoneLockMonitor.swift; sourceTree = "<group>"; };
 		BB000301 /* PhoneUsageMonitor.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PhoneUsageMonitor.swift; sourceTree = "<group>"; };
@@ -299,6 +302,7 @@
 				BB000096 /* SharedSession.swift */,
 				BB000406 /* ShareOutbox.swift */,
 				BB000097 /* MessageReply.swift */,
+				BB0000C2 /* AnnounceDiagnostics.swift */,
 				BB000016 /* JoriIntents.swift */,
 				BB000060 /* SignInView.swift */,
 				BB000070 /* MacKeychainStorage.swift */,
@@ -582,6 +586,8 @@
 				AA000091 /* SharedKeychainStorage.swift in Sources */,
 				AA000098 /* SharedSession.swift in Sources */,
 				AA000100 /* MessageReply.swift in Sources */,
+				AA0000C4 /* AnnounceDiagnostics.swift in Sources */,
+				AA0000C5 /* AnnounceCache.swift in Sources */,
 				AA000015 /* JoriIntents.swift in Sources */,
 				AA000060 /* SignInView.swift in Sources */,
 				AA000070 /* MacKeychainStorage.swift in Sources */,

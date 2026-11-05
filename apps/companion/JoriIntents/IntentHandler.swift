@@ -21,6 +21,7 @@ import Foundation
 class IntentHandler: INExtension, INSendMessageIntentHandling, INSearchForMessagesIntentHandling, INSetMessageAttributeIntentHandling {
 
     override func handler(for intent: INIntent) -> Any {
+        AnnounceCache.trace("intents handler for \(type(of: intent))")
         return self
     }
 
@@ -41,6 +42,7 @@ class IntentHandler: INExtension, INSendMessageIntentHandling, INSearchForMessag
     ) {
         let cached = AnnounceCache.all()
         let picked = Self.messagesToRead(for: intent, from: cached)
+        AnnounceCache.trace("intents search notif=\(intent.notificationIdentifiers ?? []) op=\(intent.notificationIdentifiersOperator.rawValue) ids=\(intent.identifiers ?? []) attrs=\(intent.attributes.rawValue) cached=\(cached.count) answer=\(picked.map { $0.body.prefix(30) })")
         NSLog("[JoriIntents] search: notificationIds=\(intent.notificationIdentifiers ?? []) op=\(intent.notificationIdentifiersOperator.rawValue) ids=\(intent.identifiers ?? []) cached=\(cached.count) → \(picked.count)")
         let response = INSearchForMessagesIntentResponse(code: .success, userActivity: nil)
         response.messages = picked.map { m in
@@ -105,6 +107,7 @@ class IntentHandler: INExtension, INSendMessageIntentHandling, INSearchForMessag
         intent: INSetMessageAttributeIntent,
         completion: @escaping (INSetMessageAttributeIntentResponse) -> Void
     ) {
+        AnnounceCache.trace("intents setAttribute \(intent.attribute.rawValue) ids=\(intent.identifiers ?? [])")
         let ids = (intent.identifiers ?? []).filter { UUID(uuidString: $0) != nil }
         let read = intent.attribute == .read || intent.attribute == .played
         guard !ids.isEmpty, read || intent.attribute == .unread else {
@@ -152,6 +155,7 @@ class IntentHandler: INExtension, INSendMessageIntentHandling, INSearchForMessag
         intent: INSendMessageIntent,
         completion: @escaping (INSendMessageIntentResponse) -> Void
     ) {
+        AnnounceCache.trace("intents send handle len=\(intent.content?.count ?? 0) conv=\(intent.conversationIdentifier ?? "-")")
         guard let text = intent.content, !text.isEmpty else {
             completion(INSendMessageIntentResponse(code: .failure, userActivity: nil))
             return

@@ -49,12 +49,14 @@ class NotificationService: UNNotificationServiceExtension {
         // What Siri reads aloud for this notification: the Intents extension
         // answers Siri's INSearchForMessagesIntent (keyed by this request id)
         // from this cache. See AnnounceCache.swift.
+        AnnounceCache.trace("nse received req=\(request.identifier) msg=\(request.content.userInfo["message_id"] as? String ?? "-") cat=\(request.content.categoryIdentifier) group=\(AnnounceCache.groupDescription)")
         AnnounceCache.record(AnnouncedMessage(
             requestId: request.identifier,
             messageId: request.content.userInfo["message_id"] as? String,
             title: bestAttemptContent.title,
             body: bestAttemptContent.body,
             date: Date()))
+        AnnounceCache.trace("nse cached=\(AnnounceCache.all().count)")
 
         #if os(iOS)
         // The message category: Reply action, CarPlay, and
@@ -97,14 +99,17 @@ class NotificationService: UNNotificationServiceExtension {
             guard let self = self else { return }
             if let error = error {
                 NSLog("[JoriNSE] donate failed: \(error.localizedDescription)")
+                AnnounceCache.trace("nse donate failed: \(error.localizedDescription)")
             }
             do {
                 let updated = try bestAttemptContent.updating(from: intent)
+                AnnounceCache.trace("nse upcast ok cat=\(updated.categoryIdentifier) level=\(updated.interruptionLevel.rawValue)")
                 self.deliver(updated)
             } catch {
                 // If this fires, the comm-notification upcast failed — almost
                 // always missing IntentsSupported or an unprovisioned entitlement.
                 NSLog("[JoriNSE] updating(from:) threw: \(error.localizedDescription)")
+                AnnounceCache.trace("nse upcast threw: \(error.localizedDescription)")
                 self.deliver(bestAttemptContent)
             }
         }
@@ -140,6 +145,7 @@ class NotificationService: UNNotificationServiceExtension {
     }
 
     override func serviceExtensionTimeWillExpire() {
+        AnnounceCache.trace("nse time expired")
         if let bestAttemptContent = bestAttemptContent {
             deliver(bestAttemptContent)
         }

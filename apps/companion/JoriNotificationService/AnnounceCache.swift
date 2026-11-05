@@ -76,4 +76,56 @@ enum AnnounceCache {
             NSLog("[AnnounceCache] update failed: \(status)")
         }
     }
+
+    // MARK: - Trace (diagnostics)
+    //
+    // What each process did with a message, so a silent announcement can be
+    // explained without a cable to the phone: the extensions append events
+    // here, and the app uploads them (AnnounceDiagnostics) when it next comes
+    // to the foreground, then clears them.
+
+    private static let traceAccount = "trace"
+    static let maxTrace = 120
+
+    private static func traceQuery() -> [String: Any] {
+        var q = query()
+        q[kSecAttrAccount as String] = traceAccount
+        return q
+    }
+
+    static func traceAll() -> [[String: String]] {
+        var q = traceQuery()
+        q[kSecReturnData as String] = true
+        q[kSecMatchLimit as String] = kSecMatchLimitOne
+        var out: CFTypeRef?
+        guard SecItemCopyMatching(q as CFDictionary, &out) == errSecSuccess,
+              let data = out as? Data,
+              let list = try? JSONDecoder().decode([[String: String]].self, from: data) else { return [] }
+        return list
+    }
+
+    static func trace(_ event: String) {
+        NSLog("[AnnounceTrace] \(event)")
+        let who = (Bundle.main.bundleIdentifier ?? "?").split(separator: ".").last.map(String.init) ?? "?"
+        var list = traceAll()
+        list.append(["t": ISO8601DateFormatter().string(from: Date()), "p": who, "e": event])
+        if list.count > maxTrace { list.removeFirst(list.count - maxTrace) }
+        guard let data = try? JSONEncoder().encode(list) else { return }
+        let status = SecItemUpdate(traceQuery() as CFDictionary, [kSecValueData as String: data] as CFDictionary)
+        if status == errSecItemNotFound {
+            var add = traceQuery()
+            add[kSecValueData as String] = data
+            add[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlock
+            _ = SecItemAdd(add as CFDictionary, nil)
+        }
+    }
+
+    static func clearTrace() {
+        SecItemDelete(traceQuery() as CFDictionary)
+    }
+
+    /// Whether the cache itself can be written and read back (keychain group
+    /// reachable in this process).
+    static var groupDescription: String { accessGroup ?? "(none)" }
 }
+

@@ -306,6 +306,14 @@ final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCent
         PurchaseApproval.registerNotificationCategory()
         MessageReply.registerNotificationCategory()
 
+        // Report what happened to recent messages (did Siri ask what to read?)
+        // each time the app comes forward. See AnnounceDiagnostics.swift.
+        NotificationCenter.default.addObserver(
+            forName: UIApplication.didBecomeActiveNotification, object: nil, queue: .main
+        ) { _ in
+            Task { await AnnounceDiagnostics.upload() }
+        }
+
         // Siri reaches the JoriIntents extension (which tells it what an
         // announced message says) only once the app is authorized for Siri.
         // Asks once; a no-op after the user has answered.
