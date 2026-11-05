@@ -363,7 +363,10 @@ class Supervisor {
     // to close next — which is how a `/compact` with `usage` all zeros and
     // `duration_api_ms: 0` appeared to burn tens of dollars in 140s (2026-07-20),
     // and why job-costs.ndjson was inflating daily spend ~2.8x. Diffing against this cursor recovers each dispatch's own spend.
-    this.costCursor = { sessionId: null, cost: 0, input: 0, output: 0, cacheRead: 0, cacheCreate: 0, webSearch: 0 };
+    // A resumed session's counters keep counting across a supervisor restart,
+    // so the cursor is kept in State (State.costCursorFor) and seeded from it.
+    this.costCursor = this.state.costCursorFor(this.state.sessionId)
+      || { sessionId: null, cost: 0, input: 0, output: 0, cacheRead: 0, cacheCreate: 0, webSearch: 0 };
     this.contextGuardTimer = null;
     // Live background Bash tasks (run_in_background), keyed by task id → start
     // Date.now(). Populated from tool_result events carrying backgroundTaskId;
@@ -1046,6 +1049,8 @@ class Supervisor {
           terminal_reason: info.result.terminal_reason || null,
           ...(wakeSource ? { bg_wake: true } : {}),
         });
+        // After the row, so a failed save cannot drop it.
+        this.state.recordCostCursor(this.costCursor);
 
         // Runaway-/compact detection. The TRIGGER looks normal every time
         // (ctx ~180k, compactable ~50k) — it is the execution that blows up,

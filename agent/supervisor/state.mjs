@@ -73,6 +73,21 @@ export class State {
     return f && f.sessionId === sessionId && f.tokens > 0 ? f.tokens : 0;
   }
 
+  // The cost cursor (the session's cumulative cost and token counters as of
+  // its last cost row), kept with the session for the same reason as the
+  // floor: a supervisor restart that resumes the session must diff its next
+  // row against that row. Without it the first row after a restart starts
+  // from zero and records the session's whole running total as one dispatch.
+  recordCostCursor(cursor) {
+    this.data.costCursor = cursor;
+    this.save();
+  }
+
+  costCursorFor(sessionId) {
+    const c = this.data.costCursor;
+    return c && sessionId && c.sessionId === sessionId ? { ...c } : null;
+  }
+
   markResumed() {
     this.data.lastResumeAt = new Date().toISOString();
     this.save();
