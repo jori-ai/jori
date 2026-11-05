@@ -394,7 +394,10 @@ struct SplashView: View {
                         .foregroundStyle(.white)
                         .fixedSize()
                         .offset(y: 72)
-                        .opacity(shown ? 1 : 0)
+                        // Visible from the first frame: the splash often lasts
+                        // only as long as the Keychain read (a fraction of a
+                        // second on a Mac), and a delayed fade-in never showed
+                        // the name at all. Only the small rise is animated.
                         .offset(y: shown || reduceMotion ? 0 : 8)
                 }
         }
@@ -402,7 +405,7 @@ struct SplashView: View {
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(Install.displayName)
         .onAppear {
-            withAnimation(.easeOut(duration: 0.5).delay(0.12)) { shown = true }
+            withAnimation(.easeOut(duration: 0.3)) { shown = true }
         }
     }
 }
