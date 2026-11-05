@@ -255,8 +255,9 @@ incident_clear() {
     if [ -f "$INCIDENT_DIR/${key}.alerted" ] && [ -f "$INCIDENT_DIR/${key}.delivered" ]; then
       # "auto-healed" is a causal claim this probe cannot see: a Max auth outage
       # can end because someone signed in by hand, and "recovered on its own"
-      # would then be false. Say what was observed, not why.
-      local how="auto-healed"
+      # would then be false. Say what was observed, not why. A caller that saw
+      # how it ended passes RECOVERY_HOW (e.g. chat_backlog_restart_note).
+      local how="${RECOVERY_HOW:-auto-healed}"
       case "$key" in
         # Set by § Max auth outage from what it actually saw: a fresh launchd
         # sign-in check, or only quiet logs.
@@ -552,6 +553,37 @@ disk_alert_body() {
   echo "${free} GiB free on the data volume (${pct}% used). $snap Nothing was deleted. When space runs out, downloads to ${JORI_HOST_LABEL:-the host} stall and database and log writes start failing."
 }
 
+# chat_backlog_restart_note <startedAt> <queueDepth> <queueRestored> — run on
+# every chat /health read. A chat backlog empties two ways: its turns run, or a
+# whole-process restart loses it (an in-process /restart hands the queue over).
+# startedAt is the process's own start, so a new value since the last tick, with
+# a backlog queued at that tick, is a restart; queueRestored (items the new
+# process reloaded from its saved queue at boot) says whether the queue came
+# along. The verdict (CHAT_BACKLOG_NOTE) is the backlog's recovery line in place
+# of "auto-healed", and is cleared with it. Both files sit beside INCIDENT_DIR,
+# whose every file `jori watchdog` lists as an incident.
+CHAT_BACKLOG_PROC="${INCIDENT_DIR%/*}/.watchdog-chat-backlog-proc"
+CHAT_BACKLOG_NOTE="${INCIDENT_DIR%/*}/.watchdog-chat-backlog-note"
+chat_backlog_restart_note() {
+  local started="$1" depth="$2" restored="${3:-0}" prev_started="" prev_depth=0
+  [ -f "$CHAT_BACKLOG_PROC" ] && read -r prev_started prev_depth < "$CHAT_BACKLOG_PROC"
+  [[ "$prev_depth" =~ ^[0-9]+$ ]] || prev_depth=0
+  [[ "$restored" =~ ^[0-9]+$ ]] || restored=0
+  if [ -n "$started" ] && [ -n "$prev_started" ] && [ "$started" != "$prev_started" ] \
+     && [ "$prev_depth" -ge "$QUEUE_BACKLOG_WARN" ]; then
+    if [ "$restored" -gt 0 ]; then
+      log "Chat restarted with a backlog ($prev_depth queued at the last check): the new process restored $restored"
+      # The first verdict of a backlog stands, except that a drop always wins.
+      [ -f "$CHAT_BACKLOG_NOTE" ] || echo "the chat process restarted with a backlog and reloaded its $restored queued items from disk, and the queue has since drained" > "$CHAT_BACKLOG_NOTE"
+    else
+      log "Chat restarted with a backlog ($prev_depth queued at the last check): nothing restored, those messages were dropped"
+      echo "the chat process restarted and dropped the $prev_depth messages queued at the previous check, unanswered" > "$CHAT_BACKLOG_NOTE"
+    fi
+  fi
+  [ -n "$started" ] && echo "$started $depth" > "$CHAT_BACKLOG_PROC"
+  return 0
+}
+
 ISSUES=""
 
 # --- Hum state invariant check ---
@@ -775,6 +807,8 @@ if [ -n "$CHAT_HEALTH_PORT" ]; then
     # Chat queue-depth early-alert (parity with ops). Chat
     # backlogs are rarer (one-message-at-a-time phone-channel cadence) so
     # a buildup here is a stronger signal than on ops.
+    chat_backlog_restart_note "$(echo "$CHAT_HEALTH" | jq -r '.startedAt // empty')" "$CHAT_QUEUE" \
+      "$(echo "$CHAT_HEALTH" | jq -r '.queueRestored // 0')"
     if [ "$CHAT_QUEUE" -ge "$QUEUE_BACKLOG_ALERT" ]; then
       ATTEMPT=$(incident_seen "chat-queue-backlog")
       log "Chat queue backlog: queueDepth=$CHAT_QUEUE >= $QUEUE_BACKLOG_ALERT (attempt $ATTEMPT)"
@@ -785,7 +819,9 @@ if [ -n "$CHAT_HEALTH_PORT" ]; then
     elif [ "$CHAT_QUEUE" -ge "$QUEUE_BACKLOG_WARN" ]; then
       log "Chat queue elevated: queueDepth=$CHAT_QUEUE (warn=$QUEUE_BACKLOG_WARN, alert=$QUEUE_BACKLOG_ALERT)"
     else
-      incident_clear "chat-queue-backlog"
+      RECOVERY_HOW="$(cat "$CHAT_BACKLOG_NOTE" 2>/dev/null)" incident_clear "chat-queue-backlog"
+      # No green streak left = its third green tick, where any recovery line went out.
+      [ -f "$INCIDENT_DIR/chat-queue-backlog.green_streak" ] || rm -f "$CHAT_BACKLOG_NOTE"
     fi
 
     # Phone-channel heartbeat staleness
