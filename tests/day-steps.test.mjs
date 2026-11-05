@@ -125,10 +125,12 @@ test("a walk that outlasts its GPS leg gives the leg the whole walk's steps", ()
   assert.equal(w.kind, "leg");
   assert.equal(w.leg_id, "l0");
   assert.equal(d.path.spine[0].walk_steps, w.steps);
-  assert.ok(d.path.spine[0].walk_steps > d.path.spine[0].steps);
+  assert.ok(d.path.spine[0].walk_steps >= d.path.spine[0].steps);
 });
 
-test("a walk line whose walk runs well past the stretch keeps the leg's own steps and never prints a clock that overlaps the stops beside it", () => {
+test("a walk that starts too long before GPS saw the user leave keeps the leg's own steps and never prints a clock that overlaps the stops beside it", () => {
+  // On foot from 17:00, 36 min before the home stop ends: past the 20-minute limit,
+  // so that edge stays and the walk still runs past the stretch.
   const d = {
     date: "2026-03-02", tz: "America/New_York",
     stops: [
@@ -138,11 +140,12 @@ test("a walk line whose walk runs well past the stretch keeps the leg's own step
     path: { spine: [{ type: "leg", id: "l0", mode: "walking", median_kmh: 4.2, start_ms: at(17, 36), end_ms: at(17, 45), mins: 9,
       routed_m: 700, straight_m: 650, walked_m: 700, geometry: "map_matched", fixes: 3, streets: ["Main Street"] }] },
   };
-  annotateDaySteps(d, [...readings(at(0, 5), at(0, 10), 2), ...readings(at(17, 27), at(17, 57), 95), ...readings(at(23, 50), at(23, 55), 2)],
+  annotateDaySteps(d, [...readings(at(0, 5), at(0, 10), 2), ...readings(at(17, 0), at(17, 57), 95), ...readings(at(23, 50), at(23, 55), 2)],
     null, { startMs: at(0), endMs: at(24) });
+  assert.equal(d.stops[0].end, "17:36");
   const html = buildSkeleton(d);
   assert.doesNotMatch(html, /on foot/);
-  assert.doesNotMatch(html, /2,850 steps/);
+  assert.doesNotMatch(html, /5,415 steps/);
   assert.match(html, /Walked [\d.]+ miles[^<]*, [\d,]+ steps\./);
 });
 
@@ -160,4 +163,49 @@ test("a walk line whose walk sits inside the stretch carries the whole walk's st
     null, { startMs: at(0), endMs: at(24) });
   const html = buildSkeleton(d);
   assert.match(html, /2,4\d\d steps\./);
+});
+
+test("stop edges move to the walk the steps found, so the travel line carries the whole walk", () => {
+  // Steps 17:27-17:57; GPS: home until 17:36, leg 17:36-17:45, venue from 17:50.
+  const d = {
+    date: "2026-03-02", tz: "America/New_York",
+    stops: [
+      { id: "h", start: "00:00", end: "17:36", start_ts_ms: at(0), end_ts_ms: at(17, 36), duration_min: 1056, place: { name: "Home" } },
+      { id: "v", start: "17:50", end: "19:45", start_ts_ms: at(17, 50), end_ts_ms: at(19, 45), duration_min: 115, place: { name: "Venue" } },
+    ],
+    travel_legs: [{ from: "h", to: "v", duration_min: 14 }],
+    path: { spine: [
+      { type: "dwell", id: "d0", start_ms: at(0), end_ms: at(17, 36), start: "00:00", end: "17:36", mins: 1056, place: { name: "Home" } },
+      { type: "leg", id: "l0", mode: "walking", median_kmh: 4.2, start_ms: at(17, 36), end_ms: at(17, 45), mins: 9,
+        routed_m: 2300, straight_m: 2100, walked_m: 2300, geometry: "map_matched", fixes: 3, streets: ["Main Street"] },
+      { type: "dwell", id: "d1", start_ms: at(17, 50), end_ms: at(19, 45), start: "17:50", end: "19:45", mins: 115, place: { name: "Venue" } },
+    ] },
+  };
+  const st = annotateDaySteps(d, [...readings(at(0, 5), at(0, 10), 2), ...readings(at(17, 27), at(17, 57), 95), ...readings(at(23, 50), at(23, 55), 2)],
+    null, { startMs: at(0), endMs: at(24) });
+  assert.equal(d.stops[0].end, "17:27");
+  assert.equal(d.stops[1].start, "17:57");
+  assert.equal(d.path.spine[0].end, "17:27");
+  assert.equal(d.path.spine[2].start, "17:57");
+  assert.equal(d.travel_legs[0].duration_min, 30);
+  assert.equal(st.stops_aligned.length, 2);
+  const html = buildSkeleton(d);
+  assert.match(html, /5:27pm · Walked [\d.]+ miles along Main Street, about 30 min, 2,850 steps\./);
+});
+
+test("an edge is never moved further than 20 minutes, nor past a stop's own start", () => {
+  const d = day();
+  // A walk starting 40 min before the leg: the home stop's edge stays put.
+  annotateDaySteps(d, [...readings(at(0, 5), at(0, 10), 2), ...readings(at(11, 20), at(12, 20), 95), ...readings(at(23, 50), at(23, 55), 2)],
+    null, { startMs: at(0), endMs: at(24) });
+  assert.equal(d.stops[0].end_ts_ms, at(12));
+});
+
+test("annotating a day twice gives the same counts as once", () => {
+  const d = day();
+  const rs = [...readings(at(0, 5), at(0, 10), 2), ...readings(at(11, 55), at(12, 25), 95), ...readings(at(23, 50), at(23, 55), 2)];
+  annotateDaySteps(d, rs, 9000, { startMs: at(0), endMs: at(24) });
+  const once = JSON.stringify(d.path.spine);
+  annotateDaySteps(d, rs, 9000, { startMs: at(0), endMs: at(24) });
+  assert.equal(JSON.stringify(d.path.spine), once);
 });
