@@ -33,9 +33,11 @@
 // shell out to curl, which it accepts. That failure looks like an auth error
 // and is not one, so do not "simplify" this back to fetch.
 //
-// Usage:  supabase-token            # prints token, refreshing if needed
-//         supabase-token --force    # refresh even if the cache looks fresh
-//         supabase-token --status   # human-readable, prints NO secret
+// Usage:  supabase-token              # prints token, refreshing if needed
+//         supabase-token --force      # refresh even if the cache looks fresh
+//         supabase-token --status     # human-readable, prints NO secret
+//         supabase-token --configured # exit 0 when an OAuth app is configured, 1 when not
+//                                     # (no network, prints nothing)
 
 const { execFileSync } = require("child_process");
 const fs = require("fs");
@@ -56,6 +58,10 @@ function app() {
     clientId: process.env.SUPABASE_OAUTH_CLIENT_ID || cfg.client_id || "",
     opItem: cfg.op_item || "",
   };
+}
+
+function configured() {
+  return Boolean(app().clientId);
 }
 
 function clientId() {
@@ -165,6 +171,7 @@ function current({ force = false } = {}) {
 
 function main() {
   const arg = process.argv[2];
+  if (arg === "--configured") process.exit(configured() ? 0 : 1);
   if (arg === "--status") {
     const s = readStore();
     if (!s) return console.log("no cached token yet — next call will mint one");
@@ -186,4 +193,4 @@ if (require.main === module) {
   }
 }
 
-module.exports = { current };
+module.exports = { current, configured };

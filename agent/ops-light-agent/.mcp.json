@@ -10,15 +10,8 @@
       "alwaysLoad": true
     },
     "supabase-jori": {
-      "command": "npx",
-      "args": [
-        "-y",
-        "@supabase/mcp-server-supabase@latest",
-        "--project-ref=${JORI_SUPABASE_PROJECT}"
-      ],
-      "env": {
-        "SUPABASE_ACCESS_TOKEN": "${SUPABASE_ACCESS_TOKEN}"
-      }
+      "command": "${JORI_HOME}/bin/supabase-mcp",
+      "args": ["--project-ref=${JORI_SUPABASE_PROJECT}"]
     }
   }
 }

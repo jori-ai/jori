@@ -31,6 +31,8 @@ For the MCP server's Management-API access (creating/inspecting projects via the
 SUPABASE_ACCESS_TOKEN=sbp_...    # generate at supabase.com/dashboard/account/tokens
 ```
 
+Every MCP config starts that server through `bin/supabase-mcp` (`bin/mcp-manifest-check` fails on one that starts it directly), which passes this token through. A personal access token expires, though, and nothing renews it. To have one that renews itself, register a Supabase OAuth app and give `bin/supabase-token` its client id in `agent/local/supabase-oauth/app.json` and its secret as `SUPABASE_OAUTH_CLIENT_SECRET` in `.env` (its first refresh token comes from the 1Password item named there as `op_item`). From then on `bin/supabase-mcp` uses its 24-hour tokens instead of `SUPABASE_ACCESS_TOKEN`. A server that runs longer than its token loses access until its session restarts.
+
 ## 2. Create the schema
 
 The schema is in the kernel at `system/migrations/` (one idempotent file per capability). Run `bin/jori-migrate` for a dry run of the plan, then `bin/jori-migrate --apply --project <ref> --allow-user <email>`. [schema.md](../schema.md) says which capability needs which tables and how the allowlist works.
