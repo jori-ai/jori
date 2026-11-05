@@ -29,10 +29,15 @@ export class PriorityDispatcher extends EventEmitter {
   // never fused with a background triage/cron task (different source, usually
   // different priority), which must stay a distinct turn. `maxCoalesce` caps a
   // single merged turn so a flood can't build one enormous prompt.
-  constructor(session, { sendFn, coalesce = true, maxCoalesce = 10, separator = "\n\n" } = {}) {
+  //
+  // `persist` (optional) is called after every change to queue/inFlight, so
+  // the supervisor can save them for the next process (queue-persist.mjs);
+  // restore() reloads them. Default: no-op.
+  constructor(session, { sendFn, coalesce = true, maxCoalesce = 10, separator = "\n\n", persist } = {}) {
     super();
     this.session = session;
     this._sendFn = sendFn || ((content) => session.send(content));
+    this._persist = persist || (() => {});
     this._coalesce = coalesce;
     this._maxCoalesce = Math.max(1, maxCoalesce);
     this._separator = separator;
@@ -60,6 +65,7 @@ export class PriorityDispatcher extends EventEmitter {
       }
       this.inFlight = null;
       this.completed++;
+      this._persist();
       // Free the msgId of the head item AND every item merged into this turn.
       this._forgetIds(done);
       this.emit("turn_complete", { message: done, result: ev });
@@ -101,6 +107,7 @@ export class PriorityDispatcher extends EventEmitter {
       }
     }
     this.queue.splice(insertIdx, 0, item);
+    this._persist();
     this.emit("enqueued", item);
 
     // Check if we should interrupt the current in-flight turn.
@@ -155,12 +162,14 @@ export class PriorityDispatcher extends EventEmitter {
     }
 
     this.inFlight = { ...head, content, mergedFrom, mergedCount: merged.length, dispatchedAt: Date.now() };
+    this._persist();
     this.emit("dispatching", this.inFlight);
     try {
       this._sendFn(this.inFlight.content);
     } catch (err) {
       this.emit("dispatch_error", { item: this.inFlight, error: err.message });
       this.inFlight = null;
+      this._persist();
     }
   }
 
@@ -179,8 +188,22 @@ export class PriorityDispatcher extends EventEmitter {
       }
     }
     this.queue.splice(insertIdx, 0, item);
+    this._persist();
     this.emit("requeued", item);
     return item;
+  }
+
+  // Reload what a previous process saved, before anything is sent: a turn
+  // that was in flight never finished, so it goes back in line first at its
+  // priority, and every msgId is remembered so a retried POST is still a
+  // duplicate. Sends nothing; the caller drains once its listeners are attached.
+  restore({ queue = [], inFlight = null } = {}) {
+    this.queue = [...queue];
+    if (inFlight) { this.inFlight = inFlight; this.requeueInFlight({ front: true }); }
+    for (const it of this.queue) {
+      for (const id of [it.msgId, ...(it.mergedFrom || []).map((m) => m.msgId)]) if (id) this._seenMsgIds.add(id);
+    }
+    this._persist();
   }
 
   snapshot() {

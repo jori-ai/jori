@@ -248,6 +248,10 @@ A mis-bound answer is the one failure mode this machinery can produce on its own
 
 The day's calls are in the summary, as code's own lines. `prep` settles them into `day.calls` through the installation's hook (`lib/_ext/day-calls.mjs`, loaded by `daily-summary-build`; without it a day has no calls, and the installation's companion to this playbook describes its own calls and their sources). `render` prints each as a bullet at its time, set like the work lines under a stop (bold time, then plain text), with what was discussed as very short one-line sub-bullets: **11:00pm-11:30pm** `Call with <who> · 30 min · calendar times`. A call in a stop joins that stop's work list in time order; a call outside any stop gets a one-item list of its own. `manifest.calls[]` carries each `{who, local_time, minutes, status, source, line, talk, talk_points}`; `status: "scheduled"` means nothing read whether it took place, so it is worded as on the calendar, never said to have happened; `calls_left_out[]` are calendar slots code settled did not happen. A call's event leaves "Events not matched". A call is never a stop, a visit, a map point or part of the stop count, and no prose slot renames or drops it.
 
+### Steps — code's measurements, not yours
+
+`prep` reads the day's raw step readings (`lib/day-steps.js`; the app uploads every iPhone/Watch StepCount sample, kept 7 days) and settles three things before the manifest is built. **Leg modes:** a leg the pace called walking with almost no steps (fewer than 12 a minute over 6+ minutes) becomes `riding` (`mode_by_pace` keeps the old reading, `mode_evidence` the cadence), and a riding/uncertain leg at walking cadence (60+ a minute, pace under 9 km/h) becomes `walking`; only legs inside the hours the readings cover are judged. **Walks the spine never saw:** sustained walking inside a stop's window (6+ min, 500+ steps, pauses of up to 3 min allowed) is `manifest.steps.walks[]` with `kind: "in_stop"`, and render prints it under that stop as its own line: `Walk 5:42 to 6:10pm · 28 min · 2,960 steps`. **Counts:** the day's total (Apple Health's own daily sum, already de-duplicated) is in the map caption, every "Walked N miles" line carries its legs' steps, and a walk block carries its own. In prose you may say the user went for a walk where an in-stop walk is listed (say who with only if the companions say so); never state, compute or round a step count yourself, and never write "the GPS missed it". With no readings for the day nothing changes and nothing prints; `manifest.steps.error` means the read failed and the day is built as before.
+
 ### 4.2 — Write the prose JSON
 
 Using the manifest — including `manifest.harvest.facts_by_stop` / `facts_by_leg` / `orphan_facts` (commits, sent mail, notes, messages, already anchored by code) and `tasks_completed` — write `/tmp/ds-prose-$DATE.json`:
@@ -390,6 +394,7 @@ Loop blocks are subject to the same Step 4.5 consistency rules: every stop in th
   <h3>[HH:MM]–[HH:MM] · [the settled title] · [duration] [· with [companions]]</h3>
   <p>[≤2 short sentences anchored to this stop's actual activity at this place. Lead with the meaning of the visit — "lunch with Sam", "a pitch with the host", "errand at Whole Foods" — not with what email arrived during it. Use companions, photo subjects, and declarative_self_messages tied to this stop. Only fold in calendar_event's title when it's corroborated; otherwise it's a hint for your own reasoning, not something to state. NO commit logs / no email summaries / no Tasks-completed prose in the lead sentence. NEVER mention a different stop's venue or an unmatched calendar event here (e.g. don't say "then you went to the movie" inside the restaurant's paragraph) — see Rules of the road.]</p>
   <p class="aside"><em>[ONE optional italic line for the most-relevant anchor that happened during this stop: a P1 email reply, a notable Tasks completion (commits are listed below it by code). Cap at one line per visit. If nothing rises to "notable", omit the aside entirely.]</em></p>
+  [builder-owned (2026-11-05): one italic line per walk the step readings found inside this stop, "Walk 5:42 to 6:10pm · 28 min · 2,960 steps"]
   [builder-owned (2026-10-21): <ul class="worked"> of what the user worked on during this stop — one item per `prose.commits` line, "<b>9:05am</b> <line>", the raw subject for any commit no line covers]
   [one <img> tag per photo in stops[i].photos, max 3 — produced by
    `~/Dev/jori/bin/photos embed-img <uuid>` which sources the
@@ -513,6 +518,7 @@ Runs only for a confirmed day in NORMAL mode, never in SILENT or a dry run (an u
    ~/Dev/jori/bin/daily-summary-fix status $DATE        # a re-run: skip what was already asked
    ~/Dev/jori/bin/daily-summary-fix ask $DATE --question "<question>"     # exit 5: held back by the outbound check, not asked
    ```
+   The evening pass may already have asked about this day the evening before (`status` shows those questions with `evening: true`, opening "Before I write up your <Weekday>"), and recorded what the user answered: do not ask them again. An unanswered one holds nothing (`gate` never waits on it); the send retires it.
    Inside the user's quiet hours (`agent/local/config/daily-summary-fix.json`, the user's current timezone; this run usually falls in them) `ask` does not send: it prints `held (question n): …`, exits 0 and keeps the question until the user is up (*"Why wait until 4:37am to ask this?"*). It is asked from the launchd runner then, never by you, and the email waits for it. Carry on exactly as if it had been asked.
 3. **The gate** (code decides, also on a re-run of a day already held):
    ```bash
@@ -590,7 +596,7 @@ Runs only for a confirmed day in NORMAL mode, never in SILENT or a dry run (an u
      --push "Day of $DAY_NAME, $MONTH_DAY_SHORT is in your inbox"
    ```
 
-   Then record the send: `~/Dev/jori/bin/daily-summary-fix mark-sent $DATE` (the fixer reads it to know whether a later fix is a first send or a correction).
+   Then record the send: `~/Dev/jori/bin/daily-summary-fix mark-sent $DATE` (the fixer reads it to know whether a later fix is a first send or a correction). **This 4am build only, in NORMAL mode, when its own Step 4.6 review returned `confirmed: true` and its Step 4.7 gate exited 0**, also close the day: `~/Dev/jori/bin/daily-summary-fix done $DATE --status confirmed`, so a question from the evening pass the user never answered stops holding it open (the user's later answer still reopens it as a correction). The fix loop never runs this line, even when it runs Step 5: it closes a day with its own `done`, and a best-version send of an unconfirmed day must stay open.
 
    Exit 0 = done. Exit 1 = the email did not send and nothing else ran — report the failure, do not retry by hand-running the pieces. Exit 2 = sent, but Gmail had not indexed it in time so it is unlabeled (pointer + push still went) — note it in your final output; no further action.
 

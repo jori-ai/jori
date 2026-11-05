@@ -11,9 +11,10 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createRequire } from "node:module";
+import { at } from "./fixtures/fake-geo.mjs";
 
 const require = createRequire(import.meta.url);
-const { computeAccuracy, _internal } = require("../lib/live-day.js");
+const { computeAccuracy, farCorrections, judgeSamePlaces, _internal } = require("../lib/live-day.js");
 const { tzOffsetMinutes, offsetIso, dayWindowMs } = _internal;
 
 const ms = (iso) => Date.parse(iso);
@@ -100,4 +101,78 @@ test("a night's sleep in Paris is not reported as a daytime coverage gap", () =>
   ];
   const acc = computeAccuracy({ date: "2026-08-10", tz: "Europe/Paris", intervals: withNight });
   assert.equal(acc.coverage_gaps.length, 0);
+});
+
+// A clock-change day is 23 or 25 hours, and no bucket may hold more minutes
+// than the day did. The shape: an overnight seed running in from the evening
+// before, an arrival stop overlapping its tail, and a stay running past the
+// next midnight. Summing raw durations gave 1913 unexamined minutes.
+test("a clock-change day is as long as it was lived", () => {
+  const fall = dayWindowMs("2026-11-01", "America/Chicago");
+  assert.equal(new Date(fall.start).toISOString(), "2026-11-01T05:00:00.000Z");
+  assert.equal(fall.end - fall.start, 25 * 3600_000);
+  const spring = dayWindowMs("2026-03-08", "America/Chicago");
+  assert.equal(new Date(spring.start).toISOString(), "2026-03-08T06:00:00.000Z");
+  assert.equal(spring.end - spring.start, 23 * 3600_000);
+});
+
+test("overlapping and boundary-crossing intervals count each minute once", () => {
+  const acc = computeAccuracy({ date: "2026-11-01", tz: "America/Chicago", intervals: [
+    iv("overnight seed", "2026-10-31T22:05:00.000Z", "2026-11-01T09:55:00.000Z", "calendar_seed", 0.5),
+    iv("arrival", "2026-11-01T09:30:00.000Z", "2026-11-01T10:33:00.000Z", "user_confirmed", 1),
+    iv("stay", "2026-11-01T12:00:00.000Z", "2026-11-02T07:00:00.000Z"),
+  ] });
+  // 295 (05:00Z-09:55Z) + 38 (past the seed) + 1080 (to 06:00Z).
+  assert.equal(acc.covered_min, 1413);
+  assert.equal(acc.unexamined_min, 1413);
+  assert.equal(acc.corroborated_min + acc.contradicted_min + acc.unexamined_min, acc.covered_min);
+});
+
+// Name grading: an answer 60-500 m off is a contradiction unless a model says
+// the two names are one place. Synthetic: a school named the same 98 m apart.
+const SCHOOL = at(0, 0), GATE = at(98, 0), MARKET = at(900, 0);
+const named = (id, from, to, name, p, source = "spine_dwell") => ({
+  ...iv(id, from, to), place: { name, source, confidence: 0.85, lat: p.lat, lon: p.lon, address: `${name}, 2 Sample St` },
+});
+const answer = (from, to, name, p) => ({ place_type: "user-confirmed", place_name: name,
+  arrived_at: from, departed_at: to, latitude: p.lat, longitude: p.lon });
+const DAY = { date: "2026-10-27", tz: "UTC", intervals: [
+  named("market", "2026-10-27T13:00:00.000Z", "2026-10-27T13:48:00.000Z", "Sample Market", MARKET),
+  named("school", "2026-10-27T14:00:00.000Z", "2026-10-27T14:24:00.000Z", "Example School", SCHOOL),
+] };
+const ANSWERS = [
+  answer("2026-10-27T13:00:00.000Z", "2026-10-27T13:48:00.000Z", "Sample Market", MARKET),
+  answer("2026-10-27T14:00:00.000Z", "2026-10-27T14:24:00.000Z", "Example School (North Gate)", GATE),
+];
+
+test("only the far answer is asked about, with names, address and distance only", async () => {
+  const pairs = farCorrections(DAY, ANSWERS);
+  assert.deepEqual(pairs.map((p) => [p.id, p.off_by_m]), [["school", 98]]);
+  const calls = [];
+  const same = await judgeSamePlaces(pairs, { decideImpl: async (o) => { calls.push(o); return { value: true }; } });
+  assert.equal(calls[0].site, "live-day-same-place");
+  assert.deepEqual(calls[0].state, { asserted: { name: "Example School", address: "Example School, 2 Sample St" },
+    corrected: { name: "Example School (North Gate)" }, distance_m: 98 });
+  const acc = computeAccuracy(DAY, ANSWERS, { samePlace: same });
+  assert.equal(acc.name_accuracy, 1);
+  assert.equal(acc.contradictions.length, 0);
+  assert.equal(acc.judged_same_place[0].he_said, "Example School (North Gate)");
+});
+
+test("no answer, or a no, keeps the distance rule's verdict", async () => {
+  assert.equal(computeAccuracy(DAY, ANSWERS).name_accuracy, 0.667);
+  const pairs = farCorrections(DAY, ANSWERS);
+  for (const decideImpl of [async () => { throw new Error("jev down, ladder down"); }, async () => ({ value: false })]) {
+    const same = await judgeSamePlaces(pairs, { decideImpl });
+    assert.equal(same.size, 0);
+    const acc = computeAccuracy(DAY, ANSWERS, { samePlace: same });
+    assert.equal(acc.name_accuracy, 0.667);
+    assert.equal(acc.contradictions[0].off_by_m, 98);
+  }
+});
+
+test("past 500 m a same-place yes is never asked for, and never counted", () => {
+  const far = [ANSWERS[0], answer("2026-10-27T14:00:00.000Z", "2026-10-27T14:24:00.000Z", "Example School", at(700, 0))];
+  assert.equal(farCorrections(DAY, far).length, 0);
+  assert.equal(computeAccuracy(DAY, far, { samePlace: new Set(["school"]) }).name_accuracy, 0.667);
 });

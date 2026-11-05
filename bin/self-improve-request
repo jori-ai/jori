@@ -18,6 +18,18 @@
 //   new-capability: {name, files:{...}}).
 // Exit 65: the installation's landing check refused the code-fix (personal data
 //   added to a kernel file, a new file left unclassified, …) — redraft, refile.
+// Exit 66: the code-fix touches a locked file (RECURSION_GUARD in
+//   lib/self-improve-landing.mjs) and is not the owner's own quoted chat request,
+//   or touches the lock's own machinery (LOCK_CORE), which no card may change.
+//
+// Locked files (rubric schema v6, 2026-11-04): a change the owner asked for in
+// chat may touch the rulebooks, the guarded job playbooks and chat's
+// reply-recognition text on a normal card that quotes their words:
+//   --owner-quote "<their words, copied exactly>" [--owner-message-id <row id>]
+// Only from a chat build (trigger-chat-build.sh exports JORI_CHAT_BUILD_REQUEST);
+// the quote must be an exact substring of one of their own messages. The card
+// shows the quote, and the verified request is recorded in item_json, which the
+// signature covers.
 
 import path from "node:path";
 import { createRequire } from "node:module";
@@ -152,6 +164,68 @@ for (const [f, content] of Object.entries(item.files || {})) {
 // before the card is filed, with what to fix. (A new capability is written
 // under agent/ext/<name>/, which is this installation's own by
 // definition: nothing to check.)
+// Locked files. Until schema v6 this CLI never looked: the recursion guard
+// lived only in self-improve-auto-apply, so nothing but each playbook's prose
+// stopped a card on a guarded file. Now it is decided here, from the real file
+// set, before anything is filed (and again by the applier).
+let ownerRequest = null;
+let lockedPaths = [];
+if (type === "code-fix") {
+  const { railsFor, verifyOwnerRequest } = await import(path.join(ROOT, "lib/self-improve-landing.mjs"));
+  const rails = railsFor(Object.keys(item.files || {}));
+  const refuse = (lines) => {
+    console.error("self-improve-request: refused — nothing was filed:");
+    for (const l of lines) console.error(`  - ${l}`);
+    process.exit(66);
+  };
+  if (rails.forbidden.length) refuse(rails.forbidden.map((p) => `forbidden path (secrets, credentials): ${p}`));
+  if (rails.lockCore.length) refuse(rails.lockCore.map((p) => `the lock's own machinery, which no card may change (a human edits it in a session the owner directs): ${p}`));
+  if (rails.recursion.length) {
+    const quote = arg("owner-quote");
+    if (!quote) refuse([
+      ...rails.recursion.map((p) => `a locked file (the improvement pipeline's own controls): ${p}`),
+      "only the owner's own chat request may change it: from a chat build, pass --owner-quote \"<their words, copied exactly>\" [--owner-message-id <id>]",
+    ]);
+    const v = await verifyOwnerRequest({
+      quote,
+      messageId: arg("owner-message-id"),
+      buildRequestId: process.env.JORI_CHAT_BUILD_REQUEST || null,
+      rebuildOf: arg("rebuild-of"),
+      readBuildRequest: async (id) => {
+        // The trigger moves the request to running/ before the build starts, and
+        // keeps it there until the build ends: a live chat build is in running/.
+        if (!/^[A-Za-z0-9-]{1,80}$/.test(id)) return null;
+        try { return JSON.parse(fs.readFileSync(path.join(ROOT, "data/build-queue/running", `${id}.json`), "utf8")); } catch { return null; }
+      },
+      getMessage: async (id) => {
+        const res = await fetch(`${BASE}/rest/v1/jori_messages?id=eq.${encodeURIComponent(id)}&select=id,role,content,created_at&limit=1`, { headers: H, signal: AbortSignal.timeout(15000) });
+        if (!res.ok) throw new Error(`messages ${res.status}`);
+        return (await res.json())[0] || null;
+      },
+      findUserMessages: async ({ before }) => {
+        // The owner's messages of the last 30 days, newest first; the quote is
+        // compared in code (an exact substring), not in the query.
+        const since = new Date(Date.now() - 30 * 864e5).toISOString();
+        const qs = new URLSearchParams({ select: "id,role,content,created_at", role: "eq.user", order: "created_at.desc", limit: "5000" });
+        qs.append("created_at", `gte.${since}`);
+        if (before) qs.append("created_at", `lte.${before}`);
+        const res = await fetch(`${BASE}/rest/v1/jori_messages?${qs}`, { headers: H, signal: AbortSignal.timeout(20000) });
+        if (!res.ok) throw new Error(`messages ${res.status}`);
+        return res.json();
+      },
+      getApproval: async (id) => {
+        const res = await fetch(`${BASE}/rest/v1/self_improve_approvals?id=eq.${encodeURIComponent(id)}&select=id,item_json&limit=1`, { headers: H, signal: AbortSignal.timeout(15000) });
+        if (!res.ok) throw new Error(`approvals ${res.status}`);
+        return (await res.json())[0] || null;
+      },
+    });
+    if (!v.ok) refuse([...rails.recursion.map((p) => `a locked file: ${p}`), ...v.reasons]);
+    ownerRequest = v.owner;
+    lockedPaths = rails.recursion;
+    item.owner_request = ownerRequest;
+  }
+}
+
 let cardRemovalNote = "";
 if (type === "code-fix") {
   const { installationRefusals } = await import(path.join(ROOT, "lib/self-improve-landing.mjs"));
@@ -259,6 +333,19 @@ if (inert.length) {
 
 // A declared large removal is shown on the card, so the signature is given knowing it.
 if (cardRemovalNote) rationaleOut = `${rationaleOut}${rationaleOut ? "\n\n" : ""}${cardRemovalNote}`;
+
+// A locked file: the card leads with the owner's own words, so the signature is
+// given knowing this card exists only because they asked.
+if (ownerRequest) {
+  const inst = createRequire(import.meta.url)("../lib/instance.cjs");
+  let when = "";
+  try {
+    if (ownerRequest.message_created_at) {
+      when = ` on ${new Intl.DateTimeFormat("en-US", { timeZone: inst.instance().tz, month: "short", day: "numeric", hour: "numeric", minute: "2-digit" }).format(new Date(ownerRequest.message_created_at))}`;
+    }
+  } catch {}
+  rationaleOut = `\u{1F512} This changes a locked file (${lockedPaths.join(", ")}), which only your own request can do. You asked${when}: "${ownerRequest.quote}"\n\n${rationaleOut}`;
+}
 
 const u = createUnifiedApproval({
   store: {

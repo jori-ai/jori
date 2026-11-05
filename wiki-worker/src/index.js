@@ -24,6 +24,10 @@
 import render from "../../lib/wiki-render.js";
 import portalLib from "../../lib/wiki-portal.js";
 import scopeLib from "../../lib/wiki-scope.js";
+
+// The assistant's name, from the ASSISTANT_NAME var; its pronouns from
+// ASSISTANT_PRONOUNS (both passed by bin/wiki-worker-deploy from instance.json).
+const assistant = (env) => env.ASSISTANT_NAME || "Jori"; // control-scan-ok: the setting's default
 // The site icon: the default export of the module the deploy config's [alias]
 // maps "wiki-favicon" to — an installation's module re-exporting its PNG
 // (bundled as Data by the [[rules]] in wrangler.toml), or the kernel default
@@ -183,7 +187,7 @@ async function renderSearchFallback(env, q, canRead, who) {
     .map((h) => ({ id: h.id, title: h.title || h.id, type: h.type, snippetHtml: `${snippet(h.snippet)}…` }));
   return page(who, query, portalLib.searchBody({
     query, results, answer: false,
-    offline: "Jori's memory is offline right now, so these are plain text matches from the cloud copy, with no answer.",
+    offline: `${assistant(env)}'s memory is offline right now, so these are plain text matches from the cloud copy, with no answer.`,
   }), { q: query });
 }
 
@@ -209,6 +213,7 @@ const deny = (msg) => html(403, shell("Not authorised", `<h1>Not authorised</h1>
 
 export default {
   async fetch(req, env) {
+    portalLib.setAssistant(assistant(env), env.ASSISTANT_PRONOUNS || "it/its");
     const u = new URL(req.url);
 
     // Liveness — before the identity gate, and reveals nothing.
@@ -247,7 +252,7 @@ export default {
       }
       if (u.pathname.startsWith("/api/")) {
         const res = await viaOrigin(req, u.pathname === "/api/ask" ? 75000 : 12000);
-        return res || new Response(JSON.stringify({ error: "Jori's memory is offline right now." }), { status: 503, headers: { "content-type": "application/json", ...PRIVATE } });
+        return res || new Response(JSON.stringify({ error: `${assistant(env)}'s memory is offline right now.` }), { status: 503, headers: { "content-type": "application/json", ...PRIVATE } });
       }
 
       const pages = (await pageIndex(env)).filter((p) => canRead(p.id) && p.status === "active");
@@ -255,7 +260,7 @@ export default {
         const type = u.searchParams.get("type");
         if (u.searchParams.get("pinned") === "1") {
           const pinned = pages.filter((p) => p.pinned).sort(byTitle);
-          return html(200, page(who, "Always in mind", portalLib.listingBody({ title: "Always in mind", dek: "The pages Jori keeps in mind in every conversation.", pages: pinned }), { active: "pinned" }));
+          return html(200, page(who, "Always in mind", portalLib.listingBody({ title: "Always in mind", dek: `The pages ${assistant(env)} keeps in mind in every conversation.`, pages: pinned }), { active: "pinned" }));
         }
         if (type) {
           const label = portalLib.TYPE_LABEL[type] || type;

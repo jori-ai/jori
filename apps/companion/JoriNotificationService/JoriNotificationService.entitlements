@@ -2,10 +2,19 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-	<!-- com.apple.developer.usernotifications.communication REMOVED 2026-06-27:
-	     we no longer upcast pushes into communication notifications (it broke the
-	     plain AirPods announce and tripped ITMS-90894). Plain notifications only. -->
+	<!-- Communication notifications (restored 2026-11-05): lets this
+	     extension's INSendMessageIntent upcast form, so a push reads as a message
+	     from the assistant. Needs IntentsSupported in this extension's Info.plist. -->
+	<key>com.apple.developer.usernotifications.communication</key>
+	<true/>
 	<key>com.apple.developer.usernotifications.time-sensitive</key>
 	<true/>
+	<!-- Shared with the app and JoriIntents: this extension records each
+	     message in AnnounceCache, which JoriIntents reads to tell Siri what to
+	     read aloud. -->
+	<key>keychain-access-groups</key>
+	<array>
+		<string>$(AppIdentifierPrefix)$(JORI_BUNDLE_ID).shared</string>
+	</array>
 </dict>
 </plist>

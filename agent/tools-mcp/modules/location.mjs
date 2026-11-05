@@ -16,6 +16,7 @@ const require = createRequire(import.meta.url);
 const { instance, localConfig } = require("../../../lib/instance.cjs");
 const cfg = localConfig("location-tools", { tools_after: null });
 const OWNER = instance().owner_name;
+const ASSISTANT = require("../../../lib/instance.cjs").assistantName(); // the assistant's configured name
 
 export const after = cfg.tools_after || null;
 
@@ -185,7 +186,7 @@ export function tools({ BIN, run: runBin }) {
     },
     {
       name: "location_annotate",
-      description: `Tag location_history samples retroactively with companions and/or notes. Use for 'yeah that was with <name>' / 'mark the evening as with <name>' / learning patterns. Idempotent — companions are merged, not duplicated. A companion name Jori does not already know is refused (nothing written): ask ${OWNER} who it is first, then pass the answer as new_companion_authorized.`,
+      description: `Tag location_history samples retroactively with companions and/or notes. Use for 'yeah that was with <name>' / 'mark the evening as with <name>' / learning patterns. Idempotent — companions are merged, not duplicated. A companion name ${ASSISTANT} does not already know is refused (nothing written): ask ${OWNER} who it is first, then pass the answer as new_companion_authorized.`,
       schema: {
         type: "object",
         properties: {
@@ -232,7 +233,7 @@ export function tools({ BIN, run: runBin }) {
     // ── Find My + Location ──
     {
       name: "findme_locate",
-      description: `Locate a person or device. For ${OWNER}: uses Jori app GPS (live). For others: iCloud Find My. Use 'all' for everyone.`,
+      description: `Locate a person or device. For ${OWNER}: uses Jori app GPS (live). For others: iCloud Find My. Use 'all' for everyone.`, // control-scan-ok: the software's name
       schema: { type: "object", properties: { target: { type: "string", description: "Person name, device name, or 'all'" } }, required: ["target"] },
       run: (a) => run("findme", ["locate", a.target, "--json"]),
     },

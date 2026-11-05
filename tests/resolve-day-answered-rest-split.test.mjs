@@ -287,3 +287,130 @@ test("calendarBeatsRing: only a ring name much farther than the event, or a bare
   assert.equal(calendarBeatsRing({ source: "confirmed_stop" }, { distance_m: 140 }, cal), false);
   assert.equal(calendarBeatsRing({ source: "known_recurring" }, { distance_m: 140 }, cal), false);
 });
+
+// ---------------------------------------------------------------------------
+// A booking at the stop's own address beats a name the 30 m ring found from an
+// older answer. `confirmed_stop` is a proximity match to a place named on an
+// earlier day; two venues facing each other across a street both sit inside it,
+// and the ring names whichever was confirmed first. A timed, opaque, physical
+// event that covers the stop and geocodes beside it is today's evidence and names
+// the other door. Synthetic places and date.
+// ---------------------------------------------------------------------------
+const { calendarOverProximityName } = require(path.join(ROOT, "lib/resolve-day.js"))._internal;
+
+const BP_T = (hms) => Date.parse(`2099-05-07T${hms}+00:00`);
+const BP_STOP_AT = fakeAt(0, 0);
+const BP_BOOKED_AT = fakeAt(15, 0);   // the booked venue's door, 15 m from the stop
+
+const bpStopNamedByRing = (over = {}) => ({
+  id: "s-20990507-2", start: "17:50", end: "19:45",
+  start_ts_ms: BP_T("17:50:00"), end_ts_ms: BP_T("19:45:00"), duration_min: 115,
+  lat: BP_STOP_AT.lat, lon: BP_STOP_AT.lon,
+  place: { name: "Jazz Club Example", address: "131 Example St", source: "confirmed_stop", confidence: 0.95, distance_m: 6 },
+  calendar_event: { summary: "Headliner at Comedy Club Example", location: "Comedy Room Example, 130 Example St",
+                    location_match: true, physical: true, event_share: 0.7 },
+  confirmed_row: null, photos: [], companions: [],
+  ...over,
+});
+
+const bpBooking = (over = {}) => ({
+  summary: "Headliner at Comedy Club Example", location: "Comedy Room Example, 130 Example St, Exampleville",
+  start: { dateTime: "2099-05-07T18:00:00+00:00" }, end: { dateTime: "2099-05-07T20:30:00+00:00" }, ...over,
+});
+
+const bpGeoAt = (p, name = "Comedy Room Example") => ({ lat: p.lat, lon: p.lon, name, is_business: true });
+const bpCtxFor = (events, geo) => ({
+  date: "2099-05-07", knownStopsEntries: [], confirmedStopsEntries: [], companionRows: [],
+  calendar: { mod: { placeEvents: crCalPlace.placeEvents, geocodeLocation: () => geo }, events },
+});
+
+test("the booked venue's name replaces the ring's, and the old name stays visible", () => {
+  const stops = [bpStopNamedByRing()];
+  const named = calendarOverProximityName(stops, bpCtxFor([bpBooking()], bpGeoAt(BP_BOOKED_AT)));
+  assert.equal(stops[0].place.name, "Comedy Room Example");
+  assert.equal(stops[0].place.source, "calendar_corroborated");
+  assert.equal(stops[0].displaced_label, "Jazz Club Example");
+  assert.equal(named.length, 1);
+  assert.deepEqual([named[0].name, named[0].was], ["Comedy Room Example", "Jazz Club Example"]);
+  assert.ok(stops[0].place.distance_m <= 50);
+});
+
+test("an address the geocoder reads as a bare street names the stop by the event's own venue field", () => {
+  const stops = [bpStopNamedByRing()];
+  calendarOverProximityName(stops, bpCtxFor([bpBooking()], { ...bpGeoAt(BP_BOOKED_AT), is_business: false, name: "130 Example St" }));
+  assert.equal(stops[0].place.name, "Comedy Room Example");
+});
+
+test("an answer about this window is never replaced", () => {
+  const stops = [bpStopNamedByRing({ place: { name: "Jazz Club Example", source: "user_confirmed", confidence: 1 } })];
+  assert.deepEqual(calendarOverProximityName(stops, bpCtxFor([bpBooking()], bpGeoAt(BP_BOOKED_AT))), []);
+  assert.equal(stops[0].place.name, "Jazz Club Example");
+});
+
+test("home, a known recurring place and a wifi name are left alone", () => {
+  for (const source of ["named_location", "known_recurring", "wifi_ssid"]) {
+    const stops = [bpStopNamedByRing({ place: { name: "Jazz Club Example", source, confidence: 0.95 } })];
+    assert.deepEqual(calendarOverProximityName(stops, bpCtxFor([bpBooking()], bpGeoAt(BP_BOOKED_AT))), [], source);
+    assert.equal(stops[0].place.name, "Jazz Club Example");
+  }
+});
+
+test("an event at the same venue under another spelling changes nothing", () => {
+  const stops = [bpStopNamedByRing()];
+  assert.deepEqual(calendarOverProximityName(stops, bpCtxFor([bpBooking()], bpGeoAt(BP_BOOKED_AT, "The Jazz Club Example"))), []);
+  assert.equal(stops[0].place.source, "confirmed_stop");
+});
+
+test("an event that covers little of the stop names nothing", () => {
+  const stops = [bpStopNamedByRing()];
+  const late = bpBooking({ start: { dateTime: "2099-05-07T19:30:00+00:00" }, end: { dateTime: "2099-05-07T20:30:00+00:00" } });
+  assert.deepEqual(calendarOverProximityName(stops, bpCtxFor([late], bpGeoAt(BP_BOOKED_AT))), []);
+  assert.equal(stops[0].place.name, "Jazz Club Example");
+});
+
+test("a long event the stop only passed through names nothing", () => {
+  const stops = [bpStopNamedByRing()];
+  const block = bpBooking({ start: { dateTime: "2099-05-07T17:00:00+00:00" }, end: { dateTime: "2099-05-07T23:00:00+00:00" } });
+  assert.deepEqual(calendarOverProximityName(stops, bpCtxFor([block], bpGeoAt(BP_BOOKED_AT))), []);
+  assert.equal(stops[0].place.name, "Jazz Club Example");
+});
+
+test("an address 80 m from the stop is too far to name it", () => {
+  const stops = [bpStopNamedByRing()];
+  assert.deepEqual(calendarOverProximityName(stops, bpCtxFor([bpBooking()], bpGeoAt(fakeAt(80, 0)))), []);
+  assert.equal(stops[0].place.name, "Jazz Club Example");
+});
+
+test("a free (transparent) event names nothing", () => {
+  const stops = [bpStopNamedByRing()];
+  assert.deepEqual(calendarOverProximityName(stops, bpCtxFor([bpBooking({ transparency: "transparent" })], bpGeoAt(BP_BOOKED_AT))), []);
+  assert.equal(stops[0].place.name, "Jazz Club Example");
+});
+
+test("a video call is not a place", () => {
+  const stops = [bpStopNamedByRing()];
+  assert.deepEqual(calendarOverProximityName(stops, bpCtxFor([bpBooking({ location: "https://meet.example.com/abc" })], bpGeoAt(BP_BOOKED_AT))), []);
+});
+
+test("a stop the user said was not a stop is left alone", () => {
+  const stops = [bpStopNamedByRing({ user_non_stop: true })];
+  assert.deepEqual(calendarOverProximityName(stops, bpCtxFor([bpBooking()], bpGeoAt(BP_BOOKED_AT))), []);
+});
+
+test("no calendar, or a calendar or geocoder failure, leaves the ring's answer", () => {
+  const stops = [bpStopNamedByRing()];
+  assert.deepEqual(calendarOverProximityName(stops, { date: "2099-05-07", calendar: null }), []);
+  const boom = { date: "2099-05-07", calendar: { mod: { placeEvents: () => { throw new Error("gog down"); }, geocodeLocation: () => null }, events: [bpBooking()] } };
+  assert.deepEqual(calendarOverProximityName(stops, boom), []);
+  assert.deepEqual(calendarOverProximityName(stops, bpCtxFor([bpBooking()], null)), []);
+  assert.equal(stops[0].place.name, "Jazz Club Example");
+});
+
+test("JORI_CALENDAR_OVER_PROXIMITY=0 turns the pass off", () => {
+  process.env.JORI_CALENDAR_OVER_PROXIMITY = "0";
+  try {
+    const stops = [bpStopNamedByRing()];
+    assert.deepEqual(calendarOverProximityName(stops, bpCtxFor([bpBooking()], bpGeoAt(BP_BOOKED_AT))), []);
+    assert.equal(stops[0].place.name, "Jazz Club Example");
+  } finally { delete process.env.JORI_CALENDAR_OVER_PROXIMITY; }
+});

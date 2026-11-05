@@ -28,6 +28,7 @@ import { searchEvents as recallSearchEvents, searchEventsHybrid as recallSearchE
 import { searchPagesHybrid, associatePages, searchDaysAssociative } from "../../lib/wiki-embed.mjs";
 import { inDateWindow, isIsoDate } from "../../lib/wiki-assoc.mjs";
 import { factsForPage } from "../../lib/wiki-facts.mjs";
+import { branchLine } from "../../lib/wiki-family-branch.mjs";
 import { recall as unifiedRecall } from "../../lib/unified-recall.mjs";
 import { getReplSandbox } from "../runtime/repl-runner.mjs";
 import { localLlmEmbed } from "../../lib/local-llm.mjs";
@@ -180,7 +181,7 @@ const TOOLS = [
       "Hand a self-contained research task to a background sub-agent, then END YOUR TURN. It inherits the recent conversation as background, runs on its own (web search available), and its findings come back to you as a message minutes later — you relay them to " + OWNER + " then.\n\n" +
       "Use it when the work would otherwise make " + OWNER + " wait mid-conversation, or would dump a lot of raw material into this conversation: 'compare these four hotels', 'find out what changed in X since June', 'dig up the reviews for these three places'.\n\n" +
       "What it HAS: web search/fetch, and " + ASSISTANT + "'s own skills — " + TEXT.delegate_skill_example + ".\n" +
-      "What it LACKS: any shell, file, calendar, wiki, email, home-control or money access. It reads a skill's judgment but cannot execute a skill step that shells out" + (TEXT.delegate_shell_examples ? " " + TEXT.delegate_shell_examples : "") + ", so anything needing live Jori data must come from YOU in the task text, or be done by you afterward. It is deliberately read-only: it exists to digest untrusted web content, which is not something to hand a shell.\n" +
+      "What it LACKS: any shell, file, calendar, wiki, email, home-control or money access. It reads a skill's judgment but cannot execute a skill step that shells out" + (TEXT.delegate_shell_examples ? " " + TEXT.delegate_shell_examples : "") + ", so anything needing live " + ASSISTANT + " data must come from YOU in the task text, or be done by you afterward. It is deliberately read-only: it exists to digest untrusted web content, which is not something to hand a shell.\n" +
       "Do NOT use it for anything you can answer directly, for anything needing a tool it lacks, or to avoid a short lookup. Tell " + OWNER + " you're looking into it before you end the turn, otherwise the reply lands with no explanation.",
     schema: {
       type: "object",
@@ -421,6 +422,18 @@ const TOOLS = [
           const src = f.source_page !== row.id ? `  [from ${f.source_page}]` : "";
           lines.push(`  ${f.src_id} ${f.rel}${obj}: ${f.fact_text}${when}${src}`);
         }
+      }
+      // Which side of the family a person is on (lib/wiki-family-branch.mjs),
+      // walked from the typed relations, so a who's-who for one side's
+      // gathering does not mix in the other side (2026-10-29: "Can't mix these
+      // meetups"). Person pages only; "unknown" when no relation reaches a side.
+      let entity = null;
+      try { entity = JSON.parse(row.frontmatter_json || "{}").entity || null; } catch {}
+      if (entity === "person") {
+        let line = null;
+        try { line = branchLine(row.id); } catch {}
+        lines.push("\n=== family branch ===");
+        lines.push(`  ${line || "unknown (no family relations recorded that reach either side)"}`);
       }
       return lines.join("\n");
     },

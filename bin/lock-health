@@ -1,0 +1,332 @@
+#!/usr/bin/env node
+"use strict";
+// lock-health — is every door lock in the rental portfolio ready for the next
+// code, before someone needs it?
+//
+// WHY. A door code fails when it is needed: pushed to a lock whose gateway is
+// busy, or one the gateway can no longer reach, or typed at a door whose lock
+// has been off Wi-Fi for days. Each time, the first anyone heard was the
+// failure. This checks every lock hourly — online, battery, its gateway, the
+// last thing it actually did — and says so ONCE when a lock goes bad, and once
+// more when it is fixed. A lock someone will need soon (a lease starting, a
+// code the hub is still trying to set) is checked live and alerts on the
+// first bad reading instead of waiting for a second.
+//
+// SOURCES (all read-only):
+//   - TTLock Cloud via lib/ttlock.js, with the hub's own access token borrowed
+//     from its Firestore (never refreshed here; see that file for why).
+//   - Schlage via the installation's status command (lock-health.json
+//     `schlage.command`, run as `<command> status --json --lock <key>…`),
+//     which already holds the Schlage tokens.
+//   - The books' Firestore (lib/rental-ledger.js): leases, tenants, and the
+//     unit-availability lock assignments.
+//
+// DETERMINISTIC. No model, no agent turn. Rules in lib/lock-health.js.
+// Alerts go to the system channel (jori-send-curl --channel system
+// --skip-precheck: a job reporting infrastructure state), pushed only when
+// there is a new problem; recoveries post silently.
+//
+// Usage:
+//   lock-health check [--dry-run] [--json]   the hourly run (dry-run: no send, no state write)
+//   lock-health status                       readings and open problems, nothing sent
+//   lock-health preflight --property <name> [--unit <id>]
+//                                            live check of the locks one stay needs;
+//                                            exit 0 ready, 1 a problem, 2 can't tell
+//
+// Config: agent/local/config/lock-health.json (none = nothing to check).
+// State: data/lock-health-state.json. Kill switch: data/.lock-health-off.
+
+const fs = require("node:fs");
+const path = require("node:path");
+const { spawnSync } = require("node:child_process");
+const { loadEnv } = require("../lib/load-env.js");
+const { installTools } = require("../lib/root.cjs");
+const { localConfig, instance } = require("../lib/instance.cjs");
+const { firestore, registry, resolveProperty, publicSlugOf } = require("../lib/rental-ledger.js");
+const { TTLockClient, borrowedToken, DEFAULT_BASE } = require("../lib/ttlock.js");
+const lh = require("../lib/lock-health.js");
+loadEnv();
+
+const CFG = localConfig("lock-health", { ttlock: null, schlage: null });
+const SETTINGS = lh.settings(CFG);
+const STATE = process.env.JORI_LOCK_HEALTH_STATE || installTools("data/lock-health-state.json");
+const OFF = installTools("data/.lock-health-off");
+const SEND = path.join(__dirname, "jori-send-curl");
+const TZ = instance().tz;
+const PROBE_GAP_MS = 1500;   // between live probes, so this never keeps a gateway busy itself
+
+const argv = process.argv.slice(2);
+const cmd = argv[0] && !argv[0].startsWith("--") ? argv[0] : "check";
+const has = (f) => argv.includes(f);
+const val = (f) => { const i = argv.indexOf(f); return i >= 0 ? argv[i + 1] : undefined; };
+const DRY = has("--dry-run") || cmd === "status";
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const log = (s) => console.error(`${new Date().toISOString()} lock-health: ${s}`);
+
+function readState() {
+  try { return JSON.parse(fs.readFileSync(STATE, "utf8")) || {}; } catch { return {}; }
+}
+function writeState(s) {
+  fs.mkdirSync(path.dirname(STATE), { recursive: true });
+  const tmp = `${STATE}.tmp${process.pid}`;
+  fs.writeFileSync(tmp, JSON.stringify(s, null, 2) + "\n");
+  fs.renameSync(tmp, STATE);
+}
+
+// ── TTLock ─────────────────────────────────────────────────────────────────
+
+/** lockId → [{property, unit}], from the hub's stored assignments, else this installation's seed copy. */
+function ttlockUnits(availability) {
+  const map = new Map();
+  const add = (id, property, unit) => {
+    if (!map.has(id)) map.set(id, []);
+    map.get(id).push({ property, unit });
+  };
+  const covered = new Set();
+  for (const d of availability || []) {
+    for (const [unit, u] of Object.entries(d.units || {})) {
+      const locks = Array.isArray(u?.locks) ? u.locks.filter((l) => typeof l?.lockId === "number") : [];
+      if (!locks.length) continue;
+      covered.add(`${d.id}|${unit}`);
+      for (const l of locks) add(l.lockId, d.id, unit);
+    }
+  }
+  for (const [property, units] of Object.entries(CFG.ttlock?.unit_locks || {})) {
+    for (const [unit, ids] of Object.entries(units)) {
+      if (covered.has(`${property}|${unit}`)) continue;
+      for (const id of ids) add(Number(id), property, unit);
+    }
+  }
+  return map;
+}
+
+/**
+ * Readings for every TTLock lock on the account. Returns { readings, unread }
+ * where `unread` names the provider when the account could not be read at all.
+ */
+async function ttlockReadings({ db, availability, state, needKeys, forceKeys, nowMs }) {
+  const t = CFG.ttlock;
+  if (!t) return { readings: [], unread: [] };
+  const clientId = t.client_id_env ? process.env[t.client_id_env] : null;
+  if (!clientId) {
+    log(`TTLock half off: no client id (lock-health.json ttlock.client_id_env${t.client_id_env ? ` = ${t.client_id_env}, not set in .env` : " unset"})`);
+    // Off is not "all fine": anything already open stays open rather than "recovering".
+    return { readings: [], unread: ["provider:ttlock"] };
+  }
+  const fail = (error) => ({
+    readings: [{ key: "provider:ttlock", provider: "ttlock", name: "TTLock account", property: null, units: [], error }],
+    unread: ["provider:ttlock"],
+  });
+  let client;
+  try {
+    const tok = await borrowedToken(db, t.token_doc, nowMs);
+    if (tok.error) return fail(tok.error);
+    client = new TTLockClient({ clientId, accessToken: tok.accessToken, base: (t.api_base_env && process.env[t.api_base_env]) || DEFAULT_BASE });
+  } catch (e) { return fail(e.message); }
+
+  let locks, gateways;
+  try {
+    [locks, gateways] = await Promise.all([client.listLocks(), client.listGateways()]);
+  } catch (e) { return fail(e.message); }
+
+  const gwById = new Map(gateways.map((g) => [g.gatewayId, g]));
+  const units = ttlockUnits(availability);
+  state.probes = state.probes || {};
+  state.last_ops = state.last_ops || {};
+  const readings = [];
+  let probed = 0;
+  for (const l of locks) {
+    const key = `ttlock:${l.lockId}`;
+    const where = units.get(l.lockId) || [];
+    const r = {
+      key, provider: "ttlock", name: l.lockAlias || `Lock ${l.lockId}`,
+      property: where[0]?.property || null, units: where.map((w) => w.unit),
+      battery: Number.isFinite(l.electricQuantity) ? l.electricQuantity : null,
+      has_gateway: l.hasGateway === 1 || l.hasGateway === true,
+      gateway: null, probe: null, last_op_at: state.last_ops[key] || null,
+    };
+    if (r.has_gateway) {
+      try {
+        const paired = await client.gatewaysForLock(l.lockId);
+        const known = paired.map((p) => gwById.get(p.gatewayId) || { gatewayId: p.gatewayId, gatewayName: p.gatewayName });
+        const online = known.find((g) => g.isOnline === 1);
+        const g = online || known[0];
+        if (g) r.gateway = { id: g.gatewayId, name: g.gatewayName || null, online: online ? true : (g.isOnline === 0 ? false : null) };
+      } catch (e) { r.gateway = null; log(`${r.name}: gateway lookup failed: ${e.message}`); }
+    }
+    const reachableGateway = r.has_gateway && r.gateway?.online !== false;
+    if (reachableGateway && (forceKeys.has(key) || lh.shouldProbe(key, state, { needed: needKeys.has(key), nowMs, cfg: SETTINGS }))) {
+      if (probed++) await sleep(PROBE_GAP_MS);
+      const at = new Date().toISOString();
+      try {
+        await client.queryOpenState(l.lockId);
+        state.probes[key] = { at, ok: true };
+      } catch (e) {
+        state.probes[key] = { at, ok: false, errcode: e.errcode ?? null, errmsg: e.errmsg || e.message };
+      }
+      try {
+        const recs = await client.lockRecords(l.lockId, nowMs - 30 * 86400000, nowMs);
+        const okTimes = recs.filter((x) => x.success === 1 && Number.isFinite(x.lockDate)).map((x) => x.lockDate);
+        if (okTimes.length) state.last_ops[key] = new Date(Math.max(...okTimes)).toISOString();
+        r.last_op_at = state.last_ops[key] || null;
+      } catch (e) { log(`${r.name}: records read failed: ${e.message}`); }
+    }
+    // The last probe stands until the next one: a lock probed six hours ago and
+    // fine is still taken as fine; one with an open problem is probed every run.
+    r.probe = reachableGateway ? state.probes[key] || null : null;
+    readings.push(r);
+  }
+  return { readings, unread: [] };
+}
+
+// ── Schlage ────────────────────────────────────────────────────────────────
+
+function schlageReadings() {
+  const s = CFG.schlage;
+  if (!s || !Array.isArray(s.locks) || !s.locks.length) return { readings: [], unread: [] };
+  if (!s.command) return { readings: [], unread: ["provider:schlage"] };
+  const bin = path.isAbsolute(s.command) ? s.command : installTools(s.command);
+  const args = ["status", "--json", ...s.locks.flatMap((l) => ["--lock", l.key])];
+  const r = spawnSync(bin, args, { encoding: "utf8", timeout: 180000 });
+  let rows = null;
+  try { rows = JSON.parse((r.stdout || "").trim().split("\n").pop()); } catch { /* below */ }
+  if (r.status !== 0 || !Array.isArray(rows)) {
+    const error = ((r.stderr || "").trim().split("\n").pop() || `exit ${r.status}`).slice(0, 200);
+    return {
+      readings: [{ key: "provider:schlage", provider: "schlage", name: "Schlage account", property: null, units: [], error }],
+      unread: ["provider:schlage"],
+    };
+  }
+  const byKey = new Map(rows.map((x) => [x.key, x]));
+  const readings = s.locks.map((l) => {
+    const x = byKey.get(l.key) || { ok: false, error: "no reading returned" };
+    return {
+      key: `schlage:${l.key}`, provider: "schlage", name: l.name || x.name || l.key,
+      property: l.property || null, units: l.unit ? [l.unit] : [],
+      ...(x.ok ? { online: x.connected === true ? true : x.connected === false ? false : null,
+        battery: Number.isFinite(x.battery_level) ? x.battery_level : null, battery_low: x.battery_low === true,
+        last_op_at: x.last_operation_at || null } : { error: x.error || "unreadable" }),
+    };
+  });
+  return { readings, unread: [] };
+}
+
+// ── Assembly ───────────────────────────────────────────────────────────────
+
+async function propertyNames() {
+  const names = localConfig("rentals", { stay_calendar: {} }).stay_calendar?.canonical_names || {};
+  const out = {};
+  try {
+    for (const p of (await registry()).properties) if (p.publicSlug) out[p.publicSlug] = names[p.id] || p.name || p.publicSlug;
+  } catch { /* names are a nicety */ }
+  return out;
+}
+
+/** Everything one run needs, gathered. `forceKeys` are probed live regardless of age. */
+async function gather({ state, nowMs, needFilter = null, forceAll = false }) {
+  const db = firestore();
+  const [leases, tenants, availability] = await Promise.all([db.list("leases"), db.list("tenants"), db.list("unit-availability")]);
+  let needs = lh.upcomingNeeds({ leases, tenants, nowMs, cfg: SETTINGS, tz: TZ });
+  if (needFilter) needs = [needFilter];
+
+  // Which lock keys the needs touch is only known once the locks are listed,
+  // so the TTLock seed map stands in for the probe decision.
+  const units = ttlockUnits(availability);
+  const needKeys = new Set();
+  for (const n of needs) for (const [id, ws] of units) {
+    if (ws.some((w) => w.property === n.property && (!n.unit || w.unit === n.unit))) needKeys.add(`ttlock:${id}`);
+  }
+  const forceKeys = forceAll ? needKeys : new Set();
+
+  const tt = await ttlockReadings({ db, availability, state, needKeys, forceKeys, nowMs });
+  const sc = schlageReadings();
+  const readings = [...tt.readings, ...sc.readings];
+  return { readings, needs, unread: new Set([...tt.unread, ...sc.unread]) };
+}
+
+function send(text, push) {
+  const args = ["--channel", "system", "--skip-precheck", "--intent", "lock-health", "--evidence-as-of", "live"];
+  if (push) args.push("--push", "--push-body", push);
+  const r = spawnSync(SEND, [...args, text], { encoding: "utf8", timeout: 60000 });
+  if (r.status !== 0) throw new Error(`jori-send-curl exited ${r.status}: ${(r.stderr || "").trim().slice(0, 200)}`);
+}
+
+function printReadings(readings, state, names) {
+  for (const r of readings) {
+    const prop = r.property ? `${names[r.property] || r.property} · ` : "";
+    const bits = r.error ? [`ERROR ${r.error}`] : [
+      r.provider === "schlage" ? `online=${r.online}` : `gateway=${r.has_gateway ? (r.gateway?.online === false ? "offline" : r.gateway?.name || "yes") : "none"}`,
+      r.probe ? `probe=${r.probe.ok ? "ok" : `err ${r.probe.errcode}`} @${r.probe.at.slice(0, 16)}Z` : null,
+      r.battery != null ? `battery=${r.battery}%` : null,
+      r.last_op_at ? `last op ${r.last_op_at.slice(0, 16)}Z` : null,
+    ].filter(Boolean);
+    const probs = lh.conditionsOf(r, SETTINGS);
+    console.log(`${prop}${r.name}: ${bits.join(" ")}${probs.length ? `  ⚠ ${probs.join(",")}` : ""}`);
+  }
+  const open = Object.values(state.conditions || {});
+  if (open.length) console.log(`\nopen: ${open.map((c) => `${c.name} ${c.kind}${c.alerted_at ? " (alerted)" : ` (seen ${c.runs})`}`).join("; ")}`);
+}
+
+async function cmdCheck() {
+  const nowMs = Date.now();
+  const state = readState();
+  const prevConditions = state.conditions || {};
+  const { readings, needs, unread } = await gather({ state, nowMs });
+  const names = await propertyNames();
+  const byLock = lh.needsByLock(needs, readings);
+  const planned = lh.plan({ readings, state, needs: byLock, nowMs, cfg: SETTINGS, unread });
+  const msg = lh.compose({ alerts: planned.alerts, recoveries: planned.recoveries, propertyNames: names, tz: TZ });
+
+  if (has("--json")) console.log(JSON.stringify({ readings: readings.length, needs: needs.length, alerts: planned.alerts.length, recoveries: planned.recoveries.length, message: msg?.text || null }));
+  if (DRY) {
+    printReadings(readings, planned.state, names);
+    if (msg) console.log(`\nwould send${msg.push ? " (push)" : ""}:\n${msg.text}`);
+    return;
+  }
+  let next = planned.state;
+  if (msg) {
+    try {
+      send(msg.text, msg.push);
+      log(`sent: ${planned.alerts.length} alert(s), ${planned.recoveries.length} recovery(ies)`);
+    } catch (e) {
+      // Not sent, so not said: the new alerts and the recoveries stay pending
+      // and the next run tries again.
+      log(`send FAILED, will retry next run: ${e.message}`);
+      next = { ...next, conditions: { ...next.conditions } };
+      for (const a of planned.alerts) next.conditions[`${a.lock}|${a.kind}`].alerted_at = null;
+      for (const r of planned.recoveries) next.conditions[`${r.lock}|${r.kind}`] = prevConditions[`${r.lock}|${r.kind}`];
+      process.exitCode = 1;
+    }
+  }
+  writeState(next);
+  log(`${readings.length} locks, ${needs.length} upcoming needs, ${Object.keys(next.conditions).length} open condition(s)`);
+}
+
+async function cmdPreflight() {
+  const q = val("--property");
+  if (!q) { console.error("usage: lock-health preflight --property <name> [--unit <id>]"); process.exit(2); }
+  let slug = q;
+  try { const p = resolveProperty((await registry()).properties, q); if (p && publicSlugOf(p)) slug = publicSlugOf(p); } catch { /* a raw slug still works */ }
+  const need = { property: slug, unit: val("--unit") || null, atMs: null, why: "preflight" };
+  const state = readState();
+  const { readings } = await gather({ state, nowMs: Date.now(), needFilter: need, forceAll: true });
+  if (!DRY) writeState({ ...readState(), probes: state.probes, last_ops: state.last_ops });  // keep the fresh probes; conditions are the hourly run's
+  const v = lh.preflightVerdict({ need, readings, cfg: SETTINGS });
+  if (has("--json")) console.log(JSON.stringify(v));
+  else if (!v.locks.length) console.log(`No locks known for ${q}${need.unit ? ` unit ${need.unit}` : ""}.`);
+  else for (const l of v.locks) console.log(`${l.problems.length ? "✗" : "✓"} ${l.name}${l.problems.length ? `: ${l.problems.join("; ")}` : ""}`);
+  // 2 = can't tell: no lock known for that stay (which is also what an
+  // unreadable provider looks like, since its locks are then not listed).
+  process.exitCode = !v.locks.length ? 2 : v.ok ? 0 : 1;
+}
+
+async function main() {
+  if (fs.existsSync(OFF) && cmd === "check") { log("kill switch present, skipping"); return; }
+  if (!CFG.ttlock && !CFG.schlage) { log("no locks configured (agent/local/config/lock-health.json), nothing to do"); return; }
+  if (cmd === "check" || cmd === "status") return cmdCheck();
+  if (cmd === "preflight") return cmdPreflight();
+  console.error("usage: lock-health check|status|preflight (see the header)");
+  process.exitCode = 2;
+}
+
+main().catch((e) => { log(`FAILED: ${e.message}`); process.exitCode = 1; });

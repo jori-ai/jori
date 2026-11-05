@@ -124,6 +124,13 @@ function personCandidates(guests) {
   return [...out.values()];
 }
 
+/** Names the call may mention (lib/call-vocabulary.mjs), so the model can fix Zoom's mishearings of them. */
+function vocabulary(candidates) {
+  let ws = null;
+  try { ws = require("../lib/wiki-store.js"); } catch {}
+  try { return CL.vocabularyForCall(candidates, ws); } finally { try { ws && ws.closeDb(); } catch {} }
+}
+
 async function readLog(prompt, ctx) {
   const { runToollessDetailed, parseModelJson } = await import("../lib/jev-claude.mjs");
   const { MODELS } = require("../lib/models.cjs");
@@ -247,7 +254,7 @@ async function cmdSync() {
     const ctx = { rec, candidates, hasContent: !!content };
     let got = null;
     try {
-      got = await readLog(CL.logPrompt(rec, content, candidates, tz), ctx);
+      got = await readLog(CL.logPrompt(rec, content, candidates, tz, content ? vocabulary(candidates) : []), ctx);
     } catch (e) {
       const attempts = ((prev && prev.attempts) || 0) + (e.transient ? 0 : 1);
       say(`ERROR ${base.local_date} call with ${who}: ${e.message} (${e.transient ? "no model answered" : `attempt ${attempts}`})`);

@@ -265,7 +265,7 @@ struct SelfImproveFeedView: View {
                 .foregroundStyle(JoriTheme.staff)
             Text("Nothing to improve yet")
                 .font(JoriTheme.display(22))
-            Text("When Jori proposes or applies a change to itself, it appears here. Open a card’s menu to implement, skip, or talk it through.")
+            Text("When \(Install.displayName) proposes or applies a self-improvement, the change appears here. Open a card’s menu to implement, skip, or talk it through.")
                 .font(.callout)
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)

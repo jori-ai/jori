@@ -18,6 +18,7 @@ _INSTANCE_ENV = {
     "owner_id": "JORI_OWNER_ID",
     "owner_email": "JORI_OWNER_EMAIL",
     "tz": "JORI_TZ",
+    "assistant_name": "JORI_ASSISTANT_NAME",
 }
 
 
@@ -44,8 +45,13 @@ def _read(path):
         return None
 
 
+def assistant_name():
+    """What the assistant calls itself (instance.json `assistant_name`)."""
+    return instance()["assistant_name"]
+
+
 def instance():
-    out = {"owner_name": "the user", "owner_id": "", "owner_email": "", "tz": ""}
+    out = {"owner_name": "the user", "owner_id": "", "owner_email": "", "tz": "", "assistant_name": "Jori"}  # control-scan-ok: the default, as in lib/instance.cjs
     f = _read(os.path.join(local_dir(), "instance.json")) or {}
     for k, env in _INSTANCE_ENV.items():
         if f.get(k) not in (None, ""):

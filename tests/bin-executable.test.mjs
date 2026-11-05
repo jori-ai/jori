@@ -26,9 +26,11 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 
 const REPO = path.resolve(import.meta.dirname, "..");
 const BIN = path.join(REPO, "bin");
@@ -103,3 +105,121 @@ test("the guard can actually see the bin directory", () => {
   assert.ok(modes.size > 50, `expected many tracked files under bin, saw ${modes.size}`);
   assert.ok(fs.existsSync(BIN), "bin should exist");
 });
+
+// The Supabase MCP server reads its token from the environment once, at spawn.
+// Every MCP config starts it through bin/supabase-mcp, which hands it a current
+// token (bin/supabase-token's OAuth app, else the environment's own), and
+// bin/mcp-manifest-check fails on a config that starts it directly.
+{
+  const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+  const CHECK = path.join(REPO, "bin/mcp-manifest-check");
+  const SHIPPED = [
+    "agent/supervisor/chat-mcp-config.json",
+    "agent/ops-light-agent/.mcp.json",
+    "agent/ops-haiku-agent/.mcp.json",
+    "examples/mcp/ops-agent.mcp.example.json",
+  ];
+  const DIRECT = {
+    command: "npx",
+    args: ["-y", "@supabase/mcp-server-supabase@latest", "--project-ref=${JORI_SUPABASE_PROJECT}"],
+    env: { SUPABASE_ACCESS_TOKEN: "${SUPABASE_ACCESS_TOKEN}" },
+  };
+
+  // An installation root holding only what the check reads: the shipped MCP
+  // configs, an empty job routing, a local dir, and the kernel lib it loads.
+  function fixture() {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "supabase-mcp-launch-"));
+    fs.symlinkSync(path.join(REPO, "lib"), path.join(root, "lib"));
+    const write = (rel, obj) => {
+      fs.mkdirSync(path.dirname(path.join(root, rel)), { recursive: true });
+      fs.writeFileSync(path.join(root, rel), typeof obj === "string" ? obj : JSON.stringify(obj, null, 2));
+    };
+    write("agent/config/job-routing.json", { jobs: {} });
+    fs.mkdirSync(path.join(root, "agent/local"), { recursive: true });
+    for (const rel of SHIPPED) write(rel, fs.readFileSync(path.join(REPO, rel), "utf8"));
+    return { root, write };
+  }
+
+  function check(root, ...args) {
+    const r = spawnSync(process.execPath, [CHECK, ...args], {
+      encoding: "utf8",
+      env: { ...process.env, JORI_HOME: root, JORI_LOCAL_DIR: path.join(root, "agent/local"), JORI_NO_PLUGINS: "1" },
+    });
+    return { code: r.status, out: r.stdout + r.stderr };
+  }
+
+  test("the shipped MCP configs start the Supabase server through bin/supabase-mcp", () => {
+    for (const rel of SHIPPED) {
+      const servers = JSON.parse(fs.readFileSync(path.join(REPO, rel), "utf8")).mcpServers;
+      const supa = Object.entries(servers).filter(([, s]) => /supabase/.test(`${s.command} ${(s.args || []).join(" ")}`)); // lang-regex-ok: a command line
+      assert.ok(supa.length, `${rel} has a Supabase server`);
+      for (const [name, s] of supa) {
+        assert.equal(s.command, "${JORI_HOME}/bin/supabase-mcp", `${rel} ${name}`);
+        assert.ok(!s.env?.SUPABASE_ACCESS_TOKEN, `${rel} ${name} must not pin the environment's token`);
+      }
+    }
+    const { root } = fixture();
+    const r = check(root);
+    assert.equal(r.code, 0, r.out);
+  });
+
+  test("a config that starts @supabase/mcp-server-supabase directly is a hard error", () => {
+    const { root, write } = fixture();
+    write("agent/ops-agent/.mcp.json", { mcpServers: { "supabase-x": DIRECT } });
+    const r = check(root);
+    assert.equal(r.code, 1, r.out);
+    assert.match(r.out, /agent\/ops-agent\/\.mcp\.json: "supabase-x" starts @supabase\/mcp-server-supabase directly/); // lang-regex-ok: the check's own output
+    const j = JSON.parse(check(root, "--json").out);
+    assert.equal(j.hard_errors.length, 1);
+  });
+
+  test("the agent dir's own config and the installation's local MCP configs are checked too", () => {
+    const { root, write } = fixture();
+    write("agent/.mcp.json", { mcpServers: { db: DIRECT } });
+    write("agent/local/mcp/chat-mcp-config.json", { mcpServers: { other: { command: "npx", args: ["-y", "@supabase/mcp-server-supabase@0.15.0"] } } });
+    const j = JSON.parse(check(root, "--json").out);
+    assert.deepEqual(j.hard_errors.map((e) => e.split(":")[0]).sort(), ["agent/.mcp.json", "agent/local/mcp/chat-mcp-config.json"]);
+  });
+
+  // The wrapper, with node and a stand-in npx that reports what it was given.
+  function wrapper(env) {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "supabase-mcp-bin-"));
+    fs.symlinkSync(process.execPath, path.join(dir, "node"));
+    fs.writeFileSync(path.join(dir, "npx"), '#!/bin/sh\necho "token=$SUPABASE_ACCESS_TOKEN args=$*"\n', { mode: 0o755 });
+    const local = fs.mkdtempSync(path.join(os.tmpdir(), "supabase-mcp-local-"));
+    const base = { ...process.env, JORI_NODE: path.join(dir, "node"), JORI_LOCAL_DIR: local };
+    delete base.SUPABASE_OAUTH_CLIENT_ID;
+    delete base.SUPABASE_ACCESS_TOKEN;
+    const r = spawnSync(path.join(REPO, "bin/supabase-mcp"), ["--project-ref=abc"], { encoding: "utf8", env: { ...base, ...env } });
+    return { code: r.status, out: r.stdout, err: r.stderr };
+  }
+
+  test("without an OAuth app the wrapper passes the environment's token through", () => {
+    const r = wrapper({ SUPABASE_ACCESS_TOKEN: "env-token" });
+    assert.equal(r.code, 0, r.err);
+    assert.equal(r.out.trim(), "token=env-token args=-y @supabase/mcp-server-supabase@latest --project-ref=abc");
+  });
+
+  test("with no OAuth app and no token the wrapper refuses to start the server", () => {
+    const r = wrapper({});
+    assert.equal(r.code, 1);
+    assert.equal(r.out, "", "the server is not started");
+    assert.match(r.err, /no token/); // lang-regex-ok: the wrapper's own error line
+  });
+
+  test("supabase-token --configured says whether an OAuth app is configured, offline", () => {
+    const local = fs.mkdtempSync(path.join(os.tmpdir(), "supabase-token-local-"));
+    const run = (env) => {
+      const e = { ...process.env, JORI_LOCAL_DIR: local, ...env };
+      if (!("SUPABASE_OAUTH_CLIENT_ID" in env)) delete e.SUPABASE_OAUTH_CLIENT_ID;
+      return spawnSync(process.execPath, [path.join(REPO, "bin/supabase-token"), "--configured"], { encoding: "utf8", env: e });
+    };
+    assert.equal(run({}).status, 1);
+    assert.equal(run({ SUPABASE_OAUTH_CLIENT_ID: "00000000-0000-0000-0000-000000000000" }).status, 0);
+    fs.mkdirSync(path.join(local, "supabase-oauth"));
+    fs.writeFileSync(path.join(local, "supabase-oauth/app.json"), JSON.stringify({ client_id: "00000000-0000-0000-0000-000000000000" }));
+    const r = run({});
+    assert.equal(r.status, 0);
+    assert.equal(r.stdout, "", "prints nothing");
+  });
+}

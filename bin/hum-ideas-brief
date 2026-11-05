@@ -8,23 +8,49 @@
 // a card or a chat answer, and which ideas are too big for one unattended run
 // and so need the user's call.
 //
+// An idea the user already answered in the chat is not "being asked": hum-answer
+// logs the reply to hum-responses.jsonl under lane hum_improvement:<id>, but the
+// ledger stays "proposed" until hum-idea-decide records what the answer meant.
+// Those are listed apart, as answered and waiting to be acted on. Rows that are
+// not ideas (no status: a resolved question that landed in the ledger) are skipped.
+//
 // Usage: hum-ideas-brief [--json] [--days N]   (default 7)
 // Env (tests): HUM_IDEAS_FILE.
 
 import fs from "node:fs";
 import { fileURLToPath } from "node:url";
 import { loadLatest, routeFor } from "../lib/hum-ideas.mjs";
+import { readAllResponses } from "../lib/hum-responses.mjs";
 
-export function brief(ideas, now = Date.now(), days = 7) {
+const ANSWER_LANE = "hum_improvement:";
+
+/** The user's latest answer to each hum improvement question, by idea id. */
+export function answersById(responses) {
+  const out = new Map();
+  for (const r of responses || []) {
+    const lane = String(r?.lane || "");
+    if (r?.disposition !== "answered" || !lane.startsWith(ANSWER_LANE)) continue;
+    out.set(lane.slice(ANSWER_LANE.length), { at: r.ts || null, reply: String(r.reply_text || "") });
+  }
+  return out;
+}
+
+const isIdea = (i) => i && i.consumed !== true && typeof i.status === "string";
+
+export function brief(allIdeas, now = Date.now(), days = 7, answers = new Map()) {
+  const ideas = (allIdeas || []).filter(isIdea);
   const since = now - days * 86400000;
   const ts = (i) => Date.parse(i.applied_at || i.reconciled_at || i.retired_at || "");
   const line = (i) => ({ id: i.id, title: i.title, risk: i.risk, effort: i.effort, scope: i.scope, proposed_at: i.proposed_at || null, change: i.proposed_change || null });
   const landed = ideas.filter((i) => i.status === "applied" && ts(i) >= since).map(line);
   const big = ideas.filter((i) => routeFor(i) === "weekly_email").map(line);
-  const asking = ideas.filter((i) => routeFor(i) === "ask_in_chat").map(line);
+  const asked = ideas.filter((i) => routeFor(i) === "ask_in_chat");
+  const asking = asked.filter((i) => !answers.has(i.id)).map(line);
+  const answered = asked.filter((i) => answers.has(i.id))
+    .map((i) => ({ ...line(i), answered_at: answers.get(i.id).at, answer: answers.get(i.id).reply }));
   const approved = ideas.filter((i) => routeFor(i) === "build").map(line);
   const cards = ideas.filter((i) => i.status === "awaiting_approval").map(line);
-  return { window_days: days, landed, structural: big, asking_in_chat: asking, approved_waiting_to_build: approved, cards_waiting: cards };
+  return { window_days: days, landed, structural: big, asking_in_chat: asking, answered_not_acted_on: answered, approved_waiting_to_build: approved, cards_waiting: cards };
 }
 
 export function text(b) {
@@ -34,6 +60,7 @@ export function text(b) {
   out.push(n(b.landed) ? `Landed (${n(b.landed)}): ${titles(b.landed)}` : "Landed: nothing this week.");
   if (n(b.cards_waiting)) out.push(`Waiting on a card to sign (${n(b.cards_waiting)}): ${titles(b.cards_waiting)}`);
   if (n(b.asking_in_chat)) out.push(`Asked or about to be asked in the hum chat (${n(b.asking_in_chat)}): ${titles(b.asking_in_chat)}`);
+  if (n(b.answered_not_acted_on || [])) out.push(`You answered in the chat; the answer is not yet recorded on the idea (${n(b.answered_not_acted_on)}): ${titles(b.answered_not_acted_on)}`);
   if (n(b.approved_waiting_to_build)) out.push(`You said yes; waiting for the next build run (${n(b.approved_waiting_to_build)}): ${titles(b.approved_waiting_to_build)}`);
   if (n(b.structural)) {
     out.push(`Bigger changes that need your call (${n(b.structural)}; too large to build unattended):`);
@@ -45,6 +72,6 @@ export function text(b) {
 if (process.argv[1] && fs.realpathSync(process.argv[1]) === fileURLToPath(import.meta.url)) {
   const args = process.argv.slice(2);
   const di = args.indexOf("--days");
-  const b = brief(loadLatest(), Date.now(), di >= 0 ? Number(args[di + 1]) || 7 : 7);
+  const b = brief(loadLatest(), Date.now(), di >= 0 ? Number(args[di + 1]) || 7 : 7, answersById(readAllResponses()));
   console.log(args.includes("--json") ? JSON.stringify(b, null, 2) : text(b));
 }

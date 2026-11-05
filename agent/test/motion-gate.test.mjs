@@ -1,5 +1,6 @@
-// motion-gate.test.mjs — the mobile ping gate: classify motion, park non-urgent
-// alerts while moving, let urgent ones through, coalesce on flush.
+// motion-gate.test.mjs — the mobile ping gate: classify motion, SEND non-urgent
+// alerts while moving (so AirPods/CarPlay read them aloud) and note them for one
+// re-ping on stopping if still unread, let urgent ones through, coalesce on flush.
 //
 // Run: node --test agent/test/motion-gate.test.mjs
 //
@@ -16,7 +17,7 @@ process.env.JORI_PING_QUEUE = TMP_QUEUE;
 const { describe, it, beforeEach, after } = await import("node:test");
 const assert = (await import("node:assert/strict")).default;
 const { classifyMotion, TRANSIT_FRESH_MS, OPEN_VISIT_MAX_MS } = await import("../../lib/motion-state.mjs");
-const { holdPing, readQueue, writeQueue, partitionQueue, coalesce, MAX_HOLD_MS, MAX_QUEUE } =
+const { holdPing, readQueue, writeQueue, partitionQueue, coalesce, selectRepings, MAX_HOLD_MS, MAX_QUEUE } =
   await import("../../lib/ping-hold.mjs");
 const { sendApnsPush } = await import("../../lib/apns-push.mjs");
 
@@ -163,13 +164,23 @@ describe("sendApnsPush motion gate", () => {
     };
   }
 
-  it("parks a non-urgent ping while moving and never reaches APNs", async () => {
+  it("sends a non-urgent ping while moving and notes it for a re-ping (2026-11-05)", async () => {
+    // The old gate parked it until the user stopped, so AirPods and CarPlay
+    // never read anything aloud on the move.
     const spy = {};
-    const res = await sendApnsPush(mockSupabase(liveTransit("walking", MIN), spy), { body: "Falafel 80m away" });
-    assert.equal(res.held, true);
-    assert.equal(res.delivered, false);
-    assert.ok(!spy.reachedTokens, "gate returns before the token query");
-    assert.equal(readQueue().length, 1);
+    await sendApnsPush(mockSupabase(liveTransit("driving", MIN), spy), { body: "Falafel 80m away", messageId: "m1" });
+    assert.ok(spy.reachedTokens, "a moving user's push goes out now");
+    const q = readQueue();
+    assert.equal(q.length, 1);
+    assert.equal(q[0].messageId, "m1");
+    assert.ok(q[0].sent_at, "marked as already sent, so the flusher only re-pings");
+  });
+
+  it("queues no re-ping for a push with no message row to check", async () => {
+    const spy = {};
+    await sendApnsPush(mockSupabase(liveTransit("walking", MIN), spy), { body: "no row" });
+    assert.ok(spy.reachedTokens);
+    assert.equal(readQueue().length, 0);
   });
 
   it("lets an urgent ping through while moving — it gets announced aloud", async () => {
@@ -194,11 +205,31 @@ describe("sendApnsPush motion gate", () => {
     assert.equal(readQueue().length, 0);
   });
 
-  it("honours skipMotionGate so the flusher can deliver what it parked", async () => {
+  it("honours skipMotionGate so the flusher's re-ping is not queued again", async () => {
     const spy = {};
-    await sendApnsPush(mockSupabase(liveTransit("walking", MIN), spy), { body: "flushed", skipMotionGate: true });
+    await sendApnsPush(mockSupabase(liveTransit("walking", MIN), spy), { body: "flushed", messageId: "m1", skipMotionGate: true });
     assert.ok(spy.reachedTokens);
     assert.equal(readQueue().length, 0);
+  });
+});
+
+describe("selectRepings", () => {
+  const sent = [
+    { body: "unread", messageId: "a", sent_at: ago(MIN) },
+    { body: "read", messageId: "b", sent_at: ago(MIN) },
+    { body: "deleted", messageId: "c", sent_at: ago(MIN) },
+  ];
+
+  it("re-pings only a message still unread", () => {
+    const { reping, skipped } = selectRepings(sent, new Map([["a", false], ["b", true]]));
+    assert.deepEqual(reping.map((e) => e.body), ["unread"]);
+    assert.deepEqual(skipped.map((s) => s.reason), ["already read", "message gone"]);
+  });
+
+  it("costs no second buzz when the read state cannot be fetched", () => {
+    const { reping, skipped } = selectRepings(sent, null);
+    assert.equal(reping.length, 0);
+    assert.equal(skipped.length, 3);
   });
 });
 

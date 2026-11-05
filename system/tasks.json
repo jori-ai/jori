@@ -173,8 +173,8 @@
     },
     {
       "name": "nightly-review",
-      "schedule": "0 5 * * 2",
-      "schedule_human": "Weekly Tuesday at 5:00 AM — after the 4:00 AM daily summary it reads, moved from 3:00 AM on 2026-10-22 (launchd agent ai.claude.improvement-review, NOT cron — cron can't reach the in-session Max keychain; also runs on ephemeral Opus 5, not the webhook-dispatched ops supervisor, since 2026-07-28)",
+      "schedule": "0 5 * * 4",
+      "schedule_human": "Weekly Thursday at 5:00 AM — the morning after the weekly Claude allowance resets (Wednesday night), so the review and the planner it chains start the allowance week instead of ending it (moved from Tuesday on 2026-11-04, the user's decision); after the 4:00 AM daily summary it reads, moved from 3:00 AM on 2026-10-22 (launchd agent ai.claude.improvement-review, NOT cron — cron can't reach the in-session Max keychain; also runs on ephemeral Opus 5, not the webhook-dispatched ops supervisor, since 2026-07-28)",
       "scheduler": "launchd",
       "trigger_script": "agent/scripts/trigger-nightly-review.sh",
       "webhook_url": "http://localhost:9092",
@@ -191,8 +191,8 @@
     },
     {
       "name": "improvement-plan",
-      "schedule": "30 10 * * 2",
-      "schedule_human": "Chained by nightly-review on a clean exit; launchd agent ai.claude.improvement-plan (Tue 10:30 AM, past the review's 05:00 start plus both runs' caps) is a safety-net slot only, guarded against re-running on a stale report",
+      "schedule": "30 10 * * 4",
+      "schedule_human": "Chained by nightly-review on a clean exit; launchd agent ai.claude.improvement-plan (Thu 10:30 AM, past the review's 05:00 start plus both runs' caps) is a safety-net slot only, guarded against re-running on a stale report",
       "scheduler": "launchd",
       "trigger_script": "agent/scripts/trigger-improvement-plan.sh",
       "webhook_url": null,

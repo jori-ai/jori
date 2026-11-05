@@ -28,7 +28,7 @@ export default {
     const pm = path.join(home, "agent", "bin", "process-manager.mjs");
     if (!fs.existsSync(pm)) die(`process-manager not found at ${pm}`);
     if (!fs.existsSync(path.join(home, ".env"))) console.log(c.yellow("  no .env yet — run `jori init` first for a working setup"));
-    console.log(c.bold("Jori up") + c.dim(" — Ctrl-C to stop"));
+    console.log(c.bold("Jori up") + c.dim(" — Ctrl-C to stop"));  // control-scan-ok: the software's name
     console.log(c.dim(`  JORI_HOME: ${home}\n`));
     const child = spawn(process.execPath, [pm], {
       stdio: "inherit",

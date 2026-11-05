@@ -4,25 +4,22 @@
 //
 // Stdin: detector ask JSON (the `ASK_JSON` the trigger builds — detector output
 // plus ask_id / ask_key).
-// Stdout: {decision: "auto_confirm"|"escalate"|"ask", venue?, reasoning}
+// Stdout: {decision: "escalate"|"ask", reasoning}
 //
-//   auto_confirm — calendar event currently active whose title, location, OR
-//                  description names a candidate. Caller saves directly via
-//                  `location-confirm save`. No user ping. (2026-09-08: added
-//                  description — many ticket/order confirmation events carry
-//                  the venue name only in the description block, with no
-//                  location field set at all; requiring a location field is
-//                  the wrong lever when plenty of legitimate events never
-//                  carry one. This scans everything on the event before
-//                  giving up, not just the one field that happens to be
-//                  present.)
-//   escalate     — programmatic signal is weak but the dwell deserves a
-//                  smarter lookup. Caller writes the ask to a pending state
-//                  file and dispatches the ops-agent `location-confirm-resolve`
-//                  job, which checks calendar + recent conversation + wiki
-//                  memory before deciding to auto-confirm or to ask.
+//   escalate     — the ask has candidates. Caller runs the
+//                  `location-confirm-resolve` step, which checks calendar +
+//                  recent conversation + wiki memory before deciding to
+//                  auto-confirm or to ask. `reasoning` says whether a busy
+//                  calendar event overlaps the dwell.
 //   ask          — nothing more we can do here; fall through to the existing
-//                  Gemma-phrase + jori-send path.
+//                  Gemma-phrase + queue path.
+//
+// It never names a stop. Whether an event's title, location or description
+// names one of the candidates is a reading (Rule #0b), and a fragment match
+// gets it wrong: this step used to auto-confirm when any 4+-character piece of
+// a candidate's name appeared anywhere in the event's text, and a piece of one
+// word in a venue's name matched a different word in the event's address. The
+// resolver reads the event instead (its calendar tiers, then its model tail).
 //
 // Failure modes are non-blocking: any exception writes a `{decision: "ask"}`
 // object so the existing flow proceeds unchanged.
@@ -84,35 +81,7 @@ const active = events.filter(e => {
   return s < dwellEnd && en > dwellStart; // overlaps the actual dwell window, not the instant this script runs
 });
 
-function norm(s) {
-  return (s || "").toLowerCase().replace(/[^a-z0-9 ]/g, " ").replace(/\s+/g, " ").trim();
-}
-
-const STOP = new Set(["the","a","and","of","in","at","on","cafe","bar","restaurant","kitchen","co","grill","house","shop","store"]);
-function tokensOf(s) {
-  return norm(s).split(" ").filter(t => t.length >= 4 && !STOP.has(t));
-}
-
-for (const ev of active) {
-  // Check title, location, AND description — a ticket/order confirmation
-  // often names the venue only in its description block (2026-09-08).
-  const haystack = (norm(ev.summary) + " " + norm(ev.location) + " " + norm(ev.description)).trim();
-  if (!haystack) continue;
-  for (const cand of candidates) {
-    const toks = tokensOf(cand.name);
-    if (toks.length === 0) continue;
-    const hit = toks.some(t => haystack.includes(t));
-    if (hit) {
-      emit({
-        decision: "auto_confirm",
-        venue: cand.name,
-        reasoning: `calendar:"${ev.summary || ev.location || "event"}"~"${cand.name}"`,
-      });
-    }
-  }
-}
-
 emit({
   decision: "escalate",
-  reasoning: active.length > 0 ? "active_event_no_match" : "no_active_event",
+  reasoning: active.length > 0 ? "active_event" : "no_active_event",
 });

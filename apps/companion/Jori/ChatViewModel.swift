@@ -81,6 +81,9 @@ final class ChatViewModel: ObservableObject {
     /// own mount, and the focus request would land on an input bar that doesn't
     /// exist yet. Cleared once consumed.
     @Published var pendingReplyMessage: Message?
+    /// The user's messages that have waited 10 minutes with no sign of being
+    /// picked up (PickupWatch). The bubble shows a calm status line under each.
+    @Published private(set) var notPickedUp: Set<UUID> = []
 
     private static let draftKey = Install.key("messageDraft")
     private static let channelKey = Install.key("currentChannel")
@@ -95,13 +98,41 @@ final class ChatViewModel: ObservableObject {
     private var staleRetryTask: Task<Void, Never>?
     private var isLoadingMessages = false
     private let locationManager = LocationManager.shared
+    /// Watches this device's sent messages for a sign they were picked up,
+    /// without relying on the host to report its own outage.
+    private let pickupWatch: PickupWatch
 
     init() {
         self.supabase = SupabaseManager.shared
+        self.pickupWatch = PickupWatch(supabase: SupabaseManager.shared)
         let savedChannel = UserDefaults.standard.string(forKey: Self.channelKey)
             .flatMap(ChatChannel.init(rawValue:)) ?? .chat
         self.currentChannel = savedChannel
         self.messages = store.loadAll(channel: savedChannel.rawValue)
+        self.notPickedUp = pickupWatch.flagged
+        pickupWatch.onChange = { [weak self] flagged in
+            guard let self else { return }
+            self.notPickedUp = flagged
+            // The "working" dots would contradict the status line.
+            if let last = self.messages.last, flagged.contains(last.id) {
+                self.isWaitingForResponse = false
+            }
+        }
+    }
+
+    // MARK: - Pickup watch
+
+    func isNotPickedUp(_ id: UUID) -> Bool { notPickedUp.contains(id) }
+
+    /// App came to the front: re-check every message still waiting.
+    func pickupWatchForeground() {
+        Task { await pickupWatch.check() }
+    }
+
+    /// App went to the back: one last check, so a message that was picked up
+    /// does not leave its "not picked up" notification armed.
+    func pickupWatchBackground() {
+        pickupWatch.appDidEnterBackground()
     }
 
     /// Switch the active channel — persists the selection, swaps the visible
@@ -226,7 +257,8 @@ final class ChatViewModel: ObservableObject {
                 store.sync(with: restored, channel: channel)
             }
 
-            self.isWaitingForResponse = (messages.last?.isUser == true)
+            pickupWatch.observe(response)
+            self.isWaitingForResponse = messages.last.map { $0.isUser && !notPickedUp.contains($0.id) } ?? false
 
             // Fresh install (no cache): the 3-day backfill is historical —
             // mark ALL as read immediately so they don't trigger push
@@ -381,6 +413,7 @@ final class ChatViewModel: ObservableObject {
         await withTaskGroup(of: Void.self) { group in
             group.addTask { @MainActor in
                 for await insertion in insertions {
+                    self.pickupWatch.observe(record: insertion.record, columns: insertion.columns.map(\.name))
                     do {
                         let message = try insertion.decodeRecord(as: Message.self, decoder: JSONDecoder.supabaseDecoder)
                         // Guard: if the user switched channels mid-subscribe,
@@ -413,6 +446,9 @@ final class ChatViewModel: ObservableObject {
             }
             group.addTask { @MainActor in
                 for await update in updates {
+                    // An UPDATE is how a picked-up stamp would arrive on the
+                    // user's own row.
+                    self.pickupWatch.observe(record: update.record, columns: update.columns.map(\.name))
                     do {
                         let message = try update.decodeRecord(as: Message.self, decoder: JSONDecoder.supabaseDecoder)
                         guard message.channel == self.currentChannel.rawValue else { continue }
@@ -650,6 +686,9 @@ final class ChatViewModel: ObservableObject {
             }
             store.upsert(inserted)
             backupToCloud()
+            // A quiet send (a checklist tick, a dismissal) is settled in code
+            // on the host and gets no reply, so there is nothing to wait for.
+            if !quiet { pickupWatch.track(inserted) }
         } catch {
             self.error = "Failed to send message: \(error.localizedDescription)"
             self.isWaitingForResponse = false
@@ -1028,6 +1067,7 @@ final class ChatViewModel: ObservableObject {
             }
             store.upsert(inserted)
             backupToCloud()
+            pickupWatch.track(inserted)
         } catch {
             self.error = "Failed to send attachment: \(error.localizedDescription)"
             self.isWaitingForResponse = false

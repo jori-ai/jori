@@ -11,17 +11,30 @@ held until the user has answered or the answer window closes: 11am the user's ti
 that only came up after the email went out says that instead, and holds only the
 correction.
 
+**The evening pass (2026-10-21).** Once a day, around 22:52 the user's time, on a day with
+something on the calendar, the fixer reads the day so far, settles what the user's calendar
+and words already say, and asks at most two questions with a message that starts
+`📝 Before I write up your <Weekday>:` (the user: *"Why wait until 4:37am to ask this?"*).
+Those questions hold no email. The user's reply to one is handled the same way below: the
+run it starts records the answer and stops, and the morning's summary carries it. A reply
+after the summary went out is a correction like any other. Neither kind of question is
+sent in the user's quiet hours: one composed then is held until the user is up, and an evening
+one still held when the summary is built is dropped, never sent.
+
 ## When the user's reply is the answer
 
 1. Identify the date: `ls ~/Dev/jori/data/daily-summary-fix/` and
    `~/Dev/jori/bin/daily-summary-fix status <date>` (the one `awaiting_<owner_id>`
-   whose question matches what the user is answering).
+   whose question matches what the user is answering; an evening question is usually
+   about today, or yesterday once past midnight). Note its `phase` before step 2.
 2. `~/Dev/jori/bin/daily-summary-fix request <date> --answer "<the user's reply verbatim>"`.
    That queues the fixer (launchd `ai.claude.daily-summary-fix`); it applies the user's words,
    marks the questions they settle, and sends the summary once nothing is left open (or
    the window has closed). Several replies in a row are fine: pass each one.
-3. Ack in one short line, in the user's terms ("Got it, I'll finish Monday's summary and send
-   it over"). Do not say "queued", "dispatched" or similar.
+3. Ack in one short line, in the user's terms, chosen by that `phase`:
+   `after_summary` → "Got it, I'll finish Monday's summary and send it over";
+   `before_summary` (the summary isn't built yet) → "Got it, that'll be in the morning's
+   summary". Do not say "queued", "dispatched" or similar.
 
 ## When the user wants it now
 

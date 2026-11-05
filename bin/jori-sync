@@ -72,6 +72,12 @@ loud() { echo "[$TS $HOST] $*"; }
 # the kernel repo, and pulling the kernel first left the overlay seeing them as
 # local edits (a false drift conflict and a stash on every promotion).
 OVERLAY_GIT="${JORI_OVERLAY_GIT_DIR:-$REPO_ROOT/.overlay.git}"
+# Whatever the sync did: if the assistant's name or email changed (here or on
+# another machine, pulled just now), redeploy what copied it. It no-ops when
+# nothing changed and off the host, and runs detached (bin/identity-propagate).
+if [ -z "${JORI_SYNC_PASS:-}" ] && [ -x "$REPO_ROOT/bin/identity-propagate" ]; then
+  trap '"$REPO_ROOT/bin/identity-propagate" --detach >/dev/null 2>&1 || true' EXIT
+fi
 if [ -z "${JORI_SYNC_PASS:-}" ] && [ -f "$OVERLAY_GIT/HEAD" ]; then
   rc=0
   RUN=$(mktemp "${TMPDIR:-/tmp}/jori-sync.XXXXXX") && cp "$SELF" "$RUN" && chmod +x "$RUN" || RUN="$SELF"

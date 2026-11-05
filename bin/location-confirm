@@ -1381,7 +1381,7 @@ def main(argv=None) -> int:
     )
     sp_save_visit.add_argument("visit_id")
     sp_save_visit.add_argument("venue", help="the user's answer; saved only under the place name a model reads out of it")
-    sp_save_visit.add_argument("--guess", help="what Jori had guessed (records a drift row)")
+    sp_save_visit.add_argument("--guess", help=f"what {places_local.assistant_name()} had guessed (records a drift row)")
     sp_save_visit.add_argument("--signal", default="chat_correction",
                                help="drift signal: chat_correction | unknown_answered | late_confirm")
     sp_save_visit.add_argument("--source", default="findme_resolve")

@@ -126,7 +126,9 @@ if (contentReasons.length) {
 const landing = decideLanding({ files, before, risk, category, critic });
 if (landing.mode !== "auto") {
   const route = landing.mode === "card" ? "self-improve-request" : landing.redraft ? "redraft" : "none";
-  out({ applied: false, route, reasons: landing.reasons, lines: landing.lines, files: landing.fileCount });
+  // ownerCardable: a locked file that only the owner's own quoted chat request
+  // may change, on a card (self-improve-request --owner-quote, rubric schema v6).
+  out({ applied: false, route, reasons: landing.reasons, lines: landing.lines, files: landing.fileCount, ...(landing.ownerCardable ? { ownerCardable: true } : {}) });
   process.exit(landing.mode === "card" ? 3 : landing.redraft ? 8 : 64);
 }
 

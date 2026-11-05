@@ -7,7 +7,8 @@ import AppKit
 #endif
 
 /// Upcasts Jori pushes into communication notifications so iOS shows a sender
-/// avatar, Siri announces them on AirPods, and the user can reply by voice.
+/// avatar and treats them as messages, and records each one in AnnounceCache
+/// so the Intents extension can tell Siri what to read aloud.
 ///
 /// Three things must line up or the upcast silently fails and we fall back to a
 /// plain (non-announced) notification:
@@ -45,14 +46,35 @@ class NotificationService: UNNotificationServiceExtension {
             bestAttemptContent.interruptionLevel = .timeSensitive
         }
 
+        // What Siri reads aloud for this notification: the Intents extension
+        // answers Siri's INSearchForMessagesIntent (keyed by this request id)
+        // from this cache. See AnnounceCache.swift.
+        AnnounceCache.trace("nse received req=\(request.identifier) msg=\(request.content.userInfo["message_id"] as? String ?? "-") cat=\(request.content.categoryIdentifier) group=\(AnnounceCache.groupDescription)")
+        AnnounceCache.record(AnnouncedMessage(
+            requestId: request.identifier,
+            messageId: request.content.userInfo["message_id"] as? String,
+            title: bestAttemptContent.title,
+            body: bestAttemptContent.body,
+            date: Date()))
+        AnnounceCache.trace("nse cached=\(AnnounceCache.all().count)")
+
+        #if os(iOS)
+        // The message category: Reply action, CarPlay, and
+        // INSearchForMessagesIntent as its intent (MessageReply.swift).
+        if bestAttemptContent.categoryIdentifier.isEmpty {
+            bestAttemptContent.categoryIdentifier = "JORI_MESSAGE"
+        }
+        #endif
+
         // Synthetic sender — no real contact needed (confirmed by Apple's sample).
+        let avatar = Self.senderAvatar()
         let sender = INPerson(
             personHandle: INPersonHandle(value: "jori-assistant", type: .unknown),
             nameComponents: nil,
-            displayName: "Jori",
-            image: Self.senderAvatar(),
+            displayName: Self.assistantName,
+            image: avatar,
             contactIdentifier: nil,
-            customIdentifier: nil
+            customIdentifier: "jori-assistant"   // same person as JoriIntents' IntentHandler
         )
 
         let intent = INSendMessageIntent(
@@ -66,6 +88,10 @@ class NotificationService: UNNotificationServiceExtension {
             attachments: nil
         )
 
+        if #available(iOS 15.0, macOS 12.0, *), let avatar {
+            intent.setImage(avatar, forParameterNamed: \.sender)
+        }
+
         // Donate FIRST, then update inside the completion (Apple's order).
         let interaction = INInteraction(intent: intent, response: nil)
         interaction.direction = .incoming
@@ -73,14 +99,17 @@ class NotificationService: UNNotificationServiceExtension {
             guard let self = self else { return }
             if let error = error {
                 NSLog("[JoriNSE] donate failed: \(error.localizedDescription)")
+                AnnounceCache.trace("nse donate failed: \(error.localizedDescription)")
             }
             do {
                 let updated = try bestAttemptContent.updating(from: intent)
+                AnnounceCache.trace("nse upcast ok cat=\(updated.categoryIdentifier) level=\(updated.interruptionLevel.rawValue)")
                 self.deliver(updated)
             } catch {
                 // If this fires, the comm-notification upcast failed — almost
                 // always missing IntentsSupported or an unprovisioned entitlement.
                 NSLog("[JoriNSE] updating(from:) threw: \(error.localizedDescription)")
+                AnnounceCache.trace("nse upcast threw: \(error.localizedDescription)")
                 self.deliver(bestAttemptContent)
             }
         }
@@ -90,6 +119,15 @@ class NotificationService: UNNotificationServiceExtension {
     /// image is the containing app's `JoriAvatar` asset, so this extension needs
     /// no resources of its own: the .appex sits in the app's PlugIns folder
     /// (Jori.app/PlugIns on iOS, Jori.app/Contents/PlugIns on macOS).
+    /// What the assistant is called: this extension's own Info.plist key
+    /// (JoriDisplayName ← JORI_DISPLAY_NAME), the same one `Install.displayName`
+    /// reads in the targets that compile SupabaseConfig.swift.
+    private static var assistantName: String {
+        let v = ((Bundle.main.object(forInfoDictionaryKey: "JoriDisplayName") as? String) ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return v.isEmpty || v.contains("$(") ? "Jori" : v // control-scan-ok: the setting's default
+    }
+
     private static func senderAvatar() -> INImage? {
         var url = Bundle.main.bundleURL
         while url.pathExtension != "app" && url.pathComponents.count > 1 {
@@ -107,6 +145,7 @@ class NotificationService: UNNotificationServiceExtension {
     }
 
     override func serviceExtensionTimeWillExpire() {
+        AnnounceCache.trace("nse time expired")
         if let bestAttemptContent = bestAttemptContent {
             deliver(bestAttemptContent)
         }

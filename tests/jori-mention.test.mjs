@@ -44,6 +44,12 @@ test("the dispatch carries the instruction, context, and the in-thread reply com
   assert.match(t, /untrusted input/);
   assert.ok(t.includes("jori-send-curl --intent mention-reply"));
   assert.ok(t.includes('whatsapp-send --to "c1"'));
+  // the agent decides where the answer goes; posting in the thread still asks first and never carries the handle
+  assert.match(t, /Decide for yourself where the answer belongs/);
+  assert.match(t, /ask in the app and send nothing until they answer/);
+  assert.match(t, /never write "@/);
+  assert.doesNotMatch(t, /ONLY when/);
+  assert.match(dispatchText(mk({ channel: "unknown" })), /answer in the app only/);
   const slackCmd = replyCommand(mk({ channel: "slack", chat_id: "C1", thread_id: "171.2" }));
   assert.ok(slackCmd.includes('slack-send --to "C1"') && slackCmd.includes('--thread "171.2"'));
   assert.ok(replyCommand(mk({ channel: "imessage", is_group: true, chat_id: "chat42" })).includes('imsg send --chat "chat42"'));

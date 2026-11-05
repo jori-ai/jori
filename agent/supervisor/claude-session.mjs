@@ -15,6 +15,8 @@ import fs from "node:fs";
 import path from "node:path";
 import readline from "node:readline";
 import { createRequire } from "node:module";
+import { createRequire as _identityRequire } from "node:module";
+const instanceLib = _identityRequire(import.meta.url)("../../lib/instance.cjs");
 
 const { instance, localDir } = createRequire(import.meta.url)("../../lib/instance.cjs");
 const { REPO_ROOT } = createRequire(import.meta.url)("../../lib/root.cjs");
@@ -59,7 +61,10 @@ export const LOCAL_RULES_FILE = "local-rules.md";
  * alone), or "" when there are none.
  */
 export function readLocalRules({ localDir, role }) {
+  // First, who the agent is: its name and pronouns (lib/instance.cjs
+  // identityBlock, from instance.json). Never blocks the rules below.
   const parts = [];
+  try { parts.push(instanceLib.identityBlock()); } catch {}
   for (const name of role === "shared" ? ["shared.md"] : ["shared.md", `${role}.md`]) {
     let t;
     try { t = fs.readFileSync(path.join(localDir, name), "utf8"); } catch { continue; }

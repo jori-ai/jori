@@ -174,7 +174,7 @@ struct ContentView: View {
                 // Hangs are filed under the screen they happened on.
                 Responsiveness.setContext(new.title.lowercased())
             }
-            .confirmationDialog("Sign out of Jori?",
+            .confirmationDialog("Sign out of \(Install.displayName)?",
                                 isPresented: $confirmSignOut,
                                 titleVisibility: .visible) {
                 Button("Sign Out", role: .destructive) { onSignOut() }
@@ -404,7 +404,7 @@ struct ContentView: View {
             }
         }
         .listStyle(.sidebar)
-        .navigationTitle("Jori")
+        .navigationTitle(Install.displayName)
         .sensoryFeedback(.selection, trigger: destination)
     }
 
@@ -736,6 +736,10 @@ struct ContentView: View {
     private func thread(for m: Message) -> BubbleThread {
         var t = BubbleThread()
         if let parent = m.replyTo { t.quotedParent = viewModel.quotedParent(parent) }
+        if m.isUser {
+            t.notPickedUp = viewModel.isNotPickedUp(m.id)
+            return t
+        }
         guard m.isAssistant, m.metadata != nil else { return t }
         t.isOpenQuestion = viewModel.isOpenQuestion(m)
         if m.metadata?[Checklist.metadataKey] != nil {
@@ -1146,11 +1150,11 @@ struct ContentView: View {
     /// redraws only the field, not the whole conversation above it.
     private var composerField: some View {
         #if os(macOS)
-        ComposerField(placeholder: replyTarget == nil ? "Message Jori" : "Reply",
+        ComposerField(placeholder: replyTarget == nil ? "Message \(Install.displayName)" : "Reply",
                       isActive: $inputActive,
                       onSend: send)
         #else
-        ComposerField(placeholder: replyTarget == nil ? "Message Jori" : "Reply",
+        ComposerField(placeholder: replyTarget == nil ? "Message \(Install.displayName)" : "Reply",
                       focus: $isInputFocused,
                       isActive: $inputActive,
                       onSend: send)
@@ -1167,7 +1171,7 @@ struct ContentView: View {
                 .fill(JoriTheme.cobalt.opacity(0.06))
                 .overlay(shape.strokeBorder(JoriTheme.cobalt.opacity(0.7), style: StrokeStyle(lineWidth: 2, dash: [8, 6])))
                 .overlay {
-                    Label("Drop to send to Jori", systemImage: "arrow.down.doc")
+                    Label("Drop to send to \(Install.displayName)", systemImage: "arrow.down.doc")
                         .font(.headline)
                         .foregroundStyle(JoriTheme.cobalt)
                         .padding(.horizontal, 18)
@@ -1265,6 +1269,7 @@ struct ContentView: View {
                     }
                     viewModel.reconnectIfDisconnected()
                     viewModel.startCatchUpTimer()
+                    viewModel.pickupWatchForeground()
                 }
                 #endif
                 .onChange(of: view.scenePhase) { _, newPhase in
@@ -1276,6 +1281,7 @@ struct ContentView: View {
                         Task { await viewModel.loadMessages() }
                         viewModel.reconnectIfDisconnected()
                         viewModel.startCatchUpTimer()
+                        viewModel.pickupWatchForeground()
                         #endif
                         // Both platforms: come back to full-speed polling the moment
                         // we're foregrounded again.
@@ -1286,6 +1292,7 @@ struct ContentView: View {
                         Task { await badges.refresh() }
                     } else {
                         viewModel.stopCatchUpTimer()
+                        if newPhase == .background { viewModel.pickupWatchBackground() }
                         #if os(macOS)
                         // The window is frequently open-but-unfocused on the host
                         // rather than actually closed — keep polling for a pending
@@ -1565,6 +1572,9 @@ struct BubbleThread: Equatable {
     var checked: Set<String> = []
     var answer: String?
     var defaultApplied: String?
+    /// The user's own message, waiting 10 minutes with no sign it was picked
+    /// up (PickupWatch).
+    var notPickedUp = false
 }
 
 /// What a bubble can ask the conversation to do.
@@ -1685,6 +1695,11 @@ struct MessageBubble: View, Equatable {
                             .padding(.horizontal, 8)
                             .padding(.bottom, 2)
                     }
+
+                    if thread.notPickedUp {
+                        notPickedUpLine
+                            .transition(.opacity)
+                    }
                 }
 
                 if message.isAssistant { Spacer(minLength: 56) }
@@ -1718,6 +1733,17 @@ struct MessageBubble: View, Equatable {
                 actions.resolveParent(parentId)
             }
         }
+    }
+
+    /// Calm on purpose: it reports what the app can see (no sign of pickup),
+    /// not a diagnosis, and it leaves on its own when a sign arrives.
+    private var notPickedUpLine: some View {
+        Label("Not picked up yet — \(Install.displayName) may be down", systemImage: "clock.badge.exclamationmark")
+            .font(.caption2)
+            .foregroundStyle(.secondary)
+            .padding(.horizontal, 8)
+            .padding(.bottom, 2)
+            .accessibilityLabel("Not picked up yet. \(Install.displayName) may be down.")
     }
 
     // MARK: Pointer — quick actions on hover (Mac, iPad with a pointer)

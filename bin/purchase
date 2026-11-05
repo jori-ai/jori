@@ -372,7 +372,7 @@ async function pair() {
   await rest("purchase_pairing_codes", { method: "POST", prefer: "return=minimal",
     body: { code_hash: crypto.createHash("sha256").update(code).digest("hex"), expires_at: expires } });
   out({ code: `${code.slice(0, 4)}-${code.slice(4)}`, expires_at: expires,
-    how: "Jori app → menu → Pair Purchase Approval → enter this code (Face ID)." });
+    how: "Jori app → menu → Pair Purchase Approval → enter this code (Face ID)." });  // control-scan-ok: the software's name
 }
 
 // ── session (which merchants the shop Chrome is signed in to) ───────────────

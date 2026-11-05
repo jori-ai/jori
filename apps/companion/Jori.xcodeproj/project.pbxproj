@@ -16,6 +16,8 @@
 		AA000202 /* ChannelBadges.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB000202 /* ChannelBadges.swift */; };
 		AA000E01 /* DesignSystem.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB000E01 /* DesignSystem.swift */; };
 		AA000E02 /* Responsiveness.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB000E02 /* Responsiveness.swift */; };
+		AA000E03 /* PickupRules.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB000E03 /* PickupRules.swift */; };
+		AA000E04 /* PickupWatch.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB000E04 /* PickupWatch.swift */; };
 		AA000201 /* SelfImproveApprovalView.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB000201 /* SelfImproveApprovalView.swift */; };
 		AA000299 /* ChoicePrompt.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB000299 /* ChoicePrompt.swift */; };
 		54E9FFBF941875F43A30CE18 /* TradeApprovalPairingView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6BB776C284508F7ADFFA58CE /* TradeApprovalPairingView.swift */; };
@@ -34,6 +36,9 @@
 		AA000014 /* SupabaseManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB000015 /* SupabaseManager.swift */; };
 		AA000015 /* JoriIntents.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB000016 /* JoriIntents.swift */; };
 		AA000016 /* NotificationService.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB000017 /* NotificationService.swift */; };
+		AA0000C1 /* AnnounceCache.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB0000C1 /* AnnounceCache.swift */; };
+		AA0000C2 /* AnnounceCache.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB0000C1 /* AnnounceCache.swift */; };
+		AA0000C3 /* JoriIntents.appex in Embed App Extensions */ = {isa = PBXBuildFile; fileRef = CC000003 /* JoriIntents.appex */; platformFilter = ios; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
 		AA000017 /* JoriNotificationService.appex in Embed App Extensions */ = {isa = PBXBuildFile; fileRef = CC000002 /* JoriNotificationService.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
 		AA000018 /* MessageStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB000020 /* MessageStore.swift */; };
 		AA000030 /* LocationTracker.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB000030 /* LocationTracker.swift */; };
@@ -55,6 +60,8 @@
 		AA000500 /* Installation in Resources */ = {isa = PBXBuildFile; fileRef = BB000501 /* Installation */; };
 		AA000098 /* SharedSession.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB000096 /* SharedSession.swift */; };
 		AA000099 /* SharedSession.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB000096 /* SharedSession.swift */; };
+		AA0000C4 /* AnnounceDiagnostics.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB0000C2 /* AnnounceDiagnostics.swift */; };
+		AA0000C5 /* AnnounceCache.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB0000C1 /* AnnounceCache.swift */; };
 		AA000100 /* MessageReply.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB000097 /* MessageReply.swift */; };
 		AA000300 /* PhoneLockMonitor.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB000300 /* PhoneLockMonitor.swift */; };
 		AA000301 /* PhoneUsageMonitor.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB000301 /* PhoneUsageMonitor.swift */; };
@@ -114,6 +121,7 @@
 			dstSubfolderSpec = 13;
 			files = (
 				AA000017 /* JoriNotificationService.appex in Embed App Extensions */,
+				AA0000C3 /* JoriIntents.appex in Embed App Extensions */,
 				AA000409 /* JoriShare.appex in Embed App Extensions */,
 				AA00040A /* JoriUsageMonitor.appex in Embed App Extensions */,
 			);
@@ -132,6 +140,8 @@
 		BB000202 /* ChannelBadges.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChannelBadges.swift; sourceTree = "<group>"; };
 		BB000E01 /* DesignSystem.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DesignSystem.swift; sourceTree = "<group>"; };
 		BB000E02 /* Responsiveness.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Responsiveness.swift; sourceTree = "<group>"; };
+		BB000E03 /* PickupRules.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PickupRules.swift; sourceTree = "<group>"; };
+		BB000E04 /* PickupWatch.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PickupWatch.swift; sourceTree = "<group>"; };
 		BB000201 /* SelfImproveApprovalView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SelfImproveApprovalView.swift; sourceTree = "<group>"; };
 		BB000299 /* ChoicePrompt.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChoicePrompt.swift; sourceTree = "<group>"; };
 		6BB776C284508F7ADFFA58CE /* TradeApprovalPairingView.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = TradeApprovalPairingView.swift; sourceTree = "<group>"; };
@@ -152,6 +162,7 @@
 		BB000014 /* Jori-macOS.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = "Jori-macOS.entitlements"; sourceTree = "<group>"; };
 		BB000015 /* SupabaseManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SupabaseManager.swift; sourceTree = "<group>"; };
 		BB000016 /* JoriIntents.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = JoriIntents.swift; sourceTree = "<group>"; };
+		BB0000C1 /* AnnounceCache.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AnnounceCache.swift; sourceTree = "<group>"; };
 		BB000017 /* NotificationService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NotificationService.swift; sourceTree = "<group>"; };
 		BB000018 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
 		BB000019 /* JoriNotificationService.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = JoriNotificationService.entitlements; sourceTree = "<group>"; };
@@ -173,6 +184,7 @@
 		BB000094 /* SharedKeychainStorage.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SharedKeychainStorage.swift; sourceTree = "<group>"; };
 		BB000095 /* AppIntentVocabulary.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = AppIntentVocabulary.plist; sourceTree = "<group>"; };
 		BB000096 /* SharedSession.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SharedSession.swift; sourceTree = "<group>"; };
+		BB0000C2 /* AnnounceDiagnostics.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AnnounceDiagnostics.swift; sourceTree = "<group>"; };
 		BB000097 /* MessageReply.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MessageReply.swift; sourceTree = "<group>"; };
 		BB000300 /* PhoneLockMonitor.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PhoneLockMonitor.swift; sourceTree = "<group>"; };
 		BB000301 /* PhoneUsageMonitor.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PhoneUsageMonitor.swift; sourceTree = "<group>"; };
@@ -290,6 +302,7 @@
 				BB000096 /* SharedSession.swift */,
 				BB000406 /* ShareOutbox.swift */,
 				BB000097 /* MessageReply.swift */,
+				BB0000C2 /* AnnounceDiagnostics.swift */,
 				BB000016 /* JoriIntents.swift */,
 				BB000060 /* SignInView.swift */,
 				BB000070 /* MacKeychainStorage.swift */,
@@ -303,6 +316,8 @@
 				BB000202 /* ChannelBadges.swift */,
 				BB000E01 /* DesignSystem.swift */,
 				BB000E02 /* Responsiveness.swift */,
+				BB000E03 /* PickupRules.swift */,
+				BB000E04 /* PickupWatch.swift */,
 				BB000201 /* SelfImproveApprovalView.swift */,
 				BB000299 /* ChoicePrompt.swift */,
 			);
@@ -325,6 +340,7 @@
 			isa = PBXGroup;
 			children = (
 				BB000017 /* NotificationService.swift */,
+				BB0000C1 /* AnnounceCache.swift */,
 				BB000018 /* Info.plist */,
 				BB000019 /* JoriNotificationService.entitlements */,
 			);
@@ -570,6 +586,8 @@
 				AA000091 /* SharedKeychainStorage.swift in Sources */,
 				AA000098 /* SharedSession.swift in Sources */,
 				AA000100 /* MessageReply.swift in Sources */,
+				AA0000C4 /* AnnounceDiagnostics.swift in Sources */,
+				AA0000C5 /* AnnounceCache.swift in Sources */,
 				AA000015 /* JoriIntents.swift in Sources */,
 				AA000060 /* SignInView.swift in Sources */,
 				AA000070 /* MacKeychainStorage.swift in Sources */,
@@ -583,6 +601,8 @@
 				AA000202 /* ChannelBadges.swift in Sources */,
 				AA000E01 /* DesignSystem.swift in Sources */,
 				AA000E02 /* Responsiveness.swift in Sources */,
+				AA000E03 /* PickupRules.swift in Sources */,
+				AA000E04 /* PickupWatch.swift in Sources */,
 				AA000201 /* SelfImproveApprovalView.swift in Sources */,
 				AA000299 /* ChoicePrompt.swift in Sources */,
 				AA000300 /* PhoneLockMonitor.swift in Sources */,
@@ -598,6 +618,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				AA000016 /* NotificationService.swift in Sources */,
+				AA0000C1 /* AnnounceCache.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -610,6 +631,7 @@
 				AA000094 /* SharedKeychainStorage.swift in Sources */,
 				AA000099 /* SharedSession.swift in Sources */,
 				AA000095 /* Message.swift in Sources */,
+				AA0000C2 /* AnnounceCache.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -730,14 +752,14 @@
 				INFOPLIST_FILE = Jori/Info.plist;
 				INFOPLIST_KEY_ITSAppUsesNonExemptEncryption = NO;
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.productivity";
-				INFOPLIST_KEY_NSFaceIDUsageDescription = "Unlock Jori with Face ID";
-				INFOPLIST_KEY_NSHealthClinicalHealthRecordsShareUsageDescription = "Jori reads your clinical records — lab results, medications, allergies, conditions, immunizations, procedures, vitals — so your assistant can reason about your medical history alongside everything else it knows.";
-				INFOPLIST_KEY_NSHealthShareUsageDescription = "Jori reads your health metrics — heart rate, sleep, workouts, activity — so your assistant can reason about your activity, recovery, and wellbeing.";
-				INFOPLIST_KEY_NSHealthUpdateUsageDescription = "Jori does not write to Health. This string is present only because Apple requires it whenever HealthKit is linked.";
-				INFOPLIST_KEY_NSLocationAlwaysAndWhenInUseUsageDescription = "Jori tracks your location in the background to build a timeline of where you've been throughout the day.";
+				INFOPLIST_KEY_NSFaceIDUsageDescription = "Unlock $(JORI_DISPLAY_NAME) with Face ID";
+				INFOPLIST_KEY_NSHealthClinicalHealthRecordsShareUsageDescription = "$(JORI_DISPLAY_NAME) reads your clinical records — lab results, medications, allergies, conditions, immunizations, procedures, vitals — so your assistant can reason about your medical history alongside everything else it knows.";
+				INFOPLIST_KEY_NSHealthShareUsageDescription = "$(JORI_DISPLAY_NAME) reads your health metrics — heart rate, sleep, workouts, activity — so your assistant can reason about your activity, recovery, and wellbeing.";
+				INFOPLIST_KEY_NSHealthUpdateUsageDescription = "$(JORI_DISPLAY_NAME) does not write to Health. This string is present only because Apple requires it whenever HealthKit is linked.";
+				INFOPLIST_KEY_NSLocationAlwaysAndWhenInUseUsageDescription = "$(JORI_DISPLAY_NAME) tracks your location in the background to build a timeline of where you've been throughout the day.";
 				INFOPLIST_KEY_NSLocationWhenInUseUsageDescription = "Share your location when requested by the assistant";
-				INFOPLIST_KEY_NSMotionUsageDescription = "Jori uses motion data to detect whether you're walking, driving, or stationary.";
-				INFOPLIST_KEY_NSPhotoLibraryUsageDescription = "Jori looks at photos you took during a stop to work out where you were, so it doesn't have to ask you.";
+				INFOPLIST_KEY_NSMotionUsageDescription = "$(JORI_DISPLAY_NAME) uses motion data to detect whether you're walking, driving, or stationary.";
+				INFOPLIST_KEY_NSPhotoLibraryUsageDescription = "$(JORI_DISPLAY_NAME) looks at photos you took during a stop to work out where you were, so it doesn't have to ask you.";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
 				INFOPLIST_KEY_UIBackgroundModes = "location remote-notification";
@@ -748,7 +770,8 @@
 				MARKETING_VERSION = "$(JORI_MARKETING_VERSION)";
 				PRODUCT_BUNDLE_IDENTIFIER = "$(JORI_BUNDLE_ID)";
 				PROVISIONING_PROFILE_SPECIFIER = "$(JORI_PROFILE_APP)";
-				PRODUCT_NAME = "$(TARGET_NAME)";
+				PRODUCT_MODULE_NAME = Jori;
+				PRODUCT_NAME = "$(JORI_DISPLAY_NAME)";
 				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator macosx";
 				SUPPORTS_MACCATALYST = NO;
 				SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD = NO;
@@ -772,14 +795,14 @@
 				INFOPLIST_FILE = Jori/Info.plist;
 				INFOPLIST_KEY_ITSAppUsesNonExemptEncryption = NO;
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.productivity";
-				INFOPLIST_KEY_NSFaceIDUsageDescription = "Unlock Jori with Face ID";
-				INFOPLIST_KEY_NSHealthClinicalHealthRecordsShareUsageDescription = "Jori reads your clinical records — lab results, medications, allergies, conditions, immunizations, procedures, vitals — so your assistant can reason about your medical history alongside everything else it knows.";
-				INFOPLIST_KEY_NSHealthShareUsageDescription = "Jori reads your health metrics — heart rate, sleep, workouts, activity — so your assistant can reason about your activity, recovery, and wellbeing.";
-				INFOPLIST_KEY_NSHealthUpdateUsageDescription = "Jori does not write to Health. This string is present only because Apple requires it whenever HealthKit is linked.";
-				INFOPLIST_KEY_NSLocationAlwaysAndWhenInUseUsageDescription = "Jori tracks your location in the background to build a timeline of where you've been throughout the day.";
+				INFOPLIST_KEY_NSFaceIDUsageDescription = "Unlock $(JORI_DISPLAY_NAME) with Face ID";
+				INFOPLIST_KEY_NSHealthClinicalHealthRecordsShareUsageDescription = "$(JORI_DISPLAY_NAME) reads your clinical records — lab results, medications, allergies, conditions, immunizations, procedures, vitals — so your assistant can reason about your medical history alongside everything else it knows.";
+				INFOPLIST_KEY_NSHealthShareUsageDescription = "$(JORI_DISPLAY_NAME) reads your health metrics — heart rate, sleep, workouts, activity — so your assistant can reason about your activity, recovery, and wellbeing.";
+				INFOPLIST_KEY_NSHealthUpdateUsageDescription = "$(JORI_DISPLAY_NAME) does not write to Health. This string is present only because Apple requires it whenever HealthKit is linked.";
+				INFOPLIST_KEY_NSLocationAlwaysAndWhenInUseUsageDescription = "$(JORI_DISPLAY_NAME) tracks your location in the background to build a timeline of where you've been throughout the day.";
 				INFOPLIST_KEY_NSLocationWhenInUseUsageDescription = "Share your location when requested by the assistant";
-				INFOPLIST_KEY_NSMotionUsageDescription = "Jori uses motion data to detect whether you're walking, driving, or stationary.";
-				INFOPLIST_KEY_NSPhotoLibraryUsageDescription = "Jori looks at photos you took during a stop to work out where you were, so it doesn't have to ask you.";
+				INFOPLIST_KEY_NSMotionUsageDescription = "$(JORI_DISPLAY_NAME) uses motion data to detect whether you're walking, driving, or stationary.";
+				INFOPLIST_KEY_NSPhotoLibraryUsageDescription = "$(JORI_DISPLAY_NAME) looks at photos you took during a stop to work out where you were, so it doesn't have to ask you.";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
 				INFOPLIST_KEY_UIBackgroundModes = "location remote-notification";
@@ -790,7 +813,8 @@
 				MARKETING_VERSION = "$(JORI_MARKETING_VERSION)";
 				PRODUCT_BUNDLE_IDENTIFIER = "$(JORI_BUNDLE_ID)";
 				PROVISIONING_PROFILE_SPECIFIER = "$(JORI_PROFILE_APP)";
-				PRODUCT_NAME = "$(TARGET_NAME)";
+				PRODUCT_MODULE_NAME = Jori;
+				PRODUCT_NAME = "$(JORI_DISPLAY_NAME)";
 				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator macosx";
 				SUPPORTS_MACCATALYST = NO;
 				SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD = NO;

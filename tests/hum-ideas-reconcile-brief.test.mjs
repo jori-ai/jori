@@ -9,7 +9,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { manualScope } from "../lib/hum-ideas.mjs";
 import { nextState } from "../bin/hum-ideas-reconcile";
-import { brief, text } from "../bin/hum-ideas-brief";
+import { brief, text, answersById } from "../bin/hum-ideas-brief";
 
 const MANUAL = manualScope();
 const idea = (o) => ({ id: "i", scope: "jori_autonomous", risk: "low", effort: "quick", status: "proposed", ...o });
@@ -41,4 +41,24 @@ test("weekly brief: what landed, what waits, and the big ones that need the user
   assert.deepEqual(b.cards_waiting.map((i) => i.id), ["card"]);
   assert.ok(text(b).includes("Rebuild the ranker"));
   assert.ok(text(brief([], NOW)).includes("Landed: nothing this week."));
+});
+
+test("weekly brief: an answered ask is not 'being asked', and a row that is not an idea is not structural", () => {
+  const ideas = [
+    ask("open", { title: "Still waiting" }),
+    ask("done", { title: "Answered already" }),
+    { id: "resolved-question", consumed: true, consumed_at: "2026-10-09T00:00:00Z", resolution: "settled by email" },
+  ];
+  const answers = answersById([
+    { ts: "2026-10-09T19:44:52Z", lane: "hum_improvement:done", disposition: "answered", reply_text: "Keep it as is." },
+    { ts: "2026-10-09T19:50:00Z", lane: "hum_improvement:open", disposition: "deferred", reply_text: "later" },
+    { ts: "2026-10-09T19:55:00Z", lane: "dining", disposition: "answered", reply_text: "not about an idea" },
+  ]);
+  const b = brief(ideas, NOW, 7, answers);
+  assert.deepEqual(b.asking_in_chat.map((i) => i.id), ["open"]);
+  assert.deepEqual(b.answered_not_acted_on.map((i) => [i.id, i.answer]), [["done", "Keep it as is."]]);
+  assert.deepEqual(b.structural, []);
+  assert.ok(text(b).includes("not yet recorded on the idea (1): Answered already"));
+  // Without the answers log the brief reads as before.
+  assert.deepEqual(brief(ideas, NOW).asking_in_chat.map((i) => i.id), ["open", "done"]);
 });

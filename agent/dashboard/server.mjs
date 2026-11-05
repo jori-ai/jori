@@ -66,7 +66,7 @@ registry.registerRoute("/", () => {
   catch { return { status: 500, body: "dashboard.html missing" }; }
   // The page names the assistant by its configured name (lib/instance.cjs).
   const name = assistantName().replace(/[&<>"]/g, (ch) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[ch]);
-  body = body.replaceAll("Jori · Live", `${name} · Live`);
+  body = body.replaceAll("Jori · Live", `${name} · Live`); // control-scan-ok: the setting's default, as dashboard.html writes it
   return { status: 200, headers: { "Content-Type": "text/html; charset=utf-8" }, body };
 });
 

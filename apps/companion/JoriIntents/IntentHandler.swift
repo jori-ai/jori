@@ -18,28 +18,107 @@ import Foundation
 // The donation in JoriNotificationService sets conversationIdentifier
 // "jori-chat" so Siri knows replies belong to this conversation and reaches
 // this handler.
-class IntentHandler: INExtension, INSendMessageIntentHandling, INSearchForMessagesIntentHandling {
+class IntentHandler: INExtension, INSendMessageIntentHandling, INSearchForMessagesIntentHandling, INSetMessageAttributeIntentHandling {
 
     override func handler(for intent: INIntent) -> Any {
+        AnnounceCache.trace("intents handler for \(type(of: intent))")
         return self
     }
 
     // MARK: - INSearchForMessagesIntentHandling
     //
-    // Apple requires BOTH INSendMessageIntentHandling and
-    // INSearchForMessagesIntentHandling for the AirPods listen-and-reply loop.
-    // With only the send handler, Siri announces the message but rejects the
-    // spoken reply with "Jori hasn't added support for that with Siri." We
-    // don't expose a searchable history to Siri — an empty success satisfies the
-    // messaging-provider contract so the reply path binds.
+    // THIS IS WHAT SIRI READS ALOUD. For a messaging app Siri does not speak an
+    // announced notification's text itself: it sends this intent with the
+    // notification's request identifier in `notificationIdentifiers` and speaks
+    // the INMessages returned. An empty answer, or no handler, is silence —
+    // and for a messaging app that silences plain pushes too. Answered from
+    // AnnounceCache (written by the
+    // NotificationService extension), offline, so a locked phone or an expired
+    // session token cannot silence it. Pattern: Telegram-iOS
+    // Telegram/SiriIntents/MessageSearchScope.swift.
     func handle(
         intent: INSearchForMessagesIntent,
         completion: @escaping (INSearchForMessagesIntentResponse) -> Void
     ) {
-        let activity = NSUserActivity(activityType: NSStringFromClass(INSearchForMessagesIntent.self))
-        let response = INSearchForMessagesIntentResponse(code: .success, userActivity: activity)
-        response.messages = []
+        let cached = AnnounceCache.all()
+        let picked = Self.messagesToRead(for: intent, from: cached)
+        AnnounceCache.trace("intents search notif=\(intent.notificationIdentifiers ?? []) op=\(intent.notificationIdentifiersOperator.rawValue) ids=\(intent.identifiers ?? []) attrs=\(intent.attributes.rawValue) cached=\(cached.count) answer=\(picked.map { $0.body.prefix(30) })")
+        NSLog("[JoriIntents] search: notificationIds=\(intent.notificationIdentifiers ?? []) op=\(intent.notificationIdentifiersOperator.rawValue) ids=\(intent.identifiers ?? []) cached=\(cached.count) → \(picked.count)")
+        let response = INSearchForMessagesIntentResponse(code: .success, userActivity: nil)
+        response.messages = picked.map { m in
+            INMessage(
+                identifier: m.messageId ?? m.requestId,
+                conversationIdentifier: Self.conversationId,
+                content: m.body,
+                dateSent: m.date,
+                sender: Self.joriPerson,
+                recipients: nil,
+                groupName: nil,
+                messageType: .text)
+        }
         completion(response)
+    }
+
+    /// Which cached messages answer this search. Announce asks for exactly the
+    /// notifications named (operator .all/.any; .none means "everything but
+    /// these", which for an announce is nothing new). A plain "read my
+    /// messages" names none: read the newest few. Never the whole backlog for an
+    /// announce: answering with the backlog makes Siri re-read every earlier
+    /// message on each new one (Telegram-iOS hit this).
+    static func messagesToRead(for intent: INSearchForMessagesIntent,
+                               from cached: [AnnouncedMessage]) -> [AnnouncedMessage] {
+        let notificationIds = intent.notificationIdentifiers ?? []
+        if !notificationIds.isEmpty {
+            if intent.notificationIdentifiersOperator == .none { return [] }
+            let hit = notificationIds.compactMap { id in cached.last { $0.requestId == id } }
+            if !hit.isEmpty { return hit }
+            // The notification arrived but the extension's record is missing
+            // (NSE timed out): the newest message from the last few minutes is
+            // almost certainly it. Better read than silent.
+            if let newest = cached.last, Date().timeIntervalSince(newest.date) < 300 { return [newest] }
+            return []
+        }
+        let ids = intent.identifiers ?? []
+        if !ids.isEmpty {
+            return cached.filter { m in ids.contains(m.messageId ?? "") || ids.contains(m.requestId) }
+        }
+        return Array(cached.suffix(3))
+    }
+
+    // MARK: - INSetMessageAttributeIntentHandling
+    //
+    // Siri marks an announced message read (Apple's SiriKit Messaging page:
+    // INSearchForMessagesIntent + INSetMessageAttributeIntent "allow Siri to
+    // announce incoming messages on AirPods"). Mark the row read best-effort;
+    // the answer is success either way, since a stale token must not make Siri
+    // report a failure about a message it just read.
+    func resolveAttribute(
+        for intent: INSetMessageAttributeIntent,
+        with completion: @escaping (INMessageAttributeResolutionResult) -> Void
+    ) {
+        switch intent.attribute {
+        case .read, .unread, .played: completion(.success(with: intent.attribute))
+        case .flagged, .unflagged: completion(.success(with: .unread))
+        default: completion(.needsValue())
+        }
+    }
+
+    func handle(
+        intent: INSetMessageAttributeIntent,
+        completion: @escaping (INSetMessageAttributeIntentResponse) -> Void
+    ) {
+        AnnounceCache.trace("intents setAttribute \(intent.attribute.rawValue) ids=\(intent.identifiers ?? [])")
+        let ids = (intent.identifiers ?? []).filter { UUID(uuidString: $0) != nil }
+        let read = intent.attribute == .read || intent.attribute == .played
+        guard !ids.isEmpty, read || intent.attribute == .unread else {
+            completion(INSetMessageAttributeIntentResponse(code: .success, userActivity: nil))
+            return
+        }
+        Task {
+            do { try await Self.setRead(read, ids: ids) }
+            catch { NSLog("[JoriIntents] mark read failed: \(error.localizedDescription)") }
+            completion(INSetMessageAttributeIntentResponse(code: .success, userActivity: nil))
+        }
     }
 
     // MARK: - INSendMessageIntentHandling
@@ -76,6 +155,7 @@ class IntentHandler: INExtension, INSendMessageIntentHandling, INSearchForMessag
         intent: INSendMessageIntent,
         completion: @escaping (INSendMessageIntentResponse) -> Void
     ) {
+        AnnounceCache.trace("intents send handle len=\(intent.content?.count ?? 0) conv=\(intent.conversationIdentifier ?? "-")")
         guard let text = intent.content, !text.isEmpty else {
             completion(INSendMessageIntentResponse(code: .failure, userActivity: nil))
             return
@@ -94,10 +174,14 @@ class IntentHandler: INExtension, INSendMessageIntentHandling, INSearchForMessag
 
     // MARK: - Supabase
 
+    /// The conversation the NotificationService extension donates into.
+    static let conversationId = "jori-chat"
+
+    /// The same person the NotificationService extension uses as the sender.
     private static let joriPerson = INPerson(
-        personHandle: INPersonHandle(value: "jori@assistant", type: .unknown),
+        personHandle: INPersonHandle(value: "jori-assistant", type: .unknown),
         nameComponents: nil,
-        displayName: "Jori",
+        displayName: Install.displayName,
         image: nil,
         contactIdentifier: nil,
         customIdentifier: "jori-assistant"
@@ -112,7 +196,7 @@ class IntentHandler: INExtension, INSendMessageIntentHandling, INSearchForMessag
     private static func insertUserMessage(_ content: String) async throws {
         guard let tokens = SharedSession.tokens() else {
             throw NSError(domain: "JoriIntents", code: 401,
-                          userInfo: [NSLocalizedDescriptionKey: "Open Jori and sign in first."])
+                          userInfo: [NSLocalizedDescriptionKey: "Open \(Install.displayName) and sign in first."])
         }
 
         let tz = TimeZone.current
@@ -144,6 +228,27 @@ class IntentHandler: INExtension, INSendMessageIntentHandling, INSearchForMessag
             let body = String(data: data, encoding: .utf8) ?? ""
             throw NSError(domain: "JoriIntents", code: code,
                           userInfo: [NSLocalizedDescriptionKey: "Insert failed (\(code)): \(body)"])
+        }
+    }
+
+    /// PATCH jori_messages.read for the given ids, as the signed-in user.
+    private static func setRead(_ read: Bool, ids: [String]) async throws {
+        guard let tokens = SharedSession.tokens() else { return }
+        var comps = URLComponents(url: SupabaseConfig.url.appendingPathComponent("rest/v1/\(DBTables.messages)"),
+                                  resolvingAgainstBaseURL: false)!
+        comps.queryItems = [URLQueryItem(name: "id", value: "in.(\(ids.joined(separator: ",")))")]
+        var req = URLRequest(url: comps.url!)
+        req.httpMethod = "PATCH"
+        req.setValue(SupabaseConfig.anonKey, forHTTPHeaderField: "apikey")
+        req.setValue("Bearer \(tokens.access)", forHTTPHeaderField: "Authorization")
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.setValue("return=minimal", forHTTPHeaderField: "Prefer")
+        req.httpBody = try JSONSerialization.data(withJSONObject: ["read": read])
+        let (_, resp) = try await URLSession.shared.data(for: req)
+        let code = (resp as? HTTPURLResponse)?.statusCode ?? -1
+        if !(200..<300).contains(code) {
+            throw NSError(domain: "JoriIntents", code: code,
+                          userInfo: [NSLocalizedDescriptionKey: "mark read failed (\(code))"])
         }
     }
 

@@ -334,6 +334,41 @@ describe("PriorityDispatcher", () => {
     assert.ok(dispatcher.dispatch("reuse", "g", { priority: "high", msgId: "id2" }) !== null);
   });
 
+  // ── Persistence (the chat supervisor saves the queue for the next process) ──
+
+  it("calls persist after every change, with the state already updated", () => {
+    const seen = [];
+    let d;
+    d = new PriorityDispatcher(session, { persist: () => seen.push([d.queue.map((i) => i.content), d.inFlight?.content ?? null]) });
+    d.dispatch("a", "jori", { priority: "high" });      // enqueued, then sent
+    d.dispatch("b", "jori", { priority: "high" });      // enqueued behind it
+    d.requeueInFlight({ front: true });                 // a dies mid-turn, keeps its place
+    assert.deepEqual(seen, [[["a"], null], [[], "a"], [["b"], "a"], [["a", "b"], null]]);
+    seen.length = 0;
+    d._drain();                                         // a+b merged into one turn
+    session.completeCurrentTurn();
+    assert.deepEqual(seen, [[[], "a\n\nb"], [[], null]]);
+  });
+
+  it("restore() puts the in-flight turn back first at its priority, sends nothing, and keeps msgIds", () => {
+    const saved = [];
+    const d = new PriorityDispatcher(session, { persist: () => saved.push(d.queue.length) });
+    d.restore({
+      inFlight: { id: "i", content: "was running", source: "jori", priority: 0, priorityName: "high", msgId: "m0" },
+      queue: [
+        { id: "q1", content: "next", source: "jori", priority: 0, priorityName: "high", msgId: "m1" },
+        { id: "q2", content: "init", source: "init", priority: 2, priorityName: "low" },
+      ],
+    });
+    assert.deepEqual(d.queue.map((i) => i.content), ["was running", "next", "init"]);
+    assert.equal(d.inFlight, null);
+    assert.equal(session.sent.length, 0, "the caller drains once its listeners are attached");
+    assert.ok(saved.length > 0 && saved.at(-1) === 3, "the merged state is saved");
+    assert.equal(d.dispatch("again", "jori", { priority: "high", msgId: "m1" }), null, "a retried POST of a reloaded message is a duplicate");
+    d._drain();
+    assert.equal(session.sent[0], "was running\n\nnext");
+  });
+
   it("emits a coalesced event with the merge count", () => {
     const events = [];
     dispatcher.on("coalesced", (e) => events.push(e));

@@ -9,9 +9,9 @@ source "$(dirname "$0")/lib/webhook-auth.sh"
 #        - In quiet window  → write ask to pending-asks queue, exit 0 (no dispatch)
 #        - Out of quiet     → drain queued + resolve each via the hybrid path
 #   4. Hybrid per-ask resolution:
-#        a. Programmatic precheck (location-confirm-precheck.mjs) — calendar
-#           overlap match → auto-confirm without asking.
-#        b. Otherwise run location-confirm-resolve.mjs — LOCAL-first
+#        a. Programmatic precheck (location-confirm-precheck.mjs) — names no
+#           stop; escalates every ask that has candidates.
+#        b. Then run location-confirm-resolve.mjs — LOCAL-first
 #           deterministic memory + calendar +
 #           message matching over a pre-fetched bundle, decides auto-confirm
 #           vs ask with NO model call. A forked `claude -p --model sonnet
@@ -179,7 +179,7 @@ BATCH=$(jq -n --argjson pending "$DRAIN_JSON" --argjson current "$ASK_JSON" \
 N_BATCH=$(echo "$BATCH" | jq length)
 
 # Hybrid resolution per ask:
-#   1. Programmatic precheck (calendar overlap) → auto-confirm without asking.
+#   1. Programmatic precheck → escalate (it no longer names a stop itself).
 #   2. Sonnet resolve (one-shot `claude -p --model sonnet --effort low`
 #      subprocess) — fetches calendar + recent conversation + wiki, asks
 #      Sonnet to classify, auto-confirms or falls through.
@@ -204,7 +204,7 @@ for i in $(seq 0 $((N_BATCH - 1))); do
   ASK=$(echo "$BATCH" | jq ".[$i]")
   ASK_ID_THIS=$(echo "$ASK" | jq -r '.ask_id')
 
-  # --- Step 1: programmatic precheck (calendar overlap) ---
+  # --- Step 1: programmatic precheck (escalates; never names a stop) ---
   PRECHECK_OUT=$(echo "$ASK" | "$JORI_NODE" "$PRECHECK" 2>>"$LOGFILE")
   DECISION=$(echo "$PRECHECK_OUT" | jq -r '.decision // "ask"' 2>/dev/null)
   VENUE=$(echo "$PRECHECK_OUT" | jq -r '.venue // ""' 2>/dev/null)

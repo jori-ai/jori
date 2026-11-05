@@ -91,6 +91,12 @@ jori_local_rules_file() {
     *)        rm -f "$out"; return 1 ;;
   esac
   : > "$out" || return 1
+  # First, who the agent is (name, pronouns): lib/instance.cjs --identity.
+  local node="${JORI_NODE:-$(command -v node 2>/dev/null)}" root
+  root="$(cd "$dir/../.." 2>/dev/null && pwd)"
+  if [ -n "$node" ] && [ -f "$root/lib/instance.cjs" ]; then
+    if "$node" "$root/lib/instance.cjs" --identity >> "$out" 2>/dev/null; then sep=$'\n'; any=1; fi
+  fi
   for name in "${names[@]}"; do
     _jori_local_nonblank "$dir/$name" || continue
     printf '%s%s\n' "$sep" "$(cat "$dir/$name")" >> "$out"

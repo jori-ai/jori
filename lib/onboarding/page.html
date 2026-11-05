@@ -229,6 +229,8 @@ form.code { margin-top: 24px; max-width: 520px; }
         <label>Home city<input type="text" name="home_city" autocomplete="address-level2"><small>For weather, nearby places and events</small></label>
         <label>Time zone<input type="text" name="tz" list="tzList" required></label>
         <label>Call the assistant<input type="text" name="assistant_name" required></label>
+        <label>Its pronouns<input type="text" name="assistant_pronouns" list="pronounList" placeholder="it/its"><small>How it’s referred to: she/her, he/him, they/them or it/its</small></label>
+        <datalist id="pronounList"><option value="she/her"><option value="he/him"><option value="they/them"><option value="it/its"></datalist>
         <label>A partner I also help<input type="text" name="partner_name"><small>Optional, first name</small></label>
         <label class="check wide"><input type="checkbox" name="telemetry" checked> Count this install: one anonymous ping, no personal data, sent once.</label>
         <datalist id="tzList"></datalist>
@@ -436,6 +438,7 @@ function render() {
     ["WhatsApp", "Message me from your phone, paired with a QR code.", "#channels"],
     ["Slack", "Talk to me in your workspace, as a teammate.", "#channels"],
     ["Gmail", "I sort your inbox and tell you about the urgent mail.", "#services"],
+    ["My own email address", "Optional. People email me directly and my mail comes from that address. Needs a domain on Cloudflare; without one I use your mailbox.", "#email"],
   ];
   if (!$("ways").children.length) $("ways").replaceChildren(...ways.map(([h, p, hash]) =>
     el("li", { class: "way" }, el("div", {}, el("h3", {}, h), el("p", {}, p)), el("a", { class: "btn small quiet", href: ctl + hash, target: "_blank", rel: "noopener" }, "Set up"))));
@@ -471,7 +474,7 @@ $("codeForm").addEventListener("submit", async (e) => {
 });
 $("aboutSave").addEventListener("click", async () => {
   const f = $("aboutForm"), b = {};
-  for (const k of ["owner_name", "owner_email", "home_city", "tz", "assistant_name", "partner_name"]) b[k] = f.elements[k].value.trim();
+  for (const k of ["owner_name", "owner_email", "home_city", "tz", "assistant_name", "assistant_pronouns", "partner_name"]) b[k] = f.elements[k].value.trim();
   b.telemetry = f.elements.telemetry.checked;
   const missing = ["owner_name", "owner_email", "tz", "assistant_name"].filter((k) => !b[k]);
   const err = $("aboutErr");

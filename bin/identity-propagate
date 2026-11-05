@@ -1,0 +1,121 @@
+#!/bin/sh
+':' //; for n in /opt/homebrew/bin/node /usr/local/bin/node "$(command -v node 2>/dev/null)"; do [ -x "$n" ] && exec "$n" "$0" "$@"; done; echo "$0: no node interpreter found" >&2; exit 127 # kernel-closure-ok: cron's bare PATH has no node; same launcher as bin/cron-run
+// identity-propagate — after the assistant's name or email address changes in
+// agent/local/instance.json, redeploy what copied it and tell the owner.
+// The plan and the reasons are in lib/identity-propagate.mjs.
+//
+//   identity-propagate              run if something changed since the last run
+//   identity-propagate --dry-run    print the plan, change nothing
+//   identity-propagate --force      redo every step for the current values
+//   identity-propagate --detach     run in the background and return at once
+//                                   (bin/jori-sync, the control room)
+//   identity-propagate --quiet      no output when nothing changed
+//
+// Runs only where the assistant runs as a service (the host): a laptop that
+// edits instance.json leaves the deploys to the host, which picks the change
+// up on its next jori-sync. Needs `gh` and `wrangler` signed in on the host
+// for the app and wiki steps; a step that cannot run is reported, not retried.
+
+import fs from "node:fs";
+import path from "node:path";
+import { spawn, spawnSync } from "node:child_process";
+import { createRequire } from "node:module";
+import { identityOf, plan, summary, stateFile, readState, writeState, environment, ensureCloudflareRoute } from "../lib/identity-propagate.mjs";
+import * as core from "../lib/onboarding/core.mjs";
+
+const require = createRequire(import.meta.url);
+require("../lib/load-env.js").loadEnv();
+const { TOOLS_DIR } = require("../lib/root.cjs");
+const inst = require("../lib/instance.cjs");
+
+// cron's PATH is bare; gh, wrangler and the node that runs us live here.
+process.env.PATH = [path.dirname(process.execPath), "/opt/homebrew/bin", "/usr/local/bin", path.join(process.env.HOME || "", ".local", "bin"), process.env.PATH].filter(Boolean).join(":");
+
+const args = process.argv.slice(2);
+const flag = (f) => args.includes(f);
+const quiet = flag("--quiet");
+const say = (s) => { if (!quiet) console.log(s); };
+
+if (flag("--detach")) {
+  const child = spawn(process.execPath, [process.argv[1], ...args.filter((a) => a !== "--detach"), "--quiet"], { detached: true, stdio: "ignore" });
+  child.unref();
+  process.exit(0);
+}
+
+const svc = await core.serviceStatus().catch(() => ({ loaded: false }));
+if (!svc.loaded && !flag("--dry-run")) {
+  say("identity-propagate: the assistant does not run as a service here; the host carries identity changes over");
+  process.exit(0);
+}
+
+const file = stateFile(TOOLS_DIR);
+const cur = identityOf(inst.instance());
+let prev = readState(file);
+if (!prev) {
+  if (!flag("--dry-run")) writeState(file, cur);
+  say(`identity-propagate: first run, recorded ${cur.assistant_name} <${cur.agent_email}>`);
+  process.exit(0);
+}
+if (flag("--force")) prev = { assistant_name: prev.assistant_name === cur.assistant_name ? "" : prev.assistant_name, agent_email: prev.agent_email === cur.agent_email ? "" : prev.agent_email };
+
+const env = environment(TOOLS_DIR, { serviceLoaded: svc.loaded });
+const steps = plan(prev, cur, env);
+if (!steps.length) {
+  // A value the state file doesn't hold yet (a key added later, e.g.
+  // assistant_pronouns) is recorded now, so its next change is noticed.
+  if (!flag("--dry-run") && Object.keys(cur).some((k) => !(k in prev))) writeState(file, { ...prev, ...cur });
+  say("identity-propagate: nothing changed");
+  process.exit(0);
+}
+
+if (flag("--dry-run")) {
+  for (const s of steps) console.log(`${s.kind === "run" ? "run   " : "manual"}  ${s.what}`);
+  process.exit(0);
+}
+
+// One run at a time (cron sync and a control-room save can both start one).
+const lock = path.join(TOOLS_DIR, "data", ".identity-propagate.lock");
+try {
+  const st = fs.statSync(lock);
+  if (Date.now() - st.mtimeMs < 30 * 60_000) { say("identity-propagate: another run is in progress"); process.exit(0); }
+  fs.rmSync(lock);
+} catch {}
+fs.writeFileSync(lock, String(process.pid), { flag: "wx" });
+
+const bin = (name) => path.join(TOOLS_DIR, "bin", name);
+const sh = (cmd, argv, timeout = 600_000) => {
+  const r = spawnSync(cmd, argv, { cwd: TOOLS_DIR, encoding: "utf8", timeout });
+  if (r.error) return { ok: false, error: r.error.message };
+  if (r.status !== 0) return { ok: false, error: ((r.stderr || r.stdout || "").trim().split("\n").pop() || `exit ${r.status}`).slice(0, 200) };
+  return { ok: true };
+};
+
+const results = [];
+let restart = null;
+for (const s of steps) {
+  if (s.kind === "manual") { results.push(s); continue; }
+  if (s.id === "restart") { restart = s; continue; }
+  let r;
+  try {
+    if (s.id.startsWith("gh-var:")) r = sh("gh", ["variable", "set", "JORI_ASSISTANT_NAME", "--repo", s.repo, "--body", cur.assistant_name], 60_000);
+    else if (s.id === "apps") r = sh(process.execPath, [bin("app-build"), "all"], 120_000);
+    else if (s.id === "wiki") r = sh(process.execPath, [bin("wiki-worker-deploy")]);
+    else if (s.id === "email-route") { await ensureCloudflareRoute(env.emailRouting, cur.agent_email); r = { ok: true }; }
+    else r = { ok: false, error: "unknown step" };
+  } catch (e) { r = { ok: false, error: e.message }; }
+  results.push({ ...s, ...r });
+  say(`${r.ok ? "✓" : "✗"} ${s.what}${r.ok ? "" : `: ${r.error}`}`);
+}
+if (restart) results.push({ ...restart, ok: true });
+
+writeState(file, cur);
+const text = summary(prev, cur, results);
+spawnSync(process.execPath, [bin("jori-notify"), "--title", cur.assistant_name || "Assistant", text], { cwd: TOOLS_DIR, timeout: 30_000 });
+say(text);
+fs.rmSync(lock, { force: true });
+
+// Last: a restart can end the process tree this run belongs to.
+if (restart) {
+  if (process.platform === "darwin") spawnSync("launchctl", ["kickstart", "-k", `gui/${process.getuid()}/${svc.label}`], { timeout: 30_000 });
+  else spawnSync("systemctl", ["--user", "restart", "jori.service"], { timeout: 30_000 });
+}

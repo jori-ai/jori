@@ -112,10 +112,14 @@ jobs:
       - name: Installation build configuration
         env:
           JORI_INSTALLATION_XCCONFIG: ${{ secrets.JORI_INSTALLATION_XCCONFIG }}
+          JORI_ASSISTANT_NAME: ${{ vars.JORI_ASSISTANT_NAME }}
         run: |
           if [ -n "$JORI_INSTALLATION_XCCONFIG" ]; then
             printf '%s\n' "$JORI_INSTALLATION_XCCONFIG" > Config/Installation.xcconfig
           fi
+          # The app is called what the assistant is called: the repository
+          # variable JORI_ASSISTANT_NAME (instance.json assistant_name), when set.
+          if [ -n "$JORI_ASSISTANT_NAME" ]; then printf '\nJORI_DISPLAY_NAME = %s\n' "$JORI_ASSISTANT_NAME" >> Config/Installation.xcconfig; fi
           TEAM=$(sed -n 's/^JORI_TEAM_ID *= *//p' Config/Jori.xcconfig Config/Installation.xcconfig 2>/dev/null | tail -1)
           echo "JORI_TEAM_ID=$TEAM" >> "$GITHUB_ENV"
 

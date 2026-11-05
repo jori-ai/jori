@@ -14,7 +14,7 @@ This job is the ambient awareness layer — sibling to `location-enrich` (asks c
 
 **Fire when the user STOPS, not while walking.** Only urgent pings go out while the user is moving; non-urgent ones wait until the user is stationary, because a ping that lands in a pocket is not a quieter ping, it is a lost one — the banner is gone by the time the phone comes out. This does **not** weaken the timeliness rule below; it satisfies both, because someone standing still in a neighborhood is still next to what's near them. **Proximity is measured from where the user stopped, and the tick that speaks is the one where the user has just stopped moving.**
 
-This job is the reason the system-wide motion gate (`lib/motion-state.mjs`, applied at the `sendApnsPush` chokepoint) has an explicit design partner rather than an exemption: ambient pings are non-urgent by nature, so under the gate they would be parked and flushed later at a place where the rec no longer applies. Re-anchoring the trigger is what keeps them timely instead of merely delayed.
+This job is the reason the system-wide motion gate (`lib/motion-state.mjs`, applied at the `sendApnsPush` chokepoint) has an explicit design partner rather than an exemption: ambient pings are non-urgent by nature, and a rec heard mid-walk is one the user cannot act on. Re-anchoring the trigger keeps them timely. (Since 2026-11-05 the gate sends to a moving user at once and re-pings an unread push on stopping; it no longer parks anything.)
 
 **Timeliness: a location-based rec goes out when the user is actually there** — as close to the reference point as possible, triggered by the current GPS reading. The failure this closes: at 10:00 local, walking through a neighborhood, the job sent a time-of-day-flavored roundup of three venues spread across the neighborhood ("<neighborhood> morning — <street> has great falafel and bakeries, and <shop> if you want real jam"), not anchored to where the user actually stood at that moment. The cron tick had fired, the user was wandering (both true), and the job filled the slot with the best neighborhood-level content it could find instead of asking the one question that matters: **is the user standing next to any specific one of these right now?** Step 2.5 below makes that question the gate, not an afterthought — and Step 3's one-place rule stops "morning roundup" content from recurring under a different tier.
 
@@ -202,7 +202,7 @@ This bumps `today.pings` / `last_ping_at` in `data/hum-state.json` — the same 
 ## Guardrails
 
 - **Never recommend a place already on today's calendar or already visited today** — check Step 2.0's exclusion set before surfacing anything, in every tier.
-- **Never speak while the user is moving** — walking, cycling, scooting or driving. It cannot be read, and the system-wide motion gate would park it anyway (see `lib/motion-state.mjs`). Speak on the tick where the user has just stopped.
+- **Never speak while the user is moving** — walking, cycling, scooting or driving. It cannot be acted on mid-walk (see `lib/motion-state.mjs`). Speak on the tick where the user has just stopped.
 - **Never speak unless a specific candidate is within `TRIGGER_RADIUS_M` (150m) of the stop's GPS fix** — a cron tick landing during a wandering session is not, by itself, a reason to say something. Proximity is the trigger; the tick is only when we check.
 - **Never bundle multiple venues in one message** — one candidate, the closest one, per ping.
 - **Max 1 ambient ping per walking session, 90-min cool-down**

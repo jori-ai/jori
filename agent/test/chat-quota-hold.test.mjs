@@ -122,6 +122,156 @@ describe("chat quota: watchdog leaves a holding chat alone", () => {
   });
 });
 
+// ─── watchdog.sh: a chat backlog a restart emptied says so ──────────────
+// THE LINE THIS DEFENDS: "✅ Recovered: chat agent queue backlog is back to
+// normal — auto-healed", sent after a chat process was stopped with messages
+// queued and the new process started with none: the queue had been thrown
+// away, not worked through. /health startedAt (the process's own start)
+// changing between two ticks while a backlog was queued is the restart;
+// /health queueRestored says whether the new process reloaded the saved queue.
+// Runs the real "Chat supervisor health" section tick by tick in bash, with the
+// real incident_* / notify functions and the helper under test, and curl, the
+// agent config and the sender stubbed. WATCHDOG_SH points it at a proposed copy.
+{
+  const SRC = fs.readFileSync(process.env.WATCHDOG_SH || WATCHDOG, "utf8");
+  const fnSrc = (name) => {
+    const start = SRC.indexOf(`\n${name}() {`);
+    assert.notEqual(start, -1, `${name} must be defined in watchdog.sh`);
+    return SRC.slice(start + 1, SRC.indexOf("\n}\n", start) + 3);
+  };
+  const between = (from, to) => {
+    const start = SRC.indexOf(from);
+    assert.notEqual(start, -1, `expected "${from}" in watchdog.sh`);
+    const end = SRC.indexOf(to, start);
+    assert.notEqual(end, -1, `expected "${to}" after "${from}"`);
+    return SRC.slice(start, end);
+  };
+
+  const ticker = () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "wd-chat-backlog-"));
+    const bin = path.join(root, "bin");
+    const conf = path.join(root, "config");
+    fs.mkdirSync(bin);
+    fs.mkdirSync(conf);
+    fs.mkdirSync(path.join(root, "home/Dev/jori/data"), { recursive: true });
+    const stub = (p, body) => { fs.writeFileSync(p, `#!/bin/bash\n${body}\n`); fs.chmodSync(p, 0o755); return p; };
+    // curl: a POST is recorded; anything else is the /health read.
+    stub(path.join(bin, "curl"), 'case "$*" in *-X\\ POST*) echo "$*" >> "$STUB_LOG_DIR/posts" ;; *) cat "$FAKE_HEALTH" ;; esac');
+    stub(path.join(conf, "load-agent.sh"), "echo AGENT_SUPERVISOR_HEALTH_PORT=9094");
+    const send = stub(path.join(bin, "send"), 'printf "%s\\n" "${@: -1}" >> "$STUB_LOG_DIR/sent"');
+    const script = [
+      'LOG="$HOME/watchdog.log"',
+      'log() { echo "$(date \'+%Y-%m-%d %H:%M:%S\') $1" >> "$LOG"; }',
+      `SEND=${JSON.stringify(send)}`,
+      'EMAIL_SEND="/nonexistent/email-send"',
+      `CONFIG_DIR=${JSON.stringify(conf)}`,
+      'PENDING_ALERT_KEY=""',
+      'INCIDENT_DIR="$HOME/Dev/jori/data/watchdog-incidents"',
+      'mkdir -p "$INCIDENT_DIR"',
+      "STALE_EVENT_MS=600000; QUEUE_BACKLOG_WARN=5; QUEUE_BACKLOG_ALERT=10",
+      'ISSUES=""',
+      fnSrc("notify"),
+      fnSrc("_incident_label"),
+      fnSrc("incident_seen"),
+      fnSrc("incident_clear"),
+      fnSrc("incident_should_alert"),
+      // the helper, with the two state-file paths set just above it
+      between("\nCHAT_BACKLOG_PROC=", "\nchat_backlog_restart_note() {"),
+      fnSrc("chat_backlog_restart_note"),
+      between("# --- Chat supervisor health ---", "# --- Chat message delivery check"),
+    ].join("\n");
+    const healthFile = path.join(root, "health.json");
+    const sentFile = path.join(root, "sent");
+    let seen = 0;
+    const tick = (health) => {
+      fs.writeFileSync(healthFile, JSON.stringify({ childAlive: true, lastEventAgeMs: 1000, phoneChannelHeartbeatAgeMs: 1000, ...health }));
+      execSync("bash", {
+        input: script,
+        encoding: "utf8",
+        env: { PATH: `${bin}:/usr/bin:/bin:/opt/homebrew/bin`, HOME: path.join(root, "home"), STUB_LOG_DIR: root, FAKE_HEALTH: healthFile },
+      });
+      const sent = fs.existsSync(sentFile) ? fs.readFileSync(sentFile, "utf8").split("\n").filter(Boolean) : [];
+      const fresh = sent.slice(seen);
+      seen = sent.length;
+      return fresh;
+    };
+    const dataFile = (name) => path.join(root, "home/Dev/jori/data", name);
+    return { tick, dataFile, cleanup: () => fs.rmSync(root, { recursive: true, force: true }) };
+  };
+
+  const A = "2026-01-05T06:00:00.000Z";   // the first process's start
+  const B = "2026-01-05T09:59:51.000Z";   // the process after the restart
+  const pagedBacklog = (t, startedAt = A) => {
+    const first = t.tick({ startedAt, queueDepth: 11, queueRestored: 0 });
+    assert.equal(first.length, 1, "the backlog pages on its first tick");
+    assert.ok(first[0].startsWith("⚠️ Chat queue backlog: 11 tasks queued"), first[0]);
+  };
+
+  describe("chat queue: watchdog says when a restart, not answered turns, emptied a backlog", () => {
+    it("a restart that drops the queue says so instead of 'auto-healed'", () => {
+      const t = ticker();
+      try {
+        pagedBacklog(t);
+        assert.deepEqual(t.tick({ startedAt: B, queueDepth: 0, queueRestored: 0 }), []);
+        assert.deepEqual(t.tick({ startedAt: B, queueDepth: 0, queueRestored: 0 }), []);
+        assert.deepEqual(t.tick({ startedAt: B, queueDepth: 0, queueRestored: 0 }), [
+          "✅ Recovered: chat agent queue backlog is back to normal — the chat process restarted and dropped the 11 messages queued at the previous check, unanswered, stable for 3 checks.",
+        ]);
+        assert.equal(fs.existsSync(t.dataFile(".watchdog-chat-backlog-note")), false, "the note goes with the recovery line");
+        assert.deepEqual(fs.readdirSync(t.dataFile("watchdog-incidents")), [],
+          "the incident is closed, and none of this lands in the incident dir, which `jori watchdog` lists");
+      } finally {
+        t.cleanup();
+      }
+    });
+
+    it("a restart whose new process reloaded the queue says it was restored", () => {
+      const t = ticker();
+      try {
+        pagedBacklog(t);
+        assert.deepEqual(t.tick({ startedAt: B, queueDepth: 11, queueRestored: 11 }), [], "still a backlog, already paged");
+        for (let i = 0; i < 2; i++) assert.deepEqual(t.tick({ startedAt: B, queueDepth: 0, queueRestored: 11 }), []);
+        assert.deepEqual(t.tick({ startedAt: B, queueDepth: 0, queueRestored: 11 }), [
+          "✅ Recovered: chat agent queue backlog is back to normal — the chat process restarted with a backlog and reloaded its 11 queued items from disk, and the queue has since drained, stable for 3 checks.",
+        ]);
+      } finally {
+        t.cleanup();
+      }
+    });
+
+    it("a backlog the same process works through keeps the old line", () => {
+      const t = ticker();
+      try {
+        pagedBacklog(t);
+        for (let i = 0; i < 2; i++) assert.deepEqual(t.tick({ startedAt: A, queueDepth: 0, queueRestored: 0, restartCount: 1 }), []);
+        assert.deepEqual(t.tick({ startedAt: A, queueDepth: 0, queueRestored: 0, restartCount: 1 }), [
+          "✅ Recovered: chat agent queue backlog is back to normal — auto-healed, stable for 3 checks.",
+        ], "an in-process /restart hands the queue over: same startedAt, not a drop");
+      } finally {
+        t.cleanup();
+      }
+    });
+
+    it("a restart with no backlog queued at the last check notes nothing", () => {
+      const t = ticker();
+      try {
+        pagedBacklog(t);
+        for (let i = 0; i < 3; i++) t.tick({ startedAt: A, queueDepth: 0, queueRestored: 0 });   // recovered, auto-healed
+        assert.deepEqual(t.tick({ startedAt: B, queueDepth: 0, queueRestored: 0 }), []);
+        assert.equal(fs.existsSync(t.dataFile(".watchdog-chat-backlog-note")), false);
+        // and a fresh backlog in the new process recovers with the plain line again
+        pagedBacklog(t, B);
+        for (let i = 0; i < 2; i++) t.tick({ startedAt: B, queueDepth: 0, queueRestored: 0 });
+        assert.deepEqual(t.tick({ startedAt: B, queueDepth: 0, queueRestored: 0 }), [
+          "✅ Recovered: chat agent queue backlog is back to normal — auto-healed, stable for 3 checks.",
+        ]);
+      } finally {
+        t.cleanup();
+      }
+    });
+  });
+}
+
 // ─── Part 2: the real chat supervisor ───────────────────────────────────
 
 function canChildListen() {
@@ -311,6 +461,30 @@ describe("chat quota: supervisor end to end", { skip: !canChildListen() && "chil
     assert.equal(sent().length, 1, "no turn sent after the restart");
     assert.ok(h.rateLimitHoldUntil, "hold carried onto the new dispatcher");
     assert.equal(notices().length, 1);
+  });
+
+  // The 2026-10-28 shape: messages waiting out a hold, then the whole process
+  // stopped. They used to be gone; now the next process reloads them, still held.
+  it("a message refused during a hold survives a whole-process restart, still held, and is not counted as running", async () => {
+    const first = await boot(["--mode", "reset"]);
+    await first.dispatch("QUOTA-TEST resend yesterday's summary", "m1");
+    assert.ok(await waitFor(async () => (await httpJson("GET", first.port, "/health")).rateLimitHoldUntil), `never held: ${first.log().slice(-2000)}`);
+    const queueFile = path.join(first.box.stateDir, "queue.json");
+    let saved = JSON.parse(fs.readFileSync(queueFile, "utf8"));
+    const m1 = saved.queue.find((i) => i.msgId === "m1");
+    assert.ok(m1 && m1.quotaRetried, "the refused message is saved, queued again");
+    assert.equal(m1.dispatchedAt, undefined, "it never ran, so it carries no dispatch time");
+    proc.kill("SIGTERM");
+    await new Promise((r) => proc.on("exit", r));
+
+    const second = await start(first.box, ["--mode", "reset"]);
+    assert.ok(await waitFor(() => second.log().includes("restored 1 queued item(s)")), second.log().slice(-2000));
+    const h = await httpJson("GET", second.port, "/health");
+    assert.ok(h.rateLimitHoldUntil, "the hold is restored too");
+    assert.equal(h.queueRestored, 1);
+    saved = JSON.parse(fs.readFileSync(queueFile, "utf8"));
+    assert.equal(saved.queue.find((i) => i.msgId === "m1").diedMidTurn, undefined, "waiting through a restart is not dying mid-turn");
+    assert.equal(second.sent().length, 1, "still held: nothing new reaches the CLI");
   });
 
   it("with no reset time it retries once after the hold, answers, and marks the header", async () => {

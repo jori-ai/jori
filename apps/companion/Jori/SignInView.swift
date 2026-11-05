@@ -12,11 +12,11 @@ struct SignInView: View {
 
             JoriMark(size: 136)
 
-            Text("Jori")
+            Text(Install.displayName)
                 .font(JoriTheme.display(46))
                 .padding(.top, 36)
 
-            Text("Sign in with the Google account Jori works for.")
+            Text("Sign in with the Google account \(Install.displayName) works for.")
                 .font(.body)
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
