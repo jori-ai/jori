@@ -25,7 +25,8 @@ import render from "../../lib/wiki-render.js";
 import portalLib from "../../lib/wiki-portal.js";
 import scopeLib from "../../lib/wiki-scope.js";
 
-// The assistant's name, from the ASSISTANT_NAME var ([vars] in wrangler.toml).
+// The assistant's name, from the ASSISTANT_NAME var; its pronouns from
+// ASSISTANT_PRONOUNS (both passed by bin/wiki-worker-deploy from instance.json).
 const assistant = (env) => env.ASSISTANT_NAME || "Jori"; // control-scan-ok: the setting's default
 // The site icon: the default export of the module the deploy config's [alias]
 // maps "wiki-favicon" to — an installation's module re-exporting its PNG
@@ -212,7 +213,7 @@ const deny = (msg) => html(403, shell("Not authorised", `<h1>Not authorised</h1>
 
 export default {
   async fetch(req, env) {
-    portalLib.setAssistant(assistant(env));
+    portalLib.setAssistant(assistant(env), env.ASSISTANT_PRONOUNS || "it/its");
     const u = new URL(req.url);
 
     // Liveness — before the identity gate, and reveals nothing.

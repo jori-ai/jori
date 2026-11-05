@@ -106,6 +106,7 @@ export default {
       inst.home_city = await ask("Your home city, in words (optional)", existing.home_city || "");
       inst.partner_name = await ask("A partner the assistant also acts for, first name (optional)", existing.partner_name || "");
       inst.assistant_name = await ask("What should the assistant be called?", existing.assistant_name || "Jori");  // control-scan-ok: the software's name
+      inst.assistant_pronouns = await ask("Its pronouns (she/her, he/him, they/them, it/its)", existing.assistant_pronouns || "it/its");
       for (const k of ["home_city", "partner_name"]) if (!inst[k]) delete inst[k];
 
       console.log(c.bold("\n  Webhook channel"));

@@ -72,3 +72,11 @@ test("cloudflare route: existing rule is left alone, a missing one is added", as
   assert.deepEqual(calls, ["GET", "GET", "POST"]);
   await assert.rejects(ensureCloudflareRoute(cfg, "b@x.co", { fetchFn: mk([]), env: {} }), /not set/);
 });
+
+test("pronouns: a change redeploys the wiki and restarts; an unrecorded key is not a change", () => {
+  const p0 = { ...prev, assistant_pronouns: "it/its" };
+  const ids = plan(p0, { ...p0, assistant_pronouns: "she/her" }, env).map((s) => s.id);
+  assert.deepEqual(ids, ["wiki", "restart"]);
+  assert.deepEqual(changedKeys(prev, { ...prev, assistant_pronouns: "she/her" }), []);
+  assert.match(summary(p0, { ...p0, assistant_pronouns: "she/her" }, []), /pronouns it\/its → she\/her/);
+});

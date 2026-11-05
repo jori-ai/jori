@@ -5,7 +5,8 @@
 // The worker cannot read agent/local/instance.json, so the values it needs
 // from there are passed at deploy time as wrangler vars instead of being
 // copied into its config by hand:
-//   ASSISTANT_NAME   instance.json `assistant_name` (what the pages call it)
+//   ASSISTANT_NAME       instance.json `assistant_name` (what the pages call it)
+//   ASSISTANT_PRONOUNS   instance.json `assistant_pronouns` (e.g. she/her)
 // Everything else (route, Supabase URL, Access team) stays in the
 // installation's own config: agent/local/wiki-worker/wrangler.toml.
 //
@@ -26,7 +27,7 @@ if (!fs.existsSync(config)) {
   process.exit(2);
 }
 
-const vars = { ASSISTANT_NAME: inst.assistantName() };
+const vars = { ASSISTANT_NAME: inst.assistantName(), ASSISTANT_PRONOUNS: inst.assistantPronouns().label };
 const cmd = ["deploy", "--config", config, ...Object.entries(vars).map(([k, v]) => ["--var", `${k}:${v}`]).flat()];
 if (args.includes("--dry-run")) cmd.push("--dry-run");
 

@@ -279,7 +279,7 @@ struct PurchaseApprovalPairingView: View {
                 } header: {
                     Text("Pairing code")
                 } footer: {
-                    Text("Ask \(Install.displayName) for a purchase pairing code (it runs `purchase pair` on the host). Codes expire after 15 minutes and work once.")
+                    Text("Ask \(Install.displayName) for a purchase pairing code (\(Install.displayName) runs `purchase pair` on the host). Codes expire after 15 minutes and work once.")
                 }
                 if let message {
                     Section { Text(message).foregroundStyle(isError ? .red : .green) }
