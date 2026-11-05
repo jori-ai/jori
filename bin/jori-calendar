@@ -423,8 +423,8 @@ if (cmd === "create" && !createIsFree) {
 // existing description, attachments, a source link).
 //
 // "Made by Jori" is a fact this wrapper stamps on every create
-// (private extended property gandalf_created=1, below; the name is kept so
-// existing stamps stay valid); an event the user organizes without it is the
+// (private extended property jori_created=1, below; events created before
+// 2026-11-05 carry gandalf_created=1, which still counts); an event the user organizes without it is the
 // user's. Events created before the stamp carry none and are treated as the
 // user's — the safe side. Whether an email is the confirmation for the same
 // booking is the calling agent's judgment; the wrapper requires it to name that
@@ -472,7 +472,7 @@ if (cmd === "update") {
     const priv = (ev && ev.extendedProperties && ev.extendedProperties.private) || {};
     // jori_booking_ref is stamped on the user's own events too (update
     // --booking-ref), so it never marks an event as Jori's.
-    const joriMade = priv.gandalf_created === "1" || Object.keys(priv).some((k) => k !== "jori_booking_ref");
+    const joriMade = priv.jori_created === "1" || priv.gandalf_created === "1" || Object.keys(priv).some((k) => k !== "jori_booking_ref");
     ownerEvent = readFailed ? null : Boolean(organizerSelf && !joriMade);
     if (readFailed || ownerEvent) {
       const refusals = [];
@@ -520,7 +520,7 @@ if (addAttendees.length) gogArgs.push("--add-attendee", addAttendees.join(","));
 gogArgs.push("--send-updates", sendUpdates || (attendees.length ? "all" : "none"));
 // Stamp every event Jori creates, so the owner-event rule above can tell
 // Jori's events from the ones the user made.
-if (cmd === "create") gogArgs.push("--private-prop", "gandalf_created=1");
+if (cmd === "create") gogArgs.push("--private-prop", "jori_created=1");
 // The booking's confirmation number, so the guard above finds it by its stamp.
 if (bookingRef) gogArgs.push("--private-prop", `jori_booking_ref=${bookingRef}`);
 gogArgs.push(...argv);
