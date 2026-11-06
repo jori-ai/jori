@@ -3,6 +3,7 @@ import Foundation
 #if os(iOS)
 import UIKit
 import CoreMotion
+import CoreLocation
 import Supabase
 
 /// Publishes the device's current motion + Wi-Fi snapshot to the Supabase
@@ -137,6 +138,88 @@ enum PhoneContextPublisher {
         let wifi_ssid: String?
         let wifi_bssid: String?
         let trigger: String
+        let ts: String
+    }
+}
+
+/// Publishes the newest position to `live_position` (one row per device) while
+/// the user is out of the house, so the server can react within seconds.
+///
+/// `location_history` waypoints are recorded at most every 2 minutes and
+/// uploaded every 5, so a local-history ping built from them arrived after the
+/// user had walked past the building. This is the fast lane beside that
+/// record, not a replacement: bin/local-history-live listens to the row over
+/// Realtime. Throttled here so a walk costs one small upsert every ~30 s.
+@MainActor
+enum LivePositionPublisher {
+    /// Fixes coarser than this cannot say which building the user is next to.
+    private static let maxAccuracyM: Double = 65
+    /// Never more often than this…
+    private static let minIntervalS: TimeInterval = 20
+    /// …and, standing still, only this often.
+    private static let idleIntervalS: TimeInterval = 90
+    /// Movement that earns a publish before the idle interval.
+    private static let minMoveM: Double = 25
+
+    private static var lastAt: Date?
+    private static var lastLat: Double?
+    private static var lastLon: Double?
+    private static var inFlight = false
+
+    static func maybePublish(latitude: Double, longitude: Double, accuracy: Double,
+                             timestamp: Date, motion: String?) {
+        guard accuracy >= 0, accuracy <= maxAccuracyM else { return }
+        // A cached fix iOS hands back late says nothing about now.
+        guard Date().timeIntervalSince(timestamp) < 60 else { return }
+        guard !inFlight else { return }
+        if let at = lastAt {
+            let elapsed = timestamp.timeIntervalSince(at)
+            if elapsed < minIntervalS { return }
+            let moved = (lastLat != nil && lastLon != nil)
+                ? CLLocation(latitude: latitude, longitude: longitude)
+                    .distance(from: CLLocation(latitude: lastLat!, longitude: lastLon!))
+                : .infinity
+            if moved < minMoveM && elapsed < idleIntervalS { return }
+        }
+        lastAt = timestamp
+        lastLat = latitude
+        lastLon = longitude
+        inFlight = true
+        Task {
+            defer { inFlight = false }
+            guard let deviceId = await deviceId() else { return }
+            let row = LivePositionRow(
+                device_id: deviceId, latitude: latitude, longitude: longitude,
+                accuracy_m: accuracy, motion: motion,
+                ts: ISO8601DateFormatter().string(from: timestamp)
+            )
+            do {
+                try await SupabaseManager.ensureAuthenticated()
+                try await SupabaseManager.shared
+                    .from("live_position")
+                    .upsert(row, onConflict: "device_id")
+                    .execute()
+            } catch {
+                print("[LivePosition] upsert failed: \(error.localizedDescription)")
+            }
+        }
+    }
+
+    /// Same key as PhoneContextPublisher, so every per-device row agrees.
+    private static func deviceId() async -> String? {
+        if let token = UserDefaults.standard.string(forKey: Install.key("apnsDeviceToken")),
+           !token.isEmpty {
+            return token
+        }
+        return UIDevice.current.identifierForVendor?.uuidString
+    }
+
+    private struct LivePositionRow: Encodable {
+        let device_id: String
+        let latitude: Double
+        let longitude: Double
+        let accuracy_m: Double
+        let motion: String?
         let ts: String
     }
 }

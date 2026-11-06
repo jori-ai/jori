@@ -12,7 +12,7 @@ import { fileURLToPath } from "node:url";
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const DIRS = ["agent/scripts/hum-harvesters", "agent/scripts/hum-sensors"];
 // Optional files (an installation's own) are checked when present.
-const FILES = ["agent/scripts/hum-tick.mjs", "agent/scripts/hum-harvest-all.mjs", "lib/local-lore.mjs", "lib/place-lore.mjs"]
+const FILES = ["agent/scripts/hum-tick.mjs", "agent/scripts/hum-harvest-all.mjs", "lib/local-lore.mjs", "lib/place-lore.mjs", "bin/local-history-live", "lib/local-history-live.mjs"]
   .filter((f) => fs.existsSync(path.join(ROOT, f)));
 // Code, not comments: strip // and /* */ before looking.
 const code = (src) => src.replace(/\/\*[\s\S]*?\*\//g, "").split("\n").map((l) => l.replace(/(^|[^:])\/\/.*$/, "$1")).join("\n");
