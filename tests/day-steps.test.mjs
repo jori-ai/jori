@@ -12,7 +12,7 @@ import { createRequire } from "node:module";
 
 const require = createRequire(import.meta.url);
 const { stepSeries, walkSpans, annotateDaySteps } = require("../lib/day-steps.js");
-const { buildSkeleton, buildMarkdown } = require("../lib/daily-summary-render.js");
+const { buildSkeleton, buildMarkdown, _internal } = require("../lib/daily-summary-render.js");
 
 const T0 = Date.parse("2026-03-02T05:00:00Z"); // 00:00 New York
 const at = (h, m = 0) => T0 + (h * 60 + m) * 60000;
@@ -98,6 +98,36 @@ test("the email and the wiki print the walk and the day's total", () => {
   const md = buildMarkdown(d);
   assert.match(md, /\*9,000 steps\*/);
   assert.match(md, /Walk 8:30 to 9:00am · 30 min · 2,700 steps/);
+});
+
+test("a walk with only a step count is given the day's stride, and the header counts it", () => {
+  // The header's miles are the lines summed; a step-only walk line used to add
+  // nothing, so a day of many short walks read a few miles short of its steps.
+  const d = { ...day(), map_url: "https://example.invalid/map.png" };
+  annotateDaySteps(d, [
+    ...readings(at(0, 5), at(0, 10), 2),
+    ...readings(at(8, 30), at(9), 90),      // the morning walk GPS missed: 2,700 steps
+    ...readings(at(12), at(12, 20), 100),   // the mapped walk to the cafe: 1,500 m over 2,000 steps
+    ...readings(at(23, 50), at(23, 55), 2),
+  ], 9000, { startMs: at(0), endMs: at(24) });
+  const html = buildSkeleton(d);
+  // 2,700 steps at the mapped walk's 0.75 m a step is about 2,025 m
+  assert.match(html, /Walk 8:30 to 9:00am · 30 min · about 1\.3 mi · 2,700 steps/);
+  // 1,500 m to the cafe plus that estimate, marked as partly estimated
+  assert.match(html, /about 2\.2 miles walked/);
+  assert.match(buildMarkdown(d), /Walk 8:30 to 9:00am · 30 min · about 1\.3 mi · 2,700 steps/);
+});
+
+test("the stride comes from walk blocks first, and a stride no walker has is left out", () => {
+  const { dayStrideM } = _internal;
+  const spine = [
+    { type: "leg", mode: "walking", walked_m: 1500, steps: 2000 },
+    { type: "leg", mode: "walking", walked_m: 11000, steps: 1500 },   // a ride the pace called walking
+  ];
+  assert.equal(dayStrideM({ stops: [], path: { spine } }), 0.75);
+  assert.equal(dayStrideM({ stops: [{ excursion: { routed_m: 2000, steps: 4000 } }], path: { spine } }), 0.5);
+  // too few steps to measure a stride: the line keeps no distance
+  assert.equal(dayStrideM({ stops: [], path: { spine: [{ type: "leg", mode: "walking", walked_m: 300, steps: 400 }] } }), null);
 });
 
 test("no readings: nothing changes and nothing prints", () => {
