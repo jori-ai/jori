@@ -15,6 +15,16 @@
 //
 //   projected = utilization + pace_per_day * days_until_reset
 //
+// Two things in that growth are not the week's pace and are taken out. A span
+// shorter than MIN_RATE_SPAN_H is not rated at all: the nightly batch of heavy
+// jobs is a fixed share of every day, and half a day that holds it reads as
+// twice the real rate. And a job the governor itself held and then released
+// (state `released`) is a one-off catch-up run: the span's growth is scaled
+// down by the share of its ledger spend that went to such runs, capped at
+// MAX_CATCHUP_SHARE because the scaling also shrinks usage no ledger sees (chat,
+// interactive sessions), which is the cliff direction. Without this, the run released at a reset made the
+// first day of every window read as on pace to run out.
+//
 // THE COST ESTIMATE of one run of a job, as a share of the week, is learned
 // from the job's own history: the median total_cost_usd of its last runs in
 // the job-costs ledgers, divided by what one whole allowance cost in the same
@@ -83,7 +93,9 @@ const { localConfig } = require("../lib/instance.cjs");
 const HOLD = 3;
 const CHEAPER = 4;
 const MAX_SAMPLE_AGE_H = 6;     // older than this, the reading says nothing about now
-const MIN_RATE_SPAN_H = 12;     // a younger window is too short to rate (an overnight burst x the whole week): run
+const MIN_RATE_SPAN_H = 20;     // a younger window is too short to rate (one nightly batch x the whole week): run
+const CATCHUP_H = 12;           // a released job's ledger rows up to this long after its release are its catch-up run
+const MAX_CATCHUP_SHARE = 0.5;  // never discount more than half the growth: the scaling also shrinks unledgered usage
 const PACE_LOOKBACK_H = 24;     // pace = growth over the last day of the window
 const TAIL_BYTES = 24 * 1024 * 1024; // the logs run to 100+ MB; a day of samples sits in the tail
 const RESET_DROP = 0.02;        // utilization is reported to 2dp; only a real drop is a reset
@@ -212,13 +224,35 @@ function reading(cfg) {
     return { hold: true, reason: `the week is at ${pct(util)}, past the ${brake}; waits for the reset at ${resets_at}`, utilization: util, projected: util, pace_per_day: null, resets_at, span, threshold };
   }
   if (spanH < MIN_RATE_SPAN_H) return open(`only ${spanH.toFixed(1)}h of this window to rate; week at ${pct(util)}`, { utilization: util, resets_at });
-  const pace = Math.max(0, (last.u - base.u) / (spanH / 24));
+  let catchUp = 0;
+  try { catchUp = catchUpShare(span); } catch { catchUp = 0; } // on doubt, the plain growth: never a lower pace
+  const pace = Math.max(0, (last.u - base.u) * (1 - catchUp) / (spanH / 24));
   const projected = util + pace * daysLeft;
   const facts = { utilization: util, projected: +projected.toFixed(3), pace_per_day: +pace.toFixed(3), resets_at, span, threshold };
+  if (catchUp > 0) facts.catch_up_share = +catchUp.toFixed(3);
   if (projected >= threshold) {
     return { hold: true, reason: `the week is at ${pct(util)} and on pace for ${pct(projected)} by the reset at ${resets_at} (${pct(pace)}/day), past the ${brake}`, ...facts };
   }
   return open(`the week is at ${pct(util)}, on pace for ${pct(projected)} by the reset; under the ${brake}`, facts);
+}
+
+/**
+ * The share of the span's ledger spend that went to catch-up runs: jobs this
+ * governor held and released in the span or up to CATCHUP_H before it (a run
+ * released just before the span still spends inside it), counting each one's
+ * rows in the span from its release to CATCHUP_H after. Capped at MAX_CATCHUP_SHARE. 0 when nothing was released or nothing is on the
+ * ledger for the span.
+ */
+function catchUpShare(span) {
+  const rel = (readState().released || []).map((x) => ({ job: x && x.job, at: Date.parse((x && x.at) || "") }))
+    .filter((x) => x.job && Number.isFinite(x.at) && x.at >= span.from - CATCHUP_H * 3600e3 && x.at <= span.to);
+  if (!rel.length) return 0;
+  const rows = ledgerRows().filter((x) => x.t > span.from && x.t <= span.to);
+  const total = rows.reduce((a, x) => a + x.usd, 0);
+  if (!(total > 0)) return 0;
+  const isCatchUp = (x) => rel.some((r) => r.job === x.job && x.t >= r.at && x.t <= r.at + CATCHUP_H * 3600e3);
+  const catchup = rows.filter(isCatchUp).reduce((a, x) => a + x.usd, 0);
+  return Math.min(MAX_CATCHUP_SHARE, Math.max(0, catchup / total));
 }
 
 const median = (xs) => { const s = [...xs].sort((a, b) => a - b); const n = s.length; return n ? (n % 2 ? s[(n - 1) / 2] : (s[n / 2 - 1] + s[n / 2]) / 2) : null; };
