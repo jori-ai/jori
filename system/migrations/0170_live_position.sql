@@ -15,12 +15,8 @@ create table if not exists public.live_position (
   longitude   double precision not null,
   accuracy_m  real,
   motion      text,
-  ts          timestamptz not null,
-  updated_at  timestamptz not null default now()
+  ts          timestamptz not null
 );
-drop trigger if exists live_position_set_updated_at on public.live_position;
-create trigger live_position_set_updated_at before update on public.live_position
-  for each row execute function public.jori_touch_updated_at();
 
 alter table public.live_position enable row level security;
 -- The app upserts its own row (select + insert + update); the server reads it
@@ -35,4 +31,13 @@ drop policy if exists live_position_app_update on public.live_position;
 create policy live_position_app_update on public.live_position
   for update to authenticated using (public.jori_is_allowed_user()) with check (public.jori_is_allowed_user());
 
-select public.jori_realtime_add('live_position');
+-- Inline rather than public.jori_realtime_add(): an installation whose schema
+-- predates 0000_foundation has the allowlist function but not that helper.
+do $$
+begin
+  if exists (select 1 from pg_publication where pubname = 'supabase_realtime')
+     and not exists (select 1 from pg_publication_tables
+                      where pubname = 'supabase_realtime' and schemaname = 'public' and tablename = 'live_position') then
+    alter publication supabase_realtime add table public.live_position;
+  end if;
+end $$;
