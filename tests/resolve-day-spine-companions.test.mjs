@@ -131,3 +131,29 @@ test("a cut piece that begins at an open row's arrival keeps the row's people", 
   assert.deepEqual(pieceCompanions(blend, first, rows), []);
   assert.deepEqual(pieceCompanions(blend, second, rows), ["Paige"]);
 });
+
+// A stay that began the evening before is one visit row that arrived on the
+// previous day. The merge asked for rows by arrival inside the day, so the first
+// stop of the day, held up by that row, read without the people the row listed
+// while every later stop of the day carried them.
+const { visitCompanionRowsQuery } = _internal;
+
+test("the visit-row query takes rows that arrived inside the day and closed rows that ran into it", () => {
+  const start = "2026-01-15T05:00:00.000Z", end = "2026-01-16T05:00:00.000Z";
+  const q = decodeURIComponent(visitCompanionRowsQuery(start, end));
+  assert.ok(q.includes(`or=(arrived_at.gte.${start},departed_at.gte.${start})`), q);
+  assert.ok(q.includes(`arrived_at=lt.${end}`), q);
+  assert.ok(!/(^|&)arrived_at=gte\./.test(q), "arrival alone no longer bounds the day from below");
+  assert.ok(q.includes("segment_type=eq.visit") && q.includes("companions=not.is.null"));
+});
+
+test("an overnight row that arrived the evening before gives its people to the day's first stop", () => {
+  const night = spineStop("s-1", "00:00", "08:40");
+  const row = {
+    arrived_at: new Date(at("00:00") - 4 * 3600_000).toISOString(),
+    departed_at: new Date(at("08:40")).toISOString(),
+    latitude: AIRBNB.lat, longitude: AIRBNB.lon, companions: ["Paige"],
+  };
+  applyVisitCompanions([night], [row]);
+  assert.deepEqual(night.companions, ["Paige"]);
+});
