@@ -270,7 +270,6 @@ function printReadings(readings, state, names) {
 async function cmdCheck() {
   const nowMs = Date.now();
   const state = readState();
-  const prevConditions = state.conditions || {};
   const { readings, needs, unread } = await gather({ state, nowMs });
   const names = await propertyNames();
   const byLock = lh.needsByLock(needs, readings);
@@ -293,8 +292,8 @@ async function cmdCheck() {
       // and the next run tries again.
       log(`send FAILED, will retry next run: ${e.message}`);
       next = { ...next, conditions: { ...next.conditions } };
-      for (const a of planned.alerts) next.conditions[`${a.lock}|${a.kind}`].alerted_at = null;
-      for (const r of planned.recoveries) next.conditions[`${r.lock}|${r.kind}`] = prevConditions[`${r.lock}|${r.kind}`];
+      for (const a of planned.alerts) next.conditions[lh.conditionKey(a.lock, a.kind)].alerted_at = null;
+      for (const { recovered_at, ...c } of planned.recoveries) next.conditions[lh.conditionKey(c.lock, c.kind)] = c;
       process.exitCode = 1;
     }
   }

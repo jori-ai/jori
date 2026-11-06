@@ -107,7 +107,37 @@ test("an unreadable provider keeps its locks' conditions: no data is not a recov
   const acct = { key: "provider:ttlock", provider: "ttlock", name: "TTLock account", error: "HTTP 502" };
   r = lh.plan({ readings: [acct], state: r.state, nowMs: NOW + 2 * HOUR, cfg, unread: new Set(["provider:ttlock"]) });
   assert.equal(r.recoveries.length, 0);
-  assert.ok(r.state.conditions["ttlock:1|unreachable"].alerted_at);
+  assert.ok(r.state.conditions["ttlock:1|reach"].alerted_at);
+});
+
+// Guards the "🔐 Lock problem … no gateway paired" row that also said "✅ … no
+// longer gateway … offline" for the same lock: one gateway dropping in and out
+// is one problem, whichever layer reports it on a given run.
+test("a lock's reach problem changing layer is one condition: no recovery, no second alert, words follow the layer", () => {
+  const needs = new Map([["ttlock:1", [{ property: "P1", unit: "u1", atMs: null, why: "code-pending" }]]]);
+  const gwOff = ttl({ gateway: { id: 9, name: "Main GW", online: false }, probe: null });
+  const noGw = ttl({ has_gateway: false, gateway: null, probe: null });
+  const failed = ttl({ probe: { ok: false, errcode: ERR.FAILED, errmsg: "failed or means no" } });
+  let r = lh.plan({ readings: [gwOff], state: {}, needs, nowMs: NOW, cfg });
+  assert.equal(r.alerts.length, 1);
+  assert.equal(r.alerts[0].kind, "gateway_offline");
+  for (const [i, reading] of [noGw, failed].entries()) {
+    r = lh.plan({ readings: [reading], state: r.state, needs, nowMs: NOW + (i + 1) * HOUR, cfg });
+    assert.equal(r.alerts.length + r.recoveries.length, 0, "a change of layer says nothing");
+  }
+  assert.deepEqual(Object.keys(r.state.conditions), ["ttlock:1|reach"]);
+  assert.equal(r.state.conditions["ttlock:1|reach"].text, "the gateway can't reach the lock (the lock didn't answer it)");
+  r = lh.plan({ readings: [ttl()], state: r.state, needs, nowMs: NOW + 3 * HOUR, cfg });
+  assert.equal(r.recoveries.length, 1, "one recovery when it is really back");
+  assert.match(lh.compose({ alerts: [], recoveries: r.recoveries }).text, /no longer the gateway can't reach the lock$/);
+});
+
+test("state written under the old per-layer keys folds into the reach key: no spurious recovery on deploy", () => {
+  const old = { conditions: { "ttlock:1|gateway_offline": { lock: "ttlock:1", kind: "gateway_offline", name: "Back door", property: "P1", first_seen: new Date(NOW).toISOString(), runs: 3, alerted_at: new Date(NOW).toISOString(), text: "gateway GW offline" } } };
+  const r = lh.plan({ readings: [ttl({ has_gateway: false, gateway: null, probe: null })], state: old, nowMs: NOW + HOUR, cfg });
+  assert.equal(r.alerts.length + r.recoveries.length, 0);
+  assert.equal(r.state.conditions["ttlock:1|reach"].runs, 4);
+  assert.equal(lh.plan({ readings: [ttl()], state: old, nowMs: NOW + HOUR, cfg }).recoveries.length, 1);
 });
 
 // ── needs ───────────────────────────────────────────────────────────────────
