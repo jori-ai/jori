@@ -304,6 +304,37 @@ enum PurchaseApproval {
         return rows.first?.id
     }
 
+    /// A waiting purchase, as the Pending approvals list shows it.
+    struct Waiting: Identifiable {
+        let id: String
+        let title: String
+        let expiresAt: Date
+    }
+
+    /// Every still-actionable purchase, newest first (Pending approvals list).
+    static func fetchWaiting() async throws -> [Waiting] {
+        try await SupabaseManager.ensureAuthenticated()
+        let nowMs = Int64(Date().timeIntervalSince1970 * 1000)
+        struct Row: Decodable {
+            let id: String
+            let item_json: Item
+            let expires_at_ms: Int64
+        }
+        let rows: [Row] = try await SupabaseManager.shared
+            .from("purchase_approvals").select("id,item_json,expires_at_ms")
+            .eq("status", value: "pending")
+            .gt("expires_at_ms", value: String(nowMs))
+            .order("created_at", ascending: false).execute().value
+        return rows.map { r in
+            let it = r.item_json
+            let what = it.items.count == 1 ? it.items[0].title : "\(it.items.count) items"
+            return Waiting(
+                id: r.id,
+                title: "\(it.merchant): \(what) · \(money(it.totalCents, it.currency))",
+                expiresAt: Date(timeIntervalSince1970: Double(r.expires_at_ms) / 1000))
+        }
+    }
+
     /// The review-page screenshot, verified against the hash inside the item —
     /// so the picture the user approves is the one the signature covers.
     static func screenshot(for r: Request) async throws -> Data? {

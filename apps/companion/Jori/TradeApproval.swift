@@ -308,7 +308,7 @@ enum TradeApproval {
     // The push is not the only way in (2026-11-06: a push that never reached
     // the phone left a trade waiting with nothing to approve it from). The app
     // asks the trading web app for approvals still waiting — on launch, on
-    // foreground, and from Approvals › Pending trades — and opens each in the
+    // foreground, and from Approvals › Pending approvals — and opens each in the
     // same review screen. The read token used here can only LIST them;
     // approving still signs the exact orders with the enclave key (Face ID).
 
@@ -357,27 +357,49 @@ enum TradeApproval {
         return token
     }
 
+    /// A device paired before read tokens existed gets its first one without
+    /// Face ID, by its id plus its own push token. Nil when the server wants
+    /// the signed request instead (403).
+    private static func bootstrapReadToken(deviceId: String) async -> String? {
+        guard let apnsToken = UserDefaults.standard.string(forKey: apnsTokenKey),
+              let json = try? await post("/api/approval-devices/read-token", body: [
+                  "deviceId": deviceId,
+                  "apnsToken": apnsToken,
+              ]),
+              let token = json["readToken"] as? String
+        else { return nil }
+        storeReadToken(token)
+        return token
+    }
+
     private static func listPending(deviceId: String, token: String) async throws -> [Request] {
-        let json = try await post("/api/approval-devices/pending", body: [
-            "deviceId": deviceId,
-            "readToken": token,
-        ])
+        var body: [String: Any] = ["deviceId": deviceId, "readToken": token]
+        // Lets the server replace a stale push token (reinstall, restore).
+        if let apnsToken = UserDefaults.standard.string(forKey: apnsTokenKey) { body["apnsToken"] = apnsToken }
+        let json = try await post("/api/approval-devices/pending", body: body)
         let entries = json["pending"] as? [[String: Any]] ?? []
         return entries.compactMap { entry in
             parse(Dictionary(uniqueKeysWithValues: entry.map { (AnyHashable($0.key), $0.value) }))
         }
     }
 
-    /// Approvals waiting for this user, newest first. The first call on a
-    /// device paired before read tokens existed needs a read token, which
-    /// presents Face ID: pass interactive: true only from a user action
-    /// (Pending trades); the launch/foreground check passes false and then
-    /// returns [] until the token exists.
+    /// Thrown by fetchPending(interactive: false) when the device has no read
+    /// token and couldn't get one silently: the list then needs Face ID once.
+    static let needsUnlock = NSError(domain: "TradeApproval", code: 4031, userInfo: [
+        NSLocalizedDescriptionKey: "Unlock trade approvals with Face ID once to list them here."
+    ])
+
+    /// Approvals waiting for this user, newest first. Needs no Face ID: the
+    /// read token comes from pairing or, for an older pairing, silently from
+    /// bootstrapReadToken. Only if that is refused does it need the signed
+    /// request — interactive: true allows that Face ID prompt; false throws
+    /// `needsUnlock` instead.
     static func fetchPending(interactive: Bool) async throws -> [Request] {
         guard isEnabled, let deviceId = UserDefaults.standard.string(forKey: deviceIdKey) else { return [] }
         var token = loadReadToken()
+        if token == nil { token = await bootstrapReadToken(deviceId: deviceId) }
         if token == nil {
-            guard interactive else { return [] }
+            guard interactive else { throw needsUnlock }
             token = try await obtainReadToken(deviceId: deviceId)
         }
         do {
@@ -385,7 +407,7 @@ enum TradeApproval {
         } catch let error as NSError where error.code == 401 {
             // Token replaced or revoked: get a new one, if the user is here for it.
             storeReadToken(nil)
-            guard interactive else { return [] }
+            guard interactive else { throw needsUnlock }
             let fresh = try await obtainReadToken(deviceId: deviceId)
             return try await listPending(deviceId: deviceId, token: fresh)
         }
