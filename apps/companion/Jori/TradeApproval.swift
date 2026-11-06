@@ -252,6 +252,7 @@ enum TradeApproval {
                           userInfo: [NSLocalizedDescriptionKey: "Registration returned no deviceId"])
         }
         UserDefaults.standard.set(deviceId, forKey: deviceIdKey)
+        storeReadToken(json["readToken"] as? String)
     }
 
     // MARK: - Approve / deny
@@ -302,6 +303,94 @@ enum TradeApproval {
             userInfo: ["success": success, "message": message])
     }
 
+    // MARK: - Waiting approvals (no push needed)
+    //
+    // The push is not the only way in (2026-11-06: a push that never reached
+    // the phone left a trade waiting with nothing to approve it from). The app
+    // asks the trading web app for approvals still waiting — on launch, on
+    // foreground, and from Approvals › Pending trades — and opens each in the
+    // same review screen. The read token used here can only LIST them;
+    // approving still signs the exact orders with the enclave key (Face ID).
+
+    private static let readTokenService = Install.key("tradeApproval.readToken")
+
+    private static func loadReadToken() -> String? {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: readTokenService,
+            kSecReturnData as String: true,
+        ]
+        var item: CFTypeRef?
+        guard SecItemCopyMatching(query as CFDictionary, &item) == errSecSuccess,
+              let data = item as? Data else { return nil }
+        return String(data: data, encoding: .utf8)
+    }
+
+    private static func storeReadToken(_ token: String?) {
+        let base: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: readTokenService,
+        ]
+        SecItemDelete(base as CFDictionary)
+        guard let token, let data = token.data(using: .utf8) else { return }
+        var add = base
+        add[kSecValueData as String] = data
+        add[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+        SecItemAdd(add as CFDictionary, nil)
+    }
+
+    /// Sign "<ns>-read.v1\n<deviceId>\n<timestamp>" with the enclave key
+    /// (presents Face ID) and trade it for a read token.
+    private static func obtainReadToken(deviceId: String) async throws -> String {
+        let timestamp = Int(Date().timeIntervalSince1970)
+        let signature = try sign("\(namespace)-read.v1\n\(deviceId)\n\(timestamp)".data(using: .utf8)!)
+        let json = try await post("/api/approval-devices/read-token", body: [
+            "deviceId": deviceId,
+            "timestamp": timestamp,
+            "signature": signature.base64EncodedString(),
+        ])
+        guard let token = json["readToken"] as? String else {
+            throw NSError(domain: "TradeApproval", code: -1,
+                          userInfo: [NSLocalizedDescriptionKey: "No read token returned"])
+        }
+        storeReadToken(token)
+        return token
+    }
+
+    private static func listPending(deviceId: String, token: String) async throws -> [Request] {
+        let json = try await post("/api/approval-devices/pending", body: [
+            "deviceId": deviceId,
+            "readToken": token,
+        ])
+        let entries = json["pending"] as? [[String: Any]] ?? []
+        return entries.compactMap { entry in
+            parse(Dictionary(uniqueKeysWithValues: entry.map { (AnyHashable($0.key), $0.value) }))
+        }
+    }
+
+    /// Approvals waiting for this user, newest first. The first call on a
+    /// device paired before read tokens existed needs a read token, which
+    /// presents Face ID: pass interactive: true only from a user action
+    /// (Pending trades); the launch/foreground check passes false and then
+    /// returns [] until the token exists.
+    static func fetchPending(interactive: Bool) async throws -> [Request] {
+        guard isEnabled, let deviceId = UserDefaults.standard.string(forKey: deviceIdKey) else { return [] }
+        var token = loadReadToken()
+        if token == nil {
+            guard interactive else { return [] }
+            token = try await obtainReadToken(deviceId: deviceId)
+        }
+        do {
+            return try await listPending(deviceId: deviceId, token: token!)
+        } catch let error as NSError where error.code == 401 {
+            // Token replaced or revoked: get a new one, if the user is here for it.
+            storeReadToken(nil)
+            guard interactive else { return [] }
+            let fresh = try await obtainReadToken(deviceId: deviceId)
+            return try await listPending(deviceId: deviceId, token: fresh)
+        }
+    }
+
     // MARK: - Networking
 
     @discardableResult
@@ -314,7 +403,8 @@ enum TradeApproval {
         let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] ?? [:]
         guard let http = resp as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
             let msg = (json["error"] as? String) ?? "HTTP error"
-            throw NSError(domain: "TradeApproval", code: -1, userInfo: [NSLocalizedDescriptionKey: msg])
+            let status = (resp as? HTTPURLResponse)?.statusCode ?? -1
+            throw NSError(domain: "TradeApproval", code: status, userInfo: [NSLocalizedDescriptionKey: msg])
         }
         return json
     }

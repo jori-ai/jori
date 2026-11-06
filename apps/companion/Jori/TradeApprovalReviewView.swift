@@ -123,3 +123,85 @@ struct TradeApprovalReviewView: View {
         }
     }
 }
+
+/// Approvals › Pending trades: the approvals waiting on the trading web app,
+/// fetched by the app itself so a push that never arrived doesn't strand a
+/// trade. Tapping one opens the same blocking review screen as the push.
+/// The first visit on a device paired before 2026-11-06 asks for Face ID once
+/// (to get the device's read token); after that the list loads without it.
+struct TradeApprovalPendingView: View {
+    @Environment(\.dismiss) private var dismiss
+
+    @State private var requests: [TradeApproval.Request] = []
+    @State private var loading = true
+    @State private var error: String?
+    @State private var reviewing: TradeApproval.Request?
+
+    var body: some View {
+        NavigationStack {
+            List {
+                if loading && requests.isEmpty {
+                    HStack { Spacer(); ProgressView(); Spacer() }
+                } else if let error {
+                    Label(error, systemImage: "exclamationmark.triangle.fill")
+                        .foregroundStyle(JoriTheme.deny)
+                } else if requests.isEmpty {
+                    Text("No trades are waiting for approval.")
+                        .foregroundStyle(.secondary)
+                } else {
+                    ForEach(requests) { r in
+                        Button { reviewing = r } label: {
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text(r.summary).font(.subheadline)
+                                Text("Expires \(Date(timeIntervalSince1970: TimeInterval(r.expiresAt)), style: .relative)")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                    }
+                }
+            }
+            .navigationTitle("Pending trades")
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Done") { dismiss() }
+                }
+                ToolbarItem(placement: .automatic) {
+                    Button { Task { await load() } } label: {
+                        Image(systemName: "arrow.clockwise")
+                    }
+                    .disabled(loading)
+                }
+            }
+            .refreshable { await load() }
+            .task { await load() }
+        }
+        #if os(iOS)
+        .fullScreenCover(item: $reviewing) { r in
+            TradeApprovalReviewView(request: r) {
+                reviewing = nil
+                Task { await load() }
+            }
+        }
+        #else
+        .sheet(item: $reviewing) { r in
+            TradeApprovalReviewView(request: r) {
+                reviewing = nil
+                Task { await load() }
+            }
+            .frame(minWidth: 420, idealWidth: 480, minHeight: 520, idealHeight: 620)
+        }
+        #endif
+    }
+
+    private func load() async {
+        loading = true
+        error = nil
+        do {
+            requests = try await TradeApproval.fetchPending(interactive: true)
+        } catch {
+            self.error = error.localizedDescription
+        }
+        loading = false
+    }
+}

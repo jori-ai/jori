@@ -98,6 +98,8 @@ struct ContentView: View {
 
     // Trade-approval second factor (only when the build sets a trading app)
     @State private var showApprovalPairing = false
+    /// Approvals › Pending trades (TradeApprovalPendingView).
+    @State private var showPendingApprovals = false
     @State private var showUsageSetup = false
     @State private var pendingApproval: TradeApproval.Request?
     // Face-ID purchase approval (PurchaseApproval.swift)
@@ -384,6 +386,11 @@ struct ContentView: View {
                         Label("Trades", systemImage: "checkmark.shield")
                     }
                     .badge(TradeApproval.isRegistered ? Text("Paired") : Text("Set up"))
+                    if TradeApproval.isRegistered {
+                        Button { showPendingApprovals = true } label: {
+                            Label("Pending trades", systemImage: "clock.badge.checkmark")
+                        }
+                    }
                 }
                 Button { showPurchasePairing = true } label: {
                     Label("Purchases", systemImage: "cart.badge.questionmark")
@@ -564,6 +571,11 @@ struct ContentView: View {
                             Text(TradeApproval.isRegistered ? "Paired" : "Not set up")
                         } icon: {
                             Image(systemName: "checkmark.shield")
+                        }
+                    }
+                    if TradeApproval.isRegistered {
+                        Button { showPendingApprovals = true } label: {
+                            Label("Pending trades", systemImage: "clock.badge.checkmark")
                         }
                     }
                 }
@@ -1333,6 +1345,15 @@ struct ContentView: View {
     fileprivate struct ApprovalsModifier: ViewModifier {
         let view: ContentView
 
+        @MainActor
+        private func checkWaitingApprovals() async {
+            guard TradeApproval.isRegistered, view.pendingApproval == nil, !view.showPendingApprovals,
+                  let waiting = try? await TradeApproval.fetchPending(interactive: false).first,
+                  view.pendingApproval == nil
+            else { return }
+            view.pendingApproval = waiting
+        }
+
         func body(content: Content) -> some View {
             content
                 // Trade approval — iPhone (Face ID) and Mac (Touch ID); each device
@@ -1343,9 +1364,23 @@ struct ContentView: View {
                         .frame(minWidth: 480, idealWidth: 520, minHeight: 460, idealHeight: 500)
                         #endif
                 }
+                .sheet(isPresented: view.$showPendingApprovals) {
+                    TradeApprovalPendingView()
+                        #if os(macOS)
+                        .frame(minWidth: 420, idealWidth: 480, minHeight: 360, idealHeight: 460)
+                        #endif
+                }
                 .onReceive(NotificationCenter.default.publisher(for: .openTradeApproval)) { note in
                     AppDelegate.pendingApprovalRequest = nil
                     view.pendingApproval = note.object as? TradeApproval.Request
+                }
+                // Don't depend on the push (2026-11-06): on launch and whenever
+                // the app comes forward, ask the trading web app for approvals
+                // still waiting and open the newest. Silent — no Face ID here; a
+                // device without a read token yet gets one from Pending trades.
+                .task { await checkWaitingApprovals() }
+                .onChange(of: view.scenePhase) { _, phase in
+                    if phase == .active { Task { await checkWaitingApprovals() } }
                 }
                 // Consume a request that arrived while we weren't mounted (cold launch /
                 // lock screen), once this view actually appears.
