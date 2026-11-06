@@ -40,12 +40,18 @@
 //
 // Config, the installation's decision: agent/local/config/allowance-brake.json
 //   { "threshold": 0.95, "usd_per_allowance": 1400,
+//     "final_day": { "hours": 24, "threshold": 0.90 },
 //     "jobs": { "<job>": { "importance": "optional|important|essential",
 //                          "release_label": "<launchd label>",
 //                          "cost_estimate": 0.02,
 //                          "cheaper": { "model": "sonnet", "effort": "high" },
 //                          "label": "<what the user calls it>" } } }
 // A listed job without `importance` is optional (the brake's original meaning).
+// `final_day` (optional) is a tighter brake for the last `hours` before the
+// reset: the pace forecast is least reliable there (usage no ledger sees, such
+// as interactive sessions, lands on top of it) and a held job waits at most
+// `hours` for the reset. Inside that stretch the lower of the two thresholds
+// applies, to `check` and `release` alike; absent, one threshold all week.
 // No config file = the governor is off.
 //
 // FAIL-OPEN. No sample, a sample older than MAX_SAMPLE_AGE_H, a window younger
@@ -170,9 +176,17 @@ function ledgerRows() {
 
 const pct = (x) => `${Math.round(x * 100)}%`;
 
-/** { hold, reason, utilization, projected, pace_per_day, resets_at, span } — hold is false on any doubt. */
-function reading(threshold) {
-  const open = (reason, extra = {}) => ({ hold: false, reason, ...extra });
+/** The brake in force with the reset at resetMs: the final-day threshold inside its last hours, the usual one otherwise. */
+function thresholdFor(cfg, resetMs) {
+  const f = cfg.final_day;
+  const hoursLeft = (resetMs - NOW) / 3600e3;
+  return f && hoursLeft > 0 && hoursLeft <= f.hours ? Math.min(cfg.threshold, f.threshold) : cfg.threshold;
+}
+
+/** { hold, reason, utilization, projected, pace_per_day, resets_at, span, threshold } — hold is false on any doubt. */
+function reading(cfg) {
+  let threshold = cfg.threshold;
+  const open = (reason, extra = {}) => ({ hold: false, reason, threshold, ...extra });
   let s;
   try { s = samples(); } catch (e) { return open(`no reading (${e.message.slice(0, 80)})`); }
   if (!s.length) return open("no allowance sample in the event logs");
@@ -182,6 +196,8 @@ function reading(threshold) {
   if (!last.resetsAt) return open("newest sample carries no reset time");
   const resetMs = last.resetsAt * 1000;
   if (resetMs <= NOW) return open("the window has reset since the newest sample");
+  threshold = thresholdFor(cfg, resetMs);
+  const brake = threshold < cfg.threshold ? `${pct(threshold)} last-day brake` : `${pct(threshold)} brake`;
   // The current window: samples sharing the newest reset time, after the last drop.
   let from = 0;
   for (let i = 1; i < s.length; i++) if (s[i].u < s[i - 1].u - RESET_DROP) from = i;
@@ -193,16 +209,16 @@ function reading(threshold) {
   const daysLeft = (resetMs - NOW) / 864e5;
   const span = { from: base.t, to: last.t, delta: last.u - base.u };
   if (util >= threshold) {
-    return { hold: true, reason: `the week is at ${pct(util)}, past the ${pct(threshold)} brake; waits for the reset at ${resets_at}`, utilization: util, projected: util, pace_per_day: null, resets_at, span };
+    return { hold: true, reason: `the week is at ${pct(util)}, past the ${brake}; waits for the reset at ${resets_at}`, utilization: util, projected: util, pace_per_day: null, resets_at, span, threshold };
   }
   if (spanH < MIN_RATE_SPAN_H) return open(`only ${spanH.toFixed(1)}h of this window to rate; week at ${pct(util)}`, { utilization: util, resets_at });
   const pace = Math.max(0, (last.u - base.u) / (spanH / 24));
   const projected = util + pace * daysLeft;
-  const facts = { utilization: util, projected: +projected.toFixed(3), pace_per_day: +pace.toFixed(3), resets_at, span };
+  const facts = { utilization: util, projected: +projected.toFixed(3), pace_per_day: +pace.toFixed(3), resets_at, span, threshold };
   if (projected >= threshold) {
-    return { hold: true, reason: `the week is at ${pct(util)} and on pace for ${pct(projected)} by the reset at ${resets_at} (${pct(pace)}/day), past the ${pct(threshold)} brake`, ...facts };
+    return { hold: true, reason: `the week is at ${pct(util)} and on pace for ${pct(projected)} by the reset at ${resets_at} (${pct(pace)}/day), past the ${brake}`, ...facts };
   }
-  return open(`the week is at ${pct(util)}, on pace for ${pct(projected)} by the reset; under the ${pct(threshold)} brake`, facts);
+  return open(`the week is at ${pct(util)}, on pace for ${pct(projected)} by the reset; under the ${brake}`, facts);
 }
 
 const median = (xs) => { const s = [...xs].sort((a, b) => a - b); const n = s.length; return n ? (n % 2 ? s[(n - 1) / 2] : (s[n / 2 - 1] + s[n / 2]) / 2) : null; };
@@ -257,17 +273,23 @@ function config() {
     const c = localConfig("allowance-brake", {});
     const threshold = Number(c.threshold);
     const usd = Number(c.usd_per_allowance);
+    const fd = c.final_day && typeof c.final_day === "object" ? c.final_day : {};
+    const fdT = Number(fd.threshold), fdH = Number(fd.hours);
     return {
       threshold: threshold > 0 && threshold <= 1 ? threshold : 0.95,
+      final_day: fdT > 0 && fdT <= 1 && fdH > 0 ? { threshold: fdT, hours: fdH } : null,
       usd_per_allowance: usd > 0 ? usd : DEFAULT_USD_PER_ALLOWANCE,
       jobs: c.jobs && typeof c.jobs === "object" ? c.jobs : {},
     };
-  } catch { return { threshold: 0.95, usd_per_allowance: DEFAULT_USD_PER_ALLOWANCE, jobs: {} }; }
+  } catch { return { threshold: 0.95, final_day: null, usd_per_allowance: DEFAULT_USD_PER_ALLOWANCE, jobs: {} }; }
 }
+
+/** The brake in force for reading r (the final-day one when it applies). */
+const brakeOf = (r, cfg) => (typeof r.threshold === "number" ? r.threshold : cfg.threshold);
 
 /** The one test `check` and `release` share: past the threshold, or this run would take the week there. */
 function isOver(r, est, cfg) {
-  return !!(r.hold || (typeof r.projected === "number" && r.projected + est.share >= cfg.threshold));
+  return !!(r.hold || (typeof r.projected === "number" && r.projected + est.share >= brakeOf(r, cfg)));
 }
 
 const importanceOf = (entry) => (entry && IMPORTANCE.has(entry.importance) ? entry.importance : "optional");
@@ -352,7 +374,7 @@ function check(job) {
     emit({ decision: "run", job, importance, reason: "essential" }, `run: ${job} is essential`);
     return 0;
   }
-  const r = reading(cfg.threshold);
+  const r = reading(cfg);
   const rows = ledgerRows();
   const est = estimate(job, cfg, r, rows);
   const label = entry.release_label || null;
@@ -386,7 +408,7 @@ function check(job) {
     if (closeQuestions(st, job, "no longer over budget")) logLine(`closed open budget question(s) for ${job}: no longer over budget`);
     return runNow("run", r.reason + (est.share ? `; this run ~${pct(est.share)}` : ""));
   }
-  const why = r.hold ? r.reason : `the week is at ${pct(r.utilization)}, on pace for ${pct(r.projected)} by the reset, and this run adds ~${pct(est.share)}: past the ${pct(cfg.threshold)} brake`;
+  const why = r.hold ? r.reason : `the week is at ${pct(r.utilization)}, on pace for ${pct(r.projected)} by the reset, and this run adds ~${pct(est.share)}: past the ${pct(brakeOf(r, cfg))}${brakeOf(r, cfg) < cfg.threshold ? " last-day" : ""} brake`;
 
   if (importance === "optional") {
     recordHeld(st, job, label, r);
@@ -454,7 +476,7 @@ function apply(ref) {
 function release() {
   const st = readState();
   const cfg = config();
-  const r = reading(cfg.threshold);
+  const r = reading(cfg);
   let changed = false;
   // A budget question still open after its window reset is moot: close it.
   for (const q of st.questions || []) {
@@ -491,14 +513,14 @@ function release() {
 
 function status() {
   const cfg = config();
-  const r = reading(cfg.threshold);
+  const r = reading(cfg);
   const rows = ledgerRows();
   const per = usdPerAllowance(cfg, r, rows);
   const jobs = Object.fromEntries(Object.keys(cfg.jobs).map((j) => [j, { importance: importanceOf(cfg.jobs[j]), estimate: estimate(j, cfg, r, rows) }]));
   const st = readState();
   const open = (st.questions || []).filter((q) => q.status === "open").map((q) => `bud:${q.id}`);
   if (flag("json")) {
-    const out = { threshold: cfg.threshold, usd_per_allowance: per, jobs, held: st.held || {}, open_questions: open, ...r };
+    const out = { usd_per_allowance: per, jobs, held: st.held || {}, open_questions: open, ...r, threshold: brakeOf(r, cfg), usual_threshold: cfg.threshold, final_day: cfg.final_day };
     delete out.span;
     process.stdout.write(JSON.stringify(out) + "\n");
     return 0;

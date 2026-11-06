@@ -303,3 +303,42 @@ it("relaunches a held job before the reset once the pace leaves room for it, but
   const out = run(cool, ["release", "--dry-run"]).out;
   assert.ok(!out.includes("chat-build"), out);
 });
+
+// The last-day brake: inside final_day.hours before the reset the lower
+// threshold applies, to check and release alike; earlier in the week it does not.
+const FINAL = { threshold: 0.95, final_day: { hours: 24, threshold: 0.90 }, jobs: { "nightly": { importance: "optional", release_label: "ai.test.nightly" } } };
+// 8 points over the last day (0.86 -> 0.89 over 12h = 6%/day): 16h before the reset -> projected ~0.93.
+const LAST_DAY = [["2026-11-03T23:00:00Z", 0.86], ["2026-11-04T11:00:00Z", 0.89]];
+const LAST_DAY_NOW = "2026-11-04T11:10:00Z";
+
+it("holds at the final-day threshold in the last hours before the reset, where the usual one would let it run", () => {
+  const usual = fixture({ points: LAST_DAY, config: { ...FINAL, final_day: undefined } });
+  const u = run(usual, ["check", "nightly", "--json"], LAST_DAY_NOW);
+  assert.equal(u.rc, 0, u.out);
+  assert.ok(u.json.projected > 0.90 && u.json.projected < 0.95, `projected ${u.json.projected}`);
+
+  const fx = fixture({ points: LAST_DAY, config: FINAL });
+  const r = run(fx, ["check", "nightly", "--json"], LAST_DAY_NOW);
+  assert.equal(r.rc, 3, r.out);
+  assert.equal(r.json.threshold, 0.90);
+  assert.ok(r.json.reason.includes("90% last-day brake"), r.json.reason);
+  // The held job is not released while the last-day brake still says over.
+  assert.equal(run(fx, ["release", "--dry-run"], "2026-11-04T12:00:00Z").out, "");
+});
+
+it("keeps the usual threshold earlier in the week, and status reports both", () => {
+  const fx = fixture({ points: COOL, config: FINAL });
+  const s = run(fx, ["status", "--json"]);
+  assert.equal(s.json.threshold, 0.95, "three days before the reset: the usual brake");
+  assert.equal(s.json.usual_threshold, 0.95);
+  assert.deepEqual(s.json.final_day, { threshold: 0.90, hours: 24 });
+  const late = run(fixture({ points: LAST_DAY, config: FINAL }), ["status", "--json"], LAST_DAY_NOW);
+  assert.equal(late.json.threshold, 0.90, "16h before the reset: the last-day brake");
+});
+
+it("ignores a malformed final_day and keeps one threshold", () => {
+  const fx = fixture({ points: LAST_DAY, config: { ...FINAL, final_day: { hours: 24, threshold: 1.5 } } });
+  const r = run(fx, ["check", "nightly", "--json"], LAST_DAY_NOW);
+  assert.equal(r.rc, 0, r.out);
+  assert.equal(r.json.threshold, 0.95);
+});
