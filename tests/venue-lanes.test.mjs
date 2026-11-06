@@ -184,6 +184,14 @@ test("presenceByDate: one timeline read, failing open", async () => {
   assert.equal((await W.presenceByDate(["2026-11-15"], "metro_b", { presence: broken })).get("2026-11-15"), false, "a trip metro fails closed");
 });
 
+test("regionalPrepare: no headliner bypass for a visit-only metro", async () => {
+  const pool = [{ key: "c", title: "away, headliner", date: "2026-11-06", category: "music", performers: ["Artist One"] }];
+  const presence = async (dates) => new Map(dates.map((d) => [d, false]));
+  const headliner = () => true;
+  assert.deepEqual((await L.regionalPrepare(pool, { metro: "metro_b", presence, headliner, bypass: false })).length, 0);
+  assert.deepEqual((await L.regionalPrepare(pool, { metro: "metro_b", presence, headliner, bypass: true })).length, 1);
+});
+
 test("presenceByDate: a date past the timeline is not 'maybe there' for a trip metro", async () => {
   const P = {
     fetchSegments: async () => [], loadFlights: () => [], normalizeMetro: (m) => m,
