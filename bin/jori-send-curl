@@ -148,6 +148,12 @@ IS_QUESTION=false
 IS_LOCATION_QUESTION=false
 # Set by question routing for a location question: the push is time-sensitive.
 URGENT_PUSH=false
+# --announce: the push goes out time-sensitive so it is read aloud over AirPods
+# and pierces Focus, without the Jev push-announce judgment and without
+# --urgent's motion-gate bypass. For a caller whose whole point is being heard
+# while the user walks (hum-ping sets it for the `nearby` lane). A question
+# still wins: it is never read aloud.
+ANNOUNCE_PUSH=false
 # The verbatim captured error text behind a message that asserts a specific
 # technical failure mechanism — see the mechanism-attestation gate below.
 OBSERVED_ERROR=""
@@ -175,6 +181,7 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --no-push)        NO_PUSH=true; shift ;;
     --push)           FORCE_PUSH=true; shift ;;
+    --announce)       ANNOUNCE_PUSH=true; shift ;;
     --keep-in-tab)    KEEP_IN_TAB=true; shift ;;
     --push-body)      PUSH_BODY="$2"; shift 2 ;;
     --media)          MEDIA+=("$2"); shift 2 ;;
@@ -226,7 +233,7 @@ set -- "${POSITIONAL[@]}"
 for arg in "$@"; do
   if [[ "$arg" == --* ]]; then
     echo "FATAL: unknown flag: $arg" >&2
-    echo "jori-send-curl accepts: --no-push, --push, --keep-in-tab, --push-body, --media, --choices-json, --metadata-json, --capture-id, --suppress-hook, --skip-precheck, --intent, --evidence-as-of, --observed-error, --hum-context, --agent, --channel, --question, --location-question, --event-city, --event-date, --event-artist, --p1-message" >&2
+    echo "jori-send-curl accepts: --no-push, --push, --announce, --keep-in-tab, --push-body, --media, --choices-json, --metadata-json, --capture-id, --suppress-hook, --skip-precheck, --intent, --evidence-as-of, --observed-error, --hum-context, --agent, --channel, --question, --location-question, --event-city, --event-date, --event-artist, --p1-message" >&2
     echo "Message body goes via \$1 (inline) or stdin (pipe). For long/multi-line: cat file.txt | jori-send-curl ..." >&2
     exit 2
   fi
@@ -1268,7 +1275,11 @@ except Exception:
     [ "${QR_QUESTION:-false}" = true ] && PUSH_IS_QUESTION=true
     [ -n "${ORIG_CHOICES_JSON:-}${CHOICES_JSON:-}" ] && PUSH_IS_QUESTION=true
     case "${INTENT##*:}" in question|ask) PUSH_IS_QUESTION=true ;; esac
-    [ "$PUSH_IS_QUESTION" = true ] && NOTIFY_ARGS+=(--no-announce)
+    if [ "$PUSH_IS_QUESTION" = true ]; then
+      NOTIFY_ARGS+=(--no-announce)
+    elif [ "$ANNOUNCE_PUSH" = true ]; then
+      NOTIFY_ARGS+=(--announce)
+    fi
     if [ -n "$PUSH_BODY" ]; then
       "$NOTIFY" "${NOTIFY_ARGS[@]}" "$PUSH_BODY" > /dev/null 2>&1 &
     else

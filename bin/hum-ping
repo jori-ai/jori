@@ -389,6 +389,11 @@ const captureFile = path.join(os.tmpdir(), `hum-ping-capture.${process.pid}.${Da
 const sendArgs = ["--capture-id", captureFile];
 if (suppressHook) sendArgs.push("--suppress-hook");
 if (noPush) sendArgs.push("--no-push");
+// A `nearby` local explanation is about the ground under their feet right now, so
+// it is read aloud over AirPods and pierces Focus, whatever Jev would rate it.
+// Only this lane; --announce does not touch the motion gate (a question card
+// still wins and is never read aloud).
+if (isLocalHistoryPing) sendArgs.push("--announce");
 if (pushBody) sendArgs.push("--push-body", pushBody);
 // The forwarded intent ALWAYS starts with `hum:` — it is what routes the ping
 // through jori-send-curl's resolve-first gate and tells the

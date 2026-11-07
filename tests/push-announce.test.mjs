@@ -58,3 +58,27 @@ test("a question is never read aloud, even urgent, and is not judged", async () 
   assert.equal(await announceDecision({ body: "Where did you have lunch?", announce: "never" }, { judge: never }), false);
   assert.equal(await announceDecision({ body: "Which stop was that?", urgent: true, announce: "never" }, { judge: never }), false);
 });
+
+// ── the hum `nearby` lane is always read aloud, and only that lane ──────────
+// hum-ping adds --announce for local-history pings, jori-send-curl turns it
+// into jori-notify --announce unless the message is a question, and
+// jori-notify maps it to announce "always" (time-sensitive, no judgment, motion
+// gate untouched, not urgent).
+const readSrc = (p) => fs.readFileSync(new URL(`../${p}`, import.meta.url), "utf8");
+
+test("hum-ping announces only local-history (nearby) pings", () => {
+  const src = readSrc("bin/hum-ping");
+  assert.match(src, /if \(isLocalHistoryPing\) sendArgs\.push\("--announce"\)/);
+  assert.equal((src.match(/"--announce"/g) || []).length, 1);
+});
+
+test("jori-send-curl accepts --announce and lets a question win", () => {
+  const src = readSrc("bin/jori-send-curl");
+  assert.match(src, /--announce\)\s+ANNOUNCE_PUSH=true/);
+  assert.match(src, /if \[ "\$PUSH_IS_QUESTION" = true \]; then\s+NOTIFY_ARGS\+=\(--no-announce\)\s+elif \[ "\$ANNOUNCE_PUSH" = true \]; then\s+NOTIFY_ARGS\+=\(--announce\)/);
+  assert.doesNotMatch(src, /ANNOUNCE_PUSH=true; URGENT_PUSH/);
+});
+
+test("jori-notify maps --announce to announce 'always' and leaves urgent alone", () => {
+  assert.match(readSrc("bin/jori-notify"), /a === "--announce"\) announce = "always"/);
+});
