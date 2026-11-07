@@ -76,17 +76,10 @@ const monthName = (dateStr) =>
 const resolvePath = (p) => (!p ? "" : p.startsWith("/") ? p : installTools(p));
 const readJson = (p, fallback) => { try { return JSON.parse(fs.readFileSync(resolvePath(p), "utf8")); } catch { return fallback; } };
 
-/** Funded private holdings, each valued at its latest round. */
+// Funded private holdings, each valued at its latest round (one valuer for
+// every net-worth figure: lib/private-holdings.js).
 function privateHoldings(cfg) {
-  if (!cfg.private_holdings_file) return [];
-  const reg = readJson(cfg.private_holdings_file, { holdings: [] });
-  return (reg.holdings || []).filter((h) => h.status === "funded" && num(h.committed_usd))
-    .map((h) => {
-      const entry = num(h.entry_valuation_usd);
-      const mark = num(h.mark_valuation_usd);
-      const value = entry && mark ? num(h.committed_usd) * mark / entry : num(h.committed_usd);
-      return { name: h.name, vehicle: h.vehicle || null, committed: num(h.committed_usd), value, mark, mark_as_of: h.mark_as_of || null };
-    });
+  return require("../lib/private-holdings.js").privateHoldings(cfg.private_holdings_file || null);
 }
 
 /**

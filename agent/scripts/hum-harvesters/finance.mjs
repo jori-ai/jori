@@ -28,6 +28,7 @@ import expectedLib from "../../../lib/finance-expected.js";
 import rootLib from "../../../lib/root.cjs";
 import instanceLib from "../../../lib/instance.cjs";
 import plaidStore from "../../../lib/plaid-store.js";
+import privateLib from "../../../lib/private-holdings.js";
 const { request } = supa;
 const { classify } = classifyLib;
 const { incomeStatus, scheduledDue } = expectedLib;
@@ -275,7 +276,8 @@ async function main() {
     const valued = sources.map(({ src, rows }) => ({ src, rows, now: Number(rows[0].total_value) || 0 }));
     const historiesTotal = valued.reduce((s, v) => s + v.now, 0);
     const reNow = (realEstate || []).length ? Number(realEstate[0].total_value) || 0 : 0;
-    const grossAssets = historiesTotal + plaidBrokerage + reNow + cashAssets;
+    const privateNow = privateLib.privateTotal(privateLib.privateHoldings());
+    const grossAssets = historiesTotal + plaidBrokerage + reNow + privateNow + cashAssets;
     const total = grossAssets - cardDebt;
 
     // Name each source with its own vintage — these are point-in-time snapshots,
@@ -284,6 +286,7 @@ async function main() {
     if (reNow) parts.push(`${NET_WORTH.property_totals.label || "property"} ${usd(reNow)} (as of ${realEstate[0].as_of_date})`);
     for (const v of valued) if (v.now) parts.push(`${v.src.label || v.src.table} ${usd(v.now)} (as of ${v.rows[0].as_of_date})`);
     if (plaidBrokerage) parts.push(`${NET_WORTH.holdings_label} ${usd(plaidBrokerage)} (as of ${(plaidAsOf || "").slice(0, 10)})`);
+    if (privateNow) parts.push(`private ${usd(privateNow)}`);
     parts.push(`${NET_WORTH.cash_label} ${usd(cashAssets)}`);
 
     // A card whose Item is in login_required has stopped reporting, so its last

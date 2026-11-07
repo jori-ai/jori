@@ -467,7 +467,11 @@ async function main() {
   const holdingsValue = hd.length ? sum(hd, (h) => num(h.market_value)) : null;
   const reValue = reconciled.length ? sum(reconciled, (r) => num(r.value)) : null;
   const depositLiability = deposits ? deposits.liability : 0;
-  const netWorth = (brokerNow || 0) + othersTotal + (holdingsValue || 0) + (reValue || 0) + bankCash - cardDebt - depositLiability;
+  // Private stakes valued at their latest round — the same valuer net worth uses.
+  const privateLib = require("../lib/private-holdings.js");
+  const privateList = privateLib.privateHoldings();
+  const privateValue = privateList.length ? privateLib.privateTotal(privateList) : null;
+  const netWorth = (brokerNow || 0) + othersTotal + (holdingsValue || 0) + (reValue || 0) + (privateValue || 0) + bankCash - cardDebt - depositLiability;
   const idleThreshold = map.idle_cash_buffer_usd || 50000;
   for (const a of depos.filter((a) => num(a.balance_current) > idleThreshold && ["savings", "checking"].includes(a.subtype) && gmap[a.account_id]?.group !== "deposits")) {
     flag(40, "idle-cash", `${label(a.account_id)} holds ${usd0(num(a.balance_current))}, above the ${usd0(idleThreshold)} idle-cash threshold.`);
@@ -568,6 +572,7 @@ async function main() {
         // Only when something is actually held through Plaid outside the
         // brokerage feed — a closed account must not leave a dead line behind.
         ...(holdingsValue == null ? [] : [{ label: `${NW.holdings_label} (Plaid)`, value_fmt: usd0(holdingsValue), as_of: null, note: null }]),
+        ...(privateValue == null ? [] : [{ label: "Private holdings", value_fmt: usd0(privateValue), as_of: null, note: privateList.map((h) => `${h.name}${h.mark_as_of ? ` (marked ${h.mark_as_of})` : ""}`).join(", ") }]),
         { label: "Card balances", value_fmt: `−${usd0(cardDebt)}`, as_of: "today", note: null },
         { label: "Tenant deposits owed back", value_fmt: `−${usd0(depositLiability)}`, as_of: "today", note: "every deposit held, per the deposit reconciliation" },
       ],
