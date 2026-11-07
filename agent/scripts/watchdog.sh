@@ -2775,7 +2775,8 @@ fi
 # (heartbeat-sender, minibeat, dashboard: launchctl kickstart -k; the two wiki
 # servers: SIGTERM, process-manager respawns) as soon as their committed code is
 # newer than the process, and flags what it must not restart itself: whatsapp-
-# channel / phone-channel / process-manager on old code for 6h+, a restart that
+# channel / process-manager on old code for 6h+ (phone-channel is reloaded with
+# chat by the block above and pages through its exit 4), a restart that
 # did not take, and tracked code files left uncommitted for 12h+. Exit 6 = flag
 # (text in its state file's _flag), 0 = clear, 5 = could not read processes
 # (neither). Restarts and holds go to this log. Kill switch: data/.stale-code-watch-off.

@@ -1,8 +1,9 @@
 // Item 2 of the 2026-10-20 review (2026-10-22): stale-code-watch restarts the
 // small daemons nothing else restarted (heartbeat-sender, minibeat, dashboard,
 // the wiki servers) once their committed code is newer than the process, and
-// flags what it must not restart (phone-channel, process-manager on old code
-// 6h+; a restart that did not take; code left uncommitted 12h+).
+// flags what it must not restart (process-manager on old code 6h+; a restart
+// that did not take; code left uncommitted 12h+). phone-channel is no longer
+// flagged here: supervisor-code-reload reloads it with chat.
 // whatsapp-channel is restarted the same way once WhatsApp has been quiet, and
 // flagged only when it never was. Every machine touch is an injected fake over
 // a throwaway tree: nothing real is restarted or signalled.
@@ -133,14 +134,14 @@ test("big daemons are never restarted, only flagged after 6h on old code (whatsa
   let h = harness();
   assert.equal(await m.main([], h.io, ROOT), 0, "2h: not yet");
   touch("agent/whatsapp-channel/index.mjs", NOW - 7 * H);
-  touch("agent/phone-channel/index.mjs", NOW - 8 * H);
+  touch("agent/bin/process-manager.mjs", NOW - 8 * H);
   h = harness();
   assert.equal(await m.main([], h.io, ROOT), 6);
   assert.deepEqual(h.calls, []);
   assert.match(h.state()._flag, /whatsapp-channel: on code older than committed for 7h \(jori restart whatsapp-channel\)/);
-  assert.match(h.state()._flag, /phone-channel: on code older than committed for 8h/);
+  assert.match(h.state()._flag, /process-manager: on code older than committed for 8h/);
   assert.match(h.state()._flag, /^⚠️ /);
-  touch("agent/whatsapp-channel/index.mjs", OLD); touch("agent/phone-channel/index.mjs", OLD);
+  touch("agent/whatsapp-channel/index.mjs", OLD); touch("agent/bin/process-manager.mjs", OLD);
 });
 
 // Regression guard for the stale-code-flag alert ("Code on disk isn't fully
@@ -241,15 +242,33 @@ test("quietHold: each path against its own window, first one written too recentl
   assert.equal(m.quietHold(q, NOW, at({ log: NOW - 9 * MIN, keys: NOW - 30 * 1000 })).hold, "log");
 });
 
-test("phone-channel and process-manager stay flag-only even when WhatsApp is quiet", async () => {
-  touch("agent/phone-channel/index.mjs", NOW - 7 * H);
+test("process-manager stays flag-only even when WhatsApp is quiet", async () => {
   touch("agent/bin/process-manager.mjs", NOW - 7 * H);
   const h = harness({ waLastWrite: NOW - 60 * MIN });
   assert.equal(await m.main([], h.io, ROOT), 6);
   assert.deepEqual(h.calls, []);
-  assert.match(h.state()._flag, /phone-channel: on code older than committed for 7h/);
   assert.match(h.state()._flag, /process-manager: on code older than committed for 7h/);
-  touch("agent/phone-channel/index.mjs", OLD); touch("agent/bin/process-manager.mjs", OLD);
+  touch("agent/bin/process-manager.mjs", OLD);
+});
+
+// Regression guard for the stale-code-flag alert "phone-channel: on code older
+// than committed for Nh (loads with chat's next session: jori restart chat)":
+// phone-channel is chat's MCP grandchild and nothing reloaded it, so a commit to
+// its own code sat unloaded for a day. supervisor-code-reload now reloads it with
+// chat (idle-gated) and pages through its own exit 4; flagging it here as well
+// would page twice for one condition.
+test("phone-channel on old code is neither flagged nor signalled here (supervisor-code-reload owns it)", async () => {
+  assert.ok(!m.FLAG_ONLY.some((t) => t.name === "phone-channel"));
+  assert.ok(![...m.SMALL, ...m.WHEN_QUIET].some((t) => t.name === "phone-channel"));
+  touch("agent/phone-channel/index.mjs", NOW - 30 * H);
+  try {
+    const stale = { _missed_since: { "phone-channel": { pid: 51475, startedMs: NOW - 2 * 86_400_000 + 999, sinceMs: NOW - 30 * H } } };
+    const h = harness({ state: stale });
+    assert.equal(await m.main([], h.io, ROOT), 0);
+    assert.deepEqual(h.calls, []);
+    assert.equal(h.state()._flag, undefined);
+    assert.equal(h.state()._missed_since, undefined, "an old phone-channel sighting is dropped");
+  } finally { touch("agent/phone-channel/index.mjs", OLD); }
 });
 
 // Regression guard for the stale-code-flag alert: missedSince sees only a
