@@ -576,6 +576,33 @@ test("factPack gives the walked miles the header prints even when the day has no
   assert.doesNotMatch(text, /TRANSIT, TOLL AND RIDE CHARGES/);
 });
 
+test("factPack says the walked figure can exceed all travel by the hop no leg joined", () => {
+  // The walk line adds the straight line between two dwells no leg joined (a floor);
+  // the path's observed + inferred totals do not hold it, so the review called the
+  // header's walked miles longer than all travel.
+  const T = (h, m) => Date.UTC(2026, 8, 6, h + 4, m);
+  const place = (name) => ({ name, source: "user_confirmed" });
+  const base = { id: "a", place_name: "Base", start: "08:00", end: "12:08", start_ts_ms: T(8, 0), end_ts_ms: T(12, 8), place: place("Base") };
+  const cafe = { id: "b", place_name: "Cafe", start: "12:40", end: "13:30", start_ts_ms: T(12, 40), end_ts_ms: T(13, 30), place: place("Cafe") };
+  const dwell = (id, name, lat, start, end) => ({ type: "dwell", id, place: { name, tier: "corroborated", lat, lon: -75 }, // kernel-guard-ok: synthetic fixture coordinates
+    start, end, start_ms: T(...start.split(":").map(Number)), end_ms: T(...end.split(":").map(Number)), major: true });
+  const spine = [
+    dwell("d0", "Base", 40.0, "08:00", "12:16"),
+    dwell("d1", "Passed", 40.0068, "12:16", "12:27"),
+    { type: "leg", id: "l0", start: "12:27", end: "12:32", start_ms: T(12, 27), end_ms: T(12, 32), mins: 5, mode: "walking",
+      routed_m: 784, straight_m: 784, walked_m: 784, geometry: "map_matched", streets: ["Main Street"], holes: [], confidence: "observed", fixes: 3 },
+    dwell("d2", "Cafe", 40.0136, "12:32", "13:34"),
+  ];
+  const day = { date: "2026-09-06", stops: [base, cafe], path: { stats: { observed_km: 0.8, inferred_km: 0, matched_km: 0.8, geometry_source: "map_matched" }, spine } };
+  const text = R.factPack({ date: "2026-09-06", manifest: { stops: [] }, day, statements: {}, corrections: [] });
+  assert.match(text, /walked 1\.0 miles/);
+  assert.match(text, /all travel 0\.8 km, any mode/);
+  assert.match(text, /the walked figure includes 0\.8 km of straight-line ground between places the phone took no fix on/);
+  const joined = { ...day, path: { ...day.path, spine: [dwell("d0", "Base", 40.0, "08:00", "12:08"), { ...spine[2], start: "12:08", end: "12:16", start_ms: T(12, 8), end_ms: T(12, 16) },
+    dwell("d1", "Passed", 40.0068, "12:16", "12:27"), spine[2], dwell("d2", "Cafe", 40.0136, "12:32", "13:34")] } };
+  assert.doesNotMatch(R.factPack({ date: "2026-09-06", manifest: { stops: [] }, day: joined, statements: {}, corrections: [] }), /straight-line ground/);
+});
+
 test("factPack's all-travel total counts the legs the map-matcher missed", () => {
   // 2026-10-15: two of four segments were not matched, so "all travel 1.4 km" sat
   // beside a 24.3 km evening drive and the review called the report contradictory.

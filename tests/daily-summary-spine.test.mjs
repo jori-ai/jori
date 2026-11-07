@@ -314,6 +314,7 @@ test("the header's sum is marked a floor when a line is, and not otherwise", () 
   const m = printedWalkMeters(hopDay(hopSpine()), [hopBase, hopCafe], info);
   assert.ok(m > 1500 && m < 1600, `expected about 1.54 km, got ${m}`);
   assert.equal(info.floor, true);
+  assert.ok(info.hop_m > 700 && info.hop_m < 800, `expected about 756 m of hop, got ${info.hop_m}`);
   const joined = [
     hopDwell("d0", "Base", 40.0, "08:00", "12:08"),
     hopLeg("l0", "12:08", "12:16", 800),
@@ -327,6 +328,7 @@ test("the header's sum is marked a floor when a line is, and not otherwise", () 
   assert.doesNotMatch(line, /at least/);
   printedWalkMeters(hopDay(joined), [hopBase, hopCafe], info2);
   assert.equal(info2.floor, undefined);
+  assert.equal(info2.hop_m, undefined);
 });
 
 test("a hop that would make the stretch faster than a walk is not added", () => {
