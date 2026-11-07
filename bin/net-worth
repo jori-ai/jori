@@ -231,8 +231,9 @@ async function gather(cfg) {
     lines.push([ph.key, ph.label]);
     detail[ph.label] = phPositions;
   }
-  lines.push(["private_holdings", "Private"]);
-  detail["Private holdings"] = privateNow.map((h) => ({
+  const PRIVATE_LABEL = require("../lib/private-holdings.js").privateLabel();
+  lines.push(["private_holdings", PRIVATE_LABEL]);
+  detail[PRIVATE_LABEL] = privateNow.map((h) => ({
     label: h.name,
     value: h.value,
     sub: `${usd0(h.committed)} in${h.mark ? ` at the round's $${Math.round(h.mark / 1e9)}B valuation` : ""}${h.mark_as_of ? ` (${h.mark_as_of})` : ""}`,
@@ -253,7 +254,7 @@ async function gather(cfg) {
     return i >= 0 ? Number(sources[i].position) || 20 + i : 70;
   };
   lines.sort((a, b) => pos(a[0]) - pos(b[0]));
-  const sectionOf = { bank_cash: "Bank accounts", private_holdings: "Private holdings" };
+  const sectionOf = { bank_cash: "Bank accounts", private_holdings: PRIVATE_LABEL };
   const orderedDetail = {};
   for (const [k, label] of lines) {
     const section = sectionOf[k] || label;
@@ -455,11 +456,12 @@ async function main() {
     console.log(JSON.stringify({ now, prev: prev ? { as_of_date: prev.as_of_date, net_worth: num(prev.net_worth) } : null }, null, 2));
   } else {
     log(`Net worth — ${now.as_of_date}`);
-    for (const [k, label] of now.lines) if (num(now[k])) log(`  ${label.padEnd(14)} ${usd0(num(now[k])).padStart(13)}`);
-    log(`  ${"Credit cards".padEnd(14)} ${("−" + usd0(now.card_debt).replace("−", "")).padStart(13)}`);
-    if (now.deposit_liability) log(`  ${"Tenant deposits".padEnd(14)} ${("−" + usd0(now.deposit_liability).replace("−", "")).padStart(13)}`);
-    log(`  ${"".padEnd(14)} ${"─────────────"}`);
-    log(`  ${"NET WORTH".padEnd(14)} ${usd0(now.net_worth).padStart(13)}`);
+    const W = Math.max(15, ...now.lines.map(([, l]) => String(l).length + 1));
+    for (const [k, label] of now.lines) if (num(now[k])) log(`  ${label.padEnd(W)} ${usd0(num(now[k])).padStart(13)}`);
+    log(`  ${"Credit cards".padEnd(W)} ${("−" + usd0(now.card_debt).replace("−", "")).padStart(13)}`);
+    if (now.deposit_liability) log(`  ${"Tenant deposits".padEnd(W)} ${("−" + usd0(now.deposit_liability).replace("−", "")).padStart(13)}`);
+    log(`  ${"".padEnd(W)} ${"─────────────"}`);
+    log(`  ${"NET WORTH".padEnd(W)} ${usd0(now.net_worth).padStart(13)}`);
     if (prev) {
       const delta = now.net_worth - num(prev.net_worth);
       log(`  ${delta >= 0 ? "▲" : "▼"} ${usd0(Math.abs(delta))} since ${prev.as_of_date}`);

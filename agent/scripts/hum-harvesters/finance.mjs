@@ -290,7 +290,7 @@ async function main() {
     if (reNow) parts.push(`${NET_WORTH.property_totals.label || "property"} ${usd(reNow)} (as of ${realEstate[0].as_of_date})`);
     for (const v of valued) if (v.now) parts.push(`${v.src.label || v.src.table} ${usd(v.now)} (as of ${v.rows[0].as_of_date})`);
     if (plaidBrokerage) parts.push(`${NET_WORTH.holdings_label} ${usd(plaidBrokerage)} (as of ${(plaidAsOf || "").slice(0, 10)})`);
-    if (privateNow) parts.push(`private ${usd(privateNow)}`);
+    if (privateNow) parts.push(`${privateLib.privateLabel()} ${usd(privateNow)}`);
     parts.push(`${NET_WORTH.cash_label} ${usd(cashAssets)}`);
 
     // A card whose Item is in login_required has stopped reporting, so its last
