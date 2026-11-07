@@ -118,7 +118,7 @@ async function gather(cfg) {
     Promise.all(sources.map((s) => (s.detail
       ? request(`/rest/v1/${s.detail.table}?select=${s.detail.select}&order=${s.detail.value_field}.desc`).catch(() => [])
       : Promise.resolve([])))),
-    ph ? request("/rest/v1/plaid_holdings?select=account_id,ticker,name,shares,market_value,asset_type,as_of").catch(() => []) : Promise.resolve([]),
+    ph ? request("/rest/v1/plaid_holdings?select=account_id,item_id,ticker,name,shares,market_value,asset_type,as_of").catch(() => []) : Promise.resolve([]),
     request("/rest/v1/plaid_accounts?select=account_id,name,mask,type,institution_name,balance_current,last_synced_at").catch(() => []),
     prop && prop.totals_table
       ? request(`/rest/v1/${prop.totals_table}?select=as_of_date,total_estimate,basis_note&order=as_of_date.desc&limit=1`).catch(() => [])
@@ -133,7 +133,19 @@ async function gather(cfg) {
   const excludedAcctIds = new Set(
     (accounts || []).filter((a) => excluded.some((x) => (a.institution_name || "").toLowerCase().includes(x))).map((a) => a.account_id)
   );
-  const phRows = (holdings || []).filter((h) => !excludedAcctIds.has(h.account_id));
+  // An investments-only Item (a brokerage linked just for holdings) has no
+  // plaid_accounts rows — plaid-sync can't read it — so the account lookup above
+  // misses it and its holdings would be counted twice (once by the source, once
+  // here). Match the Item's institution from the local Item store too.
+  const excludedItemIds = new Set();
+  if (excluded.length) {
+    try {
+      for (const it of require("../lib/plaid-store.js").getItems()) {
+        if (excluded.some((x) => String(it.institution_name || "").toLowerCase().includes(x))) excludedItemIds.add(it.item_id);
+      }
+    } catch { /* no Item store on this host: the account lookup is all we have */ }
+  }
+  const phRows = (holdings || []).filter((h) => !excludedAcctIds.has(h.account_id) && !excludedItemIds.has(h.item_id));
   const phTotal = phRows.reduce((s, h) => s + (Number(h.market_value) || 0), 0);
   const bankCash = (accounts || []).filter((a) => a.type === "depository")
     .reduce((s, a) => s + (Number(a.balance_current) || 0), 0);
