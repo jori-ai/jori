@@ -26,3 +26,10 @@ test("reads a file path; missing or unconfigured is an empty list, never a throw
   assert.deepEqual(privateHoldings(null), []);
   assert.deepEqual(privateHoldings(f + ".missing"), []);
 });
+
+test("depositLiability reads the reconciliation's owed-back total, 0 without one", () => {
+  const { depositLiability } = require("../lib/finance-deposit-reconcile.js");
+  assert.equal(depositLiability({ report: { liability: 37000 } }), 37000);
+  assert.equal(depositLiability(null), 0);
+  assert.equal(depositLiability({ report: {} }), 0);
+});

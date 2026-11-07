@@ -105,7 +105,7 @@ async function gather(cfg) {
   const ph = cfg.plaid_holdings || null;
   const today = localDate();
 
-  const [srcLatest, srcDetail, holdings, accounts, property, propSources] = await Promise.all([
+  const [srcLatest, srcDetail, holdings, accounts, property, propSources, depositRuns] = await Promise.all([
     Promise.all(sources.map((s) =>
       request(`/rest/v1/${s.history_table}?select=as_of_date,total_value&order=as_of_date.desc&limit=1`).catch(() => []))),
     Promise.all(sources.map((s) => (s.detail
@@ -119,7 +119,14 @@ async function gather(cfg) {
     prop && prop.sources_table
       ? request(`/rest/v1/${prop.sources_table}?select=parcel_id&as_of_date=eq.${today}`).catch(() => [])
       : Promise.resolve([]),
+    request("/rest/v1/fin_deposit_reconciliations?select=run_at,report&order=run_at.desc&limit=1").catch(() => []),
   ]);
+
+  // Tenant security deposits are the tenants' money, never the owner's: the
+  // cash sits in the bank balances above, so the amount owed back is
+  // subtracted. Same figure as the weekly review (the latest deposit
+  // reconciliation, lib/finance-deposit-reconcile.js).
+  const depositLiability = require("../lib/finance-deposit-reconcile.js").depositLiability((depositRuns || [])[0] || null);
 
   // Plaid investment holdings not already counted by a source.
   const keep = require("../lib/plaid-store.js").excludeHoldingsFilter(ph && ph.exclude_institutions, accounts);
@@ -260,8 +267,9 @@ async function gather(cfg) {
     private_holdings: privateTotal,
     bank_cash: bankCash,
     card_debt: cardDebt,
+    deposit_liability: depositLiability,
     gross_assets: gross,
-    net_worth: gross - cardDebt,
+    net_worth: gross - cardDebt - depositLiability,
     pending_commitments: pending.reduce((s, p) => s + (p.contract_price || 0), 0),
     pending,
     stale_cards: staleCards,
@@ -372,6 +380,11 @@ function renderHtml(now, prev, cfg) {
           // Debt going UP is bad, so the colour is inverted against the raw sign.
           : `<span style="color:${cardDelta > 0 ? "#b3261e" : "#1a7f37"}">${cardDelta > 0 ? "▲" : cardDelta < 0 ? "▼" : "—"} ${usd0(Math.abs(cardDelta))}</span>`}</td>
       </tr>
+      ${now.deposit_liability ? `<tr>
+        <td style="padding:8px 12px;border-bottom:1px solid #eee;color:#b3261e">Tenant deposits owed back</td>
+        <td style="padding:8px 12px;border-bottom:1px solid #eee;text-align:right;color:#b3261e;white-space:nowrap">−${usd0(now.deposit_liability).replace("−", "")}</td>
+        <td style="padding:8px 12px;border-bottom:1px solid #eee;text-align:right"><span style="color:#999">—</span></td>
+      </tr>` : ""}
       <tr style="font-weight:600">
         <td style="padding:12px">Net worth</td>
         <td style="padding:12px;text-align:right;white-space:nowrap">${usd0(now.net_worth)}</td>
@@ -399,6 +412,7 @@ function snapshotRow(now) {
     private_holdings: now.private_holdings,
     bank_cash: now.bank_cash,
     card_debt: now.card_debt,
+    deposit_liability: now.deposit_liability,
     gross_assets: now.gross_assets,
     net_worth: now.net_worth,
     pending_commitments: now.pending_commitments,
@@ -443,6 +457,7 @@ async function main() {
     log(`Net worth — ${now.as_of_date}`);
     for (const [k, label] of now.lines) if (num(now[k])) log(`  ${label.padEnd(14)} ${usd0(num(now[k])).padStart(13)}`);
     log(`  ${"Credit cards".padEnd(14)} ${("−" + usd0(now.card_debt).replace("−", "")).padStart(13)}`);
+    if (now.deposit_liability) log(`  ${"Tenant deposits".padEnd(14)} ${("−" + usd0(now.deposit_liability).replace("−", "")).padStart(13)}`);
     log(`  ${"".padEnd(14)} ${"─────────────"}`);
     log(`  ${"NET WORTH".padEnd(14)} ${usd0(now.net_worth).padStart(13)}`);
     if (prev) {

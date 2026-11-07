@@ -124,6 +124,8 @@ create table if not exists public.net_worth_snapshots (
   updated_at          timestamptz not null default now()
 );
 alter table public.net_worth_snapshots add column if not exists private_holdings numeric;
+-- Tenant security deposits owed back, subtracted from net worth (bin/net-worth).
+alter table public.net_worth_snapshots add column if not exists deposit_liability numeric;
 
 -- ── Finance facts: written by a person (bin/finance-facts), never guessed ────
 create table if not exists public.fin_txn_override (
