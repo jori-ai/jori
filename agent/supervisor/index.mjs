@@ -27,7 +27,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { spawn as spawnProc } from "node:child_process";
 import { createRequire } from "node:module";
-import { ClaudeSession, supportsCliFlag, buildLocalRulesFile, watchLocalRules } from "./claude-session.mjs";
+import { ClaudeSession, supportsCliFlag, buildLocalRulesFile, watchLocalRules, kernelRulebooks } from "./claude-session.mjs";
 import { writeFileAtomic } from "../../lib/atomic-write.js";
 import { gitGuardHooks } from "../../lib/rollback-guard-settings.mjs";
 import { supervisorSkillOverrides } from "../../lib/hidden-skills.cjs";
@@ -454,7 +454,29 @@ class Supervisor {
   // passed as --append-system-prompt-file. Every ops tier (ops, ops-light,
   // ops-haiku) shares the ops CLAUDE.md, so every tier gets ops.md. A failure
   // here never blocks the spawn: the session starts on the kernel rules alone.
+  // With `inlineRulebooks` on (the default; agents.json `inlineRulebooks: false`
+  // opts out), the kernel rulebooks go into the same file and are excluded
+  // from discovery, so a fresh session reads them from cache instead of
+  // cold-writing them (claude-session.mjs kernelRulebooks).
+  // `_rulebooksInlined` says whether this session's file carries them.
+  _kernelRulebooks() {
+    if (this.cfg?.inlineRulebooks === false || this.args?.claudeBin) return null;
+    try { return kernelRulebooks({ root: JORI_ROOT, cwd: path.join(JORI_ROOT, this.cfg.cwd) }); } catch { return null; }
+  }
+
   _buildLocalRules() {
+    this._rulebooksInlined = null;
+    const rulebooks = this._kernelRulebooks();
+    if (rulebooks?.files.length) {
+      try {
+        const r = buildLocalRulesFile({ localDir: LOCAL_DIR, role: "ops", stateDir: this.dataDir, rulebooks });
+        this._localRulesContent = r.content;
+        this._rulebooksInlined = rulebooks;
+        return r.path;
+      } catch (err) {
+        console.error(`[supervisor] rulebooks not inlined (${err.message}) — claude discovers them as before`);
+      }
+    }
     try {
       const r = buildLocalRulesFile({ localDir: LOCAL_DIR, role: "ops", stateDir: this.dataDir });
       this._localRulesContent = r.content;
@@ -486,7 +508,10 @@ class Supervisor {
   }
 
   startLocalWatchers() {
-    this._stopLocalRulesWatch = watchLocalRules(this, { localDir: LOCAL_DIR, role: "ops", logPrefix: "[supervisor]" });
+    this._stopLocalRulesWatch = watchLocalRules(this, {
+      localDir: LOCAL_DIR, role: "ops", logPrefix: "[supervisor]",
+      rulebooks: () => this._rulebooksInlined || undefined,
+    });
     this._triageRulesTimer = setInterval(() => this._refreshTriageRules(), 30_000);
     this._triageRulesTimer.unref?.();
   }
@@ -573,7 +598,9 @@ class Supervisor {
       // destructive git command, or blocks it. lib/rollback-guard.mjs.
       // + the skills a Jori agent never calls, hidden from its skill listing
       // (lib/hidden-skills.cjs; `hideUnusedSkills: false` in agents.json opts out).
-      settings: JSON.stringify({ sandbox: { enabled: false }, idleCompaction: false, hooks: gitGuardHooks(), ...(cfg.hideUnusedSkills !== false ? { skillOverrides: supervisorSkillOverrides() } : {}) }),
+      // + claudeMdExcludes when the rulebooks ride in the appended system prompt
+      // (_buildLocalRules), so they are not loaded a second time.
+      settings: JSON.stringify({ sandbox: { enabled: false }, idleCompaction: false, hooks: gitGuardHooks(), ...(cfg.hideUnusedSkills !== false ? { skillOverrides: supervisorSkillOverrides() } : {}), ...(localRulesFile && this._rulebooksInlined ? { claudeMdExcludes: this._rulebooksInlined.excludes } : {}) }),
       // The other half of the stable prefix: the default system prompt also
       // carries per-day/per-machine sections (today's date, cwd, env info).
       // The date changes daily, so the first session of each day re-wrote the
