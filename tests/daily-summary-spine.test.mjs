@@ -342,3 +342,49 @@ test("JORI_WALK_UNSEEN_HOPS=0 gives the old line", () => {
     assert.match(hopText(movementHtml(hopDay(hopSpine()), hopBase, hopCafe)), /Walked 0\.5 miles along Main Street, about 32 min\./);
   } finally { delete process.env.JORI_WALK_UNSEEN_HOPS; }
 });
+
+// A stop the spine has no dwell for (a quick shop the user named on a walk, where the
+// phone never saw a rest), inside a leg that runs on through it. The time test gave
+// that whole leg, metres and steps, to the side holding most of its minutes, and the
+// other side kept only the legs before it. The leg is now cut at the stop, each line
+// is at least the straight line between its stops, and its steps are the walking in
+// its own minutes.
+const cutStop = (id, name, s, e, lat) => ({ ...stop(id, name, s, e), lat, lon: -75 }); // kernel-guard-ok: synthetic fixture coordinates
+const cutShop = cutStop("shop", "Shop", "13:30", "13:52", 40.0);
+const cutBakery = cutStop("bakery", "Bakery", "14:06", "14:12", 40.008);
+const cutHome = cutStop("home", "Home", "14:29", "23:00", 40.017);
+const cutLeg = (id, start, end, routed, steps, extra = {}) => ({ ...hopLeg(id, start, end, routed), steps, ...extra });
+const cutDay = () => ({
+  date: "2026-09-06", stops: [cutShop, cutBakery, cutHome], routes: [],
+  steps: { walks: [{ start_ms: T(13, 50), end_ms: T(14, 29), mins: 39, steps: 3600, kind: "leg", leg_id: "l1" }] },
+  path: { stats: {}, segments: [], spine: [
+    hopDwell("d0", "Shop", 40.0, "13:30", "13:50"),
+    cutLeg("l0", "13:50", "13:55", 400, 400, { streets: [] }),
+    hopDwell("d1", "Passed", 40.0036, "13:55", "14:01"),
+    cutLeg("l1", "14:01", "14:29", 1100, 2600, { fixes: 5, walk_steps: 3600,
+      walks: [{ start_ms: T(13, 50), end_ms: T(14, 29), mins: 39, steps: 3600 }] }),
+    hopDwell("d2", "Home", 40.017, "14:29", "23:00"),
+  ] },
+});
+
+test("a leg that runs through a stop the spine never saw is cut at the stop", () => {
+  const d = cutDay();
+  const before = hopText(movementHtml(d, cutShop, cutBakery));
+  const after = hopText(movementHtml(d, cutBakery, cutHome));
+  assert.match(before, /Walked at least 0\.6 miles along Main Street, about 14 min, 1,292 steps\./);
+  assert.match(after, /Walked at least 0\.6 miles along Main Street, about 17 min, 1,569 steps\./);
+  const { printedWalkMeters } = _internal;
+  const info = {};
+  const m = printedWalkMeters(d, [cutShop, cutBakery, cutHome], info);
+  assert.ok(m > 1850 && m < 1950, `expected the two straight lines, about 1.89 km, got ${m}`);
+  assert.equal(info.floor, true);
+});
+
+test("JORI_WALK_CUT_AT_STOP=0 gives the old lines", () => {
+  process.env.JORI_WALK_CUT_AT_STOP = "0";
+  try {
+    const d = cutDay();
+    assert.match(hopText(movementHtml(d, cutShop, cutBakery)), /Walked 0\.2 miles, about 14 min, 400 steps\./);
+    assert.match(hopText(movementHtml(d, cutBakery, cutHome)), /Walked 0\.7 miles along Main Street, about 17 min, 2,600 steps\./);
+  } finally { delete process.env.JORI_WALK_CUT_AT_STOP; }
+});
