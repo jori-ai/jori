@@ -38,8 +38,16 @@ const { brokerConfig, brokerFile, localDate } = require("../lib/broker-config.cj
 const { isPartialFetch, missingAccountNames } = require("../lib/broker-partial-fetch.js");
 const { lapsedTokenSlots } = require("../lib/broker-token-clock.js");
 const { buildRows, emptyMessage, partialMessage } = require("../lib/broker-snapshot-core.js");
+const { buildPortfolio, fetchPlaidRows } = require("../lib/broker-plaid-source.js");
 
 const CFG = brokerConfig();
+// `broker.source: "plaid"` reads positions from the brokerage's Plaid Items
+// (lib/broker-plaid-source.js) instead of the bridge's /api/portfolio. Same
+// rows out, same guards, same tables — only the input changes. Alerts then
+// name Plaid as the thing to reconnect, and the bridge's token clock no longer
+// explains a missing account.
+const PLAID_SOURCE = CFG.source === "plaid";
+if (PLAID_SOURCE) CFG.app_label = CFG.plaid_app_label || "Plaid";
 const T = CFG.tables;
 const SEND = process.env.JORI_SEND_BIN || path.join(__dirname, "jori-send-curl");
 
@@ -112,7 +120,54 @@ function alert(msg) {
   } catch { /* alerting is best-effort; the non-zero exit is the durable signal */ }
 }
 
+// The day the previous snapshot priced each account+ticker, for the day change
+// Plaid does not report. Most recent history row strictly before priceDate.
+async function fetchPrevPrices(priceDate) {
+  const from = new Date(Date.parse(`${priceDate}T12:00:00Z`) - 10 * 864e5).toISOString().slice(0, 10);
+  const rows = await request(
+    `/rest/v1/${T.position_history}?select=account_hash,ticker,current_price,as_of_date` +
+    `&as_of_date=lt.${priceDate}&as_of_date=gte.${from}&order=as_of_date.desc&limit=5000`
+  ).catch(() => []);
+  const out = new Map();
+  for (const r of rows || []) {
+    const k = `${r.account_hash}|${r.ticker}`;
+    if (!out.has(k) && r.current_price != null) out.set(k, r.current_price);
+  }
+  return out;
+}
+
+async function fetchPlaidPortfolio() {
+  const { rows, failed, items } = await fetchPlaidRows(CFG);
+  for (const f of failed) console.error(`  (Plaid item ${f.item_id} failed: ${f.error})`);
+  const first = buildPortfolio(rows, CFG.plaid_accounts || {});
+  const prev = first.priceDate ? await fetchPrevPrices(first.priceDate) : null;
+  const built = prev ? buildPortfolio(rows, CFG.plaid_accounts || {}, prev) : first;
+  for (const u of built.unmapped) {
+    console.error(`  (unmapped Plaid account ${u.name || "?"} ••${u.mask || "?"} — add it to investments.json broker.plaid_accounts to keep a stable name)`);
+  }
+  return { accounts: built.accounts, priceDate: built.priceDate, plaidItems: items, plaidFailed: failed.length };
+}
+
+// The bridge's 7-day refresh token rotates as a side effect of /api/portfolio,
+// and the per-trade Face ID approval path lives on that token. When positions
+// come from Plaid the call is still made — answer discarded — so trading never
+// silently loses its sign-in. Best-effort: broker-token-watch owns the alert.
+async function keepBridgeAlive() {
+  if (!CFG.api_url || !CFG.ro_key || CFG.bridge_keepalive === false) return;
+  try {
+    const res = await fetch(`${CFG.api_url}/api/portfolio`, {
+      headers: { "x-api-key": CFG.ro_key },
+      signal: AbortSignal.timeout(45000),
+    });
+    await res.text();
+    if (!res.ok) console.error(`  (bridge keepalive: HTTP ${res.status})`);
+  } catch (e) {
+    console.error(`  (bridge keepalive failed: ${e.message})`);
+  }
+}
+
 async function fetchPortfolio() {
+  if (PLAID_SOURCE) return fetchPlaidPortfolio();
   if (!CFG.ro_key) {
     throw new Error(`${CFG.key_env} missing — set it in .env (the bridge's read-only key).`);
   }
@@ -177,17 +232,22 @@ async function deleteStale(table, nowIso) {
 }
 
 async function main() {
-  if (!CFG.api_url) {
+  if (!CFG.api_url && !PLAID_SOURCE) {
     log(`broker-snapshot: no broker bridge configured (investments.json broker.api_url / $${CFG.url_env}) — nothing to do.`);
     if (JSON_OUT) console.log(JSON.stringify({ configured: false }));
     return;
   }
   const now = new Date();
   const nowIso = now.toISOString();
-  const asOfDate = localDate(now, CFG.tz);
 
   const portfolio = await fetchPortfolio();
   const accounts = portfolio.accounts || [];
+  // Plaid prices are the official close of a stated day, which can trail the
+  // fetch (Friday's close read on Saturday). Key the day's rows on that day.
+  const asOfDate = (PLAID_SOURCE && portfolio.priceDate) || localDate(now, CFG.tz);
+  if (PLAID_SOURCE && !DRY_RUN) await keepBridgeAlive();
+  // The bridge's token clock explains bridge gaps only.
+  const lapsedSlots = (t) => (PLAID_SOURCE ? [] : lapsedTokenSlots(t));
 
   // Guard: an EMPTY portfolio. Two halves, both load-bearing.
   //
@@ -213,7 +273,7 @@ async function main() {
       // not REASSURE past one either: when broker-token-watch has already seen
       // the sign-in window run out, "there's nothing to do yet" is falsified by
       // a fact on disk. A lapse changes the WORDING of run 1, never its threshold.
-      const lapsed = lapsedTokenSlots(Date.parse(nowIso) || Date.now());
+      const lapsed = lapsedSlots(Date.parse(nowIso) || Date.now());
       alert(emptyMessage({ streak, lapsed, cfg: CFG }));
       process.exit(1);
     }
@@ -249,7 +309,7 @@ async function main() {
       // count alone leaves the user guessing, and blaming a connection on a
       // guess sends them to re-authorize for what may be a minutes-long blip.
       const missingNames = missingAccountNames(await fetchLastGoodAccountNames(), accounts);
-      const lapsed = lapsedTokenSlots(Date.parse(nowIso) || Date.now());
+      const lapsed = lapsedSlots(Date.parse(nowIso) || Date.now());
       alert(partialMessage({ streak, lapsed, cfg: CFG, incomingCount, baseline, pct, missingNames }));
       process.exit(1);
     }
@@ -333,6 +393,8 @@ async function main() {
   }
 
   const summary = {
+    source: PLAID_SOURCE ? "plaid" : "bridge",
+    ...(PLAID_SOURCE ? { price_date: portfolio.priceDate } : {}),
     as_of: nowIso,
     as_of_local: localStamp(now),
     as_of_date: asOfDate,
@@ -347,7 +409,7 @@ async function main() {
   if (JSON_OUT) {
     console.log(JSON.stringify(summary, null, 2));
   } else {
-    log(`${CFG.label} snapshot — as of ${localStamp(now)} (NOT real-time)`);
+    log(`${CFG.label} snapshot — as of ${localStamp(now)} (NOT real-time)${PLAID_SOURCE ? ` · via Plaid, prices = ${portfolio.priceDate} close` : ""}`);
     for (const a of accountRows) {
       log(`  ${a.account_name || a.account_hash}: ${usd(a.total_value)}  (cash ${usd(a.cash_balance)})`);
     }
