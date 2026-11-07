@@ -129,23 +129,8 @@ async function gather(cfg) {
   ]);
 
   // Plaid investment holdings not already counted by a source.
-  const excluded = (ph && ph.exclude_institutions || []).map((s) => String(s).toLowerCase());
-  const excludedAcctIds = new Set(
-    (accounts || []).filter((a) => excluded.some((x) => (a.institution_name || "").toLowerCase().includes(x))).map((a) => a.account_id)
-  );
-  // An investments-only Item (a brokerage linked just for holdings) has no
-  // plaid_accounts rows — plaid-sync can't read it — so the account lookup above
-  // misses it and its holdings would be counted twice (once by the source, once
-  // here). Match the Item's institution from the local Item store too.
-  const excludedItemIds = new Set();
-  if (excluded.length) {
-    try {
-      for (const it of require("../lib/plaid-store.js").getItems()) {
-        if (excluded.some((x) => String(it.institution_name || "").toLowerCase().includes(x))) excludedItemIds.add(it.item_id);
-      }
-    } catch { /* no Item store on this host: the account lookup is all we have */ }
-  }
-  const phRows = (holdings || []).filter((h) => !excludedAcctIds.has(h.account_id) && !excludedItemIds.has(h.item_id));
+  const keep = require("../lib/plaid-store.js").excludeHoldingsFilter(ph && ph.exclude_institutions, accounts);
+  const phRows = (holdings || []).filter(keep);
   const phTotal = phRows.reduce((s, h) => s + (Number(h.market_value) || 0), 0);
   const bankCash = (accounts || []).filter((a) => a.type === "depository")
     .reduce((s, a) => s + (Number(a.balance_current) || 0), 0);

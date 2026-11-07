@@ -27,6 +27,7 @@ import classifyLib from "../../../lib/finance-classify.js";
 import expectedLib from "../../../lib/finance-expected.js";
 import rootLib from "../../../lib/root.cjs";
 import instanceLib from "../../../lib/instance.cjs";
+import plaidStore from "../../../lib/plaid-store.js";
 const { request } = supa;
 const { classify } = classifyLib;
 const { incomeStatus, scheduledDue } = expectedLib;
@@ -118,7 +119,7 @@ async function main() {
     // Brokerages / exchanges Plaid does not cover keep their own dated totals.
     Promise.all((NET_WORTH.value_histories || []).map((src) => history(src, 8))),
     // Anything held through Plaid needs no query of its own: it is in plaid_holdings.
-    request(`/rest/v1/plaid_holdings?select=account_id,market_value,as_of`).catch(() => []),
+    request(`/rest/v1/plaid_holdings?select=account_id,item_id,market_value,as_of`).catch(() => []),
     NET_WORTH.property_totals ? history({ value: "total_estimate", ...NET_WORTH.property_totals }, 1) : Promise.resolve([]),
   ]);
   const acct = (id) => (accounts || []).find((a) => a.account_id === id) || {};
@@ -266,16 +267,10 @@ async function main() {
       .filter((a) => a.type === "credit")
       .reduce((s, a) => s + (Number(a.balance_current) || 0), 0);
 
-    const excluded = (NET_WORTH.holdings_exclude_institutions || []).map((x) => String(x).toLowerCase()).filter(Boolean);
-    const isExcludedAccount = new Set(
-      (accounts || [])
-        .filter((a) => excluded.some((x) => (a.institution_name || "").toLowerCase().includes(x)))
-        .map((a) => a.account_id)
-    );
-    const plaidBrokerage = (plaidHoldings || [])
-      .filter((h) => !isExcludedAccount.has(h.account_id))
+    const plaidRows = (plaidHoldings || []).filter(plaidStore.excludeHoldingsFilter(NET_WORTH.holdings_exclude_institutions, accounts));
+    const plaidBrokerage = plaidRows
       .reduce((s, h) => s + (Number(h.market_value) || 0), 0);
-    const plaidAsOf = (plaidHoldings || []).map((h) => h.as_of).sort().pop();
+    const plaidAsOf = plaidRows.map((h) => h.as_of).sort().pop();
 
     const valued = sources.map(({ src, rows }) => ({ src, rows, now: Number(rows[0].total_value) || 0 }));
     const historiesTotal = valued.reduce((s, v) => s + v.now, 0);

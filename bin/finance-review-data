@@ -135,7 +135,7 @@ async function main() {
     requestAll(`/rest/v1/plaid_transactions?select=transaction_id,account_id,amount,date,name,merchant_name,category_primary,category_detailed,pending&date=gt.${win}&order=date.desc,transaction_id.asc`),
     brokerOn ? request(`/rest/v1/${T.value_history}?select=as_of_date,total_value&order=as_of_date.desc&limit=10`) : none,
     Promise.all(OTHER_HISTORIES.filter((h) => okTable(h.table)).map((h) => safe(request(`/rest/v1/${h.table}?select=as_of_date,total_value&order=as_of_date.desc&limit=1`)).then((rows) => ({ label: h.label, rows: rows || [] })))),
-    safe(request("/rest/v1/plaid_holdings?select=account_id,market_value,as_of")),
+    safe(request("/rest/v1/plaid_holdings?select=account_id,item_id,market_value,as_of")),
     brokerOn ? safe(request(`/rest/v1/${T.accounts}?select=account_hash,account_name,cash_balance,total_value,as_of`)) : none,
     brokerOn ? safe(request(`/rest/v1/${T.positions}?select=account_hash,ticker,market_value,asset_type,as_of`)) : none,
     brokerOn ? safe(request(`/rest/v1/${T.account_history}?select=as_of_date,account_name,cash_balance,total_value&as_of_date=gte.${dayAdd(today, -21)}&order=as_of_date.desc`)) : none,
@@ -463,9 +463,7 @@ async function main() {
   const others = (otherHistories || []).map((h) => ({ label: h.label, value: h.rows[0] ? num(h.rows[0].total_value) : null, as_of: h.rows[0]?.as_of_date || null }));
   const othersTotal = sum(others, (o) => o.value || 0);
   // Plaid holdings, less the institutions counted through their own feed.
-  const excl = (NW.holdings_exclude_institutions || []).map((x) => String(x).toLowerCase()).filter(Boolean);
-  const exclIds = new Set((accounts || []).filter((a) => excl.some((x) => String(a.institution_name || "").toLowerCase().includes(x))).map((a) => a.account_id));
-  const hd = (holdings || []).filter((h) => !exclIds.has(h.account_id));
+  const hd = (holdings || []).filter(require("../lib/plaid-store.js").excludeHoldingsFilter(NW.holdings_exclude_institutions, accounts));
   const holdingsValue = hd.length ? sum(hd, (h) => num(h.market_value)) : null;
   const reValue = reconciled.length ? sum(reconciled, (r) => num(r.value)) : null;
   const depositLiability = deposits ? deposits.liability : 0;
