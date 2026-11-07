@@ -280,3 +280,65 @@ test("the caption is the walking lines and walk blocks it sits over, summed (202
   process.env.JORI_WALKED_FROM_LINES = "0";
   try { assert.match(buildSkeleton(r), /1\.4 miles walked/); } finally { delete process.env.JORI_WALKED_FROM_LINES; }
 });
+
+// Ground the spine never joined: two dwells in a row with no leg between them (a
+// pass-through dropped as no rest, no fix on the way) leave metres the legs never
+// held, while the stops' edges and the steps time all of it. The walk line adds the
+// straight line between those dwells as a floor and says "at least".
+const hopText = (html) => html.replace(/<[^>]+>/g, "");
+const hopBase = stop("a", "Base", "08:00", "12:08");
+const hopCafe = stop("b", "Cafe", "12:40", "13:30");
+// 0.0068 degrees of latitude is about 756 m
+const hopDwell = (id, name, lat, start, end) => ({ type: "dwell", id, place: { name, tier: "corroborated", lat, lon: -75 }, // kernel-guard-ok: synthetic fixture coordinates
+  start, end, start_ms: T(...start.split(":").map(Number)), end_ms: T(...end.split(":").map(Number)), major: true });
+const hopLeg = (id, start, end, routed) => ({ type: "leg", id, start, end,
+  start_ms: T(...start.split(":").map(Number)), end_ms: T(...end.split(":").map(Number)), mins: 5, mode: "walking",
+  routed_m: routed, straight_m: routed, walked_m: routed, geometry: "map_matched", streets: ["Main Street"],
+  holes: [], confidence: "observed", fixes: 3 });
+const hopDay = (spine) => ({ date: "2026-09-06", stops: [hopBase, hopCafe], routes: [], path: { stats: {}, segments: [], spine } });
+const hopSpine = (passedLat = 40.0068) => [ // kernel-guard-ok: synthetic fixture coordinates
+  hopDwell("d0", "Base", 40.0, "08:00", "12:16"),
+  hopDwell("d1", "Passed", passedLat, "12:16", "12:27"),
+  hopLeg("l0", "12:27", "12:32", 784),
+  hopDwell("d2", "Cafe", 40.0136, "12:32", "13:34"),
+];
+
+test("the hop no leg covers is walked ground, so the line states a floor", () => {
+  const line = hopText(movementHtml(hopDay(hopSpine()), hopBase, hopCafe));
+  assert.match(line, /Walked at least 1\.0 miles along Main Street, about 32 min\./);
+});
+
+test("the header's sum is marked a floor when a line is, and not otherwise", () => {
+  const { printedWalkMeters } = _internal;
+  const info = {};
+  const m = printedWalkMeters(hopDay(hopSpine()), [hopBase, hopCafe], info);
+  assert.ok(m > 1500 && m < 1600, `expected about 1.54 km, got ${m}`);
+  assert.equal(info.floor, true);
+  const joined = [
+    hopDwell("d0", "Base", 40.0, "08:00", "12:08"),
+    hopLeg("l0", "12:08", "12:16", 800),
+    hopDwell("d1", "Passed", 40.0068, "12:16", "12:27"),
+    hopLeg("l1", "12:27", "12:32", 784),
+    hopDwell("d2", "Cafe", 40.0136, "12:32", "13:34"),
+  ];
+  const info2 = {};
+  const line = hopText(movementHtml(hopDay(joined), hopBase, hopCafe, {}));
+  assert.match(line, /Walked 1\.0 miles along Main Street, about 32 min\./);
+  assert.doesNotMatch(line, /at least/);
+  printedWalkMeters(hopDay(joined), [hopBase, hopCafe], info2);
+  assert.equal(info2.floor, undefined);
+});
+
+test("a hop that would make the stretch faster than a walk is not added", () => {
+  // the dropped dwell 3 km away: 3 km and the leg in 32 minutes is over 7 km/h, a ride, not a walk
+  const line = hopText(movementHtml(hopDay(hopSpine(40.0275)), hopBase, hopCafe)); // kernel-guard-ok: synthetic fixture coordinates
+  assert.doesNotMatch(line, /at least/);
+  assert.match(line, /Walked 0\.5 miles along Main Street, about 32 min\./);
+});
+
+test("JORI_WALK_UNSEEN_HOPS=0 gives the old line", () => {
+  process.env.JORI_WALK_UNSEEN_HOPS = "0";
+  try {
+    assert.match(hopText(movementHtml(hopDay(hopSpine()), hopBase, hopCafe)), /Walked 0\.5 miles along Main Street, about 32 min\./);
+  } finally { delete process.env.JORI_WALK_UNSEEN_HOPS; }
+});
