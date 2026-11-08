@@ -2865,6 +2865,20 @@ function cmdHumInsight(args) {
   }
 
   const silentRate = bucket.silent / total;
+  // Bands for the event-driven cadence (re-baselined 2026-11-08). A run row is a dispatch, a moment that
+  // already cleared the gate, so the old ">= 0.85 silent" (written for ~72 empty ticks a day) read FAIL
+  // every week. Observed weekly silent rate since 2026-10-12: 0.50-0.67. The surface band is the one
+  // bin/hum-metrics-collect alerts on (SURFACE_RATE_LOW/HIGH). Chatter is judged with signal_per_surfaced,
+  // listed below, never by volume alone.
+  const SILENT_BAND = [0.45, 0.90], SURFACE_BAND = [0.05, 0.55];
+  const surfaceRate = bucket.info / total;
+  const inBand = (v, b) => v >= b[0] && v <= b[1];
+  let signalPerSurfaced7d = null;
+  try {
+    const daily = JSON.parse(fs.readFileSync(path.join(ROOT, 'data', 'hum-metrics-state.json'), 'utf8')).daily || [];
+    const vals = daily.slice(-7).map((d) => d.signal_per_surfaced).filter((v) => typeof v === 'number');
+    if (vals.length) signalPerSurfaced7d = vals.sort((a, b) => a - b)[Math.floor(vals.length / 2)];
+  } catch {}
   const reactedCount = feedback.filter((f) => f.reaction).length;
   const positive = feedback.filter((f) => ['helpful', 'more', '👍'].includes(f.reaction)).length;
   const negative = feedback.filter((f) => ['skip', 'snooze', '👎', '💤'].includes(f.reaction)).length;
@@ -2882,10 +2896,13 @@ function cmdHumInsight(args) {
     .filter((m) => Number.isFinite(m) && m >= 0)
     .sort((a, b) => a - b);
   const medianAnswerMin = answerMins.length ? answerMins[Math.floor(answerMins.length / 2)] : null;
+  // A repeat is a subject the user was actually told or asked about twice. A tick whose pick was
+  // blocked or not delivered (outcome.sent false) is a retry, not a second ask (2026-11-08: 4 of the
+  // week's 6 "repeats" were undelivered picks retried on the next tick).
   const subjectTicks = {};
   for (const r of runs) {
     const subj = r.sonnet?.subject;
-    if (subj && (r.sonnet?.decision === 'info' || r.sonnet?.decision === 'question')) subjectTicks[subj] = (subjectTicks[subj] || 0) + 1;
+    if (subj && r.outcome?.sent === true && (r.sonnet?.decision === 'info' || r.sonnet?.decision === 'question')) subjectTicks[subj] = (subjectTicks[subj] || 0) + 1;
   }
   const dupSubjects = Object.entries(subjectTicks).filter(([, n]) => n > 1).map(([k, n]) => ({ subject: k, ticks: n }));
   const perTopicAttempts = {};
@@ -2898,7 +2915,9 @@ function cmdHumInsight(args) {
   const worstErr = errRates.sort((a, b) => b.rate - a.rate)[0] || null;
   const grade = (value, ok) => (value == null ? 'N/A' : ok ? 'PASS' : 'FAIL');
   const criteria = [
-    { criterion: 'Silent rate', value: silentRate, target: '>= 0.85', status: grade(silentRate, silentRate >= 0.85) },
+    { criterion: 'Silent rate (of dispatches)', value: silentRate, target: `${SILENT_BAND[0]} - ${SILENT_BAND[1]}`, status: grade(silentRate, inBand(silentRate, SILENT_BAND)) },
+    { criterion: 'Surface rate (info / dispatches)', value: surfaceRate, target: `${SURFACE_BAND[0]} - ${SURFACE_BAND[1]}`, status: grade(surfaceRate, inBand(surfaceRate, SURFACE_BAND)) },
+    { criterion: 'Signal per surfaced (7-day median)', value: signalPerSurfaced7d, target: '> 0', status: grade(signalPerSurfaced7d, signalPerSurfaced7d > 0), note: 'pairs with the two rates above: a rate outside its band only counts as chatter when this is not positive' },
     { criterion: 'Info positive rate', value: (positive + negative) ? positiveRate : null, target: '>= 0.60', status: grade((positive + negative) ? positiveRate : null, positiveRate >= 0.60) },
     { criterion: 'Info response rate', value: feedback.length ? responseRate : null, target: '>= 0.30', status: grade(feedback.length ? responseRate : null, responseRate >= 0.30) },
     { criterion: 'Question answer rate', value: bucket.question ? answerRate : null, target: '>= 0.40', status: grade(bucket.question ? answerRate : null, answerRate >= 0.40) },
@@ -2926,7 +2945,7 @@ function cmdHumInsight(args) {
 
   console.log(c.bold(`Hum insight — last ${sinceDays}d`) + '\n');
   console.log(`  ticks:           ${total}`);
-  console.log(`  silent:          ${bucket.silent}  (${(silentRate * 100).toFixed(1)}%)  ${silentRate >= 0.85 ? c.green('✓ intent') : c.yellow('below 0.85')}`);
+  console.log(`  silent:          ${bucket.silent}  (${(silentRate * 100).toFixed(1)}%)  ${inBand(silentRate, SILENT_BAND) ? c.green('✓ intent') : c.yellow(`outside ${SILENT_BAND[0]}-${SILENT_BAND[1]}`)}`);
   console.log(`  info:            ${bucket.info} (sent ${sent}, downgraded ${downgrades})`);
   console.log(`  question:        ${bucket.question}  (answered ${learnings.length}, rate ${(answerRate * 100).toFixed(0)}%)  ${answerRate >= 0.4 ? c.green('✓ intent') : c.yellow('below 0.40')}`);
   if (bucket.error) console.log(`  ${c.red('error:          ' + bucket.error)}`);

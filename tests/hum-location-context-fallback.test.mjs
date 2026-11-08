@@ -71,3 +71,14 @@ test("removed tiers fall through to the file's existing null-emit convention, no
     "should reuse emitNull, not invent a new no-op mechanism",
   );
 });
+
+test("SUPABASE_URL is initialized before the queued-ask branch calls shFetch", () => {
+  // 2026-11-08: the const sat below the Step 0 retrospective-ask branch, so every tick with a
+  // queued ask threw "Cannot access 'SUPABASE_URL' before initialization" (51 errors in a week).
+  // The module runs top to bottom, so a const read by shFetch must precede its first call.
+  const declAt = src.indexOf("const SUPABASE_URL");
+  const firstCallAt = src.search(/[^n] shFetch\(|=\s*shFetch\(/);
+  assert.ok(declAt > -1, "SUPABASE_URL declaration not found");
+  assert.ok(firstCallAt > -1, "no shFetch call found");
+  assert.ok(declAt < firstCallAt, "SUPABASE_URL must be declared before the first shFetch call");
+});
