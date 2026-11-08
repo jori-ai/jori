@@ -890,7 +890,7 @@ async function main() {
         ...(holdingsValue == null ? [] : [{ label: `${NW.holdings_label} (Plaid)`, value_fmt: usd0(holdingsValue), as_of: null, note: null }]),
         ...(privateValue == null ? [] : [{ label: privateLib.privateLabel(), value_fmt: usd0(privateValue), as_of: null, note: privateList.map((h) => `${h.name}${h.mark_as_of ? ` (marked ${h.mark_as_of})` : ""}`).join(", ") }]),
         { label: "Card balances", value_fmt: `−${usd0(cardDebt)}`, as_of: "today", note: null },
-        { label: "Tenant deposits owed back", value_fmt: `−${usd0(depositLiability)}`, as_of: "today", note: "every deposit held, per the deposit reconciliation" },
+        { label: "Tenant deposits owed back", value_fmt: `−${usd0(depositLiability)}`, as_of: "today", note: "every current tenant's deposit, wherever it is held (per the deposit reconciliation)" },
       ],
       note: `Awareness only. Real estate is counted as equity: ${map.mortgage_free_as_of ? `recorded mortgage-free as of ${map.mortgage_free_as_of}` : "no mortgage is recorded in the account map"}.`,
     },
