@@ -17,6 +17,10 @@
 //   finance-names source <transaction_id> "<the account it came from>" --why "..."
 //        where a transfer that has not posted on its sending side came from, when
 //        a record names it (a bank's transfer email: "From: BANK ... ••2788").
+//   finance-names category "<text in the bank line>" <CATEGORY> --why "..."
+//        the spending category for a payee whose bank category is wrong (Plaid
+//        filed an airline as insurance, health insurance as electronics). The
+//        category is a Plaid-style primary: TRAVEL, MEDICAL, FOOD_AND_DRINK, …
 //   finance-names own "<text in the bank line>" --why "..."
 //        an outgoing transfer containing this text goes to an account of the
 //        user's own: a transfer, not spending (a brokerage, a bank elsewhere).
@@ -50,7 +54,7 @@ const die = (m) => { console.error(`finance-names: ${m}`); process.exit(2); };
 const [cmd, a, b] = pos;
 const m = load();
 if (cmd === "list") {
-  console.log(JSON.stringify({ payee_names: m.payee_names || {}, known_external_accounts: m.known_external_accounts || {}, own_transfer_phrases: m.own_transfer_phrases || [], transfer_sources: m.transfer_sources || {} }, null, 2));
+  console.log(JSON.stringify({ payee_names: m.payee_names || {}, known_external_accounts: m.known_external_accounts || {}, own_transfer_phrases: m.own_transfer_phrases || [], transfer_sources: m.transfer_sources || {}, payee_categories: m.payee_categories || {} }, null, 2));
   process.exit(0);
 }
 const why = opt("why");
@@ -70,6 +74,13 @@ if (cmd === "payee") {
   m.transfer_sources = { ...(m.transfer_sources || {}), [a]: b.trim() };
   save(m); journal({ kind: "source", key: a, name: b.trim(), why });
   console.log(`transfer ${a} came from ${b.trim()}`);
+} else if (cmd === "category") {
+  if (!a || !b || !why) die('category "<bank text>" <CATEGORY> --why "<reason>"');
+  if (a.trim().length < 3) die("the bank text must be at least 3 characters");
+  const cat = b.trim().toUpperCase().replace(/[^A-Z_]+/g, "_");
+  m.payee_categories = { ...(m.payee_categories || {}), [a.trim()]: cat };
+  save(m); journal({ kind: "category", key: a.trim(), name: cat, why });
+  console.log(`category "${a.trim()}" → ${cat}`);
 } else if (cmd === "own") {
   if (!a || !why) die('own "<bank text>" --why "<reason>"');
   if (a.trim().length < 4) die("the text must be at least 4 characters");
@@ -77,7 +88,7 @@ if (cmd === "payee") {
   save(m); journal({ kind: "own", key: a.trim().toLowerCase(), why });
   console.log(`own transfers: "${a.trim().toLowerCase()}"`);
 } else if (cmd === "rm") {
-  const field = { payee: "payee_names", account: "known_external_accounts", own: "own_transfer_phrases", source: "transfer_sources" }[a];
+  const field = { payee: "payee_names", account: "known_external_accounts", own: "own_transfer_phrases", source: "transfer_sources", category: "payee_categories" }[a];
   if (!field || !b) die("rm payee|account|own <key>");
   if (Array.isArray(m[field])) m[field] = m[field].filter((x) => x !== b.toLowerCase());
   else if (m[field]) delete m[field][b];

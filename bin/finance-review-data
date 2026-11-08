@@ -308,7 +308,7 @@ async function main() {
     }
     cashPos.pending_own = { amount: amt0, text: `${pendingOwn.map((t) => `${usd(Math.abs(Number(t.amount)))} from ${(map.transfer_sources || {})[t.transaction_id] || `your ${pendingOwnFrom.get(t.transaction_id)} account`} into ${label(t.account_id)} (${fmtD(t.date)})`).join("; ")}: its ${pendingOwnFrom.get(pendingOwn[0].transaction_id)} side has not posted yet, so it is taken off free cash once` };
   }
-  const freeCash = cashPos ? cashPos.free_cash : null;
+  let freeCash = cashPos ? cashPos.free_cash : null;
   const cardDebt = sum(credits, (a) => num(a.balance_current));
 
   // ── 2. CASH FLOW this week, by what the money WAS ───────────────────────
@@ -461,13 +461,15 @@ async function main() {
   const earliest = posted.map((t) => t.date).sort()[0];
   const spend90 = round2(sum(posted.filter((t) => t.date > d90 && isSpend(t)), amt));
   const dailySpend = earliest && earliest <= dayAdd(today, -85) ? spend90 / 90 : null;
-  const runway = freeCash != null && dailySpend ? Math.floor(freeCash / dailySpend) : null;
+  let runway = freeCash != null && dailySpend ? Math.floor(freeCash / dailySpend) : null;
 
   // ── 3. NEXT 14 DAYS: confirmed payments + recurring charges ─────────────
   const upcoming = [];
   const shortfalls = [];
+  const dueFrom = new Map(); // confirmed payments due in 14 days, per funding account
   for (const x of scheduledDue((scheduled || []).filter((s) => s.active), accounts, today, 14)) {
     const s = x.payment;
+    if (x.amount != null) dueFrom.set(s.funding_account_id, round2((dueFrom.get(s.funding_account_id) || 0) + Number(x.amount)));
     // A card payment is named by the card it pays, the same name the Cards table uses.
     const row = { source: "confirmed", label: s.target_account_id && acct(s.target_account_id).account_id ? `${label(s.target_account_id)} payment` : s.label, due: x.due, due_fmt: fmtD(x.due), amount_fmt: x.amount == null ? "amount unknown" : usd0(x.amount), amount_basis: x.amount_basis, autopay: s.autopay, account: label(s.funding_account_id) };
     upcoming.push(row);
@@ -591,6 +593,9 @@ async function main() {
         for (const grp of [re.groups?.[prop.rental_type === "short-term" ? "short_term" : "long_term"], re.portfolio]) if (grp && grp.cash != null) grp.cash = round2(grp.cash - h.amount);
       }
     }
+    // Free cash moved: so do the runway and every figure built on it.
+    freeCash = cashPos.free_cash;
+    runway = dailySpend ? Math.floor(freeCash / dailySpend) : runway;
   }
   const reserveFloor = map.reserve_months_floor ?? 3;
   const rentCheckDay = map.rent_check_from_day ?? null;
@@ -652,7 +657,8 @@ async function main() {
   // ── 7. SPENDING (classified spend only) ─────────────────────────────────
   // A payment to a person and a cash withdrawal carry Plaid's "transfer out":
   // name them for what they are.
-  const catOf = (t) => (kindOf(t) === "cash_withdrawal" ? "CASH_WITHDRAWALS" : (cls.get(t.transaction_id)?.rule === "payment_to_other" || t.category_primary === "TRANSFER_OUT") ? "PAYMENTS_TO_PEOPLE_AND_CONTRACTORS" : t.category_primary || "OTHER");
+  const payeeCat = (t) => { const lc = `${t.merchant_name || ""} ${t.name || ""}`.toLowerCase(); const hit = Object.entries(map.payee_categories || {}).filter(([k]) => k && lc.includes(String(k).toLowerCase())).sort((a, b) => b[0].length - a[0].length)[0]; return hit ? hit[1] : null; };
+  const catOf = (t) => payeeCat(t) || (kindOf(t) === "cash_withdrawal" ? "CASH_WITHDRAWALS" : (cls.get(t.transaction_id)?.rule === "payment_to_other" || t.category_primary === "TRANSFER_OUT") ? "PAYMENTS_TO_PEOPLE_AND_CONTRACTORS" : t.category_primary || "OTHER");
   const catTotals = (rows) => rows.filter(isSpend).reduce((m, t) => { const c = catOf(t); m[c] = (m[c] || 0) + amt(t); return m; }, {});
   const cw = catTotals(wk), cp = catTotals(wkPrev), c90 = catTotals(posted.filter((t) => t.date > d90));
   for (const c of Object.keys(cp)) if (!(c in cw)) cw[c] = 0; // so the prior-week column adds up too
@@ -693,8 +699,24 @@ async function main() {
   }).filter((x) => x.kind && x.kind !== "habit" && x.d.active);
   const monthlyEq = round2(sum(items.filter((x) => CADENCE_PER_MONTH[x.d.cadence] && !RECURRING_SKIP_VERDICTS.has(x.decision?.verdict)), (x) => (x.d.typicalCents || 0) / 100 * CADENCE_PER_MONTH[x.d.cadence]));
   const undecided = items.filter((x) => !x.decision && !BILL_KINDS.has(x.kind));
-  const changed = items.filter((x) => x.d.changedOn && x.d.changedOn > wkStart && x.d.priorCents && x.d.lastCents !== x.d.priorCents)
-    .map((x) => ({ name: x.name, from: x.d.priorCents / 100, to: x.d.lastCents / 100, from_fmt: usd(x.d.priorCents / 100), to_fmt: usd(x.d.lastCents / 100), on_fmt: fmtD(x.d.changedOn) }));
+  // A change is the month's charges against the month before, per name: a
+  // bill that arrives in pieces (Google Cloud: one charge per billing account)
+  // or on two cards is one bill. Comparing single charges called a $5 piece
+  // "the time before" (2026-11-08).
+  const changedRaw = items.filter((x) => x.d.changedOn && x.d.changedOn > wkStart && x.d.priorCents && x.d.lastCents !== x.d.priorCents);
+  const changed = [];
+  for (const name of [...new Set(changedRaw.map((x) => x.name))]) {
+    const xs = changedRaw.filter((x) => x.name === name);
+    const on = xs.map((x) => x.d.changedOn).sort().pop();
+    const ids = new Set(items.filter((x) => x.name === name).map((x) => x.id));
+    const charges = posted.filter((t) => out(t) && ids.has(trackedFor(t)?.id));
+    const inWindow = (a, b) => round2(sum(charges.filter((t) => t.date > a && t.date <= b), amt));
+    const cur = inWindow(dayAdd(on, -30), on), prev = inWindow(dayAdd(on, -61), dayAdd(on, -30));
+    const monthly = items.find((x) => ids.has(x.id))?.d.cadence === "monthly";
+    const from = monthly && cur && prev ? prev : sum(xs, (x) => x.d.priorCents / 100);
+    const to = monthly && cur && prev ? cur : sum(xs, (x) => x.d.lastCents / 100);
+    changed.push({ name, from: round2(from), to: round2(to), from_fmt: usd(from), to_fmt: usd(to), on_fmt: fmtD(on), basis: monthly && cur && prev ? "month" : "charge" });
+  }
   const renewals = items.filter((x) => x.d.cadence === "annual" && x.d.nextExpected && daysBetween(today, x.d.nextExpected) >= 0 && daysBetween(today, x.d.nextExpected) <= 30)
     .map((x) => ({ name: x.name, kind: x.kind, amount_fmt: usd0((x.d.typicalCents || 0) / 100), due_fmt: fmtD(x.d.nextExpected), decision: x.decision ? x.decision.verdict : "continue (default)", paid: paidById.get(x.id) || null }));
   const chargedAfterCancel = items.filter((x) => ["cancel", "already_cancelled"].includes(x.decision?.verdict) && x.d.lastCharged && x.d.lastCharged > String(x.decision.decidedAt || "").slice(0, 10))
@@ -716,7 +738,7 @@ async function main() {
   }
   // Every change is listed; only an increase of at least 5% and $5 a charge is
   // raised to the top (a utility bill moves every month, a $0.16 cloud bill is noise).
-  for (const c of changed.filter((c) => c.to - c.from >= 5 && c.to >= c.from * 1.05)) flag(55, "spend-increase", `${c.name} charged ${c.to_fmt} on ${c.on_fmt}, up from ${c.from_fmt} the time before.`); // a bigger charge, not a known price change: a usage-billed service (ads, cloud) moves with use
+  for (const c of changed.filter((c) => c.to - c.from >= 5 && c.to >= c.from * 1.05)) flag(55, "spend-increase", c.basis === "month" ? `${c.name} came to ${c.to_fmt} in the month to ${c.on_fmt}, up from ${c.from_fmt} the month before.` : `${c.name} charged ${c.to_fmt} on ${c.on_fmt}, up from ${c.from_fmt} the time before.`); // a bigger charge, not a known price change: a usage-billed service (ads, cloud) moves with use
 
   // ── 10. ANOMALIES (expense-classified rows only) ────────────────────────
   const anomalies = { duplicates: [], unusual: [], new_merchant_large: [] };
@@ -811,10 +833,13 @@ async function main() {
   // The balance net of money already on its way out of it (a transfer another
   // bank pulled, its side here not posted yet: transfer_sources names the account).
   const leaving = (a) => round2(sum(pendingOwn.filter((t) => String((map.transfer_sources || {})[t.transaction_id] || "").includes(`••${a.mask}`)), (t) => Math.abs(Number(t.amount))));
-  const idleBal = (a) => round2(num(a.balance_current) - leaving(a));
+  // ...and net of the confirmed payments due from it in the next 14 days.
+  const idleBal = (a) => round2(num(a.balance_current) - leaving(a) - (dueFrom.get(a.account_id) || 0));
   for (const a of depos.filter((a) => idleBal(a) > idleThreshold && ["savings", "checking"].includes(a.subtype) && gmap[a.account_id]?.group !== "deposits")) {
     const left = leaving(a);
-    flag(60, "idle-cash", `${label(a.account_id)} holds ${usd0(idleBal(a))}${left ? ` (after the ${usd0(left)} already on its way out)` : ""}, ${usd0(idleBal(a) - idleThreshold)} above your ${usd0(idleThreshold)} cash buffer.`,
+    const due = dueFrom.get(a.account_id) || 0;
+    const after = [left ? `the ${usd0(left)} already on its way out` : "", due ? `the ${usd0(due)} of payments due from it in the next 14 days` : ""].filter(Boolean).join(" and ");
+    flag(60, "idle-cash", `${label(a.account_id)} holds ${usd0(idleBal(a))}${after ? ` after ${after}` : ""}, ${usd0(idleBal(a) - idleThreshold)} above your ${usd0(idleThreshold)} cash buffer.`,
       `Nothing is at risk; move the ${usd0(idleBal(a) - idleThreshold)} somewhere it earns more if you want, otherwise nothing to do.`);
     attention[attention.length - 1].optional = true;
   }
@@ -910,7 +935,7 @@ async function main() {
     },
     cards: { aggregate_utilization_fmt: pct(aggUtil), utilization_basis: "cards that report a limit", items: cardItems, interest, fees },
     recurring: {
-      source: `${FR.recurring_label} (expense-recurring)`, active_count: items.length, monthly_equivalent_fmt: usd0(monthlyEq),
+      source: FR.recurring_label, active_count: items.length, monthly_equivalent_fmt: usd0(monthlyEq),
       undecided_count: undecided.length, price_changes: changed, renewals_30d: renewals, charged_after_cancel: chargedAfterCancel,
     },
     anomalies,
