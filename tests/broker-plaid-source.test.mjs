@@ -14,7 +14,7 @@ const MAP = {
 };
 
 const rows = [
-  { account_id: "a1", account_mask: "1111", account_name: "Trad IRA", security_id: "s-cash", ticker: "CUR:USD", asset_type: "cash", shares: 38224.75, current_price: 1, market_value: 38224.75, price_as_of: "2026-11-07" },
+  { account_id: "a1", account_mask: "1111", account_name: "Trad IRA", security_id: "s-cash", ticker: "CUR:USD", asset_type: "cash", shares: 40000, current_price: 1, market_value: 40000, price_as_of: "2026-11-07" },
   { account_id: "a1", account_mask: "1111", account_name: "Trad IRA", security_id: "s-nvda", ticker: "NVDA", name: "NVIDIA", asset_type: "equity", shares: 100, current_price: 186.64, market_value: 18664, cost_basis: 5000, price_as_of: "2026-11-06" },
   { account_id: "a1", account_mask: "1111", account_name: "Trad IRA", security_id: "s-brk", ticker: "BRK.B", asset_type: "equity", shares: 10, current_price: 570.89, market_value: 5708.9, price_as_of: "2026-11-06" },
   { account_id: "a2", account_mask: "2222", account_name: "Partner Trad 401k", security_id: "s-vxus", ticker: "VXUS", asset_type: "etf", shares: 50, current_price: 80.92, market_value: 4046, price_as_of: "2026-11-06" },
@@ -34,8 +34,8 @@ test("maps accounts onto the bridge-era hash and name, and keeps unmapped ones",
 test("uninvested cash becomes cashBalance; a money-market fund stays a CASH_EQUIVALENT position", () => {
   const { accounts } = buildPortfolio(rows, MAP);
   const trad = accounts.find((a) => a.accountHash === "HASH-A");
-  assert.equal(trad.cashBalance, 38224.75);
-  assert.equal(trad.totalValue, 62597.65);
+  assert.equal(trad.cashBalance, 40000);
+  assert.equal(trad.totalValue, 64372.9);
   assert.ok(!trad.positions.some((p) => p.ticker === "CUR:USD"));
   const second = accounts.find((a) => a.accountHash === "HASH-B");
   assert.equal(second.cashBalance, 0);
