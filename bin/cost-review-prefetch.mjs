@@ -250,15 +250,26 @@ guard('mcp_tool_listing', () => {
   // keys, not language.
   const MODEL_KEY = '"model":"claude-';
   const isOpusText = (s) => { const i = s.indexOf(MODEL_KEY); return i >= 0 && s.startsWith('opus', i + MODEL_KEY.length); };
-  const opsSessionIds = new Set();
-  try {
-    const since = new Date(Date.now() - 35 * 86400e3).toISOString();
-    for (const line of fs.readFileSync(path.join(ROOT, 'agent/logs/supervisor-ops/job-costs.ndjson'), 'utf8').split('\n')) {
-      if (!line) continue;
-      let r; try { r = JSON.parse(line); } catch { continue; }
-      if (r.session_id && String(r.ts || '') >= since) opsSessionIds.add(r.session_id);
-    }
-  } catch {}
+  const ledgerSessionIds = (tier) => {
+    const ids = new Set();
+    try {
+      const since = new Date(Date.now() - 35 * 86400e3).toISOString();
+      for (const line of fs.readFileSync(path.join(ROOT, `agent/logs/supervisor-${tier}/job-costs.ndjson`), 'utf8').split('\n')) {
+        if (!line) continue;
+        let r; try { r = JSON.parse(line); } catch { continue; }
+        if (r.session_id && String(r.ts || '') >= since) ids.add(r.session_id);
+      }
+    } catch {}
+    return ids;
+  };
+  const opsSessionIds = ledgerSessionIds('ops');
+  // The ops-light and ops-haiku dirs also hold sessions no supervisor started:
+  // a probe, test or scripted `claude -p` run with that cwd. Those load no deny list, so
+  // their listing is the whole account's and, being the largest, would be
+  // read as the tier's. Keep only sessions on the tier's own ledger; an
+  // unreadable or empty ledger keeps every file (unknown, not filtered).
+  const tierSessionIds = { 'ops-light': ledgerSessionIds('ops-light'), 'ops-haiku': ledgerSessionIds('ops-haiku') };
+  const onTierLedger = (tier) => (f) => !tierSessionIds[tier].size || tierSessionIds[tier].has(stemOf(f));
   const stemOf = (file) => path.basename(file, '.jsonl');
   const isOpusFile = (file) => {
     let fd; try { fd = fs.openSync(file, 'r'); } catch { return false; }
@@ -318,6 +329,8 @@ guard('mcp_tool_listing', () => {
   const notOps = (f) => !opsSessionIds.has(stemOf(f));
   const USAGE_KEEP = {
     ops: { pre: (f) => opsSessionIds.has(stemOf(f)) },
+    'ops-light': { pre: onTierLedger('ops-light') },
+    'ops-haiku': { pre: onTierLedger('ops-haiku') },
     'opus-forks': { pre: notOps, text: isOpusText },
     'sonnet-forks': { pre: notOps, text: (s) => !isOpusText(s) },
   };
@@ -358,6 +371,8 @@ guard('mcp_tool_listing', () => {
   const tiers = { ops: 'ops-agent', 'ops-light': 'ops-light-agent', 'ops-haiku': 'ops-haiku-agent', 'opus-forks': 'ops-agent', 'sonnet-forks': 'ops-agent' };
   const TIER_KEEP = {
     ops: (f) => opsSessionIds.has(stemOf(f)),
+    'ops-light': onTierLedger('ops-light'),
+    'ops-haiku': onTierLedger('ops-haiku'),
     'opus-forks': (f) => !opsSessionIds.has(stemOf(f)) && isOpusFile(f),
     'sonnet-forks': (f) => !opsSessionIds.has(stemOf(f)) && !isOpusFile(f),
   };
@@ -435,7 +450,9 @@ guard('mcp_tool_listing', () => {
     'A non-trivial delta_tokens_est with a CLEAN always_loaded_surfaces sweep means an ACCOUNT-level connector changed, not a file. ' +
     'calls_30d / calls_30d_fleet are ACTUAL call counts from the supervisor transcripts — rank any connector cut on those, not on ungranted_tokens_est alone; see usage_30d. ' +
     'ops.delta_tokens_est and usage_30d.per_tier_scanned.ops RE-BASED on 2026-10-09 when the forks left the ops tier: a one-time jump, not a change. ' +
-    'Since 2026-10-09 the ops-agent project dir is split three ways: `ops` = sessions in the supervisor-ops ledger only; `opus-forks` = Opus launchd forks; `sonnet-forks` = other `claude -p` runs with that cwd (daily-summary-run and the other scripted model calls). Forks have no agents.json entry, so their ungranted_* fields mean nothing: read tokens_est, the listing sizes and calls_30d. Subagent transcripts (subagents/*.jsonl) are not scanned.';
+    'Since 2026-10-09 the ops-agent project dir is split three ways: `ops` = sessions in the supervisor-ops ledger only; `opus-forks` = Opus launchd forks; `sonnet-forks` = other `claude -p` runs with that cwd (daily-summary-run and the other scripted model calls). Forks have no agents.json entry, so their ungranted_* fields mean nothing: read tokens_est, the listing sizes and calls_30d. ' +
+    'ops-light and ops-haiku count only sessions on their own supervisor ledger, so a probe, test or scripted `claude -p` run started in that cwd (no deny list, the whole account\'s listing) is not read as the tier. ' +
+    'Subagent transcripts (subagents/*.jsonl) are not scanned.';
   return out;
 });
 
