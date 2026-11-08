@@ -298,7 +298,7 @@ async function main() {
       cashPos.buckets[key].total = round2(cashPos.buckets[key].total - amt0);
       cashPos.buckets[key].accounts.push({ label: `In transit from your ${pendingOwnFrom.get(pendingOwn[0].transaction_id)} account (in both balances until it posts)`, mask: null, balance: -amt0, week_delta: -amt0 });
     }
-    cashPos.pending_own = { amount: amt0, text: `${pendingOwn.map((t) => `${usd(Math.abs(Number(t.amount)))} from your ${ownPullFrom(t).name} account into ${label(t.account_id)} (${fmtD(t.date)})`).join("; ")}: its ${ownPullFrom(pendingOwn[0]).name} side has not posted yet, so it is taken off free cash once` };
+    cashPos.pending_own = { amount: amt0, text: `${pendingOwn.map((t) => `${usd(Math.abs(Number(t.amount)))} from your ${pendingOwnFrom.get(t.transaction_id)} account into ${label(t.account_id)} (${fmtD(t.date)})`).join("; ")}: its ${pendingOwnFrom.get(pendingOwn[0].transaction_id)} side has not posted yet, so it is taken off free cash once` };
   }
   const freeCash = cashPos ? cashPos.free_cash : null;
   const cardDebt = sum(credits, (a) => num(a.balance_current));
