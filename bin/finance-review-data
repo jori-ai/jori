@@ -294,6 +294,10 @@ async function main() {
   // account, summing to the line to the cent (the user, 2026-11-08: "if
   // income is X, the income rows should show how it sums up to X").
   const streamLabel = new Map((expectedIncome || []).map((e) => [e.id, e.label]));
+  const norm = (x) => String(x || "").toLowerCase().replace(/[^a-z0-9 ]+/g, " ").replace(/\s+/g, " ").trim();
+  const institutions = [...new Set((accounts || []).map((a) => a.institution_name).filter(Boolean))].map((name) => ({ name, key: norm(name) }));
+  const institutionOf = (t) => acct(t.account_id).institution_name || "bank";
+  const titleish = (x) => String(x || "").trim().toLowerCase().replace(/(^|[\s(\-])([a-z])/g, (m, a, c) => a + c.toUpperCase()).replace(/\bB\.m\./i, "B.M.");
   const describe = (t) => {
     const v = cls.get(t.transaction_id) || {};
     if (v.expected_income_id && streamLabel.has(v.expected_income_id)) return streamLabel.get(v.expected_income_id);
@@ -301,8 +305,27 @@ async function main() {
     if (names.length) return `${v.kind === "deposit_in" ? "Deposit" : "Rent"} — ${names.join(", ")}${v.period ? ` (${v.period})` : ""}`;
     // A bank ACH line ("PAYER DES:Rent-cr ID:123 INDN:…") is named by its payer
     // and entry description, so one payer's payouts group into one row.
-    const ach = !t.merchant_name && /^(.*?)\s+DES:\s*(\S+)/.exec(String(t.name || "")); // lang-regex-ok: bank-generated ACH descriptor
-    const base = ach ? `${ach[1].trim()} — ${ach[2]}` : who(t);
+    const raw = String(t.name || "");
+    const ach = !t.merchant_name && /^(.*?)\s+DES:\s*(\S+)/.exec(raw); // lang-regex-ok: bank-generated ACH descriptor
+    // A wire names its sender and the sender's bank; say them.
+    const wire = /ORIG:\s*(.*?)\s+ID:/.exec(raw); // lang-regex-ok: bank-generated wire descriptor
+    const wireBank = /ORIG BK:\s*(.*?)\s+ID:/.exec(raw); // lang-regex-ok: bank-generated wire descriptor
+    // A deposit made at a branch counter names only the branch.
+    const branch = /FIN CTR .*?DEPOSIT\s+(.*)$/i.exec(raw); // lang-regex-ok: bank-generated branch-deposit descriptor
+    // A transfer pulled from a bank where the user also has linked accounts, whose
+    // other side has not posted there yet (Capital One shows "BANK OF AMERICA, N.A.").
+    const ownBank = !out(t) && kindOf(t) === "transfer_external" && institutions.find((i) => norm(raw).startsWith(i.key) && i.name !== acct(t.account_id).institution_name);
+    const zelle = /^Zelle payment (?:to|from) (.*?)(?: for "|; Conf#|\s+Conf#|$)/i.exec(raw); // lang-regex-ok: bank-generated Zelle descriptor
+    const xfer = /^TRANSFER .*?:(.*?) Confirmation#/i.exec(raw); // lang-regex-ok: bank-generated transfer descriptor
+    const chk = /transfer (?:to|from) (?:CHK|SAV) (\d{4})/i.exec(raw); // lang-regex-ok: bank-generated transfer descriptor
+    const extName = chk && (map.known_external_accounts || {})[chk[1]];
+    const base = wire ? `Wire from ${titleish(wire[1])}${wireBank ? ` (${titleish(wireBank[1])})` : ""}`
+      : zelle ? `${titleish(zelle[1])} (Zelle)`
+      : xfer ? `${titleish(xfer[1])} (bank transfer)`
+      : chk ? (extName ? `${extName} ••${chk[1]}` : `${institutionOf(t)} account ••${chk[1]} (not linked)`)
+      : branch ? `Deposit at the ${institutionOf(t)} branch, ${branch[1].trim()}`
+      : ownBank ? `Your ${ownBank.name} account (its side has not posted yet)`
+      : ach ? `${ach[1].trim()} — ${ach[2]}` : who(t);
     if (v.rule === "books_category" && (v.categories || []).length) return `${base} · ${v.categories.join(", ")}`;
     return base;
   };
@@ -322,11 +345,14 @@ async function main() {
       const pr = byProperty ? propertyOfIncome(t) : null;
       const what = pr ? `Rent — ${pr.name}` : describe(t);
       const k = pr ? `prop|${pr.id}` : `${what}|${t.account_id}`;
-      if (!g.has(k)) g.set(k, { what, account: label(t.account_id), count: 0, cents: 0, dates: [] });
+      // From and to, spelled out (the user, 2026-11-08: "it should be clearer
+      // where the payment came from and where it went"): money in comes from the
+      // payer into the account; money out leaves the account for the payee.
+      if (!g.has(k)) g.set(k, { what, account: label(t.account_id), from: out(t) ? label(t.account_id) : what, to: out(t) ? what : label(t.account_id), count: 0, cents: 0, dates: [] });
       const x = g.get(k); x.count += 1; x.cents += Math.round(amt(t) * 100); x.dates.push(t.date);
     }
     return [...g.values()].sort((a, b) => b.cents - a.cents).map((x) => ({
-      what: x.what, account: x.account, count: x.count, amount: x.cents / 100, amount_fmt: usd(x.cents / 100),
+      what: x.what, account: x.account, from: x.from, to: x.to, count: x.count, amount: x.cents / 100, amount_fmt: usd(x.cents / 100),
       dates_fmt: [...new Set(x.dates.sort())].map(fmtD).join(", "),
     }));
   };
@@ -341,6 +367,19 @@ async function main() {
     capital: wk.filter((t) => out(t) && kindOf(t) === "capital"),
     unreviewed_large: wk.filter((t) => out(t) && kindOf(t) === "unreviewed_large"),
   };
+  // An own-bank transfer to an account Plaid does not see: whose is it? Asked
+  // once per account; the answer goes in the account map's
+  // `known_external_accounts` ({mask: "<whose account>"}) and names it from then on.
+  const linkedMasks = new Set((accounts || []).map((a) => String(a.mask)));
+  for (const t of wk) {
+    const m = /transfer (?:to|from) (?:CHK|SAV) (\d{4})/i.exec(String(t.name || "")); // lang-regex-ok: bank-generated transfer descriptor
+    if (!m || linkedMasks.has(m[1]) || (map.known_external_accounts || {})[m[1]]) continue;
+    ask(`account-external:${m[1]}`, `Whose is ${institutionOf(t)} account ••${m[1]}? ${usd(amt(t))} went ${out(t) ? "to" : "from"} it from ${label(t.account_id)} on ${fmtD(t.date)}.`, `Say whose it is; it is recorded in the account map's known_external_accounts.`);
+  }
+  // A deposit made at a branch counter says nothing about whose money it was: ask.
+  for (const t of wk.filter((t) => !out(t) && /FIN CTR .*?DEPOSIT/i.test(String(t.name || "")) && amt(t) >= 500)) { // lang-regex-ok: bank-generated branch-deposit descriptor
+    ask(`txn:${t.transaction_id}`, `What was the ${usd(amt(t))} deposited at the ${institutionOf(t)} branch on ${fmtD(t.date)} into ${label(t.account_id)}?`, `finance-facts txn ${t.transaction_id} --kind income|refund|transfer_external --note "..."`);
+  }
   const flowDetail = Object.fromEntries(Object.entries(flowRows).map(([k, rows]) => [k, { total: flow[k], total_fmt: usd(flow[k]), rows: breakdown(rows, k === "income_in") }]));
   const unexplainedRows = wk.filter((t) => !out(t) && kindOf(t) === "inflow_unexplained")
     .sort((a, b) => amt(b) - amt(a))
