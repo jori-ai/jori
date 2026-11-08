@@ -402,3 +402,17 @@ test("an outgoing transfer to another person is spending; to one's own account i
   assert.equal(c.get("dep").kind, "deposit_refund");
   assert.equal(c.get("atm").kind, "cash_withdrawal");
 });
+
+test("payroll paid as one net amount and received per person is a transfer between one's own accounts (split pair)", () => {
+  const c = classify([
+    t("net", "biz", 6749.28, "2026-11-06", { name: "PAYROLLCO DES:NET 802512", pri: "TRANSFER_OUT" }),
+    t("p1", "chk", -3374.64, "2026-11-07", { name: "ACH CREDIT Acme LLC PAYROLL ON 11/07", pri: "INCOME", det: "INCOME_SALARY" }),
+    t("p2", "chk", -3374.64, "2026-11-07", { name: "ACH CREDIT Acme LLC PAYROLL ON 11/07", pri: "INCOME", det: "INCOME_SALARY" }),
+    t("rent", "chk", -3374.64, "2026-11-07", { name: "OTHER PAYER DES:RENT", pri: "INCOME" }),
+  ], accounts);
+  assert.equal(c.get("net").kind, "internal_transfer");
+  assert.equal(c.get("net").rule, "split_pair");
+  assert.equal(c.get("p1").kind, "internal_transfer");
+  assert.equal(c.get("p2").kind, "internal_transfer");
+  assert.notEqual(c.get("rent").kind, "internal_transfer"); // another payer is never part of the set
+});

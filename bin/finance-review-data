@@ -359,7 +359,7 @@ async function main() {
     const named = Object.entries(map.payee_names || {}).filter(([k]) => k && lineLc.includes(String(k).toLowerCase())).sort((a, b) => b[0].length - a[0].length)[0];
     if (named) return named[1];
     const names = (v.tenants || []).map((x) => (typeof x === "string" ? x : x?.name)).filter(Boolean);
-    if (names.length) return `${v.kind === "deposit_in" ? "Deposit" : "Rent"} — ${names.join(", ")}${v.period ? ` (${v.period})` : ""}`;
+    if (names.length) return `${v.kind === "deposit_in" ? "Deposit" : "Rent"} — ${names.join(", ")}`;
     // A bank ACH line ("PAYER DES:Rent-cr ID:123 INDN:…") is named by its payer
     // and entry description, so one payer's payouts group into one row.
     const raw = String(t.name || "");
@@ -563,12 +563,41 @@ async function main() {
 
   // ── 5. REAL ESTATE (ledger P&L, reconciled values) ──────────────────────
   const re = reg ? buildRealEstate({ registry: reg, ledgerTxns, cash: cashPos, propertyValues, reconciledValues: reconciled, unitAvailability, tenants, leases, today, config: map }) : null;
+  // Tenant deposit money sitting in a property's own account (a deposit not yet
+  // moved to the deposit account; the money for a refund the deposit account
+  // paid on its behalf) is owed, not the owner's: it comes off free cash, off
+  // that property's cash and reserve, and shows as its own row until it moves.
+  const repRows = ((depositRuns || [])[0]?.report?.rows) || [];
+  const heldElsewhere = [
+    ...repRows.filter((x) => x.location === "operating_account" && x.expected_location === "deposit_account" && x.location_account_mask)
+      .map((x) => ({ mask: String(x.location_account_mask), amount: Number(x.amount), why: `${String(x.tenant).trim()}'s deposit` })),
+    ...repRows.filter((x) => x.returned_from_other && x.returned_from_other.held_in)
+      .map((x) => ({ mask: String(x.returned_from_other.held_in), amount: Number(x.returned_from_other.amount), why: `${String(x.tenant).trim()}'s refund, paid from the deposit account` })),
+  ].filter((h) => h.amount > 0);
+  if (heldElsewhere.length && cashPos) {
+    for (const h of heldElsewhere) {
+      const a = depos.find((x) => String(x.mask) === h.mask);
+      const g = a && gmap[a.account_id];
+      cashPos.free_cash = round2(cashPos.free_cash - h.amount);
+      const key = g?.group === "property" ? "real_estate" : g?.group === "business" ? "business" : g?.group === "personal" ? "personal" : null;
+      if (key && cashPos.buckets[key]) {
+        cashPos.buckets[key].total = round2(cashPos.buckets[key].total - h.amount);
+        cashPos.buckets[key].accounts.push({ label: `Tenant money held in ••${h.mask}: ${h.why} (owed to the deposit account)`, mask: null, balance: -h.amount, week_delta: 0 });
+      }
+      const prop = re && g?.propertyId && re.properties.find((x) => x.id === g.propertyId);
+      if (prop) {
+        prop.cash = round2(prop.cash - h.amount);
+        if (prop.monthly_burn > 0) prop.reserve_months = prop.cash / prop.monthly_burn;
+        for (const grp of [re.groups?.[prop.rental_type === "short-term" ? "short_term" : "long_term"], re.portfolio]) if (grp && grp.cash != null) grp.cash = round2(grp.cash - h.amount);
+      }
+    }
+  }
   const reserveFloor = map.reserve_months_floor ?? 3;
   const rentCheckDay = map.rent_check_from_day ?? null;
   const monthStart = `${today.slice(0, 7)}-01`;
   const rentRows = [];
   for (const p of re?.properties || []) {
-    if (p.reserve_months != null && p.reserve_months < reserveFloor) flag(68, "reserve", `${p.name} holds ${usd0(p.cash)}, ${p.reserve_months.toFixed(1)} months of its own trailing running costs (${usd0(p.monthly_burn)}/mo); the floor is ${reserveFloor} months.`);
+    if ((p.accounts || []).length && p.reserve_months != null && p.reserve_months < reserveFloor) flag(68, "reserve", `${p.name} holds ${usd0(p.cash)}, ${p.reserve_months.toFixed(1)} months of its own trailing running costs (${usd0(p.monthly_burn)}/mo); the floor is ${reserveFloor} months.`);
     for (const v of p.vacant_units) flag(66, "vacancy", `${p.name} unit ${v.unit} has no current tenant${v.rent ? ` (listed at ${usd0(v.rent)}/mo)` : ""}.`);
     for (const l of p.leases_expiring_90d) flag(48, "lease-ending", `${p.name}: ${l.name}'s lease${l.unit && l.unit !== p.id ? ` on unit ${l.unit}` : ""} ends ${fmtD(l.ends)}.`);
     if (p.ledger_empty_ytd && p.acquired_on && daysBetween(p.acquired_on, today) <= 45) {
@@ -779,8 +808,15 @@ async function main() {
   const privateValue = privateList.length ? privateLib.privateTotal(privateList) : null;
   const netWorth = (brokerNow || 0) + othersTotal + (holdingsValue || 0) + (reValue || 0) + (privateValue || 0) + bankCash - cardDebt - depositLiability;
   const idleThreshold = map.idle_cash_buffer_usd || 50000;
-  for (const a of depos.filter((a) => num(a.balance_current) > idleThreshold && ["savings", "checking"].includes(a.subtype) && gmap[a.account_id]?.group !== "deposits")) {
-    flag(60, "idle-cash", `${label(a.account_id)} holds ${usd0(num(a.balance_current))}, above the ${usd0(idleThreshold)} idle-cash threshold.`);
+  // The balance net of money already on its way out of it (a transfer another
+  // bank pulled, its side here not posted yet: transfer_sources names the account).
+  const leaving = (a) => round2(sum(pendingOwn.filter((t) => String((map.transfer_sources || {})[t.transaction_id] || "").includes(`••${a.mask}`)), (t) => Math.abs(Number(t.amount))));
+  const idleBal = (a) => round2(num(a.balance_current) - leaving(a));
+  for (const a of depos.filter((a) => idleBal(a) > idleThreshold && ["savings", "checking"].includes(a.subtype) && gmap[a.account_id]?.group !== "deposits")) {
+    const left = leaving(a);
+    flag(60, "idle-cash", `${label(a.account_id)} holds ${usd0(idleBal(a))}${left ? ` (after the ${usd0(left)} already on its way out)` : ""}, ${usd0(idleBal(a) - idleThreshold)} above your ${usd0(idleThreshold)} cash buffer.`,
+      `Nothing is at risk; move the ${usd0(idleBal(a) - idleThreshold)} somewhere it earns more if you want, otherwise nothing to do.`);
+    attention[attention.length - 1].optional = true;
   }
 
   // ── 13. TAX (awareness) ─────────────────────────────────────────────────
@@ -793,7 +829,7 @@ async function main() {
     id: p.id, name: p.name, rental_type: p.rental_type, cash_fmt: usd0(p.cash),
     week_net_fmt: gap(p, signed(p.week.net)), mtd_net_fmt: gap(p, signed(p.mtd.net)), ytd_net_fmt: gap(p, signed(p.ytd.net)),
     ytd_income_fmt: gap(p, usd0(p.ytd.income)), ytd_expenses_fmt: gap(p, usd0(p.ytd.expenses)),
-    reserve_fmt: months(p.reserve_months), reserve_low: p.reserve_months != null && p.reserve_months < reserveFloor,
+    reserve_fmt: (p.accounts || []).length ? months(p.reserve_months) : "—", reserve_low: (p.accounts || []).length > 0 && p.reserve_months != null && p.reserve_months < reserveFloor,
     rent_roll_fmt: p.rent_roll == null ? null : usd0(p.rent_roll),
     value_fmt: p.value_estimate == null ? "no valuation" : usd0(p.value_estimate),
     ledger_empty_ytd: p.ledger_empty_ytd,
