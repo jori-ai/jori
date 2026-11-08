@@ -12,7 +12,9 @@ import { createRequire } from "node:module";
 
 const require = createRequire(import.meta.url);
 const { stepSeries, walkSpans, annotateDaySteps } = require("../lib/day-steps.js");
-const { buildSkeleton, buildMarkdown, _internal } = require("../lib/daily-summary-render.js");
+const { buildSkeleton: skeleton, buildMarkdown, assemble, _internal } = require("../lib/daily-summary-render.js");
+// the walk lines sit in each stop's list, which is filled at assemble
+const buildSkeleton = (d, o) => assemble(skeleton(d, o), {});
 
 const T0 = Date.parse("2026-03-02T05:00:00Z"); // 00:00 New York
 const at = (h, m = 0) => T0 + (h * 60 + m) * 60000;
