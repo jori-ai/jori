@@ -14,6 +14,9 @@
 //        (longest match wins). For a payee or payer that recurs.
 //   finance-names account <last4> "<whose account>" --why "..."
 //        an account Plaid does not see (a transfer to/from CHK 1234).
+//   finance-names source <transaction_id> "<the account it came from>" --why "..."
+//        where a transfer that has not posted on its sending side came from, when
+//        a record names it (a bank's transfer email: "From: BANK ... ••2788").
 //   finance-names own "<text in the bank line>" --why "..."
 //        an outgoing transfer containing this text goes to an account of the
 //        user's own: a transfer, not spending (a brokerage, a bank elsewhere).
@@ -23,7 +26,7 @@
 //
 // Writes the account map (agent/local/config/rental-finance.json
 // `accounts_map_file`): payee_names {text: name}, known_external_accounts
-// {last4: name}, own_transfer_phrases [text]; and appends each change with its
+// {last4: name}, own_transfer_phrases [text], transfer_sources {txn id: name}; and appends each change with its
 // reason to data/finance-names.jsonl.
 
 const fs = require("node:fs");
@@ -47,13 +50,13 @@ const die = (m) => { console.error(`finance-names: ${m}`); process.exit(2); };
 const [cmd, a, b] = pos;
 const m = load();
 if (cmd === "list") {
-  console.log(JSON.stringify({ payee_names: m.payee_names || {}, known_external_accounts: m.known_external_accounts || {}, own_transfer_phrases: m.own_transfer_phrases || [] }, null, 2));
+  console.log(JSON.stringify({ payee_names: m.payee_names || {}, known_external_accounts: m.known_external_accounts || {}, own_transfer_phrases: m.own_transfer_phrases || [], transfer_sources: m.transfer_sources || {} }, null, 2));
   process.exit(0);
 }
 const why = opt("why");
 if (cmd === "payee") {
   if (!a || !b || !why) die('payee "<bank text>" "<name>" --why "<reason>"');
-  if (a.trim().length < 4) die("the bank text must be at least 4 characters (it is matched inside every bank line)");
+  if (a.trim().length < 3) die("the bank text must be at least 3 characters (it is matched inside every bank line)");
   m.payee_names = { ...(m.payee_names || {}), [a.trim()]: b.trim() };
   save(m); journal({ kind: "payee", key: a.trim(), name: b.trim(), why });
   console.log(`payee "${a.trim()}" → ${b.trim()}`);
@@ -62,6 +65,11 @@ if (cmd === "payee") {
   m.known_external_accounts = { ...(m.known_external_accounts || {}), [a]: b.trim() };
   save(m); journal({ kind: "account", key: a, name: b.trim(), why });
   console.log(`account ••${a} → ${b.trim()}`);
+} else if (cmd === "source") {
+  if (!a || !b || !why) die('source <transaction_id> "<account it came from>" --why "<record>"');
+  m.transfer_sources = { ...(m.transfer_sources || {}), [a]: b.trim() };
+  save(m); journal({ kind: "source", key: a, name: b.trim(), why });
+  console.log(`transfer ${a} came from ${b.trim()}`);
 } else if (cmd === "own") {
   if (!a || !why) die('own "<bank text>" --why "<reason>"');
   if (a.trim().length < 4) die("the text must be at least 4 characters");
@@ -69,7 +77,7 @@ if (cmd === "payee") {
   save(m); journal({ kind: "own", key: a.trim().toLowerCase(), why });
   console.log(`own transfers: "${a.trim().toLowerCase()}"`);
 } else if (cmd === "rm") {
-  const field = { payee: "payee_names", account: "known_external_accounts", own: "own_transfer_phrases" }[a];
+  const field = { payee: "payee_names", account: "known_external_accounts", own: "own_transfer_phrases", source: "transfer_sources" }[a];
   if (!field || !b) die("rm payee|account|own <key>");
   if (Array.isArray(m[field])) m[field] = m[field].filter((x) => x !== b.toLowerCase());
   else if (m[field]) delete m[field][b];

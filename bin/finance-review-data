@@ -248,10 +248,18 @@ async function main() {
     if (!hits.length) return null;
     const total = round2(sum(hits, (t) => Math.abs(Number(t.amount))));
     const lastYear = String(x.d.lastCharged || "").slice(0, 4);
-    const prior = (x.d.charges || []).filter((c) => c.date && c.date.slice(0, 4) === lastYear);
+    const priorAll = (x.d.charges || []).filter((c) => c.date && c.date.slice(0, 4) === lastYear);
+    // Last cycle, for the same property only: a bill a property the user has
+    // since sold paid (the account's owner on that date) is not due again.
+    const propOn = (accountId, date) => (reg ? groupOf(acct(accountId), date).propertyId : null);
+    const nowProps = new Set(hits.map((t) => propOn(t.account_id, t.date)).filter(Boolean));
+    const prior = nowProps.size ? priorAll.filter((c) => nowProps.has(propOn(c.accountId, c.date))) : priorAll;
+    const others = priorAll.filter((c) => !prior.includes(c));
+    const otherNames = [...new Set(others.map((c) => propOn(c.accountId, c.date)).filter(Boolean).map((id) => reg?.propertyById?.get(id)?.name || id))];
     return {
       total, total_fmt: usd(total), on_fmt: fmtD(hits.map((t) => t.date).sort().pop()), count: hits.length,
       last_cycle_fmt: prior.length ? usd0(sum(prior, (c) => c.amountCents / 100)) : null, last_cycle_count: prior.length,
+      last_cycle_other_fmt: others.length ? `${usd0(sum(others, (c) => c.amountCents / 100))} for ${otherNames.join(", ") || "another property"}` : null,
     };
   };
   const paidById = new Map(tracked.map((x) => [x.id, paidThisCycle(x)]).filter(([, v]) => v));
@@ -296,9 +304,9 @@ async function main() {
     // A row of its own in the bucket, so the rows add up to the subtotal and the week's change.
     if (key && cashPos.buckets[key]) {
       cashPos.buckets[key].total = round2(cashPos.buckets[key].total - amt0);
-      cashPos.buckets[key].accounts.push({ label: `In transit from your ${pendingOwnFrom.get(pendingOwn[0].transaction_id)} account (in both balances until it posts)`, mask: null, balance: -amt0, week_delta: -amt0 });
+      cashPos.buckets[key].accounts.push({ label: `In transit from ${(map.transfer_sources || {})[pendingOwn[0].transaction_id] || `your ${pendingOwnFrom.get(pendingOwn[0].transaction_id)} account`} (in both balances until it posts)`, mask: null, balance: -amt0, week_delta: -amt0 });
     }
-    cashPos.pending_own = { amount: amt0, text: `${pendingOwn.map((t) => `${usd(Math.abs(Number(t.amount)))} from your ${pendingOwnFrom.get(t.transaction_id)} account into ${label(t.account_id)} (${fmtD(t.date)})`).join("; ")}: its ${pendingOwnFrom.get(pendingOwn[0].transaction_id)} side has not posted yet, so it is taken off free cash once` };
+    cashPos.pending_own = { amount: amt0, text: `${pendingOwn.map((t) => `${usd(Math.abs(Number(t.amount)))} from ${(map.transfer_sources || {})[t.transaction_id] || `your ${pendingOwnFrom.get(t.transaction_id)} account`} into ${label(t.account_id)} (${fmtD(t.date)})`).join("; ")}: its ${pendingOwnFrom.get(pendingOwn[0].transaction_id)} side has not posted yet, so it is taken off free cash once` };
   }
   const freeCash = cashPos ? cashPos.free_cash : null;
   const cardDebt = sum(credits, (a) => num(a.balance_current));
@@ -374,7 +382,7 @@ async function main() {
       : chk ? (extName ? `${extName} ••${chk[1]}` : `${institutionOf(t)} account ••${chk[1]} (not linked)`)
       : branch ? `Deposit at the ${institutionOf(t)} branch, ${branch[1].trim()}`
       : ownBank ? `Your ${ownBank.name} account (its side has not posted yet)`
-      : ach ? `${ach[1].trim()} — ${ach[2]}` : who(t);
+      : ach ? (/^(ach|pmt|payment|payments|epay|web|ppd|ccd|transfer)$/i.test(ach[2]) ? titleish(ach[1].replace(/,?\s*inc\.?$/i, "")) : `${ach[1].trim()} — ${ach[2]}`) : who(t);
     if (v.rule === "books_category" && (v.categories || []).length) return `${base} · ${v.categories.join(", ")}`;
     return base;
   };
@@ -460,7 +468,8 @@ async function main() {
   const shortfalls = [];
   for (const x of scheduledDue((scheduled || []).filter((s) => s.active), accounts, today, 14)) {
     const s = x.payment;
-    const row = { source: "confirmed", label: s.label, due: x.due, due_fmt: fmtD(x.due), amount_fmt: x.amount == null ? "amount unknown" : usd0(x.amount), amount_basis: x.amount_basis, autopay: s.autopay, account: label(s.funding_account_id) };
+    // A card payment is named by the card it pays, the same name the Cards table uses.
+    const row = { source: "confirmed", label: s.target_account_id && acct(s.target_account_id).account_id ? `${label(s.target_account_id)} payment` : s.label, due: x.due, due_fmt: fmtD(x.due), amount_fmt: x.amount == null ? "amount unknown" : usd0(x.amount), amount_basis: x.amount_basis, autopay: s.autopay, account: label(s.funding_account_id) };
     upcoming.push(row);
     if (x.short) {
       shortfalls.push({ ...row, available_fmt: usd0(x.available) });
@@ -607,7 +616,7 @@ async function main() {
   // This builder only reports it: per-tenant location, exactly which deposits
   // are not in the deposit account, and the proof that the account balances.
   const dep = depositSection((depositRuns || [])[0] || null, today, fmtD);
-  for (const f of dep.flags) flag(f.priority, f.tag, f.text, f.action);
+  for (const f of dep.flags) { flag(f.priority, f.tag, f.text, f.action); if (f.optional) attention[attention.length - 1].optional = true; }
   for (const q of dep.questions || []) ask(q.id, q.text, q.answer_with);
   const deposits = dep.section;
 
@@ -729,7 +738,7 @@ async function main() {
     const row = { account: label(t.account_id), who: who(t), amount_fmt: usd(amt(t)), date_fmt: fmtD(t.date), plaid_category: t.category_primary };
     if (lt?.override?.ignored) {
       const by = String(lt.override.updatedBy || "").split("@")[0].split(".")[0];
-      leakage.push({ ...row, direction: `excluded from the books${by ? ` by ${by}` : ""} (personal)` });
+      leakage.push({ ...row, direction: `personal${by ? `, excluded from the property's books by ${by[0].toUpperCase()}${by.slice(1)}` : ""}` });
       if (g.group === "business") repayBusiness.push({ t, by });
       continue;
     }
