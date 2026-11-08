@@ -153,7 +153,10 @@ test("deposits: the user's answer settles it, attributed to the user by name", (
   const a = depositsFromHub({ deposits: base(), report, depositMask: "5555", answers: [answer] });
   const by = Object.fromEntries(a.rows.map((x) => [x.id, x]));
   assert.equal(by.bob.location, "deposit_account");
-  assert.equal(by.ann.location, "unconfirmed");
+  // Ann's money arrived in ••4444 and the only row that moved it was not hers:
+  // it is still in ••4444 (located, with the move that fixes it), not "unknown".
+  assert.equal(by.ann.location, "operating_account");
+  assert.equal(by.ann.location_account_mask, "4444");
   assert.match(by.bob.location_basis, /^Sam, 2026-03-05:/);
   const sec = depositSection({ run_at: new Date().toISOString(), report: { ...a, deposit_account: "Deposits ••5555" } }, "2026-03-05");
   assert.match(sec.section.rows.find((x) => x.tenant === "Bob Example").location, /per Sam, 2026-03-05/);
