@@ -501,7 +501,14 @@ async function main() {
   // A bill (tax, utility, insurance, housing) is paid, not decided; one already
   // paid this cycle is not coming. Only an undecided subscription not yet
   // charged is a renewal worth a line.
-  for (const r of renewals.filter((r) => r.decision === "undecided" && !r.paid && !BILL_KINDS.has(r.kind))) flag(58, "renewal", `${r.name} renews around ${r.due_fmt} (typically ${r.amount_fmt}/yr) with no decision recorded on ${FR.recurring_label}.`, `Record a decision on ${FR.recurring_label}.`);
+  // A renewal happens by itself: the only thing to do is cancel, and only if
+  // it is unwanted (the user, 2026-11-08: "Cancel if you don't want it to
+  // renew. Otherwise it's safe to ignore"). So it is housekeeping, and its
+  // action is optional: shown under the flag, never on the to-do list.
+  for (const r of renewals.filter((r) => r.decision === "undecided" && !r.paid && !BILL_KINDS.has(r.kind))) {
+    flag(40, "renewal", `${r.name} renews around ${r.due_fmt} (typically ${r.amount_fmt}/yr).`, `Cancel before ${r.due_fmt} if you don't want it to renew; otherwise nothing to do.`);
+    attention[attention.length - 1].optional = true;
+  }
   // Every change is listed; only an increase of at least 5% and $5 a charge is
   // raised to the top (a utility bill moves every month, a $0.16 cloud bill is noise).
   for (const c of changed.filter((c) => c.to - c.from >= 5 && c.to >= c.from * 1.05)) flag(55, "price-increase", `${c.name} went from ${c.from_fmt} to ${c.to_fmt} (${c.on_fmt}).`);

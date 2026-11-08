@@ -51,7 +51,7 @@ async function main() {
       if (!n) continue;
       if (clean(n.checked)) a.checked = clean(n.checked);
       if (clean(n.fixed)) a.fixed = clean(n.fixed);
-      if (clean(n.action)) a.action = clean(n.action);
+      if (clean(n.action) && !a.optional) a.action = clean(n.action); // an optional action (a renewal: cancel only if unwanted) is the packet's
     }
     packet.meta.resolved = { attention: Object.keys(notes).length, questions: Object.keys(r?.questions || {}).length };
   }

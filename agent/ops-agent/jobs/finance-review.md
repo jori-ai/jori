@@ -114,7 +114,10 @@ Then rebuild (Step 1 again) so repaired items drop out, and write
 recorded; `action` is the instruction. Compose shows them labelled under each
 flag (Fixed / Checked / To do) and lists every `action` in **To do this week**
 at the top; the flag's own text is never changed. An item with nothing to
-add gets no entry.
+add gets no entry. A flag marked `optional` (an undecided subscription
+renewal) keeps the packet's action — "Cancel before <date> if you don't
+want it to renew; otherwise nothing to do" — and stays off the to-do list:
+a renewal needs nothing unless the user wants it gone. Do not write one.
 
 ## Step 2 — Write the summary (optional, verified)
 
