@@ -151,3 +151,27 @@ test("a calendar block held inside a stop is on the stop's fact line", () => {
   assert.ok(line1.includes('calendar block held inside this stop') && line1.includes('"Pack" 2026-10-20T19:30:00+03:00 to 2026-10-20T20:30:00+03:00'), line1);
   assert.ok(!line2.includes("calendar block held"), line2);
 });
+
+// 2026-11-07: the movement totals said "walked 4.2 mi" against "all travel 6.6 km" and
+// nothing about the walk lines printed under stops, whose distance is the step counter's
+// estimate and which the travel totals do not hold. The reviewer called it impossible.
+test("the reviewer's movement totals say the walk lines under stops are step estimates", () => {
+  const at = (min) => Date.parse("2026-11-07T13:00:00Z") + min * 60000;
+  const stops = [
+    { id: "s-a", start: "09:00", end: "10:00", start_ts_ms: at(0), end_ts_ms: at(60), duration_min: 60,
+      place: { name: "A", source: "user_confirmed" }, tz: "UTC" },
+    { id: "s-b", start: "10:20", end: "11:50", start_ts_ms: at(80), end_ts_ms: at(170), duration_min: 90,
+      place: { name: "B", source: "user_confirmed" }, tz: "UTC" },
+  ];
+  const legs = [{ type: "leg", id: "l0", mode: "walking", start_ms: at(60), end_ms: at(80), walked_m: 1000, routed_m: 1000, steps: 1500 }];
+  const day = {
+    date: "2026-11-07", tz: "UTC", stops,
+    path: { tz: "UTC", spine: legs, stats: { observed_km: 1.0, inferred_km: 0, matched_km: 1.0 } },
+    steps: { walks: [{ kind: "in_stop", stop_id: "s-b", start_ms: at(100), end_ms: at(120), mins: 20, steps: 2000 }] },
+  };
+  const text = R.factPack({ date: "2026-11-07", manifest: { stops: [] }, day, statements: {}, corrections: [] });
+  assert.match(text, /also includes about 1\.3 km estimated from step counts/, text);
+  const none = R.factPack({ date: "2026-11-07", manifest: { stops: [] },
+    day: { ...day, steps: { walks: [] } }, statements: {}, corrections: [] });
+  assert.doesNotMatch(none, /estimated from step counts/, none);
+});
