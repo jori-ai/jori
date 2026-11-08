@@ -308,6 +308,7 @@ guard('mcp_tool_listing', () => {
     if (!files.length) return null;
     const counts = {};
     const NEEDLE = '"name":"mcp__';
+    const TOOL_USE = '"type":"tool_use"';
     for (const f of files) {
       let s; try { s = fs.readFileSync(f, 'utf8'); } catch { continue; }
       if (keep && keep.text && !keep.text(s)) continue;
@@ -315,7 +316,14 @@ guard('mcp_tool_listing', () => {
       for (;;) {
         i = s.indexOf(NEEDLE, i);
         if (i < 0) break;
+        // Only a tool_use block is a call. A session-start attachment that
+        // surfaces a server's tool definitions eagerly (surfacedDefinitions)
+        // repeats `"name":"mcp__…"` twice per tool and is not one: counted, it
+        // credited an eagerly-surfaced connector with thousands of calls.
+        // tool_use serialises as {"type":"tool_use","id":"toolu_…","name":…}.
+        const isCall = s.slice(Math.max(0, i - 100), i).includes(TOOL_USE);
         i += NEEDLE.length;
+        if (!isCall) continue;
         const end = s.indexOf('__', i);
         if (end < 0) break;
         const srv = s.slice(i, end);
