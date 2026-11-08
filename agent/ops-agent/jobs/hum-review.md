@@ -49,7 +49,7 @@ For every row in the success-criteria table, report the measurement and `PASS` /
 | Info positive rate | `count(reactions in {👍,helpful,more}) / count(reactions)` | ≥ 0.60 |
 | Info response rate | `count(feedback rows with non-null reaction) / count(info sent)` | ≥ 0.30 |
 | Question answer rate | `count(learnings in window) / count(questions asked)` | ≥ 0.40 |
-| Median time-to-answer | median `answered_at - matching question.asked_at` | ≤ 30 min |
+| Median time-to-answer | median `answered_at - matching question.asked_at` | none: reported, never graded (2026-11-08); questions go to a channel that does not interrupt, so answer speed is not a fault and never a reason to time a question |
 | Memory growth | hum-attributable wiki writes this week (wiki pages updated in-window + new `hum-learnings.jsonl`/consolidated `hum-responses.jsonl` rows) — NOT the retired flat files | ≥ 3 per week |
 | Subject dedup | count subjects DELIVERED (`outcome.sent`) in >1 tick within 7d; an undelivered pick retried next tick is not a repeat | = 0 |
 | Harvester error rate | per-topic `errors / attempts` | ≤ 0.10 |

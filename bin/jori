@@ -2921,7 +2921,9 @@ function cmdHumInsight(args) {
     { criterion: 'Info positive rate', value: (positive + negative) ? positiveRate : null, target: '>= 0.60', status: grade((positive + negative) ? positiveRate : null, positiveRate >= 0.60) },
     { criterion: 'Info response rate', value: feedback.length ? responseRate : null, target: '>= 0.30', status: grade(feedback.length ? responseRate : null, responseRate >= 0.30) },
     { criterion: 'Question answer rate', value: bucket.question ? answerRate : null, target: '>= 0.40', status: grade(bucket.question ? answerRate : null, answerRate >= 0.40) },
-    { criterion: 'Median time-to-answer (min)', value: medianAnswerMin, target: '<= 30', status: grade(medianAnswerMin, medianAnswerMin <= 30) },
+    // Report only (2026-11-08): questions go to a channel that does not interrupt, so how fast one is answered is
+    // the user's choice, not a fault, and it no longer decides when a question is sent.
+    { criterion: 'Median time-to-answer (min)', value: medianAnswerMin, target: 'none (reported only)', status: medianAnswerMin == null ? 'N/A' : 'INFO' },
     { criterion: 'Subject dedup', value: dupSubjects.length, detail: dupSubjects, target: '= 0', status: grade(dupSubjects.length, dupSubjects.length === 0) },
     { criterion: 'Harvester error rate (worst topic)', value: worstErr ? worstErr.rate : 0, detail: errRates, target: '<= 0.10', status: grade(0, !worstErr || worstErr.rate <= 0.10) },
     { criterion: 'Memory growth', value: learnings.length, target: '>= 3 per week', status: 'MODEL', note: `hum-learnings rows only (${learnings.length}); add wiki pages updated in-window` },
