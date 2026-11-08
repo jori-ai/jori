@@ -279,15 +279,25 @@ async function main() {
   const ownPullFrom = (t) => !(Number(t.amount) > 0) && kindOf(t) === "transfer_external"
     && institutions.find((i) => norm(`${t.name || ""}`).startsWith(i.key) && i.name !== acct(t.account_id).institution_name);
   const pendingOwn = posted.filter((t) => t.date > dayAdd(today, -10) && ownPullFrom(t));
+  const pendingOwnFrom = new Map(pendingOwn.map((t) => [t.transaction_id, ownPullFrom(t).name]));
+  // Not money from outside: the user's own money moving, its far side pending.
+  for (const t of pendingOwn) cls.set(t.transaction_id, { ...cls.get(t.transaction_id), kind: "internal_transfer", rule: "own_bank_pull_unposted" });
+  let pendingOwnTotal = 0;
   const cashPos = reg ? buildCashBuckets({ plaidAccounts: accounts, registry: reg, brokerageAccounts, brokeragePositions, brokerageAccountHistory, brokeragePositionHistory, posted, today, config: map }) : null;
-  const bankCash = sum(depos, (a) => num(a.balance_current));
+  let bankCash = sum(depos, (a) => num(a.balance_current));
   if (cashPos && pendingOwn.length) {
     const amt0 = round2(sum(pendingOwn, (t) => Math.abs(Number(t.amount))));
+    pendingOwnTotal = amt0;
+    bankCash = round2(bankCash - amt0); // net worth counts it once too
     cashPos.free_cash = round2(cashPos.free_cash - amt0);
     cashPos.free_cash_week_delta = round2(cashPos.free_cash_week_delta - amt0);
     const g = gmap[pendingOwn[0].account_id];
     const key = g?.group === "personal" ? "personal" : g?.group === "business" ? "business" : g?.group === "property" ? "real_estate" : null;
-    if (key && cashPos.buckets[key]) cashPos.buckets[key].total = round2(cashPos.buckets[key].total - amt0);
+    // A row of its own in the bucket, so the rows add up to the subtotal and the week's change.
+    if (key && cashPos.buckets[key]) {
+      cashPos.buckets[key].total = round2(cashPos.buckets[key].total - amt0);
+      cashPos.buckets[key].accounts.push({ label: `In transit from your ${pendingOwnFrom.get(pendingOwn[0].transaction_id)} account (in both balances until it posts)`, mask: null, balance: -amt0, week_delta: -amt0 });
+    }
     cashPos.pending_own = { amount: amt0, text: `${pendingOwn.map((t) => `${usd(Math.abs(Number(t.amount)))} from your ${ownPullFrom(t).name} account into ${label(t.account_id)} (${fmtD(t.date)})`).join("; ")}: its ${ownPullFrom(pendingOwn[0]).name} side has not posted yet, so it is taken off free cash once` };
   }
   const freeCash = cashPos ? cashPos.free_cash : null;
@@ -519,6 +529,7 @@ async function main() {
   // rent paid out by the rental hub) is redundant: it is neither listed nor
   // called late (rent the hub has not collected shows on its rent invoices).
   const coveredStreams = streamsCoveredByBooks(cls);
+  const monthStart0 = `${today.slice(0, 7)}-01`;
   const incomeRows = incomeStatus((expectedIncome || []).filter((e) => !coveredStreams.has(e.id)), posted, cls, today).map((r) => {
     const e = r.stream;
     // A stream the invoice reconciliation covers takes its status from the
@@ -527,8 +538,18 @@ async function main() {
       const paid = (((invoiceRuns || [])[0]?.report?.rows) || []).filter((x) => x.status === "paid" && x.paid_on && x.paid_on >= dayAdd(r.cycle_due, -35) && x.paid_on <= today).sort((a, b) => String(a.paid_on).localeCompare(String(b.paid_on))).pop();
       if (paid) Object.assign(r, { status: "received", received_on: paid.paid_on, via_invoice: paid.number });
     }
+    // A variable stream paid inside another stream's payment (one ACH for both
+    // invoices: the installation's combined_payments): the remainder is its.
+    if (e.amount == null && r.status === "none yet this month") {
+      const combined = posted.filter((t) => !out(t) && t.date >= monthStart0 && t.account_id === e.account_id
+        && String(`${t.merchant_name || ""} ${t.name || ""}`).toLowerCase().includes(String(e.payer_contains || "").toLowerCase()))
+        .map((t) => ({ t, s: (expectedIncome || []).find((x) => x.id === cls.get(t.transaction_id)?.expected_income_id)
+          || (expectedIncome || []).find((x) => x.id !== e.id && x.amount != null && x.account_id === e.account_id && String(x.payer_contains || "").toLowerCase() === String(e.payer_contains || "").toLowerCase()) }))
+        .find(({ t, s }) => s && s.id !== e.id && s.amount != null && amt(t) > Number(s.amount) + 0.5);
+      if (combined) Object.assign(r, { status: "received", received_on: combined.t.date, share_fmt: `${usd(amt(combined.t) - Number(combined.s.amount))} of the ${usd(amt(combined.t))} payment` });
+    }
     if (r.status === "late" && !invoiceTracked.has(e.id)) flag(95, "income-late", `${e.label} (${usd0(e.amount)}, due ${fmtD(r.cycle_due)} into ${label(e.account_id)}) has not arrived.`);
-    return { label: e.label, amount_fmt: e.amount == null ? "varies" : usd0(e.amount), due_fmt: r.cycle_due ? fmtD(r.cycle_due) : "no fixed day", status: r.status, received_on: r.received_on ? `${fmtD(r.received_on)}${r.via_invoice ? `, invoice ${r.via_invoice}` : ""}` : null, account: label(e.account_id) };
+    return { label: e.label, amount_fmt: e.amount == null ? "varies" : usd0(e.amount), due_fmt: r.cycle_due ? fmtD(r.cycle_due) : "no fixed day", status: r.status, received_on: r.received_on ? `${fmtD(r.received_on)}${r.via_invoice ? `, invoice ${r.via_invoice}` : ""}${r.share_fmt ? `: ${r.share_fmt}` : ""}` : null, account: label(e.account_id) };
   });
 
   // ── 5. REAL ESTATE (ledger P&L, reconciled values) ──────────────────────
@@ -593,7 +614,7 @@ async function main() {
   // ── 7. SPENDING (classified spend only) ─────────────────────────────────
   // A payment to a person and a cash withdrawal carry Plaid's "transfer out":
   // name them for what they are.
-  const catOf = (t) => (kindOf(t) === "cash_withdrawal" ? "CASH_WITHDRAWALS" : cls.get(t.transaction_id)?.rule === "payment_to_other" ? "PAYMENTS_TO_PEOPLE_AND_CONTRACTORS" : t.category_primary || "OTHER");
+  const catOf = (t) => (kindOf(t) === "cash_withdrawal" ? "CASH_WITHDRAWALS" : (cls.get(t.transaction_id)?.rule === "payment_to_other" || t.category_primary === "TRANSFER_OUT") ? "PAYMENTS_TO_PEOPLE_AND_CONTRACTORS" : t.category_primary || "OTHER");
   const catTotals = (rows) => rows.filter(isSpend).reduce((m, t) => { const c = catOf(t); m[c] = (m[c] || 0) + amt(t); return m; }, {});
   const cw = catTotals(wk), cp = catTotals(wkPrev), c90 = catTotals(posted.filter((t) => t.date > d90));
   for (const c of Object.keys(cp)) if (!(c in cw)) cw[c] = 0; // so the prior-week column adds up too
@@ -604,7 +625,7 @@ async function main() {
   const byAccount = Object.entries(wk.filter(isSpend).reduce((m, t) => { const k = label(t.account_id); m[k] = (m[k] || 0) + amt(t); return m; }, {}))
     .sort((a, b) => b[1] - a[1]).map(([account, v]) => ({ account, total_fmt: usd0(v) }));
   const largest = wk.filter(isSpend).sort((a, b) => amt(b) - amt(a)).slice(0, 8)
-    .map((t) => ({ date_fmt: fmtD(t.date), who: describe(t), amount_fmt: usd(amt(t)), account: label(t.account_id), explained: known.get(t.transaction_id)?.note || (cls.get(t.transaction_id)?.rule === "books_category" ? `filed under ${(cls.get(t.transaction_id).categories || []).join(", ")} in the ${FR.ledger_label}` : null) }));
+    .map((t) => ({ date_fmt: fmtD(t.date), who: describe(t), amount_fmt: usd(amt(t)), account: label(t.account_id), explained: (known.get(t.transaction_id)?.name ? null : known.get(t.transaction_id)?.note) || (cls.get(t.transaction_id)?.rule === "books_category" ? `filed under ${(cls.get(t.transaction_id).categories || []).join(", ")} in the ${FR.ledger_label}` : null) }));
   const spendPrev = round2(sum(wkPrev.filter(isSpend), amt));
 
   // ── 8. CARDS ────────────────────────────────────────────────────────────
