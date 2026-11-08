@@ -306,11 +306,23 @@ async function main() {
     if (v.rule === "books_category" && (v.categories || []).length) return `${base} · ${v.categories.join(", ")}`;
     return base;
   };
-  const breakdown = (rows) => {
+  // Income into a property is one row per property (the user, 2026-11-08:
+  // "too much detail. It should be rent by property"): the property the books
+  // file the row to, else the one that owns the account it landed in.
+  const ledgerRowForFlow = new Map((ledgerTxns || []).map((x) => [String(x.id).replace(/^plaid:/, ""), x]));
+  const propertyOfIncome = (t) => {
+    const lt = ledgerRowForFlow.get(t.transaction_id);
+    const pid = (lt && ledger.effectivePropertyId(lt)) || gAt(t).propertyId;
+    const pr = pid && reg?.propertyById?.get(pid);
+    return pr && pr.kind === "property" ? pr : null;
+  };
+  const breakdown = (rows, byProperty = false) => {
     const g = new Map();
     for (const t of rows) {
-      const k = `${describe(t)}|${t.account_id}`;
-      if (!g.has(k)) g.set(k, { what: describe(t), account: label(t.account_id), count: 0, cents: 0, dates: [] });
+      const pr = byProperty ? propertyOfIncome(t) : null;
+      const what = pr ? `Rent — ${pr.name}` : describe(t);
+      const k = pr ? `prop|${pr.id}` : `${what}|${t.account_id}`;
+      if (!g.has(k)) g.set(k, { what, account: label(t.account_id), count: 0, cents: 0, dates: [] });
       const x = g.get(k); x.count += 1; x.cents += Math.round(amt(t) * 100); x.dates.push(t.date);
     }
     return [...g.values()].sort((a, b) => b.cents - a.cents).map((x) => ({
@@ -329,7 +341,7 @@ async function main() {
     capital: wk.filter((t) => out(t) && kindOf(t) === "capital"),
     unreviewed_large: wk.filter((t) => out(t) && kindOf(t) === "unreviewed_large"),
   };
-  const flowDetail = Object.fromEntries(Object.entries(flowRows).map(([k, rows]) => [k, { total: flow[k], total_fmt: usd(flow[k]), rows: breakdown(rows) }]));
+  const flowDetail = Object.fromEntries(Object.entries(flowRows).map(([k, rows]) => [k, { total: flow[k], total_fmt: usd(flow[k]), rows: breakdown(rows, k === "income_in") }]));
   const unexplainedRows = wk.filter((t) => !out(t) && kindOf(t) === "inflow_unexplained")
     .sort((a, b) => amt(b) - amt(a))
     .map((t) => ({ id: t.transaction_id, date: t.date, amount: amt(t), amount_fmt: usd(amt(t)), account: label(t.account_id), who: who(t) }));
