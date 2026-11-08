@@ -117,3 +117,99 @@ test("a variable stream takes what the fixed one did not, and is never late", ()
   assert.equal(st.variable, "none yet this month");
   assert.equal(st.fixed, "received");
 });
+
+// ── The rental books' payouts ───────────────────────────────────────────────
+// A weekly review asked "what was the $X that arrived?" about each tenant's
+// rent, one new tenant at a time, although the rental books had already linked
+// every one of those credits to the payout it was. The classifier now asks the
+// books first (rule 1b); rental-ledger.js says which credits are payouts.
+
+const { payoutsForBankRows } = require("../lib/rental-ledger.js");
+const banks = [
+  { account_id: "home", type: "depository", mask: "1111" },
+  { account_id: "dep", type: "depository", mask: "2222" },
+  { account_id: "chk", type: "depository", mask: "3333" },
+];
+const stripeLine = (code) => `Owner Name DES:${code} ID:X1Y2Z3 INDN:Owner Name CO ID:PROC0001 CCD`;
+const row = (id, account_id, amount, date, code) => ({ transaction_id: id, account_id, amount, date, name: stripeLine(code), merchant_name: null, category_primary: "INCOME", category_detailed: "INCOME_CONTRACTOR" });
+const payout = (id, last4, cents, at, descriptor, extra = {}) => ({ id, bankLast4: last4, amountCents: cents, createdAt: at, descriptor, status: "paid", tenantName: extra.tenant || "Pat Smith", period: extra.period || "2026-11", ...extra });
+
+test("a credit the books linked to a rent payout is income, a deposit payout is deposit_in, the rest still a question", () => {
+  const posted = [row("r1", "home", -512.34, "2026-11-06", "OK SMI R11"), row("d1", "dep", -750, "2026-11-05", "OK JON D11"), t("mystery", "chk", -275, "2026-11-04", { pri: "GENERAL_SERVICES" })];
+  const ledgerRows = [
+    { id: "plaid:r1", payout: { payoutId: "obt_r1", kind: "rent", descriptor: "OK-SMI R11", tenants: [{ name: "Pat Smith", period: "2026-11", propertyName: "Oak" }] } },
+    { id: "plaid:d1", payout: { payoutId: "obt_d1", kind: "deposit", descriptor: "OK-JON D11", tenants: [{ name: "Lee Jones", period: "2026-11", propertyName: "Oak" }] } },
+  ];
+  const pv = payoutsForBankRows({ ledgerRows, payouts: [], posted, accounts: banks });
+  assert.deepEqual(pv.get("r1"), { kind: "rent", source: "hub_link", payout_id: "obt_r1", tenants: ["Pat Smith"], period: "2026-11", property: "Oak" });
+  assert.equal(pv.get("d1").kind, "deposit");
+  assert.equal(pv.has("mystery"), false);
+  const bookVerdicts = new Map([...pv].map(([id, p]) => [id, { kind: p.kind === "deposit" ? "deposit_in" : "income", rule: "rental_books_payout" }]));
+  const c = classify(posted, banks, { bookVerdicts });
+  assert.equal(c.get("r1").kind, "income");
+  assert.equal(c.get("r1").rule, "rental_books_payout");
+  assert.equal(c.get("d1").kind, "deposit_in");
+  assert.equal(c.get("mystery").kind, "inflow_unexplained");
+  // Without the books, the same rent is exactly the question the review used to ask.
+  assert.equal(classify(posted, banks).get("r1").kind, "inflow_unexplained");
+});
+
+test("a person's verdict beats the books, and the books beat pairing", () => {
+  const posted = [row("r1", "home", -433.21, "2026-11-06", "OK SMI R11"), t("out", "chk", 433.21, "2026-11-05", { pri: "GENERAL_SERVICES" })];
+  const bookVerdicts = new Map([["r1", { kind: "income", rule: "rental_books_payout" }]]);
+  const c = classify(posted, banks, { bookVerdicts });
+  assert.equal(c.get("r1").rule, "rental_books_payout");
+  assert.equal(c.get("out").kind, "expense", "a same-cents debit elsewhere is not the other leg of a payout");
+  const o = classify(posted, banks, { bookVerdicts, overrides: [{ transaction_id: "r1", kind: "refund", note: "said so" }] });
+  assert.equal(o.get("r1").kind, "refund");
+});
+
+test("rent the books recognise still counts for the stream the user registered for it", () => {
+  const exp = [{ id: "oak-rent", account_id: "home", payer_contains: "DES:OK ", amount: null, due_day: 1, grace_days: 7, active_from: "2026-10-01" }];
+  const posted = [row("r1", "home", -512.34, "2026-11-06", "OK SMI R11")];
+  const c = classify(posted, banks, { expectedIncome: exp, bookVerdicts: new Map([["r1", { kind: "income", rule: "rental_books_payout" }]]) });
+  assert.equal(c.get("r1").rule, "rental_books_payout");
+  assert.equal(c.get("r1").expected_income_id, "oak-rent");
+  assert.equal(incomeStatus(exp, posted, c, "2026-11-15")[0].status, "received", "never 'late' because the books classified it first");
+});
+
+test("a payout the hub has not linked yet is found from its record: same bank, same cents, its descriptor", () => {
+  // Six tenants paying the same rent land six identical credits on one day;
+  // only the descriptor tells them apart.
+  const names = ["SMI", "JON", "LEE", "KIM", "DOE", "ROE"];
+  const posted = names.map((n, i) => row(`r${i}`, "home", -512.34, "2026-11-07", `OK ${n} R11`));
+  const payouts = names.map((n, i) => payout(`obt_${n}`, "1111", 51234, "2026-11-06T14:04:30.000Z", `OK-${n} R11`, { tenant: `Tenant ${n}` }));
+  const pv = payoutsForBankRows({ ledgerRows: [], payouts, posted, accounts: banks });
+  assert.equal(pv.size, 6);
+  for (const [i, n] of names.entries()) {
+    assert.equal(pv.get(`r${i}`).payout_id, `obt_${n}`);
+    assert.equal(pv.get(`r${i}`).source, "payout_record");
+    assert.equal(pv.get(`r${i}`).kind, "rent");
+  }
+  assert.equal(payoutsForBankRows({ payouts: [payout("obt_d", "2222", 75000, "2026-11-05T14:00:00Z", "OK-JON D11", { kind: "deposit" })], posted: [row("d", "dep", -750, "2026-11-05", "OK JON D11")], accounts: banks }).get("d").kind, "deposit");
+  // A record sent to the deposits bank is a deposit even when it carries no kind.
+  assert.equal(payoutsForBankRows({ payouts: [payout("obt_e", "2222", 75000, "2026-11-05T14:00:00Z", "OK-LEE D11", { propertySlug: "deposits" })], posted: [row("e", "dep", -750, "2026-11-05", "OK LEE D11")], accounts: banks, depositSlug: "deposits" }).get("e").kind, "deposit");
+});
+
+test("a payout record never claims a credit it cannot be sure of", () => {
+  const at = "2026-11-06T14:04:30.000Z";
+  const one = (payouts, posted, ledgerRows = []) => payoutsForBankRows({ ledgerRows, payouts, posted, accounts: banks });
+  // Same cents on the same bank, but the bank line is not the payout's: not claimed.
+  assert.equal(one([payout("p", "1111", 51234, at, "OK-SMI R11")], [{ transaction_id: "x", account_id: "home", amount: -512.34, date: "2026-11-07", name: "ZELLE FROM SOMEONE" }]).size, 0);
+  // Another bank, another amount, outside the window: not claimed.
+  assert.equal(one([payout("p", "1111", 51234, at, "OK-SMI R11")], [row("x", "chk", -512.34, "2026-11-07", "OK SMI R11")]).size, 0);
+  assert.equal(one([payout("p", "1111", 51234, at, "OK-SMI R11")], [row("x", "home", -512.35, "2026-11-07", "OK SMI R11")]).size, 0);
+  assert.equal(one([payout("p", "1111", 51234, at, "OK-SMI R11")], [row("x", "home", -512.34, "2026-11-20", "OK SMI R11")]).size, 0);
+  // A payout that failed or was cancelled never arrived.
+  assert.equal(one([payout("p", "1111", 51234, at, "OK-SMI R11", { status: "failed" })], [row("x", "home", -512.34, "2026-11-07", "OK SMI R11")]).size, 0);
+  // No descriptor and two credits that fit: neither.
+  assert.equal(one([payout("p", "1111", 32109, at, null)], [row("a", "home", -321.09, "2026-11-06", "PAYOUT CO"), row("b", "home", -321.09, "2026-11-07", "PAYOUT CO")]).size, 0);
+  // One credit two payouts both want: neither.
+  assert.equal(one([payout("p", "1111", 32109, at, null), payout("q", "1111", 32109, at, null)], [row("a", "home", -321.09, "2026-11-06", "PAYOUT CO")]).size, 0);
+  // A payout the hub already linked to another row is not reused, and a linked row is not re-matched.
+  const linked = [{ id: "plaid:a", payout: { payoutId: "p", kind: "rent", tenants: [] } }];
+  const r = one([payout("p", "1111", 51234, at, "OK-SMI R11")], [row("a", "home", -512.34, "2026-11-06", "OK SMI R11"), row("b", "home", -512.34, "2026-11-07", "OK SMI R11")], linked);
+  assert.deepEqual([...r.keys()], ["a"]);
+  // A debit is never a payout.
+  assert.equal(one([payout("p", "1111", 51234, at, "OK-SMI R11")], [row("x", "home", 512.34, "2026-11-07", "OK SMI R11")]).size, 0);
+});

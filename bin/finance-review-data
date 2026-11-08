@@ -16,7 +16,9 @@
 // statement this packet makes now comes from one of:
 //   * a bank fact (Plaid balances and posted transactions), classified by the
 //     rules in lib/finance-classify.js, each verdict naming its rule;
-//   * a record somebody keeps: the rental ledger (property P&L), the hub's
+//   * a record somebody keeps: the rental ledger (property P&L, and which
+//     bank credits are the hub's rent and deposit payouts, with the hub's
+//     billing-payouts for those it has not linked yet), the hub's
 //     billing-deposits (every tenant's deposit), expense-recurring (every
 //     recurring charge and the decision about it), property_value_reconciled;
 //   * a fact the user recorded with `finance-facts` (fin_* tables): expected
@@ -112,16 +114,18 @@ async function main() {
   const inWin = (t, from, to = today) => t.date > from && t.date <= to;
 
   // ── Records kept in the rental hub (Firestore) ──────────────────────────
-  let reg = null, ledgerTxns = [], unitAvailability = [], tenants = [], leases = [], recurring = [], invoices = [];
+  let reg = null, ledgerTxns = [], unitAvailability = [], tenants = [], leases = [], recurring = [], invoices = [], payouts = [];
   let ledgerError = null;
   try {
     const db = ledger.firestore();
     reg = await ledger.registry();
     const ledgerSince = [`${today.slice(0, 4)}-01-01`, dayAdd(today, -200)].sort()[0];
-    [ledgerTxns, unitAvailability, tenants, leases, recurring, invoices] = await Promise.all([
+    [ledgerTxns, unitAvailability, tenants, leases, recurring, invoices, payouts] = await Promise.all([
       ledger.loadTransactions({ since: ledgerSince, until: today }),
       db.list("unit-availability"), db.list("tenants"), db.list("leases"),
       db.list("expense-recurring"), db.list("billing-invoices"),
+      // Only the not-yet-linked fallback needs these; without them the hub's own links still count.
+      db.list("billing-payouts").catch(() => []),
     ]);
   } catch (e) { ledgerError = e.message; }
 
@@ -188,7 +192,15 @@ async function main() {
   }
 
   // ── Classification: what every transaction IS ───────────────────────────
-  const cls = classify(posted, accounts, { overrides, expectedIncome, depositAccountIds, largeOutflow: map.large_outflow_usd || LARGE_OUTFLOW });
+  // The rental books know which credits are the hub's payouts: a named
+  // tenant's rent or their security deposit. Asking the user about those is
+  // asking about every tenant's rent, one new lease at a time.
+  const bookVerdicts = new Map([...ledger.payoutsForBankRows({ ledgerRows: ledgerTxns, payouts, posted, accounts, depositSlug: RF.deposit_payout_slug || "security-deposits" })].map(([id, p]) => [id, {
+    kind: p.kind === "deposit" ? "deposit_in" : "income",
+    rule: p.source === "hub_link" ? "rental_books_payout" : "rental_payout_record",
+    payout_id: p.payout_id, tenants: p.tenants, period: p.period,
+  }]));
+  const cls = classify(posted, accounts, { overrides, expectedIncome, bookVerdicts, depositAccountIds, largeOutflow: map.large_outflow_usd || LARGE_OUTFLOW });
   const kindOf = (t) => cls.get(t.transaction_id)?.kind;
   const out = (t) => Number(t.amount) > 0;
   const amt = (t) => Math.abs(Number(t.amount));
