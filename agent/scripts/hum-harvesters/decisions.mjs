@@ -22,13 +22,14 @@
 import { readStdinJson, emit, emitNull, emitNoop, stampRun } from "./_common.mjs";
 import { nextDecision } from "../../../lib/decision-queue.mjs";
 import { userTz } from "../../../lib/hum-events.mjs";
-import { loadOpen } from "../../../lib/decision-queue.mjs";
+import { loadOpen, SELF_ASKED } from "../../../lib/decision-queue.mjs";
 import { reportBacklog, currentScale, recentlyOffered } from "../../../lib/question-pacing.mjs";
 
 await readStdinJson();
 
 try {
-  const items = loadOpen();
+  // Cards a job sends itself (the finance review) are not this lane's backlog.
+  const items = loadOpen().filter((it) => !SELF_ASKED.has(it.source));
   reportBacklog("decisions", items.length);
   // More than one a day per pacing group when the question backlog is long.
   // One offered in the last few hours and held steps aside for the rest

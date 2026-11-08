@@ -174,6 +174,15 @@ the likeliest answer. The questions go to the Questions tab (no push, intent
 `plaid-finance-review:question`); one still open and asked in the last 6 days
 is not asked again; one the user already answered is never asked again.
 
+A question that offers fixed options (`options` in the packet) goes as a
+tappable decision card, not a plain row. Give such a question's `resolve` note
+as usual (`tried` is printed under the card). A tap or a typed answer is filed
+by `bin/decision-answer` (`--ref fin:<fin-id>`; `--latest --text …` for an
+unthreaded reply), which closes the question and so ends the hold. Step 1's
+`--earlier` lists it with `decision_answer` (`answer`, `answer_key` = the
+`--kind` value for finance-facts, or the user's own words); record it per
+§ Recording facts. Free-form questions stay plain rows.
+
 - **Exit 3 (hold):** stop without sending. Final output: "held for the user's
   answers until <hold_until>". `finance-review-gate sweep` (every 30 min)
   starts a fresh run as soon as every question is answered, or when the window

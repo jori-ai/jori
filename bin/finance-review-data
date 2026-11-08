@@ -184,7 +184,12 @@ async function main() {
   // where to where, for how much; the page where it is answered), is that fix.
   const flag = (priority, tag, text, action = null) => attention.push({ priority, tag, text, ...(action ? { action } : {}) });
   const questions = [];
-  const ask = (id, text, answer_with) => { if (!questions.some((q) => q.id === id)) questions.push({ id, text, answer_with }); };
+  // `choices`: [{label, key}] when the answer is one of a few fixed things. bin/finance-review-ask then
+  // sends the question as a tappable card; `key` is the value finance-facts takes (`--kind`).
+  const ask = (id, text, answer_with, choices = null) => {
+    if (questions.some((q) => q.id === id)) return;
+    questions.push({ id, text, answer_with, ...(choices?.length >= 2 ? { options: choices.map((c) => c.label), option_keys: choices.map((c) => c.key ?? null) } : {}) });
+  };
 
   // ── Accounts: which property / pot each belongs to, on a date ───────────
   const KIND_TO_GROUP = { property: "property", business: "business", personal: "personal", buffer: "deposits" };
@@ -436,14 +441,16 @@ async function main() {
   }
   // A deposit made at a branch counter says nothing about whose money it was: ask.
   for (const t of wk.filter((t) => !out(t) && /FIN CTR .*?DEPOSIT/i.test(String(t.name || "")) && amt(t) >= 500 && cls.get(t.transaction_id)?.rule !== "override")) { // lang-regex-ok: bank-generated branch-deposit descriptor
-    ask(`txn:${t.transaction_id}`, `What was the ${usd(amt(t))} deposited at the ${institutionOf(t)} branch on ${fmtD(t.date)} into ${label(t.account_id)}?`, `finance-facts txn ${t.transaction_id} --kind income|refund|transfer_external --note "..."`);
+    ask(`txn:${t.transaction_id}`, `What was the ${usd(amt(t))} deposited at the ${institutionOf(t)} branch on ${fmtD(t.date)} into ${label(t.account_id)}?`, `finance-facts txn ${t.transaction_id} --kind income|refund|transfer_external --note "..."`, [
+      { label: "Income: rent or earnings", key: "income" }, { label: "A refund", key: "refund" }, { label: "A transfer from an account of mine that isn't linked", key: "transfer_external" }]);
   }
   const flowDetail = Object.fromEntries(Object.entries(flowRows).map(([k, rows]) => [k, { total: flow[k], total_fmt: usd(flow[k]), rows: breakdown(rows, k === "income_in") }]));
   const unexplainedRows = wk.filter((t) => !out(t) && kindOf(t) === "inflow_unexplained")
     .sort((a, b) => amt(b) - amt(a))
     .map((t) => ({ id: t.transaction_id, date: t.date, amount: amt(t), amount_fmt: usd(amt(t)), account: label(t.account_id), who: who(t) }));
   for (const r of unexplainedRows.filter((r) => r.amount >= 500)) {
-    ask(`txn:${r.id}`, `What was the ${r.amount_fmt} that arrived in ${r.account} on ${fmtD(r.date)} ("${r.who}")?`, `finance-facts txn ${r.id} --kind income|refund|internal_transfer|deposit_in --note "..."`);
+    ask(`txn:${r.id}`, `What was the ${r.amount_fmt} that arrived in ${r.account} on ${fmtD(r.date)} ("${r.who}")?`, `finance-facts txn ${r.id} --kind income|refund|internal_transfer|deposit_in --note "..."`, [
+      { label: "Income: rent or earnings", key: "income" }, { label: "A refund", key: "refund" }, { label: "A transfer between my own accounts", key: "internal_transfer" }, { label: "A tenant's security deposit", key: "deposit_in" }]);
   }
 
   // Large outflows nobody has classified, anywhere in the 95-day window. They
@@ -452,7 +459,8 @@ async function main() {
   for (const t of unreviewed) {
     const text = `${usd(amt(t))} left ${label(t.account_id)} on ${fmtD(t.date)} ("${who(t)}") and has not been classified; it is kept out of spending and runway until it is.`;
     flag(inWin(t, wkStart) ? 86 : 52, "unreviewed-large", text, "Say what it was in the Questions tab.");
-    ask(`txn:${t.transaction_id}`, `What was the ${usd(amt(t))} on ${fmtD(t.date)} from ${label(t.account_id)} ("${who(t)}")? (capital = an asset purchase or investment; expense = spending)`, `finance-facts txn ${t.transaction_id} --kind capital|expense|tax|transfer_external --note "..."`);
+    ask(`txn:${t.transaction_id}`, `What was the ${usd(amt(t))} on ${fmtD(t.date)} from ${label(t.account_id)} ("${who(t)}")? (capital = an asset purchase or investment; expense = spending)`, `finance-facts txn ${t.transaction_id} --kind capital|expense|tax|transfer_external --note "..."`, [
+      { label: "Capital: an asset purchase or investment", key: "capital" }, { label: "Expense: ordinary spending", key: "expense" }, { label: "Tax", key: "tax" }, { label: "A transfer to an account of mine that isn't linked", key: "transfer_external" }]);
   }
 
   // Runway: free cash over the last 90 days' average daily spending. Spending
@@ -526,7 +534,8 @@ async function main() {
     unconfirmedPayments.push({ last_date_fmt: fmtD(t.date), amount_fmt: usd(amt(t)), account: label(t.account_id), who: who(t) });
     ask(`payment:${t.account_id}:${normMerchant(t).slice(0, 30)}`,
       `"${who(t)}" (${usd(amt(t))} on ${fmtD(t.date)} from ${label(t.account_id)}): is this a scheduled card payment — autopay or manual, which day, fixed or the balance?`,
-      `finance-facts payment add --id <slug> --label "..." --funding ${t.account_id} --contains "<text from the bank line>" --rule fixed|current_balance|statement_balance --amount N --day D --autopay yes|no --note "..."`);
+      `finance-facts payment add --id <slug> --label "..." --funding ${t.account_id} --contains "<text from the bank line>" --rule fixed|current_balance|statement_balance --amount N --day D --autopay yes|no --note "..."`, [
+        { label: "Autopay, a fixed amount", key: "fixed" }, { label: "Autopay, the current balance", key: "current_balance" }, { label: "Autopay, the statement balance", key: "statement_balance" }, { label: "Paid by hand, no schedule", key: "manual" }]);
   }
 
   // ── 4. INCOME: registered streams + rent against the rent roll ──────────
@@ -651,7 +660,7 @@ async function main() {
   // are not in the deposit account, and the proof that the account balances.
   const dep = depositSection((depositRuns || [])[0] || null, today, fmtD);
   for (const f of dep.flags) { flag(f.priority, f.tag, f.text, f.action); if (f.optional) attention[attention.length - 1].optional = true; }
-  for (const q of dep.questions || []) ask(q.id, q.text, q.answer_with);
+  for (const q of dep.questions || []) ask(q.id, q.text, q.answer_with, (q.options || []).map((label) => ({ label, key: null })));
   const deposits = dep.section;
 
   // ── 7. SPENDING (classified spend only) ─────────────────────────────────
@@ -803,7 +812,8 @@ async function main() {
       continue;
     }
     ask(`owner:${t.transaction_id}`, `${who(t)} ${usd(amt(t))} on ${fmtD(t.date)} was paid from ${label(t.account_id)}: was it for ${g.propertyName || g.group}, or personal?`,
-      "File it in the hub (Financials → Transactions): pick its category, or exclude it as personal.");
+      "File it in the hub (Financials → Transactions): pick its category, or exclude it as personal.",
+      [{ label: `For ${g.propertyName || g.group}`, key: "property" }, { label: "Personal", key: "personal" }]);
   }
   for (const { t, by } of repayBusiness) {
     flag(55, "leakage", `${who(t)} ${usd(amt(t))} (${fmtD(t.date)}) on ${label(t.account_id)} was excluded from the business books${by ? ` by ${by}` : ""} as personal.`, `Repay ${usd(amt(t))} to ${label(t.account_id)} from a personal account.`);

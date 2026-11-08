@@ -27,7 +27,7 @@ import { spawnSync } from "node:child_process";
 import { createRequire } from "node:module";
 import {
   loadOpen, orderDecisions, nextDecision, findDecision, buildCard, renderDecision, groupOf, UNPACED,
-  readLane, writeLane, hashQuestion,
+  readLane, writeLane, hashQuestion, SELF_ASKED,
 } from "../lib/decision-queue.mjs";
 import { userTz } from "../lib/hum-events.mjs";
 import { recordQuestionSend, currentScale } from "../lib/question-pacing.mjs";
@@ -58,6 +58,7 @@ async function main() {
     if (!ref) { console.error("usage: decision-ask --ref <ref> [--dry-run] | --next [--dry-run] | --list"); return 2; }
     item = findDecision(ref, items);
     if (!item) { console.error(`decision-ask: ${ref} is not an open decision (answered, superseded or unknown)`); return 5; }
+    if (SELF_ASKED.has(item.source) && !has("dry-run")) { console.error(`decision-ask: ${ref} is sent by its own job over a private path that keeps its text away from the outbound precheck`); return 5; }
     if (!has("dry-run") && !UNPACED.has(item.source)) {
       const guard = nextDecision({ items, tz: userTz(), group: groupOf(item.source), perDay: currentScale() });
       if (!guard.decision && guard.reason?.startsWith("already asked one today")) { console.error(`decision-ask: ${guard.reason}`); return 5; }
