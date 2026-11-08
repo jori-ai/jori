@@ -511,7 +511,7 @@ async function main() {
   }
   // Every change is listed; only an increase of at least 5% and $5 a charge is
   // raised to the top (a utility bill moves every month, a $0.16 cloud bill is noise).
-  for (const c of changed.filter((c) => c.to - c.from >= 5 && c.to >= c.from * 1.05)) flag(55, "price-increase", `${c.name} went from ${c.from_fmt} to ${c.to_fmt} (${c.on_fmt}).`);
+  for (const c of changed.filter((c) => c.to - c.from >= 5 && c.to >= c.from * 1.05)) flag(55, "spend-increase", `${c.name} charged ${c.to_fmt} on ${c.on_fmt}, up from ${c.from_fmt} the time before.`); // a bigger charge, not a known price change: a usage-billed service (ads, cloud) moves with use
 
   // ── 10. ANOMALIES (expense-classified rows only) ────────────────────────
   const anomalies = { duplicates: [], unusual: [], new_merchant_large: [] };
