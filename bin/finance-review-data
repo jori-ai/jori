@@ -100,6 +100,8 @@ const PERSONAL_CATS = new Set(["FOOD_AND_DRINK", "ENTERTAINMENT", "PERSONAL_CARE
 const PROPERTY_CATS = new Set(["HOME_IMPROVEMENT", "RENT_AND_UTILITIES"]);
 const TAX_DUE = ["2026-09-15", "2027-01-15", "2027-04-15", "2027-06-15", "2027-09-15", "2028-01-18"];
 const RECURRING_SKIP_VERDICTS = new Set(["cancel", "already_cancelled", "not_recurring"]);
+// Recurring kinds that are bills, paid as they come, not subscriptions to decide on.
+const BILL_KINDS = new Set(["utility", "insurance", "housing", "tax"]);
 const CADENCE_PER_MONTH = { weekly: 52 / 12, monthly: 1, quarterly: 1 / 3, semiannual: 1 / 6, annual: 1 / 12 };
 
 const load = (file, fallback) => { try { return JSON.parse(fs.readFileSync(file, "utf8")); } catch { return fallback; } };
@@ -159,7 +161,9 @@ async function main() {
   const reconciled = (reconciledAll || []).filter((r) => r.as_of_date === reconciledDate);
 
   const attention = [];
-  const flag = (priority, tag, text) => attention.push({ priority, tag, text });
+  // `action`, when a flag has exactly one fix the records can name (a move, from
+  // where to where, for how much; the page where it is answered), is that fix.
+  const flag = (priority, tag, text, action = null) => attention.push({ priority, tag, text, ...(action ? { action } : {}) });
   const questions = [];
   const ask = (id, text, answer_with) => { if (!questions.some((q) => q.id === id)) questions.push({ id, text, answer_with }); };
 
@@ -187,7 +191,7 @@ async function main() {
   // was decided (the account map's `known_unregistered`: {mask: reason}).
   const knownOut = map.known_unregistered || {};
   for (const a of (accounts || []).filter((x) => ["depository", "credit"].includes(x.type) && gmap[x.account_id]?.group === "unmapped" && !knownOut[String(x.mask)])) {
-    flag(45, "unmapped-account", `${a.name} ••${a.mask} (${usd0(num(a.balance_current))}) is not in the account registry, so it is in no cash total.`);
+    flag(45, "unmapped-account", `${a.name} ••${a.mask} (${usd0(num(a.balance_current))}) is not in the account registry, so it is in no cash total.`, "Add it in the hub: Financials → Accounts.");
     ask(`account:${a.mask}`, `Which property or pot does ${a.name} ••${a.mask} belong to?`, "Add it in the hub's Financials → Accounts (the registry), or close it.");
   }
 
@@ -200,7 +204,39 @@ async function main() {
     rule: p.source === "hub_link" ? "rental_books_payout" : "rental_payout_record",
     payout_id: p.payout_id, tenants: p.tenants, period: p.period,
   }]));
-  const cls = classify(posted, accounts, { overrides, expectedIncome, bookVerdicts, depositAccountIds, largeOutflow: map.large_outflow_usd || LARGE_OUTFLOW });
+  // Large outflows a kept record already explains: the recurring tracker
+  // follows every bill (tax, utility, insurance, housing) by its merchant key,
+  // so a bill it expected is not asked about again. (What a person filed a row
+  // under in the rental books is read by classify's own books rule.)
+  const billDesc = (t) => `${t.merchant_name || ""} ${t.name || ""}`.toLowerCase().replace(/[*#]+/g, " ").replace(/\s+/g, " ");
+  const tracked = (recurring || []).map((r) => {
+    const d = r.detected || {}, e = r.enrichment || {}, o = r.override || {};
+    return { id: r.id, d, kind: o.kind || e.kind, name: o.name || e.name || d.descriptor };
+  }).filter((x) => x.d.active && String(x.d.merchantKey || "").length >= 4);
+  const trackedFor = (t) => tracked.find((x) => (x.d.chargeIds || []).includes(t.transaction_id)
+    || (billDesc(t).includes(String(x.d.merchantKey).toLowerCase()) && (!x.d.plaidCategory || x.d.plaidCategory === t.category_detailed)));
+  const known = new Map();
+  for (const t of posted.filter((t) => Number(t.amount) > 0)) {
+    const bill = trackedFor(t);
+    if (bill && BILL_KINDS.has(bill.kind)) known.set(t.transaction_id, { kind: bill.kind === "tax" ? "tax" : "expense", rule: "recurring_tracker", note: `${bill.name} (${FR.recurring_label})` });
+  }
+  // A tracked bill already paid this cycle: a matching charge from 45 days
+  // before its expected date until today.
+  const paidThisCycle = (x) => {
+    if (!x.d.nextExpected) return null;
+    const from = dayAdd(x.d.nextExpected, -45);
+    const hits = posted.filter((t) => Number(t.amount) > 0 && t.date >= from && t.date <= today && trackedFor(t) === x);
+    if (!hits.length) return null;
+    const total = round2(sum(hits, (t) => Math.abs(Number(t.amount))));
+    const lastYear = String(x.d.lastCharged || "").slice(0, 4);
+    const prior = (x.d.charges || []).filter((c) => c.date && c.date.slice(0, 4) === lastYear);
+    return {
+      total, total_fmt: usd(total), on_fmt: fmtD(hits.map((t) => t.date).sort().pop()), count: hits.length,
+      last_cycle_fmt: prior.length ? usd0(sum(prior, (c) => c.amountCents / 100)) : null, last_cycle_count: prior.length,
+    };
+  };
+  const paidById = new Map(tracked.map((x) => [x.id, paidThisCycle(x)]).filter(([, v]) => v));
+  const cls = classify(posted, accounts, { overrides, expectedIncome, bookVerdicts, depositAccountIds, largeOutflow: map.large_outflow_usd || LARGE_OUTFLOW, known });
   const kindOf = (t) => cls.get(t.transaction_id)?.kind;
   const out = (t) => Number(t.amount) > 0;
   const amt = (t) => Math.abs(Number(t.amount));
@@ -242,7 +278,7 @@ async function main() {
   const unreviewed = posted.filter((t) => kindOf(t) === "unreviewed_large").sort((a, b) => amt(b) - amt(a));
   for (const t of unreviewed) {
     const text = `${usd(amt(t))} left ${label(t.account_id)} on ${fmtD(t.date)} ("${who(t)}") and has not been classified; it is kept out of spending and runway until it is.`;
-    flag(inWin(t, wkStart) ? 86 : 52, "unreviewed-large", text);
+    flag(inWin(t, wkStart) ? 86 : 52, "unreviewed-large", text, "Say what it was in the Questions tab.");
     ask(`txn:${t.transaction_id}`, `What was the ${usd(amt(t))} on ${fmtD(t.date)} from ${label(t.account_id)} ("${who(t)}")? (capital = an asset purchase or investment; expense = spending)`, `finance-facts txn ${t.transaction_id} --kind capital|expense|tax|transfer_external --note "..."`);
   }
 
@@ -270,6 +306,7 @@ async function main() {
     const d = r.detected || {}; const e = r.enrichment || {}; const o = r.override || {};
     const kind = o.kind || e.kind;
     if (!d.active || !d.nextExpected || kind === "habit" || RECURRING_SKIP_VERDICTS.has(r.decision?.verdict)) continue;
+    if (paidById.has(r.id)) continue; // already paid this cycle: nothing is coming
     const gap = daysBetween(today, d.nextExpected);
     if (gap < 0 || gap > 14) continue;
     const accountId = (d.accountIds || [])[0];
@@ -382,7 +419,7 @@ async function main() {
   // This builder only reports it: per-tenant location, exactly which deposits
   // are not in the deposit account, and the proof that the account balances.
   const dep = depositSection((depositRuns || [])[0] || null, today, fmtD);
-  for (const f of dep.flags) flag(f.priority, f.tag, f.text);
+  for (const f of dep.flags) flag(f.priority, f.tag, f.text, f.action);
   for (const q of dep.questions || []) ask(q.id, q.text, q.answer_with);
   const deposits = dep.section;
 
@@ -396,14 +433,17 @@ async function main() {
   const byAccount = Object.entries(wk.filter(isSpend).reduce((m, t) => { const k = label(t.account_id); m[k] = (m[k] || 0) + amt(t); return m; }, {}))
     .sort((a, b) => b[1] - a[1]).map(([account, v]) => ({ account, total_fmt: usd0(v) }));
   const largest = wk.filter(isSpend).sort((a, b) => amt(b) - amt(a)).slice(0, 8)
-    .map((t) => ({ date_fmt: fmtD(t.date), who: who(t), amount_fmt: usd(amt(t)), account: label(t.account_id) }));
+    .map((t) => ({ date_fmt: fmtD(t.date), who: who(t), amount_fmt: usd(amt(t)), account: label(t.account_id), explained: known.get(t.transaction_id)?.note || (cls.get(t.transaction_id)?.rule === "books_category" ? `filed under ${(cls.get(t.transaction_id).categories || []).join(", ")} in the ${FR.ledger_label}` : null) }));
   const spendPrev = round2(sum(wkPrev.filter(isSpend), amt));
 
   // ── 8. CARDS ────────────────────────────────────────────────────────────
+  const utilFlagFrom = map.utilization_flag_from ?? 0.75;
   const cardItems = credits.map((a) => {
     const bal = num(a.balance_current), lim = num(a.balance_limit) || null;
     const util = lim ? bal / lim : null;
-    if (util != null && util > 0.289) flag(util > 0.489 ? 85 : 70, "utilization", `${label(a.account_id)} is at ${pct(util)} utilization (${usd0(bal)} of ${usd0(lim)}).`);
+    // Every card is on autopay, so a balance is not debt carried: only a card
+    // near its limit is worth a line (the user, 2026-11-08: "below 75% is not an issue").
+    if (util != null && util >= utilFlagFrom) flag(util >= 0.9 ? 85 : 70, "utilization", `${label(a.account_id)} is at ${pct(util)} utilization (${usd0(bal)} of ${usd0(lim)}).`);
     return { label: label(a.account_id), mask: a.mask, balance_fmt: usd0(bal), limit_fmt: lim ? usd0(lim) : "no limit reported", utilization_fmt: util == null ? "—" : pct(util), utilization: util };
   }).sort((a, b) => (b.utilization || 0) - (a.utilization || 0));
   const limTotal = sum(credits.filter((a) => num(a.balance_limit)), (a) => num(a.balance_limit));
@@ -411,24 +451,29 @@ async function main() {
   const aggUtil = limTotal ? debtWithLimit / limTotal : null;
   const interest = posted.filter((t) => inWin(t, dayAdd(today, -14)) && out(t) && kindOf(t) === "interest").map((t) => ({ date_fmt: fmtD(t.date), account: label(t.account_id), amount_fmt: usd(amt(t)), who: who(t) }));
   for (const h of interest) flag(92, "interest", `Interest of ${h.amount_fmt} was charged on ${h.account} (${h.date_fmt}).`);
-  const fees = wk.filter((t) => out(t) && (kindOf(t) === "fee" || FEE_RE.test(`${t.merchant_name || ""} ${t.name || ""}`))).map((t) => ({ date_fmt: fmtD(t.date), account: label(t.account_id), amount_fmt: usd(amt(t)), who: who(t) }));
-  if (fees.length) flag(60, "fee", `${fees.length} fee charge(s) this week: ${fees.map((f) => `${f.amount_fmt} on ${f.account}`).join("; ")}.`);
+  const feeRows = wk.filter((t) => out(t) && (kindOf(t) === "fee" || FEE_RE.test(`${t.merchant_name || ""} ${t.name || ""}`)));
+  const fees = feeRows.map((t) => ({ date_fmt: fmtD(t.date), account: label(t.account_id), amount_fmt: usd(amt(t)), who: who(t) }));
+  // A few dollars of fees is housekeeping, not something to keep an eye on.
+  if (fees.length) flag(sum(feeRows, amt) >= (map.fee_flag_min_usd ?? 25) ? 60 : 35, "fee", `${fees.length} fee charge(s) this week: ${fees.map((f) => `${f.amount_fmt} on ${f.account}`).join("; ")}.`);
 
   // ── 9. RECURRING (the recurring tracker is the record; this only reads it)
   const items = (recurring || []).map((r) => {
     const d = r.detected || {}, e = r.enrichment || {}, o = r.override || {};
-    return { name: o.name || e.name || d.descriptor, kind: o.kind || e.kind, d, decision: r.decision || null };
+    return { id: r.id, name: o.name || e.name || d.descriptor, kind: o.kind || e.kind, d, decision: r.decision || null };
   }).filter((x) => x.kind && x.kind !== "habit" && x.d.active);
   const monthlyEq = round2(sum(items.filter((x) => CADENCE_PER_MONTH[x.d.cadence] && !RECURRING_SKIP_VERDICTS.has(x.decision?.verdict)), (x) => (x.d.typicalCents || 0) / 100 * CADENCE_PER_MONTH[x.d.cadence]));
-  const undecided = items.filter((x) => !x.decision && !["utility", "insurance", "housing", "tax"].includes(x.kind));
+  const undecided = items.filter((x) => !x.decision && !BILL_KINDS.has(x.kind));
   const changed = items.filter((x) => x.d.changedOn && x.d.changedOn > wkStart && x.d.priorCents && x.d.lastCents !== x.d.priorCents)
     .map((x) => ({ name: x.name, from: x.d.priorCents / 100, to: x.d.lastCents / 100, from_fmt: usd(x.d.priorCents / 100), to_fmt: usd(x.d.lastCents / 100), on_fmt: fmtD(x.d.changedOn) }));
   const renewals = items.filter((x) => x.d.cadence === "annual" && x.d.nextExpected && daysBetween(today, x.d.nextExpected) >= 0 && daysBetween(today, x.d.nextExpected) <= 30)
-    .map((x) => ({ name: x.name, amount_fmt: usd0((x.d.typicalCents || 0) / 100), due_fmt: fmtD(x.d.nextExpected), decision: x.decision ? x.decision.verdict : "undecided" }));
+    .map((x) => ({ name: x.name, kind: x.kind, amount_fmt: usd0((x.d.typicalCents || 0) / 100), due_fmt: fmtD(x.d.nextExpected), decision: x.decision ? x.decision.verdict : "undecided", paid: paidById.get(x.id) || null }));
   const chargedAfterCancel = items.filter((x) => ["cancel", "already_cancelled"].includes(x.decision?.verdict) && x.d.lastCharged && x.d.lastCharged > String(x.decision.decidedAt || "").slice(0, 10))
     .map((x) => ({ name: x.name, last_fmt: fmtD(x.d.lastCharged), amount_fmt: usd(x.d.lastCents / 100) }));
   for (const c of chargedAfterCancel) flag(70, "charged-after-cancel", `${c.name} was marked cancelled on ${FR.recurring_label} but charged ${c.amount_fmt} on ${c.last_fmt}.`);
-  for (const r of renewals.filter((r) => r.decision === "undecided")) flag(58, "renewal", `${r.name} renews around ${r.due_fmt} (typically ${r.amount_fmt}/yr) with no decision recorded on ${FR.recurring_label}.`);
+  // A bill (tax, utility, insurance, housing) is paid, not decided; one already
+  // paid this cycle is not coming. Only an undecided subscription not yet
+  // charged is a renewal worth a line.
+  for (const r of renewals.filter((r) => r.decision === "undecided" && !r.paid && !BILL_KINDS.has(r.kind))) flag(58, "renewal", `${r.name} renews around ${r.due_fmt} (typically ${r.amount_fmt}/yr) with no decision recorded on ${FR.recurring_label}.`, `Record a decision on ${FR.recurring_label}.`);
   // Every change is listed; only an increase of at least 5% and $5 a charge is
   // raised to the top (a utility bill moves every month, a $0.16 cloud bill is noise).
   for (const c of changed.filter((c) => c.to - c.from >= 5 && c.to >= c.from * 1.05)) flag(55, "price-increase", `${c.name} went from ${c.from_fmt} to ${c.to_fmt} (${c.on_fmt}).`);
@@ -486,7 +531,7 @@ async function main() {
   const netWorth = (brokerNow || 0) + othersTotal + (holdingsValue || 0) + (reValue || 0) + (privateValue || 0) + bankCash - cardDebt - depositLiability;
   const idleThreshold = map.idle_cash_buffer_usd || 50000;
   for (const a of depos.filter((a) => num(a.balance_current) > idleThreshold && ["savings", "checking"].includes(a.subtype) && gmap[a.account_id]?.group !== "deposits")) {
-    flag(40, "idle-cash", `${label(a.account_id)} holds ${usd0(num(a.balance_current))}, above the ${usd0(idleThreshold)} idle-cash threshold.`);
+    flag(60, "idle-cash", `${label(a.account_id)} holds ${usd0(num(a.balance_current))}, above the ${usd0(idleThreshold)} idle-cash threshold.`);
   }
 
   // ── 13. TAX (awareness) ─────────────────────────────────────────────────
@@ -514,7 +559,7 @@ async function main() {
 
   // Facts the summary may cite. Every one is a sentence this code wrote.
   const facts = [
-    ...attention.map((a) => ({ id: a.id, text: a.text })),
+    ...attention.map((a) => ({ id: a.id, text: a.action ? `${a.text} ${a.action}` : a.text })),
     freeCash != null && { id: "cash.free", text: `Free cash is ${usd0(freeCash)}, ${signed(cashPos.free_cash_week_delta)} on the week.` },
     { id: "flow.week", text: `This week: ${flowFmt.income_in_fmt} of income arrived, ${flowFmt.spending_fmt} was spent, and ${flowFmt.card_payments_from_bank_fmt} of card payments left bank accounts.` },
     runway != null && { id: "runway", text: `Runway is ${runway} days: free cash of ${usd0(freeCash)} at ${usd0(dailySpend)} per day, the average daily spending of the last 90 days.` },

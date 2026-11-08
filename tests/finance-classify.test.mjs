@@ -63,6 +63,16 @@ test("a large unclassified outflow is held out of spending until the user says w
   assert.equal(c.get("wire").rule, "override");
 });
 
+test("a large outflow a kept record explains is not asked about (2026-11-08: a property-tax bill filed under Taxes)", () => {
+  const tax = t("tax", "cardA", 19324.61, "2026-11-03", { pri: "GOVERNMENT_AND_NON_PROFIT", det: "GOVERNMENT_AND_NON_PROFIT_TAX_PAYMENT" });
+  const known = new Map([["tax", { kind: "tax", rule: "recurring_tracker", note: "County property tax (tracker)" }]]);
+  const c = classify([tax], accounts, { known });
+  assert.deepEqual(c.get("tax"), { kind: "tax", rule: "recurring_tracker", note: "County property tax (tracker)" });
+  // A small outflow is not touched by it: the record only settles what would have been asked.
+  const small = t("small", "cardA", 40, "2026-11-03");
+  assert.equal(classify([small], accounts, { known: new Map([["small", { kind: "tax", rule: "x" }]]) }).get("small").kind, "expense");
+});
+
 test("an inflow is income only by a rule: registered stream or rental category — otherwise unexplained", () => {
   const exp = [{ id: "acme", account_id: "biz", payer_contains: "acme", amount: 12000, tolerance: 0 }];
   const posted = [

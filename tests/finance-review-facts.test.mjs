@@ -324,7 +324,7 @@ test("a deposit the hub's trail shows returned in full is refunded even while it
   assert.equal(r.liability, 0);
   const sec = depositSection({ run_at: new Date().toISOString(), report: { ...r, deposit_account: "Security Deposits ••1111" } }, "2026-11-08");
   assert.ok(!sec.flags.some((f) => f.tag === "deposit-not-returned"));
-  assert.ok(sec.flags.some((f) => f.tag === "deposit-returned-from-other-account" && /Birch ••2222 still holds \$1,600\.00/.test(f.text)));
+  assert.ok(sec.flags.some((f) => f.tag === "deposit-returned-from-other-account" && /Birch ••2222 still holds \$1,600\.00/.test(f.text) && f.action === "Move $1,600.00 from Birch ••2222 to Security Deposits ••1111."));
   assert.ok(sec.flags.some((f) => f.tag === "deposit-hub-status"));
 });
 
