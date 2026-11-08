@@ -208,6 +208,18 @@ RC=$?
 - Exit 1 = the email did not send: stop, do not mark sent. Exit 2 = sent but
   unlabeled — note it.
 
+**Copies.** When the installation lists people the owner asked to share the
+review with (`share_with` in `agent/local/config/finance-review.json`; the
+owner's explicit authorization, the only exception to "the owner's own email
+and phone"), send them the same email as the agent, after the owner's copy went
+out (RC is not 1) — the email only, never the pointer, push or questions:
+
+```bash
+SHARE=$(jq -r '.share_with // [] | join(",")' agent/local/config/finance-review.json 2>/dev/null)
+[ $RC -ne 1 ] && [ -n "$SHARE" ] && ~/Dev/jori/bin/email-send --to "$SHARE" \
+  --subject "$(jq -r .subject "$C")" --body-file /tmp/finance-review.html --html
+```
+
 Do not email anyone but the user. Do not create tasks. If the send fails,
 never fall back to an external channel for financial data.
 
