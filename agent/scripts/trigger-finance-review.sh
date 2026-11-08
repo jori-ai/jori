@@ -14,4 +14,6 @@ if ! "${JORI_NODE:-node}" "$JORI_INSTALL_TOOLS/bin/plaid-connect" status 2>/dev/
 fi
 
 source "$(dirname "$0")/lib/webhook-auth.sh"
-dispatch_or_skip '{"task": "FINANCE REVIEW", "source": "cron-finance-review"}' finance-review || true
+# FINANCE_REVIEW_SOURCE: cron-finance-review (Sunday) or cron-finance-review-sweep
+# (bin/finance-review-gate sweep, resuming a review held for the user's answers).
+dispatch_or_skip "{\"task\": \"FINANCE REVIEW\", \"source\": \"${FINANCE_REVIEW_SOURCE:-cron-finance-review}\"}" finance-review || true

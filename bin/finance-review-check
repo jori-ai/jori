@@ -1,0 +1,159 @@
+#!/usr/bin/env node
+"use strict";
+// finance-review-check — the weekly finance review is checked before it is
+// sent, the way the daily summary is (bin/daily-summary-review).
+//
+// The user (2026-11-08): "we want to run a checker before actually sending
+// anything ... everything in the review itself should be in terms i can
+// understand, not bank descriptions ... many of the answers are already in
+// either claudette memory or the ledgers, so reviewing it intelligently before
+// sending is important."
+//
+// Two layers, split the way Rule #0b requires:
+//   1. Code (structural, certain): a bank descriptor shown as a name, a
+//      breakdown whose rows do not add up to its line, a deposit whose
+//      whereabouts are unknown, an "act on" flag with no action, the same
+//      action twice, an email over Gmail's clip size.
+//   2. A model (judgment): an independent read of the email as the user will
+//      read it, on the Max session (lib/max-judge.js: no tools, no MCP, no
+//      API key), Opus by default. It reports what is unclear, inconsistent,
+//      repeated or answerable from the records — never rewrites anything.
+//      Bank data stays on the user's own model (agent/CLAUDE.md § Financial
+//      Operations rule 5): this is the same Max session the review runs on.
+//
+// It repairs nothing. The review session (jobs/finance-review.md Step 3)
+// fixes what the findings name — a payee name, a fact from the records — then
+// rebuilds and checks again.
+//
+// Usage:
+//   finance-review-check --packet P.json --html review.html [--out R.json]
+//                        [--no-model] [--model opus|sonnet] [--effort high]
+// Prints the result JSON: {confirmed, findings[], independent_review}.
+// confirmed = no high or medium finding remains AND the model read ran (or
+// --no-model was asked for). Exit 0 always unless the inputs are unreadable (2).
+
+const fs = require("node:fs");
+const path = require("node:path");
+
+const arg = (n) => { const i = process.argv.indexOf(`--${n}`); return i >= 0 ? process.argv[i + 1] : null; };
+const has = (n) => process.argv.includes(`--${n}`);
+
+// Bank-generated descriptor fragments that must never reach the user as a name.
+// lang-regex-ok: bank-generated descriptor tokens, not anything a person wrote
+const DESCRIPTOR_RE = /\b(DES:|INDN:|CO ID|TRN:|ORIG:|ORIG BK:|SEQ:|WITHDRWL|PMT\*|Confirmation#|Conf#|X{4,})|\bID:\s*\w/;
+// Three or more consecutive all-caps words read as a raw bank line.
+const SHOUTING_RE = /\b[A-Z][A-Z'&.]{2,}(?:\s+[A-Z][A-Z'&.]{1,}){2,}\b/; // lang-regex-ok: bank-generated all-caps descriptor
+const GMAIL_CLIP_BYTES = 102 * 1024;
+
+function structural(p, html) {
+  const out = [];
+  const add = (severity, kind, where, problem, fix) => out.push({ severity, kind, where, problem, fix, source: "code" });
+  const shown = [];
+  const D = p.cash?.flow?.detail || {};
+  for (const [k, d] of Object.entries(D)) for (const r of d.rows || []) {
+    shown.push([`This week's money · ${k}`, r.from ?? r.what]);
+    shown.push([`This week's money · ${k}`, r.to ?? r.account]);
+  }
+  for (const t of p.spending?.largest || []) shown.push(["Spending · largest", t.who]);
+  for (const u of p.cash?.upcoming_14d || []) shown.push(["Next 14 days", u.label]);
+  for (const a of p.attention || []) { shown.push([`Attention · ${a.tag}`, a.text]); if (a.action) shown.push([`Attention · ${a.tag}`, a.action]); }
+  for (const x of p.recurring?.renewals_30d || []) shown.push(["Recurring", x.name]);
+  const seen = new Set();
+  for (const [where, text] of shown) {
+    const s = String(text || "");
+    if (!s || seen.has(`${where}|${s}`)) continue;
+    seen.add(`${where}|${s}`);
+    if (DESCRIPTOR_RE.test(s) || SHOUTING_RE.test(s)) {
+      add("high", "bank-wording", where, `"${s.slice(0, 90)}" is a bank description, not a name the user would use.`,
+        "Find what it is (the records, Gmail, the wiki/memory) and name it: account map payee_names for a payee that recurs, finance-facts txn --note for a one-off; ask only if nothing says.");
+    }
+  }
+  const cents = (x) => Math.round(Number(x || 0) * 100);
+  for (const [k, d] of Object.entries(D)) {
+    if (!(d.rows || []).length) continue;
+    const sum = d.rows.reduce((t, r) => t + cents(r.amount), 0);
+    if (sum !== cents(d.total)) add("high", "does-not-add-up", `This week's money · ${k}`, `rows add up to ${(sum / 100).toFixed(2)}, the line says ${d.total_fmt}.`, "A code defect: report it; do not send numbers that disagree.");
+  }
+  const cats = p.spending?.by_category || [];
+  if (cats.length && cats.every((c) => c.this_week != null)) {
+    const sum = cats.reduce((t, c) => t + cents(c.this_week), 0);
+    const total = Number(String(p.spending.week_total_fmt || "").replace(/[^0-9.]/g, ""));
+    if (Math.abs(sum / 100 - total) > 1) add("high", "does-not-add-up", "Spending", `categories add up to ${(sum / 100).toFixed(0)}, the week's spending is ${p.spending.week_total_fmt}.`, "A code defect: report it.");
+  }
+  for (const r of p.deposits?.rows || []) {
+    if (/^not known|unconfirmed/i.test(String(r.location || ""))) add("high", "unknown", `Security deposits · ${r.tenant}`, `${r.tenant}'s deposit shows as "${String(r.location).slice(0, 60)}".`, "Trace it (the hub's trail, the bank rows of every account it could be in) and either locate it or say which move fixes it.");
+  }
+  for (const a of p.attention || []) {
+    if (a.tag !== "questions" && a.priority >= 70 && !a.action) add("medium", "no-action", `Attention · ${a.tag}`, `An "act on" item says what is wrong but not what to do: "${String(a.text).slice(0, 90)}".`, "Write the one concrete action (resolve file `action`), or resolve it so it drops out.");
+  }
+  const actions = (p.attention || []).map((a) => a.action).filter(Boolean);
+  for (const x of new Set(actions.filter((x, i) => actions.indexOf(x) !== i))) add("medium", "duplicate", "Attention", `The same action appears twice: "${x.slice(0, 90)}".`, "One item, one place.");
+  if (html && Buffer.byteLength(html, "utf8") > GMAIL_CLIP_BYTES) add("medium", "too-long", "Email", `The email is ${Math.round(Buffer.byteLength(html, "utf8") / 1024)} KB; Gmail clips over ~102 KB.`, "A code defect: report it.");
+  return out;
+}
+
+// The email as the user reads it: tags out, entities decoded, whitespace folded.
+function emailText(html) {
+  return String(html || "")
+    .replace(/<style[\s\S]*?<\/style>/gi, "")
+    .replace(/<\/(tr|div|li|h\d|p|table)>/gi, "\n").replace(/<br\s*\/?>/gi, "\n").replace(/<\/t[dh]>/gi, " | ")
+    .replace(/<[^>]+>/g, "")
+    .replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&quot;/g, '"').replace(/&#39;/g, "'")
+    .replace(/[ \t]+/g, " ").replace(/\n\s*\n+/g, "\n").trim();
+}
+
+const RUBRIC = `You are checking a weekly personal-finance review email before it is sent to its one reader, the account holder. Read it as that person will. Report only real problems; an empty list is a good result.
+
+What counts as a problem:
+- bank-wording: anything shown in bank/processor language instead of plain terms (raw descriptors, codes, "DES:", "ACH", truncated all-caps payee strings, account-number fragments used as names). The reader must understand every line without opening a bank statement.
+- unclear: a row or alert where the reader cannot tell what it was, where the money came from or where it went, or why it matters.
+- inconsistent: two parts of the email that disagree (numbers, a status, a direction of money).
+- duplicate: the same item reported in more than one place.
+- no-action: an alert that states a problem without saying what to do about it, or that a reasonable reader would see as noise.
+- answerable: something left open or asked that the email's own facts (or an obvious record the review keeps: the rental books, the recurring tracker, a prior answer) would settle — say what would settle it.
+
+Severity: high = wrong, misleading, or unreadable to the reader; medium = unclear or noisy; low = polish. Quote the exact text you mean in "where". Never invent facts; never suggest moving money beyond what an alert already says.`;
+
+const SCHEMA = {
+  type: "object", additionalProperties: false, required: ["findings"],
+  properties: {
+    findings: {
+      type: "array",
+      items: {
+        type: "object", additionalProperties: false, required: ["severity", "kind", "where", "problem", "fix"],
+        properties: {
+          severity: { type: "string", enum: ["high", "medium", "low"] },
+          kind: { type: "string", enum: ["bank-wording", "unclear", "inconsistent", "duplicate", "no-action", "answerable"] },
+          where: { type: "string" }, problem: { type: "string" }, fix: { type: "string" },
+        },
+      },
+    },
+  },
+};
+
+async function modelRead(html, { model, effort }) {
+  const { judge } = require(path.join(__dirname, "..", "lib", "max-judge.js"));
+  const r = await judge({ model, effort, appendSystem: RUBRIC, schema: SCHEMA, timeoutMs: 300000, prompt: `The email, as text:\n\n${emailText(html)}` });
+  return (r.findings || []).map((f) => ({ ...f, source: "model" }));
+}
+
+async function main() {
+  const packetPath = arg("packet"), htmlPath = arg("html");
+  let p, html;
+  try { p = JSON.parse(fs.readFileSync(packetPath, "utf8")); html = fs.readFileSync(htmlPath, "utf8"); }
+  catch (e) { console.error(`finance-review-check: ${e.message}`); console.error("usage: finance-review-check --packet P.json --html review.html [--out R.json] [--no-model]"); process.exit(2); }
+  const findings = structural(p, html);
+  let independent = "skipped";
+  if (!has("no-model")) {
+    try { findings.push(...await modelRead(html, { model: arg("model") || "opus", effort: arg("effort") || "high" })); independent = "ran"; }
+    catch (e) { independent = "unavailable"; findings.push({ severity: "low", kind: "unclear", where: "check", problem: `the independent read did not run: ${String(e.message).slice(0, 160)}`, fix: "Run the check again once.", source: "code" }); }
+  }
+  const blocking = findings.filter((f) => f.severity === "high" || f.severity === "medium");
+  const result = { confirmed: blocking.length === 0 && independent !== "unavailable", independent_review: independent, counts: { high: findings.filter((f) => f.severity === "high").length, medium: findings.filter((f) => f.severity === "medium").length, low: findings.filter((f) => f.severity === "low").length }, findings };
+  const s = JSON.stringify(result, null, 2);
+  if (arg("out")) fs.writeFileSync(arg("out"), s);
+  console.log(s);
+}
+
+if (require.main === module) main();
+module.exports = { structural, emailText, DESCRIPTOR_RE, SHOUTING_RE };

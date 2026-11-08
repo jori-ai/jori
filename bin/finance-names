@@ -1,0 +1,80 @@
+#!/usr/bin/env node
+"use strict";
+// finance-names — the names the weekly finance review shows, in the user's
+// terms, recorded once so every later review uses them.
+//
+// The user (2026-11-08): "everything in the review itself should be in terms i
+// can understand, not bank descriptions". The review names what it can from
+// the bank line (a wire's sender, a Zelle payee, a tenant's rent by property);
+// what is still a bank description is named here, from a record (the wiki /
+// memory, the books, an email) or from the user's answer.
+//
+//   finance-names payee "<text that appears in the bank line>" "<plain name>" --why "<record or the user's words>"
+//        every transaction whose bank line contains that text shows the name
+//        (longest match wins). For a payee or payer that recurs.
+//   finance-names account <last4> "<whose account>" --why "..."
+//        an account Plaid does not see (a transfer to/from CHK 1234).
+//   finance-names own "<text in the bank line>" --why "..."
+//        an outgoing transfer containing this text goes to an account of the
+//        user's own: a transfer, not spending (a brokerage, a bank elsewhere).
+//   finance-names list
+//   finance-names rm payee|account|own "<key>"
+// A one-off transaction is named with `finance-facts txn <id> --kind … --note "<name>"`.
+//
+// Writes the account map (agent/local/config/rental-finance.json
+// `accounts_map_file`): payee_names {text: name}, known_external_accounts
+// {last4: name}, own_transfer_phrases [text]; and appends each change with its
+// reason to data/finance-names.jsonl.
+
+const fs = require("node:fs");
+const path = require("node:path");
+const { installTools } = require("../lib/root.cjs");
+const { localConfig } = require("../lib/instance.cjs");
+
+const RF = localConfig("rental-finance", { accounts_map_file: "" });
+if (!RF.accounts_map_file) { console.error("finance-names: no accounts_map_file in rental-finance config"); process.exit(2); }
+const MAP = installTools(RF.accounts_map_file);
+const JOURNAL = installTools("data", "finance-names.jsonl");
+const argv = process.argv.slice(2);
+const opt = (k) => { const i = argv.indexOf(`--${k}`); return i >= 0 ? argv[i + 1] : null; };
+const pos = argv.filter((a, i) => !a.startsWith("--") && !(i > 0 && argv[i - 1].startsWith("--")));
+
+const load = () => JSON.parse(fs.readFileSync(MAP, "utf8"));
+const save = (m) => { const tmp = `${MAP}.tmp`; fs.writeFileSync(tmp, JSON.stringify(m, null, 2) + "\n"); fs.renameSync(tmp, MAP); };
+const journal = (e) => fs.appendFileSync(JOURNAL, JSON.stringify({ at: new Date().toISOString(), ...e }) + "\n");
+const die = (m) => { console.error(`finance-names: ${m}`); process.exit(2); };
+
+const [cmd, a, b] = pos;
+const m = load();
+if (cmd === "list") {
+  console.log(JSON.stringify({ payee_names: m.payee_names || {}, known_external_accounts: m.known_external_accounts || {}, own_transfer_phrases: m.own_transfer_phrases || [] }, null, 2));
+  process.exit(0);
+}
+const why = opt("why");
+if (cmd === "payee") {
+  if (!a || !b || !why) die('payee "<bank text>" "<name>" --why "<reason>"');
+  if (a.trim().length < 4) die("the bank text must be at least 4 characters (it is matched inside every bank line)");
+  m.payee_names = { ...(m.payee_names || {}), [a.trim()]: b.trim() };
+  save(m); journal({ kind: "payee", key: a.trim(), name: b.trim(), why });
+  console.log(`payee "${a.trim()}" → ${b.trim()}`);
+} else if (cmd === "account") {
+  if (!/^\d{4}$/.test(String(a || "")) || !b || !why) die('account <last4> "<whose>" --why "<reason>"');
+  m.known_external_accounts = { ...(m.known_external_accounts || {}), [a]: b.trim() };
+  save(m); journal({ kind: "account", key: a, name: b.trim(), why });
+  console.log(`account ••${a} → ${b.trim()}`);
+} else if (cmd === "own") {
+  if (!a || !why) die('own "<bank text>" --why "<reason>"');
+  if (a.trim().length < 4) die("the text must be at least 4 characters");
+  m.own_transfer_phrases = [...new Set([...(m.own_transfer_phrases || []), a.trim().toLowerCase()])];
+  save(m); journal({ kind: "own", key: a.trim().toLowerCase(), why });
+  console.log(`own transfers: "${a.trim().toLowerCase()}"`);
+} else if (cmd === "rm") {
+  const field = { payee: "payee_names", account: "known_external_accounts", own: "own_transfer_phrases" }[a];
+  if (!field || !b) die("rm payee|account|own <key>");
+  if (Array.isArray(m[field])) m[field] = m[field].filter((x) => x !== b.toLowerCase());
+  else if (m[field]) delete m[field][b];
+  save(m); journal({ kind: `rm-${a}`, key: b, why: why || "" });
+  console.log(`removed ${a} ${b}`);
+} else {
+  die('usage: payee "<text>" "<name>" --why … | account <last4> "<name>" --why … | own "<text>" --why … | list | rm payee|account|own <key>');
+}

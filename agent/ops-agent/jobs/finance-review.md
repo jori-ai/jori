@@ -21,158 +21,168 @@ own email + phone.
 **The email is rendered by code, not written by you.** When a model wrote it,
 almost every error was a guess stated as a fact — card payments as "late
 income", a manual payment as "autopay", a future lease as "missing deposits", a
-quiet week as "normal mid-month". So the tables and every flag are rendered
-from the packet by
-`finance-review-compose`, and your only text is a short summary that a
-verifier checks word by word against the packet's facts. If it fails, the
-email goes out without it. Questions the records cannot answer go to the
-user's **Questions tab**, one row each (Step 5); the email only says how many
-are waiting there. Never answer one yourself.
+quiet week as "normal mid-month". So every table and flag is rendered from the
+packet by `finance-review-compose`. Your work is everything before that: find
+out, record, name things in the user's terms, check, ask, and only then send.
 
-**Design principle:** a
-*weekly* review is for **liquidity, accuracy, and anomalies — NOT portfolio or
-tax ACTIONS.** Net worth, allocation, and tax appear as **awareness-only**;
-never prompt a rebalance, a trade, or a tax move here (those have their own
-flows). Lead with what's actionable this week.
+**Design principle:** a *weekly* review is for **liquidity, accuracy, and
+anomalies — NOT portfolio or tax ACTIONS.** Net worth, allocation, and tax
+appear as **awareness-only**; never prompt a rebalance, a trade, or a tax move
+here (those have their own flows). Lead with what's actionable this week.
 
-## Step 1 — Build the packet
+**The same flow as the daily summary (the user, 2026-11-08):** *"the finance
+review should use the same flow as the daily summary. we want to run a checker
+before actually sending anything - asking questions and answering them before
+the send is important. everything in the review itself should be in terms i can
+understand, not bank descriptions... also, many of the answers are already in
+either claudette memory or the ledgers, so reviewing it intelligently before
+sending is important."* So: a fresh session per run, the records and memory
+consulted before anything is asked, an independent check before anything is
+sent, and questions asked before the email, which waits for the answers.
+
+## Pipeline — launch via job-run (the dispatching turn does only this)
+
+**However this dispatch reaches you — `FINANCE REVIEW` from the Sunday cron, from
+the answer sweep (`bin/finance-review-gate sweep`), or a manual re-dispatch —
+the action is identical, unconditional, and the ONLY thing you do in this turn:**
+
+```bash
+~/Dev/jori/bin/job-run --name finance-review -- ~/Dev/jori/bin/finance-review-run
+```
+
+Then end your turn with a one-line ack ("finance review launched, id <id>").
+Never decide it already ran: a re-dispatch exists because something changed
+(the user answered, or asked for it again). `finance-review-run` forks a fresh
+single-shot session that runs everything below; it holds a lock, so a second
+launch while one is running exits at once. If the user asks whether it ran,
+read `~/Dev/jori/bin/job-status <id>`.
+
+## Step 0 — Build the packet
 
 ```bash
 cd ~/Dev/jori
 node bin/finance-deposits-reconcile > /dev/null   # fresh deposit reconciliation (deterministic)
-( set -a; . ./.env; set +a; node bin/finance-invoices-reconcile > /dev/null )   # invoice reconciliation, when configured (deterministic)
+( set -a; . ./.env; set +a; node bin/finance-invoices-reconcile > /dev/null )   # invoice reconciliation, when configured
 node bin/finance-review-data > /tmp/finance-review-packet.json
+WEEK=$(jq -r .meta.week_end /tmp/finance-review-packet.json)
 ```
 
 If it exits non-zero or the file is empty, stop silently. If
 `meta.ledger_available` is false the property and deposit sections are absent;
-the email says so itself — send it anyway.
+the email says so itself.
 
-## Step 1b — Investigate and repair everything before reporting
+## Step 1 — Record the user's answers first
+
+```bash
+node bin/finance-review-ask --packet /tmp/finance-review-packet.json --earlier
+```
+
+It prints every question this review asked that the user has answered, with
+their reply. Record each per § Recording facts (quote the reply and its date),
+then close it with `finance-review-ask --answered <fin-id> --via "<what was
+recorded>"`. Then rebuild (Step 0). On a run the answer sweep started, this is
+the point of the run.
+
+## Step 2 — Investigate and repair everything before reporting
 
 The user (2026-11-08): *"before asking any questions in the finance report, we
-should attempt to answer them autonomously as part of the finance review
-(possibly by launching an additional agent), and attempt to repair or instruct
-the admin what to do. this doesn't just apply to questions but every alert and
-discrepancy found."* The email is the last resort, not the first: every
-attention item (`attention[]`, except the `questions` count) and every
-`questions[]` entry gets worked before anything is sent.
+should attempt to answer them autonomously ... and attempt to repair or
+instruct the admin what to do. this doesn't just apply to questions but every
+alert and discrepancy found."* Every attention item, every `questions[]` entry,
+and **every name the email will show that is still a bank description** (a row
+of "This week's money" breakdowns, a largest charge, a Next-14-days line) is
+worked before anything is sent.
 
-The records already answer more than they used to, before the packet asks
-anything: the hub's rent and deposit payouts are income and deposits (the
-books' payout records, current and future leases alike), and a category a
-person set or confirmed in the hub, an earlier decision there, or the hub's own
-rule answers what a transaction was (`lib/finance-classify.js` rules 1b and
-11). The review never asks what the books, the leases or an earlier answer
-already settle, so a question that reaches you is one those leave open, or one
-the user has already answered:
+1. **Find out — memory and the records first.** Most answers are already
+   known. Look in this order: the wiki / memory (`bin/wiki search "<name or
+   number>"`: people pages say whose account ••2255 is, who Aki is, which
+   contractor works at which property), the rental books (`lib/rental-ledger.js`:
+   `billing-deposits` + `whereabouts`, `billing-payouts`, leases,
+   `financial-transactions` categories and links), earlier answers
+   (`finance-facts list txn`, `finance-names list`), the recurring tracker, the
+   bank rows themselves (the full `name` of a row says more than the packet:
+   a wire's `ORIG:` sender, a Zelle memo), Gmail (`gog gmail search`: a bank or
+   transfer confirmation names the account at the other end), Stripe through the
+   read-only key. Groups can run in parallel as subagents (deposits,
+   transactions and names, cards/recurring): this same model, so bank data
+   stays jori-model-only. Never send rows to any other model or service.
+2. **Repair what is safe and certain**, from a record that says it:
+   - a payee or payer in bank words → `bin/finance-names payee "<text in the
+     bank line>" "<plain name>" --why "<the record>"` (a one-off:
+     `finance-facts txn <id> --kind … --note "<plain name>"`, ≤ 60 characters);
+   - an account Plaid does not see → `bin/finance-names account <last4> "<whose>" --why …`;
+   - a transfer that went to an account of the user's own (it was counted as a
+     payment) → `bin/finance-names own "<text>" --why …`;
+   - what a transaction was → `finance-facts txn …`; re-run a stale sync or
+     reconcile.
+   Two plausible readings is not a fact: leave it for the user (Step 4).
+   **Never** move money, pay, refund, change a lease, write to the hub, or
+   email anyone but the user.
+3. **Otherwise, the one concrete action** for the attention item: the amount,
+   from which account to which, the page in the hub. Not "look into it".
 
-**First, the user's earlier answers.** A question the user answered in the
-Questions tab is never asked again (Step 5 lists it under `answered_before`
-instead). When the packet still asks one, the answer was closed
-without being recorded in a form the packet reads. Run Step 5's command with
-`--earlier` in place of its `--notes` file: it sends nothing and prints each
-such question with the user's reply. Record each reply per
-§ Recording facts (quote it, with its date). A reply that cannot be recorded
-here (an answer that is a change in the hub) is left alone: the email counts
-it on its own line and it is not asked again.
-
-For each item, in priority order:
-
-1. **Find out.** Read the records that would settle it: the hub (rental books
-   via `lib/rental-ledger.js`: `billing-deposits` + `whereabouts`,
-   `billing-payouts`, `billing-invoices`, leases, `financial-transactions`
-   links), the bank rows (`plaid_transactions`), Stripe through the read-only
-   key, the rental ledger, the recurring-expense tracker, Gmail receipts
-   (`gog gmail`), earlier `fin_txn_override` verdicts on the same descriptor,
-   and the hub's daily sync log (named in the instance's additions).
-   Many items can run in parallel: launch one subagent per group (deposits,
-   transactions, cards/recurring) with the packet and these sources; they are
-   this same model, so the bank data stays jori-model-only. Never send rows to
-   any other model or service.
-2. **Repair what is safe and certain.** Re-run a stale sync or reconcile
-   (the hub's daily sync named in the instance's additions,
-   `finance-deposits-reconcile`, `finance-invoices-reconcile`); record a fact
-   a record names (`finance-facts txn … --note "<the record: id, source,
-   date>"`). A fact needs a record that says it: a Stripe payout id, an
-   invoice, a receipt, the hub's own link. Two plausible readings is not a
-   fact; leave it for the user. **Never** move money, pay, refund, change a
-   lease, write to the hub, or email anyone but the user.
-3. **Otherwise, write the admin's to-do.** One concrete instruction: the
-   amount, from which account to which, the page and button in the hub, the
-   reply that answers it. Not "look into it".
-
-Then rebuild (Step 1 again) so repaired items drop out, and write
+Rebuild (Step 0) so repaired items drop out, and write
 `/tmp/finance-review-resolve.json` against the REBUILT packet's ids:
 
 ```json
-{"attention": {"a3": {"checked": "bank rows on ••2222 and ••1111 since the deposit arrived; the hub's trail for it", "fixed": "", "action": "Move $1,600.00 from 40 Birch ••2222 to Security Deposits ••1111, then link that transfer to the tenant's deposit in the hub (Financials → Security deposits)."}},
- "questions": {"txn:abc…": {"tried": "hub payouts, Stripe, Gmail: none name it", "todo": "Reply with what it was."}}}
+{"attention": {"a3": {"checked": "bank rows on ••2222 and ••1111 since the deposit arrived; the hub's trail for it", "fixed": "", "action": "Move $1,600.00 from 40 Birch ••2222 to Security Deposits ••1111."}},
+ "questions": {"txn:abc…": {"tried": "hub payouts, Stripe, Gmail, the wiki: none name it", "todo": "Reply with what it was."}}}
 ```
 
-`checked` names sources, not conclusions; `fixed` names what was run or
-recorded; `action` is the instruction. Compose shows them labelled under each
-flag (Fixed / Checked / To do) and lists every `action` in **To do this week**
-at the top; the flag's own text is never changed. An item with nothing to
-add gets no entry. A flag marked `optional` (an undecided subscription
-renewal) keeps the packet's action — "Cancel before <date> if you don't
-want it to renew; otherwise nothing to do" — and stays off the to-do list:
-a renewal needs nothing unless the user wants it gone. Do not write one.
+`checked` names sources, not conclusions; `fixed` names what was recorded;
+`action` is the instruction. A flag marked `optional` (a subscription renewal:
+"cancel if you don't want it") keeps the packet's action; do not write one.
 
-## Step 2 — Write the summary (optional, verified)
-
-**Skip this step.** Since 2026-11-08 the email shows no summary: every item
-appears once, in "Worth your attention", and a summary can only restate one
-(the user: "it should be in one location, and one location only"). Compose
-still accepts `--summary` and verifies it, but the renderer does not print it.
-
-Read `facts[]` in the packet (`id` + `text`; the `a…` ids are the attention
-flags in priority order). Write **at most 3 sentences** about what matters most
-this week, as JSON:
-
-```json
-{"sentences": [
-  {"text": "<sentence>", "facts": ["a1"]},
-  {"text": "<sentence>", "facts": ["a2", "deposits"]}
-]}
-```
-
-Rules the verifier enforces — a sentence that breaks any of them drops the
-WHOLE summary:
-
-- Every sentence cites the fact id(s) it restates.
-- Every number in it appears in a cited fact, written the same way.
-- Every word in it appears in a cited fact, apart from connectives (and, also,
-  this week, worth a look…). So: no "autopay" unless the fact says autopay, no
-  "normal", "usually", "likely", "because", "should", no explanation of why.
-  **Restate; do not interpret.**
-
-Write it to `/tmp/finance-review-summary.json`. If nothing is worth
-summarising, skip this step.
-
-## Step 3 — Compose (render + verify + record)
+## Step 3 — Compose, then check before anything is sent (max 3 rounds)
 
 ```bash
 node bin/finance-review-compose --packet /tmp/finance-review-packet.json \
-  --summary /tmp/finance-review-summary.json --resolve /tmp/finance-review-resolve.json \
-  --out /tmp/finance-review.html \
-  > /tmp/finance-review-compose.json
-cat /tmp/finance-review-compose.json
+  --resolve /tmp/finance-review-resolve.json --out /tmp/finance-review.html > /tmp/finance-review-compose.json
+# Bash tool timeout 600000: the independent read runs on Opus.
+node bin/finance-review-check --packet /tmp/finance-review-packet.json --html /tmp/finance-review.html \
+  --out /tmp/finance-review-check.json
 ```
 
-It prints `run_id`, `subject`, `pointer`, `summary_used` and `problems`. If
-`summary_used` is false, do NOT retry with a reworded summary — send what was
-rendered. (Problems are stored on the run for review.)
+`confirmed` is true when no high or medium finding remains and the
+independent read ran. Code checks: bank wording shown as a name, breakdowns
+that do not add up, a deposit whose whereabouts are unknown, an "act on" item
+with no action, the same action twice, an email Gmail would clip. The
+independent read (Opus, on the Max session, no tools) reads the email as the
+user will and names what is unclear, inconsistent, repeated, noise, or
+answerable from the records.
 
-## Step 4 — Deliver (long-form delivery rule)
+For each finding: fix it the Step 2 way (a name, a fact, an action), rebuild
+(Step 0), compose and check again — up to 3 rounds. What only the user can
+settle becomes a question (Step 4). A code defect (`does-not-add-up`,
+`too-long`) cannot be fixed here: put it in your final output so it reaches
+`--channel improvements`, and send. The independent read `unavailable` twice:
+send on the code checks, and say so in your final output.
 
-Per `agent/ops-agent/CLAUDE.md § Long-form delivery rule`:
+## Step 4 — Ask before sending; the email waits for the answers
 
-**One command**: it sends the HTML
-email, finds it in Gmail by exact subject (bounded wait), labels `personal` +
-**star** + mark read (never `p1`, no re-notify), verifies it is still in the
-INBOX, then sends the phone pointer and the APNs push. Do not hand-run
-`email-send`, `gmail-action`, `jori-send-curl` or `jori-notify` here.
+```bash
+node bin/finance-review-ask --packet /tmp/finance-review-packet.json --notes /tmp/finance-review-resolve.json
+node bin/finance-review-gate hold --week "$WEEK"      # only when the ask above sent a question
+node bin/finance-review-gate check --week "$WEEK"     # exit 0 = send now (Step 5), exit 3 = hold
+```
+
+Ask only what Steps 1–3 could not settle, one concrete question each, offering
+the likeliest answer. The questions go to the Questions tab (no push, intent
+`plaid-finance-review:question`); one still open and asked in the last 6 days
+is not asked again; one the user already answered is never asked again.
+
+- **Exit 3 (hold):** stop without sending. Final output: "held for the user's
+  answers until <hold_until>". `finance-review-gate sweep` (every 30 min)
+  starts a fresh run as soon as every question is answered, or when the window
+  closes (3 hours; asked before 8am, not before 11am).
+- **Exit 0:** Step 5. A question still open when the window closed stays in the
+  Questions tab; the email counts it.
+
+## Step 5 — Deliver (long-form delivery rule)
+
+Per `agent/ops-agent/CLAUDE.md § Long-form delivery rule` — **one command**: it
+sends the HTML email, labels it `personal` + **star** + read, verifies it is in
+the INBOX, then sends the phone pointer and the push.
 
 ```bash
 C=/tmp/finance-review-compose.json
@@ -181,48 +191,28 @@ C=/tmp/finance-review-compose.json
   --body-file /tmp/finance-review.html \
   --intent plaid-finance-review \
   --pointer "$(jq -r .pointer "$C")" \
-  --push '<subject-line summary>'
+  --push 'Weekly finance review is ready'
 RC=$?
-[ $RC -ne 1 ] && node bin/finance-review-compose --mark-sent "$(jq -r .run_id "$C")"
+[ $RC -ne 1 ] && node bin/finance-review-compose --mark-sent "$(jq -r .run_id "$C")" && node bin/finance-review-gate sent --week "$WEEK"
 ```
 
 - **Body:** the file exactly as rendered; never edit it.
-- **Pointer: the `pointer` string from compose, verbatim** (it is built from the
-  top flag, so it cannot say what the email does not). Read it straight out of
-  the JSON as above — never retype it into a double-quoted argument. **A dollar
-  amount in a double-quoted bash literal is a shell variable:** `"... $5,260 ..."`
-  expands `$5` to nothing and sends *"...,260"*. A
-  `$(jq …)` substitution's output is not re-expanded. Same for the push: single
-  quotes, or a `$(cat <<'X' … X)` heredoc if it carries a figure.
-- **The intent is what keeps bank rows out of `outbound-precheck`'s reasoning
-  and its log file** (`agent/CLAUDE.md` § Financial Operations, rule 5) —
-  the exemption is keyed on it, and `plaid-*` is on the allowlist.
-- Exit 1 = the email did not send and nothing else ran: stop (see below), do not
-  mark sent. Exit 2 = sent but unlabeled (pointer + push still went) — note it.
+- **Pointer: the `pointer` string from compose, verbatim**, read straight out
+  of the JSON as above. **A dollar amount in a double-quoted bash literal is a
+  shell variable** (`"$5,260"` sends ",260"); single quotes or `$(jq …)`.
+- **The intent keeps bank rows out of `outbound-precheck`'s reasoning and log**
+  (`agent/CLAUDE.md` § Financial Operations, rule 5).
+- Exit 1 = the email did not send: stop, do not mark sent. Exit 2 = sent but
+  unlabeled — note it.
 
-## Step 5 — Ask the open questions (Questions tab)
-
-Only after Step 4 did not exit 1:
-
-```bash
-node bin/finance-review-ask --packet /tmp/finance-review-packet.json --notes /tmp/finance-review-resolve.json
-```
-
-Only questions Step 1b could not settle are still in the packet; each row
-carries what was already checked and what to do.
-
-One Questions-tab row per packet question, no push, intent
-`plaid-finance-review:question` (jori-model-only). A question still open and
-asked in the last 6 days is not asked again; an open one the packet no longer
-asks is retired; one the user already answered is never asked again (Step 1b
-records its reply). The user asked for this (2026-11-08): *"ask me the questions
-from the weekly finance review in the questions channel - not in the email"*.
-
-Do not email anyone but the user. Do not create tasks. The review is informational
-+ awareness; any action stays the user's. If the send fails (exit 1), stop — never fall
-back to an external channel for financial data.
+Do not email anyone but the user. Do not create tasks. If the send fails,
+never fall back to an external channel for financial data.
 
 ## Recording facts (the user, or you when the user answers a question in chat or the Questions tab)
+
+**Names.** When the answer is a name — whose account ••1815 is, what a payee
+is — record it with `bin/finance-names` (account / payee / own; usage in its
+header), not as a one-off note, so every later review shows it.
 
 A Questions-tab row from this review ends with `(finance review · fin-…)`.
 When the user replies to one: `finance-review-ask --list` names the packet

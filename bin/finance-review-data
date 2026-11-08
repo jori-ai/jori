@@ -237,7 +237,7 @@ async function main() {
   const known = new Map();
   for (const t of posted.filter((t) => Number(t.amount) > 0)) {
     const bill = trackedFor(t);
-    if (bill && BILL_KINDS.has(bill.kind)) known.set(t.transaction_id, { kind: bill.kind === "tax" ? "tax" : "expense", rule: "recurring_tracker", note: `${bill.name} (${FR.recurring_label})` });
+    if (bill && BILL_KINDS.has(bill.kind)) known.set(t.transaction_id, { kind: bill.kind === "tax" ? "tax" : "expense", rule: "recurring_tracker", note: `${bill.name} (${FR.recurring_label})`, name: bill.name });
   }
   // A tracked bill already paid this cycle: a matching charge from 45 days
   // before its expected date until today.
@@ -260,7 +260,7 @@ async function main() {
   // county tax a person filed under taxes, the landscaper a person filed under
   // repairs. The books' own guesses are not read.
   const bookCategories = reg ? ledger.answeredCategoriesForBankRows({ ledgerRows: ledgerTxns, registry: reg }) : new Map();
-  const cls = classify(posted, accounts, { overrides, expectedIncome, bookVerdicts, bookCategories, bookCategoryKinds: RF.book_category_kinds || {}, depositAccountIds, largeOutflow: map.large_outflow_usd || LARGE_OUTFLOW, known, taxPayeePhrases: FR.tax_payee_phrases, taxProperties: FR.tax_property_rules });
+  const cls = classify(posted, accounts, { overrides, expectedIncome, bookVerdicts, bookCategories, bookCategoryKinds: RF.book_category_kinds || {}, depositAccountIds, largeOutflow: map.large_outflow_usd || LARGE_OUTFLOW, known, ownInstitutions: [...new Set((accounts || []).map((a) => a.institution_name).filter(Boolean))], ownTransferPhrases: map.own_transfer_phrases || [], taxPayeePhrases: FR.tax_payee_phrases, taxProperties: FR.tax_property_rules });
   const kindOf = (t) => cls.get(t.transaction_id)?.kind;
   const out = (t) => Number(t.amount) > 0;
   const amt = (t) => Math.abs(Number(t.amount));
@@ -279,6 +279,7 @@ async function main() {
   const flow = {
     income_in: kindTotal(wk, "income", "in"),
     deposits_in: kindTotal(wk, "deposit_in", "in"),
+    deposits_out: kindTotal(wk, "deposit_refund", "out"),
     unexplained_in: kindTotal(wk, "inflow_unexplained", "in"),
     from_your_other_accounts: kindTotal(wk, "transfer_external", "in"),
     spending: round2(sum(wk.filter(isSpend), amt)),
@@ -298,11 +299,31 @@ async function main() {
   const institutions = [...new Set((accounts || []).map((a) => a.institution_name).filter(Boolean))].map((name) => ({ name, key: norm(name) }));
   const institutionOf = (t) => acct(t.account_id).institution_name || "bank";
   const titleish = (x) => String(x || "").trim().toLowerCase().replace(/(^|[\s(\-])([a-z])/g, (m, a, c) => a + c.toUpperCase()).replace(/\bB\.m\./i, "B.M.");
+  const postedById = new Map(posted.map((x) => [x.transaction_id, x]));
   const describe = (t) => {
     const v = cls.get(t.transaction_id) || {};
     if (v.expected_income_id && streamLabel.has(v.expected_income_id)) return streamLabel.get(v.expected_income_id);
     // The user's own words for it (finance-facts txn --note), when short enough to be a name.
     if (v.rule === "override" && v.note && String(v.note).length <= 60) return String(v.note);
+    // A bill the recurring tracker knows is shown by the tracker's name, not
+    // Plaid's merchant guess ("Miami County Treasurers Office" for a Miami-Dade bill).
+    const kn = known.get(t.transaction_id);
+    if (kn?.name) return kn.name;
+    // A card payment is named by the card it paid: the other leg when both are
+    // linked, else the one linked card at the bank the line names.
+    if (v.kind === "card_payment") {
+      const other = v.pair && postedById.get(v.pair);
+      if (other) return label(other.account_id);
+      const lc = `${t.merchant_name || ""} ${t.name || ""}`.toLowerCase();
+      const cards = credits.filter((c) => c.institution_name && lc.includes(norm(c.institution_name).split(" ")[0]));
+      if (cards.length === 1) return label(cards[0].account_id);
+      if (cards.length > 1) return `a ${cards[0].institution_name} card`;
+    }
+    // A payee the user (or the review, from a record) has named: account map
+    // `payee_names` {"<text in the bank line>": "<plain name>"}, longest match wins.
+    const lineLc = `${t.merchant_name || ""} ${t.name || ""}`.toLowerCase();
+    const named = Object.entries(map.payee_names || {}).filter(([k]) => k && lineLc.includes(String(k).toLowerCase())).sort((a, b) => b[0].length - a[0].length)[0];
+    if (named) return named[1];
     const names = (v.tenants || []).map((x) => (typeof x === "string" ? x : x?.name)).filter(Boolean);
     if (names.length) return `${v.kind === "deposit_in" ? "Deposit" : "Rent"} — ${names.join(", ")}${v.period ? ` (${v.period})` : ""}`;
     // A bank ACH line ("PAYER DES:Rent-cr ID:123 INDN:…") is named by its payer
@@ -361,6 +382,7 @@ async function main() {
   const flowRows = {
     income_in: wk.filter((t) => !out(t) && kindOf(t) === "income"),
     deposits_in: wk.filter((t) => !out(t) && kindOf(t) === "deposit_in"),
+    deposits_out: wk.filter((t) => out(t) && kindOf(t) === "deposit_refund"),
     unexplained_in: wk.filter((t) => !out(t) && kindOf(t) === "inflow_unexplained"),
     from_your_other_accounts: wk.filter((t) => !out(t) && kindOf(t) === "transfer_external"),
     refunds: wk.filter((t) => !out(t) && kindOf(t) === "refund"),
@@ -545,7 +567,10 @@ async function main() {
   const deposits = dep.section;
 
   // ── 7. SPENDING (classified spend only) ─────────────────────────────────
-  const catTotals = (rows) => rows.filter(isSpend).reduce((m, t) => { const c = t.category_primary || "OTHER"; m[c] = (m[c] || 0) + amt(t); return m; }, {});
+  // A payment to a person and a cash withdrawal carry Plaid's "transfer out":
+  // name them for what they are.
+  const catOf = (t) => (kindOf(t) === "cash_withdrawal" ? "CASH_WITHDRAWALS" : cls.get(t.transaction_id)?.rule === "payment_to_other" ? "PAYMENTS_TO_PEOPLE_AND_CONTRACTORS" : t.category_primary || "OTHER");
+  const catTotals = (rows) => rows.filter(isSpend).reduce((m, t) => { const c = catOf(t); m[c] = (m[c] || 0) + amt(t); return m; }, {});
   const cw = catTotals(wk), cp = catTotals(wkPrev), c90 = catTotals(posted.filter((t) => t.date > d90));
   const byCategory = Object.entries(cw).map(([c, v]) => ({
     category: c.replace(/_/g, " ").toLowerCase(), this_week_fmt: usd0(v), prior_week_fmt: usd0(cp[c] || 0),
@@ -554,7 +579,7 @@ async function main() {
   const byAccount = Object.entries(wk.filter(isSpend).reduce((m, t) => { const k = label(t.account_id); m[k] = (m[k] || 0) + amt(t); return m; }, {}))
     .sort((a, b) => b[1] - a[1]).map(([account, v]) => ({ account, total_fmt: usd0(v) }));
   const largest = wk.filter(isSpend).sort((a, b) => amt(b) - amt(a)).slice(0, 8)
-    .map((t) => ({ date_fmt: fmtD(t.date), who: who(t), amount_fmt: usd(amt(t)), account: label(t.account_id), explained: known.get(t.transaction_id)?.note || (cls.get(t.transaction_id)?.rule === "books_category" ? `filed under ${(cls.get(t.transaction_id).categories || []).join(", ")} in the ${FR.ledger_label}` : null) }));
+    .map((t) => ({ date_fmt: fmtD(t.date), who: describe(t), amount_fmt: usd(amt(t)), account: label(t.account_id), explained: known.get(t.transaction_id)?.note || (cls.get(t.transaction_id)?.rule === "books_category" ? `filed under ${(cls.get(t.transaction_id).categories || []).join(", ")} in the ${FR.ledger_label}` : null) }));
   const spendPrev = round2(sum(wkPrev.filter(isSpend), amt));
 
   // ── 8. CARDS ────────────────────────────────────────────────────────────

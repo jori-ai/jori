@@ -384,3 +384,21 @@ test("a stream registered by hand for money the books already name is redundant;
   assert.deepEqual([...streamsCoveredByBooks(c)], ["oak-rent"]);
   assert.deepEqual([...streamsCoveredByBooks(classify(posted, banks, { expectedIncome: exp }))], [], "no books, nothing redundant");
 });
+
+test("an outgoing transfer to another person is spending; to one's own account it stays a transfer; out of the deposit account it is a deposit refund; at an ATM it is cash", () => {
+  const c = classify([
+    t("zelle", "chk", 335, "2026-11-04", { name: "Zelle payment to EDY'S SERVICE CORP for \"cleaning\"", pri: "TRANSFER_OUT" }),
+    t("payroll", "biz", 6749.28, "2026-11-04", { name: "GUSTO DES:NET", pri: "TRANSFER_OUT" }),
+    t("own", "chk", 3000, "2026-11-03", { name: "Online Banking transfer to CHK 2255 Confirmation# 1", pri: "TRANSFER_OUT" }),
+    t("bank", "sav", 15000, "2026-10-03", { name: "TRANSFER A AND B:JP Morgan Chase Confirmation# 2", pri: "TRANSFER_OUT" }),
+    t("dep", "dep", 1600, "2026-10-26", { name: "Zelle payment to TENANT for \"Deposit refund\"", pri: "TRANSFER_OUT" }),
+    t("atm", "chk", 135, "2026-10-21", { name: "5C002II6 10/21 # WITHDRWL LEUMI CARD ATM", pri: "TRANSFER_OUT" }),
+  ], accounts, { depositAccountIds: ["dep"], ownInstitutions: ["Chase"] });
+  assert.equal(c.get("zelle").kind, "expense");
+  assert.equal(c.get("zelle").rule, "payment_to_other");
+  assert.equal(c.get("payroll").kind, "expense");
+  assert.equal(c.get("own").kind, "transfer_external");
+  assert.equal(c.get("bank").kind, "transfer_external");
+  assert.equal(c.get("dep").kind, "deposit_refund");
+  assert.equal(c.get("atm").kind, "cash_withdrawal");
+});
