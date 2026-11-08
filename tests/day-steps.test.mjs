@@ -327,3 +327,34 @@ test("a walk with a leg under it is left to the leg's rule, and JORI_STEPS_ALIGN
   annotateDaySteps(withLeg, hopSteps(), null, { startMs: at(0), endMs: at(24) });
   assert.equal(withLeg.stops[1].start_ts_ms, at(7, 52), "a leg of another mode under the walk: not a bare hop");
 });
+
+// 2026-11-07: a market browsed on foot. The steps ran on until 10:17 and the stop's start
+// was moved there, after four photos taken at its stalls from 10:10.
+test("a stop's edge is not moved past a photo taken at the stop", () => {
+  const photo = (ms) => ({ uuid: `p${ms}`, ts: iso(ms) });
+  const hop = hopDay();
+  hop.stops[1].photos = [photo(at(7, 58))];
+  annotateDaySteps(hop, hopSteps(), null, { startMs: at(0), endMs: at(24) });
+  assert.equal(hop.stops[1].start_ts_ms, at(7, 52), "a photo at 7:58 keeps the start before the walk's end at 8:04");
+  const after = hopDay();
+  after.stops[1].photos = [photo(at(8, 10))];
+  annotateDaySteps(after, hopSteps(), null, { startMs: at(0), endMs: at(24) });
+  assert.equal(after.stops[1].start_ts_ms, at(8, 4), "a photo after the walk's end does not stop the move");
+  // the same for the stop a walking leg reaches
+  const d = {
+    date: "2026-03-02", tz: day().tz,
+    stops: [
+      { id: "h", start: "00:00", end: "17:36", start_ts_ms: at(0), end_ts_ms: at(17, 36), duration_min: 1056, place: { name: "Home" } },
+      { id: "v", start: "17:50", end: "19:45", start_ts_ms: at(17, 50), end_ts_ms: at(19, 45), duration_min: 115, place: { name: "Venue" }, photos: [photo(at(17, 52))] },
+    ],
+    travel_legs: [{ from: "h", to: "v", duration_min: 14 }],
+    path: { spine: [
+      { type: "dwell", id: "d0", start_ms: at(0), end_ms: at(17, 36), start: "00:00", end: "17:36", mins: 1056, place: { name: "Home" } },
+      { type: "leg", id: "l0", mode: "walking", median_kmh: 4.2, start_ms: at(17, 36), end_ms: at(17, 45), mins: 9, routed_m: 2300, walked_m: 2300, geometry: "map_matched", fixes: 3 },
+      { type: "dwell", id: "d1", start_ms: at(17, 50), end_ms: at(19, 45), start: "17:50", end: "19:45", mins: 115, place: { name: "Venue" } },
+    ] },
+  };
+  annotateDaySteps(d, [...readings(at(17, 27), at(17, 57), 95)], null, { startMs: at(0), endMs: at(24) });
+  assert.equal(d.stops[1].start_ts_ms, at(17, 50), "the venue's 17:52 photo keeps its start");
+  assert.equal(d.stops[0].end_ts_ms, at(17, 27), "the home stop, with no photo after, still ends at the first stride");
+});
