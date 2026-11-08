@@ -77,7 +77,7 @@ test("a file that already held a bundle (a fixture) may keep one", () => {
 const CHANGELOG = K("system/changelog.md"), CODE = K("system/code.mjs");
 function sandboxRepo() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "si-bundle-"));
-  for (const rel of ["bin/self-improve-bundle", "lib/self-improve-content-check.mjs", "lib/root.cjs"]) {
+  for (const rel of ["bin/self-improve-bundle", "lib/self-improve-content-check.mjs", "lib/root.cjs", "lib/overlay.cjs"]) {
     fs.mkdirSync(path.join(dir, path.dirname(K(rel))), { recursive: true });
     fs.copyFileSync(path.join(KERNEL, rel), path.join(dir, K(rel)));
   }
@@ -91,6 +91,7 @@ function sandboxRepo() {
   const out = fs.mkdtempSync(path.join(os.tmpdir(), "si-bundle-out-"));
   const env = { ...process.env };
   delete env.JORI_HOME;   // never the caller's installation
+  delete env.JORI_OVERLAY_GIT_DIR;   // nor its overlay: the sandbox's own <dir>/.overlay.git, if a test makes one
   return { dir, out, rev: execFileSync("git", ["rev-parse", "HEAD"], { cwd: dir, encoding: "utf8" }).trim(),
     run: (...args) => spawnSync(process.execPath, [path.join(dir, K("bin/self-improve-bundle")), ...args], { cwd: dir, encoding: "utf8", env }),
     cleanup: () => { fs.rmSync(dir, { recursive: true, force: true }); fs.rmSync(out, { recursive: true, force: true }); } };
@@ -136,4 +137,70 @@ test("bundle CLI: --out inside the repo, or equal to an input, is refused", (t) 
   const self = s.run("--out", path.join(s.dir, CHANGELOG), CHANGELOG);
   assert.equal(self.status, 64);
   assert.equal(fs.readFileSync(path.join(s.dir, CHANGELOG), "utf8"), lines(2023));
+});
+
+// Overlay files (lib/overlay.cjs): an install's private files live in a second
+// repository whose git dir is <root>/.overlay.git and whose work tree is the
+// install, so the kernel repo has no committed version of them. The bundle reads
+// theirs from the overlay's HEAD. Guards the landing refusal
+// "<path> did not exist when this fix was written, and it does now" (exit 7 from
+// self-improve-auto-apply) that every fix to an overlay file used to hit.
+const OVERLAY_FILE = K("agent/local/config/x.json");
+function withOverlay(s, content) {
+  const gd = path.join(s.dir, ".overlay.git");
+  const ov = (...a) => execFileSync("git", ["--git-dir", gd, "--work-tree", s.dir, "-c", "user.email=t@t", "-c", "user.name=t", ...a], { cwd: s.dir, stdio: "ignore" });
+  execFileSync("git", ["init", "-q", "--bare", gd], { stdio: "ignore" });
+  ov("config", "core.bare", "false");
+  ov("config", "status.showUntrackedFiles", "no");
+  fs.mkdirSync(path.join(s.dir, path.dirname(OVERLAY_FILE)), { recursive: true });
+  fs.writeFileSync(path.join(s.dir, OVERLAY_FILE), content);
+  ov("add", "--", OVERLAY_FILE);
+  ov("commit", "-q", "-m", "overlay base");
+  // The kernel repo does not track it: its only committed version is the overlay's.
+  assert.equal(execFileSync("git", ["ls-files", "--", OVERLAY_FILE], { cwd: s.dir, encoding: "utf8" }), "");
+}
+
+test("bundle CLI: an overlay-tracked file's base_sha256 is the overlay's committed version", (t) => {
+  const s = sandboxRepo(); t.after(s.cleanup);
+  const committed = JSON.stringify({ a: 1 }, null, 2) + "\n";
+  withOverlay(s, committed);
+  fs.writeFileSync(path.join(s.dir, OVERLAY_FILE), JSON.stringify({ a: 2 }, null, 2) + "\n");
+  fs.writeFileSync(path.join(s.dir, CODE), "export const a = 2;\n");
+  const out = path.join(s.out, "b.json");
+  const r = s.run("--out", out, "--base-rev", s.rev, OVERLAY_FILE, CODE);
+  assert.equal(r.status, 0, r.stderr);
+  const item = JSON.parse(fs.readFileSync(out, "utf8"));
+  assert.equal(item.files[OVERLAY_FILE], JSON.stringify({ a: 2 }, null, 2) + "\n");
+  assert.equal(item.base_sha256[OVERLAY_FILE], createHash("sha256").update(committed).digest("hex"));
+  // A kernel file in the same bundle still takes its base from the kernel commit.
+  assert.equal(item.base_sha256[CODE], createHash("sha256").update("export const a = 1;\n").digest("hex"));
+});
+
+test("bundle CLI: a truncated overlay file is refused like a kernel file", (t) => {
+  const s = sandboxRepo(); t.after(s.cleanup);
+  withOverlay(s, lines(1000));
+  fs.writeFileSync(path.join(s.dir, OVERLAY_FILE), lines(5));
+  const out = path.join(s.out, "b.json");
+  const r = s.run("--out", out, "--base-rev", s.rev, OVERLAY_FILE);
+  assert.equal(r.status, 65, r.stderr);
+  assert.ok(r.stderr.includes(`${OVERLAY_FILE}: would go from 1001 lines to 6`), r.stderr);
+  assert.equal(fs.existsSync(out), false);
+  // Declared, it passes, and still carries the overlay base.
+  const ok = s.run("--out", out, "--base-rev", s.rev, "--allow-shrink", OVERLAY_FILE, OVERLAY_FILE);
+  assert.equal(ok.status, 0, ok.stderr);
+  assert.equal(JSON.parse(fs.readFileSync(out, "utf8")).base_sha256[OVERLAY_FILE], createHash("sha256").update(lines(1000)).digest("hex"));
+});
+
+test("bundle CLI: a file neither repo tracks is new, with or without an overlay", (t) => {
+  for (const overlay of [false, true]) {
+    const s = sandboxRepo(); t.after(s.cleanup);
+    if (overlay) withOverlay(s, "{}\n");
+    const rel = K("agent/local/config/new.json");
+    fs.mkdirSync(path.join(s.dir, path.dirname(rel)), { recursive: true });
+    fs.writeFileSync(path.join(s.dir, rel), "{\"fresh\": true}\n");
+    const out = path.join(s.out, "b.json");
+    const r = s.run("--out", out, "--base-rev", s.rev, rel);
+    assert.equal(r.status, 0, r.stderr);
+    assert.deepEqual(JSON.parse(fs.readFileSync(out, "utf8")).base_sha256, {}, `overlay=${overlay}`);
+  }
 });

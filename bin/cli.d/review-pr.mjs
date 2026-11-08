@@ -42,7 +42,7 @@ Content that, without using any of the above explicit identifiers, still:
 
 2. **Specific financial or transactional detail** — concrete dollar amounts, contract terms, or transaction details that appear personal rather than illustrative.
    Examples: "the $42,300 settlement", "a monthly retainer of $4,250", "the 18% commission on the X deal".
-   NOT this: arbitrary numbers in code (port 9090, timeout 5000), illustrative pricing in docs ("$10/month for Pro plan").
+   NOT this: arbitrary numbers in code (port 8080, timeout 5000), illustrative pricing in docs ("$10/month for Pro plan").
 
 3. **Specific dated events** — a date paired with a concrete event that reads as a real autobiographical reference, not a generic example.
    Examples: "the launch on March 15, 2026", "after the merger in Q3", "since my surgery last spring".
@@ -122,7 +122,7 @@ export const SCHEMA = {
 const DEFAULT_MODEL = "claude-haiku-4-5";
 const MAX_DIFF_BYTES = 80 * 1024; // ~20k tokens — cost cap per call
 // $/1M tokens [input, output] for the cost estimate; other models fall back to the default's.
-const PRICES = { "claude-haiku-4-5": [1, 5], "claude-haiku-5-5": [0.1, 0.5], "claude-sonnet-5-5": [2, 10], "claude-opus-5-5": [4, 20] };
+const PRICES = { "claude-haiku-4-5": [1, 5], "claude-haiku-5-5": [0.1, 0.5], "claude-sonnet-5-5": [2, 10], "claude-opus-5-5": [4, 20] }; // control-scan-ok: a price per model id, not a model choice
 const SKIP_PATHS = [
   /(^|\/)package-lock\.json$/, /(^|\/)yarn\.lock$/, /(^|\/)pnpm-lock\.yaml$/, /(^|\/)Gemfile\.lock$/,
   /\.gitkeep$/, /(^|\/)node_modules\//,

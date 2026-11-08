@@ -83,7 +83,7 @@ Write commands (revisions tracked, file render gated by MEMORY_DB_AUTHORITATIVE)
   history <id> [--json]           List revisions
   show-rev <id> <rev>             Print a specific revision's raw_md
   pinned [--ids]                  Emit pinned subset (for SessionStart hook)
-  serve [--port N] [--host H]     Localhost HTTP browser (default :9096)
+  serve [--port N] [--host H]     Localhost HTTP browser (default :${registryPort("wiki")})
 
 Storage:
   DB         : ${ws.DB_PATH}

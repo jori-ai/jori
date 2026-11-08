@@ -42,6 +42,7 @@ import { participantMatch, participantIds } from "../lib/meeting-call.mjs";
 import { callContent } from "../lib/zoom-content.mjs";
 import { editPrompt, validateEdit, applyEdit, cleanLabels, cleanPriority, openItems } from "../lib/meeting-notes-update.mjs";
 import { meeting, meetings, statePath, notesPath, backupsDir, installPath } from "../lib/meetings.mjs";
+import { callVocabulary } from "../lib/call-vocabulary.mjs";
 
 const require = createRequire(import.meta.url);
 const { installTools } = require("../lib/root.cjs");
@@ -78,6 +79,21 @@ async function counterpartInstances(client, m, slotMs) {
     out.push({ uuid: x.uuid, start_ms: joins.length ? Math.min(...joins) : t, end_ms: leaves.length ? Math.max(...leaves) : t });
   }
   return out.sort((a, b) => a.start_ms - b.start_ms);
+}
+
+/**
+ * Names the call may mention, so the model can fix Zoom's mishearings of them
+ * (lib/call-vocabulary.mjs): the meeting's configured `vocabulary`, then the
+ * wiki around the counterpart (their page by `wiki_id` or exact title, the
+ * person pages linked to it, people on recent day pages that link it).
+ */
+function vocabularyFor(m) {
+  let ws = null;
+  try { ws = require("../lib/wiki-store.js"); } catch {}
+  try {
+    return callVocabulary({ config: m.vocabulary, pageIds: [m.wiki_id].filter(Boolean),
+      names: [m.name, ...(m.zoom?.participant?.names || [])], ws });
+  } finally { try { ws && ws.closeDb(); } catch {} }
 }
 
 async function readEdit(prompt, notesText) {
@@ -145,7 +161,7 @@ async function runOne(m) {
         const s = insts[0].start_ms, e = insts[insts.length - 1].end_ms;
         const when = `${clock(s, tz)}-${clock(e, tz)}, ${Math.round((e - s) / 60000)} min`;
         const notesText = fs.readFileSync(NOTES, "utf8");
-        const { tier, edit } = await readEdit(editPrompt({ date: state.date, when, source: content.kind, content: content.text, notesText, name: m.name }), notesText);
+        const { tier, edit } = await readEdit(editPrompt({ date: state.date, when, source: content.kind, content: content.text, notesText, name: m.name, vocabulary: vocabularyFor(m) }), notesText);
         const next = applyEdit(notesText, state.date, edit);
         const labels = cleanLabels(edit, notesText), priority = cleanPriority(edit, notesText);
         if (DRY) {

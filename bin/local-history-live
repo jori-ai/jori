@@ -1,0 +1,311 @@
+#!/usr/bin/env node
+// local-history-live — local-history pings within seconds of the phone's fix.
+//
+// The hum `nearby` lane reached the user a median ~6 minutes after the moment
+// (2026-11-06: the hum-sense refractory, a full hum turn, and location_history
+// that the app uploads in 5-minute batches), so a fact about the church beside
+// them arrived after they had walked a block on. The user: pings should
+// appear "when I'm at the location and not 10 minutes later".
+//
+// So this lane does not go through hum-sense or a hum turn at all:
+//   phone (out of the house) → live_position upsert every ~30 s / ~25 m
+//   → Realtime → this daemon → `once`: free Wikipedia/OSM subjects within
+//   80 m (lib/local-lore.mjs, cell-cached), the same prompt as the hum lane
+//   (lib/local-history-prompt.mjs) on Haiku, the newest position re-checked,
+//   then hum-ping — so the identity ledger, the local-history pool (10/day,
+//   5 min apart), resolve-first and the outbound precheck all still apply.
+// Nothing is queued: a fix with nothing in sight, or one the budget refuses,
+// is dropped, never sent later. Only what the user is actually passing is ever
+// looked up or written, so nothing is prepared for a street they never walk.
+//
+// Usage:
+//   local-history-live daemon                 long-running (launchd ai.claude.local-history-live)
+//   local-history-live once --pos '<json>' [--dry-run]
+//                                             evaluate one position {lat,lon,at,accuracy_m,motion}
+//   local-history-live status                 state + recent outcomes
+//
+// Off switch: touch data/.local-history-live-off (the hum `nearby` lane takes
+// over again within 3 minutes). Log: data/local-history-live.jsonl.
+
+import fs from "node:fs";
+import path from "node:path";
+import crypto from "node:crypto";
+import { execFile, spawnSync } from "node:child_process";
+import { createRequire } from "node:module";
+import { fileURLToPath } from "node:url";
+
+const require = createRequire(import.meta.url);
+if (!process.env.JORI_JOB) process.env.JORI_JOB = "local-history-live";
+require("../lib/load-env.js").loadEnv();
+
+const { installTools } = require("../lib/root.cjs");
+const { instance, supabaseUrl } = require("../lib/instance.cjs");
+const { MODELS } = require("../lib/models.cjs");
+const { textSync } = require("../lib/max-judge.js");
+const { localLore } = await import("../lib/local-lore.mjs");
+const { latestFix, haversineM } = await import("../lib/local-history-ledger.mjs");
+const { checkPingBudget } = await import("../lib/ping-budget.mjs");
+const { buildLocalHistoryPrompt, RELEVANCE_FLOOR } = await import("../lib/local-history-prompt.mjs");
+const { stashMedia } = await import("../lib/ping-media.mjs");
+const { extractJsonObject } = await import("../lib/extract-json.mjs");
+const { userTz, localHour } = await import("../lib/hum-events.mjs");
+const L = await import("../lib/local-history-live.mjs");
+
+const SELF = fileURLToPath(import.meta.url);
+const BIN = installTools("bin");
+const argv = process.argv.slice(2);
+const cmd = argv[0] || "status";
+
+function arg(name) {
+  const i = argv.indexOf(name);
+  return i >= 0 ? argv[i + 1] : undefined;
+}
+
+function out(rec) {
+  process.stdout.write(JSON.stringify(rec) + "\n");
+}
+
+if (cmd === "once") await once();
+else if (cmd === "daemon") await daemon();
+else if (cmd === "status") status();
+else { console.error("usage: local-history-live daemon | once --pos '<json>' [--dry-run] | status"); process.exit(2); }
+
+// ── once: one position → maybe one ping ──────────────────────────────────
+
+async function once() {
+  const t0 = Date.now();
+  let pos;
+  try { pos = JSON.parse(arg("--pos") || ""); } catch { out({ outcome: "error", reason: "--pos must be JSON" }); process.exit(2); }
+  const dry = argv.includes("--dry-run");
+  const lat = Number(pos.lat), lon = Number(pos.lon);
+  const fixMs = Date.parse(pos.at || "") || t0;
+  const base = { at: pos.at, lat, lon, accuracy_m: pos.accuracy_m ?? null, motion: pos.motion || null };
+  const done = (rec) => { out({ ...base, ...rec, total_ms: Date.now() - t0, since_fix_s: Math.round((Date.now() - fixMs) / 1000) }); process.exit(0); };
+
+  // 1. Budget first — free, and most fixes on a busy walk stop here.
+  if (!dry) {
+    let budget = { ok: true };
+    try { budget = checkPingBudget({ pool: "local_history" }); } catch { /* fail open, as hum-ping does */ }
+    if (!budget.ok) done({ outcome: "budget", detail: `${budget.gate}: ${budget.detail}` });
+  }
+
+  // 2. What is within sight that has not been told (free, cached per cell).
+  const tLore = Date.now();
+  let lore;
+  try { lore = localLore(lat, lon, { radiusM: L.LIVE_RADIUS_M }); }
+  catch (e) { done({ outcome: "error", reason: `lore: ${e.message}` }); }
+  const loreMs = Date.now() - tLore;
+  const near = L.withinSight(lore.items);
+  if (!near.length) done({ outcome: "nothing_in_sight", lore_ms: loreMs, told: lore.told.length });
+
+  // 3. Is any of it worth saying? (the model's call, Haiku: seconds matter here)
+  const owner = instance().owner_name;
+  const hour = localHour(userTz());
+  const moving = ["walking", "running", "cycling"].includes(String(pos.motion || ""));
+  const prompt = buildLocalHistoryPrompt({
+    owner: owner && owner !== "the user" ? owner : "The user",
+    hour, moving, items: near.slice(0, 5), radiusM: L.LIVE_RADIUS_M, live: true,
+  });
+
+  const tModel = Date.now();
+  let verdict = null;
+  try {
+    const r = textSync({ model: MODELS.haiku, effort: "low", prompt, timeoutMs: 45000, maxBuffer: 2 * 1024 * 1024, job: "local-history-live" });
+    if (r.error) throw r.error;
+    if (r.status !== 0 || r.isError) throw new Error(`claude exit ${r.status}: ${(r.text || r.stderr || "").slice(0, 160)}`);
+    verdict = extractJsonObject(r.text, { requireKey: "say" });
+  } catch (e) {
+    done({ outcome: "error", reason: `model: ${e.message}`, lore_ms: loreMs, model_ms: Date.now() - tModel });
+  }
+  const modelMs = Date.now() - tModel;
+  const timings = { lore_ms: loreMs, model_ms: modelMs };
+  if (!verdict) done({ outcome: "error", reason: "no JSON from the model", ...timings });
+  if (verdict.say !== true || !verdict.signal) done({ outcome: "nothing_worth_saying", why: String(verdict.why_not || "").slice(0, 160), ...timings });
+  const relevance = Number(verdict.relevance);
+  if (!Number.isFinite(relevance) || relevance < RELEVANCE_FLOOR) {
+    done({ outcome: "below_floor", relevance, signal: String(verdict.signal).slice(0, 120), ...timings });
+  }
+  // Placed by EXACT title against the list code built — never by reading the sentence.
+  const subject = near.find((i) => i.title === verdict.source);
+  if (!subject) done({ outcome: "unplaced", source: String(verdict.source || "").slice(0, 80), ...timings });
+  const signal = String(verdict.signal).slice(0, 400);
+  if (dry) done({ outcome: "dry_run", subject: subject.title, distance_m: subject.distance_m, relevance, signal, ...timings });
+
+  // The map renders while the position is re-checked; it gets 8 s, then the
+  // ping goes without it (the picture still rides along).
+  const mapP = mapFor({ lat, lon }, subject);
+
+  // 4. Still in sight? The newest position, not the one we started from.
+  const fix = await latestFix();
+  if (fix) {
+    const d = haversineM(Number(fix.lat), Number(fix.lon), subject.lat, subject.lon);
+    if (Number.isFinite(d) && d > L.SEND_RADIUS_M) done({ outcome: "walked_away", subject: subject.title, distance_now_m: Math.round(d), ...timings });
+  }
+
+  // 5. Send through hum-ping: ledger, pool, resolve-first, precheck, feedback row.
+  const media = { image_url: subject.image || null, map_url: await withTimeout(mapP, 8000, null), subject: { title: subject.title, lat: subject.lat, lon: subject.lon, ids: subject.ids } };
+  const identity = subject.qid || subject.ids[0] || subject.title;
+  // lang-regex-ok: building a dedup key from an id (QID / page / OSM id) — machine data.
+  const dedupKey = `nearby:${String(identity).toLowerCase().replace(/[^a-z0-9]+/g, "-").slice(0, 60)}`;
+  stashMedia(dedupKey, media);
+  const pingId = newPingId();
+  const finding = {
+    topic: "nearby",
+    signal,
+    urgency: Math.min(0.89, relevance), // below hum-ping's 0.9 carve-out: the pool and dedup always apply
+    freshness_min: 0,
+    dedup_key: dedupKey,
+    supporting_data: {
+      kind: "factoid",
+      budget_pool: "local_history",
+      path: "live",
+      relevance, relevance_floor: RELEVANCE_FLOOR, moving,
+      subject: { title: subject.title, lat: subject.lat, lon: subject.lon, ids: subject.ids, distance_m: subject.distance_m, source: subject.source },
+      harvested_at: { lat, lon, at: new Date().toISOString(), fix_at: pos.at, accuracy_m: pos.accuracy_m ?? null },
+      proximity_m: L.LIVE_RADIUS_M,
+      why_now: String(verdict.why_now || "").slice(0, 300),
+      moment_kind: "live",
+      evidence_as_of: "live",
+      // geo-gate-ok: every subject is within 80 m of the live position, checked
+      // in code here and again against the newest fix before sending.
+      media,
+    },
+  };
+  const tSend = Date.now();
+  const r = spawnSync(path.join(BIN, "hum-ping"), [
+    "--ping-id", pingId, "--lane", "nearby", "--score", String(Math.min(0.89, relevance)),
+    "--intent", "hum:nearby:live", "--findings", JSON.stringify([finding]), "--message", signal,
+  ], { encoding: "utf8", timeout: 90000 });
+  const sendMs = Date.now() - tSend;
+  const tail = String(r.stderr || "").trim().split("\n").slice(-2).join(" | ").slice(0, 300);
+  done({
+    outcome: r.status === 0 ? "sent" : `hum_ping_exit_${r.status}`,
+    ping_id: r.status === 0 ? pingId : null, subject: subject.title, distance_m: subject.distance_m,
+    relevance, signal: signal.slice(0, 160), ...timings, send_ms: sendMs, detail: r.status === 0 ? undefined : tail,
+  });
+}
+
+function newPingId() {
+  const d = new Date();
+  const p = (n) => String(n).padStart(2, "0");
+  return `p-${d.getUTCFullYear()}${p(d.getUTCMonth() + 1)}${p(d.getUTCDate())}-${p(d.getUTCHours())}${p(d.getUTCMinutes())}-${crypto.randomBytes(2).toString("hex")}`;
+}
+
+function mapFor(from, s) {
+  return new Promise((resolve) => {
+    execFile(path.join(BIN, "place-map"), [
+      "--from", `${from.lat},${from.lon}`, "--to", `${s.lat},${s.lon}`, "--label", s.title, "--upload", "--json",
+    ], { encoding: "utf8", timeout: 60000 }, (err, stdout) => {
+      try { resolve(JSON.parse(stdout || "{}").url || null); } catch { resolve(null); }
+    });
+  });
+}
+
+function withTimeout(p, ms, fallback) {
+  return Promise.race([p, new Promise((r) => setTimeout(() => r(fallback), ms))]);
+}
+
+// ── daemon: listen, evaluate the newest fix, one at a time ───────────────
+
+async function daemon() {
+  const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
+  const url = process.env.SUPABASE_URL || supabaseUrl();
+  if (!key || !url) { console.error("local-history-live: SUPABASE_SERVICE_ROLE_KEY / Supabase URL missing"); process.exit(78); }
+  // supabase-js is installed with phone-channel; resolve it from there.
+  const sbRequire = createRequire(installTools("agent/phone-channel/index.mjs"));
+  const { createClient } = sbRequire("@supabase/supabase-js");
+  const sb = createClient(url, key, { auth: { persistSession: false } });
+
+  let newest = null;      // newest position seen
+  let lastEval = null;    // last position actually evaluated
+  let running = false;
+  let realtime = "connecting";
+  const log = (m) => process.stderr.write(`${new Date().toISOString()} [local-history-live] ${m}\n`);
+
+  const heartbeat = () => L.writeState({ heartbeat_at: new Date().toISOString(), realtime, pid: process.pid });
+  heartbeat();
+  setInterval(heartbeat, 30_000);
+
+  function onRow(row, via) {
+    const pos = L.positionFromRow(row);
+    if (!pos) return;
+    if (newest && Date.parse(pos.at) <= Date.parse(newest.at)) return;
+    newest = pos;
+    L.writeState({ last_position_at: pos.at, last_position_via: via });
+    pump();
+  }
+
+  async function pump() {
+    if (running || !newest) return;
+    if (fs.existsSync(L.OFF_SWITCH)) return;
+    const pos = newest;
+    const v = L.shouldEvaluate(pos, lastEval, { hour: localHour(userTz()) });
+    if (!v.ok) return;
+    lastEval = pos;
+    running = true;
+    const t = Date.now();
+    try {
+      const rec = await runOnce(pos);
+      L.appendLog({ ...rec, wall_ms: Date.now() - t });
+      if (rec.outcome === "sent") log(`sent ${rec.ping_id}: ${rec.subject} (${rec.since_fix_s}s after the fix)`);
+    } catch (e) {
+      L.appendLog({ outcome: "error", reason: e.message, at: pos.at });
+    } finally {
+      running = false;
+      // A newer fix may have arrived while this one ran.
+      if (newest && newest !== pos) setImmediate(pump);
+    }
+  }
+
+  function runOnce(pos) {
+    return new Promise((resolve) => {
+      execFile(process.execPath, [SELF, "once", "--pos", JSON.stringify(pos)],
+        { encoding: "utf8", timeout: 150_000, maxBuffer: 4 * 1024 * 1024 },
+        (err, stdout) => {
+          const line = String(stdout || "").trim().split("\n").pop();
+          try { resolve(JSON.parse(line)); }
+          catch { resolve({ outcome: "error", reason: err ? err.message.slice(0, 200) : "no output", at: pos.at }); }
+        });
+    });
+  }
+
+  function subscribe() {
+    sb.channel("local-history-live")
+      .on("postgres_changes", { event: "*", schema: "public", table: "live_position" }, (p) => onRow(p.new, "realtime"))
+      .subscribe((status) => {
+        realtime = status;
+        log(`realtime: ${status}`);
+        if (status === "CHANNEL_ERROR" || status === "TIMED_OUT" || status === "CLOSED") {
+          setTimeout(() => { sb.removeAllChannels().finally(subscribe); }, 5000);
+        }
+      });
+  }
+  subscribe();
+
+  // Safety net: a Realtime socket can die silently while looking connected
+  // (phone-channel, 2026-06-08). One cheap primary-key read a minute bounds
+  // the damage to a minute.
+  const poll = async () => {
+    try {
+      const { data } = await sb.from("live_position").select("*").order("ts", { ascending: false }).limit(1);
+      if (data && data[0]) onRow(data[0], "poll");
+    } catch { /* next tick */ }
+  };
+  poll();
+  setInterval(poll, 60_000);
+  log("started");
+}
+
+// ── status ──────────────────────────────────────────────────────────────
+
+function status() {
+  const s = L.readState();
+  console.log(JSON.stringify({ state: s, lane: L.liveLaneActive({ state: s }) }, null, 2));
+  try {
+    const lines = fs.readFileSync(L.LOG_PATH, "utf8").trim().split("\n").slice(-12);
+    for (const l of lines) {
+      const r = JSON.parse(l);
+      console.log(`${r.ts}  ${String(r.outcome).padEnd(20)} ${r.subject || r.detail || r.reason || r.why || ""}${r.since_fix_s != null ? `  (${r.since_fix_s}s after fix)` : ""}`);
+    }
+  } catch { console.log("(no outcomes yet)"); }
+}

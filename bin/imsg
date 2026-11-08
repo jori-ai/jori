@@ -65,10 +65,75 @@ function who(m) {
   return m.from_me ? "Me" : m.sender_name || m.sender;
 }
 
-function osa(lines, args) {
+function osa(lines, args, { timeoutMs = 0 } = {}) {
   const flat = [];
   for (const l of lines) flat.push("-e", l);
-  return execFileSync("osascript", [...flat, ...args], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
+  return execFileSync("osascript", [...flat, ...args], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], timeout: timeoutMs }).trim();
+}
+
+// Messages.app left running for weeks can stop answering the send AppleEvent
+// while chat.db and every read keep working: osascript blocks for the default
+// 2 minutes and fails with "AppleEvent timed out (-1712)" (seen 2026-11-05
+// after 36 days of uptime; a relaunch fixed it at once). So a
+// send waits SEND_WAIT_S, and on a hang checks chat.db (the event may have
+// gone through late), relaunches Messages and tries exactly once more.
+const SEND_WAIT_S = 30;
+const sendLines = (lines) => ["on run argv", `with timeout of ${SEND_WAIT_S} seconds`, ...lines, "end timeout", "end run"];
+const sendOsa = (lines, args) => osa(sendLines(lines), args, { timeoutMs: (SEND_WAIT_S + 15) * 1000 });
+
+function isHang(err) {
+  const msg = String(err?.stderr || err?.message || "");
+  return err?.code === "ETIMEDOUT" || err?.signal === "SIGTERM" || /-1712|timed out/i.test(msg);
+}
+
+function landedSince(sinceMs, text) {
+  try {
+    const db = idb.openChatDb(idb.CHAT_DB, { withNames: false });
+    try {
+      return db.sent({ sinceMs }).some((m) => m.text.trim() === text.trim());
+    } finally {
+      db.close();
+    }
+  } catch {
+    return false;
+  }
+}
+
+function relaunchMessages() {
+  try {
+    execFileSync("osascript", ["-e", 'tell application "Messages" to quit'], { stdio: "ignore", timeout: 15000 });
+  } catch {}
+  for (let i = 0; i < 20; i++) {
+    try {
+      execFileSync("pgrep", ["-x", "Messages"], { stdio: "ignore" });
+    } catch {
+      break; // gone
+    }
+    if (i === 10) {
+      try {
+        execFileSync("pkill", ["-x", "Messages"], { stdio: "ignore" });
+      } catch {}
+    }
+    execFileSync("sleep", ["1"]);
+  }
+  execFileSync("open", ["-g", "-a", "Messages"], { stdio: "ignore" });
+  execFileSync("sleep", ["8"]);
+}
+
+// Run send(); on a hang, verify it did not land, relaunch Messages, retry once.
+function sendRecovering(text, send) {
+  const startMs = Date.now() - 5000;
+  try {
+    return send();
+  } catch (err) {
+    if (!isHang(err)) throw err;
+    execFileSync("sleep", ["3"]);
+    if (landedSince(startMs, text)) return null;
+    console.error(`imsg: Messages did not answer within ${SEND_WAIT_S}s; relaunching Messages and retrying once`);
+    relaunchMessages();
+    if (landedSince(startMs, text)) return null;
+    return send();
+  }
 }
 
 function sendToChat(guid, text) {
@@ -79,9 +144,10 @@ function sendToChat(guid, text) {
   let lastErr;
   for (const id of ids) {
     try {
-      osa(["on run argv", 'tell application "Messages" to send (item 1 of argv) to chat id (item 2 of argv)', "end run"], [text, id]);
+      sendOsa(['tell application "Messages" to send (item 1 of argv) to chat id (item 2 of argv)'], [text, id]);
       return id;
     } catch (err) {
+      if (isHang(err)) throw err; // a hung Messages fails every id the same way
       lastErr = err;
     }
   }
@@ -89,15 +155,13 @@ function sendToChat(guid, text) {
 }
 
 function sendToAddress(addr, text) {
-  osa(
+  sendOsa(
     [
-      "on run argv",
       'tell application "Messages"',
       "set targetService to 1st account whose service type = iMessage",
       "set targetBuddy to buddy (item 2 of argv) of targetService",
       "send (item 1 of argv) to targetBuddy",
       "end tell",
-      "end run",
     ],
     [text, addr],
   );
@@ -206,7 +270,12 @@ function main() {
         if (!text) throw new Error('Usage: imsg send --chat <group name|guid> "<message>"');
         const db = open();
         const g = resolveGroup(db, chat);
-        const id = sendToChat(g.chat_guid, text);
+        let id;
+        try {
+          id = sendRecovering(text, () => sendToChat(g.chat_guid, text)) || g.chat_guid;
+        } catch (err) {
+          throw new Error(`Failed to send via iMessage: ${String(err.stderr || err.message).trim()}`);
+        }
         console.log(`Sent to group ${g.name} (${id}) via iMessage`);
         return;
       }
@@ -227,7 +296,7 @@ function main() {
         console.error(`Resolved '${contact}' → ${addr}`);
       }
       try {
-        sendToAddress(addr, text);
+        sendRecovering(text, () => sendToAddress(addr, text));
       } catch (err) {
         throw new Error(`Failed to send via iMessage: ${String(err.stderr || err.message).trim()}`);
       }

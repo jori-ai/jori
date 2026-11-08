@@ -18,6 +18,15 @@
 //                   that existed there, so a file that moved on is refused at apply
 //   --allow-shrink  this path is meant to lose most of its lines (repeatable)
 //
+// Overlay files: a path the kernel repo does not have but the install's overlay
+// tracks (lib/overlay.cjs) is read from the overlay's HEAD when the bundle is
+// built. That is its committed version for the content checks and, with
+// --base-rev, its base_sha256 (--base-rev names a kernel commit; the overlay has
+// none matching it). The recorded base is what keeps the applier's stale-base
+// check from refusing the file as "<path> did not exist when this fix was
+// written, and it does now". With no overlay at the root, nothing changes; a path
+// neither repo has is a new file.
+//
 // Exit: 0 written · 64 usage · 65 refused by the content checks (nothing written)
 
 import fs from "node:fs";
@@ -25,6 +34,7 @@ import path from "node:path";
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import rootPaths from "../lib/root.cjs";
+import overlay from "../lib/overlay.cjs";
 import { contentRefusals } from "../lib/self-improve-content-check.mjs";
 
 // The checkout this code runs from (JORI_HOME when set): the tree the change was made in.
@@ -57,6 +67,15 @@ if (outAbs === REAL_ROOT || outAbs.startsWith(REAL_ROOT + path.sep)) usage(`--ou
 
 const git = (args) => execFileSync("git", args, { cwd: ROOT, encoding: "utf8", maxBuffer: 256 * 1024 * 1024, stdio: ["ignore", "pipe", "ignore"] });
 const atRev = (rev, rel) => { try { return git(["show", `${rev}:${rel}`]); } catch { return null; } };
+// The overlay's committed version of rel (its HEAD), or null when there is no overlay
+// at ROOT or it does not track rel. ROOT is passed explicitly: the tree being bundled.
+const HAS_OVERLAY = overlay.hasOverlay(ROOT);
+const atOverlayHead = (rel) => {
+  if (!HAS_OVERLAY) return null;
+  try {
+    return overlay.overlayGit(["show", `HEAD:${rel}`], ROOT, { cwd: ROOT, encoding: "utf8", maxBuffer: 256 * 1024 * 1024, stdio: ["ignore", "pipe", "ignore"] });
+  } catch { return null; }
+};
 
 const files = {}, before = {}, base = {};
 for (const p of paths) {
@@ -65,7 +84,7 @@ for (const p of paths) {
   const rel = path.relative(ROOT, abs).split(path.sep).join("/");
   if (path.join(REAL_ROOT, path.relative(ROOT, abs)) === outAbs) usage(`--out is one of the files being bundled: ${rel}`);
   try { files[rel] = fs.readFileSync(abs, "utf8"); } catch (e) { usage(`cannot read ${rel}: ${e.code || e.message}`); }
-  before[rel] = atRev(baseRev || "HEAD", rel);
+  before[rel] = atRev(baseRev || "HEAD", rel) ?? atOverlayHead(rel);
   if (baseRev && before[rel] !== null) base[rel] = createHash("sha256").update(before[rel]).digest("hex");
 }
 

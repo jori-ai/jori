@@ -10,6 +10,9 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+// The screen stubs fake the Ollama API; the local model defaults to Haiku via `claude -p`
+// since 2026-11-04, so pin the backend these stubs simulate.
+process.env.LOCAL_LLM_BACKEND ||= "ollama";
 
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "jev-auto-recall-"));
 fs.mkdirSync(path.join(tmp, "memory"), { recursive: true });

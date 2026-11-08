@@ -1,0 +1,56 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  local-history-live — local-history pings within seconds of the phone's fix.
+
+  Long-running, KeepAlive. Listens to the phone's live_position row over
+  Supabase Realtime (plus a once-a-minute read as a safety net) and evaluates
+  the newest fix: subjects within 80 m, Haiku decides and words it, hum-ping
+  sends. See bin/local-history-live.
+
+  A launchd USER agent on purpose (not cron): the Haiku call is a `claude -p`
+  on Max, whose login keychain only unlocks inside the GUI session.
+  If it is down, the hum `nearby` lane takes local history back within 3
+  minutes (lib/local-history-live.mjs liveLaneActive).
+
+  Install:
+    agent/launch-agents/install.sh ai.claude.local-history-live
+  Restart after a code change:
+    launchctl kickstart -k gui/$(id -u)/ai.claude.local-history-live
+  Inspect:
+    local-history-live status
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>ai.claude.local-history-live</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/env</string>
+        <string>node</string>
+        <string>__JORI_TOOLS__/bin/local-history-live</string>
+        <string>daemon</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>__HOME__</string>
+        <key>PATH</key>
+        <string>__HOME__/.local/bin:/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:__JORI_TOOLS__/bin</string>
+        <key>LANG</key>
+        <string>en_US.UTF-8</string>
+    </dict>
+    <key>WorkingDirectory</key>
+    <string>__JORI_HOME__</string>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+    <key>StandardOutPath</key>
+    <string>__JORI_TOOLS__/agent/logs/local-history-live-launchd.log</string>
+    <key>StandardErrorPath</key>
+    <string>__JORI_TOOLS__/agent/logs/local-history-live-launchd.log</string>
+</dict>
+</plist>

@@ -2,7 +2,8 @@
 // (time, name, details) only when the new details come from a confirmation
 // email for the same booking (--from-confirmation <gmail messageId>);
 // otherwise it may only ADD details. Events Jori created are stamped
-// gandalf_created=1 on create and stay freely editable. Fake gog only.
+// jori_created=1 on create (gandalf_created=1 before 2026-11-05) and stay
+// freely editable. Fake gog only.
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
@@ -33,7 +34,8 @@ function eventFile(ev) {
   return f;
 }
 const USERS = { id: "EV1", summary: "Dinner", organizer: { email: "owner@example.com", self: true }, description: "the user's notes", location: "" };
-const JORIS = { ...USERS, extendedProperties: { private: { gandalf_created: "1" } } };
+const JORIS = { ...USERS, extendedProperties: { private: { jori_created: "1" } } };
+const JORIS_LEGACY = { ...USERS, extendedProperties: { private: { gandalf_created: "1" } } };
 
 function run(args, ev) {
   fs.writeFileSync(CALLS, "");
@@ -81,6 +83,10 @@ test("events Jori created stay freely editable", () => {
   assert.equal(run(["update", "EV1", "--calendar", "primary", ...T], JORIS).code, 0);
 });
 
+test("events stamped before 2026-11-05 (gandalf_created) are still Jori's", () => {
+  assert.equal(run(["update", "EV1", "--calendar", "primary", ...T], JORIS_LEGACY).code, 0);
+});
+
 test("pre-stamp Jori events: a private property or a job's own-id claim counts as Jori's", () => {
   assert.equal(run(["update", "EV1", "--calendar", "primary", ...T], { ...USERS, extendedProperties: { private: { phStay: "k1" } } }).code, 0);
   const r = run(["update", "EV1", "--calendar", "primary", "--jori-event", "demo-job", ...T], USERS);
@@ -99,5 +105,5 @@ test("every create is stamped as Jori's", () => {
   assert.equal(r.code, 0, r.err);
   const i = r.write.indexOf("--private-prop");
   assert.ok(i > 0);
-  assert.equal(r.write[i + 1], "gandalf_created=1");
+  assert.equal(r.write[i + 1], "jori_created=1");
 });

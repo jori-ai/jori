@@ -8,6 +8,8 @@ source "$(dirname "$0")/lib/max-auth-probe.sh"   # launchd sign-in check, see §
 # This installation's identity (JORI_OWNER_EMAIL, JORI_DOMAIN,
 # JORI_SUPABASE_PROJECT, …) from lib/instance.cjs; env wins.
 source "$(dirname "$0")/lib/instance.sh"
+# The header that marks the watchdog's own HTTP probes in remote logs.
+JORI_PROBE_HEADER="X-Jori-Probe: watchdog"  # control-scan-ok: the software's name
 # The instance's own checks (optional): _ext/watchdog-checks.sh defines
 # _ext_incident_label and _ext_watchdog_checks, run below where they belong.
 [ -f "$(dirname "$0")/_ext/watchdog-checks.sh" ] && source "$(dirname "$0")/_ext/watchdog-checks.sh"
@@ -121,7 +123,7 @@ notify() {
   PENDING_ALERT_KEY=""
 
   if JORI_INFRA_PROBE=1 "$SEND" --skip-precheck --intent watchdog-alert --channel system "$1" > /dev/null 2>&1; then
-    log "Notified via Jori: $1"
+    log "Notified via ${JORI_ASSISTANT_NAME:-Jori}: $1"  # control-scan-ok: the setting's default
     [ -n "$key" ] && touch "$INCIDENT_DIR/${key}.delivered" 2>/dev/null
     return 0
   fi
@@ -135,7 +137,7 @@ notify() {
   # pings with no preceding warning anywhere in the channel.
   if [ -x "$EMAIL_SEND" ] && [ -n "${JORI_OWNER_EMAIL:-}" ] \
      && "$EMAIL_SEND" --to "$JORI_OWNER_EMAIL" --subject "🔴 ${JORI_HOST_TITLE:-Host} Watchdog" --body "$1" > /dev/null 2>&1; then
-    log "Notified via email (Jori channel unavailable): $1"
+    log "Notified via email (${JORI_ASSISTANT_NAME:-Jori} channel unavailable): $1"  # control-scan-ok: the setting's default
     [ -n "$key" ] && touch "$INCIDENT_DIR/${key}.delivered" 2>/dev/null
     return 0
   fi
@@ -253,8 +255,9 @@ incident_clear() {
     if [ -f "$INCIDENT_DIR/${key}.alerted" ] && [ -f "$INCIDENT_DIR/${key}.delivered" ]; then
       # "auto-healed" is a causal claim this probe cannot see: a Max auth outage
       # can end because someone signed in by hand, and "recovered on its own"
-      # would then be false. Say what was observed, not why.
-      local how="auto-healed"
+      # would then be false. Say what was observed, not why. A caller that saw
+      # how it ended passes RECOVERY_HOW (e.g. chat_backlog_restart_note).
+      local how="${RECOVERY_HOW:-auto-healed}"
       case "$key" in
         # Set by § Max auth outage from what it actually saw: a fresh launchd
         # sign-in check, or only quiet logs.
@@ -377,7 +380,7 @@ cloudflared_tunnel_probe() {
   [ -n "$CLOUDFLARED_HOST" ] || return 0
   out=$(curl -s -o /dev/null --max-time 8 \
     -w "%{http_code} dns=%{time_namelookup}s connect=%{time_connect}s tls=%{time_appconnect}s total=%{time_total}s" \
-    -H "X-Jori-Probe: watchdog" \
+    -H "$JORI_PROBE_HEADER" \
     "https://${CLOUDFLARED_HOST}/" 2>/dev/null)
   rc=$?
   code="${out%% *}"
@@ -470,7 +473,7 @@ host_network_reachable() {
   local host code
   for host in "https://api.github.com/" "https://aws.amazon.com/"; do
     code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 8 \
-      -H "X-Jori-Probe: watchdog" "$host" 2>/dev/null)
+      -H "$JORI_PROBE_HEADER" "$host" 2>/dev/null)
     [ -n "$code" ] && [ "$code" != "000" ] && return 0
   done
   return 1
@@ -548,6 +551,37 @@ disk_alert_body() {
     snap="data/memory-db-snapshots (hourly memory-DB copies, which have filled the disk before) could not be measured."
   fi
   echo "${free} GiB free on the data volume (${pct}% used). $snap Nothing was deleted. When space runs out, downloads to ${JORI_HOST_LABEL:-the host} stall and database and log writes start failing."
+}
+
+# chat_backlog_restart_note <startedAt> <queueDepth> <queueRestored> — run on
+# every chat /health read. A chat backlog empties two ways: its turns run, or a
+# whole-process restart loses it (an in-process /restart hands the queue over).
+# startedAt is the process's own start, so a new value since the last tick, with
+# a backlog queued at that tick, is a restart; queueRestored (items the new
+# process reloaded from its saved queue at boot) says whether the queue came
+# along. The verdict (CHAT_BACKLOG_NOTE) is the backlog's recovery line in place
+# of "auto-healed", and is cleared with it. Both files sit beside INCIDENT_DIR,
+# whose every file `jori watchdog` lists as an incident.
+CHAT_BACKLOG_PROC="${INCIDENT_DIR%/*}/.watchdog-chat-backlog-proc"
+CHAT_BACKLOG_NOTE="${INCIDENT_DIR%/*}/.watchdog-chat-backlog-note"
+chat_backlog_restart_note() {
+  local started="$1" depth="$2" restored="${3:-0}" prev_started="" prev_depth=0
+  [ -f "$CHAT_BACKLOG_PROC" ] && read -r prev_started prev_depth < "$CHAT_BACKLOG_PROC"
+  [[ "$prev_depth" =~ ^[0-9]+$ ]] || prev_depth=0
+  [[ "$restored" =~ ^[0-9]+$ ]] || restored=0
+  if [ -n "$started" ] && [ -n "$prev_started" ] && [ "$started" != "$prev_started" ] \
+     && [ "$prev_depth" -ge "$QUEUE_BACKLOG_WARN" ]; then
+    if [ "$restored" -gt 0 ]; then
+      log "Chat restarted with a backlog ($prev_depth queued at the last check): the new process restored $restored"
+      # The first verdict of a backlog stands, except that a drop always wins.
+      [ -f "$CHAT_BACKLOG_NOTE" ] || echo "the chat process restarted with a backlog and reloaded its $restored queued items from disk, and the queue has since drained" > "$CHAT_BACKLOG_NOTE"
+    else
+      log "Chat restarted with a backlog ($prev_depth queued at the last check): nothing restored, those messages were dropped"
+      echo "the chat process restarted and dropped the $prev_depth messages queued at the previous check, unanswered" > "$CHAT_BACKLOG_NOTE"
+    fi
+  fi
+  [ -n "$started" ] && echo "$started $depth" > "$CHAT_BACKLOG_PROC"
+  return 0
 }
 
 ISSUES=""
@@ -773,6 +807,8 @@ if [ -n "$CHAT_HEALTH_PORT" ]; then
     # Chat queue-depth early-alert (parity with ops). Chat
     # backlogs are rarer (one-message-at-a-time phone-channel cadence) so
     # a buildup here is a stronger signal than on ops.
+    chat_backlog_restart_note "$(echo "$CHAT_HEALTH" | jq -r '.startedAt // empty')" "$CHAT_QUEUE" \
+      "$(echo "$CHAT_HEALTH" | jq -r '.queueRestored // 0')"
     if [ "$CHAT_QUEUE" -ge "$QUEUE_BACKLOG_ALERT" ]; then
       ATTEMPT=$(incident_seen "chat-queue-backlog")
       log "Chat queue backlog: queueDepth=$CHAT_QUEUE >= $QUEUE_BACKLOG_ALERT (attempt $ATTEMPT)"
@@ -783,83 +819,101 @@ if [ -n "$CHAT_HEALTH_PORT" ]; then
     elif [ "$CHAT_QUEUE" -ge "$QUEUE_BACKLOG_WARN" ]; then
       log "Chat queue elevated: queueDepth=$CHAT_QUEUE (warn=$QUEUE_BACKLOG_WARN, alert=$QUEUE_BACKLOG_ALERT)"
     else
-      incident_clear "chat-queue-backlog"
+      RECOVERY_HOW="$(cat "$CHAT_BACKLOG_NOTE" 2>/dev/null)" incident_clear "chat-queue-backlog"
+      # No green streak left = its third green tick, where any recovery line went out.
+      [ -f "$INCIDENT_DIR/chat-queue-backlog.green_streak" ] || rm -f "$CHAT_BACKLOG_NOTE"
     fi
 
     # Phone-channel heartbeat staleness
     HEARTBEAT_AGE=$(echo "$CHAT_HEALTH" | jq -r '.phoneChannelHeartbeatAgeMs // 0')
+    # A phone-channel that never sent a first heartbeat has no age (null): the
+    # supervisor's phoneChannelStale covers it once its grace has passed. A
+    # supervisor without the field is judged on the age alone, as before.
+    PC_NO_BEAT=$(echo "$CHAT_HEALTH" | jq -r 'if .phoneChannelStale == true and .phoneChannelHeartbeatAgeMs == null then "yes" else "no" end')
     if [ "$HEARTBEAT_AGE" -gt 300000 ]; then
       log "Phone-channel heartbeat stale: ${HEARTBEAT_AGE}ms — supervisor should auto-restart"
       ISSUES="$ISSUES phone-channel(heartbeat-stale)"
+    elif [ "$PC_NO_BEAT" = "yes" ]; then
+      log "Phone-channel sent no heartbeat since the chat session started — it is not running (the supervisor restarts the session for it a bounded number of times)"
+      ISSUES="$ISSUES phone-channel(no-heartbeat)"
     fi
   fi
 fi
 
 # --- Chat message delivery check (catches silent phone-channel failures) ---
-# Query Supabase for unread user messages older than 3 minutes.
-# If any exist, the phone-channel realtime subscription likely dropped.
+# The phone-channel acknowledges a user message by moving its cursor
+# (data/phone-channel-cursor.json: lastSeenAt = created_at of the newest message
+# it has handed to the chat supervisor; a failed hand-over leaves it for its own
+# sweep to retry). So a user message created after the cursor and more than
+# STALE_MSG_THRESHOLD ago is one the chat never received. `read` says nothing
+# about delivery (the app sets it on rows it displays) and is not consulted.
 # The instance's Supabase project (JORI_SUPABASE_PROJECT). With none
 # configured SUPABASE_KEY stays empty, which skips every Supabase check below.
 SUPABASE_URL="${JORI_SUPABASE_PROJECT:+https://$JORI_SUPABASE_PROJECT.supabase.co}"
 SUPABASE_KEY=""
 [ -n "$SUPABASE_URL" ] && SUPABASE_KEY=$(grep '^SUPABASE_SERVICE_ROLE_KEY=' "$HOME/Dev/jori/.env" 2>/dev/null | cut -d= -f2-)
-STALE_MSG_THRESHOLD=180  # 3 minutes
+STALE_MSG_THRESHOLD=600     # 10 minutes: realtime delivers in seconds, the phone-channel's sweep within 2
+STALE_MSG_LOOKBACK=604800   # 7 days: never look further back, whatever the cursor says
+PC_CURSOR_FILE="$JORI_INSTALL_TOOLS/data/phone-channel-cursor.json"
+# The cursor as the last tick saw it during an incident. Beside INCIDENT_DIR,
+# not in it: `jori watchdog` lists every file there as an incident.
+CHAT_DELIVERY_CURSOR_MEMO="${INCIDENT_DIR%/*}/.watchdog-chat-delivery-cursor"
 
-CUTOFF=$(date -u -v-${STALE_MSG_THRESHOLD}S '+%Y-%m-%dT%H:%M:%S+00:00' 2>/dev/null || date -u -d "${STALE_MSG_THRESHOLD} seconds ago" '+%Y-%m-%dT%H:%M:%S+00:00' 2>/dev/null)
-if [ -n "$CUTOFF" ] && [ -n "$SUPABASE_URL" ]; then
+# chat_delivery_query <after> <floor> <before> — the PostgREST query string for
+# the oldest user messages created after both <after> and <floor> and before
+# <before>. A "+" in a timestamp ("…+00:00", the cursor's form) is sent as %2B:
+# bare, the query string reads it as a space and PostgREST answers 400.
+chat_delivery_query() {
+  printf 'select=id,created_at&role=eq.user&created_at=gt.%s&created_at=gt.%s&created_at=lt.%s&order=created_at.asc&limit=50' \
+    "${1//+/%2B}" "${2//+/%2B}" "${3//+/%2B}"
+}
+
+CUTOFF=$(date -u -v-${STALE_MSG_THRESHOLD}S '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date -u -d "${STALE_MSG_THRESHOLD} seconds ago" '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null)
+LOOKBACK_FLOOR=$(date -u -v-${STALE_MSG_LOOKBACK}S '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date -u -d "${STALE_MSG_LOOKBACK} seconds ago" '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null)
+# No cursor file: the phone-channel has never handed a message over on this
+# install, so there is no line to measure from.
+PC_CURSOR=$(jq -r '.lastSeenAt // empty' "$PC_CURSOR_FILE" 2>/dev/null)
+if [ -n "$CUTOFF" ] && [ -n "$LOOKBACK_FLOOR" ] && [ -n "$SUPABASE_URL" ] && [ -n "$PC_CURSOR" ]; then
   STALE_MSGS=$(curl -sf --max-time 5 \
-    "${SUPABASE_URL}/rest/v1/jori_messages?role=eq.user&read=eq.false&created_at=lt.${CUTOFF}&order=created_at.asc&limit=5" \
+    "${SUPABASE_URL}/rest/v1/jori_messages?$(chat_delivery_query "$PC_CURSOR" "$LOOKBACK_FLOOR" "$CUTOFF")" \
     -H "apikey: ${SUPABASE_KEY}" \
     -H "Authorization: Bearer ${SUPABASE_KEY}" 2>/dev/null)
+  # A failed query is no reading at all, never "0 stuck": it neither counts
+  # toward a page nor clears one.
+  STALE_COUNT=$(printf '%s' "$STALE_MSGS" | jq -r 'if type == "array" then length else empty end' 2>/dev/null)
 
-  STALE_COUNT=$(echo "$STALE_MSGS" | jq -r 'if type == "array" then length else 0 end' 2>/dev/null || echo 0)
-  STALE_COUNT=${STALE_COUNT:-0}
-
-  if [ "$STALE_COUNT" -gt 0 ]; then
+  if [ -z "$STALE_COUNT" ]; then
+    log_throttled "$JORI_INSTALL_TOOLS/data/.watchdog-chat-delivery-query-log" "Chat delivery check: the Supabase query failed — no reading this tick"
+  elif [ "$STALE_COUNT" -gt 0 ] && [ -n "$CHAT_HOLD_UNTIL" ]; then
+    # Chat holds for the Claude usage limit: the session starts its MCP servers
+    # (the phone-channel among them) only with a turn, and the hold queues every
+    # turn, so after a restart nothing picks messages up until the reset; the
+    # phone-channel's startup sweep then does. Neither counted nor cleared.
+    log_throttled "$JORI_INSTALL_TOOLS/data/.watchdog-chat-delivery-hold-log" "Chat delivery waiting: $STALE_COUNT user message(s) past the phone-channel cursor while chat holds for the Claude usage limit until $CHAT_HOLD_UNTIL"
+  elif [ "$STALE_COUNT" -gt 0 ]; then
     ATTEMPT=$(incident_seen "chat-delivery-stuck")
-    log "Chat delivery stuck: $STALE_COUNT unread user message(s) older than ${STALE_MSG_THRESHOLD}s (attempt $ATTEMPT)"
+    log "Chat delivery stuck: $STALE_COUNT user message(s) older than ${STALE_MSG_THRESHOLD}s not received by the chat (phone-channel cursor $PC_CURSOR, attempt $ATTEMPT)"
     ISSUES="$ISSUES chat-delivery-stuck(${STALE_COUNT}msg)"
 
-    # Self-heal: restart chat supervisor + redispatch every tick the
-    # condition holds. Idempotent — RECOVERED MESSAGE prefix dedups in chat.
-    if [ -n "$CHAT_HEALTH_PORT" ]; then
+    # Self-heal, once per incident: restart the chat session, which respawns the
+    # phone-channel; its startup sweep hands over what is past the cursor.
+    # Restarting every tick would kill each turn the recovery starts.
+    if [ "$ATTEMPT" -eq 1 ] && [ -n "$CHAT_HEALTH_PORT" ]; then
       log "Restarting chat supervisor to recover message delivery"
       curl -sf -X POST "http://127.0.0.1:$CHAT_HEALTH_PORT/restart" > /dev/null 2>&1
-      sleep 10  # Wait for session to restart and phone-channel to reconnect
-
-      # Dispatch each missed message directly to the chat supervisor
-      echo "$STALE_MSGS" | $NODE -e '
-        let d="";
-        process.stdin.on("data",c=>d+=c);
-        process.stdin.on("end",async()=>{
-          try {
-            const msgs = JSON.parse(d);
-            if (!Array.isArray(msgs)) return;
-            for (const m of msgs) {
-              const body = JSON.stringify({
-                content: "RECOVERED MESSAGE (was stuck):\n\nNew message from " + (process.env.JORI_OWNER_NAME || "the user") + ":\n\n" + m.content,
-                source: "jori",
-                priority: "high",
-                msgId: m.id
-              });
-              const resp = await fetch("http://127.0.0.1:'"$CHAT_HEALTH_PORT"'/dispatch", {
-                method: "POST",
-                headers: {"content-type":"application/json"},
-                body
-              });
-              console.error("dispatched recovered msg " + m.id + " status=" + resp.status);
-            }
-          } catch(e) { console.error("dispatch error: " + e.message); }
-        });
-      ' 2>> "$LOG"
     fi
 
-    # Alert only if recovery has demonstrably failed (still stuck on next tick).
-    if [ "$ATTEMPT" -ge 2 ] && incident_should_alert "chat-delivery-stuck"; then
-      notify "🔴 Chat delivery still stuck after self-heal — $STALE_COUNT message(s) sitting unread across $ATTEMPT consecutive ticks. Phone-channel realtime subscription needs manual reconnect."
+    # Page once the restart has demonstrably not helped: still stuck on a later
+    # tick and the cursor has not moved since the last one (a moving cursor is a
+    # backlog being handed over).
+    PREV_PC_CURSOR=$(cat "$CHAT_DELIVERY_CURSOR_MEMO" 2>/dev/null)
+    printf '%s' "$PC_CURSOR" > "$CHAT_DELIVERY_CURSOR_MEMO"
+    if [ "$ATTEMPT" -ge 2 ] && [ "$PC_CURSOR" = "$PREV_PC_CURSOR" ] && incident_should_alert "chat-delivery-stuck"; then
+      notify "🔴 Chat delivery still stuck after self-heal — $STALE_COUNT message(s) sent in the app have not reached the chat for over $((STALE_MSG_THRESHOLD / 60)) min, across $ATTEMPT consecutive checks, and restarting the chat session did not hand them over."
     fi
   else
     incident_clear "chat-delivery-stuck"
+    rm -f "$CHAT_DELIVERY_CURSOR_MEMO" 2>/dev/null
   fi
 fi
 
@@ -906,7 +960,7 @@ if ! cloudflared_tunnel_probe; then
 
     # Alert only if the kickstart didn't bring the tunnel back by the next tick.
     if [ "$ATTEMPT" -ge 2 ] && incident_should_alert "cloudflared-tunnel"; then
-      notify "🔴 Cloudflare Tunnel ($CLOUDFLARED_HOST) is down and didn't recover after launchctl kickstart ($ATTEMPT consecutive ticks): $TUNNEL_PROBE_EVIDENCE. While it is down, Gmail pushes and inbound email to ${JORI_AGENT_FROM_EMAIL:-the agent address} cannot reach Jori. Manual intervention needed on ${JORI_HOST_LABEL:-the host}: launchctl kickstart -k gui/\$(id -u)/$CLOUDFLARED_LABEL"
+      notify "🔴 Cloudflare Tunnel ($CLOUDFLARED_HOST) is down and didn't recover after launchctl kickstart ($ATTEMPT consecutive ticks): $TUNNEL_PROBE_EVIDENCE. While it is down, Gmail pushes and inbound email to ${JORI_AGENT_FROM_EMAIL:-the agent address} cannot reach ${JORI_ASSISTANT_NAME:-Jori}. Manual intervention needed on ${JORI_HOST_LABEL:-the host}: launchctl kickstart -k gui/\$(id -u)/$CLOUDFLARED_LABEL"  # control-scan-ok: the setting's default
     fi
   fi
 else
@@ -1849,7 +1903,7 @@ GH_MIN_TICKS=3   # ~6 min of sustained failure at the 2-min watchdog cadence
 github_api_reachable() {
   local code
   code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 8 \
-    -H "X-Jori-Probe: watchdog" \
+    -H "$JORI_PROBE_HEADER" \
     "https://api.github.com/" 2>/dev/null)
   [ -n "$code" ] && [ "$code" != "000" ]
 }
@@ -2100,7 +2154,7 @@ if [ -n "$SUPABASE_KEY" ]; then
       ISSUES="$ISSUES supabase(unreachable)"
       log "Supabase unreachable after in-tick re-probe (attempt $ATTEMPT), host network is fine"
       if [ "$ATTEMPT" -ge 2 ] && incident_should_alert "supabase-unreachable" 1800 4 21600; then
-        notify "🔴 Supabase DB unreachable — the Jori app + phone channel are down (queries to jori_messages failing). Failing $ATTEMPT checks running. Check Supabase compute/dashboard for project ${JORI_SUPABASE_PROJECT} (likely compute saturation)."
+        notify "🔴 Supabase DB unreachable — the Jori app + phone channel are down (queries to jori_messages failing). Failing $ATTEMPT checks running. Check Supabase compute/dashboard for project ${JORI_SUPABASE_PROJECT} (likely compute saturation)."  # control-scan-ok: the software's name
       fi
     fi
   fi
@@ -2721,7 +2775,8 @@ fi
 # (heartbeat-sender, minibeat, dashboard: launchctl kickstart -k; the two wiki
 # servers: SIGTERM, process-manager respawns) as soon as their committed code is
 # newer than the process, and flags what it must not restart itself: whatsapp-
-# channel / phone-channel / process-manager on old code for 6h+, a restart that
+# channel / process-manager on old code for 6h+ (phone-channel is reloaded with
+# chat by the block above and pages through its exit 4), a restart that
 # did not take, and tracked code files left uncommitted for 12h+. Exit 6 = flag
 # (text in its state file's _flag), 0 = clear, 5 = could not read processes
 # (neither). Restarts and holds go to this log. Kill switch: data/.stale-code-watch-off.

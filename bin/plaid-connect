@@ -18,6 +18,11 @@
 //         pipeline end-to-end. (ins_127989 is a Plaid sandbox test bank.)
 //   plaid-connect status
 //       → list connected Items and their status.
+//   plaid-connect update --institution <name> [--add-accounts]
+//       → re-consent an existing Item. With --add-accounts, the bank's account
+//         picker reopens so NEW accounts under the same login (a new checking
+//         account next to an already-linked card) join that Item — no new
+//         Item, so the Plaid Item cap is untouched.
 //   plaid-connect webhook [--url <url>] [--item <id>] [--clear] [--dry-run]
 //       → point Items at the webhook that makes the sync event-driven. Safe on
 //         a live Item: /item/webhook/update changes only the callback address,
@@ -223,8 +228,18 @@ async function cmdUpdate(flags) {
   // could even print a URL. That broke the ONE command that repairs a card in
   // `login_required`, which is exactly when you need it (it blocked a card
   // re-auth). Pass `--products` explicitly if a future product is ever added.
+  const addAccounts = !!flags["add-accounts"];
   const products = (flags.products || "transactions").split(",").map((s) => s.trim());
-  const resp = await plaid.createLinkToken({ userId: flags.user || DEFAULT_USER, products, accessToken: target.access_token, webhook: webhookUrl() });
+  const resp = await plaid.createLinkToken({ userId: flags.user || DEFAULT_USER, products, accessToken: target.access_token, accountSelection: addAccounts, webhook: webhookUrl() });
+  // Not added to pending links: update mode returns no public token to
+  // exchange — the existing access token simply gains the accounts/consent.
+  if (addAccounts) {
+    console.log(`\nAdd accounts to: ${target.institution_name} (${target.item_id})`);
+    console.log("\n── Open this URL, log in, and SELECT every account to share (keep the existing ones checked) ──\n");
+    console.log(`  ${resp.hosted_link_url}\n`);
+    console.log("When done, run:  plaid-sync\n");
+    return;
+  }
   store.addPendingLinks([resp.link_token]);
   console.log(`\nUpdate (re-consent) for: ${target.institution_name} (${target.item_id})`);
   console.log(`Adding products: ${products.join(", ")}`);

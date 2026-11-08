@@ -28,6 +28,7 @@ import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import fs from "node:fs";
 import os from "node:os";
+import { at } from "./fixtures/fake-geo.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const SCRIPT = path.join(ROOT, "bin/location-confirm-resolve.mjs");
@@ -123,3 +124,96 @@ test("no shared street token and no time overlap still just asks", () => {
   });
   assert.equal(out.decision, "ask");
 });
+
+// The precheck (bin/location-confirm-precheck.mjs): the precheck never names a stop.
+//
+// It used to auto-confirm a candidate when any 4+-character piece of the
+// candidate's name appeared anywhere in an overlapping calendar event's text.
+// A diacritic cut a word of one candidate's name ("Sampleën" -> "sample"), the
+// piece was also the start of the city in the event's address ("Sampleton"),
+// and a neighbouring business was saved as the evening's stop. Whether an event
+// names a candidate is a reading (Rule #0b): the precheck now hands every ask
+// with candidates to the resolver, whose calendar tiers still confirm an event
+// that names a candidate in full. Synthetic names, places and coordinates.
+//
+{
+  const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+  const PRECHECK = path.join(ROOT, "bin/location-confirm-precheck.mjs");
+  const RESOLVE = path.join(ROOT, "bin/location-confirm-resolve.mjs");
+
+  // An empty installation (no confirmed stops, no keys, Jev off) and a stand-in
+  // `gog` that prints whatever calendar the test wrote to EVENTS_FILE.
+  const SANDBOX = fs.mkdtempSync(path.join(os.tmpdir(), "lc-precheck-"));
+  fs.mkdirSync(path.join(SANDBOX, "local", "config"), { recursive: true });
+  fs.mkdirSync(path.join(SANDBOX, "home", "data"), { recursive: true });
+  const EVENTS_FILE = path.join(SANDBOX, "events.json");
+  const FAKE_GOG = path.join(SANDBOX, "gog");
+  fs.writeFileSync(FAKE_GOG, `#!/bin/sh\ncat "${EVENTS_FILE}"\n`, { mode: 0o755 });
+  const ENV = { ...process.env, JORI_LOCAL_DIR: path.join(SANDBOX, "local"), JORI_HOME: path.join(SANDBOX, "home"),
+    JEV_QUESTIONS_DIR: path.join(ROOT, "agent/config/jev-questions"), TYPESAFE_API_KEY: "", GOG_BIN: FAKE_GOG };
+  test.after(() => fs.rmSync(SANDBOX, { recursive: true, force: true }));
+
+  const DINNER = {
+    summary: "Family dinner",
+    location: "12 Example Street, Sampleton",
+    description: "",
+    start: { dateTime: "2026-09-18T19:00:00+00:00" },
+    end: { dateTime: "2026-09-18T20:00:00+00:00" },
+  };
+  const ASK = {
+    ask_id: "lc-test-dinner",
+    centroid: at(0, 0),
+    first_sample_ts: "2026-09-18T19:34:50+00:00",
+    last_sample_ts: "2026-09-18T20:15:19+00:00",
+    duration_min: 40,
+    primary: { name: "Avocat francophone en Sampleën", address: "8 Sample Road", primary_type: "lawyer", source: "google_places" },
+    alternatives: [{ name: "Corner Bakery", address: "14 Sample Road", primary_type: "bakery", source: "osm_overpass" }],
+  };
+
+  function precheck(ask, events) {
+    fs.writeFileSync(EVENTS_FILE, JSON.stringify(events));
+    const res = spawnSync(process.execPath, [PRECHECK], { input: JSON.stringify(ask), encoding: "utf8", env: ENV, timeout: 20000 });
+    assert.equal(res.status, 0, `expected exit 0, got ${res.status}: ${res.stderr}`);
+    return JSON.parse(res.stdout.trim());
+  }
+
+  // The resolver's deterministic tiers, as the trigger reaches them on escalate.
+  function resolve(ask, events) {
+    const payload = {
+      centroid: ask.centroid,
+      candidates: [ask.primary, ...ask.alternatives],
+      calendarEvents: events.map((e) => ({ ...e, start: e.start.dateTime, end: e.end.dateTime })),
+      messages: [],
+      dwellWindow: { startMs: Date.parse(ask.first_sample_ts), endMs: Date.parse(ask.last_sample_ts) },
+    };
+    const res = spawnSync(process.execPath, [RESOLVE, "--resolve-only"], { input: JSON.stringify(payload), encoding: "utf8", env: ENV, timeout: 20000 });
+    assert.equal(res.status, 0, `expected exit 0, got ${res.status}: ${res.stderr}`);
+    return JSON.parse(res.stdout.trim());
+  }
+
+  test("a piece of a candidate's name in an overlapping event's address no longer confirms it", () => {
+    const out = precheck(ASK, [DINNER]);
+    assert.equal(out.decision, "escalate");
+    assert.equal(out.venue, undefined, "the precheck names no venue");
+    assert.equal(out.reasoning, "active_event");
+    // ...and the resolver it escalates to does not save the neighbour either.
+    const r = resolve(ASK, [DINNER]);
+    assert.equal(r.decision, "ask", JSON.stringify(r));
+  });
+
+  test("an event that names a candidate in full escalates, and the resolver confirms it", () => {
+    const show = { ...DINNER, summary: "Concert", location: "Corner Bakery, 14 Sample Road, Sampleton" };
+    assert.equal(precheck(ASK, [show]).decision, "escalate");
+    const r = resolve(ASK, [show]);
+    assert.equal(r.decision, "auto_confirm");
+    assert.equal(r.venue, "Corner Bakery");
+    assert.equal(r.source, "local:calendar");
+  });
+
+  test("no busy event over the dwell escalates; no candidates asks", () => {
+    const free = { ...DINNER, transparency: "transparent" };
+    assert.deepEqual(precheck(ASK, [free]), { decision: "escalate", reasoning: "no_active_event" });
+    assert.deepEqual(precheck(ASK, []), { decision: "escalate", reasoning: "no_active_event" });
+    assert.equal(precheck({ ...ASK, primary: null, alternatives: [] }, [DINNER]).decision, "ask");
+  });
+}

@@ -47,7 +47,7 @@ final class ShareComposeModel: ObservableObject {
                     try? await Task.sleep(for: .seconds(1.6))
                     finish(true)
                 case .failed:
-                    phase = .failed("Couldn't send this or save it for later. Open Jori, then share again.")
+                    phase = .failed("Couldn't send this or save it for later. Open \(Install.displayName), then share again.")
                 }
             } catch {
                 phase = .failed(error.localizedDescription)
@@ -123,7 +123,7 @@ struct ShareComposeView: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 12) {
                     preview
-                    TextField("Add a note for Jori…", text: $model.note, axis: .vertical)
+                    TextField("Add a note for \(Install.displayName)…", text: $model.note, axis: .vertical)
                         .lineLimit(1...6)
                         .textFieldStyle(.plain)
                         .focused($noteFocused)
@@ -141,7 +141,7 @@ struct ShareComposeView: View {
         HStack {
             Button("Cancel", action: model.cancel)
             Spacer()
-            Text("Jori").font(.headline)
+            Text(Install.displayName).font(.headline)
             Spacer()
             if model.phase == .sending {
                 ProgressView().controlSize(.small)
@@ -200,7 +200,7 @@ struct ShareComposeView: View {
     private var status: some View {
         switch model.phase {
         case .queued:
-            Label("Saved — Jori will send it the next time the app opens.", systemImage: "clock")
+            Label("Saved — \(Install.displayName) will send it the next time the app opens.", systemImage: "clock")
                 .font(.footnote).foregroundStyle(.secondary)
         case .failed(let message):
             Label(message, systemImage: "exclamationmark.triangle")

@@ -114,7 +114,7 @@ test("no match: create goes through and stamps the reference", () => {
   assert.ok(create, "create reached gog");
   const i = create.lastIndexOf("--private-prop");
   assert.equal(create[i + 1], "jori_booking_ref=40017733");
-  assert.ok(create.includes("gandalf_created=1"));
+  assert.ok(create.includes("jori_created=1"));
   const row = JSON.parse(fs.readFileSync(LOG, "utf8").trim().split("\n").pop());
   assert.equal(row.booking_ref, "40017733");
 });

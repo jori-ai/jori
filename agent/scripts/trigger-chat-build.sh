@@ -108,8 +108,15 @@ Write your report to $RESULT (Step 6). Build size: $SIZE. $THINK
 $SPEC
 ----- END REQUEST -----"
 
+# Which request this run is building, for self-improve-request: a change to a
+# locked file (rubric schema v6) may be filed as a card only from the chat build
+# the user asked for, and the CLI checks this id against running/<id>.json and
+# its `source`. Set here and nowhere else: a pipeline job (improvement-plan, the
+# executor, system-issue-review, skill-repair, the cost review) never has it.
+export JORI_CHAT_BUILD_REQUEST="$ID"
 "$SCRIPTS/lib/run-ephemeral-opus.sh" chat-build "$JOB_MD" --task "$TASK" --timeout-min "$TIMEOUT_MIN" ${RUN_ARGS[@]+"${RUN_ARGS[@]}"}
 RC=$?
+unset JORI_CHAT_BUILD_REQUEST
 log "$ID: runner exit $RC"
 
 if [ "$RC" -eq 78 ]; then

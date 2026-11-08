@@ -315,6 +315,19 @@ def patch_row(row_id: str, patch: dict) -> bool:
         return False
 
 
+def ended_before(departed_at: Optional[str], moment: datetime) -> bool:
+    """True when a visit's departure is known and earlier than `moment`."""
+    if not departed_at:
+        return False
+    try:
+        dep = datetime.fromisoformat(departed_at.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    if dep.tzinfo is None:
+        dep = dep.replace(tzinfo=timezone.utc)
+    return dep < moment
+
+
 def resolve_nearby_visit(near_start: datetime, note: str) -> Optional[dict]:
     """Stamp the nearest not-yet-resolved VISIT row following near_start.
 
@@ -337,6 +350,13 @@ def resolve_nearby_visit(near_start: datetime, note: str) -> Optional[dict]:
     Picks the single earliest match in the window -- good enough for the
     common case (one destination stop following one departure/answer);
     an ambiguous multi-stop window is rare and not worth over-engineering.
+
+    A visit that ended before near_start is never the one: the 15-minute
+    look-back is for a stop that registered a little before the window, not
+    for the stop before it. Without that check, a note about the stop the
+    window covers (already named, so skipped) landed on a short pause minutes
+    earlier as its "user-confirmed" name, and the day's summary printed the
+    note as a stop.
     """
     key = get_key()
     if not key:
@@ -348,8 +368,8 @@ def resolve_nearby_visit(near_start: datetime, note: str) -> Optional[dict]:
         ("arrived_at", f"gte.{window_start.isoformat()}"),
         ("arrived_at", f"lte.{window_end.isoformat()}"),
         ("order", "arrived_at.asc"),
-        ("limit", "5"),
-        ("select", "id,arrived_at,place_type,place_name"),
+        ("limit", "10"),
+        ("select", "id,arrived_at,departed_at,place_type,place_name"),
     ])
     url = f"{SUPABASE_URL}/rest/v1/location_history?{qs}"
     req = urllib.request.Request(url, headers={"apikey": key, "Authorization": f"Bearer {key}"})
@@ -360,6 +380,8 @@ def resolve_nearby_visit(near_start: datetime, note: str) -> Optional[dict]:
         return None
     for row in rows:
         if row.get("place_type") in RESOLVED_PLACE_TYPES:
+            continue
+        if ended_before(row.get("departed_at"), near_start):
             continue
         place_name = note.strip()[:120]
         if patch_row(row["id"], {"place_name": place_name, "place_type": "user-confirmed"}):

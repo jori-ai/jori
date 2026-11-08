@@ -43,11 +43,42 @@
 // (trigger-daily-summary-fix.sh, keychain session) confirms the Max sign-in and runs
 // `release-held`, which sends through the full check.
 //
-//   daily-summary-fix request <date> [--reason R] [--answer "<the user's words>"] [--from-review] [--no-kick]
+// A correction is sent once per burst, not once per correction. Each reply the user
+// emails about a sent summary gets its own short answer in the thread at once (the
+// email-inbound turn), and queues a fix run; every run used to send the whole
+// summary again as "(corrected)", so a few replies in a row meant as many full
+// copies, each an unread starred email. Now a run that corrects a sent day stages
+// its version, and code sends the newest one once no correction has come in for
+// the quiet window. The staged copy is kept on disk with the day's state, so a
+// restart loses nothing: the runner's wake fires at the due time, and the hourly
+// sweep queues anything past due.
+//
+// The evening pass (the user, 2026-10-21: on a Tuesday the calendar had two friends
+// at 8pm and at 10:20pm the user wrote where they had dinner; the fix loop asked
+// whether the friends were at the dinner at 4:37am Wednesday. "Why wait until
+// 4:37am to ask this?"). What can be seen while the day is going is settled that
+// evening, or asked then. Once a day, at the hourly sweep's first run at or after
+// `evening_hour` (22) the user's local time, on a day with a timed calendar event
+// that has begun (not cancelled or declined, not a video meeting: structure, never
+// the title), the sweep starts the fixer for TODAY in its `before_summary` phase
+// (jobs/daily-summary-fix.md § Before the summary): it settles what the user's
+// calendar and words settle, asks at most two questions, and never builds, reviews
+// or sends. Those questions open with "Before I write up your <day>", hold no email
+// (no answer window: the 4am build never waits for them), and stop mattering once
+// the summary is built: a held one is dropped, and the send or the close retires
+// any still open, so an unanswered evening question never keeps the day open.
+// Kill switch: data/daily-summary-fix/.evening-off.
+//
+//   daily-summary-fix request <date> [--reason R] [--answer "<the user's words>"] [--from-review] [--evening] [--no-kick]
 //       (--from-review: the daily summary's reviewer did not confirm the day; read by pickTier)
+//       (--evening: the evening pass for this day; the sweep's own request, by hand only to re-run it)
 //       queue a fix run (the daily-summary fork on a non-confirmed review; the
 //       chat agent with the user's answer to a fixer question; the hourly sweep)
-//   daily-summary-fix status <date>                  the state JSON
+//   daily-summary-fix status <date>                  the state JSON, with its computed `phase`
+//   daily-summary-fix phase <date>                   before_summary | after_summary (the launchd runner reads it):
+//       before_summary only for a day the evening pass started whose summary is not built yet
+//   daily-summary-fix idle <date>                    (the runner, after a before_summary run) a day that run
+//       left queued waits for the 4am build (`waiting_for_summary`), not for another run
 //   daily-summary-fix tier <date>                    which model this date's next fix run uses:
 //       {"tier":"sonnet"|"opus","reason":...}. Sonnet first; Opus once a Sonnet run for the
 //       date got stuck (see pickTier). Read by trigger-daily-summary-fix.sh.
@@ -61,6 +92,9 @@
 //       Inside the user's quiet hours it is recorded and held (exit 0, `held_until` on the
 //       question); it is asked once the user is up (sweep → release-held), and the email waits for it.
 //       Questions never carry a card charge, an amount or a health reading.
+//       --evening (or DS_FIX_PHASE=before_summary, which the runner sets for a before_summary run):
+//       an evening-pass question: at most two, opens no answer window, refused (exit 3) once the
+//       day's summary is built.
 //   daily-summary-fix gate <date> [--peek]           may the email go now? exit 0 = send, 3 = hold (JSON on stdout);
 //       a hold parks the day awaiting_<owner_id> so the sweep watches it (--peek: read only).
 //       `open` lists the questions the user has been asked and owes an answer to; a question
@@ -68,6 +102,12 @@
 //   daily-summary-fix answered <date> <n> [<n> ...]  mark the questions the user's words settle (the fixer's reading)
 //   daily-summary-fix release <date> [--reason R]    the user asked for the summary now: end the wait, queue a run
 //   daily-summary-fix mark-sent <date> [--corrected]   record that the email went out (first send or a correction)
+//   daily-summary-fix stage <date> --subject S --body-file F [--push P]
+//       a correction (the day already went out): keep this version, to go once the user's
+//       corrections have stopped for 20 minutes (`correction_quiet_min`); a later stage
+//       replaces it. Sends nothing itself. Exit 3: the day was never sent (send it at once).
+//   daily-summary-fix send-due                       (launchd runner only) send each staged correction
+//       whose quiet window has passed, record the send; arm the wake for one not yet due
 //   daily-summary-fix done <date> --status confirmed|gave_up [--note N] [--still-open <i,j,...|none>]
 //       close the loop; gave_up files the remaining code-owned defects to the system channel:
 //       with --still-open only those log entries (0-based indices, as `log` prints them; none = nothing),
@@ -75,7 +115,8 @@
 //   daily-summary-fix sweep                          (cron, hourly) mark questions held through the user's quiet
 //       hours due once the user is up (sends nothing: queues `release-held` for launchd); start the fixer for a day whose answer window
 //       has closed unsent, for a never-sent day whose run died, and for a day still waiting on
-//       the user after its window once the user has written since the question
+//       the user after its window once the user has written since the question; and, once a
+//       day from `evening_hour`, the evening pass for today
 //   daily-summary-fix release-held                   (launchd only, after the Max sign-in check) send the
 //       held questions the sweep marked due, one at a time, saving after each
 //   daily-summary-fix section <date> [--settled <i,j,...|none>] [--into <html>]  the "What the review caught"
@@ -87,7 +128,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { createRequire } from "node:module";
 
 const INST = createRequire(import.meta.url)("../lib/instance.cjs");
@@ -118,6 +159,37 @@ const RELEASE_MARKER = "release-held";
 const RELEASE_ANCHOR_MS = 10 * 60e3;
 // The sweep's due mark is honoured this long (the next sweep renews it).
 const RELEASE_DUE_MAX_MS = 6 * 3600e3;
+// A staged correction goes once the user's corrections have stopped this long
+// (agent/local/config/daily-summary-fix.json `correction_quiet_min`, default 20).
+const CORRECTION_QUIET_MS = (() => {
+  const m = Number(INST.localConfig("daily-summary-fix", { correction_quiet_min: 20 }).correction_quiet_min);
+  return (Number.isFinite(m) && m >= 0 ? m : 20) * 60e3;
+})();
+const CORRECTION_STALE_MS = 3 * 3600e3;  // a newer correction whose run never finished: the newest copy goes anyway
+const SENDING_CLAIM_MS = 15 * 60e3;      // a send in flight (or one that died mid-way) is left alone this long
+const SEND_PAGE_AFTER = 3;               // failed sends of a staged correction before the system channel hears of it
+const SEND_DUE_MARKER = "send-due";      // the launchd queue marker for `send-due`
+const PENDING = path.join(DIR, "pending");
+// The evening pass. It starts at the first sweep (:52) at or after this local hour
+// (agent/local/config/daily-summary-fix.json `evening_hour`, default 22): the day's
+// dinner is usually over by then, and it is well before the quiet hours begin.
+const EVENING_HOUR = (() => {
+  const h = Number(INST.localConfig("daily-summary-fix", { evening_hour: 22 }).evening_hour ?? 22);
+  return Number.isInteger(h) && h >= 0 && h <= 23 ? h : 22;
+})();
+const EVENING_MAX_QUESTIONS = 2;         // asked that evening, at most (they do not count toward the day's cap)
+const EVENING_OFF = path.join(DIR, ".evening-off");          // kill switch
+const EVENING_LAST = path.join(DIR, "evening-last.json");    // the last day the sweep looked at, and what it did
+// The 4am build (system/tasks.json daily-summary, 0 4 * * * the user's local time). An
+// evening question still unsent then is moot: the summary is being built without it.
+const SUMMARY_BUILD_HOUR = 4;
+// A day the evening pass started stays before_summary through the next morning, until
+// this local hour: past it with no send recorded, a correction is treated as one to a
+// built day (rebuilt and sent), the safe side if the build's own record went missing.
+const BEFORE_SUMMARY_UNTIL_HOUR = 12;
+// What the send or the close writes on an evening question still open then.
+const EVENING_RETIRED = "the summary was built without it";
+const DELIVER = process.env.DS_FIX_DELIVER_BIN || path.join(ROOT, "bin", "digest-deliver");
 
 const argv = process.argv.slice(2);
 const cmd = argv[0];
@@ -135,7 +207,7 @@ const stateFile = (d) => path.join(DIR, `${d}.json`);
 // The user chose this over all-Opus (D5, 2026-10-22) when the fixer was ~15% of
 // the weekly allowance. What a run left behind, recorded by `tier-done`:
 function snapshot(s) {
-  const openQs = (s.questions || []).filter((q) => !q.answered_at && !q.dropped_at).length;
+  const openQs = (s.questions || []).filter((q) => !q.evening && !q.answered_at && !q.dropped_at).length;
   return { status_after: s.status, requests_after: (s.requests || []).length, open_questions_after: openQs };
 }
 // A date escalates to Opus, and stays there, when its last Sonnet run
@@ -181,6 +253,26 @@ const escapeHtml = (t) => String(t ?? "").replace(/&/g, "&amp;").replace(/</g, "
 function kick(d) {
   fs.mkdirSync(QUEUE, { recursive: true });
   fs.writeFileSync(path.join(QUEUE, d), now() + "\n"); // launchd QueueDirectories starts the runner
+}
+// A fix run for the day is still to come (queued, or waiting on the allowance governor in held/).
+const isQueued = (d) => fs.existsSync(path.join(QUEUE, d)) || fs.existsSync(path.join(DIR, "held", d));
+
+/**
+ * Start the launchd runner when a staged correction comes due: at once (the marker),
+ * or from a detached sleep that drops it then. The sleep does not survive a restart;
+ * the hourly sweep drops the same marker for anything past due, so a lost wake
+ * delays the email, never loses it. DS_FIX_WAKE_LOG (tests) records the wake instead.
+ */
+function armSendDue(dueMs) {
+  if (!Number.isFinite(dueMs)) return;
+  const marker = path.join(QUEUE, SEND_DUE_MARKER);
+  const secs = Math.ceil((dueMs - clock().getTime()) / 1000);
+  fs.mkdirSync(QUEUE, { recursive: true });
+  if (secs <= 0) { fs.writeFileSync(marker, now() + "\n"); return; }
+  if (process.env.DS_FIX_WAKE_LOG) { fs.appendFileSync(process.env.DS_FIX_WAKE_LOG, `${new Date(dueMs).toISOString()}\n`); return; }
+  try {
+    spawn("/bin/sh", ["-c", 'sleep "$1" && date -u > "$2"', "sh", String(secs + 5), marker], { detached: true, stdio: "ignore" }).unref();
+  } catch (e) { console.error(`daily-summary-fix: could not arm the wake (${e.message}); the hourly sweep sends it instead`); }
 }
 
 // ── The answer window ──────────────────────────────────────────────────────
@@ -306,19 +398,103 @@ function heIsUp(tz) {
  * procedure daily-summary-fix.md, or the hourly sweep), which has its own loop, so
  * it fades after 48h rather than joining hum's re-ask ledger.
  */
-function sendQuestion(d, n, text, { note = "", burst = false, asOf = "live", nowMs }) {
+function sendQuestion(d, n, text, { note = "", burst = false, asOf = "live", nowMs, evening = false, tz = null }) {
   const dayName = new Date(`${d}T12:00:00Z`).toLocaleDateString("en-US", { weekday: "long", month: "long", day: "numeric", timeZone: "UTC" });
   const qmeta = { question_id: `dsf:${d}:${n}`, question_until: new Date(nowMs + 48 * 3600e3).toISOString() };
+  // An evening question stops mattering when the 4am build makes the summary. The
+  // question hold (lib/question-hold.mjs) keeps a question while chat is not reading
+  // and replays it later; `moot_after` tells it, as structure, to drop this one
+  // rather than ask about a summary that is already written.
+  if (evening) qmeta.moot_after = new Date(eveningMootAt(d, tz || localTz())).toISOString();
+  const opener = evening ? `📝 Before I write up your ${dayName}:` : `📝 Fixing your ${dayName} summary:`;
   // --capture-id: the send exits 0 even when the outbound check holds the message
   // back, and a question the user never saw must not hold the user's email. It writes
   // {"suppressed":true} in that case (the row id otherwise).
   const cap = path.join(os.tmpdir(), `dsfix-ask-${process.pid}-${nowMs}-${n}`);
   let suppressed = false;
   try {
-    send([...(burst ? ["--no-push"] : []), "--capture-id", cap, "--metadata-json", JSON.stringify(qmeta), "--channel", "chat", "--intent", "daily-summary-fix", "--evidence-as-of", asOf, `📝 Fixing your ${dayName} summary: ${text}${note}`]);
+    send([...(burst ? ["--no-push"] : []), "--capture-id", cap, "--metadata-json", JSON.stringify(qmeta), "--channel", "chat", "--intent", "daily-summary-fix", "--evidence-as-of", asOf, `${opener} ${text}${note}`]);
     try { suppressed = JSON.parse(fs.readFileSync(cap, "utf8")).suppressed === true; } catch {}
   } finally { fs.rmSync(cap, { force: true }); }
   return !suppressed;
+}
+
+// ── The evening pass ───────────────────────────────────────────────────────
+/** When an evening question about `d` stops mattering: the 4am build the next morning. */
+function eveningMootAt(d, tz) { return wallToUtc(addDays(d, 1), SUMMARY_BUILD_HOUR, tz); }
+
+/**
+ * before_summary: the evening pass started this day and its summary is not built yet,
+ * so a fix run only settles and asks (no rebuild, review or send), and the user's answer
+ * goes into the morning's summary. after_summary: everything else, the fix loop proper.
+ * Structure only: the day is after_summary once it was sent, handed over by the 4am
+ * build's review, closed, or asked about by anything but the evening pass (the 4am
+ * build's own questions); without an evening pass it always is (the old behaviour);
+ * and past noon the next day, whatever the record says. Pure apart from the clock.
+ */
+export function phaseOf(s, nowMs = clock().getTime(), tz = localTz()) {
+  if (!s.evening_at) return "after_summary";
+  if ((s.sends || []).length) return "after_summary";
+  if ((s.requests || []).some((r) => r.from === "review")) return "after_summary";
+  if (["confirmed", "gave_up"].includes(s.status)) return "after_summary";
+  if ((s.questions || []).some((q) => !q.evening)) return "after_summary";
+  const { date: today, hour } = partsIn(nowMs, tz);
+  if (s.date === today) return "before_summary";
+  if (s.date === addDays(today, -1) && hour < BEFORE_SUMMARY_UNTIL_HOUR) return "before_summary";
+  return "after_summary";
+}
+
+/**
+ * The send or the close retires the evening questions still open: they hold nothing
+ * once the summary exists, and must not keep the day waiting on the user. A reply that
+ * comes later still reaches the fix loop as a correction (the chat agent's `request
+ * --answer`). Returns how many it retired.
+ */
+function retireEvening(t, why = EVENING_RETIRED) {
+  let n = 0;
+  for (const q of t.questions || []) {
+    if (q.evening && !q.answered_at && !q.dropped_at) { q.dropped_at = now(); q.dropped_why = why; n++; }
+  }
+  return n;
+}
+
+// A video meeting, from the event's structure: a Meet or conference-video entry, or a
+// location that is a video-call link. A dinner whose location is a maps link is not one.
+const VIDEO_HOSTS = ["zoom.us", "zoom.com", "meet.google.com", "teams.microsoft.com", "teams.live.com", "whereby.com", "webex.com"];
+function isVideoLocation(loc) {
+  if (loc.startsWith("zoom.") || loc.startsWith("meet.google")) return true;
+  try { const h = new URL(loc).hostname; return VIDEO_HOSTS.some((v) => h === v || h.endsWith(`.${v}`)); } catch { return false; }
+}
+/**
+ * Is there something on today's calendar for the evening pass to look at? A timed event
+ * (not all-day) that has begun by `nowMs`, is not cancelled, not declined by the user, and
+ * is not a video meeting. Pure: the events in.
+ */
+export function eveningEvents(events, nowMs) {
+  return (events || []).filter((e) => {
+    if (!e || !e.start || !e.start.dateTime || e.status === "cancelled") return false;
+    if (!(Date.parse(e.start.dateTime) <= nowMs)) return false;
+    const self = (e.attendees || []).find((a) => a && a.self);
+    if (self && self.responseStatus === "declined") return false;
+    const loc = String(e.location || "").trim();
+    const video = Boolean(e.hangoutLink) || isVideoLocation(loc)
+      || ((e.conferenceData && e.conferenceData.entryPoints) || []).some((p) => p && p.entryPointType === "video");
+    return !video;
+  });
+}
+/**
+ * Read today's calendar (lib/meeting-call.mjs readCalendarDay, the gog read the daily
+ * summary uses). Fails open: a calendar that cannot be read starts the pass, whose
+ * playbook reads the day itself. DS_FIX_EVENING_EVENTS (tests): the events as JSON.
+ */
+async function eveningHasCalendar(d, tz, nowMs) {
+  if (process.env.DS_FIX_EVENING_EVENTS != null) {
+    try { return eveningEvents(JSON.parse(process.env.DS_FIX_EVENING_EVENTS), nowMs).length > 0; } catch { return true; }
+  }
+  try {
+    const { readCalendarDay } = await import("../lib/meeting-call.mjs");
+    return eveningEvents(readCalendarDay(d, tz), nowMs).length > 0;
+  } catch { return true; }
 }
 
 /**
@@ -382,7 +558,7 @@ export function verdict(s, nowMs = clock().getTime()) {
   const sent = lastSendAt(s);
   const hold = sent ? (s.correction_hold && s.correction_hold.set_at > sent ? s.correction_hold : null) : (s.hold || null);
   const pending = (s.questions || []).map((q, i) => ({ ...q, n: q.n || i + 1 }))
-    .filter((q) => !q.answered_at && !q.dropped_at && (!sent || q.at > sent));
+    .filter((q) => !q.evening && !q.answered_at && !q.dropped_at && (!sent || q.at > sent)); // an evening question never holds the email
   const open = pending.filter((q) => reachedAt(q)).map(({ n, text, at }) => ({ n, text, at }));
   const held = pending.filter((q) => !reachedAt(q)).map(({ n, text, at, held_until }) => ({ n, text, composed_at: at, held_until, status: "held, not yet asked" }));
   const base = { phase: sent ? "correction" : "first_send", open, held_not_asked: held, hold_until: hold ? hold.until : null, hold_until_local: hold ? hold.label : null };
@@ -392,14 +568,61 @@ export function verdict(s, nowMs = clock().getTime()) {
   return { send: true, reason: "window_closed", ...base };
 }
 
+/**
+ * May the staged correction go now? It goes once no correction has come in since the
+ * last send for the quiet window (the user's own `request`s; the sweep's do not count,
+ * and the user asking for it now, `release`, ends the wait), never before it was staged.
+ * While a request newer than the staged copy still has a fix run to come (`queued`, or
+ * none finished since), it waits for that run, so the email carries every correction;
+ * past CORRECTION_STALE_MS the newest copy goes anyway. Questions asked since the send
+ * hold it as they hold any correction (`verdict`). Pure: state, clock and `queued` in.
+ */
+export function correctionDue(s, nowMs, { queued = false } = {}) {
+  const p = s.pending_correction;
+  const sent = lastSendAt(s) || "";
+  if (!p) return { send: false, reason: "nothing_staged" };
+  if (p.staged_at <= sent) return { send: false, reason: "superseded" }; // a send since made it moot
+  const since = (s.requests || []).filter((r) => r.at > sent);
+  const lastBy = (rs) => rs.map((r) => r.at).sort().pop() || "";
+  const lastCorrection = lastBy(since.filter((r) => r.from !== "sweep" && r.from !== "release"));
+  const released = since.some((r) => r.from === "release" && r.at >= lastCorrection);
+  const dueMs = Math.max(Date.parse(p.staged_at), released || !lastCorrection ? 0 : Date.parse(lastCorrection) + CORRECTION_QUIET_MS);
+  const lastReq = lastBy(since);
+  const current = !queued && (p.staged_at >= lastReq || lastBy(s.tier_runs || []) >= lastReq);
+  const base = { due_at: new Date(dueMs).toISOString(), staged_at: p.staged_at };
+  const v = verdict(s, nowMs);
+  if (!v.send) return { send: false, reason: v.reason, ...base };
+  if (nowMs < dueMs) return { send: false, reason: "quiet_window", ...base };
+  if (!current && nowMs - Date.parse(lastReq) < CORRECTION_STALE_MS) return { send: false, reason: "newer_correction_pending", ...base };
+  return { send: true, reason: current ? "quiet" : "stale_run", ...base };
+}
+
+// Record that the email went out (mark-sent, send-due). Sent with questions still open
+// (the window closed): keep the day parked on the user, so a late answer the chat agent
+// misses is still picked up by the sweep.
+// The evening questions still open are retired: the summary exists now, so they must not
+// keep the day parked on the user (a day left waiting only on them, or on the build, is `sent`).
+function recordSend(t, entry) {
+  (t.sends = t.sends || []).push({ at: now(), ...entry });
+  const retired = retireEvening(t);
+  if (["confirmed", "gave_up"].includes(t.status)) return;
+  if (t.questions.some((q) => !q.answered_at && !q.dropped_at)) t.status = AWAITING;
+  else if ((retired && t.status === AWAITING) || t.status === "waiting_for_summary") t.status = "sent";
+}
+
 if (cmd === "request") {
-  if (!isDate(date)) die("usage: request <YYYY-MM-DD> [--reason R] [--answer TEXT] [--from-review] [--no-kick]");
+  if (!isDate(date)) die("usage: request <YYYY-MM-DD> [--reason R] [--answer TEXT] [--from-review] [--evening] [--no-kick]");
   const s = load(date);
   if (s.status === "confirmed") {
     // A confirmed day can still be reopened by the user's answer or a new reason.
     if (!opt("--answer") && !opt("--reason")) { console.log(`${date} already ${s.status}`); process.exit(0); }
   }
-  s.requests.push({ at: now(), reason: opt("--reason") || (opt("--answer") ? "his answer" : "unspecified"), ...(has("--from-review") ? { from: "review" } : {}) });
+  const evening = has("--evening");
+  // An evening pass only fits a day whose summary is not built yet (today, or last night before the build).
+  if (evening && phaseOf({ ...s, evening_at: s.evening_at || now() }) !== "before_summary") { console.log(`${date}: its summary is already built; no evening pass`); process.exit(0); }
+  if (evening) s.evening_at = s.evening_at || now();
+  const from = has("--from-review") ? "review" : evening ? "evening" : null;
+  s.requests.push({ at: now(), reason: opt("--reason") || (opt("--answer") ? "his answer" : evening ? "evening pass: settle or ask about the day while it is fresh" : "unspecified"), ...(from ? { from } : {}) });
   if (opt("--answer")) s.answers.push({ at: now(), text: String(opt("--answer")).slice(0, 2000) });
   s.status = "queued";
   save(s);
@@ -418,7 +641,18 @@ if (cmd === "request") {
   console.log(JSON.stringify(s.tier_runs[s.tier_runs.length - 1]));
 } else if (cmd === "status") {
   if (!isDate(date)) die("usage: status <YYYY-MM-DD>");
-  console.log(JSON.stringify(load(date), null, 2));
+  const s = load(date);
+  console.log(JSON.stringify({ ...s, phase: phaseOf(s) }, null, 2));
+} else if (cmd === "phase") {
+  if (!isDate(date)) die("usage: phase <YYYY-MM-DD>");
+  console.log(phaseOf(load(date)));
+} else if (cmd === "idle") {
+  // The runner, after a before_summary run: one that settled what it could and asked
+  // nothing leaves the day waiting for the 4am build, not looking queued (which the
+  // sweep would treat as a run that died). Any other status is left as it is.
+  if (!isDate(date)) die("usage: idle <YYYY-MM-DD>");
+  const s = mutate(date, (t) => { if (t.status === "queued" && phaseOf(t) === "before_summary" && !isQueued(date)) t.status = "waiting_for_summary"; });
+  console.log(`${date} ${s.status}`);
 } else if (cmd === "log") {
   if (!isDate(date)) die("usage: log <date> --finding F --action A --outcome O");
   const outcome = opt("--outcome");
@@ -434,9 +668,19 @@ if (cmd === "request") {
   if (!q) die("--question is required");
   const s = load(date);
   if (s.questions.some((x) => x.text === q && !x.answered_at && !x.dropped_at)) { console.log("already asked"); process.exit(0); }
-  if (s.questions.length >= MAX_QUESTIONS_PER_DAY) die(`already asked ${MAX_QUESTIONS_PER_DAY} questions about ${date}; the rest stay in the email's follow-ups`, 3);
   const nowMs = clock().getTime();
   const tz = localTz();
+  // An evening-pass question: by flag, or because the runner started this run in the
+  // before_summary phase (it exports DS_FIX_PHASE, so a run that forgets the flag still
+  // cannot open an answer window that would hold the 4am email).
+  const evening = has("--evening") || process.env.DS_FIX_PHASE === "before_summary";
+  if (evening) {
+    if (phaseOf(s, nowMs, tz) !== "before_summary") die(`${date}'s summary is already being built or was sent; an evening question no longer fits (ask without --evening only from the fix loop)`, 3);
+    const asked = s.questions.filter((x) => x.evening).length + (s.held_back || []).filter((x) => x.evening).length;
+    if (asked >= EVENING_MAX_QUESTIONS) die(`already asked ${EVENING_MAX_QUESTIONS} questions about ${date} this evening; the 4am build settles the rest`, 3);
+  } else if (s.questions.filter((x) => !x.evening).length >= MAX_QUESTIONS_PER_DAY) {
+    die(`already asked ${MAX_QUESTIONS_PER_DAY} questions about ${date}; the rest stay in the email's follow-ups`, 3);
+  }
   const n = s.questions.length + 1;
   // Composed in the user's quiet hours: recorded and held, not sent. It is asked once the user is
   // up (the sweep marks it due, the launchd runner sends it). The email waits for it
@@ -445,39 +689,45 @@ if (cmd === "request") {
   const quietEnd = quietUntil(nowMs, tz, quietHours(), heIsUp(tz));
   if (quietEnd !== null) {
     const sent = lastSendAt(s);
-    if (!sent && !s.hold) {
+    if (evening) {
+      // Held like any other, but it opens no window: the email never waits for it, and
+      // it is dropped unasked once the summary is built (sweep, release-held).
+    } else if (!sent && !s.hold) {
       const until = holdUntilFor(quietEnd, tz);
       s.hold = { set_at: now(), until: new Date(until).toISOString(), label: clockLabel(until, tz, quietEnd), tz, after_quiet: true };
     } else if (sent && !(s.correction_hold && s.correction_hold.set_at > sent)) {
       const until = quietEnd + CORRECTION_HOLD_MS;
       s.correction_hold = { set_at: now(), until: new Date(until).toISOString(), label: clockLabel(until, tz, quietEnd), tz, after_quiet: true };
     }
-    s.questions.push({ n, at: now(), text: q, held_until: new Date(quietEnd).toISOString() });
+    s.questions.push({ n, at: now(), text: q, held_until: new Date(quietEnd).toISOString(), ...(evening ? { evening: true } : {}) });
     s.status = AWAITING;
     s.log.push({ at: now(), finding: q, action: HELD_ACTION, outcome: "asked", commit: null });
     save(s);
     const v = verdict(s, nowMs);
-    console.log(`held (question ${n}): inside his quiet hours; asked once he is up, ${clockLabel(quietEnd, tz, nowMs)} at the latest${v.send ? "" : `; the email waits until ${v.hold_until_local} or his answers`}`);
+    const after = evening ? (quietEnd > eveningMootAt(date, tz) ? "; dropped unasked if the summary is built first" : "") : v.send ? "" : `; the email waits until ${v.hold_until_local} or his answers`;
+    console.log(`held (question ${n}): inside his quiet hours; asked once he is up, ${clockLabel(quietEnd, tz, nowMs)} at the latest${after}`);
     process.exit(0);
   }
   // Questions asked together buzz the user's phone once; the rest land quietly beside it.
   const burst = s.questions.some((x) => reachedAt(x) && nowMs - Date.parse(reachedAt(x)) < BURST_MS);
-  const w = windowOnReach(s, now(), nowMs, tz);
+  const w = evening ? { note: "", apply: () => {} } : windowOnReach(s, now(), nowMs, tz);
   // A question the user must answer; the fixer resumes on the user's reply. Live: composed this run.
-  if (!sendQuestion(date, n, q, { note: w.note, burst, asOf: "live", nowMs })) {
+  if (!sendQuestion(date, n, q, { note: w.note, burst, asOf: "live", nowMs, evening, tz })) {
     // Kept out of the fix log: it is not a defect, and the email should not list it.
-    (s.held_back = s.held_back || []).push({ at: now(), text: q });
+    // (The question hold may still send it once chat is reading; an evening one carries
+    // `moot_after`, so it is dropped there instead once the summary is being built.)
+    (s.held_back = s.held_back || []).push({ at: now(), text: q, ...(evening ? { evening: true } : {}) });
     save(s);
     console.log("not asked: the outbound check held it back (the summary does not wait on it)");
     process.exit(5);
   }
   w.apply(s);
-  s.questions.push({ n, at: now(), text: q });
+  s.questions.push({ n, at: now(), text: q, ...(evening ? { evening: true } : {}) });
   s.status = AWAITING;
   s.log.push({ at: now(), finding: q, action: "asked you in chat", outcome: "asked", commit: null });
   save(s);
   const v = verdict(s, nowMs);
-  console.log(v.send ? `asked (question ${n})` : `asked (question ${n}); the email waits until ${v.hold_until_local} or his answers`);
+  console.log(evening ? `asked (question ${n}, evening: the answer goes into the morning's summary)` : v.send ? `asked (question ${n})` : `asked (question ${n}); the email waits until ${v.hold_until_local} or his answers`);
 } else if (cmd === "gate") {
   if (!isDate(date)) die("usage: gate <YYYY-MM-DD> [--peek]");
   const s = load(date);
@@ -504,7 +754,7 @@ if (cmd === "request") {
   const s = load(date);
   const t = now();
   for (const h of [s.hold, s.correction_hold]) if (h && h.until > t) { h.until = t; h.released_at = t; }
-  s.requests.push({ at: t, reason: opt("--reason") || "he asked for the summary now" });
+  s.requests.push({ at: t, reason: opt("--reason") || "he asked for the summary now", from: "release" });
   s.status = "queued";
   save(s);
   if (!has("--no-kick")) kick(date);
@@ -528,6 +778,7 @@ if (cmd === "request") {
     const asked = reachedAt(q); // a question still held, or dropped, was never put to him
     if (asked && !q.answered_at && s.answers.some((a) => a.at > asked)) q.answered_at = s.answers.find((a) => a.at > asked).at;
   }
+  retireEvening(s, "the day was closed"); // what is still open of the evening pass holds nothing now
   save(s);
   if (st === "gave_up") {
     // Backstop: what the fixer could not fix goes where code defects are fixed.
@@ -540,14 +791,86 @@ if (cmd === "request") {
   console.log(`${date} ${st}`);
 } else if (cmd === "mark-sent") {
   if (!isDate(date)) die("usage: mark-sent <date> [--corrected]");
-  const s = load(date);
-  s.sends = s.sends || [];
-  s.sends.push({ at: now(), corrected: has("--corrected") });
-  // Sent with questions still open (the window closed): keep the day parked on the user,
-  // so a late answer the chat agent misses is still picked up by the sweep.
-  if (s.questions.some((q) => !q.answered_at && !q.dropped_at) && !["confirmed", "gave_up"].includes(s.status)) s.status = AWAITING;
-  save(s);
+  mutate(date, (t) => recordSend(t, { corrected: has("--corrected") }));
   console.log(`${date} send recorded`);
+} else if (cmd === "stage") {
+  if (!isDate(date)) die("usage: stage <date> --subject S --body-file F [--push P]");
+  const subject = opt("--subject"), body = opt("--body-file");
+  if (!subject || !body || subject.startsWith("--") || body.startsWith("--")) die("stage: --subject and --body-file are required");
+  let html;
+  try { html = fs.readFileSync(body, "utf8"); } catch (e) { die(`stage: cannot read ${body}: ${e.message}`); }
+  if (!lastSendAt(load(date))) die(`stage: ${date} has not been sent yet; a first send goes out at once (digest-deliver), only a correction is staged`, 3);
+  // The copy that will go, kept beside the state (the fixer's /tmp file is rebuilt by the next run).
+  fs.mkdirSync(PENDING, { recursive: true });
+  const file = path.join(PENDING, `${date}.html`);
+  fs.writeFileSync(`${file}.tmp-${process.pid}`, html);
+  fs.renameSync(`${file}.tmp-${process.pid}`, file);
+  const s = mutate(date, (t) => {
+    const prev = t.pending_correction;
+    t.pending_correction = { staged_at: now(), subject, push: opt("--push") || null, body_file: file, versions: (prev ? prev.versions || 1 : 0) + 1 };
+  });
+  const nowMs = clock().getTime();
+  const c = correctionDue(s, nowMs, { queued: isQueued(date) });
+  const dueMs = Date.parse(c.due_at);
+  armSendDue(dueMs);
+  mutate(date, (t) => { if (t.pending_correction) t.pending_correction.wake_at = c.due_at; });
+  console.log(dueMs <= nowMs ? `staged: the corrected summary goes out in a moment` : `staged: the corrected summary goes out at ${clockLabel(dueMs, localTz(), nowMs)} if no other correction comes in`);
+} else if (cmd === "send-due") {
+  // The launchd runner only (after each fix run, and on the send-due marker), so it
+  // never runs beside a fix run. Code sends: digest-deliver, then the record. It looks
+  // at every day, so a marker already queued is answered by this run.
+  fs.rmSync(path.join(QUEUE, SEND_DUE_MARKER), { force: true });
+  const nowMs = clock().getTime();
+  let sentN = 0, waiting = 0, failed = 0;
+  for (const f of (fs.existsSync(DIR) ? fs.readdirSync(DIR) : [])) {
+    const d = f.slice(0, 10);
+    if (f !== `${d}.json` || !isDate(d)) continue;
+    const s = load(d);
+    const p = s.pending_correction;
+    if (!p || (p.sending_at && nowMs - Date.parse(p.sending_at) < SENDING_CLAIM_MS)) continue;
+    const c = correctionDue(s, nowMs, { queued: isQueued(d) });
+    if (c.reason === "superseded") { mutate(d, (t) => { if (t.pending_correction && t.pending_correction.staged_at === p.staged_at) delete t.pending_correction; }); continue; }
+    if (!c.send) {
+      waiting++;
+      if (c.reason === "quiet_window" && p.wake_at !== c.due_at) {
+        armSendDue(Date.parse(c.due_at));
+        mutate(d, (t) => { if (t.pending_correction) t.pending_correction.wake_at = c.due_at; });
+      }
+      console.log(`${d}: the corrected summary waits (${c.reason}${c.due_at ? `, due ${c.due_at}` : ""})`);
+      continue;
+    }
+    const claimAt = now(); // the send's time: a copy staged after it is newer than this send
+    mutate(d, (t) => { if (t.pending_correction) t.pending_correction.sending_at = claimAt; });
+    const r = spawnSync(DELIVER, ["--subject", p.subject, "--body-file", p.body_file, "--intent", "daily-summary", ...(p.push ? ["--push", p.push] : [])],
+      { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], timeout: 300000 });
+    process.stderr.write(r.stderr || "");
+    // Exit 0 sent, 2 sent but unlabeled, 1 nothing sent. digest-deliver logs `sent "<subject>"`
+    // the moment the email is out, so a crash after that still counts as sent (never twice).
+    const out = r.status === 0 || r.status === 2 || String(r.stderr || "").includes(`digest-deliver: sent "`);
+    if (!out) {
+      failed++;
+      const t = mutate(d, (x) => {
+        const q = x.pending_correction;
+        if (q) { delete q.sending_at; q.attempts = (q.attempts || 0) + 1; q.error = { at: now(), exit: r.status, ...(r.error ? { code: r.error.code } : {}) }; }
+      });
+      const n = t.pending_correction ? t.pending_correction.attempts : 0;
+      console.error(`daily-summary-fix: send-due ${d}: the corrected summary did not send (exit ${r.status}); kept, the sweep retries it`);
+      if (n === SEND_PAGE_AFTER) {
+        try { send(["--channel", "system", "--skip-precheck", "--intent", "daily-summary-fix", `⚠️ daily-summary-fix: the corrected ${d} summary failed to send ${n} times; it stays staged and is retried hourly — see agent/logs/daily-summary-fix.log.`]); } catch {}
+      }
+      continue;
+    }
+    mutate(d, (t) => {
+      recordSend(t, { at: claimAt, corrected: true, versions: p.versions || 1 });
+      const x = t.pending_correction;
+      if (x && x.staged_at === p.staged_at) delete t.pending_correction; // a copy staged meanwhile stays for its own send
+    });
+    if (!load(d).pending_correction) fs.rmSync(p.body_file, { force: true });
+    sentN++;
+    console.log(`${d}: sent the corrected summary (${p.versions || 1} version(s) staged)`);
+  }
+  console.log(`send-due: sent ${sentN}, waiting ${waiting}${failed ? `, ${failed} failed` : ""}`);
+  process.exit(failed ? 1 : 0);
 } else if (cmd === "sweep") {
   // (0) Questions held through the user's quiet hours: once the user is up (the user's phone, else the user's
   //     chat, from `awake_from`; at the latest when they end), mark the day due and
@@ -571,7 +894,10 @@ if (cmd === "request") {
   // (4) A day still waiting on the user after its window (sent with questions open):
   //     re-queue when the user has written since the question, at most every 6 hours.
   //     Whether it IS the answer is the fixer model's call (it reads the user's messages).
-  let n = 0, dueDays = 0, dropped = 0;
+  // (5) A staged correction past its quiet window: drop the `send-due` marker for the
+  //     launchd runner, which sends it. Its own wake normally does this first; this is
+  //     the backstop when the wake was lost (a restart). The sweep never sends it.
+  let n = 0, dueDays = 0, dropped = 0, dueSends = 0;
   const nowMs = clock().getTime();
   let tz = null, quietEnd; // resolved once, and only when a held question is waiting
   for (const f of (fs.existsSync(DIR) ? fs.readdirSync(DIR) : [])) {
@@ -585,6 +911,7 @@ if (cmd === "request") {
       for (const q of held) {
         if (["confirmed", "gave_up"].includes(s.status)) drop(q, "the day was closed");
         else if (q.answered_at) drop(q, "he answered it");
+        else if (q.evening && (phaseOf(s, nowMs) !== "before_summary" || nowMs >= eveningMootAt(d, localTz()))) drop(q, EVENING_RETIRED);
         else if (nowMs - Date.parse(q.at) > HELD_MAX_MS) drop(q, "held too long");
       }
       const due = held.filter((q) => !q.dropped_at);
@@ -594,7 +921,13 @@ if (cmd === "request") {
       if (changed) save(s);
       if (held.some((q) => q.dropped_at) && startIfNothingOpen(d, "sweep: the question held through his quiet hours was not asked after all; nothing is waiting on him, send it")) { n++; continue; }
     }
+    const pc = s.pending_correction;
+    if (pc && !(pc.sending_at && nowMs - Date.parse(pc.sending_at) < SENDING_CLAIM_MS) && correctionDue(s, nowMs, { queued: isQueued(d) }).send) dueSends++;
     if (s.status !== AWAITING && s.status !== "queued") continue;
+    // Before the summary (the evening pass): nothing below applies. The user's answer
+    // comes through the chat agent, and the 4am build reads the user's chat anyway; a run
+    // that died is not "a summary never sent" (the build has not run yet).
+    if (phaseOf(s, nowMs) === "before_summary") continue;
     const sent = lastSendAt(s);
     const hold = sent ? (s.correction_hold && s.correction_hold.set_at > sent ? s.correction_hold : null) : (s.hold || null);
     const lastReq = Math.max(0, ...s.requests.map((r) => Date.parse(r.at) || 0));
@@ -614,7 +947,7 @@ if (cmd === "request") {
         try { send(["--channel", "system", "--skip-precheck", "--intent", "daily-summary-fix", `⚠️ daily-summary-fix: the ${d} summary is still unsent after ${DEADLINE_MAX_RUNS} fix runs ${windowClosed ? "past its answer window" : "that ended without sending it"} — see agent/logs/daily-summary-fix.log.`]); } catch {}
         continue;
       }
-      s.requests.push({ at: now(), reason: windowClosed
+      s.requests.push({ at: now(), from: "sweep", reason: windowClosed
         ? `sweep: the answer window closed at ${hold.label}; send the best version now, the open question(s) listed`
         : "sweep: the last fix run ended without sending the summary; run it again" });
       s.deadline_queued_at = now();
@@ -624,19 +957,30 @@ if (cmd === "request") {
     }
     if (hold) continue; // inside the window
     if (s.status !== AWAITING) continue;
-    const lastQ = s.questions.filter((q) => !q.answered_at && reachedAt(q)).map(reachedAt).sort().pop(); // asked, not just held
+    const lastQ = s.questions.filter((q) => !q.evening && !q.answered_at && reachedAt(q)).map(reachedAt).sort().pop(); // asked, not just held
     if (!lastQ) continue;
     const ageDays = (nowMs - Date.parse(lastQ)) / 86400e3;
     if (ageDays > 3) { s.status = "gave_up"; s.note = "no answer within 3 days"; save(s); continue; }
     if (s.sweep_seen_at && nowMs - Date.parse(s.sweep_seen_at) < 6 * 3600e3) continue;
     const since = [lastQ, s.sweep_seen_at || "", sent || ""].sort().pop(); // the send's run already read what came before it
-    if (newUserMessageSince(since)) { s.requests.push({ at: now(), reason: "sweep: he wrote since the question" }); s.sweep_seen_at = now(); s.status = "queued"; save(s); kick(s.date); n++; }
+    if (newUserMessageSince(since)) { s.requests.push({ at: now(), from: "sweep", reason: "sweep: he wrote since the question" }); s.sweep_seen_at = now(); s.status = "queued"; save(s); kick(s.date); n++; }
   }
   if (dueDays) {
     fs.mkdirSync(QUEUE, { recursive: true });
     fs.writeFileSync(path.join(QUEUE, RELEASE_MARKER), now() + "\n"); // launchd sends them, after its Max check
   }
   if (dueDays || dropped) console.log(`held questions: ${dueDays} day(s) due to ask (queued for launchd), ${dropped} dropped`);
+  if (dueSends) {
+    fs.mkdirSync(QUEUE, { recursive: true });
+    fs.writeFileSync(path.join(QUEUE, SEND_DUE_MARKER), now() + "\n"); // launchd sends them
+    console.log(`corrected summaries: ${dueSends} due to send (queued for launchd)`);
+  }
+  // (6) The evening pass, once a day, for today: at the first sweep at or after
+  //     EVENING_HOUR the user's local time, when the calendar has something that has begun
+  //     (code looks first, so a day with nothing to check costs no model run). It only
+  //     queues the run; the launchd runner starts it in the before_summary phase.
+  const evening = await eveningPass(nowMs);
+  if (evening) console.log(`evening pass: ${evening}`);
   console.log(`re-queued ${n}`);
 } else if (cmd === "release-held") {
   // Launchd only (trigger-daily-summary-fix.sh runs it after confirming the Max
@@ -660,21 +1004,25 @@ if (cmd === "request") {
     // The window runs from the minute of the sweep that marked the day due when the
     // release follows it promptly, so an hours-long window ends on a sweep tick.
     const fromMs = nowMs - dueMs <= RELEASE_ANCHOR_MS ? Math.floor(dueMs / 60e3) * 60e3 : nowMs;
-    let first = true, dayDropped = false, dayFailed = false;
+    let first = true, opened = false, dayDropped = false, dayFailed = false;
     for (const n of s0.questions.filter(heldUnsent).map((q) => q.n)) {
       const s = load(d);
       const q = s.questions.find((x) => x.n === n);
       if (!q || !heldUnsent(q)) continue;
-      const moot = ["confirmed", "gave_up"].includes(s.status) ? "the day was closed" : q.answered_at ? "he answered it" : nowMs - Date.parse(q.at) > HELD_MAX_MS ? "held too long" : null;
+      const moot = ["confirmed", "gave_up"].includes(s.status) ? "the day was closed" : q.answered_at ? "he answered it"
+        : q.evening && (phaseOf(s, nowMs, tz) !== "before_summary" || nowMs >= eveningMootAt(d, tz)) ? EVENING_RETIRED
+        : nowMs - Date.parse(q.at) > HELD_MAX_MS ? "held too long" : null;
       if (moot) {
         mutate(d, (t) => { const x = t.questions.find((y) => y.n === n); if (x && heldUnsent(x)) Object.assign(x, { dropped_at: now(), dropped_why: moot }); });
         droppedN++; dayDropped = true; continue;
       }
-      const w = first ? windowOnReach(s, q.at, fromMs, tz) : { note: "", apply: () => {} };
+      // The first question to reach the user opens the day's answer window; an evening one opens none.
+      const opens = !opened && !q.evening;
+      const w = opens ? windowOnReach(s, q.at, fromMs, tz) : { note: "", apply: () => {} };
       const burst = !first || s.questions.some((x) => reachedAt(x) && nowMs - Date.parse(reachedAt(x)) < BURST_MS);
       let ok;
       try {
-        ok = sendQuestion(d, n, q.text, { note: w.note, burst, asOf: q.at, nowMs });
+        ok = sendQuestion(d, n, q.text, { note: w.note, burst, asOf: q.at, nowMs, evening: !!q.evening, tz });
       } catch (e) {
         const why = `send failed (exit ${e.status ?? "none"}${e.signal ? `, ${e.signal}` : ""}${e.code ? `, ${e.code}` : ""})`;
         console.error(`daily-summary-fix: release-held ${d} question ${n}: ${why}; the rest of the day waits for the next sweep`);
@@ -692,7 +1040,7 @@ if (cmd === "request") {
         console.log(`${d}: question ${n} not asked: the outbound check held it back`);
         droppedN++; dayDropped = true; continue;
       }
-      const opens = first;
+      if (opens) opened = true;
       mutate(d, (t) => {
         const x = t.questions.find((y) => y.n === n);
         if (x) x.sent_at = now();
@@ -730,16 +1078,39 @@ if (cmd === "request") {
   fs.writeFileSync(into, doc);
   console.log(html ? "section inserted" : "no review notes; nothing inserted");
 } else {
-  die("usage: request|status|log|ask|gate|answered|release|mark-sent|done|sweep|release-held|section — see the header");
+  die("usage: request|status|phase|idle|log|ask|gate|answered|release|mark-sent|stage|send-due|done|sweep|release-held|section — see the header");
 }
 
 /**
  * A never-sent day parked on the user with nothing left to wait for (its held questions
  * were dropped): start the fixer, whose gate now says send. True when it did.
  */
+async function eveningPass(nowMs) {
+  const tz = localTz();
+  const { date: today, hour } = partsIn(nowMs, tz);
+  if (hour < EVENING_HOUR) return null;
+  const last = readJson(EVENING_LAST);
+  if (last && last.date === today) return null; // already looked tonight
+  const mark = (outcome) => {
+    try { fs.mkdirSync(DIR, { recursive: true }); fs.writeFileSync(EVENING_LAST, JSON.stringify({ date: today, at: now(), outcome }) + "\n"); } catch {}
+    return outcome;
+  };
+  if (fs.existsSync(EVENING_OFF)) return "off (kill switch)"; // not marked: removing the switch the same evening still runs it
+  const s = load(today);
+  if (s.evening_at) return mark("already ran");
+  if (lastSendAt(s) || (s.requests || []).length || (s.questions || []).length) return mark("skipped: the day already has a fix-loop record");
+  if (!(await eveningHasCalendar(today, tz, nowMs))) return mark("skipped: nothing on the calendar to check");
+  s.evening_at = now();
+  s.requests.push({ at: now(), from: "evening", reason: "evening pass: settle or ask about the day while it is fresh" });
+  s.status = "queued";
+  save(s); kick(today);
+  return mark(`started for ${today}`);
+}
+
 function startIfNothingOpen(d, reason) {
   const s = load(d);
-  if (s.questions.some((q) => !q.answered_at && !q.dropped_at)) return false;
+  if (phaseOf(s) === "before_summary") return false; // the 4am build sends it, not the fixer
+  if (s.questions.some((q) => !q.evening && !q.answered_at && !q.dropped_at)) return false;
   if (lastSendAt(s) || s.status !== AWAITING || fs.existsSync(path.join(QUEUE, d))) return false;
   s.requests.push({ at: now(), reason });
   s.status = "queued";

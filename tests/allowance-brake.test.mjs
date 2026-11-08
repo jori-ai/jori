@@ -303,3 +303,77 @@ it("relaunches a held job before the reset once the pace leaves room for it, but
   const out = run(cool, ["release", "--dry-run"]).out;
   assert.ok(!out.includes("chat-build"), out);
 });
+
+// The last-day brake: inside final_day.hours before the reset the lower
+// threshold applies, to check and release alike; earlier in the week it does not.
+const FINAL = { threshold: 0.95, final_day: { hours: 24, threshold: 0.90 }, jobs: { "nightly": { importance: "optional", release_label: "ai.test.nightly" } } };
+// 0.84 -> 0.89 over 22h (~5.5%/day): 16h before the reset -> projected ~0.93.
+const LAST_DAY = [["2026-11-03T13:00:00Z", 0.84], ["2026-11-04T11:00:00Z", 0.89]];
+const LAST_DAY_NOW = "2026-11-04T11:10:00Z";
+
+it("holds at the final-day threshold in the last hours before the reset, where the usual one would let it run", () => {
+  const usual = fixture({ points: LAST_DAY, config: { ...FINAL, final_day: undefined } });
+  const u = run(usual, ["check", "nightly", "--json"], LAST_DAY_NOW);
+  assert.equal(u.rc, 0, u.out);
+  assert.ok(u.json.projected > 0.90 && u.json.projected < 0.95, `projected ${u.json.projected}`);
+
+  const fx = fixture({ points: LAST_DAY, config: FINAL });
+  const r = run(fx, ["check", "nightly", "--json"], LAST_DAY_NOW);
+  assert.equal(r.rc, 3, r.out);
+  assert.equal(r.json.threshold, 0.90);
+  assert.ok(r.json.reason.includes("90% last-day brake"), r.json.reason);
+  // The held job is not released while the last-day brake still says over.
+  assert.equal(run(fx, ["release", "--dry-run"], "2026-11-04T12:00:00Z").out, "");
+});
+
+it("keeps the usual threshold earlier in the week, and status reports both", () => {
+  const fx = fixture({ points: COOL, config: FINAL });
+  const s = run(fx, ["status", "--json"]);
+  assert.equal(s.json.threshold, 0.95, "three days before the reset: the usual brake");
+  assert.equal(s.json.usual_threshold, 0.95);
+  assert.deepEqual(s.json.final_day, { threshold: 0.90, hours: 24 });
+  const late = run(fixture({ points: LAST_DAY, config: FINAL }), ["status", "--json"], LAST_DAY_NOW);
+  assert.equal(late.json.threshold, 0.90, "16h before the reset: the last-day brake");
+});
+
+it("ignores a malformed final_day and keeps one threshold", () => {
+  const fx = fixture({ points: LAST_DAY, config: { ...FINAL, final_day: { hours: 24, threshold: 1.5 } } });
+  const r = run(fx, ["check", "nightly", "--json"], LAST_DAY_NOW);
+  assert.equal(r.rc, 0, r.out);
+  assert.equal(r.json.threshold, 0.95);
+});
+
+// The early window: a half-day span is not rated, and a run the governor released
+// at the reset is a catch-up, not the week's pace.
+it("does not rate a span shorter than a day: the nightly batch is not extrapolated over the week", () => {
+  const fx = fixture({ points: [["2026-11-01T18:00:00Z", 0.02], ["2026-11-02T07:50:00Z", 0.15]] });
+  const r = run(fx, ["check", "dream-deep", "--json"]);
+  assert.equal(r.rc, 0, r.out);
+  assert.ok(r.json.reason.includes("of this window to rate"), r.json.reason);
+});
+
+it("scales the pace down by a released job's catch-up share of the span's ledger spend, capped at half", () => {
+  const points = [["2026-11-01T10:00:00Z", 0.50], ["2026-11-02T07:50:00Z", 0.62]]; // 12 points in ~22h (~99% projected); released 10 min before the span starts
+  const plain = fixture({ points });
+  assert.equal(run(plain, ["check", "dream-deep"]).rc, 3, "without a release: on pace past the brake");
+
+  const fx = fixture({ points });
+  fs.writeFileSync(fx.state, JSON.stringify({ released: [{ job: "improvement-plan", at: "2026-11-01T09:50:00.000Z", held_since: "2026-10-30T09:00:00.000Z" }] }));
+  const dir = path.join(fx.logs, "ephemeral-forks");
+  fs.mkdirSync(dir, { recursive: true });
+  const rows = [
+    { ts: "2026-11-01T13:00:00Z", source: "improvement-plan", total_cost_usd: 80 },  // the catch-up run: 80% of the span's ledger spend, capped at 50%
+    { ts: "2026-11-01T15:00:00Z", source: "hum", total_cost_usd: 10 },
+    { ts: "2026-11-02T05:00:00Z", source: "improvement-plan", total_cost_usd: 0 },  // outside its 12h: not catch-up (and costs nothing here)
+    { ts: "2026-11-02T06:00:00Z", source: "gmail:x", total_cost_usd: 10 },
+  ];
+  fs.writeFileSync(path.join(dir, "job-costs.ndjson"), rows.map((x) => JSON.stringify(x)).join("\n") + "\n");
+  const r = run(fx, ["check", "dream-deep", "--json"]);
+  assert.equal(r.rc, 0, r.out);
+  assert.equal(r.json.catch_up_share, 0.5, "capped: the scaling also shrinks unledgered usage");
+  assert.ok(r.json.projected < 0.95, `projected ${r.json.projected}`);
+
+  // A release outside the span changes nothing.
+  fs.writeFileSync(fx.state, JSON.stringify({ released: [{ job: "improvement-plan", at: "2026-10-29T03:30:00.000Z" }] }));
+  assert.equal(run(fx, ["check", "dream-deep"]).rc, 3);
+});

@@ -21,14 +21,17 @@
 // listing the MCP servers it actually uses. Omitted = "tier default is fine"
 // (no assertion). `tools` + `health` are the universal baseline.
 //
-// Exit non-zero on a HARD error: an unknown server name in a declaration, or a
-// declared need no tier can satisfy. Advisory findings (trim candidates,
-// override-required) print but don't fail.
+// Exit non-zero on a HARD error: an unknown server name in a declaration, a
+// declared need no tier can satisfy, or a Supabase MCP server started directly
+// instead of through bin/supabase-mcp (in any agent, supervisor, local or
+// example MCP config). Advisory findings (trim candidates, override-required)
+// print but don't fail.
 
 import fs from "node:fs";
 import path from "node:path";
 import { createRequire } from "node:module";
 import { TOOLS_DIR as ROOT } from "../lib/root.cjs";
+import { localDir } from "../lib/instance.cjs";
 
 const ROUTING = path.join(ROOT, "agent/config/job-routing.json");
 const TIER_CONFIG = {
@@ -44,6 +47,35 @@ const BASELINE = ["tools", "health"]; // every claude session loads these
 function loadServers(file) {
   const j = JSON.parse(fs.readFileSync(file, "utf8"));
   return new Set(Object.keys(j.mcpServers || j.servers || {}));
+}
+
+// The Supabase MCP server reads its token from the environment once, at spawn.
+// Started directly, it gets SUPABASE_ACCESS_TOKEN as the supervisor loaded it
+// and keeps working only as long as that token does; bin/supabase-mcp hands it
+// a current one instead (see that file).
+const SUPABASE_SERVER = "@supabase/mcp-server-supabase";
+const ls = (dir) => { try { return fs.readdirSync(dir); } catch { return []; } };
+function mcpConfigFiles() {
+  const agent = path.join(ROOT, "agent");
+  const jsonIn = (dir, keep = () => true) => ls(dir).filter((f) => f.endsWith(".json") && keep(f)).map((f) => path.join(dir, f));
+  return [
+    path.join(agent, ".mcp.json"),
+    ...ls(agent).map((d) => path.join(agent, d, ".mcp.json")),
+    ...jsonIn(path.join(agent, "supervisor"), (f) => f.includes("mcp")),
+    ...jsonIn(path.join(localDir(), "mcp")),
+    ...jsonIn(path.join(ROOT, "examples/mcp")),
+  ].filter((f) => fs.existsSync(f));
+}
+function directSupabaseLaunches() {
+  const found = [];
+  for (const file of mcpConfigFiles()) {
+    let servers;
+    try { const j = JSON.parse(fs.readFileSync(file, "utf8")); servers = j.mcpServers || j.servers || {}; } catch { continue; }
+    for (const [name, s] of Object.entries(servers)) {
+      if ([s.command, ...(s.args || [])].some((a) => String(a).includes(SUPABASE_SERVER))) found.push({ file: path.relative(ROOT, file), name });
+    }
+  }
+  return found;
 }
 
 function main() {
@@ -90,6 +122,10 @@ function main() {
     for (const s of need) declaredNeedByTier[runTier]?.add(s);
   }
 
+  for (const { file, name } of directSupabaseLaunches()) {
+    hardErrors.push(`${file}: "${name}" starts ${SUPABASE_SERVER} directly — start it through bin/supabase-mcp ("command": "\${JORI_HOME}/bin/supabase-mcp", "args": ["--project-ref=…"])`);
+  }
+
   // Trim candidates: servers a tier loads that NO defaulting+declaring job needs.
   // Advisory only — a job that doesn't declare `mcp` may still use the server, so
   // this is a "review for possible removal", not an instruction.
@@ -122,7 +158,7 @@ function main() {
       console.log(`\nℹ tier ${t}: servers no declaring job needs (review for trim, if no undeclared job uses them): ${unused.join(", ")}`);
     }
     if (hardErrors.length) { console.log("\n✖ HARD ERRORS:"); hardErrors.forEach((l) => console.log("  - " + l)); }
-    else console.log("\n✓ no hard errors (every declared need is satisfiable by some tier)");
+    else console.log("\n✓ no hard errors (every declared need is satisfiable by some tier; Supabase servers start through bin/supabase-mcp)");
   }
   process.exit(hardErrors.length ? 1 : 0);
 }

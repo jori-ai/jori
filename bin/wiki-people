@@ -43,6 +43,11 @@ Usage:
       upsert a concept-map entry; --ambiguous names are never auto-linked
   wiki-people retarget --from ID --to ID --display "Text" [--dry-run] [--json]
       rewrite [[from|Text]] links to [[to|Text]] across the wiki
+  wiki-people branch [ID]... [--side owner|spouse|both|unknown] [--json]
+      which side of the family each person is on, walked from the typed
+      relations (lib/wiki-family-branch.mjs). With --side, everyone on that
+      side: a who's-who for one side's gathering lists "--side spouse" (or
+      owner) plus "--side both", and never the other side
 
 Concept map: ${linker.DEFAULT_CONCEPTS_PATH}
 `);
@@ -91,6 +96,20 @@ try {
       for (const c of r) console.log(`${c.id}: ${c.count}`);
       console.log(`${r.length} page(s)${flag("dry-run", false) ? " would change" : " updated"}`);
     }
+  } else if (cmd === "branch") {
+    // ESM module (it reads page_facts through memory-db.mjs); the rest of this
+    // CLI is synchronous, so this branch finishes on its own.
+    const ids = args.slice(1).filter((a, i, all) => !a.startsWith("--") && all[i - 1] !== "--side");
+    const side = typeof flag("side") === "string" ? flag("side") : null;
+    import("../lib/wiki-family-branch.mjs").then((fb) => {
+      const loaded = fb.loadFamilyBranches();
+      if (!loaded) { console.error("wiki-people: the wiki DB has no typed facts to walk"); process.exitCode = 1; return; }
+      const pick = ids.length ? ids : [...loaded.branches.keys()].filter((id) => !side || loaded.branches.get(id).branch === side).sort();
+      const rows = pick.map((id) => ({ id, title: loaded.title(id), ...(loaded.branches.get(id) || { branch: "unknown", owner: null, spouse: null }),
+        line: fb.branchLine(id, loaded) || "unknown (no family relations recorded that reach either side)" }));
+      if (asJson) console.log(JSON.stringify({ owner: loaded.owner, spouse: loaded.spouse, people: rows }, null, 2));
+      else for (const r of rows) console.log(`${r.id.padEnd(36)} ${r.line}`);
+    }).catch((err) => { console.error(`wiki-people: ${err.message}`); process.exitCode = 1; });
   } else {
     usage();
     process.exitCode = 2;

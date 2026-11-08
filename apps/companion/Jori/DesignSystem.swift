@@ -223,7 +223,7 @@ struct StaffLightDots: View {
             }
         }
         .accessibilityElement()
-        .accessibilityLabel("Jori is thinking")
+        .accessibilityLabel("\(Install.displayName) is thinking")
     }
 }
 
@@ -298,7 +298,7 @@ struct JoriCommands: Commands {
             Button("New Message") { actions?.focusComposer() }
                 .keyboardShortcut("l", modifiers: .command)
                 .disabled(!inChat)
-            Button("Reply to Latest from Jori") { actions?.replyToLatest() }
+            Button("Reply to Latest from \(Install.displayName)") { actions?.replyToLatest() }
                 .keyboardShortcut("r", modifiers: .command)
                 .disabled(!inChat)
             Button("Attach File…") { actions?.attachFile() }
@@ -389,20 +389,23 @@ struct SplashView: View {
             JoriBackdrop()
             JoriMark(size: Self.markSize)
                 .overlay(alignment: .bottom) {
-                    Text("Jori")
+                    Text(Install.displayName)
                         .font(JoriTheme.display(44))
                         .foregroundStyle(.white)
                         .fixedSize()
                         .offset(y: 72)
-                        .opacity(shown ? 1 : 0)
+                        // Visible from the first frame: the splash often lasts
+                        // only as long as the Keychain read (a fraction of a
+                        // second on a Mac), and a delayed fade-in never showed
+                        // the name at all. Only the small rise is animated.
                         .offset(y: shown || reduceMotion ? 0 : 8)
                 }
         }
         .environment(\.colorScheme, .dark)
         .accessibilityElement(children: .ignore)
-        .accessibilityLabel("Jori")
+        .accessibilityLabel(Install.displayName)
         .onAppear {
-            withAnimation(.easeOut(duration: 0.5).delay(0.12)) { shown = true }
+            withAnimation(.easeOut(duration: 0.3)) { shown = true }
         }
     }
 }

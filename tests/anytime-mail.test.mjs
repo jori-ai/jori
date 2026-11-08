@@ -12,7 +12,7 @@ import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { buildQuestions, interpretAnswers, judgeEnvelope } from "../lib/anytime-mail-jev.mjs";
+import { buildQuestions, interpretAnswers, judgeEnvelope, acceptLook, lookPrompt, readSenderFromImage } from "../lib/anytime-mail-jev.mjs";
 import { composeMessage, loadConfig, DEFAULTS } from "../bin/anytime-mail-check";
 
 const BIN = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "bin", "anytime-mail-check");
@@ -86,4 +86,52 @@ test("unconfigured: generic label, no portal link, and the run is off", () => {
     env: { ...process.env, JORI_LOCAL_DIR: fs.mkdtempSync(path.join(os.tmpdir(), "anytime-off-")) } });
   assert.equal(r.status, 0, r.stderr);
   assert.match(r.stdout, /no portal configured/);
+});
+
+// ---- reading the sender off the envelope image ----------------------------
+
+test("an envelope look is accepted only when it names a sender confidently", () => {
+  assert.equal(acceptLook({ sender: "FIRST BANK", confidence: 0.9 }), "FIRST BANK");
+  assert.equal(acceptLook({ sender: " FIRST BANK ", confidence: 0.7 }), "FIRST BANK");
+  assert.equal(acceptLook({ sender: "FIRST BANK", confidence: 0.5 }), null);
+  assert.equal(acceptLook({ sender: null, confidence: 0.99 }), null);
+  assert.equal(acceptLook({ sender: "", confidence: 0.99 }), null);
+  assert.equal(acceptLook({ sender: "FIRST BANK" }), null);
+  assert.equal(acceptLook(null), null);
+});
+
+test("the look prompt names the image and tells the model the owners are the recipient", () => {
+  const p = lookPrompt("/tmp/x/1.jpg", { owners: ["Sam Pie"] });
+  assert.ok(p.includes("/tmp/x/1.jpg"));
+  assert.ok(p.includes("Sam Pie"));
+  assert.ok(p.includes("untrusted"));
+});
+
+test("readSenderFromImage: the model sees a temp copy in its own cwd, and the copy is removed", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "am-test-"));
+  const scan = path.join(dir, "42.jpg");
+  fs.writeFileSync(scan, "jpeg-bytes");
+  let seen;
+  const r = await readSenderFromImage({
+    file: scan, mailbox: { owners: ["Sam Pie"] }, tmpRoot: dir,
+    run: async ({ prompt, cwd }) => {
+      const copy = path.join(cwd, "42.jpg");
+      seen = { cwd, hasCopy: fs.existsSync(copy), inPrompt: prompt.includes(copy) };
+      return 'Looked. {"sender":"FIRST BANK","return_address":"PO Box 1, Springfield","confidence":0.95}';
+    },
+  });
+  assert.deepEqual(r, { sender: "FIRST BANK", return_address: "PO Box 1, Springfield" });
+  assert.ok(seen.hasCopy && seen.inPrompt);
+  assert.equal(fs.existsSync(seen.cwd), false);
+  assert.ok(fs.existsSync(scan), "the original scan stays");
+});
+
+test("readSenderFromImage: no file, no answer, a weak answer or a crash all leave it unidentified", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "am-test-"));
+  const scan = path.join(dir, "7.jpg");
+  fs.writeFileSync(scan, "x");
+  assert.equal(await readSenderFromImage({ file: path.join(dir, "missing.jpg"), run: async () => { throw new Error("must not run"); } }), null);
+  assert.equal(await readSenderFromImage({ file: scan, tmpRoot: dir, run: async () => "" }), null);
+  assert.equal(await readSenderFromImage({ file: scan, tmpRoot: dir, run: async () => '{"sender":"X","confidence":0.3}' }), null);
+  assert.equal(await readSenderFromImage({ file: scan, tmpRoot: dir, run: async () => { throw new Error("boom"); } }), null);
 });

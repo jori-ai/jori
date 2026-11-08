@@ -386,10 +386,10 @@ export function designBatch(model, pool, { size = 5, seed = null } = {}) {
     while (chosen.length < size - 1) {
       const x = learn.find(okTS);
       if (!x) break;
-      chosen.push({ ...x, slot: "learn", why: `Learning: Gandalf's guesses split on this one (${Math.round(x.lo * 100)}–${Math.round(x.hi * 100)}%)` });
+      chosen.push({ ...x, slot: "learn", why: `Learning: my guesses split on this one (${Math.round(x.lo * 100)}–${Math.round(x.hi * 100)}%)` });
     }
     const fav = by((x) => x.ts * x.phi).find(okTS);
-    if (fav) chosen.push({ ...fav, slot: "confirm", why: fav.plus ? `Gandalf thinks you liked this — ${featureLabel(fav.plus.f)}` : "Gandalf's best guess for you" });
+    if (fav) chosen.push({ ...fav, slot: "confirm", why: fav.plus ? `I think you liked this — ${featureLabel(fav.plus.f)}` : "My best guess for you" });
     return chosen.map(({ row, slot, p, u, why }) => ({ row, slot, p: Math.round(p * 100) / 100, u: Math.round(u * 100) / 100, why }));
   }
 
@@ -401,12 +401,12 @@ export function designBatch(model, pool, { size = 5, seed = null } = {}) {
     : ["confirm", "probe", "probe", "contrast", "explore"];
   for (const slot of plan) {
     if (chosen.length >= size) break;
-    if (slot === "confirm") take(slot, by((x) => x.p * (0.4 + x.phi)), (x) => x.plus ? `Gandalf thinks you liked this — ${featureLabel(x.plus.f)}` : "Gandalf's best guess for you");
+    if (slot === "confirm") take(slot, by((x) => x.p * (0.4 + x.phi)), (x) => x.plus ? `I think you liked this — ${featureLabel(x.plus.f)}` : "My best guess for you");
     // Expected information ∝ p(1−p): a film the model is torn on teaches the most; a
     // near-certain miss (365 Days at 0.15) teaches nothing.
     if (slot === "probe") take(slot, by((x) => x.p * (1 - x.p) * x.u * x.phi), (x) => probeWhy(model, x));
     // Contrast tests a predicted miss the model is UNSURE of (0.25–0.5), never a sure one.
-    if (slot === "contrast") take(slot, by((x) => (x.p >= 0.2 && x.p < 0.5 ? 1 : 0) * x.u * x.phi), (x) => x.minus ? `Gandalf leans no — ${featureLabel(x.minus.f)}. Right?` : "Gandalf leans no. Right?");
+    if (slot === "contrast") take(slot, by((x) => (x.p >= 0.2 && x.p < 0.5 ? 1 : 0) * x.u * x.phi), (x) => x.minus ? `I lean no — ${featureLabel(x.minus.f)}. Right?` : "I lean no. Right?");
     if (slot === "explore") take(slot, by((x) => (x.p >= 0.3 ? 1 : 0) * x.phi / (1 + genreN(x))), (x) => {
       const g = x.f.filter((f) => f.startsWith("g:")).sort((a, b) => (model.stats.get(a)?.n || 0) - (model.stats.get(b)?.n || 0))[0];
       return g ? `Exploring: ${featureLabel(g)}` : "Exploring";

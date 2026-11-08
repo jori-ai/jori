@@ -6,7 +6,7 @@ set -uo pipefail
 #
 # Normally CHAINED by trigger-nightly-review.sh the moment the review exits
 # clean, so it always reads a fresh report. Also installed on its own launchd
-# slot (Tuesdays 10:30 local, after the 05:00 review's worst case) as a
+# slot (Thursdays 10:30 local, after the 05:00 review's worst case) as a
 # SAFETY NET: if the review died, or the chain
 # never fired, this catches it. Two guards make the double-trigger harmless:
 # the job's own Step 1 exits when `nightly-review-state.json` is older than
@@ -41,7 +41,7 @@ source "$(dirname "${BASH_SOURCE[0]}")/lib/root.sh"   # JORI_INSTALL, JORI_INSTA
 ROOT="$JORI_INSTALL"
 JOB_MD="$JORI_INSTALL_TOOLS/agent/ops-agent/jobs/improvement-plan.md"
 
-TASK="Run the Self Improvement Plan job. Follow the playbook below end-to-end. ultrathink — you are authoring changes to ${JORI_ASSISTANT_NAME:-Jori}'s own source code that ${JORI_OWNER_NAME:-the user} will approve with a thumb on their phone, so the reasoning behind what you choose to build, and the honesty of each card's rationale, matter more than throughput. Three things to hold onto: every item leaves this run with a disposition; a verified change goes to self-improve-auto-apply first and lands on its own when it allows, and only complex or high-blast-radius changes (its exit 3) become Face-ID cards (${JORI_OWNER_NAME:-the user}, 2026-09-29); and anything they have skipped is never re-proposed. If the review that should precede you did not run, exit without planning rather than planning from a stale report."
+TASK="Run the Self Improvement Plan job. Follow the playbook below end-to-end. ultrathink — you are authoring changes to ${JORI_ASSISTANT_NAME:-Jori}'s own source code that ${JORI_OWNER_NAME:-the user} will approve with a thumb on their phone, so the reasoning behind what you choose to build, and the honesty of each card's rationale, matter more than throughput. Three things to hold onto: every item leaves this run with a disposition; a verified change goes to self-improve-auto-apply first and lands on its own when it allows, and only complex or high-blast-radius changes (its exit 3) become Face-ID cards (${JORI_OWNER_NAME:-the user}, 2026-09-29); and anything they have skipped is never re-proposed. If the review that should precede you did not run, exit without planning rather than planning from a stale report."  # control-scan-ok: the setting's default
 
 DATA="$JORI_INSTALL_TOOLS/data"
 if [ "${IMPROVEMENT_PLAN_FORCE:-0}" != "1" ]; then

@@ -1,8 +1,8 @@
 import AppIntents
 
 struct SendToJoriIntent: AppIntent {
-    static var title: LocalizedStringResource = "Summon Jori"
-    static var description = IntentDescription("Ask Jori something by voice — your spoken message is sent into the Jori chat, and the reply comes back as an announced notification.")
+    static var title: LocalizedStringResource = "Send a Message"
+    static var description = IntentDescription("Ask something by voice: your spoken message goes into the chat, and the reply comes back as an announced notification.")
     // Run hands-free in the background (driving / AirPods) — never foreground the app.
     static var openAppWhenRun: Bool = false
 
@@ -12,7 +12,7 @@ struct SendToJoriIntent: AppIntent {
     // free-form dictation as the value, then runs perform(). This is the
     // documented two-turn hands-free pattern: "Ask Jori" → "What would you
     // like to ask?" → you dictate.
-    @Parameter(title: "Message", requestValueDialog: "What would you like to ask Jori?")
+    @Parameter(title: "Message", requestValueDialog: "What would you like to ask?")
     var message: String
 
     func perform() async throws -> some IntentResult & ProvidesDialog {
@@ -47,7 +47,7 @@ struct SendToJoriIntent: AppIntent {
             .insert(insert)
             .execute()
 
-        return .result(dialog: "Sent to Jori.")
+        return .result(dialog: "Sent to \(Install.displayName).")
     }
 }
 
@@ -65,7 +65,7 @@ struct JoriShortcuts: AppShortcutsProvider {
                 "Ask \(.applicationName)",
                 "Ask \(.applicationName) something"
             ],
-            shortTitle: "Summon Jori",
+            shortTitle: "Send a Message",
             systemImageName: "bubble.left.and.bubble.right"
         )
     }

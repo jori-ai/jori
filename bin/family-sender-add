@@ -52,6 +52,7 @@ import { readHolds, pendingHoldsFor, normAddress, HELD_FILE, HELD_DIR } from "..
 
 const require = createRequire(import.meta.url);
 const owner = () => require("../lib/instance.cjs").instance().owner_name;
+const ASSISTANT = require("../lib/instance.cjs").assistantName(); // the assistant's configured name (lib/instance.cjs)
 const ROOT = process.env.FAMILY_SENDER_ADD_ROOT || path.resolve(path.dirname(new URL(import.meta.url).pathname), "..");
 const DATA = path.join(ROOT, "data");
 const SCOPES = path.join(DATA, "wiki-share-scopes.json");
@@ -152,7 +153,7 @@ async function main() {
   const holds = pendingHoldsFor(address, DATA);
   if (!holds.length) {
     log({ action: "refused", reason: "not-held", address, as: asName });
-    out(3, `REFUSED: Jori is not holding any email from ${address}. This command only adds an address whose email is held (family-sender-add list).`);
+    out(3, `REFUSED: ${ASSISTANT} is not holding any email from ${address}. This command only adds an address whose email is held (family-sender-add list).`);
   }
   const hold = holds[holds.length - 1]; // the oldest pending one: the "add" came after it
 
@@ -184,7 +185,7 @@ async function main() {
     ...(t.inherits ? { inherits: t.inherits } : {}),
     email_qa: true,
     ...(t.email_deny_ids ? { email_deny_ids: [...t.email_deny_ids] } : {}),
-    note: `${fam.label}'s address ${address}, added ${today()} by family-sender-add on ${owner()}'s word in chat ("${quote}"), after Jori held "${hold.subject || ""}" from it. Same view as ${fam.label}'s other address(es): ${fam.addresses.join(", ")}.`,
+    note: `${fam.label}'s address ${address}, added ${today()} by family-sender-add on ${owner()}'s word in chat ("${quote}"), after ${ASSISTANT} held "${hold.subject || ""}" from it. Same view as ${fam.label}'s other address(es): ${fam.addresses.join(", ")}.`,
   };
 
   // P1 sender list: only when the member's other addresses are on it.

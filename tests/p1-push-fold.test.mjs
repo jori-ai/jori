@@ -196,6 +196,7 @@ function send(env, args, extraEnv = {}) {
   return spawnSync(SEND_CURL, args, {
     encoding: "utf8", timeout: 20_000,
     env: { ...process.env, PATH: `${env.fakeBin}:${path.dirname(process.execPath)}:${process.env.PATH}`, HOME: env.h,
+      JORI_ASSISTANT_NAME: "Jori", // the host may name its assistant; the assertions expect the default
       JORI_SEND_TEST_CURL: path.join(env.fakeBin, "curl"),
       P1_PUSH_FOLD_BIN: env.fold, FOLD_RECORD: env.foldRecord, CURL_RECORD: env.curlRecord, ...extraEnv },
   });

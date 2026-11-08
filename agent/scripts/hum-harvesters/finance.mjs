@@ -27,6 +27,9 @@ import classifyLib from "../../../lib/finance-classify.js";
 import expectedLib from "../../../lib/finance-expected.js";
 import rootLib from "../../../lib/root.cjs";
 import instanceLib from "../../../lib/instance.cjs";
+import plaidStore from "../../../lib/plaid-store.js";
+import privateLib from "../../../lib/private-holdings.js";
+import depositLib from "../../../lib/finance-deposit-reconcile.js";
 const { request } = supa;
 const { classify } = classifyLib;
 const { incomeStatus, scheduledDue } = expectedLib;
@@ -112,14 +115,16 @@ async function main() {
       .then((rows) => (rows || []).map((r) => ({ as_of_date: r[date], total_value: r[value] })))
       .catch(() => []);
   };
-  const [recent, accounts, histories, plaidHoldings, realEstate] = await Promise.all([
+  const [recent, accounts, histories, plaidHoldings, realEstate, depositRuns] = await Promise.all([
     request(`/rest/v1/plaid_transactions?select=transaction_id,account_id,amount,date,name,merchant_name,category_primary,pending&date=gte.${since}&order=date.desc&limit=400`).catch(() => []),
     request(`/rest/v1/plaid_accounts?select=account_id,name,subtype,type,institution_name,balance_current,balance_available`).catch(() => []),
     // Brokerages / exchanges Plaid does not cover keep their own dated totals.
     Promise.all((NET_WORTH.value_histories || []).map((src) => history(src, 8))),
     // Anything held through Plaid needs no query of its own: it is in plaid_holdings.
-    request(`/rest/v1/plaid_holdings?select=account_id,market_value,as_of`).catch(() => []),
+    request(`/rest/v1/plaid_holdings?select=account_id,item_id,market_value,as_of`).catch(() => []),
     NET_WORTH.property_totals ? history({ value: "total_estimate", ...NET_WORTH.property_totals }, 1) : Promise.resolve([]),
+    // Tenant deposits owed back: the tenants' money, sitting in bank cash.
+    request(`/rest/v1/fin_deposit_reconciliations?select=run_at,report&order=run_at.desc&limit=1`).catch(() => []),
   ]);
   const acct = (id) => (accounts || []).find((a) => a.account_id === id) || {};
   const acctName = (id) => acct(id).name || "account";
@@ -266,22 +271,18 @@ async function main() {
       .filter((a) => a.type === "credit")
       .reduce((s, a) => s + (Number(a.balance_current) || 0), 0);
 
-    const excluded = (NET_WORTH.holdings_exclude_institutions || []).map((x) => String(x).toLowerCase()).filter(Boolean);
-    const isExcludedAccount = new Set(
-      (accounts || [])
-        .filter((a) => excluded.some((x) => (a.institution_name || "").toLowerCase().includes(x)))
-        .map((a) => a.account_id)
-    );
-    const plaidBrokerage = (plaidHoldings || [])
-      .filter((h) => !isExcludedAccount.has(h.account_id))
+    const plaidRows = (plaidHoldings || []).filter(plaidStore.excludeHoldingsFilter(NET_WORTH.holdings_exclude_institutions, accounts));
+    const plaidBrokerage = plaidRows
       .reduce((s, h) => s + (Number(h.market_value) || 0), 0);
-    const plaidAsOf = (plaidHoldings || []).map((h) => h.as_of).sort().pop();
+    const plaidAsOf = plaidRows.map((h) => h.as_of).sort().pop();
 
     const valued = sources.map(({ src, rows }) => ({ src, rows, now: Number(rows[0].total_value) || 0 }));
     const historiesTotal = valued.reduce((s, v) => s + v.now, 0);
     const reNow = (realEstate || []).length ? Number(realEstate[0].total_value) || 0 : 0;
-    const grossAssets = historiesTotal + plaidBrokerage + reNow + cashAssets;
-    const total = grossAssets - cardDebt;
+    const privateNow = privateLib.privateTotal(privateLib.privateHoldings());
+    const grossAssets = historiesTotal + plaidBrokerage + reNow + privateNow + cashAssets;
+    const depositOwed = depositLib.depositLiability((depositRuns || [])[0] || null);
+    const total = grossAssets - cardDebt - depositOwed;
 
     // Name each source with its own vintage — these are point-in-time snapshots,
     // and CLAUDE.md § Financial Operations requires saying so every time.
@@ -289,6 +290,7 @@ async function main() {
     if (reNow) parts.push(`${NET_WORTH.property_totals.label || "property"} ${usd(reNow)} (as of ${realEstate[0].as_of_date})`);
     for (const v of valued) if (v.now) parts.push(`${v.src.label || v.src.table} ${usd(v.now)} (as of ${v.rows[0].as_of_date})`);
     if (plaidBrokerage) parts.push(`${NET_WORTH.holdings_label} ${usd(plaidBrokerage)} (as of ${(plaidAsOf || "").slice(0, 10)})`);
+    if (privateNow) parts.push(`${privateLib.privateLabel()} ${usd(privateNow)}`);
     parts.push(`${NET_WORTH.cash_label} ${usd(cashAssets)}`);
 
     // A card whose Item is in login_required has stopped reporting, so its last
@@ -311,8 +313,9 @@ async function main() {
     const debtNote = cardDebt
       ? ` − ${usd(cardDebt)} on the cards${staleCards.length ? `, though ${staleCards.join(" and ")} stopped reporting so that owed figure is a floor` : ""}`
       : "";
+    const depositNote = depositOwed ? ` − ${usd(depositOwed)} tenant deposits owed back` : "";
     add(20, {
-      signal: `Tracked net worth ~${usd(total)} after debt, none of it live: ${parts.join(" + ")}${debtNote}${trend}.`,
+      signal: `Tracked net worth ~${usd(total)} after debt, none of it live: ${parts.join(" + ")}${debtNote}${depositNote}${trend}.`,
       urgency: 0.3,
       freshness_min: 0,
       dedup_key: `finance:networth:${isoWeek()}`,

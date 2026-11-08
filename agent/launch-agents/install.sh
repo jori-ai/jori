@@ -14,9 +14,17 @@
 #   agent/launch-agents/install.sh <label> [<label>…]   install / refresh these
 #   agent/launch-agents/install.sh --dry-run <label>…   render to stdout, change nothing
 #   agent/launch-agents/install.sh --uninstall <label>  bootout + remove
+#   agent/launch-agents/install.sh --stop-running <label>  refresh even if its job is mid-run
 #
 # Re-running on an installed label re-renders it, boots the old copy out and
 # bootstraps the new one (launchd only re-reads a plist on bootstrap).
+#
+# Booting a label out kills the job it is running. For a scheduled job (no
+# KeepAlive) that is a run lost halfway, so a refresh of a label whose job is
+# running is refused unless --stop-running is given; rerun after it finishes.
+# (2026-11-04: refreshing ai.claude.improvement-plan to move its schedule
+# killed the weekly planner mid-run, before it built two P1 fixes.) Always-on
+# agents (KeepAlive) are expected to be running and are refreshed as before.
 
 set -euo pipefail
 
@@ -26,19 +34,24 @@ DOMAIN="gui/$(id -u)"
 # shellcheck source=../scripts/lib/launchd-render.sh
 source "$HERE/../scripts/lib/launchd-render.sh"
 
-DRY=0; LIST=0; UNINSTALL=0
+DRY=0; LIST=0; UNINSTALL=0; STOP_RUNNING=0
 LABELS=()
 for a in "$@"; do
   case "$a" in
     --dry-run) DRY=1 ;;
     --list) LIST=1 ;;
     --uninstall) UNINSTALL=1 ;;
-    -h|--help) sed -n '2,19p' "$0"; exit 0 ;;
+    --stop-running) STOP_RUNNING=1 ;;
+    -h|--help) sed -n '2,28p' "$0"; exit 0 ;;
     *) LABELS+=("${a%.plist}") ;;
   esac
 done
 
 loaded() { launchctl print "$DOMAIN/$1" >/dev/null 2>&1; }
+# The pid of the job a loaded label is running now, or nothing.
+running_pid() { launchctl print "$DOMAIN/$1" 2>/dev/null | awk '$1 == "pid" && $2 == "=" { print $3; exit }'; }
+# KeepAlive true (or a dict) means always-on: running is its normal state.
+keep_alive() { local v; v="$(plutil -extract KeepAlive xml1 -o - "$1" 2>/dev/null)" || return 1; ! grep -q '<false/>' <<<"$v"; }
 
 if [ "$LIST" = 1 ]; then
   for f in "$HERE"/*.plist; do
@@ -78,7 +91,14 @@ for l in "${LABELS[@]}"; do
   if command -v plutil >/dev/null 2>&1 && ! plutil -lint "$DEST/$l.plist.new" >/dev/null; then
     echo "  ✗ $l: rendered plist does not lint" >&2; rm -f "$DEST/$l.plist.new"; rc=1; continue
   fi
-  if loaded "$l"; then launchctl bootout "$DOMAIN/$l" 2>/dev/null || true; fi
+  if loaded "$l"; then
+    pid="$(running_pid "$l")"
+    if [ -n "$pid" ] && [ "$STOP_RUNNING" = 0 ] && ! keep_alive "$DEST/$l.plist.new"; then
+      echo "  ✗ $l: its job is running now (pid $pid); refreshing would kill that run. Rerun when it finishes, or pass --stop-running." >&2
+      rm -f "$DEST/$l.plist.new"; rc=1; continue
+    fi
+    launchctl bootout "$DOMAIN/$l" 2>/dev/null || true
+  fi
   mv -f "$DEST/$l.plist.new" "$DEST/$l.plist"
   if launchctl bootstrap "$DOMAIN" "$DEST/$l.plist"; then
     echo "  ✓ $l loaded"

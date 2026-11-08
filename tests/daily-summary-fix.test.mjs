@@ -38,8 +38,21 @@ cap=""; prev=""
 for a in "$@"; do [ "$prev" = "--capture-id" ] && cap="$a"; prev="$a"; done
 case "$*" in *"[held]"*) [ -n "$cap" ] && printf '{"suppressed":true,"reason":"test"}\\n' > "$cap" ;; *) [ -n "$cap" ] && printf 'row-1\\n' > "$cap" ;; esac
 `, { mode: 0o755 });
+  // Like digest-deliver: logs what it sent (args, then the body it read) and says
+  // `sent` on stderr; a body marked "[fail]" fails (exit 1) without sending.
+  const delivered = path.join(dir, "delivered.log");
+  const deliver = path.join(dir, "deliver");
+  fs.writeFileSync(deliver, `#!/bin/sh
+body=""; prev=""
+for a in "$@"; do [ "$prev" = "--body-file" ] && body="$a"; prev="$a"; done
+if grep -q 'fail]' "$body"; then echo "digest-deliver: email-send failed" >&2; exit 1; fi
+printf '%s | %s\\n---\\n' "$*" "$(cat "$body")" >> ${delivered}
+echo 'digest-deliver: sent "x"' >&2
+`, { mode: 0o755 });
   // DS_FIX_LAST_USER_MSG: when the user last wrote in chat ("" = not since), never Supabase.
-  const env = { ...process.env, DS_FIX_DIR: path.join(dir, "state"), DS_FIX_SEND_BIN: sender, DS_FIX_TMP: dir, JORI_ROOT: dir, JORI_LOCAL_DIR: local, DS_FIX_LAST_USER_MSG: "" };
+  // DS_FIX_WAKE_LOG: a staged correction's wake is logged, never a real sleep.
+  const env = { ...process.env, DS_FIX_DIR: path.join(dir, "state"), DS_FIX_SEND_BIN: sender, DS_FIX_TMP: dir, JORI_ROOT: dir, JORI_LOCAL_DIR: local, DS_FIX_LAST_USER_MSG: "",
+    DS_FIX_DELIVER_BIN: deliver, DS_FIX_WAKE_LOG: path.join(dir, "wake.log") };
   delete env.DS_FIX_NOW; delete env.DS_FIX_TZ;
   const run = (...args) => spawnSync(process.execPath, [BIN, ...args], { encoding: "utf8", env, timeout: 30000 });
   // `at(iso, tz)` runs the CLI with its clock and the user's timezone pinned.
@@ -57,7 +70,10 @@ case "$*" in *"[held]"*) [ -n "$cap" ] && printf '{"suppressed":true,"reason":"t
       night_of: "2026-10-26", tz: "Asia/Jerusalem", phone_down_at: ago(500), in_bed_now: inBed,
       phone_up_at: upMinAgo === null ? null : ago(upMinAgo), written_at: ago(writtenMinAgo) }));
   };
-  return { dir, run, at, state, sends, queued, unqueue, sleep, done: () => fs.rmSync(dir, { recursive: true, force: true }) };
+  const lines = (f, sep) => (fs.existsSync(f) ? fs.readFileSync(f, "utf8").split(sep).filter(Boolean) : []);
+  const emails = () => lines(delivered, "\n---\n");
+  const wakes = () => lines(path.join(dir, "wake.log"), "\n");
+  return { dir, run, at, state, sends, queued, unqueue, sleep, emails, wakes, done: () => fs.rmSync(dir, { recursive: true, force: true }) };
 }
 
 test("request queues the day for launchd and records why; an answer is kept verbatim", () => {
@@ -431,6 +447,138 @@ test("mark-sent records first sends and corrections; bad arguments are refused",
   } finally { s.done(); }
 });
 
+// Each reply the user emails about a sent summary gets its own short answer in the
+// thread at once (the email-inbound turn, not this CLI) and queues a fix run with
+// `request`. Every run used to send the whole summary again as "(corrected)"; now it
+// stages its version, and code sends the newest once the corrections have stopped for
+// 20 minutes. Nothing here delays the request or its reply.
+const SENT = "2099-01-03";
+const SUBJ = "Day of Saturday, January 3, 2099 (corrected)";
+function sentDay(s) {
+  s.at("2099-01-04T10:45:00Z")("mark-sent", SENT);
+  return (v) => { const f = path.join(s.dir, `v${v}.html`); fs.writeFileSync(f, `<h1>Day of Saturday</h1><p>version ${v}</p>`); return f; };
+}
+const stage = (s, iso, file) => s.at(iso)("stage", SENT, "--subject", SUBJ, "--body-file", file, "--push", "Saturday's summary, corrected");
+const correction = (s, iso) => { const r = s.at(iso)("request", SENT, "--reason", "emailed correction"); s.unqueue(SENT); return r; };
+
+test("two corrections five minutes apart: two runs, one corrected email with the latest version, 20 minutes after the last", () => {
+  const s = sandbox();
+  try {
+    const html = sentDay(s);
+    const r = s.at("2099-01-04T12:32:00Z")("request", SENT, "--reason", "emailed correction 1");
+    assert.equal(r.status, 0);
+    assert.ok(s.queued(SENT), "the correction's run is queued at once");
+    s.unqueue(SENT);
+    assert.equal(stage(s, "2099-01-04T12:35:00Z", html(1)).status, 0);
+    correction(s, "2099-01-04T12:37:00Z");
+    assert.equal(stage(s, "2099-01-04T12:41:00Z", html(2)).status, 0);
+    assert.deepEqual(s.wakes(), ["2099-01-04T12:52:00.000Z", "2099-01-04T12:57:00.000Z"]);
+    s.at("2099-01-04T12:52:05Z")("send-due"); // the first wake: a correction came in since
+    s.at("2099-01-04T12:52:30Z")("sweep");
+    assert.equal(s.emails().length, 0, "nothing goes inside the quiet window");
+    assert.ok(!s.queued("send-due"));
+    assert.equal(s.at("2099-01-04T12:57:05Z")("send-due").status, 0);
+    s.at("2099-01-04T13:30:00Z")("send-due");
+    s.at("2099-01-04T13:52:00Z")("sweep");
+    assert.equal(s.emails().length, 1, "one corrected email");
+    const [email] = s.emails();
+    assert.ok(email.includes(`--subject ${SUBJ}`) && email.includes("--push Saturday's summary, corrected") && email.includes("version 2"), email);
+    const st = s.state(SENT);
+    assert.deepEqual(st.sends.map((x) => [x.corrected, x.versions]), [[false, undefined], [true, 2]]);
+    assert.equal(st.pending_correction, undefined);
+    assert.ok(!fs.existsSync(path.join(s.dir, "state", "pending", `${SENT}.html`)));
+  } finally { s.done(); }
+});
+
+test("a single correction sends exactly one corrected email, 20 minutes after it", () => {
+  const s = sandbox();
+  try {
+    const html = sentDay(s);
+    correction(s, "2099-01-04T12:00:00Z");
+    stage(s, "2099-01-04T12:05:00Z", html(1));
+    assert.deepEqual(s.wakes(), ["2099-01-04T12:20:00.000Z"]);
+    s.at("2099-01-04T12:19:59Z")("send-due");
+    assert.equal(s.emails().length, 0);
+    s.at("2099-01-04T12:20:05Z")("send-due");
+    s.at("2099-01-04T12:21:00Z")("send-due");
+    s.at("2099-01-04T12:52:00Z")("sweep");
+    assert.equal(s.emails().length, 1);
+    assert.ok(!s.queued("send-due"));
+  } finally { s.done(); }
+});
+
+test("a staged copy waits for a newer correction's run; goes when that run ends, or after 3 hours; the sweep queues it if the wake was lost", () => {
+  const s = sandbox();
+  try {
+    const html = sentDay(s);
+    correction(s, "2099-01-04T12:00:00Z");
+    stage(s, "2099-01-04T12:05:00Z", html(1));
+    s.at("2099-01-04T12:10:00Z")("request", SENT, "--reason", "emailed correction 2"); // its run is queued
+    s.at("2099-01-04T12:31:00Z")("send-due");
+    s.at("2099-01-04T12:31:00Z")("sweep");
+    s.unqueue(SENT); // the run starts
+    s.at("2099-01-04T12:40:00Z")("send-due");
+    assert.equal(s.emails().length, 0, "not while the newer correction's run is still to come or under way");
+    assert.ok(!s.queued("send-due"));
+    s.at("2099-01-04T12:45:00Z")("tier-done", SENT, "sonnet"); // it ended without staging a new version
+    s.at("2099-01-04T12:52:00Z")("sweep");
+    assert.ok(s.queued("send-due"), "the sweep queues it for the launchd runner (it never sends)");
+    assert.equal(s.emails().length, 0);
+    s.at("2099-01-04T12:52:40Z")("send-due");
+    assert.equal(s.emails().length, 1);
+    assert.ok(s.emails()[0].includes("version 1"));
+    // A newer correction whose run never comes: the newest copy goes after 3 hours.
+    correction(s, "2099-01-04T13:00:00Z");
+    stage(s, "2099-01-04T13:05:00Z", html(2));
+    s.at("2099-01-04T13:06:00Z")("request", SENT, "--reason", "emailed correction 4");
+    s.at("2099-01-04T15:52:00Z")("send-due");
+    assert.equal(s.emails().length, 1);
+    s.at("2099-01-04T16:07:00Z")("send-due");
+    assert.equal(s.emails().length, 2);
+    assert.ok(s.emails()[1].includes("version 2"));
+  } finally { s.done(); }
+});
+
+test("stage refuses a day never sent; with no correction waiting it goes at once; 'send it now' ends the wait", () => {
+  const s = sandbox();
+  try {
+    const f = path.join(s.dir, "x.html"); fs.writeFileSync(f, "<p>x</p>");
+    assert.equal(s.run("stage", D, "--subject", "s", "--body-file", f).status, 3, "a first send is never deferred");
+    assert.ok(!fs.existsSync(path.join(s.dir, "state", `${D}.json`)), "nothing recorded");
+    const html = sentDay(s);
+    stage(s, "2099-01-04T11:00:00Z", html(1)); // e.g. the run the sweep starts when a correction's answer window closes
+    assert.ok(s.queued("send-due"), "due at once: the runner is started now");
+    s.at("2099-01-04T11:00:30Z")("send-due");
+    assert.equal(s.emails().length, 1);
+    correction(s, "2099-01-04T12:00:00Z");
+    stage(s, "2099-01-04T12:05:00Z", html(2));
+    s.at("2099-01-04T12:06:00Z")("release", SENT); s.unqueue(SENT);
+    s.at("2099-01-04T12:09:00Z")("tier-done", SENT, "sonnet");
+    s.at("2099-01-04T12:10:00Z")("send-due");
+    assert.equal(s.emails().length, 2, "released: it goes before 12:20");
+  } finally { s.done(); }
+});
+
+test("a staged correction that fails to send is kept and retried, never dropped; the third failure is said once on the system channel", () => {
+  const s = sandbox();
+  try {
+    const html = sentDay(s);
+    const f = html(1);
+    fs.writeFileSync(f, "<p>[fail]</p>");
+    stage(s, "2099-01-04T11:00:00Z", f);
+    for (const t of ["11:00:30", "11:52:00", "12:52:00", "13:52:00"]) assert.equal(s.at(`2099-01-04T${t}Z`)("send-due").status, 1);
+    assert.equal(s.emails().length, 0);
+    assert.equal(s.state(SENT).pending_correction.attempts, 4);
+    assert.equal(s.sends().filter((m) => m.includes("failed to send 3 times")).length, 1);
+    s.at("2099-01-04T14:52:00Z")("sweep");
+    assert.ok(s.queued("send-due"), "still due: the sweep keeps queueing it");
+    fs.writeFileSync(path.join(s.dir, "state", "pending", `${SENT}.html`), "<p>version 1</p>"); // the mail path recovers
+    assert.equal(s.at("2099-01-04T14:52:40Z")("send-due").status, 0);
+    assert.equal(s.emails().length, 1);
+    assert.equal(s.state(SENT).pending_correction, undefined);
+  } finally { s.done(); }
+});
+
 // The closing section is built from the append-only fix log. A finding logged
 // `unresolved` and fixed by a later run, or a question whose answer a later entry
 // applied, used to read "not fixed yet" / "waiting on your answer" beside the
@@ -787,20 +935,31 @@ test("the launchd runner sends held questions only after the Max sign-in check, 
       fs.writeFileSync(path.join(home, "local", "config", "daily-summary-fix.json"), JSON.stringify({ quiet_hours: QUIET }));
       const sent = path.join(home, "sent.log");
       fs.writeFileSync(path.join(home, "send"), `#!/bin/sh\nprintf '%s\\n---\\n' "$*" >> ${sent}\n`, { mode: 0o755 });
-      const env = { ...process.env, HOME: home, JORI_ROOT: root, JORI_LOCAL_DIR: path.join(home, "local"), DS_FIX_SEND_BIN: path.join(home, "send"), DS_FIX_TZ: "Asia/Jerusalem", DS_FIX_LAST_USER_MSG: "" };
+      fs.writeFileSync(path.join(home, "deliver"), `#!/bin/sh\necho "$*" >> ${home}/delivered.log\n`, { mode: 0o755 });
+      const env = { ...process.env, HOME: home, JORI_ROOT: root, JORI_LOCAL_DIR: path.join(home, "local"), DS_FIX_SEND_BIN: path.join(home, "send"), DS_FIX_TZ: "Asia/Jerusalem", DS_FIX_LAST_USER_MSG: "",
+        DS_FIX_DELIVER_BIN: path.join(home, "deliver"), DS_FIX_WAKE_LOG: path.join(home, "wake.log") };
       delete env.DS_FIX_DIR; delete env.CLAUDE_BIN;
       const cli = (iso, ...args) => spawnSync(process.execPath, [BIN, ...args], { encoding: "utf8", env: { ...env, DS_FIX_NOW: iso } });
       const sends = () => (fs.existsSync(sent) ? fs.readFileSync(sent, "utf8").split("\n---\n").filter(Boolean) : []);
       const queue = path.join(root, "data", "daily-summary-fix", "queue");
 
       cli("2026-10-27T02:19:18Z", "ask", OCT26, "--question", "Was Sam with you at dinner?");
+      // A corrected summary staged earlier, due since 07:30 (its wake was lost): the sweep
+      // queues `send-due`, and the runner sends it, signed in or not (code, no model).
+      fs.writeFileSync(path.join(home, "c.html"), "<p>corrected</p>");
+      cli("2026-10-27T07:00:00Z", "mark-sent", "2026-10-25");
+      cli("2026-10-27T07:10:00Z", "request", "2026-10-25", "--reason", "emailed correction", "--no-kick");
+      cli("2026-10-27T07:12:00Z", "stage", "2026-10-25", "--subject", "S (corrected)", "--body-file", path.join(home, "c.html"));
       cli("2026-10-27T07:52:02Z", "sweep");
+      assert.ok(fs.existsSync(path.join(queue, "send-due")));
       assert.equal(sends().length, 0, "the cron sweep sends nothing");
       assert.ok(fs.existsSync(path.join(queue, "release-held")));
 
       const r = spawnSync("/bin/bash", [path.join(scripts, "trigger-daily-summary-fix.sh")], { encoding: "utf8", env: { ...env, DS_FIX_NOW: "2026-10-27T07:52:40Z" }, timeout: 30000 });
       assert.equal(r.status, 0, r.stderr);
       assert.ok(!fs.existsSync(path.join(queue, "release-held")), "the marker is consumed either way, so launchd does not loop");
+      assert.ok(!fs.existsSync(path.join(queue, "send-due")));
+      assert.equal(fs.readFileSync(path.join(home, "delivered.log"), "utf8").split("\n").filter(Boolean).length, 1, "the corrected summary went once");
       assert.ok(!fs.existsSync(path.join(home, "fork.log")), "a release starts no fixer run");
       const st = JSON.parse(fs.readFileSync(path.join(root, "data", "daily-summary-fix", `${OCT26}.json`), "utf8"));
       const log = fs.readFileSync(path.join(root, "agent", "logs", "daily-summary-fix.log"), "utf8");
@@ -816,4 +975,208 @@ test("the launchd runner sends held questions only after the Max sign-in check, 
       }
     } finally { fs.rmSync(home, { recursive: true, force: true }); }
   }
+});
+
+// ── The evening pass ──────────────────────────────────────────────────────
+// the user, 2026-10-21: on a Tuesday the calendar had two friends at 8pm and at 10:20pm
+// the user wrote where they had dinner; the fix loop asked whether the friends were there
+// at 4:37am Wednesday. "Why wait until 4:37am to ask this?" Once a day, from 22:00 the
+// user's time, the sweep starts the fixer for today in its before_summary phase, on a day
+// whose calendar has something that has begun (code looks first). Times here are UTC
+// (tz "UTC"), so 22:52Z is 22:52 his time. The calendar is stubbed (DS_FIX_EVENING_EVENTS).
+const EV_DAY = "2099-01-06"; // a Tuesday
+const dinner = { summary: "dinner", start: { dateTime: `${EV_DAY}T20:00:00Z` }, end: { dateTime: `${EV_DAY}T22:00:00Z` } };
+const evAt = (s, iso, events = [dinner], extra = {}) => s.at(iso, "UTC", { DS_FIX_EVENING_EVENTS: JSON.stringify(events), ...extra });
+const lastLines = (r) => r.stdout.trim().split("\n");
+
+test("the evening pass starts once for today at the first sweep at or after 22:00, in the before_summary phase", () => {
+  const s = sandbox();
+  try {
+    let r = evAt(s, `${EV_DAY}T21:52:00Z`)("sweep");
+    assert.equal(r.status, 0, r.stderr);
+    assert.ok(!fs.existsSync(path.join(s.dir, "state", `${EV_DAY}.json`)), "not before 22:00");
+    r = evAt(s, `${EV_DAY}T22:52:00Z`)("sweep");
+    assert.ok(lastLines(r).includes(`evening pass: started for ${EV_DAY}`), r.stdout);
+    assert.ok(s.queued(EV_DAY), "the fixer is kicked");
+    const st = s.state(EV_DAY);
+    assert.equal(st.requests[0].from, "evening");
+    assert.equal(st.status, "queued");
+    assert.equal(evAt(s, `${EV_DAY}T22:55:00Z`)("phase", EV_DAY).stdout.trim(), "before_summary");
+    assert.equal(JSON.parse(evAt(s, `${EV_DAY}T22:55:00Z`)("status", EV_DAY).stdout).phase, "before_summary");
+    s.unqueue(EV_DAY);
+    r = evAt(s, `${EV_DAY}T23:52:00Z`)("sweep");
+    assert.equal(s.state(EV_DAY).requests.length, 1, "once a day");
+    assert.ok(!s.queued(EV_DAY));
+    assert.ok(!lastLines(r).some((l) => l.startsWith("evening pass: started")));
+    // A run that died before the 4am build is not "a summary never sent": the sweep leaves it.
+    evAt(s, "2099-01-07T02:52:00Z")("sweep");
+    assert.ok(!s.queued(EV_DAY), "a before_summary day is never re-queued as stranded");
+  } finally { s.done(); }
+});
+
+test("the evening pass skips a day with nothing on the calendar to check, and honours its kill switch", () => {
+  const s = sandbox();
+  try {
+    const video = { ...dinner, summary: "call", hangoutLink: "https://meet.google.com/x" };
+    const zoomLoc = { ...dinner, summary: "sync", location: "https://acme.zoom.us/j/1" };
+    const declined = { ...dinner, attendees: [{ self: true, responseStatus: "declined" }] };
+    const cancelled = { ...dinner, status: "cancelled" };
+    const later = { ...dinner, start: { dateTime: `${EV_DAY}T23:30:00Z` } };
+    const allDay = { summary: "trip", start: { date: EV_DAY }, end: { date: "2099-01-07" } };
+    let r = evAt(s, `${EV_DAY}T22:52:00Z`, [video, zoomLoc, declined, cancelled, later, allDay])("sweep");
+    assert.ok(lastLines(r).includes("evening pass: skipped: nothing on the calendar to check"), r.stdout);
+    assert.ok(!fs.existsSync(path.join(s.dir, "state", `${EV_DAY}.json`)), "no day state for a skipped evening");
+    r = evAt(s, `${EV_DAY}T23:52:00Z`)("sweep");
+    assert.ok(!lastLines(r).some((l) => l.startsWith("evening pass")), "it does not look again that night");
+    // A dinner whose location is a maps link is not a video meeting.
+    const D2 = "2099-01-07";
+    const maps = { ...dinner, start: { dateTime: `${D2}T20:00:00Z` }, location: "https://maps.google.com/?q=bistro" };
+    fs.writeFileSync(path.join(s.dir, "state", ".evening-off"), "");
+    r = evAt(s, `${D2}T22:52:00Z`, [maps])("sweep");
+    assert.ok(lastLines(r).includes("evening pass: off (kill switch)"));
+    fs.rmSync(path.join(s.dir, "state", ".evening-off"));
+    r = evAt(s, `${D2}T23:52:00Z`, [maps])("sweep");
+    assert.ok(lastLines(r).includes(`evening pass: started for ${D2}`), "the switch removed, the same evening still runs it");
+  } finally { s.done(); }
+});
+
+test("an evening question opens with 'Before I write up', holds no email, carries moot_after, and at most two are asked", () => {
+  const s = sandbox();
+  try {
+    evAt(s, `${EV_DAY}T22:52:00Z`)("sweep");
+    const ask = (q, extra = {}) => evAt(s, `${EV_DAY}T23:05:00Z`, [dinner], extra)("ask", EV_DAY, "--question", q);
+    let r = ask("Your calendar had Alex and Sam at 8. Were they at dinner with you?", { DS_FIX_PHASE: "before_summary" });
+    assert.equal(r.status, 0, r.stderr);
+    const sent = s.sends()[0];
+    assert.ok(sent.includes("📝 Before I write up your Tuesday, January 6: Your calendar had Alex and Sam at 8."), sent);
+    assert.ok(!sent.includes("holding the summary"), "no answer window");
+    const meta = JSON.parse(sent.slice(sent.indexOf("--metadata-json ") + 16, sent.indexOf(" --channel")));
+    assert.equal(meta.moot_after, "2099-01-07T04:00:00.000Z", "it stops mattering at the 4am build");
+    const st = s.state(EV_DAY);
+    assert.equal(st.questions[0].evening, true, "the runner's DS_FIX_PHASE makes it an evening question without the flag");
+    assert.equal(st.hold, undefined);
+    assert.equal(evAt(s, `${EV_DAY}T23:06:00Z`)("gate", EV_DAY, "--peek").status, 0, "the gate never waits on it");
+    // Without the flag or the runner's env it is an ordinary question (the 4am build's, or
+    // the fix loop's): not an evening one.
+    assert.equal(ask("Was the 9pm stop the bistro?", {}).status, 0);
+    assert.equal(s.state(EV_DAY).questions[1].evening, undefined);
+  } finally { s.done(); }
+  const t = sandbox();
+  try {
+    evAt(t, `${EV_DAY}T22:52:00Z`)("sweep");
+    const ask = (q) => evAt(t, `${EV_DAY}T23:05:00Z`)("ask", EV_DAY, "--evening", "--question", q);
+    assert.equal(ask("One?").status, 0);
+    assert.equal(ask("Two?").status, 0);
+    const r = ask("Three?");
+    assert.equal(r.status, 3, "at most two in the evening");
+    assert.equal(t.sends().length, 2);
+  } finally { t.done(); }
+});
+
+test("an answer before the 4am build stays before_summary; the build's send retires an unanswered evening question and the day is not left waiting", () => {
+  const s = sandbox();
+  try {
+    evAt(s, `${EV_DAY}T22:52:00Z`)("sweep");
+    s.unqueue(EV_DAY);
+    evAt(s, `${EV_DAY}T23:05:00Z`)("ask", EV_DAY, "--evening", "--question", "Were Alex and Sam at dinner?");
+    evAt(s, `${EV_DAY}T23:06:00Z`)("ask", EV_DAY, "--evening", "--question", "Was the 9pm stop the bistro?");
+    assert.ok(s.state(EV_DAY).status.startsWith("awaiting_"));
+    // His reply at 23:40 (the chat agent passes it): still before the summary.
+    evAt(s, `${EV_DAY}T23:40:00Z`)("request", EV_DAY, "--answer", "Yes, both were there");
+    assert.equal(evAt(s, `${EV_DAY}T23:41:00Z`)("phase", EV_DAY).stdout.trim(), "before_summary");
+    s.unqueue(EV_DAY);
+    evAt(s, `${EV_DAY}T23:50:00Z`)("answered", EV_DAY, "1");
+    // The runner after that run: a day it left queued waits for the build.
+    evAt(s, "2099-01-07T00:10:00Z")("request", EV_DAY, "--answer", "and we left at 11", "--no-kick");
+    evAt(s, "2099-01-07T00:30:00Z")("idle", EV_DAY);
+    assert.equal(s.state(EV_DAY).status, "waiting_for_summary");
+    assert.equal(evAt(s, "2099-01-07T03:00:00Z")("phase", EV_DAY).stdout.trim(), "before_summary", "yesterday, before the build");
+    // The 4am build: confirmed, the gate says send (nothing of the evening holds it).
+    assert.equal(evAt(s, "2099-01-07T04:20:00Z")("gate", EV_DAY).status, 0);
+    evAt(s, "2099-01-07T04:30:00Z")("mark-sent", EV_DAY);
+    let st = s.state(EV_DAY);
+    assert.equal(st.questions[1].dropped_why, "the summary was built without it");
+    assert.ok(!st.questions[0].dropped_at, "an answered one stays as it was");
+    assert.equal(st.status, "sent", "an unanswered evening question no longer keeps the day waiting on him");
+    assert.equal(evAt(s, "2099-01-07T04:31:00Z")("phase", EV_DAY).stdout.trim(), "after_summary");
+    evAt(s, "2099-01-07T04:32:00Z")("done", EV_DAY, "--status", "confirmed");
+    assert.equal(s.state(EV_DAY).status, "confirmed");
+    // He writes later in the day: the sweep has nothing to chase.
+    evAt(s, "2099-01-07T15:52:00Z", [dinner], { DS_FIX_LAST_USER_MSG: "2099-01-07T15:00:00Z" })("sweep");
+    assert.ok(!s.queued(EV_DAY));
+    // His answer after the send is a correction to a built day.
+    evAt(s, "2099-01-07T16:00:00Z")("request", EV_DAY, "--answer", "Actually the 9pm stop was the bar next door");
+    assert.equal(evAt(s, "2099-01-07T16:01:00Z")("phase", EV_DAY).stdout.trim(), "after_summary");
+  } finally { s.done(); }
+});
+
+test("an evening question composed in his quiet hours opens no window and is dropped unasked once the summary is built", () => {
+  const s = sandbox({ quiet: QUIET });
+  try {
+    evAt(s, `${EV_DAY}T22:52:00Z`)("sweep");
+    s.unqueue(EV_DAY);
+    // The run ran late (behind other days): it asks at 01:20 his time.
+    const r = evAt(s, "2099-01-07T01:20:00Z")("ask", EV_DAY, "--evening", "--question", "Were Alex and Sam at dinner?");
+    assert.equal(r.status, 0, r.stderr);
+    assert.ok(r.stdout.includes("dropped unasked if the summary is built first"), r.stdout);
+    let st = s.state(EV_DAY);
+    assert.ok(st.questions[0].held_until && st.questions[0].evening);
+    assert.equal(st.hold, undefined, "no provisional window: the 4am email never waits for it");
+    assert.equal(evAt(s, "2099-01-07T04:20:00Z")("gate", EV_DAY).status, 0);
+    evAt(s, "2099-01-07T04:30:00Z")("mark-sent", EV_DAY);
+    evAt(s, "2099-01-07T09:52:00Z")("sweep");
+    st = s.state(EV_DAY);
+    assert.equal(st.questions[0].dropped_why, "the summary was built without it");
+    assert.ok(!releaseQueued(s), "nothing to release");
+    evAt(s, "2099-01-07T09:55:00Z")("release-held");
+    assert.equal(s.sends().length, 0, "never sent");
+  } finally { s.done(); }
+  // No build at all (it failed): past the build's hour it is moot anyway.
+  const t = sandbox({ quiet: QUIET });
+  try {
+    evAt(t, `${EV_DAY}T22:52:00Z`)("sweep");
+    evAt(t, "2099-01-07T01:20:00Z")("ask", EV_DAY, "--evening", "--question", "Were Alex and Sam at dinner?");
+    evAt(t, "2099-01-07T09:52:00Z")("sweep");
+    assert.equal(t.state(EV_DAY).questions[0].dropped_why, "the summary was built without it");
+    assert.equal(t.sends().length, 0);
+  } finally { t.done(); }
+});
+
+test("the 4am build's own question ends the before_summary phase and opens its window; an evening question is refused after it", () => {
+  const s = sandbox();
+  try {
+    evAt(s, `${EV_DAY}T22:52:00Z`)("sweep");
+    s.unqueue(EV_DAY);
+    const r = evAt(s, "2099-01-07T04:20:00Z")("ask", EV_DAY, "--question", "Was the 6pm stop the gym?");
+    assert.equal(r.status, 0, r.stderr);
+    assert.ok(s.sends()[0].includes("📝 Fixing your Tuesday, January 6 summary:"));
+    assert.ok(s.state(EV_DAY).hold, "a build question opens the answer window as before");
+    assert.equal(evAt(s, "2099-01-07T04:21:00Z")("phase", EV_DAY).stdout.trim(), "after_summary");
+    assert.equal(evAt(s, "2099-01-07T04:22:00Z")("ask", EV_DAY, "--evening", "--question", "Late?").status, 3);
+    assert.equal(evAt(s, "2099-01-07T04:22:00Z")("request", EV_DAY, "--evening", "--no-kick").stdout.trim(), `${EV_DAY}: its summary is already built; no evening pass`);
+  } finally { s.done(); }
+});
+
+test("phase: no evening pass is the old behaviour, and past noon the next day a correction is to a built day", () => {
+  const s = sandbox();
+  try {
+    evAt(s, `${EV_DAY}T23:00:00Z`)("request", EV_DAY, "--answer", "that was the bistro", "--no-kick");
+    assert.equal(evAt(s, `${EV_DAY}T23:01:00Z`)("phase", EV_DAY).stdout.trim(), "after_summary", "no evening pass, no before_summary");
+  } finally { s.done(); }
+  const t = sandbox();
+  try {
+    evAt(t, `${EV_DAY}T22:52:00Z`)("sweep");
+    assert.equal(evAt(t, "2099-01-07T11:59:00Z")("phase", EV_DAY).stdout.trim(), "before_summary");
+    assert.equal(evAt(t, "2099-01-07T12:00:00Z")("phase", EV_DAY).stdout.trim(), "after_summary", "the build's record went missing: rebuild and send");
+  } finally { t.done(); }
+});
+
+test("done retires what is still open of the evening pass", () => {
+  const s = sandbox();
+  try {
+    evAt(s, `${EV_DAY}T22:52:00Z`)("sweep");
+    evAt(s, `${EV_DAY}T23:05:00Z`)("ask", EV_DAY, "--evening", "--question", "Were Alex and Sam at dinner?");
+    evAt(s, "2099-01-07T04:30:00Z")("done", EV_DAY, "--status", "confirmed");
+    assert.equal(s.state(EV_DAY).questions[0].dropped_why, "the day was closed");
+  } finally { s.done(); }
 });

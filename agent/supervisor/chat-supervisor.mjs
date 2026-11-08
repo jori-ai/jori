@@ -28,6 +28,7 @@ import { PriorityDispatcher } from "../lib/priority-dispatcher.mjs";
 import { isPhantomResult } from "../lib/phantom-result.mjs";
 import { TurnWatchdog, TURN_WATCHDOG_MS_DEFAULT, hangReasonClause } from "./turn-watchdog.mjs";
 import { QueueAlarm, CHAT_QUEUE_ALARM_HIGH, CHAT_QUEUE_ALARM_CLEAR } from "./queue-alarm.mjs";
+import { QueuePersist } from "./queue-persist.mjs";
 
 // Prefix every supervisor stderr line with an ISO timestamp; see matching
 // block in ops index.mjs for rationale.
@@ -43,6 +44,7 @@ import {
 } from "./context-guard.mjs";
 import { State } from "./state.mjs";
 import { Instrumentation } from "./instrumentation.mjs";
+import { phoneChannelLiveness, PHONE_CHANNEL_FIRST_BEAT_GRACE_MS } from "./turn-watchdog.mjs";
 import { attachClaudeMdWatcher } from "./graceful-restart.mjs";
 import { authFailureText, CHAT_AUTH_OFFLINE_REPLY } from "./auth-result.mjs";
 import { isQuotaRefusal, rateLimitHoldUntil, RATE_LIMIT_REPROBE_MS } from "./dispatcher.mjs";
@@ -259,6 +261,21 @@ function json(res, code, obj) {
   res.end(JSON.stringify(obj));
 }
 
+// Put in front of their message when a new process reloads it from the saved
+// queue (startSession): it is answered late, and the session should know when
+// it was sent. One that was being answered when its process died may have been
+// partly answered already: the resumed session can see what it did.
+function restartReplayHeader(enqueuedAt, { wasRunning = false, tz = userTz() } = {}) {
+  const when = Number.isFinite(enqueuedAt)
+    ? new Date(enqueuedAt).toLocaleString("en-US", { timeZone: tz, weekday: "short", hour: "numeric", minute: "2-digit", timeZoneName: "short" })
+    : null;
+  const arrived = when ? ` arrived ${when} and` : "";
+  const late = "if it asks for something whose moment may have passed, confirm before doing it.";
+  return wasRunning
+    ? `[supervisor] This message${arrived} was being answered when the chat supervisor restarted, so that answer may be unfinished or may already have gone out. Check this conversation for what you already did or sent, do not repeat it, and finish only what is left. The time stamps in it are out of date: check the current time before saying anything time-sensitive, and ${late}`
+    : `[supervisor] This message${arrived} was still queued when the chat supervisor restarted, so it is being answered late and the time stamps in it are out of date. Check the current time before saying anything time-sensitive, mention the delay briefly, and ${late}`;
+}
+
 class ChatSupervisor {
   constructor({ args, agentCfg, dataDir, eventDir }) {
     this.args = args;
@@ -267,6 +284,12 @@ class ChatSupervisor {
     this.eventLog = new EventLog(eventDir);
     this.instrumentation = new Instrumentation(eventDir);
     this.state = new State(path.join(dataDir, "session.json"));
+    // The queue survives a whole-process restart (SIGTERM, crash): saved on
+    // every change, reloaded once at boot. An in-process restart still hands it
+    // over in memory (startSession).
+    this.queuePersist = new QueuePersist(path.join(dataDir, "queue.json"));
+    this.queueRestored = false;
+    this.queueRestoredCount = 0;   // items this process reloaded at boot (/health queueRestored)
     this.session = null;
     this.dispatcher = null;
     this.chatAgent = null; // set in startSession() when CHAT_SUBSTRATE === "loop"
@@ -293,6 +316,8 @@ class ChatSupervisor {
     this.liveBackgroundTasks = new Map();
     this.interrupting = false;
     this.lastPhoneChannelHeartbeat = null;
+    this._phoneChannelHeldAt = 0;          // last time dispatch was seen held (see _phoneChannelLiveness)
+    this._phoneChannelNoBeatRestarts = 0;  // restarts for a phone-channel that never sent a heartbeat
     // Per-turn hang watchdog (parity with ops index.mjs, which has had one since
     // 2026-04-18). Chat previously relied only on the 15-min process-level SIGKILL
     // in process-manager.mjs; this recovers a hung chat turn faster and per-turn.
@@ -681,10 +706,60 @@ class ChatSupervisor {
 
     // Transfer pending queue from old dispatcher.
     const pendingItems = this.dispatcher ? [...this.dispatcher.queue] : [];
-    this.dispatcher = new PriorityDispatcher(this.session, { sendFn: loopSendFn });
+    this.dispatcher = new PriorityDispatcher(this.session, { sendFn: loopSendFn, persist: () => this.queuePersist.save(this.dispatcher) });
     if (this._quotaHoldTo > Date.now()) this.dispatcher.hold(this._quotaHoldTo);   // a hold outlives a restart
+    // First construction in this process: reload what the last process left
+    // queued (and in flight). Their own messages get a line saying they are
+    // answered late; one already marked late by a usage-limit retry keeps that.
+    if (!this.queueRestored) {
+      this.queueRestored = true;
+      try {
+        const saved = this.queuePersist.load();
+        const items = saved ? [saved.inFlight, ...saved.queue].filter(Boolean) : [];
+        const now = Date.now();
+        const kept = new Set(), dropped = [];
+        for (const item of items) {
+          // Session-control turns belong to the process that queued them: this
+          // one sends its own init, and a saved /compact could land on a session
+          // the cold-start guard has since replaced.
+          if (item.source === "init" || item.source === "context-guard") { dropped.push(item.source); continue; }
+          // Running when its process died = dispatched since it was last
+          // reloaded (a shutdown puts the running turn back in the queue). Twice,
+          // and it is dropped, as the turn watchdog drops a turn that hangs
+          // twice: a turn that takes the process down must not replay forever.
+          const wasRunning = item === saved.inFlight || (item.dispatchedAt || 0) > (item.restoredAt || 0);
+          if (wasRunning) item.diedMidTurn = (item.diedMidTurn || 0) + 1;
+          if (item.diedMidTurn >= 2) {
+            dropped.push(`${item.source} (running at two restarts)`);
+            this._sendSystemAlert(`⚠️ Chat turn from ${item.source} was running when the chat supervisor stopped, at two restarts in a row — dropping it so it cannot keep taking chat down.`);
+            continue;
+          }
+          item.restoredAt = now;
+          kept.add(item);
+          if (item.source !== "jori" || item.quotaRetried || item.restartReplayed) continue;
+          item.restartReplayed = true;
+          item.content = `${restartReplayHeader(item.enqueuedAt, { wasRunning })}\n\n${item.content}`;
+        }
+        if (dropped.length) {
+          console.error(`[chat-supervisor] saved queue: not replaying ${dropped.length} item(s): ${dropped.join(", ")}`);
+          this.eventLog.append({ kind: "dispatcher.queue_restore_skipped", count: dropped.length, sources: dropped });
+        }
+        if (kept.size) {
+          this.dispatcher.restore({
+            inFlight: kept.has(saved.inFlight) ? saved.inFlight : null,
+            queue: saved.queue.filter((i) => kept.has(i)),
+          });
+          this.queueRestoredCount = kept.size;
+          console.error(`[chat-supervisor] restored ${kept.size} queued item(s) saved by the previous process (cold start)`);
+          this.eventLog.append({ kind: "dispatcher.queue_restored", count: kept.size, sources: [...kept].map((i) => i.source) });
+        }
+      } catch (err) {   // a bad file must never stop chat from starting
+        console.error(`[chat-supervisor] saved queue not restored (${err.message}) — starting empty`);
+      }
+    }
     for (const item of pendingItems) this.dispatcher.queue.push(item);
     if (pendingItems.length) console.error(`[chat-supervisor] transferred ${pendingItems.length} queued item(s)`);
+    this.queuePersist.save(this.dispatcher);   // the merged queue, before the first turn
 
     this.dispatcher.on("enqueued", (item) => {
       this.eventLog.append({ kind: "dispatcher.enqueued", item });
@@ -736,6 +811,7 @@ class ChatSupervisor {
       this.eventLog.append({ kind: "dispatcher.dispatch_error", id: item.id, source: item.source, error });
       // Unshift into current dispatcher queue; restart() transfers this queue to the new dispatcher.
       this.dispatcher.queue.unshift(item);
+      this.queuePersist.save(this.dispatcher);
       this.restart().catch((e) => console.error(`[chat-supervisor] restart after dispatch_error failed: ${e.message}`));
     });
     // Drain the handed-over queue only once every listener above is attached.
@@ -743,7 +819,9 @@ class ChatSupervisor {
     // queued item with no "dispatching" handler, so that turn had no
     // currentTurn: no safety net, no usage-limit check and no hang timer (for
     // instance a message whose usage-limit hold ran out during a restart).
-    if (pendingItems.length) this.dispatcher._drain();
+    // Gated on the queue, not on pendingItems: a cold start's reloaded queue
+    // has to start too. _drain() still honours a usage-limit hold.
+    if (this.dispatcher.queue.length) this.dispatcher._drain();
   }
 
   async interruptForHighPriority(urgentItem) {
@@ -789,6 +867,7 @@ class ChatSupervisor {
       // Clear inFlight BEFORE the SIGKILL so session.on("exit") → requeueInFlight()
       // finds nothing to requeue — the poison item is discarded, not retried.
       this.dispatcher.inFlight = null;
+      this.queuePersist.save(this.dispatcher);
     }
     console.error(`[chat-supervisor] TURN WATCHDOG: no result in ${mins}min for ${src} (item ${item?.id}, hang #${hangCount}, reason ${info?.reason || "window"}, silent ${info ? Math.round(info.silentMs / 1000) + "s" : "?"}, since progress ${info ? Math.round(info.sinceProgressMs / 1000) + "s" : "?"}) — ${drop ? "DROPPING (repeat hang)" : "requeue"} + kill child`);
     this.eventLog.append({ kind: "turn_watchdog.hang", source: src, itemId: item?.id, windowMs: ms, hangCount, dropped: drop, reason: info?.reason, silentMs: info?.silentMs, sinceProgressMs: info?.sinceProgressMs, elapsedMs: info?.elapsedMs });
@@ -860,6 +939,7 @@ class ChatSupervisor {
 
       if (req.method === "POST" && url.pathname === "/heartbeat") {
         this.lastPhoneChannelHeartbeat = Date.now();
+        this._phoneChannelNoBeatRestarts = 0;
         json(res, 200, { ok: true });
         return;
       }
@@ -887,20 +967,47 @@ class ChatSupervisor {
     });
     this.server.listen(port, "127.0.0.1", () => console.error(`[chat-supervisor] HTTP on :${port}`));
 
-    // Monitor phone-channel heartbeat — restart if stale >3 minutes.
-    const HEARTBEAT_STALE_MS = 3 * 60 * 1000;
+    // Monitor phone-channel heartbeat — restart if stale >3 minutes, or if this
+    // session's phone-channel has sent none within the first-heartbeat grace
+    // (it crashed at launch). A launch crash usually repeats, so that cause gets
+    // FIRST_BEAT_RESTARTS restarts until a heartbeat arrives; after that /health
+    // keeps reporting it stale and the watchdog's delivery check pages if
+    // messages go unreceived.
+    const FIRST_BEAT_RESTARTS = 2;
     setInterval(() => {
-      if (this.lastPhoneChannelHeartbeat &&
-          Date.now() - this.lastPhoneChannelHeartbeat > HEARTBEAT_STALE_MS &&
-          !this.restarting) {
+      if (this.restarting) return;
+      const pc = this._phoneChannelLiveness();
+      if (!pc.stale) return;
+      if (pc.firstBeatPending) {
+        const n = this._phoneChannelNoBeatRestarts++;
+        if (n >= FIRST_BEAT_RESTARTS) {
+          if (n === FIRST_BEAT_RESTARTS) console.error(`[chat-supervisor] phone-channel still sent no heartbeat after ${n} restarts — not restarting for it again until one arrives`);
+          return;
+        }
+        console.error(`[chat-supervisor] phone-channel sent no heartbeat within ${PHONE_CHANNEL_FIRST_BEAT_GRACE_MS / 60_000} min of session start — restarting session (${n + 1}/${FIRST_BEAT_RESTARTS})`);
+      } else {
         console.error("[chat-supervisor] phone-channel heartbeat stale — restarting session");
-        this.restart().catch((e) => console.error(`[chat-supervisor] heartbeat restart failed: ${e.message}`));
       }
+      this.restart().catch((e) => console.error(`[chat-supervisor] heartbeat restart failed: ${e.message}`));
     }, 60_000);
 
     this.startContextGuard();
     this.startCheckLaterTick();
     this.startForkTick();
+  }
+
+  // Phone-channel liveness for the restart check and /health
+  // (phoneChannelLiveness in turn-watchdog.mjs). The first-heartbeat grace runs
+  // from the later of the session's start and the last tick that saw dispatch
+  // held for the usage limit (a hold keeps the init turn that starts the MCP
+  // servers queued). Nothing is judged mid-restart, or when no Supabase project
+  // is configured (the phone-channel exits at launch by design then).
+  _phoneChannelLiveness(now = Date.now()) {
+    if (this.dispatcher?.isHeld()) this._phoneChannelHeldAt = now;
+    this._phoneChannelExpected ??= !!(instanceValue("supabase_project") || process.env.SUPABASE_URL);
+    const waitingSince = this.restarting || !this._phoneChannelExpected ? null
+      : Math.max(this.sessionStartedAt || 0, this._phoneChannelHeldAt) || null;
+    return phoneChannelLiveness({ lastHeartbeatAt: this.lastPhoneChannelHeartbeat, waitingSince, now });
   }
 
   // Context-size guard: keep the chat session under the 200k standard window so it
@@ -1096,7 +1203,7 @@ class ChatSupervisor {
       // and the watchdog restarts a supervisor whose queue waits.
       if (this.dispatcher && !this.dispatcher.queue.some((i) => i.source === "init")) {
         this.dispatcher.dispatch(
-          "Session started. Standing by for Jori messages.",
+          "Session started. Standing by for Jori messages.", // control-scan-ok: the software's name
           "init",
           { priority: "low" }
         );
@@ -1125,6 +1232,7 @@ class ChatSupervisor {
       consecutiveNoOpTurns: this.consecutiveNoOpTurns,
       childAlive: !!(this.session?.child && this.session.child.exitCode === null && this.session.child.signalCode === null),
       phoneChannelHeartbeatAgeMs: this.lastPhoneChannelHeartbeat ? now - this.lastPhoneChannelHeartbeat : null,
+      phoneChannelStale: this._phoneChannelLiveness(now).stale,
       activeTools: [...this.activeToolMap.values()],
       safetyNetFireCount: this.safetyNetFireCount,
       authErrorCount: this.authErrorCount,
@@ -1134,6 +1242,7 @@ class ChatSupervisor {
       checkLaterPending: this.chatAgent ? pendingWakes(this.chatAgent.id).length : null,
       forksActive: this.chatAgent ? forkQueue.countActive(this.chatAgent.id) : null,
       queueAlarmActive: this.queueAlarm.active,
+      queueRestored: this.queueRestoredCount,
       ...this.dispatcher?.snapshot(),
     };
   }
@@ -1164,6 +1273,9 @@ class ChatSupervisor {
         item.quotaSeveral = (item.mergedCount || 0) > 0;   // mergedCount is recomputed when it drains again
         if (item.source === "jori") item.content = `${QUOTA_RETRY_HEADER}\n\n${item.content}`;   // never in front of a /compact
       }
+      // Refused before it did anything: waiting, not running, should the process
+      // die before it runs (the saved-queue reload counts a turn that was running).
+      delete item.dispatchedAt;
       this.dispatcher.requeueInFlight({ front: true });
     }
     const dropped = noWork && !requeued;

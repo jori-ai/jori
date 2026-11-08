@@ -19,6 +19,7 @@ When the user asks Jori in chat to build new functionality or change how Jori be
 5. **Never leave the tree dirty.** Anything you touched is either landed by the pipeline or restored before you finish. Check with `git status --porcelain`. The mini always carries runtime drift, so compare against your Step 2 snapshot and never clean anyone else's files.
 6. **Ambiguity: pick the conservative reading and say so.** You cannot ask the user mid-run. If the request has one reasonable reading, build it and name the assumption in the report. If it has two materially different readings, or needs a decision only the user can make (money, a third party, removing something the user uses), build nothing and put the question in the report. Asking is better than building the wrong thing.
 7. **Kernel files stay generic** (`agent/CLAUDE.md` § Kernel boundary). Most of Jori is the kernel (`system/kernel-manifest.json`), published without personal data. What the user asked for is usually about the user's own life: the code in a kernel file stays generic and reads the user's specifics from `agent/local/config/<module>.json` (`localConfig`, generic default in code) or an `_ext/` hook; the user's rules go in `agent/local/` (`jobs/<job>.md` for a playbook's additions); the request, the user's words and the date go in the changelog entry and `--details`, never a code comment. A wholly personal feature (the user's properties, trips) can be a personal file: add its path to `personal_globs` in the manifest in the same files-json, as every new file must be classified (`files` with its published path, or `personal_globs`). Run `bin/kernel-guard` before Step 5. Auto-apply exit 8 (`self-improve-request` exit 65) means the guard found personal data in a kernel file or an unclassified new file: move it, re-test, resubmit once.
+8. **Locked files go on a card that quotes the user (rubric schema v6, 2026-11-04).** The improvement pipeline's own controls (`RECURSION_GUARD` in `lib/self-improve-landing.mjs`: the agent `CLAUDE.md` files and their `agent/local/` twins, the guarded playbooks such as `nightly-review.md`, `improvement-plan.md`, `system-issue-review.md`, `self-improvement-executor.md`, chat's reply-recognition text) may change only because the user asked, so a build that touches one skips `self-improve-auto-apply` and files a card with the user's own words: Step 5 § Locked files. The lock's own machinery (`LOCK_CORE`: the risk rubric, `self-improve-landing.mjs`, the `self-improve-*` CLIs, the approval core, the rebase/rebuild rules and their tests) cannot change on any card, quoted or not: build nothing there and report that it needs a session the user directs. Never apply a locked file by hand or with `jori-commit`, whatever the request says ("do it automatically" included): the card is the route.
 
 ## Pipeline
 
@@ -44,7 +45,7 @@ A request that opens with `REBUILD OF AN APPROVED CARD — approval <id>` did no
      --details "Rebuilt on the current code after the approved version could not apply: <what moved>." \
      --files-json /tmp/chat-build-<request id>-files.json
    ```
-   `--rebuild-of` is what stops a loop: a rebuilt card that conflicts again is never rebuilt a second time.
+   `--rebuild-of` is what stops a loop: a rebuilt card that conflicts again is never rebuilt a second time. A rebuild of a locked-file card (Step 5 § Locked files) needs no `--owner-quote`: `self-improve-request` carries the original card's quote over and checks it again; a different quote is refused.
 3. Steps 2–4 (snapshot, build and test, critic) apply unchanged. Restore the working tree after staging, as in Step 5.
 4. **Report** in one or two sentences: the change the user approved could not go in as written because the code had moved on, it has been rebuilt, and it is waiting for the user's Face ID in Improvements.
 
@@ -92,6 +93,21 @@ Build `/tmp/chat-build-<id>-files.json` from every file you changed with `~/Dev/
 - **4**: someone else has uncommitted edits in a target file. Don't clobber them. Report it; a re-run after that work lands will go through.
 - **7**: a file you changed moved on after you read it (another change landed). Nothing was written. Re-read it, rewrite your change against the current content **once**, re-test, and resubmit with `--base-rev $(git rev-parse HEAD)` (taken before that re-read) and `--redo`. A second 7: restore your files and report that someone else's change landed on the same code; a re-run will go through.
 - **5 / 6 / 1**: report the reason exactly as the CLI printed it.
+- **64 with `ownerCardable: true`**: a locked file. Go to § Locked files below.
+
+### Locked files
+
+If any file you changed is a locked file (Critical rule 8; `bin/self-improve-auto-apply --dry-run` refuses it with "the improvement pipeline's own controls"), do not run `self-improve-auto-apply` for real. File the card directly, quoting the user:
+
+```bash
+~/Dev/jori/bin/self-improve-request --type code-fix \
+  --owner-quote "<the user's own words asking for this, copied character for character from their message>" \
+  [--owner-message-id <that message's id, when the request gives it>] \
+  --summary "..." --problem "the user asked for this in chat: ..." --impact "..." --fix "..." --side-effects "..." \
+  --details "..." --files-json /tmp/chat-build-<id>-files.json
+```
+
+The request text usually carries the user's words; if it paraphrases them, find the message itself with `recall "<topic>"` and copy from it. The quote must be at least 12 characters and an exact substring of one of the user's own messages written before this build was requested (no re-typing, no fixing typos, the same quote marks); the CLI compares it with the stored message and checks that it is running inside this chat build (the trigger exports `JORI_CHAT_BUILD_REQUEST`). The card opens with the quote, and the applier checks it again before writing. Exit **66**: refused, nothing filed. Report the reason as printed: a quote not found (copy it again, once), a file in the lock's own machinery (needs a session the user directs), or not a chat build. If the same change also touches ordinary files, they go on the same card.
 
 **Restart needed?** If the change touches a supervisor, an MCP server, `agents.json`, or anything else loaded at session start, it is on disk but inert until a restart. Say so in the report and in `--side-effects`.
 

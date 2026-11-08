@@ -1,0 +1,95 @@
+#!/usr/bin/env node
+// daily-summary-review-ab — compare the production reviewer with a shadow one.
+//
+// While data/daily-summary-review-ab.json (`{until, model, effort}`) is on, the
+// first production review of each date snapshots what it read and its findings
+// (primary.json), and daily-summary-run reviews the same snapshot with the other
+// model as a shadow (shadow.json). See bin/daily-summary-review's header.
+//
+// Usage:
+//   daily-summary-review-ab start --until YYYY-MM-DD [--model sonnet] [--effort high]
+//   daily-summary-review-ab stop
+//   daily-summary-review-ab status
+//   daily-summary-review-ab report [--json]
+//
+// The comparison is the FIRST round of each: production repairs and re-reviews,
+// the shadow does not, so its findings are set beside production's first-round
+// findings (what each model saw on the same draft), plus each one's verdict,
+// cost and time. It decides nothing; the user does.
+
+const fs = require("node:fs");
+const path = require("node:path");
+
+const ROOT = path.join(__dirname, "..");
+const CFG = path.join(ROOT, "data", "daily-summary-review-ab.json");
+const DIR = path.join(ROOT, "data", "daily-summary-review-ab");
+const readJson = (f) => { try { return JSON.parse(fs.readFileSync(f, "utf8")); } catch { return null; } };
+const arg = (f, d) => { const i = process.argv.indexOf(f); return i > -1 ? process.argv[i + 1] : d; };
+const cmd = process.argv[2];
+
+const SEV = ["high", "medium", "low"];
+const bySev = (fs_) => Object.fromEntries(SEV.map((s) => [s, (fs_ || []).filter((f) => f.severity === s).length]));
+const sevStr = (c) => SEV.map((s) => `${c[s]}${s[0]}`).join("/");
+const gate = (fs_) => !(fs_ || []).some((f) => f.severity === "high" || f.severity === "medium");
+// A finding's identity for matching across reviewers: its kind and the stop it is about.
+const keyOf = (f) => `${f.kind || "?"}|${f.stop_id || f.slot || ""}`;
+
+function rows() {
+  if (!fs.existsSync(DIR)) return [];
+  return fs.readdirSync(DIR).filter((d) => /^\d{4}-\d{2}-\d{2}$/.test(d)).sort().map((date) => { // lang-regex-ok: our own directory names
+    const p = readJson(path.join(DIR, date, "primary.json"));
+    const s = readJson(path.join(DIR, date, "shadow.json"));
+    if (!p) return { date, state: "no primary" };
+    const pf = p.first_findings || p.findings || [];
+    if (!s) return { date, state: "awaiting shadow", primary: { reviewer: p.reviewer, findings: bySev(pf), confirmed: gate(pf), cost_usd: p.cost_usd ?? null, elapsed_sec: p.elapsed_sec } };
+    const sf = s.findings || [];
+    const pk = new Set(pf.map(keyOf)), sk = new Set(sf.map(keyOf));
+    const show = (f) => ({ severity: f.severity, kind: f.kind, stop: f.stop_id || f.slot || null, detail: String(f.detail || f.what || "").slice(0, 200) });
+    return {
+      date, state: "compared",
+      primary: { reviewer: p.reviewer, findings: bySev(pf), confirmed: gate(pf), cost_usd: p.cost_usd ?? null, elapsed_sec: p.elapsed_sec },
+      shadow: { reviewer: s.reviewer, findings: bySev(sf), confirmed: gate(sf), cost_usd: s.cost_usd ?? null, elapsed_sec: s.elapsed_sec, ran: s.independent_review },
+      same_gate: gate(pf) === gate(sf),
+      both: pf.filter((f) => sk.has(keyOf(f))).map(show),
+      primary_only: pf.filter((f) => !sk.has(keyOf(f)) && f.severity !== "low").map(show),
+      shadow_only: sf.filter((f) => !pk.has(keyOf(f)) && f.severity !== "low").map(show),
+    };
+  });
+}
+
+if (cmd === "start") {
+  const until = arg("--until");
+  if (!until || !/^\d{4}-\d{2}-\d{2}$/.test(until)) { console.error("start needs --until YYYY-MM-DD"); process.exit(2); } // lang-regex-ok: a date argument
+  const cfg = { until, model: arg("--model", "sonnet"), effort: arg("--effort", "high"), started_at: new Date().toISOString() };
+  fs.mkdirSync(path.dirname(CFG), { recursive: true });
+  fs.writeFileSync(CFG, JSON.stringify(cfg, null, 2) + "\n");
+  console.log(`reviewer A/B on through ${until}: shadow ${cfg.model}/${cfg.effort}`);
+} else if (cmd === "stop") {
+  try { fs.unlinkSync(CFG); } catch {}
+  console.log("reviewer A/B off (snapshots kept in data/daily-summary-review-ab/)");
+} else if (cmd === "status") {
+  const cfg = readJson(CFG);
+  console.log(cfg ? JSON.stringify(cfg) : "off");
+  for (const r of rows()) console.log(`${r.date}  ${r.state}`);
+} else if (cmd === "report") {
+  const rs = rows();
+  if (process.argv.includes("--json")) { console.log(JSON.stringify(rs, null, 1)); process.exit(0); }
+  const done = rs.filter((r) => r.state === "compared");
+  for (const r of rs) {
+    if (r.state !== "compared") { console.log(`${r.date}  ${r.state}`); continue; }
+    const P = r.primary, S = r.shadow;
+    console.log(`${r.date}  ${P.reviewer}: ${sevStr(P.findings)} ${P.confirmed ? "confirm" : "hold"} $${P.cost_usd ?? "?"} ${P.elapsed_sec}s`
+      + `  |  ${S.reviewer}: ${sevStr(S.findings)} ${S.confirmed ? "confirm" : "hold"} $${S.cost_usd ?? "?"} ${S.elapsed_sec}s${r.same_gate ? "" : "  << gate differs"}`);
+    for (const f of r.primary_only) console.log(`    only ${P.reviewer.split(" ")[0]}: [${f.severity}] ${f.kind} ${f.detail}`);
+    for (const f of r.shadow_only) console.log(`    only ${S.reviewer.split(" ")[0]}: [${f.severity}] ${f.kind} ${f.detail}`);
+  }
+  if (done.length) {
+    const sum = (k, side) => done.reduce((t, r) => t + (Number(r[side][k]) || 0), 0);
+    console.log(`\n${done.length} day(s): gate agreed on ${done.filter((r) => r.same_gate).length};`
+      + ` cost ${sum("cost_usd", "primary").toFixed(2)} vs ${sum("cost_usd", "shadow").toFixed(2)} USD;`
+      + ` time ${sum("elapsed_sec", "primary")}s vs ${sum("elapsed_sec", "shadow")}s`);
+  }
+} else {
+  console.error("usage: daily-summary-review-ab start --until YYYY-MM-DD [--model sonnet] [--effort high] | stop | status | report [--json]");
+  process.exit(2);
+}

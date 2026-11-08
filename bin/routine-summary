@@ -1,0 +1,34 @@
+#!/usr/bin/env node
+// routine-summary — the user's usual day in a few sentences, as the models that
+// name a stop read it (lib/routine-summary.js). Built by a model from the wiki
+// pages and recent day corrections named in agent/local/config/routine-summary.json,
+// cached in data/routine-summary.json, rebuilt when a source changes or the cache
+// is older than max_age_days.
+//
+// Usage:
+//   routine-summary            print the summary (rebuilding it first if stale)
+//   routine-summary --cached   print the cached text only; never calls a model
+//   routine-summary --refresh  rebuild now, whatever the cache says
+//   routine-summary --json     the full result {text, status, ...}
+
+"use strict";
+
+const path = require("node:path");
+const R = require(path.join(__dirname, "../lib/routine-summary.js"));
+
+const args = process.argv.slice(2);
+if (args.includes("-h") || args.includes("--help")) {
+  console.log("usage: routine-summary [--cached] [--refresh] [--json]");
+  process.exit(0);
+}
+
+(async () => {
+  const json = args.includes("--json");
+  const r = args.includes("--cached")
+    ? { text: R.routineSummarySync(), status: "cached" }
+    : await R.ensureRoutineSummary({ force: args.includes("--refresh") });
+  if (json) console.log(JSON.stringify({ ...r, cache: R.readCache() }, null, 2));
+  else if (r.text) console.log(r.text);
+  else console.error(`routine-summary: no summary (${r.status}${r.error ? `: ${r.error}` : ""})`);
+  if (r.status === "failed") process.exitCode = 1;
+})();

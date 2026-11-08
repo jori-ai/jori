@@ -345,6 +345,14 @@ final class LocationTracker: NSObject, CLLocationManagerDelegate {
             // Awake for location far more often than iOS delivers silent pushes;
             // pick up any pending photo probe here (throttled to 2 min inside).
             Task { await PhotoProbeResponder.shared.runIfDue() }
+            // Out of the house, every good fix also goes to live_position
+            // (throttled inside) so a local-history ping can land while the user
+            // is still next to the place, not minutes later from the batch.
+            if self.isOutAndAbout {
+                LivePositionPublisher.maybePublish(
+                    latitude: lat, longitude: lon, accuracy: accuracy,
+                    timestamp: timestamp, motion: self.lastActivityType)
+            }
             #endif
             await self.handleTransitWaypoint(lat: lat, lon: lon, accuracy: accuracy, timestamp: timestamp)
         }
@@ -1059,7 +1067,10 @@ final class LocationTracker: NSObject, CLLocationManagerDelegate {
         // classifier believes — it is 60s regardless. Being out IS the signal;
         // whether the user is walking or standing in a shop at that moment is
         // exactly what we are trying to find out.
-        if isOutAndAbout { return 60 }
+        // 30s, not 60: each ping is also what feeds live_position, and a
+        // local-history ping is only worth sending while the user is still
+        // within sight of the place (~40 m of walking per ping).
+        if isOutAndAbout { return 30 }
         switch activity {
         case "walking", "running", "cycling", "driving":
             return 120

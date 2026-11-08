@@ -6,6 +6,8 @@
 //   jori-notify --title "Jori" "Short summary body"
 //   jori-notify --channel system "Watchdog: Ollama restarted"  (no badge)
 //   jori-notify --urgent "Leave now — tunnel is backing up"     (pierces Focus)
+//   jori-notify --no-announce "Where did you have lunch?"       (a question: never read aloud)
+//   jori-notify --announce "You are standing by the old bakery"  (time-sensitive: read aloud, no Jev judgment; motion gate unchanged)
 
 import { createClient } from "@supabase/supabase-js";
 import { createRequire } from "node:module";
@@ -25,6 +27,7 @@ let messageId = null;
 let title = assistantName();
 let channel = "chat";
 let urgent = false;
+let announce = "judge";
 const positional = [];
 
 for (let i = 0; i < args.length; i++) {
@@ -33,6 +36,8 @@ for (let i = 0; i < args.length; i++) {
   else if (a === "--title" || a === "-t") title = args[++i];
   else if (a === "--channel" || a === "-c") channel = args[++i];
   else if (a === "--urgent" || a === "-u") urgent = true;
+  else if (a === "--no-announce") announce = "never";
+  else if (a === "--announce") announce = "always";
   else positional.push(a);
 }
 
@@ -52,8 +57,8 @@ if (!process.env.SUPABASE_SERVICE_ROLE_KEY) {
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 
 try {
-  const res = await sendApnsPush(supabase, { body, title, messageId, channel, urgent });
-  if (res?.held) console.log(`Push held (${res.reason}) — ping-flush will deliver it.`);
+  const res = await sendApnsPush(supabase, { body, title, messageId, channel, urgent, announce });
+  if (res?.repingIfUnread) console.log(`Push notification sent while moving (${res.reason}) — ping-flush re-pings it once on stopping if still unread.`);
   else console.log("Push notification sent.");
 } catch (e) {
   console.error(`Push failed: ${e.message}`);

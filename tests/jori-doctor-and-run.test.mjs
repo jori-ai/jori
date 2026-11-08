@@ -41,7 +41,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { spawnSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -210,3 +210,149 @@ it("any other missing interpreter still reads exit 127, wrapped or bare", () => 
     assert.ok(ck.detail.includes("envy (#!/usr/bin/env jori-no-such-interp → exit 127)"), ck.detail);
   }
 });
+
+// jori-restart-handoff.test.mjs — `jori restart` run by the chat agent itself.
+//
+// From inside the chat agent's session (JORI_DISPATCH_URL names chat's port), a
+// restart of chat or of the whole session would kill the turn that asked for it.
+// Other targets still restart at once; that one goes to a single detached
+// job-run job that waits for the turn to end and checks the result. Elsewhere
+// nothing changes. Fixture install (JORI_HOME), fake curl / launchctl /
+// systemctl / job-run, moved ports: nothing real is touched.
+{
+const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const PORTS = { pm: "59195", wa: "59100", chat: "59094" };
+
+const FAKE_CURL = `#!/bin/sh
+for a in "$@"; do url="$a"; done
+S="$FAKE_STATE"
+case " $* " in *" -X POST "*) method=POST ;; *) method=GET ;; esac
+case "$url" in
+  *":${PORTS.pm}/health")
+    pid=$(cat "$S/wa.pid")
+    if kill -0 "$pid" 2>/dev/null; then cur=$pid; else cur=424242; fi
+    echo "$method pm" >> "$S/curl.log"
+    printf '{"pid":1000,"children":[{"name":"whatsapp-channel","alive":true,"pid":%s}]}' "$cur" ;;
+  *":${PORTS.wa}/health") echo "$method wa" >> "$S/curl.log" ;;
+  *":${PORTS.chat}/health")
+    left=$(cat "$S/inflight-left" 2>/dev/null || echo 0)
+    if [ "$left" -gt 0 ]; then echo $((left - 1)) > "$S/inflight-left"; inflight='{"id":"turn-1","source":"jori"}'; state=inflight
+    else inflight=null; state=idle; fi
+    if [ -f "$S/chat-restarted" ]; then rc=4; ss=B; else rc=3; ss=A; fi
+    echo "$method chat-health $state" >> "$S/curl.log"
+    printf '{"restartCount":%s,"childAlive":true,"sessionId":"s1","sessionStartedAt":"%s","startedAt":"T0","inFlight":%s}' "$rc" "$ss" "$inflight" ;;
+  *":${PORTS.chat}/restart") echo "$method chat-restart" >> "$S/curl.log"; : > "$S/chat-restarted"; printf 202 ;;
+  *) exit 7 ;;
+esac
+`;
+
+// Records the call (argv, whether the chat marker reached the job, whether the
+// WhatsApp restart had already happened) and answers like job-run.
+const FAKE_JOB_RUN = `#!${process.execPath}
+const fs = require("fs");
+const S = process.env.FAKE_STATE;
+let waAlive = true;
+try { process.kill(Number(fs.readFileSync(S + "/wa.pid", "utf8")), 0); } catch { waAlive = false; }
+fs.appendFileSync(S + "/jobrun.jsonl", JSON.stringify({ argv: process.argv.slice(2), marker: "JORI_DISPATCH_URL" in process.env, waAlive }) + "\\n");
+console.log("started job 20261105-000000-restart-fake-0000");
+console.log("log: /dev/null");
+`;
+
+function fixture({ inflight = 0 } = {}) {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "jori-restart-handoff-"));
+  const tools = path.join(home, "install");
+  const fakebin = path.join(home, "fakebin");
+  const state = path.join(home, "state");
+  for (const d of [path.join(tools, "bin"), path.join(tools, "system"), fakebin, state]) fs.mkdirSync(d, { recursive: true });
+  fs.writeFileSync(path.join(fakebin, "curl"), FAKE_CURL, { mode: 0o755 });
+  for (const tool of ["launchctl", "systemctl"]) fs.writeFileSync(path.join(fakebin, tool), `#!/bin/sh\necho "${tool} $*" >> "$FAKE_STATE/service-manager.log"\n`, { mode: 0o755 });
+  fs.writeFileSync(path.join(tools, "bin/job-run"), FAKE_JOB_RUN, { mode: 0o755 });
+  fs.writeFileSync(path.join(state, "inflight-left"), String(inflight));
+  // The "WhatsApp channel": a stray sleep, re-parented so it is reaped once signalled.
+  const waPid = execFileSync("/bin/sh", ["-c", "sleep 120 >/dev/null 2>&1 & echo $!"], { encoding: "utf8" }).trim();
+  fs.writeFileSync(path.join(state, "wa.pid"), waPid);
+  return { home, state, waPid: Number(waPid) };
+}
+
+function cleanup(fx) {
+  try { process.kill(fx.waPid, "SIGKILL"); } catch {}
+  fs.rmSync(fx.home, { recursive: true, force: true });
+}
+
+function runRestart(fx, args, { marker = null } = {}) {
+  const env = {
+    PATH: `${path.join(fx.home, "fakebin")}:/usr/bin:/bin`, HOME: fx.home, JORI_HOME: path.join(fx.home, "install"), NO_COLOR: "1", FAKE_STATE: fx.state,
+    JORI_PORT_PROCESS_MANAGER: PORTS.pm, JORI_PORT_WHATSAPP: PORTS.wa, JORI_PORT_CHAT_HEALTH: PORTS.chat,
+  };
+  if (marker) env.JORI_DISPATCH_URL = marker;
+  const t0 = Date.now();
+  const r = spawnSync(process.execPath, [path.join(ROOT, "bin/jori"), "restart", ...args], { encoding: "utf8", timeout: 60000, env });
+  return { ...r, ms: Date.now() - t0 };
+}
+
+const read = (fx, f) => { try { return fs.readFileSync(path.join(fx.state, f), "utf8"); } catch { return ""; } };
+const jobRuns = (fx) => read(fx, "jobrun.jsonl").split("\n").filter(Boolean).map((l) => JSON.parse(l));
+const curlLog = (fx) => read(fx, "curl.log").split("\n").filter(Boolean);
+const CHAT_MARKER = `http://127.0.0.1:${PORTS.chat}/dispatch`;
+
+it("from the chat agent, `restart whatsapp session` restarts WhatsApp now and hands the session restart to one detached job", () => {
+  const fx = fixture({ inflight: 1 });
+  try {
+    const r = runRestart(fx, ["whatsapp", "session"], { marker: CHAT_MARKER });
+    assert.equal(r.status, 0, r.stderr + r.stdout);
+    assert.ok(r.ms < 15000, `took ${r.ms} ms`);
+    assert.match(r.stdout, /whatsapp-channel restarted — new pid 424242/);
+    assert.match(r.stdout, /whole-session restart handed off \(background job 20261105-000000-restart-fake-0000\)/);
+    assert.equal(read(fx, "service-manager.log"), "", "launchctl/systemctl must not run inside the chat turn");
+    const runs = jobRuns(fx), [run] = runs;
+    assert.equal(runs.length, 1);
+    assert.equal(run.waAlive, false, "the WhatsApp restart ran before the hand-off");
+    assert.equal(run.marker, false, "the job must not look like the chat session, or it would hand off again");
+    const sep = run.argv.indexOf("--");
+    assert.deepEqual(run.argv.slice(sep + 2), [fs.realpathSync(path.join(ROOT, "bin/jori")), "restart", "session", "--after-chat-turn=turn-1"]);
+    const flags = run.argv.slice(0, sep);
+    assert.equal(flags[flags.indexOf("--tier") + 1], "ops-light");
+    assert.equal(flags[flags.indexOf("--name") + 1], "restart-session");
+    const notify = flags[flags.indexOf("--notify-task") + 1];
+    for (const part of ["{{id}}", "{{status}}", "jori-send-curl"]) assert.ok(notify.includes(part), notify);
+  } finally { cleanup(fx); }
+});
+
+it("from the chat agent, `restart chat` returns at once without touching the chat supervisor", () => {
+  const fx = fixture({ inflight: 1 });
+  try {
+    const r = runRestart(fx, ["chat"], { marker: CHAT_MARKER });
+    assert.equal(r.status, 0, r.stderr + r.stdout);
+    assert.ok(r.ms < 5000, `took ${r.ms} ms`);
+    assert.match(r.stdout, /chat restart handed off/); // lang-regex-ok: asserts this CLI's own fixed output, not a person's words
+    assert.ok(!curlLog(fx).includes("POST chat-restart"), curlLog(fx).join("\n"));
+    assert.deepEqual(jobRuns(fx).map((j) => j.argv.slice(-3)), [["restart", "chat", "--after-chat-turn=turn-1"]]);
+  } finally { cleanup(fx); }
+});
+
+it("without the chat marker (or with another supervisor's), `restart chat` restarts inline as before", () => {
+  for (const marker of [null, "http://127.0.0.1:59092/dispatch"]) {
+    const fx = fixture();
+    try {
+      const r = runRestart(fx, ["chat"], { marker });
+      assert.equal(r.status, 0, r.stderr + r.stdout);
+      assert.match(r.stdout, /✓ chat supervisor restarted \(session s1 resumed; restartCount 3→4; agents.json re-read\)/); // lang-regex-ok: asserts this CLI's own fixed output, not a person's words
+      assert.ok(curlLog(fx).includes("POST chat-restart"));
+      assert.equal(jobRuns(fx).length, 0);
+    } finally { cleanup(fx); }
+  }
+});
+
+it("the job's own run waits for the chat turn to end, then restarts and checks for a new session", () => {
+  const fx = fixture({ inflight: 2 });
+  try {
+    const r = runRestart(fx, ["chat", "--after-chat-turn=turn-1"]);
+    assert.equal(r.status, 0, r.stderr + r.stdout);
+    assert.match(r.stdout, /waiting for chat turn turn-1 to end/); // lang-regex-ok: asserts this CLI's own fixed output, not a person's words
+    assert.match(r.stdout, /✓ chat supervisor restarted \(session s1 resumed at B; restartCount 3→4/); // lang-regex-ok: asserts this CLI's own fixed output, not a person's words
+    const log = curlLog(fx);
+    assert.ok(log.indexOf("POST chat-restart") > log.lastIndexOf("GET chat-health inflight"), log.join("\n"));
+    assert.equal(jobRuns(fx).length, 0);
+  } finally { cleanup(fx); }
+});
+}

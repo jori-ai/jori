@@ -39,6 +39,9 @@ const { situation: sit, moment } = await readStdinJson(); void sit;
 const TOPIC = "location_context";
 const BIN = installTools("bin");
 const STOP_MAP = path.join(BIN, "stop-map");
+// Read by shFetch, which the queued-ask branch (Step 0) calls long before the GPS code
+// below; declared down there it was a temporal-dead-zone ReferenceError on every tick that had a queued ask.
+const SUPABASE_URL = process.env.SUPABASE_URL || supabaseUrl();
 // gog: $GOG_BIN, else a package-manager install (launchd's PATH has neither), else PATH.
 const GOG = process.env.GOG_BIN || ["/opt/homebrew/bin/gog", "/usr/local/bin/gog"].find((p) => fs.existsSync(p)) || "gog";
 const CAL_CMD = `${GOG} calendar list${GOG_ACCOUNT ? ` --account ${GOG_ACCOUNT}` : ""} --days 1 --max 40 --json 2>/dev/null`;
@@ -314,7 +317,6 @@ function localHourOf(iso) {
 // ~10 min means the user just left that place. These edges are the best
 // moments to ask — the user is about to act on the decision.
 import { execSync as _exec } from "node:child_process";
-const SUPABASE_URL = process.env.SUPABASE_URL || supabaseUrl();
 function shFetch(restPath, qs) {
   const key = process.env.SUPABASE_SERVICE_ROLE_KEY || (() => {
     try {

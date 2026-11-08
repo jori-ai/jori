@@ -310,3 +310,36 @@ test("Client invoices: voids excluded, split payments found, a later lump never 
   assert.equal(late.rows[0].status, "late");                   // due Oct 6, +3 grace
   assert.equal(reconcileInvoices({ invoices: [I("164", "2026-09-22")], payments: [], today: "2026-10-08" }).rows[0].status, "open");
 });
+
+test("a deposit the hub's trail shows returned in full is refunded even while its status still reads held (2026-11-08)", () => {
+  const w = {
+    positions: [{ place: "2222", label: "Birch ••2222", amount: 1600 }, { place: "returned", label: "Returned to the tenant", amount: 1600 }, { place: "1111", label: "Security Deposits ••1111", amount: -1600 }],
+    outside: 0, owed: 1600, trail: [], receivedOn: "2026-01-09", returnedOn: "2026-10-26", returnedAmount: 1600,
+  };
+  const d = { id: "mc", tenant: "Michael", amount: 1600, lease_number: "L", property_id: "birch", property_name: "40 Birch Ave", hub_status: "paid", paid_via: "external", lease_end: "2026-10-01", whereabouts: w, outside_allowed: { note: "stays in 2222 until refunded" } };
+  const report = { computedAt: "2026-11-08T12:00:00Z", account: { mask: "1111" }, proof: { balance: 0, deposits: 0 }, unlinked: [] };
+  const r = depositsFromHub({ deposits: [d], report, depositMask: "1111" });
+  assert.equal(r.rows[0].location, "refunded");
+  assert.deepEqual(r.rows[0].returned_from_other, { paid_from: "1111", paid_from_label: "Security Deposits ••1111", held_in: "2222", held_in_label: "Birch ••2222", amount: 1600 });
+  assert.equal(r.liability, 0);
+  const sec = depositSection({ run_at: new Date().toISOString(), report: { ...r, deposit_account: "Security Deposits ••1111" } }, "2026-11-08");
+  assert.ok(!sec.flags.some((f) => f.tag === "deposit-not-returned"));
+  assert.ok(sec.flags.some((f) => f.tag === "deposit-returned-from-other-account" && /Birch ••2222 still holds \$1,600\.00/.test(f.text)));
+  assert.ok(sec.flags.some((f) => f.tag === "deposit-hub-status"));
+});
+
+test("a Stripe deposit whose hub payout is marked paid into the deposit account is not missing; a stale hub record is flagged (2026-11-08)", () => {
+  const d = { id: "sm", tenant: "Sam", amount: 900, lease_number: "L", property_id: "elm", property_name: "12 Elm St", hub_status: "paid", paid_via: "stripe", lease_end: null,
+    whereabouts: { positions: [{ place: "stripe", label: "Stripe balance", amount: 900 }], outside: 900, trail: [], receivedOn: "2026-11-05", returnedOn: null }, outside_allowed: null };
+  const report = { computedAt: "2026-11-05T16:29:54Z", account: { mask: "1111" }, proof: { balance: 0, deposits: 0 }, unlinked: [] };
+  const paid = [{ id: "obt_1", status: "paid", bank_last4: "1111", arrival: "2026-11-05", shares: [{ deposit_id: "sm" }] }];
+  const r = depositsFromHub({ deposits: [d], report, depositMask: "1111", hubTransfers: paid });
+  assert.equal(r.rows[0].location, "payout_sent");
+  assert.equal(r.missing.length, 0);
+  // A payout to some other account does not count.
+  const other = depositsFromHub({ deposits: [d], report, depositMask: "1111", hubTransfers: [{ ...paid[0], bank_last4: "2222" }] });
+  assert.equal(other.rows[0].location, "stripe_paid");
+  const sec = depositSection({ run_at: new Date().toISOString(), report: { ...r, deposit_account: "Security Deposits ••1111" } }, "2026-11-08");
+  assert.ok(sec.flags.some((f) => f.tag === "deposit-hub-stale"));
+  assert.ok(!sec.flags.some((f) => f.tag === "deposit-missing"));
+});

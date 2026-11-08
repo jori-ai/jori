@@ -15,6 +15,8 @@ import fs from "node:fs";
 import path from "node:path";
 import readline from "node:readline";
 import { createRequire } from "node:module";
+import { createRequire as _identityRequire } from "node:module";
+const instanceLib = _identityRequire(import.meta.url)("../../lib/instance.cjs");
 
 const { instance, localDir } = createRequire(import.meta.url)("../../lib/instance.cjs");
 const { REPO_ROOT } = createRequire(import.meta.url)("../../lib/root.cjs");
@@ -54,12 +56,54 @@ export function supportsCliFlag(flag, { claudeBin = DEFAULT_CLAUDE, spawnSyncFn 
 
 export const LOCAL_RULES_FILE = "local-rules.md";
 
+// Kernel rulebooks in the system prompt (supervisor sessions only).
+//
+// claude -p puts the CLAUDE.md files it discovers in the FIRST USER MESSAGE,
+// and the prompt cache only reuses a prefix across sessions up to the system
+// prompt's breakpoint. So every fresh session cold-writes both rulebooks again
+// even though their bytes never changed, while the system prompt and tool block
+// before them are read from cache. A supervisor can instead pass the rulebooks'
+// text as part of its --append-system-prompt-file and exclude the same files
+// from discovery (`claudeMdExcludes` in its per-process --settings, which a
+// child process the agent starts does not inherit, unlike an env switch). The
+// text is the same; it moves into the cached half of the prefix.
+
+/**
+ * The kernel rulebooks a session started in `cwd` would discover:
+ * <root>/agent/CLAUDE.md, then <cwd>/CLAUDE.md. Existing files only, in that
+ * order. `excludes` lists every spelling of their paths (as given and
+ * physical), for `claudeMdExcludes`.
+ */
+export function kernelRulebooks({ root, cwd }) {
+  const real = (p) => { try { return fs.realpathSync(p); } catch { return p; } };
+  const files = [];
+  for (const p of [path.join(root, "agent", "CLAUDE.md"), path.join(cwd, "CLAUDE.md")]) {
+    if (!fs.existsSync(p)) continue;
+    if (files.some((f) => real(f) === real(p))) continue;
+    files.push(p);
+  }
+  const excludes = [...new Set(files.flatMap((f) => [f, real(f)]))];
+  return { files, excludes, root };
+}
+
 /**
  * The joined local rules for `role` ("chat" | "ops"; "shared" = shared.md
- * alone), or "" when there are none.
+ * alone), or "" when there are none. `rulebooks` (from kernelRulebooks) puts
+ * the kernel rulebooks' text first, framed the way claude frames a discovered
+ * CLAUDE.md; omitted, the output is the local rules alone (the shell twin's).
  */
-export function readLocalRules({ localDir, role }) {
+export function readLocalRules({ localDir, role, rulebooks }) {
+  // First, who the agent is: its name and pronouns (lib/instance.cjs
+  // identityBlock, from instance.json). Never blocks the rules below.
   const parts = [];
+  try { parts.push(instanceLib.identityBlock()); } catch {}
+  for (const f of rulebooks?.files || []) {
+    // A rulebook that cannot be read throws: the caller must not exclude a
+    // file from discovery that the system prompt does not carry.
+    const t = fs.readFileSync(f, "utf8");
+    const rel = rulebooks.root ? path.relative(rulebooks.root, f) : f;
+    parts.push(`Contents of ${rel} (project instructions, checked into the codebase):\n\n${t.trimEnd()}\n`);
+  }
   for (const name of role === "shared" ? ["shared.md"] : ["shared.md", `${role}.md`]) {
     let t;
     try { t = fs.readFileSync(path.join(localDir, name), "utf8"); } catch { continue; }
@@ -73,9 +117,9 @@ export function readLocalRules({ localDir, role }) {
  * (missing files skipped). Returns { path, content } — path is null when there
  * are no local rules, and then no file is left behind.
  */
-export function buildLocalRulesFile({ localDir, role, stateDir }) {
+export function buildLocalRulesFile({ localDir, role, stateDir, rulebooks }) {
   const outPath = path.join(stateDir, LOCAL_RULES_FILE);
-  const content = readLocalRules({ localDir, role });
+  const content = readLocalRules({ localDir, role, rulebooks });
   if (!content) {
     try { fs.unlinkSync(outPath); } catch {}
     return { path: null, content: "" };
@@ -152,10 +196,12 @@ export function localRulesFileForCwd({ cwd, root, localDir, stateDir }) {
  * attachClaudeMdWatcher() to have run (it supplies scheduleGracefulRestart).
  * Returns a stop function.
  */
-export function watchLocalRules(supervisor, { localDir, role, logPrefix, pollMs = 30_000 }) {
+export function watchLocalRules(supervisor, { localDir, role, logPrefix, pollMs = 30_000, rulebooks }) {
   const timer = setInterval(() => {
     let now;
-    try { now = readLocalRules({ localDir, role }); } catch { return; }
+    // `rulebooks` is a function returning what the running session was built
+    // with, so the comparison is like for like (a rulebook edit restarts too).
+    try { now = readLocalRules({ localDir, role, rulebooks: typeof rulebooks === "function" ? rulebooks() : rulebooks }); } catch { return; }
     if (supervisor._localRulesContent === undefined || now === supervisor._localRulesContent) return;
     console.error(`${logPrefix} local rules changed (${localDir}) — scheduling graceful restart`);
     supervisor.eventLog?.append({ kind: "local_rules_changed", localDir, role });

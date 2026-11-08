@@ -76,23 +76,23 @@ const SINCE = parseSince(flag('since', '24h'));
 // the day it is pinned in agent/config/models.env. Same prices as
 // MODEL_RATES in jori-cost-report (sources and quotes there).
 const RATES = {
-  'claude-opus-5-5':           [4, 20, 5.00, 0.20],   // 2026-10-06
+  'claude-opus-5-5':           [4, 20, 5.00, 0.20],   // 2026-10-06 — control-scan-ok: a price per model id, not a model choice
   'claude-opus-5':             [5, 25, 6.25, 0.50],
   'claude-sonnet-5':           [2, 10, 2.50, 0.20],
-  'claude-sonnet-5-5':         [2, 10, 2.50, 0.10],   // cache read $0.20 before 2026-10-07, see RATES_BEFORE
+  'claude-sonnet-5-5':         [2, 10, 2.50, 0.10],   // cache read $0.20 before 2026-10-07, see RATES_BEFORE — control-scan-ok: a price per model id, not a model choice
   'claude-fable-5':            [2, 10, 2.50, 0.20],
   'claude-haiku-4-5-20251001': [1,  5, 1.25, 0.10],
-  'claude-haiku-5-5':          [0.10, 0.50, 0.125, 0.01], // prompt up to 100k tokens, see LONG_PROMPT
+  'claude-haiku-5-5':          [0.10, 0.50, 0.125, 0.01], // prompt up to 100k tokens, see LONG_PROMPT — control-scan-ok: a price per model id, not a model choice
 };
 // An id's earlier price, for messages stamped before `until`.
 const RATES_BEFORE = {
-  'claude-sonnet-5-5': { until: Date.parse('2026-10-07T00:00:00Z'), rate: [2, 10, 2.50, 0.20] },
+  'claude-sonnet-5-5': { until: Date.parse('2026-10-07T00:00:00Z'), rate: [2, 10, 2.50, 0.20] }, // control-scan-ok: a price per model id, not a model choice
 };
 // Priced by prompt length: a request whose prompt (input + cache reads + cache
 // writes) is over `over` tokens pays `rate` for the whole request. A transcript
 // line is one request, so this is exact here.
 const LONG_PROMPT = {
-  'claude-haiku-5-5': { over: 100000, rate: [0.50, 2.50, 0.625, 0.05] },
+  'claude-haiku-5-5': { over: 100000, rate: [0.50, 2.50, 0.625, 0.05] }, // control-scan-ok: a price per model id, not a model choice
 };
 function rateFor(model, ts, prompt) {
   if (!RATES[model]) return null;

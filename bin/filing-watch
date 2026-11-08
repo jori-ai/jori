@@ -66,7 +66,7 @@ const JSON_OUT = FLAGS.has("--json");
 // SEC asks for a descriptive User-Agent with contact details and rate-limits
 // hard without one. Ten requests/second is their published ceiling; this makes
 // about a dozen requests once a week, so one per second is plenty polite.
-const UA = CFG.user_agent || `Jori Personal Research ${instance().owner_email || ""}`.trim();
+const UA = CFG.user_agent || `Jori Personal Research ${instance().owner_email || ""}`.trim();  // control-scan-ok: the software's name
 const FORMS = "S-1,F-1,S-4,424B4";
 // Exhibits are attachments to a filing, not filings. A single S-1 drags 20+
 // EX-* rows along with it, and alerting on those buries the one line that

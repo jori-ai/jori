@@ -1,0 +1,37 @@
+#!/usr/bin/env node
+// wiki-worker-deploy — deploy the wiki's Cloudflare worker with this
+// installation's settings.
+//
+// The worker cannot read agent/local/instance.json, so the values it needs
+// from there are passed at deploy time as wrangler vars instead of being
+// copied into its config by hand:
+//   ASSISTANT_NAME       instance.json `assistant_name` (what the pages call it)
+//   ASSISTANT_PRONOUNS   instance.json `assistant_pronouns` (e.g. she/her)
+// Everything else (route, Supabase URL, Access team) stays in the
+// installation's own config: agent/local/wiki-worker/wrangler.toml.
+//
+// Usage: wiki-worker-deploy [--dry-run] [--config <wrangler.toml>]
+// Needs wrangler on PATH, signed in (`wrangler login`).
+
+const path = require("node:path");
+const fs = require("node:fs");
+const { spawnSync } = require("node:child_process");
+const { TOOLS_DIR } = require("../lib/root.cjs");
+const inst = require("../lib/instance.cjs");
+
+const args = process.argv.slice(2);
+const i = args.indexOf("--config");
+const config = i >= 0 ? path.resolve(args[i + 1]) : path.join(inst.localDir(), "wiki-worker", "wrangler.toml");
+if (!fs.existsSync(config)) {
+  console.error(`wiki-worker-deploy: no worker config at ${config} (copy wiki-worker/wrangler.toml there and fill it in)`);
+  process.exit(2);
+}
+
+const vars = { ASSISTANT_NAME: inst.assistantName(), ASSISTANT_PRONOUNS: inst.assistantPronouns().label };
+const cmd = ["deploy", "--config", config, ...Object.entries(vars).map(([k, v]) => ["--var", `${k}:${v}`]).flat()];
+if (args.includes("--dry-run")) cmd.push("--dry-run");
+
+console.log(`wiki-worker-deploy: ${Object.entries(vars).map(([k, v]) => `${k}=${v}`).join(" ")}${args.includes("--dry-run") ? " (dry run)" : ""}`);
+const r = spawnSync("wrangler", cmd, { cwd: path.join(TOOLS_DIR, "wiki-worker"), stdio: "inherit" });
+if (r.error) { console.error(`wiki-worker-deploy: ${r.error.message}`); process.exit(1); }
+process.exit(r.status ?? 1);

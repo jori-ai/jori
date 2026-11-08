@@ -339,6 +339,105 @@ describe("chat-supervisor end-to-end", { skip: !canChildListen() && "child proce
     assert.equal(code, 0);
   });
 
+  // ── Queue survives a whole-process restart ───────────────────────
+  //
+  // A chat process stopped by SIGTERM with messages queued used to lose them:
+  // the queue lived only in memory, so the next process started empty. Now it
+  // is saved in the state dir and the next process reloads and runs it, their
+  // own messages first and in order, each told it is answered late.
+
+  it("restores the queue a SIGTERM'd process left and dispatches it in order", async () => {
+    port = allocPort();
+    tmp = tmpDir();
+    const configPath = writeTestConfig(tmp.dir, port);
+    const queueFile = path.join(tmp.dir, "queue.json");
+    // The first process never answers, so its init turn stays in flight and
+    // three messages of theirs queue up behind it.
+    sup = startSupervisor({ port, configPath, stateDir: tmp.dir, claudeArgs: ["--hang"] });
+    await sup.waitForReady();
+    await sleep(3500);   // the init dispatch (3 s after start) is now in flight
+    for (const n of ["first", "second", "third"]) {
+      await httpPost(port, "/dispatch", { content: `${n} message`, source: "jori", priority: "high", msgId: `restore-${n}` });
+    }
+    const before = await httpGet(port, "/health");
+    assert.equal(before.body.queueDepth, 3);
+    assert.equal(before.body.queueRestored, 0, "nothing reloaded on a clean start");
+    sup.proc.kill("SIGTERM");
+    await new Promise((r) => sup.proc.on("exit", r));
+    const saved = JSON.parse(fs.readFileSync(queueFile, "utf8"));
+    assert.deepEqual(saved.queue.map((i) => i.msgId || i.source), ["restore-first", "restore-second", "restore-third", "init"],
+      "their three messages, then the interrupted init put back in line at its own (low) priority");
+
+    // A new process on the same state dir, with a CLI that answers.
+    const record = path.join(tmp.dir, "received.txt");
+    sup = startSupervisor({ port, configPath, stateDir: tmp.dir, claudeArgs: ["--record", record] });
+    await sup.waitForReady();
+    await sleep(1500);
+    const after = await httpGet(port, "/health");
+    assert.equal(after.body.queueRestored, 3, "their three messages; the old process's init is not replayed");
+    assert.equal(after.body.queueDepth, 0);
+    assert.equal(after.body.inFlight, null);
+    let got = fs.readFileSync(record, "utf8");
+    const at = ["first message", "second message", "third message"].map((s) => got.indexOf(s));
+    assert.ok(at.every((i) => i >= 0), `all three delivered, got:\n${got}`);
+    assert.ok(at[0] < at[1] && at[1] < at[2], `in the order sent, got:\n${got}`);
+    assert.ok(got.indexOf("was still queued when the chat supervisor restarted") < at[0], "the late-answer line comes first");
+    assert.equal(fs.existsSync(queueFile), false, "an empty queue leaves no file behind");
+    const err = sup.stderr.join("");
+    assert.ok(err.includes("restored 3 queued item(s) saved by the previous process"), err);
+    assert.ok(err.includes("saved queue: not replaying 1 item(s): init"), err);
+    await sleep(3000);   // this process's own init (3 s after start)
+    got = fs.readFileSync(record, "utf8");
+    assert.equal(got.split("Session started.").length - 1, 1, "exactly one init: this process's own");
+    assert.ok(got.indexOf("Session started.") > at[2], "the init runs after their messages");
+  });
+
+  it("replays no session-control turns, marks a turn that was running, and drops one running at two restarts", async () => {
+    port = allocPort();
+    tmp = tmpDir();
+    const configPath = writeTestConfig(tmp.dir, port);
+    const t0 = Date.now() - 60_000;
+    const item = (o) => ({ id: o.msgId || o.source, priority: 0, priorityName: "high", enqueuedAt: t0, ...o });
+    fs.writeFileSync(path.join(tmp.dir, "queue.json"), JSON.stringify({
+      version: 1, savedAt: t0,
+      // Running when the process died, and already reloaded once after dying mid-turn.
+      inFlight: item({ content: "poison message", source: "jori", msgId: "poison", diedMidTurn: 1, restoredAt: t0 + 1000, dispatchedAt: t0 + 2000 }),
+      queue: [
+        item({ content: "interrupted message", source: "jori", msgId: "interrupted", dispatchedAt: t0 + 500 }),   // a shutdown put it back
+        item({ content: "waiting message", source: "jori", msgId: "waiting" }),
+        item({ content: "/compact", source: "context-guard" }),
+        item({ content: "Session started. Standing by.", source: "init", priority: 2, priorityName: "low" }),
+      ],
+    }));
+    const record = path.join(tmp.dir, "received.txt");
+    sup = startSupervisor({ port, configPath, stateDir: tmp.dir, claudeArgs: ["--record", record] });
+    await sup.waitForReady();
+    await sleep(1500);
+    assert.equal((await httpGet(port, "/health")).body.queueRestored, 2);
+    const got = fs.readFileSync(record, "utf8");
+    assert.ok(!got.includes("poison message"), "a turn running at two restarts is not replayed a third time");
+    assert.ok(!got.includes("/compact"), "a saved /compact belongs to the old session");
+    const i = got.indexOf("interrupted message"), w = got.indexOf("waiting message");
+    assert.ok(i >= 0 && w > i, `both delivered, interrupted first, got:\n${got}`);
+    assert.ok(got.lastIndexOf("was being answered when the chat supervisor restarted", i) >= 0, "the interrupted turn is told it may be partly done");
+    assert.ok(got.slice(i, w).includes("was still queued when the chat supervisor restarted"), "the waiting one is told it is late");
+    assert.ok(sup.stderr.join("").includes("saved queue: not replaying 3 item(s): jori (running at two restarts), context-guard, init"));
+  });
+
+  it("starts empty, and still answers, when the saved queue file is malformed", async () => {
+    port = allocPort();
+    tmp = tmpDir();
+    const configPath = writeTestConfig(tmp.dir, port);
+    fs.writeFileSync(path.join(tmp.dir, "queue.json"), JSON.stringify({ version: 1, queue: { not: "a list" }, inFlight: null }));
+    sup = startSupervisor({ port, configPath, stateDir: tmp.dir });
+    await sup.waitForReady();
+    await sleep(4000);
+    const health = await httpGet(port, "/health");
+    assert.equal(health.body.queueRestored, 0);
+    assert.ok(health.body.completed >= 1, "the init turn ran");
+    assert.ok(sup.stderr.join("").includes("saved queue not restored"));
+  });
+
   // ── State persistence ─────────────────────────────────────────────
 
   it("persists session state to disk", async () => {
@@ -475,6 +574,14 @@ describe("chat-supervisor end-to-end", { skip: !canChildListen() && "child proce
     await setup();
     const { body } = await httpGet(port, "/health");
     assert.ok("phoneChannelHeartbeatAgeMs" in body, "health should include phoneChannelHeartbeatAgeMs");
+  });
+
+  it("health reports phoneChannelStale, false while no first heartbeat is overdue", async () => {
+    await setup();
+    const { body } = await httpGet(port, "/health");
+    assert.equal(body.phoneChannelStale, false, "a session just started is inside the first-heartbeat grace");
+    await httpPost(port, "/heartbeat", { source: "phone-channel", pid: 12345 });
+    assert.equal((await httpGet(port, "/health")).body.phoneChannelStale, false);
   });
 
   // ── sendInit called after restart ─────────────────────────────────

@@ -13,6 +13,7 @@ _GSC_TOOLS="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # where its data, logs, secrets and bins live.
 . "$_GSC_TOOLS/agent/scripts/lib/root.sh"
 OWNER_NAME="${JORI_OWNER_NAME:-the user}"
+ASSISTANT="${JORI_ASSISTANT_NAME:-Jori}"  # control-scan-ok: the setting's default
 OWNER_NAME_LC=$(printf '%s' "$OWNER_NAME" | tr '[:upper:]' '[:lower:]')
 SUPABASE_URL="https://${JORI_SUPABASE_PROJECT}.supabase.co"
 
@@ -147,6 +148,12 @@ IS_QUESTION=false
 IS_LOCATION_QUESTION=false
 # Set by question routing for a location question: the push is time-sensitive.
 URGENT_PUSH=false
+# --announce: the push goes out time-sensitive so it is read aloud over AirPods
+# and pierces Focus, without the Jev push-announce judgment and without
+# --urgent's motion-gate bypass. For a caller whose whole point is being heard
+# while the user walks (hum-ping sets it for the `nearby` lane). A question
+# still wins: it is never read aloud.
+ANNOUNCE_PUSH=false
 # The verbatim captured error text behind a message that asserts a specific
 # technical failure mechanism — see the mechanism-attestation gate below.
 OBSERVED_ERROR=""
@@ -174,6 +181,7 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --no-push)        NO_PUSH=true; shift ;;
     --push)           FORCE_PUSH=true; shift ;;
+    --announce)       ANNOUNCE_PUSH=true; shift ;;
     --keep-in-tab)    KEEP_IN_TAB=true; shift ;;
     --push-body)      PUSH_BODY="$2"; shift 2 ;;
     --media)          MEDIA+=("$2"); shift 2 ;;
@@ -225,7 +233,7 @@ set -- "${POSITIONAL[@]}"
 for arg in "$@"; do
   if [[ "$arg" == --* ]]; then
     echo "FATAL: unknown flag: $arg" >&2
-    echo "jori-send-curl accepts: --no-push, --push, --keep-in-tab, --push-body, --media, --choices-json, --metadata-json, --capture-id, --suppress-hook, --skip-precheck, --intent, --evidence-as-of, --observed-error, --hum-context, --agent, --channel, --question, --location-question, --event-city, --event-date, --event-artist, --p1-message" >&2
+    echo "jori-send-curl accepts: --no-push, --push, --announce, --keep-in-tab, --push-body, --media, --choices-json, --metadata-json, --capture-id, --suppress-hook, --skip-precheck, --intent, --evidence-as-of, --observed-error, --hum-context, --agent, --channel, --question, --location-question, --event-city, --event-date, --event-artist, --p1-message" >&2
     echo "Message body goes via \$1 (inline) or stdin (pipe). For long/multi-line: cat file.txt | jori-send-curl ..." >&2
     exit 2
   fi
@@ -240,6 +248,16 @@ if [ -z "$MESSAGE" ]; then
   echo "Usage: jori-send-curl [--no-push] [--push] [--keep-in-tab] [--push-body <text>] [--skip-precheck] [--intent <topic>] [--evidence-as-of <iso|live>] [--observed-error <verbatim captured output>] [--agent ops|chat|infra] [--channel chat|system|improvements|questions] [--question|--location-question] [--event-city <metro> --event-date <YYYY-MM-DD> [--event-artist <name>]] [--p1-message <gmail messageId>] <message>" >&2
   exit 1
 fi
+
+# The message and flags as the caller sent them, before any gate below rewrites
+# them: a question the question hold (further down) keeps is replayed from
+# these, through every gate again, once chat is reading.
+ORIG_MESSAGE="$MESSAGE"
+ORIG_NO_PUSH="$NO_PUSH"
+ORIG_PUSH_BODY="$PUSH_BODY"
+ORIG_CHOICES_JSON="${CHOICES_JSON:-}"
+ORIG_SKIP_PRECHECK="$SKIP_PRECHECK"
+ORIG_CHANNEL="$CHANNEL"
 
 # ─── Fabricated-outage gate (system channel, infra-claim shape only) ──────
 # Job-scoped agent turns have repeatedly composed a total-outage page ("all
@@ -655,7 +673,7 @@ try: print(json.load(sys.stdin).get("action") or "send")
 except Exception: print("send")' 2>/dev/null)
         case "$RESOLVE_ACTION" in
           drop)
-            echo "hum-resolve-first: not sent — Jori's records already answer it (see \`hum-resolve-first tail\`)" >&2
+            echo "hum-resolve-first: not sent — ${ASSISTANT}'s records already answer it (see \`hum-resolve-first tail\`)" >&2
             exit 0
             ;;
           rewrite)
@@ -945,9 +963,9 @@ if [ "$CHANNEL" = "chat" ] && [ -f "$QUESTION_ROUTE" ] \
   QR_OUT=$(printf '%s' "$MESSAGE" | node "$QUESTION_ROUTE" "${QR_ARGS[@]}" 2>/dev/null)
   QR_FIELDS=$(printf '%s' "$QR_OUT" | python3 -c 'import json,sys
 try:
-  r=json.load(sys.stdin); print(r.get("channel","chat"), "true" if r.get("urgent") else "false", r.get("detected") or "label")
-except Exception: print("chat false label")' 2>/dev/null)
-  read -r QR_CHANNEL QR_URGENT QR_DETECTED <<< "$QR_FIELDS"
+  r=json.load(sys.stdin); print(r.get("channel","chat"), "true" if r.get("urgent") else "false", r.get("detected") or "label", "true" if r.get("question") is True else "false")
+except Exception: print("chat false label false")' 2>/dev/null)
+  read -r QR_CHANNEL QR_URGENT QR_DETECTED QR_QUESTION <<< "$QR_FIELDS"
   # Where it went, for a caller that captures the id (hum-ask: a question in the
   # Questions tab does not hold hum's single pending-question slot).
   if [ -n "$CAPTURE_ID_FILE" ] && [ -n "$QR_OUT" ]; then
@@ -962,6 +980,101 @@ except Exception: print("chat false label")' 2>/dev/null)
   # "needed within hours").
   elif [ "$QR_URGENT" = "true" ] && [ "$QR_DETECTED" != "text" ]; then
     URGENT_PUSH=true
+  fi
+fi
+
+# ─── Question hold (no questions while chat is not reading) ──────────────
+# While chat was broken for 17 hours (the phone link crashed on start), the
+# assistant kept asking: 16 questions nobody could answer, and after the chat
+# queue was wiped it asked again about things already answered. So a question,
+# and only a question, goes out only while chat is reading: not paused for the
+# Claude usage limit, and no message of the user's waiting unhandled for over
+# 10 minutes. Otherwise bin/question-hold keeps it (data/question-hold.json)
+# and its launchd release sends it once chat is reading again, after a model
+# re-checks it is still worth asking, through every gate here again.
+# Information pings are not touched.
+# A question by structure: --question / --location-question, an intent ending
+# `:question` or `:ask`, a tappable card, or the router above (which also reads
+# the words of an unlabelled message, Rule #0b). Chat and questions channels
+# only, AFTER the router so it has had its say. FAILS OPEN: a missing gate, an
+# error or a check that cannot run sends the message (the gate logs it). A held
+# question tells a --capture-id caller {"suppressed":true,"by":"question-hold"}.
+# The release replays with JORI_QUESTION_HOLD_RELEASE=1, which skips this block.
+# Not run in a test run unless JORI_QUESTION_HOLD_BIN names a stand-in. Off
+# switch: data/.question-hold-off.
+QUESTION_HOLD="${JORI_QUESTION_HOLD_BIN:-$JORI_INSTALL_TOOLS/bin/question-hold}"
+if { [ "$CHANNEL" = "chat" ] || [ "$CHANNEL" = "questions" ]; } \
+   && [ "${JORI_QUESTION_HOLD_RELEASE:-}" != "1" ] && [ -f "$QUESTION_HOLD" ] \
+   && { [ "$TEST_RUN" = false ] || [ -n "${JORI_QUESTION_HOLD_BIN:-}" ]; }; then
+  QH_IS_QUESTION=false
+  [ "$IS_QUESTION" = true ] && QH_IS_QUESTION=true
+  [ "${QR_QUESTION:-false}" = true ] && QH_IS_QUESTION=true
+  [ -n "$ORIG_CHOICES_JSON" ] && QH_IS_QUESTION=true
+  # The intent is a machine label (hum:<lane>:question, decision:ask, ...).
+  case "${INTENT##*:}" in question|ask) QH_IS_QUESTION=true ;; esac
+  if [ "$QH_IS_QUESTION" = true ]; then
+    QH_HUM_CONTEXT=""
+    [ -n "${HUM_CONTEXT_FILE:-}" ] && [ -f "$HUM_CONTEXT_FILE" ] && QH_HUM_CONTEXT=$(cat "$HUM_CONTEXT_FILE" 2>/dev/null)
+    QH_MEDIA=""
+    [ ${#MEDIA[@]} -gt 0 ] && QH_MEDIA=$(printf '%s\n' "${MEDIA[@]}")
+    # The flags to replay with, rebuilt from what the caller passed (not from
+    # what the gates above made of them). --capture-id and --hum-context are
+    # per-run temp files; the release supplies its own.
+    QH_ENTRY=$(QH_MESSAGE="$ORIG_MESSAGE" QH_INTENT="${INTENT:-}" QH_AGENT="$AGENT" QH_CHANNEL="$ORIG_CHANNEL" \
+      QH_NO_PUSH="$ORIG_NO_PUSH" QH_FORCE_PUSH="$FORCE_PUSH" QH_PUSH_BODY="$ORIG_PUSH_BODY" QH_MEDIA="$QH_MEDIA" \
+      QH_CHOICES="$ORIG_CHOICES_JSON" QH_METADATA="${EXTRA_METADATA_JSON:-}" QH_SKIP="$ORIG_SKIP_PRECHECK" \
+      QH_QUESTION="$IS_QUESTION" QH_LOCATION="$IS_LOCATION_QUESTION" QH_EVENT_CITY="${EVENT_CITY:-}" \
+      QH_EVENT_DATE="${EVENT_DATE:-}" QH_EVENT_ARTIST="${EVENT_ARTIST:-}" QH_P1="$P1_MESSAGE" \
+      QH_EVIDENCE="$EVIDENCE_AS_OF" QH_CONTEXT="$QH_HUM_CONTEXT" python3 -c '
+import json, os
+e = os.environ.get
+a = []
+if e("QH_INTENT"): a += ["--intent", e("QH_INTENT")]
+if e("QH_AGENT"): a += ["--agent", e("QH_AGENT")]
+a += ["--channel", e("QH_CHANNEL") or "chat"]
+if e("QH_NO_PUSH") == "true": a.append("--no-push")
+if e("QH_FORCE_PUSH") == "true": a.append("--push")
+if e("QH_PUSH_BODY"): a += ["--push-body", e("QH_PUSH_BODY")]
+for m in (e("QH_MEDIA") or "").split("\n"):
+    if m: a += ["--media", m]
+if e("QH_CHOICES"): a += ["--choices-json", e("QH_CHOICES")]
+if e("QH_METADATA"): a += ["--metadata-json", e("QH_METADATA")]
+if e("QH_SKIP") == "true": a.append("--skip-precheck")
+if e("QH_LOCATION") == "true": a.append("--location-question")
+elif e("QH_QUESTION") == "true": a.append("--question")
+for f, k in (("--event-city", "QH_EVENT_CITY"), ("--event-date", "QH_EVENT_DATE"), ("--event-artist", "QH_EVENT_ARTIST"), ("--p1-message", "QH_P1")):
+    if e(k): a += [f, e(k)]
+ctx = None
+if e("QH_CONTEXT"):
+    try: ctx = json.loads(e("QH_CONTEXT"))
+    except Exception: ctx = None
+meta = None
+if e("QH_METADATA"):
+    try: meta = json.loads(e("QH_METADATA"))
+    except Exception: meta = None
+print(json.dumps({"sender": "jori-send-curl", "args": a, "message": e("QH_MESSAGE"), "intent": e("QH_INTENT") or None,
+                  "channel": e("QH_CHANNEL") or "chat", "metadata": meta, "hum_context": ctx,
+                  "evidence_as_of": e("QH_EVIDENCE") or None}, ensure_ascii=False))' 2>/dev/null)
+    if [ -n "$QH_ENTRY" ]; then
+      QH_OUT=$(printf '%s' "$QH_ENTRY" | node "$QUESTION_HOLD" gate 2>/dev/null)
+      QH_ACTION=$(printf '%s' "$QH_OUT" | python3 -c 'import json,sys
+try: print(json.load(sys.stdin).get("action") or "send")
+except Exception: print("send")' 2>/dev/null)
+      if [ "$QH_ACTION" = "hold" ]; then
+        QH_REASON=$(printf '%s' "$QH_OUT" | python3 -c 'import json,sys
+try: print(json.load(sys.stdin).get("reason") or "")
+except Exception: print("")' 2>/dev/null)
+        echo "question-hold: not sent now — chat is not reading ($QH_REASON). Held; it goes out once chat is reading again, if it is still worth asking. Not an error; do not resend. See \`question-hold list\`." >&2
+        if [ -n "$CAPTURE_ID_FILE" ]; then
+          TMP_ID="${CAPTURE_ID_FILE}.tmp.$$"
+          printf '{"suppressed":true,"held":true,"by":"question-hold","reason":%s}\n' "$(printf '%s' "held until chat is reading again: $QH_REASON" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))')" > "$TMP_ID" \
+            && mv -f "$TMP_ID" "$CAPTURE_ID_FILE"
+        fi
+        exit 0
+      fi
+    else
+      echo "question-hold: could not build the hold entry; sending" >&2
+    fi
   fi
 fi
 
@@ -1112,7 +1225,7 @@ else
 fi
 
 if [ "$HTTP_CODE" = "201" ]; then
-  echo "Message sent to Jori."
+  echo "Message sent to $ASSISTANT."
 
   # Write the inserted row id when requested. PostgREST returns a JSON array
   # ([{...row...}]) under return=representation, so extract data[0].id.
@@ -1153,6 +1266,20 @@ except Exception:
     # Pass --channel so system/infra alerts never touch the app icon badge.
     NOTIFY_ARGS=(--channel "$CHANNEL")
     [ "$URGENT_PUSH" = true ] && NOTIFY_ARGS+=(--urgent)
+    # A question to the user is never read aloud (the user's decision of
+    # 2026-11-05): --no-announce keeps it a regular push, even an urgent or
+    # location one (those still skip the motion gate). Same structural test as
+    # the question hold above. lib/push-announce.mjs judges the rest.
+    PUSH_IS_QUESTION=false
+    [ "$IS_QUESTION" = true ] && PUSH_IS_QUESTION=true
+    [ "${QR_QUESTION:-false}" = true ] && PUSH_IS_QUESTION=true
+    [ -n "${ORIG_CHOICES_JSON:-}${CHOICES_JSON:-}" ] && PUSH_IS_QUESTION=true
+    case "${INTENT##*:}" in question|ask) PUSH_IS_QUESTION=true ;; esac
+    if [ "$PUSH_IS_QUESTION" = true ]; then
+      NOTIFY_ARGS+=(--no-announce)
+    elif [ "$ANNOUNCE_PUSH" = true ]; then
+      NOTIFY_ARGS+=(--announce)
+    fi
     if [ -n "$PUSH_BODY" ]; then
       "$NOTIFY" "${NOTIFY_ARGS[@]}" "$PUSH_BODY" > /dev/null 2>&1 &
     else
@@ -1190,15 +1317,15 @@ else
   # A test run's stand-in insert "failed": nothing to park or replay later
   # (a parked row would be flushed into the real system channel), no email.
   if [ "$TEST_RUN" = true ]; then
-    echo "Jori push failed (HTTP $HTTP_CODE) — test run, nothing parked, no fallback email" >&2
+    echo "$ASSISTANT push failed (HTTP $HTTP_CODE) — test run, nothing parked, no fallback email" >&2
     exit 1
   fi
   _spool_append "$HTTP_CODE"
-  echo "Jori push failed (HTTP $HTTP_CODE) — falling back to email" >&2
+  echo "$ASSISTANT push failed (HTTP $HTTP_CODE) — falling back to email" >&2
   EMAIL_SEND="$JORI_INSTALL_TOOLS/bin/email-send"
   if [ -x "$EMAIL_SEND" ]; then
     "$EMAIL_SEND" --to "$JORI_OWNER_EMAIL" \
-      --subject "${JORI_SENDER_NAME:-${JORI_ASSISTANT_NAME:-Jori}} notification (push failed)" \
+      --subject "${JORI_SENDER_NAME:-$ASSISTANT} notification (push failed)" \
       --body "$MESSAGE" 2>/dev/null
     if [ $? -eq 0 ]; then
       echo "Fallback email sent." >&2

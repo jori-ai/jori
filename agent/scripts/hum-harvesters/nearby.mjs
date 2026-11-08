@@ -23,7 +23,9 @@ import { execFileSync } from "node:child_process";
 import path from "node:path";
 import { readStdinJson, emit, emitNull, emitNoop, stampRun, localConfig, OWNER_NAME } from "./_common.mjs";
 import { installTools } from "../../../lib/root.cjs";
-import { localLore, renderLocalLoreBlock } from "../../../lib/local-lore.mjs";
+import { localLore } from "../../../lib/local-lore.mjs";
+import { buildLocalHistoryPrompt, RELEVANCE_FLOOR } from "../../../lib/local-history-prompt.mjs";
+import { liveLaneActive } from "../../../lib/local-history-live.mjs";
 import { PROXIMITY_M } from "../../../lib/local-history-ledger.mjs";
 import { stashMedia } from "../../../lib/ping-media.mjs";
 import { extractJsonObject } from "../../../lib/extract-json.mjs";
@@ -48,9 +50,9 @@ const HOME_LABELS = localConfig("meals", { home_labels: ["home ("] }).home_label
 const MAX_ARRIVAL_AGE_MIN = 15;
 const MAX_AREA_AGE_MIN = 45;
 
-// The bar, in code. Lower than when this lane competed with venue suggestions
-// for a shared slot: walking past the thing is the point.
-const RELEVANCE_FLOOR = 0.55;
+// The bar, in code (lib/local-history-prompt.mjs RELEVANCE_FLOOR, 0.55). Lower
+// than when this lane competed with venue suggestions for a shared slot:
+// walking past the thing is the point.
 
 const { situation: sit, context: _context, moment, intent } = await readStdinJson();
 
@@ -73,6 +75,15 @@ if (moment?.perishable && Number.isFinite(moment.perishable_age_min)
     && moment.perishable_age_min > MAX_MOMENT_AGE_MIN) {
   emitNoop(`moment is ${Math.round(moment.perishable_age_min)}m old (> ${MAX_MOMENT_AGE_MIN}m) — too late to be useful`);
   process.exit(0);
+}
+
+// The live lane (bin/local-history-live) answers the phone's own ~30 s
+// position within seconds. While it is running and the phone is feeding it,
+// this lane would only repeat its work minutes later from an older fix, so it
+// stands down; it stays the fallback for when either side is not there.
+{
+  const live = liveLaneActive();
+  if (live.active) { emitNoop(`live lane owns local history right now (${live.reason})`); process.exit(0); }
 }
 
 // ── 2. Where, exactly ────────────────────────────────────────────────────
@@ -234,32 +245,11 @@ function slugish(s) {
 }
 
 function buildPrompt({ place, hour, moving, items, intent, event }) {
-  const chatLines = (intent?.recent_chat || []).slice(-10).map((c) => `  - ${c.text}`).join("\n");
-  const who = OWNER_NAME === "the user" ? "The user" : OWNER_NAME;
-  return `${who} is out around ${place || "a spot"} and it is ${hour}:00 local, ${moving ? "walking" : "stopped"}. You may tell them ONE thing about the ground they are standing on, or say nothing.
-
-These are the pings that land: what stood here before, what a street or building is named after, when something was cut or built and why — specific and human. "named after a sign showing a Moor's head that hung on the old rue du Maure" is worth saying; "a street in the 3rd arrondissement" is the definition, not the fact.
-
-${renderLocalLoreBlock(items)}
-
-RULES:
-1. The fact MUST come from the list above, not from memory. If nothing above is interesting, say nothing.
-2. Pick ONE subject. Copy its title into "source" EXACTLY as written above — code uses it to place the subject on a map, check the user is still near it, and make sure it is never told again.
-3. No venue recommendations, no "you should visit", no opening hours, nothing to book. This is an explanation, not a suggestion.
-4. Read past the opening definition of an article; the story is usually under history / name-origin.
-5. If the user's own recent words show they are busy with something (a meeting, a call, a meal), keep it short or say nothing.
-
-RELEVANCE 0.0-1.0, honestly — ${RELEVANCE_FLOOR.toFixed(2)} is the floor:
-  0.9  genuinely surprising and right in front of them
-  0.75 a good story about something within sight
-  0.6  mildly interesting
-  <0.55 filler — say nothing
-
-WHAT THE USER HAS SAID IN CHAT RECENTLY:
-${chatLines || "  (nothing recent)"}
-
-${event ? `What woke you: ${event.summary || "the user arrived somewhere"}.` : "Nothing woke you; the user has been in this area a while."}
-
-Reply with ONE JSON object and nothing else:
-{"say": true|false, "relevance": 0.0-1.0, "source": "<exact title from the list>", "signal": "<what the user reads, under 220 chars, specific, no preamble>", "why_now": "<one line>", "why_not": "<if say is false, one line>"}`;
+  return buildLocalHistoryPrompt({
+    owner: OWNER_NAME === "the user" ? "The user" : OWNER_NAME,
+    place, hour, moving, items,
+    recentChat: (intent?.recent_chat || []).map((c) => c.text),
+    wokeBy: event ? (event.summary || "the user arrived somewhere") : null,
+    floor: RELEVANCE_FLOOR,
+  });
 }

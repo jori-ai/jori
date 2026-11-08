@@ -1,0 +1,52 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  question-hold-release — launchd user agent, every 5 minutes.
+
+  Sends the questions bin/question-hold kept while chat was not reading, once
+  it reads again, each re-judged by a model first (lib/question-hold.mjs). The
+  run (trigger-question-hold-release.sh) exits at once when nothing is held.
+  launchd, not cron: the re-judge, jori-send-curl's resolve-first gate and its
+  outbound precheck are `claude -p` on the Max subscription, and only the GUI
+  session can unlock the keychain holding that credential.
+
+  Install:
+    agent/launch-agents/install.sh ai.claude.question-hold-release
+    (renders __JORI_HOME__ / __JORI_TOOLS__ / __HOME__, then launchctl bootstrap)
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>ai.claude.question-hold-release</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>__JORI_TOOLS__/bin/cron-run</string>
+        <string>--label</string>
+        <string>question-hold-release</string>
+        <string>--</string>
+        <string>/bin/bash</string>
+        <string>__JORI_TOOLS__/agent/scripts/trigger-question-hold-release.sh</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>__HOME__</string>
+        <key>PATH</key>
+        <string>__HOME__/.local/bin:__HOME__/.local/node/bin:/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:__JORI_TOOLS__/bin</string>
+        <key>LANG</key>
+        <string>en_US.UTF-8</string>
+    </dict>
+    <key>WorkingDirectory</key>
+    <string>__JORI_HOME__</string>
+    <key>RunAtLoad</key>
+    <false/>
+    <key>KeepAlive</key>
+    <false/>
+    <key>StartInterval</key>
+    <integer>300</integer>
+    <key>StandardOutPath</key>
+    <string>__JORI_TOOLS__/data/logs/question-hold-release-launchd.log</string>
+    <key>StandardErrorPath</key>
+    <string>__JORI_TOOLS__/data/logs/question-hold-release-launchd.log</string>
+</dict>
+</plist>

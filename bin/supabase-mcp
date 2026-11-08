@@ -8,9 +8,15 @@
 # tokens live 24 hours, so a value baked in at supervisor start goes stale by
 # the next day while the supervisor happily keeps running.
 #
-# Minting the token here instead means every MCP spawn gets a fresh one, and
+# Minting the token here instead means every MCP spawn gets the current one, and
 # supabase-token only calls the network when the cached token is actually near
-# expiry.
+# expiry. Never --force it here: a refresh revokes the access token it replaces,
+# so it would cut off every Supabase server already running. A server that
+# outlives its token (24 hours) loses access until its session restarts.
+#
+# Without an OAuth app (supabase-token --configured fails), the personal access
+# token the environment already carries is passed through unchanged, so every
+# MCP config can start the server through this wrapper.
 #
 # Absolute paths: MCP servers are spawned with a minimal PATH that may not
 # include node's directory. lib/root.sh resolves node (JORI_NODE) the way the
@@ -28,7 +34,12 @@ NODE_DIR="$(dirname "$JORI_NODE")"
 # the server dies instantly with `env: node: No such file or directory`.
 export PATH="$NODE_DIR:$PATH"
 
-SUPABASE_ACCESS_TOKEN="$("$JORI_NODE" "$HERE/supabase-token")"
+if "$JORI_NODE" "$HERE/supabase-token" --configured; then
+  SUPABASE_ACCESS_TOKEN="$("$JORI_NODE" "$HERE/supabase-token")"
+elif [ -z "${SUPABASE_ACCESS_TOKEN:-}" ]; then
+  echo "supabase-mcp: no token (no OAuth app for bin/supabase-token, no SUPABASE_ACCESS_TOKEN)" >&2
+  exit 1
+fi
 export SUPABASE_ACCESS_TOKEN
 
 exec "$NODE_DIR/npx" -y @supabase/mcp-server-supabase@latest "$@"

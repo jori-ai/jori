@@ -20,7 +20,7 @@ const { installTools } = require("../lib/root.cjs");
 const { instance } = require("../lib/instance.cjs");
 const LIVE_DAY_FILE = installTools("data", "live-day.json");
 const ARCHIVE_DIR = installTools("data", "live-day-archive");
-const { refreshLiveDay, loadDayFile, computeAccuracy } = require("../lib/live-day.js");
+const { refreshLiveDay, loadDayFile, computeAccuracy, farCorrections, judgeSamePlaces } = require("../lib/live-day.js");
 
 function readLive() {
   try { return JSON.parse(fs.readFileSync(LIVE_DAY_FILE, "utf8")); }
@@ -247,11 +247,15 @@ async function main() {
     // confirmations are: computeAccuracy stays pure and testable, and a failed
     // read degrades to "no flag" rather than a blanked metric.
     const visits = await fetchDayVisits(date);
+    // A correction 60-500 m from the name we gave can still be the same place
+    // (a campus, a second entrance): a model reads the two names. It never
+    // throws; a pair it could not answer keeps the distance rule's verdict.
+    const samePlace = await judgeSamePlaces(farCorrections(day, confirmations));
     // `day` is the ORIGINAL record, never the corrected view (`live-day day`):
     // accuracy grades what Jori believed against what the user later said, so
     // layering the corrections in first would score every corrected day 1.0
     // (the measurement keeps comparing against the original).
-    console.log(JSON.stringify(applyBlobDayGuard(computeAccuracy(day, confirmations), visits), null, 2));
+    console.log(JSON.stringify(applyBlobDayGuard(computeAccuracy(day, confirmations, { samePlace }), visits), null, 2));
     return;
   }
 

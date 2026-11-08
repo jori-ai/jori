@@ -243,3 +243,24 @@ test("work at the stop stays inside it; JORI_WORK_AFTER_LEG=0 keeps every line i
     assert.ok(!placeCommits(dayCommits(between, STOPS, NY), STOPS)[0].after_stop);
   } finally { delete process.env.JORI_WORK_AFTER_LEG; }
 });
+
+// 2026-11-07: the walks the step counter found under a stop were printed as paragraphs
+// above its work list, so a 10pm walk sat over two 5pm work lines of the same stop.
+test("a walk under a stop is listed among its work lines in time order", () => {
+  const home = { id: "s1", start: "08:30", end: "23:30", start_ts_ms: Date.parse("2026-10-20T12:30:00Z"), end_ts_ms: Date.parse("2026-10-21T03:30:00Z"),
+    duration_min: 900, place: { name: "Home A" }, title: "Home A", title_certainty: "answered", provenance: { tier: "CONFIRMED" } };
+  const walk = (from, to, steps) => ({ kind: "in_stop", stop_id: "s1", start_ms: Date.parse(from), end_ms: Date.parse(to),
+    mins: Math.round((Date.parse(to) - Date.parse(from)) / 60000), steps });
+  const raw = [{ sha: "aaaaaaa1", at: "2026-10-20T20:56:00Z", subject: "a fix" }];
+  const day = { date: "2026-10-20", tz: NY, tzs: [NY], stops: [home], travel_legs: [], commits: dayCommits(raw, [home], NY),
+    steps: { walks: [walk("2026-10-20T19:33:00Z", "2026-10-20T19:43:00Z", 650), walk("2026-10-21T02:08:00Z", "2026-10-21T02:22:00Z", 850)] } };
+  const prose = { commits: [{ shas: ["aaaaaaa1"], text: "You made a fix." }] };
+  const html = assemble(buildSkeleton(day, {}), prose);
+  const early = html.indexOf("Walk 3:33"), work = html.indexOf("You made a fix."), late = html.indexOf("Walk 10:08");
+  assert.ok(early > 0 && early < work && work < late, `walk, work, walk in time order: ${early} ${work} ${late}`);
+  process.env.JORI_WALK_IN_LIST = "0";
+  try {
+    const old = assemble(buildSkeleton(day, {}), prose);
+    assert.ok(old.indexOf("Walk 10:08") < old.indexOf("You made a fix."), "the switch prints the walks above the list again");
+  } finally { delete process.env.JORI_WALK_IN_LIST; }
+});

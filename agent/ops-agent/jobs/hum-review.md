@@ -43,13 +43,15 @@ For every row in the success-criteria table, report the measurement and `PASS` /
 
 | Criterion | Measurement | Target |
 |---|---|---|
-| Silent rate | `count(sonnet.decision=="silent") / total_ticks` | ≥ 0.85 |
+| Silent rate | `count(sonnet.decision=="silent") / total dispatches` (re-baselined 2026-11-08 for the event-driven cadence) | 0.45 – 0.90, read with signal per surfaced |
+| Surface rate | `count(sonnet.decision=="info") / total dispatches` | 0.05 – 0.55 (the band `hum-metrics-collect` alerts on) |
+| Signal per surfaced | 7-day median of `signal_per_surfaced` in `hum-metrics-state.json` | > 0 |
 | Info positive rate | `count(reactions in {👍,helpful,more}) / count(reactions)` | ≥ 0.60 |
 | Info response rate | `count(feedback rows with non-null reaction) / count(info sent)` | ≥ 0.30 |
 | Question answer rate | `count(learnings in window) / count(questions asked)` | ≥ 0.40 |
-| Median time-to-answer | median `answered_at - matching question.asked_at` | ≤ 30 min |
+| Median time-to-answer | median `answered_at - matching question.asked_at` | none: reported, never graded (2026-11-08); questions go to a channel that does not interrupt, so answer speed is not a fault and never a reason to time a question |
 | Memory growth | hum-attributable wiki writes this week (wiki pages updated in-window + new `hum-learnings.jsonl`/consolidated `hum-responses.jsonl` rows) — NOT the retired flat files | ≥ 3 per week |
-| Subject dedup | count subjects appearing in >1 tick within 7d | = 0 |
+| Subject dedup | count subjects DELIVERED (`outcome.sent`) in >1 tick within 7d; an undelivered pick retried next tick is not a repeat | = 0 |
 | Harvester error rate | per-topic `errors / attempts` | ≤ 0.10 |
 | Attention hit-rate | `info pings with based_on_topic matching week_commit_topics OR next.upcoming_events OR 👍-history / total info` | ≥ 0.70 |
 | LLM-invocation efficiency | `bash-gated skips (watchdog.log) / total tick attempts` | ≥ 0.40 |

@@ -250,15 +250,26 @@ guard('mcp_tool_listing', () => {
   // keys, not language.
   const MODEL_KEY = '"model":"claude-';
   const isOpusText = (s) => { const i = s.indexOf(MODEL_KEY); return i >= 0 && s.startsWith('opus', i + MODEL_KEY.length); };
-  const opsSessionIds = new Set();
-  try {
-    const since = new Date(Date.now() - 35 * 86400e3).toISOString();
-    for (const line of fs.readFileSync(path.join(ROOT, 'agent/logs/supervisor-ops/job-costs.ndjson'), 'utf8').split('\n')) {
-      if (!line) continue;
-      let r; try { r = JSON.parse(line); } catch { continue; }
-      if (r.session_id && String(r.ts || '') >= since) opsSessionIds.add(r.session_id);
-    }
-  } catch {}
+  const ledgerSessionIds = (tier) => {
+    const ids = new Set();
+    try {
+      const since = new Date(Date.now() - 35 * 86400e3).toISOString();
+      for (const line of fs.readFileSync(path.join(ROOT, `agent/logs/supervisor-${tier}/job-costs.ndjson`), 'utf8').split('\n')) {
+        if (!line) continue;
+        let r; try { r = JSON.parse(line); } catch { continue; }
+        if (r.session_id && String(r.ts || '') >= since) ids.add(r.session_id);
+      }
+    } catch {}
+    return ids;
+  };
+  const opsSessionIds = ledgerSessionIds('ops');
+  // The ops-light and ops-haiku dirs also hold sessions no supervisor started:
+  // a probe, test or scripted `claude -p` run with that cwd. Those load no deny list, so
+  // their listing is the whole account's and, being the largest, would be
+  // read as the tier's. Keep only sessions on the tier's own ledger; an
+  // unreadable or empty ledger keeps every file (unknown, not filtered).
+  const tierSessionIds = { 'ops-light': ledgerSessionIds('ops-light'), 'ops-haiku': ledgerSessionIds('ops-haiku') };
+  const onTierLedger = (tier) => (f) => !tierSessionIds[tier].size || tierSessionIds[tier].has(stemOf(f));
   const stemOf = (file) => path.basename(file, '.jsonl');
   const isOpusFile = (file) => {
     let fd; try { fd = fs.openSync(file, 'r'); } catch { return false; }
@@ -297,6 +308,7 @@ guard('mcp_tool_listing', () => {
     if (!files.length) return null;
     const counts = {};
     const NEEDLE = '"name":"mcp__';
+    const TOOL_USE = '"type":"tool_use"';
     for (const f of files) {
       let s; try { s = fs.readFileSync(f, 'utf8'); } catch { continue; }
       if (keep && keep.text && !keep.text(s)) continue;
@@ -304,7 +316,14 @@ guard('mcp_tool_listing', () => {
       for (;;) {
         i = s.indexOf(NEEDLE, i);
         if (i < 0) break;
+        // Only a tool_use block is a call. A session-start attachment that
+        // surfaces a server's tool definitions eagerly (surfacedDefinitions)
+        // repeats `"name":"mcp__…"` twice per tool and is not one: counted, it
+        // credited an eagerly-surfaced connector with thousands of calls.
+        // tool_use serialises as {"type":"tool_use","id":"toolu_…","name":…}.
+        const isCall = s.slice(Math.max(0, i - 100), i).includes(TOOL_USE);
         i += NEEDLE.length;
+        if (!isCall) continue;
         const end = s.indexOf('__', i);
         if (end < 0) break;
         const srv = s.slice(i, end);
@@ -318,6 +337,8 @@ guard('mcp_tool_listing', () => {
   const notOps = (f) => !opsSessionIds.has(stemOf(f));
   const USAGE_KEEP = {
     ops: { pre: (f) => opsSessionIds.has(stemOf(f)) },
+    'ops-light': { pre: onTierLedger('ops-light') },
+    'ops-haiku': { pre: onTierLedger('ops-haiku') },
     'opus-forks': { pre: notOps, text: isOpusText },
     'sonnet-forks': { pre: notOps, text: (s) => !isOpusText(s) },
   };
@@ -358,6 +379,8 @@ guard('mcp_tool_listing', () => {
   const tiers = { ops: 'ops-agent', 'ops-light': 'ops-light-agent', 'ops-haiku': 'ops-haiku-agent', 'opus-forks': 'ops-agent', 'sonnet-forks': 'ops-agent' };
   const TIER_KEEP = {
     ops: (f) => opsSessionIds.has(stemOf(f)),
+    'ops-light': onTierLedger('ops-light'),
+    'ops-haiku': onTierLedger('ops-haiku'),
     'opus-forks': (f) => !opsSessionIds.has(stemOf(f)) && isOpusFile(f),
     'sonnet-forks': (f) => !opsSessionIds.has(stemOf(f)) && !isOpusFile(f),
   };
@@ -435,7 +458,9 @@ guard('mcp_tool_listing', () => {
     'A non-trivial delta_tokens_est with a CLEAN always_loaded_surfaces sweep means an ACCOUNT-level connector changed, not a file. ' +
     'calls_30d / calls_30d_fleet are ACTUAL call counts from the supervisor transcripts — rank any connector cut on those, not on ungranted_tokens_est alone; see usage_30d. ' +
     'ops.delta_tokens_est and usage_30d.per_tier_scanned.ops RE-BASED on 2026-10-09 when the forks left the ops tier: a one-time jump, not a change. ' +
-    'Since 2026-10-09 the ops-agent project dir is split three ways: `ops` = sessions in the supervisor-ops ledger only; `opus-forks` = Opus launchd forks; `sonnet-forks` = other `claude -p` runs with that cwd (daily-summary-run and the other scripted model calls). Forks have no agents.json entry, so their ungranted_* fields mean nothing: read tokens_est, the listing sizes and calls_30d. Subagent transcripts (subagents/*.jsonl) are not scanned.';
+    'Since 2026-10-09 the ops-agent project dir is split three ways: `ops` = sessions in the supervisor-ops ledger only; `opus-forks` = Opus launchd forks; `sonnet-forks` = other `claude -p` runs with that cwd (daily-summary-run and the other scripted model calls). Forks have no agents.json entry, so their ungranted_* fields mean nothing: read tokens_est, the listing sizes and calls_30d. ' +
+    'ops-light and ops-haiku count only sessions on their own supervisor ledger, so a probe, test or scripted `claude -p` run started in that cwd (no deny list, the whole account\'s listing) is not read as the tier. ' +
+    'Subagent transcripts (subagents/*.jsonl) are not scanned.';
   return out;
 });
 
@@ -447,18 +472,18 @@ guard('mcp_tool_listing', () => {
 // (input + cache reads + cache writes) is over `over` tokens. A transcript
 // line is one request, so both are exact here.
 const MODEL_RATES = {
-  'claude-opus-5-5': [4, 20, 5, 0.2], // 2026-10-06 — the improvement family's model since then
+  'claude-opus-5-5': [4, 20, 5, 0.2], // 2026-10-06 — the improvement family's model since then — control-scan-ok: a price per model id, not a model choice
   'claude-opus-5': [5, 25, 6.25, 0.5], 'claude-opus-4-8': [5, 25, 6.25, 0.5],
   'claude-sonnet-5': [2, 10, 2.5, 0.2],
-  'claude-sonnet-5-5': [2, 10, 2.5, 0.1], // cache read $0.20 before 2026-10-07
+  'claude-sonnet-5-5': [2, 10, 2.5, 0.1], // cache read $0.20 before 2026-10-07 — control-scan-ok: a price per model id, not a model choice
   'claude-haiku-4-5-20251001': [1, 5, 1.25, 0.1],
-  'claude-haiku-5-5': [0.1, 0.5, 0.125, 0.01], // prompt up to 100k tokens
+  'claude-haiku-5-5': [0.1, 0.5, 0.125, 0.01], // prompt up to 100k tokens — control-scan-ok: a price per model id, not a model choice
 };
 const RATES_BEFORE = {
-  'claude-sonnet-5-5': { until: Date.parse('2026-10-07T00:00:00Z'), rate: [2, 10, 2.5, 0.2] },
+  'claude-sonnet-5-5': { until: Date.parse('2026-10-07T00:00:00Z'), rate: [2, 10, 2.5, 0.2] }, // control-scan-ok: a price per model id, not a model choice
 };
 const LONG_PROMPT = {
-  'claude-haiku-5-5': { over: 100000, rate: [0.5, 2.5, 0.625, 0.05] },
+  'claude-haiku-5-5': { over: 100000, rate: [0.5, 2.5, 0.625, 0.05] }, // control-scan-ok: a price per model id, not a model choice
 };
 // USD for one assistant message, or null when its model has no rate.
 function messageUsd(model, ts, usage) {

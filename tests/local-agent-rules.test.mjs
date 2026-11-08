@@ -21,7 +21,7 @@ import http from "node:http";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { createRequire } from "node:module";
-import { ClaudeSession, buildLocalRulesFile, readLocalRules, LOCAL_RULES_FILE } from "../agent/supervisor/claude-session.mjs";
+import { ClaudeSession, buildLocalRulesFile, readLocalRules, LOCAL_RULES_FILE, kernelRulebooks } from "../agent/supervisor/claude-session.mjs";
 import {
   withLocalCompanion, sliceAll, mergeSectionedMarkdown, composeTriageRules, writeFileIfChanged,
 } from "../agent/supervisor/dispatch-preamble.mjs";
@@ -513,4 +513,32 @@ test("the chat fork executor gets the chat session's local rules", () => {
 test("runOneShot passes the local rules for its cwd unless told otherwise", async () => {
   const src = fs.readFileSync(path.join(ROOT, "agent/core/one-shot.mjs"), "utf8");
   assert.match(src, /appendSystemPromptFile: appendSystemPromptFile === undefined \? defaultLocalRulesFile\(cwd\) : appendSystemPromptFile/);
+});
+
+test("kernelRulebooks: the ops supervisor carries the rulebooks in its appended prompt, once, and excludes them from discovery", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "rulebooks-"));
+  fs.mkdirSync(path.join(root, "agent", "ops-agent"), { recursive: true });
+  fs.mkdirSync(path.join(root, "agent", "ops-light-agent"), { recursive: true });
+  fs.mkdirSync(path.join(root, "agent", "local"), { recursive: true });
+  fs.writeFileSync(path.join(root, "agent", "CLAUDE.md"), "# Kernel rules\n");
+  fs.writeFileSync(path.join(root, "agent", "ops-agent", "CLAUDE.md"), "# Ops rules\n");
+  fs.symlinkSync("../ops-agent/CLAUDE.md", path.join(root, "agent", "ops-light-agent", "CLAUDE.md"));
+  fs.writeFileSync(path.join(root, "agent", "local", "shared.md"), "# Local rules — shared\n");
+  const rb = kernelRulebooks({ root, cwd: path.join(root, "agent", "ops-light-agent") });
+  assert.equal(rb.files.length, 2);
+  const real = fs.realpathSync(path.join(root, "agent", "ops-agent", "CLAUDE.md"));
+  assert.ok(rb.excludes.includes(path.join(root, "agent", "ops-light-agent", "CLAUDE.md")));
+  assert.ok(rb.excludes.includes(real));
+  const state = fs.mkdtempSync(path.join(os.tmpdir(), "rulebooks-state-"));
+  const r = buildLocalRulesFile({ localDir: path.join(root, "agent", "local"), role: "ops", stateDir: state, rulebooks: rb });
+  const text = fs.readFileSync(r.path, "utf8");
+  assert.equal(text.split("# Kernel rules").length - 1, 1);
+  assert.equal(text.split("# Ops rules").length - 1, 1);
+  assert.ok(text.indexOf("# Kernel rules") < text.indexOf("# Ops rules"));
+  assert.ok(text.indexOf("# Ops rules") < text.indexOf("# Local rules — shared"));
+  // without rulebooks the output is the local rules alone (the shell twin's bytes)
+  assert.ok(!readLocalRules({ localDir: path.join(root, "agent", "local"), role: "ops" }).includes("# Kernel rules"));
+  // an unreadable rulebook throws, so the caller never excludes what it could not carry
+  fs.rmSync(path.join(root, "agent", "CLAUDE.md"));
+  assert.throws(() => readLocalRules({ localDir: path.join(root, "agent", "local"), role: "ops", rulebooks: rb }));
 });

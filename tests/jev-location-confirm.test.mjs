@@ -10,6 +10,9 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+// The screen stubs fake the Ollama API; the local model defaults to Haiku via `claude -p`
+// since 2026-11-04, so pin the backend these stubs simulate.
+process.env.LOCAL_LLM_BACKEND ||= "ollama";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "jev-loc-"));

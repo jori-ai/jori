@@ -289,3 +289,39 @@ export class TurnWatchdog {
     return this.timer !== null;
   }
 }
+
+// ---------------------------------------------------------------------------
+// Phone-channel liveness (chat supervisor)
+//
+// The phone-channel (agent/phone-channel/index.mjs) is an MCP server of the chat
+// session and POSTs /heartbeat every 60s from the moment it starts. A heartbeat
+// that stops arriving means it died mid-session. One that never arrives means it
+// crashed at launch, and that has no age to grow: judged on the age alone it
+// read as healthy forever. So a phone-channel that has sent no heartbeat yet is
+// stale once a grace period has passed since the supervisor started waiting for
+// it (the session's start, or the end of a usage-limit hold: the session starts
+// its MCP servers only with a turn, and a hold keeps every turn queued).
+
+export const PHONE_CHANNEL_STALE_MS = 3 * 60 * 1000;
+export const PHONE_CHANNEL_FIRST_BEAT_GRACE_MS = 5 * 60 * 1000;
+
+/**
+ * @param {object} o
+ * @param {number|null} o.lastHeartbeatAt  ms of the last heartbeat this session, null for none yet
+ * @param {number|null} o.waitingSince     ms the wait for a first heartbeat started; null when
+ *                                         nothing should be judged (restarting, held, not configured)
+ * @returns {{ageMs: number|null, firstBeatPending: boolean, stale: boolean}}
+ */
+export function phoneChannelLiveness({
+  lastHeartbeatAt = null,
+  waitingSince = null,
+  now = Date.now(),
+  staleMs = PHONE_CHANNEL_STALE_MS,
+  graceMs = PHONE_CHANNEL_FIRST_BEAT_GRACE_MS,
+} = {}) {
+  if (lastHeartbeatAt) {
+    const ageMs = now - lastHeartbeatAt;
+    return { ageMs, firstBeatPending: false, stale: ageMs > staleMs };
+  }
+  return { ageMs: null, firstBeatPending: true, stale: !!waitingSince && now - waitingSince > graceMs };
+}

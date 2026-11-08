@@ -177,6 +177,23 @@ async function pruneSold(accountId, keptSecurityIds) {
     });
   }
 
+  // When the brokerage snapshot is fed by Plaid (broker.source = "plaid"),
+  // fresh holdings for that brokerage are the event the snapshot waits on:
+  // run it now, so the broker tables follow Plaid's update rather than the
+  // next scheduled run. Best-effort; the snapshot owns its own alerts.
+  const bcfg = brokerConfig();
+  const inst = String(bcfg.plaid_institution || "").toLowerCase();
+  const brokerMoved = inst && summary.items.some((i) => String(i.institution || "").toLowerCase().includes(inst));
+  if (bcfg.source === "plaid" && brokerMoved && !DRY_RUN && process.env.PLAID_HOLDINGS_NO_SNAPSHOT !== "1") {
+    await new Promise((resolve) => {
+      execFile(path.join(__dirname, bcfg.snapshot_command), [], { timeout: 180000 }, (err, stdout, stderr) => {
+        if (err) console.error(`  ${bcfg.snapshot_command} failed: ${(stderr || err.message).trim().split("\n").pop()}`);
+        else log(`  ${bcfg.snapshot_command}: ${stdout.trim().split("\n").pop()}`);
+        resolve();
+      });
+    });
+  }
+
   if (JSON_OUT) console.log(JSON.stringify(summary, null, 2));
   else log(`\nTotal: ${summary.holdings} position(s), ${usd(summary.total_value)} as of ${now}`);
 

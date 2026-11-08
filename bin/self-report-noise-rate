@@ -33,6 +33,7 @@ import { computeSelfReportNoise } from "../lib/self-report-noise.mjs";
 const require = createRequire(import.meta.url);
 const { installTools } = require("../lib/root.cjs");
 const { supabaseUrl } = require("../lib/instance.cjs");
+const ASSISTANT = require("../lib/instance.cjs").assistantName(); // the assistant's configured name (lib/instance.cjs)
 require("../lib/load-env.js").loadEnv();
 const BASE = process.env.SUPABASE_URL || supabaseUrl();
 const K = process.env.SUPABASE_SERVICE_ROLE_KEY;
@@ -83,5 +84,5 @@ const pct = (x) => (x == null ? "n/a" : `${Math.round(x * 100)}%`);
 const a = out.alerts, f = out.fixes;
 console.log(`Window ${out.window.since} → ${out.window.until}`);
 console.log(`Alerts: ${a.noise_active} of ${a.clusters_active} clusters active this window were noise (${pct(a.noise_rate)}); all time ${a.noise_all_time} of ${a.clusters_all_time} (${pct(a.noise_rate_all_time)}).${a.error ? `  [${a.error}]` : ""}`);
-console.log(`Fixes:  ${f.self_misreport} of ${f.applied} applied fixes were Jori misdescribing its own state (${pct(f.self_misreport_rate)})${f.complete ? "" : ` — NOT FINAL, ${f.unlabelled.length} unlabelled`}.${f.error ? `  [${f.error}]` : ""}`);
+console.log(`Fixes:  ${f.self_misreport} of ${f.applied} applied fixes were ${ASSISTANT} misdescribing its own state (${pct(f.self_misreport_rate)})${f.complete ? "" : ` — NOT FINAL, ${f.unlabelled.length} unlabelled`}.${f.error ? `  [${f.error}]` : ""}`);
 for (const u of f.unlabelled) console.log(`  unlabelled ${u.id}  ${u.summary}`);

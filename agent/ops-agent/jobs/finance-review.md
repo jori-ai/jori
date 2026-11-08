@@ -25,8 +25,9 @@ quiet week as "normal mid-month". So the tables and every flag are rendered
 from the packet by
 `finance-review-compose`, and your only text is a short summary that a
 verifier checks word by word against the packet's facts. If it fails, the
-email goes out without it. Questions the records cannot answer are listed at
-the bottom of the email for the user — never answer one yourself.
+email goes out without it. Questions the records cannot answer go to the
+user's **Questions tab**, one row each (Step 5); the email only says how many
+are waiting there. Never answer one yourself.
 
 **Design principle:** a
 *weekly* review is for **liquidity, accuracy, and anomalies — NOT portfolio or
@@ -122,11 +123,34 @@ RC=$?
 - Exit 1 = the email did not send and nothing else ran: stop (see below), do not
   mark sent. Exit 2 = sent but unlabeled (pointer + push still went) — note it.
 
+## Step 5 — Ask the open questions (Questions tab)
+
+Only after Step 4 did not exit 1:
+
+```bash
+node bin/finance-review-ask --packet /tmp/finance-review-packet.json
+```
+
+One Questions-tab row per packet question, no push, intent
+`plaid-finance-review:question` (jori-model-only). A question still open and
+asked in the last 6 days is not asked again; an open one the packet no longer
+asks is retired. The user asked for this (2026-11-08): *"ask me the questions
+from the weekly finance review in the questions channel - not in the email"*.
+
 Do not email anyone but the user. Do not create tasks. The review is informational
 + awareness; any action stays the user's. If the send fails (exit 1), stop — never fall
 back to an external channel for financial data.
 
-## Recording facts (the user, or you when the user answers a question in chat)
+## Recording facts (the user, or you when the user answers a question in chat or the Questions tab)
+
+A Questions-tab row from this review ends with `(finance review · fin-…)`.
+When the user replies to one: `finance-review-ask --list` names the packet
+question (`txn:…`, `account:…`, `payment:…`) and `finance-facts questions`
+gives the command that records it. Record it as below, then close it with
+`finance-review-ask --answered <fin-id> --via "<what was recorded>"`. A
+question answered in the hub (an account, a deposit row) is closed the same
+way once the user says it is done; the next review retires it anyway when its
+records stop asking.
 
 Open questions come back as answers. Record each with `bin/finance-facts`
 (usage in its header): `txn` (what a transaction was), `income add` (a stream

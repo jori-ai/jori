@@ -280,3 +280,185 @@ test("the caption is the walking lines and walk blocks it sits over, summed (202
   process.env.JORI_WALKED_FROM_LINES = "0";
   try { assert.match(buildSkeleton(r), /1\.4 miles walked/); } finally { delete process.env.JORI_WALKED_FROM_LINES; }
 });
+
+// Ground the spine never joined: two dwells in a row with no leg between them (a
+// pass-through dropped as no rest, no fix on the way) leave metres the legs never
+// held, while the stops' edges and the steps time all of it. The walk line adds the
+// straight line between those dwells as a floor and says "at least".
+const hopText = (html) => html.replace(/<[^>]+>/g, "");
+const hopBase = stop("a", "Base", "08:00", "12:08");
+const hopCafe = stop("b", "Cafe", "12:40", "13:30");
+// 0.0068 degrees of latitude is about 756 m
+const hopDwell = (id, name, lat, start, end) => ({ type: "dwell", id, place: { name, tier: "corroborated", lat, lon: -75 }, // kernel-guard-ok: synthetic fixture coordinates
+  start, end, start_ms: T(...start.split(":").map(Number)), end_ms: T(...end.split(":").map(Number)), major: true });
+const hopLeg = (id, start, end, routed) => ({ type: "leg", id, start, end,
+  start_ms: T(...start.split(":").map(Number)), end_ms: T(...end.split(":").map(Number)), mins: 5, mode: "walking",
+  routed_m: routed, straight_m: routed, walked_m: routed, geometry: "map_matched", streets: ["Main Street"],
+  holes: [], confidence: "observed", fixes: 3 });
+const hopDay = (spine) => ({ date: "2026-09-06", stops: [hopBase, hopCafe], routes: [], path: { stats: {}, segments: [], spine } });
+const hopSpine = (passedLat = 40.0068) => [ // kernel-guard-ok: synthetic fixture coordinates
+  hopDwell("d0", "Base", 40.0, "08:00", "12:16"),
+  hopDwell("d1", "Passed", passedLat, "12:16", "12:27"),
+  hopLeg("l0", "12:27", "12:32", 784),
+  hopDwell("d2", "Cafe", 40.0136, "12:32", "13:34"),
+];
+
+test("the hop no leg covers is walked ground, so the line states a floor", () => {
+  const line = hopText(movementHtml(hopDay(hopSpine()), hopBase, hopCafe));
+  assert.match(line, /Walked at least 1\.0 miles along Main Street, about 32 min\./);
+});
+
+test("the header's sum is marked a floor when a line is, and not otherwise", () => {
+  const { printedWalkMeters } = _internal;
+  const info = {};
+  const m = printedWalkMeters(hopDay(hopSpine()), [hopBase, hopCafe], info);
+  assert.ok(m > 1500 && m < 1600, `expected about 1.54 km, got ${m}`);
+  assert.equal(info.floor, true);
+  assert.ok(info.hop_m > 700 && info.hop_m < 800, `expected about 756 m of hop, got ${info.hop_m}`);
+  const joined = [
+    hopDwell("d0", "Base", 40.0, "08:00", "12:08"),
+    hopLeg("l0", "12:08", "12:16", 800),
+    hopDwell("d1", "Passed", 40.0068, "12:16", "12:27"),
+    hopLeg("l1", "12:27", "12:32", 784),
+    hopDwell("d2", "Cafe", 40.0136, "12:32", "13:34"),
+  ];
+  const info2 = {};
+  const line = hopText(movementHtml(hopDay(joined), hopBase, hopCafe, {}));
+  assert.match(line, /Walked 1\.0 miles along Main Street, about 32 min\./);
+  assert.doesNotMatch(line, /at least/);
+  printedWalkMeters(hopDay(joined), [hopBase, hopCafe], info2);
+  assert.equal(info2.floor, undefined);
+  assert.equal(info2.hop_m, undefined);
+});
+
+test("a hop that would make the stretch faster than a walk is not added", () => {
+  // the dropped dwell 3 km away: 3 km and the leg in 32 minutes is over 7 km/h, a ride, not a walk
+  const line = hopText(movementHtml(hopDay(hopSpine(40.0275)), hopBase, hopCafe)); // kernel-guard-ok: synthetic fixture coordinates
+  assert.doesNotMatch(line, /at least/);
+  assert.match(line, /Walked 0\.5 miles along Main Street, about 32 min\./);
+});
+
+test("JORI_WALK_UNSEEN_HOPS=0 gives the old line", () => {
+  process.env.JORI_WALK_UNSEEN_HOPS = "0";
+  try {
+    assert.match(hopText(movementHtml(hopDay(hopSpine()), hopBase, hopCafe)), /Walked 0\.5 miles along Main Street, about 32 min\./);
+  } finally { delete process.env.JORI_WALK_UNSEEN_HOPS; }
+});
+
+// A stop the spine has no dwell for (a quick shop the user named on a walk, where the
+// phone never saw a rest), inside a leg that runs on through it. The time test gave
+// that whole leg, metres and steps, to the side holding most of its minutes, and the
+// other side kept only the legs before it. The leg is now cut at the stop, each line
+// is at least the straight line between its stops, and its steps are the walking in
+// its own minutes.
+const cutStop = (id, name, s, e, lat) => ({ ...stop(id, name, s, e), lat, lon: -75 }); // kernel-guard-ok: synthetic fixture coordinates
+const cutShop = cutStop("shop", "Shop", "13:30", "13:52", 40.0);
+const cutBakery = cutStop("bakery", "Bakery", "14:06", "14:12", 40.008);
+const cutHome = cutStop("home", "Home", "14:29", "23:00", 40.017);
+const cutLeg = (id, start, end, routed, steps, extra = {}) => ({ ...hopLeg(id, start, end, routed), steps, ...extra });
+const cutDay = () => ({
+  date: "2026-09-06", stops: [cutShop, cutBakery, cutHome], routes: [],
+  steps: { walks: [{ start_ms: T(13, 50), end_ms: T(14, 29), mins: 39, steps: 3600, kind: "leg", leg_id: "l1" }] },
+  path: { stats: {}, segments: [], spine: [
+    hopDwell("d0", "Shop", 40.0, "13:30", "13:50"),
+    cutLeg("l0", "13:50", "13:55", 400, 400, { streets: [] }),
+    hopDwell("d1", "Passed", 40.0036, "13:55", "14:01"),
+    cutLeg("l1", "14:01", "14:29", 1100, 2600, { fixes: 5, walk_steps: 3600,
+      walks: [{ start_ms: T(13, 50), end_ms: T(14, 29), mins: 39, steps: 3600 }] }),
+    hopDwell("d2", "Home", 40.017, "14:29", "23:00"),
+  ] },
+});
+
+test("a leg that runs through a stop the spine never saw is cut at the stop", () => {
+  const d = cutDay();
+  const before = hopText(movementHtml(d, cutShop, cutBakery));
+  const after = hopText(movementHtml(d, cutBakery, cutHome));
+  assert.match(before, /Walked at least 0\.6 miles along Main Street, about 14 min, 1,292 steps\./);
+  assert.match(after, /Walked at least 0\.6 miles along Main Street, about 17 min, 1,569 steps\./);
+  const { printedWalkMeters } = _internal;
+  const info = {};
+  const m = printedWalkMeters(d, [cutShop, cutBakery, cutHome], info);
+  assert.ok(m > 1850 && m < 1950, `expected the two straight lines, about 1.89 km, got ${m}`);
+  assert.equal(info.floor, true);
+});
+
+test("JORI_WALK_CUT_AT_STOP=0 gives the old lines", () => {
+  process.env.JORI_WALK_CUT_AT_STOP = "0";
+  try {
+    const d = cutDay();
+    assert.match(hopText(movementHtml(d, cutShop, cutBakery)), /Walked 0\.2 miles, about 14 min, 400 steps\./);
+    assert.match(hopText(movementHtml(d, cutBakery, cutHome)), /Walked 0\.7 miles along Main Street, about 17 min, 2,600 steps\./);
+  } finally { delete process.env.JORI_WALK_CUT_AT_STOP; }
+});
+
+// 2026-11-07: three ways a day's report disagreed with its own numbers at the edge of a
+// stop. A 12-minute stay at a known place came out of the rests re-cut as 9 minutes and
+// fell under the 10-minute bar though the phone's own visit record had it at 12, so the
+// stop vanished from the email while the fact sheet still listed it; and a walk the step
+// counter found was printed with its own times under a stop that began after it.
+const EDGE_T0 = Date.parse("2026-11-07T13:00:00Z");
+const edgeAt = (min) => EDGE_T0 + min * 60000;
+const edgeKnown = (extra = {}) => ({
+  id: "s-1", place: { name: "Home", source: "named_location" }, duration_min: 9,
+  start_ts_ms: edgeAt(0), end_ts_ms: edgeAt(9), ...extra,
+});
+const edgeRow = (fromMin, toMin) => ({ start_ms: edgeAt(fromMin), end_ms: edgeAt(toMin), place_type: "named" });
+
+test("a known stop the rests re-cut left at 9 minutes counts when the phone's own visit record holds it at 12", () => {
+  assert.equal(_internal.isMainStop(edgeKnown({ confirmed_row: edgeRow(-3, 9) })), true);
+  assert.equal(_internal.isMainStop(edgeKnown()), false, "no visit record: the 9 minutes stand");
+});
+
+test("a visit record far longer than the stop is a container, not the stop's own", () => {
+  // the overnight row behind a step out of the door
+  assert.equal(_internal.isMainStop(edgeKnown({ confirmed_row: edgeRow(-500, 9) })), false);
+});
+
+test("a stop whose end gave its silent tail back to the walk is measured against its span before that", () => {
+  // the row's departure ran past the user's, so resolve-day ended the stop 4 minutes early
+  const trimmed = { duration_min: 5, end_ts_ms: edgeAt(5), confirmed_row: edgeRow(-3, 9) };
+  assert.equal(_internal.isMainStop(edgeKnown({ ...trimmed, travel_trimmed_from_ms: edgeAt(9) })), true);
+  assert.equal(_internal.isMainStop(edgeKnown(trimmed)), false, "without the trim's record the row reads as a container");
+});
+
+test("a visit record under the bar changes nothing, and JORI_STOP_OWN_VISIT=0 turns the rule off", () => {
+  assert.equal(_internal.isMainStop(edgeKnown({ duration_min: 6, end_ts_ms: edgeAt(6), confirmed_row: edgeRow(-1, 6) })), false);
+  process.env.JORI_STOP_OWN_VISIT = "0";
+  try { assert.equal(_internal.isMainStop(edgeKnown({ confirmed_row: edgeRow(-3, 9) })), false); }
+  finally { delete process.env.JORI_STOP_OWN_VISIT; }
+});
+
+const edgeWalk = (fromMin, toMin, steps) => ({
+  kind: "in_stop", stop_id: "s-2", start_ms: edgeAt(fromMin), end_ms: edgeAt(toMin), mins: toMin - fromMin, steps,
+});
+const edgeVenue = { id: "s-2", start_ts_ms: edgeAt(4), end_ts_ms: edgeAt(100), tz: "UTC" };
+const edgeDay = (walks) => ({ date: "2026-11-07", tz: "UTC", steps: { walks } });
+
+test("a walk that began before its stop is printed from the stop's start, with its share of the steps", () => {
+  const [w] = _internal.stopWalks(edgeDay([edgeWalk(0, 16, 1600)]), edgeVenue, [edgeVenue]);
+  assert.equal(w.start_ms, edgeAt(4));
+  assert.equal(w.end_ms, edgeAt(16));
+  assert.equal(w.mins, 12);
+  assert.equal(w.steps, 1200);
+});
+
+test("a walk inside its stop is untouched", () => {
+  const whole = edgeWalk(20, 32, 900);
+  const [w] = _internal.stopWalks(edgeDay([whole]), edgeVenue, [edgeVenue]);
+  assert.deepEqual(w, whole);
+});
+
+test("what is left of a walk after the cut must still be a walk", () => {
+  // 3 of its 10 minutes are inside the stop: not enough to print
+  assert.deepEqual(_internal.stopWalks(edgeDay([edgeWalk(-7, 7, 800)]), edgeVenue, [edgeVenue]), []);
+  // 12 of its 76 minutes are inside, and its share of the steps is under the bar
+  assert.deepEqual(_internal.stopWalks(edgeDay([edgeWalk(-60, 16, 2000)]), edgeVenue, [edgeVenue]), []);
+});
+
+test("JORI_WALK_CLIP_TO_STOP=0 brings back the whole walk", () => {
+  process.env.JORI_WALK_CLIP_TO_STOP = "0";
+  try {
+    const [w] = _internal.stopWalks(edgeDay([edgeWalk(0, 16, 1600)]), edgeVenue, [edgeVenue]);
+    assert.equal(w.start_ms, edgeAt(0));
+  } finally { delete process.env.JORI_WALK_CLIP_TO_STOP; }
+});

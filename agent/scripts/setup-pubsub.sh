@@ -67,7 +67,7 @@ gcloud pubsub topics add-iam-policy-binding "$TOPIC" \
 echo "Ensuring OIDC service account $SA_NAME exists..."
 gcloud iam service-accounts describe "$SA_EMAIL" >/dev/null 2>&1 || \
   gcloud iam service-accounts create "$SA_NAME" \
-    --display-name="Jori Pub/Sub push OIDC signer" >/dev/null
+    --display-name="Jori Pub/Sub push OIDC signer" >/dev/null  # control-scan-ok: the software's name
 
 # Pub/Sub's service agent must be allowed to mint OIDC tokens as the SA.
 PROJECT_NUMBER="$(gcloud projects describe "$PROJECT_ID" --format='value(projectNumber)')"

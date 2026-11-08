@@ -41,6 +41,7 @@ Usage:
 import argparse
 import json
 import os
+import shutil
 import subprocess
 import sys
 import urllib.parse
@@ -80,6 +81,37 @@ def req(path, method="GET", body=None):
     with urllib.request.urlopen(r, timeout=45) as resp:
         raw = resp.read()
         return json.loads(raw) if raw else None
+
+
+def _question_hold(a, body):
+    """Ask bin/question-hold whether to hold this card. The gate's verdict dict
+    when it holds it, else None. Fails open: a missing gate, an error or a
+    timeout sends the card. The release replays this exact `choice send` with
+    JORI_QUESTION_HOLD_RELEASE=1, which skips the gate. Not run inside a test
+    run unless JORI_QUESTION_HOLD_BIN names a stand-in."""
+    if a.channel not in ("chat", "questions") or os.environ.get("JORI_QUESTION_HOLD_RELEASE") == "1":
+        return None
+    gate = os.environ.get("JORI_QUESTION_HOLD_BIN") or os.path.join(REPO, "bin/question-hold")
+    if os.environ.get("NODE_TEST_CONTEXT") and not os.environ.get("JORI_QUESTION_HOLD_BIN"):
+        return None
+    if not os.path.isfile(gate):
+        return None
+    entry = {"sender": "choice", "args": sys.argv[1:], "message": body, "intent": f"choice:{a.kind}",
+             "channel": a.channel, "card_kind": a.kind, "card_ref": a.ref}
+    try:
+        node = (os.environ.get("JORI_NODE") or shutil.which("node")
+                or os.path.expanduser("~/.local/node/bin/node"))
+        out = subprocess.run([node, gate, "gate"], input=json.dumps(entry, ensure_ascii=False),
+                             capture_output=True, text=True, timeout=60, check=False)
+        verdict = json.loads(out.stdout.strip() or "{}")
+    except Exception as e:  # never lose a card to the gate
+        print(f"[choice] question-hold gate unavailable ({e}); sending", file=sys.stderr)
+        return None
+    if verdict.get("action") == "hold":
+        print(f"[choice] held: chat is not reading ({verdict.get('reason')}); it goes out once chat is "
+              "reading again, if still worth asking", file=sys.stderr)
+        return verdict
+    return None
 
 
 def cmd_send(a):
@@ -138,6 +170,17 @@ def cmd_send(a):
     # older build still shows a tappable link. Nothing else to version.
     if getattr(a, "image_url", None):
         body = f"{body}\n\n{a.image_url}"
+
+    # QUESTION HOLD. A card is a question, and a question goes out only while
+    # chat is reading (bin/jori-send-curl § Question hold; lib/question-hold.mjs):
+    # otherwise it is kept and sent again, with these same arguments, once chat
+    # reads again and a model has checked it is still worth asking.
+    held = _question_hold(a, body)
+    if held:
+        print(json.dumps({"held": True, "hold_id": held.get("id"), "reason": held.get("reason"),
+                          "message_id": None}, indent=2, ensure_ascii=False))
+        return
+
     row = req("jori_messages", "POST", {
         "role": "assistant", "content": body, "read": False,
         "channel": a.channel,
@@ -150,9 +193,9 @@ def cmd_send(a):
     # straight to jori_messages over REST and fired nothing, so the first
     # live prompts reached the user silently, found only by opening the app.
     # `jori-notify` is the right hook rather than a raw APNs call because it goes through sendApnsPush, which carries the MOTION GATE: a
-    # non-urgent ping while the user is walking is parked and flushed once they
-    # stop, and a push that lands in a pocket is not a quieter push, it is a lost
-    # one. --message-id makes the notification deep-link to this exact prompt.
+    # non-urgent ping while the user is walking goes out at once (AirPods/CarPlay
+    # read it aloud) and is re-pinged once when they stop if still unread, because
+    # a push that lands in a pocket is not a quieter push, it is a lost one. --message-id makes the notification deep-link to this exact prompt.
     #
     # NOT routed through jori-send-curl, and that is a real gap worth naming:
     # this skips the outbound precheck. The message is composed from a decision

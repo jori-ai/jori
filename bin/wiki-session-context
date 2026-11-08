@@ -40,6 +40,7 @@ const os = require("node:os");
 const path = require("node:path");
 const ws = require("../lib/wiki-store.js");
 const OWNER_NAME = require("../lib/instance.cjs").instanceValue("owner_name");
+const ASSISTANT = require("../lib/instance.cjs").assistantName(); // the assistant's configured name (lib/instance.cjs)
 
 const FULL_PINNED = process.env.WIKI_SESSION_FULL_PINNED === "1";
 
@@ -181,7 +182,7 @@ function buildMemoryMap(byType, total) {
     `- \`wiki_search(query, mode:"hybrid")\` — paraphrase-tolerant search for what ${OWNER_NAME} IS or PREFERS or DECIDED (profile, feedback rules, projects, references). \`type:\` to scope. Reach for \`episode_search\` instead for anything that happened on a day.`,
     "- `wiki_read <id>` — full body of any page (ids appear in the pinned menu and in search hits), plus its typed facts.",
     "- `wiki_associate(ids:[...])` — everything tied to a page or several (people ↔ the days they appear in, a day ↔ the day before/after, pages often recalled together), each result saying how it was reached. For \"what else happened when…\" and the bridge between two things.",
-    "- `recall_events(query)` — search Jori's own activity stream (what it actually did/decided), not just curated pages.",
+    `- \`recall_events(query)\` — search ${ASSISTANT}'s own activity stream (what it actually did/decided), not just curated pages.`,
   ];
   return lines.join("\n") + "\n";
 }

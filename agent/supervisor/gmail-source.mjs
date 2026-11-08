@@ -314,7 +314,7 @@ async function runIntakeCascade(messageId, fromHeader, subject, toJori = false) 
   // so an instruction that lands here is filed instead of obeyed. Short-circuit
   // them exactly as a stamped P1 does on the live path, and let it dispatch.
   // Defaults to false, so a caller that cannot know stays on today's behaviour.
-  if (toJori) return { skip: false, kind: "command-channel", detail: "addressed to Jori -> always dispatch" };
+  if (toJori) return { skip: false, kind: "command-channel", detail: `addressed to ${ASSISTANT} -> always dispatch` };
   const gate = bookingGateFor(messageId, fromHeader, subject);
   const fp = await intakeFastPathCheck(messageId, fromHeader, subject, gate);
   if (fp.matched) return { skip: true, kind: "fastpath", detail: `intake-skip rule=${fp.rule} -> label=${fp.label}${fp.starred ? "+star(P2)" : ""} applied=${fp.applied}` };
@@ -913,7 +913,7 @@ export class GmailSource {
       // which reads email-triage-rules.md and handles self-sent mail itself.
       const recipients = ["To", "Cc", "Bcc"].map(n => headers.find(h => h.name === n)?.value || "").join(", ");
       if (isOwnSentToThirdParty(msg.labelIds, recipients)) {
-        this.triageLog?.(`own-sent skip ${messageId} to ${recipients.slice(0, 80)} — SENT, never in INBOX, not addressed to Jori`);
+        this.triageLog?.(`own-sent skip ${messageId} to ${recipients.slice(0, 80)} — SENT, never in INBOX, not addressed to ${ASSISTANT}`);
         return null;
       }
       // Date + RFC Message-ID ride along so the dispatch can carry the
@@ -1297,7 +1297,7 @@ export class GmailSource {
           // filters exactly as a stamped P1 does.
           const skipAutoHandle = stampedP1 || m.toJori === true;
           if (m.toJori === true && !stampedP1) {
-            this.triageLog(`command-channel ${m.messageId} from ${extractEmailAddr(m.from)} → addressed to Jori, auto-handling skipped`);
+            this.triageLog(`command-channel ${m.messageId} from ${extractEmailAddr(m.from)} → addressed to ${ASSISTANT}, auto-handling skipped`);
           }
           // A booking is never filed by either filter (see intakeBookingCheck):
           // the gate is asked only when one of them is about to file it.

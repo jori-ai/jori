@@ -319,6 +319,39 @@ class RouteStreetNames(unittest.TestCase):
             mod._post_json = saved
         self.assertEqual(names, ["Example Street", "Second Way", "Route 9"])
 
+    # A maneuver lists every name of the one road it follows (a numbered avenue and
+    # its official name), and the line read "along <avenue> and <its other name>":
+    # one road twice. The road's first name stands for it (2026-11-07).
+    def _names(self, maneuvers, **env):
+        trip = {"trip": {"legs": [{"shape": "", "summary": {"length": 0.55}, "maneuvers": maneuvers}]}}
+        old = {k: os.environ.get(k) for k in env}
+        os.environ.update(env)
+        saved = mod._post_json
+        mod._post_json = lambda url, body: trip
+        try:
+            t0 = datetime(2026, 1, 1, 9, 0)
+            a, b = G(0.0, 0.0), G(120.0, 90.0)
+            pts = [{"lat": a[0], "lon": a[1], "acc": 10, "t": t0},
+                   {"lat": b[0], "lon": b[1], "acc": 10, "t": t0 + timedelta(minutes=8)}]
+            return mod.valhalla_route_points(pts, "pedestrian")[1]
+        finally:
+            mod._post_json = saved
+            for k, v in old.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+
+    ALIASES = [{"street_names": ["Main Street"]}, {"street_names": ["7th Avenue", "Avenue of the Arts"]},
+               {"street_names": ["7th Avenue", "Avenue of the Arts"]}, {"street_names": ["3350", "Elm Street"]}, {}]
+
+    def test_a_road_is_named_once(self):
+        self.assertEqual(self._names(self.ALIASES), ["Main Street", "7th Avenue", "Elm Street"])
+
+    def test_the_switch_keeps_every_name(self):
+        self.assertEqual(self._names(self.ALIASES, JORI_STREET_ALL_NAMES="1"),
+                         ["Main Street", "7th Avenue", "Avenue of the Arts", "Elm Street"])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=1)

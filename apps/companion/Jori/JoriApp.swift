@@ -1,5 +1,6 @@
 import SwiftUI
 import UserNotifications
+import Intents
 import Supabase
 
 #if os(macOS)
@@ -303,8 +304,26 @@ final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCent
         UNUserNotificationCenter.current().delegate = self
         TradeApproval.registerNotificationCategory()
         PurchaseApproval.registerNotificationCategory()
+        MessageReply.registerNotificationCategory()
 
-        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .badge, .sound]) { granted, error in
+        // Report what happened to recent messages (did Siri ask what to read?)
+        // each time the app comes forward. See AnnounceDiagnostics.swift.
+        NotificationCenter.default.addObserver(
+            forName: UIApplication.didBecomeActiveNotification, object: nil, queue: .main
+        ) { _ in
+            Task { await AnnounceDiagnostics.upload() }
+        }
+
+        // Siri reaches the JoriIntents extension (which tells it what an
+        // announced message says) only once the app is authorized for Siri.
+        // Asks once; a no-op after the user has answered.
+        if INPreferences.siriAuthorizationStatus() == .notDetermined {
+            INPreferences.requestSiriAuthorization { status in
+                print("[Siri] authorization: \(status.rawValue)")
+            }
+        }
+
+        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .badge, .sound, .carPlay]) { granted, error in
             if let error = error {
                 print("[APNs] Authorization error: \(error)")
                 return
@@ -442,6 +461,16 @@ final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCent
             AppDelegate.pendingPurchaseId = purchaseId
             NotificationCenter.default.post(name: .openPurchaseApproval, object: purchaseId)
             completionHandler()
+            return
+        }
+
+        // Reply typed into the notification's Reply action.
+        if response.actionIdentifier == MessageReply.replyAction,
+           let text = (response as? UNTextInputNotificationResponse)?.userText {
+            Task {
+                await MessageReply.handle(text)
+                completionHandler()
+            }
             return
         }
 

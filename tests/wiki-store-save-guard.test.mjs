@@ -41,6 +41,11 @@ test("the read view's facts footer is refused", () => {
   assert.throws(() => ws.savePage("user_keller_fixture", withFacts), /facts footer/);
 });
 
+test("the read view's family branch footer is refused", () => {
+  const withBranch = PAGE + "\n=== family branch ===\n  Sam's side, blood: child_of user_x → parent_of user_sam\n";
+  assert.throws(() => ws.savePage("user_keller_fixture", withBranch), /family branch footer/);
+});
+
 test("dropping an existing page's frontmatter is refused", () => {
   assert.throws(() => ws.savePage("user_keller_fixture", "# Eli & Jo Keller\n\nOldest and best friends.\n"), /has frontmatter/);
   assert.equal(ws.getPage("user_keller_fixture").raw_md.startsWith("---\n"), true);

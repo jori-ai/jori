@@ -28,6 +28,10 @@ fs.writeFileSync(
   { mode: 0o755 },
 );
 process.env.HOME = home;
+// The page names the assistant: pin it, so the test does not depend on the
+// installation's own instance.json.
+process.env.JORI_ASSISTANT_NAME = "Jori"; // control-scan-ok: the test's fixed name
+process.env.JORI_ASSISTANT_PRONOUNS = "it/its";
 process.env.MEMORY_INDEX_DIR = path.join(dir, "memory");
 process.env.MEMORY_INDEX_DB = path.join(dir, "memory-index.db");
 process.env.MEMORY_DB_AUTHORITATIVE = "1";

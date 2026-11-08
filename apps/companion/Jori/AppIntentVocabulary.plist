@@ -2,14 +2,40 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-	<!-- IntentPhrases intentionally empty. The previous INSendMessageIntent
-	     example phrases ("Tell Jori…", "Message Jori…") triggered
-	     ITMS-90626 once we dropped SiriKit messaging support: a vocabulary
-	     phrase for an intent the app no longer supports is rejected at
-	     processing. Hands-free input is now the "Summon Jori" App Shortcut
-	     (App Intents), which registers its own phrases — no AppIntentVocabulary
-	     entry needed. -->
+	<!-- One example phrase per SiriKit intent the JoriIntents extension
+	     declares in IntentsSupported (send / search / set-attribute).
+	     The two lists must match both ways: a supported intent with no
+	     phrase draws ITMS-90626 "No example phrase was provided", and a
+	     phrase for an intent the app doesn't support draws ITMS-90626
+	     "phrase that belongs to unsupported intent" (build 147). Phrases
+	     leave out the app's name: this file is a plain resource, so
+	     $(JORI_DISPLAY_NAME) is not expanded here. -->
 	<key>IntentPhrases</key>
-	<array/>
+	<array>
+		<dict>
+			<key>IntentName</key>
+			<string>INSendMessageIntent</string>
+			<key>IntentExamples</key>
+			<array>
+				<string>Send a message</string>
+			</array>
+		</dict>
+		<dict>
+			<key>IntentName</key>
+			<string>INSearchForMessagesIntent</string>
+			<key>IntentExamples</key>
+			<array>
+				<string>Read my messages</string>
+			</array>
+		</dict>
+		<dict>
+			<key>IntentName</key>
+			<string>INSetMessageAttributeIntent</string>
+			<key>IntentExamples</key>
+			<array>
+				<string>Mark my messages as read</string>
+			</array>
+		</dict>
+	</array>
 </dict>
 </plist>

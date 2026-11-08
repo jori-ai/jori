@@ -24,9 +24,9 @@ test("a factoid 5 min ago does not trip the shared 45-min spacing", () => {
   assert.equal(shared.ok, true);
 });
 
-test("local-history pool: 15-min spacing and 10/day", () => {
-  assert.equal(checkPingBudget({ rows: [lh(5)], now, tz, pool: "local_history", statePath: "/nonexistent" }).gate, "min_interval");
-  assert.equal(checkPingBudget({ rows: [lh(20)], now, tz, pool: "local_history", statePath: "/nonexistent" }).ok, true);
+test("local-history pool: 5-min spacing and 10/day", () => {
+  assert.equal(checkPingBudget({ rows: [lh(3)], now, tz, pool: "local_history", statePath: "/nonexistent" }).gate, "min_interval");
+  assert.equal(checkPingBudget({ rows: [lh(6)], now, tz, pool: "local_history", statePath: "/nonexistent" }).ok, true);
   const ten = Array.from({ length: 10 }, (_, i) => lh(20 + i * 20));
   assert.equal(checkPingBudget({ rows: ten, now, tz, pool: "local_history", statePath: "/nonexistent" }).gate, "daily_cap");
   // Six shared pings do not block a factoid.

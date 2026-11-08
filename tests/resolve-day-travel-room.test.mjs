@@ -193,3 +193,70 @@ test("a start still runs back through silence after a far place when the gap hol
   assert.ok(b.start_ts_ms <= UM("11:00:00"), "the fix at home at 11:00 is direct evidence");
   assert.ok(b.start_ts_ms - a.end_ts_ms >= 9 * 60_000, "and the trip keeps its minutes");
 });
+
+// A visit row's departure can run minutes past the last fix at the place. Home's last
+// fix at 09:51:58, its row's departure 09:57:07, and twelve seconds later a walking fix
+// 185 m down the street: the fixes across the gap saw the walk, but not the departure,
+// so they are not travel seen from its start. Home gives back its walk to the market
+// (1.15 km at walking pace) out of its silent tail, never past its last fix.
+const UW = (hms) => Date.parse(`2026-03-14T${hms}Z`);
+const HOME_W = LLP(0, 0), MARKET_W = LLP(950.4, -641.8);
+const pw = (hms, at, acc = 15, activity = "walking") => ({ ts: UW(hms), lat: at.lat, lon: at.lon, acc, activity });
+const WALK_PINGS = [
+  pw("09:48:12", LLP(4.2, 4.4), 17),
+  pw("09:51:58", LLP(3.4, -2.4), 10, "unknown"),
+  pw("09:57:19", LLP(157.7, -95.9), 16),
+  pw("09:57:57", LLP(175.4, -120.3), 8),
+  pw("10:02:17", LLP(357.6, -282.7), 14),
+  pw("10:07:42", LLP(848.6, -569.4), 21),
+];
+const stopw = (id, name, at, from, to) => ({
+  id, start: from, end: to, start_ts_ms: UW(from), end_ts_ms: UW(to),
+  duration_min: Math.round((UW(to) - UW(from)) / 60000), lat: at.lat, lon: at.lon,
+  place: { name, source: "named_location" },
+});
+
+function walkOut(env) {
+  const old = process.env.JORI_TRAVEL_SEEN_DEPARTURE;
+  if (env == null) delete process.env.JORI_TRAVEL_SEEN_DEPARTURE; else process.env.JORI_TRAVEL_SEEN_DEPARTURE = env;
+  try {
+    const home = stopw("s-3", "Home", HOME_W, "09:48:12", "09:57:07");
+    const market = stopw("s-4", "The Market", MARKET_W, "10:06:47", "11:13:54");
+    const out = leaveRoomToTravel([home, market], WALK_PINGS);
+    return { home, market, out };
+  } finally {
+    if (old == null) delete process.env.JORI_TRAVEL_SEEN_DEPARTURE; else process.env.JORI_TRAVEL_SEEN_DEPARTURE = old;
+  }
+}
+
+test("a walking fix too far from the place to reach since its end means the departure was not seen", () => {
+  const { home, market, out } = walkOut(null);
+  assert.equal(out.length, 1);
+  const walkMin = (market.start_ts_ms - home.end_ts_ms) / 60000;
+  assert.ok(walkMin >= 13 && walkMin <= 14.5, `about 14 minutes on foot for 1.15 km, got ${walkMin.toFixed(1)}`);
+  assert.ok(home.end_ts_ms > UW("09:51:58"), "never before the last fix at home");
+  assert.equal(market.start_ts_ms, UW("10:06:47"), "the next place keeps its own start");
+  assert.equal(home.duration_min, Math.round((home.end_ts_ms - home.start_ts_ms) / 60000));
+});
+
+test("a fix at the place after that time still keeps the stay", () => {
+  const home = stopw("s-3", "Home", HOME_W, "09:48:12", "09:57:07");
+  const market = stopw("s-4", "The Market", MARKET_W, "10:06:47", "11:13:54");
+  assert.equal(leaveRoomToTravel([home, market], [...WALK_PINGS, pw("09:56:40", LLP(6, 3), 9, "unknown")]).length, 0);
+  assert.equal(home.end_ts_ms, UW("09:57:07"));
+});
+
+test("a first fix a walker could reach since the end is travel seen from its start", () => {
+  // the same walk, the first fix away 90 seconds after home's end (169 m clear of its accuracy, under 7 km/h)
+  const pings = WALK_PINGS.map(q => (q.ts === UW("09:57:19") ? { ...q, ts: UW("09:58:37") } : q))
+    .filter(q => q.ts !== UW("09:57:57"));
+  const home = stopw("s-3", "Home", HOME_W, "09:48:12", "09:57:07");
+  const market = stopw("s-4", "The Market", MARKET_W, "10:06:47", "11:13:54");
+  assert.equal(leaveRoomToTravel([home, market], pings).length, 0);
+});
+
+test("JORI_TRAVEL_SEEN_DEPARTURE=0 keeps the old test (the gap's fixes are the travel)", () => {
+  const { home, out } = walkOut("0");
+  assert.equal(out.length, 0);
+  assert.equal(home.end_ts_ms, UW("09:57:07"));
+});

@@ -157,10 +157,11 @@ function cmdHelp(extensions = []) {
   console.log('  git                           branch + status + recent commits');
   console.log('  ci [--limit N]                GitHub Actions runs\n');
   console.log(c.bold('CONTROL'));
-  console.log('  restart <target>            bounce a supervised process; target:');
+  console.log('  restart <target> [...]      bounce supervised processes, in order, session last; target:');
   console.log('     ops | ops-light | ops-haiku | chat   rotate the agent\'s claude session (POST supervisor /restart)');
   console.log('     whatsapp-channel | imessage-channel | slack-channel | wiki-server  SIGTERM the process-manager child; it respawns');
-  console.log('     session                    kickstart launchd — restart the whole stack\n');
+  console.log('     session                    kickstart launchd — restart the whole stack');
+  console.log('     (run by the chat agent, chat/session go to a background job that starts when the turn ends and posts a checked result in the chat)\n');
   console.log(c.bold('DISCOVERY'));
   console.log('  arch                          print architecture.md (+ architecture-local.md, changelog.md)');
   console.log('  where <name>                  fuzzy-find by name (tasks, scripts, services)');
@@ -999,9 +1000,19 @@ function readWebhookToken() {
 //   wiki-server         respawns it on exit. Confirms a fresh pid comes up.
 //   session           → launchctl kickstart -k of ai.claude.session (restarts
 //                       process-manager + every child)
+//
+// Several targets may be named at once; they run in the order given, session
+// last (anything after it would race the restart it starts).
+//
+// From inside the chat agent's own session, restarting chat or the whole
+// session kills the turn that asked for it (exit 137): neither the reply nor a
+// check that it worked ever runs. There, every other target runs now, and the
+// chat/session restart goes to a detached job-run job that waits for the turn
+// to end, restarts, checks, and has ops-light post the result in the chat.
+// `--after-chat-turn=<dispatch id>` marks that job's own run.
 function cmdRestart(args) {
-  const raw = args.find(a => !a.startsWith('--'));
-  if (!raw) die('restart: usage: jori restart <ops|ops-light|ops-haiku|chat|whatsapp-channel|imessage-channel|slack-channel|wiki-server|session>');
+  const raws = args.filter(a => !a.startsWith('--'));
+  if (!raws.length) die('restart: usage: jori restart <ops|ops-light|ops-haiku|chat|whatsapp-channel|imessage-channel|slack-channel|wiki-server|session> [<target> ...]');
 
   const ALIASES = {
     ops: 'ops', chat: 'chat', session: 'session',
@@ -1011,30 +1022,111 @@ function cmdRestart(args) {
     slack: 'slack-channel', 'slack-channel': 'slack-channel',
     wiki: 'wiki-server', 'wiki-server': 'wiki-server',
   };
-  const target = ALIASES[raw];
-  if (!target) die(`restart: unknown target '${raw}'. Use: ops, ops-light, ops-haiku, chat, whatsapp-channel, imessage-channel, slack-channel, wiki-server, session.`);
+  const targets = [];
+  for (const raw of raws) {
+    const target = ALIASES[raw];
+    if (!target) die(`restart: unknown target '${raw}'. Use: ops, ops-light, ops-haiku, chat, whatsapp-channel, imessage-channel, slack-channel, wiki-server, session.`);
+    if (!targets.includes(target)) targets.push(target);
+  }
+  targets.sort((a, b) => (a === 'session') - (b === 'session'));
 
+  const afterTurn = args.find(a => a.startsWith('--after-chat-turn='));
+  if (afterTurn) waitForChatTurn(afterTurn.slice('--after-chat-turn='.length));
+  // The session restart covers chat, so only one of the two is handed off.
+  const self = !afterTurn && inChatSession() ? ['session', 'chat'].find(t => targets.includes(t)) : null;
+  for (const target of targets) {
+    if (self && (target === 'session' || target === 'chat')) continue;
+    restartOne(target, { verify: !!afterTurn });
+  }
+  if (self) handOffChatSelfRestart(self);
+}
+
+// The chat supervisor gives its claude child JORI_DISPATCH_URL, pointing at its
+// own /dispatch on chat_health; every command the chat agent runs inherits it.
+function inChatSession(env = process.env) {
+  try { return !!env.JORI_DISPATCH_URL && Number(new URL(env.JORI_DISPATCH_URL).port) === portOf('chat_health'); }
+  catch { return false; }
+}
+
+// Launch the restart of chat (or of the whole session) as a detached job-run
+// job, which outlives this chat turn, and return at once.
+function handOffChatSelfRestart(target) {
+  const h = fetchJson(`http://127.0.0.1:${portOf('chat_health')}/health`);
+  const turn = (h && h.inFlight && h.inFlight.id) || 'any';
+  const env = { ...process.env };
+  delete env.JORI_DISPATCH_URL;   // the job runs outside the chat session, so it restarts instead of handing off again
+  const notify = `A restart the user asked for in the chat ran by itself once that chat turn ended: job {{id}} (${target}), status {{status}}, exit {{exit_code}}. ` +
+    `Read what it printed (${path.join(TOOLS, 'bin/job-status')} {{id}}), then tell the user in one plain sentence whether it finished and what it checked, ` +
+    `or, if it did not, what the log says, with ${path.join(TOOLS, 'bin/jori-send-curl')} --intent restart-report --evidence-as-of live "<sentence>". ` +
+    'State only what the log shows. Nothing else to do.';
+  const r = spawnSync(path.join(TOOLS, 'bin/job-run'), [
+    '--name', `restart-${target}`, '--tier', 'ops-light', '--requested-by', 'chat', '--notify-task', notify,
+    '--', process.execPath, __filename, 'restart', target, `--after-chat-turn=${turn}`,
+  ], { encoding: 'utf8', env });
+  const id = r.status === 0 ? ((r.stdout || '').match(/^started job (\S+)/m) || [])[1] : null;
+  if (!id) die(`restart: could not hand the ${target} restart to a background job (${((r.stderr || '') + (r.error ? r.error.message : '')).trim() || `job-run exit ${r.status}`}). Nothing was restarted: from inside this chat turn it would end the turn.`);
+  console.log(c.green(`✓ ${target === 'session' ? 'whole-session' : 'chat'} restart handed off`) + c.dim(` (background job ${id})`));
+  console.log(`  It starts when this chat turn ends, so reply now. Don't report it as done: a checked result is posted in the chat when it finishes (job-status ${id}).`);
+}
+
+// The job's own run: hold until the chat turn that asked has ended (its
+// dispatch is no longer in flight), at most 10 minutes.
+function waitForChatTurn(turnId) {
+  const url = `http://127.0.0.1:${portOf('chat_health')}/health`;
+  for (let i = 0; i < 300; i++) {
+    const h = fetchJson(url);
+    if (!h || !h.inFlight || (turnId !== 'any' && h.inFlight.id !== turnId)) {
+      if (i) console.log(c.dim('the chat turn has ended — restarting now'));
+      return;
+    }
+    if (!i) console.log(c.dim(`waiting for chat turn ${turnId} to end...`));
+    execFileSync('sleep', ['2']);
+  }
+  console.log(c.yellow('  the chat turn was still running after 10 minutes — restarting anyway'));
+}
+
+function restartOne(target, opts = {}) {
   const PM = `http://127.0.0.1:${portOf('process_manager')}/health`;
 
   // session: restart the whole stack. process-manager is booted by the
   // ai.claude.session LaunchAgent; kickstart -k kills + relaunches it, tearing
   // down and respawning every supervised child.
-  if (target === 'session' && process.platform !== 'darwin') {
-    // Linux: the systemd user unit jori setup installs (docs/installer.md § Linux).
-    const out = shSafe('systemctl --user restart jori.service 2>&1');
-    if (out === null) die('restart: systemctl --user restart jori.service failed. Is the unit installed? jori setup start');
-    console.log(c.green('✓ restarted jori.service. Wait ~30s, then: jori status'));
-    return;
-  }
   if (target === 'session') {
-    const uid = process.getuid();
-    // ai.jori.session (jori setup, docs/installer.md) or, on installations
-    // from before the rename, ai.claude.session — whichever is loaded.
-    const label = ['ai.jori.session', 'ai.claude.session'].find(l => (shSafe(`launchctl print gui/${uid}/${l} >/dev/null 2>&1 && echo y`) || '').trim() === 'y') || 'ai.jori.session';
-    console.log(c.dim(`kickstarting launchd ${label} — restarts process-manager + all supervised children...`));
-    const out = shSafe(`launchctl kickstart -k gui/${uid}/${label} 2>&1`);
-    if (out === null) die(`restart: launchctl kickstart failed. Try manually: launchctl kickstart -k gui/$(id -u)/${label}`);
-    console.log(c.green('✓ kickstart sent. Wait ~30s, then: jori status'));
+    const pmBefore = opts.verify ? fetchJson(PM) : null;
+    let sent;
+    if (process.platform !== 'darwin') {
+      // Linux: the systemd user unit jori setup installs (docs/installer.md § Linux).
+      const out = shSafe('systemctl --user restart jori.service 2>&1');
+      if (out === null) die('restart: systemctl --user restart jori.service failed. Is the unit installed? jori setup start');
+      sent = '✓ restarted jori.service.';
+    } else {
+      const uid = process.getuid();
+      // ai.jori.session (jori setup, docs/installer.md) or, on installations
+      // from before the rename, ai.claude.session — whichever is loaded.
+      const label = ['ai.jori.session', 'ai.claude.session'].find(l => (shSafe(`launchctl print gui/${uid}/${l} >/dev/null 2>&1 && echo y`) || '').trim() === 'y') || 'ai.jori.session';
+      console.log(c.dim(`kickstarting launchd ${label} — restarts process-manager + all supervised children...`));
+      const out = shSafe(`launchctl kickstart -k gui/${uid}/${label} 2>&1`);
+      if (out === null) die(`restart: launchctl kickstart failed. Try manually: launchctl kickstart -k gui/$(id -u)/${label}`);
+      sent = '✓ kickstart sent.';
+    }
+    if (!opts.verify) { console.log(c.green(`${sent} Wait ~30s, then: jori status`)); return; }
+    // A handed-off run reports what it checked: process-manager back under a
+    // new pid, and the chat supervisor answering again.
+    let pm = null;
+    for (let i = 0; i < 90 && !pm; i++) {
+      execFileSync('sleep', ['1']);
+      const h = fetchJson(PM);
+      if (h && h.pid && h.pid !== (pmBefore && pmBefore.pid)) pm = h;
+    }
+    if (!pm) { console.log(c.yellow('  session: process-manager did not come back under a new pid within 90s — check jori status')); process.exit(1); }
+    let chat = null;
+    for (let i = 0; i < 60 && !chat; i++) {
+      chat = fetchJson(`http://127.0.0.1:${portOf('chat_health')}/health`);
+      if (!chat) execFileSync('sleep', ['1']);
+    }
+    const pids = `process-manager pid ${pmBefore ? pmBefore.pid : '?'} → ${pm.pid}`;
+    if (!chat) { console.log(c.yellow(`  session: restarted (${pids}) but the chat supervisor was not answering after 60s — check jori status`)); process.exit(1); }
+    console.log(c.green('✓ session restarted') + c.dim(` (${pids}; chat supervisor up since ${chat.startedAt})`));
     return;
   }
 
@@ -1060,17 +1152,20 @@ function cmdRestart(args) {
       die(`restart: POST :${port}/restart returned ${code ? code.trim() : 'no response'}${hint} — check jori logs ${target}-supervisor`);
     }
     console.log(c.dim(`restart requested (HTTP ${code.trim()}) — waiting for the ${target} session to rotate...`));
+    // restartCount advances before the restart backoff, while the old child still
+    // runs; a handed-off run waits for the new one too, past the longest backoff.
+    const waitS = opts.verify ? 90 : 20;
     let after = null;
-    for (let i = 0; i < 20; i++) {
+    for (let i = 0; i < waitS; i++) {
       execFileSync('sleep', ['1']);
       const h = fetchJson(`http://127.0.0.1:${port}/health`);
-      if (h && (h.restartCount ?? 0) > oldCount && h.childAlive) { after = h; break; }
+      if (h && (h.restartCount ?? 0) > oldCount && h.childAlive && (!opts.verify || h.sessionStartedAt !== before.sessionStartedAt)) { after = h; break; }
     }
     if (!after) {
-      console.log(c.yellow(`  ${target}: POST accepted but restartCount didn't advance within 20s — check jori logs ${target}-supervisor`));
+      console.log(c.yellow(`  ${target}: POST accepted but ${opts.verify ? 'no new session started' : "restartCount didn't advance"} within ${waitS}s — check jori logs ${target}-supervisor`));
       process.exit(1);
     }
-    console.log(c.green(`✓ ${target} supervisor restarted`) + c.dim(` (session ${after.sessionId} resumed; restartCount ${oldCount}→${after.restartCount}; agents.json re-read).`));
+    console.log(c.green(`✓ ${target} supervisor restarted`) + c.dim(` (session ${after.sessionId} resumed${opts.verify ? ` at ${after.sessionStartedAt}` : ''}; restartCount ${oldCount}→${after.restartCount}; agents.json re-read).`));
     return;
   }
 
@@ -2770,6 +2865,20 @@ function cmdHumInsight(args) {
   }
 
   const silentRate = bucket.silent / total;
+  // Bands for the event-driven cadence (re-baselined 2026-11-08). A run row is a dispatch, a moment that
+  // already cleared the gate, so the old ">= 0.85 silent" (written for ~72 empty ticks a day) read FAIL
+  // every week. Observed weekly silent rate since 2026-10-12: 0.50-0.67. The surface band is the one
+  // bin/hum-metrics-collect alerts on (SURFACE_RATE_LOW/HIGH). Chatter is judged with signal_per_surfaced,
+  // listed below, never by volume alone.
+  const SILENT_BAND = [0.45, 0.90], SURFACE_BAND = [0.05, 0.55];
+  const surfaceRate = bucket.info / total;
+  const inBand = (v, b) => v >= b[0] && v <= b[1];
+  let signalPerSurfaced7d = null;
+  try {
+    const daily = JSON.parse(fs.readFileSync(path.join(ROOT, 'data', 'hum-metrics-state.json'), 'utf8')).daily || [];
+    const vals = daily.slice(-7).map((d) => d.signal_per_surfaced).filter((v) => typeof v === 'number');
+    if (vals.length) signalPerSurfaced7d = vals.sort((a, b) => a - b)[Math.floor(vals.length / 2)];
+  } catch {}
   const reactedCount = feedback.filter((f) => f.reaction).length;
   const positive = feedback.filter((f) => ['helpful', 'more', '👍'].includes(f.reaction)).length;
   const negative = feedback.filter((f) => ['skip', 'snooze', '👎', '💤'].includes(f.reaction)).length;
@@ -2787,10 +2896,13 @@ function cmdHumInsight(args) {
     .filter((m) => Number.isFinite(m) && m >= 0)
     .sort((a, b) => a - b);
   const medianAnswerMin = answerMins.length ? answerMins[Math.floor(answerMins.length / 2)] : null;
+  // A repeat is a subject the user was actually told or asked about twice. A tick whose pick was
+  // blocked or not delivered (outcome.sent false) is a retry, not a second ask (2026-11-08: 4 of the
+  // week's 6 "repeats" were undelivered picks retried on the next tick).
   const subjectTicks = {};
   for (const r of runs) {
     const subj = r.sonnet?.subject;
-    if (subj && (r.sonnet?.decision === 'info' || r.sonnet?.decision === 'question')) subjectTicks[subj] = (subjectTicks[subj] || 0) + 1;
+    if (subj && r.outcome?.sent === true && (r.sonnet?.decision === 'info' || r.sonnet?.decision === 'question')) subjectTicks[subj] = (subjectTicks[subj] || 0) + 1;
   }
   const dupSubjects = Object.entries(subjectTicks).filter(([, n]) => n > 1).map(([k, n]) => ({ subject: k, ticks: n }));
   const perTopicAttempts = {};
@@ -2803,11 +2915,15 @@ function cmdHumInsight(args) {
   const worstErr = errRates.sort((a, b) => b.rate - a.rate)[0] || null;
   const grade = (value, ok) => (value == null ? 'N/A' : ok ? 'PASS' : 'FAIL');
   const criteria = [
-    { criterion: 'Silent rate', value: silentRate, target: '>= 0.85', status: grade(silentRate, silentRate >= 0.85) },
+    { criterion: 'Silent rate (of dispatches)', value: silentRate, target: `${SILENT_BAND[0]} - ${SILENT_BAND[1]}`, status: grade(silentRate, inBand(silentRate, SILENT_BAND)) },
+    { criterion: 'Surface rate (info / dispatches)', value: surfaceRate, target: `${SURFACE_BAND[0]} - ${SURFACE_BAND[1]}`, status: grade(surfaceRate, inBand(surfaceRate, SURFACE_BAND)) },
+    { criterion: 'Signal per surfaced (7-day median)', value: signalPerSurfaced7d, target: '> 0', status: grade(signalPerSurfaced7d, signalPerSurfaced7d > 0), note: 'pairs with the two rates above: a rate outside its band only counts as chatter when this is not positive' },
     { criterion: 'Info positive rate', value: (positive + negative) ? positiveRate : null, target: '>= 0.60', status: grade((positive + negative) ? positiveRate : null, positiveRate >= 0.60) },
     { criterion: 'Info response rate', value: feedback.length ? responseRate : null, target: '>= 0.30', status: grade(feedback.length ? responseRate : null, responseRate >= 0.30) },
     { criterion: 'Question answer rate', value: bucket.question ? answerRate : null, target: '>= 0.40', status: grade(bucket.question ? answerRate : null, answerRate >= 0.40) },
-    { criterion: 'Median time-to-answer (min)', value: medianAnswerMin, target: '<= 30', status: grade(medianAnswerMin, medianAnswerMin <= 30) },
+    // Report only (2026-11-08): questions go to a channel that does not interrupt, so how fast one is answered is
+    // the user's choice, not a fault, and it no longer decides when a question is sent.
+    { criterion: 'Median time-to-answer (min)', value: medianAnswerMin, target: 'none (reported only)', status: medianAnswerMin == null ? 'N/A' : 'INFO' },
     { criterion: 'Subject dedup', value: dupSubjects.length, detail: dupSubjects, target: '= 0', status: grade(dupSubjects.length, dupSubjects.length === 0) },
     { criterion: 'Harvester error rate (worst topic)', value: worstErr ? worstErr.rate : 0, detail: errRates, target: '<= 0.10', status: grade(0, !worstErr || worstErr.rate <= 0.10) },
     { criterion: 'Memory growth', value: learnings.length, target: '>= 3 per week', status: 'MODEL', note: `hum-learnings rows only (${learnings.length}); add wiki pages updated in-window` },
@@ -2831,7 +2947,7 @@ function cmdHumInsight(args) {
 
   console.log(c.bold(`Hum insight — last ${sinceDays}d`) + '\n');
   console.log(`  ticks:           ${total}`);
-  console.log(`  silent:          ${bucket.silent}  (${(silentRate * 100).toFixed(1)}%)  ${silentRate >= 0.85 ? c.green('✓ intent') : c.yellow('below 0.85')}`);
+  console.log(`  silent:          ${bucket.silent}  (${(silentRate * 100).toFixed(1)}%)  ${inBand(silentRate, SILENT_BAND) ? c.green('✓ intent') : c.yellow(`outside ${SILENT_BAND[0]}-${SILENT_BAND[1]}`)}`);
   console.log(`  info:            ${bucket.info} (sent ${sent}, downgraded ${downgrades})`);
   console.log(`  question:        ${bucket.question}  (answered ${learnings.length}, rate ${(answerRate * 100).toFixed(0)}%)  ${answerRate >= 0.4 ? c.green('✓ intent') : c.yellow('below 0.40')}`);
   if (bucket.error) console.log(`  ${c.red('error:          ' + bucket.error)}`);

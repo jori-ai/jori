@@ -607,6 +607,12 @@ def valhalla_route_points(pts, costing):
                 runs.append(dict(coords=[[round(c[0], 6), round(c[1], 6)] for c in coords],
                                  t0=a["t"], t1=b["t"], hole=hole, m=round(lm)))
             for m in leg.get("maneuvers", []):
+                # A maneuver follows one road, and its street_names are that road's
+                # names: a numbered avenue and its official name both came back, and
+                # the line read "along <avenue> and <its other name>", one road
+                # twice. The road's first name stands for it.
+                # JORI_STREET_ALL_NAMES=1 keeps every name, as before.
+                every = os.environ.get("JORI_STREET_ALL_NAMES") == "1"
                 for n in m.get("street_names", []) or []:
                     # A bare road number ("3350") is not a street a person reads;
                     # it printed as "Walked 0.3 miles along <street> and 3350".
@@ -614,6 +620,8 @@ def valhalla_route_points(pts, costing):
                         continue
                     if not names or names[-1] != n:
                         names.append(n)
+                    if not every:
+                        break
     # ordered, consecutive-deduped, then globally deduped keeping first sighting
     seen, ordered = set(), []
     for n in names:

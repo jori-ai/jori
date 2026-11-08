@@ -93,6 +93,32 @@
   .door.life .k, .door.life .go { color:var(--life); border-color:var(--life); }
   .door.work { background:var(--work-tint); }
   .door.work .k, .door.work .go { color:var(--work); border-color:var(--work); }
+  section.install, section.plugins { padding:56px 0; border-top:1px solid var(--line); }
+  section.install h2, section.plugins h2 { font-family:Fraunces, Georgia, serif; font-weight:600; font-size:clamp(32px, 5vw, 48px); line-height:1.05; }
+  section.install .sub, section.plugins .sub { color:var(--muted); margin:12px 0 28px; max-width:660px; }
+  .term { display:flex; align-items:center; gap:12px; background:var(--ink); color:var(--bg); border-radius:14px; padding:16px 18px; max-width:760px; }
+  .term code { flex:1; min-width:0; overflow-x:auto; white-space:pre; font-size:15px; }
+  .term.block { display:block; max-width:none; }
+  .term.block code { display:block; font-size:13.5px; line-height:1.7; }
+  .term .c { opacity:.55; }
+  .copy { flex:none; background:transparent; color:var(--bg); border:1px solid currentColor; border-radius:999px; padding:5px 14px; font:500 13px Inter, system-ui, sans-serif; cursor:pointer; opacity:.85; }
+  .copy:hover { opacity:1; }
+  .alt { display:grid; grid-template-columns:repeat(3, 1fr); gap:20px; margin:24px 0 8px; max-width:900px; }
+  .alt .k { font-size:13px; letter-spacing:.08em; text-transform:uppercase; color:var(--accent); margin-bottom:6px; }
+  .alt p { color:var(--muted); font-size:15px; }
+  .alt a { color:var(--ink); }
+  .steps { list-style:none; padding:0; counter-reset:s; display:grid; grid-template-columns:repeat(5, 1fr); gap:16px; margin:32px 0 8px; }
+  .steps li { counter-increment:s; background:var(--us); border-radius:14px; padding:18px; font-size:14.5px; color:var(--muted); }
+  .steps li::before { content:counter(s); display:block; font-family:Fraunces, Georgia, serif; font-weight:600; font-size:28px; line-height:1; color:var(--accent); margin-bottom:10px; }
+  .steps strong { color:var(--ink); font-weight:600; display:block; }
+  section.install .note a { color:var(--muted); }
+  .plug-grid { display:grid; grid-template-columns:1.4fr 1fr; gap:28px; align-items:start; }
+  .chips { list-style:none; padding:0; display:grid; grid-template-columns:1fr 1fr; gap:10px; }
+  .chips li { background:var(--us); border-radius:12px; padding:12px 14px; font-size:13.5px; color:var(--muted); line-height:1.4; }
+  .chips b { display:block; color:var(--ink); font-weight:600; font-size:14.5px; margin-bottom:2px; }
+  .plug-side p { color:var(--muted); font-size:15px; margin-top:14px; }
+  @media (max-width:900px) { .steps { grid-template-columns:1fr 1fr; } .plug-grid { grid-template-columns:1fr; } }
+  @media (max-width:560px) { .alt, .steps, .chips { grid-template-columns:1fr; } .term code { font-size:13px; } }
 </style>
 </head>
 <body>
@@ -102,6 +128,10 @@
     <div class="tag">Open source</div>
     <h1>Meet Jori.<br>AI for <em class="life">life</em> and <em class="work">work</em>.</h1>
     <p class="lede">One assistant that stays on and takes care of the details, day and night. <strong>It's private and secure by design, so what it learns stays yours.</strong> And it's yours to shape, until it works exactly the way you do. All on the Claude subscription you already have.</p>
+    <div class="ctas">
+      <a class="btn" href="#install">Install Jori</a>
+      <a class="link" href="#plugins">Every feature is a plugin →</a>
+    </div>
   </header>
 
   <div class="doors">
@@ -134,11 +164,70 @@
     </div>
   </div>
 
+  <section class="install" id="install">
+    <h2>Running in two minutes.</h2>
+    <p class="sub">One line in Terminal. It installs whatever is missing, puts Jori on your Mac and opens a setup page in your browser.</p>
+    <div class="term"><code id="install-cmd">curl -fsSL https://getjori.ai/install.sh | bash</code><button type="button" class="copy" data-copy="install-cmd">Copy</button></div>
+    <div class="alt">
+      <div><div class="k">Mac app</div><p><a href="https://github.com/jori-ai/jori/releases/latest/download/Jori.dmg">Download Jori.dmg</a>, drag it to Applications and open it. It installs Jori, then lives in your menu bar.</p></div>
+      <div><div class="k">Homebrew</div><p><code>brew trust jori-ai/tap</code><br><code>brew install jori-ai/tap/jori</code><br>then <code>jori setup</code></p></div>
+      <div><div class="k">npm</div><p><code>npm create jori</code></p></div>
+    </div>
+    <ol class="steps">
+      <li><strong>Your Mac.</strong> Checks what Jori needs and installs what's missing.</li>
+      <li><strong>Claude.</strong> Sign in with the Claude subscription you already have.</li>
+      <li><strong>About you.</strong> Your name, email, city and time zone, filled in from this Mac. Fix what's wrong.</li>
+      <li><strong>Keep it running.</strong> One button. Jori starts now, at every login and after a crash, with a few starter jobs on.</li>
+      <li><strong>Reach you.</strong> Connect the Jori app, iMessage, WhatsApp, Slack or Gmail.</li>
+    </ol>
+    <p class="note">On a Mac mini or a VM, run the same line over SSH. Setup gives you a link to open from your own computer, over Tailscale or an SSH tunnel, and checks that the machine stays on by itself: automatic login, no sleep, back up after a power cut. Linux VMs work too, minus the Mac-only features. <code>jori update</code> keeps it current. <a href="/install.sh">Read the script</a> before you run it.</p>
+  </section>
+
+  <section class="plugins" id="plugins">
+    <h2>Every feature is a plugin.</h2>
+    <p class="sub">The core is small: memory, chat, the scheduler and the safety rails. Everything Jori does on top of that is a plugin you turn on, turn off or remove. Turn one off and everything it runs stops. Remove it and nothing else breaks.</p>
+    <div class="plug-grid">
+      <ul class="chips">
+        <li><b>Morning digest</b>Calendar, tasks, weather and headlines</li>
+        <li><b>Flights</b>Trips scanned, fares watched</li>
+        <li><b>Finance</b>Read-only bank and card sync, net worth</li>
+        <li><b>Purchases</b>Buy anything, approved with Face ID</li>
+        <li><b>Memory upkeep</b>Long-term memory kept healthy</li>
+        <li><b>Day, week, month</b>The story of your days, written for you</li>
+        <li><b>Photos</b>The day's photos read into memory</li>
+        <li><b>Call log</b>A summary and next steps for every call</li>
+        <li><b>Newsletter digest</b>One digest of what's worth reading</li>
+        <li><b>Watchlist</b>Shows and movies you'll like, and where</li>
+        <li><b>Weekend picks</b>Friday ideas for the weekend</li>
+        <li><b>Comedy club watch</b>Your comedians, in small rooms</li>
+        <li><b>Home devices</b>What's offline, before you notice</li>
+        <li><b>Security watch</b>Breaches and exposures, weekly</li>
+        <li><b>Exercise</b>Workouts planned around your calendar</li>
+        <li><b>Sleep</b>A nightly sleep summary</li>
+        <li><b>Rain on your walks</b>A heads-up before rain meets your walk</li>
+        <li><b>Builds from chat</b>"Build me X", built and tested</li>
+      </ul>
+      <div class="plug-side">
+        <div class="term block"><code><span class="c"># see what's on</span>
+jori plugin list
+jori plugin enable flights
+jori plugin disable sleep
+
+<span class="c"># write your own</span>
+jori plugin new tide-alert --schedule "0 7 * * *"
+jori plugin install https://github.com/you/your-plugin</code></div>
+        <p>Or flip them on the control room's Plugins page.</p>
+        <p>A plugin is one folder: a <code>plugin.json</code> that declares its commands, schedules, settings and the keys it needs, playbooks in plain Markdown, and its tests. Keep yours private in your own folder or share it as a git repo. Nothing outside a plugin points into it, and <code>jori plugin check</code> keeps it that way.</p>
+      </div>
+    </div>
+  </section>
+
   <footer>
     <span>© 2026 Jori</span>
     <a href="https://github.com/jori-ai/jori">github.com/jori-ai/jori</a>
   </footer>
 </div>
 <script src="https://ask.silo.co/embed.js" data-site="jori" async></script><!-- kernel-guard-ok: getjori.ai website chat widget, hosted by the project owner's Site Chat service -->
+<script>document.querySelectorAll('.copy').forEach(b=>b.addEventListener('click',()=>{const t=document.getElementById(b.dataset.copy).textContent;navigator.clipboard.writeText(t).then(()=>{b.textContent='Copied';setTimeout(()=>b.textContent='Copy',1600)}).catch(()=>{})}));</script>
 </body>
 </html>
