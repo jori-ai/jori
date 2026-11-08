@@ -268,7 +268,7 @@ async function main() {
   // county tax a person filed under taxes, the landscaper a person filed under
   // repairs. The books' own guesses are not read.
   const bookCategories = reg ? ledger.answeredCategoriesForBankRows({ ledgerRows: ledgerTxns, registry: reg }) : new Map();
-  const cls = classify(posted, accounts, { overrides, expectedIncome, bookVerdicts, bookCategories, bookCategoryKinds: RF.book_category_kinds || {}, depositAccountIds, largeOutflow: map.large_outflow_usd || LARGE_OUTFLOW, known, ownInstitutions: [...new Set((accounts || []).map((a) => a.institution_name).filter(Boolean))], ownTransferPhrases: map.own_transfer_phrases || [], taxPayeePhrases: FR.tax_payee_phrases, taxProperties: FR.tax_property_rules });
+  const cls = classify(posted, accounts, { pending: (txns || []).filter((t) => t.pending), overrides, expectedIncome, bookVerdicts, bookCategories, bookCategoryKinds: RF.book_category_kinds || {}, depositAccountIds, largeOutflow: map.large_outflow_usd || LARGE_OUTFLOW, known, ownInstitutions: [...new Set((accounts || []).map((a) => a.institution_name).filter(Boolean))], ownTransferPhrases: map.own_transfer_phrases || [], taxPayeePhrases: FR.tax_payee_phrases, taxProperties: FR.tax_property_rules });
   const kindOf = (t) => cls.get(t.transaction_id)?.kind;
   const out = (t) => Number(t.amount) > 0;
   const amt = (t) => Math.abs(Number(t.amount));

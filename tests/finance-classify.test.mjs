@@ -416,3 +416,11 @@ test("payroll paid as one net amount and received per person is a transfer betwe
   assert.equal(c.get("p2").kind, "internal_transfer");
   assert.notEqual(c.get("rent").kind, "internal_transfer"); // another payer is never part of the set
 });
+
+test("a split pair matches pending credits too (payroll lands a day later, pending first)", () => {
+  const c = classify([t("net", "biz", 100, "2026-11-06", { name: "PAYROLLCO DES:NET", pri: "TRANSFER_OUT" })], accounts, {
+    pending: [{ ...t("q1", "chk", -60, "2026-11-07", { name: "ACH CREDIT Acme LLC PAYROLL" }), pending: true }, { ...t("q2", "chk", -40, "2026-11-07", { name: "ACH CREDIT Acme LLC PAYROLL" }), pending: true }],
+  });
+  assert.equal(c.get("net").kind, "internal_transfer");
+  assert.equal(c.has("q1"), false);
+});
