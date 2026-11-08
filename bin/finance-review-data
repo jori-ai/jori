@@ -532,16 +532,52 @@ async function main() {
   }
 
   // ── 11. COMMINGLING (both directions) ───────────────────────────────────
+  // Plaid's category only picks the candidates (it calls pool supplies and
+  // health insurance "general merchandise"). Whether a charge is commingled
+  // is what the books say about it:
+  //   - filed (a person's category, a review, the books' own rule or an
+  //     earlier decision; or the business books' entity) → settled, no line,
+  //     unless the books put it with a different owner than the account's;
+  //   - excluded from the books by a person → a personal charge: nothing to do
+  //     on a property account (the books already leave it out); on the
+  //     business account, the to-do is to repay it;
+  //   - not filed → one question in the Questions tab, never a vague flag
+  //     (the user, 2026-11-08: "either fix directly, ask me questions, or tell
+  //     me what to do").
   const leakage = [];
+  const ledgerRowOf = new Map((ledgerTxns || []).map((x) => [String(x.id).replace(/^plaid:/, ""), x]));
+  const ownerGroup = (pid) => { const pr = pid && reg?.propertyById?.get(pid); return pr ? (KIND_TO_GROUP[pr.kind] || null) : null; };
+  const repayBusiness = [];
   for (const t of wk.filter((t) => out(t) && kindOf(t) === "expense")) {
     const g = gAt(t);
-    if ((g.group === "property" || g.group === "business") && PERSONAL_CATS.has(t.category_primary) && amt(t) >= 50) {
-      leakage.push({ account: label(t.account_id), who: who(t), amount_fmt: usd(amt(t)), plaid_category: t.category_primary, direction: "personal-category charge on a property/business account" });
-    } else if (g.group === "personal" && PROPERTY_CATS.has(t.category_primary) && amt(t) >= 100) {
-      leakage.push({ account: label(t.account_id), who: who(t), amount_fmt: usd(amt(t)), plaid_category: t.category_primary, direction: "property-category charge on a personal account" });
+    const candidate = ((g.group === "property" || g.group === "business") && PERSONAL_CATS.has(t.category_primary) && amt(t) >= 50)
+      || (g.group === "personal" && PROPERTY_CATS.has(t.category_primary) && amt(t) >= 100);
+    if (!candidate) continue;
+    const lt = ledgerRowOf.get(t.transaction_id);
+    const filed = bookCategories.get(t.transaction_id);
+    const ent = lt?.entity || null;
+    const entSettled = ent && (ent.override?.entityId || (["precedent", "rule"].includes(ent.classification?.method) && Number(ent.classification?.confidence) >= 1));
+    const row = { account: label(t.account_id), who: who(t), amount_fmt: usd(amt(t)), date_fmt: fmtD(t.date), plaid_category: t.category_primary };
+    if (lt?.override?.ignored) {
+      const by = String(lt.override.updatedBy || "").split("@")[0].split(".")[0];
+      leakage.push({ ...row, direction: `excluded from the books${by ? ` by ${by}` : ""} (personal)` });
+      if (g.group === "business") repayBusiness.push({ t, by });
+      continue;
     }
+    if (filed || entSettled) {
+      const owner = filed ? ownerGroup(filed.property_id) : (ent.override?.entityId || ent.classification?.entityId) === "business" ? "business" : "personal";
+      if (owner && owner !== g.group && !(owner === "property" && g.group === "property")) {
+        leakage.push({ ...row, direction: `filed to ${owner} in the books, paid from a ${g.group} account` });
+        flag(50, "leakage", `${who(t)} ${usd(amt(t))} (${fmtD(t.date)}) was paid from ${label(t.account_id)} (${g.group}) but the books file it as ${owner}.`, `Move ${usd(amt(t))} to ${label(t.account_id)} from the ${owner} account that should have paid it.`);
+      }
+      continue;
+    }
+    ask(`owner:${t.transaction_id}`, `${who(t)} ${usd(amt(t))} on ${fmtD(t.date)} was paid from ${label(t.account_id)}: was it for ${g.propertyName || g.group}, or personal?`,
+      "File it in the hub (Financials → Transactions): pick its category, or exclude it as personal.");
   }
-  if (leakage.length) flag(50, "leakage", `${leakage.length} charge(s) this week are in a Plaid category that does not match the account's owner (listed under Spending).`);
+  for (const { t, by } of repayBusiness) {
+    flag(55, "leakage", `${who(t)} ${usd(amt(t))} (${fmtD(t.date)}) on ${label(t.account_id)} was excluded from the business books${by ? ` by ${by}` : ""} as personal.`, `Repay ${usd(amt(t))} to ${label(t.account_id)} from a personal account.`);
+  }
   const incomeInPersonal = wk.filter((t) => !out(t) && acct(t.account_id).type === "depository" && ["personal", "business"].includes(gAt(t).group)
     && /airbnb|booking\.com|vrbo|expedia|homeaway/i.test(`${t.merchant_name || ""} ${t.name || ""}`))
     .map((t) => ({ date_fmt: fmtD(t.date), amount_fmt: usd(amt(t)), account: label(t.account_id), who: who(t) }));
