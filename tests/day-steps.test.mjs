@@ -272,3 +272,56 @@ test("annotating a day twice gives the same counts as once", () => {
   annotateDaySteps(d, rs, 9000, { startMs: at(0), endMs: at(24) });
   assert.equal(JSON.stringify(d.path.spine), once);
 });
+
+// 2026-11-07: home to the coffee stop. The spine joined the two stops with no leg (the
+// phone took no fix on the hop), the steps ran 7:48-8:04, and the phone's first rest at
+// the venue began 7:52. The line printed the walk under the venue from before it began.
+function hopDay() {
+  return {
+    date: "2026-03-02", tz: day().tz,
+    stops: [
+      { id: "h", start: "00:00", end: "07:48", start_ts_ms: at(0), end_ts_ms: at(7, 48), duration_min: 468, place: { name: "Home" } },
+      { id: "v", start: "07:52", end: "09:43", start_ts_ms: at(7, 52), end_ts_ms: at(9, 43), duration_min: 111, place: { name: "Cafe" } },
+    ],
+    travel_legs: [{ from: "h", to: "v", duration_min: 4 }],
+    path: { spine: [
+      { type: "dwell", id: "d0", start_ms: at(0), end_ms: at(7, 52), start: "00:00", end: "07:52", mins: 472, place: { name: "Home" } },
+      { type: "dwell", id: "d1", start_ms: at(7, 52), end_ms: at(9, 43), start: "07:52", end: "09:43", mins: 111, place: { name: "Cafe" } },
+    ] },
+  };
+}
+const hopSteps = () => [...readings(at(0, 5), at(0, 10), 2), ...readings(at(7, 48), at(8, 4), 77), ...readings(at(23, 50), at(23, 55), 2)];
+
+test("a walk from one stop's end into the next stop's first minutes, with no leg between them, starts that stop at the last stride", () => {
+  const d = hopDay();
+  const st = annotateDaySteps(d, hopSteps(), null, { startMs: at(0), endMs: at(24) });
+  assert.equal(d.stops[1].start, "08:04");
+  assert.equal(d.stops[1].start_ts_ms, at(8, 4));
+  assert.equal(d.stops[1].duration_min, 99);
+  assert.equal(d.path.spine[1].start, "08:04");
+  assert.equal(d.travel_legs[0].duration_min, 16);
+  assert.deepEqual(st.stops_aligned.map(m => [m.stop_id, m.edge]), [["v", "start"]]);
+  assert.equal(st.walks[0].kind, "between", "the walk is the way there, not a walk inside the venue");
+});
+
+test("a hop walk that does not begin as the first stop ends, or leaves the next stop too little, moves nothing", () => {
+  const early = hopDay();
+  annotateDaySteps(early, [...readings(at(0, 5), at(0, 10), 2), ...readings(at(7, 30), at(8, 4), 77)], null, { startMs: at(0), endMs: at(24) });
+  assert.equal(early.stops[1].start_ts_ms, at(7, 52), "begins 18 min before the first stop ends: not its walk");
+  const brief = hopDay();
+  brief.stops[1].end_ts_ms = at(8, 6); brief.stops[1].end = "08:06"; brief.stops[1].duration_min = 14;
+  annotateDaySteps(brief, hopSteps(), null, { startMs: at(0), endMs: at(24) });
+  assert.equal(brief.stops[1].start_ts_ms, at(7, 52), "would leave the stop 2 minutes");
+});
+
+test("a walk with a leg under it is left to the leg's rule, and JORI_STEPS_ALIGN_HOPS=0 leaves the hop as the phone saw it", () => {
+  const off = hopDay();
+  process.env.JORI_STEPS_ALIGN_HOPS = "0";
+  try { annotateDaySteps(off, hopSteps(), null, { startMs: at(0), endMs: at(24) }); }
+  finally { delete process.env.JORI_STEPS_ALIGN_HOPS; }
+  assert.equal(off.stops[1].start_ts_ms, at(7, 52));
+  const withLeg = hopDay();
+  withLeg.path.spine.splice(1, 0, { type: "leg", id: "l0", mode: "riding", start_ms: at(7, 50), end_ms: at(7, 52), mins: 2 });
+  annotateDaySteps(withLeg, hopSteps(), null, { startMs: at(0), endMs: at(24) });
+  assert.equal(withLeg.stops[1].start_ts_ms, at(7, 52), "a leg of another mode under the walk: not a bare hop");
+});
