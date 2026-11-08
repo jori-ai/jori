@@ -121,6 +121,11 @@ a renewal needs nothing unless the user wants it gone. Do not write one.
 
 ## Step 2 — Write the summary (optional, verified)
 
+**Skip this step.** Since 2026-11-08 the email shows no summary: every item
+appears once, in "Worth your attention", and a summary can only restate one
+(the user: "it should be in one location, and one location only"). Compose
+still accepts `--summary` and verifies it, but the renderer does not print it.
+
 Read `facts[]` in the packet (`id` + `text`; the `a…` ids are the attention
 flags in priority order). Write **at most 3 sentences** about what matters most
 this week, as JSON:
