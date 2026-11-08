@@ -4,12 +4,14 @@ The spa is configured in `agent/local/config/spa.json` (`server_url`, `lat` / `l
 
 ## Purpose
 
-Jori and the companion app both quote "time until the spa is ready". That
-number comes from a flat **minutes per °F** fallback in SpaServer
-(`HEATING_DEGREES_PER_MINUTE`, reported as `current_fallback` in the packet),
-which is a placeholder, not a measurement: two constants in SpaServer once
-disagreed by more than 3×, and nothing had recorded enough data to say which
-was closer.
+Jori and the companion app both quote "time until the spa is ready". SpaServer
+(`estimate_minutes_to`) answers from, in order: a live rate measured in the
+current session; the **fitted line** (`HEATING_FIT_A` / `HEATING_FIT_B`, recorded
+as `served_formula` in the packet), driven by the air temperature; and a flat
+**minutes per °F** fallback (`HEATING_DEGREES_PER_MINUTE`, reported as
+`current_fallback`) only when there is no usable air reading. The flat figure
+began as a placeholder: two constants in SpaServer once disagreed by more than 3×,
+and nothing had recorded enough data to say which was closer.
 
 A flat constant cannot be right, because heating rate is not constant. The heater
 delivers roughly fixed power, so the rate is governed by how fast the water sheds
@@ -21,8 +23,8 @@ dT/dt  =  a  -  b * (T_water - T_air)
 
 That is why the two constants could both seem defensible — they were each right
 for different weather. This job fits `a` and `b` from real sessions and reports
-where the estimate stands, so the fallback can eventually be replaced by a
-formula. Target horizon is about a year, reassessed every 30 days.
+where the estimate stands, so the line SpaServer serves can be kept honest.
+Target horizon is about a year, reassessed every 30 days.
 
 Output goes to the user. Nothing is changed automatically — see Guardrails.
 
@@ -131,9 +133,12 @@ Key fields:
 
 Write a short analysis covering:
 
-1. **Where the estimate stands.** Observed median min/°F versus the
-   `current_fallback` in use (skip the comparison when it is null). If they differ materially, say so plainly and quantify what
-   it means for a typical warm-up.
+1. **Where the estimate stands.** Observed median min/°F versus what SpaServer
+   quotes: the `served_formula` (compare it to the new `model`: if `a` and `b`
+   have moved, say by how much and what that does to a typical 82→101 °F
+   warm-up) and the `current_fallback` (skip either comparison when it is null).
+   If they differ materially, say so plainly and quantify what it means for a
+   typical warm-up.
 2. **Whether the model is usable yet.** `model_ready` false means report progress
    and stop — do not present a fitted line as actionable.
 3. **Coverage, not just fit.** A high R² over a narrow `ambient_range` is
@@ -197,7 +202,8 @@ Write `data/spa-heating-model-state.json`:
   "model": { "a": 0.31, "b": -0.004, "r2": 0.71 },
   "model_ready": false,
   "ambient_span_f": 12.4,
-  "recommended_fallback_min_per_degree": null
+  "recommended_fallback_min_per_degree": null,
+  "served_formula": { "a": 0.29, "b": -0.0022, "since": "2026-11-08" }
 }
 ```
 
@@ -220,8 +226,12 @@ contains no personal data.
   into `model` or `model_wind`. Don't re-raise this without a fresh ask.
 - **Read-only on the spa.** This job never starts, stops or otherwise touches the
   spa. It reads Postgres and sends one email.
-- **Never edits `HEATING_DEGREES_PER_MINUTE`.** Changing the constant that quotes
-  ETAs is the user's call. Recommend, with the evidence; never apply.
+- **Never changes what SpaServer quotes on its own.** The ETA constants and
+  fitted coefficients (`HEATING_DEGREES_PER_MINUTE`, `HEATING_FIT_A`,
+  `HEATING_FIT_B` in SpaServer's `src/config.py`) change only on the user's word.
+  Recommend, with the evidence; apply only when they say to, then update
+  `served_formula` / `fallback_f_per_min` in `spa.json` to match. An earlier
+  go-ahead does not cover a later refit.
 - **Never presents a fit as settled science before the data supports it.** Report
   `model_ready: false` plainly rather than dressing up a thin fit.
 - **Silent on empty.** The trigger script exits before dispatch below 3 usable
