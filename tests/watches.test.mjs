@@ -238,6 +238,13 @@ test("tracking: every step lands in watch_events and the scorecard reads it back
   assert.equal(s.firings.median_late_min, 0);
 });
 
+test("fire_any_time: only an explicit true lets firings out of the awake window", () => {
+  assert.equal(W.fireAnyTime({ fire_any_time: true }), true);
+  assert.equal(W.fireAnyTime({ fire_any_time: "yes" }), false);
+  assert.equal(W.fireAnyTime({}), false);
+  assert.equal(W.fireAnyTime(null), false);
+});
+
 test("quiet hours: next awake moment is 08:00 local", () => {
   assert.equal(new Date(W.nextAwake(Date.parse("2026-10-27T07:00:00Z"), "America/New_York")).toISOString(), "2026-10-27T12:00:00.000Z");
   assert.equal(new Date(W.nextAwake(Date.parse("2026-10-28T03:30:00Z"), "America/New_York")).toISOString(), "2026-10-28T12:00:00.000Z");

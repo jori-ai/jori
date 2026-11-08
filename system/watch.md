@@ -65,7 +65,7 @@ New sources: spool an event with `spoolEvents()` (`{type, subject_key, summary, 
 
 ## Firing
 
-- Only inside **08:00–21:59 local** (`AWAKE`). A match at 03:00 is held and fires at 08:00; nothing is dropped for timing.
+- By default only inside **08:00–21:59 local** (`AWAKE`, `quiet-hours.json`). A match at 03:00 is held and fires at 08:00; nothing is dropped for timing. An installation that sets `fire_any_time: true` in `agent/local/config/watches.json` fires at any hour (asking about an unclear match still waits for the awake window).
 - **notify** → `jori-send-curl --intent watch:<id> --evidence-as-of live` on chat; the precheck stays on. The message is the rule's `notify` text plus one line naming what set it off. A failed send is retried next tick (the match stays unfired).
 - **task** → `gog tasks add @default`.
 - **agent** → a `task` POST to ops-light (job-routing `watch-action`) that points at `jobs/watch-action.md` and carries the watch, its memory pages, the trigger and the instruction. Use it when the action needs judgment or tools beyond a reminder.
