@@ -358,3 +358,70 @@ test("a stop's edge is not moved past a photo taken at the stop", () => {
   assert.equal(d.stops[1].start_ts_ms, at(17, 50), "the venue's 17:52 photo keeps its start");
   assert.equal(d.stops[0].end_ts_ms, at(17, 27), "the home stop, with no photo after, still ends at the first stride");
 });
+
+// A walk line counts the steps in the minutes it prints. Its legs' own counts leave out
+// a pass the email does not draw (a visit row the phone wrote on the way), whose minutes
+// are in the line's time: a 14-minute walk printed the 4 minutes its two legs held, the
+// walk the steps found running on past both stops' edges.
+function passDay() {
+  const s = (h, m, sec = 0) => at(h, m) + sec * 1000;
+  return {
+    date: "2026-03-02", tz: "America/New_York",
+    stops: [
+      { id: "c", start: "08:04", end: "09:43", start_ts_ms: at(8, 4), end_ts_ms: at(9, 43), duration_min: 99, place: { name: "Cafe" } },
+      { id: "h", start: "09:48", end: "09:53", start_ts_ms: at(9, 48), end_ts_ms: at(9, 53), duration_min: 5,
+        place: { name: "Home", source: "user_confirmed" } },
+      { id: "m", start: "10:06", end: "11:13", start_ts_ms: s(10, 6, 47), end_ts_ms: at(11, 13), duration_min: 66,
+        place: { name: "Market" }, photos: [{ ts: new Date(at(10, 10)).toISOString() }] },
+    ],
+    path: { spine: [
+      { type: "dwell", id: "dc", start_ms: at(8, 4), end_ms: at(9, 43), place: { name: "Cafe" } },
+      { type: "leg", id: "l0", mode: "walking", start_ms: at(9, 43), end_ms: s(9, 45, 18), mins: 2,
+        routed_m: 341, straight_m: 273, walked_m: 341, geometry: "map_matched", fixes: 2, streets: ["Third Street"] },
+      { type: "dwell", id: "d0", start_ms: s(9, 45, 18), end_ms: s(9, 57, 7), place: { name: "Home" } },
+      { type: "leg", id: "l1", mode: "walking", start_ms: s(9, 57, 7), end_ms: s(9, 57, 19), mins: 0,
+        routed_m: 405, straight_m: 338, walked_m: 405, geometry: "map_matched", fixes: 2, streets: ["First Street"] },
+      { type: "dwell", id: "d1", start_ms: s(9, 57, 19), end_ms: s(10, 3, 4), place: { name: "Somewhere on the way" } },
+      { type: "leg", id: "l2", mode: "walking", start_ms: s(10, 3, 4), end_ms: s(10, 6, 47), mins: 4,
+        routed_m: 756, straight_m: 754, walked_m: 756, geometry: "map_matched", fixes: 0, streets: ["Second Street"] },
+      { type: "dwell", id: "d2", start_ms: s(10, 6, 47), end_ms: at(11, 13), place: { name: "Market" } },
+    ] },
+  };
+}
+// The cadence of whole ten-minute batches: the minutes either side of the walk read as
+// walking too, so the walk the steps find runs from inside the cafe to inside the market.
+const passReadings = () => [...readings(at(0, 5), at(0, 10), 2), ...readings(at(9, 36), at(9, 53), 50),
+  ...readings(at(9, 53), at(10, 7), 110), ...readings(at(10, 7), at(10, 17), 50), ...readings(at(23, 50), at(23, 55), 2)];
+
+test("a walk line over a pass the email does not draw counts every step in the minutes it prints", () => {
+  const d = passDay();
+  annotateDaySteps(d, passReadings(), null, { startMs: at(0), endMs: at(24) });
+  const html = buildSkeleton(d);
+  const m = html.match(/Walked 0\.7 miles[^<]*, ([\d,]+) steps\./);
+  assert.ok(m, "the walk line prints its steps");
+  const n = Number(m[1].replace(/,/g, ""));
+  assert.ok(n >= 1450 && n <= 1600, `14 minutes at 110 a minute, got ${n}`);
+});
+
+test("JORI_WALK_STEPS_WINDOW=0 prints the legs' own counts", () => {
+  const old = process.env.JORI_WALK_STEPS_WINDOW;
+  process.env.JORI_WALK_STEPS_WINDOW = "0";
+  try {
+    const d = passDay();
+    annotateDaySteps(d, passReadings(), null, { startMs: at(0), endMs: at(24) });
+    const m = buildSkeleton(d).match(/Walked 0\.7 miles[^<]*, ([\d,]+) steps\./);
+    assert.ok(m && Number(m[1].replace(/,/g, "")) < 600, `the legs held about 4 minutes, got ${m && m[1]}`);
+  } finally {
+    if (old == null) delete process.env.JORI_WALK_STEPS_WINDOW; else process.env.JORI_WALK_STEPS_WINDOW = old;
+  }
+});
+
+test("stepsInWindow counts the minutes it covers, and says nothing outside the readings", () => {
+  const { stepsInWindow } = require("../lib/day-steps.js");
+  const d = { stops: [], path: { spine: [] } };
+  const st = annotateDaySteps(d, [...readings(at(9), at(10), 100)], null, { startMs: at(0), endMs: at(24) });
+  assert.equal(stepsInWindow(st, at(9, 10), at(9, 20)), 1000);
+  assert.equal(stepsInWindow(st, at(9, 10, ) + 30000, at(9, 11)), 50);
+  assert.equal(stepsInWindow(st, at(15), at(16)), null, "hours the readings never reached");
+  assert.equal(stepsInWindow({ total: 5 }, at(9), at(10)), null, "a day annotated before the minutes were kept");
+});
