@@ -48,6 +48,55 @@ If it exits non-zero or the file is empty, stop silently. If
 `meta.ledger_available` is false the property and deposit sections are absent;
 the email says so itself — send it anyway.
 
+## Step 1b — Investigate and repair everything before reporting
+
+The user (2026-11-08): *"before asking any questions in the finance report, we
+should attempt to answer them autonomously as part of the finance review
+(possibly by launching an additional agent), and attempt to repair or instruct
+the admin what to do. this doesn't just apply to questions but every alert and
+discrepancy found."* The email is the last resort, not the first: every
+attention item (`attention[]`, except the `questions` count) and every
+`questions[]` entry gets worked before anything is sent.
+
+For each item, in priority order:
+
+1. **Find out.** Read the records that would settle it: the hub (rental books
+   via `lib/rental-ledger.js`: `billing-deposits` + `whereabouts`,
+   `billing-payouts`, `billing-invoices`, leases, `financial-transactions`
+   links), the bank rows (`plaid_transactions`), Stripe through the read-only
+   key, the rental ledger, the recurring-expense tracker, Gmail receipts
+   (`gog gmail`), earlier `fin_txn_override` verdicts on the same descriptor,
+   and the hub's daily sync log (named in the instance's additions).
+   Many items can run in parallel: launch one subagent per group (deposits,
+   transactions, cards/recurring) with the packet and these sources; they are
+   this same model, so the bank data stays jori-model-only. Never send rows to
+   any other model or service.
+2. **Repair what is safe and certain.** Re-run a stale sync or reconcile
+   (the hub's daily sync named in the instance's additions,
+   `finance-deposits-reconcile`, `finance-invoices-reconcile`); record a fact
+   a record names (`finance-facts txn … --note "<the record: id, source,
+   date>"`). A fact needs a record that says it: a Stripe payout id, an
+   invoice, a receipt, the hub's own link. Two plausible readings is not a
+   fact; leave it for the user. **Never** move money, pay, refund, change a
+   lease, write to the hub, or email anyone but the user.
+3. **Otherwise, write the admin's to-do.** One concrete instruction: the
+   amount, from which account to which, the page and button in the hub, the
+   reply that answers it. Not "look into it".
+
+Then rebuild (Step 1 again) so repaired items drop out, and write
+`/tmp/finance-review-resolve.json` against the REBUILT packet's ids:
+
+```json
+{"attention": {"a3": {"checked": "bank rows on ••2222 and ••1111 since the deposit arrived; the hub's trail for it", "fixed": "", "action": "Move $1,600.00 from 40 Birch ••2222 to Security Deposits ••1111, then link that transfer to the tenant's deposit in the hub (Financials → Security deposits)."}},
+ "questions": {"txn:abc…": {"tried": "hub payouts, Stripe, Gmail: none name it", "todo": "Reply with what it was."}}}
+```
+
+`checked` names sources, not conclusions; `fixed` names what was run or
+recorded; `action` is the instruction. Compose shows them labelled under each
+flag (Fixed / Checked / To do) and lists every `action` in **To do this week**
+at the top; the flag's own text is never changed. An item with nothing to
+add gets no entry.
+
 ## Step 2 — Write the summary (optional, verified)
 
 Read `facts[]` in the packet (`id` + `text`; the `a…` ids are the attention
@@ -78,7 +127,8 @@ summarising, skip this step.
 
 ```bash
 node bin/finance-review-compose --packet /tmp/finance-review-packet.json \
-  --summary /tmp/finance-review-summary.json --out /tmp/finance-review.html \
+  --summary /tmp/finance-review-summary.json --resolve /tmp/finance-review-resolve.json \
+  --out /tmp/finance-review.html \
   > /tmp/finance-review-compose.json
 cat /tmp/finance-review-compose.json
 ```
@@ -128,8 +178,11 @@ RC=$?
 Only after Step 4 did not exit 1:
 
 ```bash
-node bin/finance-review-ask --packet /tmp/finance-review-packet.json
+node bin/finance-review-ask --packet /tmp/finance-review-packet.json --notes /tmp/finance-review-resolve.json
 ```
+
+Only questions Step 1b could not settle are still in the packet; each row
+carries what was already checked and what to do.
 
 One Questions-tab row per packet question, no push, intent
 `plaid-finance-review:question` (jori-model-only). A question still open and

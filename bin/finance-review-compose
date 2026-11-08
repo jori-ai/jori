@@ -9,6 +9,13 @@
 //       the problems are printed and stored. Renders, writes the HTML, inserts a
 //       fin_review_runs row, prints JSON: {run_id, html, subject, pointer,
 //       summary_used, problems}.
+//   finance-review-compose ... --resolve R.json
+//       The job's investigation (playbook Step 2): per attention id, what was
+//       checked, what was repaired, and the one thing left for the admin:
+//         {"attention": {"a2": {"checked": "...", "fixed": "...", "action": "..."}},
+//          "questions": {"txn:abc": {"tried": "...", "todo": "..."}}}
+//       Merged onto packet.attention (an `action` here replaces the packet's);
+//       the flag text itself is never changed. Stored with the run.
 //   finance-review-compose --mark-sent <run_id>
 //
 // The pointer text is built here, from the top attention flag verbatim, so the
@@ -31,8 +38,23 @@ async function main() {
     return;
   }
   const packetPath = arg("packet"), summaryPath = arg("summary"), outPath = arg("out");
-  if (!packetPath || !outPath) { console.error("usage: finance-review-compose --packet P.json [--summary S.json] --out review.html"); process.exit(2); }
+  if (!packetPath || !outPath) { console.error("usage: finance-review-compose --packet P.json [--summary S.json] [--resolve R.json] --out review.html"); process.exit(2); }
   const packet = JSON.parse(fs.readFileSync(packetPath, "utf8"));
+  const resolvePath = arg("resolve");
+  if (resolvePath) {
+    let r = null;
+    try { r = JSON.parse(fs.readFileSync(resolvePath, "utf8")); } catch (e) { console.error(`finance-review-compose: --resolve ${resolvePath} unreadable (${e.message}); composing without it`); }
+    const notes = r?.attention || {};
+    const clean = (x) => (typeof x === "string" && x.trim() ? x.trim().slice(0, 600) : null);
+    for (const a of packet.attention || []) {
+      const n = notes[a.id];
+      if (!n) continue;
+      if (clean(n.checked)) a.checked = clean(n.checked);
+      if (clean(n.fixed)) a.fixed = clean(n.fixed);
+      if (clean(n.action)) a.action = clean(n.action);
+    }
+    packet.meta.resolved = { attention: Object.keys(notes).length, questions: Object.keys(r?.questions || {}).length };
+  }
 
   let summary = null, verify = { ok: true, problems: [], skipped: true };
   if (summaryPath) {
