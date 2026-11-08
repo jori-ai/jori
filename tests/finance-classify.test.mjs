@@ -73,6 +73,26 @@ test("a large outflow a kept record explains is not asked about (2026-11-08: a p
   assert.equal(classify([small], accounts, { known: new Map([["small", { kind: "tax", rule: "x" }]]) }).get("small").kind, "expense");
 });
 
+test("a tax payment is tax, never asked about, and carries its property when one is named (a county property-tax bill paid on a card)", () => {
+  const tax = t("tax", "cardA", 19324.61, "2026-11-03", { name: "PMT*SAMPLE CTY TCSAMPLE", pri: "GENERAL_SERVICES" });
+  const plain = classify([tax], accounts).get("tax");
+  assert.equal(plain.kind, "tax");
+  assert.equal(plain.rule, "tax_payee");
+  assert.equal(plain.property_id, undefined);
+  const rules = [{ contains: "sample", property_id: "home-a", from: "2026-06-23" }];
+  assert.equal(classify([tax], accounts, { taxProperties: rules }).get("tax").property_id, "home-a");
+  // Outside the rule's dates the property is not determinable, so none is claimed.
+  assert.equal(classify([{ ...tax, date: "2026-01-05" }], accounts, { taxProperties: rules }).get("tax").property_id, undefined);
+  // Merchant name alone, Plaid's own tax category, and an instance's extra phrase all count.
+  assert.equal(classify([t("m", "cardA", 12000, "2026-11-03", { name: "x", pri: "GOVERNMENT_AND_NON_PROFIT", det: "GOVERNMENT_AND_NON_PROFIT_TAX_PAYMENT" })], accounts).get("m").rule, "plaid_tax_payment");
+  const m = t("m2", "cardA", 800, "2026-11-03", { name: "ACME COUNTY TREASURERS OFFICE" });
+  assert.equal(classify([m], accounts).get("m2").kind, "tax");
+  assert.equal(classify([t("m3", "cardA", 800, "2026-11-03", { name: "BOROUGH LEVY DEPT" })], accounts, { taxPayeePhrases: ["levy dept"] }).get("m3").kind, "tax");
+  // An ordinary charge is untouched, and a person's verdict still wins.
+  assert.equal(classify([t("o", "cardA", 40, "2026-11-03", { name: "COFFEE" })], accounts).get("o").kind, "expense");
+  assert.equal(classify([tax], accounts, { overrides: [{ transaction_id: "tax", kind: "capital", note: "n" }] }).get("tax").kind, "capital");
+});
+
 test("an inflow is income only by a rule: registered stream or rental category — otherwise unexplained", () => {
   const exp = [{ id: "acme", account_id: "biz", payer_contains: "acme", amount: 12000, tolerance: 0 }];
   const posted = [

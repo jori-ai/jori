@@ -69,6 +69,8 @@ const FR = localConfig("finance-review", {
   ledger_label: "rental ledger",
   recurring_label: "the Recurring tracker",
   invoice_tracked_streams: [],
+  tax_payee_phrases: [],
+  tax_property_rules: [],
 });
 const MODEL_FILE = installTools("data", "finance-model.json");
 const MAP_FILE = RF.accounts_map_file ? installTools(RF.accounts_map_file) : null;
@@ -236,7 +238,7 @@ async function main() {
     };
   };
   const paidById = new Map(tracked.map((x) => [x.id, paidThisCycle(x)]).filter(([, v]) => v));
-  const cls = classify(posted, accounts, { overrides, expectedIncome, bookVerdicts, depositAccountIds, largeOutflow: map.large_outflow_usd || LARGE_OUTFLOW, known });
+  const cls = classify(posted, accounts, { overrides, expectedIncome, bookVerdicts, depositAccountIds, largeOutflow: map.large_outflow_usd || LARGE_OUTFLOW, known, taxPayeePhrases: FR.tax_payee_phrases, taxProperties: FR.tax_property_rules });
   const kindOf = (t) => cls.get(t.transaction_id)?.kind;
   const out = (t) => Number(t.amount) > 0;
   const amt = (t) => Math.abs(Number(t.amount));
