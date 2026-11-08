@@ -12,6 +12,7 @@ const H = require("../lib/daily-summary-harvest.js");
 const REVIEW = path.join(path.dirname(fileURLToPath(import.meta.url)), "../bin/daily-summary-review");
 
 const NO_MSG = () => ({ facts: [], counts: {}, errors: {} });
+const NO_LOOK = () => ({ facts: [], errors: {} });
 
 test("dayWindow is home midnight to home midnight, DST-aware", () => {
   const summer = H.dayWindow("2026-07-15");
@@ -74,7 +75,7 @@ test("harvestDay: stubbed sources, per-source errors, and cache reuse", () => {
   const sources = {
     git: () => { calls++; return { commits: [{ kind: "commit", at: "2026-07-15T13:20:00Z", ms: ms("2026-07-15T13:20:00Z"), sha: "abc", subject: "s" }], added: [] }; },
     sentMail: () => { calls++; throw new Error("keyring locked"); },
-    messages: NO_MSG, notes: () => { calls++; return [{ kind: "note", at: "2026-07-15T16:00:00Z", ms: ms("2026-07-15T16:00:00Z"), title: "Plan" }]; },
+    messages: NO_MSG, lookbackLinks: NO_LOOK, notes: () => { calls++; return [{ kind: "note", at: "2026-07-15T16:00:00Z", ms: ms("2026-07-15T16:00:00Z"), title: "Plan" }]; },
   };
   const chatRows = [{ id: 9, role: "user", content: "we went to Ping's", created_at: "2026-07-15T13:45:00Z" }];
   const h = H.harvestDay({ date: "2026-07-15", chatRows, stops, sources });
@@ -93,7 +94,7 @@ test("harvestDay: stubbed sources, per-source errors, and cache reuse", () => {
 });
 
 test("harvestDay anchors the tasks he closed to the stop they closed at (2026-10-19 Café Example)", () => {
-  const sources = { git: () => ({ commits: [], added: [] }), sentMail: () => [], messages: NO_MSG, notes: () => [], corrections: () => [] };
+  const sources = { git: () => ({ commits: [], added: [] }), sentMail: () => [], messages: NO_MSG, lookbackLinks: NO_LOOK, notes: () => [], corrections: () => [] };
   const tasks = [
     { title: "Pension Fund payout: send bank SWIFT/BIC", completed_at: "10:15", completed_ts: ms("2026-07-15T13:15:00Z"), completed_utc: "2026-07-15T13:15:00.000Z" },
     { title: "Between stops", completed_ts: ms("2026-07-15T14:30:00Z") },
@@ -108,7 +109,7 @@ test("harvestDay anchors the tasks he closed to the stop they closed at (2026-10
 
 test("harvestDay ignores a cache for another date", () => {
   let calls = 0;
-  const sources = { git: () => { calls++; return { commits: [], added: [] }; }, sentMail: () => [], messages: NO_MSG, notes: () => [] };
+  const sources = { git: () => { calls++; return { commits: [], added: [] }; }, sentMail: () => [], messages: NO_MSG, lookbackLinks: NO_LOOK, notes: () => [] };
   H.harvestDay({ date: "2026-07-15", stops, cached: { date: "2026-07-14", raw: {}, errors: {} }, sources });
   assert.equal(calls, 1);
 });
@@ -178,7 +179,7 @@ test("readCorrections skips a torn line and a missing file is empty", () => {
 
 test("harvestDay carries corrections into counts and the anchored facts, uncached", () => {
   const morning = [{ id: "cafe", start_ts_ms: ms("2026-10-10T04:55:00Z"), end_ts_ms: ms("2026-10-10T05:52:00Z") }];
-  const stub = { git: () => ({ commits: [], added: [] }), sentMail: () => [], messages: NO_MSG, notes: () => [],
+  const stub = { git: () => ({ commits: [], added: [] }), sentMail: () => [], messages: NO_MSG, lookbackLinks: NO_LOOK, notes: () => [],
     corrections: () => [{ said_at: "2026-10-11T06:54:35Z", channel: "email", text: "bagel run at Falafel Example",
       applies_from: "2026-10-10T07:00:00+03:00", applies_to: "2026-10-10T09:18:00+03:00" }] };
   const h = H.harvestDay({ date: "2026-10-10", stops: morning, sources: stub });
@@ -242,7 +243,7 @@ test("countColumns: a harvest cut for another date, or none, yields nothing", ()
 test("harvestDay carries the previous days' autonomous tags, topped up once on an older cache; a failed read is null", () => {
   let reads = 0;
   const prior = [{ date: "2026-10-20", tags: ["[auto-impl]"] }];
-  const sources = { git: () => ({ commits: [], added: [] }), sentMail: () => [], messages: NO_MSG, notes: () => [], corrections: () => [],
+  const sources = { git: () => ({ commits: [], added: [] }), sentMail: () => [], messages: NO_MSG, lookbackLinks: NO_LOOK, notes: () => [], corrections: () => [],
     priorTags: () => { reads++; return prior; } };
   const h = H.harvestDay({ date: "2026-10-21", stops: [], sources });
   assert.deepEqual(h.prior_commit_tags, prior);
@@ -265,9 +266,26 @@ test("harvestDay anchors the day's iMessage/WhatsApp/Slack messages to stops and
   const msg = { kind: "message", at: "2026-10-26T12:30:00Z", ms: ms("2026-10-26T12:30:00Z"), channel: "imessage",
     chat: "Family", is_group: true, from_me: false, who: "Alice", text: "see you at the cafe" };
   const sources = { git: () => ({ commits: [], added: [] }), sentMail: () => [], notes: () => [], corrections: () => [],
-    priorTags: () => [], messages: () => ({ facts: [msg], counts: { imessage: 1, kept: 1, dropped: 0 }, errors: { slack: "no log" } }) };
+    priorTags: () => [], lookbackLinks: NO_LOOK, messages: () => ({ facts: [msg], counts: { imessage: 1, kept: 1, dropped: 0 }, errors: { slack: "no log" } }) };
   const h = H.harvestDay({ date: "2026-10-26", stops: cafe, sources });
   assert.equal(h.counts.messages, 1);
   assert.deepEqual(h.facts_by_stop.cafe.map((f) => f.text), ["see you at the cafe"]);
   assert.equal(h.errors.messages_slack, "no log");
+});
+
+test("harvestDay carries links sent before the day, with page titles, unanchored", () => {
+  const link = { kind: "lookback_link", at: "2026-07-15T01:22:23.000Z", ms: ms("2026-07-15T01:22:23Z"), channel: "imessage", chat: "Sam Example", who: "Sam Example",
+    text: "", links: [{ url: "https://dumplings.example/", title: "Example Dumplings | Dimsum | 1 Main Street" }] };
+  let calls = 0;
+  const sources = { git: () => ({ commits: [], added: [] }), sentMail: () => [], notes: () => [], corrections: () => [], priorTags: () => [], messages: NO_MSG,
+    lookbackLinks: () => { calls++; return { facts: [link], errors: { slack: "no log" } }; } };
+  const h = H.harvestDay({ date: "2026-07-15", chatRows: [], stops, sources });
+  assert.equal(h.counts.lookback_links, 1);
+  assert.equal(h.lookback_links[0].links[0].title.startsWith("Example Dumplings"), true);
+  assert.equal("ms" in h.lookback_links[0], false);
+  assert.equal(h.errors.lookback_slack, "no log");
+  assert.equal(h.orphan_facts.some((f) => f.kind === "lookback_link"), false);
+  // the cache keeps it; a re-prep does not read the chats again
+  H.harvestDay({ date: "2026-07-15", chatRows: [], stops, sources, cached: h._cache });
+  assert.equal(calls, 1);
 });
