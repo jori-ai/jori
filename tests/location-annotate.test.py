@@ -60,5 +60,53 @@ class Window(unittest.TestCase):
         self.assertEqual(e.isoformat(), "2026-07-15T18:00:00+00:00")
 
 
+class NearbyVisit(unittest.TestCase):
+    """A note stamps the next unresolved visit, never one that ended before the window."""
+
+    def stamp(self, rows, start="2026-07-15T19:23:16+00:00"):
+        import io
+        from unittest import mock
+        patched = []
+        body = io.BytesIO(json.dumps(rows).encode())
+        fake = mock.MagicMock()
+        fake.__enter__.return_value = body
+        with mock.patch.object(mod.urllib.request, "urlopen", return_value=fake), \
+             mock.patch.dict(mod.__dict__, {
+                 "get_key": lambda: "k",
+                 "patch_row": lambda rid, patch: patched.append((rid, patch)) or True}):
+            out = mod.resolve_nearby_visit(mod.datetime.fromisoformat(start), "Sam came over")
+        return out, patched
+
+    def test_a_pause_that_ended_before_the_window_is_left_alone(self):
+        out, patched = self.stamp([
+            {"id": "pause", "arrived_at": "2026-07-15T19:15:38+00:00",
+             "departed_at": "2026-07-15T19:18:16+00:00", "place_type": "address", "place_name": "1 Example St"},
+            {"id": "home", "arrived_at": "2026-07-15T19:23:16+00:00",
+             "departed_at": "2026-07-16T03:12:26+00:00", "place_type": "named", "place_name": "Home"},
+        ])
+        self.assertIsNone(out)
+        self.assertEqual(patched, [])
+
+    def test_a_visit_still_open_at_the_window_is_stamped(self):
+        out, patched = self.stamp([
+            {"id": "early", "arrived_at": "2026-07-15T19:20:00+00:00",
+             "departed_at": "2026-07-15T19:40:00+00:00", "place_type": "address", "place_name": "2 Example St"},
+        ])
+        self.assertEqual(out["id"], "early")
+        self.assertEqual(patched, [("early", {"place_name": "Sam came over", "place_type": "user-confirmed"})])
+
+    def test_the_destination_after_a_named_stop_is_stamped(self):
+        out, patched = self.stamp([
+            {"id": "pause", "arrived_at": "2026-07-15T19:10:00+00:00",
+             "departed_at": "2026-07-15T19:12:00+00:00", "place_type": None, "place_name": None},
+            {"id": "home", "arrived_at": "2026-07-15T19:23:16+00:00",
+             "departed_at": "2026-07-15T19:30:00+00:00", "place_type": "named", "place_name": "Home"},
+            {"id": "cafe", "arrived_at": "2026-07-15T19:45:00Z",
+             "departed_at": None, "place_type": "poi", "place_name": "Example Cafe"},
+        ])
+        self.assertEqual(out["id"], "cafe")
+        self.assertEqual([p[0] for p in patched], ["cafe"])
+
+
 if __name__ == "__main__":
     unittest.main()
