@@ -199,11 +199,15 @@ the INBOX, then sends the phone pointer and the push.
 ```bash
 C=/tmp/finance-review-compose.json
 SHARE=$(jq -r '.share_with // [] | join(",")' agent/local/config/finance-review.json 2>/dev/null)
+# An array, not ${SHARE:+--also-to "$SHARE"}: the Bash tool's shell is zsh, which
+# does not split that into two words, so digest-deliver got one unknown argument
+# and sent nothing (2026-11-08). An array is two words in zsh and bash alike.
+ALSO=(); [ -n "$SHARE" ] && ALSO=(--also-to "$SHARE")
 ~/Dev/jori/bin/digest-deliver \
   --subject "$(jq -r .subject "$C")" \
   --body-file /tmp/finance-review.html \
   --intent plaid-finance-review \
-  ${SHARE:+--also-to "$SHARE"} \
+  "${ALSO[@]}" \
   --pointer "$(jq -r .pointer "$C")" \
   --push 'Weekly finance review is ready'
 RC=$?

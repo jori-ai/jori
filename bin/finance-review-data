@@ -796,7 +796,7 @@ async function main() {
     const filed = bookCategories.get(t.transaction_id);
     const ent = lt?.entity || null;
     const entSettled = ent && (ent.override?.entityId || (["precedent", "rule"].includes(ent.classification?.method) && Number(ent.classification?.confidence) >= 1));
-    const row = { account: label(t.account_id), who: who(t), amount_fmt: usd(amt(t)), date_fmt: fmtD(t.date), plaid_category: t.category_primary };
+    const row = { account: `${label(t.account_id)}${g.propertyName ? `, ${g.propertyName}'s card` : ""}`, who: who(t), amount_fmt: usd(amt(t)), date_fmt: fmtD(t.date), plaid_category: t.category_primary };
     if (lt?.override?.ignored) {
       const by = String(lt.override.updatedBy || "").split("@")[0].split(".")[0];
       leakage.push({ ...row, direction: `personal${by ? `, excluded from the property's books by ${by[0].toUpperCase()}${by.slice(1)}` : ""}` });
