@@ -249,14 +249,17 @@ test("one transfer that fits two sets of tenants is asked, not asserted; the own
   const ab = Object.fromEntries(a.rows.map((x) => [x.id, x]));
   assert.equal(ab.noel.location, "deposit_account");
   assert.equal(ab.lena.amount_in_deposit_account, 1200);
-  assert.equal(ab.nora.location, "unconfirmed");                 // not located, not flagged
+  // Nora's money arrived in ••2222 and the only row that moved it was not hers:
+  // it is still in ••2222, so she is missing with the move that fixes it.
+  assert.equal(ab.nora.location, "operating_account");
+  assert.equal(ab.nora.location_account_mask, "2222");
   assert.equal(a.ambiguities.filter((x) => x.kind === "transfer-fits-two").length, 0);
-  assert.deepEqual(a.missing.map((x) => x.id), ["ola"]);
+  assert.deepEqual(a.missing.map((x) => x.id).sort(), ["nora", "ola"]);
   const as = run(a);
-  assert.ok(!as.flags.some((f) => /Nora|Noel|Lena/.test(f.text)));
+  assert.ok(!as.flags.some((f) => /Noel|Lena/.test(f.text)));
+  assert.ok(as.flags.some((f) => f.tag === "deposit-missing" && /Nora Wells/.test(f.text) && f.action === "Move $2,400.00 from ••2222 to Security Deposits ••1111."));
   assert.equal(as.questions.length, 0);
-  assert.equal(as.section.unconfirmed.length, 1);
-  assert.match(as.section.rows.find((x) => x.tenant === "Nora Wells").location, /^not known/);
+  assert.equal(as.section.unconfirmed.length, 0);
   assert.match(as.section.rows.find((x) => x.tenant === "Noel Carter").location, /per Alex, 2026-10-18/);
 
   // Naming only whose it was still makes the third tenant unknown: the row cannot count twice.
@@ -264,14 +267,15 @@ test("one transfer that fits two sets of tenants is asked, not asserted; the own
     depositMask: "1111", whose: ["Noel Carter", "Lena Ross"], said: "x", saidOn: "2026-10-18" });
   assert.deepEqual(bare.unknown.map((x) => x.deposit_id), ["nora"]);
   const hand = depositsFromHub({ deposits: base(), report, depositMask: "1111", answers: [{ ...answer, unknown: [] }] });
-  assert.equal(hand.rows.find((x) => x.id === "nora").location, "unconfirmed");
+  assert.equal(hand.rows.find((x) => x.id === "nora").location, "operating_account");
   assert.equal(hand.rows.filter((x) => x.location === "deposit_account").reduce((t, x) => t + x.amount_in_deposit_account, 0), 2400);
 
   // A newer hub row about that tenant does not undo the answer while the hub still
   // credits them the answered row; once it stops and records something newer, the hub is read again.
   const natLater = base();
   natLater[0].whereabouts.trail.push(leg("plaid:oct17", "2026-10-17", "2222", "1111", 2400));
-  assert.equal(depositsFromHub({ deposits: natLater, report, depositMask: "1111", answers: [answer] }).rows.find((x) => x.id === "nora").location, "unconfirmed");
+  // ...and its own trail, less the answered row, says where the money went: the Oct 17 move put it in the deposit account.
+  assert.equal(depositsFromHub({ deposits: natLater, report, depositMask: "1111", answers: [answer] }).rows.find((x) => x.id === "nora").location, "deposit_account");
   natLater[0].whereabouts.trail = [leg("plaid:jul25", "2025-07-14", "tenant", "2222", 2400), leg("plaid:nov1", "2026-11-01", "2222", "1111", 2400)];
   const noOla = natLater.filter((d) => d.id !== "ola");          // Ola's $2,400 in ••2222 would make Nov 1 a question of its own
   assert.equal(depositsFromHub({ deposits: noOla, report, depositMask: "1111", answers: [answer] }).rows.find((x) => x.id === "nora").location, "deposit_account");

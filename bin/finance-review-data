@@ -534,7 +534,7 @@ async function main() {
   const changed = items.filter((x) => x.d.changedOn && x.d.changedOn > wkStart && x.d.priorCents && x.d.lastCents !== x.d.priorCents)
     .map((x) => ({ name: x.name, from: x.d.priorCents / 100, to: x.d.lastCents / 100, from_fmt: usd(x.d.priorCents / 100), to_fmt: usd(x.d.lastCents / 100), on_fmt: fmtD(x.d.changedOn) }));
   const renewals = items.filter((x) => x.d.cadence === "annual" && x.d.nextExpected && daysBetween(today, x.d.nextExpected) >= 0 && daysBetween(today, x.d.nextExpected) <= 30)
-    .map((x) => ({ name: x.name, kind: x.kind, amount_fmt: usd0((x.d.typicalCents || 0) / 100), due_fmt: fmtD(x.d.nextExpected), decision: x.decision ? x.decision.verdict : "undecided", paid: paidById.get(x.id) || null }));
+    .map((x) => ({ name: x.name, kind: x.kind, amount_fmt: usd0((x.d.typicalCents || 0) / 100), due_fmt: fmtD(x.d.nextExpected), decision: x.decision ? x.decision.verdict : "continue (default)", paid: paidById.get(x.id) || null }));
   const chargedAfterCancel = items.filter((x) => ["cancel", "already_cancelled"].includes(x.decision?.verdict) && x.d.lastCharged && x.d.lastCharged > String(x.decision.decidedAt || "").slice(0, 10))
     .map((x) => ({ name: x.name, last_fmt: fmtD(x.d.lastCharged), amount_fmt: usd(x.d.lastCents / 100) }));
   for (const c of chargedAfterCancel) flag(70, "charged-after-cancel", `${c.name} was marked cancelled on ${FR.recurring_label} but charged ${c.amount_fmt} on ${c.last_fmt}.`);
@@ -545,8 +545,11 @@ async function main() {
   // it is unwanted (the user, 2026-11-08: "Cancel if you don't want it to
   // renew. Otherwise it's safe to ignore"). So it is housekeeping, and its
   // action is optional: shown under the flag, never on the to-do list.
-  for (const r of renewals.filter((r) => r.decision === "undecided" && !r.paid && !BILL_KINDS.has(r.kind))) {
-    flag(40, "renewal", `${r.name} renews around ${r.due_fmt} (typically ${r.amount_fmt}/yr).`, `Cancel before ${r.due_fmt} if you don't want it to renew; otherwise nothing to do.`);
+  // Every recurring charge continues unless a decision says otherwise (the
+  // user, 2026-11-08: "the default decision for any recurring payment should
+  // be to continue"); "no decision" is that default, not a gap.
+  for (const r of renewals.filter((r) => r.decision === "continue (default)" && !r.paid && !BILL_KINDS.has(r.kind))) {
+    flag(40, "renewal", `${r.name} renews around ${r.due_fmt} (typically ${r.amount_fmt}/yr) and continues by default.`, `Cancel before ${r.due_fmt} if you don't want it to renew; otherwise nothing to do.`);
     attention[attention.length - 1].optional = true;
   }
   // Every change is listed; only an increase of at least 5% and $5 a charge is
