@@ -130,7 +130,9 @@ Rebuild (Step 0) so repaired items drop out, and write
 ```
 
 `checked` names sources, not conclusions; `fixed` names what was recorded;
-`action` is the instruction. A flag marked `optional` (a subscription renewal:
+`action` is the instruction. When the investigation settled an item and
+nothing is left for the user, write `"resolved": true` with `fixed` and **no
+action** (never "nothing to do"): it moves to Housekeeping. A flag marked `optional` (a subscription renewal:
 "cancel if you don't want it") keeps the packet's action; do not write one.
 
 ## Step 3 — Compose, then check before anything is sent (max 3 rounds)

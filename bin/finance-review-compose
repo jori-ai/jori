@@ -52,6 +52,9 @@ async function main() {
       if (clean(n.checked)) a.checked = clean(n.checked);
       if (clean(n.fixed)) a.fixed = clean(n.fixed);
       if (clean(n.action) && !a.optional) a.action = clean(n.action); // an optional action (a renewal: cancel only if unwanted) is the packet's
+      // Settled by the review itself: nothing is left for the user, so it is
+      // housekeeping (shown once, with what was fixed), never "act on".
+      if (n.resolved === true && clean(n.fixed)) { a.priority = Math.min(a.priority, 35); if (!clean(n.action)) delete a.action; a.resolved = true; }
     }
     packet.meta.resolved = { attention: Object.keys(notes).length, questions: Object.keys(r?.questions || {}).length };
   }
