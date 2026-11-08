@@ -414,6 +414,13 @@ test("a visit record far longer than the stop is a container, not the stop's own
   assert.equal(_internal.isMainStop(edgeKnown({ confirmed_row: edgeRow(-500, 9) })), false);
 });
 
+test("a stop whose end gave its silent tail back to the walk is measured against its span before that", () => {
+  // the row's departure ran past the user's, so resolve-day ended the stop 4 minutes early
+  const trimmed = { duration_min: 5, end_ts_ms: edgeAt(5), confirmed_row: edgeRow(-3, 9) };
+  assert.equal(_internal.isMainStop(edgeKnown({ ...trimmed, travel_trimmed_from_ms: edgeAt(9) })), true);
+  assert.equal(_internal.isMainStop(edgeKnown(trimmed)), false, "without the trim's record the row reads as a container");
+});
+
 test("a visit record under the bar changes nothing, and JORI_STOP_OWN_VISIT=0 turns the rule off", () => {
   assert.equal(_internal.isMainStop(edgeKnown({ duration_min: 6, end_ts_ms: edgeAt(6), confirmed_row: edgeRow(-1, 6) })), false);
   process.env.JORI_STOP_OWN_VISIT = "0";
