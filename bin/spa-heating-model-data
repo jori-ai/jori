@@ -55,7 +55,16 @@ const { localConfig } = require("../lib/instance.cjs");
 // `fallback_f_per_min`, the rate SpaServer currently quotes ETAs from
 // (its HEATING_DEGREES_PER_MINUTE), shown next to what the data says.
 // Keep it in sync if that constant changes; unset = not shown.
-const CFG = localConfig("spa", { server_url: "", fallback_f_per_min: null });
+// `exclude_sessions`: sessions the user ruled out of the analysis, as
+// `{ session_id, reason, decided }` (a bare id string also works). They are
+// dropped before any count or fit and listed in the packet as `excluded_sessions`.
+const CFG = localConfig("spa", { server_url: "", fallback_f_per_min: null, exclude_sessions: [] });
+const EXCLUDED = new Map(
+  (Array.isArray(CFG.exclude_sessions) ? CFG.exclude_sessions : [])
+    .map((e) => (typeof e === "string" ? { session_id: e } : e))
+    .filter((e) => e && e.session_id)
+    .map((e) => [String(e.session_id), e])
+);
 
 const FLAGS = new Set(process.argv.slice(2).filter((a) => a.startsWith("--")));
 const COUNT_ONLY = FLAGS.has("--count");
@@ -159,7 +168,10 @@ async function main() {
   // Only settled sessions can produce an honest rate: before circulation the
   // reading describes a stratified body, not the spa.
   const usable = sessions.filter(
-    (s) => s.temp_settled != null && s.heating_seconds > 600
+    (s) =>
+      s.temp_settled != null &&
+      s.heating_seconds > 600 &&
+      !EXCLUDED.has(String(s.session_id))
   );
 
   if (COUNT_ONLY) {
@@ -283,6 +295,16 @@ async function main() {
   const packet = {
     generated_at: new Date().toISOString(),
     sessions_total: sessions.length,
+    // Sessions the user ruled out (spa.json `exclude_sessions`), kept out of
+    // every count and fit below. Say so in the report so the gap is visible.
+    excluded_sessions: sessions
+      .filter((s) => EXCLUDED.has(String(s.session_id)))
+      .map((s) => ({
+        session_id: s.session_id,
+        started_at: s.started_at,
+        reason: EXCLUDED.get(String(s.session_id)).reason ?? null,
+        decided: EXCLUDED.get(String(s.session_id)).decided ?? null,
+      })),
     sessions_usable: rows.length,
     // Tick-measured sessions with ambient — the set `model` is fitted on.
     sessions_fit: withGap.length,
@@ -357,6 +379,9 @@ async function main() {
       `fallback: ${packet.current_fallback ? `${packet.current_fallback.min_per_degree} min/°F` : "(not set)"}` +
         (packet.observed ? `   observed median: ${packet.observed.median_min_per_degree} min/°F` : "")
     );
+    if (packet.excluded_sessions.length) {
+      console.log(`excluded: ${packet.excluded_sessions.map((e) => e.session_id).join(", ")} (spa.json exclude_sessions)`);
+    }
     if (packet.model) {
       console.log(
         `model:    f_per_min = ${packet.model.a} + ${packet.model.b} * gap   (R²=${packet.model.r2}, n=${packet.model.n})`

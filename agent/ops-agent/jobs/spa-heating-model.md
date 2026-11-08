@@ -91,10 +91,19 @@ even after the ambient and heating-phase fixes. They still count in
 `sessions_fit`, so it grows each month. Report it next to `sessions_usable` so a small `n` is read as a small
 `n`.
 
+**Sessions the user ruled out stay out.** `exclude_sessions` in
+`agent/local/config/spa.json` (`{ session_id, reason, decided }`) drops a session
+before any count, median or fit, and the packet lists it as `excluded_sessions`.
+Add an entry only on the user's own word about that session, quoting it in
+`reason`; it covers that one session, never a rule about a kind of session. Never
+put an excluded session back into the per-session table or any figure, and say in
+one line of the email that it is excluded and why (their words).
+
 Key fields:
 
 | Field | Meaning |
 |---|---|
+| `excluded_sessions` | Sessions the user ruled out (kept out of everything below) |
 | `sessions_usable` | Sessions with a settled baseline and >10 min of heating |
 | `sessions_fit` | Tick-measured sessions with ambient data — the only ones `model` is fitted on |
 | `ambient_range` | Air-temp span of the fit set — the honesty check on the fit |
