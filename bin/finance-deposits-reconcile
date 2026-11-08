@@ -71,7 +71,7 @@ async function main() {
   // Deposit transfers the hub has sent and the bank has not shown yet.
   const invById = new Map(hubInvoices.map((i) => [i.id, i]));
   const hubTransfers = hubPayouts.filter((p) => p.kind === "deposit" || p.propertySlug === CFG.deposit_payout_slug).map((p) => ({
-    id: p.id, status: p.status,
+    id: p.id, status: p.status, bank_last4: p.bankLast4 || null,
     arrival: tsIso(p.arrivalDate)?.slice(0, 10) || tsIso(p.createdAt)?.slice(0, 10),
     shares: (p.invoiceIds || []).map((iid) => invById.get(iid)).filter(Boolean).map((inv) => ({ deposit_id: inv.accountId })),
   }));
@@ -115,7 +115,7 @@ async function main() {
     await request("/rest/v1/fin_deposit_reconciliations", { method: "POST", prefer: "return=minimal", body: [{
       account_balance: r.proof.deposit_account_balance, located_total: r.proof.located_total,
       unattributed_total: r.proof.unattributed_total, difference: r.proof.difference, ok: r.proof.ok,
-      report: { deposit_account: `${dep.name} ••${dep.mask}`, proof: r.proof, missing: r.missing, in_transit: r.in_transit, fee_shortfall_total: r.fee_shortfall_total, ambiguities: r.ambiguities, liability: r.liability, rows: r.rows },
+      report: { deposit_account: `${dep.name} ••${dep.mask}`, proof: r.proof, missing: r.missing, in_transit: r.in_transit, fee_shortfall_total: r.fee_shortfall_total, ambiguities: r.ambiguities, liability: r.liability, rows: r.rows, report_at: r.report_at },
     }] });
   }
 

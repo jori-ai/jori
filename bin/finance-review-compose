@@ -54,7 +54,7 @@ async function main() {
     run_id: rows?.[0]?.id ?? null,
     html: outPath,
     subject: `Weekly finance review — week ending ${weekEnd}`,
-    pointer: `Weekly finance review is in your inbox${top ? ` — ${top.text}` : " — nothing urgent this week."}${packet.questions?.length ? ` (${packet.questions.length} open questions at the end.)` : ""}`,
+    pointer: `Weekly finance review is in your inbox${top ? ` — ${top.text}` : " — nothing urgent this week."}${packet.questions?.length ? ` (${packet.questions.length} open questions in your Questions tab.)` : ""}`,
     summary_used: !!used,
     problems: verify.problems,
   }, null, 2));

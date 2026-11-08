@@ -498,7 +498,7 @@ async function main() {
 
   attention.sort((a, b) => b.priority - a.priority);
   attention.forEach((a, i) => { a.id = `a${i + 1}`; });
-  if (questions.length) attention.push({ priority: 30, tag: "questions", id: `a${attention.length + 1}`, text: `${questions.length} open question(s) at the end of this review need an answer before the review can state them.` });
+  if (questions.length) attention.push({ priority: 30, tag: "questions", id: `a${attention.length + 1}`, text: `${questions.length} open question(s) in the Questions tab need an answer before the review can state them.` });
 
   // Facts the summary may cite. Every one is a sentence this code wrote.
   const facts = [
