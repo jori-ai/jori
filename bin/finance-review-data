@@ -712,7 +712,8 @@ async function main() {
     const charges = posted.filter((t) => out(t) && ids.has(trackedFor(t)?.id));
     const inWindow = (a, b) => round2(sum(charges.filter((t) => t.date > a && t.date <= b), amt));
     const cur = inWindow(dayAdd(on, -30), on), prev = inWindow(dayAdd(on, -61), dayAdd(on, -30));
-    const monthly = items.find((x) => ids.has(x.id))?.d.cadence === "monthly";
+    // Month on month whenever both months have charges; an annual bill has no month before it.
+    const monthly = items.find((x) => ids.has(x.id))?.d.cadence !== "annual";
     const from = monthly && cur && prev ? prev : sum(xs, (x) => x.d.priorCents / 100);
     const to = monthly && cur && prev ? cur : sum(xs, (x) => x.d.lastCents / 100);
     changed.push({ name, from: round2(from), to: round2(to), from_fmt: usd(from), to_fmt: usd(to), on_fmt: fmtD(on), basis: monthly && cur && prev ? "month" : "charge" });
