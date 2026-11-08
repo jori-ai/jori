@@ -243,3 +243,144 @@ test("a payout record never claims a credit it cannot be sure of", () => {
   // A debit is never a payout.
   assert.equal(one([payout("p", "1111", 51234, at, "OK-SMI R11")], [row("x", "home", 512.34, "2026-11-07", "OK SMI R11")]).size, 0);
 });
+
+// ── What the books already answered ─────────────────────────────────────────
+// The same review asked "capital or expense?" about a county tax payment a
+// person had already filed under taxes in the books, and "is this a scheduled
+// card payment?" about a landscaper's bill a person had filed under repairs.
+// A category a person set or confirmed, or the books' own rule or earlier
+// decision, answers what the rules leave as a question (rule 11); the books'
+// guesses never do.
+
+const { answeredCategoriesForBankRows } = require("../lib/rental-ledger.js");
+const { bookCategoryKind, streamsCoveredByBooks } = require("../lib/finance-classify.js");
+const cats = [
+  { id: "income", kind: "income", name: "Rental Income" },
+  { id: "income-interest", kind: "income", name: "Interest Income" },
+  { id: "maintenance-repairs", kind: "expense", name: "Maintenance/Repairs" },
+  { id: "taxes", kind: "expense", name: "Taxes" },
+  { id: "security-deposit", kind: "capital", name: "Security Deposits Held" },
+  { id: "mortgage-principal", kind: "capital", name: "Mortgage Principal" },
+  { id: "transfers-card-payments", kind: "expense", name: "Transfers & Card Payments", excludedFromReports: true },
+  { id: "ask-my-accountant", kind: "expense", name: "Ask My Accountant", isUnclassified: true },
+];
+const reg = { categoryById: new Map(cats.map((c) => [c.id, c])), unclassifiedId: "ask-my-accountant" };
+const lrow = (txn, extra) => ({ id: `plaid:${txn}`, classification: { categoryId: "ask-my-accountant", method: "deterministic", confidence: 0 }, override: null, reviewed: false, ...extra });
+
+test("only a person's category, a reviewed row, an earlier decision or a sure rule counts as the books' answer", () => {
+  const rows = [
+    lrow("person", { override: { categoryId: "taxes", updatedBy: "someone@example.com" } }),
+    lrow("reviewed", { classification: { categoryId: "maintenance-repairs", method: "model", confidence: 0.75 }, reviewed: true }),
+    lrow("precedent", { classification: { categoryId: "maintenance-repairs", method: "precedent", confidence: 1 } }),
+    lrow("rule", { classification: { categoryId: "income", method: "deterministic", confidence: 1 } }),
+    lrow("guess", { classification: { categoryId: "maintenance-repairs", method: "model", confidence: 0.9 } }),
+    lrow("unclassified", {}),
+    lrow("transfer", { override: { categoryId: "transfers-card-payments" } }),
+    lrow("ignored", { override: { categoryId: "taxes", ignored: true } }),
+    lrow("split", { override: { categoryId: "taxes" }, splits: [{ categoryId: "taxes", amount: 5 }, { categoryId: "maintenance-repairs", amount: 5 }] }),
+    { id: "manual:1", override: { categoryId: "taxes" } },
+  ];
+  const a = answeredCategoriesForBankRows({ ledgerRows: rows, registry: reg });
+  assert.deepEqual([...a.keys()].sort(), ["person", "precedent", "reviewed", "rule", "split"]);
+  assert.deepEqual(a.get("person"), { categories: [{ id: "taxes", kind: "expense", name: "Taxes" }], basis: "person", by: "someone@example.com", property_id: null });
+  assert.equal(a.get("reviewed").basis, "reviewed");
+  assert.equal(a.get("precedent").basis, "precedent");
+  assert.equal(a.get("rule").basis, "rule");
+  assert.equal(answeredCategoriesForBankRows({ ledgerRows: rows }).size, 0, "no registry, no answers");
+});
+
+test("what a books category makes a transaction, by direction", () => {
+  const k = (id, inflow, kinds) => bookCategoryKind({ categories: [cats.find((c) => c.id === id)] }, inflow, kinds);
+  assert.equal(k("income", true), "income");
+  assert.equal(k("income", false), null, "money paid out under an income category answers nothing");
+  assert.equal(k("income-interest", true), "interest_earned");
+  assert.equal(k("maintenance-repairs", false), "expense");
+  assert.equal(k("maintenance-repairs", true), "refund");
+  assert.equal(k("taxes", false), "tax");
+  assert.equal(k("taxes", true), null);
+  assert.equal(k("security-deposit", true), "deposit_in");
+  assert.equal(k("security-deposit", false), null);
+  assert.equal(k("mortgage-principal", false), "capital");
+  assert.equal(k("taxes", false, { taxes: { out: "expense" } }), "expense", "an installation can say otherwise");
+  assert.equal(k("taxes", false, { taxes: null }), null);
+  assert.equal(bookCategoryKind({ categories: [cats[2], cats[3]] }, false), null, "a split whose parts disagree answers nothing");
+});
+
+test("the books answer what the rules leave as a question, and only that", () => {
+  const posted = [
+    t("tax", "cardA", 19324.61, "2026-11-03", { pri: "GOVERNMENT_AND_NON_PROFIT" }),        // unreviewed large on a card
+    t("in", "chk", -1200, "2026-11-04", { pri: "TRANSFER_IN", det: "TRANSFER_IN_DEPOSIT" }), // stays transfer_external: not a question
+    t("odd", "biz", -640, "2026-11-04", { pri: "GENERAL_SERVICES" }),                          // unexplained
+    t("lawn", "chk", 300, "2026-10-19", { pri: "HOME_IMPROVEMENT" }),                          // a bill that happens to pair…
+    t("cr", "cardB", -300, "2026-10-20", { pri: "GENERAL_MERCHANDISE" }),                      // …with a card credit
+    t("shop", "chk", 80, "2026-11-02", { pri: "GENERAL_MERCHANDISE" }),                        // plain expense
+    t("guessed", "biz", -900, "2026-11-05", { pri: "GENERAL_SERVICES" }),                      // the books only guessed
+  ];
+  const bookCategories = answeredCategoriesForBankRows({ registry: reg, ledgerRows: [
+    lrow("tax", { override: { categoryId: "taxes", updatedBy: "p@example.com" } }),
+    lrow("in", { override: { categoryId: "maintenance-repairs" } }),
+    lrow("odd", { classification: { categoryId: "income", method: "precedent", confidence: 1 } }),
+    lrow("lawn", { override: { categoryId: "maintenance-repairs" } }),
+    lrow("shop", { override: { categoryId: "mortgage-principal" } }),
+    lrow("guessed", { classification: { categoryId: "income", method: "model", confidence: 0.95 } }),
+  ] });
+  const before = classify(posted, accounts);
+  assert.equal(before.get("tax").kind, "unreviewed_large");
+  assert.equal(before.get("odd").kind, "inflow_unexplained");
+  assert.equal(before.get("lawn").kind, "card_payment");
+  const c = classify(posted, accounts, { bookCategories });
+  assert.equal(c.get("tax").kind, "tax");
+  assert.equal(c.get("tax").rule, "books_category");
+  assert.equal(c.get("tax").book_basis, "person");
+  assert.equal(c.get("odd").kind, "income");
+  assert.equal(c.get("lawn").kind, "expense", "a bank debit a person filed as a repair is not a card payment");
+  assert.equal(c.get("in").kind, "transfer_external", "a verdict the rules reached stays");
+  assert.equal(c.get("shop").kind, "expense", "spending is never re-read");
+  assert.equal(c.get("guessed").kind, "inflow_unexplained", "a guess is not an answer");
+  // A person's verdict recorded here still wins.
+  const o = classify(posted, accounts, { bookCategories, overrides: [{ transaction_id: "tax", kind: "capital", note: "said so" }] });
+  assert.equal(o.get("tax").kind, "capital");
+});
+
+test("a real card payment out of a bank account is never re-read as spending, whatever the books filed it under", () => {
+  // That card's purchases are already spending; calling the payment an expense too counts them twice.
+  const posted = [
+    t("pay", "chk", 640, "2026-11-02", { pri: "LOAN_PAYMENTS", det: "LOAN_PAYMENTS_CREDIT_CARD_PAYMENT" }),
+    t("in", "cardA", -640, "2026-11-03", { pri: "LOAN_PAYMENTS", det: "LOAN_PAYMENTS_CREDIT_CARD_PAYMENT" }),
+    t("solo", "chk", 210, "2026-11-04", { pri: "LOAN_PAYMENTS", det: "LOAN_PAYMENTS_CREDIT_CARD_PAYMENT" }),
+  ];
+  const bookCategories = answeredCategoriesForBankRows({ registry: reg, ledgerRows: [
+    lrow("pay", { override: { categoryId: "maintenance-repairs" } }), lrow("solo", { override: { categoryId: "maintenance-repairs" } }),
+  ] });
+  const c = classify(posted, accounts, { bookCategories });
+  assert.equal(c.get("pay").kind, "card_payment");
+  assert.equal(c.get("solo").kind, "card_payment");
+});
+
+test("the books never re-read what the tax rule or a tracked bill already settled", () => {
+  // Rules 8b and 9 answer before rule 11 is reached: a books category on the same row changes nothing.
+  const posted = [
+    t("cty", "cardA", 19324.61, "2026-11-03", { name: "PMT*SAMPLE CTY TCSAMPLE", pri: "GENERAL_SERVICES" }),
+    t("bill", "chk", 12500, "2026-11-04", { pri: "GENERAL_SERVICES" }),
+  ];
+  const bookCategories = answeredCategoriesForBankRows({ registry: reg, ledgerRows: [
+    lrow("cty", { override: { categoryId: "maintenance-repairs" } }),
+    lrow("bill", { override: { categoryId: "mortgage-principal" } }),
+  ] });
+  const known = new Map([["bill", { kind: "expense", rule: "recurring_tracker", note: "Insurance (tracker)" }]]);
+  const c = classify(posted, accounts, { bookCategories, known });
+  assert.equal(c.get("cty").kind, "tax");
+  assert.equal(c.get("cty").rule, "tax_payee");
+  assert.deepEqual(c.get("bill"), { kind: "expense", rule: "recurring_tracker", note: "Insurance (tracker)" });
+});
+
+test("a stream registered by hand for money the books already name is redundant; one they only partly name is not", () => {
+  const exp = [
+    { id: "oak-rent", account_id: "home", payer_contains: "DES:OK ", amount: null, due_day: 1, grace_days: 7, active_from: "2026-10-01" },
+    { id: "elm-rent", account_id: "home", payer_contains: "DES:EL ", amount: null, due_day: 1, grace_days: 7, active_from: "2026-10-01" },
+  ];
+  const posted = [row("r1", "home", -512.34, "2026-11-06", "OK SMI R11"), row("r2", "home", -700, "2026-10-06", "EL ZED R10"), row("r3", "home", -700, "2026-11-06", "EL ZED R11")];
+  const c = classify(posted, banks, { expectedIncome: exp, bookVerdicts: new Map([["r1", { kind: "income", rule: "rental_books_payout" }], ["r3", { kind: "income", rule: "rental_books_payout" }]]) });
+  assert.deepEqual([...streamsCoveredByBooks(c)], ["oak-rent"]);
+  assert.deepEqual([...streamsCoveredByBooks(classify(posted, banks, { expectedIncome: exp }))], [], "no books, nothing redundant");
+});

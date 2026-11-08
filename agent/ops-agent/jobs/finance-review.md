@@ -58,6 +58,25 @@ discrepancy found."* The email is the last resort, not the first: every
 attention item (`attention[]`, except the `questions` count) and every
 `questions[]` entry gets worked before anything is sent.
 
+The records already answer more than they used to, before the packet asks
+anything: the hub's rent and deposit payouts are income and deposits (the
+books' payout records, current and future leases alike), and a category a
+person set or confirmed in the hub, an earlier decision there, or the hub's own
+rule answers what a transaction was (`lib/finance-classify.js` rules 1b and
+11). The review never asks what the books, the leases or an earlier answer
+already settle, so a question that reaches you is one those leave open, or one
+the user has already answered:
+
+**First, the user's earlier answers.** A question the user answered in the
+Questions tab is never asked again (Step 5 lists it under `answered_before`
+instead). When the packet still asks one, the answer was closed
+without being recorded in a form the packet reads. Run Step 5's command with
+`--earlier` in place of its `--notes` file: it sends nothing and prints each
+such question with the user's reply. Record each reply per
+§ Recording facts (quote it, with its date). A reply that cannot be recorded
+here (an answer that is a change in the hub) is left alone: the email counts
+it on its own line and it is not asked again.
+
 For each item, in priority order:
 
 1. **Find out.** Read the records that would settle it: the hub (rental books
@@ -187,7 +206,8 @@ carries what was already checked and what to do.
 One Questions-tab row per packet question, no push, intent
 `plaid-finance-review:question` (jori-model-only). A question still open and
 asked in the last 6 days is not asked again; an open one the packet no longer
-asks is retired. The user asked for this (2026-11-08): *"ask me the questions
+asks is retired; one the user already answered is never asked again (Step 1b
+records its reply). The user asked for this (2026-11-08): *"ask me the questions
 from the weekly finance review in the questions channel - not in the email"*.
 
 Do not email anyone but the user. Do not create tasks. The review is informational
@@ -203,13 +223,22 @@ gives the command that records it. Record it as below, then close it with
 `finance-review-ask --answered <fin-id> --via "<what was recorded>"`. A
 question answered in the hub (an account, a deposit row) is closed the same
 way once the user says it is done; the next review retires it anyway when its
-records stop asking.
+records stop asking. Record **before** closing, never instead: a closed
+question the packet still raises is not asked again, so the review has to
+re-read the answer from the reply (Step 1b).
 
 Open questions come back as answers. Record each with `bin/finance-facts`
 (usage in its header): `txn` (what a transaction was), `income add` (a stream
 to expect), `payment add` (a confirmed scheduled payment — the only thing a
-shortfall alarm fires on). Every write needs a note/evidence: quote what the user
-said and the date. Deposits mostly are not recorded here: which tenants an
+shortfall alarm fires on), `payment manual` (a payee the user pays by hand: the
+answer when "is this a scheduled card payment?" is no), `account <mask>` (an
+account that belongs to no property or pot on purpose: the answer when "which
+property or pot?" is none; one that belongs somewhere is added in the hub's
+account registry). Every write needs a note/evidence: quote what the user
+said and the date. **Never register an income stream for rent or a deposit the
+rental hub collects:** the review reads those payouts from the books, so a stream
+would only say it twice, `income add` refuses one, and rent a tenant has not paid
+shows on the hub's rent invoices. Deposits mostly are not recorded here: which tenants an
 unlinked bank row was, where a deposit started, and whether one may sit outside
 the deposit account are answered in the hub (Financials -> Security deposits;
 the tenant's card). Point the user there; then re-run `finance-deposits-reconcile`.

@@ -18,14 +18,16 @@
 //     rules in lib/finance-classify.js, each verdict naming its rule;
 //   * a record somebody keeps: the rental ledger (property P&L, and which
 //     bank credits are the hub's rent and deposit payouts, with the hub's
-//     billing-payouts for those it has not linked yet), the hub's
+//     billing-payouts for those it has not linked yet; and what a person in
+//     the hub, or its own rules, filed a bank row under), the hub's
 //     billing-deposits (every tenant's deposit), expense-recurring (every
 //     recurring charge and the decision about it), property_value_reconciled;
 //   * a fact the user recorded with `finance-facts` (fin_* tables): expected
 //     income, confirmed scheduled payments, a verdict on one transaction, where
 //     a deposit is held.
 // Where none of those answers a question, the packet does not answer it: it
-// adds an entry to `questions[]`, and the email asks.
+// adds an entry to `questions[]`, and the Questions tab asks (once: an answer
+// the user already gave is recorded, never asked for again; bin/finance-review-ask).
 //
 // READ-ONLY. Bank data is jori-model-only (health-data tier).
 //
@@ -33,8 +35,9 @@
 //
 // CONFIG (all optional; absent = that section is empty or generic):
 //   agent/local/config/rental-finance.json  the rental books' finance config
-//     (lib/finance-real-estate.js) and `accounts_map_file` (the account map,
-//     relative to the install).
+//     (lib/finance-real-estate.js), `accounts_map_file` (the account map,
+//     relative to the install) and `book_category_kinds` (what a category in
+//     the books makes a transaction, over lib/finance-classify.js's defaults).
 //   agent/local/config/investments.json `broker`  the brokerage tables and
 //     label (lib/broker-config.cjs).
 //   agent/local/config/finance.json `net_worth`  the other asset histories
@@ -51,7 +54,7 @@ const { loadEnv } = require("../lib/load-env.js");
 const { request, requestAll } = require("../lib/supabase-rest.js");
 const ledger = require("../lib/rental-ledger.js");
 const { attributionFor, bucketOf, buildCashBuckets, buildRealEstate } = require("../lib/finance-real-estate.js");
-const { classify, SPEND_KINDS, LARGE_OUTFLOW } = require("../lib/finance-classify.js");
+const { classify, streamsCoveredByBooks, SPEND_KINDS, LARGE_OUTFLOW } = require("../lib/finance-classify.js");
 const { depositSection } = require("../lib/finance-deposit-reconcile.js");
 const { invoiceSection } = require("../lib/finance-invoice-reconcile.js");
 const { incomeStatus, scheduledDue } = require("../lib/finance-expected.js");
@@ -107,6 +110,20 @@ const BILL_KINDS = new Set(["utility", "insurance", "housing", "tax"]);
 const CADENCE_PER_MONTH = { weekly: 52 / 12, monthly: 1, quarterly: 1 / 3, semiannual: 1 / 6, annual: 1 / 12 };
 
 const load = (file, fallback) => { try { return JSON.parse(fs.readFileSync(file, "utf8")); } catch { return fallback; } };
+
+/** Packet question ids whose latest Questions-tab entry the user answered (the open-questions ledger, lane finance-review). */
+async function answeredFinanceQuestions() {
+  try {
+    const { foldQuestions } = await import("../lib/open-questions.mjs");
+    const latest = new Map();
+    for (const q of foldQuestions().values()) {
+      if (q.lane !== "finance-review" || !q.subject) continue;
+      const cur = latest.get(q.subject);
+      if (!cur || String(q.first_asked_at) > String(cur.first_asked_at)) latest.set(q.subject, q);
+    }
+    return new Set([...latest.values()].filter((q) => q.status === "answered").map((q) => q.subject));
+  } catch { return new Set(); }
+}
 const safe = (p) => p.catch(() => null);
 
 async function main() {
@@ -238,7 +255,12 @@ async function main() {
     };
   };
   const paidById = new Map(tracked.map((x) => [x.id, paidThisCycle(x)]).filter(([, v]) => v));
-  const cls = classify(posted, accounts, { overrides, expectedIncome, bookVerdicts, depositAccountIds, largeOutflow: map.large_outflow_usd || LARGE_OUTFLOW, known, taxPayeePhrases: FR.tax_payee_phrases, taxProperties: FR.tax_property_rules });
+  // And what a person (or the books' own rules, or an earlier decision) said
+  // a bank row was, for the rows the review would otherwise ask about: the
+  // county tax a person filed under taxes, the landscaper a person filed under
+  // repairs. The books' own guesses are not read.
+  const bookCategories = reg ? ledger.answeredCategoriesForBankRows({ ledgerRows: ledgerTxns, registry: reg }) : new Map();
+  const cls = classify(posted, accounts, { overrides, expectedIncome, bookVerdicts, bookCategories, bookCategoryKinds: RF.book_category_kinds || {}, depositAccountIds, largeOutflow: map.large_outflow_usd || LARGE_OUTFLOW, known, taxPayeePhrases: FR.tax_payee_phrases, taxProperties: FR.tax_property_rules });
   const kindOf = (t) => cls.get(t.transaction_id)?.kind;
   const out = (t) => Number(t.amount) > 0;
   const amt = (t) => Math.abs(Number(t.amount));
@@ -362,7 +384,11 @@ async function main() {
   const inv = invoiceSection((invoiceRuns || [])[0] || null, today, fmtD);
   for (const f of inv.flags) flag(f.priority, f.tag, f.text);
   const invoiceTracked = new Set(inv.section ? (FR.invoice_tracked_streams || []) : []);
-  const incomeRows = incomeStatus(expectedIncome, posted, cls, today).map((r) => {
+  // A stream registered by hand for money the books already name (a tenant's
+  // rent paid out by the rental hub) is redundant: it is neither listed nor
+  // called late (rent the hub has not collected shows on its rent invoices).
+  const coveredStreams = streamsCoveredByBooks(cls);
+  const incomeRows = incomeStatus((expectedIncome || []).filter((e) => !coveredStreams.has(e.id)), posted, cls, today).map((r) => {
     const e = r.stream;
     if (r.status === "late" && !invoiceTracked.has(e.id)) flag(95, "income-late", `${e.label} (${usd0(e.amount)}, due ${fmtD(r.cycle_due)} into ${label(e.account_id)}) has not arrived.`);
     return { label: e.label, amount_fmt: e.amount == null ? "varies" : usd0(e.amount), due_fmt: r.cycle_due ? fmtD(r.cycle_due) : "no fixed day", status: r.status, received_on: r.received_on ? fmtD(r.received_on) : null, account: label(e.account_id) };
@@ -557,7 +583,16 @@ async function main() {
 
   attention.sort((a, b) => b.priority - a.priority);
   attention.forEach((a, i) => { a.id = `a${i + 1}`; });
-  if (questions.length) attention.push({ priority: 30, tag: "questions", id: `a${attention.length + 1}`, text: `${questions.length} open question(s) in the Questions tab need an answer before the review can state them.` });
+  // A question the user already answered in the Questions tab is never asked
+  // again (bin/finance-review-ask). One the records still raise has an answer
+  // they do not hold yet: it goes to `questions_answered`, not `questions`, so
+  // nothing downstream (the to-do list, the footer, the phone pointer) calls it
+  // open or tells the user to answer it.
+  const answeredBefore = await answeredFinanceQuestions();
+  const questionsAnswered = questions.filter((q) => answeredBefore.has(String(q.id)));
+  const waiting = questions.filter((q) => !answeredBefore.has(String(q.id)));
+  if (waiting.length) attention.push({ priority: 30, tag: "questions", id: `a${attention.length + 1}`, text: `${waiting.length} open question(s) in the Questions tab need an answer before the review can state them.` });
+  if (questionsAnswered.length) attention.push({ priority: 29, tag: "answers-unrecorded", id: `a${attention.length + 1}`, text: `${questionsAnswered.length} question(s) you already answered are not in the records yet, so this review still treats them as open.` });
 
   // Facts the summary may cite. Every one is a sentence this code wrote.
   const facts = [
@@ -577,7 +612,7 @@ async function main() {
       valuation_as_of: reconciledDate,
       classifier: "lib/finance-classify.js — every transaction's kind and the rule that set it",
     },
-    attention, facts, questions,
+    attention, facts, questions: waiting, questions_answered: questionsAnswered,
     cash: {
       position: cashPos ? {
         free_cash_fmt: usd0(cashPos.free_cash), free_cash_week_delta_fmt: signed(cashPos.free_cash_week_delta),
@@ -601,7 +636,7 @@ async function main() {
       upcoming_14d: upcoming, shortfalls, unconfirmed_card_payments: unconfirmedPayments,
     },
     invoices: inv.section, invoices_label: (RF.invoices && RF.invoices.label) || "Client",
-    income: { registered: incomeRows, rent: rentRows, rent_invoices_open: rentInvoicesOpen, rent_invoices_failed: rentInvoicesFailed, rent_check_from_day: rentCheckDay, note: expectedIncome?.length ? null : "No income streams are registered; none is reported as late. Register with `finance-facts income add`." },
+    income: { registered: incomeRows, covered_by_books: [...coveredStreams], rent: rentRows, rent_invoices_open: rentInvoicesOpen, rent_invoices_failed: rentInvoicesFailed, rent_check_from_day: rentCheckDay, note: expectedIncome?.length ? null : "No income streams are registered; none is reported as late. Register with `finance-facts income add`." },
     real_estate: re ? {
       properties: props.map(propRow), short_term: groupRow(re.groups.short_term), long_term: groupRow(re.groups.long_term), portfolio: groupRow(re.portfolio),
       sold_this_year: re.sold_this_year.map((r) => ({ name: r.name, disposed_on_fmt: fmtD(r.disposed_on), ytd_net_fmt: signed(r.ytd.net) })),
