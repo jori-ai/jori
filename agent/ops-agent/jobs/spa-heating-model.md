@@ -91,19 +91,31 @@ even after the ambient and heating-phase fixes. They still count in
 `sessions_fit`, so it grows each month. Report it next to `sessions_usable` so a small `n` is read as a small
 `n`.
 
-**Sessions the user ruled out stay out.** `exclude_sessions` in
-`agent/local/config/spa.json` (`{ session_id, reason, decided }`) drops a session
-before any count, median or fit, and the packet lists it as `excluded_sessions`.
-Add an entry only on the user's own word about that session, quoting it in
-`reason`; it covers that one session, never a rule about a kind of session. Never
-put an excluded session back into the per-session table or any figure, and say in
-one line of the email that it is excluded and why (their words).
+**Sessions that don't make sense stay out.** Three ways a session leaves every
+count, median and fit (and the per-session table), each listed in the packet:
+
+- `exclude_sessions` in `agent/local/config/spa.json` (`{ session_id, reason, decided }`)
+  — sessions the user ruled out by name; the packet lists them as `excluded_sessions`.
+- `stall_f_per_min` in the same file — a heating-phase rate under it is a stalled
+  heater, dropped automatically and listed as `stalled_sessions` (possible heater
+  faults).
+- The user's standing word to disregard any session that doesn't make sense: when
+  the table holds one that cannot be a real warm-up (a rate or temperature the
+  heater and water could not produce, a clock or sensor glitch), add it to
+  `exclude_sessions` yourself, quoting that standing word in `reason` and naming
+  the physical impossibility. Judge by the physics, never by how much a session
+  moves the fit. A merely slow, noisy or off-season session is data, not an error.
+
+Never put an excluded or stalled session back into any figure. Name each one in one
+line of the email (id or date, rate, why), and on the run it first appears say it was
+dropped under the standing word so the user can overrule it.
 
 Key fields:
 
 | Field | Meaning |
 |---|---|
 | `excluded_sessions` | Sessions the user ruled out (kept out of everything below) |
+| `stalled_sessions` | Sessions under `stall_f_per_min`: possible heater faults, kept out of everything below |
 | `sessions_usable` | Sessions with a settled baseline and >10 min of heating |
 | `sessions_fit` | Tick-measured sessions with ambient data — the only ones `model` is fitted on |
 | `ambient_range` | Air-temp span of the fit set — the honesty check on the fit |

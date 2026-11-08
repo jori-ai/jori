@@ -58,7 +58,16 @@ const { localConfig } = require("../lib/instance.cjs");
 // `exclude_sessions`: sessions the user ruled out of the analysis, as
 // `{ session_id, reason, decided }` (a bare id string also works). They are
 // dropped before any count or fit and listed in the packet as `excluded_sessions`.
-const CFG = localConfig("spa", { server_url: "", fallback_f_per_min: null, exclude_sessions: [] });
+// `stall_f_per_min`: a session whose heating-phase rate falls below this is a
+// stalled heater, not a measurement. It is dropped the same way and listed as
+// `stalled_sessions`. Unset = nothing is dropped for being slow.
+const CFG = localConfig("spa", {
+  server_url: "",
+  fallback_f_per_min: null,
+  exclude_sessions: [],
+  stall_f_per_min: null,
+});
+const STALL_F_PER_MIN = Number(CFG.stall_f_per_min) > 0 ? Number(CFG.stall_f_per_min) : null;
 const EXCLUDED = new Map(
   (Array.isArray(CFG.exclude_sessions) ? CFG.exclude_sessions : [])
     .map((e) => (typeof e === "string" ? { session_id: e } : e))
@@ -181,6 +190,7 @@ async function main() {
 
   // Per-session slope from the tick curve where available.
   const rows = [];
+  const stalled = [];
   for (const s of usable) {
     const ticks =
       (await fetchJson(
@@ -225,6 +235,15 @@ async function main() {
       waterMean = (lo + hi) / 2;
     }
     if (!rate || rate <= 0) continue;
+    if (STALL_F_PER_MIN != null && rate < STALL_F_PER_MIN) {
+      stalled.push({
+        session_id: s.session_id,
+        started_at: s.started_at,
+        f_per_min: Number(rate.toFixed(4)),
+        rate_source: rateSource,
+      });
+      continue;
+    }
 
     const weatherAir = s.weather_air_temp_f == null ? null : Number(s.weather_air_temp_f);
     const phaseAir = phase ? phase.map((t) => t.air_temp).filter((a) => a != null).map(Number) : [];
@@ -305,6 +324,9 @@ async function main() {
         reason: EXCLUDED.get(String(s.session_id)).reason ?? null,
         decided: EXCLUDED.get(String(s.session_id)).decided ?? null,
       })),
+    // Sessions slower than `stall_f_per_min`: possible heater faults, kept out
+    // of every count and fit. Name them in the report.
+    stalled_sessions: stalled,
     sessions_usable: rows.length,
     // Tick-measured sessions with ambient — the set `model` is fitted on.
     sessions_fit: withGap.length,
@@ -379,6 +401,11 @@ async function main() {
       `fallback: ${packet.current_fallback ? `${packet.current_fallback.min_per_degree} min/°F` : "(not set)"}` +
         (packet.observed ? `   observed median: ${packet.observed.median_min_per_degree} min/°F` : "")
     );
+    if (packet.stalled_sessions.length) {
+      console.log(
+        `stalled:  ${packet.stalled_sessions.map((e) => `${e.session_id} (${e.f_per_min} °F/min)`).join(", ")} (under ${STALL_F_PER_MIN} °F/min, left out)`
+      );
+    }
     if (packet.excluded_sessions.length) {
       console.log(`excluded: ${packet.excluded_sessions.map((e) => e.session_id).join(", ")} (spa.json exclude_sessions)`);
     }
