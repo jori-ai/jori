@@ -290,6 +290,46 @@ async function main() {
     internal_transfers: round2(sum(wk.filter((t) => out(t) && kindOf(t) === "internal_transfer"), amt)),
   };
   const flowFmt = Object.fromEntries(Object.entries(flow).map(([k, v]) => [`${k}_fmt`, usd0(v)]));
+  // What each line of the flow is made of: rows grouped by who and which
+  // account, summing to the line to the cent (the user, 2026-11-08: "if
+  // income is X, the income rows should show how it sums up to X").
+  const streamLabel = new Map((expectedIncome || []).map((e) => [e.id, e.label]));
+  const describe = (t) => {
+    const v = cls.get(t.transaction_id) || {};
+    if (v.expected_income_id && streamLabel.has(v.expected_income_id)) return streamLabel.get(v.expected_income_id);
+    const names = (v.tenants || []).map((x) => (typeof x === "string" ? x : x?.name)).filter(Boolean);
+    if (names.length) return `${v.kind === "deposit_in" ? "Deposit" : "Rent"} — ${names.join(", ")}${v.period ? ` (${v.period})` : ""}`;
+    // A bank ACH line ("PAYER DES:Rent-cr ID:123 INDN:…") is named by its payer
+    // and entry description, so one payer's payouts group into one row.
+    const ach = !t.merchant_name && /^(.*?)\s+DES:\s*(\S+)/.exec(String(t.name || "")); // lang-regex-ok: bank-generated ACH descriptor
+    const base = ach ? `${ach[1].trim()} — ${ach[2]}` : who(t);
+    if (v.rule === "books_category" && (v.categories || []).length) return `${base} · ${v.categories.join(", ")}`;
+    return base;
+  };
+  const breakdown = (rows) => {
+    const g = new Map();
+    for (const t of rows) {
+      const k = `${describe(t)}|${t.account_id}`;
+      if (!g.has(k)) g.set(k, { what: describe(t), account: label(t.account_id), count: 0, cents: 0, dates: [] });
+      const x = g.get(k); x.count += 1; x.cents += Math.round(amt(t) * 100); x.dates.push(t.date);
+    }
+    return [...g.values()].sort((a, b) => b.cents - a.cents).map((x) => ({
+      what: x.what, account: x.account, count: x.count, amount: x.cents / 100, amount_fmt: usd(x.cents / 100),
+      dates_fmt: [...new Set(x.dates.sort())].map(fmtD).join(", "),
+    }));
+  };
+  const flowRows = {
+    income_in: wk.filter((t) => !out(t) && kindOf(t) === "income"),
+    deposits_in: wk.filter((t) => !out(t) && kindOf(t) === "deposit_in"),
+    unexplained_in: wk.filter((t) => !out(t) && kindOf(t) === "inflow_unexplained"),
+    from_your_other_accounts: wk.filter((t) => !out(t) && kindOf(t) === "transfer_external"),
+    refunds: wk.filter((t) => !out(t) && kindOf(t) === "refund"),
+    card_payments_from_bank: wk.filter((t) => out(t) && kindOf(t) === "card_payment" && acct(t.account_id).type === "depository"),
+    to_your_other_accounts: wk.filter((t) => out(t) && kindOf(t) === "transfer_external"),
+    capital: wk.filter((t) => out(t) && kindOf(t) === "capital"),
+    unreviewed_large: wk.filter((t) => out(t) && kindOf(t) === "unreviewed_large"),
+  };
+  const flowDetail = Object.fromEntries(Object.entries(flowRows).map(([k, rows]) => [k, { total: flow[k], total_fmt: usd(flow[k]), rows: breakdown(rows) }]));
   const unexplainedRows = wk.filter((t) => !out(t) && kindOf(t) === "inflow_unexplained")
     .sort((a, b) => amt(b) - amt(a))
     .map((t) => ({ id: t.transaction_id, date: t.date, amount: amt(t), amount_fmt: usd(amt(t)), account: label(t.account_id), who: who(t) }));
@@ -673,7 +713,7 @@ async function main() {
         delta_note: `bank week-on-week is reconstructed from posted transactions; the ${BROKER.label}'s is measured against its own daily history`,
       } : null,
       card_debt_fmt: usd0(cardDebt),
-      flow: { ...flowFmt, unexplained_rows: unexplainedRows },
+      flow: { ...flowFmt, unexplained_rows: unexplainedRows, detail: flowDetail },
       runway_days: runway, daily_spend_fmt: dailySpend ? usd0(dailySpend) : null,
       runway_basis: "free cash ÷ average daily classified spending over the last 90 days (excludes transfers, card payments, capital and unclassified large outflows)",
       upcoming_14d: upcoming, shortfalls, unconfirmed_card_payments: unconfirmedPayments,
