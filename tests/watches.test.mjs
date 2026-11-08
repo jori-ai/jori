@@ -135,9 +135,9 @@ test("event watch: a 3am match is held until 08:00, then fires", async () => {
     judgeMatch: async (rule, item) => { calls.judged.push(item.subject_key); return { verdict: item.type === "mail.piece" ? "match" : "no_match", used: "jev" }; },
   });
   W.spoolEvents([{ type: "mail.piece", subject_key: "mail:abc:mailer-1.jpg", summary: "Physical mail piece arriving today (USPS scan of the envelope reads: ACME BANK / PO BOX 15284)", data: {} }]);
-  await W.tick({ nowMs: Date.parse("2026-10-27T07:00:00Z"), deps }); // 03:00 EDT
+  await W.tick({ nowMs: Date.parse("2026-10-27T07:00:00Z"), deps, anyTime: false }); // 03:00 EDT
   assert.equal(calls.sent.length, 0);
-  await W.tick({ nowMs: Date.parse("2026-10-27T12:30:00Z"), deps }); // 08:30 EDT
+  await W.tick({ nowMs: Date.parse("2026-10-27T12:30:00Z"), deps, anyTime: false }); // 08:30 EDT
   assert.equal(calls.sent.length, 1);
   assert.match(calls.sent[0].text, /ACME BANK/);
   assert.equal(calls.judged.length, 1);
@@ -236,6 +236,35 @@ test("tracking: every step lands in watch_events and the scorecard reads it back
   assert.equal(s.feedback.length, 1);
   assert.equal(s.misses.length, 1);
   assert.equal(s.firings.median_late_min, 0);
+});
+
+test("email action: the event summary becomes the subject; a failed email with nothing else sent is retried", async () => {
+  reset();
+  const spec = { id: "power-back", title: "Power back at the property", trigger: { kind: "event", listens: ["ups.*"], condition: "power came back" },
+    action: { email: { subject_from: "event" }, notify: undefined }, recurrence: "each" };
+  delete spec.action.notify;
+  W.upsertRule(spec);
+  const mails = [];
+  let fail = true;
+  const { deps } = fakeDeps({
+    judgeMatch: async () => ({ verdict: "match", used: "jev" }),
+    sendEmail: (m, id) => { if (fail) throw new Error("smtp down"); mails.push({ ...m, id }); return { delivery: "sent" }; },
+  });
+  W.spoolEvents([{ type: "ups.power_restored", subject_key: "ups:1", summary: "Power is back after about 12 min on battery.", data: {} }]);
+  const nowMs = Date.parse("2026-10-27T14:00:00Z");
+  await W.tick({ nowMs, deps });
+  assert.equal(mails.length, 0);
+  assert.equal(W.getMatch("power-back", "ups:1").fired_at, null, "not marked fired when the email failed");
+  fail = false;
+  await W.tick({ nowMs: nowMs + 60e3, deps });
+  assert.equal(mails.length, 1);
+  assert.equal(mails[0].subject, "Power is back after about 12 min on battery.");
+  assert.equal(mails[0].id, "power-back");
+  assert.ok(W.getMatch("power-back", "ups:1").fired_at);
+});
+
+test("email action: spec validation", () => {
+  assert.throws(() => W.upsertRule({ id: "bad-email", title: "x", trigger: { kind: "at", at: "2027-01-01T00:00:00Z" }, action: { email: "yes" } }), /action\.email/);
 });
 
 test("fire_any_time: only an explicit true lets firings out of the awake window", () => {
