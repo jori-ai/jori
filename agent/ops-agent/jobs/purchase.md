@@ -57,6 +57,7 @@ Open the site. If already signed in, skip to Step 2.
    - It tries the password manager's website logins (`site-pass`, matched by the item's website URL; several accounts on one site → the `op_item` pinned in `purchase-merchants.json`, else the user's own address, else the newest), then the installation's own `site:<domain>` items (`dev-pass`). Exit 5 = none had it. Tell the user they can sign in from the phone (the `shop-view link` above), or save the <site> login in the password manager for next time. Stop.
 2. **2FA.** Note `SINCE=$(date +%s)` immediately BEFORE you trigger the code (choose "text me" or "email me"; prefer whichever the site defaults to). Then:
    `~/Dev/jori/bin/purchase otp <site> --since $SINCE --wait 120`
+   (Calling it right after the trigger also opens the window in which Gmail intake files that merchant's code email by itself: read, no label, star or ping.)
    It returns candidates from SMS (Messages on the host, when it receives the user's texts) and Gmail, newest first, flagged `mentions_site`. Use the newest code that mentions the site; if none do, use one only when exactly one code arrived in the window. Type it with `cdp.py eval` into the code field. If nothing arrives, tell the user and stop — never request codes repeatedly (lockouts).
    - An authenticator-app / passkey / push-to-phone challenge you can't complete: tell the user what the site is asking for, with the `shop-view link` so the user can finish it from the phone, and stop.
 3. Tick "keep me signed in" when offered, so next time skips this.
