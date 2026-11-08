@@ -301,6 +301,8 @@ async function main() {
   const describe = (t) => {
     const v = cls.get(t.transaction_id) || {};
     if (v.expected_income_id && streamLabel.has(v.expected_income_id)) return streamLabel.get(v.expected_income_id);
+    // The user's own words for it (finance-facts txn --note), when short enough to be a name.
+    if (v.rule === "override" && v.note && String(v.note).length <= 60) return String(v.note);
     const names = (v.tenants || []).map((x) => (typeof x === "string" ? x : x?.name)).filter(Boolean);
     if (names.length) return `${v.kind === "deposit_in" ? "Deposit" : "Rent"} — ${names.join(", ")}${v.period ? ` (${v.period})` : ""}`;
     // A bank ACH line ("PAYER DES:Rent-cr ID:123 INDN:…") is named by its payer
@@ -377,7 +379,7 @@ async function main() {
     ask(`account-external:${m[1]}`, `Whose is ${institutionOf(t)} account ••${m[1]}? ${usd(amt(t))} went ${out(t) ? "to" : "from"} it from ${label(t.account_id)} on ${fmtD(t.date)}.`, `Say whose it is; it is recorded in the account map's known_external_accounts.`);
   }
   // A deposit made at a branch counter says nothing about whose money it was: ask.
-  for (const t of wk.filter((t) => !out(t) && /FIN CTR .*?DEPOSIT/i.test(String(t.name || "")) && amt(t) >= 500)) { // lang-regex-ok: bank-generated branch-deposit descriptor
+  for (const t of wk.filter((t) => !out(t) && /FIN CTR .*?DEPOSIT/i.test(String(t.name || "")) && amt(t) >= 500 && cls.get(t.transaction_id)?.rule !== "override")) { // lang-regex-ok: bank-generated branch-deposit descriptor
     ask(`txn:${t.transaction_id}`, `What was the ${usd(amt(t))} deposited at the ${institutionOf(t)} branch on ${fmtD(t.date)} into ${label(t.account_id)}?`, `finance-facts txn ${t.transaction_id} --kind income|refund|transfer_external --note "..."`);
   }
   const flowDetail = Object.fromEntries(Object.entries(flowRows).map(([k, rows]) => [k, { total: flow[k], total_fmt: usd(flow[k]), rows: breakdown(rows, k === "income_in") }]));
