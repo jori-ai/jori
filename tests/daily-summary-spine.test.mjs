@@ -390,3 +390,68 @@ test("JORI_WALK_CUT_AT_STOP=0 gives the old lines", () => {
     assert.match(hopText(movementHtml(d, cutBakery, cutHome)), /Walked 0\.7 miles along Main Street, about 17 min, 2,600 steps\./);
   } finally { delete process.env.JORI_WALK_CUT_AT_STOP; }
 });
+
+// 2026-11-07: three ways a day's report disagreed with its own numbers at the edge of a
+// stop. A 12-minute stay at a known place came out of the rests re-cut as 9 minutes and
+// fell under the 10-minute bar though the phone's own visit record had it at 12, so the
+// stop vanished from the email while the fact sheet still listed it; and a walk the step
+// counter found was printed with its own times under a stop that began after it.
+const EDGE_T0 = Date.parse("2026-11-07T13:00:00Z");
+const edgeAt = (min) => EDGE_T0 + min * 60000;
+const edgeKnown = (extra = {}) => ({
+  id: "s-1", place: { name: "Home", source: "named_location" }, duration_min: 9,
+  start_ts_ms: edgeAt(0), end_ts_ms: edgeAt(9), ...extra,
+});
+const edgeRow = (fromMin, toMin) => ({ start_ms: edgeAt(fromMin), end_ms: edgeAt(toMin), place_type: "named" });
+
+test("a known stop the rests re-cut left at 9 minutes counts when the phone's own visit record holds it at 12", () => {
+  assert.equal(_internal.isMainStop(edgeKnown({ confirmed_row: edgeRow(-3, 9) })), true);
+  assert.equal(_internal.isMainStop(edgeKnown()), false, "no visit record: the 9 minutes stand");
+});
+
+test("a visit record far longer than the stop is a container, not the stop's own", () => {
+  // the overnight row behind a step out of the door
+  assert.equal(_internal.isMainStop(edgeKnown({ confirmed_row: edgeRow(-500, 9) })), false);
+});
+
+test("a visit record under the bar changes nothing, and JORI_STOP_OWN_VISIT=0 turns the rule off", () => {
+  assert.equal(_internal.isMainStop(edgeKnown({ duration_min: 6, end_ts_ms: edgeAt(6), confirmed_row: edgeRow(-1, 6) })), false);
+  process.env.JORI_STOP_OWN_VISIT = "0";
+  try { assert.equal(_internal.isMainStop(edgeKnown({ confirmed_row: edgeRow(-3, 9) })), false); }
+  finally { delete process.env.JORI_STOP_OWN_VISIT; }
+});
+
+const edgeWalk = (fromMin, toMin, steps) => ({
+  kind: "in_stop", stop_id: "s-2", start_ms: edgeAt(fromMin), end_ms: edgeAt(toMin), mins: toMin - fromMin, steps,
+});
+const edgeVenue = { id: "s-2", start_ts_ms: edgeAt(4), end_ts_ms: edgeAt(100), tz: "UTC" };
+const edgeDay = (walks) => ({ date: "2026-11-07", tz: "UTC", steps: { walks } });
+
+test("a walk that began before its stop is printed from the stop's start, with its share of the steps", () => {
+  const [w] = _internal.stopWalks(edgeDay([edgeWalk(0, 16, 1600)]), edgeVenue, [edgeVenue]);
+  assert.equal(w.start_ms, edgeAt(4));
+  assert.equal(w.end_ms, edgeAt(16));
+  assert.equal(w.mins, 12);
+  assert.equal(w.steps, 1200);
+});
+
+test("a walk inside its stop is untouched", () => {
+  const whole = edgeWalk(20, 32, 900);
+  const [w] = _internal.stopWalks(edgeDay([whole]), edgeVenue, [edgeVenue]);
+  assert.deepEqual(w, whole);
+});
+
+test("what is left of a walk after the cut must still be a walk", () => {
+  // 3 of its 10 minutes are inside the stop: not enough to print
+  assert.deepEqual(_internal.stopWalks(edgeDay([edgeWalk(-7, 7, 800)]), edgeVenue, [edgeVenue]), []);
+  // 12 of its 76 minutes are inside, and its share of the steps is under the bar
+  assert.deepEqual(_internal.stopWalks(edgeDay([edgeWalk(-60, 16, 2000)]), edgeVenue, [edgeVenue]), []);
+});
+
+test("JORI_WALK_CLIP_TO_STOP=0 brings back the whole walk", () => {
+  process.env.JORI_WALK_CLIP_TO_STOP = "0";
+  try {
+    const [w] = _internal.stopWalks(edgeDay([edgeWalk(0, 16, 1600)]), edgeVenue, [edgeVenue]);
+    assert.equal(w.start_ms, edgeAt(0));
+  } finally { delete process.env.JORI_WALK_CLIP_TO_STOP; }
+});
