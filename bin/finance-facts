@@ -8,9 +8,15 @@
 //   finance-facts txn <transaction_id> --kind capital|expense|income|internal_transfer|card_payment|refund|deposit_in|deposit_refund|tax|transfer_external|ignore --note "..." [--property <id>]
 //   finance-facts income add --id <slug> --label "..." --account <mask|account_id> --contains "<bank text>" [--amount N]
 //                            --cadence monthly|semimonthly|biweekly|quarterly [--day D] --from YYYY-MM-DD --note "..." [--tolerance N] [--grace N] [--to YYYY-MM-DD]
+//       Refused for money the rental books already name (the hub's rent and deposit payouts): the review counts those itself.
 //   finance-facts payment add --id <slug> --label "..." --kind card_payment|loan|bill|tax|other --funding <mask|account_id>
 //                            --contains "<bank text>" --rule fixed|current_balance|statement_balance|minimum [--amount N]
 //                            --day D --autopay yes|no --note "..." [--target <mask|account_id>]
+//   finance-facts payment manual --funding <mask|account_id> --contains "<bank text>" --note "<the user's words>" [--label "..."]
+//       A payee the user pays by hand, NOT a scheduled payment: the review stops asking whether it is one.
+//   finance-facts account <mask> --note "<the user's words>"
+//       An account the review asked about that belongs to no property or pot in the hub's registry (account map
+//       `known_unregistered`): the review stops asking. One that does belong somewhere is added in the hub.
 //   finance-facts deposits                          the reconciled deposit table (fin_deposits)
 //   finance-facts deposit-answer <bank row id> --whose "Tenant, Tenant" [--unknown "Tenant"] --said "<the user's words>" [--dry-run]
 //       Whose money a transfer into the deposit account was, when the hub links it wrongly or the review asked
@@ -29,7 +35,9 @@
 
 const { loadEnv } = require("../lib/load-env.js");
 const { request } = require("../lib/supabase-rest.js");
+const { localConfig } = require("../lib/instance.cjs");
 loadEnv();
+const RF = localConfig("rental-finance", { accounts_map_file: "" });
 
 const TABLES = {
   txn: { table: "fin_txn_override", key: "transaction_id" },
@@ -51,6 +59,39 @@ async function accountId(ref) {
   if (hit.length !== 1) die(`account "${ref}" matched ${hit.length} accounts (use the account_id): ${rows.map((a) => `${a.name} ••${a.mask}`).join(", ")}`);
   return hit[0].account_id;
 }
+
+// Which credits into an account carrying this bank text the rental books
+// already name: payouts the hub sent (a tenant's rent or deposit), linked or
+// matched by rental-ledger.js payoutsForBankRows, over the last 120 days.
+// Unreadable books = none (the stream is recorded, as before).
+async function namedByBooks(accountId, contains) {
+  const ledger = require("../lib/rental-ledger.js");
+  // firestore() exits the process when its key is missing; this check must
+  // never cost the user their recording, so find the key the same way first.
+  const cfg = ledger.config();
+  if (!cfg.firebase_project) return [];
+  try { require("../lib/firestore-rest.js").loadServiceAccount(cfg.service_account_env || undefined); } catch { return []; }
+  const since = new Date(Date.now() - 120 * 86400000).toISOString().slice(0, 10);
+  try {
+    const [accounts, rows] = await Promise.all([
+      request("/rest/v1/plaid_accounts?select=account_id,mask"),
+      request(`/rest/v1/plaid_transactions?select=transaction_id,account_id,amount,date,name,merchant_name&account_id=eq.${encodeURIComponent(accountId)}&amount=lt.0&date=gte.${since}`),
+    ]);
+    const needle = String(contains).toLowerCase();
+    const posted = (rows || []).filter((t) => `${t.merchant_name || ""} ${t.name || ""}`.toLowerCase().includes(needle));
+    if (!posted.length) return [];
+    const [ledgerRows, payouts] = await Promise.all([
+      ledger.loadTransactions({ since, until: ledger.today() }),
+      ledger.firestore().list("billing-payouts").catch(() => []),
+    ]);
+    const hits = ledger.payoutsForBankRows({ ledgerRows, payouts, posted, accounts, depositSlug: RF.deposit_payout_slug || "security-deposits" });
+    return posted.filter((t) => hits.has(t.transaction_id)).map((t) => ({ date: t.date, ...hits.get(t.transaction_id) }));
+  } catch (e) {
+    console.error(`finance-facts: could not read the rental books (${e.message}); recording anyway.`);
+    return [];
+  }
+}
+
 const upsert = (t, row) => request(`/rest/v1/${TABLES[t].table}?on_conflict=${TABLES[t].key}`, { method: "POST", body: [row], prefer: "resolution=merge-duplicates,return=representation" });
 
 async function main() {
@@ -83,8 +124,17 @@ async function main() {
     return console.log(`recorded: ${t[0].date} ${t[0].amount} "${t[0].name}" → ${r[0].kind}`);
   }
   if (cmd === "income" && a1 === "add") {
+    // Rent and deposits the rental hub collects need no registration: the
+    // review reads those payouts from the books, so a stream for one would only
+    // say it twice (and could call a payout still in the hub's queue late).
+    const acct = await accountId(need("account"));
+    const named = await namedByBooks(acct, need("contains"));
+    if (named.length) {
+      const say = named.slice(0, 3).map((p) => `${p.date} ${p.kind}${p.tenants?.length ? ` from ${p.tenants.join(" & ")}` : ""}${p.period ? ` (${p.period})` : ""}`).join("; ");
+      die(`not recorded: the rental books already name this money (${say}${named.length > 3 ? `; ${named.length - 3} more` : ""}). The review counts the hub's rent and deposit payouts as income or deposits on its own, and a tenant's unpaid rent shows on the hub's rent invoices, so no stream is needed.`);
+    }
     const r = await upsert("income", {
-      id: need("id"), label: need("label"), account_id: await accountId(need("account")), payer_contains: need("contains"),
+      id: need("id"), label: need("label"), account_id: acct, payer_contains: need("contains"),
       // --amount / --day may be omitted for a stream that varies (invoiced by
       // weeks worked): it is then reported, never called late.
       amount: numOpt("amount"), tolerance: numOpt("tolerance") ?? 0, cadence: need("cadence"), due_day: numOpt("day"),
@@ -102,6 +152,40 @@ async function main() {
       autopay: /^y/i.test(need("autopay")), active: true, note: need("note"), confirmed_at: new Date().toISOString(),
     });
     return console.log(`recorded payment ${r[0].id}`);
+  }
+  if (cmd === "payment" && a1 === "manual") {
+    // "That payee bills by hand, it is never scheduled" is an answer, kept as an
+    // inactive row so it is never forecast; the review's card-payment question
+    // matches recorded rows active or not. Due day and amount rule are
+    // required columns and never read on an inactive row.
+    const contains = need("contains");
+    const funding = await accountId(need("funding"));
+    const r = await upsert("payment", {
+      // One per payee per account: the same payee paid from two accounts is two answers.
+      id: `manual-${contains.toLowerCase().split(/[^a-z0-9]+/).filter(Boolean).join("-").slice(0, 40)}-${funding.slice(-6).toLowerCase()}`, // lang-regex-ok: a slug from bank text, not anyone's words
+      label: opt("label") || `${contains} (paid by hand, not scheduled)`, kind: "bill", funding_account_id: funding,
+      target_account_id: null, descriptor_contains: contains, amount_rule: "current_balance", fixed_amount: null, due_day: 1,
+      autopay: false, active: false, note: need("note"), confirmed_at: new Date().toISOString(),
+    });
+    return console.log(`recorded ${r[0].id}: paid by hand, not a scheduled payment`);
+  }
+  if (cmd === "account") {
+    if (!a1) die(`usage: account <mask> --note "<the user's words>"`);
+    if (!RF.accounts_map_file) die("no account map is configured (rental-finance.json accounts_map_file)");
+    const note = need("note");
+    // The review looks accounts up by mask: store the mask even when given an account_id.
+    const id = await accountId(a1);
+    const rows = await request("/rest/v1/plaid_accounts?select=account_id,mask");
+    const mask = String(rows.find((r) => r.account_id === id)?.mask || "");
+    if (!mask) die(`account "${a1}" has no mask to record`);
+    const fs = require("node:fs");
+    const file = require("../lib/root.cjs").installTools(RF.accounts_map_file);
+    let m = {};
+    try { m = JSON.parse(fs.readFileSync(file, "utf8")); } catch (e) { if (e.code !== "ENOENT") die(`cannot read ${file}: ${e.message}`); }
+    m.known_unregistered = { ...(m.known_unregistered || {}), [mask]: note };
+    fs.writeFileSync(`${file}.tmp`, JSON.stringify(m, null, 2) + "\n");
+    fs.renameSync(`${file}.tmp`, file);
+    return console.log(`recorded account ••${mask} as outside the registry on purpose; the review stops asking about it.`);
   }
   if (cmd === "deposits") {
     const rows = await request("/rest/v1/fin_deposits?select=property_name,lease_number,tenant,amount,location,location_account_mask,location_basis,expected_location&order=property_name.asc,lease_number.asc");
@@ -137,7 +221,7 @@ async function main() {
     // finance-deposits-reconcile. Recording them here would be a second truth.
     die(`${cmd} is retired: answer it in the rental hub instead. A bank row's tenants: Financials -> Security deposits ("Whose money was this?"). Where a deposit started, or allowing it outside the deposit account: the tenant's card, Security deposit section.`);
   }
-  console.error(require("node:fs").readFileSync(__filename, "utf8").split("\n").filter((l) => l.startsWith("//")).slice(1, 23).map((l) => l.slice(3)).join("\n"));
+  console.error(require("node:fs").readFileSync(__filename, "utf8").split("\n").filter((l) => l.startsWith("//")).slice(1, 30).map((l) => l.slice(3)).join("\n"));
   process.exit(2);
 }
 

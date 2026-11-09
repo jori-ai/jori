@@ -103,7 +103,10 @@ async function skill(site, action, url, params, cdpHost = OWNER_CDP) {
     }
     return { ok: false, error: r?.error || "runner_error", message: r?.message };
   } catch (e) {
-    return { ok: false, error: "runner_exception", message: String(e.message || e).slice(0, 300) };
+    // A WebSocket failure arrives as an Event with no .message: keep its type so the log says what broke.
+    const message = String(e?.message || (e?.type ? `websocket ${e.type}` : e)).slice(0, 300);
+    log(`skill ${site}/${action} threw: ${message}`);
+    return { ok: false, error: "runner_exception", message };
   }
 }
 
@@ -227,7 +230,7 @@ async function triageUnknown(r, ctx, retry) {
   if (!c) return { r, c: null };
   console.log(JSON.stringify({ error_triage: r.error, class: c.class, source: c.source, show: ctx.show, platform: ctx.platform }));
   if (c.class !== "retryable") return { r, c };
-  await sleep(5000);
+  await sleep(c.source === "builtin" ? 20_000 : 5000);
   const r2 = await retry();
   skillLog(`${ctx.site}/lottery-enter`, "lottery-enter", r2.ok ? null : r2.error, { show: ctx.show, retry_of: r.error, ...(ctx.entrant ? { entrant: ctx.entrant } : {}) });
   return { r: r2, c, retriedFrom: r.error };

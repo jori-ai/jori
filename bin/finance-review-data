@@ -16,14 +16,18 @@
 // statement this packet makes now comes from one of:
 //   * a bank fact (Plaid balances and posted transactions), classified by the
 //     rules in lib/finance-classify.js, each verdict naming its rule;
-//   * a record somebody keeps: the rental ledger (property P&L), the hub's
+//   * a record somebody keeps: the rental ledger (property P&L, and which
+//     bank credits are the hub's rent and deposit payouts, with the hub's
+//     billing-payouts for those it has not linked yet; and what a person in
+//     the hub, or its own rules, filed a bank row under), the hub's
 //     billing-deposits (every tenant's deposit), expense-recurring (every
 //     recurring charge and the decision about it), property_value_reconciled;
 //   * a fact the user recorded with `finance-facts` (fin_* tables): expected
 //     income, confirmed scheduled payments, a verdict on one transaction, where
 //     a deposit is held.
 // Where none of those answers a question, the packet does not answer it: it
-// adds an entry to `questions[]`, and the email asks.
+// adds an entry to `questions[]`, and the Questions tab asks (once: an answer
+// the user already gave is recorded, never asked for again; bin/finance-review-ask).
 //
 // READ-ONLY. Bank data is jori-model-only (health-data tier).
 //
@@ -31,8 +35,9 @@
 //
 // CONFIG (all optional; absent = that section is empty or generic):
 //   agent/local/config/rental-finance.json  the rental books' finance config
-//     (lib/finance-real-estate.js) and `accounts_map_file` (the account map,
-//     relative to the install).
+//     (lib/finance-real-estate.js), `accounts_map_file` (the account map,
+//     relative to the install) and `book_category_kinds` (what a category in
+//     the books makes a transaction, over lib/finance-classify.js's defaults).
 //   agent/local/config/investments.json `broker`  the brokerage tables and
 //     label (lib/broker-config.cjs).
 //   agent/local/config/finance.json `net_worth`  the other asset histories
@@ -43,15 +48,19 @@
 //     `recurring_label` (the recurring-charges tracker), and
 //     `invoice_tracked_streams` (expected-income stream ids the invoice
 //     reconciliation already reports, so they are not also called late).
+//   agent/local/config/loyalty.json  the miles & points section's per-point
+//     values and header tiles (lib/finance-loyalty.js); absent = balances
+//     without dollar values.
 
 const fs = require("node:fs");
 const { loadEnv } = require("../lib/load-env.js");
 const { request, requestAll } = require("../lib/supabase-rest.js");
 const ledger = require("../lib/rental-ledger.js");
 const { attributionFor, bucketOf, buildCashBuckets, buildRealEstate } = require("../lib/finance-real-estate.js");
-const { classify, SPEND_KINDS, LARGE_OUTFLOW } = require("../lib/finance-classify.js");
+const { classify, streamsCoveredByBooks, SPEND_KINDS, LARGE_OUTFLOW } = require("../lib/finance-classify.js");
 const { depositSection } = require("../lib/finance-deposit-reconcile.js");
 const { invoiceSection } = require("../lib/finance-invoice-reconcile.js");
+const { loyaltySection } = require("../lib/finance-loyalty.js");
 const { incomeStatus, scheduledDue } = require("../lib/finance-expected.js");
 const { brokerConfig } = require("../lib/broker-config.cjs");
 const { instance, localConfig } = require("../lib/instance.cjs");
@@ -67,6 +76,8 @@ const FR = localConfig("finance-review", {
   ledger_label: "rental ledger",
   recurring_label: "the Recurring tracker",
   invoice_tracked_streams: [],
+  tax_payee_phrases: [],
+  tax_property_rules: [],
 });
 const MODEL_FILE = installTools("data", "finance-model.json");
 const MAP_FILE = RF.accounts_map_file ? installTools(RF.accounts_map_file) : null;
@@ -98,9 +109,25 @@ const PERSONAL_CATS = new Set(["FOOD_AND_DRINK", "ENTERTAINMENT", "PERSONAL_CARE
 const PROPERTY_CATS = new Set(["HOME_IMPROVEMENT", "RENT_AND_UTILITIES"]);
 const TAX_DUE = ["2026-09-15", "2027-01-15", "2027-04-15", "2027-06-15", "2027-09-15", "2028-01-18"];
 const RECURRING_SKIP_VERDICTS = new Set(["cancel", "already_cancelled", "not_recurring"]);
+// Recurring kinds that are bills, paid as they come, not subscriptions to decide on.
+const BILL_KINDS = new Set(["utility", "insurance", "housing", "tax"]);
 const CADENCE_PER_MONTH = { weekly: 52 / 12, monthly: 1, quarterly: 1 / 3, semiannual: 1 / 6, annual: 1 / 12 };
 
 const load = (file, fallback) => { try { return JSON.parse(fs.readFileSync(file, "utf8")); } catch { return fallback; } };
+
+/** Packet question ids whose latest Questions-tab entry the user answered (the open-questions ledger, lane finance-review). */
+async function answeredFinanceQuestions() {
+  try {
+    const { foldQuestions } = await import("../lib/open-questions.mjs");
+    const latest = new Map();
+    for (const q of foldQuestions().values()) {
+      if (q.lane !== "finance-review" || !q.subject) continue;
+      const cur = latest.get(q.subject);
+      if (!cur || String(q.first_asked_at) > String(cur.first_asked_at)) latest.set(q.subject, q);
+    }
+    return new Set([...latest.values()].filter((q) => q.status === "answered").map((q) => q.subject));
+  } catch { return new Set(); }
+}
 const safe = (p) => p.catch(() => null);
 
 async function main() {
@@ -112,16 +139,18 @@ async function main() {
   const inWin = (t, from, to = today) => t.date > from && t.date <= to;
 
   // ── Records kept in the rental hub (Firestore) ──────────────────────────
-  let reg = null, ledgerTxns = [], unitAvailability = [], tenants = [], leases = [], recurring = [], invoices = [];
+  let reg = null, ledgerTxns = [], unitAvailability = [], tenants = [], leases = [], recurring = [], invoices = [], payouts = [];
   let ledgerError = null;
   try {
     const db = ledger.firestore();
     reg = await ledger.registry();
     const ledgerSince = [`${today.slice(0, 4)}-01-01`, dayAdd(today, -200)].sort()[0];
-    [ledgerTxns, unitAvailability, tenants, leases, recurring, invoices] = await Promise.all([
+    [ledgerTxns, unitAvailability, tenants, leases, recurring, invoices, payouts] = await Promise.all([
       ledger.loadTransactions({ since: ledgerSince, until: today }),
       db.list("unit-availability"), db.list("tenants"), db.list("leases"),
       db.list("expense-recurring"), db.list("billing-invoices"),
+      // Only the not-yet-linked fallback needs these; without them the hub's own links still count.
+      db.list("billing-payouts").catch(() => []),
     ]);
   } catch (e) { ledgerError = e.message; }
 
@@ -148,6 +177,17 @@ async function main() {
     request("/rest/v1/fin_deposit_reconciliations?select=run_at,report&order=run_at.desc&limit=1"),
     request(`/rest/v1/fin_invoice_reconciliations?select=run_at,report&payer=eq.${encodeURIComponent(INST.owner_id || "")}&order=run_at.desc&limit=1`),
   ]);
+
+  // ── Miles & points (bin/awardwallet-sync's snapshot; absent tables = no section) ──
+  const [loyaltyRows, loyaltyHistory] = await Promise.all([
+    safe(request("/rest/v1/loyalty_accounts?select=account_id,owner_kind,owner_name,provider_code,display_name,kind,balance_raw,elite_status,last_retrieve_date,error_code,sub_accounts")),
+    safe(request(`/rest/v1/loyalty_balance_history?select=account_id,as_of_date,balance_raw&as_of_date=gte.${dayAdd(today, -21)}&order=as_of_date.asc`)),
+  ]);
+  const loyalty = loyaltyRows?.length ? loyaltySection({
+    rows: loyaltyRows, history: loyaltyHistory || [], today, weekStart: wkStart, tz: INST.tz, ownerName: INST.owner_name || "",
+    lastOk: (load(installTools("data", "awardwallet-sync-state.json"), {}) || {}).last_ok || {},
+    config: localConfig("loyalty", {}),
+  }) : null;
   const posted = (txns || []).filter((t) => !t.pending);
   const acctById = new Map((accounts || []).map((a) => [a.account_id, a]));
   const acct = (id) => acctById.get(id) || {};
@@ -155,9 +195,16 @@ async function main() {
   const reconciled = (reconciledAll || []).filter((r) => r.as_of_date === reconciledDate);
 
   const attention = [];
-  const flag = (priority, tag, text) => attention.push({ priority, tag, text });
+  // `action`, when a flag has exactly one fix the records can name (a move, from
+  // where to where, for how much; the page where it is answered), is that fix.
+  const flag = (priority, tag, text, action = null) => attention.push({ priority, tag, text, ...(action ? { action } : {}) });
   const questions = [];
-  const ask = (id, text, answer_with) => { if (!questions.some((q) => q.id === id)) questions.push({ id, text, answer_with }); };
+  // `choices`: [{label, key}] when the answer is one of a few fixed things. bin/finance-review-ask then
+  // sends the question as a tappable card; `key` is the value finance-facts takes (`--kind`).
+  const ask = (id, text, answer_with, choices = null) => {
+    if (questions.some((q) => q.id === id)) return;
+    questions.push({ id, text, answer_with, ...(choices?.length >= 2 ? { options: choices.map((c) => c.label), option_keys: choices.map((c) => c.key ?? null) } : {}) });
+  };
 
   // ── Accounts: which property / pot each belongs to, on a date ───────────
   const KIND_TO_GROUP = { property: "property", business: "business", personal: "personal", buffer: "deposits" };
@@ -183,12 +230,65 @@ async function main() {
   // was decided (the account map's `known_unregistered`: {mask: reason}).
   const knownOut = map.known_unregistered || {};
   for (const a of (accounts || []).filter((x) => ["depository", "credit"].includes(x.type) && gmap[x.account_id]?.group === "unmapped" && !knownOut[String(x.mask)])) {
-    flag(45, "unmapped-account", `${a.name} ••${a.mask} (${usd0(num(a.balance_current))}) is not in the account registry, so it is in no cash total.`);
+    flag(45, "unmapped-account", `${a.name} ••${a.mask} (${usd0(num(a.balance_current))}) is not in the account registry, so it is in no cash total.`, "Add it in the hub: Financials → Accounts.");
     ask(`account:${a.mask}`, `Which property or pot does ${a.name} ••${a.mask} belong to?`, "Add it in the hub's Financials → Accounts (the registry), or close it.");
   }
 
   // ── Classification: what every transaction IS ───────────────────────────
-  const cls = classify(posted, accounts, { overrides, expectedIncome, depositAccountIds, largeOutflow: map.large_outflow_usd || LARGE_OUTFLOW });
+  // The rental books know which credits are the hub's payouts: a named
+  // tenant's rent or their security deposit. Asking the user about those is
+  // asking about every tenant's rent, one new lease at a time.
+  const bookVerdicts = new Map([...ledger.payoutsForBankRows({ ledgerRows: ledgerTxns, payouts, posted, accounts, depositSlug: RF.deposit_payout_slug || "security-deposits" })].map(([id, p]) => [id, {
+    kind: p.kind === "deposit" ? "deposit_in" : "income",
+    rule: p.source === "hub_link" ? "rental_books_payout" : "rental_payout_record",
+    payout_id: p.payout_id, tenants: p.tenants, period: p.period,
+  }]));
+  // Large outflows a kept record already explains: the recurring tracker
+  // follows every bill (tax, utility, insurance, housing) by its merchant key,
+  // so a bill it expected is not asked about again. (What a person filed a row
+  // under in the rental books is read by classify's own books rule.)
+  const billDesc = (t) => `${t.merchant_name || ""} ${t.name || ""}`.toLowerCase().replace(/[*#]+/g, " ").replace(/\s+/g, " ");
+  const tracked = (recurring || []).map((r) => {
+    const d = r.detected || {}, e = r.enrichment || {}, o = r.override || {};
+    return { id: r.id, d, kind: o.kind || e.kind, name: o.name || e.name || d.descriptor };
+  }).filter((x) => x.d.active && String(x.d.merchantKey || "").length >= 4);
+  const trackedFor = (t) => tracked.find((x) => (x.d.chargeIds || []).includes(t.transaction_id)
+    || (billDesc(t).includes(String(x.d.merchantKey).toLowerCase()) && (!x.d.plaidCategory || x.d.plaidCategory === t.category_detailed)));
+  const known = new Map();
+  for (const t of posted.filter((t) => Number(t.amount) > 0)) {
+    const bill = trackedFor(t);
+    if (bill && BILL_KINDS.has(bill.kind)) known.set(t.transaction_id, { kind: bill.kind === "tax" ? "tax" : "expense", rule: "recurring_tracker", note: `${bill.name} (${FR.recurring_label})`, name: bill.name });
+  }
+  // A tracked bill already paid this cycle: a matching charge from 45 days
+  // before its expected date until today.
+  const paidThisCycle = (x) => {
+    if (!x.d.nextExpected) return null;
+    const from = dayAdd(x.d.nextExpected, -45);
+    const hits = posted.filter((t) => Number(t.amount) > 0 && t.date >= from && t.date <= today && trackedFor(t) === x);
+    if (!hits.length) return null;
+    const total = round2(sum(hits, (t) => Math.abs(Number(t.amount))));
+    const lastYear = String(x.d.lastCharged || "").slice(0, 4);
+    const priorAll = (x.d.charges || []).filter((c) => c.date && c.date.slice(0, 4) === lastYear);
+    // Last cycle, for the same property only: a bill a property the user has
+    // since sold paid (the account's owner on that date) is not due again.
+    const propOn = (accountId, date) => (reg ? groupOf(acct(accountId), date).propertyId : null);
+    const nowProps = new Set(hits.map((t) => propOn(t.account_id, t.date)).filter(Boolean));
+    const prior = nowProps.size ? priorAll.filter((c) => nowProps.has(propOn(c.accountId, c.date))) : priorAll;
+    const others = priorAll.filter((c) => !prior.includes(c));
+    const otherNames = [...new Set(others.map((c) => propOn(c.accountId, c.date)).filter(Boolean).map((id) => reg?.propertyById?.get(id)?.name || id))];
+    return {
+      total, total_fmt: usd(total), on_fmt: fmtD(hits.map((t) => t.date).sort().pop()), count: hits.length,
+      last_cycle_fmt: prior.length ? usd0(sum(prior, (c) => c.amountCents / 100)) : null, last_cycle_count: prior.length,
+      last_cycle_other_fmt: others.length ? `${usd0(sum(others, (c) => c.amountCents / 100))} for ${otherNames.join(", ") || "another property"}` : null,
+    };
+  };
+  const paidById = new Map(tracked.map((x) => [x.id, paidThisCycle(x)]).filter(([, v]) => v));
+  // And what a person (or the books' own rules, or an earlier decision) said
+  // a bank row was, for the rows the review would otherwise ask about: the
+  // county tax a person filed under taxes, the landscaper a person filed under
+  // repairs. The books' own guesses are not read.
+  const bookCategories = reg ? ledger.answeredCategoriesForBankRows({ ledgerRows: ledgerTxns, registry: reg }) : new Map();
+  const cls = classify(posted, accounts, { pending: (txns || []).filter((t) => t.pending), overrides, expectedIncome, bookVerdicts, bookCategories, bookCategoryKinds: RF.book_category_kinds || {}, depositAccountIds, largeOutflow: map.large_outflow_usd || LARGE_OUTFLOW, known, ownInstitutions: [...new Set((accounts || []).map((a) => a.institution_name).filter(Boolean))], ownTransferPhrases: map.own_transfer_phrases || [], taxPayeePhrases: FR.tax_payee_phrases, taxProperties: FR.tax_property_rules });
   const kindOf = (t) => cls.get(t.transaction_id)?.kind;
   const out = (t) => Number(t.amount) > 0;
   const amt = (t) => Math.abs(Number(t.amount));
@@ -198,15 +298,44 @@ async function main() {
   const kindTotal = (rows, kind, dir) => round2(sum(rows.filter((t) => kindOf(t) === kind && (dir === "in" ? !out(t) : out(t))), amt));
 
   // ── 1. CASH POSITION ────────────────────────────────────────────────────
+  const norm = (x) => String(x || "").toLowerCase().replace(/[^a-z0-9 ]+/g, " ").replace(/\s+/g, " ").trim();
+  const institutions = [...new Set((accounts || []).map((a) => a.institution_name).filter(Boolean))].map((name) => ({ name, key: norm(name) }));
+  // A transfer pulled from one of the user's own banks whose sending side has
+  // not posted yet is already in the receiving balance and still in the
+  // sender's: counted twice. Until the sending side posts, it comes off free
+  // cash (and its bucket), and the cash card says so.
+  const ownPullFrom = (t) => !(Number(t.amount) > 0) && kindOf(t) === "transfer_external"
+    && institutions.find((i) => norm(`${t.name || ""}`).startsWith(i.key) && i.name !== acct(t.account_id).institution_name);
+  const pendingOwn = posted.filter((t) => t.date > dayAdd(today, -10) && ownPullFrom(t));
+  const pendingOwnFrom = new Map(pendingOwn.map((t) => [t.transaction_id, ownPullFrom(t).name]));
+  // Not money from outside: the user's own money moving, its far side pending.
+  for (const t of pendingOwn) cls.set(t.transaction_id, { ...cls.get(t.transaction_id), kind: "internal_transfer", rule: "own_bank_pull_unposted" });
+  let pendingOwnTotal = 0;
   const cashPos = reg ? buildCashBuckets({ plaidAccounts: accounts, registry: reg, brokerageAccounts, brokeragePositions, brokerageAccountHistory, brokeragePositionHistory, posted, today, config: map }) : null;
-  const bankCash = sum(depos, (a) => num(a.balance_current));
-  const freeCash = cashPos ? cashPos.free_cash : null;
+  let bankCash = sum(depos, (a) => num(a.balance_current));
+  if (cashPos && pendingOwn.length) {
+    const amt0 = round2(sum(pendingOwn, (t) => Math.abs(Number(t.amount))));
+    pendingOwnTotal = amt0;
+    bankCash = round2(bankCash - amt0); // net worth counts it once too
+    cashPos.free_cash = round2(cashPos.free_cash - amt0);
+    cashPos.free_cash_week_delta = round2(cashPos.free_cash_week_delta - amt0);
+    const g = gmap[pendingOwn[0].account_id];
+    const key = g?.group === "personal" ? "personal" : g?.group === "business" ? "business" : g?.group === "property" ? "real_estate" : null;
+    // A row of its own in the bucket, so the rows add up to the subtotal and the week's change.
+    if (key && cashPos.buckets[key]) {
+      cashPos.buckets[key].total = round2(cashPos.buckets[key].total - amt0);
+      cashPos.buckets[key].accounts.push({ label: `In transit from ${(map.transfer_sources || {})[pendingOwn[0].transaction_id] || `your ${pendingOwnFrom.get(pendingOwn[0].transaction_id)} account`} (in both balances until it posts)`, mask: null, balance: -amt0, week_delta: -amt0 });
+    }
+    cashPos.pending_own = { amount: amt0, text: `${pendingOwn.map((t) => `${usd(Math.abs(Number(t.amount)))} from ${(map.transfer_sources || {})[t.transaction_id] || `your ${pendingOwnFrom.get(t.transaction_id)} account`} into ${label(t.account_id)} (${fmtD(t.date)})`).join("; ")}: its ${pendingOwnFrom.get(pendingOwn[0].transaction_id)} side has not posted yet, so it is taken off free cash once` };
+  }
+  let freeCash = cashPos ? cashPos.free_cash : null;
   const cardDebt = sum(credits, (a) => num(a.balance_current));
 
   // ── 2. CASH FLOW this week, by what the money WAS ───────────────────────
   const flow = {
     income_in: kindTotal(wk, "income", "in"),
     deposits_in: kindTotal(wk, "deposit_in", "in"),
+    deposits_out: kindTotal(wk, "deposit_refund", "out"),
     unexplained_in: kindTotal(wk, "inflow_unexplained", "in"),
     from_your_other_accounts: kindTotal(wk, "transfer_external", "in"),
     spending: round2(sum(wk.filter(isSpend), amt)),
@@ -218,11 +347,125 @@ async function main() {
     internal_transfers: round2(sum(wk.filter((t) => out(t) && kindOf(t) === "internal_transfer"), amt)),
   };
   const flowFmt = Object.fromEntries(Object.entries(flow).map(([k, v]) => [`${k}_fmt`, usd0(v)]));
+  // What each line of the flow is made of: rows grouped by who and which
+  // account, summing to the line to the cent (the user, 2026-11-08: "if
+  // income is X, the income rows should show how it sums up to X").
+  const streamLabel = new Map((expectedIncome || []).map((e) => [e.id, e.label]));
+  const institutionOf = (t) => acct(t.account_id).institution_name || "bank";
+  const titleish = (x) => String(x || "").trim().toLowerCase().replace(/(^|[\s(\-])([a-z])/g, (m, a, c) => a + c.toUpperCase()).replace(/\bB\.m\./i, "B.M.");
+  const postedById = new Map(posted.map((x) => [x.transaction_id, x]));
+  const describe = (t) => {
+    const v = cls.get(t.transaction_id) || {};
+    if (v.expected_income_id && streamLabel.has(v.expected_income_id)) return streamLabel.get(v.expected_income_id);
+    // The user's own words for it (finance-facts txn --note), when short enough to be a name.
+    if (v.rule === "override" && v.note && String(v.note).length <= 60) return String(v.note);
+    // A bill the recurring tracker knows is shown by the tracker's name, not
+    // Plaid's merchant guess ("Miami County Treasurers Office" for a Miami-Dade bill).
+    const kn = known.get(t.transaction_id);
+    if (kn?.name) return kn.name;
+    // A card payment is named by the card it paid: the other leg when both are
+    // linked, else the one linked card at the bank the line names.
+    if (v.kind === "card_payment") {
+      const other = v.pair && postedById.get(v.pair);
+      if (other) return label(other.account_id);
+      const lc = `${t.merchant_name || ""} ${t.name || ""}`.toLowerCase();
+      const cards = credits.filter((c) => c.institution_name && lc.includes(norm(c.institution_name).split(" ")[0]));
+      if (cards.length === 1) return label(cards[0].account_id);
+      if (cards.length > 1) return `a ${cards[0].institution_name} card`;
+    }
+    // A payee the user (or the review, from a record) has named: account map
+    // `payee_names` {"<text in the bank line>": "<plain name>"}, longest match wins.
+    const lineLc = `${t.merchant_name || ""} ${t.name || ""}`.toLowerCase();
+    const named = Object.entries(map.payee_names || {}).filter(([k]) => k && lineLc.includes(String(k).toLowerCase())).sort((a, b) => b[0].length - a[0].length)[0];
+    if (named) return named[1];
+    const names = (v.tenants || []).map((x) => (typeof x === "string" ? x : x?.name)).filter(Boolean);
+    if (names.length) return `${v.kind === "deposit_in" ? "Deposit" : "Rent"} — ${names.join(", ")}`;
+    // A bank ACH line ("PAYER DES:Rent-cr ID:123 INDN:…") is named by its payer
+    // and entry description, so one payer's payouts group into one row.
+    const raw = String(t.name || "");
+    const ach = !t.merchant_name && /^(.*?)\s+DES:\s*(\S+)/.exec(raw); // lang-regex-ok: bank-generated ACH descriptor
+    // A wire names its sender and the sender's bank; say them.
+    const wire = /ORIG:\s*(.*?)\s+ID:/.exec(raw); // lang-regex-ok: bank-generated wire descriptor
+    const wireBank = /ORIG BK:\s*(.*?)\s+ID:/.exec(raw); // lang-regex-ok: bank-generated wire descriptor
+    // A deposit made at a branch counter names only the branch.
+    const branch = /FIN CTR .*?DEPOSIT\s+(.*)$/i.exec(raw); // lang-regex-ok: bank-generated branch-deposit descriptor
+    // A transfer pulled from a bank where the user also has linked accounts, whose
+    // other side has not posted there yet (Capital One shows "BANK OF AMERICA, N.A.").
+    const ownBank = !out(t) && kindOf(t) === "transfer_external" && institutions.find((i) => norm(raw).startsWith(i.key) && i.name !== acct(t.account_id).institution_name);
+    const zelle = /^Zelle payment (?:to|from) (.*?)(?: for "|; Conf#|\s+Conf#|$)/i.exec(raw); // lang-regex-ok: bank-generated Zelle descriptor
+    const xfer = /^TRANSFER .*?:(.*?) Confirmation#/i.exec(raw); // lang-regex-ok: bank-generated transfer descriptor
+    const chk = /transfer (?:to|from) (?:CHK|SAV) (\d{4})/i.exec(raw); // lang-regex-ok: bank-generated transfer descriptor
+    const extName = chk && (map.known_external_accounts || {})[chk[1]];
+    const base = wire ? `Wire from ${titleish(wire[1])}${wireBank ? ` (${titleish(wireBank[1])})` : ""}`
+      : zelle ? `${titleish(zelle[1])} (Zelle)`
+      : xfer ? `${titleish(xfer[1])} (bank transfer)`
+      : chk ? (extName ? `${extName} ••${chk[1]}` : `${institutionOf(t)} account ••${chk[1]} (not linked)`)
+      : branch ? `Deposit at the ${institutionOf(t)} branch, ${branch[1].trim()}`
+      : ownBank ? `Your ${ownBank.name} account (its side has not posted yet)`
+      : ach ? (/^(ach|pmt|payment|payments|epay|web|ppd|ccd|transfer)$/i.test(ach[2]) ? titleish(ach[1].replace(/,?\s*inc\.?$/i, "")) : `${ach[1].trim()} — ${ach[2]}`) : who(t);
+    if (v.rule === "books_category" && (v.categories || []).length) return `${base} · ${v.categories.join(", ")}`;
+    return base;
+  };
+  // Income into a property is one row per property (the user, 2026-11-08:
+  // "too much detail. It should be rent by property"): the property the books
+  // file the row to, else the one that owns the account it landed in.
+  const ledgerRowForFlow = new Map((ledgerTxns || []).map((x) => [String(x.id).replace(/^plaid:/, ""), x]));
+  const propertyOfIncome = (t) => {
+    const lt = ledgerRowForFlow.get(t.transaction_id);
+    const pid = (lt && ledger.effectivePropertyId(lt)) || gAt(t).propertyId;
+    const pr = pid && reg?.propertyById?.get(pid);
+    return pr && pr.kind === "property" ? pr : null;
+  };
+  const breakdown = (rows, byProperty = false) => {
+    const g = new Map();
+    for (const t of rows) {
+      const pr = byProperty ? propertyOfIncome(t) : null;
+      const what = pr ? `Rent — ${pr.name}` : describe(t);
+      const k = pr ? `prop|${pr.id}` : `${what}|${t.account_id}`;
+      // From and to, spelled out (the user, 2026-11-08: "it should be clearer
+      // where the payment came from and where it went"): money in comes from the
+      // payer into the account; money out leaves the account for the payee.
+      if (!g.has(k)) g.set(k, { what, account: label(t.account_id), from: out(t) ? label(t.account_id) : what, to: out(t) ? what : label(t.account_id), count: 0, cents: 0, dates: [] });
+      const x = g.get(k); x.count += 1; x.cents += Math.round(amt(t) * 100); x.dates.push(t.date);
+    }
+    return [...g.values()].sort((a, b) => b.cents - a.cents).map((x) => ({
+      what: x.what, account: x.account, from: x.from, to: x.to, count: x.count, amount: x.cents / 100, amount_fmt: usd(x.cents / 100),
+      dates_fmt: [...new Set(x.dates.sort())].map(fmtD).join(", "),
+    }));
+  };
+  const flowRows = {
+    income_in: wk.filter((t) => !out(t) && kindOf(t) === "income"),
+    deposits_in: wk.filter((t) => !out(t) && kindOf(t) === "deposit_in"),
+    deposits_out: wk.filter((t) => out(t) && kindOf(t) === "deposit_refund"),
+    unexplained_in: wk.filter((t) => !out(t) && kindOf(t) === "inflow_unexplained"),
+    from_your_other_accounts: wk.filter((t) => !out(t) && kindOf(t) === "transfer_external"),
+    refunds: wk.filter((t) => !out(t) && kindOf(t) === "refund"),
+    card_payments_from_bank: wk.filter((t) => out(t) && kindOf(t) === "card_payment" && acct(t.account_id).type === "depository"),
+    to_your_other_accounts: wk.filter((t) => out(t) && kindOf(t) === "transfer_external"),
+    capital: wk.filter((t) => out(t) && kindOf(t) === "capital"),
+    unreviewed_large: wk.filter((t) => out(t) && kindOf(t) === "unreviewed_large"),
+  };
+  // An own-bank transfer to an account Plaid does not see: whose is it? Asked
+  // once per account; the answer goes in the account map's
+  // `known_external_accounts` ({mask: "<whose account>"}) and names it from then on.
+  const linkedMasks = new Set((accounts || []).map((a) => String(a.mask)));
+  for (const t of wk) {
+    const m = /transfer (?:to|from) (?:CHK|SAV) (\d{4})/i.exec(String(t.name || "")); // lang-regex-ok: bank-generated transfer descriptor
+    if (!m || linkedMasks.has(m[1]) || (map.known_external_accounts || {})[m[1]]) continue;
+    ask(`account-external:${m[1]}`, `Whose is ${institutionOf(t)} account ••${m[1]}? ${usd(amt(t))} went ${out(t) ? "to" : "from"} it from ${label(t.account_id)} on ${fmtD(t.date)}.`, `Say whose it is; it is recorded in the account map's known_external_accounts.`);
+  }
+  // A deposit made at a branch counter says nothing about whose money it was: ask.
+  for (const t of wk.filter((t) => !out(t) && /FIN CTR .*?DEPOSIT/i.test(String(t.name || "")) && amt(t) >= 500 && cls.get(t.transaction_id)?.rule !== "override")) { // lang-regex-ok: bank-generated branch-deposit descriptor
+    ask(`txn:${t.transaction_id}`, `What was the ${usd(amt(t))} deposited at the ${institutionOf(t)} branch on ${fmtD(t.date)} into ${label(t.account_id)}?`, `finance-facts txn ${t.transaction_id} --kind income|refund|transfer_external --note "..."`, [
+      { label: "Income: rent or earnings", key: "income" }, { label: "A refund", key: "refund" }, { label: "A transfer from an account of mine that isn't linked", key: "transfer_external" }]);
+  }
+  const flowDetail = Object.fromEntries(Object.entries(flowRows).map(([k, rows]) => [k, { total: flow[k], total_fmt: usd(flow[k]), rows: breakdown(rows, k === "income_in") }]));
   const unexplainedRows = wk.filter((t) => !out(t) && kindOf(t) === "inflow_unexplained")
     .sort((a, b) => amt(b) - amt(a))
     .map((t) => ({ id: t.transaction_id, date: t.date, amount: amt(t), amount_fmt: usd(amt(t)), account: label(t.account_id), who: who(t) }));
   for (const r of unexplainedRows.filter((r) => r.amount >= 500)) {
-    ask(`txn:${r.id}`, `What was the ${r.amount_fmt} that arrived in ${r.account} on ${fmtD(r.date)} ("${r.who}")?`, `finance-facts txn ${r.id} --kind income|refund|internal_transfer|deposit_in --note "..."`);
+    ask(`txn:${r.id}`, `What was the ${r.amount_fmt} that arrived in ${r.account} on ${fmtD(r.date)} ("${r.who}")?`, `finance-facts txn ${r.id} --kind income|refund|internal_transfer|deposit_in --note "..."`, [
+      { label: "Income: rent or earnings", key: "income" }, { label: "A refund", key: "refund" }, { label: "A transfer between my own accounts", key: "internal_transfer" }, { label: "A tenant's security deposit", key: "deposit_in" }]);
   }
 
   // Large outflows nobody has classified, anywhere in the 95-day window. They
@@ -230,8 +473,9 @@ async function main() {
   const unreviewed = posted.filter((t) => kindOf(t) === "unreviewed_large").sort((a, b) => amt(b) - amt(a));
   for (const t of unreviewed) {
     const text = `${usd(amt(t))} left ${label(t.account_id)} on ${fmtD(t.date)} ("${who(t)}") and has not been classified; it is kept out of spending and runway until it is.`;
-    flag(inWin(t, wkStart) ? 86 : 52, "unreviewed-large", text);
-    ask(`txn:${t.transaction_id}`, `What was the ${usd(amt(t))} on ${fmtD(t.date)} from ${label(t.account_id)} ("${who(t)}")? (capital = an asset purchase or investment; expense = spending)`, `finance-facts txn ${t.transaction_id} --kind capital|expense|tax|transfer_external --note "..."`);
+    flag(inWin(t, wkStart) ? 86 : 52, "unreviewed-large", text, "Say what it was in the Questions tab.");
+    ask(`txn:${t.transaction_id}`, `What was the ${usd(amt(t))} on ${fmtD(t.date)} from ${label(t.account_id)} ("${who(t)}")? (capital = an asset purchase or investment; expense = spending)`, `finance-facts txn ${t.transaction_id} --kind capital|expense|tax|transfer_external --note "..."`, [
+      { label: "Capital: an asset purchase or investment", key: "capital" }, { label: "Expense: ordinary spending", key: "expense" }, { label: "Tax", key: "tax" }, { label: "A transfer to an account of mine that isn't linked", key: "transfer_external" }]);
   }
 
   // Runway: free cash over the last 90 days' average daily spending. Spending
@@ -240,14 +484,17 @@ async function main() {
   const earliest = posted.map((t) => t.date).sort()[0];
   const spend90 = round2(sum(posted.filter((t) => t.date > d90 && isSpend(t)), amt));
   const dailySpend = earliest && earliest <= dayAdd(today, -85) ? spend90 / 90 : null;
-  const runway = freeCash != null && dailySpend ? Math.floor(freeCash / dailySpend) : null;
+  let runway = freeCash != null && dailySpend ? Math.floor(freeCash / dailySpend) : null;
 
   // ── 3. NEXT 14 DAYS: confirmed payments + recurring charges ─────────────
   const upcoming = [];
   const shortfalls = [];
+  const dueFrom = new Map(); // confirmed payments due in 14 days, per funding account
   for (const x of scheduledDue((scheduled || []).filter((s) => s.active), accounts, today, 14)) {
     const s = x.payment;
-    const row = { source: "confirmed", label: s.label, due: x.due, due_fmt: fmtD(x.due), amount_fmt: x.amount == null ? "amount unknown" : usd0(x.amount), amount_basis: x.amount_basis, autopay: s.autopay, account: label(s.funding_account_id) };
+    if (x.amount != null) dueFrom.set(s.funding_account_id, round2((dueFrom.get(s.funding_account_id) || 0) + Number(x.amount)));
+    // A card payment is named by the card it pays, the same name the Cards table uses.
+    const row = { source: "confirmed", label: s.target_account_id && acct(s.target_account_id).account_id ? `${label(s.target_account_id)} payment` : s.label, due: x.due, due_fmt: fmtD(x.due), amount_fmt: x.amount == null ? "amount unknown" : usd0(x.amount), amount_basis: x.amount_basis, autopay: s.autopay, account: label(s.funding_account_id) };
     upcoming.push(row);
     if (x.short) {
       shortfalls.push({ ...row, available_fmt: usd0(x.available) });
@@ -258,6 +505,7 @@ async function main() {
     const d = r.detected || {}; const e = r.enrichment || {}; const o = r.override || {};
     const kind = o.kind || e.kind;
     if (!d.active || !d.nextExpected || kind === "habit" || RECURRING_SKIP_VERDICTS.has(r.decision?.verdict)) continue;
+    if (paidById.has(r.id)) continue; // already paid this cycle: nothing is coming
     const gap = daysBetween(today, d.nextExpected);
     if (gap < 0 || gap > 14) continue;
     const accountId = (d.accountIds || [])[0];
@@ -301,7 +549,8 @@ async function main() {
     unconfirmedPayments.push({ last_date_fmt: fmtD(t.date), amount_fmt: usd(amt(t)), account: label(t.account_id), who: who(t) });
     ask(`payment:${t.account_id}:${normMerchant(t).slice(0, 30)}`,
       `"${who(t)}" (${usd(amt(t))} on ${fmtD(t.date)} from ${label(t.account_id)}): is this a scheduled card payment — autopay or manual, which day, fixed or the balance?`,
-      `finance-facts payment add --id <slug> --label "..." --funding ${t.account_id} --contains "<text from the bank line>" --rule fixed|current_balance|statement_balance --amount N --day D --autopay yes|no --note "..."`);
+      `finance-facts payment add --id <slug> --label "..." --funding ${t.account_id} --contains "<text from the bank line>" --rule fixed|current_balance|statement_balance --amount N --day D --autopay yes|no --note "..."`, [
+        { label: "Autopay, a fixed amount", key: "fixed" }, { label: "Autopay, the current balance", key: "current_balance" }, { label: "Autopay, the statement balance", key: "statement_balance" }, { label: "Paid by hand, no schedule", key: "manual" }]);
   }
 
   // ── 4. INCOME: registered streams + rent against the rent roll ──────────
@@ -311,22 +560,75 @@ async function main() {
   const inv = invoiceSection((invoiceRuns || [])[0] || null, today, fmtD);
   for (const f of inv.flags) flag(f.priority, f.tag, f.text);
   const invoiceTracked = new Set(inv.section ? (FR.invoice_tracked_streams || []) : []);
-  const incomeRows = incomeStatus(expectedIncome, posted, cls, today).map((r) => {
+  // A stream registered by hand for money the books already name (a tenant's
+  // rent paid out by the rental hub) is redundant: it is neither listed nor
+  // called late (rent the hub has not collected shows on its rent invoices).
+  const coveredStreams = streamsCoveredByBooks(cls);
+  const monthStart0 = `${today.slice(0, 7)}-01`;
+  const incomeRows = incomeStatus((expectedIncome || []).filter((e) => !coveredStreams.has(e.id)), posted, cls, today).map((r) => {
     const e = r.stream;
+    // A stream the invoice reconciliation covers takes its status from the
+    // invoices: the latest one paid within this cycle means it arrived.
+    if (invoiceTracked.has(e.id) && r.cycle_due && r.status !== "received") {
+      const paid = (((invoiceRuns || [])[0]?.report?.rows) || []).filter((x) => x.status === "paid" && x.paid_on && x.paid_on >= dayAdd(r.cycle_due, -35) && x.paid_on <= today).sort((a, b) => String(a.paid_on).localeCompare(String(b.paid_on))).pop();
+      if (paid) Object.assign(r, { status: "received", received_on: paid.paid_on, via_invoice: paid.number });
+    }
+    // A variable stream paid inside another stream's payment (one ACH for both
+    // invoices: the installation's combined_payments): the remainder is its.
+    if (e.amount == null && r.status === "none yet this month") {
+      const combined = posted.filter((t) => !out(t) && t.date >= monthStart0 && t.account_id === e.account_id
+        && String(`${t.merchant_name || ""} ${t.name || ""}`).toLowerCase().includes(String(e.payer_contains || "").toLowerCase()))
+        .map((t) => ({ t, s: (expectedIncome || []).find((x) => x.id === cls.get(t.transaction_id)?.expected_income_id)
+          || (expectedIncome || []).find((x) => x.id !== e.id && x.amount != null && x.account_id === e.account_id && String(x.payer_contains || "").toLowerCase() === String(e.payer_contains || "").toLowerCase()) }))
+        .find(({ t, s }) => s && s.id !== e.id && s.amount != null && amt(t) > Number(s.amount) + 0.5);
+      if (combined) Object.assign(r, { status: "received", received_on: combined.t.date, share_fmt: `${usd(amt(combined.t) - Number(combined.s.amount))} of the ${usd(amt(combined.t))} payment` });
+    }
     if (r.status === "late" && !invoiceTracked.has(e.id)) flag(95, "income-late", `${e.label} (${usd0(e.amount)}, due ${fmtD(r.cycle_due)} into ${label(e.account_id)}) has not arrived.`);
-    return { label: e.label, amount_fmt: e.amount == null ? "varies" : usd0(e.amount), due_fmt: r.cycle_due ? fmtD(r.cycle_due) : "no fixed day", status: r.status, received_on: r.received_on ? fmtD(r.received_on) : null, account: label(e.account_id) };
+    return { label: e.label, amount_fmt: e.amount == null ? "varies" : usd0(e.amount), due_fmt: r.cycle_due ? fmtD(r.cycle_due) : "no fixed day", status: r.status, received_on: r.received_on ? `${fmtD(r.received_on)}${r.via_invoice ? `, invoice ${r.via_invoice}` : ""}${r.share_fmt ? `: ${r.share_fmt}` : ""}` : null, account: label(e.account_id) };
   });
 
   // ── 5. REAL ESTATE (ledger P&L, reconciled values) ──────────────────────
   const re = reg ? buildRealEstate({ registry: reg, ledgerTxns, cash: cashPos, propertyValues, reconciledValues: reconciled, unitAvailability, tenants, leases, today, config: map }) : null;
+  // Tenant deposit money sitting in a property's own account (a deposit not yet
+  // moved to the deposit account; the money for a refund the deposit account
+  // paid on its behalf) is owed, not the owner's: it comes off free cash, off
+  // that property's cash and reserve, and shows as its own row until it moves.
+  const repRows = ((depositRuns || [])[0]?.report?.rows) || [];
+  const heldElsewhere = [
+    ...repRows.filter((x) => x.location === "operating_account" && x.expected_location === "deposit_account" && x.location_account_mask)
+      .map((x) => ({ mask: String(x.location_account_mask), amount: Number(x.amount), why: `${String(x.tenant).trim()}'s deposit` })),
+    ...repRows.filter((x) => x.returned_from_other && x.returned_from_other.held_in)
+      .map((x) => ({ mask: String(x.returned_from_other.held_in), amount: Number(x.returned_from_other.amount), why: `${String(x.tenant).trim()}'s refund, paid from the deposit account` })),
+  ].filter((h) => h.amount > 0);
+  if (heldElsewhere.length && cashPos) {
+    for (const h of heldElsewhere) {
+      const a = depos.find((x) => String(x.mask) === h.mask);
+      const g = a && gmap[a.account_id];
+      cashPos.free_cash = round2(cashPos.free_cash - h.amount);
+      const key = g?.group === "property" ? "real_estate" : g?.group === "business" ? "business" : g?.group === "personal" ? "personal" : null;
+      if (key && cashPos.buckets[key]) {
+        cashPos.buckets[key].total = round2(cashPos.buckets[key].total - h.amount);
+        cashPos.buckets[key].accounts.push({ label: `Tenant money held in ••${h.mask}: ${h.why} (owed to the deposit account)`, mask: null, balance: -h.amount, week_delta: 0 });
+      }
+      const prop = re && g?.propertyId && re.properties.find((x) => x.id === g.propertyId);
+      if (prop) {
+        prop.cash = round2(prop.cash - h.amount);
+        if (prop.monthly_burn > 0) prop.reserve_months = prop.cash / prop.monthly_burn;
+        for (const grp of [re.groups?.[prop.rental_type === "short-term" ? "short_term" : "long_term"], re.portfolio]) if (grp && grp.cash != null) grp.cash = round2(grp.cash - h.amount);
+      }
+    }
+    // Free cash moved: so do the runway and every figure built on it.
+    freeCash = cashPos.free_cash;
+    runway = dailySpend ? Math.floor(freeCash / dailySpend) : runway;
+  }
   const reserveFloor = map.reserve_months_floor ?? 3;
   const rentCheckDay = map.rent_check_from_day ?? null;
   const monthStart = `${today.slice(0, 7)}-01`;
   const rentRows = [];
   for (const p of re?.properties || []) {
-    if (p.reserve_months != null && p.reserve_months < reserveFloor) flag(68, "reserve", `${p.name} holds ${usd0(p.cash)}, ${p.reserve_months.toFixed(1)} months of its own trailing running costs (${usd0(p.monthly_burn)}/mo); the floor is ${reserveFloor} months.`);
+    if ((p.accounts || []).length && p.reserve_months != null && p.reserve_months < reserveFloor) flag(68, "reserve", `${p.name} holds ${usd0(p.cash)}, ${p.reserve_months.toFixed(1)} months of its own trailing running costs (${usd0(p.monthly_burn)}/mo); the floor is ${reserveFloor} months.`);
     for (const v of p.vacant_units) flag(66, "vacancy", `${p.name} unit ${v.unit} has no current tenant${v.rent ? ` (listed at ${usd0(v.rent)}/mo)` : ""}.`);
-    for (const l of p.leases_expiring_90d) flag(48, "lease-ending", `${p.name}: ${l.name}'s lease on unit ${l.unit} ends ${fmtD(l.ends)}.`);
+    for (const l of p.leases_expiring_90d) flag(48, "lease-ending", `${p.name}: ${l.name}'s lease${l.unit && l.unit !== p.id ? ` on unit ${l.unit}` : ""} ends ${fmtD(l.ends)}.`);
     if (p.ledger_empty_ytd && p.acquired_on && daysBetween(p.acquired_on, today) <= 45) {
       flag(46, "new-property", `${p.name} was acquired ${fmtD(p.acquired_on)}; the ledger has no rows for it yet.`);
     } else if (p.ledger_empty_ytd) {
@@ -335,7 +637,9 @@ async function main() {
     }
     if (p.rental_type === "long-term" && p.rent_roll) {
       const accountsOfP = (cashPos?.buckets.real_estate.accounts || []).filter((a) => a.property_id === p.id);
-      const rentMtd = round2(sum(posted.filter((t) => t.date >= monthStart && !out(t) && kindOf(t) === "income" && gAt(t).propertyId === p.id), amt));
+      // Rent counts for the property the books file it to (a unit with no
+      // account of its own is paid into a sibling's), else the account's owner.
+      const rentMtd = round2(sum(posted.filter((t) => t.date >= monthStart && !out(t) && kindOf(t) === "income" && (propertyOfIncome(t)?.id || gAt(t).propertyId) === p.id), amt));
       rentRows.push({ name: p.name, rent_roll_fmt: usd0(p.rent_roll), received_mtd_fmt: usd0(rentMtd), has_account: accountsOfP.length > 0 });
       if (rentCheckDay != null && Number(today.slice(8)) >= rentCheckDay && rentMtd + 0.5 < p.rent_roll) {
         flag(88, "rent-short", `${p.name}: ${usd0(rentMtd)} of rental income has arrived this month${accountsOfP.length ? "" : " (it has no bank account in the registry)"}, against ${usd0(p.rent_roll)}/mo in current leases.`);
@@ -370,13 +674,18 @@ async function main() {
   // This builder only reports it: per-tenant location, exactly which deposits
   // are not in the deposit account, and the proof that the account balances.
   const dep = depositSection((depositRuns || [])[0] || null, today, fmtD);
-  for (const f of dep.flags) flag(f.priority, f.tag, f.text);
-  for (const q of dep.questions || []) ask(q.id, q.text, q.answer_with);
+  for (const f of dep.flags) { flag(f.priority, f.tag, f.text, f.action); if (f.optional) attention[attention.length - 1].optional = true; }
+  for (const q of dep.questions || []) ask(q.id, q.text, q.answer_with, (q.options || []).map((label) => ({ label, key: null })));
   const deposits = dep.section;
 
   // ── 7. SPENDING (classified spend only) ─────────────────────────────────
-  const catTotals = (rows) => rows.filter(isSpend).reduce((m, t) => { const c = t.category_primary || "OTHER"; m[c] = (m[c] || 0) + amt(t); return m; }, {});
+  // A payment to a person and a cash withdrawal carry Plaid's "transfer out":
+  // name them for what they are.
+  const payeeCat = (t) => { const lc = `${t.merchant_name || ""} ${t.name || ""}`.toLowerCase(); const hit = Object.entries(map.payee_categories || {}).filter(([k]) => k && lc.includes(String(k).toLowerCase())).sort((a, b) => b[0].length - a[0].length)[0]; return hit ? hit[1] : null; };
+  const catOf = (t) => payeeCat(t) || (kindOf(t) === "cash_withdrawal" ? "CASH_WITHDRAWALS" : (cls.get(t.transaction_id)?.rule === "payment_to_other" || t.category_primary === "TRANSFER_OUT") ? "PAYMENTS_TO_PEOPLE_AND_CONTRACTORS" : t.category_primary || "OTHER");
+  const catTotals = (rows) => rows.filter(isSpend).reduce((m, t) => { const c = catOf(t); m[c] = (m[c] || 0) + amt(t); return m; }, {});
   const cw = catTotals(wk), cp = catTotals(wkPrev), c90 = catTotals(posted.filter((t) => t.date > d90));
+  for (const c of Object.keys(cp)) if (!(c in cw)) cw[c] = 0; // so the prior-week column adds up too
   const byCategory = Object.entries(cw).map(([c, v]) => ({
     category: c.replace(/_/g, " ").toLowerCase(), this_week_fmt: usd0(v), prior_week_fmt: usd0(cp[c] || 0),
     avg_week_90d_fmt: dailySpend ? usd0((c90[c] || 0) / (90 / 7)) : "—", this_week: round2(v),
@@ -384,14 +693,17 @@ async function main() {
   const byAccount = Object.entries(wk.filter(isSpend).reduce((m, t) => { const k = label(t.account_id); m[k] = (m[k] || 0) + amt(t); return m; }, {}))
     .sort((a, b) => b[1] - a[1]).map(([account, v]) => ({ account, total_fmt: usd0(v) }));
   const largest = wk.filter(isSpend).sort((a, b) => amt(b) - amt(a)).slice(0, 8)
-    .map((t) => ({ date_fmt: fmtD(t.date), who: who(t), amount_fmt: usd(amt(t)), account: label(t.account_id) }));
+    .map((t) => ({ date_fmt: fmtD(t.date), who: describe(t), amount_fmt: usd(amt(t)), account: label(t.account_id), explained: (known.get(t.transaction_id)?.name ? null : known.get(t.transaction_id)?.note) || (cls.get(t.transaction_id)?.rule === "books_category" ? `filed under ${(cls.get(t.transaction_id).categories || []).join(", ")} in the ${FR.ledger_label}` : null) }));
   const spendPrev = round2(sum(wkPrev.filter(isSpend), amt));
 
   // ── 8. CARDS ────────────────────────────────────────────────────────────
+  const utilFlagFrom = map.utilization_flag_from ?? 0.75;
   const cardItems = credits.map((a) => {
     const bal = num(a.balance_current), lim = num(a.balance_limit) || null;
     const util = lim ? bal / lim : null;
-    if (util != null && util > 0.289) flag(util > 0.489 ? 85 : 70, "utilization", `${label(a.account_id)} is at ${pct(util)} utilization (${usd0(bal)} of ${usd0(lim)}).`);
+    // Every card is on autopay, so a balance is not debt carried: only a card
+    // near its limit is worth a line (the user, 2026-11-08: "below 75% is not an issue").
+    if (util != null && util >= utilFlagFrom) flag(util >= 0.9 ? 85 : 70, "utilization", `${label(a.account_id)} is at ${pct(util)} utilization (${usd0(bal)} of ${usd0(lim)}).`);
     return { label: label(a.account_id), mask: a.mask, balance_fmt: usd0(bal), limit_fmt: lim ? usd0(lim) : "no limit reported", utilization_fmt: util == null ? "—" : pct(util), utilization: util };
   }).sort((a, b) => (b.utilization || 0) - (a.utilization || 0));
   const limTotal = sum(credits.filter((a) => num(a.balance_limit)), (a) => num(a.balance_limit));
@@ -399,31 +711,65 @@ async function main() {
   const aggUtil = limTotal ? debtWithLimit / limTotal : null;
   const interest = posted.filter((t) => inWin(t, dayAdd(today, -14)) && out(t) && kindOf(t) === "interest").map((t) => ({ date_fmt: fmtD(t.date), account: label(t.account_id), amount_fmt: usd(amt(t)), who: who(t) }));
   for (const h of interest) flag(92, "interest", `Interest of ${h.amount_fmt} was charged on ${h.account} (${h.date_fmt}).`);
-  const fees = wk.filter((t) => out(t) && (kindOf(t) === "fee" || FEE_RE.test(`${t.merchant_name || ""} ${t.name || ""}`))).map((t) => ({ date_fmt: fmtD(t.date), account: label(t.account_id), amount_fmt: usd(amt(t)), who: who(t) }));
-  if (fees.length) flag(60, "fee", `${fees.length} fee charge(s) this week: ${fees.map((f) => `${f.amount_fmt} on ${f.account}`).join("; ")}.`);
+  const feeRows = wk.filter((t) => out(t) && (kindOf(t) === "fee" || FEE_RE.test(`${t.merchant_name || ""} ${t.name || ""}`)));
+  const fees = feeRows.map((t) => ({ date_fmt: fmtD(t.date), account: label(t.account_id), amount_fmt: usd(amt(t)), who: describe(t) }));
+  // A few dollars of fees is housekeeping, not something to keep an eye on.
+  if (fees.length) flag(sum(feeRows, amt) >= (map.fee_flag_min_usd ?? 25) ? 60 : 35, "fee", `${fees.length} fee charge(s) this week: ${fees.map((f) => `${f.amount_fmt} on ${f.account}`).join("; ")}.`);
 
   // ── 9. RECURRING (the recurring tracker is the record; this only reads it)
   const items = (recurring || []).map((r) => {
     const d = r.detected || {}, e = r.enrichment || {}, o = r.override || {};
-    return { name: o.name || e.name || d.descriptor, kind: o.kind || e.kind, d, decision: r.decision || null };
+    return { id: r.id, name: o.name || e.name || d.descriptor, kind: o.kind || e.kind, d, decision: r.decision || null };
   }).filter((x) => x.kind && x.kind !== "habit" && x.d.active);
   const monthlyEq = round2(sum(items.filter((x) => CADENCE_PER_MONTH[x.d.cadence] && !RECURRING_SKIP_VERDICTS.has(x.decision?.verdict)), (x) => (x.d.typicalCents || 0) / 100 * CADENCE_PER_MONTH[x.d.cadence]));
-  const undecided = items.filter((x) => !x.decision && !["utility", "insurance", "housing", "tax"].includes(x.kind));
-  const changed = items.filter((x) => x.d.changedOn && x.d.changedOn > wkStart && x.d.priorCents && x.d.lastCents !== x.d.priorCents)
-    .map((x) => ({ name: x.name, from: x.d.priorCents / 100, to: x.d.lastCents / 100, from_fmt: usd(x.d.priorCents / 100), to_fmt: usd(x.d.lastCents / 100), on_fmt: fmtD(x.d.changedOn) }));
+  const undecided = items.filter((x) => !x.decision && !BILL_KINDS.has(x.kind));
+  // A change is the month's charges against the month before, per name: a
+  // bill that arrives in pieces (Google Cloud: one charge per billing account)
+  // or on two cards is one bill. Comparing single charges called a $5 piece
+  // "the time before" (2026-11-08).
+  const changedRaw = items.filter((x) => x.d.changedOn && x.d.changedOn > wkStart && x.d.priorCents && x.d.lastCents !== x.d.priorCents);
+  const changed = [];
+  for (const name of [...new Set(changedRaw.map((x) => x.name))]) {
+    const xs = changedRaw.filter((x) => x.name === name);
+    const on = xs.map((x) => x.d.changedOn).sort().pop();
+    const ids = new Set(items.filter((x) => x.name === name).map((x) => x.id));
+    const charges = posted.filter((t) => out(t) && ids.has(trackedFor(t)?.id));
+    const inWindow = (a, b) => round2(sum(charges.filter((t) => t.date > a && t.date <= b), amt));
+    const cur = inWindow(dayAdd(on, -30), on), prev = inWindow(dayAdd(on, -61), dayAdd(on, -30));
+    // Month on month whenever both months have charges; an annual bill has no month before it.
+    const monthly = items.find((x) => ids.has(x.id))?.d.cadence !== "annual";
+    const from = monthly && cur && prev ? prev : sum(xs, (x) => x.d.priorCents / 100);
+    const to = monthly && cur && prev ? cur : sum(xs, (x) => x.d.lastCents / 100);
+    changed.push({ name, from: round2(from), to: round2(to), from_fmt: usd(from), to_fmt: usd(to), on_fmt: fmtD(on), basis: monthly && cur && prev ? "month" : "charge" });
+  }
   const renewals = items.filter((x) => x.d.cadence === "annual" && x.d.nextExpected && daysBetween(today, x.d.nextExpected) >= 0 && daysBetween(today, x.d.nextExpected) <= 30)
-    .map((x) => ({ name: x.name, amount_fmt: usd0((x.d.typicalCents || 0) / 100), due_fmt: fmtD(x.d.nextExpected), decision: x.decision ? x.decision.verdict : "undecided" }));
+    .map((x) => ({ name: x.name, kind: x.kind, amount_fmt: usd0((x.d.typicalCents || 0) / 100), due_fmt: fmtD(x.d.nextExpected), decision: x.decision ? x.decision.verdict : "continue (default)", paid: paidById.get(x.id) || null }));
   const chargedAfterCancel = items.filter((x) => ["cancel", "already_cancelled"].includes(x.decision?.verdict) && x.d.lastCharged && x.d.lastCharged > String(x.decision.decidedAt || "").slice(0, 10))
     .map((x) => ({ name: x.name, last_fmt: fmtD(x.d.lastCharged), amount_fmt: usd(x.d.lastCents / 100) }));
   for (const c of chargedAfterCancel) flag(70, "charged-after-cancel", `${c.name} was marked cancelled on ${FR.recurring_label} but charged ${c.amount_fmt} on ${c.last_fmt}.`);
-  for (const r of renewals.filter((r) => r.decision === "undecided")) flag(58, "renewal", `${r.name} renews around ${r.due_fmt} (typically ${r.amount_fmt}/yr) with no decision recorded on ${FR.recurring_label}.`);
+  // A bill (tax, utility, insurance, housing) is paid, not decided; one already
+  // paid this cycle is not coming. Only an undecided subscription not yet
+  // charged is a renewal worth a line.
+  // A renewal happens by itself: the only thing to do is cancel, and only if
+  // it is unwanted (the user, 2026-11-08: "Cancel if you don't want it to
+  // renew. Otherwise it's safe to ignore"). So it is housekeeping, and its
+  // action is optional: shown under the flag, never on the to-do list.
+  // Every recurring charge continues unless a decision says otherwise (the
+  // user, 2026-11-08: "the default decision for any recurring payment should
+  // be to continue"); "no decision" is that default, not a gap.
+  for (const r of renewals.filter((r) => r.decision === "continue (default)" && !r.paid && !BILL_KINDS.has(r.kind))) {
+    flag(40, "renewal", `${r.name} renews around ${r.due_fmt} (typically ${r.amount_fmt}/yr) and continues by default.`, `Cancel before ${r.due_fmt} if you don't want it to renew; otherwise nothing to do.`);
+    attention[attention.length - 1].optional = true;
+  }
   // Every change is listed; only an increase of at least 5% and $5 a charge is
   // raised to the top (a utility bill moves every month, a $0.16 cloud bill is noise).
-  for (const c of changed.filter((c) => c.to - c.from >= 5 && c.to >= c.from * 1.05)) flag(55, "price-increase", `${c.name} went from ${c.from_fmt} to ${c.to_fmt} (${c.on_fmt}).`);
+  for (const c of changed.filter((c) => c.to - c.from >= 5 && c.to >= c.from * 1.05)) flag(55, "spend-increase", c.basis === "month" ? `${c.name} came to ${c.to_fmt} in the month to ${c.on_fmt}, up from ${c.from_fmt} the month before.` : `${c.name} charged ${c.to_fmt} on ${c.on_fmt}, up from ${c.from_fmt} the time before.`); // a bigger charge, not a known price change: a usage-billed service (ads, cloud) moves with use
 
   // ── 10. ANOMALIES (expense-classified rows only) ────────────────────────
   const anomalies = { duplicates: [], unusual: [], new_merchant_large: [] };
-  for (const t of wk.filter((t) => out(t) && kindOf(t) === "expense")) {
+  // A charge the user (or the review, from a record) already said what it was
+  // is not an anomaly any more (finance-facts txn).
+  for (const t of wk.filter((t) => out(t) && kindOf(t) === "expense" && cls.get(t.transaction_id)?.rule !== "override")) {
     const a = amt(t); const m = normMerchant(t); const st = model.merchant_stats?.[m];
     const dup = a >= 25 && !["TRANSPORTATION", "FOOD_AND_DRINK"].includes(t.category_primary)
       && wk.find((u) => u.transaction_id !== t.transaction_id && normMerchant(u) === m && Math.abs(amt(u) - a) <= 1 && Math.abs(daysBetween(u.date, t.date)) <= 3);
@@ -440,16 +786,53 @@ async function main() {
   }
 
   // ── 11. COMMINGLING (both directions) ───────────────────────────────────
+  // Plaid's category only picks the candidates (it calls pool supplies and
+  // health insurance "general merchandise"). Whether a charge is commingled
+  // is what the books say about it:
+  //   - filed (a person's category, a review, the books' own rule or an
+  //     earlier decision; or the business books' entity) → settled, no line,
+  //     unless the books put it with a different owner than the account's;
+  //   - excluded from the books by a person → a personal charge: nothing to do
+  //     on a property account (the books already leave it out); on the
+  //     business account, the to-do is to repay it;
+  //   - not filed → one question in the Questions tab, never a vague flag
+  //     (the user, 2026-11-08: "either fix directly, ask me questions, or tell
+  //     me what to do").
   const leakage = [];
+  const ledgerRowOf = new Map((ledgerTxns || []).map((x) => [String(x.id).replace(/^plaid:/, ""), x]));
+  const ownerGroup = (pid) => { const pr = pid && reg?.propertyById?.get(pid); return pr ? (KIND_TO_GROUP[pr.kind] || null) : null; };
+  const repayBusiness = [];
   for (const t of wk.filter((t) => out(t) && kindOf(t) === "expense")) {
     const g = gAt(t);
-    if ((g.group === "property" || g.group === "business") && PERSONAL_CATS.has(t.category_primary) && amt(t) >= 50) {
-      leakage.push({ account: label(t.account_id), who: who(t), amount_fmt: usd(amt(t)), plaid_category: t.category_primary, direction: "personal-category charge on a property/business account" });
-    } else if (g.group === "personal" && PROPERTY_CATS.has(t.category_primary) && amt(t) >= 100) {
-      leakage.push({ account: label(t.account_id), who: who(t), amount_fmt: usd(amt(t)), plaid_category: t.category_primary, direction: "property-category charge on a personal account" });
+    const candidate = ((g.group === "property" || g.group === "business") && PERSONAL_CATS.has(t.category_primary) && amt(t) >= 50)
+      || (g.group === "personal" && PROPERTY_CATS.has(t.category_primary) && amt(t) >= 100);
+    if (!candidate) continue;
+    const lt = ledgerRowOf.get(t.transaction_id);
+    const filed = bookCategories.get(t.transaction_id);
+    const ent = lt?.entity || null;
+    const entSettled = ent && (ent.override?.entityId || (["precedent", "rule"].includes(ent.classification?.method) && Number(ent.classification?.confidence) >= 1));
+    const row = { account: `${label(t.account_id)}${g.propertyName ? `, ${g.propertyName}'s card` : ""}`, who: who(t), amount_fmt: usd(amt(t)), date_fmt: fmtD(t.date), plaid_category: t.category_primary };
+    if (lt?.override?.ignored) {
+      const by = String(lt.override.updatedBy || "").split("@")[0].split(".")[0];
+      leakage.push({ ...row, direction: `personal${by ? `, excluded from the property's books by ${by[0].toUpperCase()}${by.slice(1)}` : ""}` });
+      if (g.group === "business") repayBusiness.push({ t, by });
+      continue;
     }
+    if (filed || entSettled) {
+      const owner = filed ? ownerGroup(filed.property_id) : (ent.override?.entityId || ent.classification?.entityId) === "business" ? "business" : "personal";
+      if (owner && owner !== g.group && !(owner === "property" && g.group === "property")) {
+        leakage.push({ ...row, direction: `filed to ${owner} in the books, paid from a ${g.group} account` });
+        flag(50, "leakage", `${who(t)} ${usd(amt(t))} (${fmtD(t.date)}) was paid from ${label(t.account_id)} (${g.group}) but the books file it as ${owner}.`, `Move ${usd(amt(t))} to ${label(t.account_id)} from the ${owner} account that should have paid it.`);
+      }
+      continue;
+    }
+    ask(`owner:${t.transaction_id}`, `${who(t)} ${usd(amt(t))} on ${fmtD(t.date)} was paid from ${label(t.account_id)}: was it for ${g.propertyName || g.group}, or personal?`,
+      "File it in the hub (Financials → Transactions): pick its category, or exclude it as personal.",
+      [{ label: `For ${g.propertyName || g.group}`, key: "property" }, { label: "Personal", key: "personal" }]);
   }
-  if (leakage.length) flag(50, "leakage", `${leakage.length} charge(s) this week are in a Plaid category that does not match the account's owner (listed under Spending).`);
+  for (const { t, by } of repayBusiness) {
+    flag(55, "leakage", `${who(t)} ${usd(amt(t))} (${fmtD(t.date)}) on ${label(t.account_id)} was excluded from the business books${by ? ` by ${by}` : ""} as personal.`, `Repay ${usd(amt(t))} to ${label(t.account_id)} from a personal account.`);
+  }
   const incomeInPersonal = wk.filter((t) => !out(t) && acct(t.account_id).type === "depository" && ["personal", "business"].includes(gAt(t).group)
     && /airbnb|booking\.com|vrbo|expedia|homeaway/i.test(`${t.merchant_name || ""} ${t.name || ""}`))
     .map((t) => ({ date_fmt: fmtD(t.date), amount_fmt: usd(amt(t)), account: label(t.account_id), who: who(t) }));
@@ -473,8 +856,18 @@ async function main() {
   const privateValue = privateList.length ? privateLib.privateTotal(privateList) : null;
   const netWorth = (brokerNow || 0) + othersTotal + (holdingsValue || 0) + (reValue || 0) + (privateValue || 0) + bankCash - cardDebt - depositLiability;
   const idleThreshold = map.idle_cash_buffer_usd || 50000;
-  for (const a of depos.filter((a) => num(a.balance_current) > idleThreshold && ["savings", "checking"].includes(a.subtype) && gmap[a.account_id]?.group !== "deposits")) {
-    flag(40, "idle-cash", `${label(a.account_id)} holds ${usd0(num(a.balance_current))}, above the ${usd0(idleThreshold)} idle-cash threshold.`);
+  // The balance net of money already on its way out of it (a transfer another
+  // bank pulled, its side here not posted yet: transfer_sources names the account).
+  const leaving = (a) => round2(sum(pendingOwn.filter((t) => String((map.transfer_sources || {})[t.transaction_id] || "").includes(`••${a.mask}`)), (t) => Math.abs(Number(t.amount))));
+  // ...and net of the confirmed payments due from it in the next 14 days.
+  const idleBal = (a) => round2(num(a.balance_current) - leaving(a) - (dueFrom.get(a.account_id) || 0));
+  for (const a of depos.filter((a) => idleBal(a) > idleThreshold && ["savings", "checking"].includes(a.subtype) && gmap[a.account_id]?.group !== "deposits")) {
+    const left = leaving(a);
+    const due = dueFrom.get(a.account_id) || 0;
+    const after = [left ? `the ${usd0(left)} already on its way out` : "", due ? `the ${usd0(due)} of payments due from it in the next 14 days` : ""].filter(Boolean).join(" and ");
+    flag(60, "idle-cash", `${label(a.account_id)} holds ${usd0(idleBal(a))}${after ? ` after ${after}` : ""}, ${usd0(idleBal(a) - idleThreshold)} above your ${usd0(idleThreshold)} cash buffer.`,
+      `Nothing is at risk; move the ${usd0(idleBal(a) - idleThreshold)} somewhere it earns more if you want, otherwise nothing to do.`);
+    attention[attention.length - 1].optional = true;
   }
 
   // ── 13. TAX (awareness) ─────────────────────────────────────────────────
@@ -487,7 +880,7 @@ async function main() {
     id: p.id, name: p.name, rental_type: p.rental_type, cash_fmt: usd0(p.cash),
     week_net_fmt: gap(p, signed(p.week.net)), mtd_net_fmt: gap(p, signed(p.mtd.net)), ytd_net_fmt: gap(p, signed(p.ytd.net)),
     ytd_income_fmt: gap(p, usd0(p.ytd.income)), ytd_expenses_fmt: gap(p, usd0(p.ytd.expenses)),
-    reserve_fmt: months(p.reserve_months), reserve_low: p.reserve_months != null && p.reserve_months < reserveFloor,
+    reserve_fmt: (p.accounts || []).length ? months(p.reserve_months) : "—", reserve_low: (p.accounts || []).length > 0 && p.reserve_months != null && p.reserve_months < reserveFloor,
     rent_roll_fmt: p.rent_roll == null ? null : usd0(p.rent_roll),
     value_fmt: p.value_estimate == null ? "no valuation" : usd0(p.value_estimate),
     ledger_empty_ytd: p.ledger_empty_ytd,
@@ -498,11 +891,20 @@ async function main() {
 
   attention.sort((a, b) => b.priority - a.priority);
   attention.forEach((a, i) => { a.id = `a${i + 1}`; });
-  if (questions.length) attention.push({ priority: 30, tag: "questions", id: `a${attention.length + 1}`, text: `${questions.length} open question(s) in the Questions tab need an answer before the review can state them.` });
+  // A question the user already answered in the Questions tab is never asked
+  // again (bin/finance-review-ask). One the records still raise has an answer
+  // they do not hold yet: it goes to `questions_answered`, not `questions`, so
+  // nothing downstream (the to-do list, the footer, the phone pointer) calls it
+  // open or tells the user to answer it.
+  const answeredBefore = await answeredFinanceQuestions();
+  const questionsAnswered = questions.filter((q) => answeredBefore.has(String(q.id)));
+  const waiting = questions.filter((q) => !answeredBefore.has(String(q.id)));
+  if (waiting.length) attention.push({ priority: 30, tag: "questions", id: `a${attention.length + 1}`, text: `${waiting.length} open question(s) in the Questions tab need an answer before the review can state them.` });
+  if (questionsAnswered.length) attention.push({ priority: 29, tag: "answers-unrecorded", id: `a${attention.length + 1}`, text: `${questionsAnswered.length} question(s) you already answered are not in the records yet, so this review still treats them as open.` });
 
   // Facts the summary may cite. Every one is a sentence this code wrote.
   const facts = [
-    ...attention.map((a) => ({ id: a.id, text: a.text })),
+    ...attention.map((a) => ({ id: a.id, text: a.action ? `${a.text} ${a.action}` : a.text })),
     freeCash != null && { id: "cash.free", text: `Free cash is ${usd0(freeCash)}, ${signed(cashPos.free_cash_week_delta)} on the week.` },
     { id: "flow.week", text: `This week: ${flowFmt.income_in_fmt} of income arrived, ${flowFmt.spending_fmt} was spent, and ${flowFmt.card_payments_from_bank_fmt} of card payments left bank accounts.` },
     runway != null && { id: "runway", text: `Runway is ${runway} days: free cash of ${usd0(freeCash)} at ${usd0(dailySpend)} per day, the average daily spending of the last 90 days.` },
@@ -518,7 +920,7 @@ async function main() {
       valuation_as_of: reconciledDate,
       classifier: "lib/finance-classify.js — every transaction's kind and the rule that set it",
     },
-    attention, facts, questions,
+    attention, facts, questions: waiting, questions_answered: questionsAnswered,
     cash: {
       position: cashPos ? {
         free_cash_fmt: usd0(cashPos.free_cash), free_cash_week_delta_fmt: signed(cashPos.free_cash_week_delta),
@@ -531,18 +933,19 @@ async function main() {
           detail: `sweep ${usd0(cashPos.buckets.brokerage_taxable.sweep)}, money market ${usd0(cashPos.buckets.brokerage_taxable.money_market)}, as of ${fmtD(String(cashPos.buckets.brokerage_taxable.as_of || "").slice(0, 10))}${cashPos.buckets.brokerage_taxable.settlement_note ? `; ${cashPos.buckets.brokerage_taxable.settlement_note}` : ""}`,
         }]),
         restricted_fmt: usd0(cashPos.restricted.security_deposits.total),
+        pending_own_note: cashPos.pending_own ? cashPos.pending_own.text : null,
         retirement_cash_fmt: usd0(cashPos.not_spendable.retirement_cash),
         unmapped: cashPos.unmapped.accounts.map((a) => `${a.label} ••${a.mask}: ${usd0(a.balance)}`),
         delta_note: `bank week-on-week is reconstructed from posted transactions; the ${BROKER.label}'s is measured against its own daily history`,
       } : null,
       card_debt_fmt: usd0(cardDebt),
-      flow: { ...flowFmt, unexplained_rows: unexplainedRows },
+      flow: { ...flowFmt, unexplained_rows: unexplainedRows, detail: flowDetail },
       runway_days: runway, daily_spend_fmt: dailySpend ? usd0(dailySpend) : null,
       runway_basis: "free cash ÷ average daily classified spending over the last 90 days (excludes transfers, card payments, capital and unclassified large outflows)",
       upcoming_14d: upcoming, shortfalls, unconfirmed_card_payments: unconfirmedPayments,
     },
     invoices: inv.section, invoices_label: (RF.invoices && RF.invoices.label) || "Client",
-    income: { registered: incomeRows, rent: rentRows, rent_invoices_open: rentInvoicesOpen, rent_invoices_failed: rentInvoicesFailed, rent_check_from_day: rentCheckDay, note: expectedIncome?.length ? null : "No income streams are registered; none is reported as late. Register with `finance-facts income add`." },
+    income: { registered: incomeRows, covered_by_books: [...coveredStreams], rent: rentRows, rent_invoices_open: rentInvoicesOpen, rent_invoices_failed: rentInvoicesFailed, rent_check_from_day: rentCheckDay, note: expectedIncome?.length ? null : "No income streams are registered; none is reported as late. Register with `finance-facts income add`." },
     real_estate: re ? {
       properties: props.map(propRow), short_term: groupRow(re.groups.short_term), long_term: groupRow(re.groups.long_term), portfolio: groupRow(re.portfolio),
       sold_this_year: re.sold_this_year.map((r) => ({ name: r.name, disposed_on_fmt: fmtD(r.disposed_on), ytd_net_fmt: signed(r.ytd.net) })),
@@ -556,9 +959,10 @@ async function main() {
       week_total_fmt: flowFmt.spending_fmt, prior_week_total_fmt: usd0(spendPrev),
       by_category: byCategory, by_account: byAccount, largest, leakage, income_in_personal: incomeInPersonal,
     },
+    loyalty,
     cards: { aggregate_utilization_fmt: pct(aggUtil), utilization_basis: "cards that report a limit", items: cardItems, interest, fees },
     recurring: {
-      source: `${FR.recurring_label} (expense-recurring)`, active_count: items.length, monthly_equivalent_fmt: usd0(monthlyEq),
+      source: FR.recurring_label, active_count: items.length, monthly_equivalent_fmt: usd0(monthlyEq),
       undecided_count: undecided.length, price_changes: changed, renewals_30d: renewals, charged_after_cancel: chargedAfterCancel,
     },
     anomalies,
@@ -574,7 +978,7 @@ async function main() {
         ...(holdingsValue == null ? [] : [{ label: `${NW.holdings_label} (Plaid)`, value_fmt: usd0(holdingsValue), as_of: null, note: null }]),
         ...(privateValue == null ? [] : [{ label: privateLib.privateLabel(), value_fmt: usd0(privateValue), as_of: null, note: privateList.map((h) => `${h.name}${h.mark_as_of ? ` (marked ${h.mark_as_of})` : ""}`).join(", ") }]),
         { label: "Card balances", value_fmt: `−${usd0(cardDebt)}`, as_of: "today", note: null },
-        { label: "Tenant deposits owed back", value_fmt: `−${usd0(depositLiability)}`, as_of: "today", note: "every deposit held, per the deposit reconciliation" },
+        { label: "Tenant deposits owed back", value_fmt: `−${usd0(depositLiability)}`, as_of: "today", note: "every current tenant's deposit, wherever it is held (per the deposit reconciliation)" },
       ],
       note: `Awareness only. Real estate is counted as equity: ${map.mortgage_free_as_of ? `recorded mortgage-free as of ${map.mortgage_free_as_of}` : "no mortgage is recorded in the account map"}.`,
     },

@@ -1,0 +1,110 @@
+#!/usr/bin/env node
+"use strict";
+// finance-review-gate — the weekly finance review's questions go out BEFORE
+// the email, and the email waits for the answers (as the daily summary's do,
+// bin/daily-summary-fix ask/gate/sweep).
+//
+// The user (2026-11-08): "asking questions and answering them before the send
+// is important." So the run asks what only the user can settle, holds the
+// email, and a later run (started by the sweep once every question is
+// answered, or once the answer window closes) records the answers, rebuilds,
+// checks and sends.
+//
+//   finance-review-gate hold --week <YYYY-MM-DD> [--hours 3]
+//        after finance-review-ask sent this run's questions: record the hold
+//        for that week (the open finance-review questions are what it waits on).
+//   finance-review-gate check --week <YYYY-MM-DD>
+//        exit 0 = send now; exit 3 = hold (questions open and the window open).
+//        Prints {decision, open, hold_until}.
+//   finance-review-gate sent --week <YYYY-MM-DD>
+//        the email went out: the hold is closed.
+//   finance-review-gate sweep
+//        (cron, every 30 min) a held week whose questions are all answered, or
+//        whose window has closed, is started again: trigger-finance-review.sh
+//        with source cron-finance-review-sweep. Once per hold.
+//
+// State: data/finance-review-hold.json {week, asked_at, hold_until, open_at_hold[],
+// resumed_at, sent_at}. One week at a time: a new hold replaces a sent one.
+// The answer window: 3 hours, ending no earlier than 11:00 the user's time when
+// the questions went out in the quiet hours (before 08:00), so a question asked
+// early is answered before the email goes.
+
+const fs = require("node:fs");
+const path = require("node:path");
+const { spawnSync } = require("node:child_process");
+const { installTools } = require("../lib/root.cjs");
+const { instance } = require("../lib/instance.cjs");
+
+const STATE = installTools("data", "finance-review-hold.json");
+const LOG = installTools("data", "logs", "finance-review-gate.log");
+const arg = (n) => { const i = process.argv.indexOf(`--${n}`); return i >= 0 ? process.argv[i + 1] : null; };
+const read = () => { try { return JSON.parse(fs.readFileSync(STATE, "utf8")); } catch { return null; } };
+const write = (s) => { fs.mkdirSync(path.dirname(STATE), { recursive: true }); fs.writeFileSync(STATE, JSON.stringify(s, null, 2) + "\n"); };
+const log = (m) => { try { fs.mkdirSync(path.dirname(LOG), { recursive: true }); fs.appendFileSync(LOG, `${new Date().toISOString()} ${m}\n`); } catch {} };
+
+async function openFinanceQuestions() {
+  const oq = await import(path.join(__dirname, "..", "lib", "open-questions.mjs"));
+  return oq.foldQuestions().filter((q) => q.lane === "finance-review" && q.status === "open").map((q) => q.id);
+}
+
+function localHour(d, tz) {
+  return Number(new Intl.DateTimeFormat("en-US", { timeZone: tz, hour: "numeric", hour12: false }).format(d)) % 24;
+}
+
+function windowEnd(now, hours, tz) {
+  let end = new Date(now.getTime() + hours * 3600e3);
+  const h = localHour(now, tz);
+  if (h < 8) {
+    // Asked in the quiet hours: no earlier than 11:00 local the same morning.
+    const elevenToday = new Date(now.getTime() + ((11 - h) * 3600e3) - (now.getMinutes() * 60e3));
+    if (elevenToday > end) end = elevenToday;
+  }
+  return end;
+}
+
+async function main() {
+  const cmd = process.argv[2];
+  const tz = instance().tz || "UTC";
+  const week = arg("week");
+  if (cmd === "hold") {
+    if (!week) throw new Error("--week is required");
+    const open = await openFinanceQuestions();
+    if (!open.length) { console.log(JSON.stringify({ held: false, reason: "no open questions" })); return 0; }
+    const now = new Date();
+    const s = { week, asked_at: now.toISOString(), hold_until: windowEnd(now, Number(arg("hours") || 3), tz).toISOString(), open_at_hold: open, resumed_at: null, sent_at: null };
+    write(s); log(`hold ${week}: ${open.length} open until ${s.hold_until}`);
+    console.log(JSON.stringify({ held: true, ...s }));
+    return 0;
+  }
+  if (cmd === "check") {
+    const s = read();
+    if (!s || (week && s.week !== week) || s.sent_at) { console.log(JSON.stringify({ decision: "send", reason: "no hold" })); return 0; }
+    const open = (await openFinanceQuestions()).filter((id) => s.open_at_hold.includes(id));
+    if (!open.length) { console.log(JSON.stringify({ decision: "send", reason: "all answered" })); return 0; }
+    if (Date.now() >= Date.parse(s.hold_until)) { console.log(JSON.stringify({ decision: "send", reason: "answer window closed", open })); return 0; }
+    console.log(JSON.stringify({ decision: "hold", open, hold_until: s.hold_until }));
+    return 3;
+  }
+  if (cmd === "sent") {
+    const s = read();
+    if (s && (!week || s.week === week)) { s.sent_at = new Date().toISOString(); write(s); log(`sent ${s.week}`); }
+    console.log(JSON.stringify({ ok: true }));
+    return 0;
+  }
+  if (cmd === "sweep") {
+    const s = read();
+    if (!s || s.sent_at || s.resumed_at) return 0;
+    const open = (await openFinanceQuestions()).filter((id) => s.open_at_hold.includes(id));
+    const due = !open.length || Date.now() >= Date.parse(s.hold_until);
+    if (!due) return 0;
+    s.resumed_at = new Date().toISOString(); write(s);
+    log(`sweep: resume ${s.week} (${open.length ? `window closed, ${open.length} still open` : "all answered"})`);
+    const r = spawnSync(installTools("agent", "scripts", "trigger-finance-review.sh"), [], { encoding: "utf8", env: { ...process.env, FINANCE_REVIEW_SOURCE: "cron-finance-review-sweep" }, timeout: 120000 });
+    log(`sweep: trigger exit ${r.status} ${String(r.stderr || "").slice(0, 200)}`);
+    return 0;
+  }
+  console.error("usage: finance-review-gate hold --week D [--hours N] | check --week D | sent --week D | sweep");
+  return 2;
+}
+
+main().then((c) => process.exit(c || 0)).catch((e) => { console.error(`finance-review-gate: ${e.message}`); log(`error: ${e.message}`); process.exit(1); });

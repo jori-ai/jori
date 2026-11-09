@@ -1007,7 +1007,7 @@
         "spa heating formula",
         "refit spa model"
       ],
-      "description": "Monthly re-fit of the spa heating formula (rate vs water/air gap, plus wind) from synced sessions; emails the analysis. Silent below 3 usable sessions or without a spa configured. Playbook: agent/ops-agent/jobs/spa-heating-model.md.",
+      "description": "Monthly re-fit of the spa heating formula (rate vs water/air gap, plus wind) from synced sessions; installs a better re-fit on SpaServer itself (bin/spa-heating-tune, standing word 2026-11-08) until it converges, then only monitors; emails the analysis. Silent below 3 usable sessions or without a spa configured. Playbook: agent/ops-agent/jobs/spa-heating-model.md.",
       "job": "spa-heating-model"
     },
     {
@@ -1666,7 +1666,7 @@
         "where did my money go",
         "weekly spending"
       ],
-      "description": "Weekly financial review across all connected accounts: cash and runway with shortfalls, income arrival, spending by category, card and merchant, anomalies and fees; a deterministic packet (bin/finance-review-data, -compose) narrated once. READ-ONLY. Playbook: agent/ops-agent/jobs/finance-review.md.",
+      "description": "Weekly financial review across all connected accounts: cash and runway with shortfalls, income arrival, spending by category, card and merchant, anomalies and fees; a deterministic packet (bin/finance-review-data, -compose) narrated once. READ-ONLY. Playbook: agent/ops-agent/jobs/finance-review.md. Runs in a fresh session (bin/finance-review-run); checked before sending (bin/finance-review-check); questions go out first and the email waits for the answers (bin/finance-review-gate; sweep at :23/:53).",
       "job": "finance-review"
     },
     {

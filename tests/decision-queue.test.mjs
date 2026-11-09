@@ -289,3 +289,10 @@ test("reads the allowance governor's budget questions as their own unpaced sourc
   assert.ok(dq.UNPACED.has("budget"));
   assert.equal(dq.followUp("bud:chat-build-abc").who, "the allowance governor");
 });
+
+test("withoutHeld drops items the pre-rank filter already holds as settled, and fails open", () => {
+  const items = [{ ref: "ppl:a" }, { ref: "si-1" }];
+  assert.deepEqual(dq.withoutHeld(items, new Map([["decision:ppl:a", "2026-11-07T00:00:00Z"]])).map((i) => i.ref), ["si-1"]);
+  assert.equal(dq.withoutHeld(items, new Set()), items);
+  assert.equal(dq.withoutHeld(items, null), items);
+});

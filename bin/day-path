@@ -912,6 +912,33 @@ def walked_out(v, inside, cls, fixes, stays):
     return cut, dest, min(arrive, dest["start"])
 
 
+def open_visit_end(all_visits, day_end, now=None):
+    """The day's latest visit row, still open, runs on to the day's end (or to now).
+
+    A row with no departed_at is a stay the user had not left when the rows were
+    read. Taken as the instant it began, an arrival home for the night that the
+    phone, lying still, followed with no fix had no dwell at all, and the day ended
+    a street short of it, where the ride dropped the user before the walk in. Only the
+    latest row (with its exact duplicates) is open in that sense, and only when no
+    row of that instant has a departure: an earlier row with no departure was left
+    without the phone saying so, and stays the instant it began. And only a row at a
+    place the phone matched or the user confirmed (`named`, `user-confirmed`): which place
+    a bare street-address row is, is the place fold's guess, and a guess does not get
+    to hold the rest of the evening. Its end is the day's end, or now on a day still
+    under way; reconcile_visit still clips it where the fixes put the user elsewhere.
+    JORI_OPEN_VISIT_TO_END=0 turns it off. Returns (arrived_at, end) or None."""
+    if os.environ.get("JORI_OPEN_VISIT_TO_END") == "0" or not all_visits:
+        return None
+    last = max(ts(r["arrived_at"]) for r in all_visits)
+    at_last = [r for r in all_visits if ts(r["arrived_at"]) == last]
+    if any(r.get("departed_at") for r in at_last):
+        return None
+    if not all(r.get("place_type") in ("named", "user-confirmed") for r in at_last):
+        return None
+    end = min(day_end, now or datetime.now(timezone.utc))
+    return (last, end) if end > last else None
+
+
 def reconcile_visit(v, fixes, stays=None):
     """A visit row may only stop the clock where the fixes agree he was there.
 
@@ -1097,8 +1124,11 @@ def build(date_str, tzname, rows, do_match=True, verbose=False, statements=None)
                 for r in sorted(raw_nonstops, key=lambda r: r["arrived_at"])]
 
     unsupported, visits = [], []
+    still_open = open_visit_end(all_visits, day_end)
     for r in sorted(raw_visits, key=lambda r: r["arrived_at"]):
         a, dpt = ts(r["arrived_at"]), ts(r["departed_at"] or r["arrived_at"])
+        if still_open and not r.get("departed_at") and a == still_open[0]:
+            dpt = still_open[1]     # not left yet: open_visit_end
         v0 = dict(start=a, end=dpt, lat=r["latitude"], lon=r["longitude"], ptype=r["place_type"],
                   name=clean_name(r["place_name"]))
         spans, why = reconcile_visit(v0, all_fixes, stays)

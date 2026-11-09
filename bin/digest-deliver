@@ -15,7 +15,11 @@
 // Usage:
 //   digest-deliver --subject <s> --body-file <html> --intent <job>
 //                  [--label personal] [--pointer "<one line + hook>"] [--push "<text>"]
-//                  [--evidence-live]
+//                  [--evidence-live] [--also-to <addr>[,<addr>...]]
+//
+// --also-to: people the owner asked to share this digest with, on the SAME
+// message as the owner (one email, both in To), never a separate send. The
+// pointer and push stay the owner's.
 //
 // Omit --pointer when the email has nothing worth surfacing (the rule says no
 // pointer then). Exit: 0 done · 1 email did not send (nothing else ran) ·
@@ -26,7 +30,7 @@ import { sendHtmlEmail, labelDigest, pointerAndPush } from "../lib/digest-delive
 
 function usage(msg) {
   if (msg) console.error(`digest-deliver: ${msg}`);
-  console.error("usage: digest-deliver --subject S --body-file F --intent JOB [--label L] [--pointer TEXT] [--push TEXT] [--evidence-live]");
+  console.error("usage: digest-deliver --subject S --body-file F --intent JOB [--label L] [--pointer TEXT] [--push TEXT] [--evidence-live] [--also-to ADDRS]");
   process.exit(64);
 }
 
@@ -42,6 +46,7 @@ for (let i = 0; i < argv.length; i++) {
   else if (k === "--pointer") o.pointer = v();
   else if (k === "--push") o.push = v();
   else if (k === "--evidence-live") o.evidenceLive = true;
+  else if (k === "--also-to") o.alsoTo = v();
   else if (k === "-h" || k === "--help") usage();
   else usage(`unknown arg ${k}`);
 }
@@ -50,12 +55,12 @@ if (!o.subject || !o.bodyFile || !o.intent) usage("--subject, --body-file and --
 const log = (m) => console.error(`digest-deliver: ${m}`);
 
 try {
-  sendHtmlEmail({ subject: o.subject, html: fs.readFileSync(o.bodyFile, "utf8") });
+  sendHtmlEmail({ subject: o.subject, html: fs.readFileSync(o.bodyFile, "utf8"), alsoTo: o.alsoTo });
 } catch (e) {
   log(`email-send failed — nothing else ran: ${String(e.stderr || e.message).trim().slice(0, 400)}`);
   process.exit(1);
 }
-log(`sent "${o.subject}"`);
+log(`sent "${o.subject}"${o.alsoTo ? ` (also to ${o.alsoTo})` : ""}`);
 
 const id = await labelDigest(o.subject, { label: o.label, log });
 if (id) log(`labeled ${o.label} + starred + read, in INBOX: ${id}`);

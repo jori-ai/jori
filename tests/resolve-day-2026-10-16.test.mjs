@@ -32,7 +32,7 @@ const require = createRequire(import.meta.url);
 // another zone, or a fresh install, reads them the same.
 process.env.JORI_TZ = "America/New_York";
 const ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
-const { applySpineVerdicts, mergeTouchingSameName, mergeSplitVisits, reclaimMisplacedPhotos,
+const { applySpineVerdicts, mergeTouchingSameName, mergeSplitVisits, reclaimMisplacedPhotos, applyVisitCompanions, pruneShrunkCompanions,
         overlayConfirmedVisits, reclaimTargetIds, extendThroughSilence, mergeDuplicateStops } =
   require(path.join(ROOT, "lib/resolve-day.js"))._internal;
 
@@ -263,4 +263,102 @@ test("a photo taken at the other piece (by the car, 18:04) still lands on the jo
   const rows = [{ uuid: "IMG_7728", taken_at: "2026-10-16T15:04:37Z", ...LLR(-2032.86, -6168.85), self_captured: true }];
   const moved = reclaimMisplacedPhotos([joined], new Set([joined.id]), rows);
   assert.deepEqual(moved.map(m => [m.uuid, m.to]), [["IMG_7728", joined.id]]);
+});
+
+// One stay cut in two by a short gap (a venue's arrival outside, its seats inside): the
+// touch merge joined only stops within 2 minutes, while the review calls any same-title
+// pair within 15 minutes one stay. It now takes 15 minutes when the two stops are close
+// (250 m; touching ones keep the 700 m fuzz), and a calendar-named place outranks a
+// spine dwell's when they merge.
+test("a stay cut in two by a gap just over two minutes, 130 m apart, is one stop", () => {
+  const arrival = stop("s-4", "The Hall Theatre", "00:27:08", "00:33:12",
+    { ...LL(60, 115), place: { name: "The Hall Theatre", source: "spine_dwell", confidence: 0.85 }, confirmed_row: null });
+  const seats = stop("s-5", "The Hall Theatre", "00:35:22", "02:18:10", {
+    ...LL(0, 0), place: { name: "The Hall Theatre", source: "calendar_corroborated", confidence: 0.9 }, confirmed_row: null,
+    calendar_event: { summary: "A show" }, photos: [{ uuid: "p1" }, { uuid: "p2" }], companions: ["Pat"],
+  });
+  const { stops, merged } = mergeTouchingSameName([seats, arrival]);
+  assert.equal(stops.length, 1);
+  assert.equal(stops[0].id, "s-4", "the earlier keeps its id");
+  assert.equal(stops[0].start_ts_ms, U("00:27:08"));
+  assert.equal(stops[0].end_ts_ms, U("02:18:10"));
+  assert.equal(stops[0].place.source, "calendar_corroborated", "the calendar's place outranks the spine's dwell");
+  assert.equal(stops[0].lat, seats.lat, "and its pin comes with it");
+  assert.equal(stops[0].calendar_event.summary, "A show");
+  assert.deepEqual(stops[0].photos.map(p => p.uuid), ["p1", "p2"]);
+  assert.deepEqual(stops[0].companions, ["Pat"]);
+  assert.deepEqual(merged[0].absorbed, ["s-5"]);
+});
+
+test("ten minutes apart on the same spot is still one stay", () => {
+  const mk = (id, from, to, e) => stop(id, "Corner Cafe", from, to, { ...LL(e, 0), place: { name: "Corner Cafe", source: "confirmed_stop" } });
+  assert.equal(mergeTouchingSameName([mk("s-1", "13:00:00", "13:40:00", 0), mk("s-2", "13:50:00", "14:20:00", 80)]).stops.length, 1);
+});
+
+test("a gap past 15 minutes, or two spots far apart after a gap, is a return", () => {
+  const mk = (id, from, to, e) => stop(id, "Corner Cafe", from, to, { ...LL(e, 0), place: { name: "Corner Cafe", source: "confirmed_stop" } });
+  assert.equal(mergeTouchingSameName([mk("s-1", "13:00:00", "13:40:00", 0), mk("s-2", "14:00:00", "14:20:00", 80)]).stops.length, 2,
+    "20 minutes apart: he left and came back");
+  assert.equal(mergeTouchingSameName([mk("s-1", "13:00:00", "13:40:00", 0), mk("s-2", "13:50:00", "14:20:00", 400)]).stops.length, 2,
+    "400 m apart after a gap: two places with one name");
+});
+
+test("a stop with no coordinates is only merged when it touches, and a different venue between keeps both apart", () => {
+  const none = { lat: null, lon: null, place: { name: "Corner Cafe", source: "confirmed_stop" } };
+  const mk = (id, from, to) => stop(id, "Corner Cafe", from, to, none);
+  assert.equal(mergeTouchingSameName([mk("s-1", "13:00:00", "13:40:00"), mk("s-2", "13:41:00", "14:20:00")]).stops.length, 1);
+  assert.equal(mergeTouchingSameName([mk("s-1", "13:00:00", "13:40:00"), mk("s-3", "13:50:00", "14:20:00")]).stops.length, 2,
+    "a ten-minute gap with nothing to place it by is not joined");
+  const cafe = (id, from, to) => stop(id, "Corner Cafe", from, to, { ...LL(0, 0), place: { name: "Corner Cafe", source: "confirmed_stop" } });
+  const shop = stop("s-2", "Book Shop", "13:42:00", "13:50:00", { ...LL(30, 0), place: { name: "Book Shop", source: "confirmed_stop" } });
+  assert.equal(mergeTouchingSameName([cafe("s-1", "13:00:00", "13:40:00"), shop, cafe("s-3", "13:52:00", "14:30:00")]).stops.length, 3);
+});
+
+// A long visit row that touches a stop for seconds is the neighbour's: the flat's row
+// (a visitor staying there), arrived at as the walk home from the cafe ended 260 m away,
+// gave the cafe the visitor.
+test("a visit row that grazes a stop for seconds gives it no people; one that holds it does", () => {
+  const row = (from, to, who, e = 0) => ({ arrived_at: new Date(U(from)).toISOString(), departed_at: new Date(U(to)).toISOString(),
+    ...(() => { const p = LLR(e, 0); return p; })(), companions: who });
+  const cafe = () => ({ ...stop("cafe", "Corner Cafe", "13:15:00", "14:00:30"), ...LL(260, 0), companions: [] });
+  const flat = row("14:00:15", "23:00:00", ["Visitor"], 0);
+  const stays = [cafe()];
+  applyVisitCompanions(stays, [flat]);
+  assert.deepEqual(stays[0].companions, [], "15 seconds of a nine-hour row");
+  const held = [cafe()];
+  applyVisitCompanions(held, [row("13:10:00", "13:50:00", ["Friend"], 260)]);
+  assert.deepEqual(held[0].companions, ["Friend"], "the row holds most of the stop");
+  const inside = [{ ...stop("quick", "Corner Cafe", "15:00:00", "15:01:30"), ...LL(0, 0), companions: [] }];
+  applyVisitCompanions(inside, [row("12:00:00", "23:00:00", ["Friend"], 0)]);
+  assert.deepEqual(inside[0].companions, ["Friend"], "a short stop wholly inside a long row keeps its people");
+  const off = [cafe()];
+  process.env.JORI_ROW_GRAZE = "0";
+  try { applyVisitCompanions(off, [flat]); } finally { delete process.env.JORI_ROW_GRAZE; }
+  assert.deepEqual(off[0].companions, ["Visitor"]);
+});
+
+// A visitor staying at the flat is on the stops either side of the morning coffee, and the
+// coffee stop shrank after it took the flat's row. The bracket kept him there; the coffee's
+// own visit row, which names who went, says he did not.
+test("the bracket does not put a name on a stop whose own visit row lists others without it", () => {
+  const iso = (hms) => new Date(U(hms)).toISOString();
+  const row = (from, to, who, e) => ({ arrived_at: iso(from), departed_at: iso(to), ...LLR(e, 0), companions: who });
+  const build = () => {
+    const prev = stop("night", "The Flat", "00:00:00", "13:12:00", { ...LL(0, 0), companions: ["Visitor"] });
+    const cafe = stop("cafe", "Corner Cafe", "13:15:25", "14:00:30", { ...LL(260, 0), companions: ["Visitor", "Pat"],
+      companion_merge_window: { start_ts_ms: U("13:15:25"), end_ts_ms: U("14:12:00"), lat: LL(260, 0).lat, lon: LL(260, 0).lon } });
+    const next = stop("day", "The Flat", "14:03:00", "23:00:00", { ...LL(0, 0), companions: ["Visitor"] });
+    return [prev, cafe, next];
+  };
+  const flatRow = row("14:05:15", "23:00:00", ["Visitor"], 0);
+  const withOwn = build();
+  pruneShrunkCompanions(withOwn, [row("13:15:25", "14:00:30", ["Pat"], 260), flatRow]);
+  assert.deepEqual(withOwn[1].companions, ["Pat"], "the cafe's own row lists Pat alone");
+  const noOwn = build();
+  pruneShrunkCompanions(noOwn, [row("13:15:25", "14:00:30", [], 260), flatRow]);
+  assert.deepEqual(noOwn[1].companions, ["Visitor", "Pat"], "a row with no people says nothing: the bracket stands");
+  const off = build();
+  process.env.JORI_BRACKET_OWN_ROW = "0";
+  try { pruneShrunkCompanions(off, [row("13:15:25", "14:00:30", ["Pat"], 260), flatRow]); } finally { delete process.env.JORI_BRACKET_OWN_ROW; }
+  assert.deepEqual(off[1].companions, ["Visitor", "Pat"]);
 });

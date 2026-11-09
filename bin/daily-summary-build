@@ -275,6 +275,27 @@ async function attachCalls(date, resolved) {
   await hook.attachCalls({ date, tz: boundaryTzOf(resolved), resolved, tmp: TMP, bin: BIN, boundaryTzOf });
 }
 
+// The day's decisions (an installation's own record of what the user decided
+// that day in some area it tracks): a list at the bottom of the report, never
+// stops. The hook lib/_ext/day-decisions.mjs exports attachDecisions({ date,
+// tz, resolved, tmp, bin, boundaryTzOf }) and sets resolved.decisions
+// ([{ area, line, source, time? }]) and, when its read failed,
+// resolved.decisions_error. Without the hook a day has no decisions section.
+async function attachDecisions(date, resolved) {
+  const { loadHook } = await import(require("url").pathToFileURL(path.join(__dirname, "..", "lib", "ext-hooks.mjs")).href);
+  const hook = await loadHook(path.join(__dirname, "..", "lib"), "day-decisions");
+  if (!hook || typeof hook.attachDecisions !== "function") { resolved.decisions = []; delete resolved.decisions_error; return; }
+  try {
+    await hook.attachDecisions({ date, tz: boundaryTzOf(resolved), resolved, tmp: TMP, bin: BIN, boundaryTzOf });
+  } catch (e) {
+    // A hook that throws leaves the day's earlier settling (if any) and says so.
+    resolved.decisions = Array.isArray(resolved.decisions) ? resolved.decisions : [];
+    resolved.decisions_error = String((e && e.message) || e).split("\n")[0].slice(0, 200);
+    process.stderr.write(`[daily-summary-build] decisions failed: ${resolved.decisions_error}\n`);
+  }
+  if (!Array.isArray(resolved.decisions)) resolved.decisions = [];
+}
+
 // prep — settle the JSON. NO HTML: photos aren't rendered and no skeleton is
 // written, so a re-prep after vetting costs nothing but the settle loop: the day
 // is settled as JSON, in as many passes as it takes, and only then formatted.
@@ -333,6 +354,7 @@ async function cmdPrep(date, resolvedOverride, confirmedPath, freshHarvest = fal
     resolved.tasks_completed = localizeTasksToStops(resolved.tasks_completed, resolved.stops, tz);
   }
   await attachCalls(date, resolved);
+  await attachDecisions(date, resolved);
   // A place-less event that missed every stop by minutes is the stop the person it
   // names joined the user at ("Pick up Sam"; attachNearMissEvents).
   const nearMiss = attachNearMissEvents(resolved);

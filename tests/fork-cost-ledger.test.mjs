@@ -163,3 +163,76 @@ test("run-ephemeral-opus.sh runs the pinned model with JSON output, records a ro
     fs.rmSync(home, { recursive: true, force: true });
   }
 });
+
+// A run that woke again on a background task: its result's num_turns and
+// duration_ms describe only the last segment, while the cost covers the whole
+// session. The row is completed from the run's own transcript.
+const { transcriptStats } = require("../lib/fork-cost-ledger.cjs");
+
+function fakeTranscript(dir, sid, { replies, sidechain = 0, spanMs }) {
+  const proj = path.join(dir, "-some-project");
+  fs.mkdirSync(proj, { recursive: true });
+  fs.mkdirSync(path.join(dir, "-other-project"), { recursive: true });
+  const t0 = Date.parse("2026-11-08T16:20:00Z");
+  const lines = [JSON.stringify({ type: "user", timestamp: new Date(t0).toISOString() })];
+  for (let i = 0; i < replies; i++) {
+    const ts = new Date(t0 + Math.round((spanMs * (i + 1)) / replies)).toISOString();
+    // A reply with two content blocks is written as two lines with one id.
+    lines.push(JSON.stringify({ type: "assistant", timestamp: ts, message: { id: `msg_${i}` } }));
+    lines.push(JSON.stringify({ type: "assistant", timestamp: ts, message: { id: `msg_${i}` } }));
+  }
+  for (let i = 0; i < sidechain; i++) {
+    lines.push(JSON.stringify({ type: "assistant", isSidechain: true, timestamp: new Date(t0 + 1000).toISOString(), message: { id: `side_${i}` } }));
+  }
+  lines.push("not json");
+  fs.writeFileSync(path.join(proj, `${sid}.jsonl`), lines.join("\n") + "\n");
+}
+
+test("transcriptStats counts distinct main-thread replies and the wall-clock span", () => {
+  const dir = tmp();
+  fakeTranscript(dir, "sid-a", { replies: 30, sidechain: 5, spanMs: 1_800_000 });
+  assert.deepEqual(transcriptStats("sid-a", dir), { wall_ms: 1_800_000, replies: 30 });
+  assert.equal(transcriptStats("sid-missing", dir), null);
+  assert.equal(transcriptStats(null, dir), null);
+  assert.equal(transcriptStats("sid-a", path.join(dir, "nope")), null);
+});
+
+test("a result covering only its last segment takes turns and duration from the transcript", () => {
+  const result = { ...ENVELOPE, num_turns: 16, duration_ms: 147_000 };
+  const row = rowFromResult({ job: "chat-build", result, transcript: { wall_ms: 1_851_000, replies: 143 } });
+  assert.equal(row.num_turns, 143);
+  assert.equal(row.duration_ms, 1_851_000);
+  assert.equal(row.num_turns_reported, 16);
+  assert.equal(row.duration_ms_reported, 147_000);
+  assert.equal(row.turns_source, "transcript");
+  assert.equal(row.total_cost_usd, 11.5); // cost untouched
+});
+
+test("a result that already covers the run is left exactly as reported", () => {
+  // num_turns runs a little above the transcript's reply count on a normal run.
+  const row = rowFromResult({ job: "dream", result: { ...ENVELOPE, num_turns: 64, duration_ms: 805_000 }, transcript: { wall_ms: 809_000, replies: 53 } });
+  assert.equal(row.num_turns, 64);
+  assert.equal(row.duration_ms, 805_000);
+  assert.ok(!("num_turns_reported" in row) && !("turns_source" in row));
+  // No transcript, or one with fewer replies than reported: unchanged too.
+  assert.equal(rowFromResult({ job: "x", result: ENVELOPE }).num_turns, 57);
+  const fewer = rowFromResult({ job: "x", result: { ...ENVELOPE, duration_ms: 1000 }, transcript: { wall_ms: 900_000, replies: 3 } });
+  assert.equal(fewer.num_turns, 57);
+  assert.equal(fewer.duration_ms, 1000);
+});
+
+test("fork-cost-record completes a partial result from the transcript it finds", () => {
+  const dir = tmp();
+  const sid = "partial0-0000-0000-0000-000000000000";
+  fakeTranscript(dir, sid, { replies: 40, spanMs: 600_000 });
+  const ledger = path.join(dir, "ledger.ndjson");
+  const out = path.join(dir, "out.json");
+  fs.writeFileSync(out, JSON.stringify({ ...ENVELOPE, session_id: sid, num_turns: 5, duration_ms: 20_000 }));
+  execFileSync(process.execPath, [path.join(ROOT, "bin/fork-cost-record"), "chat-build", out],
+    { env: { ...process.env, JORI_FORK_COST_LEDGER: ledger, JORI_CLAUDE_PROJECTS_DIR: dir } });
+  const [row] = readRows(ledger);
+  assert.equal(row.num_turns, 40);
+  assert.equal(row.num_turns_reported, 5);
+  assert.equal(row.duration_ms, 600_000);
+  assert.equal(row.turns_source, "transcript");
+});

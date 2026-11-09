@@ -81,4 +81,16 @@ if (r.source === "budget" && !r.already) {
   const a = spawnSync(brake, ["apply", ref], { encoding: "utf8", timeout: 30_000 });
   applied = String(a.stdout || "").trim() || `allowance-brake apply exit ${a.status}`;
 }
+// A source whose job is waiting on the answer can name a command to run once it is filed
+// (`on_answer: {bin, args}` on its own entry, written by that job): it closes the job's own
+// bookkeeping, and the job reads the answer on its next run. Only a bin/ path under the install.
+if (r.onAnswer && !r.already) {
+  const { spawnSync } = await import("node:child_process");
+  const { createRequire } = await import("node:module");
+  const { bin, args } = r.onAnswer;
+  if (typeof bin === "string" && /^bin\/\w[\w.-]*$/.test(bin) && Array.isArray(args)) { // lang-regex-ok: validating our own state file's path, not the user's words
+    const c = spawnSync(createRequire(import.meta.url)("../lib/root.cjs").installTools(bin), args.map(String), { encoding: "utf8", timeout: 30_000 });
+    applied = c.status === 0 ? "the job that asked has been told" : `${bin} exit ${c.status}: ${String(c.stderr || "").trim().slice(-200)}`;
+  }
+}
 console.log(JSON.stringify({ recorded: !r.already, already_answered: !!r.already, ref, source: r.source, answer, next, ...(applied ? { applied } : {}) }));

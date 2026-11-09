@@ -54,7 +54,10 @@ const { localConfig } = require("../lib/instance.cjs");
 // agent/local/config/spa.json: `server_url` (no spa without it) and
 // `fallback_f_per_min`, the rate SpaServer currently quotes ETAs from
 // (its HEATING_DEGREES_PER_MINUTE), shown next to what the data says.
-// Keep it in sync if that constant changes; unset = not shown.
+// Keep it in sync if that constant changes; unset = not shown. Since 2026-11-08
+// SpaServer quotes from a fitted line first and uses that constant only when it
+// has no air reading: `served_formula` (`{ a, b, since }`) records the line it
+// serves, shown beside the new fit so drift between them is visible.
 // `exclude_sessions`: sessions the user ruled out of the analysis, as
 // `{ session_id, reason, decided }` (a bare id string also works). They are
 // dropped before any count or fit and listed in the packet as `excluded_sessions`.
@@ -64,6 +67,7 @@ const { localConfig } = require("../lib/instance.cjs");
 const CFG = localConfig("spa", {
   server_url: "",
   fallback_f_per_min: null,
+  served_formula: null,
   exclude_sessions: [],
   stall_f_per_min: null,
 });
@@ -80,6 +84,9 @@ const COUNT_ONLY = FLAGS.has("--count");
 const TEXT = FLAGS.has("--text");
 
 const FALLBACK_F_PER_MIN = Number(CFG.fallback_f_per_min) > 0 ? Number(CFG.fallback_f_per_min) : null;
+const SERVED = CFG.served_formula && Number.isFinite(Number(CFG.served_formula.a)) && Number.isFinite(Number(CFG.served_formula.b))
+  ? { a: Number(CFG.served_formula.a), b: Number(CFG.served_formula.b), since: CFG.served_formula.since || null }
+  : null;
 
 /** Ordinary least squares. Returns null when the x values carry no spread. */
 function ols(points) {
@@ -351,6 +358,8 @@ async function main() {
     current_fallback: FALLBACK_F_PER_MIN
       ? { f_per_min: FALLBACK_F_PER_MIN, min_per_degree: Number((1 / FALLBACK_F_PER_MIN).toFixed(2)) }
       : null,
+    // The line SpaServer quotes warm-up times from (f_per_min = a + b * gap), from spa.json.
+    served_formula: SERVED,
     observed: median
       ? { median_f_per_min: median, median_min_per_degree: Number((1 / median).toFixed(2)) }
       : null,
@@ -401,6 +410,10 @@ async function main() {
       `fallback: ${packet.current_fallback ? `${packet.current_fallback.min_per_degree} min/°F` : "(not set)"}` +
         (packet.observed ? `   observed median: ${packet.observed.median_min_per_degree} min/°F` : "")
     );
+    if (packet.served_formula) {
+      const f = packet.served_formula;
+      console.log(`served:   f_per_min = ${f.a} + ${f.b} * gap${f.since ? ` (SpaServer, since ${f.since})` : ""}`);
+    }
     if (packet.stalled_sessions.length) {
       console.log(
         `stalled:  ${packet.stalled_sessions.map((e) => `${e.session_id} (${e.f_per_min} °F/min)`).join(", ")} (under ${STALL_F_PER_MIN} °F/min, left out)`

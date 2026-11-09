@@ -110,3 +110,37 @@ test("the gate predicate: block only when not-protected, low-urgency, and above 
   assert.equal(decide(0.91, 0.5, false, "dining"), false, "an untuned lane keeps 0.93");
   assert.equal(decide(N.THRESHOLD, 0.5, false), true, "exactly at threshold → block");
 });
+
+test("zero vector is an embedding fault, not a duplicate", () => {
+  const rows = [{ ping_id: "a", signal: "x", vec: [1, 0, 0] }];
+  const r = N.nearestDuplicate([0, 0, 0], rows, "y");
+  assert.equal(r.fault, "zero_vector");
+  assert.equal(r.maxSim, 0);
+  const r2 = N.nearestDuplicate([1, 0, 0], [{ ping_id: "z", signal: "x", vec: [0, 0, 0] }], "y");
+  assert.equal(r2.fault, null, "a zero stored row is skipped, not a fault");
+  assert.equal(r2.maxSim, 0);
+  // a zero row must not mask a genuine duplicate elsewhere in the window
+  const r3 = N.nearestDuplicate([1, 0, 0], [{ ping_id: "z", signal: "q", vec: [0, 0, 0] }, { ping_id: "g", signal: "x", vec: [1, 0.01, 0] }], "x");
+  assert.equal(r3.fault, null);
+  assert.ok(r3.maxSim > 0.99);
+});
+
+test("sim 1.0 over different texts is a fault; maxSim kept for audit", () => {
+  const rows = [{ ping_id: "a", signal: "Lunch with Sam at 1pm", vec: [1, 2, 3] }];
+  const r = N.nearestDuplicate([1, 2, 3], rows, "Flight to Lisbon is delayed");
+  assert.equal(r.fault, "identical_vectors_different_text");
+  assert.ok(r.maxSim >= 0.999);
+  assert.equal(r.nearest.ping_id, "a");
+});
+
+test("genuine near-duplicates still refused (no fault)", () => {
+  const rows = [{ ping_id: "a", signal: "Lunch with Sam at 1pm", vec: [1, 2, 3] }];
+  // same normalized text at sim 1.0
+  assert.equal(N.nearestDuplicate([1, 2, 3], rows, "  lunch with SAM  at 1pm ", ).fault, null);
+  // sim in [threshold, 0.999) with different text
+  const near = N.nearestDuplicate([1, 2, 4], rows, "Don't forget lunch with Sam");
+  assert.equal(near.fault, null);
+  assert.ok(near.maxSim >= 0.93 && near.maxSim < 0.999, `got ${near.maxSim}`);
+  // no text supplied: legacy behaviour
+  assert.equal(N.nearestDuplicate([1, 2, 3], rows).fault, null);
+});

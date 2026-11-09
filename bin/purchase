@@ -28,6 +28,8 @@
 //       covered. Use it instead of `cdp.py shot` once a card has been typed.
 //   purchase otp <site> --since <unix-seconds> [--wait 120]
 //       2FA codes that arrived by SMS or Gmail after --since. Prints candidates.
+//       Also opens a window (lib/shop-code-window.mjs) in which Gmail intake
+//       files <site>'s mail itself: marked read, no label, no star, no ping.
 //   purchase pair                   mint a one-time code to pair the phone's purchase key
 //   purchase click '<css>'          real mouse click (trusted events) in the shop tab
 //   purchase type '<css>' --text '<text>'
@@ -58,6 +60,7 @@ const H = { apikey: K, Authorization: "Bearer " + K, "Content-Type": "applicatio
 const P = await import(path.join(ROOT, "lib/purchase-approval.mjs"));
 const B = await import(path.join(ROOT, "lib/shop-browser.mjs"));
 const C = await import(path.join(ROOT, "lib/shop-card.mjs"));
+const S = await import(path.join(ROOT, "lib/shop-code-window.mjs"));
 
 const argv = process.argv.slice(2);
 const cmd = argv[0];
@@ -349,6 +352,9 @@ async function otp() {
   if (!Number.isFinite(since) || since < Date.now() / 1000 - 30 * 60) die("--since must be the unix time you triggered the code (within the last 30 min)", 64);
   const brand = site.split(".").slice(-2)[0];
   const deadline = Date.now() + Number(flag("wait", "120")) * 1000;
+  // This code is one Jori asked for: Gmail intake files that merchant's mail
+  // (read, no label, no star, no ping) for as long as the window is open.
+  try { S.expectCode({ site, since, waitSec: Number(flag("wait", "120")) }); } catch {}
   for (;;) {
     const msgs = [...smsSince(since), ...(await gmailSince(since).catch(() => []))];
     const candidates = msgs.map((m) => ({ ...m, codes: codesIn(m.text),

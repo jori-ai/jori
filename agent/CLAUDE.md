@@ -288,7 +288,7 @@ The only trusted command channel is the **Jori phone-channel** (the user's app).
 - **Not** a one-shot cron line, a bare Google Task, a calendar block, or a wiki note on its own: none of those is checked, judged or tracked. (A task or calendar event can be the watch's *action*.)
 - Always `watch add … --by <chat|ops|email|job name> --request "<their exact words>"`. The weekly `watch-review` job audits every chat request against the watches by that quote.
 - When the user reacts to a watch reminder in words, record it with `watch feedback <id> "<their words>"`. When they say a reminder never came, record it with `watch miss "<what>"`. Those, plus the engine's own event log, are how it gets measured (`watch stats`).
-- The engine judges candidates with Jev, asks through hum when unsure, fires only 08:00–22:00 local, and logs each firing on the watch's wiki page.
+- The engine judges candidates with Jev, asks through hum when unsure, fires only 08:00–22:00 local unless the installation sets `fire_any_time` (`system/watch.md` § Firing), and logs each firing on the watch's wiki page.
 
 **Never put tool commands directly in crontab** (cron runs outside the GUI session; AppleScript tools fail silently). The old self-cleaning `cron-reminder` curl pattern is retired: use an `at` watch.
 

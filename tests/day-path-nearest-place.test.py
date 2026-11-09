@@ -76,12 +76,18 @@ def dwells(**env):
     return [(n["start"], n["end"], (n["place"] or {}).get("name")) for n in day["spine"] if n["type"] == "dwell"]
 
 
+# The flat's 20:22 row was still open when the rows were read (not left yet),
+# so the evening there runs on to the day's end (day-path open_visit_end); it
+# ended at the last fix, 21:14, before that rule.
+EVENING_END = "00:00⁺"
+
+
 class NearestPlaceWins(unittest.TestCase):
     def setUp(self):
         self.d = dwells()
 
     def test_the_evening_at_the_flat_is_the_flat(self):
-        self.assertIn(("20:22", "21:14", "The Harbor Flat"), self.d)
+        self.assertIn(("20:22", EVENING_END, "The Harbor Flat"), self.d)
 
     def test_the_rest_of_the_day_is_unchanged(self):
         for want in [("13:29", "14:16", "pita place"),
@@ -119,14 +125,16 @@ class PaceFromEveryFix(unittest.TestCase):
 
 class SwitchRestoresTheOldOrder(unittest.TestCase):
     def test_first_built_order(self):
+        # all three off: the open flat row is an instant again, so only the fixes'
+        # 20:22-21:14 stay is left, and the first-built order names it for the café
         self.assertIn(("20:22", "21:14", "Café Example"),
-                      dwells(JORI_NEAREST_PLACE="0", JORI_VERDICT_OWN_PLACE="0"))
+                      dwells(JORI_NEAREST_PLACE="0", JORI_VERDICT_OWN_PLACE="0", JORI_OPEN_VISIT_TO_END="0"))
 
     def test_verdict_own_place_off_renames_the_night(self):
         d = dwells(JORI_VERDICT_OWN_PLACE="0")
         self.assertIn(("00:00", "09:48", "Café Example"), d)
         self.assertIn(("10:05", "13:29", "Café Example"), d)
-        self.assertIn(("20:22", "21:14", "The Harbor Flat"), d)
+        self.assertIn(("20:22", EVENING_END, "The Harbor Flat"), d)
 
 
 if __name__ == "__main__":

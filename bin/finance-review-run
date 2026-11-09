@@ -1,0 +1,119 @@
+#!/bin/bash
+set -uo pipefail
+# finance-review-run — run the weekly finance review in a FRESH, single-shot
+# `claude -p` session, the way bin/daily-summary-run runs the daily summary.
+#
+# Why (2026-11-08). The review used to run inside the ops-light supervisor's
+# long-lived session. Re-dispatching it the same day ("retrigger") did nothing:
+# that session had just done it, read "FINANCE REVIEW" again, and answered in
+# three seconds without building anything (three dispatches at 12:42–12:47 ET,
+# 1–2 turns each). A fresh session per run has no earlier run to remember, so
+# every dispatch builds, checks, asks and sends; and a long review can no
+# longer be orphaned by that shared session rotating mid-run.
+#
+# The dispatching turn only launches this (jobs/finance-review.md § Pipeline):
+#   ~/Dev/jori/bin/job-run --name finance-review -- ~/Dev/jori/bin/finance-review-run
+#
+# Usage: finance-review-run [--effort low|medium|high|xhigh]
+# Exit: 0 the fork ran to completion · 1 it produced nothing (auth/empty) or was
+# killed · 3 another run holds the lock · 4 refused from an SSH session (the
+# Max login is in the GUI session's keychain; dispatch FINANCE REVIEW instead).
+
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../agent/scripts/lib/root.sh"   # JORI_INSTALL, JORI_INSTALL_TOOLS, JORI_NODE
+[ -d /opt/homebrew/bin ] && export PATH="/opt/homebrew/bin:$PATH"
+CLAUDE="${CLAUDE_BIN:-$HOME/.local/bin/claude}"
+CWD="$JORI_INSTALL_TOOLS/agent/ops-agent"
+JOB_MD="$CWD/jobs/finance-review.md"
+LOG="$JORI_INSTALL_TOOLS/data/logs/finance-review-run.log"
+ENV_FILE="$JORI_INSTALL/.env"
+mkdir -p "$(dirname "$LOG")" 2>/dev/null || true
+log() { echo "$(date '+%Y-%m-%d %H:%M:%S') [finance-review-run] $1" >> "$LOG"; }
+
+EFFORT="high"
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --effort) EFFORT="${2:-}"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+[[ "$EFFORT" =~ ^(low|medium|high|xhigh)$ ]] || { log "ERROR: bad --effort '$EFFORT'"; exit 1; }
+[[ -f "$JOB_MD" ]] || { log "ERROR: job file missing: $JOB_MD"; exit 1; }
+
+# SSH guard: the fork could only fail "Not logged in" (see daily-summary-run).
+if [[ -n "${SSH_CONNECTION:-}${SSH_CLIENT:-}" && "${FINANCE_REVIEW_ALLOW_SSH:-}" != "1" ]]; then
+  log "REFUSED: SSH session; dispatch FINANCE REVIEW to the supervisor instead (agent/scripts/trigger-finance-review.sh)"
+  echo "finance-review-run: refused from an SSH session (the Max login is in the GUI session's keychain). Run agent/scripts/trigger-finance-review.sh instead." >&2
+  exit 4
+fi
+
+# One run at a time: two overlapping runs would build, ask and send twice.
+LOCK_DIR="$JORI_INSTALL_TOOLS/data/finance-review-run.lock"
+if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+  HOLDER="$(cat "$LOCK_DIR/pid" 2>/dev/null || true)"
+  if [[ -n "$HOLDER" ]] && kill -0 "$HOLDER" 2>/dev/null; then
+    log "skip: another run (pid $HOLDER) holds the lock"
+    exit 3
+  fi
+  rm -rf "$LOCK_DIR"; mkdir "$LOCK_DIR" || { log "ERROR: could not take the lock"; exit 3; }
+fi
+echo $$ > "$LOCK_DIR/pid"
+trap 'rm -rf "$LOCK_DIR"' EXIT INT TERM
+
+if [[ -f "$ENV_FILE" ]]; then set -a; source "$ENV_FILE"; set +a; fi
+unset ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN
+
+TMP_BASE="${TMPDIR:-/tmp}"; TMP_BASE="${TMP_BASE%/}"
+OUT_TMP="$(mktemp "$TMP_BASE/finance-review-run.XXXXXXXX")" || { log "ERROR: mktemp failed"; exit 1; }
+
+source "$JORI_INSTALL_TOOLS/agent/scripts/lib/fork-connector-deny.sh"
+FR_DISALLOWED_TOOLS="${FR_DISALLOWED_TOOLS-${JORI_FORK_CONNECTOR_DENY-}}"
+FR_SETTINGS="${FR_SETTINGS-${JORI_FORK_SKILL_SETTINGS-}}"
+FR_SETTINGS="$(jori_fork_settings "$FR_SETTINGS")"
+source "$JORI_INSTALL_TOOLS/agent/scripts/lib/local-rules.sh"
+source "$JORI_TOOLS/agent/config/models.env"   # JORI_MODEL_SONNET
+LOCAL_COMPANION="$(jori_job_companion "$JOB_MD")"
+LOCAL_RULES_FILE="$OUT_TMP.local-rules"
+jori_local_rules_file "$(jori_local_rules_role "$CWD")" "$LOCAL_RULES_FILE" || LOCAL_RULES_FILE=""
+
+# The playbook body only: never its "## Pipeline — launch via job-run" section,
+# which tells a dispatching turn to launch THIS script (a fork that read it
+# would launch itself again; daily-summary-run 2026-07-17).
+PLAYBOOK_BODY=$(awk '
+  /^## Pipeline — launch via job-run/ { skip=1; next }
+  /^## / && skip { skip=0 }
+  !skip { print }
+' "$JOB_MD")
+
+log "start (sonnet $EFFORT)"
+{
+  printf 'You are ALREADY running inside the protected job-run harness as a fresh, single-shot session for the weekly finance review. Do NOT call job-run or dispatch FINANCE REVIEW. Execute the playbook below from Step 0 to the end yourself, in this turn. NEVER run a Bash call in the background (no run_in_background, no trailing &): this session has no later turn, so a backgrounded call is silently lost.\n\n'
+  printf '%s\n' "$PLAYBOOK_BODY"
+  [[ -n "$LOCAL_COMPANION" ]] && printf '\n%s\n' "$(cat "$LOCAL_COMPANION")"
+  printf '\n---\n\nDispatch instruction for this run: FINANCE REVIEW (source: %s)\n' "${FINANCE_REVIEW_SOURCE:-dispatch}"
+} | ( cd "$CWD" && "$CLAUDE" -p \
+      --model "$JORI_MODEL_SONNET" \
+      --effort "$EFFORT" \
+      --permission-mode bypassPermissions \
+      ${FR_DISALLOWED_TOOLS:+--disallowedTools $FR_DISALLOWED_TOOLS} \
+      ${FR_SETTINGS:+--settings "$FR_SETTINGS"} \
+      ${LOCAL_RULES_FILE:+--append-system-prompt-file "$LOCAL_RULES_FILE"} \
+      --add-dir "$JORI_INSTALL" ) > "$OUT_TMP" 2>&1
+RC=$?
+rm -f "$OUT_TMP.local-rules"
+cat "$OUT_TMP" >> "$LOG"
+
+if (( RC > 128 )); then
+  "$JORI_INSTALL_TOOLS/bin/jori-send-curl" --skip-precheck --channel system \
+    "⚠️ finance-review-run was killed mid-run (signal $((RC - 128))) — the weekly finance review may not have been sent; check job-list." >> "$LOG" 2>&1 || true
+  log "exit 1 (killed by signal $((RC - 128)))"; rm -f "$OUT_TMP"; exit 1
+fi
+AUTH_FAIL_RE='not logged in|please run /login|invalid (api )?key|authentication_error|unauthorized|failed to authenticate|token has been revoked|oauth session expired'
+if [[ ! -s "$OUT_TMP" ]] || { [[ "$(wc -l < "$OUT_TMP")" -le 3 ]] && grep -qiE "$AUTH_FAIL_RE" "$OUT_TMP"; }; then
+  FIRST="$(head -n1 "$OUT_TMP" | cut -c1-100)"
+  "$JORI_INSTALL_TOOLS/bin/jori-send-curl" --skip-precheck --channel system --observed-error "$FIRST" \
+    "⚠️ finance-review-run exited without producing output — auth/empty (\"${FIRST}\"). Nothing was produced by this invocation." >> "$LOG" 2>&1 || true
+  log "exit 1 (auth/empty)"; rm -f "$OUT_TMP"; exit 1
+fi
+rm -f "$OUT_TMP"
+log "exit $RC"
+exit "$RC"

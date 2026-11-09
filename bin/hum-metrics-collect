@@ -268,6 +268,20 @@ def in_window(iso_str, start, end):
     return start <= dt <= end
 
 
+REACTION_LATE_DAYS = 3  # a reaction stamped later than this after the send is a backfill, not a reaction
+
+
+def is_late_reaction(row):
+    """True when reaction_at is more than REACTION_LATE_DAYS after sent_at, so
+    a bulk stamp cannot move a day's metrics. A row with no usable sent_at or
+    reaction_at is never late (kept counting as before)."""
+    sent = parse_iso(row.get("sent_at"))
+    reacted = parse_iso(row.get("reaction_at"))
+    if sent is None or reacted is None:
+        return False
+    return (reacted - sent).total_seconds() > REACTION_LATE_DAYS * 86400
+
+
 def workout_recent_cmd():
     """argv for the configured workout source, or [] when none is set. A
     relative first element resolves against this checkout (e.g. a bin/ tool)."""
@@ -520,6 +534,7 @@ def collect_for_day(target_date, tz, runs, feedback, history):
         if h.get("kind") == "reaction" and h.get("message_id")
         and in_window(h.get("ts"), start, end)
     }
+    reactions_late = 0
     for r in feedback:
         r = as_dict(r)
         reaction = r.get("reaction")
@@ -531,6 +546,9 @@ def collect_for_day(target_date, tz, runs, feedback, history):
         if not tok:
             continue
         if not in_window(r.get("reaction_at"), start, end):
+            continue
+        if is_late_reaction(r):
+            reactions_late += 1
             continue
         mid = r.get("message_id")
         if mid and mid in history_reaction_message_ids:
@@ -633,6 +651,9 @@ def collect_for_day(target_date, tz, runs, feedback, history):
         "lane_pings": ping_lanes_for_day(feedback, start, end),
         "reactions": {k: by_token[k] for k in
                       ("love", "up", "down", "snooze", "freeform_pos", "freeform_neg")},
+        # Reactions stamped > REACTION_LATE_DAYS after the send (backfills):
+        # excluded from the buckets above, counted here.
+        "reactions_late": reactions_late,
         "signal_score_raw": round(signal_raw, 3),
         # Additive (hum-i-20261018-04): signal per ping actually delivered.
         # None when no ping was delivered that day.

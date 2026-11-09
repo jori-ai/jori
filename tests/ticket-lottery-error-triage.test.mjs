@@ -10,7 +10,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import {
-  KNOWN_CODES, isUnknown, validate, cached, createTriager, CACHE_TTL_MS, SCHEMA,
+  KNOWN_CODES, HARNESS_CODES, isUnknown, validate, cached, createTriager, CACHE_TTL_MS, SCHEMA,
 } from "../lib/ticket-lottery-error-triage.mjs";
 import { doneKeys, entryKey } from "../lib/ticket-lottery.mjs";
 
@@ -86,4 +86,15 @@ test("failed_permanent rows join the duplicate guard; error rows do not", () => 
   const keys = doneKeys({ entries: [perm, err] });
   assert.ok(keys.has(entryKey(perm)));
   assert.ok(!keys.has(entryKey(err)));
+});
+
+test("browser-harness codes are retryable without a model call", async () => {
+  let called = 0;
+  const t = createTriager({ judge: async () => { called++; throw new Error("claude -p: Not logged in"); } });
+  for (const code of HARNESS_CODES) {
+    const c = await t.classify({ code, message: "x", platform: "alpha", show: "Chess" });
+    assert.equal(c.class, "retryable");
+    assert.equal(c.source, "builtin");
+  }
+  assert.equal(called, 0);
 });

@@ -13,6 +13,7 @@ import { createRequire } from "node:module";
 import { recordAttempt, countRecent, isPhantom, markPhantom, trackingFile } from "../../lib/dispatch-attempts.mjs";
 import { mode as triageDecideMode } from "../../lib/triage-decide.mjs";
 import { loadHook } from "../../lib/ext-hooks.mjs";
+import { windowFor as shopCodeWindow } from "../../lib/shop-code-window.mjs";
 import { fileURLToPath } from "node:url";
 
 import { installTools } from "../../lib/root.cjs";
@@ -269,6 +270,27 @@ async function runExtIntake(messageId, fromHeader, subject) {
   }
 }
 
+// A sign-in code the shop browser asked for is not mail for the user to review.
+// `purchase otp` opens a window (lib/shop-code-window.mjs) for the merchant whose
+// code it is waiting on; a message from that merchant's domain inside it is marked
+// read and stripped of the labels Gmail added on delivery (the installation's
+// pre-applied label, Gmail's own IMPORTANT), then filed with no dispatch, no star
+// and no ping. It stays in the inbox (nothing is archived). Sender and clock only,
+// never the wording. Fail-open: no window, an unreadable file or a mark-read that
+// does not apply leaves the message to the rest of the cascade.
+function intakeShopCode(messageId, fromHeader) {
+  let win = null;
+  try { win = shopCodeWindow(fromHeader); } catch {}
+  if (!win) return { filed: false };
+  let read = false;
+  try { read = spawnSync(GMAIL_ACTION_BIN, ["mark-read", messageId], GA_OPTS).status === 0; } catch {}
+  if (!read) return { filed: false };
+  for (const label of [PRE_APPLIED_LABEL, "IMPORTANT"].filter(Boolean)) {
+    try { spawnSync(GMAIL_ACTION_BIN, ["unlabel", messageId, label], GA_OPTS); } catch {}
+  }
+  return { filed: true, site: win.site };
+}
+
 // Jori's own P1 mail, finished in code. That is ALL Jori mail (the
 // p1-senders.json entry for JORI_SENDER, exceptions only via its
 // unless_subject_re — today the push-failed fallback). Their whole target state is fixed:
@@ -297,6 +319,10 @@ async function runIntakeCascade(messageId, fromHeader, subject, toJori = false) 
   if (spam.blocked) return { skip: true, kind: "spam", detail: `spam-blocklist ${spam.via} (${spam.reason})` };
   const ext = await runExtIntake(messageId, fromHeader, subject);
   if (ext) return { skip: true, kind: ext.kind || "ext-intake", detail: ext.detail || "handled by _ext/gmail-intake" };
+  if (!toJori) {
+    const sc = intakeShopCode(messageId, fromHeader);
+    if (sc.filed) return { skip: true, kind: "shop-code", detail: `sign-in code requested for ${sc.site} -> read, labels stripped, no triage` };
+  }
   const p1s = intakeP1Sender(messageId, fromHeader, subject);
   if (p1s.stamped) {
     if (finishJoriP1(messageId, fromHeader, p1s).handled) return { skip: true, kind: "jori-p1", detail: "jori memo (p1-sender) -> personal+p1+star, unread — finished in code" };
@@ -1245,6 +1271,14 @@ export class GmailSource {
           if (ext) {
             this.triageLog(ext.log || `ext-intake ${m.messageId} → ${ext.detail || "handled by _ext/gmail-intake"}, dispatch skipped`);
             continue;
+          }
+          // A sign-in code the shop browser requested — see intakeShopCode.
+          if (m.toJori !== true) {
+            const sc = intakeShopCode(m.messageId, m.from);
+            if (sc.filed) {
+              this.triageLog(`shop-code ${m.messageId} from ${extractEmailAddr(m.from)} → sign-in code requested for ${sc.site}: read, labels stripped, dispatch skipped`);
+              continue;
+            }
           }
           let stampedP1 = false;
           const stamps = [];

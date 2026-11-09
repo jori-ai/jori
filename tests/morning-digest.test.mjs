@@ -27,6 +27,19 @@ test("calendar: instants are converted into the user's tz; a stale-offset event 
   assert.deepEqual(prev.map((e) => [e.title, e.time]), [["Car pickup", "11:45 PM"]]);
 });
 
+test("calendar: an event the owner declined is left out; one someone else declined stays", () => {
+  const items = [
+    { summary: "Declined by me", start: { dateTime: "2026-11-09T09:00:00-05:00" },
+      attendees: [{ email: "me@x.com", self: true, responseStatus: "declined" }, { email: "org@x.com", responseStatus: "accepted" }] },
+    { summary: "Someone else declined", start: { dateTime: "2026-11-09T10:00:00-05:00" },
+      attendees: [{ email: "me@x.com", self: true, responseStatus: "accepted" }, { email: "other@x.com", responseStatus: "declined" }] },
+    { summary: "Not answered yet", start: { dateTime: "2026-11-09T11:00:00-05:00" },
+      attendees: [{ email: "me@x.com", self: true, responseStatus: "needsAction" }] },
+  ];
+  const got = calendarToday(items, "America/New_York", "2026-11-09");
+  assert.deepEqual(got.map((e) => e.title), ["Someone else declined", "Not answered yet"]);
+});
+
 test("calendar: same instant, different tz → different local day", () => {
   const items = [{ summary: "Call", start: { dateTime: "2026-10-05T01:00:00Z" } }];
   assert.equal(calendarToday(items, "America/New_York", "2026-10-04").length, 1);

@@ -24,6 +24,11 @@
       "label": "trigger-net-worth-monthly",
       "cron": "20 7 1 * *",
       "command": "{root}/bin/cron-run --label trigger-net-worth-monthly -- {root}/agent/scripts/trigger-net-worth-monthly.sh"
+    },
+    {
+      "label": "finance-review-sweep",
+      "cron": "23,53 * * * *",
+      "command": "{root}/bin/cron-run --label finance-review-sweep -- bash -c '{home}/.local/node/bin/node {root}/bin/finance-review-gate sweep >> {root}/data/logs/finance-review-gate.log 2>&1'"
     }
   ],
   "adopted_jobs": [
