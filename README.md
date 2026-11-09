@@ -24,11 +24,11 @@ Most assistants wait. You type, they reply, the moment passes. Jori stays on. It
 <td><b>Nothing spends without you.</b> Purchases wait for Face ID.</td>
 </tr>
 <tr>
-<td><img src="site/img/work-showcase.png" alt="For work: a client's person page with every interaction and open follow-ups, and today's follow-ups on the phone"></td>
+<td><img src="site/img/work-slack.png" alt="For work: the team mentions @Jori in a channel to find a time across four calendars, book the meeting and recall what was promised"></td>
 <td><img src="site/img/personal-app-trip-dinner.png" alt="For life: a day planned in Lisbon and dinner booked before a show"></td>
 </tr>
 <tr>
-<td><b>For work.</b> A page for every person, every meeting written up, every follow-up chased.</td>
+<td><b>For work.</b> @Jori in the team channel: times found across calendars, meetings booked, promises recalled. Plus the inbox sorted, every meeting written up, every follow-up chased.</td>
 <td><b>For life.</b> Trips, tables, tickets, money and the home.</td>
 </tr>
 </table>

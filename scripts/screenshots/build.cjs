@@ -313,6 +313,7 @@ const appDoc = (screens) => `<!doctype html><html><head><meta charset="utf-8"><s
 
 // ── Composites (framed for the site and README) ────────────────────────────
 
+const appWin = (img, title) => `<div class="win"><div class="top"><i></i><i></i><i></i><div class="url" style="background:transparent;font-weight:600">${title}</div></div><img src="${img}"></div>`;
 const browser = (img, url, dark = false) => `<div class="win${dark ? " dark" : ""}"><div class="top"><i></i><i></i><i></i><div class="url">🔒 ${url}</div></div><img src="${img}"></div>`;
 const FRAME_CSS = `
 * { box-sizing:border-box; margin:0; }
@@ -491,6 +492,84 @@ const workFollowUps = `${NAV}<div class="thread">
 </div></div></div>
 </div>${COMPOSER}`;
 
+const chat = (sep, body) => `${NAV}<div class="thread"><div class="sep">${sep}</div>${body}</div>${COMPOSER}`;
+const jori = (html, { first = true, avatar = false, wide = true } = {}) =>
+  `<div class="row jori">${avatar ? AV : '<div class="spacer"></div>'}<div class="b ${first ? "j1" : "j2"}"${wide ? ' style="max-width:330px"' : ""}>${html}</div></div>`;
+const me = (text) => `<div class="gap"></div><div class="row me"><div class="b">${text}</div></div><div class="gap"></div>`;
+const choice = (opts) => `<div class="card"><div class="wait">✦ Waiting for your answer</div>${opts
+  .map(([l, d, rec], i) => `<div class="opt${rec ? " rec" : ""}"><span class="n">${i + 1}</span><div><div class="l">${l}${rec ? "<em>Recommended</em>" : ""}</div><div class="d">${d}</div></div></div>`)
+  .join("")}</div>`;
+
+// ── Email, scheduling and team chat (work) ─────────────────────────────────
+
+const mail = (from, subj, take, tag) => `<div class="place"><div class="pic" style="background:#E8ECFB;color:#2F45C9;font:600 15px -apple-system,system-ui">${from.split(" ").map((w) => w[0]).join("").slice(0, 2)}</div><div><b>${from} · ${subj}</b><span>${take}</span>${tag ? `<span style="color:var(--cobalt);font-weight:600;margin-top:2px">${tag}</span>` : ""}</div></div>`;
+const workEmail = chat("Today 7:45 AM",
+  jori(`<b>Your inbox at 7:45.</b> 3 need you; 38 sorted out of the way.
+${mail("Priya Natarajan", "Re: pricing", "Asks if Atlanta can start in February instead.", "Reply drafted")}
+${mail("Tom Becker", "Contract redlines", "Two changes, both to payment terms: net 45, quarterly billing.", "Summary on the renewal page")}
+${mail("Alex Chen", "Intro, Brightline", "Wants 30 minutes next week.", "Times offered")}
+<div style="font-size:13px;color:var(--ink2);margin-top:8px">Sorted: 12 receipts, 9 newsletters, 17 updates.</div>`) +
+  jori(`My draft to Priya says yes to February, same kickoff team.${choice([["Send the draft", "It's short, one ask, the way she likes.", true], ["Show it to me first", ""]])}`, { first: false, avatar: true }));
+
+const workSchedule = chat("Monday 9:12 AM",
+  me("Set up 30 minutes with Alex Chen from Brightline next week.") +
+  jori(`Emailed Alex from your account with three times that fit your calendar and your no-meetings-before-10 rule: Tue 11:00, Wed 3:30 or Thu 11:00.`, { avatar: true }) +
+  `<div class="sep" style="margin-top:14px">Monday 11:20 AM</div>` +
+  jori(`Alex picked <b>Thursday at 11</b>. Booked, with a Zoom link.
+<div class="linkcard"><div class="ic" style="flex-direction:column;font:700 15px -apple-system,system-ui;line-height:1"><span style="font-size:9px;color:#D93A33;display:block">NOV</span>13</div><div><b>Dana / Alex Chen (Brightline)</b><span>Thu 11:00 to 11:30 AM · Zoom</span></div></div>
+<div style="margin-top:8px">The invite notes have his background and Brightline's last funding round, and I'll send you a one-paragraph brief that morning.</div>`, { avatar: true }));
+
+// The team-chat scene: a generic workspace layout (not any vendor's look).
+const SL_CSS = `
+* { box-sizing:border-box; margin:0; }
+body { font:15px/1.45 -apple-system, system-ui, sans-serif; color:#1d1c1d; background:#fff; -webkit-font-smoothing:antialiased; display:flex; height:100vh; }
+.side { width:250px; background:#1f2430; color:#c9cdd6; padding:14px 10px; flex:none; display:flex; flex-direction:column; gap:2px; }
+.ws { color:#fff; font-weight:700; font-size:17px; padding:4px 10px 14px; }
+.grp { font-size:13px; color:#8b93a3; padding:12px 10px 4px; }
+.ch { padding:5px 10px; border-radius:6px; font-size:15px; display:flex; align-items:center; gap:8px; }
+.ch.on { background:#2f5bd3; color:#fff; }
+.ch .dot { width:9px; height:9px; border-radius:50%; background:#2bac76; }
+.main { flex:1; display:flex; flex-direction:column; min-width:0; }
+.head { padding:14px 22px; border-bottom:1px solid #e3e5e8; display:flex; align-items:baseline; gap:12px; }
+.head b { font-size:18px; }
+.head span { color:#6b6f76; font-size:13.5px; }
+.msgs { flex:1; padding:10px 22px; display:flex; flex-direction:column; gap:14px; overflow:hidden; }
+.m { display:flex; gap:11px; }
+.m .a { width:38px; height:38px; border-radius:8px; flex:none; display:grid; place-items:center; color:#fff; font-weight:700; font-size:15px; }
+.m .a svg { width:38px; height:38px; border-radius:8px; }
+.m .who { font-weight:700; font-size:15px; }
+.m .who .app { font-size:10.5px; font-weight:700; color:#6b6f76; background:#eceef1; border-radius:3px; padding:1px 4px; margin-left:6px; vertical-align:2px; }
+.m .who time { font-weight:400; color:#6b6f76; font-size:12.5px; margin-left:8px; }
+.mention { background:#e8ecfb; color:#2f45c9; border-radius:3px; padding:0 2px; font-weight:500; }
+.slots { display:flex; gap:8px; margin-top:8px; }
+.slot { border:1px solid #d0d4da; border-radius:8px; padding:7px 12px; font-size:14px; font-weight:600; }
+.slot.pick { border-color:#2f5bd3; color:#2f5bd3; background:#f3f6fe; }
+.att { margin-top:8px; border-left:4px solid #2f5bd3; padding:4px 12px; font-size:14px; color:#3d3f43; background:#f7f8fa; border-radius:0 6px 6px 0; }
+.att b { color:#1d1c1d; }
+.rx { display:inline-flex; gap:5px; align-items:center; border:1px solid #d0d4da; border-radius:12px; padding:1px 8px; font-size:12.5px; margin-top:6px; background:#f7f8fa; }
+.comp { margin:6px 22px 18px; border:1px solid #c9ccd1; border-radius:10px; padding:12px 14px; color:#8b8f96; }
+`;
+const av = (initials, color) => `<div class="a" style="background:${color}">${initials}</div>`;
+const JAV = `<div class="a">${ICON_FACE.replace('width="30" height="30"', 'width="38" height="38"').replace('<circle cx="15" cy="15" r="15"', '<rect width="30" height="30" rx="6"')}</div>`;
+const msg = (a, who, time, body, app = false) => `<div class="m">${a}<div><div class="who">${who}${app ? '<span class="app">APP</span>' : ""}<time>${time}</time></div><div>${body}</div></div></div>`;
+const slackDoc = `<!doctype html><html><head><meta charset="utf-8"><style>${SL_CSS}</style></head><body>
+<div class="side"><div class="ws">Fieldstone</div>
+<div class="grp">Channels</div><div class="ch"># general</div><div class="ch"># partnerships</div><div class="ch on"># harbor-pine</div><div class="ch"># rollout</div>
+<div class="grp">Direct messages</div><div class="ch"><span class="dot"></span>Leo Martin</div><div class="ch"><span class="dot"></span>Jori</div><div class="ch"><span class="dot" style="background:#8b93a3"></span>Maria Soto</div></div>
+<div class="main"><div class="head"><b># harbor-pine</b><span>The Harbor &amp; Pine renewal · 6 members</span></div><div class="msgs">
+${msg(av("LM", "#7a5af8"), "Leo Martin", "10:02 AM", "Rollout plan v2 is up. Priya wants to walk Tom through it before they sign.")}
+${msg(av("DR", "#d9773a"), "Dana Reyes", "10:04 AM", `<span class="mention">@Jori</span> can you find an hour next week for Priya, Tom, Leo and me?`)}
+${msg(JAV, "Jori", "10:04 AM", `I checked all four calendars. Tom is out Wednesday, and Priya prefers Tuesday or Thursday afternoons. Open for everyone:
+<div class="slots"><div class="slot">Tue Nov 11 · 2:00–3:00 PM</div><div class="slot">Thu Nov 13 · 3:30–4:30 PM</div></div>
+<div style="margin-top:6px">Say which and I'll send the invite with a Zoom link and the plan attached.</div>`, true)}
+${msg(av("LM", "#7a5af8"), "Leo Martin", "10:06 AM", "Tuesday works for me")}
+${msg(av("DR", "#d9773a"), "Dana Reyes", "10:06 AM", `<span class="mention">@Jori</span> Tuesday. And remind Leo to send the deck the day before.`)}
+${msg(JAV, "Jori", "10:06 AM", `Done.<div class="att"><b>Harbor &amp; Pine rollout review</b><br>Tue Nov 11, 2:00–3:00 PM · Zoom · Priya, Tom, Leo, Dana · rollout plan v2 attached</div>
+<div style="margin-top:6px"><span class="mention">@Leo Martin</span> I'll ping you Monday at 10 about the deck.</div><span class="rx">👍 2</span>`, true)}
+${msg(av("DR", "#d9773a"), "Dana Reyes", "10:09 AM", `<span class="mention">@Jori</span> what did we promise them at the QBR?`)}
+${msg(JAV, "Jori", "10:09 AM", `Three things: pricing for all six sites (sent Nov 5), a one-page rollout plan (Leo, due Nov 7) and kickoff the week of Jan 12. From the <span style="color:#2f45c9">QBR notes, Oct 28</span>.`, true)}
+</div><div class="comp">Message #harbor-pine</div></div></body></html>`;
+
 // ── Personal scenes (getjori.ai/personal) ──────────────────────────────────
 
 const moneyPage = wikiDoc("Money · November", portal.pageBody({
@@ -522,14 +601,6 @@ const moneyPage = wikiDoc("Money · November", portal.pageBody({
   back: links(["week_2026-11-02", "project_lisbon_trip"], "src_id"),
   topic: { slug: "money", name: "Money" },
 }), { active: null });
-
-const chat = (sep, body) => `${NAV}<div class="thread"><div class="sep">${sep}</div>${body}</div>${COMPOSER}`;
-const jori = (html, { first = true, avatar = false, wide = true } = {}) =>
-  `<div class="row jori">${avatar ? AV : '<div class="spacer"></div>'}<div class="b ${first ? "j1" : "j2"}"${wide ? ' style="max-width:330px"' : ""}>${html}</div></div>`;
-const me = (text) => `<div class="gap"></div><div class="row me"><div class="b">${text}</div></div><div class="gap"></div>`;
-const choice = (opts) => `<div class="card"><div class="wait">✦ Waiting for your answer</div>${opts
-  .map(([l, d, rec], i) => `<div class="opt${rec ? " rec" : ""}"><span class="n">${i + 1}</span><div><div class="l">${l}${rec ? "<em>Recommended</em>" : ""}</div><div class="d">${d}</div></div></div>`)
-  .join("")}</div>`;
 
 const pMoney = chat("Sunday 9:00 AM",
   jori(`<b>Your week in money</b><ul>
@@ -577,7 +648,7 @@ const pHome = chat("Today 8:41 AM",
 
 const crypto = require("crypto");
 const stamp = crypto.createHash("sha256")
-  .update([wikiHome, wikiAnswer, wikiPage, appDoc([chatThread]), appDoc([approval]), workPerson, workMeeting, workProject, appDoc([workAfterMeeting]), appDoc([workFollowUps]), moneyPage, ...[pMoney, pTrip, pDinner, pTickets, pHome].map((x) => appDoc([x])), FRAME_CSS, fs.readFileSync(__filename, "utf8")].join("\u0000"))
+  .update([wikiHome, wikiAnswer, wikiPage, appDoc([chatThread]), appDoc([approval]), workPerson, workMeeting, workProject, appDoc([workAfterMeeting]), appDoc([workFollowUps]), slackDoc, appDoc([workEmail]), appDoc([workSchedule]), moneyPage, ...[pMoney, pTrip, pDinner, pTickets, pHome].map((x) => appDoc([x])), FRAME_CSS, fs.readFileSync(__filename, "utf8")].join("\u0000"))
   .digest("hex");
 if (CHECK) {
   let have = "";
@@ -600,6 +671,7 @@ const raw = {
   workMeetingApp: shoot(appDoc([workAfterMeeting]), "raw-work-app-meeting", 610, 1060, { transparent: true }),
   workFollowApp: shoot(appDoc([workFollowUps]), "raw-work-app-followups", 610, 1060, { transparent: true }),
   money: shoot(moneyPage, "raw-money", 1280, 900),
+  slack: shoot(slackDoc, "raw-work-slack", 1280, 860),
 };
 const URL = "memory.example.com";
 const out = {
@@ -616,6 +688,8 @@ const out = {
   "work-app-followups.png": raw.workFollowApp,
   "work-app-pair.png": shoot(appDoc([workAfterMeeting, workFollowUps]), "work-app-pair", 1096, 1060, { transparent: true }),
   "work-showcase.png": shoot(frameDoc(`<div class="show">${browser(raw.workPerson, URL)}<div class="ph"><img src="${raw.workFollowApp}"></div></div>`), "work-showcase", 1700, 1180, { transparent: true }),
+  "work-slack.png": shoot(frameDoc(appWin(raw.slack, "Fieldstone · #harbor-pine")), "work-slack", 1460, 1080, { transparent: true }),
+  "work-app-email-schedule.png": shoot(appDoc([workEmail, workSchedule]), "work-app-email-schedule", 1096, 1060, { transparent: true }),
   "personal-money.png": shoot(frameDoc(browser(raw.money, `${URL}/p/money_2026-11`)), "personal-money", 1460, 1120, { transparent: true }),
   "personal-app-money-home.png": shoot(appDoc([pMoney, pHome]), "personal-app-money-home", 1096, 1060, { transparent: true }),
   "personal-app-trip-dinner.png": shoot(appDoc([pTrip, pDinner]), "personal-app-trip-dinner", 1096, 1060, { transparent: true }),
