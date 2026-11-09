@@ -32,7 +32,7 @@ const require = createRequire(import.meta.url);
 // another zone, or a fresh install, reads them the same.
 process.env.JORI_TZ = "America/New_York";
 const ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
-const { applySpineVerdicts, mergeTouchingSameName, mergeSplitVisits, reclaimMisplacedPhotos,
+const { applySpineVerdicts, mergeTouchingSameName, mergeSplitVisits, reclaimMisplacedPhotos, applyVisitCompanions,
         overlayConfirmedVisits, reclaimTargetIds, extendThroughSilence, mergeDuplicateStops } =
   require(path.join(ROOT, "lib/resolve-day.js"))._internal;
 
@@ -312,4 +312,27 @@ test("a stop with no coordinates is only merged when it touches, and a different
   const cafe = (id, from, to) => stop(id, "Corner Cafe", from, to, { ...LL(0, 0), place: { name: "Corner Cafe", source: "confirmed_stop" } });
   const shop = stop("s-2", "Book Shop", "13:42:00", "13:50:00", { ...LL(30, 0), place: { name: "Book Shop", source: "confirmed_stop" } });
   assert.equal(mergeTouchingSameName([cafe("s-1", "13:00:00", "13:40:00"), shop, cafe("s-3", "13:52:00", "14:30:00")]).stops.length, 3);
+});
+
+// A long visit row that touches a stop for seconds is the neighbour's: the flat's row
+// (a visitor staying there), arrived at as the walk home from the cafe ended 260 m away,
+// gave the cafe the visitor.
+test("a visit row that grazes a stop for seconds gives it no people; one that holds it does", () => {
+  const row = (from, to, who, e = 0) => ({ arrived_at: new Date(U(from)).toISOString(), departed_at: new Date(U(to)).toISOString(),
+    ...(() => { const p = LLR(e, 0); return p; })(), companions: who });
+  const cafe = () => ({ ...stop("cafe", "Corner Cafe", "13:15:00", "14:00:30"), ...LL(260, 0), companions: [] });
+  const flat = row("14:00:15", "23:00:00", ["Visitor"], 0);
+  const stays = [cafe()];
+  applyVisitCompanions(stays, [flat]);
+  assert.deepEqual(stays[0].companions, [], "15 seconds of a nine-hour row");
+  const held = [cafe()];
+  applyVisitCompanions(held, [row("13:10:00", "13:50:00", ["Friend"], 260)]);
+  assert.deepEqual(held[0].companions, ["Friend"], "the row holds most of the stop");
+  const inside = [{ ...stop("quick", "Corner Cafe", "15:00:00", "15:01:30"), ...LL(0, 0), companions: [] }];
+  applyVisitCompanions(inside, [row("12:00:00", "23:00:00", ["Friend"], 0)]);
+  assert.deepEqual(inside[0].companions, ["Friend"], "a short stop wholly inside a long row keeps its people");
+  const off = [cafe()];
+  process.env.JORI_ROW_GRAZE = "0";
+  try { applyVisitCompanions(off, [flat]); } finally { delete process.env.JORI_ROW_GRAZE; }
+  assert.deepEqual(off[0].companions, ["Visitor"]);
 });
