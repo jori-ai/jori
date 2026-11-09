@@ -4,8 +4,9 @@
 // Once a day it starts `watch-discover --window-days 21 --max 4 --source screen` in the
 // background and returns at once. That script owns the whole pipeline (a TMDB sweep of
 // new series on the configured services + the model's web search; code enforces TMDB
-// match, id dedup incl. rejected, IMDb rating and votes from IMDb's dataset, season 1
-// fully dropped, genre excludes, taste fit, the Jev fit gate). Titles go straight onto
+// match, id dedup incl. rejected, IMDb rating and votes from IMDb's dataset — a show too
+// new for a settled rating is judged on its other reviews instead (the review check) —,
+// season 1 fully dropped, genre excludes, taste fit, the Jev fit gate). Titles go straight onto
 // the list — no approval gate — and the user sees them in the weekly veto digest
 // emitted by the `watchlist` lane, where any "not interested" becomes a rejected row
 // + feedback. So this lane always emits null.
@@ -45,7 +46,7 @@ if (fresh && fresh.error && fresh._age_min < ERROR_TTL_MIN) {
 }
 if (fresh && !fresh.error && fresh._age_min < TTL_MIN) {
   stampRun("screen", false);
-  const held = fresh.held?.length ? `, holding ${fresh.held.length} for a rating` : "";
+  const held = fresh.held?.length ? `, holding ${fresh.held.length} too new to judge yet` : "";
   emitNull(`cached — searched ${fresh._age_min}m ago (added ${fresh.added?.length ?? 0}${fresh.added?.length ? `: ${fresh.added.map((a) => a.name).join(", ")}` : ""}${held})`);
   process.exit(0);
 }

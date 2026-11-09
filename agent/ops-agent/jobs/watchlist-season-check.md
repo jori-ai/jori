@@ -29,9 +29,24 @@ was visibly wrong (Slow Horses S7/S8 "aired >180d ago"). Replaced wholesale.
    viewing state** (watched / watching / episodes_watched).
 3. A season counts as fully dropped when every episode has an air date on or before today (local)
    and TMDB lists no upcoming episode in it.
-4. If a season `watchedThrough + 1` of a tracked show flipped to fully dropped this run →
+4. **Per-season ratings** (2026-11-09): a new season is never held for a rating of its own;
+   it is assumed to rate the average of the show's past seasons (`assumedSeasonRating` in
+   `lib/watch-rank.mjs`, the show's own rating when no season is rated). After the sync,
+   `refreshSeasonRatings` (`lib/watch-db.mjs`) fetches, for every followed show with a next
+   season on record, each earlier fully dropped season's rating (the mean of its episodes'
+   IMDb ratings, from OMDb's season listing) that is missing or over 30 days old, at most 60
+   OMDb calls a run, into `data/watch-discover/season-ratings.json`. `next-show` and the hum
+   `watchlist` lane read that file (no network) to show and rank a next season.
+5. **Settled IMDb ratings**: a listed show with no rating on file, from this year or last, or
+   still queued from discovery (which covers a show discovery added on its reviews: it carries the rating the review
+   check judged it at until IMDb settles), gets its `imdb_rating` from IMDb's daily dataset
+   (`imdbRatings`) once IMDb has 1,000 votes (`MIN_SHOW_VOTES`).
+   OMDb: an error or the daily request limit is not stored, so the season is retried next
+   run; the season calls share OMDb's daily quota with `watch-catalog-enrich` and discovery.
+6. If a season `watchedThrough + 1` of a tracked show flipped to fully dropped this run →
    one pointer via `jori-send-curl --suppress-hook --intent watchlist-season` (goes through
-   the outbound precheck).
+   the outbound precheck), naming each season with its assumed rating when its past
+   seasons are rated.
 
 ## Usage
 
@@ -48,12 +63,16 @@ Daily 09:37 local via `cron-run` (registered with `jori-cron-slots`, low critica
 
 ## State
 
-Stateless — the DB is the state. Idempotent: a second run the same day changes nothing and
-sends nothing.
+The DB is the state, plus the per-season ratings cache `data/watch-discover/season-ratings.json`
+(gitignored; delete it and the next runs rebuild it). Idempotent: a second run the same day
+changes nothing and sends nothing.
 
 ## Guardrails
 
-- Writes `watch_seasons` air facts and `watch_titles.year_end` only.
+- Writes `watch_seasons` air facts, `watch_titles.year_end` / `original_language` / `keywords`
+  / `imdb_rating` (step 5) and the season-ratings cache only.
+- Requires `OMDB_API_KEY` for step 4; without it the step does nothing and next seasons rank on
+  the show's rating, as before.
 - Silent on empty (most days).
 - Requires `TMDB_API_KEY` and `SUPABASE_SERVICE_ROLE_KEY` in `.env`; exits 1 without TMDB.
 
