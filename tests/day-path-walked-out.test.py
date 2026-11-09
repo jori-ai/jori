@@ -130,5 +130,114 @@ class WalkedOutOnTheSpine(unittest.TestCase):
         self.assertEqual(dwells[1]["witnessed_min"], 52, "the quiet before 17:18 was not seen")
 
 
+# --- the day's latest visit row, still open, runs on to the day's end ---------
+# A ride home at night ended two blocks from the flat; the user walked the rest,
+# and the phone logged the arrival at the flat at 21:45 and then, lying still all
+# night, no further fix. That row had no departed_at (the user had not left when
+# the rows were read), so day-path took it as the instant it began: the evening
+# at the flat had no dwell and the day's spine ended at the drop-off. Now the
+# latest open row at a matched or confirmed place runs on to the day's end; an
+# earlier row with no departure is still the instant it began, fixes elsewhere
+# still clip it, and JORI_OPEN_VISIT_TO_END=0 restores the old reading.
+OV_DATE, OV_TZ = "2026-03-02", "America/New_York"
+OV_T0 = datetime(2026, 3, 2, 5, 0, tzinfo=timezone.utc)            # midnight in OV_TZ
+OV_DAY_END = OV_T0 + timedelta(hours=24)
+OV_FLAT = G(0.0, 0.0)
+OV_CAFE = G(900.0, 400.0)
+OV_DROP = G(200.0, -60.0)                                           # where the ride stopped
+OV_AWAY = G(3000.0, 2500.0)                                         # far across town
+
+
+def ov_iso(minute):
+    return (OV_T0 + timedelta(minutes=minute)).isoformat()
+
+
+_ov_n = [0]
+
+
+def ov_fix(minute, pos, acc=15.0, activity="unknown"):
+    _ov_n[0] += 1
+    return dict(id=f"f{_ov_n[0]}", segment_type="transit", latitude=pos[0], longitude=pos[1],
+                accuracy_m=acc, arrived_at=ov_iso(minute), departed_at=None, activity=activity,
+                place_name=None, place_type="transit", city=None)
+
+
+def ov_visit(minute, end_minute, pos, name, ptype="named"):
+    _ov_n[0] += 1
+    return dict(id=f"v{_ov_n[0]}", segment_type="visit", latitude=pos[0], longitude=pos[1],
+                accuracy_m=20.0, arrived_at=ov_iso(minute),
+                departed_at=ov_iso(end_minute) if end_minute is not None else None,
+                activity=None, place_name=name, place_type=ptype, city=None)
+
+
+def ov_day(home_open=True, later=()):
+    """Afternoon at the café, back to the flat, out again by ride, dropped two blocks
+    away at 21:30, at the flat from 21:45 with nothing after it."""
+    rows = [ov_fix(m, OV_FLAT) for m in (60, 200, 400, 600, 800)]
+    rows += [ov_visit(840, 900, OV_CAFE, "The Corner Cafe"), ov_fix(845, OV_CAFE), ov_fix(880, OV_CAFE), ov_fix(895, OV_CAFE)]
+    rows += [ov_fix(915, OV_FLAT), ov_visit(916, 1270, OV_FLAT, "Home"), ov_fix(1000, OV_FLAT), ov_fix(1150, OV_FLAT), ov_fix(1265, OV_FLAT)]
+    rows += [ov_fix(1280, OV_AWAY, activity="automotive"), ov_fix(1288, G(1200.0, 800.0), activity="automotive")]
+    rows += [ov_fix(1290, OV_DROP), ov_fix(1293, OV_DROP, activity="walking")]
+    rows += [ov_fix(1305, OV_FLAT), ov_visit(1305, None if home_open else 1440 + 400, OV_FLAT, "Home"), ov_fix(1306, OV_FLAT)]
+    rows += list(later)
+    return rows
+
+
+def ov_dwells(rows):
+    built = mod.build(OV_DATE, OV_TZ, rows, do_match=False)
+    return [n for n in built["spine"] if n["type"] == "dwell"]
+
+
+def ov_evening_home(rows):
+    return [d for d in ov_dwells(rows) if d["start_ms"] >= int((OV_T0 + timedelta(minutes=1300)).timestamp() * 1000)
+            and mod.haversine((d["place"]["lat"], d["place"]["lon"]), OV_FLAT) < 60]
+
+
+class OpenVisit(unittest.TestCase):
+    def test_the_open_arrival_home_runs_to_the_days_end(self):
+        home = ov_evening_home(ov_day())
+        self.assertEqual(len(home), 1, home)
+        self.assertEqual(home[0]["end_ms"], int(OV_DAY_END.timestamp() * 1000))
+
+    def test_a_closed_row_was_already_read_so(self):
+        home = ov_evening_home(ov_day(home_open=False))
+        self.assertEqual(len(home), 1, home)
+        self.assertEqual(home[0]["end_ms"], int(OV_DAY_END.timestamp() * 1000))
+
+    def test_the_helper_takes_only_the_latest_row(self):
+        rows = [ov_visit(600, None, OV_CAFE, "The Corner Cafe"), ov_visit(900, 1000, OV_FLAT, "Home")]
+        self.assertIsNone(mod.open_visit_end(rows, OV_DAY_END), "an earlier open row is left the instant it began")
+        rows = [ov_visit(600, 700, OV_CAFE, "The Corner Cafe"), ov_visit(900, None, OV_FLAT, "Home"), ov_visit(900, None, OV_FLAT, "Home")]
+        got = mod.open_visit_end(rows, OV_DAY_END)
+        self.assertEqual(got, (OV_T0 + timedelta(minutes=900), OV_DAY_END), "duplicates of the latest row share it")
+        rows = [ov_visit(900, None, OV_FLAT, "Home"), ov_visit(900, 950, OV_FLAT, "Home")]
+        self.assertIsNone(mod.open_visit_end(rows, OV_DAY_END), "a twin with a departure closes it")
+
+    def test_a_day_still_under_way_runs_to_now(self):
+        now = OV_T0 + timedelta(minutes=1320)
+        rows = [ov_visit(1305, None, OV_FLAT, "Home")]
+        self.assertEqual(mod.open_visit_end(rows, OV_DAY_END, now=now), (OV_T0 + timedelta(minutes=1305), now))
+        self.assertIsNone(mod.open_visit_end(rows, OV_DAY_END, now=OV_T0 + timedelta(minutes=1300)))
+
+    def test_fixes_elsewhere_still_clip_it(self):
+        later = [ov_fix(m, OV_AWAY, activity="walking") for m in (1350, 1352, 1355, 1360, 1370, 1380)]
+        home = ov_evening_home(ov_day(later=later))
+        self.assertTrue(home, "the arrival home is still a dwell")
+        self.assertLessEqual(home[0]["end_ms"], int((OV_T0 + timedelta(minutes=1350)).timestamp() * 1000))
+
+    def test_kill_switch(self):
+        old = os.environ.get("JORI_OPEN_VISIT_TO_END")
+        os.environ["JORI_OPEN_VISIT_TO_END"] = "0"
+        try:
+            self.assertIsNone(mod.open_visit_end([ov_visit(1305, None, OV_FLAT, "Home")], OV_DAY_END))
+            for d in ov_evening_home(ov_day()):
+                self.assertLess(d["end_ms"], int(OV_DAY_END.timestamp() * 1000))
+        finally:
+            if old is None:
+                os.environ.pop("JORI_OPEN_VISIT_TO_END", None)
+            else:
+                os.environ["JORI_OPEN_VISIT_TO_END"] = old
+
+
 if __name__ == "__main__":
     unittest.main()
