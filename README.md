@@ -12,6 +12,21 @@ Most assistants wait. You type, they reply, the moment passes. Jori stays on. It
 
 → Get started: **[docs/quickstart.md](docs/quickstart.md)**
 
+<p align="center"><img src="site/img/showcase.png" alt="Jori's memory site in a browser, with the Jori app on a phone" width="900"></p>
+
+<table>
+<tr>
+<td width="62%"><img src="site/img/wiki-answer.png" alt="Asking Jori's memory a question; the answer cites its sources"></td>
+<td><img src="site/img/app-approval.png" alt="The Jori app asking to approve a purchase with Face ID"></td>
+</tr>
+<tr>
+<td><b>Ask your memory.</b> Answers in plain words, with the pages they came from.</td>
+<td><b>Nothing spends without you.</b> Purchases wait for Face ID.</td>
+</tr>
+</table>
+
+<sub>Simulated screens with a made-up household (Sam, Jordan and their dog Biscuit). Regenerate with <code>node scripts/screenshots/build.cjs</code>.</sub>
+
 ---
 
 ## On the Claude you already have

@@ -9,11 +9,11 @@
 <meta property="og:description" content="One open-source assistant, for you or for your business. Private, secure and yours to shape.">
 <link rel="icon" type="image/png" href="/icon.png?v=4">
 <link rel="apple-touch-icon" href="/apple-touch-icon.png?v=4">
-<meta property="og:image" content="https://getjori.ai/og.png?v=1">
+<meta property="og:image" content="https://getjori.ai/og.png?v=2">
 <meta property="og:image:width" content="1200">
 <meta property="og:image:height" content="630">
 <meta name="twitter:card" content="summary_large_image">
-<meta name="twitter:image" content="https://getjori.ai/og.png?v=1">
+<meta name="twitter:image" content="https://getjori.ai/og.png?v=2">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,600&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400&display=swap" rel="stylesheet">
@@ -123,6 +123,16 @@
   .plug-side p { color:var(--muted); font-size:15px; margin-top:14px; }
   @media (max-width:900px) { .steps { grid-template-columns:1fr 1fr; } .plug-grid { grid-template-columns:1fr; } }
   @media (max-width:560px) { .alt, .steps, .chips { grid-template-columns:1fr; } .term code { font-size:13px; } }
+  section.see { padding:56px 0; border-top:1px solid var(--line); }
+  section.see h2 { font-family:Fraunces, Georgia, serif; font-weight:600; font-size:clamp(32px, 5vw, 48px); line-height:1.05; }
+  section.see .sub { color:var(--muted); margin:12px 0 28px; max-width:660px; }
+  section.see img { display:block; width:100%; height:auto; }
+  .shots { display:grid; grid-template-columns:1.25fr .75fr; gap:28px; margin-top:28px; align-items:start; }
+  .shots figure { margin:0; }
+  .shots figcaption { color:var(--muted); font-size:14.5px; margin-top:8px; padding:0 4%; }
+  .shots figcaption b { color:var(--ink); font-weight:600; }
+  .shots .wide { grid-column:1 / -1; }
+  @media (max-width:760px) { .shots { grid-template-columns:1fr; } .shots .phone-shot img { max-width:340px; margin:0 auto; } }
 </style>
 </head>
 <body>
@@ -152,6 +162,17 @@
       <span class="go">Jori for business →</span>
     </a>
   </div>
+
+  <section class="see" id="see">
+    <h2>See it at work.</h2>
+    <p class="sub">A sample household: Sam, Jordan and their dog Biscuit. Every Jori install has a memory you can browse and ask, and an app where Jori reaches you. These screens are simulated with made-up data.</p>
+    <img src="/img/showcase.png?v=2" alt="Jori's memory site in a browser, with the Jori app on a phone in front showing a morning brief and a question waiting for an answer" width="1700" height="1180" loading="lazy">
+    <div class="shots">
+      <figure><img src="/img/wiki-answer.png?v=2" alt="Asking the memory site what to get Jordan for their birthday. Jori answers with sources." width="1460" height="1120" loading="lazy"><figcaption><b>Ask your memory.</b> Jori answers in plain words and cites the pages it used.</figcaption></figure>
+      <figure class="phone-shot"><img src="/img/app-approval.png?v=2" alt="The Jori app asking to approve a $1,284 flight purchase with Face ID" width="610" height="1060" loading="lazy"><figcaption><b>Nothing spends without you.</b> Purchases wait for Face ID on your phone.</figcaption></figure>
+      <figure class="wide"><img src="/img/wiki-page.png?v=2" alt="A memory page for a Lisbon trip, in dark mode, with flights, where to stay and linked pages" width="1460" height="1120" loading="lazy"><figcaption><b>Every page, linked.</b> Trips, people and preferences live as pages Jori keeps up to date, with their history.</figcaption></figure>
+    </div>
+  </section>
 
   <div class="pillars">
     <div>
