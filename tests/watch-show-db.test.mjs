@@ -56,6 +56,12 @@ test("upsertCatalogRows: drops nulls and groups rows by column set", async () =>
   assert.equal(sent.flat().find((r) => r.tmdb_id === 1).imdb_rating, undefined, "a null never overwrites a stored rating");
 });
 
+test("upsertCatalogRows: keepNull writes an explicit null for the named columns only", async () => {
+  const sent = [];
+  await upsertCatalogRows([{ kind: "show", tmdb_id: 9, title: "D", season_finale_date: null, rating: null }], { keepNull: ["season_finale_date"], send: async (b) => sent.push(b) });
+  assert.deepEqual(sent[0][0], { kind: "show", tmdb_id: 9, title: "D", season_finale_date: null });
+});
+
 test("tmdbSeasons: a running season's finale date, episodes aired and whether the finale is dated", async () => {
   const { tmdbSeasons } = await import("../lib/watch-db.mjs");
   process.env.TMDB_API_KEY = "test";

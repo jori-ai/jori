@@ -234,8 +234,10 @@ const seasonFacts = (seasons) => {
   return {
     season_n: cur.n, season_episodes: cur.episodes_total ?? null,
     season_episodes_aired: cur.episodes_aired ?? (cur.fully_dropped ? cur.episodes_total ?? null : null),
-    season_finale_date: cur.finale_date || null,
+    // Only a scheduled finale counts: while TMDB has undated episodes the last DATED one
+    // isn't the finale (14 of 28 out, "finale" a date already past), so it reads as unknown.
     season_finale_known: cur.finale_known ?? (cur.fully_dropped ? true : null),
+    season_finale_date: (cur.finale_known ?? cur.fully_dropped) ? cur.finale_date || null : null,
   };
 };
 const mark = (meta, status, reason) => {
@@ -578,7 +580,7 @@ if (showDb.size) {
         rating, rating_source: source, rating_at: rating != null ? now : null, discover_at: now,
       };
     });
-    catalog = { shows: rows.length, rating_sources: sources, written: DRY ? 0 : await upsertCatalogRows(rows) };
+    catalog = { shows: rows.length, rating_sources: sources, written: DRY ? 0 : await upsertCatalogRows(rows, { keepNull: ["season_finale_date"] }) };
   } catch (e) { catalog.error = String(e?.message || e).slice(0, 200); console.error(`[watch-discover] show database: ${catalog.error}`); }
 }
 
