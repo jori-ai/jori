@@ -40,7 +40,7 @@ test("an unreadable balance is 'as of' its last read and counted in the stale sh
   assert.ok(gold.stale);
   assert.equal(gold.as_of, "Oct 21");
   assert.equal(l.stale.share_pct, 83);
-  assert.deepEqual(l.stale.reasons, [{ reason: "AwardWallet cannot read it", programs: ["BankX Gold Card ••1234"] }]);
+  assert.deepEqual(l.stale.reasons, [{ reason: "AwardWallet can't read the account", programs: ["BankX Gold Card ••1234"] }]);
 });
 
 test("card credits inside the window, soonest first; tiles group a provider's accounts", () => {
