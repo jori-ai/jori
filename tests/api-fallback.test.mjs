@@ -153,6 +153,61 @@ test("rung: not_logged_in and usage_limit go to the API; the next call skips the
   ladder._resetMaxDown();
 });
 
+// Regression guard for the system-channel alert "... the wiki is answering on
+// the Anthropic API ...": the once-a-day use page may say only what this
+// process's own Max fork saw, never that Max is down for everything or that
+// agents and every other job have stopped (nothing on this path checks that).
+test("the use page names what the fork saw and claims nothing about the rest of the system", () => {
+  const base = { caller: "wiki-answer", cap: 25, spent: 1.5, month: "2026-11" };
+  const saw = {
+    not_logged_in: 'came back "Not logged in"',
+    usage_limit: "hit the Max usage limit",
+    max_down_recently: "found Max unavailable a few minutes ago",
+  };
+  for (const [maxWhy, phrase] of Object.entries(saw)) {
+    const text = af.usePageText({ ...base, maxWhy });
+    assert.ok(text.includes(phrase), `${maxWhy}: ${text}`);
+  }
+  for (const maxWhy of [undefined, null, "something_else"]) {
+    assert.ok(af.usePageText({ ...base, maxWhy }).includes("found Max unavailable, so"), String(maxWhy));
+  }
+  for (const maxWhy of [...Object.keys(saw), null]) {
+    const text = af.usePageText({ ...base, maxWhy });
+    assert.ok(!/every other job/i.test(text), text);
+    assert.ok(!text.includes("Agents"), text);
+    assert.ok(!text.startsWith("⚠️ Max is unavailable"), text);
+  }
+});
+
+test("the use page keeps the stable phrase and the cap, spend and month", () => {
+  const text = af.usePageText({ caller: "wiki-portal", cap: 25, spent: 3.456, month: "2026-11", maxWhy: "usage_limit" });
+  assert.ok(text.startsWith("⚠️ "), text);
+  assert.ok(text.includes("the wiki is answering on the Anthropic API (wiki-portal)"), text);
+  assert.ok(text.includes("Billed per call, capped at $25.00 a month ($3.46 spent so far in 2026-11)."), text);
+});
+
+test("apiComplete accepts maxWhy without changing the call", async () => {
+  freshLedger();
+  const client = stubClient(ok('{"answer": "yes"}'));
+  const r = await af.apiComplete("q", { caller: "wiki-answer", client, maxWhy: "not_logged_in" });
+  assert.equal(r.error, null);
+  assert.equal(client.calls[0].maxWhy, undefined, "maxWhy is for the page, never sent to the API");
+});
+
+test("rung: passes what the fork saw to the API as maxWhy, and max_down_recently when it skipped the fork", async () => {
+  for (const kind of ["not_logged_in", "usage_limit"]) {
+    ladder._resetMaxDown();
+    const { seen, deps: d } = deps({ out: "", error: { kind, message: "x" } });
+    const rung = ladder.sonnetRung({ apiCaller: "wiki-answer", deps: d });
+    await ladder.runLadder("q", { rungs: [rung], validate: validAnswer });
+    assert.equal(seen.api[0].maxWhy, kind);
+    await ladder.runLadder("q2", { rungs: [rung], validate: validAnswer });
+    assert.equal(seen.fork, 1);
+    assert.equal(seen.api[1].maxWhy, "max_down_recently");
+  }
+  ladder._resetMaxDown();
+});
+
 test("rung: a timeout or empty output is not a reason to bill the API", async () => {
   for (const kind of ["timeout", "empty_output", "exit_nonzero"]) {
     ladder._resetMaxDown();
