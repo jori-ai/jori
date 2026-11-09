@@ -363,7 +363,7 @@ if (findings && findings.length > 0) {
   noveltyVec = await novelty.embed(text); // null on empty text / embedder failure
   if (noveltyVec) {
     const rows = novelty.recentVectors();
-    const { maxSim, nearest } = novelty.nearestDuplicate(noveltyVec, rows);
+    const { maxSim, nearest, fault: noveltyFault } = novelty.nearestDuplicate(noveltyVec, rows, text);
     noveltyMaxSim = Number(maxSim.toFixed(4));
     noveltyNearestPingId = nearest?.ping_id || null;
     const noveltyProtected = isProtectedIntent(intent);
@@ -376,7 +376,7 @@ if (findings && findings.length > 0) {
     // one path this backstop exists for: a send that skipped hum-harvest-all
     // and may carry no --lane at all.
     const noveltyThreshold = novelty.thresholdFor((headline && headline.topic) || lane);
-    if (!noveltyProtected && score < 0.9 && maxSim >= noveltyThreshold) {
+    if (!noveltyProtected && score < 0.9 && !noveltyFault && maxSim >= noveltyThreshold) {
       console.error(`hum-ping: REFUSED (exit 9) — headline is a semantic near-duplicate of ping ${noveltyNearestPingId} (cosine ${noveltyMaxSim} >= ${noveltyThreshold}) within ${novelty.WINDOW_H}h; score ${score} < 0.9 and not a protected lane. Novelty gate.`);
       process.exit(9);
     }
