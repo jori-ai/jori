@@ -50,5 +50,52 @@ class T(unittest.TestCase):
         self.assertEqual(self.drops(today, legacy), [])
 
 
+
+# hum-i-20261108-01: a reaction stamped > 3 days after its ping was sent (a
+# bulk backfill) is counted in reactions_late, not in the day it was stamped.
+_l2 = importlib.machinery.SourceFileLoader("hmc_late", os.path.join(ROOT, "bin", "hum-metrics-collect"))
+_s2 = importlib.util.spec_from_loader("hmc_late", _l2)
+m = importlib.util.module_from_spec(_s2)
+_l2.exec_module(m)
+from datetime import date
+from zoneinfo import ZoneInfo
+TZ = ZoneInfo("UTC")
+
+
+
+def fb(sent, at, reaction="more", pid="p"):
+    r = {"ping_id": pid, "lane": "nearby", "reaction": reaction, "reaction_at": at}
+    if sent is not None:
+        r["sent_at"] = sent
+    return r
+
+
+class LateReactionTests(unittest.TestCase):
+    def collect(self, rows):
+        return m.collect_for_day(date(2026, 11, 3), TZ, [], rows, [])
+
+    def test_backfill_ignored(self):
+        d = self.collect([fb("2026-04-10T12:00:00Z", "2026-11-03T22:02:00Z")])
+        self.assertEqual(d["reactions"]["love"], 0)
+        self.assertEqual(d["reactions_late"], 1)
+
+    def test_prompt_reaction_counts(self):
+        d = self.collect([fb("2026-11-03T12:00:00Z", "2026-11-03T13:00:00Z")])
+        self.assertEqual(d["reactions"]["love"], 1)
+        self.assertEqual(d["reactions_late"], 0)
+
+    def test_two_day_old_counts(self):
+        d = self.collect([fb("2026-11-01T12:00:00Z", "2026-11-03T13:00:00Z")])
+        self.assertEqual(d["reactions"]["love"], 1)
+
+    def test_missing_sent_at_still_counts(self):
+        d = self.collect([fb(None, "2026-11-03T13:00:00Z"),
+                          fb("garbage", "2026-11-03T14:00:00Z", pid="q")])
+        self.assertEqual(d["reactions"]["love"], 2)
+        self.assertEqual(d["reactions_late"], 0)
+
+
+
+
 if __name__ == "__main__":
     unittest.main()
