@@ -526,3 +526,71 @@ test("JORI_WALK_STEPS_FLOOR=0 prints the route's distance", () => {
     if (old == null) delete process.env.JORI_WALK_STEPS_FLOOR; else process.env.JORI_WALK_STEPS_FLOOR = old;
   }
 });
+
+// A stop that is nothing but the walk between a ride and the next place: the ride
+// home stopped two blocks short, the phone logged an arrival there and went quiet,
+// and a ten-minute "stop" at a street address was built from it while the steps
+// show a walk through all of it and on to the door.
+function dropOffDay({ rideOut = false, photos = [], source = "spine_dwell", certainty = "weak_guess" } = {}) {
+  const spine = [
+    { type: "dwell", id: "d0", start_ms: at(19, 35), end_ms: at(21, 18), place: { name: "The Hall Theatre" } },
+    { type: "leg", id: "l0", mode: "riding", median_kmh: 28, start_ms: at(21, 18), end_ms: at(21, 30), mins: 12, routed_m: 6600, walked_m: 0, fixes: 6 },
+    { type: "dwell", id: "d1", start_ms: at(21, 30), end_ms: at(21, 40), place: { name: "12 Example Street" } },
+  ];
+  if (rideOut) spine.push({ type: "leg", id: "l1", mode: "riding", median_kmh: 25, start_ms: at(21, 40), end_ms: at(21, 52), mins: 12, routed_m: 4000, walked_m: 0, fixes: 5 });
+  else spine.push({ type: "leg", id: "l1", mode: "walking", median_kmh: 4, start_ms: at(21, 40), end_ms: at(21, 45), mins: 5, routed_m: 300, walked_m: 300, fixes: 2 });
+  spine.push({ type: "dwell", id: "d2", start_ms: at(21, 45), end_ms: at(24), place: { name: "Home" } });
+  return {
+    date: "2026-03-02", tz: "America/New_York",
+    stops: [
+      { id: "venue", start: "19:35", end: "21:18", start_ts_ms: at(19, 35), end_ts_ms: at(21, 18), duration_min: 103, place: { name: "The Hall Theatre", source: "calendar_corroborated" } },
+      { id: "drop", start: "21:30", end: "21:40", start_ts_ms: at(21, 30), end_ts_ms: at(21, 40), duration_min: 10, photos,
+        place: { name: "12 Example Street", source }, provenance: { certainty }, needs_review: { reason: "thin guess with competing alternatives" } },
+      { id: "home", start: "21:45", end: "24:00", start_ts_ms: at(21, 45), end_ts_ms: at(24), duration_min: 135, place: { name: "Home", source: "named_location" } },
+    ],
+    unknown_stops: [{ id: "drop" }],
+    path: { spine },
+  };
+}
+const dropOffSteps = (to = at(21, 48)) => [...vehCover, ...readings(at(21, 5), at(21, 14), 85), ...readings(at(21, 30), to, 86)];
+
+test("a short unnamed stop the walk from a drop-off runs straight through is movement, and nobody is asked about it", () => {
+  const d = dropOffDay();
+  const st = annotateDaySteps(d, dropOffSteps(), null, { startMs: at(0), endMs: at(24) });
+  const drop = d.stops.find(s => s.id === "drop");
+  assert.equal(drop.is_movement, true);
+  assert.equal(drop.needs_review, null);
+  assert.deepEqual(d.unknown_stops, []);
+  assert.deepEqual(st.stops_walked_through.map(m => [m.id, m.beside]), [["drop", "ride_in"]]);
+  assert.ok(!d.stops.find(s => s.id === "home").is_movement, "the place the walk reached stays a stop");
+  assert.ok(!_internal.isMainStop(drop), "and it is not printed");
+});
+
+test("arriving and leaving by ride is an errand, a walk that stops at its edge is a stay, and a photo or a name keeps it", () => {
+  const off = { startMs: at(0), endMs: at(24) };
+  const errand = dropOffDay({ rideOut: true });
+  annotateDaySteps(errand, dropOffSteps(at(21, 40)), null, off);
+  assert.ok(!errand.stops.find(s => s.id === "drop").is_movement, "ride in and ride out");
+  const stayed = dropOffDay();
+  annotateDaySteps(stayed, dropOffSteps(at(21, 40)), null, off);
+  assert.ok(!stayed.stops.find(s => s.id === "drop").is_movement, "the walk ended at the stop's edge");
+  const pictured = dropOffDay({ photos: [{ ts: new Date(at(21, 35)).toISOString() }] });
+  annotateDaySteps(pictured, dropOffSteps(), null, off);
+  assert.ok(!pictured.stops.find(s => s.id === "drop").is_movement, "a photo taken there");
+  const named = dropOffDay({ source: "user_confirmed", certainty: "answered" });
+  annotateDaySteps(named, dropOffSteps(), null, off);
+  assert.ok(!named.stops.find(s => s.id === "drop").is_movement, "a name the user gave");
+});
+
+test("JORI_STEPS_WALK_STOP=0 keeps the stop", () => {
+  const old = process.env.JORI_STEPS_WALK_STOP;
+  process.env.JORI_STEPS_WALK_STOP = "0";
+  try {
+    const d = dropOffDay();
+    const st = annotateDaySteps(d, dropOffSteps(), null, { startMs: at(0), endMs: at(24) });
+    assert.ok(!d.stops.find(s => s.id === "drop").is_movement);
+    assert.deepEqual(st.stops_walked_through, []);
+  } finally {
+    if (old == null) delete process.env.JORI_STEPS_WALK_STOP; else process.env.JORI_STEPS_WALK_STOP = old;
+  }
+});
