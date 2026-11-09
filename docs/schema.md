@@ -100,6 +100,7 @@ like an unconfigured feature and turns itself off.
 | `0130_cruise` | cruise watch and its site | `cruise_sailings`, `cruise_price_history`, `cruise_ship_photos`, `cruise_ship_ratings`, `cruise_favorites`, bucket `cruise-ships` | the site reads; favourites are per user (own rows only) |
 | `0140_trip` | trip reservoirs, rendered day plans | `trip_reservoirs`, `trip_day_plans` | the site reads reservoirs and marks entries done |
 | `0150_spa` | spa heating telemetry | `spa_heating_sessions`, `spa_heating_ticks` | none |
+| `0180_action_approvals` | Face-ID approval for plugin actions | `action_approvals` (+ freeze trigger); keys are the paired `purchase_device_keys` | read; rows only `pending → signed/denied` on the decision columns |
 | `9999_reload_schema` | always | `notify pgrst, 'reload schema'` | none |
 
 Config-dependent names:

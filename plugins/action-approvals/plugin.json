@@ -1,0 +1,20 @@
+{
+  "name": "action-approvals",
+  "title": "Approvals for plugin actions",
+  "description": "Runs a plugin's risky actions only after you approve them with Face ID on your paired phone. It does nothing until a plugin declares an action that needs approval.",
+  "version": "1.0.0",
+  "default": "enabled",
+  "requires": { "plugins": [], "bins": ["bin/approval", "bin/action-approval-poll"], "commands": [], "env": ["SUPABASE_SERVICE_ROLE_KEY"] },
+  "schedules": [
+    {
+      "label": "action-approval-poll",
+      "cron": "* * * * *",
+      "command": "{sysnode} {root}/bin/action-approval-poll >> {root}/data/logs/action-approval-poll.log 2>&1"
+    }
+  ],
+  "files": [
+    "bin/approval",
+    "bin/action-approval-poll",
+    "lib/action-approval.mjs"
+  ]
+}

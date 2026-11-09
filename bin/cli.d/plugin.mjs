@@ -23,7 +23,7 @@ function describeSync(r, c) {
 export default {
   name: "plugin",
   summary: "feature plugins: list, info, new, enable, disable, install, remove, sync, check",
-  usage: "plugin [list|info <name>|new <name> [--title T] [--local] [--schedule CRON] [--job]|enable <name> [--force]|disable <name>|install <path|git-url> [--local]|remove <name> [--purge-config]|sync [--dry-run]|check]",
+  usage: "plugin [list|info <name>|new <name> [--title T] [--local] [--schedule CRON] [--job] [--approval ACTION]|enable <name> [--force]|disable <name>|install <path|git-url> [--local]|remove <name> [--purge-config]|sync [--dry-run]|check]",
   async run(args, ctx) {
     const { c, die, hasFlag } = ctx;
     const [cmd = "list", name] = args;
@@ -45,6 +45,7 @@ export default {
         if (sch.length) console.log(`  schedules ${sch.map((s) => `${s.label} (${s.cron})`).join(", ")}`);
         if (m.launchd?.length) console.log(`  launchd   ${m.launchd.map((l) => l.label).join(", ")}`);
         if (Object.keys(m.jobs || {}).length) console.log(`  jobs      ${Object.keys(m.jobs).join(", ")}`);
+        if (Object.keys(m.approvals || {}).length) console.log(`  approvals ${Object.keys(m.approvals).join(", ")} (Face ID before each run)`);
         if (m.provides_bins?.length) console.log(`  commands  ${m.provides_bins.join(", ")}`);
         if (m.config?.name) console.log(`  settings  agent/local/config/${m.config.name}.json`);
         const miss = M.missingRequirements(p);
@@ -85,8 +86,8 @@ export default {
         return;
       }
       case "new": {
-        if (!name) die('usage: jori plugin new <name> [--title "Title"] [--local] [--schedule "15 8 * * *"] [--job]');
-        const r = M.create(name, { local: hasFlag(args, "--local"), title: ctx.getFlag(args, "--title"), schedule: ctx.getFlag(args, "--schedule"), job: hasFlag(args, "--job") });
+        if (!name) die('usage: jori plugin new <name> [--title "Title"] [--local] [--schedule "15 8 * * *"] [--job] [--approval <action>]');
+        const r = M.create(name, { local: hasFlag(args, "--local"), title: ctx.getFlag(args, "--title"), schedule: ctx.getFlag(args, "--schedule"), job: hasFlag(args, "--job"), approval: ctx.getFlag(args, "--approval") });
         record({ who: who(), page: "plugins", what: `Created the ${name} plugin`, target: `plugin:${name}` });
         console.log(c.green(`✓ created ${name}`) + c.dim(` at ${r.dir}`));
         for (const f of r.files) console.log(c.dim(`  ${f}`));

@@ -108,6 +108,8 @@ struct ContentView: View {
     // Face-ID purchase approval (PurchaseApproval.swift)
     @State private var showPurchasePairing = false
     @State private var pendingPurchase: PurchaseApproval.Ref?
+    // Face-ID approval for plugin actions (ActionApproval.swift)
+    @State private var pendingAction: ActionApproval.Ref?
 
     /// Wiki HTTP browser served from the host (Tailscale / home LAN), from
     /// the build's JORI_WIKI_URL. Nil: the Memory tab explains it is not set up.
@@ -1410,6 +1412,10 @@ struct ContentView: View {
                         AppDelegate.pendingPurchaseId = nil
                         view.pendingPurchase = PurchaseApproval.Ref(id: id)
                     }
+                    if let id = AppDelegate.pendingActionApprovalId {
+                        AppDelegate.pendingActionApprovalId = nil
+                        view.pendingAction = ActionApproval.Ref(id: id)
+                    }
                 }
                 #if os(iOS)
                 .sheet(isPresented: view.$showUsageSetup) {
@@ -1447,6 +1453,28 @@ struct ContentView: View {
                             view.pendingPurchase = PurchaseApproval.Ref(id: id)
                         }
                     }
+                }
+                // Plugin-action approval: same shape as purchases (ActionApproval.swift).
+                .onReceive(NotificationCenter.default.publisher(for: .openActionApproval)) { note in
+                    AppDelegate.pendingActionApprovalId = nil
+                    if let id = note.object as? String { view.pendingAction = ActionApproval.Ref(id: id) }
+                }
+                .onReceive(NotificationCenter.default.publisher(for: PurchaseApproval.didBecomeActive)) { _ in
+                    guard view.pendingAction == nil, ActionApproval.isRegistered else { return }
+                    Task {
+                        if let id = try? await ActionApproval.fetchPendingId(), view.pendingAction == nil {
+                            view.pendingAction = ActionApproval.Ref(id: id)
+                        }
+                    }
+                }
+                .sheet(item: view.$pendingAction) { ref in
+                    ActionApprovalReviewView(approvalId: ref.id) { view.pendingAction = nil }
+                        #if os(iOS)
+                        .presentationDetents([.large])
+                        .presentationDragIndicator(.hidden)
+                        #else
+                        .frame(minWidth: 460, idealWidth: 520, minHeight: 560, idealHeight: 680)
+                        #endif
                 }
                 #if os(iOS)
                 // A bottom sheet, not a chat message: it can't be

@@ -13,6 +13,8 @@
 		AA000200 /* SelfImproveApproval.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB000200 /* SelfImproveApproval.swift */; };
 		AA000F10 /* PurchaseApproval.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB000F10 /* PurchaseApproval.swift */; };
 		AA000F11 /* PurchaseApprovalReviewView.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB000F11 /* PurchaseApprovalReviewView.swift */; };
+		AA000F12 /* ActionApproval.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB000F12 /* ActionApproval.swift */; };
+		AA000F13 /* ActionApprovalReviewView.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB000F13 /* ActionApprovalReviewView.swift */; };
 		AA000202 /* ChannelBadges.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB000202 /* ChannelBadges.swift */; };
 		AA000E01 /* DesignSystem.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB000E01 /* DesignSystem.swift */; };
 		AA000E02 /* Responsiveness.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB000E02 /* Responsiveness.swift */; };
@@ -137,6 +139,8 @@
 		BB000200 /* SelfImproveApproval.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SelfImproveApproval.swift; sourceTree = "<group>"; };
 		BB000F10 /* PurchaseApproval.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PurchaseApproval.swift; sourceTree = "<group>"; };
 		BB000F11 /* PurchaseApprovalReviewView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PurchaseApprovalReviewView.swift; sourceTree = "<group>"; };
+		BB000F12 /* ActionApproval.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ActionApproval.swift; sourceTree = "<group>"; };
+		BB000F13 /* ActionApprovalReviewView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ActionApprovalReviewView.swift; sourceTree = "<group>"; };
 		BB000202 /* ChannelBadges.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChannelBadges.swift; sourceTree = "<group>"; };
 		BB000E01 /* DesignSystem.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DesignSystem.swift; sourceTree = "<group>"; };
 		BB000E02 /* Responsiveness.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Responsiveness.swift; sourceTree = "<group>"; };
@@ -313,6 +317,8 @@
 				BB000200 /* SelfImproveApproval.swift */,
 				BB000F10 /* PurchaseApproval.swift */,
 				BB000F11 /* PurchaseApprovalReviewView.swift */,
+				BB000F12 /* ActionApproval.swift */,
+				BB000F13 /* ActionApprovalReviewView.swift */,
 				BB000202 /* ChannelBadges.swift */,
 				BB000E01 /* DesignSystem.swift */,
 				BB000E02 /* Responsiveness.swift */,
@@ -598,6 +604,8 @@
 				AA000200 /* SelfImproveApproval.swift in Sources */,
 				AA000F10 /* PurchaseApproval.swift in Sources */,
 				AA000F11 /* PurchaseApprovalReviewView.swift in Sources */,
+				AA000F12 /* ActionApproval.swift in Sources */,
+				AA000F13 /* ActionApprovalReviewView.swift in Sources */,
 				AA000202 /* ChannelBadges.swift in Sources */,
 				AA000E01 /* DesignSystem.swift in Sources */,
 				AA000E02 /* Responsiveness.swift in Sources */,

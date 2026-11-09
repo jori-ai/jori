@@ -137,29 +137,34 @@ struct PendingApprovalsView: View {
     private enum Entry: Identifiable {
         case trade(TradeApproval.Request)
         case purchase(PurchaseApproval.Waiting)
+        case action(ActionApproval.Waiting)
 
         var id: String {
             switch self {
             case .trade(let r): return "trade-\(r.executionId)"
             case .purchase(let p): return "purchase-\(p.id)"
+            case .action(let a): return "action-\(a.id)"
             }
         }
         var title: String {
             switch self {
             case .trade(let r): return r.summary
             case .purchase(let p): return p.title
+            case .action(let a): return a.title
             }
         }
         var kind: String {
             switch self {
             case .trade: return "Trade"
             case .purchase: return "Purchase"
+            case .action: return "Action"
             }
         }
         var expiresAt: Date {
             switch self {
             case .trade(let r): return Date(timeIntervalSince1970: TimeInterval(r.expiresAt))
             case .purchase(let p): return p.expiresAt
+            case .action(let a): return a.expiresAt
             }
         }
     }
@@ -170,6 +175,7 @@ struct PendingApprovalsView: View {
     @State private var errors: [String] = []
     @State private var trade: TradeApproval.Request?
     @State private var purchase: PurchaseApproval.Ref?
+    @State private var action: ActionApproval.Ref?
 
     var body: some View {
         NavigationStack {
@@ -241,12 +247,22 @@ struct PendingApprovalsView: View {
             .frame(minWidth: 460, idealWidth: 520, minHeight: 560, idealHeight: 680)
             #endif
         }
+        .sheet(item: $action) { ref in
+            ActionApprovalReviewView(approvalId: ref.id) {
+                action = nil
+                Task { await load() }
+            }
+            #if os(macOS)
+            .frame(minWidth: 460, idealWidth: 520, minHeight: 560, idealHeight: 680)
+            #endif
+        }
     }
 
     private func open(_ e: Entry) {
         switch e {
         case .trade(let r): trade = r
         case .purchase(let p): purchase = PurchaseApproval.Ref(id: p.id)
+        case .action(let a): action = ActionApproval.Ref(id: a.id)
         }
     }
 
@@ -270,6 +286,11 @@ struct PendingApprovalsView: View {
             } catch {
                 problems.append("Purchases: \(error.localizedDescription)")
             }
+            do {
+                next += try await ActionApproval.fetchWaiting().map(Entry.action)
+            } catch {
+                problems.append("Actions: \(error.localizedDescription)")
+            }
         }
         entries = next.sorted { $0.expiresAt > $1.expiresAt }
         errors = problems
@@ -286,6 +307,7 @@ enum PendingApprovals {
         var n = 0
         if TradeApproval.isRegistered, let t = try? await TradeApproval.fetchPending(interactive: false) { n += t.count }
         if PurchaseApproval.isRegistered, let p = try? await PurchaseApproval.fetchWaiting() { n += p.count }
+        if ActionApproval.isRegistered, let a = try? await ActionApproval.fetchWaiting() { n += a.count }
         return n
     }
 }
