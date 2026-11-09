@@ -261,7 +261,7 @@ Besides venue-watch's config lanes (one trigger, `agent/scripts/trigger-venue-wa
 
 ## Optional business modules
 
-`bin/launch-watch-run` (calendar holds for launches matching `launch-watch.json` `search`), `bin/filing-watch` (SEC going-public filings over a private watchlist), `bin/domain-allocation` and the `stocks` hum lane (over the broker positions), `bin/awardwallet-sync` / `awardwallet-refresh` (loyalty balances; `loyalty.json` adds direct readers), the Amazon order tools, and the app-marketing measurement module (`bin/aso-*`, `bin/mkt-*`, `lib/mkt_local.py`; off without `marketing.json`; a product's facts ride `agent/local/jobs/<job>.md`). Content and outreach jobs for a product stay per-installation.
+`bin/launch-watch-run` (calendar holds for launches matching `launch-watch.json` `search`), `bin/filing-watch` (SEC going-public filings over a private watchlist), `bin/domain-allocation` and the `stocks` hum lane (over the broker positions), `bin/awardwallet-sync` / `awardwallet-refresh` (loyalty balances; `loyalty.json` adds direct readers; the weekly finance review's Miles & points section reads them via `lib/finance-loyalty.js`), the Amazon order tools, and the app-marketing measurement module (`bin/aso-*`, `bin/mkt-*`, `lib/mkt_local.py`; off without `marketing.json`; a product's facts ride `agent/local/jobs/<job>.md`). Content and outreach jobs for a product stay per-installation.
 
 ## Apps
 

@@ -48,6 +48,9 @@
 //     `recurring_label` (the recurring-charges tracker), and
 //     `invoice_tracked_streams` (expected-income stream ids the invoice
 //     reconciliation already reports, so they are not also called late).
+//   agent/local/config/loyalty.json  the miles & points section's per-point
+//     values and header tiles (lib/finance-loyalty.js); absent = balances
+//     without dollar values.
 
 const fs = require("node:fs");
 const { loadEnv } = require("../lib/load-env.js");
@@ -57,6 +60,7 @@ const { attributionFor, bucketOf, buildCashBuckets, buildRealEstate } = require(
 const { classify, streamsCoveredByBooks, SPEND_KINDS, LARGE_OUTFLOW } = require("../lib/finance-classify.js");
 const { depositSection } = require("../lib/finance-deposit-reconcile.js");
 const { invoiceSection } = require("../lib/finance-invoice-reconcile.js");
+const { loyaltySection } = require("../lib/finance-loyalty.js");
 const { incomeStatus, scheduledDue } = require("../lib/finance-expected.js");
 const { brokerConfig } = require("../lib/broker-config.cjs");
 const { instance, localConfig } = require("../lib/instance.cjs");
@@ -173,6 +177,17 @@ async function main() {
     request("/rest/v1/fin_deposit_reconciliations?select=run_at,report&order=run_at.desc&limit=1"),
     request(`/rest/v1/fin_invoice_reconciliations?select=run_at,report&payer=eq.${encodeURIComponent(INST.owner_id || "")}&order=run_at.desc&limit=1`),
   ]);
+
+  // ── Miles & points (bin/awardwallet-sync's snapshot; absent tables = no section) ──
+  const [loyaltyRows, loyaltyHistory] = await Promise.all([
+    safe(request("/rest/v1/loyalty_accounts?select=account_id,owner_kind,owner_name,provider_code,display_name,kind,balance_raw,elite_status,last_retrieve_date,error_code,sub_accounts")),
+    safe(request(`/rest/v1/loyalty_balance_history?select=account_id,as_of_date,balance_raw&as_of_date=gte.${dayAdd(today, -21)}&order=as_of_date.asc`)),
+  ]);
+  const loyalty = loyaltyRows?.length ? loyaltySection({
+    rows: loyaltyRows, history: loyaltyHistory || [], today, weekStart: wkStart, tz: INST.tz, ownerName: INST.owner_name || "",
+    lastOk: (load(installTools("data", "awardwallet-sync-state.json"), {}) || {}).last_ok || {},
+    config: localConfig("loyalty", {}),
+  }) : null;
   const posted = (txns || []).filter((t) => !t.pending);
   const acctById = new Map((accounts || []).map((a) => [a.account_id, a]));
   const acct = (id) => acctById.get(id) || {};
@@ -944,6 +959,7 @@ async function main() {
       week_total_fmt: flowFmt.spending_fmt, prior_week_total_fmt: usd0(spendPrev),
       by_category: byCategory, by_account: byAccount, largest, leakage, income_in_personal: incomeInPersonal,
     },
+    loyalty,
     cards: { aggregate_utilization_fmt: pct(aggUtil), utilization_basis: "cards that report a limit", items: cardItems, interest, fees },
     recurring: {
       source: FR.recurring_label, active_count: items.length, monthly_equivalent_fmt: usd0(monthlyEq),
