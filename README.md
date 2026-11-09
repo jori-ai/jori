@@ -23,9 +23,17 @@ Most assistants wait. You type, they reply, the moment passes. Jori stays on. It
 <td><b>Ask your memory.</b> Answers in plain words, with the pages they came from.</td>
 <td><b>Nothing spends without you.</b> Purchases wait for Face ID.</td>
 </tr>
+<tr>
+<td><img src="site/img/work-showcase.png" alt="For work: a client's person page with every interaction and open follow-ups, and today's follow-ups on the phone"></td>
+<td><img src="site/img/personal-app-trip-dinner.png" alt="For life: a day planned in Lisbon and dinner booked before a show"></td>
+</tr>
+<tr>
+<td><b>For work.</b> A page for every person, every meeting written up, every follow-up chased.</td>
+<td><b>For life.</b> Trips, tables, tickets, money and the home.</td>
+</tr>
 </table>
 
-<sub>Simulated screens with a made-up household (Sam, Jordan and their dog Biscuit). Regenerate with <code>node scripts/screenshots/build.cjs</code>.</sub>
+<sub>Simulated screens with a made-up household (Sam, Jordan and their dog Biscuit; Dana and the Harbor &amp; Pine account at work). Rebuilt by <code>node scripts/screenshots/build.cjs</code>, which the pre-push hook runs whenever the UI they show has changed.</sub>
 
 ---
 

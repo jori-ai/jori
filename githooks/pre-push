@@ -1,0 +1,64 @@
+#!/usr/bin/env bash
+# pre-push — keep the simulated screenshots (site/img/*.png, shown on
+# getjori.ai and in the README) in step with the UI they depict.
+#
+# scripts/screenshots/build.cjs --check hashes the mockup pages it would render
+# (the wiki's own renderer + the app's palette from DesignSystem.swift + the
+# mockups themselves) against site/img/.stamp. Cheap, no Chrome. When it says
+# stale, this hook rebuilds the PNGs with headless Chrome, commits them, deploys
+# getjori.ai (the site deploys by Vercel CLI only, never on push), and stops
+# this push once so the next `git push` carries the new images.
+#
+# Never blocks when it cannot help: other remotes, no node, no Chrome, a
+# failed render, or uncommitted edits to the inputs (the images must match what
+# is committed, not what is in flight) all warn and let the push through.
+#
+# Escape hatch: JORI_SKIP_SCREENSHOTS=1 git push
+
+remote_url="$2"
+[ "${JORI_SKIP_SCREENSHOTS:-}" = "1" ] && exit 0
+case "$remote_url" in *jori-ai/jori*) ;; *) exit 0 ;; esac
+command -v node >/dev/null 2>&1 || exit 0
+
+root="$(git rev-parse --show-toplevel)" || exit 0
+cd "$root" || exit 0
+build="scripts/screenshots/build.cjs"
+[ -f "$build" ] || exit 0
+
+node "$build" --check >/dev/null 2>&1 && exit 0
+
+inputs="lib/wiki-render.js lib/wiki-portal.js apps/companion/Jori/DesignSystem.swift scripts/screenshots"
+if [ -n "$(git status --porcelain -- $inputs)" ]; then
+  echo "pre-push: screenshots are stale, but their inputs have uncommitted edits; not rebuilding. Commit them, then push again." >&2
+  exit 0
+fi
+
+echo "pre-push: the UI behind the screenshots changed; rebuilding site/img (headless Chrome)…" >&2
+if ! node "$build" >&2; then
+  echo "pre-push: rebuild failed (Chrome missing or blocked?); pushing without new screenshots. Run: node $build" >&2
+  exit 0
+fi
+
+pngs=$(git ls-files --others --modified -- site/img)
+if [ -z "$pngs" ]; then
+  exit 0 # only the stamp's inputs moved, the pictures did not; nothing to commit
+fi
+# shellcheck disable=SC2086
+if ! bin/jori-commit --kernel -m "site/img: screenshots rebuilt after a UI change (githooks/pre-push)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>" -- $pngs >&2; then
+  echo "pre-push: rebuilt the screenshots but could not commit them; commit site/img yourself." >&2
+  exit 0
+fi
+
+if command -v vercel >/dev/null 2>&1 && [ -f site/.vercel/project.json ] && [ -z "$(git status --porcelain -- site)" ]; then
+  echo "pre-push: deploying getjori.ai with the new screenshots…" >&2
+  (cd site && vercel deploy --prod --yes >/dev/null 2>&1) \
+    && echo "pre-push: getjori.ai deployed." >&2 \
+    || echo "pre-push: deploy failed; run: cd site && vercel deploy --prod --yes" >&2
+else
+  echo "pre-push: deploy getjori.ai when ready: cd site && vercel deploy --prod --yes" >&2
+fi
+
+echo "pre-push: screenshots rebuilt and committed ($(git rev-parse --short HEAD)). Push again to include them." >&2
+exit 1

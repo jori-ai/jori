@@ -11,9 +11,17 @@
 // (apps/companion/Jori/DesignSystem.swift: cobalt = you, slate = Jori,
 // gold = "Jori is waiting on you").
 //
-// Usage: node scripts/screenshots/build.cjs [--out site/img]
-// Needs Google Chrome (headless). Under a sandbox that blocks Chrome, run it
-// unsandboxed.
+// Usage: node scripts/screenshots/build.cjs [--out site/img]   rebuild the PNGs
+//        node scripts/screenshots/build.cjs --check             exit 1 if stale
+// Needs Google Chrome (headless) to rebuild; --check needs only node. Under a
+// sandbox that blocks Chrome, run it unsandboxed.
+//
+// Staleness: every mockup page is generated here, deterministically (the clock
+// is frozen at FIXED_NOW), so a hash of the generated HTML says whether the
+// images still match the code. The hash is kept in site/img/.stamp; the
+// pre-push hook (githooks/pre-push) runs --check and rebuilds when it differs,
+// e.g. after a change to lib/wiki-render.js, lib/wiki-portal.js, the app's
+// palette in DesignSystem.swift, or this file.
 
 "use strict";
 
@@ -28,14 +36,20 @@ const portal = require(path.join(ROOT, "lib/wiki-portal.js"));
 
 const outArg = process.argv.indexOf("--out");
 const OUT = path.resolve(ROOT, outArg > 0 ? process.argv[outArg + 1] : "site/img");
-const WORK = fs.mkdtempSync(path.join(os.tmpdir(), "jori-shots-"));
+const CHECK = process.argv.includes("--check");
+const STAMP = path.join(ROOT, "site/img/.stamp");
+const WORK = CHECK ? null : fs.mkdtempSync(path.join(os.tmpdir(), "jori-shots-"));
 const CHROME = process.env.CHROME || "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
 
 portal.setAssistant("Jori", "it/its");
 
 // ── Sample memory ───────────────────────────────────────────────────────────
 
-const now = Date.now();
+// A frozen clock, so the pages (relative times, the days strip) are the same on
+// every run and the stamp only changes when the code does.
+const FIXED_NOW = Date.parse("2026-11-05T14:00:00Z");
+Date.now = () => FIXED_NOW;
+const now = FIXED_NOW;
 const ago = (mins) => new Date(now - mins * 60000).toISOString();
 const P = (id, type, title, description, mins, extra = {}) => ({ id, type, title, description, status: "active", updated_at: ago(mins), ...extra });
 
@@ -82,8 +96,8 @@ const portalConfig = {
   ],
 };
 
-function wikiDoc(title, body, { dark = false, active = "home", q = "" } = {}) {
-  let html = render.shell(title, body, { label: "sam@example.com", scoped: false }, { active, q, control: true });
+function wikiDoc(title, body, { dark = false, active = "home", q = "", who = "sam@example.com" } = {}) {
+  let html = render.shell(title, body, { label: who, scoped: false }, { active, q, control: true });
   html = html.replace('<link rel="stylesheet" href="/style.css">', `<style>${render.CSS}</style>`);
   if (dark) html = html.replace('<html lang="en">', '<html lang="en" data-theme="dark">');
   return html;
@@ -155,8 +169,22 @@ const wikiPage = wikiDoc("Lisbon in March", lisbonBody, { dark: true, active: nu
 
 // ── App mockups ─────────────────────────────────────────────────────────────
 
+// The app's light-mode colours, read from DesignSystem.swift so a palette
+// change there reaches the mockups (and the stamp). Falls back to the values
+// below if a name is missing.
+function appPalette() {
+  const want = { cobalt: "#2F5BD3", staff: "#D98E12", staffWash: "#FFF3D9", staffInk: "#8F5600", slate: "#EEF0F4", slateRaised: "#E3E6EC", hairline: "#D7DBE3", confirmed: "#1F8F4E", deny: "#D93A33" };
+  let src = "";
+  try { src = fs.readFileSync(path.join(ROOT, "apps/companion/Jori/DesignSystem.swift"), "utf8"); } catch {}
+  for (const name of Object.keys(want)) {
+    const m = src.match(new RegExp(`static let ${name} = dynamic\\(light: 0x([0-9A-Fa-f]{6})`)); // lang-regex-ok: reads a hex literal out of Swift source (structure)
+    if (m) want[name] = `#${m[1].toUpperCase()}`;
+  }
+  return Object.entries(want).map(([k, v]) => `--${k === "confirmed" ? "ok" : k}:${v};`).join(" ");
+}
+
 const APP_CSS = `
-:root { --cobalt:#2F5BD3; --staff:#D98E12; --staffWash:#FFF3D9; --staffInk:#8F5600; --slate:#EEF0F4; --slateRaised:#E3E6EC; --hairline:#D7DBE3; --ok:#1F8F4E; --deny:#D93A33; --canvas:#FFFFFF; --grouped:#F2F2F7; --card:#FFFFFF; --ink:#111318; --ink2:#6B7280; }
+:root { ${appPalette()} --canvas:#FFFFFF; --grouped:#F2F2F7; --card:#FFFFFF; --ink:#111318; --ink2:#6B7280; }
 * { box-sizing:border-box; margin:0; }
 html, body { background:transparent; }
 body { font:17px/1.35 -apple-system, system-ui, "SF Pro Text", sans-serif; color:var(--ink); -webkit-font-smoothing:antialiased; display:flex; gap:56px; padding:90px; }
@@ -223,6 +251,26 @@ body { font:17px/1.35 -apple-system, system-ui, "SF Pro Text", sans-serif; color
 .btns div { flex:1; height:52px; border-radius:16px; display:flex; align-items:center; justify-content:center; gap:8px; font-weight:600; font-size:17px; }
 .btns .no { background:var(--card); color:var(--deny); border:1px solid var(--hairline); }
 .btns .yes { background:var(--cobalt); color:#fff; flex:1.5; }
+/* Work scenes */
+.plan { margin-top:8px; display:grid; gap:7px; }
+.plan div { display:grid; grid-template-columns:44px 1fr; gap:8px; font-size:15px; line-height:1.35; }
+.plan div b { font-weight:600; font-variant-numeric:tabular-nums; color:var(--ink2); font-size:13px; padding-top:1px; }
+.place { display:flex; gap:10px; align-items:flex-start; background:var(--card); border:1px solid var(--hairline); border-radius:12px; padding:9px 11px; margin-top:7px; }
+.place .pic { width:40px; height:40px; border-radius:8px; flex:none; display:grid; place-items:center; font-size:20px; }
+.place b { display:block; font-size:14.5px; font-weight:600; }
+.place span { display:block; font-size:12.5px; color:var(--ink2); line-height:1.35; }
+.home { background:var(--card); border:1px solid var(--hairline); border-radius:12px; margin-top:8px; }
+.home div { display:flex; justify-content:space-between; align-items:center; padding:8px 12px; border-top:1px solid var(--hairline); font-size:15px; }
+.home div:first-child { border-top:0; }
+.home .ok { color:var(--ok); font-weight:600; font-size:14px; }
+.home .warn { color:var(--staffInk); font-weight:600; font-size:14px; }
+.linkcard { display:flex; gap:10px; align-items:center; background:var(--card); border:1px solid var(--hairline); border-radius:12px; padding:9px 11px; margin-top:8px; }
+.linkcard .ic { width:34px; height:34px; border-radius:8px; background:#E8ECFB; color:#2F45C9; display:grid; place-items:center; font:600 15px ui-serif, Georgia, serif; flex:none; }
+.linkcard b { display:block; font-size:14px; font-weight:600; }
+.linkcard span { display:block; font-size:12px; color:var(--ink2); }
+.draft { background:var(--card); border:1px solid var(--hairline); border-radius:12px; padding:9px 12px; margin-top:8px; font-size:14px; line-height:1.4; }
+.draft .h { font-size:12px; color:var(--ink2); padding-bottom:6px; margin-bottom:6px; border-bottom:1px solid var(--hairline); }
+.draft .h b { color:var(--ink); font-weight:600; }
 `;
 
 const ICON_FACE = `<svg width="30" height="30" viewBox="0 0 30 30"><defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#2B54B8"/><stop offset="1" stop-color="#0A1640"/></linearGradient></defs><circle cx="15" cy="15" r="15" fill="url(#g)"/><rect x="8" y="11.5" width="5" height="7" rx="2.5" fill="#2AF2D4"/><rect x="17" y="11.5" width="5" height="7" rx="2.5" fill="#2AF2D4"/></svg>`;
@@ -301,6 +349,244 @@ function shoot(html, name, w, h, { transparent = false } = {}) {
   return png;
 }
 
+// ── Work scenes (getjori.ai/business) ───────────────────────────────────────
+//
+// A made-up work setup: Dana Reyes, head of partnerships at Fieldstone; the
+// client Harbor & Pine Logistics (Priya Natarajan, VP Operations, and Tom
+// Becker, COO); Leo Martin, Dana's colleague. "Today" is FIXED_NOW (Wed Nov 5).
+
+const WHO_WORK = "dana@fieldstone.example";
+const workTitles = new Map([
+  ["person_priya_natarajan", "Priya Natarajan"],
+  ["person_tom_becker", "Tom Becker"],
+  ["person_leo_martin", "Leo Martin"],
+  ["org_harbor_pine", "Harbor & Pine Logistics"],
+  ["project_harbor_pine_renewal", "Harbor & Pine renewal"],
+  ["meeting_2026-10-28_harbor_pine_qbr", "Harbor & Pine QBR · Oct 28"],
+  ["reference_security_questionnaire", "Security questionnaire"],
+  ["week_2026-11-02", "Week of Nov 2"],
+  ["project_pipeline_review", "Weekly pipeline review"],
+]);
+const workMd = (md) => render.renderMarkdown(md, { resolveLink: () => true, labelFor: (id) => workTitles.get(id) });
+const links = (ids, key) => ids.map((id) => ({ [key]: id }));
+const workPage = ({ id, type, description, mins, pinned = false, revs, topic, md, fwd, back, dark = false }) =>
+  wikiDoc(workTitles.get(id), portal.pageBody({
+    page: { id, type, title: workTitles.get(id), description, status: "active", pinned, updated_at: ago(mins), last_verified_at: "today" },
+    bodyHtml: workMd(md), titles: workTitles, revCount: revs, connected: false,
+    fwd: links(fwd, "dst_id"), back: links(back, "src_id"), topic,
+  }), { dark, active: null, who: WHO_WORK });
+
+const workPerson = workPage({
+  id: "person_priya_natarajan", type: "person", pinned: true, mins: 12, revs: 23,
+  topic: { slug: "people", name: "People" },
+  description: "VP Operations at Harbor & Pine Logistics. Decides the renewal. Short emails, Tuesday calls.",
+  md: `Runs operations at [[org_harbor_pine]]: 380 people, six warehouses. Reports to the COO, [[person_tom_becker]]. Met at a logistics summit in Chicago, May 2026.
+
+## What matters to her
+- Fewer late-shipment escalations. Her team loses Mondays to them.
+- One ask per email. Calls on Tuesday or Thursday, never Monday.
+- The rollout plan matters more to her than the price.
+
+## Interactions
+| When | Where | What |
+|---|---|---|
+| Oct 30 | Email | Asked whether the 6-site pricing includes Atlanta. |
+| Oct 28 | Zoom | QBR. Two-year renewal if rollout starts by January ([[meeting_2026-10-28_harbor_pine_qbr]]). |
+| Oct 21 | Slack | Shared the Q3 late-shipment report. |
+| Oct 9 | Call | Introduced Tom. Budget approved in principle. |
+| Sep 30 | LinkedIn | Congratulated her on the Atlanta opening. |
+
+## Open follow-ups
+- **You owe her** the revised 6-site pricing. Promised for Mon Nov 3: **2 days late**. A draft is ready.
+- **She owes you** the [[reference_security_questionnaire]]. Asked Oct 28. Jori nudges her Thursday.
+- **Next touch:** the kickoff date, once the contract is signed.`,
+  fwd: ["org_harbor_pine", "person_tom_becker", "meeting_2026-10-28_harbor_pine_qbr", "project_harbor_pine_renewal", "reference_security_questionnaire"],
+  back: ["project_harbor_pine_renewal", "meeting_2026-10-28_harbor_pine_qbr", "project_pipeline_review", "week_2026-11-02"],
+});
+
+const workMeeting = workPage({
+  id: "meeting_2026-10-28_harbor_pine_qbr", type: "meeting", mins: 60 * 24 * 8, revs: 3, dark: true,
+  topic: { slug: "meetings", name: "Meetings" },
+  description: "Zoom, Tue Oct 28, 2:00 to 2:45 PM. Priya Natarajan, Tom Becker, Dana Reyes, Leo Martin. Summarized from the recording.",
+  md: `## Summary
+Harbor & Pine will renew for two years if the rollout reaches all six warehouses by January. Price is not the blocker; the rollout plan is. Tom wants one named onboarding lead.
+
+## Decisions
+- Scope grows from 4 sites to 6, Atlanta included.
+- Kickoff the week of Jan 12.
+- [[person_leo_martin]] leads onboarding.
+
+## Action items
+| Owner | What | Due | Status |
+|---|---|---|---|
+| Dana | Revised pricing for 6 sites | Nov 3 | 2 days late, draft ready |
+| Leo | One-page rollout plan | Nov 7 | On track |
+| Priya | Security questionnaire | Nov 6 | Waiting |
+| Tom | Budget confirmed in writing | Nov 10 | Waiting |
+
+## Follow-ups Jori is watching
+- Nudges Priya Thursday if the questionnaire hasn't arrived.
+- Reminds Leo Friday morning about the rollout plan.
+- Books the kickoff once the contract is signed.`,
+  fwd: ["person_priya_natarajan", "person_tom_becker", "person_leo_martin", "project_harbor_pine_renewal", "reference_security_questionnaire"],
+  back: ["person_priya_natarajan", "project_harbor_pine_renewal", "week_2026-11-02"],
+});
+
+const workProject = workPage({
+  id: "project_harbor_pine_renewal", type: "project", pinned: true, mins: 30, revs: 31,
+  topic: { slug: "projects", name: "Projects" },
+  description: "Two-year renewal, six sites, $184k a year. Target signature Fri Nov 21.",
+  md: `**On track, one item late.** Last movement: the QBR on Oct 28 ([[meeting_2026-10-28_harbor_pine_qbr]]).
+
+## Next steps
+| Step | Owner | Due | |
+|---|---|---|---|
+| Revised pricing to Priya | Dana | Nov 3 | Late |
+| Security questionnaire back | Priya | Nov 6 | Waiting |
+| One-page rollout plan | Leo | Nov 7 | On track |
+| Contract out for signature | Dana | Nov 14 | |
+| Signed | Tom | Nov 21 | |
+
+## Risks
+- The pricing is late. Priya answers fastest on Tuesdays.
+- Nothing from [[person_tom_becker]] since Oct 9. Copy him on the pricing email.
+
+## Timeline
+- **Oct 28** QBR: six sites, kickoff week of Jan 12.
+- **Oct 9** Budget approved in principle.
+- **Sep 12** First call with [[person_priya_natarajan]].`,
+  fwd: ["person_priya_natarajan", "person_tom_becker", "person_leo_martin", "meeting_2026-10-28_harbor_pine_qbr", "reference_security_questionnaire"],
+  back: ["person_priya_natarajan", "meeting_2026-10-28_harbor_pine_qbr", "project_pipeline_review", "week_2026-11-02"],
+});
+
+const AV = ICON_FACE.replace("<svg", '<svg class="av"');
+const workAfterMeeting = `${NAV}<div class="thread">
+<div class="sep">Tue Oct 28, 2:47 PM</div>
+<div class="row jori"><div class="spacer"></div><div class="b j1" style="max-width:330px"><b>Harbor &amp; Pine QBR just ended.</b> 45 minutes on Zoom with Priya and Tom.
+<ul>
+<li><i>✅</i><span>Two-year renewal, six sites.</span></li>
+<li><i>📅</i><span>Kickoff the week of Jan 12.</span></li>
+<li><i>📝</i><span>4 action items. Yours: revised pricing by Monday.</span></li>
+</ul>
+<div class="linkcard"><div class="ic">J</div><div><b>Harbor &amp; Pine QBR · Oct 28</b><span>Summary, decisions, action items</span></div></div></div></div>
+<div class="gap"></div>
+<div class="row me"><div class="b">Remind Leo about the rollout plan Friday.</div></div>
+<div class="gap"></div>
+<div class="row jori">${AV}<div class="b j1">Done: Friday 9 AM, on Slack. I'll nudge Priya Thursday if the security questionnaire isn't in, and I've added Tom to the people page.</div></div>
+</div>${COMPOSER}`;
+
+const workFollowUps = `${NAV}<div class="thread">
+<div class="sep">Today 8:30 AM</div>
+<div class="row jori"><div class="spacer"></div><div class="b j1" style="max-width:330px"><b>Follow-ups for today</b>
+<ul>
+<li><i>⚠️</i><span>Pricing to Priya, promised Monday. 2 days late.</span></li>
+<li><i>⏳</i><span>Priya's questionnaire, asked a week ago.</span></li>
+<li><i>🔇</i><span>No word from Tom Becker in 4 weeks.</span></li>
+</ul></div></div>
+<div class="row jori">${AV}<div class="b j2" style="max-width:330px">I drafted the pricing email from the QBR notes:
+<div class="draft"><div class="h">To <b>Priya Natarajan</b> · Cc <b>Tom Becker</b></div>Priya, here's the pricing for all six sites, Atlanta included. Sorry it's a couple of days late…</div>
+<div class="card"><div class="wait">✦ Waiting for your answer</div>
+<div class="opt rec"><span class="n">1</span><div><div class="l">Send it now<em>Recommended</em></div><div class="d">Copies Tom, who's gone quiet.</div></div></div>
+<div class="opt"><span class="n">2</span><div><div class="l">Snooze to Tuesday</div><div class="d">Priya answers fastest then.</div></div></div>
+</div></div></div>
+</div>${COMPOSER}`;
+
+// ── Personal scenes (getjori.ai/personal) ──────────────────────────────────
+
+const moneyPage = wikiDoc("Money · November", portal.pageBody({
+  page: { id: "money_2026-11", type: "money", title: "Money · November", description: "Where it went, what's coming up, and what changed. From read-only bank and card sync.", status: "active", pinned: true, updated_at: ago(45), last_verified_at: "today" },
+  bodyHtml: render.renderMarkdown(`**Net worth** $412,300, up $3,400 this month. **Spent** $4,120 so far, against a usual $4,400.
+
+## Spending vs usual
+| | This month | Usual |
+|---|---|---|
+| Groceries | $640 | $700 |
+| Dining out | $520 | $410 |
+| Travel | $1,284 | $300 |
+| Subscriptions | $142 | $118 |
+
+## Worth a look
+- **New subscription:** StreamBox, $23.99 a month since Nov 2, not opened since. Jori asked whether to cancel.
+- **Charged twice:** Corner Hardware, $46.20 on Nov 3. A dispute is drafted.
+- **Dining out** is $110 over usual: two birthday dinners.
+
+## Coming up
+| Due | Bill | Amount |
+|---|---|---|
+| Nov 12 | Rent | $3,200 |
+| Nov 15 | Travel card, autopay | $1,912 |
+| Nov 20 | Electric | about $96 |`, { resolveLink: () => true }),
+  titles: new Map([["project_lisbon_trip", "Lisbon in March"], ["reference_cards", "Cards & accounts"], ["feedback_purchases", "Purchases need Face ID"], ["week_2026-11-02", "Week of Nov 2"]]),
+  revCount: 41, connected: false,
+  fwd: links(["reference_cards", "project_lisbon_trip", "feedback_purchases"], "dst_id"),
+  back: links(["week_2026-11-02", "project_lisbon_trip"], "src_id"),
+  topic: { slug: "money", name: "Money" },
+}), { active: null });
+
+const chat = (sep, body) => `${NAV}<div class="thread"><div class="sep">${sep}</div>${body}</div>${COMPOSER}`;
+const jori = (html, { first = true, avatar = false, wide = true } = {}) =>
+  `<div class="row jori">${avatar ? AV : '<div class="spacer"></div>'}<div class="b ${first ? "j1" : "j2"}"${wide ? ' style="max-width:330px"' : ""}>${html}</div></div>`;
+const me = (text) => `<div class="gap"></div><div class="row me"><div class="b">${text}</div></div><div class="gap"></div>`;
+const choice = (opts) => `<div class="card"><div class="wait">✦ Waiting for your answer</div>${opts
+  .map(([l, d, rec], i) => `<div class="opt${rec ? " rec" : ""}"><span class="n">${i + 1}</span><div><div class="l">${l}${rec ? "<em>Recommended</em>" : ""}</div><div class="d">${d}</div></div></div>`)
+  .join("")}</div>`;
+
+const pMoney = chat("Sunday 9:00 AM",
+  jori(`<b>Your week in money</b><ul>
+<li><i>💳</i><span>Spent $1,040, about usual.</span></li>
+<li><i>✈️</i><span>Lisbon flights booked, $1,284.</span></li>
+<li><i>⚠️</i><span>Corner Hardware charged you twice. Dispute drafted.</span></li>
+<li><i>📈</i><span>Net worth up 0.8%.</span></li></ul>`) +
+  jori(`StreamBox started billing $23.99 a month on Nov 2, and nobody has opened it since.${choice([["Cancel it", "Saves $288 a year.", true], ["Keep it", "I'll ask again in a month."]])}`, { first: false, avatar: true }));
+
+const pTrip = chat("Sat Mar 14, 8:05 AM",
+  jori(`<b>Saturday in Lisbon.</b> Sunny, 66°.<div class="plan">
+<div><b>9:30</b><span>Príncipe Real garden market, 8 min walk.</span></div>
+<div><b>11:00</b><span>Tram 28 up to Graça, before the lines.</span></div>
+<div><b>1:00</b><span>Lunch at Taberna do Largo: grilled fish, walk-in, where locals eat.</span></div>
+<div><b>5:30</b><span>Miradouro da Graça. Sunset 6:42.</span></div></div>`) +
+  me("Swap lunch for somewhere with a view?") +
+  jori(`Café do Rio: terrace over the river, walk-ins until 2, the fish is just as good and about $8 more a head. Swapped, and the walk from Graça is 14 minutes downhill.`, { avatar: true }));
+
+const pDinner = chat("Thursday 5:10 PM",
+  jori(`<b>Friday, before the 8 PM show.</b> Three places within 6 minutes of the theater:
+<div class="place"><div class="pic" style="background:#FDE8D8">🍝</div><div><b>Nonna Bea · Italian · 4 min</b><span>Fresh pasta, fast. You loved their sister place.</span></div></div>
+<div class="place"><div class="pic" style="background:#E3ECF8">🍣</div><div><b>Sora · Japanese · 6 min</b><span>Counter seats. Walk in by 6:15.</span></div></div>
+<div class="place"><div class="pic" style="background:#E5F2E3">🥗</div><div><b>Fig &amp; Fennel · Mediterranean · 5 min</b><span>Jordan's pick last time. No oysters on the menu.</span></div></div>`) +
+  me("Nonna Bea. Get us a table at 6.") +
+  jori(`Booked: Nonna Bea, Friday 6:00, table for two. It's on your calendar with a 7:40 leave-by.`, { avatar: true }));
+
+const pTickets = chat("Today 11:02 AM",
+  jori(`<b>🎟️ The Lumen Quartet</b> just announced Ridgeway Hall, Sat Feb 7. You've seen them twice. Presale is tomorrow at 10.`) +
+  jori(`Also on your watchlist:<ul>
+<li><i>🎤</i><span>Mara Kent added a late show Dec 12, a 140-seat room.</span></li>
+<li><i>📺</i><span>Season 3 of <i style="width:auto">Night Shift</i> drops Friday.</span></li></ul>
+<div style="margin-top:8px">Want me to grab two at presale?</div>${choice([["Orchestra, about $95 each", "Rows K to P: best view for the price.", true], ["Balcony front row, about $70", "Good sound, farther away."]])}`, { first: false, avatar: true }));
+
+const pHome = chat("Today 8:41 AM",
+  jori(`Looks like you're both heading out. I set the place to away:<div class="home">
+<div><span>🔒 Front door</span><span class="ok">Locked</span></div>
+<div><span>❄️ Air conditioning</span><span class="ok">78° away</span></div>
+<div><span>💡 Lights</span><span class="ok">All off</span></div>
+<div><span>🐶 Biscuit cam</span><span class="ok">On</span></div>
+<div><span>💧 Leak sensor, kitchen</span><span class="warn">Offline</span></div></div>`) +
+  me("What's up with the leak sensor?") +
+  jori(`Its battery died at 2 AM; the last reading was dry. I added AAA batteries to the grocery list and I'll check it reports again once they're in.`, { avatar: true }));
+
+// ── Stamp ───────────────────────────────────────────────────────────────────
+
+const crypto = require("crypto");
+const stamp = crypto.createHash("sha256")
+  .update([wikiHome, wikiAnswer, wikiPage, appDoc([chatThread]), appDoc([approval]), workPerson, workMeeting, workProject, appDoc([workAfterMeeting]), appDoc([workFollowUps]), moneyPage, ...[pMoney, pTrip, pDinner, pTickets, pHome].map((x) => appDoc([x])), FRAME_CSS, fs.readFileSync(__filename, "utf8")].join("\u0000"))
+  .digest("hex");
+if (CHECK) {
+  let have = "";
+  try { have = fs.readFileSync(STAMP, "utf8").trim(); } catch {}
+  if (have === stamp) process.exit(0);
+  console.error("screenshots are stale: run node scripts/screenshots/build.cjs");
+  process.exit(1);
+}
+
 fs.mkdirSync(OUT, { recursive: true });
 const raw = {
   home: shoot(wikiHome, "raw-wiki-home", 1280, 900),
@@ -308,6 +594,12 @@ const raw = {
   page: shoot(wikiPage, "raw-wiki-page", 1280, 900),
   chat: shoot(appDoc([chatThread]), "raw-app-chat", 610, 1060, { transparent: true }),
   approval: shoot(appDoc([approval]), "raw-app-approval", 610, 1060, { transparent: true }),
+  workPerson: shoot(workPerson, "raw-work-person", 1280, 900),
+  workMeeting: shoot(workMeeting, "raw-work-meeting", 1280, 900),
+  workProject: shoot(workProject, "raw-work-project", 1280, 900),
+  workMeetingApp: shoot(appDoc([workAfterMeeting]), "raw-work-app-meeting", 610, 1060, { transparent: true }),
+  workFollowApp: shoot(appDoc([workFollowUps]), "raw-work-app-followups", 610, 1060, { transparent: true }),
+  money: shoot(moneyPage, "raw-money", 1280, 900),
 };
 const URL = "memory.example.com";
 const out = {
@@ -317,7 +609,19 @@ const out = {
   "app-chat.png": raw.chat,
   "app-approval.png": raw.approval,
   "app-pair.png": shoot(appDoc([chatThread, approval]), "app-pair", 1096, 1060, { transparent: true }),
+  "work-person.png": shoot(frameDoc(browser(raw.workPerson, `${URL}/p/person_priya_natarajan`)), "work-person", 1460, 1120, { transparent: true }),
+  "work-meeting.png": shoot(frameDoc(browser(raw.workMeeting, `${URL}/p/meeting_2026-10-28_harbor_pine_qbr`, true)), "work-meeting", 1460, 1120, { transparent: true }),
+  "work-project.png": shoot(frameDoc(browser(raw.workProject, `${URL}/p/project_harbor_pine_renewal`)), "work-project", 1460, 1120, { transparent: true }),
+  "work-app-meeting.png": raw.workMeetingApp,
+  "work-app-followups.png": raw.workFollowApp,
+  "work-app-pair.png": shoot(appDoc([workAfterMeeting, workFollowUps]), "work-app-pair", 1096, 1060, { transparent: true }),
+  "work-showcase.png": shoot(frameDoc(`<div class="show">${browser(raw.workPerson, URL)}<div class="ph"><img src="${raw.workFollowApp}"></div></div>`), "work-showcase", 1700, 1180, { transparent: true }),
+  "personal-money.png": shoot(frameDoc(browser(raw.money, `${URL}/p/money_2026-11`)), "personal-money", 1460, 1120, { transparent: true }),
+  "personal-app-money-home.png": shoot(appDoc([pMoney, pHome]), "personal-app-money-home", 1096, 1060, { transparent: true }),
+  "personal-app-trip-dinner.png": shoot(appDoc([pTrip, pDinner]), "personal-app-trip-dinner", 1096, 1060, { transparent: true }),
+  "personal-app-tickets.png": shoot(appDoc([pTickets]), "personal-app-tickets", 610, 1060, { transparent: true }),
   "showcase.png": shoot(frameDoc(`<div class="show">${browser(raw.home, URL)}<div class="ph"><img src="${raw.chat}"></div></div>`), "showcase", 1700, 1180, { transparent: true }),
 };
 for (const [name, src] of Object.entries(out)) fs.copyFileSync(src, path.join(OUT, name));
+if (OUT === path.dirname(STAMP)) fs.writeFileSync(STAMP, stamp + "\n");
 console.log(`wrote ${Object.keys(out).length} images to ${path.relative(ROOT, OUT)} (work dir ${WORK})`);
