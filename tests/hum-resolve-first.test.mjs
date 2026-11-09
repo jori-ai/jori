@@ -21,7 +21,7 @@ import { fileURLToPath } from "node:url";
 import {
   laneOf, kindOf, isPrivateLane, validateVerdict, decideAction, resolveFirst, buildPrompt,
   logRow, rememberIfSettled, writeCaptureArtifacts, readSidecar, sidecarPath,
-  loadOverlaySources, gatherEvidence,
+  loadOverlaySources, gatherEvidence, taskIdFor, checkTaskLive, taskLiveFor,
 } from "../lib/hum-resolve-first.mjs";
 import { resolvedKeys, recentResolved, forgetResolved, recordResolved } from "../lib/hum-resolve-first-store.mjs";
 import { preRankFilter } from "../lib/hum-vetoes.mjs";
@@ -411,4 +411,76 @@ test("CLI: forget writes a withdraw row", () => {
   });
   assert.equal(r.status, 0, r.stderr);
   assert.equal(JSON.parse(fs.readFileSync(store, "utf8")).forget, "idea-jordan");
+});
+
+// ── a message built on a Google Task: live check of the task itself ───────
+const tlOk = (task) => async () => ({ ok: true, out: JSON.stringify({ task }), err: "" });
+const tlFail = (err) => async () => ({ ok: false, out: "", err });
+
+test("task id: direct from the finding, or via the idea's own ledger row", () => {
+  const dir = tmp(); const file = path.join(dir, "hum-ideas.jsonl");
+  fs.writeFileSync(file, [
+    JSON.stringify({ id: "idea-1", supporting_data: { task_id: "T1" } }),
+    JSON.stringify({ id: "idea-1", consumed: true }),
+    JSON.stringify({ id: "idea-2", supporting_data: {} }),
+  ].join("\n"));
+  assert.equal(taskIdFor({ finding: { supporting_data: { task_id: "TX" } } }, { reservoirFile: file }), "TX");
+  assert.equal(taskIdFor({ dedup_key: "idea-1" }, { reservoirFile: file }), "T1");
+  assert.equal(taskIdFor({ dedup_key: "idea-2" }, { reservoirFile: file }), null);
+  assert.equal(taskIdFor({ dedup_key: "nearby:x" }, { reservoirFile: file }), null);
+  assert.equal(taskIdFor(null, { reservoirFile: file }), null);
+});
+
+test("live state: open, completed, deleted, 404, and everything else fails open", async () => {
+  assert.equal((await checkTaskLive("T", { run: tlOk({ id: "T", status: "needsAction", title: "x" }) })).state, "open");
+  assert.equal((await checkTaskLive("T", { run: tlOk({ id: "T", status: "completed", title: "x" }) })).state, "closed");
+  assert.equal((await checkTaskLive("T", { run: tlOk({ id: "T", status: "needsAction", deleted: true }) })).state, "gone");
+  assert.equal((await checkTaskLive("T", { run: tlFail("Google API error (404 notFound): Not Found") })).state, "gone");
+  assert.equal((await checkTaskLive("T", { run: tlFail("Google API error (400 invalid): Invalid task ID") })).state, "unknown");
+  assert.equal((await checkTaskLive("T", { run: tlFail("ETIMEDOUT") })).state, "unknown");
+  assert.equal((await checkTaskLive("T", { run: async () => ({ ok: true, out: "not json", err: "" }) })).state, "unknown");
+  assert.equal((await checkTaskLive("", { run: tlOk({}) })).state, "unknown");
+  assert.equal((await taskLiveFor({ dedup_key: "nearby:x" })).state, "unknown");
+});
+
+const tlInput = (finding) => ({
+  message: "Have you picked a provider for the course?", intent: "hum:ideas:question",
+  context: { kind: "question", lane: "ideas", dedup_key: "idea-1", finding },
+});
+const TL_FINDING = { dedup_key: "idea-1", supporting_data: { task_id: "T1" } };
+const tlNever = async () => { throw new Error("the model pass must not run"); };
+
+test("resolveFirst drops a message whose task was deleted or completed, before any model read", async () => {
+  for (const state of ["gone", "closed"]) {
+    const d = await resolveFirst(tlInput(TL_FINDING), {
+      killSwitch: false, gather: tlNever, model: tlNever,
+      taskLive: async () => ({ state, title: "Schedule the course", task_id: "T1" }),
+    });
+    assert.equal(d.action, "drop");
+    assert.equal(d.verdict, "resolved");
+    assert.equal(d.dedup_key, "idea-1");
+    assert.deepEqual(d.sources, ["tasks"]);
+    assert.ok(d.answer.includes(state === "gone" ? "was removed" : "is already done"));
+  }
+});
+
+test("resolveFirst leaves an open or unknowable task to the normal pass", async () => {
+  for (const state of ["open", "unknown"]) {
+    let gathered = false;
+    const d = await resolveFirst(tlInput(TL_FINDING), {
+      killSwitch: false,
+      gather: async () => { gathered = true; return [{ id: "tasks", text: "x" }]; },
+      model: async () => ({ out: JSON.stringify({ verdict: "nothing_to_resolve", sources: [] }), error: null }),
+      taskLive: async () => ({ state, task_id: "T1" }),
+    });
+    assert.equal(gathered, true);
+    assert.equal(d.action, "send");
+  }
+  // a throwing lookup fails open too
+  const d = await resolveFirst(tlInput(TL_FINDING), {
+    killSwitch: false, gather: async () => [{ id: "tasks", text: "x" }],
+    model: async () => ({ out: JSON.stringify({ verdict: "nothing_to_resolve", sources: [] }), error: null }),
+    taskLive: async () => { throw new Error("boom"); },
+  });
+  assert.equal(d.action, "send");
 });
