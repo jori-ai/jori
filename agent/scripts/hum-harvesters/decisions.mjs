@@ -22,15 +22,24 @@
 import { readStdinJson, emit, emitNull, emitNoop, stampRun } from "./_common.mjs";
 import { nextDecision } from "../../../lib/decision-queue.mjs";
 import { userTz } from "../../../lib/hum-events.mjs";
-import { loadOpen, SELF_ASKED } from "../../../lib/decision-queue.mjs";
+import { loadOpen, SELF_ASKED, withoutHeld } from "../../../lib/decision-queue.mjs";
+import { wikiSettledKeys } from "../../../lib/hum-vetoes.mjs";
+import { resolvedKeys } from "../../../lib/hum-resolve-first-store.mjs";
 import { reportBacklog, currentScale, recentlyOffered } from "../../../lib/question-pacing.mjs";
 
 await readStdinJson();
 
 try {
   // Cards a job sends itself (the finance review) are not this lane's backlog.
-  const items = loadOpen().filter((it) => !SELF_ASKED.has(it.source));
+  let items = loadOpen().filter((it) => !SELF_ASKED.has(it.source));
   reportBacklog("decisions", items.length);
+  // Skip what the pre-rank filter already holds as settled (wiki_settled within
+  // 7 days, or resolved_first): re-emitting it only burns the slot again.
+  // Fail open: an unreadable ledger holds nothing back.
+  try {
+    const held = new Set([...wikiSettledKeys().keys(), ...resolvedKeys().keys()]);
+    items = withoutHeld(items, held);
+  } catch { /* fail open */ }
   // More than one a day per pacing group when the question backlog is long.
   // One offered in the last few hours and held steps aside for the rest
   // (nextDecision orders by importance, so it is left out, not moved back).
