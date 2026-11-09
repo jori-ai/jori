@@ -109,6 +109,17 @@
   .plug-side p { color:var(--muted); font-size:15px; margin-top:14px; }
   @media (max-width:900px) { .steps { grid-template-columns:1fr 1fr; } .plug-grid { grid-template-columns:1fr; } }
   @media (max-width:560px) { .alt, .steps, .chips { grid-template-columns:1fr; } .term code { font-size:13px; } }
+  section.see { padding:56px 0; border-top:1px solid var(--line); }
+  section.see h2 { font-family:Fraunces, Georgia, serif; font-weight:600; font-size:clamp(32px, 5vw, 48px); line-height:1.05; }
+  section.see .sub { color:var(--muted); margin:12px 0 28px; max-width:660px; }
+  section.see img { display:block; width:100%; height:auto; }
+  .shots { display:grid; grid-template-columns:1.25fr .75fr; gap:28px; margin-top:28px; align-items:start; }
+  .shots.two { grid-template-columns:1fr 1fr; }
+  .shots figure { margin:0; }
+  .shots figcaption { color:var(--muted); font-size:14.5px; margin-top:8px; padding:0 4%; }
+  .shots figcaption b { color:var(--ink); font-weight:600; }
+  .shots .wide { grid-column:1 / -1; }
+  @media (max-width:760px) { .shots, .shots.two { grid-template-columns:1fr; } .shots .phone-shot img { max-width:340px; margin:0 auto; } }
 </style>
 </head>
 <body>
@@ -157,6 +168,20 @@
         <h3>A Mac mini or a small cloud VM.</h3>
         <p>A Mac mini in the corner works, and so does a Linux VM you rent for a few dollars a month. Either way it's your machine: the agent, its memory and everything it learns about you live on a box you control and can wipe, not in an agent vendor's cloud.</p>
       </div>
+    </div>
+  </section>
+
+  <section class="see" id="see">
+    <h2>A week with Jori.</h2>
+    <p class="sub">A sample household: Sam, Jordan and their dog Biscuit. Money, trips, tables, tickets and the home, all in one place. These screens are simulated with made-up data.</p>
+    <div class="shots">
+      <figure><img src="/img/personal-money.png?v=3" alt="A memory page for the month's money: net worth, spending against usual, charges worth a look and upcoming bills" width="1460" height="1120" loading="lazy"><figcaption><b>Money, watched.</b> Spending against your usual, odd charges caught, bills coming up. Read-only.</figcaption></figure>
+      <figure class="phone-shot"><img src="/img/personal-app-tickets.png?v=3" alt="Jori reporting a concert announcement, a comedy show and a new TV season, and offering to buy presale tickets" width="610" height="1060" loading="lazy"><figcaption><b>Shows you'd want.</b> Concerts, comedy and new seasons, with the best seats for the price.</figcaption></figure>
+    </div>
+    <div class="shots two">
+      <figure><img src="/img/personal-app-trip-dinner.png?v=3" alt="Two phone screens: a Saturday plan in Lisbon with a lunch swapped for one with a view, and three dinner picks near a theater with a table booked" width="1096" height="1060" loading="lazy"><figcaption><b>Trips and tables.</b> A day planned around the weather, places locals eat, and the booking made.</figcaption></figure>
+      <figure><img src="/img/personal-app-money-home.png?v=3" alt="Two phone screens: the week in money with a subscription to cancel, and the home set to away with a leak sensor that went offline" width="1096" height="1060" loading="lazy"><figcaption><b>The week and the house.</b> A Sunday money check, and the home locked up when you leave.</figcaption></figure>
+      <figure class="wide"><img src="/img/wiki-page.png?v=3" alt="A memory page for a Lisbon trip, in dark mode, with flights, where to stay and linked pages" width="1460" height="1120" loading="lazy"><figcaption><b>Every trip, on one page.</b> Flights, fares watched, where to stay and where to eat, kept up to date.</figcaption></figure>
     </div>
   </section>
 
