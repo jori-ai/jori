@@ -11,9 +11,17 @@
 // (apps/companion/Jori/DesignSystem.swift: cobalt = you, slate = Jori,
 // gold = "Jori is waiting on you").
 //
-// Usage: node scripts/screenshots/build.cjs [--out site/img]
-// Needs Google Chrome (headless). Under a sandbox that blocks Chrome, run it
-// unsandboxed.
+// Usage: node scripts/screenshots/build.cjs [--out site/img]   rebuild the PNGs
+//        node scripts/screenshots/build.cjs --check             exit 1 if stale
+// Needs Google Chrome (headless) to rebuild; --check needs only node. Under a
+// sandbox that blocks Chrome, run it unsandboxed.
+//
+// Staleness: every mockup page is generated here, deterministically (the clock
+// is frozen at FIXED_NOW), so a hash of the generated HTML says whether the
+// images still match the code. The hash is kept in site/img/.stamp; the
+// pre-push hook (githooks/pre-push) runs --check and rebuilds when it differs,
+// e.g. after a change to lib/wiki-render.js, lib/wiki-portal.js, the app's
+// palette in DesignSystem.swift, or this file.
 
 "use strict";
 
@@ -28,14 +36,20 @@ const portal = require(path.join(ROOT, "lib/wiki-portal.js"));
 
 const outArg = process.argv.indexOf("--out");
 const OUT = path.resolve(ROOT, outArg > 0 ? process.argv[outArg + 1] : "site/img");
-const WORK = fs.mkdtempSync(path.join(os.tmpdir(), "jori-shots-"));
+const CHECK = process.argv.includes("--check");
+const STAMP = path.join(ROOT, "site/img/.stamp");
+const WORK = CHECK ? null : fs.mkdtempSync(path.join(os.tmpdir(), "jori-shots-"));
 const CHROME = process.env.CHROME || "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
 
 portal.setAssistant("Jori", "it/its");
 
 // ── Sample memory ───────────────────────────────────────────────────────────
 
-const now = Date.now();
+// A frozen clock, so the pages (relative times, the days strip) are the same on
+// every run and the stamp only changes when the code does.
+const FIXED_NOW = Date.parse("2026-11-05T14:00:00Z");
+Date.now = () => FIXED_NOW;
+const now = FIXED_NOW;
 const ago = (mins) => new Date(now - mins * 60000).toISOString();
 const P = (id, type, title, description, mins, extra = {}) => ({ id, type, title, description, status: "active", updated_at: ago(mins), ...extra });
 
@@ -155,8 +169,22 @@ const wikiPage = wikiDoc("Lisbon in March", lisbonBody, { dark: true, active: nu
 
 // ── App mockups ─────────────────────────────────────────────────────────────
 
+// The app's light-mode colours, read from DesignSystem.swift so a palette
+// change there reaches the mockups (and the stamp). Falls back to the values
+// below if a name is missing.
+function appPalette() {
+  const want = { cobalt: "#2F5BD3", staff: "#D98E12", staffWash: "#FFF3D9", staffInk: "#8F5600", slate: "#EEF0F4", slateRaised: "#E3E6EC", hairline: "#D7DBE3", confirmed: "#1F8F4E", deny: "#D93A33" };
+  let src = "";
+  try { src = fs.readFileSync(path.join(ROOT, "apps/companion/Jori/DesignSystem.swift"), "utf8"); } catch {}
+  for (const name of Object.keys(want)) {
+    const m = src.match(new RegExp(`static let ${name} = dynamic\\(light: 0x([0-9A-Fa-f]{6})`)); // lang-regex-ok: reads a hex literal out of Swift source (structure)
+    if (m) want[name] = `#${m[1].toUpperCase()}`;
+  }
+  return Object.entries(want).map(([k, v]) => `--${k === "confirmed" ? "ok" : k}:${v};`).join(" ");
+}
+
 const APP_CSS = `
-:root { --cobalt:#2F5BD3; --staff:#D98E12; --staffWash:#FFF3D9; --staffInk:#8F5600; --slate:#EEF0F4; --slateRaised:#E3E6EC; --hairline:#D7DBE3; --ok:#1F8F4E; --deny:#D93A33; --canvas:#FFFFFF; --grouped:#F2F2F7; --card:#FFFFFF; --ink:#111318; --ink2:#6B7280; }
+:root { ${appPalette()} --canvas:#FFFFFF; --grouped:#F2F2F7; --card:#FFFFFF; --ink:#111318; --ink2:#6B7280; }
 * { box-sizing:border-box; margin:0; }
 html, body { background:transparent; }
 body { font:17px/1.35 -apple-system, system-ui, "SF Pro Text", sans-serif; color:var(--ink); -webkit-font-smoothing:antialiased; display:flex; gap:56px; padding:90px; }
@@ -301,6 +329,20 @@ function shoot(html, name, w, h, { transparent = false } = {}) {
   return png;
 }
 
+// ── Stamp ───────────────────────────────────────────────────────────────────
+
+const crypto = require("crypto");
+const stamp = crypto.createHash("sha256")
+  .update([wikiHome, wikiAnswer, wikiPage, appDoc([chatThread]), appDoc([approval]), FRAME_CSS, fs.readFileSync(__filename, "utf8")].join("\u0000"))
+  .digest("hex");
+if (CHECK) {
+  let have = "";
+  try { have = fs.readFileSync(STAMP, "utf8").trim(); } catch {}
+  if (have === stamp) process.exit(0);
+  console.error("screenshots are stale: run node scripts/screenshots/build.cjs");
+  process.exit(1);
+}
+
 fs.mkdirSync(OUT, { recursive: true });
 const raw = {
   home: shoot(wikiHome, "raw-wiki-home", 1280, 900),
@@ -320,4 +362,5 @@ const out = {
   "showcase.png": shoot(frameDoc(`<div class="show">${browser(raw.home, URL)}<div class="ph"><img src="${raw.chat}"></div></div>`), "showcase", 1700, 1180, { transparent: true }),
 };
 for (const [name, src] of Object.entries(out)) fs.copyFileSync(src, path.join(OUT, name));
+if (OUT === path.dirname(STAMP)) fs.writeFileSync(STAMP, stamp + "\n");
 console.log(`wrote ${Object.keys(out).length} images to ${path.relative(ROOT, OUT)} (work dir ${WORK})`);

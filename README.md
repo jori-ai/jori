@@ -25,7 +25,7 @@ Most assistants wait. You type, they reply, the moment passes. Jori stays on. It
 </tr>
 </table>
 
-<sub>Simulated screens with a made-up household (Sam, Jordan and their dog Biscuit). Regenerate with <code>node scripts/screenshots/build.cjs</code>.</sub>
+<sub>Simulated screens with a made-up household (Sam, Jordan and their dog Biscuit). Rebuilt by <code>node scripts/screenshots/build.cjs</code>, which the pre-push hook runs whenever the UI they show has changed.</sub>
 
 ---
 
