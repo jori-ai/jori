@@ -32,7 +32,7 @@ const require = createRequire(import.meta.url);
 // another zone, or a fresh install, reads them the same.
 process.env.JORI_TZ = "America/New_York";
 const ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
-const { applySpineVerdicts, mergeTouchingSameName, mergeSplitVisits, reclaimMisplacedPhotos, applyVisitCompanions,
+const { applySpineVerdicts, mergeTouchingSameName, mergeSplitVisits, reclaimMisplacedPhotos, applyVisitCompanions, pruneShrunkCompanions,
         overlayConfirmedVisits, reclaimTargetIds, extendThroughSilence, mergeDuplicateStops } =
   require(path.join(ROOT, "lib/resolve-day.js"))._internal;
 
@@ -335,4 +335,30 @@ test("a visit row that grazes a stop for seconds gives it no people; one that ho
   process.env.JORI_ROW_GRAZE = "0";
   try { applyVisitCompanions(off, [flat]); } finally { delete process.env.JORI_ROW_GRAZE; }
   assert.deepEqual(off[0].companions, ["Visitor"]);
+});
+
+// A visitor staying at the flat is on the stops either side of the morning coffee, and the
+// coffee stop shrank after it took the flat's row. The bracket kept him there; the coffee's
+// own visit row, which names who went, says he did not.
+test("the bracket does not put a name on a stop whose own visit row lists others without it", () => {
+  const iso = (hms) => new Date(U(hms)).toISOString();
+  const row = (from, to, who, e) => ({ arrived_at: iso(from), departed_at: iso(to), ...LLR(e, 0), companions: who });
+  const build = () => {
+    const prev = stop("night", "The Flat", "00:00:00", "13:12:00", { ...LL(0, 0), companions: ["Visitor"] });
+    const cafe = stop("cafe", "Corner Cafe", "13:15:25", "14:00:30", { ...LL(260, 0), companions: ["Visitor", "Pat"],
+      companion_merge_window: { start_ts_ms: U("13:15:25"), end_ts_ms: U("14:12:00"), lat: LL(260, 0).lat, lon: LL(260, 0).lon } });
+    const next = stop("day", "The Flat", "14:03:00", "23:00:00", { ...LL(0, 0), companions: ["Visitor"] });
+    return [prev, cafe, next];
+  };
+  const flatRow = row("14:05:15", "23:00:00", ["Visitor"], 0);
+  const withOwn = build();
+  pruneShrunkCompanions(withOwn, [row("13:15:25", "14:00:30", ["Pat"], 260), flatRow]);
+  assert.deepEqual(withOwn[1].companions, ["Pat"], "the cafe's own row lists Pat alone");
+  const noOwn = build();
+  pruneShrunkCompanions(noOwn, [row("13:15:25", "14:00:30", [], 260), flatRow]);
+  assert.deepEqual(noOwn[1].companions, ["Visitor", "Pat"], "a row with no people says nothing: the bracket stands");
+  const off = build();
+  process.env.JORI_BRACKET_OWN_ROW = "0";
+  try { pruneShrunkCompanions(off, [row("13:15:25", "14:00:30", ["Pat"], 260), flatRow]); } finally { delete process.env.JORI_BRACKET_OWN_ROW; }
+  assert.deepEqual(off[1].companions, ["Visitor", "Pat"]);
 });
