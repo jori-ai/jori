@@ -18,9 +18,14 @@ bin/job-run --name watchlist-discover --tier ops -- \
 ```
 
 That is the whole job. Do not wait for it, do not add a `--notify-task`: the run script
-handles its own outcome — it calls `bin/watch-discover` (model proposes, code enforces
-every add rule; see that file's header and `agent/watchlist-rules.md`) and sends one
-phone pointer only if something was added. A one-line ack in your turn is enough.
+handles its own outcome — it calls `bin/watch-discover` (a TMDB sweep of new series on the
+configured services plus the model's web search propose; code enforces every add rule; see
+that file's header and `agent/watchlist-rules.md`) and sends one phone pointer only if
+something was added. A one-line ack in your turn is enough.
+
+The daily `screen` hum lane runs the same pipeline (21-day model window, max 4) every day,
+TMDB sweep included, so this monthly pass is the wide model search (60 days, up to 12, medium
+effort), not the only safety net.
 
 ## Why it goes through you
 

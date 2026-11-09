@@ -53,6 +53,15 @@ test("judgeFit: keep/drop from decide, legacy batch called once, fails closed", 
   assert.equal(boom[0].keep, false);
 });
 
+test("judgeFit: a title the batch judgement left out is a drop, marked unjudged", async () => {
+  const legacyBatch = async () => new Map([[0, { decision: "keep", reason: "close to Heat" }]]);
+  const decide = async (o) => ({ value: await o.legacy(), used: "legacy" });
+  const out = await judgeFit([cand, { ...cand, name: "Tracker" }], data, { decide, legacyBatch });
+  assert.deepEqual(out.map((x) => [x.keep, x.judged]), [[true, true], [false, false]]);
+  const jev = await judgeFit([cand], data, { decide: async () => ({ value: "drop", used: "jev" }), legacyBatch });
+  assert.deepEqual([jev[0].keep, jev[0].judged], [false, true]);
+});
+
 test("combineRatings: solo → the owner's, together → floor of the mean", () => {
   const byId = new Map(titles.map((t) => [t.id, t]));
   const rows = combineRatings([
