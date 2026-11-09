@@ -68,6 +68,12 @@ agent/local/plugins/<name>/     this installation's own plugin (private overlay)
 - `jobs.<job>.routing` joins the merged `job-routing` registry and
   `jobs.<job>.task` the `tasks` registry, only while the plugin is enabled.
 - `services` adds entries to the control room's service catalog.
+- `approvals` declares actions that run only after a Face ID approval:
+  `{ "<action>": { "title", "run", "ttl_minutes"?, "timeout_seconds"? } }`.
+  The plugin files a card with `bin/approval request`; the
+  `action-approvals` plugin's poller verifies the signature and runs `run`
+  with the signed params on stdin (`lib/action-approval.mjs`,
+  docs/writing-a-plugin.md).
 
 ## State and layers
 

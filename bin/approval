@@ -1,0 +1,139 @@
+#!/usr/bin/env node
+// approval — file and follow Face-ID approvals for plugin actions.
+// Core: lib/action-approval.mjs. Executor: bin/action-approval-poll.
+// How-to: docs/writing-a-plugin.md, "Actions that need your approval".
+//
+//   approval request --plugin <name> --action <action>
+//                    [--title "<what will happen>"] [--field "Label=Value"]...
+//                    [--params '<json object>' | --params-file <file>] [--asked "<the user's words>"]
+//       File a request for an action the plugin declares under `approvals` in
+//       its plugin.json. The phone shows the title, every field and every
+//       param; nothing runs until Face ID approves. After approval the
+//       manifest's `run` command runs with {id, plugin, action, params} as JSON
+//       on stdin. Prints {id, status, expires_at, push}.
+//       Exit 2 = the plugin is off or does not declare the action.
+//   approval status <id>            the row (status, result)
+//   approval wait <id> [--timeout <seconds>]
+//       Block until decided and run; prints the final row.
+//   approval cancel <id>            withdraw a pending request
+//
+// No LLM anywhere in here.
+
+import fs from "node:fs";
+import path from "node:path";
+import crypto from "node:crypto";
+import { createRequire } from "node:module";
+import { installRoot } from "../lib/root.cjs";
+
+const ROOT = installRoot();
+for (const l of (() => { try { return fs.readFileSync(path.join(ROOT, ".env"), "utf8").split("\n"); } catch { return []; } })()) {
+  const m = l.match(/^([A-Z_]+)=(.*)$/); if (m && !process.env[m[1]]) process.env[m[1]] = m[2];
+}
+const require = createRequire(import.meta.url);
+const { supabaseUrl } = require("../lib/instance.cjs");
+const Plugins = require("../lib/plugins.cjs");
+const BASE = process.env.SUPABASE_URL || supabaseUrl();
+const K = process.env.SUPABASE_SERVICE_ROLE_KEY;
+const H = { apikey: K, Authorization: "Bearer " + K, "Content-Type": "application/json" };
+
+const A = await import(path.join(ROOT, "lib/action-approval.mjs"));
+
+const argv = process.argv.slice(2);
+const cmd = argv[0];
+const flag = (n, d = null) => { const i = argv.indexOf(`--${n}`); return i > -1 ? argv[i + 1] : d; };
+const flags = (n) => argv.flatMap((a, i) => (a === `--${n}` && argv[i + 1] != null ? [argv[i + 1]] : []));
+const out = (o) => console.log(JSON.stringify(o, null, 2));
+const die = (msg, code = 1) => { console.error(`approval: ${msg}`); process.exit(code); };
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+async function rest(pathq, { method = "GET", body, prefer } = {}) {
+  const r = await fetch(`${BASE}/rest/v1/${pathq}`, {
+    method, headers: { ...H, ...(prefer ? { Prefer: prefer } : {}) },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  if (!r.ok) throw new Error(`supabase ${method} ${pathq.split("?")[0]}: HTTP ${r.status} ${await r.text()}`);
+  const t = await r.text();
+  return t ? JSON.parse(t) : null;
+}
+
+const COLS = "id,plugin,action,status,item_json,expires_at_ms,created_at,decided_at,executed_at,result,request_text";
+async function getRow(id) {
+  const d = await rest(`action_approvals?id=eq.${encodeURIComponent(id)}&select=${COLS}&limit=1`);
+  return d[0] || null;
+}
+
+async function request() {
+  const plugin = flag("plugin"), action = flag("action");
+  if (!plugin || !action) die("usage: approval request --plugin <name> --action <action> [--title ...] [--field \"Label=Value\"]... [--params '<json>' | --params-file <file>] [--asked ...]", 64);
+  const decl = Plugins.declaredApproval(plugin, action);
+  if (!decl) die(`plugin ${plugin} is off or does not declare the action '${action}' under approvals in its plugin.json`, 2);
+
+  const fields = flags("field").map((f) => {
+    const i = f.indexOf("=");
+    if (i < 1) die(`--field takes "Label=Value", got '${f}'`, 64);
+    return { label: f.slice(0, i), value: f.slice(i + 1) };
+  });
+  let params = {};
+  try {
+    if (flag("params-file")) params = JSON.parse(fs.readFileSync(flag("params-file"), "utf8"));
+    else if (flag("params")) params = JSON.parse(flag("params"));
+  } catch (e) { die(`params are not valid JSON (${e.message})`, 64); }
+  const asked = flag("asked");
+  if (asked && asked.length > 1200) die("--asked is longer than 1200 characters", 64);
+
+  let item;
+  try { item = A.normalizeActionItem({ plugin, action, title: flag("title") || decl.title, fields, params }); }
+  catch (e) { die(e.message, 64); }
+
+  const ttlMs = (decl.ttl_minutes || A.DEFAULT_TTL_MINUTES) * 60000;
+  const id = `act_${new Date().toISOString().slice(0, 10).replace(/-/g, "")}_${crypto.randomBytes(4).toString("hex")}`;
+  const req = A.buildActionRequest(id, item, { ttlMs });
+  await rest("action_approvals", {
+    method: "POST", prefer: "return=minimal",
+    body: {
+      id, plugin, action, status: "pending", item_json: req.item, item_hash: req.hash, nonce: req.nonce,
+      expires_at_ms: req.expiresAt, expires_at: new Date(req.expiresAt).toISOString(), request_text: asked,
+    },
+  });
+
+  const { sendActionApprovalPush } = await import(path.join(ROOT, "lib/apns-push.mjs"));
+  const supa = { from: () => ({ select: async () => {
+    try { return { data: await rest("device_tokens?select=token,platform,active_until"), error: null }; }
+    catch (e) { return { data: null, error: e }; }
+  } }) };
+  let push;
+  try { push = await sendActionApprovalPush(supa, { approvalId: id, body: A.summarize(req.item) }); }
+  catch (e) { push = { delivered: false, reason: e.message }; }
+  out({ id, status: "pending", summary: A.summarize(req.item), expires_at: new Date(req.expiresAt).toISOString(), push });
+}
+
+async function status() {
+  const row = await getRow(argv[1] || die("usage: approval status <id>", 64));
+  if (!row) die("no such approval", 2);
+  out(row);
+}
+
+const FINAL = new Set(["done", "failed", "denied", "expired", "cancelled"]);
+async function wait() {
+  const id = argv[1] || die("usage: approval wait <id> [--timeout <seconds>]", 64);
+  const deadline = Date.now() + Number(flag("timeout", "960")) * 1000;
+  for (;;) {
+    const row = await getRow(id);
+    if (!row) die("no such approval", 2);
+    if (row.status === "pending" && Number(row.expires_at_ms) + A.EXECUTE_GRACE_MS < Date.now()) row.status = "expired";
+    if (FINAL.has(row.status) || Date.now() > deadline) return out(row);
+    await sleep(4000);
+  }
+}
+
+async function cancel() {
+  const id = argv[1] || die("usage: approval cancel <id>", 64);
+  const d = await rest(`action_approvals?id=eq.${encodeURIComponent(id)}&status=eq.pending`, {
+    method: "PATCH", prefer: "return=representation", body: { status: "cancelled", decided_at: new Date().toISOString() },
+  });
+  out({ id, cancelled: d.length === 1 });
+}
+
+const cmds = { request, status, wait, cancel };
+if (!cmds[cmd]) die("usage: approval request|status|wait|cancel (see the header of bin/approval)", 64);
+try { await cmds[cmd](); } catch (e) { die(e.message); }

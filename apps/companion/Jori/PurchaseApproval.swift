@@ -237,7 +237,7 @@ enum PurchaseApproval {
     /// JSON.stringify's string escaping, exactly: \" \\ \b \f \n \r \t, other
     /// controls as lowercase \u00xx, everything else (incl. "/" and non-ASCII)
     /// literal. Foundation's JSONSerialization escapes "/" — hence hand-rolled.
-    private static func quote(_ s: String) -> String {
+    static func quote(_ s: String) -> String {
         // Work in UTF-16 code units (as JS does) and decode once at the end, so
         // surrogate pairs (emoji) pass through intact.
         var out: [UInt16] = [0x22]
@@ -471,6 +471,12 @@ enum PurchaseApproval {
             throw error("sign", err)
         }
         return sig
+    }
+
+    /// Plugin-action approvals (ActionApproval.swift) sign with this same
+    /// paired key, over their own fixed domain.
+    static func signWithPairedKey(_ data: Data, reason: String) throws -> Data {
+        try sign(data, reason: reason)
     }
 
     private static func error(_ what: String, _ e: Unmanaged<CFError>?) -> Error {

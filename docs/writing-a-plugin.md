@@ -11,6 +11,7 @@ and removed without touching the rest of Jori. The design is in
 jori plugin new tide-check --title "Tide check"                  # a command, its test, settings, a README
 jori plugin new tide-check --schedule "10 6 * * *"               # …and a daily schedule that runs the command
 jori plugin new tide-check --job                                 # …and a playbook the ops agent runs
+jori plugin new tide-check --approval send-alert                 # …and an action that runs only after Face ID
 jori plugin new tide-check --local                               # this installation's own (private overlay)
 ```
 
@@ -70,6 +71,7 @@ installation's own people, businesses or accounts, use `--local`: it goes in
 | `jobs` | Playbooks in the plugin's `jobs/` folder, with their routing (which agent, model, effort) and their task-registry entry. Dispatch with `jori dispatch <job>` or from a trigger. |
 | `cron_tags` | Crontab lines your plugin's own code writes and removes (a one-off reminder), marked with a comment tag. The manager leaves them alone while the plugin is on and removes them when it is turned off. |
 | `runtime/` | A folder with `manifest.json` + `index.mjs` adds MCP tools and skills to the agents while the plugin is on (`agent/plugins/loader.mjs`). |
+| `approvals` | Actions that run only after the user approves them with Face ID: `{ "<action>": { "title", "run", "ttl_minutes", "timeout_seconds" } }`. See "Actions that need your approval" below. |
 | `services` | Outside services the plugin uses, for the control room's Services page. |
 | `provides_bins` | Commands in `bin/`. They must not also exist in the core `bin/`. |
 | `core` | Only for Jori's own upkeep: always on, cannot be turned off or removed. |
@@ -92,6 +94,59 @@ installation's own people, businesses or accounts, use `--local`: it goes in
   output, following `agent/CLAUDE.md`.
 - **Language:** a model decides what someone meant, never a regex
   (`agent/CLAUDE.md` Rule #0b; `bin/lint-no-language-regex` enforces it).
+
+## Actions that need your approval
+
+Some actions should never run without the user saying yes on their own
+device: sending something on their behalf, changing a setting that costs
+money, unlocking something. Declare each one, and Jori puts a Face ID check
+in front of it. You write no approval code and no app screen.
+
+1. **Declare it** in `plugin.json` (`jori plugin new … --approval <action>`
+   does this and writes the handler):
+
+   ```json
+   "requires": { "plugins": ["action-approvals"] },
+   "approvals": {
+     "send-alert": { "title": "Send a tide alert", "run": "{node} bin/tide-check-send-alert", "ttl_minutes": 15, "timeout_seconds": 120 }
+   }
+   ```
+
+   `run` takes the same placeholders and plugin-relative `bin/` paths as a
+   schedule's `run`. `ttl_minutes` (default 15, at most 1440) is how long the
+   card waits; `timeout_seconds` (default 300) bounds the run.
+
+2. **Ask** from the plugin's code or playbook:
+
+   ```bash
+   bin/approval request --plugin tide-check --action send-alert \
+     --title "Text the beach group about Saturday's low tide" \
+     --field "To=Beach group" --field "When=Sat 07:10" \
+     --params '{"group": "beach", "minutes": 25}' [--asked "<the user's words>"]
+   bin/approval wait <id>        # or status / cancel
+   ```
+
+   The phone gets a time-sensitive push. The card shows the title, the plugin,
+   every field and **every param**. Params are strings, whole numbers,
+   true/false or null; anything else is refused, so the card can show exactly
+   what will run.
+
+3. **Act** in the handler. After Face ID, `bin/action-approval-poll` (no
+   model) checks the signature against the paired device key and checks that
+   the plugin is still on and still declares the action. Only then does it run
+   `run` with `{id, plugin, action, params}` as JSON on stdin (also
+   `JORI_APPROVAL_ID` in the environment). Exit 0 means done. Print
+   `say: <one line>` last to tell the user how it went; otherwise the chat
+   gets "Done: <title>." or the failure.
+
+What the signature covers: the plugin, the action, the title, the fields and
+the params. The command comes from the manifest, never from the request, so
+a request cannot choose what runs. The device key is the one paired for
+purchases (`purchase pair`), signing under its own domain (`jori-action.v1`),
+so an action approval can never stand in for a purchase or a self-improvement
+change. Approvals never loosen the money rules: transfers stay forbidden and
+purchases go through the purchase flow (`agent/CLAUDE.md`, Financial
+Operations).
 
 ## 4. The rules
 

@@ -161,6 +161,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     static var pendingMessageId: UUID?
     /// Set when a purchase-approval push arrives; ContentView consumes it.
     static var pendingPurchaseId: String?
+    /// Same, for a plugin-action approval push (ActionApproval.swift).
+    static var pendingActionApprovalId: String?
     /// Set when a trade-approval push arrives (TradeApproval.swift).
     static var pendingApprovalRequest: TradeApproval.Request?
 
@@ -179,6 +181,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     func applicationDidFinishLaunching(_ notification: Notification) {
         UNUserNotificationCenter.current().delegate = self
         PurchaseApproval.registerNotificationCategory()
+        ActionApproval.registerNotificationCategory()
         TradeApproval.registerNotificationCategory()
         UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .badge, .sound]) { granted, error in
             if let error = error {
@@ -230,6 +233,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
             completionHandler([.banner, .sound])
             return
         }
+        // Plugin-action approval: same, the review screen, never an approval.
+        if let approvalId = ActionApproval.approvalId(from: notification.request.content.userInfo) {
+            AppDelegate.pendingActionApprovalId = approvalId
+            NotificationCenter.default.post(name: .openActionApproval, object: approvalId)
+            completionHandler([.banner, .sound])
+            return
+        }
         if NSApplication.shared.isActive {
             completionHandler([])
         } else {
@@ -254,6 +264,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         if let purchaseId = PurchaseApproval.purchaseId(from: response.notification.request.content.userInfo) {
             AppDelegate.pendingPurchaseId = purchaseId
             NotificationCenter.default.post(name: .openPurchaseApproval, object: purchaseId)
+            NSApplication.shared.activate(ignoringOtherApps: true)
+            completionHandler()
+            return
+        }
+        // Plugin-action approval: same, the review screen, never an approval.
+        if let approvalId = ActionApproval.approvalId(from: response.notification.request.content.userInfo) {
+            AppDelegate.pendingActionApprovalId = approvalId
+            NotificationCenter.default.post(name: .openActionApproval, object: approvalId)
             NSApplication.shared.activate(ignoringOtherApps: true)
             completionHandler()
             return
@@ -294,6 +312,8 @@ final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCent
     static var pendingApprovalRequest: TradeApproval.Request?
     /// Same, for a purchase-approval push (PurchaseApproval.swift).
     static var pendingPurchaseId: String?
+    /// Same, for a plugin-action approval push (ActionApproval.swift).
+    static var pendingActionApprovalId: String?
 
     private lazy var supabase = SupabaseManager.shared
 
@@ -304,6 +324,7 @@ final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCent
         UNUserNotificationCenter.current().delegate = self
         TradeApproval.registerNotificationCategory()
         PurchaseApproval.registerNotificationCategory()
+        ActionApproval.registerNotificationCategory()
         MessageReply.registerNotificationCategory()
 
         // Report what happened to recent messages (did Siri ask what to read?)
@@ -431,6 +452,13 @@ final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCent
             completionHandler([.sound])
             return
         }
+        // Plugin-action approval: same, the review screen, never an approval.
+        if let approvalId = ActionApproval.approvalId(from: notification.request.content.userInfo) {
+            AppDelegate.pendingActionApprovalId = approvalId
+            NotificationCenter.default.post(name: .openActionApproval, object: approvalId)
+            completionHandler([.sound])
+            return
+        }
         if UIApplication.shared.applicationState == .active {
             completionHandler([])  // silent — message already visible in chat
         } else {
@@ -460,6 +488,13 @@ final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCent
         if let purchaseId = PurchaseApproval.purchaseId(from: userInfo) {
             AppDelegate.pendingPurchaseId = purchaseId
             NotificationCenter.default.post(name: .openPurchaseApproval, object: purchaseId)
+            completionHandler()
+            return
+        }
+        // Plugin-action approval: same, the review screen, never an approval.
+        if let approvalId = ActionApproval.approvalId(from: userInfo) {
+            AppDelegate.pendingActionApprovalId = approvalId
+            NotificationCenter.default.post(name: .openActionApproval, object: approvalId)
             completionHandler()
             return
         }
