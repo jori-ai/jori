@@ -38,6 +38,12 @@ session rotation.
 ## Guardrails
 
 - Adds rows to `watch_titles` only. Never removes, rejects or edits existing rows.
+- Records every series the sweep lists (recommended or not) in the show database,
+  `watch_catalog` rows of kind `show`: its facts, its current season (when the season's last
+  episode drops: `season_finale_date`, `season_finale_known`), one rating with its source
+  (`rating`, `rating_source`: IMDb once it has 1,000 votes, else the review check's reading,
+  else an estimate) and where discovery left it (`discover_status`, `discover_reason`).
+  It never touches a catalog row's `title_id`, `seen` or `not_for_us`.
 - No email. At most one phone pointer, from the run script.
 - Inspect a run with `job-list` / `job-status <id>`; the run log is
   `agent/logs/watchlist-discover.log`.
