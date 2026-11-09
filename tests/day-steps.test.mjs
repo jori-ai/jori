@@ -425,3 +425,104 @@ test("stepsInWindow counts the minutes it covers, and says nothing outside the r
   assert.equal(stepsInWindow(st, at(15), at(16)), null, "hours the readings never reached");
   assert.equal(stepsInWindow({ total: 5 }, at(9), at(10)), null, "a day annotated before the minutes were kept");
 });
+
+// A walk the steps found at a stop's edge, beside a ride, is the way to or from the
+// vehicle: the walk out of a venue to the cab was filed under the venue stop the phone's
+// silence kept open until 9:18, and the walk from the drop-off under the stop that begins
+// as the ride ends.
+const vehCover = [...readings(at(0, 5), at(0, 10), 2), ...readings(at(23, 50), at(23, 55), 2)];
+function vehEveningDay(rideMode = "riding") {
+  return {
+    date: "2026-03-02", tz: "America/New_York",
+    stops: [
+      { id: "venue", start: "19:35", end: "21:18", start_ts_ms: at(19, 35), end_ts_ms: at(21, 18), duration_min: 103, place: { name: "The Hall Theatre" } },
+      { id: "home", start: "21:30", end: "21:42", start_ts_ms: at(21, 30), end_ts_ms: at(21, 42), duration_min: 12, place: { name: "Home" } },
+    ],
+    path: { spine: [
+      { type: "dwell", id: "d0", start_ms: at(19, 35), end_ms: at(21, 18), place: { name: "The Hall Theatre" } },
+      { type: "leg", id: "l0", mode: rideMode, median_kmh: 28, start_ms: at(21, 18), end_ms: at(21, 30), mins: 12, routed_m: 6600, walked_m: 0, fixes: 6 },
+      { type: "dwell", id: "d1", start_ms: at(21, 30), end_ms: at(21, 42), place: { name: "Home" } },
+    ] },
+  };
+}
+const vehEveningSteps = (extra = []) => [...vehCover,
+  ...readings(at(21, 5), at(21, 14), 85), ...readings(at(21, 30), at(21, 40), 84), ...extra];
+
+test("the walk out to a ride and the walk in from one are travel, not walks inside the stops", () => {
+  const st = annotateDaySteps(vehEveningDay(), vehEveningSteps(), null, { startMs: at(0), endMs: at(24) });
+  assert.deepEqual(st.walks.map(w => [w.mins, w.kind, w.stop_id]), [[9, "between", null], [10, "between", null]]);
+});
+
+test("a walk in the middle of the same stop is still a walk inside it, and one ending 10 minutes before the stop does is too", () => {
+  const st = annotateDaySteps(vehEveningDay(), vehEveningSteps(readings(at(20, 0), at(20, 15), 80)), null, { startMs: at(0), endMs: at(24) });
+  const mid = st.walks.find(w => w.start_ms === at(20, 0));
+  assert.equal(mid.kind, "in_stop");
+  assert.equal(mid.stop_id, "venue");
+  const early = annotateDaySteps(vehEveningDay(), [...vehCover, ...readings(at(20, 50), at(21, 8), 85)], null, { startMs: at(0), endMs: at(24) });
+  assert.equal(early.walks[0].kind, "in_stop");
+});
+
+test("a leg the steps show was walked is the walking rule's, not the ride rule's", () => {
+  const st = annotateDaySteps(vehEveningDay("walking"), [...vehCover, ...readings(at(21, 5), at(21, 40), 85)], null, { startMs: at(0), endMs: at(24) });
+  assert.ok(st.walks.every(w => w.kind !== "between"), "one continuous walk through a walking leg");
+});
+
+test("JORI_STEPS_EDGE_RIDE=0 keeps the old placement", () => {
+  const old = process.env.JORI_STEPS_EDGE_RIDE;
+  process.env.JORI_STEPS_EDGE_RIDE = "0";
+  try {
+    const st = annotateDaySteps(vehEveningDay(), vehEveningSteps(), null, { startMs: at(0), endMs: at(24) });
+    assert.deepEqual(st.walks.map(w => [w.kind, w.stop_id]), [["in_stop", "venue"], ["in_stop", "home"]]);
+  } finally {
+    if (old == null) delete process.env.JORI_STEPS_EDGE_RIDE; else process.env.JORI_STEPS_EDGE_RIDE = old;
+  }
+});
+
+// A walk nobody's phone traced is not shorter than its steps: the walk home from a cafe
+// was bridged by the router alone (350 m, no fix on the way) while the steps over the same
+// 20 minutes were 1,158; the line printed "Walked 0.2 miles ... 1,154 steps", 0.3 m a step.
+function homeWalkDay(fixes = 0) {
+  return {
+    date: "2026-03-02", tz: "America/New_York", map_url: "https://example.test/map.png",
+    stops: [
+      { id: "cafe", start: "08:15", end: "08:52", start_ts_ms: at(8, 15), end_ts_ms: at(8, 52), duration_min: 37, place: { name: "The Corner Cafe", source: "user_confirmed" } },
+      { id: "home", start: "09:12", end: "18:00", start_ts_ms: at(9, 12), end_ts_ms: at(18), duration_min: 528, place: { name: "Home", source: "named_location" } },
+    ],
+    path: { spine: [
+      { type: "leg", id: "l0", mode: "walking", start_ms: at(8, 52), end_ms: at(9, 12), mins: 20,
+        routed_m: 350, straight_m: 260, walked_m: 350, geometry: "map_matched", fixes, streets: [] },
+    ] },
+  };
+}
+const homeWalkSteps = () => [...readings(at(0, 5), at(0, 10), 2), ...readings(at(8, 52), at(9, 12), 58), ...readings(at(23, 50), at(23, 55), 2)];
+
+test("a bridged walk whose steps reach farther than its route prints the steps' floor, and the header sums it", () => {
+  const d = homeWalkDay();
+  annotateDaySteps(d, homeWalkSteps(), null, { startMs: at(0), endMs: at(24) });
+  const html = buildSkeleton(d);
+  assert.match(html, /Walked at least 0\.3 miles[^<]*1,1\d\d steps/);
+  assert.match(html, /at least 0\.3 miles walked/);
+  assert.doesNotMatch(html, /Walked 0\.2 miles/);
+});
+
+test("a walk the phone did trace, or a route longer than the steps' floor, keeps the route's distance", () => {
+  const traced = homeWalkDay(9);
+  annotateDaySteps(traced, homeWalkSteps(), null, { startMs: at(0), endMs: at(24) });
+  assert.match(buildSkeleton(traced), /Walked 0\.2 miles/);
+  const long = homeWalkDay();
+  long.path.spine[0].routed_m = 900; long.path.spine[0].straight_m = 800; long.path.spine[0].walked_m = 900;
+  annotateDaySteps(long, homeWalkSteps(), null, { startMs: at(0), endMs: at(24) });
+  assert.match(buildSkeleton(long), /Walked 0\.6 miles/);
+});
+
+test("JORI_WALK_STEPS_FLOOR=0 prints the route's distance", () => {
+  const old = process.env.JORI_WALK_STEPS_FLOOR;
+  process.env.JORI_WALK_STEPS_FLOOR = "0";
+  try {
+    const d = homeWalkDay();
+    annotateDaySteps(d, homeWalkSteps(), null, { startMs: at(0), endMs: at(24) });
+    assert.match(buildSkeleton(d), /Walked 0\.2 miles/);
+  } finally {
+    if (old == null) delete process.env.JORI_WALK_STEPS_FLOOR; else process.env.JORI_WALK_STEPS_FLOOR = old;
+  }
+});
