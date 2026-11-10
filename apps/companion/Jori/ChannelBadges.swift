@@ -436,17 +436,23 @@ final class TeamStore: ObservableObject {
                 next[key] = s
             }
 
-            // Open questions: the last 45 days of questions and choice cards, with
-            // the replies that would close them, judged by the shared rule.
-            let since = Date().addingTimeInterval(-45 * 86400).ISO8601Format()
+            // Open questions: questions and choice cards inside the open window
+            // (ChatViewModel.questionStaleAfter, the same cutoff the thread uses)
+            // that carry no recorded state, with the replies that would close
+            // them, judged by the shared rule. Only rows without a state are
+            // fetched: with every answered question in the window too, a
+            // 300-row cap cut off the older open ones, and a badge went missing
+            // while the thread still showed them open.
+            let since = Date().addingTimeInterval(-ChatViewModel.questionStaleAfter).ISO8601Format()
             let asked: [Message] = try await client
                 .from(DBTables.messages)
                 .select(Message.columns)
                 .eq("role", value: "assistant")
                 .gte("created_at", value: since)
                 .or("metadata->>question_id.not.is.null,metadata->>\(ChoicePrompt.metadataKey).not.is.null")
+                .is("metadata->>question_state", value: nil)
                 .order("created_at", ascending: false)
-                .limit(300)
+                .limit(1000)
                 .execute()
                 .value
             var replies: [Message] = []
