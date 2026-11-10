@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  ROLE SESSIONS: a message the user wrote to a team role in the app (queued by
+  phone-channel in data/role-queue/pending) is answered by that role on its own
+  session (bin/role-session, jobs/role-session.md). QueueDirectories runs the
+  trigger while the queue holds files. launchd, not cron: the fork needs the
+  GUI keychain's Max login. Installed by `jori plugin sync` with role-chief-of-staff.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>ai.claude.role-session</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>__JORI_TOOLS__/plugins/role-chief-of-staff/bin/role-session-trigger</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>__HOME__</string>
+        <key>PATH</key>
+        <string>__HOME__/.local/node/bin:__HOME__/.local/bin:/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:__JORI_TOOLS__/bin</string>
+        <key>LANG</key>
+        <string>en_US.UTF-8</string>
+    </dict>
+    <key>WorkingDirectory</key>
+    <string>__JORI_TOOLS__/agent/ops-agent</string>
+    <key>QueueDirectories</key>
+    <array>
+        <string>__JORI_TOOLS__/data/role-queue/pending</string>
+    </array>
+    <key>StandardOutPath</key>
+    <string>__JORI_TOOLS__/agent/logs/role-session-launchd.log</string>
+    <key>StandardErrorPath</key>
+    <string>__JORI_TOOLS__/agent/logs/role-session-launchd.log</string>
+</dict>
+</plist>

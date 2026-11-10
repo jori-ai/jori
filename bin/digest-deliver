@@ -53,11 +53,12 @@ for (let i = 0; i < argv.length; i++) {
   else usage(`unknown arg ${k}`);
 }
 if (!o.subject || !o.bodyFile || !o.intent) usage("--subject, --body-file and --intent are required");
-// The team role that owns this job signs it (lib/org.cjs): the subject here, and
-// through JORI_SIGN_AS the pointer (jori-send-curl) and the push title (jori-notify),
-// so all three name the same role.
+// The team role that owns this job signs it (lib/org.cjs), all through
+// JORI_SIGN_AS: the email's From name (email-send: "Ben (CFO)"), the pointer
+// (jori-send-curl) and the push title (jori-notify), so all three name the same
+// role. With --also-to the mail is not the user's alone, so email-send signs
+// its subject instead and labelDigest still finds it (it accepts the signed form).
 process.env.JORI_SIGN_AS = o.intent;
-try { o.subject = require("../lib/org.cjs").signSubject(o.subject, { job: o.intent, intent: o.intent }); } catch { /* unsigned is fine */ }
 
 const log = (m) => console.error(`digest-deliver: ${m}`);
 

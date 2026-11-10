@@ -732,7 +732,9 @@ const wReview = chat("Monday 7:45 AM",
 <li><i>📅</i><span>Due: Harbor &amp; Pine contract out (Fri).</span></li>
 <li><i>👥</i><span>Waiting on you: Gia's case study, Kai's PR.</span></li></ul>`, { avatar: true }));
 
-// An inbox where every role signs its email (a generic mail-client layout).
+// An inbox where every email comes from the role that sent it, as email-send
+// does for mail to the user (From "Sid (IT & Security)", system/org.md), in a
+// generic mail-client layout.
 const MAIL_CSS = `
 * { box-sizing:border-box; margin:0; }
 body { font:15px/1.4 -apple-system, system-ui, sans-serif; color:#1d1c1d; background:#fff; -webkit-font-smoothing:antialiased; display:flex; height:100vh; }
@@ -742,16 +744,19 @@ body { font:15px/1.4 -apple-system, system-ui, sans-serif; color:#1d1c1d; backgr
 .side div.f.on { background:#e1e7f8; font-weight:600; }
 .main { flex:1; min-width:0; }
 .bar { padding:14px 22px; border-bottom:1px solid #e3e5e8; font-weight:700; font-size:18px; }
-.mrow { display:grid; grid-template-columns:150px 1fr 70px; gap:14px; align-items:baseline; padding:12px 22px; border-bottom:1px solid #eef0f3; }
+.mrow { display:grid; grid-template-columns:250px 1fr 70px; gap:14px; align-items:baseline; padding:12px 22px; border-bottom:1px solid #eef0f3; }
 .mrow.unread b, .mrow.unread .who { font-weight:700; }
-.mrow .who { font-size:14.5px; }
+.mrow .who { font-size:14.5px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.mrow .who small { color:#6b6f76; font-size:13.5px; font-weight:400; }
 .mrow .t { white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
 .mrow .t b { font-weight:600; }
 .mrow .t span { color:#6b6f76; }
 .mrow time { color:#6b6f76; font-size:13px; text-align:right; }
-.mrow .t span.role { color:#2f45c9; }
 `;
-const mrow = (role, subj, snip, time, unread = true) => `<div class="mrow${unread ? " unread" : ""}"><div class="who">Jori</div><div class="t"><b><span class="role">${role}:</span> ${subj}</b> <span>— ${snip}</span></div><time>${time}</time></div>`;
+const mrow = (role, subj, snip, time, unread = true) => {
+  const [, name, title] = role.match(/^(.*?) \((.*)\)$/);
+  return `<div class="mrow${unread ? " unread" : ""}"><div class="who">${name} <small>(${title})</small></div><div class="t"><b>${subj}</b> <span>— ${snip}</span></div><time>${time}</time></div>`;
+};
 const inboxDoc = `<!doctype html><html><head><meta charset="utf-8"><style>${MAIL_CSS}</style></head><body>
 <div class="side"><div class="new">Compose</div><div class="f on"><span>Inbox</span><span>9</span></div><div class="f"><span>Starred</span></div><div class="f"><span>Sent</span></div><div class="f"><span>Clients</span></div><div class="f"><span>Finance</span></div></div>
 <div class="main"><div class="bar">Inbox</div>

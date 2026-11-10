@@ -1,0 +1,131 @@
+#!/usr/bin/env node
+// role-session — the team roles' own sessions in the app (system/conversations.md).
+//
+// When the user writes in a role's conversation (role:<id>) or mentions roles
+// in a group, phone-channel queues the message here instead of handing it to
+// the coordinator's chat session (data/role-queue/pending/<message id>.json).
+// launchd runs plugins/role-chief-of-staff/bin/role-session-trigger, which,
+// per role, runs jobs/role-session.md as that role on a resumable session of
+// its own, and the role answers with `role-session reply`.
+//
+//   role-session prepare <queue-file> <role-id>
+//       Print the run's opening task: the role's specialization, who the user
+//       is talking to and where, the conversation's recent messages, the new
+//       message. Prints the session to resume (or nothing) on stderr-free
+//       line 1 as `RESUME <id>` when there is one.
+//   role-session done <role-id> <session-id-file>
+//       Record the run: the session id, one more turn, the time.
+//   role-session reply --conversation <id> --role <role-id> [--reply-to <message id>]
+//                      (--text "<…>" | --text-file <file>)
+//       Write the role's answer into the conversation (sender = the role) and
+//       push it, titled with the role's name and title.
+//
+// Sessions: one per role, resumed between messages so a role keeps its own
+// thread, and started fresh after ROTATE_TURNS turns or ROTATE_IDLE_H hours idle
+// (every resumed turn re-reads the whole session, so a long one grows costly);
+// the recent conversation is in every task, so a fresh session loses nothing
+// the user can see.
+"use strict";
+
+const fs = require("node:fs");
+const path = require("node:path");
+const { spawnSync } = require("node:child_process");
+const ROOT = path.join(__dirname, "..");
+const { installTools } = require(path.join(ROOT, "lib", "root.cjs"));
+const org = require(path.join(ROOT, "lib", "org.cjs"));
+try { require(path.join(ROOT, "lib", "load-env.js")).loadEnv(); } catch { /* env may be set */ }
+const rest = require(path.join(ROOT, "lib", "supabase-rest.js"));
+
+const STATE = installTools("data", "role-sessions.json");
+const ROTATE_TURNS = Number(process.env.ROLE_SESSION_ROTATE_TURNS || 30);
+const ROTATE_IDLE_H = Number(process.env.ROLE_SESSION_ROTATE_IDLE_H || 12);
+const HISTORY = 30;
+
+const args = process.argv.slice(2);
+const cmd = args[0];
+const flag = (n) => { const i = args.indexOf(`--${n}`); return i === -1 ? undefined : args[i + 1]; };
+const die = (m, c = 1) => { console.error(`role-session: ${m}`); process.exit(c); };
+
+function state() { try { return JSON.parse(fs.readFileSync(STATE, "utf8")); } catch { return {}; } }
+function saveState(s) { fs.mkdirSync(path.dirname(STATE), { recursive: true }); fs.writeFileSync(STATE, JSON.stringify(s, null, 1) + "\n"); }
+
+function roleById(id, o) { return o.roles.find((r) => r.id === id) || null; }
+
+async function prepare(queueFile, roleId) {
+  const q = JSON.parse(fs.readFileSync(queueFile, "utf8"));
+  const o = org.org();
+  const role = roleById(roleId, o);
+  if (!role) die(`no role ${roleId} on the team`, 3);
+  const conv = q.conversation_id;
+  const rows = await rest.request(`/rest/v1/jori_messages?select=id,role,sender,content,created_at&conversation_id=eq.${encodeURIComponent(conv)}&order=created_at.desc&limit=${HISTORY}`);
+  const names = new Map(o.roles.map((r) => [r.id, `${r.name} (${r.title})`]));
+  const ceo = o.ceo || "the user";
+  const history = (rows || []).reverse().map((m) => {
+    const who = m.role === "user" ? ceo : (names.get(m.sender) || m.sender || "assistant");
+    return `[${m.created_at.slice(0, 16).replace("T", " ")}Z] ${who}: ${String(m.content).slice(0, 1500)}`;
+  }).join("\n");
+  let members = [roleId];
+  if (conv.startsWith("group:")) {
+    const c = await rest.request(`/rest/v1/jori_conversations?select=members,title&id=eq.${encodeURIComponent(conv)}`);
+    if (c && c[0]) members = c[0].members || members;
+  }
+  const others = members.filter((m) => m !== roleId).map((m) => names.get(m) || m);
+  const brief = org.briefForRole(roleId, o) || "";
+  const s = state()[roleId];
+  const idleH = s && s.last_at ? (Date.now() - Date.parse(s.last_at)) / 36e5 : Infinity;
+  const resume = s && s.session_id && s.turns < ROTATE_TURNS && idleH < ROTATE_IDLE_H ? s.session_id : null;
+  const where = conv.startsWith("group:")
+    ? `a group conversation (${conv}) with ${others.length ? others.join(", ") + " and " : ""}${ceo}`
+    : `your own conversation with ${ceo} (${conv})`;
+  const task = [
+    `ROLE SESSION. You are ${role.name}, ${role.title} on ${ceo}'s team. ${ceo} wrote to you in ${where}.`,
+    `Answer as ${role.name}, then deliver it with exactly one call:`,
+    `  ${path.join(ROOT, "bin", "role-session")} reply --conversation ${conv} --role ${roleId} --reply-to ${q.message_id} --text-file <your file>`,
+    "",
+    brief,
+    "",
+    `----- RECENT CONVERSATION (oldest first; the last line is the new message) -----`,
+    history || "(no earlier messages)",
+    `----- NEW MESSAGE from ${ceo} -----`,
+    String(q.text || ""),
+    `----- END -----`,
+  ].join("\n");
+  process.stdout.write((resume ? `RESUME ${resume}\n` : "") + task + "\n");
+}
+
+function done(roleId, sessionFile) {
+  const s = state();
+  let sid = null;
+  try { sid = fs.readFileSync(sessionFile, "utf8").trim() || null; } catch { /* no id: keep the old */ }
+  const cur = s[roleId] || {};
+  const fresh = sid && sid !== cur.session_id;
+  s[roleId] = { session_id: sid || cur.session_id || null, turns: fresh ? 1 : (cur.turns || 0) + 1, last_at: new Date().toISOString() };
+  saveState(s);
+  console.log(JSON.stringify({ role: roleId, ...s[roleId] }));
+}
+
+async function reply() {
+  const conv = flag("conversation"), roleId = flag("role"), replyTo = flag("reply-to");
+  const text = flag("text") ?? (flag("text-file") ? fs.readFileSync(flag("text-file"), "utf8") : undefined);
+  if (!conv || !roleId || !text || !String(text).trim()) die("reply needs --conversation, --role and --text or --text-file", 64);
+  if (!/^(role|group):[a-z0-9-]+$/.test(conv)) die(`bad conversation id ${conv}`, 64); // lang-regex-ok: id shape
+  const o = org.org();
+  const role = roleById(roleId, o);
+  if (!role) die(`no role ${roleId} on the team`, 3);
+  const row = { role: "assistant", content: String(text).trim(), read: false, conversation_id: conv, sender: roleId, channel: "chat", ...(replyTo ? { reply_to: replyTo } : {}) };
+  const out = await rest.request("/rest/v1/jori_messages", { method: "POST", body: row, prefer: "return=representation" });
+  const id = Array.isArray(out) && out[0] ? out[0].id : null;
+  // The push names who answered. Fail-open: the message is already in the app.
+  spawnSync(path.join(ROOT, "bin", "jori-notify"), ["--title", org.signature(role), ...(id ? ["--message-id", id] : []), String(text).trim().slice(0, 300)],
+    { stdio: "ignore", timeout: 30000, env: { ...process.env, JORI_NO_SIGN: "1" } });
+  console.log(JSON.stringify({ id, conversation: conv, sender: roleId }));
+}
+
+(async () => {
+  try {
+    if (cmd === "prepare") return await prepare(args[1], args[2]);
+    if (cmd === "done") return done(args[1], args[2]);
+    if (cmd === "reply") return await reply();
+    die("usage: role-session prepare|done|reply (see the header)", 64);
+  } catch (e) { die(e.message); }
+})();

@@ -19,10 +19,16 @@ final class CachedMessage {
     // string, so a cached question keeps its colour and a cached choice card
     // keeps its buttons before the network fetch lands (2026-10-17).
     var metadataJSON: String?
+    // Optional for lightweight migration (2026-11-10): the row's conversation and
+    // the team role that wrote it. Rows cached before then derive the
+    // conversation from their channel.
+    var conversationId: String?
+    var sender: String?
 
     init(id: UUID, role: String, content: String, read: Bool, createdAt: Date,
          reaction: String? = nil, channel: String? = ChatChannel.chat.rawValue,
-         replyTo: UUID? = nil, metadataJSON: String? = nil) {
+         replyTo: UUID? = nil, metadataJSON: String? = nil,
+         conversationId: String? = nil, sender: String? = nil) {
         self.id = id
         self.role = role
         self.content = content
@@ -32,6 +38,13 @@ final class CachedMessage {
         self.channel = channel
         self.replyTo = replyTo
         self.metadataJSON = metadataJSON
+        self.conversationId = conversationId
+        self.sender = sender
+    }
+
+    /// The conversation this row belongs to, for rows cached before conversations.
+    var conversation: String {
+        conversationId ?? ConversationID.legacy(channel: channel ?? ChatChannel.chat.rawValue)
     }
 
     static func encode(_ metadata: [String: String]?) -> String? {
@@ -54,7 +67,9 @@ final class CachedMessage {
                   reaction: message.reaction?.rawValue,
                   channel: message.channel,
                   replyTo: message.replyTo,
-                  metadataJSON: Self.encode(message.metadata))
+                  metadataJSON: Self.encode(message.metadata),
+                  conversationId: message.conversationId,
+                  sender: message.sender)
     }
 
     func apply(_ message: Message) {
@@ -66,6 +81,8 @@ final class CachedMessage {
         self.channel = message.channel
         self.replyTo = message.replyTo
         self.metadataJSON = Self.encode(message.metadata)
+        self.conversationId = message.conversationId
+        self.sender = message.sender
     }
 
     var asMessage: Message {
@@ -73,7 +90,9 @@ final class CachedMessage {
                 reaction: reaction.flatMap { Reaction(rawValue: $0) },
                 channel: channel ?? ChatChannel.chat.rawValue,
                 replyTo: replyTo,
-                metadata: Self.decode(metadataJSON))
+                metadata: Self.decode(metadataJSON),
+                conversationId: conversation,
+                sender: sender)
     }
 }
 
@@ -107,10 +126,10 @@ final class MessageStore {
         // always calls it during cold start, so we avoid a duplicate fetch.
     }
 
-    /// Synchronous load, oldest → newest, scoped to a single channel. Also
-    /// seeds `runningBytes` from the full table so cold start only hits
+    /// Synchronous load, oldest → newest, scoped to a single conversation.
+    /// Also seeds `runningBytes` from the full table so cold start only hits
     /// SwiftData once.
-    func loadAll(channel: String = ChatChannel.chat.rawValue) -> [Message] {
+    func loadAll(conversation: String = ConversationID.coordinator) -> [Message] {
         let descriptor = FetchDescriptor<CachedMessage>(
             sortBy: [SortDescriptor(\.createdAt, order: .forward)]
         )
@@ -120,22 +139,21 @@ final class MessageStore {
         }
         runningBytes = rows.reduce(0) { $0 + cost(for: $1.content) }
         return rows
-            .filter { ($0.channel ?? ChatChannel.chat.rawValue) == channel }
+            .filter { $0.conversation == conversation }
             .map(\.asMessage)
     }
 
     /// Full reconciliation against a fresh server response, scoped to one
-    /// channel. Rows in other channels are left untouched so switching back
-    /// doesn't re-fetch from scratch.
-    func sync(with freshMessages: [Message], channel: String) {
+    /// conversation. Rows in other conversations are left untouched so
+    /// switching back doesn't re-fetch from scratch.
+    func sync(with freshMessages: [Message], conversation: String) {
         let freshIds = Set(freshMessages.map(\.id))
         let descriptor = FetchDescriptor<CachedMessage>()
         guard let cached = try? context.fetch(descriptor) else { return }
 
         var existingById: [UUID: CachedMessage] = [:]
         for row in cached {
-            let rowChannel = row.channel ?? ChatChannel.chat.rawValue
-            if rowChannel != channel { continue }   // out of scope
+            if row.conversation != conversation { continue }   // out of scope
             if freshIds.contains(row.id) {
                 existingById[row.id] = row
             } else {

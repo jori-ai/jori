@@ -20,7 +20,11 @@ A role is a kernel plugin, `plugins/role-<id>/` (`jori plugin enable role-cfo`):
         "jobs": ["projects", "hum", "hum-*", "morning-digest"] } ] }
   ```
   `jobs` are job names (the task registry, playbooks, plugin schedules and launchd labels); a trailing `*` is a prefix. A launcher's wrapper prefix (`trigger-`, `venue-watch-`, `ai.claude.`) is ignored. **The most specific match wins**: an exact name beats any prefix, a longer prefix a shorter one. `intents` are the `jori-send-curl --intent` values that belong to the role when they are not a job's own name.
-- **Code:** `lib/org.cjs` (`org`, `rolePlugins`, `roleFor`, `roleBrief`, `signSubject`, `signPing`, `chart`); `lib/plugins.cjs` validates a `role` block. **CLI:** `bin/org` — `org list` (the chart), `org who <job|intent>`, `org audit` (jobs no role owns; exit 1 when any), `org sign-subject|sign-ping <job> <text>`.
+- **Code:** `lib/org.cjs` (`org`, `rolePlugins`, `roleFor`, `roleBrief`, `senderName`, `signSubject`, `signPing`, `chart`); `lib/plugins.cjs` validates a `role` block. **CLI:** `bin/org` — `org list` (the chart), `org who <job|intent>`, `org audit` (jobs no role owns; exit 1 when any), `org sign-subject|sign-ping <job> <text>`.
+
+## In the app: conversations with the team
+
+Migration `system/migrations/0180_team_conversations.sql` gives the app a team and conversations: `jori_team` (each role's id, name, title, responsibility; **the user can rename any role, name and title, in the app**, which sets `renamed_by_user`), `jori_conversations` (`role:<id>` with one role, `group:<uuid>` with several), `jori_channel_roles` (the legacy channel each role answers for: chat → chief-of-staff, system → it-security, improvements → software-engineer, questions → chief-of-staff) and two columns on `jori_messages`: `conversation_id` and `sender`. A trigger files a row that only names a channel (or a `sender`) into the right role's conversation and keeps `channel` meaningful for the older app; a role's conversation exists from its first message. **`org sync`** (every 10 minutes, the chief-of-staff plugin's `team-sync`) upserts the team into `jori_team` and keeps the user's renames, caching them in `data/team-renames.json`, which `org()` reads, so a rename reaches signatures and briefs too. **`jori-send-curl`** writes the speaking role's id as `sender` (from `--role`, else the job or intent's role; never the coordinator's), so a role's messages land in its own conversation.
 
 ## How the roles show
 
@@ -28,11 +32,12 @@ Each role **signs** what its jobs send to the user:
 
 | What | How it is signed | Where |
 |---|---|---|
-| An email | `Name (Title): <subject>` | `email-send` (from `--sign <job>` or the job in `JORI_SIGN_AS` / `JORI_JOB`), `digest-deliver` (its `--intent`) |
+| An email to the user | it comes **from** the role: From `Name (Title) <agent address>`, the subject untouched (replies too) | `email-send` (from `--sign <job>` or the job in `JORI_SIGN_AS` / `JORI_JOB`), `digest-deliver` (its `--intent`, through `JORI_SIGN_AS`) |
+| An email to anyone else | From stays the assistant (others always hear from the user's assistant); subject `Name (Title): <subject>`, never on a reply | `email-send` |
 | A chat or questions ping | `Name: <text>` | `jori-send-curl` (its `--intent`, else the job in the env), after every gate (precheck, claim-freshness, dedup) and before media |
 | A push | title `Name (Title)` | `jori-notify` (when no `--title` was given) |
 
-`cron-run` sets `JORI_JOB` to its label and `lib/run-ephemeral-opus.sh` to the fork's job, so a job's sends know who they are from. **Not signed:** the chief of staff's own pings and pushes (it is the assistant's voice: hum, chat replies), the system and improvements channels, replies (`Re:` subjects, `--in-reply-to`), and anything sent with `JORI_NO_SIGN=1` (the push-failed fallback email, whose exact subject a P1 exception matches). `digest-deliver`'s Gmail lookup accepts the signed form of a subject (`<role>): <subject>`), so labelling still finds a digest that `email-send` signed.
+`cron-run` sets `JORI_JOB` to its label and `lib/run-ephemeral-opus.sh` to the fork's job, so a job's sends know who they are from. **Not signed:** the chief of staff's own pings and pushes (it is the assistant's voice: hum, chat replies), the system and improvements channels, the subject of a reply (`Re:` subjects, `--in-reply-to`), an email given an explicit `--from-name`, and anything sent with `JORI_NO_SIGN=1` (the push-failed fallback email, whose exact subject a P1 exception matches). `digest-deliver`'s Gmail lookup accepts the signed form of a subject (`<role>): <subject>`), so labelling still finds a digest that `email-send` signed.
 
 ## Rules
 

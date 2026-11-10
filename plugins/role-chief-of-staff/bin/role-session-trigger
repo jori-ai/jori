@@ -1,0 +1,54 @@
+#!/bin/bash
+# role-session-trigger — answer one queued app message as the team role(s) it
+# was written to (bin/role-session, jobs/role-session.md, system/conversations.md).
+#
+# launchd (ai.claude.role-session) watches data/role-queue/pending with
+# QueueDirectories and runs this while it holds files; one request per run,
+# oldest first, moved out of pending before anything slow. Each role named in
+# the request runs jobs/role-session.md on its own resumable session through
+# lib/run-ephemeral-opus.sh (Max-only guard, cost ledger, allowance governor).
+# Not cron: the run is a `claude -p` that needs the GUI keychain's Max login.
+
+PLUGIN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+KERNEL_TOOLS="$(cd "$PLUGIN_DIR/../.." && pwd)"
+source "$KERNEL_TOOLS/agent/scripts/lib/script-job-env.sh"
+NODE="${JORI_NODE:-node}"
+Q="$JORI_INSTALL_TOOLS/data/role-queue"
+LOG="$JORI_INSTALL_TOOLS/agent/logs/role-session.log"
+JOB_MD="$KERNEL_TOOLS/agent/ops-agent/jobs/role-session.md"
+mkdir -p "$Q/pending" "$Q/running" "$Q/done" "$Q/failed" "$(dirname "$LOG")"
+log() { echo "$(date '+%Y-%m-%d %H:%M:%S') [role-session] $1" >> "$LOG"; }
+
+REQ="$(ls -1 "$Q/pending"/*.json 2>/dev/null | sort | head -n1)"
+[ -n "$REQ" ] || exit 0
+ID="$(basename "$REQ" .json)"
+mv "$REQ" "$Q/running/$ID.json" || { log "$ID: could not claim"; exit 1; }
+REQ="$Q/running/$ID.json"
+
+[ -f "$KERNEL_TOOLS/agent/config/models.env" ] && source "$KERNEL_TOOLS/agent/config/models.env"
+ROLES="$("$NODE" -e 'process.stdout.write((JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")).roles||[]).join(" "))' "$REQ" 2>/dev/null)"
+RC_ALL=0
+for ROLE in $ROLES; do
+  TASK_FILE="$(mktemp -t role-task.XXXXXX)"
+  SID_FILE="$(mktemp -t role-sid.XXXXXX)"
+  if ! "$NODE" "$KERNEL_TOOLS/bin/role-session" prepare "$REQ" "$ROLE" > "$TASK_FILE" 2>>"$LOG"; then
+    log "$ID: prepare failed for $ROLE"; RC_ALL=1; rm -f "$TASK_FILE" "$SID_FILE"; continue
+  fi
+  RESUME=""
+  if head -n1 "$TASK_FILE" | grep -q '^RESUME '; then
+    RESUME="$(head -n1 "$TASK_FILE" | cut -d' ' -f2)"
+    tail -n +2 "$TASK_FILE" > "$TASK_FILE.t" && mv "$TASK_FILE.t" "$TASK_FILE"
+  fi
+  log "$ID: $ROLE ${RESUME:+resuming $RESUME}"
+  JORI_FORK_RESUME="$RESUME" JORI_FORK_SESSION_OUT="$SID_FILE" JORI_BRAKE_DECIDED=1 \
+    "$KERNEL_TOOLS/agent/scripts/lib/run-ephemeral-opus.sh" "role-$ROLE" "$JOB_MD" \
+      --task "$(cat "$TASK_FILE")" --timeout-min 15 \
+      --model "${JORI_MODEL_SONNET:-claude-sonnet-5-5}" --effort medium
+  RC=$?
+  "$NODE" "$KERNEL_TOOLS/bin/role-session" done "$ROLE" "$SID_FILE" >> "$LOG" 2>&1
+  log "$ID: $ROLE exit $RC"
+  [ "$RC" -ne 0 ] && RC_ALL=1
+  rm -f "$TASK_FILE" "$SID_FILE"
+done
+if [ "$RC_ALL" -eq 0 ]; then mv "$REQ" "$Q/done/$ID.json"; else mv "$REQ" "$Q/failed/$ID.json"; fi
+exit 0

@@ -40,7 +40,7 @@ struct JoriApp: App {
                 .task { isSignedIn = await SupabaseManager.hasSession() }
                 .task { await SupabaseManager.mirrorOnTokenChanges() }
                 #if os(macOS)
-                // 480 = traffic lights + sidebar toggle + the channel tabs, with no title.
+                // 480 = traffic lights + sidebar toggle + the conversation header, with no title.
                 .frame(minWidth: 480, minHeight: 480)
                 #endif
         }

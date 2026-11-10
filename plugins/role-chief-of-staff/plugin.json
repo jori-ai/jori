@@ -12,8 +12,20 @@
     "commands": [],
     "env": []
   },
-  "schedules": [],
-  "launchd": [],
+  "schedules": [
+    {
+      "label": "team-sync",
+      "cron": "*/10 * * * *",
+      "command": "{node} {root}/bin/org sync",
+      "log": "agent/logs/team-sync.log"
+    }
+  ],
+  "launchd": [
+    {
+      "label": "ai.claude.role-session",
+      "file": "ai.claude.role-session.plist"
+    }
+  ],
   "role": {
     "id": "chief-of-staff",
     "title": "Chief of Staff",

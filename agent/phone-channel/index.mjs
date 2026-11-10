@@ -357,6 +357,9 @@ mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
           content: deliveredMessage,
           read: false,
           channel: replyChannel,
+          // The conversation the user wrote in (a group the coordinator was
+          // asked in answers there; its own conversation otherwise).
+          ...(pendingEntry?.conversation_id ? { conversation_id: pendingEntry.conversation_id } : {}),
         }).select("id").single());
       }
 
@@ -686,6 +689,28 @@ const shareBundler = new ShareBundler({
     .catch((err) => console.error(`[phone-channel] share bundle dispatch failed: ${err.message}`)),
 });
 
+// ── The team: which roles answer a message (system/conversations.md) ──────────
+function teamRoute(row) {
+  const org = require("../../lib/org.cjs").org();
+  const cos = (org.roles.find((r) => r.chief_of_staff) || {}).id || "chief-of-staff";
+  const onTeam = new Set(org.roles.map((r) => r.id));
+  const conv = row.conversation_id || `role:${cos}`;
+  if (conv.startsWith("role:")) {
+    const id = conv.slice(5);
+    if (id === cos || !onTeam.has(id)) return { roles: [], coordinator: true };
+    return { roles: [id], coordinator: false };
+  }
+  const mentions = Array.isArray(row.metadata?.mentions) ? row.metadata.mentions.filter((m) => onTeam.has(m)) : [];
+  return { roles: mentions.filter((m) => m !== cos), coordinator: mentions.length === 0 || mentions.includes(cos) };
+}
+
+function enqueueRoleSession(row, roles) {
+  const dir = installTools("data/role-queue/pending");
+  fs.mkdirSync(dir, { recursive: true });
+  const body = { message_id: row.id, conversation_id: row.conversation_id, roles, text: row.content, created_at: row.created_at, queued_at: new Date().toISOString() };
+  writeFileAtomic(path.join(dir, `${row.created_at.replace(/[^0-9]/g, "").slice(0, 17)}-${row.id}.json`), JSON.stringify(body) + "\n"); // lang-regex-ok: digits of a timestamp for a sortable file name
+}
+
 async function handleIncomingMessage(row) {
   if (!row.shareBundleIds && shareBundler.add(row)) return;
   const msgId = row.id;
@@ -698,7 +723,7 @@ async function handleIncomingMessage(row) {
   if (pendingMessages.has(msgId)) return; // already processing
   // Anything new the user sends goes after a share still being collected.
   if (!row.shareBundleIds) shareBundler.flush();
-  pendingMessages.set(msgId, { text, t0_created: createdAt, channel: row.channel || "chat" });
+  pendingMessages.set(msgId, { text, t0_created: createdAt, channel: row.channel || "chat", conversation_id: row.conversation_id || null });
   ensureStreamPoll();
 
   // Persist the user's current timezone for trigger scripts (pulse sleep-window check).
@@ -762,6 +787,25 @@ async function handleIncomingMessage(row) {
     }
   } catch (err) {
     console.error(`[phone-channel] choice fast-path error, dispatching normally: ${err.message}`);
+  }
+
+  // The team (system/conversations.md): a message written to a role's own
+  // conversation, or mentioning roles in a group, is answered by those roles'
+  // own sessions (bin/role-session), not by this coordinator session. The
+  // coordinator still answers in its own conversation, and in a group when it
+  // is mentioned or nobody is.
+  try {
+    const route = teamRoute(row);
+    if (route.roles.length) enqueueRoleSession(row, route.roles);
+    if (!route.coordinator) {
+      advanceCursor(row.created_at);
+      pendingMessages.delete(msgId);
+      profLog(msgId, "t2_role_session", route.roles.join(","));
+      log(`team: queued for ${route.roles.join(", ")}`);
+      return;
+    }
+  } catch (err) {
+    console.error(`[phone-channel] team routing failed, answering as the coordinator: ${err.message}`);
   }
 
   classifySuggestionReply(msgId, text, row.reply_to);
