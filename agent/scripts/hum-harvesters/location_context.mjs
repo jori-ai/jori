@@ -21,7 +21,7 @@
 //   generic_place_names  geocoder names too generic to count as a settled
 //                        place (district / borough / city names the phone's
 //                        reverse geocoder returns for many POIs)
-import { execSync } from "node:child_process";
+import { execSync, execFileSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { createRequire } from "node:module";
@@ -231,8 +231,8 @@ function isSettledPlace(row) {
       let mapUrl = null, trace = null;
       if (row && fs.existsSync(STOP_MAP)) {
         try {
-          const mj = JSON.parse(execSync(
-            `${STOP_MAP} --visit ${queued.visit_id} --tz ${askTz} --upload --json`,
+          const mj = JSON.parse(execFileSync(
+            STOP_MAP, ["--visit", String(queued.visit_id), "--tz", askTz, "--upload", "--json"],
             { encoding: "utf8", timeout: 120000, stdio: ["ignore", "pipe", "ignore"] }));
           if (String(mj.url || "").startsWith("https://")) { mapUrl = mj.url; trace = mj.trace || null; }
         } catch { /* ask without a map */ }
@@ -316,7 +316,6 @@ function localHourOf(iso) {
 // within the last ~10 min is a NEW arrival; a departed_at within the last
 // ~10 min means the user just left that place. These edges are the best
 // moments to ask — the user is about to act on the decision.
-import { execSync as _exec } from "node:child_process";
 function shFetch(restPath, qs) {
   const key = process.env.SUPABASE_SERVICE_ROLE_KEY || (() => {
     try {
@@ -328,7 +327,7 @@ function shFetch(restPath, qs) {
   if (!key || !SUPABASE_URL) return [];
   const url = `${SUPABASE_URL}${restPath}?${qs}`;
   try {
-    const raw = _exec(`curl -s -H "apikey: ${key}" -H "Authorization: Bearer ${key}" "${url}"`, { encoding: "utf8", timeout: 6000 });
+    const raw = execFileSync("curl", ["-s", "-H", `apikey: ${key}`, "-H", `Authorization: Bearer ${key}`, url], { encoding: "utf8", timeout: 6000 });
     return JSON.parse(raw);
   } catch { return []; }
 }
@@ -593,11 +592,10 @@ if (!recallMedia(dedupKey) && startIso) {
   let mapUrl = null, trace = null;
   try {
     if (!fs.existsSync(STOP_MAP)) throw new Error("no stop-map");
-    const tzFlag = `--tz ${LOCAL_TZ}`;
-    const cmdMap = edgeEvent && !walk
-      ? `${STOP_MAP} --visit ${edgeEvent.row.id} ${tzFlag} --upload --json`
-      : `${STOP_MAP} --start ${startIso} --end ${cardEnd} ${tzFlag} --upload --json`;
-    const mj = JSON.parse(execSync(cmdMap, { encoding: "utf8", timeout: 120000, stdio: ["ignore", "pipe", "ignore"] }));
+    const mapArgs = edgeEvent && !walk
+      ? ["--visit", String(edgeEvent.row.id)]
+      : ["--start", startIso, "--end", cardEnd];
+    const mj = JSON.parse(execFileSync(STOP_MAP, [...mapArgs, "--tz", LOCAL_TZ, "--upload", "--json"], { encoding: "utf8", timeout: 120000, stdio: ["ignore", "pipe", "ignore"] }));
     if (String(mj.url || "").startsWith("https://")) { mapUrl = mj.url; trace = mj.trace || null; }
   } catch { /* card without a map */ }
   const note = hypothesis.annotate?.note || null;

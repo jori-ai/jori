@@ -28,7 +28,7 @@ Object.assign(process.env, {
   JEV_SHADOW_DIR: path.join(tmp, "shadow"),
   JEV_ENDPOINT: "https://jev.test/v1/evaluate",
   JEV_NO_ALERT: "1",
-  TYPESAFE_API_KEY: "test-key",
+  TYPESAFE_API_KEY: "example-test-key",
   AUTO_RECALL_CLAUDE_BIN: "/usr/bin/false",
   AUTO_RECALL_JUDGE_LOG: path.join(tmp, "judge.jsonl"),
 });

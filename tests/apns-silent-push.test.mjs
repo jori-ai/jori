@@ -21,14 +21,14 @@ test("sendSilentPush sends a background payload to iOS tokens only", async () =>
   const calls = [];
   const send = async (jwt, token, payload, headers) => { calls.push({ jwt, token, payload: JSON.parse(payload), headers }); return { status: 200, body: "" }; };
   const r = await sendSilentPush(
-    fakeSupabase([{ token: "aaaaaaaaaa", platform: "ios" }, { token: "mmmmmmmmmm", platform: "macos" }]),
+    fakeSupabase([{ token: "example-ios", platform: "ios" }, { token: "example-mac", platform: "macos" }]),
     { kind: "sync_probe", probe_id: "p1" },
     { send, jwt: "j" },
   );
   assert.equal(r.delivered, true);
   assert.equal(r.sent, 1);
   assert.equal(calls.length, 1);
-  assert.equal(calls[0].token, "aaaaaaaaaa");
+  assert.equal(calls[0].token, "example-ios");
   assert.deepEqual(calls[0].payload, { kind: "sync_probe", probe_id: "p1", aps: { "content-available": 1 } });
   assert.equal(calls[0].headers["apns-push-type"], "background");
   assert.equal(calls[0].headers["apns-priority"], "5");

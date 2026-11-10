@@ -6,6 +6,8 @@ import os from "node:os";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
+// The privacy-screen stubs fake Ollama; the local model defaults to Haiku via `claude -p` since 2026-11-04, so pin the backend they simulate.
+process.env.LOCAL_LLM_BACKEND ||= "ollama";
 
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "jev-hum-gate-"));
 Object.assign(process.env, {
@@ -14,7 +16,7 @@ Object.assign(process.env, {
   JEV_SHADOW_DIR: path.join(tmp, "shadow"),
   JEV_NO_ALERT: "1",
   JEV_PRIVATE_SCREEN: "off",
-  TYPESAFE_API_KEY: "test-key",
+  TYPESAFE_API_KEY: "example-test-key",
 });
 
 let jevCalls = 0;

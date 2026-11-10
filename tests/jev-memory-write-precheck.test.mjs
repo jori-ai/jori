@@ -12,6 +12,8 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { execFile } from "node:child_process";
+// The privacy-screen stubs fake Ollama; the local model defaults to Haiku via `claude -p` since 2026-11-04, so pin the backend they simulate.
+process.env.LOCAL_LLM_BACKEND ||= "ollama";
 
 const BIN = path.resolve("bin/memory-write-precheck.mjs");
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "jev-mwp-"));
@@ -83,7 +85,7 @@ function run(extraEnv = {}) {
         JEV_ENDPOINT: "https://jev.test/v1/evaluate",
         NODE_OPTIONS: `--import ${fetchStub}`,
         STUB_JEV_P: String(jevP), STUB_SCREEN: screen,
-        JEV_NO_ALERT: "1", TYPESAFE_API_KEY: "test-key",
+        JEV_NO_ALERT: "1", TYPESAFE_API_KEY: "example-test-key",
         JEV_PRIVATE_SCREEN: "",
         ...extraEnv,
       },

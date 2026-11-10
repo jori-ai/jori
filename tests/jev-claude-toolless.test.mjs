@@ -24,7 +24,7 @@ const { runToolless, toollessArgs, parseModelJson } = await import("../lib/jev-c
 
 test("runToolless: no tools, no MCP, no project/user settings, neutral cwd, Max-only env, prompt on stdin", async () => {
   process.env.ANTHROPIC_API_KEY = "sk-should-not-leak";
-  process.env.ANTHROPIC_AUTH_TOKEN = "tok-should-not-leak";
+  process.env.ANTHROPIC_AUTH_TOKEN = "example-should-not-leak";
   try {
     const out = await runToolless({ bin: STUB, model: "claude-sonnet-5", prompt: "PROMPT-TEXT" });
     assert.equal(out, '{"ok": true}');

@@ -13,7 +13,7 @@
 //
 // Read-only: never mutates the timeline. It surfaces a question; the chat-agent
 // applies the fix via `travel add|edit|rm|sync` after the user answers.
-import { execSync } from "node:child_process";
+import { execFileSync } from "node:child_process";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { emit, emitNull, stampRun } from "./_common.mjs";
@@ -25,7 +25,7 @@ function hash(s) { let h = 0; for (let i = 0; i < s.length; i++) h = (h * 31 + s
 
 let report;
 try {
-  const out = execSync(`"${TRAVEL}" audit --json`, { encoding: "utf8", timeout: 15000 });
+  const out = execFileSync(TRAVEL, ["audit", "--json"], { encoding: "utf8", timeout: 15000 });
   report = JSON.parse(out);
 } catch (e) {
   // `travel audit` can exit non-zero on environment trouble but still print

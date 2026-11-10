@@ -22,7 +22,7 @@ process.env.JEV_CONFIG_FILE = path.join(tmp, "jev-config.json");
 process.env.JEV_QUESTIONS_DIR = path.join(tmp, "q");
 process.env.JEV_SHADOW_DIR = path.join(tmp, "log");
 process.env.JEV_NO_ALERT = "1";
-process.env.TYPESAFE_API_KEY = "test-key";
+process.env.TYPESAFE_API_KEY = "example-test-key";
 fs.mkdirSync(process.env.JEV_QUESTIONS_DIR, { recursive: true });
 after(() => fs.rmSync(tmp, { recursive: true, force: true }));
 const QUESTION = JSON.parse(fs.readFileSync(new URL("../agent/config/jev-questions/calendar-hold.json", import.meta.url), "utf8"));

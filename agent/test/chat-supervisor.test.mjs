@@ -12,14 +12,14 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { spawn, execSync } from "node:child_process";
+import { spawn, execFileSync } from "node:child_process";
 
 // These tests spawn the chat supervisor as a child process which starts an HTTP
 // server. Sandbox environments block child processes from binding ports.
 // The tests skip gracefully when this is detected.
 function canChildListen() {
   try {
-    execSync(`${"/opt/homebrew/bin/node"} -e "const s=require('net').createServer();s.listen(0,'127.0.0.1',()=>{s.close();process.exit(0)})"`, { timeout: 3000, stdio: "pipe" });
+    execFileSync("/opt/homebrew/bin/node", ["-e", "const s=require('net').createServer();s.listen(0,'127.0.0.1',()=>{s.close();process.exit(0)})"], { timeout: 3000, stdio: "pipe" });
     return true;
   } catch { return false; }
 }

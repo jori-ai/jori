@@ -244,7 +244,7 @@ test("refreshSeasonRatings stores what it fetched, caps the calls, and retries a
 test("omdbSeasonRating: an OMDb error is retried later, only 'no such season' is stored as unrated", async () => {
   const { omdbSeasonRating } = await import("../lib/watch-db.mjs");
   const prev = process.env.OMDB_API_KEY;
-  process.env.OMDB_API_KEY = "test-key";
+  process.env.OMDB_API_KEY = "example-test-key";
   const reply = (status, body) => async () => ({ ok: status < 400, status, json: async () => body });
   try {
     assert.equal(await omdbSeasonRating("tt1", 2, { fetchImpl: reply(401, { Response: "False", Error: "Request limit reached!" }) }), null);

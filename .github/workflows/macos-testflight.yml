@@ -16,7 +16,7 @@ jobs:
         working-directory: apps/companion
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           clean: true
 
@@ -34,7 +34,7 @@ jobs:
           MAC_SHARE_PROFILE: ${{ secrets.MAC_SHARE_PROFILE }}
         run: |
           KEYCHAIN_PATH="$RUNNER_TEMP/app-signing.keychain-db"
-          KEYCHAIN_PASSWORD="$(openssl rand -hex 16)"
+          KEYCHAIN_PASSWORD=$(openssl rand -hex 16)
 
           security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
           security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
@@ -229,7 +229,7 @@ jobs:
 
       - name: Upload artifacts
         if: success()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: jori-companion-macos-build
           path: ${{ runner.temp }}/export-macos/*

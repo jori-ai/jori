@@ -123,7 +123,7 @@ test("the setup server: loopback Host, the page token, JSON writes", async () =>
     assert.equal((await req(port, { p: "/?t=wrong" })).status, 403);
     const page = await req(port, { p: "/?t=t0k" });
     assert.equal(page.status, 200);
-    assert.ok(page.body.includes(`const TOKEN = "t0k"`));
+    assert.ok(page.body.includes(`const SETUP_AUTH = "t0k"`));
     assert.equal((await req(port, { p: "/api/state" })).status, 403, "the API needs the token header");
     const form = await req(port, { method: "POST", p: "/api/identity", headers: { "x-setup-token": token, "content-type": "application/x-www-form-urlencoded" }, body: "a=1" });
     assert.equal(form.status, 415, "a cross-site form post is refused");

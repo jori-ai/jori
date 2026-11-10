@@ -43,7 +43,7 @@ const TZ = "Asia/Jerusalem";
 const ROOM = "https://us02web.zoom.us/j/1234567890?pwd=abc";
 const NOW = Date.parse("2026-10-21T08:00:00Z");
 // Fake, test-only Zoom credentials (the test asserts they never reach output).
-const CREDS = { cfg: { accountId: "ACCTabcdefghijklmnop12", clientId: "CLIENTxyz0123456789ab", clientSecret: "SECRET0123456789abcdef0123456789" }, // gitleaks:allow
+const CREDS = { cfg: { accountId: "ACCTabcdefghijklmnop12", clientId: "CLIENTxyz0123456789ab", clientSecret: "example-client-secret-0123456789" }, // gitleaks:allow
                 source: "file", problem: null };
 const SECRETS = Object.values(CREDS.cfg);
 
