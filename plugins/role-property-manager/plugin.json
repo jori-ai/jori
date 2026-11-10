@@ -1,0 +1,32 @@
+{
+  "name": "role-property-manager",
+  "title": "Property Manager (role)",
+  "description": "The Property Manager on your team: the homes: stays and leases, property books, locks, devices, maintenance. Owns those jobs, signs what they send, and brings this role's specialty to every one of them.",
+  "version": "1.0.0",
+  "default": "disabled",
+  "requires": {
+    "plugins": [],
+    "bins": [],
+    "commands": [],
+    "env": []
+  },
+  "schedules": [],
+  "launchd": [],
+  "role": {
+    "id": "property-manager",
+    "title": "Property Manager",
+    "responsibility": "The homes: stays and leases, property books, locks, devices, maintenance.",
+    "jobs": [
+      "stay-calendar",
+      "finance-property-review",
+      "lock-health",
+      "home-devices",
+      "spa-heating-*"
+    ],
+    "intents": [
+      "lock-health",
+      "property"
+    ],
+    "specialization": "specialization.md"
+  }
+}

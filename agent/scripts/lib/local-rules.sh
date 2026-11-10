@@ -16,8 +16,8 @@
 #       when it exists and is not blank; nothing otherwise.
 #   jori_job_prompt <job-md>
 #       The playbook, then its local companion (<local>/jobs/<basename>.md)
-#       after a blank line when that exists and is not blank. Without one the
-#       playbook's bytes are printed unchanged.
+#       after a blank line when that exists and is not blank, then the owning
+#       team role's specialization (lib/org.cjs roleBrief) when it has one.
 #   jori_local_rules_role <cwd>
 #       Which local rules the CLAUDE.md hierarchy at <cwd> stands for:
 #       "ops" (an ops-* agent dir), "chat" (chat-agent), "shared" (elsewhere
@@ -59,13 +59,18 @@ jori_job_companion() {
 }
 
 jori_job_prompt() {
-  local md="$1" companion
+  local md="$1" companion brief
   companion="$(jori_job_companion "$md")"
   if [ -n "$companion" ]; then
     printf '%s\n\n%s\n' "$(cat "$md")" "$(cat "$companion")"
   else
     cat "$md"
   fi
+  # The specialization of the team role that owns this job (system/org.md).
+  brief="$("${JORI_NODE:-node}" -e 'try{const b=require(process.argv[1]).roleBrief(process.argv[2]);if(b)process.stdout.write(b)}catch{}' \
+    "$(_jori_local_tools)/lib/org.cjs" "$(basename "$md" .md)" 2>/dev/null)"
+  [ -n "$brief" ] && printf '\n%s\n' "$brief"
+  return 0
 }
 
 jori_local_rules_role() {

@@ -1,0 +1,26 @@
+{
+  "name": "role-sales-ops",
+  "title": "Sales Ops (role)",
+  "description": "The Sales Ops on your team: pipeline, renewals and the CRM, kept honest. Owns those jobs, signs what they send, and brings this role's specialty to every one of them.",
+  "version": "1.0.0",
+  "default": "disabled",
+  "requires": {
+    "plugins": [],
+    "bins": [],
+    "commands": [],
+    "env": []
+  },
+  "schedules": [],
+  "launchd": [],
+  "role": {
+    "id": "sales-ops",
+    "title": "Sales Ops",
+    "responsibility": "Pipeline, renewals and the CRM, kept honest.",
+    "jobs": [],
+    "intents": [
+      "pipeline",
+      "renewal"
+    ],
+    "specialization": "specialization.md"
+  }
+}

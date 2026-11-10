@@ -1,0 +1,47 @@
+{
+  "name": "role-executive-assistant",
+  "title": "Executive Assistant (role)",
+  "description": "The Executive Assistant on your team: inbox, calendar, messages, reminders, meetings and purchases. Owns those jobs, signs what they send, and brings this role's specialty to every one of them.",
+  "version": "1.0.0",
+  "default": "disabled",
+  "requires": {
+    "plugins": [],
+    "bins": [],
+    "commands": [],
+    "env": []
+  },
+  "schedules": [],
+  "launchd": [],
+  "role": {
+    "id": "executive-assistant",
+    "title": "Executive Assistant",
+    "responsibility": "Inbox, calendar, messages, reminders, meetings and purchases.",
+    "jobs": [
+      "email-inbound",
+      "anytime-mail-check",
+      "p1-resolve",
+      "reclassification-digest",
+      "triage-learning",
+      "message-digest",
+      "message-followup",
+      "watch-action",
+      "watch-review",
+      "meetings",
+      "meeting-calendar-check",
+      "call-log",
+      "calendar-attendee-audit",
+      "purchase",
+      "purchase-*",
+      "receipt-scan"
+    ],
+    "intents": [
+      "p1-email",
+      "ticket-confirmation",
+      "reminder",
+      "watch",
+      "purchase",
+      "message-followup"
+    ],
+    "specialization": "specialization.md"
+  }
+}

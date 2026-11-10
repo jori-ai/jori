@@ -1,0 +1,35 @@
+{
+  "name": "role-travel-manager",
+  "title": "Travel Manager (role)",
+  "description": "The Travel Manager on your team: trips: flights and bookings, the travel timeline, area guides and fares. Owns those jobs, signs what they send, and brings this role's specialty to every one of them.",
+  "version": "1.0.0",
+  "default": "disabled",
+  "requires": {
+    "plugins": [],
+    "bins": [],
+    "commands": [],
+    "env": []
+  },
+  "schedules": [],
+  "launchd": [],
+  "role": {
+    "id": "travel-manager",
+    "title": "Travel Manager",
+    "responsibility": "Trips: flights and bookings, the travel timeline, area guides and fares.",
+    "jobs": [
+      "flights-scan",
+      "trip-reservoir",
+      "trip-reservoir-*",
+      "reservoir-mark-done",
+      "cruise-watch",
+      "festival-watch",
+      "places-saved-refresh"
+    ],
+    "intents": [
+      "flights",
+      "travel",
+      "cruise-watch"
+    ],
+    "specialization": "specialization.md"
+  }
+}

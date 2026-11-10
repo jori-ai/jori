@@ -1,0 +1,40 @@
+{
+  "name": "role-social-director",
+  "title": "Social Director (role)",
+  "description": "The Social Director on your team: the fun: shows, comedy, concerts, events, restaurants, movies and TV. Owns those jobs, signs what they send, and brings this role's specialty to every one of them.",
+  "version": "1.0.0",
+  "default": "disabled",
+  "requires": {
+    "plugins": [],
+    "bins": [],
+    "commands": [],
+    "env": []
+  },
+  "schedules": [],
+  "launchd": [],
+  "role": {
+    "id": "social-director",
+    "title": "Social Director",
+    "responsibility": "The fun: shows, comedy, concerts, events, restaurants, movies and TV.",
+    "jobs": [
+      "weekend-events",
+      "venue-ingest",
+      "venue-watch",
+      "comedy-club-watch",
+      "experiences-watch",
+      "launch-watch",
+      "watchlist-*",
+      "watch-catalog-enrich",
+      "movie-*",
+      "tmdb-watch-providers",
+      "location-ambient"
+    ],
+    "intents": [
+      "weekend-events",
+      "watchlist",
+      "events",
+      "dining"
+    ],
+    "specialization": "specialization.md"
+  }
+}

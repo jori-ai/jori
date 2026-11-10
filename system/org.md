@@ -2,9 +2,13 @@
 
 Jori runs a lot of independent jobs: an inbox triage, a finance review, a weekend-events scan, a nightly memory pass, a build pipeline. The **team** gives them an org chart. Each job belongs to a **role** with a title, a first name and one responsibility (a CFO, a Software Engineer, a Marketer, a Historian…). Every role reports to the user, **the CEO**, and one role, the **Chief of Staff**, coordinates the rest: it keeps track of every project and holds everyone accountable (the projects plugin, `plugins/projects`).
 
+## Each role is a plugin
+
+A role is a kernel plugin, `plugins/role-<id>/` (`jori plugin enable role-cfo`): its `plugin.json` carries a `role` block (`id`, `title`, `responsibility`, the kernel `jobs` it owns, `intents`, `chief_of_staff`) and its **specialization**, `specialization.md`: how that role thinks, what it checks, its standards. At dispatch the specialization is appended to the playbook of every job the role owns (the supervisor's webhook path in `agent/supervisor/http-server.mjs`, and `jori_job_prompt` in `agent/scripts/lib/local-rules.sh` for the forks), headed `## Your role on the team: <name>, <title>`, so the CFO's jobs run as a CFO. The kernel ships: Chief of Staff (requires the projects plugin), Executive Assistant, Software Engineer, IT & Security, CFO, Marketer, Property Manager, Travel Manager, Social Director, Relationships, Health Coach, Historian, Research Analyst, Sales Ops, Customer Success. All off by default.
+
 ## Where it lives
 
-- **The roster:** `agent/local/config/org.json` (the installation's own; no file = no team, nothing signed).
+- **The roster:** the enabled role plugins, named and extended by `agent/local/config/org.json` (the installation's own: each `roles` entry by `id` gives the role its `name` and adds the installation's own `jobs` and `intents`; a role whose plugin is installed but off is off; an entry with no plugin at all is an installation-only role). No enabled role = no team, nothing signed.
   ```json
   { "ceo": "<the user's first name>",
     "roles": [
@@ -16,7 +20,7 @@ Jori runs a lot of independent jobs: an inbox triage, a finance review, a weeken
         "jobs": ["projects", "hum", "hum-*", "morning-digest"] } ] }
   ```
   `jobs` are job names (the task registry, playbooks, plugin schedules and launchd labels); a trailing `*` is a prefix. A launcher's wrapper prefix (`trigger-`, `venue-watch-`, `ai.claude.`) is ignored. **The most specific match wins**: an exact name beats any prefix, a longer prefix a shorter one. `intents` are the `jori-send-curl --intent` values that belong to the role when they are not a job's own name.
-- **Code:** `lib/org.cjs` (`roleFor`, `signSubject`, `signPing`, `chart`). **CLI:** `bin/org` — `org list` (the chart), `org who <job|intent>`, `org audit` (jobs no role owns; exit 1 when any), `org sign-subject|sign-ping <job> <text>`.
+- **Code:** `lib/org.cjs` (`org`, `rolePlugins`, `roleFor`, `roleBrief`, `signSubject`, `signPing`, `chart`); `lib/plugins.cjs` validates a `role` block. **CLI:** `bin/org` — `org list` (the chart), `org who <job|intent>`, `org audit` (jobs no role owns; exit 1 when any), `org sign-subject|sign-ping <job> <text>`.
 
 ## How the roles show
 
@@ -33,5 +37,5 @@ Each role **signs** what its jobs send to the user:
 ## Rules
 
 - **Every job has a role.** A new job, plugin schedule or launchd agent is added to a role in `org.json` in the same change (`org audit` lists the ones that are not). Where it fits two roles, it goes to the one whose responsibility is the job's purpose.
-- **The roles are a lens, not new agents.** A role does not get its own model session or memory: its jobs run exactly as before, and the chat agent still answers as the assistant. "Who handles X?" is answered with `org who` / `org list`.
+- **The roles are specializations, not new agents.** A role does not get its own model session or memory: its jobs run on the same agents, with the role's specialization appended to their playbooks, and the chat agent still answers as the assistant. "Who handles X?" is answered with `org who` / `org list`.
 - **The Chief of Staff coordinates.** The projects job assigns Jori's own project tasks to the role whose domain they are, and its Sunday review reports by role (`plugins/projects/jobs/projects.md` Step 8).

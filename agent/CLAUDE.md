@@ -53,7 +53,7 @@ A new feature is a plugin (`plugins/<name>/`, or `agent/local/plugins/<name>/` w
 
 ## The team — every job belongs to a role
 
-Jori's jobs are organized as a team (`system/org.md`): roles with a title and a first name (CFO, Software Engineer, Marketer, Historian, …), all reporting to the user (the CEO) and coordinated by the Chief of Staff, the assistant itself. The roster is `agent/local/config/org.json`; `org list` shows it, `org who <job>` names a job's role. **A new job is added to a role in the same change** (`org audit`). A role signs its job's emails and pings (`lib/org.cjs`, through `email-send`, `digest-deliver`, `jori-send-curl`, `jori-notify`); never sign by hand, and never re-sign a message whose text already starts with a role's name.
+Jori's jobs are organized as a team (`system/org.md`): roles with a title and a first name (CFO, Software Engineer, Marketer, Historian, …), all reporting to the user (the CEO) and coordinated by the Chief of Staff, the assistant itself. **Each role is a plugin** (`plugins/role-<id>`) with its own specialization, appended to the playbook of every job it owns at dispatch; when one is appended, work the job as that role. The installation names the roles and adds its own jobs in `agent/local/config/org.json`; `org list` shows it, `org who <job>` names a job's role. **A new job is added to a role in the same change** (`org audit`). A role signs its job's emails and pings (`lib/org.cjs`, through `email-send`, `digest-deliver`, `jori-send-curl`, `jori-notify`); never sign by hand, and never re-sign a message whose text already starts with a role's name.
 
 ## Calendar Invitations — Never invite anyone else unless the user explicitly asks
 

@@ -370,6 +370,8 @@ export function startServers({ ports, gmailSource, supervisor }) {
           task = fs.readFileSync(jobFile, "utf8");
           // + the operator's additions to this playbook, when there are any.
           task = withLocalCompanion(task, readOptional(localCompanionPath(LOCAL_DIR, payload.job)));
+          // + the specialization of the team role that owns this job (system/org.md).
+          try { const brief = require("../../lib/org.cjs").roleBrief(payload.job); if (brief) task = `${task.trimEnd()}\n\n${brief}\n`; } catch { /* no role, no brief */ }
           // No log line here — the subsequent `[supervisor] disp NNNNNN → <job>`
           // already records the dispatch. The former `loaded job instructions`
           // line fired on every webhook and drowned real signal.

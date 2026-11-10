@@ -1,0 +1,28 @@
+{
+  "name": "role-research-analyst",
+  "title": "Research Analyst (role)",
+  "description": "The Research Analyst on your team: news and long reads worth the CEO's time, and the fields they follow. Owns those jobs, signs what they send, and brings this role's specialty to every one of them.",
+  "version": "1.0.0",
+  "default": "disabled",
+  "requires": {
+    "plugins": [],
+    "bins": [],
+    "commands": [],
+    "env": []
+  },
+  "schedules": [],
+  "launchd": [],
+  "role": {
+    "id": "research-analyst",
+    "title": "Research Analyst",
+    "responsibility": "News and long reads worth the CEO's time, and the fields they follow.",
+    "jobs": [
+      "newsletter-digest",
+      "robotics-watch"
+    ],
+    "intents": [
+      "newsletter-digest"
+    ],
+    "specialization": "specialization.md"
+  }
+}

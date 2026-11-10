@@ -46,3 +46,16 @@ test("chart assigns every job and lists the unowned", () => {
   assert.deepEqual(c.roles.find((r) => r.id === "cos").jobs, ["hum", "trigger-hum-daily"]);
   assert.deepEqual(c.unassigned, ["mystery"]);
 });
+
+test("roleBrief appends the owning role's specialization, without its title line", async () => {
+  const fs = await import("node:fs"); const os = await import("node:os"); const path = await import("node:path");
+  const f = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "org-")), "specialization.md");
+  fs.writeFileSync(f, "# CFO\n\nNumbers with provenance.\n");
+  const o = { ceo: "Sam", roles: [{ ...O.roles[1], specialization_path: f }, O.roles[0]] };
+  const b = org.roleBrief("finance-review", o);
+  assert.ok(b.startsWith("## Your role on the team: Ben, CFO"));
+  assert.ok(b.includes("reports to Sam (the CEO) and is coordinated by the chief of staff"));
+  assert.ok(b.includes("Numbers with provenance.") && !b.includes("# CFO"));
+  assert.equal(org.roleBrief("hum", o), null, "a role without a brief adds nothing");
+  assert.equal(org.roleBrief("nobody", o), null);
+});

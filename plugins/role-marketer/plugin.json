@@ -1,0 +1,31 @@
+{
+  "name": "role-marketer",
+  "title": "Marketer (role)",
+  "description": "The Marketer on your team: growth for the CEO's products: app stores, search, reviews, communities and outreach. Owns those jobs, signs what they send, and brings this role's specialty to every one of them.",
+  "version": "1.0.0",
+  "default": "disabled",
+  "requires": {
+    "plugins": [],
+    "bins": [],
+    "commands": [],
+    "env": []
+  },
+  "schedules": [],
+  "launchd": [],
+  "role": {
+    "id": "marketer",
+    "title": "Marketer",
+    "responsibility": "Growth for the CEO's products: app stores, search, reviews, communities and outreach.",
+    "jobs": [
+      "mkt-*",
+      "ph-marketing",
+      "domain-research",
+      "domain-research-*"
+    ],
+    "intents": [
+      "mkt",
+      "marketing"
+    ],
+    "specialization": "specialization.md"
+  }
+}
