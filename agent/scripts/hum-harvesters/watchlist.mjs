@@ -25,7 +25,7 @@
 // shelf was folded into the queue by the v2 migration.
 import { createRequire } from "node:module";
 import { readStdinJson, readCache, writeCache, emit, emitNull, stampRun } from "./_common.mjs";
-import { loadAll, patchSeason, patchTitle, todayEt, watchedThrough, rest } from "../../../lib/watch-db.mjs";
+import { loadAll, patchSeason, patchTitle, todayEt, watchedThrough, rest, readSeasonRatings } from "../../../lib/watch-db.mjs";
 import { currentPresence, countryFromPresence } from "../../../lib/watch-where.mjs";
 import { recommend } from "../../../lib/watch-rank.mjs";
 import { PARTNER, listLabel, whoFor, siteName } from "../../../lib/watch-config.mjs";
@@ -62,7 +62,7 @@ async function finaleDay() {
     const key = `watchlist-finale-day:${t.id}:${s.n}:${proj.projected_finale_date}`;
     if (cache.last_finale_day_key === key) return { reason: `finale-day already surfaced for ${t.name}` };
 
-    const r = recommend({ titles, feedback, prefs, audience: t.audience, kind: "show", today });
+    const r = recommend({ titles, feedback, prefs, audience: t.audience, kind: "show", today, seasonRatings: readSeasonRatings() });
     const picks = [...r.ready, ...r.fresh].filter((p) => p.id !== t.id).slice(0, 3);
     if (!picks.length) return { reason: `finale today for ${t.name} but nothing to suggest` };
     writeCache("watchlist", { ...cache, last_finale_day_key: key });

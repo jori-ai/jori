@@ -1,13 +1,21 @@
 {
   "name": "projects",
-  "title": "Projects",
-  "description": "Keeps a page for every project you're working on, from a trip you're planning to something you're building: its goal and what you might need to finish it. Kept current every night from your memory, calendar and tasks, and corrected by the dream. You get an email when a project is added or finished.",
-  "version": "1.0.0",
+  "title": "Chief of Staff",
+  "description": "Your chief of staff: keeps track of every project you're working on and holds everyone accountable. A page per project, from a trip you're planning to something you're building, with its goal, what you might need, and a task list. Your tasks go on your Google Tasks list with a date, and it follows up when one slips, with a review every Sunday. Tasks Jori can do itself (code, documents, research) it does overnight and brings to you for review. Kept current every night from your memory, calendar and tasks, and corrected by the dream.",
+  "version": "1.1.1",
   "default": "disabled",
   "requires": {
     "plugins": [],
-    "bins": ["bin/wiki", "bin/wiki-people", "bin/hum-ideas-append", "bin/digest-deliver"],
-    "commands": ["gog", "git"],
+    "bins": [
+      "bin/wiki",
+      "bin/wiki-people",
+      "bin/hum-ideas-append",
+      "bin/digest-deliver"
+    ],
+    "commands": [
+      "gog",
+      "git"
+    ],
     "env": []
   },
   "config": {
@@ -21,6 +29,12 @@
       "cron": "51 4 * * *",
       "run": "bin/projects-trigger",
       "log": "agent/logs/projects.log"
+    },
+    {
+      "label": "projects-task-sync",
+      "cron": "*/30 * * * *",
+      "run": "bin/projects-task-sync",
+      "log": "agent/logs/projects-task-sync.log"
     }
   ],
   "provides_bins": [
@@ -34,8 +48,14 @@
         "effort": "high"
       },
       "task": {
-        "description": "Nightly: keep a wiki page for each project the user is working on (goal, what they might need, coming up, lately) from memory, calendar and tasks."
+        "description": "Nightly: keep a wiki page and a task list for each project the user is working on (goal, what they might need, tasks, coming up, lately) from memory, calendar and tasks; follow up on slipped tasks; pick the work Jori can do."
       }
     }
-  }
+  },
+  "launchd": [
+    {
+      "label": "ai.claude.project-work",
+      "file": "ai.claude.project-work.plist"
+    }
+  ]
 }

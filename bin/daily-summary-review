@@ -98,7 +98,15 @@ if (!date || !/^\d{4}-\d{2}-\d{2}$/.test(date)) {
 }
 const arg = (f, d) => { const i = process.argv.indexOf(f); return i > -1 ? process.argv[i + 1] : d; };
 const flag = (f) => process.argv.includes(f);
-const modelName = arg("--model", "opus");
+// The default reviewer model is the installation's choice when it made one
+// (agent/local/config/fork-models.json jobs["daily-summary-review"].model), else Opus.
+let defaultModel = "opus";
+try {
+  const fm = require(path.join(__dirname, "../lib/instance.cjs")).localConfig("fork-models", { jobs: {} });
+  const m = fm && fm.jobs && fm.jobs["daily-summary-review"] && fm.jobs["daily-summary-review"].model;
+  if (m && MODELS[m]) defaultModel = m;
+} catch { /* Opus */ }
+const modelName = arg("--model", defaultModel);
 const model = MODELS[modelName] || MODELS.opus;
 const effort = arg("--effort", "high");
 const noModel = flag("--no-model");

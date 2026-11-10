@@ -1,0 +1,94 @@
+#!/bin/bash
+# project-work-trigger — once a night, after the projects job has planned: let
+# Jori do the project tasks it may do on its own, and email the user what is
+# ready for review (plugins/projects/jobs/project-work.md).
+#
+# launchd (ai.claude.project-work) fires this at a few times in the early
+# morning; the first that finds tonight's projects run done (or that it is past
+# the last chance) does the work, and the rest see the day is done and exit.
+# Not cron: the run is a `claude -p` that needs the Max sign-in in the GUI
+# keychain (lib/run-ephemeral-opus.sh).
+#
+# Spend is bounded twice: the lane's own weekly share (projects settings
+# `work_weekly_share`, checked here against the fork cost ledger) and the
+# allowance governor (bin/allowance-brake), which holds the run while the week
+# is on pace to run out.
+
+PLUGIN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+KERNEL_TOOLS="$(cd "$PLUGIN_DIR/../.." && pwd)"
+source "$KERNEL_TOOLS/agent/scripts/lib/script-job-env.sh"   # PATH, GOG_KEYRING_PASSWORD, JORI_INSTALL_TOOLS
+SCRIPTS="$KERNEL_TOOLS/agent/scripts"
+NODE="${JORI_NODE:-node}"
+P="$PLUGIN_DIR/bin/projects"
+DATA="$JORI_INSTALL_TOOLS/data/projects"
+STATE="$DATA/work-state.json"
+LOG="$JORI_INSTALL_TOOLS/agent/logs/project-work.log"
+JOB_MD="$PLUGIN_DIR/jobs/project-work.md"
+mkdir -p "$DATA/work-results" "$(dirname "$LOG")"
+log() { echo "$(date '+%Y-%m-%d %H:%M:%S') [project-work] $1" >> "$LOG"; }
+
+TODAY="$("$NODE" -e 'process.stdout.write(require(process.argv[1]).today())' "$PLUGIN_DIR/lib/project-tasks.js")"
+FORCE=0; [ "${1:-}" = "--force" ] && FORCE=1
+LAST_CHANCE_HOUR="${PROJECT_WORK_LAST_HOUR:-8}"
+HOUR="$(date +%H)"; HOUR=$((10#$HOUR))
+
+done_today() { "$NODE" -e 'const fs=require("fs");const p=process.argv[1];let s={};try{s=JSON.parse(fs.readFileSync(p,"utf8"))}catch{};s.last_date=process.argv[2];s.last_outcome=process.argv[3];s.at=new Date().toISOString();fs.writeFileSync(p,JSON.stringify(s,null,1)+"\n")' "$STATE" "$TODAY" "$1"; }
+
+if [ "$FORCE" -eq 0 ]; then
+  LAST="$("$NODE" -e 'try{process.stdout.write(JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")).last_date||"")}catch{}' "$STATE")"
+  [ "$LAST" = "$TODAY" ] && exit 0
+  # Wait for tonight's planning pass, which picks and sizes the work; past the
+  # last chance, work from what the ledger already holds.
+  PLANNED="$(tail -n 1 "$JORI_INSTALL_TOOLS/data/projects-log.jsonl" 2>/dev/null | "$NODE" -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{process.stdout.write(JSON.parse(s).date||"")}catch{}})')"
+  if [ "$PLANNED" != "$TODAY" ] && [ "$HOUR" -lt "$LAST_CHANCE_HOUR" ]; then
+    log "waiting: tonight's projects run is not logged yet"
+    exit 0
+  fi
+fi
+
+QUEUE_JSON="$("$NODE" "$P" task work-queue --json 2>>"$LOG")" || { log "work-queue failed"; exit 1; }
+read -r OVER N PER_NIGHT LARGE <<<"$(printf '%s' "$QUEUE_JSON" | "$NODE" -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{const j=JSON.parse(s);const pick=j.queue.slice(0,j.per_night||2);console.log([j.budget.over||j.budget.cap<=0?1:0,pick.length,j.per_night||2,pick.some(t=>t.size==="large")?1:0].join(" "))})')"
+if [ "$OVER" = "1" ]; then log "skip: the lane's weekly share is used up ($(printf '%s' "$QUEUE_JSON" | "$NODE" -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{const b=JSON.parse(s).budget;process.stdout.write(`${(b.share*100).toFixed(1)}% of ${(b.cap*100).toFixed(0)}%`)})'))"; done_today over-budget; exit 0; fi
+if [ "${N:-0}" -eq 0 ]; then log "nothing Jori can work on tonight"; done_today empty; exit 0; fi
+
+# The allowance governor, decided before the run (lib/allowance-gate.sh).
+source "$KERNEL_TOOLS/agent/scripts/lib/allowance-gate.sh"
+allowance_gate project-work "$TODAY"
+if [ "$BRAKE_RC" -eq 3 ]; then
+  log "held by the allowance governor: $BRAKE_REASON"
+  # Past the last chance the night is over; the tasks wait for tomorrow.
+  [ "$HOUR" -ge "$LAST_CHANCE_HOUR" ] && done_today held
+  exit 0
+fi
+[ -f "$KERNEL_TOOLS/agent/config/models.env" ] && source "$KERNEL_TOOLS/agent/config/models.env"
+# Sonnet at high for small and medium work; a large task gets Opus at xhigh. kernel-guard-ok: generic effort level names
+RUN_ARGS=(--model "${JORI_MODEL_SONNET:-claude-sonnet-5-5}" --effort high)
+[ "$LARGE" = "1" ] && RUN_ARGS=()
+[ "$BRAKE_RC" -eq 4 ] && RUN_ARGS=(--model "$BRAKE_MODEL" ${BRAKE_EFFORT:+--effort "$BRAKE_EFFORT"})
+export JORI_BRAKE_DECIDED=1
+
+REPORT="$DATA/work-results/$TODAY.html"
+POINTER="$DATA/work-results/$TODAY.pointer"
+rm -f "$REPORT" "$POINTER"
+log "start: $N task(s), large=$LARGE, ${RUN_ARGS[1]:-opus}"
+TASK="Run the PROJECT WORK job for $TODAY. Take at most $PER_NIGHT task(s) from \`projects task work-queue --json\`, in its order.
+Write the review email to $REPORT and its one-line phone pointer to $POINTER (Step 6)."
+"$KERNEL_TOOLS/agent/scripts/lib/run-ephemeral-opus.sh" project-work "$JOB_MD" --task "$TASK" --timeout-min 90 ${RUN_ARGS[@]+"${RUN_ARGS[@]}"}
+RC=$?
+log "runner exit $RC"
+done_today "ran:$RC"
+
+# Anything left "working" was cut off: give it back to the queue's next night.
+"$NODE" -e '
+const pt=require(process.argv[1]);
+pt.withLock((l)=>{for(const t of Object.values(l.tasks)) if(t.jori.state==="working"){t.jori.state="failed";t.jori.result={kind:null,link:null,summary:"The run ended before this task was finished.",failed:true,at:new Date().toISOString()};}});' "$PLUGIN_DIR/lib/project-tasks.js" 2>>"$LOG"
+
+if [ -s "$REPORT" ]; then
+  PTR=(); [ -s "$POINTER" ] && PTR=(--pointer "$(head -n 1 "$POINTER")")
+  "$KERNEL_TOOLS/bin/digest-deliver" --subject "Chief of Staff: work ready for your review — $(date '+%a %b %-d')" \
+    --body-file "$REPORT" --intent project-work --evidence-live "${PTR[@]}" >> "$LOG" 2>&1 \
+    && log "review email sent" || log "review email failed (rc $?)"
+else
+  log "no report written"
+fi
+exit 0

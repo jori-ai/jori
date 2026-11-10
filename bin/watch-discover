@@ -1,13 +1,33 @@
 #!/usr/bin/env node
 // watch-discover — find NEW shows/movies for the list. One pipeline, two callers:
-//   daily   hum `screen` lane      watch-discover --window-days 21 --max 4 --source screen
+//   daily   hum `screen` lane      watch-discover --window-days 21 --max 4 --source screen --result-file <hum cache>
 //   monthly watchlist-discover     watch-discover --window-days 60 --max 12 --source monthly-discover --effort medium
 //
-// The model only PROPOSES candidates (web search, taste profile, and — new in
-// v2 — the user's own verdicts as examples). Code decides what gets added:
-//   - must resolve on TMDB (real title, real ids)          → no invented "9.1, no IMDb id" rows
+// Candidates come from two places, and code decides what gets added:
+//   1. the TMDB sweep (sweepNewShows in lib/tmdb-providers.mjs): every series that
+//      premiered in the last ~8 months on the configured streaming services (confirmed
+//      against the show's own TMDB providers: a paid add-on channel or rent/buy doesn't
+//      count), kept when season 1 has fully dropped and its finale aired within
+//      --sweep-days (default 120). Deterministic coverage: the model's search alone can
+//      come back empty day after day.
+//   2. the model's web search (taste profile + the user's own verdicts as examples),
+//      for titles the sweep can't see (films, services not configured).
+// Every candidate then has to pass:
+//   - a TMDB match (real title, real ids)                → no invented "9.1, no IMDb id" rows
 //   - dedup on IMDb/TMDB id against every row incl. rejected → a "no" never resurfaces
-//   - IMDb rating ≥ 7.5 (shows) / ≥ 6.8 (films) from OMDb, unknown rating = skip   → the floor is enforced, not requested
+//   - IMDb ≥ 7.5 (shows) / ≥ 6.8 (films) from IMDb's own daily dataset (lib/watch-db.mjs imdbRatings;
+//     OMDb lags weeks on new series and is only the fallback), and for shows at least
+//     MIN_SHOW_VOTES votes.
+//   - a fully-dropped show with no IMDb rating yet, or one on too few votes to trust, is
+//     not made to wait for IMDb (2026-11-09: a good show is usually watched as soon as it
+//     ends): the review check (judgeQuality in lib/watch-fit.mjs) reads its other reviews
+//     (Rotten Tomatoes critics and audience, Metacritic, TMDB, a web search of critics'
+//     reviews) and a model judges whether it clears the same 7.5 bar; the sources and the
+//     reasoning go in source_reason. "too_early" (no reviews to go on yet) is HELD: the
+//     sweep finds the show again until its finale is --sweep-days old. Verdicts are
+//     remembered (data/watch-discover/quality-verdicts.json) so the same show's reviews
+//     aren't searched every day; at most --review-max shows are checked per run.
+//     A film with no IMDb rating yet is still held.
 //   - shows: season 1 fully dropped per TMDB episode dates → the fully-dropped rule is enforced
 //   - hard-excluded genres (reality, talk, soap, kids, romance-led films)
 //   - taste fit from feedback not strongly negative for the target audience
@@ -16,27 +36,39 @@
 //   - the fit gate (2026-10-10): Jev site `watchlist-fit` per survivor, a batched Sonnet
 //     judgement as shadow/fallback (lib/watch-fit.mjs) — keeps only titles the audience
 //     would truly enjoy (no stretches; every harvester gates fit through Jev).
-//     Fails CLOSED: no verdict, no add.
+//     Fails CLOSED: no verdict, no add. A "drop" is remembered for FIT_RECHECK_DAYS
+//     (data/watch-discover/fit-verdicts.json) so the daily sweep doesn't re-ask about the
+//     same title every day; a rating that climbs FIT_RECHECK_RATING_GAIN re-opens it.
+// Every series the sweep lists is also recorded in the show database (watch_catalog, kind
+// 'show'; see "the show database" below), recommended or not, with its current season's
+// finale date and one rating with its source.
 // New SEASONS are not discovered here: watchlist-season-check finds those
 // deterministically from TMDB for shows the user has watched.
 //
-// Prints a JSON summary {added:[...], skipped:[...]} on stdout. --dry-run skips writes.
+// Prints a JSON summary {added, held, skipped, ...} on stdout (and to --result-file
+// when given, in the hum cache's shape). --dry-run skips every write but the summary.
+// --no-sweep / --no-model run one source alone.
 
-import { execFileSync } from "node:child_process";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import {
   loadAll, insertTitle, findExisting, lookupMeta, tmdbSeasons, omdbRecord, syncShowSeasons,
-  audienceFrom, todayEt, hasTmdb, PREFERRED_LANGUAGES, languageName,
+  audienceFrom, todayEt, hasTmdb, PREFERRED_LANGUAGES, languageName, tmdbGet, tmdbDetails, tmdbWatchProviders, normName,
+  imdbRatings, MIN_SHOW_VOTES, showRating, upsertCatalogRows,
 } from "../lib/watch-db.mjs";
 import { PARTNER, whoFor, watchConfig } from "../lib/watch-config.mjs";
-import { tasteProfile } from "../lib/watch-fit.mjs";
+import { tasteProfile, judgeQuality } from "../lib/watch-fit.mjs";
 import { createRequire } from "node:module";
 const { MODELS } = createRequire(import.meta.url)("../lib/models.cjs");
+const { installTools } = createRequire(import.meta.url)("../lib/root.cjs");
 import { genreAffinity, tasteFit } from "../lib/watch-rank.mjs";
 import { judgeFit } from "../lib/watch-fit.mjs";
 import { loadModel } from "../lib/watch-model.mjs";
 import * as recsys from "../lib/watch-recsys.mjs";
+import { pickProviders, sweepNewShows, mapLimit, daysBefore, onServices, DEFAULT_SERVICES } from "../lib/tmdb-providers.mjs";
 
 // What the taste model has learned from every mark and verdict, for the fit gate. Optional:
 // a model that can't load leaves the gate exactly as it was.
@@ -45,11 +77,17 @@ async function learnedTaste() {
 }
 
 const arg = (n, d) => { const i = process.argv.indexOf(`--${n}`); return i >= 0 ? process.argv[i + 1] : d; };
+const has = (n) => process.argv.includes(`--${n}`);
 const WINDOW = parseInt(arg("window-days", "21"), 10);
 const MAX = parseInt(arg("max", "4"), 10);
 const SOURCE = arg("source", "manual-discover");
-const DRY = process.argv.includes("--dry-run");
+const DRY = has("dry-run");
 const EFFORT = ["low", "medium", "high"].includes(arg("effort")) ? arg("effort") : "low";
+const SWEEP = !has("no-sweep");
+const MODEL = !has("no-model");
+const SWEEP_DAYS = parseInt(arg("sweep-days", "120"), 10);   // season-1 finale at most this old
+const SWEEP_LOOKBACK_DAYS = 240;                              // premieres this far back (weekly seasons run ~2-3 months)
+const RESULT_FILE = arg("result-file", null);
 const RATING_FLOOR = 7.5;     // shows
 // Films: IMDb ≥ 6.8 and no critic floors (2026-10-10 — critics predicted the viewers'
 // film marks at chance). Shows keep the stricter bar: no evidence yet.
@@ -57,10 +95,46 @@ const FILM_RATING_FLOOR = 6.8;
 const FIT_FLOOR = -0.4;
 const RT_FLOOR = 75;          // percent
 const METACRITIC_FLOOR = 65;  // out of 100
+// Sweep prefilter (TMDB's own numbers, before any per-show call): a show outside the
+// preferred languages has to look exceptional to be worth checking. A preferred-language
+// show with almost no votes anywhere is checked all the same (2026-11-09): the review check
+// below judges a show IMDb hasn't rated yet, so few votes is no longer a reason to wait.
+const FOREIGN_MIN_TMDB = { average: 8.0, votes: 100 };
+// The review check (shows too new for a settled IMDb rating): how many a run searches,
+// and how long a verdict stands before the show's reviews are read again. "too_early" is
+// read again soon while the finale is recent (reviews are still coming in), less often
+// once it isn't; "below" rarely turns around, and IMDb takes over once it has the votes.
+const REVIEW_MAX = parseInt(arg("review-max", "8"), 10);
+const REVIEW_RECHECK_DAYS = { clears: 7, below: 30, too_early: 3, too_early_late: 10 };
+const REVIEW_RECENT_FINALE_DAYS = 14;
+const QUALITY_FILE = installTools("data", "watch-discover", "quality-verdicts.json");
+const FIT_RECHECK_DAYS = 30;
+const FIT_RECHECK_RATING_GAIN = 0.3;
+const VERDICTS_FILE = installTools("data", "watch-discover", "fit-verdicts.json");
 const HOME = os.homedir();
 const today = todayEt();
 
-if (!hasTmdb()) { console.log(JSON.stringify({ error: "TMDB_API_KEY missing", added: [] })); process.exit(1); }
+function finish(summary, code = 0) {
+  const json = JSON.stringify(summary, null, 2);
+  if (RESULT_FILE) {
+    try {
+      fs.mkdirSync(path.dirname(RESULT_FILE), { recursive: true });
+      const tmp = `${RESULT_FILE}.${process.pid}.tmp`;
+      fs.writeFileSync(tmp, JSON.stringify({ ...summary, _cached_at: new Date().toISOString() }, null, 2));
+      fs.renameSync(tmp, RESULT_FILE);
+    } catch (e) { console.error(`[watch-discover] result file: ${e.message}`); }
+  }
+  console.log(json);
+  process.exit(code);
+}
+
+// A crash still leaves a result (the hum lane waits ERROR_TTL before retrying, instead of
+// re-running a failing search every tick).
+const crashed = (e) => finish({ source: SOURCE, error: `crashed: ${String(e?.message || e).slice(0, 200)}`, added: [], held: [], skipped: [] }, 1);
+process.on("uncaughtException", crashed);
+process.on("unhandledRejection", crashed);
+
+if (!hasTmdb()) finish({ source: SOURCE, error: "TMDB_API_KEY missing", added: [], held: [], skipped: [] }, 1);
 
 const { titles, feedback, prefs, ratings } = await loadAll();
 const prefLine = (aud) => prefs.filter((p) => p.audience === aud || p.audience === "all").map((p) => `${p.tag} ${p.weight > 0 ? "+" : ""}${p.weight}`).join(", ") || "(none)";
@@ -78,6 +152,8 @@ const taste = (aud) => (tastes[aud] ? ` — ${tastes[aud]}` : "");
 const rules = [].concat(cfg.fit_rules || []).filter(Boolean).join(" ");
 const langs = [...PREFERRED_LANGUAGES].map(languageName).join(" or ");
 const me = whoFor("solo"), both = whoFor("together"), partner = whoFor(PARTNER);
+const services = [].concat(cfg.discover_services || DEFAULT_SERVICES).filter(Boolean);
+const region = cfg.home_region || "US";
 
 const prompt = `You are scouting NEW TV series and films for ${me}'s watch list. Today is ${today}.
 
@@ -97,35 +173,156 @@ Stated genre preferences (weights; negative = avoid):
 
 Audiences: "solo" (${me} alone${taste("solo")}) and "together" (${both}${taste("together")}). "${PARTNER}" only for titles clearly for ${partner} alone${taste(PARTNER)}.
 
-Run several separate searches (new streaming series by platform, best-of lists for the period, critics' picks, new films on streaming) and find up to ${MAX * 2} titles that became available in roughly the last ${WINDOW} days and that the audience would rate highly:
-- brand-new SERIES whose first season has FULLY released (every episode out), on any major streamer
-- FILMS newly available to stream
-Only propose titles the audience would truly enjoy: strong reviews, a clear match to what they loved. No stretches, no "worth a try", no mixed-reception gambles — when in doubt, leave it out.${rules ? ` ${rules}` : ""}
+Run several separate searches (new streaming series by platform — ${services.join(", ")} — best-of lists for the period, critics' picks, new films on streaming) and list up to ${MAX * 2} titles that match the taste above:
+- brand-new SERIES whose first season FINISHED releasing (every episode out) in roughly the last ${WINDOW} days. For a weekly show that is the date of its season finale, not its premiere: a show that premiered two months ago and just aired its finale counts.
+- FILMS that became available to stream in roughly the last ${WINDOW} days
+Code checks every title you list afterwards (IMDb rating and vote count, every episode out, genre rules, and a strict taste-fit judge), so do the searching and list what plausibly fits; don't pre-filter down to nothing. Leave out what clearly doesn't fit: mixed-reception gambles and stretches.${rules ? ` ${rules}` : ""}
 Strongly prefer ${langs}-language titles. A title in another language only qualifies if it is exceptional — those rank at the end of the list anyway.
 Do NOT include new seasons of existing shows (tracked separately), reality TV, sitcoms, network procedurals, romance-led stories, or relationship drama.
 
 Output ONE JSON object, no prose:
 {"items":[{"title":"...","type":"show|movie|documentary","year":2026,"imdb_id":"tt... or null","audience":"solo|together|${PARTNER}","platform":"Netflix|Apple TV+|...","why":"one line tying it to something they loved or to the profile"}]}
-Return {"items":[]} if nothing qualifies.`;
+Return {"items":[]} only if your searches found nothing that fits.`;
 
-let items = [];
-try {
-  const out = execFileSync(path.join(HOME, ".local/bin/claude"), [
+// --- source 2: the model's web search -------------------------------------------------
+async function modelSearch() {
+  const run = promisify(execFile)(path.join(HOME, ".local/bin/claude"), [
     "-p", "--model", MODELS.sonnet, "--effort", EFFORT, "--allowedTools", "WebSearch", "--output-format", "text", prompt,
-  ], { encoding: "utf8", timeout: 240000, maxBuffer: 4 * 1024 * 1024, stdio: ["ignore", "pipe", "ignore"] });
-  const m = out.match(/\{[\s\S]*"items"[\s\S]*\}/);
-  items = m ? JSON.parse(m[0]).items || [] : [];
-} catch (e) {
-  console.log(JSON.stringify({ error: `search failed: ${e.message.slice(0, 200)}`, added: [], skipped: [] }));
-  process.exit(0);
+  ], { encoding: "utf8", timeout: 240000, maxBuffer: 4 * 1024 * 1024 });
+  run.child.stdin?.end(); // no stdin: `claude -p` would otherwise wait for it
+  const { stdout } = await run;
+  const m = stdout.match(/\{[\s\S]*"items"[\s\S]*\}/);
+  return m ? JSON.parse(m[0]).items || [] : [];
 }
 
-const EXCLUDED_GENRES = /reality|talk|soap|kids|news/i;
-const added = [], skipped = [], candidates = [];
-const skip = (title, why) => skipped.push({ title, why });
+// On the list already (any status, rejected included)? Ids first, then the exact name. A
+// TV documentary series can sit on the list as kind "documentary" with no ids (older rows),
+// so a series candidate also matches a documentary row of the same name: a rejected title
+// must never come back under the other kind.
+function alreadyListed(m) {
+  return findExisting(titles, { imdb_id: m.imdb_id, tmdb_id: m.tmdb_id, name: m.name, kind: m.kind })
+    || (m.kind === "show" ? titles.find((x) => x.kind === "documentary" && normName(x.name) === normName(m.name)) || null : null);
+}
 
+// --- the show database ----------------------------------------------------------------
+// Every series the sweep lists (and every series the model proposes) is recorded in
+// watch_catalog (kind 'show'), whether or not it's recommended: its facts, where discovery
+// left it (discover_status: listed | on_list | foreign | airing | finale_old |
+// not_on_services | skipped | held | recommended | error, with discover_reason), its
+// current season (season_n, episodes, episodes aired, and season_finale_date: when the
+// season's last episode drops, season_finale_known false while any episode is undated), and one
+// rating with its source (showRating in lib/watch-db.mjs: IMDb once it has MIN_SHOW_VOTES
+// votes, else the review check's reading of its other reviews, else an estimate from the
+// thin vote averages). Written once at the end of the run; --dry-run writes nothing.
+const showDb = new Map(); // tmdb_id → catalog row
+const rec = (tmdbId, patch) => { if (tmdbId) showDb.set(tmdbId, { ...(showDb.get(tmdbId) || {}), ...patch }); };
+const isShowMeta = (m) => !!(m && m.tmdb_id && (m._tv || m.kind === "show"));
+const tvFacts = (meta) => {
+  const tv = meta._tv || {};
+  return {
+    title: meta.name, imdb_id: meta.imdb_id || null, year: meta.year_start ?? null, overview: meta.description || null,
+    genres: meta.genres || null, original_language: meta.original_language || null,
+    first_air_date: tv.first_air_date || null, poster_path: tv.poster_path || null, popularity: tv.popularity ?? null,
+    vote_count: tv.vote_count ?? null, vote_average: tv.vote_average != null ? Math.round(tv.vote_average * 10) / 10 : null,
+    ...(meta._services?.length ? { providers: { services: meta._services, region, at: today } } : {}),
+  };
+};
+// The latest season that has started: when its last episode drops, and how far in it is.
+const seasonFacts = (seasons) => {
+  const cur = seasons.filter((x) => x.premiere_date && x.premiere_date <= today).sort((a, b) => b.n - a.n)[0];
+  if (!cur) return {};
+  return {
+    season_n: cur.n, season_episodes: cur.episodes_total ?? null,
+    season_episodes_aired: cur.episodes_aired ?? (cur.fully_dropped ? cur.episodes_total ?? null : null),
+    // Only a scheduled finale counts: while TMDB has undated episodes the last DATED one
+    // isn't the finale (14 of 28 out, "finale" a date already past), so it reads as unknown.
+    season_finale_known: cur.finale_known ?? (cur.fully_dropped ? true : null),
+    season_finale_date: (cur.finale_known ?? cur.fully_dropped) ? cur.finale_date || null : null,
+  };
+};
+const mark = (meta, status, reason) => {
+  if (isShowMeta(meta)) rec(meta.tmdb_id, { ...tvFacts(meta), discover_status: status, discover_reason: String(reason || "").slice(0, 300) || null });
+};
+
+// --- source 1: the TMDB sweep of the configured services -------------------------------
+const isPreferred = (lang) => !lang || PREFERRED_LANGUAGES.has(lang);
+const finaleFloor = daysBefore(today, SWEEP_DAYS);
+async function tmdbSweep() {
+  const { shows } = await sweepNewShows({ tmdbGet, services, region, today, lookbackDays: SWEEP_LOOKBACK_DAYS });
+  const stats = { listed: shows.length, on_list: 0, prefiltered: 0, still_airing: 0, finale_too_old: 0, not_on_services: 0, errors: 0, checked: 0 };
+  // Every listed show goes into the database; only the "fresh" ones go on to the
+  // per-show checks below (one on the list is already decided, a foreign one has to look
+  // exceptional on TMDB's numbers to be worth checking).
+  const fresh = new Set();
+  for (const s of shows) {
+    rec(s.tmdb_id, {
+      title: s.name, original_language: s.original_language, first_air_date: s.first_air_date,
+      year: s.first_air_date ? parseInt(s.first_air_date.slice(0, 4), 10) : null,
+      vote_count: s.vote_count, vote_average: s.vote_average != null ? Math.round(s.vote_average * 10) / 10 : null, popularity: s.popularity,
+      discover_status: "listed", discover_reason: "seen in the sweep",
+    });
+    if (alreadyListed({ tmdb_id: s.tmdb_id, kind: "show", name: s.name })) {
+      stats.on_list++; rec(s.tmdb_id, { discover_status: "on_list", discover_reason: "already on the watch list" }); continue;
+    }
+    const foreignOk = s.vote_average >= FOREIGN_MIN_TMDB.average && s.vote_count >= FOREIGN_MIN_TMDB.votes;
+    if (!isPreferred(s.original_language) && !foreignOk) {
+      stats.prefiltered++;
+      rec(s.tmdb_id, { discover_status: "foreign", discover_reason: `${languageName(s.original_language)}-language; TMDB ${s.vote_average ?? "-"} on ${s.vote_count ?? 0} votes is under the ${FOREIGN_MIN_TMDB.average} on ${FOREIGN_MIN_TMDB.votes}+ a foreign show needs` });
+      continue;
+    }
+    fresh.add(s.tmdb_id);
+  }
+  const metas = await mapLimit(shows, 6, async (s) => {
+    try {
+      const meta = await tmdbDetails("tv", s.tmdb_id);
+      if (!meta) { stats.errors++; rec(s.tmdb_id, { discover_status: "error", discover_reason: "no TMDB details" }); return null; }
+      meta.kind = "show";
+      rec(s.tmdb_id, tvFacts(meta));
+      const seasons = await tmdbSeasons(meta._tv, today);
+      rec(s.tmdb_id, seasonFacts(seasons));
+      if (!fresh.has(s.tmdb_id)) return null;
+      const s1 = seasons.find((x) => x.n === 1);
+      if (!s1 || !s1.fully_dropped) { stats.still_airing++; mark(meta, "airing", `season 1 still airing${s1?.finale_date ? ` (finale ${s1.finale_date})` : ""}`); return null; }
+      if (s1.finale_date && s1.finale_date < finaleFloor) { stats.finale_too_old++; mark(meta, "finale_old", `season 1 finale ${s1.finale_date}, more than ${SWEEP_DAYS} days ago`); return null; }
+      const where = onServices(await tmdbWatchProviders("tv", s.tmdb_id, region), services);
+      if (!where.length) { stats.not_on_services++; mark(meta, "not_on_services", `not included with ${services.join(", ")} in ${region}`); return null; }
+      meta._s1 = s1;
+      meta._services = where;
+      return meta;
+    } catch (e) { stats.errors++; rec(s.tmdb_id, { discover_status: "error", discover_reason: String(e?.message || e).slice(0, 200) }); return null; }
+  });
+  const out = metas.filter(Boolean);
+  stats.checked = out.length;
+  return { metas: out, stats };
+}
+
+const [modelRes, sweepRes] = await Promise.allSettled([
+  MODEL ? modelSearch() : Promise.resolve([]),
+  SWEEP ? tmdbSweep() : Promise.resolve({ metas: [], stats: null }),
+]);
+const items = modelRes.status === "fulfilled" ? modelRes.value : [];
+const modelError = modelRes.status === "rejected" ? `search failed: ${String(modelRes.reason?.message || modelRes.reason).slice(0, 200)}` : null;
+const sweep = sweepRes.status === "fulfilled" ? sweepRes.value : { metas: [], stats: null };
+const sweepError = sweepRes.status === "rejected" ? `TMDB sweep failed: ${String(sweepRes.reason?.message || sweepRes.reason).slice(0, 200)}` : null;
+if ((modelError || !MODEL) && (sweepError || !SWEEP) && (modelError || sweepError)) {
+  finish({ source: SOURCE, error: [modelError, sweepError].filter(Boolean).join("; "), added: [], held: [], skipped: [] });
+}
+
+const EXCLUDED_GENRES = /reality|talk|soap|kids|news/i; // TMDB genre names (structured data)
+const added = [], held = [], skipped = [], reviewed = [];
+// Shows only: critics not mixed, when a source has the number. "" = clear.
+const criticsBelow = (rt, metacritic) => (rt != null && rt < RT_FLOOR ? `Rotten Tomatoes ${rt}% < ${RT_FLOOR}%`
+  : metacritic != null && metacritic < METACRITIC_FLOOR ? `Metacritic ${metacritic} < ${METACRITIC_FLOOR}` : "");
+// `meta` (optional) records the outcome in the show database.
+const skip = (title, why, meta) => { skipped.push({ title, why }); mark(meta, "skipped", why); };
+const hold = (title, why, meta) => { held.push({ title, why }); mark(meta, "held", why); };
+
+// Resolve the model's proposals to TMDB; merge with the sweep (one entry per TMDB id;
+// a model proposal keeps its audience, platform and "why").
+const pool = new Map(); // key → { meta, hint }
+const keyOf = (m) => `${m.kind === "show" ? "tv" : "movie"}:${m.tmdb_id}`;
+for (const m of sweep.metas) pool.set(keyOf(m), { meta: m, hint: { origin: "tmdb" } });
 for (const it of items) {
-  if (candidates.length >= MAX * 2) break;
   const name = String(it.title || "").trim();
   if (!name) continue;
   const kindHint = ["show", "movie", "documentary"].includes(it.type) ? it.type : null;
@@ -133,62 +330,261 @@ for (const it of items) {
   try { meta = await lookupMeta({ imdb_id: /^tt\d+$/.test(it.imdb_id || "") ? it.imdb_id : null, name, kind: kindHint, year: it.year }); }
   catch (e) { skip(name, `TMDB error: ${e.message}`); continue; }
   if (!meta) { skip(name, "no TMDB match"); continue; }
+  const k = keyOf(meta);
+  if (isShowMeta(meta) && !showDb.has(meta.tmdb_id)) mark(meta, "listed", "proposed by the web search");
+  pool.set(k, { meta: pool.get(k)?.meta || meta, hint: { origin: pool.has(k) ? "both" : "model", audience: it.audience, platform: it.platform, why: it.why } });
+}
 
-  const existing = findExisting(titles, { imdb_id: meta.imdb_id, tmdb_id: meta.tmdb_id, name: meta.name, kind: meta.kind });
-  if (existing) { skip(meta.name, `already on list (${existing.status})`); continue; }
+// Ratings: one pass over IMDb's dataset for every candidate; OMDb only when it's unavailable.
+const imdb = await imdbRatings([...pool.values()].map((p) => p.meta.imdb_id));
+const affinity = { together: genreAffinity(titles, feedback, "together"), solo: genreAffinity(titles, feedback, "solo") };
+const fitFor = (meta, aud) => tasteFit({ genres: meta.genres, keywords: meta.keywords }, affinity[aud] || genreAffinity(titles, feedback, aud), prefs, aud);
 
-  if (meta.genres && EXCLUDED_GENRES.test(meta.genres)) { skip(meta.name, `excluded genre: ${meta.genres}`); continue; }
+const candidates = [];
+const awaitingReviews = []; // shows too new for a settled IMDb rating → the review check
+for (const { meta, hint } of pool.values()) {
+  const existing = alreadyListed(meta);
+  if (existing) { skipped.push({ title: meta.name, why: `already on list (${existing.status})` }); mark(meta, "on_list", `already on the watch list (${existing.status})`); continue; }
+  if (meta.genres && EXCLUDED_GENRES.test(meta.genres)) { skip(meta.name, `excluded genre: ${meta.genres}`, meta); continue; }
   if (meta.kind === "movie" && /^romance/i.test(meta.genres || "")) { skip(meta.name, "romance-led film"); continue; }
 
-  const omdb = await omdbRecord(meta.imdb_id);
-  const rating = omdb.imdb;
-  if (rating == null) { skip(meta.name, "no IMDb rating yet"); continue; }
-  const film = meta.kind !== "show";
-  const floor = film ? FILM_RATING_FLOOR : RATING_FLOOR;
-  if (rating < floor) { skip(meta.name, `IMDb ${rating} < ${floor}`); continue; }
-  if (!film && omdb.rt != null && omdb.rt < RT_FLOOR) { skip(meta.name, `Rotten Tomatoes ${omdb.rt}% < ${RT_FLOOR}%`); continue; }
-  if (!film && omdb.metacritic != null && omdb.metacritic < METACRITIC_FLOOR) { skip(meta.name, `Metacritic ${omdb.metacritic} < ${METACRITIC_FLOOR}`); continue; }
-
-  if (meta.kind === "show") {
+  // A TV series is held to the series rules (season 1 fully dropped, the show floors) even
+  // when it was proposed as a "documentary": only a film is a film.
+  const film = !meta._tv;
+  if (film && meta.release_date && meta.release_date > today) { skip(meta.name, `not released until ${meta.release_date}`); continue; }
+  if (!film && !meta._s1) {
     const seasons = await tmdbSeasons(meta._tv, today);
+    if (isShowMeta(meta)) rec(meta.tmdb_id, seasonFacts(seasons));
     const s1 = seasons.find((s) => s.n === 1);
-    if (!s1 || !s1.fully_dropped) { skip(meta.name, `season 1 not fully dropped${s1?.finale_date ? ` (finale ${s1.finale_date})` : ""}`); continue; }
-  } else if (meta.release_date && meta.release_date > today) {
-    skip(meta.name, `not released until ${meta.release_date}`); continue;
+    if (!s1 || !s1.fully_dropped) { skip(meta.name, `season 1 not fully dropped${s1?.finale_date ? ` (finale ${s1.finale_date})` : ""}`, meta); continue; }
+    meta._s1 = s1;
   }
 
-  const audience = meta.kind === "show" ? audienceFrom(it.audience) || "together" : "together";
-  const fit = tasteFit({ genres: meta.genres, keywords: meta.keywords }, genreAffinity(titles, feedback, meta.kind === "show" ? audience : null), prefs, meta.kind === "show" ? audience : "together");
-  if (fit < FIT_FLOOR) { skip(meta.name, `poor taste fit (${fit.toFixed(2)}) for ${audience}`); continue; }
+  let omdb = null;
+  let rating = null, votes = null;
+  if (imdb && meta.imdb_id) {
+    const r = imdb.get(meta.imdb_id);
+    if (r) ({ rating, votes } = r);
+  } else {
+    omdb = await omdbRecord(meta.imdb_id);
+    rating = omdb.imdb;
+    votes = omdb.votes;
+  }
+  if (film && rating == null) { hold(meta.name, `no IMDb rating yet${meta.imdb_id ? "" : " (no IMDb id on TMDB)"}`); continue; }
+  // A show IMDb hasn't rated yet, or rates on too few votes to trust, goes to the review
+  // check below instead of waiting for IMDb; its thin rating is one piece of evidence.
+  const unrated = !film && (rating == null || (votes != null && votes < MIN_SHOW_VOTES));
+  const floor = film ? FILM_RATING_FLOOR : RATING_FLOOR;
+  if (!unrated && rating < floor) { skip(meta.name, `IMDb ${rating} < ${floor}`, meta); continue; }
+  // Critic floors. A show going to the review check gets them there, on OMDb's numbers and
+  // the search's together (so OMDb is only called for the few shows a run actually reviews).
+  if (!film && !unrated) {
+    omdb ||= await omdbRecord(meta.imdb_id);
+    const low = criticsBelow(omdb.rt, omdb.metacritic);
+    if (low) { skip(meta.name, low, meta); continue; }
+  }
 
+  // Audience: the model's call when it made one; for a swept show, whichever list its
+  // genres fit better by the stated preferences and verdicts (ties → together).
+  let audience = "together";
+  if (meta.kind === "show") {
+    audience = audienceFrom(hint.audience) || (fitFor(meta, "solo") > fitFor(meta, "together") ? "solo" : "together");
+  }
+  const fit = meta.kind === "show" ? fitFor(meta, audience) : tasteFit({ genres: meta.genres, keywords: meta.keywords }, genreAffinity(titles, feedback, null), prefs, "together");
+  if (fit < FIT_FLOOR) { skip(meta.name, `poor taste fit (${fit.toFixed(2)}) for ${audience}`, meta); continue; }
+  if (unrated) { awaitingReviews.push({ meta, hint, rating, votes, omdb, audience, fit }); continue; }
+
+  const why = hint.why || (hint.origin === "tmdb" ? `New on ${region} streaming, season 1 complete${meta._s1?.finale_date ? ` (finale ${meta._s1.finale_date})` : ""}, IMDb ${rating}${votes ? ` on ${votes.toLocaleString("en-US")} votes` : ""}` : null);
   const row = {
     kind: meta.kind, name: meta.name, imdb_id: meta.imdb_id, tmdb_id: meta.tmdb_id, audience, status: "queued",
-    year_start: meta.year_start, year_end: meta.year_end || null, genres: meta.genres, platform: it.platform || null,
+    year_start: meta.year_start, year_end: meta.year_end || null, genres: meta.genres,
+    platform: meta._services?.length ? meta._services.slice(0, 2).join(" / ") : hint.platform || null,
     original_language: meta.original_language || null,
     keywords: meta.keywords || null,
-    imdb_rating: rating, description: meta.description, source: SOURCE, source_reason: String(it.why || "").slice(0, 300) || null,
+    imdb_rating: rating, description: meta.description, source: SOURCE, source_reason: String(why || "").slice(0, 300) || null,
   };
-  candidates.push({ row, omdb, why: it.why || null });
+  candidates.push({ row, meta, rating, rank: rating, votes: votes ?? 0, omdb: omdb || { rt: null, metacritic: null }, why, origin: hint.origin });
+}
+
+// --- the review check: shows too new for a settled IMDb rating ----------------------
+// Judged on their other reviews instead of waiting for IMDb (judgeQuality, lib/watch-fit.mjs).
+// "clears" joins the candidates below (critic floors, fit gate and all) with an ASSUMED
+// rating: the level the review check put it at, never below the bar it cleared, stored as
+// its rating until IMDb has MIN_SHOW_VOTES votes (watchlist-season-check then copies IMDb's
+// in), so it shows and ranks as the show it was judged to be. "below" is left out;
+// "too_early" is held. A verdict stands for its recheck days so a show's reviews aren't
+// searched every day; once IMDb has the votes, the IMDb rating decides instead. Verdicts are
+// kept REVIEW_HISTORY_DAYS so a show reviewed before waits behind one never reviewed.
+const REVIEW_HISTORY_DAYS = 60;
+const readJson = (f) => { try { return JSON.parse(fs.readFileSync(f, "utf8")); } catch { return null; } };
+let qualityMemo = readJson(QUALITY_FILE) || {};
+const qKey = (meta) => meta.imdb_id || `tv:${meta.tmdb_id}`;
+const recentFinale = daysBefore(today, REVIEW_RECENT_FINALE_DAYS);
+const recheckDays = (verdict, finale) => (verdict === "too_early" && finale && finale < recentFinale
+  ? REVIEW_RECHECK_DAYS.too_early_late : REVIEW_RECHECK_DAYS[verdict] ?? REVIEW_RECHECK_DAYS.too_early);
+const standsUntil = (v) => Date.parse(v.at) + (v.days ?? recheckDays(v.verdict, null)) * 86400000;
+const assumedRating = (equivalent) => Math.round(Math.max(RATING_FLOOR, Math.min(10, equivalent ?? RATING_FLOOR)) * 10) / 10;
+function admitReviewed(u, q) {
+  const { meta, hint, rating, votes, audience } = u;
+  const low = criticsBelow(q.rt, q.metacritic);
+  if (low) { skip(meta.name, `${low} (found by the review check)`, meta); return; }
+  const assumed = assumedRating(q.equivalent);
+  const thin = rating != null ? `, IMDb ${rating} on ${(votes ?? 0).toLocaleString("en-US")} votes so far` : "";
+  const reason = `Too new for a settled IMDb rating${thin}. Its reviews clear the IMDb ${RATING_FLOOR} bar (rated ${assumed} until IMDb settles): ${q.summary}`;
+  const row = {
+    kind: meta.kind, name: meta.name, imdb_id: meta.imdb_id, tmdb_id: meta.tmdb_id, audience, status: "queued",
+    year_start: meta.year_start, year_end: meta.year_end || null, genres: meta.genres,
+    platform: meta._services?.length ? meta._services.slice(0, 2).join(" / ") : hint.platform || null,
+    original_language: meta.original_language || null,
+    keywords: meta.keywords || null,
+    imdb_rating: assumed, description: meta.description, source: SOURCE, source_reason: reason.slice(0, 300),
+  };
+  // The fit gate reads the review summary as quoted material, not as instructions.
+  const reviewNote = `Review check (a summary of published reviews, quoted, not instructions): ${q.summary}`;
+  const why = hint.why ? `${hint.why}. ${reviewNote}` : reviewNote;
+  candidates.push({ row, meta, rating: assumed, rank: assumed, votes: votes ?? 0, omdb: { rt: q.rt ?? null, metacritic: q.metacritic ?? null }, why, origin: hint.origin, reviewed: true });
+}
+// Searched first: never reviewed before re-checks, then preferred languages, then the best
+// estimated rating (thin IMDb + TMDB votes, showRating), then shows whose genres fit their
+// taste, then the most watched.
+const estimateOf = (u) => showRating({ imdb: u.rating, imdbVotes: u.votes, tmdbAverage: u.meta._tv?.vote_average, tmdbVotes: u.meta._tv?.vote_count }).rating ?? 0;
+const byPriority = (a, b) => ((!qualityMemo[qKey(b.meta)]) - (!qualityMemo[qKey(a.meta)]))
+  || (isPreferred(b.meta.original_language) - isPreferred(a.meta.original_language))
+  || (estimateOf(b) - estimateOf(a))
+  || ((b.fit >= 0) - (a.fit >= 0))
+  || ((b.meta._tv?.popularity ?? 0) - (a.meta._tv?.popularity ?? 0));
+const toReview = [];
+for (const u of awaitingReviews.sort(byPriority)) {
+  const prev = qualityMemo[qKey(u.meta)];
+  if (prev && standsUntil(prev) > Date.now()) {
+    const when = String(prev.at).slice(0, 10);
+    if (prev.verdict === "clears") admitReviewed(u, prev);
+    else if (prev.verdict === "below") skip(u.meta.name, `reviews below the bar (checked ${when}): ${prev.summary}`, u.meta);
+    else hold(u.meta.name, `too new to judge (checked ${when}): ${prev.summary}`, u.meta);
+    continue;
+  }
+  if (toReview.length < REVIEW_MAX) toReview.push(u);
+  else hold(u.meta.name, "no settled IMDb rating; its reviews get checked on a later run (over this run's limit)", u.meta);
+}
+if (toReview.length) {
+  const finaleOf = (m) => m._s1?.finale_date || null;
+  // OMDb's critics for just these shows (the rest wait for their turn without a call).
+  await mapLimit(toReview, 4, async (u) => { u.omdb ||= await omdbRecord(u.meta.imdb_id); });
+  const qv = await judgeQuality(toReview.map(({ meta, hint, rating, votes, omdb }) => ({
+    name: meta.name, year: meta.year_start, genres: meta.genres, language: meta.original_language,
+    platform: meta._services?.join(", ") || hint.platform || null, finale: finaleOf(meta), synopsis: meta.description,
+    imdb: rating, imdb_votes: votes, rt: omdb?.rt ?? null, metacritic: omdb?.metacritic ?? null,
+    tmdb_average: meta._tv?.vote_average ?? null, tmdb_votes: meta._tv?.vote_count ?? null,
+  })), { bar: `IMDb ${RATING_FLOOR} or higher (on ${MIN_SHOW_VOTES.toLocaleString("en-US")}+ votes)`, today });
+  for (const [i, u] of toReview.entries()) {
+    const v = qv[i] || { verdict: "too_early", reason: "no verdict", used: "none", judged: false };
+    const e = v.state?.evidence || {};
+    const q = {
+      verdict: v.verdict, summary: String(v.reason || "").slice(0, 300), used: v.used, equivalent: v.equivalent ?? null,
+      rt: e.rotten_tomatoes_critics ?? null, metacritic: e.metacritic ?? null,
+      at: new Date().toISOString(), days: recheckDays(v.verdict, finaleOf(u.meta)), name: u.meta.name,
+    };
+    if (v.judged) qualityMemo[qKey(u.meta)] = q;
+    reviewed.push({ title: u.meta.name, verdict: v.verdict, used: v.used, reviews: q.summary });
+    if (v.verdict === "clears") admitReviewed(u, q);
+    else if (v.verdict === "below") skip(u.meta.name, `reviews below the bar: ${q.summary}`, u.meta);
+    else hold(u.meta.name, `too new to judge on reviews yet: ${q.summary}`, u.meta);
+  }
+}
+
+// Best first: preferred languages, then IMDb rating, then votes. Only the top of the
+// list goes to the fit gate (each verdict is a Jev call).
+candidates.sort((a, b) => (isPreferred(b.row.original_language) - isPreferred(a.row.original_language))
+  || (b.rank - a.rank) || (b.votes - a.votes));
+
+// Fit-gate memory: a title judged "drop" recently isn't re-judged until it ages out or
+// its rating climbs.
+let verdictMemo = {};
+try { verdictMemo = JSON.parse(fs.readFileSync(VERDICTS_FILE, "utf8")); } catch {}
+const memoKey = (row) => `${row.imdb_id || `${row.kind}:${row.tmdb_id}`}|${row.audience}`;
+const recheckAfter = Date.now() - FIT_RECHECK_DAYS * 86400000;
+const toJudge = [];
+for (const c of candidates) {
+  const prev = verdictMemo[memoKey(c.row)];
+  if (prev && !prev.keep && Date.parse(prev.at) > recheckAfter && c.rank < (prev.rating ?? 0) + FIT_RECHECK_RATING_GAIN) {
+    skip(c.row.name, `fit gate ${prev.at.slice(0, 10)} (${prev.used}): ${prev.reason || "drop"}`, c.meta);
+    continue;
+  }
+  if (toJudge.length < MAX * 3) toJudge.push(c);
+  else skip(c.row.name, "over this run's review limit (checked next run)", c.meta);
 }
 
 // Fit gate — Jev (site watchlist-fit) per candidate, Sonnet batch as shadow/fallback.
 // lib/watch-fit.mjs; fails closed.
-const verdicts = await judgeFit(candidates.map(({ row, omdb, why }) => ({
+// A show admitted on its reviews has no IMDb rating to show the judge (its stored one is
+// assumed); its reviews are in `why`.
+const verdicts = await judgeFit(toJudge.map(({ row, omdb, why, reviewed: byReviews }) => ({
   name: row.name, kind: row.kind, audience: row.audience, year: row.year_start, genres: row.genres,
-  language: row.original_language, synopsis: row.description, imdb: omdb.imdb, rt: omdb.rt, metacritic: omdb.metacritic, why,
+  language: row.original_language, synopsis: row.description, imdb: byReviews ? null : row.imdb_rating, rt: omdb.rt, metacritic: omdb.metacritic, why,
 })), { titles, feedback, prefs, ratings, learned: await learnedTaste() });
 
-for (const [i, { row, omdb }] of candidates.entries()) {
-  if (added.length >= MAX) break;
+for (const [i, { row, rating, rank, origin, reviewed: byReviews, meta }] of toJudge.entries()) {
   const v = verdicts[i];
-  if (!v?.keep) { skip(row.name, `fit gate (${v?.used || "none"}): ${v?.reason || "no verdict"}`); continue; }
-  if (DRY) { added.push({ name: row.name, kind: row.kind, audience: row.audience, rating: omdb.imdb, dry_run: true }); continue; }
+  if (v && v.used !== "none" && v.judged !== false) verdictMemo[memoKey(row)] = { keep: !!v.keep, reason: String(v.reason || "").slice(0, 200), used: v.used, at: new Date().toISOString(), rating: rank, name: row.name };
+  if (!v?.keep) { skip(row.name, `fit gate (${v?.used || "none"}): ${v?.reason || "no verdict"}`, meta); continue; }
+  if (added.length >= MAX) { skip(row.name, `passed every gate; over this run's limit of ${MAX} (added next run)`, meta); delete verdictMemo[memoKey(row)]; continue; }
+  if (DRY) { added.push({ name: row.name, kind: row.kind, audience: row.audience, rating, origin, ...(byReviews ? { by_reviews: row.source_reason } : {}), dry_run: true }); mark(meta, "recommended", row.source_reason); continue; }
   try {
+    if (row.tmdb_id && origin === "model") {
+      // The model's platform guess, replaced by TMDB's when it has one (swept titles already carry it).
+      const providers = pickProviders(await tmdbWatchProviders(row.kind === "show" ? "tv" : "movie", row.tmdb_id, region).catch(() => null), 2);
+      if (providers.length) row.platform = providers.join(" / ");
+    }
     const t = await insertTitle(row);
     titles.push({ ...t, seasons: [] });
     if (t.kind === "show") await syncShowSeasons({ ...t, seasons: [] }, today);
-    added.push({ name: t.name, kind: t.kind, audience: row.audience, rating: omdb.imdb });
-  } catch (e) { skip(row.name, `insert failed: ${e.message}`); }
+    added.push({ name: t.name, kind: t.kind, audience: row.audience, rating, platform: row.platform || null, origin, ...(byReviews ? { by_reviews: row.source_reason } : {}) });
+    mark(meta, "recommended", row.source_reason);
+  } catch (e) { skip(row.name, `insert failed: ${e.message}`, meta); }
 }
 
-console.log(JSON.stringify({ source: SOURCE, proposed: items.length, added, skipped }, null, 2));
+if (!DRY) {
+  // Keep the memory small: forget verdicts past the recheck window.
+  for (const [k, v] of Object.entries(verdictMemo)) if (!(Date.parse(v.at) > recheckAfter)) delete verdictMemo[k];
+  try {
+    fs.mkdirSync(path.dirname(VERDICTS_FILE), { recursive: true });
+    fs.writeFileSync(VERDICTS_FILE, JSON.stringify(verdictMemo, null, 1));
+  } catch (e) { console.error(`[watch-discover] verdict memory: ${e.message}`); }
+  // Review verdicts: kept REVIEW_HISTORY_DAYS (a lapsed one still marks "reviewed before").
+  for (const [k, v] of Object.entries(qualityMemo)) if (!(Date.parse(v.at) > Date.now() - REVIEW_HISTORY_DAYS * 86400000)) delete qualityMemo[k];
+  try {
+    fs.mkdirSync(path.dirname(QUALITY_FILE), { recursive: true });
+    fs.writeFileSync(QUALITY_FILE, JSON.stringify(qualityMemo, null, 1));
+  } catch (e) { console.error(`[watch-discover] review memory: ${e.message}`); }
+}
+
+// --- write the show database ------------------------------------------------------------
+// Every recorded show gets IMDb's numbers from the dataset and one rating with its source.
+let catalog = { shows: showDb.size };
+if (showDb.size) {
+  try {
+    const ids = [...showDb.values()].map((r) => r.imdb_id).filter(Boolean);
+    const dataset = await imdbRatings(ids).catch(() => null);
+    const sources = { imdb: 0, reviews: 0, estimate: 0, none: 0 };
+    const now = new Date().toISOString();
+    const rows = [...showDb.entries()].map(([tmdbId, r]) => {
+      const i = r.imdb_id && dataset ? dataset.get(r.imdb_id) : null;
+      // Only a review check that reached a verdict rates a show ("too_early" had too little to go on).
+      const q = qualityMemo[r.imdb_id || `tv:${tmdbId}`] || qualityMemo[`tv:${tmdbId}`] || null;
+      const review = q && q.verdict !== "too_early" ? q : null;
+      const { rating, source } = showRating({ imdb: i?.rating ?? null, imdbVotes: i?.votes ?? null, review, tmdbAverage: r.vote_average, tmdbVotes: r.vote_count });
+      sources[source || "none"]++;
+      return {
+        ...r, kind: "show", tmdb_id: tmdbId,
+        imdb_rating: i?.rating ?? null, imdb_votes: i?.votes ?? null,
+        rating, rating_source: source, rating_at: rating != null ? now : null, discover_at: now,
+      };
+    });
+    catalog = { shows: rows.length, rating_sources: sources, written: DRY ? 0 : await upsertCatalogRows(rows, { keepNull: ["season_finale_date"] }) };
+  } catch (e) { catalog.error = String(e?.message || e).slice(0, 200); console.error(`[watch-discover] show database: ${catalog.error}`); }
+}
+
+finish({
+  source: SOURCE, proposed: items.length, swept: sweep.stats, catalog, added, held, skipped, reviewed,
+  ...(modelError ? { model_error: modelError } : {}), ...(sweepError ? { sweep_error: sweepError } : {}),
+});

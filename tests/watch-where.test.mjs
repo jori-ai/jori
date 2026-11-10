@@ -195,3 +195,60 @@ test("formatted answer flags the local country and credits JustWatch", async () 
     "  (JustWatch via TMDB, as of 2026-10-06)",
   ].join("\n"));
 });
+
+// --- IMDb's daily ratings dataset (lib/watch-db.mjs imdbRatings) --------------------
+// A small gzipped fixture in a temp dir; no network.
+
+const zlib = (await import("node:zlib")).default;
+const { parseImdbRatingLine, imdbRatings, ensureImdbRatingsFile } = await import("../lib/watch-db.mjs");
+
+const TSV = "tconst\taverageRating\tnumVotes\ntt0000001\t5.7\t2239\ntt30460310\t7.6\t77481\ntt34866681\t6.7\t20312\ntt35618070\t7.4\t20145\n";
+
+function ratingsFixture() {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "imdb-ratings-"));
+  const file = path.join(dir, "title.ratings.tsv.gz");
+  fs.writeFileSync(file, zlib.gzipSync(TSV));
+  return { dir, file };
+}
+
+test("parseImdbRatingLine reads a rating row and skips the header and junk", () => {
+  assert.deepEqual(parseImdbRatingLine("tt34866681\t6.7\t20312"), ["tt34866681", { rating: 6.7, votes: 20312 }]);
+  assert.equal(parseImdbRatingLine("tconst\taverageRating\tnumVotes"), null);
+  assert.equal(parseImdbRatingLine("tt1\t\\N\t5"), null);
+  assert.equal(parseImdbRatingLine(""), null);
+});
+
+test("imdbRatings returns only the ids asked for; an unrated id is absent", async () => {
+  const { file } = ratingsFixture();
+  const r = await imdbRatings(["tt34866681", "tt35618070", "tt99999999", null, "nope"], { file });
+  assert.deepEqual(Object.fromEntries(r), {
+    tt34866681: { rating: 6.7, votes: 20312 },
+    tt35618070: { rating: 7.4, votes: 20145 },
+  });
+  assert.equal((await imdbRatings([], { file })).size, 0);
+});
+
+test("a fresh copy is reused without a download; a stale one is replaced", async () => {
+  const { file } = ratingsFixture();
+  let fetched = 0;
+  const fetchImpl = async () => { fetched++; return new Response(zlib.gzipSync("tconst\taverageRating\tnumVotes\ntt1\t9.0\t5000\n")); };
+  assert.equal(await ensureImdbRatingsFile({ file, fetchImpl }), file);
+  assert.equal(fetched, 0);
+  const later = Date.now() + 2 * 24 * 3600 * 1000;
+  assert.equal(await ensureImdbRatingsFile({ file, fetchImpl, now: later }), file);
+  assert.equal(fetched, 1);
+  assert.deepEqual(Object.fromEntries(await imdbRatings(["tt1"], { file })), { tt1: { rating: 9, votes: 5000 } });
+});
+
+test("a failed or bogus download keeps the old copy, and with no copy reports unavailable", async () => {
+  const { dir, file } = ratingsFixture();
+  const later = Date.now() + 2 * 24 * 3600 * 1000;
+  const html = async () => new Response("<html>rate limited</html>");
+  assert.equal(await ensureImdbRatingsFile({ file, fetchImpl: html, now: later }), file);
+  assert.equal((await imdbRatings(["tt34866681"], { file })).get("tt34866681").votes, 20312);
+  const missing = path.join(dir, "none", "title.ratings.tsv.gz");
+  const boom = async () => { throw new Error("offline"); };
+  assert.equal(await ensureImdbRatingsFile({ file: missing, fetchImpl: boom }), null);
+  // file: null skips the default cache path, so ensureRatingsFile has nothing to fall back on.
+  assert.equal(await imdbRatings(["tt1"], { file: null, fetchImpl: boom }), null);
+});

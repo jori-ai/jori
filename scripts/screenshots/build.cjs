@@ -644,11 +644,121 @@ const pHome = chat("Today 8:41 AM",
   me("What's up with the leak sensor?") +
   jori(`Its battery died at 2 AM; the last reading was dry. I added AAA batteries to the grocery list and I'll check it reports again once they're in.`, { avatar: true }));
 
+// ── Projects and the team (getjori.ai/personal § Your team) ─────────────────
+//
+// The Chief of Staff (Jori itself) keeps a task list per project: Sam's tasks go
+// on Sam's own task list with a date, Jori follows up when one slips, and the
+// team's roles (a made-up roster: Nora the CFO, Rhea the Historian, …) do the
+// work they can overnight and sign what they send.
+
+const TEAM = [
+  ["Jori", "Chief of Staff", "Keeps every project on track and everyone accountable."],
+  ["Robin", "Executive Assistant", "Inbox, calendar, reminders and purchases."],
+  ["Nora", "CFO", "Spending, bills, investments and net worth."],
+  ["Milo", "Travel Manager", "Flights, fares, bookings and trip plans."],
+  ["Zoe", "Social Director", "Shows, restaurants, events and what to watch."],
+  ["Juno", "Relationships", "Birthdays, occasions and staying in touch."],
+  ["Ivy", "Health Coach", "Sleep, workouts and health patterns."],
+  ["Otto", "Property Manager", "The home: locks, devices, repairs."],
+  ["Rhea", "Historian", "The story of your days, and what Jori remembers."],
+  ["Kai", "Software Engineer", "Builds what you ask for and fixes what breaks."],
+  ["Sid", "IT & Security", "Backups, uptime and breach alerts."],
+  ["Wren", "Research Analyst", "News and long reads worth your time."],
+];
+
+const kitchen = pages.find((p) => p.id === "project_kitchen_reno");
+const kitchenMd = `## Goal
+A brighter kitchen before Jordan's birthday in March: new countertops, two lower cabinets replaced, under-cabinet lights. Done means the crew is gone and the sink works.
+
+## What you might need
+- A contractor, chosen from the three quotes (quotes in, Oct 29)
+- A countertop: the quartz sample comes Friday
+- A start date before Reyes' December slots go on Nov 14 (gap)
+
+## Tasks
+- [ ] Call Reyes Builders about a December start for the kitchen refresh · Sam · due 2026-11-06 · moved from Nov 3
+- [ ] Pick the countertop for the kitchen refresh · Sam · due 2026-11-04 (overdue)
+- [ ] Review Nora's side-by-side of the kitchen quotes · Sam · due 2026-11-07 · Google Doc
+- [ ] Ask the building about work hours for the kitchen refresh · Robin · due 2026-11-06
+- [x] Measure the counters for the kitchen refresh · done Nov 2 (Sam ticked it off)
+
+## Coming up
+- 2026-11-06 · Quartz sample delivery, 10 to 2 (calendar)
+- 2026-11-14 · Reyes Builders' last December start date (email)
+
+## Lately
+- 2026-11-05 · Nora put the three quotes side by side: Reyes is cheapest once the permit they left out is added; Linden is two weeks faster.
+- 2026-11-04 · The call with Reyes slipped; Sam moved it to Friday.
+- 2026-11-02 · Counters measured: 11 ft 4 in of run, 2 ft 1 in deep.
+
+## People
+[[user_sam]], [[user_jordan]]`;
+const kitchenBody = portal.pageBody({
+  page: { ...kitchen, description: "Countertops, two cabinets, lights. Three quotes in; start date by Nov 14.", updated_at: ago(40), last_verified_at: "today" },
+  bodyHtml: render.renderMarkdown(kitchenMd, { resolveLink: () => true, labelFor: (id) => titles.get(id) }),
+  fwd: ["user_sam", "user_jordan", "project_jordan_gift"].map((dst_id) => ({ dst_id })),
+  back: ["user_sam", "day_" + new Date(now - 3 * 86400000).toISOString().slice(0, 10)].map((src_id) => ({ src_id })),
+  titles, revCount: 22, connected: false,
+  topic: resolved.topics.find((t) => t.slug === "plans"),
+});
+const projectPage = wikiDoc("Kitchen refresh", kitchenBody, { active: null });
+
+const signed = (name, html) => `<b>${name}:</b> ${html}`;
+const pSlip = chat("Wednesday 9:10 AM",
+  jori(`The call with Reyes Builders about the kitchen start date slipped past Monday. Their December slots go on the 14th, so this one matters this week.${choice([["Call them today", "Their number and your three questions are in the task.", true], ["Move it to Friday", "Still leaves room before the 14th."], ["Have Jori email them", "A short note from your account. You approve it first."]])}`) +
+  me("Friday. And can someone compare the three quotes?") +
+  jori(`Moved to Friday, on your list. Nora will put the quotes side by side tonight, and you'll have it with your coffee.`, { avatar: true }));
+
+const pWork = chat("Thursday 7:05 AM",
+  jori(signed("Nora", `The three kitchen quotes, side by side. Reyes is cheapest once you add the permit they left out; Linden is two weeks faster for $1,100 more.
+<div class="linkcard"><div class="ic">G</div><div><b>Kitchen quotes, side by side</b><span>Google Doc · ready for your review</span></div></div>
+<div style="margin-top:8px">Reviewing it is on your list for Saturday.</div>`)) +
+  `<div class="sep" style="margin-top:14px">Sunday 9:00 AM</div>` +
+  jori(`<b>Your projects this week</b><ul>
+<li><i>✅</i><span>6 tasks done: 4 yours, 2 by the team.</span></li>
+<li><i>⚠️</i><span>Slipping: the countertop pick, 4 days late.</span></li>
+<li><i>📅</i><span>Due this week: Lisbon hotel (Tue), Jordan's gift (Fri).</span></li>
+<li><i>🏃</i><span>Half marathon: Sunday's long run is on track.</span></li></ul>`, { avatar: true }));
+
+// An inbox where every role signs its email (a generic mail-client layout).
+const MAIL_CSS = `
+* { box-sizing:border-box; margin:0; }
+body { font:15px/1.4 -apple-system, system-ui, sans-serif; color:#1d1c1d; background:#fff; -webkit-font-smoothing:antialiased; display:flex; height:100vh; }
+.side { width:220px; background:#f6f7f9; border-right:1px solid #e3e5e8; padding:18px 12px; flex:none; }
+.side .new { background:#2f5bd3; color:#fff; font-weight:600; border-radius:12px; padding:10px 14px; margin-bottom:14px; text-align:center; }
+.side div.f { padding:6px 10px; border-radius:8px; font-size:14.5px; display:flex; justify-content:space-between; }
+.side div.f.on { background:#e1e7f8; font-weight:600; }
+.main { flex:1; min-width:0; }
+.bar { padding:14px 22px; border-bottom:1px solid #e3e5e8; font-weight:700; font-size:18px; }
+.mrow { display:grid; grid-template-columns:150px 1fr 70px; gap:14px; align-items:baseline; padding:12px 22px; border-bottom:1px solid #eef0f3; }
+.mrow.unread b, .mrow.unread .who { font-weight:700; }
+.mrow .who { font-size:14.5px; }
+.mrow .t { white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.mrow .t b { font-weight:600; }
+.mrow .t span { color:#6b6f76; }
+.mrow time { color:#6b6f76; font-size:13px; text-align:right; }
+.mrow .t span.role { color:#2f45c9; }
+`;
+const mrow = (role, subj, snip, time, unread = true) => `<div class="mrow${unread ? " unread" : ""}"><div class="who">Jori</div><div class="t"><b><span class="role">${role}:</span> ${subj}</b> <span>— ${snip}</span></div><time>${time}</time></div>`;
+const inboxDoc = `<!doctype html><html><head><meta charset="utf-8"><style>${MAIL_CSS}</style></head><body>
+<div class="side"><div class="new">Compose</div><div class="f on"><span>Inbox</span><span>9</span></div><div class="f"><span>Starred</span></div><div class="f"><span>Sent</span></div><div class="f"><span>Personal</span></div><div class="f"><span>Travel</span></div></div>
+<div class="main"><div class="bar">Inbox</div>
+${mrow("Jori (Chief of Staff)", "Your projects this week", "6 done, 1 slipping, 2 due this week", "9:00 AM")}
+${mrow("Nora (CFO)", "Weekly money review", "Spent about usual. StreamBox hasn't been opened since it started billing", "8:40 AM")}
+${mrow("Rhea (Historian)", "Your Saturday", "Farmers market, the long run, movie night at home", "8:15 AM")}
+${mrow("Zoe (Social Director)", "Three picks for this weekend", "A small-room comedy show, a jazz brunch, a night market", "Fri")}
+${mrow("Milo (Travel Manager)", "Lisbon fare dropped $142", "TAP 202, same row-14 seats. Want me to book?", "Fri")}
+${mrow("Kai (Software Engineer)", "Work ready for your review", "The shared shopping list now sorts by aisle. Draft PR inside", "Thu", false)}
+${mrow("Juno (Relationships)", "Jordan's birthday is in 4 weeks", "Three gift ideas, and the ceramics class has 2 spots left", "Thu", false)}
+${mrow("Ivy (Health Coach)", "Your sleep this week", "Later nights after dinners out; the long runs held up", "Wed", false)}
+${mrow("Wren (Research Analyst)", "Worth reading this week", "Four long reads from your newsletters, one paragraph each", "Mon", false)}
+</div></body></html>`;
+
 // ── Stamp ───────────────────────────────────────────────────────────────────
 
 const crypto = require("crypto");
 const stamp = crypto.createHash("sha256")
-  .update([wikiHome, wikiAnswer, wikiPage, appDoc([chatThread]), appDoc([approval]), workPerson, workMeeting, workProject, appDoc([workAfterMeeting]), appDoc([workFollowUps]), slackDoc, appDoc([workEmail]), appDoc([workSchedule]), moneyPage, ...[pMoney, pTrip, pDinner, pTickets, pHome].map((x) => appDoc([x])), FRAME_CSS, fs.readFileSync(__filename, "utf8")].join("\u0000"))
+  .update([wikiHome, wikiAnswer, wikiPage, appDoc([chatThread]), appDoc([approval]), workPerson, workMeeting, workProject, appDoc([workAfterMeeting]), appDoc([workFollowUps]), slackDoc, appDoc([workEmail]), appDoc([workSchedule]), moneyPage, ...[pMoney, pTrip, pDinner, pTickets, pHome].map((x) => appDoc([x])), projectPage, appDoc([pSlip, pWork]), inboxDoc, JSON.stringify(TEAM), FRAME_CSS, fs.readFileSync(__filename, "utf8")].join("\u0000"))
   .digest("hex");
 if (CHECK) {
   let have = "";
@@ -672,6 +782,8 @@ const raw = {
   workFollowApp: shoot(appDoc([workFollowUps]), "raw-work-app-followups", 610, 1060, { transparent: true }),
   money: shoot(moneyPage, "raw-money", 1280, 900),
   slack: shoot(slackDoc, "raw-work-slack", 1280, 860),
+  project: shoot(projectPage, "raw-project-tasks", 1280, 900),
+  inbox: shoot(inboxDoc, "raw-team-inbox", 1280, 600),
 };
 const URL = "memory.example.com";
 const out = {
@@ -694,6 +806,9 @@ const out = {
   "personal-app-money-home.png": shoot(appDoc([pMoney, pHome]), "personal-app-money-home", 1096, 1060, { transparent: true }),
   "personal-app-trip-dinner.png": shoot(appDoc([pTrip, pDinner]), "personal-app-trip-dinner", 1096, 1060, { transparent: true }),
   "personal-app-tickets.png": shoot(appDoc([pTickets]), "personal-app-tickets", 610, 1060, { transparent: true }),
+  "personal-project-tasks.png": shoot(frameDoc(browser(raw.project, `${URL}/p/project_kitchen_reno`)), "personal-project-tasks", 1460, 1120, { transparent: true }),
+  "personal-app-chief-of-staff.png": shoot(appDoc([pSlip, pWork]), "personal-app-chief-of-staff", 1096, 1060, { transparent: true }),
+  "team-inbox.png": shoot(frameDoc(appWin(raw.inbox, "Mail · Inbox")), "team-inbox", 1460, 820, { transparent: true }),
   "showcase.png": shoot(frameDoc(`<div class="show">${browser(raw.home, URL)}<div class="ph"><img src="${raw.chat}"></div></div>`), "showcase", 1700, 1180, { transparent: true }),
 };
 for (const [name, src] of Object.entries(out)) fs.copyFileSync(src, path.join(OUT, name));

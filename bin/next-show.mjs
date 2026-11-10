@@ -21,7 +21,7 @@
 //                                      (2026-10-11: a poster for the top pick, descriptions
 //                                      for the others)
 
-import { loadAll, todayEt, audienceFrom, languageName } from "../lib/watch-db.mjs";
+import { loadAll, todayEt, audienceFrom, languageName, readSeasonRatings } from "../lib/watch-db.mjs";
 import { recommend, foreign } from "../lib/watch-rank.mjs";
 import { writeReplyFile } from "../lib/reply-file.mjs";
 import { cardLines, postersFor, posterUrl, linksLine } from "../lib/watch-chat-card.mjs";
@@ -45,8 +45,10 @@ const sections = (() => {
 const LABEL = { together: `Together (with ${PARTNER_NAME})`, solo: "Solo", [PARTNER]: PARTNER_NAME, movies: "Movies & docs" };
 
 const { titles, feedback, prefs } = await loadAll();
+// A next season is shown and ranked with its past seasons' average rating (local file, no network).
+const seasonRatings = readSeasonRatings();
 const results = {};
-for (const s of sections) results[s.key] = recommend({ titles, feedback, prefs, audience: s.audience, kind: s.kind, today });
+for (const s of sections) results[s.key] = recommend({ titles, feedback, prefs, audience: s.audience, kind: s.kind, today, seasonRatings });
 
 // Abroad → say where each shown title plays in the LOCAL country too
 // (2026-10-06: the home-region `platform` tag is no answer abroad). One TMDB call

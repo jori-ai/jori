@@ -247,7 +247,7 @@
       "ops_playbook_section": null,
       "delivers_to": "none",
       "phrases": [],
-      "description": "Hourly hot snapshot of data/memory-index.db via SQLite VACUUM INTO. Rotates to the last 24 copies under data/memory-db-snapshots/. Defense-in-depth backup for the wiki layer (`pages` / `page_links` / `page_revisions` / `pages_fts` and the legacy `memory_chunks` index) — protects against DB corruption (e.g. the 2026-05-02 FTS5 incident). Restore = `cp memory-db-snapshots/memory-index-<ts>.db data/memory-index.db`. Direct script — no webhook, no Anthropic API.",
+      "description": "Hourly hot snapshot of data/memory-index.db via SQLite VACUUM INTO. Keeps the newest 2 plus the newest of the previous day under data/memory-db-snapshots/, all but the newest zstd-compressed (.db.zst). Defense-in-depth backup for the wiki layer (`pages` / `page_links` / `page_revisions` / `pages_fts` and the legacy `memory_chunks` index) — protects against DB corruption (e.g. the 2026-05-02 FTS5 incident). Restore = `cp memory-db-snapshots/memory-index-<ts>.db data/memory-index.db` (newest) or `zstd -d <ts>.db.zst -o data/memory-index.db`. Direct script — no webhook, no Anthropic API.",
       "job": null
     },
     {
@@ -614,7 +614,7 @@
         "monthly watchlist",
         "show recommendations"
       ],
-      "description": "Monthly wide pass (60-day window, max 12) of bin/watch-discover: the model proposes new series/films from the taste profile + the user's verdicts, code enforces TMDB match, id dedup incl. rejected, IMDb >= 7.5, season 1 fully dropped. Adds to watch_titles; one phone pointer if anything was added. Cron posts job=watchlist-discover to the ops supervisor, which launches agent/scripts/watchlist-discover-run.sh via job-run (claude -p needs the Max session). Playbook: ops-agent/jobs/watchlist-discover.md."
+      "description": "Monthly wide pass (60-day window, max 12) of bin/watch-discover: a TMDB sweep of new series on the configured streaming services plus the model's web search (taste profile + the user's verdicts) propose; code enforces TMDB match, id dedup incl. rejected, IMDb >= 7.5 on enough votes from IMDb's daily dataset (unrated finished shows held for a later run), season 1 fully dropped, the fit gate. The daily hum screen lane runs the same pipeline. Adds to watch_titles; one phone pointer if anything was added. Cron posts job=watchlist-discover to the ops supervisor, which launches agent/scripts/watchlist-discover-run.sh via job-run (claude -p needs the Max session). Playbook: ops-agent/jobs/watchlist-discover.md."
     },
     {
       "name": "watchlist-intro-email",

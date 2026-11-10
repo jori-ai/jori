@@ -25,6 +25,8 @@ const SUPABASE_ANON_KEY = supabaseAnonKey();
 const args = process.argv.slice(2);
 let messageId = null;
 let title = assistantName();
+let titleGiven = false;
+let signAs = (process.env.JORI_SIGN_AS || process.env.JORI_JOB) || null;
 let channel = "chat";
 let urgent = false;
 let announce = "judge";
@@ -33,7 +35,8 @@ const positional = [];
 for (let i = 0; i < args.length; i++) {
   const a = args[i];
   if (a === "--message-id" || a === "-m") messageId = args[++i];
-  else if (a === "--title" || a === "-t") title = args[++i];
+  else if (a === "--title" || a === "-t") { title = args[++i]; titleGiven = true; }
+  else if (a === "--sign") signAs = args[++i];
   else if (a === "--channel" || a === "-c") channel = args[++i];
   else if (a === "--urgent" || a === "-u") urgent = true;
   else if (a === "--no-announce") announce = "never";
@@ -42,6 +45,15 @@ for (let i = 0; i < args.length; i++) {
 }
 
 const body = positional.join(" ").trim();
+// The push's title names the team role that owns the sending job ("Ben (CFO)",
+// lib/org.cjs) when no title was given; the chief of staff keeps the assistant's name.
+if (!titleGiven && signAs && !process.env.JORI_NO_SIGN) {
+  try {
+    const org = require("../lib/org.cjs");
+    const r = org.roleFor({ job: signAs, intent: signAs });
+    if (r && !r.chief_of_staff) title = org.signature(r);
+  } catch { /* the default title is fine */ }
+}
 if (!body) {
   console.error("Usage: jori-notify [--message-id <uuid>] [--title <title>] <body>");
   process.exit(1);

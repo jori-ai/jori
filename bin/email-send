@@ -91,11 +91,20 @@ function parseArgs(argv) {
     else if (k === "--no-reply-to") a.replyTo = null;
     else if (k === "--in-reply-to") a.inReplyTo = argv[++i];
     else if (k === "--references") a.references = argv[++i];
+    else if (k === "--sign") a.signAs = argv[++i];
     else if (k === "-h" || k === "--help") { printUsage(); process.exit(0); }
     else { console.error(`email-send: unknown flag: ${k}`); process.exit(1); }
   }
   // Same guard as gmail-action: a markup body is HTML even without --html.
   if (!a.html && a.body && looksLikeHtml(a.body)) a.html = true;
+  // Sign the subject with the team role that owns the sending job ("Ben (CFO): …",
+  // lib/org.cjs): from --sign <job>, or JORI_SIGN_AS (set by cron-run and the fork
+  // runner). Never a reply (its subject belongs to the thread) and never with
+  // JORI_NO_SIGN (system notices whose exact subject other rules match).
+  const signAs = a.signAs || (process.env.JORI_SIGN_AS || process.env.JORI_JOB);
+  if (signAs && a.subject && !a.inReplyTo && !process.env.JORI_NO_SIGN && !/^\s*re:/i.test(a.subject)) { // lang-regex-ok: reply prefix of a subject line
+    try { a.subject = require("../lib/org.cjs").signSubject(a.subject, { job: signAs, intent: signAs }); } catch { /* unsigned is fine */ }
+  }
   return a;
 }
 

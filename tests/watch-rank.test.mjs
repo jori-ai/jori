@@ -172,3 +172,87 @@ test("stated preferences: together likes action/spy/comedy, nobody likes romance
   assert.ok(prefScore(titles[2], prefs, "solo").pref > prefScore(titles[2], prefs, "together").pref);
   assert.ok(tasteFit(titles[1], new Map(), prefs, "together") < -0.4);   // discovery gate rejects romance
 });
+
+// --- a next season's assumed rating: its past seasons' average (2026-11-09) ----------
+const { assumedSeasonRating } = await import("../lib/watch-rank.mjs");
+
+test("assumedSeasonRating: the average of the earlier seasons that are rated, else the show's rating", () => {
+  const t = { imdb_id: "tt1", imdb_rating: 7.5 };
+  const store = { tt1: { seasons: { 1: { rating: 8.4 }, 2: { rating: 7.9 }, 3: { rating: null }, 4: { rating: 6.0 } } } };
+  // Season 4 averages seasons 1-3; season 3 has no rated episodes, so it is left out.
+  assert.deepEqual(assumedSeasonRating(t, 4, store), { rating: 8.2, basis: "past_seasons", seasons: 2 });
+  // Later seasons never count toward an earlier one.
+  assert.deepEqual(assumedSeasonRating(t, 2, store), { rating: 8.4, basis: "past_seasons", seasons: 1 });
+  assert.deepEqual(assumedSeasonRating(t, 3, {}), { rating: 7.5, basis: "show", seasons: 0 });
+  assert.deepEqual(assumedSeasonRating({ imdb_id: "tt2", imdb_rating: null }, 2, store), { rating: null, basis: null, seasons: 0 });
+});
+
+test("a next season is shown and ranked with its past seasons' average; no store, no change", () => {
+  const titles = [
+    T(1, "Lupin", { imdb_id: "tt2531336", status: "watched", imdb_rating: 7.5, seasons: [season(1, "watched"), season(2, "watched"), season(3, "unwatched", { finale_date: "2026-09-20" })] }),
+  ];
+  const store = { tt2531336: { seasons: { 1: { rating: 7.8 }, 2: { rating: 7.0 } } } };
+  const plain = recommend({ titles, feedback: [], audience: "together", kind: "show", today: TODAY });
+  assert.equal(plain.ready[0].imdb_rating, 7.5);
+  assert.equal(plain.ready[0].rating_basis, undefined);
+  const r = recommend({ titles, feedback: [], audience: "together", kind: "show", today: TODAY, seasonRatings: store });
+  assert.equal(r.ready[0].imdb_rating, 7.4);
+  assert.equal(r.ready[0].show_imdb_rating, 7.5);
+  assert.equal(r.ready[0].rating_basis, "past_seasons");
+  assert.ok(r.ready[0].score < plain.ready[0].score);
+  assert.equal(titles[0].imdb_rating, 7.5, "the title row itself is never changed");
+});
+
+// --- per-season ratings store (lib/watch-db.mjs) --------------------------------------
+const { seasonMean, seasonsNeedingRatings, refreshSeasonRatings, readSeasonRatings } = await import("../lib/watch-db.mjs");
+
+test("seasonMean averages the rated episodes and skips N/A", () => {
+  assert.deepEqual(seasonMean({ Episodes: [{ imdbRating: "8.5" }, { imdbRating: "N/A" }, { imdbRating: "8.0" }] }), { rating: 8.3, episodes: 2 });
+  assert.deepEqual(seasonMean({ Episodes: [{ imdbRating: "N/A" }] }), { rating: null, episodes: 0 });
+  assert.deepEqual(seasonMean(null), { rating: null, episodes: 0 });
+});
+
+test("seasonsNeedingRatings: only the dropped seasons before a followed show's next one, and only when stale", () => {
+  const now = Date.parse("2026-11-09T12:00:00Z");
+  const titles = [
+    { kind: "show", imdb_id: "ttA", name: "A", status: "watched", seasons: [season(1, "watched"), season(2, "watched"), season(3, "unwatched")] },
+    { kind: "show", imdb_id: "ttB", name: "B", status: "queued", seasons: [season(1, "unwatched"), season(2, "unwatched")] }, // not started
+    { kind: "show", imdb_id: "ttC", name: "C", status: "watched", seasons: [season(1, "watched")] },                         // nothing next
+    { kind: "show", imdb_id: "ttD", name: "D", status: "rejected", seasons: [season(1, "watched"), season(2, "unwatched")] },
+  ];
+  const fresh = { ttA: { seasons: { 1: { rating: 8, at: "2026-11-01T00:00:00Z" }, 2: { rating: 7, at: "2026-08-01T00:00:00Z" } } } };
+  assert.deepEqual(seasonsNeedingRatings(titles, fresh, { now }), [{ imdb_id: "ttA", n: 2, name: "A" }]);
+  assert.deepEqual(seasonsNeedingRatings(titles, {}, { now }).map((x) => `${x.imdb_id}:${x.n}`), ["ttA:1", "ttA:2"]);
+});
+
+test("refreshSeasonRatings stores what it fetched, caps the calls, and retries an unreachable OMDb", async () => {
+  const file = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "season-ratings-")), "season-ratings.json");
+  const titles = [{ kind: "show", imdb_id: "ttA", name: "A", status: "watched", seasons: [season(1, "watched"), season(2, "watched"), season(3, "watched"), season(4, "unwatched")] }];
+  const calls = [];
+  const fetchSeason = async (id, n) => { calls.push(n); return n === 2 ? null : { rating: 7 + n / 10, episodes: 8 }; };
+  const r = await refreshSeasonRatings(titles, { file, fetchSeason, maxCalls: 2 });
+  assert.deepEqual(r, { needed: 3, calls: 2, updated: 1 });
+  assert.deepEqual(calls, [1, 2]);
+  const store = readSeasonRatings(file);
+  assert.equal(store.ttA.seasons[1].rating, 7.1);
+  assert.equal(store.ttA.seasons[2], undefined, "an unreachable OMDb is not recorded, so it is retried");
+  const again = await refreshSeasonRatings(titles, { file, fetchSeason: async (id, n) => ({ rating: 7 + n / 10, episodes: 8 }) });
+  assert.deepEqual(again, { needed: 2, calls: 2, updated: 2 });
+  assert.deepEqual(readSeasonRatings(path.join(path.dirname(file), "missing.json")), {});
+});
+
+test("omdbSeasonRating: an OMDb error is retried later, only 'no such season' is stored as unrated", async () => {
+  const { omdbSeasonRating } = await import("../lib/watch-db.mjs");
+  const prev = process.env.OMDB_API_KEY;
+  process.env.OMDB_API_KEY = "test-key";
+  const reply = (status, body) => async () => ({ ok: status < 400, status, json: async () => body });
+  try {
+    assert.equal(await omdbSeasonRating("tt1", 2, { fetchImpl: reply(401, { Response: "False", Error: "Request limit reached!" }) }), null);
+    assert.equal(await omdbSeasonRating("tt1", 2, { fetchImpl: reply(200, { Response: "False", Error: "Invalid API key!" }) }), null);
+    assert.equal(await omdbSeasonRating("tt1", 2, { fetchImpl: async () => { throw new Error("ECONNRESET"); } }), null);
+    assert.deepEqual(await omdbSeasonRating("tt1", 9, { fetchImpl: reply(200, { Response: "False", Error: "Series or season not found!" }) }), { rating: null, episodes: 0 });
+    assert.deepEqual(await omdbSeasonRating("tt1", 1, { fetchImpl: reply(200, { Response: "True", Episodes: [{ imdbRating: "8.0" }, { imdbRating: "9.0" }] }) }), { rating: 8.5, episodes: 2 });
+  } finally {
+    if (prev === undefined) delete process.env.OMDB_API_KEY; else process.env.OMDB_API_KEY = prev;
+  }
+});

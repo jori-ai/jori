@@ -181,7 +181,13 @@ begin
     'collection text', 'imdb_rating real', 'rt_score smallint', 'metacritic smallint',
     'omdb_at timestamptz', 'providers jsonb', 'providers_at timestamptz',
     'in_theaters boolean not null default false', 'theatrical_date date', 'digital_date date',
-    'model_p real', 'model_at timestamptz', 'created_at timestamptz not null default now()'] loop
+    'model_p real', 'model_at timestamptz', 'created_at timestamptz not null default now()',
+    -- The show database (bin/watch-discover, every run): every new series the sweep lists,
+    -- its current season, one rating with its source, and where discovery left it.
+    'imdb_votes integer', 'rating real', 'rating_source text', 'rating_at timestamptz',
+    'first_air_date date', 'season_n integer', 'season_episodes integer', 'season_episodes_aired integer',
+    'season_finale_date date', 'season_finale_known boolean',
+    'discover_status text', 'discover_reason text', 'discover_at timestamptz'] loop
     execute 'alter table public.watch_catalog add column if not exists ' || c;
   end loop;
 end $$;
@@ -189,6 +195,8 @@ create index if not exists watch_catalog_rank on public.watch_catalog (seen, ran
 create index if not exists watch_catalog_next on public.watch_catalog (seen, affinity desc, rank);
 create index if not exists watch_catalog_features_pending on public.watch_catalog (features_at) where features_at is null;
 create index if not exists watch_catalog_model_p on public.watch_catalog (model_p desc) where kind = 'movie';
+create index if not exists watch_catalog_show_status on public.watch_catalog (discover_status, rating desc) where kind = 'show';
+create index if not exists watch_catalog_show_finale on public.watch_catalog (season_finale_date) where kind = 'show';
 
 create table if not exists public.watch_film_edges (
   src_tmdb integer not null,

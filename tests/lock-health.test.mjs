@@ -33,7 +33,7 @@ test("TTLock: dead lock (-2012) is unreachable, busy gateway (-3003) is its own 
   assert.deepEqual(lh.conditionsOf(busy, cfg), ["gateway_busy"]);
 });
 
-test("TTLock: gateway offline outranks a stale probe; no gateway is stated outright", () => {
+test("TTLock: gateway offline outranks a stale probe; no gateway is read from the lock list", () => {
   assert.deepEqual(lh.conditionsOf(ttl({ gateway: { id: 9, name: "GW", online: false }, probe: null }), cfg), ["gateway_offline"]);
   assert.deepEqual(lh.conditionsOf(ttl({ has_gateway: false, gateway: null, probe: null }), cfg), ["no_gateway"]);
 });
@@ -132,6 +132,27 @@ test("a lock's reach problem changing layer is one condition: no recovery, no se
   assert.match(lh.compose({ alerts: [], recoveries: r.recoveries }).text, /no longer the gateway can't reach the lock$/);
 });
 
+// Guards the "🔐 Lock problem … no gateway paired, so codes can't be sent to
+// it" rows that named several locks at once and all cleared within hours: a
+// no-gateway reading follows the gateway's connection, so it confirms over two
+// runs like every other reach layer, and its words do not claim a pairing fact.
+test("no gateway is a reach layer: a one-run reading says nothing, two runs alert", () => {
+  const noGw = ttl({ has_gateway: false, gateway: null, probe: null });
+  let r = lh.plan({ readings: [noGw], state: {}, nowMs: NOW, cfg });
+  assert.equal(r.alerts.length, 0, "first sight waits for a second run");
+  const cleared = lh.plan({ readings: [ttl()], state: r.state, nowMs: NOW + HOUR, cfg });
+  assert.equal(cleared.alerts.length + cleared.recoveries.length, 0, "a blip that clears says nothing");
+  r = lh.plan({ readings: [noGw], state: r.state, nowMs: NOW + HOUR, cfg });
+  assert.equal(r.alerts.length, 1);
+  assert.equal(r.alerts[0].kind, "no_gateway");
+  assert.equal(r.state.conditions["ttlock:1|reach"].text, "no gateway connected, so codes can't be sent to it");
+  // A lock someone needs soon still alerts at once.
+  const needs = new Map([["ttlock:1", [{ property: "P1", unit: "u1", atMs: NOW + HOUR, why: "check-in" }]]]);
+  assert.equal(lh.plan({ readings: [noGw], state: {}, needs, nowMs: NOW, cfg }).alerts.length, 1);
+  // A low battery is still stated outright.
+  assert.equal(lh.plan({ readings: [ttl({ battery: 10 })], state: {}, nowMs: NOW, cfg }).alerts.length, 1);
+});
+
 test("state written under the old per-layer keys folds into the reach key: no spurious recovery on deploy", () => {
   const old = { conditions: { "ttlock:1|gateway_offline": { lock: "ttlock:1", kind: "gateway_offline", name: "Back door", property: "P1", first_seen: new Date(NOW).toISOString(), runs: 3, alerted_at: new Date(NOW).toISOString(), text: "gateway GW offline" } } };
   const r = lh.plan({ readings: [ttl({ has_gateway: false, gateway: null, probe: null })], state: old, nowMs: NOW + HOUR, cfg });
@@ -150,12 +171,19 @@ test("upcoming needs: a signed lease starting inside the window, and a code the 
     { status: "completed", terms: { propertySlug: "P1", unitId: "u4", startDate: "2026-10-01T00:00:00Z" } }, // long started
   ];
   const tenants = [
-    { propertySlug: "P1", unitId: "u5", status: "current", ttlockError: "E118 Back: error -2012" },
-    { propertySlug: "P1", unitId: "u6", status: "former", ttlockError: "old" },
-    { propertySlug: "P1", unitId: "u7", status: "current" },
+    { propertySlug: "P1", unitId: "u5", status: "future", leaseStartDate: "2026-11-05T00:00:00Z", ttlockError: "E118 Back: error -2012" },
+    { propertySlug: "P1", unitId: "u6", status: "former", leaseStartDate: "2026-11-05T00:00:00Z", ttlockError: "old" },
+    { propertySlug: "P1", unitId: "u7", status: "current", leaseStartDate: "2026-11-05T00:00:00Z" },
+    // Guards the 'Lock problem … needed: 2 codes waiting to be set' alert that
+    // fired on every one-hour reach blip: a door error on a tenant who checked
+    // in months ago is past the hub's retry, so it is not a need.
+    { propertySlug: "P1", unitId: "u8", status: "current", leaseStartDate: "2026-08-01T00:00:00Z", ttlockError: "window not moved, error -2012" },
+    { propertySlug: "P1", unitId: "u9", status: "current", ttlockError: "no lease start: the hub does not retry it either" },
+    // Check-in today at the property (Berlin, 16:00 on Nov 4) is still retried.
+    { propertySlug: "P1", unitId: "u10", status: "future", leaseStartDate: "2026-11-04T00:00:00Z", schlageError: "busy" },
   ];
   const needs = lh.upcomingNeeds({ leases, tenants, nowMs: NOW, cfg, tz: "Europe/Berlin" });
-  assert.deepEqual(needs.map((n) => `${n.unit}:${n.why}`), ["u1:check-in", "u5:code-pending"]);
+  assert.deepEqual(needs.map((n) => `${n.unit}:${n.why}`), ["u1:check-in", "u5:code-pending", "u10:code-pending"]);
   // 15:00 at the property's wall clock (Berlin in November = UTC+1).
   assert.equal(new Date(needs[0].atMs).toISOString(), "2026-11-05T14:00:00.000Z");
 });

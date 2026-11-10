@@ -18,9 +18,15 @@ bin/job-run --name watchlist-discover --tier ops -- \
 ```
 
 That is the whole job. Do not wait for it, do not add a `--notify-task`: the run script
-handles its own outcome — it calls `bin/watch-discover` (model proposes, code enforces
-every add rule; see that file's header and `agent/watchlist-rules.md`) and sends one
-phone pointer only if something was added. A one-line ack in your turn is enough.
+handles its own outcome — it calls `bin/watch-discover` (a TMDB sweep of new series on the
+configured services plus the model's web search propose; code enforces every add rule; a show
+too new for a settled IMDb rating is judged on its other reviews by the review check,
+`judgeQuality` in `lib/watch-fit.mjs`; see that file's header and `agent/watchlist-rules.md`)
+and sends one phone pointer only if something was added. A one-line ack in your turn is enough.
+
+The daily `screen` hum lane runs the same pipeline (21-day model window, max 4) every day,
+TMDB sweep included, so this monthly pass is the wide model search (60 days, up to 12, medium
+effort), not the only safety net.
 
 ## Why it goes through you
 
@@ -32,6 +38,12 @@ session rotation.
 ## Guardrails
 
 - Adds rows to `watch_titles` only. Never removes, rejects or edits existing rows.
+- Records every series the sweep lists (recommended or not) in the show database,
+  `watch_catalog` rows of kind `show`: its facts, its current season (when the season's last
+  episode drops: `season_finale_date`, `season_finale_known`), one rating with its source
+  (`rating`, `rating_source`: IMDb once it has 1,000 votes, else the review check's reading,
+  else an estimate) and where discovery left it (`discover_status`, `discover_reason`).
+  It never touches a catalog row's `title_id`, `seen` or `not_for_us`.
 - No email. At most one phone pointer, from the run script.
 - Inspect a run with `job-list` / `job-status <id>`; the run log is
   `agent/logs/watchlist-discover.log`.

@@ -42,6 +42,16 @@ const DEFAULTS = {
   wiki_recent_days: 30,
   // How many project pages a single run may create (the backlog drains over nights).
   max_new_pages_per_run: 25,
+  // Tasks (lib/project-tasks.js). The list the user's project tasks go on.
+  tasks_list: "@default",
+  // At most one follow-up per slipped task in this many days.
+  nudge_every_days: 7,
+  // Projects that get the deep "how do we move this forward" pass each night.
+  deep_reviews_per_night: 5,
+  // Jori's own work on project tasks (jobs/project-work.md): the share of the
+  // weekly allowance the lane may spend in 7 days, and tasks per night.
+  work_weekly_share: 0.05,
+  work_tasks_per_night: 2,
 };
 
 const SECTION_START = "<!-- projects:start -->";
@@ -165,7 +175,12 @@ function readTasks(cfg, now = Date.now(), gog = gogJson) {
           completed: t.completed ? String(t.completed).slice(0, 10) : null });
         continue;
       }
+      const marker = String(t.notes || "").indexOf("[jori:pt-");
       tasks.push({
+        id: t.id,
+        list_id: l.id,
+        // The ledger task this one is linked to (`projects task`), when it carries the marker.
+        ledger_id: marker === -1 ? null : String(t.notes).slice(marker + 6, String(t.notes).indexOf("]", marker)),
         title: clip(t.title, 200) || "(untitled)",
         notes: clip(t.notes, 300),
         list,
@@ -263,7 +278,32 @@ function gather({ now = Date.now(), cfg = settings(), gog = gogJson, ws = null }
   run("tasks", () => readTasks(cfg, now, gog));
   run("wiki", () => readWiki(cfg, ws || wikiStore()));
   run("repos", () => readRepos(cfg, now));
+  // The task ledger (lib/project-tasks.js): open and recently closed tasks, the
+  // user's slipped ones, tonight's deep-review rotation and Jori's work budget.
+  run("ledger", () => {
+    const pt = require("./project-tasks.js");
+    return pt.bundleView(pt.load(), bundle.wiki ? bundle.wiki.projects : [], { now, cfg });
+  });
+  bundle.weekday = new Date(now).toLocaleDateString("en-US", { weekday: "long", timeZone: instanceValue("tz") || "UTC" });
   return bundle;
+}
+
+// Rewrite only the `## Tasks` section of a project page's block from the
+// ledger (after a task changed outside the nightly turn: the sync, the dream,
+// chat). Leaves a page without a block alone. Returns whether it saved.
+function refreshPageTasks(id, { ws = wikiStore(), ledger = null, by = "projects:tasks", now = Date.now() } = {}) {
+  const pt = require("./project-tasks.js");
+  const row = ws.getPage(id);
+  if (!row || row.pin_locked) return false;
+  const block = currentBlock(row.raw_md);
+  if (!block) return false;
+  const fm = frontmatterOf(row);
+  const status = STATUSES.includes(fm.project_status) ? fm.project_status : "active";
+  const section = pt.injectTasks(block, pt.renderTasksSection(ledger || pt.load(), id, { now }));
+  if (section === block) return false;
+  const next = renderBlock(row.raw_md, { section, status, today: now });
+  const out = ws.savePage(row.basename || id, next, { editedBy: by });
+  return !!out.changed;
 }
 
 // ── the managed block ────────────────────────────────────────────────────────
@@ -323,6 +363,6 @@ function newPage({ id, name, description, scope, intro, section, status, today =
 
 module.exports = {
   DEFAULTS, SECTION_START, SECTION_END, STATUSES, REQUIRED_HEADINGS,
-  settings, gather, readCalendar, readTasks, readWiki, readRepos, listProjects,
-  renderBlock, currentBlock, checkSection, newPage, hasBlock, frontmatterOf,
+  settings, gather, gogJson, readCalendar, readTasks, readWiki, readRepos, listProjects,
+  renderBlock, currentBlock, checkSection, newPage, hasBlock, frontmatterOf, refreshPageTasks,
 };

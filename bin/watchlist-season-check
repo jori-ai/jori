@@ -15,11 +15,23 @@
 //
 // Writes go through watch-db syncShowSeasons, which only touches air facts —
 // viewing state (watched / watching) is never changed by this job.
+//
+// Two rating refreshes ride along (2026-11-09, no LLM either):
+//   - per-season IMDb ratings (OMDb season listings) for the seasons a next season's
+//     assumed rating is averaged from (watch-db refreshSeasonRatings → season-ratings.json;
+//     watch-rank assumedSeasonRating). A new season is never held for its own rating.
+//   - a show added before IMDb had a settled rating (watch-discover's review check stores
+//     the rating it judged the show at) gets IMDb's own from IMDb's dataset once it has
+//     MIN_SHOW_VOTES votes; so does any show from this year or last, and any with none.
 
 import { execFileSync } from "node:child_process";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { loadAll, syncShowSeasons, watchedThrough, todayEt, hasTmdb } from "../lib/watch-db.mjs";
+import {
+  loadAll, syncShowSeasons, watchedThrough, todayEt, hasTmdb, patchTitle,
+  refreshSeasonRatings, readSeasonRatings, imdbRatings, MIN_SHOW_VOTES,
+} from "../lib/watch-db.mjs";
+import { assumedSeasonRating } from "../lib/watch-rank.mjs";
 
 const COMMIT = process.env.DROP === "1";
 const today = todayEt();
@@ -42,7 +54,7 @@ for (const t of shows) {
     if (added.length || nowDropped.length) changed++;
     const through = watchedThrough(t);
     const following = through > 0 && t.track_seasons;
-    for (const n of nowDropped) if (following && n === through + 1) nowReady.push(`${t.name} S${n}`);
+    for (const n of nowDropped) if (following && n === through + 1) nowReady.push({ t, n });
     if (added.length || nowDropped.length) console.log(`${t.name}: added S${added.join(",S") || "-"}; fully dropped S${nowDropped.join(",S") || "-"}`);
   } catch (e) {
     errors++;
@@ -50,10 +62,42 @@ for (const t of shows) {
   }
 }
 
-console.log(`${new Date().toISOString()} checked=${shows.length} changed=${changed} ready=${nowReady.length} errors=${errors}`);
+// Per-season ratings for the next seasons' assumed ratings (capped OMDb calls; the rest next
+// run). Read after the sync, so a season it just added counts.
+let seasonRatingsLine = "season-ratings=skipped";
+try {
+  const { titles: synced } = await loadAll();
+  const r = await refreshSeasonRatings(synced.filter((t) => t.kind === "show" && t.tmdb_id && !["rejected", "dropped"].includes(t.status)));
+  seasonRatingsLine = `season-ratings needed=${r.needed} fetched=${r.calls} updated=${r.updated}`;
+} catch (e) { seasonRatingsLine = `season-ratings error: ${e.message}`; }
+
+// IMDb ratings for shows with none on file and for recent shows (their ratings move most in
+// the first weeks; a show discovery added on its reviews carries an assumed rating until
+// IMDb settles). Only a rating on MIN_SHOW_VOTES votes replaces what is stored.
+let ratingsUpdated = 0;
+try {
+  const thisYear = parseInt(today.slice(0, 4), 10);
+  const DISCOVERED = new Set(["screen", "monthly-discover", "manual-discover"]); // watch-discover's --source values
+  const fresh = shows.filter((t) => t.imdb_id && (t.imdb_rating == null || (t.year_start || 0) >= thisYear - 1
+    || (t.status === "queued" && DISCOVERED.has(t.source))));
+  const got = fresh.length ? await imdbRatings(fresh.map((t) => t.imdb_id)) : null;
+  for (const t of fresh) {
+    const r = got?.get(t.imdb_id);
+    if (!r || r.votes < MIN_SHOW_VOTES || (t.imdb_rating != null && Math.abs(r.rating - Number(t.imdb_rating)) < 0.05)) continue;
+    await patchTitle(t.id, { imdb_rating: r.rating });
+    ratingsUpdated++;
+  }
+} catch (e) { console.error(`imdb rating refresh: ${e.message}`); }
+
+console.log(`${new Date().toISOString()} checked=${shows.length} changed=${changed} ready=${nowReady.length} errors=${errors} ${seasonRatingsLine} imdb-ratings-updated=${ratingsUpdated}`);
 
 if (nowReady.length) {
-  const msg = `New season${nowReady.length === 1 ? "" : "s"} fully dropped: ${nowReady.join(", ")}. Ask "what should we watch" for the full list.`;
+  const store = readSeasonRatings();
+  const named = nowReady.map(({ t, n }) => {
+    const a = assumedSeasonRating(t, n, store);
+    return `${t.name} S${n}${a.basis === "past_seasons" ? ` (⭐${a.rating}, its past seasons' average)` : ""}`;
+  });
+  const msg = `New season${nowReady.length === 1 ? "" : "s"} fully dropped: ${named.join(", ")}. Ask "what should we watch" for the full list.`;
   try {
     execFileSync(path.join(path.dirname(fileURLToPath(import.meta.url)), "jori-send-curl"), ["--suppress-hook", "--intent", "watchlist-season", msg], { stdio: "inherit", timeout: 30000 });
   } catch (e) { console.error(`phone pointer failed: ${e.message}`); }
