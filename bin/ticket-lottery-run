@@ -41,7 +41,7 @@ import { isMeetingEvent } from "../lib/meeting-event.mjs";
 import { port as registryPort } from "../lib/ports.cjs";
 import { meeting, knownSeriesId } from "../lib/meetings.mjs";
 import * as gmail from "../lib/gmail-parsed.mjs";
-import { createTriager, isUnknown } from "../lib/ticket-lottery-error-triage.mjs";
+import { createTriager, isUnknown, HARNESS_CODES, cdpResponsive, healChrome, describeHarnessFailure } from "../lib/ticket-lottery-error-triage.mjs";
 
 const require = createRequire(import.meta.url);
 const { instance } = require("../lib/instance.cjs");
@@ -57,6 +57,8 @@ const OWNER_CDP = CFG.cdp_host || `localhost:${registryPort("chrome_cdp")}`;
 const TICKETS = Number(CFG.tickets) || 2;
 const portOf = (host) => String(host).split(":").pop();
 const HOST_LABEL = instance().host_label || "the host";
+const CHROME_LABEL = "com.jori.chrome-cdp"; // launchd agent of the owner automation Chrome (:chrome_cdp)
+let healedThisRun = false; // one Chrome restart per run: a second wedge in the same run is reported, not looped on
 
 const argv = process.argv.slice(2);
 const flag = (n) => argv.includes(n);
@@ -230,9 +232,37 @@ async function triageUnknown(r, ctx, retry) {
   if (!c) return { r, c: null };
   console.log(JSON.stringify({ error_triage: r.error, class: c.class, source: c.source, show: ctx.show, platform: ctx.platform }));
   if (c.class !== "retryable") return { r, c };
-  await sleep(c.source === "builtin" ? 20_000 : 5000);
+  // A browser-driver failure usually means Chrome itself stopped opening tabs.
+  // Check, and if it is wedged restart it and wait (lib/ticket-lottery-error-triage.mjs), instead
+  // of retrying into the same dead browser.
+  let healNote = null, justHealed = false;
+  if (HARNESS_CODES.has(r.error)) {
+    const host = ctx.cdpHost || OWNER_CDP;
+    const probe = await cdpResponsive(host);
+    if (!probe.ok) {
+      log(`CDP ${host} not opening tabs (${probe.stage}: ${probe.detail})`);
+      if (host !== OWNER_CDP) {
+        healNote = `their Chrome (port ${portOf(host)}) stopped answering`;
+      } else if (healedThisRun) {
+        healNote = "the automation Chrome stopped answering again after being restarted";
+      } else {
+        const h = await healChrome({ host, label: CHROME_LABEL });
+        log(`CDP heal: ${h.detail}`);
+        healedThisRun = h.healed;
+        justHealed = h.healed;
+        healNote = h.healed ? "the automation Chrome had stopped answering and was restarted" : `the automation Chrome stopped answering and restarting it did not help (${h.detail})`;
+        if (!h.healed) {
+          const why = `${describeHarnessFailure(r.message)}; ${h.detail}`;
+          return { r: { ...r, cause: why }, c: { class: "needs_attention", explanation: `the automation Chrome on ${HOST_LABEL} stopped answering and restarting it did not bring it back, so no entry could go in (${h.detail})` }, retriedFrom: r.error };
+        }
+      }
+    }
+  }
+  if (!justHealed) await sleep(c.source === "builtin" ? 20_000 : 5000);
   const r2 = await retry();
   skillLog(`${ctx.site}/lottery-enter`, "lottery-enter", r2.ok ? null : r2.error, { show: ctx.show, retry_of: r.error, ...(ctx.entrant ? { entrant: ctx.entrant } : {}) });
+  if (!r2.ok && HARNESS_CODES.has(r2.error)) r2.cause = [describeHarnessFailure(r2.message), healNote].filter(Boolean).join("; ");
+  else if (!r2.ok && healNote) r2.cause = healNote;
   return { r: r2, c, retriedFrom: r.error };
 }
 
@@ -244,9 +274,11 @@ function recordFailure(base, r, c, blockers, retriedFrom) {
   if (c.class === "needs_attention") {
     const who = base.entrant && base.entrant !== OWNER ? ` (${mirrorLabel(base.entrant)})` : "";
     blockers.push(`${label(base.platform)}${who} — ${c.explanation}`);
-    return record({ ...base, status: "error", note: code });
+    return record({ ...base, status: "error", note: HARNESS_CODES.has(code) ? describeHarnessFailure(r.message) : code });
   }
-  return record({ ...base, status: "error", note: `${code} (retried once, will retry next run)` });
+  // A browser-driver failure names its real cause, not the bare code (2026-11-10).
+  const what = r.cause || (HARNESS_CODES.has(code) ? describeHarnessFailure(r.message) : code);
+  return record({ ...base, status: "error", note: `${what} (retried once, will retry next run)` });
 }
 
 // ── Main ───────────────────────────────────────────────────────────────────
@@ -433,7 +465,7 @@ async function mirrorPass(P, M, ownerRows, blockers) {
     if ((r.ok && r.entered) || r.error === "already_entered") record({ ...row, status: "submitted", ...(r.error ? { note: "pre-existing" } : {}) });
     else if (["captcha_challenge", "not_logged_in"].includes(r.error)) { record({ ...row, status: "blocked", note: r.error }); blockers.push(`${who}'s ${P.label} entries stopped: ${r.error}`); break; }
     else {
-      const tr = await triageUnknown(r, { platform: P.key, site: P.site, show: o.show, entrant: M.entrant },
+      const tr = await triageUnknown(r, { platform: P.key, site: P.site, show: o.show, entrant: M.entrant, cdpHost: host },
         () => skill(P.site, "lottery-enter", P.url, enterParams(o.eventId), host));
       if ((tr.r.ok && tr.r.entered) || tr.r.error === "already_entered") record({ ...row, status: "submitted", ...(tr.r.error ? { note: "pre-existing" } : {}) });
       else recordFailure(row, tr.r, tr.c, blockers, tr.retriedFrom);

@@ -24,6 +24,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
+import { cdpResponsive, healChrome, describeHarnessFailure } from "../lib/ticket-lottery-error-triage.mjs";
 
 const SCRIPT = path.resolve(import.meta.dirname, "..", "bin", "ticket-lottery-run");
 const SIGNED_OUT = { ok: false, error: "not_logged_in" };
@@ -40,9 +41,24 @@ registerHooks({
     return next(specifier, context);
   },
 });
-globalThis.WebSocket = class { constructor() { throw new Error("test: WebSocket blocked"); } };
+// "healed" exists once the stub launchctl has restarted the (pretend) Chrome: only then do new tabs open.
+const healed = () => fs.existsSync(dir + "/healed");
+globalThis.WebSocket = class {
+  constructor() {
+    if (!healed()) throw new Error("test: WebSocket blocked");
+    this.l = {};
+    setTimeout(() => this.l.open && this.l.open(), 1);
+  }
+  addEventListener(ev, fn) { this.l[ev] = fn; }
+  close() {}
+};
 globalThis.fetch = async (url) => {
   const u = String(url);
+  if (u.includes("/json/new")) {
+    if (!healed()) throw new Error("The operation was aborted due to timeout");
+    return { ok: true, json: async () => ({ id: "T1", webSocketDebuggerUrl: "ws://localhost/x" }) };
+  }
+  if (u.includes("/json/close/")) return { ok: true };
   if (u.endsWith("/json/version")) {
     fs.appendFileSync(dir + "/fetch.log", u + "\\n");
     return { ok: process.env.BW_TEST_CDP_UP === "1" };
@@ -120,7 +136,7 @@ const tcStamp = (iso) =>
   new Date(`${iso}T12:00:00Z`).toLocaleDateString("en-US", { weekday: "long", month: "long", day: "numeric", year: "numeric", timeZone: "UTC" }) + " at 7:30PM";
 
 /** Run the script once in a fresh sandbox. presence: {default, [date]: exitCode}. */
-function run({ skills, presence = { default: 1 }, cdpUp = true, guest = null, platform = "alpha", login = null }) {
+function run({ skills, presence = { default: 1 }, cdpUp = true, guest = null, platform = "alpha", login = null, heal = "ok" }) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bw-lottery-run-"));
   const root = path.join(dir, "install");
   const bin = path.join(root, "bin");
@@ -140,8 +156,17 @@ function run({ skills, presence = { default: 1 }, cdpUp = true, guest = null, pl
   fs.writeFileSync(path.join(dir, "fake-cdp-runner.mjs"), FAKE_RUNNER);
   fs.writeFileSync(path.join(dir, "preload.mjs"), PRELOAD);
 
+  // A stub launchctl, first on PATH: logs the call and "restarts" Chrome (or fails), so the real one is never touched.
+  const stubs = path.join(dir, "stubs");
+  fs.mkdirSync(stubs);
+  fs.writeFileSync(path.join(stubs, "launchctl"), `#!/bin/bash
+echo "$*" >> "$BW_TEST_DIR/launchctl.log"
+[ "$BW_TEST_HEAL" = "fail" ] && { echo "Could not find service" >&2; exit 113; }
+touch "$BW_TEST_DIR/healed"
+`, { mode: 0o755 });
+
   const r = spawnSync(process.execPath, ["--import", pathToFileURL(path.join(dir, "preload.mjs")).href, SCRIPT, "--platform", platform], {
-    env: { PATH: process.env.PATH, HOME: dir, JORI_HOME: root, JORI_LOCAL_DIR: local, BW_TEST_DIR: dir, BW_TEST_CDP_UP: cdpUp ? "1" : "0" },
+    env: { PATH: `${stubs}:${process.env.PATH}`, BW_TEST_HEAL: heal, HOME: dir, JORI_HOME: root, JORI_LOCAL_DIR: local, BW_TEST_DIR: dir, BW_TEST_CDP_UP: cdpUp ? "1" : "0" },
     encoding: "utf8",
     timeout: 60_000,
   });
@@ -151,6 +176,7 @@ function run({ skills, presence = { default: 1 }, cdpUp = true, guest = null, pl
     status: r.status, stdout: r.stdout, stderr: r.stderr, sends,
     presenceAsked: read("presence.log").split("\n").filter(Boolean),
     skillCalls: read("skills.log").split("\n").filter(Boolean),
+    launchctlCalls: read("launchctl.log").split("\n").filter(Boolean),
     loginCalls: read("login.log").split("\n").filter(Boolean),
     fetches: read("fetch.log").split("\n").filter(Boolean),
     state: JSON.parse(fs.readFileSync(path.join(data, "lottery-state.json"), "utf8")),
@@ -305,4 +331,67 @@ test("no lottery config: off — exits 0, drives nothing, writes nothing", () =>
   assert.match(r.stdout, /no lottery platforms configured/);
   assert.ok(!fs.existsSync(path.join(dir, "install", "data")), "no state written");
   fs.rmSync(dir, { recursive: true, force: true });
+});
+
+const EXC = { ok: false, error: "runner_exception", message: "cdp websocket open timeout" };
+const wedgedEnter = (date, enter) => ({ presence: { default: 0 }, skills: { "alpha.example/lottery-list-active": POPULATED(date), "alpha.example/lottery-enter": enter } });
+
+test("browser driver failure + Chrome wedged → Chrome is restarted, the entry retried and goes in", () => {
+  const date = plusDays(etToday(), 1);
+  const r = run(wedgedEnter(date, [EXC, { ok: true, entered: true }]));
+  assert.equal(r.launchctlCalls.length, 1, "Chrome restarted once");
+  assert.match(r.launchctlCalls[0], /^kickstart -k gui\/\d+\/com\.jori\.chrome-cdp$/);
+  assert.deepEqual(r.state.entries.map((e) => [e.entrant, e.status]), [["user", "submitted"], ["friend", "submitted"]]);
+  assert.deepEqual(r.sends, ["🎟️ Test lottery entries for today:\n• The Test Play! — Alpha Tix 1 date (+1 for Friend)"]);
+});
+
+test("browser driver failure + Chrome will not restart → no pointless retry, the message states the real cause", () => {
+  const date = plusDays(etToday(), 1);
+  const r = run({ ...wedgedEnter(date, EXC), heal: "fail" });
+  assert.equal(r.launchctlCalls.length, 1);
+  assert.equal(r.skillCalls.filter((c) => c.startsWith("alpha.example/lottery-enter")).length, 1, "not retried into a dead browser");
+  assert.equal(r.sends.length, 1);
+  assert.match(r.sends[0], /errors: the automation Chrome stopped answering \(it would not open a new tab\)/);
+  assert.match(r.sends[0], /Needs a look: Alpha Tix — the automation Chrome on .* stopped answering and restarting it did not bring it back/);
+  assert.doesNotMatch(r.sends[0], /runner_exception/);
+});
+
+// ── wedged-Chrome helpers in lib/ticket-lottery-error-triage.mjs ──
+
+const okFetch = async (u) => (String(u).includes("/json/new")
+  ? { ok: true, json: async () => ({ id: "T", webSocketDebuggerUrl: "ws://x" }) } : { ok: true });
+const OpenWS = class { constructor() { this.l = {}; setTimeout(() => this.l.open?.(), 1); } addEventListener(e, f) { this.l[e] = f; } close() {} };
+const SilentWS = class { addEventListener() {} close() {} };
+
+test("cdp-health: a Chrome that opens a tab and a socket is responsive", async () => {
+  assert.deepEqual(await cdpResponsive("h:1", { fetchImpl: okFetch, WS: OpenWS }), { ok: true });
+});
+test("cdp-health: /json/new hanging is reported at the new_tab stage", async () => {
+  const r = await cdpResponsive("h:1", { fetchImpl: async () => { throw new Error("The operation was aborted due to timeout"); }, WS: OpenWS });
+  assert.equal(r.ok, false); assert.equal(r.stage, "new_tab");
+});
+test("cdp-health: a socket that never opens is reported at the socket stage, and the tab is still closed", async () => {
+  const closed = [];
+  const f = async (u) => { if (String(u).includes("/json/close/")) closed.push(u); return okFetch(u); };
+  const r = await cdpResponsive("h:1", { timeoutMs: 30, fetchImpl: f, WS: SilentWS });
+  assert.equal(r.stage, "socket"); assert.equal(closed.length, 1);
+});
+test("cdp-health: healChrome kickstarts, then waits until tabs open again", async () => {
+  const calls = []; let n = 0; let t = 0;
+  const h = await healChrome({ host: "h:1", label: "com.x", run: async (...a) => calls.push(a), probe: async () => ({ ok: ++n >= 3 }), sleep: async (ms) => { t += ms; }, now: () => t });
+  assert.equal(h.healed, true); assert.equal(calls.length, 1); assert.deepEqual(calls[0][1].slice(0, 2), ["kickstart", "-k"]);
+});
+test("cdp-health: healChrome gives up after the wait, and reports a failed kickstart", async () => {
+  let t = 0;
+  const a = await healChrome({ host: "h:1", label: "com.x", waitMs: 10_000, run: async () => {}, probe: async () => ({ ok: false }), sleep: async (ms) => { t += ms; }, now: () => t });
+  assert.equal(a.healed, false);
+  const b = await healChrome({ host: "h:1", label: "com.x", run: async () => { throw new Error("no service"); } });
+  assert.equal(b.healed, false); assert.match(b.detail, /kickstart com\.x failed/);
+});
+test("cdp-health: describeHarnessFailure names the cause", () => {
+  assert.match(describeHarnessFailure("cdp websocket open timeout"), /stopped answering/);
+  assert.match(describeHarnessFailure("The operation was aborted due to timeout"), /stopped answering/);
+  assert.match(describeHarnessFailure("websocket error"), /stopped answering/);
+  assert.equal(describeHarnessFailure("something odd"), "something odd");
+  assert.match(describeHarnessFailure(""), /without saying why/);
 });
