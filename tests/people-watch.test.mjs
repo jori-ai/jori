@@ -173,3 +173,27 @@ test("decision cards: more than one a day per group when the backlog is long", (
   assert.equal(dq.nextDecision({ items, lane, now: NOW, tz: "America/Chicago" }).decision, null);
   assert.equal(dq.nextDecision({ items, lane, now: NOW, tz: "America/Chicago", perDay: 2 }).decision.ref, "ppl:b");
 });
+
+test("stay_in_touch and follow_news cards offer 'Just watch their news' between the news option and 'Not now'", () => {
+  for (const kind of ["stay_in_touch", "follow_news"]) {
+    const opts = pw.optionsFor(kind, { cadence_days: 90 });
+    const i = opts.findIndex((o) => o.text === "Just watch their news");
+    assert.ok(i > 0, `${kind} has the option`);
+    assert.deepEqual(opts[i].effect, { status: "tracking", research: 1, nudges: 0 });
+    assert.match(opts[i].description, /^No reminders to reach out\. I'll keep an eye on them/);
+    assert.match(opts[i - 1].text, /news|look them up|nudge/i);
+    assert.match(opts[i + 1].text, /^Not now/);
+  }
+  assert.equal(pw.optionsFor("reach_out").some((o) => o.text === "Just watch their news"), false);
+});
+
+test("the option's description reaches the card verbatim", async () => {
+  const opts = pw.optionsFor("stay_in_touch", { cadence_days: 90 });
+  const notes = opts.map((o) => o.description || "");
+  const item = { ref: "ppl:x", source: "people", q: { id: "x", question: "Q?", options: opts.map((o) => o.text), option_notes: notes, recommended: 0, status: "open" } };
+  const card = dq.fallbackCard(item);
+  const watch = card.options.find((o) => o.label === "Just watch their news");
+  assert.equal(watch.description, "No reminders to reach out. I'll keep an eye on them and tell you if something interesting happens in their job or life.");
+  const validated = dq.validateCard({ header: "People", question: "Q?", recommended_source_index: 0, options: card.options.map((o) => ({ source_index: o.source_index, label: o.label, description: "model wrote this" })) }, item);
+  assert.equal(validated.options.find((o) => o.label === "Just watch their news").description, watch.description);
+});
