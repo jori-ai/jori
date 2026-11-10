@@ -1284,5 +1284,215 @@ guard('floor_attribution', () => {
   };
 });
 
+// ── fork_ledger: the ephemeral forks, per source, over 24h windows ──────────
+// `ledger` above rolls up the three supervisor ledgers only, while the largest
+// lines on the account are forks (chat builds, the daily summary fix loop, the
+// nightly system review, this job) on agent/logs/ephemeral-forks/job-costs.ndjson.
+// So every night the review hand-summed those rows to answer "is this job's day
+// inside its own range" and "what is its 3-day mean against a decision line".
+// This block does that arithmetic once, on the same 24h-window basis as the
+// report (window 0 is the report's window, window k ends k days earlier).
+// usd is each row's own total_cost_usd, not the report's re-priced weighted
+// cost: compare within this block, never add it to weighted_cost_usd.
+guard('fork_ledger', () => {
+  const f = path.join(ROOT, 'agent/logs/ephemeral-forks/job-costs.ndjson');
+  let content;
+  try { content = fs.readFileSync(f, 'utf8'); } catch { return { note: 'no fork ledger readable — UNKNOWN, not zero', sources: {} }; }
+  const WINDOWS = 7, BAND_DAYS = 14, MIN_USD_14D = 3;
+  const END = SINCE + WINDOW_MS;
+  const START = END - BAND_DAYS * WINDOW_MS;
+  const r2 = (x) => Math.round(x * 100) / 100;
+  const med = (a) => { const s = [...a].sort((x, y) => x - y); return s[Math.floor(s.length / 2)]; };
+  const src = {};
+  const totals = Array(WINDOWS).fill(0);
+  for (const line of content.split('\n')) {
+    if (!line) continue;
+    let r; try { r = JSON.parse(line); } catch { continue; }
+    const ts = Date.parse(r.ts || 0);
+    if (!(ts >= START && ts < END)) continue;
+    const s = r.source || '(none)';
+    const usd = Number(r.total_cost_usd) || 0;
+    const turns = Number(r.num_turns) || 0;
+    const b = src[s] || (src[s] = { rows: [], windows_usd: Array(WINDOWS).fill(0), windows_runs: Array(WINDOWS).fill(0) });
+    b.rows.push({ ts, usd, turns, transcript: r.turns_source === 'transcript' });
+    // Window index counted back from the report's window: 0 = current.
+    const k = Math.floor((END - 1 - ts) / WINDOW_MS);
+    if (k < WINDOWS) {
+      const i = WINDOWS - 1 - k; // arrays run oldest -> newest
+      b.windows_usd[i] += usd; b.windows_runs[i] += 1; totals[i] += usd;
+    }
+  }
+  const sources = {};
+  let otherUsd = 0, otherRuns = 0;
+  for (const [s, b] of Object.entries(src)) {
+    const usd14 = b.rows.reduce((a, x) => a + x.usd, 0);
+    if (usd14 < MIN_USD_14D) { otherUsd += usd14; otherRuns += b.rows.length; continue; }
+    const cur = b.rows.filter((x) => x.ts >= SINCE);
+    const prior = b.rows.filter((x) => x.ts < SINCE).map((x) => x.usd);
+    const curUsd = cur.reduce((a, x) => a + x.usd, 0);
+    const last3 = b.windows_usd.slice(-3);
+    sources[s] = {
+      runs_14d: b.rows.length,
+      usd_14d: r2(usd14),
+      windows_usd: b.windows_usd.map(r2),
+      windows_runs: b.windows_runs,
+      mean_last3_windows_usd: r2(last3.reduce((a, x) => a + x, 0) / 3),
+      // The prior windows' spread on the days the source ran, for "inside its range".
+      prior_window_usd_range: (() => {
+        const ran = b.windows_usd.slice(0, -1).filter((x, i) => b.windows_runs[i] > 0);
+        return ran.length ? [r2(Math.min(...ran)), r2(Math.max(...ran))] : null;
+      })(),
+      current: {
+        runs: cur.length,
+        usd: r2(curUsd),
+        usd_per_run: cur.length ? r2(curUsd / cur.length) : null,
+        turns_per_run: cur.length ? Math.round(cur.reduce((a, x) => a + x.turns, 0) / cur.length * 10) / 10 : null,
+        // Rows whose turns came from the run's transcript (lib/fork-cost-ledger.cjs):
+        // their turns are not comparable with earlier rows of the same source.
+        transcript_turn_rows: cur.filter((x) => x.transcript).length,
+      },
+      prior_run_usd: prior.length ? { n: prior.length, min: r2(Math.min(...prior)), median: r2(med(prior)), max: r2(Math.max(...prior)) } : null,
+      current_run_above_prior_max: prior.length > 0 && cur.some((x) => x.usd > Math.max(...prior)),
+    };
+  }
+  return {
+    note: 'Fork rows (agent/logs/ephemeral-forks/job-costs.ndjson) per source. windows_* run oldest -> newest over 7 consecutive 24h windows ending at the report window (last element = the report window). usd = the rows own total_cost_usd, NOT the report weighted cost; compare within this block only. Sources under $3 over 14 days fold into other.',
+    window_ms: WINDOW_MS,
+    total_windows_usd: totals.map(r2),
+    sources: Object.fromEntries(Object.entries(sources).sort((a, b) => b[1].usd_14d - a[1].usd_14d)),
+    other: { runs_14d: otherRuns, usd_14d: r2(otherUsd) },
+  };
+});
+
+// ── floor_cohorts: the floor compared COHORT TO COHORT across days ─────────
+// floor_attribution picks each day's prefix from whichever cohort is lightest
+// that day, so a day-over-day difference of prefix_floor_tokens can be two
+// different jobs' first messages, and a cohort swap can read as several
+// thousand tokens of growth on a day the matched cohort barely moved. The
+// 1-day and 3-day floor tripwires need the
+// SAME cohort on both sides, and every night the review rebuilt that series by
+// hand from events.ndjson. This block lays it out per tier, picks the cohort to
+// compare, and applies the cross-tier corroboration ratio (ops-haiku:ops-light,
+// standing 0.725) as arithmetic. Whether a flag is real stays the reader's call.
+guard('floor_cohorts', () => {
+  const WINDOWS = 7, JOIN_MS = 5 * 60 * 1000;
+  const END = SINCE + WINDOW_MS;
+  const START = END - WINDOWS * WINDOW_MS;
+  const med = (a) => { const s = [...a].sort((x, y) => x - y); return s[Math.floor(s.length / 2)]; };
+  const tiers = {};
+  for (const tier of TIERS) {
+    let content;
+    try { content = fs.readFileSync(path.join(ROOT, `agent/logs/supervisor-${tier}/events.ndjson`), 'utf8'); } catch { tiers[tier] = { note: 'events.ndjson unreadable — UNKNOWN' }; continue; }
+    let firstTs = null;
+    const floors = [], dispatches = [];
+    for (const line of content.split('\n')) {
+      if (!line) continue;
+      let e; try { e = JSON.parse(line); } catch { continue; }
+      const ts = Date.parse(e.ts);
+      if (!Number.isFinite(ts)) continue;
+      if (firstTs === null || ts < firstTs) firstTs = ts;
+      if (!(ts >= START && ts < END)) continue;
+      if (e.kind === 'context.floor_measured' && typeof e.floorTokens === 'number' && e.floorTokens > 0) {
+        floors.push({ ts, sid: e.sessionId || null, floor: e.floorTokens });
+      } else if (e.kind === 'dispatcher.dispatching' && e.item && e.item.source) {
+        dispatches.push({ ts, source: e.item.source });
+      }
+    }
+    // Same session-start and join rules as floor_attribution.
+    floors.sort((a, b) => a.ts - b.ts);
+    const seen = new Set();
+    const cohorts = {};
+    for (const f of floors) {
+      const key = f.sid || `ts:${f.ts}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      let best = null;
+      for (const d of dispatches) {
+        const dt = Math.abs(d.ts - f.ts);
+        if (dt > JOIN_MS) continue;
+        if (!best || dt < best.dt) best = { dt, source: d.source };
+      }
+      let s = best ? best.source : 'unjoined';
+      if (s.startsWith('gmail:')) s = 'gmail:*';
+      const i = WINDOWS - 1 - Math.floor((END - 1 - f.ts) / WINDOW_MS);
+      const c = cohorts[s] || (cohorts[s] = Array.from({ length: WINDOWS }, () => []));
+      c[i].push(f.floor);
+    }
+    const series = {};
+    for (const [s, w] of Object.entries(cohorts)) {
+      series[s] = w.map((v) => (v.length ? { n: v.length, median: med(v), min: Math.min(...v) } : null));
+    }
+    // The cohort to compare: present in the report window AND in an earlier
+    // one. A cohort's floor carries its own first message (hum's is its whole
+    // playbook), so prefer LIGHT cohorts: those within PREFIX_BAND of the
+    // lightest current median, and among them the most session starts over the
+    // 7 windows (ties to the lighter). Every candidate is listed in
+    // alternatives so the reader can see whether the choice decides the answer.
+    const cur = WINDOWS - 1, PREFIX_BAND = 5000;
+    const prevOf = (w) => { for (let i = cur - 1; i >= 0; i--) if (w[i]) return i; return -1; };
+    // "Three days back": window cur-3, or the nearest earlier window with data.
+    const backOf = (w) => { for (let i = cur - 3; i >= 0; i--) if (w[i]) return i; return -1; };
+    const candidates = Object.entries(series)
+      .filter(([s, w]) => s !== 'unjoined' && w[cur] && prevOf(w) >= 0)
+      .map(([s, w]) => {
+        const p = prevOf(w), b = backOf(w);
+        return {
+          cohort: s, w, p, b,
+          samples_7w: w.reduce((a, x) => a + (x ? x.n : 0), 0),
+          current_median: w[cur].median,
+          delta_1d: w[cur].median - w[p].median,
+          delta_3d: b >= 0 ? w[cur].median - w[b].median : null,
+        };
+      });
+    let matched = null;
+    if (candidates.length) {
+      const lightest = Math.min(...candidates.map((c) => c.current_median));
+      const pick = candidates
+        .filter((c) => c.current_median - lightest <= PREFIX_BAND)
+        .sort((a, b) => (b.samples_7w - a.samples_7w) || (a.current_median - b.current_median))[0];
+      const { w, p, b } = pick;
+      matched = {
+        cohort: pick.cohort,
+        samples_7w: pick.samples_7w,
+        current: w[cur],
+        previous: { ...w[p], windows_back: cur - p },
+        three_back: b >= 0 ? { ...w[b], windows_back: cur - b } : null,
+        delta_1d: pick.delta_1d,
+        delta_3d: pick.delta_3d,
+      };
+    }
+    const alternatives = candidates
+      .sort((a, b) => a.current_median - b.current_median)
+      .map(({ cohort, samples_7w, current_median, delta_1d, delta_3d }) => ({ cohort, samples_7w, current_median, delta_1d, delta_3d }));
+    tiers[tier] = {
+      events_coverage_from: firstTs ? new Date(firstTs).toISOString() : null,
+      // Windows that start before the event log does are UNMEASURED, not empty.
+      unmeasured_windows: firstTs ? Array.from({ length: WINDOWS }, (_, i) => END - (WINDOWS - i) * WINDOW_MS < firstTs) : null,
+      series,
+      matched,
+      alternatives,
+    };
+  }
+  // Cross-tier corroboration: a real change to a file all three ops tiers read
+  // moves ops-haiku by ~0.725x what it moves ops-light (Haiku tokenizer).
+  const EXPECTED = 0.725, TOL = 0.15;
+  const ratio = (key) => {
+    const h = tiers['ops-haiku']?.matched?.[key], l = tiers['ops-light']?.matched?.[key];
+    if (h == null || l == null || l === 0) return { ratio: null, corroborated: null };
+    const r = h / l;
+    return { ratio: Math.round(r * 1000) / 1000, corroborated: Math.sign(h) === Math.sign(l) && Math.abs(r - EXPECTED) <= TOL };
+  };
+  const over = (key, line) => TIERS.filter((t) => (tiers[t]?.matched?.[key] ?? 0) > line);
+  return {
+    note: 'series[cohort] runs oldest -> newest over 7 consecutive 24h windows ending at the report window; null = no session start of that cohort in that window. matched = among cohorts present now and earlier and within 5k of the lightest current median, the most-sampled one, compared on its median (alternatives lists every candidate). Per-cohort medians on n=1 are hints. corroboration is the ops-haiku:ops-light delta ratio against the standing 0.725 +-0.15.',
+    expected_haiku_to_light: EXPECTED,
+    tiers,
+    corroboration_1d: ratio('delta_1d'),
+    corroboration_3d: ratio('delta_3d'),
+    over_1d_line: over('delta_1d', 1500),
+    over_3d_line: over('delta_3d', 3000),
+  };
+});
+
 fs.writeFileSync(outPath, JSON.stringify(out, null, 2));
 console.log(`cost-review-prefetch: wrote ${outPath} (${fs.statSync(outPath).size} bytes, ${out.errors.length} soft errors)`);
