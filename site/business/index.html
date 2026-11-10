@@ -84,6 +84,15 @@
   .nav .gh { color:var(--muted); font-size:14px; text-decoration:none; }
   @media (max-width:560px) { .nav .gh { display:none; } }
   section.see { padding:56px 0; border-top:1px solid var(--line); }
+  .org { margin:8px 0 28px; }
+  .org .ceo, .org .cos { max-width:340px; margin:0 auto; text-align:center; border:1px solid var(--line); border-radius:14px; padding:12px 16px; background:var(--us); }
+  .org .cos { margin-top:14px; background:transparent; border-color:var(--accent); }
+  .org .ceo b, .org .cos b { display:block; font-family:Fraunces, Georgia, serif; font-size:20px; }
+  .org .ceo span, .org .cos span { color:var(--muted); font-size:14px; }
+  .org .stem { width:1px; height:14px; background:var(--line); margin:0 auto; }
+  .org ul { list-style:none; padding:0; margin:18px 0 0; display:grid; grid-template-columns:repeat(auto-fill, minmax(210px, 1fr)); gap:10px; }
+  .org li { border:1px solid var(--line); border-radius:12px; padding:10px 12px; font-size:14px; color:var(--muted); line-height:1.4; }
+  .org li b { display:block; color:var(--ink); font-size:15px; }
   section.see h2 { font-family:Fraunces, Georgia, serif; font-weight:600; font-size:clamp(32px, 5vw, 48px); line-height:1.05; }
   section.see .sub { color:var(--muted); margin:12px 0 28px; max-width:660px; }
   section.see img { display:block; width:100%; height:auto; }
@@ -134,12 +143,37 @@
     <img src="/img/work-showcase.png?v=4" alt="A person page for a client contact with every interaction and the open follow-ups, and the Jori app with today's follow-ups and a drafted email" width="1700" height="1180" loading="lazy">
     <div class="shots two">
       <figure><img src="/img/work-app-email-schedule.png?v=4" alt="Two phone screens: the morning inbox with three emails that need you and a reply drafted, and a meeting with an outside contact proposed by email and booked" width="1096" height="1060" loading="lazy"><figcaption><b>Email and scheduling, handled.</b> The inbox sorted before you're up, replies drafted, and meetings booked over email with the times that suit you.</figcaption></figure>
-      <figure><img src="/img/work-project.png?v=4" alt="A project page for a client renewal with next steps, owners, due dates, risks and a timeline" width="1460" height="1120" loading="lazy"><figcaption><b>Projects that don't stall.</b> Who owes what, what's late, and who's gone quiet.</figcaption></figure>
+      <figure class="phone-shot"><img src="/img/work-app-followups.png?v=5" alt="Jori's morning follow-ups: a late pricing email with a draft ready, a questionnaire still out, and a contact gone quiet" width="610" height="1060" loading="lazy"><figcaption><b>Nothing falls through.</b> What you owe, what you're owed, and who's gone quiet, with the email drafted.</figcaption></figure>
       <figure class="wide"><img src="/img/work-slack.png?v=4" alt="A team channel where people mention @Jori to find a meeting time across four calendars, book it with a reminder, and recall what was promised at a meeting" width="1460" height="1080" loading="lazy"><figcaption><b>@Jori in the team channel.</b> Anyone can ask it to find a time across calendars, book the meeting, set a reminder, or recall what was promised.</figcaption></figure>
     </div>
     <div class="shots">
       <figure><img src="/img/work-meeting.png?v=4" alt="A Zoom meeting summary page with decisions, action items with owners and due dates, and the follow-ups Jori is watching" width="1460" height="1120" loading="lazy"><figcaption><b>Every meeting, written up.</b> Summary, decisions and action items from the Zoom recording, with owners and due dates.</figcaption></figure>
       <figure class="phone-shot"><img src="/img/work-app-meeting.png?v=4" alt="Jori's message right after a Zoom call ends, with the outcome and a link to the meeting page, and a reminder set for a colleague" width="610" height="1060" loading="lazy"><figcaption><b>Before you've closed Zoom.</b> The outcome and your action items, on your phone.</figcaption></figure>
+    </div>
+  </section>
+
+  <section class="see" id="team">
+    <h2>A team that answers to you.</h2>
+    <p class="sub">You're the CEO. Jori is your chief of staff: it keeps a page and a to-do list for every project, puts your tasks on your own task list with a date, and checks in when one slips. Every job Jori runs belongs to a role, each a plugin with its own specialty, and each role signs what it sends, so you always know who's talking. Turn roles on, off, or rename them.</p>
+    <div class="org">
+      <div class="ceo"><b>You</b><span>CEO. Every role reports to you.</span></div>
+      <div class="stem"></div>
+      <div class="cos"><b>Jori · Chief of Staff</b><span>Keeps every project on track and everyone accountable.</span></div>
+      <ul>
+        <li><b>Morgan · Executive Assistant</b>Inbox, calendar, meetings and travel.</li>
+        <li><b>Reese · Sales Ops</b>Pipeline, renewals and the CRM, kept honest.</li>
+        <li><b>Paige · Customer Success</b>Onboarding, health checks and follow-ups.</li>
+        <li><b>Nora · CFO</b>Invoices, cash, budgets and month-end.</li>
+        <li><b>Gia · Marketer</b>Case studies, the site and campaigns.</li>
+        <li><b>Kai · Software Engineer</b>Builds what you ask for and fixes what breaks.</li>
+        <li><b>Sid · IT &amp; Security</b>Laptops, accounts, backups and breach alerts.</li>
+        <li><b>Wren · Research Analyst</b>Prospects, competitors and the news that matters.</li>
+      </ul>
+    </div>
+    <div class="shots two">
+      <figure class="wide"><img src="/img/work-team-inbox.png?v=5" alt="An inbox where each of Jori's emails is signed by a team role: the chief of staff's weekly projects review, sales ops' pipeline review, the executive assistant's day, the CFO's month-end close" width="1460" height="820" loading="lazy"><figcaption><b>Signed by who did the work.</b> Sales ops sends the pipeline review, the CFO the month-end close, the chief of staff the weekly roundup.</figcaption></figure>
+      <figure><img src="/img/work-project.png?v=5" alt="A project page for a client renewal with its task list: owners, due dates, one late item, and risks" width="1460" height="1120" loading="lazy"><figcaption><b>Every project, with its to-do list.</b> Yours, the team's and the client's, each with an owner and a date.</figcaption></figure>
+      <figure><img src="/img/work-app-chief-of-staff.png?v=5" alt="Two phone screens: the chief of staff following up on late pricing with three ways forward, and the software engineer's draft pull request plus the weekly projects review" width="1096" height="1060" loading="lazy"><figcaption><b>Held to it, kindly.</b> One check-in when something slips. What the team can do itself, it does overnight and brings to you for review.</figcaption></figure>
     </div>
   </section>
 

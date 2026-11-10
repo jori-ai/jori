@@ -17,6 +17,12 @@
 //       no capture files) — for trying a message by hand.
 //   hum-resolve-first stats [--since 7d] [--json]
 //   hum-resolve-first tail [-n 10]
+//   hum-resolve-first questions [--since 7d] [--json] [--list]
+//       How the gate did on questions: answered from the records (not sent, or
+//       an FYI sent instead) vs narrowed vs asked, how often it looked further
+//       (mail, calendar dates, memory, the user's own words) and settled one,
+//       and how many answers the user withdrew. --list prints each question it
+//       kept from the user (data/hum-question-suppressions.jsonl).
 //   hum-resolve-first forget <decision_id|dedup_key> [--reason "..."]
 //       Withdraw an answer the user says is wrong, so the question may be asked.
 //
@@ -24,9 +30,10 @@
 
 import fs from "node:fs";
 import {
-  resolveFirst, appendLog, rememberIfSettled, writeCaptureArtifacts, DEADLINE_MS, LOG_FILE,
+  resolveFirst, appendLog, rememberIfSettled, writeCaptureArtifacts, recordSuppressedQuestion, questionStats, inputLabels,
+  DEADLINE_MS, LOG_FILE, QUESTIONS_LEDGER,
 } from "../lib/hum-resolve-first.mjs";
-import { forgetResolved } from "../lib/hum-resolve-first-store.mjs";
+import { forgetResolved, forgottenIds } from "../lib/hum-resolve-first-store.mjs";
 
 const argv = process.argv.slice(2);
 const opt = (name) => { const i = argv.indexOf(name); return i >= 0 ? argv[i + 1] : null; };
@@ -59,7 +66,8 @@ async function gate() {
   // The pass carries its own deadline; this outer one is the backstop for a
   // hung child process, so the send path is never held past it.
   const backstop = new Promise((resolve) => {
-    const t = setTimeout(() => resolve({ action: "send", verdict: "error", reason: "deadline", decision_id: null }), DEADLINE_MS + 5_000);
+    // Labelled with the input's lane and kind, so a timeout shows in `stats` and `questions`.
+    const t = setTimeout(() => resolve({ ...inputLabels(input), original: input.message, action: "send", verdict: "error", reason: "deadline", decision_id: null }), DEADLINE_MS + 5_000);
     t.unref();
   });
   const d = await Promise.race([resolveFirst(input), backstop]);
@@ -67,11 +75,12 @@ async function gate() {
   if (!dry) {
     appendLog(d);
     rememberIfSettled(d);
+    recordSuppressedQuestion(d);
     writeCaptureArtifacts(capture, d);
   }
   const out = { action: d.action, verdict: d.verdict, decision_id: d.decision_id, reason: d.private ? null : d.reason };
   if (d.action === "rewrite") Object.assign(out, { text: d.text, still_question: Boolean(d.still_question), keep_choices: Boolean(d.keep_choices) });
-  if (dry) Object.assign(out, { dry_run: true, answer: d.answer ?? null, sources: d.sources || [], checked: d.checked ?? null, evidence: d.evidence || null, latency_ms: d.latency_ms ?? null });
+  if (dry) Object.assign(out, { dry_run: true, answer: d.answer ?? null, sources: d.sources || [], checked: d.checked ?? null, evidence: d.evidence || null, deep: d.deep || null, latency_ms: d.latency_ms ?? null });
   emit(out);
 }
 
@@ -95,6 +104,38 @@ function stats() {
   console.log(`  median latency ${s.median_latency_ms ?? "–"} ms`);
 }
 
+function readJsonl(file) {
+  try {
+    return fs.readFileSync(file, "utf8").split("\n").filter(Boolean)
+      .map((l) => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+  } catch { return []; }
+}
+
+function questions() {
+  const since = sinceMs(opt("--since") || "7d");
+  const rows = readLog().filter((r) => Date.parse(r.ts || "") >= since);
+  const s = { since: new Date(since).toISOString(), ...questionStats(rows, { forgotten: forgottenIds() }) };
+  const ledger = readJsonl(process.env.HUM_QUESTION_SUPPRESSIONS || QUESTIONS_LEDGER)
+    .filter((r) => Date.parse(r.ts || "") >= since);
+  if (has("--json")) { emit(has("--list") ? { ...s, suppressed: ledger } : s); return; }
+  const pct = s.answered_rate == null ? "–" : `${Math.round(s.answered_rate * 100)}%`;
+  console.log(`questions since ${s.since}: ${s.considered} considered`);
+  console.log(`  answered from the records: ${s.answered_by_records} (${pct}) · not sent ${s.not_sent}, answered instead ${s.answered_instead}`);
+  console.log(`  asked: ${s.asked} (narrowed to the gap ${s.narrowed}, errors sent as written ${s.errors})`);
+  console.log(`  looked further: ${s.looked_further} · settled by looking: ${s.settled_by_looking}`);
+  console.log(`  answers the user withdrew: ${s.withdrawn}`);
+  for (const [lane, L] of Object.entries(s.by_lane).sort((a, b) => b[1].considered - a[1].considered)) {
+    console.log(`  ${lane}: ${L.considered} considered, ${L.answered_by_records} answered, ${L.asked} asked`);
+  }
+  if (has("--list")) {
+    for (const r of ledger) {
+      const q = typeof r.question === "string" ? r.question.slice(0, 110) : "(private)";
+      const a = typeof r.answer === "string" ? r.answer.slice(0, 140) : "";
+      console.log(`${r.ts} ${r.lane} ${r.outcome} (${r.settled_by})  ${q}${a ? `\n    → ${a}  [${(r.sources || []).join(", ")}]` : ""}`);
+    }
+  }
+}
+
 function tail() {
   const n = Number(opt("-n") || 10);
   for (const r of readLog().slice(-n)) {
@@ -113,6 +154,7 @@ try {
   }
   else if (cmd === "stats") stats();
   else if (cmd === "tail") tail();
+  else if (cmd === "questions") questions();
   else if (cmd === "forget") {
     const id = argv[1];
     if (!id) { console.error("usage: hum-resolve-first forget <decision_id|dedup_key> [--reason \"...\"]"); process.exit(2); }
@@ -120,7 +162,7 @@ try {
     console.log(ok ? `forgot ${id}: it may be asked again` : `could not write the forget row for ${id}`);
     process.exit(ok ? 0 : 1);
   } else {
-    console.error("usage: hum-resolve-first [--capture-id F] [--dry-run] < input.json | stats [--since 7d] [--json] | tail [-n N] | forget <id>");
+    console.error("usage: hum-resolve-first [--capture-id F] [--dry-run] < input.json | stats [--since 7d] [--json] | questions [--since 7d] [--json] [--list] | tail [-n N] | forget <id>");
     process.exit(2);
   }
 } catch (e) {

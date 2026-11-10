@@ -36,6 +36,7 @@ Issue all in a single parallel turn:
 10. **Memory growth — measure the WIKI, not the retired flat files.** hum consolidation (`hum-consolidate`) writes durable answers into the general wiki now, not the 6 hardcoded flat files (4 of which don't even exist, so `wc -l` always read 0 — the perennial false FAIL). Measure hum-attributable memory growth this week as the SUM of: (a) wiki pages created or updated in the last 7 days — `~/Dev/jori/bin/wiki list --json` and count entries whose `updated_at` (or `revised_at`) falls in the window; if the CLI doesn't expose timestamps, fall back to `wiki search` over the week's hum subjects, or query `pages.updated_at` in memory-index.db directly; plus (b) rows added to `hum-learnings.jsonl` in the window (answered questions) and consolidated rows in `hum-responses.jsonl` — the direct hum→memory contribution. Report both components. Do NOT `wc -l` the old flat files.
 11. `agent/logs/watchdog.log` grep `[hum:` — dispatch-level skip reasons
 12. Structural-validity scan of `hum-runs.jsonl` — count rows lacking `sonnet.decision` (legacy schema; ignore for metrics but count for completeness)
+13. `~/Dev/jori/bin/hum-resolve-first questions --since 7d --json --list` — questions the resolve-first gate answered from Jori's own records instead of asking (not sent / answered with an FYI), how many it still asked, how often its deeper look (mail, calendar dates, memory, the user's own words) settled one, and how many of its answers the user withdrew
 
 ## Step 3 — Score every intent criterion
 
@@ -110,6 +111,7 @@ Commits touching hum itself. Registry diff vs last week. Intent-file edits. Purp
 - Answer rate + time-to-answer (Step 3).
 - Memory growth: N wiki pages created/updated this week + M new answered-question / consolidated hum rows (Step 2 #10). The per-flat-file breakdown is retired — content lands in the wiki now.
 - Per-hook answer rate — which hook types are earning their keep, which are dead?
+- **Questions Jori answered itself** (Step 2 #13): answered-from-records count and rate, by lane; the deeper look's share; withdrawn answers (each one is a wrong suppression, name it). Sample 3 suppressed questions from the list and judge whether the answer was really on file. Then sample 3 questions that were asked and say whether any record could have answered them: each one that could is a miss to report.
 - Sample 3 answered questions: are their routed memory entries specific enough to sharpen a future decision, or too vague?
 
 ### 6f. Reactions & topic bias
