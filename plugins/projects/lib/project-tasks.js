@@ -150,6 +150,9 @@ function addTask(ledger, f, { now = Date.now() } = {}) {
     id, project: f.project, title: String(f.title).trim(), owner,
     who: f.who || null, due: f.due || null, status: "open",
     why: f.why ? String(f.why).trim() : null,
+    // How the task reads on the wiki page when its own title (the user's words on
+    // their list) carries something a page must not: an amount, a health detail.
+    page_title: f.page_title ? String(f.page_title).trim() : null,
     created_at: iso, created_by: f.by || "projects", updated_at: iso, updated_by: f.by || "projects",
     closed_at: null, closed_by: null, close_note: null,
     jori: {
@@ -184,6 +187,7 @@ function updateTask(ledger, id, f, { now = Date.now() } = {}) {
   if (t.owner === "user" && t.status === "open" && !isDay(t.due)) throw new Error("a task for the user needs a due date");
   if (f.who != null) t.who = f.who;
   if (f.why != null) t.why = f.why;
+  if (f.page_title != null) t.page_title = f.page_title || null;
   if (f.jori != null) {
     if (!JORI_MODES.includes(f.jori)) throw new Error(`--jori must be ${JORI_MODES.join("|")}`);
     t.jori.mode = f.jori;
@@ -345,10 +349,10 @@ function renderTasksSection(ledger, projectId, { now = Date.now(), closedDays = 
   const lines = ["## Tasks"];
   for (const t of open) {
     const late = t.due && t.due < d ? " (overdue)" : "";
-    lines.push(`- [ ] ${t.title} · ${ownerLabel(t)}${t.due ? ` · due ${t.due}${late}` : ""}${joriNote(t)} · ${t.id}`);
+    lines.push(`- [ ] ${t.page_title || t.title} · ${ownerLabel(t)}${t.due ? ` · due ${t.due}${late}` : ""}${joriNote(t)} · ${t.id}`);
   }
   for (const t of closed) {
-    lines.push(`- [${t.status === "done" ? "x" : "-"}] ${t.title} · ${t.status} ${t.closed_at.slice(0, 10)}${t.close_note ? ` (${t.close_note})` : ""} · ${t.id}`);
+    lines.push(`- [${t.status === "done" ? "x" : "-"}] ${t.page_title || t.title} · ${t.status} ${t.closed_at.slice(0, 10)}${t.close_note ? ` (${t.close_note})` : ""} · ${t.id}`);
   }
   return lines.join("\n");
 }
@@ -507,7 +511,7 @@ function bundleView(ledger, projects, { now = Date.now(), cfg = {} } = {}) {
   const d = today(now);
   const tasks = Object.values(ledger.tasks).filter((t) => t.status === "open"
     || (t.closed_at && daysBetween(t.closed_at.slice(0, 10), d) <= 14))
-    .map((t) => ({ id: t.id, project: t.project, title: t.title, owner: t.owner, who: t.who, due: t.due, status: t.status,
+    .map((t) => ({ id: t.id, project: t.project, title: t.title, page_title: t.page_title || null, owner: t.owner, who: t.who, due: t.due, status: t.status,
       why: t.why, closed_at: t.closed_at, closed_by: t.closed_by, close_note: t.close_note, slips: t.slips.length,
       jori: { mode: t.jori.mode, size: t.jori.size, state: t.jori.state, approved: !!t.jori.approved_at, attempts: t.jori.attempts, result: t.jori.result },
       on_task_list: !!(t.gtask && !t.gtask.detached) }));
