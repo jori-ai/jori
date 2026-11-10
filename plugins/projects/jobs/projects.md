@@ -1,4 +1,4 @@
-PROJECTS — nightly: keep one wiki page for every project the user is working on, from planning a trip to building a product. Each page says what the project's **goal** is and **what the user might need to complete it**, carries a **task list** (`## Tasks`, from the task ledger), and is kept current every night from memory, the calendar and the user's tasks, past and upcoming. The dream corrects and extends the same pages from each day (`jobs/dream.md` Step 4.8). Each night this job also **thinks about how to advance every project**: it closes the tasks that are done, adds the ones the project needs next, puts the user's tasks on their own task list with a date, follows up when one slips, and picks the work Jori can do itself (done overnight by `jobs/project-work.md`). Dispatched as `{"job":"projects"}` by `plugins/projects/bin/projects-trigger`.
+PROJECTS — the **Chief of Staff**'s nightly pass: keep one wiki page for every project the user is working on, from planning a trip to building a product. Each page says what the project's **goal** is and **what the user might need to complete it**, carries a **task list** (`## Tasks`, from the task ledger), and is kept current every night from memory, the calendar and the user's tasks, past and upcoming. The dream corrects and extends the same pages from each day (`jobs/dream.md` Step 4.8). Together with `projects-task-sync` and `project-work`, this job is the **Chief of Staff**: it keeps track of every project and holds everyone accountable. Each night it **thinks about how to advance every project**: it closes the tasks that are done, adds the ones the project needs next, puts the user's tasks on their own task list with a date, follows up when one slips, and picks the work Jori can do itself (done overnight by `jobs/project-work.md`). Dispatched as `{"job":"projects"}` by `plugins/projects/bin/projects-trigger`.
 
 ## Purpose
 
@@ -194,7 +194,7 @@ Append one line to `data/projects-log.jsonl`:
 
 Email only: no `--pointer`, no `--push` (a night job's filing does not ping the phone). If `digest-deliver` fails, log it and stop: the pages are already written.
 
-**The Sunday review** (when `weekday` is Sunday, in place of the email above, and whether or not anything changed shape): one email, second person, warm and short, `--subject "Your projects this week — <Mon D>"`:
+**The Sunday review** (when `weekday` is Sunday, in place of the email above, and whether or not anything changed shape): one email, second person, warm and short, `--subject "Chief of Staff — your projects this week, <Mon D>"`:
 
 1. One line on the week: how many tasks got done (by the user and by Jori), and the one project that moved most.
 2. **Slipping**: every task of the user's that is past its date, oldest first, with its project, how late, and the one-line way forward offered in the hum. This is where accountability lives; say it plainly and kindly.

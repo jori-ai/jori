@@ -85,7 +85,7 @@ pt.withLock((l)=>{for(const t of Object.values(l.tasks)) if(t.jori.state==="work
 
 if [ -s "$REPORT" ]; then
   PTR=(); [ -s "$POINTER" ] && PTR=(--pointer "$(head -n 1 "$POINTER")")
-  "$KERNEL_TOOLS/bin/digest-deliver" --subject "Project work ready for your review — $(date '+%a %b %-d')" \
+  "$KERNEL_TOOLS/bin/digest-deliver" --subject "Chief of Staff: work ready for your review — $(date '+%a %b %-d')" \
     --body-file "$REPORT" --intent project-work --evidence-live "${PTR[@]}" >> "$LOG" 2>&1 \
     && log "review email sent" || log "review email failed (rc $?)"
 else

@@ -1,4 +1,4 @@
-PROJECT WORK — once a night, after the projects job has planned: do the project tasks Jori may do on its own, hand each result to the user for review, and write the email that tells them what is ready. Run by `plugins/projects/bin/project-work-trigger` (launchd `ai.claude.project-work`) through `lib/run-ephemeral-opus.sh`.
+PROJECT WORK — the **Chief of Staff**'s overnight work: once a night, after the projects job has planned: do the project tasks Jori may do on its own, hand each result to the user for review, and write the email that tells them what is ready. Run by `plugins/projects/bin/project-work-trigger` (launchd `ai.claude.project-work`) through `lib/run-ephemeral-opus.sh`.
 
 ## Purpose
 

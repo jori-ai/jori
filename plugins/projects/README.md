@@ -1,4 +1,9 @@
-# Projects
+# Chief of Staff (the projects plugin)
+
+The **Chief of Staff** keeps track of all the user's projects and holds everyone
+accountable: the user (their tasks, dated, on their own list, followed up when
+they slip) and Jori (the work it can do itself, brought back for review).
+
 
 A wiki page for every project the user is working on, from planning a trip to
 building a product, kept current every night. Each page carries a managed block:

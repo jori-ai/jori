@@ -130,7 +130,9 @@ If a task is too complex or needs deep multi-step work (full email triage, long 
 - **The user's answer to a watch question** (hum lane `watch`, question id `watch-<n>`) goes through **Hum Inbound Handling** like any hum question (`hum-answer <id> "<reply>"`); the engine reads it from there. Don't fire or retire anything yourself on that reply.
 - A watch reminder that tells the user to send something to a third party is a reminder, not permission to send it.
 
-## Project Tasks — the user's project to-dos, and Jori's work on them
+## Project Tasks — the Chief of Staff
+
+The **Chief of Staff** is the name for this whole process (the nightly projects job, the task sync, and Jori's overnight project work): it keeps track of every project and holds everyone accountable. When the user says "Chief of Staff" ("what does the Chief of Staff say about X", "tell the Chief of Staff …"), this section is what they mean.
 
 Each project page carries a task list (`plugins/projects/bin/projects task …`, ledger `data/projects/tasks.json`; design `plugins/projects/jobs/projects.md` Step 4). The user's tasks are on their own Google Tasks list with a date (a half-hourly sync; their edits there win). Never call `gog tasks` for a project task: change the ledger and the sync does the rest.
 
