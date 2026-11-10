@@ -26,7 +26,9 @@
 // 2 sent, but it could not be found in Gmail to label.
 
 import fs from "node:fs";
+import { createRequire } from "node:module";
 import { sendHtmlEmail, labelDigest, pointerAndPush } from "../lib/digest-deliver.mjs";
+const require = createRequire(import.meta.url);
 
 function usage(msg) {
   if (msg) console.error(`digest-deliver: ${msg}`);
@@ -51,6 +53,11 @@ for (let i = 0; i < argv.length; i++) {
   else usage(`unknown arg ${k}`);
 }
 if (!o.subject || !o.bodyFile || !o.intent) usage("--subject, --body-file and --intent are required");
+// The team role that owns this job signs it (lib/org.cjs): the subject here, and
+// through JORI_SIGN_AS the pointer (jori-send-curl) and the push title (jori-notify),
+// so all three name the same role.
+process.env.JORI_SIGN_AS = o.intent;
+try { o.subject = require("../lib/org.cjs").signSubject(o.subject, { job: o.intent, intent: o.intent }); } catch { /* unsigned is fine */ }
 
 const log = (m) => console.error(`digest-deliver: ${m}`);
 

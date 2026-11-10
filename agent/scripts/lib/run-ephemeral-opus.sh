@@ -56,6 +56,9 @@ MODELS_ENV="$JORI_INSTALL_TOOLS/agent/config/models.env"
 [ -f "$MODELS_ENV" ] && source "$MODELS_ENV"
 
 JOB="${1:-}"; JOB_MD="${2:-}"; shift 2 2>/dev/null || true
+# The job this run is, for whatever it sends: lib/org.cjs signs its emails and
+# pings with the team role that owns it (cron-run sets the same for cron jobs).
+export JORI_JOB="$JOB"
 TASK=""
 TIMEOUT_MIN=0
 MODEL="${JORI_MODEL_OPUS:-}"

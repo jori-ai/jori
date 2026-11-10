@@ -83,7 +83,7 @@ A task gets two attempts on two nights; after that it waits for a person (the ni
 Write `$REPORT` (path in the opening line): plain HTML, readable on a phone, second person (it is to the user alone), warm and direct (Rule #0).
 
 1. One opening line: what is ready ("Two things are ready for you to look at: the venue shortlist for the anniversary dinner and a fix for…").
-2. Per task: the project, the task, what was done, how it was checked, the link (`og-card` is not needed for Drive, GitHub or card links), and what to look at first. The review task's date.
+2. Per task, under the team role that did it (the role its plan names, else the one whose domain it is, `org list`): the project, the task, what was done, how it was checked, the link (`og-card` is not needed for Drive, GitHub or card links), and what to look at first. The review task's date.
 3. Tasks that could not be done, one line each with what they need.
 4. One closing line with the lane's budget for the week (`share` of `cap`), as a percentage.
 

@@ -410,3 +410,12 @@ test("the mailbox lookup uses the logged Message-ID, then the mailbox id; a dele
   assert.equal(gone, null);
   await assert.rejects(mailboxLookup("m.1.ab12", { gmail: { ...empty, getMessage: async () => { throw new Error("Gmail 500: oops"); } }, messageId: "<m@x>", gmailId: "g1" }), /500/);
 });
+
+test("findSentMessageId finds a subject a team role signed, but not a reply to it", async () => {
+  const msgs = {
+    reply: { payload: { headers: [{ name: "Subject", value: "Re: Cy (Historian): Day of Sunday" }] } },
+    signed: { payload: { headers: [{ name: "Subject", value: "Cy (Historian): Day of Sunday" }] } },
+  };
+  const gmail = { searchIds: async () => ["reply", "signed"], getMessage: async (id) => msgs[id] };
+  assert.equal(await findSentMessageId("Day of Sunday", { attempts: 1, gmail }), "signed");
+});

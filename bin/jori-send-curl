@@ -1138,6 +1138,19 @@ fi
 # They are also kept out of the push preview below: a lock-screen banner reading
 # "https://upload.wikimedia.org/wikipedia/commons/thumb/..." is worse than one
 # that simply ends early. PUSH_TEXT is the message as the gates left it.
+# Sign it with the team role that owns the sending job (lib/org.cjs,
+# system/org.md): "Ben: …" for a job the CFO role owns. After every gate, so
+# the precheck and claim-freshness judge the words, not the name; before the
+# media, which stays last. Chat and questions only (system rows are the
+# watchdog's). The chief of staff's own pings stay unsigned (lib/org.cjs).
+if { [ "$CHANNEL" = "chat" ] || [ "$CHANNEL" = "questions" ]; } && [ -z "${JORI_NO_SIGN:-}" ] \
+   && { [ -n "$INTENT" ] || [ -n "${JORI_SIGN_AS:-${JORI_JOB:-}}" ]; }; then
+  _SIGNED="$(ORG_TEXT="$MESSAGE" ORG_INTENT="$INTENT" "${JORI_NODE:-node}" -e '
+    const o=require(process.argv[1]);
+    process.stdout.write(o.signPing(process.env.ORG_TEXT,{job:process.env.JORI_SIGN_AS||process.env.JORI_JOB||null,intent:process.env.ORG_INTENT||null}));' \
+    "$JORI_INSTALL_TOOLS/lib/org.cjs" 2>/dev/null)"
+  [ -n "$_SIGNED" ] && MESSAGE="$_SIGNED"
+fi
 PUSH_TEXT="$MESSAGE"
 if [ ${#MEDIA[@]} -gt 0 ]; then
   for media_url in "${MEDIA[@]}"; do
@@ -1324,7 +1337,7 @@ else
   echo "$ASSISTANT push failed (HTTP $HTTP_CODE) — falling back to email" >&2
   EMAIL_SEND="$JORI_INSTALL_TOOLS/bin/email-send"
   if [ -x "$EMAIL_SEND" ]; then
-    "$EMAIL_SEND" --to "$JORI_OWNER_EMAIL" \
+    JORI_NO_SIGN=1 "$EMAIL_SEND" --to "$JORI_OWNER_EMAIL" \
       --subject "${JORI_SENDER_NAME:-$ASSISTANT} notification (push failed)" \
       --body "$MESSAGE" 2>/dev/null
     if [ $? -eq 0 ]; then

@@ -51,6 +51,10 @@ The files listed in `system/kernel-manifest.json` are the generic kernel, shared
 
 A new feature is a plugin (`plugins/<name>/`, or `agent/local/plugins/<name>/` when it is this installation's own): a `plugin.json` manifest plus its commands, playbooks, schedules and settings in that directory. Start it with `jori plugin new <name> [--schedule CRON] [--job] [--local]`; the how-to is `docs/writing-a-plugin.md`. Never add a plugin's cron line by hand (`jori plugin sync` writes it), and never name a plugin's files from outside it: ask `lib/plugins.cjs`. Turn features on and off with `jori plugin enable|disable`. Design: `system/plugins.md`.
 
+## The team — every job belongs to a role
+
+Jori's jobs are organized as a team (`system/org.md`): roles with a title and a first name (CFO, Software Engineer, Marketer, Historian, …), all reporting to the user (the CEO) and coordinated by the Chief of Staff, the assistant itself. The roster is `agent/local/config/org.json`; `org list` shows it, `org who <job>` names a job's role. **A new job is added to a role in the same change** (`org audit`). A role signs its job's emails and pings (`lib/org.cjs`, through `email-send`, `digest-deliver`, `jori-send-curl`, `jori-notify`); never sign by hand, and never re-sign a message whose text already starts with a role's name.
+
 ## Calendar Invitations — Never invite anyone else unless the user explicitly asks
 
 Top-tier rule. **Default: every calendar event Jori creates or updates has zero attendees other than the user (the organizer).** Applies to every path that ends in a calendar write: email-triage auto-created events, webhook/cron calendar tasks, chat-agent calendar tools, and updates (never add attendees to an existing event unless the user said to).
