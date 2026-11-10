@@ -103,6 +103,26 @@ LOG="$LOGDIR/$JOB.log"
 mkdir -p "$LOGDIR"
 log() { echo "$(date '+%Y-%m-%d %H:%M:%S') [$JOB] $1" >> "$LOG"; }
 
+# A per-job model the installation chose (agent/local/config/fork-models.json:
+# {"jobs": {"<job>": {"model": "sonnet|opus|<full id>", "effort": "<level>"}}}).
+# It wins over the trigger's default; the allowance governor below may still
+# move a run to its cheaper model.
+_FM="$(node -e '
+  try { const c=require(process.argv[1]).localConfig("fork-models",{jobs:{}}); const j=(c.jobs||{})[process.argv[2]];
+        if (j) process.stdout.write([j.model||"", j.effort||""].join(" ")); } catch {}' \
+  "$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)/lib/instance.cjs" "$JOB" 2>/dev/null)"
+if [ -n "$_FM" ]; then
+  read -r _FM_MODEL _FM_EFFORT <<<"$_FM"
+  case "$_FM_MODEL" in
+    sonnet) _FM_MODEL="${JORI_MODEL_SONNET:-}" ;;
+    opus)   _FM_MODEL="${JORI_MODEL_OPUS:-}" ;;
+    haiku)  _FM_MODEL="${JORI_MODEL_HAIKU:-}" ;;
+  esac
+  [ -n "$_FM_MODEL" ] && MODEL="$_FM_MODEL"
+  [ -n "$_FM_EFFORT" ] && EFFORT="$_FM_EFFORT"
+  log "model from fork-models.json: $MODEL${_FM_EFFORT:+, $_FM_EFFORT}"
+fi
+
 if [ ! -f "$JOB_MD" ]; then
   log "ERROR: job file missing: $JOB_MD"
   exit 1
