@@ -358,9 +358,14 @@ struct ContentView: View {
         var frame = hidden
         frame.size.width += width
         if frame.maxX > visible.maxX { frame.size.width = max(hidden.width, visible.maxX - frame.minX) }
-        window.setFrame(frame, display: true, animate: true)
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
-            if window.frame != frame { window.setFrame(frame, display: true, animate: true) }
+        // Instant, not animated: an animated window resize ran on AppKit's
+        // own clock beside the sidebar's slide (plus a corrective re-apply at
+        // 0.4 s), and the two motions fought, so the conversation jittered.
+        // Now the slide is the only motion; the conversation's width is held
+        // meanwhile (holdDetailWidthDuringSidebarAnimation).
+        window.setFrame(frame, display: true, animate: false)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.45) {
+            if window.frame != frame { window.setFrame(frame, display: true, animate: false) }
         }
     }
 
@@ -377,9 +382,9 @@ struct ContentView: View {
         guard taken > 0 else { return }
         frame.size.width = target
         windowShrunkForSidebar = taken
-        window.setFrame(frame, display: true, animate: true)
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
-            if window.frame != frame { window.setFrame(frame, display: true, animate: true) }
+        // Instant, after the sidebar has slid away (see growWindowForSidebar).
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+            window.setFrame(frame, display: true, animate: false)
         }
     }
 
@@ -1424,8 +1429,12 @@ struct ContentView: View {
                     badges.activeConversation = viewModel.currentConversation
                     badges.start()
                 }
-                .onChange(of: viewModel.openQuestions.count) { _, n in
-                    badges.setOpenQuestions(n, in: viewModel.currentConversation)
+                // One source for the counts: the list's own query. The thread
+                // only sees the messages it has loaded, so letting it override
+                // the count made a badge clear on open and return on the way
+                // back. An answer here just triggers a recount.
+                .onChange(of: viewModel.openQuestions.count) { _, _ in
+                    Task { await badges.loadSummaries() }
                 }
                 .onChange(of: viewModel.currentConversation) { oldConversation, newConversation in
                     badges.activeConversation = newConversation
