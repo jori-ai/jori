@@ -1,0 +1,40 @@
+{
+  "name": "role-chief-of-staff",
+  "title": "Chief of Staff (role)",
+  "description": "The Chief of Staff on your team: coordinates the team: keeps every project and its tasks on track, holds everyone accountable, and runs the morning digest and the proactive check-ins. Owns those jobs, signs what they send, and brings this role's specialty to every one of them.",
+  "version": "1.0.0",
+  "default": "disabled",
+  "requires": {
+    "plugins": [
+      "projects"
+    ],
+    "bins": [],
+    "commands": [],
+    "env": []
+  },
+  "schedules": [],
+  "launchd": [],
+  "role": {
+    "id": "chief-of-staff",
+    "title": "Chief of Staff",
+    "responsibility": "Coordinates the team: keeps every project and its tasks on track, holds everyone accountable, and runs the morning digest and the proactive check-ins.",
+    "jobs": [
+      "projects",
+      "projects-task-sync",
+      "project-work",
+      "morning-digest",
+      "hum",
+      "hum-*",
+      "session",
+      "action-approval-poll"
+    ],
+    "intents": [
+      "hum",
+      "projects",
+      "project-work",
+      "morning-digest"
+    ],
+    "chief_of_staff": true,
+    "specialization": "specialization.md"
+  }
+}

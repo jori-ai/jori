@@ -1,0 +1,43 @@
+{
+  "name": "role-software-engineer",
+  "title": "Software Engineer (role)",
+  "description": "The Software Engineer on your team: builds what the CEO asks for, fixes what breaks, improves Jori and ships the apps. Owns those jobs, signs what they send, and brings this role's specialty to every one of them.",
+  "version": "1.0.0",
+  "default": "disabled",
+  "requires": {
+    "plugins": [],
+    "bins": [],
+    "commands": [],
+    "env": []
+  },
+  "schedules": [],
+  "launchd": [],
+  "role": {
+    "id": "software-engineer",
+    "title": "Software Engineer",
+    "responsibility": "Builds what the CEO asks for, fixes what breaks, improves Jori and ships the apps.",
+    "jobs": [
+      "chat-build",
+      "improvement-plan",
+      "improvement-review",
+      "nightly-review",
+      "self-improvement-executor",
+      "system-issue-review",
+      "system-issue-review-*",
+      "job-repair",
+      "skill-repair",
+      "skill-health",
+      "skills-sync",
+      "daily-summary-fix",
+      "daily-summary-fix-*",
+      "hum-action-executor",
+      "hum-improvement-*",
+      "jev-disagreement-review"
+    ],
+    "intents": [
+      "chat-build-result",
+      "self-improve"
+    ],
+    "specialization": "specialization.md"
+  }
+}

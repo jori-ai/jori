@@ -1,0 +1,33 @@
+{
+  "name": "role-relationships",
+  "title": "Relationships (role)",
+  "description": "The Relationships on your team: the people in the CEO's life: staying in touch, birthdays and occasions. Owns those jobs, signs what they send, and brings this role's specialty to every one of them.",
+  "version": "1.0.0",
+  "default": "disabled",
+  "requires": {
+    "plugins": [],
+    "bins": [],
+    "commands": [],
+    "env": []
+  },
+  "schedules": [],
+  "launchd": [],
+  "role": {
+    "id": "relationships",
+    "title": "Relationships",
+    "responsibility": "The people in the CEO's life: staying in touch, birthdays and occasions.",
+    "jobs": [
+      "people-email",
+      "people-watch",
+      "people-watch-*",
+      "birthday-brainstorm",
+      "occasion-ideas"
+    ],
+    "intents": [
+      "people-watch",
+      "birthday",
+      "occasion"
+    ],
+    "specialization": "specialization.md"
+  }
+}

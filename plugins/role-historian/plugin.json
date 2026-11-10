@@ -1,0 +1,52 @@
+{
+  "name": "role-historian",
+  "title": "Historian (role)",
+  "description": "The Historian on your team: memory: what happened each day, where the CEO was, and everything Jori knows. Owns those jobs, signs what they send, and brings this role's specialty to every one of them.",
+  "version": "1.0.0",
+  "default": "disabled",
+  "requires": {
+    "plugins": [],
+    "bins": [],
+    "commands": [],
+    "env": []
+  },
+  "schedules": [],
+  "launchd": [],
+  "role": {
+    "id": "historian",
+    "title": "Historian",
+    "responsibility": "Memory: what happened each day, where the CEO was, and everything Jori knows.",
+    "jobs": [
+      "daily-summary",
+      "daily-summary-*",
+      "weekly-summary",
+      "monthly-summary",
+      "dream",
+      "dream-deep",
+      "episode-archive",
+      "chat-consolidate",
+      "hum-consolidate",
+      "memory-*",
+      "wiki-*",
+      "recall-events-embed",
+      "embed-messages",
+      "inbox-mem-sync",
+      "inbox-mem-sync-*",
+      "context-sync",
+      "photos-*",
+      "location-*",
+      "segment-ask",
+      "choice-sweep",
+      "live-day",
+      "companion-presence"
+    ],
+    "intents": [
+      "daily-summary",
+      "weekly-summary",
+      "monthly-summary",
+      "dream",
+      "location"
+    ],
+    "specialization": "specialization.md"
+  }
+}

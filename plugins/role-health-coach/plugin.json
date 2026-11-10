@@ -1,0 +1,29 @@
+{
+  "name": "role-health-coach",
+  "title": "Health Coach (role)",
+  "description": "The Health Coach on your team: sleep, exercise and health patterns, framed as patterns and always deferring to the doctor. Owns those jobs, signs what they send, and brings this role's specialty to every one of them.",
+  "version": "1.0.0",
+  "default": "disabled",
+  "requires": {
+    "plugins": [],
+    "bins": [],
+    "commands": [],
+    "env": []
+  },
+  "schedules": [],
+  "launchd": [],
+  "role": {
+    "id": "health-coach",
+    "title": "Health Coach",
+    "responsibility": "Sleep, exercise and health patterns, framed as patterns and always deferring to the doctor.",
+    "jobs": [
+      "exercise-schedule",
+      "sleep-night"
+    ],
+    "intents": [
+      "health",
+      "exercise"
+    ],
+    "specialization": "specialization.md"
+  }
+}
