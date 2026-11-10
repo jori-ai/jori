@@ -17,46 +17,58 @@
 //                       otherwise it waits for a digest or is dropped.
 //
 // Verdicts: send | rewrite (message = the better text) | resolve (back to the
-// role: research_plan says what to look up / answer instead) | digest (hold for
-// the daily summary) | drop.
+// role: research_plan says what was found / what to answer instead) | digest
+// (hold for the daily summary) | drop.
 //
-// Two depths (the user's call, 2026-11-10): a PROACTIVE message gets all four,
-// Sonnet at medium effort with up to one round of read-only lookups. A REPLY to
-// something the user just wrote gets the light check — 1 and 3 only, never
-// dropped (it can only be sent or corrected).
+// Two depths (the user's call, 2026-11-10): a PROACTIVE message gets all four;
+// a REPLY to something the user just wrote gets 1 and 3 and is never dropped
+// (it can only be sent or corrected).
 //
-// RESEARCH WITHOUT TOOLS. The judge runs tool-less (lib/jev-claude.mjs: no
-// tools, no MCP, no settings). It may answer {"lookups":[…]} once instead of a
-// verdict; this file runs those from a fixed READ-ONLY menu (wiki, calendar,
-// travel, the message log, recorded finance facts) and asks again with the
-// results. Nothing the model writes is ever executed as a command.
+// RESEARCH, NOT A GLANCE (the user, grading the first replay: "go beyond a
+// cursory verification — check all available sources, including all our
+// databases and applications, and the web"). The judge is a Claude session
+// with READ-ONLY tools, as many steps as it needs within a time budget:
+//   - bin/db-read (every Supabase table, GET only by construction), bin/recall
+//     (chat + wiki + inbox + replies), bin/jori-messages-search, bin/wiki,
+//     bin/rentals (the rental books, read-only by design), bin/location-day
+//     (where, with steps), bin/findme history, bin/travel, bin/finance-facts,
+//     gog calendar/gmail/tasks reads;
+//   - Read/Grep/Glob over the installation (logs, data stores) with secrets
+//     denied; WebSearch and WebFetch.
+// Locked down: --permission-mode dontAsk (anything not allowed is refused, no
+// prompt), only those Bash prefixes allowed, no MCP servers, no settings files,
+// no session kept. It cannot write, send or change anything.
 //
-// Evidence: outbound-precheck in evidence mode (transcript, calendar, the
-// user's dated words, wiki, acknowledged topics, today's pings, travel facts),
-// plus what the precheck never had — the role's own conversation and the state
-// of every question it asked (answered / open), which is what the Felix
-// reply of 2026-11-10 got wrong.
+// Evidence handed to it up front (so research starts from what is known): the
+// outbound precheck in evidence mode (transcript, calendar, the user's dated
+// words, wiki hits, acknowledged topics, today's pings, travel facts and any
+// place/date pairing the travel check flagged), the sending role's own
+// conversation with each question's state, the questions still open, and the
+// user's standing rules (agent/local/config/speak-gate.json standing_rules).
 //
 // Claude only, never Jev: money and health messages pass through here too.
 //
 // Stdin:  {message, intent?, sender? (role id), kind?: "proactive"|"reply",
 //          reply_to_text?, channel?, supporting_data?, as_of? (replay)}
-// Stdout: {verdict, message?, research_plan?, reason, checks, lookups_used}
+// Stdout: {verdict, message?, research_plan?, reason, checks, sources, ms}
 // Fail-open: an error emits {verdict:"send", reason:"gate_error:…"}.
-// Env: SPEAK_GATE_LOG (default data/speak-gate-log.jsonl), SPEAK_GATE_NO_LOG=1.
+// Env: SPEAK_GATE_LOG (default data/speak-gate-log.jsonl), SPEAK_GATE_NO_LOG=1,
+//      SPEAK_GATE_TIMEOUT_S (proactive 300, reply 120).
 "use strict";
 
-import { spawnSync } from "node:child_process";
+import { spawnSync, execFile } from "node:child_process";
 import { appendFileSync, mkdirSync, readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
+import os from "node:os";
 import path from "node:path";
 import { createRequire } from "node:module";
-import { runToollessDetailed, parseModelJson } from "../lib/jev-claude.mjs";
+import { maxOnlyEnv, DEFAULT_CLAUDE_BIN } from "../lib/jev-claude.mjs";
+import { extractJsonObject } from "../lib/extract-json.mjs";
 
 const require = createRequire(import.meta.url);
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const { MODELS } = require(path.join(ROOT, "lib", "models.cjs"));
-const { instance } = require(path.join(ROOT, "lib", "instance.cjs"));
+const { instance, localConfig } = require(path.join(ROOT, "lib", "instance.cjs"));
 try { require(path.join(ROOT, "lib", "load-env.js")).loadEnv(); } catch { /* env may be set */ }
 const rest = require(path.join(ROOT, "lib", "supabase-rest.js"));
 let org = null;
@@ -66,9 +78,12 @@ const OWNER = instance().owner_name || "the user";
 const ASSISTANT = instance().assistant_name || "Jori"; // control-scan-ok: the setting's default
 const LOG = process.env.SPEAK_GATE_LOG || path.join(ROOT, "data", "speak-gate-log.jsonl");
 const GOG = process.env.SPEAK_GATE_GOG_BIN || "/opt/homebrew/bin/gog";
+const CLAUDE_BIN = process.env.SPEAK_GATE_CLAUDE_BIN || DEFAULT_CLAUDE_BIN;
 const VERDICTS = ["send", "rewrite", "resolve", "digest", "drop"];
-const MAX_LOOKUPS = 3;
-let AS_OF = null; // a replay's instant: lookups see nothing after it
+// SPEAK_GATE_CONFIG: a config file to read instead (a staged replay).
+const CFG = process.env.SPEAK_GATE_CONFIG
+  ? JSON.parse(readFileSync(process.env.SPEAK_GATE_CONFIG, "utf8"))
+  : localConfig("speak-gate", { standing_rules: [] });
 
 function log(row) {
   if (process.env.SPEAK_GATE_NO_LOG === "1") return;
@@ -96,6 +111,7 @@ function precheckEvidence(input) {
 }
 
 const ts = (iso) => String(iso || "").slice(0, 16).replace("T", " ") + "Z";
+const oneLine = (s, n) => String(s).slice(0, n).split("\n").join(" ");
 
 async function roleThread(sender, asOf) {
   if (!sender) return "";
@@ -106,108 +122,138 @@ async function roleThread(sender, asOf) {
     return (rows || []).reverse().map((m) => {
       // A question's state is today's; in a replay it would leak the later answer.
       const st = !asOf && m.metadata && m.metadata.question_state ? ` [question ${m.metadata.question_state}]` : "";
-      return `- [${ts(m.created_at)}] ${m.role === "user" ? OWNER : "role"}${st}: ${String(m.content).slice(0, 300).replace(/\n/g, " ")}`; // lang-regex-ok: flattens newlines for a one-line log row
+      return `- [${ts(m.created_at)}] ${m.role === "user" ? OWNER : "role"}${st}: ${oneLine(m.content, 300)}`;
     }).join("\n");
   } catch { return ""; }
 }
 
 async function openQuestions(asOf) {
   if (asOf) return ""; // states are today's: unknowable as of a replay instant
-  const since = new Date((asOf ? Date.parse(asOf) : Date.now()) - 14 * 864e5).toISOString();
+  const since = new Date(Date.now() - 14 * 864e5).toISOString();
   try {
     const rows = await rest.request(`/rest/v1/jori_messages?select=content,created_at,sender,metadata&role=eq.assistant&metadata->>question_state=eq.open&created_at=gt.${encodeURIComponent(since)}&order=created_at.desc&limit=20`);
-    return (rows || []).map((m) => `- [${ts(m.created_at)}] (${m.sender || "?"}) ${String(m.content).slice(0, 200).replace(/\n/g, " ")}`).join("\n"); // lang-regex-ok: flattens newlines for a one-line log row
+    return (rows || []).map((m) => `- [${ts(m.created_at)}] (${m.sender || "?"}) ${oneLine(m.content, 200)}`).join("\n");
   } catch { return ""; }
 }
 
-// ─── The read-only lookup menu ──────────────────────────────────────────────
+// ─── The research agent's tools (read-only) ────────────────────────────────
 
-function run(bin, args, timeout = 15000) {
-  const r = spawnSync(bin, args, { encoding: "utf8", timeout });
-  return String(r.stdout || r.stderr || "").trim().slice(0, 2500) || "(nothing)";
+const B = (name) => path.join(ROOT, "bin", name);
+const TOOLS_DOC = `READ-ONLY TOOLS (use them; a verdict without research is not acceptable). Call each by its FULL PATH as written, never after \`cd\`; pipe only into head, tail, grep, jq, wc, sort, uniq, cut or tr. Anything else is refused.:
+- ${B("db-read")} tables | ${B("db-read")} <table> "<postgrest query>"   every database table (messages, location history, health samples, finance, Plaid transactions, receipts, Amazon orders, trips, …). Start with \`tables\` when unsure where something lives.
+- ${B("recall")} "<question>"   one search across chat, wiki, inbox and ${OWNER}'s replies.
+- ${B("jori-messages-search")} "<text>" --k 8   semantic search of every message between ${OWNER} and ${ASSISTANT}.
+- ${B("wiki")} search "<q>" --k 5 | ${B("wiki")} read <id>   long-term memory.
+- ${B("rentals")} <overview|property|tenants|tenant|leases|accounts|transactions|pnl|orders|order|receipts> …   the rental portfolio's books (tenants, leases, ledger, Amazon orders, receipts). \`${B("rentals")} help\` lists options.
+- ${B("location-day")} <YYYY-MM-DD>   where ${OWNER} went that day, legs and modes, with step counts (walked or rode).
+- ${B("findme")} history <YYYY-MM-DD>   the raw location timeline.
+- ${B("travel")} where <date> | ${B("travel")} list   the travel timeline (the authority on where ${OWNER} is).
+- ${B("finance-facts")} questions | ${B("finance-facts")} list <txn|income|payment|move|exception>   what the finance review recorded.
+- ${GOG} calendar list --json --results-only --from <iso> --to <iso> --all
+- ${GOG} gmail search "<gmail query>" --max 10   email.
+- ${GOG} tasks list <list>   task lists.
+- Read / Grep / Glob over ${ROOT} (logs under agent/logs, data stores under data/). Secrets are off limits.
+- WebSearch / WebFetch (when offered)   the outside world (an event's lineup, a price, a business, a date). NEVER put ${OWNER}'s personal data in a web query: no account numbers, amounts, balances, health values, addresses or names of people he knows. Search for the public thing (the band, the venue, the company), never for the person.`;
+
+// Bank and health content is Jori-model-only and never goes into an outbound
+// web request (agent/CLAUDE.md § Financial Operations rule 5, § Health): a
+// message from a money or health role, or with a private intent, is
+// researched without WebSearch/WebFetch. Every other run is told never to put
+// personal data into a web query.
+const NO_WEB_ROLES = new Set(CFG.no_web_roles || ["cfo", "health-coach"]);
+const PRIVATE_PREFIXES = ["bank", "health", "net-worth", "property", "finance", "fin-", "hum:finance", "hum:stocks", "portfolio", "plaid", "broker"];
+function webAllowed(input) {
+  if (NO_WEB_ROLES.has(String(input.sender || ""))) return false;
+  const i = String(input.intent || "").toLowerCase();
+  return !PRIVATE_PREFIXES.some((p) => i.startsWith(p));
 }
 
-const LOOKUPS = {
-  wiki_search: { args: "query", doc: "search long-term memory (people, places, plans, decisions)", run: (a) => run(path.join(ROOT, "bin", "wiki"), ["search", String(a.query || ""), "--k", "4"]) },
-  wiki_read: { args: "id", doc: "read one wiki page by id", run: (a) => run(path.join(ROOT, "bin", "wiki"), ["read", String(a.id || "").replace(/[^a-z0-9_-]/gi, "")]) },
-  calendar: { args: "from, to (ISO dates)", doc: "calendar events in a range", run: (a) => run(GOG, ["calendar", "list", "--json", "--results-only", "--from", String(a.from || ""), "--to", String(a.to || ""), "--all"]) },
-  travel_where: { args: "when (date or ISO time)", doc: "where the user is/will be", run: (a) => run(path.join(ROOT, "bin", "travel"), ["where", String(a.when || "")]) },
-  messages_search: { args: "text, days (≤60)", doc: `search ${OWNER}'s conversations with ${ASSISTANT} (both sides)`, run: async (a) => {
-    const days = Math.min(60, Math.max(1, Number(a.days) || 14));
-    const until = AS_OF ? Date.parse(AS_OF) : Date.now();
-    const since = new Date(until - days * 864e5).toISOString();
-    const q = String(a.text || "").replace(/[%*,()]/g, " ").trim().slice(0, 80);
-    if (!q) return "(no text)";
-    try {
-      const rows = await rest.request(`/rest/v1/jori_messages?select=role,content,created_at,metadata&content=ilike.*${encodeURIComponent(q)}*&created_at=gt.${encodeURIComponent(since)}${AS_OF ? `&created_at=lt.${encodeURIComponent(AS_OF)}` : ""}&order=created_at.desc&limit=8`);
-      return (rows || []).map((m) => `- [${ts(m.created_at)}] ${m.role}${!AS_OF && m.metadata?.question_state ? ` [question ${m.metadata.question_state}]` : ""}: ${String(m.content).slice(0, 300).replace(/\n/g, " ")}`).join("\n") || "(no matches)"; // lang-regex-ok: flattens newlines for a one-line log row
-    } catch (e) { return `(failed: ${e.message})`; }
-  } },
-  finance_facts: { args: "what: questions|txn|income|payment|move|exception", doc: "what the finance review has recorded or still asks", run: (a) => {
-    const what = String(a.what || "questions");
-    return what === "questions" ? run(path.join(ROOT, "bin", "finance-facts"), ["questions"]) : run(path.join(ROOT, "bin", "finance-facts"), ["list", what.replace(/[^a-z]/g, "")]);
-  } },
-};
+function agentArgs(model, effort, web = true) {
+  const bash = ["db-read", "recall", "jori-messages-search", "wiki", "rentals", "location-day", "travel", "finance-facts"]
+    .map((b) => `Bash(${B(b)}:*)`)
+    .concat([`Bash(${B("findme")} history:*)`, `Bash(${GOG} calendar list:*)`, `Bash(${GOG} gmail search:*)`, `Bash(${GOG} tasks list:*)`])
+    // Read-only filters, so `… | head` or `… | jq` is not refused whole (the
+    // first research replay lost most of its shell calls to an unlisted pipe).
+    .concat(["head", "tail", "jq", "wc", "sort", "uniq", "cut", "grep", "tr"].map((f) => `Bash(${f}:*)`));
+  return [
+    "-p", "--model", model, "--effort", effort,
+    "--tools", web ? "Bash,Read,Grep,Glob,WebSearch,WebFetch" : "Bash,Read,Grep,Glob",
+    "--allowedTools", ["Read", "Grep", "Glob", ...(web ? ["WebSearch", "WebFetch"] : []), ...bash].join(","),
+    "--disallowedTools", ["Read(**/.env*)", "Grep(**/.env*)", "Read(**/*oauth*)", "Read(**/*secret*)", "Read(**/*.key)", "Read(**/*.pem)", "Read(**/.ssh/**)"].join(","),
+    "--permission-mode", "dontAsk",
+    "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}',
+    "--setting-sources", "project",
+    "--add-dir", ROOT,
+    "--no-session-persistence",
+    "--output-format", "text",
+  ];
+}
 
-async function runLookups(list) {
-  const done = [];
-  for (const l of (Array.isArray(list) ? list : []).slice(0, MAX_LOOKUPS)) {
-    const tool = LOOKUPS[l && l.tool];
-    if (!tool) { done.push({ ...l, result: "(unknown lookup)" }); continue; }
-    let result;
-    try { result = await tool.run(l.args || {}); } catch (e) { result = `(failed: ${e.message})`; }
-    done.push({ tool: l.tool, args: l.args, result });
-  }
-  return done;
+function runAgent(prompt, { model, effort, timeoutMs, web }) {
+  return new Promise((resolve) => {
+    const child = execFile(CLAUDE_BIN, agentArgs(model, effort, web),
+      { encoding: "utf8", timeout: timeoutMs, maxBuffer: 4 * 1024 * 1024, cwd: os.tmpdir(), env: maxOnlyEnv() },
+      (err, stdout) => resolve({ text: String(stdout || "").trim(), err }));
+    child.stdin.on("error", () => {});
+    child.stdin.end(prompt);
+  });
 }
 
 // ─── The judge ──────────────────────────────────────────────────────────────
 
-function prompt(input, ev, extra, lookups) {
+function roleName(id) {
+  if (!id || !org) return id || "ops";
+  try { const r = org.org().roles.find((x) => x.id === id); return r ? `${r.name} (${r.title})` : id; } catch { return id; }
+}
+
+function prompt(input, ev, extra) {
   const reply = input.kind === "reply";
-  const who = input.sender && org ? (() => { try { const r = org.org().roles.find((x) => x.id === input.sender); return r ? `${r.name} (${r.title})` : input.sender; } catch { return input.sender; } })() : (input.sender || "ops");
   const E = (title, body) => (body && String(body).trim() ? `\n## ${title}\n${String(body).trim()}\n` : "");
-  const menu = Object.entries(LOOKUPS).map(([k, v]) => `  - ${k} {${v.args}}: ${v.doc}`).join("\n");
+  const rules = (CFG.standing_rules || []).map((r) => `- ${r}`).join("\n");
   const checks = reply
-    ? `This is a REPLY to something ${OWNER} just wrote. Light check, two questions only:
-1. TRUE — is every claim in it supported by the evidence? A claim the evidence contradicts (e.g. "I can't tell whether you answered" when the thread shows the questions answered) must be fixed.
-3. PHRASING — does it answer what ${OWNER} asked, directly, short, in plain words, without hedges like "tell me if…" or "I can't tell…" when the answer is findable?
+    ? `This is a REPLY to something ${OWNER} just wrote. Two questions:
+1. TRUE — verify every factual claim against the sources (tools below). A claim the sources contradict, or a hedge ("I can't tell whether…", "tell me if…") where the answer is findable, must be fixed — find the answer and put it in.
+3. PHRASING — answers what ${OWNER} asked, directly, short, plain.
 A reply is NEVER dropped, held or sent back: the verdict is "send" or "rewrite".`
     : `This is a PROACTIVE message — ${OWNER} did not ask for it. Think before you speak. Four questions:
-1. TRUE & CURRENT — is every claim true right now, against the evidence? Is it still relevant (not settled, not past, not already handled)?
-2. SELF-RESOLVE — if it asks ${OWNER} something: could ${ASSISTANT} find the answer itself (the wiki, the message log, calendar, travel, recorded finance facts), or close the item without asking? If so → "resolve" with a research_plan naming where the answer is. If asking is right but the question is the wrong one (asks for something knowable, asks two things, asks what instead of the real decision) → "rewrite" with the better question.
-3. PHRASING — one point. A question is ONE decision, with short choices and a recommendation first. Short, plain, topic first; no internal jargon (job names, ids, "the review's queue"); no hedging.
-4. VALUE — would ${OWNER} be glad to get this now? New to them, actionable or genuinely interesting, and timely. Routine status with nothing to do → "digest" (waits for the daily summary). Nothing new, nothing to do, or noise about ${ASSISTANT}'s own plumbing → "drop".
-Default to "send" only when all four pass. Prefer "rewrite" over "drop" when the core is valuable but the wording or question is off.`;
-  return `You are the think-before-you-speak gate for ${OWNER}'s assistant (${ASSISTANT}). Every message to ${OWNER} passes you first. Sender: ${who}. Intent: ${input.intent || "unknown"}. Channel: ${input.channel || "chat"}.${input.as_of ? ` REPLAY: judge as of ${input.as_of}, the moment it was about to be sent. Anything dated after that instant (a wiki line, a reply, a decision) did not exist yet: ignore it. In particular ${OWNER}'s later answer to THIS message never counts as "already answered".` : ""}
+1. TRUE & CURRENT — verify every claim against the sources, not just the evidence below. A claim that something MATCHES (a listing fits a watch, an artist is the one followed, a charge is a known payee, a place is where ${OWNER} is) needs the match itself checked: a different act with a similar name is a false claim. Still relevant (not settled, past or already handled)?
+2. SELF-RESOLVE — if it asks ${OWNER} something, look for the answer yourself first, in EVERY source (databases, location and steps, transactions, receipts, email, the books, messages, the web), not only the wiki. If you find it → "resolve" (never "drop"), and research_plan states the answer you found and where, so it is recorded instead of asked. If asking is right but the question is the wrong one → "rewrite" with the better question.
+3. PHRASING — one point. A question is ONE decision with short choices and a recommendation first. Short, plain, topic first; no internal jargon; no hedging.
+4. VALUE — would ${OWNER} be glad to get this now? New, actionable or genuinely interesting, timely. Routine status with nothing to do → "digest". Nothing new or ${ASSISTANT}'s own plumbing → "drop". ${OWNER}'s standing rules below override your sense of value.
+Default to "send" only when all four pass. Prefer "rewrite" to "drop" when the core is valuable but the wording or question is off.`;
+  return `You are the think-before-you-speak gate for ${OWNER}'s assistant (${ASSISTANT}). Every message to ${OWNER} passes you first. Sender: ${roleName(input.sender)}. Intent: ${input.intent || "unknown"}. Channel: ${input.channel || "chat"}. Now: ${input.as_of || new Date().toISOString()}.${input.as_of ? ` REPLAY: judge as of that instant, the moment it was about to be sent. Anything dated after it (a message, a wiki line, a row, an email) did not exist yet: ignore it. ${OWNER}'s later answer to THIS message never counts as "already answered".` : ""}
 
 ${checks}
 
+RESEARCH FIRST. Use the tools to verify the claims and look for answers before you decide; check several sources, not one. Budget: a few minutes. You cannot change anything, and must not try.
+
+${TOOLS_DOC}
+${rules ? `\n## ${OWNER.toUpperCase()}'S STANDING RULES (their own words; they override your judgment)\n${rules}\n` : ""}
 THE MESSAGE:
 """${input.message}"""
-${reply ? E(`WHAT ${OWNER.toUpperCase()} WROTE (being answered)`, input.reply_to_text) : ""}${E("THIS ROLE'S CONVERSATION, LAST 14 DAYS (question states are authoritative)", extra.thread)}${E("QUESTIONS STILL OPEN (any role)", extra.open)}${E(`WHAT ${OWNER.toUpperCase()} SAID (dated, from the reply log)`, ev.owner_said)}${E("AUTHORITATIVE TRAVEL FACTS", ev.authoritative_facts)}${E("LONG-TERM MEMORY (wiki hits)", ev.long_term_memory)}${E("TOPICS ACKNOWLEDGED IN THE LAST 48H", ev.acknowledged_topics_48h)}${E("PINGS ALREADY SENT TODAY", ev.hum_pings_today)}${E("SENDER'S SUPPORTING DATA", ev.supporting_data)}${E("CHAT, LAST 8H", ev.transcript_last_8h)}${E("CALENDAR, REST OF TODAY", ev.calendar_today)}${lookups ? E("YOUR LOOKUPS", lookups.map((l) => `### ${l.tool} ${JSON.stringify(l.args || {})}\n${l.result}`).join("\n\n")) : ""}
-${lookups ? "You have used your lookups: decide now." : `If a check needs a fact the evidence lacks, you may FIRST ask for up to ${MAX_LOOKUPS} read-only lookups instead of deciding — reply {"lookups":[{"tool":"…","args":{…}}]}. Menu:\n${menu}\nOnly when the answer could change the verdict; otherwise decide now.`}
+${reply ? E(`WHAT ${OWNER.toUpperCase()} WROTE (being answered)`, input.reply_to_text) : ""}${E("THIS ROLE'S CONVERSATION, LAST 14 DAYS (question states are authoritative)", extra.thread)}${E("QUESTIONS STILL OPEN (any role)", extra.open)}${E(`WHAT ${OWNER.toUpperCase()} SAID (dated, from the reply log)`, ev.owner_said)}${E("TRAVEL TIMELINE FACTS", ev.authoritative_facts)}${E("TRAVEL CHECK FLAGGED (code paired a place and a date; decide yourself whether the message actually claims where the user is)", ev.travel_check_flagged)}${E("LONG-TERM MEMORY (wiki hits)", ev.long_term_memory)}${E("TOPICS ACKNOWLEDGED IN THE LAST 48H", ev.acknowledged_topics_48h)}${E("PINGS ALREADY SENT TODAY", ev.hum_pings_today)}${E("SENDER'S SUPPORTING DATA", ev.supporting_data)}${E("CHAT, LAST 8H", ev.transcript_last_8h)}${E("CALENDAR, REST OF TODAY", ev.calendar_today)}
+When done, end your answer with ONE LINE of compact JSON (nothing after it):
+{"verdict":"${reply ? "send|rewrite" : "send|rewrite|resolve|digest|drop"}","message":"<the rewritten text, only for rewrite>","research_plan":"<only for resolve: the answer you found and its source, or what is left to do>","checks":{"true":"ok|<problem>","${reply ? "phrasing" : "self_resolve"}":"ok|<problem>"${reply ? "" : ',"phrasing":"ok|<problem>","value":"ok|<problem>"'}},"sources":["<each source you checked, short>"],"reason":"<≤200 chars>"}`;
+}
 
-Reply with ONE LINE of compact JSON, no prose, no fence:
-{"verdict":"${reply ? "send|rewrite" : "send|rewrite|resolve|digest|drop"}","message":"<the rewritten text, only for rewrite>","research_plan":"<only for resolve: what to look up or answer instead of asking>","checks":{"true":"ok|<problem>","${reply ? "phrasing" : "self_resolve"}":"ok|<problem>"${reply ? "" : ',"phrasing":"ok|<problem>","value":"ok|<problem>"'}},"reason":"<≤160 chars>"}`;
+function lastJson(text) {
+  const lines = String(text).trim().split("\n").reverse();
+  for (const l of lines) { const t = l.trim(); if (t.startsWith("{") && t.endsWith("}")) { try { return JSON.parse(t); } catch {} } }
+  try { return extractJsonObject(text); } catch { return null; }
 }
 
 async function judge(input, ev, extra) {
-  const model = MODELS.sonnet;
-  const effort = input.kind === "reply" ? "low" : "medium";
-  let lookups = null;
-  for (let round = 0; round < 2; round++) {
-    const { out: text, error } = await runToollessDetailed({ model, effort, prompt: prompt(input, ev, extra, lookups), timeoutMs: 150000 });
-    if (!text) throw new Error(`judge_unavailable:${error?.kind || "?"}`);
-    const p = parseModelJson(text);
-    if (!p) throw new Error(`judge_no_json:${text.slice(0, 80)}`);
-    if (Array.isArray(p.lookups) && !lookups && round === 0) { lookups = await runLookups(p.lookups); continue; }
-    if (!VERDICTS.includes(p.verdict)) p.verdict = "send";
-    if (input.kind === "reply" && !["send", "rewrite"].includes(p.verdict)) p.verdict = "send";
-    if (p.verdict === "rewrite" && !String(p.message || "").trim()) p.verdict = "send";
-    return { ...p, lookups_used: (lookups || []).map((l) => ({ tool: l.tool, args: l.args })) };
-  }
-  throw new Error("judge_no_decision");
+  const reply = input.kind === "reply";
+  const timeoutMs = 1000 * Number(process.env.SPEAK_GATE_TIMEOUT_S || (reply ? 120 : 300));
+  const { text, err } = await runAgent(prompt(input, ev, extra), { model: MODELS.sonnet, effort: reply ? "low" : "medium", timeoutMs, web: webAllowed(input) });
+  if (!text) throw new Error(`judge_unavailable:${err?.killed ? "timeout" : (err?.code || "empty")}`);
+  if (text.startsWith("Not logged in")) throw new Error("judge_unavailable:not_logged_in");
+  const p = lastJson(text);
+  if (!p || !p.verdict) throw new Error(`judge_no_json:${oneLine(text.slice(-120), 120)}`);
+  if (!VERDICTS.includes(p.verdict)) p.verdict = "send";
+  if (reply && !["send", "rewrite"].includes(p.verdict)) p.verdict = "send";
+  if (p.verdict === "rewrite" && !String(p.message || "").trim()) p.verdict = "send";
+  return p;
 }
 
 // ─── Main ───────────────────────────────────────────────────────────────────
@@ -216,14 +262,13 @@ let input;
 try { input = JSON.parse(readFileSync(0, "utf8")); } catch { out({ verdict: "send", reason: "gate_invalid_input" }, {}); }
 if (!input || !String(input.message || "").trim()) out({ verdict: "send", reason: "gate_empty_input" }, {});
 input.kind = input.kind === "reply" ? "reply" : "proactive";
-AS_OF = input.as_of || null;
 const ctx = { intent: input.intent || null, sender: input.sender || null, kind: input.kind, as_of: input.as_of || null, message: String(input.message).slice(0, 400), ...(input.replay_id ? { replay_id: input.replay_id } : {}) };
 const t0 = Date.now();
 try {
   const pre = precheckEvidence(input);
   if (pre && pre.decision && pre.decision !== "evidence") {
-    // A deterministic stage decided (authority contradiction, settled subject,
-    // stale premise). A reply is never dropped: its suppress becomes a send.
+    // A deterministic stage decided (settled subject, stale premise). A reply
+    // is never dropped: its suppress becomes a send.
     const v = pre.decision === "suppress" ? (input.kind === "reply" ? "send" : "drop") : pre.decision === "modify" ? "rewrite" : "send";
     out({ verdict: v, ...(v === "rewrite" ? { message: pre.message } : {}), reason: `deterministic: ${pre.reason || ""}`.slice(0, 200), ms: Date.now() - t0 }, ctx);
   }

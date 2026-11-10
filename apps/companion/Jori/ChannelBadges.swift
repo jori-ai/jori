@@ -307,6 +307,29 @@ final class TeamStore: ObservableObject {
         }
     }
 
+    /// Everything in a conversation the user has opened is read: clear its
+    /// count here at once, and mark every unread assistant row in it read on
+    /// the server in ONE update, awaited, so the next summary load cannot bring
+    /// the badge back. (The thread view marks rows one at a time and only the
+    /// rows it loaded, so older unread rows, or a summary load that raced those
+    /// writes, made a badge clear on open and return on the way back.)
+    func markRead(_ conversationId: String) async {
+        guard !conversationId.isEmpty else { return }
+        if var s = summaries[conversationId], s.unread != 0 { s.unread = 0; summaries[conversationId] = s }
+        do {
+            try await SupabaseManager.ensureAuthenticated()
+            try await SupabaseManager.shared
+                .from(DBTables.messages)
+                .update(["read": true])
+                .eq("conversation_id", value: conversationId)
+                .eq("role", value: "assistant")
+                .eq("read", value: false)
+                .execute()
+        } catch {
+            print("[Team] mark read failed: \(error)")
+        }
+    }
+
     /// Previews, unread counts and open questions for every conversation, in
     /// three queries rather than three per conversation.
     func loadSummaries() async {

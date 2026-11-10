@@ -27,7 +27,7 @@ this turn:
   Step 4 people-watch propose (enqueue the changes Step 3 found)
 ```
 
-The "stay in touch" and "follow their news" cards carry a fixed option, "Just watch their news" (no reminders to reach out; status tracking, research on, nudges off), after the follow-their-news option and before "Not now"; cards already open keep the options they were asked with.
+Every relationship card ("stay in touch", "follow their news", "reach out", and a change in someone's life) carries a fixed option, "Track only" (the user's words, 2026-11-10: reach out to some people only when they change jobs or something else happens in their life): no reminders to reach out; status tracking, research on, nudges off; on a change card it also closes the change. Its description shows verbatim on the card. Cards already open keep the options they were asked with.
 
 The questions themselves are code: `people-watch propose` picks them (news about a followed person, then overdue nudges, then slipping away, then people the user works with; at most 3 open, one per person), and the hum `decisions` lane sends one a day as a multiple-choice card in the people slot (`lib/decision-queue.mjs`, source `people`, `ppl:` refs). A tapped option is applied in code by the next `apply`. You never compose or send a people question yourself.
 
@@ -47,7 +47,7 @@ Each `words` row: `{id, wiki_id, kind, question, options, answer}`. The user typ
 |---|---|
 | Yes, stay in touch (maybe with a rhythm: "every few months") | `people-watch decide <wiki_id> --ask <id> --status tracking --nudges 1 [--cadence <days>] --note "<their words>"` |
 | Yes, and follow their news | add `--research 1` |
-| Only follow the news, no nudges ("just track them and tell me if something happens", "just watch their news") | `--status tracking --research 1 --nudges 0` (the same as the card option "Just watch their news") |
+| Only follow the news, no nudges ("just track them and tell me if something happens", "track only", "just watch their news") | `--status tracking --research 1 --nudges 0` (the same as the card option "Track only") |
 | Not now / later | `--status snoozed --snooze-days <what they said, else 90>` |
 | No / let it go / leave them out | `--status declined` |
 | A reach-out or change card: "draft something" | `--draft` (Step 2 writes it) |

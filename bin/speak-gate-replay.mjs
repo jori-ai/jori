@@ -13,7 +13,7 @@
 "use strict";
 
 import { spawn } from "node:child_process";
-import { appendFileSync, mkdirSync, writeFileSync } from "node:fs";
+import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 import { createRequire } from "node:module";
@@ -29,6 +29,7 @@ const DAYS = Number(flag("days", 7));
 const N = Number(flag("n", 100));
 const OUT = flag("out", path.join(ROOT, "data", `speak-gate-replay-${new Date().toISOString().slice(0, 10)}.jsonl`));
 const CONC = Number(flag("concurrency", 3));
+const IDS = flag("ids", null); // a file of message ids (one per line): replay exactly those
 const SHARE = { questions: 0.3, proactive: 0.4, reply: 0.2, system: 0.05, improvements: 0.05 };
 
 function shuffle(a, seed = 7) { let s = seed; for (let i = a.length - 1; i > 0; i--) { s = (s * 9301 + 49297) % 233280; const j = Math.floor((s / 233280) * (i + 1)); [a[i], a[j]] = [a[j], a[i]]; } return a; }
@@ -76,7 +77,12 @@ function gate(item) {
 (async () => {
   const all = await load();
   const pick = [];
-  for (const [b, share] of Object.entries(SHARE)) pick.push(...shuffle(all.filter((x) => x.bucket === b)).slice(0, Math.round(N * share)));
+  if (IDS) {
+    const want = new Set(readFileSync(IDS, "utf8").split("\n").map((l) => l.trim()).filter(Boolean));
+    pick.push(...all.filter((x) => want.has(x.m.id)));
+  } else {
+    for (const [b, share] of Object.entries(SHARE)) pick.push(...shuffle(all.filter((x) => x.bucket === b)).slice(0, Math.round(N * share)));
+  }
   mkdirSync(path.dirname(OUT), { recursive: true });
   writeFileSync(OUT, "");
   console.log(`replay: ${all.length} messages in ${DAYS}d, sampling ${pick.length} → ${OUT}`);
