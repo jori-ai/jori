@@ -33,7 +33,7 @@ test("TTLock: dead lock (-2012) is unreachable, busy gateway (-3003) is its own 
   assert.deepEqual(lh.conditionsOf(busy, cfg), ["gateway_busy"]);
 });
 
-test("TTLock: gateway offline outranks a stale probe; no gateway is stated outright", () => {
+test("TTLock: gateway offline outranks a stale probe; no gateway is read from the lock list", () => {
   assert.deepEqual(lh.conditionsOf(ttl({ gateway: { id: 9, name: "GW", online: false }, probe: null }), cfg), ["gateway_offline"]);
   assert.deepEqual(lh.conditionsOf(ttl({ has_gateway: false, gateway: null, probe: null }), cfg), ["no_gateway"]);
 });
@@ -130,6 +130,27 @@ test("a lock's reach problem changing layer is one condition: no recovery, no se
   r = lh.plan({ readings: [ttl()], state: r.state, needs, nowMs: NOW + 3 * HOUR, cfg });
   assert.equal(r.recoveries.length, 1, "one recovery when it is really back");
   assert.match(lh.compose({ alerts: [], recoveries: r.recoveries }).text, /no longer the gateway can't reach the lock$/);
+});
+
+// Guards the "🔐 Lock problem … no gateway paired, so codes can't be sent to
+// it" rows that named several locks at once and all cleared within hours: a
+// no-gateway reading follows the gateway's connection, so it confirms over two
+// runs like every other reach layer, and its words do not claim a pairing fact.
+test("no gateway is a reach layer: a one-run reading says nothing, two runs alert", () => {
+  const noGw = ttl({ has_gateway: false, gateway: null, probe: null });
+  let r = lh.plan({ readings: [noGw], state: {}, nowMs: NOW, cfg });
+  assert.equal(r.alerts.length, 0, "first sight waits for a second run");
+  const cleared = lh.plan({ readings: [ttl()], state: r.state, nowMs: NOW + HOUR, cfg });
+  assert.equal(cleared.alerts.length + cleared.recoveries.length, 0, "a blip that clears says nothing");
+  r = lh.plan({ readings: [noGw], state: r.state, nowMs: NOW + HOUR, cfg });
+  assert.equal(r.alerts.length, 1);
+  assert.equal(r.alerts[0].kind, "no_gateway");
+  assert.equal(r.state.conditions["ttlock:1|reach"].text, "no gateway connected, so codes can't be sent to it");
+  // A lock someone needs soon still alerts at once.
+  const needs = new Map([["ttlock:1", [{ property: "P1", unit: "u1", atMs: NOW + HOUR, why: "check-in" }]]]);
+  assert.equal(lh.plan({ readings: [noGw], state: {}, needs, nowMs: NOW, cfg }).alerts.length, 1);
+  // A low battery is still stated outright.
+  assert.equal(lh.plan({ readings: [ttl({ battery: 10 })], state: {}, nowMs: NOW, cfg }).alerts.length, 1);
 });
 
 test("state written under the old per-layer keys folds into the reach key: no spurious recovery on deploy", () => {
