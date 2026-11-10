@@ -10,7 +10,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { execSync } from "node:child_process";
+import { execFileSync } from "node:child_process";
 import { readStdinJson, emit, emitNull, stampRun, minsSince, readCache, writeCache, GOG_ACCOUNT, localConfig } from "./_common.mjs";
 import { loadTimelineSync, checkClaims } from "../../../lib/claim-facts.mjs";
 import { localityVerdict } from "../../../lib/hum-idea-locality.mjs";
@@ -315,8 +315,9 @@ function premiseValid(idea) {
   const hasClock = /\b\d{1,2}:\d{2}\b|\b\d{1,2}\s*(am|pm)\b/i.test(idea.subject || "");
   if (!hasClock) return true;
   try {
-    const out = execSync(`/opt/homebrew/bin/gog calendar events --from="${date}" --to="${date}" -j${GOG_ACCOUNT ? ` --account=${GOG_ACCOUNT}` : ""} --no-input 2>/dev/null`, {
+    const out = execFileSync("/opt/homebrew/bin/gog", ["calendar", "events", `--from=${date}`, `--to=${date}`, "-j", ...(GOG_ACCOUNT ? [`--account=${GOG_ACCOUNT}`] : []), "--no-input"], {
       encoding: "utf8",
+      stdio: ["pipe", "pipe", "ignore"],
       timeout: 5000,
     });
     const parsed = JSON.parse(out);

@@ -54,7 +54,7 @@ const SEND = path.join(f.tmp, "send"), SENT = path.join(f.tmp, "sent.txt"), HEAL
 fs.writeFileSync(SEND, `#!/bin/sh\nprintf '%s\\n' "$*" >> "${SENT}"\n`, { mode: 0o755 });
 Object.assign(process.env, {
   JEV_CONFIG_FILE: f.CFG, JEV_QUESTIONS_DIR: f.qdir, JEV_SHADOW_DIR: f.SHADOW,
-  JEV_ENDPOINT: "https://jev.test/v1/evaluate", JEV_NO_ALERT: "1", TYPESAFE_API_KEY: "test-key", JEV_PRIVATE_SCREEN: "off",
+  JEV_ENDPOINT: "https://jev.test/v1/evaluate", JEV_NO_ALERT: "1", TYPESAFE_API_KEY: "example-test-key", JEV_PRIVATE_SCREEN: "off",
   CLAIM_FRESHNESS_CLAUDE_BIN: STUB, CLAIM_FRESHNESS_TRAVEL_BIN: TRAVEL, CLAIM_FRESHNESS_LOG: LOG,
   CLAIM_FRESHNESS_HEALTH: HEALTH, CLAIM_FRESHNESS_NO_ALERT: "1", CLAIM_FRESHNESS_SEND_BIN: SEND,
 });

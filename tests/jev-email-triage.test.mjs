@@ -7,6 +7,8 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { createRequire } from "node:module";
+// The privacy-screen stubs fake Ollama; the local model defaults to Haiku via `claude -p` since 2026-11-04, so pin the backend they simulate.
+process.env.LOCAL_LLM_BACKEND ||= "ollama";
 
 const TMP = fs.mkdtempSync(path.join(os.tmpdir(), "jev-email-"));
 process.env.JEV_CONFIG_FILE = path.join(TMP, "jev-config.json");
@@ -18,7 +20,7 @@ process.env.JEV_EXCLUDE_SENDERS_FILE = path.join(TMP, "exclude.json");
 process.env.LOCAL_TRIAGE_RULES_FILE = path.join(TMP, "local-triage-rules.json");
 fs.writeFileSync(process.env.LOCAL_TRIAGE_RULES_FILE, JSON.stringify({ rules: [{ id: "medical-subject", subject: "test results|lab results|care team", label: "personal", priority: "P1", escalate: true, reason: "medical subject" }] }));
 process.env.JEV_NO_ALERT = "1";
-process.env.TYPESAFE_API_KEY = "test-key";
+process.env.TYPESAFE_API_KEY = "example-test-key";
 process.env.JEV_PRIVATE_SCREEN = "off"; // the content screen has its own test below
 fs.mkdirSync(process.env.JEV_QUESTIONS_DIR, { recursive: true });
 fs.copyFileSync(new URL("../agent/config/jev-questions/email-triage.json", import.meta.url), path.join(process.env.JEV_QUESTIONS_DIR, "email-triage.json"));

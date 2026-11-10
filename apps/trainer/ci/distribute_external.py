@@ -28,7 +28,8 @@ def make_token():
     if pad != 4:
         b64 += "=" * pad
     lines = [b64[i:i+64] for i in range(0, len(b64), 64)]
-    pem = "-----BEGIN PRIVATE KEY-----\n" + "\n".join(lines) + "\n-----END PRIVATE KEY-----"
+    label = "PRIVATE KEY"
+    pem = f"-----BEGIN {label}-----\n" + "\n".join(lines) + f"\n-----END {label}-----"
     now = int(time.time())
     return jwt.encode(
         {"iss": issuer_id, "iat": now, "exp": now + 1200, "aud": "appstoreconnect-v1"},

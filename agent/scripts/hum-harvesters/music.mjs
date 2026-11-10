@@ -12,7 +12,7 @@
 //                            words in them are not read as kernel-guard tokens
 //   home_sources             extra prompt text used only at home (editorial sources, groups to watch)
 // Off when there is neither a music profile nor extra_taste.
-import { execSync, execFileSync } from "node:child_process";
+import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
@@ -83,9 +83,10 @@ Output ONE JSON object on stdout, no prose:
 {"items":[{"title":"...","artist":"...","kind":"album|tour|news","city":"city of the show for tour/concert (else null)","date":"YYYY-MM-DD of the show for tour/concert (else null)","url":"...","why":"one-line match to profile"}]}
 If nothing new, return {"items":[]}.`;
   try {
-    const out = execSync(
-      `"${CLAUDE}" -p --model ${MODELS.sonnet} --effort low --allowedTools WebSearch --output-format text "${prompt.replace(/"/g, '\\"').replace(/\n/g, "\\n")}" 2>/dev/null`,
-      { encoding: "utf8", timeout: 120000, maxBuffer: 2 * 1024 * 1024 }
+    const out = execFileSync(
+      CLAUDE,
+      ["-p", "--model", MODELS.sonnet, "--effort", "low", "--allowedTools", "WebSearch", "--output-format", "text", prompt],
+      { encoding: "utf8", timeout: 120000, maxBuffer: 2 * 1024 * 1024, stdio: ["pipe", "pipe", "ignore"] }
     );
     const parsed = extractJsonObject(out, { requireKey: "items" });
     if (!parsed) { emitNull("no JSON in subagent output"); process.exit(0); }

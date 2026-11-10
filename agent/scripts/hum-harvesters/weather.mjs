@@ -2,7 +2,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { execSync } from "node:child_process";
+import { execFileSync } from "node:child_process";
 import { readStdinJson, readCache, writeCache, emit, emitNull, stampRun } from "./_common.mjs";
 
 import { installTools } from "../../../lib/root.cjs";
@@ -49,8 +49,8 @@ let cur = readCache("weather");
 let prev = cur; // for delta detection
 if (!cur || cur._age_min >= TTL_MIN) {
   try {
-    const out = execSync(`${installTools("bin/apple-weather")} --findme --json 2>/dev/null`, {
-      encoding: "utf8", timeout: 10000,
+    const out = execFileSync(installTools("bin/apple-weather"), ["--findme", "--json"], {
+      encoding: "utf8", timeout: 10000, stdio: ["pipe", "pipe", "ignore"],
     });
     const w = JSON.parse(out);
     const c = w?.currentWeather || w?.current || null;

@@ -27,7 +27,7 @@ let input = ""; process.stdin.on("data", (d) => input += d).on("end", () => {
 fs.chmodSync(STUB, 0o755);
 process.env.CLAUDE_BIN = STUB;
 process.env.ANTHROPIC_API_KEY = "sk-test-not-real";
-process.env.ANTHROPIC_AUTH_TOKEN = "tok-test-not-real";
+process.env.ANTHROPIC_AUTH_TOKEN = "example-not-real";
 const require = createRequire(import.meta.url);
 const { judge, textSync, maxOnlyEnv, CLAUDE_BIN } = require("../lib/max-judge.js");
 const ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), "..");

@@ -2,7 +2,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
-import { execSync } from "node:child_process";
+import { execFileSync } from "node:child_process";
 import { readStdinJson, emit, emitNull, stampRun, GOG_ACCOUNT, localConfig } from "./_common.mjs";
 
 import { installTools } from "../../../lib/root.cjs";
@@ -102,9 +102,10 @@ if (isMain) {
   const { situation: sit } = await readStdinJson();
 
   try {
-    const json = execSync(
-      `/opt/homebrew/bin/gog calendar list${GOG_ACCOUNT ? ` --account ${GOG_ACCOUNT}` : ""} --days 2 --max 30 --json 2>/dev/null`,
-      { encoding: "utf8", timeout: 10000 },
+    const json = execFileSync(
+      "/opt/homebrew/bin/gog",
+      ["calendar", "list", ...(GOG_ACCOUNT ? ["--account", GOG_ACCOUNT] : []), "--days", "2", "--max", "30", "--json"],
+      { encoding: "utf8", timeout: 10000, stdio: ["pipe", "pipe", "ignore"] },
     );
     const data = JSON.parse(json);
     const rawEvents = data?.events || data?.items || data || [];

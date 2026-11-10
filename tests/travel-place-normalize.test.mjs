@@ -20,6 +20,7 @@ import { test, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
+import vm from "node:vm";
 import { fileURLToPath } from "node:url";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -43,7 +44,7 @@ const ctx = {};
     extract(/function isPlausibleCityName\(city\)[\s\S]*?\n\}/),
     "ctx.isPlausiblePlace = isPlausiblePlace; ctx.isSubdivisionCode = isSubdivisionCode; ctx.isPlausibleCityName = isPlausibleCityName;",
   ].join("\n");
-  new Function("US_STATE_CODES", "CA_PROV_CODES", "ctx", body)(US_STATE_CODES, CA_PROV_CODES, ctx);
+  vm.runInNewContext(body, { US_STATE_CODES, CA_PROV_CODES, ctx });
 }
 const { isPlausiblePlace, isSubdivisionCode, isPlausibleCityName } = ctx;
 
@@ -171,7 +172,7 @@ describe("the directory build is idempotent", () => {
       extract(/function preferCityDisplay\(a, b\)[\s\S]*?\n\}/),
       "ctx2.preferCityDisplay = preferCityDisplay;",
     ].join("\n");
-    new Function("ctx2", body)(ctx2);
+    vm.runInNewContext(body, { ctx2 });
   }
   const { preferCityDisplay } = ctx2;
 

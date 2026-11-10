@@ -439,7 +439,7 @@ function derivedRepo(kernelFiles, { allow = [], tz = "Asia/Tokyo" } = {}) {
     address: "742 Quorlington Ave", // kernel-guard-ok: synthetic fixture for the detector under test
     page: "user_quillon_tastes",
     team_id: "QX7Z9K2LMB",
-    tags: ["calendar-event", "glorp-update"],
+    tags: ["calendar-event", "demo-glorp-update"],
   });
   w("bin/zorp-ledger", "#!/bin/sh\n");
   w("bin/plainword", "#!/bin/sh\n");
@@ -467,7 +467,7 @@ const KERNEL_DOC = [
   "page user_quillon_tastes",         // 14 derived_wiki_id
   "team QX7Z9K2LMB",                  // 15 derived_config (id)
   "calendar-event tags",              // 16 common words: no hit
-  "glorp-update tags",                // 17 derived_config unless allowed
+  "demo-glorp-update tags",                // 17 derived_config unless allowed
   "notifyThaddeus()",                 // 18 camelCase hump: derived_config
   "mail quillonvex.co",               // 19 derived_instance (domain)
 ].join("\n") + "\n";
@@ -493,14 +493,14 @@ test("derived patterns: a personal file named by path in kernel code is left to 
 });
 
 test("derived_allow: a {token} entry drops that token, a {word} entry stops a word making names personal", () => {
-  const root = derivedRepo({ "docs/k.md": "glorp-update tags\nyacht-rebalance runs\n" }, {
-    allow: [{ token: "glorp-update", reason: "test: generic" }, { word: "rebalance", reason: "test: generic" }, { word: "yacht", reason: "test: generic" }],
+  const root = derivedRepo({ "docs/k.md": "demo-glorp-update tags\nyacht-rebalance runs\n" }, {
+    allow: [{ token: "demo-glorp-update", reason: "test: generic" }, { word: "rebalance", reason: "test: generic" }, { word: "yacht", reason: "test: generic" }],
   });
   const j = JSON.parse(run(root, "--json").out);
   assert.deepEqual(j.hits.filter((h) => h.pattern.startsWith("derived_")), []);
   const list = run(root, "--list-patterns", "--explain").out;
   assert.match(list, /derived_allow in use \(3\):/);
-  assert.match(list, /"glorp-update": test: generic/);
+  assert.match(list, /"demo-glorp-update": test: generic/);
 });
 
 test("an IANA zone id in local config is not a derived name (its area and city words are generic in kernel text)", () => {

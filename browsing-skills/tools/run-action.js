@@ -80,12 +80,13 @@ async function runWithFixture(actionBlock, params, fixturePath) {
     process.exit(2);
   }
   const html = fs.readFileSync(fixturePath, 'utf8');
-  const dom = new JSDOM(html, { url: 'https://www.example.com/', pretendToBeVisual: true });
-  const win = dom.window;
-  // Make minimal browser APIs available to the action.
-  const ctx = { window: win, document: win.document, console, setTimeout, clearTimeout, URL: win.URL, InputEvent: win.InputEvent, DataTransfer: win.DataTransfer, ClipboardEvent: win.ClipboardEvent };
-  const fn = new Function(...Object.keys(ctx), `return (${actionBlock}).execute(${JSON.stringify(params)});`);
-  return await fn(...Object.values(ctx));
+  // runScripts 'outside-only' gives the page its own VM context with the full
+  // browser globals (window, document, events, timers) and nothing from Node:
+  // the action block runs there, so it cannot reach process or require.
+  const dom = new JSDOM(html, { url: 'https://www.example.com/', pretendToBeVisual: true, runScripts: 'outside-only' });
+  const vm = await import('node:vm');
+  const script = new vm.Script(`(${actionBlock}).execute(${JSON.stringify(params)});`, { filename: 'action-block.js' });
+  return await script.runInContext(dom.getInternalVMContext());
 }
 
 async function runWithCdp(actionBlock, params, url, cdpHost) {

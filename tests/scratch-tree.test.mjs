@@ -18,7 +18,7 @@ import { fileURLToPath } from "node:url";
 const KERNEL = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const { KERNEL_SUBDIR } = createRequire(import.meta.url)("../lib/root.cjs");
 const K = (rel) => (KERNEL_SUBDIR ? `${KERNEL_SUBDIR}/${rel}` : rel);
-const SECRET = "SUPABASE_SERVICE_ROLE_KEY=not-a-real-key\n";
+const FAKE_ENV = "SUPABASE_SERVICE_ROLE_KEY=not-a-real-key\n";
 
 // A throwaway installation: the tool, root.cjs, a tracked file, a gitignored .env
 // and data dir, plus a temp dir that stands in for /tmp. `extraEnv` is added to
@@ -35,8 +35,8 @@ function sandbox(extraEnv = {}) {
   fs.writeFileSync(path.join(home, K("code.mjs")), "export const a = 1;\n");
   const git = (...a) => execFileSync("git", ["-c", "user.email=t@t", "-c", "user.name=t", ...a], { cwd: home, stdio: "ignore" });
   git("init", "-q"); git("add", "-A"); git("commit", "-q", "-m", "base");
-  fs.writeFileSync(path.join(home, K(".env")), SECRET);
-  fs.writeFileSync(path.join(home, K(".env.bak-1")), SECRET + "OLD=1\n");
+  fs.writeFileSync(path.join(home, K(".env")), FAKE_ENV);
+  fs.writeFileSync(path.join(home, K(".env.bak-1")), FAKE_ENV + "OLD=1\n");
   fs.mkdirSync(path.join(home, K("data")));
   fs.writeFileSync(path.join(home, K("data/private.json")), "{}");
   const env = { ...process.env, ...extraEnv, JORI_HOME: home, TMPDIR: tmp, SCRATCH_TREE_TMP_ROOTS: tmp };
@@ -89,7 +89,7 @@ const PROBE = `process.stdout.write(JSON.stringify(Object.fromEntries(${JSON.str
 test("run: the installation's secrets stay out of the command's environment unless named with --keep-env", (t) => {
   // Every value below is a stand-in; the names come from the fixture .env, never the real one.
   const s = sandbox({ SUPABASE_SERVICE_ROLE_KEY: "fake-inherited-value", FAKE_PLAIN_SETTING: "fake-setting",
-    OLD: "fake-old", SOME_OTHER_TOKEN: "fake-token", KEEP_ME: "1" });
+    OLD: "fake-old", SOME_OTHER_TOKEN: "example-fake-token", KEEP_ME: "1" });
   t.after(s.cleanup);
   // Named in .env (SUPABASE_SERVICE_ROLE_KEY, and an `export NAME =` spelling) or only in a
   // backup beside it (OLD); SOME_OTHER_TOKEN is in neither but is named like a credential.
@@ -130,7 +130,7 @@ test("run: the installation's secrets stay out of the command's environment unle
   // Comma lists work; anything else before -- is refused.
   const two = JSON.parse(s.cli("run", dir, "--keep-env", "OLD,SOME_OTHER_TOKEN", "--", process.execPath, "-e", PROBE).stdout);
   assert.equal(two.OLD, "fake-old");
-  assert.equal(two.SOME_OTHER_TOKEN, "fake-token");
+  assert.equal(two.SOME_OTHER_TOKEN, "example-fake-token");
   assert.equal(two.SUPABASE_SERVICE_ROLE_KEY, null);
   assert.equal(s.cli("run", dir, "--bogus", "--", "true").status, 64);
   assert.equal(s.cli("run", dir, "--keep-env", "--", "true").status, 64);
@@ -154,8 +154,8 @@ test("sweep: old scratch trees and stray copies of secrets go; everything else s
   // A hand-made copy of the tree, as a critic used to make it.
   const manual = path.join(s.tmp, "cer-critic-run", "jori", K(""));
   fs.mkdirSync(manual, { recursive: true });
-  fs.writeFileSync(path.join(manual, ".env"), SECRET);
-  fs.writeFileSync(path.join(manual, ".env.bak-1"), SECRET + "OLD=1\n");
+  fs.writeFileSync(path.join(manual, ".env"), FAKE_ENV);
+  fs.writeFileSync(path.join(manual, ".env.bak-1"), FAKE_ENV + "OLD=1\n");
   fs.writeFileSync(path.join(manual, ".env.example"), "SUPABASE_SERVICE_ROLE_KEY=\n");   // not a copy
   fs.writeFileSync(path.join(manual, "code.mjs"), "x");
 
@@ -172,5 +172,5 @@ test("sweep: old scratch trees and stray copies of secrets go; everything else s
   assert.equal(fs.existsSync(path.join(manual, ".env.bak-1")), false);
   assert.equal(fs.existsSync(path.join(manual, ".env.example")), true);
   assert.equal(fs.existsSync(path.join(manual, "code.mjs")), true);
-  assert.equal(fs.readFileSync(path.join(s.home, K(".env")), "utf8"), SECRET);   // the real one is untouched
+  assert.equal(fs.readFileSync(path.join(s.home, K(".env")), "utf8"), FAKE_ENV);   // the real one is untouched
 });

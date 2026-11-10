@@ -59,7 +59,7 @@ globalThis.fetch = async (url, init) => {
     const env = {
       ...process.env,
       JEV_CONFIG_FILE: f.CFG, JEV_QUESTIONS_DIR: qdir, JEV_SHADOW_DIR: f.SHADOW,
-      JEV_ENDPOINT: "https://jev.test/v1/evaluate", JEV_NO_ALERT: "1", TYPESAFE_API_KEY: "test-key",
+      JEV_ENDPOINT: "https://jev.test/v1/evaluate", JEV_NO_ALERT: "1", TYPESAFE_API_KEY: "<test-key>",
       JEV_PRIVATE_SCREEN: "off", JEV_TEST_CALLS: f.CALLS,
       // outbound-precheck's rolling health file and its system-channel report
       // must never be the live ones during a test run.

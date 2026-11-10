@@ -14,7 +14,7 @@
 //
 // Runs as the last harvester in parallel with the rest. If no topical "now"
 // focus exists (quiet situation), returns null.
-import { execSync } from "node:child_process";
+import { execFileSync } from "node:child_process";
 import { createRequire } from "node:module";
 import { readStdinJson, emit, emitNull, stampRun, readTopicState, writeTopicState, localConfig } from "./_common.mjs";
 
@@ -66,7 +66,7 @@ if (!focus || focus.length < 3) {
 // Search cross-source index
 let hits = [];
 try {
-  const out = execSync(`"${BIN}" "${focus.replace(/"/g, '\\"')}"`, {
+  const out = execFileSync(BIN, [focus], {
     encoding: "utf8", timeout: 6000,
   });
   // context-search emits `[source] id — summary` lines

@@ -14,9 +14,9 @@ import { recordPushRecipients, pushRecipients, sendClearPush } from "../lib/apns
 const tmpFile = () => path.join(fs.mkdtempSync(path.join(os.tmpdir(), "push-rcpt-")), "push-recipients.json");
 const fakeSupabase = (rows) => ({ from: () => ({ select: async () => ({ data: rows, error: null }) }) });
 const rows = [
-  { token: "mac1111111", platform: "macos" },
-  { token: "ios1111111", platform: "ios" },
-  { token: "pad1111111", platform: "ipados" },
+  { token: "example-mac", platform: "macos" },
+  { token: "example-ios", platform: "ios" },
+  { token: "example-pad", platform: "ipados" },
 ];
 const recorder = () => {
   const calls = [];
@@ -41,7 +41,7 @@ test("sendClearPush wakes only the device classes that got the banner", async ()
   const { calls, send } = recorder();
   const r = await sendClearPush(fakeSupabase(rows), ["m1", "unpushed"], { send, jwt: "j", file, badge: 2 });
   assert.equal(r.delivered, true);
-  assert.deepEqual(calls.map((c) => c.token), ["ios1111111", "pad1111111"]);
+  assert.deepEqual(calls.map((c) => c.token), ["example-ios", "example-pad"]);
   assert.deepEqual(calls[0].payload, { kind: "clear_notifications", message_ids: ["m1"], badge: 2, aps: { "content-available": 1 } });
   assert.equal(calls[0].headers["apns-push-type"], "background");
 });
@@ -51,7 +51,7 @@ test("sendClearPush reaches the Mac when the Mac got the banner", async () => {
   recordPushRecipients("m1", ["mac", "mobile"], { file });
   const { calls, send } = recorder();
   await sendClearPush(fakeSupabase(rows), ["m1"], { send, jwt: "j", file, badge: 0 });
-  assert.deepEqual(calls.map((c) => c.token), ["mac1111111", "ios1111111", "pad1111111"]);
+  assert.deepEqual(calls.map((c) => c.token), ["example-mac", "example-ios", "example-pad"]);
 });
 
 test("sendClearPush sends nothing for messages that never pushed", async () => {

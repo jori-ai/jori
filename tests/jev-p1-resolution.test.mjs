@@ -18,7 +18,7 @@ Object.assign(process.env, {
   P1_RESOLUTIONS_FILE: path.join(tmp, "p1-resolutions.jsonl"),
   JEV_NO_ALERT: "1",
   JEV_PRIVATE_SCREEN: "off",
-  TYPESAFE_API_KEY: "test-key",
+  TYPESAFE_API_KEY: "example-test-key",
 });
 fs.writeFileSync(process.env.JEV_EXCLUDE_SENDERS_FILE, JSON.stringify({ senders: [{ domain: "bank.example", category: "financial" }, { contains: "mychart", category: "health" }] }));
 

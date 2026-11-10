@@ -117,7 +117,7 @@ class CacheCase(unittest.TestCase):
                            "PLACES_TIER_COUNTS_FILE": os.path.join(self.tmp, "counts.json")})
         os.environ.pop("PLACES_LANE", None)
         mod._now_utc = lambda: TUESDAY_NOON
-        mod.API_KEY = "test-key"
+        mod.API_KEY = "example-test-key"
 
     def tearDown(self):
         (mod.urllib.request.urlopen, mod._places_log, mod.assert_places_allowed,

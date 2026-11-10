@@ -33,7 +33,7 @@ const oc = { zoomCalls: (a = {}) => MC.zoomCalls({ m: M, ...a }), callsForDay: (
 const TZ = "Europe/Athens"; // UTC+3 on the fixture day
 const ROOM = "https://us02web.zoom.us/j/1234567890?pwd=abc";
 const NOW = Date.parse("2026-10-21T08:00:00Z");
-const CREDS = { cfg: { accountId: "ACCTabcdefghijklmnop12", clientId: "CLIENTxyz0123456789ab", clientSecret: "SECRET0123456789abcdef0123456789" }, // gitleaks:allow
+const CREDS = { cfg: { accountId: "ACCTabcdefghijklmnop12", clientId: "CLIENTxyz0123456789ab", clientSecret: "example-client-secret-0123456789" }, // gitleaks:allow
                 source: "file", problem: null };
 
 function gogEvent(id, start, end) {

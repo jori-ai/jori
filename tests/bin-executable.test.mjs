@@ -195,9 +195,9 @@ test("the guard can actually see the bin directory", () => {
   }
 
   test("without an OAuth app the wrapper passes the environment's token through", () => {
-    const r = wrapper({ SUPABASE_ACCESS_TOKEN: "env-token" });
+    const r = wrapper({ SUPABASE_ACCESS_TOKEN: "example-env-token" });
     assert.equal(r.code, 0, r.err);
-    assert.equal(r.out.trim(), "token=env-token args=-y @supabase/mcp-server-supabase@latest --project-ref=abc");
+    assert.equal(r.out.trim(), "token=example-env-token args=-y @supabase/mcp-server-supabase@latest --project-ref=abc");
   });
 
   test("with no OAuth app and no token the wrapper refuses to start the server", () => {

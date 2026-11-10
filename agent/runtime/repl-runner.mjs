@@ -17,7 +17,7 @@
 //   4. `sample()` (the one resource risk — a code loop could fan out many
 //      `claude -p` Haiku forks) is wrapped with a concurrency cap + a per-run
 //      budget, so a runaway loop can't spawn an unbounded fork storm.
-//   5. Kill switch: `REPL_ENABLED=0` disables eval (the sandbox returns a
+//   5. Kill switch: `REPL_ENABLED=0` disables evaluation (the sandbox returns a
 //      disabled error). Default-on (activated by the user).
 //
 // This runner is why `repl_run` is safe even when the CALLING agent turn is

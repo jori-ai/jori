@@ -45,7 +45,7 @@
 // Urgency 0.85-0.95 throughout. The ranker brief in jobs/hum.md gives exercise
 // findings preference over other candidates.
 import fs from "node:fs";
-import { execSync } from "node:child_process";
+import { execSync, execFileSync } from "node:child_process";
 import { createRequire } from "node:module";
 import { readStdinJson, readCache, writeCache, emit, emitNull, emitNoop, stampRun } from "./_common.mjs";
 
@@ -123,11 +123,11 @@ function countSentExercisePingsToday() {
   return count;
 }
 
-function run(cmd) {
-  return execSync(`"${BIN}" ${cmd}`, { encoding: "utf8", timeout: 8000 });
+function run(args) {
+  return execFileSync(BIN, args, { encoding: "utf8", timeout: 8000 });
 }
 function runJson(cmd) {
-  return JSON.parse(run(`${cmd} --json`));
+  return JSON.parse(run([cmd, "--json"]));
 }
 
 const WORKOUT_NAMES = {
@@ -299,8 +299,8 @@ function tryPostSlotMissBranch() {
     // "Rescheduled to HH:MM" confirmation and the user gets two buzzes about
     // one decision roughly a minute apart.
     try {
-      execSync(
-        `"${installTools("bin/exercise-schedule")}" --reschedule ${nextSlot} --no-notify`,
+      execFileSync(
+        installTools("bin/exercise-schedule"), ["--reschedule", nextSlot, "--no-notify"],
         { encoding: "utf8", timeout: 15000 }
       );
       rescheduleHHMM = nextSlot;

@@ -10,7 +10,7 @@ import { makeFixture, choice } from "./jev-gate-harness.mjs";
 const f = makeFixture("claim-freshness");
 Object.assign(process.env, {
   JEV_CONFIG_FILE: f.CFG, JEV_QUESTIONS_DIR: f.qdir, JEV_SHADOW_DIR: f.SHADOW,
-  JEV_ENDPOINT: "https://jev.test/v1/evaluate", JEV_NO_ALERT: "1", TYPESAFE_API_KEY: "test-key",
+  JEV_ENDPOINT: "https://jev.test/v1/evaluate", JEV_NO_ALERT: "1", TYPESAFE_API_KEY: "example-test-key",
   JEV_PRIVATE_SCREEN: "off",
   CLAIM_FRESHNESS_CLAUDE_BIN: f.CLAUDE, CLAIM_FRESHNESS_LOG: path.join(f.tmp, "cf-log.jsonl"),
 });

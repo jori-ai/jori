@@ -8,7 +8,7 @@
 
 import { describe, it, afterEach, before } from "node:test";
 import assert from "node:assert/strict";
-import { spawn, execSync } from "node:child_process";
+import { spawn, execFileSync } from "node:child_process";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -23,7 +23,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 // Check if PTY allocation works in this environment.
 function canAllocatePty() {
   try {
-    execSync(`${PYTHON} -c "import pty; pty.openpty()"`, {
+    execFileSync(PYTHON, ["-c", "import pty; pty.openpty()"], {
       stdio: "pipe",
       timeout: 3000,
     });

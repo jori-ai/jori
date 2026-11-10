@@ -368,7 +368,7 @@ test("_incident_label covers daily-summary-orphan-row", () => {
 
 test("watchdog.sh is valid bash", () => {
   assert.doesNotThrow(() => {
-    execSync(`bash -n ${JSON.stringify(WATCHDOG_PATH)}`, {
+    execFileSync("bash", ["-n", WATCHDOG_PATH], {
       stdio: ["ignore", "ignore", "pipe"],
     });
   }, "watchdog.sh must pass `bash -n` syntax check");

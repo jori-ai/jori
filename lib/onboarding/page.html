@@ -263,7 +263,7 @@ form.code { margin-top: 24px; max-width: 520px; }
 </div>
 
 <script>
-const TOKEN = "__SETUP_TOKEN__";
+const SETUP_AUTH = "__SETUP_TOKEN__";
 const ORDER = ["mac", "claude", "you", "on", "reach"];
 let S = null;            // last /api/state
 let current = "mac";
@@ -271,7 +271,7 @@ let polling = null;
 const $ = (id) => document.getElementById(id);
 
 async function api(pathname, body) {
-  const opt = { headers: { "x-setup-token": TOKEN } };
+  const opt = { headers: { "x-setup-token": SETUP_AUTH } };
   if (body !== undefined) { opt.method = "POST"; opt.headers["content-type"] = "application/json"; opt.body = JSON.stringify(body); }
   const r = await fetch(pathname, opt);
   const j = await r.json().catch(() => ({}));

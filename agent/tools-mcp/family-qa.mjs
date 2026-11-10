@@ -24,7 +24,7 @@ import { ListToolsRequestSchema, CallToolRequestSchema } from "@modelcontextprot
 const require = createRequire(import.meta.url);
 const ws = require("../../lib/wiki-store.js");
 const { emailQaIdentityFromConfig } = require("../../lib/wiki-scope.js");
-const exec = promisify(execFile);
+const execFileAsync = promisify(execFile);
 
 const ROOT = new URL("../..", import.meta.url).pathname;
 const REQUESTER = String(process.env.FAMILY_QA_EMAIL || "").toLowerCase();
@@ -76,7 +76,7 @@ const TOOLS = [
     schema: { type: "object", properties: {} },
     run: async () => {
       if (!who) return { error: "not available" };
-      const { stdout } = await exec(`${ROOT}bin/net-worth`, ["--json", "--no-snapshot"], { timeout: 120_000, maxBuffer: 8 << 20 });
+      const { stdout } = await execFileAsync(`${ROOT}bin/net-worth`, ["--json", "--no-snapshot"], { timeout: 120_000, maxBuffer: 8 << 20 });
       return JSON.parse(stdout);
     },
   },

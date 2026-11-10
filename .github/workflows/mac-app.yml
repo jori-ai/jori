@@ -26,7 +26,7 @@ jobs:
     env:
       HAS_DEVID: ${{ secrets.MAC_DEVID_P12 != '' }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Version
         id: v
         run: |
@@ -56,7 +56,7 @@ jobs:
           NOTARY_KEY_ID: ${{ env.HAS_DEVID == 'true' && secrets.ASC_KEY_ID || '' }}
           NOTARY_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
         run: bash apps/mac/build.sh --version "${{ steps.v.outputs.version }}" --build "${{ github.run_number }}" --out "$RUNNER_TEMP/out"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: Jori-${{ steps.v.outputs.version }}
           path: ${{ runner.temp }}/out/Jori.dmg

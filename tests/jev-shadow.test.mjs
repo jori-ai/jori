@@ -10,7 +10,7 @@ process.env.JEV_CONFIG_FILE = path.join(tmp, "jev-config.json");
 process.env.JEV_QUESTIONS_DIR = path.join(tmp, "q");
 process.env.JEV_SHADOW_DIR = path.join(tmp, "log");
 process.env.JEV_NO_ALERT = "1";
-process.env.TYPESAFE_API_KEY = "test-key";
+process.env.TYPESAFE_API_KEY = "example-test-key";
 fs.mkdirSync(process.env.JEV_QUESTIONS_DIR, { recursive: true });
 fs.writeFileSync(path.join(process.env.JEV_QUESTIONS_DIR, "t.json"), JSON.stringify({
   threshold: 0.8,

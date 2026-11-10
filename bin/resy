@@ -28,7 +28,8 @@ const TZ = CFG.tz || instance().tz;
 
 // ── Resy API ───────────────────────────────────────────────────────────────
 const RESY_BASE = "https://api.resy.com";
-const DEFAULT_API_KEY = "youarewhereyoueat";
+// Resy's public web-client key: the same value every browser sends from resy.com, not an account credential.
+const RESY_PUBLIC_CLIENT_KEY = "youarewhereyoueat";
 
 // ── Alert delivery ─────────────────────────────────────────────────────────
 const JORI_SEND = path.join(__dirname, "jori-send-curl");
@@ -110,8 +111,9 @@ function resolveVenue(auth, venueInput) {
 // ── Resy API client ────────────────────────────────────────────────────────
 
 function resyHeaders(auth) {
+  const clientKey = auth.apiKey || RESY_PUBLIC_CLIENT_KEY;
   return {
-    Authorization: `ResyAPI api_key="${auth.apiKey || DEFAULT_API_KEY}"`,
+    Authorization: `ResyAPI api_key="${clientKey}"`,
     "x-resy-auth-token": auth.authToken,
     Accept: "application/json, text/plain, */*",
     Origin: "https://resy.com",
@@ -219,7 +221,7 @@ function matchSlot(slots, timePrefs, tableType) {
 async function cmdLogin(args) {
   const email = flag(args, "email");
   const password = flag(args, "password");
-  const apiKey = flag(args, "api-key") || DEFAULT_API_KEY;
+  const apiKey = flag(args, "api-key") || RESY_PUBLIC_CLIENT_KEY;
 
   if (!email || !password) {
     console.error("Usage: resy login --email <email> --password <password> [--api-key <key>]");
@@ -280,7 +282,7 @@ async function cmdLogin(args) {
 
 async function cmdToken(args) {
   const authToken = flag(args, "auth-token");
-  const apiKey = flag(args, "api-key") || DEFAULT_API_KEY;
+  const apiKey = flag(args, "api-key") || RESY_PUBLIC_CLIENT_KEY;
 
   if (!authToken) {
     console.error("Usage: resy token --auth-token <token> [--api-key <key>]");

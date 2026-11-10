@@ -9,7 +9,7 @@
 //   editorial_sources  [{ city, url, note }] listings to mine first
 //   cities             [{ match: [place words], city }] place → city, first match wins
 //   default_city       the city when no place matches
-import { execSync } from "node:child_process";
+import { execFileSync } from "node:child_process";
 import os from "node:os";
 import path from "node:path";
 import { createRequire } from "node:module";
@@ -65,9 +65,10 @@ Output ONE JSON object on stdout, no prose:
 {"items":[{"title":"...","venue":"...","location":"...","ends":"YYYY-MM-DD","why":"one-line match to taste","url":"..."}]}
 If nothing new, return {"items":[]}.`;
   try {
-    const out = execSync(
-      `"${CLAUDE}" -p --model ${MODELS.sonnet} --effort low --allowedTools WebSearch --output-format text "${prompt.replace(/"/g, '\\"').replace(/\n/g, "\\n")}" 2>/dev/null`,
-      { encoding: "utf8", timeout: 120000, maxBuffer: 2 * 1024 * 1024 }
+    const out = execFileSync(
+      CLAUDE,
+      ["-p", "--model", MODELS.sonnet, "--effort", "low", "--allowedTools", "WebSearch", "--output-format", "text", prompt],
+      { encoding: "utf8", timeout: 120000, maxBuffer: 2 * 1024 * 1024, stdio: ["pipe", "pipe", "ignore"] }
     );
     // Extract JSON from the text output
     const parsed = extractJsonObject(out, { requireKey: "items" });

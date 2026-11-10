@@ -33,7 +33,7 @@ fs.mkdirSync(JOBS_DIR, { recursive: true });
 
 const AUDIENCE = "https://push.example.com";
 const SA_EMAIL = "jori-pubsub@example-project.iam.gserviceaccount.com";
-const INBOUND_SECRET = "test-inbound-secret-value-1234567890";
+const INBOUND_SECRET = "example-inbound-secret-value-1234567890";
 
 fs.writeFileSync(
   path.join(SECRETS_DIR, "pubsub-oidc.json"),
