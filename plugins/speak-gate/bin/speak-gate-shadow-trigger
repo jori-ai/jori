@@ -1,0 +1,18 @@
+#!/bin/bash
+# speak-gate-shadow-trigger — run one shadow pass of the speak gate
+# (bin/speak-gate-shadow.mjs; system/speak-gate.md § Shadow week).
+# launchd (ai.claude.speak-gate-shadow), every 5 minutes. Not cron: the gate
+# forks `claude -p`, which needs the GUI keychain's Max login, and the Max-auth
+# guard refuses to start it on anything but the subscription.
+PLUGIN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+KERNEL_TOOLS="$(cd "$PLUGIN_DIR/../.." && pwd)"
+source "$KERNEL_TOOLS/agent/scripts/lib/script-job-env.sh"
+LOG="$JORI_INSTALL_TOOLS/agent/logs/speak-gate-shadow.log"
+mkdir -p "$(dirname "$LOG")"
+source "$KERNEL_TOOLS/agent/scripts/lib/max-auth-guard.sh"
+max_auth_scrub
+if ! max_auth_check "${CLAUDE_BIN:-$HOME/.local/bin/claude}"; then
+  echo "$(date '+%Y-%m-%d %H:%M:%S') REFUSED: $MAX_AUTH_SUMMARY" >> "$LOG"
+  exit "${MAX_AUTH_REFUSED_RC:-78}"
+fi
+{ echo "--- $(date '+%Y-%m-%d %H:%M:%S')"; "${JORI_NODE:-node}" "$PLUGIN_DIR/bin/speak-gate-shadow.mjs"; } >> "$LOG" 2>&1

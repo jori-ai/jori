@@ -891,13 +891,15 @@ struct ContentView: View {
             answer: { label, parent in Task { await vm.sendMessage(label, replyTo: parent) } },
             toggleChecklist: { label, on, id in vm.toggleChecklistItem(label, checked: on, on: id) },
             resolveParent: { vm.resolveQuotedParent($0) },
-            dismiss: { vm.dismissQuestion($0) }
+            dismiss: { vm.dismissQuestion($0) },
+            gradeGate: { id, grade, note in Task { await team.gradeGate(id, grade: grade, note: note) } }
         )
     }
 
     private func thread(for m: Message, senderLabel: String? = nil) -> BubbleThread {
         var t = BubbleThread()
         t.senderLabel = senderLabel
+        if m.isAssistant { t.gate = team.gateReviews[m.id] }
         if let parent = m.replyTo { t.quotedParent = viewModel.quotedParent(parent) }
         if m.isUser {
             t.notPickedUp = viewModel.isNotPickedUp(m.id)
@@ -1840,6 +1842,8 @@ struct BubbleThread: Equatable {
     var notPickedUp = false
     /// "Ada · CFO" over the first bubble of a run, where it isn't obvious who is speaking.
     var senderLabel: String?
+    /// The speak gate's shadow verdict on this message, for the user to grade.
+    var gate: GateReview?
 }
 
 /// What a bubble can ask the conversation to do.
@@ -1852,6 +1856,7 @@ struct BubbleActions {
     var toggleChecklist: (String, Bool, UUID) -> Void
     var resolveParent: (UUID) -> Void
     var dismiss: (Message) -> Void
+    var gradeGate: (UUID, String, String) -> Void = { _, _, _ in }
 }
 
 /// Equatable on its inputs (the closures are deliberately left out — they
@@ -1970,6 +1975,10 @@ struct MessageBubble: View, Equatable {
                     if thread.notPickedUp {
                         notPickedUpLine
                             .transition(.opacity)
+                    }
+
+                    if let gate = thread.gate {
+                        GateReviewLine(review: gate) { grade, note in actions.gradeGate(message.id, grade, note) }
                     }
                 }
 

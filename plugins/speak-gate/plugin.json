@@ -1,0 +1,20 @@
+{
+  "name": "speak-gate",
+  "title": "Think before you speak",
+  "description": "One gate for every message to you: is it true, could the assistant answer it itself, is it asked well, is it worth your attention. Researches across every source before judging. In its shadow week it only judges and shows its verdict under each message for you to grade.",
+  "version": "0.1.0",
+  "default": "disabled",
+  "requires": {
+    "plugins": [],
+    "bins": [],
+    "commands": [],
+    "env": []
+  },
+  "schedules": [],
+  "launchd": [
+    {
+      "label": "ai.claude.speak-gate-shadow",
+      "file": "ai.claude.speak-gate-shadow.plist"
+    }
+  ]
+}

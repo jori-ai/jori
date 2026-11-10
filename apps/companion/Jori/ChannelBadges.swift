@@ -272,6 +272,7 @@ final class TeamStore: ObservableObject {
         await loadTeam()
         await loadConversations()
         await loadSummaries()
+        await loadGateReviews(activeConversation)
         if let n = try? await SelfImproveApproval.pendingApprovalCount(), n != pendingImprovements {
             pendingImprovements = n
         }
@@ -304,6 +305,49 @@ final class TeamStore: ObservableObject {
             if rows != conversations { conversations = rows }
         } catch {
             print("[Team] conversations load failed: \(error)")
+        }
+    }
+
+    // MARK: Gate reviews (shadow week, system/speak-gate.md)
+
+    /// The think-before-you-speak gate's verdict on each message, judged in
+    /// shadow (nothing is held), shown under the message for the user to grade.
+    @Published var gateReviews: [UUID: GateReview] = [:]
+    static let gateReviewsTable = "jori_gate_reviews"
+
+    func loadGateReviews(_ conversationId: String) async {
+        guard !conversationId.isEmpty else { return }
+        do {
+            try await SupabaseManager.ensureAuthenticated()
+            let rows: [GateReview] = try await SupabaseManager.shared
+                .from(Self.gateReviewsTable)
+                .select("message_id,verdict,reason,suggestion,grade,note")
+                .eq("conversation_id", value: conversationId)
+                .order("judged_at", ascending: false)
+                .limit(300)
+                .execute()
+                .value
+            var next = gateReviews
+            for r in rows { next[r.message_id] = r }
+            if next != gateReviews { gateReviews = next }
+        } catch {
+            print("[Team] gate reviews load failed: \(error)")
+        }
+    }
+
+    /// The user's grade on one verdict: "right" or "wrong", with an optional note.
+    func gradeGate(_ messageId: UUID, grade: String, note: String) async {
+        if let r = gateReviews[messageId] { gateReviews[messageId] = r.graded(grade, note: note) }
+        struct Patch: Encodable { let grade: String; let note: String?; let graded_at: String }
+        do {
+            try await SupabaseManager.ensureAuthenticated()
+            try await SupabaseManager.shared
+                .from(Self.gateReviewsTable)
+                .update(Patch(grade: grade, note: note.isEmpty ? nil : note, graded_at: Date().ISO8601Format()))
+                .eq("message_id", value: messageId.uuidString)
+                .execute()
+        } catch {
+            print("[Team] gate grade failed: \(error)")
         }
     }
 
@@ -885,3 +929,98 @@ struct HiddenToolbarTitle: ViewModifier {
     }
 }
 #endif
+
+
+// MARK: - Gate review (shadow week)
+
+struct GateReview: Codable, Equatable {
+    let message_id: UUID
+    let verdict: String
+    let reason: String?
+    let suggestion: String?
+    var grade: String?
+    var note: String?
+
+    func graded(_ g: String, note n: String) -> GateReview {
+        var c = self; c.grade = g; c.note = n.isEmpty ? nil : n; return c
+    }
+
+    var verdictText: String {
+        switch verdict {
+        case "send": return "Would send as is"
+        case "rewrite": return "Would rewrite"
+        case "resolve": return "Would answer it itself"
+        case "digest": return "Would hold for the daily summary"
+        case "drop": return "Would not send"
+        default: return "Would send"
+        }
+    }
+
+    var suggestionLabel: String { verdict == "resolve" ? "What it found / would do" : "Would have sent instead" }
+}
+
+/// Under a message: what the gate would have done, why, and two buttons. Tap
+/// the line to see the reason and its suggested text.
+struct GateReviewLine: View {
+    let review: GateReview
+    let onGrade: (String, String) -> Void
+    @State private var open = false
+    @State private var note = ""
+    @State private var askingNote = false
+
+    private var tint: Color {
+        switch review.verdict {
+        case "send": return .green
+        case "rewrite": return .orange
+        case "resolve": return .blue
+        case "digest": return .purple
+        default: return .red
+        }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Button { withAnimation(.snappy(duration: 0.2)) { open.toggle() } } label: {
+                HStack(spacing: 6) {
+                    Circle().fill(tint).frame(width: 7, height: 7)
+                    Text("Gate: \(review.verdictText)").font(.caption.weight(.medium))
+                    if let g = review.grade {
+                        Text(g == "right" ? "· you: right" : "· you: wrong").font(.caption).foregroundStyle(.secondary)
+                    }
+                    Image(systemName: open ? "chevron.up" : "chevron.down").font(.system(size: 9, weight: .semibold))
+                }
+                .foregroundStyle(.secondary)
+            }
+            .buttonStyle(.plain)
+            if open {
+                if let r = review.reason, !r.isEmpty {
+                    Text(r).font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                }
+                if let s = review.suggestion, !s.isEmpty {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(review.suggestionLabel).font(.caption2.weight(.semibold)).foregroundStyle(.secondary)
+                        Text(s).font(.caption).textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
+                    }
+                    .padding(8)
+                    .background(.quaternary.opacity(0.5), in: RoundedRectangle(cornerRadius: 8))
+                }
+                HStack(spacing: 8) {
+                    Button("Right call") { onGrade("right", note) }
+                        .buttonStyle(.bordered).tint(review.grade == "right" ? .green : nil)
+                    Button("Wrong call") { askingNote = true; onGrade("wrong", note) }
+                        .buttonStyle(.bordered).tint(review.grade == "wrong" ? .red : nil)
+                }
+                .controlSize(.small)
+                if askingNote || review.grade == "wrong" {
+                    TextField("What should it have done?", text: $note)
+                        .textFieldStyle(.roundedBorder)
+                        .font(.caption)
+                        .onSubmit { onGrade(review.grade ?? "wrong", note) }
+                }
+            }
+        }
+        .padding(.horizontal, 8)
+        .padding(.top, 2)
+        .onAppear { note = review.note ?? "" }
+    }
+}

@@ -1,6 +1,6 @@
 # Think before you speak (the speak gate)
 
-**Status (2026-11-10): built and replayed, NOT wired.** `bin/speak-gate.mjs` judges a message; nothing live goes through it yet. The live path is still `bin/outbound-precheck.mjs`, called from `jori-send-curl`.
+**Status (2026-11-10): shadow week (to 2026-11-17).** `bin/speak-gate.mjs` judges every message that reaches the app, after the fact, and holds nothing; the user grades each verdict in the app. The live gate is still `bin/outbound-precheck.mjs`, called from `jori-send-curl`.
 
 ## Why
 
@@ -43,6 +43,16 @@ It is locked down: `--permission-mode dontAsk` (anything not allowed is refused 
 
 - **Replay 1** (2026-11-10, 100 messages, tool-less judge): 21 sent as written. The user graded 29 of its calls: 23 right, 1 partly, 5 wrong. Two of the wrong ones were the travel-check drop, one was a package notice held for the digest (the user wants every delivery right away), one was a false watch match the gate kept, and one was a question the gate should have answered from location and steps data.
 - **Replay 2** (same 30, research gate, standing rules): the package notice is sent, the false match is caught, and the appraiser message is held for the right reason (already answered). p50 15 s, max 77 s per message. The large-charge alert was still held, so its standing rule was made absolute.
+
+## Shadow week
+
+The user's call (2026-11-10): "shadow for a week and show me your judgement on each. I'll provide feedback on whether it's correct or not."
+
+- `plugins/speak-gate` (enable with `jori plugin enable speak-gate`): launchd `ai.claude.speak-gate-shadow`, every 5 min, runs `bin/speak-gate-shadow-trigger` (Max-auth guard) → `bin/speak-gate-shadow.mjs`. Each pass takes up to 12 assistant messages sent since its cursor (`data/speak-gate-shadow.json`; the first run starts the cursor at that moment and sets `ends_at` a week later), works out proactive or reply (a `reply_to`, or a user message in the same conversation within 15 minutes before), and runs the gate as of one second before the message was sent. Log: `agent/logs/speak-gate-shadow.log`.
+- Verdicts go to `public.jori_gate_reviews` (migration 0181): message id, conversation, verdict, reason, suggestion (the rewrite, or what it found), checks, sources, time.
+- The app shows a line under each judged message ("Gate: would hold for the daily summary"); tapping it shows the reason and suggestion, with **Right call** / **Wrong call** and a note, written back to the same row (`grade`, `note`, `graded_at`).
+- Covers every route into the app (jobs, role replies, location, chat answers). Emails to the user are not in the shadow.
+- At the end: the grades decide the prompt and rule changes, then wiring.
 
 ## Before wiring (open)
 
