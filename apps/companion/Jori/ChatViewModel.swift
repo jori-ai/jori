@@ -22,7 +22,8 @@ final class ChatViewModel: ObservableObject {
     @Published var messages: [Message] = [] {
         didSet { _threadIndex = nil }
     }
-    @Published var currentChannel: ChatChannel
+    /// The conversation on screen: `role:<id>` or `group:<uuid>` (ConversationID).
+    @Published var currentConversation: String
 
     /// Replies, ids and question re-asks, indexed once per change to
     /// `messages`. Every bubble asks "who answered me?" on each redraw; a scan
@@ -74,7 +75,7 @@ final class ChatViewModel: ObservableObject {
     @Published var isLoadingOlder: Bool = false
     @Published var hasOlderMessages: Bool = true
     /// Set by the Improvements card menu's "Chat" action right after
-    /// `switchChannel(to: .chat)`: the message the reply composer should open on.
+    /// opening the conversation it belongs to: the message the reply composer should open on.
     /// ContentView observes it at the TOP level rather than inside the
     /// channel-conditional chat subview, so the request survives the channel
     /// switch — opening the composer synchronously would race the chat view's
@@ -86,7 +87,7 @@ final class ChatViewModel: ObservableObject {
     @Published private(set) var notPickedUp: Set<UUID> = []
 
     private static let draftKey = Install.key("messageDraft")
-    private static let channelKey = Install.key("currentChannel")
+    private static let conversationKey = Install.key("currentConversation")
 
     private let supabase: SupabaseClient
     private let cloudBackup = CloudBackup.shared
@@ -105,10 +106,9 @@ final class ChatViewModel: ObservableObject {
     init() {
         self.supabase = SupabaseManager.shared
         self.pickupWatch = PickupWatch(supabase: SupabaseManager.shared)
-        let savedChannel = UserDefaults.standard.string(forKey: Self.channelKey)
-            .flatMap(ChatChannel.init(rawValue:)) ?? .chat
-        self.currentChannel = savedChannel
-        self.messages = store.loadAll(channel: savedChannel.rawValue)
+        let saved = UserDefaults.standard.string(forKey: Self.conversationKey) ?? ConversationID.coordinator
+        self.currentConversation = saved
+        self.messages = store.loadAll(conversation: saved)
         self.notPickedUp = pickupWatch.flagged
         pickupWatch.onChange = { [weak self] flagged in
             guard let self else { return }
@@ -135,13 +135,13 @@ final class ChatViewModel: ObservableObject {
         pickupWatch.appDidEnterBackground()
     }
 
-    /// Switch the active channel — persists the selection, swaps the visible
-    /// message list from cache, then re-subscribes realtime + re-fetches.
-    func switchChannel(to channel: ChatChannel) {
-        guard channel != currentChannel else { return }
-        currentChannel = channel
-        UserDefaults.standard.set(channel.rawValue, forKey: Self.channelKey)
-        messages = store.loadAll(channel: channel.rawValue)
+    /// Switch the conversation on screen — persists the selection, swaps the
+    /// visible message list from cache, then re-subscribes realtime + re-fetches.
+    func switchConversation(to conversation: String) {
+        guard conversation != currentConversation else { return }
+        currentConversation = conversation
+        UserDefaults.standard.set(conversation, forKey: Self.conversationKey)
+        messages = store.loadAll(conversation: conversation)
         hasOlderMessages = true
         isWaitingForResponse = false
         reconnectIfNeeded()
@@ -163,20 +163,20 @@ final class ChatViewModel: ObservableObject {
             return
         }
 
-        let channel = currentChannel.rawValue
+        let channel = currentConversation
         do {
             // On fresh install (empty cache), load last 3 days.
             // With cache, load all (incremental sync via realtime handles new messages).
             let query = supabase
                 .from(DBTables.messages)
-                .select("id,role,content,read,created_at,reaction,channel,reply_to,metadata")
-                .eq("channel", value: channel)
+                .select(Message.columns)
+                .eq("conversation_id", value: channel)
 
             // Always cap the initial fetch — a multi-thousand message array
                                                                                                              // in a LazyVStack blows up scroll performance (each bubble runs
                                                                                                              // MarkdownUI), and cache eviction already bounds persistent storage.
                                                                                                              // Older history still reachable via the "Load older" button.
-            let hasCache = !store.loadAll(channel: channel).isEmpty
+            let hasCache = !store.loadAll(conversation: channel).isEmpty
             let response: [Message]
             if hasCache {
                 let newestFirst: [Message] = try await query
@@ -204,9 +204,9 @@ final class ChatViewModel: ObservableObject {
             // them under their own channel and stop. The switch's own load was
             // swallowed by the in-flight guard above, so run it now; the Task
             // starts after this return has cleared `isLoadingMessages`.
-            guard channel == currentChannel.rawValue else {
+            guard channel == currentConversation else {
                 if !response.isEmpty {
-                    store.sync(with: response, channel: channel)
+                    store.sync(with: response, conversation: channel)
                 }
                 Task { [weak self] in await self?.loadMessages() }
                 return
@@ -233,7 +233,7 @@ final class ChatViewModel: ObservableObject {
                 // another channel can never be carried forward fetch after fetch.
                 let responseIds = Set(response.map(\.id))
                 let inMemoryNewer = self.messages.filter {
-                    !responseIds.contains($0.id) && $0.channel == channel
+                    !responseIds.contains($0.id) && $0.conversationId == channel
                 }
                 if inMemoryNewer.isEmpty {
                     // Only reassign if content actually differs — avoids
@@ -249,12 +249,12 @@ final class ChatViewModel: ObservableObject {
                         .sorted { $0.createdAt < $1.createdAt }
                     self.messages = merged
                 }
-            } else if self.messages.isEmpty, channel == ChatChannel.chat.rawValue,
+            } else if self.messages.isEmpty, channel == ConversationID.coordinator,
                       let restored = cloudBackup.restore(), !restored.isEmpty {
                 // CloudBackup only ever held chat-channel messages, so only
                 // restore it when we're viewing chat.
                 self.messages = restored
-                store.sync(with: restored, channel: channel)
+                store.sync(with: restored, conversation: channel)
             }
 
             pickupWatch.observe(response)
@@ -274,7 +274,7 @@ final class ChatViewModel: ObservableObject {
             // even if the in-memory array hasn't visibly changed — guarantees
             // the persistent store can never silently drift out of sync.
             if !response.isEmpty {
-                store.sync(with: response, channel: channel)
+                store.sync(with: response, conversation: channel)
                 backupToCloud()
             }
 
@@ -287,7 +287,7 @@ final class ChatViewModel: ObservableObject {
 
             // A switch during the markAsRead awaits above also had its load
             // swallowed; the rows shown are already right, so just fetch.
-            if channel != currentChannel.rawValue {
+            if channel != currentConversation {
                 Task { [weak self] in await self?.loadMessages() }
             }
         } catch {
@@ -296,7 +296,7 @@ final class ChatViewModel: ObservableObject {
             print("[loadMessages] error: \(String(describing: error))")
             // Same mid-flight switch as the success path: the error belongs to
             // the channel the user left, so retry for the one on screen instead.
-            guard channel == currentChannel.rawValue else {
+            guard channel == currentConversation else {
                 Task { [weak self] in await self?.loadMessages() }
                 return
             }
@@ -304,7 +304,7 @@ final class ChatViewModel: ObservableObject {
             // still usable, the retry loop will recover silently, and the
             // offline banner gives the user a non-intrusive hint.
             self.isOffline = true
-            if self.messages.isEmpty, channel == ChatChannel.chat.rawValue,
+            if self.messages.isEmpty, channel == ConversationID.coordinator,
                let restored = cloudBackup.restore(), !restored.isEmpty {
                 self.messages = restored
             }
@@ -324,14 +324,14 @@ final class ChatViewModel: ObservableObject {
         isLoadingOlder = true
         defer { isLoadingOlder = false }
 
-        let channel = currentChannel.rawValue
+        let channel = currentConversation
         do {
             try await SupabaseManager.ensureAuthenticated()
             let cutoff = ISO8601DateFormatter().string(from: earliest)
             let older: [Message] = try await supabase
                 .from(DBTables.messages)
-                .select("id,role,content,read,created_at,reaction,channel,reply_to,metadata")
-                .eq("channel", value: channel)
+                .select(Message.columns)
+                .eq("conversation_id", value: channel)
                 .lt("created_at", value: cutoff)
                 .order("created_at", ascending: false)
                 .limit(50)
@@ -340,7 +340,7 @@ final class ChatViewModel: ObservableObject {
 
             // The user switched channels while this page loaded: it belongs to the
             // channel the user left, so it must not be prepended to this one.
-            guard channel == currentChannel.rawValue else { return }
+            guard channel == currentConversation else { return }
 
             if older.isEmpty {
                 hasOlderMessages = false
@@ -349,7 +349,7 @@ final class ChatViewModel: ObservableObject {
 
             let reversed = older.reversed()
             messages.insert(contentsOf: reversed, at: 0)
-            store.sync(with: messages, channel: channel)
+            store.sync(with: messages, conversation: channel)
         } catch {
             print("[loadOlderMessages] error: \(error)")
         }
@@ -382,9 +382,11 @@ final class ChatViewModel: ObservableObject {
 
         // Per-channel realtime topic — switching channels tears this down
         // and re-subscribes via `reconnectIfNeeded()`.
-        let activeChannel = currentChannel.rawValue
-        let filter = "channel=eq.\(activeChannel)"
-        let channel = supabase.realtimeV2.channel("\(DBTables.messages)_changes_\(activeChannel)")
+        let activeConversation = currentConversation
+        let filter = "conversation_id=eq.\(activeConversation)"
+        // Topic names keep to letters, digits, dashes and underscores.
+        let topic = String(activeConversation.map { $0.isLetter || $0.isNumber || $0 == "-" ? $0 : "_" })
+        let channel = supabase.realtimeV2.channel("\(DBTables.messages)_changes_\(topic)")
 
         let insertions = channel.postgresChange(
             InsertAction.self,
@@ -418,7 +420,7 @@ final class ChatViewModel: ObservableObject {
                         let message = try insertion.decodeRecord(as: Message.self, decoder: JSONDecoder.supabaseDecoder)
                         // Guard: if the user switched channels mid-subscribe,
                         // drop messages that don't belong to the new view.
-                        guard message.channel == self.currentChannel.rawValue else { continue }
+                        guard message.conversationId == self.currentConversation else { continue }
                         if !self.messages.contains(where: { $0.id == message.id }) {
                             self.messages.append(message)
                             if message.isAssistant {
@@ -451,7 +453,7 @@ final class ChatViewModel: ObservableObject {
                     self.pickupWatch.observe(record: update.record, columns: update.columns.map(\.name))
                     do {
                         let message = try update.decodeRecord(as: Message.self, decoder: JSONDecoder.supabaseDecoder)
-                        guard message.channel == self.currentChannel.rawValue else { continue }
+                        guard message.conversationId == self.currentConversation else { continue }
                         if let idx = self.messages.firstIndex(where: { $0.id == message.id }) {
                             self.messages[idx] = message
                             self.backupToCloud()
@@ -503,7 +505,7 @@ final class ChatViewModel: ObservableObject {
         Task { await sendMessage("Dismissed", replyTo: message.id, quiet: true, extraMetadata: [Self.dismissKey: "1"]) }
     }
 
-    /// The open questions in the current channel, oldest first, one per
+    /// The open questions in the current conversation, oldest first, one per
     /// question (a re-ask replaces the earlier copy). Drawn in a tray at the
     /// bottom of the stream so what is still open is always in view.
     var openQuestions: [Message] {
@@ -565,7 +567,7 @@ final class ChatViewModel: ObservableObject {
     }
 
     /// The one rule for "still open", shared by the bubble colour, the tray and
-    /// the Questions badge (ChannelBadges), so they can never disagree.
+    /// the per-conversation question counts (TeamStore), so they can never disagree.
     /// - Parameters:
     ///   - replies: the replies to `message`, in list order.
     ///   - latestAsk: the newest createdAt carrying the same question_id.
@@ -617,9 +619,13 @@ final class ChatViewModel: ObservableObject {
 
     /// - Parameter quiet: a checklist tick — no reply is coming, so no "working"
     ///   indicator, and the typed draft is left alone.
-    func sendMessage(_ rawText: String, replyTo: UUID? = nil, quiet: Bool = false, extraMetadata: [String: String] = [:]) async {
+    /// - Parameter conversation: where to send it; the conversation on screen
+    ///   when nil. An @mention that adds someone sends into the new group.
+    func sendMessage(_ rawText: String, replyTo: UUID? = nil, quiet: Bool = false,
+                     extraMetadata: [String: String] = [:], conversation explicitConversation: String? = nil) async {
         let text = rawText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { return }
+        let conversation = explicitConversation ?? currentConversation
 
         if !quiet {
             Self.saveDraft("") // clear persisted draft
@@ -666,21 +672,22 @@ final class ChatViewModel: ObservableObject {
             role: "user",
             content: text,
             read: false,
-            channel: currentChannel.rawValue,
+            channel: channelForSend(replyTo: replyTo),
             metadata: metadata,
             userId: currentUserId,
-            replyTo: replyTo
+            replyTo: replyTo,
+            conversationId: conversation
         )
 
         do {
             let inserted: Message = try await supabase
                 .from(DBTables.messages)
                 .insert(newMessage)
-                .select("id,role,content,read,created_at,reaction,channel,reply_to,metadata")
+                .select(Message.columns)
                 .single()
                 .execute()
                 .value
-            if inserted.channel == currentChannel.rawValue,
+            if inserted.conversationId == currentConversation,
                !self.messages.contains(where: { $0.id == inserted.id }) {
                 self.messages.append(inserted)
             }
@@ -694,6 +701,32 @@ final class ChatViewModel: ObservableObject {
             self.isWaitingForResponse = false
             print("Send error: \(error)")
         }
+    }
+
+    /// The legacy channel a user row carries. A reply keeps its parent's (a
+    /// question answered where it was asked, a System row answered in System),
+    /// so the agent side routes it exactly as before; anything else is chat,
+    /// and the server files it by `conversation_id` (migration 0180).
+    private func channelForSend(replyTo: UUID?) -> String {
+        if let parentId = replyTo, let parent = threadIndex.byId[parentId] ?? quotedParents[parentId] {
+            return parent.channel
+        }
+        return ChatChannel.chat.rawValue
+    }
+
+    /// The conversation a message lives in, from the loaded window, the cache,
+    /// or the server (a notification for a conversation not on screen).
+    func conversationOf(_ messageId: UUID) async -> String? {
+        if let m = threadIndex.byId[messageId] ?? store.message(id: messageId) { return m.conversationId }
+        struct Row: Decodable { let conversation_id: String? }
+        let rows: [Row]? = try? await supabase
+            .from(DBTables.messages)
+            .select("conversation_id")
+            .eq("id", value: messageId.uuidString)
+            .limit(1)
+            .execute()
+            .value
+        return rows?.first?.conversation_id ?? nil
     }
 
     func setReaction(for message: Message, to newValue: Reaction?) async {
@@ -753,7 +786,7 @@ final class ChatViewModel: ObservableObject {
             do {
                 let parent: Message = try await supabase
                     .from(DBTables.messages)
-                    .select("id,role,content,read,created_at,reaction,channel,reply_to,metadata")
+                    .select(Message.columns)
                     .eq("id", value: id.uuidString)
                     .single()
                     .execute()
@@ -775,13 +808,13 @@ final class ChatViewModel: ObservableObject {
             .execute()
     }
 
-    /// CloudBackup is the Chat thread's fallback copy (both restore paths put
-    /// it straight into the Chat view), so only chat rows may go into it. It
-    /// used to snapshot whatever channel was on screen, so a System session
+    /// CloudBackup is the coordinator conversation's fallback copy (both
+    /// restore paths put it straight into that view), so only its rows may go
+    /// into it. It used to snapshot whatever was on screen, so a System session
     /// overwrote it with System rows.
     private func backupToCloud() {
-        guard currentChannel == .chat else { return }
-        let snapshot = self.messages.filter { $0.channel == ChatChannel.chat.rawValue }
+        guard currentConversation == ConversationID.coordinator else { return }
+        let snapshot = self.messages.filter { $0.conversationId == ConversationID.coordinator }
         Task.detached(priority: .utility) {
             CloudBackup.shared.backup(messages: snapshot)
         }
@@ -1052,16 +1085,17 @@ final class ChatViewModel: ObservableObject {
                 role: "user",
                 content: publicURL.absoluteString,
                 read: false,
-                channel: currentChannel.rawValue
+                channel: ChatChannel.chat.rawValue,
+                conversationId: currentConversation
             )
             let inserted: Message = try await supabase
                 .from(DBTables.messages)
                 .insert(newMessage)
-                .select("id,role,content,read,created_at,reaction,channel,reply_to,metadata")
+                .select(Message.columns)
                 .single()
                 .execute()
                 .value
-            if inserted.channel == currentChannel.rawValue,
+            if inserted.conversationId == currentConversation,
                !self.messages.contains(where: { $0.id == inserted.id }) {
                 self.messages.append(inserted)
             }

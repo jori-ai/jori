@@ -424,7 +424,7 @@ enum SelfImproveApproval {
     static func chatAnchor(for it: Improvement) async throws -> Message {
         try await SupabaseManager.ensureAuthenticated()
 
-        let columns = "id,role,content,read,created_at,reaction,channel,reply_to"
+        let columns = Message.columns
 
         if let existing = it.chatMessageId {
             let rows: [Message] = try await SupabaseManager.shared

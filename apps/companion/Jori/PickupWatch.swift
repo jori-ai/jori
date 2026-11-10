@@ -114,7 +114,7 @@ final class PickupWatch {
                 guard let oldest = entries.filter({ $0.channel == channel }).map(\.sentAt).min() else { continue }
                 let after: [Message] = try await supabase
                     .from(DBTables.messages)
-                    .select("id,role,content,read,created_at,reaction,channel,reply_to,metadata")
+                    .select(Message.columns)
                     .eq("channel", value: channel)
                     .eq("role", value: "assistant")
                     .gt("created_at", value: ISO8601DateFormatter().string(from: oldest.addingTimeInterval(-1)))

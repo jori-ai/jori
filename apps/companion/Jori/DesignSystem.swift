@@ -229,27 +229,37 @@ struct StaffLightDots: View {
 
 // MARK: - Keyboard commands
 
-/// Where the main window can point. Memory is the wiki, not a channel, but it
-/// lives in the same switcher.
+/// Where the main window can point: a conversation with the team (one role or
+/// a group, ConversationID) or Memory, the wiki.
 enum Destination: Hashable {
-    case channel(ChatChannel)
+    case conversation(String)
     case memory
 
+    /// A generic name (the screen's own title comes from the team): used for
+    /// the Go menu and to file hangs under the screen they happened on.
     var title: String {
         switch self {
-        case .channel(let c): return c.displayName
+        case .conversation(let id):
+            if id == ConversationID.coordinator { return "Chat" }
+            return ConversationID.isGroup(id) ? "Group" : "Conversation"
         case .memory: return "Memory"
         }
     }
 
     var symbol: String {
         switch self {
-        case .channel(let c): return c.symbol
+        case .conversation(let id): return ConversationID.isGroup(id) ? "person.3" : "bubble.left.and.bubble.right"
         case .memory: return "book.closed"
         }
     }
 
-    static let all: [Destination] = ChatChannel.allCases.map { .channel($0) } + [.memory]
+    var isConversation: Bool {
+        if case .conversation = self { return true }
+        return false
+    }
+
+    /// The Go menu: the coordinator's conversation and Memory.
+    static let all: [Destination] = [.conversation(ConversationID.coordinator), .memory]
 }
 
 /// What the menu bar (Mac, and iPad with a keyboard) can ask the focused
@@ -290,10 +300,7 @@ struct JoriCommands: Commands {
             }
         }
         CommandMenu("Conversation") {
-            let inChat: Bool = {
-                if case .channel(let c) = actions?.current { return c != .improvements }
-                return false
-            }()
+            let inChat: Bool = actions?.current.isConversation ?? false
             // ⌘L, not ⌘N: ⌘N is File › New Window.
             Button("New Message") { actions?.focusComposer() }
                 .keyboardShortcut("l", modifiers: .command)

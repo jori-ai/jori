@@ -41,7 +41,8 @@ struct ContentView: View {
     var onSignOut: () -> Void = {}
 
     @StateObject private var viewModel = ChatViewModel()
-    @StateObject private var badges = ChannelBadges()
+    /// The team and its conversations (ChannelBadges.swift).
+    @StateObject private var team = TeamStore()
     @Environment(\.scenePhase) private var scenePhase
     #if os(iOS)
     @Environment(\.verticalSizeClass) private var verticalSizeClass
@@ -95,6 +96,14 @@ struct ContentView: View {
     /// and disappears when every open question is already in view.
     @State private var onScreenQuestionIds: Set<UUID> = []
     @State private var isDropTargeted = false
+    /// iPhone: the conversation list is the home screen; a conversation (or
+    /// Memory) is pushed on top of it.
+    @State private var phonePath: [Destination] = []
+    @State private var showNewConversation = false
+    @State private var showConversationInfo = false
+    /// In the software engineer's conversation: the improvement cards instead
+    /// of the messages (the old Improvements channel lives there now).
+    @State private var showImprovementCards = false
 
     // Trade-approval second factor (only when the build sets a trading app)
     @State private var showApprovalPairing = false
@@ -118,7 +127,17 @@ struct ContentView: View {
     // MARK: - Destination
 
     private var destination: Destination {
-        memoryMode ? .memory : .channel(viewModel.currentChannel)
+        memoryMode ? .memory : .conversation(viewModel.currentConversation)
+    }
+
+    /// The software engineer's conversation, where the improvement cards live.
+    private var isImprovementsConversation: Bool {
+        ConversationID.roleId(viewModel.currentConversation) == TeamStore.improvementsRole
+    }
+
+    /// Open a conversation (a notification, a new group, an @mention).
+    fileprivate func openConversation(_ id: String) {
+        go(.conversation(id))
     }
 
     private var destinationBinding: Binding<Destination> {
@@ -126,14 +145,21 @@ struct ContentView: View {
     }
 
     private func go(_ target: Destination) {
+        #if os(iOS)
+        // iPhone: the list is the root, the destination is pushed on it.
+        if horizontalSizeClass != .regular, phonePath != [target] {
+            phonePath = [target]
+        }
+        #endif
         guard target != destination else { return }
         switch target {
         case .memory:
             memoryMode = true
-        case .channel(let channel):
+        case .conversation(let id):
             memoryMode = false
-            if channel != viewModel.currentChannel {
-                viewModel.switchChannel(to: channel)
+            showImprovementCards = false
+            if id != viewModel.currentConversation {
+                viewModel.switchConversation(to: id)
             }
         }
         replyTarget = nil
@@ -202,7 +228,10 @@ struct ContentView: View {
         if horizontalSizeClass == .regular {
             splitNavigation
         } else {
-            NavigationStack { detail }
+            NavigationStack(path: $phonePath) {
+                phoneConversationList
+                    .navigationDestination(for: Destination.self) { _ in detail }
+            }
         }
         #endif
     }
@@ -369,16 +398,21 @@ struct ContentView: View {
 
     private var sidebar: some View {
         List(selection: Binding<Destination?>(get: { destination }, set: { if let d = $0 { go(d) } })) {
-            Section("Conversations") {
-                ForEach(ChatChannel.allCases) { channel in
-                    let count = badges.count(for: channel)
-                    Label(channel.displayName, systemImage: channel.symbol)
-                        .badge(count)
-                        // Improvements counts cards waiting on Face ID — the one
-                        // thing that blocks on you — so its badge shouts.
-                        // So do unanswered questions: red, like the Mac toolbar tab.
-                        .badgeProminence((channel == .improvements || channel == .questions) && count > 0 ? .increased : .standard)
-                        .tag(Destination.channel(channel))
+            Section {
+                ForEach(team.visibleConversations) { conversation in
+                    ConversationRowView(conversation: conversation, team: team)
+                        .tag(Destination.conversation(conversation.id))
+                }
+            } header: {
+                HStack {
+                    Text("Conversations")
+                    Spacer()
+                    Button { showNewConversation = true } label: {
+                        Image(systemName: "square.and.pencil")
+                    }
+                    .buttonStyle(.borderless)
+                    .help("New conversation or group")
+                    .accessibilityLabel("New conversation")
                 }
             }
             Section("Library") {
@@ -421,6 +455,99 @@ struct ContentView: View {
         .sensoryFeedback(.selection, trigger: destination)
     }
 
+    // MARK: - Conversation list (iPhone home screen)
+
+    #if os(iOS)
+    private var phoneConversationList: some View {
+        List {
+            ForEach(team.visibleConversations) { conversation in
+                Button { go(.conversation(conversation.id)) } label: {
+                    ConversationRowView(conversation: conversation, team: team)
+                }
+                .buttonStyle(.plain)
+            }
+        }
+        .listStyle(.plain)
+        .refreshable { await team.refresh() }
+        // Back on the list, the conversation just left counts its unread again.
+        .onChange(of: phonePath) { _, path in
+            team.activeConversation = path.isEmpty ? "" : viewModel.currentConversation
+            if path.isEmpty { Task { await team.loadSummaries() } }
+        }
+        .navigationTitle(Install.displayName)
+        .toolbar {
+            ToolbarItem(placement: .topBarLeading) { settingsMenu }
+            ToolbarItem(placement: .topBarTrailing) {
+                Button { go(.memory) } label: { Label("Memory", systemImage: "book.closed") }
+            }
+            ToolbarItem(placement: .topBarTrailing) {
+                Button { showNewConversation = true } label: {
+                    Label("New conversation", systemImage: "square.and.pencil")
+                }
+            }
+        }
+    }
+    #endif
+
+    /// The conversation's name with its people's roles under it; tapping it
+    /// shows who is in it, where anyone can be renamed or added.
+    private var conversationHeader: some View {
+        let id = viewModel.currentConversation
+        return Button { showConversationInfo = true } label: {
+            HStack(spacing: 8) {
+                TeamAvatar(members: team.members(of: id), size: 26)
+                VStack(alignment: .leading, spacing: 0) {
+                    Text(team.title(of: id))
+                        .font(.headline)
+                        .foregroundStyle(.primary)
+                        .lineLimit(1)
+                    let sub = team.subtitle(of: id)
+                    if !sub.isEmpty {
+                        Text(sub)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                    }
+                }
+            }
+            .padding(.horizontal, 6)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("\(team.title(of: id)), \(team.subtitle(of: id)). Show people")
+    }
+
+    /// Send into the conversation on screen. An @-handle to someone not in it
+    /// brings them in: a one-role conversation becomes a group with them, a
+    /// group gains them, and the message goes there with `mentions` set.
+    private func sendWithMentions(_ text: String, replyTo threadParent: UUID?) {
+        let current = viewModel.currentConversation
+        let mentioned = team.mentioned(in: text)
+        Task {
+            var target = current
+            var extra: [String: String] = [:]
+            if !mentioned.isEmpty {
+                extra["mentions"] = mentioned.map(\.id).joined(separator: ",")
+                let next = await team.add(mentioned.map(\.id), to: current)
+                if next != current {
+                    target = next
+                    go(.conversation(next))
+                }
+            }
+            await viewModel.sendMessage(text, replyTo: target == current ? threadParent : nil,
+                                        extraMetadata: extra, conversation: target)
+            await team.loadSummaries()
+        }
+    }
+
+    /// Start the conversation the new-conversation sheet picked: a role's own
+    /// for one person, a group for several.
+    private func startConversation(with roleIds: [String]) {
+        Task {
+            if let id = await team.conversation(with: roleIds) { go(.conversation(id)) }
+        }
+    }
+
     // MARK: - Detail
 
     private var detail: some View {
@@ -435,33 +562,57 @@ struct ContentView: View {
             #else
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             #endif
-            .background(viewModel.currentChannel == .improvements && !memoryMode ? JoriTheme.groupedCanvas : JoriTheme.canvas)
+            .background(showImprovementCards && isImprovementsConversation && !memoryMode ? JoriTheme.groupedCanvas : JoriTheme.canvas)
             .overlay(alignment: .top) { offlineBanner }
             .animation(.snappy(duration: 0.3), value: viewModel.isOffline)
-            .navigationTitle(destination.title)
+            .navigationTitle(memoryMode ? "Memory" : team.title(of: viewModel.currentConversation))
             #if os(iOS)
             .navigationBarTitleDisplayMode(.inline)
             #else
-            // The channel tabs are the title: they show where you are and
-            // where else you can go. The title stays set for the Window menu
-            // and Mission Control, just not drawn in the toolbar.
+            // The conversation header is the title. The title stays set for
+            // the Window menu and Mission Control, just not drawn in the toolbar.
             .modifier(HiddenToolbarTitle())
             #endif
             .toolbar { detailToolbar }
+            .sheet(isPresented: $showConversationInfo) {
+                ConversationInfoSheet(team: team, conversationId: viewModel.currentConversation) { ids in
+                    Task {
+                        let next = await team.add(ids, to: viewModel.currentConversation)
+                        go(.conversation(next))
+                    }
+                }
+                #if os(macOS)
+                .frame(minWidth: 420, idealWidth: 460, minHeight: 420, idealHeight: 520)
+                #endif
+            }
     }
 
     @ViewBuilder
     private var detailContent: some View {
         if memoryMode {
             MemoryView(url: Self.memoryWikiURL, state: memoryState)
-        } else if viewModel.currentChannel == .improvements {
-            // A card feed, not a chat log — every action lives in the card's
-            // menu; no input bar, no reactions. "Chat" hands the card back
-            // here, because talking about an improvement belongs in the
-            // channel that has a keyboard.
-            SelfImproveFeedView(onChat: { improvement in
-                Task { await openImprovementThread(improvement) }
-            })
+        } else if isImprovementsConversation {
+            // The software engineer's conversation holds the improvement cards
+            // (the old Improvements channel) beside the messages.
+            VStack(spacing: 0) {
+                Picker("Show", selection: $showImprovementCards) {
+                    Text("Messages").tag(false)
+                    Text(team.pendingImprovements > 0 ? "Improvements (\(team.pendingImprovements))" : "Improvements").tag(true)
+                }
+                .pickerStyle(.segmented)
+                .padding(.horizontal, 14)
+                .padding(.vertical, 8)
+                if showImprovementCards {
+                    // A card feed, not a chat log — every action lives in the
+                    // card's menu; no input bar, no reactions. "Chat" hands the
+                    // card back to a conversation, where there is a keyboard.
+                    SelfImproveFeedView(onChat: { improvement in
+                        Task { await openImprovementThread(improvement) }
+                    })
+                } else {
+                    chatPane
+                }
+            }
         } else {
             chatPane
         }
@@ -474,22 +625,15 @@ struct ContentView: View {
         if memoryMode {
             ToolbarItemGroup(placement: .topBarLeading) { memoryNavButtons }
         }
-        // iPhone only: with a sidebar (iPad), its toggle is the one way to the
-        // channels — a second switcher beside it was a duplicate.
-        if horizontalSizeClass != .regular {
-            ToolbarItem(placement: .principal) { destinationMenu }
-            ToolbarItem(placement: .topBarTrailing) { settingsMenu }
+        if !memoryMode {
+            ToolbarItem(placement: .principal) { conversationHeader }
         }
         if memoryMode {
             ToolbarItem(placement: .topBarTrailing) { memoryReloadButton }
         }
         #else
-        ToolbarItem(placement: .principal) {
-            ChannelTabBar(
-                selection: memoryMode ? nil : viewModel.currentChannel,
-                badges: badges,
-                onSelect: { go(.channel($0)) }
-            )
+        if !memoryMode {
+            ToolbarItem(placement: .principal) { conversationHeader }
         }
         if memoryMode {
             ToolbarItemGroup(placement: .navigation) { memoryNavButtons }
@@ -517,54 +661,6 @@ struct ContentView: View {
             Label("Reload", systemImage: "arrow.clockwise")
         }
         .help("Reload (⇧⌘R)")
-    }
-
-    /// iPhone: the title IS the channel switcher. The count rides on it so a
-    /// pending card is visible without opening anything.
-    private var destinationMenu: some View {
-        Menu {
-            Picker("Go to", selection: destinationBinding) {
-                ForEach(Destination.all, id: \.self) { d in
-                    Label(menuTitle(for: d), systemImage: d.symbol).tag(d)
-                }
-            }
-            .pickerStyle(.inline)
-        } label: {
-            HStack(spacing: 6) {
-                Image(systemName: destination.symbol)
-                    .font(.system(size: 13, weight: .semibold))
-                    .foregroundStyle(.secondary)
-                    .contentTransition(.symbolEffect(.replace))
-                Text(destination.title)
-                    .font(.headline)
-                    .foregroundStyle(.primary)
-                    .contentTransition(.opacity)
-                Image(systemName: "chevron.down")
-                    .font(.system(size: 10, weight: .bold))
-                    .foregroundStyle(.tertiary)
-                if badges.total > 0 {
-                    ChannelBadgeBubble(count: badges.total)
-                        .transition(.scale.combined(with: .opacity))
-                }
-            }
-            .animation(.snappy(duration: 0.25), value: destination)
-            .animation(.snappy(duration: 0.25), value: badges.total)
-            .padding(.horizontal, 8)
-            .padding(.vertical, 4)
-            .contentShape(Capsule())
-        }
-        .menuIndicator(.hidden)
-        .sensoryFeedback(.selection, trigger: destination)
-        .accessibilityLabel("\(destination.title), switch channel")
-        .accessibilityValue(badges.total > 0 ? "\(badges.total) waiting" : "")
-    }
-
-    private func menuTitle(for d: Destination) -> String {
-        guard case .channel(let c) = d else { return d.title }
-        let n = badges.count(for: c)
-        // A Menu renders its rows natively — a real badge view would be
-        // flattened away — so the count goes in the title text instead.
-        return n > 0 ? "\(c.displayName) (\(ChannelBadges.label(n)))" : c.displayName
     }
 
     private var settingsMenu: some View {
@@ -719,6 +815,11 @@ struct ContentView: View {
         let visible = Array(all.suffix(renderLimit))
         let layout = BubbleLayout.compute(visible)
         let actions = bubbleActions
+        // Name the speaker over the first bubble of each run when the
+        // conversation has more than one person in it, or the message came
+        // from someone other than the conversation's own role.
+        let conversationRole = ConversationID.roleId(viewModel.currentConversation)
+        let multi = team.memberIds(of: viewModel.currentConversation).count > 1
         loadOlderButton(hidden: all.count - visible.count)
         ForEach(visible) { message in
             let place = layout[message.id] ?? .solo
@@ -729,7 +830,10 @@ struct ContentView: View {
                 MessageBubble(
                     message: message,
                     layout: place,
-                    thread: thread(for: message),
+                    thread: thread(for: message,
+                                   senderLabel: place.startsGroup && message.isAssistant
+                                       && (multi || (message.sender != nil && message.sender != conversationRole))
+                                       ? team.senderLabel(message.sender) : nil),
                     isPaletteOpen: activeReactionMessageId == message.id,
                     actions: actions
                 )
@@ -756,8 +860,9 @@ struct ContentView: View {
         )
     }
 
-    private func thread(for m: Message) -> BubbleThread {
+    private func thread(for m: Message, senderLabel: String? = nil) -> BubbleThread {
         var t = BubbleThread()
+        t.senderLabel = senderLabel
         if let parent = m.replyTo { t.quotedParent = viewModel.quotedParent(parent) }
         if m.isUser {
             t.notPickedUp = viewModel.isNotPickedUp(m.id)
@@ -833,14 +938,20 @@ struct ContentView: View {
                     proxy.scrollTo(newId, anchor: .bottom)
                 }
             }
-            .onChange(of: viewModel.currentChannel) { _, _ in
-                // Channel switch replaces `messages` from cache — the
+            .onChange(of: viewModel.currentConversation) { _, _ in
+                // A conversation switch replaces `messages` from cache — the
                 // ScrollView keeps its prior offset, so latest can be
                 // off-screen. Force a snap to bottom.
                 renderLimit = Self.renderPage
                 scrollToBottomTick &+= 1
             }
             .onAppear {
+                // A notification opened this conversation and named a message in it.
+                if let pending = pendingScrollId, viewModel.messages.contains(where: { $0.id == pending }) {
+                    reveal(pending, proxy: proxy)
+                    pendingScrollId = nil
+                    return
+                }
                 // Consume any message ID stashed while the app was launching / locked
                 if let pending = AppDelegate.pendingMessageId {
                     pendingScrollId = pending
@@ -921,7 +1032,7 @@ struct ContentView: View {
                 }
                 .padding(.horizontal, 14)
             }
-            if viewModel.currentChannel == .chat || viewModel.currentChannel == .questions {
+            Group {
                 OpenQuestionsTray(
                     questions: viewModel.openQuestions.filter { !onScreenQuestionIds.contains($0.id) },
                     reveal: { quoteJumpTarget = $0.id },
@@ -986,7 +1097,7 @@ struct ContentView: View {
         withAnimation(.easeOut(duration: 0.2)) { replyTarget = nil }
     }
 
-    /// "Chat" on an improvement card: land in the chat channel with the reply
+    /// "Chat" on an improvement card: land in its conversation with the reply
     /// composer already open on that improvement, so the next thing typed is a
     /// question or feedback about it.
     ///
@@ -999,7 +1110,9 @@ struct ContentView: View {
         do {
             let anchor = try await SelfImproveApproval.chatAnchor(for: improvement)
             await MainActor.run {
-                viewModel.switchChannel(to: .chat)
+                // Wherever the anchor landed (the server files it by role).
+                showImprovementCards = false
+                go(.conversation(anchor.conversationId))
                 // The anchor may be brand new (or older than the loaded window),
                 // so seed it locally instead of waiting for the channel's fetch —
                 // beginReply needs the message present for the quote to render.
@@ -1023,7 +1136,7 @@ struct ContentView: View {
         if replyTarget != nil {
             withAnimation(.easeOut(duration: 0.2)) { replyTarget = nil }
         }
-        Task { await viewModel.sendMessage(text, replyTo: threadParent) }
+        sendWithMentions(text, replyTo: threadParent)
     }
 
     private func replyHeaderLabel(_ date: Date) -> String {
@@ -1173,15 +1286,18 @@ struct ContentView: View {
     /// The text field lives in its own view with its own state: typing then
     /// redraws only the field, not the whole conversation above it.
     private var composerField: some View {
+        let placeholder = replyTarget == nil ? "Message \(team.title(of: viewModel.currentConversation))" : "Reply"
         #if os(macOS)
-        ComposerField(placeholder: replyTarget == nil ? "Message \(Install.displayName)" : "Reply",
-                      isActive: $inputActive,
-                      onSend: send)
+        return ComposerField(placeholder: placeholder,
+                             team: team.team,
+                             isActive: $inputActive,
+                             onSend: send)
         #else
-        ComposerField(placeholder: replyTarget == nil ? "Message \(Install.displayName)" : "Reply",
-                      focus: $isInputFocused,
-                      isActive: $inputActive,
-                      onSend: send)
+        return ComposerField(placeholder: placeholder,
+                             team: team.team,
+                             focus: $isInputFocused,
+                             isActive: $inputActive,
+                             onSend: send)
         #endif
     }
 
@@ -1195,7 +1311,7 @@ struct ContentView: View {
                 .fill(JoriTheme.cobalt.opacity(0.06))
                 .overlay(shape.strokeBorder(JoriTheme.cobalt.opacity(0.7), style: StrokeStyle(lineWidth: 2, dash: [8, 6])))
                 .overlay {
-                    Label("Drop to send to \(Install.displayName)", systemImage: "arrow.down.doc")
+                    Label("Drop to send to \(team.title(of: viewModel.currentConversation))", systemImage: "arrow.down.doc")
                         .font(.headline)
                         .foregroundStyle(JoriTheme.cobalt)
                         .padding(.horizontal, 18)
@@ -1250,29 +1366,54 @@ struct ContentView: View {
 
         func body(content: Content) -> some View {
             let viewModel = view.viewModel
-            let badges = view.badges
+            let badges = view.team
             return content
                 .task {
+                    // A notification that launched the app names a message:
+                    // open its conversation first.
+                    if let pending = AppDelegate.pendingMessageId {
+                        AppDelegate.pendingMessageId = nil
+                        view.pendingScrollId = pending
+                        if let conv = await viewModel.conversationOf(pending) { view.openConversation(conv) }
+                    }
                     await viewModel.loadMessages()
                     viewModel.startCatchUpTimer()
-                    // loadMessages just marked this channel read — refresh so its badge
-                    // clears instead of waiting out the poll interval.
+                    // loadMessages just marked this conversation read — refresh so its
+                    // badge clears instead of waiting out the poll interval.
                     await badges.refresh()
                 }
                 .task {
-                    badges.activeChannel = viewModel.currentChannel
+                    badges.activeConversation = viewModel.currentConversation
                     badges.start()
                 }
                 .onChange(of: viewModel.openQuestions.count) { _, n in
-                    if viewModel.currentChannel == .questions { badges.setOpenQuestions(n) }
+                    badges.setOpenQuestions(n, in: viewModel.currentConversation)
                 }
-                .onChange(of: viewModel.currentChannel) { _, newChannel in
-                    badges.activeChannel = newChannel
+                .onChange(of: viewModel.currentConversation) { _, newConversation in
+                    badges.activeConversation = newConversation
                     Task { await badges.refresh() }
                 }
+                // A notification tapped while the app runs: open the message's
+                // conversation; the thread scrolls to it once it has loaded.
+                .onReceive(NotificationCenter.default.publisher(for: .openJoriMessage)) { note in
+                    guard let uuid = note.object as? UUID else { return }
+                    Task {
+                        guard let conv = await viewModel.conversationOf(uuid) else { return }
+                        if conv != viewModel.currentConversation || view.memoryMode {
+                            view.pendingScrollId = uuid
+                            view.openConversation(conv)
+                        }
+                    }
+                }
+                .sheet(isPresented: view.$showNewConversation) {
+                    NewConversationSheet(team: badges) { ids in view.startConversation(with: ids) }
+                        #if os(macOS)
+                        .frame(minWidth: 420, idealWidth: 460, minHeight: 420, idealHeight: 520)
+                        #endif
+                }
                 // Handoff from the Improvements card menu's "Chat" action. Attached at
-                // this level (not inside the channel-conditional chat subview) so it
-                // fires after the switch to .chat has actually mounted the chat view.
+                // this level (not inside the conversation's chat subview) so it
+                // fires after the switch has actually mounted the chat view.
                 .onChange(of: viewModel.pendingReplyMessage) { _, message in
                     guard let message else { return }
                     viewModel.pendingReplyMessage = nil
@@ -1603,6 +1744,7 @@ struct BubbleLayout: Equatable {
                 }
                 place.startsGroup = place.separator != nil
                     || prev.role != m.role
+                    || prev.sender != m.sender
                     || gap > groupGap
                     || m.replyTo != nil
             }
@@ -1656,6 +1798,8 @@ struct BubbleThread: Equatable {
     /// The user's own message, waiting 10 minutes with no sign it was picked
     /// up (PickupWatch).
     var notPickedUp = false
+    /// "Ada · CFO" over the first bubble of a run, where it isn't obvious who is speaking.
+    var senderLabel: String?
 }
 
 /// What a bubble can ask the conversation to do.
@@ -1759,6 +1903,12 @@ struct MessageBubble: View, Equatable {
                 if message.isUser { Spacer(minLength: 56) }
 
                 VStack(alignment: message.isUser ? .trailing : .leading, spacing: 3) {
+                    if let label = thread.senderLabel {
+                        Text(label)
+                            .font(.caption2.weight(.semibold))
+                            .foregroundStyle(.secondary)
+                            .padding(.horizontal, 8)
+                    }
                     bubbleContent
                         .overlay(alignment: message.isUser ? .topLeading : .topTrailing) {
                             if (hovering || barHovering) && !isPaletteOpen {
@@ -2355,6 +2505,8 @@ private struct ReactionBadge: View {
 /// re-renders this view alone.
 private struct ComposerField: View {
     let placeholder: String
+    /// The team, for @mentions: typing "@" offers them, a tap completes the handle.
+    var team: [TeamMember] = []
     #if os(iOS)
     var focus: FocusState<Bool>.Binding
     #endif
@@ -2378,9 +2530,28 @@ private struct ComposerField: View {
         onSend(toSend)
     }
 
+    /// Team members matching the "@handle" being typed; empty when not typing one.
+    private var mentionMatches: [TeamMember] {
+        guard let q = MentionSuggestions.query(in: text) else { return [] }
+        return MentionSuggestions.matches(team, query: q)
+    }
+
     var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            if !mentionMatches.isEmpty {
+                MentionSuggestions(members: mentionMatches) { m in
+                    text = MentionSuggestions.complete(text, with: m)
+                }
+                .transition(.move(edge: .bottom).combined(with: .opacity))
+            }
+            field
+        }
+        .animation(.snappy(duration: 0.2), value: mentionMatches.map(\.id))
+    }
+
+    private var field: some View {
         let shape = RoundedRectangle(cornerRadius: 20, style: .continuous)
-        HStack(alignment: .bottom, spacing: 4) {
+        return HStack(alignment: .bottom, spacing: 4) {
             Group {
                 #if os(macOS)
                 MacMessageField(
