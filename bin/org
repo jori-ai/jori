@@ -7,6 +7,8 @@
 //   org audit [--json]         Jobs no role owns (exit 1 when there are any).
 //   org sign-subject <job> <subject>   The subject as that job's email would carry it.
 //   org sign-ping <job> <text>         The text as that job's ping would carry it.
+//   org sync [--dry-run]       Push the team (names, titles, responsibilities) to the app's
+//                              jori_team table; keep and cache the names the user changed there.
 //
 // The roster is agent/local/config/org.json. No LLM anywhere in here.
 "use strict";
@@ -48,5 +50,12 @@ if (cmd === "sign-subject" || cmd === "sign-ping") {
   console.log(cmd === "sign-subject" ? org.signSubject(text, { job, intent: job }) : org.signPing(text, { job, intent: job }));
   process.exit(0);
 }
-console.error("usage: org [list|who|audit|sign-subject|sign-ping]");
+if (cmd === "sync") {
+  try { require("../lib/load-env.js").loadEnv(); } catch { /* the env may already carry the key */ }
+  org.syncTeam({ dryRun: rest.includes("--dry-run") })
+    .then((r) => { console.log(JSON.stringify(r)); process.exit(0); })
+    .catch((e) => { console.error(`org sync: ${e.message}`); process.exit(1); });
+  return;
+}
+console.error("usage: org [list|who|audit|sign-subject|sign-ping|sync]");
 process.exit(64);

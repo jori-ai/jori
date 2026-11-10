@@ -12,7 +12,14 @@
     "commands": [],
     "env": []
   },
-  "schedules": [],
+  "schedules": [
+    {
+      "label": "team-sync",
+      "cron": "*/10 * * * *",
+      "command": "{node} {root}/bin/org sync",
+      "log": "agent/logs/team-sync.log"
+    }
+  ],
   "launchd": [],
   "role": {
     "id": "chief-of-staff",

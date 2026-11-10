@@ -141,6 +141,7 @@ CAPTURE_ID_FILE=""
 SKIP_PRECHECK=false
 EVIDENCE_AS_OF=""
 INTENT=""
+ROLE_FLAG=""
 # --question / --location-question: this message is a question. See "Question
 # routing" below; most question senders are recognised from their intent or hum
 # context and never need the flag.
@@ -196,6 +197,7 @@ while [[ $# -gt 0 ]]; do
     --suppress-hook)  SUPPRESS_HOOK=true; shift ;;
     --skip-precheck)  SKIP_PRECHECK=true; shift ;;
     --intent)         INTENT="$2"; shift 2 ;;
+    --role)           ROLE_FLAG="$2"; shift 2 ;;
     --agent)          AGENT="$2"; shift 2 ;;
     --channel)        CHANNEL="$2"; shift 2 ;;
     --question)       IS_QUESTION=true; shift ;;
@@ -1151,6 +1153,23 @@ if { [ "$CHANNEL" = "chat" ] || [ "$CHANNEL" = "questions" ]; } && [ -z "${JORI_
     "$JORI_INSTALL_TOOLS/lib/org.cjs" 2>/dev/null)"
   [ -n "$_SIGNED" ] && MESSAGE="$_SIGNED"
 fi
+# Which team role is speaking (lib/org.cjs): its id goes on the row as `sender`,
+# and the database files the row in that role's own conversation (migration
+# 0180). --role <id> names it outright; otherwise the job or intent decides.
+# Chat and questions only; the coordinator's own messages need no sender.
+SENDER_ROLE="${ROLE_FLAG:-}"
+if [ -z "$SENDER_ROLE" ] && { [ "$CHANNEL" = "chat" ] || [ "$CHANNEL" = "questions" ]; } \
+   && { [ -n "$INTENT" ] || [ -n "${JORI_SIGN_AS:-${JORI_JOB:-}}" ]; }; then
+  SENDER_ROLE="$(ORG_INTENT="$INTENT" "${JORI_NODE:-node}" -e '
+    const o=require(process.argv[1]);
+    const r=o.roleFor({job:process.env.JORI_SIGN_AS||process.env.JORI_JOB||null,intent:process.env.ORG_INTENT||null});
+    if(r&&!r.chief_of_staff)process.stdout.write(r.id);' "$JORI_INSTALL_TOOLS/lib/org.cjs" 2>/dev/null)"
+fi
+JSON_SENDER=""
+case "$SENDER_ROLE" in
+  ""|*[!a-z0-9-]*) ;;
+  *) JSON_SENDER=",\"sender\":\"${SENDER_ROLE}\"" ;;
+esac
 PUSH_TEXT="$MESSAGE"
 if [ ${#MEDIA[@]} -gt 0 ]; then
   for media_url in "${MEDIA[@]}"; do
@@ -1226,7 +1245,7 @@ if [ -n "$CAPTURE_ID_FILE" ]; then
     -H "Authorization: Bearer ${SUPABASE_KEY}" \
     -H "Content-Type: application/json" \
     -H "Prefer: ${PREFER}" \
-    -d "{\"role\":\"assistant\",\"content\":${JSON_MESSAGE},\"read\":false,\"channel\":${JSON_CHANNEL}${JSON_METADATA}}")
+    -d "{\"role\":\"assistant\",\"content\":${JSON_MESSAGE},\"read\":false,\"channel\":${JSON_CHANNEL}${JSON_SENDER}${JSON_METADATA}}")
 else
   HTTP_CODE=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 \
     -X POST "${SUPABASE_URL}/rest/v1/jori_messages" \
@@ -1234,7 +1253,7 @@ else
     -H "Authorization: Bearer ${SUPABASE_KEY}" \
     -H "Content-Type: application/json" \
     -H "Prefer: ${PREFER}" \
-    -d "{\"role\":\"assistant\",\"content\":${JSON_MESSAGE},\"read\":false,\"channel\":${JSON_CHANNEL}${JSON_METADATA}}")
+    -d "{\"role\":\"assistant\",\"content\":${JSON_MESSAGE},\"read\":false,\"channel\":${JSON_CHANNEL}${JSON_SENDER}${JSON_METADATA}}")
 fi
 
 if [ "$HTTP_CODE" = "201" ]; then
