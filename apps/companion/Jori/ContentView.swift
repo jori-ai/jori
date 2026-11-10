@@ -75,6 +75,15 @@ struct ContentView: View {
     /// True when the sidebar was hidden by narrowing the window, so widening
     /// it again brings the sidebar back. A sidebar the user hid themselves stays hidden.
     @State private var sidebarAutoHidden = false
+    /// The conversation column's width, measured while it is free, and the
+    /// width it is held at while the sidebar opens or closes. Without the
+    /// hold, the column's width changed on every frame of the sidebar's
+    /// animation (and, on the Mac, of the window's resize running alongside
+    /// it), so the text re-wrapped on every frame and the conversation
+    /// jittered. Held, it re-wraps once at the end — or not at all when the
+    /// window grows or shrinks by exactly the sidebar.
+    @State private var detailWidth: CGFloat = 0
+    @State private var detailHeldWidth: CGFloat?
     @State private var lastMeasuredWidth: CGFloat?
     #if os(macOS)
     @State private var hostWindow = WindowBox()
@@ -251,7 +260,18 @@ struct ContentView: View {
                 #endif
         } detail: {
             detail
+                .frame(width: detailHeldWidth, alignment: .leading)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                .clipped()
+                .background {
+                    GeometryReader { geo in
+                        Color.clear
+                            .onAppear { if detailHeldWidth == nil { detailWidth = geo.size.width } }
+                            .onChange(of: geo.size.width) { _, w in if detailHeldWidth == nil { detailWidth = w } }
+                    }
+                }
         }
+        .onChange(of: columnVisibility) { _, _ in holdDetailWidthDuringSidebarAnimation() }
         #if os(macOS)
         // The Mac reads the WINDOW's width from its resize notifications.
         // Both SwiftUI ways of measuring broke the split view there: a
@@ -303,6 +323,17 @@ struct ContentView: View {
             }
         }
         #endif
+    }
+
+    /// Hold the conversation at its current width until the sidebar (and, on
+    /// the Mac, the window: its resize is re-applied at 0.4 s) has settled.
+    private func holdDetailWidthDuringSidebarAnimation() {
+        guard detailWidth > 0 else { return }
+        detailHeldWidth = detailWidth
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.55) {
+            var t = Transaction(); t.disablesAnimations = true
+            withTransaction(t) { detailHeldWidth = nil }
+        }
     }
 
     #if os(macOS)
@@ -471,8 +502,11 @@ struct ContentView: View {
         .refreshable { await team.refresh() }
         // Back on the list, the conversation just left counts its unread again.
         .onChange(of: phonePath) { _, path in
+            let left = team.activeConversation
             team.activeConversation = path.isEmpty ? "" : viewModel.currentConversation
-            if path.isEmpty { Task { await team.loadSummaries() } }
+            // Mark the conversation just left read BEFORE recounting, so its
+            // badge does not come back.
+            if path.isEmpty { Task { await team.markRead(left); await team.loadSummaries() } }
         }
         .navigationTitle(Install.displayName)
         .toolbar {
@@ -518,8 +552,9 @@ struct ContentView: View {
     }
 
     /// Send into the conversation on screen. An @-handle to someone not in it
-    /// brings them in: a one-role conversation becomes a group with them, a
-    /// group gains them, and the message goes there with `mentions` set.
+    /// brings them into THIS conversation (no new group); the message carries
+    /// `mentions`, and the mentioned roles answer here with its recent
+    /// messages as context (bin/role-session prepare).
     private func sendWithMentions(_ text: String, replyTo threadParent: UUID?) {
         let current = viewModel.currentConversation
         let mentioned = team.mentioned(in: text)
@@ -856,13 +891,15 @@ struct ContentView: View {
             answer: { label, parent in Task { await vm.sendMessage(label, replyTo: parent) } },
             toggleChecklist: { label, on, id in vm.toggleChecklistItem(label, checked: on, on: id) },
             resolveParent: { vm.resolveQuotedParent($0) },
-            dismiss: { vm.dismissQuestion($0) }
+            dismiss: { vm.dismissQuestion($0) },
+            gradeGate: { id, grade, note in Task { await team.gradeGate(id, grade: grade, note: note) } }
         )
     }
 
     private func thread(for m: Message, senderLabel: String? = nil) -> BubbleThread {
         var t = BubbleThread()
         t.senderLabel = senderLabel
+        if m.isAssistant { t.gate = team.gateReviews[m.id] }
         if let parent = m.replyTo { t.quotedParent = viewModel.quotedParent(parent) }
         if m.isUser {
             t.notPickedUp = viewModel.isNotPickedUp(m.id)
@@ -1378,8 +1415,9 @@ struct ContentView: View {
                     }
                     await viewModel.loadMessages()
                     viewModel.startCatchUpTimer()
-                    // loadMessages just marked this conversation read — refresh so its
-                    // badge clears instead of waiting out the poll interval.
+                    // Opening a conversation reads it: mark it read, then refresh
+                    // so its badge clears instead of waiting out the poll.
+                    await badges.markRead(viewModel.currentConversation)
                     await badges.refresh()
                 }
                 .task {
@@ -1389,9 +1427,13 @@ struct ContentView: View {
                 .onChange(of: viewModel.openQuestions.count) { _, n in
                     badges.setOpenQuestions(n, in: viewModel.currentConversation)
                 }
-                .onChange(of: viewModel.currentConversation) { _, newConversation in
+                .onChange(of: viewModel.currentConversation) { oldConversation, newConversation in
                     badges.activeConversation = newConversation
-                    Task { await badges.refresh() }
+                    Task {
+                        await badges.markRead(oldConversation)
+                        await badges.markRead(newConversation)
+                        await badges.refresh()
+                    }
                 }
                 // A notification tapped while the app runs: open the message's
                 // conversation; the thread scrolls to it once it has loaded.
@@ -1800,6 +1842,8 @@ struct BubbleThread: Equatable {
     var notPickedUp = false
     /// "Ada · CFO" over the first bubble of a run, where it isn't obvious who is speaking.
     var senderLabel: String?
+    /// The speak gate's shadow verdict on this message, for the user to grade.
+    var gate: GateReview?
 }
 
 /// What a bubble can ask the conversation to do.
@@ -1812,6 +1856,7 @@ struct BubbleActions {
     var toggleChecklist: (String, Bool, UUID) -> Void
     var resolveParent: (UUID) -> Void
     var dismiss: (Message) -> Void
+    var gradeGate: (UUID, String, String) -> Void = { _, _, _ in }
 }
 
 /// Equatable on its inputs (the closures are deliberately left out — they
@@ -1930,6 +1975,10 @@ struct MessageBubble: View, Equatable {
                     if thread.notPickedUp {
                         notPickedUpLine
                             .transition(.opacity)
+                    }
+
+                    if let gate = thread.gate {
+                        GateReviewLine(review: gate) { grade, note in actions.gradeGate(message.id, grade, note) }
                     }
                 }
 

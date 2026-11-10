@@ -38,7 +38,10 @@
       "hum",
       "hum-*",
       "session",
-      "action-approval-poll"
+      "action-approval-poll",
+      "speak-gate-shadow",
+      "role-session",
+      "team-sync"
     ],
     "intents": [
       "hum",

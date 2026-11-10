@@ -173,3 +173,30 @@ test("decision cards: more than one a day per group when the backlog is long", (
   assert.equal(dq.nextDecision({ items, lane, now: NOW, tz: "America/Chicago" }).decision, null);
   assert.equal(dq.nextDecision({ items, lane, now: NOW, tz: "America/Chicago", perDay: 2 }).decision.ref, "ppl:b");
 });
+
+test("every relationship card offers 'Track only' (follow, never nudge)", () => {
+  for (const kind of ["stay_in_touch", "follow_news"]) {
+    const opts = pw.optionsFor(kind, { cadence_days: 90 });
+    const i = opts.findIndex((o) => o.text === "Track only");
+    assert.ok(i > 0, `${kind} has the option`);
+    assert.deepEqual(opts[i].effect, { status: "tracking", research: 1, nudges: 0 });
+    assert.match(opts[i].description, /^No reminders to reach out\./);
+    assert.match(opts[i + 1].text, /^Not now/);
+  }
+  const reach = pw.optionsFor("reach_out", { cadence_days: 90 }).find((o) => o.text === "Track only");
+  assert.deepEqual(reach.effect, { status: "tracking", research: 1, nudges: 0, nudged: true });
+  const change = pw.optionsFor("change").find((o) => o.text === "Track only");
+  assert.deepEqual(change.effect, { status: "tracking", research: 1, nudges: 0, change_status: "done" });
+  assert.ok(reach.description && change.description, "the description travels with every copy");
+});
+
+test("the option's description reaches the card verbatim", async () => {
+  const opts = pw.optionsFor("stay_in_touch", { cadence_days: 90 });
+  const notes = opts.map((o) => o.description || "");
+  const item = { ref: "ppl:x", source: "people", q: { id: "x", question: "Q?", options: opts.map((o) => o.text), option_notes: notes, recommended: 0, status: "open" } };
+  const card = dq.fallbackCard(item);
+  const watch = card.options.find((o) => o.label === "Track only");
+  assert.equal(watch.description, "No reminders to reach out. I'll watch their job and life news and tell you when something happens, so you have a reason to get in touch.");
+  const validated = dq.validateCard({ header: "People", question: "Q?", recommended_source_index: 0, options: card.options.map((o) => ({ source_index: o.source_index, label: o.label, description: "model wrote this" })) }, item);
+  assert.equal(validated.options.find((o) => o.label === "Track only").description, watch.description);
+});

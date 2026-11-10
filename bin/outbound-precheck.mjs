@@ -273,6 +273,18 @@ const senderLabel = (input.agent || input.sender || "ops").toString().slice(0, 2
 logContext = { intent, sender: senderLabel };
 const supportingData = input.supporting_data || null;
 
+// ─── Evidence mode (bin/speak-gate) ──────────────────────────────────────
+// The think-before-you-speak gate (system/speak-gate.md) reuses everything
+// this file gathers. OUTBOUND_PRECHECK_EVIDENCE=1: gather as usual (the
+// deterministic suppressions above the prompt still decide), then print
+// {decision:"evidence", message, evidence} instead of asking the model.
+// OUTBOUND_PRECHECK_AS_OF=<iso>: read the transcript and calendar as they were
+// at that instant and skip the freshness stage (a replay of a past message
+// asks whether it was right THEN; "true now" is the live gate's question).
+const EVIDENCE_MODE = process.env.OUTBOUND_PRECHECK_EVIDENCE === "1";
+const AS_OF = process.env.OUTBOUND_PRECHECK_AS_OF ? new Date(process.env.OUTBOUND_PRECHECK_AS_OF) : null;
+const NOW_MS = AS_OF && !isNaN(AS_OF) ? AS_OF.getTime() : Date.now();
+
 // ─── Fetch last 8h of phone-channel messages (BOTH roles) ─────────────────
 // 8h covers the common case where the user answered a question (e.g. "already
 // done") and the same question fires again after a quiet-window
@@ -322,10 +334,10 @@ let recentMessages = [];
 const sbKey = readSupabaseKey();
 if (sbKey) {
   try {
-    const since = new Date(Date.now() - 8 * 60 * 60 * 1000).toISOString();
+    const since = new Date(NOW_MS - 8 * 60 * 60 * 1000).toISOString();
     const qs = new URLSearchParams({
       select: "role,content,created_at",
-      "created_at": `gt.${since}`,
+      and: `(created_at.gt.${since},created_at.lt.${new Date(NOW_MS).toISOString()})`,
       channel: "in.(chat,questions)",
       order: "created_at.desc",
       limit: "60",
@@ -356,7 +368,7 @@ if (sbKey) {
 //
 // End of day is 02:00 local tomorrow, so an evening that runs past midnight is covered.
 // Floored at now+2h so a late-night call never gets a SHORTER window than before.
-const now = new Date();
+const now = new Date(NOW_MS);
 const calFrom = new Date(now.getTime() - 2 * 60 * 60 * 1000).toISOString();
 const localNow = new Date(now.toLocaleString("en-US", { timeZone: instance().tz }));
 const localDayEnd = new Date(localNow); localDayEnd.setHours(26, 0, 0, 0); // 02:00 local tomorrow
@@ -579,6 +591,7 @@ try {
 //      "don't re-ask" — was invisible. utterance-store makes every reply
 //      permanently searchable, dated and attributed.
 let claimFactsText = "";
+let claimContradictionText = "";
 try {
   const { loadTimeline, checkClaims } = await import("../lib/claim-facts.mjs");
   const timeline = await loadTimeline();
@@ -587,12 +600,21 @@ try {
       { text: proposedMessage, supporting_data: supportingData },
       timeline,
     );
-    const hard = contradictions.find(c => c.severity === "hard");
-    if (hard) {
-      emit({
-        decision: "suppress",
-        reason: `authority contradiction: ${hard.why}`.slice(0, 200),
-      });
+    // A "hard" contradiction used to SUPPRESS here, deterministically. The
+    // extractor pairs ANY place with ANY date in the text, so a message that
+    // merely mentions a place and a date ("a $1,379 Budget charge from your
+    // Israel trip, posted Nov 3"; "the appraiser's reply waiting since Oct 28
+    // … you're in New York until the 15th") read as asserting the user's
+    // whereabouts, and was dropped unseen — 19 times by 2026-11-10, a P1 email
+    // and a nightly review among them, one naming a country while the user
+    // was in a city inside it. The user, grading those drops: "This has nothing to do with where
+    // I am"; "when a large charge comes in it doesn't matter where I am."
+    // Whether the message actually ASSERTS presence is a question about
+    // meaning (Rule #0b), so the flag is now evidence for the model, which
+    // decides.
+    const hard = contradictions.filter(c => c.severity === "hard");
+    if (hard.length) {
+      claimContradictionText = hard.map(c => `  - ${c.why}`).join("\n");
     }
     if (facts.length) {
       // Lead with the CANONICAL METRO, not the segment's display label.
@@ -643,6 +665,10 @@ try {
 let workingMessage = proposedMessage;
 let freshnessModified = false;
 try {
+  // Evidence mode (bin/speak-gate) skips it too: the gate's own research
+  // verifies truth, and it must not route bank or health text through the
+  // freshness extractor's models.
+  if (AS_OF || EVIDENCE_MODE) throw new Error("freshness skipped (replay or evidence mode)");
   const { checkFreshness } = await import("../lib/claim-freshness.mjs");
   const fresh = await checkFreshness({
     text: proposedMessage,
@@ -670,7 +696,10 @@ try {
 let utterancesText = "";
 try {
   const { searchUtterances } = await import("../lib/utterance-store.mjs");
-  const hits = searchUtterances(`${intent} ${workingMessage}`.slice(0, 400), { k: 6 });
+  // As of a replay instant: only what the user had said BY then (an answer
+  // to this very message must not count as having answered it).
+  const hits = searchUtterances(`${intent} ${workingMessage}`.slice(0, 400), { k: AS_OF ? 40 : 6 })
+    .filter((u) => !AS_OF || Date.parse(u.ts || 0) < NOW_MS).slice(0, 6);
   if (hits.length) utterancesText = hits.map(u => `  - ${u.rendered}`).join("\n");
 } catch {}
 
@@ -701,6 +730,10 @@ const sameDayPingsBlock = sameDayPingsText
 
 const claimFactsBlock = claimFactsText
   ? `\nAUTHORITATIVE FACTS (${ASSISTANT}'s live travel timeline — GROUND TRUTH, outranks the message's wording and outranks any wiki page, which can lag).\nEach line was resolved by code against the timeline. "SAME METRO: YES" is the verdict and it is ALREADY CORRECT — trust it over your own reading of the place names, and do NOT suppress a message for a location mismatch when it says YES. A neighbourhood, borough, airport or suburb of the same metro reads YES by design:\n${claimFactsText}\n`
+  : "";
+
+const contradictionBlock = claimContradictionText
+  ? `\nTRAVEL CHECK FLAGGED (code paired a place and a date in the text; it cannot tell whether the message claims where ${OWNER} IS). Suppress only if the message really asserts ${OWNER}'s whereabouts and the timeline refutes it; a place or date merely mentioned (a charge from a past trip, a filing date) is not a claim about where they are:\n${claimContradictionText}\n`
   : "";
 
 const utterancesBlock = utterancesText
@@ -782,7 +815,7 @@ Proposed message:
 
 Sender (agent label): ${senderLabel}    (ops = autonomous backend / harvester / digest / cron; chat = chat-agent escalating via jori-send-curl; infra = supervisor liveness alert)
 Intent (sender's tag): ${intent}
-${supportingBlock}${claimFactsBlock}${utterancesBlock}${wikiBlock}${resolvedTopicsBlock}${sameDayPingsBlock}
+${supportingBlock}${claimFactsBlock}${contradictionBlock}${utterancesBlock}${wikiBlock}${resolvedTopicsBlock}${sameDayPingsBlock}
 Phone-channel transcript, last 8h (oldest first):
 ${msgBlock}
 
@@ -806,6 +839,26 @@ Reply with ONE LINE of compact JSON, no prose, no markdown fence. Schema:
 {"decision":"send"|"suppress"|"modify","message":"<modified text, only if decision=modify, ≤400 chars>","reason":"<≤140 chars: what in the transcript or memory drove the decision. For protected intents that you decided to send anyway, write ${P.protected_reason_example} or similar.>"}
 
 If decision=send or suppress, omit the "message" field or set it to "". If decision=modify, "message" MUST be non-empty and ≤400 chars.`;
+
+if (EVIDENCE_MODE) {
+  process.stdout.write(JSON.stringify({
+    decision: "evidence",
+    message: workingMessage,
+    freshness_modified: freshnessModified,
+    evidence: {
+      transcript_last_8h: msgBlock,
+      calendar_today: calBlock,
+      supporting_data: supportingData ? JSON.stringify(supportingData).slice(0, 800) : "",
+      authoritative_facts: claimFactsText,
+      travel_check_flagged: claimContradictionText,
+      owner_said: utterancesText,
+      long_term_memory: wikiContext,
+      acknowledged_topics_48h: resolvedTopicsText,
+      hum_pings_today: sameDayPingsText,
+    },
+  }));
+  process.exit(0);
+}
 
 // "Send it" means "send what survived the freshness stage". Every fail-open
 // path below routes through here, so a truth correction is never lost to a

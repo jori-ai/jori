@@ -1,0 +1,42 @@
+#!/usr/bin/env node
+// db-read — READ-ONLY access to the installation's Supabase tables, for
+// research agents (bin/speak-gate.mjs) that must check "all our databases"
+// before speaking to the user, without any power to change them.
+//
+//   db-read tables                         every table and view, with its columns
+//   db-read <table> "<postgrest query>"    rows, e.g.
+//       db-read jori_messages "select=role,content,created_at&content=ilike.*bridge*&order=created_at.desc&limit=10"
+//       db-read location_history "select=*&started_at=gte.2026-11-07&started_at=lt.2026-11-08"
+//
+// Read-only BY CONSTRUCTION: the only request this file can make is an HTTP
+// GET (lib/supabase-rest.js fetchJson); there is no method switch and no body.
+// Output is capped (DB_READ_MAX_CHARS, default 12000) so a broad query cannot
+// flood the agent's context.
+"use strict";
+
+const path = require("node:path");
+const ROOT = path.join(__dirname, "..");
+try { require(path.join(ROOT, "lib", "load-env.js")).loadEnv(); } catch { /* env may be set */ }
+const { fetchJson } = require(path.join(ROOT, "lib", "supabase-rest.js"));
+
+const MAX = Number(process.env.DB_READ_MAX_CHARS || 12000);
+const [table, query = "select=*&limit=20"] = process.argv.slice(2);
+const print = (v) => { const s = typeof v === "string" ? v : JSON.stringify(v, null, 0); process.stdout.write((s.length > MAX ? s.slice(0, MAX) + `\n… (cut at ${MAX} chars; narrow the query)` : s) + "\n"); };
+
+(async () => {
+  if (!table || table === "--help" || table === "-h") {
+    console.log("usage: db-read tables | db-read <table> \"<postgrest query>\"  (read-only)");
+    process.exit(table ? 0 : 64);
+  }
+  if (table === "tables") {
+    const spec = await fetchJson("/rest/v1/", { timeoutMs: 15000 });
+    if (!spec || !spec.definitions) { console.error("db-read: could not read the schema"); process.exit(1); }
+    print(Object.entries(spec.definitions).map(([t, d]) => `${t}: ${Object.keys(d.properties || {}).join(", ")}`).join("\n"));
+    return;
+  }
+  if (!/^[a-z0-9_]+$/.test(table)) { console.error("db-read: table names are lowercase letters, digits and _"); process.exit(64); } // lang-regex-ok: identifier shape
+  const q = String(query).replace(/^\?/, ""); // lang-regex-ok: strips a leading "?" from a query string
+  const rows = await fetchJson(`/rest/v1/${table}?${q}`, { timeoutMs: 20000 });
+  if (rows == null) { console.error("db-read: no answer (bad table, bad query or no access)"); process.exit(1); }
+  print(rows);
+})();

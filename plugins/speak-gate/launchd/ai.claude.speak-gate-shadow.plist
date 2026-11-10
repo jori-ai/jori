@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  SPEAK GATE SHADOW: every 5 minutes, judge the messages that reached the user
+  since the last pass (plugins/speak-gate/bin/speak-gate-shadow.mjs) and file
+  the verdicts in jori_gate_reviews for the app to show. Holds nothing.
+  launchd, not cron: the gate forks `claude -p` (GUI keychain's Max login).
+  Installed by `jori plugin sync` with the speak-gate plugin.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>ai.claude.speak-gate-shadow</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>__JORI_TOOLS__/plugins/speak-gate/bin/speak-gate-shadow-trigger</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>__HOME__</string>
+        <key>PATH</key>
+        <string>__HOME__/.local/node/bin:__HOME__/.local/bin:/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:__JORI_TOOLS__/bin</string>
+        <key>LANG</key>
+        <string>en_US.UTF-8</string>
+    </dict>
+    <key>WorkingDirectory</key>
+    <string>__JORI_TOOLS__</string>
+    <key>StartInterval</key>
+    <integer>300</integer>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>__JORI_TOOLS__/agent/logs/speak-gate-shadow-launchd.log</string>
+    <key>StandardErrorPath</key>
+    <string>__JORI_TOOLS__/agent/logs/speak-gate-shadow-launchd.log</string>
+</dict>
+</plist>
