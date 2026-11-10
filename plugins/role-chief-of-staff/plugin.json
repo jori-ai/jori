@@ -20,7 +20,12 @@
       "log": "agent/logs/team-sync.log"
     }
   ],
-  "launchd": [],
+  "launchd": [
+    {
+      "label": "ai.claude.role-session",
+      "file": "ai.claude.role-session.plist"
+    }
+  ],
   "role": {
     "id": "chief-of-staff",
     "title": "Chief of Staff",

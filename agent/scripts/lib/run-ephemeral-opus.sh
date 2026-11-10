@@ -225,6 +225,7 @@ cd "$CWD" || { rm -f "$OUT_TMP.prompt" "$OUT_TMP.local-rules"; exit 1; }
   ${FORK_DISALLOWED_TOOLS:+--disallowedTools $FORK_DISALLOWED_TOOLS} \
   ${FORK_SKILL_SETTINGS:+--settings "$FORK_SKILL_SETTINGS"} \
   ${LOCAL_RULES_FILE:+--append-system-prompt-file "$LOCAL_RULES_FILE"} \
+  ${JORI_FORK_RESUME:+--resume "$JORI_FORK_RESUME"} \
   --add-dir "$ROOT" < "$OUT_TMP.prompt" > "$OUT_TMP.json" 2> "$OUT_TMP.err" &
 CLAUDE_PID=$!
 
@@ -253,6 +254,12 @@ rm -f "$OUT_TMP.prompt" "$OUT_TMP.local-rules"
 # Ledger row + plain text. Unparseable output (a crash, a plain-text auth error)
 # passes through unchanged and writes no row; if node itself is unavailable the
 # raw envelope is used, so the guards still see SOMETHING rather than nothing.
+# A caller that keeps a session going (JORI_FORK_RESUME on the next run; the
+# team-role sessions, bin/role-session) asks for this run's session id here.
+if [ -n "${JORI_FORK_SESSION_OUT:-}" ]; then
+  node -e 'try{const j=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8"));if(j.session_id)require("fs").writeFileSync(process.argv[2],j.session_id)}catch{}' \
+    "$OUT_TMP.json" "$JORI_FORK_SESSION_OUT" 2>/dev/null
+fi
 node "$JORI_INSTALL_TOOLS/bin/fork-cost-record" "$JOB" "$OUT_TMP.json" --model "$MODEL" > "$OUT_TMP" 2>> "$LOG" \
   || cat "$OUT_TMP.json" > "$OUT_TMP"
 cat "$OUT_TMP.err" >> "$OUT_TMP" 2>/dev/null
