@@ -16,7 +16,8 @@ source "$KERNEL_TOOLS/agent/scripts/lib/webhook-auth.sh"     # dispatch_or_skip
 JOBLOG="$JORI_INSTALL_TOOLS/agent/logs/projects.log"
 log() { echo "$(date '+%Y-%m-%d %H:%M:%S') [projects] $1" >> "$JOBLOG"; }
 
-OUT="$("$JORI_NODE" "$PLUGIN_DIR/bin/projects" gather 2>>"$JOBLOG")"
+# --deep-all (by hand): deep-review every live project tonight, not the rotation.
+OUT="$("$JORI_NODE" "$PLUGIN_DIR/bin/projects" gather ${1:+"$1"} 2>>"$JOBLOG")"
 RC=$?
 log "gather (rc $RC): $OUT"
 if [ "$RC" -eq 2 ]; then log "skip: every source failed"; exit 1; fi

@@ -1,5 +1,5 @@
 {
-  "_doc": "Projects (plugins/projects). calendar_past_days / calendar_future_days: how far back and ahead the calendar is read. exclude_calendars: calendars to leave out, by id or name (holiday calendars are always left out). tasks_completed_days: completed tasks older than this are not read. repo_roots: folders whose sub-folders are git repositories to read commit activity from ([] = none). repo_days: how far back commits are read. wiki_recent_days: how many days of recently changed wiki pages the bundle lists. max_new_pages_per_run: the most project pages one night may create. tasks_list: the Google Tasks list the user's project tasks go on (@default = their main list). nudge_every_days: at most one follow-up per slipped task in this many days. deep_reviews_per_night: projects that get the deep 'how do we move this forward' pass each night (a rotation). work_weekly_share: the share of the weekly allowance Jori's own work on project tasks (project-work) may spend in 7 days; 0 turns the lane off. work_tasks_per_night: the most tasks it takes on a night. schedules: this installation's own schedule time, if not the manifest's.",
+  "_doc": "Projects (plugins/projects). calendar_past_days / calendar_future_days: how far back and ahead the calendar is read. exclude_calendars: calendars to leave out, by id or name (holiday calendars are always left out). tasks_completed_days: completed tasks older than this are not read. repo_roots: folders whose sub-folders are git repositories to read commit activity from ([] = none). repo_days: how far back commits are read. wiki_recent_days: how many days of recently changed wiki pages the bundle lists. max_new_pages_per_run: the most project pages one night may create. tasks_list: the Google Tasks list the user's project tasks go on (@default = their main list). nudge_every_days: at most one follow-up per slipped task in this many days. deep_reviews_per_night: projects that get the deep 'how do we move this forward' pass each night (a rotation). work_weekly_share: the share of the weekly allowance Jori's own work on project tasks (project-work) may spend in 7 days; 0 turns the lane off. work_tasks_per_night: the most tasks it takes on a night. money_on_pages: amounts (costs, quotes, budgets, balances) may appear on project pages and task titles; account numbers and health details never do. schedules: this installation's own schedule time, if not the manifest's.",
   "calendar_past_days": 90,
   "calendar_future_days": 180,
   "exclude_calendars": [],
@@ -12,5 +12,6 @@
   "nudge_every_days": 7,
   "deep_reviews_per_night": 5,
   "work_weekly_share": 0.05,
-  "work_tasks_per_night": 2
+  "work_tasks_per_night": 2,
+  "money_on_pages": false
 }
