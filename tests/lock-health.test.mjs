@@ -150,12 +150,19 @@ test("upcoming needs: a signed lease starting inside the window, and a code the 
     { status: "completed", terms: { propertySlug: "P1", unitId: "u4", startDate: "2026-10-01T00:00:00Z" } }, // long started
   ];
   const tenants = [
-    { propertySlug: "P1", unitId: "u5", status: "current", ttlockError: "E118 Back: error -2012" },
-    { propertySlug: "P1", unitId: "u6", status: "former", ttlockError: "old" },
-    { propertySlug: "P1", unitId: "u7", status: "current" },
+    { propertySlug: "P1", unitId: "u5", status: "future", leaseStartDate: "2026-11-05T00:00:00Z", ttlockError: "E118 Back: error -2012" },
+    { propertySlug: "P1", unitId: "u6", status: "former", leaseStartDate: "2026-11-05T00:00:00Z", ttlockError: "old" },
+    { propertySlug: "P1", unitId: "u7", status: "current", leaseStartDate: "2026-11-05T00:00:00Z" },
+    // Guards the 'Lock problem … needed: 2 codes waiting to be set' alert that
+    // fired on every one-hour reach blip: a door error on a tenant who checked
+    // in months ago is past the hub's retry, so it is not a need.
+    { propertySlug: "P1", unitId: "u8", status: "current", leaseStartDate: "2026-08-01T00:00:00Z", ttlockError: "window not moved, error -2012" },
+    { propertySlug: "P1", unitId: "u9", status: "current", ttlockError: "no lease start: the hub does not retry it either" },
+    // Check-in today at the property (Berlin, 16:00 on Nov 4) is still retried.
+    { propertySlug: "P1", unitId: "u10", status: "future", leaseStartDate: "2026-11-04T00:00:00Z", schlageError: "busy" },
   ];
   const needs = lh.upcomingNeeds({ leases, tenants, nowMs: NOW, cfg, tz: "Europe/Berlin" });
-  assert.deepEqual(needs.map((n) => `${n.unit}:${n.why}`), ["u1:check-in", "u5:code-pending"]);
+  assert.deepEqual(needs.map((n) => `${n.unit}:${n.why}`), ["u1:check-in", "u5:code-pending", "u10:code-pending"]);
   // 15:00 at the property's wall clock (Berlin in November = UTC+1).
   assert.equal(new Date(needs[0].atMs).toISOString(), "2026-11-05T14:00:00.000Z");
 });
