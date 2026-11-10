@@ -269,18 +269,16 @@ async function daemon() {
     });
   }
 
-  function subscribe() {
-    sb.channel("local-history-live")
+  // One subscription, at most one reconnect pending, with backoff. Reacting to
+  // every CLOSED (including the one our own removal emits) turned a single
+  // CHANNEL_ERROR into a self-feeding loop that logged every few ms.
+  L.realtimeKeeper({
+    open: (attempt, onStatus) => sb.channel(`local-history-live-${attempt}`)
       .on("postgres_changes", { event: "*", schema: "public", table: "live_position" }, (p) => onRow(p.new, "realtime"))
-      .subscribe((status) => {
-        realtime = status;
-        log(`realtime: ${status}`);
-        if (status === "CHANNEL_ERROR" || status === "TIMED_OUT" || status === "CLOSED") {
-          setTimeout(() => { sb.removeAllChannels().finally(subscribe); }, 5000);
-        }
-      });
-  }
-  subscribe();
+      .subscribe(onStatus),
+    closeAll: () => withTimeout(sb.removeAllChannels(), 15_000, null),
+    report: (status) => { realtime = status; log(`realtime: ${status}`); },
+  });
 
   // Safety net: a Realtime socket can die silently while looking connected
   // (phone-channel, 2026-06-08). One cheap primary-key read a minute bounds

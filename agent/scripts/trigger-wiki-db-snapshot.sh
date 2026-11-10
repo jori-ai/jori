@@ -2,7 +2,8 @@
 # trigger-wiki-db-snapshot.sh — wraps `wiki-db-snapshot` for cron.
 #
 # Hourly snapshot of data/memory-index.db via SQLite VACUUM INTO into
-# data/memory-db-snapshots/, rotated to last 4. Defense-in-depth
+# data/memory-db-snapshots/: newest 2 + newest of the previous day, older kept
+# copies zstd-compressed (bin/wiki-db-snapshot). Defense-in-depth
 # complement to the file-based memory-snapshot cron — protects against the
 # DB itself going bad (FTS5 corruption, accidental DROP, etc.).
 #

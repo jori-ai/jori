@@ -1,39 +1,58 @@
 #!/usr/bin/env bash
 # wiki-db-snapshot — atomic snapshot of memory-index.db for backup.
 #
-# Runs SQLite VACUUM INTO into a timestamped file, then keeps only the last
-# 4 snapshots (hourly cron; was 24 until 2026-10-17, ~76 GB). Defense-in-depth complement to the
-# file-based memory-snapshot cron — if the DB itself corrupts (the FTS5
-# bridge briefly did so during a 2026-05-02 experiment), restoring from the
-# most recent snapshot is one cp away.
+# Runs SQLite VACUUM INTO into a timestamped file, then applies retention:
+# the newest --hourly snapshots (default 2) plus the newest snapshot of each
+# of the --daily previous UTC days (default 1). That daily copy is the last one
+# taken the day before, so its age runs from about 1 to about 25 hours over the
+# day (none exists until a day has passed). Every kept snapshot but the newest
+# is compressed with zstd
+# (memory-index-<ts>.db.zst, about a third of the size, checked with `zstd -t`
+# before the plain copy is removed); the newest stays a plain .db so a restore
+# is one cp away. Hourly cron. History: 24 kept until 2026-10-17 (~76 GB),
+# then 4 plain copies (~15 GB). Defense-in-depth complement to the file-based
+# memory-snapshot cron — if the DB itself corrupts (the FTS5 bridge briefly did
+# so during a 2026-05-02 experiment), restoring is:
+#   cp memory-index-<ts>.db data/memory-index.db                 (newest)
+#   zstd -d memory-index-<ts>.db.zst -o data/memory-index.db     (older ones)
 #
 # VACUUM INTO is hot-safe: it reads the live DB through normal SQLite
 # isolation and writes a fresh, defragmented copy. No locking the live DB,
 # no journal-mode quirks. Equivalent to `cp` but guaranteed-consistent
-# under WAL.
+# under WAL. Retention only ever touches memory-index-<ts>.db[.zst] files in
+# the destination directory, never the live DB.
 #
 # Usage:
-#   wiki-db-snapshot              # snapshot + rotate
+#   wiki-db-snapshot              # snapshot + retention
 #   wiki-db-snapshot --quiet      # no stdout unless something failed
-#   wiki-db-snapshot --keep N     # rotate to last N (default 4)
+#   wiki-db-snapshot --rotate-only  # retention only, no new snapshot
+#   wiki-db-snapshot --hourly N   # newest N kept (default 2; --keep N is the same)
+#   wiki-db-snapshot --daily N    # plus the newest of each of N earlier days (default 1)
 #   wiki-db-snapshot --dest <dir> # override destination dir
+#
+# Without zstd (ZSTD_BIN, PATH, then the Homebrew / /usr/local paths) the kept
+# snapshots stay plain; nothing else changes.
 #
 # Exit codes:
 #   0  success
 #   1  snapshot failed
-#   2  source DB missing
+#   2  source DB missing / bad usage
 
 set -euo pipefail
 
 DB_PATH="${MEMORY_INDEX_DB:-$HOME/Dev/jori/data/memory-index.db}"
 DEST_DIR="$HOME/Dev/jori/data/memory-db-snapshots"
-KEEP=4
+KEEP_HOURLY=2
+KEEP_DAILY=1
 QUIET=0
+ROTATE_ONLY=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --quiet) QUIET=1; shift ;;
-    --keep) KEEP="$2"; shift 2 ;;
+    --keep|--hourly) KEEP_HOURLY="$2"; shift 2 ;;
+    --daily) KEEP_DAILY="$2"; shift 2 ;;
+    --rotate-only) ROTATE_ONLY=1; shift ;;
     --dest) DEST_DIR="$2"; shift 2 ;;
     -h|--help)
       sed -n '2,/^$/p' "$0" | sed 's/^# *//'
@@ -43,18 +62,102 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+case "$KEEP_HOURLY" in ''|*[!0-9]*) echo "wiki-db-snapshot: --hourly needs a number" >&2; exit 2 ;; esac
+case "$KEEP_DAILY" in ''|*[!0-9]*) echo "wiki-db-snapshot: --daily needs a number" >&2; exit 2 ;; esac
+# At least one snapshot is always kept, whatever was asked.
+[[ "$KEEP_HOURLY" -lt 1 ]] && KEEP_HOURLY=1
+
 log() {
   if [[ "$QUIET" -eq 0 ]]; then
     echo "$@"
   fi
 }
 
+mkdir -p "$DEST_DIR"
+
+# ── retention ────────────────────────────────────────────────────────────
+# Snapshot names carry their UTC time (memory-index-YYYYMMDDTHHMMSSZ[-pid]),
+# so name order is time order; a snapshot is one "stem" whether it is plain,
+# compressed, or both (an interrupted compression).
+ZSTD="${ZSTD_BIN:-}"
+if [[ -z "$ZSTD" ]]; then
+  ZSTD="$(command -v zstd 2>/dev/null || true)"
+  for z in /opt/homebrew/bin/zstd /usr/local/bin/zstd; do
+    [[ -z "$ZSTD" && -x "$z" ]] && ZSTD="$z"
+  done
+fi
+
+LIVE_REAL="$(cd "$(dirname "$DB_PATH")" 2>/dev/null && pwd -P)/$(basename "$DB_PATH")"
+
+# remove_stem <stem> — delete a snapshot in every form it exists in.
+remove_stem() {
+  local f
+  for f in "$DEST_DIR/$1.db" "$DEST_DIR/$1.db.zst"; do
+    [[ -e "$f" ]] || continue
+    [[ "$(cd "$(dirname "$f")" && pwd -P)/$(basename "$f")" == "$LIVE_REAL" ]] && continue
+    rm -f -- "$f"
+  done
+}
+
+# compress_stem <stem> — plain .db → verified .db.zst, then the plain copy goes.
+compress_stem() {
+  local plain="$DEST_DIR/$1.db" packed="$DEST_DIR/$1.db.zst"
+  [[ -f "$plain" && -n "$ZSTD" ]] || return 0
+  [[ "$(cd "$DEST_DIR" && pwd -P)/$1.db" == "$LIVE_REAL" ]] && return 0
+  if [[ -f "$packed" ]] && "$ZSTD" -q -t "$packed" 2>/dev/null; then
+    rm -f -- "$plain"   # a finished compression whose plain copy survived a crash
+    return 0
+  fi
+  if "$ZSTD" -q -3 -T2 -f "$plain" -o "$packed.tmp" 2>/dev/null \
+     && "$ZSTD" -q -t "$packed.tmp" 2>/dev/null \
+     && mv -f -- "$packed.tmp" "$packed"; then
+    rm -f -- "$plain"
+  else
+    rm -f -- "$packed.tmp"
+    echo "wiki-db-snapshot: could not compress $1.db; kept it plain" >&2
+  fi
+}
+
+rotate() {
+  rm -f -- "$DEST_DIR"/memory-index-*.db.zst.tmp 2>/dev/null || true
+  local stems kept_days="" n=0 dailies=0 newest="" stem day
+  stems=$(ls "$DEST_DIR" 2>/dev/null | grep -E '^memory-index-[0-9]{8}T[0-9]{6}Z(-[0-9]+)?\.db(\.zst)?$' \
+    | sed -E 's/\.db(\.zst)?$//' | sort -ru || true)
+  for stem in $stems; do
+    day="${stem#memory-index-}"; day="${day:0:8}"
+    if [[ "$n" -lt "$KEEP_HOURLY" ]]; then
+      n=$((n + 1))
+      [[ -z "$newest" ]] && newest="$stem"
+      case " $kept_days " in *" $day "*) ;; *) kept_days="$kept_days $day" ;; esac
+      [[ "$stem" != "$newest" ]] && compress_stem "$stem"
+      continue
+    fi
+    case " $kept_days " in
+      *" $day "*) remove_stem "$stem" ;;   # that day already has its copy
+      *)
+        if [[ "$dailies" -lt "$KEEP_DAILY" ]]; then
+          dailies=$((dailies + 1))
+          kept_days="$kept_days $day"
+          compress_stem "$stem"
+        else
+          remove_stem "$stem"
+        fi
+        ;;
+    esac
+  done
+}
+
+if [[ "$ROTATE_ONLY" -eq 1 ]]; then
+  rotate
+  remaining=$(ls "$DEST_DIR" | grep -cE '^memory-index-.*\.db(\.zst)?$' || true)
+  log "wiki-db-snapshot: retention only; $remaining snapshot(s) kept (hourly $KEEP_HOURLY + daily $KEEP_DAILY)"
+  exit 0
+fi
+
 if [[ ! -f "$DB_PATH" ]]; then
   echo "wiki-db-snapshot: source DB not found: $DB_PATH" >&2
   exit 2
 fi
-
-mkdir -p "$DEST_DIR"
 
 TS=$(date -u +%Y%m%dT%H%M%SZ)
 OUT="$DEST_DIR/memory-index-$TS.db"
@@ -78,17 +181,12 @@ ERR_LOG="${TMPDIR:-/tmp}/wiki-db-snapshot.err"
 if ! sqlite3 "$DB_PATH" "VACUUM INTO '$OUT';" 2>"$ERR_LOG"; then
   echo "wiki-db-snapshot: VACUUM INTO failed:" >&2
   cat "$ERR_LOG" >&2 || true
+  rm -f -- "$OUT"   # a half-written copy would count as the newest snapshot
   exit 1
 fi
 
-# Rotate: keep newest $KEEP by mtime; drop the rest. ls -t prints newest
-# first; tail -n +N skips the first N-1 lines, so +KEEP+1 leaves only the
-# stragglers older than the cutoff.
-ls -t "$DEST_DIR"/memory-index-*.db 2>/dev/null | tail -n +$((KEEP + 1)) | while IFS= read -r f; do
-  rm -f -- "$f"
-done
+rotate
 
-# Count what remains.
-remaining=$(ls "$DEST_DIR"/memory-index-*.db 2>/dev/null | wc -l | tr -d ' ')
+remaining=$(ls "$DEST_DIR" | grep -cE '^memory-index-.*\.db(\.zst)?$' || true)
 bytes=$(stat -f%z "$OUT" 2>/dev/null || stat -c%s "$OUT" 2>/dev/null || echo "?")
-log "wiki-db-snapshot: $OUT ($bytes bytes; keeping $remaining/$KEEP)"
+log "wiki-db-snapshot: $OUT ($bytes bytes; keeping $remaining: hourly $KEEP_HOURLY + daily $KEEP_DAILY)"

@@ -247,7 +247,7 @@
       "ops_playbook_section": null,
       "delivers_to": "none",
       "phrases": [],
-      "description": "Hourly hot snapshot of data/memory-index.db via SQLite VACUUM INTO. Rotates to the last 24 copies under data/memory-db-snapshots/. Defense-in-depth backup for the wiki layer (`pages` / `page_links` / `page_revisions` / `pages_fts` and the legacy `memory_chunks` index) — protects against DB corruption (e.g. the 2026-05-02 FTS5 incident). Restore = `cp memory-db-snapshots/memory-index-<ts>.db data/memory-index.db`. Direct script — no webhook, no Anthropic API.",
+      "description": "Hourly hot snapshot of data/memory-index.db via SQLite VACUUM INTO. Keeps the newest 2 plus the newest of the previous day under data/memory-db-snapshots/, all but the newest zstd-compressed (.db.zst). Defense-in-depth backup for the wiki layer (`pages` / `page_links` / `page_revisions` / `pages_fts` and the legacy `memory_chunks` index) — protects against DB corruption (e.g. the 2026-05-02 FTS5 incident). Restore = `cp memory-db-snapshots/memory-index-<ts>.db data/memory-index.db` (newest) or `zstd -d <ts>.db.zst -o data/memory-index.db`. Direct script — no webhook, no Anthropic API.",
       "job": null
     },
     {

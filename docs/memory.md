@@ -160,7 +160,7 @@ git init && git remote add origin https://github.com/<you>/<private-memory-repo>
 
 Without a repo the job exits with code 2 and nothing is backed up; `memory-snapshot --no-push` keeps local commits only.
 
-The wiki DB (`data/memory-index.db`) has its own hourly hot-snapshot via `wiki-db-snapshot` job — rotates to 24 in `data/memory-db-snapshots/`. Defense in depth against FTS5 corruption.
+The wiki DB (`data/memory-index.db`) has its own hourly hot-snapshot via `wiki-db-snapshot` job — keeps the newest 2 plus the newest of the previous day in `data/memory-db-snapshots/`, all but the newest zstd-compressed (`.db.zst`). Defense in depth against FTS5 corruption.
 
 ## Smoke test
 
