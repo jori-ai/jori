@@ -4,9 +4,9 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Jori for business · Your AI chief of staff</title>
-<meta name="description" content="Jori is your AI chief of staff: every project kept on track, plus customer email, meetings, business travel, invoices and reports. Private, secure and yours to shape. Open source.">
+<meta name="description" content="Jori is your AI chief of staff, with a team of AI specialists that works for you: inbox and calendar, pipeline, marketing, finance, IT and more. Private, secure and yours to shape. Open source.">
 <meta property="og:title" content="Jori for business · Your AI chief of staff">
-<meta property="og:description" content="Every project on track, every follow-up chased. Private, secure and yours to shape.">
+<meta property="og:description" content="Your AI chief of staff, and a team that works for you. Private, secure and yours to shape.">
 <link rel="icon" type="image/png" href="/icon.png?v=4">
 <link rel="apple-touch-icon" href="/apple-touch-icon.png?v=4">
 <meta property="og:image" content="https://getjori.ai/og.png?v=1">
@@ -16,7 +16,7 @@
 <meta name="twitter:image" content="https://getjori.ai/og.png?v=1">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,600&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,600;1,8..60,400;1,8..60,600&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400&display=swap" rel="stylesheet">
 <style>
   /* Palettes: life = red, work = blue, neutral when a page speaks to both. Each page maps its accent to one. */
   :root { --bg:#f4efe6; --ink:#141414; --muted:#5e5a52; --line:#d9d1c3; --life:#b42318; --life-tint:#f7e2de; --work:#1d4ed8; --work-tint:#e1e7f4; --neutral:#57534e; --neutral-tint:#ebe4d8; --accent:var(--work); --us:var(--work-tint); --yes:#1f7a4d; --no:#a3473a; }
@@ -27,7 +27,7 @@
   header.hero { padding:12vh 0 72px; max-width:760px; }
   .logo { display:block; width:112px; height:auto; margin-bottom:28px; }
   .tag { font-size:13px; letter-spacing:.08em; text-transform:uppercase; color:var(--muted); margin-bottom:24px; }
-  h1 { font-family:Fraunces, Georgia, serif; font-weight:600; font-size:clamp(48px, 8.5vw, 92px); line-height:1; letter-spacing:-.01em; }
+  h1 { font-family:"Source Serif 4", Georgia, serif; font-weight:600; font-size:clamp(48px, 8.5vw, 92px); line-height:1; letter-spacing:-.01em; }
   h1 em { color:var(--accent); }
   .lede { font-size:clamp(18px, 2.3vw, 21px); color:var(--muted); max-width:620px; margin-top:28px; }
   .lede strong { color:var(--ink); font-weight:500; }
@@ -36,15 +36,15 @@
   .link { color:var(--ink); text-decoration:none; border-bottom:1px solid var(--ink); padding-bottom:2px; font-weight:500; font-size:15px; }
   code, .mono { font-family:"JetBrains Mono", ui-monospace, monospace; font-size:.88em; }
   .pillars { display:grid; grid-template-columns:repeat(3, 1fr); gap:20px; padding:56px 0; border-top:1px solid var(--line); }
-  .pillars h3 { font-family:Fraunces, Georgia, serif; font-weight:600; font-size:28px; line-height:1.15; margin-bottom:10px; }
+  .pillars h3 { font-family:"Source Serif 4", Georgia, serif; font-weight:600; font-size:28px; line-height:1.15; margin-bottom:10px; }
   .pillars p { color:var(--muted); font-size:15px; }
   section.needs { padding:56px 0; border-top:1px solid var(--line); }
-  section.needs h2, section.compare h2 { font-family:Fraunces, Georgia, serif; font-weight:600; font-size:clamp(32px, 5vw, 48px); line-height:1.05; }
+  section.needs h2, section.compare h2 { font-family:"Source Serif 4", Georgia, serif; font-weight:600; font-size:clamp(32px, 5vw, 48px); line-height:1.05; }
   section.needs .sub { color:var(--muted); margin:12px 0 28px; max-width:640px; }
   .cards { display:grid; grid-template-columns:1fr 1fr; gap:20px; }
   .card { background:var(--us); border-radius:14px; padding:26px 26px 24px; }
   .card .k { font-size:13px; letter-spacing:.08em; text-transform:uppercase; color:var(--accent); margin-bottom:10px; }
-  .card h3 { font-family:Fraunces, Georgia, serif; font-weight:600; font-size:30px; line-height:1.1; margin-bottom:10px; }
+  .card h3 { font-family:"Source Serif 4", Georgia, serif; font-weight:600; font-size:30px; line-height:1.1; margin-bottom:10px; }
   .card p { color:var(--muted); font-size:15px; }
   @media (max-width:760px) { .cards { grid-template-columns:1fr; } }
   section.compare { padding:56px 0 24px; border-top:1px solid var(--line); }
@@ -65,6 +65,8 @@
   .caps tbody th { white-space:normal; width:300px; color:var(--ink); font-weight:600; }
   .caps tbody th .d { display:block; font-weight:400; color:var(--muted); font-size:12.5px; line-height:1.45; margin-top:3px; }
   .caps thead th:first-child { width:300px; }
+  .caps tr.grp th { position:static; white-space:normal; width:auto; background:var(--neutral-tint); color:var(--muted); padding:11px 14px; font-weight:400; font-size:13.5px; }
+  .caps tr.grp th b { font-family:"Source Serif 4", Georgia, serif; font-weight:600; font-size:17px; color:var(--ink); margin-right:8px; }
   .b { color:var(--accent); font-weight:500; }
   .p { color:#9a6b12; }
   .u { color:var(--muted); }
@@ -74,9 +76,9 @@
   footer a { color:var(--muted); }
   @media (max-width:760px) { .pillars { grid-template-columns:1fr; gap:28px; } header.hero { padding-top:8vh; } }
   h1 { letter-spacing:-.02em; line-height:1.02; }
-  .mark { display:inline-grid; place-items:center; width:64px; height:64px; border-radius:16px; background:var(--ink); color:var(--bg); font-family:Fraunces, Georgia, serif; font-size:40px; margin-bottom:28px; }
+  .mark { display:inline-grid; place-items:center; width:64px; height:64px; border-radius:16px; background:var(--ink); color:var(--bg); font-family:"Source Serif 4", Georgia, serif; font-size:40px; margin-bottom:28px; }
   .nav { display:flex; align-items:center; justify-content:space-between; gap:16px; padding:20px 0; }
-  .nav .brand { display:flex; align-items:center; gap:10px; color:var(--ink); text-decoration:none; font-family:Fraunces, Georgia, serif; font-weight:600; font-size:22px; }
+  .nav .brand { display:flex; align-items:center; gap:10px; color:var(--ink); text-decoration:none; font-family:"Source Serif 4", Georgia, serif; font-weight:600; font-size:22px; }
   .nav .brand img { width:30px; height:30px; }
   .nav .seg { display:flex; gap:4px; background:var(--us); border-radius:999px; padding:4px; }
   .nav .seg a { color:var(--muted); text-decoration:none; font-size:14px; font-weight:500; padding:6px 14px; border-radius:999px; }
@@ -87,13 +89,13 @@
   .org { margin:8px 0 28px; }
   .org .ceo, .org .cos { max-width:340px; margin:0 auto; text-align:center; border:1px solid var(--line); border-radius:14px; padding:12px 16px; background:var(--us); }
   .org .cos { margin-top:14px; background:transparent; border-color:var(--accent); }
-  .org .ceo b, .org .cos b { display:block; font-family:Fraunces, Georgia, serif; font-size:20px; }
+  .org .ceo b, .org .cos b { display:block; font-family:"Source Serif 4", Georgia, serif; font-size:20px; }
   .org .ceo span, .org .cos span { color:var(--muted); font-size:14px; }
   .org .stem { width:1px; height:14px; background:var(--line); margin:0 auto; }
   .org ul { list-style:none; padding:0; margin:18px 0 0; display:grid; grid-template-columns:repeat(auto-fill, minmax(210px, 1fr)); gap:10px; }
   .org li { border:1px solid var(--line); border-radius:12px; padding:10px 12px; font-size:14px; color:var(--muted); line-height:1.4; }
   .org li b { display:block; color:var(--ink); font-size:15px; }
-  section.see h2 { font-family:Fraunces, Georgia, serif; font-weight:600; font-size:clamp(32px, 5vw, 48px); line-height:1.05; }
+  section.see h2 { font-family:"Source Serif 4", Georgia, serif; font-weight:600; font-size:clamp(32px, 5vw, 48px); line-height:1.05; }
   section.see .sub { color:var(--muted); margin:12px 0 28px; max-width:660px; }
   section.see img { display:block; width:100%; height:auto; }
   .shots { display:grid; grid-template-columns:1.25fr .75fr; gap:28px; margin-top:28px; align-items:start; }
@@ -115,56 +117,26 @@
   <header class="hero">
     <div class="tag">Open source · Business</div>
     <h1>Meet Jori,<br>your <em>AI chief of staff</em>.</h1>
-    <p class="lede">Every project on track, every follow-up chased. Customer email, answered. Meetings, scheduled and prepped. Business trips, planned and booked. Invoices and spend, watched. The weekly report, written before Monday. Jori runs the details, day and night, so you can run the business. <strong>It's private and secure by design, so your company's data stays your company's.</strong> And it's yours to shape, until it works exactly the way your business does.</p>
+    <p class="lede">You run the company. Jori runs the details. As your chief of staff, it keeps every project on track, chases every follow-up and checks in when something slips. Under it, a team of AI specialists works day and night: an executive assistant for your inbox, calendar and travel, sales ops for the pipeline, a CFO for invoices and spend, an engineer for what breaks. <strong>It's private and secure by design, so your company's data stays your company's.</strong> And it's yours to shape, until it works exactly the way your business does.</p>
     <div class="ctas">
       <a class="btn" href="https://github.com/jori-ai/jori">Follow on GitHub</a>
       <span class="link" style="border:0;color:var(--muted);font-weight:400">Be among the first to try it.</span>
     </div>
   </header>
 
-  <div class="pillars">
-    <div>
-      <h3>Your company's data stays yours.</h3>
-      <p>Jori runs on servers you control, in your office or your own cloud account. What it learns about your customers, deals and people never ends up in someone else's product.</p>
-    </div>
-    <div>
-      <h3>Nothing hidden.</h3>
-      <p>Open source, top to bottom. Every job is a plain-language playbook and every action is on the record, so you always know what it did and why.</p>
-    </div>
-    <div>
-      <h3>Shaped to your business.</h3>
-      <p>Teach it your processes, connect your tools and set your own rules. Jori works the way your team already does, not the other way around.</p>
-    </div>
-  </div>
-
-  <section class="see" id="see">
-    <h2>See it at work.</h2>
-    <p class="sub">A sample account: Dana runs partnerships at Fieldstone, and Harbor &amp; Pine is up for renewal. Jori clears the inbox, books the meetings, keeps a page for every person, writes up every call and chases every follow-up. These screens are simulated with made-up data.</p>
-    <img src="/img/work-showcase.png?v=4" alt="A person page for a client contact with every interaction and the open follow-ups, and the Jori app with today's follow-ups and a drafted email" width="1700" height="1180" loading="lazy">
-    <div class="shots two">
-      <figure><img src="/img/work-app-email-schedule.png?v=4" alt="Two phone screens: the morning inbox with three emails that need you and a reply drafted, and a meeting with an outside contact proposed by email and booked" width="1096" height="1060" loading="lazy"><figcaption><b>Email and scheduling, handled.</b> The inbox sorted before you're up, replies drafted, and meetings booked over email with the times that suit you.</figcaption></figure>
-      <figure class="phone-shot"><img src="/img/work-app-followups.png?v=5" alt="Jori's morning follow-ups: a late pricing email with a draft ready, a questionnaire still out, and a contact gone quiet" width="610" height="1060" loading="lazy"><figcaption><b>Nothing falls through.</b> What you owe, what you're owed, and who's gone quiet, with the email drafted.</figcaption></figure>
-      <figure class="wide"><img src="/img/work-slack.png?v=4" alt="A team channel where people mention @Jori to find a meeting time across four calendars, book it with a reminder, and recall what was promised at a meeting" width="1460" height="1080" loading="lazy"><figcaption><b>@Jori in the team channel.</b> Anyone can ask it to find a time across calendars, book the meeting, set a reminder, or recall what was promised.</figcaption></figure>
-    </div>
-    <div class="shots">
-      <figure><img src="/img/work-meeting.png?v=4" alt="A Zoom meeting summary page with decisions, action items with owners and due dates, and the follow-ups Jori is watching" width="1460" height="1120" loading="lazy"><figcaption><b>Every meeting, written up.</b> Summary, decisions and action items from the Zoom recording, with owners and due dates.</figcaption></figure>
-      <figure class="phone-shot"><img src="/img/work-app-meeting.png?v=4" alt="Jori's message right after a Zoom call ends, with the outcome and a link to the meeting page, and a reminder set for a colleague" width="610" height="1060" loading="lazy"><figcaption><b>Before you've closed Zoom.</b> The outcome and your action items, on your phone.</figcaption></figure>
-    </div>
-  </section>
-
   <section class="see" id="team">
-    <h2>A team that answers to you.</h2>
-    <p class="sub">You're the CEO. Jori is your chief of staff: it keeps a page and a to-do list for every project, puts your tasks on your own task list with a date, and checks in when one slips. Every job Jori runs belongs to a role, each a plugin with its own specialty, and each role signs what it sends, so you always know who's talking. Turn roles on, off, or rename them.</p>
+    <h2>A team that works for you.</h2>
+    <p class="sub">You're the CEO. Jori is your chief of staff, and every job it runs belongs to a specialist on its team. Each role knows its craft, owns its work end to end and signs what it sends, so you always know who did what. Turn roles on or off, or rename them.</p>
     <div class="org">
-      <div class="ceo"><b>You</b><span>CEO. Every role reports to you.</span></div>
+      <div class="ceo"><b>You</b><span>CEO. You set the direction.</span></div>
       <div class="stem"></div>
-      <div class="cos"><b>Jori · Chief of Staff</b><span>Keeps every project on track and everyone accountable.</span></div>
+      <div class="cos"><b>Jori · Chief of Staff</b><span>A page and a to-do list for every project. Holds the team, and you, to every date.</span></div>
       <ul>
         <li><b>Morgan · Executive Assistant</b>Inbox, calendar, meetings and travel.</li>
         <li><b>Reese · Sales Ops</b>Pipeline, renewals and the CRM, kept honest.</li>
         <li><b>Paige · Customer Success</b>Onboarding, health checks and follow-ups.</li>
         <li><b>Nora · CFO</b>Invoices, cash, budgets and month-end.</li>
-        <li><b>Gia · Marketer</b>Case studies, the site and campaigns.</li>
+        <li><b>Gia · Marketer</b>Search, app stores, reviews and outreach.</li>
         <li><b>Kai · Software Engineer</b>Builds what you ask for and fixes what breaks.</li>
         <li><b>Sid · IT &amp; Security</b>Laptops, accounts, backups and breach alerts.</li>
         <li><b>Wren · Research Analyst</b>Prospects, competitors and the news that matters.</li>
@@ -177,19 +149,49 @@
     </div>
   </section>
 
+  <section class="see" id="see">
+    <h2>See it at work.</h2>
+    <p class="sub">A sample account: Dana runs partnerships at Fieldstone, and Harbor &amp; Pine is up for renewal. The executive assistant clears the inbox, books the meetings and writes up every call. Sales ops keeps a page for every person. The chief of staff makes sure every follow-up gets done. These screens are simulated with made-up data.</p>
+    <img src="/img/work-showcase.png?v=4" alt="A person page for a client contact with every interaction and the open follow-ups, and the Jori app with today's follow-ups and a drafted email" width="1700" height="1180" loading="lazy">
+    <div class="shots two">
+      <figure><img src="/img/work-app-email-schedule.png?v=4" alt="Two phone screens: the morning inbox with three emails that need you and a reply drafted, and a meeting with an outside contact proposed by email and booked" width="1096" height="1060" loading="lazy"><figcaption><b>Email and scheduling, handled.</b> The inbox sorted before you're up, replies drafted, and meetings booked over email with the times that suit you.</figcaption></figure>
+      <figure class="phone-shot"><img src="/img/work-app-followups.png?v=5" alt="Jori's morning follow-ups: a late pricing email with a draft ready, a questionnaire still out, and a contact gone quiet" width="610" height="1060" loading="lazy"><figcaption><b>Nothing falls through.</b> What you owe, what you're owed, and who's gone quiet, with the email drafted.</figcaption></figure>
+      <figure class="wide"><img src="/img/work-slack.png?v=4" alt="A team channel where people mention @Jori to find a meeting time across four calendars, book it with a reminder, and recall what was promised at a meeting" width="1460" height="1080" loading="lazy"><figcaption><b>@Jori in the team channel.</b> Anyone can ask it to find a time across calendars, book the meeting, set a reminder, or recall what was promised.</figcaption></figure>
+    </div>
+    <div class="shots">
+      <figure><img src="/img/work-meeting.png?v=4" alt="A Zoom meeting summary page with decisions, action items with owners and due dates, and the follow-ups Jori is watching" width="1460" height="1120" loading="lazy"><figcaption><b>Every meeting, written up.</b> Summary, decisions and action items from the Zoom recording, with owners and due dates.</figcaption></figure>
+      <figure class="phone-shot"><img src="/img/work-app-meeting.png?v=4" alt="Jori's message right after a Zoom call ends, with the outcome and a link to the meeting page, and a reminder set for a colleague" width="610" height="1060" loading="lazy"><figcaption><b>Before you've closed Zoom.</b> The outcome and your action items, on your phone.</figcaption></figure>
+    </div>
+  </section>
+
+  <div class="pillars">
+    <div>
+      <h3>Your company's data stays yours.</h3>
+      <p>Jori runs on servers you control, in your office or your own cloud account. What it learns about your customers, deals and people never ends up in someone else's product.</p>
+    </div>
+    <div>
+      <h3>Nothing hidden.</h3>
+      <p>Open source, top to bottom. Every job is a plain-language playbook and every action is on the record, so you always know who did what, and why.</p>
+    </div>
+    <div>
+      <h3>Shaped to your business.</h3>
+      <p>Turn on the roles you need, teach them your processes, connect your tools and set your own rules. The team works the way your business already does, not the other way around.</p>
+    </div>
+  </div>
+
   <section class="needs">
     <h2>All it takes: two things you already have.</h2>
-    <p class="sub">No new platform to buy, no per-seat agent fees.</p>
+    <p class="sub">No new platform to buy, and no per-seat fees for a whole team of agents.</p>
     <div class="cards">
       <div class="card">
         <div class="k">1 · Your Claude plan</div>
         <h3>The one your team already uses.</h3>
-        <p>Jori works through your company's own Claude subscription, so there's no second AI bill and no meter running every time it does the work.</p>
+        <p>The whole team works through your company's own Claude subscription, so there's no second AI bill and no meter running every time it does the work.</p>
       </div>
       <div class="card">
         <div class="k">2 · A server that stays on</div>
         <h3>A machine in the office or a small cloud server.</h3>
-        <p>Either way it's yours: Jori, its memory and everything it learns about your business live on a server you control and can wipe.</p>
+        <p>Either way it's yours: Jori, its team, its memory and everything they learn about your business live on a server you control and can wipe.</p>
       </div>
     </div>
   </section>
@@ -209,6 +211,13 @@
           </tr>
         </thead>
         <tbody>
+          <tr>
+            <th>How it's organized</th>
+            <td class="us y">A chief of staff and a team of roles that sign their work</td>
+            <td class="p">Separate agents you open one at a time</td>
+            <td class="p">An agent gallery you pick from</td>
+            <td class="p">One agent, or several you wire up</td>
+          </tr>
           <tr>
             <th>Runs on</th>
             <td class="us y">Your own server or cloud account</td>
@@ -258,8 +267,8 @@
   </section>
 
   <section class="compare caps">
-    <h2>What it takes off your plate</h2>
-    <p class="sub">All of this runs every day on Jori's reference installation.</p>
+    <h2>What your team takes off your plate</h2>
+    <p class="sub">Grouped by the role that owns the work. All of it runs every day on Jori's reference installation.</p>
     <div class="scroller">
       <table>
         <thead>
@@ -272,6 +281,24 @@
           </tr>
         </thead>
         <tbody>
+          <tr class="grp"><th colspan="5"><b>Jori · Chief of Staff</b>Keeps it all on track</th></tr>
+          <tr>
+            <th>Projects &amp; accountability<span class="d">A page and a to-do list for every project, with an owner and a date on every task: yours, the team's and the client's. Your own tasks land on your task list, and one check-in arrives when something slips.</span></th>
+            <td class="us y">Project pages, owners, dates, check-ins</td><td class="p">Planner agent; you run the plan</td><td class="u">Not documented</td><td class="p">DIY via skills</td>
+          </tr>
+          <tr>
+            <th>Daily brief &amp; digests<span class="d">A morning brief: today's meetings, open tasks and what changed overnight. One daily digest for all your newsletters, plus weekly and monthly reviews by email.</span></th>
+            <td class="us y">Morning brief, digests, weekly reviews</td><td class="p">Scheduled prompts, catch-ups</td><td class="p">Daily Brief rolling out</td><td class="y">Scheduled briefs via automations</td>
+          </tr>
+          <tr>
+            <th>"Tell me when…" watches<span class="d">Any condition becomes a watch: when a contract comes back signed, two days before a renewal, when a big customer goes quiet, at 9 tomorrow. It judges each match and asks when unsure.</span></th>
+            <td class="us y">Email, deadline or timed; can act</td><td class="p">Studio triggers; you build them</td><td class="p">Workflow triggers, reminders</td><td class="y">Reminders, cron, webhook triggers</td>
+          </tr>
+          <tr>
+            <th>Reports<span class="d">Briefs, digests and weekly and monthly reviews, pulled from your tools, checked against the data and sent on schedule.</span></th>
+            <td class="us y">Scheduled, verified reports</td><td class="p">Scheduled prompts, Analyst</td><td class="p">Scheduled workflows, data agent</td><td class="p">Team reports plugin; else DIY</td>
+          </tr>
+          <tr class="grp"><th colspan="5"><b>Morgan · Executive Assistant</b>Your inbox, calendar, meetings and travel</th></tr>
           <tr>
             <th>Inbox triage<span class="d">Sorts every email as it lands into urgent, today and later, using rules it learns from you. Urgent mail reaches you at once and becomes a task that closes itself when you reply. Spam and phishing are blocked, unknown senders held, and it suggests better rules from your corrections every week.</span></th>
             <td class="us y">Learned priorities, auto-closing tasks</td><td class="p">Outlook agent (preview)</td><td class="p">Gmail AI Inbox (US, English)</td><td class="p">Gmail triggers; triage is DIY</td>
@@ -289,21 +316,32 @@
             <td class="us y">Zoom built in: summaries, next steps chased</td><td class="y">Agenda, notes, action items</td><td class="y">Meet notes with next steps</td><td class="p">Meeting plugins: notes, summary</td>
           </tr>
           <tr>
-            <th>Works where your team works<span class="d">Its own iPhone, iPad and Mac app, email to its own address, WhatsApp and iMessage. When it writes to customers or vendors, it always says it's an assistant.</span></th>
-            <td class="us y">Own app, email, WhatsApp, iMessage</td><td class="p">Teams, Outlook, web, mobile; no Slack</td><td class="y">Slack, Teams, web, mobile</td><td class="y">Slack, Teams, web, mobile + more</td>
-          </tr>
-          <tr>
-            <th>Daily brief &amp; digests<span class="d">A morning brief: today's meetings, open tasks and what changed overnight. One daily digest for all your newsletters, plus weekly and monthly reviews by email.</span></th>
-            <td class="us y">Morning brief, digests, weekly reviews</td><td class="p">Scheduled prompts, catch-ups</td><td class="p">Daily Brief rolling out</td><td class="y">Scheduled briefs via automations</td>
-          </tr>
-          <tr>
-            <th>"Tell me when…" watches<span class="d">Any condition becomes a watch: when a contract comes back signed, two days before a renewal, when a big customer goes quiet, at 9 tomorrow. It judges each match and asks when unsure.</span></th>
-            <td class="us y">Email, deadline or timed; can act</td><td class="p">Studio triggers; you build them</td><td class="p">Workflow triggers, reminders</td><td class="y">Reminders, cron, webhook triggers</td>
-          </tr>
-          <tr>
             <th>Business travel<span class="d">Searches live fares, Google Flights and Hotels and Booking.com, and books once you approve. Every confirmation, change and cancellation in your email lands in one itinerary and your calendar, and flights are tracked live.</span></th>
             <td class="us y">Search &amp; book with approval; live itinerary</td><td class="n">Trip research only, no booking</td><td class="n">Not offered</td><td class="u">Not documented</td>
           </tr>
+          <tr class="grp"><th colspan="5"><b>Reese &amp; Paige · Sales Ops and Customer Success</b>Every account, every promise</th></tr>
+          <tr>
+            <th>Sales follow-up<span class="d">Every promise in an email becomes a follow-up, quiet threads get nudged, and its built-in CRM keeps itself current from your email and calls, so no one types anything in.</span></th>
+            <td class="us y">Follow-ups, built-in CRM</td><td class="y">Sales agent with your CRM</td><td class="p">Salesforce connector; DIY</td><td class="p">Community CRM skills</td>
+          </tr>
+          <tr>
+            <th>People &amp; accounts<span class="d">A built-in CRM: a page for every customer, vendor and contact, built from your email and meetings: who they are, what was discussed and what's open.</span></th>
+            <td class="us y">Built-in CRM: a page per contact</td><td class="p">Summaries on request, no pages</td><td class="u">Not documented</td><td class="p">Memory-wiki entity pages</td>
+          </tr>
+          <tr class="grp"><th colspan="5"><b>Gia · Marketer</b>Growth you can measure</th></tr>
+          <tr>
+            <th>Growth loop<span class="d">Checks site visits, signups and downloads every day, ships one improvement at a time, and later judges whether it moved the number. A daily digest says what changed, not just what was done.</span></th>
+            <td class="us y">Daily metrics, one change at a time, judged</td><td class="u">Not documented</td><td class="u">Not documented</td><td class="p">DIY via automations</td>
+          </tr>
+          <tr>
+            <th>Search &amp; AI visibility<span class="d">Watches your rankings, indexing and new backlinks, drafts posts for the keywords where you're almost on page one, adds FAQ markup, and checks whether AI assistants cite you when buyers ask.</span></th>
+            <td class="us y">SEO health, drafts, AI-answer checks</td><td class="u">Not documented</td><td class="u">Not documented</td><td class="p">Community skills; DIY</td>
+          </tr>
+          <tr>
+            <th>App stores, reviews &amp; outreach<span class="d">Tracks your app's keyword ranks and competitors' listings, turns reviews into themes, and drafts listing tests. Finds roundup articles, journalist queries and community threads where you belong, and drafts the pitch or the reply. Anything that mentions your product waits for your yes.</span></th>
+            <td class="us y">ASO, review themes, pitches on approval</td><td class="u">Not documented</td><td class="u">Not documented</td><td class="p">Community skills; DIY</td>
+          </tr>
+          <tr class="grp"><th colspan="5"><b>Nora · CFO</b>Receipts, cash and spend</th></tr>
           <tr>
             <th>Expenses &amp; receipts<span class="d">Turns receipt emails into vendor, amount and card, recovers what each charge actually bought, and files contractor quotes and invoices.</span></th>
             <td class="us y">Receipts parsed, charges explained</td><td class="p">Dynamics 365 add-on</td><td class="n">Not built in</td><td class="p">Community receipt skill</td>
@@ -312,14 +350,30 @@
             <th>Finance ops<span class="d">Balances and transactions across your banks and cards, with alerts on late payments in, fees, overdraft risk, unusual or duplicate charges and subscription creep, plus a weekly review where every number is checked against the data. Read-only: it never moves money.</span></th>
             <td class="us y">Spend alerts, verified weekly review</td><td class="p">Dynamics 365 add-on</td><td class="n">Not built in</td><td class="u">Not documented</td>
           </tr>
+          <tr class="grp"><th colspan="5"><b>Wren · Research Analyst</b>What you need to know</th></tr>
           <tr>
-            <th>Sales follow-up<span class="d">Every promise in an email becomes a follow-up, quiet threads get nudged, and its built-in CRM keeps itself current from your email and calls, so no one types anything in.</span></th>
-            <td class="us y">Follow-ups, built-in CRM</td><td class="y">Sales agent with your CRM</td><td class="p">Salesforce connector; DIY</td><td class="p">Community CRM skills</td>
+            <th>Documents &amp; research<span class="d">Research, summaries and drafts; reads PDFs and contracts; creates and edits Word, Excel and slides; hands long work to background agents.</span></th>
+            <td class="us y">Research, contracts, Office files</td><td class="y">Researcher, Analyst, Office</td><td class="y">Deep Research, NotebookLM</td><td class="y">Web search, PDFs, sub-agents</td>
+          </tr>
+          <tr class="grp"><th colspan="5"><b>Sid · IT &amp; Security</b>Keeps the lights on and the doors locked</th></tr>
+          <tr>
+            <th>Operations<span class="d">Watches your devices, services, API keys, app builds and deadlines around the clock, and tells you before anyone else notices.</span></th>
+            <td class="us y">24/7 checks, early warnings</td><td class="n">Not built in</td><td class="n">Not offered</td><td class="p">DIY via automations</td>
           </tr>
           <tr>
-            <th>Reports<span class="d">Briefs, digests and weekly and monthly reviews, pulled from your tools, checked against the data and sent on schedule.</span></th>
-            <td class="us y">Scheduled, verified reports</td><td class="p">Scheduled prompts, Analyst</td><td class="p">Scheduled workflows, data agent</td><td class="p">Team reports plugin; else DIY</td>
+            <th>Security watch<span class="d">Checks security news, breaches and vulnerable packages against the services and code your company actually uses, and sends a weekly summary.</span></th>
+            <td class="us y">Breaches + CVEs vs what you use</td><td class="p">Separate product (Security Copilot)</td><td class="n">Separate product (SecOps)</td><td class="u">Not documented</td>
           </tr>
+          <tr class="grp"><th colspan="5"><b>Kai · Software Engineer</b>Builds what you ask for, fixes what breaks</th></tr>
+          <tr>
+            <th>Build new abilities<span class="d">New jobs are plain-language playbooks; new tools drop into your own folders; or ask in chat ("build me X") and the engineer builds, tests and ships it for your approval.</span></th>
+            <td class="us y">Playbooks, "build me X" from chat</td><td class="y">Copilot Studio, Agent Builder</td><td class="y">Workflow Builder, ADK</td><td class="y">Skills, plugin SDK, ClawHub</td>
+          </tr>
+          <tr>
+            <th>Improves itself<span class="d">Reviews the team's week, finds the root cause of every failure overnight, watches costs and proposes upgrades for you to approve.</span></th>
+            <td class="us y">Nightly root-cause, weekly self-review</td><td class="n">Maker-run evaluations only</td><td class="u">Not documented</td><td class="p">Learns procedures; no root-cause</td>
+          </tr>
+          <tr class="grp"><th colspan="5"><b>The whole team</b>One memory, your tools, your rules</th></tr>
           <tr>
             <th>Company memory<span class="d">A living wiki of customers, vendors, decisions and how things are done here, with recall across all of it ("what did we promise Acme in March?"). Every fact is checked for contradictions before it's saved.</span></th>
             <td class="us y">Company wiki with recall</td><td class="y">Copilot Memory + Work IQ</td><td class="y">Memories + indexed company data</td><td class="y">Persistent memory with search</td>
@@ -329,32 +383,12 @@
             <td class="us y">Email, chats, docs, its own log</td><td class="y">Copilot Search + connectors</td><td class="y">Core feature, many connectors</td><td class="p">Its own memory only</td>
           </tr>
           <tr>
-            <th>People &amp; accounts<span class="d">A built-in CRM: a page for every customer, vendor and contact, built from your email and meetings: who they are, what was discussed and what's open.</span></th>
-            <td class="us y">Built-in CRM: a page per contact</td><td class="p">Summaries on request, no pages</td><td class="u">Not documented</td><td class="p">Memory-wiki entity pages</td>
-          </tr>
-          <tr>
-            <th>Documents &amp; research<span class="d">Research, summaries and drafts; reads PDFs and contracts; creates and edits Word, Excel and slides; hands long work to background agents.</span></th>
-            <td class="us y">Research, contracts, Office files</td><td class="y">Researcher, Analyst, Office</td><td class="y">Deep Research, NotebookLM</td><td class="y">Web search, PDFs, sub-agents</td>
+            <th>Works where your team works<span class="d">Its own iPhone, iPad and Mac app, email to its own address, WhatsApp and iMessage. When it writes to customers or vendors, it always says it's an assistant.</span></th>
+            <td class="us y">Own app, email, WhatsApp, iMessage</td><td class="p">Teams, Outlook, web, mobile; no Slack</td><td class="y">Slack, Teams, web, mobile</td><td class="y">Slack, Teams, web, mobile + more</td>
           </tr>
           <tr>
             <th>Works your web apps<span class="d">Uses the tools your team is already signed in to, even ones with no integration, and fixes a broken step the same day.</span></th>
             <td class="us y">Signed-in web apps, same-day repair</td><td class="p">Computer use in Studio (credits)</td><td class="p">Agent in private preview</td><td class="y">Built-in browser, signed-in Chrome</td>
-          </tr>
-          <tr>
-            <th>Operations<span class="d">Watches your devices, services, API keys, app builds and deadlines around the clock, and tells you before anyone else notices.</span></th>
-            <td class="us y">24/7 checks, early warnings</td><td class="n">Not built in</td><td class="n">Not offered</td><td class="p">DIY via automations</td>
-          </tr>
-          <tr>
-            <th>Security watch<span class="d">Checks security news, breaches and vulnerable packages against the services and code your company actually uses, and sends a weekly summary.</span></th>
-            <td class="us y">Breaches + CVEs vs what you use</td><td class="p">Separate product (Security Copilot)</td><td class="n">Separate product (SecOps)</td><td class="u">Not documented</td>
-          </tr>
-          <tr>
-            <th>Improves itself<span class="d">Reviews its own week, finds the root cause of every failure overnight, watches its own costs and proposes upgrades for a person to approve.</span></th>
-            <td class="us y">Nightly root-cause, weekly self-review</td><td class="n">Maker-run evaluations only</td><td class="u">Not documented</td><td class="p">Learns procedures; no root-cause</td>
-          </tr>
-          <tr>
-            <th>Build new abilities<span class="d">New jobs are plain-language playbooks; new tools drop into your own folders; or ask in chat ("build me X") and it builds, tests and ships it for your approval.</span></th>
-            <td class="us y">Playbooks, "build me X" from chat</td><td class="y">Copilot Studio, Agent Builder</td><td class="y">Workflow Builder, ADK</td><td class="y">Skills, plugin SDK, ClawHub</td>
           </tr>
           <tr>
             <th>Asks before risky actions<span class="d">Paying, buying, booking or writing to someone new waits for a person's approval.</span></th>
