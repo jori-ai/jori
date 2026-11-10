@@ -15,8 +15,31 @@
 //                   --intro @<file> --section @<file> --status <…> [--scope <area>] [--by <who>]
 //                                        A new project page. Refuses an id that exists.
 //
+//   projects reviewed <id>               Record tonight's deep review of a project (the rotation).
+//
+// Tasks (lib/project-tasks.js; the ledger is data/projects/tasks.json):
+//   projects task list [--project <id>] [--all] [--json]
+//   projects task add --project <id> --title "<task, naming the project>" --owner user|jori|other
+//                     [--due YYYY-MM-DD] [--who "<name>"] --why "<evidence>"
+//                     [--jori no|autonomous|needs_ok] [--size small|medium|large] [--plan "<how>"] [--by <who>]
+//                                        A task for the user needs --due (it goes on their task list).
+//   projects task update <pt-id> [--title] [--due] [--owner] [--who] [--why] [--jori] [--size] [--plan] [--by]
+//   projects task done <pt-id> --note "<what shows it is done>" [--by]
+//   projects task drop <pt-id> --note "<why>" [--by]
+//   projects task reopen <pt-id> [--due YYYY-MM-DD] [--by]
+//   projects task adopt --gtask <google task id> --project <id> --why "<evidence>" [--by]
+//                                        Link one of the user's own tasks to a project (no duplicate).
+//   projects task nudged <pt-id>         A follow-up about this slipped task went out.
+//   projects task approve <pt-id> --quote "<the user's words>"   The user said yes to Jori doing it.
+//   projects task work-queue [--json]    What Jori may work on now (jobs/project-work.md).
+//   projects task work-start <pt-id>
+//   projects task work-result <pt-id> --kind code|pr|doc|note|research --summary "<…>" [--link <url>] [--failed]
+//   projects task work-budget [--json]   The project-work lane's share of the week so far.
+//   projects task sync [--dry-run]       Two-way sync with Google Tasks. Network: un-sandboxed only.
+//
 // The block holds `## Goal` and `## What you might need` (both required) and
-// whatever else the playbook asks for. Everything outside the block is left as it is.
+// whatever else the playbook asks for; `## Tasks` is always written by code from
+// the ledger. Everything outside the block is left as it is.
 
 "use strict";
 
@@ -25,6 +48,7 @@ const path = require("node:path");
 const LIB = path.join(__dirname, "..", "..", "..", "lib");
 const { installTools } = require(path.join(LIB, "root.cjs"));
 const pr = require(path.join(__dirname, "..", "lib", "projects.js"));
+const pt = require(path.join(__dirname, "..", "lib", "project-tasks.js"));
 
 const args = process.argv.slice(2);
 const cmd = args[0];
@@ -49,6 +73,167 @@ function die(msg, code = 1) {
 
 function ws() {
   return require(path.join(LIB, "wiki-store.js"));
+}
+
+function str(name) {
+  const v = flag(name);
+  return typeof v === "string" ? v : undefined;
+}
+
+// After a task changes, rewrite that project's `## Tasks` section (best effort:
+// the nightly write-section renders it anyway).
+function refresh(projectIds) {
+  if (flag("no-refresh")) return [];
+  const ledger = pt.load();
+  const done = [];
+  for (const id of new Set(projectIds)) {
+    try { if (pr.refreshPageTasks(id, { ws: ws(), ledger, by: str("by") || "projects:tasks" })) done.push(id); }
+    catch (e) { console.error(`projects: could not refresh ${id}: ${e.message}`); }
+  }
+  return done;
+}
+
+function brief(t) {
+  return { id: t.id, project: t.project, title: t.title, owner: t.owner, due: t.due, status: t.status, jori: t.jori.mode, state: t.jori.state };
+}
+
+function taskCmd(sub) {
+  const id = args[2] && !args[2].startsWith("--") ? args[2] : null;
+  const by = str("by");
+  const cfg = pr.settings();
+
+  if (sub === "list") {
+    const l = pt.load();
+    const rows = Object.values(l.tasks).filter((t) => (flag("all") || t.status === "open") && (!str("project") || t.project === str("project")))
+      .sort((a, b) => a.project.localeCompare(b.project) || String(a.due || "9999").localeCompare(String(b.due || "9999")));
+    if (flag("json")) { console.log(JSON.stringify(rows, null, 1)); return 0; }
+    for (const t of rows) console.log(`${t.id}  ${t.status.padEnd(7)} ${t.owner.padEnd(5)} ${(t.due || "").padEnd(10)}  ${t.project.padEnd(36)} ${t.title}${t.jori.mode !== "no" ? `  [jori: ${t.jori.mode}/${t.jori.state}]` : ""}`);
+    return 0;
+  }
+
+  if (sub === "add") {
+    const project = str("project");
+    const row = project && ws().getPage(project);
+    if (!row) die(`no wiki page ${project}`);
+    if (pr.frontmatterOf(row).entity !== "project") die(`${project} is not a project page`);
+    const t = pt.withLock((l) => pt.addTask(l, {
+      project, title: str("title"), owner: str("owner"), due: str("due"), who: str("who"), why: str("why"),
+      jori: str("jori"), size: str("size"), plan: str("plan"), by,
+    }));
+    console.log(JSON.stringify({ ...brief(t), refreshed: refresh([project]) }));
+    return 0;
+  }
+
+  if (sub === "update") {
+    if (!id) die("task update needs a task id");
+    const f = { title: str("title"), owner: str("owner"), who: str("who"), why: str("why"), jori: str("jori"), size: str("size"), plan: str("plan"), by };
+    if (str("due")) f.due = str("due");
+    for (const k of Object.keys(f)) if (f[k] === undefined) delete f[k];
+    const t = pt.withLock((l) => pt.updateTask(l, id, f));
+    console.log(JSON.stringify({ ...brief(t), refreshed: refresh([t.project]) }));
+    return 0;
+  }
+
+  if (sub === "done" || sub === "drop") {
+    if (!id) die(`task ${sub} needs a task id`);
+    const t = pt.withLock((l) => pt.closeTask(l, id, { status: sub === "done" ? "done" : "dropped", note: str("note"), by }));
+    console.log(JSON.stringify({ ...brief(t), refreshed: refresh([t.project]) }));
+    return 0;
+  }
+
+  if (sub === "reopen") {
+    if (!id) die("task reopen needs a task id");
+    const t = pt.withLock((l) => pt.reopenTask(l, id, { by, due: str("due") }));
+    console.log(JSON.stringify({ ...brief(t), refreshed: refresh([t.project]) }));
+    return 0;
+  }
+
+  if (sub === "adopt") {
+    // One of the user's own tasks belongs to a project: link it, never copy it.
+    // Its title and date come from tonight's bundle (this command makes no network call).
+    const gid = str("gtask");
+    const project = str("project");
+    if (!gid || !project) die("task adopt needs --gtask and --project");
+    const row = ws().getPage(project);
+    if (!row || pr.frontmatterOf(row).entity !== "project") die(`${project} is not a project page`);
+    let bundle;
+    try { bundle = JSON.parse(fs.readFileSync(installTools("data", "projects", "bundle.json"), "utf8")); } catch { die("no bundle: adopt reads the task from data/projects/bundle.json"); }
+    const g = ((bundle.tasks && bundle.tasks.tasks) || []).find((x) => x.id === gid);
+    if (!g) die(`Google task ${gid} is not in tonight's bundle (only open tasks can be adopted)`);
+    const t = pt.withLock((l) => {
+      if (Object.values(l.tasks).some((x) => x.gtask && x.gtask.id === gid)) throw new Error(`Google task ${gid} is already linked`);
+      const due = g.due || pt.today();
+      const nt = pt.addTask(l, { project, title: g.title, owner: "user", due, why: str("why"), by: by || "projects" });
+      nt.gtask = { id: gid, list: g.list_id || cfg.tasks_list, synced: { title: g.title, due: g.due || null, status: "needsAction" }, synced_at: new Date().toISOString(), detached: false, adopted: true };
+      // A task with no date gets one on the next sync (every project task has a date).
+      if (!g.due) nt.gtask.synced.due = null;
+      return nt;
+    });
+    console.log(JSON.stringify({ ...brief(t), adopted: gid, refreshed: refresh([project]) }));
+    return 0;
+  }
+
+  if (sub === "nudged") {
+    if (!id) die("task nudged needs a task id");
+    const t = pt.withLock((l) => pt.markNudged(l, id));
+    console.log(JSON.stringify({ id: t.id, last_nudged_at: t.last_nudged_at }));
+    return 0;
+  }
+
+  if (sub === "approve") {
+    if (!id) die("task approve needs a task id");
+    const t = pt.withLock((l) => pt.approveWork(l, id, { quote: str("quote"), by }));
+    console.log(JSON.stringify({ ...brief(t), approved_at: t.jori.approved_at }));
+    return 0;
+  }
+
+  if (sub === "work-queue") {
+    const q = pt.workQueue(pt.load());
+    const budget = pt.workBudget({ cap: cfg.work_weekly_share });
+    const out = { budget, per_night: cfg.work_tasks_per_night, queue: q.map((t) => ({ ...brief(t), why: t.why, size: t.jori.size, plan: t.jori.plan, approved_quote: t.jori.approved_quote, attempts: t.jori.attempts })) };
+    if (flag("json")) { console.log(JSON.stringify(out, null, 1)); return 0; }
+    console.log(`budget: ${(budget.share * 100).toFixed(1)}% of the week used of ${(budget.cap * 100).toFixed(0)}% (${budget.runs} runs)`);
+    for (const t of out.queue) console.log(`${t.id}  ${(t.size || "?").padEnd(6)} ${t.project.padEnd(36)} ${t.title}`);
+    return 0;
+  }
+
+  if (sub === "work-start") {
+    if (!id) die("task work-start needs a task id");
+    const t = pt.withLock((l) => pt.startWork(l, id));
+    console.log(JSON.stringify({ ...brief(t), attempts: t.jori.attempts }));
+    return 0;
+  }
+
+  if (sub === "work-result") {
+    if (!id) die("task work-result needs a task id");
+    const t = pt.withLock((l) => pt.recordWork(l, id, { kind: str("kind"), link: str("link"), summary: str("summary"), failed: !!flag("failed"), by }));
+    console.log(JSON.stringify({ ...brief(t), result: t.jori.result, refreshed: refresh([t.project]) }));
+    return 0;
+  }
+
+  if (sub === "work-budget") {
+    const b = pt.workBudget({ cap: cfg.work_weekly_share });
+    console.log(JSON.stringify(b));
+    return 0;
+  }
+
+  if (sub === "sync") {
+    const names = {};
+    try { for (const p of pr.listProjects(ws()).projects) names[p.id] = p.name; } catch { /* names are a nicety */ }
+    const report = pt.withLock((l) => pt.syncGoogle(l, pt.gogTasksAdapter(pr.gogJson), {
+      list: cfg.tasks_list || "@default", projectNames: names, dryRun: !!flag("dry-run"),
+    }));
+    const changed = new Set();
+    const l = pt.load();
+    for (const k of ["closed_by_user", "reopened_by_user", "adopted_edits"]) for (const tid of report[k]) if (l.tasks[tid]) changed.add(l.tasks[tid].project);
+    const refreshed = flag("dry-run") ? [] : refresh([...changed]);
+    const counts = Object.fromEntries(Object.entries(report).map(([k, v]) => [k, v.length]));
+    console.log(JSON.stringify({ ...counts, errors: report.errors, refreshed, ...(flag("verbose") ? { report } : {}) }));
+    return report.errors.length ? 1 : 0;
+  }
+
+  console.error("usage: projects task list|add|update|done|drop|reopen|adopt|nudged|approve|work-queue|work-start|work-result|work-budget|sync");
+  return 1;
 }
 
 function main() {
@@ -103,7 +288,8 @@ function main() {
     if (!row) die(`no wiki page ${id}`);
     if (row.pin_locked) die(`${id} is pin_locked; ask through the hum instead`, 3);
     if (["day", "week", "month"].includes(row.type)) die(`${id} is an episodic page`, 3);
-    const withBlock = pr.renderBlock(row.raw_md, { section, status });
+    const withTasks = pt.injectTasks(section, pt.renderTasksSection(pt.load(), id));
+    const withBlock = pr.renderBlock(row.raw_md, { section: withTasks, status });
     const { frontmatterText, body } = store.splitFrontmatter(withBlock);
     const fm = { ...store.parseFrontmatterText(frontmatterText), entity: "project", project_status: status };
     const next = store.renderFrontmatter(fm) + body;
@@ -123,13 +309,23 @@ function main() {
       description: flag("description"),
       scope: typeof flag("scope") === "string" ? flag("scope") : null,
       intro: readArg(flag("intro"), "--intro"),
-      section: readArg(flag("section"), "--section"),
+      section: pt.injectTasks(readArg(flag("section"), "--section"), pt.renderTasksSection(pt.load(), id)),
       status: flag("status"),
     });
     const out = store.savePage(id, raw, { editedBy: flag("by") || "projects" });
     console.log(JSON.stringify({ wiki_id: id, rev: out.rev, created: out.isNew }));
     return 0;
   }
+
+  if (cmd === "reviewed") {
+    const id = args[1];
+    if (!id) die("reviewed needs a project page id");
+    pt.withLock((l) => { l.meta.reviewed[id] = pt.today(); });
+    console.log(JSON.stringify({ reviewed: id, on: pt.today() }));
+    return 0;
+  }
+
+  if (cmd === "task") return taskCmd(args[1]);
 
   console.error("usage: projects gather|list|show|write-section|create (see the header of this file)");
   return 1;

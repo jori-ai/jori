@@ -1,0 +1,21 @@
+#!/bin/bash
+# projects-task-sync — every half hour: make the user's task list and the
+# project task ledger agree (plugins/projects/lib/project-tasks.js syncGoogle).
+#
+# Code only, no model. Un-sandboxed cron, because Google Tasks needs the network
+# and gog's keychain. The user's side wins: a task they tick off or delete
+# closes the project task, a title or date they change is adopted; a task Jori
+# added since the last run goes onto their list with its date.
+
+PLUGIN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+KERNEL_TOOLS="$(cd "$PLUGIN_DIR/../.." && pwd)"
+source "$KERNEL_TOOLS/agent/scripts/lib/script-job-env.sh"   # PATH, GOG_KEYRING_PASSWORD, JORI_INSTALL_TOOLS
+
+JOBLOG="$JORI_INSTALL_TOOLS/agent/logs/projects-task-sync.log"
+OUT="$("$JORI_NODE" "$PLUGIN_DIR/bin/projects" task sync 2>&1)"
+RC=$?
+# Quiet when nothing moved: a line only when something changed or failed.
+if [ "$RC" -ne 0 ] || ! echo "$OUT" | grep -q '"created":0,"closed_by_user":0,"reopened_by_user":0,"adopted_edits":0,"pushed":0,"completed":0,"deleted":0,"detached":0,"relinked":0'; then
+  echo "$(date '+%Y-%m-%d %H:%M:%S') [projects-task-sync] rc $RC: $OUT" >> "$JOBLOG"
+fi
+exit "$RC"
