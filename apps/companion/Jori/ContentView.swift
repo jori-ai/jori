@@ -926,7 +926,8 @@ struct ContentView: View {
                     questions: viewModel.openQuestions.filter { !onScreenQuestionIds.contains($0.id) },
                     reveal: { quoteJumpTarget = $0.id },
                     answer: { beginReply(to: $0) },
-                    dismiss: { viewModel.dismissQuestion($0) }
+                    dismiss: { viewModel.dismissQuestion($0) },
+                    select: { option, q in Task { await viewModel.sendMessage(option.label, replyTo: q.id) } }
                 )
                 .padding(.horizontal, 14)
             }
@@ -2628,6 +2629,8 @@ struct OpenQuestionsTray: View {
     var reveal: (Message) -> Void
     var answer: (Message) -> Void
     var dismiss: (Message) -> Void
+    /// A tapped option: the same pre-composed reply a tap on the card sends.
+    var select: (ChoiceOption, Message) -> Void
     @AppStorage(Install.key("openQuestionsTrayExpanded")) private var expanded = true
 
     var body: some View {
@@ -2658,7 +2661,7 @@ struct OpenQuestionsTray: View {
                             }
                         }
                     }
-                    .frame(maxHeight: 176)
+                    .frame(maxHeight: 280)
                     .fixedSize(horizontal: false, vertical: questions.count <= 3)
                 }
             }
@@ -2669,27 +2672,47 @@ struct OpenQuestionsTray: View {
     }
 
     private func row(_ q: Message) -> some View {
-        HStack(alignment: .center, spacing: 8) {
-            Button { reveal(q) } label: {
-                Text(Self.headline(q.content))
-                    .font(.subheadline)
-                    .lineLimit(2)
-                    .multilineTextAlignment(.leading)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .contentShape(Rectangle())
+        // A question that carries tappable options (a decision card, a choice
+        // prompt) is answered by tapping one right here. The "Answer" button
+        // alone only opens a typed reply, so a card scrolled out of view used to
+        // be answerable only in words (2026-11-10: a "stay in touch?" card).
+        let options = ChoicePrompt.from(metadata: q.metadata)?.options ?? []
+        return VStack(alignment: .leading, spacing: 6) {
+            HStack(alignment: .center, spacing: 8) {
+                Button { reveal(q) } label: {
+                    Text(Self.headline(q.content))
+                        .font(.subheadline)
+                        .lineLimit(2)
+                        .multilineTextAlignment(.leading)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                Button(options.isEmpty ? "Answer" : "Type") { answer(q) }
+                    .font(.caption.weight(.semibold))
+                    .buttonStyle(.borderless)
+                    .foregroundStyle(JoriTheme.staffInk)
+                Button { dismiss(q) } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .font(.system(size: 18))
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Dismiss question")
             }
-            .buttonStyle(.plain)
-            Button("Answer") { answer(q) }
-                .font(.caption.weight(.semibold))
-                .buttonStyle(.borderless)
-                .foregroundStyle(JoriTheme.staffInk)
-            Button { dismiss(q) } label: {
-                Image(systemName: "xmark.circle.fill")
-                    .font(.system(size: 18))
-                    .foregroundStyle(.secondary)
+            ForEach(options) { option in
+                Button { select(option, q) } label: {
+                    Text(option.label)
+                        .font(.callout.weight(.medium))
+                        .multilineTextAlignment(.leading)
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 8)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(Color.primary.opacity(0.06), in: RoundedRectangle(cornerRadius: Radius.row, style: .continuous))
+                        .contentShape(RoundedRectangle(cornerRadius: Radius.row, style: .continuous))
+                }
+                .buttonStyle(PressableStyle())
             }
-            .buttonStyle(.plain)
-            .accessibilityLabel("Dismiss question")
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 7)
