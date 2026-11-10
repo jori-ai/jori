@@ -85,7 +85,7 @@ function parseArgs(argv) {
       if (idx < 0) { console.error(`--inline requires <path>:<cid>`); process.exit(1); }
       a.attachments.push({ path: spec.slice(0, idx), cid: spec.slice(idx + 1) });
     }
-    else if (k === "--from-name") a.fromName = argv[++i];
+    else if (k === "--from-name") { a.fromName = argv[++i]; a.fromNameGiven = true; }
     else if (k === "--from") a.fromAddress = argv[++i];
     else if (k === "--reply-to") a.replyTo = argv[++i];
     else if (k === "--no-reply-to") a.replyTo = null;
@@ -97,13 +97,25 @@ function parseArgs(argv) {
   }
   // Same guard as gmail-action: a markup body is HTML even without --html.
   if (!a.html && a.body && looksLikeHtml(a.body)) a.html = true;
-  // Sign the subject with the team role that owns the sending job ("Ben (CFO): …",
-  // lib/org.cjs): from --sign <job>, or JORI_SIGN_AS (set by cron-run and the fork
-  // runner). Never a reply (its subject belongs to the thread) and never with
-  // JORI_NO_SIGN (system notices whose exact subject other rules match).
+  // The team role that owns the sending job signs it (lib/org.cjs, system/org.md):
+  // from --sign <job>, or JORI_SIGN_AS (set by cron-run and the fork runner).
+  // Mail to the user alone comes FROM the role: "Ben (CFO) <agent address>", the
+  // subject untouched (replies too: the From name is not part of the thread).
+  // Mail to anyone else keeps the assistant's From name (outbound-comms policy:
+  // others always hear from the user's assistant) and, as before, carries the
+  // role in its subject ("Ben (CFO): …"), never on a reply. JORI_NO_SIGN (system
+  // notices whose exact subject other rules match) and an explicit --from-name
+  // turn signing off.
   const signAs = a.signAs || (process.env.JORI_SIGN_AS || process.env.JORI_JOB);
-  if (signAs && a.subject && !a.inReplyTo && !process.env.JORI_NO_SIGN && !/^\s*re:/i.test(a.subject)) { // lang-regex-ok: reply prefix of a subject line
-    try { a.subject = require("../lib/org.cjs").signSubject(a.subject, { job: signAs, intent: signAs }); } catch { /* unsigned is fine */ }
+  if (signAs && !process.env.JORI_NO_SIGN && !a.fromNameGiven) {
+    try {
+      const org = require("../lib/org.cjs");
+      const ctx = { job: signAs, intent: signAs };
+      const rcpts = String(a.to || "").split(",").map((x) => x.trim().toLowerCase()).filter(Boolean);
+      const toOwnerOnly = !!OWNER_ADDRESS && rcpts.length > 0 && rcpts.every((x) => x === OWNER_ADDRESS.toLowerCase());
+      if (toOwnerOnly) a.fromName = org.senderName(ctx) || a.fromName;
+      else if (a.subject && !a.inReplyTo && !/^\s*re:/i.test(a.subject)) a.subject = org.signSubject(a.subject, ctx); // lang-regex-ok: reply prefix of a subject line
+    } catch { /* unsigned is fine */ }
   }
   return a;
 }
@@ -272,7 +284,10 @@ async function send(a) {
     }
   }
 
-  const sender = a.fromName ? `${a.fromName} <${a.fromAddress}>` : a.fromAddress;
+  // Quote a display name with specials: a role's "Sid (IT & Security)" unquoted is
+  // "Sid" plus an RFC 5322 comment, and clients would show just "Sid".
+  const quotedName = (n) => /^[A-Za-z0-9 !#$%&'*+\/=?^_`{|}~-]+$/.test(n) ? n : `"${String(n).replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
+  const sender = a.fromName ? `${quotedName(a.fromName)} <${a.fromAddress}>` : a.fromAddress;
   const payload = {
     api_key: API_KEY,
     sender,

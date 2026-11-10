@@ -40,6 +40,14 @@ test("signing: emails carry name and title, pings the name; the chief of staff's
   assert.equal(org.signSubject("x", {}, { roles: [] }), "x");
 });
 
+test("an email to the user comes from the role that owns the job", () => {
+  assert.equal(org.senderName({ job: "finance-review" }, O), "Ben (CFO)");
+  assert.equal(org.senderName({ job: "projects" }, O), "Ada (Chief of Staff)");
+  assert.equal(org.senderName({ intent: "bank-alert" }, O), "Ben (CFO)");
+  assert.equal(org.senderName({ job: "nobody-owns-this" }, O), null);
+  assert.equal(org.senderName({}, { roles: [] }), null);
+});
+
 test("chart assigns every job and lists the unowned", () => {
   const c = org.chart(O, ["finance-review", "hum", "trigger-hum-daily", "mystery"]);
   assert.deepEqual(c.roles.find((r) => r.id === "cfo").jobs, ["finance-review"]);
