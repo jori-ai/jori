@@ -65,18 +65,21 @@ async function prepare(queueFile, roleId) {
     return `[${m.created_at.slice(0, 16).replace("T", " ")}Z] ${who}: ${String(m.content).slice(0, 1500)}`;
   }).join("\n");
   let members = [roleId];
-  if (conv.startsWith("group:")) {
-    const c = await rest.request(`/rest/v1/jori_conversations?select=members,title&id=eq.${encodeURIComponent(conv)}`);
-    if (c && c[0]) members = c[0].members || members;
-  }
+  const c = await rest.request(`/rest/v1/jori_conversations?select=members,title&id=eq.${encodeURIComponent(conv)}`);
+  if (c && c[0] && Array.isArray(c[0].members) && c[0].members.length) members = [...new Set([...c[0].members, roleId])];
   const others = members.filter((m) => m !== roleId).map((m) => names.get(m) || m);
   const brief = org.briefForRole(roleId, o) || "";
   const s = state()[roleId];
   const idleH = s && s.last_at ? (Date.now() - Date.parse(s.last_at)) / 36e5 : Infinity;
   const resume = s && s.session_id && s.turns < ROTATE_TURNS && idleH < ROTATE_IDLE_H ? s.session_id : null;
+  // A role @mentioned into someone else's conversation joins it mid-thread:
+  // say so, so it reads the messages below before it answers.
+  const owner = conv.startsWith("role:") ? conv.slice(5) : null;
   const where = conv.startsWith("group:")
     ? `a group conversation (${conv}) with ${others.length ? others.join(", ") + " and " : ""}${ceo}`
-    : `your own conversation with ${ceo} (${conv})`;
+    : owner === roleId
+      ? `your own conversation with ${ceo} (${conv})`
+      : `${names.get(owner) || owner}'s conversation with ${ceo} (${conv}), and brought you into it with an @mention. Read the recent messages below first: you are joining mid-thread, and ${ceo} expects you to pick up from them`;
   const task = [
     `ROLE SESSION. You are ${role.name}, ${role.title} on ${ceo}'s team. ${ceo} wrote to you in ${where}.`,
     `Answer as ${role.name}, then deliver it with exactly one call:`,

@@ -518,8 +518,9 @@ struct ContentView: View {
     }
 
     /// Send into the conversation on screen. An @-handle to someone not in it
-    /// brings them in: a one-role conversation becomes a group with them, a
-    /// group gains them, and the message goes there with `mentions` set.
+    /// brings them into THIS conversation (no new group); the message carries
+    /// `mentions`, and the mentioned roles answer here with its recent
+    /// messages as context (bin/role-session prepare).
     private func sendWithMentions(_ text: String, replyTo threadParent: UUID?) {
         let current = viewModel.currentConversation
         let mentioned = team.mentioned(in: text)

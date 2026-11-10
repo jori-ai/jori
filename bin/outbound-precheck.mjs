@@ -273,6 +273,18 @@ const senderLabel = (input.agent || input.sender || "ops").toString().slice(0, 2
 logContext = { intent, sender: senderLabel };
 const supportingData = input.supporting_data || null;
 
+// ─── Evidence mode (bin/speak-gate) ──────────────────────────────────────
+// The think-before-you-speak gate (system/speak-gate.md) reuses everything
+// this file gathers. OUTBOUND_PRECHECK_EVIDENCE=1: gather as usual (the
+// deterministic suppressions above the prompt still decide), then print
+// {decision:"evidence", message, evidence} instead of asking the model.
+// OUTBOUND_PRECHECK_AS_OF=<iso>: read the transcript and calendar as they were
+// at that instant and skip the freshness stage (a replay of a past message
+// asks whether it was right THEN; "true now" is the live gate's question).
+const EVIDENCE_MODE = process.env.OUTBOUND_PRECHECK_EVIDENCE === "1";
+const AS_OF = process.env.OUTBOUND_PRECHECK_AS_OF ? new Date(process.env.OUTBOUND_PRECHECK_AS_OF) : null;
+const NOW_MS = AS_OF && !isNaN(AS_OF) ? AS_OF.getTime() : Date.now();
+
 // ─── Fetch last 8h of phone-channel messages (BOTH roles) ─────────────────
 // 8h covers the common case where the user answered a question (e.g. "already
 // done") and the same question fires again after a quiet-window
@@ -322,10 +334,10 @@ let recentMessages = [];
 const sbKey = readSupabaseKey();
 if (sbKey) {
   try {
-    const since = new Date(Date.now() - 8 * 60 * 60 * 1000).toISOString();
+    const since = new Date(NOW_MS - 8 * 60 * 60 * 1000).toISOString();
     const qs = new URLSearchParams({
       select: "role,content,created_at",
-      "created_at": `gt.${since}`,
+      and: `(created_at.gt.${since},created_at.lt.${new Date(NOW_MS).toISOString()})`,
       channel: "in.(chat,questions)",
       order: "created_at.desc",
       limit: "60",
@@ -356,7 +368,7 @@ if (sbKey) {
 //
 // End of day is 02:00 local tomorrow, so an evening that runs past midnight is covered.
 // Floored at now+2h so a late-night call never gets a SHORTER window than before.
-const now = new Date();
+const now = new Date(NOW_MS);
 const calFrom = new Date(now.getTime() - 2 * 60 * 60 * 1000).toISOString();
 const localNow = new Date(now.toLocaleString("en-US", { timeZone: instance().tz }));
 const localDayEnd = new Date(localNow); localDayEnd.setHours(26, 0, 0, 0); // 02:00 local tomorrow
@@ -643,6 +655,7 @@ try {
 let workingMessage = proposedMessage;
 let freshnessModified = false;
 try {
+  if (AS_OF) throw new Error("as-of replay: freshness skipped");
   const { checkFreshness } = await import("../lib/claim-freshness.mjs");
   const fresh = await checkFreshness({
     text: proposedMessage,
@@ -670,7 +683,10 @@ try {
 let utterancesText = "";
 try {
   const { searchUtterances } = await import("../lib/utterance-store.mjs");
-  const hits = searchUtterances(`${intent} ${workingMessage}`.slice(0, 400), { k: 6 });
+  // As of a replay instant: only what the user had said BY then (an answer
+  // to this very message must not count as having answered it).
+  const hits = searchUtterances(`${intent} ${workingMessage}`.slice(0, 400), { k: AS_OF ? 40 : 6 })
+    .filter((u) => !AS_OF || Date.parse(u.ts || 0) < NOW_MS).slice(0, 6);
   if (hits.length) utterancesText = hits.map(u => `  - ${u.rendered}`).join("\n");
 } catch {}
 
@@ -806,6 +822,25 @@ Reply with ONE LINE of compact JSON, no prose, no markdown fence. Schema:
 {"decision":"send"|"suppress"|"modify","message":"<modified text, only if decision=modify, ≤400 chars>","reason":"<≤140 chars: what in the transcript or memory drove the decision. For protected intents that you decided to send anyway, write ${P.protected_reason_example} or similar.>"}
 
 If decision=send or suppress, omit the "message" field or set it to "". If decision=modify, "message" MUST be non-empty and ≤400 chars.`;
+
+if (EVIDENCE_MODE) {
+  process.stdout.write(JSON.stringify({
+    decision: "evidence",
+    message: workingMessage,
+    freshness_modified: freshnessModified,
+    evidence: {
+      transcript_last_8h: msgBlock,
+      calendar_today: calBlock,
+      supporting_data: supportingData ? JSON.stringify(supportingData).slice(0, 800) : "",
+      authoritative_facts: claimFactsText,
+      owner_said: utterancesText,
+      long_term_memory: wikiContext,
+      acknowledged_topics_48h: resolvedTopicsText,
+      hum_pings_today: sameDayPingsText,
+    },
+  }));
+  process.exit(0);
+}
 
 // "Send it" means "send what survived the freshness stage". Every fail-open
 // path below routes through here, so a truth correction is never lost to a

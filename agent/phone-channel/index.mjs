@@ -695,13 +695,22 @@ function teamRoute(row) {
   const cos = (org.roles.find((r) => r.chief_of_staff) || {}).id || "chief-of-staff";
   const onTeam = new Set(org.roles.map((r) => r.id));
   const conv = row.conversation_id || `role:${cos}`;
+  // The app sends `mentions` as "a,b" (its metadata is string-valued); an
+  // array is accepted too.
+  const raw = row.metadata?.mentions;
+  const mentions = (Array.isArray(raw) ? raw : String(raw || "").split(","))
+    .map((m) => String(m).trim()).filter((m) => onTeam.has(m));
+  // An @mention brings a role into THIS conversation, whatever kind it is: the
+  // mentioned roles answer here, with its recent messages as context (the
+  // user's call, 2026-11-10: no new group). The coordinator answers too only
+  // when it is mentioned.
+  if (mentions.length) return { roles: mentions.filter((m) => m !== cos), coordinator: mentions.includes(cos) };
   if (conv.startsWith("role:")) {
     const id = conv.slice(5);
     if (id === cos || !onTeam.has(id)) return { roles: [], coordinator: true };
     return { roles: [id], coordinator: false };
   }
-  const mentions = Array.isArray(row.metadata?.mentions) ? row.metadata.mentions.filter((m) => onTeam.has(m)) : [];
-  return { roles: mentions.filter((m) => m !== cos), coordinator: mentions.length === 0 || mentions.includes(cos) };
+  return { roles: [], coordinator: true };
 }
 
 function enqueueRoleSession(row, roles) {

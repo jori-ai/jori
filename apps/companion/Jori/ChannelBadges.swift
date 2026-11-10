@@ -196,9 +196,15 @@ final class TeamStore: ObservableObject {
         ConversationID.roleId(conversationId) == Self.improvementsRole ? pendingImprovements : 0
     }
 
+    /// What one conversation's red badge counts: unread messages, unanswered
+    /// questions, and approvals waiting for Face ID — one number, no icons.
+    func badgeCount(_ conversationId: String) -> Int {
+        unread(conversationId) + openQuestions(conversationId) + waiting(conversationId)
+    }
+
     /// Everything waiting on the user, for the badge on the way back to the list.
     var total: Int {
-        visibleConversations.reduce(0) { $0 + unread($1.id) + openQuestions($1.id) + waiting($1.id) }
+        visibleConversations.reduce(0) { $0 + badgeCount($1.id) }
     }
 
     /// Badge text, capped so a runaway count can't blow out the toolbar.
@@ -437,19 +443,20 @@ final class TeamStore: ObservableObject {
         return id
     }
 
-    /// Add roles to a conversation. A group gains them; a one-role
-    /// conversation becomes a group with everyone (its own history stays where
-    /// it is). Returns the conversation to continue in.
+    /// Bring roles into the conversation on screen (an @mention, or "Add
+    /// someone"). They join THIS conversation — a role's own conversation
+    /// included — and read its recent messages before they answer; no new
+    /// group is started (the user's call, 2026-11-10). Returns the conversation
+    /// to continue in, which is always the same one.
     func add(_ roleIds: [String], to conversationId: String) async -> String {
         let current = memberIds(of: conversationId)
         let missing = roleIds.filter { !current.contains($0) }
         guard !missing.isEmpty else { return conversationId }
-        if ConversationID.isGroup(conversationId),
-           let c = conversations.first(where: { $0.id == conversationId }) {
-            await write(ConversationRow(id: c.id, kind: "group", title: c.title, members: c.members + missing, created_by: "user"))
-            return c.id
-        }
-        return await conversation(with: current + missing) ?? conversationId
+        let c = conversations.first(where: { $0.id == conversationId })
+        let kind = c?.kind ?? (ConversationID.isGroup(conversationId) ? "group" : "role")
+        await write(ConversationRow(id: conversationId, kind: kind, title: c?.title,
+                                    members: current + missing, created_by: "user"))
+        return conversationId
     }
 
     func renameConversation(_ conversationId: String, to title: String) async {
@@ -581,6 +588,7 @@ struct ConversationRowView: View {
         let unread = team.unread(conversation.id)
         let questions = team.openQuestions(conversation.id)
         let waiting = team.waiting(conversation.id)
+        let badge = team.badgeCount(conversation.id)
         HStack(alignment: .top, spacing: 12) {
             TeamAvatar(members: members, size: 42)
             VStack(alignment: .leading, spacing: 2) {
@@ -600,11 +608,8 @@ struct ConversationRowView: View {
                         .foregroundStyle(.secondary)
                         .lineLimit(2)
                     Spacer(minLength: 4)
-                    VStack(alignment: .trailing, spacing: 3) {
-                        if waiting > 0 { countPill(waiting, color: JoriTheme.staff, symbol: "faceid") }
-                        if questions > 0 { countPill(questions, color: .red, symbol: "questionmark") }
-                        if unread > 0 { countPill(unread, color: JoriTheme.cobalt, symbol: nil) }
-                    }
+                    // One red badge, only when something is waiting.
+                    if badge > 0 { ChannelBadgeBubble(count: badge) }
                 }
             }
         }
@@ -629,17 +634,6 @@ struct ConversationRowView: View {
             (Text(m.name).font(.headline)
              + Text(m.title.isEmpty ? "" : "  \(m.title)").font(.subheadline).foregroundColor(.secondary))
         }
-    }
-
-    private func countPill(_ n: Int, color: Color, symbol: String?) -> some View {
-        HStack(spacing: 2) {
-            if let symbol { Image(systemName: symbol).font(.system(size: 8, weight: .bold)) }
-            Text(TeamStore.label(n)).font(.system(size: 11, weight: .bold)).monospacedDigit()
-        }
-        .foregroundStyle(.white)
-        .padding(.horizontal, 6)
-        .frame(minHeight: 18)
-        .background(color, in: Capsule())
     }
 
     static func when(_ date: Date) -> String {

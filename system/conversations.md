@@ -23,9 +23,10 @@ Triggers: a row that names only a channel (or only a `sender`) is filed in the m
 
 phone-channel (`teamRoute`) decides who answers a user message:
 
-- in `role:<coordinator>` (or no conversation): the chat agent, as today;
+- a message that @mentions roles (`metadata.mentions`, "a,b", set by the app from `@name`), in ANY conversation: each mentioned role answers in that same conversation on its own session; the coordinator answers too only when mentioned. The mention brings them into the conversation (they join its `members`); no new group is started (the user's call, 2026-11-10). A role joining someone else's conversation is told so, and reads its last 30 messages before answering;
+- otherwise, in `role:<coordinator>` (or no conversation): the chat agent, as today;
 - in `role:<id>`: that role's own session;
-- in a group: every role in the message's `metadata.mentions` (set by the app from `@name`), each on its own session; the coordinator answers too when it is mentioned or nobody is.
+- in a group with no mention: the coordinator.
 
 A role's message is queued at `data/role-queue/pending/<time>-<message id>.json`; launchd `ai.claude.role-session` (QueueDirectories, from the role-chief-of-staff plugin) runs `plugins/role-chief-of-staff/bin/role-session-trigger`, which for each role runs `agent/ops-agent/jobs/role-session.md` through `lib/run-ephemeral-opus.sh` on Sonnet at medium effort, with a task built by `bin/role-session prepare` (the role's specialization, the conversation's last 30 messages with names, the new message). The role answers with `bin/role-session reply` (sender = the role, a push titled with its name and title).
 
@@ -33,4 +34,4 @@ A role's message is queued at `data/role-queue/pending/<time>-<message id>.json`
 
 ## The app
 
-`apps/companion`: a conversation list (each row: names with their role titles, the last message, unread and unanswered-question counts), a conversation view filtered by `conversation_id` with the sender's name and title on each message in a group, `@name` autocomplete that adds a role (and sets `metadata.mentions`), new groups, and renaming a role's name and title. The channel menu is gone: channels are roles' conversations.
+`apps/companion`: a conversation list (each row: names with their role titles, the last message, and a single red badge counting unread messages, unanswered questions and Face ID approvals — no icons, nothing when nothing is waiting), a conversation view filtered by `conversation_id` with the sender's name and title on each message in a group, `@name` autocomplete that brings a role into the conversation on screen (and sets `metadata.mentions`), new groups from the new-conversation sheet, and renaming a role's name and title. The channel menu is gone: channels are roles' conversations.
