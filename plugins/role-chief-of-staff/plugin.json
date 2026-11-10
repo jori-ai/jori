@@ -39,7 +39,9 @@
       "hum-*",
       "session",
       "action-approval-poll",
-      "speak-gate-shadow"
+      "speak-gate-shadow",
+      "role-session",
+      "team-sync"
     ],
     "intents": [
       "hum",
