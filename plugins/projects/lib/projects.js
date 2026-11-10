@@ -52,6 +52,9 @@ const DEFAULTS = {
   // weekly allowance the lane may spend in 7 days, and tasks per night.
   work_weekly_share: 0.05,
   work_tasks_per_night: 2,
+  // Money amounts (costs, prices, budgets, balances) may appear on project pages
+  // and task titles. Off by default; account numbers and health details never do.
+  money_on_pages: false,
 };
 
 const SECTION_START = "<!-- projects:start -->";
@@ -268,8 +271,11 @@ function readRepos(cfg, now = Date.now()) {
   return { since, repos };
 }
 
-function gather({ now = Date.now(), cfg = settings(), gog = gogJson, ws = null } = {}) {
-  const bundle = { generated_at: new Date(now).toISOString(), date: isoDay(now), settings: cfg, errors: {} };
+function gather({ now = Date.now(), cfg = settings(), gog = gogJson, ws = null, deepAll = false } = {}) {
+  // --deep-all: an on-demand run that deep-reviews every live project, looking
+  // above all for work Jori can take on (jobs/projects.md § Deep review).
+  if (deepAll) cfg = { ...cfg, deep_reviews_per_night: 1000 };
+  const bundle = { generated_at: new Date(now).toISOString(), date: isoDay(now), settings: cfg, errors: {}, deep_all: !!deepAll };
   const run = (key, fn) => {
     try { bundle[key] = fn(); } catch (e) { bundle[key] = null; bundle.errors[key] = String(e.message || e).slice(0, 300); }
   };

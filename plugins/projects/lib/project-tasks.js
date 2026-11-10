@@ -133,8 +133,9 @@ function addTask(ledger, f, { now = Date.now() } = {}) {
   if (!OWNERS.includes(owner)) throw new Error(`owner must be ${OWNERS.join("|")}`);
   if (!f.project) throw new Error("--project is required");
   if (!f.title || !String(f.title).trim()) throw new Error("--title is required");
-  if (owner === "user" && !isDay(f.due)) throw new Error("a task for the user needs --due YYYY-MM-DD (every task on their list has a date)");
-  if (f.due != null && !isDay(f.due)) throw new Error("--due must be YYYY-MM-DD");
+  // Every task has a date (the user's rule): when the user does it, when Jori
+  // delivers it, when the other person is expected to.
+  if (!isDay(f.due)) throw new Error("--due YYYY-MM-DD is required: every task has a date");
   if (owner === "other" && !f.who) throw new Error("a task for someone else needs --who");
   const mode = f.jori || (owner === "jori" ? "autonomous" : "no");
   if (!JORI_MODES.includes(mode)) throw new Error(`--jori must be ${JORI_MODES.join("|")}`);
@@ -184,7 +185,7 @@ function updateTask(ledger, id, f, { now = Date.now() } = {}) {
     if (!OWNERS.includes(f.owner)) throw new Error(`owner must be ${OWNERS.join("|")}`);
     t.owner = f.owner;
   }
-  if (t.owner === "user" && t.status === "open" && !isDay(t.due)) throw new Error("a task for the user needs a due date");
+  if (t.status === "open" && !isDay(t.due)) throw new Error("every task needs a due date");
   if (f.who != null) t.who = f.who;
   if (f.why != null) t.why = f.why;
   if (f.page_title != null) t.page_title = f.page_title || null;
@@ -218,7 +219,7 @@ function reopenTask(ledger, id, { by, due, now = Date.now() } = {}) {
   t.status = "open";
   t.closed_at = null; t.closed_by = null; t.close_note = null;
   if (due) t.due = due;
-  if (t.owner === "user" && !isDay(t.due)) throw new Error("a task for the user needs --due");
+  if (!isDay(t.due)) throw new Error("every task needs --due");
   if (t.gtask) t.gtask.detached = false;
   stamp(t, by, now);
   return t;

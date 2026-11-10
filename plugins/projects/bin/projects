@@ -2,7 +2,7 @@
 // projects — project pages (plugins/projects, jobs/projects.md).
 //
 // Usage:
-//   projects gather [--out <file>]       Calendar + Google Tasks + wiki + repo activity
+//   projects gather [--out <file>] [--deep-all]   Calendar + Google Tasks + wiki + repo activity
 //                                        → one bundle (default data/projects/bundle.json).
 //                                        Prints the counts. Network: run it un-sandboxed.
 //   projects list [--json]               Every project page (entity: project) and the
@@ -241,7 +241,7 @@ function taskCmd(sub) {
 function main() {
   if (cmd === "gather") {
     const out = flag("out") || path.join(installTools(), "data", "projects", "bundle.json");
-    const b = pr.gather();
+    const b = pr.gather({ deepAll: !!flag("deep-all") });
     fs.mkdirSync(path.dirname(out), { recursive: true });
     const tmp = `${out}.tmp.${process.pid}`;
     fs.writeFileSync(tmp, JSON.stringify(b) + "\n"); // compact: one turn reads it whole

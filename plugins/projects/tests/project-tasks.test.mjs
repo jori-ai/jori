@@ -41,16 +41,17 @@ test("a task for the user needs a date; Jori's tasks need a work mode; duplicate
   assert.match(t.id, /^pt-[0-9a-f]{6}$/);
   assert.equal(t.jori.mode, "no");
   assert.throws(() => pt.addTask(l, { project: "project_x", title: "book the restaurant for the anniversary ", owner: "user", due: "2027-02-01" }), /already open/);
-  const j = pt.addTask(l, { project: "project_x", title: "Draft the menu options", owner: "jori", size: "small" }, { now: NOW });
+  const j = pt.addTask(l, { project: "project_x", title: "Draft the menu options", owner: "jori", size: "small", due: "2026-11-12" }, { now: NOW });
   assert.equal(j.jori.mode, "autonomous");
-  assert.throws(() => pt.addTask(l, { project: "project_x", title: "Y", owner: "jori", jori: "no" }), /autonomous or needs_ok/);
-  assert.throws(() => pt.addTask(l, { project: "project_x", title: "Z", owner: "other" }), /who/);
+  assert.throws(() => pt.addTask(l, { project: "project_x", title: "Y", owner: "jori", jori: "no", due: "2026-11-12" }), /autonomous or needs_ok/);
+  assert.throws(() => pt.addTask(l, { project: "project_x", title: "Undated", owner: "jori" }), /every task has a date/);
+  assert.throws(() => pt.addTask(l, { project: "project_x", title: "Z", owner: "other", due: "2026-11-12" }), /who/);
 });
 
 test("sync puts a new user task on the list with its date and the marker; Jori's own tasks stay off it", () => {
   const l = fresh();
   const t = pt.addTask(l, { project: "project_x", title: "Get movie tickets for the family weekend", owner: "user", due: "2026-11-14", why: "Family chat" }, { now: NOW });
-  pt.addTask(l, { project: "project_x", title: "Draft plan", owner: "jori" }, { now: NOW });
+  pt.addTask(l, { project: "project_x", title: "Draft plan", owner: "jori", due: "2026-11-12" }, { now: NOW });
   const g = fakeList();
   const r = pt.syncGoogle(l, g, { projectNames: { project_x: "Family weekend" }, now: NOW });
   assert.deepEqual(r.created, [t.id]);
@@ -143,10 +144,11 @@ test("slipped lists the user's overdue tasks, once a week each", () => {
 test("the page's Tasks section is written by code and goes after What you might need", () => {
   const l = fresh();
   pt.addTask(l, { project: "p", title: "Book the restaurant for the anniversary", owner: "user", due: "2027-02-01" }, { now: NOW });
-  const j = pt.addTask(l, { project: "p", title: "Shortlist restaurants", owner: "jori", size: "small" }, { now: NOW });
+  const j = pt.addTask(l, { project: "p", title: "Shortlist restaurants", owner: "jori", size: "small", due: "2026-11-12" }, { now: NOW });
   pt.recordWork(l, j.id, { kind: "doc", link: "https://docs.example/1", summary: "Six places" }, { now: NOW });
   const md = pt.renderTasksSection(l, "p", { now: NOW });
-  assert.match(md, /^## Tasks\n- \[ \] Book the restaurant for the anniversary · \S+ · due 2027-02-01 · pt-/);
+  assert.match(md, /^## Tasks\n- \[ \] Shortlist restaurants · Jori · due 2026-11-12/);
+  assert.match(md, /\n- \[ \] Book the restaurant for the anniversary · \S+ · due 2027-02-01 · pt-/);
   assert.ok(md.includes("Jori's doc is ready for review (https://docs.example/1)"));
   const section = "## Goal\nG\n\n## What you might need\n- x\n\n## Tasks\n- stale\n\n## Coming up\n- y";
   const out = pt.injectTasks(section, md);
@@ -159,7 +161,7 @@ test("the page's Tasks section is written by code and goes after What you might 
 
 test("work queue: Jori's own tasks and approved ones, once a night, two attempts at most", () => {
   const l = fresh();
-  const a = pt.addTask(l, { project: "p", title: "Draft A", owner: "jori", size: "small" }, { now: NOW });
+  const a = pt.addTask(l, { project: "p", title: "Draft A", owner: "jori", size: "small", due: "2026-11-12" }, { now: NOW });
   const b = pt.addTask(l, { project: "p", title: "Email the contractor", owner: "user", due: "2026-11-20", jori: "needs_ok" }, { now: NOW });
   assert.deepEqual(pt.workQueue(l, { now: NOW }).map((t) => t.id), [a.id]);
   assert.throws(() => pt.approveWork(l, b.id, {}), /quote/);
