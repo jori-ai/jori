@@ -23,7 +23,9 @@
 //                     [--due YYYY-MM-DD] [--who "<name>"] --why "<evidence>"
 //                     [--jori no|autonomous|needs_ok] [--size small|medium|large] [--plan "<how>"] [--by <who>]
 //                                        A task for the user needs --due (it goes on their task list).
-//   projects task update <pt-id> [--title] [--due] [--owner] [--who] [--why] [--jori] [--size] [--plan] [--by]
+//   projects task update <pt-id> [--title] [--due] [--owner] [--who] [--why] [--jori] [--size] [--plan] [--page-title] [--by]
+//                                        --page-title: how the task reads on the wiki page when its own title
+//                                        carries an amount or a health detail (the user's list keeps their words).
 //   projects task done <pt-id> --note "<what shows it is done>" [--by]
 //   projects task drop <pt-id> --note "<why>" [--by]
 //   projects task reopen <pt-id> [--due YYYY-MM-DD] [--by]
@@ -118,7 +120,7 @@ function taskCmd(sub) {
     if (pr.frontmatterOf(row).entity !== "project") die(`${project} is not a project page`);
     const t = pt.withLock((l) => pt.addTask(l, {
       project, title: str("title"), owner: str("owner"), due: str("due"), who: str("who"), why: str("why"),
-      jori: str("jori"), size: str("size"), plan: str("plan"), by,
+      jori: str("jori"), size: str("size"), plan: str("plan"), page_title: str("page-title"), by,
     }));
     console.log(JSON.stringify({ ...brief(t), refreshed: refresh([project]) }));
     return 0;
@@ -126,7 +128,7 @@ function taskCmd(sub) {
 
   if (sub === "update") {
     if (!id) die("task update needs a task id");
-    const f = { title: str("title"), owner: str("owner"), who: str("who"), why: str("why"), jori: str("jori"), size: str("size"), plan: str("plan"), by };
+    const f = { title: str("title"), owner: str("owner"), who: str("who"), why: str("why"), jori: str("jori"), size: str("size"), plan: str("plan"), page_title: str("page-title"), by };
     if (str("due")) f.due = str("due");
     for (const k of Object.keys(f)) if (f[k] === undefined) delete f[k];
     const t = pt.withLock((l) => pt.updateTask(l, id, f));
@@ -163,7 +165,7 @@ function taskCmd(sub) {
     const t = pt.withLock((l) => {
       if (Object.values(l.tasks).some((x) => x.gtask && x.gtask.id === gid)) throw new Error(`Google task ${gid} is already linked`);
       const due = g.due || pt.today();
-      const nt = pt.addTask(l, { project, title: g.title, owner: "user", due, why: str("why"), by: by || "projects" });
+      const nt = pt.addTask(l, { project, title: g.title, owner: "user", due, why: str("why"), page_title: str("page-title"), by: by || "projects" });
       nt.gtask = { id: gid, list: g.list_id || cfg.tasks_list, synced: { title: g.title, due: g.due || null, status: "needsAction" }, synced_at: new Date().toISOString(), detached: false, adopted: true };
       // A task with no date gets one on the next sync (every project task has a date).
       if (!g.due) nt.gtask.synced.due = null;

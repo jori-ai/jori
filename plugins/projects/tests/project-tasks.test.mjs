@@ -194,3 +194,13 @@ test("the ledger file round-trips under the lock", () => {
   assert.equal(pt.load(file).tasks[t.id].title, "A");
   assert.ok(!fs.existsSync(`${file}.lock`));
 });
+
+test("a page title keeps an amount off the page while the user's list keeps their words", () => {
+  const l = pt.emptyLedger();
+  const t = pt.addTask(l, { project: "p", title: "Move $2k into the safe", owner: "user", due: "2026-11-17", page_title: "Move cash into the safe" }, { now: NOW });
+  const md = pt.renderTasksSection(l, "p", { now: NOW });
+  assert.ok(md.includes("Move cash into the safe") && !md.includes("$2k"));
+  assert.equal(l.tasks[t.id].title, "Move $2k into the safe");
+  pt.updateTask(l, t.id, { page_title: "" }, { now: NOW });
+  assert.ok(pt.renderTasksSection(l, "p", { now: NOW }).includes("$2k"));
+});

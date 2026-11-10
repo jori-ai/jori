@@ -82,11 +82,13 @@ Granularity: one page per thing the user would name as one effort. A product wit
 $P task list --project <id> --all          # this project's tasks
 ```
 
+**Before anything else, check the ledger's tasks for page-safe titles:** any open task whose title (and no `page_title`) carries an amount or health detail gets one now with `$P task update <pt-id> --page-title "…"`.
+
 **Every live project, every night** (`active` and `upcoming`), from the bundle:
 
 1. **Close what is done**, with the evidence in `--note`: a linked Google Task the user completed is closed by the sync already; close the rest when a calendar event took place, a commit or merged PR shows it, a booking or confirmation is in memory, the dream recorded it (`(dream: …)` lines), or the project itself is done.
    `$P task done <pt-id> --note "<what shows it>"`. A need that went away: `$P task drop <pt-id> --note "<why>"`.
-2. **Adopt the user's own tasks** that belong to the project (`tasks.tasks[]` with `ledger_id: null` whose subject is clearly this project): `$P task adopt --gtask <id> --project <pid> --why "<evidence>"`. Never add a second task for something already on their list. A task of theirs with no date gets one on the next sync (today); say so in the run log.
+2. **Adopt the user's own tasks** that belong to the project (`tasks.tasks[]` with `ledger_id: null` whose subject is clearly this project): `$P task adopt --gtask <id> --project <pid> --why "<evidence>"`. Their title is their own words and stays theirs on their list; when it carries an amount, a balance, a health detail or anything else a page must not show, add `--page-title "<the same task without it>"` ("Move cash into the safe", not the sum): the page shows that instead. Never add a second task for something already on their list. A task of theirs with no date gets one on the next sync (today); say so in the run log.
 3. **Add what the project needs next.** Every live project has **at least one open next step** with an owner and, for the user, a date. Add a task for each concrete need on the page that has none, and for each `(gap)` someone can act on:
    ```bash
    $P task add --project <pid> --owner user --due <YYYY-MM-DD> \
@@ -102,7 +104,7 @@ $P task list --project <id> --all          # this project's tasks
 4. **Re-date** a task whose date no longer fits (the project's date moved, a dependency is late): `$P task update <pt-id> --due <date>`. Never quietly push a slipped task's date: that is the user's call (Step 7).
 5. **Close Jori's reviewed work**: a Jori task in state `review` whose "Review Jori's …" task the user completed, or whose PR merged, is `done`; if the user asked for changes (chat, a PR comment), reopen it with `--plan` naming the change.
 
-**Deep review** — for each project in `ledger.deep_review` (a rotation, so every project gets this about once a week), stop and think it through before writing: what is the goal, what is the critical path to it, what is the **single next action that moves it most**, what is blocked and on whom, what could go wrong given the dates. Then make the tasks say so: the critical next step exists with a sensible date; a blocked one names the blocker; a risk worth acting on becomes a task. Write one dated line in `## Lately` only if the review changed the plan. Then `$P reviewed <pid>`.
+**Deep review** — for each project in `ledger.deep_review` (a rotation, so every project gets this about once a week), stop and think it through before writing: what is the goal, what is the critical path to it, what is the **single next action that moves it most**, what is blocked and on whom, what could go wrong given the dates. Then make the tasks say so: the critical next step exists with a sensible date; a blocked one names the blocker; a risk worth acting on becomes a task. **And ask what the team can take off the user's plate:** for each open task of the user's on these projects, is there a piece Jori could do now without anyone else (research the options, draft the document or message, compare the quotes, write the code)? If so, add it as its own `--owner jori` task (`autonomous`, or `needs_ok` when it touches another person or is large) with a `--plan`, so the user's task gets easier and `project-work` has real work. A deep review that finds nothing for Jori to do says why in the run log. Write one dated line in `## Lately` only if the review changed the plan. Then `$P reviewed <pid>`.
 
 Rules: no health or financial specifics in a task title or `--why` (they show on a phone: "Pay the deposit for the villa", never an amount); no contact details; at most 8 new tasks per project a night (most important first); the dream may also close and add tasks from the day (`jobs/dream.md` Step 4.8).
 
