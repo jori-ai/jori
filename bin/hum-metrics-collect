@@ -4,6 +4,18 @@ hum improvement loop. Reads tick traces, reactions, and the cross-lane
 suggestion ledger; writes one row per local day to hum-metrics-state.json.daily[];
 detects decay events; dispatches qualitative-diagnosis questions on trigger.
 
+Each row also counts the questions routed through the question router
+(bin/question-route) that day (`questions`, from question-route-log.jsonl;
+not every question sent: a held question is logged when held and again on
+release, and one posted straight to the Questions channel is never logged)
+and what the resolve-first gate did with hum messages (`resolve_first`, from
+hum-resolve-first-log.jsonl: checked, by verdict/action/kind/lane, and how
+many it caught as already answered). The watch lane dominates `caught`
+(re-proposed watch matches), so read it by lane and by
+`caught_distinct_keys`. Both are counts of structured fields, there for the
+weekly review and hum-review to read; an unreadable log, or one that starts
+after the day, leaves the field null.
+
 Canonical design: data/hum-improvement-loop.md. Read that before
 editing this script.
 
@@ -76,6 +88,11 @@ QUAL_COOLDOWN = os.path.join(DATA, "hum-qual-cooldown.json")
 QUAL_STARVATION = os.path.join(DATA, "hum-qual-starvation.json")
 HUM_LEARNINGS = os.path.join(DATA, "hum-learnings.jsonl")
 HUM_IMPROVEMENT_IDEAS = os.path.join(DATA, "hum-improvement-ideas.jsonl")
+# Question accounting. Written by lib/question-route.mjs (one row per message
+# the question router routed or held) and by lib/hum-resolve-first.mjs (one
+# row per hum message the gate checked).
+QUESTION_ROUTE_LOG = os.path.join(DATA, "question-route-log.jsonl")
+RESOLVE_FIRST_LOG = os.path.join(DATA, "hum-resolve-first-log.jsonl")
 
 # Reaction-token weights. The hum-improvement-loop's north star.
 TOKEN_WEIGHTS = {
@@ -407,7 +424,229 @@ def ping_lanes_for_day(feedback, start, end):
     return out
 
 
-def collect_for_day(target_date, tz, runs, feedback, history):
+# ─── Question accounting ──────────────────────────────────────────────────
+# How many questions the question router routed, and how many hum messages
+# the resolve-first gate (docs/hum-resolve-first.md) caught as already
+# answered. Counts of structured fields only (intent, lane, channel, urgent,
+# kind, verdict, action, still_question). Whether two questions are about the
+# same thing is a language judgment (Rule #0b): it is not made here, so there
+# is no re-ask rate. These fields are there for the weekly review and
+# hum-review to read as denominators; counting the complaints stays a model's
+# judgment.
+
+def load_jsonl_or_none(path):
+    """Dict rows of a JSONL log, or None when the file is missing or cannot
+    be read (unknown, which a caller must keep apart from an empty day). A
+    malformed line or a non-dict row is skipped."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            lines = f.readlines()
+    except (OSError, UnicodeDecodeError, ValueError):
+        return None
+    rows = []
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            r = json.loads(line)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if isinstance(r, dict):
+            rows.append(r)
+    return rows
+
+
+def log_covers_day(rows, end):
+    """False when the log's earliest dated row is after the day's end: the log
+    did not exist yet (or was rotated past it), so a zero would be a guess. A
+    log with no dated row at all covers every day (nothing was logged)."""
+    first = None
+    for r in rows:
+        dt = parse_iso(r.get("ts"))
+        if dt is not None and (first is None or dt < first):
+            first = dt
+    return first is None or first <= end
+
+
+def question_family(intent, lane):
+    """The intent's part before its first ':' ('hum', 'decision', 'p1-email');
+    the lane when the row has no intent; 'unknown' when it has neither."""
+    if isinstance(intent, str) and intent.strip():
+        return intent.split(":", 1)[0].strip() or "unknown"
+    if isinstance(lane, str) and lane.strip():
+        return lane.strip()
+    return "unknown"
+
+
+def questions_for_day(rows, start, end):
+    """Questions routed through the question router (bin/question-route) that
+    local day, from question-route-log.jsonl, or None when the log is
+    unreadable (rows is None) or starts after the day.
+
+    The router runs after the other send gates (precheck, resolve-first,
+    freshness). This is not a count of questions sent: a held question is
+    logged when held and again on release, and a question posted straight to
+    the Questions channel is never logged. `question: null` marks a message
+    whose words check failed: it stayed in chat as a non-question and is
+    counted apart (`check_failed`). `found_by_words` counts questions the
+    sender did not label as one (`detected: "text"`).
+    """
+    if rows is None or not log_covers_day(rows, end):
+        return None
+    out = {"total": 0, "by_channel": {"chat": 0, "questions": 0}, "urgent": 0,
+           "by_family": {}, "hum": 0, "hum_by_lane": {}, "found_by_words": 0,
+           "check_failed": 0}
+    for r in rows:
+        if not in_window(r.get("ts"), start, end):
+            continue
+        q = r.get("question", True)
+        if q is None:
+            out["check_failed"] += 1
+            continue
+        if q is not True:
+            continue
+        out["total"] += 1
+        ch = r.get("channel") if isinstance(r.get("channel"), str) and r.get("channel") else "unknown"
+        out["by_channel"][ch] = out["by_channel"].get(ch, 0) + 1
+        if r.get("urgent") is True:
+            out["urgent"] += 1
+        intent, lane = r.get("intent"), r.get("lane")
+        fam = question_family(intent, lane)
+        out["by_family"][fam] = out["by_family"].get(fam, 0) + 1
+        if isinstance(intent, str) and intent.startswith("hum:"):
+            out["hum"] += 1
+            # "hum:<lane>:<branch>": the row's lane, else the intent's.
+            hl = (lane if isinstance(lane, str) and lane
+                  else intent.split(":")[1] or "unknown")
+            out["hum_by_lane"][hl] = out["hum_by_lane"].get(hl, 0) + 1
+        if r.get("detected") == "text":
+            out["found_by_words"] += 1
+    return out
+
+
+RESOLVE_FIRST_VERDICTS = ("resolved", "partial", "unresolved", "covered",
+                          "nothing_to_resolve", "error")
+RESOLVE_FIRST_ACTIONS = ("drop", "rewrite", "send")
+
+
+def resolve_first_caught(r):
+    """Did the gate catch this hum message as already answered?
+
+    Caught = the records settled it (verdict `resolved`, or `covered` by a
+    standing review) AND the user was not asked it: the message was not sent
+    (action `drop`) or went out as the answer instead (action `rewrite` with
+    `still_question` not true, an FYI). A `partial` rewrite still asks (only
+    the gap: counted as `narrowed`), and `unresolved`, `nothing_to_resolve`
+    and `error` reach the user as written or as the specific unknown. For
+    kind `question` this is the same set as `isSuppressedQuestion` /
+    `questionStats().answered_by_records` in lib/hum-resolve-first.mjs, so
+    this count and `hum-resolve-first questions` agree."""
+    if r.get("verdict") not in ("resolved", "covered"):
+        return False
+    action = r.get("action")
+    return action == "drop" or (action == "rewrite" and r.get("still_question") is not True)
+
+
+def resolve_first_for_day(rows, start, end):
+    """What the resolve-first gate did with the local day's hum messages, from
+    hum-resolve-first-log.jsonl, or None when the log is unreadable (rows is
+    None) or starts after the day.
+
+    `checked` counts gate decisions (one per send attempt: a message re-sent
+    later is checked again, so `distinct_keys` counts the distinct
+    `dedup_key`s among them, and `caught_distinct_keys`, overall and per lane,
+    the distinct keys among the caught ones). The watch lane dominates
+    `caught` (re-proposed watch matches), so read it by lane and by
+    `caught_distinct_keys`. `by_kind` splits by the log's own `kind`
+    (`question`, or `ping` for a comment) and lists only the verdicts and
+    actions that occurred. Dry-run rows (`--dry-run` by hand) are not hum
+    sends and are left out.
+    """
+    if rows is None or not log_covers_day(rows, end):
+        return None
+
+    def blank():
+        return {"checked": 0, "caught": 0, "narrowed": 0, "by_verdict": {}, "by_action": {}}
+
+    # Top level: every known verdict/action, so the shape is stable. Under
+    # by_kind: only those that occurred (the row stays small; it is read back
+    # many days at a time).
+    out = {"checked": 0, "caught": 0, "caught_distinct_keys": 0, "narrowed": 0,
+           "by_verdict": {v: 0 for v in RESOLVE_FIRST_VERDICTS},
+           "by_action": {a: 0 for a in RESOLVE_FIRST_ACTIONS}}
+    out.update({"by_kind": {}, "by_lane": {}, "distinct_keys": 0,
+                "looked_further": 0, "settled_by_looking": 0})
+    keys, caught_keys = set(), set()
+    lane_caught_keys = defaultdict(set)
+    for r in rows:
+        if r.get("dry_run"):
+            continue
+        if not in_window(r.get("ts"), start, end):
+            continue
+        verdict = r.get("verdict") if isinstance(r.get("verdict"), str) and r.get("verdict") else "unknown"
+        action = r.get("action") if isinstance(r.get("action"), str) and r.get("action") else "unknown"
+        kind = r.get("kind") if isinstance(r.get("kind"), str) and r.get("kind") else "unknown"
+        lane = r.get("lane") if isinstance(r.get("lane"), str) and r.get("lane") else "unknown"
+        caught = resolve_first_caught(r)
+        narrowed = verdict == "partial" and action == "rewrite"
+        key = str(r.get("dedup_key")) if r.get("dedup_key") else None
+        k = out["by_kind"].get(kind)
+        if k is None:
+            k = out["by_kind"][kind] = blank()
+        for b in (out, k):
+            b["checked"] += 1
+            b["caught"] += int(caught)
+            b["narrowed"] += int(narrowed)
+            b["by_verdict"][verdict] = b["by_verdict"].get(verdict, 0) + 1
+            b["by_action"][action] = b["by_action"].get(action, 0) + 1
+        ln = out["by_lane"].setdefault(lane, {"checked": 0, "caught": 0,
+                                              "caught_distinct_keys": 0, "narrowed": 0,
+                                              "sent_as_written": 0})
+        ln["checked"] += 1
+        ln["caught"] += int(caught)
+        ln["narrowed"] += int(narrowed)
+        ln["sent_as_written"] += int(action == "send")
+        if key:
+            keys.add(key)
+            if caught:
+                caught_keys.add(key)
+                lane_caught_keys[lane].add(key)
+        deep = as_dict(r.get("deep"))
+        if deep.get("ran"):
+            out["looked_further"] += 1
+            if deep.get("settled") and caught:
+                out["settled_by_looking"] += 1
+    out["distinct_keys"] = len(keys)
+    out["caught_distinct_keys"] = len(caught_keys)
+    for lane, ln in out["by_lane"].items():
+        ln["caught_distinct_keys"] = len(lane_caught_keys.get(lane, ()))
+    return out
+
+
+def _safe_count(fn, rows, start, end):
+    """fn(rows, start, end), or None if it raises: a bad row in either log
+    can cost these fields (unknown), never the day's row."""
+    try:
+        return fn(rows, start, end)
+    except Exception:
+        return None
+
+
+def _safe_load(path):
+    """load_jsonl_or_none(path), or None if anything at all raises: a log
+    that cannot be loaded costs its field (unknown), never the day's row."""
+    try:
+        return load_jsonl_or_none(path)
+    except Exception:
+        return None
+
+
+def collect_for_day(target_date, tz, runs, feedback, history,
+                    question_rows=None, resolve_rows=None):
+    # question_rows / resolve_rows: the question-route and resolve-first logs
+    # (load_jsonl_or_none). None = unknown, so `questions` / `resolve_first`
+    # are written null, never 0.
     start, end = et_day_window(target_date, tz)
     iso_start, iso_end = start.isoformat(), end.isoformat()
 
@@ -668,6 +907,11 @@ def collect_for_day(target_date, tz, runs, feedback, history):
         "surface_rate": round(surface_rate, 4),
         "silent_rate": round(silent_rate, 4),
         "lane_yield": lane_yield,
+        # Additive: questions the question router routed, and what the
+        # resolve-first gate caught. null = the log could not be read or
+        # starts later.
+        "questions": _safe_count(questions_for_day, question_rows, start, end),
+        "resolve_first": _safe_count(resolve_first_for_day, resolve_rows, start, end),
         # context_flags populated separately; downstream readers tolerate absence.
         "context_flags": derive_context_flags(target_date, tz),
     }
@@ -1496,7 +1740,9 @@ def main():
     state = load_json(METRICS_STATE, {"schema_version": 1, "daily": [],
                                        "decay_events": [], "_comment": "hum metrics time series; canonical: data/hum-improvement-loop.md"})
 
-    row = collect_for_day(target, tz, runs, feedback, history)
+    row = collect_for_day(target, tz, runs, feedback, history,
+                          question_rows=_safe_load(QUESTION_ROUTE_LOG),
+                          resolve_rows=_safe_load(RESOLVE_FIRST_LOG))
 
     # Compute rolling metrics relative to existing daily history.
     other_daily = [r for r in state.get("daily", []) if r["date"] != row["date"]]
@@ -1515,8 +1761,12 @@ def main():
             return
 
     if args.dry_run:
+        qs, rf = row.get("questions"), row.get("resolve_first")
         print(f"[dry-run] would write date={row['date']} signal_per_surfaced="
-              f"{row['signal_per_surfaced']} decay_events={len(decay_events)}", file=sys.stderr)
+              f"{row['signal_per_surfaced']} decay_events={len(decay_events)} "
+              f"questions={qs['total'] if qs is not None else None} "
+              f"resolve_first_checked={rf['checked'] if rf is not None else None} "
+              f"resolve_first_caught={rf['caught'] if rf is not None else None}", file=sys.stderr)
         return
 
     # Gap detection (hum-i-20260816-04): before writing today's row, check
