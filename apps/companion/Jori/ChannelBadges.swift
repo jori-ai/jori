@@ -318,6 +318,8 @@ final class TeamStore: ObservableObject {
     /// The think-before-you-speak gate's verdict on each message, judged in
     /// shadow (nothing is held), shown under the message for the user to grade.
     @Published var gateReviews: [UUID: GateReview] = [:]
+    /// Every open question the badges count, by conversation (loadSummaries).
+    @Published var openQuestionMessages: [String: [Message]] = [:]
     static let gateReviewsTable = "jori_gate_reviews"
 
     func loadGateReviews(_ conversationId: String) async {
@@ -472,6 +474,11 @@ final class TeamStore: ObservableObject {
             let open = ChatViewModel.openQuestions(in: (asked + replies).sorted { $0.createdAt < $1.createdAt })
             var openBy: [String: Int] = [:]
             for q in open { openBy[q.conversationId, default: 0] += 1 }
+            // The questions themselves, so the conversation's tray can list
+            // every one the badge counts, including any too old to have been
+            // loaded into the thread (one sat 24 days back, counted and unfindable).
+            let byConversation = Dictionary(grouping: open, by: \.conversationId)
+            if byConversation != openQuestionMessages { openQuestionMessages = byConversation }
             for key in Set(next.keys).union(openBy.keys) {
                 var s = next[key] ?? ConversationSummary()
                 s.openQuestions = openBy[key] ?? 0

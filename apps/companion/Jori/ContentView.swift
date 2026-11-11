@@ -1076,11 +1076,14 @@ struct ContentView: View {
             }
             Group {
                 OpenQuestionsTray(
-                    questions: viewModel.openQuestions.filter { !onScreenQuestionIds.contains($0.id) },
+                    questions: trayQuestions,
                     reveal: { quoteJumpTarget = $0.id },
                     answer: { beginReply(to: $0) },
-                    dismiss: { viewModel.dismissQuestion($0) },
-                    select: { option, q in Task { await viewModel.sendMessage(option.label, replyTo: q.id) } }
+                    dismiss: { q in
+                        viewModel.dismissQuestion(q)
+                        Task { try? await Task.sleep(for: .seconds(1)); await team.loadSummaries() }
+                    },
+                    select: { option, q in Task { await viewModel.sendMessage(option.label, replyTo: q.id); await team.loadSummaries() } }
                 )
                 .padding(.horizontal, 14)
             }
@@ -1088,6 +1091,16 @@ struct ContentView: View {
         }
         .animation(.spring(response: 0.35, dampingFraction: 0.8), value: viewModel.isWaitingForResponse)
         .animation(.spring(response: 0.35, dampingFraction: 0.8), value: isScrolledUp)
+    }
+
+    /// The tray: the thread's own open questions not on screen, plus any the
+    /// badge counts that are too old to be loaded here (answer or dismiss them
+    /// from the tray), oldest first.
+    private var trayQuestions: [Message] {
+        let loaded = viewModel.openQuestions.filter { !onScreenQuestionIds.contains($0.id) }
+        let loadedIds = Set(viewModel.messages.map(\.id))
+        let older = (team.openQuestionMessages[viewModel.currentConversation] ?? []).filter { !loadedIds.contains($0.id) }
+        return (older + loaded).sorted { $0.createdAt < $1.createdAt }
     }
 
     private var jumpToLatestButton: some View {
