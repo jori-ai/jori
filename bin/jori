@@ -142,6 +142,7 @@ function cmdHelp(extensions = []) {
   console.log('  triage status                 running? paused? last event?');
   console.log('  triage recent [N] | pending | rules | playbook');
   console.log('  triage pause | resume | reclassify <msgId>');
+  console.log('  triage code-filed [--days N] [--json]  mail filed by code at intake, and how much was relabelled or starred later');
   console.log('  triage memory ... | spam ... | p1 ...  (wrap email-mem / spam-filter / p1-sender)\n');
   console.log(c.bold('HUM'));
   console.log('  hum status                  next run, pings today, cool-down, pause state');
@@ -693,6 +694,7 @@ function cmdTriage(args) {
     pending: cmdTriagePending, rules: cmdTriageRules, playbook: cmdTriagePlaybook,
     memory: cmdTriageMemory, spam: cmdTriageSpam, p1: cmdTriageP1, pause: cmdTriagePause,
     resume: cmdTriageResume, reclassify: cmdTriageReclassify, resolve: cmdTriageResolve,
+    'code-filed': cmdTriageCodeFiled,
   };
   const fn = subs[sub];
   if (!fn) die(`unknown: triage ${sub}. Try: jori triage help`);
@@ -714,6 +716,9 @@ function cmdTriageHelp() {
   console.log('  resume                   re-enable + dispatch CATCH UP to process missed');
   console.log('  reclassify <messageId>   dispatch RECLASSIFY: <msgId> to ops-agent');
   console.log('  resolve "<topic>"        dispatch RESOLVE P1: <topic> — matches + downgrades');
+  console.log('  code-filed [--days N] [--json]  mail filed by code at intake (no model read it), per');
+  console.log('                           handler, and how much of it was relabelled or starred');
+  console.log('                           afterwards (default 7 days, at most 30; read-only)');
   console.log('');
   console.log(c.dim('To change rules: edit agent/ops-agent/CLAUDE.md, then `jori restart ops`'));
 }
@@ -979,6 +984,178 @@ function cmdTriageResolve(args) {
     if (stderr) console.error(c.dim('  stderr: ') + stderr);
     process.exit(1);
   }
+}
+
+// --- triage code-filed ---
+// Mail that intake filed in code, with no model reading it (sender-history
+// consensus, the Jev classifier, an intake-skip rule, the spam blocklist; on
+// the live path or a catchup), joined on messageId to the label and star
+// changes the same message got afterwards. The handler is already on the
+// intake line of the triage log, and every later gmail-action LABEL / UNLABEL
+// / STAR / UNSTAR on the message is in the same log, so "how often was
+// code-filed mail changed" is a join of two machine-written line shapes.
+// Read-only.
+const CODE_FILED_MERGE_MS = 10 * 60 * 1000;   // a second intake line this close is a re-delivery, not a new filing
+const CODE_FILED_LOOKBACK_MS = 60 * 1000;     // intake writes its own label/star events just before its line
+const CODE_FILED_NOT_SEEN = [
+  '"changed" is a floor: a wrong call nobody corrected on the message itself (fixed by a rule, or never noticed) is not counted.',
+  'Changes made in the Gmail app, or through the agents\' Gmail connector tools, are invisible.',
+];
+
+function codeFiledHandler(kind, source) {
+  if (kind === 'jev-classify') return { handler: 'jev-classify', family: 'jev-classify' };
+  return { handler: `local-classify:${source}`, family: `local-classify:${source.startsWith('rule:') ? 'rule' : source}` };
+}
+
+function codeFiledIntake(rest) {
+  let m;
+  // Live intake lines (gmail-source).
+  // lang-regex-ok: machine-written triage log line (gmail-source intake), not anyone's words
+  if ((m = /^(local-classify|jev-classify) intake (\S+) from .*? → (\S+)\/(P[123]) \((\S+)\)/.exec(rest))) {
+    return { id: m[2], ...codeFiledHandler(m[1], m[5]), label: m[3], priority: m[4] };
+  }
+  // lang-regex-ok: machine-written triage log line (gmail-source intake), not anyone's words
+  if ((m = /^intake-skip rule=(\S+) (\S+) from .*? → label=(\S+) applied=(\S+)/.exec(rest))) {
+    return { id: m[2], handler: `intake-skip:${m[1]}`, family: 'intake-skip', label: m[3], priority: null };
+  }
+  // lang-regex-ok: machine-written triage log line (gmail-source intake), not anyone's words
+  if ((m = /^spam-blocklist\((\w+)\) intake skip (\S+) /.exec(rest))) {
+    return { id: m[2], handler: `spam-blocklist:${m[1]}`, family: 'spam-blocklist', label: null, priority: 'P3' };
+  }
+  // Catchup lines: `<storm|startup|periodic>-catchup intake-skip (<kind>) <id>: <detail>`.
+  // lang-regex-ok: machine-written triage log line (gmail-source catchup), not anyone's words
+  if (!(m = /^\S+-catchup intake-skip \(([\w-]+)\) (\S+): (.*)$/.exec(rest))) return null;
+  const [, kind, id, detail] = m;
+  if (kind === 'fastpath') {
+    // lang-regex-ok: machine-written cascade detail, not anyone's words
+    const f = /^intake-skip rule=(\S+) -> label=([^+\s]+)(\+star\(P2\))? applied=/.exec(detail);
+    return f ? { id, handler: `intake-skip:${f[1]}`, family: 'intake-skip', label: f[2], priority: f[3] ? 'P2' : null } : null;
+  }
+  if (kind === 'jev-classify' || kind === 'local-classify') {
+    // lang-regex-ok: machine-written cascade detail, not anyone's words
+    const f = / -> (\S+)\/(P[123]) \((\S+)\)/.exec(detail);
+    return f ? { id, ...codeFiledHandler(kind, f[3]), label: f[1], priority: f[2] } : null;
+  }
+  if (kind === 'spam') {
+    // lang-regex-ok: machine-written cascade detail, not anyone's words
+    const f = /^spam-blocklist (\w+) /.exec(detail);
+    return { id, handler: `spam-blocklist:${f ? f[1] : 'unknown'}`, family: 'spam-blocklist', label: null, priority: 'P3' };
+  }
+  return null;
+}
+
+// `ACTION | messageId=<id> | label=<name>` as bin/gmail-action's triageLog writes it.
+function codeFiledEvent(rest) {
+  const parts = rest.split(' | ');
+  const action = parts[0] === 'LABEL+ARCHIVE' ? 'LABEL' : parts[0];
+  if (!['LABEL', 'UNLABEL', 'STAR', 'UNSTAR'].includes(action)) return null;
+  const kv = {};
+  for (const p of parts.slice(1)) { const i = p.indexOf('='); if (i > 0) kv[p.slice(0, i)] = p.slice(i + 1).trim(); }
+  return kv.messageId ? { id: kv.messageId, action, label: kv.label || null } : null;
+}
+
+function cmdTriageCodeFiled(args) {
+  let days = 7;
+  const di = args.indexOf('--days');
+  if (di >= 0) {
+    const v = args[di + 1];
+    if (v === undefined || v.startsWith('--')) die('--days needs a value: --days N (1 to 30)');
+    days = Number(v);
+    if (!Number.isInteger(days) || days < 1 || days > 30) die('--days must be a whole number from 1 to 30 (the triage log keeps 30 days)');
+  }
+  const now = Date.now();
+  const cutoff = now - days * 86400000;
+
+  let triageSet;
+  try { triageSet = new Set(require(path.join(__dirname, '..', 'lib', 'triage-labels.cjs')).LABELS); }
+  catch { triageSet = new Set(['personal', 'vendor', 'spam']); }
+
+  // Intake lines in the window, and every label/star event on any message.
+  const intakes = new Map();   // id → [{ ms, ts, ...parsed }]
+  const events = new Map();    // id → [{ ms, ts, action, label }]
+  for (const f of triageLogFilesForWindow(cutoff)) {
+    let raw = '';
+    try { raw = fs.readFileSync(f, 'utf8'); } catch { continue; }
+    for (const line of raw.split('\n')) {
+      const sep = line.indexOf(' | ');
+      if (sep < 0) continue;
+      const ts = line.slice(0, sep);
+      const ms = Date.parse(ts);
+      if (isNaN(ms)) continue;
+      const rest = line.slice(sep + 3);
+      const ev = codeFiledEvent(rest);
+      if (ev) { if (!events.has(ev.id)) events.set(ev.id, []); events.get(ev.id).push({ ms, ts, action: ev.action, label: ev.label }); continue; }
+      if (ms < cutoff) continue;
+      const it = codeFiledIntake(rest);
+      if (it) { if (!intakes.has(it.id)) intakes.set(it.id, []); intakes.get(it.id).push({ ms, ts, ...it }); }
+    }
+  }
+
+  const rows = [];
+  for (const [id, list] of intakes) {
+    list.sort((a, b) => a.ms - b.ms);
+    const first = list[0];
+    let spanEnd = first.ms;
+    for (const x of list) if (x.ms - first.ms <= CODE_FILED_MERGE_MS) spanEnd = Math.max(spanEnd, x.ms);
+    const evs = (events.get(id) || []).slice().sort((a, b) => a.ms - b.ms);
+    const own = evs.filter(e => e.ms >= first.ms - CODE_FILED_LOOKBACK_MS && e.ms <= spanEnd);
+    const later = evs.filter(e => e.ms > spanEnd);
+
+    // What intake left: the line's label/priority, plus its own star / p1 events.
+    const label = first.label;
+    const priority = first.priority || (own.some(e => e.action === 'LABEL' && e.label === 'p1') ? 'P1' : own.some(e => e.action === 'STAR') ? 'P2' : 'P3');
+
+    const changes = [];
+    for (const e of later) {
+      let change = null;
+      if (e.action === 'LABEL' && e.label === 'p1') { if (priority !== 'P1') change = 'raised to P1'; }
+      else if (e.action === 'LABEL' && triageSet.has(e.label) && e.label !== label) change = `relabelled ${e.label}`;
+      else if (e.action === 'UNLABEL' && e.label === 'p1') { if (priority === 'P1') change = 'P1 removed'; }
+      else if (e.action === 'UNLABEL' && label && e.label === label) change = `${label} removed`;
+      else if (e.action === 'STAR') { if (priority === 'P3') change = 'starred'; }
+      else if (e.action === 'UNSTAR') { if (priority === 'P2') change = 'unstarred'; }
+      if (change) changes.push({ ts: e.ts, action: e.action, label: e.label, change });
+    }
+    rows.push({
+      messageId: id, handler: first.handler, family: first.family,
+      filed_at: first.ts, filed_label: label, filed_priority: priority,
+      changes, changed: changes.length > 0,
+    });
+  }
+  rows.sort((a, b) => a.filed_at.localeCompare(b.filed_at));
+
+  const byFamily = new Map();
+  const total = { handler: 'all', filed: 0, changed: 0 };
+  for (const r of rows) {
+    if (!byFamily.has(r.family)) byFamily.set(r.family, { handler: r.family, filed: 0, changed: 0 });
+    for (const t of [byFamily.get(r.family), total]) { t.filed++; if (r.changed) t.changed++; }
+  }
+  const rate = (t) => t.filed ? Math.round((t.changed / t.filed) * 1000) / 10 : 0;
+  const handlers = [...byFamily.values()].sort((a, b) => b.filed - a.filed).map(t => ({ ...t, rate_pct: rate(t) }));
+
+  if (hasFlag(args, '--json')) {
+    console.log(JSON.stringify({
+      window_days: days, since: new Date(cutoff).toISOString(), generated_at: new Date(now).toISOString(),
+      totals: { ...total, rate_pct: rate(total) }, handlers, not_seen: CODE_FILED_NOT_SEEN, rows,
+    }, null, 2));
+    return;
+  }
+
+  console.log(c.bold(`Code-filed mail, last ${days} day${days === 1 ? '' : 's'}: ${total.filed} filed, ${total.changed} relabelled or starred afterwards (${rate(total)}%)`));
+  if (total.filed) {
+    console.log(table(handlers.map(t => ({ handler: t.handler, filed: t.filed, changed: t.changed, rate: `${t.rate_pct}%` })), ['handler', 'filed', 'changed', 'rate']));
+    const changed = rows.filter(r => r.changed);
+    if (changed.length) console.log('');
+    for (const r of changed.slice(-10)) {
+      const what = r.changes.map(x => `${x.change} ${x.ts.slice(5, 16).replace('T', ' ')}`).join('; ');
+      console.log(`  ${c.dim(r.filed_at.slice(5, 16).replace('T', ' '))} ${r.messageId} ${c.cyan(r.handler)} ${r.filed_label || '-'}/${r.filed_priority} → ${what}`);
+    }
+    if (changed.length > 10) console.log(c.dim(`  … ${changed.length - 10} more (--json for all)`));
+  } else {
+    console.log(c.dim('  (no intake-filed messages in the triage log for this window)'));
+  }
+  console.log('');
+  for (const n of CODE_FILED_NOT_SEEN) console.log(c.dim(`  ${n}`));
 }
 
 // --- restart ---
