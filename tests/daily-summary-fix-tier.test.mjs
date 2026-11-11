@@ -17,8 +17,10 @@ const D = "2026-11-02";
 
 function fx() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ds-fix-tier-"));
+  // An empty local dir: the installation's own fork-models pin must not reach these tests.
+  const local = fs.mkdtempSync(path.join(os.tmpdir(), "ds-fix-nolocal-"));
   const run = (...args) => {
-    const r = spawnSync(process.execPath, [BIN, ...args], { encoding: "utf8", env: { ...process.env, DS_FIX_DIR: dir, DS_FIX_SEND_BIN: "/usr/bin/true" } });
+    const r = spawnSync(process.execPath, [BIN, ...args], { encoding: "utf8", env: { ...process.env, DS_FIX_DIR: dir, DS_FIX_SEND_BIN: "/usr/bin/true", JORI_LOCAL_DIR: local } });
     return { rc: r.status, out: r.stdout.trim(), err: r.stderr.trim() };
   };
   const tier = () => JSON.parse(run("tier", D).out).tier;
@@ -59,4 +61,23 @@ it("escalates when a Sonnet run gave up, or ended without confirming or asking a
   b.run("request", D, "--reason", "x", "--no-kick");
   b.run("tier-done", D, "sonnet"); // still "queued", no questions
   assert.equal(b.tier(), "opus");
+});
+
+// An installation pin (agent/local/config/fork-models.json, jobs["daily-summary-fix"])
+// is the whole answer: Sonnet stays Sonnet even where the usual tiers would escalate.
+it("fork-models.json pinned to sonnet keeps every date on Sonnet, even after a run that gave up", () => {
+  const f = fx();
+  const local = fs.mkdtempSync(path.join(os.tmpdir(), "ds-fix-local-"));
+  fs.mkdirSync(path.join(local, "config"), { recursive: true });
+  fs.writeFileSync(path.join(local, "config", "fork-models.json"), JSON.stringify({ jobs: { "daily-summary-fix": { model: "sonnet" } } }));
+  const run = (...args) => spawnSync(process.execPath, [BIN, ...args], { encoding: "utf8", env: { ...process.env, DS_FIX_DIR: f.dir, DS_FIX_SEND_BIN: "/usr/bin/true", JORI_LOCAL_DIR: local } });
+  const tier = () => JSON.parse(run("tier", D).stdout.trim());
+  run("request", D, "--from-review", "--reason", "x", "--no-kick");
+  f.edit((s) => { s.status = "gave_up"; });
+  run("tier-done", D, "sonnet");
+  const t = tier();
+  assert.equal(t.tier, "sonnet");
+  assert.match(t.reason, /pins/);
+  // The same state without the pin escalates, so the test proves the pin is what held it.
+  assert.equal(f.tier(), "opus");
 });

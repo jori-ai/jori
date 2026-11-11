@@ -81,7 +81,8 @@
 //       left queued waits for the 4am build (`waiting_for_summary`), not for another run
 //   daily-summary-fix tier <date>                    which model this date's next fix run uses:
 //       {"tier":"sonnet"|"opus","reason":...}. Sonnet first; Opus once a Sonnet run for the
-//       date got stuck (see pickTier). Read by trigger-daily-summary-fix.sh.
+//       date got stuck (see pickTier), unless fork-models.json pins the job to one model.
+//       Read by trigger-daily-summary-fix.sh.
 //   daily-summary-fix tier-done <date> <sonnet|opus>  record a finished run and the state it left
 //   daily-summary-fix log <date> --finding F --action A --outcome fixed|data-corrected|code-landed|asked|unresolved [--commit SHA]
 //       record one finding and what was done about it (feeds the email section); prints the entry's log index
@@ -217,7 +218,23 @@ function snapshot(s) {
 //   - was followed by a new request from the reviewer ("review not confirmed"):
 //     the day it fixed did not pass.
 // A run queued only to apply the user's answers is not stuck: it stays Sonnet.
-export function pickTier(s) {
+// An installation can pin the fixer to one model in agent/local/config/fork-models.json
+// (jobs["daily-summary-fix"].model: "sonnet" | "opus" | a full id). The pin is the
+// whole answer: no escalation, and the tier recorded matches the model that runs
+// (lib/run-ephemeral-opus.sh applies the same entry, so the two never disagree).
+export function pinnedTier() {
+  try {
+    const fm = INST.localConfig("fork-models", { jobs: {} });
+    const m = String((fm.jobs && fm.jobs["daily-summary-fix"] && fm.jobs["daily-summary-fix"].model) || "").trim();
+    if (!m) return null;
+    const { MODELS } = createRequire(import.meta.url)("../lib/models.cjs");
+    if (m === "sonnet" || m === MODELS.sonnet) return "sonnet";
+    if (m === "opus" || m === MODELS.opus) return "opus";
+  } catch { /* unreadable config: no pin, the usual tiers apply */ }
+  return null;
+}
+export function pickTier(s, pinned = null) {
+  if (pinned) return { tier: pinned, reason: `fork-models.json pins the daily summary fixer to ${pinned === "sonnet" ? "Sonnet" : "Opus"}` };
   const runs = s.tier_runs || [];
   const last = runs[runs.length - 1];
   if (!last) return { tier: "sonnet", reason: "first fix run for this date" };
@@ -630,7 +647,7 @@ if (cmd === "request") {
   console.log(`queued ${date}`);
 } else if (cmd === "tier") {
   if (!isDate(date)) die("usage: tier <YYYY-MM-DD>");
-  console.log(JSON.stringify(pickTier(load(date))));
+  console.log(JSON.stringify(pickTier(load(date), pinnedTier())));
 } else if (cmd === "tier-done") {
   if (!isDate(date)) die("usage: tier-done <YYYY-MM-DD> <sonnet|opus>");
   const tier = argv[2];
