@@ -46,7 +46,7 @@ test("rhythm: too little history, or gone quiet years ago, is not slipping", () 
 });
 
 function person(wiki_id, extra = {}) {
-  return { wiki_id, name: wiki_id.replace("user_", ""), description: null, scope: ["people"], locked: false, works_with: false, state: { status: "unasked", nudges: 0, research: 0 }, ...pw.rhythm(monthly(35), NOW), ...extra };
+  return { wiki_id, name: wiki_id.replace("user_", ""), description: null, scope: ["people"], works_with: false, state: { status: "unasked", nudges: 0, research: 0 }, ...pw.rhythm(monthly(35), NOW), ...extra };
 }
 
 test("propose: slipping people before work people, one per person, at most MAX_OPEN open", () => {

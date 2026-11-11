@@ -113,7 +113,7 @@ Write `data/wiki-link-weave-state.json`:
 
 - Wiki writes only, plus the concept map (via `wiki-people`), ≤3 hum questions and one chat message. No email.
 - Never drop or rewrite a fact. Splitting is a move. Linking changes link syntax, not wording, except where a relational phrase needs the names added in parentheses.
-- Never edit `day`/`week`/`month` or `pin_locked` pages. Propose a `pin_locked` change as a hum question.
+- Never edit `day`/`week`/`month` pages. A person page that is `pin_locked` is pinned, not read-only (the flag only stops the auditor un-pinning it), so it is split, linked and given Relations lines like any other.
 - Never put health or financial specifics on a person page. When moving a hub fact that has them, leave that line on the hub.
 - Never merge or retire a person page for being thin. Thin person pages are intended.
 - At most 15 new person pages a run from hubs, so a bad run is easy to revert (`wiki history <id>`).
