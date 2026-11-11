@@ -438,6 +438,9 @@ struct ContentView: View {
                 ForEach(team.visibleConversations) { conversation in
                     ConversationRowView(conversation: conversation, team: team)
                         .tag(Destination.conversation(conversation.id))
+                        .modifier(ConversationDeleteActions(conversation: conversation, team: team) { gone in
+                            if viewModel.currentConversation == gone { go(.conversation(team.coordinatorConversation)) }
+                        })
                 }
             } header: {
                 HStack {
@@ -501,6 +504,7 @@ struct ContentView: View {
                     ConversationRowView(conversation: conversation, team: team)
                 }
                 .buttonStyle(.plain)
+                .modifier(ConversationDeleteActions(conversation: conversation, team: team))
             }
         }
         .listStyle(.plain)

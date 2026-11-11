@@ -500,6 +500,28 @@ final class TeamStore: ObservableObject {
 
     // MARK: Writes
 
+    /// Delete a conversation from the list. It is hidden (archived), not
+    /// erased: its messages stay in Jori's memory. A role's own conversation
+    /// comes back by itself the next time that role writes (the database
+    /// trigger un-archives it); a deleted group stays gone. The coordinator's
+    /// conversation can't be deleted.
+    func deleteConversation(_ id: String) async {
+        guard id != coordinatorConversation else { return }
+        struct Patch: Encodable { let archived: Bool }
+        if let i = conversations.firstIndex(where: { $0.id == id }) { conversations[i].archived = true }
+        do {
+            try await SupabaseManager.ensureAuthenticated()
+            try await SupabaseManager.shared
+                .from(Self.conversationsTable)
+                .update(Patch(archived: true))
+                .eq("id", value: id)
+                .execute()
+            await loadConversations()
+        } catch {
+            print("[Team] delete conversation failed: \(error)")
+        }
+    }
+
     private struct ConversationRow: Encodable {
         let id: String
         let kind: String
@@ -1133,5 +1155,46 @@ struct GateReviewLine: View {
         .padding(.horizontal, 8)
         .padding(.top, 2)
         .onAppear { note = review.note ?? "" }
+    }
+}
+
+
+// MARK: - Deleting a conversation
+
+/// Swipe (iPhone, iPad) or right-click / long-press: delete a conversation or a
+/// group, after a confirmation that says what deleting means.
+struct ConversationDeleteActions: ViewModifier {
+    let conversation: Conversation
+    @ObservedObject var team: TeamStore
+    var onDeleted: (String) -> Void = { _ in }
+    @State private var confirming = false
+
+    private var deletable: Bool { conversation.id != team.coordinatorConversation }
+
+    func body(content: Content) -> some View {
+        if deletable {
+            content
+                #if os(iOS)
+                .swipeActions(edge: .trailing, allowsFullSwipe: false) {
+                    Button(role: .destructive) { confirming = true } label: { Label("Delete", systemImage: "trash") }
+                }
+                #endif
+                .contextMenu {
+                    Button(role: .destructive) { confirming = true } label: { Label("Delete conversation", systemImage: "trash") }
+                }
+                .confirmationDialog(conversation.isGroup ? "Delete this group?" : "Delete this conversation?",
+                                    isPresented: $confirming, titleVisibility: .visible) {
+                    Button("Delete", role: .destructive) {
+                        Task { await team.deleteConversation(conversation.id); onDeleted(conversation.id) }
+                    }
+                    Button("Cancel", role: .cancel) {}
+                } message: {
+                    Text(conversation.isGroup
+                         ? "The group leaves your list. Jori keeps its messages in its memory."
+                         : "It leaves your list until \(team.title(of: conversation.id)) next writes to you. Jori keeps the messages in its memory.")
+                }
+        } else {
+            content
+        }
     }
 }
