@@ -14,6 +14,8 @@
 import { test, after } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
+import { createRequire } from "node:module";
+const requireT = createRequire(import.meta.url);
 import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
@@ -118,6 +120,22 @@ test("pulse-state.json is retired from the dispatch preamble", () => {
     const code = src.split("\n").filter((l) => !l.trim().startsWith("//") && !l.trim().startsWith("#")).join("\n");
     assert.ok(!code.includes("pulse-state.json"), `${f} still reads pulse-state.json`);
   }
+});
+
+test("the dispatch preamble shows the enforced cap and the ledger count, not hum-state's leftover 999", async () => {
+  const { buildPreamble } = await import("../agent/supervisor/dispatch-preamble.mjs");
+  const dir = fs.mkdtempSync(path.join(DATA, "preamble-"));
+  const tz = requireT("../lib/instance.cjs").instance().tz;
+  const today = new Date().toLocaleDateString("en-CA", { timeZone: tz });
+  fs.writeFileSync(path.join(dir, "hum-state.json"), JSON.stringify({ today: { date: today, pings: 2 }, max_pings_per_day: 999 }));
+  const now = Date.now();
+  const rows = [5, 4, 3, 2, 1, 0].map((h) => JSON.stringify({ sent_at: new Date(now - h * 60_000).toISOString(), topic: "ideas", dedup_key: `k${h}` }));
+  fs.writeFileSync(path.join(dir, "hum-feedback.jsonl"), rows.join("\n") + "\n");
+  const out = buildPreamble({ cacheDir: dir });
+  const line = out.split("\n").find((l) => l.startsWith("hum/ambient pings"));
+  assert.ok(line, "ping line present");
+  assert.ok(!line.includes("999"), line);
+  assert.match(line, /so far today: 6 \(budget 6\/day/);
 });
 
 // ─── item 14: nearby keys are deduped across days ──────────────────────────

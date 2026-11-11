@@ -175,7 +175,7 @@ The Supabase schema lives in the kernel at `system/migrations/` (apply with `bin
 | `data/hum-interests-state.json` | Per-topic `last_run_at` / `last_signal_at` (cadence accounting) |
 | `data/hum-cache/<topic>.json` | Per-topic harvester output cache (TTL per registry) |
 | `data/hum-question-sends.jsonl` / `data/question-backlog/` | The question pool's send log (written by `hum-ask`, `decision-ask` and `hum-ping` for a location ask) and each question lane's waiting count; `lib/question-pacing.mjs` reads both (gitignored) |
-| `data/hum-state.json` | Daily counters (runs/pings/questions) — `today.pings` is the live counter of the shared daily ping budget (hum + any other proactive lane, which adds via `bin/ping-budget record`) — plus pause state. `max_pings_per_day` / `min_ping_interval_minutes` are a mirror hum-tick rewrites each tick from `lib/ping-budget.mjs`; the budget itself is code (6/day, 45 min apart) |
+| `data/hum-state.json` | Daily counters (runs/pings/questions) — `today.pings` is the live counter of the shared daily ping budget (hum + any other proactive lane, which adds via `bin/ping-budget record`) — plus pause state. `max_pings_per_day` / `min_ping_interval_minutes` are ignored leftovers (hum-tick, which mirrored them, is gone; nothing reads them since 2026-11-10, when the dispatch preamble moved to `lib/ping-budget.mjs`); the budget itself is code (6/day, 45 min apart) |
 | `data/hum-seen.json` | Per-subject dedup |
 | `data/hum-feedback.jsonl` | Per-ping records with reactions |
 | `data/hum-runs.jsonl` | **Enriched tick trace** — one JSON line per tick with `{situation, harvest{candidates,errors}, sonnet{decision,score,rationale,based_on_topic}, outcome}`. Sole input to `hum-review` metrics |

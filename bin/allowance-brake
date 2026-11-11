@@ -47,6 +47,11 @@
 //               bin/decision-answer once the answer is filed) relaunches it
 //               through its release_label the way the user chose. A question
 //               still open at the reset is closed and the job just runs.
+//               With `"auto_cheaper": true` in the config, a job that names a
+//               cheaper model runs on it without asking when the week, with
+//               the cheaper run on it, still ends under 100% (outside the
+//               final_day window), and the user is told afterwards on the
+//               system channel; the card is asked only past that.
 //
 // Config, the installation's decision: agent/local/config/allowance-brake.json
 //   { "threshold": 0.95, "usd_per_allowance": 1400,
@@ -314,6 +319,7 @@ function config() {
       final_day: fdT > 0 && fdT <= 1 && fdH > 0 ? { threshold: fdT, hours: fdH } : null,
       usd_per_allowance: usd > 0 ? usd : DEFAULT_USD_PER_ALLOWANCE,
       jobs: c.jobs && typeof c.jobs === "object" ? c.jobs : {},
+      auto_cheaper: c.auto_cheaper === true,
     };
   } catch { return { threshold: 0.95, final_day: null, usd_per_allowance: DEFAULT_USD_PER_ALLOWANCE, jobs: {} }; }
 }
@@ -460,6 +466,19 @@ function check(job) {
     }
     return runNow("run", "you chose to run it now");
   }
+  // Standing choice (config `auto_cheaper`): when the job has a cheaper model
+  // and the week, with this run on it, still ends under 100%, run it on the
+  // cheaper model without asking and say so afterwards. Asks only when even the
+  // cheaper run would pass 100%, and never inside the last-day window (that
+  // brake keeps asking).
+  const lastDay = brakeOf(r, cfg) < cfg.threshold;
+  const cheapFits = entry.cheaper && entry.cheaper.model && (r.projected ?? r.utilization) + est.share * 0.5 < 1;
+  if (cfg.auto_cheaper && cheapFits && !lastDay && !flag("no-ask")) {
+    closeQuestions(st, job, "ran on the cheaper model by standing choice");
+    const note = `${entry.label || job} ran on the cheaper model (${entry.cheaper.model}) without asking: the week is at ${pct(r.utilization)} and on pace for ${pct(r.projected ?? r.utilization)}, so it still ends under 100%.`;
+    notifyAfter(note);
+    return runNow("cheaper", `${why}; ran on the cheaper model by your standing choice (projected under 100%)`, { model: entry.cheaper.model, effort: entry.cheaper.effort || null, auto: true });
+  }
   recordHeld(st, job, label, r);
   const pending = st.asks && st.asks[job];
   if (pending && Date.parse(pending.resets_at || "") > NOW && (st.questions || []).some((q) => q.id === pending.id && q.status === "open")) {
@@ -471,6 +490,12 @@ function check(job) {
   const sent = sendCard(`bud:${q.id}`);
   logLine(`asked about ${job}${key ? ` [${key}]` : ""} (bud:${q.id}): ${sent}`);
   return hold(`${why}; asked you (bud:${q.id}, ${sent})`);
+}
+
+/** Tell the user, quietly (system channel, no badge), about a choice made for them. Fail-soft. */
+function notifyAfter(text) {
+  if (TESTING || flag("dry-run")) return;
+  try { spawnSync(installTools("bin/jori-notify"), ["--channel", "system", text], { stdio: "ignore", timeout: 30_000 }); } catch { /* the log line stands */ }
 }
 
 function kick(label) {

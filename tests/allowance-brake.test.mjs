@@ -377,3 +377,49 @@ it("scales the pace down by a released job's catch-up share of the span's ledger
   fs.writeFileSync(fx.state, JSON.stringify({ released: [{ job: "improvement-plan", at: "2026-10-29T03:30:00.000Z" }] }));
   assert.equal(run(fx, ["check", "dream-deep"]).rc, 3);
 });
+
+// ─── auto_cheaper: the user's standing choice (review item 7, 2026-11-10) ───
+// "Run it now, cheaper model" was chosen on all four budget cards in a week;
+// with auto_cheaper on, a job with a cheaper model runs on it without a card
+// while the week still ends under 100%, and the card comes back past that.
+const WARM = [["2026-11-01T08:00:00Z", 0.85], ["2026-11-02T07:50:00Z", 0.88]];
+const GOV_AUTO = { ...GOV, auto_cheaper: true };
+
+it("auto_cheaper: an important job with a cheaper model runs on it without asking when the week ends under 100%", () => {
+  const fx = fixture({ points: WARM, config: GOV_AUTO });
+  const r = run(fx, ["check", "chat-build", "--key", "req-1", "--json"]);
+  assert.equal(r.rc, 4, r.out);
+  assert.equal(r.json.decision, "cheaper");
+  assert.equal(r.json.model, "sonnet");
+  assert.equal(r.json.auto, true);
+  const st = fs.existsSync(fx.state) ? JSON.parse(fs.readFileSync(fx.state, "utf8")) : {};
+  assert.equal((st.questions || []).length, 0, "no card");
+});
+
+it("auto_cheaper: still asks when even the cheaper run would pass 100%", () => {
+  const fx = fixture({ points: HOT, config: GOV_AUTO });
+  const r = run(fx, ["check", "chat-build", "--json"]);
+  assert.equal(r.rc, 3);
+  assert.match(r.json.reason, /asked you/); // lang-regex-ok: asserts the governor's own output, not the user's words
+});
+
+it("auto_cheaper: a job with no cheaper model is still asked about", () => {
+  const fx = fixture({ points: WARM, config: GOV_AUTO });
+  const r = run(fx, ["check", "chat-plain", "--json"]);
+  assert.equal(r.rc, 3);
+  assert.match(r.json.reason, /asked you/); // lang-regex-ok: asserts the governor's own output, not the user's words
+});
+
+it("auto_cheaper: inside the last-day window the card is asked as before", () => {
+  const LAST = [["2026-11-03T08:00:00Z", 0.87], ["2026-11-04T07:50:00Z", 0.9]];
+  const fx = fixture({ points: LAST, config: { ...GOV_AUTO, final_day: { hours: 24, threshold: 0.9 } } });
+  const r = run(fx, ["check", "chat-build", "--json"], "2026-11-04T08:00:00Z");
+  assert.equal(r.rc, 3, r.out);
+  assert.match(r.json.reason, /asked you/); // lang-regex-ok: asserts the governor's own output, not the user's words
+});
+
+it("without auto_cheaper the same week still asks", () => {
+  const fx = fixture({ points: WARM, config: GOV });
+  const r = run(fx, ["check", "chat-build", "--json"]);
+  assert.equal(r.rc, 3, r.out);
+});

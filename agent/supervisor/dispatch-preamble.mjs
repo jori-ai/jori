@@ -28,6 +28,7 @@
 
 import fs from "node:fs";
 import { createRequire } from "node:module";
+import { checkPingBudget } from "../../lib/ping-budget.mjs";
 
 // Home timezone and the operator's name, from lib/instance.cjs
 // (JORI_TZ, else agent/local/instance.json, else the host's zone).
@@ -102,17 +103,6 @@ function currentLocationLine(cacheDir) {
   return `${ownerPossessive(true)} current local time (where they actually are): ${formatInTz(tz)} (${label}) — this is what quiet-hours/sleep-window gates use, not the line above`;
 }
 
-// hum-state's today.date is the user's local day; accept it if it matches
-// the home timezone or their current tz, so a traveling day boundary never hides a live count.
-function todayCandidates(cacheDir) {
-  const out = new Set();
-  for (const tz of [TZ, readCachedJson(`${cacheDir}/user-timezone.json`)?.timezone]) {
-    if (!tz) continue;
-    try { out.add(new Date().toLocaleDateString("en-CA", { timeZone: tz })); } catch { /* bad tz */ }
-  }
-  return out;
-}
-
 // Build the preamble string, or null if there's nothing worth adding.
 // `opts.cacheDir` (optional) points at data for cheap cached signals.
 export function buildPreamble(opts = {}) {
@@ -122,19 +112,24 @@ export function buildPreamble(opts = {}) {
   const locLine = currentLocationLine(opts.cacheDir);
   if (locLine) parts.push(locLine);
 
-  // Optional cheap signals — each fully best-effort. Today's ping count from
-  // hum-state.json's live counter, against the shared daily budget (6/day, 45 min
-  // apart — lib/ping-budget.mjs, enforced in code by hum-ping and the
-  // location-ambient trigger; this line is only so the agent can see it without
-  // a tool call). Until 2026-10-06 this read pulse-state.json, dead since
-  // 2026-09-10 and always 0. A counter from another day is omitted, not shown.
+  // Optional cheap signals — each fully best-effort. Today's ping count and cap
+  // come from lib/ping-budget.mjs, the same function hum-ping and the
+  // location-ambient trigger enforce with (6/day, 45 min apart, env-overridable);
+  // this line is only so the agent can see it without a tool call. Until
+  // 2026-11-10 the cap was read from hum-state.json's max_pings_per_day, a
+  // leftover nothing enforces (the live file said 999), and the count from its
+  // state counter alone, which lagged the send ledger (said 2 when 6 were sent).
   if (opts.cacheDir) {
-    const hum = readCachedJson(`${opts.cacheDir}/hum-state.json`);
-    const pings = hum?.today?.pings;
-    if (Number.isFinite(pings) && hum?.today?.date && todayCandidates(opts.cacheDir).has(hum.today.date)) {
-      const cap = Number.isFinite(hum.max_pings_per_day) ? hum.max_pings_per_day : 6;
-      parts.push(`hum/ambient pings so far today: ${pings} (budget ${cap}/day, enforced in code)`);
-    }
+    try {
+      const b = checkPingBudget({
+        statePath: `${opts.cacheDir}/hum-state.json`,
+        feedbackPath: `${opts.cacheDir}/hum-feedback.jsonl`,
+      });
+      if (Number.isFinite(b.count)) {
+        const cap = b.caps?.maxPerDay > 0 ? b.caps.maxPerDay : "no cap";
+        parts.push(`hum/ambient pings so far today: ${b.count} (budget ${cap}/day, enforced in code)`);
+      }
+    } catch { /* best-effort line */ }
   }
 
   if (!parts.length) return null;
