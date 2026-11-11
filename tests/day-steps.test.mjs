@@ -594,3 +594,90 @@ test("JORI_STEPS_WALK_STOP=0 keeps the stop", () => {
     if (old == null) delete process.env.JORI_STEPS_WALK_STOP; else process.env.JORI_STEPS_WALK_STOP = old;
   }
 });
+
+// A walk block the matcher drew no route for: it measured only the one point of the
+// stops it absorbed (0 m, or a straight line between a few, a floor), so it printed
+// and counted no distance while its own steps showed a long walk, and the header
+// summed a figure a mile or more short of the walk it sat over.
+function blockDay(excursion) {
+  const leg = (id, a, b) => ({ type: "leg", id, mode: "walking", median_kmh: 4.5, start_ms: at(...a), end_ms: at(...b),
+    mins: 10, routed_m: 600, walked_m: 600, steps: 800, geometry: "map_matched" });
+  return {
+    date: "2026-03-02", tz: "America/New_York", map_url: "https://example.invalid/map.png",
+    stops: [
+      { id: "s1", start: "00:00", end: "12:00", start_ms: at(0), start_ts_ms: at(0), end_ts_ms: at(12), duration_min: 720, place: { name: "Home" } },
+      { id: "w", start: "12:10", end: "12:40", start_ts_ms: at(12, 10), end_ts_ms: at(12, 40), duration_min: 30,
+        place: { name: "Walk along the river", source: "excursion" }, provenance: { excursion: true },
+        excursion: { from_base: null, mode: "walking", ...excursion } },
+      { id: "s3", start: "12:50", end: "23:59", start_ts_ms: at(12, 50), end_ts_ms: at(23, 59), duration_min: 669, place: { name: "Home" } },
+    ],
+    path: { stats: {}, segments: [], spine: [leg("l0", [12, 0], [12, 10]), leg("l1", [12, 40], [12, 50])] },
+    routes: [],
+  };
+}
+const { printedWalkMeters, excursionDistance, stopHeaderHtml, dayStrideM } = _internal;
+const plain = (h) => h.replace(/<[^>]+>/g, "");
+
+test("a walk block with no route is given its steps' distance, said about, and the header counts it", () => {
+  // the two mapped legs give a stride of 0.75 m a step: 2,800 steps is 2,100 m
+  const d = blockDay({ routed_m: 0, geometry: "straight_line_fallback", steps: 2800 });
+  const block = d.stops[1];
+  assert.deepEqual(excursionDistance(block, d), { m: 2100, estimated: true });
+  const info = {};
+  assert.equal(Math.round(printedWalkMeters(d, d.stops, info)), 600 + 600 + 2100);
+  assert.equal(Math.round(info.estimated_m), 2100);
+  assert.match(plain(stopHeaderHtml(block, d)), /Walk along the river · about 1\.3 mi · 2,800 steps/);
+  assert.match(buildSkeleton(d), /about 2\.1 miles walked/);
+  assert.match(buildMarkdown(d), /Walk along the river\*\* · about 1\.3 mi/);
+});
+
+test("a straight-line floor shorter than the steps is raised to them; a longer one, and a drawn route, stay", () => {
+  const raised = blockDay({ routed_m: 300, geometry: "straight_line_fallback", steps: 2800 });
+  assert.deepEqual(excursionDistance(raised.stops[1], raised), { m: 2100, estimated: true });
+  const floor = blockDay({ routed_m: 3000, geometry: "straight_line_fallback", steps: 2800 });
+  assert.deepEqual(excursionDistance(floor.stops[1], floor), { m: 3000, estimated: false });
+  // a route the matcher drew is the walk's distance, whatever the steps say
+  const drawn = blockDay({ routed_m: 800, geometry: "matched", steps: 5000 });
+  assert.deepEqual(excursionDistance(drawn.stops[1], drawn), { m: 800, estimated: false });
+  // no route distance at all, whatever the geometry's label: the steps are the only measurement
+  const none = blockDay({ routed_m: 0, geometry: "matched", steps: 2800 });
+  assert.deepEqual(excursionDistance(none.stops[1], none), { m: 2100, estimated: true });
+  // a drawn route under a tenth of a mile with few steps prints nothing, as before
+  const tiny = blockDay({ routed_m: 80, geometry: "matched", steps: 120 });
+  assert.equal(excursionDistance(tiny.stops[1], tiny), null);
+});
+
+test("a block with too few steps, no stride to measure, or a drive gets no estimate", () => {
+  const few = blockDay({ routed_m: 0, geometry: "straight_line_fallback", steps: 90 });
+  assert.equal(excursionDistance(few.stops[1], few), null);
+  const drove = blockDay({ routed_m: 0, geometry: "straight_line_fallback", steps: 2800, mode: "driving" });
+  assert.equal(excursionDistance(drove.stops[1], drove), null);
+  // a day with nothing mapped to measure a stride from keeps the block without a distance
+  const bare = blockDay({ routed_m: 0, geometry: "straight_line_fallback", steps: 2800 });
+  bare.path.spine = [];
+  assert.equal(excursionDistance(bare.stops[1], bare), null);
+  assert.match(plain(stopHeaderHtml(bare.stops[1], bare)), /2,800 steps/);
+});
+
+test("a straight-line block is no stride, and the day-level estimate says at least", () => {
+  const spine = [{ type: "leg", mode: "walking", walked_m: 1500, steps: 2000 }];
+  // routed over steps would be 0.5 m a step; as a floor it is left out of the stride
+  const floorBlock = { excursion: { routed_m: 2000, steps: 4000, geometry: "straight_line_fallback" } };
+  assert.equal(dayStrideM({ stops: [floorBlock], path: { spine } }), 0.75);
+  const d = blockDay({ routed_m: 0, geometry: "straight_line_fallback", steps: 2800 });
+  d.path.stats.geometry_source = "straight_line_fallback";
+  assert.match(plain(stopHeaderHtml(d.stops[1], d)), /at least 1\.3 mi/);
+});
+
+test("JORI_EXCURSION_STEPS_DISTANCE=0 restores the route-or-nothing block", () => {
+  const old = process.env.JORI_EXCURSION_STEPS_DISTANCE;
+  process.env.JORI_EXCURSION_STEPS_DISTANCE = "0";
+  try {
+    const d = blockDay({ routed_m: 0, geometry: "straight_line_fallback", steps: 2800 });
+    assert.equal(excursionDistance(d.stops[1], d), null);
+    assert.equal(Math.round(printedWalkMeters(d, d.stops)), 1200);
+    assert.match(buildSkeleton(d), /0\.7 miles walked/);
+  } finally {
+    if (old == null) delete process.env.JORI_EXCURSION_STEPS_DISTANCE; else process.env.JORI_EXCURSION_STEPS_DISTANCE = old;
+  }
+});
