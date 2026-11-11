@@ -87,6 +87,19 @@ test("audit finds one-way person links but ignores hubs", () => {
   assert.ok(r.orphans.includes("note_lonely"));
 });
 
+test("a centre page never owes a return link to the people who link to it", () => {
+  page("user_owner", "person", "The owner. Spouse: [[user_dana_hill|Dana]].");
+  page("user_ann_lee", "person", "A friend of [[user_owner|the owner]].");
+  const all = people.pagesByEntity().people;
+  const need = (center) => people.asymmetricLinks(all, { center }).map((a) => a.need);
+  assert.ok(need(new Set()).includes("user_owner → user_ann_lee"));
+  assert.ok(!need(new Set(["user_owner"])).some((n) => n.startsWith("user_owner →")));
+  // The exemption is one direction only: the owner's own one-way link still counts.
+  assert.ok(need(new Set(["user_owner"])).includes("user_dana_hill → user_owner"));
+  // No local config, no exemption.
+  assert.ok(need(undefined).includes("user_owner → user_ann_lee"));
+});
+
 test("concept-add is idempotent and keeps ambiguous names out of aliases", () => {
   const first = people.addConcept({
     target: "user_ben_doe",

@@ -68,6 +68,7 @@ Save each page with `wiki save <id> --body @file` once, after all its edits.
 ## Step 4 — Two-way relations
 
 For each entry in `audit.asymmetric` (`need: "B → A"`), add the inverse relation to B's `## Relations` section as a typed line (`jobs/people-email.md` Step 3): `child_of` ↔ `parent_of`, and `sibling_of`, `spouse_of`, `partner_of`, `friend_of`, `works_with`, `relative_of`, `related_to` on both. If A's link to B isn't a relationship (a passing mention), it doesn't need a return link, so skip it.
+The audit already leaves out the user's own page and their partner's (`center_wiki_ids` in `wiki-people.json`): both are person pages, so a person's link to them is never listed as one-way. Don't add return lines to those pages by hand either; they are loaded at the start of every session and the people-email and people-watch blocks are all they take.
 
 While you are on a person page for Step 1 or Step 4, convert any free-text Relations lines ("Father of …", "fiancée of …") to tokens, keeping the wording as the plain words after the link, and link a hub (`[[<hub_id>|Ari]]`) to the person's own page when it exists. A person page with **no** Relations section but a stated relation in its text gets one (every person page connects to related people). Evidence only; never infer a relation.
 
