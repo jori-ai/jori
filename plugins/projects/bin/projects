@@ -52,6 +52,17 @@ const { installTools } = require(path.join(LIB, "root.cjs"));
 const pr = require(path.join(__dirname, "..", "lib", "projects.js"));
 const pt = require(path.join(__dirname, "..", "lib", "project-tasks.js"));
 
+// gog reads the user's Google login from a keyring that needs this password.
+// The cron jobs source it (script-job-env.sh); an agent's shell may not have
+// it, and a task change now reaches Google right away from wherever it is
+// made. Only this one key is read, never the rest of .env.
+if (!process.env.GOG_KEYRING_PASSWORD) {
+  try {
+    const line = fs.readFileSync(installTools(".env"), "utf8").split("\n").find((l) => l.startsWith("GOG_KEYRING_PASSWORD="));
+    if (line) process.env.GOG_KEYRING_PASSWORD = line.slice("GOG_KEYRING_PASSWORD=".length).trim();
+  } catch { /* no .env: the half-hourly sync still has it */ }
+}
+
 const args = process.argv.slice(2);
 const cmd = args[0];
 
