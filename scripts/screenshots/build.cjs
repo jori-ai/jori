@@ -271,12 +271,46 @@ body { font:17px/1.35 -apple-system, system-ui, "SF Pro Text", sans-serif; color
 .draft { background:var(--card); border:1px solid var(--hairline); border-radius:12px; padding:9px 12px; margin-top:8px; font-size:14px; line-height:1.4; }
 .draft .h { font-size:12px; color:var(--ink2); padding-bottom:6px; margin-bottom:6px; border-bottom:1px solid var(--hairline); }
 .draft .h b { color:var(--ink); font-weight:600; }
+/* The app as it is now: a conversation per person (or group), a header naming
+   who you are talking to, a team list with photos and one red badge. */
+.nav .who { display:flex; align-items:center; gap:9px; }
+.nav .who .av, .nav .who img { width:34px; height:34px; border-radius:50%; object-fit:cover; flex:none; }
+.nav .who .t b { display:block; font:600 17px/1.15 -apple-system, system-ui, sans-serif; }
+.nav .who .t span { display:block; font-size:12px; color:var(--ink2); }
+.nav .stack { position:relative; width:38px; height:34px; flex:none; }
+.nav .stack img { position:absolute; width:24px; height:24px; border:1.5px solid #fff; }
+.nav .stack img:first-child { left:0; top:0; } .nav .stack img:last-child { right:0; bottom:0; }
+.lhead { display:flex; justify-content:space-between; align-items:center; padding:6px 20px 4px; }
+.lhead b { font:700 30px/1.1 -apple-system, system-ui, sans-serif; }
+.clist { flex:1; overflow:hidden; }
+.crow { display:flex; gap:12px; padding:11px 20px; border-bottom:1px solid var(--hairline); }
+.crow .ph { width:46px; height:46px; border-radius:50%; flex:none; object-fit:cover; }
+.crow .grp { position:relative; width:46px; height:46px; flex:none; }
+.crow .grp img { position:absolute; width:32px; height:32px; border-radius:50%; border:1.5px solid #fff; object-fit:cover; }
+.crow .grp img:first-child { left:0; top:0; } .crow .grp img:last-child { right:0; bottom:0; }
+.crow .c { flex:1; min-width:0; }
+.crow .top { display:flex; align-items:baseline; gap:6px; }
+.crow .top b { font-size:16px; font-weight:600; white-space:nowrap; }
+.crow .top i { font-style:normal; color:var(--ink2); font-size:13.5px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.crow .top time { margin-left:auto; color:var(--ink2); font-size:13px; flex:none; }
+.crow .bot { display:flex; gap:8px; align-items:flex-start; margin-top:2px; }
+.crow .bot span { flex:1; color:var(--ink2); font-size:14px; line-height:1.3; display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; overflow:hidden; }
+.crow .badge { background:#FF3B30; color:#fff; font:700 11px/16px -apple-system, system-ui; min-width:18px; height:18px; border-radius:9px; text-align:center; padding:1px 5px 0; flex:none; }
+.from { font-size:12px; color:var(--ink2); margin:0 0 3px 44px; font-weight:600; }
+.row.jori img.av { object-fit:cover; }
+.row.me .mention { color:#fff; font-weight:700; background:rgba(255,255,255,.22); border-radius:5px; padding:0 4px; }
 `;
 
 const ICON_FACE = `<svg width="30" height="30" viewBox="0 0 30 30"><defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#2B54B8"/><stop offset="1" stop-color="#0A1640"/></linearGradient></defs><circle cx="15" cy="15" r="15" fill="url(#g)"/><rect x="8" y="11.5" width="5" height="7" rx="2.5" fill="#2AF2D4"/><rect x="17" y="11.5" width="5" height="7" rx="2.5" fill="#2AF2D4"/></svg>`;
 const STATUS = `<div class="status"><span>9:41</span><span class="r"><svg width="18" height="12" viewBox="0 0 18 12"><rect x="0" y="8" width="3" height="4" rx="1" fill="#111"/><rect x="5" y="5.5" width="3" height="6.5" rx="1" fill="#111"/><rect x="10" y="3" width="3" height="9" rx="1" fill="#111"/><rect x="15" y="0" width="3" height="12" rx="1" fill="#111"/></svg><svg width="17" height="12" viewBox="0 0 17 12"><path d="M8.5 2.2c2.4 0 4.6.9 6.2 2.5l1.2-1.2C13.9 1.4 11.3.4 8.5.4S3.1 1.4 1.1 3.5l1.2 1.2C3.9 3.1 6.1 2.2 8.5 2.2Zm0 3.6c1.4 0 2.7.5 3.7 1.5l1.2-1.2C12.1 4.8 10.4 4 8.5 4S4.9 4.8 3.6 6.1l1.2 1.2c1-1 2.3-1.5 3.7-1.5Zm0 3.6c.5 0 1 .2 1.3.6L8.5 11.3 7.2 10c.3-.4.8-.6 1.3-.6Z" fill="#111"/></svg><svg width="27" height="13" viewBox="0 0 27 13"><rect x=".5" y=".5" width="23" height="12" rx="3.5" fill="none" stroke="#111" opacity=".4"/><rect x="2" y="2" width="18" height="9" rx="2" fill="#111"/><rect x="24.5" y="4.5" width="1.5" height="4" rx=".75" fill="#111" opacity=".4"/></svg></span></div>`;
-const NAV = `<div class="nav"><div class="ico"><svg width="18" height="18" viewBox="0 0 18 18"><path d="M3 5h12M3 9h12M3 13h12" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg></div><div class="ttl"><b>${ICON_FACE.replace('width="30" height="30"', 'width="22" height="22"')}Jori<svg width="10" height="10" viewBox="0 0 10 10"><path d="M2 3.5l3 3 3-3" stroke="#6B7280" stroke-width="1.6" fill="none" stroke-linecap="round"/></svg></b><span>On · watching 14 things</span></div><div class="ico"><svg width="18" height="18" viewBox="0 0 18 18"><path d="M4 2.5h7.5l2.5 2.5v10.5H4z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/><path d="M6.5 8h5M6.5 11h5" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg></div></div>`;
-const COMPOSER = `<div class="composer"><div class="plus">+</div><div class="field">Message Jori</div><div class="mic"><svg width="16" height="18" viewBox="0 0 16 18"><rect x="5" y="1" width="6" height="10" rx="3" fill="#fff"/><path d="M2.5 8.5a5.5 5.5 0 0 0 11 0M8 14v3" stroke="#fff" stroke-width="1.6" fill="none" stroke-linecap="round"/></svg></div></div>`;
+// The header of a conversation: back, who you're talking to (photo, name,
+// role), and the people in it.
+const BACK = `<div class="ico"><svg width="18" height="18" viewBox="0 0 18 18"><path d="M11.5 3 5.5 9l6 6" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg></div>`;
+const PEOPLE = `<div class="ico"><svg width="20" height="18" viewBox="0 0 20 18"><circle cx="7" cy="6" r="3.2" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M1.5 16c.6-3 2.8-4.6 5.5-4.6s4.9 1.6 5.5 4.6" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/><circle cx="14" cy="6.5" r="2.6" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M14.5 11.4c2 .3 3.4 1.7 3.9 4" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg></div>`;
+const navFor = (avatarHtml, name, title) => `<div class="nav">${BACK}<div class="who">${avatarHtml}<div class="t"><b>${name}</b><span>${title}</span></div></div>${PEOPLE}</div>`;
+const NAV = navFor(ICON_FACE.replace('width="30" height="30"', 'width="34" height="34"'), "Jori", "Chief of Staff");
+const composer = (to = "Jori") => `<div class="composer"><div class="plus">+</div><div class="field">Message ${to}</div><div class="mic"><svg width="16" height="18" viewBox="0 0 16 18"><rect x="5" y="1" width="6" height="10" rx="3" fill="#fff"/><path d="M2.5 8.5a5.5 5.5 0 0 0 11 0M8 14v3" stroke="#fff" stroke-width="1.6" fill="none" stroke-linecap="round"/></svg></div></div>`;
+const COMPOSER = composer();
 const phone = (inner) => `<div class="phone"><div class="island"></div><div class="screen">${STATUS}${inner}</div></div>`;
 
 const chatThread = `${NAV}<div class="thread">
@@ -460,6 +494,44 @@ const workProject = workPage({
 });
 
 const AV = ICON_FACE.replace("<svg", '<svg class="av"');
+
+// ── The team in the app: a conversation per role, photos, one red badge ────
+// Made-up headshots for the made-up work roster (scripts/screenshots/team/).
+const PHOTO = Object.fromEntries(["morgan", "reese", "paige", "nora", "gia", "kai", "sid", "wren"].map((n) =>
+  [n, `data:image/jpeg;base64,${fs.readFileSync(path.join(__dirname, "team", `${n}.jpg`)).toString("base64")}`])); // kernel-closure-ok: the demo headshots ship in the kernel beside this script
+const JORI_LIST_AV = ICON_FACE.replace('width="30" height="30"', 'width="46" height="46" class="ph"');
+const crow = (av, name, title, preview, time, badge = 0) => `<div class="crow">${av}<div class="c"><div class="top"><b>${name}</b><i>${title}</i><time>${time}</time></div><div class="bot"><span>${preview}</span>${badge ? `<div class="badge">${badge}</div>` : ""}</div></div></div>`;
+const img = (n, cls = "ph") => `<img class="${cls}" src="${PHOTO[n]}">`;
+// A screen as it looks in a role's own conversation: its photo and title in the
+// header and beside its messages, the composer addressed to it.
+const asRole = (screen, key, name, title) => screen
+  .split(NAV).join(navFor(`<img src="${PHOTO[key]}">`, name, title))
+  .split(AV).join(img(key, "av"))
+  .split(COMPOSER).join(composer(name));
+const teamList = `<div class="lhead"><b>Jori</b><div class="ico"><svg width="18" height="18" viewBox="0 0 18 18"><path d="M3 15l1-3.5 8.5-8.5 2.5 2.5L6.5 14z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/></svg></div></div>
+<div class="clist">
+${crow(JORI_LIST_AV, "Jori", "Chief of Staff", "The Harbor &amp; Pine contract is due Friday. Tom's redlines are summarized on the page.", "9:02 AM")}
+${crow(img("nora"), "Nora", "CFO", "Bottom line: two invoices are 30+ days late. Reminders are drafted for your OK.", "8:41 AM", 2)}
+${crow(img("morgan"), "Morgan", "Executive Assistant", "Done: Thursday 11:00 with Alex Chen is booked, Zoom link in the invite.", "8:15 AM", 1)}
+${crow(`<div class="grp">${img("reese", "")}${img("paige", "")}</div>`, "Harbor &amp; Pine renewal", "Reese, Paige", "Paige: Lakeview's two missing admins are invited again.", "Yesterday", 1)}
+${crow(img("kai"), "Kai", "Software Engineer", "Root cause found: multi-site quotes dropped the Atlanta tier. Draft PR is up.", "Thu")}
+${crow(img("sid"), "Sid", "IT &amp; Security", "All clear. Both laptops have the security update.", "Wed")}
+${crow(img("gia"), "Gia", "Marketer", "The case study draft is ready for your edits.", "Wed")}
+${crow(img("wren"), "Wren", "Research Analyst", "Brightline before Thursday: their Series B, and a new COO.", "Mon")}
+</div>`;
+const groupThread = `${navFor(`<div class="stack">${img("reese", "")}${img("nora", "")}</div>`, "Harbor &amp; Pine renewal", "Reese, Paige, Nora")}<div class="thread">
+<div class="sep">Today 10:14 AM</div>
+<div class="from">Reese · Sales Ops</div>
+<div class="row jori">${img("reese", "av")}<div class="b j1" style="max-width:320px">Tom wants quarterly billing instead of annual before they sign. Everything else in the redlines is fine.</div></div>
+<div class="gap"></div>
+<div class="row me"><div class="b"><span class="mention">@Nora</span> can we do quarterly if they sign by the 21st?</div></div>
+<div class="gap"></div>
+<div class="from">Nora · CFO</div>
+<div class="row jori">${img("nora", "av")}<div class="b j1" style="max-width:320px"><b>Bottom line: yes.</b> Quarterly costs us about $1,800 in float over the year, from the contract value and our cash balance as of this morning. Worth it to close by the 21st.</div></div>
+<div class="gap"></div>
+<div class="from">Reese · Sales Ops</div>
+<div class="row jori">${img("reese", "av")}<div class="b j1" style="max-width:320px">Putting it in the reply to Tom now. I'll tell you when he answers.</div></div>
+</div>${composer("the group")}`;
 const workAfterMeeting = `${NAV}<div class="thread">
 <div class="sep">Tue Oct 28, 2:47 PM</div>
 <div class="row jori"><div class="spacer"></div><div class="b j1" style="max-width:330px"><b>Harbor &amp; Pine QBR just ended.</b> 45 minutes on Zoom with Priya and Tom.
@@ -723,14 +795,10 @@ const wSlip = chat("Tuesday 8:30 AM",
   me("Have Nora check it, then send it today.") +
   jori(`Nora will check the numbers by noon, and the send is on your list for 2 PM. I told Reese the renewal stays on track for the 21st.`, { avatar: true }));
 const wReview = chat("Monday 7:45 AM",
-  jori(signed("Kai", `The renewal-quote calculator now prices multiple sites with the volume discount. Tested against the last four quotes.
-<div class="linkcard"><div class="ic">PR</div><div><b>Multi-site pricing in the quote calculator</b><span>Draft pull request · ready for your review</span></div></div>`)) +
-  `<div class="sep" style="margin-top:14px">Monday 9:00 AM</div>` +
-  jori(`<b>Your projects this week</b><ul>
-<li><i>✅</i><span>7 tasks done: 3 yours, 4 by the team.</span></li>
-<li><i>⚠️</i><span>Slipping: Brightline follow-up, a week late.</span></li>
-<li><i>📅</i><span>Due: Harbor &amp; Pine contract out (Fri).</span></li>
-<li><i>👥</i><span>Waiting on you: Gia's case study, Kai's PR.</span></li></ul>`, { avatar: true }));
+  jori(`The renewal-quote calculator now prices multiple sites with the volume discount. Root cause of the old gap: the Atlanta tier was dropped on multi-site quotes. Tested against the last four quotes.
+<div class="linkcard"><div class="ic">PR</div><div><b>Multi-site pricing in the quote calculator</b><span>Draft pull request · ready for your review</span></div></div>`, { avatar: true }) +
+  me("Looks good. Merge it after lunch.") +
+  jori(`Merging at 1. I'll watch the first live quotes and tell you if anything looks off.`, { avatar: true }));
 
 // An inbox where every email comes from the role that sent it, as email-send
 // does for mail to the user (From "Sid (IT & Security)", system/org.md), in a
@@ -775,7 +843,7 @@ ${mrow("Wren (Research Analyst)", "Brightline before Thursday", "Their Series B,
 
 const crypto = require("crypto");
 const stamp = crypto.createHash("sha256")
-  .update([wikiHome, wikiAnswer, wikiPage, appDoc([chatThread]), appDoc([approval]), workPerson, workMeeting, workProject, appDoc([workAfterMeeting]), appDoc([workFollowUps]), slackDoc, appDoc([workEmail]), appDoc([workSchedule]), moneyPage, ...[pMoney, pTrip, pDinner, pTickets, pHome].map((x) => appDoc([x])), projectPage, appDoc([pSlip, pWork]), appDoc([wSlip, wReview]), inboxDoc, JSON.stringify(TEAM), FRAME_CSS, fs.readFileSync(__filename, "utf8")].join("\u0000"))
+  .update([wikiHome, wikiAnswer, wikiPage, appDoc([chatThread]), appDoc([approval]), workPerson, workMeeting, workProject, appDoc([workAfterMeeting]), appDoc([workFollowUps]), slackDoc, appDoc([workEmail]), appDoc([workSchedule]), moneyPage, ...[pMoney, pTrip, pDinner, pTickets, pHome].map((x) => appDoc([x])), projectPage, appDoc([pSlip, pWork]), appDoc([wSlip, wReview]), inboxDoc, appDoc([teamList, groupThread]), JSON.stringify(TEAM), FRAME_CSS, fs.readFileSync(__filename, "utf8")].join("\u0000"))
   .digest("hex");
 if (CHECK) {
   let have = "";
@@ -784,6 +852,11 @@ if (CHECK) {
   console.error("screenshots are stale: run node scripts/screenshots/build.cjs");
   process.exit(1);
 }
+
+// Work screens live in the conversation of the role that owns the work.
+const MORGAN = (x) => asRole(x, "morgan", "Morgan", "Executive Assistant");
+const REESE = (x) => asRole(x, "reese", "Reese", "Sales Ops");
+const KAI = (x) => asRole(x, "kai", "Kai", "Software Engineer");
 
 fs.mkdirSync(OUT, { recursive: true });
 const raw = {
@@ -795,8 +868,8 @@ const raw = {
   workPerson: shoot(workPerson, "raw-work-person", 1280, 900),
   workMeeting: shoot(workMeeting, "raw-work-meeting", 1280, 900),
   workProject: shoot(workProject, "raw-work-project", 1280, 900),
-  workMeetingApp: shoot(appDoc([workAfterMeeting]), "raw-work-app-meeting", 610, 1060, { transparent: true }),
-  workFollowApp: shoot(appDoc([workFollowUps]), "raw-work-app-followups", 610, 1060, { transparent: true }),
+  workMeetingApp: shoot(appDoc([MORGAN(workAfterMeeting)]), "raw-work-app-meeting", 610, 1060, { transparent: true }),
+  workFollowApp: shoot(appDoc([REESE(workFollowUps)]), "raw-work-app-followups", 610, 1060, { transparent: true }),
   money: shoot(moneyPage, "raw-money", 1280, 900),
   slack: shoot(slackDoc, "raw-work-slack", 1280, 860),
   project: shoot(projectPage, "raw-project-tasks", 1280, 900),
@@ -815,10 +888,10 @@ const out = {
   "work-project.png": shoot(frameDoc(browser(raw.workProject, `${URL}/p/project_harbor_pine_renewal`)), "work-project", 1460, 1120, { transparent: true }),
   "work-app-meeting.png": raw.workMeetingApp,
   "work-app-followups.png": raw.workFollowApp,
-  "work-app-pair.png": shoot(appDoc([workAfterMeeting, workFollowUps]), "work-app-pair", 1096, 1060, { transparent: true }),
+  "work-app-pair.png": shoot(appDoc([MORGAN(workAfterMeeting), REESE(workFollowUps)]), "work-app-pair", 1096, 1060, { transparent: true }),
   "work-showcase.png": shoot(frameDoc(`<div class="show">${browser(raw.workPerson, URL)}<div class="ph"><img src="${raw.workFollowApp}"></div></div>`), "work-showcase", 1700, 1180, { transparent: true }),
   "work-slack.png": shoot(frameDoc(appWin(raw.slack, "Fieldstone · #harbor-pine")), "work-slack", 1460, 1080, { transparent: true }),
-  "work-app-email-schedule.png": shoot(appDoc([workEmail, workSchedule]), "work-app-email-schedule", 1096, 1060, { transparent: true }),
+  "work-app-email-schedule.png": shoot(appDoc([MORGAN(workEmail), MORGAN(workSchedule)]), "work-app-email-schedule", 1096, 1060, { transparent: true }),
   "personal-money.png": shoot(frameDoc(browser(raw.money, `${URL}/p/money_2026-11`)), "personal-money", 1460, 1120, { transparent: true }),
   "personal-app-money-home.png": shoot(appDoc([pMoney, pHome]), "personal-app-money-home", 1096, 1060, { transparent: true }),
   "personal-app-trip-dinner.png": shoot(appDoc([pTrip, pDinner]), "personal-app-trip-dinner", 1096, 1060, { transparent: true }),
@@ -826,7 +899,8 @@ const out = {
   "personal-project-tasks.png": shoot(frameDoc(browser(raw.project, `${URL}/p/project_kitchen_reno`)), "personal-project-tasks", 1460, 1120, { transparent: true }),
   "personal-app-chief-of-staff.png": shoot(appDoc([pSlip, pWork]), "personal-app-chief-of-staff", 1096, 1060, { transparent: true }),
   "work-team-inbox.png": shoot(frameDoc(appWin(raw.inbox, "Mail · Inbox")), "work-team-inbox", 1460, 820, { transparent: true }),
-  "work-app-chief-of-staff.png": shoot(appDoc([wSlip, wReview]), "work-app-chief-of-staff", 1096, 1060, { transparent: true }),
+  "work-app-chief-of-staff.png": shoot(appDoc([wSlip, KAI(wReview)]), "work-app-chief-of-staff", 1096, 1060, { transparent: true }),
+  "work-app-team.png": shoot(appDoc([teamList, groupThread]), "work-app-team", 1096, 1060, { transparent: true }),
   "showcase.png": shoot(frameDoc(`<div class="show">${browser(raw.home, URL)}<div class="ph"><img src="${raw.chat}"></div></div>`), "showcase", 1700, 1180, { transparent: true }),
 };
 for (const [name, src] of Object.entries(out)) fs.copyFileSync(src, path.join(OUT, name));

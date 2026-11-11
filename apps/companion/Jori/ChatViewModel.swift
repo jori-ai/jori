@@ -571,17 +571,31 @@ final class ChatViewModel: ObservableObject {
     /// - Parameters:
     ///   - replies: the replies to `message`, in list order.
     ///   - latestAsk: the newest createdAt carrying the same question_id.
+    /// A question or choice card with no expiry of its own stops counting as
+    /// open after this (the user's call, 2026-11-10: 30 days).
+    nonisolated static let questionStaleAfter: TimeInterval = 30 * 86400
+
     nonisolated static func isOpenQuestion(_ message: Message, replies: [Message], latestAsk: Date?) -> Bool {
         guard message.isAssistant, let meta = message.metadata else { return false }
         if replies.contains(where: { $0.role == "user" }) { return false }   // answered or dismissed
         if let state = meta["question_state"], !state.isEmpty { return false }
         if let qid = meta["question_id"], !qid.isEmpty {
-            if let until = meta["question_until"].flatMap(parseISO), until < Date() { return false }
+            if let until = meta["question_until"].flatMap(parseISO) {
+                if until < Date() { return false }
+            } else if message.createdAt < Date().addingTimeInterval(-Self.questionStaleAfter) {
+                // No expiry and 30 days without an answer: not waiting on the
+                // user any more.
+                return false
+            }
             return (latestAsk ?? .distantPast) <= message.createdAt
         }
         if let prompt = ChoicePrompt.from(metadata: meta) {
             if replies.contains(where: { $0.metadata?["choice_default"] != nil }) { return false }
-            if let exp = prompt.expiresAt.flatMap(parseISO), exp < Date() { return false }
+            if let exp = prompt.expiresAt.flatMap(parseISO) {
+                if exp < Date() { return false }
+            } else if message.createdAt < Date().addingTimeInterval(-Self.questionStaleAfter) {
+                return false
+            }
             return true
         }
         return false

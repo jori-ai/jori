@@ -52,6 +52,17 @@ const { installTools } = require(path.join(LIB, "root.cjs"));
 const pr = require(path.join(__dirname, "..", "lib", "projects.js"));
 const pt = require(path.join(__dirname, "..", "lib", "project-tasks.js"));
 
+// gog reads the user's Google login from a keyring that needs this password.
+// The cron jobs source it (script-job-env.sh); an agent's shell may not have
+// it, and a task change now reaches Google right away from wherever it is
+// made. Only this one key is read, never the rest of .env.
+if (!process.env.GOG_KEYRING_PASSWORD) {
+  try {
+    const line = fs.readFileSync(installTools(".env"), "utf8").split("\n").find((l) => l.startsWith("GOG_KEYRING_PASSWORD="));
+    if (line) process.env.GOG_KEYRING_PASSWORD = line.slice("GOG_KEYRING_PASSWORD=".length).trim();
+  } catch { /* no .env: the half-hourly sync still has it */ }
+}
+
 const args = process.argv.slice(2);
 const cmd = args[0];
 
@@ -99,6 +110,75 @@ function brief(t) {
   return { id: t.id, project: t.project, title: t.title, owner: t.owner, due: t.due, status: t.status, jori: t.jori.mode, state: t.jori.state };
 }
 
+// Make the user's task list and the ledger agree, now.
+function syncNow({ dryRun = false } = {}) {
+  const cfg = pr.settings();
+  const names = {};
+  try { for (const p of pr.listProjects(ws()).projects) names[p.id] = p.name; } catch { /* names are a nicety */ }
+  const report = pt.withLock((l) => pt.syncGoogle(l, pt.gogTasksAdapter(pr.gogJson), {
+    list: cfg.tasks_list || "@default", projectNames: names, dryRun,
+  }));
+  const changed = new Set();
+  const l = pt.load();
+  for (const k of ["closed_by_user", "reopened_by_user", "adopted_edits"]) for (const tid of report[k]) if (l.tasks[tid]) changed.add(l.tasks[tid].project);
+  const refreshed = dryRun ? [] : refresh([...changed]);
+  // The user's own changes on their list are messages to the chief of staff
+  // (the user, 2026-11-10: ticking a task off means "I finished this" or "I
+  // don't need to do this", so ask which; a new date matters, so ask why). One
+  // question card per change, in the coordinator's conversation; the answer
+  // comes back to the chat agent, which acts on it (agent/chat-agent/CLAUDE.md
+  // § Project task changes). Renames and reopens are only recorded.
+  if (!dryRun && report.changes.length) askAboutChanges(report.changes, names);
+  const counts = Object.fromEntries(Object.entries(report).map(([k, v]) => [k, v.length]));
+  return { report, counts, errors: report.errors, refreshed };
+}
+
+const fmtDay = (d) => { try { return new Date(`${d}T12:00:00Z`).toLocaleDateString("en-US", { weekday: "short", month: "short", day: "numeric", timeZone: "UTC" }); } catch { return d; } };
+
+function askAboutChanges(changes, names) {
+  const { spawnSync } = require("node:child_process");
+  const choice = installTools("bin", "choice");
+  for (const c of changes) {
+    const proj = names[c.project] ? ` (${names[c.project]})` : "";
+    let prompt, options;
+    if (c.kind === "completed") {
+      prompt = `You ticked off "${c.title}"${proj}. Did you finish it, or don't you need it any more?`;
+      options = ["Finished it", "Don't need it any more", "Something else|type it"];
+    } else if (c.kind === "deleted") {
+      prompt = `You took "${c.title}"${proj} off your list. Not needed any more, or already done?`;
+      options = ["Not needed any more", "Already done", "Keep it, that was a mistake"];
+    } else if (c.kind === "rescheduled") {
+      prompt = `You moved "${c.title}"${proj} from ${c.from ? fmtDay(c.from) : "no date"} to ${c.to ? fmtDay(c.to) : "no date"}. What changed?`;
+      options = ["Waiting on someone", "Ran out of time", "Plans changed", "Not a priority right now", "Something else|type it"];
+    } else continue;
+    const args = [choice, "send", "--kind", "project_task_change", "--ref", `${c.id}:${c.kind}`,
+      "--prompt", prompt, "--text", `${prompt}\n(project task · ${c.id} · ${c.kind})`,
+      "--channel", "questions", "--no-push", "--expires-h", String(30 * 24)];
+    for (const o of options) args.push("--option", o);
+    const r = spawnSync("python3", args, { encoding: "utf8", timeout: 60000 });
+    if (r.status !== 0) console.error(`projects: question for ${c.id} not sent: ${String(r.stderr || "").slice(0, 200)}`);
+  }
+}
+
+// A change to one of the user's tasks reaches their task list right away,
+// like an email that is sent, not queued (the user, 2026-11-10: "managing tasks
+// is like managing email — it should be done right away"; a task dropped in
+// chat sat on their list until the half-hourly sync). The cron sync stays as
+// the backstop: if this push fails (no network, no keychain), it says so and
+// the next sync catches up. --no-sync skips it for batch callers that sync once
+// at the end.
+function pushNow(t) {
+  if (flag("no-sync") || !t || t.owner !== "user") return undefined;
+  try {
+    const r = syncNow();
+    if (r.errors.length) return { pending: true, error: String(r.errors[0].error || "").slice(0, 160) };
+    const done = Object.entries(r.counts).filter(([, n]) => n).map(([k, n]) => `${k} ${n}`).join(", ");
+    return { synced: true, ...(done ? { changes: done } : {}) };
+  } catch (e) {
+    return { pending: true, error: `${String(e.message || e).slice(0, 160)} (the half-hourly sync will retry)` };
+  }
+}
+
 function taskCmd(sub) {
   const id = args[2] && !args[2].startsWith("--") ? args[2] : null;
   const by = str("by");
@@ -122,7 +202,7 @@ function taskCmd(sub) {
       project, title: str("title"), owner: str("owner"), due: str("due"), who: str("who"), why: str("why"),
       jori: str("jori"), size: str("size"), plan: str("plan"), page_title: str("page-title"), by,
     }));
-    console.log(JSON.stringify({ ...brief(t), refreshed: refresh([project]) }));
+    console.log(JSON.stringify({ ...brief(t), refreshed: refresh([project]), google: pushNow(t) }));
     return 0;
   }
 
@@ -132,21 +212,33 @@ function taskCmd(sub) {
     if (str("due")) f.due = str("due");
     for (const k of Object.keys(f)) if (f[k] === undefined) delete f[k];
     const t = pt.withLock((l) => pt.updateTask(l, id, f));
-    console.log(JSON.stringify({ ...brief(t), refreshed: refresh([t.project]) }));
+    console.log(JSON.stringify({ ...brief(t), refreshed: refresh([t.project]), google: pushNow(t) }));
     return 0;
   }
 
   if (sub === "done" || sub === "drop") {
     if (!id) die(`task ${sub} needs a task id`);
     const t = pt.withLock((l) => pt.closeTask(l, id, { status: sub === "done" ? "done" : "dropped", note: str("note"), by }));
-    console.log(JSON.stringify({ ...brief(t), refreshed: refresh([t.project]) }));
+    console.log(JSON.stringify({ ...brief(t), refreshed: refresh([t.project]), google: pushNow(t) }));
+    return 0;
+  }
+
+  if (sub === "reason") {
+    // Why the user changed a task (the answer to a task-change question), kept on the task.
+    if (!id || !str("text")) die("task reason needs a task id and --text");
+    const t = pt.withLock((l) => {
+      const x = l.tasks[id]; if (!x) throw new Error(`no task ${id}`);
+      (x.change_reasons = x.change_reasons || []).push({ at: new Date().toISOString(), kind: str("kind") || null, text: str("text") });
+      return x;
+    });
+    console.log(JSON.stringify({ ...brief(t), reasons: t.change_reasons.length }));
     return 0;
   }
 
   if (sub === "reopen") {
     if (!id) die("task reopen needs a task id");
     const t = pt.withLock((l) => pt.reopenTask(l, id, { by, due: str("due") }));
-    console.log(JSON.stringify({ ...brief(t), refreshed: refresh([t.project]) }));
+    console.log(JSON.stringify({ ...brief(t), refreshed: refresh([t.project]), google: pushNow(t) }));
     return 0;
   }
 
@@ -220,21 +312,12 @@ function taskCmd(sub) {
   }
 
   if (sub === "sync") {
-    const names = {};
-    try { for (const p of pr.listProjects(ws()).projects) names[p.id] = p.name; } catch { /* names are a nicety */ }
-    const report = pt.withLock((l) => pt.syncGoogle(l, pt.gogTasksAdapter(pr.gogJson), {
-      list: cfg.tasks_list || "@default", projectNames: names, dryRun: !!flag("dry-run"),
-    }));
-    const changed = new Set();
-    const l = pt.load();
-    for (const k of ["closed_by_user", "reopened_by_user", "adopted_edits"]) for (const tid of report[k]) if (l.tasks[tid]) changed.add(l.tasks[tid].project);
-    const refreshed = flag("dry-run") ? [] : refresh([...changed]);
-    const counts = Object.fromEntries(Object.entries(report).map(([k, v]) => [k, v.length]));
-    console.log(JSON.stringify({ ...counts, errors: report.errors, refreshed, ...(flag("verbose") ? { report } : {}) }));
-    return report.errors.length ? 1 : 0;
+    const r = syncNow({ dryRun: !!flag("dry-run") });
+    console.log(JSON.stringify({ ...r.counts, errors: r.errors, refreshed: r.refreshed, ...(flag("verbose") ? { report: r.report } : {}) }));
+    return r.errors.length ? 1 : 0;
   }
 
-  console.error("usage: projects task list|add|update|done|drop|reopen|adopt|nudged|approve|work-queue|work-start|work-result|work-budget|sync");
+  console.error("usage: projects task list|add|update|done|drop|reopen|reason|adopt|nudged|approve|work-queue|work-start|work-result|work-budget|sync");
   return 1;
 }
 

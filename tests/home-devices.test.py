@@ -52,6 +52,8 @@ class Fake:
 
     def __init__(self):
         self.lan = {ip: "ping" for ip in LEASES.values()}  # ip -> "ping" | "arp <mac>" | "none"
+        self.leases = dict(LEASES)  # what the router's lease file holds
+        self.neigh = []  # the router's `ip neigh` lines: "<ip> dev br-lan lladdr <mac> <STATE>"
         self.remote_up = {"198.51.100.5": True, "198.51.100.36": True}
         self.ring = {"CB Porch": {"conn": "online", "battery": 80}}
         self.lock = True
@@ -68,7 +70,9 @@ class Fake:
             if not self.ssh_ok:
                 return Res(255, "", "ssh: connect timed out")
             if "dhcp.leases" in cmd:
-                out = "".join(f"1700000000 {m} {ip} host{i} *\n" for i, (m, ip) in enumerate(LEASES.items()))
+                out = "".join(f"1700000000 {m} {ip} host{i} *\n" for i, (m, ip) in enumerate(self.leases.items()))
+            elif cmd.startswith("ip neigh show dev"):
+                out = "".join(line + "\n" for line in self.neigh)
             else:
                 out = "".join(f"{ip} {self.lan[ip]}\n" for ip in (input or "").split())
         elif exe == "ping":
@@ -220,6 +224,41 @@ class HomeDevicesTest(unittest.TestCase):
         self.assertEqual(res["Test extender client"], (True, "192.0.2.12 ARP"))
         self.assertEqual(res["Test lamp"], (False, "192.0.2.11 answered by another MAC 02:00:00:00:00:77"))
 
+    def test_missing_lease_falls_back_to_the_arp_table(self):
+        # dnsmasq restarted and lost two records; both devices are still on the LAN.
+        mod = self.load()
+        del self.fake.leases["02:00:00:00:00:01"]
+        del self.fake.leases["02:00:00:00:00:02"]
+        self.fake.lan["192.0.2.21"] = "ping"
+        self.fake.lan["192.0.2.22"] = "ping"
+        self.fake.neigh = [
+            "192.0.2.21 dev br-lan lladdr 02:00:00:00:00:01 REACHABLE",
+            "192.0.2.99 dev br-lan lladdr 02:00:00:00:00:a2 STALE",  # an older address of the extender
+            "192.0.2.22 dev br-lan lladdr 02:00:00:00:00:a2 REACHABLE",  # the fresh one wins
+            "fe80::1 dev br-lan lladdr 02:00:00:00:00:03 REACHABLE",  # IPv6 is no evidence
+        ]
+        res = mod.check_all(mod.roster_cfg())
+        self.assertEqual(res["Test lamp"], (True, "192.0.2.21 ping (no lease record, from ARP table)"))
+        self.assertEqual(res["Test extender client"], (True, "192.0.2.22 ping (no lease record, from ARP table)"))
+        self.assertEqual(res["Test doorbell"], (True, "192.0.2.13 ping"))  # still has its lease
+
+    def test_missing_lease_and_no_usable_arp_entry_is_still_down(self):
+        mod = self.load()
+        del self.fake.leases["02:00:00:00:00:01"]
+        del self.fake.leases["02:00:00:00:00:03"]
+        self.fake.neigh = ["192.0.2.31 dev br-lan lladdr 02:00:00:00:00:03 FAILED"]
+        res = mod.check_all(mod.roster_cfg())
+        self.assertEqual(res["Test lamp"], (False, "no DHCP lease"))
+        self.assertEqual(res["Test doorbell"], (False, "no DHCP lease"))
+
+    def test_missing_lease_with_a_dead_arp_entry_is_down(self):
+        mod = self.load()
+        del self.fake.leases["02:00:00:00:00:01"]
+        self.fake.lan["192.0.2.41"] = "none"
+        self.fake.neigh = ["192.0.2.41 dev br-lan lladdr 02:00:00:00:00:01 STALE"]
+        res = mod.check_all(mod.roster_cfg())
+        self.assertEqual(res["Test lamp"], (False, "192.0.2.41 no ping, no ARP (no lease record, from ARP table)"))
+
     def test_router_unreachable_judges_nothing_behind_it(self):
         mod = self.load()
         self.fake.ssh_ok = False
@@ -282,16 +321,10 @@ class HomeDevicesTest(unittest.TestCase):
 
     def test_unlisted_skips_roster_and_ignored(self):
         mod = self.load()
-        global LEASES
-        saved = dict(LEASES)
-        LEASES.update({"02:00:00:00:00:99": "192.0.2.99", "02:00:00:00:00:55": "192.0.2.55"})
-        try:
-            out = io.StringIO()
-            with contextlib.redirect_stdout(out):
-                mod.cmd_unlisted(None, mod.roster_cfg())
-        finally:
-            LEASES.clear()
-            LEASES.update(saved)
+        self.fake.leases.update({"02:00:00:00:00:99": "192.0.2.99", "02:00:00:00:00:55": "192.0.2.55"})
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            mod.cmd_unlisted(None, mod.roster_cfg())
         self.assertIn("02:00:00:00:00:55", out.getvalue())
         self.assertNotIn("02:00:00:00:00:99", out.getvalue())
         self.assertNotIn("02:00:00:00:00:01", out.getvalue())

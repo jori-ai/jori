@@ -358,9 +358,14 @@ struct ContentView: View {
         var frame = hidden
         frame.size.width += width
         if frame.maxX > visible.maxX { frame.size.width = max(hidden.width, visible.maxX - frame.minX) }
-        window.setFrame(frame, display: true, animate: true)
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
-            if window.frame != frame { window.setFrame(frame, display: true, animate: true) }
+        // Instant, not animated: an animated window resize ran on AppKit's
+        // own clock beside the sidebar's slide (plus a corrective re-apply at
+        // 0.4 s), and the two motions fought, so the conversation jittered.
+        // Now the slide is the only motion; the conversation's width is held
+        // meanwhile (holdDetailWidthDuringSidebarAnimation).
+        window.setFrame(frame, display: true, animate: false)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.45) {
+            if window.frame != frame { window.setFrame(frame, display: true, animate: false) }
         }
     }
 
@@ -377,9 +382,9 @@ struct ContentView: View {
         guard taken > 0 else { return }
         frame.size.width = target
         windowShrunkForSidebar = taken
-        window.setFrame(frame, display: true, animate: true)
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
-            if window.frame != frame { window.setFrame(frame, display: true, animate: true) }
+        // Instant, after the sidebar has slid away (see growWindowForSidebar).
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+            window.setFrame(frame, display: true, animate: false)
         }
     }
 
@@ -433,6 +438,9 @@ struct ContentView: View {
                 ForEach(team.visibleConversations) { conversation in
                     ConversationRowView(conversation: conversation, team: team)
                         .tag(Destination.conversation(conversation.id))
+                        .modifier(ConversationDeleteActions(conversation: conversation, team: team) { gone in
+                            if viewModel.currentConversation == gone { go(.conversation(team.coordinatorConversation)) }
+                        })
                 }
             } header: {
                 HStack {
@@ -496,6 +504,7 @@ struct ContentView: View {
                     ConversationRowView(conversation: conversation, team: team)
                 }
                 .buttonStyle(.plain)
+                .modifier(ConversationDeleteActions(conversation: conversation, team: team))
             }
         }
         .listStyle(.plain)
@@ -1071,11 +1080,14 @@ struct ContentView: View {
             }
             Group {
                 OpenQuestionsTray(
-                    questions: viewModel.openQuestions.filter { !onScreenQuestionIds.contains($0.id) },
+                    questions: trayQuestions,
                     reveal: { quoteJumpTarget = $0.id },
                     answer: { beginReply(to: $0) },
-                    dismiss: { viewModel.dismissQuestion($0) },
-                    select: { option, q in Task { await viewModel.sendMessage(option.label, replyTo: q.id) } }
+                    dismiss: { q in
+                        viewModel.dismissQuestion(q)
+                        Task { try? await Task.sleep(for: .seconds(1)); await team.loadSummaries() }
+                    },
+                    select: { option, q in Task { await viewModel.sendMessage(option.label, replyTo: q.id); await team.loadSummaries() } }
                 )
                 .padding(.horizontal, 14)
             }
@@ -1083,6 +1095,16 @@ struct ContentView: View {
         }
         .animation(.spring(response: 0.35, dampingFraction: 0.8), value: viewModel.isWaitingForResponse)
         .animation(.spring(response: 0.35, dampingFraction: 0.8), value: isScrolledUp)
+    }
+
+    /// The tray: the thread's own open questions not on screen, plus any the
+    /// badge counts that are too old to be loaded here (answer or dismiss them
+    /// from the tray), oldest first.
+    private var trayQuestions: [Message] {
+        let loaded = viewModel.openQuestions.filter { !onScreenQuestionIds.contains($0.id) }
+        let loadedIds = Set(viewModel.messages.map(\.id))
+        let older = (team.openQuestionMessages[viewModel.currentConversation] ?? []).filter { !loadedIds.contains($0.id) }
+        return (older + loaded).sorted { $0.createdAt < $1.createdAt }
     }
 
     private var jumpToLatestButton: some View {
@@ -1424,8 +1446,12 @@ struct ContentView: View {
                     badges.activeConversation = viewModel.currentConversation
                     badges.start()
                 }
-                .onChange(of: viewModel.openQuestions.count) { _, n in
-                    badges.setOpenQuestions(n, in: viewModel.currentConversation)
+                // One source for the counts: the list's own query. The thread
+                // only sees the messages it has loaded, so letting it override
+                // the count made a badge clear on open and return on the way
+                // back. An answer here just triggers a recount.
+                .onChange(of: viewModel.openQuestions.count) { _, _ in
+                    Task { await badges.loadSummaries() }
                 }
                 .onChange(of: viewModel.currentConversation) { oldConversation, newConversation in
                     badges.activeConversation = newConversation

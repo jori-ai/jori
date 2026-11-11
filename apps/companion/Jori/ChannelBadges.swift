@@ -31,6 +31,8 @@
 
 import Foundation
 import SwiftUI
+import PhotosUI
+import ImageIO
 import Supabase
 import Realtime
 
@@ -46,10 +48,13 @@ struct TeamMember: Identifiable, Codable, Equatable, Hashable {
     var chiefOfStaff: Bool
     var enabled: Bool
     var sort: Int
+    /// A photo the user picked for this role; nil = its initials.
+    var avatarURL: String? = nil
 
     enum CodingKeys: String, CodingKey {
         case id, name, title, responsibility, enabled, sort
         case chiefOfStaff = "chief_of_staff"
+        case avatarURL = "avatar_url"
     }
 
     /// "Ada · CFO": a name always travels with its role.
@@ -283,7 +288,7 @@ final class TeamStore: ObservableObject {
             try await SupabaseManager.ensureAuthenticated()
             let rows: [TeamMember] = try await SupabaseManager.shared
                 .from(Self.teamTable)
-                .select("id,name,title,responsibility,chief_of_staff,enabled,sort")
+                .select("id,name,title,responsibility,chief_of_staff,enabled,sort,avatar_url")
                 .eq("enabled", value: true)
                 .order("sort", ascending: true)
                 .execute()
@@ -313,6 +318,8 @@ final class TeamStore: ObservableObject {
     /// The think-before-you-speak gate's verdict on each message, judged in
     /// shadow (nothing is held), shown under the message for the user to grade.
     @Published var gateReviews: [UUID: GateReview] = [:]
+    /// Every open question the badges count, by conversation (loadSummaries).
+    @Published var openQuestionMessages: [String: [Message]] = [:]
     static let gateReviewsTable = "jori_gate_reviews"
 
     func loadGateReviews(_ conversationId: String) async {
@@ -436,17 +443,23 @@ final class TeamStore: ObservableObject {
                 next[key] = s
             }
 
-            // Open questions: the last 45 days of questions and choice cards, with
-            // the replies that would close them, judged by the shared rule.
-            let since = Date().addingTimeInterval(-45 * 86400).ISO8601Format()
+            // Open questions: questions and choice cards inside the open window
+            // (ChatViewModel.questionStaleAfter, the same cutoff the thread uses)
+            // that carry no recorded state, with the replies that would close
+            // them, judged by the shared rule. Only rows without a state are
+            // fetched: with every answered question in the window too, a
+            // 300-row cap cut off the older open ones, and a badge went missing
+            // while the thread still showed them open.
+            let since = Date().addingTimeInterval(-ChatViewModel.questionStaleAfter).ISO8601Format()
             let asked: [Message] = try await client
                 .from(DBTables.messages)
                 .select(Message.columns)
                 .eq("role", value: "assistant")
                 .gte("created_at", value: since)
                 .or("metadata->>question_id.not.is.null,metadata->>\(ChoicePrompt.metadataKey).not.is.null")
+                .is("metadata->>question_state", value: nil)
                 .order("created_at", ascending: false)
-                .limit(300)
+                .limit(1000)
                 .execute()
                 .value
             var replies: [Message] = []
@@ -461,6 +474,11 @@ final class TeamStore: ObservableObject {
             let open = ChatViewModel.openQuestions(in: (asked + replies).sorted { $0.createdAt < $1.createdAt })
             var openBy: [String: Int] = [:]
             for q in open { openBy[q.conversationId, default: 0] += 1 }
+            // The questions themselves, so the conversation's tray can list
+            // every one the badge counts, including any too old to have been
+            // loaded into the thread (one sat 24 days back, counted and unfindable).
+            let byConversation = Dictionary(grouping: open, by: \.conversationId)
+            if byConversation != openQuestionMessages { openQuestionMessages = byConversation }
             for key in Set(next.keys).union(openBy.keys) {
                 var s = next[key] ?? ConversationSummary()
                 s.openQuestions = openBy[key] ?? 0
@@ -481,6 +499,28 @@ final class TeamStore: ObservableObject {
     }
 
     // MARK: Writes
+
+    /// Delete a conversation from the list. It is hidden (archived), not
+    /// erased: its messages stay in Jori's memory. A role's own conversation
+    /// comes back by itself the next time that role writes (the database
+    /// trigger un-archives it); a deleted group stays gone. The coordinator's
+    /// conversation can't be deleted.
+    func deleteConversation(_ id: String) async {
+        guard id != coordinatorConversation else { return }
+        struct Patch: Encodable { let archived: Bool }
+        if let i = conversations.firstIndex(where: { $0.id == id }) { conversations[i].archived = true }
+        do {
+            try await SupabaseManager.ensureAuthenticated()
+            try await SupabaseManager.shared
+                .from(Self.conversationsTable)
+                .update(Patch(archived: true))
+                .eq("id", value: id)
+                .execute()
+            await loadConversations()
+        } catch {
+            print("[Team] delete conversation failed: \(error)")
+        }
+    }
 
     private struct ConversationRow: Encodable {
         let id: String
@@ -547,6 +587,58 @@ final class TeamStore: ObservableObject {
 
     /// Rename a role: its name, its title, or both. The roster sync keeps the
     /// user's choice from now on (renamed_by_user).
+    /// Give a role a photo: shrink what the user picked to a 512 px JPEG,
+    /// upload it next to the chat attachments, and point the role at it.
+    /// Its initials stay the default (removePhoto goes back to them).
+    func setPhoto(_ id: String, imageData: Data) async {
+        guard let jpeg = Self.avatarJPEG(from: imageData) else { print("[Team] photo: unreadable image"); return }
+        let path = "team/\(id)-\(UUID().uuidString.prefix(8)).jpg"
+        do {
+            try await SupabaseManager.ensureAuthenticated()
+            let client = SupabaseManager.shared
+            try await client.storage.from(Install.attachmentsBucket)
+                .upload(path, data: jpeg, options: .init(contentType: "image/jpeg"))
+            let url = try client.storage.from(Install.attachmentsBucket).getPublicURL(path: path).absoluteString
+            await writeAvatar(id, url)
+        } catch {
+            print("[Team] photo upload failed: \(error)")
+        }
+    }
+
+    func removePhoto(_ id: String) async { await writeAvatar(id, nil) }
+
+    private func writeAvatar(_ id: String, _ url: String?) async {
+        struct Patch: Encodable { let avatar_url: String?; let updated_at: String
+            func encode(to e: Encoder) throws { var c = e.container(keyedBy: K.self); try c.encode(avatar_url, forKey: .avatar_url); try c.encode(updated_at, forKey: .updated_at) }
+            enum K: String, CodingKey { case avatar_url, updated_at } }
+        if let i = team.firstIndex(where: { $0.id == id }) { team[i].avatarURL = url }
+        do {
+            try await SupabaseManager.ensureAuthenticated()
+            try await SupabaseManager.shared
+                .from(Self.teamTable)
+                .update(Patch(avatar_url: url, updated_at: Date().ISO8601Format()))
+                .eq("id", value: id)
+                .execute()
+        } catch {
+            print("[Team] photo save failed: \(error)")
+        }
+    }
+
+    /// Any image the system can read (HEIC included) as a square-ish 512 px JPEG.
+    static func avatarJPEG(from data: Data) -> Data? {
+        guard let src = CGImageSourceCreateWithData(data as CFData, nil) else { return nil }
+        let opts: [CFString: Any] = [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceThumbnailMaxPixelSize: 512,
+        ]
+        guard let img = CGImageSourceCreateThumbnailAtIndex(src, 0, opts as CFDictionary) else { return nil }
+        let out = NSMutableData()
+        guard let dst = CGImageDestinationCreateWithData(out, "public.jpeg" as CFString, 1, nil) else { return nil }
+        CGImageDestinationAddImage(dst, img, [kCGImageDestinationLossyCompressionQuality: 0.85] as CFDictionary)
+        return CGImageDestinationFinalize(dst) ? out as Data : nil
+    }
+
     func rename(_ id: String, name: String, title: String) async {
         let n = name.trimmingCharacters(in: .whitespacesAndNewlines)
         let t = title.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -631,13 +723,28 @@ struct TeamAvatar: View {
         }
     }
 
+    /// The role's photo when the user picked one, its initials otherwise
+    /// (and while the photo loads, or if it can't).
     private func circle(_ m: TeamMember, size: CGFloat) -> some View {
+        initials(m, size: size)
+            .overlay {
+                if let s = m.avatarURL, let url = URL(string: s) {
+                    AsyncImage(url: url) { phase in
+                        if let image = phase.image { image.resizable().scaledToFill() } else { Color.clear }
+                    }
+                    .frame(width: size, height: size)
+                    .clipShape(Circle())
+                }
+            }
+            .overlay(Circle().strokeBorder(.white.opacity(0.6), lineWidth: members.count > 1 ? 1.5 : 0))
+    }
+
+    private func initials(_ m: TeamMember, size: CGFloat) -> some View {
         Text(m.initials)
             .font(.system(size: size * 0.38, weight: .semibold, design: .rounded))
             .foregroundStyle(.white)
             .frame(width: size, height: size)
             .background(Circle().fill(m.tint.gradient))
-            .overlay(Circle().strokeBorder(.white.opacity(0.6), lineWidth: members.count > 1 ? 1.5 : 0))
     }
 }
 
@@ -839,9 +946,35 @@ struct RenameRoleRow: View {
         return !n.isEmpty && !t.isEmpty && (n != member.name || t != member.title)
     }
 
+    @State private var pick: PhotosPickerItem?
+
     var body: some View {
         HStack(alignment: .center, spacing: 12) {
-            TeamAvatar(members: [member], size: 34)
+            // Tap the avatar to give the role a photo; its initials are the default.
+            PhotosPicker(selection: $pick, matching: .images) {
+                TeamAvatar(members: [member], size: 40)
+                    .overlay(alignment: .bottomTrailing) {
+                        Image(systemName: "camera.fill")
+                            .font(.system(size: 9, weight: .bold))
+                            .foregroundStyle(.white)
+                            .padding(4)
+                            .background(Circle().fill(.black.opacity(0.55)))
+                    }
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Change \(member.name)'s photo")
+            .contextMenu {
+                if member.avatarURL != nil {
+                    Button("Use initials instead", role: .destructive) { Task { await team.removePhoto(member.id) } }
+                }
+            }
+            .onChange(of: pick) { _, item in
+                guard let item else { return }
+                Task {
+                    if let data = try? await item.loadTransferable(type: Data.self) { await team.setPhoto(member.id, imageData: data) }
+                    pick = nil
+                }
+            }
             VStack(alignment: .leading, spacing: 4) {
                 TextField("Name", text: $name)
                     .font(.headline)
@@ -1022,5 +1155,46 @@ struct GateReviewLine: View {
         .padding(.horizontal, 8)
         .padding(.top, 2)
         .onAppear { note = review.note ?? "" }
+    }
+}
+
+
+// MARK: - Deleting a conversation
+
+/// Swipe (iPhone, iPad) or right-click / long-press: delete a conversation or a
+/// group, after a confirmation that says what deleting means.
+struct ConversationDeleteActions: ViewModifier {
+    let conversation: Conversation
+    @ObservedObject var team: TeamStore
+    var onDeleted: (String) -> Void = { _ in }
+    @State private var confirming = false
+
+    private var deletable: Bool { conversation.id != team.coordinatorConversation }
+
+    func body(content: Content) -> some View {
+        if deletable {
+            content
+                #if os(iOS)
+                .swipeActions(edge: .trailing, allowsFullSwipe: false) {
+                    Button(role: .destructive) { confirming = true } label: { Label("Delete", systemImage: "trash") }
+                }
+                #endif
+                .contextMenu {
+                    Button(role: .destructive) { confirming = true } label: { Label("Delete conversation", systemImage: "trash") }
+                }
+                .confirmationDialog(conversation.isGroup ? "Delete this group?" : "Delete this conversation?",
+                                    isPresented: $confirming, titleVisibility: .visible) {
+                    Button("Delete", role: .destructive) {
+                        Task { await team.deleteConversation(conversation.id); onDeleted(conversation.id) }
+                    }
+                    Button("Cancel", role: .cancel) {}
+                } message: {
+                    Text(conversation.isGroup
+                         ? "The group leaves your list. Jori keeps its messages in its memory."
+                         : "It leaves your list until \(team.title(of: conversation.id)) next writes to you. Jori keeps the messages in its memory.")
+                }
+        } else {
+            content
+        }
     }
 }

@@ -43,7 +43,8 @@
       "ping-flush",
       "control-scan",
       "dashboard",
-      "jori-sync"
+      "jori-sync",
+      "home-devices"
     ],
     "intents": [
       "cyber-watch",

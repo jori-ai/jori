@@ -245,6 +245,34 @@ def leases(site):
     return out
 
 
+def neighbors(site):
+    """MAC -> IPv4 from the router's neighbour (ARP) table, for a device whose
+    DHCP lease record is missing (the lease file is only a convenience: a
+    dnsmasq restart that drops or rejects lines loses the records of devices
+    that are still on the LAN, and a device with a static address never had
+    one). A fresh entry beats a stale one; an unresolved one is no evidence."""
+    iface = site.get("lan_iface", "br-lan")
+    try:
+        r = router_ssh(site, f"ip neigh show dev {iface}")
+    except Exception:
+        return {}
+    if r.returncode != 0:
+        return {}
+    rank = {"REACHABLE": 0, "DELAY": 1, "PROBE": 1, "PERMANENT": 1, "STALE": 2}
+    best = {}
+    for line in r.stdout.splitlines():
+        parts = line.split()
+        if len(parts) < 4 or "lladdr" not in parts or ":" in parts[0]:
+            continue
+        mac = parts[parts.index("lladdr") + 1].lower()
+        state = parts[-1]
+        if state not in rank:
+            continue  # FAILED / INCOMPLETE
+        if mac not in best or rank[state] < best[mac][0]:
+            best[mac] = (rank[state], parts[0])
+    return {mac: ip for mac, (_, ip) in best.items()}
+
+
 def probe(site, ips):
     if not ips:
         return {}
@@ -373,6 +401,18 @@ def check_router_site(cfg, site, devs):
 
     lan = [d for d in devs if d.get("check", "lan") == "lan"]
     ip_of = {d["mac"]: lease.get(d["mac"], (None, None))[0] for d in lan}
+    # No lease record is not proof the device is gone: fall back to where the
+    # router's ARP table has its MAC (or an alt MAC), then probe that address as
+    # usual. Only a device with neither a lease nor a neighbour entry is "no DHCP lease".
+    no_lease = {d["mac"] for d in lan if not ip_of[d["mac"]]}
+    if no_lease:
+        seen = neighbors(site)
+        for d in lan:
+            if d["mac"] in no_lease:
+                for m in [d["mac"]] + d.get("alt_macs", []):
+                    if seen.get(m.lower()):
+                        ip_of[d["mac"]] = seen[m.lower()]
+                        break
     got = probe(site, sorted({ip for ip in ip_of.values() if ip}))
 
     for d in devs:
@@ -388,16 +428,17 @@ def check_router_site(cfg, site, devs):
                 results[d["name"]] = (False, "no DHCP lease")
                 continue
             p = got.get(ip)
+            via = " (no lease record, from ARP table)" if d["mac"] in no_lease else ""
             if not p:
-                results[d["name"]] = (None, f"{ip}: probe returned nothing")
+                results[d["name"]] = (None, f"{ip}: probe returned nothing{via}")
             elif p[0] == "ping":
-                results[d["name"]] = (True, f"{ip} ping")
+                results[d["name"]] = (True, f"{ip} ping{via}")
             elif p[0] == "arp" and len(p) > 1 and p[1].lower() in [d["mac"]] + d.get("alt_macs", []):
-                results[d["name"]] = (True, f"{ip} ARP")
+                results[d["name"]] = (True, f"{ip} ARP{via}")
             elif p[0] == "arp":
-                results[d["name"]] = (False, f"{ip} answered by another MAC {p[1]}")
+                results[d["name"]] = (False, f"{ip} answered by another MAC {p[1]}{via}")
             else:
-                results[d["name"]] = (False, f"{ip} no ping, no ARP")
+                results[d["name"]] = (False, f"{ip} no ping, no ARP{via}")
     return results
 
 

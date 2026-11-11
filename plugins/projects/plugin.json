@@ -32,7 +32,7 @@
     },
     {
       "label": "projects-task-sync",
-      "cron": "*/30 * * * *",
+      "cron": "*/10 * * * *",
       "run": "bin/projects-task-sync",
       "log": "agent/logs/projects-task-sync.log"
     }
