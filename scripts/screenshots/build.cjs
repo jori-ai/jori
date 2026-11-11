@@ -502,6 +502,12 @@ const PHOTO = Object.fromEntries(["morgan", "reese", "paige", "nora", "gia", "ka
 const JORI_LIST_AV = ICON_FACE.replace('width="30" height="30"', 'width="46" height="46" class="ph"');
 const crow = (av, name, title, preview, time, badge = 0) => `<div class="crow">${av}<div class="c"><div class="top"><b>${name}</b><i>${title}</i><time>${time}</time></div><div class="bot"><span>${preview}</span>${badge ? `<div class="badge">${badge}</div>` : ""}</div></div></div>`;
 const img = (n, cls = "ph") => `<img class="${cls}" src="${PHOTO[n]}">`;
+// A screen as it looks in a role's own conversation: its photo and title in the
+// header and beside its messages, the composer addressed to it.
+const asRole = (screen, key, name, title) => screen
+  .split(NAV).join(navFor(`<img src="${PHOTO[key]}">`, name, title))
+  .split(AV).join(img(key, "av"))
+  .split(COMPOSER).join(composer(name));
 const teamList = `<div class="lhead"><b>Jori</b><div class="ico"><svg width="18" height="18" viewBox="0 0 18 18"><path d="M3 15l1-3.5 8.5-8.5 2.5 2.5L6.5 14z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/></svg></div></div>
 <div class="clist">
 ${crow(JORI_LIST_AV, "Jori", "Chief of Staff", "The Harbor &amp; Pine contract is due Friday. Tom's redlines are summarized on the page.", "9:02 AM")}
@@ -789,14 +795,10 @@ const wSlip = chat("Tuesday 8:30 AM",
   me("Have Nora check it, then send it today.") +
   jori(`Nora will check the numbers by noon, and the send is on your list for 2 PM. I told Reese the renewal stays on track for the 21st.`, { avatar: true }));
 const wReview = chat("Monday 7:45 AM",
-  jori(signed("Kai", `The renewal-quote calculator now prices multiple sites with the volume discount. Tested against the last four quotes.
-<div class="linkcard"><div class="ic">PR</div><div><b>Multi-site pricing in the quote calculator</b><span>Draft pull request · ready for your review</span></div></div>`)) +
-  `<div class="sep" style="margin-top:14px">Monday 9:00 AM</div>` +
-  jori(`<b>Your projects this week</b><ul>
-<li><i>✅</i><span>7 tasks done: 3 yours, 4 by the team.</span></li>
-<li><i>⚠️</i><span>Slipping: Brightline follow-up, a week late.</span></li>
-<li><i>📅</i><span>Due: Harbor &amp; Pine contract out (Fri).</span></li>
-<li><i>👥</i><span>Waiting on you: Gia's case study, Kai's PR.</span></li></ul>`, { avatar: true }));
+  jori(`The renewal-quote calculator now prices multiple sites with the volume discount. Root cause of the old gap: the Atlanta tier was dropped on multi-site quotes. Tested against the last four quotes.
+<div class="linkcard"><div class="ic">PR</div><div><b>Multi-site pricing in the quote calculator</b><span>Draft pull request · ready for your review</span></div></div>`, { avatar: true }) +
+  me("Looks good. Merge it after lunch.") +
+  jori(`Merging at 1. I'll watch the first live quotes and tell you if anything looks off.`, { avatar: true }));
 
 // An inbox where every email comes from the role that sent it, as email-send
 // does for mail to the user (From "Sid (IT & Security)", system/org.md), in a
@@ -851,6 +853,11 @@ if (CHECK) {
   process.exit(1);
 }
 
+// Work screens live in the conversation of the role that owns the work.
+const MORGAN = (x) => asRole(x, "morgan", "Morgan", "Executive Assistant");
+const REESE = (x) => asRole(x, "reese", "Reese", "Sales Ops");
+const KAI = (x) => asRole(x, "kai", "Kai", "Software Engineer");
+
 fs.mkdirSync(OUT, { recursive: true });
 const raw = {
   home: shoot(wikiHome, "raw-wiki-home", 1280, 900),
@@ -861,8 +868,8 @@ const raw = {
   workPerson: shoot(workPerson, "raw-work-person", 1280, 900),
   workMeeting: shoot(workMeeting, "raw-work-meeting", 1280, 900),
   workProject: shoot(workProject, "raw-work-project", 1280, 900),
-  workMeetingApp: shoot(appDoc([workAfterMeeting]), "raw-work-app-meeting", 610, 1060, { transparent: true }),
-  workFollowApp: shoot(appDoc([workFollowUps]), "raw-work-app-followups", 610, 1060, { transparent: true }),
+  workMeetingApp: shoot(appDoc([MORGAN(workAfterMeeting)]), "raw-work-app-meeting", 610, 1060, { transparent: true }),
+  workFollowApp: shoot(appDoc([REESE(workFollowUps)]), "raw-work-app-followups", 610, 1060, { transparent: true }),
   money: shoot(moneyPage, "raw-money", 1280, 900),
   slack: shoot(slackDoc, "raw-work-slack", 1280, 860),
   project: shoot(projectPage, "raw-project-tasks", 1280, 900),
@@ -881,10 +888,10 @@ const out = {
   "work-project.png": shoot(frameDoc(browser(raw.workProject, `${URL}/p/project_harbor_pine_renewal`)), "work-project", 1460, 1120, { transparent: true }),
   "work-app-meeting.png": raw.workMeetingApp,
   "work-app-followups.png": raw.workFollowApp,
-  "work-app-pair.png": shoot(appDoc([workAfterMeeting, workFollowUps]), "work-app-pair", 1096, 1060, { transparent: true }),
+  "work-app-pair.png": shoot(appDoc([MORGAN(workAfterMeeting), REESE(workFollowUps)]), "work-app-pair", 1096, 1060, { transparent: true }),
   "work-showcase.png": shoot(frameDoc(`<div class="show">${browser(raw.workPerson, URL)}<div class="ph"><img src="${raw.workFollowApp}"></div></div>`), "work-showcase", 1700, 1180, { transparent: true }),
   "work-slack.png": shoot(frameDoc(appWin(raw.slack, "Fieldstone · #harbor-pine")), "work-slack", 1460, 1080, { transparent: true }),
-  "work-app-email-schedule.png": shoot(appDoc([workEmail, workSchedule]), "work-app-email-schedule", 1096, 1060, { transparent: true }),
+  "work-app-email-schedule.png": shoot(appDoc([MORGAN(workEmail), MORGAN(workSchedule)]), "work-app-email-schedule", 1096, 1060, { transparent: true }),
   "personal-money.png": shoot(frameDoc(browser(raw.money, `${URL}/p/money_2026-11`)), "personal-money", 1460, 1120, { transparent: true }),
   "personal-app-money-home.png": shoot(appDoc([pMoney, pHome]), "personal-app-money-home", 1096, 1060, { transparent: true }),
   "personal-app-trip-dinner.png": shoot(appDoc([pTrip, pDinner]), "personal-app-trip-dinner", 1096, 1060, { transparent: true }),
@@ -892,7 +899,7 @@ const out = {
   "personal-project-tasks.png": shoot(frameDoc(browser(raw.project, `${URL}/p/project_kitchen_reno`)), "personal-project-tasks", 1460, 1120, { transparent: true }),
   "personal-app-chief-of-staff.png": shoot(appDoc([pSlip, pWork]), "personal-app-chief-of-staff", 1096, 1060, { transparent: true }),
   "work-team-inbox.png": shoot(frameDoc(appWin(raw.inbox, "Mail · Inbox")), "work-team-inbox", 1460, 820, { transparent: true }),
-  "work-app-chief-of-staff.png": shoot(appDoc([wSlip, wReview]), "work-app-chief-of-staff", 1096, 1060, { transparent: true }),
+  "work-app-chief-of-staff.png": shoot(appDoc([wSlip, KAI(wReview)]), "work-app-chief-of-staff", 1096, 1060, { transparent: true }),
   "work-app-team.png": shoot(appDoc([teamList, groupThread]), "work-app-team", 1096, 1060, { transparent: true }),
   "showcase.png": shoot(frameDoc(`<div class="show">${browser(raw.home, URL)}<div class="ph"><img src="${raw.chat}"></div></div>`), "showcase", 1700, 1180, { transparent: true }),
 };
