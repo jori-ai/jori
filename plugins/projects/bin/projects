@@ -122,8 +122,42 @@ function syncNow({ dryRun = false } = {}) {
   const l = pt.load();
   for (const k of ["closed_by_user", "reopened_by_user", "adopted_edits"]) for (const tid of report[k]) if (l.tasks[tid]) changed.add(l.tasks[tid].project);
   const refreshed = dryRun ? [] : refresh([...changed]);
+  // The user's own changes on their list are messages to the chief of staff
+  // (the user, 2026-11-10: ticking a task off means "I finished this" or "I
+  // don't need to do this", so ask which; a new date matters, so ask why). One
+  // question card per change, in the coordinator's conversation; the answer
+  // comes back to the chat agent, which acts on it (agent/chat-agent/CLAUDE.md
+  // § Project task changes). Renames and reopens are only recorded.
+  if (!dryRun && report.changes.length) askAboutChanges(report.changes, names);
   const counts = Object.fromEntries(Object.entries(report).map(([k, v]) => [k, v.length]));
   return { report, counts, errors: report.errors, refreshed };
+}
+
+const fmtDay = (d) => { try { return new Date(`${d}T12:00:00Z`).toLocaleDateString("en-US", { weekday: "short", month: "short", day: "numeric", timeZone: "UTC" }); } catch { return d; } };
+
+function askAboutChanges(changes, names) {
+  const { spawnSync } = require("node:child_process");
+  const choice = installTools("bin", "choice");
+  for (const c of changes) {
+    const proj = names[c.project] ? ` (${names[c.project]})` : "";
+    let prompt, options;
+    if (c.kind === "completed") {
+      prompt = `You ticked off "${c.title}"${proj}. Did you finish it, or don't you need it any more?`;
+      options = ["Finished it", "Don't need it any more", "Something else|type it"];
+    } else if (c.kind === "deleted") {
+      prompt = `You took "${c.title}"${proj} off your list. Not needed any more, or already done?`;
+      options = ["Not needed any more", "Already done", "Keep it, that was a mistake"];
+    } else if (c.kind === "rescheduled") {
+      prompt = `You moved "${c.title}"${proj} from ${c.from ? fmtDay(c.from) : "no date"} to ${c.to ? fmtDay(c.to) : "no date"}. What changed?`;
+      options = ["Waiting on someone", "Ran out of time", "Plans changed", "Not a priority right now", "Something else|type it"];
+    } else continue;
+    const args = [choice, "send", "--kind", "project_task_change", "--ref", `${c.id}:${c.kind}`,
+      "--prompt", prompt, "--text", `${prompt}\n(project task · ${c.id} · ${c.kind})`,
+      "--channel", "questions", "--no-push", "--expires-h", String(30 * 24)];
+    for (const o of options) args.push("--option", o);
+    const r = spawnSync("python3", args, { encoding: "utf8", timeout: 60000 });
+    if (r.status !== 0) console.error(`projects: question for ${c.id} not sent: ${String(r.stderr || "").slice(0, 200)}`);
+  }
 }
 
 // A change to one of the user's tasks reaches their task list right away,
@@ -186,6 +220,18 @@ function taskCmd(sub) {
     if (!id) die(`task ${sub} needs a task id`);
     const t = pt.withLock((l) => pt.closeTask(l, id, { status: sub === "done" ? "done" : "dropped", note: str("note"), by }));
     console.log(JSON.stringify({ ...brief(t), refreshed: refresh([t.project]), google: pushNow(t) }));
+    return 0;
+  }
+
+  if (sub === "reason") {
+    // Why the user changed a task (the answer to a task-change question), kept on the task.
+    if (!id || !str("text")) die("task reason needs a task id and --text");
+    const t = pt.withLock((l) => {
+      const x = l.tasks[id]; if (!x) throw new Error(`no task ${id}`);
+      (x.change_reasons = x.change_reasons || []).push({ at: new Date().toISOString(), kind: str("kind") || null, text: str("text") });
+      return x;
+    });
+    console.log(JSON.stringify({ ...brief(t), reasons: t.change_reasons.length }));
     return 0;
   }
 
@@ -271,7 +317,7 @@ function taskCmd(sub) {
     return r.errors.length ? 1 : 0;
   }
 
-  console.error("usage: projects task list|add|update|done|drop|reopen|adopt|nudged|approve|work-queue|work-start|work-result|work-budget|sync");
+  console.error("usage: projects task list|add|update|done|drop|reopen|reason|adopt|nudged|approve|work-queue|work-start|work-result|work-budget|sync");
   return 1;
 }
 

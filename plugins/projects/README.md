@@ -23,8 +23,12 @@ counterpart for the things the user works on.
   with a date and the project named in the title. Every change made through
   `projects task add|update|done|drop|reopen` reaches their list right away
   (the user: "managing tasks is like managing email — it should be done right
-  away"; `--no-sync` for batch callers); `bin/projects-task-sync` runs every 30
-  minutes as the backstop and picks up their own edits (theirs win); a slipped one gets one follow-up a week
+  away"; `--no-sync` for batch callers); `bin/projects-task-sync` runs every 10
+  minutes as the backstop and picks up their own edits (theirs win). Each of
+  their own changes is a message to the chief of staff: ticking a task off or
+  deleting it asks "finished, or not needed any more?", a new date asks "what
+  changed?" (a choice card in the coordinator's conversation), and the chat
+  agent acts on the answer (`agent/chat-agent/CLAUDE.md` § Project Tasks); a slipped one gets one follow-up a week
   through the hum, and a Sunday email reviews the week. Tasks Jori may do on
   its own are done early each morning by `project-work` (launchd,
   `jobs/project-work.md`, `bin/project-work-trigger`) within a weekly share of

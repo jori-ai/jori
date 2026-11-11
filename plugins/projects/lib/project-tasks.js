@@ -404,7 +404,10 @@ function markerIn(notes) {
 // not touched the task since the last sync. Never deletes a task the user
 // changed. `gt` is an adapter over gog (list/add/update/done/undo/delete).
 function syncGoogle(ledger, gt, { list = "@default", projectNames = {}, now = Date.now(), dryRun = false } = {}) {
-  const report = { created: [], closed_by_user: [], reopened_by_user: [], adopted_edits: [], pushed: [], completed: [], deleted: [], detached: [], relinked: [], errors: [] };
+  const report = { created: [], closed_by_user: [], reopened_by_user: [], adopted_edits: [], pushed: [], completed: [], deleted: [], detached: [], relinked: [], errors: [], changes: [] };
+  // What the USER changed on their list, with before and after, so the chief
+  // of staff can act on it (jobs/project-task-change.md).
+  const change = (t, kind, extra = {}) => report.changes.push({ id: t.id, project: t.project, title: t.title, kind, ...extra });
   const remote = new Map();
   for (const r of gt.list(list)) if (r && r.id && !r.deleted) remote.set(r.id, r);
   const byMarker = new Map();
@@ -434,7 +437,7 @@ function syncGoogle(ledger, gt, { list = "@default", projectNames = {}, now = Da
         // Gone from the list: the user deleted it (or Jori did, after a drop).
         if (t.status === "open") {
           t.status = "dropped"; t.closed_at = iso; t.closed_by = "user"; t.close_note = "deleted from the task list";
-          report.closed_by_user.push(t.id);
+          report.closed_by_user.push(t.id); change(t, "deleted", { due: t.due });
         }
         t.gtask.detached = true;
         continue;
@@ -443,19 +446,20 @@ function syncGoogle(ledger, gt, { list = "@default", projectNames = {}, now = Da
 
       if (r.status === "completed" && s.status !== "completed" && t.status === "open") {
         t.status = "done"; t.closed_at = r.completed || iso; t.closed_by = "user"; t.close_note = "ticked off on the task list";
-        snap(t, r); report.closed_by_user.push(t.id);
+        snap(t, r); report.closed_by_user.push(t.id); change(t, "completed", { due: t.due });
         continue;
       }
       if (r.status !== "completed" && s.status === "completed" && t.status !== "open") {
         t.status = "open"; t.closed_at = null; t.closed_by = null; t.close_note = null;
         if (remoteDue(r)) t.due = remoteDue(r);
-        snap(t, r); report.reopened_by_user.push(t.id);
+        snap(t, r); report.reopened_by_user.push(t.id); change(t, "reopened", { due: t.due });
         continue;
       }
 
       if (t.status === "open") {
         if (touched && r.status !== "completed") {
           // The user edited it on their list: their title and date win.
+          const before = { title: t.title, due: t.due };
           if (r.title && r.title !== t.title) t.title = r.title;
           const due = remoteDue(r);
           if (due && due !== t.due) {
@@ -463,6 +467,8 @@ function syncGoogle(ledger, gt, { list = "@default", projectNames = {}, now = Da
             t.due = due;
           }
           snap(t, r); report.adopted_edits.push(t.id);
+          if (before.due !== t.due) change(t, "rescheduled", { from: before.due, to: t.due });
+          if (before.title !== t.title) change(t, "retitled", { from: before.title, to: t.title });
           continue;
         }
         if (t.title !== s.title || t.due !== s.due) {
