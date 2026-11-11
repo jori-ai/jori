@@ -27,6 +27,18 @@ How a device is judged, by site kind:
                probe runs on the router because clearing an ARP entry needs root.
           A device behind a Wi-Fi extender may be answered for with the
           extender's MAC: list it in `alt_macs`.
+          A device with no lease record is looked for in the router's ARP
+          table, then at its last good address (kept in the state file). There
+          only an answer from its own MAC or an alt MAC counts: a ping says
+          something answers, not what, so a ping with no MAC to show is
+          "couldn't check", and another MAC means the address moved on. A
+          device found nowhere is "no DHCP lease" (a miss), unless the lease
+          list itself looks broken (missing at least half of the site's
+          devices that aren't already DOWN, and at least 2 of them, as after a
+          DHCP restart; a device already DOWN says nothing about the list):
+          then it is "couldn't check", not judged, so a failed lease list
+          can't call the LAN offline. A device that has an address and doesn't answer there is a
+          miss as always, however many fail in the same sweep.
   remote  a site with no box of ours on its LAN, reached over a routed tunnel
           (a subnet route through a device there). Devices are keyed by IP and
           judged from HERE: ping, then a TCP connect to the device's `ports`.
@@ -209,10 +221,15 @@ def local_time(iso):
 
 
 # Runs on a router site's router (BusyBox ash). Reads "ip" lines on stdin,
-# prints "<ip> ping" | "<ip> arp <mac>" | "<ip> none" for each.
+# prints "<ip> ping [<mac>]" | "<ip> arp <mac>" | "<ip> none" for each.
 PROBE = r'''
 while read ip; do
-  if ping -c1 -W1 "$ip" >/dev/null 2>&1; then echo "$ip ping"; continue; fi
+  if ping -c1 -W1 "$ip" >/dev/null 2>&1; then
+    # Say which MAC answered: at an address we only remember, a ping proves
+    # that something is there, not what.
+    echo "$ip ping $(ip neigh show "$ip" dev "$IFACE" | awk '/lladdr/ && !/FAILED|INCOMPLETE/ {print $3}')"
+    continue
+  fi
   # Power-saving Wi-Fi devices (doorbells) need a few ARP tries and a moment
   # to wake - a 1-ping/1-second window missed a doorbell while it was fine.
   ip neigh del "$ip" dev "$IFACE" 2>/dev/null
@@ -383,8 +400,32 @@ def check_remote_device(d):
     return False, f"{ip} no ping, no TCP"
 
 
-def check_router_site(cfg, site, devs):
+def at_last_address(d, ip, p):
+    """Verdict on a LAN device probed only at its last good address (no lease
+    record, no neighbour entry). The address may have moved to another device,
+    so only an answer from its own MAC or an alt MAC is up; a ping with no MAC
+    to show proves something answers, not what: "couldn't check". Nothing
+    answering there is a miss, as at a leased address. When another MAC
+    answers, returns a note instead of a verdict: the device is then as
+    unaccounted for as one found nowhere."""
+    via = " (no lease record, at its last good address)"
+    if not p:
+        return None, f"{ip}: probe returned nothing{via}"
+    if p[0] not in ("ping", "arp"):
+        return False, f"{ip} no ping, no ARP{via}"
+    if len(p) < 2:
+        return None, f"couldn't check: something answers ping at its last address {ip}, but the router showed no MAC"
+    if p[1].lower() in [m.lower() for m in [d["mac"]] + d.get("alt_macs", [])]:
+        return True, f"{ip} {'ping' if p[0] == 'ping' else 'ARP'}{via}"
+    return f"its last address {ip} now answers with another MAC {p[1]}"
+
+
+def check_router_site(cfg, site, devs, last_ip=None, addrs=None, down=()):
+    """`last_ip`: name -> a LAN device's last good address; `down`: names already
+    DOWN; `addrs`, when given, gets name -> the address each LAN device is
+    judged up at."""
     results = {}
+    last_ip = last_ip or {}
     try:
         lease = leases(site)
     except Exception as e:
@@ -403,8 +444,19 @@ def check_router_site(cfg, site, devs):
     ip_of = {d["mac"]: lease.get(d["mac"], (None, None))[0] for d in lan}
     # No lease record is not proof the device is gone: fall back to where the
     # router's ARP table has its MAC (or an alt MAC), then probe that address as
-    # usual. Only a device with neither a lease nor a neighbour entry is "no DHCP lease".
+    # usual; failing that, probe its last good address (at_last_address). Only a
+    # device found nowhere is "no DHCP lease".
     no_lease = {d["mac"] for d in lan if not ip_of[d["mac"]]}
+    # A lease list missing at least half the devices we expect in it (and at
+    # least 2) is more likely broken (dnsmasq restarted) than half the LAN gone
+    # at once, so a device found nowhere then is not judged rather than a miss.
+    # Only a device not already DOWN is expected there: one that is DOWN says
+    # nothing about the list.
+    expected = [d for d in lan if d["name"] not in down]
+    missing = sum(1 for d in expected if d["mac"] in no_lease)
+    suspect = missing >= 2 and 2 * missing >= len(expected)
+    unsure = (None, f"couldn't check: the router's lease list is missing {missing} of {len(expected)} devices (DHCP restart?)")
+    remembered = set()
     if no_lease:
         seen = neighbors(site)
         for d in lan:
@@ -413,6 +465,9 @@ def check_router_site(cfg, site, devs):
                     if seen.get(m.lower()):
                         ip_of[d["mac"]] = seen[m.lower()]
                         break
+                if not ip_of[d["mac"]] and last_ip.get(d["name"]):
+                    ip_of[d["mac"]] = last_ip[d["name"]]
+                    remembered.add(d["mac"])
     got = probe(site, sorted({ip for ip in ip_of.values() if ip}))
 
     for d in devs:
@@ -424,8 +479,17 @@ def check_router_site(cfg, site, devs):
             results[d["name"]] = (c, {True: "cloud: connected", False: "cloud: NOT connected", None: "cloud API unavailable"}[c])
         else:
             ip = ip_of[d["mac"]]
+            moved = None
+            if d["mac"] in remembered:
+                v = at_last_address(d, ip, got.get(ip))
+                if isinstance(v, tuple):
+                    results[d["name"]] = v
+                    if v[0] and addrs is not None:
+                        addrs[d["name"]] = ip
+                    continue
+                moved, ip = v, None
             if not ip:
-                results[d["name"]] = (False, "no DHCP lease")
+                results[d["name"]] = unsure if suspect else (False, "no DHCP lease" + (f" ({moved})" if moved else ""))
                 continue
             p = got.get(ip)
             via = " (no lease record, from ARP table)" if d["mac"] in no_lease else ""
@@ -439,6 +503,8 @@ def check_router_site(cfg, site, devs):
                 results[d["name"]] = (False, f"{ip} answered by another MAC {p[1]}{via}")
             else:
                 results[d["name"]] = (False, f"{ip} no ping, no ARP{via}")
+            if results[d["name"]][0] and addrs is not None:
+                addrs[d["name"]] = ip
     return results
 
 
@@ -463,10 +529,17 @@ def check_remote_site(cfg, devs):
     return results
 
 
-def check_all(cfg):
-    """name -> (ok: True/False/None, detail). None = couldn't judge, don't count."""
+def check_all(cfg, state=None, addrs=None):
+    """name -> (ok: True/False/None, detail). None = couldn't judge, don't count.
+    `state` (the sweep's) gives each LAN device's last good address and which
+    devices are already DOWN; `addrs`, when given, is filled with name -> the
+    address a LAN device was judged up at (cmd_sweep keeps it as the next last
+    good address)."""
     roster = cfg.get("devices", [])
     sites = cfg.get("sites", {})
+    prior = {k: v for k, v in ((state or {}).get("devices") or {}).items() if isinstance(v, dict)}
+    last_ip = {k: v["ip"] for k, v in prior.items() if v.get("ip")}
+    down = {k for k, v in prior.items() if v.get("status") == "down"}
     results = {}
     ring = [d for d in roster if d.get("check") == "ring"]
     rest = [d for d in roster if d.get("check") != "ring"]
@@ -475,7 +548,7 @@ def check_all(cfg):
         if not devs:
             continue
         if site.get("kind") == "router":
-            results.update(check_router_site(cfg, site, devs))
+            results.update(check_router_site(cfg, site, devs, last_ip, addrs, down))
         else:
             results.update(check_remote_site(cfg, devs))
     for d in rest:
@@ -567,7 +640,8 @@ def cmd_sweep(args, cfg):
     roster = cfg.get("devices", [])
     labels = {k: v.get("label", k) for k, v in cfg.get("sites", {}).items()}
     state = load(STATE, {"devices": {}, "pending": []})
-    results = check_all(cfg)
+    addrs = {}
+    results = check_all(cfg, state, addrs)
     t = now_iso()
     for d in roster:
         name = d["name"]
@@ -576,9 +650,13 @@ def cmd_sweep(args, cfg):
         s = state["devices"].setdefault(name, {"status": "up", "fails": 0})
         s["detail"], s["checked"] = detail, t
         if ok is None:
+            s["not_judged"] = True  # `status` shows it as such, not as a miss
             continue
+        s.pop("not_judged", None)
         if ok:
             s["last_seen"] = t
+            if addrs.get(name):
+                s["ip"] = addrs[name]  # its last good address, tried when it has no lease record
             if s["status"] == "down":
                 state["pending"].append({**tag, "kind": "up", "name": name, "at": t, "since": s.get("since", t)})
             s.update(status="up", fails=0)
@@ -638,7 +716,7 @@ def cmd_status(_args, _cfg):
     state = load(STATE, {"devices": {}})
     print(f"last sweep: {local_time(state['last_sweep']) if state.get('last_sweep') else 'never'}")
     for name, s in sorted(state["devices"].items()):
-        tag = "DOWN" if s["status"] == "down" else ("miss" if s.get("fails") else "up")
+        tag = "DOWN" if s["status"] == "down" else ("??" if s.get("not_judged") else ("miss" if s.get("fails") else "up"))
         held = f"  (failing since {local_time(s['failing_since'])})" if s.get("failing_since") and s["status"] != "down" else ""
         print(f"  {tag:4} {name:28} {s.get('detail', '')}{held}")
     for rname, b in sorted(state.get("ring_battery", {}).items()):

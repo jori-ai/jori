@@ -4,9 +4,13 @@ device is touched, no mail is sent).
 
 Covers: off when no roster; DOWN only after DOWN_AFTER failed sweeps and UP on
 the first good one; the down_after_min hold; ARP proof by the device's own or
-an alt MAC; a remote site's anchor gating the rest; camera connection matched
-case-insensitively and the low-battery / recharged pair; cloud checks "not
-judged" without a homectl; alerts to the instance owner (alert_to overrides).
+an alt MAC; a device with no lease record found in the ARP table or at its last
+good address (own MAC only), and "couldn't check" rather than DOWN when the
+lease list itself is broken, while several devices failing at their addresses
+still go DOWN together; a remote site's anchor gating the rest; camera
+connection matched case-insensitively and the low-battery / recharged pair;
+cloud checks "not judged" without a homectl; alerts to the instance owner
+(alert_to overrides).
 
 Run: python3 tests/home-devices.test.py
 """
@@ -244,12 +248,13 @@ class HomeDevicesTest(unittest.TestCase):
 
     def test_missing_lease_and_no_usable_arp_entry_is_still_down(self):
         mod = self.load()
-        del self.fake.leases["02:00:00:00:00:01"]
-        del self.fake.leases["02:00:00:00:00:03"]
         self.fake.neigh = ["192.0.2.31 dev br-lan lladdr 02:00:00:00:00:03 FAILED"]
-        res = mod.check_all(mod.roster_cfg())
-        self.assertEqual(res["Test lamp"], (False, "no DHCP lease"))
-        self.assertEqual(res["Test doorbell"], (False, "no DHCP lease"))
+        # One record missing at a time: a lease list missing two of these three
+        # devices reads as broken (test_broken_lease_list_with_no_trace_is_not_judged).
+        for mac, name in (("02:00:00:00:00:01", "Test lamp"), ("02:00:00:00:00:03", "Test doorbell")):
+            self.fake.leases = dict(LEASES)
+            del self.fake.leases[mac]
+            self.assertEqual(mod.check_all(mod.roster_cfg())[name], (False, "no DHCP lease"))
 
     def test_missing_lease_with_a_dead_arp_entry_is_down(self):
         mod = self.load()
@@ -258,6 +263,119 @@ class HomeDevicesTest(unittest.TestCase):
         self.fake.neigh = ["192.0.2.41 dev br-lan lladdr 02:00:00:00:00:01 STALE"]
         res = mod.check_all(mod.roster_cfg())
         self.assertEqual(res["Test lamp"], (False, "192.0.2.41 no ping, no ARP (no lease record, from ARP table)"))
+
+    def test_empty_lease_list_devices_answer_at_their_last_address(self):
+        # dnsmasq restarted with an empty lease list and the ARP table has
+        # nothing for them; each device still answers, with its own MAC (or the
+        # extender's), at the address it had when last judged up.
+        mod = self.load()
+        self.sweep(mod)
+        self.assertEqual(self.state()["devices"]["Test lamp"]["ip"], "192.0.2.11")
+        self.fake.leases = {}
+        self.fake.lan["192.0.2.11"] = "ping 02:00:00:00:00:01"
+        self.fake.lan["192.0.2.12"] = "arp 02:00:00:00:00:a2"
+        self.fake.lan["192.0.2.13"] = "arp 02:00:00:00:00:03"
+        for _ in range(5):
+            self.sweep(mod)
+        self.assertEqual(self.fake.emails, [])
+        devs = self.state()["devices"]
+        for name in ("Test lamp", "Test extender client", "Test doorbell"):
+            self.assertEqual((devs[name]["status"], devs[name]["fails"]), ("up", 0), name)
+        self.assertEqual(devs["Test lamp"]["detail"], "192.0.2.11 ping (no lease record, at its last good address)")
+        self.assertEqual(devs["Test extender client"]["detail"], "192.0.2.12 ARP (no lease record, at its last good address)")
+        self.assertEqual(devs["Test doorbell"]["ip"], "192.0.2.13")
+
+    def test_broken_lease_list_with_no_trace_is_not_judged(self):
+        # A state file from before last good addresses were kept: the lamp had
+        # missed one sweep. Then the lease list comes back empty and nothing
+        # else knows where the devices are.
+        os.makedirs(os.path.join(self.install, "data"))
+        with open(os.path.join(self.install, "data", "home-devices-state.json"), "w") as f:
+            json.dump({"devices": {"Test lamp": {"status": "up", "fails": 1, "failing_since": "2026-01-05T11:58:00+00:00",
+                                                 "detail": "192.0.2.11 no ping, no ARP", "last_seen": "2026-01-05T11:56:00+00:00"}},
+                       "pending": []}, f)
+        mod = self.load()
+        self.fake.leases = {}
+        for _ in range(5):
+            self.sweep(mod)
+        self.assertEqual(self.fake.emails, [])
+        devs = self.state()["devices"]
+        want = "couldn't check: the router's lease list is missing 3 of 3 devices (DHCP restart?)"
+        for name in ("Test lamp", "Test extender client", "Test doorbell"):
+            self.assertEqual((devs[name]["status"], devs[name]["detail"]), ("up", want), name)
+        self.assertEqual(devs["Test lamp"]["fails"], 1)  # not counted while not judged
+        self.assertEqual(devs["Test router"]["detail"], "SSH OK")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            mod.cmd_status(None, mod.roster_cfg())
+        line = next(ln for ln in out.getvalue().splitlines() if "Test lamp" in ln)
+        self.assertEqual(line.split()[0], "??", line)
+        self.assertIn(want, line)
+
+    def test_intact_lease_list_several_silent_devices_still_go_down(self):
+        # A real outage (an extender losing power) takes several devices down
+        # at once; their leases are intact, so each is a miss as always.
+        mod = self.load()
+        for ip in LEASES.values():
+            self.fake.lan[ip] = "none"
+        self.sweep(mod, minutes=30)  # 30-minute steps clear the doorbell's 60-minute hold too
+        self.sweep(mod, minutes=30)
+        self.assertEqual(self.fake.emails, [])
+        self.sweep(mod, minutes=30)
+        self.assertEqual(self.subjects(), ["Offline: Home Test lamp; Home Test extender client; Home Test doorbell"])
+
+    def test_one_missing_lease_is_not_a_broken_lease_list(self):
+        mod = self.load()
+        del self.fake.leases["02:00:00:00:00:01"]
+        for _ in range(3):
+            self.sweep(mod)
+        self.assertEqual(self.subjects(), ["Offline: Home Test lamp"])
+        self.assertEqual(self.state()["devices"]["Test lamp"]["detail"], "no DHCP lease")
+
+    def test_long_down_devices_do_not_make_the_lease_list_look_broken(self):
+        # Three devices gone for days have no leases; the list is otherwise
+        # intact. The lamp, up until now, loses its lease with no trace: that is
+        # one of the three devices we expect in the list, so it is a miss.
+        gone = [{"site": "home", "name": f"Test gone {i}", "mac": f"02:00:00:00:00:0{i}"} for i in (4, 5, 6)]
+        self.write("config/home-devices.json", {**ROSTER, "devices": ROSTER["devices"] + gone})
+        os.makedirs(os.path.join(self.install, "data"))
+        down = {"status": "down", "fails": 500, "since": "2026-01-01T00:00:00+00:00", "failing_since": "2026-01-01T00:00:00+00:00", "detail": "no DHCP lease"}
+        with open(os.path.join(self.install, "data", "home-devices-state.json"), "w") as f:
+            json.dump({"devices": {**{g["name"]: dict(down) for g in gone}, "Test lamp": {"status": "up", "fails": 0}}, "pending": []}, f)
+        mod = self.load()
+        del self.fake.leases["02:00:00:00:00:01"]
+        self.sweep(mod)
+        self.sweep(mod)
+        self.assertEqual(self.fake.emails, [])
+        self.sweep(mod)
+        self.assertEqual(self.subjects(), ["Offline: Home Test lamp"])
+        devs = self.state()["devices"]
+        self.assertEqual((devs["Test lamp"]["status"], devs["Test lamp"]["detail"]), ("down", "no DHCP lease"))
+        self.assertEqual({devs[g["name"]]["status"] for g in gone}, {"down"})
+
+    def test_last_address_answered_by_another_mac_is_not_proof(self):
+        mod = self.load()
+        self.sweep(mod)  # all up: their addresses are remembered
+        del self.fake.leases["02:00:00:00:00:01"]  # one of three missing: the lease list is fine
+        moved = (False, "no DHCP lease (its last address 192.0.2.11 now answers with another MAC 02:00:00:00:00:77)")
+        for answer in ("arp 02:00:00:00:00:77", "ping 02:00:00:00:00:77"):
+            self.fake.lan["192.0.2.11"] = answer
+            self.assertEqual(mod.check_all(mod.roster_cfg(), self.state())["Test lamp"], moved)
+        # With the lease list broken, the same answer is "couldn't check", never up.
+        self.fake.leases = {}
+        self.fake.lan["192.0.2.12"] = "ping 02:00:00:00:00:02"
+        self.fake.lan["192.0.2.13"] = "ping 02:00:00:00:00:03"
+        res = mod.check_all(mod.roster_cfg(), self.state())
+        self.assertEqual(res["Test lamp"], (None, "couldn't check: the router's lease list is missing 3 of 3 devices (DHCP restart?)"))
+        self.assertEqual(res["Test doorbell"], (True, "192.0.2.13 ping (no lease record, at its last good address)"))
+        # A ping there with no MAC shown proves something answers, not what.
+        self.fake.lan["192.0.2.11"] = "ping"
+        self.assertEqual(mod.check_all(mod.roster_cfg(), self.state())["Test lamp"],
+                         (None, "couldn't check: something answers ping at its last address 192.0.2.11, but the router showed no MAC"))
+        # Nothing answering there at all is a miss, as at a leased address.
+        self.fake.lan["192.0.2.11"] = "none"
+        self.assertEqual(mod.check_all(mod.roster_cfg(), self.state())["Test lamp"],
+                         (False, "192.0.2.11 no ping, no ARP (no lease record, at its last good address)"))
 
     def test_router_unreachable_judges_nothing_behind_it(self):
         mod = self.load()
