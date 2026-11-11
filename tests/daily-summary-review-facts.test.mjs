@@ -175,3 +175,82 @@ test("the reviewer's movement totals say the walk lines under stops are step est
     day: { ...day, steps: { walks: [] } }, statements: {}, corrections: [] });
   assert.doesNotMatch(none, /estimated from step counts/, none);
 });
+
+// 2026-11-11: the report's prose and Messages lines are written from the day's phone
+// chats and the digest that summarises every conversation, but the fact sheet held only
+// the user's own chat with the assistant. A line restating what a relative sent (photos
+// in the family chat, a comment on one) had nothing to be checked against, and the
+// reviewer called it invented on one pass and passed it on the next.
+const phoneDay = (extra = {}) => ({ harvest: {
+  window: { start: "2026-10-19T21:00:00.000Z", end: "2026-10-20T21:00:00.000Z" },
+  facts_by_stop: { "s-1": [
+    { kind: "message", channel: "imessage", at: "2026-10-20T10:00:00Z", chat: "Family chat", is_group: true, from_me: false, who: "Sam", text: "[image] [image] [image]" },
+    { kind: "message", channel: "imessage", at: "2026-10-20T10:04:00Z", chat: "Family chat", is_group: true, from_me: false, who: "Alex", text: "That's a funny slide :)" },
+    { kind: "message", channel: "slack", at: "2026-10-20T10:05:00Z", chat: "#ops-alerts", is_group: true, from_me: false, who: "Bot", text: "disk usage warning" },
+  ] },
+  facts_by_leg: [{ facts: [
+    { kind: "message", channel: "imessage", at: "2026-10-20T10:09:00Z", chat: "Family chat", is_group: true, from_me: true, who: "me", text: "I see the joke worked" },
+  ] }],
+  orphan_facts: [
+    // the same message twice (a stop and the orphan list): shown once
+    { kind: "message", channel: "imessage", at: "2026-10-20T10:04:00Z", chat: "Family chat", is_group: true, from_me: false, who: "Alex", text: "That's a funny slide :)" },
+    { kind: "message", channel: "whatsapp", at: "2026-10-20T11:00:00Z", chat: "Book club", is_group: true, from_me: false, who: "Dana", text: "Meeting moved to Thursday" },
+    // another day
+    { kind: "message", channel: "imessage", at: "2026-10-21T10:00:00Z", chat: "Family chat", is_group: true, from_me: false, who: "Sam", text: "tomorrow's message" },
+  ],
+  ...extra } });
+
+test("the day's iMessage and WhatsApp messages are in the fact sheet, from both sides, once each, and Slack is not listed", () => {
+  const text = pack(phoneDay());
+  assert.ok(text.includes("MESSAGES IN THE USER'S PHONE CHATS THAT DAY"), text);
+  assert.ok(text.includes('- 1:00pm Family chat (group), Sam: "[image] [image] [image]"'), text);
+  assert.ok(text.includes('- 1:04pm Family chat (group), Alex: "That\'s a funny slide :)"'), text);
+  assert.ok(text.includes('- 1:09pm Family chat (group), sent from the user\'s account: "I see the joke worked"'), text);
+  assert.ok(text.includes('- 2:00pm Book club (group), Dana: "Meeting moved to Thursday"'), text);
+  assert.equal(text.split("That's a funny slide").length - 1, 1, "the repeated message is shown once");
+  assert.ok(!text.includes("disk usage warning"), "a work channel is not listed message by message");
+  assert.ok(!text.includes("tomorrow's message"), "another day's message is left out");
+});
+
+test("a long day of phone messages is capped and says how many are not shown", () => {
+  const many = Array.from({ length: 95 }, (_, i) => ({ kind: "message", channel: "imessage",
+    at: new Date(Date.parse("2026-10-20T06:00:00Z") + i * 60000).toISOString(), chat: "Pal", is_group: false, from_me: false, who: "Pal", text: `note ${i}` }));
+  const text = pack({ harvest: { window: { start: "2026-10-19T21:00:00.000Z", end: "2026-10-20T21:00:00.000Z" }, orphan_facts: many } });
+  assert.ok(text.includes('"note 79"') && !text.includes('"note 80"'), text);
+  assert.ok(text.includes("(15 more not shown)"), text);
+});
+
+test("the conversation summaries list phone chats first, then work channels that wanted the user, and skip empty ones", () => {
+  const text = pack({ harvest: { message_digest: { conversations: [
+    { channel: "slack", chat: "#general", is_group: true, messages: 90, summary: "Company news.", needs_you: false },
+    { channel: "slack", chat: "#deals", is_group: true, messages: 5, summary: "A deal closed; kickoff tomorrow.", needs_you: true },
+    { channel: "imessage", chat: "Family chat", is_group: true, messages: 12, summary: "Sam shared photos of the talk; Alex liked one slide.", needs_you: false },
+    { channel: "whatsapp", chat: "Quiet group", is_group: true, messages: 3, summary: "   ", needs_you: false },
+  ] } } });
+  const at = (s) => text.indexOf(s);
+  assert.ok(at("THE DAY'S CONVERSATIONS, SUMMARISED") > 0, text);
+  assert.ok(at("- imessage Family chat (group): Sam shared photos") < at("- slack #deals (group) [open for the user]: A deal closed"), text);
+  assert.ok(at("- slack #deals") < at("- slack #general (group): Company news."), text);
+  assert.ok(!text.includes("Quiet group"), "a conversation with no summary is skipped");
+});
+
+test("the conversation summaries stop at a fixed length", () => {
+  const conversations = Array.from({ length: 60 }, (_, i) => ({ channel: "imessage", chat: `Chat ${i}`, is_group: false, messages: 60 - i,
+    summary: "x".repeat(300) }));
+  const text = pack({ harvest: { message_digest: { conversations } } });
+  const shown = text.split("\n").filter((l) => /^- imessage Chat \d+:/.test(l));
+  assert.ok(shown.length > 10 && shown.length < 60, `shown ${shown.length}`);
+  assert.ok(shown.reduce((n, l) => n + l.length, 0) < 8200);
+  assert.ok(text.includes("- imessage Chat 0:") && !text.includes("- imessage Chat 59:"));
+});
+
+test("JORI_REVIEW_PHONE_MESSAGES=0 leaves the phone chats and the summaries out", () => {
+  const old = process.env.JORI_REVIEW_PHONE_MESSAGES;
+  process.env.JORI_REVIEW_PHONE_MESSAGES = "0";
+  try {
+    const text = pack(phoneDay({ message_digest: { conversations: [{ channel: "imessage", chat: "Family chat", summary: "Photos shared." }] } }));
+    assert.ok(!text.includes("PHONE CHATS") && !text.includes("SUMMARISED") && !text.includes("funny slide"), text);
+  } finally {
+    if (old == null) delete process.env.JORI_REVIEW_PHONE_MESSAGES; else process.env.JORI_REVIEW_PHONE_MESSAGES = old;
+  }
+});
