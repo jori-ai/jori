@@ -29,7 +29,7 @@ after(() => {
 
 const NOW = Date.UTC(2026, 10, 3);
 const person = (wiki_id, extra = {}) => ({
-  wiki_id, name: wiki_id, description: null, scope: ["people"], locked: false, works_with: false,
+  wiki_id, name: wiki_id, description: null, scope: ["people"], works_with: false,
   slipping: false, silence_days: 10, contact_days: 5, recent_contact_days: 3,
   state: pw.getPerson(wiki_id) || { status: "unasked", nudges: 0, research: 0 }, ...extra,
 });
@@ -40,7 +40,6 @@ test("work people are followed without a question; decided and non-work people a
     person("user_work", { works_with: true }),
     person("user_declined", { works_with: true }),
     person("user_friend"),
-    person("user_locked", { works_with: true, locked: true }),
   ];
   const plan = pw.propose({ now: NOW, scanned });
   const work = pw.getPerson("user_work");
@@ -48,7 +47,6 @@ test("work people are followed without a question; decided and non-work people a
   assert.equal(work.research, 1);
   assert.equal(work.nudges, 0);
   assert.equal(pw.getPerson("user_declined").status, "declined", "a decline stands");
-  assert.equal(pw.getPerson("user_locked"), null);
   assert.ok(plan.some((x) => x.kind === "auto_follow" && x.wiki_id === "user_work"));
   assert.ok(!plan.some((x) => x.kind === "follow_news"), "no follow_news card for an auto-followed person");
 });

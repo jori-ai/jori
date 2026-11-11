@@ -32,6 +32,8 @@
 //    exits 127: it runs while the wrapper puts node on PATH. A bare line, or
 //    any other missing interpreter, still reads "→ exit 127".
 //
+// 5. (2026-11-10) `jori triage code-filed` — see its section below.
+//
 // All run the real CLI against a fixture HOME with fake `crontab` / `curl`
 // first on PATH (the jori-doctor-null-trigger.test.mjs harness), so no
 // supervisor, network, real crontab or dispatch is touched.
@@ -354,5 +356,151 @@ it("the job's own run waits for the chat turn to end, then restarts and checks f
     assert.ok(log.indexOf("POST chat-restart") > log.lastIndexOf("GET chat-health inflight"), log.join("\n"));
     assert.equal(jobRuns(fx).length, 0);
   } finally { cleanup(fx); }
+});
+}
+
+// ─── 5. triage code-filed: intake-filed mail joined to later label/star changes ──
+//
+// (2026-11-10) `jori triage code-filed` lists every message intake filed in
+// code with no model reading it (sender-history consensus, Jev, an
+// intake-skip rule, the spam blocklist; on the live path or a catchup) and
+// joins it on messageId to the gmail-action LABEL / UNLABEL / STAR / UNSTAR
+// events the same message got afterwards. Intake's own events, a re-delivery
+// re-applying the same call and labels outside the triage set are not
+// changes. Fixture install (JORI_HOME) holding a synthetic triage log (live +
+// rotated days); the run must leave every file untouched.
+{
+const ID = Object.fromEntries("abcdefghjk".split("").map((k) => [k, `fixture-msg-${k}`]));
+
+function codeFiledFixture() {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "jori-code-filed-"));
+  const tools = path.join(home, "install");
+  for (const d of ["logs", "data", "system"]) fs.mkdirSync(path.join(tools, d), { recursive: true });
+  const now = Date.now();
+  const at = (min) => new Date(now - min * 60_000).toISOString();
+  const sec = (min, s) => new Date(now - min * 60_000 + s * 1000).toISOString();
+  const L = (ts, rest) => `${ts} | ${rest}\n`;
+
+  // Rotated day, three days back: A filed by sender history.
+  const rotatedDay = new Date(now - 3 * 86_400_000).toISOString().slice(0, 10);
+  fs.writeFileSync(path.join(tools, "logs", `triage-${rotatedDay}.log`),
+    L(sec(4320, -2), `LABEL | messageId=${ID.a} | label=personal`) +
+    L(sec(4320, -1), `MARK-READ | messageId=${ID.a}`) +
+    L(at(4320), `local-classify intake ${ID.a} from a@example.com → personal/P3 (mem-consensus) — dispatch skipped`));
+  // Nine days back, outside a 7-day window.
+  const oldDay = new Date(now - 9 * 86_400_000).toISOString().slice(0, 10);
+  fs.writeFileSync(path.join(tools, "logs", `triage-${oldDay}.log`),
+    L(at(9 * 1440), `local-classify intake ${ID.g} from g@example.com → personal/P3 (mem-consensus) — dispatch skipped`));
+
+  fs.writeFileSync(path.join(tools, "logs", "triage.log"),
+    // A, two days after filing: starred, then p1.
+    L(at(2880), `STAR | messageId=${ID.a}`) +
+    L(at(2879), `LABEL | messageId=${ID.a} | label=p1`) +
+    // F filed by decision consensus; a later label outside the triage set is not a change.
+    L(sec(2000, -1), `LABEL | messageId=${ID.f} | label=personal`) +
+    L(at(2000), `local-classify intake ${ID.f} from f@example.com → personal/P3 (decision-consensus) — dispatch skipped`) +
+    L(at(1990), `LABEL | messageId=${ID.f} | label=assistant-out`) +
+    // J: a storm catchup's fast path, starred at intake, unstarred later.
+    L(sec(1500, -2), `LABEL | messageId=${ID.j} | label=vendor`) +
+    L(sec(1500, -1), `STAR | messageId=${ID.j}`) +
+    L(at(1500), `storm-catchup intake-skip (fastpath) ${ID.j}: intake-skip rule=build-ready -> label=vendor+star(P2) applied=true`) +
+    L(at(1400), `UNSTAR | messageId=${ID.j}`) +
+    // K: a startup catchup's fast path, left alone.
+    L(sec(1000, -1), `LABEL | messageId=${ID.k} | label=personal`) +
+    L(at(1000), `startup-catchup intake-skip (fastpath) ${ID.k}: intake-skip rule=digest -> label=personal applied=true`) +
+    // D: a live intake-skip rule that stars.
+    L(sec(500, -2), `LABEL | messageId=${ID.d} | label=personal`) +
+    L(sec(500, -1), `STAR | messageId=${ID.d}`) +
+    L(at(500), `intake-skip rule=build-ready ${ID.d} from d@example.com → label=personal applied=true`) +
+    // E: spam blocklist.
+    L(sec(400, -1), `MARK-READ | messageId=${ID.e}`) +
+    L(at(400), `spam-blocklist(sender) intake skip ${ID.e} from e@example.com (matches "e@example.com" (noise))`) +
+    // H: booking withheld from the filter and dispatched — not code-filed.
+    L(at(300), `booking-check ${ID.h} from h@example.com → booking (rule) — intake-skip rule=x withheld, dispatching`) +
+    // C: Jev, delivered twice a few seconds apart (its second label is intake's own).
+    L(sec(200, -1), `LABEL | messageId=${ID.c} | label=vendor`) +
+    L(at(200), `jev-classify intake ${ID.c} from c@example.com → vendor/P3 (jev) — dispatch skipped`) +
+    L(sec(200, 4), `LABEL | messageId=${ID.c} | label=vendor`) +
+    L(sec(200, 5), `jev-classify intake ${ID.c} from c@example.com → vendor/P3 (jev) — dispatch skipped`) +
+    // B: Jev, relabelled later.
+    L(sec(60, -1), `LABEL | messageId=${ID.b} | label=vendor`) +
+    L(at(60), `jev-classify intake ${ID.b} from b@example.com → vendor/P3 (jev) — dispatch skipped`) +
+    L(at(20), `LABEL | messageId=${ID.b} | label=personal`) +
+    L(at(19), `UNLABEL | messageId=${ID.b} | label=vendor`));
+  return { home, tools };
+}
+
+function snapshot(dir) {
+  const out = {};
+  const walk = (d) => { for (const e of fs.readdirSync(d, { withFileTypes: true })) { const p = path.join(d, e.name); if (e.isDirectory()) walk(p); else { const st = fs.statSync(p); out[path.relative(dir, p)] = `${st.size}:${st.mtimeMs}`; } } };
+  walk(dir);
+  return out;
+}
+
+function runCodeFiled(fx, args) {
+  return spawnSync(process.execPath, [path.join(ROOT, "bin/jori"), "triage", "code-filed", ...args], {
+    encoding: "utf8", timeout: 30000,
+    env: { PATH: "/usr/bin:/bin", HOME: fx.home, JORI_HOME: fx.tools, NO_COLOR: "1" },
+  });
+}
+
+const NOT_SEEN = [
+  "\"changed\" is a floor: a wrong call nobody corrected on the message itself (fixed by a rule, or never noticed) is not counted.",
+  "Changes made in the Gmail app, or through the agents' Gmail connector tools, are invisible.",
+];
+
+it("triage code-filed joins each intake-filed message to later label/star changes, and writes nothing", () => {
+  const fx = codeFiledFixture();
+  try {
+    const before = snapshot(fx.tools);
+    const r = runCodeFiled(fx, ["--json"]);
+    assert.equal(r.status, 0, r.stderr + r.stdout);
+    const out = JSON.parse(r.stdout);
+    assert.deepEqual(snapshot(fx.tools), before, "the report must not create or touch any file");
+
+    const ids = out.rows.map((x) => x.messageId).sort();
+    assert.deepEqual(ids, [ID.a, ID.b, ID.c, ID.d, ID.e, ID.f, ID.j, ID.k].sort(), "outside the window (G) and dispatched (H) mail are not code-filed");
+    const row = Object.fromEntries(out.rows.map((x) => [x.messageId, x]));
+
+    assert.equal(row[ID.a].handler, "local-classify:mem-consensus");
+    assert.deepEqual(row[ID.a].changes.map((x) => x.change), ["starred", "raised to P1"]);
+    assert.deepEqual(row[ID.b].changes.map((x) => x.change), ["relabelled personal", "vendor removed"]);
+    assert.deepEqual(row[ID.c].changes, [], "a re-delivery re-applying the same label is not a change");
+    assert.equal(row[ID.d].handler, "intake-skip:build-ready");
+    assert.equal(row[ID.d].filed_priority, "P2", "intake's own star is part of what it filed");
+    assert.equal(row[ID.d].changed, false);
+    assert.equal(row[ID.e].family, "spam-blocklist");
+    assert.equal(row[ID.e].changed, false);
+    assert.deepEqual(row[ID.f].changes, [], "a label outside the triage set is not a relabel");
+    assert.deepEqual([row[ID.j].handler, row[ID.j].filed_label, row[ID.j].filed_priority], ["intake-skip:build-ready", "vendor", "P2"], "a catchup fast path is code-filed too");
+    assert.deepEqual(row[ID.j].changes.map((x) => x.change), ["unstarred"]);
+    assert.deepEqual([row[ID.k].handler, row[ID.k].changed], ["intake-skip:digest", false]);
+
+    const h = Object.fromEntries(out.handlers.map((x) => [x.handler, x]));
+    assert.deepEqual([h["intake-skip"].filed, h["intake-skip"].changed], [3, 1]);
+    assert.deepEqual([h["jev-classify"].filed, h["jev-classify"].changed], [2, 1]);
+    assert.deepEqual([h["local-classify:mem-consensus"].changed, h["local-classify:decision-consensus"].changed, h["spam-blocklist"].changed], [1, 0, 0]);
+    assert.deepEqual([out.totals.filed, out.totals.changed, out.totals.rate_pct], [8, 3, 37.5]);
+    assert.deepEqual(out.not_seen, NOT_SEEN);
+
+    const human = runCodeFiled(fx, []);
+    assert.equal(human.status, 0, human.stderr);
+    assert.ok(human.stdout.includes("8 filed, 3 relabelled or starred afterwards (37.5%)"), human.stdout);
+    for (const n of NOT_SEEN) assert.ok(human.stdout.includes(n), human.stdout);
+  } finally { fs.rmSync(fx.home, { recursive: true, force: true }); }
+});
+
+it("triage code-filed refuses a bare, non-positive or too-long --days instead of using 7", () => {
+  const fx = codeFiledFixture();
+  try {
+    for (const args of [["--days"], ["--days", "--json"], ["--days", "0"], ["--days", "-3"], ["--days", "45"], ["--days", "2.5"]]) {
+      const r = runCodeFiled(fx, args);
+      assert.equal(r.status, 1, `${args.join(" ")}: ${r.stdout}`);
+      assert.ok(r.stderr.includes("--days"), r.stderr);
+      assert.equal(r.stdout, "", `${args.join(" ")} must print no report`);
+    }
+    assert.ok(runCodeFiled(fx, ["--days"]).stderr.includes("--days needs a value"), "a bare --days says what is missing");
+    assert.equal(runCodeFiled(fx, ["--days", "30"]).status, 0);
+  } finally { fs.rmSync(fx.home, { recursive: true, force: true }); }
 });
 }

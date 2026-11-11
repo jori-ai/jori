@@ -68,6 +68,7 @@ Save each page with `wiki save <id> --body @file` once, after all its edits.
 ## Step 4 — Two-way relations
 
 For each entry in `audit.asymmetric` (`need: "B → A"`), add the inverse relation to B's `## Relations` section as a typed line (`jobs/people-email.md` Step 3): `child_of` ↔ `parent_of`, and `sibling_of`, `spouse_of`, `partner_of`, `friend_of`, `works_with`, `relative_of`, `related_to` on both. If A's link to B isn't a relationship (a passing mention), it doesn't need a return link, so skip it.
+The audit already leaves out the user's own page and their partner's (`center_wiki_ids` in `wiki-people.json`): both are person pages, so a person's link to them is never listed as one-way. Don't add return lines to those pages by hand either; they are loaded at the start of every session and the people-email and people-watch blocks are all they take.
 
 While you are on a person page for Step 1 or Step 4, convert any free-text Relations lines ("Father of …", "fiancée of …") to tokens, keeping the wording as the plain words after the link, and link a hub (`[[<hub_id>|Ari]]`) to the person's own page when it exists. A person page with **no** Relations section but a stated relation in its text gets one (every person page connects to related people). Evidence only; never infer a relation.
 
@@ -113,7 +114,7 @@ Write `data/wiki-link-weave-state.json`:
 
 - Wiki writes only, plus the concept map (via `wiki-people`), ≤3 hum questions and one chat message. No email.
 - Never drop or rewrite a fact. Splitting is a move. Linking changes link syntax, not wording, except where a relational phrase needs the names added in parentheses.
-- Never edit `day`/`week`/`month` or `pin_locked` pages. Propose a `pin_locked` change as a hum question.
+- Never edit `day`/`week`/`month` pages. A person page that is `pin_locked` is pinned, not read-only (the flag only stops the auditor un-pinning it), so it is split, linked and given Relations lines like any other.
 - Never put health or financial specifics on a person page. When moving a hub fact that has them, leave that line on the hub.
 - Never merge or retire a person page for being thin. Thin person pages are intended.
 - At most 15 new person pages a run from hubs, so a bad run is easy to revert (`wiki history <id>`).

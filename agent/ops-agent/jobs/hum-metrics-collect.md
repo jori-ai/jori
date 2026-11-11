@@ -6,8 +6,9 @@ Canonical design: `data/hum-improvement-loop.md`. Read that before any change to
 
 ## What this job does (overview)
 
-1. Reads `hum-runs.jsonl`, `suggestion-history.jsonl`, `hum-feedback.jsonl`, `hum-state.json`, `confirmed-stops.json` for yesterday's local day.
+1. Reads `hum-runs.jsonl`, `suggestion-history.jsonl`, `hum-feedback.jsonl`, `hum-state.json`, `confirmed-stops.json`, `question-route-log.jsonl`, `hum-resolve-first-log.jsonl` for yesterday's local day.
 2. Computes daily metrics (signal_score_raw, signal_per_surfaced, surface_rate, silent_rate, per-lane yields, reactions histogram) and writes one row to `data/hum-metrics-state.json.daily[]`.
+   The row also carries `questions` (from `question-route-log.jsonl`: questions routed through the question router (`bin/question-route`) that day, by channel, urgency, intent family and hum lane; not every question sent, since a held question is logged when held and again on release, and one posted straight to the Questions channel is never logged) and `resolve_first` (from `hum-resolve-first-log.jsonl`: hum messages the resolve-first gate checked, by verdict, action, kind and lane, and `caught`: settled by the records and not asked, i.e. dropped or sent as the answer instead, with `caught_distinct_keys` overall and per lane). The watch lane dominates `caught` (re-proposed watch matches), so read it by lane and by `caught_distinct_keys`. Counts of structured fields only; a log that is missing, unreadable or starts after the day leaves its field null, not 0. They are there for the weekly review and `hum-review` to read as denominators; counting re-asked questions stays a model's judgment.
 3. Runs the decay detector against the new row + prior history:
    - `lane_decay_silent`: 5+ days of zero reactions on a lane that has ≥3 surfacings in the window
    - `lane_decay_negative`: trailing 7d mean signal_per_surfaced ≤ -0.5 on a lane with ≥3 surfacings in the window (a lane that's reacted to every time, but always negatively — the silent walk above never sees this since it requires a zero-reaction day)

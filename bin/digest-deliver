@@ -6,7 +6,8 @@
 // from lib/digest-deliver.mjs directly.
 //
 // Sequence: email-send → find it in Gmail (bounded wait) → label + star +
-// mark read → verify still in INBOX (restore if not) → phone pointer → push.
+// mark read (skipped when the P1 sender policy keeps the agent's email unread)
+// → verify still in INBOX (restore if not) → phone pointer → push.
 //
 // Why (2026-10-05): the daily-summary fork picked `gmail-action label-archive`
 // and the Oct 4 summary never showed in the inbox. A model should not be
@@ -71,7 +72,7 @@ try {
 log(`sent "${o.subject}"${o.alsoTo ? ` (also to ${o.alsoTo})` : ""}`);
 
 const id = await labelDigest(o.subject, { label: o.label, log });
-if (id) log(`labeled ${o.label} + starred + read, in INBOX: ${id}`);
+if (id) log(`labeled ${o.label} + starred, in INBOX: ${id}`);
 else log("sent, but Gmail had not indexed it after the bounded wait — left unlabeled");
 
 pointerAndPush({ pointer: o.pointer, push: o.push, intent: o.intent, evidenceLive: o.evidenceLive });

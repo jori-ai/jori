@@ -92,6 +92,7 @@ function parseArgs(argv) {
     else if (k === "--in-reply-to") a.inReplyTo = argv[++i];
     else if (k === "--references") a.references = argv[++i];
     else if (k === "--sign") a.signAs = argv[++i];
+    else if (k === "--role-from") a.roleFrom = true;
     else if (k === "-h" || k === "--help") { printUsage(); process.exit(0); }
     else { console.error(`email-send: unknown flag: ${k}`); process.exit(1); }
   }
@@ -105,16 +106,16 @@ function parseArgs(argv) {
   // others always hear from the user's assistant) and, as before, carries the
   // role in its subject ("Ben (CFO): …"), never on a reply. JORI_NO_SIGN (system
   // notices whose exact subject other rules match) and an explicit --from-name
-  // turn signing off.
+  // turn signing off. --role-from (with --sign) makes the From name the role's
+  // for a send that also goes to the owner's household, on the owner's explicit
+  // ask (a trip plan for the owner and their partner, say).
   const signAs = a.signAs || (process.env.JORI_SIGN_AS || process.env.JORI_JOB);
   if (signAs && !process.env.JORI_NO_SIGN && !a.fromNameGiven) {
     try {
       const org = require("../lib/org.cjs");
-      const ctx = { job: signAs, intent: signAs };
-      const rcpts = String(a.to || "").split(",").map((x) => x.trim().toLowerCase()).filter(Boolean);
-      const toOwnerOnly = !!OWNER_ADDRESS && rcpts.length > 0 && rcpts.every((x) => x === OWNER_ADDRESS.toLowerCase());
-      if (toOwnerOnly) a.fromName = org.senderName(ctx) || a.fromName;
-      else if (a.subject && !a.inReplyTo && !/^\s*re:/i.test(a.subject)) a.subject = org.signSubject(a.subject, ctx); // lang-regex-ok: reply prefix of a subject line
+      const r = org.signMail({ job: signAs, to: a.to, owner: OWNER_ADDRESS, subject: a.subject, fromName: a.fromName, inReplyTo: a.inReplyTo, roleFrom: a.roleFrom });
+      a.fromName = r.fromName || a.fromName;
+      a.subject = r.subject;
     } catch { /* unsigned is fine */ }
   }
   return a;
@@ -133,6 +134,7 @@ Usage:
              [--html] [--attach <file>]...
              [--from <addr>] [--from-name <name>]
              [--reply-to <addr>] [--no-reply-to]
+             [--sign <job> [--role-from]]   --role-from: From the job's role even with a second recipient
              [--in-reply-to <message-id>] [--references <ids>]
   email-send --check-delivery (<email_id> | --subject <s>) [--wait <seconds>] [--json]
              did a sent message arrive? (exit 0 inbox · 2 held · 3 bounced · 4 not in inbox · 1 unknown)

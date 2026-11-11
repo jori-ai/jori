@@ -78,7 +78,6 @@ function stats() {
         people: n("SELECT COUNT(*) n FROM people"),
         people_with_handles: n("SELECT COUNT(DISTINCT wiki_id) n FROM handles"),
         people_with_messages: n("SELECT COUNT(DISTINCT wiki_id) n FROM stats"),
-        locked_pages_skipped: n("SELECT COUNT(*) n FROM people WHERE locked = 1 AND wiki_id IN (SELECT wiki_id FROM stats)"),
         qualified: c.length,
         stale: c.filter((x) => x.stale).length,
         summarized: n("SELECT COUNT(*) n FROM links WHERE summarized_at IS NOT NULL"),

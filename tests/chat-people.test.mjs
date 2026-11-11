@@ -179,7 +179,7 @@ function makeInbox() {
 
 const PEOPLE = [
   { wiki_id: "user_dana_levi", name: "Dana Levi", emails: ["dana@example.com"] },
-  { wiki_id: "user_sam_park", name: "Sam Park", emails: [], locked: false },
+  { wiki_id: "user_sam_park", name: "Sam Park", emails: [] },
 ];
 
 test("sync counts real messages only, in both directions, with overflow-sized dates", () => {
@@ -203,14 +203,11 @@ test("sync counts real messages only, in both directions, with overflow-sized da
   assert.ok(cp.getMeta("whatsapp_since"));
 });
 
-test("candidates apply the thresholds, order newest first and honour locked pages", () => {
+test("candidates apply the thresholds and order newest first", () => {
   const all = cp.candidates();
   assert.deepEqual(all.map((c) => c.wiki_id), ["user_dana_levi"], "Sam has one text and one group message: below both thresholds");
   assert.equal(all[0].direct_messages, 7);
   assert.equal(all[0].stale, true);
-  cp.db().prepare("UPDATE people SET locked = 1 WHERE wiki_id = 'user_dana_levi'").run();
-  assert.deepEqual(cp.candidates(), []);
-  cp.db().prepare("UPDATE people SET locked = 0 WHERE wiki_id = 'user_dana_levi'").run();
 });
 
 test("a summarised active texter is not due again until the cooldown and enough new messages", () => {

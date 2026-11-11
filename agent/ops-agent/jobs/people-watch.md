@@ -142,7 +142,7 @@ EOF
 ~/Dev/jori/bin/people-watch write-section <wiki_id> --summary @"$TMPDIR/bg.md"
 ```
 
-It replaces the page's `## Background` block between `<!-- people-watch:start/end -->` markers, or appends one, and refuses a `pin_locked` page (skip that person).
+It replaces the page's `## Background` block between `<!-- people-watch:start/end -->` markers, or appends one, and writes a `pin_locked` (pinned) page like any other.
 
 ## Step 4 — Enqueue
 
@@ -170,6 +170,5 @@ Then exit. **Silent:** no email, no chat message (except Step 2 drafts), no push
 ## Failure modes
 
 - **`observe` says identity not established**: expected for namesakes; nothing is written, the person is retried in a month.
-- **`write-section` refuses a pin_locked page**: skip; the snapshot is still stored.
 - **WebSearch unavailable**: skip Step 3; the people stay due and come back tomorrow.
 - **No email or texts ledger**: `scan` sees no contact dates, so nobody is slipping and no nudges are due; the questions about people the user works with still go out.
