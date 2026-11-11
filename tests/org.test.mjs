@@ -67,3 +67,12 @@ test("roleBrief appends the owning role's specialization, without its title line
   assert.equal(org.roleBrief("hum", o), null, "a role without a brief adds nothing");
   assert.equal(org.roleBrief("nobody", o), null);
 });
+
+test("signMail: owner-only mail and --role-from mail come FROM the role; other mail carries the role in its subject", () => {
+  const base = { job: "finance-review", owner: "me@x.com", subject: "Plan", fromName: "Jori" };
+  assert.deepEqual(org.signMail({ ...base, to: "me@x.com" }, O), { fromName: "Ben (CFO)", subject: "Plan" });
+  assert.deepEqual(org.signMail({ ...base, to: "me@x.com,her@x.com", roleFrom: true }, O), { fromName: "Ben (CFO)", subject: "Plan" });
+  assert.deepEqual(org.signMail({ ...base, to: "me@x.com,her@x.com" }, O), { fromName: "Jori", subject: "Ben (CFO): Plan" });
+  assert.deepEqual(org.signMail({ ...base, to: "me@x.com,her@x.com", inReplyTo: "<a@b>" }, O), { fromName: "Jori", subject: "Plan" });
+  assert.deepEqual(org.signMail({ ...base, job: "nobody", to: "me@x.com", roleFrom: true }, O), { fromName: "Jori", subject: "Plan" });
+});
