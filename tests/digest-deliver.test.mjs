@@ -7,7 +7,7 @@
 import { SYNTHETIC } from "./synthetic-instance.mjs";
 import assert from "node:assert/strict";
 import test from "node:test";
-import { labelDigest, findSentMessageId, todayLocal, todayET, ownerEmail } from "../lib/digest-deliver.mjs";
+import { labelDigest, findSentMessageId, p1BySenderPolicy, todayLocal, todayET, ownerEmail } from "../lib/digest-deliver.mjs";
 
 function seams(labelIds) {
   const calls = [];
@@ -17,6 +17,7 @@ function seams(labelIds) {
       findId: async () => "m1",
       action: (args) => { calls.push(args); return 0; },
       labels: async () => labelIds,
+      isP1: async () => false,
     },
   };
 }
@@ -25,6 +26,50 @@ test("labels, stars, marks read — never archives", async () => {
   const { calls, opts } = seams(["INBOX", "STARRED"]);
   assert.equal(await labelDigest("S", opts), "m1");
   assert.deepEqual(calls, [["label", "m1", "personal"], ["star", "m1"], ["mark-read", "m1"]]);
+});
+
+// gmail-action refuses a mark-read on the agent's own P1 email (the P1 sender
+// policy), and logged that refusal for nearly every digest, burying real ones.
+// So the policy is asked first: P1 → no mark-read; not P1 → as before; the
+// policy unreadable → the mark-read is attempted and gmail-action decides.
+test("a P1 digest is labeled and starred but not marked read, and says so", async () => {
+  const { calls, opts } = seams(["INBOX", "STARRED"]);
+  const logged = [];
+  let asked = null;
+  const findId = async (_s, o) => { o.onMatch({ id: "m1", subject: "Role (Title): S" }); return "m1"; };
+  const isP1 = async (q) => { asked = q; return true; };
+  assert.equal(await labelDigest("S", { ...opts, findId, isP1, log: (m) => logged.push(m) }), "m1");
+  assert.deepEqual(calls, [["label", "m1", "personal"], ["star", "m1"]]);
+  assert.deepEqual(asked, { sender: SYNTHETIC.agent_email, subject: "Role (Title): S" }, "the sending address and the subject as Gmail has it");
+  assert.ok(logged.some((m) => m.startsWith("mark-read skipped: P1 by the sender policy")), logged.join("; "));
+});
+
+test("not P1 by the policy: marked read as before", async () => {
+  const { calls, opts } = seams(["INBOX"]);
+  let asked = null;
+  await labelDigest("S", { ...opts, isP1: async (q) => { asked = q; return false; } });
+  assert.deepEqual(calls, [["label", "m1", "personal"], ["star", "m1"], ["mark-read", "m1"]]);
+  assert.equal(asked.subject, "S", "without a matched header, the subject it searched for");
+});
+
+test("the policy check failing falls back to attempting the mark-read", async () => {
+  for (const isP1 of [async () => { throw new Error("boom"); }, async () => null]) {
+    const { calls, opts } = seams(["INBOX"]);
+    assert.equal(await labelDigest("S", { ...opts, isP1 }), "m1");
+    assert.deepEqual(calls, [["label", "m1", "personal"], ["star", "m1"], ["mark-read", "m1"]]);
+  }
+});
+
+test("p1BySenderPolicy reads p1-sender check's exit: 0 P1, 3 not, anything else unknown", () => {
+  let argv = null;
+  const run = (status) => (_bin, args) => { argv = args; return { status }; };
+  assert.equal(p1BySenderPolicy({ sender: SYNTHETIC.agent_email, subject: "S" }, { run: run(0) }), true);
+  assert.deepEqual(argv.slice(1), ["check", "--sender", SYNTHETIC.agent_email, "--subject", "S"]);
+  assert.ok(argv[0].endsWith("p1-sender"));
+  assert.equal(p1BySenderPolicy({ sender: SYNTHETIC.agent_email, subject: "S" }, { run: run(3) }), false);
+  assert.equal(p1BySenderPolicy({ sender: SYNTHETIC.agent_email, subject: "S" }, { run: run(1) }), null);
+  assert.equal(p1BySenderPolicy({ sender: SYNTHETIC.agent_email, subject: "S" }, { run: run(null) }), null, "killed by the timeout");
+  assert.equal(p1BySenderPolicy({ sender: "", subject: "S" }, { run: run(0) }), null, "no sending address configured");
 });
 
 test("restores INBOX when the message ended up archived", async () => {
@@ -417,5 +462,7 @@ test("findSentMessageId finds a subject a team role signed, but not a reply to i
     signed: { payload: { headers: [{ name: "Subject", value: "Cy (Historian): Day of Sunday" }] } },
   };
   const gmail = { searchIds: async () => ["reply", "signed"], getMessage: async (id) => msgs[id] };
-  assert.equal(await findSentMessageId("Day of Sunday", { attempts: 1, gmail }), "signed");
+  let matched = null;
+  assert.equal(await findSentMessageId("Day of Sunday", { attempts: 1, gmail, onMatch: (m) => { matched = m; } }), "signed");
+  assert.deepEqual(matched, { id: "signed", subject: "Cy (Historian): Day of Sunday" });
 });
