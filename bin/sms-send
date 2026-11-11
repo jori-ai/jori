@@ -12,8 +12,8 @@
 //   - --authorized is required: what the user actually said when they asked
 //     for this text (a quote, not a flag). It is logged with the send.
 //   - the text must open with the Jori identity line the outbound policy
-//     fixes for anyone other than the user ("Hi <Name>, this is Jori,
-//     <owner>'s AI assistant. …" or "This is Jori on behalf of <owner> …").
+//     fixes for anyone other than the user ("Hi <Name>, this is <assistant>,
+//     <owner>'s AI assistant. …" or "This is <assistant> on behalf of <owner> …").
 //   - --to must be E.164; the text at most 1600 characters.
 //   - inside a test run (NODE_TEST_CONTEXT) nothing is sent unless the test
 //     names a stand-in API (SMS_TWILIO_API_BASE).
