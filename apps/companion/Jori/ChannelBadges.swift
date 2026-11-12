@@ -930,15 +930,16 @@ struct PinnedConversationsGrid: View {
                     }
                 VStack(spacing: 1) {
                     Text(Self.short(name))
-                        .font(.caption.weight(.medium))
+                        .font(.system(size: 10, weight: .medium))
                         .foregroundStyle(.primary)
                     if !role.isEmpty {
                         Text(Self.short(role))
-                            .font(.caption2)
+                            .font(.system(size: 9))
                             .foregroundStyle(.secondary)
                     }
                 }
                 .lineLimit(1)
+                .minimumScaleFactor(0.85)
             }
             .frame(maxWidth: .infinity)
             .contentShape(Rectangle())
@@ -947,9 +948,9 @@ struct PinnedConversationsGrid: View {
         .accessibilityLabel(name + (role.isEmpty ? "" : ", \(role)") + (badge > 0 ? ", \(badge) waiting" : "") + ", pinned")
     }
 
-    /// At most 10 characters under a circle, with an ellipsis when cut.
+    /// At most 16 characters under a circle, with an ellipsis when cut.
     static func short(_ s: String) -> String {
-        s.count > 10 ? s.prefix(10).trimmingCharacters(in: .whitespaces) + "…" : s
+        s.count > 16 ? s.prefix(16).trimmingCharacters(in: .whitespaces) + "…" : s
     }
 }
 
