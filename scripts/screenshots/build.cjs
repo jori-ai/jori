@@ -475,7 +475,7 @@ const workProject = workPage({
 
 ## Tasks
 - [ ] Send Priya the revised pricing for all six Harbor & Pine sites · Dana · due 2026-11-03 (overdue) · draft ready
-- [ ] Check the multi-site discount on the Harbor & Pine pricing · Nora (CFO) · due 2026-11-05
+- [ ] Check the multi-site discount on the Harbor & Pine pricing · Nora (Finances) · due 2026-11-05
 - [ ] Get the security questionnaire back for the Harbor & Pine renewal · Priya · due 2026-11-06
 - [ ] Write the one-page Harbor & Pine rollout plan · Leo · due 2026-11-07
 - [ ] Send the Harbor & Pine contract for signature · Dana · due 2026-11-14
@@ -497,7 +497,7 @@ const AV = ICON_FACE.replace("<svg", '<svg class="av"');
 
 // ── The team in the app: a conversation per role, photos, one red badge ────
 // Made-up headshots for the made-up work roster (scripts/screenshots/team/).
-const PHOTO = Object.fromEntries(["morgan", "reese", "paige", "nora", "gia", "kai", "sid", "wren"].map((n) =>
+const PHOTO = Object.fromEntries(["morgan", "reese", "paige", "nora", "gia", "kai", "wren"].map((n) =>
   [n, `data:image/jpeg;base64,${fs.readFileSync(path.join(__dirname, "team", `${n}.jpg`)).toString("base64")}`])); // kernel-closure-ok: the demo headshots ship in the kernel beside this script
 const JORI_LIST_AV = ICON_FACE.replace('width="30" height="30"', 'width="46" height="46" class="ph"');
 const crow = (av, name, title, preview, time, badge = 0) => `<div class="crow">${av}<div class="c"><div class="top"><b>${name}</b><i>${title}</i><time>${time}</time></div><div class="bot"><span>${preview}</span>${badge ? `<div class="badge">${badge}</div>` : ""}</div></div></div>`;
@@ -511,25 +511,24 @@ const asRole = (screen, key, name, title) => screen
 const teamList = `<div class="lhead"><b>Jori</b><div class="ico"><svg width="18" height="18" viewBox="0 0 18 18"><path d="M3 15l1-3.5 8.5-8.5 2.5 2.5L6.5 14z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/></svg></div></div>
 <div class="clist">
 ${crow(JORI_LIST_AV, "Jori", "Chief of Staff", "The Harbor &amp; Pine contract is due Friday. Tom's redlines are summarized on the page.", "9:02 AM")}
-${crow(img("nora"), "Nora", "CFO", "Bottom line: two invoices are 30+ days late. Reminders are drafted for your OK.", "8:41 AM", 2)}
-${crow(img("morgan"), "Morgan", "Executive Assistant", "Done: Thursday 11:00 with Alex Chen is booked, Zoom link in the invite.", "8:15 AM", 1)}
+${crow(img("nora"), "Nora", "Finances", "Bottom line: two invoices are 30+ days late. Reminders are drafted for your OK.", "8:41 AM", 2)}
+${crow(img("morgan"), "Morgan", "Admin", "Done: Thursday 11:00 with Alex Chen is booked, Zoom link in the invite.", "8:15 AM", 1)}
 ${crow(`<div class="grp">${img("reese", "")}${img("paige", "")}</div>`, "Harbor &amp; Pine renewal", "Reese, Paige", "Paige: Lakeview's two missing admins are invited again.", "Yesterday", 1)}
-${crow(img("kai"), "Kai", "Software Engineer", "Root cause found: multi-site quotes dropped the Atlanta tier. Draft PR is up.", "Thu")}
-${crow(img("sid"), "Sid", "IT &amp; Security", "All clear. Both laptops have the security update.", "Wed")}
-${crow(img("gia"), "Gia", "Marketer", "The case study draft is ready for your edits.", "Wed")}
-${crow(img("wren"), "Wren", "Research Analyst", "Brightline before Thursday: their Series B, and a new COO.", "Mon")}
+${crow(img("kai"), "Kai", "Product", "Root cause found: multi-site quotes dropped the Atlanta tier. Draft PR is up.", "Thu")}
+${crow(img("gia"), "Gia", "Marketing", "The case study draft is ready for your edits.", "Wed")}
+${crow(img("wren"), "Wren", "Research", "Brightline before Thursday: their Series B, and a new COO.", "Mon")}
 </div>`;
 const groupThread = `${navFor(`<div class="stack">${img("reese", "")}${img("nora", "")}</div>`, "Harbor &amp; Pine renewal", "Reese, Paige, Nora")}<div class="thread">
 <div class="sep">Today 10:14 AM</div>
-<div class="from">Reese · Sales Ops</div>
+<div class="from">Reese · Sales</div>
 <div class="row jori">${img("reese", "av")}<div class="b j1" style="max-width:320px">Tom wants quarterly billing instead of annual before they sign. Everything else in the redlines is fine.</div></div>
 <div class="gap"></div>
 <div class="row me"><div class="b"><span class="mention">@Nora</span> can we do quarterly if they sign by the 21st?</div></div>
 <div class="gap"></div>
-<div class="from">Nora · CFO</div>
+<div class="from">Nora · Finances</div>
 <div class="row jori">${img("nora", "av")}<div class="b j1" style="max-width:320px"><b>Bottom line: yes.</b> Quarterly costs us about $1,800 in float over the year, from the contract value and our cash balance as of this morning. Worth it to close by the 21st.</div></div>
 <div class="gap"></div>
-<div class="from">Reese · Sales Ops</div>
+<div class="from">Reese · Sales</div>
 <div class="row jori">${img("reese", "av")}<div class="b j1" style="max-width:320px">Putting it in the reply to Tom now. I'll tell you when he answers.</div></div>
 </div>${composer("the group")}`;
 const workAfterMeeting = `${NAV}<div class="thread">
@@ -720,18 +719,17 @@ const pHome = chat("Today 8:41 AM",
 // Personal: Jori keeps a task list per project; Sam's tasks go on Sam's own list
 // with a date, Jori follows up when one slips and does the work it can overnight.
 // Work: the same chief of staff leads a team of roles (a made-up roster: Morgan
-// the executive assistant, Reese in sales ops, Nora the CFO, …) that sign their work.
+// on admin, Reese on sales, Nora on finances, …) that sign their work.
 
 const TEAM = [
   ["Jori", "Chief of Staff", "Keeps every project on track and everyone accountable."],
-  ["Morgan", "Executive Assistant", "Inbox, calendar, meetings and travel."],
-  ["Reese", "Sales Ops", "Pipeline, renewals and the CRM, kept honest."],
+  ["Morgan", "Admin", "Inbox, calendar, meetings and travel."],
+  ["Reese", "Sales", "Pipeline, renewals and the CRM, kept honest."],
   ["Paige", "Customer Success", "Onboarding, health checks and follow-ups."],
-  ["Nora", "CFO", "Invoices, cash, budgets and month-end."],
-  ["Gia", "Marketer", "Case studies, the site and campaigns."],
-  ["Kai", "Software Engineer", "Builds what you ask for and fixes what breaks."],
-  ["Sid", "IT & Security", "Laptops, accounts, backups and breach alerts."],
-  ["Wren", "Research Analyst", "Prospects, competitors and the news that matters."],
+  ["Nora", "Finances", "Invoices, cash, budgets and month-end."],
+  ["Gia", "Marketing", "Case studies, the site and campaigns."],
+  ["Kai", "Product", "All the tech: builds, fixes, and keeps laptops, accounts and backups safe."],
+  ["Wren", "Research", "Prospects, competitors and the news that matters."],
 ];
 
 const kitchen = pages.find((p) => p.id === "project_kitchen_reno");
@@ -801,7 +799,7 @@ const wReview = chat("Monday 7:45 AM",
   jori(`Merging at 1. I'll watch the first live quotes and tell you if anything looks off.`, { avatar: true }));
 
 // An inbox where every email comes from the role that sent it, as email-send
-// does for mail to the user (From "Sid (IT & Security)", system/org.md), in a
+// does for mail to the user (From "Nora (Finances)", system/org.md), in a
 // generic mail-client layout.
 const MAIL_CSS = `
 * { box-sizing:border-box; margin:0; }
@@ -829,14 +827,14 @@ const inboxDoc = `<!doctype html><html><head><meta charset="utf-8"><style>${MAIL
 <div class="side"><div class="new">Compose</div><div class="f on"><span>Inbox</span><span>9</span></div><div class="f"><span>Starred</span></div><div class="f"><span>Sent</span></div><div class="f"><span>Clients</span></div><div class="f"><span>Finance</span></div></div>
 <div class="main"><div class="bar">Inbox</div>
 ${mrow("Jori (Chief of Staff)", "Your projects this week", "7 done, 1 slipping, the Harbor & Pine contract due Friday", "9:00 AM")}
-${mrow("Reese (Sales Ops)", "Pipeline review", "Harbor & Pine moved to contract; Brightline stalled since Oct 20", "8:40 AM")}
-${mrow("Morgan (Executive Assistant)", "Your day", "3 meetings, a 90-minute focus block, Priya's reply drafted", "8:15 AM")}
-${mrow("Nora (CFO)", "Month-end close", "Two client invoices 30+ days late; reminders drafted", "8:02 AM")}
+${mrow("Reese (Sales)", "Pipeline review", "Harbor & Pine moved to contract; Brightline stalled since Oct 20", "8:40 AM")}
+${mrow("Morgan (Admin)", "Your day", "3 meetings, a 90-minute focus block, Priya's reply drafted", "8:15 AM")}
+${mrow("Nora (Finances)", "Month-end close", "Two client invoices 30+ days late; reminders drafted", "8:02 AM")}
 ${mrow("Paige (Customer Success)", "Onboarding check-in", "Lakeview is live on 4 of 6 sites; two admins never logged in", "Fri")}
-${mrow("Kai (Software Engineer)", "Work ready for your review", "The renewal-quote calculator now handles multi-site pricing. Draft PR inside", "Thu", false)}
-${mrow("Gia (Marketer)", "Case study draft: Harbor & Pine", "Ready for your edits before it goes to Priya for approval", "Thu", false)}
-${mrow("Sid (IT & Security)", "Two laptops need the security update", "Leo's and Maria's; the patch closes a browser exploit", "Wed", false)}
-${mrow("Wren (Research Analyst)", "Brightline before Thursday", "Their Series B, the new COO, and what they asked competitors", "Mon", false)}
+${mrow("Kai (Product)", "Work ready for your review", "The renewal-quote calculator now handles multi-site pricing. Draft PR inside", "Thu", false)}
+${mrow("Gia (Marketing)", "Case study draft: Harbor & Pine", "Ready for your edits before it goes to Priya for approval", "Thu", false)}
+${mrow("Kai (Product)", "Two laptops need the security update", "Leo's and Maria's; the patch closes a browser exploit", "Wed", false)}
+${mrow("Wren (Research)", "Brightline before Thursday", "Their Series B, the new COO, and what they asked competitors", "Mon", false)}
 </div></body></html>`;
 
 // ── Stamp ───────────────────────────────────────────────────────────────────
@@ -854,9 +852,9 @@ if (CHECK) {
 }
 
 // Work screens live in the conversation of the role that owns the work.
-const MORGAN = (x) => asRole(x, "morgan", "Morgan", "Executive Assistant");
-const REESE = (x) => asRole(x, "reese", "Reese", "Sales Ops");
-const KAI = (x) => asRole(x, "kai", "Kai", "Software Engineer");
+const MORGAN = (x) => asRole(x, "morgan", "Morgan", "Admin");
+const REESE = (x) => asRole(x, "reese", "Reese", "Sales");
+const KAI = (x) => asRole(x, "kai", "Kai", "Product");
 
 fs.mkdirSync(OUT, { recursive: true });
 const raw = {
