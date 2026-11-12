@@ -1421,7 +1421,8 @@ else
   echo "$ASSISTANT push failed (HTTP $HTTP_CODE) — falling back to email" >&2
   EMAIL_SEND="$JORI_INSTALL_TOOLS/bin/email-send"
   if [ -x "$EMAIL_SEND" ]; then
-    JORI_NO_SIGN=1 "$EMAIL_SEND" --to "$JORI_OWNER_EMAIL" \
+    # Already judged by the speak gate above (it is the same message): no second review.
+    SPEAK_GATE_EMAIL=0 JORI_NO_SIGN=1 "$EMAIL_SEND" --to "$JORI_OWNER_EMAIL" \
       --subject "${JORI_SENDER_NAME:-$ASSISTANT} notification (push failed)" \
       --body "$MESSAGE" 2>/dev/null
     if [ $? -eq 0 ]; then

@@ -111,3 +111,17 @@ test("the daily summary prints held messages verbatim, in their own section, ema
   assert.deepEqual(_internal.heldDigestsHtml({}), []);
   assert.ok(_internal.heldDigestsHtml({ held_digests_error: "boom" }).join("").includes("Couldn't read the held messages"));
 });
+
+test("an email to the user is gated; a report email is never held", async () => {
+  fakeJudge({ verdict: "drop", reason: "noise" });
+  const p = await gateOutbound({ message: "FYI nothing changed", channel: "email", kind: "proactive" });
+  assert.equal(p.deliver, false);
+  const r = await gateOutbound({ message: "Morning brief text", channel: "email", kind: "report" });
+  assert.equal(r.deliver, true);
+  assert.equal(r.review.verdict, "send");
+  assert.equal(r.review.kind, "report");
+  fakeJudge({ verdict: "rewrite", message: "fixed line", reason: "wrong date" });
+  const w = await gateOutbound({ message: "Report", channel: "email", kind: "report" });
+  assert.equal(w.verdict, "rewrite");
+  assert.equal(w.text, "fixed line");
+});

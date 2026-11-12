@@ -356,8 +356,9 @@ final class TeamStore: ObservableObject {
     /// (2026-11-11) it judges before delivery and acts: a rewritten message
     /// carries its original, folded until opened.
     @Published var gateReviews: [UUID: GateReview] = [:]
-    /// Messages the gate held (drop / digest / resolve): never delivered, so
-    /// they have no message row. Shown as a folded line in their conversation.
+    /// Reviews with no message row: messages the gate held (drop / digest /
+    /// resolve), and emails to the user (sent or held). Shown as a folded line
+    /// in their conversation.
     @Published var heldReviews: [String: [GateReview]] = [:]
     /// Every open question the badges count, by conversation (loadSummaries).
     @Published var openQuestionMessages: [String: [Message]] = [:]
@@ -369,7 +370,7 @@ final class TeamStore: ObservableObject {
             try await SupabaseManager.ensureAuthenticated()
             let rows: [GateReview] = try await SupabaseManager.shared
                 .from(Self.gateReviewsTable)
-                .select("id,message_id,verdict,reason,suggestion,grade,note,original,live,held,judged_at,digested_on,handed_back_at")
+                .select("id,message_id,channel,verdict,reason,suggestion,grade,note,original,live,held,judged_at,digested_on,handed_back_at")
                 .eq("conversation_id", value: conversationId)
                 .order("judged_at", ascending: false)
                 .limit(300)
@@ -378,7 +379,8 @@ final class TeamStore: ObservableObject {
             var next = gateReviews
             for r in rows { if let mid = r.message_id { next[mid] = r } }
             if next != gateReviews { gateReviews = next }
-            let held = rows.filter { $0.held == true }.sorted { ($0.judged_at ?? .distantPast) < ($1.judged_at ?? .distantPast) }
+            // Reviews with no message row: held messages, and emails (checked before sending).
+            let held = rows.filter { $0.message_id == nil && ($0.held == true || $0.channel == "email") }.sorted { ($0.judged_at ?? .distantPast) < ($1.judged_at ?? .distantPast) }
             if heldReviews[conversationId] != held { heldReviews[conversationId] = held }
         } catch {
             print("[Team] gate reviews load failed: \(error)")
@@ -1317,6 +1319,8 @@ struct HiddenToolbarTitle: ViewModifier {
 struct GateReview: Codable, Equatable, Identifiable {
     let id: UUID
     let message_id: UUID?
+    /// "email" for mail to the user (bin/email-send); otherwise the app channel.
+    let channel: String?
     let verdict: String
     let reason: String?
     let suggestion: String?
@@ -1348,7 +1352,22 @@ struct GateReview: Codable, Equatable, Identifiable {
     }
     var isHeld: Bool { held == true }
 
+    var isEmail: Bool { channel == "email" }
+
     var verdictText: String {
+        if isLive && isEmail {
+            switch verdict {
+            case "send": return "Email checked, sent as written"
+            case "rewrite": return suggestion != nil ? "Email sent; a fix suggested" : "Email rewritten before sending"
+            case "resolve": return "Email held: it could answer this itself"
+            case "digest":
+                if let d = digested_on, let shown = Self.dayLabel(d) { return "Email held, in the daily summary for \(shown)" }
+                return "Email held for the daily summary"
+            case "drop": return "Email held: not worth sending"
+            case "error": return "Email check failed, sent as written"
+            default: return "Email checked"
+            }
+        }
         if isLive {
             switch verdict {
             case "send": return "Checked, sent as written"
@@ -1372,15 +1391,19 @@ struct GateReview: Codable, Equatable, Identifiable {
         }
     }
 
-    var suggestionLabel: String { verdict == "resolve" ? "What it found" : "Would have sent instead" }
+    var suggestionLabel: String { verdict == "resolve" ? "What it found" : (isEmail ? "Suggested fix" : "Would have sent instead") }
 
     /// The original, shown folded: for a rewrite (what was written before the
     /// gate changed it) and for a held message (what was not sent).
     var originalToShow: String? {
         guard isLive, let o = original, !o.isEmpty else { return nil }
+        if isEmail { return o }
         return (verdict == "rewrite" || isHeld) ? o : nil
     }
-    var originalLabel: String { isHeld ? "The message it held" : "Original, before the rewrite" }
+    var originalLabel: String {
+        if isEmail { return isHeld ? "The email it held" : (verdict == "rewrite" && suggestion == nil ? "Original email, before the rewrite" : "The email") }
+        return isHeld ? "The message it held" : "Original, before the rewrite"
+    }
 }
 
 /// Under a message: what the gate did (or, in shadow, would have done), why,

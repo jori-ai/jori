@@ -246,6 +246,60 @@ async function send(a) {
   // non-zero.)
   const toHasOwner = !!OWNER_ADDRESS && toList.some((addr) => addr.toLowerCase() === OWNER_ADDRESS.toLowerCase());
 
+  // ─── The speak gate (system/speak-gate.md § Live, email) ───────────────
+  // Mail to the user ALONE is judged before it is sent, like a message to the
+  // app (the user, 2026-11-11: emails to them had no check at all). A plain
+  // text email is proactive: sent, rewritten (the body is replaced) or held
+  // (not sent; the user sees it as a folded line in the sender's conversation
+  // in the app). An HTML email is a report the user set up: checked for truth
+  // and wording, never held, and a suggested fix is shown in the app rather
+  // than spliced into the built HTML. A reply in one of the user's own threads
+  // (--in-reply-to) is a reply: never held. Mail that also goes to someone
+  // else is not judged (holding it would hold it from them too). Fails open.
+  // Off: data/.speak-gate-off; SPEAK_GATE_EMAIL=0 skips it for one send.
+  let gateReview = null;
+  if (toHasOwner && toList.length === 1 && process.env.SPEAK_GATE_EMAIL !== "0") {
+    try {
+      const sg = await import("../lib/speak-gate-live.mjs");
+      const html = a.html || looksLikeHtml(a.body);
+      const kind = a.inReplyTo ? "reply" : html ? "report" : "proactive";
+      let sender = null;
+      try {
+        const job = a.signAs || process.env.JORI_SIGN_AS || process.env.JORI_JOB;
+        const r = job ? require("../lib/org.cjs").roleFor({ job }) : null;
+        sender = r && r.id ? r.id : null;
+      } catch {}
+      const text = html ? htmlToText(a.body) : String(a.body);
+      const g = await sg.gateOutbound({
+        message: text.slice(0, 12000), channel: "email", kind, sender,
+        intent: `email:${process.env.JORI_JOB || a.signAs || "email-send"}`,
+        supporting_data: { email_subject: a.subject, attachments: a.attachments.length },
+      });
+      if (!g.deliver) {
+        console.log(`Held: not sent — the speak gate held it (${g.verdict}: ${String(g.reason || "").slice(0, 200)}). ${INSTANCE.owner_name || "The user"} sees it in the app and grades the call. Not an error; do not resend.`);
+        return;
+      }
+      if (g.review) {
+        gateReview = { ...g.review, original: `Subject: ${a.subject}\n\n${text.slice(0, 4000)}` };
+        if (g.verdict === "rewrite") {
+          if (html) {
+            // The built report goes out as written; the fix is shown in the app.
+            gateReview.suggestion = g.text;
+            gateReview.reason = `Report sent as written; suggested fix below. ${gateReview.reason || ""}`.trim();
+          } else {
+            a.body = g.text;
+          }
+        }
+      }
+    } catch (err) {
+      console.error(`email-send: speak gate skipped (${err.message})`);
+    }
+  }
+  const recordGate = async () => {
+    if (!gateReview) return;
+    try { const { recordReview } = await import("../lib/speak-gate-live.mjs"); await recordReview(gateReview, null); } catch {}
+  };
+
   // No writing-style gate here. email-send is the internal channel only:
   // agent-to-user digests, alerts, reports (Outbound Email Policy default). An
   // installation's style rules for outreach are about mail that goes to a
@@ -280,6 +334,7 @@ async function send(a) {
     }
     if (direct) {
       console.log(`Sent: email_id=${direct.emailId} succeeded=1 failed=0 via=mailbox`);
+      await recordGate();
       await logSent(a, toList, { email_id: direct.emailId, message_id: direct.messageId, gmail_id: direct.gmailId, transport: "mailbox" });
       await autoLabel(a, toHasOwner, direct.emailId);
       return;
@@ -341,6 +396,7 @@ async function send(a) {
   }
   const d = data.data || {};
   console.log(`Sent: email_id=${d.email_id || "?"} succeeded=${d.succeeded} failed=${d.failed}`);
+  await recordGate();
   await logSent(a, toList, { email_id: d.email_id || null });
   await autoLabel(a, toHasOwner, d.email_id);
 }

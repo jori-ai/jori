@@ -48,7 +48,7 @@
 //
 // Claude only, never Jev: money and health messages pass through here too.
 //
-// Stdin:  {message, intent?, sender? (role id), kind?: "proactive"|"reply",
+// Stdin:  {message, intent?, sender? (role id), kind?: "proactive"|"reply"|"report",
 //          reply_to_text?, channel?, supporting_data?, fixed_choices? (a card's
 //          option labels), as_of? (replay)}
 // Stdout: {verdict, message?, research_plan?, reason, checks, sources, ms}
@@ -106,7 +106,7 @@ function precheckEvidence(input) {
   if (input.as_of) env.OUTBOUND_PRECHECK_AS_OF = input.as_of;
   const r = spawnSync(process.execPath, [path.join(ROOT, "bin", "outbound-precheck.mjs")], {
     input: JSON.stringify({ message: input.message, intent: input.intent, agent: input.sender || "ops",
-      supporting_data: input.supporting_data, created_at: input.as_of || null, solicited: input.kind === "reply" }),
+      supporting_data: input.supporting_data, created_at: input.as_of || null, solicited: input.kind !== "proactive" }),
     encoding: "utf8", timeout: 90000, env,
   });
   try { return JSON.parse(String(r.stdout || "").trim().split("\n").pop()); } catch { return null; }
@@ -219,10 +219,17 @@ function roleName(id) {
 }
 
 function prompt(input, ev, extra) {
-  const reply = input.kind === "reply";
+  // A report email the user set up (kind "report") is checked like a reply:
+  // truth and phrasing, never held.
+  const reply = input.kind === "reply" || input.kind === "report";
   const E = (title, body) => (body && String(body).trim() ? `\n## ${title}\n${String(body).trim()}\n` : "");
   const rules = (CFG.standing_rules || []).map((r) => `- ${r}`).join("\n");
-  const checks = reply
+  const checks = input.kind === "report"
+    ? `This is a REPORT EMAIL ${OWNER} set up (a scheduled brief, summary or report), shown as text. Two questions:
+1. TRUE — verify its factual claims against the sources (tools below), the ones that matter most first. A claim the sources contradict, or a hedge where the answer is findable, must be fixed.
+3. PHRASING — plain, clear, no internal jargon.
+A report is NEVER dropped or held: the verdict is "send" or "rewrite". For "rewrite", "message" is the corrected text of only the parts you would change, each as "<what it said> → <what it should say>", one per line.`
+    : reply
     ? `This is a REPLY to something ${OWNER} just wrote. Two questions:
 1. TRUE — verify every factual claim against the sources (tools below). A claim the sources contradict, or a hedge ("I can't tell whether…", "tell me if…") where the answer is findable, must be fixed — find the answer and put it in.
 3. PHRASING — answers what ${OWNER} asked, directly, short, plain.
@@ -255,7 +262,7 @@ function lastJson(text) {
 }
 
 async function judge(input, ev, extra) {
-  const reply = input.kind === "reply";
+  const reply = input.kind === "reply" || input.kind === "report";
   const timeoutMs = 1000 * Number(process.env.SPEAK_GATE_TIMEOUT_S || (reply ? 120 : 300));
   const { text, err } = await runAgent(prompt(input, ev, extra), { model: MODELS.sonnet, effort: reply ? "low" : "medium", timeoutMs, web: webAllowed(input) });
   if (!text) throw new Error(`judge_unavailable:${err?.killed ? "timeout" : (err?.code || "empty")}`);
@@ -273,7 +280,7 @@ async function judge(input, ev, extra) {
 let input;
 try { input = JSON.parse(readFileSync(0, "utf8")); } catch { out({ verdict: "send", reason: "gate_invalid_input" }, {}); }
 if (!input || !String(input.message || "").trim()) out({ verdict: "send", reason: "gate_empty_input" }, {});
-input.kind = input.kind === "reply" ? "reply" : "proactive";
+input.kind = ["reply", "report"].includes(input.kind) ? input.kind : "proactive";
 const ctx = { intent: input.intent || null, sender: input.sender || null, kind: input.kind, as_of: input.as_of || null, message: String(input.message).slice(0, 400), ...(input.replay_id ? { replay_id: input.replay_id } : {}) };
 const t0 = Date.now();
 try {
@@ -281,7 +288,7 @@ try {
   if (pre && pre.decision && pre.decision !== "evidence") {
     // A deterministic stage decided (settled subject, stale premise). A reply
     // is never dropped: its suppress becomes a send.
-    const v = pre.decision === "suppress" ? (input.kind === "reply" ? "send" : "drop") : pre.decision === "modify" ? "rewrite" : "send";
+    const v = pre.decision === "suppress" ? (input.kind !== "proactive" ? "send" : "drop") : pre.decision === "modify" ? "rewrite" : "send";
     out({ verdict: v, ...(v === "rewrite" ? { message: pre.message } : {}), reason: `deterministic: ${pre.reason || ""}`.slice(0, 200), ms: Date.now() - t0 }, ctx);
   }
   const ev = (pre && pre.evidence) || {};
