@@ -557,9 +557,6 @@ struct ContentView: View {
         .toolbar {
             ToolbarItem(placement: .topBarLeading) { settingsMenu }
             ToolbarItem(placement: .topBarTrailing) {
-                Button { go(.memory) } label: { Label("Memory", systemImage: "book.closed") }
-            }
-            ToolbarItem(placement: .topBarTrailing) {
                 Button { showNewConversation = true } label: {
                     Label("New conversation", systemImage: "square.and.pencil")
                 }
@@ -745,6 +742,8 @@ struct ContentView: View {
 
     private var settingsMenu: some View {
         Menu {
+            // Memory lives here on the iPhone (the Go menu, ⌘2, elsewhere).
+            Button { go(.memory) } label: { Label("Memory", systemImage: "book.closed") }
             Section("Approvals") {
                 if TradeApproval.isEnabled {
                     Button { showApprovalPairing = true } label: {
