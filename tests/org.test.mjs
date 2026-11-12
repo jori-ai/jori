@@ -109,3 +109,7 @@ test("adoptRoles: only installed roles that are off are turned on", () => {
   assert.deepEqual(done, []);
   assert.deepEqual(seen, []);
 });
+
+test("retiredRoles: read from org.json `retired`; empty when absent", () => {
+  assert.ok(org.retiredRoles() instanceof Set);
+});

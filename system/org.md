@@ -19,7 +19,7 @@ Setup is additive: answering again never turns a role off.
 
 ## Growing the team
 
-The app lists every installed role: the team (`jori_team.enabled`), and under **Add to your team** the roles that are off (`enabled = false`, written by `org sync`). Picking one, in a new conversation or with "Add someone", sets its `requested_at` (migration `0186_team_requested.sql`) and shows it as a teammate at once. The server then turns its plugin on (`org adopt`, `lib/org.cjs` `adoptRoles`): the phone channel does it before routing the first message written to that role, so the role answers it itself, and `org sync` (every 10 minutes) catches anything else. From then on the role owns its plugin's jobs, signs what they send, and the coordinator, no longer alone, becomes the Chief of Staff.
+The app lists every installed role: the team (`jori_team.enabled`), and under **Add to your team** the roles that are off (`enabled = false`, written by `org sync`). Picking one, in a new conversation or with "Add someone", sets its `requested_at` (migration `0186_team_requested.sql`) and shows it as a teammate at once. The server then turns its plugin on (`org adopt`, `lib/org.cjs` `adoptRoles`): the phone channel does it before routing the first message written to that role, so the role answers it itself, and `org sync` (every 10 minutes) catches anything else. An installation can **retire** roles it never wants offered: `org.json` `"retired": ["<role id>", …]` keeps them out of "Add to your team", and `org sync` deletes their rows from `jori_team`. From then on the role owns its plugin's jobs, signs what they send, and the coordinator, no longer alone, becomes the Chief of Staff.
 
 ## Where it lives
 
