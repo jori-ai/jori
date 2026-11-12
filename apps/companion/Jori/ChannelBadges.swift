@@ -958,7 +958,7 @@ struct ConversationRowView: View {
 
 // MARK: - Pinned conversations
 
-/// The pinned conversations as iMessage shows them: big circles, three across,
+/// The pinned conversations as iMessage shows them: circles, three across,
 /// the name under each, above the list. A red badge sits on a circle when
 /// something is waiting; right-click / long-press unpins or deletes.
 struct PinnedConversationsGrid: View {
@@ -967,10 +967,10 @@ struct PinnedConversationsGrid: View {
     let open: (String) -> Void
     var onDeleted: (String) -> Void = { _ in }
 
-    private let columns = Array(repeating: GridItem(.flexible(), spacing: 8, alignment: .top), count: 3)
+    private let columns = Array(repeating: GridItem(.flexible(), spacing: 18, alignment: .top), count: 3)
 
     var body: some View {
-        LazyVGrid(columns: columns, spacing: 14) {
+        LazyVGrid(columns: columns, spacing: 18) {
             ForEach(team.pinnedConversations) { conversation in
                 tile(conversation)
                     .modifier(ConversationDeleteActions(conversation: conversation, team: team, onDeleted: onDeleted, swipes: false))
@@ -986,7 +986,7 @@ struct PinnedConversationsGrid: View {
         let role = team.subtitle(of: conversation.id)
         return Button { open(conversation.id) } label: {
             VStack(spacing: 6) {
-                TeamAvatar(members: team.members(of: conversation.id), size: 64)
+                TeamAvatar(members: team.members(of: conversation.id), size: 54)
                     .padding(3)
                     .overlay {
                         if isSelected { Circle().strokeBorder(JoriTheme.cobalt, lineWidth: 2.5) }
