@@ -96,3 +96,18 @@ test("recordReview links the review to the delivered row", async () => {
   await recordReview({ verdict: "send", original: "a" }, "11111111-1111-1111-1111-111111111111");
   assert.equal(rows().slice(before)[0].message_id, "11111111-1111-1111-1111-111111111111");
 });
+
+test("the daily summary prints held messages verbatim, in their own section, email only", async () => {
+  const { createRequire } = await import("node:module");
+  const require = createRequire(import.meta.url);
+  const { _internal } = require("../lib/daily-summary-render.js");
+  const day = { tz: "America/New_York", held_digests: [
+    { judged_at: "2026-11-11T14:05:00Z", from: "Ada (CFO)", text: "Card statement posted: $1,240\nNothing due." },
+  ] };
+  const html = _internal.heldDigestsHtml(day).join("\n");
+  for (const want of ["Held for this summary", 'class="held-digest"', "9:05 AM", "Ada (CFO)", "$1,240<br>Nothing due."]) {
+    assert.ok(html.includes(want), `missing ${want}`);
+  }
+  assert.deepEqual(_internal.heldDigestsHtml({}), []);
+  assert.ok(_internal.heldDigestsHtml({ held_digests_error: "boom" }).join("").includes("Couldn't read the held messages"));
+});

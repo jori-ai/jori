@@ -617,6 +617,30 @@ async function buildHumBlock(row, text) {
  * into the anchor's text. Empty string for every other reply. Fail-soft — a
  * missing hint is never worth losing the message over.
  */
+/**
+ * Answers the speak gate found for the coordinator's (or an unsigned job's)
+ * own questions: it held each question instead of sending it
+ * (system/speak-gate.md § Live). Handed to the next chat turn once, so the
+ * coordinator records them and never asks them again. Fail-soft → "".
+ */
+async function buildFoundAnswersBlock() {
+  try {
+    const { resolvedAnswers, markHandedBack } = await import("../../lib/speak-gate-live.mjs");
+    const since = new Date(Date.now() - 30 * 864e5).toISOString();
+    const rows = [
+      ...(await resolvedAnswers({ sender: "chief-of-staff", notHandedBack: true, since })),
+      ...(await resolvedAnswers({ notHandedBack: true, since })).filter((r) => !r.sender),
+    ];
+    if (!rows.length) return "";
+    await markHandedBack(rows.map((r) => r.id));
+    const lines = rows.reverse().map((r) => `- You were going to ask: ${String(r.original || "").slice(0, 300)}\n  The answer found: ${String(r.suggestion).slice(0, 500)}`);
+    return `Answers found for you (the review before delivery held these questions because it found the answers; take them as settled, record them where they belong, and never ask ${OWNER} them again; mention one only if it changes something ${OWNER} needs to know):\n${lines.join("\n")}\n\n`;
+  } catch (err) {
+    console.error(`[phone-channel] found-answers block failed: ${err.message}`);
+    return "";
+  }
+}
+
 async function buildImprovementBlock(row) {
   if (!row?.reply_to) return "";
   try {
@@ -865,6 +889,7 @@ async function handleIncomingMessage(row) {
   const replyBlockP = buildReplyBlock(row, tz);
   const humBlockP = buildHumBlock(row, text);
   const improvementBlockP = buildImprovementBlock(row);
+  const foundBlockP = buildFoundAnswersBlock();
 
   // Fire-and-forget; see the header on startAck for the race with the reply.
   startAck(msgId, row, text).catch((err) => log(`ack task error: ${err.message}`));
@@ -920,10 +945,10 @@ async function handleIncomingMessage(row) {
     // them into this one message, photos first.
     const shareLine = metadata.source === "share" ? "\n[Shared into Jori from another app via the share sheet]" : ""; // control-scan-ok: the software's name
 
-    const [recallBlock, replyBlock, humBlock, improvementBlock] =
-      await Promise.all([recallP, replyBlockP, humBlockP, improvementBlockP]);
+    const [recallBlock, replyBlock, humBlock, improvementBlock, foundBlock] =
+      await Promise.all([recallP, replyBlockP, humBlockP, improvementBlockP, foundBlockP]);
     profLog(msgId, "t1b_context", `recall=${recallBlock ? "yes" : "no"}`);
-    const builtContent = `${recallBlock}${convoBlock}${replyBlock}${humBlock}${improvementBlock}New message from ${OWNER}:\n\n${text}\n\n[Current time: ${localTimeStr} ${tzAbbr}]${locationLine}${shareLine}`;
+    const builtContent = `${recallBlock}${convoBlock}${replyBlock}${humBlock}${improvementBlock}${foundBlock}New message from ${OWNER}:\n\n${text}\n\n[Current time: ${localTimeStr} ${tzAbbr}]${locationLine}${shareLine}`;
     const DISPATCH_URL = process.env.JORI_DISPATCH_URL;
 
     if (DISPATCH_URL) {

@@ -74,7 +74,10 @@ Every line has **Right call / Wrong call** and a note. A reply to something the 
 - **Budgets (live):** reply 60 s, proactive 240 s (`SPEAK_GATE_LIVE_TIMEOUT_S`).
 - **Storage:** `jori_gate_reviews` (migration 0184): own `id` key; `message_id` optional and unique; `original`, `live`, `held`. The app reloads on realtime changes to the table. A review that cannot be written is parked in `data/speak-gate-live-unrecorded.jsonl`.
 - **Off switch, no deploy:** `data/.speak-gate-off`, or `"live": false` in `agent/local/config/speak-gate.json`. Everything fails open.
-- **Not yet built:** a held `digest` is not rolled into the daily summary yet, and a held `resolve` does not yet hand its answer back to the role. Both are visible, folded, in the conversation. Emails to the user are still not gated.
+- **After a hold** (migration 0185):
+  - `digest` → the nightly daily summary email prints it verbatim under **"Held for this summary"**, after Decisions (`bin/daily-summary-build` `attachHeldDigests` at prep: every held digest not yet printed and held before that day ended, plus any already printed in that day's summary; `publish` sets `digested_on`). Email only, never the wiki day page; the review's money check skips the list (`class="held-digest"`). The app line then reads "In the daily summary for <day>".
+  - `resolve` → the answer goes back to the role that asked: `bin/role-session prepare` gives that role's next session an "ANSWERS FOUND FOR YOU" block (record it, act on it, never ask again), and phone-channel gives the coordinator's next chat turn the same for chief-of-staff and unsigned senders; `handed_back_at` is set. The gate itself is shown every answer it found in the last 14 days, so a job that asks the same thing again is resolved with the same answer.
+- **Still not gated:** emails to the user.
 
 ## Before wiring (open, as of the shadow week)
 

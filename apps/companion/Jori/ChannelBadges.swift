@@ -369,7 +369,7 @@ final class TeamStore: ObservableObject {
             try await SupabaseManager.ensureAuthenticated()
             let rows: [GateReview] = try await SupabaseManager.shared
                 .from(Self.gateReviewsTable)
-                .select("id,message_id,verdict,reason,suggestion,grade,note,original,live,held,judged_at")
+                .select("id,message_id,verdict,reason,suggestion,grade,note,original,live,held,judged_at,digested_on,handed_back_at")
                 .eq("conversation_id", value: conversationId)
                 .order("judged_at", ascending: false)
                 .limit(300)
@@ -1328,12 +1328,24 @@ struct GateReview: Codable, Equatable, Identifiable {
     /// Held by the gate: never delivered.
     let held: Bool?
     let judged_at: Date?
+    /// The day whose daily summary printed this held message (YYYY-MM-DD).
+    let digested_on: String?
+    /// When the answer the gate found went back to the role that asked.
+    let handed_back_at: Date?
 
     func graded(_ g: String, note n: String) -> GateReview {
         var c = self; c.grade = g; c.note = n.isEmpty ? nil : n; return c
     }
 
     var isLive: Bool { live == true }
+
+    /// "Nov 11" from "2026-11-11".
+    static func dayLabel(_ ymd: String) -> String? {
+        let p = DateFormatter(); p.dateFormat = "yyyy-MM-dd"; p.timeZone = TimeZone(identifier: "UTC")
+        guard let d = p.date(from: ymd) else { return nil }
+        let f = DateFormatter(); f.dateFormat = "MMM d"; f.timeZone = TimeZone(identifier: "UTC")
+        return f.string(from: d)
+    }
     var isHeld: Bool { held == true }
 
     var verdictText: String {
@@ -1341,8 +1353,10 @@ struct GateReview: Codable, Equatable, Identifiable {
             switch verdict {
             case "send": return "Checked, sent as written"
             case "rewrite": return "Rewritten before sending"
-            case "resolve": return "Held: it could answer this itself"
-            case "digest": return "Held for the daily summary"
+            case "resolve": return handed_back_at != nil ? "Held: answered itself, passed to the role" : "Held: it could answer this itself"
+            case "digest":
+                if let d = digested_on, let shown = Self.dayLabel(d) { return "In the daily summary for \(shown)" }
+                return "Held for the daily summary"
             case "drop": return "Held: not worth sending"
             case "error": return "Check failed, sent as written"
             default: return "Checked"

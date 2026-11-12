@@ -80,12 +80,28 @@ async function prepare(queueFile, roleId) {
     : owner === roleId
       ? `your own conversation with ${ceo} (${conv})`
       : `${names.get(owner) || owner}'s conversation with ${ceo} (${conv}), and brought you into it with an @mention. Read the recent messages below first: you are joining mid-thread, and ${ceo} expects you to pick up from them`;
+  // Answers the speak gate found for this role's own questions (it held each
+  // question instead of letting it through: system/speak-gate.md § Live). The
+  // role records them now and never asks them again. Fails soft.
+  let found = [];
+  try {
+    const { resolvedAnswers, markHandedBack } = await import("../lib/speak-gate-live.mjs");
+    found = await resolvedAnswers({ sender: roleId, notHandedBack: true, since: new Date(Date.now() - 30 * 864e5).toISOString() });
+    if (found.length) await markHandedBack(found.map((r) => r.id));
+  } catch { found = []; }
+  const foundBlock = found.length ? [
+    "",
+    `----- ANSWERS FOUND FOR YOU (you were going to ask ${ceo} these; the review before delivery found the answers, so they were not sent) -----`,
+    ...found.reverse().map((r) => `- [${String(r.judged_at).slice(0, 16).replace("T", " ")}Z] You were going to ask: ${String(r.original || "").slice(0, 400)}\n  The answer found: ${String(r.suggestion).slice(0, 600)}`),
+    `Take each as settled: record it wherever your area keeps such facts, act on it if it needed acting on, and never ask ${ceo} it again. Mention it to ${ceo} only if it changes something they need to know.`,
+  ] : [];
   const task = [
     `ROLE SESSION. You are ${role.name}, ${role.title} on ${ceo}'s team. ${ceo} wrote to you in ${where}.`,
     `Answer as ${role.name}, then deliver it with exactly one call:`,
     `  ${path.join(ROOT, "bin", "role-session")} reply --conversation ${conv} --role ${roleId} --reply-to ${q.message_id} --text-file <your file>`,
     "",
     brief,
+    ...foundBlock,
     "",
     `----- RECENT CONVERSATION (oldest first; the last line is the new message) -----`,
     history || "(no earlier messages)",

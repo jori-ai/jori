@@ -65,6 +65,7 @@ import path from "node:path";
 import { createRequire } from "node:module";
 import { maxOnlyEnv, DEFAULT_CLAUDE_BIN } from "../lib/jev-claude.mjs";
 import { extractJsonObject } from "../lib/extract-json.mjs";
+import { resolvedAnswers } from "../lib/speak-gate-live.mjs";
 
 const require = createRequire(import.meta.url);
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -125,6 +126,16 @@ async function roleThread(sender, asOf) {
       const st = !asOf && m.metadata && m.metadata.question_state ? ` [question ${m.metadata.question_state}]` : "";
       return `- [${ts(m.created_at)}] ${m.role === "user" ? OWNER : "role"}${st}: ${oneLine(m.content, 300)}`;
     }).join("\n");
+  } catch { return ""; }
+}
+
+// Answers this gate already found instead of letting a question through (held
+// resolve, last 14 days): a message asking one of them again is a re-ask, and
+// the answer is right here.
+async function foundAnswers(asOf) {
+  try {
+    const rows = await resolvedAnswers({ before: asOf || undefined, limit: 15 });
+    return rows.map((r) => `- [${ts(r.judged_at)}] (${r.sender || "?"}) asked: ${oneLine(r.original || "", 200)}\n  found: ${oneLine(r.suggestion, 300)}`).join("\n");
   } catch { return ""; }
 }
 
@@ -232,7 +243,7 @@ ${TOOLS_DOC}
 ${rules ? `\n## ${OWNER.toUpperCase()}'S STANDING RULES (their own words; they override your judgment)\n${rules}\n` : ""}
 THE MESSAGE:
 """${input.message}"""
-${E("TAPPABLE CHOICES SENT WITH IT (fixed: a rewrite must still be a question these answer)", Array.isArray(input.fixed_choices) ? input.fixed_choices.join(" | ") : "")}${reply ? E(`WHAT ${OWNER.toUpperCase()} WROTE (being answered)`, input.reply_to_text) : ""}${E("THIS ROLE'S CONVERSATION, LAST 14 DAYS (question states are authoritative)", extra.thread)}${E("QUESTIONS STILL OPEN (any role)", extra.open)}${E(`WHAT ${OWNER.toUpperCase()} SAID (dated, from the reply log)`, ev.owner_said)}${E("TRAVEL TIMELINE FACTS", ev.authoritative_facts)}${E("TRAVEL CHECK FLAGGED (code paired a place and a date; decide yourself whether the message actually claims where the user is)", ev.travel_check_flagged)}${E("LONG-TERM MEMORY (wiki hits)", ev.long_term_memory)}${E("TOPICS ACKNOWLEDGED IN THE LAST 48H", ev.acknowledged_topics_48h)}${E("PINGS ALREADY SENT TODAY", ev.hum_pings_today)}${E("SENDER'S SUPPORTING DATA", ev.supporting_data)}${E("CHAT, LAST 8H", ev.transcript_last_8h)}${E("CALENDAR, REST OF TODAY", ev.calendar_today)}
+${E("TAPPABLE CHOICES SENT WITH IT (fixed: a rewrite must still be a question these answer)", Array.isArray(input.fixed_choices) ? input.fixed_choices.join(" | ") : "")}${reply ? E(`WHAT ${OWNER.toUpperCase()} WROTE (being answered)`, input.reply_to_text) : ""}${E("THIS ROLE'S CONVERSATION, LAST 14 DAYS (question states are authoritative)", extra.thread)}${E("QUESTIONS STILL OPEN (any role)", extra.open)}${E("ANSWERS THIS GATE ALREADY FOUND (a question it held because it found the answer; asking one again is a re-ask: resolve it with the same answer)", extra.found)}${E(`WHAT ${OWNER.toUpperCase()} SAID (dated, from the reply log)`, ev.owner_said)}${E("TRAVEL TIMELINE FACTS", ev.authoritative_facts)}${E("TRAVEL CHECK FLAGGED (code paired a place and a date; decide yourself whether the message actually claims where the user is)", ev.travel_check_flagged)}${E("LONG-TERM MEMORY (wiki hits)", ev.long_term_memory)}${E("TOPICS ACKNOWLEDGED IN THE LAST 48H", ev.acknowledged_topics_48h)}${E("PINGS ALREADY SENT TODAY", ev.hum_pings_today)}${E("SENDER'S SUPPORTING DATA", ev.supporting_data)}${E("CHAT, LAST 8H", ev.transcript_last_8h)}${E("CALENDAR, REST OF TODAY", ev.calendar_today)}
 When done, end your answer with ONE LINE of compact JSON (nothing after it):
 {"verdict":"${reply ? "send|rewrite" : "send|rewrite|resolve|digest|drop"}","message":"<the rewritten text, only for rewrite>","research_plan":"<only for resolve: the answer you found and its source, or what is left to do>","checks":{"true":"ok|<problem>","${reply ? "phrasing" : "self_resolve"}":"ok|<problem>"${reply ? "" : ',"phrasing":"ok|<problem>","value":"ok|<problem>"'}},"sources":["<each source you checked, short>"],"reason":"<≤200 chars>"}`;
 }
@@ -275,8 +286,8 @@ try {
   }
   const ev = (pre && pre.evidence) || {};
   if (pre && pre.message) input.message = pre.message;
-  const [thread, open] = await Promise.all([roleThread(input.sender, input.as_of), openQuestions(input.as_of)]);
-  const r = await judge(input, ev, { thread, open });
+  const [thread, open, found] = await Promise.all([roleThread(input.sender, input.as_of), openQuestions(input.as_of), foundAnswers(input.as_of)]);
+  const r = await judge(input, ev, { thread, open, found });
   out({ ...r, ms: Date.now() - t0 }, ctx);
 } catch (e) {
   out({ verdict: "send", reason: `gate_error:${String(e.message || e).slice(0, 160)}`, ms: Date.now() - t0 }, ctx);
