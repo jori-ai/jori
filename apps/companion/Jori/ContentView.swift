@@ -2045,13 +2045,6 @@ struct MessageBubble: View, Equatable {
                                       style: .continuous)
     }
 
-    private func openPalette() {
-        reactionTick &+= 1
-        withAnimation(.spring(response: 0.3, dampingFraction: 0.72)) {
-            actions.setPalette(message.id)
-        }
-    }
-
     private func apply(_ reaction: Reaction?) {
         let target = message
         reactionTick &+= 1
@@ -2411,11 +2404,10 @@ struct MessageBubble: View, Equatable {
                 .transition(.scale(scale: 0.6, anchor: .bottomLeading).combined(with: .opacity))
             }
         }
-        #if os(iOS)
-        .onLongPressGesture(minimumDuration: 0.35) {
-            openPalette()
-        }
-        #endif
+        // Long-press opens the system menu on iOS (Reply, reactions, Copy,
+        // Share…). A custom 0.35 s long-press for the reaction palette used to
+        // sit here; it fired first and the system menu never opened, so a
+        // Jori message could not be copied or forwarded on the phone.
         .contextMenu {
             replyMenuItem
             if thread.isOpenQuestion {
