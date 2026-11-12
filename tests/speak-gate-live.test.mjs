@@ -84,11 +84,24 @@ test("a judge that prints nothing fails open", async () => {
   assert.equal(r.text, "m2");
 });
 
-test("system channel is not gated", async () => {
+test("a system alert is gated like any message (rewritten, fact-checked)", async () => {
+  fakeJudge({ verdict: "rewrite", message: "🔐 Oak House back door lock is offline", reason: "clearer" });
+  const r = await gateOutbound({ message: "🔐 Lock problem: the lock didn't answer it", channel: "system", intent: "lock-health" });
+  assert.equal(r.skipped, undefined);
+  assert.equal(r.text, "🔐 Oak House back door lock is offline");
+  assert.equal(r.review.channel, "system");
+});
+
+test("a message about the gate itself is not judged by it", async () => {
   fakeJudge({ verdict: "drop", reason: "x" });
-  const r = await gateOutbound({ message: "🔴 disk full", channel: "system" });
-  assert.equal(r.deliver, true);
-  assert.equal(r.skipped, true);
+  const a = await gateOutbound({ message: "relay could not install", channel: "system", intent: "speak-gate-relay" });
+  assert.equal(a.deliver, true);
+  assert.equal(a.skipped, true);
+  process.env.SPEAK_GATE_SELF = "1";
+  try {
+    const b = await gateOutbound({ message: "🔴 Max auth is DOWN", channel: "system", intent: "watchdog-alert" });
+    assert.equal(b.skipped, true);
+  } finally { delete process.env.SPEAK_GATE_SELF; }
 });
 
 test("recordReview links the review to the delivered row", async () => {

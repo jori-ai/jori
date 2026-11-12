@@ -1180,12 +1180,14 @@ esac
 # show the verdict, with the original folded under it, for the user to grade.
 # The user, 2026-11-11: "it should be reviewed before i see it — not after";
 # "review and act". Runs whatever --skip-precheck says: that flag skipped the
-# old narrow check, not this one. Chat and questions channels only; not in a
-# test run. Fails open (a gate error sends as written). Off switch:
+# old narrow check, not this one. Every channel (system alerts too: "everything
+# goes through the gate unless the issue is with the gate itself", 2026-11-12);
+# not in a test run, and not for a message about the gate itself (--intent
+# speak-gate*, decided in lib/speak-gate-live.mjs inScope). Fails open (a gate error sends as written). Off switch:
 # data/.speak-gate-off. Design: system/speak-gate.md § Live.
 SPEAK_GATE_LIVE="${JORI_SPEAK_GATE_LIVE_BIN:-$JORI_INSTALL_TOOLS/bin/speak-gate-live}"
 GATE_REVIEW_FILE=""
-if [ "$TEST_RUN" = false ] && { [ "$CHANNEL" = "chat" ] || [ "$CHANNEL" = "questions" ]; } && [ -f "$SPEAK_GATE_LIVE" ]; then
+if [ "$TEST_RUN" = false ] && [ -f "$SPEAK_GATE_LIVE" ]; then
   GATE_KIND=proactive
   [ "$AGENT" = "chat" ] && GATE_KIND=reply
   GATE_INPUT=$(GM="$MESSAGE" GS="${SENDER_ROLE:-}" GI="${INTENT:-}" GC="$CHANNEL" GK="$GATE_KIND" GCH="${CHOICES_JSON:-}" python3 -c '

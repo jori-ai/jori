@@ -122,6 +122,9 @@ notify() {
   local key="$PENDING_ALERT_KEY"
   PENDING_ALERT_KEY=""
 
+  # The speak gate judges this page too (everything to the user goes through
+  # it, 2026-11-12) — except a Max-auth page: the gate's judge runs on Max, so
+  # that alarm is about the gate itself. Those calls run SPEAK_GATE_SELF=1 notify.
   if JORI_INFRA_PROBE=1 "$SEND" --skip-precheck --intent watchdog-alert --channel system "$1" > /dev/null 2>&1; then
     log "Notified via ${JORI_ASSISTANT_NAME:-Jori}: $1"  # control-scan-ok: the setting's default
     [ -n "$key" ] && touch "$INCIDENT_DIR/${key}.delivered" 2>/dev/null
@@ -1574,7 +1577,7 @@ if [ -n "$AUTH_HIT" ]; then
     # misdiagnose. Mirrors supervisor/index.mjs's own outage page.
     auth_err_text=$(grep 'AUTH ERROR' "$AUTH_HIT" 2>/dev/null | tail -1 | sed -E 's/^.*AUTH ERROR #[0-9]+: //' | cut -c1-200)
     [ -n "$auth_err_text" ] || auth_err_text="(no error text captured)"
-    notify "🔴 Max auth is DOWN on $(basename "$AUTH_HIT" | sed 's/-supervisor\.log//'). Captured error: \"$auth_err_text\". If it mentions a keychain, check \`security default-keychain\` + \`security list-keychains\`; otherwise it's likely just expired/invalid creds needing a plain re-login. Either way: \`claude /login\` on ${JORI_HOST_LABEL:-the host}. No API-key fallback exists by design."
+    SPEAK_GATE_SELF=1 notify "🔴 Max auth is DOWN on $(basename "$AUTH_HIT" | sed 's/-supervisor\.log//'). Captured error: \"$auth_err_text\". If it mentions a keychain, check \`security default-keychain\` + \`security list-keychains\`; otherwise it's likely just expired/invalid creds needing a plain re-login. Either way: \`claude /login\` on ${JORI_HOST_LABEL:-the host}. No API-key fallback exists by design."
   fi
 else
   # The log-recency probe above goes BLIND during a sustained outage. Once a
@@ -1611,7 +1614,7 @@ else
     AUTH_OUTAGE_HELD=1
     # Same cadence as the fresh-error page above: every 30 min, cap 4 in 6h.
     if incident_should_alert "auth-outage" 1800 4 21600; then
-      notify "🔴 Max auth is STILL down on$AUTH_STILL_PAUSED. The supervisor(s) killed the child and paused dispatch, so there is nothing new in the logs — quiet does not mean recovered here. Anything queued behind this is not being worked. Run \`claude /login\` on ${JORI_HOST_LABEL:-the host}; there is no API-key fallback by design."
+      SPEAK_GATE_SELF=1 notify "🔴 Max auth is STILL down on$AUTH_STILL_PAUSED. The supervisor(s) killed the child and paused dispatch, so there is nothing new in the logs — quiet does not mean recovered here. Anything queued behind this is not being worked. Run \`claude /login\` on ${JORI_HOST_LABEL:-the host}; there is no API-key fallback by design."
     fi
   elif [ "$MAX_AUTH_PROBE_STATE" = "fail" ]; then
     # The authAlertSent guard above only engages once a supervisor has failed 3
@@ -1635,7 +1638,7 @@ else
     else
       log "Max auth outage: no fresh AUTH ERROR line, but the launchd sign-in check has read signed out since $_auth_since_local ($MAX_AUTH_PROBE_SUMMARY) — holding the incident open"
       if incident_should_alert "auth-outage" 1800 4 21600; then
-        notify "🔴 Max auth is down: Claude Code on ${JORI_HOST_LABEL:-the host} has read as signed out since $_auth_since_local, checked every 10 min from launchd (the context the scheduled runs use). Every scheduled Claude run will refuse to start until it is back, and quiet supervisor logs don't mean it recovered. Run \`claude /login\` on ${JORI_HOST_LABEL:-the host}; there is no API-key fallback by design."
+        SPEAK_GATE_SELF=1 notify "🔴 Max auth is down: Claude Code on ${JORI_HOST_LABEL:-the host} has read as signed out since $_auth_since_local, checked every 10 min from launchd (the context the scheduled runs use). Every scheduled Claude run will refuse to start until it is back, and quiet supervisor logs don't mean it recovered. Run \`claude /login\` on ${JORI_HOST_LABEL:-the host}; there is no API-key fallback by design."
       fi
     fi
   elif [ "$MAX_AUTH_PROBE_STATE" = "pre-heal" ]; then
