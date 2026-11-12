@@ -178,7 +178,7 @@ enum ConversationID {
     /// mapping as the server's jori_channel_roles defaults.
     static func legacy(channel: String) -> String {
         switch channel {
-        case ChatChannel.system.rawValue: return role("it-security")
+        case ChatChannel.system.rawValue: return role("software-engineer")
         case ChatChannel.improvements.rawValue: return role("software-engineer")
         default: return coordinator
         }

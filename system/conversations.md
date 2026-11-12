@@ -8,7 +8,7 @@ The app is a messenger with the user's team (system/org.md): every role is a "pe
 |---|---|
 | `jori_team` | One row per role: `id` (the role plugin's id), `name`, `title`, `responsibility`, `chief_of_staff`, `enabled`, `sort`, `renamed_by_user`. `org sync` (every 10 min) writes it from the roster; the app writes `name`/`title` when the user renames a role, and sync keeps those. |
 | `jori_conversations` | `role:<id>` (one role) or `group:<uuid>` (`members` = role ids, `title`); `last_message_at`, `archived`, `created_by`. |
-| `jori_channel_roles` | The role that answers for each legacy channel: chat and questions → the coordinator, system → IT & Security, improvements → Software Engineer. |
+| `jori_channel_roles` | The role that answers for each legacy channel: chat and questions → the coordinator, system and improvements → Product (all the tech; system was IT & Security's until migration 0187). |
 | `jori_messages.conversation_id`, `.sender` | Where a message belongs and which role wrote it. |
 
 Triggers: a row that names only a channel (or only a `sender`) is filed in the matching role's conversation, and `channel` stays meaningful for the older app; a role's conversation is created by its first message; `last_message_at` follows every insert.

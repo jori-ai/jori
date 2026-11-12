@@ -13,8 +13,8 @@
 //  A fresh install shows only the coordinator; a role's conversation appears
 //  when the role has something to say (the server creates it on its first
 //  message) or when the user starts one. The old channels are roles'
-//  conversations: System is IT & Security's, Improvements the software
-//  engineer's, and a question lives with the role that asked it.
+//  conversations: System and Improvements are Product's (all the tech), and
+//  a question lives with the role that asked it.
 //
 //  Counts per conversation, and what they mean:
 //    - unread    → assistant messages not marked read yet (zero for the one on
