@@ -917,6 +917,7 @@ struct PinnedConversationsGrid: View {
         let badge = team.badgeCount(conversation.id)
         let isSelected = selected == conversation.id
         let name = team.title(of: conversation.id)
+        let role = team.subtitle(of: conversation.id)
         return Button { open(conversation.id) } label: {
             VStack(spacing: 6) {
                 TeamAvatar(members: team.members(of: conversation.id), size: 64)
@@ -927,17 +928,28 @@ struct PinnedConversationsGrid: View {
                     .overlay(alignment: .topTrailing) {
                         if badge > 0 { ChannelBadgeBubble(count: badge).offset(x: 2, y: -2) }
                     }
-                Text(name)
-                    .font(.caption)
-                    .foregroundStyle(isSelected ? .primary : .secondary)
-                    .lineLimit(1)
-                    .truncationMode(.tail)
+                VStack(spacing: 1) {
+                    Text(Self.short(name))
+                        .font(.caption.weight(.medium))
+                        .foregroundStyle(.primary)
+                    if !role.isEmpty {
+                        Text(Self.short(role))
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                .lineLimit(1)
             }
             .frame(maxWidth: .infinity)
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .accessibilityLabel(name + (badge > 0 ? ", \(badge) waiting" : "") + ", pinned")
+        .accessibilityLabel(name + (role.isEmpty ? "" : ", \(role)") + (badge > 0 ? ", \(badge) waiting" : "") + ", pinned")
+    }
+
+    /// At most 10 characters under a circle, with an ellipsis when cut.
+    static func short(_ s: String) -> String {
+        s.count > 10 ? s.prefix(10).trimmingCharacters(in: .whitespaces) + "…" : s
     }
 }
 
