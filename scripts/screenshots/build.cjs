@@ -298,6 +298,14 @@ body { font:17px/1.35 -apple-system, system-ui, "SF Pro Text", sans-serif; color
 .crow .badge { background:#FF3B30; color:#fff; font:700 11px/16px -apple-system, system-ui; min-width:18px; height:18px; border-radius:9px; text-align:center; padding:1px 5px 0; flex:none; }
 .from { font-size:12px; color:var(--ink2); margin:0 0 3px 44px; font-weight:600; }
 .row.jori img.av { object-fit:cover; }
+.tbar { display:flex; justify-content:space-between; padding:2px 16px 0; }
+.pins { display:grid; grid-template-columns:repeat(3, 1fr); gap:18px; padding:10px 20px 14px; border-bottom:1px solid var(--hairline); }
+.pin { display:flex; flex-direction:column; align-items:center; gap:6px; }
+.pin .pc { position:relative; padding:3px; }
+.pin .pc img, .pin .pc svg { display:block; width:54px; height:54px; border-radius:50%; object-fit:cover; }
+.pin .pc .badge { position:absolute; top:-2px; right:-2px; background:#FF3B30; color:#fff; font:700 11px/16px -apple-system, system-ui; min-width:18px; height:18px; border-radius:9px; text-align:center; padding:1px 5px 0; }
+.pin b { font-size:10px; font-weight:500; line-height:1.15; }
+.pin span { font-size:9px; color:var(--ink2); line-height:1.15; margin-top:-5px; }
 .row.me .mention { color:#fff; font-weight:700; background:rgba(255,255,255,.22); border-radius:5px; padding:0 4px; }
 `;
 
@@ -308,7 +316,12 @@ const STATUS = `<div class="status"><span>9:41</span><span class="r"><svg width=
 const BACK = `<div class="ico"><svg width="18" height="18" viewBox="0 0 18 18"><path d="M11.5 3 5.5 9l6 6" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg></div>`;
 const PEOPLE = `<div class="ico"><svg width="20" height="18" viewBox="0 0 20 18"><circle cx="7" cy="6" r="3.2" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M1.5 16c.6-3 2.8-4.6 5.5-4.6s4.9 1.6 5.5 4.6" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/><circle cx="14" cy="6.5" r="2.6" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M14.5 11.4c2 .3 3.4 1.7 3.9 4" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg></div>`;
 const navFor = (avatarHtml, name, title) => `<div class="nav">${BACK}<div class="who">${avatarHtml}<div class="t"><b>${name}</b><span>${title}</span></div></div>${PEOPLE}</div>`;
-const NAV = navFor(ICON_FACE.replace('width="30" height="30"', 'width="34" height="34"'), "Jori", "Chief of Staff");
+// As the app titles the coordinator (lib/org.cjs soloTitle): alone, as in a
+// personal install, it is the Personal Assistant; with a team (work) it is the
+// Chief of Staff. Personal scenes use NAV; work scenes swap in NAV_COS.
+const JORI_HEAD = ICON_FACE.replace('width="30" height="30"', 'width="34" height="34"');
+const NAV = navFor(JORI_HEAD, "Jori", "Personal Assistant");
+const NAV_COS = navFor(JORI_HEAD, "Jori", "Chief of Staff");
 const composer = (to = "Jori") => `<div class="composer"><div class="plus">+</div><div class="field">Message ${to}</div><div class="mic"><svg width="16" height="18" viewBox="0 0 16 18"><rect x="5" y="1" width="6" height="10" rx="3" fill="#fff"/><path d="M2.5 8.5a5.5 5.5 0 0 0 11 0M8 14v3" stroke="#fff" stroke-width="1.6" fill="none" stroke-linecap="round"/></svg></div></div>`;
 const COMPOSER = composer();
 const phone = (inner) => `<div class="phone"><div class="island"></div><div class="screen">${STATUS}${inner}</div></div>`;
@@ -475,11 +488,11 @@ const workProject = workPage({
 
 ## Tasks
 - [ ] Send Priya the revised pricing for all six Harbor & Pine sites · Dana · due 2026-11-03 (overdue) · draft ready
-- [ ] Check the multi-site discount on the Harbor & Pine pricing · Nora (Finances) · due 2026-11-05
+- [ ] Check the multi-site discount on the Harbor & Pine pricing · Sasha (Finances) · due 2026-11-05
 - [ ] Get the security questionnaire back for the Harbor & Pine renewal · Priya · due 2026-11-06
 - [ ] Write the one-page Harbor & Pine rollout plan · Leo · due 2026-11-07
 - [ ] Send the Harbor & Pine contract for signature · Dana · due 2026-11-14
-- [x] Book the Harbor & Pine QBR · done Oct 21 (Morgan)
+- [x] Book the Harbor & Pine QBR · done Oct 21 (Jori)
 
 ## Risks
 - The pricing is late. Priya answers fastest on Tuesdays.
@@ -496,8 +509,10 @@ const workProject = workPage({
 const AV = ICON_FACE.replace("<svg", '<svg class="av"');
 
 // ── The team in the app: a conversation per role, photos, one red badge ────
-// Made-up headshots for the made-up work roster (scripts/screenshots/team/).
-const PHOTO = Object.fromEntries(["morgan", "reese", "paige", "nora", "gia", "kai", "wren"].map((n) =>
+// The work roster, one role per kernel plugin (plugins/role-*): Jori (Chief of
+// Staff), Alex (Product), Sasha (Finances), Kim (Marketing), Eden (Travel),
+// Dani (Social), Jules (Health). Made-up headshots in scripts/screenshots/team/.
+const PHOTO = Object.fromEntries(["alex", "sasha", "kim", "eden", "dani", "jules"].map((n) =>
   [n, `data:image/jpeg;base64,${fs.readFileSync(path.join(__dirname, "team", `${n}.jpg`)).toString("base64")}`])); // kernel-closure-ok: the demo headshots ship in the kernel beside this script
 const JORI_LIST_AV = ICON_FACE.replace('width="30" height="30"', 'width="46" height="46" class="ph"');
 const crow = (av, name, title, preview, time, badge = 0) => `<div class="crow">${av}<div class="c"><div class="top"><b>${name}</b><i>${title}</i><time>${time}</time></div><div class="bot"><span>${preview}</span>${badge ? `<div class="badge">${badge}</div>` : ""}</div></div></div>`;
@@ -508,28 +523,39 @@ const asRole = (screen, key, name, title) => screen
   .split(NAV).join(navFor(`<img src="${PHOTO[key]}">`, name, title))
   .split(AV).join(img(key, "av"))
   .split(COMPOSER).join(composer(name));
-const teamList = `<div class="lhead"><b>Jori</b><div class="ico"><svg width="18" height="18" viewBox="0 0 18 18"><path d="M3 15l1-3.5 8.5-8.5 2.5 2.5L6.5 14z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/></svg></div></div>
+// Jori's own conversation at work, where it has a team: the Chief of Staff.
+const asCos = (screen) => screen.split(NAV).join(NAV_COS);
+// The iPhone list as PinnedConversationsGrid + the list draw it: pinned
+// conversations as circles three across (54 pt, the name and the role under
+// each in a small font, a red badge when something waits), then the rest.
+const pin = (av, name, role, badge = 0) => `<div class="pin"><div class="pc">${av}${badge ? `<div class="badge">${badge}</div>` : ""}</div><b>${name}</b><span>${role}</span></div>`;
+const MORE = `<div class="ico"><svg width="18" height="4" viewBox="0 0 18 4"><circle cx="2" cy="2" r="1.8" fill="currentColor"/><circle cx="9" cy="2" r="1.8" fill="currentColor"/><circle cx="16" cy="2" r="1.8" fill="currentColor"/></svg></div>`;
+const COMPOSE = `<div class="ico"><svg width="18" height="18" viewBox="0 0 18 18"><path d="M3 15l1-3.5 8.5-8.5 2.5 2.5L6.5 14z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/></svg></div>`;
+const teamList = `<div class="tbar">${MORE}${COMPOSE}</div><div class="lhead"><b>Jori</b></div>
+<div class="pins">
+${pin(ICON_FACE.replace('width="30" height="30"', 'width="54" height="54"'), "Jori", "Chief of Staff")}
+${pin(img("sasha", ""), "Sasha", "Finances", 2)}
+${pin(img("alex", ""), "Alex", "Product")}
+</div>
 <div class="clist">
-${crow(JORI_LIST_AV, "Jori", "Chief of Staff", "The Harbor &amp; Pine contract is due Friday. Tom's redlines are summarized on the page.", "9:02 AM")}
-${crow(img("nora"), "Nora", "Finances", "Bottom line: two invoices are 30+ days late. Reminders are drafted for your OK.", "8:41 AM", 2)}
-${crow(img("morgan"), "Morgan", "Admin", "Done: Thursday 11:00 with Alex Chen is booked, Zoom link in the invite.", "8:15 AM", 1)}
-${crow(`<div class="grp">${img("reese", "")}${img("paige", "")}</div>`, "Harbor &amp; Pine renewal", "Reese, Paige", "Paige: Lakeview's two missing admins are invited again.", "Yesterday", 1)}
-${crow(img("kai"), "Kai", "Product", "Root cause found: multi-site quotes dropped the Atlanta tier. Draft PR is up.", "Thu")}
-${crow(img("gia"), "Gia", "Marketing", "The case study draft is ready for your edits.", "Wed")}
-${crow(img("wren"), "Wren", "Research", "Brightline before Thursday: their Series B, and a new COO.", "Mon")}
+${crow(img("eden"), "Eden", "Travel", "Chicago on the 18th: the 7 AM flight is held, and the hotel is 4 minutes from Harbor &amp; Pine.", "8:41 AM", 1)}
+${crow(`<div class="grp">${img("sasha", "")}${img("kim", "")}</div>`, "Harbor &amp; Pine renewal", "Jori, Sasha, Kim", "Sasha: Quarterly works if they sign by the 21st.", "Yesterday", 1)}
+${crow(img("kim"), "Kim", "Marketing", "The Harbor &amp; Pine case study draft is ready for your edits.", "Thu")}
+${crow(img("dani"), "Dani", "Social", "Priya's birthday is Monday. A card from you and Leo is drafted.", "Wed")}
+${crow(img("jules"), "Jules", "Health", "Thursday is five meetings back to back. I moved your run to 7 AM.", "Mon")}
 </div>`;
-const groupThread = `${navFor(`<div class="stack">${img("reese", "")}${img("nora", "")}</div>`, "Harbor &amp; Pine renewal", "Reese, Paige, Nora")}<div class="thread">
+const groupThread = `${navFor(`<div class="stack">${img("sasha", "")}${img("kim", "")}</div>`, "Harbor &amp; Pine renewal", "Jori, Sasha, Kim")}<div class="thread">
 <div class="sep">Today 10:14 AM</div>
-<div class="from">Reese · Sales</div>
-<div class="row jori">${img("reese", "av")}<div class="b j1" style="max-width:320px">Tom wants quarterly billing instead of annual before they sign. Everything else in the redlines is fine.</div></div>
+<div class="from">Jori · Chief of Staff</div>
+<div class="row jori">${AV}<div class="b j1" style="max-width:320px">Tom wants quarterly billing instead of annual before they sign. Everything else in the redlines is fine.</div></div>
 <div class="gap"></div>
-<div class="row me"><div class="b"><span class="mention">@Nora</span> can we do quarterly if they sign by the 21st?</div></div>
+<div class="row me"><div class="b"><span class="mention">@Sasha</span> can we do quarterly if they sign by the 21st?</div></div>
 <div class="gap"></div>
-<div class="from">Nora · Finances</div>
-<div class="row jori">${img("nora", "av")}<div class="b j1" style="max-width:320px"><b>Bottom line: yes.</b> Quarterly costs us about $1,800 in float over the year, from the contract value and our cash balance as of this morning. Worth it to close by the 21st.</div></div>
+<div class="from">Sasha · Finances</div>
+<div class="row jori">${img("sasha", "av")}<div class="b j1" style="max-width:320px"><b>Bottom line: yes.</b> Quarterly costs us about $1,800 in float over the year, from the contract value and our cash balance as of this morning. Worth it to close by the 21st.</div></div>
 <div class="gap"></div>
-<div class="from">Reese · Sales</div>
-<div class="row jori">${img("reese", "av")}<div class="b j1" style="max-width:320px">Putting it in the reply to Tom now. I'll tell you when he answers.</div></div>
+<div class="from">Jori · Chief of Staff</div>
+<div class="row jori">${AV}<div class="b j1" style="max-width:320px">Putting it in the reply to Tom now. I'll tell you when he answers.</div></div>
 </div>${composer("the group")}`;
 const workAfterMeeting = `${NAV}<div class="thread">
 <div class="sep">Tue Oct 28, 2:47 PM</div>
@@ -716,20 +742,20 @@ const pHome = chat("Today 8:41 AM",
 
 // ── Projects and the team (getjori.ai/personal § Your team) ─────────────────
 //
-// Personal: Jori keeps a task list per project; Sam's tasks go on Sam's own list
-// with a date, Jori follows up when one slips and does the work it can overnight.
-// Work: the same chief of staff leads a team of roles (a made-up roster: Morgan
-// on admin, Reese on sales, Nora on finances, …) that sign their work.
+// Personal: Jori works alone, as the personal assistant, and keeps a task list
+// per project; Sam's tasks go on Sam's own list with a date, Jori follows up when
+// one slips and does the work it can overnight.
+// Work: Jori is the chief of staff of a team of roles that sign their work —
+// the app's own roster (lib/org.cjs, plugins/role-*), with its own names.
 
 const TEAM = [
-  ["Jori", "Chief of Staff", "Keeps every project on track and everyone accountable."],
-  ["Morgan", "Admin", "Inbox, calendar, meetings and travel."],
-  ["Reese", "Sales", "Pipeline, renewals and the CRM, kept honest."],
-  ["Paige", "Customer Success", "Onboarding, health checks and follow-ups."],
-  ["Nora", "Finances", "Invoices, cash, budgets and month-end."],
-  ["Gia", "Marketing", "Case studies, the site and campaigns."],
-  ["Kai", "Product", "All the tech: builds, fixes, and keeps laptops, accounts and backups safe."],
-  ["Wren", "Research", "Prospects, competitors and the news that matters."],
+  ["Jori", "Chief of Staff", "Projects, inbox and calendar, meetings, follow-ups and research."],
+  ["Alex", "Product", "All the tech: builds, fixes, and keeps laptops, accounts and backups safe."],
+  ["Sasha", "Finances", "Invoices, cash, spend and month-end."],
+  ["Kim", "Marketing", "Search, app stores, reviews and outreach."],
+  ["Eden", "Travel", "Flights, hotels and every itinerary."],
+  ["Dani", "Social", "Clients and contacts, staying in touch, events and occasions."],
+  ["Jules", "Health", "Focus time, sleep and exercise, so the pace holds."],
 ];
 
 const kitchen = pages.find((p) => p.id === "project_kitchen_reno");
@@ -789,9 +815,9 @@ const pWork = chat("Thursday 7:05 AM",
 // The chief of staff at work: a slipped task with a way forward, the team's
 // overnight work, and the Monday roll-up by role.
 const wSlip = chat("Tuesday 8:30 AM",
-  jori(`The revised pricing for Harbor &amp; Pine slipped past Monday, and it's the one thing between Priya and the contract.${choice([["Send Morgan's draft today", "Six sites, Atlanta included, from the QBR notes.", true], ["Move it to Thursday", "Still a week before the Nov 21 signature."], ["Have Nora check the numbers first", "She has the multi-site discount rules."]])}`) +
-  me("Have Nora check it, then send it today.") +
-  jori(`Nora will check the numbers by noon, and the send is on your list for 2 PM. I told Reese the renewal stays on track for the 21st.`, { avatar: true }));
+  jori(`The revised pricing for Harbor &amp; Pine slipped past Monday, and it's the one thing between Priya and the contract.${choice([["Send my draft today", "Six sites, Atlanta included, from the QBR notes.", true], ["Move it to Thursday", "Still a week before the Nov 21 signature."], ["Have Sasha check the numbers first", "Finances has the multi-site discount rules."]])}`) +
+  me("Have Sasha check it, then send it today.") +
+  jori(`Sasha will check the numbers by noon, and the send is on your list for 2 PM. The renewal stays on track for the 21st.`, { avatar: true }));
 const wReview = chat("Monday 7:45 AM",
   jori(`The renewal-quote calculator now prices multiple sites with the volume discount. Root cause of the old gap: the Atlanta tier was dropped on multi-site quotes. Tested against the last four quotes.
 <div class="linkcard"><div class="ic">PR</div><div><b>Multi-site pricing in the quote calculator</b><span>Draft pull request · ready for your review</span></div></div>`, { avatar: true }) +
@@ -799,7 +825,7 @@ const wReview = chat("Monday 7:45 AM",
   jori(`Merging at 1. I'll watch the first live quotes and tell you if anything looks off.`, { avatar: true }));
 
 // An inbox where every email comes from the role that sent it, as email-send
-// does for mail to the user (From "Nora (Finances)", system/org.md), in a
+// does for mail to the user (From "Sasha (Finances)", system/org.md), in a
 // generic mail-client layout.
 const MAIL_CSS = `
 * { box-sizing:border-box; margin:0; }
@@ -827,14 +853,14 @@ const inboxDoc = `<!doctype html><html><head><meta charset="utf-8"><style>${MAIL
 <div class="side"><div class="new">Compose</div><div class="f on"><span>Inbox</span><span>9</span></div><div class="f"><span>Starred</span></div><div class="f"><span>Sent</span></div><div class="f"><span>Clients</span></div><div class="f"><span>Finance</span></div></div>
 <div class="main"><div class="bar">Inbox</div>
 ${mrow("Jori (Chief of Staff)", "Your projects this week", "7 done, 1 slipping, the Harbor & Pine contract due Friday", "9:00 AM")}
-${mrow("Reese (Sales)", "Pipeline review", "Harbor & Pine moved to contract; Brightline stalled since Oct 20", "8:40 AM")}
-${mrow("Morgan (Admin)", "Your day", "3 meetings, a 90-minute focus block, Priya's reply drafted", "8:15 AM")}
-${mrow("Nora (Finances)", "Month-end close", "Two client invoices 30+ days late; reminders drafted", "8:02 AM")}
-${mrow("Paige (Customer Success)", "Onboarding check-in", "Lakeview is live on 4 of 6 sites; two admins never logged in", "Fri")}
-${mrow("Kai (Product)", "Work ready for your review", "The renewal-quote calculator now handles multi-site pricing. Draft PR inside", "Thu", false)}
-${mrow("Gia (Marketing)", "Case study draft: Harbor & Pine", "Ready for your edits before it goes to Priya for approval", "Thu", false)}
-${mrow("Kai (Product)", "Two laptops need the security update", "Leo's and Maria's; the patch closes a browser exploit", "Wed", false)}
-${mrow("Wren (Research)", "Brightline before Thursday", "Their Series B, the new COO, and what they asked competitors", "Mon", false)}
+${mrow("Eden (Travel)", "Chicago, Nov 18", "The 7 AM flight is held and the hotel is 4 minutes from Harbor & Pine", "8:41 AM")}
+${mrow("Jori (Chief of Staff)", "Your day", "3 meetings, a 90-minute focus block, Priya's reply drafted", "8:15 AM")}
+${mrow("Sasha (Finances)", "Month-end close", "Two client invoices 30+ days late; reminders drafted", "8:02 AM")}
+${mrow("Dani (Social)", "Priya's birthday is Monday", "A card from you and Leo is drafted, and a lunch idea for after the signing", "Fri")}
+${mrow("Alex (Product)", "Work ready for your review", "The renewal-quote calculator now handles multi-site pricing. Draft PR inside", "Thu", false)}
+${mrow("Kim (Marketing)", "Case study draft: Harbor & Pine", "Ready for your edits before it goes to Priya for approval", "Thu", false)}
+${mrow("Alex (Product)", "Two laptops need the security update", "Leo's and Maria's; the patch closes a browser exploit", "Wed", false)}
+${mrow("Jules (Health)", "Your week", "Thursday is five meetings back to back; your run moved to 7 AM", "Mon", false)}
 </div></body></html>`;
 
 // ── Stamp ───────────────────────────────────────────────────────────────────
@@ -852,9 +878,8 @@ if (CHECK) {
 }
 
 // Work screens live in the conversation of the role that owns the work.
-const MORGAN = (x) => asRole(x, "morgan", "Morgan", "Admin");
-const REESE = (x) => asRole(x, "reese", "Reese", "Sales");
-const KAI = (x) => asRole(x, "kai", "Kai", "Product");
+// The chief of staff owns the inbox, calendar, meetings and follow-ups.
+const ALEX = (x) => asRole(x, "alex", "Alex", "Product");
 
 fs.mkdirSync(OUT, { recursive: true });
 const raw = {
@@ -866,8 +891,8 @@ const raw = {
   workPerson: shoot(workPerson, "raw-work-person", 1280, 900),
   workMeeting: shoot(workMeeting, "raw-work-meeting", 1280, 900),
   workProject: shoot(workProject, "raw-work-project", 1280, 900),
-  workMeetingApp: shoot(appDoc([MORGAN(workAfterMeeting)]), "raw-work-app-meeting", 610, 1060, { transparent: true }),
-  workFollowApp: shoot(appDoc([REESE(workFollowUps)]), "raw-work-app-followups", 610, 1060, { transparent: true }),
+  workMeetingApp: shoot(appDoc([asCos(workAfterMeeting)]), "raw-work-app-meeting", 610, 1060, { transparent: true }),
+  workFollowApp: shoot(appDoc([asCos(workFollowUps)]), "raw-work-app-followups", 610, 1060, { transparent: true }),
   money: shoot(moneyPage, "raw-money", 1280, 900),
   slack: shoot(slackDoc, "raw-work-slack", 1280, 860),
   project: shoot(projectPage, "raw-project-tasks", 1280, 900),
@@ -886,18 +911,18 @@ const out = {
   "work-project.png": shoot(frameDoc(browser(raw.workProject, `${URL}/p/project_harbor_pine_renewal`)), "work-project", 1460, 1120, { transparent: true }),
   "work-app-meeting.png": raw.workMeetingApp,
   "work-app-followups.png": raw.workFollowApp,
-  "work-app-pair.png": shoot(appDoc([MORGAN(workAfterMeeting), REESE(workFollowUps)]), "work-app-pair", 1096, 1060, { transparent: true }),
+  "work-app-pair.png": shoot(appDoc([asCos(workAfterMeeting), asCos(workFollowUps)]), "work-app-pair", 1096, 1060, { transparent: true }),
   "work-showcase.png": shoot(frameDoc(`<div class="show">${browser(raw.workPerson, URL)}<div class="ph"><img src="${raw.workFollowApp}"></div></div>`), "work-showcase", 1700, 1180, { transparent: true }),
   "work-slack.png": shoot(frameDoc(appWin(raw.slack, "Fieldstone · #harbor-pine")), "work-slack", 1460, 1080, { transparent: true }),
-  "work-app-email-schedule.png": shoot(appDoc([MORGAN(workEmail), MORGAN(workSchedule)]), "work-app-email-schedule", 1096, 1060, { transparent: true }),
+  "work-app-email-schedule.png": shoot(appDoc([asCos(workEmail), asCos(workSchedule)]), "work-app-email-schedule", 1096, 1060, { transparent: true }),
   "personal-money.png": shoot(frameDoc(browser(raw.money, `${URL}/p/money_2026-11`)), "personal-money", 1460, 1120, { transparent: true }),
   "personal-app-money-home.png": shoot(appDoc([pMoney, pHome]), "personal-app-money-home", 1096, 1060, { transparent: true }),
   "personal-app-trip-dinner.png": shoot(appDoc([pTrip, pDinner]), "personal-app-trip-dinner", 1096, 1060, { transparent: true }),
   "personal-app-tickets.png": shoot(appDoc([pTickets]), "personal-app-tickets", 610, 1060, { transparent: true }),
   "personal-project-tasks.png": shoot(frameDoc(browser(raw.project, `${URL}/p/project_kitchen_reno`)), "personal-project-tasks", 1460, 1120, { transparent: true }),
-  "personal-app-chief-of-staff.png": shoot(appDoc([pSlip, pWork]), "personal-app-chief-of-staff", 1096, 1060, { transparent: true }),
+  "personal-app-projects.png": shoot(appDoc([pSlip, pWork]), "personal-app-chief-of-staff", 1096, 1060, { transparent: true }),
   "work-team-inbox.png": shoot(frameDoc(appWin(raw.inbox, "Mail · Inbox")), "work-team-inbox", 1460, 820, { transparent: true }),
-  "work-app-chief-of-staff.png": shoot(appDoc([wSlip, KAI(wReview)]), "work-app-chief-of-staff", 1096, 1060, { transparent: true }),
+  "work-app-chief-of-staff.png": shoot(appDoc([asCos(wSlip), ALEX(wReview)]), "work-app-chief-of-staff", 1096, 1060, { transparent: true }),
   "work-app-team.png": shoot(appDoc([teamList, groupThread]), "work-app-team", 1096, 1060, { transparent: true }),
   "showcase.png": shoot(frameDoc(`<div class="show">${browser(raw.home, URL)}<div class="ph"><img src="${raw.chat}"></div></div>`), "showcase", 1700, 1180, { transparent: true }),
 };
