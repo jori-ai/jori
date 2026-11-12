@@ -763,6 +763,36 @@ function teamRoute(row) {
   return { roles: [], coordinator: true };
 }
 
+// A role the user just added in the app (jori_team.requested_at, system/org.md
+// § Growing the team) joins the team before its first message is routed, so it
+// answers that message itself; `org sync` does the same every 10 minutes.
+async function adoptRequestedRoles(row) {
+  const conv = row.conversation_id || "";
+  const O = require("../../lib/org.cjs");
+  const onTeam = new Set(O.org().roles.map((r) => r.id));
+  let ids = [];
+  if (conv.startsWith("role:")) ids = [conv.slice(5)];
+  else if (conv.startsWith("group:")) {
+    const { data } = await supabase.from("jori_conversations").select("members").eq("id", conv).maybeSingle();
+    ids = data?.members || [];
+  }
+  ids = ids.filter((id) => !onTeam.has(id));
+  if (!ids.length) return;
+  const { data: rows } = await supabase.from("jori_team").select("id,requested_at").in("id", ids);
+  const asked = (rows || []).filter((r) => r.requested_at).map((r) => r.id);
+  if (!asked.length) return;
+  const done = O.adoptRoles(asked);
+  if (done.length) {
+    await supabase.from("jori_team").update({ requested_at: null, enabled: true }).in("id", done);
+    log(`team: ${done.join(", ")} joined (added in the app)`);
+    // The app's team table now: the coordinator's title (chief of staff once
+    // it is not alone) and the roles still to add.
+    const org = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "bin", "org");
+    import("node:child_process").then(({ spawn }) => spawn(process.execPath, [org, "sync"], { detached: true, stdio: "ignore" }).unref())
+      .catch(() => { /* the 10-minute sync catches up */ });
+  }
+}
+
 function enqueueRoleSession(row, roles) {
   const dir = installTools("data/role-queue/pending");
   fs.mkdirSync(dir, { recursive: true });
@@ -853,6 +883,11 @@ async function handleIncomingMessage(row) {
   // own sessions (bin/role-session), not by this coordinator session. The
   // coordinator still answers in its own conversation, and in a group when it
   // is mentioned or nobody is.
+  try {
+    await adoptRequestedRoles(row);
+  } catch (err) {
+    console.error(`[phone-channel] adding a requested role failed: ${err.message}`);
+  }
   try {
     const route = teamRoute(row);
     if (route.roles.length) enqueueRoleSession(row, route.roles);

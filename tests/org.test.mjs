@@ -76,3 +76,36 @@ test("signMail: owner-only mail and --role-from mail come FROM the role; other m
   assert.deepEqual(org.signMail({ ...base, to: "me@x.com,her@x.com", inReplyTo: "<a@b>" }, O), { fromName: "Jori", subject: "Plan" });
   assert.deepEqual(org.signMail({ ...base, job: "nobody", to: "me@x.com", roleFrom: true }, O), { fromName: "Jori", subject: "Plan" });
 });
+
+test("soloTitle: the coordinator alone is the Personal Assistant; with a team, or a title set explicitly, it keeps its title", () => {
+  const cos = { id: "cos", title: "Chief of Staff", name: "Ada", chief_of_staff: true };
+  assert.equal(org.soloTitle([cos])[0].title, "Personal Assistant");
+  assert.equal(org.soloTitle([cos], () => true)[0].title, "Chief of Staff");
+  assert.equal(org.soloTitle([cos, { id: "cfo", title: "Finances", name: "Ben" }])[0].title, "Chief of Staff");
+  assert.equal(org.soloTitle([{ id: "cfo", title: "Finances", name: "Ben" }])[0].title, "Finances");
+  assert.equal(cos.title, "Chief of Staff", "the input is not mutated");
+});
+
+test("syncTeam: roles the user requested in the app are adopted first, and requested_at is cleared on the team rows", async () => {
+  const calls = [];
+  const rest = {
+    requestAll: async () => [{ id: "cfo", enabled: false, requested_at: "2026-11-12T10:00:00Z" }, { id: "old", enabled: true }],
+    request: async (url, opts) => { calls.push([url, opts]); },
+  };
+  let adopted = null;
+  const r = await org.syncTeam({ rest, dryRun: true, adopt: (ids) => { adopted = ids; return ids; } });
+  assert.equal(adopted, null, "a dry run turns nothing on");
+  assert.equal(calls.length, 0);
+  assert.ok(Array.isArray(r.available));
+  process.env.ORG_RENAMES_FILE = (await import("node:path")).join((await import("node:os")).tmpdir(), `org-renames-${process.pid}.json`);
+  const r2 = await org.syncTeam({ rest: { ...rest, request: async () => {} }, dryRun: false, adopt: (ids) => { adopted = ids; return ids; } }).catch((e) => ({ err: e.message }));
+  assert.deepEqual(adopted, ["cfo"]);
+  void r2;
+});
+
+test("adoptRoles: only installed roles that are off are turned on", () => {
+  const seen = [];
+  const done = org.adoptRoles(["no-such-role"], { enable: (n) => seen.push(n) });
+  assert.deepEqual(done, []);
+  assert.deepEqual(seen, []);
+});

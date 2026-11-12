@@ -1,7 +1,7 @@
 {
   "name": "role-travel-manager",
-  "title": "Travel Manager (role)",
-  "description": "The Travel Manager on your team: trips: flights and bookings, the travel timeline, area guides and fares. Owns those jobs, signs what they send, and brings this role's specialty to every one of them.",
+  "title": "Travel (role)",
+  "description": "The Travel role on your team: trips: flights and bookings, the travel timeline, area guides and fares. Owns those jobs, signs what they send, and brings this role's specialty to every one of them.",
   "version": "1.0.0",
   "default": "disabled",
   "requires": {
@@ -14,7 +14,7 @@
   "launchd": [],
   "role": {
     "id": "travel-manager",
-    "title": "Travel Manager",
+    "title": "Travel",
     "responsibility": "Trips: flights and bookings, the travel timeline, area guides and fares.",
     "jobs": [
       "flights-scan",

@@ -108,6 +108,10 @@ struct ConversationSummary: Equatable {
 @MainActor
 final class TeamStore: ObservableObject {
     @Published private(set) var team: [TeamMember] = []
+    /// Roles installed but not on the team yet (jori_team.enabled = false): the
+    /// user can add one, and it joins the team (system/org.md § Growing the
+    /// team). A personal assistant becomes the chief of staff when one does.
+    @Published private(set) var available: [TeamMember] = []
     @Published private(set) var conversations: [Conversation] = []
     @Published private(set) var summaries: [String: ConversationSummary] = [:]
     /// Improvement cards waiting on Face ID: counted on the software engineer's conversation.
@@ -133,7 +137,7 @@ final class TeamStore: ObservableObject {
 
     func member(_ id: String?) -> TeamMember? {
         guard let id else { return nil }
-        return team.first { $0.id == id }
+        return team.first { $0.id == id } ?? available.first { $0.id == id }
     }
 
     /// The coordinator's conversation: the chief of staff's, once the team has
@@ -314,11 +318,16 @@ final class TeamStore: ObservableObject {
             let rows: [TeamMember] = try await SupabaseManager.shared
                 .from(Self.teamTable)
                 .select("id,name,title,responsibility,chief_of_staff,enabled,sort,avatar_url")
-                .eq("enabled", value: true)
                 .order("sort", ascending: true)
                 .execute()
                 .value
-            if rows != team { team = rows }
+            // A role the user just added stays on the team here until the
+            // server has turned it on (and the next load says enabled).
+            let on = rows.filter { $0.enabled || joining.contains($0.id) }
+            for r in rows where r.enabled { joining.remove(r.id) }
+            let off = rows.filter { !$0.enabled && !joining.contains($0.id) }
+            if on != team { team = on }
+            if off != available { available = off }
         } catch {
             print("[Team] team load failed: \(error)")
         }
@@ -621,11 +630,45 @@ final class TeamStore: ObservableObject {
         let created_by: String
     }
 
+    /// Roles the user added that the server has not turned on yet.
+    private var joining: Set<String> = []
+
+    /// Bring roles that are not on the team yet onto it: flag them in
+    /// jori_team (requested_at) for the server to turn on, and show them as
+    /// teammates right away.
+    func join(_ roleIds: [String]) async {
+        let newcomers = roleIds.filter { id in available.contains { $0.id == id } }
+        guard !newcomers.isEmpty else { return }
+        struct Patch: Encodable { let requested_at: String }
+        let stamp = ISO8601DateFormatter().string(from: Date())
+        for id in newcomers {
+            joining.insert(id)
+            if let i = available.firstIndex(where: { $0.id == id }) {
+                var m = available.remove(at: i)
+                m.enabled = true
+                team.append(m)
+            }
+        }
+        do {
+            try await SupabaseManager.ensureAuthenticated()
+            try await SupabaseManager.shared
+                .from(Self.teamTable)
+                .update(Patch(requested_at: stamp))
+                .in("id", values: newcomers)
+                .execute()
+        } catch {
+            print("[Team] adding \(newcomers) failed: \(error)")
+            joining.subtract(newcomers)
+            await loadTeam()
+        }
+    }
+
     /// The conversation with exactly these roles: the role's own for one, a new
     /// group for several (an existing group with the same people is reused).
     func conversation(with roleIds: [String]) async -> String? {
         let ids = Array(Set(roleIds)).sorted()
         guard !ids.isEmpty else { return nil }
+        await join(ids)
         if ids.count == 1 {
             let id = ConversationID.role(ids[0])
             if !conversations.contains(where: { $0.id == id }) {
@@ -650,6 +693,7 @@ final class TeamStore: ObservableObject {
         let current = memberIds(of: conversationId)
         let missing = roleIds.filter { !current.contains($0) }
         guard !missing.isEmpty else { return conversationId }
+        await join(missing)
         let c = conversations.first(where: { $0.id == conversationId })
         let kind = c?.kind ?? (ConversationID.isGroup(conversationId) ? "group" : "role")
         await write(ConversationRow(id: conversationId, kind: kind, title: c?.title,
@@ -1082,26 +1126,19 @@ struct NewConversationSheet: View {
 
     var body: some View {
         NavigationStack {
-            List(team.team) { m in
-                Button {
-                    if picked.contains(m.id) { picked.remove(m.id) } else { picked.insert(m.id) }
-                } label: {
-                    HStack(spacing: 12) {
-                        TeamAvatar(members: [m], size: 34)
-                        VStack(alignment: .leading, spacing: 1) {
-                            Text(m.label).foregroundStyle(.primary)
-                            if let r = m.responsibility {
-                                Text(r).font(.caption).foregroundStyle(.secondary).lineLimit(2)
-                            }
-                        }
-                        Spacer()
-                        Image(systemName: picked.contains(m.id) ? "checkmark.circle.fill" : "circle")
-                            .foregroundStyle(picked.contains(m.id) ? JoriTheme.cobalt : .secondary)
-                            .font(.title3)
-                    }
-                    .contentShape(Rectangle())
+            List {
+                Section {
+                    ForEach(team.team) { row($0) }
                 }
-                .buttonStyle(.plain)
+                if !team.available.isEmpty {
+                    Section {
+                        ForEach(team.available) { row($0) }
+                    } header: {
+                        Text("Add to your team")
+                    } footer: {
+                        Text("Each one takes over its own area.")
+                    }
+                }
             }
             .navigationTitle(picked.count > 1 ? "New group" : "New conversation")
             #if os(iOS)
@@ -1118,6 +1155,28 @@ struct NewConversationSheet: View {
                 }
             }
         }
+    }
+
+    private func row(_ m: TeamMember) -> some View {
+        Button {
+            if picked.contains(m.id) { picked.remove(m.id) } else { picked.insert(m.id) }
+        } label: {
+            HStack(spacing: 12) {
+                TeamAvatar(members: [m], size: 34)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(m.label).foregroundStyle(.primary)
+                    if let r = m.responsibility {
+                        Text(r).font(.caption).foregroundStyle(.secondary).lineLimit(2)
+                    }
+                }
+                Spacer()
+                Image(systemName: picked.contains(m.id) ? "checkmark.circle.fill" : "circle")
+                    .foregroundStyle(picked.contains(m.id) ? JoriTheme.cobalt : .secondary)
+                    .font(.title3)
+            }
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
     }
 }
 

@@ -1,7 +1,7 @@
 {
   "name": "role-software-engineer",
-  "title": "Software Engineer (role)",
-  "description": "The Software Engineer on your team: builds what the CEO asks for, fixes what breaks, improves Jori and ships the apps. Owns those jobs, signs what they send, and brings this role's specialty to every one of them.",
+  "title": "Product (role)",
+  "description": "The Product role on your team: builds what the CEO asks for, fixes what breaks, improves Jori and ships the apps. Owns those jobs, signs what they send, and brings this role's specialty to every one of them.",
   "version": "1.0.0",
   "default": "disabled",
   "requires": {
@@ -14,7 +14,7 @@
   "launchd": [],
   "role": {
     "id": "software-engineer",
-    "title": "Software Engineer",
+    "title": "Product",
     "responsibility": "Builds what the CEO asks for, fixes what breaks, improves Jori and ships the apps.",
     "jobs": [
       "chat-build",

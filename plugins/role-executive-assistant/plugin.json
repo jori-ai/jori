@@ -1,7 +1,7 @@
 {
   "name": "role-executive-assistant",
-  "title": "Executive Assistant (role)",
-  "description": "The Executive Assistant on your team: inbox, calendar, messages, reminders, meetings and purchases. Owns those jobs, signs what they send, and brings this role's specialty to every one of them.",
+  "title": "Admin (role)",
+  "description": "The Admin role on your team: inbox, calendar, messages, reminders, meetings and purchases. Owns those jobs, signs what they send, and brings this role's specialty to every one of them.",
   "version": "1.0.0",
   "default": "disabled",
   "requires": {
@@ -14,7 +14,7 @@
   "launchd": [],
   "role": {
     "id": "executive-assistant",
-    "title": "Executive Assistant",
+    "title": "Admin",
     "responsibility": "Inbox, calendar, messages, reminders, meetings and purchases.",
     "jobs": [
       "email-inbound",

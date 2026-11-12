@@ -1,4 +1,4 @@
-# CFO (role plugin)
+# Finances (role plugin)
 
 Cash, spending, investments, net worth, retirement and taxes.
 

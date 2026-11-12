@@ -1,7 +1,7 @@
 {
   "name": "role-it-security",
   "title": "IT & Security (role)",
-  "description": "The IT & Security on your team: keeps the machines up, backed up and safe, and watches the AI budget and service spend. Owns those jobs, signs what they send, and brings this role's specialty to every one of them.",
+  "description": "The IT & Security role on your team: keeps the machines up, backed up and safe, and watches the AI budget and service spend. Owns those jobs, signs what they send, and brings this role's specialty to every one of them.",
   "version": "1.0.0",
   "default": "disabled",
   "requires": {

@@ -1,4 +1,4 @@
-# Software Engineer (role plugin)
+# Product (role plugin)
 
 Builds what the CEO asks for, fixes what breaks, improves Jori and ships the apps.
 

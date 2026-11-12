@@ -1,7 +1,7 @@
 {
   "name": "role-cfo",
-  "title": "CFO (role)",
-  "description": "The CFO on your team: cash, spending, investments, net worth, retirement and taxes. Owns those jobs, signs what they send, and brings this role's specialty to every one of them.",
+  "title": "Finances (role)",
+  "description": "The Finances role on your team: cash, spending, investments, net worth, retirement and taxes. Owns those jobs, signs what they send, and brings this role's specialty to every one of them.",
   "version": "1.0.0",
   "default": "disabled",
   "requires": {
@@ -14,7 +14,7 @@
   "launchd": [],
   "role": {
     "id": "cfo",
-    "title": "CFO",
+    "title": "Finances",
     "responsibility": "Cash, spending, investments, net worth, retirement and taxes.",
     "jobs": [
       "plaid-sync",
