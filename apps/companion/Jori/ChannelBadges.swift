@@ -1023,7 +1023,7 @@ struct PinnedConversationsGrid: View {
 // MARK: - Collapsed sidebar (Mac)
 
 /// The sidebar folded to a rail, the way Messages on the Mac does it: one
-/// avatar per conversation with its name under it, pinned ones first, a short
+/// avatar per conversation with its name and role under it, pinned ones first, a short
 /// rule, then the rest. The open one sits on a blue tile; a red badge marks
 /// what is waiting. Right-click pins, unpins or deletes.
 struct ConversationRail: View {
@@ -1088,11 +1088,21 @@ private struct RailItem: View {
                     .overlay(alignment: .topTrailing) {
                         if badge > 0 { ChannelBadgeBubble(count: badge).offset(x: 4, y: -2) }
                     }
-                Text(name)
-                    .font(.system(size: 10, weight: .medium))
-                    .foregroundStyle(isSelected ? Color.white : Color.secondary)
-                    .lineLimit(1)
-                    .truncationMode(.tail)
+                VStack(spacing: 1) {
+                    Text(name)
+                        .font(.system(size: 10, weight: .medium))
+                        .foregroundStyle(isSelected ? Color.white : Color.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                    if !role.isEmpty {
+                        Text(role)
+                            .font(.system(size: 8.5))
+                            .foregroundStyle(isSelected ? Color.white.opacity(0.8) : Color.secondary.opacity(0.75))
+                            .lineLimit(2)
+                            .multilineTextAlignment(.center)
+                            .minimumScaleFactor(0.85)
+                    }
+                }
             }
             .padding(.vertical, 8)
             .padding(.horizontal, 4)
@@ -1109,7 +1119,7 @@ private struct RailItem: View {
         .focusEffectDisabled()
         .transaction { $0.animation = nil }
         .help(role.isEmpty ? name : "\(name) — \(role)")
-        .accessibilityLabel(name + (badge > 0 ? ", \(badge) waiting" : "") + (conversation.isPinned ? ", pinned" : ""))
+        .accessibilityLabel(name + (role.isEmpty ? "" : ", \(role)") + (badge > 0 ? ", \(badge) waiting" : "") + (conversation.isPinned ? ", pinned" : ""))
         .accessibilityAddTraits(isSelected ? .isSelected : [])
         .modifier(ConversationDeleteActions(conversation: conversation, team: team, onDeleted: onDeleted, swipes: false))
     }
