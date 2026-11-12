@@ -87,7 +87,9 @@ final class ChatViewModel: ObservableObject {
     @Published private(set) var notPickedUp: Set<UUID> = []
 
     private static let draftKey = Install.key("messageDraft")
-    private static let conversationKey = Install.key("currentConversation")
+    /// The conversation on screen, kept so the app reopens in it (ContentView
+    /// reads it too, to reopen the iPhone inside it rather than on the list).
+    static let conversationKey = Install.key("currentConversation")
 
     private let supabase: SupabaseClient
     private let cloudBackup = CloudBackup.shared

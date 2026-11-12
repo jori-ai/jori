@@ -68,10 +68,28 @@ struct ContentView: View {
     private static let renderPage = 60
     @State private var scrollToBottomTick: Int = 0
     @State private var confirmSignOut = false
-    @State private var memoryMode = false
+    /// Memory on screen instead of a conversation. Kept, with the
+    /// conversation (ChatViewModel) and the improvement cards, so the app
+    /// reopens on the screen it was left on.
+    @AppStorage(ContentView.memoryOpenKey) private var memoryMode = false
+    private static let memoryOpenKey = Install.key("memoryOpen")
     @StateObject private var memoryState = WebViewState()
     @StateObject private var commandCenter = CommandCenter()
-    @State private var columnVisibility: NavigationSplitViewVisibility = .automatic
+    @State private var columnVisibility: NavigationSplitViewVisibility
+    #if os(macOS)
+    /// The user folded the sidebar to the rail themselves (not by narrowing
+    /// the window), so it reopens folded.
+    @AppStorage(ContentView.sidebarFoldedKey) private var sidebarFolded = false
+    private static let sidebarFoldedKey = Install.key("sidebarFolded")
+    /// How much the window shrank when the user hid the sidebar themselves, so opening
+    /// it again gives that width back — also after a relaunch. 0 when nothing was taken.
+    @AppStorage(Install.key("windowShrunkForSidebar")) private var windowShrunkForSidebar: Double = 0
+    #endif
+    #if os(iOS)
+    /// iPhone: the app was left inside a conversation (or Memory), not on the list.
+    @AppStorage(ContentView.phoneInDetailKey) private var phoneInDetail = false
+    private static let phoneInDetailKey = Install.key("phoneInDetail")
+    #endif
     /// True when the sidebar was hidden by narrowing the window, so widening
     /// it again brings the sidebar back. A sidebar the user hid themselves stays hidden.
     @State private var sidebarAutoHidden = false
@@ -90,9 +108,6 @@ struct ContentView: View {
     /// The sidebar column's width while open — the user can drag it — so hiding it
     /// takes exactly that much off the window.
     @State private var sidebarColumnWidth: CGFloat = 230
-    /// How much the window shrank when the user hid the sidebar themselves, so opening
-    /// it again gives that width back. nil when nothing was taken.
-    @State private var windowShrunkForSidebar: CGFloat?
     #endif
     /// True while the conversation is scrolled away from the latest message
     /// (iOS 18 / macOS 15 and later — older systems never report it, and keep
@@ -107,12 +122,35 @@ struct ContentView: View {
     @State private var isDropTargeted = false
     /// iPhone: the conversation list is the home screen; a conversation (or
     /// Memory) is pushed on top of it.
-    @State private var phonePath: [Destination] = []
+    @State private var phonePath: [Destination]
     @State private var showNewConversation = false
     @State private var showConversationInfo = false
     /// In the software engineer's conversation: the improvement cards instead
     /// of the messages (the old Improvements channel lives there now).
-    @State private var showImprovementCards = false
+    @AppStorage(Install.key("improvementCardsOpen")) private var showImprovementCards = false
+
+    init(onSignOut: @escaping () -> Void = {}) {
+        self.onSignOut = onSignOut
+        let defaults = UserDefaults.standard
+        // Reopen where the app was left, set before the first frame so
+        // nothing visibly pushes or folds on launch.
+        #if os(macOS)
+        _columnVisibility = State(initialValue: defaults.bool(forKey: Self.sidebarFoldedKey) ? .detailOnly : .automatic)
+        #else
+        _columnVisibility = State(initialValue: .automatic)
+        #endif
+        #if os(iOS)
+        if defaults.bool(forKey: Self.phoneInDetailKey) {
+            let conversation = defaults.string(forKey: ChatViewModel.conversationKey) ?? ConversationID.coordinator
+            let screen: Destination = defaults.bool(forKey: Self.memoryOpenKey) ? .memory : .conversation(conversation)
+            _phonePath = State(initialValue: [screen])
+        } else {
+            _phonePath = State(initialValue: [])
+        }
+        #else
+        _phonePath = State(initialValue: [])
+        #endif
+    }
 
     // Trade-approval second factor (only when the build sets a trading app)
     @State private var showApprovalPairing = false
@@ -287,6 +325,9 @@ struct ContentView: View {
             windowResized(to: window.frame.width)
         }
         .onChange(of: columnVisibility) { old, new in
+            // Only a fold the user made reopens folded; narrowing the window
+            // folds it again by itself on the next launch.
+            sidebarFolded = new == .detailOnly && !sidebarAutoHidden
             if new == .detailOnly {
                 // The user folded the sidebar: the window gives up the
                 // sidebar's width minus the rail's, so the conversation keeps
@@ -300,8 +341,8 @@ struct ContentView: View {
             guard old == .detailOnly, let now = currentWindow?.frame else { return }
             // Give back what folding took; a narrow window gets the
             // sidebar's room regardless, so the conversation isn't squeezed.
-            let given = windowShrunkForSidebar ?? 0
-            windowShrunkForSidebar = nil
+            let given = CGFloat(windowShrunkForSidebar)
+            windowShrunkForSidebar = 0
             let needed = now.width < Self.sidebarRestoreWidth ? Self.sidebarWidth - Self.railWidth : 0
             let grow = max(given, needed)
             if grow > 0 { growWindowForSidebar(from: now, by: grow) }
@@ -387,7 +428,7 @@ struct ContentView: View {
         let taken = frame.width - target
         guard taken > 0 else { return }
         frame.size.width = target
-        windowShrunkForSidebar = taken
+        windowShrunkForSidebar = Double(taken)
         // Instant, in the same pass as the swap (see growWindowForSidebar).
         window.setFrame(frame, display: true, animate: false)
     }
@@ -543,6 +584,7 @@ struct ContentView: View {
         .refreshable { await team.refresh() }
         // Back on the list, the conversation just left counts its unread again.
         .onChange(of: phonePath) { _, path in
+            phoneInDetail = !path.isEmpty
             let left = team.activeConversation
             team.activeConversation = path.isEmpty ? "" : viewModel.currentConversation
             // Mark the conversation just left read BEFORE recounting, so its
