@@ -245,53 +245,42 @@ struct ContentView: View {
         #endif
     }
 
+    #if os(macOS)
+    /// The Mac: the sidebar and the conversation side by side in our own
+    /// layout, not a NavigationSplitView. Hiding the sidebar folds it to the
+    /// avatar rail (ConversationRail) and takes the difference off the window
+    /// in the same instant, so the conversation keeps its width and nothing
+    /// slides, re-wraps or blinks. The split view's own collapse animated the
+    /// column away while the rail appeared beside it and the window resized
+    /// on its own clock: a gap, then a jump, then a redraw.
     private var splitNavigation: some View {
-        NavigationSplitView(columnVisibility: $columnVisibility) {
-            sidebar
-                .navigationSplitViewColumnWidth(min: 200, ideal: Self.sidebarWidth, max: 320)
-                #if os(macOS)
-                .background {
-                    GeometryReader { geo in
-                        Color.clear
-                            .onAppear { noteSidebarWidth(geo.size.width) }
-                            .onChange(of: geo.size.width) { _, width in noteSidebarWidth(width) }
-                    }
+        HStack(spacing: 0) {
+            if isSidebarHidden {
+                ConversationRail(team: team, chat: viewModel, inMemory: memoryMode,
+                                 open: { go(.conversation($0)) },
+                                 onDeleted: { gone in
+                                     if viewModel.currentConversation == gone { go(.conversation(team.coordinatorConversation)) }
+                                 })
+            } else {
+                sidebar
+                    .scrollContentBackground(.hidden)
+                    .background(.bar)
+                    .frame(width: Self.sidebarWidth)
+            }
+            Divider()
+            detail
+                .frame(minWidth: 0, maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        }
+        .toolbar {
+            ToolbarItem(placement: .navigation) {
+                Button { columnVisibility = isSidebarHidden ? .all : .detailOnly } label: {
+                    Label(isSidebarHidden ? "Show Sidebar" : "Hide Sidebar", systemImage: "sidebar.left")
                 }
-                #endif
-        } detail: {
-            HStack(spacing: 0) {
-                #if os(macOS)
-                // Hidden, the sidebar folds to a rail of avatars instead of
-                // going away (Messages on the Mac does the same).
-                if isSidebarHidden {
-                    ConversationRail(team: team, chat: viewModel, inMemory: memoryMode,
-                                     open: { go(.conversation($0)) },
-                                     onDeleted: { gone in
-                                         if viewModel.currentConversation == gone { go(.conversation(team.coordinatorConversation)) }
-                                     })
-                    Divider()
-                }
-                #endif
-                detail
-                    .frame(width: detailHeldWidth, alignment: .leading)
-                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-                    .clipped()
-                    .background {
-                        GeometryReader { geo in
-                            Color.clear
-                                .onAppear { if detailHeldWidth == nil { detailWidth = geo.size.width } }
-                                .onChange(of: geo.size.width) { _, w in if detailHeldWidth == nil { detailWidth = w } }
-                        }
-                    }
+                .help(isSidebarHidden ? "Show the sidebar (⌃⌘S)" : "Fold the sidebar to avatars (⌃⌘S)")
+                .keyboardShortcut("s", modifiers: [.control, .command])
             }
         }
-        .onChange(of: columnVisibility) { _, _ in holdDetailWidthDuringSidebarAnimation() }
-        #if os(macOS)
         // The Mac reads the WINDOW's width from its resize notifications.
-        // Both SwiftUI ways of measuring broke the split view there: a
-        // reader attached as a modifier measured the sidebar column (so the
-        // sidebar re-hid every time it opened), and a reader wrapping the
-        // split view collapsed it into a narrow centred column.
         .background(WindowReader(box: hostWindow) { window in windowResized(to: window.frame.width) })
         .onReceive(NotificationCenter.default.publisher(for: NSWindow.didResizeNotification)) { note in
             guard let window = note.object as? NSWindow, window === hostWindow.window else { return }
@@ -299,36 +288,44 @@ struct ContentView: View {
         }
         .onChange(of: columnVisibility) { old, new in
             if new == .detailOnly {
-                // The user hid the sidebar: the window becomes just the
-                // conversation, instead of the conversation stretching into
-                // the sidebar's space. Not when narrowing the window hid it —
-                // the user is already sizing the window themselves.
+                // The user folded the sidebar: the window gives up the
+                // sidebar's width minus the rail's, so the conversation keeps
+                // its width. Not when narrowing the window folded it — the
+                // user is already sizing the window themselves.
                 if old != .detailOnly, !sidebarAutoHidden { shrinkWindowForHiddenSidebar() }
                 return
             }
-            // Open again, by whatever route: a later hide is their own.
+            // Open again, by whatever route: a later fold is their own.
             sidebarAutoHidden = false
-            // The user opened the sidebar: grow the window by the sidebar, from where it stood while
-            // hidden, instead of squeezing the conversation. The frame is
-            // remembered from before, because AppKit may already have
-            // widened the window to the right by the time this runs.
-            // (The automatic restore only happens once the window is
-            // already wide, so it never lands here.)
-            // Grow from where the window is NOW (AppKit hasn't resized it yet
-            // when this runs): a frame remembered at hide time goes stale as
-            // soon as the user moves the window, and growing from it threw the
-            // window back to where it used to be.
             guard old == .detailOnly, let now = currentWindow?.frame else { return }
-            // Give back what hiding took; and a narrow window gets the
-            // sidebar's full width regardless, so the conversation isn't
-            // squeezed (hiding at the minimum width takes less than that).
+            // Give back what folding took; a narrow window gets the
+            // sidebar's room regardless, so the conversation isn't squeezed.
             let given = windowShrunkForSidebar ?? 0
             windowShrunkForSidebar = nil
-            let needed = now.width < Self.sidebarRestoreWidth ? sidebarColumnWidth - Self.railWidth : 0
+            let needed = now.width < Self.sidebarRestoreWidth ? Self.sidebarWidth - Self.railWidth : 0
             let grow = max(given, needed)
             if grow > 0 { growWindowForSidebar(from: now, by: grow) }
         }
-        #else
+    }
+    #else
+    private var splitNavigation: some View {
+        NavigationSplitView(columnVisibility: $columnVisibility) {
+            sidebar
+                .navigationSplitViewColumnWidth(min: 200, ideal: Self.sidebarWidth, max: 320)
+        } detail: {
+            detail
+                .frame(width: detailHeldWidth, alignment: .leading)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                .clipped()
+                .background {
+                    GeometryReader { geo in
+                        Color.clear
+                            .onAppear { if detailHeldWidth == nil { detailWidth = geo.size.width } }
+                            .onChange(of: geo.size.width) { _, w in if detailHeldWidth == nil { detailWidth = w } }
+                    }
+                }
+        }
+        .onChange(of: columnVisibility) { _, _ in holdDetailWidthDuringSidebarAnimation() }
         .background {
             GeometryReader { geo in
                 Color.clear
@@ -336,8 +333,8 @@ struct ContentView: View {
                     .onChange(of: geo.size.width) { _, width in fitSidebar(to: width) }
             }
         }
-        #endif
     }
+    #endif
 
     /// Hold the conversation at its current width until the sidebar (and, on
     /// the Mac, the window: its resize is re-applied at 0.4 s) has settled.
@@ -372,15 +369,9 @@ struct ContentView: View {
         var frame = hidden
         frame.size.width += width
         if frame.maxX > visible.maxX { frame.size.width = max(hidden.width, visible.maxX - frame.minX) }
-        // Instant, not animated: an animated window resize ran on AppKit's
-        // own clock beside the sidebar's slide (plus a corrective re-apply at
-        // 0.4 s), and the two motions fought, so the conversation jittered.
-        // Now the slide is the only motion; the conversation's width is held
-        // meanwhile (holdDetailWidthDuringSidebarAnimation).
+        // Instant and in the same pass as the sidebar's swap, so the
+        // conversation never changes width on screen.
         window.setFrame(frame, display: true, animate: false)
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.45) {
-            if window.frame != frame { window.setFrame(frame, display: true, animate: false) }
-        }
     }
 
     /// The reverse of `growWindowForSidebar`: take the sidebar's width off the
@@ -392,15 +383,13 @@ struct ContentView: View {
         var frame = window.frame
         let minWidth = max(window.minSize.width, 480)
         // The rail stays, so only the rest of the sidebar's width comes off.
-        let target = max(minWidth, frame.width - (sidebarColumnWidth - Self.railWidth))
+        let target = max(minWidth, frame.width - (Self.sidebarWidth - Self.railWidth))
         let taken = frame.width - target
         guard taken > 0 else { return }
         frame.size.width = target
         windowShrunkForSidebar = taken
-        // Instant, after the sidebar has slid away (see growWindowForSidebar).
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
-            window.setFrame(frame, display: true, animate: false)
-        }
+        // Instant, in the same pass as the swap (see growWindowForSidebar).
+        window.setFrame(frame, display: true, animate: false)
     }
 
     /// Only while the sidebar is open: during the hide animation the column
@@ -429,12 +418,18 @@ struct ContentView: View {
         let previous = lastMeasuredWidth
         lastMeasuredWidth = width
         let wasNarrow = previous.map { $0 < Self.sidebarCollapseWidth } ?? false
+        #if os(macOS)
+        let fold: Animation? = nil   // the Mac swaps sidebar and rail in place
+        #else
+        let fold: Animation? = .snappy(duration: 0.3)
+        #endif
         if width < Self.sidebarCollapseWidth, !wasNarrow {
             guard !isSidebarHidden else { return }
-            withAnimation(.snappy(duration: 0.3)) { columnVisibility = .detailOnly }
+            // Set before the change, so the window isn't shrunk for it.
             sidebarAutoHidden = true
+            withAnimation(fold) { columnVisibility = .detailOnly }
         } else if width >= Self.sidebarRestoreWidth, sidebarAutoHidden {
-            withAnimation(.snappy(duration: 0.3)) { columnVisibility = .all }
+            withAnimation(fold) { columnVisibility = .all }
             sidebarAutoHidden = false
         }
     }
@@ -521,7 +516,9 @@ struct ContentView: View {
             }
         }
         .listStyle(.sidebar)
+        #if os(iOS)
         .navigationTitle(Install.displayName)
+        #endif
         .sensoryFeedback(.selection, trigger: destination)
     }
 
