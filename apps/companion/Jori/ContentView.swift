@@ -259,17 +259,32 @@ struct ContentView: View {
                 }
                 #endif
         } detail: {
-            detail
-                .frame(width: detailHeldWidth, alignment: .leading)
-                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-                .clipped()
-                .background {
-                    GeometryReader { geo in
-                        Color.clear
-                            .onAppear { if detailHeldWidth == nil { detailWidth = geo.size.width } }
-                            .onChange(of: geo.size.width) { _, w in if detailHeldWidth == nil { detailWidth = w } }
-                    }
+            HStack(spacing: 0) {
+                #if os(macOS)
+                // Hidden, the sidebar folds to a rail of avatars instead of
+                // going away (Messages on the Mac does the same).
+                if isSidebarHidden {
+                    ConversationRail(team: team,
+                                     selected: memoryMode ? nil : viewModel.currentConversation,
+                                     open: { go(.conversation($0)) },
+                                     onDeleted: { gone in
+                                         if viewModel.currentConversation == gone { go(.conversation(team.coordinatorConversation)) }
+                                     })
+                    Divider()
                 }
+                #endif
+                detail
+                    .frame(width: detailHeldWidth, alignment: .leading)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                    .clipped()
+                    .background {
+                        GeometryReader { geo in
+                            Color.clear
+                                .onAppear { if detailHeldWidth == nil { detailWidth = geo.size.width } }
+                                .onChange(of: geo.size.width) { _, w in if detailHeldWidth == nil { detailWidth = w } }
+                        }
+                    }
+            }
         }
         .onChange(of: columnVisibility) { _, _ in holdDetailWidthDuringSidebarAnimation() }
         #if os(macOS)
@@ -310,7 +325,7 @@ struct ContentView: View {
             // squeezed (hiding at the minimum width takes less than that).
             let given = windowShrunkForSidebar ?? 0
             windowShrunkForSidebar = nil
-            let needed = now.width < Self.sidebarRestoreWidth ? sidebarColumnWidth : 0
+            let needed = now.width < Self.sidebarRestoreWidth ? sidebarColumnWidth - Self.railWidth : 0
             let grow = max(given, needed)
             if grow > 0 { growWindowForSidebar(from: now, by: grow) }
         }
@@ -377,7 +392,8 @@ struct ContentView: View {
         guard let window = currentWindow else { return }
         var frame = window.frame
         let minWidth = max(window.minSize.width, 480)
-        let target = max(minWidth, frame.width - sidebarColumnWidth)
+        // The rail stays, so only the rest of the sidebar's width comes off.
+        let target = max(minWidth, frame.width - (sidebarColumnWidth - Self.railWidth))
         let taken = frame.width - target
         guard taken > 0 else { return }
         frame.size.width = target
@@ -400,6 +416,8 @@ struct ContentView: View {
     /// it folds away; it returns a little above it (the gap keeps a resize
     /// hovering at the edge from flickering it in and out).
     private static let sidebarWidth: CGFloat = 230
+    /// The folded sidebar (ConversationRail) that stays when it is hidden.
+    private static let railWidth: CGFloat = ConversationRail.width + 1
     private static let sidebarCollapseWidth: CGFloat = 720
     private static let sidebarRestoreWidth: CGFloat = 760
 

@@ -954,6 +954,74 @@ struct PinnedConversationsGrid: View {
     }
 }
 
+// MARK: - Collapsed sidebar (Mac)
+
+/// The sidebar folded to a rail, the way Messages on the Mac does it: one
+/// avatar per conversation with its name under it, pinned ones first, a short
+/// rule, then the rest. The open one sits on a blue tile; a red badge marks
+/// what is waiting. Right-click pins, unpins or deletes.
+struct ConversationRail: View {
+    @ObservedObject var team: TeamStore
+    var selected: String?
+    let open: (String) -> Void
+    var onDeleted: (String) -> Void = { _ in }
+
+    static let width: CGFloat = 84
+
+    var body: some View {
+        ScrollView(.vertical) {
+            LazyVStack(spacing: 4) {
+                ForEach(team.pinnedConversations) { item($0) }
+                if !team.pinnedConversations.isEmpty, !team.unpinnedConversations.isEmpty {
+                    Capsule()
+                        .fill(.secondary.opacity(0.35))
+                        .frame(width: 44, height: 2)
+                        .padding(.vertical, 6)
+                }
+                ForEach(team.unpinnedConversations) { item($0) }
+            }
+            .padding(.horizontal, 8)
+            .padding(.vertical, 8)
+        }
+        .scrollIndicators(.never)
+        .frame(width: Self.width)
+        .frame(maxHeight: .infinity)
+        .background(.bar)
+    }
+
+    private func item(_ conversation: Conversation) -> some View {
+        let isSelected = selected == conversation.id
+        let badge = team.badgeCount(conversation.id)
+        let name = team.title(of: conversation.id)
+        return Button { open(conversation.id) } label: {
+            VStack(spacing: 4) {
+                TeamAvatar(members: team.members(of: conversation.id), size: 44)
+                    .overlay(alignment: .topTrailing) {
+                        if badge > 0 { ChannelBadgeBubble(count: badge).offset(x: 4, y: -2) }
+                    }
+                Text(name)
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundStyle(isSelected ? Color.white : Color.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+            }
+            .padding(.vertical, 8)
+            .padding(.horizontal, 4)
+            .frame(maxWidth: .infinity)
+            .background {
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .fill(JoriTheme.cobalt)
+                    .opacity(isSelected ? 1 : 0)
+            }
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help(team.subtitle(of: conversation.id).isEmpty ? name : "\(name) — \(team.subtitle(of: conversation.id))")
+        .accessibilityLabel(name + (badge > 0 ? ", \(badge) waiting" : "") + (conversation.isPinned ? ", pinned" : ""))
+        .modifier(ConversationDeleteActions(conversation: conversation, team: team, onDeleted: onDeleted, swipes: false))
+    }
+}
+
 // MARK: - New conversation
 
 /// Start a conversation with one role or a group of several.
