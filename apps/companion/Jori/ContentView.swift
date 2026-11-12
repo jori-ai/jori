@@ -2962,6 +2962,11 @@ private struct MacTextViewRepresentable: NSViewRepresentable {
 /// however far the flow of messages has pushed the question itself. Tap a row
 /// to jump to the question; Answer opens a reply to it; the x dismisses it
 /// (a silent reply the server closes in code — see ChatViewModel.dismissQuestion).
+///
+/// Only the most recent questions are listed — three on Mac/iPad, one on a
+/// phone — the header still counts them all. With more than one open, rows show
+/// the question alone (no option buttons) and each row gets its own shade, the
+/// most recent lightest, so neighbouring questions read as separate.
 struct OpenQuestionsTray: View {
     let questions: [Message]
     var reveal: (Message) -> Void
@@ -2970,6 +2975,22 @@ struct OpenQuestionsTray: View {
     /// A tapped option: the same pre-composed reply a tap on the card sends.
     var select: (ChoiceOption, Message) -> Void
     @AppStorage(Install.key("openQuestionsTrayExpanded")) private var expanded = true
+    #if os(iOS)
+    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
+    #endif
+
+    /// How many rows the tray lists: one on a phone, three on Mac/iPad.
+    private var visibleLimit: Int {
+        #if os(iOS)
+        return horizontalSizeClass == .compact ? 1 : 3
+        #else
+        return 3
+        #endif
+    }
+
+    /// The most recent `visibleLimit` questions, oldest first (the newest sits
+    /// nearest the composer).
+    private var shown: [Message] { Array(questions.suffix(visibleLimit)) }
 
     var body: some View {
         if !questions.isEmpty {
@@ -2991,30 +3012,37 @@ struct OpenQuestionsTray: View {
                 }
                 .buttonStyle(.plain)
                 if expanded {
-                    ScrollView {
-                        VStack(spacing: 0) {
-                            ForEach(questions) { q in
-                                Divider().overlay(JoriTheme.hairline)
-                                row(q)
-                            }
+                    let rows = shown
+                    VStack(spacing: 0) {
+                        ForEach(Array(rows.enumerated()), id: \.element.id) { index, q in
+                            Divider().overlay(JoriTheme.hairline)
+                            row(q, showOptions: questions.count == 1)
+                                .background(shade(fromNewest: rows.count - 1 - index, of: rows.count))
                         }
                     }
-                    .frame(maxHeight: 280)
-                    .fixedSize(horizontal: false, vertical: questions.count <= 3)
                 }
             }
             .background(JoriTheme.staffWash, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+            .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
             .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous).stroke(JoriTheme.staff.opacity(0.35), lineWidth: 0.5))
             .transition(.move(edge: .bottom).combined(with: .opacity))
         }
     }
 
-    private func row(_ q: Message) -> some View {
+    /// A row's tint: none for the newest, a step deeper for each older one.
+    /// Only drawn when several rows share the tray.
+    private func shade(fromNewest step: Int, of count: Int) -> Color {
+        count > 1 ? JoriTheme.staff.opacity(0.09 * Double(step)) : .clear
+    }
+
+    private func row(_ q: Message, showOptions: Bool) -> some View {
         // A question that carries tappable options (a decision card, a choice
         // prompt) is answered by tapping one right here. The "Answer" button
         // alone only opens a typed reply, so a card scrolled out of view used to
         // be answerable only in words (2026-11-10: a "stay in touch?" card).
-        let options = ChoicePrompt.from(metadata: q.metadata)?.options ?? []
+        // With several open, the tray lists questions only; answer by tapping
+        // the row (jumps to the card) or Answer.
+        let options = showOptions ? (ChoicePrompt.from(metadata: q.metadata)?.options ?? []) : []
         return VStack(alignment: .leading, spacing: 6) {
             HStack(alignment: .center, spacing: 8) {
                 Button { reveal(q) } label: {
