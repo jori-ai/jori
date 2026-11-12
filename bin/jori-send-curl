@@ -1328,8 +1328,11 @@ try:
 except Exception:
   pass' "$RESP_BODY_FILE")
     # The speak gate's verdict, linked to the row it judged (shown under it).
+    # In the foreground (under a second): launchd kills a job's leftover
+    # background processes when it exits, and the first live review was lost
+    # that way.
     if [ -n "$GATE_REVIEW_FILE" ]; then
-      "${JORI_NODE:-node}" "$SPEAK_GATE_LIVE" record "$GATE_REVIEW_FILE" "$MSG_ID" > /dev/null 2>&1 &
+      "${JORI_NODE:-node}" "$SPEAK_GATE_LIVE" record "$GATE_REVIEW_FILE" "$MSG_ID" > /dev/null 2>&1
     fi
     if [ -n "$MSG_ID" ] && [ -n "$CAPTURE_ID_FILE" ]; then
       TMP_ID="${CAPTURE_ID_FILE}.tmp.$$"
