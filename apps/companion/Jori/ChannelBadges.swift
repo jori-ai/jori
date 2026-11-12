@@ -923,7 +923,7 @@ struct PinnedConversationsGrid: View {
                 TeamAvatar(members: team.members(of: conversation.id), size: 64)
                     .padding(3)
                     .overlay {
-                        Circle().strokeBorder(JoriTheme.cobalt, lineWidth: 2.5).opacity(isSelected ? 1 : 0)
+                        if isSelected { Circle().strokeBorder(JoriTheme.cobalt, lineWidth: 2.5) }
                     }
                     .overlay(alignment: .topTrailing) {
                         if badge > 0 { ChannelBadgeBubble(count: badge).offset(x: 2, y: -2) }
@@ -990,10 +990,27 @@ struct ConversationRail: View {
     }
 
     private func item(_ conversation: Conversation) -> some View {
-        let isSelected = selected == conversation.id
+        RailItem(conversation: conversation, team: team,
+                 isSelected: selected == conversation.id,
+                 open: open, onDeleted: onDeleted)
+    }
+}
+
+/// One avatar in the rail. Its own view with `isSelected` as a plain value,
+/// and the blue tile only drawn when selected (not faded by opacity): with
+/// the tile kept and faded, the conversation just left could stay blue.
+private struct RailItem: View {
+    let conversation: Conversation
+    @ObservedObject var team: TeamStore
+    let isSelected: Bool
+    let open: (String) -> Void
+    let onDeleted: (String) -> Void
+
+    var body: some View {
         let badge = team.badgeCount(conversation.id)
         let name = team.title(of: conversation.id)
-        return Button { open(conversation.id) } label: {
+        let role = team.subtitle(of: conversation.id)
+        Button { open(conversation.id) } label: {
             VStack(spacing: 4) {
                 TeamAvatar(members: team.members(of: conversation.id), size: 44)
                     .overlay(alignment: .topTrailing) {
@@ -1009,15 +1026,19 @@ struct ConversationRail: View {
             .padding(.horizontal, 4)
             .frame(maxWidth: .infinity)
             .background {
-                RoundedRectangle(cornerRadius: 12, style: .continuous)
-                    .fill(JoriTheme.cobalt)
-                    .opacity(isSelected ? 1 : 0)
+                if isSelected {
+                    RoundedRectangle(cornerRadius: 12, style: .continuous)
+                        .fill(JoriTheme.cobalt)
+                }
             }
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .help(team.subtitle(of: conversation.id).isEmpty ? name : "\(name) — \(team.subtitle(of: conversation.id))")
+        .focusEffectDisabled()
+        .transaction { $0.animation = nil }
+        .help(role.isEmpty ? name : "\(name) — \(role)")
         .accessibilityLabel(name + (badge > 0 ? ", \(badge) waiting" : "") + (conversation.isPinned ? ", pinned" : ""))
+        .accessibilityAddTraits(isSelected ? .isSelected : [])
         .modifier(ConversationDeleteActions(conversation: conversation, team: team, onDeleted: onDeleted, swipes: false))
     }
 }
