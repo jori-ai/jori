@@ -200,6 +200,11 @@ final class TeamStore: ObservableObject {
         }
     }
 
+    /// The pinned conversations, in pin order: the grid of circles on top.
+    var pinnedConversations: [Conversation] { visibleConversations.filter(\.isPinned) }
+    /// Everything else, newest first: the rows under the grid.
+    var unpinnedConversations: [Conversation] { visibleConversations.filter { !$0.isPinned } }
+
     // MARK: Counts
 
     func unread(_ conversationId: String) -> Int {
@@ -834,12 +839,6 @@ struct ConversationRowView: View {
                     nameLine(members)
                         .lineLimit(1)
                     Spacer(minLength: 4)
-                    if conversation.isPinned {
-                        Image(systemName: "pin.fill")
-                            .font(.caption2)
-                            .foregroundStyle(.secondary)
-                            .accessibilityLabel("Pinned")
-                    }
                     if let at = summary?.previewAt ?? conversation.lastMessageAt {
                         Text(Self.when(at))
                             .font(.caption)
@@ -888,6 +887,57 @@ struct ConversationRowView: View {
             return date.formatted(.dateTime.weekday(.wide))
         }
         return date.formatted(.dateTime.month(.abbreviated).day())
+    }
+}
+
+// MARK: - Pinned conversations
+
+/// The pinned conversations as iMessage shows them: big circles, three across,
+/// the name under each, above the list. A red badge sits on a circle when
+/// something is waiting; right-click / long-press unpins or deletes.
+struct PinnedConversationsGrid: View {
+    @ObservedObject var team: TeamStore
+    var selected: String?
+    let open: (String) -> Void
+    var onDeleted: (String) -> Void = { _ in }
+
+    private let columns = Array(repeating: GridItem(.flexible(), spacing: 8, alignment: .top), count: 3)
+
+    var body: some View {
+        LazyVGrid(columns: columns, spacing: 14) {
+            ForEach(team.pinnedConversations) { conversation in
+                tile(conversation)
+                    .modifier(ConversationDeleteActions(conversation: conversation, team: team, onDeleted: onDeleted, swipes: false))
+            }
+        }
+        .padding(.vertical, 8)
+    }
+
+    private func tile(_ conversation: Conversation) -> some View {
+        let badge = team.badgeCount(conversation.id)
+        let isSelected = selected == conversation.id
+        let name = team.title(of: conversation.id)
+        return Button { open(conversation.id) } label: {
+            VStack(spacing: 6) {
+                TeamAvatar(members: team.members(of: conversation.id), size: 64)
+                    .padding(3)
+                    .overlay {
+                        Circle().strokeBorder(JoriTheme.cobalt, lineWidth: 2.5).opacity(isSelected ? 1 : 0)
+                    }
+                    .overlay(alignment: .topTrailing) {
+                        if badge > 0 { ChannelBadgeBubble(count: badge).offset(x: 2, y: -2) }
+                    }
+                Text(name)
+                    .font(.caption)
+                    .foregroundStyle(isSelected ? .primary : .secondary)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+            }
+            .frame(maxWidth: .infinity)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(name + (badge > 0 ? ", \(badge) waiting" : "") + ", pinned")
     }
 }
 
@@ -1238,6 +1288,9 @@ struct ConversationDeleteActions: ViewModifier {
     let conversation: Conversation
     @ObservedObject var team: TeamStore
     var onDeleted: (String) -> Void = { _ in }
+    /// Off for a pinned circle: it sits inside the grid's one list row, where
+    /// swipe actions would belong to the whole row, not to it.
+    var swipes = true
     @State private var confirming = false
 
     private var deletable: Bool { conversation.id != team.coordinatorConversation }
@@ -1255,10 +1308,10 @@ struct ConversationDeleteActions: ViewModifier {
         content
             #if os(iOS)
             .swipeActions(edge: .leading, allowsFullSwipe: true) {
-                pinButton.tint(.orange)
+                if swipes { pinButton.tint(.orange) }
             }
             .swipeActions(edge: .trailing, allowsFullSwipe: false) {
-                if deletable {
+                if swipes && deletable {
                     Button(role: .destructive) { confirming = true } label: { Label("Delete", systemImage: "trash") }
                 }
             }

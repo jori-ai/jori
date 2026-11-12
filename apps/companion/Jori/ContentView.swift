@@ -434,8 +434,19 @@ struct ContentView: View {
 
     private var sidebar: some View {
         List(selection: Binding<Destination?>(get: { destination }, set: { if let d = $0 { go(d) } })) {
+            if !team.pinnedConversations.isEmpty {
+                PinnedConversationsGrid(team: team,
+                                        selected: memoryMode ? nil : viewModel.currentConversation,
+                                        open: { go(.conversation($0)) },
+                                        onDeleted: { gone in
+                                            if viewModel.currentConversation == gone { go(.conversation(team.coordinatorConversation)) }
+                                        })
+                    .listRowSeparator(.hidden)
+                    .listRowBackground(Color.clear)
+                    .selectionDisabled()
+            }
             Section {
-                ForEach(team.visibleConversations) { conversation in
+                ForEach(team.unpinnedConversations) { conversation in
                     ConversationRowView(conversation: conversation, team: team)
                         .tag(Destination.conversation(conversation.id))
                         .modifier(ConversationDeleteActions(conversation: conversation, team: team) { gone in
@@ -502,7 +513,11 @@ struct ContentView: View {
     #if os(iOS)
     private var phoneConversationList: some View {
         List {
-            ForEach(team.visibleConversations) { conversation in
+            if !team.pinnedConversations.isEmpty {
+                PinnedConversationsGrid(team: team, open: { go(.conversation($0)) })
+                    .listRowSeparator(.hidden)
+            }
+            ForEach(team.unpinnedConversations) { conversation in
                 Button { go(.conversation(conversation.id)) } label: {
                     ConversationRowView(conversation: conversation, team: team)
                 }
