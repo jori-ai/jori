@@ -454,10 +454,13 @@ struct ContentView: View {
                     .accessibilityLabel("New conversation")
                 }
             }
+            #if os(iOS)
+            // On the Mac, Memory is in the Go menu (⌘2), not the sidebar.
             Section("Library") {
                 Label("Memory", systemImage: "book.closed")
                     .tag(Destination.memory)
             }
+            #endif
             Section("Approvals") {
                 if TradeApproval.isEnabled {
                     Button { showApprovalPairing = true } label: {

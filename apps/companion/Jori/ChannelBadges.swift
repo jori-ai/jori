@@ -81,13 +81,17 @@ struct Conversation: Identifiable, Codable, Equatable, Hashable {
     var members: [String]
     var lastMessageAt: Date?
     var archived: Bool
+    /// When it was pinned to the top of the list; nil = not pinned.
+    var pinnedAt: Date?
 
     enum CodingKeys: String, CodingKey {
         case id, kind, title, members, archived
         case lastMessageAt = "last_message_at"
+        case pinnedAt = "pinned_at"
     }
 
     var isGroup: Bool { kind == "group" }
+    var isPinned: Bool { pinnedAt != nil }
 }
 
 /// What a conversation's row shows besides its people.
@@ -172,8 +176,9 @@ final class TeamStore: ObservableObject {
         id.split(separator: "-").map { $0.prefix(1).uppercased() + $0.dropFirst() }.joined(separator: " ")
     }
 
-    /// The conversations the list shows, newest first. The coordinator is
-    /// always there, even before its first row exists.
+    /// The conversations the list shows: pinned ones first (in the order they
+    /// were pinned, like iMessage), then the rest newest first. The coordinator
+    /// is always there, even before its first row exists.
     var visibleConversations: [Conversation] {
         var list = conversations.filter { !$0.archived }
         let coord = coordinatorConversation
@@ -183,6 +188,12 @@ final class TeamStore: ObservableObject {
                                      lastMessageAt: nil, archived: false))
         }
         return list.sorted { a, b in
+            switch (a.pinnedAt, b.pinnedAt) {
+            case let (pa?, pb?): return pa < pb
+            case (.some, nil): return true
+            case (nil, .some): return false
+            case (nil, nil): break
+            }
             let da = summaries[a.id]?.previewAt ?? a.lastMessageAt ?? .distantPast
             let db = summaries[b.id]?.previewAt ?? b.lastMessageAt ?? .distantPast
             return da > db
@@ -302,11 +313,22 @@ final class TeamStore: ObservableObject {
     func loadConversations() async {
         do {
             try await SupabaseManager.ensureAuthenticated()
-            let rows: [Conversation] = try await SupabaseManager.shared
-                .from(Self.conversationsTable)
-                .select("id,kind,title,members,last_message_at,archived")
-                .execute()
-                .value
+            let rows: [Conversation]
+            do {
+                rows = try await SupabaseManager.shared
+                    .from(Self.conversationsTable)
+                    .select("id,kind,title,members,last_message_at,archived,pinned_at")
+                    .execute()
+                    .value
+            } catch {
+                // A database without migration 0183 has no pinned_at: list
+                // the conversations unpinned rather than not at all.
+                rows = try await SupabaseManager.shared
+                    .from(Self.conversationsTable)
+                    .select("id,kind,title,members,last_message_at,archived")
+                    .execute()
+                    .value
+            }
             if rows != conversations { conversations = rows }
         } catch {
             print("[Team] conversations load failed: \(error)")
@@ -519,6 +541,48 @@ final class TeamStore: ObservableObject {
             await loadConversations()
         } catch {
             print("[Team] delete conversation failed: \(error)")
+        }
+    }
+
+    /// Pin a conversation to the top of the list, or unpin it. Stored on the
+    /// row (pinned_at, migration 0183) so every device shows the same pins.
+    func setPinned(_ id: String, _ pinned: Bool) async {
+        let now = Date()
+        if let i = conversations.firstIndex(where: { $0.id == id }) {
+            conversations[i].pinnedAt = pinned ? now : nil
+        }
+        struct Patch: Encodable {
+            let id: String
+            let pinned_at: String?
+            // Encode a null explicitly: unpinning must clear the column.
+            func encode(to e: Encoder) throws {
+                var c = e.container(keyedBy: CodingKeys.self)
+                try c.encode(pinned_at, forKey: .pinned_at)
+            }
+            enum CodingKeys: String, CodingKey { case pinned_at }
+        }
+        let stamp = pinned ? ISO8601DateFormatter().string(from: now) : nil
+        do {
+            try await SupabaseManager.ensureAuthenticated()
+            if conversations.contains(where: { $0.id == id }) {
+                try await SupabaseManager.shared
+                    .from(Self.conversationsTable)
+                    .update(Patch(id: id, pinned_at: stamp))
+                    .eq("id", value: id)
+                    .execute()
+            } else if let roleId = ConversationID.roleId(id) {
+                // The coordinator before its first row exists.
+                await write(ConversationRow(id: id, kind: "role", title: nil, members: [roleId], created_by: "user"))
+                try await SupabaseManager.shared
+                    .from(Self.conversationsTable)
+                    .update(Patch(id: id, pinned_at: stamp))
+                    .eq("id", value: id)
+                    .execute()
+            }
+            await loadConversations()
+        } catch {
+            print("[Team] pin conversation failed: \(error)")
+            await loadConversations()
         }
     }
 
@@ -770,6 +834,12 @@ struct ConversationRowView: View {
                     nameLine(members)
                         .lineLimit(1)
                     Spacer(minLength: 4)
+                    if conversation.isPinned {
+                        Image(systemName: "pin.fill")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                            .accessibilityLabel("Pinned")
+                    }
                     if let at = summary?.previewAt ?? conversation.lastMessageAt {
                         Text(Self.when(at))
                             .font(.caption)
@@ -1159,10 +1229,11 @@ struct GateReviewLine: View {
 }
 
 
-// MARK: - Deleting a conversation
+// MARK: - Pinning and deleting a conversation
 
-/// Swipe (iPhone, iPad) or right-click / long-press: delete a conversation or a
-/// group, after a confirmation that says what deleting means.
+/// Swipe (iPhone, iPad) or right-click / long-press: pin a conversation to the
+/// top of the list or unpin it (any conversation, the coordinator's too), and
+/// delete one, after a confirmation that says what deleting means.
 struct ConversationDeleteActions: ViewModifier {
     let conversation: Conversation
     @ObservedObject var team: TeamStore
@@ -1171,30 +1242,44 @@ struct ConversationDeleteActions: ViewModifier {
 
     private var deletable: Bool { conversation.id != team.coordinatorConversation }
 
+    private var pinButton: some View {
+        let pinned = conversation.isPinned
+        return Button {
+            Task { await team.setPinned(conversation.id, !pinned) }
+        } label: {
+            Label(pinned ? "Unpin" : "Pin", systemImage: pinned ? "pin.slash" : "pin")
+        }
+    }
+
     func body(content: Content) -> some View {
-        if deletable {
-            content
-                #if os(iOS)
-                .swipeActions(edge: .trailing, allowsFullSwipe: false) {
+        content
+            #if os(iOS)
+            .swipeActions(edge: .leading, allowsFullSwipe: true) {
+                pinButton.tint(.orange)
+            }
+            .swipeActions(edge: .trailing, allowsFullSwipe: false) {
+                if deletable {
                     Button(role: .destructive) { confirming = true } label: { Label("Delete", systemImage: "trash") }
                 }
-                #endif
-                .contextMenu {
+            }
+            #endif
+            .contextMenu {
+                pinButton
+                if deletable {
+                    Divider()
                     Button(role: .destructive) { confirming = true } label: { Label("Delete conversation", systemImage: "trash") }
                 }
-                .confirmationDialog(conversation.isGroup ? "Delete this group?" : "Delete this conversation?",
-                                    isPresented: $confirming, titleVisibility: .visible) {
-                    Button("Delete", role: .destructive) {
-                        Task { await team.deleteConversation(conversation.id); onDeleted(conversation.id) }
-                    }
-                    Button("Cancel", role: .cancel) {}
-                } message: {
-                    Text(conversation.isGroup
-                         ? "The group leaves your list. Jori keeps its messages in its memory."
-                         : "It leaves your list until \(team.title(of: conversation.id)) next writes to you. Jori keeps the messages in its memory.")
+            }
+            .confirmationDialog(conversation.isGroup ? "Delete this group?" : "Delete this conversation?",
+                                isPresented: $confirming, titleVisibility: .visible) {
+                Button("Delete", role: .destructive) {
+                    Task { await team.deleteConversation(conversation.id); onDeleted(conversation.id) }
                 }
-        } else {
-            content
-        }
+                Button("Cancel", role: .cancel) {}
+            } message: {
+                Text(conversation.isGroup
+                     ? "The group leaves your list. Jori keeps its messages in its memory."
+                     : "It leaves your list until \(team.title(of: conversation.id)) next writes to you. Jori keeps the messages in its memory.")
+            }
     }
 }
