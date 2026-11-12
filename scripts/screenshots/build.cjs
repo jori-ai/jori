@@ -310,6 +310,10 @@ body { font:17px/1.35 -apple-system, system-ui, "SF Pro Text", sans-serif; color
 `;
 
 const ICON_FACE = `<svg width="30" height="30" viewBox="0 0 30 30"><defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#2B54B8"/><stop offset="1" stop-color="#0A1640"/></linearGradient></defs><circle cx="15" cy="15" r="15" fill="url(#g)"/><rect x="8" y="11.5" width="5" height="7" rx="2.5" fill="#2AF2D4"/><rect x="17" y="11.5" width="5" height="7" rx="2.5" fill="#2AF2D4"/></svg>`;
+// In the app Jori is a persona with a photo (jori_team.avatar_url); the phone
+// screens show it in the header, beside its messages and in the list.
+const JORI_PHOTO = `data:image/jpeg;base64,${fs.readFileSync(path.join(__dirname, "team", "jori.jpg")).toString("base64")}`; // kernel-closure-ok: the demo headshot ships in the kernel beside this script
+const AV = `<img class="av" src="${JORI_PHOTO}">`;
 const STATUS = `<div class="status"><span>9:41</span><span class="r"><svg width="18" height="12" viewBox="0 0 18 12"><rect x="0" y="8" width="3" height="4" rx="1" fill="#111"/><rect x="5" y="5.5" width="3" height="6.5" rx="1" fill="#111"/><rect x="10" y="3" width="3" height="9" rx="1" fill="#111"/><rect x="15" y="0" width="3" height="12" rx="1" fill="#111"/></svg><svg width="17" height="12" viewBox="0 0 17 12"><path d="M8.5 2.2c2.4 0 4.6.9 6.2 2.5l1.2-1.2C13.9 1.4 11.3.4 8.5.4S3.1 1.4 1.1 3.5l1.2 1.2C3.9 3.1 6.1 2.2 8.5 2.2Zm0 3.6c1.4 0 2.7.5 3.7 1.5l1.2-1.2C12.1 4.8 10.4 4 8.5 4S4.9 4.8 3.6 6.1l1.2 1.2c1-1 2.3-1.5 3.7-1.5Zm0 3.6c.5 0 1 .2 1.3.6L8.5 11.3 7.2 10c.3-.4.8-.6 1.3-.6Z" fill="#111"/></svg><svg width="27" height="13" viewBox="0 0 27 13"><rect x=".5" y=".5" width="23" height="12" rx="3.5" fill="none" stroke="#111" opacity=".4"/><rect x="2" y="2" width="18" height="9" rx="2" fill="#111"/><rect x="24.5" y="4.5" width="1.5" height="4" rx=".75" fill="#111" opacity=".4"/></svg></span></div>`;
 // The header of a conversation: back, who you're talking to (photo, name,
 // role), and the people in it.
@@ -319,7 +323,7 @@ const navFor = (avatarHtml, name, title) => `<div class="nav">${BACK}<div class=
 // As the app titles the coordinator (lib/org.cjs soloTitle): alone, as in a
 // personal install, it is the Personal Assistant; with a team (work) it is the
 // Chief of Staff. Personal scenes use NAV; work scenes swap in NAV_COS.
-const JORI_HEAD = ICON_FACE.replace('width="30" height="30"', 'width="34" height="34"');
+const JORI_HEAD = `<img src="${JORI_PHOTO}">`;
 const NAV = navFor(JORI_HEAD, "Jori", "Personal Assistant");
 const NAV_COS = navFor(JORI_HEAD, "Jori", "Chief of Staff");
 const composer = (to = "Jori") => `<div class="composer"><div class="plus">+</div><div class="field">Message ${to}</div><div class="mic"><svg width="16" height="18" viewBox="0 0 16 18"><rect x="5" y="1" width="6" height="10" rx="3" fill="#fff"/><path d="M2.5 8.5a5.5 5.5 0 0 0 11 0M8 14v3" stroke="#fff" stroke-width="1.6" fill="none" stroke-linecap="round"/></svg></div></div>`;
@@ -338,7 +342,7 @@ const chatThread = `${NAV}<div class="thread">
 <div class="row me"><div class="b">Book the Lisbon flights. Same seats as last time.</div></div>
 <div class="gap"></div>
 <div class="row jori"><div class="spacer"></div><div class="b j1">Found them: TAP 202 on Mar 13, row 14 aisles, $1,284 for two. Approve with Face ID.</div></div>
-<div class="row jori">${ICON_FACE.replace("<svg", '<svg class="av"')}<div class="b j2" style="max-width:330px">And for Jordan's birthday, I'd go with:
+<div class="row jori">${AV}<div class="b j2" style="max-width:330px">And for Jordan's birthday, I'd go with:
 <div class="card"><div class="wait">✦ Waiting for your answer</div>
 <div class="opt rec"><span class="n">1</span><div><div class="l">Ceramics class for two<em>Recommended</em></div><div class="d">$180. Jordan stopped there twice.</div></div></div>
 <div class="opt"><span class="n">2</span><div><div class="l">Blue Note vinyl box set</div><div class="d">$95. They own most of it.</div></div></div>
@@ -506,7 +510,6 @@ const workProject = workPage({
   back: ["person_priya_natarajan", "meeting_2026-10-28_harbor_pine_qbr", "project_pipeline_review", "week_2026-11-02"],
 });
 
-const AV = ICON_FACE.replace("<svg", '<svg class="av"');
 
 // ── The team in the app: a conversation per role, photos, one red badge ────
 // The work roster, one role per kernel plugin (plugins/role-*): Jori (Chief of
@@ -514,7 +517,6 @@ const AV = ICON_FACE.replace("<svg", '<svg class="av"');
 // Dani (Social), Jules (Health). Made-up headshots in scripts/screenshots/team/.
 const PHOTO = Object.fromEntries(["alex", "sasha", "kim", "eden", "dani", "jules"].map((n) =>
   [n, `data:image/jpeg;base64,${fs.readFileSync(path.join(__dirname, "team", `${n}.jpg`)).toString("base64")}`])); // kernel-closure-ok: the demo headshots ship in the kernel beside this script
-const JORI_LIST_AV = ICON_FACE.replace('width="30" height="30"', 'width="46" height="46" class="ph"');
 const crow = (av, name, title, preview, time, badge = 0) => `<div class="crow">${av}<div class="c"><div class="top"><b>${name}</b><i>${title}</i><time>${time}</time></div><div class="bot"><span>${preview}</span>${badge ? `<div class="badge">${badge}</div>` : ""}</div></div></div>`;
 const img = (n, cls = "ph") => `<img class="${cls}" src="${PHOTO[n]}">`;
 // A screen as it looks in a role's own conversation: its photo and title in the
@@ -533,7 +535,7 @@ const MORE = `<div class="ico"><svg width="18" height="4" viewBox="0 0 18 4"><ci
 const COMPOSE = `<div class="ico"><svg width="18" height="18" viewBox="0 0 18 18"><path d="M3 15l1-3.5 8.5-8.5 2.5 2.5L6.5 14z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/></svg></div>`;
 const teamList = `<div class="tbar">${MORE}${COMPOSE}</div><div class="lhead"><b>Jori</b></div>
 <div class="pins">
-${pin(ICON_FACE.replace('width="30" height="30"', 'width="54" height="54"'), "Jori", "Chief of Staff")}
+${pin(`<img src="${JORI_PHOTO}">`, "Jori", "Chief of Staff")}
 ${pin(img("sasha", ""), "Sasha", "Finances", 2)}
 ${pin(img("alex", ""), "Alex", "Product")}
 </div>
