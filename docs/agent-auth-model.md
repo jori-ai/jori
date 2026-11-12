@@ -13,6 +13,15 @@ This is a hard architectural invariant. It is NOT a fallback chain; it is the on
 
 The cheap-model helper (`lib/local-llm.mjs` `localLlmChat()`) is intentionally generic: it accepts `{system, messages, user, timeoutMs, ...}` so low-stakes, non-agent tasks (quick classifications, one-shot rewrites) can reuse it without reaching for an API key. Since 2026-11-04 it runs Claude Haiku 5.5 as a tool-less `claude -p` fork on Max (it replaced `gemma3:1b`; the user chose Max only), so it throws wherever Max is unreadable (cron, SSH). Anything routed through it must still work when it throws. Gemma stays available behind `data/.local-llm-ollama`.
 
+## Cron: a Max token instead of the keychain (2026-11-12)
+
+The keychain login can be read only inside the GUI (Aqua) session. A process started by cron (or over SSH) is in another security session, so `claude -p` there prints "Not logged in", and every cron-started judgment failed: the speak gate let cron messages through unchecked ("Check failed, sent as written · judge_unavailable:not_logged_in"), and jobs were moved to launchd agents one by one to get around it. The user chose, 2026-11-12, to give cron a token rather than keep doing that.
+
+- **The token:** `claude setup-token` (a Max subscription OAuth token, about a year; billed to the subscription, never the API). Canonical copy in the password manager; runtime copy in the host's `.env` as `JORI_CRON_CLAUDE_TOKEN`, a name Claude Code does not read, so nothing picks it up by accident.
+- **Where it is used:** only `bin/cron-run`, which loads `.env` for its child, removes `JORI_CRON_CLAUDE_TOKEN` from the child's environment and sets `CLAUDE_CODE_OAUTH_TOKEN` to it **only under cron**: not when `XPC_SERVICE_NAME` is set (launchd agents also start through cron-run, and there the keychain works and stays in charge), and never over a token already set. Cron lines that do not go through cron-run do not get it. Test: `tests/cron-run-claude-token.test.mjs`.
+- **What stays:** the keychain is the login everywhere else; `max-auth-guard.sh` still scrubs `CLAUDE_CODE_OAUTH_TOKEN` before the launchd Opus/Fable forks; still no API key anywhere. The speak gate's launchd relay (`system/speak-gate.md` § Live) remains the fallback for a sender with no login at all.
+- **Renewal:** the token expires about a year after it was made; a watch reminds before then. Renew: `claude setup-token`, update the 1Password item and the host's `.env`.
+
 ## The wiki's API fallback (the one exception)
 
 An automatic switch to the API (Sonnet) when the Max subscription is unavailable, scoped to **the wiki answers only** and capped per month (`WIKI_API_MONTHLY_CAP_USD`, default 25). Everything else above still holds: agents, supervisors and every other job stop when Max is down.
