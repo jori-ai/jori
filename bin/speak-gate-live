@@ -1,0 +1,63 @@
+#!/usr/bin/env node
+// speak-gate-live — the live speak gate for shell and Python senders
+// (bin/jori-send-curl, bin/choice). The logic is lib/speak-gate-live.mjs.
+//
+//   speak-gate-live gate < input.json
+//       input: {message, sender?, intent?, channel?, kind?, reply_to_text?,
+//               conversation_id?, fixed_choices?}
+//       prints ONE line of JSON:
+//         {"deliver":true,"text":"<what to send>","verdict":"send|rewrite|error","review_file":"<path>|null"}
+//         {"deliver":false,"verdict":"drop|digest|resolve","reason":"…"}   (held; already recorded)
+//       Always exits 0. Any failure prints deliver:true with the input text.
+//   speak-gate-live record <review_file> <message_id>
+//       links the review to the delivered row, then removes the file.
+//   speak-gate-live enabled      exit 0 when the live gate is on, 1 when off.
+"use strict";
+
+import { readFileSync, writeFileSync, mkdirSync, unlinkSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+import { createRequire } from "node:module";
+import { gateOutbound, recordReview, liveEnabled } from "../lib/speak-gate-live.mjs";
+
+const require = createRequire(import.meta.url);
+const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const { installTools } = require(path.join(ROOT, "lib", "root.cjs"));
+const [cmd, a1, a2] = process.argv.slice(2);
+
+async function gate() {
+  let input = {};
+  try { input = JSON.parse(readFileSync(0, "utf8")); } catch {}
+  const fallback = { deliver: true, text: String(input.message || ""), verdict: "send", review_file: null };
+  try {
+    const r = await gateOutbound(input);
+    if (!r.deliver) return console.log(JSON.stringify({ deliver: false, verdict: r.verdict, reason: r.reason || null }));
+    let review_file = null;
+    if (r.review) {
+      const dir = installTools("data", "speak-gate-pending");
+      mkdirSync(dir, { recursive: true });
+      review_file = path.join(dir, `${randomUUID()}.json`);
+      writeFileSync(review_file, JSON.stringify(r.review));
+    }
+    console.log(JSON.stringify({ deliver: true, text: r.text, verdict: r.verdict, review_file }));
+  } catch {
+    console.log(JSON.stringify(fallback));
+  }
+}
+
+async function record() {
+  if (!a1) return;
+  let review = null;
+  try { review = JSON.parse(readFileSync(a1, "utf8")); } catch { return; }
+  await recordReview(review, a2 || null);
+  try { unlinkSync(a1); } catch {}
+}
+
+(async () => {
+  if (cmd === "gate") return gate();
+  if (cmd === "record") return record();
+  if (cmd === "enabled") process.exit(liveEnabled() ? 0 : 1);
+  console.error("usage: speak-gate-live gate|record <file> <message_id>|enabled");
+  process.exit(64);
+})();

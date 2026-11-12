@@ -14,6 +14,7 @@ import { spoolEvent } from "../../lib/hum-events.mjs";
 import { displayableDraft } from "../../lib/reply-stream.mjs";
 import { composeReply } from "../../lib/reply-file.mjs";
 import { recordSuperseded } from "../../lib/superseded-replies.mjs";
+import { gateOutbound, recordReview, liveEnabled as speakGateLive } from "../../lib/speak-gate-live.mjs";
 import { ShareBundler, laterTimestamp } from "./share-bundle.mjs";
 import { loadHook } from "../../lib/ext-hooks.mjs";
 import { fileURLToPath } from "node:url";
@@ -295,7 +296,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
     // + adjudication. A solicited reply can only ever be rewritten, never
     // withheld, so nothing is lost by sending first and correcting the same
     // row in place (send-then-correct, the user's choice).
-    const deliveredMessage = message;
+    let deliveredMessage = message;
 
     // Stop the ack refresh interval. If we have an ack row, UPDATE it in place
     // with the real reply — that keeps a single stable message row in the
@@ -329,6 +330,28 @@ mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
             .then(({ error }) => { if (error) log(`superseded ack delete error: ${error.message}`); });
         }
         reuseAckId = streamed.rowId;
+      }
+    }
+
+    // THE SPEAK GATE, before the user sees it (system/speak-gate.md § Live).
+    // A reply is only ever sent as written or as the gate's correction, never
+    // held; its verdict is linked to the row below and shown under it with the
+    // original folded. A message_file reply was composed by a tool from the
+    // source of record seconds ago and is sent exactly as written (see the
+    // freshness note below), so it is not judged. Fails open.
+    let gateReview = null;
+    if (!request.params.arguments?.message_file) {
+      try {
+        const g = await gateOutbound({
+          message, kind: "reply", channel: replyChannel, intent: "chat-reply",
+          sender: null, reply_to_text: pendingEntry?.text || null,
+          conversation_id: pendingEntry?.conversation_id || null,
+        });
+        if (g.deliver && g.text) deliveredMessage = g.text;
+        gateReview = g.review;
+        if (g.verdict === "rewrite") console.error(`[phone-channel] speak gate rewrote the reply: ${String(g.reason || "").slice(0, 160)}`);
+      } catch (e) {
+        console.error(`[phone-channel] speak gate skipped: ${e?.message || e}`);
       }
     }
 
@@ -382,7 +405,10 @@ mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
       // of record seconds ago — it IS the live evidence, so the freshness gate has nothing to
       // re-check; and a rewrite would replace the whole row with prose (e.g. a poster list cut
       // to 1,200 chars, with "as of when I looked" hedges on live data).
-      if (msgId && !request.params.arguments?.message_file) correctReplyInPlace(msgId, message, pendingEntry?.text || null, replyChannel);
+      if (msgId && gateReview) recordReview(gateReview, msgId);
+      // The speak gate already judged it before delivery; the older
+      // send-then-correct freshness pass runs only when the gate did not.
+      if (msgId && !request.params.arguments?.message_file && (!gateReview || gateReview.verdict === "error")) correctReplyInPlace(msgId, deliveredMessage, pendingEntry?.text || null, replyChannel);
       setTimeout(async () => {
         try {
           if (msgId) {
@@ -1049,7 +1075,10 @@ async function startAck(msgId, row, text) {
 //     message.
 // Streamed writes never push; the reply handler's push is the only one. The
 // truth gate still runs on the final text only (send-then-correct).
-const STREAM_ENABLED = process.env.CHAT_REPLY_STREAM !== "0";
+// With the speak gate live (lib/speak-gate-live.mjs) nothing is streamed: the
+// user must see a reply only after the gate has judged it (the user,
+// 2026-11-11: "it should be reviewed before i see it").
+const STREAM_ENABLED = process.env.CHAT_REPLY_STREAM !== "0" && !speakGateLive();
 const STREAM_POLL_MS = 400;
 // Short replies finish in about a second; streaming them only adds a flicker.
 const STREAM_MIN_CHARS = 60;

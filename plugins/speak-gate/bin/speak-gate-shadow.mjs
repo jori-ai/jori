@@ -100,11 +100,28 @@ async function one(m) {
   try {
     const st = readState();
     if (!st.cursor) { st.cursor = new Date().toISOString(); st.started_at = st.cursor; st.ends_at = new Date(Date.now() + 7 * 864e5).toISOString(); writeState(st); console.log(`shadow starts at ${st.cursor}`); return; }
-    if (st.ends_at && Date.now() > Date.parse(st.ends_at)) { console.log("shadow week over"); return; }
+    // No end date any more: since going live this pass is the safety net for
+    // routes that bypass the live gate (system/speak-gate.md § Live).
     const until = new Date(Date.now() - SETTLE_MS).toISOString();
     const rows = await rest.request(`/rest/v1/jori_messages?select=id,role,content,created_at,channel,sender,conversation_id,reply_to,metadata&role=eq.assistant&created_at=gt.${encodeURIComponent(st.cursor)}&created_at=lt.${encodeURIComponent(until)}&order=created_at.asc&limit=${MAX}`);
-    const todo = (rows || []).filter((m) => String(m.content || "").trim());
-    if (!todo.length) return;
+    const fetched = (rows || []).filter((m) => String(m.content || "").trim());
+    if (!fetched.length) return;
+    // Since the gate went live (lib/speak-gate-live.mjs) most messages are
+    // judged BEFORE delivery; this pass is now the safety net for any route
+    // that still writes without it. Never re-judge (or overwrite) a message
+    // that already has its review.
+    let reviewed = new Set();
+    try {
+      const have = await rest.request(`/rest/v1/jori_gate_reviews?select=message_id&message_id=in.(${fetched.map((m) => m.id).join(",")})`);
+      reviewed = new Set((have || []).map((r) => r.message_id));
+    } catch {}
+    const todo = fetched.filter((m) => !reviewed.has(m.id));
+    if (!todo.length) {
+      st.cursor = fetched[fetched.length - 1].created_at;
+      st.last_run = new Date().toISOString();
+      if (!DRY) writeState(st);
+      return;
+    }
     let i = 0;
     const done = new Set();
     await Promise.all(Array.from({ length: Math.min(CONC, todo.length) }, async () => {
@@ -112,7 +129,7 @@ async function one(m) {
     }));
     // Advance past every message handled (judged or not: a gate error is
     // logged, not retried forever).
-    st.cursor = todo[todo.length - 1].created_at;
+    st.cursor = fetched[fetched.length - 1].created_at;
     st.judged = (st.judged || 0) + todo.length;
     st.last_run = new Date().toISOString();
     if (!DRY) writeState(st);

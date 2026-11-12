@@ -1,6 +1,6 @@
 # Think before you speak (the speak gate)
 
-**Status (2026-11-10): shadow week (to 2026-11-17).** `bin/speak-gate.mjs` judges every message that reaches the app, after the fact, and holds nothing; the user grades each verdict in the app. The live gate is still `bin/outbound-precheck.mjs`, called from `jori-send-curl`.
+**Status (2026-11-11): LIVE.** Every message to the user in the app is judged by `bin/speak-gate.mjs` BEFORE it is written or pushed, and the verdict is acted on (§ Live). The shadow pass stays on as the safety net for any route that still writes without it.
 
 ## Why
 
@@ -54,7 +54,29 @@ The user's call (2026-11-10): "shadow for a week and show me your judgement on e
 - Covers every route into the app (jobs, role replies, location, chat answers). Emails to the user are not in the shadow.
 - At the end: the grades decide the prompt and rule changes, then wiring.
 
-## Before wiring (open)
+## Live (2026-11-11)
+
+The user, after the shadow week's first day: "it should be reviewed before i see it — not after"; "review and act — below tell me what was the original and still ask if made the right decision"; "show the reviewed result as primary and the original as hidden until exposed by the user".
+
+`lib/speak-gate-live.mjs` (`gateOutbound`, `recordReview`; CLI `bin/speak-gate-live gate|record|enabled` for shell and Python) runs the gate in front of delivery:
+
+| Verdict | What happens | In the app |
+|---|---|---|
+| `send` | delivered as written | folded line "Checked, sent as written" |
+| `rewrite` | the gate's text is delivered | "Rewritten before sending"; opening it shows the original |
+| `drop` / `digest` / `resolve` (proactive only) | **held**: never written to `jori_messages`, never pushed | a folded "Held: …" line in the conversation (after the last message before it), with the message it held and, for resolve, what it found |
+| gate error / timeout | delivered as written | "Check failed, sent as written" |
+
+Every line has **Right call / Wrong call** and a note. A reply to something the user wrote is only ever sent or rewritten.
+
+- **Routes:** `bin/jori-send-curl` (after every other gate, before the insert; regardless of `--skip-precheck`; `--agent chat` = reply; a held message prints `{"suppressed":true,"by":"speak-gate"}` to a `--capture-id` file and releases a P1 fold claim), `bin/choice` (the card's options are passed as fixed choices; a location card gets 90 s), `bin/role-session reply` (reply), `bin/jori-send.mjs`, and the phone-channel `reply` tool (reply; `message_file` replies, composed by a tool from the source of record, are not judged). With the gate live, phone-channel does not stream replies, since streamed text would be seen before review, and the older send-then-correct freshness pass runs only when the gate failed.
+- **Scope:** channels `chat` and `questions`; never `system`/`improvements`, never a test run.
+- **Budgets (live):** reply 60 s, proactive 240 s (`SPEAK_GATE_LIVE_TIMEOUT_S`).
+- **Storage:** `jori_gate_reviews` (migration 0184): own `id` key; `message_id` optional and unique; `original`, `live`, `held`. The app reloads on realtime changes to the table. A review that cannot be written is parked in `data/speak-gate-live-unrecorded.jsonl`.
+- **Off switch, no deploy:** `data/.speak-gate-off`, or `"live": false` in `agent/local/config/speak-gate.json`. Everything fails open.
+- **Not yet built:** a held `digest` is not rolled into the daily summary yet, and a held `resolve` does not yet hand its answer back to the role. Both are visible, folded, in the conversation. Emails to the user are still not gated.
+
+## Before wiring (open, as of the shadow week)
 
 - What happens to `resolve` (the role's next session gets the answer to record) and `digest` (the daily summary takes held items) in the live path.
 - The fixed allowlist of pure system alerts that replaces `--skip-precheck`.

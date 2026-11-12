@@ -54,13 +54,25 @@ for (let i = 0; i < args.length; i++) {
   else positional.push(a);
 }
 
-const message = positional.join(" ");
+let message = positional.join(" ");
 if (!message) {
   console.error("Usage: jori-send [--notify <summary>] [--silent] <message>");
   process.exit(1);
 }
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
+
+// The speak gate, before the user sees it (system/speak-gate.md § Live): a
+// rewrite is sent as the gate's text, a held message is not written at all.
+// Fails open.
+const { gateOutbound, recordReview } = await import("../lib/speak-gate-live.mjs");
+let gate = { deliver: true, text: message, review: null };
+try { gate = await gateOutbound({ message, kind: "proactive", channel: "chat", intent: process.env.JORI_JOB || "jori-send" }); } catch {}
+if (!gate.deliver) {
+  console.log(`Not sent: held by the speak gate (${gate.verdict}: ${gate.reason || ""}). The user sees it folded in the conversation.`);
+  process.exit(0);
+}
+message = gate.text || message;
 
 const { data: inserted, error } = await supabase.from("jori_messages").insert({
   role: "assistant",
@@ -72,6 +84,8 @@ if (error) {
   console.error(`Failed to insert: ${error.message}`);
   process.exit(1);
 }
+
+if (gate.review && inserted?.id) await recordReview(gate.review, inserted.id);
 
 console.log(`Message sent to ${createRequire(import.meta.url)("../lib/instance.cjs").assistantName()}.`);
 

@@ -1170,6 +1170,64 @@ case "$SENDER_ROLE" in
   ""|*[!a-z0-9-]*) ;;
   *) JSON_SENDER=",\"sender\":\"${SENDER_ROLE}\"" ;;
 esac
+# ─── Speak gate, live (think before you speak) ───────────────────────────
+# AFTER every gate above has decided to send, and BEFORE the insert and the
+# push: bin/speak-gate-live judges the message (true, could Jori settle it
+# itself, phrased right, worth the user's attention) and its verdict is acted
+# on. A rewrite is sent as the gate's text; drop / digest / resolve holds it
+# (never written, never pushed; the review row shows it, folded, in its
+# conversation). The review is linked to the inserted row below so the app can
+# show the verdict, with the original folded under it, for the user to grade.
+# The user, 2026-11-11: "it should be reviewed before i see it — not after";
+# "review and act". Runs whatever --skip-precheck says: that flag skipped the
+# old narrow check, not this one. Chat and questions channels only; not in a
+# test run. Fails open (a gate error sends as written). Off switch:
+# data/.speak-gate-off. Design: system/speak-gate.md § Live.
+SPEAK_GATE_LIVE="${JORI_SPEAK_GATE_LIVE_BIN:-$JORI_INSTALL_TOOLS/bin/speak-gate-live}"
+GATE_REVIEW_FILE=""
+if [ "$TEST_RUN" = false ] && { [ "$CHANNEL" = "chat" ] || [ "$CHANNEL" = "questions" ]; } && [ -f "$SPEAK_GATE_LIVE" ]; then
+  GATE_KIND=proactive
+  [ "$AGENT" = "chat" ] && GATE_KIND=reply
+  GATE_INPUT=$(GM="$MESSAGE" GS="${SENDER_ROLE:-}" GI="${INTENT:-}" GC="$CHANNEL" GK="$GATE_KIND" GCH="${CHOICES_JSON:-}" python3 -c '
+import json, os
+e = os.environ.get
+d = {"message": e("GM"), "sender": e("GS") or None, "intent": e("GI") or None, "channel": e("GC"), "kind": e("GK")}
+try:
+    c = json.loads(e("GCH") or "null")
+    opts = c.get("options") if isinstance(c, dict) else c
+    if isinstance(opts, list):
+        d["fixed_choices"] = [str(o.get("label", o)) if isinstance(o, dict) else str(o) for o in opts]
+except Exception:
+    pass
+print(json.dumps(d))' 2>/dev/null)
+  if [ -n "$GATE_INPUT" ]; then
+    GATE_OUT=$(printf '%s' "$GATE_INPUT" | "${JORI_NODE:-node}" "$SPEAK_GATE_LIVE" gate 2>/dev/null)
+    GATE_DELIVER=$(printf '%s' "$GATE_OUT" | python3 -c 'import json,sys
+try: print("no" if json.load(sys.stdin).get("deliver") is False else "yes")
+except Exception: print("yes")' 2>/dev/null)
+    if [ "$GATE_DELIVER" = "no" ]; then
+      GATE_VERDICT=$(printf '%s' "$GATE_OUT" | python3 -c 'import json,sys
+try: d=json.load(sys.stdin); print(d.get("verdict","held")+": "+(d.get("reason") or ""))
+except Exception: print("held")' 2>/dev/null)
+      echo "speak-gate: not sent — held by the gate ($GATE_VERDICT). The user sees it folded in the conversation and grades the call. Not an error; do not resend." >&2
+      if [ "$P1_FOLD_CLAIMED" = true ]; then node "$P1_FOLD" release --message "$P1_MESSAGE" > /dev/null 2>&1; fi
+      if [ -n "$CAPTURE_ID_FILE" ]; then
+        TMP_ID="${CAPTURE_ID_FILE}.tmp.$$"
+        printf '{"suppressed":true,"by":"speak-gate","reason":%s}\n' "$(printf '%s' "$GATE_VERDICT" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))')" > "$TMP_ID" \
+          && mv -f "$TMP_ID" "$CAPTURE_ID_FILE"
+      fi
+      exit 0
+    fi
+    GATE_TEXT=$(printf '%s' "$GATE_OUT" | python3 -c 'import json,sys
+try: print(json.load(sys.stdin).get("text",""), end="")
+except Exception: pass' 2>/dev/null)
+    [ -n "$GATE_TEXT" ] && MESSAGE="$GATE_TEXT"
+    GATE_REVIEW_FILE=$(printf '%s' "$GATE_OUT" | python3 -c 'import json,sys
+try: print(json.load(sys.stdin).get("review_file") or "")
+except Exception: pass' 2>/dev/null)
+  fi
+fi
+
 PUSH_TEXT="$MESSAGE"
 if [ ${#MEDIA[@]} -gt 0 ]; then
   for media_url in "${MEDIA[@]}"; do
@@ -1190,7 +1248,7 @@ JSON_CHANNEL=$(printf '%s' "$CHANNEL" | python3 -c 'import json,sys; print(json.
 # capture jori_messages.id and link the outbound ping to subsequent
 # tapback-reaction UPDATEs. Otherwise stay on the default return=minimal for
 # the cheaper path most callers want.
-if [ -n "$CAPTURE_ID_FILE" ]; then
+if [ -n "$CAPTURE_ID_FILE" ] || [ -n "$GATE_REVIEW_FILE" ]; then
   PREFER="return=representation"
 else
   PREFER="return=minimal"
@@ -1237,7 +1295,7 @@ print(",\"metadata\":" + json.dumps(m, ensure_ascii=False) if m else "")' 2>/dev
 fi
 
 RESP_BODY_FILE=""
-if [ -n "$CAPTURE_ID_FILE" ]; then
+if [ -n "$CAPTURE_ID_FILE" ] || [ -n "$GATE_REVIEW_FILE" ]; then
   RESP_BODY_FILE=$(mktemp -t jori-send.XXXXXX)
   HTTP_CODE=$(curl -s -o "$RESP_BODY_FILE" -w '%{http_code}' --max-time 10 \
     -X POST "${SUPABASE_URL}/rest/v1/jori_messages" \
@@ -1261,7 +1319,7 @@ if [ "$HTTP_CODE" = "201" ]; then
 
   # Write the inserted row id when requested. PostgREST returns a JSON array
   # ([{...row...}]) under return=representation, so extract data[0].id.
-  if [ -n "$CAPTURE_ID_FILE" ] && [ -s "$RESP_BODY_FILE" ]; then
+  if [ -n "$RESP_BODY_FILE" ] && [ -s "$RESP_BODY_FILE" ]; then
     MSG_ID=$(python3 -c 'import json,sys
 try:
   data = json.load(open(sys.argv[1]))
@@ -1269,7 +1327,11 @@ try:
   print(rows[0].get("id",""))
 except Exception:
   pass' "$RESP_BODY_FILE")
-    if [ -n "$MSG_ID" ]; then
+    # The speak gate's verdict, linked to the row it judged (shown under it).
+    if [ -n "$GATE_REVIEW_FILE" ]; then
+      "${JORI_NODE:-node}" "$SPEAK_GATE_LIVE" record "$GATE_REVIEW_FILE" "$MSG_ID" > /dev/null 2>&1 &
+    fi
+    if [ -n "$MSG_ID" ] && [ -n "$CAPTURE_ID_FILE" ]; then
       TMP_ID="${CAPTURE_ID_FILE}.tmp.$$"
       printf '%s\n' "$MSG_ID" > "$TMP_ID" && mv -f "$TMP_ID" "$CAPTURE_ID_FILE"
     fi

@@ -275,6 +275,7 @@ final class TeamStore: ObservableObject {
         let channel = SupabaseManager.shared.realtimeV2.channel("team_and_conversations")
         let team = channel.postgresChange(AnyAction.self, schema: "public", table: Self.teamTable)
         let conversations = channel.postgresChange(AnyAction.self, schema: "public", table: Self.conversationsTable)
+        let reviews = channel.postgresChange(AnyAction.self, schema: "public", table: Self.gateReviewsTable)
         await channel.subscribe()
         realtimeChannel = channel
         await withTaskGroup(of: Void.self) { group in
@@ -283,6 +284,14 @@ final class TeamStore: ObservableObject {
             }
             group.addTask { @MainActor [weak self] in
                 for await _ in conversations { await self?.loadConversations() }
+            }
+            // A speak-gate verdict (live: written seconds after its message;
+            // or a held message) shows at once.
+            group.addTask { @MainActor [weak self] in
+                for await _ in reviews {
+                    guard let self else { return }
+                    await self.loadGateReviews(self.activeConversation)
+                }
             }
         }
     }
@@ -340,11 +349,16 @@ final class TeamStore: ObservableObject {
         }
     }
 
-    // MARK: Gate reviews (shadow week, system/speak-gate.md)
+    // MARK: Gate reviews (system/speak-gate.md)
 
-    /// The think-before-you-speak gate's verdict on each message, judged in
-    /// shadow (nothing is held), shown under the message for the user to grade.
+    /// The think-before-you-speak gate's verdict on each delivered message,
+    /// shown folded under it for the user to grade. Since the gate went live
+    /// (2026-11-11) it judges before delivery and acts: a rewritten message
+    /// carries its original, folded until opened.
     @Published var gateReviews: [UUID: GateReview] = [:]
+    /// Messages the gate held (drop / digest / resolve): never delivered, so
+    /// they have no message row. Shown as a folded line in their conversation.
+    @Published var heldReviews: [String: [GateReview]] = [:]
     /// Every open question the badges count, by conversation (loadSummaries).
     @Published var openQuestionMessages: [String: [Message]] = [:]
     static let gateReviewsTable = "jori_gate_reviews"
@@ -355,30 +369,36 @@ final class TeamStore: ObservableObject {
             try await SupabaseManager.ensureAuthenticated()
             let rows: [GateReview] = try await SupabaseManager.shared
                 .from(Self.gateReviewsTable)
-                .select("message_id,verdict,reason,suggestion,grade,note")
+                .select("id,message_id,verdict,reason,suggestion,grade,note,original,live,held,judged_at")
                 .eq("conversation_id", value: conversationId)
                 .order("judged_at", ascending: false)
                 .limit(300)
                 .execute()
                 .value
             var next = gateReviews
-            for r in rows { next[r.message_id] = r }
+            for r in rows { if let mid = r.message_id { next[mid] = r } }
             if next != gateReviews { gateReviews = next }
+            let held = rows.filter { $0.held == true }.sorted { ($0.judged_at ?? .distantPast) < ($1.judged_at ?? .distantPast) }
+            if heldReviews[conversationId] != held { heldReviews[conversationId] = held }
         } catch {
             print("[Team] gate reviews load failed: \(error)")
         }
     }
 
-    /// The user's grade on one verdict: "right" or "wrong", with an optional note.
-    func gradeGate(_ messageId: UUID, grade: String, note: String) async {
-        if let r = gateReviews[messageId] { gateReviews[messageId] = r.graded(grade, note: note) }
+    /// The user's grade on one verdict: "right" or "wrong", with an optional
+    /// note. Keyed by the review's own id (a held message has no message row).
+    func gradeGate(_ reviewId: UUID, grade: String, note: String) async {
+        for (k, r) in gateReviews where r.id == reviewId { gateReviews[k] = r.graded(grade, note: note) }
+        for (c, list) in heldReviews where list.contains(where: { $0.id == reviewId }) {
+            heldReviews[c] = list.map { $0.id == reviewId ? $0.graded(grade, note: note) : $0 }
+        }
         struct Patch: Encodable { let grade: String; let note: String?; let graded_at: String }
         do {
             try await SupabaseManager.ensureAuthenticated()
             try await SupabaseManager.shared
                 .from(Self.gateReviewsTable)
                 .update(Patch(grade: grade, note: note.isEmpty ? nil : note, graded_at: Date().ISO8601Format()))
-                .eq("message_id", value: messageId.uuidString)
+                .eq("id", value: reviewId.uuidString)
                 .execute()
         } catch {
             print("[Team] gate grade failed: \(error)")
@@ -1292,21 +1312,42 @@ struct HiddenToolbarTitle: ViewModifier {
 #endif
 
 
-// MARK: - Gate review (shadow week)
+// MARK: - Gate review
 
-struct GateReview: Codable, Equatable {
-    let message_id: UUID
+struct GateReview: Codable, Equatable, Identifiable {
+    let id: UUID
+    let message_id: UUID?
     let verdict: String
     let reason: String?
     let suggestion: String?
     var grade: String?
     var note: String?
+    /// What the role wrote, when the gate judged it live (before delivery).
+    let original: String?
+    let live: Bool?
+    /// Held by the gate: never delivered.
+    let held: Bool?
+    let judged_at: Date?
 
     func graded(_ g: String, note n: String) -> GateReview {
         var c = self; c.grade = g; c.note = n.isEmpty ? nil : n; return c
     }
 
+    var isLive: Bool { live == true }
+    var isHeld: Bool { held == true }
+
     var verdictText: String {
+        if isLive {
+            switch verdict {
+            case "send": return "Checked, sent as written"
+            case "rewrite": return "Rewritten before sending"
+            case "resolve": return "Held: it could answer this itself"
+            case "digest": return "Held for the daily summary"
+            case "drop": return "Held: not worth sending"
+            case "error": return "Check failed, sent as written"
+            default: return "Checked"
+            }
+        }
         switch verdict {
         case "send": return "Would send as is"
         case "rewrite": return "Would rewrite"
@@ -1317,11 +1358,21 @@ struct GateReview: Codable, Equatable {
         }
     }
 
-    var suggestionLabel: String { verdict == "resolve" ? "What it found / would do" : "Would have sent instead" }
+    var suggestionLabel: String { verdict == "resolve" ? "What it found" : "Would have sent instead" }
+
+    /// The original, shown folded: for a rewrite (what was written before the
+    /// gate changed it) and for a held message (what was not sent).
+    var originalToShow: String? {
+        guard isLive, let o = original, !o.isEmpty else { return nil }
+        return (verdict == "rewrite" || isHeld) ? o : nil
+    }
+    var originalLabel: String { isHeld ? "The message it held" : "Original, before the rewrite" }
 }
 
-/// Under a message: what the gate would have done, why, and two buttons. Tap
-/// the line to see the reason and its suggested text.
+/// Under a message: what the gate did (or, in shadow, would have done), why,
+/// and two buttons. Tap the line to see the reason, the original (folded until
+/// then) and any suggestion. A held message has no bubble: this line stands
+/// alone in the conversation.
 struct GateReviewLine: View {
     let review: GateReview
     let onGrade: (String, String) -> Void
@@ -1335,6 +1386,7 @@ struct GateReviewLine: View {
         case "rewrite": return .orange
         case "resolve": return .blue
         case "digest": return .purple
+        case "error": return .gray
         default: return .red
         }
     }
@@ -1356,6 +1408,14 @@ struct GateReviewLine: View {
             if open {
                 if let r = review.reason, !r.isEmpty {
                     Text(r).font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                }
+                if let o = review.originalToShow {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(review.originalLabel).font(.caption2.weight(.semibold)).foregroundStyle(.secondary)
+                        Text(o).font(.caption).textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
+                    }
+                    .padding(8)
+                    .background(.quaternary.opacity(0.5), in: RoundedRectangle(cornerRadius: 8))
                 }
                 if let s = review.suggestion, !s.isEmpty {
                     VStack(alignment: .leading, spacing: 2) {

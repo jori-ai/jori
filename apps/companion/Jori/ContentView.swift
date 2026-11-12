@@ -895,6 +895,7 @@ struct ContentView: View {
         // from someone other than the conversation's own role.
         let conversationRole = ConversationID.roleId(viewModel.currentConversation)
         let multi = team.memberIds(of: viewModel.currentConversation).count > 1
+        let held = heldByAnchor(visible)
         loadOlderButton(hidden: all.count - visible.count)
         ForEach(visible) { message in
             let place = layout[message.id] ?? .solo
@@ -913,6 +914,15 @@ struct ContentView: View {
                     actions: actions
                 )
                 .equatable()
+                // What the speak gate held after this message: never
+                // delivered, so no bubble, just the folded line to grade.
+                ForEach(held[message.id] ?? []) { review in
+                    HStack(spacing: 0) {
+                        GateReviewLine(review: review) { grade, note in actions.gradeGate(review.id, grade, note) }
+                        Spacer(minLength: 56)
+                    }
+                    .padding(.top, 6)
+                }
             }
             .padding(.top, place.startsGroup && place.separator == nil ? 10 : 0)
             .modifier(OnScreenReader(id: message.id, tracked: viewModel.isOpenQuestion(message), onScreen: $onScreenQuestionIds))
@@ -934,6 +944,23 @@ struct ContentView: View {
             dismiss: { vm.dismissQuestion($0) },
             gradeGate: { id, grade, note in Task { await team.gradeGate(id, grade: grade, note: note) } }
         )
+    }
+
+    /// Messages the speak gate held have no row of their own: each is shown,
+    /// folded, under the last message before it was judged (or the last one
+    /// on screen). Ones older than the first message on screen wait for
+    /// "load older".
+    private func heldByAnchor(_ visible: [Message]) -> [UUID: [GateReview]] {
+        let list = team.heldReviews[viewModel.currentConversation] ?? []
+        guard !list.isEmpty, let first = visible.first else { return [:] }
+        var out: [UUID: [GateReview]] = [:]
+        for r in list {
+            let at = r.judged_at ?? .distantFuture
+            if at < first.createdAt { continue }
+            let anchor = visible.last(where: { $0.createdAt <= at }) ?? first
+            out[anchor.id, default: []].append(r)
+        }
+        return out
     }
 
     private func thread(for m: Message, senderLabel: String? = nil) -> BubbleThread {
@@ -2035,7 +2062,7 @@ struct MessageBubble: View, Equatable {
                     }
 
                     if let gate = thread.gate {
-                        GateReviewLine(review: gate) { grade, note in actions.gradeGate(message.id, grade, note) }
+                        GateReviewLine(review: gate) { grade, note in actions.gradeGate(gate.id, grade, note) }
                     }
                 }
 

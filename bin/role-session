@@ -115,11 +115,31 @@ async function reply() {
   const o = org.org();
   const role = roleById(roleId, o);
   if (!role) die(`no role ${roleId} on the team`, 3);
-  const row = { role: "assistant", content: String(text).trim(), read: false, conversation_id: conv, sender: roleId, channel: "chat", ...(replyTo ? { reply_to: replyTo } : {}) };
+  // The speak gate, before the user sees it (system/speak-gate.md § Live): a
+  // role's answer is a reply, so it is sent as written or as the gate's
+  // correction, never held. Fails open.
+  let body = String(text).trim();
+  let review = null;
+  try {
+    const { gateOutbound } = await import("../lib/speak-gate-live.mjs");
+    let replyToText = null;
+    try {
+      const q = replyTo
+        ? `/rest/v1/jori_messages?select=content&id=eq.${encodeURIComponent(replyTo)}`
+        : `/rest/v1/jori_messages?select=content&conversation_id=eq.${encodeURIComponent(conv)}&role=eq.user&order=created_at.desc&limit=1`;
+      const p = await rest.request(q);
+      replyToText = p && p[0] ? p[0].content : null;
+    } catch {}
+    const g = await gateOutbound({ message: body, sender: roleId, intent: `role:${roleId}`, channel: "chat", kind: "reply", reply_to_text: replyToText, conversation_id: conv });
+    if (g.deliver && g.text) body = g.text;
+    review = g.review;
+  } catch { /* gate unavailable: send as written */ }
+  const row = { role: "assistant", content: body, read: false, conversation_id: conv, sender: roleId, channel: "chat", ...(replyTo ? { reply_to: replyTo } : {}) };
   const out = await rest.request("/rest/v1/jori_messages", { method: "POST", body: row, prefer: "return=representation" });
   const id = Array.isArray(out) && out[0] ? out[0].id : null;
+  if (review && id) { const { recordReview } = await import("../lib/speak-gate-live.mjs"); await recordReview(review, id); }
   // The push names who answered. Fail-open: the message is already in the app.
-  spawnSync(path.join(ROOT, "bin", "jori-notify"), ["--title", org.signature(role), ...(id ? ["--message-id", id] : []), String(text).trim().slice(0, 300)],
+  spawnSync(path.join(ROOT, "bin", "jori-notify"), ["--title", org.signature(role), ...(id ? ["--message-id", id] : []), body.slice(0, 300)],
     { stdio: "ignore", timeout: 30000, env: { ...process.env, JORI_NO_SIGN: "1" } });
   console.log(JSON.stringify({ id, conversation: conv, sender: roleId }));
 }
