@@ -264,8 +264,7 @@ struct ContentView: View {
                 // Hidden, the sidebar folds to a rail of avatars instead of
                 // going away (Messages on the Mac does the same).
                 if isSidebarHidden {
-                    ConversationRail(team: team,
-                                     selected: memoryMode ? nil : viewModel.currentConversation,
+                    ConversationRail(team: team, chat: viewModel, inMemory: memoryMode,
                                      open: { go(.conversation($0)) },
                                      onDeleted: { gone in
                                          if viewModel.currentConversation == gone { go(.conversation(team.coordinatorConversation)) }

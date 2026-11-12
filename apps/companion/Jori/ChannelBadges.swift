@@ -962,7 +962,10 @@ struct PinnedConversationsGrid: View {
 /// what is waiting. Right-click pins, unpins or deletes.
 struct ConversationRail: View {
     @ObservedObject var team: TeamStore
-    var selected: String?
+    /// The conversation on screen is read from here by each tile itself.
+    @ObservedObject var chat: ChatViewModel
+    /// Memory is on screen: no conversation is highlighted.
+    var inMemory = false
     let open: (String) -> Void
     var onDeleted: (String) -> Void = { _ in }
 
@@ -970,7 +973,9 @@ struct ConversationRail: View {
 
     var body: some View {
         ScrollView(.vertical) {
-            LazyVStack(spacing: 4) {
+            // Not lazy: a lazy stack kept a stale tile, and the conversation
+            // just left stayed blue. A dozen tiles cost nothing to keep.
+            VStack(spacing: 4) {
                 ForEach(team.pinnedConversations) { item($0) }
                 if !team.pinnedConversations.isEmpty, !team.unpinnedConversations.isEmpty {
                     Capsule()
@@ -990,23 +995,24 @@ struct ConversationRail: View {
     }
 
     private func item(_ conversation: Conversation) -> some View {
-        RailItem(conversation: conversation, team: team,
-                 isSelected: selected == conversation.id,
+        RailItem(conversation: conversation, team: team, chat: chat, inMemory: inMemory,
                  open: open, onDeleted: onDeleted)
     }
 }
 
-/// One avatar in the rail. Its own view with `isSelected` as a plain value,
-/// and the blue tile only drawn when selected (not faded by opacity): with
-/// the tile kept and faded, the conversation just left could stay blue.
+/// One avatar in the rail. It watches the conversation on screen itself
+/// (not a value handed down), and draws the blue tile only while selected:
+/// handed down, the conversation just left could stay blue.
 private struct RailItem: View {
     let conversation: Conversation
     @ObservedObject var team: TeamStore
-    let isSelected: Bool
+    @ObservedObject var chat: ChatViewModel
+    let inMemory: Bool
     let open: (String) -> Void
     let onDeleted: (String) -> Void
 
     var body: some View {
+        let isSelected = !inMemory && chat.currentConversation == conversation.id
         let badge = team.badgeCount(conversation.id)
         let name = team.title(of: conversation.id)
         let role = team.subtitle(of: conversation.id)
