@@ -58,7 +58,7 @@ struct TeamMember: Identifiable, Codable, Equatable, Hashable {
     }
 
     /// "Ada · CFO": a name always travels with its role.
-    var label: String { "\(name) · \(title)" }
+    var label: String { title.isEmpty || title == name ? name : "\(name) · \(title)" }
 
     var initials: String {
         let parts = name.split(separator: " ")
