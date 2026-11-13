@@ -20,7 +20,10 @@
 //
 // --to accepts a comma-separated list (e.g. "a@x.com,b@y.com") so multiple
 // recipients land on the SAME message/thread (two recipients of one thread
-// need to see the same email, not two separate ones).
+// need to see the same email, not two separate ones). `me` in that list is the
+// owner's own address (`--to me`, `--to me,b@y.com`): agents write that, never
+// the address itself, or Claude Code's privacy plugin refuses the call
+// (lib/email-recipients.cjs).
 //
 //   email-send --check-delivery <email_id> [--wait <seconds>] [--interval <seconds>] [--json]
 //   email-send --check-delivery --subject "<exact subject>" [--wait …] [--json]
@@ -44,6 +47,7 @@ const require = createRequire(import.meta.url);
 const { loadEnv } = require("../lib/load-env.js");
 const { guessMimeType } = require("../lib/mime-types.js");
 const { instance } = require("../lib/instance.cjs");
+const { resolveRecipients } = require("../lib/email-recipients.cjs");
 
 loadEnv();
 
@@ -96,6 +100,15 @@ function parseArgs(argv) {
     else if (k === "-h" || k === "--help") { printUsage(); process.exit(0); }
     else { console.error(`email-send: unknown flag: ${k}`); process.exit(1); }
   }
+  // `--to me` is the owner's own address, filled in here so an agent never
+  // types it into a command (lib/email-recipients.cjs says why). Resolved
+  // before signing: the role signature asks whether the owner is the only
+  // recipient.
+  if (a.to) {
+    const r = resolveRecipients(a.to, OWNER_ADDRESS);
+    if (r.error) { console.error(`email-send: --to: ${r.error}`); process.exit(1); }
+    a.to = r.list.join(",");
+  }
   // Same guard as gmail-action: a markup body is HTML even without --html.
   if (!a.html && a.body && looksLikeHtml(a.body)) a.html = true;
   // The team role that owns the sending job signs it (lib/org.cjs, system/org.md):
@@ -130,8 +143,9 @@ function looksLikeHtml(body) {
 function printUsage() {
   console.log(`email-send — send mail via smtp2go as ${DEFAULT_FROM_NAME}
 Usage:
-  email-send --to <addr> --subject <s> (--body <text> | --body-file <path>)
+  email-send --to <addr|me>[,<addr>...] --subject <s> (--body <text> | --body-file <path>)
              [--html] [--attach <file>]...
+             (me = the owner's own address; write it instead of the address)
              [--from <addr>] [--from-name <name>]
              [--reply-to <addr>] [--no-reply-to]
              [--sign <job> [--role-from]]   --role-from: From the job's role even with a second recipient

@@ -116,6 +116,7 @@ The harvest anchors it to every stop that window touches and the narrator states
 ```
 
 - Use `payload.message_id` verbatim. If `payload.references` is null, `--references` is just `payload.message_id`.
+- **When `payload.from` is the user, write `--to me`**, never their address: Claude Code's built-in privacy plugin refuses a call that holds it next to a link (`docs/outbound-messaging.md` § The account-address guard; a reply with a link in its body was refused this way on 2026-11-12). Write the body file in its own call either way.
 - Reply-To defaults to Jori's own address, so the back-and-forth keeps routing through the Worker.
 - `email-send` records the reply in `data/jori-sent-mail.jsonl`; the handled-log row was written by code at intake. Nothing else to log.
 

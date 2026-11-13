@@ -143,7 +143,7 @@ Ops-agent-only. The ruleset lives in **`agent/ops-agent/email-triage-rules.md`**
 
 ## Outbound Email Policy
 
-- **Default — agent-originated to the user:** `~/Dev/jori/bin/email-send --to <the user's address> --subject "…" --body-file … --html` (ships as Jori from Jori's own address, Reply-To the user). No dash gate.
+- **Default — agent-originated to the user:** `~/Dev/jori/bin/email-send --to me --subject "…" --body-file … --html` (ships as Jori from Jori's own address, Reply-To the user). No dash gate. **`me` is the user's own address, filled in by the tool (also in a list: `--to me,other@…`). Never type their address into a command or a ping's text:** Claude Code's built-in privacy plugin refuses a headless call that holds it next to a link or a network word (`https`, `curl`, …; `docs/outbound-messaging.md` § The account-address guard).
 - **On behalf of the user to a third party — only when they explicitly ask** ("email the contractor"): `gmail-action send "recipient@…" "Subject" "Body" --from <the user's address> --from-name "<the user's full name>"`. Without `--from` the binary refuses. This path hard-blocks em/en dashes (override `GMAIL_ACTION_ALLOW_DASHES=1` only for verbatim paste-through).
 - **HTML bodies:** both `email-send` and `gmail-action send` auto-detect a markup body (opens with a tag or has block-level closing tags) and send it as `text/html` even without `--html` (2026-10-07: a plan email went out as raw tags). Still pass `--html` explicitly.
 - **Never:** `gmail-action send` for agent-originated email; a Gmail draft as notification/fallback; default to the user's Gmail identity without an explicit third-party instruction; fall back to Slack or Gmail drafts when phone-channel is down (use `email-send`).
