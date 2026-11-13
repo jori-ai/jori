@@ -206,3 +206,24 @@ test("a page title keeps an amount off the page while the user's list keeps thei
   pt.updateTask(l, t.id, { page_title: "" }, { now: NOW });
   assert.ok(pt.renderTasksSection(l, "p", { now: NOW }).includes("$2k"));
 });
+
+test("a completion Jori's own job pushed to the list is told apart from the user's tick", () => {
+  const l = fresh();
+  const a = pt.addTask(l, { project: "project_x", title: "Book the car for the trip", owner: "user", due: "2026-11-20", why: "(gap)" }, { now: NOW });
+  const b = pt.addTask(l, { project: "project_x", title: "Renew the parking permit", owner: "user", due: "2026-11-21", why: "(gap)" }, { now: NOW });
+  const c = pt.addTask(l, { project: "project_x", title: "Pay the deposit for the venue", owner: "user", due: "2026-11-22", why: "(gap)" }, { now: NOW });
+  const t0 = Date.parse("2026-11-12T09:43:39Z");
+  pt.closeTask(l, a.id, { status: "done", note: "approved", by: "dream:2026-11-11", now: t0 });
+  pt.closeTask(l, b.id, { status: "done", note: "they said so", by: "chat", now: t0 });
+  pt.closeTask(l, c.id, { status: "done", note: "the nightly pass", by: "projects", now: t0 });
+  l.tasks[c.id].gtask = { id: "g-c" };
+  const test = pt.joriCompletionTest(l);
+  const at = "2026-11-12T09:43:57.000Z";
+  assert.equal(test({ id: "g1", notes: `why\n\n${pt.MARKER(a.id)}`, completed: at }), true);   // by the marker
+  assert.equal(test({ id: "g-c", notes: null, completed: at }), true);                        // by the linked id
+  assert.equal(test({ id: "g2", notes: pt.MARKER(b.id), completed: at }), false);             // chat is the user's word
+  assert.equal(test({ id: "g3", notes: pt.MARKER(a.id), completed: "2026-11-12T08:00:00.000Z" }), false); // the user got there first
+  assert.equal(test({ id: "g4", notes: "no marker", completed: at }), false);                 // not a project task
+  assert.equal(test({ id: "g5", notes: pt.MARKER(a.id), completed: "not a date" }), false);   // unreadable: not hidden
+  assert.equal(pt.joriCompletionTest({})({ id: "g6", notes: pt.MARKER(a.id), completed: at }), false); // empty ledger
+});
