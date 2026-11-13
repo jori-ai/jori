@@ -545,15 +545,23 @@ disk_free_probe() {
 # disk page, after its stable prefix. Sizes <snapshot_dir> with `du -sk` (that
 # one directory, nothing wider), and is only ever called while composing a page,
 # so a healthy tick never walks a directory. Read-only like the probe.
+#
+# The snapshot folder is named as the lead only while it is big enough to be one
+# (WATCHDOG_DISK_SNAPSHOT_LEAD_GIB, default 8, above the few GiB its retention
+# keeps). Below that it is unlikely to be the cause, so the page says how to
+# tell a sudden drop from a slow one instead. Both branches stay under the ~350
+# character page limit.
 disk_alert_body() {
-  local free="$1" pct="$2" dir="$3" kb snap
+  local free="$1" pct="$2" dir="$3" kb lead lead_kb lead_text
   kb=$(du -sk "$dir" 2>/dev/null | awk 'NR == 1 { print $1 }')
-  if [[ "$kb" =~ ^[0-9]+$ ]]; then
-    snap="data/memory-db-snapshots holds $(awk -v k="$kb" 'BEGIN { printf "%.1f", k / 1048576 }') GiB of hourly memory-DB copies (they have filled the disk before)."
+  lead=$(_disk_gib_threshold "$WATCHDOG_DISK_SNAPSHOT_LEAD_GIB" 8)
+  lead_kb=$(( lead * 1048576 ))
+  if [[ "$kb" =~ ^[0-9]+$ ]] && [ "$kb" -ge "$lead_kb" ]; then
+    lead_text="data/memory-db-snapshots holds $(awk -v k="$kb" 'BEGIN { printf "%.1f", k / 1048576 }') GiB of hourly memory-DB copies (they have filled the disk before)."
   else
-    snap="data/memory-db-snapshots (hourly memory-DB copies, which have filled the disk before) could not be measured."
+    lead_text="A sudden drop that clears within the hour is usually an OS update, a build or a download; a steady fall means a folder keeps growing."
   fi
-  echo "${free} GiB free on the data volume (${pct}% used). $snap Nothing was deleted. When space runs out, downloads to ${JORI_HOST_LABEL:-the host} stall and database and log writes start failing."
+  echo "${free} GiB free on the data volume (${pct}% used). $lead_text Nothing was deleted. When space runs out, downloads to ${JORI_HOST_LABEL:-the host} stall and database and log writes start failing."
 }
 
 # chat_backlog_restart_note <startedAt> <queueDepth> <queueRestored> — run on
@@ -2675,7 +2683,8 @@ fi
 # deletes, prunes or moves a file. What may be thrown away, backups above all,
 # is an operator decision, and the fix for a filling disk is to find what is
 # growing and stop it, not to delete whatever is biggest. The page names the
-# folder that filled it last time so that search starts in the right place.
+# snapshot folder that filled it before only while that folder is big enough to
+# be the lead again; otherwise it says how to read the drop (disk_alert_body).
 DISK_SNAPSHOT_DIR="$HOME/Dev/jori/data/memory-db-snapshots"
 read -r DISK_LEVEL DISK_FREE_GIB DISK_USED_PCT DISK_DETAIL <<< "$(disk_free_probe "$HOME/Dev/jori/data")"
 case "$DISK_LEVEL" in

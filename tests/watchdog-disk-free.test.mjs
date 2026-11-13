@@ -371,17 +371,59 @@ test("an unreadable df neither counts toward a page nor clears an incident", () 
   }
 });
 
-test("when du cannot size the snapshot folder the page says so and still goes out", () => {
+test("when du cannot size the snapshot folder the page still goes out, claims no size and does not name it as the lead", () => {
   const t = ticker();
   try {
     t.tick(CRIT, { duOut: "", duRc: 1 });
     const r = t.tick(CRIT, { duOut: "", duRc: 1 });
     assert.equal(r.pages.length, 1);
-    assert.ok(r.pages[0].includes("data/memory-db-snapshots (hourly memory-DB copies, which have filled the disk before) could not be measured."), r.pages[0]);
+    assert.ok(!r.pages[0].includes("data/memory-db-snapshots"), r.pages[0]);
+    assert.ok(r.pages[0].includes("A sudden drop that clears within the hour is usually an OS update, a build or a download"), r.pages[0]);
     assert.ok([...r.pages[0]].length < 350);
   } finally {
     t.cleanup();
   }
+});
+
+// WATCHDOG DISK PAGE NAMED THE WRONG SUSPECT: the page always led with the
+// snapshot folder, even when it held only the few GiB its retention keeps and
+// the drop came from something else (an OS update staging its download).
+test("a small snapshot folder is not named as the lead; the page says how to read the drop instead", () => {
+  const t = ticker();
+  try {
+    const small = `${gib(5.8)}\t/x/data/memory-db-snapshots`;
+    t.tick(LOW, { duOut: small });
+    const r = t.tick(LOW, { duOut: small });
+    assert.equal(r.pages.length, 1);
+    const page = r.pages[0];
+    assert.ok(page.startsWith("⚠️ Server disk space low: 20.0 GiB free on the data volume (96% used)."), page);
+    assert.ok(!page.includes("data/memory-db-snapshots"), page);
+    assert.ok(page.includes("A sudden drop that clears within the hour is usually an OS update, a build or a download; a steady fall means a folder keeps growing."), page);
+    assert.ok(page.includes("Nothing was deleted."), page);
+    assert.ok(page.includes("database and log writes start failing"), page);
+    assert.ok([...page].length < 350, `page must stay under ~350 characters, got ${[...page].length}`);
+    assert.equal(r.duCalls.length, 1, "du still sizes that one directory only");
+  } finally {
+    t.cleanup();
+  }
+});
+
+test("the snapshot folder is named as the lead from 8 GiB up, and the line is overridable", () => {
+  const at = (gibs, env = {}) => {
+    const t = ticker();
+    try {
+      const du = `${gib(gibs)}\t/x/data/memory-db-snapshots`;
+      t.tick(LOW, { duOut: du, env });
+      return t.tick(LOW, { duOut: du, env }).pages[0];
+    } finally {
+      t.cleanup();
+    }
+  };
+  assert.ok(at(8).includes("data/memory-db-snapshots holds 8.0 GiB"), "exactly 8 GiB is the lead");
+  assert.ok(!at(7.9).includes("data/memory-db-snapshots"), "just under 8 GiB is not");
+  assert.ok(at(3, { WATCHDOG_DISK_SNAPSHOT_LEAD_GIB: "2" }).includes("data/memory-db-snapshots holds 3.0 GiB"), "the line follows the environment");
+  assert.ok(!at(40, { WATCHDOG_DISK_SNAPSHOT_LEAD_GIB: "50" }).includes("data/memory-db-snapshots"), "a higher line hides a smaller folder");
+  assert.ok(at(40, { WATCHDOG_DISK_SNAPSHOT_LEAD_GIB: "oops" }).includes("data/memory-db-snapshots holds 40.0 GiB"), "a typo falls back to 8");
 });
 
 test("env thresholds also drive the section and its recovery wording", () => {
