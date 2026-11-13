@@ -1567,7 +1567,32 @@ if [ "$MAX_AUTH_PROBE_STATE" = "fail" ] && [ -f "$INCIDENT_DIR/auth-outage.keych
    && [ "$(stat -f%m "$INCIDENT_DIR/auth-outage.keychain_healed" 2>/dev/null || echo 0)" -ge "$MAX_AUTH_PROBE_TS" ]; then
   MAX_AUTH_PROBE_STATE=pre-heal
 fi
-if [ -n "$AUTH_HIT" ]; then
+# One failed turn is not an outage. A supervisor pauses and pages for itself only
+# after AUTH_FAIL_THRESHOLD (3, supervisor/index.mjs) consecutive failures, so the
+# "#N" in its AUTH ERROR line says how far along it is. When the newest line is
+# #1 or #2, is not a credential failure (an upstream HTTP error such as a
+# Cloudflare "Attention Required!" 403 block page), and the launchd sign-in check
+# (the context that reads the credentials; fresh and signed in) says the login is
+# fine, paging 🔴 "run claude /login" is wrong: /login cannot fix it and the next
+# turn usually succeeds. Hold quietly instead; a repeat (#3, the supervisor's own
+# page), a credential-shaped error, or a signed-out check still pages as before.
+# Never while an outage is already paged (its re-page cadence is unchanged).
+# Defends: "🔴 Max auth is DOWN ... 403 Attention Required! | Cloudflare" paged on
+# one blip while the login was healthy.
+AUTH_BLIP=0
+if [ -n "$AUTH_HIT" ] && [ "$MAX_AUTH_PROBE_STATE" = "ok" ] && [ ! -f "$INCIDENT_DIR/auth-outage.alerted" ]; then
+  _blip_line=$(grep 'AUTH ERROR' "$AUTH_HIT" 2>/dev/null | tail -1)
+  _blip_n=$(printf '%s' "$_blip_line" | sed -nE 's/^.*AUTH ERROR #([0-9]+): .*$/\1/p')
+  # lang-regex-ok: matches the CLI's own machine-written error text, not anything the user said
+  if [[ "$_blip_n" =~ ^[0-9]+$ ]] && [ "$_blip_n" -lt 3 ] \
+     && ! printf '%s' "$_blip_line" | grep -qiE 'oauth|not logged in|log ?in|keychain|authentication_error|401'; then
+    AUTH_BLIP=1
+  fi
+fi
+if [ "$AUTH_BLIP" = "1" ]; then
+  log "Max auth: one supervisor turn hit a non-credential error (AUTH ERROR #$_blip_n in $(basename "$AUTH_HIT")) below the supervisor's own pause threshold, and the launchd sign-in check reads signed in — not paging; a repeat or a signed-out check will"
+  AUTH_OUTAGE_HELD=1   # defers the daily-summary backfill one tick, like the keychain-healed deferral
+elif [ -n "$AUTH_HIT" ]; then
   log "Max auth outage: recent 'AUTH ERROR / Not logged in' in $(basename "$AUTH_HIT") — backend stalled"
   ISSUES="$ISSUES auth(not-logged-in)"
   AUTH_OUTAGE_HELD=1   # held through the keychain-healed deferral too
