@@ -937,7 +937,6 @@ struct ContentView: View {
         // from someone other than the conversation's own role.
         let conversationRole = ConversationID.roleId(viewModel.currentConversation)
         let multi = team.memberIds(of: viewModel.currentConversation).count > 1
-        let held = heldByAnchor(visible)
         loadOlderButton(hidden: all.count - visible.count)
         ForEach(visible) { message in
             let place = layout[message.id] ?? .solo
@@ -956,15 +955,6 @@ struct ContentView: View {
                     actions: actions
                 )
                 .equatable()
-                // What the speak gate held after this message: never
-                // delivered, so no bubble, just the folded line to grade.
-                ForEach(held[message.id] ?? []) { review in
-                    HStack(spacing: 0) {
-                        GateReviewLine(review: review) { grade, note in actions.gradeGate(review.id, grade, note) }
-                        Spacer(minLength: 56)
-                    }
-                    .padding(.top, 6)
-                }
             }
             .padding(.top, place.startsGroup && place.separator == nil ? 10 : 0)
             .modifier(OnScreenReader(id: message.id, tracked: viewModel.isOpenQuestion(message), onScreen: $onScreenQuestionIds))
@@ -983,32 +973,13 @@ struct ContentView: View {
             answer: { label, parent in Task { await vm.sendMessage(label, replyTo: parent) } },
             toggleChecklist: { label, on, id in vm.toggleChecklistItem(label, checked: on, on: id) },
             resolveParent: { vm.resolveQuotedParent($0) },
-            dismiss: { vm.dismissQuestion($0) },
-            gradeGate: { id, grade, note in Task { await team.gradeGate(id, grade: grade, note: note) } }
+            dismiss: { vm.dismissQuestion($0) }
         )
-    }
-
-    /// Messages the speak gate held have no row of their own: each is shown,
-    /// folded, under the last message before it was judged (or the last one
-    /// on screen). Ones older than the first message on screen wait for
-    /// "load older".
-    private func heldByAnchor(_ visible: [Message]) -> [UUID: [GateReview]] {
-        let list = team.heldReviews[viewModel.currentConversation] ?? []
-        guard !list.isEmpty, let first = visible.first else { return [:] }
-        var out: [UUID: [GateReview]] = [:]
-        for r in list {
-            let at = r.judged_at ?? .distantFuture
-            if at < first.createdAt { continue }
-            let anchor = visible.last(where: { $0.createdAt <= at }) ?? first
-            out[anchor.id, default: []].append(r)
-        }
-        return out
     }
 
     private func thread(for m: Message, senderLabel: String? = nil) -> BubbleThread {
         var t = BubbleThread()
         t.senderLabel = senderLabel
-        if m.isAssistant { t.gate = team.gateReviews[m.id] }
         if let parent = m.replyTo { t.quotedParent = viewModel.quotedParent(parent) }
         if m.isUser {
             t.notPickedUp = viewModel.isNotPickedUp(m.id)
@@ -1968,8 +1939,6 @@ struct BubbleThread: Equatable {
     var notPickedUp = false
     /// "Ada · CFO" over the first bubble of a run, where it isn't obvious who is speaking.
     var senderLabel: String?
-    /// The speak gate's shadow verdict on this message, for the user to grade.
-    var gate: GateReview?
 }
 
 /// What a bubble can ask the conversation to do.
@@ -1982,7 +1951,6 @@ struct BubbleActions {
     var toggleChecklist: (String, Bool, UUID) -> Void
     var resolveParent: (UUID) -> Void
     var dismiss: (Message) -> Void
-    var gradeGate: (UUID, String, String) -> Void = { _, _, _ in }
 }
 
 /// Equatable on its inputs (the closures are deliberately left out — they
@@ -2094,10 +2062,6 @@ struct MessageBubble: View, Equatable {
                     if thread.notPickedUp {
                         notPickedUpLine
                             .transition(.opacity)
-                    }
-
-                    if let gate = thread.gate {
-                        GateReviewLine(review: gate) { grade, note in actions.gradeGate(gate.id, grade, note) }
                     }
                 }
 

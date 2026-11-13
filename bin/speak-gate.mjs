@@ -57,30 +57,24 @@
 //      SPEAK_GATE_TIMEOUT_S (proactive 300, reply 120).
 "use strict";
 
-import { spawnSync, execFile } from "node:child_process";
+import { spawnSync } from "node:child_process";
 import { appendFileSync, mkdirSync, readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import os from "node:os";
 import path from "node:path";
 import { createRequire } from "node:module";
-import { maxOnlyEnv, DEFAULT_CLAUDE_BIN } from "../lib/jev-claude.mjs";
-import { extractJsonObject } from "../lib/extract-json.mjs";
 import { resolvedAnswers } from "../lib/speak-gate-live.mjs";
+import { OWNER, ASSISTANT, TOOLS_DOC, webAllowed as webAllowedFor, runAgent, lastJson, readLessons } from "../lib/speak-gate-agent.mjs";
 
 const require = createRequire(import.meta.url);
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const { MODELS } = require(path.join(ROOT, "lib", "models.cjs"));
-const { instance, localConfig } = require(path.join(ROOT, "lib", "instance.cjs"));
+const { localConfig } = require(path.join(ROOT, "lib", "instance.cjs"));
 try { require(path.join(ROOT, "lib", "load-env.js")).loadEnv(); } catch { /* env may be set */ }
 const rest = require(path.join(ROOT, "lib", "supabase-rest.js"));
 let org = null;
 try { org = require(path.join(ROOT, "lib", "org.cjs")); } catch { /* no team: names fall back to ids */ }
 
-const OWNER = instance().owner_name || "the user";
-const ASSISTANT = instance().assistant_name || "Jori"; // control-scan-ok: the setting's default
 const LOG = process.env.SPEAK_GATE_LOG || path.join(ROOT, "data", "speak-gate-log.jsonl");
-const GOG = process.env.SPEAK_GATE_GOG_BIN || "/opt/homebrew/bin/gog";
-const CLAUDE_BIN = process.env.SPEAK_GATE_CLAUDE_BIN || DEFAULT_CLAUDE_BIN;
 const VERDICTS = ["send", "rewrite", "resolve", "digest", "drop"];
 // SPEAK_GATE_CONFIG: a config file to read instead (a staged replay).
 const CFG = process.env.SPEAK_GATE_CONFIG
@@ -148,68 +142,10 @@ async function openQuestions(asOf) {
   } catch { return ""; }
 }
 
-// ─── The research agent's tools (read-only) ────────────────────────────────
-
-const B = (name) => path.join(ROOT, "bin", name);
-const TOOLS_DOC = `READ-ONLY TOOLS (use them; a verdict without research is not acceptable). Call each by its FULL PATH as written, never after \`cd\`; pipe only into head, tail, grep, jq, wc, sort, uniq, cut or tr. Anything else is refused.:
-- ${B("db-read")} tables | ${B("db-read")} <table> "<postgrest query>"   every database table (messages, location history, health samples, finance, Plaid transactions, receipts, Amazon orders, trips, …). Start with \`tables\` when unsure where something lives.
-- ${B("recall")} "<question>"   one search across chat, wiki, inbox and ${OWNER}'s replies.
-- ${B("jori-messages-search")} "<text>" --k 8   semantic search of every message between ${OWNER} and ${ASSISTANT}.
-- ${B("wiki")} search "<q>" --k 5 | ${B("wiki")} read <id>   long-term memory.
-- ${B("rentals")} <overview|property|tenants|tenant|leases|accounts|transactions|pnl|orders|order|receipts> …   the rental portfolio's books (tenants, leases, ledger, Amazon orders, receipts). \`${B("rentals")} help\` lists options.
-- ${B("location-day")} <YYYY-MM-DD>   where ${OWNER} went that day, legs and modes, with step counts (walked or rode).
-- ${B("findme")} history <YYYY-MM-DD>   the raw location timeline.
-- ${B("travel")} where <date> | ${B("travel")} list   the travel timeline (the authority on where ${OWNER} is).
-- ${B("finance-facts")} questions | ${B("finance-facts")} list <txn|income|payment|move|exception>   what the finance review recorded.
-- ${GOG} calendar list --json --results-only --from <iso> --to <iso> --all
-- ${GOG} gmail search "<gmail query>" --max 10   email.
-- ${GOG} tasks list <list>   task lists.
-- Read / Grep / Glob over ${ROOT} (logs under agent/logs, data stores under data/). Secrets are off limits.
-- WebSearch / WebFetch (when offered)   the outside world (an event's lineup, a price, a business, a date). NEVER put ${OWNER}'s personal data in a web query: no account numbers, amounts, balances, health values, addresses or names of people he knows. Search for the public thing (the band, the venue, the company), never for the person.`;
-
-// Bank and health content is Jori-model-only and never goes into an outbound
-// web request (agent/CLAUDE.md § Financial Operations rule 5, § Health): a
-// message from a money or health role, or with a private intent, is
-// researched without WebSearch/WebFetch. Every other run is told never to put
-// personal data into a web query.
-const NO_WEB_ROLES = new Set(CFG.no_web_roles || ["cfo", "health-coach"]);
-const PRIVATE_PREFIXES = ["bank", "health", "net-worth", "property", "finance", "fin-", "hum:finance", "hum:stocks", "portfolio", "plaid", "broker"];
-function webAllowed(input) {
-  if (NO_WEB_ROLES.has(String(input.sender || ""))) return false;
-  const i = String(input.intent || "").toLowerCase();
-  return !PRIVATE_PREFIXES.some((p) => i.startsWith(p));
-}
-
-function agentArgs(model, effort, web = true) {
-  const bash = ["db-read", "recall", "jori-messages-search", "wiki", "rentals", "location-day", "travel", "finance-facts"]
-    .map((b) => `Bash(${B(b)}:*)`)
-    .concat([`Bash(${B("findme")} history:*)`, `Bash(${GOG} calendar list:*)`, `Bash(${GOG} gmail search:*)`, `Bash(${GOG} tasks list:*)`])
-    // Read-only filters, so `… | head` or `… | jq` is not refused whole (the
-    // first research replay lost most of its shell calls to an unlisted pipe).
-    .concat(["head", "tail", "jq", "wc", "sort", "uniq", "cut", "grep", "tr"].map((f) => `Bash(${f}:*)`));
-  return [
-    "-p", "--model", model, "--effort", effort,
-    "--tools", web ? "Bash,Read,Grep,Glob,WebSearch,WebFetch" : "Bash,Read,Grep,Glob",
-    "--allowedTools", ["Read", "Grep", "Glob", ...(web ? ["WebSearch", "WebFetch"] : []), ...bash].join(","),
-    "--disallowedTools", ["Read(**/.env*)", "Grep(**/.env*)", "Read(**/*oauth*)", "Read(**/*secret*)", "Read(**/*.key)", "Read(**/*.pem)", "Read(**/.ssh/**)"].join(","),
-    "--permission-mode", "dontAsk",
-    "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}',
-    "--setting-sources", "project",
-    "--add-dir", ROOT,
-    "--no-session-persistence",
-    "--output-format", "text",
-  ];
-}
-
-function runAgent(prompt, { model, effort, timeoutMs, web }) {
-  return new Promise((resolve) => {
-    const child = execFile(CLAUDE_BIN, agentArgs(model, effort, web),
-      { encoding: "utf8", timeout: timeoutMs, maxBuffer: 4 * 1024 * 1024, cwd: os.tmpdir(), env: maxOnlyEnv() },
-      (err, stdout) => resolve({ text: String(stdout || "").trim(), err }));
-    child.stdin.on("error", () => {});
-    child.stdin.end(prompt);
-  });
-}
+// The research session and its tools live in lib/speak-gate-agent.mjs (shared
+// with the nightly audit). Money and health messages are researched without
+// the web.
+const webAllowed = (input) => webAllowedFor(input, CFG);
 
 // ─── The judge ──────────────────────────────────────────────────────────────
 
@@ -224,6 +160,9 @@ function prompt(input, ev, extra) {
   const reply = input.kind === "reply" || input.kind === "report";
   const E = (title, body) => (body && String(body).trim() ? `\n## ${title}\n${String(body).trim()}\n` : "");
   const rules = (CFG.standing_rules || []).map((r) => `- ${r}`).join("\n");
+  // The nightly audit's feedback (bin/speak-gate-audit.mjs): an Opus review of
+  // this gate's past decisions, distilled into lessons.
+  const lessons = readLessons().map((l) => `- ${l.text}`).join("\n");
   const checks = input.kind === "report"
     ? `This is a REPORT EMAIL ${OWNER} set up (a scheduled brief, summary or report), shown as text. Two questions:
 1. TRUE — verify its factual claims against the sources (tools below), the ones that matter most first. A claim the sources contradict, or a hedge where the answer is findable, must be fixed.
@@ -247,18 +186,12 @@ ${checks}
 RESEARCH FIRST. Use the tools to verify the claims and look for answers before you decide; check several sources, not one. Budget: a few minutes. You cannot change anything, and must not try.
 
 ${TOOLS_DOC}
-${rules ? `\n## ${OWNER.toUpperCase()}'S STANDING RULES (their own words; they override your judgment)\n${rules}\n` : ""}
+${rules ? `\n## ${OWNER.toUpperCase()}'S STANDING RULES (their own words; they override your judgment)\n${rules}\n` : ""}${lessons ? `\n## LESSONS FROM THE NIGHTLY AUDIT (a senior reviewer re-checked your past decisions; apply these. ${OWNER}'s standing rules win over them)\n${lessons}\n` : ""}
 THE MESSAGE:
 """${input.message}"""
 ${E("TAPPABLE CHOICES SENT WITH IT (fixed: a rewrite must still be a question these answer)", Array.isArray(input.fixed_choices) ? input.fixed_choices.join(" | ") : "")}${reply ? E(`WHAT ${OWNER.toUpperCase()} WROTE (being answered)`, input.reply_to_text) : ""}${E("THIS ROLE'S CONVERSATION, LAST 14 DAYS (question states are authoritative)", extra.thread)}${E("QUESTIONS STILL OPEN (any role)", extra.open)}${E("ANSWERS THIS GATE ALREADY FOUND (a question it held because it found the answer; asking one again is a re-ask: resolve it with the same answer)", extra.found)}${E(`WHAT ${OWNER.toUpperCase()} SAID (dated, from the reply log)`, ev.owner_said)}${E("TRAVEL TIMELINE FACTS", ev.authoritative_facts)}${E("TRAVEL CHECK FLAGGED (code paired a place and a date; decide yourself whether the message actually claims where the user is)", ev.travel_check_flagged)}${E("LONG-TERM MEMORY (wiki hits)", ev.long_term_memory)}${E("TOPICS ACKNOWLEDGED IN THE LAST 48H", ev.acknowledged_topics_48h)}${E("PINGS ALREADY SENT TODAY", ev.hum_pings_today)}${E("SENDER'S SUPPORTING DATA", ev.supporting_data)}${E("CHAT, LAST 8H", ev.transcript_last_8h)}${E("CALENDAR, REST OF TODAY", ev.calendar_today)}
 When done, end your answer with ONE LINE of compact JSON (nothing after it):
 {"verdict":"${reply ? "send|rewrite" : "send|rewrite|resolve|digest|drop"}","message":"<the rewritten text, only for rewrite>","research_plan":"<only for resolve: the answer you found and its source, or what is left to do>","checks":{"true":"ok|<problem>","${reply ? "phrasing" : "self_resolve"}":"ok|<problem>"${reply ? "" : ',"phrasing":"ok|<problem>","value":"ok|<problem>"'}},"sources":["<each source you checked, short>"],"reason":"<≤200 chars>"}`;
-}
-
-function lastJson(text) {
-  const lines = String(text).trim().split("\n").reverse();
-  for (const l of lines) { const t = l.trim(); if (t.startsWith("{") && t.endsWith("}")) { try { return JSON.parse(t); } catch {} } }
-  try { return extractJsonObject(text); } catch { return null; }
 }
 
 async function judge(input, ev, extra) {

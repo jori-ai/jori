@@ -2,6 +2,8 @@
 
 **Status (2026-11-11): LIVE.** Every message to the user in the app is judged by `bin/speak-gate.mjs` BEFORE it is written or pushed, and the verdict is acted on (§ Live). The shadow pass stays on as the safety net for any route that still writes without it.
 
+**2026-11-13: out of the chats, audited nightly.** The app no longer shows the gate's lines (the folded verdict under each message, the held lines, the email folds) and no longer asks the user to grade them. Instead an Opus session re-checks every decision each night for a week and leaves the gate lessons (§ Nightly audit).
+
 ## Why
 
 The user, 2026-11-10: proactive messages reached them without a real review. The outbound precheck asks one narrow question on a tool-less, low-effort read: does this contradict or repeat the last 8 hours of chat? It never asks whether the message is true, whether the assistant could have found the answer instead of asking, whether the question is the right one, or whether it is worth the user's attention. About half the messages in a week (340 of ~670) skipped even that: 59 `--skip-precheck` callers, and three paths that write to the app directly (`findme`, `bin/role-session`, `jori-notify` from playbooks). Emails to the user had no check at all.
@@ -60,7 +62,7 @@ The user, after the shadow week's first day: "it should be reviewed before i see
 
 `lib/speak-gate-live.mjs` (`gateOutbound`, `recordReview`; CLI `bin/speak-gate-live gate|record|enabled` for shell and Python) runs the gate in front of delivery:
 
-| Verdict | What happens | In the app |
+| Verdict | What happens | In the app (until 2026-11-13; no longer shown) |
 |---|---|---|
 | `send` | delivered as written | folded line "Checked, sent as written" |
 | `rewrite` | the gate's text is delivered | "Rewritten before sending"; opening it shows the original |
@@ -79,6 +81,16 @@ Every line has **Right call / Wrong call** and a note. A reply to something the 
   - `digest` → the nightly daily summary email prints it verbatim under **"Held for this summary"**, after Decisions (`bin/daily-summary-build` `attachHeldDigests` at prep: every held digest not yet printed and held before that day ended, plus any already printed in that day's summary; `publish` sets `digested_on`). Email only, never the wiki day page; the review's money check skips the list (`class="held-digest"`). The app line then reads "In the daily summary for <day>".
   - `resolve` → the answer goes back to the role that asked: `bin/role-session prepare` gives that role's next session an "ANSWERS FOUND FOR YOU" block (record it, act on it, never ask again), and phone-channel gives the coordinator's next chat turn the same for chief-of-staff and unsigned senders; `handed_back_at` is set. The gate itself is shown every answer it found in the last 14 days, so a job that asks the same thing again is resolved with the same answer.
 - **Email to the user** (`bin/email-send`, every one of its callers): mail whose ONLY recipient is the user is judged before it is sent. Plain text = proactive (sent, rewritten with the body replaced, or held: not sent, "Held: …" printed, exit 0). HTML = a report the user set up (`kind: "report"`: truth and phrasing only, never held; a suggested fix goes to the app, never spliced into the built HTML). `--in-reply-to` = a reply (never held). Mail that also goes to someone else is not judged. The review has no message row; the app shows it as a folded "Email …" line in the sender's conversation, with the email folded under it. `SPEAK_GATE_EMAIL=0` skips one send (jori-send-curl's push-failure email fallback, already judged).
+
+## Nightly audit (2026-11-13, one week)
+
+The user: "we can clear the 'think before you speak' messages from the chats. let's add an opus process nightly for a week to double check the decisions made that day and provide feedback to the decision maker."
+
+- **Out of the chats:** the app (`ContentView.swift`, `ChannelBadges.swift`) no longer loads `jori_gate_reviews` or shows any line from it; the Right/Wrong grading went with them. Nothing else changed: the gate still acts, rows are still written, held digests still reach the daily summary.
+- **The audit:** `plugins/speak-gate/bin/speak-gate-audit.mjs`, run by launchd `ai.claude.speak-gate-audit` at 01:50 local (`speak-gate-audit-trigger`, Max-auth guard; launchd because it forks `claude -p`). For the day that just ended (America/New_York), every live review with a verdict other than `error` and no `audited_at` goes to an **Opus, high-effort** research session with the gate's own read-only tools (`lib/speak-gate-agent.mjs`, now shared by both), six to a session, two sessions at a time, 30 min each; money and health senders batch apart and get no web. Each case carries what the role wrote, what was delivered, the gate's reason/checks/sources, the user's own grade if any, and what the user wrote next in that conversation (3 h). It grades the DECISION against what was knowable then: `right | partly | wrong`, a note, and what it should have done.
+- **Stored** on the row (migration 0189): `audit_grade`, `audit_note`, `audit_better`, `audited_at`. The user's `grade`/`note` stay theirs. The night's report: `data/speak-gate-audit/<day>.json`; log `agent/logs/speak-gate-audit.log`.
+- **Feedback to the gate:** after grading, one more Opus pass folds the night's partly/wrong findings, the user's own grades and the current list into at most 12 one-sentence lessons in `data/speak-gate-lessons.json`. `bin/speak-gate.mjs` puts them in every judgment under "LESSONS FROM THE NIGHTLY AUDIT" (the user's standing rules win over them). `SPEAK_GATE_NO_LESSONS=1` leaves them out; `SPEAK_GATE_LESSONS` points at another file (tests).
+- **One week:** the first run sets `ends_at` (+7 days) in `data/speak-gate-audit.json`; the last night emails the user one summary (share right/partly/wrong per night, the latest wrong calls, the lessons now in effect). After that each run exits at once; the lessons stay in effect. Pause: `data/.speak-gate-audit-pause`. A day can be re-run by hand: `speak-gate-audit-trigger 2026-11-14` (`--dry-run`, `--limit N`, `--force` past the week).
 
 ## Before wiring (open, as of the shadow week)
 
