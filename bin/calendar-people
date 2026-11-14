@@ -52,6 +52,8 @@ Write (jobs/people-email.md Part C):
                                               Before verify_from only --same-title or --user (the user
                                               said it did not happen) is accepted: the calendar stands
   confirm <event_id> [--note ".."]            the day record shows it happened
+  absent <event_id> <wiki_id> [--note ".."]   it happened, but this person was not there
+  present <event_id> <wiki_id>                this person was there though the invite and title don't say
   verify [--limit N] [--days N] [--json]      past in-person / no-place meetings on days with a day record,
                                               not yet confirmed or ruled out
   write-section --person <wiki_id> --summary @file
@@ -193,6 +195,16 @@ function main() {
       }
       const r = cal.markNotHeld(args[1], note, { userSaid: Boolean(flag("user")) });
       return console.log(`not held: ${args[1]} (pages to re-summarise: ${r.pages.join(", ") || "none"})`);
+    }
+    case "absent": {
+      if (!args[1] || !args[2]) throw new Error("absent <event_id> <wiki_id>");
+      cal.markAbsent(args[1], args[2], typeof flag("note") === "string" ? flag("note") : null);
+      return console.log(`absent: ${args[2]} from ${args[1]}`);
+    }
+    case "present": {
+      if (!args[1] || !args[2]) throw new Error("present <event_id> <wiki_id>");
+      cal.markPresent(args[1], args[2]);
+      return console.log(`present: ${args[2]} at ${args[1]}`);
     }
     case "confirm": {
       if (!args[1]) throw new Error("confirm <event_id>");

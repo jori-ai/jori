@@ -222,3 +222,15 @@ test("before verify_from a meeting is only ruled out on the user's word or as no
   assert.throws(() => cal.markNotHeld("old1", "day record", { verifyFrom: "2026-07-01" }), /calendar stands/);
   assert.doesNotThrow(() => cal.markNotHeld("old1", "the user: never happened", { verifyFrom: "2026-07-01", userSaid: true }));
 });
+
+test("absent and present adjust who an event counts for, not whether it happened", () => {
+  cal.ingestWindow([ev("p1", "2026-08-01", { summary: "Comedy night", attendees: [me(), guest("dana@example.com", "Dana"), guest("gil@example.org", "Gil")] })],
+    { fromMs: Date.parse("2026-07-31"), toMs: Date.parse("2026-08-02"), now: NOW, self });
+  const count = (id) => cal.candidates({ now: NOW }).find((c) => c.wiki_id === id)?.meetings || 0;
+  const [dana, gil, kim] = [count("user_dana_levi"), count("user_gil"), count("user_kim")];
+  cal.markAbsent("p1", "user_gil", "the user: Gil didn't come");
+  cal.markPresent("p1", "user_kim");
+  assert.equal(count("user_gil"), gil - 1);
+  assert.equal(count("user_dana_levi"), dana);
+  assert.equal(count("user_kim"), kim + 1);
+});
