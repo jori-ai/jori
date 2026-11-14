@@ -3,7 +3,7 @@ IPs and camera names; every subprocess is stubbed — nothing is probed, no
 device is touched, no mail is sent).
 
 Covers: off when no roster; DOWN only after DOWN_AFTER failed sweeps and UP on
-the first good one; the down_after_min hold; ARP proof by the device's own or
+the first good one; the down_after_min hold; a temporary down_after that lapses; ARP proof by the device's own or
 an alt MAC; a device with no lease record found in the ARP table or at its last
 good address (own MAC only), and "couldn't check" rather than DOWN when the
 lease list itself is broken, while several devices failing at their addresses
@@ -219,6 +219,24 @@ class HomeDevicesTest(unittest.TestCase):
         for _ in range(3):
             self.sweep(mod, minutes=30)
         self.assertEqual(self.subjects(), ["Offline: Home Test doorbell"])
+
+    def test_down_after_lowers_the_bar_until_it_lapses(self):
+        roster = json.loads(json.dumps(ROSTER))
+        roster["devices"][1].update(down_after=1, down_after_until=(self.t + dt.timedelta(minutes=5)).isoformat())
+        self.write("config/home-devices.json", roster)
+        mod = self.load()
+        self.fake.lan["192.0.2.11"] = "none"
+        self.sweep(mod)  # one miss inside the window is enough
+        self.assertEqual(self.subjects(), ["Offline: Home Test lamp"])
+        self.fake.lan["192.0.2.11"] = "ping"
+        self.sweep(mod)
+        self.sweep(mod)  # now past the window
+        self.fake.lan["192.0.2.11"] = "none"
+        self.sweep(mod)
+        self.sweep(mod)
+        self.assertEqual(len(self.fake.emails), 2)  # Offline, Back online; back on three misses
+        self.sweep(mod)
+        self.assertEqual(self.subjects()[-1], "Offline: Home Test lamp")
 
     def test_arp_proof_by_alt_mac_and_wrong_mac(self):
         mod = self.load()

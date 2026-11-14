@@ -79,6 +79,12 @@ whose Wi-Fi power-save naps would otherwise flap Offline/Back online several
 times a day; alert only on an outage longer than the hold). A nap shorter than
 the hold sends nothing, neither the DOWN nor the matching UP.
 
+A roster entry can also LOWER the bar for a while with `down_after` (a count
+of failed sweeps, e.g. 1 to hear about every miss of a device being watched)
+and `down_after_until` (an ISO date-time with offset; after it the device is
+back on DOWN_AFTER on its own, so a temporary watch cannot outlive its reason).
+Without `down_after_until`, `down_after` holds until removed.
+
 Alerts go out as ONE email per sweep via email-send to the instance owner
 (`alert_to` in the roster overrides); if the send fails (e.g. the site's
 internet is down, which minibeat reports separately) they stay queued in the
@@ -613,7 +619,8 @@ def send_email(cfg, events):
         lines.append("")
     held = any(d.get("down_after_min") for d in cfg.get("devices", []))
     lines.append(f"Checked from {INST['host_label']} every 2 minutes; a device is called offline after {DOWN_AFTER} missed checks"
-                 + (" (a device with a hold only after it has failed that long)." if held else "."))
+                 + (" (a device with a hold only after it has failed that long)" if held else "")
+                 + ("; a device being watched closely sooner." if any(x.get("down_after") for x in cfg.get("devices", [])) else "."))
     where = INSTALL_TOOLS.replace(HOME, "~", 1).rstrip("/")
     lines.append(f"Current view: {'ssh ' + INST['host'] + ' ' if INST['host'] else ''}{where}/bin/home-devices status")
     to = alert_to(cfg)
@@ -634,6 +641,17 @@ def ring_site(cfg, rname):
         if pre and low.startswith(pre):
             return s.get("label", k)
     return "Ring"
+
+
+def down_after(d, t):
+    """Failed sweeps before `d` is called DOWN at time `t` (ISO): its own
+    `down_after` while `down_after_until` has not passed, else DOWN_AFTER."""
+    n, until = d.get("down_after"), d.get("down_after_until")
+    if not n:
+        return DOWN_AFTER
+    if until and dt.datetime.fromisoformat(t) > dt.datetime.fromisoformat(until):
+        return DOWN_AFTER
+    return int(n)
 
 
 def cmd_sweep(args, cfg):
@@ -666,7 +684,7 @@ def cmd_sweep(args, cfg):
             s["fails"] = s.get("fails", 0) + 1
             s.setdefault("failing_since", t)
             held = dt.datetime.fromisoformat(t) - dt.datetime.fromisoformat(s["failing_since"])
-            if (s["status"] == "up" and s["fails"] >= DOWN_AFTER
+            if (s["status"] == "up" and s["fails"] >= down_after(d, t)
                     and held >= dt.timedelta(minutes=d.get("down_after_min", 0))):
                 s.update(status="down", since=s["failing_since"])
                 state["pending"].append({**tag, "kind": "down", "name": name, "detail": detail, "last_seen": s.get("last_seen")})
