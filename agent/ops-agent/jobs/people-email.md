@@ -248,7 +248,7 @@ EOF
 bin/calendar-people write-section --person <wiki_id> --summary @"$TMPDIR/meetings.md"
 ```
 
-`write-section` replaces the page's `## Meetings` block between its markers (or appends one), writes the facts line (meetings; in person, video, group; first, last, next; today), your summary, then the log, and marks the page summarized. New meetings make it due again after 14 days or 3 more meetings.
+`write-section` replaces the page's `## Meetings` block between its markers (or appends one), writes the facts line (meetings; in person, video, group; first, last, next; today), your summary, then the log, and marks the page summarized. A change in its meeting count (new meetings, older ones found when their titles are read, or ones ruled out) makes it due again after 14 days, or at once when the count moved by 3 or more.
 
 ## Step 5 — Questions you couldn't settle (≤3 a night)
 
