@@ -141,3 +141,37 @@ test("renderSection appends ## Meetings once and replaces it after", () => {
   assert.equal((b.match(/## Meetings/g) || []).length, 1);
   assert.ok(b.includes("s2 $& literal"));
 });
+
+test("eventPlatform reads Zoom, Meet and Teams from the conference fields or the link", () => {
+  assert.equal(cal.eventPlatform({ location: "https://us02web.zoom.us/j/1" }), "Zoom");
+  assert.equal(cal.eventPlatform({ hangoutLink: "https://meet.google.com/x" }), "Google Meet");
+  assert.equal(cal.eventPlatform({ conferenceData: { conferenceSolution: { name: "Zoom Meeting" } } }), "Zoom");
+  assert.equal(cal.eventPlatform({ location: "https://teams.microsoft.com/l/1" }), "Teams");
+  assert.equal(cal.eventPlatform({ location: "Cafe, Springfield" }), null);
+});
+
+test("weekOf is the local Monday, as M/D/YY", () => {
+  assert.deepEqual(cal.weekOf(Date.parse("2026-01-15T15:00:00Z"), "America/Los_Angeles"), { key: "2026-01-12", label: "1/12/26" });
+  // Late Sunday on the west coast is Monday in UTC: still the week before, locally.
+  assert.equal(cal.weekOf(Date.parse("2026-01-19T07:30:00Z"), "America/Los_Angeles").label, "1/12/26");
+});
+
+test("meetingLog: an almost-daily partner gets weekly counts; a rare one each meeting and how", () => {
+  const now = Date.parse("2026-11-14T12:00:00Z");
+  const mk = (iso, kind, platform = null) => ({ start_ms: Date.parse(iso), end_ms: Date.parse(iso) + 36e5, kind, platform });
+  const daily = [];
+  for (let d = 0; d < 200; d++) daily.push(mk(new Date(now - (d + 1) * 864e5).toISOString(), d % 5 ? "video" : "in_person", d % 5 ? "Zoom" : null));
+  daily.push(mk("2024-03-01T15:00:00Z", "video", "Zoom"));
+  const f = cal.meetingLog(daily, { now, tz: "America/Los_Angeles" });
+  assert.equal(f.mode, "weekly");
+  assert.match(f.lines[0], /^- Week of 11\/9\/26: (\d+ times|once) \(/);
+  assert.ok(f.lines.some((l) => /Zoom/.test(l) && /in person/.test(l)));
+  assert.equal(f.lines.at(-1), "- 2024: once (1 Zoom)");
+  assert.ok(f.lines.length <= 53);
+  const rare = [mk("2026-10-02T16:00:00Z", "in_person"), mk("2026-03-04T17:00:00Z", "video", "Google Meet"), mk("2026-03-04T19:00:00Z", "video", "Google Meet"), mk("2023-05-01T12:00:00Z", "unknown")];
+  const r = cal.meetingLog(rare, { now, tz: "America/Los_Angeles" });
+  assert.equal(r.mode, "dated");
+  assert.deepEqual(r.lines, ["- 10/2/26: in person", "- 3/4/26: Google Meet (×2)", "- 2023: once (1 no place or link on the invite)"]);
+  const md = cal.renderSection("# X\n", { facts: "_f_", summary: "s", log: r });
+  assert.match(md, /s\n\n\*\*When and how they met\*\* [^\n]*\n- 10\/2\/26: in person\n/);
+});

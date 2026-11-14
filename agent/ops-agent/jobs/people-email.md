@@ -216,12 +216,12 @@ For each due page (`bin/calendar-people candidates --stale --limit 20 --json`):
 bin/calendar-people person <wiki_id> --json
 ```
 
-You get the totals, meetings per year, and the meetings themselves (date, title, in person or video, `via` guest or title, who else was there, a recurring series' size, upcoming ones flagged). Write 2–5 sentences on **when and how the user and this person meet, and about what**: the rhythm (a weekly call, dinners when the user is in <city>), the eras and topics the titles show, and the most recent meeting (and the next one, if scheduled).
+You get the totals, meetings per year, the `log` code will write under your summary, and the meetings themselves (date, title, `how` it was held: in person, Zoom, Google Meet, Teams…, `via` guest or title, who else was there, a recurring series' size, upcoming ones flagged). Write 2–5 sentences on **when and how the user and this person meet, and about what**: the rhythm (a weekly call, dinners when the user is in <city>), the eras and topics the titles show, and the most recent meeting (and the next one, if scheduled).
 
 - Third person with names, never "you". No street addresses, locations finer than a city, email addresses or phone numbers. A location is context for you ("in <city>"), never page text.
 - **Health and financial specifics never go on the page** (Step 4's rule): "<owner>'s dentist; appointments twice a year", not the procedure; "meetings with the banker", not the account.
 - Don't invent beyond the titles. A run of opaque titles ("Catch up", "Call") is described as cadence only.
-- Don't repeat the facts line (counts and dates are already there).
+- Don't repeat the facts line or list meetings: code writes the log under your summary. For someone the user meets almost daily (2+ a week on average over the year up to the last meeting; `frequent_per_week` in `agent/local/config/calendar-people.json`) it is a count per week ("Week of 1/12/26: 5 times (4 Zoom, 1 in person)") for the past 52 weeks; for anyone else, each meeting with how it was held ("3/4/26: Google Meet") for the past 24 months. Older history folds into one line a year. Your summary is the prose around it: the rhythm and what they meet about.
 
 ```bash
 cat > "$TMPDIR/meetings.md" <<'EOF'
@@ -230,7 +230,7 @@ EOF
 bin/calendar-people write-section --person <wiki_id> --summary @"$TMPDIR/meetings.md"
 ```
 
-`write-section` replaces the page's `## Meetings` block between its markers (or appends one), writes the facts line (meetings; in person, video, group; first, last, next; today) and marks the page summarized. New meetings make it due again after 14 days or 3 more meetings.
+`write-section` replaces the page's `## Meetings` block between its markers (or appends one), writes the facts line (meetings; in person, video, group; first, last, next; today), your summary, then the log, and marks the page summarized. New meetings make it due again after 14 days or 3 more meetings.
 
 ## Step 5 — Questions you couldn't settle (≤3 a night)
 

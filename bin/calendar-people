@@ -154,6 +154,8 @@ function main() {
       if (asJson) return console.log(JSON.stringify(r, null, 2));
       console.log(`${r.name} (${r.wiki_id})  ${JSON.stringify(r.totals)}`);
       console.log(`by year: ${JSON.stringify(r.by_year)}`);
+      console.log(`log (${r.log.mode}, written under the summary):`);
+      for (const l of r.log.lines.slice(0, 12)) console.log(`  ${l}`);
       for (const m of r.meetings) console.log(`  ${m.date}${m.upcoming ? " (upcoming)" : ""} ${m.kind} [${m.via}] ${m.title}${m.others.length ? ` — with ${m.others.map((o) => o.name || o.wiki_id || "?").join(", ")}` : ""}`);
       return;
     }
