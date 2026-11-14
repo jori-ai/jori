@@ -45,10 +45,12 @@ Write (jobs/people-email.md Part C):
                                               the reading applies to every event with that title
   link <email> <wiki_id> [--note ".."]        this guest address is that person
   ignore <email> [--note ".."]                not a person (a room, a shared inbox, a bot)
-  not-held <event_id> [--note ".."] [--same-title]
+  not-held <event_id> [--note ".."] [--same-title] [--user]
                                               on the calendar but it did not happen; never counts.
                                               --same-title: not a meeting at all (a shared chore or
-                                              reminder): every event with exactly that title
+                                              reminder): every event with exactly that title.
+                                              Before verify_from only --same-title or --user (the user
+                                              said it did not happen) is accepted: the calendar stands
   confirm <event_id> [--note ".."]            the day record shows it happened
   verify [--limit N] [--days N] [--json]      past in-person / no-place meetings on days with a day record,
                                               not yet confirmed or ruled out
@@ -189,7 +191,7 @@ function main() {
         const t = cal.markTitleNotMeeting(args[1], note);
         return console.log(`not a meeting: "${t.title}" × ${t.events} (pages to re-summarise: ${t.pages.join(", ") || "none"})`);
       }
-      const r = cal.markNotHeld(args[1], note);
+      const r = cal.markNotHeld(args[1], note, { userSaid: Boolean(flag("user")) });
       return console.log(`not held: ${args[1]} (pages to re-summarise: ${r.pages.join(", ") || "none"})`);
     }
     case "confirm": {

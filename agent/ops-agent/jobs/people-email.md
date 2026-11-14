@@ -211,7 +211,7 @@ For each `unmatched` row, the same judgment as Step 2, from the names, Contacts 
 
 ### C3b — Did it happen? Check against the day record
 
-A calendar event is a plan, not proof: a lunch can stay on the calendar after it was called off, or end up with other people. Code counts a past event as held when it was not cancelled or declined. This step checks the ones that could have been in person (a street location, or no place and no link) against the day record, for dates that have one and only from `verify_from` in `agent/local/config/calendar-people.json` on: before that date the installation's day records are not reliable and the calendar is the source of truth (`verify` never offers those). Video calls are not checked here.
+A calendar event is a plan, not proof: a lunch can stay on the calendar after it was called off, or end up with other people. Code counts a past event as held when it was not cancelled or declined. This step checks the ones that could have been in person (a street location, or no place and no link) against the day record, for dates that have one and only from `verify_from` in `agent/local/config/calendar-people.json` on: before that date the installation's day records are not reliable and the calendar is the source of truth (`verify` never offers those, and `not-held` refuses them unless the user said so: `--user`). Video calls are not checked here.
 
 ```bash
 bin/calendar-people verify --limit 40 --json

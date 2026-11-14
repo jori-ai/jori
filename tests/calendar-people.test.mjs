@@ -215,3 +215,10 @@ test("verify_from: before it the calendar stands and nothing is offered for chec
   assert.ok(rows.every((r) => r.date >= "2026-10-23"));
   assert.ok(cal.verifyPending({ now: NOW, dayExists: () => true, verifyFrom: null }).some((r) => r.date < "2026-10-23"));
 });
+
+test("before verify_from a meeting is only ruled out on the user's word or as not a meeting", () => {
+  cal.ingestWindow([ev("old1", "2026-03-10", { summary: "Dinner with Gil", attendees: [me(), guest("gil@example.org", "Gil")] })],
+    { fromMs: Date.parse("2026-03-09"), toMs: Date.parse("2026-03-11"), now: NOW, self });
+  assert.throws(() => cal.markNotHeld("old1", "day record", { verifyFrom: "2026-07-01" }), /calendar stands/);
+  assert.doesNotThrow(() => cal.markNotHeld("old1", "the user: never happened", { verifyFrom: "2026-07-01", userSaid: true }));
+});
