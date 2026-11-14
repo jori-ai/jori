@@ -316,6 +316,37 @@ test("a hop walk that does not begin as the first stop ends, or leaves the next 
   assert.equal(brief.stops[1].start_ts_ms, at(7, 52), "would leave the stop 2 minutes");
 });
 
+// A departure the phone saw late: the first stop's recorded end runs a few minutes past
+// the walk's first stride, and the next stop begins as that stop ends. The walk was then
+// printed inside the next stop, from its first minute.
+function lateDepartureDay(endMin) {
+  const d = hopDay();
+  d.stops[0].end_ts_ms = at(7, endMin); d.stops[0].end = `07:${String(endMin).padStart(2, "0")}`;
+  d.stops[1].start_ts_ms = at(7, endMin); d.stops[1].start = d.stops[0].end;
+  d.stops[1].duration_min = Math.round((d.stops[1].end_ts_ms - d.stops[1].start_ts_ms) / 60000);
+  d.path.spine[0].end_ms = at(7, endMin); d.path.spine[1].start_ms = at(7, endMin);
+  return d;
+}
+
+test("a hop walk that begins a few minutes before the first stop's recorded end still starts the next stop at the last stride", () => {
+  const d = lateDepartureDay(55);            // the walk began 7 minutes before the stop's end
+  const st = annotateDaySteps(d, hopSteps(), null, { startMs: at(0), endMs: at(24) });
+  assert.equal(d.stops[1].start_ts_ms, at(8, 4));
+  assert.deepEqual(st.stops_aligned.map(m => [m.stop_id, m.edge]), [["v", "start"]]);
+  assert.equal(st.walks[0].kind, "between", "the walk is the way there, not a walk inside the venue");
+});
+
+test("a hop walk that began more than ten minutes before the first stop's recorded end moves nothing, and JORI_STEPS_HOP_EARLY=0 restores the three-minute window", () => {
+  const far = lateDepartureDay(59);          // 11 minutes before the stop's end
+  annotateDaySteps(far, hopSteps(), null, { startMs: at(0), endMs: at(24) });
+  assert.equal(far.stops[1].start_ts_ms, at(7, 59));
+  const off = lateDepartureDay(55);
+  process.env.JORI_STEPS_HOP_EARLY = "0";
+  try { annotateDaySteps(off, hopSteps(), null, { startMs: at(0), endMs: at(24) }); }
+  finally { delete process.env.JORI_STEPS_HOP_EARLY; }
+  assert.equal(off.stops[1].start_ts_ms, at(7, 55));
+});
+
 test("a walk with a leg under it is left to the leg's rule, and JORI_STEPS_ALIGN_HOPS=0 leaves the hop as the phone saw it", () => {
   const off = hopDay();
   process.env.JORI_STEPS_ALIGN_HOPS = "0";
