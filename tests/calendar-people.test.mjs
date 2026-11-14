@@ -200,3 +200,12 @@ test("verify lists unsettled in-person meetings on recorded days; confirm and no
   cal.markConfirmed("v1");
   assert.ok(cal.candidates({ now: NOW }).some((c) => c.wiki_id === "user_omer" && c.meetings >= 1));
 });
+
+test("not-held --same-title rules out a whole chore series", () => {
+  const w = { fromMs: Date.parse("2026-06-01"), toMs: Date.parse("2026-06-30"), now: NOW, self };
+  cal.ingestWindow([1, 8, 15].map((d) => ev(`c${d}`, `2026-06-${String(d).padStart(2, "0")}`, { summary: "Take out trash", attendees: [me(), guest("gil@example.org", "Gil")] })), w);
+  const before = cal.candidates({ now: NOW }).find((c) => c.wiki_id === "user_gil").meetings;
+  const r = cal.markTitleNotMeeting("c8", "not a meeting: a chore");
+  assert.equal(r.events, 3);
+  assert.equal(cal.candidates({ now: NOW }).find((c) => c.wiki_id === "user_gil").meetings, before - 3);
+});
