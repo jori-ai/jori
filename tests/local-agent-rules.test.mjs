@@ -542,3 +542,25 @@ test("kernelRulebooks: the ops supervisor carries the rulebooks in its appended 
   fs.rmSync(path.join(root, "agent", "CLAUDE.md"));
   assert.throws(() => readLocalRules({ localDir: path.join(root, "agent", "local"), role: "ops", rulebooks: rb }));
 });
+
+test("kernelRulebooks: tiers whose CLAUDE.md is a symlink to the same file get byte-identical rules files (one prompt-cache key)", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "rulebooks-sym-"));
+  for (const d of ["ops-agent", "ops-light-agent", "ops-haiku-agent", "local"]) fs.mkdirSync(path.join(root, "agent", d), { recursive: true });
+  fs.writeFileSync(path.join(root, "agent", "CLAUDE.md"), "# Kernel rules\n");
+  fs.writeFileSync(path.join(root, "agent", "ops-agent", "CLAUDE.md"), "# Ops rules\n");
+  for (const d of ["ops-light-agent", "ops-haiku-agent"]) fs.symlinkSync("../ops-agent/CLAUDE.md", path.join(root, "agent", d, "CLAUDE.md"));
+  fs.writeFileSync(path.join(root, "agent", "local", "shared.md"), "# Local rules — shared\n");
+  const texts = ["ops-agent", "ops-light-agent", "ops-haiku-agent"].map((d) => {
+    const rb = kernelRulebooks({ root, cwd: path.join(root, "agent", d) });
+    return readLocalRules({ localDir: path.join(root, "agent", "local"), role: "ops", rulebooks: rb });
+  });
+  assert.equal(texts[1], texts[0]);
+  assert.equal(texts[2], texts[0]);
+  assert.ok(texts[0].includes("Contents of agent/CLAUDE.md "));
+  assert.ok(texts[0].includes("Contents of agent/ops-agent/CLAUDE.md "));
+  // a tier with its own regular file keeps its own label
+  fs.mkdirSync(path.join(root, "agent", "chat-agent"), { recursive: true });
+  fs.writeFileSync(path.join(root, "agent", "chat-agent", "CLAUDE.md"), "# Chat rules\n");
+  const chat = readLocalRules({ localDir: path.join(root, "agent", "local"), role: "chat", rulebooks: kernelRulebooks({ root, cwd: path.join(root, "agent", "chat-agent") }) });
+  assert.ok(chat.includes("Contents of agent/chat-agent/CLAUDE.md "));
+});

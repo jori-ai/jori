@@ -185,3 +185,25 @@ test("over Tailscale the page answers to the tailnet name; otherwise loopback on
     plain.server.close();
   }
 });
+
+test("use: personal turns on the coordinator alone; work and both the whole team; an unknown answer is refused", async () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "onb-use-"));
+  for (const [d, cos] of [["role-cfo", false], ["role-chief-of-staff", true], ["role-travel-manager", false]]) {
+    fs.mkdirSync(path.join(tmp, "plugins", d), { recursive: true });
+    fs.writeFileSync(path.join(tmp, "plugins", d, "plugin.json"), JSON.stringify({ name: d, role: { id: d.slice(5), chief_of_staff: cos } }));
+  }
+  const on = [];
+  const enable = async (n) => { on.push(n); return { ok: true }; };
+  assert.deepEqual((await core.applyUse(tmp, "personal", { enable })).enabled, ["role-chief-of-staff"]);
+  on.length = 0;
+  const work = await core.applyUse(tmp, "work", { enable });
+  assert.equal(work.enabled[0], "role-chief-of-staff", "the coordinator first");
+  assert.equal(work.enabled.length, 3);
+  assert.equal((await core.applyUse(tmp, "both", { enable })).enabled.length, 3, "both starts as work");
+  assert.deepEqual((await core.applyUse(tmp, "nonsense", { enable })).enabled, []);
+  const fail = await core.applyUse(tmp, "personal", { enable: async () => ({ ok: false, stderr: "needs: projects" }) });
+  assert.deepEqual(fail.failed, [{ name: "role-chief-of-staff", why: "needs: projects" }]);
+  assert.throws(() => core.writeIdentity(tmp, { use: "hobby" }), /work, personal or both/);
+  assert.equal(core.writeIdentity(tmp, { use: "both" }).use, "both");
+  assert.equal(core.currentUse(tmp), "both");
+});

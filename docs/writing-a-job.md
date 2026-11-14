@@ -25,7 +25,7 @@ Summarize last week for the user: the meetings they had, the tasks they closed, 
 2. Build a short HTML body: three sections (Meetings, Done, Still open), one line per item, no more than 15 lines in total.
 3. Send it to the user:
    ```bash
-   ~/Dev/jori/bin/email-send --to "$(node ~/Dev/jori/lib/instance.cjs owner_email)" \
+   ~/Dev/jori/bin/email-send --to me \
      --subject "Week of $(date -v-7d '+%b %-d')" --body-file /tmp/weekly-report.html --html
    ```
 4. Reply with one line: "Weekly report emailed."

@@ -1,4 +1,4 @@
-# Executive Assistant (role plugin)
+# Admin (role plugin)
 
 Inbox, calendar, messages, reminders, meetings and purchases.
 

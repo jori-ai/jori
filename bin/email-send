@@ -20,7 +20,10 @@
 //
 // --to accepts a comma-separated list (e.g. "a@x.com,b@y.com") so multiple
 // recipients land on the SAME message/thread (two recipients of one thread
-// need to see the same email, not two separate ones).
+// need to see the same email, not two separate ones). `me` in that list is the
+// owner's own address (`--to me`, `--to me,b@y.com`): agents write that, never
+// the address itself, or Claude Code's privacy plugin refuses the call
+// (lib/email-recipients.cjs).
 //
 //   email-send --check-delivery <email_id> [--wait <seconds>] [--interval <seconds>] [--json]
 //   email-send --check-delivery --subject "<exact subject>" [--wait …] [--json]
@@ -44,6 +47,7 @@ const require = createRequire(import.meta.url);
 const { loadEnv } = require("../lib/load-env.js");
 const { guessMimeType } = require("../lib/mime-types.js");
 const { instance } = require("../lib/instance.cjs");
+const { resolveRecipients } = require("../lib/email-recipients.cjs");
 
 loadEnv();
 
@@ -96,6 +100,15 @@ function parseArgs(argv) {
     else if (k === "-h" || k === "--help") { printUsage(); process.exit(0); }
     else { console.error(`email-send: unknown flag: ${k}`); process.exit(1); }
   }
+  // `--to me` is the owner's own address, filled in here so an agent never
+  // types it into a command (lib/email-recipients.cjs says why). Resolved
+  // before signing: the role signature asks whether the owner is the only
+  // recipient.
+  if (a.to) {
+    const r = resolveRecipients(a.to, OWNER_ADDRESS);
+    if (r.error) { console.error(`email-send: --to: ${r.error}`); process.exit(1); }
+    a.to = r.list.join(",");
+  }
   // Same guard as gmail-action: a markup body is HTML even without --html.
   if (!a.html && a.body && looksLikeHtml(a.body)) a.html = true;
   // The team role that owns the sending job signs it (lib/org.cjs, system/org.md):
@@ -130,8 +143,9 @@ function looksLikeHtml(body) {
 function printUsage() {
   console.log(`email-send — send mail via smtp2go as ${DEFAULT_FROM_NAME}
 Usage:
-  email-send --to <addr> --subject <s> (--body <text> | --body-file <path>)
+  email-send --to <addr|me>[,<addr>...] --subject <s> (--body <text> | --body-file <path>)
              [--html] [--attach <file>]...
+             (me = the owner's own address; write it instead of the address)
              [--from <addr>] [--from-name <name>]
              [--reply-to <addr>] [--no-reply-to]
              [--sign <job> [--role-from]]   --role-from: From the job's role even with a second recipient
@@ -246,6 +260,60 @@ async function send(a) {
   // non-zero.)
   const toHasOwner = !!OWNER_ADDRESS && toList.some((addr) => addr.toLowerCase() === OWNER_ADDRESS.toLowerCase());
 
+  // ─── The speak gate (system/speak-gate.md § Live, email) ───────────────
+  // Mail to the user ALONE is judged before it is sent, like a message to the
+  // app (the user, 2026-11-11: emails to them had no check at all). A plain
+  // text email is proactive: sent, rewritten (the body is replaced) or held
+  // (not sent; the user sees it as a folded line in the sender's conversation
+  // in the app). An HTML email is a report the user set up: checked for truth
+  // and wording, never held, and a suggested fix is shown in the app rather
+  // than spliced into the built HTML. A reply in one of the user's own threads
+  // (--in-reply-to) is a reply: never held. Mail that also goes to someone
+  // else is not judged (holding it would hold it from them too). Fails open.
+  // Off: data/.speak-gate-off; SPEAK_GATE_EMAIL=0 skips it for one send.
+  let gateReview = null;
+  if (toHasOwner && toList.length === 1 && process.env.SPEAK_GATE_EMAIL !== "0") {
+    try {
+      const sg = await import("../lib/speak-gate-live.mjs");
+      const html = a.html || looksLikeHtml(a.body);
+      const kind = a.inReplyTo ? "reply" : html ? "report" : "proactive";
+      let sender = null;
+      try {
+        const job = a.signAs || process.env.JORI_SIGN_AS || process.env.JORI_JOB;
+        const r = job ? require("../lib/org.cjs").roleFor({ job }) : null;
+        sender = r && r.id ? r.id : null;
+      } catch {}
+      const text = html ? htmlToText(a.body) : String(a.body);
+      const g = await sg.gateOutbound({
+        message: text.slice(0, 12000), channel: "email", kind, sender,
+        intent: `email:${process.env.JORI_JOB || a.signAs || "email-send"}`,
+        supporting_data: { email_subject: a.subject, attachments: a.attachments.length },
+      });
+      if (!g.deliver) {
+        console.log(`Held: not sent — the speak gate held it (${g.verdict}: ${String(g.reason || "").slice(0, 200)}). ${INSTANCE.owner_name || "The user"} sees it in the app and grades the call. Not an error; do not resend.`);
+        return;
+      }
+      if (g.review) {
+        gateReview = { ...g.review, original: `Subject: ${a.subject}\n\n${text.slice(0, 4000)}` };
+        if (g.verdict === "rewrite") {
+          if (html) {
+            // The built report goes out as written; the fix is shown in the app.
+            gateReview.suggestion = g.text;
+            gateReview.reason = `Report sent as written; suggested fix below. ${gateReview.reason || ""}`.trim();
+          } else {
+            a.body = g.text;
+          }
+        }
+      }
+    } catch (err) {
+      console.error(`email-send: speak gate skipped (${err.message})`);
+    }
+  }
+  const recordGate = async () => {
+    if (!gateReview) return;
+    try { const { recordReview } = await import("../lib/speak-gate-live.mjs"); await recordReview(gateReview, null); } catch {}
+  };
+
   // No writing-style gate here. email-send is the internal channel only:
   // agent-to-user digests, alerts, reports (Outbound Email Policy default). An
   // installation's style rules for outreach are about mail that goes to a
@@ -280,6 +348,7 @@ async function send(a) {
     }
     if (direct) {
       console.log(`Sent: email_id=${direct.emailId} succeeded=1 failed=0 via=mailbox`);
+      await recordGate();
       await logSent(a, toList, { email_id: direct.emailId, message_id: direct.messageId, gmail_id: direct.gmailId, transport: "mailbox" });
       await autoLabel(a, toHasOwner, direct.emailId);
       return;
@@ -341,6 +410,7 @@ async function send(a) {
   }
   const d = data.data || {};
   console.log(`Sent: email_id=${d.email_id || "?"} succeeded=${d.succeeded} failed=${d.failed}`);
+  await recordGate();
   await logSent(a, toList, { email_id: d.email_id || null });
   await autoLabel(a, toHasOwner, d.email_id);
 }

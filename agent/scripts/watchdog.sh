@@ -122,6 +122,9 @@ notify() {
   local key="$PENDING_ALERT_KEY"
   PENDING_ALERT_KEY=""
 
+  # The speak gate judges this page too (everything to the user goes through
+  # it, 2026-11-12) — except a Max-auth page: the gate's judge runs on Max, so
+  # that alarm is about the gate itself. Those calls run SPEAK_GATE_SELF=1 notify.
   if JORI_INFRA_PROBE=1 "$SEND" --skip-precheck --intent watchdog-alert --channel system "$1" > /dev/null 2>&1; then
     log "Notified via ${JORI_ASSISTANT_NAME:-Jori}: $1"  # control-scan-ok: the setting's default
     [ -n "$key" ] && touch "$INCIDENT_DIR/${key}.delivered" 2>/dev/null
@@ -542,15 +545,23 @@ disk_free_probe() {
 # disk page, after its stable prefix. Sizes <snapshot_dir> with `du -sk` (that
 # one directory, nothing wider), and is only ever called while composing a page,
 # so a healthy tick never walks a directory. Read-only like the probe.
+#
+# The snapshot folder is named as the lead only while it is big enough to be one
+# (WATCHDOG_DISK_SNAPSHOT_LEAD_GIB, default 8, above the few GiB its retention
+# keeps). Below that it is unlikely to be the cause, so the page says how to
+# tell a sudden drop from a slow one instead. Both branches stay under the ~350
+# character page limit.
 disk_alert_body() {
-  local free="$1" pct="$2" dir="$3" kb snap
+  local free="$1" pct="$2" dir="$3" kb lead lead_kb lead_text
   kb=$(du -sk "$dir" 2>/dev/null | awk 'NR == 1 { print $1 }')
-  if [[ "$kb" =~ ^[0-9]+$ ]]; then
-    snap="data/memory-db-snapshots holds $(awk -v k="$kb" 'BEGIN { printf "%.1f", k / 1048576 }') GiB of hourly memory-DB copies (they have filled the disk before)."
+  lead=$(_disk_gib_threshold "$WATCHDOG_DISK_SNAPSHOT_LEAD_GIB" 8)
+  lead_kb=$(( lead * 1048576 ))
+  if [[ "$kb" =~ ^[0-9]+$ ]] && [ "$kb" -ge "$lead_kb" ]; then
+    lead_text="data/memory-db-snapshots holds $(awk -v k="$kb" 'BEGIN { printf "%.1f", k / 1048576 }') GiB of hourly memory-DB copies (they have filled the disk before)."
   else
-    snap="data/memory-db-snapshots (hourly memory-DB copies, which have filled the disk before) could not be measured."
+    lead_text="A sudden drop that clears within the hour is usually an OS update, a build or a download; a steady fall means a folder keeps growing."
   fi
-  echo "${free} GiB free on the data volume (${pct}% used). $snap Nothing was deleted. When space runs out, downloads to ${JORI_HOST_LABEL:-the host} stall and database and log writes start failing."
+  echo "${free} GiB free on the data volume (${pct}% used). $lead_text Nothing was deleted. When space runs out, downloads to ${JORI_HOST_LABEL:-the host} stall and database and log writes start failing."
 }
 
 # chat_backlog_restart_note <startedAt> <queueDepth> <queueRestored> — run on
@@ -1556,7 +1567,32 @@ if [ "$MAX_AUTH_PROBE_STATE" = "fail" ] && [ -f "$INCIDENT_DIR/auth-outage.keych
    && [ "$(stat -f%m "$INCIDENT_DIR/auth-outage.keychain_healed" 2>/dev/null || echo 0)" -ge "$MAX_AUTH_PROBE_TS" ]; then
   MAX_AUTH_PROBE_STATE=pre-heal
 fi
-if [ -n "$AUTH_HIT" ]; then
+# One failed turn is not an outage. A supervisor pauses and pages for itself only
+# after AUTH_FAIL_THRESHOLD (3, supervisor/index.mjs) consecutive failures, so the
+# "#N" in its AUTH ERROR line says how far along it is. When the newest line is
+# #1 or #2, is not a credential failure (an upstream HTTP error such as a
+# Cloudflare "Attention Required!" 403 block page), and the launchd sign-in check
+# (the context that reads the credentials; fresh and signed in) says the login is
+# fine, paging 🔴 "run claude /login" is wrong: /login cannot fix it and the next
+# turn usually succeeds. Hold quietly instead; a repeat (#3, the supervisor's own
+# page), a credential-shaped error, or a signed-out check still pages as before.
+# Never while an outage is already paged (its re-page cadence is unchanged).
+# Defends: "🔴 Max auth is DOWN ... 403 Attention Required! | Cloudflare" paged on
+# one blip while the login was healthy.
+AUTH_BLIP=0
+if [ -n "$AUTH_HIT" ] && [ "$MAX_AUTH_PROBE_STATE" = "ok" ] && [ ! -f "$INCIDENT_DIR/auth-outage.alerted" ]; then
+  _blip_line=$(grep 'AUTH ERROR' "$AUTH_HIT" 2>/dev/null | tail -1)
+  _blip_n=$(printf '%s' "$_blip_line" | sed -nE 's/^.*AUTH ERROR #([0-9]+): .*$/\1/p')
+  # lang-regex-ok: matches the CLI's own machine-written error text, not anything the user said
+  if [[ "$_blip_n" =~ ^[0-9]+$ ]] && [ "$_blip_n" -lt 3 ] \
+     && ! printf '%s' "$_blip_line" | grep -qiE 'oauth|not logged in|log ?in|keychain|authentication_error|401'; then
+    AUTH_BLIP=1
+  fi
+fi
+if [ "$AUTH_BLIP" = "1" ]; then
+  log "Max auth: one supervisor turn hit a non-credential error (AUTH ERROR #$_blip_n in $(basename "$AUTH_HIT")) below the supervisor's own pause threshold, and the launchd sign-in check reads signed in — not paging; a repeat or a signed-out check will"
+  AUTH_OUTAGE_HELD=1   # defers the daily-summary backfill one tick, like the keychain-healed deferral
+elif [ -n "$AUTH_HIT" ]; then
   log "Max auth outage: recent 'AUTH ERROR / Not logged in' in $(basename "$AUTH_HIT") — backend stalled"
   ISSUES="$ISSUES auth(not-logged-in)"
   AUTH_OUTAGE_HELD=1   # held through the keychain-healed deferral too
@@ -1574,7 +1610,7 @@ if [ -n "$AUTH_HIT" ]; then
     # misdiagnose. Mirrors supervisor/index.mjs's own outage page.
     auth_err_text=$(grep 'AUTH ERROR' "$AUTH_HIT" 2>/dev/null | tail -1 | sed -E 's/^.*AUTH ERROR #[0-9]+: //' | cut -c1-200)
     [ -n "$auth_err_text" ] || auth_err_text="(no error text captured)"
-    notify "🔴 Max auth is DOWN on $(basename "$AUTH_HIT" | sed 's/-supervisor\.log//'). Captured error: \"$auth_err_text\". If it mentions a keychain, check \`security default-keychain\` + \`security list-keychains\`; otherwise it's likely just expired/invalid creds needing a plain re-login. Either way: \`claude /login\` on ${JORI_HOST_LABEL:-the host}. No API-key fallback exists by design."
+    SPEAK_GATE_SELF=1 notify "🔴 Max auth is DOWN on $(basename "$AUTH_HIT" | sed 's/-supervisor\.log//'). Captured error: \"$auth_err_text\". If it mentions a keychain, check \`security default-keychain\` + \`security list-keychains\`; otherwise it's likely just expired/invalid creds needing a plain re-login. Either way: \`claude /login\` on ${JORI_HOST_LABEL:-the host}. No API-key fallback exists by design."
   fi
 else
   # The log-recency probe above goes BLIND during a sustained outage. Once a
@@ -1611,7 +1647,7 @@ else
     AUTH_OUTAGE_HELD=1
     # Same cadence as the fresh-error page above: every 30 min, cap 4 in 6h.
     if incident_should_alert "auth-outage" 1800 4 21600; then
-      notify "🔴 Max auth is STILL down on$AUTH_STILL_PAUSED. The supervisor(s) killed the child and paused dispatch, so there is nothing new in the logs — quiet does not mean recovered here. Anything queued behind this is not being worked. Run \`claude /login\` on ${JORI_HOST_LABEL:-the host}; there is no API-key fallback by design."
+      SPEAK_GATE_SELF=1 notify "🔴 Max auth is STILL down on$AUTH_STILL_PAUSED. The supervisor(s) killed the child and paused dispatch, so there is nothing new in the logs — quiet does not mean recovered here. Anything queued behind this is not being worked. Run \`claude /login\` on ${JORI_HOST_LABEL:-the host}; there is no API-key fallback by design."
     fi
   elif [ "$MAX_AUTH_PROBE_STATE" = "fail" ]; then
     # The authAlertSent guard above only engages once a supervisor has failed 3
@@ -1635,7 +1671,7 @@ else
     else
       log "Max auth outage: no fresh AUTH ERROR line, but the launchd sign-in check has read signed out since $_auth_since_local ($MAX_AUTH_PROBE_SUMMARY) — holding the incident open"
       if incident_should_alert "auth-outage" 1800 4 21600; then
-        notify "🔴 Max auth is down: Claude Code on ${JORI_HOST_LABEL:-the host} has read as signed out since $_auth_since_local, checked every 10 min from launchd (the context the scheduled runs use). Every scheduled Claude run will refuse to start until it is back, and quiet supervisor logs don't mean it recovered. Run \`claude /login\` on ${JORI_HOST_LABEL:-the host}; there is no API-key fallback by design."
+        SPEAK_GATE_SELF=1 notify "🔴 Max auth is down: Claude Code on ${JORI_HOST_LABEL:-the host} has read as signed out since $_auth_since_local, checked every 10 min from launchd (the context the scheduled runs use). Every scheduled Claude run will refuse to start until it is back, and quiet supervisor logs don't mean it recovered. Run \`claude /login\` on ${JORI_HOST_LABEL:-the host}; there is no API-key fallback by design."
       fi
     fi
   elif [ "$MAX_AUTH_PROBE_STATE" = "pre-heal" ]; then
@@ -2672,7 +2708,8 @@ fi
 # deletes, prunes or moves a file. What may be thrown away, backups above all,
 # is an operator decision, and the fix for a filling disk is to find what is
 # growing and stop it, not to delete whatever is biggest. The page names the
-# folder that filled it last time so that search starts in the right place.
+# snapshot folder that filled it before only while that folder is big enough to
+# be the lead again; otherwise it says how to read the drop (disk_alert_body).
 DISK_SNAPSHOT_DIR="$HOME/Dev/jori/data/memory-db-snapshots"
 read -r DISK_LEVEL DISK_FREE_GIB DISK_USED_PCT DISK_DETAIL <<< "$(disk_free_probe "$HOME/Dev/jori/data")"
 case "$DISK_LEVEL" in

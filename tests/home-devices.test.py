@@ -3,14 +3,16 @@ IPs and camera names; every subprocess is stubbed — nothing is probed, no
 device is touched, no mail is sent).
 
 Covers: off when no roster; DOWN only after DOWN_AFTER failed sweeps and UP on
-the first good one; the down_after_min hold; ARP proof by the device's own or
+the first good one; the down_after_min hold; a temporary down_after that lapses; ARP proof by the device's own or
 an alt MAC; a device with no lease record found in the ARP table or at its last
 good address (own MAC only), and "couldn't check" rather than DOWN when the
 lease list itself is broken, while several devices failing at their addresses
 still go DOWN together; a remote site's anchor gating the rest; camera
 connection matched case-insensitively and the low-battery / recharged pair;
 cloud checks "not judged" without a homectl; alerts to the instance owner
-(alert_to overrides).
+(alert_to overrides); the outage log (a row on DOWN, a completed row on UP, both
+timed from the first missed sweep, nothing for a nap under the hold or a dry
+run) and the `outages` report.
 
 Run: python3 tests/home-devices.test.py
 """
@@ -219,6 +221,24 @@ class HomeDevicesTest(unittest.TestCase):
         for _ in range(3):
             self.sweep(mod, minutes=30)
         self.assertEqual(self.subjects(), ["Offline: Home Test doorbell"])
+
+    def test_down_after_lowers_the_bar_until_it_lapses(self):
+        roster = json.loads(json.dumps(ROSTER))
+        roster["devices"][1].update(down_after=1, down_after_until=(self.t + dt.timedelta(minutes=5)).isoformat())
+        self.write("config/home-devices.json", roster)
+        mod = self.load()
+        self.fake.lan["192.0.2.11"] = "none"
+        self.sweep(mod)  # one miss inside the window is enough
+        self.assertEqual(self.subjects(), ["Offline: Home Test lamp"])
+        self.fake.lan["192.0.2.11"] = "ping"
+        self.sweep(mod)
+        self.sweep(mod)  # now past the window
+        self.fake.lan["192.0.2.11"] = "none"
+        self.sweep(mod)
+        self.sweep(mod)
+        self.assertEqual(len(self.fake.emails), 2)  # Offline, Back online; back on three misses
+        self.sweep(mod)
+        self.assertEqual(self.subjects()[-1], "Offline: Home Test lamp")
 
     def test_arp_proof_by_alt_mac_and_wrong_mac(self):
         mod = self.load()
@@ -446,6 +466,100 @@ class HomeDevicesTest(unittest.TestCase):
         self.assertIn("02:00:00:00:00:55", out.getvalue())
         self.assertNotIn("02:00:00:00:00:99", out.getvalue())
         self.assertNotIn("02:00:00:00:00:01", out.getvalue())
+
+    def outage_rows(self):
+        try:
+            with open(os.path.join(self.install, "data", "home-devices-outages.jsonl")) as f:
+                return [json.loads(line) for line in f]
+        except FileNotFoundError:
+            return []
+
+    def outages_report(self, mod, **kw):
+        out = io.StringIO()
+        args = type("A", (), {"device": kw.get("device"), "days": kw.get("days", 100000)})()
+        with contextlib.redirect_stdout(out):
+            mod.cmd_outages(args, mod.roster_cfg())
+        return out.getvalue()
+
+    def test_outage_log_rows_down_then_recovered_from_first_miss(self):
+        mod = self.load()
+        self.sweep(mod)  # 12:00 all up
+        self.fake.lan["192.0.2.11"] = "none"
+        for _ in range(3):  # first miss 12:02, DOWN at the third, 12:06
+            self.sweep(mod)
+        rows = self.outage_rows()
+        self.assertEqual(rows, [{"device": "Test lamp", "site": "Home", "down_at": "2026-01-05T12:02:00+00:00",
+                                 "up_at": None, "duration_seconds": None, "last_seen": "2026-01-05T12:00:00+00:00"}])
+        self.sweep(mod)  # 12:08 still down: no new row
+        self.assertEqual(len(self.outage_rows()), 1)
+        self.fake.lan["192.0.2.11"] = "ping"
+        self.sweep(mod)  # 12:10 back
+        rows = self.outage_rows()
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[1], {"device": "Test lamp", "site": "Home", "down_at": "2026-01-05T12:02:00+00:00",
+                                   "up_at": "2026-01-05T12:10:00+00:00", "duration_seconds": 480,
+                                   "last_seen": "2026-01-05T12:00:00+00:00"})
+
+    def test_outage_log_uses_failing_since_under_the_lowered_bar(self):
+        roster = json.loads(json.dumps(ROSTER))
+        roster["devices"][1].update(down_after=1, down_after_until=(self.t + dt.timedelta(hours=1)).isoformat())
+        self.write("config/home-devices.json", roster)
+        mod = self.load()
+        self.fake.lan["192.0.2.11"] = "none"
+        self.sweep(mod)  # one miss at 12:00 is a drop
+        self.fake.lan["192.0.2.11"] = "ping"
+        self.sweep(mod)  # back at 12:02
+        rows = self.outage_rows()
+        self.assertEqual([(r["down_at"], r["up_at"], r["duration_seconds"]) for r in rows],
+                         [("2026-01-05T12:00:00+00:00", None, None),
+                          ("2026-01-05T12:00:00+00:00", "2026-01-05T12:02:00+00:00", 120)])
+
+    def test_outage_log_ignores_a_nap_under_the_hold_and_a_dry_run(self):
+        mod = self.load()
+        self.fake.lan["192.0.2.13"] = "none"
+        for _ in range(5):  # under the doorbell's 60-minute hold
+            self.sweep(mod)
+        self.fake.lan["192.0.2.13"] = "ping"
+        self.sweep(mod)
+        self.assertEqual(self.outage_rows(), [])
+        self.fake.lan["192.0.2.11"] = "none"
+        self.sweep(mod)
+        self.sweep(mod)
+        with contextlib.redirect_stdout(io.StringIO()):
+            mod.cmd_sweep(type("A", (), {"dry_run": True})(), mod.roster_cfg())  # the third miss, probed only
+        self.assertEqual(self.outage_rows(), [])
+
+    def test_outages_report_counts_median_longest_and_still_down(self):
+        mod = self.load()
+        path = os.path.join(self.install, "data", "home-devices-outages.jsonl")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        base = dt.datetime(2026, 1, 5, 0, 0, tzinfo=dt.timezone.utc)
+
+        def row(dev, start_min, mins, last_seen=None):
+            d = base + dt.timedelta(minutes=start_min)
+            up = None if mins is None else (d + dt.timedelta(minutes=mins)).isoformat()
+            return {"device": dev, "site": "Home", "down_at": d.isoformat(), "up_at": up,
+                    "duration_seconds": None if mins is None else mins * 60, "last_seen": last_seen}
+
+        rows = [row("Test lamp", 0, None), row("Test lamp", 0, 6),  # one drop: open row, then its recovered row
+                row("Test lamp", 60, 10), row("Test lamp", 120, 20),
+                row("Test lamp", 300, None),  # still down
+                row("Test lock", 30, 4)]
+        with open(path, "w") as f:
+            f.write("not json\n" + "".join(json.dumps(r) + "\n" for r in rows))
+        out = self.outages_report(mod)
+        self.assertIn("Home Test lamp: 4 drops (1 still down)", out)
+        self.assertIn("total 36m, median 10m, longest 20m", out)
+        self.assertIn("still down (", out)
+        self.assertIn("Home Test lock: 1 drop\n", out)
+        only = self.outages_report(mod, device="lock")
+        self.assertIn("Test lock", only)
+        self.assertNotIn("Test lamp", only)
+        self.assertIn("no drops logged", self.outages_report(mod, days=1))
+
+    def test_outages_report_with_no_log(self):
+        mod = self.load()
+        self.assertIn("no drops logged", self.outages_report(mod))
 
 
 if __name__ == "__main__":

@@ -1,0 +1,247 @@
+#!/usr/bin/env node
+// calendar-people — who the user meets (Google Calendar), for person pages.
+//
+// Code side of the meetings half of the people pipeline (jobs/people-email.md
+// Part C; lib/calendar-people.js). `sync`/`backfill` read the primary calendar
+// through gog (network: run from the un-sandboxed trigger); everything else
+// is the local ledger. Descriptions are never fetched.
+
+"use strict";
+
+const fs = require("node:fs");
+const { execFileSync } = require("node:child_process");
+const cal = require("../lib/calendar-people.js");
+
+const args = process.argv.slice(2);
+const cmd = args[0];
+const DAY = 864e5;
+const GOG = process.env.GOG_BIN || ["/opt/homebrew/bin/gog", "/usr/local/bin/gog"].find((p) => fs.existsSync(p)) || "gog";
+
+function flag(name, def = undefined) {
+  const i = args.indexOf(`--${name}`);
+  if (i === -1) return def;
+  const next = args[i + 1];
+  if (!next || next.startsWith("--")) return true;
+  return next;
+}
+
+function usage() {
+  console.log(`calendar-people — Google Calendar meetings ledger for person pages
+
+Ingest (network, gog; run from the trigger):
+  sync [--back-days 45] [--ahead-days 60]     re-read the recent window (edits, deletions, new events)
+  backfill [--since YYYY-MM-DD] [--chunk-days 90]
+                                              read history once, oldest last; resumes where it stopped
+
+Read:
+  stats
+  candidates [--stale] [--limit N] [--json]   pages with held meetings, newest first (* = summary due)
+  unmatched [--limit N] [--json]              qualifying guests with no page
+  titles [--limit N] [--json]                 distinct titles of held events nobody has read yet
+  person <wiki_id> [--limit N] [--json]       one page's meetings
+
+Write (jobs/people-email.md Part C):
+  review --file <json>                        {"<title key>": ["wiki_id", ...]}; every key is marked read,
+                                              the reading applies to every event with that title
+  link <email> <wiki_id> [--note ".."]        this guest address is that person
+  ignore <email> [--note ".."]                not a person (a room, a shared inbox, a bot)
+  not-held <event_id> [--note ".."] [--same-title] [--user]
+                                              on the calendar but it did not happen; never counts.
+                                              --same-title: not a meeting at all (a shared chore or
+                                              reminder): every event with exactly that title.
+                                              Before verify_from only --same-title or --user (the user
+                                              said it did not happen) is accepted: the calendar stands
+  confirm <event_id> [--note ".."]            the day record shows it happened
+  absent <event_id> <wiki_id> [--note ".."]   it happened, but this person was not there
+  present <event_id> <wiki_id>                this person was there though the invite and title don't say
+  verify [--limit N] [--days N] [--json]      past in-person / no-place meetings on days with a day record,
+                                              not yet confirmed or ruled out
+  write-section --person <wiki_id> --summary @file
+                                              replace the page's ## Meetings block, mark summarized
+
+DB: ${cal.DB_PATH}
+`);
+}
+
+function day(ms) {
+  return ms ? new Date(ms).toISOString().slice(0, 10) : "—";
+}
+
+function readWindow(fromMs, toMs) {
+  const acct = cal.account();
+  if (!acct) throw new Error("no calendar account (instance owner_email or calendar-people.json account)");
+  const out = execFileSync(
+    GOG,
+    ["calendar", "list", "primary", "--account", acct, "--from", new Date(fromMs).toISOString(), "--to", new Date(toMs).toISOString(), "--all-pages", "--max=2500", "--json", "--results-only"],
+    { encoding: "utf8", maxBuffer: 256 * 1024 * 1024, timeout: 180_000, env: { ...process.env, GOG_ACCOUNT: acct } },
+  );
+  const parsed = JSON.parse(out || "[]");
+  return Array.isArray(parsed) ? parsed : parsed.events || [];
+}
+
+function sync() {
+  const now = Date.now();
+  const fromMs = now - Number(flag("back-days", 45)) * DAY;
+  const toMs = now + Number(flag("ahead-days", 60)) * DAY;
+  const r = cal.ingestWindow(readWindow(fromMs, toMs), { fromMs, toMs, now });
+  cal.setMeta("synced_at", new Date(now).toISOString());
+  return { ...r, from: day(fromMs), to: day(toMs) };
+}
+
+function backfill() {
+  const cfgSince = cal.config().backfill_from;
+  const since = Date.parse(typeof flag("since") === "string" ? flag("since") : cfgSince || "2010-01-01");
+  const chunk = Number(flag("chunk-days", 90)) * DAY;
+  // Walk back from the oldest window already read (or now) to `since`.
+  let to = Number(cal.getMeta("backfilled_to")) || Date.now();
+  let windows = 0;
+  let events = 0;
+  while (to > since) {
+    const from = Math.max(since, to - chunk);
+    events += cal.ingestWindow(readWindow(from, to), { fromMs: from, toMs: to }).events;
+    cal.setMeta("backfilled_to", from);
+    to = from;
+    windows++;
+  }
+  return { windows, events, backfilled_to: day(Number(cal.getMeta("backfilled_to"))) };
+}
+
+function stats() {
+  const d = cal.db();
+  const n = (sql, ...a) => d.prepare(sql).get(...a).n;
+  const c = cal.candidates();
+  console.log(
+    JSON.stringify(
+      {
+        events: n("SELECT COUNT(*) n FROM events"),
+        held: n("SELECT COUNT(*) n FROM events WHERE status != 'cancelled' AND COALESCE(self_response,'') != 'declined' AND end_ms <= ?", Date.now()),
+        with_guests: n("SELECT COUNT(*) n FROM events WHERE guests > 0"),
+        titles_read: n("SELECT COUNT(*) n FROM title_readings"),
+        titles_naming_people: n("SELECT COUNT(*) n FROM title_readings WHERE wiki_ids != '[]'"),
+        title_mentions: n("SELECT COUNT(*) n FROM mentions"),
+        guest_links: n("SELECT COUNT(*) n FROM attendee_links WHERE ignored = 0"),
+        pages_with_meetings: c.length,
+        stale: c.filter((x) => x.stale).length,
+        summarized: n("SELECT COUNT(*) n FROM links WHERE summarized_at IS NOT NULL"),
+        synced_at: cal.getMeta("synced_at"),
+        backfilled_to: cal.getMeta("backfilled_to") ? day(Number(cal.getMeta("backfilled_to"))) : null,
+      },
+      null,
+      2,
+    ),
+  );
+}
+
+function main() {
+  const asJson = Boolean(flag("json", false));
+  const limit = flag("limit") ? Number(flag("limit")) : null;
+  switch (cmd) {
+    case "sync":
+      return console.log(JSON.stringify(sync()));
+    case "backfill":
+      return console.log(JSON.stringify(backfill()));
+    case "stats":
+      return stats();
+    case "candidates": {
+      const rows = cal.candidates({ staleOnly: Boolean(flag("stale", false)), limit });
+      if (asJson) return console.log(JSON.stringify(rows, null, 2));
+      for (const r of rows) console.log(`${String(r.meetings).padStart(5)}  ${day(r.last_at)}  ${r.stale ? "*" : " "} ${r.wiki_id}  ${r.name}`);
+      return console.log(`\n${rows.length} pages (* = summary due)`);
+    }
+    case "unmatched": {
+      const rows = cal.unmatched({ limit });
+      if (asJson) return console.log(JSON.stringify(rows, null, 2));
+      for (const r of rows) console.log(`${String(r.small_meetings).padStart(4)}  ${day(r.last_at)}  ${r.email}  ${r.names.join(" / ")}${r.contact ? "  [contacts]" : ""}`);
+      return console.log(`\n${rows.length} guests with no page`);
+    }
+    case "titles": {
+      const rows = cal.titlesPending({ limit: limit || 300 });
+      if (asJson) return console.log(JSON.stringify(rows, null, 2));
+      for (const r of rows) console.log(`${r.last}  ${r.key}  ×${r.events}  ${r.title}${r.guests.length ? `  [guests: ${r.guests.map((g) => g.wiki_id || g.name || "?").join(", ")}]` : ""}`);
+      return console.log(`\n${rows.length} titles to read`);
+    }
+    case "person": {
+      if (!args[1]) throw new Error("person <wiki_id>");
+      const r = cal.personDigest(args[1], { limit: Number(flag("limit", 80)) });
+      if (asJson) return console.log(JSON.stringify(r, null, 2));
+      console.log(`${r.name} (${r.wiki_id})  ${JSON.stringify(r.totals)}`);
+      console.log(`by year: ${JSON.stringify(r.by_year)}`);
+      console.log(`log (${r.log.mode}, written under the summary):`);
+      for (const l of r.log.lines.slice(0, 12)) console.log(`  ${l}`);
+      for (const m of r.meetings) console.log(`  ${m.date}${m.upcoming ? " (upcoming)" : ""} ${m.kind} [${m.via}] ${m.title}${m.others.length ? ` — with ${m.others.map((o) => o.name || o.wiki_id || "?").join(", ")}` : ""}`);
+      return;
+    }
+    case "review": {
+      const file = flag("file");
+      if (typeof file !== "string") throw new Error("review --file <json>");
+      return console.log(JSON.stringify(cal.review(JSON.parse(fs.readFileSync(file, "utf8")))));
+    }
+    case "link": {
+      if (!args[1] || !args[2]) throw new Error("link <email> <wiki_id>");
+      cal.linkGuest(args[1], args[2], typeof flag("note") === "string" ? flag("note") : null);
+      return console.log(`linked ${args[1]} → ${args[2]}`);
+    }
+    case "ignore": {
+      if (!args[1]) throw new Error("ignore <email>");
+      cal.ignoreGuest(args[1], typeof flag("note") === "string" ? flag("note") : null);
+      return console.log(`ignored ${args[1]}`);
+    }
+    case "not-held": {
+      if (!args[1]) throw new Error("not-held <event_id>");
+      const note = typeof flag("note") === "string" ? flag("note") : null;
+      if (flag("same-title")) {
+        const t = cal.markTitleNotMeeting(args[1], note);
+        return console.log(`not a meeting: "${t.title}" × ${t.events} (pages to re-summarise: ${t.pages.join(", ") || "none"})`);
+      }
+      const r = cal.markNotHeld(args[1], note, { userSaid: Boolean(flag("user")) });
+      return console.log(`not held: ${args[1]} (pages to re-summarise: ${r.pages.join(", ") || "none"})`);
+    }
+    case "absent": {
+      if (!args[1] || !args[2]) throw new Error("absent <event_id> <wiki_id>");
+      cal.markAbsent(args[1], args[2], typeof flag("note") === "string" ? flag("note") : null);
+      return console.log(`absent: ${args[2]} from ${args[1]}`);
+    }
+    case "present": {
+      if (!args[1] || !args[2]) throw new Error("present <event_id> <wiki_id>");
+      cal.markPresent(args[1], args[2]);
+      return console.log(`present: ${args[2]} at ${args[1]}`);
+    }
+    case "confirm": {
+      if (!args[1]) throw new Error("confirm <event_id>");
+      cal.markConfirmed(args[1], typeof flag("note") === "string" ? flag("note") : null);
+      return console.log(`confirmed: ${args[1]}`);
+    }
+    case "verify": {
+      const ws = require("../lib/wiki-store.js");
+      const days = flag("days") ? Number(flag("days")) : null;
+      const rows = cal.verifyPending({
+        limit: limit || 40,
+        since: days ? Date.now() - days * 864e5 : null,
+        dayExists: (date) => !!ws.getPage(`day_${date}`),
+      });
+      ws.closeDb();
+      if (asJson) return console.log(JSON.stringify(rows, null, 2));
+      for (const r of rows) console.log(`${r.start_local || r.date}  ${r.event_id}  ${r.title}  @ ${r.location || "—"}  [${r.people.map((p) => p.wiki_id).join(", ")}]`);
+      return console.log(`\n${rows.length} meetings to check against the day record (day_<date>)`);
+    }
+    case "write-section": {
+      const person = flag("person");
+      const summaryArg = flag("summary");
+      if (typeof person !== "string" || typeof summaryArg !== "string") throw new Error("write-section needs --person and --summary @file");
+      const summary = summaryArg.startsWith("@") ? fs.readFileSync(summaryArg.slice(1), "utf8") : summaryArg;
+      return console.log(JSON.stringify(cal.writeSection(person, summary)));
+    }
+    default:
+      usage();
+      if (cmd && cmd !== "-h" && cmd !== "--help") process.exitCode = 2;
+  }
+}
+
+try {
+  main();
+} catch (err) {
+  console.error(`calendar-people: ${err.message}`);
+  process.exitCode = 1;
+} finally {
+  cal.closeDb();
+}

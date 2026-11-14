@@ -1,6 +1,8 @@
 # Think before you speak (the speak gate)
 
-**Status (2026-11-10): shadow week (to 2026-11-17).** `bin/speak-gate.mjs` judges every message that reaches the app, after the fact, and holds nothing; the user grades each verdict in the app. The live gate is still `bin/outbound-precheck.mjs`, called from `jori-send-curl`.
+**Status (2026-11-11): LIVE.** Every message to the user in the app is judged by `bin/speak-gate.mjs` BEFORE it is written or pushed, and the verdict is acted on (§ Live). The shadow pass stays on as the safety net for any route that still writes without it.
+
+**2026-11-13: out of the chats, audited nightly.** The app no longer shows the gate's lines (the folded verdict under each message, the held lines, the email folds) and no longer asks the user to grade them. Instead an Opus session re-checks every decision each night for a week and leaves the gate lessons (§ Nightly audit).
 
 ## Why
 
@@ -54,7 +56,43 @@ The user's call (2026-11-10): "shadow for a week and show me your judgement on e
 - Covers every route into the app (jobs, role replies, location, chat answers). Emails to the user are not in the shadow.
 - At the end: the grades decide the prompt and rule changes, then wiring.
 
-## Before wiring (open)
+## Live (2026-11-11)
+
+The user, after the shadow week's first day: "it should be reviewed before i see it — not after"; "review and act — below tell me what was the original and still ask if made the right decision"; "show the reviewed result as primary and the original as hidden until exposed by the user".
+
+`lib/speak-gate-live.mjs` (`gateOutbound`, `recordReview`; CLI `bin/speak-gate-live gate|record|enabled` for shell and Python) runs the gate in front of delivery:
+
+| Verdict | What happens | In the app (until 2026-11-13; no longer shown) |
+|---|---|---|
+| `send` | delivered as written | folded line "Checked, sent as written" |
+| `rewrite` | the gate's text is delivered | "Rewritten before sending"; opening it shows the original |
+| `drop` / `digest` / `resolve` (proactive only) | **held**: never written to `jori_messages`, never pushed | a folded "Held: …" line in the conversation (after the last message before it), with the message it held and, for resolve, what it found |
+| gate error / timeout | delivered as written | "Check failed, sent as written" |
+
+Every line has **Right call / Wrong call** and a note. A reply to something the user wrote is only ever sent or rewritten.
+
+- **Routes:** `bin/jori-send-curl` (after every other gate, before the insert; regardless of `--skip-precheck`; `--agent chat` = reply; a held message prints `{"suppressed":true,"by":"speak-gate"}` to a `--capture-id` file and releases a P1 fold claim), `bin/choice` (the card's options are passed as fixed choices; a location card gets 90 s), `bin/role-session reply` (reply), `bin/jori-send.mjs`, and the phone-channel `reply` tool (reply; `message_file` replies, composed by a tool from the source of record, are not judged). With the gate live, phone-channel does not stream replies, since streamed text would be seen before review, and the older send-then-correct freshness pass runs only when the gate failed.
+- **Scope (2026-11-12):** every message to the user, on every channel (`chat`, `questions`, `system`, `improvements`), and email to the user alone. The user: "everything goes through the gate unless the issue is with the gate itself" — system alerts get rewritten and fact-checked like anything else (it started with a lock-health alert that reached the app unjudged). Not judged: a message about the gate itself (`--intent speak-gate*`, e.g. the relay's own install page, or `SPEAK_GATE_SELF=1`, set on the watchdog's Max-auth pages since the judge runs on Max), and a test run. A gate that is down fails open, as always. The deterministic system-channel checks in `jori-send-curl` (infra-claim provenance, P1 sweep author, mechanism attestation, recovery log, dedup) still run first.
+- **Cron senders (2026-11-12):** the judge is `claude -p` on Max, which only the GUI session can log in to; from cron it answers "Not logged in", and the 6:30 rain-walk summary, the Broadway lottery list and project-task cards were going out as "Check failed, sent as written · judge_unavailable:not_logged_in". On that answer `gateOutbound` now relays the judgment to the on-demand launchd agent `ai.claude.speak-gate-relay` (`bin/speak-gate-relay`; request/verdict files in `data/speak-gate-relay/`; the first kick installs the agent itself via `launchd_kick`) and acts on the relayed verdict. If Max is really down the relayed judge says so too and the message fails open as before. `SPEAK_GATE_NO_RELAY=1` skips it. Test: `tests/speak-gate-relay.test.mjs`.
+- **Budgets (live):** reply 60 s, proactive 240 s (`SPEAK_GATE_LIVE_TIMEOUT_S`).
+- **Storage:** `jori_gate_reviews` (migration 0184): own `id` key; `message_id` optional and unique; `original`, `live`, `held`. The app reloads on realtime changes to the table. A review that cannot be written is parked in `data/speak-gate-live-unrecorded.jsonl`.
+- **Off switch, no deploy:** `data/.speak-gate-off`, or `"live": false` in `agent/local/config/speak-gate.json`. Everything fails open.
+- **After a hold** (migration 0185):
+  - `digest` → the nightly daily summary email prints it verbatim under **"Held for this summary"**, after Decisions (`bin/daily-summary-build` `attachHeldDigests` at prep: every held digest not yet printed and held before that day ended, plus any already printed in that day's summary; `publish` sets `digested_on`). Email only, never the wiki day page; the review's money check skips the list (`class="held-digest"`). The app line then reads "In the daily summary for <day>".
+  - `resolve` → the answer goes back to the role that asked: `bin/role-session prepare` gives that role's next session an "ANSWERS FOUND FOR YOU" block (record it, act on it, never ask again), and phone-channel gives the coordinator's next chat turn the same for chief-of-staff and unsigned senders; `handed_back_at` is set. The gate itself is shown every answer it found in the last 14 days, so a job that asks the same thing again is resolved with the same answer.
+- **Email to the user** (`bin/email-send`, every one of its callers): mail whose ONLY recipient is the user is judged before it is sent. Plain text = proactive (sent, rewritten with the body replaced, or held: not sent, "Held: …" printed, exit 0). HTML = a report the user set up (`kind: "report"`: truth and phrasing only, never held; a suggested fix goes to the app, never spliced into the built HTML). `--in-reply-to` = a reply (never held). Mail that also goes to someone else is not judged. The review has no message row; the app shows it as a folded "Email …" line in the sender's conversation, with the email folded under it. `SPEAK_GATE_EMAIL=0` skips one send (jori-send-curl's push-failure email fallback, already judged).
+
+## Nightly audit (2026-11-13, one week)
+
+The user: "we can clear the 'think before you speak' messages from the chats. let's add an opus process nightly for a week to double check the decisions made that day and provide feedback to the decision maker."
+
+- **Out of the chats:** the app (`ContentView.swift`, `ChannelBadges.swift`) no longer loads `jori_gate_reviews` or shows any line from it; the Right/Wrong grading went with them. Because an installed older build still drew them, migration 0190 also takes the table away from the app's role (select/update policies dropped, out of the realtime publication): every build, for past and future reviews, sees no rows. The service role on the mini is unaffected; no row was deleted. Nothing else changed: the gate still acts, rows are still written, held digests still reach the daily summary.
+- **The audit:** `plugins/speak-gate/bin/speak-gate-audit.mjs`, run by launchd `ai.claude.speak-gate-audit` at 01:50 local (`speak-gate-audit-trigger`, Max-auth guard; launchd because it forks `claude -p`). For the day that just ended (America/New_York), every live review with a verdict other than `error` and no `audited_at` goes to an **Opus, high-effort** research session with the gate's own read-only tools (`lib/speak-gate-agent.mjs`, now shared by both), six to a session, two sessions at a time, 30 min each; money and health senders batch apart and get no web. Each case carries what the role wrote, what was delivered, the gate's reason/checks/sources, the user's own grade if any, and what the user wrote next in that conversation (3 h). It grades the DECISION against what was knowable then: `right | partly | wrong`, a note, and what it should have done.
+- **Stored** on the row (migration 0189): `audit_grade`, `audit_note`, `audit_better`, `audited_at`. The user's `grade`/`note` stay theirs. The night's report: `data/speak-gate-audit/<day>.json`; log `agent/logs/speak-gate-audit.log`.
+- **Feedback to the gate:** after grading, one more Opus pass folds the night's partly/wrong findings, the user's own grades and the current list into at most 12 one-sentence lessons in `data/speak-gate-lessons.json`. `bin/speak-gate.mjs` puts them in every judgment under "LESSONS FROM THE NIGHTLY AUDIT" (the user's standing rules win over them). `SPEAK_GATE_NO_LESSONS=1` leaves them out; `SPEAK_GATE_LESSONS` points at another file (tests).
+- **One week:** the first run sets `ends_at` (+7 days) in `data/speak-gate-audit.json`; the last night emails the user one summary (share right/partly/wrong per night, the latest wrong calls, the lessons now in effect). After that each run exits at once; the lessons stay in effect. Pause: `data/.speak-gate-audit-pause`. A day can be re-run by hand: `speak-gate-audit-trigger 2026-11-14` (`--dry-run`, `--limit N`, `--force` past the week).
+
+## Before wiring (open, as of the shadow week)
 
 - What happens to `resolve` (the role's next session gets the answer to record) and `digest` (the daily summary takes held items) in the live path.
 - The fixed allowlist of pure system alerts that replaces `--skip-precheck`.

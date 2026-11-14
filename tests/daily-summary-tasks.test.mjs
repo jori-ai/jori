@@ -107,3 +107,60 @@ test("the manifest exposes the closed tasks to the narrator", () => {
   assert.equal(m.tasks_completed.length, 3);
   assert.equal(m.tasks_completed_error, null);
 });
+
+// A task one of Jori's own jobs closed is ticked on the user's list by the next
+// sync, and Google stamps that moment as `completed`: a 04:43 "closing" while the
+// Watch had the user asleep. The list is what the user closed.
+test("a completion Jori's own job made is left out; the user's own stay", () => {
+  const lists = [{
+    title: "My Tasks",
+    tasks: [
+      { id: "mine", title: "Ticked off by the user", status: "completed", completed: "2026-08-23T15:00:00.000Z" },
+      { id: "jobs", title: "Closed overnight by a job", status: "completed", completed: "2026-08-23T09:43:57.000Z" },
+    ],
+  }];
+  const byJori = (g) => g.id === "jobs";
+  const picked = selectCompletedTasks(lists, "2026-08-23", "UTC", { byJori });
+  assert.deepEqual(picked.map((t) => t.id), ["mine"]);
+  // Without the test (no projects plugin, no ledger) nothing is hidden.
+  assert.deepEqual(selectCompletedTasks(lists, "2026-08-23", "UTC").map((t) => t.id), ["jobs", "mine"]);
+});
+
+test("the ledger test: a job's closing is left out, the user's, chat's and an earlier tick are not", async () => {
+  const fs = await import("node:fs");
+  const os = await import("node:os");
+  const { _internal } = require(path.join(ROOT, "lib/daily-summary-tasks.js"));
+  const P = require(path.join(ROOT, "lib/plugins.cjs"));
+  if (!P.isEnabled("projects")) return; // the plugin is optional
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dst-ledger-"));
+  const file = path.join(dir, "tasks.json");
+  const done = (id, by, closed_at, gid) => ({ id, status: "done", closed_by: by, closed_at, gtask: { id: gid } });
+  fs.writeFileSync(file, JSON.stringify({ version: 1, meta: { reviewed: {} }, tasks: {
+    "pt-job": done("pt-job", "dream:2026-08-22", "2026-08-23T09:43:39.000Z", "g-job"),
+    "pt-user": done("pt-user", "user", "2026-08-23T09:43:39.000Z", "g-user"),
+    "pt-chat": done("pt-chat", "chat", "2026-08-23T09:43:39.000Z", "g-chat"),
+    "pt-early": done("pt-early", "projects", "2026-08-23T09:43:39.000Z", "g-early"),
+  } }));
+  const prev = process.env.PROJECTS_TASKS_FILE;
+  process.env.PROJECTS_TASKS_FILE = file;
+  try {
+    const byJori = _internal.joriClosedTest();
+    assert.equal(typeof byJori, "function");
+    // Pushed to the list after the ledger closed it: Jori's. Matched by the marker...
+    assert.equal(byJori({ id: "x", notes: "why\n\n[jori:pt-job]", completed: "2026-08-23T09:43:57.000Z" }), true);
+    // ...or by the linked Google task id (an adopted task has no marker).
+    assert.equal(byJori({ id: "g-job", notes: null, completed: "2026-08-23T09:43:57.000Z" }), true);
+    assert.equal(byJori({ id: "g-user", notes: null, completed: "2026-08-23T09:43:57.000Z" }), false);
+    assert.equal(byJori({ id: "g-chat", notes: null, completed: "2026-08-23T09:43:57.000Z" }), false);
+    // The user ticked it before the job closed it in the ledger: theirs.
+    assert.equal(byJori({ id: "g-early", notes: null, completed: "2026-08-23T08:00:00.000Z" }), false);
+    // A task the ledger has never heard of: listed.
+    assert.equal(byJori({ id: "other", notes: "[jori-p1 thread:abc msg:def]", completed: "2026-08-23T09:43:57.000Z" }), false);
+    // A ledger that cannot be read hides nothing.
+    fs.writeFileSync(file, "{ not json");
+    assert.equal(_internal.joriClosedTest(), null);
+  } finally {
+    if (prev === undefined) delete process.env.PROJECTS_TASKS_FILE; else process.env.PROJECTS_TASKS_FILE = prev;
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});

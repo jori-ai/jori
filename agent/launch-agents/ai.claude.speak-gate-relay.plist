@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  speak-gate-relay — ON-DEMAND launchd user agent (no schedule of its own).
+
+  lib/speak-gate-live.mjs kicks it when the speak gate's judge answered "Not
+  logged in": the sender is a cron job, and `claude -p` can read the Max
+  credential from the login keychain only inside the GUI session. It judges
+  the queued requests in data/speak-gate-relay/ (bin/speak-gate-relay) and
+  exits when none are left. Design: system/speak-gate.md § Live.
+
+  Install (a first kick also installs it itself, via launchd_kick):
+    agent/launch-agents/install.sh ai.claude.speak-gate-relay
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>ai.claude.speak-gate-relay</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>__JORI_TOOLS__/bin/cron-run</string>
+        <string>--label</string>
+        <string>speak-gate-relay</string>
+        <string>--</string>
+        <string>__HOME__/.local/node/bin/node</string>
+        <string>__JORI_TOOLS__/bin/speak-gate-relay</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>__HOME__</string>
+        <key>PATH</key>
+        <string>__HOME__/.local/bin:__HOME__/.local/node/bin:/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:__JORI_TOOLS__/bin</string>
+        <key>LANG</key>
+        <string>en_US.UTF-8</string>
+    </dict>
+    <key>WorkingDirectory</key>
+    <string>__JORI_HOME__</string>
+    <key>RunAtLoad</key>
+    <false/>
+    <key>KeepAlive</key>
+    <false/>
+    <key>StandardOutPath</key>
+    <string>__JORI_TOOLS__/data/logs/speak-gate-relay-launchd.log</string>
+    <key>StandardErrorPath</key>
+    <string>__JORI_TOOLS__/data/logs/speak-gate-relay-launchd.log</string>
+</dict>
+</plist>

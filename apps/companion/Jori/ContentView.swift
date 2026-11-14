@@ -68,10 +68,28 @@ struct ContentView: View {
     private static let renderPage = 60
     @State private var scrollToBottomTick: Int = 0
     @State private var confirmSignOut = false
-    @State private var memoryMode = false
+    /// Memory on screen instead of a conversation. Kept, with the
+    /// conversation (ChatViewModel) and the improvement cards, so the app
+    /// reopens on the screen it was left on.
+    @AppStorage(ContentView.memoryOpenKey) private var memoryMode = false
+    private static let memoryOpenKey = Install.key("memoryOpen")
     @StateObject private var memoryState = WebViewState()
     @StateObject private var commandCenter = CommandCenter()
-    @State private var columnVisibility: NavigationSplitViewVisibility = .automatic
+    @State private var columnVisibility: NavigationSplitViewVisibility
+    #if os(macOS)
+    /// The user folded the sidebar to the rail themselves (not by narrowing
+    /// the window), so it reopens folded.
+    @AppStorage(ContentView.sidebarFoldedKey) private var sidebarFolded = false
+    private static let sidebarFoldedKey = Install.key("sidebarFolded")
+    /// How much the window shrank when the user hid the sidebar themselves, so opening
+    /// it again gives that width back — also after a relaunch. 0 when nothing was taken.
+    @AppStorage(Install.key("windowShrunkForSidebar")) private var windowShrunkForSidebar: Double = 0
+    #endif
+    #if os(iOS)
+    /// iPhone: the app was left inside a conversation (or Memory), not on the list.
+    @AppStorage(ContentView.phoneInDetailKey) private var phoneInDetail = false
+    private static let phoneInDetailKey = Install.key("phoneInDetail")
+    #endif
     /// True when the sidebar was hidden by narrowing the window, so widening
     /// it again brings the sidebar back. A sidebar the user hid themselves stays hidden.
     @State private var sidebarAutoHidden = false
@@ -90,9 +108,6 @@ struct ContentView: View {
     /// The sidebar column's width while open — the user can drag it — so hiding it
     /// takes exactly that much off the window.
     @State private var sidebarColumnWidth: CGFloat = 230
-    /// How much the window shrank when the user hid the sidebar themselves, so opening
-    /// it again gives that width back. nil when nothing was taken.
-    @State private var windowShrunkForSidebar: CGFloat?
     #endif
     /// True while the conversation is scrolled away from the latest message
     /// (iOS 18 / macOS 15 and later — older systems never report it, and keep
@@ -107,12 +122,35 @@ struct ContentView: View {
     @State private var isDropTargeted = false
     /// iPhone: the conversation list is the home screen; a conversation (or
     /// Memory) is pushed on top of it.
-    @State private var phonePath: [Destination] = []
+    @State private var phonePath: [Destination]
     @State private var showNewConversation = false
     @State private var showConversationInfo = false
     /// In the software engineer's conversation: the improvement cards instead
     /// of the messages (the old Improvements channel lives there now).
-    @State private var showImprovementCards = false
+    @AppStorage(Install.key("improvementCardsOpen")) private var showImprovementCards = false
+
+    init(onSignOut: @escaping () -> Void = {}) {
+        self.onSignOut = onSignOut
+        let defaults = UserDefaults.standard
+        // Reopen where the app was left, set before the first frame so
+        // nothing visibly pushes or folds on launch.
+        #if os(macOS)
+        _columnVisibility = State(initialValue: defaults.bool(forKey: Self.sidebarFoldedKey) ? .detailOnly : .automatic)
+        #else
+        _columnVisibility = State(initialValue: .automatic)
+        #endif
+        #if os(iOS)
+        if defaults.bool(forKey: Self.phoneInDetailKey) {
+            let conversation = defaults.string(forKey: ChatViewModel.conversationKey) ?? ConversationID.coordinator
+            let screen: Destination = defaults.bool(forKey: Self.memoryOpenKey) ? .memory : .conversation(conversation)
+            _phonePath = State(initialValue: [screen])
+        } else {
+            _phonePath = State(initialValue: [])
+        }
+        #else
+        _phonePath = State(initialValue: [])
+        #endif
+    }
 
     // Trade-approval second factor (only when the build sets a trading app)
     @State private var showApprovalPairing = false
@@ -245,19 +283,76 @@ struct ContentView: View {
         #endif
     }
 
+    #if os(macOS)
+    /// The Mac: the sidebar and the conversation side by side in our own
+    /// layout, not a NavigationSplitView. Hiding the sidebar folds it to the
+    /// avatar rail (ConversationRail) and takes the difference off the window
+    /// in the same instant, so the conversation keeps its width and nothing
+    /// slides, re-wraps or blinks. The split view's own collapse animated the
+    /// column away while the rail appeared beside it and the window resized
+    /// on its own clock: a gap, then a jump, then a redraw.
+    private var splitNavigation: some View {
+        HStack(spacing: 0) {
+            if isSidebarHidden {
+                ConversationRail(team: team, chat: viewModel, inMemory: memoryMode,
+                                 open: { go(.conversation($0)) },
+                                 onDeleted: { gone in
+                                     if viewModel.currentConversation == gone { go(.conversation(team.coordinatorConversation)) }
+                                 })
+            } else {
+                sidebar
+                    .scrollContentBackground(.hidden)
+                    .background(.bar)
+                    .frame(width: Self.sidebarWidth)
+            }
+            Divider()
+            detail
+                .frame(minWidth: 0, maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        }
+        .toolbar {
+            ToolbarItem(placement: .navigation) {
+                Button { columnVisibility = isSidebarHidden ? .all : .detailOnly } label: {
+                    Label(isSidebarHidden ? "Show Sidebar" : "Hide Sidebar", systemImage: "sidebar.left")
+                }
+                .help(isSidebarHidden ? "Show the sidebar (⌃⌘S)" : "Fold the sidebar to avatars (⌃⌘S)")
+                .keyboardShortcut("s", modifiers: [.control, .command])
+            }
+        }
+        // The Mac reads the WINDOW's width from its resize notifications.
+        .background(WindowReader(box: hostWindow) { window in windowResized(to: window.frame.width) })
+        .onReceive(NotificationCenter.default.publisher(for: NSWindow.didResizeNotification)) { note in
+            guard let window = note.object as? NSWindow, window === hostWindow.window else { return }
+            windowResized(to: window.frame.width)
+        }
+        .onChange(of: columnVisibility) { old, new in
+            // Only a fold the user made reopens folded; narrowing the window
+            // folds it again by itself on the next launch.
+            sidebarFolded = new == .detailOnly && !sidebarAutoHidden
+            if new == .detailOnly {
+                // The user folded the sidebar: the window gives up the
+                // sidebar's width minus the rail's, so the conversation keeps
+                // its width. Not when narrowing the window folded it — the
+                // user is already sizing the window themselves.
+                if old != .detailOnly, !sidebarAutoHidden { shrinkWindowForHiddenSidebar() }
+                return
+            }
+            // Open again, by whatever route: a later fold is their own.
+            sidebarAutoHidden = false
+            guard old == .detailOnly, let now = currentWindow?.frame else { return }
+            // Give back what folding took; a narrow window gets the
+            // sidebar's room regardless, so the conversation isn't squeezed.
+            let given = CGFloat(windowShrunkForSidebar)
+            windowShrunkForSidebar = 0
+            let needed = now.width < Self.sidebarRestoreWidth ? Self.sidebarWidth - Self.railWidth : 0
+            let grow = max(given, needed)
+            if grow > 0 { growWindowForSidebar(from: now, by: grow) }
+        }
+    }
+    #else
     private var splitNavigation: some View {
         NavigationSplitView(columnVisibility: $columnVisibility) {
             sidebar
                 .navigationSplitViewColumnWidth(min: 200, ideal: Self.sidebarWidth, max: 320)
-                #if os(macOS)
-                .background {
-                    GeometryReader { geo in
-                        Color.clear
-                            .onAppear { noteSidebarWidth(geo.size.width) }
-                            .onChange(of: geo.size.width) { _, width in noteSidebarWidth(width) }
-                    }
-                }
-                #endif
         } detail: {
             detail
                 .frame(width: detailHeldWidth, alignment: .leading)
@@ -272,49 +367,6 @@ struct ContentView: View {
                 }
         }
         .onChange(of: columnVisibility) { _, _ in holdDetailWidthDuringSidebarAnimation() }
-        #if os(macOS)
-        // The Mac reads the WINDOW's width from its resize notifications.
-        // Both SwiftUI ways of measuring broke the split view there: a
-        // reader attached as a modifier measured the sidebar column (so the
-        // sidebar re-hid every time it opened), and a reader wrapping the
-        // split view collapsed it into a narrow centred column.
-        .background(WindowReader(box: hostWindow) { window in windowResized(to: window.frame.width) })
-        .onReceive(NotificationCenter.default.publisher(for: NSWindow.didResizeNotification)) { note in
-            guard let window = note.object as? NSWindow, window === hostWindow.window else { return }
-            windowResized(to: window.frame.width)
-        }
-        .onChange(of: columnVisibility) { old, new in
-            if new == .detailOnly {
-                // The user hid the sidebar: the window becomes just the
-                // conversation, instead of the conversation stretching into
-                // the sidebar's space. Not when narrowing the window hid it —
-                // the user is already sizing the window themselves.
-                if old != .detailOnly, !sidebarAutoHidden { shrinkWindowForHiddenSidebar() }
-                return
-            }
-            // Open again, by whatever route: a later hide is their own.
-            sidebarAutoHidden = false
-            // The user opened the sidebar: grow the window by the sidebar, from where it stood while
-            // hidden, instead of squeezing the conversation. The frame is
-            // remembered from before, because AppKit may already have
-            // widened the window to the right by the time this runs.
-            // (The automatic restore only happens once the window is
-            // already wide, so it never lands here.)
-            // Grow from where the window is NOW (AppKit hasn't resized it yet
-            // when this runs): a frame remembered at hide time goes stale as
-            // soon as the user moves the window, and growing from it threw the
-            // window back to where it used to be.
-            guard old == .detailOnly, let now = currentWindow?.frame else { return }
-            // Give back what hiding took; and a narrow window gets the
-            // sidebar's full width regardless, so the conversation isn't
-            // squeezed (hiding at the minimum width takes less than that).
-            let given = windowShrunkForSidebar ?? 0
-            windowShrunkForSidebar = nil
-            let needed = now.width < Self.sidebarRestoreWidth ? sidebarColumnWidth : 0
-            let grow = max(given, needed)
-            if grow > 0 { growWindowForSidebar(from: now, by: grow) }
-        }
-        #else
         .background {
             GeometryReader { geo in
                 Color.clear
@@ -322,8 +374,8 @@ struct ContentView: View {
                     .onChange(of: geo.size.width) { _, width in fitSidebar(to: width) }
             }
         }
-        #endif
     }
+    #endif
 
     /// Hold the conversation at its current width until the sidebar (and, on
     /// the Mac, the window: its resize is re-applied at 0.4 s) has settled.
@@ -358,15 +410,9 @@ struct ContentView: View {
         var frame = hidden
         frame.size.width += width
         if frame.maxX > visible.maxX { frame.size.width = max(hidden.width, visible.maxX - frame.minX) }
-        // Instant, not animated: an animated window resize ran on AppKit's
-        // own clock beside the sidebar's slide (plus a corrective re-apply at
-        // 0.4 s), and the two motions fought, so the conversation jittered.
-        // Now the slide is the only motion; the conversation's width is held
-        // meanwhile (holdDetailWidthDuringSidebarAnimation).
+        // Instant and in the same pass as the sidebar's swap, so the
+        // conversation never changes width on screen.
         window.setFrame(frame, display: true, animate: false)
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.45) {
-            if window.frame != frame { window.setFrame(frame, display: true, animate: false) }
-        }
     }
 
     /// The reverse of `growWindowForSidebar`: take the sidebar's width off the
@@ -377,15 +423,14 @@ struct ContentView: View {
         guard let window = currentWindow else { return }
         var frame = window.frame
         let minWidth = max(window.minSize.width, 480)
-        let target = max(minWidth, frame.width - sidebarColumnWidth)
+        // The rail stays, so only the rest of the sidebar's width comes off.
+        let target = max(minWidth, frame.width - (Self.sidebarWidth - Self.railWidth))
         let taken = frame.width - target
         guard taken > 0 else { return }
         frame.size.width = target
-        windowShrunkForSidebar = taken
-        // Instant, after the sidebar has slid away (see growWindowForSidebar).
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
-            window.setFrame(frame, display: true, animate: false)
-        }
+        windowShrunkForSidebar = Double(taken)
+        // Instant, in the same pass as the swap (see growWindowForSidebar).
+        window.setFrame(frame, display: true, animate: false)
     }
 
     /// Only while the sidebar is open: during the hide animation the column
@@ -400,6 +445,8 @@ struct ContentView: View {
     /// it folds away; it returns a little above it (the gap keeps a resize
     /// hovering at the edge from flickering it in and out).
     private static let sidebarWidth: CGFloat = 230
+    /// The folded sidebar (ConversationRail) that stays when it is hidden.
+    private static let railWidth: CGFloat = ConversationRail.width + 1
     private static let sidebarCollapseWidth: CGFloat = 720
     private static let sidebarRestoreWidth: CGFloat = 760
 
@@ -412,12 +459,18 @@ struct ContentView: View {
         let previous = lastMeasuredWidth
         lastMeasuredWidth = width
         let wasNarrow = previous.map { $0 < Self.sidebarCollapseWidth } ?? false
+        #if os(macOS)
+        let fold: Animation? = nil   // the Mac swaps sidebar and rail in place
+        #else
+        let fold: Animation? = .snappy(duration: 0.3)
+        #endif
         if width < Self.sidebarCollapseWidth, !wasNarrow {
             guard !isSidebarHidden else { return }
-            withAnimation(.snappy(duration: 0.3)) { columnVisibility = .detailOnly }
+            // Set before the change, so the window isn't shrunk for it.
             sidebarAutoHidden = true
+            withAnimation(fold) { columnVisibility = .detailOnly }
         } else if width >= Self.sidebarRestoreWidth, sidebarAutoHidden {
-            withAnimation(.snappy(duration: 0.3)) { columnVisibility = .all }
+            withAnimation(fold) { columnVisibility = .all }
             sidebarAutoHidden = false
         }
     }
@@ -434,8 +487,19 @@ struct ContentView: View {
 
     private var sidebar: some View {
         List(selection: Binding<Destination?>(get: { destination }, set: { if let d = $0 { go(d) } })) {
+            if !team.pinnedConversations.isEmpty {
+                PinnedConversationsGrid(team: team,
+                                        selected: memoryMode ? nil : viewModel.currentConversation,
+                                        open: { go(.conversation($0)) },
+                                        onDeleted: { gone in
+                                            if viewModel.currentConversation == gone { go(.conversation(team.coordinatorConversation)) }
+                                        })
+                    .listRowSeparator(.hidden)
+                    .listRowBackground(Color.clear)
+                    .selectionDisabled()
+            }
             Section {
-                ForEach(team.visibleConversations) { conversation in
+                ForEach(team.unpinnedConversations) { conversation in
                     ConversationRowView(conversation: conversation, team: team)
                         .tag(Destination.conversation(conversation.id))
                         .modifier(ConversationDeleteActions(conversation: conversation, team: team) { gone in
@@ -454,10 +518,13 @@ struct ContentView: View {
                     .accessibilityLabel("New conversation")
                 }
             }
+            #if os(iOS)
+            // On the Mac, Memory is in the Go menu (⌘2), not the sidebar.
             Section("Library") {
                 Label("Memory", systemImage: "book.closed")
                     .tag(Destination.memory)
             }
+            #endif
             Section("Approvals") {
                 if TradeApproval.isEnabled {
                     Button { showApprovalPairing = true } label: {
@@ -490,7 +557,9 @@ struct ContentView: View {
             }
         }
         .listStyle(.sidebar)
+        #if os(iOS)
         .navigationTitle(Install.displayName)
+        #endif
         .sensoryFeedback(.selection, trigger: destination)
     }
 
@@ -499,10 +568,16 @@ struct ContentView: View {
     #if os(iOS)
     private var phoneConversationList: some View {
         List {
-            ForEach(team.visibleConversations) { conversation in
+            if !team.pinnedConversations.isEmpty {
+                PinnedConversationsGrid(team: team, open: { go(.conversation($0)) }, phone: true)
+                    .listRowSeparator(.hidden)
+                    .listRowInsets(EdgeInsets(top: 4, leading: 16, bottom: 8, trailing: 16))
+            }
+            ForEach(team.unpinnedConversations) { conversation in
                 Button { go(.conversation(conversation.id)) } label: {
-                    ConversationRowView(conversation: conversation, team: team)
+                    ConversationRowView(conversation: conversation, team: team, phone: true)
                 }
+                .listRowInsets(EdgeInsets(top: 0, leading: 16, bottom: 0, trailing: 16))
                 .buttonStyle(.plain)
                 .modifier(ConversationDeleteActions(conversation: conversation, team: team))
             }
@@ -511,6 +586,7 @@ struct ContentView: View {
         .refreshable { await team.refresh() }
         // Back on the list, the conversation just left counts its unread again.
         .onChange(of: phonePath) { _, path in
+            phoneInDetail = !path.isEmpty
             let left = team.activeConversation
             team.activeConversation = path.isEmpty ? "" : viewModel.currentConversation
             // Mark the conversation just left read BEFORE recounting, so its
@@ -518,11 +594,10 @@ struct ContentView: View {
             if path.isEmpty { Task { await team.markRead(left); await team.loadSummaries() } }
         }
         .navigationTitle(Install.displayName)
+        // Messages keeps its title small and centred over the pins.
+        .navigationBarTitleDisplayMode(.inline)
         .toolbar {
             ToolbarItem(placement: .topBarLeading) { settingsMenu }
-            ToolbarItem(placement: .topBarTrailing) {
-                Button { go(.memory) } label: { Label("Memory", systemImage: "book.closed") }
-            }
             ToolbarItem(placement: .topBarTrailing) {
                 Button { showNewConversation = true } label: {
                     Label("New conversation", systemImage: "square.and.pencil")
@@ -709,6 +784,8 @@ struct ContentView: View {
 
     private var settingsMenu: some View {
         Menu {
+            // Memory lives here on the iPhone (the Go menu, ⌘2, elsewhere).
+            Button { go(.memory) } label: { Label("Memory", systemImage: "book.closed") }
             Section("Approvals") {
                 if TradeApproval.isEnabled {
                     Button { showApprovalPairing = true } label: {
@@ -900,15 +977,13 @@ struct ContentView: View {
             answer: { label, parent in Task { await vm.sendMessage(label, replyTo: parent) } },
             toggleChecklist: { label, on, id in vm.toggleChecklistItem(label, checked: on, on: id) },
             resolveParent: { vm.resolveQuotedParent($0) },
-            dismiss: { vm.dismissQuestion($0) },
-            gradeGate: { id, grade, note in Task { await team.gradeGate(id, grade: grade, note: note) } }
+            dismiss: { vm.dismissQuestion($0) }
         )
     }
 
     private func thread(for m: Message, senderLabel: String? = nil) -> BubbleThread {
         var t = BubbleThread()
         t.senderLabel = senderLabel
-        if m.isAssistant { t.gate = team.gateReviews[m.id] }
         if let parent = m.replyTo { t.quotedParent = viewModel.quotedParent(parent) }
         if m.isUser {
             t.notPickedUp = viewModel.isNotPickedUp(m.id)
@@ -1868,8 +1943,6 @@ struct BubbleThread: Equatable {
     var notPickedUp = false
     /// "Ada · CFO" over the first bubble of a run, where it isn't obvious who is speaking.
     var senderLabel: String?
-    /// The speak gate's shadow verdict on this message, for the user to grade.
-    var gate: GateReview?
 }
 
 /// What a bubble can ask the conversation to do.
@@ -1882,7 +1955,6 @@ struct BubbleActions {
     var toggleChecklist: (String, Bool, UUID) -> Void
     var resolveParent: (UUID) -> Void
     var dismiss: (Message) -> Void
-    var gradeGate: (UUID, String, String) -> Void = { _, _, _ in }
 }
 
 /// Equatable on its inputs (the closures are deliberately left out — they
@@ -1945,13 +2017,6 @@ struct MessageBubble: View, Equatable {
                                       style: .continuous)
     }
 
-    private func openPalette() {
-        reactionTick &+= 1
-        withAnimation(.spring(response: 0.3, dampingFraction: 0.72)) {
-            actions.setPalette(message.id)
-        }
-    }
-
     private func apply(_ reaction: Reaction?) {
         let target = message
         reactionTick &+= 1
@@ -2001,10 +2066,6 @@ struct MessageBubble: View, Equatable {
                     if thread.notPickedUp {
                         notPickedUpLine
                             .transition(.opacity)
-                    }
-
-                    if let gate = thread.gate {
-                        GateReviewLine(review: gate) { grade, note in actions.gradeGate(message.id, grade, note) }
                     }
                 }
 
@@ -2311,11 +2372,10 @@ struct MessageBubble: View, Equatable {
                 .transition(.scale(scale: 0.6, anchor: .bottomLeading).combined(with: .opacity))
             }
         }
-        #if os(iOS)
-        .onLongPressGesture(minimumDuration: 0.35) {
-            openPalette()
-        }
-        #endif
+        // Long-press opens the system menu on iOS (Reply, reactions, Copy,
+        // Share…). A custom 0.35 s long-press for the reaction palette used to
+        // sit here; it fired first and the system menu never opened, so a
+        // Jori message could not be copied or forwarded on the phone.
         .contextMenu {
             replyMenuItem
             if thread.isOpenQuestion {
@@ -2870,6 +2930,11 @@ private struct MacTextViewRepresentable: NSViewRepresentable {
 /// however far the flow of messages has pushed the question itself. Tap a row
 /// to jump to the question; Answer opens a reply to it; the x dismisses it
 /// (a silent reply the server closes in code — see ChatViewModel.dismissQuestion).
+///
+/// Only the most recent questions are listed — three on Mac/iPad, one on a
+/// phone — the header still counts them all. With more than one open, rows show
+/// the question alone (no option buttons) and each row gets its own shade, the
+/// most recent lightest, so neighbouring questions read as separate.
 struct OpenQuestionsTray: View {
     let questions: [Message]
     var reveal: (Message) -> Void
@@ -2878,6 +2943,22 @@ struct OpenQuestionsTray: View {
     /// A tapped option: the same pre-composed reply a tap on the card sends.
     var select: (ChoiceOption, Message) -> Void
     @AppStorage(Install.key("openQuestionsTrayExpanded")) private var expanded = true
+    #if os(iOS)
+    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
+    #endif
+
+    /// How many rows the tray lists: one on a phone, three on Mac/iPad.
+    private var visibleLimit: Int {
+        #if os(iOS)
+        return horizontalSizeClass == .compact ? 1 : 3
+        #else
+        return 3
+        #endif
+    }
+
+    /// The most recent `visibleLimit` questions, oldest first (the newest sits
+    /// nearest the composer).
+    private var shown: [Message] { Array(questions.suffix(visibleLimit)) }
 
     var body: some View {
         if !questions.isEmpty {
@@ -2899,30 +2980,37 @@ struct OpenQuestionsTray: View {
                 }
                 .buttonStyle(.plain)
                 if expanded {
-                    ScrollView {
-                        VStack(spacing: 0) {
-                            ForEach(questions) { q in
-                                Divider().overlay(JoriTheme.hairline)
-                                row(q)
-                            }
+                    let rows = shown
+                    VStack(spacing: 0) {
+                        ForEach(Array(rows.enumerated()), id: \.element.id) { index, q in
+                            Divider().overlay(JoriTheme.hairline)
+                            row(q, showOptions: questions.count == 1)
+                                .background(shade(fromNewest: rows.count - 1 - index, of: rows.count))
                         }
                     }
-                    .frame(maxHeight: 280)
-                    .fixedSize(horizontal: false, vertical: questions.count <= 3)
                 }
             }
             .background(JoriTheme.staffWash, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+            .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
             .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous).stroke(JoriTheme.staff.opacity(0.35), lineWidth: 0.5))
             .transition(.move(edge: .bottom).combined(with: .opacity))
         }
     }
 
-    private func row(_ q: Message) -> some View {
+    /// A row's tint: none for the newest, a step deeper for each older one.
+    /// Only drawn when several rows share the tray.
+    private func shade(fromNewest step: Int, of count: Int) -> Color {
+        count > 1 ? JoriTheme.staff.opacity(0.09 * Double(step)) : .clear
+    }
+
+    private func row(_ q: Message, showOptions: Bool) -> some View {
         // A question that carries tappable options (a decision card, a choice
         // prompt) is answered by tapping one right here. The "Answer" button
         // alone only opens a typed reply, so a card scrolled out of view used to
         // be answerable only in words (2026-11-10: a "stay in touch?" card).
-        let options = ChoicePrompt.from(metadata: q.metadata)?.options ?? []
+        // With several open, the tray lists questions only; answer by tapping
+        // the row (jumps to the card) or Answer.
+        let options = showOptions ? (ChoicePrompt.from(metadata: q.metadata)?.options ?? []) : []
         return VStack(alignment: .leading, spacing: 6) {
             HStack(alignment: .center, spacing: 8) {
                 Button { reveal(q) } label: {

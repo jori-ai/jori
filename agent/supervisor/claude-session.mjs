@@ -87,6 +87,20 @@ export function kernelRulebooks({ root, cwd }) {
 }
 
 /**
+ * The path a rulebook is labelled with in the appended prompt: its PHYSICAL path
+ * relative to the root, so the ops tiers, whose own CLAUDE.md is a symlink to
+ * the same file, frame it with the same line. The prompt cache matches a system
+ * block whole, so one differing header line (the tier's cwd) made every tier's
+ * block a different key and a cold session never read a sibling tier's warm
+ * copy. A file whose physical path leaves the root keeps its path as given.
+ */
+function rulebookLabel(root, f) {
+  const real = (p) => { try { return fs.realpathSync(p); } catch { return p; } };
+  const physical = path.relative(real(root), real(f));
+  return physical && !physical.startsWith("..") && !path.isAbsolute(physical) ? physical : path.relative(root, f);
+}
+
+/**
  * The joined local rules for `role` ("chat" | "ops"; "shared" = shared.md
  * alone), or "" when there are none. `rulebooks` (from kernelRulebooks) puts
  * the kernel rulebooks' text first, framed the way claude frames a discovered
@@ -101,7 +115,7 @@ export function readLocalRules({ localDir, role, rulebooks }) {
     // A rulebook that cannot be read throws: the caller must not exclude a
     // file from discovery that the system prompt does not carry.
     const t = fs.readFileSync(f, "utf8");
-    const rel = rulebooks.root ? path.relative(rulebooks.root, f) : f;
+    const rel = rulebooks.root ? rulebookLabel(rulebooks.root, f) : f;
     parts.push(`Contents of ${rel} (project instructions, checked into the codebase):\n\n${t.trimEnd()}\n`);
   }
   for (const name of role === "shared" ? ["shared.md"] : ["shared.md", `${role}.md`]) {

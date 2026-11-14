@@ -4,6 +4,7 @@
     home-devices sweep [--dry-run]   # probe every device, email on DOWN / back UP (cron, every 2 min)
     home-devices status              # table of the last sweep's view
     home-devices unlisted            # DHCP leases that are NOT in the roster (to decide what to add)
+    home-devices outages [--device NAME] [--days N]   # how often each device dropped and how long it took to reconnect
 
 Requirement: watch every fixed device at each of the user's sites and email
 the user when one drops off or comes back. The host's OWN liveness is a
@@ -79,6 +80,24 @@ whose Wi-Fi power-save naps would otherwise flap Offline/Back online several
 times a day; alert only on an outage longer than the hold). A nap shorter than
 the hold sends nothing, neither the DOWN nor the matching UP.
 
+A roster entry can also LOWER the bar for a while with `down_after` (a count
+of failed sweeps, e.g. 1 to hear about every miss of a device being watched)
+and `down_after_until` (an ISO date-time with offset; after it the device is
+back on DOWN_AFTER on its own, so a temporary watch cannot outlive its reason).
+Without `down_after_until`, `down_after` holds until removed.
+
+Outage log: every DOWN and every UP also appends one line to
+data/home-devices-outages.jsonl, whether or not an email goes out. A device's
+row is {device, site, down_at, up_at, duration_seconds, last_seen}: when it
+goes DOWN a row with up_at and duration_seconds null; when it comes back a
+second row with the same down_at, now complete (the file is append-only; a
+reader pairs rows by device + down_at and the later one wins). `down_at` is the
+first missed sweep (the state's failing_since), not the moment the alert fired,
+and `up_at` is the first good sweep, so each time is good to about one sweep
+(2 minutes). `last_seen` is the last good sweep before the drop. A nap shorter
+than the hold or the DOWN_AFTER bar never goes DOWN and is not logged.
+`home-devices outages` reads it back.
+
 Alerts go out as ONE email per sweep via email-send to the instance owner
 (`alert_to` in the roster overrides); if the send fails (e.g. the site's
 internet is down, which minibeat reports separately) they stay queued in the
@@ -121,6 +140,7 @@ TOOLS = os.path.join(os.environ["JORI_HOME"], _kernel_subdir()) if os.environ.ge
 LOCAL = os.environ.get("JORI_LOCAL_DIR") or os.path.join(TOOLS, "agent", "local")
 ROSTER = os.path.join(LOCAL, "config", "home-devices.json")
 STATE = os.path.join(INSTALL_TOOLS, "data", "home-devices-state.json")
+OUTAGES = os.path.join(INSTALL_TOOLS, "data", "home-devices-outages.jsonl")
 EMAIL_SEND = os.environ.get("HOME_DEVICES_EMAIL_SEND") or os.path.join(TOOLS, "bin", "email-send")
 DOWN_AFTER = 3  # consecutive failed sweeps; at a 2-min cadence ~6 min
 NOT_CONFIGURED = "no home devices configured (agent/local/config/home-devices.json)"
@@ -613,7 +633,8 @@ def send_email(cfg, events):
         lines.append("")
     held = any(d.get("down_after_min") for d in cfg.get("devices", []))
     lines.append(f"Checked from {INST['host_label']} every 2 minutes; a device is called offline after {DOWN_AFTER} missed checks"
-                 + (" (a device with a hold only after it has failed that long)." if held else "."))
+                 + (" (a device with a hold only after it has failed that long)" if held else "")
+                 + ("; a device being watched closely sooner." if any(x.get("down_after") for x in cfg.get("devices", [])) else "."))
     where = INSTALL_TOOLS.replace(HOME, "~", 1).rstrip("/")
     lines.append(f"Current view: {'ssh ' + INST['host'] + ' ' if INST['host'] else ''}{where}/bin/home-devices status")
     to = alert_to(cfg)
@@ -636,6 +657,30 @@ def ring_site(cfg, rname):
     return "Ring"
 
 
+def down_after(d, t):
+    """Failed sweeps before `d` is called DOWN at time `t` (ISO): its own
+    `down_after` while `down_after_until` has not passed, else DOWN_AFTER."""
+    n, until = d.get("down_after"), d.get("down_after_until")
+    if not n:
+        return DOWN_AFTER
+    if until and dt.datetime.fromisoformat(t) > dt.datetime.fromisoformat(until):
+        return DOWN_AFTER
+    return int(n)
+
+
+def log_outages(rows):
+    """Append rows to the outage log. Never fatal: a full disk must not stop the sweep."""
+    if not rows:
+        return
+    try:
+        os.makedirs(os.path.dirname(OUTAGES), exist_ok=True)
+        with open(OUTAGES, "a") as f:
+            for r in rows:
+                f.write(json.dumps(r) + "\n")
+    except OSError as e:
+        print(f"outage log not written: {e}", file=sys.stderr)
+
+
 def cmd_sweep(args, cfg):
     roster = cfg.get("devices", [])
     labels = {k: v.get("label", k) for k, v in cfg.get("sites", {}).items()}
@@ -643,6 +688,7 @@ def cmd_sweep(args, cfg):
     addrs = {}
     results = check_all(cfg, state, addrs)
     t = now_iso()
+    outage_rows = []
     for d in roster:
         name = d["name"]
         tag = {"site": labels.get(d["site"], d["site"]), "anchor": bool(d.get("anchor") or d.get("check") == "router")}
@@ -654,11 +700,16 @@ def cmd_sweep(args, cfg):
             continue
         s.pop("not_judged", None)
         if ok:
+            prev_seen = s.get("last_seen")
             s["last_seen"] = t
             if addrs.get(name):
                 s["ip"] = addrs[name]  # its last good address, tried when it has no lease record
             if s["status"] == "down":
-                state["pending"].append({**tag, "kind": "up", "name": name, "at": t, "since": s.get("since", t)})
+                down_at = s.get("since", t)
+                state["pending"].append({**tag, "kind": "up", "name": name, "at": t, "since": down_at})
+                outage_rows.append({"device": name, "site": tag["site"], "down_at": down_at, "up_at": t,
+                                    "duration_seconds": int((dt.datetime.fromisoformat(t) - dt.datetime.fromisoformat(down_at)).total_seconds()),
+                                    "last_seen": prev_seen})
             s.update(status="up", fails=0)
             s.pop("since", None)
             s.pop("failing_since", None)
@@ -666,10 +717,12 @@ def cmd_sweep(args, cfg):
             s["fails"] = s.get("fails", 0) + 1
             s.setdefault("failing_since", t)
             held = dt.datetime.fromisoformat(t) - dt.datetime.fromisoformat(s["failing_since"])
-            if (s["status"] == "up" and s["fails"] >= DOWN_AFTER
+            if (s["status"] == "up" and s["fails"] >= down_after(d, t)
                     and held >= dt.timedelta(minutes=d.get("down_after_min", 0))):
                 s.update(status="down", since=s["failing_since"])
                 state["pending"].append({**tag, "kind": "down", "name": name, "detail": detail, "last_seen": s.get("last_seen")})
+                outage_rows.append({"device": name, "site": tag["site"], "down_at": s["failing_since"], "up_at": None,
+                                    "duration_seconds": None, "last_seen": s.get("last_seen")})
     # Drop devices removed from the roster.
     names = {d["name"] for d in roster}
     state["devices"] = {k: v for k, v in state["devices"].items() if k in names}
@@ -702,6 +755,7 @@ def cmd_sweep(args, cfg):
         print("pending:", json.dumps(state["pending"]))
         return
 
+    log_outages(outage_rows)
     if state["pending"]:
         sent, info = send_email(cfg, state["pending"])
         if sent:
@@ -725,6 +779,76 @@ def cmd_status(_args, _cfg):
         print(f"queued, not yet emailed: {len(state['pending'])}")
 
 
+def fmt_span(seconds):
+    seconds = int(round(seconds))
+    if seconds < 90:
+        return f"{seconds}s"
+    m = round(seconds / 60)
+    if m < 120:
+        return f"{m}m"
+    h, m = divmod(m, 60)
+    if h < 48:
+        return f"{h}h {m:02d}m"
+    d, h = divmod(h, 24)
+    return f"{d}d {h}h"
+
+
+def read_drops(device=None, days=30):
+    """Drops from the outage log, one per (device, down_at): the recovered row
+    replaces the open one. Sorted oldest first; limited to `days` back from now."""
+    drops = {}
+    try:
+        with open(OUTAGES) as f:
+            for line in f:
+                try:
+                    r = json.loads(line)
+                    key = (r["device"], r["down_at"])
+                    dt.datetime.fromisoformat(r["down_at"])
+                except (ValueError, KeyError, TypeError):
+                    continue
+                if key not in drops or r.get("up_at") or not drops[key].get("up_at"):
+                    drops[key] = r
+    except FileNotFoundError:
+        return []
+    cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=days)
+    rows = [r for r in drops.values() if dt.datetime.fromisoformat(r["down_at"]) >= cutoff]
+    if device:
+        rows = [r for r in rows if device.lower() in r["device"].lower()]
+    return sorted(rows, key=lambda r: r["down_at"])
+
+
+def cmd_outages(args, _cfg):
+    import statistics
+    days = args.days
+    rows = read_drops(args.device, days)
+    scope = f"last {days} days" + (f", devices matching {args.device!r}" if args.device else "")
+    if not rows:
+        print(f"no drops logged ({scope}); log: {OUTAGES}")
+        return
+    now = dt.datetime.now(dt.timezone.utc)
+    print(f"drops, {scope} (times {INST['tz'] or 'local'}; each good to about one 2-minute sweep)")
+    by = {}
+    for r in rows:
+        by.setdefault((r.get("site", ""), r["device"]), []).append(r)
+    for (site, name), rs in sorted(by.items()):
+        done = [r["duration_seconds"] for r in rs if r.get("up_at") and r.get("duration_seconds") is not None]
+        ongoing = len(rs) - len(done)
+        line = f"\n{site + ' ' if site else ''}{name}: {len(rs)} drop{'s' if len(rs) != 1 else ''}"
+        if ongoing:
+            line += f" ({ongoing} still down)"
+        print(line)
+        if done:
+            print(f"  time to reconnect: total {fmt_span(sum(done))}, median {fmt_span(statistics.median(done))}, longest {fmt_span(max(done))}")
+        for r in rs[-20:]:
+            if r.get("up_at"):
+                tail = f"back {local_time(r['up_at'])} ({fmt_span(r['duration_seconds'])})"
+            else:
+                tail = f"still down ({fmt_span((now - dt.datetime.fromisoformat(r['down_at'])).total_seconds())} so far)"
+            print(f"  down {local_time(r['down_at'])}  {tail}")
+        if len(rs) > 20:
+            print(f"  ({len(rs) - 20} older drops not listed)")
+
+
 def cmd_unlisted(_args, cfg):
     known = {d["mac"] for d in cfg.get("devices", []) if "mac" in d}
     known |= set(cfg.get("ignore", {}).keys())
@@ -743,6 +867,9 @@ def main():
     sw.add_argument("--dry-run", action="store_true", help="probe and print; no email, no state write")
     sub.add_parser("status")
     sub.add_parser("unlisted")
+    ou = sub.add_parser("outages")
+    ou.add_argument("--device", help="only devices whose name contains this (case-insensitive)")
+    ou.add_argument("--days", type=int, default=30, help="how far back to look (default 30)")
     args = ap.parse_args()
     cfg = roster_cfg()
     if cfg is None:
@@ -750,7 +877,7 @@ def main():
         return
     load_env()
     if args.cmd != "sweep" or args.dry_run:
-        return {"sweep": cmd_sweep, "status": cmd_status, "unlisted": cmd_unlisted}[args.cmd](args, cfg)
+        return {"sweep": cmd_sweep, "status": cmd_status, "unlisted": cmd_unlisted, "outages": cmd_outages}[args.cmd](args, cfg)
     # A sweep that crashes leaves the user silently unmonitored, so say so —
     # at most every 6 hours, so a persistent bug is one email, not 180.
     try:

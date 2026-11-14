@@ -53,7 +53,7 @@ The contract `email-send` exposes upstream is just:
 email-send --to <to> --subject <subj> [--body <text> | --body-file <path>] [--html] [--from <addr>] [--from-name <name>] [--reply-to <addr>] [--inline path:cid ...]
 ```
 
-…so as long as the script reads those args and POSTs to your provider, the playbooks calling it don't change. Take an hour, swap the provider, you're done.
+…so as long as the script reads those args and POSTs to your provider, the playbooks calling it don't change. Keep the `me` recipient when you swap it: `--to me` (alone or in a comma list) is the owner's address, resolved inside the script by `lib/email-recipients.cjs`, and the agents rely on it to keep that address out of their commands (`docs/outbound-messaging.md` § The account-address guard). Take an hour, swap the provider, you're done.
 
 ## Option C — use Gmail directly (on-behalf-of)
 

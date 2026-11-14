@@ -1,7 +1,7 @@
 {
   "name": "role-customer-success",
   "title": "Customer Success (role)",
-  "description": "The Customer Success on your team: onboarding, health checks and follow-ups with customers. Owns those jobs, signs what they send, and brings this role's specialty to every one of them.",
+  "description": "The Customer Success role on your team: onboarding, health checks and follow-ups with customers. Owns those jobs, signs what they send, and brings this role's specialty to every one of them.",
   "version": "1.0.0",
   "default": "disabled",
   "requires": {

@@ -1,7 +1,7 @@
 {
   "name": "role-software-engineer",
-  "title": "Software Engineer (role)",
-  "description": "The Software Engineer on your team: builds what the CEO asks for, fixes what breaks, improves Jori and ships the apps. Owns those jobs, signs what they send, and brings this role's specialty to every one of them.",
+  "title": "Product (role)",
+  "description": "The Product role on your team: all the tech. Builds what the CEO asks for, fixes what breaks, ships the apps, and keeps the machines up, backed up, safe and within budget. Owns those jobs, signs what they send, and brings this role's specialty to every one of them.",
   "version": "1.0.0",
   "default": "disabled",
   "requires": {
@@ -14,8 +14,8 @@
   "launchd": [],
   "role": {
     "id": "software-engineer",
-    "title": "Software Engineer",
-    "responsibility": "Builds what the CEO asks for, fixes what breaks, improves Jori and ships the apps.",
+    "title": "Product",
+    "responsibility": "All the tech: builds what the CEO asks for, fixes what breaks, improves Jori and ships the apps, and keeps the machines up, backed up, safe and within budget.",
     "jobs": [
       "chat-build",
       "improvement-plan",
@@ -32,11 +32,41 @@
       "daily-summary-fix-*",
       "hum-action-executor",
       "hum-improvement-*",
-      "jev-disagreement-review"
+      "jev-disagreement-review",
+      "watchdog",
+      "minibeat",
+      "chrome-cdp",
+      "chrome-cdp-*",
+      "cyber-watch",
+      "cyber-watch-*",
+      "memory-snapshot",
+      "wiki-db-snapshot",
+      "wiki-cloud-sync",
+      "db-retention",
+      "disk-cleanup",
+      "rotate-agent-logs",
+      "runner-update",
+      "stale-code-watch",
+      "cron-boot-catchup",
+      "cron-tz-sync",
+      "launchd-tz-sync",
+      "apns-token-cleanup",
+      "cost-efficiency-review",
+      "usage-push",
+      "jev-budget-check",
+      "places-budget",
+      "loop-mode-watch",
+      "ping-flush",
+      "control-scan",
+      "dashboard",
+      "jori-sync",
+      "home-devices"
     ],
     "intents": [
       "chat-build-result",
-      "self-improve"
+      "self-improve",
+      "cyber-watch",
+      "cost-review"
     ],
     "specialization": "specialization.md"
   }

@@ -72,7 +72,19 @@ const TEXT = localConfig("tools-mcp", {
   episode_assoc_question: "which lunch did <friend> come to",
 });
 
+// What a failed command returns. One the wrapper killed at its timeout used to
+// come back as the bare "Command failed: …", which reads like the command
+// itself broke; say it timed out, and after how long.
+function describeExecError(err, timeoutMs) {
+  if (err && err.killed && (err.signal === "SIGTERM" || err.signal == null) && timeoutMs) {
+    const said = String(err.stderr || "").trim();
+    return `timed out after ${Math.round(timeoutMs / 1000)}s${said ? `: ${said}` : ""}`;
+  }
+  return String((err && (err.stderr || err.message)) ?? err);
+}
+
 async function run(cmd, args = [], opts = {}) {
+  const timeoutMs = opts.timeout ?? 30000;
   try {
     const { env: optsEnv, ...restOpts } = opts;
     const { stdout, stderr } = await exec(cmd, args, {
@@ -86,7 +98,7 @@ async function run(cmd, args = [], opts = {}) {
     });
     return (stdout || stderr || "Done").trim();
   } catch (err) {
-    return `Error: ${err.stderr || err.message}`;
+    return `Error: ${describeExecError(err, timeoutMs)}`;
   }
 }
 

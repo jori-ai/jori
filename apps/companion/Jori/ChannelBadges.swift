@@ -13,8 +13,8 @@
 //  A fresh install shows only the coordinator; a role's conversation appears
 //  when the role has something to say (the server creates it on its first
 //  message) or when the user starts one. The old channels are roles'
-//  conversations: System is IT & Security's, Improvements the software
-//  engineer's, and a question lives with the role that asked it.
+//  conversations: System and Improvements are Product's (all the tech), and
+//  a question lives with the role that asked it.
 //
 //  Counts per conversation, and what they mean:
 //    - unread    → assistant messages not marked read yet (zero for the one on
@@ -58,7 +58,7 @@ struct TeamMember: Identifiable, Codable, Equatable, Hashable {
     }
 
     /// "Ada · CFO": a name always travels with its role.
-    var label: String { "\(name) · \(title)" }
+    var label: String { title.isEmpty || title == name ? name : "\(name) · \(title)" }
 
     var initials: String {
         let parts = name.split(separator: " ")
@@ -81,13 +81,17 @@ struct Conversation: Identifiable, Codable, Equatable, Hashable {
     var members: [String]
     var lastMessageAt: Date?
     var archived: Bool
+    /// When it was pinned to the top of the list; nil = not pinned.
+    var pinnedAt: Date?
 
     enum CodingKeys: String, CodingKey {
         case id, kind, title, members, archived
         case lastMessageAt = "last_message_at"
+        case pinnedAt = "pinned_at"
     }
 
     var isGroup: Bool { kind == "group" }
+    var isPinned: Bool { pinnedAt != nil }
 }
 
 /// What a conversation's row shows besides its people.
@@ -104,6 +108,10 @@ struct ConversationSummary: Equatable {
 @MainActor
 final class TeamStore: ObservableObject {
     @Published private(set) var team: [TeamMember] = []
+    /// Roles installed but not on the team yet (jori_team.enabled = false): the
+    /// user can add one, and it joins the team (system/org.md § Growing the
+    /// team). A personal assistant becomes the chief of staff when one does.
+    @Published private(set) var available: [TeamMember] = []
     @Published private(set) var conversations: [Conversation] = []
     @Published private(set) var summaries: [String: ConversationSummary] = [:]
     /// Improvement cards waiting on Face ID: counted on the software engineer's conversation.
@@ -129,7 +137,7 @@ final class TeamStore: ObservableObject {
 
     func member(_ id: String?) -> TeamMember? {
         guard let id else { return nil }
-        return team.first { $0.id == id }
+        return team.first { $0.id == id } ?? available.first { $0.id == id }
     }
 
     /// The coordinator's conversation: the chief of staff's, once the team has
@@ -172,8 +180,9 @@ final class TeamStore: ObservableObject {
         id.split(separator: "-").map { $0.prefix(1).uppercased() + $0.dropFirst() }.joined(separator: " ")
     }
 
-    /// The conversations the list shows, newest first. The coordinator is
-    /// always there, even before its first row exists.
+    /// The conversations the list shows: pinned ones first (in the order they
+    /// were pinned, like iMessage), then the rest newest first. The coordinator
+    /// is always there, even before its first row exists.
     var visibleConversations: [Conversation] {
         var list = conversations.filter { !$0.archived }
         let coord = coordinatorConversation
@@ -183,11 +192,22 @@ final class TeamStore: ObservableObject {
                                      lastMessageAt: nil, archived: false))
         }
         return list.sorted { a, b in
+            switch (a.pinnedAt, b.pinnedAt) {
+            case let (pa?, pb?): return pa < pb
+            case (.some, nil): return true
+            case (nil, .some): return false
+            case (nil, nil): break
+            }
             let da = summaries[a.id]?.previewAt ?? a.lastMessageAt ?? .distantPast
             let db = summaries[b.id]?.previewAt ?? b.lastMessageAt ?? .distantPast
             return da > db
         }
     }
+
+    /// The pinned conversations, in pin order: the grid of circles on top.
+    var pinnedConversations: [Conversation] { visibleConversations.filter(\.isPinned) }
+    /// Everything else, newest first: the rows under the grid.
+    var unpinnedConversations: [Conversation] { visibleConversations.filter { !$0.isPinned } }
 
     // MARK: Counts
 
@@ -277,7 +297,6 @@ final class TeamStore: ObservableObject {
         await loadTeam()
         await loadConversations()
         await loadSummaries()
-        await loadGateReviews(activeConversation)
         if let n = try? await SelfImproveApproval.pendingApprovalCount(), n != pendingImprovements {
             pendingImprovements = n
         }
@@ -289,11 +308,16 @@ final class TeamStore: ObservableObject {
             let rows: [TeamMember] = try await SupabaseManager.shared
                 .from(Self.teamTable)
                 .select("id,name,title,responsibility,chief_of_staff,enabled,sort,avatar_url")
-                .eq("enabled", value: true)
                 .order("sort", ascending: true)
                 .execute()
                 .value
-            if rows != team { team = rows }
+            // A role the user just added stays on the team here until the
+            // server has turned it on (and the next load says enabled).
+            let on = rows.filter { $0.enabled || joining.contains($0.id) }
+            for r in rows where r.enabled { joining.remove(r.id) }
+            let off = rows.filter { !$0.enabled && !joining.contains($0.id) }
+            if on != team { team = on }
+            if off != available { available = off }
         } catch {
             print("[Team] team load failed: \(error)")
         }
@@ -302,61 +326,30 @@ final class TeamStore: ObservableObject {
     func loadConversations() async {
         do {
             try await SupabaseManager.ensureAuthenticated()
-            let rows: [Conversation] = try await SupabaseManager.shared
-                .from(Self.conversationsTable)
-                .select("id,kind,title,members,last_message_at,archived")
-                .execute()
-                .value
+            let rows: [Conversation]
+            do {
+                rows = try await SupabaseManager.shared
+                    .from(Self.conversationsTable)
+                    .select("id,kind,title,members,last_message_at,archived,pinned_at")
+                    .execute()
+                    .value
+            } catch {
+                // A database without migration 0183 has no pinned_at: list
+                // the conversations unpinned rather than not at all.
+                rows = try await SupabaseManager.shared
+                    .from(Self.conversationsTable)
+                    .select("id,kind,title,members,last_message_at,archived")
+                    .execute()
+                    .value
+            }
             if rows != conversations { conversations = rows }
         } catch {
             print("[Team] conversations load failed: \(error)")
         }
     }
 
-    // MARK: Gate reviews (shadow week, system/speak-gate.md)
-
-    /// The think-before-you-speak gate's verdict on each message, judged in
-    /// shadow (nothing is held), shown under the message for the user to grade.
-    @Published var gateReviews: [UUID: GateReview] = [:]
     /// Every open question the badges count, by conversation (loadSummaries).
     @Published var openQuestionMessages: [String: [Message]] = [:]
-    static let gateReviewsTable = "jori_gate_reviews"
-
-    func loadGateReviews(_ conversationId: String) async {
-        guard !conversationId.isEmpty else { return }
-        do {
-            try await SupabaseManager.ensureAuthenticated()
-            let rows: [GateReview] = try await SupabaseManager.shared
-                .from(Self.gateReviewsTable)
-                .select("message_id,verdict,reason,suggestion,grade,note")
-                .eq("conversation_id", value: conversationId)
-                .order("judged_at", ascending: false)
-                .limit(300)
-                .execute()
-                .value
-            var next = gateReviews
-            for r in rows { next[r.message_id] = r }
-            if next != gateReviews { gateReviews = next }
-        } catch {
-            print("[Team] gate reviews load failed: \(error)")
-        }
-    }
-
-    /// The user's grade on one verdict: "right" or "wrong", with an optional note.
-    func gradeGate(_ messageId: UUID, grade: String, note: String) async {
-        if let r = gateReviews[messageId] { gateReviews[messageId] = r.graded(grade, note: note) }
-        struct Patch: Encodable { let grade: String; let note: String?; let graded_at: String }
-        do {
-            try await SupabaseManager.ensureAuthenticated()
-            try await SupabaseManager.shared
-                .from(Self.gateReviewsTable)
-                .update(Patch(grade: grade, note: note.isEmpty ? nil : note, graded_at: Date().ISO8601Format()))
-                .eq("message_id", value: messageId.uuidString)
-                .execute()
-        } catch {
-            print("[Team] gate grade failed: \(error)")
-        }
-    }
 
     /// Everything in a conversation the user has opened is read: clear its
     /// count here at once, and mark every unread assistant row in it read on
@@ -522,6 +515,48 @@ final class TeamStore: ObservableObject {
         }
     }
 
+    /// Pin a conversation to the top of the list, or unpin it. Stored on the
+    /// row (pinned_at, migration 0183) so every device shows the same pins.
+    func setPinned(_ id: String, _ pinned: Bool) async {
+        let now = Date()
+        if let i = conversations.firstIndex(where: { $0.id == id }) {
+            conversations[i].pinnedAt = pinned ? now : nil
+        }
+        struct Patch: Encodable {
+            let id: String
+            let pinned_at: String?
+            // Encode a null explicitly: unpinning must clear the column.
+            func encode(to e: Encoder) throws {
+                var c = e.container(keyedBy: CodingKeys.self)
+                try c.encode(pinned_at, forKey: .pinned_at)
+            }
+            enum CodingKeys: String, CodingKey { case pinned_at }
+        }
+        let stamp = pinned ? ISO8601DateFormatter().string(from: now) : nil
+        do {
+            try await SupabaseManager.ensureAuthenticated()
+            if conversations.contains(where: { $0.id == id }) {
+                try await SupabaseManager.shared
+                    .from(Self.conversationsTable)
+                    .update(Patch(id: id, pinned_at: stamp))
+                    .eq("id", value: id)
+                    .execute()
+            } else if let roleId = ConversationID.roleId(id) {
+                // The coordinator before its first row exists.
+                await write(ConversationRow(id: id, kind: "role", title: nil, members: [roleId], created_by: "user"))
+                try await SupabaseManager.shared
+                    .from(Self.conversationsTable)
+                    .update(Patch(id: id, pinned_at: stamp))
+                    .eq("id", value: id)
+                    .execute()
+            }
+            await loadConversations()
+        } catch {
+            print("[Team] pin conversation failed: \(error)")
+            await loadConversations()
+        }
+    }
+
     private struct ConversationRow: Encodable {
         let id: String
         let kind: String
@@ -530,11 +565,45 @@ final class TeamStore: ObservableObject {
         let created_by: String
     }
 
+    /// Roles the user added that the server has not turned on yet.
+    private var joining: Set<String> = []
+
+    /// Bring roles that are not on the team yet onto it: flag them in
+    /// jori_team (requested_at) for the server to turn on, and show them as
+    /// teammates right away.
+    func join(_ roleIds: [String]) async {
+        let newcomers = roleIds.filter { id in available.contains { $0.id == id } }
+        guard !newcomers.isEmpty else { return }
+        struct Patch: Encodable { let requested_at: String }
+        let stamp = ISO8601DateFormatter().string(from: Date())
+        for id in newcomers {
+            joining.insert(id)
+            if let i = available.firstIndex(where: { $0.id == id }) {
+                var m = available.remove(at: i)
+                m.enabled = true
+                team.append(m)
+            }
+        }
+        do {
+            try await SupabaseManager.ensureAuthenticated()
+            try await SupabaseManager.shared
+                .from(Self.teamTable)
+                .update(Patch(requested_at: stamp))
+                .in("id", values: newcomers)
+                .execute()
+        } catch {
+            print("[Team] adding \(newcomers) failed: \(error)")
+            joining.subtract(newcomers)
+            await loadTeam()
+        }
+    }
+
     /// The conversation with exactly these roles: the role's own for one, a new
     /// group for several (an existing group with the same people is reused).
     func conversation(with roleIds: [String]) async -> String? {
         let ids = Array(Set(roleIds)).sorted()
         guard !ids.isEmpty else { return nil }
+        await join(ids)
         if ids.count == 1 {
             let id = ConversationID.role(ids[0])
             if !conversations.contains(where: { $0.id == id }) {
@@ -559,6 +628,7 @@ final class TeamStore: ObservableObject {
         let current = memberIds(of: conversationId)
         let missing = roleIds.filter { !current.contains($0) }
         guard !missing.isEmpty else { return conversationId }
+        await join(missing)
         let c = conversations.first(where: { $0.id == conversationId })
         let kind = c?.kind ?? (ConversationID.isGroup(conversationId) ? "group" : "role")
         await write(ConversationRow(id: conversationId, kind: kind, title: c?.title,
@@ -755,6 +825,10 @@ struct TeamAvatar: View {
 struct ConversationRowView: View {
     let conversation: Conversation
     @ObservedObject var team: TeamStore
+    /// The iPhone home list, sized like Messages on iOS: 40pt avatar, 17pt
+    /// semibold name, 15pt time with a chevron, two 15pt preview lines.
+    /// Off, the denser Mac/iPad sidebar row.
+    var phone = false
 
     var body: some View {
         let members = team.members(of: conversation.id)
@@ -763,31 +837,38 @@ struct ConversationRowView: View {
         let questions = team.openQuestions(conversation.id)
         let waiting = team.waiting(conversation.id)
         let badge = team.badgeCount(conversation.id)
-        HStack(alignment: .top, spacing: 12) {
-            TeamAvatar(members: members, size: 42)
-            VStack(alignment: .leading, spacing: 2) {
+        HStack(alignment: phone ? .center : .top, spacing: 12) {
+            TeamAvatar(members: members, size: phone ? 40 : 42)
+            VStack(alignment: .leading, spacing: phone ? 1 : 2) {
                 HStack(alignment: .firstTextBaseline, spacing: 6) {
                     nameLine(members)
                         .lineLimit(1)
                     Spacer(minLength: 4)
                     if let at = summary?.previewAt ?? conversation.lastMessageAt {
-                        Text(Self.when(at))
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
+                        HStack(alignment: .firstTextBaseline, spacing: 5) {
+                            Text(Self.when(at))
+                                .font(phone ? .subheadline : .caption)
+                                .foregroundStyle(.secondary)
+                            if phone {
+                                Image(systemName: "chevron.right")
+                                    .font(.footnote.weight(.semibold))
+                                    .foregroundStyle(.tertiary)
+                            }
+                        }
                     }
                 }
                 HStack(alignment: .top, spacing: 6) {
                     Text(summary?.preview ?? (members.first?.responsibility ?? ""))
                         .font(.subheadline)
                         .foregroundStyle(.secondary)
-                        .lineLimit(2)
-                    Spacer(minLength: 4)
+                        .lineLimit(2, reservesSpace: phone)
+                        .frame(maxWidth: .infinity, alignment: .leading)
                     // One red badge, only when something is waiting.
                     if badge > 0 { ChannelBadgeBubble(count: badge) }
                 }
             }
         }
-        .padding(.vertical, 4)
+        .padding(.vertical, phone ? 6 : 4)
         .contentShape(Rectangle())
         .accessibilityElement(children: .combine)
         .accessibilityValue([unread > 0 ? "\(unread) unread" : nil,
@@ -798,14 +879,17 @@ struct ConversationRowView: View {
 
     @ViewBuilder
     private func nameLine(_ members: [TeamMember]) -> some View {
-        if conversation.isGroup {
+        if conversation.isGroup && phone {
+            // Messages shows a group by its name alone; the avatar shows who.
+            Text(team.title(of: conversation.id)).font(.body.weight(.semibold))
+        } else if conversation.isGroup {
             VStack(alignment: .leading, spacing: 0) {
                 Text(team.title(of: conversation.id)).font(.headline)
                 Text(members.map(\.label).joined(separator: ", "))
                     .font(.caption).foregroundStyle(.secondary)
             }
         } else if let m = members.first {
-            (Text(m.name).font(.headline)
+            (Text(m.name).font(phone ? .body.weight(.semibold) : .headline)
              + Text(m.title.isEmpty ? "" : "  \(m.title)").font(.subheadline).foregroundColor(.secondary))
         }
     }
@@ -821,6 +905,180 @@ struct ConversationRowView: View {
     }
 }
 
+// MARK: - Pinned conversations
+
+/// The pinned conversations as iMessage shows them: circles, three across,
+/// the name under each, above the list. A red badge sits on a circle when
+/// something is waiting; right-click / long-press unpins or deletes.
+struct PinnedConversationsGrid: View {
+    @ObservedObject var team: TeamStore
+    var selected: String?
+    let open: (String) -> Void
+    var onDeleted: (String) -> Void = { _ in }
+    /// The iPhone home list, sized like Messages' pins: 76pt circles, the
+    /// name alone under each in 12pt. Off, the smaller Mac/iPad sidebar tiles.
+    var phone = false
+
+    private var columns: [GridItem] {
+        Array(repeating: GridItem(.flexible(), spacing: phone ? 12 : 18, alignment: .top), count: 3)
+    }
+
+    var body: some View {
+        LazyVGrid(columns: columns, spacing: phone ? 14 : 18) {
+            ForEach(team.pinnedConversations) { conversation in
+                tile(conversation)
+                    .modifier(ConversationDeleteActions(conversation: conversation, team: team, onDeleted: onDeleted, swipes: false))
+            }
+        }
+        .padding(.vertical, 8)
+    }
+
+    private func tile(_ conversation: Conversation) -> some View {
+        let badge = team.badgeCount(conversation.id)
+        let isSelected = selected == conversation.id
+        let name = team.title(of: conversation.id)
+        let role = team.subtitle(of: conversation.id)
+        return Button { open(conversation.id) } label: {
+            VStack(spacing: phone ? 5 : 6) {
+                TeamAvatar(members: team.members(of: conversation.id), size: phone ? 76 : 54)
+                    .padding(phone ? 0 : 3)
+                    .overlay {
+                        if isSelected { Circle().strokeBorder(JoriTheme.cobalt, lineWidth: 2.5) }
+                    }
+                    .overlay(alignment: .topTrailing) {
+                        if badge > 0 { ChannelBadgeBubble(count: badge).offset(x: 2, y: -2) }
+                    }
+                VStack(spacing: 1) {
+                    Text(Self.short(name))
+                        .font(phone ? .caption : .system(size: 10, weight: .medium))
+                        .foregroundStyle(phone ? .secondary : .primary)
+                    if !role.isEmpty, !phone {
+                        Text(Self.short(role))
+                            .font(.system(size: 9))
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                .lineLimit(1)
+                .minimumScaleFactor(0.85)
+            }
+            .frame(maxWidth: .infinity)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(name + (role.isEmpty ? "" : ", \(role)") + (badge > 0 ? ", \(badge) waiting" : "") + ", pinned")
+    }
+
+    /// At most 16 characters under a circle, with an ellipsis when cut.
+    static func short(_ s: String) -> String {
+        s.count > 16 ? s.prefix(16).trimmingCharacters(in: .whitespaces) + "…" : s
+    }
+}
+
+// MARK: - Collapsed sidebar (Mac)
+
+/// The sidebar folded to a rail, the way Messages on the Mac does it: one
+/// avatar per conversation with its name and role under it, pinned ones first, a short
+/// rule, then the rest. The open one sits on a blue tile; a red badge marks
+/// what is waiting. Right-click pins, unpins or deletes.
+struct ConversationRail: View {
+    @ObservedObject var team: TeamStore
+    /// The conversation on screen is read from here by each tile itself.
+    @ObservedObject var chat: ChatViewModel
+    /// Memory is on screen: no conversation is highlighted.
+    var inMemory = false
+    let open: (String) -> Void
+    var onDeleted: (String) -> Void = { _ in }
+
+    static let width: CGFloat = 84
+
+    var body: some View {
+        ScrollView(.vertical) {
+            // Not lazy: a lazy stack kept a stale tile, and the conversation
+            // just left stayed blue. A dozen tiles cost nothing to keep.
+            VStack(spacing: 4) {
+                ForEach(team.pinnedConversations) { item($0) }
+                if !team.pinnedConversations.isEmpty, !team.unpinnedConversations.isEmpty {
+                    Capsule()
+                        .fill(.secondary.opacity(0.35))
+                        .frame(width: 44, height: 2)
+                        .padding(.vertical, 6)
+                }
+                ForEach(team.unpinnedConversations) { item($0) }
+            }
+            .padding(.horizontal, 8)
+            .padding(.vertical, 8)
+        }
+        .scrollIndicators(.never)
+        .frame(width: Self.width)
+        .frame(maxHeight: .infinity)
+        .background(.bar)
+    }
+
+    private func item(_ conversation: Conversation) -> some View {
+        RailItem(conversation: conversation, team: team, chat: chat, inMemory: inMemory,
+                 open: open, onDeleted: onDeleted)
+    }
+}
+
+/// One avatar in the rail. It watches the conversation on screen itself
+/// (not a value handed down), and draws the blue tile only while selected:
+/// handed down, the conversation just left could stay blue.
+private struct RailItem: View {
+    let conversation: Conversation
+    @ObservedObject var team: TeamStore
+    @ObservedObject var chat: ChatViewModel
+    let inMemory: Bool
+    let open: (String) -> Void
+    let onDeleted: (String) -> Void
+
+    var body: some View {
+        let isSelected = !inMemory && chat.currentConversation == conversation.id
+        let badge = team.badgeCount(conversation.id)
+        let name = team.title(of: conversation.id)
+        let role = team.subtitle(of: conversation.id)
+        Button { open(conversation.id) } label: {
+            VStack(spacing: 4) {
+                TeamAvatar(members: team.members(of: conversation.id), size: 44)
+                    .overlay(alignment: .topTrailing) {
+                        if badge > 0 { ChannelBadgeBubble(count: badge).offset(x: 4, y: -2) }
+                    }
+                VStack(spacing: 1) {
+                    Text(name)
+                        .font(.system(size: 10, weight: .medium))
+                        .foregroundStyle(isSelected ? Color.white : Color.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                    if !role.isEmpty {
+                        Text(role)
+                            .font(.system(size: 8.5))
+                            .foregroundStyle(isSelected ? Color.white.opacity(0.8) : Color.secondary.opacity(0.75))
+                            .lineLimit(2)
+                            .multilineTextAlignment(.center)
+                            .minimumScaleFactor(0.85)
+                    }
+                }
+            }
+            .padding(.vertical, 8)
+            .padding(.horizontal, 4)
+            .frame(maxWidth: .infinity)
+            .background {
+                if isSelected {
+                    RoundedRectangle(cornerRadius: 12, style: .continuous)
+                        .fill(JoriTheme.cobalt)
+                }
+            }
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .focusEffectDisabled()
+        .transaction { $0.animation = nil }
+        .help(role.isEmpty ? name : "\(name) — \(role)")
+        .accessibilityLabel(name + (role.isEmpty ? "" : ", \(role)") + (badge > 0 ? ", \(badge) waiting" : "") + (conversation.isPinned ? ", pinned" : ""))
+        .accessibilityAddTraits(isSelected ? .isSelected : [])
+        .modifier(ConversationDeleteActions(conversation: conversation, team: team, onDeleted: onDeleted, swipes: false))
+    }
+}
+
 // MARK: - New conversation
 
 /// Start a conversation with one role or a group of several.
@@ -832,26 +1090,19 @@ struct NewConversationSheet: View {
 
     var body: some View {
         NavigationStack {
-            List(team.team) { m in
-                Button {
-                    if picked.contains(m.id) { picked.remove(m.id) } else { picked.insert(m.id) }
-                } label: {
-                    HStack(spacing: 12) {
-                        TeamAvatar(members: [m], size: 34)
-                        VStack(alignment: .leading, spacing: 1) {
-                            Text(m.label).foregroundStyle(.primary)
-                            if let r = m.responsibility {
-                                Text(r).font(.caption).foregroundStyle(.secondary).lineLimit(2)
-                            }
-                        }
-                        Spacer()
-                        Image(systemName: picked.contains(m.id) ? "checkmark.circle.fill" : "circle")
-                            .foregroundStyle(picked.contains(m.id) ? JoriTheme.cobalt : .secondary)
-                            .font(.title3)
-                    }
-                    .contentShape(Rectangle())
+            List {
+                Section {
+                    ForEach(team.team) { row($0) }
                 }
-                .buttonStyle(.plain)
+                if !team.available.isEmpty {
+                    Section {
+                        ForEach(team.available) { row($0) }
+                    } header: {
+                        Text("Add to your team")
+                    } footer: {
+                        Text("Each one takes over its own area.")
+                    }
+                }
             }
             .navigationTitle(picked.count > 1 ? "New group" : "New conversation")
             #if os(iOS)
@@ -868,6 +1119,28 @@ struct NewConversationSheet: View {
                 }
             }
         }
+    }
+
+    private func row(_ m: TeamMember) -> some View {
+        Button {
+            if picked.contains(m.id) { picked.remove(m.id) } else { picked.insert(m.id) }
+        } label: {
+            HStack(spacing: 12) {
+                TeamAvatar(members: [m], size: 34)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(m.label).foregroundStyle(.primary)
+                    if let r = m.responsibility {
+                        Text(r).font(.caption).foregroundStyle(.secondary).lineLimit(2)
+                    }
+                }
+                Spacer()
+                Image(systemName: picked.contains(m.id) ? "checkmark.circle.fill" : "circle")
+                    .foregroundStyle(picked.contains(m.id) ? JoriTheme.cobalt : .secondary)
+                    .font(.title3)
+            }
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
     }
 }
 
@@ -1064,137 +1337,60 @@ struct HiddenToolbarTitle: ViewModifier {
 #endif
 
 
-// MARK: - Gate review (shadow week)
+// MARK: - Pinning and deleting a conversation
 
-struct GateReview: Codable, Equatable {
-    let message_id: UUID
-    let verdict: String
-    let reason: String?
-    let suggestion: String?
-    var grade: String?
-    var note: String?
-
-    func graded(_ g: String, note n: String) -> GateReview {
-        var c = self; c.grade = g; c.note = n.isEmpty ? nil : n; return c
-    }
-
-    var verdictText: String {
-        switch verdict {
-        case "send": return "Would send as is"
-        case "rewrite": return "Would rewrite"
-        case "resolve": return "Would answer it itself"
-        case "digest": return "Would hold for the daily summary"
-        case "drop": return "Would not send"
-        default: return "Would send"
-        }
-    }
-
-    var suggestionLabel: String { verdict == "resolve" ? "What it found / would do" : "Would have sent instead" }
-}
-
-/// Under a message: what the gate would have done, why, and two buttons. Tap
-/// the line to see the reason and its suggested text.
-struct GateReviewLine: View {
-    let review: GateReview
-    let onGrade: (String, String) -> Void
-    @State private var open = false
-    @State private var note = ""
-    @State private var askingNote = false
-
-    private var tint: Color {
-        switch review.verdict {
-        case "send": return .green
-        case "rewrite": return .orange
-        case "resolve": return .blue
-        case "digest": return .purple
-        default: return .red
-        }
-    }
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Button { withAnimation(.snappy(duration: 0.2)) { open.toggle() } } label: {
-                HStack(spacing: 6) {
-                    Circle().fill(tint).frame(width: 7, height: 7)
-                    Text("Gate: \(review.verdictText)").font(.caption.weight(.medium))
-                    if let g = review.grade {
-                        Text(g == "right" ? "· you: right" : "· you: wrong").font(.caption).foregroundStyle(.secondary)
-                    }
-                    Image(systemName: open ? "chevron.up" : "chevron.down").font(.system(size: 9, weight: .semibold))
-                }
-                .foregroundStyle(.secondary)
-            }
-            .buttonStyle(.plain)
-            if open {
-                if let r = review.reason, !r.isEmpty {
-                    Text(r).font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
-                }
-                if let s = review.suggestion, !s.isEmpty {
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(review.suggestionLabel).font(.caption2.weight(.semibold)).foregroundStyle(.secondary)
-                        Text(s).font(.caption).textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
-                    }
-                    .padding(8)
-                    .background(.quaternary.opacity(0.5), in: RoundedRectangle(cornerRadius: 8))
-                }
-                HStack(spacing: 8) {
-                    Button("Right call") { onGrade("right", note) }
-                        .buttonStyle(.bordered).tint(review.grade == "right" ? .green : nil)
-                    Button("Wrong call") { askingNote = true; onGrade("wrong", note) }
-                        .buttonStyle(.bordered).tint(review.grade == "wrong" ? .red : nil)
-                }
-                .controlSize(.small)
-                if askingNote || review.grade == "wrong" {
-                    TextField("What should it have done?", text: $note)
-                        .textFieldStyle(.roundedBorder)
-                        .font(.caption)
-                        .onSubmit { onGrade(review.grade ?? "wrong", note) }
-                }
-            }
-        }
-        .padding(.horizontal, 8)
-        .padding(.top, 2)
-        .onAppear { note = review.note ?? "" }
-    }
-}
-
-
-// MARK: - Deleting a conversation
-
-/// Swipe (iPhone, iPad) or right-click / long-press: delete a conversation or a
-/// group, after a confirmation that says what deleting means.
+/// Swipe (iPhone, iPad) or right-click / long-press: pin a conversation to the
+/// top of the list or unpin it (any conversation, the coordinator's too), and
+/// delete one, after a confirmation that says what deleting means.
 struct ConversationDeleteActions: ViewModifier {
     let conversation: Conversation
     @ObservedObject var team: TeamStore
     var onDeleted: (String) -> Void = { _ in }
+    /// Off for a pinned circle: it sits inside the grid's one list row, where
+    /// swipe actions would belong to the whole row, not to it.
+    var swipes = true
     @State private var confirming = false
 
     private var deletable: Bool { conversation.id != team.coordinatorConversation }
 
+    private var pinButton: some View {
+        let pinned = conversation.isPinned
+        return Button {
+            Task { await team.setPinned(conversation.id, !pinned) }
+        } label: {
+            Label(pinned ? "Unpin" : "Pin", systemImage: pinned ? "pin.slash" : "pin")
+        }
+    }
+
     func body(content: Content) -> some View {
-        if deletable {
-            content
-                #if os(iOS)
-                .swipeActions(edge: .trailing, allowsFullSwipe: false) {
+        content
+            #if os(iOS)
+            .swipeActions(edge: .leading, allowsFullSwipe: true) {
+                if swipes { pinButton.tint(.orange) }
+            }
+            .swipeActions(edge: .trailing, allowsFullSwipe: false) {
+                if swipes && deletable {
                     Button(role: .destructive) { confirming = true } label: { Label("Delete", systemImage: "trash") }
                 }
-                #endif
-                .contextMenu {
+            }
+            #endif
+            .contextMenu {
+                pinButton
+                if deletable {
+                    Divider()
                     Button(role: .destructive) { confirming = true } label: { Label("Delete conversation", systemImage: "trash") }
                 }
-                .confirmationDialog(conversation.isGroup ? "Delete this group?" : "Delete this conversation?",
-                                    isPresented: $confirming, titleVisibility: .visible) {
-                    Button("Delete", role: .destructive) {
-                        Task { await team.deleteConversation(conversation.id); onDeleted(conversation.id) }
-                    }
-                    Button("Cancel", role: .cancel) {}
-                } message: {
-                    Text(conversation.isGroup
-                         ? "The group leaves your list. Jori keeps its messages in its memory."
-                         : "It leaves your list until \(team.title(of: conversation.id)) next writes to you. Jori keeps the messages in its memory.")
+            }
+            .confirmationDialog(conversation.isGroup ? "Delete this group?" : "Delete this conversation?",
+                                isPresented: $confirming, titleVisibility: .visible) {
+                Button("Delete", role: .destructive) {
+                    Task { await team.deleteConversation(conversation.id); onDeleted(conversation.id) }
                 }
-        } else {
-            content
-        }
+                Button("Cancel", role: .cancel) {}
+            } message: {
+                Text(conversation.isGroup
+                     ? "The group leaves your list. Jori keeps its messages in its memory."
+                     : "It leaves your list until \(team.title(of: conversation.id)) next writes to you. Jori keeps the messages in its memory.")
+            }
     }
 }

@@ -181,12 +181,51 @@ def cmd_send(a):
                           "message_id": None}, indent=2, ensure_ascii=False))
         return
 
+    # THE SPEAK GATE, before the user sees it (system/speak-gate.md § Live;
+    # lib/speak-gate-live.mjs). The card's options are fixed, so the gate is
+    # told them and a rewrite keeps a question they answer. Held → nothing is
+    # written or pushed (the user sees it folded in the conversation). A
+    # location card gets a shorter budget: it must reach the user promptly.
+    # Fails open.
+    gate_review = None
+    gate_bin = os.path.join(REPO, "bin/speak-gate-live")
+    if os.path.exists(gate_bin) and a.channel in ("chat", "questions"):
+        try:
+            env = dict(os.environ)
+            if a.kind.startswith("location") or a.urgent:
+                env["SPEAK_GATE_LIVE_TIMEOUT_S"] = "90"
+            gp = subprocess.run(
+                ["node", gate_bin, "gate"],
+                input=json.dumps({"message": body, "channel": a.channel, "kind": "proactive",
+                                  "intent": f"choice:{a.kind}",
+                                  "fixed_choices": [o["label"] for o in opts]}),
+                capture_output=True, text=True, timeout=420, env=env)
+            g = json.loads((gp.stdout or "").strip().splitlines()[-1])
+            if g.get("deliver") is False:
+                print(json.dumps({"held": True, "by": "speak-gate", "verdict": g.get("verdict"),
+                                  "reason": g.get("reason"), "message_id": None}, indent=2, ensure_ascii=False))
+                return
+            if g.get("text"):
+                body = g["text"]
+                # The picture rides behind the words: keep it if a rewrite dropped it.
+                if getattr(a, "image_url", None) and a.image_url not in body:
+                    body = f"{body}\n\n{a.image_url}"
+            gate_review = g.get("review_file")
+        except Exception as e:  # a broken gate never loses a question
+            print(f"[choice] speak gate skipped: {e}", file=sys.stderr)
+
     row = req("jori_messages", "POST", {
         "role": "assistant", "content": body, "read": False,
         "channel": a.channel,
         "metadata": {"choices": json.dumps(prompt, ensure_ascii=False)},
     })
     mid = (row or [{}])[0].get("id")
+    if gate_review and mid:
+        try:
+            subprocess.run(["node", os.path.join(REPO, "bin/speak-gate-live"), "record", gate_review, str(mid)],
+                           timeout=30, check=False, capture_output=True)
+        except Exception:
+            pass
 
     # PUSH IT. Inserting the row is not sending the message: a question sitting
     # unseen in the app is not a question. `choice send` originally wrote

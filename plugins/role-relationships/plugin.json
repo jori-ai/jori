@@ -1,7 +1,7 @@
 {
   "name": "role-relationships",
   "title": "Relationships (role)",
-  "description": "The Relationships on your team: the people in the CEO's life: staying in touch, birthdays and occasions. Owns those jobs, signs what they send, and brings this role's specialty to every one of them.",
+  "description": "The Relationships role on your team: the people in the CEO's life: staying in touch, birthdays and occasions. Owns those jobs, signs what they send, and brings this role's specialty to every one of them.",
   "version": "1.0.0",
   "default": "disabled",
   "requires": {

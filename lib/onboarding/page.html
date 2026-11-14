@@ -128,11 +128,11 @@ form.about { display: grid; grid-template-columns: 1fr 1fr; gap: 20px 24px; marg
 form.about .wide { grid-column: 1 / -1; }
 label { display: grid; gap: 7px; align-content: start; font-weight: 500; font-size: 14px; }
 label small { color: var(--muted); font-weight: 400; }
-input[type="text"], input[type="email"] {
+input[type="text"], input[type="email"], .about select {
   font: 16px/1.3 var(--sans); color: var(--ink); background: var(--field); border: 1.5px solid var(--rule);
   border-radius: 9px; padding: 11px 13px; width: 100%;
 }
-input:focus { outline: none; border-color: var(--focus); }
+input:focus, .about select:focus { outline: none; border-color: var(--focus); }
 .check { display: flex; gap: 10px; align-items: flex-start; font-weight: 400; color: var(--muted); }
 .check input { margin-top: 4px; accent-color: var(--night); }
 
@@ -232,6 +232,7 @@ form.code { margin-top: 24px; max-width: 520px; }
         <label>Its pronouns<input type="text" name="assistant_pronouns" list="pronounList" placeholder="it/its"><small>How it’s referred to: she/her, he/him, they/them or it/its</small></label>
         <datalist id="pronounList"><option value="she/her"><option value="he/him"><option value="they/them"><option value="it/its"></datalist>
         <label>A partner I also help<input type="text" name="partner_name"><small>Optional, first name</small></label>
+        <label>I’ll use it for<select name="use" required><option value="">Choose…</option><option value="personal">My personal life</option><option value="work">Work</option><option value="both">Both</option></select><small>Personal: one assistant does everything. Work or both: a team, each with an area (finances, travel…), with the assistant as chief of staff. Add a teammate any time in the app.</small></label>
         <label class="check wide"><input type="checkbox" name="telemetry" checked> Count this install: one anonymous ping, no personal data, sent once.</label>
         <datalist id="tzList"></datalist>
       </form>
@@ -393,7 +394,7 @@ function render() {
   // About you: a field takes the detected value until the person types in it,
   // so the email found by the Claude sign-in still arrives after the page loaded.
   const f = $("aboutForm");
-  for (const k of ["owner_name", "owner_email", "home_city", "tz", "assistant_name", "partner_name"]) {
+  for (const k of ["owner_name", "owner_email", "home_city", "tz", "assistant_name", "partner_name", "use"]) {
     const input = f.elements[k];
     if (input && !input.dataset.touched && input !== document.activeElement) input.value = S.identity[k] || "";
   }
@@ -474,11 +475,11 @@ $("codeForm").addEventListener("submit", async (e) => {
 });
 $("aboutSave").addEventListener("click", async () => {
   const f = $("aboutForm"), b = {};
-  for (const k of ["owner_name", "owner_email", "home_city", "tz", "assistant_name", "assistant_pronouns", "partner_name"]) b[k] = f.elements[k].value.trim();
+  for (const k of ["owner_name", "owner_email", "home_city", "tz", "assistant_name", "assistant_pronouns", "partner_name", "use"]) b[k] = f.elements[k].value.trim();
   b.telemetry = f.elements.telemetry.checked;
-  const missing = ["owner_name", "owner_email", "tz", "assistant_name"].filter((k) => !b[k]);
+  const missing = ["owner_name", "owner_email", "tz", "assistant_name", "use"].filter((k) => !b[k]);
   const err = $("aboutErr");
-  if (missing.length) { err.hidden = false; err.textContent = "Fill in your name, email, time zone and what to call the assistant."; f.elements[missing[0]].focus(); return; }
+  if (missing.length) { err.hidden = false; err.textContent = "Fill in your name, email, time zone, what to call the assistant and what you’ll use it for."; f.elements[missing[0]].focus(); return; }
   const r = await api("/api/identity", b);
   if (!r.ok) { err.hidden = false; err.textContent = r.message; return; }
   err.hidden = true;

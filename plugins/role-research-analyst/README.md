@@ -1,4 +1,4 @@
-# Research Analyst (role plugin)
+# Research (role plugin)
 
 News and long reads worth the CEO's time, and the fields they follow.
 

@@ -1,0 +1,91 @@
+#!/usr/bin/env node
+// speak-gate-relay — run the speak gate's judge inside the GUI session for a
+// sender that has no Max login (a cron job). Started on demand by launchd
+// (agent/launch-agents/ai.claude.speak-gate-relay.plist), kicked by
+// lib/speak-gate-live.mjs when the judge answered "Not logged in".
+//
+// Protocol (data/speak-gate-relay/, or SPEAK_GATE_RELAY_DIR):
+//   <id>.in.json   {input, timeoutS}   written by the sender (tmp + rename)
+//   <id>.run.json  claimed by this runner (rename, so two runners never share one)
+//   <id>.out.json  bin/speak-gate.mjs's JSON line, read and removed by the sender
+// Requests are judged in parallel; the runner keeps scanning until nothing is
+// pending or running, then exits. Leftovers older than an hour are removed.
+// Design: system/speak-gate.md § Live (cron senders).
+"use strict";
+
+import { spawn } from "node:child_process";
+import { mkdirSync, readdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+import { createRequire } from "node:module";
+
+const require = createRequire(import.meta.url);
+const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const { installTools } = require(path.join(ROOT, "lib", "root.cjs"));
+try { require(path.join(ROOT, "lib", "load-env.js")).loadEnv(); } catch {}
+
+const DIR = process.env.SPEAK_GATE_RELAY_DIR || installTools("data", "speak-gate-relay");
+const GATE = process.env.SPEAK_GATE_BIN || path.join(ROOT, "bin", "speak-gate.mjs");
+const IDLE_MS = Number(process.env.SPEAK_GATE_RELAY_IDLE_MS || 3000);
+const log = (m) => console.log(`${new Date().toISOString()} [speak-gate-relay] ${m}`);
+
+// Max only: never let an API key stand in for the login.
+for (const k of Object.keys(process.env)) {
+  if (/^ANTHROPIC_|^CLAUDE_CODE_USE_|^CLAUDE_CODE_OAUTH_TOKEN$|^AWS_BEARER_TOKEN_BEDROCK$/.test(k)) delete process.env[k];
+}
+
+function judge(input, timeoutS) {
+  return new Promise((resolve) => {
+    const child = spawn(process.execPath, [GATE], {
+      env: { ...process.env, SPEAK_GATE_TIMEOUT_S: String(timeoutS), SPEAK_GATE_RELAYED: "1" },
+      stdio: ["pipe", "pipe", "ignore"],
+    });
+    let out = "";
+    const kill = setTimeout(() => { try { child.kill("SIGKILL"); } catch {} }, (timeoutS + 90) * 1000);
+    child.stdout.on("data", (d) => { out += d; });
+    child.on("error", () => { clearTimeout(kill); resolve(null); });
+    child.on("close", () => {
+      clearTimeout(kill);
+      try { resolve(JSON.parse(out.trim().split("\n").pop())); } catch { resolve(null); }
+    });
+    child.stdin.on("error", () => {});
+    child.stdin.end(JSON.stringify(input));
+  });
+}
+
+async function handle(id) {
+  const run = path.join(DIR, `${id}.run.json`);
+  try { renameSync(path.join(DIR, `${id}.in.json`), run); } catch { return; } // another runner took it
+  let req;
+  try { req = JSON.parse(readFileSync(run, "utf8")); } catch { try { unlinkSync(run); } catch {} return; }
+  const t0 = Date.now();
+  const r = (await judge(req.input || {}, Number(req.timeoutS) || 240))
+    || { verdict: "send", reason: "gate_error:relay_no_output" };
+  const out = path.join(DIR, `${id}.out.json`);
+  writeFileSync(`${out}.tmp`, JSON.stringify(r));
+  renameSync(`${out}.tmp`, out);
+  try { unlinkSync(run); } catch {}
+  log(`${id} ${r.verdict} (${r.reason ? String(r.reason).slice(0, 80) : "-"}) ${Date.now() - t0}ms`);
+}
+
+function sweep() {
+  const hourAgo = Date.now() - 3600e3;
+  for (const f of readdirSync(DIR)) {
+    try { if (statSync(path.join(DIR, f)).mtimeMs < hourAgo) unlinkSync(path.join(DIR, f)); } catch {}
+  }
+}
+
+mkdirSync(DIR, { recursive: true });
+sweep();
+const running = new Map();
+let idleSince = Date.now();
+for (;;) {
+  for (const f of readdirSync(DIR)) {
+    const m = f.match(/^(.+)\.in\.json$/);
+    if (!m || running.has(m[1])) continue;
+    running.set(m[1], handle(m[1]).catch((e) => log(`${m[1]} failed: ${e.message}`)).finally(() => running.delete(m[1])));
+  }
+  if (running.size) idleSince = Date.now();
+  else if (Date.now() - idleSince >= IDLE_MS) break;
+  await new Promise((r) => setTimeout(r, 500));
+}
