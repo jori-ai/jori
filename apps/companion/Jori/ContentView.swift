@@ -569,13 +569,15 @@ struct ContentView: View {
     private var phoneConversationList: some View {
         List {
             if !team.pinnedConversations.isEmpty {
-                PinnedConversationsGrid(team: team, open: { go(.conversation($0)) })
+                PinnedConversationsGrid(team: team, open: { go(.conversation($0)) }, phone: true)
                     .listRowSeparator(.hidden)
+                    .listRowInsets(EdgeInsets(top: 4, leading: 16, bottom: 8, trailing: 16))
             }
             ForEach(team.unpinnedConversations) { conversation in
                 Button { go(.conversation(conversation.id)) } label: {
-                    ConversationRowView(conversation: conversation, team: team)
+                    ConversationRowView(conversation: conversation, team: team, phone: true)
                 }
+                .listRowInsets(EdgeInsets(top: 0, leading: 16, bottom: 0, trailing: 16))
                 .buttonStyle(.plain)
                 .modifier(ConversationDeleteActions(conversation: conversation, team: team))
             }
@@ -592,6 +594,8 @@ struct ContentView: View {
             if path.isEmpty { Task { await team.markRead(left); await team.loadSummaries() } }
         }
         .navigationTitle(Install.displayName)
+        // Messages keeps its title small and centred over the pins.
+        .navigationBarTitleDisplayMode(.inline)
         .toolbar {
             ToolbarItem(placement: .topBarLeading) { settingsMenu }
             ToolbarItem(placement: .topBarTrailing) {

@@ -825,6 +825,10 @@ struct TeamAvatar: View {
 struct ConversationRowView: View {
     let conversation: Conversation
     @ObservedObject var team: TeamStore
+    /// The iPhone home list, sized like Messages on iOS: 40pt avatar, 17pt
+    /// semibold name, 15pt time with a chevron, two 15pt preview lines.
+    /// Off, the denser Mac/iPad sidebar row.
+    var phone = false
 
     var body: some View {
         let members = team.members(of: conversation.id)
@@ -833,31 +837,38 @@ struct ConversationRowView: View {
         let questions = team.openQuestions(conversation.id)
         let waiting = team.waiting(conversation.id)
         let badge = team.badgeCount(conversation.id)
-        HStack(alignment: .top, spacing: 12) {
-            TeamAvatar(members: members, size: 42)
-            VStack(alignment: .leading, spacing: 2) {
+        HStack(alignment: phone ? .center : .top, spacing: 12) {
+            TeamAvatar(members: members, size: phone ? 40 : 42)
+            VStack(alignment: .leading, spacing: phone ? 1 : 2) {
                 HStack(alignment: .firstTextBaseline, spacing: 6) {
                     nameLine(members)
                         .lineLimit(1)
                     Spacer(minLength: 4)
                     if let at = summary?.previewAt ?? conversation.lastMessageAt {
-                        Text(Self.when(at))
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
+                        HStack(alignment: .firstTextBaseline, spacing: 5) {
+                            Text(Self.when(at))
+                                .font(phone ? .subheadline : .caption)
+                                .foregroundStyle(.secondary)
+                            if phone {
+                                Image(systemName: "chevron.right")
+                                    .font(.footnote.weight(.semibold))
+                                    .foregroundStyle(.tertiary)
+                            }
+                        }
                     }
                 }
                 HStack(alignment: .top, spacing: 6) {
                     Text(summary?.preview ?? (members.first?.responsibility ?? ""))
                         .font(.subheadline)
                         .foregroundStyle(.secondary)
-                        .lineLimit(2)
-                    Spacer(minLength: 4)
+                        .lineLimit(2, reservesSpace: phone)
+                        .frame(maxWidth: .infinity, alignment: .leading)
                     // One red badge, only when something is waiting.
                     if badge > 0 { ChannelBadgeBubble(count: badge) }
                 }
             }
         }
-        .padding(.vertical, 4)
+        .padding(.vertical, phone ? 6 : 4)
         .contentShape(Rectangle())
         .accessibilityElement(children: .combine)
         .accessibilityValue([unread > 0 ? "\(unread) unread" : nil,
@@ -868,14 +879,17 @@ struct ConversationRowView: View {
 
     @ViewBuilder
     private func nameLine(_ members: [TeamMember]) -> some View {
-        if conversation.isGroup {
+        if conversation.isGroup && phone {
+            // Messages shows a group by its name alone; the avatar shows who.
+            Text(team.title(of: conversation.id)).font(.body.weight(.semibold))
+        } else if conversation.isGroup {
             VStack(alignment: .leading, spacing: 0) {
                 Text(team.title(of: conversation.id)).font(.headline)
                 Text(members.map(\.label).joined(separator: ", "))
                     .font(.caption).foregroundStyle(.secondary)
             }
         } else if let m = members.first {
-            (Text(m.name).font(.headline)
+            (Text(m.name).font(phone ? .body.weight(.semibold) : .headline)
              + Text(m.title.isEmpty ? "" : "  \(m.title)").font(.subheadline).foregroundColor(.secondary))
         }
     }
@@ -901,11 +915,16 @@ struct PinnedConversationsGrid: View {
     var selected: String?
     let open: (String) -> Void
     var onDeleted: (String) -> Void = { _ in }
+    /// The iPhone home list, sized like Messages' pins: 76pt circles, the
+    /// name alone under each in 12pt. Off, the smaller Mac/iPad sidebar tiles.
+    var phone = false
 
-    private let columns = Array(repeating: GridItem(.flexible(), spacing: 18, alignment: .top), count: 3)
+    private var columns: [GridItem] {
+        Array(repeating: GridItem(.flexible(), spacing: phone ? 12 : 18, alignment: .top), count: 3)
+    }
 
     var body: some View {
-        LazyVGrid(columns: columns, spacing: 18) {
+        LazyVGrid(columns: columns, spacing: phone ? 14 : 18) {
             ForEach(team.pinnedConversations) { conversation in
                 tile(conversation)
                     .modifier(ConversationDeleteActions(conversation: conversation, team: team, onDeleted: onDeleted, swipes: false))
@@ -920,9 +939,9 @@ struct PinnedConversationsGrid: View {
         let name = team.title(of: conversation.id)
         let role = team.subtitle(of: conversation.id)
         return Button { open(conversation.id) } label: {
-            VStack(spacing: 6) {
-                TeamAvatar(members: team.members(of: conversation.id), size: 54)
-                    .padding(3)
+            VStack(spacing: phone ? 5 : 6) {
+                TeamAvatar(members: team.members(of: conversation.id), size: phone ? 76 : 54)
+                    .padding(phone ? 0 : 3)
                     .overlay {
                         if isSelected { Circle().strokeBorder(JoriTheme.cobalt, lineWidth: 2.5) }
                     }
@@ -931,9 +950,9 @@ struct PinnedConversationsGrid: View {
                     }
                 VStack(spacing: 1) {
                     Text(Self.short(name))
-                        .font(.system(size: 10, weight: .medium))
-                        .foregroundStyle(.primary)
-                    if !role.isEmpty {
+                        .font(phone ? .caption : .system(size: 10, weight: .medium))
+                        .foregroundStyle(phone ? .secondary : .primary)
+                    if !role.isEmpty, !phone {
                         Text(Self.short(role))
                             .font(.system(size: 9))
                             .foregroundStyle(.secondary)
