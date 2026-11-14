@@ -175,3 +175,10 @@ test("meetingLog: an almost-daily partner gets weekly counts; a rare one each me
   const md = cal.renderSection("# X\n", { facts: "_f_", summary: "s", log: r });
   assert.match(md, /s\n\n\*\*When and how they met\*\* [^\n]*\n- 10\/2\/26: in person\n/);
 });
+
+test("an event marked not held stops counting everywhere", () => {
+  const before = cal.candidates({ now: NOW }).find((c) => c.wiki_id === "user_gil").meetings;
+  cal.markNotHeld("u6", "the user: it did not happen");
+  assert.equal(cal.candidates({ now: NOW }).find((c) => c.wiki_id === "user_gil").meetings, before - 1);
+  assert.throws(() => cal.markNotHeld("no-such-event"));
+});

@@ -45,6 +45,7 @@ Write (jobs/people-email.md Part C):
                                               the reading applies to every event with that title
   link <email> <wiki_id> [--note ".."]        this guest address is that person
   ignore <email> [--note ".."]                not a person (a room, a shared inbox, a bot)
+  not-held <event_id> [--note ".."]           on the calendar but it did not happen; never counts
   write-section --person <wiki_id> --summary @file
                                               replace the page's ## Meetings block, mark summarized
 
@@ -174,6 +175,11 @@ function main() {
       if (!args[1]) throw new Error("ignore <email>");
       cal.ignoreGuest(args[1], typeof flag("note") === "string" ? flag("note") : null);
       return console.log(`ignored ${args[1]}`);
+    }
+    case "not-held": {
+      if (!args[1]) throw new Error("not-held <event_id>");
+      cal.markNotHeld(args[1], typeof flag("note") === "string" ? flag("note") : null);
+      return console.log(`not held: ${args[1]}`);
     }
     case "write-section": {
       const person = flag("person");
