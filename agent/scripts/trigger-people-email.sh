@@ -33,8 +33,8 @@ PAYLOAD='{"job": "people-email"}'
 BATCH_LIMIT=30
 CHAT_BATCH_LIMIT=20
 MEET_BATCH_LIMIT=20
-TITLE_BATCH_LIMIT=150
-GUEST_BATCH_LIMIT=15
+TITLE_BATCH_LIMIT=300
+GUEST_BATCH_LIMIT=25
 
 log() { echo "$(date '+%Y-%m-%d %H:%M:%S') [people-email] $1" | tee -a "$JOBLOG" >> "$LOGFILE"; }
 

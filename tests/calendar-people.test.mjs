@@ -78,17 +78,25 @@ test("an event gone from its window is dropped", () => {
   assert.equal(c.meetings, 1, "m2 (in the window, not returned) is gone; m1 is outside it and stays");
 });
 
-test("titles: read once, names recorded, unknown pages refused, retitle re-reads", () => {
-  cal.ingestWindow([ev("t1", "2026-11-01", { summary: "Lunch with Omer" }), ev("t2", "2026-11-02", { summary: "Dentist" })], { fromMs: Date.parse("2026-10-31"), toMs: Date.parse("2026-11-03"), now: NOW, self });
-  assert.deepEqual(cal.titlesPending({ now: NOW }).map((r) => r.event_id).filter((id) => id.startsWith("t")), ["t2", "t1"]);
-  const res = cal.review({ t1: ["user_omer", "user_ghost"], t2: [] }, { pageExists: (id) => id !== "user_ghost" });
-  assert.equal(res.reviewed, 2);
+test("titles: one reading per distinct title covers every event with it, later ones too", () => {
+  const w = { fromMs: Date.parse("2026-10-31"), toMs: Date.parse("2026-11-04"), now: NOW, self };
+  cal.ingestWindow([ev("t1", "2026-11-01", { summary: "Lunch with Omer" }), ev("t1b", "2026-11-03", { summary: "Lunch with Omer" }), ev("t2", "2026-11-02", { summary: "Dentist" })], w);
+  const pending = cal.titlesPending({ now: NOW }).filter((r) => ["Lunch with Omer", "Dentist"].includes(r.title));
+  assert.deepEqual(pending.map((r) => [r.title, r.events]), [["Lunch with Omer", 2], ["Dentist", 1]]);
+  const key = (t) => cal.titleKey(t);
+  const res = cal.review({ [key("Lunch with Omer")]: ["user_omer", "user_ghost"], [key("Dentist")]: [], nope: [] }, { pageExists: (id) => id !== "user_ghost" });
+  assert.deepEqual([res.titles, res.events, res.mentions], [2, 3, 2]);
   assert.deepEqual(res.unknown_pages, ["user_ghost"]);
-  assert.equal(cal.titlesPending({ now: NOW }).filter((r) => r.event_id.startsWith("t")).length, 0);
-  assert.ok(cal.candidates({ now: NOW }).some((c) => c.wiki_id === "user_omer"));
-  cal.ingestWindow([ev("t1", "2026-11-01", { summary: "Lunch with Omer and Gil" }), ev("t2", "2026-11-02", { summary: "Dentist" })], { fromMs: Date.parse("2026-10-31"), toMs: Date.parse("2026-11-03"), now: NOW, self });
-  assert.deepEqual(cal.titlesPending({ now: NOW }).map((r) => r.event_id).filter((id) => id.startsWith("t")), ["t1"]);
-  assert.ok(!cal.candidates({ now: NOW }).some((c) => c.wiki_id === "user_omer"), "the old reading is cleared until re-read");
+  assert.deepEqual(res.unknown_keys, ["nope"]);
+  assert.equal(cal.titlesPending({ now: NOW }).filter((r) => ["Lunch with Omer", "Dentist"].includes(r.title)).length, 0);
+  assert.equal(cal.candidates({ now: NOW }).find((c) => c.wiki_id === "user_omer").meetings, 2);
+  // A later event with a title already read inherits its reading.
+  cal.ingestWindow([ev("t3", "2026-11-05", { summary: "Lunch with Omer" })], { fromMs: Date.parse("2026-11-05"), toMs: Date.parse("2026-11-06"), now: NOW, self });
+  assert.equal(cal.candidates({ now: NOW }).find((c) => c.wiki_id === "user_omer").meetings, 3);
+  // A retitled event loses the old reading and its new title waits to be read.
+  cal.ingestWindow([ev("t3", "2026-11-05", { summary: "Lunch with Omer and Gil" })], { fromMs: Date.parse("2026-11-05"), toMs: Date.parse("2026-11-06"), now: NOW, self });
+  assert.equal(cal.candidates({ now: NOW }).find((c) => c.wiki_id === "user_omer").meetings, 2);
+  assert.ok(cal.titlesPending({ now: NOW }).some((r) => r.title === "Lunch with Omer and Gil"));
 });
 
 test("unmatched: 2 small meetings qualify, 1 in Contacts, big invites don't, role addresses never", () => {

@@ -37,11 +37,12 @@ Read:
   stats
   candidates [--stale] [--limit N] [--json]   pages with held meetings, newest first (* = summary due)
   unmatched [--limit N] [--json]              qualifying guests with no page
-  titles [--limit N] [--json]                 held events whose title nobody has read yet
+  titles [--limit N] [--json]                 distinct titles of held events nobody has read yet
   person <wiki_id> [--limit N] [--json]       one page's meetings
 
 Write (jobs/people-email.md Part C):
-  review --file <json>                        {"<event_id>": ["wiki_id", ...]}; every key is marked read
+  review --file <json>                        {"<title key>": ["wiki_id", ...]}; every key is marked read,
+                                              the reading applies to every event with that title
   link <email> <wiki_id> [--note ".."]        this guest address is that person
   ignore <email> [--note ".."]                not a person (a room, a shared inbox, a bot)
   write-section --person <wiki_id> --summary @file
@@ -142,9 +143,9 @@ function main() {
       return console.log(`\n${rows.length} guests with no page`);
     }
     case "titles": {
-      const rows = cal.titlesPending({ limit: limit || 200 });
+      const rows = cal.titlesPending({ limit: limit || 300 });
       if (asJson) return console.log(JSON.stringify(rows, null, 2));
-      for (const r of rows) console.log(`${r.date}  ${r.event_id}  ${r.title}${r.guests.length ? `  [guests: ${r.guests.map((g) => g.wiki_id || g.name || "?").join(", ")}]` : ""}`);
+      for (const r of rows) console.log(`${r.last}  ${r.key}  ×${r.events}  ${r.title}${r.guests.length ? `  [guests: ${r.guests.map((g) => g.wiki_id || g.name || "?").join(", ")}]` : ""}`);
       return console.log(`\n${rows.length} titles to read`);
     }
     case "person": {
