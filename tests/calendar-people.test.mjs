@@ -209,3 +209,9 @@ test("not-held --same-title rules out a whole chore series", () => {
   assert.equal(r.events, 3);
   assert.equal(cal.candidates({ now: NOW }).find((c) => c.wiki_id === "user_gil").meetings, before - 3);
 });
+
+test("verify_from: before it the calendar stands and nothing is offered for checking", () => {
+  const rows = cal.verifyPending({ now: NOW, dayExists: () => true, verifyFrom: "2026-10-23" });
+  assert.ok(rows.every((r) => r.date >= "2026-10-23"));
+  assert.ok(cal.verifyPending({ now: NOW, dayExists: () => true, verifyFrom: null }).some((r) => r.date < "2026-10-23"));
+});
