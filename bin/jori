@@ -1481,8 +1481,26 @@ function cmdDoctor(args) {
   const allTriggers = [...triggerScripts, ...checkScripts];
   // Exclude event-driven scripts (not scheduled tasks) from orphan check
   const eventDriven = new Set(['trigger-startup-catchup.sh']);
-  const orphans = allTriggers.filter(f => !eventDriven.has(f) && !tasks.some(t => t.trigger_script && t.trigger_script.endsWith(f)));
-  add('trigger scripts in tasks.json', orphans.length === 0, orphans.length ? `orphans: ${orphans.join(', ')}` : `${allTriggers.length} trigger scripts, all registered`);
+  // A trigger is owned when a task names it, a plugin's schedule runs it (a
+  // plugin's cron lines never reach tasks.json; a disabled plugin still owns
+  // its scripts), or a LaunchAgent in agent/launch-agents launches it (the
+  // launchd-driven ones, e.g. question-hold-release, have no task at all).
+  const ownedElsewhere = new Set();
+  try {
+    const pl = require(path.join(__dirname, '..', 'lib', 'plugins.cjs'));
+    for (const p of pl.plugins()) {
+      if (p.errors && p.errors.length) continue;
+      for (const sch of pl.schedulesOf(p)) for (const m of String(sch.command || '').matchAll(/agent\/scripts\/([\w.-]+\.sh)/g)) ownedElsewhere.add(m[1]);
+    }
+  } catch { /* no plugins: tasks alone decide */ }
+  for (const dir of [path.join(TOOLS, 'agent/launch-agents'), path.join(TOOLS, 'agent/local/launch-agents')]) {
+    if (!fs.existsSync(dir)) continue;
+    for (const f of fs.readdirSync(dir).filter(f => f.endsWith('.plist'))) {
+      for (const m of fs.readFileSync(path.join(dir, f), 'utf8').matchAll(/agent\/scripts\/([\w.-]+\.sh)/g)) ownedElsewhere.add(m[1]);
+    }
+  }
+  const orphans = allTriggers.filter(f => !eventDriven.has(f) && !ownedElsewhere.has(f) && !tasks.some(t => t.trigger_script && t.trigger_script.endsWith(f)));
+  add('trigger scripts in tasks.json', orphans.length === 0, orphans.length ? `orphans: ${orphans.join(', ')}` : `${allTriggers.length} trigger scripts, all registered (tasks, plugin schedules or LaunchAgents)`);
 
   // A task with paused_until = YYYY-MM-DD (or full ISO) is expected to be
   // absent from crontab until that date. When it passes, the check starts
@@ -1579,13 +1597,19 @@ function cmdDoctor(args) {
   add('ops playbook sections exist', missingSections.length === 0, missingSections.length ? `missing: ${missingSections.join('; ')}` : `${tasks.length} sections verified in ops-agent/CLAUDE.md`);
 
   // 5. services.json plists → exist
+  // A `transient` service installs its plist only while it runs and removes
+  // it itself (resilience-test self-removes after 72h), so absence is normal.
   const missingPlists = [];
+  let transientAbsent = 0;
   for (const s of services) {
     if (s.type !== 'launchagent') continue;
     const p = expandHome(s.plist);
-    if (!fs.existsSync(p)) missingPlists.push(s.label);
+    if (fs.existsSync(p)) continue;
+    if (s.transient) transientAbsent++;
+    else missingPlists.push(s.label);
   }
-  add('services.json plists exist', missingPlists.length === 0, missingPlists.length ? `missing: ${missingPlists.join(', ')}` : `${services.filter(s => s.type === 'launchagent').length} plists verified`);
+  const transientNote = transientAbsent ? ` (${transientAbsent} transient, not installed)` : '';
+  add('services.json plists exist', missingPlists.length === 0, missingPlists.length ? `missing: ${missingPlists.join(', ')}` : `${services.filter(s => s.type === 'launchagent' && !s.transient).length} plists verified${transientNote}`);
 
   // 6. no old Dev/Tools paths in tracked text files
   // Use git grep — it natively skips binary files and respects .gitignore.
@@ -2024,6 +2048,7 @@ function cmdDoctor(args) {
     const taskScriptsR = new Set(mutableTasks.map(t => t.trigger_script && t.trigger_script.split('/').pop()).filter(Boolean));
     for (const [bname, scheds] of Object.entries(cronMapR)) {
       if (taskScriptsR.has(bname)) continue;
+      if (ownedElsewhere.has(bname)) continue; // a plugin's schedule or a LaunchAgent owns it
       const scriptPath = path.join(TOOLS, 'agent/scripts', bname);
       if (!fs.existsSync(scriptPath)) continue;
       // Read the first comment line for a description

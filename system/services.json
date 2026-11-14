@@ -1,5 +1,5 @@
 {
-  "_comment": "LaunchAgents and long-running processes that make up the Jori always-on server (the kernel's). This installation's own services live in agent/local/services.json, merged by lib/registry.cjs.",
+  "_comment": "LaunchAgents and long-running processes that make up the Jori always-on server (the kernel's). This installation's own services live in agent/local/services.json, merged by lib/registry.cjs. `transient: true` marks a LaunchAgent that installs its plist only while it runs and removes it itself; `jori doctor` does not call its absence missing.",
   "services": [
     {
       "name": "claude-session",
@@ -25,7 +25,8 @@
         "stdout": "agent/logs/resilience-test.log",
         "stderr": "agent/logs/resilience-test.log"
       },
-      "expected_running": false
+      "expected_running": false,
+      "transient": true
     },
     {
       "name": "hum-sense",
