@@ -19,7 +19,8 @@ source "$(dirname "$0")/lib/webhook-auth.sh"
 # window of the primary calendar through gog: network, so here) and
 # `backfill` (resumes reading history until it reaches the configured start;
 # a no-op once done), then three batches for Part C: titles to read, guests
-# with no page, and pages due a ## Meetings summary.
+# with no page, in-person meetings to check against the day record, and pages
+# due a ## Meetings summary.
 
 export PATH="$HOME/.local/node/bin:/opt/homebrew/bin:$PATH"
 source "$(dirname "${BASH_SOURCE[0]}")/lib/root.sh"   # JORI_INSTALL_TOOLS
@@ -35,6 +36,7 @@ CHAT_BATCH_LIMIT=20
 MEET_BATCH_LIMIT=20
 TITLE_BATCH_LIMIT=300
 GUEST_BATCH_LIMIT=25
+VERIFY_BATCH_LIMIT=40
 
 log() { echo "$(date '+%Y-%m-%d %H:%M:%S') [people-email] $1" | tee -a "$JOBLOG" >> "$LOGFILE"; }
 
@@ -69,12 +71,16 @@ try {
   const out = {
     titles: cal.titlesPending({ limit: Number(process.argv[3]) }),
     unmatched: cal.unmatched({ limit: Number(process.argv[4]) }),
+    verify: (() => {
+      const ws = require(require("path").join(require("path").dirname(process.argv[1]), "wiki-store.js"));
+      try { return cal.verifyPending({ limit: Number(process.argv[6]), dayExists: (d) => !!ws.getPage("day_" + d) }); } finally { ws.closeDb(); }
+    })(),
     pages: cal.candidates({ staleOnly: true, limit: Number(process.argv[5]) }),
   };
   require("fs").writeFileSync(process.argv[2], JSON.stringify(out, null, 2));
-  console.log(out.titles.length + out.unmatched.length + out.pages.length);
+  console.log(out.titles.length + out.unmatched.length + out.verify.length + out.pages.length);
 } catch (e) { process.stderr.write(String(e.message) + "\n"); console.log(0); } finally { cal.closeDb(); }
-' "$ROOT/lib/calendar-people.js" "$DATA/people-meetings-pending.json" "$TITLE_BATCH_LIMIT" "$GUEST_BATCH_LIMIT" "$MEET_BATCH_LIMIT" 2>>"$JOBLOG")
+' "$ROOT/lib/calendar-people.js" "$DATA/people-meetings-pending.json" "$TITLE_BATCH_LIMIT" "$GUEST_BATCH_LIMIT" "$MEET_BATCH_LIMIT" "$VERIFY_BATCH_LIMIT" 2>>"$JOBLOG")
 
 if [ "${PENDING:-0}" -eq 0 ] && [ "${CHAT_PENDING:-0}" -eq 0 ] && [ "${MEET_PENDING:-0}" -eq 0 ]; then
   log "skip: no stale correspondents, text partners or meetings"

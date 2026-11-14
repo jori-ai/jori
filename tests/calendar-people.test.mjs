@@ -182,3 +182,21 @@ test("an event marked not held stops counting everywhere", () => {
   assert.equal(cal.candidates({ now: NOW }).find((c) => c.wiki_id === "user_gil").meetings, before - 1);
   assert.throws(() => cal.markNotHeld("no-such-event"));
 });
+
+test("verify lists unsettled in-person meetings on recorded days; confirm and not-held settle them", () => {
+  cal.ingestWindow([ev("v1", "2026-10-22", { summary: "Lunch with Omer", location: "Cafe, Springfield", start: { dateTime: "2026-10-22T13:30:00+03:00" }, end: { dateTime: "2026-10-22T14:30:00+03:00" } })],
+    { fromMs: Date.parse("2026-10-21"), toMs: Date.parse("2026-10-23"), now: NOW, self });
+  cal.review({ [cal.titleKey("Lunch with Omer")]: ["user_omer"] }, { pageExists: () => true });
+  const rows = cal.verifyPending({ now: NOW, dayExists: (d) => d === "2026-10-22" });
+  const v1 = rows.find((r) => r.event_id === "v1");
+  assert.equal(v1.date, "2026-10-22");
+  assert.deepEqual(v1.people.map((p) => p.wiki_id), ["user_omer"]);
+  assert.ok(!rows.some((r) => r.event_id === "m2"), "video calls are not checked here");
+  cal.markSummarized("user_omer", { now: NOW });
+  const r = cal.markNotHeld("v1", "the day record: lunch there with others");
+  assert.deepEqual(r.pages, ["user_omer"]);
+  assert.equal(cal.candidates({ now: NOW }).find((c) => c.wiki_id === "user_omer")?.stale ?? true, true, "re-summarised");
+  assert.ok(!cal.verifyPending({ now: NOW, dayExists: () => true }).some((x) => x.event_id === "v1"));
+  cal.markConfirmed("v1");
+  assert.ok(cal.candidates({ now: NOW }).some((c) => c.wiki_id === "user_omer" && c.meetings >= 1));
+});
