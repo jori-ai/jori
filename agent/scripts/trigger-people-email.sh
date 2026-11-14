@@ -15,6 +15,11 @@ source "$(dirname "$0")/lib/webhook-auth.sh"
 # job dispatches when either half has someone due. A sync that cannot read
 # Messages/Contacts (Full Disk Access) is logged and non-fatal: the agent turn
 # runs the same sync itself.
+# 2026-11-14: also the meetings half — `calendar-people sync` (the recent
+# window of the primary calendar through gog: network, so here) and
+# `backfill` (resumes reading history until it reaches the configured start;
+# a no-op once done), then three batches for Part C: titles to read, guests
+# with no page, and pages due a ## Meetings summary.
 
 export PATH="$HOME/.local/node/bin:/opt/homebrew/bin:$PATH"
 source "$(dirname "${BASH_SOURCE[0]}")/lib/root.sh"   # JORI_INSTALL_TOOLS
@@ -27,6 +32,9 @@ JOBLOG="$ROOT/agent/logs/people-email.log"
 PAYLOAD='{"job": "people-email"}'
 BATCH_LIMIT=30
 CHAT_BATCH_LIMIT=20
+MEET_BATCH_LIMIT=20
+TITLE_BATCH_LIMIT=150
+GUEST_BATCH_LIMIT=15
 
 log() { echo "$(date '+%Y-%m-%d %H:%M:%S') [people-email] $1" | tee -a "$JOBLOG" >> "$LOGFILE"; }
 
@@ -50,8 +58,26 @@ CHAT_SYNC=$("$ROOT/bin/chat-people" sync 2>>"$JOBLOG") || log "chat-people sync 
   > "$DATA/people-chats-pending.json" 2>>"$JOBLOG" || echo '[]' > "$DATA/people-chats-pending.json"
 CHAT_PENDING=$(node -e 'try{console.log(JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")).length)}catch{console.log(0)}' "$DATA/people-chats-pending.json")
 
-if [ "${PENDING:-0}" -eq 0 ] && [ "${CHAT_PENDING:-0}" -eq 0 ]; then
-  log "skip: no stale correspondents or text partners"
+# Meetings half: the calendar ledger, then Part C's three batches in one file.
+CAL_SYNC=$("$ROOT/bin/calendar-people" sync 2>>"$JOBLOG") || log "calendar-people sync failed (gog auth?)"
+[ -n "$CAL_SYNC" ] && log "calendar-people: $CAL_SYNC"
+CAL_BACK=$("$ROOT/bin/calendar-people" backfill 2>>"$JOBLOG") || log "calendar-people backfill failed (resumes tomorrow)"
+[ -n "$CAL_BACK" ] && log "calendar-people backfill: $CAL_BACK"
+MEET_PENDING=$(node -e '
+const cal = require(process.argv[1]);
+try {
+  const out = {
+    titles: cal.titlesPending({ limit: Number(process.argv[3]) }),
+    unmatched: cal.unmatched({ limit: Number(process.argv[4]) }),
+    pages: cal.candidates({ staleOnly: true, limit: Number(process.argv[5]) }),
+  };
+  require("fs").writeFileSync(process.argv[2], JSON.stringify(out, null, 2));
+  console.log(out.titles.length + out.unmatched.length + out.pages.length);
+} catch (e) { process.stderr.write(String(e.message) + "\n"); console.log(0); } finally { cal.closeDb(); }
+' "$ROOT/lib/calendar-people.js" "$DATA/people-meetings-pending.json" "$TITLE_BATCH_LIMIT" "$GUEST_BATCH_LIMIT" "$MEET_BATCH_LIMIT" 2>>"$JOBLOG")
+
+if [ "${PENDING:-0}" -eq 0 ] && [ "${CHAT_PENDING:-0}" -eq 0 ] && [ "${MEET_PENDING:-0}" -eq 0 ]; then
+  log "skip: no stale correspondents, text partners or meetings"
   exit 0
 fi
 
@@ -70,13 +96,13 @@ dispatch() {
 }
 
 if is_healthy && dispatch; then
-  log "Dispatched people-email ($PENDING by email, $CHAT_PENDING by texts)"
+  log "Dispatched people-email ($PENDING by email, $CHAT_PENDING by texts, $MEET_PENDING calendar items)"
   exit 0
 fi
 
 sleep 60
 if is_healthy && dispatch; then
-  log "Dispatched people-email (retry, $PENDING by email, $CHAT_PENDING by texts)"
+  log "Dispatched people-email (retry, $PENDING by email, $CHAT_PENDING by texts, $MEET_PENDING calendar items)"
   exit 0
 fi
 
