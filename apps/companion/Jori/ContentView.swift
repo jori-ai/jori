@@ -836,6 +836,7 @@ struct ContentView: View {
                 while !Task.isCancelled {
                     let ids = Set(viewModel.messages.compactMap(\.improvementId))
                     if !ids.isEmpty { await improvementCards.refresh(ids: ids) }
+                    await improvementCards.refreshPending()
                     try? await Task.sleep(for: .seconds(8))
                 }
             }
@@ -955,7 +956,7 @@ struct ContentView: View {
                 .equatable()
             }
             .padding(.top, place.startsGroup && place.separator == nil ? 10 : 0)
-            .modifier(OnScreenReader(id: message.id, tracked: viewModel.isOpenQuestion(message), onScreen: $onScreenQuestionIds))
+            .modifier(OnScreenReader(id: message.id, tracked: viewModel.isOpenQuestion(message) || isPendingCard(message), onScreen: $onScreenQuestionIds))
             .id(message.id)
             .zIndex(activeReactionMessageId == message.id ? 1 : 0)
         }
@@ -1165,7 +1166,12 @@ struct ContentView: View {
                         viewModel.dismissQuestion(q)
                         Task { try? await Task.sleep(for: .seconds(1)); await team.loadSummaries() }
                     },
-                    select: { option, q in Task { await viewModel.sendMessage(option.label, replyTo: q.id); await team.loadSummaries() } }
+                    select: { option, q in Task { await viewModel.sendMessage(option.label, replyTo: q.id); await team.loadSummaries() } },
+                    improvement: { m in m.improvementId.flatMap { improvementCards.byId[$0] } },
+                    act: { action, item in
+                        let cards = improvementCards
+                        Task { await cards.perform(action, item); await team.loadSummaries() }
+                    }
                 )
                 .padding(.horizontal, 14)
             }
@@ -1178,11 +1184,26 @@ struct ContentView: View {
     /// The tray: the thread's own open questions not on screen, plus any the
     /// badge counts that are too old to be loaded here (answer or dismiss them
     /// from the tray), oldest first.
+    ///
+    /// Improvement cards waiting on the owner (a Face ID, or a Retry on a
+    /// failed apply) stack here too, the same way: the owner, 2026-11-15, "if
+    /// there are multiple improvements (new or retries) pending it should show
+    /// the bottom stack (similar to pending questions)."
     private var trayQuestions: [Message] {
         let loaded = viewModel.openQuestions.filter { !onScreenQuestionIds.contains($0.id) }
         let loadedIds = Set(viewModel.messages.map(\.id))
         let older = (team.openQuestionMessages[viewModel.currentConversation] ?? []).filter { !loadedIds.contains($0.id) }
-        return (older + loaded).sorted { $0.createdAt < $1.createdAt }
+        let cardsLoaded = viewModel.messages.filter { isPendingCard($0) && !onScreenQuestionIds.contains($0.id) }
+        let cardsOlder = improvementCards.pendingMessages.filter {
+            $0.conversationId == viewModel.currentConversation && !loadedIds.contains($0.id) && isPendingCard($0)
+        }
+        return (older + loaded + cardsOlder + cardsLoaded).sorted { $0.createdAt < $1.createdAt }
+    }
+
+    /// An improvement card whose row is waiting on the owner.
+    private func isPendingCard(_ m: Message) -> Bool {
+        guard let id = m.improvementId, let row = improvementCards.byId[id] else { return false }
+        return row.isPending
     }
 
     private var jumpToLatestButton: some View {
@@ -2945,6 +2966,10 @@ struct OpenQuestionsTray: View {
     var dismiss: (Message) -> Void
     /// A tapped option: the same pre-composed reply a tap on the card sends.
     var select: (ChoiceOption, Message) -> Void
+    /// The live row behind an improvement card in the tray (nil for a question).
+    var improvement: (Message) -> SelfImproveApproval.Improvement? = { _ in nil }
+    /// Implement / Retry / Skip on a card row.
+    var act: (ImprovementCardAction, SelfImproveApproval.Improvement) -> Void = { _, _ in }
     @AppStorage(Install.key("openQuestionsTrayExpanded")) private var expanded = true
     #if os(iOS)
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
@@ -2971,7 +2996,7 @@ struct OpenQuestionsTray: View {
                 } label: {
                     HStack(spacing: 6) {
                         Image(systemName: "sparkle")
-                        Text(questions.count == 1 ? "1 open question" : "\(questions.count) open questions")
+                        Text(headerText)
                         Spacer(minLength: 0)
                         Image(systemName: expanded ? "chevron.down" : "chevron.up")
                     }
@@ -2987,8 +3012,14 @@ struct OpenQuestionsTray: View {
                     VStack(spacing: 0) {
                         ForEach(Array(rows.enumerated()), id: \.element.id) { index, q in
                             Divider().overlay(JoriTheme.hairline)
-                            row(q, showOptions: questions.count == 1)
-                                .background(shade(fromNewest: rows.count - 1 - index, of: rows.count))
+                            Group {
+                                if let card = improvement(q) {
+                                    cardRow(q, card)
+                                } else {
+                                    row(q, showOptions: questions.count == 1)
+                                }
+                            }
+                            .background(shade(fromNewest: rows.count - 1 - index, of: rows.count))
                         }
                     }
                 }
@@ -2998,6 +3029,57 @@ struct OpenQuestionsTray: View {
             .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous).stroke(JoriTheme.staff.opacity(0.35), lineWidth: 0.5))
             .transition(.move(edge: .bottom).combined(with: .opacity))
         }
+    }
+
+    /// "2 open questions · 1 improvement", counting each kind.
+    private var headerText: String {
+        let cards = questions.filter { improvement($0) != nil }.count
+        let asks = questions.count - cards
+        var parts: [String] = []
+        if asks > 0 { parts.append(asks == 1 ? "1 open question" : "\(asks) open questions") }
+        if cards > 0 { parts.append(cards == 1 ? "1 improvement" : "\(cards) improvements") }
+        return parts.joined(separator: " · ")
+    }
+
+    /// An improvement card waiting on the owner: its summary, Implement (Face
+    /// ID) or Retry, and the x skips it.
+    private func cardRow(_ m: Message, _ card: SelfImproveApproval.Improvement) -> some View {
+        HStack(alignment: .center, spacing: 8) {
+            Button { reveal(m) } label: {
+                HStack(spacing: 6) {
+                    Image(systemName: card.isRetryable ? "exclamationmark.triangle.fill" : "wrench.and.screwdriver")
+                        .font(.caption)
+                        .foregroundStyle(card.isRetryable ? Color.orange : JoriTheme.staffInk)
+                    Text(card.summary)
+                        .font(.subheadline)
+                        .lineLimit(2)
+                        .multilineTextAlignment(.leading)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            if card.needsApproval {
+                Button { act(.implement, card) } label: { Label("Implement", systemImage: "faceid") }
+                    .font(.caption.weight(.semibold))
+                    .buttonStyle(.borderless)
+                    .foregroundStyle(JoriTheme.staffInk)
+            } else {
+                Button("Retry") { act(.retry, card) }
+                    .font(.caption.weight(.semibold))
+                    .buttonStyle(.borderless)
+                    .foregroundStyle(JoriTheme.staffInk)
+            }
+            Button { act(.skip, card) } label: {
+                Image(systemName: "xmark.circle.fill")
+                    .font(.system(size: 18))
+                    .foregroundStyle(.secondary)
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Skip improvement")
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 7)
     }
 
     /// A row's tint: none for the newest, a step deeper for each older one.

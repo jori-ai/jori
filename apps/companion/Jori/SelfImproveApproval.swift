@@ -204,6 +204,11 @@ enum SelfImproveApproval {
         /// without a new signature. `failed` (a signature/authorization miss) is
         /// NOT retryable this way — see SelfImproveApproval.retry().
         var isRetryable: Bool { !skipped && status == "apply_failed" }
+
+        /// Waiting on the owner: a Face ID, or a Retry on a failed apply. These
+        /// sit in the tray at the bottom of the conversation with the open
+        /// questions (ContentView.trayQuestions).
+        var isPending: Bool { needsApproval || isRetryable }
     }
 
     /// The exact byte string the host reconstructs and verifies. MUST match

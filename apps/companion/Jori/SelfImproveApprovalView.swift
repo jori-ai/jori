@@ -39,6 +39,41 @@ final class ImprovementCards: ObservableObject {
     @Published var errorText: String?
     /// Bumped when an approval signs, for the success haptic.
     @Published private(set) var approvedTick = 0
+    /// Card messages for pending rows that may be older than the loaded
+    /// window, so the bottom tray lists every card waiting on the owner (the
+    /// way TeamStore.openQuestionMessages does for questions).
+    @Published private(set) var pendingMessages: [Message] = []
+
+    func refreshPending() async {
+        do {
+            try await SupabaseManager.ensureAuthenticated()
+            let rows: [SelfImproveApproval.Improvement] = try await SupabaseManager.shared
+                .from("self_improve_approvals")
+                .select("id,item_type,summary,rationale,item_hash,nonce,status,risk,skipped,chat_message_id,expires_at_ms,result")
+                .in("status", values: ["pending", "apply_failed"])
+                .eq("skipped", value: false)
+                .order("created_at", ascending: false)
+                .limit(50)
+                .execute()
+                .value
+            let pending = rows.filter { $0.isPending && $0.chatMessageId != nil }
+            for r in pending where r.id != workingId { byId[r.id] = r }
+            let ids = pending.compactMap { $0.chatMessageId?.uuidString }
+            guard !ids.isEmpty else { if !pendingMessages.isEmpty { pendingMessages = [] }; return }
+            let msgs: [Message] = try await SupabaseManager.shared
+                .from(DBTables.messages)
+                .select(Message.columns)
+                .in("id", values: ids)
+                .execute()
+                .value
+            // Only messages that really are the card (the retired Chat action's
+            // anchors in the chat channel are not).
+            let cards = msgs.filter { $0.improvementId != nil }
+            if cards != pendingMessages { pendingMessages = cards }
+        } catch {
+            print("[SelfImprove] pending refresh failed: \(error)")
+        }
+    }
 
     func refresh(ids: Set<String>) async {
         guard !ids.isEmpty else { return }
