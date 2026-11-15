@@ -263,15 +263,9 @@ account registry). Every write needs a note/evidence: quote what the user
 said and the date. **Never register an income stream for rent or a deposit the
 rental hub collects:** the review reads those payouts from the books, so a stream
 would only say it twice, `income add` refuses one, and rent a tenant has not paid
-shows on the hub's rent invoices. Deposits mostly are not recorded here: which tenants an
-unlinked bank row was, where a deposit started, and whether one may sit outside
-the deposit account are answered in the hub (Financials -> Security deposits;
-the tenant's card). Point the user there; then re-run `finance-deposits-reconcile`.
-The one exception is a transfer the review asked about because it fits two sets
-of tenants, or one the user says the hub has linked to the wrong tenants: record
-the answer with `finance-facts deposit-answer <row id> --whose "<tenant>, <tenant>"
-[--unknown "<tenant>"] --said "<their words>"` (the question carries the row id;
-the answer goes to the gitignored `data/finance-deposit-answers.jsonl`),
-then re-run `finance-deposits-reconcile`. Whoever else the hub credits that row
-to becomes unknown on its own; `--unknown` adds anyone further whose deposit's
-whereabouts the user says are not known. Unknown deposits are never flagged or located.
+shows on the hub's rent invoices. Deposits are never recorded here: the hub's
+deposit table is the only source, and no note of ours overrides it. Which
+tenants a bank row was (including one the user says the hub linked wrongly),
+where a deposit started, and whether one may sit outside the deposit account
+are answered in the hub (Financials -> Security deposits; the tenant's card).
+Point the user there; then re-run `finance-deposits-reconcile`.

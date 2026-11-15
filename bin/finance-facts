@@ -18,11 +18,7 @@
 //       An account the review asked about that belongs to no property or pot in the hub's registry (account map
 //       `known_unregistered`): the review stops asking. One that does belong somewhere is added in the hub.
 //   finance-facts deposits                          the reconciled deposit table (fin_deposits)
-//   finance-facts deposit-answer <bank row id> --whose "Tenant, Tenant" [--unknown "Tenant"] --said "<the user's words>" [--dry-run]
-//       Whose money a transfer into the deposit account was, when the hub links it wrongly or the review asked
-//       (one amount fitting two sets of tenants). Appended to data/finance-deposit-answers.jsonl, read by
-//       finance-deposits-reconcile. Tenants the hub credits the row to who are not --whose become unknown (never flagged).
-//   finance-facts deposit-move / deposit-exception   RETIRED: answered in the hub (Financials -> Security deposits, the tenant's card)
+//   finance-facts deposit-answer / deposit-move / deposit-exception   RETIRED: answered in the hub (Financials -> Security deposits, the tenant's card)
 //   (was) finance-facts deposit-move <deposit_id|"Tenant Name"> --kind received|closing_credit|swept|payout|refunded
 //                            --amount N --date YYYY-MM-DD --evidence "..." [--txn <plaid txn id>] [--from NNNN] [--to NNNN]
 //       A recorded movement: the reconciler (finance-deposits-reconcile) applies it first and never overrides it.
@@ -192,30 +188,9 @@ async function main() {
     for (const r of rows) console.log(`${String(r.property_name).padEnd(15)} ${r.lease_number.padEnd(13)} ${r.tenant.padEnd(22)} ${String(r.amount).padStart(9)}  ${r.location}${r.location_account_mask ? ` ••${r.location_account_mask}` : ""}${r.expected_location === "exception" ? " (exception)" : ""}  [${r.location_basis}]`);
     return;
   }
-  if (cmd === "deposit-answer") {
-    // The hub is read-only from here (lib/rental-ledger.js), so an
-    // answer the user gives in chat is kept beside it, attributed to their words,
-    // and covers each deposit only until the hub records something newer.
-    if (!a1) die(`usage: deposit-answer <bank row id> --whose "Tenant, Tenant" [--unknown "Tenant"] --said "<the user's words>" [--dry-run]`);
-    const fs = require("node:fs"), path = require("node:path");
-    const ledger = require("../lib/rental-ledger.js");
-    const { depositAnswer } = require("../lib/finance-deposit-reconcile.js");
-    const names = (k) => (opt(k) || "").split(",").map((x) => x.trim()).filter(Boolean);
-    const db = ledger.firestore();
-    const [hubDeposits, report] = await Promise.all([db.list("billing-deposits"), db.get("billing-deposit-reports", "latest").catch(() => null)]);
-    let entry;
-    try {
-      entry = depositAnswer({ rowId: a1, deposits: hubDeposits, depositMask: String(report?.account?.mask || require("../lib/instance.cjs").localConfig("rental-finance", { deposit_account_mask: "" }).deposit_account_mask || ""), whose: names("whose"), unknown: names("unknown"), said: need("said"), saidOn: ledger.today() });
-    } catch (e) { die(e.message); }
-    console.log(JSON.stringify(entry, null, 2));
-    if (argv.includes("--dry-run")) return console.log("(dry run: nothing written)");
-    // Append-only: the latest line for a row wins, and the earlier ones stay as history.
-    const file = path.join(require("../lib/root.cjs").installTools("data"), "finance-deposit-answers.jsonl");
-    fs.appendFileSync(file, JSON.stringify({ ...entry, recorded_at: new Date().toISOString() }) + "\n");
-    return console.log(`recorded in ${file}; finance-deposits-reconcile applies it (nightly and before each review, or run it now).`);
-  }
-  if (cmd === "deposit-move" || cmd === "deposit-exception") {
-    // Retired 2026-10-17. Whose a deposit transfer was, where a deposit
+  if (cmd === "deposit-answer" || cmd === "deposit-move" || cmd === "deposit-exception") {
+    // Retired (deposit-move/-exception 2026-10-17, deposit-answer 2026-11-15:
+    // "only use verified data"). Whose a deposit transfer was, where a deposit
     // started and whether it may sit outside the deposit account are answered
     // in the hub, attributed to a person, and read back from there by
     // finance-deposits-reconcile. Recording them here would be a second truth.
