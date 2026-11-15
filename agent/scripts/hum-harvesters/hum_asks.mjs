@@ -26,7 +26,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { readStdinJson, emit, emitNull, stampRun, OWNER_NAME } from "./_common.mjs";
-import { loadLatest, pickAsk } from "../../../lib/hum-ideas.mjs";
+import { loadLatest, pickAsk, retiredIds } from "../../../lib/hum-ideas.mjs";
 import { reportBacklog, currentScale, recentlyOffered } from "../../../lib/question-pacing.mjs";
 
 import { installTools } from "../../../lib/root.cjs";
@@ -42,7 +42,9 @@ try {
   try { runs = fs.readFileSync(RUNS_FILE, "utf8"); } catch { /* no runs yet */ }
   // One offered in the last few hours and held steps aside for the rest.
   const offered = recentlyOffered("hum_asks");
-  const ideas = loadLatest();
+  // An idea the ranker retired in the reservoir stays retired (it is not offered again).
+  const retired = retiredIds();
+  const ideas = loadLatest().filter((i) => !retired.has(i.id));
   const fresh = ideas.filter((i) => !offered.has(`hum_asks:${i.id}`));
   const all = pickAsk(ideas, runs, Date.now(), { scale: currentScale() });
   pick = pickAsk(fresh, runs, Date.now(), { scale: currentScale() });
