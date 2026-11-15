@@ -41,6 +41,8 @@ const REBUILD_LIB = path.join(ROOT, "lib/self-improve-rebuild.mjs");
 const { queueCardRebuild } = fs.existsSync(REBUILD_LIB)
   ? await import(REBUILD_LIB)
   : { queueCardRebuild: () => ({ queued: false, reason: "no rebuild queue in this installation" }) };
+// After a card went in but is not running, and after its fix went in (lib/self-improve-repair.mjs).
+const { notLiveFollowUp, settleRepaired } = await import(path.join(ROOT, "lib/self-improve-repair.mjs"));
 const SIC_STATE = path.join(ROOT, "data/system-issue-review-state.json");
 
 // ---- Supabase-backed stores (REST) ----------------------------------------
@@ -443,31 +445,6 @@ async function confirm(text) {
   } catch {}
 }
 
-// A repair (or rebuild) card just went in and runs. If the card it fixes is
-// still "in, not running", check that one again the same way and, when it now
-// runs, mark it applied: its own Retry would re-write files the repair has
-// since changed. Never throws.
-async function settleRepaired(origId, fixId, fixTitle) {
-  try {
-    const x = await store.getApproval(origId);
-    if (!x || x.status !== "apply_failed" || !x.result?.not_live || !Array.isArray(x.result.files)) return;
-    const live = await goLive(x.result.files, fixMsg(x));
-    const title = x.summary || origId;
-    if (live.ok) {
-      const { tests_failed, failures, error, ...kept } = x.result;
-      await store.updateApproval(origId, { status: "applied", result: { ...kept, ok: true, not_live: false, repaired_by: fixId, notes: live.notes } });
-      console.error(`[si-approval] ${origId} running after repair ${fixId}`);
-      await confirm(`✅ "${title}" is running now too: "${fixTitle}" fixed what stopped it. ${live.notes.join(" ")}`.trim());
-    } else {
-      await store.updateApproval(origId, { result: { ...x.result, error: live.error, notes: live.notes, checked_after: fixId } });
-      console.error(`[si-approval] ${origId} still not running after repair ${fixId}: ${live.error}`);
-      await confirm(`⚠️ "${fixTitle}" went in, but "${title}" still isn't running: ${live.error} Ask me in chat, or tap Retry on it.`);
-    }
-  } catch (e) {
-    console.error(`[si-approval] settle ${origId} after ${fixId} failed: ${e?.message || e}`);
-  }
-}
-
 // One poller at a time. With the not-live check a tick can run for minutes
 // (a plugin sync, the card's tests), and the 2-minute cron would otherwise
 // start a second one that picks the same `approved` row up and applies it
@@ -534,7 +511,10 @@ async function main() {
         const checked = (o.result?.notes || []).join(" ");
         await confirm(`✅ ${retried ? "Retried and applied" : "Approved + applied"}: ${label}. ${checked || o.result?.note || ""}`.trim());
         const orig = rowById[o.id]?.item_json?.rebuild_of;
-        if (orig) await settleRepaired(orig, o.id, titleOf[o.id] || o.id);
+        if (orig) {
+          await settleRepaired({ origId: orig, fixId: o.id, fixTitle: titleOf[o.id] || o.id, store, goLive, commitMsgOf: fixMsg, confirm,
+            log: (m) => console.error(`[si-approval] ${m}`) });
+        }
       }
     }
     // `expired` and `skipped` are the user's own decisions playing out, not
@@ -561,24 +541,9 @@ async function main() {
         // request id goes on the row's result so the app can say it is being
         // fixed. Anything else (a plugin left off, a schedule missing) still
         // waits for Retry.
-        const head = `${retried ? `I retried "${title}"` : `"${title}" is in the code`} but it is not running: ${o.result.error}`;
-        let rp = null;
-        if (o.result.tests_failed) {
-          rp = queueCardRebuild({ root: ROOT, row: rowById[o.id] || { id: o.id }, error: o.result.error, kind: "repair", failures: o.result.failures || [] });
-          if (rp.queued) console.error(`[si-approval] ${o.id} queued for repair as build request ${rp.requestId}`);
-          else console.error(`[si-approval] ${o.id} not repaired: ${rp.reason}`);
-          const reqId = rp.queued ? rp.requestId : (rp.kind === "repair" ? rp.requestId : null);
-          if (reqId) { try { await store.updateApproval(o.id, { result: { ...o.result, repair_request: reqId } }); } catch {} }
-        }
-        if (rp?.queued) {
-          await confirm(`⚠️ ${head} I'm fixing it now: the fix comes back as a fresh card for your Face ID, and this one turns green once the fix is in.`);
-        } else if (rp?.kind === "repair") {
-          await confirm(`⚠️ ${head} The fix I started for it is still on its way as a fresh card.`);
-        } else if (rp?.already) {
-          await confirm(`⚠️ ${head} This card was itself a fix, so I won't start another one on my own. Ask me in chat, or tap Retry once it's sorted.`);
-        } else {
-          await confirm(`⚠️ ${head} The card shows it as failed. Tap Retry on it once that's fixed, or ask me in chat.`);
-        }
+        const { message } = await notLiveFollowUp({ o, row: rowById[o.id], retried, title, root: ROOT,
+          update: store.updateApproval, log: (m) => console.error(`[si-approval] ${m}`) });
+        await confirm(message);
       } else if (o.result.stale) {
         // The signing-time truth check (core/self-improve-unified.mjs decideRow)
         // found the card's finding no longer true. Nothing was written. Retry is
