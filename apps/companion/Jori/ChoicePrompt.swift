@@ -161,6 +161,9 @@ struct ChoicePromptView: View {
     /// and a late tap supersedes it. Locking on a default would make being busy
     /// permanent, which is the opposite of what defaulting is for.
     var defaultAppliedLabel: String? = nil
+    /// Minimized in the feed: the question alone, the options hidden until the
+    /// card is tapped (QuestionCollapsedFooter says what a tap does).
+    var collapsed: Bool = false
     let onSelect: (ChoiceOption) -> Void
 
     /// Only THEIR tap closes the question.
@@ -168,6 +171,14 @@ struct ChoicePromptView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
+            if collapsed {
+                if let text = prompt.subject?.question ?? prompt.prompt, !text.isEmpty {
+                    Text(text)
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(.primary)
+                }
+                QuestionCollapsedFooter(answer: answeredLabel ?? defaultAppliedLabel, provisional: answeredLabel == nil)
+            } else {
             if let subject = prompt.subject {
                 SubjectHeader(subject: subject)
                     .padding(.bottom, 4)
@@ -243,9 +254,11 @@ struct ChoicePromptView: View {
                 .opacity(isAnswered && !chosen(option) ? 0.45 : 1.0)
                 .disabled(isAnswered)
             }
+            }
         }
         .padding(.top, 2)
         .animation(.spring(response: 0.32, dampingFraction: 0.8), value: answeredLabel)
+        .animation(.spring(response: 0.32, dampingFraction: 0.85), value: collapsed)
         .sensoryFeedback(.selection, trigger: answeredLabel) { _, new in new != nil }
     }
 
@@ -282,6 +295,9 @@ struct DecisionCardView: View {
     let prompt: ChoicePrompt
     /// Whatever the user replied to the card — a tapped label or their own words.
     let answeredLabel: String?
+    /// Minimized in the feed: header and question, the options hidden until
+    /// the card is tapped.
+    var collapsed: Bool = false
     let onSelect: (ChoiceOption) -> Void
     let onTypeSomething: () -> Void
 
@@ -313,6 +329,9 @@ struct DecisionCardView: View {
                     .foregroundStyle(.primary)
                     .fixedSize(horizontal: false, vertical: true)
             }
+            if collapsed {
+                QuestionCollapsedFooter(answer: answeredLabel, provisional: false)
+            } else {
             ForEach(Array(ordered.enumerated()), id: \.element.id) { index, option in
                 Button {
                     guard !isAnswered else { return }
@@ -345,9 +364,11 @@ struct DecisionCardView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
+            }
         }
         .padding(.top, 2)
         .animation(.spring(response: 0.32, dampingFraction: 0.8), value: answeredLabel)
+        .animation(.spring(response: 0.32, dampingFraction: 0.85), value: collapsed)
         .sensoryFeedback(.selection, trigger: answeredLabel) { _, new in new != nil }
     }
 
@@ -403,6 +424,37 @@ struct DecisionCardView: View {
     private func chosen(_ option: ChoiceOption) -> Bool {
         guard let a = answeredLabel else { return false }
         return a.compare(option.label, options: [.caseInsensitive, .diacriticInsensitive]) == .orderedSame
+    }
+}
+
+// MARK: - Collapsed footer
+
+/// The last line of a minimized question card in the feed: the answer once
+/// given (the owner, 2026-11-15: "questions should show minimized hiding the
+/// answers so they don't overwhelm the feed. tapping one should focus on it and
+/// show the answers"), or what a tap does while it is still open.
+struct QuestionCollapsedFooter: View {
+    let answer: String?
+    /// A default the server applied, not their own answer: a dotted mark.
+    var provisional = false
+
+    var body: some View {
+        HStack(spacing: 5) {
+            if let answer {
+                Image(systemName: provisional ? "checkmark.circle.dotted" : "checkmark.circle.fill")
+                    .foregroundStyle(provisional ? Color.secondary : Color.accentColor)
+                Text(answer)
+                    .lineLimit(1)
+                    .foregroundStyle(.secondary)
+            } else {
+                Text("Tap to answer")
+                    .foregroundStyle(JoriTheme.staffInk)
+                Image(systemName: "chevron.down")
+                    .foregroundStyle(JoriTheme.staffInk)
+            }
+        }
+        .font(.caption.weight(.semibold))
+        .padding(.top, 2)
     }
 }
 

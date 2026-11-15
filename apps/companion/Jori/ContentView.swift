@@ -119,6 +119,14 @@ struct ContentView: View {
     /// those out — it exists for questions the stream has scrolled away —
     /// and disappears when every open question is already in view.
     @State private var onScreenQuestionIds: Set<UUID> = []
+    /// The question card drawn open in the feed. Every other choice or
+    /// decision card is minimized to its question (and the answer, once given)
+    /// so a run of questions does not take over the stream; tapping one focuses
+    /// it (the owner, 2026-11-15).
+    @State private var focusedQuestionId: UUID?
+    /// A question opened from the tray's Answer button, shown with its choices
+    /// in a sheet, the same card as in the feed.
+    @State private var answeringQuestion: Message?
     @State private var isDropTargeted = false
     /// iPhone: the conversation list is the home screen; a conversation (or
     /// Memory) is pushed on top of it.
@@ -687,6 +695,28 @@ struct ContentView: View {
             .modifier(HiddenToolbarTitle())
             #endif
             .toolbar { detailToolbar }
+            .sheet(item: $answeringQuestion) { q in
+                QuestionAnswerSheet(
+                    message: q,
+                    answeredLabel: viewModel.tappedAnswer(for: q.id),
+                    defaultAppliedLabel: viewModel.defaultApplied(for: q.id),
+                    onSelect: { option in
+                        answeringQuestion = nil
+                        Task { await viewModel.sendMessage(option.label, replyTo: q.id); await team.loadSummaries() }
+                    },
+                    onTypeSomething: {
+                        answeringQuestion = nil
+                        beginReply(to: q)
+                    },
+                    onClose: { answeringQuestion = nil }
+                )
+                #if os(iOS)
+                .presentationDetents([.medium, .large])
+                .presentationDragIndicator(.visible)
+                #else
+                .frame(minWidth: 420, idealWidth: 480, minHeight: 360, idealHeight: 480)
+                #endif
+            }
             .sheet(isPresented: $showConversationInfo) {
                 ConversationInfoSheet(team: team, conversationId: viewModel.currentConversation) { ids in
                     Task {
@@ -970,7 +1000,15 @@ struct ContentView: View {
             quoteTap: { quoteJumpTarget = $0 },
             setPalette: { activeReactionMessageId = $0 },
             react: { message, reaction in Task { await vm.setReaction(for: message, to: reaction) } },
-            answer: { label, parent in Task { await vm.sendMessage(label, replyTo: parent) } },
+            answer: { label, parent in
+                // Answered: the card folds back to its question and the answer.
+                if focusedQuestionId == parent { withAnimation(.spring(response: 0.32, dampingFraction: 0.85)) { focusedQuestionId = nil } }
+                Task { await vm.sendMessage(label, replyTo: parent) }
+            },
+            focus: { id in
+                withAnimation(.spring(response: 0.32, dampingFraction: 0.85)) { focusedQuestionId = id }
+                quoteJumpTarget = id
+            },
             toggleChecklist: { label, on, id in vm.toggleChecklistItem(label, checked: on, on: id) },
             resolveParent: { vm.resolveQuotedParent($0) },
             dismiss: { vm.dismissQuestion($0) },
@@ -1001,6 +1039,7 @@ struct ContentView: View {
         if m.metadata?[ChoicePrompt.metadataKey] != nil {
             t.answer = viewModel.tappedAnswer(for: m.id)
             t.defaultApplied = viewModel.defaultApplied(for: m.id)
+            t.isFocused = focusedQuestionId == m.id
         }
         return t
     }
@@ -1160,8 +1199,20 @@ struct ContentView: View {
             Group {
                 OpenQuestionsTray(
                     questions: trayQuestions,
-                    reveal: { quoteJumpTarget = $0.id },
-                    answer: { beginReply(to: $0) },
+                    reveal: { q in
+                        // Jump to the card, drawn open with its choices.
+                        withAnimation(.spring(response: 0.32, dampingFraction: 0.85)) { focusedQuestionId = q.id }
+                        quoteJumpTarget = q.id
+                    },
+                    answer: { q in
+                        // A question with choices opens as its card, choices and
+                        // all, the same as in the feed; one without is a typed reply.
+                        if let prompt = ChoicePrompt.from(metadata: q.metadata), !prompt.options.isEmpty {
+                            answeringQuestion = q
+                        } else {
+                            beginReply(to: q)
+                        }
+                    },
                     dismiss: { q in
                         viewModel.dismissQuestion(q)
                         Task { try? await Task.sleep(for: .seconds(1)); await team.loadSummaries() }
@@ -1958,6 +2009,9 @@ struct BubbleThread: Equatable {
     /// The live approval row behind an improvement card message.
     var improvement: SelfImproveApproval.Improvement?
     var improvementWorking = false
+    /// The question card the feed shows open (choices visible); every other
+    /// one is drawn minimized.
+    var isFocused = false
 }
 
 /// What a bubble can ask the conversation to do.
@@ -1967,6 +2021,8 @@ struct BubbleActions {
     var setPalette: (UUID?) -> Void
     var react: (Message, Reaction?) -> Void
     var answer: (String, UUID) -> Void
+    /// Open a minimized question card in the feed (and scroll to it).
+    var focus: (UUID) -> Void
     var toggleChecklist: (String, Bool, UUID) -> Void
     var resolveParent: (UUID) -> Void
     var dismiss: (Message) -> Void
@@ -2295,6 +2351,8 @@ struct MessageBubble: View, Equatable {
         // highlighted confirmation in the chat.
         let isConfirmed = message.metadata?["card"] == "purchase" && message.metadata?["status"] == "placed"
         let fill: Color = isConfirmed ? JoriTheme.confirmedWash : (openQuestion || isDecision ? JoriTheme.staffWash : JoriTheme.slate)
+        // A card with choices is minimized in the feed until it is tapped.
+        let collapsed = (choice.map { !$0.options.isEmpty } ?? false) && !thread.isFocused
         VStack(alignment: .leading, spacing: 10) {
             if isConfirmed {
                 Label("Purchase confirmed", systemImage: "checkmark.seal.fill")
@@ -2329,6 +2387,7 @@ struct MessageBubble: View, Equatable {
                 DecisionCardView(
                     prompt: prompt,
                     answeredLabel: thread.answer,
+                    collapsed: collapsed,
                     onSelect: { option in
                         actions.answer(option.label, message.id)
                     },
@@ -2345,7 +2404,8 @@ struct MessageBubble: View, Equatable {
                     ChoicePromptView(
                         prompt: prompt,
                         answeredLabel: thread.answer,
-                        defaultAppliedLabel: thread.defaultApplied
+                        defaultAppliedLabel: thread.defaultApplied,
+                        collapsed: collapsed
                     ) { option in
                         // The tap IS the reply — same path as typing it.
                         actions.answer(option.label, message.id)
@@ -2356,6 +2416,17 @@ struct MessageBubble: View, Equatable {
         .padding(.horizontal, 14)
         .padding(.vertical, 10)
         .frame(maxWidth: .infinity, alignment: .leading)
+        .overlay {
+            // Minimized: the whole card is the tap target that opens it.
+            if collapsed {
+                Color.clear
+                    .contentShape(Rectangle())
+                    .onTapGesture { actions.focus(message.id) }
+                    .accessibilityElement()
+                    .accessibilityLabel(thread.answer == nil ? "Show the choices" : "Show the question")
+                    .accessibilityAddTraits(.isButton)
+            }
+        }
         .background {
             // The staff light: an unanswered question glows faintly gold, the
             // one place in the stream that is waiting on you. The shadow is
@@ -2946,6 +3017,71 @@ private struct MacTextViewRepresentable: NSViewRepresentable {
     ContentView()
 }
 
+
+// MARK: - Answer sheet
+
+/// A question opened from the tray's Answer button: the same card the feed
+/// draws, every choice tappable (the owner, 2026-11-15: "tapping 'answer' in
+/// the bottom tray should show the question with multiple choice, just like it
+/// appears in the feed"). A tap is the same reply as a tap on the card.
+struct QuestionAnswerSheet: View {
+    let message: Message
+    let answeredLabel: String?
+    let defaultAppliedLabel: String?
+    let onSelect: (ChoiceOption) -> Void
+    let onTypeSomething: () -> Void
+    let onClose: () -> Void
+
+    var body: some View {
+        let prompt = ChoicePrompt.from(metadata: message.metadata)
+        VStack(alignment: .leading, spacing: 0) {
+            HStack {
+                Label("Waiting for your answer", systemImage: "sparkle")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(JoriTheme.staffInk)
+                Spacer()
+                Button { onClose() } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .font(.system(size: 22))
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Close")
+            }
+            .padding(.horizontal, 18)
+            .padding(.top, 16)
+            .padding(.bottom, 8)
+            ScrollView {
+                VStack(alignment: .leading, spacing: 10) {
+                    if let prompt, prompt.isDecision {
+                        DecisionCardView(prompt: prompt, answeredLabel: answeredLabel,
+                                         onSelect: onSelect, onTypeSomething: onTypeSomething)
+                    } else if let prompt {
+                        if prompt.subject == nil {
+                            RichMessageView(content: message.content)
+                        }
+                        ChoicePromptView(prompt: prompt, answeredLabel: answeredLabel,
+                                         defaultAppliedLabel: defaultAppliedLabel, onSelect: onSelect)
+                        Button { onTypeSomething() } label: {
+                            Label("Type an answer instead", systemImage: "pencil")
+                                .font(.callout.weight(.medium))
+                        }
+                        .buttonStyle(.borderless)
+                        .foregroundStyle(JoriTheme.staffInk)
+                        .padding(.top, 4)
+                    } else {
+                        RichMessageView(content: message.content)
+                    }
+                }
+                .padding(14)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(JoriTheme.staffWash, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+                .padding(.horizontal, 14)
+                .padding(.bottom, 18)
+            }
+        }
+    }
+}
 
 // MARK: - Open questions tray
 
