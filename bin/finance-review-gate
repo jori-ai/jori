@@ -44,7 +44,7 @@ const log = (m) => { try { fs.mkdirSync(path.dirname(LOG), { recursive: true });
 
 async function openFinanceQuestions() {
   const oq = await import(path.join(__dirname, "..", "lib", "open-questions.mjs"));
-  return oq.foldQuestions().filter((q) => q.lane === "finance-review" && q.status === "open").map((q) => q.id);
+  return [...oq.foldQuestions().values()].filter((q) => q.lane === "finance-review" && q.status === "open").map((q) => q.id);
 }
 
 function localHour(d, tz) {
