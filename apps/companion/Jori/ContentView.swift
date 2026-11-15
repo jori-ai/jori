@@ -953,7 +953,10 @@ struct ContentView: View {
 
     @ViewBuilder
     private var messagesListContent: some View {
-        let all = viewModel.messages.filter { !viewModel.isChecklistTick($0) && !viewModel.isQuestionDismissal($0) }
+        // Open questions one after the other: only the first stays in the
+        // stream, the rest wait in the tray (queuedQuestionIds).
+        let queued = queuedQuestionIds
+        let all = viewModel.messages.filter { !viewModel.isChecklistTick($0) && !viewModel.isQuestionDismissal($0) && !queued.contains($0.id) }
         let visible = Array(all.suffix(renderLimit))
         // Over the whole conversation, not just the drawn window: whether a
         // reply needs its quote depends on what came just before it.
@@ -1200,6 +1203,15 @@ struct ContentView: View {
                 OpenQuestionsTray(
                     questions: trayQuestions,
                     reveal: { q in
+                        // A question waiting its turn is not in the stream: open its card here.
+                        if queuedQuestionIds.contains(q.id) {
+                            if let prompt = ChoicePrompt.from(metadata: q.metadata), !prompt.options.isEmpty {
+                                answeringQuestion = q
+                            } else {
+                                beginReply(to: q)
+                            }
+                            return
+                        }
                         // Jump to the card, drawn open with its choices.
                         withAnimation(.spring(response: 0.32, dampingFraction: 0.85)) { focusedQuestionId = q.id }
                         quoteJumpTarget = q.id
@@ -1230,6 +1242,18 @@ struct ContentView: View {
         }
         .animation(.spring(response: 0.35, dampingFraction: 0.8), value: viewModel.isWaitingForResponse)
         .animation(.spring(response: 0.35, dampingFraction: 0.8), value: isScrolledUp)
+    }
+
+    /// Open questions that came straight after another open question: the
+    /// stream draws only the first of such a run and the tray holds the rest
+    /// (the owner, 2026-11-15: "we shouldn't show multiple questions one after
+    /// the other. show one and the rest in the tray"). Answering the first ends
+    /// its run, so the next one takes its place in the stream.
+    private var queuedQuestionIds: Set<UUID> {
+        BubbleLayout.queuedQuestions(
+            viewModel.messages.filter { !viewModel.isChecklistTick($0) && !viewModel.isQuestionDismissal($0) },
+            isOpen: { viewModel.isOpenQuestion($0) && $0.improvementId == nil }
+        )
     }
 
     /// The tray: the thread's own open questions not on screen, plus any the
@@ -1883,8 +1907,17 @@ private struct OnScreenReader: ViewModifier {
 
     func body(content: Content) -> some View {
         if tracked, #available(iOS 18.0, macOS 15.0, *) {
+            // Measured against the scroll view's visible rect on every layout
+            // pass. onScrollVisibilityChange fired only on a change, so a card
+            // already in view when the stream loaded (or when the tray resized
+            // it) was never counted and showed in the tray as well (2026-11-15).
             content
-                .onScrollVisibilityChange(threshold: 0.5) { visible in
+                .onGeometryChange(for: Bool.self) { proxy in
+                    guard let viewport = proxy.bounds(of: .scrollView) else { return false }
+                    let frame = proxy.frame(in: .local)
+                    let seen = frame.intersection(viewport)
+                    return !seen.isNull && seen.height >= min(frame.height, viewport.height) * 0.5
+                } action: { visible in
                     if visible { onScreen.insert(id) } else { onScreen.remove(id) }
                 }
                 .onDisappear { onScreen.remove(id) }
@@ -1920,6 +1953,21 @@ struct BubbleLayout: Equatable {
     /// feed." So only the owner's own message is ever drawn as a reply, and
     /// only when it answers something other than the latest message from the
     /// assistant before it. Jori's answers to a reply are plain messages.
+    /// In each run of open questions with nothing else between them, every
+    /// one after the first (the stream shows one; the tray holds the rest).
+    static func queuedQuestions(_ messages: [Message], isOpen: (Message) -> Bool) -> Set<UUID> {
+        var queued = Set<UUID>()
+        var runStarted = false
+        for m in messages {
+            if isOpen(m) {
+                if runStarted { queued.insert(m.id) } else { runStarted = true }
+            } else {
+                runStarted = false
+            }
+        }
+        return queued
+    }
+
     static func quotedReplies(_ messages: [Message]) -> Set<UUID> {
         var quoted = Set<UUID>()
         var lastAssistant: UUID?
