@@ -105,7 +105,18 @@ manifest's `default`. Everything reads the state through `lib/plugins.cjs`.
 - `sync` — makes the machine match the state: adds missing schedule lines and
   agents for enabled plugins, removes those of disabled or removed ones. A
   line's time is left alone if it exists (cron-tz-sync and the control room
-  retime lines in place). Run by `jori-sync` after a pull.
+  retime lines in place). Run by `jori-sync` after a pull, and hourly by the
+  watchdog (from cron).
+- **Where a sync can write the crontab (macOS).** Writing the crontab needs the
+  "administer your computer" permission (TCC `SystemPolicySysAdminFiles`) for
+  the process macOS holds responsible. Cron holds it on a set-up host; an
+  agent's Claude Code session does not. So `enable` or `sync` run from inside
+  a session records the state, but the crontab write waits on a permission
+  prompt nobody answers until `crontab-safe` gives up (exit 142, a `skipped`
+  line in `data/logs/crontab-safe.log`); reading the crontab is not affected.
+  Nothing is lost: the watchdog's hourly sync installs the lines within the
+  hour. To install at once, run `jori plugin sync` from a Terminal that has
+  the permission.
 - `check` — manifests valid, no file claimed by two plugins, nothing outside a
   plugin imports a plugin's files, schedules match. Fails the pre-commit hook
   on a manifest error.
