@@ -329,3 +329,12 @@ test("museum questions: their own ref and group; never the hum lane's pick", () 
   assert.equal(dq.nextDecision({ items, lane: { asked: [] }, now, tz: "UTC" }).decision, null, "the tracker sends these itself");
   assert.equal(dq.FOLLOW_UP.museums.task, "shows-seen");
 });
+
+// ─── who asks (2026-11-15): social and entertainment cards come from the role that owns the job ───
+test("social and entertainment cards are asked by the role owning their job; review decisions stay with the Chief of Staff", () => {
+  for (const s of ["people", "shows", "restaurants", "museums"]) {
+    assert.ok(dq.ASKED_BY_OWNER_ROLE.has(s), s);
+    assert.ok(dq.FOLLOW_UP[s]?.task, `${s} names its job`);
+  }
+  for (const s of ["improvement", "cost", "budget", "finance"]) assert.ok(!dq.ASKED_BY_OWNER_ROLE.has(s), s);
+});

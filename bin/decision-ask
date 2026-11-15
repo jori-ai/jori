@@ -30,12 +30,21 @@ import { spawnSync } from "node:child_process";
 import { createRequire } from "node:module";
 import {
   loadOpen, orderDecisions, nextDecision, findDecision, buildCard, renderDecision, groupOf, UNPACED,
-  readLane, writeLane, hashQuestion, SELF_ASKED,
+  readLane, writeLane, hashQuestion, SELF_ASKED, ASKED_BY_OWNER_ROLE, FOLLOW_UP,
 } from "../lib/decision-queue.mjs";
 import { userTz } from "../lib/hum-events.mjs";
 import { recordQuestionSend, currentScale } from "../lib/question-pacing.mjs";
 
 const BIN = createRequire(import.meta.url)("../lib/root.cjs").installTools("bin");
+
+/** The team role that asks this card (ASKED_BY_OWNER_ROLE), or null for the Chief of Staff. */
+function askingRole(source) {
+  if (!ASKED_BY_OWNER_ROLE.has(source) || !FOLLOW_UP[source]?.task) return null;
+  try {
+    const r = createRequire(import.meta.url)("../lib/org.cjs").roleFor({ job: FOLLOW_UP[source].task });
+    return r && !r.chief_of_staff && /^[a-z0-9-]+$/.test(r.id) ? r.id : null; // lang-regex-ok: validates a role id slug from config, not language
+  } catch { return null; }
+}
 const arg = (n) => { const i = process.argv.indexOf(`--${n}`); return i >= 0 ? process.argv[i + 1] : null; };
 const has = (n) => process.argv.includes(`--${n}`);
 
@@ -84,6 +93,7 @@ async function main() {
     "--choices-json", JSON.stringify(choices),
     "--metadata-json", JSON.stringify({ decision_ref: item.ref }),
     ...(has("no-push") ? ["--no-push"] : ["--push-body", `Decision: ${card.header}`]),
+    ...(askingRole(item.source) ? ["--role", askingRole(item.source)] : []),
     text,
   ], { encoding: "utf8", timeout: 180_000 });
   let captured = "";
