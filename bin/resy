@@ -21,19 +21,26 @@ const LOG_FILE = installTools("logs", "resy-snipe.log");
 //                the bare slug is not found (e.g. a city code).
 // tz:            the zone drop times and "today" are read in (default: the
 //                installation's zone).
+// client_key:    Resy's public web-client key, used only when resy.com can't
+//                be read and no sign-in has stored one ("" = none).
 // Without a Resy login (`resy login`) every command that needs the API says
 // so and stops; `watch run` (cron) is a no-op.
-const CFG = localConfig("resy", { location: "", slug_suffixes: [], tz: "" });
+const CFG = localConfig("resy", { location: "", slug_suffixes: [], tz: "", client_key: "" });
 const TZ = CFG.tz || instance().tz;
 
 // ── Resy API ───────────────────────────────────────────────────────────────
 const RESY_BASE = "https://api.resy.com";
-// Resy's public web-client key: the value every browser sends from resy.com
+// Resy's public web-client key is the value every browser sends from resy.com
 // (it is in the site's own JavaScript), not an account credential. Resy
-// rotates it (the old "youarewhereyoueat" stopped working in 2026), so login
-// reads the live one from resy.com (discoverClientKey) and this is only the
-// fallback when that page can't be read.
-const RESY_PUBLIC_CLIENT_KEY = "VbWk7s3L4KiK5fzlO7JD3Q5EYolJI7n5";
+// rotates it, so login reads the live one from resy.com (discoverClientKey)
+// and the session stores it. No key lives in this file: when resy.com can't be
+// read, the fallback is the key the last sign-in stored, then `client_key`
+// in the local config.
+function fallbackClientKey() {
+  const key = (loadAuth() || {}).apiKey || CFG.client_key;
+  if (!key) throw new Error("could not read Resy's client key from resy.com; set client_key in agent/local/config/resy.json");
+  return key;
+}
 const BROWSER_UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.3.1 Safari/605.1.15";
 
 // ── Session lifetime ───────────────────────────────────────────────────────
@@ -157,7 +164,7 @@ async function withLock(fn) {
   }
 }
 
-// The live public client key from resy.com's own JavaScript (see RESY_PUBLIC_CLIENT_KEY).
+// The live public client key from resy.com's own JavaScript (see fallbackClientKey).
 async function discoverClientKey() {
   try {
     const html = await (await fetch("https://resy.com/", { headers: { "User-Agent": BROWSER_UA }, signal: AbortSignal.timeout(15_000) })).text();
@@ -207,7 +214,7 @@ async function authPost(endpoint, apiKey, form, extraHeaders = {}) {
 // Trade the refresh token for a new access token (and a new refresh token).
 async function refreshSession(auth) {
   if (!auth.refreshToken) throw new Error("no refresh token stored");
-  const { res, data, text } = await authPost("/3/auth/refresh", auth.apiKey || RESY_PUBLIC_CLIENT_KEY, null, {
+  const { res, data, text } = await authPost("/3/auth/refresh", auth.apiKey || fallbackClientKey(), null, {
     Cookie: `production_refresh_token=${auth.refreshToken}`,
   });
   if (!res.ok || !data.token) throw new Error(`refresh returned ${res.status}: ${text.slice(0, 120)}`);
@@ -227,7 +234,7 @@ function savedEmail(auth) {
 
 // Ask Resy to email a one-time code. Returns { apiKey, sinceSec, emailMask }.
 async function requestEmailCode(email) {
-  const apiKey = (await discoverClientKey()) || RESY_PUBLIC_CLIENT_KEY;
+  const apiKey = (await discoverClientKey()) || fallbackClientKey();
   const sinceSec = Math.floor(Date.now() / 1000);
   const { res, data, text } = await authPost("/3/auth/email/request", apiKey, { em_address: email });
   if (!res.ok) throw new Error(`code request returned ${res.status}: ${text.slice(0, 160)}`);
@@ -344,7 +351,7 @@ function resolveVenue(auth, venueInput) {
 
 function resyHeaders(auth) {
   return {
-    ...authHeaders(auth.apiKey || RESY_PUBLIC_CLIENT_KEY),
+    ...authHeaders(auth.apiKey || fallbackClientKey()),
     "x-resy-auth-token": auth.authToken,
     "x-resy-universal-auth": auth.authToken,
   };
@@ -471,7 +478,7 @@ async function cmdLogin(args) {
   try {
     if (code) {
       // Finishing a code sent earlier: the key that asked for it is stored as pending.
-      const apiKey = auth.pendingApiKey || (await discoverClientKey()) || RESY_PUBLIC_CLIENT_KEY;
+      const apiKey = auth.pendingApiKey || (await discoverClientKey()) || fallbackClientKey();
       delete auth.pendingApiKey;
       await verifyEmailCode(auth, { apiKey, email, code });
     } else {
@@ -510,7 +517,7 @@ async function cmdToken(args) {
     process.exit(1);
   }
   const auth = loadAuth() || { aliases: {} };
-  const apiKey = flag(args, "api-key") || (await discoverClientKey()) || RESY_PUBLIC_CLIENT_KEY;
+  const apiKey = flag(args, "api-key") || (await discoverClientKey()) || fallbackClientKey();
   setSession(auth, { apiKey, authToken });
   delete auth.refreshToken;
   auth.refreshExpiresAt = null;
