@@ -206,7 +206,7 @@ test("[Hum state] tells the chat agent about an unanswered decision card", () =>
 // (2026-10-27: every tap got the same "recorded, I'll act on it at the
 // next review run", which said nothing about what happens or when.)
 const NY = "US/Eastern"; // EST after Nov 1
-const SCHED = { "nightly-review": "0 5 * * 2", "cost-efficiency-review": "37 2 * * *", "people-watch": "5 3 * * *" };
+const SCHED = { "nightly-review": "0 5 * * 2", "cost-efficiency-review": "37 2 * * *", "people-watch": "5 3 * * *", "shows-seen": "51 3 * * *" };
 const TUE_3PM = Date.parse("2026-10-27T19:00:00Z");
 
 test("nextRun reads a cron schedule in the scheduler's zone, across a clock change", () => {
@@ -227,6 +227,8 @@ test("followUp names the job that acts on the answer and when, from the registry
   assert.equal(at("cost:q", TUE_3PM).when, "by tomorrow morning");
   assert.equal(at("cost:q", Date.parse("2026-10-28T05:00:00Z")).when, "by this morning", "1am: tonight's run");
   assert.equal(at("ppl:x", TUE_3PM).who, "the people tracker");
+  assert.equal(at("shw:x", TUE_3PM).who, "the shows tracker");
+  assert.equal(at("shw:x", TUE_3PM).when, "by tomorrow morning");
   assert.equal(dq.followUp("imp:abc", { now: TUE_3PM, scheduleOf: () => null }).when, null, "no schedule, no promised time");
   assert.equal(dq.followUp("zzz:1", { now: TUE_3PM }), null);
 });
@@ -295,4 +297,20 @@ test("withoutHeld drops items the pre-rank filter already holds as settled, and 
   assert.deepEqual(dq.withoutHeld(items, new Map([["decision:ppl:a", "2026-11-07T00:00:00Z"]])).map((i) => i.ref), ["si-1"]);
   assert.equal(dq.withoutHeld(items, new Set()), items);
   assert.equal(dq.withoutHeld(items, null), items);
+});
+
+// ─── shows (2026-11-15): the shows tracker's morning-after questions ──────
+test("shows questions: their own ref, their own daily slot, behind review decisions like people", () => {
+  const q = (id, extra = {}) => ({ id, question: `How was ${id}?`, options: ["Loved it", "Not for us"], asked_at: "2026-11-15T08:00:00Z", status: "open", ...extra });
+  const items = dq.loadOpen({ improvement: { questions: [{ question: "Plan?", options: ["a", "b"], asked_at: "2026-11-14T08:00:00Z", status: "open" }] }, cost: {}, people: { questions: [q("p1")] }, shows: { questions: [q("s1"), q("s2", { status: "answered" })] }, budget: {}, finance: {} });
+  const shows = items.filter((it) => it.source === "shows");
+  assert.deepEqual(shows.map((it) => it.ref), ["shw:s1"]);
+  const now = Date.parse("2026-11-15T15:00:00Z");
+  const first = dq.nextDecision({ items, lane: { asked: [] }, now, tz: "UTC" });
+  assert.equal(first.decision.source, "improvement", "review decisions first");
+  // Review asked today: the shows slot is still open, and asking people does not close it.
+  const lane = { asked: [{ ref: first.decision.ref, at: "2026-11-15T09:00:00Z" }, { ref: "ppl:p1", at: "2026-11-15T10:00:00Z" }] };
+  assert.equal(dq.nextDecision({ items, lane, now, tz: "UTC" }).decision.ref, "shw:s1");
+  lane.asked.push({ ref: "shw:s1", at: "2026-11-15T11:00:00Z" });
+  assert.equal(dq.nextDecision({ items, lane, now, tz: "UTC" }).decision, null);
 });

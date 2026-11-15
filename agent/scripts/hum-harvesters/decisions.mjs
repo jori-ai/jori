@@ -57,6 +57,8 @@ try {
   const signal = [
     source === "people"
       ? `A question about someone the user knows, from the people tracker (open ${ageDays} day${ageDays === 1 ? "" : "s"}): whether to stay in touch, track their news, or act on a change in their life. The user asked to be asked about each person, never to have it done automatically.`
+      : source === "shows"
+      ? `A morning-after question from the shows tracker (open ${ageDays} day${ageDays === 1 ? "" : "s"}): how a show, film or concert the user went to was, and whether they would go again. The user asked to be asked after each show so their taste profile and recommendations learn from it.`
       : `A decision waiting on the user (from the ${source === "cost" ? "daily cost review" : "weekly self-improvement planner"}, open ${ageDays} day${ageDays === 1 ? "" : "s"}; ${r.waiting} waiting in all). The user asked for these one a day in chat instead of at the bottom of the weekly email.`,
     "If it wins, it is a QUESTION and code sends it as a multiple-choice card (`decision-ask --ref`); do not write or rewrite its text.",
     `The decision: ${String(q.question).slice(0, 700)}`,
@@ -69,7 +71,8 @@ try {
     // A pending owner decision blocks a fix; time-sensitive ones more so. Still
     // below operational, health-urgent and time-critical candidates.
     // People questions are welcome but never pressing: below review decisions.
-    urgency: source === "people" ? (q.time_sensitive ? 0.55 : 0.45) : q.time_sensitive ? 0.72 : 0.6,
+    // Shows feedback is best asked while the night is fresh: a touch above people, still below review decisions.
+    urgency: source === "people" ? (q.time_sensitive ? 0.55 : 0.45) : source === "shows" ? 0.5 : q.time_sensitive ? 0.72 : 0.6,
     freshness_min: 0,
     dedup_key: `decision:${ref}`,
     act_fit: { effort_to_act: "quick_win", steps_to_act: ["tap an option, or type an answer"] },
