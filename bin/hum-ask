@@ -25,7 +25,17 @@
 //   hum-ask --id <q-id> --lane <lane> [--subject S] [--memory-hook H]
 //           [--rationale R] [--ttl-min 15] [--intent hum:<lane>:question]
 //           [--findings <json array>] [--relevant-until <iso>]
+//           [--options '<json: 2-4 labels or {label, description}>'
+//            [--recommended <1-based n>] [--header <topic chip>]]
 //           (--message <text> | --message-from-stdin)
+//
+// --options (2026-11-15): a question with fixed answers goes out as a tappable
+// card (metadata.choices, the decision card's layout: header chip, bold
+// question, numbered options, the recommended one first, "Type something")
+// instead of a list typed into the text. --message is then the question ALONE;
+// the numbered copy for the push and older builds is built here
+// (lib/decision-queue.mjs renderQuestionChoices). The card carries no ref, so a
+// tap reaches the chat agent as a threaded reply and is filed with hum-answer.
 //
 // Open-questions ledger: every question that lands is recorded in
 // data/open-questions.jsonl (lib/open-questions.mjs) and stays open until
@@ -33,8 +43,8 @@
 // ORIGINAL --id. The chat row is tagged metadata.question_id (+ question_until
 // for a time-bound one) so the app colours it while it is open, and
 // metadata.finding_key, the dedup_key of the --findings headline, so the row
-// says structurally what it asked about (a hum question carries no choice
-// card): a stop question's key is `location_ask:<visit id>`, which
+// says structurally what it asked about (a hum question without --options
+// carries no choice card): a stop question's key is `location_ask:<visit id>`, which
 // bin/stop-evidence's audit reads. A re-ask the resolve-first gate settles
 // from the records (12 / 13) retires the question.
 // --relevant-until defaults from the lane (location lanes: end of the local day).
@@ -62,6 +72,7 @@ import { spawnSync } from "node:child_process";
 import { readSidecar } from "../lib/hum-resolve-first.mjs";
 import { recordAsked, recordRetired, getQuestion, relevantUntilFor, stampRows } from "../lib/open-questions.mjs";
 import { recordQuestionSend } from "../lib/question-pacing.mjs";
+import { renderQuestionChoices } from "../lib/decision-queue.mjs";
 
 import { installTools } from "../lib/root.cjs";
 const HOME = os.homedir();
@@ -88,6 +99,9 @@ const ttlMin = Number(flag("--ttl-min") ?? 15);
 const intentArg = flag("--intent");
 const findingsRaw = flag("--findings");
 const relevantUntilArg = flag("--relevant-until") ?? null;
+const optionsRaw = flag("--options");
+const recommendedArg = flag("--recommended");
+const headerArg = flag("--header");
 let message = flag("--message");
 const fromStdin = flag("--message-from-stdin", false);
 if (args.length) die(`unrecognized args: ${args.join(" ")}`);
@@ -104,6 +118,26 @@ if (findingsRaw) {
   if (!Array.isArray(findings)) die("--findings must be a JSON array");
 }
 
+// A question with fixed answers goes out as a tappable card (metadata.choices,
+// the decision card's layout) instead of a numbered list typed into the text.
+let choicesJson = null;
+if (optionsRaw !== undefined) {
+  let opts;
+  try { opts = JSON.parse(optionsRaw); } catch (e) { die(`--options must be JSON (${e.message})`); }
+  let rec = null;
+  if (recommendedArg !== undefined) {
+    rec = Number(recommendedArg) - 1;
+    if (!Number.isInteger(rec)) die("--recommended is the 1-based number of an option");
+  }
+  try {
+    const card = renderQuestionChoices({ question: message, options: opts, recommended: rec, header: headerArg || "Question" });
+    choicesJson = card.choices;
+    message = card.text;
+  } catch (e) { die(`--options: ${e.message}`); }
+} else if (recommendedArg !== undefined || headerArg !== undefined) {
+  die("--recommended and --header need --options");
+}
+
 // Always a `hum:` intent ending in `:question` — the gate's routing key and its
 // hint that this is a question.
 const intent = intentArg && intentArg.startsWith("hum:") ? intentArg : `hum:${lane}:question`;
@@ -117,7 +151,9 @@ const findingKey = findings && findings[0] && typeof findings[0].dedup_key === "
   ? findings[0].dedup_key : null;
 const rowMeta = { question_id: id, ...(relevantUntil ? { question_until: relevantUntil } : {}),
   ...(findingKey ? { finding_key: findingKey } : {}) };
+if (choicesJson && relevantUntil) choicesJson.expires_at = relevantUntil;
 const sendArgs = ["--suppress-hook", "--capture-id", captureFile, "--intent", intent, "--metadata-json", JSON.stringify(rowMeta)];
+if (choicesJson) sendArgs.push("--choices-json", JSON.stringify(choicesJson));
 try {
   fs.writeFileSync(contextFile, JSON.stringify({
     kind: "question", lane, question_id: id, subject,

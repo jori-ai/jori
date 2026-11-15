@@ -294,7 +294,10 @@ Output EXACTLY one JSON object, no prose:
    "subject":"<kebab-case>","rationale":"<one sentence>",
    "urgency":"low|med|high","based_on_topic":"<topic>"}
 
-  {"decision":"question","text":"<≤3 lines, specific, curious>",
+  {"decision":"question","text":"<≤3 lines, specific, curious; the question alone, never a list of answers>",
+   "options":["<optional: 2-4 short answer labels when the question has fixed answers>"],
+   "recommended":<optional: 1-based number of the option you would pick>,
+   "header":"<optional: 1-2 word topic chip, e.g. Travel>",
    "subject":"<kebab-case>",
    "memory_hook":"show_preference|restaurant_preference|event_recap|general_preference|person|<a hook the local additions name>",
    "rationale":"<one sentence on the future decision this sharpens>"}
@@ -574,8 +577,11 @@ Every tick, including silent. It self-expires (no-op after the window or if `dat
      --id "<q-YYYYMMDD-HHMM-hex>" --lane "<lane>" \
      --subject "<subject>" --memory-hook "<memory_hook>" --rationale "<rationale>" \
      --findings '<JSON array: the winning candidate>' --ttl-min 15 \
+     [--options '<JSON array of 2-4 labels>' --recommended <n> --header "<chip>"] \
      --message-from-stdin
    ```
+
+   **A question with fixed answers is a card, never a list in the text (2026-11-15).** When you offer choices ("should someone pick them up at the airport, or do they take a car?"), pass them as `--options` (labels, or `{label, description}` for a one-line grey note), `--recommended` (1-based) when you have a pick, and `--header`; the text is the bare question. `hum-ask` builds the card the decisions lane uses (header chip, bold question, recommended option first marked "(Recommended)", "Type something") and the numbered copy for the push. Never type "1. … (my pick)" or "Type something" into the text: that arrives as a plain bubble with nothing to tap. Open questions with no fixed answer set ("what did you think of it?") stay text-only.
 
    It sends with intent `hum:<lane>:question` and `--capture-id`, and writes `hum-pending-question.json` (`{id, asked_at, question, subject, memory_hook, rationale, lane, delivered_msg_id, expires_at}`) **only for what landed as a question**, holding the text they actually saw. The captured `jori_messages.id` is what routes a threaded reply back to *this* question (`lib/hum-reply-target.mjs`). (15-min TTL policy: hum-detail.md § Step 4.) Exit codes:
    - **0** asked (possibly narrowed by the gate to just the remaining gap) → steps 4–5.
