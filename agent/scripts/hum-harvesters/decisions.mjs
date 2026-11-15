@@ -22,7 +22,7 @@
 import { readStdinJson, emit, emitNull, emitNoop, stampRun } from "./_common.mjs";
 import { nextDecision } from "../../../lib/decision-queue.mjs";
 import { userTz } from "../../../lib/hum-events.mjs";
-import { loadOpen, SELF_ASKED, withoutHeld } from "../../../lib/decision-queue.mjs";
+import { loadOpen, SELF_ASKED, ASKED_AT_ONCE, withoutHeld } from "../../../lib/decision-queue.mjs";
 import { wikiSettledKeys } from "../../../lib/hum-vetoes.mjs";
 import { resolvedKeys } from "../../../lib/hum-resolve-first-store.mjs";
 import { reportBacklog, currentScale, recentlyOffered } from "../../../lib/question-pacing.mjs";
@@ -30,8 +30,9 @@ import { reportBacklog, currentScale, recentlyOffered } from "../../../lib/quest
 await readStdinJson();
 
 try {
-  // Cards a job sends itself (the finance review) are not this lane's backlog.
-  let items = loadOpen().filter((it) => !SELF_ASKED.has(it.source));
+  // Cards a job sends itself (the finance review; the shows, meal and museum
+  // feedback asks, sent the moment they are raised) are not this lane's backlog.
+  let items = loadOpen().filter((it) => !SELF_ASKED.has(it.source) && !ASKED_AT_ONCE.has(it.source));
   reportBacklog("decisions", items.length);
   // Skip what the pre-rank filter already holds as settled (wiki_settled within
   // 7 days, or resolved_first): re-emitting it only burns the slot again.

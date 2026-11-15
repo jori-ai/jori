@@ -7,7 +7,9 @@
 // question, numbered options with a grey one-line description, the recommended
 // option first and marked "(Recommended)", and a free-text "Type something".
 //
-//   decision-ask --ref <ref> [--dry-run]   send it (or print the card)
+//   decision-ask --ref <ref> [--dry-run] [--no-push]   send it (or print the card);
+//                                           --no-push: into the chat (and its open-questions
+//                                           tray) without a notification
 //   decision-ask --next [--dry-run]         the lane's pick right now
 //   decision-ask --list                     every open decision, in order
 //
@@ -80,7 +82,7 @@ async function main() {
     "--intent", "decision:ask",
     "--choices-json", JSON.stringify(choices),
     "--metadata-json", JSON.stringify({ decision_ref: item.ref }),
-    "--push-body", `Decision: ${card.header}`,
+    ...(has("no-push") ? ["--no-push"] : ["--push-body", `Decision: ${card.header}`]),
     text,
   ], { encoding: "utf8", timeout: 180_000 });
   let captured = "";

@@ -300,7 +300,7 @@ test("withoutHeld drops items the pre-rank filter already holds as settled, and 
 });
 
 // ─── shows (2026-11-15): the shows tracker's morning-after questions ──────
-test("shows questions: their own ref, their own daily slot, behind review decisions like people", () => {
+test("shows questions: their own ref; sent at once by the tracker, never picked by the hum lane", () => {
   const q = (id, extra = {}) => ({ id, question: `How was ${id}?`, options: ["Loved it", "Not for us"], asked_at: "2026-11-15T08:00:00Z", status: "open", ...extra });
   const items = dq.loadOpen({ improvement: { questions: [{ question: "Plan?", options: ["a", "b"], asked_at: "2026-11-14T08:00:00Z", status: "open" }] }, cost: {}, people: { questions: [q("p1")] }, shows: { questions: [q("s1"), q("s2", { status: "answered" })] }, budget: {}, finance: {} });
   const shows = items.filter((it) => it.source === "shows");
@@ -308,25 +308,24 @@ test("shows questions: their own ref, their own daily slot, behind review decisi
   const now = Date.parse("2026-11-15T15:00:00Z");
   const first = dq.nextDecision({ items, lane: { asked: [] }, now, tz: "UTC" });
   assert.equal(first.decision.source, "improvement", "review decisions first");
-  // Review asked today: the shows slot is still open, and asking people does not close it.
+  // Review and people asked today: the lane has nothing left — the show is not its to ask.
   const lane = { asked: [{ ref: first.decision.ref, at: "2026-11-15T09:00:00Z" }, { ref: "ppl:p1", at: "2026-11-15T10:00:00Z" }] };
-  assert.equal(dq.nextDecision({ items, lane, now, tz: "UTC" }).decision.ref, "shw:s1");
-  lane.asked.push({ ref: "shw:s1", at: "2026-11-15T11:00:00Z" });
   assert.equal(dq.nextDecision({ items, lane, now, tz: "UTC" }).decision, null);
+  assert.equal(dq.nextDecision({ items, lane: { asked: [] }, now, tz: "UTC", group: "shows" }).decision, null);
+  for (const s of ["shows", "restaurants", "museums"]) {
+    assert.ok(dq.ASKED_AT_ONCE.has(s), `${s}: sent the moment it is raised`);
+    assert.ok(dq.UNPACED.has(s), `${s}: no daily slot`);
+  }
 });
 
 // ─── museums (2026-11-15): the museum tracker's morning-after questions ───
-test("museum questions: their own ref, header and daily slot, so a show, a meal and a museum can all be asked one day", () => {
+test("museum questions: their own ref and group; never the hum lane's pick", () => {
   const q = (id, extra = {}) => ({ id, question: `How was ${id}?`, options: ["Loved it", "Not for us"], asked_at: "2026-11-15T08:00:00Z", status: "open", ...extra });
   const items = dq.loadOpen({ improvement: {}, cost: {}, people: {}, shows: { questions: [q("s1")] }, restaurants: { questions: [q("r1")] }, museums: { questions: [q("m1"), q("m2", { status: "answered" })] }, budget: {}, finance: {} });
   assert.deepEqual(items.filter((it) => it.source === "museums").map((it) => it.ref), ["mus:m1"]);
   assert.equal(dq.groupOf("museums"), "museums");
   assert.ok(dq.LATE_GROUPS.has("museums"), "behind review decisions, like shows and meals");
   const now = Date.parse("2026-11-15T15:00:00Z");
-  // A show and a meal already asked today: the museum slot is still open.
-  const lane = { asked: [{ ref: "shw:s1", at: "2026-11-15T09:00:00Z" }, { ref: "rst:r1", at: "2026-11-15T10:00:00Z" }] };
-  assert.equal(dq.nextDecision({ items, lane, now, tz: "UTC" }).decision.ref, "mus:m1");
-  lane.asked.push({ ref: "mus:m1", at: "2026-11-15T11:00:00Z" });
-  assert.equal(dq.nextDecision({ items, lane, now, tz: "UTC" }).decision, null, "one museum question a day");
+  assert.equal(dq.nextDecision({ items, lane: { asked: [] }, now, tz: "UTC" }).decision, null, "the tracker sends these itself");
   assert.equal(dq.FOLLOW_UP.museums.task, "shows-seen");
 });
