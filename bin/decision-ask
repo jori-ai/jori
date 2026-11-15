@@ -14,7 +14,8 @@
 //   decision-ask --list                     every open decision, in order
 //
 // Exit: 0 sent (or printed) · 5 nothing to send (unknown/answered ref, already
-// one today) · 6 the outbound precheck held it (nothing recorded) · 3 send failed.
+// one today) · 6 the outbound precheck or speak gate held it (nothing recorded;
+// stdout {sent:false, held:{by, verdict, note, …}}) · 3 send failed.
 //
 // Sends through jori-send-curl (outbound precheck, push + motion gate),
 // with intent `decision:ask` — deliberately NOT a `hum:` intent: the
@@ -93,6 +94,11 @@ async function main() {
   }
   if (!captured || captured.startsWith("{")) {
     console.error(`decision-ask: held before sending (${captured || "no message id"}); nothing recorded`);
+    // The hold itself on stdout, for a caller that acts on it (a speak-gate
+    // "resolve" hold: the user already answered; plugins/shows-seen/lib/ask-now.js).
+    let hold = null;
+    try { hold = captured ? JSON.parse(captured) : null; } catch { hold = null; }
+    console.log(JSON.stringify({ sent: false, ref: item.ref, held: hold }));
     return 6;
   }
 

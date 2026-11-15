@@ -1224,7 +1224,12 @@ except Exception: print("held")' 2>/dev/null)
       if [ "$P1_FOLD_CLAIMED" = true ]; then node "$P1_FOLD" release --message "$P1_MESSAGE" > /dev/null 2>&1; fi
       if [ -n "$CAPTURE_ID_FILE" ]; then
         TMP_ID="${CAPTURE_ID_FILE}.tmp.$$"
-        printf '{"suppressed":true,"by":"speak-gate","reason":%s}\n' "$(printf '%s' "$GATE_VERDICT" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))')" > "$TMP_ID" \
+        # verdict/note apart from the combined reason, so a caller can act on the
+        # verdict (e.g. "resolve": the user already answered it) without parsing words.
+        printf '%s' "$GATE_OUT" | GATE_VERDICT="$GATE_VERDICT" python3 -c 'import json,os,sys
+try: d=json.load(sys.stdin)
+except Exception: d={}
+print(json.dumps({"suppressed": True, "by": "speak-gate", "reason": os.environ.get("GATE_VERDICT", "held"), "verdict": d.get("verdict") or "held", "note": d.get("reason") or ""}))' > "$TMP_ID" \
           && mv -f "$TMP_ID" "$CAPTURE_ID_FILE"
       fi
       exit 0
