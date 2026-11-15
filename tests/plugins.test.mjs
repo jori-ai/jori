@@ -198,3 +198,12 @@ test("plugin new: the template becomes a valid, off-by-default plugin with its s
   fs.rmSync(path.join(KDIR, "mu-check"), { recursive: true });
   fs.rmSync(path.join(KDIR, "nu-check"), { recursive: true });
 });
+
+test("a sync's crontab-safe call is capped above crontab-safe's own read and install timeouts", () => {
+  // Defaults: 20 s read + 120 s install (+ room to start). The install never gets less than the read.
+  assert.equal(M.crontabSafeMs({}), (20 + 120 + 30) * 1000);
+  assert.equal(M.crontabSafeMs({ CRONTAB_SAFE_TIMEOUT: "150" }), (150 + 150 + 30) * 1000);
+  assert.equal(M.crontabSafeMs({ CRONTAB_SAFE_INSTALL_TIMEOUT: "300" }), (20 + 300 + 30) * 1000);
+  // Not a positive whole number: the default, as crontab-safe reads it.
+  assert.equal(M.crontabSafeMs({ CRONTAB_SAFE_TIMEOUT: "0", CRONTAB_SAFE_INSTALL_TIMEOUT: "soon" }), (20 + 120 + 30) * 1000);
+});

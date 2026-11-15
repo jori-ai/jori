@@ -9,7 +9,12 @@
 //   editorial_sources  [{ city, url, note }] listings to mine first
 //   cities             [{ match: [place words], city }] place → city, first match wins
 //   default_city       the city when no place matches
+//   taste_files        [path] markdown files read into the taste profile as well
+//                      (relative to the install, or absolute; a missing one is
+//                      skipped), e.g. a file another tracker renders the user's
+//                      verdicts on the places they visited into
 import { execFileSync } from "node:child_process";
+import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { createRequire } from "node:module";
@@ -20,7 +25,19 @@ import { extractJsonObject } from "../../../lib/extract-json.mjs";
 
 const { situation: sit, context } = await readStdinJson();
 const TTL_MIN = 24 * 60;
-const CFG = localConfig("hum-art", { taste: "", focus: "art exhibitions", venues: [], editorial_sources: [], cities: [], default_city: "" });
+const CFG = localConfig("hum-art", { taste: "", focus: "art exhibitions", venues: [], editorial_sources: [], cities: [], default_city: "", taste_files: [] });
+const { installTools } = createRequire(import.meta.url)("../../../lib/root.cjs");
+
+/** The configured taste files' text, each bounded (a missing or unreadable one is skipped). */
+function tasteFilesText() {
+  return (CFG.taste_files || []).map((f) => {
+    try {
+      return fs.readFileSync(path.isAbsolute(f) ? f : installTools(f), "utf8").slice(0, 4000).trim();
+    } catch {
+      return "";
+    }
+  }).filter(Boolean).join("\n\n");
+}
 const { MODELS } = createRequire(import.meta.url)("../../../lib/models.cjs");
 const CLAUDE = path.join(os.homedir(), ".local/bin/claude");
 
@@ -35,7 +52,7 @@ const recall = recallForLane({ lane: "art", max_rows: 40, window_days: 365 });
 let cache = readCache("art");
 if (!cache || cache._age_min >= TTL_MIN) {
   const city = inferCity(sit);
-  const tasteDigest = (context?.tastes?.art || CFG.taste).slice(0, 1500);
+  const tasteDigest = [(context?.tastes?.art || CFG.taste).slice(0, 1500), tasteFilesText()].filter(Boolean).join("\n\n");
   const recentLearnings = (context?.recent?.recent_learnings || [])
     .filter((l) => ["show_preference", "event_recap", "general_preference"].includes(l.memory_hook))
     .slice(0, 8);
@@ -59,6 +76,7 @@ Use web_search to find up to 5 notable ${CFG.focus || "art exhibitions"} / galle
 - Gallery openings${venues ? ` (${venues}, etc.)` : ""}
 - Museum shows matching the taste profile
 - Limited-run exhibitions with specific end dates
+- Never anything at a place the taste profile marks "Not for us"; a place or kind of show it marks loved comes first
 ${editorial ? `\n${editorial}\nAlways check it (or its current week's listings page) before broad web search.` : ""} Local/buzzy > tourist blockbuster.
 
 Output ONE JSON object on stdout, no prose:

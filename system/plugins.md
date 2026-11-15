@@ -110,10 +110,16 @@ manifest's `default`. Everything reads the state through `lib/plugins.cjs`.
 - **Where a sync can write the crontab (macOS).** Writing the crontab needs the
   "administer your computer" permission (TCC `SystemPolicySysAdminFiles`) for
   the process macOS holds responsible. Cron holds it on a set-up host; an
-  agent's Claude Code session does not. So `enable` or `sync` run from inside
-  a session records the state, but the crontab write waits on a permission
-  prompt nobody answers until `crontab-safe` gives up (exit 142, a `skipped`
-  line in `data/logs/crontab-safe.log`); reading the crontab is not affected.
+  agent's Claude Code session may not. Writing is also slow: installing a
+  crontab of a few hundred lines can take tens of seconds, far longer than
+  reading it, so `crontab-safe` gives the install its own timeout
+  (`CRONTAB_SAFE_INSTALL_TIMEOUT`, default 120 s, never shorter than the
+  read's) while the read keeps its 20 s (`CRONTAB_SAFE_TIMEOUT`), and a sync
+  caps each `crontab-safe` call above both (`crontabSafeMs` in
+  `lib/plugin-manager.mjs`). A write that still does not finish in time (a
+  permission prompt nobody answers) is a skip: exit 1, a `timed out` line in
+  `data/logs/crontab-safe.log`, the crontab exactly as it was; reading the
+  crontab is not affected.
   Nothing is lost: the watchdog's hourly sync installs the lines within the
   hour. To install at once, run `jori plugin sync` from a Terminal that has
   the permission.
