@@ -148,6 +148,7 @@ test("validateAnswer refuses kinds, places and pages it was not offered", () => 
   assert.match(pp.validateAnswer({ stops: [{ i: 0, kind: "cafe", same_as: "pl_zzz" }] }, items), /same_as/);
   assert.match(pp.validateAnswer({ stops: [{ i: 0, kind: "cafe", page: "user_bob" }] }, items), /page/);
   assert.match(pp.validateAnswer({ stops: [] }, items), /no answer/); // lang-regex-ok: matches our own validator error string
+  assert.match(pp.validateAnswer({ stops: [{ i: 0, kind: "rental", title: 42 }] }, items), /title/); // lang-regex-ok: matches our own validator error string
 });
 
 test("keepPhoto keeps only the user's own camera shots, never screenshots or receipts; pickCover prefers a pin, a favorite, then no people", () => {
@@ -245,4 +246,22 @@ test("a day re-swept after a correction moves the photos with the stop", async (
   assert.deepEqual(db.t.photo_links.filter((l) => l.target === "place_corner_cafe"), []);
   assert.deepEqual(db.t.photo_links.filter((l) => l.target === "place_cafe_nine").map((l) => l.photo_uuid).sort(), ["P1", "P2"]);
   assert.match(wiki.store.get("place_corner_cafe"), /No visits on record/);
+});
+
+test("a generic stop name gets the model's title; the stop's own words stay an alias", async () => {
+  const db = fakeDb({ photos: PHOTOS.map((p) => ({ ...p })) });
+  const wiki = fakeWiki();
+  const answer = (prompt) => {
+    const items = [...prompt.matchAll(/\[(\d+)\] "([^"]+)"/g)].map((m) => ({ i: Number(m[1]), name: m[2] })); // lang-regex-ok: reads our own prompt layout
+    return { stops: items.map((it) => ({ i: it.i, kind: it.name === "Corner Café" ? "rental" : "theater", same_as: null, page: null, title: it.name === "Corner Café" ? "Rental, Example Town" : null })) };
+  };
+  const r = await pp.sweep({ date: DAY.date, apply: true, deps: deps({ db, wiki, answer }) });
+  assert.equal(r.errors.length, 0, r.errors.join("\n"));
+  const place = db.t.places.find((p) => p.kind === "rental");
+  assert.equal(place.name, "Rental, Example Town");
+  assert.deepEqual(place.names, ["Rental, Example Town", "Corner Café"]);
+  assert.ok(wiki.store.has("place_rental_example_town"));
+  // The next sweep matches the stop by its own words, with no model call.
+  const r2 = await pp.sweep({ date: DAY.date, apply: true, deps: deps({ db, wiki, answer: () => { throw new Error("no model call expected"); } }) });
+  assert.equal(r2.matched, 2);
 });

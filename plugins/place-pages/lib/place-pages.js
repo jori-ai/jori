@@ -269,9 +269,10 @@ function promptFor(items, cfg = config()) {
     "   A café that mainly serves coffee is cafe; a sit-down meal place is restaurant. An airport lounge is lounge, not transit. A hotel or a rental the user stayed in is hotel or rental.",
     (cfg.exclude_names || []).length ? `   The user's own homes and properties (always own_home): ${cfg.exclude_names.join("; ")}.` : "",
     "3. page: if one of the stop's listed existing wiki pages is a page about this same place, its id; else null. A list of places, a city, a trip or a person is not a page about the place.",
+    "4. title: only for a NEW public place (same_as and page both null) whose name does not say which place it is or is a sentence (\"the airbnb\", \"Yes — the airbnb\", \"our hotel\"): a short clear title from what the stop shows (\"Airbnb, Old Town\", the hotel's own name from the calendar or address). Otherwise null; never rename a proper venue name.",
     "",
     "Use only the ids listed with each stop. Answer with JSON only:",
-    '{"stops": [{"i": 0, "same_as": null, "kind": "cafe", "page": null}, …]}',
+    '{"stops": [{"i": 0, "same_as": null, "kind": "cafe", "page": null, "title": null}, …]}',
     "",
   ].filter((l) => l !== "");
   for (const it of items) {
@@ -295,6 +296,7 @@ function validateAnswer(parsed, items) {
     if (!KINDS.includes(a.kind)) return `stop ${it.i}: kind ${JSON.stringify(a.kind)} is not one of the listed kinds`;
     if (a.same_as != null && !it.near.some((n) => n.id === a.same_as)) return `stop ${it.i}: same_as ${a.same_as} is not one of its nearby places`;
     if (a.page != null && !it.pages.some((p) => p.id === a.page)) return `stop ${it.i}: page ${a.page} is not one of its listed pages`;
+    if (a.title != null && (typeof a.title !== "string" || !a.title.trim() || a.title.length > 80)) return `stop ${it.i}: title must be a short string or null`;
   }
   return null;
 }
@@ -502,14 +504,18 @@ async function sweep({ dates = null, from = null, to = null, date = null, all = 
       out.aliases.push({ place: place.id, name: it.name });
     } else {
       const id = `pl_${sha(`${it.group[0].norm}|${it.lat?.toFixed(4)}|${it.lon?.toFixed(4)}`)}`;
+      // A generic or sentence-like stop name gets the model's clear title; the
+      // stop's own words stay an alias, so the next stop under them still matches.
+      const title = !a.page && typeof a.title === "string" && a.title.trim() ? a.title.trim() : it.name;
+      const names = [...new Set([title, it.name])];
       place = {
-        id, name: it.name, names: [it.name], norm_names: [norm(it.name)], kind: a.kind, page_id: null,
+        id, name: title, names, norm_names: [...new Set(names.map(norm))], kind: a.kind, page_id: null,
         lat: it.lat, lon: it.lon, address: it.address, kind_source: `model:${rung}`,
       };
       if (isPublic(a.kind)) {
         place.page_id = apply ? pageFor(place, a.page, { deps, pageOwners, log }) : (a.page || `(new page for ${it.name})`);
         if (place.page_id) pageOwners.set(place.page_id, id);
-        out.new_places.push({ id, name: it.name, kind: a.kind, page_id: place.page_id, adopted: Boolean(a.page) });
+        out.new_places.push({ id, name: title, kind: a.kind, page_id: place.page_id, adopted: Boolean(a.page) });
       } else {
         out.private.push({ name: it.name, kind: a.kind });
       }
