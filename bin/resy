@@ -3,7 +3,7 @@
 
 const fs = require("fs");
 const path = require("path");
-const { execSync, spawn } = require("child_process");
+const { execSync, execFileSync, spawn } = require("child_process");
 
 const { instance, localConfig } = require(path.join(__dirname, "..", "lib", "instance.cjs"));
 const { installTools } = require(path.join(__dirname, "..", "lib", "root.cjs"));
@@ -28,8 +28,27 @@ const TZ = CFG.tz || instance().tz;
 
 // ── Resy API ───────────────────────────────────────────────────────────────
 const RESY_BASE = "https://api.resy.com";
-// Resy's public web-client key: the same value every browser sends from resy.com, not an account credential.
-const RESY_PUBLIC_CLIENT_KEY = "youarewhereyoueat";
+// Resy's public web-client key: the value every browser sends from resy.com
+// (it is in the site's own JavaScript), not an account credential. Resy
+// rotates it (the old "youarewhereyoueat" stopped working in 2026), so login
+// reads the live one from resy.com (discoverClientKey) and this is only the
+// fallback when that page can't be read.
+const RESY_PUBLIC_CLIENT_KEY = "VbWk7s3L4KiK5fzlO7JD3Q5EYolJI7n5";
+const BROWSER_UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.3.1 Safari/605.1.15";
+
+// ── Session lifetime ───────────────────────────────────────────────────────
+// Resy signs in by an emailed one-time code (passwords are gone from resy.com).
+// The code buys an access token (~45 days) and a refresh token (~90 days,
+// sent as the production_refresh_token cookie, replaced on every refresh).
+// The CLI renews the access token itself once it is within RENEW_BEFORE_MS of
+// expiry, or when Resy answers 419; when the refresh token is gone too it
+// signs in again by email code on its own (reading the code from Gmail via
+// `purchase otp`), at most once per AUTO_LOGIN_EVERY_MS.
+const RENEW_BEFORE_MS = 7 * 24 * 3600_000;
+const AUTO_LOGIN_EVERY_MS = 12 * 3600_000;
+const LOCK_FILE = path.join(DATA_DIR, "resy-auth.lock");
+const PURCHASE_BIN = path.join(__dirname, "purchase");
+const SITE_PASS_BIN = path.join(__dirname, "site-pass");
 
 // ── Alert delivery ─────────────────────────────────────────────────────────
 const JORI_SEND = path.join(__dirname, "jori-send-curl");
@@ -74,26 +93,239 @@ function loadAuth() {
   }
 }
 
+// The session fields. Another process (a snipe, the watch cron) may have
+// renewed them since this one loaded the file, and the refresh token is
+// replaced on every renewal, so a save never writes back older ones.
+const SESSION_FIELDS = ["apiKey", "authToken", "refreshToken", "email", "obtainedAt", "accessExpiresAt", "refreshExpiresAt", "sessionAt"];
+
 function saveAuth(auth) {
   fs.mkdirSync(DATA_DIR, { recursive: true });
-  fs.writeFileSync(AUTH_FILE, JSON.stringify(auth, null, 2) + "\n");
+  const disk = loadAuth();
+  if (disk && (disk.sessionAt || "") > (auth.sessionAt || "")) {
+    for (const k of SESSION_FIELDS) auth[k] = disk[k];
+  }
+  const tmp = AUTH_FILE + "." + process.pid + ".tmp";
+  fs.writeFileSync(tmp, JSON.stringify(auth, null, 2) + "\n", { mode: 0o600 });
+  fs.renameSync(tmp, AUTH_FILE);
 }
 
-function requireAuth() {
-  const auth = loadAuth();
-  if (!auth || !auth.authToken) {
-    console.error("Not logged in. Run: resy login --email <email> --password <password>");
-    process.exit(1);
+function jwtExp(token) {
+  try {
+    const p = JSON.parse(Buffer.from(String(token).split(".")[1], "base64url").toString("utf8"));
+    return p.exp ? new Date(p.exp * 1000).toISOString() : null;
+  } catch {
+    return null;
   }
-  // Check token age (warn if >30 days)
-  if (auth.obtainedAt) {
-    const ageMs = Date.now() - new Date(auth.obtainedAt).getTime();
-    const ageDays = ageMs / (24 * 3600_000);
-    if (ageDays > 30) {
-      console.error("Warning: Auth token is " + Math.floor(ageDays) + " days old. Consider re-running: resy login");
+}
+
+function setSession(auth, { apiKey, authToken, refreshToken, email }) {
+  if (apiKey) auth.apiKey = apiKey;
+  auth.authToken = authToken;
+  if (refreshToken) auth.refreshToken = refreshToken;
+  if (email) auth.email = email;
+  auth.obtainedAt = new Date().toISOString();
+  auth.sessionAt = auth.obtainedAt;
+  auth.accessExpiresAt = jwtExp(authToken);
+  auth.refreshExpiresAt = auth.refreshToken ? jwtExp(auth.refreshToken) : null;
+  delete auth.renewFailedAt;
+  if (!auth.aliases) auth.aliases = {};
+}
+
+// One renewal at a time across processes (the refresh token is single-use).
+async function withLock(fn) {
+  const deadline = Date.now() + 90_000;
+  for (;;) {
+    try {
+      fs.mkdirSync(DATA_DIR, { recursive: true });
+      const fd = fs.openSync(LOCK_FILE, "wx");
+      fs.writeSync(fd, String(process.pid));
+      fs.closeSync(fd);
+      break;
+    } catch (e) {
+      if (e.code !== "EEXIST") throw e;
+      try {
+        if (Date.now() - fs.statSync(LOCK_FILE).mtimeMs > 180_000) fs.unlinkSync(LOCK_FILE);
+      } catch {}
+      if (Date.now() > deadline) throw new Error("another resy process is renewing the login; try again shortly");
+      await new Promise((r) => setTimeout(r, 500));
     }
   }
+  try {
+    return await fn();
+  } finally {
+    try { fs.unlinkSync(LOCK_FILE); } catch {}
+  }
+}
+
+// The live public client key from resy.com's own JavaScript (see RESY_PUBLIC_CLIENT_KEY).
+async function discoverClientKey() {
+  try {
+    const html = await (await fetch("https://resy.com/", { headers: { "User-Agent": BROWSER_UA }, signal: AbortSignal.timeout(15_000) })).text();
+    const scripts = [...html.matchAll(/src="([^"]*modules\/app\.[0-9a-f]+\.js)"/g)].map((m) => new URL(m[1], "https://resy.com/").toString());
+    for (const src of scripts) {
+      const js = await (await fetch(src, { headers: { "User-Agent": BROWSER_UA }, signal: AbortSignal.timeout(30_000) })).text();
+      const m = js.match(/baseRequestUrl:"https:\/\/api\.resy\.com\/"[^}]{0,200}?apiKey:"([A-Za-z0-9_-]{8,})"/);
+      if (m) return m[1];
+    }
+  } catch (err) {
+    log(`client key discovery failed: ${err.message}`);
+  }
+  return null;
+}
+
+function authHeaders(apiKey) {
+  return {
+    Authorization: `ResyAPI api_key="${apiKey}"`,
+    Accept: "application/json, text/plain, */*",
+    Origin: "https://resy.com",
+    Referer: "https://resy.com/",
+    "X-Origin": "https://resy.com",
+    "Cache-Control": "no-cache",
+    "User-Agent": BROWSER_UA,
+  };
+}
+
+function refreshCookie(res) {
+  const set = typeof res.headers.getSetCookie === "function" ? res.headers.getSetCookie() : [];
+  const c = set.find((s) => s.startsWith("production_refresh_token="));
+  return c ? c.split(";")[0].slice("production_refresh_token=".length) : null;
+}
+
+async function authPost(endpoint, apiKey, form, extraHeaders = {}) {
+  const res = await fetch(RESY_BASE + endpoint, {
+    method: "POST",
+    headers: { ...authHeaders(apiKey), "Content-Type": "application/x-www-form-urlencoded", ...extraHeaders },
+    body: new URLSearchParams(form || {}).toString(),
+    signal: AbortSignal.timeout(20_000),
+  });
+  const text = await res.text().catch(() => "");
+  let data = {};
+  try { data = JSON.parse(text); } catch {}
+  return { res, data, text };
+}
+
+// Trade the refresh token for a new access token (and a new refresh token).
+async function refreshSession(auth) {
+  if (!auth.refreshToken) throw new Error("no refresh token stored");
+  const { res, data, text } = await authPost("/3/auth/refresh", auth.apiKey || RESY_PUBLIC_CLIENT_KEY, null, {
+    Cookie: `production_refresh_token=${auth.refreshToken}`,
+  });
+  if (!res.ok || !data.token) throw new Error(`refresh returned ${res.status}: ${text.slice(0, 120)}`);
+  setSession(auth, { authToken: data.token, refreshToken: refreshCookie(res) || auth.refreshToken });
+  saveAuth(auth);
+  log(`session renewed (access until ${auth.accessExpiresAt})`);
+}
+
+function savedEmail(auth) {
+  if (auth && auth.email) return auth.email;
+  try {
+    return execFileSync(SITE_PASS_BIN, ["resy.com", "--user"], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: 30_000 }).trim() || null;
+  } catch {
+    return null;
+  }
+}
+
+// Ask Resy to email a one-time code. Returns { apiKey, sinceSec, emailMask }.
+async function requestEmailCode(email) {
+  const apiKey = (await discoverClientKey()) || RESY_PUBLIC_CLIENT_KEY;
+  const sinceSec = Math.floor(Date.now() / 1000);
+  const { res, data, text } = await authPost("/3/auth/email/request", apiKey, { em_address: email });
+  if (!res.ok) throw new Error(`code request returned ${res.status}: ${text.slice(0, 160)}`);
+  return { apiKey, sinceSec, emailMask: data.email_mask || "" };
+}
+
+// Wait for Resy's code email (bin/purchase otp reads Gmail and keeps the
+// intake from pinging about it). null when it does not arrive in time.
+function readEmailCode(sinceSec, waitSec = 150) {
+  try {
+    const out = execFileSync(PURCHASE_BIN, ["otp", "resy.com", "--since", String(sinceSec), "--wait", String(waitSec)], {
+      encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: (waitSec + 60) * 1000,
+    });
+    const candidates = (JSON.parse(out).candidates || []).filter((c) => c.mentions_site).sort((a, b) => String(b.at).localeCompare(String(a.at)));
+    for (const c of candidates) {
+      // lang-regex-ok: digits in Resy's machine-sent code ("123-456"), not the user's words
+      const m = String(c.excerpt || "").match(/(?<!\d)(\d{3})-?(\d{3})(?!\d)/);
+      if (m) return m[1] + m[2];
+    }
+  } catch (err) {
+    log(`reading the code email failed: ${err.message}`);
+  }
+  return null;
+}
+
+async function verifyEmailCode(auth, { apiKey, email, code }) {
+  const { res, data, text } = await authPost("/4/auth/email/verify", apiKey, { code: String(code).replace(/\D/g, ""), em_address: email });
+  if (!res.ok) throw new Error(`code rejected (${res.status}): ${(data && data.message) || text.slice(0, 120)}`);
+  if (data.email_claim && data.email_claim.claim_token) throw new Error(`no Resy account uses ${email}`);
+  if (!data.token) throw new Error(`Resy accepted the code but sent no token (keys: ${Object.keys(data).slice(0, 12).join(", ")})`);
+  setSession(auth, { apiKey, authToken: data.token, refreshToken: refreshCookie(res), email });
+  saveAuth(auth);
+}
+
+// Full sign-in with no one at the keyboard: email code → Gmail → verify.
+async function autoLogin(auth) {
+  const email = savedEmail(auth);
+  if (!email) throw new Error("no Resy email on file (resy login --email <email>)");
+  const { apiKey, sinceSec } = await requestEmailCode(email);
+  const code = readEmailCode(sinceSec);
+  if (!code) throw new Error("Resy's code email did not arrive (or could not be read from Gmail)");
+  await verifyEmailCode(auth, { apiKey, email, code });
+  log(`signed in again by email code as ${email}`);
+}
+
+const msLeft = (iso) => (iso ? new Date(iso).getTime() - Date.now() : -Infinity);
+
+// Keep the session alive; `force` renews even when the access token looks fine
+// (Resy answered 419). Throws with the reason when it can't.
+async function renew(auth, { force = false } = {}) {
+  return withLock(async () => {
+    const disk = loadAuth();
+    if (disk && (disk.sessionAt || "") > (auth.sessionAt || "")) {
+      for (const k of SESSION_FIELDS) auth[k] = disk[k];
+      if (msLeft(auth.accessExpiresAt) > RENEW_BEFORE_MS) return; // another process just renewed
+    }
+    if (!force && msLeft(auth.accessExpiresAt || jwtExp(auth.authToken)) > RENEW_BEFORE_MS) return;
+    if (auth.refreshToken && msLeft(auth.refreshExpiresAt || jwtExp(auth.refreshToken)) > 60_000) {
+      try {
+        return await refreshSession(auth);
+      } catch (err) {
+        log(`refresh failed: ${err.message}`);
+      }
+    }
+    const last = auth.autoLoginAt ? Date.now() - new Date(auth.autoLoginAt).getTime() : Infinity;
+    if (last < AUTO_LOGIN_EVERY_MS) throw new Error(`login lapsed; the last automatic sign-in was ${Math.round(last / 60_000)} min ago (run: resy login)`);
+    auth.autoLoginAt = new Date().toISOString();
+    saveAuth(auth);
+    await autoLogin(auth);
+  });
+}
+
+// The signed-in session, renewed when it is near expiry. Exits with the
+// reason when there is no login or it can't be renewed.
+async function ensureAuth() {
+  const auth = loadAuth();
+  if (!auth || !auth.authToken) {
+    console.error("Not logged in. Run: resy login");
+    process.exit(1);
+  }
+  if (!auth.aliases) auth.aliases = {};
+  try {
+    await renew(auth);
+  } catch (err) {
+    await renewFailed(auth, err);
+    console.error(`Resy login could not be renewed: ${err.message}`);
+    process.exit(1);
+  }
   return auth;
+}
+
+// Say so once per lapse (not on every cron tick); cleared by the next success.
+async function renewFailed(auth, err) {
+  log(`renewal failed: ${err.message}`);
+  if (auth.renewFailedAt) return;
+  auth.renewFailedAt = new Date().toISOString();
+  saveAuth(auth);
+  await sendAlert(`Resy sign-in lapsed and could not renew itself: ${err.message}. Snipes and watches are paused until \`resy login\` succeeds.`);
 }
 
 function resolveVenue(auth, venueInput) {
@@ -111,17 +343,30 @@ function resolveVenue(auth, venueInput) {
 // ── Resy API client ────────────────────────────────────────────────────────
 
 function resyHeaders(auth) {
-  const clientKey = auth.apiKey || RESY_PUBLIC_CLIENT_KEY;
   return {
-    Authorization: `ResyAPI api_key="${clientKey}"`,
+    ...authHeaders(auth.apiKey || RESY_PUBLIC_CLIENT_KEY),
     "x-resy-auth-token": auth.authToken,
-    Accept: "application/json, text/plain, */*",
-    Origin: "https://resy.com",
-    Referer: "https://resy.com/",
-    "Cache-Control": "no-cache",
-    "X-Origin": "https://resy.com",
-    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.3.1 Safari/605.1.15",
+    "x-resy-universal-auth": auth.authToken,
   };
+}
+
+// One call; on 419 (Resy's "signed out") renew the session and try once more.
+async function resyCall(endpoint, auth, init) {
+  for (let attempt = 0; ; attempt++) {
+    const res = await fetch(init.url, { ...init.options(), signal: AbortSignal.timeout(init.timeoutMs) });
+    if (res.ok) return res.json();
+    const body = await res.text().catch(() => "");
+    if (res.status === 419 && attempt === 0) {
+      try {
+        await renew(auth, { force: true });
+        continue;
+      } catch (err) {
+        await renewFailed(auth, err);
+        throw new Error(`Resy signed this login out and it could not be renewed: ${err.message}`);
+      }
+    }
+    throw new Error(`Resy ${init.method} ${endpoint} returned ${res.status}: ${body.slice(0, 200)}`);
+  }
 }
 
 async function resyGet(endpoint, params, auth) {
@@ -129,35 +374,26 @@ async function resyGet(endpoint, params, auth) {
   for (const [k, v] of Object.entries(params || {})) {
     if (v != null) url.searchParams.set(k, v);
   }
-  const res = await fetch(url.toString(), {
-    headers: resyHeaders(auth),
-    signal: AbortSignal.timeout(15_000),
-  });
-  if (!res.ok) {
-    const body = await res.text().catch(() => "");
-    throw new Error(`Resy ${endpoint} returned ${res.status}: ${body.slice(0, 200)}`);
-  }
-  return res.json();
+  return resyCall(endpoint, auth, { method: "GET", url: url.toString(), timeoutMs: 15_000, options: () => ({ headers: resyHeaders(auth) }) });
 }
 
 async function resyPost(endpoint, formData, auth, extraHeaders = {}) {
-  const res = await fetch(RESY_BASE + endpoint, {
+  return resyCall(endpoint, auth, {
     method: "POST",
-    headers: {
-      ...resyHeaders(auth),
-      "Content-Type": "application/x-www-form-urlencoded",
-      Origin: "https://widgets.resy.com",
-      Referer: "https://widgets.resy.com/",
-      ...extraHeaders,
-    },
-    body: new URLSearchParams(formData).toString(),
-    signal: AbortSignal.timeout(10_000),
+    url: RESY_BASE + endpoint,
+    timeoutMs: 10_000,
+    options: () => ({
+      method: "POST",
+      headers: {
+        ...resyHeaders(auth),
+        "Content-Type": "application/x-www-form-urlencoded",
+        Origin: "https://widgets.resy.com",
+        Referer: "https://widgets.resy.com/",
+        ...extraHeaders,
+      },
+      body: new URLSearchParams(formData).toString(),
+    }),
   });
-  if (!res.ok) {
-    const body = await res.text().catch(() => "");
-    throw new Error(`Resy POST ${endpoint} returned ${res.status}: ${body.slice(0, 200)}`);
-  }
-  return res.json();
 }
 
 // ── Alert delivery ─────────────────────────────────────────────────────────
@@ -218,96 +454,111 @@ function matchSlot(slots, timePrefs, tableType) {
 
 // ── Commands ───────────────────────────────────────────────────────────────
 
+// Resy signs in by an emailed one-time code. `resy login` asks for one and
+// reads it from Gmail itself; with --no-wait it only sends the code, and
+// `resy login --code <123456>` finishes by hand.
 async function cmdLogin(args) {
-  const email = flag(args, "email");
-  const password = flag(args, "password");
-  const apiKey = flag(args, "api-key") || RESY_PUBLIC_CLIENT_KEY;
-
-  if (!email || !password) {
-    console.error("Usage: resy login --email <email> --password <password> [--api-key <key>]");
+  const auth = loadAuth() || { aliases: {} };
+  const jsonOut = hasFlag(args, "json");
+  const email = flag(args, "email") || savedEmail(auth);
+  const code = flag(args, "code");
+  if (flag(args, "password")) console.error("Note: Resy no longer accepts passwords; signing in with an email code instead.");
+  if (!email) {
+    console.error("Usage: resy login [--email <email>] [--code <code>] [--no-wait]");
     process.exit(1);
   }
 
-  console.log("Authenticating with Resy...");
-
   try {
-    const res = await fetch(RESY_BASE + "/3/auth/password", {
-      method: "POST",
-      headers: {
-        Authorization: `ResyAPI api_key="${apiKey}"`,
-        "Content-Type": "application/x-www-form-urlencoded",
-      },
-      body: new URLSearchParams({ email, password }).toString(),
-      signal: AbortSignal.timeout(10_000),
-    });
-
-    if (!res.ok) {
-      const body = await res.text().catch(() => "");
-      console.error(`Login failed (${res.status}): ${body.slice(0, 200)}`);
-      process.exit(1);
-    }
-
-    const data = await res.json();
-    const authToken = data.token || data.auth_token;
-
-    if (!authToken) {
-      console.error("Login succeeded but no auth token in response.");
-      console.error("Response keys:", Object.keys(data).join(", "));
-      console.error("Try providing your auth token directly: resy token --auth-token <token>");
-      process.exit(1);
-    }
-
-    const existing = loadAuth() || {};
-    const auth = {
-      ...existing,
-      apiKey,
-      authToken,
-      email,
-      obtainedAt: new Date().toISOString(),
-      aliases: existing.aliases || {},
-    };
-    saveAuth(auth);
-
-    if (hasFlag(args, "json")) {
-      console.log(JSON.stringify({ success: true, email }, null, 2));
+    if (code) {
+      // Finishing a code sent earlier: the key that asked for it is stored as pending.
+      const apiKey = auth.pendingApiKey || (await discoverClientKey()) || RESY_PUBLIC_CLIENT_KEY;
+      delete auth.pendingApiKey;
+      await verifyEmailCode(auth, { apiKey, email, code });
     } else {
-      console.log(`Logged in as ${email}`);
-      console.log(`Auth token stored in ${AUTH_FILE}`);
+      const { apiKey, sinceSec, emailMask } = await requestEmailCode(email);
+      if (!jsonOut) console.log(`Resy sent a sign-in code to ${emailMask || email}.`);
+      const got = hasFlag(args, "no-wait") ? null : readEmailCode(sinceSec, Number(flag(args, "wait") || 150));
+      if (!got) {
+        auth.pendingApiKey = apiKey;
+        saveAuth(auth);
+        console.error("Finish with: resy login --code <the 6-digit code>");
+        process.exit(hasFlag(args, "no-wait") ? 0 : 2);
+      }
+      await verifyEmailCode(auth, { apiKey, email, code: got });
     }
   } catch (err) {
-    console.error(`Login error: ${err.message}`);
+    console.error(`Login failed: ${err.message}`);
     process.exit(1);
+  }
+
+  if (jsonOut) {
+    console.log(JSON.stringify({ success: true, email, accessExpiresAt: auth.accessExpiresAt, refreshExpiresAt: auth.refreshExpiresAt }, null, 2));
+  } else {
+    console.log(`Logged in as ${email} (renews itself; access until ${auth.accessExpiresAt}, refresh until ${auth.refreshExpiresAt})`);
   }
 }
 
+// An access token copied from a signed-in browser (DevTools: the
+// x-resy-auth-token header). It has no refresh token, so it lasts until it
+// expires and the CLI then signs in again by email code.
 async function cmdToken(args) {
   const authToken = flag(args, "auth-token");
-  const apiKey = flag(args, "api-key") || RESY_PUBLIC_CLIENT_KEY;
-
   if (!authToken) {
     console.error("Usage: resy token --auth-token <token> [--api-key <key>]");
-    console.error("\nGet your auth token from browser DevTools:");
-    console.error("1. Log in to resy.com");
-    console.error("2. Open DevTools → Network tab");
-    console.error('3. Find any api.resy.com request');
-    console.error('4. Copy the x-resy-auth-token header value');
+    console.error("Prefer `resy login`, which renews itself. A pasted token comes from browser DevTools:");
+    console.error("1. Log in to resy.com  2. DevTools → Network  3. any api.resy.com request  4. copy x-resy-auth-token");
     process.exit(1);
   }
-
-  const existing = loadAuth() || {};
-  const auth = {
-    ...existing,
-    apiKey,
-    authToken,
-    obtainedAt: new Date().toISOString(),
-    aliases: existing.aliases || {},
-  };
+  const auth = loadAuth() || { aliases: {} };
+  const apiKey = flag(args, "api-key") || (await discoverClientKey()) || RESY_PUBLIC_CLIENT_KEY;
+  setSession(auth, { apiKey, authToken });
+  delete auth.refreshToken;
+  auth.refreshExpiresAt = null;
   saveAuth(auth);
-  console.log("Auth token saved.");
+  console.log(`Auth token saved (valid until ${auth.accessExpiresAt || "unknown"}; no refresh token, so it will not renew itself).`);
+}
+
+// Who is signed in and until when; --check also renews if due and makes one call.
+async function cmdStatus(args) {
+  const auth = loadAuth();
+  const jsonOut = hasFlag(args, "json");
+  if (!auth || !auth.authToken) {
+    if (jsonOut) console.log(JSON.stringify({ signed_in: false }));
+    else console.log("Not logged in. Run: resy login");
+    process.exit(jsonOut ? 0 : 1);
+  }
+  let live = null;
+  if (hasFlag(args, "check")) {
+    try {
+      const a = await ensureAuth();
+      await resyGet("/2/user", {}, a);
+      Object.assign(auth, loadAuth());
+      live = true;
+    } catch (err) {
+      live = false;
+      if (!jsonOut) console.error(err.message);
+    }
+  }
+  const out = {
+    signed_in: true,
+    email: auth.email || null,
+    access_expires_at: auth.accessExpiresAt || jwtExp(auth.authToken),
+    refresh_expires_at: auth.refreshToken ? auth.refreshExpiresAt || jwtExp(auth.refreshToken) : null,
+    renews_itself: Boolean(auth.refreshToken) || Boolean(auth.email),
+    renew_failed_at: auth.renewFailedAt || null,
+    ...(live === null ? {} : { live }),
+  };
+  if (jsonOut) return console.log(JSON.stringify(out, null, 2));
+  console.log(`Signed in as ${out.email || "(unknown email)"}`);
+  console.log(`  access until  ${out.access_expires_at || "?"}`);
+  console.log(`  refresh until ${out.refresh_expires_at || "none (pasted token)"}`);
+  if (out.renew_failed_at) console.log(`  renewal failing since ${out.renew_failed_at}`);
+  if (live !== null) console.log(`  live check: ${live ? "ok" : "FAILED"}`);
+  if (live === false) process.exit(1);
 }
 
 async function cmdSearch(args) {
-  const auth = requireAuth();
+  const auth = await ensureAuth();
   const query = args.find((a) => !a.startsWith("--"));
   const date = flag(args, "date") || today();
   const party = flag(args, "party") || "2";
@@ -451,7 +702,7 @@ async function cmdSearchDisplay(auth, venueData, date, party, jsonOut) {
 }
 
 async function cmdSlots(args) {
-  const auth = requireAuth();
+  const auth = await ensureAuth();
   const venueInput = args.find((a) => !a.startsWith("--"));
   const date = flag(args, "date") || today();
   const party = flag(args, "party") || "2";
@@ -500,7 +751,7 @@ async function cmdSlots(args) {
 }
 
 async function cmdBook(args) {
-  const auth = requireAuth();
+  const auth = await ensureAuth();
   const venueInput = args.find((a) => !a.startsWith("--"));
   const date = flag(args, "date");
   const timeStr = flag(args, "time");
@@ -602,7 +853,7 @@ async function cmdBook(args) {
 // ── Snipe command ──────────────────────────────────────────────────────────
 
 async function cmdSnipe(args) {
-  const auth = requireAuth();
+  const auth = await ensureAuth();
   const venueInput = args.find((a) => !a.startsWith("--"));
   const date = flag(args, "date");
   const timeStr = flag(args, "time");
@@ -696,7 +947,7 @@ async function cmdSnipeExec(args) {
   const dropTime = args[5];
   const dropTimestamp = parseInt(args[6], 10);
 
-  const auth = requireAuth();
+  const auth = await ensureAuth();
   const msUntilDrop = dropTimestamp - Date.now() - SNIPE_BUFFER_MS;
 
   log(`Snipe scheduled: venue=${venueId} date=${date} time=${timeStr} drop=${dropTime}`);
@@ -820,35 +1071,58 @@ async function attemptBook(auth, slot, date, party) {
 
 // ── Upcoming reservations ──────────────────────────────────────────────────
 
+// Resy's /3/user/reservations is the whole history (paged), with venue details
+// in a separate `venues` map keyed by id. Each reservation comes back with its
+// venue's name and location folded in. Default: today and later, soonest
+// first; --all: everything, newest first.
 async function cmdUpcoming(args) {
-  const auth = requireAuth();
+  const auth = await ensureAuth();
   const jsonOut = hasFlag(args, "json");
+  const all = hasFlag(args, "all");
 
   try {
-    const data = await resyGet("/3/user/reservations", {}, auth);
-    const reservations = data?.reservations || data || [];
+    const reservations = [];
+    for (let offset = 0; offset < 2000; ) {
+      const data = await resyGet("/3/user/reservations", { limit: 100, offset }, auth);
+      const page = Array.isArray(data?.reservations) ? data.reservations : [];
+      const venues = data?.venues || {};
+      for (const r of page) {
+        const v = venues[r?.venue?.id] || {};
+        reservations.push({
+          ...r,
+          venue: {
+            ...(r.venue || {}),
+            name: r?.venue?.name || v.name || null,
+            url_slug: v.venue_url_slug || null,
+            location: v.location ? { locality: v.location.locality || null, neighborhood: v.location.neighborhood || null, address: v.location.address_1 || null } : null,
+          },
+          date: { start: r.day && r.time_slot ? `${r.day} ${r.time_slot}` : r.day || null },
+        });
+      }
+      const total = Number(data?.metadata?.total) || 0;
+      offset += page.length;
+      if (!page.length || offset >= total) break;
+    }
+
+    const todayStr = today();
+    const list = all
+      ? reservations.sort((x, y) => String(y.date.start).localeCompare(String(x.date.start)))
+      : reservations.filter((r) => String(r.day || "") >= todayStr).sort((x, y) => String(x.date.start).localeCompare(String(y.date.start)));
 
     if (jsonOut) {
-      console.log(JSON.stringify(reservations, null, 2));
+      console.log(JSON.stringify(list, null, 2));
       return;
     }
-
-    if (!Array.isArray(reservations) || reservations.length === 0) {
-      console.log("No upcoming reservations.");
+    if (list.length === 0) {
+      console.log(all ? "No reservations." : `No upcoming reservations (${reservations.length} past; resy upcoming --all lists them).`);
       return;
     }
-
-    console.log("Upcoming Reservations:");
+    console.log(all ? "Reservations:" : "Upcoming Reservations:");
     console.log("─".repeat(50));
-    for (const r of reservations) {
-      const venue = r?.venue?.name || r?.restaurant?.name || "Unknown";
-      const date = r?.date?.start || r?.day || "";
-      const time = date.includes(" ") ? date.split(" ")[1]?.slice(0, 5) : "";
-      const party = r?.num_seats || r?.party_size || "?";
-      const token = r?.resy_token || r?.confirmation || "";
-      console.log(`  ${venue}`);
-      console.log(`    ${date.slice(0, 10)} at ${time} — party of ${party}`);
-      if (token) console.log(`    Confirmation: ${token}`);
+    for (const r of list) {
+      const where = r.venue.location?.neighborhood || r.venue.location?.locality || "";
+      console.log(`  ${r.venue.name || `venue ${r.venue.id}`}${where ? ` (${where})` : ""}`);
+      console.log(`    ${r.day || "?"} at ${String(r.time_slot || "").slice(0, 5) || "?"} — party of ${r.num_seats || "?"}`);
     }
   } catch (err) {
     console.error(`Failed to get reservations: ${err.message}`);
@@ -1074,9 +1348,10 @@ function cmdWatchList(args) {
 
 async function cmdWatchRun(args) {
   // Cron entry point: an installation without a Resy login has nothing to watch.
+  // It also keeps the login warm: ensureAuth renews it when it is near expiry.
   const loaded = loadAuth();
   if (!loaded || !loaded.authToken) return;
-  const auth = requireAuth();
+  const auth = await ensureAuth();
   const watches = auth.watches || [];
 
   if (watches.length === 0) {
@@ -1170,8 +1445,10 @@ function cmdHelp() {
   console.log(`resy — Book restaurant reservations via Resy
 
 Usage:
-  resy login --email <email> --password <pass>     Authenticate with Resy
-  resy token --auth-token <token>                  Set auth token manually (from DevTools)
+  resy login [--email E] [--no-wait]               Sign in by emailed code (read from Gmail)
+  resy login --code <123456>                       Finish a sign-in by hand
+  resy status [--check]                            Who is signed in, until when (renews itself)
+  resy token --auth-token <token>                  Paste a browser token (does not renew)
   resy search <query> [--date DATE] [--party N]    Search venues in the configured city
     [--location SLUG]
   resy slots <venue_id> --date DATE [--party N]    Show available time slots
@@ -1179,7 +1456,7 @@ Usage:
     [--party N] [--type TYPE]
   resy snipe <venue_id> --date DATE --time HH:MM   Snipe a reservation at drop time
     [--drop HH:MM] [--party N] [--type TYPE]
-  resy upcoming                                    List upcoming reservations
+  resy upcoming [--all]                            Upcoming reservations (--all: history too)
   resy alias [<name> <venue_id>]                   Manage venue aliases
   resy alias remove <name>                         Remove an alias
   resy snipes                                      Show active snipe processes
@@ -1199,7 +1476,7 @@ Snipe mode:
   booking the first matching slot. Many restaurants drop at local midnight.
 
 Examples:
-  resy login --email me@example.com --password hunter2
+  resy login --email me@example.com
   resy search "Some Restaurant" --date 2026-04-15 --party 2
   resy alias some-restaurant 1234
   resy slots some-restaurant --date 2026-04-15 --party 2
@@ -1217,6 +1494,9 @@ async function main() {
   switch (cmd) {
     case "login":
       await cmdLogin(rest);
+      break;
+    case "status":
+      await cmdStatus(rest);
       break;
     case "token":
       await cmdToken(rest);
