@@ -797,14 +797,22 @@ struct TeamAvatar: View {
     /// hairline gap, wherever its avatar is drawn — the cue that sets it
     /// apart from the other roles. The ring sits inside the avatar's frame,
     /// so every layout keeps its size.
+    ///
+    /// Flattened into one picture (`drawingGroup`) because the Mac's glass
+    /// toolbar draws vibrant content over its material: in the conversation
+    /// header the stroked ring came out a faint grey while the photo inside
+    /// it kept its colour (the owner, 2026-11-15: "there should be a blue
+    /// frame around this too"). Rendered as one image, the ring keeps its blue
+    /// like the photo does. At least 2pt so it reads at the header's 26pt.
     @ViewBuilder
     private func circle(_ m: TeamMember, size: CGFloat) -> some View {
         if m.chiefOfStaff {
-            let ring = max(1.5, size * 0.05)
+            let ring = max(2, size * 0.05)
             let gap = max(1, size * 0.04)
             face(m, size: size - 2 * (ring + gap))
                 .frame(width: size, height: size)
                 .overlay(Circle().strokeBorder(JoriTheme.cobalt, lineWidth: ring))
+                .drawingGroup()
         } else {
             face(m, size: size)
         }
