@@ -197,7 +197,8 @@ struct ImprovementCardView: View {
                 .font(.caption2.weight(.semibold))
                 .foregroundStyle(JoriTheme.confirmed)
         case .failed:
-            Label(item.result?.notLive == true ? "In, not running" : "Didn’t go in",
+            Label(item.result?.notLive != true ? "Didn’t go in"
+                  : item.result?.repairRequest != nil ? "In, being fixed" : "In, not running",
                   systemImage: "exclamationmark.triangle.fill")
                 .font(.caption2.weight(.semibold))
                 .foregroundStyle(.orange)

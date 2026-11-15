@@ -49,6 +49,14 @@ A request that opens with `REBUILD OF AN APPROVED CARD — approval <id>` did no
 3. Steps 2–4 (snapshot, build and test, critic) apply unchanged. Restore the working tree after staging, as in Step 5.
 4. **Report** in one or two sentences: the change the user approved could not go in as written because the code had moved on, it has been rebuilt, and it is waiting for the user's Face ID in Improvements.
 
+## Repairing an applied card
+
+A request that opens with `REPAIR OF AN APPLIED CARD — approval <id>` also came from `self-improve-approval-poll` (same queue and source as a rebuild, plus `kind: "repair"`). Here the card DID go in: it is written and committed, but its tests fail where the poller runs them (from cron: only HOME, and PATH = node's directory + `/usr/bin:/bin`), so the app shows it as "In, not running". The poller has already ruled out failures that were there before the card (it runs the failing tests again on the tree without it), so the failures listed are new with this change. Same steps as a rebuild, except:
+
+1. **Keep the approved change; fix forward.** Read the original with `bin/self-improve-show <id> --full`. Reproduce first: run the listed test files with `node --test --test-reporter=tap <files>` under `env -i HOME=$HOME PATH=$(dirname "$(command -v node)"):/usr/bin:/bin`. Then make them pass: fix the code, or the test when the test is what is wrong, or what the test assumes about its environment. Never revert the approved change to make a test pass. If they already pass on today's code, build nothing and say so: tapping Retry on the card is then all it takes.
+2. **Land it as a fresh card with `--rebuild-of <id>`**, exactly as in § Rebuilding an approved card (same flags; title it for what the fix does, e.g. "Shows seen's tests pass when run from cron"). When that card is applied and running, the poller checks the original again and marks it running too, so there is no Retry to remember.
+3. **Report** in one or two sentences: the approved change went in but its tests failed; the fix is waiting for the user's Face ID in Improvements.
+
 ## Step 1 — Understand
 
 Find the parts of `system/architecture.md` the request touches and read only those: `grep -n '^#\|<keyword>' system/architecture.md`, then `Read` with `offset`/`limit`. Do **not** read it whole: it is ~170 KB (~42k tokens), and everything you read is re-sent on every later turn of the build, so a whole read costs millions of tokens over a 100-turn run. Then read the code the request touches. Use `recall` / `wiki_search` if the request leans on something the user said before ("like the cruise one"). Check whether it already exists: grep the tree and `git log --oneline --since="30 days ago" --grep=<keyword>`. **If it already exists, the build is the report**: tell him where it is and how to use it.
@@ -127,7 +135,7 @@ Everything lives under `data/build-queue/` (gitignored runtime data):
 
 | Path | Written by | Meaning |
 |---|---|---|
-| `pending/<id>.json` | `build-request`, or `self-improve-approval-poll` for a card rebuild | `{id, spec, source: "chat" \| "approval-rebuild", requested_at, rebuild_of?}`, waiting |
+| `pending/<id>.json` | `build-request`, or `self-improve-approval-poll` for a card rebuild or repair | `{id, spec, source: "chat" \| "approval-rebuild", kind?: "rebuild" \| "repair", requested_at, rebuild_of?}`, waiting |
 | `running/<id>.json` | trigger | claimed. One left here at the next start was orphaned and moves to `failed/`, and the user is told |
 | `done/<id>.json` / `failed/<id>.json` | trigger | finished, with or without a report |
 | `results/<id>.md` | **you** (Step 6) | the report the trigger posts |

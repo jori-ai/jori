@@ -69,3 +69,28 @@ test("never throws: an unwritable root reports why", () => {
   assert.equal(out.queued, false);
   assert.match(out.reason, /could not queue/);
 });
+
+test("a card that went in but whose tests fail is queued once for a repair, not a rebuild", () => {
+  const r = root();
+  const card = row({ item_json: { files: { "bin/segment-ask": "x", "tests/segment-ask.test.mjs": "y" } } });
+  const out = queueCardRepair(r, card);
+  assert.equal(out.queued, true);
+  assert.match(out.requestId, /-rp3f1c2a90$/);
+  const req = JSON.parse(fs.readFileSync(path.join(r, "data/build-queue/pending", `${out.requestId}.json`), "utf8"));
+  assert.equal(req.source, "approval-rebuild", "same landing rules as a rebuild");
+  assert.equal(req.kind, "repair");
+  assert.equal(req.rebuild_of, card.id);
+  assert.match(req.spec, /^REPAIR OF AN APPLIED CARD — approval 3f1c2a90/);
+  assert.match(req.spec, /- asks once \(boom\)/);
+  assert.match(req.spec, /Do not revert the change/);
+  assert.match(req.spec, /Its test files: tests\/segment-ask\.test\.mjs/);
+  assert.ok(req.spec.length < 6000);
+  // Retried, same failure: no second request, and it says it is a repair already queued.
+  const again = queueCardRepair(r, card);
+  assert.equal(again.queued, false);
+  assert.match(again.reason, /^repair already queued/);
+});
+
+function queueCardRepair(r, card) {
+  return queueCardRebuild({ root: r, row: card, kind: "repair", error: "its tests fail: asks once (boom).", failures: ["asks once (boom)"], now });
+}

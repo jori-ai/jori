@@ -4,7 +4,8 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { goLive, pluginsTouched, testEnv, tapFailures, defaultRunTests } from "../lib/self-improve-live.mjs";
+import { execFileSync } from "node:child_process";
+import { goLive, pluginsTouched, testEnv, tapFailures, defaultRunTests, buildBaseline } from "../lib/self-improve-live.mjs";
 
 const root = fs.mkdtempSync(path.join(os.tmpdir(), "si-live-"));
 fs.mkdirSync(path.join(root, "plugins/shows-seen/tests"), { recursive: true });
@@ -119,18 +120,79 @@ test("a test that spawns a `#!/usr/bin/env node` script passes under cron's PATH
   try {
     const r = await defaultRunTests(["tests/spawn.test.mjs"], dir);
     assert.equal(r.ok, false);
-    assert.equal(r.failed.length, 1, JSON.stringify(r.failed));
-    assert.match(r.failed[0], /^a real failure \(Expected values to be strictly equal/);
+    assert.equal(r.failures.length, 1, JSON.stringify(r.failures));
+    assert.equal(r.failures[0].name, "a real failure");
+    assert.equal(r.failures[0].file, "tests/spawn.test.mjs", "located relative to the tree");
+    assert.match(r.failures[0].why, /^Expected values to be strictly equal/);
   } finally { process.env.PATH = saved; }
 });
 
-test("tapFailures names each failing test with the first line of its error", () => {
+test("tapFailures names each failing test, its file and the first line of its error", () => {
   const out = [
     "not ok 1 - a tapped decision answers in code",
-    "  ---", "  type: 'test'", "  error: |-", "    Expected values to be strictly equal:", "    ", "    false !== true", "  ...",
+    "  ---", "  type: 'test'", "  location: '/r/tests/decision-queue.test.mjs:251:1'",
+    "  error: |-", "    Expected values to be strictly equal:", "    ", "    false !== true", "  ...",
     "ok 2 - fine",
     "    not ok 1 - nested one", "      ---", "      error: 'boom'", "      ...",
   ].join("\n");
-  assert.deepEqual(tapFailures(out), ["a tapped decision answers in code (Expected values to be strictly equal:)", "nested one (boom)"]);
+  assert.deepEqual(tapFailures(out, "/r"), [
+    { name: "a tapped decision answers in code", file: "tests/decision-queue.test.mjs", why: "Expected values to be strictly equal:" },
+    { name: "nested one", file: "", why: "boom" },
+  ]);
   assert.deepEqual(tapFailures(""), []);
+});
+
+const T = "plugins/shows-seen/tests/a.test.mjs";
+const pm = () => { const { P, M } = world(); return { plugins: P, manager: M }; };
+const fail = (...names) => async () => ({ ok: false, failures: names.map((name) => ({ name, file: T, why: "x" })) });
+
+test("only failures new with the card count: one that failed without it too is a note", async () => {
+  const r = await goLive([T], { root, ...pm(), runTests: fail("old flake", "new break"),
+    baseline: async (files) => { assert.deepEqual(files, [T]); return { failures: [{ name: "old flake", file: T }] }; } });
+  assert.equal(r.ok, false);
+  assert.match(r.error, /its tests fail: new break \(x\)\./);
+  assert.doesNotMatch(r.error, /old flake/);
+  assert.equal(r.tests_failed, true);
+  assert.deepEqual(r.failures, ["new break (x)"]);
+  assert.match(r.notes.join(" "), /One test was already failing before this change and still is.*old flake/);
+});
+
+test("every failure was already there → running, with a note", async () => {
+  const r = await goLive([T], { root, ...pm(), runTests: fail("old flake"), baseline: async () => ({ failures: [{ name: "old flake", file: T }] }) });
+  assert.equal(r.ok, true);
+  assert.match(r.notes.join(" "), /already failing before this change/);
+});
+
+test("no baseline → every failure counts, as before", async () => {
+  const r = await goLive([T], { root, ...pm(), runTests: fail("a", "b", "c", "d"), baseline: async () => null });
+  assert.equal(r.ok, false);
+  assert.match(r.error, /its tests fail: a \(x\); b \(x\); c \(x\) and 1 more\./);
+  assert.equal(r.failures.length, 4);
+});
+
+test("a plugin left unscheduled is not a test failure: no repair is offered", async () => {
+  const { P, M } = world({ crontabLeft: [{ op: "add", plugin: "shows-seen", label: "shows-seen" }] });
+  const r = await goLive(["plugins/shows-seen/plugin.json", T], { root, plugins: P, manager: M, runTests: fail("z"), baseline: async () => null });
+  assert.equal(r.ok, false);
+  assert.equal(r.tests_failed, undefined);
+});
+
+test("buildBaseline: HEAD with the card's files put back to before its commit", async () => {
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), "si-live-git-"));
+  const git = (...a) => execFileSync("git", a, { cwd: repo, stdio: "pipe" });
+  git("init", "-q"); git("config", "user.email", "t@t"); git("config", "user.name", "t");
+  fs.mkdirSync(path.join(repo, "lib")); fs.mkdirSync(path.join(repo, "node_modules"));
+  fs.writeFileSync(path.join(repo, "lib/a.js"), "old\n"); fs.writeFileSync(path.join(repo, "lib/other.js"), "1\n");
+  git("add", "lib"); git("commit", "-qm", "base");
+  fs.writeFileSync(path.join(repo, "lib/a.js"), "card\n"); fs.writeFileSync(path.join(repo, "lib/new.js"), "card\n");
+  git("add", "lib"); git("commit", "-qm", "self-improve: apply owner-approved fix (Face-ID) — Thing");
+  fs.writeFileSync(path.join(repo, "lib/other.js"), "2\n"); git("commit", "-qam", "later");
+  assert.equal(await buildBaseline(["lib/a.js"], repo, "self-improve: apply owner-approved fix (Face-ID) — Nope"), null, "no such commit → no baseline");
+  const dir = await buildBaseline(["lib/a.js", "lib/new.js"], repo, "self-improve: apply owner-approved fix (Face-ID) — Thing");
+  try {
+    assert.equal(fs.readFileSync(path.join(dir, "lib/a.js"), "utf8"), "old\n", "back to before the card");
+    assert.equal(fs.existsSync(path.join(dir, "lib/new.js")), false, "the card created it");
+    assert.equal(fs.readFileSync(path.join(dir, "lib/other.js"), "utf8"), "2\n", "everything else as at HEAD");
+    assert.ok(fs.lstatSync(path.join(dir, "node_modules")).isSymbolicLink(), "installed packages borrowed");
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });

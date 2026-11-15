@@ -288,7 +288,8 @@ async function lockedFileRefusal(item, rels) {
 // Written and committed is not the same as working: after the commit the card's
 // change is made to run and checked (lib/self-improve-live.mjs has the why).
 const { goLive: goLiveIn } = await import(path.join(ROOT, "lib/self-improve-live.mjs"));
-const goLive = (rels) => goLiveIn(rels, { root: ROOT });
+const goLive = (rels, commitMsg) => goLiveIn(rels, { root: ROOT, commitMsg });
+const fixMsg = (row) => `self-improve: apply owner-approved fix (Face-ID) — ${row.summary || row.id}`;
 
 async function applyItem(row) {
   const item = row.item_json || {};
@@ -410,10 +411,15 @@ async function applyItem(row) {
       ensureExecIfScript(fp, String(content));
       rels.push(rel);
     }
-    const g = await gitCommit(rels, `self-improve: apply owner-approved fix (Face-ID) — ${row.summary || row.id}`);
+    const g = await gitCommit(rels, fixMsg(row));
     const landed = { files: rels, ...(rebased.length ? { rebased } : {}), git: g === true ? "committed" : g };
-    const live = await goLive(rels);
-    if (!live.ok) return { ok: false, not_live: true, ...landed, error: live.error, notes: live.notes };
+    // The commit message is how goLive finds the tree without this card, to
+    // tell a test the card broke from one that was failing already.
+    const live = await goLive(rels, fixMsg(row));
+    if (!live.ok) {
+      return { ok: false, not_live: true, ...landed, error: live.error, notes: live.notes,
+        ...(live.tests_failed ? { tests_failed: true, failures: live.failures } : {}) };
+    }
     return { ok: true, ...landed, notes: live.notes };
   }
   return { ok: false, error: `unknown item_type ${row.item_type}` };
@@ -435,6 +441,31 @@ async function confirm(text) {
     child.on("error", () => {});
     child.unref();
   } catch {}
+}
+
+// A repair (or rebuild) card just went in and runs. If the card it fixes is
+// still "in, not running", check that one again the same way and, when it now
+// runs, mark it applied: its own Retry would re-write files the repair has
+// since changed. Never throws.
+async function settleRepaired(origId, fixId, fixTitle) {
+  try {
+    const x = await store.getApproval(origId);
+    if (!x || x.status !== "apply_failed" || !x.result?.not_live || !Array.isArray(x.result.files)) return;
+    const live = await goLive(x.result.files, fixMsg(x));
+    const title = x.summary || origId;
+    if (live.ok) {
+      const { tests_failed, failures, error, ...kept } = x.result;
+      await store.updateApproval(origId, { status: "applied", result: { ...kept, ok: true, not_live: false, repaired_by: fixId, notes: live.notes } });
+      console.error(`[si-approval] ${origId} running after repair ${fixId}`);
+      await confirm(`✅ "${title}" is running now too: "${fixTitle}" fixed what stopped it. ${live.notes.join(" ")}`.trim());
+    } else {
+      await store.updateApproval(origId, { result: { ...x.result, error: live.error, notes: live.notes, checked_after: fixId } });
+      console.error(`[si-approval] ${origId} still not running after repair ${fixId}: ${live.error}`);
+      await confirm(`⚠️ "${fixTitle}" went in, but "${title}" still isn't running: ${live.error} Ask me in chat, or tap Retry on it.`);
+    }
+  } catch (e) {
+    console.error(`[si-approval] settle ${origId} after ${fixId} failed: ${e?.message || e}`);
+  }
 }
 
 // One poller at a time. With the not-live check a tick can run for minutes
@@ -502,6 +533,8 @@ async function main() {
         console.error(`[si-approval] applied ${o.id}${retried ? " (retry)" : ""}`);
         const checked = (o.result?.notes || []).join(" ");
         await confirm(`✅ ${retried ? "Retried and applied" : "Approved + applied"}: ${label}. ${checked || o.result?.note || ""}`.trim());
+        const orig = rowById[o.id]?.item_json?.rebuild_of;
+        if (orig) await settleRepaired(orig, o.id, titleOf[o.id] || o.id);
       }
     }
     // `expired` and `skipped` are the user's own decisions playing out, not
@@ -521,9 +554,31 @@ async function main() {
       const title = titleOf[o.id] || o.id;
       if (o.result.not_live) {
         // Written and committed, but not running (see goLive). Not a conflict:
-        // rebuilding the card would not help; fixing what stops it running and
-        // tapping Retry does.
-        await confirm(`⚠️ ${retried ? `I retried "${title}"` : `"${title}" is in the code`} but it is not running: ${o.result.error} The card shows it as failed. Tap Retry on it once that's fixed, or ask me in chat.`);
+        // rebuilding the card would not help. When what stops it is failing
+        // tests new with the card, a repair is queued (fix forward, as a fresh
+        // card; lib/self-improve-rebuild.mjs): Retry alone re-runs the same
+        // check and, for anything but a passing hiccup, fails the same way. The
+        // request id goes on the row's result so the app can say it is being
+        // fixed. Anything else (a plugin left off, a schedule missing) still
+        // waits for Retry.
+        const head = `${retried ? `I retried "${title}"` : `"${title}" is in the code`} but it is not running: ${o.result.error}`;
+        let rp = null;
+        if (o.result.tests_failed) {
+          rp = queueCardRebuild({ root: ROOT, row: rowById[o.id] || { id: o.id }, error: o.result.error, kind: "repair", failures: o.result.failures || [] });
+          if (rp.queued) console.error(`[si-approval] ${o.id} queued for repair as build request ${rp.requestId}`);
+          else console.error(`[si-approval] ${o.id} not repaired: ${rp.reason}`);
+          const reqId = rp.queued ? rp.requestId : (rp.kind === "repair" ? rp.requestId : null);
+          if (reqId) { try { await store.updateApproval(o.id, { result: { ...o.result, repair_request: reqId } }); } catch {} }
+        }
+        if (rp?.queued) {
+          await confirm(`⚠️ ${head} I'm fixing it now: the fix comes back as a fresh card for your Face ID, and this one turns green once the fix is in.`);
+        } else if (rp?.kind === "repair") {
+          await confirm(`⚠️ ${head} The fix I started for it is still on its way as a fresh card.`);
+        } else if (rp?.already) {
+          await confirm(`⚠️ ${head} This card was itself a fix, so I won't start another one on my own. Ask me in chat, or tap Retry once it's sorted.`);
+        } else {
+          await confirm(`⚠️ ${head} The card shows it as failed. Tap Retry on it once that's fixed, or ask me in chat.`);
+        }
       } else if (o.result.stale) {
         // The signing-time truth check (core/self-improve-unified.mjs decideRow)
         // found the card's finding no longer true. Nothing was written. Retry is

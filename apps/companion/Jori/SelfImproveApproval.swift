@@ -102,9 +102,13 @@ enum SelfImproveApproval {
             /// Written and committed, but not running (a plugin left off, a
             /// schedule not installed, its tests failing).
             let notLive: Bool?
+            /// Set when its tests fail and the host queued a fix for it (a
+            /// fresh card that, once in, turns this one green).
+            let repairRequest: String?
             enum CodingKeys: String, CodingKey {
                 case error, notes
                 case notLive = "not_live"
+                case repairRequest = "repair_request"
             }
         }
 
