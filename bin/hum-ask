@@ -27,6 +27,7 @@
 //           [--findings <json array>] [--relevant-until <iso>]
 //           [--options '<json: 2-4 labels or {label, description}>'
 //            [--recommended <1-based n>] [--header <topic chip>]]
+//           [--page <wiki id>]  (a place's page: its cover photo goes with the question)
 //           (--message <text> | --message-from-stdin)
 //
 // --options (2026-11-15): a question with fixed answers goes out as a tappable
@@ -102,6 +103,7 @@ const relevantUntilArg = flag("--relevant-until") ?? null;
 const optionsRaw = flag("--options");
 const recommendedArg = flag("--recommended");
 const headerArg = flag("--header");
+const pageArg = flag("--page");
 let message = flag("--message");
 const fromStdin = flag("--message-from-stdin", false);
 if (args.length) die(`unrecognized args: ${args.join(" ")}`);
@@ -118,6 +120,18 @@ if (findingsRaw) {
   if (!Array.isArray(findings)) die("--findings must be a JSON array");
 }
 
+// --page <wiki id>: the question is about a place (or anything) with a page in
+// the photo repository; its cover photo goes on the card (over the question),
+// or under a text question on its own line (the app draws a lone image URL
+// inline). No cover → the question goes out as it is.
+let coverUrl = null;
+if (pageArg) {
+  try {
+    const { createRequire } = await import("node:module");
+    coverUrl = (await createRequire(import.meta.url)("../lib/photo-repo.js").coverForPage(pageArg))?.url || null;
+  } catch { coverUrl = null; }
+}
+
 // A question with fixed answers goes out as a tappable card (metadata.choices,
 // the decision card's layout) instead of a numbered list typed into the text.
 let choicesJson = null;
@@ -130,12 +144,14 @@ if (optionsRaw !== undefined) {
     if (!Number.isInteger(rec)) die("--recommended is the 1-based number of an option");
   }
   try {
-    const card = renderQuestionChoices({ question: message, options: opts, recommended: rec, header: headerArg || "Question" });
+    const card = renderQuestionChoices({ question: message, options: opts, recommended: rec, header: headerArg || "Question", imageUrl: coverUrl });
     choicesJson = card.choices;
     message = card.text;
   } catch (e) { die(`--options: ${e.message}`); }
 } else if (recommendedArg !== undefined || headerArg !== undefined) {
   die("--recommended and --header need --options");
+} else if (coverUrl) {
+  message = `${message.trimEnd()}\n\n${coverUrl}`;
 }
 
 // Always a `hum:` intent ending in `:question` — the gate's routing key and its

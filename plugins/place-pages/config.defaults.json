@@ -1,0 +1,19 @@
+{
+  "_doc": "Place pages (plugins/place-pages). enabled: off stops the sweep. min_stop_minutes: a stop counts from this long. lookback_days: each morning re-sweeps this many complete days, so later corrections reach the pages. since: the earliest day ever swept (null: the whole archive). settled_sources: the ways a day names a stop that count as known (the user named it, it was booked, a saved place, the sign in a photo…). guess_sources and guess_min_confidence: map guesses that count when this confident; their visits say 'name from the map'. exclude_names: the user's own homes and properties, by the name the day gives them; never a page. same_name_radius_m: the same name within this distance is the same place (code); same_place_radius_m: a different name this close is put to the model as maybe the same place. excluded_labels: photo-library labels that keep a photo off a page (documents, receipts). cover_avoid_labels: labels that make a photo a worse cover (people). max_photos_on_page: the most photos drawn on one page (the rest are counted). batch_size: new places per model call. sonnet_budget: Sonnet escalations per run. thumb_fetch_limit: the most missing thumbnails exported from the photo library per run.",
+  "enabled": true,
+  "min_stop_minutes": 15,
+  "lookback_days": 7,
+  "since": null,
+  "settled_sources": ["user_confirmed", "user_confirmed_via_transcript", "named_location", "known_recurring", "confirmed_stop", "accommodation", "saved_place", "photo_text", "calendar_corroborated", "wifi_ssid"],
+  "guess_sources": ["osm_overpass", "google_places"],
+  "guess_min_confidence": 0.9,
+  "exclude_names": [],
+  "same_name_radius_m": 400,
+  "same_place_radius_m": 120,
+  "excluded_labels": ["document", "receipt"],
+  "cover_avoid_labels": ["people", "person", "adult", "child", "baby", "selfie", "face", "crowd"],
+  "max_photos_on_page": 40,
+  "batch_size": 12,
+  "sonnet_budget": 10,
+  "thumb_fetch_limit": 300
+}

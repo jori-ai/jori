@@ -578,9 +578,11 @@ Every tick, including silent. It self-expires (no-op after the window or if `dat
      --subject "<subject>" --memory-hook "<memory_hook>" --rationale "<rationale>" \
      --findings '<JSON array: the winning candidate>' --ttl-min 15 \
      [--options '<JSON array of 2-4 labels>' --recommended <n> --header "<chip>"] \
+     [--page <wiki page id>] \
      --message-from-stdin
    ```
 
+   **A question about a place shows the place.** When the question is about a place the user has a page for (a lounge, a hotel, a café: `place-pages show "<name>"` gives its `page_id`), pass `--page <page_id>`: its cover photo goes on the card, or under a text question. No photo yet → the question goes out unchanged. Pings that name such a place may carry the cover too (`place-pages cover "<name>"` → the `url`, as its own line).
    **A question with fixed answers is a card, never a list in the text (2026-11-15).** When you offer choices ("should someone pick them up at the airport, or do they take a car?"), pass them as `--options` (labels, or `{label, description}` for a one-line grey note), `--recommended` (1-based) when you have a pick, and `--header`; the text is the bare question. `hum-ask` builds the card the decisions lane uses (header chip, bold question, recommended option first marked "(Recommended)", "Type something") and the numbered copy for the push. Never type "1. … (my pick)" or "Type something" into the text: that arrives as a plain bubble with nothing to tap. Open questions with no fixed answer set ("what did you think of it?") stay text-only.
 
    It sends with intent `hum:<lane>:question` and `--capture-id`, and writes `hum-pending-question.json` (`{id, asked_at, question, subject, memory_hook, rationale, lane, delivered_msg_id, expires_at}`) **only for what landed as a question**, holding the text they actually saw. The captured `jori_messages.id` is what routes a threaded reply back to *this* question (`lib/hum-reply-target.mjs`). (15-min TTL policy: hum-detail.md § Step 4.) Exit codes:

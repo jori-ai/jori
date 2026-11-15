@@ -101,6 +101,7 @@ like an unconfigured feature and turns itself off.
 | `0140_trip` | trip reservoirs, rendered day plans | `trip_reservoirs`, `trip_day_plans` | the site reads reservoirs and marks entries done |
 | `0150_spa` | spa heating telemetry | `spa_heating_sessions`, `spa_heating_ticks` | none |
 | `0180_action_approvals` | Face-ID approval for plugin actions | `action_approvals` (+ freeze trigger); keys are the paired `purchase_device_keys` | read; rows only `pending → signed/denied` on the decision columns |
+| `0191_places_photo_links` | the photo repository's usage index, the place registry | `photo_links`, `places`, `place_visits` | the app reads all three; writes are service role (`lib/photo-repo.js`, `plugins/place-pages`) |
 | `9999_reload_schema` | always | `notify pgrst, 'reload schema'` | none |
 
 Config-dependent names:

@@ -35,6 +35,9 @@ Usage:
   choice send --kind location_stop --ref <visit_id> --prompt "Where was this?" \\
               --option "Cafe One|16m · Restaurant" --option "Cafe Two|23m" \\
               --default 1 [--expires-h 12] [--channel chat]
+              [--option-image "2=<url>"] [--no-place-photos]
+              (options naming a place with a page near the subject's lat/lon get its
+               cover beside them automatically: bin/photo-repo place-covers)
   choice sweep [--apply]     # reports expired prompts; --apply guesses location_stop defaults
   choice list
 """
@@ -114,6 +117,51 @@ def _question_hold(a, body):
     return None
 
 
+def _option_images(a, opts):
+    """A small photo beside each option (ChoicePrompt.swift § option image_url).
+
+    Explicit: --option-image "N=<url>" (1-based). Automatic: when the card is
+    about a point (subject lat/lon), every option whose label is the name of a
+    place the user has a page for nearby gets that place's cover, from the photo
+    repository (bin/photo-repo place-covers: exact folded-name match within
+    400 m, so "Just driving" or a typed protocol word never matches). Without
+    the place-pages plugin nothing matches; any failure sends the card as is.
+    """
+    for spec in getattr(a, "option_image", None) or []:
+        n, _, url = spec.partition("=")
+        try:
+            idx = int(n) - 1
+        except ValueError:
+            continue
+        if 0 <= idx < len(opts) and url.strip().startswith("http"):
+            opts[idx]["image_url"] = url.strip()
+    if getattr(a, "no_place_photos", False) or not getattr(a, "subject_json", None):
+        return
+    try:
+        subj = json.loads(a.subject_json)
+        lat, lon = float(subj["lat"]), float(subj["lon"])
+    except (ValueError, KeyError, TypeError):
+        return
+    want = [o for o in opts if not o.get("image_url")]
+    if not want:
+        return
+    try:
+        node = (os.environ.get("JORI_NODE") or shutil.which("node")
+                or os.path.expanduser("~/.local/node/bin/node"))
+        cmd = [node, os.path.join(REPO, "bin/photo-repo"), "place-covers", "--lat", str(lat), "--lon", str(lon)]
+        for o in want:
+            cmd += ["--name", o.get("value") or o["label"]]
+        out = subprocess.run(cmd, capture_output=True, text=True, timeout=20, check=False)
+        covers = json.loads(out.stdout.strip() or "{}") if out.returncode == 0 else {}
+    except Exception as e:  # a photo is a nicety; never lose a card to it
+        print(f"[choice] place photos skipped: {e}", file=sys.stderr)
+        return
+    for o in want:
+        hit = covers.get(o.get("value") or o["label"])
+        if hit and str(hit.get("url", "")).startswith("http"):
+            o["image_url"] = hit["url"]
+
+
 def cmd_send(a):
     opts = []
     for i, spec in enumerate(a.option):
@@ -131,6 +179,7 @@ def cmd_send(a):
     if not opts and not getattr(a, "subject_json", None):
         # A card with a subject may have no buttons: the user answers by typing.
         sys.exit("need at least one --option (or a --subject-json card)")
+    _option_images(a, opts)
     default_id = None
     if a.default:
         # 1-based so the CLI matches what the list looks like on screen.
@@ -404,6 +453,11 @@ def main():
                    help="image shown under the question (e.g. a stop-map PNG)")
     s.add_argument("--option", action="append", default=[],
                    help='"Label|sublabel", repeatable')
+    s.add_argument("--option-image", action="append", default=[], dest="option_image",
+                   help='"N=<url>": a photo beside option N (1-based); repeatable. Options naming a '
+                        "place the user has a page for get its cover automatically on a card with a subject lat/lon")
+    s.add_argument("--no-place-photos", action="store_true", dest="no_place_photos",
+                   help="don't look up place covers for the options")
     s.add_argument("--default", help="1-based index of the default option")
     s.add_argument("--expires-h", type=float, default=DEFAULT_EXPIRES_H, dest="expires_h")
     s.add_argument("--channel", default="chat")

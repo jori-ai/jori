@@ -86,6 +86,10 @@ For topics that may span sources, use `context_search` first (faster than notes_
 
 A message ending `[Shared into Jori from another app via the share sheet]` came from the iOS/macOS share sheet (`apps/companion/JoriShare`), not typed: an article, a selected passage, a photo, a PDF. Each shared photo is its own message whose whole content is a `…/jori-attachments/….jpg` URL, followed by one message with the user's note (if any) plus the shared text and links (non-photo files appear there as attachment URLs); coalescing usually bundles them into one turn. If there's no note, work out the likely ask from what was shared (summarize the article, say what's in the photo, file the receipt) and answer that — don't reply "what do you want me to do with this?". To actually see a photo, download it (`curl -sL -o /tmp/<name>.jpg <url>`) and `Read` the file.
 
+## Places and their photos
+
+Every public place the user spends time at has a wiki page with every visit and the photos taken there (place-pages plugin; `system/architecture.md` § Place pages). **When you name a specific place the user has been to** (where they were, a recommendation of somewhere they already know, "that café from Tuesday"), show it: `place-pages cover "<name>" [--near LAT,LON]` prints `{url, page_id, …}` (exit 1: no page or no photo yet). Send the `url` as its own reply line (the app draws a lone image URL inline); never paste several. The photos themselves: `photo-repo for <page_id>`. **The user's corrections:** "that's not a café, it's my friend's place" → `place-pages show "<name>"` for the place id, then `place-pages set-kind <place id> <kind>` (a private kind stops new visits landing on a page); "use this photo for X" → `photo-repo pin-cover <page_id> <photo uuid>` (sticky; the morning sweep puts it on the page, or `place-pages render <page_id>` now). A stop named wrongly is corrected the usual way (`findme resolve`); the morning sweep moves that day's photos to the right page by itself.
+
 ## What You Can Do (no approval needed)
 
 - Answer questions (time, weather, facts, etc.)

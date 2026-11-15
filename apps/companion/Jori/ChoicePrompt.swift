@@ -29,6 +29,15 @@ struct ChoiceOption: Codable, Identifiable, Equatable {
     let id: String
     let label: String
     var sublabel: String?
+    /// A small photo beside the option: the cover of a place the user has a
+    /// page for (the photo repository, bin/photo-repo place-covers), so "was it
+    /// this one?" can be answered at a glance. Optional and additive.
+    var imageUrl: String?
+
+    enum CodingKeys: String, CodingKey {
+        case id, label, sublabel
+        case imageUrl = "image_url"
+    }
 }
 
 /// What a question is ABOUT — so the user can tell at a glance whether it asks about
@@ -116,9 +125,13 @@ struct ChoicePrompt: Codable, Equatable {
     var header: String?
     var recommendedId: String?
     var freeText: Bool?
+    /// A picture of what is asked about — a place's cover photo on "how was
+    /// it?" — drawn over the question. Optional and additive.
+    var imageUrl: String?
 
     enum CodingKeys: String, CodingKey {
         case v, id, kind, ref, prompt, options, subject, header
+        case imageUrl = "image_url"
         case defaultId = "default_id"
         case expiresAt = "expires_at"
         case recommendedId = "recommended_id"
@@ -182,6 +195,9 @@ struct ChoicePromptView: View {
             if let subject = prompt.subject {
                 SubjectHeader(subject: subject)
                     .padding(.bottom, 4)
+            } else if let s = prompt.imageUrl, let url = URL(string: s) {
+                CardPhoto(url: url)
+                    .padding(.bottom, 4)
             }
             if let text = prompt.subject?.question ?? prompt.prompt, !text.isEmpty {
                 Text(text)
@@ -200,6 +216,9 @@ struct ChoicePromptView: View {
                     onSelect(option)
                 } label: {
                     HStack(spacing: 8) {
+                        if let s = option.imageUrl, let url = URL(string: s) {
+                            OptionThumb(url: url)
+                        }
                         VStack(alignment: .leading, spacing: 1) {
                             Text(option.label)
                                 .font(.callout.weight(.medium))
@@ -323,6 +342,9 @@ struct DecisionCardView: View {
                     .padding(.vertical, 4)
                     .background(Capsule().fill(JoriTheme.staff.opacity(0.18)))
             }
+            if !collapsed, let s = prompt.imageUrl, let url = URL(string: s) {
+                CardPhoto(url: url)
+            }
             if let q = prompt.prompt, !q.isEmpty {
                 Text(q)
                     .font(.body.weight(.semibold))
@@ -341,7 +363,8 @@ struct DecisionCardView: View {
                         label: option.label,
                         recommended: option.id == prompt.recommendedId,
                         description: option.sublabel,
-                        chosen: chosen(option))
+                        chosen: chosen(option),
+                        imageUrl: option.imageUrl)
                 }
                 .buttonStyle(PressableStyle())
                 .opacity(isAnswered && !chosen(option) ? 0.45 : 1.0)
@@ -373,13 +396,16 @@ struct DecisionCardView: View {
     }
 
     private func row(number: Int, label: String, recommended: Bool, description: String?,
-                     chosen: Bool, systemImage: String? = nil) -> some View {
-        HStack(alignment: .firstTextBaseline, spacing: 10) {
+                     chosen: Bool, systemImage: String? = nil, imageUrl: String? = nil) -> some View {
+        HStack(alignment: imageUrl == nil ? .firstTextBaseline : .center, spacing: 10) {
             Text("\(number)")
                 .font(.caption.monospacedDigit().weight(.bold))
                 .foregroundStyle(recommended && !isAnswered ? JoriTheme.staffInk : Color.secondary)
                 .frame(width: 22, height: 22)
                 .background(Circle().fill(recommended && !isAnswered ? JoriTheme.staff.opacity(0.22) : Color.primary.opacity(0.07)))
+            if let s = imageUrl, let url = URL(string: s) {
+                OptionThumb(url: url)
+            }
             VStack(alignment: .leading, spacing: 2) {
                 HStack(spacing: 4) {
                     if let systemImage {
@@ -424,6 +450,43 @@ struct DecisionCardView: View {
     private func chosen(_ option: ChoiceOption) -> Bool {
         guard let a = answeredLabel else { return false }
         return a.compare(option.label, options: [.caseInsensitive, .diacriticInsensitive]) == .orderedSame
+    }
+}
+
+// MARK: - Photos on a card
+
+/// The picture of what a card asks about (a place's cover), full width over
+/// the question. A failed load leaves a quiet tint, never a broken frame.
+struct CardPhoto: View {
+    let url: URL
+
+    var body: some View {
+        AsyncImage(url: url) { phase in
+            switch phase {
+            case .success(let image): image.resizable().scaledToFill()
+            case .failure: Color.primary.opacity(0.05)
+            default: Color.primary.opacity(0.06).overlay(ProgressView())
+            }
+        }
+        .frame(maxWidth: .infinity)
+        .aspectRatio(16.0 / 9.0, contentMode: .fit)
+        .clipShape(RoundedRectangle(cornerRadius: Radius.row, style: .continuous))
+        .accessibilityHidden(true)
+    }
+}
+
+/// A place's cover beside an option: small, square, rounded.
+struct OptionThumb: View {
+    let url: URL
+    var size: CGFloat = 40
+
+    var body: some View {
+        AsyncImage(url: url) { phase in
+            if let image = phase.image { image.resizable().scaledToFill() } else { Color.primary.opacity(0.07) }
+        }
+        .frame(width: size, height: size)
+        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .accessibilityHidden(true)
     }
 }
 

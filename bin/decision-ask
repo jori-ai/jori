@@ -79,6 +79,15 @@ async function main() {
 
   const lane = readLane();
   const card = await buildCard(item, { lane });
+  // A question about a page with a cover photo (a restaurant, a museum, any
+  // place page) shows it: the photo repository's cover for that page. Absent
+  // (no place-pages, no photo yet, offline), the card goes out as before.
+  if (!item.q.image_url && item.q.wiki_id) {
+    try {
+      const c = await createRequire(import.meta.url)("../lib/photo-repo.js").coverForPage(item.q.wiki_id);
+      if (c?.url) item.q = { ...item.q, image_url: c.url };
+    } catch { /* a photo is a nicety */ }
+  }
   const { choices, text } = renderDecision(item, card);
 
   if (has("dry-run")) {
