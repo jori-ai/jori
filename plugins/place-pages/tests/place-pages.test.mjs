@@ -265,3 +265,20 @@ test("a generic stop name gets the model's title; the stop's own words stay an a
   const r2 = await pp.sweep({ date: DAY.date, apply: true, deps: deps({ db, wiki, answer: () => { throw new Error("no model call expected"); } }) });
   assert.equal(r2.matched, 2);
 });
+
+test("only pages about a place are offered for adoption, never a rule or list that mentions it", async () => {
+  const db = fakeDb({ photos: PHOTOS.map((p) => ({ ...p })) });
+  const wiki = fakeWiki({
+    feedback_corner_cafe_access: "---\nname: \"Corner Café access\"\ntype: feedback\n---\nHow to get into Corner Café.\n",
+    lounge_corner_cafe: "---\nname: \"Corner Café\"\nentity: lounge\n---\n# Corner Café\n",
+  });
+  const prompts = [];
+  const answer = (prompt) => {
+    prompts.push(prompt);
+    const items = [...prompt.matchAll(/\[(\d+)\] "([^"]+)"/g)].map((m) => ({ i: Number(m[1]), name: m[2] })); // lang-regex-ok: reads our own prompt layout
+    return { stops: items.map((it) => ({ i: it.i, kind: "theater", same_as: null, page: null })) };
+  };
+  await pp.sweep({ date: DAY.date, deps: deps({ db, wiki, answer }) });
+  assert.match(prompts[0], /lounge_corner_cafe/);
+  assert.doesNotMatch(prompts[0], /feedback_corner_cafe_access/);
+});

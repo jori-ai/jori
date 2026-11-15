@@ -250,11 +250,23 @@ function matchStop(stop, places, cfg = config()) {
 
 // ── The model's half ──
 
+/**
+ * The wiki's pages that may already be about this place, for the model to
+ * judge: only pages that ARE about a place (a place-like `entity` in their
+ * frontmatter, or a place-like id family). A rule, a list or a trip page that
+ * mentions the place is never offered: a dry run adopted a page of advice
+ * about getting into a club as that club's page.
+ */
+const PLACE_ID_FAMILIES = ["place_", "restaurant_", "museum_", "lounge_", "hotel_", "cafe_", "bar_", "venue_"];
 function existingPagesFor(name, wiki) {
   let hits = [];
-  try { hits = wiki.searchPages(norm(name), { mode: "fts", limit: 6 }) || []; } catch { hits = []; }
-  return hits.filter((h) => !["day", "week", "month"].includes(h.type) && !String(h.id).startsWith("day_"))
-    .map((h) => ({ id: h.id, title: h.title || h.id, description: clip(h.description || "", 140) }));
+  try { hits = wiki.searchPages(norm(name), { mode: "fts", limit: 12 }) || []; } catch { hits = []; }
+  return hits.filter((h) => {
+    const row = wiki.getPage(h.id);
+    if (!row || ["day", "week", "month"].includes(row.type)) return false;
+    const entity = frontmatterOf(row).entity;
+    return entity ? PLACE_ENTITIES.has(entity) : PLACE_ID_FAMILIES.some((f) => String(h.id).startsWith(f));
+  }).slice(0, 6).map((h) => ({ id: h.id, title: h.title || h.id, description: clip(h.description || "", 140) }));
 }
 
 function promptFor(items, cfg = config()) {
@@ -266,6 +278,7 @@ function promptFor(items, cfg = config()) {
     "2. kind: what kind of place it is, exactly one of:",
     ...Object.entries(PUBLIC_KINDS).map(([k, v]) => `   - ${k}: ${v === "Place" ? "another place open to the public" : v.toLowerCase()}`),
     ...Object.entries(PRIVATE_KINDS).map(([k, v]) => `   - ${k}: ${v}`),
+    "   A name that is only a street address says nothing about the place: not_a_venue, unless the calendar or the photos show what it is (then that kind).",
     "   A café that mainly serves coffee is cafe; a sit-down meal place is restaurant. An airport lounge is lounge, not transit. A hotel or a rental the user stayed in is hotel or rental.",
     (cfg.exclude_names || []).length ? `   The user's own homes and properties (always own_home): ${cfg.exclude_names.join("; ")}.` : "",
     "3. page: if one of the stop's listed existing wiki pages is a page about this same place, its id; else null. A list of places, a city, a trip or a person is not a page about the place.",
