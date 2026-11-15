@@ -1187,6 +1187,15 @@ esac
 # data/.speak-gate-off. Design: system/speak-gate.md § Live.
 SPEAK_GATE_LIVE="${JORI_SPEAK_GATE_LIVE_BIN:-$JORI_INSTALL_TOOLS/bin/speak-gate-live}"
 GATE_REVIEW_FILE=""
+# From here to the insert, a caller's timeout must not drop the message. The
+# gate takes minutes (240 s budget for a proactive message, more when relayed),
+# and many callers wrap this script in a 15–60 s timeout that sends SIGTERM:
+# the gate's verdict then arrived after this script was gone, and a message
+# judged "send" was never written (2026-11-15: an owner's approval-failed
+# notice, killed at 15 s, judged "send" at 208 s, never seen). Ignoring TERM
+# lets the send finish; the caller simply waits for it. The gate bounds its own
+# time, and curl below has --max-time.
+trap '' TERM
 if [ "$TEST_RUN" = false ] && [ -f "$SPEAK_GATE_LIVE" ]; then
   GATE_KIND=proactive
   [ "$AGENT" = "chat" ] && GATE_KIND=reply

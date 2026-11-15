@@ -125,9 +125,9 @@ struct ContentView: View {
     @State private var phonePath: [Destination]
     @State private var showNewConversation = false
     @State private var showConversationInfo = false
-    /// In the software engineer's conversation: the improvement cards instead
-    /// of the messages (the old Improvements channel lives there now).
-    @AppStorage(Install.key("improvementCardsOpen")) private var showImprovementCards = false
+    /// The approval rows behind the improvement cards in the feed (each card is
+    /// a message, drawn like a question; there is no Improvements tab).
+    @StateObject private var improvementCards = ImprovementCards()
 
     init(onSignOut: @escaping () -> Void = {}) {
         self.onSignOut = onSignOut
@@ -177,11 +177,6 @@ struct ContentView: View {
         memoryMode ? .memory : .conversation(viewModel.currentConversation)
     }
 
-    /// The software engineer's conversation, where the improvement cards live.
-    private var isImprovementsConversation: Bool {
-        ConversationID.roleId(viewModel.currentConversation) == TeamStore.improvementsRole
-    }
-
     /// Open a conversation (a notification, a new group, an @mention).
     fileprivate func openConversation(_ id: String) {
         go(.conversation(id))
@@ -204,7 +199,6 @@ struct ContentView: View {
             memoryMode = true
         case .conversation(let id):
             memoryMode = false
-            showImprovementCards = false
             if id != viewModel.currentConversation {
                 viewModel.switchConversation(to: id)
             }
@@ -681,7 +675,7 @@ struct ContentView: View {
             #else
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             #endif
-            .background(showImprovementCards && isImprovementsConversation && !memoryMode ? JoriTheme.groupedCanvas : JoriTheme.canvas)
+            .background(JoriTheme.canvas)
             .overlay(alignment: .top) { offlineBanner }
             .animation(.snappy(duration: 0.3), value: viewModel.isOffline)
             .navigationTitle(memoryMode ? "Memory" : team.title(of: viewModel.currentConversation))
@@ -710,28 +704,6 @@ struct ContentView: View {
     private var detailContent: some View {
         if memoryMode {
             MemoryView(url: Self.memoryWikiURL, state: memoryState)
-        } else if isImprovementsConversation {
-            // The software engineer's conversation holds the improvement cards
-            // (the old Improvements channel) beside the messages.
-            VStack(spacing: 0) {
-                Picker("Show", selection: $showImprovementCards) {
-                    Text("Messages").tag(false)
-                    Text(team.pendingImprovements > 0 ? "Improvements (\(team.pendingImprovements))" : "Improvements").tag(true)
-                }
-                .pickerStyle(.segmented)
-                .padding(.horizontal, 14)
-                .padding(.vertical, 8)
-                if showImprovementCards {
-                    // A card feed, not a chat log — every action lives in the
-                    // card's menu; no input bar, no reactions. "Chat" hands the
-                    // card back to a conversation, where there is a keyboard.
-                    SelfImproveFeedView(onChat: { improvement in
-                        Task { await openImprovementThread(improvement) }
-                    })
-                } else {
-                    chatPane
-                }
-            }
         } else {
             chatPane
         }
@@ -857,6 +829,24 @@ struct ContentView: View {
 
     private var chatPane: some View {
         chatMessages
+            // Improvement cards in this conversation read their live approval
+            // row; poll while it is open so Applying → In and running (or →
+            // Didn't go in) shows without leaving.
+            .task(id: viewModel.currentConversation) {
+                while !Task.isCancelled {
+                    let ids = Set(viewModel.messages.compactMap(\.improvementId))
+                    if !ids.isEmpty { await improvementCards.refresh(ids: ids) }
+                    try? await Task.sleep(for: .seconds(8))
+                }
+            }
+            .sensoryFeedback(.success, trigger: improvementCards.approvedTick)
+            .alert("Couldn’t complete", isPresented: Binding(
+                get: { improvementCards.errorText != nil }, set: { if !$0 { improvementCards.errorText = nil } })
+            ) {
+                Button("OK") { improvementCards.errorText = nil }
+            } message: {
+                Text(improvementCards.errorText ?? "")
+            }
             .overlay { replyBackdrop }
             .safeAreaInset(edge: .bottom, spacing: 0) { composerStack }
             .overlay { dropOverlay }
@@ -934,7 +924,10 @@ struct ContentView: View {
     private var messagesListContent: some View {
         let all = viewModel.messages.filter { !viewModel.isChecklistTick($0) && !viewModel.isQuestionDismissal($0) }
         let visible = Array(all.suffix(renderLimit))
-        let layout = BubbleLayout.compute(visible)
+        // Over the whole conversation, not just the drawn window: whether a
+        // reply needs its quote depends on what came just before it.
+        let quoted = BubbleLayout.quotedReplies(all)
+        let layout = BubbleLayout.compute(visible, quoted: quoted)
         let actions = bubbleActions
         // Name the speaker over the first bubble of each run when the
         // conversation has more than one person in it, or the message came
@@ -954,7 +947,8 @@ struct ContentView: View {
                     thread: thread(for: message,
                                    senderLabel: place.startsGroup && message.isAssistant
                                        && (multi || (message.sender != nil && message.sender != conversationRole))
-                                       ? team.senderLabel(message.sender) : nil),
+                                       ? team.senderLabel(message.sender) : nil,
+                                   showsQuote: quoted.contains(message.id)),
                     isPaletteOpen: activeReactionMessageId == message.id,
                     actions: actions
                 )
@@ -969,6 +963,7 @@ struct ContentView: View {
 
     private var bubbleActions: BubbleActions {
         let vm = viewModel
+        let cards = improvementCards
         return BubbleActions(
             reply: { beginReply(to: $0) },
             quoteTap: { quoteJumpTarget = $0 },
@@ -977,14 +972,22 @@ struct ContentView: View {
             answer: { label, parent in Task { await vm.sendMessage(label, replyTo: parent) } },
             toggleChecklist: { label, on, id in vm.toggleChecklistItem(label, checked: on, on: id) },
             resolveParent: { vm.resolveQuotedParent($0) },
-            dismiss: { vm.dismissQuestion($0) }
+            dismiss: { vm.dismissQuestion($0) },
+            improvement: { action, item in
+                Task { await cards.perform(action, item) }
+            }
         )
     }
 
-    private func thread(for m: Message, senderLabel: String? = nil) -> BubbleThread {
+    private func thread(for m: Message, senderLabel: String? = nil, showsQuote: Bool = false) -> BubbleThread {
         var t = BubbleThread()
         t.senderLabel = senderLabel
-        if let parent = m.replyTo { t.quotedParent = viewModel.quotedParent(parent) }
+        t.showsQuote = showsQuote
+        if showsQuote, let parent = m.replyTo { t.quotedParent = viewModel.quotedParent(parent) }
+        if let id = m.improvementId {
+            t.improvement = improvementCards.byId[id]
+            t.improvementWorking = improvementCards.workingId == id
+        }
         if m.isUser {
             t.notPickedUp = viewModel.isNotPickedUp(m.id)
             return t
@@ -1229,39 +1232,6 @@ struct ContentView: View {
 
     private func cancelReply() {
         withAnimation(.easeOut(duration: 0.2)) { replyTarget = nil }
-    }
-
-    /// "Chat" on an improvement card: land in its conversation with the reply
-    /// composer already open on that improvement, so the next thing typed is a
-    /// question or feedback about it.
-    ///
-    /// The anchor is a real chat message (find-or-create, see
-    /// SelfImproveApproval.chatAnchor) rather than a synthetic quote: `reply_to`
-    /// is a foreign key, and phone-channel builds the agent's context by reading
-    /// the parent row — a fake target would thread to nothing and the agent
-    /// would answer the question against whatever it last said instead.
-    fileprivate func openImprovementThread(_ improvement: SelfImproveApproval.Improvement) async {
-        do {
-            let anchor = try await SelfImproveApproval.chatAnchor(for: improvement)
-            await MainActor.run {
-                // Wherever the anchor landed (the server files it by role).
-                showImprovementCards = false
-                go(.conversation(anchor.conversationId))
-                // The anchor may be brand new (or older than the loaded window),
-                // so seed it locally instead of waiting for the channel's fetch —
-                // beginReply needs the message present for the quote to render.
-                if !viewModel.messages.contains(where: { $0.id == anchor.id }) {
-                    viewModel.messages.append(anchor)
-                }
-                pendingScrollId = anchor.id
-                // Hand off rather than calling beginReply() here: the chat view
-                // (and the input bar the composer focuses) hasn't mounted yet
-                // this run loop, so the focus request would land on nothing.
-                viewModel.pendingReplyMessage = anchor
-            }
-        } catch {
-            print("[SelfImprove] opening chat thread failed: \(error)")
-        }
     }
 
     /// Send `text`, threading it to `replyTarget` when the reply composer is open.
@@ -1869,7 +1839,26 @@ struct BubbleLayout: Equatable {
     private static let groupGap: TimeInterval = 5 * 60
     private static let sectionGap: TimeInterval = 60 * 60
 
-    static func compute(_ messages: [Message]) -> [UUID: BubbleLayout] {
+    /// The replies that show the message they answer, quoted above them.
+    ///
+    /// The owner, 2026-11-15: no reply formatting for questions and answers —
+    /// it is a regular conversation in the feed, "except if my reply was to a
+    /// question or improvement earlier in the feed - in that case my answer is
+    /// a reply - and the rest of the conversation after that is a regular chat
+    /// feed." So only the owner's own message is ever drawn as a reply, and
+    /// only when it answers something other than the latest message from the
+    /// assistant before it. Jori's answers to a reply are plain messages.
+    static func quotedReplies(_ messages: [Message]) -> Set<UUID> {
+        var quoted = Set<UUID>()
+        var lastAssistant: UUID?
+        for m in messages {
+            if m.isUser, let parent = m.replyTo, parent != lastAssistant { quoted.insert(m.id) }
+            if m.isAssistant { lastAssistant = m.id }
+        }
+        return quoted
+    }
+
+    static func compute(_ messages: [Message], quoted: Set<UUID> = []) -> [UUID: BubbleLayout] {
         var result: [UUID: BubbleLayout] = [:]
         result.reserveCapacity(messages.count)
         var places: [BubbleLayout] = []
@@ -1889,7 +1878,7 @@ struct BubbleLayout: Equatable {
                     || prev.role != m.role
                     || prev.sender != m.sender
                     || gap > groupGap
-                    || m.replyTo != nil
+                    || quoted.contains(m.id)
             }
             places.append(place)
         }
@@ -1943,6 +1932,11 @@ struct BubbleThread: Equatable {
     var notPickedUp = false
     /// "Ada · CFO" over the first bubble of a run, where it isn't obvious who is speaking.
     var senderLabel: String?
+    /// Draw the quoted parent above this reply (BubbleLayout.quotedReplies).
+    var showsQuote = false
+    /// The live approval row behind an improvement card message.
+    var improvement: SelfImproveApproval.Improvement?
+    var improvementWorking = false
 }
 
 /// What a bubble can ask the conversation to do.
@@ -1955,6 +1949,7 @@ struct BubbleActions {
     var toggleChecklist: (String, Bool, UUID) -> Void
     var resolveParent: (UUID) -> Void
     var dismiss: (Message) -> Void
+    var improvement: (ImprovementCardAction, SelfImproveApproval.Improvement) -> Void
 }
 
 /// Equatable on its inputs (the closures are deliberately left out — they
@@ -2028,7 +2023,7 @@ struct MessageBubble: View, Equatable {
 
     var body: some View {
         VStack(spacing: 0) {
-            if let parentId = message.replyTo {
+            if let parentId = message.replyTo, thread.showsQuote {
                 QuotedReplyView(
                     parent: thread.quotedParent,
                     onTap: { actions.quoteTap(parentId) }
@@ -2096,7 +2091,7 @@ struct MessageBubble: View, Equatable {
         // Resolve the quoted parent when it has scrolled out of the loaded
         // window (no-ops when it's already on screen or cached).
         .task(id: message.replyTo) {
-            if let parentId = message.replyTo {
+            if let parentId = message.replyTo, thread.showsQuote {
                 actions.resolveParent(parentId)
             }
         }
@@ -2267,7 +2262,9 @@ struct MessageBubble: View, Equatable {
 
     @ViewBuilder
     private var assistantBubble: some View {
-        let openQuestion = thread.isOpenQuestion
+        // An improvement card waiting on the owner's Face ID is drawn as an
+        // open question: the same gold, the same "waiting on you".
+        let openQuestion = thread.isOpenQuestion || (thread.improvement?.needsApproval ?? false)
         let choice = ChoicePrompt.from(metadata: message.metadata)
         // A decision card stays question-gold after it is answered too
         // (decisions are drawn as questions).
@@ -2283,12 +2280,18 @@ struct MessageBubble: View, Equatable {
                     .font(.subheadline.weight(.bold))
                     .foregroundStyle(JoriTheme.confirmed)
             }
-            if openQuestion {
+            if openQuestion && thread.improvement == nil {
                 Label("Waiting for your answer", systemImage: "sparkle")
                     .font(.caption.weight(.semibold))
                     .foregroundStyle(JoriTheme.staffInk)
             }
-            if let checklist = Checklist.from(metadata: message.metadata) {
+            if let card = thread.improvement {
+                // The card is drawn from the live approval row; the message
+                // text is the plain copy for the push and older builds.
+                ImprovementCardView(item: card, working: thread.improvementWorking) { action in
+                    actions.improvement(action, card)
+                }
+            } else if let checklist = Checklist.from(metadata: message.metadata) {
                 // The checklist carries the agenda; the message text is the
                 // plain copy for older builds and the push.
                 if let title = checklist.title, !title.isEmpty {

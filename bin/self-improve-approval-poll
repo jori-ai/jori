@@ -15,7 +15,7 @@
 import path from "node:path";
 import { createRequire } from "node:module";
 import fs from "node:fs";
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { promisify } from "node:util";
 import { createHash } from "node:crypto";
 import { installRoot } from "../lib/root.cjs";
@@ -95,7 +95,13 @@ async function gitCommit(paths, msg) {
   try {
     await exec(path.join(ROOT, "bin/jori-commit"), ["-m", msg, "--", ...paths], { cwd: ROOT });
   } catch (e) {
-    return { error: (e.stderr || e.message || "").toString().trim() };
+    const err = (e.stderr || e.message || "").toString().trim();
+    // A retry of a card whose files already landed (the not-live retry below):
+    // jori-commit is the authority on both repos, and "nothing to commit" from
+    // it means every named path is already in git. That is committed, not a
+    // failed commit to warn about.
+    if (/nothing to commit/.test(err)) return true; // lang-regex-ok: jori-commit's own fixed message
+    return { error: err };
   }
   // A commit that only exists on this host is one `git checkout` from gone
   // and invisible to every other clone. The 15-minute sync cron used to be
@@ -278,6 +284,12 @@ async function lockedFileRefusal(item, rels) {
   return null;
 }
 
+// ---- applied means running ---------------------------------------------------
+// Written and committed is not the same as working: after the commit the card's
+// change is made to run and checked (lib/self-improve-live.mjs has the why).
+const { goLive: goLiveIn } = await import(path.join(ROOT, "lib/self-improve-live.mjs"));
+const goLive = (rels) => goLiveIn(rels, { root: ROOT });
+
 async function applyItem(row) {
   const item = row.item_json || {};
   if (row.item_type === "new-capability") {
@@ -399,20 +411,59 @@ async function applyItem(row) {
       rels.push(rel);
     }
     const g = await gitCommit(rels, `self-improve: apply owner-approved fix (Face-ID) — ${row.summary || row.id}`);
-    return { ok: true, files: rels, ...(rebased.length ? { rebased } : {}), git: g === true ? "committed" : g };
+    const landed = { files: rels, ...(rebased.length ? { rebased } : {}), git: g === true ? "committed" : g };
+    const live = await goLive(rels);
+    if (!live.ok) return { ok: false, not_live: true, ...landed, error: live.error, notes: live.notes };
+    return { ok: true, ...landed, notes: live.notes };
   }
   return { ok: false, error: `unknown item_type ${row.item_type}` };
 }
 
-// confirm to the user in the Improvements channel
+// confirm to the user in the Improvements channel.
+//
+// Detached and never killed. This used to wait 15 s and then kill
+// jori-send-curl — but every message passes the speak gate first, and the gate
+// takes minutes (240 s budget for a proactive message, more when the judge is
+// relayed to the GUI session). On 2026-11-15 the "you approved Shows seen, but
+// it didn't go in" notice was judged "send" after 208 s by a gate whose sender
+// had been killed at 15 s: the verdict had nobody to deliver it, and the owner
+// never heard the approval failed. Fire and forget: the send outlives this
+// poller, and the poller never waits on the gate.
 async function confirm(text) {
-  try { await exec(path.join(ROOT, "bin/jori-send-curl"), ["--channel", "improvements", "--skip-precheck", text], { timeout: 15000 }); } catch {}
+  try {
+    const child = spawn(path.join(ROOT, "bin/jori-send-curl"), ["--channel", "improvements", "--skip-precheck", text], { detached: true, stdio: "ignore", cwd: ROOT });
+    child.on("error", () => {});
+    child.unref();
+  } catch {}
+}
+
+// One poller at a time. With the not-live check a tick can run for minutes
+// (a plugin sync, the card's tests), and the 2-minute cron would otherwise
+// start a second one that picks the same `approved` row up and applies it
+// again underneath the first.
+const LOCK = path.join(ROOT, "data/.self-improve-approval-poll.lock");
+function takeLock() {
+  for (let i = 0; i < 2; i++) {
+    try { fs.writeFileSync(LOCK, String(process.pid), { flag: "wx" }); return true; }
+    catch {
+      let pid = 0;
+      try { pid = Number(fs.readFileSync(LOCK, "utf8")); } catch {}
+      try { if (pid) { process.kill(pid, 0); return false; } } catch {}
+      try { fs.unlinkSync(LOCK); } catch {}   // holder is gone: stale lock
+    }
+  }
+  return false;
+}
+function releaseLock() {
+  try { if (Number(fs.readFileSync(LOCK, "utf8")) === process.pid) fs.unlinkSync(LOCK); } catch {}
 }
 
 const u = createUnifiedApproval({ store, deviceKeys, postSuggestion: null, applyItem });
 
 async function main() {
   if (!K) { console.error("[si-approval] no service key"); return; }
+  if (!takeLock()) return;   // another tick is still applying
+  process.on("exit", releaseLock);
   // Ahead of the cheap exit: a stuck commit is independent of whether anything
   // new is signed and pending.
   await drainUncommitted();
@@ -432,7 +483,10 @@ async function main() {
   for (const o of out) {
     const retried = !!o.retried;
     if (o.ok) {
-      const label = o.result?.loaded || o.result?.files?.join(", ") || o.id;
+      // Named by its title, not a file list (a raw list of paths is plumbing,
+      // and the speak gate once "rewrote" one into "is now live" with nothing
+      // behind it). The notes are what goLive checked, so the claim is earned.
+      const label = o.result?.loaded || (titleOf[o.id] ? `"${titleOf[o.id]}"` : null) || o.result?.files?.join(", ") || o.id;
       const gitErr = o.result?.git && o.result.git !== "committed" ? o.result.git.error : null;
       if (gitErr) {
         // Files were written to disk but the commit failed — do NOT report a
@@ -446,7 +500,8 @@ async function main() {
         await confirm(`⚠️ Applied but NOT committed: ${label}. The files are on disk but the commit failed (${gitErr}). I will keep retrying, and say something again if it is still stuck tomorrow.`);
       } else {
         console.error(`[si-approval] applied ${o.id}${retried ? " (retry)" : ""}`);
-        await confirm(`✅ ${retried ? "Retried and applied" : "Approved + applied"}: ${label}. ${o.result?.note || ""}`);
+        const checked = (o.result?.notes || []).join(" ");
+        await confirm(`✅ ${retried ? "Retried and applied" : "Approved + applied"}: ${label}. ${checked || o.result?.note || ""}`.trim());
       }
     }
     // `expired` and `skipped` are the user's own decisions playing out, not
@@ -464,7 +519,12 @@ async function main() {
       // Nothing in it said which feature it was or that the feature had not
       // shipped, and the user only found out from the next morning's brief.
       const title = titleOf[o.id] || o.id;
-      if (o.result.stale) {
+      if (o.result.not_live) {
+        // Written and committed, but not running (see goLive). Not a conflict:
+        // rebuilding the card would not help; fixing what stops it running and
+        // tapping Retry does.
+        await confirm(`⚠️ ${retried ? `I retried "${title}"` : `"${title}" is in the code`} but it is not running: ${o.result.error} The card shows it as failed. Tap Retry on it once that's fixed, or ask me in chat.`);
+      } else if (o.result.stale) {
         // The signing-time truth check (core/self-improve-unified.mjs decideRow)
         // found the card's finding no longer true. Nothing was written. Retry is
         // the user's override: it re-runs the apply without asking the check again.

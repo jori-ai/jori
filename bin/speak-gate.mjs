@@ -183,6 +183,8 @@ Default to "send" only when all four pass. Prefer "rewrite" to "drop" when the c
 
 ${checks}
 
+A REWRITE NEVER CLAIMS MORE than the original and the sources you checked show. A message that says a change was approved, applied or committed must not become "live", "running" or "working" unless a source you checked shows it running.
+
 RESEARCH FIRST. Use the tools to verify the claims and look for answers before you decide; check several sources, not one. Budget: a few minutes. You cannot change anything, and must not try.
 
 ${TOOLS_DOC}

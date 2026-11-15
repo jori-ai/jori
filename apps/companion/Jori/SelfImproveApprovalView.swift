@@ -2,158 +2,112 @@
 //  SelfImproveApprovalView.swift
 //  Jori
 //
-//  The "Improvements" channel — a card feed, not a chat log. Each card is one
-//  self-improvement Jori proposed or applied. Everything you can do to a card
-//  lives in ONE right-click (macOS) / long-press (iOS) menu:
+//  An improvement card, drawn inside its message in the conversation feed —
+//  the way a question is drawn. The owner, 2026-11-15: "Fixes should behave
+//  like questions in the way they're presented to the user - not in a
+//  separate Improvements tab."
 //
-//    1. Implement   — the default action, listed first. Face ID → signs the
-//                     approval (see SelfImproveApproval.swift), after which the
-//                     host verifies and applies it.
-//    2. Skip/Unskip — "we're not implementing this", and its reversal.
-//    3. Chat        — jump to the chat channel with a reply composer already
-//                     open on this improvement, to ask questions or push back.
-//    4. Retry       — only on a card whose apply mechanically failed.
-//
-//  Replaced tap-to-approve on 2026-07-28: Implement is now the first, bold,
-//  default item of the card's menu. Tap-anywhere-to-approve was the only gesture on the
-//  card, so every new action would have had to become another inline button
-//  competing with it; worse, the single most consequential thing in the app —
-//  authorizing Jori to modify its own source — was one stray tap away while
-//  scrolling. A menu makes the destructive-adjacent action deliberate and gives
-//  the other three somewhere to live.
-//
-//  Status drives the trailing accessory:
-//    - needs approval → a gold "Needs approval" pill
-//    - in progress    → a spinning recycle glyph ("Applying…")
-//    - done           → a green checkmark
-//    - failed         → an amber warning
-//    - skipped        → a grey "Skipped" pill, card dimmed, sorted to the bottom
+//  The card is a message (self-improve-request posts it with metadata
+//  card=improvement, approval_id=<row>); the bubble reads the LIVE approval
+//  row (ImprovementCards) and shows it:
+//    - needs approval → question-gold bubble, Implement (Face ID) and Skip
+//    - in progress    → "Applying…"
+//    - done           → green "In and running" — the host only records
+//                       `applied` once the change runs (lib/self-improve-live.mjs)
+//    - failed         → orange "Didn't go in" with the host's reason, and Retry
+//                       when the failure was mechanical
+//    - skipped        → grey "Skipped", Unskip
+//  The summary and rationale come from the row (what is signed), not from the
+//  message text, which is the plain copy for the push and older builds.
+//  Talking about a card is replying to its message, like answering a question
+//  in your own words; the host resolves the card from the reply
+//  (chat_message_id, lib/improvement-reply-target.mjs).
 //
 
 import SwiftUI
 
-struct SelfImproveFeedView: View {
-    /// Open a chat thread about this improvement. ContentView owns the channel
-    /// switch + reply composer, so the feed hands the card up rather than
-    /// reaching across into the chat view model itself.
-    var onChat: (SelfImproveApproval.Improvement) -> Void = { _ in }
+/// What a card's buttons ask for.
+enum ImprovementCardAction { case implement, skip, unskip, retry }
 
-    @State private var items: [SelfImproveApproval.Improvement] = []
-    @State private var workingId: String?
-    @State private var errorText: String?
-    @State private var loaded = false
+/// The approval rows behind the improvement cards on screen, refreshed while
+/// the conversation is open so Applying → In and running (or → Didn't go in)
+/// shows without leaving it.
+@MainActor
+final class ImprovementCards: ObservableObject {
+    @Published private(set) var byId: [String: SelfImproveApproval.Improvement] = [:]
+    @Published private(set) var workingId: String?
+    @Published var errorText: String?
     /// Bumped when an approval signs, for the success haptic.
-    @State private var approvedTick = 0
+    @Published private(set) var approvedTick = 0
 
-    // Poll while the feed is on screen so pending → applying → done transitions
-    // appear without the user leaving the channel.
-    private let refresh = Timer.publish(every: 8, on: .main, in: .common).autoconnect()
+    func refresh(ids: Set<String>) async {
+        guard !ids.isEmpty else { return }
+        do {
+            let rows = try await SelfImproveApproval.fetch(ids: Array(ids))
+            // Don't clobber an optimistic local status mid-action.
+            for r in rows where r.id != workingId { byId[r.id] = r }
+            if !SelfImproveApproval.isRegistered,
+               rows.contains(where: { $0.needsApproval }) {
+                try? await SelfImproveApproval.registerDeviceKey()
+            }
+        } catch {
+            print("[SelfImprove] card refresh failed: \(error)")
+        }
+    }
+
+    func perform(_ action: ImprovementCardAction, _ item: SelfImproveApproval.Improvement) async {
+        workingId = item.id
+        do {
+            switch action {
+            case .implement:
+                try await SelfImproveApproval.approve(item)
+                byId[item.id] = item.withStatus("signed")
+                approvedTick &+= 1
+            case .skip, .unskip:
+                let skip = action == .skip
+                try await SelfImproveApproval.setSkipped(item, skip)
+                byId[item.id] = item.withSkipped(skip)
+            case .retry:
+                try await SelfImproveApproval.retry(item)
+                byId[item.id] = item.withStatus("retry_requested")
+            }
+        } catch {
+            if !Self.isUserCancel(error) { errorText = error.localizedDescription }
+        }
+        workingId = nil
+        if let fresh = try? await SelfImproveApproval.fetchOne(item.id) { byId[item.id] = fresh }
+    }
+
+    private static func isUserCancel(_ error: Error) -> Bool {
+        // LAError.userCancel == -2; Security userCanceled == errSecUserCanceled.
+        (error as NSError).localizedDescription.lowercased().contains("cancel")
+    }
+}
+
+/// The card's content inside an assistant bubble (the bubble supplies the
+/// background: question-gold while it needs approval).
+struct ImprovementCardView: View {
+    let item: SelfImproveApproval.Improvement
+    let working: Bool
+    let onAction: (ImprovementCardAction) -> Void
+
+    @State private var expanded = false
 
     var body: some View {
-        ScrollView {
-            LazyVStack(spacing: 12) {
-                if items.isEmpty && loaded {
-                    emptyState
-                } else if !loaded {
-                    ProgressView()
-                        .padding(.top, 80)
-                }
-                ForEach(items) { item in
-                    card(item)
-                        .transition(.opacity.combined(with: .scale(scale: 0.97)))
-                }
-            }
-            .frame(maxWidth: 720)
-            .frame(maxWidth: .infinity)
-            .padding(.horizontal, 16)
-            .padding(.top, 12)
-            .padding(.bottom, 28)
-            .animation(.snappy(duration: 0.3), value: items.map { "\($0.id)|\($0.status)|\($0.skipped)" })
-        }
-        .refreshable { await reload() }
-        .task { await reload() }
-        .onReceive(refresh) { _ in Task { await reload() } }
-        .sensoryFeedback(.success, trigger: approvedTick)
-        .alert("Couldn’t complete", isPresented: Binding(
-            get: { errorText != nil }, set: { if !$0 { errorText = nil } })
-        ) {
-            Button("OK") { errorText = nil }
-        } message: {
-            Text(errorText ?? "")
-        }
-    }
-
-    // MARK: - Cards
-
-    @ViewBuilder
-    private func card(_ item: SelfImproveApproval.Improvement) -> some View {
-        cardBody(item)
-            // contentShape so the menu opens from anywhere on the card, not just
-            // where the text happens to be.
-            .contentShape(RoundedRectangle(cornerRadius: Radius.card, style: .continuous))
-            .contextMenu { menu(item) }
-    }
-
-    /// The card's whole action surface. Order is deliberate: Implement is first
-    /// and bold because it is the default — the thing you came here to do.
-    ///
-    /// (`.fontWeight(.bold)` on a menu label is honoured by AppKit's NSMenu on
-    /// macOS; UIKit renders context-menu items in the system style and will
-    /// ignore it. Position and the filled Face ID glyph carry the "this is the
-    /// default" signal on iOS, where the styling can't.)
-    @ViewBuilder
-    private func menu(_ item: SelfImproveApproval.Improvement) -> some View {
-        if item.isImplementable {
-            Button { Task { await approve(item) } } label: {
-                Label {
-                    Text("Implement").fontWeight(.bold)
-                } icon: {
-                    Image(systemName: "faceid")
-                }
-            }
-        }
-
-        if item.skipped {
-            Button { Task { await setSkipped(item, false) } } label: {
-                Label("Unskip", systemImage: "arrow.uturn.backward")
-            }
-        } else if item.isSkippable {
-            Button { Task { await setSkipped(item, true) } } label: {
-                Label("Skip", systemImage: "xmark.circle")
-            }
-        }
-
-        Button { onChat(item) } label: {
-            Label("Chat", systemImage: "bubble.left.and.bubble.right")
-        }
-
-        if item.isRetryable {
-            Divider()
-            Button { Task { await retry(item) } } label: {
-                Label("Retry", systemImage: "arrow.clockwise")
-            }
-        }
-    }
-
-    @ViewBuilder
-    private func cardBody(_ item: SelfImproveApproval.Improvement) -> some View {
-        let shape = RoundedRectangle(cornerRadius: Radius.card, style: .continuous)
         VStack(alignment: .leading, spacing: 8) {
-            HStack(spacing: 8) {
-                Label(item.itemType == "new-capability" ? "New capability" : "Code fix",
+            HStack(spacing: 6) {
+                Label(item.itemType == "new-capability" ? "New capability" : "Fix",
                       systemImage: item.itemType == "new-capability" ? "sparkles" : "wrench.and.screwdriver")
                     .font(.caption.weight(.semibold))
                     .foregroundStyle(.secondary)
                 Spacer(minLength: 0)
-                accessory(item)
+                stateBadge
                     .transition(.scale(scale: 0.6).combined(with: .opacity))
                     .id(item.phase)
-                actionsButton(item)
             }
 
             Text(item.summary)
                 .font(.body.weight(.semibold))
-                .foregroundStyle(.primary)
                 .fixedSize(horizontal: false, vertical: true)
                 .frame(maxWidth: .infinity, alignment: .leading)
 
@@ -161,207 +115,115 @@ struct SelfImproveFeedView: View {
                 Text(rationale)
                     .font(.callout)
                     .foregroundStyle(.secondary)
+                    .lineLimit(expanded ? nil : 5)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                if rationale.count > 280 {
+                    Button(expanded ? "Less" : "More") {
+                        withAnimation(.easeOut(duration: 0.2)) { expanded.toggle() }
+                    }
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(JoriTheme.cobalt)
+                    .buttonStyle(.plain)
+                }
+            }
+
+            if item.phase == .failed, let why = item.result?.error, !why.isEmpty {
+                Text(why)
+                    .font(.footnote)
+                    .foregroundStyle(.orange)
                     .fixedSize(horizontal: false, vertical: true)
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
+            if item.phase == .done, let notes = item.result?.notes, !notes.isEmpty {
+                Text(notes.joined(separator: " "))
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
 
-            footer(item)
+            actions
+                .padding(.top, 2)
         }
-        .padding(16)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(JoriTheme.card, in: shape)
-        .overlay(
-            shape.strokeBorder(item.needsApproval ? JoriTheme.staff.opacity(0.6) : JoriTheme.hairline.opacity(0.7),
-                               lineWidth: item.needsApproval ? 1.5 : 0.5))
-        // Gold means "waiting on you" everywhere in the app.
-        .shadow(color: item.needsApproval ? JoriTheme.staff.opacity(0.22) : Color.black.opacity(0.04),
-                radius: item.needsApproval ? 14 : 4, y: 2)
-        // A skipped card is kept legible but visibly out of the running — it is
-        // still there to be un-skipped, it just isn't asking for anything.
-        .opacity(item.skipped ? 0.55 : 1)
+        .animation(.snappy(duration: 0.3), value: "\(item.status)|\(item.skipped)|\(working)")
     }
 
-    /// A visible handle on the card's menu — the same items as the long-press
-    /// / right-click menu, for anyone who doesn't know to hold the card.
-    private func actionsButton(_ item: SelfImproveApproval.Improvement) -> some View {
-        Menu { menu(item) } label: {
-            Image(systemName: "ellipsis")
-                .font(.system(size: 14, weight: .semibold))
-                .foregroundStyle(.secondary)
-                .frame(width: 30, height: 30)
-                .background(Circle().fill(Color.primary.opacity(0.06)))
-                .contentShape(Circle())
-        }
-        .menuIndicator(.hidden)
-        .fixedSize()
-        #if os(macOS)
-        .menuStyle(.borderlessButton)
-        #endif
-        .accessibilityLabel("Actions")
-    }
-
-    /// The line under the card: what's happening right now, or what the card
-    /// is waiting for.
     @ViewBuilder
-    private func footer(_ item: SelfImproveApproval.Improvement) -> some View {
-        if workingId == item.id {
+    private var stateBadge: some View {
+        switch item.phase {
+        case .needsApproval:
+            pill("Needs your OK", fg: JoriTheme.staffInk, bg: JoriTheme.staff.opacity(0.2))
+        case .inProgress:
+            HStack(spacing: 4) {
+                SpinningGlyph()
+                Text("Applying").font(.caption2.weight(.semibold)).foregroundStyle(JoriTheme.cobalt)
+            }
+        case .done:
+            Label("In and running", systemImage: "checkmark.circle.fill")
+                .font(.caption2.weight(.semibold))
+                .foregroundStyle(JoriTheme.confirmed)
+        case .failed:
+            Label(item.result?.notLive == true ? "In, not running" : "Didn’t go in",
+                  systemImage: "exclamationmark.triangle.fill")
+                .font(.caption2.weight(.semibold))
+                .foregroundStyle(.orange)
+        case .skipped:
+            pill("Skipped", fg: .secondary, bg: Color.secondary.opacity(0.18))
+        }
+    }
+
+    private func pill(_ text: String, fg: Color, bg: Color) -> some View {
+        Text(text)
+            .font(.caption2.weight(.semibold))
+            .padding(.horizontal, 8).padding(.vertical, 3)
+            .background(bg, in: Capsule())
+            .foregroundStyle(fg)
+    }
+
+    @ViewBuilder
+    private var actions: some View {
+        if working {
             HStack(spacing: 6) {
                 ProgressView().controlSize(.mini)
                 Text("Working…")
             }
             .font(.caption.weight(.semibold))
             .foregroundStyle(.secondary)
-            .padding(.top, 2)
-        } else if item.needsApproval {
-            Label("Implement from the menu", systemImage: "faceid")
-                .font(.caption.weight(.semibold))
-                .foregroundStyle(JoriTheme.staffInk)
-                .padding(.top, 2)
+        } else if item.isImplementable {
+            HStack(spacing: 10) {
+                Button { onAction(.implement) } label: {
+                    Label("Implement", systemImage: "faceid")
+                        .font(.subheadline.weight(.semibold))
+                        .frame(maxWidth: .infinity)
+                }
+                .prominentButtonStyle()
+                .buttonBorderShape(.capsule)
+                .tint(JoriTheme.staffInk)
+                if item.isSkippable {
+                    Button { onAction(.skip) } label: {
+                        Text("Skip").font(.subheadline).frame(maxWidth: .infinity)
+                    }
+                    .secondaryButtonStyle()
+                    .buttonBorderShape(.capsule)
+                }
+            }
         } else if item.isRetryable {
-            Label("Didn’t apply. Retry from the menu.", systemImage: "arrow.clockwise")
-                .font(.caption.weight(.semibold))
-                .foregroundStyle(.orange)
-                .padding(.top, 2)
-        }
-    }
-
-    @ViewBuilder
-    private func accessory(_ item: SelfImproveApproval.Improvement) -> some View {
-        switch item.phase {
-        case .needsApproval:
-            Text("Needs approval")
-                .font(.caption2.weight(.semibold))
-                .padding(.horizontal, 8).padding(.vertical, 3)
-                .background(JoriTheme.staff.opacity(0.2), in: Capsule())
-                .foregroundStyle(JoriTheme.staffInk)
-        case .inProgress:
-            HStack(spacing: 4) {
-                SpinningGlyph()
-                Text("Applying")
-                    .font(.caption2.weight(.semibold))
-                    .foregroundStyle(JoriTheme.cobalt)
-            }
-        case .done:
-            Image(systemName: "checkmark.circle.fill")
-                .foregroundStyle(JoriTheme.confirmed)
-                .accessibilityLabel("Done")
-        case .failed:
-            Image(systemName: "exclamationmark.triangle.fill")
-                .foregroundStyle(.orange)
-                .accessibilityLabel("Failed")
-        case .skipped:
-            Text("Skipped")
-                .font(.caption2.weight(.semibold))
-                .padding(.horizontal, 8).padding(.vertical, 3)
-                .background(Color.secondary.opacity(0.18), in: Capsule())
-                .foregroundStyle(.secondary)
-        }
-    }
-
-    private var emptyState: some View {
-        VStack(spacing: 10) {
-            Image(systemName: "wand.and.stars")
-                .font(.system(size: 34, weight: .light))
-                .foregroundStyle(JoriTheme.staff)
-            Text("Nothing to improve yet")
-                .font(JoriTheme.display(22))
-            Text("When \(Install.displayName) proposes or applies a self-improvement, the change appears here. Open a card’s menu to implement, skip, or talk it through.")
-                .font(.callout)
-                .foregroundStyle(.secondary)
-                .multilineTextAlignment(.center)
-                .frame(maxWidth: 380)
-        }
-        .frame(maxWidth: .infinity)
-        .padding(.top, 80)
-        .padding(.horizontal, 24)
-    }
-
-    // MARK: - Actions
-
-    private func reload() async {
-        do {
-            let rows = try await SelfImproveApproval.fetchFeed()
-            await MainActor.run {
-                // Don't clobber an optimistic local status mid-approval.
-                if workingId == nil { items = rows }
-                loaded = true
-            }
-            if !SelfImproveApproval.isRegistered {
-                try? await SelfImproveApproval.registerDeviceKey()
-            }
-        } catch {
-            await MainActor.run { loaded = true }
-            print("[SelfImprove] fetch feed failed: \(error)")
-        }
-    }
-
-    private func approve(_ item: SelfImproveApproval.Improvement) async {
-        await MainActor.run { workingId = item.id }
-        do {
-            try await SelfImproveApproval.approve(item)
-            // Optimistically flip to in-progress so the card animates immediately;
-            // the next poll confirms applied.
-            await MainActor.run {
-                if let idx = items.firstIndex(where: { $0.id == item.id }) {
-                    items[idx] = item.withStatus("signed")
+            HStack(spacing: 10) {
+                Button { onAction(.retry) } label: {
+                    Label("Retry", systemImage: "arrow.clockwise").font(.subheadline.weight(.semibold))
                 }
-                workingId = nil
-                approvedTick &+= 1
+                .secondaryButtonStyle()
+                .buttonBorderShape(.capsule)
+                Button { onAction(.skip) } label: { Text("Skip").font(.subheadline) }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(.secondary)
             }
-        } catch {
-            await MainActor.run {
-                workingId = nil
-                // A user-cancelled Face ID isn't an error worth an alert.
-                if !isUserCancel(error) { errorText = error.localizedDescription }
+        } else if item.skipped {
+            Button { onAction(.unskip) } label: {
+                Label("Unskip", systemImage: "arrow.uturn.backward").font(.subheadline)
             }
+            .buttonStyle(.plain)
+            .foregroundStyle(JoriTheme.cobalt)
         }
-    }
-
-    private func setSkipped(_ item: SelfImproveApproval.Improvement, _ skipped: Bool) async {
-        await MainActor.run { workingId = item.id }
-        do {
-            try await SelfImproveApproval.setSkipped(item, skipped)
-            await MainActor.run {
-                if let idx = items.firstIndex(where: { $0.id == item.id }) {
-                    items[idx] = item.withSkipped(skipped)
-                }
-                workingId = nil
-            }
-            // Re-sort immediately (skipped cards drop to the bottom) rather than
-            // leaving the card sitting where it was until the next 8s poll.
-            await reload()
-        } catch {
-            await MainActor.run {
-                workingId = nil
-                errorText = error.localizedDescription
-            }
-        }
-    }
-
-    private func retry(_ item: SelfImproveApproval.Improvement) async {
-        await MainActor.run { workingId = item.id }
-        do {
-            try await SelfImproveApproval.retry(item)
-            // Optimistically flip to in-progress; the next poll confirms
-            // applied or reports it's still failing.
-            await MainActor.run {
-                if let idx = items.firstIndex(where: { $0.id == item.id }) {
-                    items[idx] = item.withStatus("retry_requested")
-                }
-                workingId = nil
-            }
-        } catch {
-            await MainActor.run {
-                workingId = nil
-                errorText = error.localizedDescription
-            }
-        }
-    }
-
-    private func isUserCancel(_ error: Error) -> Bool {
-        let ns = error as NSError
-        // LAError.userCancel == -2; Security userCanceled == errSecUserCanceled.
-        return ns.localizedDescription.lowercased().contains("cancel")
     }
 }
 
@@ -378,18 +240,20 @@ private struct SpinningGlyph: View {
     }
 }
 
-private extension SelfImproveApproval.Improvement {
+extension SelfImproveApproval.Improvement {
     func withStatus(_ s: String) -> SelfImproveApproval.Improvement {
         SelfImproveApproval.Improvement(
             id: id, itemType: itemType, summary: summary, rationale: rationale,
             itemHash: itemHash, nonce: nonce, status: s, risk: risk,
-            skipped: false, chatMessageId: chatMessageId, expiresAtMs: expiresAtMs)
+            skipped: false, chatMessageId: chatMessageId, expiresAtMs: expiresAtMs,
+            result: result)
     }
 
     func withSkipped(_ v: Bool) -> SelfImproveApproval.Improvement {
         SelfImproveApproval.Improvement(
             id: id, itemType: itemType, summary: summary, rationale: rationale,
             itemHash: itemHash, nonce: nonce, status: status, risk: risk,
-            skipped: v, chatMessageId: chatMessageId, expiresAtMs: expiresAtMs)
+            skipped: v, chatMessageId: chatMessageId, expiresAtMs: expiresAtMs,
+            result: result)
     }
 }

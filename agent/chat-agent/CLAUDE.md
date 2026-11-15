@@ -156,9 +156,9 @@ Each project page carries a task list (`plugins/projects/bin/projects task …`,
 
 **People cards and people requests (2026-10-27).** A card with the "People" chip comes from `people-watch` (stay in touch? follow their news? a change in their life? reach out?). Typed answers file like any card (`decision-answer --ref ppl:… --text "<their words>"`); the nightly `people-watch` turn reads them. When the user says it in chat without a card ("keep in touch with Alice", "stop following Bob's news", "nudge me about Carol every couple of months"), file it directly: `~/Dev/jori/bin/people-watch decide <wiki_id> --note "<their words>" [--status tracking|declined|snoozed] [--nudges 0|1] [--research 0|1] [--cadence <days>]`. Never start following or nudging anyone the user did not name. A note `people-watch` drafted for them ("Want me to send it, or will you?") is sent only on their explicit go-ahead, under the outbound policies (as the user only when they asked for that; otherwise framed as Jori).
 
-## Improvement Threads (talking about a card in the Improvements channel)
+## Improvement Threads (talking about an improvement card)
 
-**Trigger:** an `[Improvement thread]` block is prepended (the user tapped Chat on an Improvements card). Read the change with `self-improve-show <id>` before characterising it; the block's status is authoritative. You may `self-improve-skip <id>` only on an explicit decision ("no", "skip it" — not a critical question), and `self-improve-retry <id>` a mechanically failed apply. **You may NOT approve, sign or apply anything (Face ID only), and never hand-edit the files behind a card.**
+**Trigger:** an `[Improvement thread]` block is prepended (the user replied to an improvement card's message in the feed). Read the change with `self-improve-show <id>` before characterising it; the block's status is authoritative. You may `self-improve-skip <id>` only on an explicit decision ("no", "skip it" — not a critical question), and `self-improve-retry <id>` a mechanically failed apply. **You may NOT approve, sign or apply anything (Face ID only), and never hand-edit the files behind a card.**
 
 Details: `agent/chat-agent/procedures/improvement-threads.md`.
 

@@ -355,7 +355,34 @@ const u = createUnifiedApproval({
     async findByItemHash(hash) { const res = await fetch(`${BASE}/rest/v1/self_improve_approvals?item_hash=eq.${encodeURIComponent(hash)}&select=id,status,skipped,risk,expires_at,expires_at_ms`, { headers: H }); if (!res.ok) throw new Error(`lookup ${res.status}`); return res.json(); },
   },
   deviceKeys: { getKey: async () => null },
-  postSuggestion: async (s, r) => { try { await exec(path.join(ROOT, "bin/jori-send-curl"), ["--channel", "improvements", "--skip-precheck", `🔧 ${s}\n${r || ""}\n\nApprove in the app (Face ID) to apply.`], { timeout: 15000 }); } catch {} },
+  // The card is a message in the software engineer's conversation, drawn by the
+  // app as a question-style card (Implement / Skip / Retry inline) from the
+  // approval row named in its metadata — there is no separate Improvements tab.
+  // The message text stays the plain copy for the push and older builds.
+  //   intent improvement-card: the speak gate may rewrite it but never holds it
+  //     (lib/speak-gate-live.mjs NEVER_HELD_INTENTS) — a held card would be an
+  //     approval nobody can reach.
+  //   chat_message_id = this message: a reply to the card is a reply about the
+  //     card (lib/improvement-reply-target.mjs resolves it).
+  // No short timeout: the gate takes minutes, and a killed send used to lose the
+  // card's message entirely (jori-send-curl now ignores TERM through the gate).
+  postSuggestion: async (s, r, _type, id) => {
+    const cap = path.join(fs.mkdtempSync(path.join((await import("node:os")).tmpdir(), "si-card-")), "id");
+    try {
+      await exec(path.join(ROOT, "bin/jori-send-curl"), [
+        "--channel", "improvements", "--skip-precheck", "--intent", "improvement-card",
+        "--metadata-json", JSON.stringify({ card: "improvement", approval_id: id }),
+        "--capture-id", cap,
+        `🔧 ${s}\n${r || ""}\n\nApprove in the app (Face ID) to apply.`,
+      ], { timeout: 900_000 });
+    } catch {}
+    try {
+      const msgId = fs.readFileSync(cap, "utf8").trim();
+      if (/^[0-9a-f-]{36}$/.test(msgId) && id) { // lang-regex-ok: a uuid
+        await fetch(`${BASE}/rest/v1/self_improve_approvals?id=eq.${encodeURIComponent(id)}`, { method: "PATCH", headers: H, body: JSON.stringify({ chat_message_id: msgId }) });
+      }
+    } catch {}
+  },
   applyItem: async () => ({ ok: false }),
 });
 
