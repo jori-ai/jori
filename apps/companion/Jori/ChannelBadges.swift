@@ -793,9 +793,26 @@ struct TeamAvatar: View {
         }
     }
 
+    /// The chief of staff (Jori's own assistant) wears a blue ring, with a
+    /// hairline gap, wherever its avatar is drawn — the cue that sets it
+    /// apart from the other roles. The ring sits inside the avatar's frame,
+    /// so every layout keeps its size.
+    @ViewBuilder
+    private func circle(_ m: TeamMember, size: CGFloat) -> some View {
+        if m.chiefOfStaff {
+            let ring = max(1.5, size * 0.05)
+            let gap = max(1, size * 0.04)
+            face(m, size: size - 2 * (ring + gap))
+                .frame(width: size, height: size)
+                .overlay(Circle().strokeBorder(JoriTheme.cobalt, lineWidth: ring))
+        } else {
+            face(m, size: size)
+        }
+    }
+
     /// The role's photo when the user picked one, its initials otherwise
     /// (and while the photo loads, or if it can't).
-    private func circle(_ m: TeamMember, size: CGFloat) -> some View {
+    private func face(_ m: TeamMember, size: CGFloat) -> some View {
         initials(m, size: size)
             .overlay {
                 if let s = m.avatarURL, let url = URL(string: s) {
@@ -916,7 +933,8 @@ struct PinnedConversationsGrid: View {
     let open: (String) -> Void
     var onDeleted: (String) -> Void = { _ in }
     /// The iPhone home list, sized like Messages' pins: 76pt circles, the
-    /// name alone under each in 12pt. Off, the smaller Mac/iPad sidebar tiles.
+    /// name under each in 12pt (a one-role pin adds its role). Off, the smaller
+    /// Mac/iPad sidebar tiles.
     var phone = false
 
     private var columns: [GridItem] {
@@ -937,7 +955,9 @@ struct PinnedConversationsGrid: View {
         let badge = team.badgeCount(conversation.id)
         let isSelected = selected == conversation.id
         let name = team.title(of: conversation.id)
-        let role = team.subtitle(of: conversation.id)
+        // A one-person conversation shows that role under the name; a group
+        // shows its name alone (its avatar already shows who).
+        let role = conversation.isGroup ? "" : team.subtitle(of: conversation.id)
         return Button { open(conversation.id) } label: {
             VStack(spacing: phone ? 5 : 6) {
                 TeamAvatar(members: team.members(of: conversation.id), size: phone ? 76 : 54)
@@ -952,10 +972,10 @@ struct PinnedConversationsGrid: View {
                     Text(Self.short(name))
                         .font(phone ? .caption : .system(size: 10, weight: .medium))
                         .foregroundStyle(phone ? .secondary : .primary)
-                    if !role.isEmpty, !phone {
+                    if !role.isEmpty {
                         Text(Self.short(role))
-                            .font(.system(size: 9))
-                            .foregroundStyle(.secondary)
+                            .font(phone ? .caption2 : .system(size: 9))
+                            .foregroundStyle(phone ? .tertiary : .secondary)
                     }
                 }
                 .lineLimit(1)
