@@ -19,7 +19,7 @@ test("splitEnv moves exactly the names whose value .env gives back unchanged", (
   assert.deepEqual(env, { OVERRIDDEN: "launchd", PATH: "/usr/bin" }, "an overridden value and a non-.env name stay");
 });
 
-function runChild(isolate) {
+function runChild(isolate, extraEnv = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "env-isolate-"));
   fs.mkdirSync(path.join(dir, "config"));
   fs.writeFileSync(path.join(dir, "config", "agent-env.json"), JSON.stringify({ isolate }));
@@ -35,7 +35,7 @@ function runChild(isolate) {
   `);
   const r = spawnSync(process.execPath, [script, "serve", "--port", "1"], {
     encoding: "utf8",
-    env: { PATH: process.env.PATH, HOME: process.env.HOME, JORI_LOCAL_DIR: dir, PROBE_SECRET_TOKEN: "s3cret", PROBE_URL: "http://x" },
+    env: { PATH: process.env.PATH, HOME: process.env.HOME, JORI_LOCAL_DIR: dir, PROBE_SECRET_TOKEN: "s3cret", PROBE_URL: "http://x", ...extraEnv },
   });
   fs.rmSync(dir, { recursive: true, force: true });
   if (!r.stdout.trim()) throw new Error(`child printed nothing: ${String(r.stderr).slice(0, 400)}`);
@@ -56,4 +56,11 @@ test("a process the installation does not list is left alone", { skip: typeof pr
   const { out } = runChild([]);
   assert.equal(out.r.why, "not listed");
   if (out.visible) assert.deepEqual(out.visible.sort(), ["PROBE_SECRET_TOKEN", "PROBE_URL"]);
+});
+
+test("a child that inherits an isolated parent's mark still isolates itself", { skip: typeof process.execve !== "function" }, () => {
+  const { out, pid } = runChild(["probe"], { JORI_ENV_ISOLATED: "1" });
+  assert.equal(out.pid, pid);
+  assert.equal(out.r.why, "already", "it re-exec'd: the inherited mark names another pid");
+  if (out.visible) assert.deepEqual(out.visible, []);
 });
