@@ -641,11 +641,7 @@ TARGET="2026-04-21"   # the day that was missed (NOT today)
 **`watchdog.sh`'s automated same-morning self-heal** (described above) can't do this directly — it runs under plain cron, which has no GUI-session keychain access and therefore can't authenticate a `claude -p` fork (same constraint documented in `agent/CLAUDE.md` § Effort Policy for why a weekly Opus memo job needs a launchd user agent, not crontab). So it still dispatches through the webhook into the persistent, already-authenticated ops-agent session:
 
 ```bash
-TOKEN=$(cat ~/Dev/jori/secrets/webhook-token)
-curl -s -X POST http://localhost:9092 \
-  -H "Authorization: Bearer $TOKEN" \
-  -H "Content-Type: application/json" \
-  -d "{\"task\": \"DAILY SUMMARY $TARGET\", \"source\": \"watchdog-backfill\"}"
+~/Dev/jori/bin/jori dispatch --source watchdog-backfill --task "DAILY SUMMARY $TARGET"
 ```
 
 **Over SSH, `daily-summary-run` refuses with exit 4 (2026-10-13).** An SSH session sits outside the Mac's GUI security session, so it cannot reach the Max login in the login keychain and the fork could only die with "Not logged in" — which the auth/empty guard used to page to the system channel as if Max were down. The script now checks `SSH_CONNECTION`/`SSH_CLIENT` before the per-date lock: nothing is built, no lock taken, nothing paged; it prints the dispatch recipe above on stderr with the run's own task line (`DAILY SUMMARY <date>`, plus ` SILENT` if that was asked; `"source": "manual-backfill"` so an operator's dispatch is not mistaken for the watchdog's) and exits 4. If you are on SSH, use that dispatch. `DAILY_SUMMARY_ALLOW_SSH=1` overrides the check only when you have confirmed the keychain is reachable from your session.

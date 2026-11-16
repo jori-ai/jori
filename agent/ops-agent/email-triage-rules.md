@@ -422,10 +422,11 @@ When triaging a reply from the user's address on a Jori-originated thread (a dig
 Instead: label + star + mark read as a normal P2 personal email (it needs follow-through, so don't silence it), then dispatch it as its own top-level task so it gets a fresh turn and proper budget — the usual webhook dispatch shape:
 
 ```bash
-TOKEN=$(cat ~/Dev/jori/secrets/webhook-token) && curl -s -X POST http://localhost:9092 \
-  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
-  -d '{"task":"The user replied to <original subject> with an instruction: \"<verbatim instruction text>\". Context: <one-line summary of what the original email was about>. Follow the instruction.","source":"triage-reply-instruction"}'
+~/Dev/jori/bin/jori dispatch --source triage-reply-instruction \
+  --task 'The user replied to <original subject> with an instruction: "<verbatim instruction text>". Context: <one-line summary of what the original email was about>. Follow the instruction.'
 ```
+
+(`jori dispatch` reads the webhook token itself; an agent never reads `secrets/` — agent/CLAUDE.md § Secrets.)
 
 This only applies to genuine instructions — a plain acknowledgment ("thanks", "got it"), a question, or commentary with nothing actionable stays as ordinary triage (label + read, no dispatch). When in doubt about whether something rises to "instruction," lean toward dispatching — a redundant task that finds nothing to do is cheap; a silently dropped instruction is not.
 
