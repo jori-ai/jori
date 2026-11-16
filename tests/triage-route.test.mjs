@@ -17,13 +17,13 @@ const AGENTS = {
 };
 
 test("target: defaults to ops-light; 'ops'/null roll back; missing ports disable", () => {
-  assert.deepEqual(triageTargetFromConfig(AGENTS), { agent: "ops-light", webhookPort: 9082, healthPort: 9083 });
+  assert.deepEqual(triageTargetFromConfig(AGENTS, { local: undefined }), { agent: "ops-light", webhookPort: 9082, healthPort: 9083 });
   const roll = structuredClone(AGENTS); roll.agents.ops.gmailTriageTarget = "ops";
-  assert.equal(triageTargetFromConfig(roll), null);
+  assert.equal(triageTargetFromConfig(roll, { local: undefined }), null);
   const off = structuredClone(AGENTS); off.agents.ops.gmailTriageTarget = null;
-  assert.equal(triageTargetFromConfig(off), null);
+  assert.equal(triageTargetFromConfig(off, { local: undefined }), null);
   const bad = structuredClone(AGENTS); delete bad.agents["ops-light"].supervisor.webhookPort;
-  assert.equal(triageTargetFromConfig(bad), null);
+  assert.equal(triageTargetFromConfig(bad, { local: undefined }), null);
 });
 
 function fakeFetch({ healthy = true, postStatus = 200, throwOnPost = false } = {}) {
@@ -105,7 +105,7 @@ test("ClaudeSession passes the flag only when asked", () => {
 
 test("strict: config value 'strict' targets ops-light as the fallback", () => {
   const s = structuredClone(AGENTS); s.agents.ops.gmailTriageTarget = "strict";
-  assert.deepEqual(triageTargetFromConfig(s), { agent: "ops-light", webhookPort: 9082, healthPort: 9083, strict: true });
+  assert.deepEqual(triageTargetFromConfig(s, { local: undefined }), { agent: "ops-light", webhookPort: 9082, healthPort: 9083, strict: true });
 });
 
 test("strict: a finished one-shot is the whole route; a failed one falls back with what it did", async () => {
@@ -156,7 +156,7 @@ test("strict: at most strictMax one-shots at once; the rest go to ops-light", as
 
 test("strict-shadow: the dispatch is untouched and a dry one-shot runs alongside", async () => {
   const s = structuredClone(AGENTS); s.agents.ops.gmailTriageTarget = "strict-shadow";
-  const t = triageTargetFromConfig(s);
+  const t = triageTargetFromConfig(s, { local: undefined });
   assert.equal(t.shadow, true); assert.equal(t.strict, undefined);
   const { fn, calls } = fakeFetch();
   const runs = [];
@@ -186,4 +186,9 @@ test("strict: a run the supervisor never saw end is dispatched once by the sweep
   assert.ok(JSON.parse(post.init.body).task.startsWith("BODY"));
   assert.equal(fs.readdirSync(dir).length, 0);
   assert.equal(await route.sweepPending(), 0);           // once
+});
+
+test("the installation's gmail_triage_target overrides the kernel config", () => {
+  assert.equal(triageTargetFromConfig(AGENTS, { local: "strict-shadow" }).shadow, true);
+  assert.equal(triageTargetFromConfig(AGENTS, { local: "ops" }), null);
 });

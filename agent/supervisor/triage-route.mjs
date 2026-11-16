@@ -24,8 +24,10 @@
 // Fails toward delivery: if ops-light is unhealthy, or the POST fails, the item
 // goes to the local (ops) dispatcher exactly as before. Never drop an email.
 //
-// Config (agents.json → ops.gmailTriageTarget): "ops-light" (default) | "ops"
-// | "strict". Rollback: set it to "ops" and restart the ops supervisor.
+// Config (agents.json → ops.gmailTriageTarget, overridden by the installation's
+// agent/local/config/agents.json `gmail_triage_target`): "ops-light" (default)
+// | "ops" | "strict" | "strict-shadow". Read at supervisor start. Rollback: set
+// it to "ops" and restart the ops supervisor.
 //
 // "strict" (2026-11-16): each per-message item first runs the strict one-shot
 // (bin/email-triage-run: no shell, web or browser; tools bound to the one email;
@@ -46,6 +48,7 @@ import os from "node:os";
 import path from "node:path";
 import { execFile } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import { createRequire } from "node:module";
 
 const ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
 const RUNNER = path.join(ROOT, "bin", "email-triage-run");
@@ -80,9 +83,18 @@ export function strictFallbackNote(r) {
   return `\n\n[triage-route] A strict triage one-shot ran first and stopped (${r.why || "no result"}). It already did: ${done.join("; ")}. Do not repeat those; finish the rest.`;
 }
 
-export function triageTargetFromConfig(agentsConfig, { selfAgent = "ops" } = {}) {
+// The installation's own choice wins (agent/local/config/agents.json
+// `gmail_triage_target`), so trying "strict-shadow" or "strict" is not a kernel edit.
+function localTriageTarget() {
+  try {
+    const { localConfig } = createRequire(import.meta.url)("../../lib/instance.cjs");
+    return localConfig("agents", {}).gmail_triage_target;
+  } catch { return undefined; }
+}
+
+export function triageTargetFromConfig(agentsConfig, { selfAgent = "ops", local = localTriageTarget() } = {}) {
   const self = agentsConfig?.agents?.[selfAgent] || {};
-  const configured = self.gmailTriageTarget === undefined ? "ops-light" : self.gmailTriageTarget;
+  const configured = local !== undefined ? local : self.gmailTriageTarget === undefined ? "ops-light" : self.gmailTriageTarget;
   const strict = configured === "strict";
   const shadow = configured === "strict-shadow";
   const target = strict || shadow ? "ops-light" : configured;
