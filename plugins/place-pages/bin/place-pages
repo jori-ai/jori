@@ -56,6 +56,7 @@ async function main() {
       for (const p of r.new_places) console.log(`  + ${p.name} (${p.kind}) → ${p.page_id}${p.adopted ? " (existing page)" : ""}`);
       for (const a of r.aliases) console.log(`  = "${a.name}" is ${a.place}`);
       for (const p of r.private) console.log(`  - ${p.name}: ${p.kind}, no page`);
+      for (const k of r.skipped_small_hours || []) console.log(`  ~ ${k.date} ${k.name}: runs through the small hours, not counted as a visit`);
       for (const e of r.errors) console.log(`  ! ${e}`);
       return r.errors.length ? 1 : 0;
     }

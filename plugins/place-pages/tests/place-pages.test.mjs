@@ -282,3 +282,29 @@ test("only pages about a place are offered for adoption, never a rule or list th
   assert.match(prompts[0], /lounge_corner_cafe/);
   assert.doesNotMatch(prompts[0], /feedback_corner_cafe_access/);
 });
+
+test("a stop through the small hours at a daytime place is not a visit; at a bar it is", async () => {
+  assert.equal(pp.overlapsSmallHours("2026-10-21T21:54:00Z", "2026-10-22T06:16:00Z", "Etc/GMT-3"), true);  // 00:54–09:16 local
+  assert.equal(pp.overlapsSmallHours("2026-10-21T21:00:00Z", "2026-10-21T22:05:00Z", "Etc/GMT-3"), false); // 00:00–01:05 local
+  assert.equal(pp.overlapsSmallHours("2026-10-25T07:05:00Z", "2026-10-25T10:29:00Z", "Etc/GMT-3"), false);
+  const night = { type: "stop", start: "2026-11-08T07:00:00Z", start_ts_ms: Date.parse("2026-11-08T07:00:00Z"), end: "2026-11-08T12:00:00Z", duration_min: 300,
+    place: { name: "Corner Café", source: "user_confirmed", confidence: 1, ...at(5, 5) }, photos: [] };
+  DAY.intervals.push(night);
+  try {
+    for (const kind of ["cafe", "bar"]) {
+      const db = fakeDb({ photos: PHOTOS.map((p) => ({ ...p })) });
+      const wiki = fakeWiki();
+      const answer = (prompt) => {
+        const items = [...prompt.matchAll(/\[(\d+)\] "([^"]+)"/g)].map((m) => ({ i: Number(m[1]), name: m[2] })); // lang-regex-ok: reads our own prompt layout
+        return { stops: items.map((it) => ({ i: it.i, kind: it.name === "Corner Café" ? kind : "theater", same_as: null, page: null })) };
+      };
+      const r = await pp.sweep({ date: DAY.date, apply: true, deps: deps({ db, wiki, answer }) });
+      const place = db.t.places.find((p) => p.name === "Corner Café");
+      const visits = db.t.place_visits.filter((v) => v.place_id === place.id).length;
+      if (kind === "cafe") { assert.equal(visits, 1); assert.equal(r.skipped_small_hours.length, 1); }
+      else { assert.equal(visits, 2); assert.equal(r.skipped_small_hours.length, 0); }
+    }
+  } finally {
+    DAY.intervals.pop();
+  }
+});

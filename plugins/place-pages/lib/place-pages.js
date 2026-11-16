@@ -72,6 +72,12 @@ const DEFAULTS = {
   batch_size: 12,
   sonnet_budget: 10,
   thumb_fetch_limit: 300,
+  // A stop that runs through these local hours is not a visit to a daytime
+  // place: it is a night somewhere near it that the day named after it (a café
+  // 12 m from the flat took nights at the flat). Bars, venues and lodging are
+  // open then and keep their visits.
+  small_hours: [2, 5],
+  daytime_kinds: ["cafe", "bakery", "restaurant", "shop", "market", "museum", "gallery", "gym", "spa", "park", "beach", "attraction", "library", "worship", "other_public"],
 };
 
 const PUBLIC_KINDS = {
@@ -314,6 +320,20 @@ function validateAnswer(parsed, items) {
   return null;
 }
 
+/** True when [startIso, endIso) touches the local hours [from, to) in tz (15-minute steps). */
+function overlapsSmallHours(startIso, endIso, tz, [from, to] = DEFAULTS.small_hours) {
+  const a = Date.parse(startIso);
+  const b = endIso ? Date.parse(endIso) : a;
+  if (!Number.isFinite(a) || !Number.isFinite(b)) return false;
+  const hourOf = (ms) => Number(new Intl.DateTimeFormat("en-GB", { timeZone: tz || "UTC", hour: "2-digit", hourCycle: "h23" }).format(new Date(ms)));
+  for (let t = a; t <= b; t += 15 * 60e3) {
+    const h = hourOf(t);
+    if (h >= from && h < to) return true;
+  }
+  const h = hourOf(b);
+  return h >= from && h < to;
+}
+
 // ── Photos ──
 
 /** The user's own camera shots, minus documents and receipts (machine labels from the photo library). */
@@ -443,7 +463,7 @@ async function sweep({ dates = null, from = null, to = null, date = null, all = 
   if (!cfg.enabled) return { skipped: "place pages are off" };
   const now = deps.now();
   const days = dates || datesToSweep({ from, to, date, all, now, archiveDates: () => deps.archiveDates(), cfg });
-  const out = { dates: days.length, stops: 0, matched: 0, new_places: [], aliases: [], private: [], visits: 0, photos_linked: 0, thumbs_made: 0, pages: [], errors: [] };
+  const out = { dates: days.length, stops: 0, matched: 0, new_places: [], aliases: [], private: [], visits: 0, photos_linked: 0, thumbs_made: 0, pages: [], skipped_small_hours: [], errors: [] };
   const places = await loadPlaces(deps.request);
   const byId = new Map(places.map((p) => [p.id, p]));
 
@@ -542,7 +562,15 @@ async function sweep({ dates = null, from = null, to = null, date = null, all = 
   const touched = new Set();
   const thumbBudget = { left: cfg.thumb_fetch_limit };
   for (const d of days) {
-    const dayStops = stops.filter((s) => s.date === d && s.place_id && byId.get(s.place_id)?.page_id);
+    const daytime = new Set(cfg.daytime_kinds || []);
+    const dayStops = stops.filter((s) => {
+      if (s.date !== d || !s.place_id || !byId.get(s.place_id)?.page_id) return false;
+      if (daytime.has(byId.get(s.place_id).kind) && overlapsSmallHours(s.start, s.end, s.tz, cfg.small_hours)) {
+        out.skipped_small_hours.push({ date: d, name: s.name, start: s.start, end: s.end });
+        return false;
+      }
+      return true;
+    });
     const rows = await repo.photoRows(dayStops.flatMap((s) => s.photo_uuids), { request: deps.request });
     const meta = new Map(rows.map((r) => [r.uuid, r]));
     const visits = [];
@@ -671,5 +699,5 @@ async function setKind(placeId, kind, { deps = liveDeps(), log = () => {} } = {}
 module.exports = {
   TOOL, START, END, DEFAULTS, PUBLIC_KINDS, PRIVATE_KINDS, KINDS, PLACE_ENTITIES,
   config, slug, isPublic, liveDeps, datesToSweep, eligibleStops, matchStop, promptFor, validateAnswer,
-  keepPhoto, pickCover, renderBlock, replaceBlock, newPageMd, sweep, renderPlace, findPlaces, setKind, addDays,
+  keepPhoto, pickCover, overlapsSmallHours, renderBlock, replaceBlock, newPageMd, sweep, renderPlace, findPlaces, setKind, addDays,
 };
