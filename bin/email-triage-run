@@ -110,7 +110,7 @@ async function main() {
   for (const k of Object.keys(process.env)) if (!(k in env)) delete process.env[k];
   Object.assign(process.env, env);
 
-  let text = "", usage = null, err = null;
+  let text = "", usage = null, costUsd = null, err = null;
   try {
     const run = makeStatelessExecutor({
       model: MODELS.sonnet,
@@ -122,14 +122,14 @@ async function main() {
       allowedTools: TOOL_NAMES.map((t) => `mcp__email-triage__${t}`),
       timeoutMs: TIMEOUT_MS,
     });
-    ({ text, usage } = await run({ system: systemPrompt(), messages: [{ role: "user", content: p.content }] }));
+    ({ text, usage, cost_usd: costUsd = null } = await run({ system: systemPrompt(), messages: [{ role: "user", content: p.content }] }));
   } catch (e) { err = e; }
   const st = readState(stateFile);
   fs.rmSync(tmp, { recursive: true, force: true });
 
   const verdict = err ? { ok: false, why: `error: ${err.message}` } : judge({ text, actions: st.actions });
   const ms = Date.now() - t0;
-  const cost = usage?.total_cost_usd ?? null;
+  const cost = costUsd ?? usage?.total_cost_usd ?? null;
   const out = {
     ok: verdict.ok, why: verdict.why || null, text: String(text || "").trim().slice(0, 1500),
     actions: st.actions, calls: st.calls, escalated: st.escalated, cost_usd: cost, ms, dry: DRY,
