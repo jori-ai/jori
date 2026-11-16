@@ -271,7 +271,7 @@ Misheard names: `lib/call-vocabulary.mjs` gives the notes model in `meeting-note
 
 ## Security watch
 
-`cyber-watch`: security news (CISA advisories and KEV, HIBP, security RSS, per-provider news) checked against an exposure inventory (the host's runtimes, Homebrew, Docker and listening ports, plus every GitHub repo's lockfiles scanned on OSV.dev) before anything is sent. The alert lane every 3 h pings chat only when the user must act today; the weekly lane is a Monday email. Scripted (`bin/cyber-watch-run`), two tool-less Sonnet calls. Off until `agent/local/config/cyber-watch.json` (`enabled`, `profile`) and `agent/local/cyber-watch/providers.json` (`stack`, `vendors`).
+`cyber-watch`: security news (CISA advisories and KEV, HIBP, security RSS, per-provider news) checked against an exposure inventory (the host's runtimes, Homebrew, Docker and listening ports, plus every GitHub repo's lockfiles scanned on OSV.dev) before anything is sent; deterministic checks (`lib/cyber-checks.mjs`: host versions, off-host listener and sshd probes, a GitHub account audit, dependency reachability) settle the facts and code owns each item's status, the model writes the prose. The alert lane every 3 h pings chat only when the user must act today; the weekly lane is a Monday email. Scripted (`bin/cyber-watch-run`), two tool-less Sonnet calls. Off until `agent/local/config/cyber-watch.json` (`enabled`, `profile`) and `agent/local/cyber-watch/providers.json` (`stack`, `vendors`).
 
 ## Location and life log
 

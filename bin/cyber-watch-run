@@ -35,9 +35,12 @@ import { spawnSync } from "node:child_process";
 import path from "node:path";
 import {
   REPO, loadConfig, loadState, saveState, pruneState, fetchFeeds, fetchKev, fetchHibp, fetchVendorNews,
-  vendorForDomain, allVendors, vendorBrief, unseen, markSeen, localHour, inQuiet, articleText, cveIds, nvdCve,
+  vendorForDomain, allVendors, vendorBrief, unseen, markSeen, localHour, inQuiet, articleText, cveIds, nvdCve, saveWeeklyAudit,
 } from "../lib/cyber-watch.mjs";
 import { buildInventory, lookupSoftware, inventorySummary, osvScan, osvVuln } from "../lib/cyber-inventory.mjs";
+import {
+  hostVersionCheck, listenerCheck, sshAuthCheck, githubAudit, reachabilityCheck, commitAsOf, itemStatus, isThin, dedupeCandidates, lanAddress,
+} from "../lib/cyber-checks.mjs";
 import { sendHtmlEmail, labelDigest, ogCards, escapeHtml } from "../lib/digest-deliver.mjs";
 
 const require = createRequire(import.meta.url);
@@ -45,6 +48,12 @@ const { MODELS } = require("../lib/models.cjs");
 const { instance } = require("../lib/instance.cjs");
 const argv = process.argv.slice(2);
 const DRY = argv.includes("--dry-run");
+const argVal = (f) => (argv.includes(f) ? argv[argv.indexOf(f) + 1] : null);
+// Replay: --inventory-file <snapshot> checks against a saved inventory instead of
+// rebuilding it; --as-of <ISO time> reads lockfiles and repo trees at the default
+// branch's commit as of that moment. Both are for auditing a past run (dry-run).
+const INV_OVERRIDE = argVal("--inventory-file");
+const AS_OF = argVal("--as-of");
 const LANE = argv.includes("--vendors") ? "vendors" : argv.includes("--inventory") ? "inventory" : argv[argv.indexOf("--lane") + 1];
 const log = (m) => console.error(`${new Date().toISOString()} [cyber-watch:${LANE}] ${m}`);
 const DAY = 86400000;
@@ -65,10 +74,23 @@ Never invent facts that are not in the items. Write to the user directly as "you
 
 const SOFTWARE_FIELD = {
   type: "array", description: "the software/products this story is about, to look up in the user's inventory: npm/PyPI/Pub/crate package names exactly as published, Homebrew formula names, or one of these runtime keys: macos, node, python, php, openssh, chrome, docker, tailscale, ollama, git, gh, claude-code, op. Empty for a pure account breach.",
-  items: { type: "object", additionalProperties: false, required: ["name", "ecosystem"], properties: {
+  items: { type: "object", additionalProperties: false, required: ["name", "ecosystem", "fixed_versions"], properties: {
     name: { type: "string" },
+    fixed_versions: { type: "array", items: { type: "string" }, description: "fixed version numbers the items state for this software (one per release branch, e.g. git 2.50.2, 2.51.3), exactly as written; empty when none is stated" },
     ecosystem: { type: "string", enum: ["any", "npm", "PyPI", "Pub", "crates.io", "SwiftURL", "Go", "CocoaPods", "docker-image", "engine", "runtime", "homebrew"] },
   } },
+};
+
+// Indicators a story publishes, extracted as data so code can search for them
+// (the model reads the article; code does the matching).
+const IOC_FIELD = {
+  type: "object", additionalProperties: false, required: ["pr_titles", "branch_names", "targets_code_host"],
+  description: "indicators of compromise the items state, copied exactly; empty arrays when none",
+  properties: {
+    pr_titles: { type: "array", items: { type: "string" }, description: "pull-request titles the attackers used" },
+    branch_names: { type: "array", items: { type: "string" }, description: "branch names (or prefixes) the attackers used" },
+    targets_code_host: { type: "boolean", description: "true when the story is an attack on code-host accounts or repos (GitHub/GitLab: CI secrets, malicious PRs, stolen tokens)" },
+  },
 };
 
 async function judgeWith(opts) {
@@ -92,6 +114,7 @@ async function pool(items, n, fn) {
 // ------------------------------------------------------------ inventory
 
 async function ensureInventory(maxAgeH) {
+  if (INV_OVERRIDE) { log(`replay: inventory from ${INV_OVERRIDE}`); return JSON.parse(fs.readFileSync(INV_OVERRIDE, "utf8")); }
   let inv = null;
   try { inv = JSON.parse(fs.readFileSync(INV_FILE, "utf8")); } catch {}
   if (inv && Date.now() - Date.parse(inv.built_at) < maxAgeH * 3600000) return inv;
@@ -156,21 +179,20 @@ const VERDICT_SCHEMA = {
     // an affected mini filed under "doesn't affect you".
     properties: {
       id: { type: "string", description: "candidate id exactly as given" },
-      analysis: { type: "string", description: "2-4 plain sentences to the user as 'you': the issue in one clause, exactly what the inventory shows (machine, repos, versions, or that it is absent), and why that does or does not put the user at risk" },
+      analysis: { type: "string", description: "2-4 plain sentences to the user as 'you': the issue in one clause, then what the checks found (cite them), and why that does or does not put the user at risk" },
       applies: { type: "string", enum: ["yes", "no", "unclear"], description: "must agree with the analysis just written" },
       urgency: { type: "string", enum: ["now", "this_week", "routine", "none"] },
-      action: { type: "string", description: "concrete steps with versions or a command; 'Nothing to do.' when none" },
+      action: { type: "string", description: "concrete steps with versions or a command; for something no check could reach, the exact step for the user (where to click or what to run on which device); 'Nothing to do.' when none" },
     } } } },
 };
 
-const verdictSystem = () => `You check whether a security issue actually affects the user — their ${HOST()}, their code on GitHub, their accounts — using ONLY the evidence given: their exposure inventory (summary + exact lookups of the software each story names), the advisory/article text, NVD version ranges, and OSV records. Write to the user as "you".
-- applies "yes": the inventory shows an affected product at an affected version (compare the version against the affected/fixed ranges explicitly and say so), a malicious package present, or — for a provider story — the user has an account there and their data/credentials are plausibly in scope.
-- applies "no": the software is absent, or present at a fixed version, or the flaw needs something the user lacks (Windows, a public-facing server of that kind, a feature the user does not use, a port that only listens on localhost). Say what you checked.
-- applies "unclear": the evidence cannot settle it — ${OTHER_DEVICES()} (not inventoried), device firmware, a version the article does not give. Say exactly what to check, with one command if possible.
-- urgency "now": applies AND (actively exploited, or a malicious package, or credentials known stolen). "this_week": applies, serious, not known exploited; or a provider breach where rotating a password/key is prudent. "routine": applies but low risk — dev-only dependency, no exposure path, low severity, an unused/stale repo. "none": does not apply.
-- Dependency findings (OSV): a devDependency or a package only in a stale repo is at most "routine" unless malicious. A malicious package is always "now". Name the repos and the fixed version.
-- Write the analysis first, then set applies to match it. An inventory version inside the affected range (below the fixed version) is "yes", never "no".
-- Never invent versions, repos or facts. If a lookup came back empty, the software is not in the inventory — say "not found in your repos or on the ${HOST()}", not "you are safe" for ${OTHER_DEVICES()}.`;
+const verdictSystem = () => `You write the verdict on whether a security issue affects the user — their ${HOST()}, their code on GitHub, their accounts. Code has ALREADY run the checks that can be run; their results are in each candidate's "checks" ({check, status, result}: found = the problem is there, clean = checked and not there, n/a = the thing is absent or only reachable another way, error = the check could not run). Write to the user as "you".
+- The checks are facts. Never contradict one, never re-derive a version comparison a check already made, and cite what was checked and what it found in the analysis ("checked X: found Y").
+- Never tell the user to "check whether" something a check already covered. Anything no check could reach (${OTHER_DEVICES()}, a cloud console such as AWS IAM, a phone, account security settings, firmware) is "unclear": say exactly what to look at and where, as a step the user takes.
+- applies "yes": a check found it (status found), or the advisory plainly covers something the inventory shows at an affected version. "no": the checks came back clean or n/a, or the flaw needs something the user lacks (Windows, a server they do not run), or — for a provider story with no possible check — the provider's role shows nothing at stake (e.g. a dormant trial holding no secrets). "unclear": the rest.
+- urgency "now": applies AND (actively exploited, a malicious package, or credentials known stolen). "this_week": applies and serious; or a provider breach where rotating a password/key is prudent. "routine": applies but low risk. "none": does not apply.
+- A provider story: use the provider's role (given) to judge what is at stake; never claim the user's data was taken unless the story says so.
+- Write the analysis first, then set applies to match it. Never invent versions, repos or facts.`;
 
 // Small batches, then a one-at-a-time retry for any candidate the model skipped:
 // the first weekly dry run (2026-10-23) sent 17 stories in one call and got 2
@@ -202,25 +224,120 @@ async function verdicts(cands, inv, { batch = 5, timeoutMs = 420000 } = {}) {
   return out;
 }
 
-/** Evidence for one news candidate: article text, NVD ranges for its CVEs, inventory lookups. */
-async function newsEvidence(c, inv, { articleCap }) {
+// ------------------------------------------------------------------ checks
+
+// One run's shared check context: the GitHub audit runs at most once per IOC
+// set, the listener probe once.
+function checkContext(cfg, inv) {
+  return { cfg, inv, ghCache: new Map(), listeners: null, ssh: null, lanIp: lanAddress() };
+}
+
+function auditGithub(ctx, iocs) {
+  const key = JSON.stringify([...(iocs?.pr_titles || [])].sort().concat("|", [...(iocs?.branch_names || [])].sort()));
+  if (!ctx.ghCache.has(key)) {
+    log(`GitHub audit (${key.length > 6 ? "with IOCs" : "posture only"}) over ${(ctx.inv.repos || []).length} repos`);
+    ctx.ghCache.set(key, githubAudit({ owner: instance().github_owner, repos: ctx.inv.repos, iocs, trusted: ctx.cfg.github_trusted_authors || [] }));
+  }
+  return ctx.ghCache.get(key);
+}
+
+const RUNTIME_ALIASES = { "google-chrome": "chrome", chromium: "chrome", "mac-os": "macos", "mac os": "macos", "node.js": "node", nodejs: "node", ssh: "openssh", "open-ssh": "openssh" };
+
+/** Run every check that applies to a news candidate; returns [{check, status, result}]. */
+async function runChecks(c, ctx, nvd) {
+  const checks = [];
+  const runtimes = ctx.inv.host?.runtimes || {};
+  const keys = [];
+  const fixed = {};
+  for (const sw of c.software || []) {
+    const n = String(sw.name || "").toLowerCase();
+    const k = RUNTIME_ALIASES[n] || n;
+    if (!(k in runtimes)) continue;
+    keys.push(k);
+    if (k === "openssh" && "sshd" in runtimes) keys.push("sshd");
+    if (sw.fixed_versions?.length) { fixed[k] = sw.fixed_versions; if (k === "openssh") fixed.sshd = sw.fixed_versions; }
+  }
+  if (keys.length) checks.push(...hostVersionCheck(ctx.inv, keys, { nvd, fixedFromArticle: fixed, host: HOST() }));
+  if (keys.includes("openssh")) {
+    ctx.ssh ||= sshAuthCheck(ctx.lanIp, { host: HOST() });
+    checks.push(ctx.ssh);
+  }
+  const iocs = c.iocs || {};
+  const github = iocs.targets_code_host || iocs.pr_titles?.length || iocs.branch_names?.length || (c.providers || []).some((p) => /^github$/i.test(p.name)) || /^github$/i.test(c.provider || ""); // lang-regex-ok: exact provider-name identity
+  if (github) checks.push(...auditGithub(ctx, iocs));
+  return checks;
+}
+
+/** Evidence for one news candidate: article text, NVD ranges, inventory lookups, and the code checks. */
+async function newsEvidence(c, inv, { articleCap, ctx }) {
   const first = c.items.find((i) => i.link && !i.link.includes("news.google.com/")) || c.items[0];
   const article = await articleText(first?.link, articleCap);
   const cves = cveIds([...c.items.map((i) => `${i.title} ${i.summary}`), article || ""].join(" ")).slice(0, 3);
   const nvd = (await pool(cves, 3, nvdCve)).filter(Boolean);
   const hits = lookupSoftware(inv, c.software).slice(0, 12);
+  c.checks = await runChecks(c, ctx, nvd);
+  c.article_found = !!article;
   return {
-    id: c.id, kind: c.kind, headline: c.headline, provider: c.provider || null,
-    provider_role: c.provider ? c.providerRole || null : null,
+    id: c.id, kind: c.kind, headline: c.headline,
+    providers: (c.providers || (c.provider ? [{ name: c.provider, role: c.providerRole || null }] : [])),
     context: c.context || null,
     story: c.items.slice(0, 3).map((i) => ({ title: i.title, summary: i.summary, published: i.published })),
-    article, nvd,
+    article, nvd: nvd.map(({ ranges, ...rest }) => rest),
     software_named: c.software, inventory_lookups: hits.length ? hits : `none of the named software was found in the user's repos or on the ${HOST()}`,
+    checks: c.checks,
   };
 }
 
-function depCandidate(f, id) {
-  return { id, kind: "dependency", headline: `${f.name} (${f.eco}) ${f.versions.join(", ")}`, repos: f.repos, uses: f.uses, runtime_dependency: f.runtime, repo_active_last_120d: f.active, osv: f.vulns };
+/** Reachability checks for one dependency finding (npm package-locks; other ecosystems report "not checked"). */
+function depChecks(f, ctx) {
+  const owner = instance().github_owner;
+  const out = [];
+  const uses = f.uses.filter((u) => !u.dev).slice(0, 3);
+  if (f.eco !== "npm") return [{ check: `reachability of ${f.name}`, status: "error", result: `no reachability checker for ${f.eco} yet` }];
+  for (const u of uses) {
+    if (!/package-lock\.json$|npm-shrinkwrap\.json$/.test(u.file)) { out.push({ check: `reachability of ${f.name} in ${u.repo}/${u.file}`, status: "error", result: "only package-lock files are traced so far" }); continue; } // lang-regex-ok: lockfile name
+    const ref = AS_OF ? commitAsOf(owner, u.repo, AS_OF) : null;
+    out.push(reachabilityCheck({ owner, repo: u.repo, file: u.file, name: f.name, version: u.version, ref }));
+  }
+  if (!uses.length) out.push({ check: `reachability of ${f.name}`, status: "clean", result: `dev-only in ${f.repos.join(", ")}` });
+  return out;
+}
+
+function depCandidate(f, id, checks) {
+  return { id, kind: "dependency", headline: `${f.name} (${f.eco}) ${f.versions.join(", ")}`, repos: f.repos, uses: f.uses, runtime_dependency: f.runtime, repo_active_last_120d: f.active, osv: f.vulns, checks };
+}
+
+/** The host's own off-host exposures, as items with code-written verdicts (no model call). */
+async function hostExposureItems(ctx) {
+  ctx.listeners ||= await listenerCheck(ctx.inv, { lanIp: ctx.lanIp, repo: REPO, host: HOST() });
+  ctx.ssh ||= sshAuthCheck(ctx.lanIp, { host: HOST() }); // a refused port 22 comes back clean
+  const items = [];
+  for (const l of ctx.listeners.filter((x) => x.status === "found")) {
+    const own = l.data?.own;
+    items.push({
+      id: `h:${l.data.port}`, event_key: `host-listener:${l.data.port}`, kind: "host_exposure", status: "exposed",
+      headline: `Port ${l.data.port} on the ${HOST()} answers anyone on your network`,
+      title: l.check, link: null, checks: [l],
+      verdict: {
+        applies: "yes", urgency: own ? "this_week" : "routine",
+        analysis: `Checked: ${l.check} — ${l.result}. ${own ? "This is one of your assistant's own services, and" : "This"} nothing asks the caller who they are, so any device on the same network can use it.`,
+        action: own ? "Bind it to 127.0.0.1 (plus the tailnet address if your other devices need it) and refuse other callers; lib/net-trust.cjs has the checks." : `If you don't need it, stop it (${(l.data?.command || l.data?.process || "").slice(0, 100)}); otherwise bind it to 127.0.0.1.`,
+      },
+    });
+  }
+  if (ctx.ssh?.status === "found") items.push({
+    id: "h:ssh", event_key: "host-sshd-password-auth", kind: "host_exposure", status: "exposed",
+    headline: `SSH on the ${HOST()} still accepts passwords`, title: ctx.ssh.check, link: null, checks: [ctx.ssh],
+    verdict: { applies: "yes", urgency: "routine", analysis: `Checked: ${ctx.ssh.check} — ${ctx.ssh.result}. Anyone on the network can try to guess the password.`, action: "Add /etc/ssh/sshd_config.d/200-hardening.conf with `PasswordAuthentication no` and `KbdInteractiveAuthentication no` (needs sudo), after confirming key login works." },
+  });
+  return items;
+}
+
+/** Code owns the status; the model's urgency is clamped to it. */
+function finalize(c, v) {
+  const status = itemStatus(c.checks || [], v.applies);
+  const urgency = status === "clean" ? "none" : status === "exposed" && v.urgency === "none" ? "this_week" : v.urgency;
+  return { ...v, status, urgency, applies: status === "exposed" ? "yes" : status === "clean" ? "no" : "unclear" };
 }
 
 // ---------------------------------------------------------------- alert lane
@@ -230,7 +347,7 @@ const TRIAGE_SCHEMA = {
   properties: {
     candidates: { type: "array", items: {
       type: "object", additionalProperties: false,
-      required: ["event_key", "kind", "headline", "item_ids", "provider", "software"],
+      required: ["event_key", "kind", "headline", "item_ids", "provider", "software", "iocs"],
       properties: {
         event_key: { type: "string", description: "stable kebab-case slug for the underlying event, e.g. railway-env-var-breach-2026-10 — the same story from another outlet gets the same key" },
         kind: { type: "string", enum: ["top_event", "provider_hit"] },
@@ -238,6 +355,7 @@ const TRIAGE_SCHEMA = {
         headline: { type: "string", description: "plain words, at most 9 words, topic first" },
         item_ids: { type: "array", items: { type: "string" }, description: "ids of the items this rests on (1-3)" },
         software: SOFTWARE_FIELD,
+        iocs: IOC_FIELD,
       } } },
   },
 };
@@ -303,22 +421,24 @@ Never repeat an event already in already_alerted (same underlying event = same s
     return;
   }
 
+  const ctx = checkContext(cfg, inv);
+  const depCks = newDeps.slice(0, 5).map((f) => depChecks(f, ctx));
   const evidence = [
-    ...(await pool(triaged, 3, (c) => newsEvidence(c, inv, { articleCap: 7000 }))),
-    ...newDeps.slice(0, 5).map((f, k) => depCandidate(f, `d${k + 1}`)),
+    ...(await pool(triaged, 3, (c) => newsEvidence(c, inv, { articleCap: 7000, ctx }))),
+    ...newDeps.slice(0, 5).map((f, k) => depCandidate(f, `d${k + 1}`, depCks[k])),
   ];
   log(`checking ${evidence.length} candidate(s) against the inventory`);
   const vmap = await verdicts(evidence, inv);
 
   const checked = [
     ...triaged.map((c) => ({ ...c, verdict: vmap.get(c.id), link: (c.items.find((i) => i.link && !i.link.includes("news.google.com/")) || c.items[0]).link })),
-    ...newDeps.slice(0, 5).map((f, k) => ({ id: `d${k + 1}`, event_key: `dep:${f.key}:${f.ids[0]}`, kind: "dependency", headline: `${f.name} ${f.versions.join("/")} in ${f.repos.slice(0, 3).join(", ")}`, verdict: vmap.get(`d${k + 1}`), link: `https://osv.dev/vulnerability/${f.ids[0]}` })),
-  ].filter((c) => c.verdict);
+    ...newDeps.slice(0, 5).map((f, k) => ({ id: `d${k + 1}`, event_key: `dep:${f.key}:${f.ids[0]}`, kind: "dependency", headline: `${f.name} ${f.versions.join("/")} in ${f.repos.slice(0, 3).join(", ")}`, checks: depCks[k], verdict: vmap.get(`d${k + 1}`), link: `https://osv.dev/vulnerability/${f.ids[0]}` })),
+  ].filter((c) => c.verdict).map((c) => ({ ...c, verdict: finalize(c, c.verdict) }));
   // Chat is for urgent impact only: "this week" and below wait for Monday's email.
-  const toSend = checked.filter((c) => ["yes", "unclear"].includes(c.verdict.applies) && c.verdict.urgency === "now")
+  const toSend = checked.filter((c) => c.verdict.status !== "clean" && c.verdict.urgency === "now" && !isThin(c.items || []))
     .sort((a, b) => URGENCY_ORDER[a.verdict.urgency] - URGENCY_ORDER[b.verdict.urgency]).slice(0, cfg.alert.max_alerts_per_run);
 
-  if (DRY) { console.log(JSON.stringify({ tz, hour, new_items: fresh.length, new_dependency_findings: newDeps.length, checked: checked.map((c) => ({ headline: c.headline, kind: c.kind, ...c.verdict, sent: toSend.includes(c) })) }, null, 2)); return; }
+  if (DRY) { console.log(JSON.stringify({ tz, hour, new_items: fresh.length, new_dependency_findings: newDeps.length, checked: checked.map((c) => ({ headline: c.headline, kind: c.kind, ...c.verdict, checked: c.checks || [], sent: toSend.includes(c) })) }, null, 2)); return; }
 
   if (toSend.length) {
     const lines = [toSend.length === 1 ? "Urgent security issue — this one affects you:" : `Urgent security issues — ${toSend.length} affect you:`];
@@ -328,7 +448,7 @@ Never repeat an event already in already_alerted (same underlying event = same s
   const at = new Date().toISOString();
   for (const c of checked) {
     state.alerted.push({ event_key: c.event_key, headline: c.headline, kind: c.kind, provider: c.provider || null, at, sent: toSend.includes(c) });
-    state.checked.push({ event_key: c.event_key, headline: c.headline, kind: c.kind, link: c.link, ...c.verdict, sent: toSend.includes(c), at });
+    state.checked.push({ lane: "alert", event_key: c.event_key, headline: c.headline, kind: c.kind, link: c.link, ...c.verdict, checked: (c.checks || []).map(({ check, status, result }) => ({ check, status, result })), sent: toSend.includes(c), at });
   }
   log(`checked ${checked.length}: ${checked.map((c) => `${c.event_key}=${c.verdict.applies}/${c.verdict.urgency}`).join(", ")}; sent ${toSend.length}`);
   // A story whose check failed stays unseen, so the next run triages and checks it again.
@@ -345,16 +465,21 @@ const WEEKLY_SCHEMA = {
   type: "object", additionalProperties: false, required: ["top_events", "provider_impacts", "new_providers"],
   properties: {
     top_events: { type: "array", description: "the 3-6 biggest security events of the week, most important first", items: {
-      type: "object", additionalProperties: false, required: ["headline", "summary", "item_ids", "software"],
+      type: "object", additionalProperties: false, required: ["event_key", "headline", "summary", "item_ids", "software", "providers", "iocs"],
       properties: {
+        event_key: { type: "string", description: "stable kebab-case slug for the underlying event; a provider_impacts entry about the same event MUST reuse it" },
+        providers: { type: "array", items: { type: "string" }, description: "providers from the user's list this event touches, exactly as listed; empty if none" },
+        iocs: IOC_FIELD,
         headline: { type: "string" },
         summary: { type: "string", description: "2-3 plain sentences: what happened" },
         item_ids: { type: "array", items: { type: "string" } },
         software: SOFTWARE_FIELD,
       } } },
     provider_impacts: { type: "array", description: "every provider in the user's list that a story this week is genuinely about; empty if none", items: {
-      type: "object", additionalProperties: false, required: ["provider", "headline", "what_happened", "item_ids", "software"],
+      type: "object", additionalProperties: false, required: ["event_key", "provider", "headline", "what_happened", "item_ids", "software", "iocs"],
       properties: {
+        event_key: { type: "string", description: "stable kebab-case slug; the same as the top event's when it is the same event" },
+        iocs: IOC_FIELD,
         provider: { type: "string", description: "exactly as in the provider list" },
         headline: { type: "string" },
         what_happened: { type: "string" },
@@ -430,32 +555,49 @@ async function weeklyLane(cfg, state) {
     effort: "medium", timeoutMs: 900000, schema: WEEKLY_SCHEMA,
     system: `You prepare the user's weekly security briefing. A later step checks every item you pick against their real systems and code, so pick on importance. ${relevanceRules()}
 From the week's items: pick the 3-6 biggest TOP EVENTS of the week, and list EVERY provider in the user's list that a story is genuinely about (a Google News hit returned for a provider's name is only a candidate; drop it if the story is not really about a security problem at that provider). For each, name the software it is about. Cite items by id.
-One entry per underlying event: a provider hit that is the same event as a top event goes under the top event only, and one event touching several providers (e.g. a breach exposing OpenAI, Google and Anthropic keys) is ONE entry naming them all, never one per provider.
+One entry per underlying event: a provider hit that is the same event as a top event goes under the top event only (list the provider in the top event's providers and reuse its event_key), and one event touching several providers (e.g. a breach exposing OpenAI, Google and Anthropic keys) is ONE entry naming them all, never one per provider.
 Also give one verdict for each merchant in new_merchants (payees from the user's statements not yet in the list; ignore categories: ${cfg.ignore_merchants.join("; ")}).`,
     prompt: JSON.stringify({ providers: vendorBrief(vendors), stack: cfg.stack, items: rowsForModel, new_merchants: candidates }),
   });
 
   const refs = (ids) => (ids || []).map((id) => byShort.get(id)).filter((x) => x && x.link);
-  const newsCands = [
-    ...(res.top_events || []).map((t, k) => ({ id: `t${k + 1}`, kind: "top_event", headline: t.headline, context: t.summary, software: t.software, items: refs(t.item_ids) })),
-    ...(res.provider_impacts || []).filter((p) => vendors.some((v) => v.name === p.provider))
-      .map((p, k) => ({ id: `p${k + 1}`, kind: "provider_hit", provider: p.provider, providerRole: vendors.find((v) => v.name === p.provider)?.role, headline: `${p.provider}: ${p.headline}`, context: p.what_happened, software: p.software, items: refs(p.item_ids) })),
-  ].filter((c) => c.items.length);
+  const roleOf = (name) => vendors.find((v) => v.name === name)?.role || null;
+  const known = (name) => vendors.some((v) => v.name === name);
+  // One candidate per event, BEFORE any verdict: a provider hit that is the same
+  // event as a top event folds into it (2026-11-16: GitHub, Qubole and Apple each
+  // appeared twice, and Railway landed under both "affects you" and "doesn't").
+  const { top, prov } = dedupeCandidates(
+    (res.top_events || []).map((t) => ({ kind: "top_event", event_key: t.event_key, headline: t.headline, context: t.summary, software: t.software, iocs: t.iocs, items: refs(t.item_ids),
+      providers: (t.providers || []).filter(known).map((n) => ({ name: n, role: roleOf(n) })) })),
+    (res.provider_impacts || []).filter((p) => known(p.provider)).map((p) => ({ kind: "provider_hit", event_key: p.event_key, provider: p.provider, providerRole: roleOf(p.provider),
+      headline: `${p.provider}: ${p.headline}`, context: p.what_happened, software: p.software, iocs: p.iocs, items: refs(p.item_ids) })),
+  );
+  const allNews = [...top, ...prov].filter((c) => c.items.length).map((c, k) => ({ ...c, id: `n${k + 1}` }));
+  // A single Google News hit with no article behind it is a rumour, not a finding: it goes on the "watching" line unchecked.
+  const watching = allNews.filter((c) => isThin(c.items));
+  const newsCands = allNews.filter((c) => !isThin(c.items));
 
+  const ctx = checkContext(cfg, inv);
   const findings = osvFindings(inv).filter((f) => f.rank >= 3).slice(0, cfg.weekly.max_dependency_findings ?? 25);
-  const depCands = findings.map((f, k) => depCandidate(f, `d${k + 1}`));
-  const newsEv = await pool(newsCands, 4, (c) => newsEvidence(c, inv, { articleCap: 3000 }));
-  log(`checking ${newsEv.length} stories + ${depCands.length} dependency findings against the inventory`);
+  const reachN = cfg.weekly.max_reachability_checks ?? 12;
+  const depCks = findings.map((f, k) => (k < reachN && f.runtime ? depChecks(f, ctx) : [{ check: `reachability of ${f.name}`, status: f.runtime ? "error" : "clean", result: f.runtime ? "not traced this week (below the top findings)" : `dev-only in ${f.repos.join(", ")}` }]));
+  const depCands = findings.map((f, k) => depCandidate(f, `d${k + 1}`, depCks[k]));
+  const newsEv = await pool(newsCands, 4, (c) => newsEvidence(c, inv, { articleCap: 3000, ctx }));
+  const hostItems = await hostExposureItems(ctx);
+  log(`checking ${newsEv.length} stories + ${depCands.length} dependency findings; ${hostItems.length} host exposure(s); ${watching.length} thin item(s) to the watching line`);
   const [vNews, vDeps] = await Promise.all([verdicts(newsEv, inv), verdicts(depCands, inv)]);
 
   const link = (c) => (c.items.find((i) => !i.link.includes("news.google.com/")) || c.items[0]).link;
-  const checkedNews = newsCands.map((c) => ({ ...c, verdict: vNews.get(c.id), link: link(c), title: c.items[0].title })).filter((c) => c.verdict);
-  const checkedDeps = findings.map((f, k) => ({ id: `d${k + 1}`, kind: "dependency", headline: `${f.name} ${f.versions.join(" / ")} — ${f.repos.slice(0, 4).join(", ")}${f.repos.length > 4 ? ` +${f.repos.length - 4}` : ""}`, verdict: vDeps.get(`d${k + 1}`), link: `https://osv.dev/vulnerability/${f.ids[0]}`, title: f.vulns[0]?.summary || f.ids[0] })).filter((c) => c.verdict);
+  const checkedNews = newsCands.filter((c) => vNews.get(c.id)).map((c) => ({ ...c, verdict: finalize(c, vNews.get(c.id)), link: link(c), title: c.items[0].title }));
+  const checkedDeps = findings.map((f, k) => ({ id: `d${k + 1}`, event_key: `dep:${f.key}`, kind: "dependency", checks: depCks[k], headline: `${f.name} ${f.versions.join(" / ")} — ${f.repos.slice(0, 4).join(", ")}${f.repos.length > 4 ? ` +${f.repos.length - 4}` : ""}`, raw: vDeps.get(`d${k + 1}`), link: `https://osv.dev/vulnerability/${f.ids[0]}`, title: f.vulns[0]?.summary || f.ids[0] }))
+    .filter((c) => c.raw).map(({ raw, ...c }) => ({ ...c, verdict: finalize(c, raw) }));
+  const hostChecked = hostItems.map((h) => ({ ...h, verdict: { ...h.verdict, status: "exposed" } }));
   const bySev = (a, b) => URGENCY_ORDER[a.verdict.urgency] - URGENCY_ORDER[b.verdict.urgency];
-  const affects = checkedNews.filter((c) => c.verdict.applies !== "no").sort(bySev);
-  const depAffects = checkedDeps.filter((c) => c.verdict.applies !== "no").sort(bySev);
-  const notAffecting = [...checkedNews, ...checkedDeps].filter((c) => c.verdict.applies === "no");
-  const pressing = [...affects, ...depAffects].filter((c) => ["now", "this_week"].includes(c.verdict.urgency));
+  const affects = [...hostChecked, ...checkedNews.filter((c) => c.verdict.status === "exposed")].sort(bySev);
+  const needsYou = checkedNews.filter((c) => c.verdict.status === "needs_you").sort(bySev);
+  const depAffects = checkedDeps.filter((c) => c.verdict.status !== "clean").sort((a, b) => (a.verdict.status === "exposed" ? 0 : 1) - (b.verdict.status === "exposed" ? 0 : 1) || bySev(a, b));
+  const notAffecting = [...checkedNews, ...checkedDeps].filter((c) => c.verdict.status === "clean");
+  const pressing = [...affects, ...depAffects.filter((c) => c.verdict.status === "exposed")].filter((c) => ["now", "this_week"].includes(c.verdict.urgency));
 
   const candSet = new Set(candidates.map((c) => c.merchant));
   const merchantVerdicts = (res.new_providers || []).filter((n) => candSet.has(n.merchant));
@@ -463,38 +605,49 @@ Also give one verdict for each merchant in new_merchants (payees from the user's
 
   const summaryLine = pressing.length
     ? `${pressing.length} item${pressing.length === 1 ? "" : "s"} need${pressing.length === 1 ? "s" : ""} action — ${pressing.slice(0, 2).map((c) => c.headline).join("; ")}${pressing.length > 2 ? "; …" : ""}`
-    : affects.length + depAffects.length ? "Nothing urgent this week; a few low-priority items are below." : "Nothing this week affects your systems, code or accounts.";
+    : affects.length + depAffects.length + needsYou.length ? "Nothing urgent this week; a few items are below." : "Nothing this week affects your systems, code or accounts.";
 
-  if (DRY) {
-    const show = (c) => ({ headline: c.headline, applies: c.verdict.applies, urgency: c.verdict.urgency, analysis: c.verdict.analysis, action: c.verdict.action });
-    console.log(JSON.stringify({ summaryLine, affects: affects.map(show), dependencies: depAffects.map(show), not_affecting: notAffecting.map(show), added, rejected: merchantVerdicts.length - added.length }, null, 2));
-    return;
-  }
+  const rowOf = (c) => ({ event_key: c.event_key || c.id, kind: c.kind, headline: c.headline, link: c.link, status: c.verdict.status, applies: c.verdict.applies, urgency: c.verdict.urgency,
+    analysis: c.verdict.analysis, action: c.verdict.action, providers: c.providers || [], checked: (c.checks || []).map(({ check, status, result }) => ({ check, status, result })) });
+  const record = {
+    lane: "weekly", at: new Date().toISOString(), replay: INV_OVERRIDE ? { inventory: INV_OVERRIDE, as_of: AS_OF } : null, inventory_built_at: inv.built_at, summaryLine,
+    affects: affects.map(rowOf), needs_you: needsYou.map(rowOf), dependencies: depAffects.map(rowOf), not_affecting: notAffecting.map(rowOf),
+    watching: watching.map((c) => ({ headline: c.headline, link: c.items[0]?.link, providers: c.providers || [] })),
+    listeners: ctx.listeners, added, rejected: merchantVerdicts.length - added.length,
+  };
+  if (DRY) { console.log(JSON.stringify(record, null, 2)); return; }
 
   const dateHuman = new Intl.DateTimeFormat("en-US", { timeZone: instance().tz, month: "short", day: "numeric" }).format(new Date());
   const subject = `Cyber Watch — week of ${dateHuman}`;
   const F = "font-family:-apple-system,Segoe UI,Arial,sans-serif";
   const color = { now: "#b42318", this_week: "#b54708", routine: "#475467", none: "#667085" };
   // Every content URL renders through og-card (ops-agent CLAUDE.md) — one card per news item; dependency links stay plain.
-  const cardUrls = affects.map((c) => c.link);
+  const cardUrls = [...affects, ...needsYou].map((c) => c.link).filter(Boolean);
   const cards = new Map(ogCards(cardUrls).map((h, k) => [cardUrls[k], h]));
-  const badge = (v) => `<span style="color:${color[v.urgency]};font-size:12px;text-transform:uppercase;font-weight:600">${escapeHtml(v.applies === "unclear" ? `check · ${URGENCY_LABEL[v.urgency]}` : URGENCY_LABEL[v.urgency])}</span>`;
+  const STATUS_LABEL = { exposed: "", needs_you: "needs you · ", clean: "" };
+  const badge = (v) => `<span style="color:${color[v.urgency]};font-size:12px;text-transform:uppercase;font-weight:600">${escapeHtml(`${STATUS_LABEL[v.status] || ""}${URGENCY_LABEL[v.urgency]}`)}</span>`;
+  const MARK = { found: "✗", clean: "✓", "n/a": "–", error: "?" };
+  const checkList = (c) => (c.checks || []).length ? `<ul style="font-size:12px;color:#475467;margin:4px 0;padding-left:16px">${c.checks.slice(0, 8).map((k) => `<li>${MARK[k.status] || ""} ${escapeHtml(k.check)}: ${escapeHtml(k.result)}</li>`).join("")}</ul>` : "";
   const card = (c, withOg) => [
     `<div style="border-left:4px solid ${color[c.verdict.urgency]};padding:4px 12px;margin:12px 0">`,
     `<div style="font-size:15px"><b>${escapeHtml(c.headline)}</b> ${badge(c.verdict)}</div>`,
     `<div style="font-size:14px;margin-top:2px">${escapeHtml(c.verdict.analysis)}</div>`,
+    checkList(c),
     `<div style="font-size:14px;margin-top:2px"><b>What to do:</b> ${escapeHtml(c.verdict.action)}</div>`,
-    withOg ? (cards.get(c.link) || "") : `<div style="font-size:12px"><a href="${escapeHtml(c.link)}" style="color:#1a56db">${escapeHtml(String(c.title).slice(0, 110))}</a></div>`,
+    !c.link ? "" : withOg ? (cards.get(c.link) || "") : `<div style="font-size:12px"><a href="${escapeHtml(c.link)}" style="color:#1a56db">${escapeHtml(String(c.title).slice(0, 110))}</a></div>`,
     `</div>`].join("");
+  const h2 = (t) => `<h2 style="font-size:17px;margin:22px 0 8px">${t}</h2>`;
   const html = [`<div style="${F};max-width:660px;color:#222;line-height:1.5">`,
     `<p style="font-size:15px"><b>${escapeHtml(summaryLine)}</b></p>`,
-    `<p style="font-size:13px;color:#475467">Every item below was checked against what you actually run: the ${escapeHtml(HOST())} (${escapeHtml(inv.host?.runtimes?.macos ? `macOS ${inv.host.runtimes.macos}` : "macOS")}, its runtimes, Homebrew and Docker) and the ${(inv.repos || []).length} repos on your GitHub, whose lockfiles were also scanned against the OSV vulnerability database. ${escapeHtml(OTHER_DEVICES().replace(/^./, (c) => c.toUpperCase()))} ${CFG.uninventoried ? "is" : "are"} not inventoried.</p>`,
-    `<h2 style="font-size:17px;margin:22px 0 8px">Affects you</h2>`,
-    affects.length ? affects.map((c) => card(c, true)).join("\n") : `<p style="font-size:14px">None of this week's security news affects your systems, code or accounts.</p>`,
-    depAffects.length ? `<h2 style="font-size:17px;margin:22px 0 8px">Vulnerable dependencies in your code</h2>` + depAffects.map((c) => card(c, false)).join("\n") : "",
-    notAffecting.length ? `<h2 style="font-size:17px;margin:22px 0 8px">Checked — doesn't affect you</h2><ul style="font-size:13px;color:#344054;padding-left:18px">` +
+    `<p style="font-size:13px;color:#475467">Every item below was checked by code where a check is possible: versions on the ${escapeHtml(HOST())} (${escapeHtml(inv.host?.runtimes?.macos ? `macOS ${inv.host.runtimes.macos}` : "macOS")}), its listening ports probed from the network, the ${(inv.repos || []).length} repos on your GitHub (lockfiles scanned against OSV, reachability traced, and an account audit when a story targets GitHub). ✓ checked clean, ✗ found, ? couldn't check. ${escapeHtml(OTHER_DEVICES().replace(/^./, (c) => c.toUpperCase()))} ${CFG.uninventoried ? "is" : "are"} not inventoried, so those items are under "Needs you".</p>`,
+    h2("Affects you"),
+    affects.length ? affects.map((c) => card(c, true)).join("\n") : `<p style="font-size:14px">No check found anything affecting your systems, code or accounts this week.</p>`,
+    needsYou.length ? h2("Needs you — only you can check these") + needsYou.map((c) => card(c, true)).join("\n") : "",
+    depAffects.length ? h2("Vulnerable dependencies in your code") + depAffects.map((c) => card(c, false)).join("\n") : "",
+    watching.length ? h2("Watching") + `<p style="font-size:13px;color:#344054">Single unconfirmed reports, not checked: ${watching.map((c) => `<a href="${escapeHtml(c.items[0].link)}" style="color:#1a56db">${escapeHtml(c.headline)}</a>`).join(" · ")}.</p>` : "",
+    notAffecting.length ? h2("Checked — doesn't affect you") + `<ul style="font-size:13px;color:#344054;padding-left:18px">` +
       notAffecting.map((c) => `<li style="margin:4px 0"><b>${escapeHtml(c.headline)}</b> — ${escapeHtml(c.verdict.analysis)} <a href="${escapeHtml(c.link)}" style="color:#1a56db">source</a></li>`).join("") + "</ul>" : "",
-    added.length ? `<h2 style="font-size:17px;margin:22px 0 8px">Added to your provider list</h2><p style="font-size:14px">From new payees on your statements: ${added.map((a) => escapeHtml(a.name)).join(", ")}.</p>` : "",
+    added.length ? h2("Added to your provider list") + `<p style="font-size:14px">From new payees on your statements: ${added.map((a) => escapeHtml(a.name)).join(", ")}.</p>` : "",
     `<p style="font-size:12px;color:#667085;margin-top:24px">Sources: CISA advisories and its Known Exploited Vulnerabilities catalog, NVD, OSV.dev, Have I Been Pwned, BleepingComputer, The Hacker News, SecurityWeek, Krebs, The Record, and Google News searches for each of your ${searched.length} key providers. Urgent items reach you in chat the same day.</p>`,
     "</div>"].join("\n");
 
@@ -504,6 +657,9 @@ Also give one verdict for each merchant in new_merchants (payees from the user's
 
 
   const now = Date.now();
+  // Weekly verdicts are persisted too: state.checked (10 days) and a per-week audit file.
+  try { log(`audit record: ${saveWeeklyAudit(record)}`); } catch (e) { log(`WARN: audit record not written: ${e.message}`); }
+  for (const r of [...record.affects, ...record.needs_you, ...record.dependencies, ...record.not_affecting]) state.checked.push({ lane: "weekly", ...r, sent: true, at: record.at });
   const knownNames = new Set(vendors.map((v) => v.name.toLowerCase()));
   for (const a of added) {
     if (knownNames.has(a.name.toLowerCase())) continue;
@@ -515,7 +671,7 @@ Also give one verdict for each merchant in new_merchants (payees from the user's
   state.osv_known = [...new Set([...(state.osv_known || []), ...osvFindings(inv).flatMap((f) => f.ids.map((id) => `${f.key}:${id}`))])];
   state.last_weekly_run = new Date(now).toISOString();
   saveState(pruneState(state));
-  log(`sent: ${affects.length} affecting, ${depAffects.length} dependency, ${notAffecting.length} not affecting, ${added.length} provider(s) learned`);
+  log(`sent: ${affects.length} affecting, ${needsYou.length} needs-you, ${depAffects.length} dependency, ${watching.length} watching, ${notAffecting.length} not affecting, ${added.length} provider(s) learned`);
 }
 
 async function main() {
