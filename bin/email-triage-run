@@ -69,7 +69,11 @@ export function readState(file) {
   const actions = rows.filter((r) => r.tool);
   const calls = rows.filter((r) => r.call).map((r) => r.call);
   const ok = actions.filter((a) => !a.failed);
-  return { actions, calls, escalated: ok.some((a) => a.tool === "escalate_to_ops"), escalationFailed: actions.some((a) => a.tool === "escalate_to_ops" && a.failed) };
+  // Whether the model read every page of the rules core.
+  const core = rows.filter((r) => r.rules === "core");
+  const corePages = core.length ? core[0].pages : 0;
+  const coreComplete = corePages > 0 && new Set(core.map((r) => r.page)).size >= corePages;
+  return { coreComplete, actions, calls, escalated: ok.some((a) => a.tool === "escalate_to_ops"), escalationFailed: actions.some((a) => a.tool === "escalate_to_ops" && a.failed) };
 }
 
 /**
@@ -145,11 +149,11 @@ async function main() {
   const cost = costUsd ?? usage?.total_cost_usd ?? null;
   const out = {
     ok: verdict.ok, why: verdict.why || null, text: String(text || "").trim().slice(0, 1500),
-    actions: st.actions, calls: st.calls, escalated: st.escalated, cost_usd: cost, ms, dry: DRY,
+    actions: st.actions, calls: st.calls, escalated: st.escalated, core_complete: st.coreComplete, cost_usd: cost, ms, dry: DRY,
   };
   append(LOG, {
     ts: new Date().toISOString(), messageId: p.messageId, mode: MODE, outcome: verdict.ok ? (st.escalated ? "escalated" : "triaged") : "fallback",
-    why: verdict.why || null, actions: st.actions.map((a) => a.tool), calls: st.calls.length, ms, cost_usd: cost, dry: DRY,
+    why: verdict.why || null, actions: st.actions.map((a) => a.tool), calls: st.calls.length, core_complete: st.coreComplete, ms, cost_usd: cost, dry: DRY,
     // what a dry run would have done, in code's words, for bin/email-triage-report
     ...(DRY ? { summaries: st.actions.map((a) => a.summary || a.tool), intake_p1: intakeP1(p.content) } : {}),
   });

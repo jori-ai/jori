@@ -46,12 +46,13 @@ export function shadowOutcome(row) {
 export function score(rows, { now = Date.now(), getRow = td.get } = {}) {
   const latest = new Map();
   for (const r of rows) if (r.mode === "shadow" && r.messageId) latest.set(r.messageId, r);
-  const out = { scored: 0, label_agree: 0, priority_agree: 0, missed_p1: [], escalated: 0, failed: 0, unsettled: 0, no_actual: 0, disagreements: [], first: null, last: null };
+  const out = { core_incomplete: 0, scored: 0, label_agree: 0, priority_agree: 0, missed_p1: [], escalated: 0, failed: 0, unsettled: 0, no_actual: 0, disagreements: [], first: null, last: null };
   for (const r of latest.values()) {
     const t = Date.parse(r.ts);
     if (now - t < SETTLE_MS) { out.unsettled++; continue; }
     if (r.outcome === "fallback") { out.failed++; continue; }
     if (r.outcome === "escalated") { out.escalated++; continue; }
+    if (r.core_complete === false) out.core_incomplete++;
     const actual = getRow(r.messageId);
     if (!actual || !actual.label) { out.no_actual++; continue; }
     const sh = shadowOutcome(r);
@@ -90,7 +91,7 @@ if (import.meta.url === `file://${process.argv[1]}` || process.argv[1]?.endsWith
   const r = score(rows);
   if (JSON_OUT) { console.log(JSON.stringify(r)); process.exit(0); }
   console.log(`strict triage shadow report — last ${DAYS}d, span ${r.span_days.toFixed(1)}d`);
-  console.log(`  scored ${r.scored} | label ${(r.label_rate * 100).toFixed(1)}% | priority ${(r.priority_rate * 100).toFixed(1)}% | missed P1 ${r.missed_p1.length} | escalated ${r.escalated} | fell back ${r.failed} | no actual ${r.no_actual} | settling ${r.unsettled}`);
+  console.log(`  scored ${r.scored} | label ${(r.label_rate * 100).toFixed(1)}% | priority ${(r.priority_rate * 100).toFixed(1)}% | missed P1 ${r.missed_p1.length} | escalated ${r.escalated} | fell back ${r.failed} | no actual ${r.no_actual} | settling ${r.unsettled} | read only part of the rules core ${r.core_incomplete}`);
   console.log(`  ${r.verdict.ready ? "MEETS THE BAR — switching to \"strict\" is the owner's call" : `not ready — ${r.verdict.reasons.join("; ")}`}`);
   for (const d of r.disagreements.slice(0, 25)) console.log(`  ≠ ${d.messageId} ${d.shadow} vs ${d.actual}`);
 }

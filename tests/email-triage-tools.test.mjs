@@ -100,3 +100,14 @@ test("a failed call is recorded as failed, never as done, and an escalation list
   assert.equal(judge({ text: "x", actions: [{ tool: "gmail_message", failed: true }] }).ok, false);
   assert.equal(judge({ text: "x", actions: [{ tool: "gmail_message" }], escalationFailed: true }).ok, false);
 });
+
+test("long results are paged under the size Claude Code would move to a file", async () => {
+  const { paged, PAGE } = await import("../lib/email-triage-tools.mjs");
+  const big = "x".repeat(PAGE * 2 + 10);
+  const p1 = paged(big, 1), p3 = paged(big, 3);
+  assert.equal(p1.pages, 3); assert.equal(p1.text.length, PAGE); assert.ok(p1.next);
+  assert.equal(p3.text.length, 10); assert.equal(p3.next, undefined);
+  const tools = makeTools({ bound, run: async () => big });
+  const r = await tools.find((t) => t.name === "triage_rules").run({ part: "core", page: 2 });
+  assert.equal(r.page, 2); assert.equal(r.pages, 3);
+});

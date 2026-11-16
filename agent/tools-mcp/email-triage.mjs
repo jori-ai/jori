@@ -52,6 +52,7 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
   record({ call: tool.name });
   try {
     const out = await tool.run(req.params.arguments || {});
+    if (tool.name === "triage_rules" && out?.pages) record({ rules: req.params.arguments?.part, page: out.page, pages: out.pages });
     return { content: [{ type: "text", text: JSON.stringify(out, null, 2) }] };
   } catch (err) {
     return { content: [{ type: "text", text: `error: ${String(err.stderr || err.message).slice(0, 600)}` }], isError: true };
