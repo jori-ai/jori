@@ -19,6 +19,8 @@
 //   block_chats           chat guids never pushed
 // Decided on structure (who/which chat), never on what the text says.
 
+// First: re-exec without the .env in the starting environment (lib/env-isolate.cjs).
+import "../../lib/env-isolate-first.mjs";
 import { createServer } from "node:http";
 import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, watch, writeFileSync } from "node:fs";
 import { spawn } from "node:child_process";

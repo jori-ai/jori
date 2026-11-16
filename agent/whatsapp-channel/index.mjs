@@ -10,6 +10,8 @@
 // WebSocket protocol directly). See docs/whatsapp-gateway-setup.md
 // for the pairing flow and TOS notes.
 
+// First: re-exec without the .env in the starting environment (lib/env-isolate.cjs).
+import "../../lib/env-isolate-first.mjs";
 import {
   default as makeWASocket,
   useMultiFileAuthState,

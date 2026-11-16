@@ -13,6 +13,8 @@
 //       SLACK_CHANNEL_PORT                 (overrides config `port`, default 9108)
 // Config: agent/local/config/slack-channel.json (see core.mjs DEFAULTS).
 
+// First: re-exec without the .env in the starting environment (lib/env-isolate.cjs).
+import "../../lib/env-isolate-first.mjs";
 import { createServer } from "node:http";
 import fs from "node:fs";
 import path from "node:path";

@@ -64,3 +64,21 @@ test("a child that inherits an isolated parent's mark still isolates itself", { 
   assert.equal(out.r.why, "already", "it re-exec'd: the inherited mark names another pid");
   if (out.visible) assert.deepEqual(out.visible, []);
 });
+
+test("nameForEntry maps process-manager entry points to their child names", () => {
+  const { nameForEntry } = require("../lib/env-isolate.cjs");
+  const r = (p) => path.join(ROOT, p);
+  assert.equal(nameForEntry(r("agent/imessage-channel/index.mjs"), [], ROOT), "imessage-channel");
+  assert.equal(nameForEntry(r("agent/whatsapp-channel/index.mjs"), [], ROOT), "whatsapp-channel");
+  assert.equal(nameForEntry(r("agent/supervisor/index.mjs"), ["node", "x", "--agent", "ops-light"], ROOT), "ops-light-supervisor");
+  assert.equal(nameForEntry(r("bin/somewhere"), [], ROOT), null);
+});
+
+test("each wired entry point imports the hook before anything else", () => {
+  const { ENTRIES } = require("../lib/env-isolate.cjs");
+  for (const entry of Object.keys(ENTRIES)) {
+    if (entry.endsWith("chat-supervisor.mjs")) continue; // supervisors: not wired yet
+    const first = fs.readFileSync(path.join(ROOT, entry), "utf8").split("\n").find((l) => l.startsWith("import "));
+    assert.equal(first, 'import "../../lib/env-isolate-first.mjs";', entry);
+  }
+});
