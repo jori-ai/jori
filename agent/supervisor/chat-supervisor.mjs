@@ -15,6 +15,8 @@
 //   --no-resume           don't try to resume previous session
 //   --claude-bin <path>   override claude binary path
 
+// First: re-exec without the .env in the starting environment (lib/env-isolate.cjs).
+import "../../lib/env-isolate-first.mjs";
 import fs from "node:fs";
 import { MODELS } from "../../lib/models.cjs";
 import { createRequire } from "node:module";

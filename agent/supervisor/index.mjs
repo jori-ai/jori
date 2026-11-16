@@ -23,6 +23,8 @@
 // Env:
 //   CLAUDE_BIN             fallback claude binary path
 
+// First: re-exec without the .env in the starting environment (lib/env-isolate.cjs).
+import "../../lib/env-isolate-first.mjs";
 import fs from "node:fs";
 import path from "node:path";
 import { spawn as spawnProc } from "node:child_process";

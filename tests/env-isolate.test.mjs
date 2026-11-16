@@ -76,8 +76,7 @@ test("nameForEntry maps process-manager entry points to their child names", () =
 
 test("each wired entry point imports the hook before anything else", () => {
   const { ENTRIES } = require("../lib/env-isolate.cjs");
-  for (const entry of Object.keys(ENTRIES)) {
-    if (entry.endsWith("chat-supervisor.mjs")) continue; // supervisors: not wired yet
+  for (const entry of [...Object.keys(ENTRIES), "agent/supervisor/index.mjs"]) {
     const first = fs.readFileSync(path.join(ROOT, entry), "utf8").split("\n").find((l) => l.startsWith("import "));
     assert.equal(first, 'import "../../lib/env-isolate-first.mjs";', entry);
   }
