@@ -85,7 +85,7 @@ export function strictFallbackNote(r) {
 
 // The installation's own choice wins (agent/local/config/agents.json
 // `gmail_triage_target`), so trying "strict-shadow" or "strict" is not a kernel edit.
-function localTriageTarget() {
+export function localTriageTarget() {
   try {
     const { localConfig } = createRequire(import.meta.url)("../../lib/instance.cjs");
     return localConfig("agents", {}).gmail_triage_target;
@@ -94,14 +94,17 @@ function localTriageTarget() {
 
 export function triageTargetFromConfig(agentsConfig, { selfAgent = "ops", local = localTriageTarget() } = {}) {
   const self = agentsConfig?.agents?.[selfAgent] || {};
-  const configured = local !== undefined ? local : self.gmailTriageTarget === undefined ? "ops-light" : self.gmailTriageTarget;
+  const configured = local != null ? local : self.gmailTriageTarget === undefined ? "ops-light" : self.gmailTriageTarget;
   const strict = configured === "strict";
   const shadow = configured === "strict-shadow";
   const target = strict || shadow ? "ops-light" : configured;
   if (!target || target === selfAgent) return null;
   const sup = agentsConfig?.agents?.[target]?.supervisor;
   if (!sup?.webhookPort || !sup?.healthPort) return null;
-  return { agent: target, webhookPort: sup.webhookPort, healthPort: sup.healthPort, ...(strict ? { strict: true } : {}), ...(shadow ? { shadow: true } : {}) };
+  const t = { agent: target, webhookPort: sup.webhookPort, healthPort: sup.healthPort, ...(strict ? { strict: true } : {}), ...(shadow ? { shadow: true } : {}) };
+  // Hidden marker: this target follows the installation's config live (makeTriageRouter readMode).
+  Object.defineProperty(t, "fromConfig", { value: true, enumerable: false });
+  return t;
 }
 
 export function makeTriageRouter({
@@ -117,7 +120,24 @@ export function makeTriageRouter({
   pendingDir = PENDING_DIR,
   sweepEveryMs = 5 * 60 * 1000,
   now = () => Date.now(),
+  // The installation's choice, re-read per email (cached 30 s), so switching
+  // between ops-light / strict-shadow / strict needs no supervisor restart.
+  // null = keep the mode the router was built with (tests, other callers).
+  readMode = localTriageTarget,
 }) {
+  let modeCache = { at: -Infinity, mode: undefined };
+  function currentTarget() {
+    if (!target || !readMode || !target.fromConfig) return target;
+    if (now() - modeCache.at > 30_000) {
+      let m; try { m = readMode(); } catch { m = undefined; }
+      modeCache = { at: now(), mode: m };
+    }
+    const m = modeCache.mode;
+    if (m === undefined || m === null) return target;
+    if (m === "ops") return null;                      // rollback: this supervisor's own dispatcher
+    const { strict: _s, shadow: _h, ...base } = target;
+    return { ...base, ...(m === "strict" ? { strict: true } : {}), ...(m === "strict-shadow" ? { shadow: true } : {}) };
+  }
   let strictInFlight = 0;
   const marker = (source) => path.join(pendingDir, `${String(source).replace(/[^A-Za-z0-9:_-]/g, "_")}.json`); // lang-regex-ok: file-name sanitising
   const putMarker = (source, content, packet) => {
@@ -136,6 +156,7 @@ export function makeTriageRouter({
   }
 
   async function routeTriage(content, source, { forceLocal = false, packet = null, skipStrict = false } = {}) {
+    const target = currentTarget();
     if (!target || forceLocal) return { routed: "local", result: localDispatch(content, source) };
     if (target.shadow && packet?.messageId && strictInFlight < strictMax) {
       // Shadow: a dry one-shot alongside, never in the way of the real dispatch.
@@ -202,7 +223,7 @@ export function makeTriageRouter({
     }
     return n;
   }
-  if (target?.strict && sweepEveryMs > 0) {
+  if ((target?.strict || target?.fromConfig) && sweepEveryMs > 0) {
     const t = setInterval(() => { sweepPending().catch(() => {}); }, sweepEveryMs);
     t.unref?.();
   }
