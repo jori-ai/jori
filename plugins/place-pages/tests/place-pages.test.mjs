@@ -75,6 +75,8 @@ function fakeWiki(pages = {}) {
     store,
     getPage: (id) => (store.has(id) ? { id, type: "reference", raw_md: store.get(id), frontmatter_json: JSON.stringify(fm(store.get(id))) } : null),
     savePage: (id, md) => store.set(id, md),
+    superseded: new Map(),
+    supersedePage(oldId, newId) { this.superseded.set(oldId, newId); },
     // Like FTS5 unicode61: case- and accent-folded.
     searchPages: (q) => [...store.keys()].filter((id) => store.get(id).normalize("NFKD").replace(/\p{M}+/gu, "").toLowerCase().includes(q)).map((id) => ({ id, type: "reference", title: fm(store.get(id)).name || id, description: "" })),
   };
@@ -307,4 +309,30 @@ test("a stop through the small hours at a daytime place is not a visit; at a bar
   } finally {
     DAY.intervals.pop();
   }
+});
+
+test("rename: our own page is retitled in place; a page made under a broken name is replaced and its photos move", async () => {
+  const db = fakeDb({ photos: PHOTOS.map((p) => ({ ...p })) });
+  const wiki = fakeWiki();
+  const answer = (prompt) => {
+    const items = [...prompt.matchAll(/\[(\d+)\] "([^"]+)"/g)].map((m) => ({ i: Number(m[1]), name: m[2] })); // lang-regex-ok: reads our own prompt layout
+    return { stops: items.map((it) => ({ i: it.i, kind: it.name === "Corner Café" ? "cafe" : "theater", same_as: null, page: null })) };
+  };
+  const d = deps({ db, wiki, answer });
+  await pp.sweep({ date: DAY.date, apply: true, deps: d });
+  const cafe = db.t.places.find((p) => p.name === "Corner Café");
+  // Our own page: same id, new title, the old name kept as an alias.
+  await pp.rename(cafe.id, "Corner Coffee Bar", { deps: d });
+  assert.match(wiki.store.get("place_corner_cafe"), /^name: "Corner Coffee Bar"$/m);
+  assert.match(wiki.store.get("place_corner_cafe"), /^# Corner Coffee Bar$/m);
+  assert.deepEqual(db.t.places.find((p) => p.id === cafe.id).names, ["Corner Coffee Bar", "Corner Café"]);
+  // A tracker-style page titled with the broken name: a new page, links moved, the old one superseded.
+  const theatre = db.t.places.find((p) => p.name === "Grand Theatre");
+  wiki.store.set("restaurant_grand_theatre_id_9", "---\nname: \"Grand Theatre\"\nentity: restaurant\n---\n# Grand Theatre\n");
+  theatre.page_id = "restaurant_grand_theatre_id_9";
+  db.t.photo_links.push({ photo_uuid: "P1", target: "restaurant_grand_theatre_id_9", role: "gallery", context: "x", added_by: "place-pages" });
+  const r = await pp.rename(theatre.id, "Grand Hall", { deps: d });
+  assert.deepEqual(r.moved, { from: "restaurant_grand_theatre_id_9", to: "place_grand_hall" });
+  assert.equal(wiki.superseded.get("restaurant_grand_theatre_id_9"), "place_grand_hall");
+  assert.equal(db.t.photo_links.find((l) => l.context === "x").target, "place_grand_hall");
 });

@@ -31,7 +31,9 @@ stop, minus screenshots, received photos, documents and receipts. The cover is t
 one you pinned, else a favorite, else the newest without people.
 
 Because each run re-sweeps the past week, renaming a stop moves that day's photos
-to the right page on the next run.
+to the right page on the next run. A stop that runs through the small hours
+(2–5am local) at a daytime kind of place (café, bakery, restaurant, shop…) is not
+counted as a visit: it is a night nearby that the day named after the place.
 
 ## Using the photos
 
@@ -51,6 +53,7 @@ place-pages show "<name or page id>"
 place-pages cover "<name>" [--near LAT,LON]
 place-pages render <place id|page id>
 place-pages set-kind <place id> <kind>
+place-pages rename <place id> "<name>"                     # the old name stays an alias
 photo-repo for <page id> | uses <uuid> | pin-cover <page id> <uuid>
 ```
 

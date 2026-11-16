@@ -15,6 +15,7 @@
 //                         to a place and wants to show it.
 //   place-pages render <place id|page id>          rebuild one page's block now
 //   place-pages set-kind <place id> <kind>         the user's correction of what a place is
+//   place-pages rename <place id> "<name>"         the user's correction of its name (the old one stays an alias)
 //
 // Settings: agent/local/config/place-pages.json (defaults in config.defaults.json).
 
@@ -109,13 +110,21 @@ async function main() {
       if (place.page_id) console.log(JSON.stringify(await pp.renderPlace(place, { deps })));
       return 0;
     }
+    case "rename": {
+      const [id, name] = pos();
+      if (!id || !name) return usage();
+      const { place, moved } = await pp.rename(id, name, { deps });
+      console.log(`${id} is now "${place.name}"${moved ? ` (page ${moved.from} → ${moved.to})` : ""}`);
+      if (place.page_id) console.log(JSON.stringify(await pp.renderPlace(place, { deps })));
+      return 0;
+    }
     default:
       return usage();
   }
 }
 
 function usage() {
-  const lines = require("node:fs").readFileSync(__filename, "utf8").split("\n").slice(2, 21).map((l) => l.slice(3));
+  const lines = require("node:fs").readFileSync(__filename, "utf8").split("\n").slice(2, 22).map((l) => l.slice(3));
   console.error(lines.join("\n"));
   return 2;
 }

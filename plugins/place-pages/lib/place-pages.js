@@ -288,7 +288,7 @@ function promptFor(items, cfg = config()) {
     "   A café that mainly serves coffee is cafe; a sit-down meal place is restaurant. An airport lounge is lounge, not transit. A hotel or a rental the user stayed in is hotel or rental.",
     (cfg.exclude_names || []).length ? `   The user's own homes and properties (always own_home): ${cfg.exclude_names.join("; ")}.` : "",
     "3. page: if one of the stop's listed existing wiki pages is a page about this same place, its id; else null. A list of places, a city, a trip or a person is not a page about the place.",
-    "4. title: only for a NEW public place (same_as and page both null) whose name does not say which place it is or is a sentence (\"the airbnb\", \"Yes — the airbnb\", \"our hotel\"): a short clear title from what the stop shows (\"Airbnb, Old Town\", the hotel's own name from the calendar or address). Otherwise null; never rename a proper venue name.",
+    "4. title: only for a NEW public place (same_as and page both null) whose name does not say which place it is, is a sentence, or carries text that is not part of a name such as a command flag or an id (\"the airbnb\", \"Yes — the airbnb\", \"our hotel\", \"Some Bistro --visit-id 1234\"): a short clear title from what the stop shows (\"Airbnb, Old Town\", the hotel's own name from the calendar or address). Otherwise null; never rename a proper venue name.",
     "",
     "Use only the ids listed with each stop. Answer with JSON only:",
     '{"stops": [{"i": 0, "same_as": null, "kind": "cafe", "page": null, "title": null}, …]}',
@@ -696,8 +696,50 @@ async function setKind(placeId, kind, { deps = liveDeps(), log = () => {} } = {}
   return place;
 }
 
+/**
+ * The user's correction of a place's name. The old name stays an alias, so
+ * stops under it still land here. Its page follows: our own page is retitled in
+ * place; a page that was made under the old name (its title is the old name)
+ * is replaced by a page under the new one (through the tracker for a
+ * restaurant or museum), the photo links move, and the old page is superseded
+ * by the new (its history kept). An adopted page with its own title is left as
+ * it is.
+ */
+async function rename(placeId, newName, { deps = liveDeps(), log = () => {} } = {}) {
+  const name = String(newName || "").trim();
+  if (!name) throw new Error("the new name is empty");
+  const [place] = (await deps.request(`/rest/v1/places?select=*&id=eq.${encodeURIComponent(placeId)}`)) || [];
+  if (!place) throw new Error(`no place ${placeId}`);
+  const old = place.name;
+  place.names = [...new Set([name, ...(place.names || []), old])];
+  place.norm_names = [...new Set(place.names.map(norm))];
+  place.name = name;
+  let moved = null;
+  const row = place.page_id ? deps.wiki.getPage(place.page_id) : null;
+  if (row) {
+    const fm = frontmatterOf(row);
+    if (fm.entity === "place") {
+      const md = row.raw_md
+        .replace(`name: ${JSON.stringify(old)}`, `name: ${JSON.stringify(name)}`)
+        .replace(`\n# ${old}\n`, `\n# ${name}\n`);
+      if (md !== row.raw_md) deps.wiki.savePage(place.page_id, md, { editedBy: TOOL });
+    } else if (fm.name === old || row.title === old) {
+      const owners = new Map(((await loadPlaces(deps.request)) || []).filter((p) => p.page_id && p.id !== place.id).map((p) => [p.page_id, p.id]));
+      const next = pageFor(place, null, { deps, pageOwners: owners, log });
+      if (next && next !== place.page_id) {
+        await deps.request(`/rest/v1/photo_links?target=eq.${encodeURIComponent(place.page_id)}`, { method: "PATCH", body: { target: next }, prefer: "return=minimal" });
+        try { deps.wiki.supersedePage(place.page_id, next, { editedBy: TOOL }); } catch (e) { log(`supersede ${place.page_id}: ${e.message}`); }
+        moved = { from: place.page_id, to: next };
+        place.page_id = next;
+      }
+    }
+  }
+  await upsertPlace(place, deps.request, deps.now());
+  return { place, moved };
+}
+
 module.exports = {
   TOOL, START, END, DEFAULTS, PUBLIC_KINDS, PRIVATE_KINDS, KINDS, PLACE_ENTITIES,
   config, slug, isPublic, liveDeps, datesToSweep, eligibleStops, matchStop, promptFor, validateAnswer,
-  keepPhoto, pickCover, overlapsSmallHours, renderBlock, replaceBlock, newPageMd, sweep, renderPlace, findPlaces, setKind, addDays,
+  keepPhoto, pickCover, overlapsSmallHours, renderBlock, replaceBlock, newPageMd, sweep, renderPlace, findPlaces, setKind, rename, addDays,
 };
