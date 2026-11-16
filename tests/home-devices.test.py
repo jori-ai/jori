@@ -65,9 +65,11 @@ class Fake:
         self.lock = True
         self.ssh_ok = True
         self.emails = []
+        self.email_envs = []
+        self.email_out = ""  # what email-send prints ("Held: not sent ..." when the gate holds it)
         self.calls = []
 
-    def __call__(self, argv, input=None, capture_output=False, text=False, timeout=None, cwd=None, errors=None):
+    def __call__(self, argv, input=None, capture_output=False, text=False, timeout=None, cwd=None, errors=None, env=None):
         self.calls.append(argv)
         out, rc = "", 0
         exe = os.path.basename(argv[0])
@@ -93,6 +95,8 @@ class Fake:
                 out = json.dumps(self.lock)
         elif exe == "email-send":
             self.emails.append(argv)
+            self.email_envs.append(env)
+            out = self.email_out
         else:
             raise AssertionError(f"unexpected subprocess {argv}")
         return Res(rc, out, "")
@@ -199,6 +203,29 @@ class HomeDevicesTest(unittest.TestCase):
         self.fake.lan["192.0.2.11"] = "ping"
         self.sweep(mod)
         self.assertEqual(self.subjects()[-1], "Back online: Home Test lamp")
+
+    def test_alerts_skip_the_speak_gate(self):
+        mod = self.load()
+        self.fake.lan["192.0.2.11"] = "none"
+        for _ in range(3):
+            self.sweep(mod)
+        self.assertEqual(self.subjects(), ["Offline: Home Test lamp"])
+        self.assertEqual((self.fake.email_envs[0] or {}).get("SPEAK_GATE_EMAIL"), "0")
+
+    def test_a_held_email_is_logged_as_not_sent_and_not_retried(self):
+        mod = self.load()
+        self.fake.email_out = "Held: not sent — the speak gate held it (digest: routine)."
+        self.fake.lan["192.0.2.11"] = "none"
+        self.sweep(mod)
+        self.sweep(mod)
+        err = io.StringIO()
+        mod.RING["data"] = "unfetched"
+        with contextlib.redirect_stdout(io.StringIO()) as out, contextlib.redirect_stderr(err):
+            mod.cmd_sweep(type("A", (), {"dry_run": False})(), mod.roster_cfg())
+        self.assertNotIn("emailed", out.getvalue())
+        self.assertIn("NOT emailed, held by the speak gate", err.getvalue())
+        self.assertEqual(self.state()["pending"], [])
+        self.assertEqual(len(self.fake.emails), 1)
 
     def test_alert_to_overrides_owner(self):
         self.write("config/home-devices.json", {**ROSTER, "alert_to": "alerts@example.com"})

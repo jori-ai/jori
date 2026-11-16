@@ -101,7 +101,13 @@ than the hold or the DOWN_AFTER bar never goes DOWN and is not logged.
 Alerts go out as ONE email per sweep via email-send to the instance owner
 (`alert_to` in the roster overrides); if the send fails (e.g. the site's
 internet is down, which minibeat reports separately) they stay queued in the
-state file and go with the next successful sweep. A Tuya smart-plug check was
+state file and go with the next successful sweep. They skip the speak gate
+(SPEAK_GATE_EMAIL=0, system/speak-gate.md § Live, email): the owner,
+2026-11-16, after the gate folded a 21-hour outage of a bedroom access point
+into the next morning's summary as a "routine repeat flapper". A device alert
+is the whole point of this job and arrives as its own email, every time. If
+email-send still prints "Held:" it was not sent: the log says so and the
+events are dropped rather than re-held every two minutes. A Tuya smart-plug check was
 removed with its last roster entry (plugs switched off at the wall are
 indistinguishable from dropped ones, so every alert was a false positive).
 """
@@ -588,6 +594,21 @@ def alert_to(cfg):
     return cfg.get("alert_to") or INST["owner_email"]
 
 
+def deliver(to, subj, body):
+    """email-send, past the speak gate. Returns ("sent" | "held" | "failed", detail).
+    A held email exits 0 with "Held: not sent" on stdout, so exit status alone
+    is not proof it went out."""
+    r = subprocess.run(
+        [EMAIL_SEND, "--to", to, "--subject", subj, "--body", body],
+        capture_output=True, text=True, timeout=60,
+        env={**os.environ, "SPEAK_GATE_EMAIL": "0"},
+    )
+    out = (r.stdout or "").strip()
+    if r.returncode == 0 and "Held: not sent" in out:
+        return "held", out
+    return ("sent" if r.returncode == 0 else "failed"), (r.stderr or r.stdout or "").strip()
+
+
 def send_email(cfg, events):
     downs = [e for e in events if e["kind"] == "down"]
     ups = [e for e in events if e["kind"] == "up"]
@@ -640,12 +661,8 @@ def send_email(cfg, events):
     to = alert_to(cfg)
     if not to:
         print(f"no alert recipient (owner_email / alert_to) — {subj}\n" + "\n".join(lines))
-        return True, "printed (no recipient)"
-    r = subprocess.run(
-        [EMAIL_SEND, "--to", to, "--subject", subj, "--body", "\n".join(lines)],
-        capture_output=True, text=True, timeout=60,
-    )
-    return r.returncode == 0, (r.stderr or r.stdout).strip()
+        return "sent", "printed (no recipient)"
+    return deliver(to, subj, "\n".join(lines))
 
 
 def ring_site(cfg, rname):
@@ -757,9 +774,12 @@ def cmd_sweep(args, cfg):
 
     log_outages(outage_rows)
     if state["pending"]:
-        sent, info = send_email(cfg, state["pending"])
-        if sent:
+        status, info = send_email(cfg, state["pending"])
+        if status == "sent":
             print(f"{t} emailed {len(state['pending'])} event(s)")
+            state["pending"] = []
+        elif status == "held":
+            print(f"{t} NOT emailed, held by the speak gate; dropping {len(state['pending'])} event(s): {info}", file=sys.stderr)
             state["pending"] = []
         else:
             print(f"{t} email failed, keeping {len(state['pending'])} queued: {info}", file=sys.stderr)
@@ -890,10 +910,9 @@ def main():
         to = alert_to(cfg)
         if to and (not last or dt.datetime.now(dt.timezone.utc) - dt.datetime.fromisoformat(last) > dt.timedelta(hours=6)):
             where = INSTALL_TOOLS.replace(HOME, "~", 1).rstrip("/")
-            r = subprocess.run([EMAIL_SEND, "--to", to, "--subject", "Home device monitor is failing",
-                                "--body", f"The home-devices sweep on {INST['host_label']} crashed, so devices are NOT being checked.\n\n{type(e).__name__}: {e}\n\nLog: {where}/logs/home-devices.log"],
-                               capture_output=True, text=True, timeout=60)
-            if r.returncode == 0:
+            status, _ = deliver(to, "Home device monitor is failing",
+                                f"The home-devices sweep on {INST['host_label']} crashed, so devices are NOT being checked.\n\n{type(e).__name__}: {e}\n\nLog: {where}/logs/home-devices.log")
+            if status == "sent":
                 state["crash_emailed"] = now_iso()
                 save(STATE, state)
         sys.exit(1)
