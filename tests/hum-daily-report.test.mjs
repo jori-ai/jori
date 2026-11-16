@@ -80,3 +80,25 @@ test("hum-daily-run records one row per date to hum-daily.jsonl and sends nothin
   assert.equal(rows[0].date, "2026-10-05");
   assert.equal(rows[0].low_ticks, true);
 });
+
+test("hum audit treats nearby local-history feedback as expected without a run", () => {
+  const dir = mkdtempSync(join(tmpdir(), "hum-audit-"));
+  const now = new Date().toISOString();
+  const runsFile = join(dir, "runs.jsonl");
+  const fbFile = join(dir, "fb.jsonl");
+  writeFileSync(runsFile, JSON.stringify({ ts: now, outcome: { sent: true, ping_id: "p-run" } }) + "\n");
+  const rows = [
+    { ping_id: "p-run", sent_at: now, lane: "situation" },
+    { ping_id: "p-live", sent_at: now, lane: "nearby", budget_pool: "local_history" },
+    { ping_id: "p-orphan", sent_at: now, lane: "situation" },
+    { ping_id: "p-nearby-other", sent_at: now, lane: "nearby", budget_pool: "other" },
+  ];
+  writeFileSync(fbFile, rows.map((r) => JSON.stringify(r)).join("\n") + "\n");
+  const r = spawnSync(process.execPath, [resolve(HERE, "../bin/jori"), "hum", "audit", "--json"], {
+    encoding: "utf8", env: { ...process.env, HUM_RUNS_FILE: runsFile, HUM_FEEDBACK_FILE: fbFile },
+  });
+  const rep = JSON.parse(r.stdout);
+  assert.equal(rep.live_lane_no_run_count, 1);
+  assert.deepEqual(rep.orphan_feedback_no_run.sort(), ["p-nearby-other", "p-orphan"]);
+  assert.equal(rep.drift_count, 2);
+});

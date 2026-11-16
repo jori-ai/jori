@@ -2946,8 +2946,8 @@ function cmdHumAudit(args) {
     }
   }
 
-  const runs = parseJsonl(HUM_RUNS);
-  const feedback = parseJsonl(HUM_FEEDBK);
+  const runs = parseJsonl(process.env.HUM_RUNS_FILE || HUM_RUNS);
+  const feedback = parseJsonl(process.env.HUM_FEEDBACK_FILE || HUM_FEEDBK);
 
   // A run "sent" if outcome.sent === true (new schema) OR decision === 'PING'
   // with a ping_id (legacy schema, pre-2026-04-15 rewrite). Accept `ts` or
@@ -2961,15 +2961,21 @@ function cmdHumAudit(args) {
     return newSchema || legacy;
   }).map((r) => r.outcome?.ping_id || r.ping_id);
 
-  const feedbackPings = feedback.filter((r) => {
+  // Live-lane pings (nearby / local_history) go out outside the tick loop, so
+  // they never have a run row. Structured fields only: lane + budget_pool.
+  const isLiveLane = (r) => r.lane === 'nearby' && r.budget_pool === 'local_history';
+  const windowFeedback = feedback.filter((r) => {
     const ts = Date.parse(r.sent_at || '');
     return Number.isFinite(ts) && ts >= cutoff;
-  }).map((r) => r.ping_id);
+  });
+  const liveLaneIds = new Set(windowFeedback.filter(isLiveLane).map((r) => r.ping_id));
+  const feedbackPings = windowFeedback.map((r) => r.ping_id);
 
   const sentSet = new Set(sentPings);
   const feedbackSet = new Set(feedbackPings);
   const missingFeedback = [...sentSet].filter((id) => !feedbackSet.has(id));
-  const orphanFeedback = [...feedbackSet].filter((id) => !sentSet.has(id));
+  const orphanFeedback = [...feedbackSet].filter((id) => !sentSet.has(id) && !liveLaneIds.has(id));
+  const liveLaneNoRun = [...liveLaneIds].filter((id) => !sentSet.has(id));
   const drift = missingFeedback.length + orphanFeedback.length;
 
   const report = {
@@ -2979,6 +2985,7 @@ function cmdHumAudit(args) {
     pings_logged_in_feedback: feedbackPings.length,
     missing_feedback_for_sent: missingFeedback,
     orphan_feedback_no_run: orphanFeedback,
+    live_lane_no_run_count: liveLaneNoRun.length,
     drift_count: drift,
     healthy: drift === 0,
   };
@@ -2990,6 +2997,7 @@ function cmdHumAudit(args) {
     console.log(`${c.bold('hum audit')} (last ${windowHours}h) — ${mark}`);
     console.log(`  sent in runs:      ${report.pings_sent_in_runs}`);
     console.log(`  logged in feedback: ${report.pings_logged_in_feedback}`);
+    console.log(`  live-lane (no run expected): ${liveLaneNoRun.length}`);
     if (missingFeedback.length) {
       console.log(c.red(`  missing feedback (${missingFeedback.length}):`));
       for (const id of missingFeedback) console.log(`    ${id}`);
