@@ -172,7 +172,7 @@ function osvFindings(inv) {
 const VERDICT_SCHEMA = {
   type: "object", additionalProperties: false, required: ["verdicts"],
   properties: { verdicts: { type: "array", items: {
-    type: "object", additionalProperties: false, required: ["id", "analysis", "applies", "urgency", "action"],
+    type: "object", additionalProperties: false, required: ["id", "analysis", "unmet_precondition", "applies", "urgency", "action"],
     // analysis BEFORE applies: the model must reason, then decide. With applies
     // first, the Nov 2 2026 weekly committed "no" on the CoreGraphics zero-day
     // and its own analysis then concluded "that makes this a yes, not a no" —
@@ -180,6 +180,7 @@ const VERDICT_SCHEMA = {
     properties: {
       id: { type: "string", description: "candidate id exactly as given" },
       analysis: { type: "string", description: "2-4 plain sentences to the user as 'you': the issue in one clause, then what the checks found (cite them), and why that does or does not put the user at risk" },
+      unmet_precondition: { type: "string", description: "only when a check found a version in range: a precondition the advisory states that the user's setup plainly lacks (e.g. 'Linux builds without PAM only; the host runs macOS'), quoted from the advisory; empty string otherwise" },
       applies: { type: "string", enum: ["yes", "no", "unclear"], description: "must agree with the analysis just written" },
       urgency: { type: "string", enum: ["now", "this_week", "routine", "none"] },
       action: { type: "string", description: "concrete steps with versions or a command; for something no check could reach, the exact step for the user (where to click or what to run on which device); 'Nothing to do.' when none" },
@@ -335,7 +336,9 @@ async function hostExposureItems(ctx) {
 
 /** Code owns the status; the model's urgency is clamped to it. */
 function finalize(c, v) {
-  const status = itemStatus(c.checks || [], v.applies);
+  const pre = String(v.unmet_precondition || "").trim();
+  const status = itemStatus(c.checks || [], v.applies, { unmetPrecondition: pre });
+  if (pre && (c.checks || []).some((k) => k.kind === "version" && k.status === "found")) c.checks = [...c.checks, { check: "advisory precondition", status: status === "clean" ? "n/a" : "found", result: pre }];
   const urgency = status === "clean" ? "none" : status === "exposed" && v.urgency === "none" ? "this_week" : v.urgency;
   return { ...v, status, urgency, applies: status === "exposed" ? "yes" : status === "clean" ? "no" : "unclear" };
 }
@@ -579,7 +582,7 @@ Also give one verdict for each merchant in new_merchants (payees from the user's
 
   const ctx = checkContext(cfg, inv);
   const findings = osvFindings(inv).filter((f) => f.rank >= 3).slice(0, cfg.weekly.max_dependency_findings ?? 25);
-  const reachN = cfg.weekly.max_reachability_checks ?? 12;
+  const reachN = cfg.weekly.max_reachability_checks ?? 25;
   const depCks = findings.map((f, k) => (k < reachN && f.runtime ? depChecks(f, ctx) : [{ check: `reachability of ${f.name}`, status: f.runtime ? "error" : "clean", result: f.runtime ? "not traced this week (below the top findings)" : `dev-only in ${f.repos.join(", ")}` }]));
   const depCands = findings.map((f, k) => depCandidate(f, `d${k + 1}`, depCks[k]));
   const newsEv = await pool(newsCands, 4, (c) => newsEvidence(c, inv, { articleCap: 3000, ctx }));

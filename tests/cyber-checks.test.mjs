@@ -208,6 +208,11 @@ test("itemStatus: a found check is exposed whatever the model says; yes without 
   assert.equal(itemStatus([], "no"), "clean");
   assert.equal(itemStatus(err, "no"), "needs_you");
   assert.equal(itemStatus([], "unclear"), "needs_you");
+  // SSHole: OpenSSH 10.5 is inside NVD's range, but the advisory needs Linux without PAM
+  const ver = [{ status: "found", kind: "version" }];
+  assert.equal(itemStatus(ver, "no", { unmetPrecondition: "Linux/musl builds without PAM only; the host runs macOS" }), "clean");
+  assert.equal(itemStatus(ver, "no"), "exposed");
+  assert.equal(itemStatus([{ status: "found" }], "no", { unmetPrecondition: "x" }), "exposed", "only version findings can be set aside");
 });
 
 test("isThin: one Google News hit is thin; a real article or two sources is not", () => {
