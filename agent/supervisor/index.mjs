@@ -532,6 +532,24 @@ class Supervisor {
     if (this._triageRulesTimer) { clearInterval(this._triageRulesTimer); this._triageRulesTimer = null; }
   }
 
+  // A restart re-reads agents.json (allowlists, model, effort, MCP flags), so a
+  // config change takes effect with `jori restart <agent>` without bouncing the
+  // supervisor process. Before this, the config read at process start was reused
+  // on every restart: an allowlist entry removed from agents.json stayed on the
+  // respawned session until launchd restarted the supervisor. A file that does
+  // not parse (mid-edit) keeps the config already loaded. Values the
+  // constructor derived from the config at boot are not recomputed.
+  reloadConfig() {
+    const p = this.args.config || path.join(JORI_ROOT, "agent/config/agents.json");
+    try {
+      this.cfg = loadAgentConfig(p, this.args.agent || "ops");
+      return true;
+    } catch (e) {
+      console.error(`[supervisor] config reload failed, keeping the loaded config: ${e.message}`);
+      return false;
+    }
+  }
+
   async startSession({ resume }) {
     this.sessionStartedAt = Date.now();
     const cfg = this.cfg;
@@ -1639,6 +1657,7 @@ class Supervisor {
       this.state.rotateSession();
       this._resetContextTracking();
     }
+    this.reloadConfig();
     await this.startSession({ resume: shouldResume });
     this.restarting = false;
   }
