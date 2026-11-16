@@ -595,10 +595,31 @@ EN_PROMPT_V = hashlib.sha256(EN_PROMPT.encode("utf-8")).hexdigest()[:12]
 _en_run = {"calls": 0, "down": None}  # this process's model calls; why it stopped asking
 
 
+def _model_env():
+    """lib/agent-env.cjs modelEnv for a model call: our environment without the
+    .env secrets once the installation locks "model-calls" down (a child's
+    starting environment is readable with `ps eww`), else ours unchanged.
+    Fails open. docs/agent-secrets.md."""
+    import shutil, subprocess
+    lib = os.path.join(os.path.dirname(os.path.realpath(__file__)), "agent-env.cjs")
+    node = os.environ.get("JORI_NODE") or shutil.which("node")
+    if not node or not os.path.exists(lib):
+        return dict(os.environ)
+    try:
+        r = subprocess.run([node, lib, "--agent", "model-calls", "--print0"], capture_output=True, timeout=10)
+        if r.returncode == 0 and r.stdout:
+            kept = dict(kv.split("=", 1) for kv in r.stdout.decode("utf-8", "replace").split("\0") if "=" in kv)
+            if kept:
+                return kept
+    except Exception:
+        pass
+    return dict(os.environ)
+
+
 def _claude_toolless(model, prompt, timeout_s):
     """lib/jev-claude.mjs runToollessDetailed: no tools, Max login only. Raises on no answer."""
     import subprocess, tempfile
-    env = {k: v for k, v in os.environ.items() if k not in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN")}
+    env = {k: v for k, v in _model_env().items() if k not in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN")}
     r = subprocess.run([CLAUDE_BIN, "-p", "--model", model, "--effort", "low", "--tools", "",
                         "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}', "--setting-sources",
                         "project", "--no-session-persistence", "--output-format", "text"],

@@ -31,6 +31,8 @@ import { EventEmitter } from "node:events";
 import { spawn } from "node:child_process";
 import os from "node:os";
 import * as defaultStore from "./message-store.mjs";
+import { createRequire } from "node:module";
+const { modelEnv } = createRequire(import.meta.url)("../../lib/agent-env.cjs");
 
 // Interrupt-permission rule (Conway): main & forks can interrupt; subagents cannot.
 export const INTERRUPT_ALLOWED_KINDS = new Set(["main", "fork"]);
@@ -255,8 +257,7 @@ export function makeClaudeTextExecutor({ claudeBin = null, model = "haiku", time
   return function claudeTextExecutor({ system, messages, signal }) {
     return new Promise((resolve) => {
       const prompt = renderTranscriptPrompt(system, messages);
-      const env = { ...process.env };
-      delete env.ANTHROPIC_API_KEY;                       // Max-only invariant
+      const env = modelEnv();                             // Max-only, no .env secrets (lib/agent-env.cjs)
       const args = [...bin.slice(1), "-p", prompt, "--model", model, "--output-format", "text"];
       let child, out = "", done = false;
       const finish = (text) => { if (done) return; done = true; try { child?.kill("SIGKILL"); } catch {} resolve({ text: (text || "").trim() }); };

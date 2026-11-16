@@ -26,12 +26,13 @@ Everything else (PATH, HOME, the Claude Code settings variables, the supervisor'
 
 **Rule, held by `tests/agent-env-launchers.test.mjs`:** every launcher that starts `claude -p` with `bypassPermissions` goes through the lockdown. That combination gives the model Bash, so it could print its environment.
 
-**Not wired, on purpose:** the `claude -p` calls that give the model no Bash.
-- Tool-less judges with `--tools ""`: `lib/jev-claude.mjs`, `max-judge.js`, `speak-gate-agent.mjs`, `stop-evidence.mjs`, `place_naming.py`, `agent/core/stateless-executor.mjs`.
-- WebSearch-only calls without `bypassPermissions`, where headless mode refuses any other tool: `agent/capabilities/web-search.mjs`, `agent/supervisor/web-read.mjs`, the hum harvesters, `bin/watch-discover`, `bin/watchlist-intro-email`.
-- `agent/core/agent.mjs` and `agent/runtime/repl-sandbox.mjs`: plain `claude -p <prompt>` in default permission mode.
+**Model calls made by code** (id `model-calls`, since 2026-11-16): `lib/agent-env.cjs` `modelEnv()`, the same filter plus the Anthropic keys stripped. The model in these calls has no Bash, but the call runs inside a tool that has loaded `.env` (the phone channel, hum-sense, a cron job), and **a process's starting environment is readable by any process of the same user** (`ps eww <pid>`). So a `claude -p` handed the loaded `.env` showed every secret to any agent with Bash for as long as it ran: on 2026-11-16 a tool-less judgment from the phone channel was seen holding 106 variables, the whole `.env`. Wired:
+- the shared helpers `lib/jev-claude.mjs` and `lib/max-judge.js` (`maxOnlyEnv`), which most judgments go through: Jev, claim checks, outbound precheck, the speak gate, stop evidence, watch fit, the cheap-model rung (`lib/local-llm.mjs`), `day-statements`, the daily-summary review, photo place names;
+- `agent/core/stateless-executor.mjs` (the strict triage one-shot, `agent-oneshot`, family Q&A, wiki dedup), `agent/core/agent.mjs`, `agent/runtime/repl-sandbox.mjs`;
+- the WebSearch forks: `agent/capabilities/web-search.mjs`, `agent/supervisor/web-read.mjs`, the art and music harvesters, `bin/watch-discover`, `bin/watchlist-intro-email`, `trip-day-render`, `trip-day-select`, `trip-reservoir-build`, `lib/reservoir-refine.js`;
+- `lib/place_naming.py` (`_model_env`, through `agent-env.cjs --agent model-calls --print0`).
 
-Their environment still holds the secrets, but the model has no tool that reads it.
+The speak gate's research session runs gog through `bin/shims/gog`, since it no longer gets the keyring password. **Rule, held by `tests/model-call-env.test.mjs`:** every file that starts the `claude` binary with `-p` in process (Node or Python) references the filter. A process's own environment set by `process.env` assignments after it started is not in `ps eww`; only what a child is started with is.
 
 **Tools read their own secrets.** A program that needs a key loads `.env` itself: `lib/load-env.js` `loadEnv()` (Node; many libs call it at import, e.g. `plaid-api.js`, `supabase-rest.js`), `lib/supabase_local.py` `env_value()` (Python), or a `sed -n 's/^NAME=//p' .env` fallback (bash; `site-pass`, `card-pass`, `dev-pass`, `supabase-mcp`). The tools MCP server loads `.env` at start, so the CLIs it runs (`gog`, `homectl`, `imsg`) have what they need. A new tool that reads a secret must do the same: never rely on the agent's environment.
 

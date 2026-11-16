@@ -86,7 +86,7 @@ If nothing new, return {"items":[]}.`;
     const out = execFileSync(
       CLAUDE,
       ["-p", "--model", MODELS.sonnet, "--effort", "low", "--allowedTools", "WebSearch", "--output-format", "text", prompt],
-      { encoding: "utf8", timeout: 120000, maxBuffer: 2 * 1024 * 1024, stdio: ["pipe", "pipe", "ignore"] }
+      { encoding: "utf8", timeout: 120000, maxBuffer: 2 * 1024 * 1024, stdio: ["pipe", "pipe", "ignore"], env: createRequire(import.meta.url)("../../../lib/agent-env.cjs").modelEnv() }
     );
     // Extract JSON from the text output
     const parsed = extractJsonObject(out, { requireKey: "items" });

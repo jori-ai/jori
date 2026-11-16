@@ -38,7 +38,9 @@ test("CLAUDE_BIN honours the environment", () => assert.equal(CLAUDE_BIN, STUB))
 
 test("maxOnlyEnv strips API credentials and keeps the rest", () => {
   const e = maxOnlyEnv({ ANTHROPIC_API_KEY: "a", ANTHROPIC_AUTH_TOKEN: "b", HOME: "/h" });
-  assert.deepEqual(e, { HOME: "/h" });
+  assert.equal(e.ANTHROPIC_API_KEY, undefined);
+  assert.equal(e.ANTHROPIC_AUTH_TOKEN, undefined);
+  assert.equal(e.HOME, "/h");
 });
 
 test("a judgment is tool-less, MCP-less, session-less, prompt on stdin, no API key", async () => {
@@ -76,11 +78,11 @@ test("webSearch grants WebSearch and nothing else", async () => {
 
 test("not logged in is fatal; a missing structured output is not", async () => {
   process.env.STUB_MODE = "nologin";
-  await assert.rejects(judge({ model: "haiku", prompt: "p", schema: SCHEMA }), (e) => e.fatal === true && /Not logged in/.test(e.message));
+  await assert.rejects(judge({ model: "haiku", prompt: "p", schema: SCHEMA }), (e) => e.fatal === true && /Not logged in/.test(e.message)); // lang-regex-ok: matches a stub error message, not language
   process.env.STUB_MODE = "plain";
   await assert.rejects(judge({ model: "haiku", prompt: "p", schema: SCHEMA }), (e) => e.fatal === false);
   process.env.STUB_MODE = "crash";
-  await assert.rejects(judge({ model: "haiku", prompt: "p", schema: SCHEMA }), (e) => e.fatal === false && /boom/.test(e.message));
+  await assert.rejects(judge({ model: "haiku", prompt: "p", schema: SCHEMA }), (e) => e.fatal === false && /boom/.test(e.message)); // lang-regex-ok: matches a stub error message, not language
 });
 
 test("an onResult that throws never fails the judgment", async () => {

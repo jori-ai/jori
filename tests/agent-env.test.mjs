@@ -126,3 +126,38 @@ test("the bash helper hands the fork the filtered set, and nothing when not lock
     assert.match(r.stdout, /PLAID_SECRET=p/);
   });
 });
+
+test("modelEnv: a model call made by code starts without .env secrets once model-calls is locked down", () => {
+  withLocal({ lockdown: ["model-calls"] }, ({ envFile }) => {
+    const { modelEnv } = require("../lib/agent-env.cjs");
+    const env = modelEnv({ ...PARENT, ANTHROPIC_API_KEY: "a", ANTHROPIC_AUTH_TOKEN: "t" }, { envPath: envFile });
+    for (const k of ["PLAID_SECRET", "OP_SERVICE_ACCOUNT_TOKEN", "SUPABASE_SERVICE_ROLE_KEY", "SLACK_D", "ICLOUD_APP",
+      "JORI_WIKI_API_KEY", "JORI_CRON_CLAUDE_TOKEN", "GOG_KEYRING_PASSWORD", "SOME_RANDOM_API_KEY", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"]) {
+      assert.equal(env[k], undefined, `${k} dropped`);
+    }
+    assert.equal(env.CLAUDE_CODE_OAUTH_TOKEN, "max", "the Max login under cron is kept");
+    assert.equal(env.HOME, "/Users/u");
+    assert.equal(env.SUPABASE_URL, "https://x");
+  });
+});
+
+test("modelEnv: not locked down, it only strips the Anthropic keys (staged roll-out)", () => {
+  withLocal({ lockdown: ["ops"] }, ({ envFile }) => {
+    const { modelEnv } = require("../lib/agent-env.cjs");
+    const env = modelEnv({ ...PARENT, ANTHROPIC_API_KEY: "a" }, { envPath: envFile });
+    assert.equal(env.PLAID_SECRET, "p");
+    assert.equal(env.ANTHROPIC_API_KEY, undefined);
+  });
+});
+
+test("modelEnv: the shared judgment helpers use it", async () => {
+  const { maxOnlyEnv } = await import("../lib/jev-claude.mjs");
+  withLocal({ lockdown: ["model-calls"] }, () => {
+    const saved = process.env.PLAID_SECRET;
+    process.env.PLAID_SECRET = "p";
+    try {
+      assert.equal(maxOnlyEnv().PLAID_SECRET, undefined, "jev-claude");
+      assert.equal(require("../lib/max-judge.js").maxOnlyEnv().PLAID_SECRET, undefined, "max-judge");
+    } finally { if (saved === undefined) delete process.env.PLAID_SECRET; else process.env.PLAID_SECRET = saved; }
+  });
+});

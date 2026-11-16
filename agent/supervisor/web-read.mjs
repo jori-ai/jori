@@ -75,10 +75,11 @@ function runClaude({ system, prompt, model, effort, maxTurns }) {
   return new Promise((resolve, reject) => {
     const modelId = model || loadModels().opus;
     fs.mkdirSync(WORK_DIR, { recursive: true });
-    const env = { ...process.env, PATH: `/opt/homebrew/bin:${HOME}/.local/bin:${process.env.PATH || ""}` };
-    // The subscription, never the metered key: a stray credential would move this onto the API.
-    delete env.ANTHROPIC_API_KEY;
-    delete env.ANTHROPIC_AUTH_TOKEN;
+    // The subscription, never the metered key (a stray credential would move
+    // this onto the API), and none of the supervisor's .env secrets
+    // (lib/agent-env.cjs modelEnv): it reads the open web.
+    const base = require("../../lib/agent-env.cjs").modelEnv();
+    const env = { ...base, PATH: `/opt/homebrew/bin:${HOME}/.local/bin:${base.PATH || ""}` };
     const args = [
       "-p",
       "--model", modelId,

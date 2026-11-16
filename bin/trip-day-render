@@ -214,7 +214,7 @@ function pickPhoto(stop, place, files) {
   try {
     out = execFileSync("/bin/bash", ["-c",
       `${CLAUDE_BIN} -p --model ${MODELS.sonnet} --effort low --output-format text "${escaped}"`],
-      { encoding: "utf8", maxBuffer: 4 * 1024 * 1024, timeout: 180000 });
+      { encoding: "utf8", maxBuffer: 4 * 1024 * 1024, timeout: 180000, env: require("../lib/agent-env.cjs").modelEnv() });
   } catch (e) {
     // Most common cause by far: the Claude CLI reads its Max token from the
     // login keychain, which is NOT unlocked in a plain ssh session — it fails

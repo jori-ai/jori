@@ -444,7 +444,7 @@ async function main() {
     try {
       out = execFileSync("/bin/bash", ["-c",
         `${CLAUDE_BIN} -p --model ${MODELS.sonnet} --effort medium --output-format text "${escaped}"`],
-        { encoding: "utf8", maxBuffer: 10 * 1024 * 1024, timeout: 300000 });
+        { encoding: "utf8", maxBuffer: 10 * 1024 * 1024, timeout: 300000, env: require("../lib/agent-env.cjs").modelEnv() });
     } catch (e) { lastErr = e; continue; }
     const parsed = extractJson(out);
     if (parsed && Array.isArray(parsed.days)) {
