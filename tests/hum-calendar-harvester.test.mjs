@@ -156,3 +156,14 @@ test("pairKey: stable regardless of ordering + case / whitespace", () => {
     pairKey("FOO", "Bar"),
   );
 });
+
+test("situationStaleReason drops departures while moving and closed task refs", async () => {
+  const { situationStaleReason } = await import("../agent/scripts/hum-harvesters/_common.mjs");
+  assert.match(situationStaleReason({ kind: "DEPARTURE" }, { where: { activity: "driving" } }, {}), /moving/);
+  assert.equal(situationStaleReason({ kind: "DEPARTURE" }, { where: { activity: "stationary" } }, {}), null);
+  const ctx = { knowledge: { tasks: [{ id: "t1", status: "needsAction" }, { id: "t2", status: "completed" }] } };
+  assert.equal(situationStaleReason({ task_ref: "t1" }, {}, ctx), null);
+  assert.match(situationStaleReason({ task_ref: "t2" }, {}, ctx), /no longer open/);
+  assert.match(situationStaleReason({ task_ref: "gone" }, {}, ctx), /no longer open/);
+  assert.equal(situationStaleReason({ task_ref: "gone" }, {}, {}), null);
+});

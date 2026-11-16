@@ -323,3 +323,21 @@ export function geoGate(metro, dateStr, artist) {
     return { suppress: false, reason: `gate error (${e && e.message}) — fail-open` };
   }
 }
+
+// Harvest-time staleness check for a situation candidate. Structured fields
+// only: `kind` and `task_ref` come from the candidate's schema, motion from the
+// phone's own class labels, open tasks from context.knowledge.tasks when that
+// list is present. Returns a drop reason string, or null to keep.
+const MOVING_CLASSES = ["walking", "running", "cycling", "driving", "moving", "automotive"];
+export function situationStaleReason(parsed, sit, context) {
+  const kind = String(parsed?.kind || "").toUpperCase();
+  const motion = String(sit?.where?.activity || sit?.environment?.motion_class || "").toLowerCase();
+  if (kind === "DEPARTURE" && MOVING_CLASSES.includes(motion)) return `already moving (${motion})`;
+  const ref = parsed?.task_ref;
+  const tasks = context?.knowledge?.tasks;
+  if (ref && Array.isArray(tasks)) {
+    const open = tasks.some((t) => t && String(t.id) === String(ref) && t.status !== "completed");
+    if (!open) return `task ${ref} is no longer open`;
+  }
+  return null;
+}
