@@ -120,7 +120,8 @@ test("githubAudit: the wfx campaign IOCs come back clean on a clean account", ()
   const gh = fakeGh({
     "a/pulls": [{ number: 3, title: "Bump deps", head: { ref: "main-bump" }, user: { login: "Owner" }, created_at: new Date().toISOString() },
       { number: 4, title: "chore", head: { ref: "x" }, user: { login: "dependabot[bot]" }, created_at: new Date().toISOString() }],
-    "a/commits": [{ sha: "abc1234", author: { login: "owner" } }, { sha: "def5678", author: { login: "jori-bot" } }],
+    "a/commits": [{ sha: "abc1234", author: { login: "owner" } }, { sha: "def5678", author: { login: "jori-bot" } },
+      { sha: "aaa1111", author: null, committer: { login: "owner" }, commit: { author: { name: "claude" } } }],
   });
   const rows = githubAudit({ owner: "owner", repos, trusted: ["jori-bot"], gh, iocs: { pr_titles: ["docs: dependency audit notes"], branch_names: ["wfx", "audit"] } });
   assert.ok(rows.every((r) => r.status === "clean"), JSON.stringify(rows));

@@ -338,7 +338,9 @@ async function hostExposureItems(ctx) {
 function finalize(c, v) {
   const pre = String(v.unmet_precondition || "").trim();
   const status = itemStatus(c.checks || [], v.applies, { unmetPrecondition: pre });
-  if (pre && (c.checks || []).some((k) => k.kind === "version" && k.status === "found")) c.checks = [...c.checks, { check: "advisory precondition", status: status === "clean" ? "n/a" : "found", result: pre }];
+  // The precondition is shown as its own check line; callers spread `c` AFTER finalize so they keep it.
+  const extra = pre && (c.checks || []).some((k) => k.kind === "version" && k.status === "found") ? [{ check: "advisory precondition", status: status === "clean" ? "n/a" : "found", result: pre }] : [];
+  if (extra.length) c.checks = [...(c.checks || []), ...extra];
   const urgency = status === "clean" ? "none" : status === "exposed" && v.urgency === "none" ? "this_week" : v.urgency;
   return { ...v, status, urgency, applies: status === "exposed" ? "yes" : status === "clean" ? "no" : "unclear" };
 }
@@ -436,7 +438,7 @@ Never repeat an event already in already_alerted (same underlying event = same s
   const checked = [
     ...triaged.map((c) => ({ ...c, verdict: vmap.get(c.id), link: (c.items.find((i) => i.link && !i.link.includes("news.google.com/")) || c.items[0]).link })),
     ...newDeps.slice(0, 5).map((f, k) => ({ id: `d${k + 1}`, event_key: `dep:${f.key}:${f.ids[0]}`, kind: "dependency", headline: `${f.name} ${f.versions.join("/")} in ${f.repos.slice(0, 3).join(", ")}`, checks: depCks[k], verdict: vmap.get(`d${k + 1}`), link: `https://osv.dev/vulnerability/${f.ids[0]}` })),
-  ].filter((c) => c.verdict).map((c) => ({ ...c, verdict: finalize(c, c.verdict) }));
+  ].filter((c) => c.verdict).map((c) => { const verdict = finalize(c, c.verdict); return { ...c, verdict }; });
   // Chat is for urgent impact only: "this week" and below wait for Monday's email.
   const toSend = checked.filter((c) => c.verdict.status !== "clean" && c.verdict.urgency === "now" && !isThin(c.items || []))
     .sort((a, b) => URGENCY_ORDER[a.verdict.urgency] - URGENCY_ORDER[b.verdict.urgency]).slice(0, cfg.alert.max_alerts_per_run);
@@ -591,9 +593,9 @@ Also give one verdict for each merchant in new_merchants (payees from the user's
   const [vNews, vDeps] = await Promise.all([verdicts(newsEv, inv), verdicts(depCands, inv)]);
 
   const link = (c) => (c.items.find((i) => !i.link.includes("news.google.com/")) || c.items[0]).link;
-  const checkedNews = newsCands.filter((c) => vNews.get(c.id)).map((c) => ({ ...c, verdict: finalize(c, vNews.get(c.id)), link: link(c), title: c.items[0].title }));
+  const checkedNews = newsCands.filter((c) => vNews.get(c.id)).map((c) => { const verdict = finalize(c, vNews.get(c.id)); return { ...c, verdict, link: link(c), title: c.items[0].title }; });
   const checkedDeps = findings.map((f, k) => ({ id: `d${k + 1}`, event_key: `dep:${f.key}`, kind: "dependency", checks: depCks[k], headline: `${f.name} ${f.versions.join(" / ")} — ${f.repos.slice(0, 4).join(", ")}${f.repos.length > 4 ? ` +${f.repos.length - 4}` : ""}`, raw: vDeps.get(`d${k + 1}`), link: `https://osv.dev/vulnerability/${f.ids[0]}`, title: f.vulns[0]?.summary || f.ids[0] }))
-    .filter((c) => c.raw).map(({ raw, ...c }) => ({ ...c, verdict: finalize(c, raw) }));
+    .filter((c) => c.raw).map(({ raw, ...c }) => { const verdict = finalize(c, raw); return { ...c, verdict }; });
   const hostChecked = hostItems.map((h) => ({ ...h, verdict: { ...h.verdict, status: "exposed" } }));
   const bySev = (a, b) => URGENCY_ORDER[a.verdict.urgency] - URGENCY_ORDER[b.verdict.urgency];
   const affects = [...hostChecked, ...checkedNews.filter((c) => c.verdict.status === "exposed")].sort(bySev);
