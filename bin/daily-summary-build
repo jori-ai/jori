@@ -676,6 +676,15 @@ async function cmdConfirmVenue(date, stopId, name, source, resolvedOverride) {
   const resolved = loadResolved(date, resolvedOverride);
   const stop = (resolved.stops || []).find(s => s.id === stopId);
   if (!stop) die(`confirm-venue: stop ${stopId} not found in resolved day ${date}`);
+  // A span the phone never saw (resolve-day's moved_place_unknown) has no row of its
+  // own: the rows under it are the place it was cut FROM, so naming them would
+  // rename that place. The answer is a place named for a window.
+  if (stop.moved_place_unknown) {
+    die(`confirm-venue: stop ${stopId} is a span the phone never saw (place unknown, cut from `
+      + `${stop.moved_place_unknown.from_place}); record the answer with: location-confirm save-at "<place>" `
+      + `--lat <the place's lat> --lon <the place's lon> --start ${new Date(stop.start_ts_ms).toISOString()} `
+      + `--end ${new Date(stop.end_ts_ms).toISOString()} (or the window the user named)`);
+  }
   if (stop.lat == null || stop.lon == null) die(`confirm-venue: stop ${stopId} has no centroid`);
   // ± a 30-min window around the stop covers the visit row whose arrived_at lags
   // the first GPS sample slightly.

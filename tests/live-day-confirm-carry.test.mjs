@@ -323,3 +323,20 @@ test("an answer saved only to the confirmed-stops list counts as his answer", as
     if (prev === undefined) delete process.env.JORI_CONFIRMED_STOPS_FILE; else process.env.JORI_CONFIRMED_STOPS_FILE = prev;
   }
 });
+
+// A span cut out of a stop because the phone sat silent while the steps show the
+// user out (resolve-day / lib/day-steps.js) is the one place the user was NOT: a
+// prior name for the stop it was cut from never lands on it, even when it holds
+// the most of the prior's window and an answer row covers it.
+test("a prior name never renames a span the phone never saw", () => {
+  const prior = [interval("iv-old", 0, 260, "Home", "user_confirmed")];
+  const head = interval("iv-head", 0, 100, "Home", "named_location");
+  const away = { ...interval("iv-away", 100, 150, null, "moved_place_unknown"), moved_silence: true };
+  const answers = [{ name: "Home", start_ms: T0 - 600 * MIN, end_ms: T0 + 300 * MIN }];
+  preservePriorBeliefs([head, away], prior, answers);
+  assert.equal(away.place.name, null);
+  assert.equal(away.place.source, "moved_place_unknown");
+  const answered = { ...interval("iv-cafe", 100, 150, "Corner Cafe", "user_confirmed"), moved_silence: true };
+  preservePriorBeliefs([interval("iv-head2", 0, 100, "Home", "named_location"), answered], prior, answers);
+  assert.equal(answered.place.name, "Corner Cafe");
+});

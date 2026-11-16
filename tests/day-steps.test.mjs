@@ -712,3 +712,163 @@ test("JORI_EXCURSION_STEPS_DISTANCE=0 restores the route-or-nothing block", () =
     if (old == null) delete process.env.JORI_EXCURSION_STEPS_DISTANCE; else process.env.JORI_EXCURSION_STEPS_DISTANCE = old;
   }
 });
+
+// ---------------------------------------------------------------------------
+// A silence inside a stop is its place only when the steps agree
+// (splitStopsOnMovedSilence). Requirement: a long GPS silence inside a stop,
+// with the stop's place on both sides, is not filled as that place when the
+// steps show the user walked away while the phone stayed put; it becomes a
+// place-unknown span. A walk every device counted (the phone went along, its
+// GPS was only quiet), or no walking, leaves the stop as it was.
+// ---------------------------------------------------------------------------
+const { splitStopsOnMovedSilence, stepBursts, silentGapConfig, SILENT_GAP_DEFAULTS } = require("../lib/day-steps.js");
+const WATCH = "health.watch", PHONE = "health.phone";
+const fix = (ms, east = 0) => ({ ts: ms, lat: 12.3456, lon: -65.4321 + east * 1e-5, acc: 8, kind: "transit" });
+const one = (a, b, value, src) => ({ start_date: iso(a), end_date: iso(b), value, source_bundle_id: src });
+const homeStop = (from, to) => ({ id: "s1", start: "x", end: "y", start_ts_ms: from, end_ts_ms: to,
+  duration_min: Math.round((to - from) / 60000), lat: 12.3456, lon: -65.4321, place: { name: "Home", source: "named_location", confidence: 1 }, photos: [] });
+const cfg = (o = {}) => ({ ...SILENT_GAP_DEFAULTS, phone_sources: [], ...o });
+const hm = (ms) => new Date(ms).toISOString().slice(11, 16);
+// fixes every 5 minutes on both sides of a silence from `a` to `b`
+const fixesAround = (from, a, b, to) => {
+  const out = [];
+  for (let t = from; t <= a; t += 5 * 60000) out.push(fix(t));
+  for (let t = b; t <= to; t += 5 * 60000) out.push(fix(t));
+  return out;
+};
+
+test("the phone left at home while the Watch walks out and back: the span is place unknown, not home", () => {
+  const stop = homeStop(at(7), at(12));
+  const pings = fixesAround(at(7), at(8, 50), at(11, 25), at(12));
+  const samples = [
+    one(at(8, 20), at(8, 22), 20, PHONE), one(at(8, 40), at(8, 41), 25, PHONE),   // the phone in use before
+    one(at(9, 20), at(9, 30), 650, WATCH),                                         // walking out, phone silent
+    one(at(10, 15), at(10, 16), 18, WATCH), one(at(10, 50), at(10, 51), 6, WATCH), // sitting somewhere
+    one(at(11, 10), at(11, 20), 500, WATCH),                                       // walking back
+    one(at(11, 30), at(11, 40), 700, WATCH), one(at(11, 30), at(11, 40), 690, PHONE), // out again, phone along
+  ];
+  const r = splitStopsOnMovedSilence([stop], pings, samples, { config: cfg(), hm });
+  assert.deepEqual(r.stops.map(s => [hm(s.start_ts_ms), hm(s.end_ts_ms), s.place.name]),
+    [[hm(at(7)), hm(at(9, 20)), "Home"], [hm(at(9, 20)), hm(at(11, 25)), null], [hm(at(11, 25)), hm(at(12)), "Home"]]);
+  assert.equal(r.stops[2].id, "s1-r1");
+  const m = r.stops[1];
+  assert.equal(m.place.source, "moved_place_unknown");
+  assert.equal(m.lat, null);
+  assert.equal(m.moved_place_unknown.from_place, "Home");
+  assert.equal(m.cut_from, "s1");
+  const sil = r.silences.find(x => x.verdict === "moved");
+  assert.ok(sil, JSON.stringify(r.silences));
+  assert.deepEqual(sil.walks.map(w => w.away), [true, false]);
+  // the record carries times and verdicts, never a count
+  assert.ok(!JSON.stringify(r.silences).includes("650"));
+});
+
+test("walking every device counted (getting up at a show) stays the stop's place", () => {
+  const stop = { ...homeStop(at(19), at(21, 30)), place: { name: "Theatre", source: "user_confirmed", confidence: 1 } };
+  const pings = fixesAround(at(19), at(19, 10), at(21, 15), at(21, 30));
+  const samples = [
+    one(at(18, 40), at(18, 45), 300, PHONE), one(at(18, 40), at(18, 45), 290, WATCH),
+    one(at(19, 12), at(19, 17), 240, PHONE), one(at(19, 12), at(19, 17), 210, WATCH),  // to the seat
+    one(at(20, 10), at(20, 15), 200, PHONE), one(at(20, 10), at(20, 16), 190, WATCH),  // the interval
+    one(at(21, 13), at(21, 23), 600, WATCH), one(at(21, 14), at(21, 24), 620, PHONE),  // leaving
+  ];
+  const r = splitStopsOnMovedSilence([stop], pings, samples, { config: cfg(), hm });
+  assert.equal(r.stops.length, 1);
+  assert.equal(r.stops[0], stop);
+  assert.equal(r.silences[0].verdict, "walked_with_every_device");
+});
+
+test("a silence with no walking in it stays the place; one the readings do not reach is left alone", () => {
+  const stop = homeStop(at(7), at(12));
+  const pings = fixesAround(at(7), at(8), at(11), at(12));
+  const still = [one(at(6), at(6, 1), 30, WATCH), one(at(9), at(9, 1), 20, WATCH), one(at(12, 30), at(12, 31), 10, WATCH)];
+  const r = splitStopsOnMovedSilence([stop], pings, still, { config: cfg(), hm });
+  assert.equal(r.stops.length, 1);
+  assert.equal(r.silences[0].verdict, "still");
+  const r2 = splitStopsOnMovedSilence([stop], pings, [one(at(6), at(6, 1), 30, WATCH), one(at(9), at(9, 1), 20, WATCH)], { config: cfg(), hm });
+  assert.equal(r2.silences[0].verdict, "no_step_readings");
+  assert.equal(r2.stops.length, 1);
+});
+
+test("a quick step out (under min_moved_min) stays inside the stop", () => {
+  const stop = homeStop(at(7), at(12));
+  const pings = fixesAround(at(7), at(8), at(11), at(12));
+  const samples = [one(at(7, 30), at(7, 31), 20, PHONE), one(at(9, 30), at(9, 40), 400, WATCH), one(at(11, 30), at(11, 31), 20, PHONE)];
+  const r = splitStopsOnMovedSilence([stop], pings, samples, { config: cfg(), hm });
+  assert.equal(r.stops.length, 1);
+  assert.equal(r.silences[0].verdict, "moved_briefly");
+});
+
+test("a short silence, an unnamed stop and a walk block are not judged", () => {
+  const pings = fixesAround(at(7), at(8), at(8, 15), at(12));
+  const samples = [one(at(7, 30), at(7, 31), 20, PHONE), one(at(8, 2), at(8, 12), 600, WATCH), one(at(11, 30), at(11, 31), 20, PHONE)];
+  assert.equal(splitStopsOnMovedSilence([homeStop(at(7), at(12))], pings, samples, { config: cfg(), hm }).silences.length, 0);
+  const longGap = fixesAround(at(7), at(8), at(11), at(12));
+  const bare = { ...homeStop(at(7), at(12)), place: { name: null, source: "geocode" } };
+  const walk = { ...homeStop(at(7), at(12)), excursion: { away_m: 400 } };
+  assert.equal(splitStopsOnMovedSilence([bare, walk], longGap, samples, { config: cfg(), hm }).silences.length, 0);
+});
+
+test("phone_sources: the phone pacing at home while the Watch charges is not a move; the phone left behind is", () => {
+  const stop = homeStop(at(7), at(12));
+  const pings = fixesAround(at(7), at(8), at(11), at(12));
+  const pacing = [one(at(6), at(6, 1), 40, WATCH), one(at(9), at(9, 10), 450, PHONE), one(at(9, 20), at(9, 30), 420, PHONE),
+                  one(at(12, 30), at(12, 31), 40, WATCH)];
+  // with nothing configured the charging Watch looks like a device left behind
+  assert.equal(splitStopsOnMovedSilence([stop], pings, pacing, { config: cfg(), hm }).silences[0].verdict, "moved");
+  // naming the phone settles it: the phone walked, so the user did not leave it
+  assert.equal(splitStopsOnMovedSilence([stop], pings, pacing, { config: cfg({ phone_sources: [PHONE] }), hm }).silences[0].verdict,
+    "walked_with_every_device");
+  const leftBehind = [one(at(7, 30), at(7, 31), 20, PHONE), one(at(9), at(9, 10), 450, WATCH), one(at(10, 30), at(10, 40), 420, WATCH)];
+  assert.equal(splitStopsOnMovedSilence([stop], pings, leftBehind, { config: cfg({ phone_sources: [PHONE] }), hm }).silences[0].verdict, "moved");
+});
+
+test("the user's own answer for the window names the span instead of leaving it unknown", () => {
+  const stop = homeStop(at(7), at(12));
+  const pings = fixesAround(at(7), at(8), at(11), at(12));
+  const samples = [one(at(7, 30), at(7, 31), 20, PHONE), one(at(8, 30), at(8, 40), 600, WATCH),
+                   one(at(10, 30), at(10, 40), 600, WATCH), one(at(11, 30), at(11, 31), 20, PHONE)];
+  const r = splitStopsOnMovedSilence([stop], pings, samples, { config: cfg(), hm,
+    answerFor: () => ({ name: "Corner Cafe", lat: 12.35, lon: -65.43, start_ms: at(8, 40), end_ms: at(10, 30), ask_id: "lc-at-x" }) });
+  const named = r.stops.find(s => s.place.name === "Corner Cafe");
+  assert.ok(named);
+  assert.equal(named.place.source, "user_confirmed");
+  assert.equal(named.from_saved_at, "lc-at-x");
+  assert.deepEqual([hm(named.start_ts_ms), hm(named.end_ts_ms)], [hm(at(8, 40)), hm(at(10, 30))]);
+  assert.ok(!r.stops.some(s => s.moved_place_unknown));
+});
+
+test("bursts: a few steps just before a walk do not stretch it, and tiny batches are never a walk", () => {
+  const s = stepSeries([one(at(9), at(9, 1), 18, WATCH), one(at(9, 8), at(9, 9), 8, WATCH), one(at(9, 10), at(9, 20), 500, WATCH)]);
+  const b = stepBursts(s, cfg());
+  assert.equal(b.length, 1);
+  assert.equal(b[0].start_ms, at(9, 10));
+  assert.equal(stepBursts(stepSeries([one(at(9), at(9, 1), 18, WATCH), one(at(9, 5), at(9, 6), 30, WATCH)]), cfg()).length, 0);
+});
+
+test("silentGapConfig: the defaults stand when the installation sets nothing usable", () => {
+  const c = silentGapConfig({ gap_min: "x", burst_steps: 200, phone_sources: "nope" });
+  assert.equal(c.gap_min, SILENT_GAP_DEFAULTS.gap_min);
+  assert.equal(c.burst_steps, 200);
+  assert.deepEqual(c.phone_sources, []);
+});
+
+test("cutting a stop around a moved span loses no photo, and two answers in one outing are two stops", () => {
+  const stop = { ...homeStop(at(7), at(11, 16)), photos: [
+    { uuid: "early", ts: iso(at(7, 30)) }, { uuid: "away", ts: iso(at(10)) }, { uuid: "tail", ts: iso(at(11, 15)) }] };
+  const pings = fixesAround(at(7), at(8), at(11, 14), at(11, 16));
+  const samples = [one(at(7, 30), at(7, 31), 20, PHONE), one(at(8, 30), at(8, 40), 600, WATCH),
+                   one(at(11, 0), at(11, 10), 600, WATCH), one(at(11, 40), at(11, 41), 20, PHONE)];
+  const r = splitStopsOnMovedSilence([stop], pings, samples, { config: cfg(), hm });
+  // the 11:14-11:16 tail is under ten minutes and goes; its photo and the one taken
+  // while away (no GPS on it) stay on the day, on the nearest piece
+  const uuids = r.stops.flatMap(s => (s.photos || []).map(p => p.uuid)).sort();
+  assert.deepEqual(uuids, ["away", "early", "tail"]);
+  assert.equal(r.stops.find(s => s.moved_place_unknown).photos.map(p => p.uuid).join(), "away,tail");
+  const two = splitStopsOnMovedSilence([{ ...stop, photos: [] }], pings, samples, { config: cfg(), hm, answerFor: () => [
+    { name: "Bakery", lat: 1, lon: 1, start_ms: at(8, 45), end_ms: at(9, 30) },
+    { name: "Bookshop", lat: 1, lon: 1, start_ms: at(9, 40), end_ms: at(10, 50) },
+    { name: "Overlapping", lat: 1, lon: 1, start_ms: at(9, 20), end_ms: at(9, 50) }] });
+  assert.deepEqual(two.stops.map(s => s.place.name), ["Home", "Bakery", "Bookshop"]);
+  assert.deepEqual(two.stops.slice(1).map(s => s.id), ["s1-m1-1", "s1-m1-2"]);
+});
