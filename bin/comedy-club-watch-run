@@ -51,6 +51,7 @@ import { rosterHits, cardDate, onsalePhrase, itemKey, pingText, to24, urlDate,
 import { loadSightings, forComedian, repeatCheck } from "../lib/comedy-seen.mjs";
 
 const require = createRequire(import.meta.url);
+require("../lib/load-env.js").loadEnv(); // TICKETMASTER_* from .env (docs/agent-secrets.md)
 const { comedyConfig, root } = require("../lib/comedy-config.cjs");
 const { instance } = require("../lib/instance.cjs");
 

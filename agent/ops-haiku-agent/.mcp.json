@@ -5,7 +5,8 @@
       "command": "node",
       "args": ["${JORI_HOME}/agent/tools-mcp/index.mjs"],
       "env": {
-        "JORI_AGENT_ID": "ops-haiku"
+        "JORI_AGENT_ID": "ops-haiku",
+        "JORI_TOOL_PROFILE": "watcher"
       },
       "alwaysLoad": true
     },

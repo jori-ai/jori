@@ -62,6 +62,12 @@ if jori_financial_domain "$DOMAIN"; then
   exit 77
 fi
 
+# The agents' environment no longer carries the token (docs/agent-secrets.md):
+# read it from .env, as site-pass and card-pass do.
+if [[ -z "${OP_SERVICE_ACCOUNT_TOKEN:-}" && -f "$JORI_TOOLS/.env" ]]; then
+  OP_SERVICE_ACCOUNT_TOKEN="$(sed -n 's/^OP_SERVICE_ACCOUNT_TOKEN=//p' "$JORI_TOOLS/.env" | head -1)"
+  export OP_SERVICE_ACCOUNT_TOKEN
+fi
 if [[ -z "${OP_SERVICE_ACCOUNT_TOKEN:-}" ]]; then
   echo "dev-pass: OP_SERVICE_ACCOUNT_TOKEN is not set; cannot read the 1Password $DEV_VAULT vault." >&2
   exit 78

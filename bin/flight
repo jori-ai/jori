@@ -8,6 +8,7 @@ const { execSync } = require("child_process");
 // ── Paths ──────────────────────────────────────────────────────────────────
 const { installTools } = require("../lib/root.cjs");
 const { instance } = require("../lib/instance.cjs");
+require("../lib/load-env.js").loadEnv(); // OPENSKY_* from .env (docs/agent-secrets.md)
 const STATE_FILE = installTools("data", "flights.json");
 const LOG_FILE = installTools("logs", "flight-monitor.log");
 

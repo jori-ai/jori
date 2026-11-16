@@ -45,6 +45,9 @@ const path = require("path");
 const os = require("os");
 
 const { localDir } = require("../lib/instance.cjs");
+// SUPABASE_OAUTH_CLIENT_SECRET from .env: the agents' environment no longer
+// carries it, and `op` must not run on the unattended host (docs/agent-secrets.md).
+require("../lib/load-env.js").loadEnv();
 const JORI = path.resolve(__dirname, "..");
 const APP_FILE = path.join(localDir(), "supabase-oauth", "app.json");
 const STORE = path.join(JORI, "data/.supabase-oauth.json");

@@ -86,6 +86,10 @@ Hard architectural invariant — not a fallback chain. Strong preference for the
 
 Changing this invariant requires an explicit change to this rule + `system/architecture.md`. Full mechanics (keychain-first resolution, canned acks, history): `docs/agent-auth-model.md`.
 
+## Secrets — never read them yourself
+
+Your environment carries no keys, tokens or passwords once your agent is locked down (`agent/local/config/agent-env.json`). The tools that need one read it from `.env` themselves. **Never read `.env`, `secrets/`, `credentials/` or the Supabase OAuth store, never run `op` or `security find-*-password`, never dump the environment.** Run the tool that needs the secret (`site-pass`, `card-pass`, `dev-pass`, `email-send`, `plaid-*`, …), or tell the user what is missing. A PreToolUse hook (`bin/secrets-guard`) logs every such read, and in block mode refuses it. A tool you write that needs a secret loads `.env` itself (`lib/load-env.js`), never from the inherited environment. Your MCP tools are a profile (`JORI_TOOL_PROFILE`); a tool that says it is not available to this session is not, so ask the chat agent or the user. Mechanics: `docs/agent-secrets.md`.
+
 ## Effort Policy
 
 - Effort (`low|medium|high|xhigh`) is **session-scoped**, set by `--effort` at `claude -p` spawn. It **cannot** change mid-session. **Never** prepend `/effort <level>` to dispatched messages or playbooks — it is silently ignored. (`ultrathink`/`think hard` hints in the opening message ARE honored; they are a separate mechanism.)

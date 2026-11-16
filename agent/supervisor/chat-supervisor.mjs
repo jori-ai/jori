@@ -424,6 +424,8 @@ class ChatSupervisor {
       // ~/.claude/.credentials.json; the API key is reserved exclusively for
       // phone-channel ack generation (Haiku only).
       unsetEnv: ["ANTHROPIC_API_KEY"],
+      // Which agent-env lockdown entry applies (lib/agent-env.cjs).
+      agentEnvId: this.args.agent || "chat",
       // No idle compaction for the long-running chat session (Claude Code
       // 2.1.299+ would otherwise compact it after ~54 idle minutes). Chat has its
       // own context guard; this is per supervisor session, so the user's own

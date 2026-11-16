@@ -549,6 +549,8 @@ class Supervisor {
       // credentials in ~/.claude/.credentials.json; otherwise the API key
       // takes precedence and ops hits the same usage cap as the chat agent.
       unsetEnv: ["ANTHROPIC_API_KEY"],
+      // Which agent-env lockdown entry applies (lib/agent-env.cjs).
+      agentEnvId: this.args.agent || "ops",
       // Keep the session's prompt prefix byte-stable across rotations. With
       // git context on, claude -p snapshots `git status` + recent commits into
       // the context at session start; the repo always has churning untracked

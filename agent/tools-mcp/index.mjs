@@ -50,6 +50,7 @@ import { createToolRegistry } from "../core/tool-registry.mjs";
 import { createPluginLoader } from "../plugins/loader.mjs";
 import * as siStore from "../core/message-store.mjs";
 import { installRoot, installTools } from "../../lib/root.cjs";
+import { resolveProfile, allowsTool, callRefusal } from "./profiles.mjs";
 
 const exec = promisify(execFile);
 const BIN = installTools("bin");
@@ -57,6 +58,10 @@ const BIN = installTools("bin");
 // Who this installation serves (lib/instance.cjs): tool descriptions
 // name the operator as `OWNER` ("the user" in a fresh install).
 const { instance, localConfig, localDir } = require("../../lib/instance.cjs");
+// Secrets come from .env, not from the agent that started this server: the
+// supervisors hand claude a minimal environment (lib/agent-env.cjs), and the
+// CLIs run() starts (gog, homectl, imsg, …) inherit this process's env.
+require("../../lib/load-env.js").loadEnv();
 const ASSISTANT = require("../../lib/instance.cjs").assistantName(); // the assistant's configured name (lib/instance.cjs)
 const INSTANCE = instance();
 const OWNER = INSTANCE.owner_name;
@@ -925,8 +930,15 @@ if (process.env.JORI_AGENT_ID === "chat") {
   );
 }
 
+// Tool profile (JORI_TOOL_PROFILE, set per launcher in its MCP config):
+// list and serve only that profile's tools (profiles.mjs,
+// agent/config/tool-profiles.json).
+const PROFILE = resolveProfile(process.env.JORI_TOOL_PROFILE);
+if (PROFILE.warning) console.error(`[tools-mcp] ${PROFILE.warning}`);
+else console.error(`[tools-mcp] tool profile "${PROFILE.name}": ${TOOLS.filter((t) => allowsTool(PROFILE.profile, t.name)).length} of ${TOOLS.length} tools`);
+
 mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
-  tools: TOOLS.map((t) => ({
+  tools: TOOLS.filter((t) => allowsTool(PROFILE.profile, t.name)).map((t) => ({
     name: t.name,
     description: t.description,
     inputSchema: t.schema,
@@ -938,6 +950,8 @@ mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
   if (!tool) {
     return { content: [{ type: "text", text: `Unknown tool: ${request.params.name}` }], isError: true };
   }
+  const refused = callRefusal(PROFILE.name, PROFILE.profile, tool.name, request.params.arguments || {});
+  if (refused) return { content: [{ type: "text", text: refused }], isError: true };
   const result = await tool.run(request.params.arguments || {});
   return { content: [{ type: "text", text: result }] };
 });

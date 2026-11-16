@@ -13,7 +13,8 @@
       "command": "node",
       "args": ["${JORI_HOME}/agent/tools-mcp/index.mjs"],
       "env": {
-        "JORI_AGENT_ID": "chat"
+        "JORI_AGENT_ID": "chat",
+        "JORI_TOOL_PROFILE": "full"
       },
       "alwaysLoad": true
     },
