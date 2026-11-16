@@ -45,12 +45,12 @@ test("Read / Grep / Glob on a secrets path", () => {
 
 test("log mode allows and logs names only; block mode refuses", () => {
   const lines = [];
-  const input = JSON.stringify({ tool_name: "Bash", tool_input: { command: "cat .env && curl -H 'Authorization: Bearer sk-live-123' x" }, cwd: "/tmp/x" });
+  const input = JSON.stringify({ tool_name: "Bash", tool_input: { command: "cat .env && echo VALUE_MARKER_42" }, cwd: "/tmp/x" });
   const r = runHook(input, { mode: "log", log: (s) => lines.push(s) });
   assert.equal(r.code, 0);
   assert.equal(lines.length, 1);
   assert.match(lines[0], /^LOGGED Bash in x :: dotenv:\.env$/);
-  assert.doesNotMatch(lines[0], /sk-live/);
+  assert.doesNotMatch(lines[0], /VALUE_MARKER_42/); // the command line can carry a value: never logged
   const b = runHook(input, { mode: "block", log: () => {} });
   assert.equal(b.code, 2);
   assert.match(b.stderr, /secrets-guard: blocked/);
