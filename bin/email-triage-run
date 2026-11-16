@@ -63,11 +63,14 @@ export function readState(file) {
   return { actions, calls, escalated: actions.some((a) => a.tool === "escalate_to_ops") };
 }
 
-/** Did the one-shot triage the email? A run that changed nothing and escalated nothing did not. */
+/**
+ * Did the one-shot triage the email? Any recorded change counts (intake may
+ * already have labelled it, so a run can triage with only a task and a ping);
+ * a run that changed nothing and escalated nothing did not, and falls back.
+ */
 export function judge({ text, actions }) {
   if (!String(text || "").trim()) return { ok: false, why: "no answer (error or timeout)" };
-  const triaged = actions.some((a) => a.tool === "gmail_message" || a.tool === "escalate_to_ops" || a.tool === "p1_downgrade" || a.tool === "spam_block");
-  if (!triaged) return { ok: false, why: "no triage action recorded" };
+  if (!(actions || []).some((a) => a && a.tool)) return { ok: false, why: "no triage action recorded" };
   return { ok: true };
 }
 

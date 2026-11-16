@@ -76,3 +76,10 @@ test("dry run: read tools run, changing tools only record", async () => {
   assert.deepEqual(h.runs, [["triage-rules", "core"]]);
   assert.deepEqual(h.records.map((r) => [r.tool, r.dry]), [["gmail_message", true], ["notify_owner", true], ["escalate_to_ops", true]]);
 });
+
+test("the runner counts any recorded change as triage, and nothing as a fallback", async () => {
+  const { judge } = await import("../bin/email-triage-run");
+  assert.equal(judge({ text: "done", actions: [{ tool: "p1_task" }, { tool: "notify_owner" }] }).ok, true);
+  assert.equal(judge({ text: "done", actions: [] }).ok, false);
+  assert.equal(judge({ text: "", actions: [{ tool: "gmail_message" }] }).ok, false);
+});
