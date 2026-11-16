@@ -448,7 +448,7 @@ This only applies to genuine instructions — a plain acknowledgment ("thanks", 
 
 **Current mode: `shadow`** (`data/triage-decide-config.json`). Live triage is unchanged: every email still dispatches to you. Alongside each dispatch a detached `triage-decide shadow` logs what it WOULD have done to `data/triage-decide-shadow.jsonl`. You do not interact with it.
 
-**Measuring it.** `triage-decide report [--days N]` compares each shadow decision with what actually happened — the `triage_decisions` row (final label + priority, including any later reclassify or unstar by the user) — after a 20-minute settle.
+**Measuring it.** `triage-decide report [--days N]` compares each shadow decision with what actually happened — the `triage_decisions` row (final label + priority, including any later reclassification) — after a 20-minute settle. A P1 that was later **handled** (the user replied, unstarred it or resolved it by text; `p1-downgrade` sources `reply`, `unstar-scan`, `text-resolve`, `paired-followup`) stays a P1 in that row: the resolution is stamped in `resolved_at` / `resolved_by` and never rewrites the decision. Before 2026-11-16 it did, so every handled P1 read as P3 and the report showed ~61% priority agreement where the shadow had mostly matched the agent; the old rows were repaired from `data/p1-resolutions.jsonl` (`lib/triage-decisions.js` `repairFromResolutions`).
 
 **Cutover criteria — all must hold, over the report window:**
 1. ≥ 150 compared emails spanning ≥ 7 days;
@@ -456,4 +456,4 @@ This only applies to genuine instructions — a plain acknowledgment ("thanks", 
 3. **zero missed P1s** (the actual outcome was P1 and the shadow said P2/P3);
 4. (was: a human read of every disagreement first — waived by the user on 2026-10-05; read the `≠` rows in `triage-decide report` after the flip instead.)
 
-**The flip is automatic.** The daily `shadow-cutover-check` cron (10:00 local) sets `"mode": "live"` in the config when `report --json` says `verdict.ready`, and announces it once on the system channel. Rollback is the same edit back to `"shadow"` (read per email; no restart). In live mode any model failure, invalid output, failed gmail-action call, or agent-needing tag falls back to the normal dispatch — an email is never dropped.
+**The flip is held for the owner (since 2026-11-16).** The daily `shadow-cutover-check` cron (10:00 local) reads `report --json`; with `"auto_flip": false` in the config it announces readiness once on the system channel and leaves the mode alone, and the owner sets `"mode": "live"`. Without that key it flips on its own when `verdict.ready`, and announces it once. Rollback is the same edit back to `"shadow"` (read per email; no restart). In live mode any model failure, invalid output, failed gmail-action call, or agent-needing tag falls back to the normal dispatch — an email is never dropped.

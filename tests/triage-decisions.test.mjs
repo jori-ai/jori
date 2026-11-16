@@ -79,3 +79,45 @@ test("senderConsensusDetail: structured rows win once there are enough, else ema
   assert.equal(m.source, "email-mem");
   assert.equal(m.consensus.label, "personal");
 });
+
+test("a handled P1 stays a P1 decision; a reclassification does not", () => {
+  fresh();
+  for (const id of ["r1", "r2", "r3"]) decided(id, "Shop <orders@shop.com>", "personal", { star: true, p1: true });
+  // Resolved: the user replied / unstarred. p1-downgrade runs under a resolution actor.
+  process.env.JORI_TRIAGE_ACTOR = td.resolutionActor("reply");
+  for (const id of ["r1", "r2", "r3"]) { td.recordAction(id, "unlabel", "p1"); td.recordAction(id, "unstar"); }
+  delete process.env.JORI_TRIAGE_ACTOR;
+  const r = td.get("r1");
+  assert.equal(r.priority, "P1");
+  assert.equal(r.resolved_by, "resolution:reply");
+  assert.ok(r.resolved_at);
+  // Three handled P1s are not a P3 consensus for the sender.
+  assert.equal(td.senderConsensus("orders@shop.com").consensus, null);
+
+  // A reclassification (source triage / manual) is a new decision.
+  decided("c1", "News <news@shop.com>", "vendor", { star: true, p1: true });
+  assert.equal(td.resolutionActor("manual"), null);
+  td.recordAction("c1", "unlabel", "p1"); td.recordAction("c1", "unstar");
+  assert.equal(td.get("c1").priority, "P3");
+});
+
+test("repairFromResolutions restores resolved P1s and leaves reclassified ones", () => {
+  fresh();
+  for (const id of ["a", "b", "c"]) decided(id, "X <x@y.com>", "personal"); // rows now read P3 (as the old sweep left them)
+  const rows = [
+    { ts: "2026-11-01T10:00:00Z", messageId: "a", source: "unstar-scan", was_starred: true },
+    { ts: "2026-11-01T10:00:00Z", messageId: "b", source: "reply", was_starred: false },
+    { ts: "2026-11-02T10:00:00Z", messageId: "b", source: "manual" },          // later reclassified
+    { ts: "2026-11-01T10:00:00Z", messageId: "c", source: "triage" },
+    { ts: "2026-11-01T10:00:00Z", messageId: "zz", source: "reply" },          // no row: untouched
+  ];
+  assert.deepEqual(td.repairFromResolutions(rows, { dryRun: true }), { restored: 1, skipped: 3 });
+  assert.equal(td.get("a").priority, "P3");
+  assert.deepEqual(td.repairFromResolutions(rows), { restored: 1, skipped: 3 });
+  assert.equal(td.get("a").priority, "P1");
+  assert.equal(td.get("a").starred, 1);
+  assert.equal(td.get("a").resolved_by, "resolution:unstar-scan");
+  assert.equal(td.get("b").priority, "P3");
+  assert.equal(td.get("c").priority, "P3");
+  assert.deepEqual(td.repairFromResolutions(rows), { restored: 0, skipped: 4 }); // idempotent
+});
