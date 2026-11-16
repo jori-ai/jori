@@ -24,18 +24,59 @@
 // Fails toward delivery: if ops-light is unhealthy, or the POST fails, the item
 // goes to the local (ops) dispatcher exactly as before. Never drop an email.
 //
-// Config (agents.json → ops.gmailTriageTarget): "ops-light" (default) | "ops".
-// Rollback: set it to "ops" and restart the ops supervisor.
+// Config (agents.json → ops.gmailTriageTarget): "ops-light" (default) | "ops"
+// | "strict". Rollback: set it to "ops" and restart the ops supervisor.
+//
+// "strict" (2026-11-16): each per-message item first runs the strict one-shot
+// (bin/email-triage-run: no shell, web or browser; tools bound to the one email;
+// agent/ops-agent/jobs/email-triage-strict.md). When it does not finish — no
+// answer, a timeout, no triage action, or STRICT_MAX already running — the item
+// goes to ops-light exactly as before, with a note of what the one-shot already
+// did. Never drops an email.
 
 import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { execFile } from "node:child_process";
+import { fileURLToPath } from "node:url";
+
+const RUNNER = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "bin", "email-triage-run");
+export const STRICT_MAX = 3;
+
+// Run the strict one-shot for one email. Resolves { ok, actions, why }; never rejects.
+export function runStrictOneShot(packet, { timeoutMs = 9 * 60 * 1000 } = {}) {
+  return new Promise((resolve) => {
+    let f;
+    try {
+      f = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "triage-strict-")), "payload.json");
+      fs.writeFileSync(f, JSON.stringify(packet));
+    } catch (e) { return resolve({ ok: false, actions: [], why: `payload: ${e.message}` }); }
+    execFile(process.execPath, [RUNNER, "--payload", f], { timeout: timeoutMs, maxBuffer: 1 << 20 }, (err, stdout) => {
+      try { fs.rmSync(path.dirname(f), { recursive: true, force: true }); } catch {}
+      let r = null;
+      try { r = JSON.parse(String(stdout || "").trim().split("\n").pop()); } catch {}
+      if (r && r.ok === true && !err) return resolve(r);
+      resolve({ ok: false, actions: r?.actions || [], why: r?.why || err?.message || "no result" });
+    });
+  });
+}
+
+/** The note an ops-light fallback carries when the one-shot already acted. */
+export function strictFallbackNote(r) {
+  const done = (r?.actions || []).filter((a) => !a.dry).map((a) => a.summary || a.tool).filter(Boolean);
+  if (!done.length) return "";
+  return `\n\n[triage-route] A strict triage one-shot ran first and stopped (${r.why || "no result"}). It already did: ${done.join("; ")}. Do not repeat those; finish the rest.`;
+}
 
 export function triageTargetFromConfig(agentsConfig, { selfAgent = "ops" } = {}) {
   const self = agentsConfig?.agents?.[selfAgent] || {};
-  const target = self.gmailTriageTarget === undefined ? "ops-light" : self.gmailTriageTarget;
+  const configured = self.gmailTriageTarget === undefined ? "ops-light" : self.gmailTriageTarget;
+  const strict = configured === "strict";
+  const target = strict ? "ops-light" : configured;
   if (!target || target === selfAgent) return null;
   const sup = agentsConfig?.agents?.[target]?.supervisor;
   if (!sup?.webhookPort || !sup?.healthPort) return null;
-  return { agent: target, webhookPort: sup.webhookPort, healthPort: sup.healthPort };
+  return { agent: target, webhookPort: sup.webhookPort, healthPort: sup.healthPort, ...(strict ? { strict: true } : {}) };
 }
 
 export function makeTriageRouter({
@@ -46,7 +87,10 @@ export function makeTriageRouter({
   readFile = (p) => fs.readFileSync(p, "utf8"),
   log = () => {},
   timeoutMs = 5000,
+  runStrict = runStrictOneShot,   // the strict one-shot (target.strict)
+  strictMax = STRICT_MAX,
 }) {
+  let strictInFlight = 0;
   const token = () => { try { return readFile(tokenFile).trim(); } catch { return ""; } };
 
   async function healthy() {
@@ -58,8 +102,23 @@ export function makeTriageRouter({
     } catch { return false; }
   }
 
-  return async function routeTriage(content, source, { forceLocal = false } = {}) {
+  return async function routeTriage(content, source, { forceLocal = false, packet = null } = {}) {
     if (!target || forceLocal) return { routed: "local", result: localDispatch(content, source) };
+    if (target.strict && packet?.messageId) {
+      if (strictInFlight >= strictMax) {
+        log(`triage-route ${source} → ${target.agent} (strict: ${strictInFlight} already running)`);
+      } else {
+        strictInFlight++;
+        let r;
+        try { r = await runStrict({ ...packet, content }); } finally { strictInFlight--; }
+        if (r?.ok) {
+          log(`triage-route ${source} → strict one-shot (${r.escalated ? "escalated to ops" : "triaged"}, ${(r.actions || []).length} action(s))`);
+          return { routed: "strict" };
+        }
+        log(`triage-route ${source} → ${target.agent} (strict fallback: ${r?.why || "no result"})`);
+        content = content + strictFallbackNote(r);
+      }
+    }
     if (!(await healthy())) {
       log(`triage-route ${source} → ops (fallback: ${target.agent} unhealthy)`);
       return { routed: "local", result: localDispatch(content, source) };

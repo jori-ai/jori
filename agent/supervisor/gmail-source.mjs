@@ -1088,11 +1088,11 @@ export class GmailSource {
   // wired one (triage-route.mjs → the ops-light tier); mail
   // addressed to Jori (the command channel) always stays on the local ops
   // dispatcher. The attempt is recorded first either way.
-  _dispatchTriage(content, messageId, { commandChannel = false } = {}) {
+  _dispatchTriage(content, messageId, { commandChannel = false, packet = null } = {}) {
     try { recordAttempt(messageId, "triage", { file: this._trackingFile() }); } catch {}
     const source = `gmail:${messageId}`;
     if (this._triageDispatchFn && !commandChannel) {
-      Promise.resolve(this._triageDispatchFn(content, source))
+      Promise.resolve(this._triageDispatchFn(content, source, { packet }))
         .then((r) => { if (r?.routed && r.routed !== "local") this.triageLog?.(`triage ${messageId} → ${r.routed}`); })
         .catch(() => this._dispatchFn(content, source));
       return;
@@ -1145,11 +1145,11 @@ export class GmailSource {
         try { r = JSON.parse(String(stdout || "").trim().split("\n").pop()); } catch {}
         if (r && r.handled === true) { this.triageLog(`triage-decide live ${p.messageId} → executed in code, no dispatch`); return; }
         this.triageLog(`triage-decide live ${p.messageId} → agent (${r?.reason || err?.message || "no result"})`);
-        this._dispatchTriage(content, p.messageId, { commandChannel });
+        this._dispatchTriage(content, p.messageId, { commandChannel, packet: { messageId: p.messageId, from: p.from, subject: p.subject, date: p.date } });
       });
       return;
     }
-    this._dispatchTriage(content, p.messageId, { commandChannel });
+    this._dispatchTriage(content, p.messageId, { commandChannel, packet: { messageId: p.messageId, from: p.from, subject: p.subject, date: p.date } });
     if (m === "shadow" && eligible) {
       try {
         const c = spawn(process.execPath, [TRIAGE_DECIDE_BIN, "shadow", ...args], { detached: true, stdio: "ignore" });

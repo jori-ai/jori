@@ -102,3 +102,54 @@ test("ClaudeSession passes the flag only when asked", () => {
   assert.ok(new ClaudeSession({ ...base, excludeDynamicSystemPromptSections: true })._buildArgs({ resume: false }).includes("--exclude-dynamic-system-prompt-sections"));
   assert.ok(!new ClaudeSession(base)._buildArgs({ resume: false }).includes("--exclude-dynamic-system-prompt-sections"));
 });
+
+test("strict: config value 'strict' targets ops-light as the fallback", () => {
+  const s = structuredClone(AGENTS); s.agents.ops.gmailTriageTarget = "strict";
+  assert.deepEqual(triageTargetFromConfig(s), { agent: "ops-light", webhookPort: 9082, healthPort: 9083, strict: true });
+});
+
+test("strict: a finished one-shot is the whole route; a failed one falls back with what it did", async () => {
+  const strictTarget = { ...target, strict: true };
+  const packet = { messageId: "m1", from: "A <a@x.com>", subject: "s", date: "Mon, 16 Nov 2026 10:00:00 +0000" };
+  // finished
+  let { fn, calls } = fakeFetch();
+  let seen = null;
+  let route = makeTriageRouter({ target: strictTarget, localDispatch: () => {}, tokenFile: "/x", readFile: () => "t", fetchFn: fn,
+    runStrict: async (p) => { seen = p; return { ok: true, actions: [{ tool: "gmail_message" }] }; } });
+  assert.equal((await route("BODY", "gmail:m1", { packet })).routed, "strict");
+  assert.equal(seen.content, "BODY");
+  assert.equal(seen.messageId, "m1");
+  assert.equal(calls.length, 0);
+  // failed after acting → ops-light POST carries the note
+  ({ fn, calls } = fakeFetch());
+  route = makeTriageRouter({ target: strictTarget, localDispatch: () => {}, tokenFile: "/x", readFile: () => "t", fetchFn: fn,
+    runStrict: async () => ({ ok: false, why: "no answer", actions: [{ tool: "gmail_message", summary: "gmail-action label m1 personal" }] }) });
+  assert.equal((await route("BODY", "gmail:m1", { packet })).routed, "ops-light");
+  const post = calls.find((c) => !c.url.endsWith("/health"));
+  const body = JSON.parse(post.init.body);
+  assert.ok(body.task.startsWith("BODY"));
+  assert.ok(body.task.includes("gmail-action label m1 personal"));
+  // no packet (e.g. an old caller) → straight to ops-light, the one-shot never runs
+  ({ fn, calls } = fakeFetch());
+  let ran = false;
+  route = makeTriageRouter({ target: strictTarget, localDispatch: () => {}, tokenFile: "/x", readFile: () => "t", fetchFn: fn, runStrict: async () => { ran = true; return { ok: true }; } });
+  assert.equal((await route("BODY", "gmail:m2")).routed, "ops-light");
+  assert.equal(ran, false);
+});
+
+test("strict: at most strictMax one-shots at once; the rest go to ops-light", async () => {
+  const { fn } = fakeFetch();
+  let release;
+  const gate = new Promise((r) => { release = r; });
+  let started = 0;
+  const route = makeTriageRouter({ target: { ...target, strict: true }, localDispatch: () => {}, tokenFile: "/x", readFile: () => "t", fetchFn: fn, strictMax: 2,
+    runStrict: async () => { started++; await gate; return { ok: true, actions: [] }; } });
+  const p = (id) => route("B", `gmail:${id}`, { packet: { messageId: id } });
+  const a = p("a"), b = p("b");
+  const c = await p("c");
+  assert.equal(c.routed, "ops-light");
+  assert.equal(started, 2);
+  release();
+  assert.equal((await a).routed, "strict");
+  assert.equal((await b).routed, "strict");
+});
