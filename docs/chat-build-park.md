@@ -13,6 +13,7 @@ Before this, a build with a question built nothing and asked in its report. The 
    - The request moves from `running/` to `parked/<id>.json`, together with its session id and question.
    - A card goes to chat with `choices.kind = "build-park"` and `choices.ref = <id>`. It expires after 5 days.
    - A card held by question-hold still parks; the hold re-sends it with the same choices.
+   - The card (and the fallback report below) goes out with intent `chat-build-question`, which the speak gate may reword but never holds (`NEVER_HELD_INTENTS` in `lib/speak-gate-live.mjs`). A held card would strand the build: on 2026-11-16 the gate held the first test card as "the user didn't ask for this", so the build was closed and the question never arrived.
    - If the build can't be parked (no session id, or the card failed), the question goes out as the report, as before.
 3. **Answer.**
    - A tap is filed in code: the `build-park` handler in `lib/choice-reply.mjs` runs `build-park answer --id <id> --option <label>`, an exact match on our own labels.

@@ -64,6 +64,7 @@
     ],
     "intents": [
       "chat-build-result",
+      "chat-build-question",
       "self-improve",
       "cyber-watch",
       "cost-review"

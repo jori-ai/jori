@@ -33,6 +33,8 @@ SEND="$JORI_INSTALL_TOOLS/bin/jori-send-curl"
 # waiting for, not Jori narrating its own plumbing), and the report is written
 # by the run itself about work it just did, so its claims are live, not stale.
 REPORT=(--agent ops --channel chat --intent chat-build-result --evidence-as-of live)
+# A build's question is never held by the speak gate (lib/speak-gate-live.mjs NEVER_HELD_INTENTS).
+QUESTION=(--agent ops --channel chat --intent chat-build-question --evidence-as-of live)
 TIMEOUT_MIN=120
 
 mkdir -p "$Q/pending" "$Q/held" "$Q/running" "$Q/done" "$Q/failed" "$Q/results" "$Q/asks" "$Q/parked" "$(dirname "$LOG")"
@@ -165,7 +167,7 @@ if [ "$RC" -eq 78 ]; then
   "$SEND" "${REPORT[@]}" "🛠️ I didn't start the build you asked for ($(label "$Q/failed/$ID.json")). Claude Code on $HOST wasn't signed in to your Max plan, and builds only run on that — so nothing ran and nothing was charged. Once it's signed back in, ask me again and I'll pick it up." >> "$LOG" 2>&1 || true
 elif [ -n "$PARK_FALLBACK" ] && [ ! -s "$RESULT" ]; then
   mv "$Q/running/$ID.json" "$Q/done/$ID.json"
-  "$SEND" "${REPORT[@]}" "🛠️ The build you asked for ($(label "$Q/done/$ID.json")) needs an answer from you before it can go on: $PARK_FALLBACK — tell me and I'll start it again with your answer." >> "$LOG" 2>&1 || true
+  "$SEND" "${QUESTION[@]}" "🛠️ The build you asked for ($(label "$Q/done/$ID.json")) needs an answer from you before it can go on: $PARK_FALLBACK — tell me and I'll start it again with your answer." >> "$LOG" 2>&1 || true
 elif [ -s "$RESULT" ]; then
   mv "$Q/running/$ID.json" "$Q/done/$ID.json"
   "$SEND" "${REPORT[@]}" "🛠️ $(head -c 1500 "$RESULT")" >> "$LOG" 2>&1 || true

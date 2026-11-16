@@ -139,6 +139,14 @@ test("an email to the user is gated; a report email is never held", async () => 
   assert.equal(w.text, "fixed line");
 });
 
+test("a parked build's question is never held: a drop sends it as written", async () => {
+  fakeJudge({ verdict: "drop", reason: "pipeline test" });
+  const r = await gateOutbound({ message: "🛠️ a build question", channel: "chat", intent: "chat-build-question" });
+  assert.equal(r.deliver, true);
+  assert.equal(r.text, "🛠️ a build question");
+  assert.equal(r.review.verdict, "send");
+});
+
 test("an improvement card is never held: a drop sends it as written", async () => {
   fakeJudge({ verdict: "drop", reason: "plumbing" });
   const r = await gateOutbound({ message: "🔧 a card", channel: "improvements", intent: "improvement-card" });
