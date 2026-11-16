@@ -86,5 +86,26 @@ class ConfirmedStopAtRest(unittest.TestCase):
         self.assertIsNone(mod.match_confirmed_stop_at_rest(stop, [CLUB]))
 
 
+# Two different places inside the ring: ask, don't pick (a café 12 m from a
+# rental used to name nights at the rental by nearest-wins).
+CAFE_NEXT_DOOR = {"name": "Example Cafe", "centroid": dict(zip(("lat", "lon"), P(8.0, 9.0)))}
+CLUB_WORDY = {"name": "example jazz club - drinks after the show", "centroid": dict(zip(("lat", "lon"), P(2.0, 1.0)))}
+
+
+class ConfirmedStopAmbiguity(unittest.TestCase):
+    def test_two_different_places_in_the_ring_name_nothing(self):
+        self.assertIsNone(mod.match_confirmed_stop(CLUB_LAT, CLUB_LON, [CLUB, CAFE_NEXT_DOOR]))
+        self.assertIsNone(mod.match_confirmed_stop_at_rest(club_stop(), [CLUB, CAFE_NEXT_DOOR]))
+
+    def test_one_answer_worded_two_ways_is_one_place(self):
+        hit = mod.match_confirmed_stop(CLUB_LAT, CLUB_LON, [CLUB, CLUB_WORDY])
+        self.assertIsNotNone(hit)
+        self.assertEqual(hit[0]["name"], "Example Jazz Club")
+
+    def test_a_place_outside_the_ring_does_not_make_it_ambiguous(self):
+        hit = mod.match_confirmed_stop(CLUB_LAT, CLUB_LON, [CLUB, NEIGHBOUR])
+        self.assertEqual(hit[0]["name"], "Example Jazz Club")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

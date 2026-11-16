@@ -254,3 +254,47 @@ test("with nothing on disk, anything is written", () => {
 test("two empties are harmless — the guard does not wedge the file", () => {
   assert.equal(shouldReplaceDay(day("2026-08-07", 0), day("2026-08-07", 0)), true);
 });
+
+// ── A carried name must still be his answer (2026-11-15) ──
+// A prior interval can say user_confirmed without his answer behind it (a name
+// taken from a nearby earlier answer, a row since trimmed or reverted). Once
+// carried it used to be locked for good: nights at a rental 12 m from a café
+// stayed "the café" even after resolve-day named them correctly.
+const ans = (name, startMin, durMin) => ({ name, start_ms: T0 + startMin * MIN, end_ms: T0 + (startMin + durMin) * MIN });
+
+test("a prior name with no answer of his behind it is not carried; the current resolution stands", () => {
+  const night = interval("iv-night", 0, 500, "The rental", "confirmed_stop");
+  const prior = interval("iv-night-prior", 0, 480, "Corner Cafe", "user_confirmed");
+  const newIntervals = [night];
+  // His only answer for the café is a morning visit, not this night.
+  preservePriorBeliefs(newIntervals, [prior], [ans("Corner Cafe", 560, 40)]);
+  assert.equal(night.place.name, "The rental");
+  assert.equal(carryLines(night).length, 0);
+  assert.equal(night.evidence_log.filter((e) => e.source === "user_confirmed_released").length, 1);
+});
+
+test("a prior name his answer still covers is carried, matching the name across case and accents", () => {
+  const stop = interval("iv-stop", 0, 60, "12 Example St", "visit_address");
+  const prior = interval("iv-stop-prior", 0, 55, "Corner Café", "user_confirmed");
+  preservePriorBeliefs([stop], [prior], [ans("corner cafe", 10, 30)]);
+  assert.equal(stop.place.name, "Corner Café");
+  assert.equal(carryLines(stop).length, 1);
+});
+
+test("without the day's answers (fetch failed) the carry behaves as before", () => {
+  const stop = interval("iv-stop", 0, 60, "12 Example St", "visit_address");
+  const prior = interval("iv-stop-prior", 0, 55, "Corner Cafe", "user_confirmed");
+  preservePriorBeliefs([stop], [prior], null);
+  assert.equal(stop.place.name, "Corner Cafe");
+});
+
+test("an unbacked prior with no overlapping interval is not re-added as a stop of its own", () => {
+  const other = interval("iv-later", 600, 30, "Somewhere", "confirmed_stop");
+  const orphan = interval("iv-orphan", 0, 120, "Corner Cafe", "user_confirmed");
+  const list = [other];
+  preservePriorBeliefs(list, [orphan], []);
+  assert.deepEqual(list.map((i) => i.id), ["iv-later"]);
+  const backed = [interval("iv-later", 600, 30, "Somewhere", "confirmed_stop")];
+  preservePriorBeliefs(backed, [orphan], [ans("Corner Cafe", 0, 120)]);
+  assert.deepEqual(backed.map((i) => i.id).sort(), ["iv-later", "iv-orphan"]);
+});
