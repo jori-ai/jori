@@ -11,7 +11,7 @@ Before this, a build with a question built nothing and asked in its report. The 
    - A build may ask at most 3 times.
 2. **Park.** `agent/scripts/trigger-chat-build.sh` gives every run `JORI_FORK_SESSION_OUT=asks/<id>.session`. After a clean run that left an ask, it calls `build-park park`:
    - The request moves from `running/` to `parked/<id>.json`, together with its session id and question.
-   - A card goes to chat with `choices.kind = "build-park"` and `choices.ref = <id>`. It expires after 5 days.
+   - A card goes to chat with `choices.kind = "decision"`, `choices.handler = "build-park"` and `choices.ref = <id>`. It expires after 5 days. The kind must be `decision`: the app draws the multiple-choice card only for that kind (`ChoicePrompt.swift` `isDecision`); the first test card, sent as kind `build-park`, showed as plain text with a numbered list. `handler` is what routes the answer to build-park instead of the decision queue (choice-reply, the phone-channel hint, and question-dismiss all check it).
    - A card held by question-hold still parks; the hold re-sends it with the same choices.
    - The card (and the fallback report below) goes out with intent `chat-build-question`, which the speak gate may reword but never holds (`NEVER_HELD_INTENTS` in `lib/speak-gate-live.mjs`). A held card would strand the build: on 2026-11-16 the gate held the first test card as "the user didn't ask for this", so the build was closed and the question never arrived.
    - If the build can't be parked (no session id, or the card failed), the question goes out as the report, as before.

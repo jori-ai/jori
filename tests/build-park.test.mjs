@@ -24,7 +24,8 @@ test("ask → park → tap answer → the request is back in pending with the se
   let sent = null;
   const r = park({ id: "b1", sessionId: "sess-1" }, { q, now, send: (c) => { sent = c; return { ok: true, msgId: "m1" }; } });
   assert.equal(r.parked, true);
-  assert.equal(sent.choices.kind, KIND);
+  assert.equal(sent.choices.kind, "decision"); // the app draws multiple choice only for this kind
+  assert.equal(sent.choices.handler, KIND);
   assert.equal(sent.choices.ref, "b1");
   assert.deepEqual(sent.choices.options.map((o) => o.label), Q.options);
   assert.ok(sent.text.includes("needs one answer"));

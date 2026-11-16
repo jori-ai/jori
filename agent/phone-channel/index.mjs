@@ -669,12 +669,13 @@ function decisionReplyHint(parent) {
     const extHint = p?.kind !== "decision" && p?.ref ? REPLY_HINTS[p.kind] : null;
     if (typeof extHint === "function") return extHint(p) || "";
     // A chat build parked on a question (lib/build-park.mjs): the typed answer
-    // resumes that build's own session.
-    if (p?.kind === "build-park" && p.ref) {
+    // resumes that build's own session. Drawn as a decision card, routed by
+    // `handler` (cards sent before 2026-11-16 carry kind "build-park").
+    if ((p?.handler || p?.kind) === "build-park" && p.ref) {
       const bopts = (p.options || []).map((o, i) => `${i + 1}. ${o.label}`).join("; ");
       return `[Build question ${p.ref}] That message was a build they asked for, stopped to ask them this (options: ${bopts}). Once you know their answer, file it with \`${installTools("bin/build-park")} answer --id ${p.ref} --option "<that option's label, exactly>"\` or \`--text "<their answer, in their words>"\`; the build then resumes where it stopped. Confirm in one short line. If they are asking about it rather than answering, answer and leave it open.\n\n`;
     }
-    if (p?.kind !== "decision" || !p.ref) return "";
+    if (p?.kind !== "decision" || p.handler || !p.ref) return "";
     const opts = (p.options || []).map((o, i) => `${i + 1}. ${o.label}`).join("; ");
     return `[Decision card ${p.ref}] That message was a decision ${ASSISTANT} asked them (options: ${opts}). Once you know their answer — an option (by number or meaning) or their own words — file it with \`~/Dev/jori/bin/decision-answer --ref ${p.ref} --option "<that option's label, exactly>"\` or \`--text "<their answer>"\`, then confirm in one short line. If they are asking about it rather than answering, answer and leave it open.\n\n`;
   } catch {

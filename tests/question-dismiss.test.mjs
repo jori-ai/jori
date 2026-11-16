@@ -57,6 +57,14 @@ test("a decision card is closed in its source", async () => {
   assert.deepEqual(d.calls.retired, []);
 });
 
+test("a build question drawn as a decision card is not sent to the decision queue", async () => {
+  const d = deps();
+  const choices = JSON.stringify({ v: 1, kind: "decision", handler: "build-park", ref: "req-1", options: [{ label: "Yes" }, { label: "No" }] });
+  await dismissQuestion({ id: "m10", metadata: { choices } }, d);
+  assert.deepEqual(d.calls.decisions, []);
+  assert.deepEqual(d.calls.stamped, [[["m10"], "dismissed"]]);
+});
+
 test("the decision source entry becomes dismissed and is no longer open", async () => {
   const dq = await import("../lib/decision-queue.mjs");
   const q = { id: "abc", status: "open", question: "Stay in touch?", options: ["Yes", "No"] };
