@@ -2972,6 +2972,31 @@ def cmd_pending(args, as_json=False):
             print(f"  {i}. {c['name']}{rating}{reviews} — {c['type']} · {c['distance_m']}m")
         print()
 
+def _agent_env(agent):
+    """The environment for a claude -p this script starts: lib/agent-env.cjs's
+    filtered set (no secrets) when the installation locks `agent` down
+    (agent/local/config/agent-env.json), else ours unchanged. Fails open.
+    docs/agent-secrets.md."""
+    import shutil
+    lib = os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "lib", "agent-env.cjs")
+    node = os.environ.get("JORI_NODE") or shutil.which("node")
+    if not node or not os.path.exists(lib):
+        return dict(os.environ)
+    try:
+        r = subprocess.run([node, lib, "--agent", agent, "--print0"], capture_output=True, timeout=10)
+        if r.returncode == 0 and r.stdout:
+            kept = {}
+            for kv in r.stdout.decode("utf-8", "replace").split("\0"):
+                if "=" in kv:
+                    k, v = kv.split("=", 1)
+                    kept[k] = v
+            if kept:
+                return kept
+    except Exception:
+        pass
+    return dict(os.environ)
+
+
 def _haiku_toolless(prompt, timeout=30):
     """One tool-less Claude Haiku judgment on the Max session — the same flags
     as lib/jev-claude.mjs toollessArgs (no tools, no MCP, no user settings, no
@@ -2990,7 +3015,7 @@ def _haiku_toolless(prompt, timeout=30):
         pass
     if not model:
         raise RuntimeError("JORI_MODEL_HAIKU missing from agent/config/models.env")
-    env = {k: v for k, v in os.environ.items() if k not in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN")}
+    env = {k: v for k, v in _agent_env("findme").items() if k not in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN")}
     r = subprocess.run(
         [os.path.expanduser("~/.local/bin/claude"), "-p", "--model", model, "--effort", "low",
          "--tools", "", "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}',

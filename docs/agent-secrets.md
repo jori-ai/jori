@@ -21,10 +21,17 @@ Everything else (PATH, HOME, the Claude Code settings variables, the supervisor'
 **Spawn sites wired:**
 - `agent/supervisor/claude-session.mjs`, the four supervisors' sessions (`agentEnvId` = the agents.json id).
 - `agent/scripts/lib/run-ephemeral-opus.sh` and `run-ephemeral-fable.sh`, every Opus/Fable fork (`agent-env.sh` `jori_agent_env_cmd forks` → `env -i …`). The runner still sources `.env` for its own needs; only `claude` gets the filtered set.
+- `bin/daily-summary-run` (id `daily-summary`) and `bin/finance-review-run` (id `finance-review`), the same way. Each logs `agent env: locked down, N kept` or `inherited` per run.
+- `bin/findme`'s tool-less Haiku call (id `findme`, `_agent_env`).
 
-**Not yet wired (they inherit the full environment):**
-- Tool-less or strict one-shots: `stateless-executor`, `email-inbound-run`, `agent-oneshot`, `family-qa`, `speak-gate`, `local-llm`. They have no Bash, so the model cannot read the environment.
-- `bin/findme`, `bin/daily-summary-run` and `bin/finance-review-run`, which launch `claude -p` themselves.
+**Rule, held by `tests/agent-env-launchers.test.mjs`:** every launcher that starts `claude -p` with `bypassPermissions` goes through the lockdown. That combination gives the model Bash, so it could print its environment.
+
+**Not wired, on purpose:** the `claude -p` calls that give the model no Bash.
+- Tool-less judges with `--tools ""`: `lib/jev-claude.mjs`, `max-judge.js`, `speak-gate-agent.mjs`, `stop-evidence.mjs`, `place_naming.py`, `agent/core/stateless-executor.mjs`.
+- WebSearch-only calls without `bypassPermissions`, where headless mode refuses any other tool: `agent/capabilities/web-search.mjs`, `agent/supervisor/web-read.mjs`, the hum harvesters, `bin/watch-discover`, `bin/watchlist-intro-email`.
+- `agent/core/agent.mjs` and `agent/runtime/repl-sandbox.mjs`: plain `claude -p <prompt>` in default permission mode.
+
+Their environment still holds the secrets, but the model has no tool that reads it.
 
 **Tools read their own secrets.** A program that needs a key loads `.env` itself: `lib/load-env.js` `loadEnv()` (Node; many libs call it at import, e.g. `plaid-api.js`, `supabase-rest.js`), `lib/supabase_local.py` `env_value()` (Python), or a `sed -n 's/^NAME=//p' .env` fallback (bash; `site-pass`, `card-pass`, `dev-pass`, `supabase-mcp`). The tools MCP server loads `.env` at start, so the CLIs it runs (`gog`, `homectl`, `imsg`) have what they need. A new tool that reads a secret must do the same: never rely on the agent's environment.
 

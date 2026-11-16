@@ -69,6 +69,12 @@ source "$JORI_INSTALL_TOOLS/agent/scripts/lib/fork-connector-deny.sh"
 FR_DISALLOWED_TOOLS="${FR_DISALLOWED_TOOLS-${JORI_FORK_CONNECTOR_DENY-}}"
 FR_SETTINGS="${FR_SETTINGS-${JORI_FORK_SKILL_SETTINGS-}}"
 FR_SETTINGS="$(jori_fork_settings "$FR_SETTINGS")"
+# The fork's claude gets the agent environment, not this runner's (which sourced
+# all of .env above): lib/agent-env.cjs drops every secret when the installation
+# locks "finance-review" down (agent/local/config/agent-env.json). Fails open. docs/agent-secrets.md.
+source "$JORI_INSTALL_TOOLS/agent/scripts/lib/agent-env.sh"
+jori_agent_env_cmd finance-review
+log "agent env: $([ ${#AGENT_ENV_CMD[@]} -gt 0 ] && echo "locked down, $(( ${#AGENT_ENV_CMD[@]} - 2 )) kept" || echo "inherited")"
 source "$JORI_INSTALL_TOOLS/agent/scripts/lib/local-rules.sh"
 source "$JORI_TOOLS/agent/config/models.env"   # JORI_MODEL_SONNET
 LOCAL_COMPANION="$(jori_job_companion "$JOB_MD")"
@@ -90,7 +96,7 @@ log "start (sonnet $EFFORT)"
   printf '%s\n' "$PLAYBOOK_BODY"
   [[ -n "$LOCAL_COMPANION" ]] && printf '\n%s\n' "$(cat "$LOCAL_COMPANION")"
   printf '\n---\n\nDispatch instruction for this run: FINANCE REVIEW (source: %s)\n' "${FINANCE_REVIEW_SOURCE:-dispatch}"
-} | ( cd "$CWD" && "$CLAUDE" -p \
+} | ( cd "$CWD" && ${AGENT_ENV_CMD[@]+"${AGENT_ENV_CMD[@]}"} "$CLAUDE" -p \
       --model "$JORI_MODEL_SONNET" \
       --effort "$EFFORT" \
       --permission-mode bypassPermissions \

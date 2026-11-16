@@ -414,6 +414,12 @@ DS_DISALLOWED_TOOLS="${DS_DISALLOWED_TOOLS-${JORI_FORK_CONNECTOR_DENY-}}"
 DS_SKILL_SETTINGS="${DS_SKILL_SETTINGS-${JORI_FORK_SKILL_SETTINGS-}}"
 # + the git-rollback guard hook (D2), merged into the same --settings.
 DS_SKILL_SETTINGS="$(jori_fork_settings "$DS_SKILL_SETTINGS")"
+# The fork's claude gets the agent environment, not this runner's (which sourced
+# all of .env above): lib/agent-env.cjs drops every secret when the installation
+# locks "daily-summary" down (agent/local/config/agent-env.json). Fails open. docs/agent-secrets.md.
+source "$JORI_INSTALL_TOOLS/agent/scripts/lib/agent-env.sh"
+jori_agent_env_cmd daily-summary
+log "agent env: $([ ${#AGENT_ENV_CMD[@]} -gt 0 ] && echo "locked down, $(( ${#AGENT_ENV_CMD[@]} - 2 )) kept" || echo "inherited")"
 
 # The instance's own rules (agent/local/, scripts/lib/local-rules.sh):
 # the playbook's local companion after the playbook body, and shared.md +
@@ -438,7 +444,7 @@ PLAYBOOK_BODY=$(awk '
   printf '%s\n' "$PLAYBOOK_BODY"
   [[ -n "$LOCAL_COMPANION" ]] && printf '\n%s\n' "$(cat "$LOCAL_COMPANION")"
   printf '\n---\n\nDispatch instruction for this run (the target date is always given; it supersedes any default in Step 1): %s\n' "$TASK_LINE"
-} | ( cd "$CWD" && "$CLAUDE" -p \
+} | ( cd "$CWD" && ${AGENT_ENV_CMD[@]+"${AGENT_ENV_CMD[@]}"} "$CLAUDE" -p \
       --model "$JORI_MODEL_SONNET" \
       --effort "$EFFORT" \
       $( (( DRY_RUN )) && echo "--output-format json" ) \
