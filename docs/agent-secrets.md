@@ -62,12 +62,12 @@ It follows `cd`, `bash -c`/`sh -c` and `eval`, like the git guard. It only sees 
 
 **Modes:** set by `agent-env.json` `guard`, re-read on every call.
 - `"log"` (default): allow, and append `LOGGED <tool> in <cwd> :: <kind>:<target>` to `agent/logs/secrets-guard.log`.
-- `"block"`: exit 2 with a reason the model reads.
+- `"block"`: exit 2 with a reason the model reads. An environment dump is still only logged: a locked-down agent's environment holds no secret, and `env | grep PATH` is ordinary debugging.
 - `"off"`.
 
 The log names the kind and the matched path or program, never the command line, which can carry a value.
 
-Roll-out: a week in `log`; read the log; move what legitimately needs a secret into a tool; then `block`.
+Roll-out: the plan was a week in `log`; the user switched to `block` on 2026-11-16, once every agent was locked down. Playbooks that had the agent source `.env` were moved onto tools that read it themselves (`improvement-plan` → `db-read`, the portfolio quotes → the installation's quotes CLI). The paused marketing playbooks (`mkt-*`) still tell the agent to source `.env` or run `op`; they fail at the guard if unpaused, and need the same move first.
 
 ## 3. Tool profiles
 

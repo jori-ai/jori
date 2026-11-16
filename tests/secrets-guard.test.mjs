@@ -55,6 +55,10 @@ test("log mode allows and logs names only; block mode refuses", () => {
   assert.equal(b.code, 2);
   assert.match(b.stderr, /secrets-guard: blocked/);
   assert.equal(runHook(input, { mode: "off", log: () => assert.fail("no log when off") }).code, 0);
+  const dump = JSON.stringify({ tool_name: "Bash", tool_input: { command: "env | grep PATH" }, cwd: "/tmp/x" });
+  const seen = [];
+  assert.equal(runHook(dump, { mode: "block", log: (s) => seen.push(s) }).code, 0, "an env dump is logged, not blocked");
+  assert.match(seen[0], /^LOGGED/);
   assert.equal(runHook("not json", { mode: "block" }).code, 0);
 });
 
