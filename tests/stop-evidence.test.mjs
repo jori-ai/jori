@@ -16,6 +16,7 @@ process.env.JORI_LOCAL_DIR = LOCAL;
 const {
   readJpegExif, exifTimeMs, exifFix, attachmentUrl, buildCandidates, hasDirectEvidence,
   acceptLegacy, interpretJev, decideVenue, evidenceVerdict, buildState, askSonnet,
+  annotateWrittenFrom, gatherEvidence,
 } = await import("../lib/stop-evidence.mjs");
 
 // Synthetic coordinates: metres east/north of an obviously fake origin, so the
@@ -310,4 +311,52 @@ test("audit: a cardless hum-ask stop question counts by finding_key; one sent be
     "reported, not silently zero, and not audited as a stop with no window");
   // Without the ledger nothing hum-ask sent can be told from an FYI, so none of it counts.
   assert.equal(askedStops(gateRows, messages, "2026-10-18", "Asia/Jerusalem").asked.size, 0);
+});
+
+// A message written before the window began was written wherever the user was THEN.
+// The next stop, 300 m on, must not be named from a remark sent at the first.
+test("a message written before the window carries how far the phone was from this stop", () => {
+  const msgs = [{ t: START - 4 * 60000, who: "Alex", text: "This place was great" }, { t: START + 5 * 60000, who: "Alex", text: "still here" }];
+  const fixes = [{ t: START - 5 * 60000, ...fakeAt(317, 0), acc: 12 }];
+  assert.equal(annotateWrittenFrom(msgs, fixes, REST, START), 1);
+  assert.ok(Math.abs(msgs[0].from_stop_m - 317) <= 2);
+  assert.equal(msgs[1].from_stop_m, undefined, "a message inside the window is not tagged");
+});
+
+test("no fix near the message in time, or only a poor one, tags nothing (fail open)", () => {
+  const msg = () => [{ t: START - 4 * 60000, who: "Alex", text: "x" }];
+  const far = msg(), poor = msg(), noAnchor = msg();
+  assert.equal(annotateWrittenFrom(far, [{ t: START - 30 * 60000, ...fakeAt(300, 0), acc: 10 }], REST, START), 0);
+  assert.equal(annotateWrittenFrom(poor, [{ t: START - 4 * 60000, ...fakeAt(300, 0), acc: 2000 }], REST, START), 0);
+  assert.equal(annotateWrittenFrom(noAnchor, [{ t: START - 4 * 60000, ...fakeAt(300, 0), acc: 10 }], null, START), 0);
+  assert.equal(far[0].from_stop_m, undefined);
+});
+
+test("buildState carries the distance and says how to read it; with none the state is as before", () => {
+  const base = { start: START, end: END, tz: TZ, rest: REST, photos: [], candidates: [], minutes: 65 };
+  const withDist = buildState({ ...base, transcript: [{ t: START - 4 * 60000, who: "Alex", text: "This place was great", from_stop_m: 317 }] });
+  assert.equal(withDist.chat[0].written_m_from_this_stop, 317);
+  assert.match(withDist.how_to_read_the_chat, /another place/);
+  const plain = buildState({ ...base, transcript: [{ t: START + 60000, who: "Alex", text: "here" }] });
+  assert.equal("how_to_read_the_chat" in plain, false);
+  assert.equal("written_m_from_this_stop" in plain.chat[0], false);
+});
+
+test("gatherEvidence reads the phone's fixes only when a message came before the window", async () => {
+  const queries = [];
+  const mk = (messages) => async (q) => {
+    queries.push(q);
+    if (q.startsWith("jori_messages")) return messages;
+    if (q.startsWith("location_history")) return [{ ...fakeRow(317, 0), accuracy_m: 12, arrived_at: new Date(START - 5 * 60000).toISOString() }];
+    return [];
+  };
+  const before = { role: "user", content: "This place was great", created_at: new Date(START - 4 * 60000).toISOString() };
+  const inside = { role: "user", content: "still here", created_at: new Date(START + 5 * 60000).toISOString() };
+  const ev = await gatherEvidence({ sb: mk([before, inside]), start: START, end: END, tz: TZ, rest: REST, fallback: CENTROID, near: () => [] });
+  assert.ok(Math.abs(ev.transcript[0].from_stop_m - 317) <= 2);
+  assert.equal(ev.transcript[1].from_stop_m, undefined);
+  assert.equal(queries.filter((q) => q.startsWith("location_history")).length, 1);
+  queries.length = 0;
+  await gatherEvidence({ sb: mk([inside]), start: START, end: END, tz: TZ, rest: REST, fallback: CENTROID, near: () => [] });
+  assert.equal(queries.filter((q) => q.startsWith("location_history")).length, 0);
 });
