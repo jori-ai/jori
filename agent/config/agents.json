@@ -23,8 +23,7 @@
         "mcp__claude_ai_Google_Calendar__suggest_time",
         "mcp__claude_ai_Google_Calendar__respond_to_event",
         "mcp__claude_ai_Slack__*",
-        "mcp__supabase-jori__*",
-        "mcp__gtasks__*"
+        "mcp__supabase-jori__*"
       ],
       "effort": "low",
     "_effort_comment": "2026-10-04 — latency. Chat turns were dominated by thinking time, not tools: in the latency benchmark a memory question spent 8s in four tool calls and ~18s thinking before replying, and one watchlist ask thought for ~4.5 min before its first tool call (blocking the next message). Low still thinks adaptively when a question needs it. Revert by deleting this line + restarting the chat supervisor process.",
@@ -67,8 +66,7 @@
         "mcp__claude_ai_Google_Calendar__suggest_time",
         "mcp__claude_ai_Google_Calendar__respond_to_event",
         "mcp__claude_ai_Slack__*",
-        "mcp__supabase-jori__*",
-        "mcp__gtasks__*"
+        "mcp__supabase-jori__*"
       ],
       "remoteControlPrefix": "ops-agent",
       "supervisor": {
@@ -104,8 +102,7 @@
         "mcp__claude_ai_Google_Calendar__suggest_time",
         "mcp__claude_ai_Google_Calendar__respond_to_event",
         "mcp__claude_ai_Slack__*",
-        "mcp__supabase-jori__*",
-        "mcp__gtasks__*"
+        "mcp__supabase-jori__*"
       ],
       "remoteControlPrefix": "ops-light-agent",
       "supervisor": {
@@ -140,8 +137,7 @@
         "mcp__claude_ai_Google_Calendar__suggest_time",
         "mcp__claude_ai_Google_Calendar__respond_to_event",
         "mcp__claude_ai_Slack__*",
-        "mcp__supabase-jori__*",
-        "mcp__gtasks__*"
+        "mcp__supabase-jori__*"
       ],
       "remoteControlPrefix": "ops-haiku-agent",
       "supervisor": {

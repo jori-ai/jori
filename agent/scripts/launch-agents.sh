@@ -10,7 +10,7 @@
 CLAUDE="$HOME/.local/bin/claude"
 source "$(dirname "$0")/../config/models.env"   # JORI_MODEL_SONNET
 SESSION="claude"
-ALLOWED_TOOLS='Bash Read Edit Write WebFetch WebSearch Glob Grep Agent "mcp__tools__*" "mcp__claude_ai_Gmail__*" "mcp__claude_ai_Google_Calendar__*" "mcp__claude_ai_Slack__*" "mcp__supabase-jori__*" "mcp__gtasks__*"'
+ALLOWED_TOOLS='Bash Read Edit Write WebFetch WebSearch Glob Grep Agent "mcp__tools__*" "mcp__claude_ai_Gmail__*" "mcp__claude_ai_Google_Calendar__*" "mcp__claude_ai_Slack__*" "mcp__supabase-jori__*"'
 
 # Kill existing session if running
 tmux kill-session -t "$SESSION" 2>/dev/null
