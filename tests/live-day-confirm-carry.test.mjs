@@ -298,3 +298,28 @@ test("an unbacked prior with no overlapping interval is not re-added as a stop o
   preservePriorBeliefs(backed, [orphan], [ans("Corner Cafe", 0, 120)]);
   assert.deepEqual(backed.map((i) => i.id).sort(), ["iv-later", "iv-orphan"]);
 });
+
+test("an answer saved only to the confirmed-stops list counts as his answer", async () => {
+  const fs = await import("node:fs");
+  const os = await import("node:os");
+  const path = await import("node:path");
+  const { _internal: { confirmedStopAnswers } } = require("../lib/live-day.js");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "live-day-answers-"));
+  const file = path.join(dir, "confirmed-stops.json");
+  fs.writeFileSync(file, JSON.stringify([
+    { name: "Corner Cafe", stop_window: { start: new Date(T0 + 10 * MIN).toISOString(), end: new Date(T0 + 40 * MIN).toISOString() } },
+    { name: "Elsewhere", stop_window: { start: "2026-01-01T10:00:00Z", end: "2026-01-01T11:00:00Z" } },
+    { name: "No window" },
+  ]));
+  const prev = process.env.JORI_CONFIRMED_STOPS_FILE;
+  process.env.JORI_CONFIRMED_STOPS_FILE = file;
+  try {
+    const answers = confirmedStopAnswers({ start: T0, end: T0 + 24 * 60 * MIN });
+    assert.deepEqual(answers.map((a) => a.name), ["Corner Cafe"]);
+    const stop = interval("iv-stop", 0, 60, "12 Example St", "visit_address");
+    preservePriorBeliefs([stop], [interval("iv-stop-prior", 0, 55, "Corner Cafe", "user_confirmed")], answers);
+    assert.equal(stop.place.name, "Corner Cafe");
+  } finally {
+    if (prev === undefined) delete process.env.JORI_CONFIRMED_STOPS_FILE; else process.env.JORI_CONFIRMED_STOPS_FILE = prev;
+  }
+});
