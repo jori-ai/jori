@@ -237,7 +237,7 @@ function auditGithub(ctx, iocs) {
   const key = JSON.stringify([...(iocs?.pr_titles || [])].sort().concat("|", [...(iocs?.branch_names || [])].sort()));
   if (!ctx.ghCache.has(key)) {
     log(`GitHub audit (${key.length > 6 ? "with IOCs" : "posture only"}) over ${(ctx.inv.repos || []).length} repos`);
-    ctx.ghCache.set(key, githubAudit({ owner: instance().github_owner, repos: ctx.inv.repos, iocs, trusted: ctx.cfg.github_trusted_authors || [] }));
+    ctx.ghCache.set(key, githubAudit({ owner: instance().github_owner, repos: ctx.inv.repos, iocs, trusted: ctx.cfg.github_trusted_authors || [], trustedEmails: ctx.cfg.github_trusted_emails || [] }));
   }
   return ctx.ghCache.get(key);
 }

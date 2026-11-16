@@ -121,9 +121,10 @@ test("githubAudit: the wfx campaign IOCs come back clean on a clean account", ()
     "a/pulls": [{ number: 3, title: "Bump deps", head: { ref: "main-bump" }, user: { login: "Owner" }, created_at: new Date().toISOString() },
       { number: 4, title: "chore", head: { ref: "x" }, user: { login: "dependabot[bot]" }, created_at: new Date().toISOString() }],
     "a/commits": [{ sha: "abc1234", author: { login: "owner" } }, { sha: "def5678", author: { login: "jori-bot" } },
-      { sha: "aaa1111", author: null, committer: { login: "owner" }, commit: { author: { name: "claude" } } }],
+      { sha: "aaa1111", author: null, committer: { login: "owner" }, commit: { author: { name: "claude" } } },
+      { sha: "bbb2222", author: { login: "someone" }, committer: { login: "someone" }, commit: { author: { name: "agent", email: "agent@example.com" } } }],
   });
-  const rows = githubAudit({ owner: "owner", repos, trusted: ["jori-bot"], gh, iocs: { pr_titles: ["docs: dependency audit notes"], branch_names: ["wfx", "audit"] } });
+  const rows = githubAudit({ owner: "owner", repos, trusted: ["jori-bot"], trustedEmails: ["Agent@example.com"], gh, iocs: { pr_titles: ["docs: dependency audit notes"], branch_names: ["wfx", "audit"] } });
   assert.ok(rows.every((r) => r.status === "clean"), JSON.stringify(rows));
   assert.match(rows[0].check, /across 2 repos/, "forks are skipped");
 });
