@@ -36,6 +36,7 @@ import { createRequire } from "node:module";
 import { installTools } from "../../lib/root.cjs";
 const require = createRequire(import.meta.url);
 const { loadEnv } = require("../../lib/load-env.js");
+const netTrust = require("../../lib/net-trust.cjs");
 
 loadEnv();
 
@@ -101,6 +102,14 @@ function normalizeJid(to) {
 
 function buildHttpServer(socketRef, groupsRef) {
   return createServer(async (req, res) => {
+    // No login on this server, and /send speaks as the user. It binds
+    // 127.0.0.1; the checks below also stop a web page in a browser on this
+    // machine from driving it: a DNS-rebinding page fails the Host check, and
+    // a cross-site POST can't set Content-Type: application/json without a
+    // CORS preflight, which this server never answers.
+    if (!netTrust.isLoopback(req.socket.remoteAddress) || !netTrust.isTrustedHost(req.headers.host)) {
+      res.writeHead(403); res.end("forbidden"); return;
+    }
     const url = new URL(req.url, `http://localhost:${PORT}`);
     if (req.method === "GET" && url.pathname === "/health") {
       const sock = socketRef.current;
@@ -130,6 +139,9 @@ function buildHttpServer(socketRef, groupsRef) {
       return;
     }
     if (req.method === "POST" && url.pathname === "/send") {
+      if (!String(req.headers["content-type"] || "").toLowerCase().startsWith("application/json")) {
+        res.writeHead(415); res.end("Content-Type must be application/json"); return;
+      }
       const chunks = [];
       let size = 0;
       req.on("data", (c) => { size += c.length; if (size > 64 * 1024) { req.destroy(); return; } chunks.push(c); });
@@ -392,7 +404,7 @@ async function start() {
   connect();
 
   const server = buildHttpServer(socketRef, groupsRef);
-  server.listen(PORT, () => log(`HTTP send-server on :${PORT}`));
+  server.listen(PORT, "127.0.0.1", () => log(`HTTP send-server on 127.0.0.1:${PORT}`));
 
   const shutdown = (signal) => {
     log(`${signal} received, shutting down`);

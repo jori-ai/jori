@@ -121,9 +121,10 @@ function createProcesses() {
   );
 
   // 3. Wiki server — HTTP wiki browser on :9096. Binds to 0.0.0.0 so
-  // it's reachable over Tailscale (e.g. http://<host>:9096) and
-  // on the home LAN, not just localhost. Read-only, no auth — exposure is
-  // gated by network trust (LAN + Tailscale), same model as before.
+  // it's reachable over Tailscale (e.g. http://<host>:9096; the companion
+  // app's Memory tab). No login, so lib/wiki-serve.js answers only loopback
+  // and tailnet callers with one of this host's own names in Host
+  // (lib/net-trust.cjs): the home LAN and DNS-rebinding pages get nothing.
   children.push(
     new ManagedProcess({
       name: "wiki-server",
@@ -144,7 +145,7 @@ function createProcesses() {
   //     mandatory on every request and scopes what each identity may read
   //     (lib/wiki-access.js, data/wiki-share-scopes.json).
   //
-  // Keeping them separate preserves the unauthenticated Tailscale/LAN browsing
+  // Keeping them separate preserves the unauthenticated Tailscale browsing
   // above — which is network-trust gated and works fine — while guaranteeing
   // the internet-facing instance can never serve a page without an identity.
   // One process serving both would have meant choosing between the two.
@@ -161,7 +162,8 @@ function createProcesses() {
   );
 
   // 4. WhatsApp channel — Baileys gateway holding the user's personal WhatsApp
-  // session. HTTP send-server on :9100, inbound to whatsapp-inbox.jsonl,
+  // session. HTTP send-server on 127.0.0.1:9100 (local callers only),
+  // inbound to whatsapp-inbox.jsonl,
   // chat-channel pings on filter-pass. If down, inbound stalls (WhatsApp
   // servers queue messages for Linked Devices for a few hours, not days),
   // so supervision matters here more than for wiki-server.
