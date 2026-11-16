@@ -122,7 +122,15 @@ let logContext = {};
 // The request is not in the app transcript the relevance check reads, so it can
 // mistake the answer for an unsolicited run report. Rule #2: solicited replies
 // are never dropped, only corrected, so a "suppress" becomes a "send".
-const SOLICITED_INTENTS = new Set(["mention-reply"]);
+//
+// A chat build the user asked for (agent/scripts/trigger-chat-build.sh) is
+// solicited too: its question card (chat-build-question) and its report
+// (chat-build-result). A dropped question strands the build, and its fallback
+// goes out under the same intent, so on 2026-11-16 the check took both the card
+// and the fallback as "same question already answered" and the build closed
+// with nothing sent. The speak gate already never holds a build question
+// (NEVER_HELD_INTENTS in lib/speak-gate-live.mjs); this is the same rule here.
+const SOLICITED_INTENTS = new Set(["mention-reply", "chat-build-question", "chat-build-result"]);
 let solicitedSend = false;
 
 function emit(obj) {

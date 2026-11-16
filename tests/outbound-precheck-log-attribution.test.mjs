@@ -116,3 +116,13 @@ test("an @mention answer is solicited: a suppress verdict still sends", async ()
   assert.equal(rows.at(-1).intent, "mention-reply");
   assert.ok(rows.at(-1).reason.startsWith("solicited"));
 });
+
+test("a chat build's question and report are solicited: a suppress verdict still sends", async () => {
+  for (const intent of ["chat-build-question", "chat-build-result"]) {
+    await run({ intent, agent: "ops", jev: choice("suppress", 0.97, OPTS), sonnet: JSON.stringify({ decision: "suppress", reason: "same question already answered" }) });
+    const rows = logRows();
+    assert.equal(rows.at(-1).decision, "send");
+    assert.equal(rows.at(-1).intent, intent);
+    assert.ok(rows.at(-1).reason.startsWith("solicited"));
+  }
+});
