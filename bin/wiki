@@ -16,6 +16,11 @@
 
 "use strict";
 
+// A server started by process-manager re-execs first, so its starting
+// environment (readable with `ps eww`) holds none of the .env values
+// (lib/env-isolate.cjs; per process in agent-env.json `isolate`).
+if (process.argv[2] === "serve") require("../lib/env-isolate.cjs").isolateProcessEnv(process.env.WIKI_PUBLIC === "1" ? "wiki-server-public" : "wiki-server");
+
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
