@@ -1425,10 +1425,11 @@ guard('floor_cohorts', () => {
     // The cohort to compare: present in the report window AND in an earlier
     // one. A cohort's floor carries its own first message (hum's is its whole
     // playbook), so prefer LIGHT cohorts: those within PREFIX_BAND of the
-    // lightest current median, and among them the most session starts over the
+    // lightest current median among cohorts with 3+ session starts in the
+    // report window (a one-off cannot set it), and among them the most session starts over the
     // 7 windows (ties to the lighter). Every candidate is listed in
     // alternatives so the reader can see whether the choice decides the answer.
-    const cur = WINDOWS - 1, PREFIX_BAND = 5000;
+    const cur = WINDOWS - 1, PREFIX_BAND = 5000, PREFIX_MIN_SAMPLES = 3;
     const prevOf = (w) => { for (let i = cur - 1; i >= 0; i--) if (w[i]) return i; return -1; };
     // "Three days back": window cur-3, or the nearest earlier window with data.
     const backOf = (w) => { for (let i = cur - 3; i >= 0; i--) if (w[i]) return i; return -1; };
@@ -1446,8 +1447,15 @@ guard('floor_cohorts', () => {
       });
     let matched = null;
     if (candidates.length) {
-      const lightest = Math.min(...candidates.map((c) => c.current_median));
-      const pick = candidates
+      // A cohort with fewer than PREFIX_MIN_SAMPLES session starts in the report
+      // window is a one-off: it may not set the reference, or its median (one
+      // reading) can sit more than PREFIX_BAND below the well-sampled cohort and
+      // shut that cohort out of the match. Fall back to every candidate only
+      // when none is sampled.
+      const sampled = candidates.filter((c) => c.w[cur].n >= PREFIX_MIN_SAMPLES);
+      const pool = sampled.length ? sampled : candidates;
+      const lightest = Math.min(...pool.map((c) => c.current_median));
+      const pick = pool
         .filter((c) => c.current_median - lightest <= PREFIX_BAND)
         .sort((a, b) => (b.samples_7w - a.samples_7w) || (a.current_median - b.current_median))[0];
       const { w, p, b } = pick;
@@ -1484,7 +1492,7 @@ guard('floor_cohorts', () => {
   };
   const over = (key, line) => TIERS.filter((t) => (tiers[t]?.matched?.[key] ?? 0) > line);
   return {
-    note: 'series[cohort] runs oldest -> newest over 7 consecutive 24h windows ending at the report window; null = no session start of that cohort in that window. matched = among cohorts present now and earlier and within 5k of the lightest current median, the most-sampled one, compared on its median (alternatives lists every candidate). Per-cohort medians on n=1 are hints. corroboration is the ops-haiku:ops-light delta ratio against the standing 0.725 +-0.15.',
+    note: 'series[cohort] runs oldest -> newest over 7 consecutive 24h windows ending at the report window; null = no session start of that cohort in that window. matched = among cohorts present now and earlier with 3+ session starts in the report window (every one when none has) and within 5k of the lightest such median, the most-sampled one, compared on its median (alternatives lists every candidate). Per-cohort medians on n=1 are hints. corroboration is the ops-haiku:ops-light delta ratio against the standing 0.725 +-0.15.',
     expected_haiku_to_light: EXPECTED,
     tiers,
     corroboration_1d: ratio('delta_1d'),
