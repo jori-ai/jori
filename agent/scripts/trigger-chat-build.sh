@@ -35,7 +35,8 @@ SEND="$JORI_INSTALL_TOOLS/bin/jori-send-curl"
 REPORT=(--agent ops --channel chat --intent chat-build-result --evidence-as-of live)
 TIMEOUT_MIN=120
 
-mkdir -p "$Q/pending" "$Q/held" "$Q/running" "$Q/done" "$Q/failed" "$Q/results" "$(dirname "$LOG")"
+mkdir -p "$Q/pending" "$Q/held" "$Q/running" "$Q/done" "$Q/failed" "$Q/results" "$Q/asks" "$Q/parked" "$(dirname "$LOG")"
+PARK="$JORI_INSTALL_TOOLS/bin/build-park"
 log() { echo "$(date '+%Y-%m-%d %H:%M:%S') [chat-build] $1" >> "$LOG"; }
 # A few words of the request, so a message names the build the way the user asked for it.
 label() { node -e 'try{const s=String(JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")).spec).replace(/\s+/g," ").trim();process.stdout.write(s.length>70?s.slice(0,70)+"…":s)}catch{process.stdout.write("a request")}' "$1" 2>/dev/null; }
@@ -49,6 +50,9 @@ for f in "$Q/running"/*.json; do
   log "$id: orphaned in running/ — moved to failed/"
   "$SEND" "${REPORT[@]}" "🛠️ The build you asked for ($(label "$Q/failed/$id.json")) got cut off before it finished — $HOST restarted or the run was killed. Nothing from it landed unless you see it in Improvements. Just say the word and I'll start it again." >> "$LOG" 2>&1 || true
 done
+
+# Parked builds nobody answered for a month go to failed/ (lib/build-park.mjs).
+node "$PARK" sweep >> "$LOG" 2>&1 || true
 
 # A request the allowance governor held (held/) goes first: it is older than
 # anything in pending/, and its release (the user's answer, or the weekly reset)
@@ -98,15 +102,30 @@ if [ -z "$SPEC" ]; then
 fi
 
 RESULT="$Q/results/$ID.md"
-rm -f "$RESULT"
-log "$ID: start (size $SIZE${RUN_ARGS[1]:+, ${RUN_ARGS[1]}})"
+rm -f "$RESULT" "$Q/asks/$ID.json"
+# The run's session id, so a build that stops to ask (build-park ask) can be
+# resumed in the same session when the user answers (lib/build-park.mjs).
+SESSION_FILE="$Q/asks/$ID.session"
+rm -f "$SESSION_FILE"
+export JORI_FORK_SESSION_OUT="$SESSION_FILE"
+RESUME_SID="$(node -e 'try{const r=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")).resume;process.stdout.write(r&&r.session_id?String(r.session_id):"")}catch{}' "$Q/running/$ID.json" 2>/dev/null)"
 
-TASK="Run the CHAT BUILD job for request $ID. The user asked for this in chat; the request, verbatim, is between the markers.
+if [ -n "$RESUME_SID" ]; then
+  # The user answered a parked build's question: the same session carries on,
+  # with only the answer as its new message (the playbook is already in it).
+  TASK="$(node "$PARK" resume-task --id "$ID" --result "$RESULT" 2>/dev/null)"
+  export JORI_FORK_RESUME="$RESUME_SID" JORI_FORK_TASK_ONLY=1
+  log "$ID: resume parked session (size $SIZE${RUN_ARGS[1]:+, ${RUN_ARGS[1]}})"
+else
+  unset JORI_FORK_RESUME JORI_FORK_TASK_ONLY
+  log "$ID: start (size $SIZE${RUN_ARGS[1]:+, ${RUN_ARGS[1]}})"
+  TASK="Run the CHAT BUILD job for request $ID. The user asked for this in chat; the request, verbatim, is between the markers.
 Write your report to $RESULT (Step 6). Build size: $SIZE. $THINK
 
 ----- REQUEST $ID -----
 $SPEC
 ----- END REQUEST -----"
+fi
 
 # Which request this run is building, for self-improve-request: a change to a
 # locked file (rubric schema v6) may be filed as a card only from the chat build
@@ -116,8 +135,27 @@ $SPEC
 export JORI_CHAT_BUILD_REQUEST="$ID"
 "$SCRIPTS/lib/run-ephemeral-opus.sh" chat-build "$JOB_MD" --task "$TASK" --timeout-min "$TIMEOUT_MIN" ${RUN_ARGS[@]+"${RUN_ARGS[@]}"}
 RC=$?
-unset JORI_CHAT_BUILD_REQUEST
+unset JORI_CHAT_BUILD_REQUEST JORI_FORK_RESUME JORI_FORK_TASK_ONLY JORI_FORK_SESSION_OUT
 log "$ID: runner exit $RC"
+
+# The build stopped to ask the user (build-park ask): park it with its session
+# and send the card. If it cannot be parked (no session id, the card failed),
+# the question goes out as the report, as before.
+PARK_FALLBACK=""
+# Parks on a clean exit, and also when the runner's empty-output guard
+# returned 1 after an ask (a parked turn can end on very little text): the
+# session id is written before that guard runs. Never after a Max refusal (78).
+if [ -f "$Q/asks/$ID.json" ] && { [ "$RC" -eq 0 ] || { [ "$RC" -eq 1 ] && [ -s "$SESSION_FILE" ]; }; }; then
+  if PARK_OUT="$(node "$PARK" park --id "$ID" --session-file "$SESSION_FILE" 2>> "$LOG")"; then
+    log "$ID: parked on a question ($PARK_OUT)"
+    rm -f "$SESSION_FILE"
+    for f in "$Q/held"/*.json; do [ -e "$f" ] && mv "$f" "$Q/pending/"; done
+    exit 0
+  fi
+  log "$ID: could not park ($PARK_OUT) — sending the question as the report"
+  PARK_FALLBACK="$(node -e 'try{process.stdout.write(String(JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")).question||""))}catch{}' "$Q/asks/$ID.json" 2>/dev/null)"
+fi
+rm -f "$SESSION_FILE" "$Q/asks/$ID.json"
 
 if [ "$RC" -eq 78 ]; then
   # The runner's Max-only guard refused to start (lib/max-auth-guard.sh), so no
@@ -125,6 +163,9 @@ if [ "$RC" -eq 78 ]; then
   # until someone signs in, and QueueDirectories would relaunch it forever.
   mv "$Q/running/$ID.json" "$Q/failed/$ID.json"
   "$SEND" "${REPORT[@]}" "🛠️ I didn't start the build you asked for ($(label "$Q/failed/$ID.json")). Claude Code on $HOST wasn't signed in to your Max plan, and builds only run on that — so nothing ran and nothing was charged. Once it's signed back in, ask me again and I'll pick it up." >> "$LOG" 2>&1 || true
+elif [ -n "$PARK_FALLBACK" ] && [ ! -s "$RESULT" ]; then
+  mv "$Q/running/$ID.json" "$Q/done/$ID.json"
+  "$SEND" "${REPORT[@]}" "🛠️ The build you asked for ($(label "$Q/done/$ID.json")) needs an answer from you before it can go on: $PARK_FALLBACK — tell me and I'll start it again with your answer." >> "$LOG" 2>&1 || true
 elif [ -s "$RESULT" ]; then
   mv "$Q/running/$ID.json" "$Q/done/$ID.json"
   "$SEND" "${REPORT[@]}" "🛠️ $(head -c 1500 "$RESULT")" >> "$LOG" 2>&1 || true

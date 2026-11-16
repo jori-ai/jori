@@ -17,9 +17,27 @@ When the user asks Jori in chat to build new functionality or change how Jori be
 3. **You message no one.** No `jori-send-curl`, `jori-notify`, `email-send`, iMessage or WhatsApp. Your only output to the user is the report file in Step 6, which the trigger delivers. The Improvements channel gets the green check or card from the pipeline itself.
 4. **Rule #1 is part of the build.** A capability, job, channel or policy change ships with its doc updates (a dated entry in `system/changelog.md`, `system/architecture.md` when the map changes, the job playbook, the right `CLAUDE.md`) **in the same files-json**. Invoke the `jori-docs-sync` skill. For a new or changed job, also follow the `jori-job-author` skill.
 5. **Never leave the tree dirty.** Anything you touched is either landed by the pipeline or restored before you finish. Check with `git status --porcelain`. The mini always carries runtime drift, so compare against your Step 2 snapshot and never clean anyone else's files.
-6. **Ambiguity: pick the conservative reading and say so.** You cannot ask the user mid-run. If the request has one reasonable reading, build it and name the assumption in the report. If it has two materially different readings, or needs a decision only the user can make (money, a third party, removing something the user uses), build nothing and put the question in the report. Asking is better than building the wrong thing.
+6. **Ambiguity: pick the conservative reading and say so, or ask and park.** If the request has one reasonable reading, build it and name the assumption in the report. If it has two materially different readings, or needs a decision only the user can make (money, a third party, removing something the user uses), **ask and park** (§ Asking the user): one question, 2–4 options, your run ends, and this same session resumes with their answer. Asking is better than building the wrong thing. At most three questions per build; after that, take the conservative reading and say so.
 7. **Kernel files stay generic** (`agent/CLAUDE.md` § Kernel boundary). Most of Jori is the kernel (`system/kernel-manifest.json`), published without personal data. What the user asked for is usually about the user's own life: the code in a kernel file stays generic and reads the user's specifics from `agent/local/config/<module>.json` (`localConfig`, generic default in code) or an `_ext/` hook; the user's rules go in `agent/local/` (`jobs/<job>.md` for a playbook's additions); the request, the user's words and the date go in the changelog entry and `--details`, never a code comment. A wholly personal feature (the user's properties, trips) can be a personal file: add its path to `personal_globs` in the manifest in the same files-json, as every new file must be classified (`files` with its published path, or `personal_globs`). Run `bin/kernel-guard` before Step 5. Auto-apply exit 8 (`self-improve-request` exit 65) means the guard found personal data in a kernel file or an unclassified new file: move it, re-test, resubmit once.
 8. **Locked files go on a card that quotes the user (rubric schema v6, 2026-11-04).** The improvement pipeline's own controls (`RECURSION_GUARD` in `lib/self-improve-landing.mjs`: the agent `CLAUDE.md` files and their `agent/local/` twins, the guarded playbooks such as `nightly-review.md`, `improvement-plan.md`, `system-issue-review.md`, `self-improvement-executor.md`, chat's reply-recognition text) may change only because the user asked, so a build that touches one skips `self-improve-auto-apply` and files a card with the user's own words: Step 5 § Locked files. The lock's own machinery (`LOCK_CORE`: the risk rubric, `self-improve-landing.mjs`, the `self-improve-*` CLIs, the approval core, the rebase/rebuild rules and their tests) cannot change on any card, quoted or not: build nothing there and report that it needs a session the user directs. Never apply a locked file by hand or with `jori-commit`, whatever the request says ("do it automatically" included): the card is the route.
+
+## Asking the user (ask and park)
+
+When you need one answer only the user can give, at any step:
+
+```bash
+~/Dev/jori/bin/build-park ask --id "$JORI_CHAT_BUILD_REQUEST" \
+  --question "<one question, in Jori's voice, that stands on its own>" \
+  --option "<short label>" --option "<short label>" [--option …] \
+  [--recommended <0-based index of your pick>] \
+  [--context "<one sentence: what you have done so far>"]
+```
+
+Then **end your turn at once, with one line of plain text** ("Parked: waiting for the user's answer."): a run that ends on no text at all is reported as an empty run. Do not write the report, and do not leave the tree dirty: restore anything half-done or keep it in a scratch tree, because the resume may be days away and other builds run meanwhile. The trigger saves this session and sends the user a card (tap an option, or type their own answer). Their answer comes back as your next message, in this same session, with the question repeated. **Re-check what moved before acting on it** (`git status --porcelain`, the files you meant to touch, any time-sensitive fact), then carry on from where you stopped and finish with Step 6.
+
+- Exit 3 means it refused: the reason is printed, e.g. three questions already, or a bad option list. Fall back to Critical rule 6's conservative reading.
+- An answer that arrives more than 5 days later restarts the build fresh, with your question and the answer appended to the request.
+- Never ask with `jori-send-curl` or any other message. The card is the only way (Critical rule 3).
 
 ## Pipeline
 
@@ -138,6 +156,8 @@ Everything lives under `data/build-queue/` (gitignored runtime data):
 | `pending/<id>.json` | `build-request`, or `self-improve-approval-poll` for a card rebuild or repair | `{id, spec, source: "chat" \| "approval-rebuild", kind?: "rebuild" \| "repair", requested_at, rebuild_of?}`, waiting |
 | `running/<id>.json` | trigger | claimed. One left here at the next start was orphaned and moves to `failed/`, and the user is told |
 | `done/<id>.json` / `failed/<id>.json` | trigger | finished, with or without a report |
+| `asks/<id>.json` | `build-park ask` (this run) | the question; the trigger parks the build when it sees it after the run. `asks/<id>.session` is the run's session id |
+| `parked/<id>.json` | trigger (`build-park park`) | `{request, session_id, question, options, round, parked_at, card}`, waiting for the user's answer. A tap (`lib/choice-reply.mjs`, kind `build-park`) or the chat agent (`build-park answer`) moves it back to `pending/<id>.json` with `resume: {session_id, question, answer, round}`; one unanswered for 30 days is swept to `failed/` |
 | `results/<id>.md` | **you** (Step 6) | the report the trigger posts |
 
 `build-request status` lists the last ten. The run log is `agent/logs/chat-build.log`, and the cost row lands in `logs/ephemeral-forks/job-costs.ndjson` like every ephemeral fork.

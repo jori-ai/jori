@@ -203,7 +203,14 @@ log "start (ephemeral ${MODEL#claude-}, $EFFORT${TIMEOUT_MIN:+, ${TIMEOUT_MIN}m 
 
 # Prompt = task line + the playbook, exactly what the webhook server used to
 # assemble for the supervisor.
-{ [ -n "$TASK" ] && printf '%s\n\n' "$TASK"; jori_job_prompt "$JOB_MD"; } > "$OUT_TMP.prompt"
+# A resumed session already holds the playbook from its first run: with
+# JORI_FORK_TASK_ONLY=1 (set with JORI_FORK_RESUME by trigger-chat-build.sh for a
+# parked build, lib/build-park.mjs) the new message is the task alone.
+if [ -n "${JORI_FORK_RESUME:-}" ] && [ "${JORI_FORK_TASK_ONLY:-}" = "1" ] && [ -n "$TASK" ]; then
+  printf '%s\n' "$TASK" > "$OUT_TMP.prompt"
+else
+  { [ -n "$TASK" ] && printf '%s\n\n' "$TASK"; jori_job_prompt "$JOB_MD"; } > "$OUT_TMP.prompt"
+fi
 # + the local rules as --append-system-prompt-file (what the supervisors pass
 # their own sessions); none when the cwd loads no Jori CLAUDE.md.
 LOCAL_RULES_FILE="$OUT_TMP.local-rules"
