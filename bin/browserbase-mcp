@@ -1,0 +1,68 @@
+#!/usr/bin/env node
+// browserbase-mcp — start the Browserbase MCP server (@browserbasehq/mcp) with
+// its keys read from the installation's .env, never from the command line or
+// the MCP config.
+//
+// The package takes its model key only as a `--modelApiKey` flag, and a flag
+// on the command line is readable by every process of the same user (`ps`),
+// agents included. This launcher loads .env in its own process, adds the flag
+// to the argv it hands the package in-process, and imports the package's
+// entry point: the OS-visible command line and environment carry no key.
+//
+// .env names:
+//   BROWSERBASE_API_KEY, BROWSERBASE_PROJECT_ID  (read by the package itself)
+//   BROWSERBASE_MODEL_API_KEY                    (→ --modelApiKey)
+// Every other argument is passed through (--contextId, --modelName, …).
+//
+// MCP config:  command <node>, args [<this file>, --contextId <id>, --modelName <provider/model>], no env.
+// Check it:    bin/bb-verify. Design: docs/agent-secrets.md § 1.
+
+const fs = require("fs");
+const os = require("os");
+const path = require("path");
+const { spawnSync } = require("child_process");
+const { pathToFileURL } = require("url");
+
+const ROOT = path.resolve(__dirname, "..");
+require(path.join(ROOT, "lib", "load-env.js")).loadEnv();
+
+const VERSION = process.env.BROWSERBASE_MCP_VERSION || "3.0.0";
+
+// The package as npx caches it (~/.npm/_npx/<hash>/node_modules/...), pinned.
+function findPackage() {
+  const base = path.join(os.homedir(), ".npm", "_npx");
+  let dirs = [];
+  try { dirs = fs.readdirSync(base); } catch {}
+  for (const d of dirs) {
+    const p = path.join(base, d, "node_modules", "@browserbasehq", "mcp");
+    try {
+      if (JSON.parse(fs.readFileSync(path.join(p, "package.json"), "utf8")).version === VERSION) return p;
+    } catch {}
+  }
+  return null;
+}
+
+let pkg = findPackage();
+if (!pkg) {
+  // Fetch it into the npx cache without starting it. stdout stays clean: it is the MCP channel.
+  spawnSync("npx", ["-y", "-p", `@browserbasehq/mcp@${VERSION}`, "true"], { stdio: ["ignore", 2, 2] });
+  pkg = findPackage();
+}
+if (!pkg) {
+  console.error(`browserbase-mcp: @browserbasehq/mcp@${VERSION} is not in the npx cache and could not be fetched`);
+  process.exit(1);
+}
+
+const args = process.argv.slice(2);
+if (args.includes("--modelApiKey")) {
+  console.error("browserbase-mcp: refusing --modelApiKey on the command line; put it in .env as BROWSERBASE_MODEL_API_KEY");
+  process.exit(2);
+}
+if (process.env.BROWSERBASE_MODEL_API_KEY) args.push("--modelApiKey", process.env.BROWSERBASE_MODEL_API_KEY);
+
+const entry = path.join(pkg, "dist", "program.js");
+process.argv = [process.argv[0], entry, ...args];
+import(pathToFileURL(entry).href).catch((e) => {
+  console.error(`browserbase-mcp: ${e && e.message ? e.message : e}`);
+  process.exit(1);
+});

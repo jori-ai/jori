@@ -28,6 +28,8 @@ Everything else (PATH, HOME, the Claude Code settings variables, the supervisor'
 
 **Tools read their own secrets.** A program that needs a key loads `.env` itself: `lib/load-env.js` `loadEnv()` (Node; many libs call it at import, e.g. `plaid-api.js`, `supabase-rest.js`), `lib/supabase_local.py` `env_value()` (Python), or a `sed -n 's/^NAME=//p' .env` fallback (bash; `site-pass`, `card-pass`, `dev-pass`, `supabase-mcp`). The tools MCP server loads `.env` at start, so the CLIs it runs (`gog`, `homectl`, `imsg`) have what they need. A new tool that reads a secret must do the same: never rely on the agent's environment.
 
+**MCP servers defined in Claude Code's user config.** `~/.claude.json` on the host defines MCP servers that every Claude session starts, locked-down agents included, even when their tools are disallowed. A key in such a server's `args` sits on its command line, readable by any same-user process (`ps`), and a key in its `env` block sits in the config file. The lockdown does not reach either. So no key goes there: the server runs through a launcher that reads `.env` in its own process. The Browserbase server (`bin/browserbase-mcp`) is the first. Its keys moved on 2026-11-16 from `--modelApiKey` and the config's `env` to `.env` (`BROWSERBASE_API_KEY`, `BROWSERBASE_PROJECT_ID`, `BROWSERBASE_MODEL_API_KEY`); `bin/bb-verify` checks the setup and warns when a key is back in the config. Claude Code keeps copies of the old config under `~/.claude/backups/`, so a key that sat in the config is still on disk there until it is rotated.
+
 **Roll-out, per agent.** `agent/local/config/agent-env.json`:
 
 ```json
@@ -53,6 +55,7 @@ It finds the agent's own tool call reaching:
 - any `.env` (not `.env.example` / `.sample` / `.tpl` / `.template`);
 - the repo's top-level `secrets/` and `credentials/`;
 - `data/.supabase-oauth.json`;
+- Claude Code's user config, `~/.claude.json` and its copies (`~/.claude.json.*`, `~/.claude/backups/`);
 - 1Password's local config and store;
 - `op …`;
 - `security find-generic-password | find-internet-password | dump-keychain | export`;

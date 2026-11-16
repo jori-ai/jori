@@ -70,3 +70,14 @@ test("the session settings carry both guards", () => {
   assert.match(h[1].matcher, /Read/);
   assert.match(h[1].hooks[0].command, /secrets-guard/);
 });
+
+test("Claude Code's user config is a secrets file; the rest of ~/.claude is not", () => {
+  const o = { cwd: ROOT, root: ROOT, home: HOME };
+  assert.equal(protectedPath(`${HOME}/.claude.json`, o), "claude-config");
+  assert.equal(protectedPath(`${HOME}/.claude.json.backup`, o), "claude-config");
+  assert.equal(protectedPath(`${HOME}/.claude/backups/.claude.json.backup.1`, o), "claude-config");
+  assert.equal(protectedPath(`${HOME}/.claude/settings.json`, o), null);
+  assert.equal(protectedPath(`${ROOT}/.claude.json`, o), null);
+  const hits = findAccesses({ tool_name: "Bash", cwd: ROOT, tool_input: { command: `jq .mcpServers ${HOME}/.claude.json` } }, { root: ROOT, home: HOME });
+  assert.deepEqual(hits.map((h) => h.kind), ["claude-config"]);
+});
