@@ -393,7 +393,8 @@ function renderBlock(place, visits, photos, { own, cfg = config() } = {}) {
   }
   const lines = [START, facts(place, visits, { own }), ""];
   if (place.cover_url) lines.push(`![${place.name}](${place.cover_url})`, "");
-  lines.push(own ? "## Visits" : "## Photos", "");
+  const anyPhoto = photos.some((p) => p.photo && p.photo.thumb_url);
+  if (own || anyPhoto) lines.push(own ? "## Visits" : "## Photos", "");
   let shown = 0;
   let hidden = 0;
   for (const v of visits) {
@@ -729,6 +730,11 @@ async function rename(placeId, newName, { deps = liveDeps(), log = () => {} } = 
       if (next && next !== place.page_id) {
         await deps.request(`/rest/v1/photo_links?target=eq.${encodeURIComponent(place.page_id)}`, { method: "PATCH", body: { target: next }, prefer: "return=minimal" });
         try { deps.wiki.supersedePage(place.page_id, next, { editedBy: TOOL }); } catch (e) { log(`supersede ${place.page_id}: ${e.message}`); }
+        // The tracker's ledger knew the old name: point it at the new page too,
+        // so its next render does not write to the superseded one.
+        const shows = deps.shows ? deps.shows() : null;
+        const tracker = place.kind === "restaurant" ? shows?.restaurant : (place.kind === "museum" || place.kind === "gallery") ? shows?.museum : null;
+        if (tracker) { try { tracker(old, { page: next, by: TOOL }); } catch (e) { log(`tracker link ${old}: ${e.message}`); } }
         moved = { from: place.page_id, to: next };
         place.page_id = next;
       }
