@@ -558,6 +558,36 @@ test("JORI_WALK_STEPS_FLOOR=0 prints the route's distance", () => {
   }
 });
 
+// A walk line with no distance (the day has no stride to measure it by) is ground the
+// header's total leaves out, so the header says "at least"; with every printed walk
+// measured, or the switch off, it reads as before.
+test("a printed walk line with no distance makes the header's miles a floor", () => {
+  const steps = [...homeWalkSteps(), ...readings(at(12, 0), at(12, 12), 70)];
+  const d = homeWalkDay(9);
+  annotateDaySteps(d, steps, null, { startMs: at(0), endMs: at(24) });
+  const text = (h) => h.replace(/<[^>]+>/g, "");
+  const html = buildSkeleton(d);
+  assert.match(text(html), /Walk 12:00 to 12:12pm · 12 min · 8\d\d steps/);
+  assert.doesNotMatch(text(html), /Walk 12:00[^\n]*about/);
+  assert.match(html, /at least 0\.2 miles walked/);
+  const info = {};
+  _internal.printedWalkMeters(d, d.stops, info);
+  assert.equal(info.unmeasured_walk, true);
+  // the same day without that walk keeps its plain total
+  const plainDay = homeWalkDay(9);
+  annotateDaySteps(plainDay, homeWalkSteps(), null, { startMs: at(0), endMs: at(24) });
+  assert.match(buildSkeleton(plainDay), />0\.2 miles walked/);
+  const old = process.env.JORI_WALK_UNMEASURED_FLOOR;
+  process.env.JORI_WALK_UNMEASURED_FLOOR = "0";
+  try {
+    const off = homeWalkDay(9);
+    annotateDaySteps(off, steps, null, { startMs: at(0), endMs: at(24) });
+    assert.doesNotMatch(buildSkeleton(off), /at least 0\.2 miles walked/);
+  } finally {
+    if (old == null) delete process.env.JORI_WALK_UNMEASURED_FLOOR; else process.env.JORI_WALK_UNMEASURED_FLOOR = old;
+  }
+});
+
 // A stop that is nothing but the walk between a ride and the next place: the ride
 // home stopped two blocks short, the phone logged an arrival there and went quiet,
 // and a ten-minute "stop" at a street address was built from it while the steps
