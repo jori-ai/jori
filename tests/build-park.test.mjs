@@ -110,4 +110,5 @@ test("the card goes out under an intent the speak gate never holds", async () =>
   const { QUESTION_INTENT } = await import("../lib/build-park.mjs");
   const { NEVER_HELD_INTENTS } = await import("../lib/speak-gate-live.mjs");
   assert.ok(NEVER_HELD_INTENTS.has(QUESTION_INTENT));
+  assert.ok(NEVER_HELD_INTENTS.has("chat-build-result"), "the build's report answers a request the user made");
 });
