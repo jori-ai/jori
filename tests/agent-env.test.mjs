@@ -90,7 +90,7 @@ test("keep and strip lists from the installation", () => {
 test("secret shapes", () => {
   const { isSecretShaped } = require("../lib/agent-env.cjs");
   for (const n of ["PLAID_SECRET", "X_TOKEN", "OP_LOGINS_SERVICE_ACCOUNT_TOKEN", "TYPESAFE_API_KEY",
-    "SMTP2GO_API_KEY", "ICLOUD_APP_PASSWORD", "SLACK_XOXC", "SLACK_D_COOKIE", "AWS_SECRET_ACCESS_KEY"]) {
+    "SMTP2GO_API_KEY", "RESEND_API_KEY_SECOND", "ICLOUD_APP_PASSWORD", "SLACK_XOXC", "SLACK_D_COOKIE", "AWS_SECRET_ACCESS_KEY"]) {
     assert.equal(isSecretShaped(n), true, n);
   }
   for (const n of ["PATH", "JORI_APNS_KEY_ID", "GMAIL_OAUTH_CLIENT_ID", "SUPABASE_URL", "JORI_TZ"]) {
