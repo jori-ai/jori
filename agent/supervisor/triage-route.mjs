@@ -32,7 +32,14 @@
 // agent/ops-agent/jobs/email-triage-strict.md). When it does not finish — no
 // answer, a timeout, no triage action, or STRICT_MAX already running — the item
 // goes to ops-light exactly as before, with a note of what the one-shot already
-// did. Never drops an email.
+// did. Never drops an email: each run leaves a marker in
+// data/triage-strict-pending/ until it ends, and a marker older than
+// PENDING_STALE_MS (a supervisor restart mid-run) is dispatched to ops-light.
+//
+// "strict-shadow": triage stays on ops-light as before, and each per-message
+// item ALSO runs the one-shot in dry run (nothing changes), started alongside
+// the dispatch. bin/email-triage-report scores those runs against the
+// recorded decisions — the evidence for "strict".
 
 import fs from "node:fs";
 import os from "node:os";
@@ -40,18 +47,23 @@ import path from "node:path";
 import { execFile } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
-const RUNNER = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "bin", "email-triage-run");
+const ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
+const RUNNER = path.join(ROOT, "bin", "email-triage-run");
 export const STRICT_MAX = 3;
+export const PENDING_DIR = path.join(ROOT, "data", "triage-strict-pending");
+export const PENDING_STALE_MS = 11 * 60 * 1000;   // past the runner's 9-minute cap
 
 // Run the strict one-shot for one email. Resolves { ok, actions, why }; never rejects.
-export function runStrictOneShot(packet, { timeoutMs = 9 * 60 * 1000 } = {}) {
+export function runStrictOneShot(packet, { timeoutMs = 9 * 60 * 1000, dry = false } = {}) {
   return new Promise((resolve) => {
     let f;
     try {
       f = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "triage-strict-")), "payload.json");
       fs.writeFileSync(f, JSON.stringify(packet));
     } catch (e) { return resolve({ ok: false, actions: [], why: `payload: ${e.message}` }); }
-    execFile(process.execPath, [RUNNER, "--payload", f], { timeout: timeoutMs, maxBuffer: 1 << 20 }, (err, stdout) => {
+    const args = [RUNNER, "--payload", f, ...(dry ? ["--dry-run"] : [])];
+    const env = dry ? { ...process.env, EMAIL_TRIAGE_MODE: "shadow" } : process.env;
+    execFile(process.execPath, args, { timeout: timeoutMs, maxBuffer: 1 << 20, env }, (err, stdout) => {
       try { fs.rmSync(path.dirname(f), { recursive: true, force: true }); } catch {}
       let r = null;
       try { r = JSON.parse(String(stdout || "").trim().split("\n").pop()); } catch {}
@@ -63,7 +75,7 @@ export function runStrictOneShot(packet, { timeoutMs = 9 * 60 * 1000 } = {}) {
 
 /** The note an ops-light fallback carries when the one-shot already acted. */
 export function strictFallbackNote(r) {
-  const done = (r?.actions || []).filter((a) => !a.dry).map((a) => a.summary || a.tool).filter(Boolean);
+  const done = (r?.actions || []).filter((a) => !a.dry && !a.failed).map((a) => a.summary || a.tool).filter(Boolean);
   if (!done.length) return "";
   return `\n\n[triage-route] A strict triage one-shot ran first and stopped (${r.why || "no result"}). It already did: ${done.join("; ")}. Do not repeat those; finish the rest.`;
 }
@@ -72,11 +84,12 @@ export function triageTargetFromConfig(agentsConfig, { selfAgent = "ops" } = {})
   const self = agentsConfig?.agents?.[selfAgent] || {};
   const configured = self.gmailTriageTarget === undefined ? "ops-light" : self.gmailTriageTarget;
   const strict = configured === "strict";
-  const target = strict ? "ops-light" : configured;
+  const shadow = configured === "strict-shadow";
+  const target = strict || shadow ? "ops-light" : configured;
   if (!target || target === selfAgent) return null;
   const sup = agentsConfig?.agents?.[target]?.supervisor;
   if (!sup?.webhookPort || !sup?.healthPort) return null;
-  return { agent: target, webhookPort: sup.webhookPort, healthPort: sup.healthPort, ...(strict ? { strict: true } : {}) };
+  return { agent: target, webhookPort: sup.webhookPort, healthPort: sup.healthPort, ...(strict ? { strict: true } : {}), ...(shadow ? { shadow: true } : {}) };
 }
 
 export function makeTriageRouter({
@@ -87,10 +100,18 @@ export function makeTriageRouter({
   readFile = (p) => fs.readFileSync(p, "utf8"),
   log = () => {},
   timeoutMs = 5000,
-  runStrict = runStrictOneShot,   // the strict one-shot (target.strict)
+  runStrict = runStrictOneShot,   // the strict one-shot (target.strict / target.shadow)
   strictMax = STRICT_MAX,
+  pendingDir = PENDING_DIR,
+  sweepEveryMs = 5 * 60 * 1000,
+  now = () => Date.now(),
 }) {
   let strictInFlight = 0;
+  const marker = (source) => path.join(pendingDir, `${String(source).replace(/[^A-Za-z0-9:_-]/g, "_")}.json`); // lang-regex-ok: file-name sanitising
+  const putMarker = (source, content, packet) => {
+    try { fs.mkdirSync(pendingDir, { recursive: true }); fs.writeFileSync(marker(source), JSON.stringify({ ts: now(), source, content, packet })); } catch {}
+  };
+  const dropMarker = (source) => { try { fs.rmSync(marker(source), { force: true }); } catch {} };
   const token = () => { try { return readFile(tokenFile).trim(); } catch { return ""; } };
 
   async function healthy() {
@@ -102,15 +123,24 @@ export function makeTriageRouter({
     } catch { return false; }
   }
 
-  return async function routeTriage(content, source, { forceLocal = false, packet = null } = {}) {
+  async function routeTriage(content, source, { forceLocal = false, packet = null, skipStrict = false } = {}) {
     if (!target || forceLocal) return { routed: "local", result: localDispatch(content, source) };
-    if (target.strict && packet?.messageId) {
+    if (target.shadow && packet?.messageId && strictInFlight < strictMax) {
+      // Shadow: a dry one-shot alongside, never in the way of the real dispatch.
+      strictInFlight++;
+      Promise.resolve(runStrict({ ...packet, content }, { dry: true }))
+        .then((r) => log(`triage-route ${source} shadow one-shot: ${r?.ok ? `${(r.actions || []).length} action(s)${r.escalated ? ", escalated" : ""}` : r?.why || "no result"}`))
+        .catch(() => {})
+        .finally(() => { strictInFlight--; });
+    }
+    if (target.strict && packet?.messageId && !skipStrict) {
       if (strictInFlight >= strictMax) {
         log(`triage-route ${source} → ${target.agent} (strict: ${strictInFlight} already running)`);
       } else {
         strictInFlight++;
+        putMarker(source, content, packet);
         let r;
-        try { r = await runStrict({ ...packet, content }); } finally { strictInFlight--; }
+        try { r = await runStrict({ ...packet, content }); } finally { strictInFlight--; dropMarker(source); }
         if (r?.ok) {
           log(`triage-route ${source} → strict one-shot (${r.escalated ? "escalated to ops" : "triaged"}, ${(r.actions || []).length} action(s))`);
           return { routed: "strict" };
@@ -139,5 +169,31 @@ export function makeTriageRouter({
       log(`triage-route ${source} → ops (fallback: POST to ${target.agent} failed: ${err.message})`);
       return { routed: "local", result: localDispatch(content, source) };
     }
-  };
+  }
+
+  // A run the supervisor did not see end (a restart mid-run): dispatch its
+  // email the ordinary way, once.
+  async function sweepPending() {
+    let names = [];
+    try { names = fs.readdirSync(pendingDir).filter((n) => n.endsWith(".json")); } catch { return 0; }
+    let n = 0;
+    for (const name of names) {
+      const f = path.join(pendingDir, name);
+      let m = null;
+      try { m = JSON.parse(fs.readFileSync(f, "utf8")); } catch {}
+      if (m && now() - Number(m.ts || 0) < PENDING_STALE_MS) continue;
+      try { fs.rmSync(f, { force: true }); } catch {}
+      if (!m?.content || !m?.source) continue;
+      log(`triage-route ${m.source} → ${target?.agent || "ops"} (strict one-shot never finished — restart?)`);
+      await routeTriage(`${m.content}\n\n[triage-route] A strict triage one-shot started on this email and never reported back (the supervisor restarted). Check its current labels before acting.`, m.source, { skipStrict: true });
+      n++;
+    }
+    return n;
+  }
+  if (target?.strict && sweepEveryMs > 0) {
+    const t = setInterval(() => { sweepPending().catch(() => {}); }, sweepEveryMs);
+    t.unref?.();
+  }
+  routeTriage.sweepPending = sweepPending;
+  return routeTriage;
 }

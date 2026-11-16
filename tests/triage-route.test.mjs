@@ -153,3 +153,37 @@ test("strict: at most strictMax one-shots at once; the rest go to ops-light", as
   assert.equal((await a).routed, "strict");
   assert.equal((await b).routed, "strict");
 });
+
+test("strict-shadow: the dispatch is untouched and a dry one-shot runs alongside", async () => {
+  const s = structuredClone(AGENTS); s.agents.ops.gmailTriageTarget = "strict-shadow";
+  const t = triageTargetFromConfig(s);
+  assert.equal(t.shadow, true); assert.equal(t.strict, undefined);
+  const { fn, calls } = fakeFetch();
+  const runs = [];
+  const route = makeTriageRouter({ target: t, localDispatch: () => {}, tokenFile: "/x", readFile: () => "t", fetchFn: fn,
+    runStrict: async (p, o) => { runs.push(o); return { ok: true, actions: [] }; } });
+  assert.equal((await route("BODY", "gmail:s1", { packet: { messageId: "s1" } })).routed, "ops-light");
+  assert.equal(JSON.parse(calls.find((c) => !c.url.endsWith("/health")).init.body).task, "BODY");
+  await new Promise((r) => setImmediate(r));
+  assert.deepEqual(runs, [{ dry: true }]);
+});
+
+test("strict: a run the supervisor never saw end is dispatched once by the sweep", async () => {
+  const fs = await import("node:fs"); const os = await import("node:os"); const path = await import("node:path");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tr-pending-"));
+  let clock = 1_000_000;
+  const { fn, calls } = fakeFetch();
+  // a run that never returns (the supervisor "restarts" while it is in flight)
+  const route = makeTriageRouter({ target: { ...target, strict: true }, localDispatch: () => {}, tokenFile: "/x", readFile: () => "t", fetchFn: fn,
+    pendingDir: dir, sweepEveryMs: 0, now: () => clock, runStrict: () => new Promise(() => {}) });
+  route("BODY", "gmail:p1", { packet: { messageId: "p1" } });
+  await new Promise((r) => setImmediate(r));
+  assert.equal(fs.readdirSync(dir).length, 1);
+  assert.equal(await route.sweepPending(), 0);           // too fresh
+  clock += 12 * 60 * 1000;
+  assert.equal(await route.sweepPending(), 1);
+  const post = calls.find((c) => !c.url.endsWith("/health"));
+  assert.ok(JSON.parse(post.init.body).task.startsWith("BODY"));
+  assert.equal(fs.readdirSync(dir).length, 0);
+  assert.equal(await route.sweepPending(), 0);           // once
+});
