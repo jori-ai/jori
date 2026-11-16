@@ -277,12 +277,23 @@ function parseArgs(argv) {
 // An agent's config from agents.json, with the installation's own connector
 // deny list for it appended to `disallowedTools`
 // (agent/local/config/agents.json `disallowed_tools: { <agent>: [...] }`).
+const PERMISSION_MODES = new Set(["bypassPermissions", "auto", "dontAsk", "acceptEdits"]);
+
 function loadAgentConfig(configPath, agentName) {
   const cfg = JSON.parse(fs.readFileSync(configPath, "utf8"));
   const a = cfg.agents[agentName];
   if (!a) throw new Error(`agent "${agentName}" not found in ${configPath}`);
-  const extra = createRequire(import.meta.url)("../../lib/instance.cjs").localConfig("agents", { disallowed_tools: {} }).disallowed_tools?.[agentName];
+  const local = createRequire(import.meta.url)("../../lib/instance.cjs").localConfig("agents", { disallowed_tools: {}, permission_mode: {} });
+  const extra = local.disallowed_tools?.[agentName];
   if (Array.isArray(extra) && extra.length) a.disallowedTools = [...(a.disallowedTools || []), ...extra];
+  // The installation may run one tier in another permission mode (e.g. the
+  // auto-mode trial: Claude Code's classifier screens each action;
+  // docs/agent-secrets.md § Auto mode). Read at supervisor start.
+  const mode = local.permission_mode?.[agentName];
+  if (mode) {
+    if (PERMISSION_MODES.has(mode)) a.permissionMode = mode;
+    else console.error(`[supervisor] ignoring permission_mode "${mode}" for ${agentName} (not one of ${[...PERMISSION_MODES].join(", ")})`);
+  }
   return a;
 }
 

