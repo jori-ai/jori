@@ -97,7 +97,7 @@ fi
 # calendarSituation(), with the model verdicts the daemon cached for events
 # over three hours. A long event with no cached verdict holds, as before.
 if [ "$MODE" != "manual" ]; then
-  GOG_BIN="/opt/homebrew/bin/gog"
+  GOG_BIN="${GOG_BIN:-/opt/homebrew/bin/gog}"
   if [ -x "$GOG_BIN" ]; then
     NOW_ISO=$(TZ="$USER_TZ" date -Iseconds)
     FOUR_AGO=$(TZ="$USER_TZ" date -v-4H -Iseconds)

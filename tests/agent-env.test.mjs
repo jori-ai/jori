@@ -57,11 +57,16 @@ test("it keeps what claude and the agent's tools need", () => {
   withLocal({ lockdown: "all" }, ({ envFile }) => {
     const { agentEnv } = require("../lib/agent-env.cjs");
     const { env } = agentEnv("chat", { parentEnv: PARENT, envPath: envFile });
-    for (const k of ["PATH", "HOME", "USER", "TMPDIR", "JORI_HOME", "JORI_TZ", "SUPABASE_URL",
+    for (const k of ["HOME", "USER", "TMPDIR", "JORI_HOME", "JORI_TZ", "SUPABASE_URL",
       "OLLAMA_URL", "JORI_APNS_KEY_ID", "CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS",
-      "GOG_KEYRING_PASSWORD", "TRIAGE_RULES_FILE"]) {
+      "TRIAGE_RULES_FILE"]) {
       assert.equal(env[k], PARENT[k], `${k} must be kept`);
     }
+    // gog runs through its shim, which reads the keyring password itself.
+    assert.equal(env.GOG_KEYRING_PASSWORD, undefined);
+    const shims = path.join(ROOT, "bin", "shims");
+    assert.equal(env.PATH, `${shims}:${PARENT.PATH}`);
+    assert.equal(env.GOG_BIN, path.join(shims, "gog"));
   });
 });
 
@@ -108,7 +113,8 @@ test("the bash helper hands the fork the filtered set, and nothing when not lock
     });
     assert.equal(r.status, 0, r.stderr);
     assert.doesNotMatch(r.stdout, /PLAID_SECRET/);
-    assert.match(r.stdout, /GOG_KEYRING_PASSWORD=g/);
+    assert.doesNotMatch(r.stdout, /GOG_KEYRING_PASSWORD/);
+    assert.match(r.stdout, /GOG_BIN=.*\/bin\/shims\/gog/);
   });
   withLocal({ lockdown: [] }, ({ dir }) => {
     const script = `source "${ROOT}/agent/scripts/lib/agent-env.sh"; jori_agent_env_cmd forks; ` +

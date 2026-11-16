@@ -1938,7 +1938,7 @@ function cmdDoctor(args) {
   // target was inspected instead of the actual binary. Probe by invoking a
   // no-op subcommand: a non-zero exit surfaces real auth/binary regressions
   // (renamed binary, expired token bucket) without reading the symlink.
-  const gogProbe = shSafe(`/opt/homebrew/bin/gog tasks lists --plain ${OWNER_EMAIL ? `--account=${OWNER_EMAIL} ` : ''}--no-input 2>&1 | head -3`);
+  const gogProbe = shSafe(`${process.env.GOG_BIN || '/opt/homebrew/bin/gog'} tasks lists --plain ${OWNER_EMAIL ? `--account=${OWNER_EMAIL} ` : ''}--no-input 2>&1 | head -3`);
   const gogOk = gogProbe && !/no auth|missing|not found|error/i.test(gogProbe);
   add('gog tasks CLI reachable', !!gogOk, gogOk
     ? `lists fetched (${gogProbe.split('\n').filter(Boolean).length} rows)`
@@ -2746,7 +2746,7 @@ function buildSituation() {
   // trumps most other candidates).
   let upcomingEvents = [];
   try {
-    const raw = shSafe(`/opt/homebrew/bin/gog calendar list ${OWNER_EMAIL ? `--account ${OWNER_EMAIL} ` : ''}--days 1 --max 20 --json 2>/dev/null`) || '';
+    const raw = shSafe(`${process.env.GOG_BIN || '/opt/homebrew/bin/gog'} calendar list ${OWNER_EMAIL ? `--account ${OWNER_EMAIL} ` : ''}--days 1 --max 20 --json 2>/dev/null`) || '';
     const data = JSON.parse(raw || '{}');
     const events = data?.events || data?.items || [];
     const now = Date.now();
@@ -2770,7 +2770,7 @@ function buildSituation() {
   // Due-today + overdue tasks — lightweight counts + top-3 titles
   let dueToday = [], overdueCount = 0;
   try {
-    const plain = shSafe(`/opt/homebrew/bin/gog tasks list @default --plain 2>/dev/null`) || '';
+    const plain = shSafe(`${process.env.GOG_BIN || '/opt/homebrew/bin/gog'} tasks list @default --plain 2>/dev/null`) || '';
     const today = new Date().toISOString().slice(0, 10);
     for (const line of plain.split('\n').filter(Boolean)) {
       if (line.includes('completed')) continue;

@@ -13,7 +13,7 @@ The agents read untrusted text all day (mail from anyone, web pages, group chats
 
 It keeps by name the few secrets the agent process itself needs:
 - `CLAUDE_CODE_OAUTH_TOKEN`: the Max login under cron (`bin/cron-run`).
-- `GOG_KEYRING_PASSWORD`: `gog` is an external binary that only reads its keyring password from its environment, and agents run it directly. **This is a documented remainder** until gog gets a shim that reads `.env`.
+- (Until 2026-11-16 also `GOG_KEYRING_PASSWORD`. `gog` reads its keyring password only from its environment, so a locked-down environment now puts `bin/shims` first on `PATH` and sets `GOG_BIN` to `bin/shims/gog`, a wrapper that reads the password from `.env` in its own process and runs the real gog. Every tool that runs gog honours `GOG_BIN`; cron and launchd jobs source `.env` and pass straight through. The password is briefly in the gog process's own environment while it runs.)
 - Anything in the installation's `keep` list.
 
 Everything else (PATH, HOME, the Claude Code settings variables, the supervisor's own non-secret variables) passes unchanged.
@@ -64,6 +64,7 @@ It finds the agent's own tool call reaching:
 - `data/.supabase-oauth.json`;
 - Claude Code's user config, `~/.claude.json` and its copies (`~/.claude.json.*`, `~/.claude/backups/`);
 - 1Password's local config and store;
+- gog's keyring and OAuth client file (`~/Library/Application Support/gogcli/keyring`, `credentials.json`; its attachments folder stays readable);
 - `op …`;
 - `security find-generic-password | find-internet-password | dump-keychain | export`;
 - an environment dump (`env`, `printenv`, `export -p`, bare `set`).

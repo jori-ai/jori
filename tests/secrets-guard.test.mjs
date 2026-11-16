@@ -81,3 +81,11 @@ test("Claude Code's user config is a secrets file; the rest of ~/.claude is not"
   const hits = findAccesses({ tool_name: "Bash", cwd: ROOT, tool_input: { command: `jq .mcpServers ${HOME}/.claude.json` } }, { root: ROOT, home: HOME });
   assert.deepEqual(hits.map((h) => h.kind), ["claude-config"]);
 });
+
+test("gog's keyring and OAuth client file are secrets; its attachments are not", () => {
+  const o = { cwd: ROOT, root: ROOT, home: HOME };
+  const g = `${HOME}/Library/Application Support/gogcli`;
+  assert.equal(protectedPath(`${g}/keyring/token-x`, o), "gog-keyring");
+  assert.equal(protectedPath(`${g}/credentials.json`, o), "gog-keyring");
+  assert.equal(protectedPath(`${g}/gmail-attachments/a.pdf`, o), null);
+});

@@ -12,7 +12,7 @@ await readStdinJson();
 
 try {
   const args = ["tasks", "list", "@default", "-j", ...(GOG_ACCOUNT ? ["-a", GOG_ACCOUNT] : [])];
-  const out = execFileSync("/opt/homebrew/bin/gog", args, { encoding: "utf8", timeout: 10000, maxBuffer: 8 * 1024 * 1024 });
+  const out = execFileSync(process.env.GOG_BIN || "/opt/homebrew/bin/gog", args, { encoding: "utf8", timeout: 10000, maxBuffer: 8 * 1024 * 1024 });
   const tasks = (JSON.parse(out).tasks || []).filter((t) => t && t.id && t.status !== "completed" && t.due);
 
   const today = new Date().toISOString().slice(0, 10);

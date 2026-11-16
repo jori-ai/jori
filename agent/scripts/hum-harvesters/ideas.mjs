@@ -315,7 +315,7 @@ function premiseValid(idea) {
   const hasClock = /\b\d{1,2}:\d{2}\b|\b\d{1,2}\s*(am|pm)\b/i.test(idea.subject || "");
   if (!hasClock) return true;
   try {
-    const out = execFileSync("/opt/homebrew/bin/gog", ["calendar", "events", `--from=${date}`, `--to=${date}`, "-j", ...(GOG_ACCOUNT ? [`--account=${GOG_ACCOUNT}`] : []), "--no-input"], {
+    const out = execFileSync(process.env.GOG_BIN || "/opt/homebrew/bin/gog", ["calendar", "events", `--from=${date}`, `--to=${date}`, "-j", ...(GOG_ACCOUNT ? [`--account=${GOG_ACCOUNT}`] : []), "--no-input"], {
       encoding: "utf8",
       stdio: ["pipe", "pipe", "ignore"],
       timeout: 5000,

@@ -103,7 +103,7 @@ if (isMain) {
 
   try {
     const json = execFileSync(
-      "/opt/homebrew/bin/gog",
+      process.env.GOG_BIN || "/opt/homebrew/bin/gog",
       ["calendar", "list", ...(GOG_ACCOUNT ? ["--account", GOG_ACCOUNT] : []), "--days", "2", "--max", "30", "--json"],
       { encoding: "utf8", timeout: 10000, stdio: ["pipe", "pipe", "ignore"] },
     );

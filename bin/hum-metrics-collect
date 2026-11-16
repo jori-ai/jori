@@ -190,7 +190,7 @@ DEFAULT_TZ_NAME = places_local.instance().get("tz") or "UTC"
 # bin/calendar-conflict-check do (absolute gog path, primary calendar,
 # `--json`, response `{"events": [...]}`). Hard-bounded so a hung gog can never
 # stall the daily collector: any failure degrades the flag to None.
-GOG_BIN = "/opt/homebrew/bin/gog"
+GOG_BIN = os.environ.get("GOG_BIN") or "/opt/homebrew/bin/gog"
 GOG_CALENDAR_ACCOUNT = places_local.instance().get("owner_email") or ""
 CALENDAR_LIST_TIMEOUT_SECS = 15
 CALENDAR_LIST_MAX_EVENTS = 250

@@ -46,7 +46,7 @@ const OUT = path.join(DIR, "hum-ideation-context.json");
 const STATE = path.join(DIR, "hum-ideation-last-input.json");
 const MIN_LIVE = Number(process.env.HUM_IDEATION_MIN_LIVE || 25);
 const MIN_CATEGORIES = Number(process.env.HUM_IDEATION_MIN_CATEGORIES || 5);
-const GOG = fs.existsSync("/opt/homebrew/bin/gog") ? "/opt/homebrew/bin/gog" : "gog";
+const GOG = process.env.GOG_BIN || (fs.existsSync("/opt/homebrew/bin/gog") ? "/opt/homebrew/bin/gog" : "gog");
 const ACCOUNT = instance().owner_email;
 
 function readJson(p) { try { return JSON.parse(fs.readFileSync(p, "utf8")); } catch { return null; } }

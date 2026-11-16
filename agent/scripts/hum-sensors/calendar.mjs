@@ -222,7 +222,7 @@ export function refreshVerdicts(events, { memo = {}, nowMs, classify = classifyL
 }
 
 export default async function detect(ctx) {
-  const payload = await shJson("/opt/homebrew/bin/gog",
+  const payload = await shJson(process.env.GOG_BIN || "/opt/homebrew/bin/gog",
     ["calendar", "list", ...(ACCOUNT ? ["--account", ACCOUNT] : []), "--days", "1", "--max", "30", "--json"],
     { timeout: 15000 });
   // A real calendar with nothing on it still returns valid JSON, so an

@@ -2071,7 +2071,7 @@ fi
 # So: persist across GOG_MIN_TICKS consecutive failing ticks before paging,
 # name the cause from the error actually observed, and clear through the shared
 # machinery so recovery pings for free.
-GOG_BIN=/opt/homebrew/bin/gog
+GOG_BIN="${GOG_BIN:-/opt/homebrew/bin/gog}"
 GOG_MIN_TICKS=3   # ~4-6 min of sustained failure at the 2-min watchdog cadence
 if [ -x "$GOG_BIN" ]; then
   GOG_OUT=$("$GOG_BIN" tasks lists --plain ${JORI_OWNER_EMAIL:+--account=$JORI_OWNER_EMAIL} --no-input 2>&1)
