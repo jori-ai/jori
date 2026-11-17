@@ -27,6 +27,7 @@ const OK_TEXT = "Hi Dana, this is Jori, Alex's AI assistant. Alex asked me to te
 function run(args, env = {}) {
   const base = {
     PATH: process.env.PATH, HOME: tmp, JORI_HOME: tmp, JORI_LOCAL_DIR: local,
+    JORI_SECRETS_BROKER_SOCK: path.join(tmp, "no-broker.sock"), // never the host's real broker
     JORI_OWNER_NAME: "Alex", NODE_TEST_CONTEXT: process.env.NODE_TEST_CONTEXT || "child-v8",
   };
   return new Promise((resolve) => {

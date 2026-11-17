@@ -47,6 +47,8 @@ shasum -a 256 /Library/JoriSecrets/staging/*        # compare with the hashes yo
 sudo /Library/JoriSecrets/staging/secrets-broker-install --install --env ~/Dev/jori/.env --import OP_SERVICE_ACCOUNT_TOKEN,OP_LOGINS_SERVICE_ACCOUNT_TOKEN
 ```
 
+The install ends with a self-test: two reads that return no value (the purchase cards' overview, and a Dev item that does not exist), run through `op` as `_jorisecrets`. If either fails, it unloads the broker again, so the helpers keep using `.env`. Re-running the install is safe. Rollback: `--uninstall`.
+
 Then, once `jori doctor` shows `secrets broker answers` and the helpers work through it:
 1. Remove both tokens and `OP_LOGINS_WRITER_TOKEN` from `.env`.
 2. Rotate: in 1Password, create new service accounts, give each to the broker with `sudo /Library/JoriSecrets/staging/secrets-broker-install --set OP_SERVICE_ACCOUNT_TOKEN` (the value on stdin) and the same for `OP_LOGINS_SERVICE_ACCOUNT_TOKEN`, then revoke the old three. The new Dev one should see a small vault holding only the `site:*` items and the Twilio item, not the whole Dev vault. That way a mistake in the policy cannot expose the rest.
