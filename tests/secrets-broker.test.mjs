@@ -161,7 +161,7 @@ test("over the socket: the CLI's answers and exit codes", { skip: process.platfo
     const env = { ...process.env, JORI_SECRETS_BROKER_SOCK: s.P.sock };
     delete env.OP_SERVICE_ACCOUNT_TOKEN; delete env.OP_LOGINS_SERVICE_ACCOUNT_TOKEN;
     const helper = (bin, ...a) => spawnSync(path.join(ROOT, "bin", bin), a, { encoding: "utf8", env });
-    assert.equal(helper("site-pass", "shop.example.com", "--stdout").stdout, "pw-shop");
+    assert.equal(helper("site-pass", "shop.example.com", "--stdout").stdout, "pw-shop\n", "a newline after the value, as op prints it");
     assert.equal(helper("site-pass", "shop.example.com", "--id").stdout.trim(), ID("a"));
     assert.equal(helper("site-pass", "nothing.example.com", "--stdout").status, 5);
     assert.equal(helper("card-pass", "4242", "--field", "number").stdout, "4242424242424242");

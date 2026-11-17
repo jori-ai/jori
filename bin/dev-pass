@@ -69,10 +69,13 @@ ITEM="site:${DOMAIN}"
 if "$SCRIPT_DIR/secrets-broker" available 2>/dev/null; then
   if [[ "$MODE" == "json" ]]; then exec "$SCRIPT_DIR/secrets-broker" dev-site "$DOMAIN"; fi
   set +e
-  VAL="$("$SCRIPT_DIR/secrets-broker" dev-site "$DOMAIN" --field "$FIELD")"
+  BERR="$(mktemp)"
+  VAL="$("$SCRIPT_DIR/secrets-broker" dev-site "$DOMAIN" --field "$FIELD" 2>"$BERR")"
   RC=$?
   set -e
-  if [[ $RC -ne 0 && $RC -ne 5 ]]; then exit "$RC"; fi
+  # Not found (5) gets this script's own message below; anything else is the broker's.
+  if [[ $RC -ne 0 && $RC -ne 5 ]]; then cat "$BERR" >&2; rm -f "$BERR"; exit "$RC"; fi
+  rm -f "$BERR"
 fi
 
 # Without a broker, the token: the agents' environment no longer carries it

@@ -43,7 +43,7 @@ fi
 # from the environment or .env, as before.
 if "$SCRIPT_DIR/secrets-broker" available 2>/dev/null; then
   op_list() { "$SCRIPT_DIR/secrets-broker" logins-list Login; }
-  op_field() { "$SCRIPT_DIR/secrets-broker" login-field "$1" "$2"; }
+  op_field() { "$SCRIPT_DIR/secrets-broker" login-field "$1" "$2" && echo; } # op prints a newline after the value
 else
   TOKEN="${OP_LOGINS_SERVICE_ACCOUNT_TOKEN:-}"
   if [[ -z "$TOKEN" && -f "$ROOT/.env" ]]; then
