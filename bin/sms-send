@@ -89,6 +89,18 @@ function log(row) {
 // { accountSid, authToken, from } — read here, used for the request, never echoed.
 async function credentials() {
   const op = CONFIG.onepassword;
+  // The secrets broker (docs/secrets-broker.md) holds the 1Password token where
+  // one is installed, and returns only the fields its policy lists for "sms-send".
+  const broker = require("../lib/secrets-broker/client.cjs");
+  if (op && op.item && broker.present()) {
+    const r = await broker.ask("dev.item", { name: "sms-send" });
+    if (!r.ok) fail(78, `could not read the Twilio item through the secrets broker (${r.code}: ${r.error}).`);
+    const names = { ...FIELD_DEFAULTS, ...(op.fields || {}) };
+    const field = (k) => String(r.value[names[k]] || "").trim();
+    const creds = { accountSid: field("account_sid"), authToken: field("auth_token"), from: CONFIG.from || field("from") };
+    if (!creds.accountSid || !creds.authToken) fail(78, `the broker returned no "${names.account_sid}" / "${names.auth_token}" value.`);
+    return creds;
+  }
   if (op && op.item) {
     const token = process.env.OP_SERVICE_ACCOUNT_TOKEN;
     if (!token) fail(78, "OP_SERVICE_ACCOUNT_TOKEN is not set (.env); cannot read the Twilio item from 1Password.");

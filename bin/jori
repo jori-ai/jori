@@ -2009,6 +2009,26 @@ function cmdDoctor(args) {
     }
   }
 
+  // The secrets broker (docs/secrets-broker.md), where one is installed: it
+  // answers, holds its tokens, and .env no longer carries a copy of them.
+  {
+    const brokerClient = require(path.join(TOOLS, 'lib/secrets-broker/client.cjs'));
+    if (brokerClient.present() || fs.existsSync('/Library/LaunchDaemons/com.jori.secrets-broker.plist')) {
+      const r = spawnSync(path.join(TOOLS, 'bin/secrets-broker'), ['health'], { encoding: 'utf8', timeout: 15_000 });
+      let h = null;
+      try { h = JSON.parse(r.stdout); } catch { /* no answer */ }
+      if (!h) add('secrets broker answers', false, `no answer from ${brokerClient.sockPath()} (${String(r.stderr || '').trim().slice(0, 160) || `exit ${r.status}`}); see /Library/JoriSecrets/log/broker.log`);
+      else {
+        const missing = Object.entries(h.tokens || {}).filter(([, v]) => !v).map(([k]) => k);
+        let dup = [];
+        try { dup = fs.readFileSync(path.join(TOOLS, '.env'), 'utf8').split('\n').map((l) => l.split('=')[0].trim()).filter((k) => /^OP_(LOGINS_)?SERVICE_ACCOUNT_TOKEN$/.test(k)); } catch { /* no .env */ }
+        add('secrets broker answers', missing.length === 0, missing.length
+          ? `broker v${h.version} holds no ${missing.join(', ')} token (sudo secrets-broker-install --set …)`
+          : `broker v${h.version} holds the 1Password tokens${dup.length ? `; .env still has ${dup.join(', ')}, so an agent can read them there: remove them and rotate` : '; .env has none of them'}`, dup.length > 0);
+      }
+    }
+  }
+
   if (hasFlag(args, '--json')) { console.log(JSON.stringify(checks, null, 2)); process.exit(checks.every(c => c.ok) ? 0 : 1); }
 
   // --repair: auto-fix repairable drift (schedule mismatches + orphan scripts in cron)

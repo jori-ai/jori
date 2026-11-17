@@ -55,7 +55,7 @@ The speak gate's research session runs gog through `bin/shims/gog`, since it no 
 
 **Check an agent:** `node lib/agent-env.cjs --agent ops --explain` prints what it keeps and drops, names only. On a live agent, the supervisor log line `agent env lockdown (<agent>): N kept, M dropped` confirms it at spawn.
 
-**Not airtight.** Everything still runs as the same macOS user: an agent can read `.env` from disk. § 2 notices and then blocks that. A broker running under its own user, owning the secrets and talking only to each key's own site, is the follow-up (Step B, largest-risk keys first: the 1Password service-account tokens, then the bank feed, database, Slack, iCloud).
+**Not airtight.** Everything still runs as the same macOS user: an agent can read `.env` from disk. § 2 catches the plain reads but not one that builds the path in pieces or loads `.env` through the repo's own loader (checked 2026-11-17). The fix is the secrets broker (`docs/secrets-broker.md`), running as its own user and owning the keys. Stage 1, built 2026-11-17, takes the 1Password service-account tokens; the bank feed, database, Slack and iCloud follow.
 
 ## 2. The secrets read-guard
 
