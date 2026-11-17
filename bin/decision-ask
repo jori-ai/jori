@@ -14,7 +14,7 @@
 //   decision-ask --list                     every open decision, in order
 //
 // Exit: 0 sent (or printed) · 5 nothing to send (unknown/answered ref, already
-// one today) · 6 the outbound precheck or speak gate held it (nothing recorded;
+// one today) · 6 the outbound precheck or speak gate held it (recorded in the lane's held[] for 3 days;
 // stdout {sent:false, held:{by, verdict, note, …}}) · 3 send failed.
 //
 // Sends through jori-send-curl (outbound precheck, push + motion gate),
@@ -30,7 +30,7 @@ import { spawnSync } from "node:child_process";
 import { createRequire } from "node:module";
 import {
   loadOpen, orderDecisions, nextDecision, findDecision, buildCard, renderDecision, groupOf, UNPACED,
-  readLane, writeLane, hashQuestion, SELF_ASKED, ASKED_BY_OWNER_ROLE, FOLLOW_UP,
+  readLane, writeLane, holdRecord, hashQuestion, SELF_ASKED, ASKED_BY_OWNER_ROLE, FOLLOW_UP,
 } from "../lib/decision-queue.mjs";
 import { userTz } from "../lib/hum-events.mjs";
 import { recordQuestionSend, currentScale } from "../lib/question-pacing.mjs";
@@ -117,6 +117,14 @@ async function main() {
     // "resolve" hold: the user already answered; plugins/shows-seen/lib/ask-now.js).
     let hold = null;
     try { hold = captured ? JSON.parse(captured) : null; } catch { hold = null; }
+    // A hold on the card itself (precheck or speak gate) is remembered, so the
+    // lane stops offering the same card every tick; a transient hold is not.
+    const rec = holdRecord(item.ref, hold);
+    if (rec) {
+      const lane = readLane();
+      lane.held = [...(lane.held || []).filter((h) => h.ref !== item.ref), rec].slice(-100);
+      writeLane(lane);
+    }
     console.log(JSON.stringify({ sent: false, ref: item.ref, held: hold }));
     return 6;
   }

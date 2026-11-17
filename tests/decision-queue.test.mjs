@@ -338,3 +338,23 @@ test("social and entertainment cards are asked by the role owning their job; rev
   }
   for (const s of ["improvement", "cost", "budget", "finance"]) assert.ok(!dq.ASKED_BY_OWNER_ROLE.has(s), s);
 });
+
+// ─── a card the precheck or speak gate held is not re-offered for 3 days ───
+test("holdRecord keeps precheck and speak-gate holds, drops transient ones", () => {
+  const now = new Date("2026-11-17T15:00:00Z");
+  assert.equal(dq.holdRecord("cost:q-urgent", { suppressed: true, reason: "already answered" }, now).by, "precheck");
+  assert.equal(dq.holdRecord("cost:q-urgent", { suppressed: true, by: "speak-gate", verdict: "resolve", note: "n" }, now).by, "speak-gate");
+  assert.equal(dq.holdRecord("cost:q-urgent", { suppressed: true, by: "question-hold", reason: "x" }, now), null);
+  assert.equal(dq.holdRecord("cost:q-urgent", { suppressed: true, by: "p1-push-fold" }, now), null);
+  assert.equal(dq.holdRecord("cost:q-urgent", null, now), null);
+});
+
+test("nextDecision skips a recently held card and offers it again after 3 days", () => {
+  seed();
+  const now = Date.now();
+  const held = [{ ref: "cost:q-urgent", held_at: new Date(now - 3600e3).toISOString(), by: "precheck", reason: "x" }];
+  const r = dq.nextDecision({ lane: { asked: [], held }, now });
+  assert.notEqual(r.decision?.ref, "cost:q-urgent");
+  const old = [{ ...held[0], held_at: new Date(now - 4 * 86400e3).toISOString() }];
+  assert.equal(dq.nextDecision({ lane: { asked: [], held: old }, now }).decision.ref, "cost:q-urgent");
+});
