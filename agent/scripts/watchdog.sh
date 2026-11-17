@@ -1001,7 +1001,37 @@ fi
 # each stuck message. (The `-label:p1` exclusion lives in
 # `gmail-action list-unread-older`'s query — without it the watchdog
 # dispatches RECLASSIFY for every legit-unread P1 every tick forever.)
+
+# drop_phantom_skipped <list-json> [tracking-file] — prints the sweep's list
+# without the messages the ops agent has already flagged as a reclassify loop
+# (`phantom_skip: true` in the dispatcher's tracking file,
+# lib/dispatch-attempts.mjs). The sweep posts RECLASSIFY through the ops
+# webhook, a path that never reads that flag, so without this a flagged message
+# is re-dispatched every tick. Fail-open: a missing, unreadable or non-JSON
+# tracking file, a list jq cannot read, or any jq error prints <list-json>
+# unchanged; nothing is logged unless something was dropped.
+drop_phantom_skipped() {
+  local list="$1"
+  local file="${2:-${RECLASSIFY_TRACKING_FILE:-${JORI_INSTALL_TOOLS:-}/data/reclassify-tracking.json}}"
+  local prog='(($trk[0] // {}) | if type == "object" then . else {} end) as $t
+    | if type == "array"
+      then map(select(((try (.id | tostring) catch "") as $k
+                       | ($t[$k] // {}) | if type == "object" then .phantom_skip else null end) != true))
+      else . end'
+  local kept before after
+  kept=$(printf '%s' "$list" | jq -c --slurpfile trk "$file" "$prog" 2>/dev/null) || { printf '%s' "$list"; return 0; }
+  before=$(printf '%s' "$list" | jq 'length' 2>/dev/null) || { printf '%s' "$list"; return 0; }
+  after=$(printf '%s' "$kept" | jq 'length' 2>/dev/null) || { printf '%s' "$list"; return 0; }
+  if [ "$after" -lt "$before" ] 2>/dev/null; then
+    log "Gmail unread sweep: $((before - after)) message(s) skipped — phantom_skip already set (reclassify loop flagged by the agent)"
+    printf '%s' "$kept"
+  else
+    printf '%s' "$list"
+  fi
+}
+
 STUCK_EMAILS=$("$HOME/Dev/jori/bin/gmail-action" list-unread-older 5 2>/dev/null || echo "[]")
+STUCK_EMAILS=$(drop_phantom_skipped "$STUCK_EMAILS")
 STUCK_COUNT=$(echo "$STUCK_EMAILS" | jq 'length' 2>/dev/null || echo 0)
 STUCK_COUNT=${STUCK_COUNT:-0}
 # The ops dispatcher's usage-limit hold (/health rateLimitHoldUntil: an ISO time
