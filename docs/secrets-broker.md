@@ -13,7 +13,13 @@ The agents run as the same macOS user as everything else, so any key in a file o
 | `bin/dev-pass` | `dev.site` | the Dev item titled `site:<domain>`, never for a money-movement domain |
 | `bin/sms-send` | `dev.item` `sms-send` | the Twilio item's listed fields only |
 
-There is no generic read: no `op read` of an arbitrary reference, no other vault, no write. Every read that returns a value counts against an hourly cap (`rate.per_hour`, 120). Every request is appended to `/Library/JoriSecrets/log/audit.jsonl` (operation, item, field, result; never a value), which the agents' user can read but not change.
+| a job that ran under `op run` | `dev.env` `<bundle>`, through `secrets-broker run` | the references its template lists, as the policy copied them |
+
+There is no generic read: no `op read` of an arbitrary reference, no other vault, no write.
+
+### Bundles
+
+A job that ran under `op run` (a template whose lines are 1Password references) runs under `secrets-broker run <bundle> --env-file <template> -- <command>` instead. The broker resolves the bundle's references with one `op item get` per item. The command starts with the template's plain lines and the bundle's values in its environment, and never with a token. Bundles are listed in `agent/local/config/secrets-broker.json` (`env_file`, `vars` for `${VAR}` in the references, `token`); `bin/secrets-broker-policy` copies each template's references into the policy, so the broker never reads the template itself. A reference the policy does not list is refused, and so is a template line the bundle does not supply. The values are in the command's starting environment for as long as it runs, as they were under `op run`. Every read that returns a value counts against an hourly cap (`rate.per_hour`, 120). Every request is appended to `/Library/JoriSecrets/log/audit.jsonl` (operation, item, field, result; never a value), which the agents' user can read but not change.
 
 What it does **not** stop: an agent can still read, through these helpers, the logins and cards they reach today. What it stops is taking a token, which reads the whole vault from anywhere until it is revoked, and writes. The gain lands once the old tokens are revoked: until then a copy in `.env`, a backup or a log is still good.
 

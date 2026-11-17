@@ -56,6 +56,11 @@ function setup({ perHour = 120, withTokens = true } = {}) {
   fs.writeFileSync(path.join(dir, "etc", "policy.json"), JSON.stringify({
     vaults: { logins: "Logins", dev: "Dev" }, card_tag: "jori-purchase", deny_domains: ["bank.example", "broker.example"],
     dev_items: { "sms-send": { vault: "vd", item: ID("f"), fields: ["account sid", "auth token"] } }, rate: { per_hour: perHour },
+    dev_envs: {
+      job: { token: "dev", vars: { SID: "op://Dev/Twilio/account sid", TOK: "op://Dev/Twilio/auth token", SITE_PW: "op://Dev/site:example.org/password" } }, // kernel-guard-ok: the 1Password reference scheme, not a reference
+      odd: { vars: { X: "op://Dev/Twilio/account sid?attribute=otp" } }, // kernel-guard-ok: the 1Password reference scheme, not a reference
+      gone: { vars: { X: "op://Dev/Twilio/no such field" } }, // kernel-guard-ok: the 1Password reference scheme, not a reference
+    },
   }));
   const P = paths(dir);
   if (withTokens) { storeSet(P, "OP_LOGINS_SERVICE_ACCOUNT_TOKEN", "ops_LOGINS\n"); storeSet(P, "OP_SERVICE_ACCOUNT_TOKEN", "ops_DEV"); }
@@ -119,6 +124,18 @@ test("Dev: only site:<domain> items and the items the policy names, with the Dev
   s.done();
 });
 
+test("a bundle: the listed references, one op call per item, nothing else", async () => {
+  const s = setup();
+  assert.deepEqual((await s.handle({ op: "dev.env", name: "job" })).value, { SID: "AC1", TOK: "t0k", SITE_PW: "pw-dev" });
+  assert.equal(s.opCalls().length, 2, "Twilio and site:example.org, once each");
+  assert.equal(s.opCalls()[0].env.OP_SERVICE_ACCOUNT_TOKEN, "ops_DEV");
+  assert.equal((await s.handle({ op: "dev.env", name: "odd" })).code, "denied", "only plain references");
+  assert.equal((await s.handle({ op: "dev.env", name: "gone" })).code, "not_found");
+  assert.equal((await s.handle({ op: "dev.env", name: "constructor" })).code, "denied");
+  assert.ok(!s.auditText().includes("t0k"));
+  s.done();
+});
+
 test("the hourly cap stops a dump", async () => {
   const s = setup({ perHour: 2 });
   for (let i = 0; i < 2; i++) assert.equal((await s.handle({ op: "logins.login_field", id: ID("a"), field: "username" })).ok, true);
@@ -169,6 +186,16 @@ test("over the socket: the CLI's answers and exit codes", { skip: process.platfo
     assert.equal(helper("dev-pass", "example.org", "--stdout").stdout, "pw-dev");
     assert.equal(helper("dev-pass", "missing.example", "--stdout").status, 1);
     assert.ok(!/OP_SERVICE_ACCOUNT_TOKEN is not set/.test(helper("dev-pass", "missing.example", "--stdout").stderr), "no fallback to .env when the broker answered");
+
+    // run: op run without the token.
+    const tpl = path.join(s.dir, "job.env.tpl");
+    fs.writeFileSync(tpl, '# a comment with op://x/y/z\nPLAIN="hello"\nSID="op://Dev/Twilio/account sid"\nSITE_PW=op://Dev/site:example.org/password\n'); // kernel-guard-ok: the 1Password reference scheme, not a reference
+    const show = "process.stdout.write([process.env.PLAIN, process.env.SID, process.env.SITE_PW, process.env.OP_SERVICE_ACCOUNT_TOKEN || 'none'].join(','))";
+    const r = spawnSync(path.join(ROOT, "bin/secrets-broker"), ["run", "job", "--env-file", tpl, "--", process.execPath, "-e", show], { encoding: "utf8", env });
+    assert.equal(r.stdout, "hello,AC1,pw-dev,none");
+    assert.equal(spawnSync(path.join(ROOT, "bin/secrets-broker"), ["run", "job", "--", process.execPath, "-e", "process.exit(7)"], { env }).status, 7, "the command's exit code");
+    fs.writeFileSync(tpl, "EXTRA=op://Dev/Cloud root/key\n"); // kernel-guard-ok: a placeholder 1Password reference, no real vault
+    assert.equal(spawnSync(path.join(ROOT, "bin/secrets-broker"), ["run", "job", "--env-file", tpl, "--", "true"], { env }).status, 77, "a reference the bundle does not supply");
   } finally {
     server.kill("SIGTERM");
     s.done();
