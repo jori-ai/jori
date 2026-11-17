@@ -92,7 +92,8 @@ async function credentials() {
   // The secrets broker (docs/secrets-broker.md) holds the 1Password token where
   // one is installed, and returns only the fields its policy lists for "sms-send".
   const broker = require("../lib/secrets-broker/client.cjs");
-  if (op && op.item && broker.present()) {
+  const held = op && op.item && broker.present() ? await broker.ask("health", {}, { timeoutMs: 5000 }) : null;
+  if (held && held.ok && held.value.tokens && held.value.tokens.dev === true) {
     const r = await broker.ask("dev.item", { name: "sms-send" });
     if (!r.ok) fail(78, `could not read the Twilio item through the secrets broker (${r.code}: ${r.error}).`);
     const names = { ...FIELD_DEFAULTS, ...(op.fields || {}) };

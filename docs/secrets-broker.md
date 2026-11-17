@@ -46,18 +46,20 @@ Root must never run or copy anything the agents can change: the checkout, `~/.lo
 
 ```bash
 sudo mkdir -p /Library/JoriSecrets/staging
-sudo install -o root -g wheel -m 755 ~/Dev/jori/bin/secrets-broker-install /Library/JoriSecrets/staging/
-sudo install -o root -g wheel -m 644 ~/Dev/jori/lib/secrets-broker/broker.cjs ~/Dev/jori/agent/local/config/secrets-broker-policy.json /Library/JoriSecrets/staging/
-sudo mv /Library/JoriSecrets/staging/secrets-broker-policy.json /Library/JoriSecrets/staging/policy.json
+sudo install -o root -g wheel -m 755 ~/Dev/jori/bin/secrets-broker-install /Library/JoriSecrets/staging/secrets-broker-install
+sudo install -o root -g wheel -m 644 ~/Dev/jori/lib/secrets-broker/broker.cjs /Library/JoriSecrets/staging/broker.cjs
+sudo install -o root -g wheel -m 644 ~/Dev/jori/agent/local/config/secrets-broker-policy.json /Library/JoriSecrets/staging/policy.json
 shasum -a 256 /Library/JoriSecrets/staging/*        # compare with the hashes you were given
-sudo /Library/JoriSecrets/staging/secrets-broker-install --install --env ~/Dev/jori/.env --import OP_SERVICE_ACCOUNT_TOKEN,OP_LOGINS_SERVICE_ACCOUNT_TOKEN
+sudo /Library/JoriSecrets/staging/secrets-broker-install --install
+sudo /Library/JoriSecrets/staging/secrets-broker-install --set OP_SERVICE_ACCOUNT_TOKEN
+sudo /Library/JoriSecrets/staging/secrets-broker-install --set OP_LOGINS_SERVICE_ACCOUNT_TOKEN
 ```
 
-The install ends with a self-test: two reads that return no value (the purchase cards' overview, and a Dev item that does not exist), run through `op` as `_jorisecrets`. If either fails, it unloads the broker again, so the helpers keep using `.env`. Re-running the install is safe. Rollback: `--uninstall`.
+The tokens given with `--set` are new ones, made for the broker in 1Password: a value that sat in `.env` was readable by the agents and is treated as spent. `--set` asks for the value without echoing it, then runs that token's self-test: one read that returns no value (the purchase cards' overview for Logins, a Dev item that does not exist for Dev) through `op` as `_jorisecrets`. A token that fails it is removed again. A helper asks the broker only for a token it holds (`secrets-broker available logins|dev`), so until both are set the rest keep using `.env`. Re-running any step is safe. Rollback: `--uninstall`. (`--install --env FILE --import NAME,…` copies keys from a dotenv file instead, read as data and never sourced.)
 
-Then, once `jori doctor` shows `secrets broker answers` and the helpers work through it:
-1. Remove both tokens and `OP_LOGINS_WRITER_TOKEN` from `.env`.
-2. Rotate: in 1Password, create new service accounts, give each to the broker with `sudo /Library/JoriSecrets/staging/secrets-broker-install --set OP_SERVICE_ACCOUNT_TOKEN` (the value on stdin) and the same for `OP_LOGINS_SERVICE_ACCOUNT_TOKEN`, then revoke the old three. The new Dev one should see a small vault holding only the `site:*` items and the Twilio item, not the whole Dev vault. That way a mistake in the policy cannot expose the rest.
+Then:
+1. Remove `OP_SERVICE_ACCOUNT_TOKEN`, `OP_LOGINS_SERVICE_ACCOUNT_TOKEN` and `OP_LOGINS_WRITER_TOKEN` from `.env`.
+2. Revoke the old three service accounts in 1Password. Better still, give the new Dev one a vault holding only what the policy names (the `site:*` items and the named items and bundles), not the whole Dev vault. A mistake in the policy then cannot expose the rest (the policy's vault names change with it).
 
 Changing the broker or its policy repeats the staging copy, the hash check and `--update`. Off: `sudo /Library/JoriSecrets/staging/secrets-broker-install --uninstall` (the helpers then fall back to `.env`, which by then has no token).
 

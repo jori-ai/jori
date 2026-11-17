@@ -31,7 +31,7 @@ CARD_TAG="${CARD_TAG:-jori-purchase}"
 # The secrets broker (docs/secrets-broker.md) holds the token where one is
 # installed, and holds cards to its own copy of the tag; without one, the token
 # is read from the environment or .env, as before.
-if "$SCRIPT_DIR/secrets-broker" available 2>/dev/null; then
+if "$SCRIPT_DIR/secrets-broker" available logins 2>/dev/null; then
   op_cards() { "$SCRIPT_DIR/secrets-broker" logins-list card; }
   op_card() { "$SCRIPT_DIR/secrets-broker" card "$1"; }
 else

@@ -168,6 +168,8 @@ test("over the socket: the CLI's answers and exit codes", { skip: process.platfo
     const cli = (...a) => spawnSync(path.join(ROOT, "bin/secrets-broker"), a, { encoding: "utf8", env: { ...process.env, JORI_SECRETS_BROKER_SOCK: s.P.sock } });
     if (!fs.existsSync(s.P.sock)) return; // a sandbox that refuses unix sockets
     assert.equal(cli("available").status, 0);
+    assert.equal(cli("available", "dev").status, 0);
+    assert.equal(cli("available", "other-job").status, 78, "a token the broker does not hold: the helper keeps its own path");
     assert.equal(cli("login-field", ID("a"), "username").stdout, "me@x");
     assert.equal(cli("login-field", ID("b"), "password").status, 77);
     assert.equal(cli("dev-site", "nope.example", "--field", "password").status, 5);

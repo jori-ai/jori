@@ -41,7 +41,7 @@ fi
 # The secrets broker (docs/secrets-broker.md) holds the token where one is
 # installed; this script then never sees it. Without one, the token is read
 # from the environment or .env, as before.
-if "$SCRIPT_DIR/secrets-broker" available 2>/dev/null; then
+if "$SCRIPT_DIR/secrets-broker" available logins 2>/dev/null; then
   op_list() { "$SCRIPT_DIR/secrets-broker" logins-list Login; }
   op_field() { "$SCRIPT_DIR/secrets-broker" login-field "$1" "$2" && echo; } # op prints a newline after the value
 else
