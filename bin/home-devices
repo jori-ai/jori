@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """home-devices — heartbeat sweep of the installation's fixed home devices.
 
-    home-devices sweep [--dry-run]   # probe every device, email on DOWN / back UP (cron, every 2 min)
+    home-devices sweep [--dry-run [--daily-text]]   # probe every device, email on DOWN / back UP (cron, every 2 min)
     home-devices status              # table of the last sweep's view
-    home-devices unlisted            # DHCP leases that are NOT in the roster (to decide what to add)
+    home-devices unlisted            # DHCP leases / client-list MACs NOT in the roster (to decide what to add)
     home-devices outages [--device NAME] [--days N]   # how often each device dropped and how long it took to reconnect
 
 Requirement: watch every fixed device at each of the user's sites and email
@@ -59,7 +59,28 @@ Cloud-judged devices (any site):
               `ring_name` is matched case-insensitively.
   lock_cloud  a lock whose LAN presence proves nothing (behind an extender that
               answers ARP for it) is judged by its cloud `connected` flag, via
-              the `device_state()` of the installation's `lock_cloud_script`.
+              the `device_state(lock)` of the installation's `lock_cloud_script`.
+              The entry's `lock` names which lock (none = the script's
+              default); every lock is read in one subprocess per sweep.
+
+Listed devices (a LAN we can't route to, behind a router in router mode):
+
+  client_list judged by whether that router's own attached-devices page lists
+              the device's MAC. The site's `client_list` says how to read it;
+              the reading is cached and refreshed at most every `every_min`
+              (never under 10), with a logout after each read, because such
+              routers allow one admin session and a person may be in it. See
+              read_client_list for the rules (a refused password is not retried,
+              another session is never forced out, `paused_until`).
+
+Tiers: an entry with `tier: "daily"` is watched the same way but never emailed;
+its changes go into the daily summary once a day (flush_daily). Everything else
+is the immediate tier.
+
+A site's `maintenance_until` (ISO with offset) turns its failures into "not
+judged" until then, so planned work (a router swap) sends no burst of
+Offline / Back online mail. An entry's `down_note` is printed under its
+Offline line (e.g. what else depends on it).
 
 Both cloud checks run under homectl's own interpreter: the python next to the
 homectl the installation binds at bin/homectl (HOMECTL_BIN, or `homectl_bin` /
@@ -107,9 +128,9 @@ state file and go with the next successful sweep. They skip the speak gate
 into the next morning's summary as a "routine repeat flapper". A device alert
 is the whole point of this job and arrives as its own email, every time. If
 email-send still prints "Held:" it was not sent: the log says so and the
-events are dropped rather than re-held every two minutes. A Tuya smart-plug check was
-removed with its last roster entry (plugs switched off at the wall are
-indistinguishable from dropped ones, so every alert was a false positive).
+events are dropped rather than re-held every two minutes. Plugs and bulbs that
+guests switch off at the wall are indistinguishable from dropped ones, so they
+are never emailed: they belong in the daily tier.
 """
 import argparse
 import datetime as dt
@@ -329,27 +350,51 @@ def probe(site, ips):
     return res
 
 
-def lock_cloud_connected(cfg):
-    """True / False from the lock's cloud, or None if it couldn't be asked."""
+LOCKS = {"data": "unfetched"}
+DEFAULT_LOCK = "_default"
+
+
+def lock_cloud_states(cfg):
+    """Lock key -> True / False from the lock's cloud (None for one that
+    couldn't be asked), or None when the cloud couldn't be asked at all. Every
+    lock_cloud entry's `lock` (a key the script's device_state(lock) knows;
+    none = the script's own default lock) is read in ONE subprocess per sweep."""
+    if LOCKS["data"] != "unfetched":
+        return LOCKS["data"]
+    LOCKS["data"] = None
     script = cfg.get("lock_cloud_script")
     py, _ = homectl_env(cfg)
-    if not script or not py:
+    keys = sorted({d.get("lock") or DEFAULT_LOCK for d in cfg.get("devices", []) if d.get("check") == "lock_cloud"})
+    if not script or not py or not keys:
         return None
     script = expand(script)
     if not os.path.isabs(script):
         script = os.path.join(TOOLS, script)
     code = (
-        "import importlib.util,json;"
+        "import importlib.util,json,sys;"
         f"s=importlib.util.spec_from_file_location('h',{script!r});"
-        "h=importlib.util.module_from_spec(s);s.loader.exec_module(h);"
-        "d,a=h.device_state();print(json.dumps(d.get('connected')))"
+        "h=importlib.util.module_from_spec(s);s.loader.exec_module(h);\n"
+        "out={}\n"
+        f"for k in {keys!r}:\n"
+        "    try:\n"
+        f"        d,a=h.device_state() if k=={DEFAULT_LOCK!r} else h.device_state(k)\n"
+        "        out[k]=d.get('connected')\n"
+        "    except Exception:\n"
+        "        out[k]=None\n"
+        "print(json.dumps(out))"
     )
     try:
-        r = subprocess.run([py, "-c", code], capture_output=True, text=True, timeout=45)
+        r = subprocess.run([py, "-c", code], capture_output=True, text=True, timeout=45 + 15 * len(keys))
         v = json.loads(r.stdout.strip().splitlines()[-1])
-        return v if isinstance(v, bool) else None
+        LOCKS["data"] = {k: (x if isinstance(x, bool) else None) for k, x in v.items()} if isinstance(v, dict) else None
     except Exception:
-        return None
+        LOCKS["data"] = None
+    return LOCKS["data"]
+
+
+def lock_cloud_result(cfg, d):
+    c = (lock_cloud_states(cfg) or {}).get(d.get("lock") or DEFAULT_LOCK)
+    return c, {True: "cloud: connected", False: "cloud: NOT connected", None: "cloud API unavailable"}[c]
 
 
 RING_Q = """
@@ -501,8 +546,7 @@ def check_router_site(cfg, site, devs, last_ip=None, addrs=None, down=()):
         if kind == "router":
             results[d["name"]] = (True, "SSH OK")
         elif kind == "lock_cloud":
-            c = lock_cloud_connected(cfg)
-            results[d["name"]] = (c, {True: "cloud: connected", False: "cloud: NOT connected", None: "cloud API unavailable"}[c])
+            results[d["name"]] = lock_cloud_result(cfg, d)
         else:
             ip = ip_of[d["mac"]]
             moved = None
@@ -548,11 +592,139 @@ def check_remote_site(cfg, devs):
     for d in devs:
         if d is not anchor:
             if d.get("check") == "lock_cloud":
-                c = lock_cloud_connected(cfg)
-                results[d["name"]] = (c, {True: "cloud: connected", False: "cloud: NOT connected", None: "cloud API unavailable"}[c])
+                results[d["name"]] = lock_cloud_result(cfg, d)
             else:
                 results[d["name"]] = check_remote_device(d)
     return results
+
+
+# ── Client lists: a router's own "attached devices" page ──────────────────
+#
+# A device that can't be reached from here (a LAN behind a router in router
+# mode: no route, no ping) is judged by whether that router lists it, by MAC.
+# The site carries `client_list` {reader_script, label, via, every_min,
+# password_env, paused_until, plus whatever its reader needs}; `via` is the
+# roster device that IS the router, and while it isn't answering nothing
+# behind it is judged. The login itself is the installation's reader_script.
+#
+# Routers like this allow ONE admin session, and a person may be using it, so:
+#   - at most one read per `every_min` (never under 10), timed from the last
+#     ATTEMPT and kept in its own file, so a dry run or a crash cannot read
+#     more often;
+#   - log out after every read;
+#   - a refused password is not tried again until the password in the env
+#     changes (a salted hash of the refused one is kept, not the password);
+#   - "another admin is logged in" backs off and never forces the login;
+#   - `paused_until` (ISO) holds off reads entirely, e.g. while someone works
+#     in the router's pages.
+# A page with no MACs at all, or none of the expected ones, is "not judged",
+# never a miss. Between reads a device keeps the last reading.
+
+CLIENT_LISTS = os.path.join(INSTALL_TOOLS, "data", "home-devices-client-lists.json")
+
+
+def _fp(salt, secret):
+    import hashlib
+    return hashlib.sha256((salt + secret).encode()).hexdigest()[:16]
+
+
+def load_reader(cl):
+    """The installation's reader for this list: `reader_script` (kernel-relative
+    or absolute), a Python module whose read(cl, password) logs in, reads the
+    attached-devices page, logs out, and returns {"macs": [...], "page"?: html}
+    or {"error": ..., "auth_failed"?: True, "busy"?: True}. The vendor's login
+    lives there, not here."""
+    import importlib.util
+    script = expand(cl.get("reader_script") or "")
+    if not script:
+        raise RuntimeError("the site's client_list has no reader_script")
+    if not os.path.isabs(script):
+        script = os.path.join(TOOLS, script)
+    spec = importlib.util.spec_from_file_location("client_list_reader", script)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod.read
+
+
+def read_client_list(key, site, now):
+    """The site's cached reading, refreshed when it is due. Returns the cache entry."""
+    import fcntl
+    cl = site["client_list"]
+    every = max(10, int(cl.get("every_min", 10)))
+    os.makedirs(os.path.dirname(CLIENT_LISTS), exist_ok=True)
+    with open(CLIENT_LISTS + ".lock", "w") as lk:
+        fcntl.flock(lk, fcntl.LOCK_EX)
+        allc = load(CLIENT_LISTS, {})
+        c = allc.setdefault(key, {})
+        last = c.get("attempt_at")
+        due = not last or now - dt.datetime.fromisoformat(last) >= dt.timedelta(minutes=every)
+        paused = cl.get("paused_until")
+        if paused and now < dt.datetime.fromisoformat(paused):
+            c["skipped"] = f"paused until {local_time(paused)}"
+            due = False
+        password = os.environ.get(cl.get("password_env", ""), "")
+        if due and not password:
+            c["skipped"], due = f"no password ({cl.get('password_env')} not set)", False
+        if due and c.get("refused_fp") and c["refused_fp"] == _fp(c.get("salt", ""), password):
+            c["skipped"], due = "password refused earlier; not tried again until it changes", False
+        if due:
+            c.pop("skipped", None)
+            c["attempt_at"] = now.isoformat(timespec="seconds")
+            try:
+                r = load_reader(cl)(cl, password)
+            except Exception as e:
+                r = {"error": f"{type(e).__name__}: {e}"[:200]}
+            if r.get("page") is not None:
+                try:
+                    with open(os.path.join(os.path.dirname(CLIENT_LISTS), f"home-devices-client-list-{key}.html"), "w") as f:
+                        f.write(r["page"])
+                except OSError:
+                    pass
+            if r.get("macs"):
+                c.update(read_at=c["attempt_at"], macs=r["macs"])
+                c.pop("error", None)
+                c.pop("refused_fp", None)
+            else:
+                c["error"] = r.get("error")
+                if r.get("auth_failed"):
+                    c["salt"] = c.get("salt") or os.urandom(8).hex()
+                    c["refused_fp"] = _fp(c["salt"], password)
+        save(CLIENT_LISTS, allc)
+        return c
+
+
+def check_client_lists(cfg, devs, results, down=()):
+    out = {}
+    sites = cfg.get("sites", {})
+    now = dt.datetime.fromisoformat(now_iso())
+    for key in sorted({d["site"] for d in devs}):
+        site = sites.get(key) or {}
+        cl = site.get("client_list")
+        mine = [d for d in devs if d["site"] == key]
+        if not cl:
+            out.update({d["name"]: (None, "the site has no client_list") for d in mine})
+            continue
+        label = cl.get("label") or cl.get("via") or "router"
+        via = cl.get("via")
+        if via and results.get(via, (None,))[0] is not True:
+            out.update({d["name"]: (None, f"not judged: {via} not answering") for d in mine})
+            continue
+        c = read_client_list(key, site, now)
+        every = max(10, int(cl.get("every_min", 10)))
+        read_at = c.get("read_at")
+        if not read_at or now - dt.datetime.fromisoformat(read_at) > dt.timedelta(minutes=2 * every + 5):
+            why = c.get("skipped") or c.get("error") or "not read yet"
+            out.update({d["name"]: (None, f"{label} list not read{' since ' + local_time(read_at) if read_at else ''} ({why})") for d in mine})
+            continue
+        macs = set(c.get("macs") or [])
+        expected = [d for d in mine if d["name"] not in down]
+        if len(expected) >= 2 and not any(m in macs for d in expected for m in [d["mac"].lower()] + [x.lower() for x in d.get("alt_macs", [])]):
+            out.update({d["name"]: (None, f"couldn't check: the {label} list has none of the expected devices (read {local_time(read_at)})") for d in mine})
+            continue
+        for d in mine:
+            seen = any(m in macs for m in [d["mac"].lower()] + [x.lower() for x in d.get("alt_macs", [])])
+            out[d["name"]] = (seen, f"{'in' if seen else 'not in'} the {label} list (read {local_time(read_at)})")
+    return out
 
 
 def check_all(cfg, state=None, addrs=None):
@@ -563,12 +735,14 @@ def check_all(cfg, state=None, addrs=None):
     good address)."""
     roster = cfg.get("devices", [])
     sites = cfg.get("sites", {})
+    RING["data"] = LOCKS["data"] = "unfetched"  # each sweep asks the clouds afresh
     prior = {k: v for k, v in ((state or {}).get("devices") or {}).items() if isinstance(v, dict)}
     last_ip = {k: v["ip"] for k, v in prior.items() if v.get("ip")}
     down = {k for k, v in prior.items() if v.get("status") == "down"}
     results = {}
     ring = [d for d in roster if d.get("check") == "ring"]
-    rest = [d for d in roster if d.get("check") != "ring"]
+    listed = [d for d in roster if d.get("check") == "client_list"]
+    rest = [d for d in roster if d.get("check") not in ("ring", "client_list")]
     for key, site in sites.items():
         devs = [d for d in rest if d["site"] == key]
         if not devs:
@@ -581,6 +755,36 @@ def check_all(cfg, state=None, addrs=None):
         if d["name"] not in results:
             results[d["name"]] = (None, f"site {d['site']!r} is not in the roster's sites")
     results.update(check_ring(cfg, ring))
+    # Last: a client list is read through its `via` device, judged above.
+    results.update(check_client_lists(cfg, listed, results, down))
+    return quiet_in_maintenance(cfg, results)
+
+
+def in_maintenance(site, t=None):
+    """The site's `maintenance_until` (ISO with offset) while it is still ahead, else None."""
+    until = (site or {}).get("maintenance_until")
+    if not until:
+        return None
+    try:
+        end = dt.datetime.fromisoformat(until)
+        now = dt.datetime.fromisoformat(t) if t else dt.datetime.now(dt.timezone.utc)
+        return until if now < end else None
+    except (TypeError, ValueError):
+        return None
+
+
+def quiet_in_maintenance(cfg, results):
+    """During a site's maintenance window (`maintenance_until`, e.g. while its
+    router is swapped) a failure there is "not judged", never a miss: the work
+    makes devices blink, and each blink would otherwise become an Offline / Back
+    online pair. A device that answers is still recorded as up, so one that was
+    DOWN before the window can still come back. The window ends on its own."""
+    sites = cfg.get("sites", {})
+    for d in cfg.get("devices", []):
+        until = in_maintenance(sites.get(d.get("site")), now_iso())
+        r = results.get(d["name"])
+        if until and r and r[0] is False:
+            results[d["name"]] = (None, f"{r[1]}; not judged, maintenance until {local_time(until)}")
     return results
 
 
@@ -636,6 +840,8 @@ def send_email(cfg, events):
                 lines.append(f"    Everything else at {e['site']} is reached through it, so nothing there can be checked until it's back.")
                 if causes.get(e["site"]):
                     lines.append(f"    {causes[e['site']]}")
+            if e.get("note"):
+                lines.append(f"    {e['note']}")
         lines.append("")
     if lows:
         lines.append("LOW BATTERY")
@@ -698,6 +904,120 @@ def log_outages(rows):
         print(f"outage log not written: {e}", file=sys.stderr)
 
 
+# ── The daily tier ─────────────────────────────────────────────────────────
+#
+# A device with `tier: "daily"` is watched like any other (state, outage log,
+# `status`), but its changes are never emailed: they wait in
+# state["daily_events"], and once a day, at the first sweep after the roster's
+# `daily_summary_at` (local HH:MM, default 23:50, so the section is in before
+# the day ends), one section goes into the daily summary's held list through
+# `speak-gate-live digest`. Things guests switch off at the wall (plugs,
+# bulbs) live here: an outage is worth a line the next morning, not an email.
+
+DIGEST = os.environ.get("HOME_DEVICES_DIGEST") or os.path.join(TOOLS, "bin", "speak-gate-live")
+
+
+def _local(iso):
+    t = dt.datetime.fromisoformat(iso)
+    try:
+        from zoneinfo import ZoneInfo
+        return t.astimezone(ZoneInfo(INST["tz"])) if INST["tz"] else t.astimezone()
+    except Exception:
+        return t.astimezone()
+
+
+def _clock(iso, ref):
+    """"3:10 PM" on the reference day, "Nov 16, 3:10 PM" otherwise."""
+    t = _local(iso)
+    return t.strftime("%-I:%M %p") if t.date() == _local(ref).date() else local_time(iso)
+
+
+def daily_text(cfg, state, t):
+    """The daily summary's section: per site, what went offline, came back, or
+    is still offline since the last section. One line when all is well."""
+    labels = {k: v.get("label", k) for k, v in cfg.get("sites", {}).items()}
+    devs = [d for d in cfg.get("devices", []) if d.get("tier") == "daily"]
+    events = state.get("daily_events", [])
+    lists = load(CLIENT_LISTS, {})
+    blocks = []
+    for key in sorted({d["site"] for d in devs}):
+        label = labels.get(key, key)
+        mine = [d for d in devs if d["site"] == key]
+        lines = []
+        for d in mine:
+            s = state["devices"].get(d["name"], {})
+            evs = [e for e in events if e["name"] == d["name"]]
+            spans = []
+            for e in evs:
+                if e["kind"] == "down":
+                    spans.append([e.get("at"), None])
+                elif spans and spans[-1][1] is None:
+                    spans[-1][1] = e["at"]
+                else:
+                    spans.append([e.get("since"), e["at"], e.get("seeded")])
+            parts = []
+            for sp in spans:
+                down_at, up_at = sp[0], sp[1]
+                if up_at and len(sp) > 2 and sp[2]:
+                    parts.append(f"missing when the watch began, first seen at {_clock(up_at, t)}")
+                elif up_at:
+                    parts.append(f"offline from {_clock(down_at, t)} to {_clock(up_at, t)}")
+            if s.get("status") == "down":
+                since = s.get("since")
+                if s.get("seeded"):
+                    parts.append(f"not seen since the watch began ({local_time(since)})" if since else "not seen yet")
+                else:
+                    parts.append(f"offline since {_clock(since, t)}" if since else "offline")
+            if parts:
+                lines.append(f"- {d['name']}: {'; '.join(parts)}.")
+        cl = (cfg["sites"].get(key) or {}).get("client_list")
+        c = lists.get(key, {})
+        unread = None
+        if cl:
+            read_at = c.get("read_at")
+            if not read_at or dt.datetime.fromisoformat(t) - dt.datetime.fromisoformat(read_at) > dt.timedelta(hours=6):
+                why = c.get("skipped") or c.get("error") or "not read yet"
+                unread = (f"The {cl.get('label') or cl.get('via') or 'router'} device list has not been read"
+                          + (f" since {local_time(read_at)}" if read_at else "") + f" ({why}), so these could not be checked.")
+        n_ok = len(mine) - len(lines)
+        if unread:
+            blocks.append(f"{label}, daily device watch: {unread}" + ("\n" + "\n".join(lines) if lines else ""))
+        elif not lines:
+            blocks.append(f"{label}, daily device watch: all {len(mine)} devices online since the last summary.")
+        else:
+            head = f"{label}, daily device watch (not urgent: plugs and bulbs are often switched off at the wall):"
+            blocks.append(head + "\n" + "\n".join(lines) + (f"\nThe other {n_ok} {'was' if n_ok == 1 else 'were'} online." if n_ok else ""))
+    return "\n\n".join(blocks)
+
+
+def flush_daily(cfg, state, t, force=False):
+    """Queue the daily section once a day, after `daily_summary_at`. Events stay
+    queued until the hand-off succeeds."""
+    if not any(d.get("tier") == "daily" for d in cfg.get("devices", [])):
+        return
+    now = _local(t)
+    hh, mm = (cfg.get("daily_summary_at") or "23:50").split(":")
+    if not force and (state.get("daily_digest_on") == now.date().isoformat()
+                      or (now.hour, now.minute) < (int(hh), int(mm))):
+        return
+    text = daily_text(cfg, state, t)
+    if not text:
+        return
+    r = subprocess.run([DIGEST, "digest"], input=json.dumps({"text": text, "sender": "home-devices",
+                       "reason": "home-devices daily tier: queued for the daily summary by design, not judged"}),
+                       capture_output=True, text=True, timeout=60)
+    try:
+        ok = json.loads(r.stdout.strip().splitlines()[-1]).get("ok")
+    except Exception:
+        ok = False
+    if ok:
+        state["daily_events"] = []
+        state["daily_digest_on"] = now.date().isoformat()
+        print(f"{t} daily device section queued for the daily summary")
+    else:
+        print(f"{t} daily device section NOT queued, kept for the next sweep: {(r.stdout or r.stderr).strip()[:300]}", file=sys.stderr)
+
+
 def cmd_sweep(args, cfg):
     roster = cfg.get("devices", [])
     labels = {k: v.get("label", k) for k, v in cfg.get("sites", {}).items()}
@@ -709,6 +1029,10 @@ def cmd_sweep(args, cfg):
     for d in roster:
         name = d["name"]
         tag = {"site": labels.get(d["site"], d["site"]), "anchor": bool(d.get("anchor") or d.get("check") == "router")}
+        daily = d.get("tier") == "daily"
+        # A daily-tier change waits for the daily summary (flush_daily); the
+        # rest is emailed now.
+        queue = state.setdefault("daily_events", []) if daily else state["pending"]
         ok, detail = results[name]
         s = state["devices"].setdefault(name, {"status": "up", "fails": 0})
         s["detail"], s["checked"] = detail, t
@@ -723,13 +1047,18 @@ def cmd_sweep(args, cfg):
                 s["ip"] = addrs[name]  # its last good address, tried when it has no lease record
             if s["status"] == "down":
                 down_at = s.get("since", t)
-                state["pending"].append({**tag, "kind": "up", "name": name, "at": t, "since": down_at})
+                queue.append({**tag, "kind": "up", "name": name, "at": t, "since": down_at, "seeded": bool(s.get("seeded"))})
                 outage_rows.append({"device": name, "site": tag["site"], "down_at": down_at, "up_at": t,
                                     "duration_seconds": int((dt.datetime.fromisoformat(t) - dt.datetime.fromisoformat(down_at)).total_seconds()),
-                                    "last_seen": prev_seen})
+                                    "last_seen": prev_seen, **({"tier": "daily"} if daily else {})})
             s.update(status="up", fails=0)
-            s.pop("since", None)
-            s.pop("failing_since", None)
+            for k in ("since", "failing_since", "seeded"):
+                s.pop(k, None)
+        elif daily and not s.get("last_seen") and not s.get("fails") and s["status"] == "up":
+            # A daily-tier device missing at its very first check was already
+            # gone when the watch began: recorded as offline, nothing reported
+            # as a change (the summary lists it as not seen since then).
+            s.update(status="down", since=t, failing_since=t, fails=1, seeded=True)
         else:
             s["fails"] = s.get("fails", 0) + 1
             s.setdefault("failing_since", t)
@@ -737,9 +1066,10 @@ def cmd_sweep(args, cfg):
             if (s["status"] == "up" and s["fails"] >= down_after(d, t)
                     and held >= dt.timedelta(minutes=d.get("down_after_min", 0))):
                 s.update(status="down", since=s["failing_since"])
-                state["pending"].append({**tag, "kind": "down", "name": name, "detail": detail, "last_seen": s.get("last_seen")})
+                queue.append({**tag, "kind": "down", "name": name, "detail": detail, "last_seen": s.get("last_seen"),
+                              "at": s["failing_since"], **({"note": d["down_note"]} if d.get("down_note") else {})})
                 outage_rows.append({"device": name, "site": tag["site"], "down_at": s["failing_since"], "up_at": None,
-                                    "duration_seconds": None, "last_seen": s.get("last_seen")})
+                                    "duration_seconds": None, "last_seen": s.get("last_seen"), **({"tier": "daily"} if daily else {})})
     # Drop devices removed from the roster.
     names = {d["name"] for d in roster}
     state["devices"] = {k: v for k, v in state["devices"].items() if k in names}
@@ -767,9 +1097,13 @@ def cmd_sweep(args, cfg):
     if args.dry_run:
         if ring:
             print("ring batteries:", {k: v.get("battery") for k, v in ring.items() if v.get("battery") is not None})
+        tiers = {d["name"]: d.get("tier") for d in roster}
         for name, (ok, detail) in results.items():
-            print(f"{'OK  ' if ok else ('??  ' if ok is None else 'FAIL')} {name:34} {detail}")
+            print(f"{'OK  ' if ok else ('??  ' if ok is None else 'FAIL')} {name:34} {detail}{'  [daily]' if tiers.get(name) == 'daily' else ''}")
         print("pending:", json.dumps(state["pending"]))
+        print("daily events:", json.dumps(state.get("daily_events", [])))
+        if getattr(args, "daily_text", False):
+            print("--- daily summary section ---\n" + daily_text(cfg, state, t))
         return
 
     log_outages(outage_rows)
@@ -783,16 +1117,24 @@ def cmd_sweep(args, cfg):
             state["pending"] = []
         else:
             print(f"{t} email failed, keeping {len(state['pending'])} queued: {info}", file=sys.stderr)
+    flush_daily(cfg, state, t)
     save(STATE, state)
 
 
-def cmd_status(_args, _cfg):
+def cmd_status(_args, cfg):
     state = load(STATE, {"devices": {}})
+    daily = {d["name"] for d in cfg.get("devices", []) if d.get("tier") == "daily"}
     print(f"last sweep: {local_time(state['last_sweep']) if state.get('last_sweep') else 'never'}")
     for name, s in sorted(state["devices"].items()):
         tag = "DOWN" if s["status"] == "down" else ("??" if s.get("not_judged") else ("miss" if s.get("fails") else "up"))
         held = f"  (failing since {local_time(s['failing_since'])})" if s.get("failing_since") and s["status"] != "down" else ""
-        print(f"  {tag:4} {name:28} {s.get('detail', '')}{held}")
+        print(f"  {tag:4} {name:28} {s.get('detail', '')}{held}{'  [daily]' if name in daily else ''}")
+    for key, c in sorted(load(CLIENT_LISTS, {}).items()):
+        note = c.get("skipped") or c.get("error")
+        print(f"  list {key}: read {local_time(c['read_at']) if c.get('read_at') else 'never'}, {len(c.get('macs') or [])} MACs"
+              + (f"; last attempt {local_time(c['attempt_at'])}" if c.get("attempt_at") else "") + (f" ({note})" if note else ""))
+    if state.get("daily_events"):
+        print(f"daily tier, waiting for the summary: {len(state['daily_events'])} change(s)")
     for rname, b in sorted(state.get("ring_battery", {}).items()):
         print(f"  batt {rname:28} {b.get('pct')}%{'  (low-battery alert sent)' if b.get('alerted') else ''}")
     if state.get("pending"):
@@ -872,7 +1214,13 @@ def cmd_outages(args, _cfg):
 def cmd_unlisted(_args, cfg):
     known = {d["mac"] for d in cfg.get("devices", []) if "mac" in d}
     known |= set(cfg.get("ignore", {}).keys())
+    lists = load(CLIENT_LISTS, {})
     for key, site in cfg.get("sites", {}).items():
+        if site.get("client_list"):
+            # From the last reading: never a login of its own.
+            for mac in lists.get(key, {}).get("macs") or []:
+                if mac not in known:
+                    print(f"  {site.get('label', key)}  {mac}  (in the {site['client_list'].get('label', 'router')} list)")
         if site.get("kind") != "router":
             continue
         for mac, (ip, host) in sorted(leases(site).items(), key=lambda kv: kv[1][0]):
@@ -884,7 +1232,8 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
     sw = sub.add_parser("sweep")
-    sw.add_argument("--dry-run", action="store_true", help="probe and print; no email, no state write")
+    sw.add_argument("--dry-run", action="store_true", help="probe and print; no email, no state write (a due client-list read still happens, and is timed)")
+    sw.add_argument("--daily-text", action="store_true", help="with --dry-run: also print the daily summary section as it would be queued now")
     sub.add_parser("status")
     sub.add_parser("unlisted")
     ou = sub.add_parser("outages")

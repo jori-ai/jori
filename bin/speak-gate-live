@@ -12,6 +12,10 @@
 //   speak-gate-live record <review_file> <message_id>
 //       links the review to the delivered row, then removes the file.
 //   speak-gate-live enabled      exit 0 when the live gate is on, 1 when off.
+//   speak-gate-live digest < {"text","sender"?,"reason"?}
+//       puts the text straight into the daily summary's held list (queueDigest:
+//       a held digest row, live=false, so the nightly audit skips it), unjudged.
+//       prints {"ok":true,"id":…} or {"ok":false,"error":…} (exit 1).
 "use strict";
 
 import { readFileSync, writeFileSync, mkdirSync, unlinkSync } from "node:fs";
@@ -19,7 +23,7 @@ import { randomUUID } from "node:crypto";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { createRequire } from "node:module";
-import { gateOutbound, recordReview, liveEnabled } from "../lib/speak-gate-live.mjs";
+import { gateOutbound, recordReview, liveEnabled, queueDigest } from "../lib/speak-gate-live.mjs";
 
 const require = createRequire(import.meta.url);
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -46,6 +50,18 @@ async function gate() {
   }
 }
 
+async function digest() {
+  let input = {};
+  try { input = JSON.parse(readFileSync(0, "utf8")); } catch {}
+  try {
+    const id = await queueDigest(input);
+    console.log(JSON.stringify({ ok: true, id }));
+  } catch (e) {
+    console.log(JSON.stringify({ ok: false, error: String((e && e.message) || e).slice(0, 300) }));
+    process.exit(1);
+  }
+}
+
 async function record() {
   if (!a1) return;
   let review = null;
@@ -58,6 +74,7 @@ async function record() {
   if (cmd === "gate") return gate();
   if (cmd === "record") return record();
   if (cmd === "enabled") process.exit(liveEnabled() ? 0 : 1);
-  console.error("usage: speak-gate-live gate|record <file> <message_id>|enabled");
+  if (cmd === "digest") return digest();
+  console.error("usage: speak-gate-live gate|record <file> <message_id>|enabled|digest");
   process.exit(64);
 })();

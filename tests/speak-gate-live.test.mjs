@@ -20,7 +20,7 @@ function fakeJudge(result) {
 }
 const rows = () => (existsSync(sink) ? readFileSync(sink, "utf8").trim().split("\n").filter(Boolean).map((l) => JSON.parse(l)) : []);
 
-const { gateOutbound, recordReview } = await import("../lib/speak-gate-live.mjs");
+const { gateOutbound, recordReview, queueDigest } = await import("../lib/speak-gate-live.mjs");
 
 test("send delivers as written with a review to link", async () => {
   fakeJudge({ verdict: "send", reason: "fine" });
@@ -153,4 +153,17 @@ test("an improvement card is never held: a drop sends it as written", async () =
   assert.equal(r.deliver, true);
   assert.equal(r.text, "🔧 a card");
   assert.equal(r.review.verdict, "send");
+});
+
+test("queueDigest writes a held digest the audit skips (live false), and refuses empty text", async () => {
+  const before = rows().length;
+  const id = await queueDigest({ text: "  a quiet line for the summary  ", sender: "some-job" });
+  const r = rows().slice(before);
+  assert.equal(r.length, 1);
+  assert.equal(r[0].id, id);
+  assert.equal(r[0].verdict, "digest");
+  assert.equal(r[0].held, true);
+  assert.equal(r[0].live, false);
+  assert.equal(r[0].original, "a quiet line for the summary");
+  await assert.rejects(() => queueDigest({ text: "   " }));
 });

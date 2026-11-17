@@ -12,7 +12,12 @@ connection matched case-insensitively and the low-battery / recharged pair;
 cloud checks "not judged" without a homectl; alerts to the instance owner
 (alert_to overrides); the outage log (a row on DOWN, a completed row on UP, both
 timed from the first missed sweep, nothing for a nap under the hold or a dry
-run) and the `outages` report.
+run) and the `outages` report; named locks read in one call; the daily tier
+(never emailed, seeded when missing at its first check, one summary section a
+day after its hour, kept when the hand-off fails); client lists (not judged
+while their router is down or when they show none of the expected devices,
+read at most every every_min, a refused password not retried until it
+changes); a maintenance window.
 
 Run: python3 tests/home-devices.test.py
 """
@@ -68,6 +73,8 @@ class Fake:
         self.email_envs = []
         self.email_out = ""  # what email-send prints ("Held: not sent ..." when the gate holds it)
         self.calls = []
+        self.digests = []  # what home-devices handed to `speak-gate-live digest`
+        self.digest_out = '{"ok": true, "id": "x"}'
 
     def __call__(self, argv, input=None, capture_output=False, text=False, timeout=None, cwd=None, errors=None, env=None):
         self.calls.append(argv)
@@ -91,8 +98,11 @@ class Fake:
             code = argv[2]
             if "RingClient" in code:
                 out = json.dumps(self.ring)
-            else:
-                out = json.dumps(self.lock)
+            else:  # lock_cloud: {lock key: connected}; "_default" = the script's own lock
+                out = json.dumps(self.lock if isinstance(self.lock, dict) else {"_default": self.lock})
+        elif exe == "speak-gate-live":
+            self.digests.append(json.loads(input))
+            out = self.digest_out
         elif exe == "email-send":
             self.emails.append(argv)
             self.email_envs.append(env)
@@ -120,12 +130,13 @@ class HomeDevicesTest(unittest.TestCase):
         for f in ("homectl", "python"):
             open(os.path.join(venv, f), "w").close()
         os.symlink(os.path.join(venv, "homectl"), os.path.join(self.install, "bin", "homectl"))
-        self.env = {k: os.environ.get(k) for k in ("JORI_HOME", "JORI_LOCAL_DIR", "HOMECTL_BIN", "JORI_OWNER_EMAIL", "JORI_TZ", "JORI_HOST", "JORI_HOST_LABEL", "HOME_DEVICES_EMAIL_SEND")}
+        self.env = {k: os.environ.get(k) for k in ("JORI_HOME", "JORI_LOCAL_DIR", "HOMECTL_BIN", "JORI_OWNER_EMAIL", "JORI_TZ", "JORI_HOST", "JORI_HOST_LABEL", "HOME_DEVICES_EMAIL_SEND", "HOME_DEVICES_DIGEST")}
         for k in self.env:
             os.environ.pop(k, None)
         os.environ["JORI_HOME"] = self.install
         os.environ["JORI_LOCAL_DIR"] = self.local
         os.environ["HOME_DEVICES_EMAIL_SEND"] = os.path.join(self.install, "bin", "email-send")
+        os.environ["HOME_DEVICES_DIGEST"] = os.path.join(self.install, "bin", "speak-gate-live")
         self.write("instance.json", {"owner_email": "owner@example.com", "tz": "UTC", "host": "test-host", "host_label": "the test host"})
         self.write("config/home-devices.json", ROSTER)
         self.fake = Fake()
@@ -587,6 +598,148 @@ class HomeDevicesTest(unittest.TestCase):
     def test_outages_report_with_no_log(self):
         mod = self.load()
         self.assertIn("no drops logged", self.outages_report(mod))
+
+    # ── named locks, the daily tier, client lists, maintenance ──────────────
+
+    def tiered(self, reader=None):
+        """The roster plus a listed LAN behind a router at the cabin, read by a
+        stand-in reader module, and two named locks."""
+        roster = json.loads(json.dumps(ROSTER))
+        roster["daily_summary_at"] = "23:50"
+        roster["sites"]["cabin"]["client_list"] = {"reader_script": os.path.join(self.tmp, "reader.py"),
+                                                   "label": "Router", "via": "Cabin router", "every_min": 10,
+                                                   "password_env": "TEST_ROUTER_PW"}
+        roster["devices"] += [
+            {"site": "cabin", "name": "Cabin router", "check": "remote", "ip": "198.51.100.36"},
+            {"site": "cabin", "name": "Lock A", "check": "lock_cloud", "lock": "lock_a"},
+            {"site": "cabin", "name": "Plug 1", "check": "client_list", "mac": "02:00:00:00:00:01", "tier": "daily", "down_after_min": 20},
+            {"site": "cabin", "name": "Plug 2", "check": "client_list", "mac": "02:00:00:00:00:02", "tier": "daily", "down_after_min": 20},
+            {"site": "cabin", "name": "Bulb 3", "check": "client_list", "mac": "02:00:00:00:00:03", "tier": "daily", "down_after_min": 20},
+        ]
+        self.write("config/home-devices.json", roster)
+        self.listed = {"macs": ["02:00:00:00:00:01", "02:00:00:00:00:03"]}  # Plug 2 missing from the start
+        self.reads = []
+        with open(os.path.join(self.tmp, "reader.py"), "w") as f:
+            f.write("import json, os\n"
+                    "def read(cl, pw):\n"
+                    f"    p = {os.path.join(self.tmp, 'listed.json')!r}\n"
+                    "    open(p + '.log', 'a').write(pw + '\\n')\n"
+                    "    return json.load(open(p))\n")
+        os.environ["TEST_ROUTER_PW"] = "pw1"
+        self.fake.lock = {"_default": True, "lock_a": True}
+        self.set_listed(self.listed)
+
+    def set_listed(self, v):
+        with open(os.path.join(self.tmp, "listed.json"), "w") as f:
+            json.dump(v, f)
+
+    def reads_done(self):
+        try:
+            return open(os.path.join(self.tmp, "listed.json.log")).read().split()
+        except FileNotFoundError:
+            return []
+
+    def test_named_locks_read_in_one_call(self):
+        self.tiered()
+        mod = self.load()
+        self.fake.lock = {"_default": True, "lock_a": False}
+        res = mod.check_all(mod.roster_cfg())
+        self.assertEqual(res["Test lock"], (True, "cloud: connected"))
+        self.assertEqual(res["Lock A"], (False, "cloud: NOT connected"))
+        self.assertEqual(sum(1 for c in self.fake.calls if os.path.basename(c[0]) == "python" and "device_state" in c[2]), 1)
+
+    def test_daily_tier_never_emails_and_seeds_missing_devices(self):
+        self.tiered()
+        mod = self.load()
+        self.sweep(mod)
+        st = self.state()["devices"]
+        self.assertEqual(st["Plug 2"]["status"], "down")  # missing at its first check: recorded, not reported
+        self.assertTrue(st["Plug 2"]["seeded"])
+        self.assertEqual(st["Plug 1"]["status"], "up")
+        self.set_listed({"macs": ["02:00:00:00:00:03"]})  # Plug 1 switched off at the wall
+        for _ in range(15):
+            self.sweep(mod)
+        self.assertEqual(self.fake.emails, [])
+        self.assertEqual(self.state()["devices"]["Plug 1"]["status"], "down")
+        self.assertEqual([e["kind"] for e in self.state()["daily_events"]], ["down"])
+        self.assertEqual(len(self.reads_done()), 4)  # 0, +10, +20, +30 min: never more often than every 10
+
+    def test_daily_section_goes_to_the_summary_once_after_its_hour(self):
+        self.tiered()
+        mod = self.load()
+        self.t = dt.datetime(2026, 1, 5, 23, 30, tzinfo=dt.timezone.utc)
+        self.sweep(mod, minutes=12)
+        self.set_listed({"macs": ["02:00:00:00:00:01", "02:00:00:00:00:02", "02:00:00:00:00:03"]})
+        self.sweep(mod, minutes=2)  # 23:42: Plug 2 seen at last; not yet the hour
+        self.assertEqual(self.fake.digests, [])
+        self.sweep(mod, minutes=10)  # 23:44
+        self.sweep(mod, minutes=2)   # 23:54: after 23:50
+        self.assertEqual(len(self.fake.digests), 1)
+        text = self.fake.digests[0]["text"]
+        self.assertIn("Cabin, daily device watch", text)
+        self.assertIn("Plug 2: missing when the watch began, first seen at", text)
+        self.assertNotIn("\u2014", text)
+        self.assertEqual(self.state()["daily_events"], [])
+        self.sweep(mod)
+        self.assertEqual(len(self.fake.digests), 1)  # once a day
+        self.assertEqual(self.fake.emails, [])
+
+    def test_daily_section_kept_when_the_hand_off_fails(self):
+        self.tiered()
+        mod = self.load()
+        self.fake.digest_out = '{"ok": false, "error": "db down"}'
+        self.t = dt.datetime(2026, 1, 5, 23, 51, tzinfo=dt.timezone.utc)
+        self.set_listed({"macs": ["02:00:00:00:00:01", "02:00:00:00:00:02", "02:00:00:00:00:03"]})
+        self.sweep(mod)
+        self.assertEqual(len(self.fake.digests), 1)
+        self.assertNotIn("daily_digest_on", self.state())
+        self.fake.digest_out = '{"ok": true, "id": "y"}'
+        self.sweep(mod)
+        self.assertEqual(len(self.fake.digests), 2)
+        self.assertEqual(self.state()["daily_digest_on"], "2026-01-05")
+
+    def test_client_list_not_judged_while_its_router_is_down(self):
+        self.tiered()
+        mod = self.load()
+        self.fake.remote_up["198.51.100.36"] = False
+        res = mod.check_all(mod.roster_cfg())
+        self.assertEqual(res["Plug 1"], (None, "not judged: Cabin router not answering"))
+        self.assertEqual(self.reads_done(), [])  # no login at all
+
+    def test_client_list_refused_password_not_retried_until_it_changes(self):
+        self.tiered()
+        mod = self.load()
+        self.set_listed({"error": "password refused", "auth_failed": True})
+        for _ in range(12):
+            self.sweep(mod, minutes=5)
+        self.assertEqual(self.reads_done(), ["pw1"])
+        self.assertIsNone(mod.check_all(mod.roster_cfg())["Plug 1"][0])
+        self.assertNotIn("pw1", open(mod.CLIENT_LISTS).read())  # only a salted hash is kept
+        os.environ["TEST_ROUTER_PW"] = "pw2"
+        self.set_listed({"macs": ["02:00:00:00:00:01"]})
+        self.sweep(mod)
+        self.assertEqual(self.reads_done(), ["pw1", "pw2"])
+
+    def test_client_list_with_none_of_the_expected_devices_is_not_judged(self):
+        self.tiered()
+        mod = self.load()
+        self.set_listed({"macs": ["02:00:00:00:00:99"]})
+        res = mod.check_all(mod.roster_cfg())
+        self.assertIsNone(res["Plug 1"][0])
+        self.assertIn("none of the expected devices", res["Plug 1"][1])
+
+    def test_maintenance_window_mutes_failures_until_it_ends(self):
+        roster = json.loads(json.dumps(ROSTER))
+        roster["sites"]["cabin"]["maintenance_until"] = (self.t + dt.timedelta(minutes=30)).isoformat()
+        self.write("config/home-devices.json", roster)
+        mod = self.load()
+        self.fake.remote_up["198.51.100.36"] = False
+        for _ in range(10):
+            self.sweep(mod)
+        self.assertEqual(self.fake.emails, [])
+        for _ in range(10):
+            self.sweep(mod)
+        self.assertEqual(len(self.fake.emails), 1)  # after the window, alerted as usual
 
 
 if __name__ == "__main__":
