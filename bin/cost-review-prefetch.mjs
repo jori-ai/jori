@@ -1294,6 +1294,18 @@ guard('floor_attribution', () => {
 // report (window 0 is the report's window, window k ends k days earlier).
 // usd is each row's own total_cost_usd, not the report's re-priced weighted
 // cost: compare within this block, never add it to weighted_cost_usd.
+//
+// A per-message family writes one row per email with the message id in its
+// source (the strict triage one-shot: gmail:<id> live, email-triage-shadow:<id>
+// in shadow, email-triage-replay:<id> by hand). Left as it is, every id is its
+// own source and stays under the MIN_USD_14D fold line, so a whole line of
+// dollars a day sits unnamed in `other`. It is folded by family, like gmail:*
+// in the supervisor ledger rollup above.
+const PER_MESSAGE_SOURCES = ['gmail:', 'email-triage-shadow:', 'email-triage-replay:'];
+const forkSourceFamily = (s) => {
+  const p = PER_MESSAGE_SOURCES.find((x) => s.startsWith(x));
+  return p ? `${p}*` : s;
+};
 guard('fork_ledger', () => {
   const f = path.join(ROOT, 'agent/logs/ephemeral-forks/job-costs.ndjson');
   let content;
@@ -1310,7 +1322,7 @@ guard('fork_ledger', () => {
     let r; try { r = JSON.parse(line); } catch { continue; }
     const ts = Date.parse(r.ts || 0);
     if (!(ts >= START && ts < END)) continue;
-    const s = r.source || '(none)';
+    const s = forkSourceFamily(String(r.source || '(none)'));
     const usd = Number(r.total_cost_usd) || 0;
     const turns = Number(r.num_turns) || 0;
     const b = src[s] || (src[s] = { rows: [], windows_usd: Array(WINDOWS).fill(0), windows_runs: Array(WINDOWS).fill(0) });
@@ -1356,7 +1368,7 @@ guard('fork_ledger', () => {
     };
   }
   return {
-    note: 'Fork rows (agent/logs/ephemeral-forks/job-costs.ndjson) per source. windows_* run oldest -> newest over 7 consecutive 24h windows ending at the report window (last element = the report window). usd = the rows own total_cost_usd, NOT the report weighted cost; compare within this block only. Sources under $3 over 14 days fold into other.',
+    note: 'Fork rows (agent/logs/ephemeral-forks/job-costs.ndjson) per source. windows_* run oldest -> newest over 7 consecutive 24h windows ending at the report window (last element = the report window). usd = the rows own total_cost_usd, NOT the report weighted cost; compare within this block only. Per-message sources (gmail:<id>, email-triage-shadow:<id>, email-triage-replay:<id>) are folded into <family>* first; sources under $3 over 14 days then fold into other.',
     window_ms: WINDOW_MS,
     total_windows_usd: totals.map(r2),
     sources: Object.fromEntries(Object.entries(sources).sort((a, b) => b[1].usd_14d - a[1].usd_14d)),

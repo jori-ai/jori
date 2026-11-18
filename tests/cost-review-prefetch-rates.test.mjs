@@ -161,6 +161,41 @@ test("fork_ledger: per-source 24h windows, 3-window mean, prior range, small sou
   }
 });
 
+test("fork_ledger: per-message sources fold by family, so a line of small rows is named and not buried in other", () => {
+  const { home, g } = forksHome();
+  try {
+    const since = Date.now() - DAY;
+    const mid = (k) => since - k * DAY + DAY / 2;
+    const row = (t, source, usd) => JSON.stringify({ ts: iso(t), source, total_cost_usd: usd, num_turns: 0 });
+    const lines = [];
+    // 40 dry one-shots at $0.17 across two windows, each under $3 on its own id: $6.80 in all.
+    for (let i = 0; i < 40; i++) lines.push(row(mid(i < 25 ? 0 : 1), `email-triage-shadow:${String(i).padStart(16, "0")}`, 0.17));
+    // The live strict rows (gmail:<id>) and a by-hand replay family fold the same way.
+    for (let i = 0; i < 20; i++) lines.push(row(mid(0), `gmail:${"a".repeat(15)}${i % 10}`, 0.16));
+    lines.push(row(mid(0), "email-triage-replay:example-id", 0.07));
+    // Sources whose name only contains a colon (a mode, not a message id) stay as they are.
+    lines.push(row(mid(0), "daily-summary-review:review", 0.1));
+    fs.writeFileSync(path.join(g, "agent/logs/ephemeral-forks/job-costs.ndjson"), lines.join("\n") + "\n");
+    const fl = runPrefetch(home, g, since).fork_ledger;
+    const shadow = fl.sources["email-triage-shadow:*"];
+    assert.ok(shadow, JSON.stringify(fl));
+    assert.equal(shadow.runs_14d, 40);
+    assert.equal(shadow.usd_14d, 6.8);
+    assert.deepEqual(shadow.windows_runs.slice(-2), [15, 25]);
+    assert.equal(shadow.current.runs, 25);
+    near(shadow.current.usd, 4.25, "shadow current usd");
+    // 20 x $0.16 = $3.20 is over the $3 fold line only because the family is one source.
+    assert.equal(fl.sources["gmail:*"].runs_14d, 20);
+    assert.equal(fl.sources["gmail:*"].usd_14d, 3.2);
+    // No per-id source survives, and the small ones still fold into other.
+    assert.deepEqual(Object.keys(fl.sources), ["email-triage-shadow:*", "gmail:*"]);
+    assert.deepEqual(fl.other, { runs_14d: 2, usd_14d: 0.17 });
+    assert.ok(fl.note.includes("Per-message sources"), fl.note);
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
 test("fork_ledger: a missing ledger is UNKNOWN, not zero", () => {
   const { home, g } = forksHome();
   try {
