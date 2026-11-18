@@ -362,3 +362,53 @@ test("the bracket does not put a name on a stop whose own visit row lists others
   try { pruneShrunkCompanions(off, [row("13:15:25", "14:00:30", ["Pat"], 260), flatRow]); } finally { delete process.env.JORI_BRACKET_OWN_ROW; }
   assert.deepEqual(off[1].companions, ["Visitor", "Pat"]);
 });
+
+// A short unnamed step out between two stays at one place does not keep them apart.
+// The rests cut one stay on a stretch the phone stood a block away for a few minutes;
+// the middle piece has no name and is under the report's 10-minute bar, so the stay
+// either side of it was drawn twice with a "10 min between stops" line between them.
+const STAY = { place: { name: "Corner House", source: "named_location", confidence: 0.95 }, confirmed_row: { id: "r1", name: "Corner House", place_type: "named" } };
+const stay = (id, from, to, extra = {}) => stop(id, "Corner House", from, to, { ...LL(0, 0), ...STAY, ...extra });
+const stepOut = (id, from, to, e = 180, extra = {}) => stop(id, null, from, to, {
+  ...LL(e, 0), place: { name: null, source: "unknown", confidence: 0 }, confirmed_row: { id: "r2", name: "Corner House", place_type: "named" }, ...extra });
+
+test("a short unnamed step out between two stays at one place is one stay", () => {
+  const before = stay("s-1", "17:39:00", "17:54:00", { companions: ["Pat"] });
+  const away = stepOut("s-2", "17:57:00", "18:03:00");
+  const after = stay("s-3", "18:04:00", "18:17:00");
+  const { stops, merged } = mergeTouchingSameName([before, away, after]);
+  assert.equal(stops.length, 1);
+  assert.equal(stops[0].id, "s-1");
+  assert.equal(stops[0].start_ts_ms, U("17:39:00"));
+  assert.equal(stops[0].end_ts_ms, U("18:17:00"));
+  assert.deepEqual(stops[0].companions, ["Pat"]);
+  assert.deepEqual(merged[0].absorbed, ["s-2", "s-3"]);
+  assert.deepEqual(stops[0].absorbed_step_outs.map(x => [x.id, x.minutes]), [["s-2", 6]]);
+});
+
+test("the step out stays a stop when it is long, named, shot, far, or the user's own word", () => {
+  const before = stay("s-1", "17:39:00", "17:54:00");
+  const after = (from = "18:04:00") => stay("s-3", from, "18:17:00");
+  const kept = (away, last) => mergeTouchingSameName([before, away, last || after()]).stops.length;
+  assert.equal(kept(stepOut("s-2", "17:55:00", "18:03:00", 180, { duration_min: 10 })), 3, "ten minutes is a stop");
+  assert.equal(kept(stepOut("s-2", "17:57:00", "18:03:00", 180, { place: { name: "Book Shop", source: "confirmed_stop" } })), 3, "a named place");
+  assert.equal(kept(stepOut("s-2", "17:57:00", "18:03:00", 180, { photos: [{ uuid: "p" }] })), 3, "a photo taken there");
+  assert.equal(kept(stepOut("s-2", "17:57:00", "18:03:00", 400)), 3, "400 m away is a trip out");
+  assert.equal(kept(stepOut("s-2", "17:57:00", "18:03:00", 180, { confirmed_row: { id: "r3", place_type: "user-confirmed", name: "x" } })), 3, "the user answered for it");
+  assert.equal(kept(stepOut("s-2", "17:57:00", "18:03:00", 180, { companions: ["Sam"] })), 3, "someone was with the user");
+  assert.equal(kept(stepOut("s-2", "17:57:00", "18:03:00", 180, { his_words: [{ text: "stopped to chat" }] })), 3, "the user described it");
+  assert.equal(kept(stepOut("s-2", "17:57:00", "18:03:00"), after("18:20:00")), 3, "a gap past 15 minutes is a return");
+});
+
+test("two step outs in one gap, and the kill switch", () => {
+  const before = stay("s-1", "17:39:00", "17:50:00");
+  const a = stepOut("s-2", "17:52:00", "17:56:00");
+  const b = stepOut("s-3", "17:57:00", "18:01:00", 90);
+  const after = stay("s-4", "18:03:00", "18:20:00");
+  const { stops, merged } = mergeTouchingSameName([before, a, b, after]);
+  assert.equal(stops.length, 1);
+  assert.deepEqual(merged[0].absorbed, ["s-2", "s-3", "s-4"]);
+  process.env.JORI_TOUCH_MERGE_STEP_OUT = "0";
+  try { assert.equal(mergeTouchingSameName([before, a, b, after]).stops.length, 4); }
+  finally { delete process.env.JORI_TOUCH_MERGE_STEP_OUT; }
+});

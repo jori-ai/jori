@@ -498,6 +498,24 @@ test("a leg the steps show was walked is the walking rule's, not the ride rule's
   assert.ok(st.walks.every(w => w.kind !== "between"), "one continuous walk through a walking leg");
 });
 
+test("a long walk that begins as the ride ends is a walk inside the stop, not the way from the vehicle", () => {
+  const day = vehEveningDay();
+  day.stops[1] = { ...day.stops[1], end: "22:20", end_ts_ms: at(22, 20), duration_min: 50 };
+  day.path.spine[2] = { ...day.path.spine[2], end_ms: at(22, 20) };
+  const st = annotateDaySteps(day, [...vehCover, ...readings(at(21, 5), at(21, 14), 85), ...readings(at(21, 32), at(22, 0), 75)], null, { startMs: at(0), endMs: at(24) });
+  const long = st.walks.find(w => w.start_ms === at(21, 32));
+  assert.equal(long.mins, 28);
+  assert.deepEqual([long.kind, long.stop_id], ["in_stop", "home"]);
+  const old = process.env.JORI_STEPS_EDGE_RIDE_CAP;
+  process.env.JORI_STEPS_EDGE_RIDE_CAP = "0";
+  try {
+    const was = annotateDaySteps(day, [...vehCover, ...readings(at(21, 5), at(21, 14), 85), ...readings(at(21, 32), at(22, 0), 75)], null, { startMs: at(0), endMs: at(24) });
+    assert.equal(was.walks.find(w => w.start_ms === at(21, 32)).kind, "between", "without the cap it is the way from the vehicle");
+  } finally {
+    if (old == null) delete process.env.JORI_STEPS_EDGE_RIDE_CAP; else process.env.JORI_STEPS_EDGE_RIDE_CAP = old;
+  }
+});
+
 test("JORI_STEPS_EDGE_RIDE=0 keeps the old placement", () => {
   const old = process.env.JORI_STEPS_EDGE_RIDE;
   process.env.JORI_STEPS_EDGE_RIDE = "0";
