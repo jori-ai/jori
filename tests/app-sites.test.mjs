@@ -1,5 +1,5 @@
 // app-sites.test.mjs — the web apps' own config parsing (each app's
-// lib/config.ts), and the watch site's copy of the recommendation model.
+// lib/config.ts), and the copies the watch and itin sites carry of kernel modules.
 //
 // The sites are built from their own directory, so nothing personal is compiled
 // in: every value arrives as an env var (bin/app-env prints them). These pin
@@ -81,4 +81,11 @@ test("the watch site's model is a byte-for-byte copy of lib/watch-recsys.mjs", (
   const kernel = fs.readFileSync(path.join(ROOT, "lib/watch-recsys.mjs"), "utf8");
   const copy = fs.readFileSync(path.join(appDir("watch"), "lib/recsys.mjs"), "utf8");
   assert.equal(copy, kernel, "run `npm run sync-model` in the watch app");
+});
+
+test("the itin site's stay resolver is a byte-for-byte copy of lib/trip-stays.mjs", () => {
+  // Same deal as the watch model: `npm run sync-stays` (also its prebuild) refreshes it.
+  const kernel = fs.readFileSync(path.join(ROOT, "lib/trip-stays.mjs"), "utf8");
+  const copy = fs.readFileSync(path.join(appDir("itin"), "lib/trip-stays.mjs"), "utf8");
+  assert.equal(copy, kernel, "run `npm run sync-stays` in the itin app");
 });

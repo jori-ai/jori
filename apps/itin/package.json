@@ -4,7 +4,9 @@
   "private": true,
   "description": "The travel-guide site — an authenticated viewer for the trip area guides (the trip reservoirs), backed by the trip_reservoirs Supabase table.",
   "scripts": {
+    "sync-stays": "if [ -f ../../lib/trip-stays.mjs ]; then cp ../../lib/trip-stays.mjs lib/trip-stays.mjs; fi",
     "dev": "next dev",
+    "prebuild": "npm run sync-stays",
     "build": "next build",
     "start": "next start"
   },
