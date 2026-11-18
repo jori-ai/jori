@@ -48,6 +48,7 @@ const { wantedKind } = require("../lib/reservoir-photo-policy.js");
 const { reservoirTarget } = require("../lib/reservoir-target.js");
 const { installTools } = require("../lib/root.cjs");
 const { localConfig } = require("../lib/instance.cjs");
+const { classifyVerifyExit, refusalMessage } = require("../lib/places-client.js");
 
 const BIN = installTools("bin");
 const DATA_DIR = installTools("data/trip-reservoir");
@@ -279,15 +280,21 @@ rc=$?; [ -n "$lr" ] && rm -f "$lr"; exit $rc`, "_", prompt, LOCAL_RULES_SH],
 }
 
 // Geocode an arbitrary area label to a center lat/lon, so the build works for
-// ANY location visited — not just the seeded AREAS. Reuses the Places text
-// search in trip-place-verify; its locationBias is soft, so a
-// "City, Country" query resolves correctly even with a neutral 0,0 center
-// (verified for four cities on three continents). Returns {lat,lon} or null.
+// ANY location visited — not just the seeded AREAS. Uses trip-place-verify's
+// --geocode mode (a Places text search with a below-Enterprise field mask), so
+// finding a city's center is priced and capped apart from the venue checks (the
+// daily Atmosphere cap), so a build that spent that cap can still find the next
+// city's center. The locationBias is soft, so
+// a "City, Country" query resolves correctly even with a neutral 0,0 center.
+// Returns {lat,lon}, {refused} (Places would not run it: see
+// lib/places-client.js), or null (no match).
 function geocodeArea(label) {
   if (!label) return null;
-  const res = spawnSync(VERIFY_BIN, [label, "0", "0"], {
+  const res = spawnSync(VERIFY_BIN, [label, "0", "0", "--geocode"], {
     encoding: "utf8", maxBuffer: 4 * 1024 * 1024, timeout: 30000 });
-  if (res.status !== 0 || !res.stdout) return null;
+  const c = classifyVerifyExit(res.status, res.stderr);
+  if (c.kind === "refused") return { refused: c };
+  if (c.kind !== "ok" || !res.stdout) return null;
   try {
     const p = JSON.parse(res.stdout);
     if (Number.isFinite(p.lat) && Number.isFinite(p.lon)) return { lat: p.lat, lon: p.lon };
@@ -295,12 +302,16 @@ function geocodeArea(label) {
   return null;
 }
 
-// Resolve a named place near the area; returns {mapsUri,address,rating,lat,lon} or null.
+// Resolve a named place near the area; returns {mapsUri,address,rating,lat,lon},
+// null (no match: the venue is dropped), or {refused} (Places refused the call:
+// the venue was NOT checked, so the caller must stop, not drop it).
 function verifyPlace(query, area) {
   if (!query) return null;
   const res = spawnSync(VERIFY_BIN, [query, String(area.lat), String(area.lon)], {
     encoding: "utf8", maxBuffer: 4 * 1024 * 1024, timeout: 30000 });
-  if (res.status !== 0 || !res.stdout) return null;
+  const c = classifyVerifyExit(res.status, res.stderr);
+  if (c.kind === "refused") return { refused: c };
+  if (c.kind !== "ok" || !res.stdout) return null;
   try { return JSON.parse(res.stdout); } catch { return null; }
 }
 
@@ -357,6 +368,12 @@ async function main() {
     // place label for a location we've never built before.
     const label = args.label || args.area;
     const geo = geocodeArea(label);
+    if (geo && geo.refused) {
+      // Not a bad label: Places would not run the search (budget). Say so, and
+      // exit 3 (not 2) so a caller can tell "retry later" from "check the label".
+      log(refusalMessage(geo.refused, `could not geocode "${label}"`));
+      process.exit(3);
+    }
     if (!geo) {
       log(`could not geocode "${label}" — pass --lat/--lon explicitly, or check the label`);
       process.exit(2);
@@ -450,6 +467,15 @@ async function main() {
       if (keptIds.has(id)) { done.add(id); continue; } // top-up: already in the guide
       const entry = { id, ...e };
       const p = verifyPlace(e.search_query, area);
+      if (p && p.refused) {
+        // The venue was never checked, so it must not be dropped as "unverified"
+        // and the build must not save a reservoir missing everything after it.
+        // Keep the checkpoint (resumable: the done ids are kept) and stop.
+        if (!args.dryRun) writeCkpt(CKPT, { area: area.key, research, verified: buckets, done: [...done] });
+        log(refusalMessage(p.refused, `stopped verifying ${area.key} after ${verifiedCount} verified, ${done.size} handled`)
+          + (args.dryRun ? "" : " — progress is checkpointed; re-running resumes from here (nothing saved yet)"));
+        process.exit(3);
+      }
       if (p) {
         entry.verified = true; entry.mapsUri = p.mapsUri; entry.address = p.address;
         entry.rating = p.rating; entry.lat = p.lat; entry.lon = p.lon;

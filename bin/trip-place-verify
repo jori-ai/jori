@@ -13,7 +13,12 @@
 // A direct Places Text Search call, biased but not re-ranked, resolves the
 // named entity correctly (same call shape as trip-place-photo).
 //
-// Usage: trip-place-verify "<query>" <lat> <lon>
+// Usage: trip-place-verify "<query>" <lat> <lon> [--on YYYY-MM-DD] [--geocode]
+// --geocode: resolve only an area's CENTER ("City, Country"; lat/lon may be
+// 0 0, the bias is soft) with a below-Enterprise field mask, so it is priced
+// and capped apart from the venue verification (the 80/day Atmosphere searches)
+// and prints {"name","address","lat","lon","placeId"}. Exit codes: 0 match,
+// 1 no match, 2 usage, 3-6 a refusal by lib/places-client.js (lib/places-client.js classifyVerifyExit).
 // Prints {"name","address","mapsUri","rating","lat","lon","placeId","photoName"}
 // JSON on a match, or exits 1 with nothing on stdout if no confident match.
 // `photoName` is the first photo RESOURCE of the resolved place (or null) —
@@ -39,6 +44,7 @@ const { logPlacesCall } = require(require("node:path").join(__dirname, "..", "li
 const argv = process.argv.slice(2);
 const flag = (n) => { const i = argv.indexOf(n); return i >= 0 ? argv[i + 1] : null; };
 const ON = flag("--on");
+const GEOCODE = argv.includes("--geocode");
 const positional = argv.filter((a, i) => !a.startsWith("--") && argv[i - 1] !== "--on");
 const [query, latStr, lonStr] = positional;
 if (!query || !latStr || !lonStr) {
@@ -137,6 +143,9 @@ const VERIFY_MASK = [
   "places.userRatingCount",
 ].join(",");
 
+const { GEOCODE_MASK } = require(require("node:path").join(__dirname, "..", "lib", "places-client.js"));
+const MASK = GEOCODE ? GEOCODE_MASK : VERIFY_MASK;
+
 // A trip build re-verifies the same places every time it is rebuilt, and each
 // verify is an Atmosphere call ($0.04). Keep the answer 30 days per query and
 // ~1 km bias cell; hours are resolved from the stored weekly pattern for --on,
@@ -145,7 +154,7 @@ const VERIFY_CACHE_DIR = require(require("node:path").join(__dirname, "..", "lib
 const VERIFY_TTL_MS = 30 * 24 * 3600 * 1000;
 function verifyCacheFile() {
   const { createHash } = require("node:crypto");
-  const k = createHash("sha256").update(`${query.trim().toLowerCase()}|${Number(latStr).toFixed(2)},${Number(lonStr).toFixed(2)}|${VERIFY_MASK}`).digest("hex").slice(0, 32);
+  const k = createHash("sha256").update(`${query.trim().toLowerCase()}|${Number(latStr).toFixed(2)},${Number(lonStr).toFixed(2)}|${MASK}`).digest("hex").slice(0, 32);
   return require("node:path").join(VERIFY_CACHE_DIR, `${k}.json`);
 }
 
@@ -156,7 +165,7 @@ async function main() {
   try {
     if (Date.now() - fs.statSync(cacheFile).mtimeMs < VERIFY_TTL_MS) {
       data = JSON.parse(fs.readFileSync(cacheFile, "utf8"));
-      logPlacesCall({ tool: "trip-place-verify", method: "searchText", tier: "enterprise_atmosphere", cached: true,
+      logPlacesCall({ tool: GEOCODE ? "trip-place-geocode" : "trip-place-verify", method: "searchText", tier: GEOCODE ? "pro" : "enterprise_atmosphere", cached: true,
         query, lat: Number(latStr), lon: Number(lonStr), radius: 20000 });
     }
   } catch { data = null; }
@@ -165,11 +174,11 @@ async function main() {
     // for the Atmosphere tier (lib/places-tier-policy.json), logged.
     const pc = require(require("node:path").join(__dirname, "..", "lib", "places-client.js"));
     try {
-      data = await pc.post("trip-place-verify", "places:searchText", {
+      data = await pc.post(GEOCODE ? "trip-place-geocode" : "trip-place-verify", "places:searchText", {
         textQuery: query,
         locationBias: { circle: { center: { latitude: Number(latStr), longitude: Number(lonStr) }, radius: 20000 } },
         maxResultCount: 1,
-      }, { mask: VERIFY_MASK, method: "searchText", key: PLACES_KEY, query, lat: Number(latStr), lon: Number(lonStr), radius: 20000 });
+      }, { mask: MASK, method: "searchText", key: PLACES_KEY, query, lat: Number(latStr), lon: Number(lonStr), radius: 20000 });
     } catch (e) {
       console.error(`trip-place-verify: ${e.reason || `Places search failed: ${e.message}`}`);
       process.exit(e.code || 1);
@@ -180,6 +189,16 @@ async function main() {
   if (!place) {
     console.error(`trip-place-verify: no match for "${query}"`);
     process.exit(1);
+  }
+  if (GEOCODE) {
+    process.stdout.write(JSON.stringify({
+      name: place.displayName?.text || query,
+      address: place.formattedAddress || null,
+      lat: place.location?.latitude ?? null,
+      lon: place.location?.longitude ?? null,
+      placeId: place.id || null,
+    }));
+    return;
   }
   const { hours, on } = resolveHours(place, ON);
   process.stdout.write(JSON.stringify({
