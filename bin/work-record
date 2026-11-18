@@ -25,6 +25,9 @@ import * as W from "../lib/work-records.mjs";
 const require = createRequire(import.meta.url);
 require("../lib/load-env.js").loadEnv();
 
+// `work-record list | head` closes the pipe early: that is not an error.
+process.stdout.on("error", (e) => { if (e.code === "EPIPE") process.exit(0); throw e; });
+
 const argv = process.argv.slice(2);
 const cmd = argv[0];
 const MULTI = new Set(["source", "link", "related"]);
