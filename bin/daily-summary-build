@@ -44,7 +44,7 @@ const fs = require("fs");
 const path = require("path");
 const { spawnSync } = require("child_process");
 const { buildManifest, buildSkeleton, assemble, photosNotShown, attachNearMissEvents, _internal: { isMainStop } } = require("../lib/daily-summary-render.js");
-const { selectStandouts } = require("../lib/daily-summary-transactions.js");
+const { selectStandouts, chargesOfDay } = require("../lib/daily-summary-transactions.js");
 const { linkStandoutsToStops, placesBesidePhotos } = require("../lib/standout-stop-link.js");
 const { settleDay } = require("../lib/daily-summary-day.js");
 const { fetchCompletedTasks, localizeTasksToStops } = require("../lib/daily-summary-tasks.js");
@@ -136,7 +136,10 @@ function renderStopPhotos(stop) {
 
 // Fetch the day's standout purchases from plaid_transactions. Matches on either
 // the posted `date` or the `authorized_date` (in-person charges post a day or
-// two late but authorize same-day). READ-ONLY, service-role REST. Fail-open:
+// two late but authorize same-day), then keeps only the rows whose purchase day
+// IS the day (chargesOfDay: authorization date, else posted date) — a row that
+// merely POSTED today for something bought yesterday is yesterday's, and used to
+// print as today's purchase and name a stop. READ-ONLY, service-role REST. Fail-open:
 // any error (Plaid not configured, DB unreachable, no rows) yields no standouts
 // and the spine still builds. BANK-DATA: jori-model-only — these rows feed
 // the self-addressed daily-summary email per the rule-5 carve-out; never relay
@@ -147,7 +150,7 @@ async function fetchTxnRows(date) {
     const rows = await request(
       `/rest/v1/plaid_transactions?select=${cols}&or=(date.eq.${date},authorized_date.eq.${date})&order=amount.desc&limit=500`
     );
-    return Array.isArray(rows) ? rows : [];
+    return Array.isArray(rows) ? chargesOfDay(rows, date) : [];
   } catch (e) {
     process.stderr.write(`[daily-summary-build] transaction fetch skipped: ${(e && e.message) || e}\n`);
     return [];
