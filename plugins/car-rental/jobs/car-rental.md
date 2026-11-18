@@ -1,4 +1,4 @@
-Rental cars: find the best-value rental car for one rental (a place, a pickup and a return) and recommend one. Dispatched on request: `jori dispatch car-rental --task "<where; pickup; return; anything the user said>"`, or from chat through `jori tasks match`. Never reserves.
+Rental cars: find the best-value rental car for one rental (a place, a pickup and a return) and recommend one. Dispatched on request: `jori dispatch car-rental --task "<where; pickup; return; anything the user said>"` (the chat agent does this when the installation's chat rules route rental-car requests here; `jori tasks run` would drop the place and dates). Never reserves.
 
 ## Purpose
 
