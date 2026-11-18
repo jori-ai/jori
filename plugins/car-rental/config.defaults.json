@@ -1,0 +1,9 @@
+{
+  "_doc": "Rental cars (plugins/car-rental). Copied to agent/local/config/car-rental.json the first time the plugin is turned on. The user's own car-rental preferences (class, which companies) live in memory on the wiki page named by preferences_page; the playbook reads that page first. preferences_page: the wiki page id with those preferences. aggregators: comparison sites searched first, in order (default in code: the two the link builder knows). direct: rental companies' own sites checked after the aggregators, in order. companies: the fallback company filter for the aggregator links when the preferences page names none. classes: the fallback class filter (compact, midsize, fullsize, suv, minivan). driver_age: the age entered on sites that ask. grace_minutes: how late a return can be before the companies bill another day.",
+  "preferences_page": "travel_car_rental_preferences",
+  "direct": ["sixt.com", "avis.com", "hertz.com", "nationalcar.com", "enterprise.com", "budget.com", "alamo.com"],
+  "companies": ["Alamo", "Avis", "Budget", "Dollar", "Enterprise", "Hertz", "National", "Sixt", "Thrifty"],
+  "classes": ["compact", "midsize", "suv"],
+  "driver_age": 40,
+  "grace_minutes": 29
+}

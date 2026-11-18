@@ -65,6 +65,9 @@ agent/local/plugins/<name>/     this installation's own plugin (private overlay)
 - `requires.bins` are files that must exist (relative to the install),
   `requires.commands` programs on PATH, `requires.env` `.env` keys,
   `requires.plugins` other plugins that must be enabled first.
+- `jobs.<job>.chrome: true` adds the job to the merged `chrome-jobs` registry
+  (`webhook-auth.sh` then pins it to ops, the only supervisor with the
+  chrome-devtools MCP), only while the plugin is enabled.
 - `jobs.<job>.routing` joins the merged `job-routing` registry and
   `jobs.<job>.task` the `tasks` registry, only while the plugin is enabled.
 - `services` adds entries to the control room's service catalog.

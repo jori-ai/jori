@@ -33,11 +33,15 @@ const CONFIG = path.join(REPO, "agent", "config", "chrome-jobs.json");
 // run-action from Bash are deliberately absent.
 const MCP_USE = /mcp__chrome-devtools(?!-)|`chrome-devtools` MCP|\bcdp\.(navigate|evaluate)\b/;
 
+// Kernel playbooks plus enabled plugins' jobs/ (a plugin pins its own Chrome
+// jobs with `"chrome": true` in plugin.json, merged in by lib/registry.cjs).
 function livePlaybooks() {
   const out = new Map();
-  for (const f of fs.readdirSync(JOBS_DIR)) {
+  const dirs = [JOBS_DIR];
+  try { dirs.push(...createRequire(import.meta.url)(path.join(REPO, "lib", "plugins.cjs")).jobDirs()); } catch {}
+  for (const dir of dirs) for (const f of fs.readdirSync(dir)) {
     if (!f.endsWith(".md")) continue;
-    const text = fs.readFileSync(path.join(JOBS_DIR, f), "utf8");
+    const text = fs.readFileSync(path.join(dir, f), "utf8");
     const first = text.split("\n", 1)[0];
     if (/^\**\s*(SUPERSEDED|RETIRED)/i.test(first)) continue;
     out.set(f.replace(/\.md$/, ""), text);
