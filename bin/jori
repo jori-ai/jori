@@ -85,7 +85,11 @@ function shSafe(cmd, opts = {}) {
 // A registry read with no install at the expected root (installRoot():
 // $JORI_HOME, else ~/Dev/jori) says so instead of dying on an ENOENT stack.
 function loadRegistryOrHint(name) {
-  try { return registry.loadRegistryList(name, { root: ROOT }); }
+  // An explicit root reads that checkout's files only (no plugin layer), so
+  // pass it only when the install differs from this checkout; otherwise the
+  // enabled plugins' tasks would be invisible to `jori tasks`.
+  const sameCheckout = path.resolve(ROOT) === path.resolve(require(path.join(__dirname, '..', 'lib', 'root.cjs')).REPO_ROOT);
+  try { return registry.loadRegistryList(name, sameCheckout ? {} : { root: ROOT }); }
   catch (e) {
     if (e && e.code === 'ENOENT' && !fs.existsSync(SYSTEM)) {
       die(`no Jori install at ${ROOT} (${SYSTEM} is missing). Set JORI_HOME to the repo root, e.g. JORI_HOME=${path.resolve(__dirname, '..', '..')} jori ${process.argv.slice(2).join(' ')}`, 2);  // control-scan-ok: the software's name
