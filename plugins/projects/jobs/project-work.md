@@ -68,6 +68,8 @@ $P task add --project <project> --owner user --due <3 days from today, YYYY-MM-D
   --why "<link> · <one line on what to look at>" --by project-work
 ```
 
+After the run the trigger records every result as a **work record** (`bin/work-record sync-project-work`: a wiki page `type: work` with the summary and, for a doc, the Google Doc's full text), so chat, recall and the speak gate can say later what the work concluded without opening the doc. So the summary must carry the conclusion and the as-of date of its sources, not just say what was done.
+
 The Jori task stays open (state `review`) until the user's review closes it: the nightly projects job closes it when the review task is done or the PR is merged, or re-opens the work if the user asked for changes.
 
 ## Step 5 — When it cannot be done

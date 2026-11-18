@@ -139,6 +139,16 @@ Full tool reference, legacy `memory` CLI, frontmatter, backup/restore: `docs/mem
 
 ---
 
+## Work records — one-off work is recorded, and read back before it is quoted
+
+Every one-off piece of work done for the user (a comparison, an evaluation, research, a plan, a review, an analysis; not a routine job's regular output) has a **work record**: a wiki page `type: work` holding the bottom line, what was asked, what it was built from and as of when, the deliverable's full text as delivered, and dated updates. CLI `bin/work-record` (design: `system/wiki-architecture.md` § Work records).
+
+- **When you hand one over** (in chat, a role session, an email or a doc), record it in the same turn: `work-record add --title "…" --bottom-line "<the conclusion in one sentence>" --summary "<every recommendation, warning and exclusion>" --by "<your role>" [--project <project page>] [--as-of "…"] [--doc <Google Doc URL> | --deliverable @file] [--link …]`. The substance goes in, not just a link. Project-work results are recorded by their trigger; the dream records what a turn missed.
+- **When the user refers to earlier work** ("the review you prepared", "your comparison", "what did we conclude about…"), run `work-record find "<subject>"` and `work-record show <id>` BEFORE answering: the record holds the full text, so never say you could not open the doc. Read its `As of` and its `## Updates`: what arrived after it was written is not in it.
+- **When something changes a past conclusion** (a new offer, a decision, a correction), add it: `work-record update <id> "<what changed>" --by "<role>"`.
+
+---
+
 ## Email Triage
 
 Ops-agent-only. The ruleset lives in **`agent/ops-agent/email-triage-rules.md`** and is loaded on demand — read it before triaging. Chat-agent only uses `jori triage …` subcommands and never triages itself.

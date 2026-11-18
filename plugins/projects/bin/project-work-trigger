@@ -83,6 +83,10 @@ done_today "ran:$RC"
 const pt=require(process.argv[1]);
 pt.withLock((l)=>{for(const t of Object.values(l.tasks)) if(t.jori.state==="working"){t.jori.state="failed";t.jori.result={kind:null,link:null,summary:"The run ended before this task was finished.",failed:true,at:new Date().toISOString()};}});' "$PLUGIN_DIR/lib/project-tasks.js" 2>>"$LOG"
 
+# Every finished result becomes a work record (the doc's full text, not just its
+# link), so chat, recall and the speak gate can say what the work concluded.
+"$NODE" "$KERNEL_TOOLS/bin/work-record" sync-project-work >> "$LOG" 2>&1 || log "work-record sync failed (rc $?)"
+
 if [ -s "$REPORT" ]; then
   PTR=(); [ -s "$POINTER" ] && PTR=(--pointer "$(head -n 1 "$POINTER")")
   "$KERNEL_TOOLS/bin/digest-deliver" --subject "Chief of Staff: work ready for your review — $(date '+%a %b %-d')" \
