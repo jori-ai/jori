@@ -11,6 +11,9 @@ const { TTLockClient, TTLockError, ERR, borrowedToken } = require("../lib/ttlock
 const NOW = Date.parse("2026-11-04T15:00:00Z");
 const HOUR = 3600e3;
 const cfg = { battery_low_pct: 20, probe_every_hours: 6, preflight_hours: 36, confirm_runs: 2 };
+// Tests about state carry-over or wording, not about how long a reach problem
+// waits, confirm it over two runs; the reach wait itself is tested below.
+const cfgFast = { ...cfg, reach_confirm_runs: 2 };
 
 const ttl = (over = {}) => ({
   key: "ttlock:1", provider: "ttlock", name: "Back door", property: "P1", units: ["u1"],
@@ -68,19 +71,95 @@ test("a healthy lock is probed only every probe_every_hours; an open problem eve
 
 const dead = ttl({ probe: { ok: false, errcode: -2012, errmsg: "not connected" } });
 
-test("a probe failure alerts on the second run in a row, then stays quiet, then recovers once", () => {
-  let r = lh.plan({ readings: [dead], state: {}, nowMs: NOW, cfg });
+test("a probe failure alerts once confirmed (here at 2 runs), then stays quiet, then recovers once", () => {
+  let r = lh.plan({ readings: [dead], state: {}, nowMs: NOW, cfg: cfgFast });
   assert.equal(r.alerts.length, 0, "one bad probe may be a blip");
-  r = lh.plan({ readings: [dead], state: r.state, nowMs: NOW + HOUR, cfg });
+  r = lh.plan({ readings: [dead], state: r.state, nowMs: NOW + HOUR, cfg: cfgFast });
   assert.equal(r.alerts.length, 1);
   assert.equal(r.alerts[0].kind, "unreachable");
-  r = lh.plan({ readings: [dead], state: r.state, nowMs: NOW + 2 * HOUR, cfg });
+  r = lh.plan({ readings: [dead], state: r.state, nowMs: NOW + 2 * HOUR, cfg: cfgFast });
   assert.equal(r.alerts.length, 0, "never twice for the same condition");
-  r = lh.plan({ readings: [ttl()], state: r.state, nowMs: NOW + 3 * HOUR, cfg });
+  r = lh.plan({ readings: [ttl()], state: r.state, nowMs: NOW + 3 * HOUR, cfg: cfgFast });
   assert.equal(r.recoveries.length, 1);
   assert.deepEqual(r.state.conditions, {});
-  r = lh.plan({ readings: [ttl()], state: r.state, nowMs: NOW + 4 * HOUR, cfg });
+  r = lh.plan({ readings: [ttl()], state: r.state, nowMs: NOW + 4 * HOUR, cfg: cfgFast });
   assert.equal(r.recoveries.length, 0);
+});
+
+// Guards the "🔐 Lock problem … gateway offline" push + "✅ back to normal" row
+// pairs that fired for every gateway drop of a few hours while no lease or
+// pending code touched the lock: such a drop cannot fail a code, so a reach
+// problem with no need waits for reach_confirm_runs consecutive runs, and one
+// that clears sooner says nothing at all (no alert, no recovery).
+test("a reach problem with no need stays silent for five runs, alerts once on the sixth, then recovers once", () => {
+  assert.equal(lh.DEFAULTS.reach_confirm_runs, 6);
+  assert.equal(lh.settings(cfg).reach_confirm_runs, 6, "the installation config does not have to set it");
+  let r = { state: {} };
+  for (let i = 0; i < 5; i++) {
+    r = lh.plan({ readings: [dead], state: r.state, nowMs: NOW + i * HOUR, cfg });
+    assert.equal(r.alerts.length, 0, `run ${i + 1} is still waiting`);
+  }
+  r = lh.plan({ readings: [dead], state: r.state, nowMs: NOW + 5 * HOUR, cfg });
+  assert.equal(r.alerts.length, 1, "the sixth run alerts");
+  assert.equal(r.alerts[0].kind, "unreachable");
+  for (const i of [6, 7]) {
+    r = lh.plan({ readings: [dead], state: r.state, nowMs: NOW + i * HOUR, cfg });
+    assert.equal(r.alerts.length, 0, "never twice for the same condition");
+  }
+  r = lh.plan({ readings: [ttl()], state: r.state, nowMs: NOW + 8 * HOUR, cfg });
+  assert.equal(r.recoveries.length, 1);
+  assert.deepEqual(r.state.conditions, {});
+  r = lh.plan({ readings: [ttl()], state: r.state, nowMs: NOW + 9 * HOUR, cfg });
+  assert.equal(r.recoveries.length, 0);
+});
+
+test("a short reach outage with no need says nothing, however many runs it lasted below the wait", () => {
+  for (let bad = 1; bad <= 5; bad++) {
+    let r = { state: {} };
+    for (let i = 0; i < bad; i++) {
+      r = lh.plan({ readings: [dead], state: r.state, nowMs: NOW + i * HOUR, cfg });
+      assert.equal(r.alerts.length + r.recoveries.length, 0, `run ${i + 1} of ${bad}`);
+    }
+    r = lh.plan({ readings: [ttl()], state: r.state, nowMs: NOW + bad * HOUR, cfg });
+    assert.equal(r.alerts.length + r.recoveries.length, 0, `clearing after ${bad} bad runs is silent`);
+    assert.deepEqual(r.state.conditions, {}, "a clean run drops the condition, so its counter restarts");
+  }
+});
+
+test("a reach problem on a lock someone needs alerts on the first run, whatever the wait", () => {
+  const needs = new Map([["ttlock:1", [{ property: "P1", unit: "u1", atMs: NOW + 20 * HOUR, why: "check-in" }]]]);
+  const r = lh.plan({ readings: [dead], state: {}, needs, nowMs: NOW, cfg });
+  assert.equal(r.alerts.length, 1);
+  assert.equal(r.alerts[0].needs.length, 1);
+  const pending = new Map([["ttlock:1", [{ property: "P1", unit: "u1", atMs: null, why: "code-pending" }]]]);
+  const noGw = ttl({ has_gateway: false, gateway: null, probe: null });
+  assert.equal(lh.plan({ readings: [noGw], state: {}, needs: pending, nowMs: NOW, cfg }).alerts.length, 1);
+});
+
+test("the longer reach wait is only for reach layers: a low battery alerts on first sight, a Schlage offline at two runs", () => {
+  assert.equal(lh.plan({ readings: [ttl({ battery: 12 })], state: {}, nowMs: NOW, cfg }).alerts.length, 1);
+  const off = sch({ online: false });
+  let r = lh.plan({ readings: [off], state: {}, nowMs: NOW, cfg });
+  assert.equal(r.alerts.length, 0, "first sight waits for a second run");
+  r = lh.plan({ readings: [off], state: r.state, nowMs: NOW + HOUR, cfg });
+  assert.equal(r.alerts.length, 1);
+  assert.equal(r.alerts[0].kind, "offline");
+});
+
+test("reach_confirm_runs is a setting, and never confirms sooner than confirm_runs", () => {
+  const three = { ...cfg, reach_confirm_runs: 3 };
+  let r = { state: {} };
+  const seen = [];
+  for (let i = 0; i < 4; i++) {
+    r = lh.plan({ readings: [dead], state: r.state, nowMs: NOW + i * HOUR, cfg: three });
+    seen.push(r.alerts.length);
+  }
+  assert.deepEqual(seen, [0, 0, 1, 0], "alerts on the third run only");
+  const one = { ...cfg, reach_confirm_runs: 1 };
+  r = lh.plan({ readings: [dead], state: {}, nowMs: NOW, cfg: one });
+  assert.equal(r.alerts.length, 0, "confirm_runs (2) is the floor");
+  r = lh.plan({ readings: [dead], state: r.state, nowMs: NOW + HOUR, cfg: one });
+  assert.equal(r.alerts.length, 1);
 });
 
 test("a blip that clears before confirming says nothing either way", () => {
@@ -102,10 +181,10 @@ test("a lock someone needs soon alerts on the first bad reading (the pre-flight)
 });
 
 test("an unreadable provider keeps its locks' conditions: no data is not a recovery", () => {
-  let r = lh.plan({ readings: [dead], state: {}, nowMs: NOW, cfg });
-  r = lh.plan({ readings: [dead], state: r.state, nowMs: NOW + HOUR, cfg });
+  let r = lh.plan({ readings: [dead], state: {}, nowMs: NOW, cfg: cfgFast });
+  r = lh.plan({ readings: [dead], state: r.state, nowMs: NOW + HOUR, cfg: cfgFast });
   const acct = { key: "provider:ttlock", provider: "ttlock", name: "TTLock account", error: "HTTP 502" };
-  r = lh.plan({ readings: [acct], state: r.state, nowMs: NOW + 2 * HOUR, cfg, unread: new Set(["provider:ttlock"]) });
+  r = lh.plan({ readings: [acct], state: r.state, nowMs: NOW + 2 * HOUR, cfg: cfgFast, unread: new Set(["provider:ttlock"]) });
   assert.equal(r.recoveries.length, 0);
   assert.ok(r.state.conditions["ttlock:1|reach"].alerted_at);
 });
@@ -136,13 +215,13 @@ test("a lock's reach problem changing layer is one condition: no recovery, no se
 // it" rows that named several locks at once and all cleared within hours: a
 // no-gateway reading follows the gateway's connection, so it confirms over two
 // runs like every other reach layer, and its words do not claim a pairing fact.
-test("no gateway is a reach layer: a one-run reading says nothing, two runs alert", () => {
+test("no gateway is a reach layer: a one-run reading says nothing, a confirmed one alerts (here at 2 runs)", () => {
   const noGw = ttl({ has_gateway: false, gateway: null, probe: null });
-  let r = lh.plan({ readings: [noGw], state: {}, nowMs: NOW, cfg });
+  let r = lh.plan({ readings: [noGw], state: {}, nowMs: NOW, cfg: cfgFast });
   assert.equal(r.alerts.length, 0, "first sight waits for a second run");
-  const cleared = lh.plan({ readings: [ttl()], state: r.state, nowMs: NOW + HOUR, cfg });
+  const cleared = lh.plan({ readings: [ttl()], state: r.state, nowMs: NOW + HOUR, cfg: cfgFast });
   assert.equal(cleared.alerts.length + cleared.recoveries.length, 0, "a blip that clears says nothing");
-  r = lh.plan({ readings: [noGw], state: r.state, nowMs: NOW + HOUR, cfg });
+  r = lh.plan({ readings: [noGw], state: r.state, nowMs: NOW + HOUR, cfg: cfgFast });
   assert.equal(r.alerts.length, 1);
   assert.equal(r.alerts[0].kind, "no_gateway");
   assert.equal(r.state.conditions["ttlock:1|reach"].text, "no gateway connected, so codes can't be sent to it");
