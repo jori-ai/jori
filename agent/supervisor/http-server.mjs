@@ -372,6 +372,10 @@ export function startServers({ ports, gmailSource, supervisor }) {
           task = withLocalCompanion(task, readOptional(localCompanionPath(LOCAL_DIR, payload.job)));
           // + the specialization of the team role that owns this job (system/org.md).
           try { const brief = require("../../lib/org.cjs").roleBrief(payload.job); if (brief) task = `${task.trimEnd()}\n\n${brief}\n`; } catch { /* no role, no brief */ }
+          // + this dispatch's own instructions (`jori dispatch <job> --task …`):
+          // an on-request job (a search for one place and date) needs them,
+          // and they used to be dropped whenever a job file loaded.
+          if (typeof payload.task === "string" && payload.task.trim()) task = `${task.trimEnd()}\n\n## This dispatch\n\n${payload.task.trim()}\n`;
           // No log line here — the subsequent `[supervisor] disp NNNNNN → <job>`
           // already records the dispatch. The former `loaded job instructions`
           // line fired on every webhook and drowned real signal.
