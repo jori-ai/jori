@@ -142,6 +142,23 @@ async function openQuestions(asOf) {
   } catch { return ""; }
 }
 
+// Earlier one-off work the message may lean on (system/wiki-architecture.md
+// § Work records): the closest work records, each with its bottom line and its
+// dated updates, so a recommendation that was corrected or superseded later is
+// in front of the judge without it having to think of searching.
+function workRecords(message) {
+  try {
+    const ws = require(path.join(ROOT, "lib", "wiki-store.js"));
+    const hits = ws.searchPages(String(message).slice(0, 600), { type: "work", limit: 4 });
+    return hits.map((h) => {
+      const p = ws.getPage(h.id);
+      if (!p) return "";
+      const ups = (p.body_md.split(/\n## Updates\n/)[1] || "").trim();
+      return `- ${h.id}: ${p.title} — ${p.description || ""}${ups && !ups.startsWith("_None yet") ? `\n  Updates: ${oneLine(ups, 900)}` : ""}`;
+    }).filter(Boolean).join("\n");
+  } catch { return ""; }
+}
+
 // The research session and its tools live in lib/speak-gate-agent.mjs (shared
 // with the nightly audit). Money and health messages are researched without
 // the web.
@@ -191,7 +208,7 @@ ${TOOLS_DOC}
 ${rules ? `\n## ${OWNER.toUpperCase()}'S STANDING RULES (their own words; they override your judgment)\n${rules}\n` : ""}${lessons ? `\n## LESSONS FROM THE NIGHTLY AUDIT (a senior reviewer re-checked your past decisions; apply these. ${OWNER}'s standing rules win over them)\n${lessons}\n` : ""}
 THE MESSAGE:
 """${input.message}"""
-${E("TAPPABLE CHOICES SENT WITH IT (fixed: a rewrite must still be a question these answer)", Array.isArray(input.fixed_choices) ? input.fixed_choices.join(" | ") : "")}${reply ? E(`WHAT ${OWNER.toUpperCase()} WROTE (being answered)`, input.reply_to_text) : ""}${E("THIS ROLE'S CONVERSATION, LAST 14 DAYS (question states are authoritative)", extra.thread)}${E("QUESTIONS STILL OPEN (any role)", extra.open)}${E("ANSWERS THIS GATE ALREADY FOUND (a question it held because it found the answer; asking one again is a re-ask: resolve it with the same answer)", extra.found)}${E(`WHAT ${OWNER.toUpperCase()} SAID (dated, from the reply log)`, ev.owner_said)}${E("TRAVEL TIMELINE FACTS", ev.authoritative_facts)}${E("TRAVEL CHECK FLAGGED (code paired a place and a date; decide yourself whether the message actually claims where the user is)", ev.travel_check_flagged)}${E("LONG-TERM MEMORY (wiki hits)", ev.long_term_memory)}${E("TOPICS ACKNOWLEDGED IN THE LAST 48H", ev.acknowledged_topics_48h)}${E("PINGS ALREADY SENT TODAY", ev.hum_pings_today)}${E("SENDER'S SUPPORTING DATA", ev.supporting_data)}${E("CHAT, LAST 8H", ev.transcript_last_8h)}${E("CALENDAR, REST OF TODAY", ev.calendar_today)}
+${E("TAPPABLE CHOICES SENT WITH IT (fixed: a rewrite must still be a question these answer)", Array.isArray(input.fixed_choices) ? input.fixed_choices.join(" | ") : "")}${reply ? E(`WHAT ${OWNER.toUpperCase()} WROTE (being answered)`, input.reply_to_text) : ""}${E("THIS ROLE'S CONVERSATION, LAST 14 DAYS (question states are authoritative)", extra.thread)}${E("QUESTIONS STILL OPEN (any role)", extra.open)}${E(`EARLIER WORK DONE FOR ${OWNER.toUpperCase()} (work records: the newest record and its updates win; a superseded recommendation is not the current one; work-record show <id> has the full text)`, extra.work)}${E("ANSWERS THIS GATE ALREADY FOUND (a question it held because it found the answer; asking one again is a re-ask: resolve it with the same answer)", extra.found)}${E(`WHAT ${OWNER.toUpperCase()} SAID (dated, from the reply log)`, ev.owner_said)}${E("TRAVEL TIMELINE FACTS", ev.authoritative_facts)}${E("TRAVEL CHECK FLAGGED (code paired a place and a date; decide yourself whether the message actually claims where the user is)", ev.travel_check_flagged)}${E("LONG-TERM MEMORY (wiki hits)", ev.long_term_memory)}${E("TOPICS ACKNOWLEDGED IN THE LAST 48H", ev.acknowledged_topics_48h)}${E("PINGS ALREADY SENT TODAY", ev.hum_pings_today)}${E("SENDER'S SUPPORTING DATA", ev.supporting_data)}${E("CHAT, LAST 8H", ev.transcript_last_8h)}${E("CALENDAR, REST OF TODAY", ev.calendar_today)}
 When done, end your answer with ONE LINE of compact JSON (nothing after it):
 {"verdict":"${reply ? "send|rewrite" : "send|rewrite|resolve|digest|drop"}","message":"<the rewritten text, only for rewrite>","research_plan":"<only for resolve: the answer you found and its source, or what is left to do>","checks":{"true":"ok|<problem>","${reply ? "phrasing" : "self_resolve"}":"ok|<problem>"${reply ? "" : ',"phrasing":"ok|<problem>","value":"ok|<problem>"'}},"sources":["<each source you checked, short>"],"reason":"<≤200 chars>"}`;
 }
@@ -229,7 +246,8 @@ try {
   const ev = (pre && pre.evidence) || {};
   if (pre && pre.message) input.message = pre.message;
   const [thread, open, found] = await Promise.all([roleThread(input.sender, input.as_of), openQuestions(input.as_of), foundAnswers(input.as_of)]);
-  const r = await judge(input, ev, { thread, open, found });
+  const work = workRecords(input.message);
+  const r = await judge(input, ev, { thread, open, found, work });
   out({ ...r, ms: Date.now() - t0 }, ctx);
 } catch (e) {
   out({ verdict: "send", reason: `gate_error:${String(e.message || e).slice(0, 160)}`, ms: Date.now() - t0 }, ctx);
