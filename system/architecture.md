@@ -665,7 +665,7 @@ One read of every place Jori's own work lives, so every agent (chat, the ops tie
 |---|---|
 | dispatches | each supervisor's `/health` (in flight, paused, rate-limit hold, child alive), its persisted queue (`data/dispatcher-queue[-<agent>].json`, chat's `agent/supervisor/state/chat/queue.json`), and its log's `disp <id> → / done / error` lines (a start with neither end, not in flight, after 10 min = interrupted) |
 | forks | `pending_forks` in `data/memory-index.db` (delegate) |
-| purchases | `data/purchases/queue.json` (a stopped request with a later one after it is history, not stuck) and `purchase_approvals` with the poller's `result` (an unchanged page after the click is flagged) |
+| purchases | `data/purchases/queue.json` (a stopped request with a later one after it is history, not stuck) and `purchase_approvals` with the poller's `result`, including which evidence a `placed` rests on (`signal`: a new URL, the Place Order button leaving a page redrawn in place, or a navigation; `clicked` = none, not confirmed) |
 | builds | `data/build-queue/{pending,held,running,asks,parked,done,failed}`; a held build carries the allowance governor's reason from `chat-build.log`, a finished one its result's first line |
 | jobs | `job-run` registry, `data/jobs/*.json` |
 | cron | `data/cron-runs.jsonl` (labels whose last run failed), `job-failure-watch` incidents and repair queue, `watchdog.log` `supervisor-code-reload … stale, holding` (new code not loaded) |

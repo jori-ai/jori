@@ -114,21 +114,22 @@ async function execute(row) {
     await B.click(s, row.place_selector);
     log(`${row.id} clicked ${row.place_selector} (${btn.label})`);
     // Watch for the order to go through: the URL moves, or the button leaves the page.
-    let after = before, moved = false;
-    for (let i = 0; i < 15 && !moved; i++) {
+    let after = before, outcome = { moved: false, signal: null };
+    for (let i = 0; i < 15 && !outcome.moved; i++) {
       await B.sleep(2000);
       try {
         after = await B.pageState(s);
         const still = await B.describeSelector(s, row.place_selector);
-        moved = after.url !== before.url || !still?.ok;
+        outcome = P.clickOutcome({ beforeUrl: before.url, afterUrl: after.url, buttonStill: !!still?.ok });
       } catch {
         // The tab navigated under our session; reconnect and read the new page.
         s.close(); s = await B.connect(await B.workingTab(row.tab_id));
-        after = await B.pageState(s); moved = true;
+        after = await B.pageState(s); outcome = P.clickOutcome({ beforeUrl: before.url, afterUrl: after.url, navigated: true });
       }
     }
-    const result = { clicked: btn.label, before_url: before.url, after_url: after.url, after_title: after.title };
-    if (moved) {
+    // `signal` records which evidence "placed" rests on (lib/purchase-approval.mjs clickOutcome).
+    const result = { clicked: btn.label, signal: outcome.signal, before_url: before.url, after_url: after.url, after_title: after.title };
+    if (outcome.moved) {
       return finish(row, "placed", result, P.placedMessage(item, after.title));
     }
     return finish(row, "clicked", result,

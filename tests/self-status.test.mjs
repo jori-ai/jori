@@ -101,12 +101,17 @@ test("purchases: raw queue status with its bucket; the approval keeps the poller
   assert.match(a.what, /361\.63 USD/);
 });
 
-test("placed with an unchanged page is flagged, not hidden", () => {
-  const [it] = purchaseApprovalItems([{ id: "p", status: "placed", created_at: iso(5), result: { clicked: "Book now", before_url: "https://x/checkout/1", after_url: "https://x/checkout/1", after_title: "Checkout" } }], NOW);
-  assert.equal(it.bucket, "done");
-  assert.equal(it.state, "placed");
-  assert.match(it.detail.page_after_click, /unchanged/);
-  assert.equal(it.detail.after_title, "Checkout");
+test("placed says which evidence it rests on; a legacy same-URL placed is a button that left the page", () => {
+  const [legacy, recorded, clicked] = purchaseApprovalItems([
+    { id: "p", status: "placed", created_at: iso(5), result: { clicked: "Book now", before_url: "https://x/checkout/1", after_url: "https://x/checkout/1", after_title: "Checkout" } },
+    { id: "q", status: "placed", created_at: iso(6), result: { clicked: "Place order", signal: "url_changed", before_url: "https://x/c", after_url: "https://x/thanks" } },
+    { id: "r", status: "clicked", created_at: iso(7), result: { clicked: "Place order", signal: null, before_url: "https://x/c", after_url: "https://x/c" } },
+  ], NOW);
+  assert.equal(legacy.state, "placed");
+  assert.match(legacy.detail.after_click, /Place Order button left the page/);
+  assert.equal(legacy.detail.after_title, "Checkout");
+  assert.match(recorded.detail.after_click, /new URL/);
+  assert.match(clicked.detail.after_click, /not confirmed/);
 });
 
 test("a pending approval past its expiry is not waiting on the user", () => {
