@@ -474,6 +474,16 @@ enum PurchaseApproval {
         return sig
     }
 
+    /// The shop browser's sign-in (ShopBrowserView.swift): this paired key
+    /// over `<purchase domain>/shop-view` — never the bare purchase domain, so
+    /// it can't pass for a purchase approval. Mirrors lib/shop-view.mjs
+    /// appSessionMessage byte for byte. Returns the signature in base64.
+    static func signShopViewSession(nonce: String, expiresAtMs: Int64) throws -> String {
+        guard isRegistered else { throw ApprovalError.notPaired }
+        let message = "\(domain)/shop-view\n\(deviceId)\n\(nonce)\n\(expiresAtMs)"
+        return try sign(Data(message.utf8), reason: "Open the shop browser").base64EncodedString()
+    }
+
     /// Plugin-action approvals (ActionApproval.swift) sign with this same
     /// paired key, over their own fixed domain.
     static func signWithPairedKey(_ data: Data, reason: String) throws -> Data {

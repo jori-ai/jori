@@ -178,6 +178,8 @@ struct ContentView: View {
     @State private var pendingPurchase: PurchaseApproval.Ref?
     // Face-ID approval for plugin actions (ActionApproval.swift)
     @State private var pendingAction: ActionApproval.Ref?
+    // The shop browser (ShopBrowserView.swift), opened from a chat link.
+    @State private var shopBrowserLink: ShopBrowserLink?
 
     /// Wiki HTTP browser served from the host (Tailscale / home LAN), from
     /// the build's JORI_WIKI_URL. Nil: the Memory tab explains it is not set up.
@@ -745,6 +747,23 @@ struct ContentView: View {
                 .frame(minWidth: 420, idealWidth: 460, minHeight: 420, idealHeight: 520)
                 #endif
             }
+            // A shop-browser link (a merchant sign-in, a card field the agent
+            // couldn't finish) opens the host's shop Chrome here, not in a browser.
+            .sheet(item: $shopBrowserLink) { link in
+                ShopBrowserView(link: link.url)
+                #if os(iOS)
+                .presentationDetents([.large])
+                .interactiveDismissDisabled()
+                #endif
+            }
+            .onReceive(NotificationCenter.default.publisher(for: ShopBrowser.openRequest)) { note in
+                if let url = note.object as? URL { shopBrowserLink = ShopBrowserLink(url: url) }
+            }
+            .environment(\.openURL, OpenURLAction { url in
+                guard ShopBrowser.handles(url) else { return .systemAction }
+                ShopBrowser.open(url)
+                return .handled
+            })
     }
 
     @ViewBuilder

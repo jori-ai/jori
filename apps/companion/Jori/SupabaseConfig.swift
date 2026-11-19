@@ -112,6 +112,10 @@ enum Install {
     /// tab says so.
     static let wikiURL = URL(string: string("JoriWikiURL")).flatMap { $0.host == nil ? nil : $0 }
 
+    /// The host's shop browser for the app (JORI_SHOP_VIEW_URL, over
+    /// Tailscale); when unset, shop-browser links open like any other link.
+    static let shopViewURL = URL(string: string("JoriShopViewURL")).flatMap { $0.host == nil ? nil : $0 }
+
     /// Trade approval: on only when the build names the trading web app that
     /// verifies the signatures (JORI_TRADE_APPROVAL_URL).
     static let tradeApprovalURL = URL(string: string("JoriTradeApprovalURL")).flatMap { $0.host == nil ? nil : $0 }

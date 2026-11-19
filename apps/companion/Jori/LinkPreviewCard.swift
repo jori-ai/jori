@@ -13,6 +13,7 @@ private let previewFill = Color.primary.opacity(0.07)
 #endif
 
 private func openExternalURL(_ url: URL) {
+    if ShopBrowser.handles(url) { ShopBrowser.open(url); return }
     #if os(macOS)
     NSWorkspace.shared.open(url)
     #else

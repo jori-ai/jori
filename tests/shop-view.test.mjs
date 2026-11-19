@@ -220,3 +220,86 @@ test("server: /healthz answers; every other path refuses a request with no Acces
   const forged = await fetch(`http://127.0.0.1:${port}/`, { headers: { "Cf-Access-Jwt-Assertion": "a.b.c" } });
   assert.equal(forged.status, 403, "a token that does not verify is no token");
 });
+
+// ── the app's way in (tailnet + Face ID purchase key) ─────────────────────
+import { verifySignature } from "../agent/core/app-approval.mjs";
+
+function p256() {
+  const { privateKey, publicKey } = crypto.generateKeyPairSync("ec", { namedCurve: "P-256" });
+  const raw = publicKey.export({ format: "jwk" });
+  const pub = Buffer.concat([Buffer.from([4]), Buffer.from(raw.x, "base64url"), Buffer.from(raw.y, "base64url")]).toString("base64");
+  const sign = (msg) => crypto.sign("sha256", Buffer.from(msg, "utf8"), { key: privateKey, dsaEncoding: "der" }).toString("base64");
+  return { pub, sign };
+}
+
+test("isTailnetAddress: Tailscale ranges only", () => {
+  for (const a of ["100.64.0.1", "100.108.95.34", "100.127.255.254", "::ffff:100.100.1.2", "fd7a:115c:a1e0::1234"]) assert.equal(V.isTailnetAddress(a), true, a);
+  for (const a of ["100.63.255.255", "100.128.0.1", "192.168.1.10", "10.0.0.2", "127.0.0.1", "::1", "::ffff:192.168.1.2", "fd00::1", "", undefined]) assert.equal(V.isTailnetAddress(a), false, String(a));
+});
+
+test("appSessionMessage: never the bare purchase domain on its first line", () => {
+  const m = V.appSessionMessage({ domain: "jori-purchase.v1", deviceId: "dev-12345678", nonce: "ab", expiresAt: 5 });
+  assert.equal(m, "jori-purchase.v1/shop-view\ndev-12345678\nab\n5");
+  assert.notEqual(m.split("\n")[0], "jori-purchase.v1");
+});
+
+test("AppSessions: a signed challenge opens a session; it is one-time and expires", () => {
+  let t = 1_000_000;
+  const k = p256();
+  const S = new V.AppSessions({ domain: "jori-purchase.v1", now: () => t });
+  const c = S.challenge();
+  assert.equal(S.challengeExpiry(c.nonce), c.expiresAt);
+  const sig = k.sign(V.appSessionMessage({ domain: "jori-purchase.v1", deviceId: "dev-12345678", nonce: c.nonce, expiresAt: c.expiresAt }));
+  const r = S.redeem({ deviceId: "dev-12345678", nonce: c.nonce, signatureB64: sig, publicKeyRawB64: k.pub, verify: verifySignature });
+  assert.equal(r.ok, true);
+  assert.match(r.token, /^[0-9a-f]{64}$/);
+  assert.deepEqual(S.check(r.token), { ok: true, deviceId: "dev-12345678" });
+  // The same challenge again: refused.
+  assert.equal(S.redeem({ deviceId: "dev-12345678", nonce: c.nonce, signatureB64: sig, publicKeyRawB64: k.pub, verify: verifySignature }).ok, false);
+  // Idle past the window: signed out.
+  t += V.APP_SESSION_IDLE_MS + 1;
+  assert.equal(S.check(r.token).ok, false);
+});
+
+test("AppSessions: refuses a wrong key, a purchase-shaped signature, an unpaired device, an expired challenge", () => {
+  let t = 5_000_000;
+  const k = p256(), other = p256();
+  const S = new V.AppSessions({ domain: "jori-purchase.v1", now: () => t });
+  const go = (signer, { pub = k.pub, msg } = {}) => {
+    const c = S.challenge();
+    const m = msg ? msg(c) : V.appSessionMessage({ domain: "jori-purchase.v1", deviceId: "dev-12345678", nonce: c.nonce, expiresAt: c.expiresAt });
+    return S.redeem({ deviceId: "dev-12345678", nonce: c.nonce, signatureB64: signer.sign(m), publicKeyRawB64: pub, verify: verifySignature });
+  };
+  assert.equal(go(other).ok, false);
+  // A purchase approval's message (first line = the bare domain) is not a sign-in.
+  assert.equal(go(k, { msg: (c) => `jori-purchase.v1\nid\n${"0".repeat(64)}\n${c.nonce}\n${c.expiresAt}` }).ok, false);
+  assert.equal(go(k, { pub: null }).reason, "this device is not paired for purchases");
+  const c = S.challenge();
+  t += V.APP_CHALLENGE_TTL_MS + 1;
+  const sig = k.sign(V.appSessionMessage({ domain: "jori-purchase.v1", deviceId: "dev-12345678", nonce: c.nonce, expiresAt: c.expiresAt }));
+  assert.equal(S.redeem({ deviceId: "dev-12345678", nonce: c.nonce, signatureB64: sig, publicKeyRawB64: k.pub, verify: verifySignature }).ok, false);
+});
+
+test("AppSessions: a session ends at the hard cap even while in use", () => {
+  let t = 0;
+  const k = p256();
+  const S = new V.AppSessions({ domain: "d", now: () => t });
+  const c = S.challenge();
+  const r = S.redeem({ deviceId: "dev-12345678", nonce: c.nonce, signatureB64: k.sign(V.appSessionMessage({ domain: "d", deviceId: "dev-12345678", nonce: c.nonce, expiresAt: c.expiresAt })), publicKeyRawB64: k.pub, verify: verifySignature });
+  for (t = 0; t < V.APP_SESSION_MAX_MS; t += V.APP_SESSION_IDLE_MS / 2) assert.equal(S.check(r.token).ok, true);
+  t = V.APP_SESSION_MAX_MS + 1;
+  assert.equal(S.check(r.token).ok, false);
+});
+
+test("cookieValue and safeNext", () => {
+  assert.equal(V.cookieValue("a=1; jori_shop=abc; b=2", "jori_shop"), "abc");
+  assert.equal(V.cookieValue("jori_shopx=1", "jori_shop"), null);
+  assert.equal(V.safeNext("/?open=https%3A%2F%2Fhertz.com%2F&site=hertz.com"), "/?open=https%3A%2F%2Fhertz.com%2F&site=hertz.com");
+  for (const bad of ["//evil.com/", "https://evil.com/", "/api/input", "/\\evil", "", null]) assert.equal(V.safeNext(bad), "/", String(bad));
+});
+
+test("appSigninLink: the app address when configured, null otherwise", () => {
+  assert.equal(V.appSigninLink({ base: "http://mini:9088", site: "hertz.com" }), "http://mini:9088/?open=https%3A%2F%2Fhertz.com%2F&site=hertz.com");
+  assert.equal(V.appSigninLink({ site: "x.com" }, { SHOP_VIEW_APP_URL: "http://m:1/" }), "http://m:1/?open=https%3A%2F%2Fx.com%2F&site=x.com");
+  if (!V.DEFAULT_APP_URL) assert.equal(V.appSigninLink({ site: "x.com" }, {}), null);
+});

@@ -21,10 +21,18 @@
 //           data/purchases/shop-view-done.json so the job that asked can
 //           see the user finished.
 //
-// Binds 127.0.0.1 ONLY. Reachable from outside solely through the Cloudflare
-// tunnel hostname behind a Cloudflare Access application; every request is
-// re-authorized here (lib/shop-view.mjs → authorize). Typed text is never
-// logged — it is often a password.
+// Two listeners, the same page and the same CDP session behind both:
+//   web  127.0.0.1:<shop_view> — reachable from outside solely through the
+//        Cloudflare tunnel hostname behind a Cloudflare Access application;
+//        every request is re-authorized here (lib/shop-view.mjs → authorize).
+//   app  [::]:<shop_view_app> — the Jori app's shop browser screen, straight
+//        over Tailscale. Answers Tailscale addresses only; a session starts
+//        with a Face ID signature from the app's paired purchase key over a
+//        one-time challenge (GET /app/challenge, GET /app/session), checked
+//        against `purchase_device_keys`, then rides an HttpOnly cookie
+//        (lib/shop-view.mjs → AppSessions). On only when the app address is
+//        configured (purchase.json `shop_view_app_url` / SHOP_VIEW_APP_URL).
+// Typed text is never logged — it is often a password.
 //
 // launchd: agent/shop-view/com.jori.shop-view.plist (KeepAlive).
 
@@ -32,6 +40,7 @@ import http from "node:http";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { createRequire } from "node:module";
 import { REPO_ROOT } from "../../lib/root.cjs";
 import { assistantName } from "../../lib/instance.cjs";
 import { port as registryPort } from "../../lib/ports.cjs";
@@ -44,9 +53,15 @@ for (const l of (() => { try { return fs.readFileSync(path.join(ROOT, ".env"), "
 
 const V = await import(path.join(ROOT, "lib/shop-view.mjs"));
 const B = await import(path.join(ROOT, "lib/shop-browser.mjs"));
+const { verifySignature } = await import(path.join(ROOT, "agent/core/app-approval.mjs"));
+const { PURCHASE_DOMAIN } = await import(path.join(ROOT, "lib/purchase-approval.mjs"));
+const { supabaseUrl } = createRequire(import.meta.url)("../../lib/instance.cjs");
 
 const PORT = Number(process.env.SHOP_VIEW_PORT) || registryPort("shop_view");
 const HOST = "127.0.0.1";
+const APP_PORT = Number(process.env.SHOP_VIEW_APP_PORT) || registryPort("shop_view_app");
+const APP_ON = Boolean(process.env.SHOP_VIEW_APP_URL || V.DEFAULT_APP_URL);
+const APP = new V.AppSessions({ domain: PURCHASE_DOMAIN });
 const IDLE_MS = 20_000;
 const HOLD_MS = 5 * 60_000;
 const LONGPOLL_MS = 12_000;
@@ -221,6 +236,70 @@ async function state() {
   };
 }
 
+// ── the app's sign-in ──────────────────────────────────────────────────────
+/** The paired purchase key of one device, from Supabase (service role). */
+async function devicePublicKey(deviceId) {
+  const base = process.env.SUPABASE_URL || supabaseUrl();
+  const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
+  if (!base || !key) throw new Error("Supabase is not configured");
+  const r = await fetch(`${base}/rest/v1/purchase_device_keys?device_id=eq.${encodeURIComponent(deviceId)}&select=public_key_raw&limit=1`, {
+    headers: { apikey: key, Authorization: `Bearer ${key}` },
+    signal: AbortSignal.timeout(8000),
+  });
+  if (!r.ok) throw new Error(`purchase_device_keys: HTTP ${r.status}`);
+  return (await r.json())[0]?.public_key_raw || null;
+}
+
+const NOTICE = (title, text) => `<!doctype html><meta name="viewport" content="width=device-width,initial-scale=1"><title>${title}</title><body style="font:16px -apple-system,system-ui,sans-serif;margin:2rem;color:#222;background:#fff"><h2>${title}</h2><p>${text}</p></body>`;
+
+/** The app listener's own routes and its gate. Returns {ok, email} to go on, or null when it answered. */
+async function appGate(req, res, url) {
+  if (!V.isTailnetAddress(req.socket.remoteAddress)) {
+    log(`refused app ${req.method} ${url.pathname}: not a Tailscale address`);
+    send(res, 403, NOTICE("Turn on Tailscale", "The shop browser opens only over Tailscale. Turn Tailscale on and try again."), { "Content-Type": "text/html; charset=utf-8" });
+    return null;
+  }
+  if (url.pathname === "/healthz") { send(res, 200, { ok: true }); return null; }
+  if (req.method === "GET" && url.pathname === "/app/challenge") {
+    const c = APP.challenge();
+    send(res, 200, { nonce: c.nonce, expires_at_ms: c.expiresAt });
+    return null;
+  }
+  if (req.method === "GET" && url.pathname === "/app/session") {
+    const deviceId = url.searchParams.get("d") || "";
+    const nonce = url.searchParams.get("n") || "";
+    let publicKeyRawB64 = null;
+    try {
+      if (/^[A-Za-z0-9-]{8,64}$/.test(deviceId)) publicKeyRawB64 = await devicePublicKey(deviceId);
+    } catch (e) {
+      log(`app sign-in: key lookup failed: ${e.message}`);
+      send(res, 502, NOTICE("Can't check this device", "The device list could not be read. Try again in a minute."), { "Content-Type": "text/html; charset=utf-8" });
+      return null;
+    }
+    const r = APP.redeem({ deviceId, nonce, signatureB64: url.searchParams.get("s") || "", publicKeyRawB64, verify: verifySignature });
+    if (!r.ok) {
+      log(`app sign-in refused for ${deviceId.slice(0, 12)}: ${r.reason}`);
+      send(res, 403, NOTICE("Sign-in refused", r.reason === "this device is not paired for purchases"
+        ? "This device isn't paired for purchase approval yet. Pair it from the app's menu, then try again."
+        : "Close this screen and open the shop browser again."), { "Content-Type": "text/html; charset=utf-8" });
+      return null;
+    }
+    log(`app sign-in by device ${deviceId.slice(0, 12)}`);
+    send(res, 302, "", {
+      Location: V.safeNext(url.searchParams.get("next")),
+      "Set-Cookie": `${V.APP_COOKIE}=${r.token}; HttpOnly; SameSite=Strict; Path=/; Max-Age=${Math.round(V.APP_SESSION_MAX_MS / 1000)}`,
+    });
+    return null;
+  }
+  const s = APP.check(V.cookieValue(req.headers.cookie, V.APP_COOKIE));
+  if (!s.ok) {
+    if (url.pathname === "/") send(res, 401, NOTICE("Open it from the app", "This page opens inside the Jori app: tap the link there."), { "Content-Type": "text/html; charset=utf-8" });
+    else send(res, 401, { error: "not signed in" });
+    return null;
+  }
+  return { ok: true, email: `app:${s.deviceId.slice(0, 12)}` };
+}
+
 // ── the HTTP side ──────────────────────────────────────────────────────────
 function send(res, status, body, headers = {}) {
   const buf = Buffer.isBuffer(body) ? body : Buffer.from(typeof body === "string" ? body : JSON.stringify(body));
@@ -250,14 +329,19 @@ async function waitFrame(after) {
   });
 }
 
-async function handle(req, res) {
+async function handle(req, res, listener) {
   const url = new URL(req.url, "http://localhost");
-  if (url.pathname === "/healthz") return send(res, 200, { ok: true });
-
-  const who = await V.authorize(req);
-  if (!who.ok) {
-    if (who.status !== 403 || url.pathname === "/") log(`refused ${req.method} ${url.pathname}: ${who.reason}`);
-    return send(res, who.status, { error: "not allowed" });
+  let who;
+  if (listener === "app") {
+    who = await appGate(req, res, url);
+    if (!who) return;
+  } else {
+    if (url.pathname === "/healthz") return send(res, 200, { ok: true });
+    who = await V.authorize(req);
+    if (!who.ok) {
+      if (who.status !== 403 || url.pathname === "/") log(`refused ${req.method} ${url.pathname}: ${who.reason}`);
+      return send(res, who.status, { error: "not allowed" });
+    }
   }
 
   if (req.method === "GET" && url.pathname === "/") {
@@ -291,11 +375,14 @@ async function handle(req, res) {
   return send(res, 404, { error: "not found" });
 }
 
-const server = http.createServer((req, res) => {
-  handle(req, res).catch((e) => {
-    log(`error ${req.method} ${req.url.split("?")[0]}: ${e.message}`);
+const serve = (listener) => (req, res) => {
+  handle(req, res, listener).catch((e) => {
+    log(`error ${listener} ${req.method} ${req.url.split("?")[0]}: ${e.message}`);
     if (/websocket|not reachable|gone|no tab/i.test(e.message)) dropSession(); // lang-regex-ok: our own and CDP's error strings, not anyone's words
     if (!res.headersSent) send(res, 502, { error: e.message });
   });
-});
-server.listen(PORT, HOST, () => log(`listening on ${HOST}:${PORT} (shop Chrome :${B.SHOP_PORT})`));
+};
+http.createServer(serve("web")).listen(PORT, HOST, () => log(`listening on ${HOST}:${PORT} (shop Chrome :${B.SHOP_PORT})`));
+// The app listener binds every interface (Tailscale's included) and answers
+// only Tailscale source addresses (appGate).
+if (APP_ON) http.createServer(serve("app")).listen(APP_PORT, "::", () => log(`app listener on [::]:${APP_PORT}, Tailscale addresses only`));

@@ -47,7 +47,7 @@ Never use the 9222 automation profile or the chrome-devtools MCP for a purchase:
 
 Open the site. If already signed in, skip to Step 2.
 
-**When you can't sign in yourself** (no stored login, a push/authenticator/passkey challenge, a captcha you can't solve, a bot wall), the user can do it from the phone: send ONE message with `~/Dev/jori/bin/shop-view link --site <site> [--url <login_url>]` — the shop Chrome's tab live on the phone behind the user's Cloudflare Access login, where the user taps and types to sign in and taps **Done** — and stop; re-queue on the user's "try again". `shop-view done --since <unix>` shows whether the user tapped Done. Never tell the user to run a command on the host.
+**When you can't sign in yourself** (no stored login, a push/authenticator/passkey challenge, a captcha you can't solve, a bot wall), the user can do it from the phone: send ONE message with `~/Dev/jori/bin/shop-view link --site <site> [--url <login_url>]` — the shop Chrome's tab live in the Jori app's shop browser (over Tailscale, opened with Face ID; the Cloudflare web page only where the app address is not configured), where the user taps and types to sign in and taps **Done**. Say what the user needs to do there ("sign in to hertz.com", "type the card's security code") — and stop; re-queue on the user's "try again". `shop-view done --since <unix>` shows whether the user tapped Done. Never tell the user to run a command on the host.
 
 1. Find the username field's selector, then:
    `~/Dev/jori/bin/purchase fill <site> --field username --selector '<css>'`
