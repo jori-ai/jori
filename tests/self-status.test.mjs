@@ -65,6 +65,7 @@ async function snap(extra = {}) {
       : q.startsWith("action_approvals") ? [] : [{ id: "si1", summary: "Better card step", status: "pending", created_at: iso(30) }],
     openQuestions: async () => [{ id: "q1", question: "Which hotel do you prefer?", asks: 2, first_asked_at: iso(600) }],
     watchCounts: async () => ({ active: 3, paused: 1 }),
+    procAlive: () => true,
     ...extra,
   });
 }
@@ -179,6 +180,26 @@ test("render groups by bucket with ages", async () => {
   assert.match(text, /needs_card \(a later request followed: pq_2\), 80m ago \(pq_1\)/);
   assert.match(text, /Waiting on the user/);
   assert.ok(text.includes("Supervisors: chat up, idle | ops up, busy (purchase), 1 queued"));
+});
+
+test("a build left in running/ is stuck when its process is gone or it is past the timeout", async () => {
+  const root = fixture();
+  fs.mkdirSync(path.join(root, "data/build-queue/running"), { recursive: true });
+  fs.writeFileSync(path.join(root, "data/build-queue/running/r1.json"), JSON.stringify({ spec: "x", requested_at: iso(20) }));
+  fs.writeFileSync(path.join(root, "data/build-queue/running/r2.json"), JSON.stringify({ spec: "y", requested_at: iso(200) }));
+  const run = (alive) => collect({ root, now: NOW, sections: ["builds"], procAlive: () => alive, remote: false });
+  let s = await run(true);
+  assert.equal(find(s, "builds", "r1").bucket, "running");
+  assert.match(find(s, "builds", "r2").state, /past the build timeout/);
+  s = await run(false);
+  assert.match(find(s, "builds", "r1").state, /no build process alive/);
+  s = await run(null); // pgrep could not tell: nothing inferred
+  assert.equal(find(s, "builds", "r1").bucket, "running");
+});
+
+test("purchase approvals not read is said, not hidden", async () => {
+  const s = await snap({ supabase: null, sections: ["purchases"] });
+  assert.ok(s.unknown.some((u) => u.section === "purchases" && /not read/.test(u.why)));
 });
 
 test("parsers", () => {

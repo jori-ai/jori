@@ -723,7 +723,11 @@ if (!AS_OF) {
   try {
     const SS = await import("../lib/self-status.mjs");
     const snap = await SS.collect({ remote: false, sections: ["dispatches", "purchases", "builds", "jobs"] });
-    if (snap.items.length) workStateText = SS.render(snap, { tz: instance().tz || undefined, doneLimit: 5, footer: false }).slice(0, 2200);
+    // Routine finished dispatches are noise here; the work items are what a message can claim about.
+    snap.items = snap.items.filter((i) => !(i.section === "dispatches" && i.bucket === "done"));
+    snap.counts = Object.fromEntries(SS.BUCKETS.map((b) => [b, snap.items.filter((i) => i.bucket === b).length]));
+    snap.unknown = [];
+    if (snap.items.length) workStateText = SS.render(snap, { tz: instance().tz || undefined, doneLimit: 8, footer: false, compact: true }).slice(0, 3500);
   } catch {}
 }
 
