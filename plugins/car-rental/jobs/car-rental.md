@@ -76,7 +76,7 @@ Direct sites matter for two reasons: member/discount rates and loyalty status. C
 ## Step 5 — choose
 
 1. Keep only qualifying cards: a company and class the preferences allow, unlimited mileage, automatic, and a counter open at pickup and at return (Step 2).
-2. Rank by **all-in total** for the whole rental. Within ~$40 of each other, prefer free cancellation / pay-later, then a counter in the terminal, then a company where the user has status (skip-the-counter matters on a late-night pickup).
+2. Rank by **all-in total** for the whole rental, with **pay later as the default**: a pay-now rate wins only if it is cheaper than the best qualifying pay-later rate by more than the preferences page's threshold (10% unless the page says otherwise). Otherwise recommend the pay-later rate and show the pay-now saving as a runner-up line. Among pay-later rates within ~$40 of each other, prefer free cancellation, then a counter in the terminal, then a company where the user has status (skip-the-counter matters on a late-night pickup).
 3. Value a status perk only as far as the preferences page does; say what you weighed ("Hertz is $70 more than Thrifty for the same small SUV, with the counter skip on a 9 pm arrival").
 
 ## Step 6 — deliver
