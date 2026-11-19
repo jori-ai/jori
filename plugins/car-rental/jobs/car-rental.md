@@ -25,6 +25,12 @@ The page is the authority for **which classes** and **which companies** count, a
 
 It returns `billing_days` (24-hour periods from pickup; companies bill an extra day after a short grace), `return_by_for_same_price` (a later return that costs nothing more: mention it when it is hours later than planned) and the two aggregator links, already filtered to the companies and classes and sorted by total price.
 
+**Counter hours decide what qualifies.** Before ranking, read each candidate company's hours at that exact location (its own location page, e.g. thrifty.com / hertz.com "locations"; an aggregator's "open hours" line only as a fallback) for both dates. A company qualifies only if its counter is open at pickup and at return:
+- **Pickup outside hours:** not qualifying. A late flight that lands after closing is a no-show risk; say which companies stay open late enough.
+- **Return outside hours:** not qualifying unless the company's own page states an after-hours key drop at that location. A third-party mention does not count. Even then, flag that the renter usually stays responsible for the car until opening.
+- For a disqualified company, price the nearest workable alternative that costs no extra billing day: return before closing the evening before (say how long the wait at the airport is), or a company open at that hour (24-hour counters are often the pricier brands). Then show the trade-off.
+- Write the hours you found into the reply and the work record: company, location, hours, source, and whether pickup and return fall inside them. Never assume an airport counter is open around the clock.
+
 ## Step 3 — aggregators first (in settings order)
 
 Use the ops agent's `chrome-devtools` MCP (`navigate_page` to the link, wait ~8 s, then `evaluate_script`).
@@ -69,7 +75,7 @@ Direct sites matter for two reasons: member/discount rates and loyalty status. C
 
 ## Step 5 — choose
 
-1. Keep only qualifying cards: a company and class the preferences allow, unlimited mileage, automatic.
+1. Keep only qualifying cards: a company and class the preferences allow, unlimited mileage, automatic, and a counter open at pickup and at return (Step 2).
 2. Rank by **all-in total** for the whole rental. Within ~$40 of each other, prefer free cancellation / pay-later, then a counter in the terminal, then a company where the user has status (skip-the-counter matters on a late-night pickup).
 3. Value a status perk only as far as the preferences page does; say what you weighed ("Hertz is $70 more than Thrifty for the same small SUV, with the counter skip on a 9 pm arrival").
 
