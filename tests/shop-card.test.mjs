@@ -248,6 +248,20 @@ test("end to end: fills a processor's cross-origin frame with real keys, clicks 
   assert.equal(r.button, "continue");
   assert.equal(JSON.stringify(r).includes("4111"), false, "the result never carries a value");
 
+  // The review step can vouch for the last 4 from the frame's own field (true/false only).
+  s = await B.connect(tab);
+  assert.equal(await C.cardNumberEndsWith(s, { site: "merchant.test", last4: "1111", processors: ["processor.test"] }), true);
+  s.close();
+  s = await B.connect(tab);
+  assert.equal(await C.cardNumberEndsWith(s, { site: "merchant.test", last4: "4242", processors: ["processor.test"] }), false);
+  s.close();
+  s = await B.connect(tab);
+  assert.equal(await C.cardNumberEndsWith(s, { site: "merchant.test", last4: "1111", processors: ["stripe.com"] }), false, "a processor not on the list cannot vouch");
+  s.close();
+  s = await B.connect(tab);
+  assert.equal(await C.cardNumberEndsWith(s, { site: "other.test", last4: "1111", processors: ["processor.test"] }), false);
+  s.close();
+
   await B.sleep(300);
   const inFrame = await frameEval(chrome.port, "pay.processor.test", `({
     number: document.getElementById("card-number").value, month: document.getElementById("card-expiry-month").value,

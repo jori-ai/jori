@@ -110,7 +110,16 @@ async function request() {
   try {
     page = await B.pageState(s);
     if (!P.hostMatchesSite(page.url, draft.site)) die(`shop tab is on ${page.url}, not ${draft.site}`, 3);
-    const match = P.pageMatchesItem(page.text, draft);
+    let match = P.pageMatchesItem(page.text, draft);
+    // A card typed into a processor's frame (purchase card) is not in the
+    // page's text; the frame's own number field can vouch for the last 4.
+    const cardMiss = `card ending ${draft.card.last4}`;
+    if (!match.ok && match.missing.includes(cardMiss)) {
+      const s2 = await B.connect(tab);
+      let inFrame = false;
+      try { inFrame = await C.cardNumberEndsWith(s2, { site: draft.site, last4: draft.card.last4 }); } catch { inFrame = false; } finally { s2.close(); }
+      if (inFrame) { const missing = match.missing.filter((m) => m !== cardMiss); match = { ok: missing.length === 0, missing }; }
+    }
     if (!match.ok) die(`the review page does not show: ${match.missing.join("; ")}. Re-read the page; do not loosen the item.`, 3);
     const btn = await B.describeSelector(s, selector);
     if (!btn?.ok) die(`--place-selector must match exactly one visible, enabled element (matched ${btn?.count ?? 0})`, 3);
