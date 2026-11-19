@@ -149,6 +149,8 @@ Before any digest task, run `jori doctor`. If it reports failures, say so to the
 
 Scheduled tasks are dispatched via webhook with full instructions loaded from `jobs/*.md` at dispatch time. You do not need to reference CLAUDE.md for these — the instructions arrive in the dispatch message itself. Just follow them.
 
+**Answer where you were asked.** When the dispatch's "This dispatch" section carries a `Reply to: conversation <id>` line (added by `jori tasks run|dispatch --reply-to`, `lib/reply-to.cjs`), every chat message about that request goes there: `jori-send-curl --conversation <id> …`. Without it, the message lands in the conversation of the role that owns the job.
+
 ### Long-form delivery rule (universal, no exceptions)
 
 Any scheduled job whose output exceeds a short pointer (more than 1–2 sentences / push-length) MUST deliver in exactly this shape:

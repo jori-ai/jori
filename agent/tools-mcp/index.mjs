@@ -39,7 +39,14 @@ import { localLlmEmbed } from "../../lib/local-llm.mjs";
 // ticker fires only wakes whose session_id matches its Agent's id, "chat").
 import { checkLater } from "../core/check-later.mjs";
 import { requestFork, listForks, MAX_INFLIGHT_FORKS } from "../core/fork-queue.mjs";
-const AGENT_ID = process.env.JORI_AGENT_ID || "chat";
+// No default: a session whose MCP config names no agent (the ops tier, a role
+// session, a chat-build, any ephemeral run on the ops-agent config) used to be
+// filed as "chat", so its background tasks ran under the chat agent and their
+// answers went to the chat agent, never back to the session that asked
+// (2026-11-18: the travel manager's car pricing reached the chief of staff).
+const AGENT_ID = process.env.JORI_AGENT_ID || "unscoped";
+// Self-wakes and forks only where the chat supervisor drains them (profiles.mjs).
+const LOOP_TOOLS_SERVED = servesLoopTools(AGENT_ID);
 // WP11 self-improvement (gated). tools-mcp SERVES owner-approved ext/ modules as
 // real tools; the chat agent (only) can PROPOSE new ones — which stay staged and
 // inert until the user approves out-of-band via `bin/self-improve`.
@@ -50,7 +57,7 @@ import { createToolRegistry } from "../core/tool-registry.mjs";
 import { createPluginLoader } from "../plugins/loader.mjs";
 import * as siStore from "../core/message-store.mjs";
 import { installRoot, installTools } from "../../lib/root.cjs";
-import { resolveProfile, allowsTool, callRefusal } from "./profiles.mjs";
+import { resolveProfile, allowsTool, callRefusal, LOOP_TOOLS, servesLoopTools } from "./profiles.mjs";
 
 const exec = promisify(execFile);
 const BIN = installTools("bin");
@@ -961,6 +968,10 @@ if (process.env.JORI_AGENT_ID === "chat") {
 // Tool profile (JORI_TOOL_PROFILE, set per launcher in its MCP config):
 // list and serve only that profile's tools (profiles.mjs,
 // agent/config/tool-profiles.json).
+if (!LOOP_TOOLS_SERVED) {
+  for (let i = TOOLS.length - 1; i >= 0; i--) if (LOOP_TOOLS.has(TOOLS[i].name)) TOOLS.splice(i, 1);
+}
+
 const PROFILE = resolveProfile(process.env.JORI_TOOL_PROFILE);
 if (PROFILE.warning) console.error(`[tools-mcp] ${PROFILE.warning}`);
 else console.error(`[tools-mcp] tool profile "${PROFILE.name}": ${TOOLS.filter((t) => allowsTool(PROFILE.profile, t.name)).length} of ${TOOLS.length} tools`);

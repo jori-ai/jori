@@ -146,7 +146,7 @@ function cmdHelp(extensions = []) {
   console.log('  tasks [list] [--json]         list automated tasks');
   console.log('  tasks show <name>             show full task detail');
   console.log('  tasks match "<phrase>"        find task by natural-language phrase');
-  console.log('  tasks run <name> [--task T]   dispatch task via webhook (T: this request, for a job)\n');
+  console.log('  tasks run <name> [--task T] [--reply-to CONV]   dispatch task via webhook (T: this request, for a job; CONV: the conversation the answer goes to)\n');
   console.log(c.bold('HEALTH'));
   console.log('  whereami [--json|--banner|--role]  which machine am I on (the production host vs another)');
   console.log('  status                        system health dashboard + what Jori is doing');
@@ -385,10 +385,16 @@ function postWebhook(url, body) {
 
 function cmdTasksRun(args) {
   // The first bare word that is not a flag's value (`--task "…" car-rental`).
-  const name = args.find((a, i) => !a.startsWith('--') && args[i - 1] !== '--task');
-  if (!name) die('tasks run: missing <name>. Usage: jori tasks run <name> [--task "this request"] [--dry-run]');
-  const extra = args.includes('--task') ? getFlag(args, '--task') : null;
+  const name = args.find((a, i) => !a.startsWith('--') && args[i - 1] !== '--task' && args[i - 1] !== '--reply-to');
+  if (!name) die('tasks run: missing <name>. Usage: jori tasks run <name> [--task "this request"] [--reply-to <conversation>] [--dry-run]');
+  let extra = args.includes('--task') ? getFlag(args, '--task') : null;
   if (args.includes('--task') && !(extra && extra.trim())) die('tasks run: --task needs the request text, e.g. --task "Lisbon airport; Dec 3 10:00; Dec 9 18:00"');
+  // --reply-to <conversation>: the job answers in the conversation that asked,
+  // not in the one of the role that owns the job (lib/reply-to.cjs).
+  if (args.includes('--reply-to')) {
+    try { extra = require(path.join(TOOLS, 'lib/reply-to.cjs')).withReplyTo(extra, getFlag(args, '--reply-to')); }
+    catch (e) { die(`tasks run: ${e.message}`); }
+  }
   const task = loadTasks().find(t => t.name === name);
   if (!task) die(`No task named '${name}'. Try: jori tasks`);
   // A plugin's task has no webhook of its own: `jori dispatch <job>` sends it

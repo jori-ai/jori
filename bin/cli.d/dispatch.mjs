@@ -69,13 +69,19 @@ function jobFiles() {
 
 export default {
   summary: "POST a job to its tier's supervisor webhook (no args: list jobs)",
-  usage: "dispatch <job> [--task T] [--source S] | dispatch --task T [--source S]",
+  usage: "dispatch <job> [--task T] [--reply-to CONV] [--source S] | dispatch --task T [--source S]",
   async run(args, ctx) {
     const { c, die, getFlag, hasFlag } = ctx;
-    const job = args.find((a, i) => !a.startsWith("--") && !["--task", "--port", "--source"].includes(args[i - 1]));
-    const task = getFlag(args, "--task");
+    const job = args.find((a, i) => !a.startsWith("--") && !["--task", "--port", "--source", "--reply-to"].includes(args[i - 1]));
+    // --reply-to <conversation>: the job answers in the conversation that asked
+    // (lib/reply-to.cjs), not in the one of the role that owns it.
+    let task = getFlag(args, "--task");
+    if (args.includes("--reply-to")) {
+      try { task = require("../../lib/reply-to.cjs").withReplyTo(task, getFlag(args, "--reply-to")); }
+      catch (e) { die(e.message); }
+    }
     if ((!job && !task) || isHelp(args)) {
-      console.log("Usage: jori dispatch <job> [--task \"extra instructions\"] [--source S] [--port N] [--dry-run]");
+      console.log("Usage: jori dispatch <job> [--task \"extra instructions\"] [--reply-to <conversation>] [--source S] [--port N] [--dry-run]");
       console.log("       jori dispatch --task \"what to do\" [--source S]   # a free-text task, to ops");
       console.log("       jori dispatch            # list dispatchable jobs");
       if (!job && !isHelp(args)) {

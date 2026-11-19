@@ -198,6 +198,11 @@ while [[ $# -gt 0 ]]; do
     --skip-precheck)  SKIP_PRECHECK=true; shift ;;
     --intent)         INTENT="$2"; shift 2 ;;
     --role)           ROLE_FLAG="$2"; shift 2 ;;
+    # The conversation this message belongs in (role:<id> or group:<uuid>):
+    # a job answering a request passes the one the request came from
+    # (`jori tasks run … --reply-to`, lib/reply-to.cjs). Unset: the database
+    # files it by its sender, the role's own conversation (migration 0180).
+    --conversation)   CONVERSATION_FLAG="$2"; shift 2 ;;
     --agent)          AGENT="$2"; shift 2 ;;
     --channel)        CHANNEL="$2"; shift 2 ;;
     --question)       IS_QUESTION=true; shift ;;
@@ -1165,6 +1170,14 @@ if [ -z "$SENDER_ROLE" ] && { [ "$CHANNEL" = "chat" ] || [ "$CHANNEL" = "questio
     const r=o.roleFor({job:process.env.JORI_SIGN_AS||process.env.JORI_JOB||null,intent:process.env.ORG_INTENT||null});
     if(r&&!r.chief_of_staff)process.stdout.write(r.id);' "$JORI_INSTALL_TOOLS/lib/org.cjs" 2>/dev/null)"
 fi
+JSON_CONVERSATION=""
+if [ -n "${CONVERSATION_FLAG:-}" ]; then
+  if "${JORI_NODE:-node}" -e 'process.exit(require(process.argv[1]).validConversation(process.argv[2]) ? 0 : 1)' "$JORI_INSTALL_TOOLS/lib/reply-to.cjs" "$CONVERSATION_FLAG" 2>/dev/null; then
+    JSON_CONVERSATION=",\"conversation_id\":\"${CONVERSATION_FLAG}\""
+  else
+    echo "jori-send-curl: --conversation \"$CONVERSATION_FLAG\" is not a conversation id (role:<id> or group:<uuid>); sending without it" >&2
+  fi
+fi
 JSON_SENDER=""
 case "$SENDER_ROLE" in
   ""|*[!a-z0-9-]*) ;;
@@ -1319,7 +1332,7 @@ if [ -n "$CAPTURE_ID_FILE" ] || [ -n "$GATE_REVIEW_FILE" ]; then
     -H "Authorization: Bearer ${SUPABASE_KEY}" \
     -H "Content-Type: application/json" \
     -H "Prefer: ${PREFER}" \
-    -d "{\"role\":\"assistant\",\"content\":${JSON_MESSAGE},\"read\":false,\"channel\":${JSON_CHANNEL}${JSON_SENDER}${JSON_METADATA}}")
+    -d "{\"role\":\"assistant\",\"content\":${JSON_MESSAGE},\"read\":false,\"channel\":${JSON_CHANNEL}${JSON_SENDER}${JSON_CONVERSATION}${JSON_METADATA}}")
 else
   HTTP_CODE=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 \
     -X POST "${SUPABASE_URL}/rest/v1/jori_messages" \
@@ -1327,7 +1340,7 @@ else
     -H "Authorization: Bearer ${SUPABASE_KEY}" \
     -H "Content-Type: application/json" \
     -H "Prefer: ${PREFER}" \
-    -d "{\"role\":\"assistant\",\"content\":${JSON_MESSAGE},\"read\":false,\"channel\":${JSON_CHANNEL}${JSON_SENDER}${JSON_METADATA}}")
+    -d "{\"role\":\"assistant\",\"content\":${JSON_MESSAGE},\"read\":false,\"channel\":${JSON_CHANNEL}${JSON_SENDER}${JSON_CONVERSATION}${JSON_METADATA}}")
 fi
 
 if [ "$HTTP_CODE" = "201" ]; then

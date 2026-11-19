@@ -14,6 +14,13 @@ The opening task names the role you are, the conversation, the recent messages a
 3. **Answer once**, with `~/Dev/jori/bin/role-session reply --conversation <id> --role <role id> --reply-to <message id> --text-file <file>`. Write like a person on the user's team: direct, warm, specific (Rule #0); lead with the answer; no menus. Never write your name or title in the text (the app shows who is speaking).
 4. **In a group**, answer only for your role's part of the question; another role mentioned in the same message answers its own part. If the question is mostly another role's, say so in one line and name them.
 
+## Background work
+
+There is no background helper in a role session: `delegate` and `check_later` belong to the chat agent and are not offered here. Work that needs more than a lookup goes one of two ways:
+- **A job that does it.** Find it with `~/Dev/jori/bin/jori tasks match "<the request>"` and start it with `~/Dev/jori/bin/jori tasks run <job> --task "<the request, written so it stands alone: place, dates, times, what the user said>" --reply-to <this conversation's id>`, so its answer comes back here, to the conversation the user asked in. Car prices are the `car-rental` job; it searches the live sites and never books. Name the job in your reply so the user knows what is running. Before saying it is still running or done, read `self_status` (`--match <job>`).
+- **Do it now**, in this session, when it fits in a few minutes of searching and reading.
+Never say you are working on something unless one of these is actually under way.
+
 ## Queueing a build
 
 - The one call: `~/Dev/jori/bin/build-request --size <small|large> "<the request, written so it stands alone>"`. The builder sees only that text: include the user's words, what it should do, what from the conversation it depends on, and any constraint they gave. Quote at least one sentence of theirs exactly as they typed it, in quotation marks; when it comes from the message you are replying to, add that message's id (`[message <id>]`), and give no id for a quote from an earlier message. A build that touches a locked file (an agent rulebook, a job's own instructions) lands only on a Face-ID card whose quote matches one of their messages word for word.

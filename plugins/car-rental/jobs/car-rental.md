@@ -81,7 +81,7 @@ Direct sites matter for two reasons: member/discount rates and loyalty status. C
 
 ## Step 6 — deliver
 
-- **Chat reply** (one message, the short-bullet style): the window and billing days, the pick (company · class · model · all-in total · pay-later/now · cancellation · where to pick up), the two best alternatives, sources that could not be read, and one line on how to book (the link). End with a question only if a real choice remains.
+- **Chat reply** (one message, the short-bullet style), in the conversation that asked: when "This dispatch" names one (`Reply to: conversation <id>`), pass `--conversation <id>` to `jori-send-curl`. the window and billing days, the pick (company · class · model · all-in total · pay-later/now · cancellation · where to pick up), the two best alternatives, sources that could not be read, and one line on how to book (the link). End with a question only if a real choice remains.
 - If the comparison ran over more than ~6 qualifying options, also send the full table by email (long-form delivery rule, `agent/ops-agent/CLAUDE.md`).
 - **Work record** in the same turn (`agent/CLAUDE.md` § Work records): `work-record find "rental car <place> <month>"` first; then `add` (or `update`) with the bottom line and every option with its numbers.
 

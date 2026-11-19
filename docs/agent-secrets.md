@@ -102,7 +102,7 @@ The profiles were drawn from 30 days of real `mcp__tools__*` calls per agent (20
 
 An unset or unknown profile serves everything and warns on stderr (`[tools-mcp] JORI_TOOL_PROFILE is not set`).
 
-`JORI_AGENT_ID` is a separate setting and stays as it is. The ops cwd's `.mcp.json` leaves it unset on purpose. tools-mcp then keys `check_later` to `chat`, and the chat supervisor's ticker is the only one that fires wakes.
+`JORI_AGENT_ID` is a separate setting. Only the chat agent's config sets it to `chat`, and only the chat supervisor drains self-wakes and forks, so tools-mcp offers `check_later`, `delegate` and `delegate_status` only where `JORI_AGENT_ID` is `chat` (2026-11-18). Before that an unset id meant `chat`: a role session's `delegate` and a build's `check_later` were run and answered under the chat agent instead of coming back to the session that asked. Every other session does the waiting or research itself, or dispatches a job.
 
 **Not a security boundary while the agent has Bash.** `bin/imsg`, `bin/homectl` and `bin/email-send` reach the same actions. A profile takes the tool out of the model's context and its call path. The containment is § 1 and § 2, and later a broker.
 

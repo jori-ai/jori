@@ -990,7 +990,10 @@ async function handleIncomingMessage(row) {
     const [recallBlock, replyBlock, humBlock, improvementBlock, foundBlock] =
       await Promise.all([recallP, replyBlockP, humBlockP, improvementBlockP, foundBlockP]);
     profLog(msgId, "t1b_context", `recall=${recallBlock ? "yes" : "no"}`);
-    const builtContent = `${recallBlock}${convoBlock}${replyBlock}${humBlock}${improvementBlock}${foundBlock}New message from ${OWNER}:\n\n${text}\n\n[Current time: ${localTimeStr} ${tzAbbr}]${locationLine}${shareLine}`;
+    // The conversation the user wrote in, so a job started for this request can
+    // answer there (`jori tasks run … --reply-to <id>`, lib/reply-to.cjs).
+    const conversationLine = row.conversation_id ? `\n[Conversation: ${row.conversation_id}]` : "";
+    const builtContent = `${recallBlock}${convoBlock}${replyBlock}${humBlock}${improvementBlock}${foundBlock}New message from ${OWNER}:\n\n${text}\n\n[Current time: ${localTimeStr} ${tzAbbr}]${locationLine}${shareLine}${conversationLine}`;
     const DISPATCH_URL = process.env.JORI_DISPATCH_URL;
 
     if (DISPATCH_URL) {

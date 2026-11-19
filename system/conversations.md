@@ -18,6 +18,8 @@ Triggers: a row that names only a channel (or only a `sender`) is filed in the m
 - **Jobs** (`jori-send-curl`): the role that owns the job (or `--role <id>`) goes on the row as `sender`, so it lands in that role's conversation. The coordinator's own messages (hum, digests it owns) stay in its conversation. Emails and pushes are signed by role (system/org.md).
 - **Questions** follow the same rule: a question lives in the conversation of the role whose job asked.
 - **Replies** in the coordinator's conversation come from the chat agent (phone-channel `reply`), written into the conversation the user wrote in.
+- **A job started for a request answers where it was asked** (2026-11-18; the owner: "car price request should go back to the channel that requested them"). The asker passes `--reply-to <conversation id>` to `jori tasks run` / `jori dispatch` (`lib/reply-to.cjs` adds a `Reply to: conversation <id>` line to the task). The job then sends with `jori-send-curl --conversation <id>`, which writes `conversation_id` on the row, so it lands in that conversation, still signed by the job's role (`agent/ops-agent/CLAUDE.md` § Scheduled Jobs). The chat agent reads the id from the `[Conversation: …]` line phone-channel adds to each message; a role session has it in its task.
+- **No background helpers outside the chat agent.** `delegate` and `check_later` are drained only by the chat supervisor, so tools-mcp offers them only where `JORI_AGENT_ID` is `chat` (`agent/tools-mcp/profiles.mjs` `servesLoopTools`). Before that an unset id meant `chat`, so a role's research ran under the chat agent and its answer went to the coordinator. A role does the work in its own session or starts a job.
 
 ## The user writing to a role
 

@@ -5,7 +5,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { loadProfiles, resolveProfile, allowsTool, callRefusal } from "../agent/tools-mcp/profiles.mjs";
+import { loadProfiles, resolveProfile, allowsTool, callRefusal, LOOP_TOOLS, servesLoopTools } from "../agent/tools-mcp/profiles.mjs";
 
 const noLocal = fs.mkdtempSync(path.join(os.tmpdir(), "tp-"));
 const P = loadProfiles({ localDir: noLocal });
@@ -61,4 +61,10 @@ test("an installation profile replaces the kernel one", () => {
   const L = loadProfiles({ localDir: dir });
   assert.equal(allowsTool(L.ops, "lock_unlock"), true);
   assert.equal(allowsTool(L.ops, "x"), false);
+});
+
+test("self-wakes and forks are offered only to the chat agent, whose supervisor drains them", () => {
+  assert.deepEqual([...LOOP_TOOLS].sort(), ["check_later", "delegate", "delegate_status"]);
+  assert.equal(servesLoopTools("chat"), true);
+  for (const id of [undefined, "", "unscoped", "ops", "ops-light", "ops-haiku", "role-travel-manager"]) assert.equal(servesLoopTools(id), false, String(id));
 });

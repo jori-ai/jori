@@ -63,3 +63,10 @@ export function callRefusal(profileName, profile, name, args = {}) {
   }
   return null;
 }
+
+// Self-wakes and forks are drained only by the chat supervisor (its fork and
+// check-later ticks, keyed to the agent id "chat"). A session with any other id,
+// or none, would file them where nothing fires them or where their answer goes
+// to the chat agent instead of back to the asker, so they are not offered there.
+export const LOOP_TOOLS = new Set(["check_later", "delegate", "delegate_status"]);
+export function servesLoopTools(agentId) { return agentId === "chat"; }
