@@ -23,7 +23,8 @@
       "reservoir-mark-done",
       "cruise-watch",
       "festival-watch",
-      "places-saved-refresh"
+      "places-saved-refresh",
+      "car-rental"
     ],
     "intents": [
       "flights",
