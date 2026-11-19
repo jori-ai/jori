@@ -147,7 +147,7 @@ it("tasks run passes --task along: to a plugin job through jori dispatch, to a w
       const r = fx.run(["tasks", "run", ...args, "--dry-run"]);
       assert.equal(r.status, 0, r.stderr);
       assert.match(r.stdout, /tier chain: ops:/, "a chrome job goes to ops");
-      assert.ok(r.stdout.includes(JSON.stringify({ job: "rentals-demo", source: "jori-cli", task: "Lisbon airport; Dec 3; Dec 9" })), r.stdout);
+      assert.ok(r.stdout.includes(JSON.stringify({ job: "rentals-demo", source: "rentals-demo", task: "Lisbon airport; Dec 3; Dec 9" })), r.stdout);
     }
     const k = fx.run(["tasks", "run", "kernel-job", "--task", "only this week", "--dry-run"]);
     assert.equal(k.status, 0, k.stderr);
