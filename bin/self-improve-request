@@ -309,7 +309,26 @@ if (rebuildOf) {
 // than reverting. Only files that already EXIST are fingerprinted — a brand-new
 // file has no base to drift from — so `base_sha256` is deliberately partial,
 // and a card filed before this existed carries none at all and is unaffected.
-if (type === "code-fix") {
+//
+// A bundle made with `self-improve-bundle --base-rev` already carries the right
+// base: each file's hash at the commit its author read, and none for a file that
+// commit did not have (a new file). That one is kept. Re-fingerprinting the
+// working tree over it pinned a NEW file the author had written in place, and
+// when the author then removed it (as chat-build restores its tree after
+// filing) the applier refused the signed card as "no longer exists"
+// (2026-11-19, the Places one-day cap card). It also pinned whatever the tree
+// held at filing rather than what the change was written against.
+const supplied = item.base_sha256;
+const suppliedOk = supplied && typeof supplied === "object" && !Array.isArray(supplied)
+  && Object.entries(supplied).every(([rel, h]) => rel in (item.files || {}) && (h === null || /^[0-9a-f]{64}$/.test(String(h))));
+if (suppliedOk) {
+  // null = "a new file, no base" (self-improve-auto-apply's files-json form): nothing to pin.
+  for (const [rel, h] of Object.entries(supplied)) if (h === null) delete supplied[rel];
+} else if (supplied !== undefined) {
+  console.error("note: --files-json base_sha256 is not a {path: sha256|null} map over the card's files; fingerprinting the working tree instead");
+  delete item.base_sha256;
+}
+if (type === "code-fix" && !suppliedOk) {
   const base = {};
   for (const rel of Object.keys(item.files || {})) {
     const fp = path.resolve(ROOT, rel);

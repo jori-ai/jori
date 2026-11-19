@@ -32,15 +32,16 @@ const EXT = path.join(ROOT, "agent/ext");
 
 const { createUnifiedApproval } = await import(path.join(ROOT, "agent/core/self-improve-unified.mjs"));
 const { writebackApprovalOutcome } = await import(path.join(ROOT, "lib/system-issue-writeback.mjs"));
-const { rebaseDrifted, isLegacyArchCard } = await import(path.join(ROOT, "lib/self-improve-rebase.mjs"));
+const { rebaseDrifted, isLegacyArchCard, neverCommitted } = await import(path.join(ROOT, "lib/self-improve-rebase.mjs"));
 const { contentRefusals } = await import(path.join(ROOT, "lib/self-improve-content-check.mjs"));
 const { railsFor, isVerifiedOwnerRequest } = await import(path.join(ROOT, "lib/self-improve-landing.mjs"));
 // The installation's rebuild queue for a card whose apply hit a conflict
 // (optional: without it the "ask me in chat to rebuild it" notice stands).
 const REBUILD_LIB = path.join(ROOT, "lib/self-improve-rebuild.mjs");
-const { queueCardRebuild } = fs.existsSync(REBUILD_LIB)
+const { queueCardRebuild, queuedRebuild, withdrawQueuedRebuild } = fs.existsSync(REBUILD_LIB)
   ? await import(REBUILD_LIB)
-  : { queueCardRebuild: () => ({ queued: false, reason: "no rebuild queue in this installation" }) };
+  : { queueCardRebuild: () => ({ queued: false, reason: "no rebuild queue in this installation" }),
+      queuedRebuild: () => null, withdrawQueuedRebuild: () => ({ withdrawn: false }) };
 // After a card went in but is not running, and after its fix went in (lib/self-improve-repair.mjs).
 const { notLiveFollowUp, settleRepaired } = await import(path.join(ROOT, "lib/self-improve-repair.mjs"));
 const SIC_STATE = path.join(ROOT, "data/system-issue-review-state.json");
@@ -370,6 +371,13 @@ async function applyItem(row) {
         let onDisk;
         try { onDisk = fs.readFileSync(fp); } catch { onDisk = null; }
         if (onDisk === null) {
+          // A file in no commit of either repo was new with this card: its
+          // author wrote it in place before filing and it was removed since.
+          // Nothing landed there to revert, so it is created like any new file
+          // (lib/self-improve-rebase.mjs neverCommitted has the card this cost).
+          // A file that WAS committed and is gone now was deleted or moved on
+          // purpose, and the card stays refused.
+          if (await neverCommitted(ROOT, rel) === true) continue;
           return { ok: false, conflict: true, error: `${rel} no longer exists — it did when this card was authored, so its new content cannot be trusted. Nothing was written.` };
         }
         const now = sha(onDisk);
@@ -510,6 +518,10 @@ async function main() {
         console.error(`[si-approval] applied ${o.id}${retried ? " (retry)" : ""}`);
         const checked = (o.result?.notes || []).join(" ");
         await confirm(`✅ ${retried ? "Retried and applied" : "Approved + applied"}: ${label}. ${checked || o.result?.note || ""}`.trim());
+        // It went in after all, so a rebuild of it still waiting in the queue
+        // would only come back as a second card for a live change.
+        const wd = withdrawQueuedRebuild({ root: ROOT, id: o.id });
+        if (wd.withdrawn) console.error(`[si-approval] ${o.id} applied; withdrew its queued rebuild ${wd.requestId} (${wd.where})`);
         const orig = rowById[o.id]?.item_json?.rebuild_of;
         if (orig) {
           await settleRepaired({ origId: orig, fixId: o.id, fixTitle: titleOf[o.id] || o.id, store, goLive, commitMsgOf: fixMsg, confirm,
@@ -557,9 +569,17 @@ async function main() {
         const rb = queueCardRebuild({ root: ROOT, row: rowById[o.id] || { id: o.id }, error: o.result.error });
         if (rb.queued) console.error(`[si-approval] ${o.id} queued for rebuild as build request ${rb.requestId}`);
         else console.error(`[si-approval] ${o.id} not rebuilt: ${rb.reason}`);
+        // "Already rebuilt once" was said of a rebuild that had not even started
+        // (2026-11-19: it sat in held/ waiting on the allowance governor), so the
+        // notice now says where the queued one actually is.
+        const qr = rb.already ? queuedRebuild({ root: ROOT, id: o.id }) : null;
+        const after = !rb.already ? "Ask me in chat to rebuild it on the current code."
+          : qr && ["pending", "held", "running"].includes(qr.where)
+            ? `A rebuild of it is already ${qr.where === "running" ? "being built" : qr.where === "held" ? "queued, waiting for build allowance" : "queued"}; it will come back as a fresh card for your Face ID.`
+            : "It has already been rebuilt once, so ask me in chat if you want another try.";
         await confirm(rb.queued
           ? `⚠️ You approved "${title}", but the code it changes moved on before it could go in, so nothing was written. I'm rebuilding it on the current code now; it will come back as a fresh card for your Face ID.`
-          : `⚠️ ${retried ? `I retried "${title}" and it still didn't go in` : `You approved "${title}", but it didn't go in`}: ${o.result.error} ${rb.already ? "It has already been rebuilt once, so ask me in chat if you want another try." : "Ask me in chat to rebuild it on the current code."}`);
+          : `⚠️ ${retried ? `I retried "${title}" and it still didn't go in` : `You approved "${title}", but it didn't go in`}: ${o.result.error} ${after}`);
       } else {
         await confirm(retried
           ? `⚠️ I retried "${title}" and it still didn't go in: ${o.result.error} Ask me in chat to rebuild it on the current code.`

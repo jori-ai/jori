@@ -11,7 +11,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
-import { rebaseDrifted, findBaseContent, findMovedFiles, sha256, isLegacyArchCard, ARCH_REL, CHANGELOG_REL } from "../lib/self-improve-rebase.mjs";
+import { rebaseDrifted, findBaseContent, neverCommitted, findMovedFiles, sha256, isLegacyArchCard, ARCH_REL, CHANGELOG_REL } from "../lib/self-improve-rebase.mjs";
 
 function repo(initial) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "si-rebase-test-"));
@@ -223,4 +223,22 @@ test("auto-apply: an unknown --base-rev counts as moved, the safe direction", as
   const { dir } = repo(BASE);
   const r = await findMovedFiles(dir, { "f.txt": "x\n" }, { baseRev: "0123456789abcdef0123456789abcdef01234567" });
   assert.match(r.moved[0].reason, /not a commit/);
+});
+
+// A card's new file that its author wrote in place before filing gets a base
+// hash; if it is gone at apply time, it was never committed, so the applier
+// creates it instead of refusing the card (2026-11-19, the Places cap card).
+test("neverCommitted: an untracked or removed-before-commit file is new; a committed one is not", async () => {
+  const { dir, git } = repo(BASE);
+  process.env.JORI_OVERLAY_GIT_DIR = path.join(dir, "no-overlay");   // kernel repo only
+  try {
+    assert.equal(await neverCommitted(dir, "tests/new.test.mjs"), true);
+    assert.equal(await neverCommitted(dir, "f.txt"), false);
+    // Committed once and deleted since: still counts as committed (deleted on purpose).
+    fs.writeFileSync(path.join(dir, "old.txt"), "x"); git("add", "old.txt"); git("commit", "-qm", "old");
+    git("rm", "-q", "old.txt"); git("commit", "-qm", "rm old");
+    assert.equal(await neverCommitted(dir, "old.txt"), false);
+    // A history that cannot be read is not taken as "new".
+    assert.equal(await neverCommitted(path.join(dir, "not-a-repo-dir-xyz"), "f.txt"), null);
+  } finally { delete process.env.JORI_OVERLAY_GIT_DIR; }
 });
