@@ -670,9 +670,10 @@ One read of every place Jori's own work lives, so every agent (chat, the ops tie
 | jobs | `job-run` registry, `data/jobs/*.json` |
 | cron | `data/cron-runs.jsonl` (labels whose last run failed), `job-failure-watch` incidents and repair queue, `watchdog.log` `supervisor-code-reload … stale, holding` (new code not loaded) |
 | questions, approvals, roles, watches | `open-questions`, `action_approvals` + `self_improve_approvals`, `data/role-queue`, `watch_rules` counts |
+| said | what Jori last told the user: `jori_messages` rows with role `assistant` (every channel and conversation, with the speaking role's name), the last 24 h; with `--match`, the last 7 days of messages containing that text, so "what did I tell them about X?" sits next to the live state of X |
 | doctor | `jori doctor --json`, only with `--deep` (~10 s) |
 
-Each item is `{section, bucket, id, what, state, at, age_s, detail}`; buckets are running, waiting (on the user), stuck, failed, queued, done (last 24 h; purchases 48 h). States are the source's own words. A source that cannot be read is listed under `unknown`, never shown as empty. `--match` is a plain substring filter over our own records (an id, a site, a job name). The outbound precheck reads a local-only snapshot (dispatches, purchases, builds, jobs) as evidence, so a message about Jori's own work is judged against it rather than against silent memory. It does not cover what Jori said (`recall_events`, the transcript) or how Jori is built (this file).
+Each item is `{section, bucket, id, what, state, at, age_s, detail}`; buckets are running, waiting (on the user), stuck, failed, queued, done (last 24 h; purchases 48 h). States are the source's own words. A source that cannot be read is listed under `unknown`, never shown as empty. `--match` is a plain substring filter over our own records (an id, a site, a job name). The outbound precheck reads a local-only snapshot (dispatches, purchases, builds, jobs) as evidence, so a message about Jori's own work is judged against it rather than against silent memory. It does not cover how Jori is built (this file) or older history (`recall_events`, the full transcript).
 
 ## Live State Queries
 

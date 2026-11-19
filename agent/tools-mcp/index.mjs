@@ -115,7 +115,7 @@ const DEFAULT_INSTRUCTIONS = `${ASSISTANT}'s built-in tools. Keep responses shor
 ## Quick Reference
 
 ### Your own state
-- self_status — what ${ASSISTANT} is doing right now: dispatches, purchases + approvals, builds, background jobs, failing jobs, what waits on ${OWNER}. Read it before saying anything about your own work.
+- self_status — what ${ASSISTANT} is doing right now: dispatches, purchases + approvals, builds, background jobs, failing jobs, what waits on ${OWNER}, and what you last told ${OWNER}. Read it before saying anything about your own work.
 
 ### Loop primitives
 - check_later — one-shot self-wake after N seconds (survives a restart)
@@ -234,12 +234,12 @@ const TOOLS = [
   // ── Self-awareness: what Jori is doing right now (lib/self-status.mjs) ──
   {
     name: "self_status",
-    description: "What " + ASSISTANT + " is doing right now and how it is going, from live state: dispatches in flight and recent, purchases and their Face-ID approvals, builds, background jobs, failing scheduled jobs, open questions and approvals waiting on " + OWNER + ". Each item has its raw status and age. Call it BEFORE saying anything about the state of your own work (is it done, being built, waiting, why it stopped); never answer that from memory or a guess. `match` narrows to items containing that text (an id, a site, a job name).",
+    description: "What " + ASSISTANT + " is doing right now and how it is going, from live state: dispatches in flight and recent, purchases and their Face-ID approvals, builds, background jobs, failing scheduled jobs, open questions and approvals waiting on " + OWNER + ", and what you last told " + OWNER + " (with `match`: the last 7 days of your messages containing it). Each item has its raw status and age. Call it BEFORE saying anything about the state of your own work (is it done, being built, waiting, why it stopped); never answer that from memory or a guess. `match` narrows to items containing that text (an id, a site, a job name).",
     schema: {
       type: "object",
       properties: {
         match: { type: "string", description: "keep only items whose id/description/state contains this text (case-insensitive)" },
-        section: { type: "string", description: "comma-separated subset: dispatches,forks,purchases,builds,jobs,cron,questions,approvals,roles,watches,doctor" },
+        section: { type: "string", description: "comma-separated subset: dispatches,forks,purchases,builds,jobs,cron,questions,approvals,roles,watches,said,doctor" },
         deep: { type: "boolean", description: "also run the full health checks (jori doctor, ~10 s)" },
         json: { type: "boolean", description: "the full JSON instead of the compact text" },
       },

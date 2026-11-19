@@ -6,7 +6,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { collect, render, parseDispatchLog, cronFailures, codeReloadHolds, purchaseQueueItems, purchaseApprovalItems } from "../lib/self-status.mjs";
+import { collect, render, parseDispatchLog, cronFailures, codeReloadHolds, purchaseQueueItems, purchaseApprovalItems, saidEntries } from "../lib/self-status.mjs";
 
 const NOW = Date.parse("2026-03-10T15:00:00Z");
 const iso = (minAgo) => new Date(NOW - minAgo * 60e3).toISOString();
@@ -205,6 +205,31 @@ test("a build left in running/ is stuck when its process is gone or it is past t
 test("purchase approvals not read is said, not hidden", async () => {
   const s = await snap({ supabase: null, sections: ["purchases"] });
   assert.ok(s.unknown.some((u) => u.section === "purchases" && /not read/.test(u.why)));
+});
+
+test("said: what Jori last told the user, with the speaking role; match narrows it server-side", async () => {
+  const queries = [];
+  const rows = [{ id: "m1", sender: "travel-manager", channel: "chat", conversation_id: "role:travel-manager", content: "Still pricing the   car.", created_at: iso(30) }];
+  const supabase = async (q) => { queries.push(q); return q.startsWith("jori_messages") ? rows : []; };
+  const team = () => [{ id: "travel-manager", name: "Eve", title: "Travel" }];
+  let s = await snap({ sections: ["said"], supabase, team });
+  assert.equal(s.said.length, 1);
+  assert.deepEqual([s.said[0].who, s.said[0].channel, s.said[0].text, s.said[0].age_s], ["Eve (Travel)", "chat", "Still pricing the car.", 1800]);
+  assert.match(queries[0], /role=eq\.assistant/);
+  assert.doesNotMatch(queries[0], /ilike/);
+  const text = render(s);
+  assert.ok(text.includes("What Jori said to the user (last 24h"));
+  assert.ok(text.includes("- 30m ago, Eve (Travel) in chat: Still pricing the car."));
+  queries.length = 0;
+  s = await snap({ sections: ["said"], supabase, team, match: "car*,x" });
+  assert.ok(queries[0].includes("content=ilike.*car%20%20x*"));
+  assert.match(s.said_window, /7 days/);
+});
+
+test("said unreadable is unknown; an unknown sender keeps its id", async () => {
+  const s = await snap({ sections: ["said"], supabase: async () => null });
+  assert.ok(s.unknown.some((u) => u.section === "said"));
+  assert.equal(saidEntries([{ id: "x", sender: "ghost", content: "hi", created_at: iso(1) }], NOW, [])[0].who, "ghost");
 });
 
 test("parsers", () => {
