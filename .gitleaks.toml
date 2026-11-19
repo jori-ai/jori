@@ -12,6 +12,15 @@ paths = [
 ]
 regexes = [
   '''sb_publishable_[A-Za-z0-9_-]+''',
+  # The push relay's published test vector (docs/push-relay.md § Test vector),
+  # pinned in tests/push-relay.test.mjs and PushCrypto.swift. Exact values only,
+  # so a real key in those files still trips the scan.
+  '''eb0d6b0bf7f9b0ccab93db17a79d3086924558805faba532046598df906a8cb2''',
+  '''eb0fbfc69ad54040e850d4540543bbb2e164ffc918317022172a2afe56561596''',
+  '''66081ea6fd9afd60423eb6770910267685ccebd43de567c41ffbd8570eeed3c6''',
+  '''4de50aa9373518f43074567b90755f8e636cd4a3fe977005c57066410f49f167''',
+  '''c2VjcmV0LWZvci10ZXN0cy1vbmx5LTAxMjM0NTY3ODk''',
+  '''ZGV2aWNlLXNlY3JldC1mb3ItdGVzdHMtMDEyMzQ1Njc''',
 ]
 stopwords = [
   "cm9sZSI6ImFub24i",
