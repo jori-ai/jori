@@ -170,7 +170,7 @@ def preflight(tool, method, tier, n=1, caller=None, ask=None):
     if method == "searchText" and tier in places_guard.CAPPED_TIERS:
         # A paid tier always needs an opt-in: a tier missing from the policy
         # means nobody may buy it, never "uncapped".
-        caps = (policy.get("daily_live_caps") or {}).get(tier) or {}
+        caps = places_guard.daily_caps_for(policy, tier)  # daily_live_caps + today's dated override, if any
         if caller not in caps:
             raise PlacesRefused(4, f"'{caller}' has no opt-in for {tier} text search (lib/places-tier-policy.json). "
                                    "Use a cheaper mask (--lean, or drop --tier rich).")

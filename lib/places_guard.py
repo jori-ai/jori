@@ -87,6 +87,8 @@ def merge_policy(base, local):
     for k, v in (local or {}).items():
         if k == "assumed_free_per_month":
             out[k] = {**(base.get(k) or {}), **(v or {})}
+        elif k == "daily_cap_overrides":
+            out[k] = {**(base.get(k) or {}), **(v or {})}
         elif k == "daily_live_caps":
             caps = {t: dict(c) for t, c in (base.get(k) or {}).items()}
             for tier, c in (v or {}).items():
@@ -119,6 +121,24 @@ def _counts_file():
     return os.environ.get("PLACES_TIER_COUNTS_FILE") or COUNTS_FILE
 
 
+def daily_caps_for(policy, tier, day=None):
+    """The day's caps for one tier: daily_live_caps, raised by a dated one-off in
+    daily_cap_overrides ({"<YYYY-MM-DD>": {"<tier>": {"<caller>": N}}}, UTC day)
+    when that date is today. It only ever raises a cap (or opts a caller in for
+    that day); any other date does nothing, so it expires by itself. Twin of
+    places-guard.js dailyCapsFor."""
+    caps = dict((policy.get("daily_live_caps") or {}).get(tier) or {})
+    over = ((policy.get("daily_cap_overrides") or {}).get(day or _utc_day()) or {}).get(tier) or {}
+    for who, n in over.items():
+        try:
+            v = int(n)
+        except (TypeError, ValueError):
+            continue
+        if who not in caps or v > int(caps[who]):
+            caps[who] = v
+    return caps
+
+
 def _read_counts(path=None):
     try:
         with open(path or _counts_file()) as f:
@@ -140,7 +160,7 @@ def tier_cap_reason(caller, tier, policy_file=None, counts_file=None):
                 pol = json.load(f)
         else:
             pol = read_policy()
-        caps = pol.get("daily_live_caps", {}).get(tier, {})
+        caps = daily_caps_for(pol, tier)
     except Exception:
         return None  # no policy file — never block on absence of information
     caller = caller or "untagged"
