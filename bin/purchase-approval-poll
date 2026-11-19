@@ -33,6 +33,7 @@ const LOG = path.join(ROOT, "data/logs/purchase.log");
 
 const P = await import(path.join(ROOT, "lib/purchase-approval.mjs"));
 const B = await import(path.join(ROOT, "lib/shop-browser.mjs"));
+const C = await import(path.join(ROOT, "lib/shop-card.mjs"));
 
 function log(msg) {
   try { fs.mkdirSync(path.dirname(LOG), { recursive: true }); fs.appendFileSync(LOG, `${new Date().toISOString()} ${msg}\n`); } catch {}
@@ -91,7 +92,15 @@ async function execute(row) {
       return finish(row, "stale", { reason: `tab moved to ${before.url}` },
         `I didn't place ${what}: the checkout tab had moved off ${item.site}. Nothing was charged.`);
     }
-    const match = P.pageMatchesItem(before.text, item);
+    let match = P.pageMatchesItem(before.text, item);
+    // A card typed into a processor's frame is not in the page text; the
+    // frame's number field vouches for the last 4 (as at request time).
+    const cardMiss = `card ending ${item.card?.last4}`;
+    if (!match.ok && match.missing.includes(cardMiss)) {
+      let inFrame = false;
+      try { const s2 = await B.connect(tab); try { inFrame = await C.cardNumberEndsWith(s2, { site: item.site, last4: item.card.last4 }); } finally { s2.close(); } } catch { inFrame = false; }
+      if (inFrame) { const missing = match.missing.filter((m) => m !== cardMiss); match = { ok: missing.length === 0, missing }; }
+    }
     if (!match.ok) {
       return finish(row, "stale", { reason: "page changed", missing: match.missing },
         `I didn't place ${what}: the checkout page changed after you approved — it no longer shows ${match.missing.join(", ")}. Nothing was charged. Want me to take another look?`);
