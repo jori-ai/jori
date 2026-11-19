@@ -80,10 +80,36 @@ launchd_ensure_installed() {
   return 0
 }
 
+# launchd_run_direct <label> [job] — a host without launchd (Linux): run the
+# agent's program straight from here. The keychain that makes macOS go through
+# launchd doesn't exist there; Claude Code's login is a file cron can read.
+# One copy at a time, like kickstart without -k (launchd-run-direct.mjs).
+launchd_run_direct() {
+  local label="$1" job="${2:-$1}"
+  local logfile="$_LAUNCHD_KICK_TOOLS/agent/logs/watchdog.log"
+  local src="$_LAUNCHD_KICK_TOOLS/agent/launch-agents/$label.plist"
+  local node="${JORI_NODE:-$(command -v node || echo /opt/homebrew/bin/node)}"
+  local out
+  if [ ! -f "$src" ]; then
+    echo "$(date '+%Y-%m-%d %H:%M:%S') [$job] ERROR: no agent/launch-agents/$label.plist to run" >> "$logfile"
+    return 1
+  fi
+  if out=$(launchd_render_plist "$src" - | "$node" "$(dirname "${BASH_SOURCE[0]}")/launchd-run-direct.mjs" "$label" "$_LAUNCHD_KICK_TOOLS/data/locks" 2>&1); then
+    echo "$(date '+%Y-%m-%d %H:%M:%S') [$job] ran $label directly (no launchd on this host): $out" >> "$logfile"
+    return 0
+  fi
+  echo "$(date '+%Y-%m-%d %H:%M:%S') [$job] ERROR: running $label directly failed: ${out//$'\n'/ }" >> "$logfile"
+  return 1
+}
+
 launchd_kick() {
   local label="$1" job="${2:-$1}"
   local logfile="$_LAUNCHD_KICK_TOOLS/agent/logs/watchdog.log"
   local out note=""
+  if [ "$(uname -s)" != "Darwin" ]; then
+    launchd_run_direct "$label" "$job"
+    return $?
+  fi
   if out=$(launchctl kickstart "gui/$(id -u)/$label" 2>&1); then
     echo "$(date '+%Y-%m-%d %H:%M:%S') [$job] kicked launchd agent $label" >> "$logfile"
     return 0

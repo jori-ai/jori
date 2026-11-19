@@ -39,6 +39,11 @@
 		AA000015 /* JoriIntents.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB000016 /* JoriIntents.swift */; };
 		AA000016 /* NotificationService.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB000017 /* NotificationService.swift */; };
 		AA0000C1 /* AnnounceCache.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB0000C1 /* AnnounceCache.swift */; };
+		AA000A01 /* Pairing.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB000A01 /* Pairing.swift */; };
+		AA000A02 /* PairingView.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB000A02 /* PairingView.swift */; };
+		AA000A03 /* PushCrypto.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB000A03 /* PushCrypto.swift */; };
+		AA000A04 /* PushCrypto.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB000A03 /* PushCrypto.swift */; };
+		AA000A05 /* SupabaseConfig.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB000093 /* SupabaseConfig.swift */; };
 		AA0000C2 /* AnnounceCache.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB0000C1 /* AnnounceCache.swift */; };
 		AA0000C3 /* JoriIntents.appex in Embed App Extensions */ = {isa = PBXBuildFile; fileRef = CC000003 /* JoriIntents.appex */; platformFilter = ios; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
 		AA000017 /* JoriNotificationService.appex in Embed App Extensions */ = {isa = PBXBuildFile; fileRef = CC000002 /* JoriNotificationService.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
@@ -167,6 +172,9 @@
 		BB000015 /* SupabaseManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SupabaseManager.swift; sourceTree = "<group>"; };
 		BB000016 /* JoriIntents.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = JoriIntents.swift; sourceTree = "<group>"; };
 		BB0000C1 /* AnnounceCache.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AnnounceCache.swift; sourceTree = "<group>"; };
+		BB000A01 /* Pairing.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Pairing.swift; sourceTree = "<group>"; };
+		BB000A02 /* PairingView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PairingView.swift; sourceTree = "<group>"; };
+		BB000A03 /* PushCrypto.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PushCrypto.swift; sourceTree = "<group>"; };
 		BB000017 /* NotificationService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NotificationService.swift; sourceTree = "<group>"; };
 		BB000018 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
 		BB000019 /* JoriNotificationService.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = JoriNotificationService.entitlements; sourceTree = "<group>"; };
@@ -309,6 +317,8 @@
 				BB0000C2 /* AnnounceDiagnostics.swift */,
 				BB000016 /* JoriIntents.swift */,
 				BB000060 /* SignInView.swift */,
+				BB000A01 /* Pairing.swift */,
+				BB000A02 /* PairingView.swift */,
 				BB000070 /* MacKeychainStorage.swift */,
 				BB000080 /* MemoryView.swift */,
 				1B6BC1E802B543B03BFF2296 /* TradeApproval.swift */,
@@ -347,6 +357,7 @@
 			children = (
 				BB000017 /* NotificationService.swift */,
 				BB0000C1 /* AnnounceCache.swift */,
+				BB000A03 /* PushCrypto.swift */,
 				BB000018 /* Info.plist */,
 				BB000019 /* JoriNotificationService.entitlements */,
 			);
@@ -596,6 +607,9 @@
 				AA0000C5 /* AnnounceCache.swift in Sources */,
 				AA000015 /* JoriIntents.swift in Sources */,
 				AA000060 /* SignInView.swift in Sources */,
+				AA000A01 /* Pairing.swift in Sources */,
+				AA000A02 /* PairingView.swift in Sources */,
+				AA000A03 /* PushCrypto.swift in Sources */,
 				AA000070 /* MacKeychainStorage.swift in Sources */,
 				AA000080 /* MemoryView.swift in Sources */,
 				3F27B96416D060AF08ACA6D9 /* TradeApproval.swift in Sources */,
@@ -627,6 +641,8 @@
 			files = (
 				AA000016 /* NotificationService.swift in Sources */,
 				AA0000C1 /* AnnounceCache.swift in Sources */,
+				AA000A04 /* PushCrypto.swift in Sources */,
+				AA000A05 /* SupabaseConfig.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

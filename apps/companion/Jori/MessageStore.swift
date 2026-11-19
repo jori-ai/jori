@@ -198,6 +198,13 @@ final class MessageStore {
         row(id: id)?.asMessage
     }
 
+    /// Drop every cached message (the app was unpaired from its Jori).
+    func deleteAll() {
+        try? context.delete(model: CachedMessage.self)
+        try? context.save()
+        runningBytes = 0
+    }
+
     func delete(id: UUID) {
         guard let target = row(id: id) else { return }
         runningBytes -= cost(for: target.content)

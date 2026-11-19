@@ -52,7 +52,8 @@ enum PurchaseApproval {
     private static var legacyPushKind: String? {
         Install.legacyName.isEmpty ? nil : "\(Install.legacyName)-purchase-approval"
     }
-    private static let domain = Install.purchaseSigningDomain
+    /// Computed: a pairing can supply the domain at runtime.
+    private static var domain: String { Install.purchaseSigningDomain }
     private static let keyTag = Install.keyTag("purchaseKey")
     private static let deviceIdKey = Install.key("purchase.deviceId")
     private static let registeredKey = Install.key("purchase.registered")

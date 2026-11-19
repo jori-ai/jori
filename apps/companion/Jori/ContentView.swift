@@ -39,6 +39,8 @@ private func attachmentContentType(forExtension ext: String) -> String {
 
 struct ContentView: View {
     var onSignOut: () -> Void = {}
+    /// Unpair from this Jori (a paired public app only) and scan another.
+    var onUseAnotherJori: () -> Void = {}
 
     @StateObject private var viewModel = ChatViewModel()
     /// The team and its conversations (ChannelBadges.swift).
@@ -68,6 +70,7 @@ struct ContentView: View {
     private static let renderPage = 60
     @State private var scrollToBottomTick: Int = 0
     @State private var confirmSignOut = false
+    @State private var confirmUseAnotherJori = false
     /// Memory on screen instead of a conversation. Kept, with the
     /// conversation (ChatViewModel) and the improvement cards, so the app
     /// reopens on the screen it was left on.
@@ -137,8 +140,9 @@ struct ContentView: View {
     /// a message, drawn like a question; there is no Improvements tab).
     @StateObject private var improvementCards = ImprovementCards()
 
-    init(onSignOut: @escaping () -> Void = {}) {
+    init(onSignOut: @escaping () -> Void = {}, onUseAnotherJori: @escaping () -> Void = {}) {
         self.onSignOut = onSignOut
+        self.onUseAnotherJori = onUseAnotherJori
         let defaults = UserDefaults.standard
         // Reopen where the app was left, set before the first frame so
         // nothing visibly pushes or folds on launch.
@@ -261,6 +265,14 @@ struct ContentView: View {
                                 titleVisibility: .visible) {
                 Button("Sign Out", role: .destructive) { onSignOut() }
                 Button("Cancel", role: .cancel) { }
+            }
+            .confirmationDialog("Use another Jori?",
+                                isPresented: $confirmUseAnotherJori,
+                                titleVisibility: .visible) {
+                Button("Sign Out and Scan a New Code", role: .destructive) { onUseAnotherJori() }
+                Button("Cancel", role: .cancel) { }
+            } message: {
+                Text("You'll be signed out of \(Install.displayName) on this device, and its messages are removed from it.")
             }
             .modifier(lifecycle)
             .modifier(approvals)
@@ -553,6 +565,11 @@ struct ContentView: View {
                 #endif
             }
             Section {
+                if PairingStore.current != nil {
+                    Button { confirmUseAnotherJori = true } label: {
+                        Label("Use another Jori", systemImage: "qrcode.viewfinder")
+                    }
+                }
                 Button(role: .destructive) { confirmSignOut = true } label: {
                     Label("Sign Out", systemImage: "rectangle.portrait.and.arrow.right")
                 }
@@ -826,6 +843,11 @@ struct ContentView: View {
             }
             #endif
             Divider()
+            if PairingStore.current != nil {
+                Button { confirmUseAnotherJori = true } label: {
+                    Label("Use another Jori", systemImage: "qrcode.viewfinder")
+                }
+            }
             Button(role: .destructive) { confirmSignOut = true } label: {
                 Label("Sign Out", systemImage: "rectangle.portrait.and.arrow.right")
             }

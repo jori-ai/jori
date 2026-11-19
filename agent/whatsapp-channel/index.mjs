@@ -102,6 +102,9 @@ function normalizeJid(to) {
   return `${digits}@s.whatsapp.net`;
 }
 
+// The latest pairing QR WhatsApp offered (GET /qr), cleared once linked.
+const pairing = { qr: null };
+
 function buildHttpServer(socketRef, groupsRef) {
   return createServer(async (req, res) => {
     // No login on this server, and /send speaks as the user. It binds
@@ -123,6 +126,14 @@ function buildHttpServer(socketRef, groupsRef) {
         host_jid: host,
         host_name: sock?.user?.name || null,
       }));
+      return;
+    }
+    // The pairing QR for the setup page (lib/onboarding/services.mjs): the
+    // latest code WhatsApp offered, until the link is made.
+    if (req.method === "GET" && url.pathname === "/qr") {
+      const sock = socketRef.current;
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ ok: true, paired: !!sock?.user, qr: sock?.user ? null : pairing.qr }));
       return;
     }
     if (req.method === "GET" && url.pathname === "/groups") {
@@ -368,6 +379,8 @@ async function start() {
         // just past it). Fire on the first non-close update.
         maybeRequestPairingCode().catch(() => {});
       }
+      if (qr) pairing.qr = qr;
+      if (connection === "open") pairing.qr = null;
       if (qr && !PAIR_PHONE) {
         log("QR code received — scan with WhatsApp (Settings, Linked Devices, Link a Device):");
         qrcode.generate(qr, { small: true });

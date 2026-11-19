@@ -4,5 +4,12 @@
 <dict>
 	<key>com.apple.security.app-sandbox</key>
 	<true/>
+	<!-- Shared with the app (same group as the iOS extension): the push
+	     relay's device key, which opens sealed pushes (PushCrypto.swift), the
+	     runtime pairing (display name), and AnnounceCache. -->
+	<key>keychain-access-groups</key>
+	<array>
+		<string>$(AppIdentifierPrefix)$(JORI_BUNDLE_ID).shared</string>
+	</array>
 </dict>
 </plist>

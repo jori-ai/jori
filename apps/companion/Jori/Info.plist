@@ -76,6 +76,10 @@
 	<array>
 		<string>INSendMessageIntent</string>
 	</array>
+	<!-- "Find your Jori": the shared app scans the pairing QR code on the
+	     host's setup page (PairingView.swift). -->
+	<key>NSCameraUsageDescription</key>
+	<string>Scan the pairing code on your Jori's setup page to connect this app to it.</string>
 	<!-- Siri usage description for the "Summon" App Shortcut (App Intents). -->
 	<key>NSSiriUsageDescription</key>
 	<string>Lets you talk to $(JORI_DISPLAY_NAME) with Siri — "Hey Siri, Summon $(JORI_DISPLAY_NAME)".</string>

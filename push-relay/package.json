@@ -1,0 +1,7 @@
+{
+  "name": "jori-push-relay",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "the Jori push relay: holds the shared app's APNs key and forwards end-to-end encrypted pushes — see wrangler.toml and docs/push-relay.md"
+}

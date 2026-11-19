@@ -5,8 +5,22 @@ struct SignInView: View {
 
     @State private var signingIn = false
     @State private var error: String?
+    /// A shared (public) build with no backend yet starts at "Find your Jori";
+    /// a build with its own backend, or a paired one, goes straight to sign-in.
+    @State private var findingJori = !Install.isConfigured
 
     var body: some View {
+        if findingJori {
+            FindJoriView(onPaired: { withAnimation(.smooth) { findingJori = false } },
+                         onCancel: Install.isConfigured ? { withAnimation(.smooth) { findingJori = false } } : nil)
+                .transition(.opacity)
+        } else {
+            signIn
+                .transition(.opacity)
+        }
+    }
+
+    private var signIn: some View {
         VStack(spacing: 0) {
             Spacer(minLength: 40)
 
@@ -23,9 +37,17 @@ struct SignInView: View {
                 .padding(.top, 8)
                 .padding(.horizontal, 32)
 
+            // A pairing may say whose Jori it is (a hint; Google decides).
+            if let email = PairingStore.current?.ownerEmail {
+                Text(email)
+                    .font(.callout.weight(.semibold))
+                    .foregroundStyle(JoriTheme.eye)
+                    .padding(.top, 6)
+            }
+
             Spacer(minLength: 40)
 
-            Button(action: signIn) {
+            Button(action: startSignIn) {
                 HStack(spacing: 10) {
                     if signingIn {
                         ProgressView().controlSize(.small).tint(JoriTheme.iconDeep)
@@ -59,6 +81,19 @@ struct SignInView: View {
                     .transition(.opacity.combined(with: .move(edge: .top)))
             }
 
+            // Only a paired app can switch: a build with its own backend looks
+            // exactly as it always has.
+            if PairingStore.current != nil {
+                Button("Use another Jori") {
+                    error = nil
+                    withAnimation(.smooth) { findingJori = true }
+                }
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+                .padding(.top, 18)
+                .disabled(signingIn)
+            }
+
             Spacer().frame(height: 56)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -70,11 +105,11 @@ struct SignInView: View {
         .sensoryFeedback(.error, trigger: error) { _, new in new != nil }
     }
 
-    private func signIn() {
-        // A build without a backend (the public defaults) can't sign in; say
-        // which settings it needs rather than fail inside the web sheet.
+    private func startSignIn() {
+        // No backend (the shared app, not yet paired): find one first rather
+        // than fail inside the web sheet.
         guard Install.isConfigured else {
-            error = "This build has no server: set JORI_SUPABASE_URL and JORI_SUPABASE_ANON_KEY in Config/Installation.xcconfig."
+            withAnimation(.smooth) { findingJori = true }
             return
         }
         signingIn = true

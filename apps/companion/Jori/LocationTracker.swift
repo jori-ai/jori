@@ -1,6 +1,7 @@
 import Foundation
 import CoreLocation
 import SwiftData
+import Supabase
 
 #if os(iOS)
 import CoreMotion
@@ -162,7 +163,8 @@ final class LocationTracker: NSObject, CLLocationManagerDelegate {
     private var modelContainer: ModelContainer?
     private var modelContext: ModelContext?
 
-    private let supabase = SupabaseManager.shared
+    /// Read each time: the client is rebuilt when the app is paired.
+    private var supabase: SupabaseClient { SupabaseManager.shared }
 
     /// Current context for message metadata enrichment.
     private(set) var currentContext: LocationContext?

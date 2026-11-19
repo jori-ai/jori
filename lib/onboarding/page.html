@@ -140,6 +140,44 @@ details.jobs { margin: -16px 0 32px; color: var(--muted); font-size: 14px; }
 details.jobs summary { cursor: pointer; }
 details.jobs ul { margin: 10px 0 0; padding-left: 18px; columns: 2; column-gap: 28px; }
 
+.grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 12px; margin: 0 0 28px; }
+.card { background: var(--field); border: 1px solid var(--rule); border-radius: 12px; padding: 14px 16px; font-size: 15px; }
+.card p { margin: 6px 0 0; color: var(--muted); font-size: 14px; }
+.card .ok { color: var(--ok); font-weight: 600; } .card .no { color: var(--warn); font-weight: 600; }
+.note { background: color-mix(in srgb, var(--focus) 9%, var(--paper)); border-radius: 12px; padding: 14px 16px; font-size: 15px; margin: 0 0 32px; max-width: 60ch; }
+.sub.spaced, .spaced { margin-top: 8px; }
+.hint.tight { margin: -6px 0 12px; }
+.eyebrow { font: 600 12px/1 var(--sans); letter-spacing: .08em; text-transform: uppercase; color: var(--muted); margin: 0 0 10px; }
+.svc { border: 1px solid var(--rule); border-radius: 14px; padding: 16px 18px; margin: 0 0 12px; background: var(--field); }
+.svc.app { border: 2px solid var(--btn); margin-bottom: 28px; }
+.svc-head { display: flex; justify-content: space-between; gap: 12px; flex-wrap: wrap; align-items: baseline; }
+.svc h3 { margin: 0; font-size: 16px; }
+.svc .cost { color: var(--muted); font-size: 13px; }
+.svc .on { margin: 6px 0 0; font-size: 14px; }
+.svc .state { font-size: 13px; margin-top: 6px; color: var(--muted); }
+.svc .state.ok { color: var(--ok); font-weight: 600; }
+.svc ol { margin: 12px 0 0; padding-left: 20px; color: var(--muted); font-size: 14px; display: grid; gap: 4px; }
+.svc .fields { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; margin-top: 12px; }
+.svc input[type="password"] { font: 16px/1.3 var(--sans); color: var(--ink); background: var(--paper); border: 1.5px solid var(--rule); border-radius: 9px; padding: 11px 13px; width: 100%; }
+.svc .fields input { background: var(--paper); }
+.svc pre { white-space: pre-wrap; word-break: break-all; font-size: 12px; background: var(--paper); border: 1px solid var(--rule); border-radius: 8px; padding: 10px; max-height: 180px; overflow: auto; }
+.svc .acts { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 12px; align-items: center; }
+.checks { list-style: none; margin: 12px 0 0; padding: 0; border-top: 1px solid var(--rule); font-size: 14px; }
+.checks li { display: flex; justify-content: space-between; gap: 12px; padding: 8px 0; border-bottom: 1px solid var(--rule); }
+.checks .y { color: var(--ok); font-weight: 600; } .checks .n { color: var(--bad); font-weight: 600; }
+.routine { display: grid; gap: 10px; margin: 0 0 28px; }
+.routine .r { display: grid; grid-template-columns: 130px 1fr; gap: 16px; background: var(--field); border: 1px solid var(--rule); border-radius: 12px; padding: 12px 16px; font-size: 15px; }
+.routine .r > span:first-child { font-weight: 600; }
+.routine ul { margin: 0; padding-left: 18px; }
+.pair { display: flex; gap: 28px; flex-wrap: wrap; align-items: flex-start; margin: 0 0 28px; }
+.qr { width: 220px; height: 220px; background: #fff; border-radius: 12px; padding: 10px; border: 1px solid var(--rule); display: grid; place-items: center; color: #5b6377; font-size: 13px; text-align: center; }
+.qr svg { width: 100%; height: 100%; }
+.steplist { margin: 0 0 16px; padding-left: 20px; display: grid; gap: 6px; }
+.chat { background: var(--field); border: 1px solid var(--rule); border-radius: 14px; padding: 16px; display: grid; gap: 10px; margin: 0 0 28px; min-height: 64px; }
+.bubble { max-width: 46ch; padding: 10px 14px; border-radius: 14px; font-size: 15px; }
+.bubble.me { justify-self: end; background: var(--btn); color: var(--btn-ink); border-bottom-right-radius: 4px; }
+.bubble.jori { justify-self: start; background: color-mix(in srgb, var(--focus) 10%, var(--paper)); border-bottom-left-radius: 4px; }
+.tag { font-size: 12px; font-weight: 600; color: var(--ok); }
 .ways { list-style: none; margin: 0 0 36px; padding: 0; display: grid; gap: 0; border-top: 1px solid var(--rule); }
 .way { display: grid; grid-template-columns: 1fr auto; gap: 16px; align-items: center; padding: 18px 0; border-bottom: 1px solid var(--rule); }
 .way h3 { margin: 0; font-size: 16px; font-weight: 600; }
@@ -194,8 +232,10 @@ form.code { margin-top: 24px; max-width: 520px; }
       <li data-step="mac"><button type="button">Your Mac</button></li>
       <li data-step="claude"><button type="button">Claude sign-in</button></li>
       <li data-step="you"><button type="button">About you</button></li>
+      <li data-step="connect"><button type="button">Connect services</button></li>
       <li data-step="on"><button type="button">Keep it running</button></li>
-      <li data-step="reach"><button type="button">Ways to reach you</button></li>
+      <li data-step="phone"><button type="button">Your phone</button></li>
+      <li data-step="try"><button type="button">Try me</button></li>
     </ol>
     <p class="panel-foot">Prefer the terminal? Close this tab and run <code>jori init</code>.</p>
   </aside>
@@ -205,6 +245,9 @@ form.code { margin-top: 24px; max-width: 520px; }
       <h1 id="macTitle">Let me look around your Mac.</h1>
       <p class="lede">I check what I need and install anything that’s missing. You’ll only be asked when I can’t do it myself.</p>
       <ul class="rows" id="macRows"></ul>
+      <h2 class="sub">What you can do from here</h2>
+      <div class="grid" id="canDo"></div>
+      <p class="note"><b>Why a computer that stays on?</b> Most of what I do happens while you’re not looking: the brief before you’re up, the price that drops at 2 a.m., the urgent email during dinner. On a laptop I still work, but only while it’s awake, and I catch up when it wakes.</p>
       <div class="actions"><button class="btn" id="macNext" disabled>Continue</button></div>
     </section>
 
@@ -218,26 +261,44 @@ form.code { margin-top: 24px; max-width: 520px; }
         <label>Did Claude show you a code? Paste it here.<span class="code-row"><input type="text" name="code" autocomplete="one-time-code" spellcheck="false"><button class="btn small" type="submit">Finish sign-in</button></span></label>
         <p class="err" id="codeErr" hidden></p>
       </form>
+      <h2 class="sub spaced">How I use your plan</h2>
+      <div class="grid">
+        <div class="card"><b>A chat session</b><p>Answers you in the app, in seconds.</p></div>
+        <div class="card"><b>Work sessions</b><p>Sort your mail, run your scheduled jobs, do the research you ask for.</p></div>
+        <div class="card"><b>Quick checks</b><p>Small yes/no calls, like whether a message is worth sending you.</p></div>
+      </div>
+      <p class="note">I’m built for Claude Max. The control room’s Budget page shows how much of your plan I use each day, and you can turn off the busiest jobs if you get close to the limit.</p>
     </section>
 
     <section class="step" data-step="you" hidden>
       <h1>What should I call you?</h1>
       <p class="lede">I filled in what I could find on this Mac. Fix anything that’s wrong; you can change it later in the control room.</p>
       <form class="about" id="aboutForm" novalidate>
-        <label>Your first name<input type="text" name="owner_name" autocomplete="given-name" required></label>
-        <label>Your email<input type="email" name="owner_email" autocomplete="email" required></label>
+        <label>Your first name<input type="text" name="owner_name" autocomplete="given-name" required><small>How I address you, and how I sign mail I send for you</small></label>
+        <label>Your email<input type="email" name="owner_email" autocomplete="email" required><small>Who may sign in to the app and your memory site</small></label>
         <label>Home city<input type="text" name="home_city" autocomplete="address-level2"><small>For weather, nearby places and events</small></label>
-        <label>Time zone<input type="text" name="tz" list="tzList" required></label>
-        <label>Call the assistant<input type="text" name="assistant_name" required></label>
+        <label>Time zone<input type="text" name="tz" list="tzList" required><small>When your brief arrives and when I stay quiet</small></label>
+        <label>Call the assistant<input type="text" name="assistant_name" required><small>Any name; the app and memory site use it too</small></label>
         <label>Its pronouns<input type="text" name="assistant_pronouns" list="pronounList" placeholder="it/its"><small>How it’s referred to: she/her, he/him, they/them or it/its</small></label>
         <datalist id="pronounList"><option value="she/her"><option value="he/him"><option value="they/them"><option value="it/its"></datalist>
-        <label>A partner I also help<input type="text" name="partner_name"><small>Optional, first name</small></label>
+        <label>A partner I also help<input type="text" name="partner_name"><small>Optional, first name. I plan for two: tables, trips, birthdays</small></label>
         <label>I’ll use it for<select name="use" required><option value="">Choose…</option><option value="personal">My personal life</option><option value="work">Work</option><option value="both">Both</option></select><small>Personal: one assistant does everything. Work or both: a team, each with an area (finances, travel…), with the assistant as chief of staff. Add a teammate any time in the app.</small></label>
         <label class="check wide"><input type="checkbox" name="telemetry" checked> Count this install: one anonymous ping, no personal data, sent once.</label>
         <datalist id="tzList"></datalist>
       </form>
       <div class="actions"><button class="btn" id="aboutSave">Save and continue</button></div>
       <p class="err" id="aboutErr" hidden></p>
+    </section>
+
+    <section class="step" data-step="connect" hidden>
+      <h1>Connect what you want me to use.</h1>
+      <p class="lede">Each card says what it switches on and what it costs. Most are free for one person. Skip any; you can come back from the control room.</p>
+      <p class="eyebrow">Needed for the phone app</p>
+      <div id="svcApp"></div>
+      <p class="eyebrow">Optional, any order</p>
+      <div id="svcOpt"></div>
+      <p class="hint">Each key is tested before it’s saved to this computer’s <code>.env</code>, and never shown again. Keys are never sent to us.</p>
+      <div class="actions"><button class="btn" id="connectNext">Continue</button><span class="hint" id="connectCount"></span></div>
     </section>
 
     <section class="step" data-step="on" hidden>
@@ -248,16 +309,57 @@ form.code { margin-top: 24px; max-width: 520px; }
         <h2 class="sub" id="stayOnTitle">Staying on by itself</h2>
         <ul class="rows" id="stayOnRows"></ul>
       </div>
-      <details class="jobs" id="jobsList"><summary>Which jobs</summary><ul></ul></details>
+      <h2 class="sub spaced">My routine</h2>
+      <div class="routine" id="routine"></div>
+      <div id="waitingBox" hidden>
+        <h2 class="sub spaced">Waiting for a connection</h2>
+        <p class="hint tight">These switch on by themselves when you connect the service.</p>
+        <div class="grid" id="waiting"></div>
+      </div>
       <div class="actions" id="onActions"></div>
       <p class="hint" id="onHint" hidden></p>
     </section>
 
-    <section class="step" data-step="reach" hidden>
-      <h1 id="reachTitle">How should I reach you?</h1>
-      <p class="lede">Pick at least one way to talk to me. Each one takes a few minutes and is set up from the control room, where you can also see and change everything I do.</p>
-      <ul class="ways" id="ways"></ul>
-      <div class="actions"><button class="btn" id="openControl">Open the control room</button><button class="link" id="finishLater">I’ll do this later</button></div>
+    <section class="step" data-step="phone" hidden>
+      <h1>Put me on your phone.</h1>
+      <p class="lede">Install the Jori app, then scan this code with it. The code tells the app where I live; there’s no account with us.</p>
+      <div class="pair">
+        <div class="qr" id="pairQr" aria-label="Pairing code"></div>
+        <div>
+          <ol class="steplist">
+            <li id="tfLine">Install the Jori app from TestFlight on your iPhone.</li>
+            <li>Open it and choose <b>Scan the code</b>.</li>
+            <li>Sign in with Google, with the email you gave me.</li>
+          </ol>
+          <div class="actions"><button class="btn small quiet" id="pairCopy" type="button">Copy the code instead</button><button class="btn small quiet" id="pairNew" type="button">New code</button></div>
+          <p class="hint" id="pairHint" hidden></p>
+        </div>
+      </div>
+      <h2 class="sub spaced">What the app adds</h2>
+      <div class="grid">
+        <div class="card"><b>Chat</b><p>Talk to me from anywhere.</p></div>
+        <div class="card"><b>Notifications you can answer</b><p>A thumbs-up says yes; “skip” teaches me.</p></div>
+        <div class="card"><b>Face ID approvals</b><p>Nothing spends without you.</p></div>
+        <div class="card"><b>Where you are, if you allow it</b><p>Nearby places and “leave now” nudges.</p></div>
+      </div>
+      <div class="actions spaced"><button class="btn" id="phoneNext">Continue</button><button class="link" id="phoneSkip">No phone app for now</button></div>
+    </section>
+
+    <section class="step" data-step="try" hidden>
+      <h1>Say hi from your phone.</h1>
+      <p class="lede">Send me anything in the app. When it shows up here, everything is connected end to end.</p>
+      <div class="chat" id="tryChat"></div>
+      <h2 class="sub spaced">Things to try this week</h2>
+      <div class="grid prompts">
+        <div class="card"><span class="tag">Teach me</span><p>“I’m vegetarian and I hate early meetings.”</p></div>
+        <div class="card"><span class="tag">Watch something</span><p>“Tell me if flights to Rome in May go under $600.”</p></div>
+        <div class="card"><span class="tag">Remind me</span><p>“Remind me to renew the car insurance two weeks before it’s due.”</p></div>
+        <div class="card"><span class="tag">Plan</span><p>“Plan a long weekend away for two, under $1,500.”</p></div>
+        <div class="card"><span class="tag">Ask my memory</span><p>“What did I decide about the kitchen contractor?”</p></div>
+        <div class="card"><span class="tag">Write for me</span><p>“Write a polite no to the school fundraiser.”</p></div>
+      </div>
+      <p class="note"><b>Tomorrow morning</b> you’ll get your first brief. Reply to anything I send: a thumbs-up confirms, “skip” teaches me not to bring it up again.</p>
+      <div class="actions"><button class="btn" id="openControl">Open the control room</button><button class="link" id="finishLater">Close setup</button></div>
       <p class="hint" id="doneHint" hidden></p>
     </section>
   </main>
@@ -265,7 +367,8 @@ form.code { margin-top: 24px; max-width: 520px; }
 
 <script>
 const SETUP_AUTH = "__SETUP_TOKEN__";
-const ORDER = ["mac", "claude", "you", "on", "reach"];
+const ORDER = ["mac", "claude", "you", "connect", "on", "phone", "try"];
+const skipped = new Set();   // steps the person chose to skip this visit
 let S = null;            // last /api/state
 let current = "mac";
 let polling = null;
@@ -319,13 +422,19 @@ function doneMap(s) {
     mac: s.node.ok && s.claude.installed,
     claude: s.claude.loggedIn,
     you: s.identity.saved,
+    connect: skipped.has("connect") || (s.services || []).some((x) => x.id === "supabase" && x.connected),
     on: s.service.chat && s.service.ops && s.schedule.ok && s.schedule.missing === 0,
-    reach: false,
+    phone: skipped.has("phone") || paired,
+    try: false,
   };
 }
 
 function show(step) {
   current = step;
+  if (step === "phone") {
+    loadPairing();
+    if (S && S.testflightUrl) $("tfLine").replaceChildren("Install the Jori app from ", el("a", { href: S.testflightUrl, target: "_blank", rel: "noopener" }, "TestFlight"), " on your iPhone."); // control-scan-ok: the software's name
+  }
   for (const sec of document.querySelectorAll(".step")) sec.hidden = sec.dataset.step !== step;
   render();
   const h = document.querySelector(`.step[data-step="${step}"] h1`);
@@ -364,6 +473,12 @@ function render() {
       !(S.ollama.running && S.ollama.model) && mem?.state !== "running" ? el("button", { class: "btn small quiet", onclick: () => api("/api/memory", {}).then(poll) }, "Set up") : null),
   ]);
   $("macNext").disabled = !d.mac;
+  if (!$("canDo").children.length) {
+    const mac = H.os === "darwin";
+    const can = [["Chat, memory, inbox", true, "Works here"], ["Morning brief, watches", true, "Works here"],
+      ["iMessage, Notes, Photos", mac, mac ? "Works here" : "Needs a Mac"], ["Booking on websites", mac, mac ? "Works here, with Chrome" : "Needs a browser on this machine (later)"]];
+    $("canDo").replaceChildren(...can.map(([t, ok, w]) => el("div", { class: "card" }, el("b", {}, t), el("p", {}, el("span", { class: ok ? "ok" : "no" }, w)))));
+  }
 
   // Claude
   const cl = S.claude, login = jobs.claudeLogin;
@@ -419,8 +534,6 @@ function render() {
     row(sv.ops ? "ok" : sv.running || starting ? "work" : "todo", "Background work", sv.ops ? "Answering" : sv.running ? "Waking up…" : "Where scheduled jobs run"),
     row(!sc.ok ? "need" : sc.missing === 0 ? "ok" : starting ? "work" : "todo", "Scheduled jobs", !sc.ok ? `I couldn’t read this Mac’s schedule: ${sc.error}` : sc.missing === 0 ? `${sc.total} jobs scheduled` : `${sc.total} jobs, from a morning brief to keeping memory backed up`),
   ]);
-  const jl = $("jobsList").querySelector("ul");
-  if (!jl.children.length) jl.replaceChildren(...(sc.jobs || []).map((j) => el("li", {}, j.why)));
   const oa = [];
   if (!d.on) oa.push(el("button", { class: "btn", disabled: starting || !d.claude ? "" : null, onclick: startJori }, sv.running ? "Finish setting up" : "Start " + (S.identity.assistant_name || "Jori"))); // control-scan-ok: the setting's default
   if (d.on || (sv.running && sc.missing === 0)) oa.push(el("button", { class: "btn", onclick: next }, "Continue"));
@@ -430,25 +543,135 @@ function render() {
   $("onHint").hidden = !(bad || (!d.claude) || (sv.running && !(sv.chat && sv.ops) && slow()));
   $("onHint").replaceChildren(...rich(bad ? bad.message : !d.claude ? "Sign in with Claude first; the agents need it to start." : "Still waking up. If this lasts more than a few minutes, run `jori logs ops-agent` in Terminal to see why."));
 
-  // Reach
-  $("reachTitle").textContent = d.on ? "I’m on. How should I reach you?" : "How should I reach you?";
-  const ctl = S.controlUrl.replace(/#.*$/, "");
-  const ways = [
-    ["The Jori app", "Chat and notifications on iPhone and Mac. Needs a free Supabase project.", "#services"], // control-scan-ok: the software's name
-    ["iMessage", "Text me from the Messages app. Needs Full Disk Access for this Mac.", "#channels"],
-    ["WhatsApp", "Message me from your phone, paired with a QR code.", "#channels"],
-    ["Slack", "Talk to me in your workspace, as a teammate.", "#channels"],
-    ["Gmail", "I sort your inbox and tell you about the urgent mail.", "#services"],
-    ["My own email address", "Optional. People email me directly and my mail comes from that address. Needs a domain on Cloudflare; without one I use your mailbox.", "#email"],
-  ];
-  if (!$("ways").children.length) $("ways").replaceChildren(...ways.map(([h, p, hash]) =>
-    el("li", { class: "way" }, el("div", {}, el("h3", {}, h), el("p", {}, p)), el("a", { class: "btn small quiet", href: ctl + hash, target: "_blank", rel: "noopener" }, "Set up"))));
+  renderConnect();
+  renderRoutine();
+  if (current === "try") renderTry();
 
   // Face
-  if (current === "reach" && d.on) setFace("happy", "All set. I’ll be here.");
+  if (current === "try" && d.on) setFace("happy", "All set. I’ll be here.");
   else if (Object.values(jobs).some((j) => j.state === "running") || starting) setFace("busy", "Working on it…");
-  else if (d.mac) setFace("awake", current === "you" ? "Nice to meet you." : current === "on" ? "Almost there." : "Awake and listening.");
+  else if (d.mac) setFace("awake", current === "you" ? "Nice to meet you." : current === "connect" ? "Each one gives me a new sense." : current === "on" ? "Almost there." : current === "phone" ? "Let’s get me in your pocket." : "Awake and listening.");
   else setFace("sleep", "Getting ready on this Mac.");
+}
+
+// ── Connect: one card per service, built once so typing survives the poll ──
+const svcEls = {};
+function renderConnect() {
+  const list = S.services || [];
+  if (!list.length) return;
+  if (!$("svcApp").children.length && !$("svcOpt").children.length) {
+    for (const v of list) (v.group === "app" ? $("svcApp") : $("svcOpt")).append(buildService(v));
+  }
+  for (const v of list) {
+    const e = svcEls[v.id]; if (!e) continue;
+    e.state.textContent = v.connected ? `Connected · ${v.detail}` : v.detail;
+    e.state.className = "state" + (v.connected ? " ok" : "");
+  }
+  const n = list.filter((v) => v.connected).length;
+  $("connectCount").textContent = `${n} connected · ${list.length - n} to explore later`;
+}
+function buildService(v) {
+  const box = el("section", { class: "svc" + (v.group === "app" ? " app" : ""), id: `svc-${v.id}` });
+  const state = el("div", { class: "state" });
+  const checks = el("ul", { class: "checks", hidden: "" });
+  box.append(el("div", { class: "svc-head" }, el("h3", {}, v.title), el("span", { class: "cost" }, v.cost)),
+    el("p", { class: "on" }, el("b", {}, "Switches on: "), v.switchesOn), state);
+  const body = el("div", { hidden: "" });
+  body.append(el("ol", {}, ...v.steps.map((t) => el("li", {}, ...rich(t)))));
+  if (v.id === "google" && S.googleRedirect) body.append(el("p", { class: "hint" }, "Web client redirect URI: ", el("code", {}, S.googleRedirect)));
+  if (v.manifest) body.append(el("pre", {}, S.slackManifest));
+  const form = el("form", { class: "fields" });
+  for (const f of v.fields) form.append(el("label", {}, f.label + (f.optional ? " (optional)" : ""), el("input", { type: f.secret ? "password" : "text", name: f.key, placeholder: f.placeholder || "", autocomplete: "off", spellcheck: "false" })));
+  if (v.fields.length) body.append(form);
+  const qrBox = el("div", { class: "qr", hidden: "" });
+  if (v.qr) body.append(qrBox);
+  const acts = el("div", { class: "acts" });
+  if (v.controlPage) acts.append(el("a", { class: "btn small", href: S.controlUrl.replace(/#.*$/, "") + v.controlPage, target: "_blank", rel: "noopener" }, "Set up in the control room"));
+  if (v.fields.length) acts.append(el("button", { class: "btn small", type: "button", onclick: () => testService(v, form, checks) }, "Test and save"));
+  if (v.id === "google") acts.append(el("button", { class: "btn small quiet", type: "button", onclick: googleAuth }, "Sign in with Google"));
+  if (v.qr) acts.append(el("button", { class: "btn small", type: "button", onclick: () => showQr(qrBox) }, "Show the code"));
+  body.append(acts, checks);
+  const toggle = el("button", { class: "btn small quiet", type: "button" }, v.group === "app" ? "Set up" : "Connect");
+  toggle.addEventListener("click", () => { body.hidden = !body.hidden; toggle.textContent = body.hidden ? (v.group === "app" ? "Set up" : "Connect") : "Close"; });
+  box.append(el("div", { class: "acts" }, toggle), body);
+  if (v.group === "app" && !v.connected) { body.hidden = false; toggle.textContent = "Close"; }
+  svcEls[v.id] = { state, checks };
+  return box;
+}
+async function testService(v, form, checks) {
+  const fields = {};
+  for (const f of v.fields) fields[f.key] = form.elements[f.key].value.trim();
+  checks.hidden = false;
+  checks.replaceChildren(el("li", {}, "Checking…"));
+  const r = await api("/api/service/connect", { id: v.id, fields });
+  checks.replaceChildren(...(r.checks || [{ name: r.message || "That didn’t work", ok: false }]).map((c) =>
+    el("li", {}, el("span", {}, c.name, c.detail ? el("span", { class: "row-detail" }, ...rich(c.detail)) : null), el("span", { class: c.ok ? "y" : "n" }, c.ok ? "Yes" : "Not yet"))));
+  if (r.ok) for (const f of v.fields) if (f.secret) form.elements[f.key].value = "";
+  if (r.next === "authorize") checks.append(el("li", {}, el("span", {}, "Next: press Sign in with Google to let me read your mail."), el("span", {})));
+  await poll();
+}
+async function googleAuth() {
+  await api("/api/google/authorize", {});
+  await poll();
+  const u = (S.jobs || {}).googleAuth?.url;
+  if (u) window.open(u, "_blank", "noopener");
+}
+async function showQr(box) {
+  box.hidden = false; box.textContent = "Getting the code…";
+  const r = await api("/api/service/qr", {});
+  if (!r.ok) { box.textContent = r.message; return; }
+  if (r.paired) { box.textContent = "Linked."; return; }
+  if (r.waiting) { box.textContent = "Waiting for WhatsApp to offer a code. Try again in a few seconds."; return; }
+  box.innerHTML = r.svg; // SVG built on this machine by the qrcode library, from WhatsApp's code
+}
+
+// ── Keep it running: the starter jobs as a routine ──
+const WHEN = [["morning", "Every morning"], ["day", "All day"], ["evening", "Each evening"], ["night", "Overnight"], ["background", "In the background"]];
+function renderRoutine() {
+  const jobs = (S.schedule && S.schedule.jobs) || [];
+  if (!$("routine").children.length && jobs.length) {
+    $("routine").replaceChildren(...WHEN.map(([k, label]) => {
+      const js = jobs.filter((j) => (j.when || "background") === k);
+      return js.length ? el("div", { class: "r" }, el("span", {}, label), el("ul", {}, ...js.map((j) => el("li", {}, j.why)))) : null;
+    }).filter(Boolean));
+  }
+  const w = S.waiting || [];
+  $("waitingBox").hidden = !w.length;
+  $("waiting").replaceChildren(...w.map((j) => el("div", { class: "card" }, el("b", {}, j.why), el("p", {}, `needs ${j.requires.join(" or ")}`))));
+}
+
+// ── Your phone: the pairing code ──
+let paired = false, pairCode = null;
+async function loadPairing() {
+  const r = await api("/api/pairing", {});
+  const hint = $("pairHint");
+  if (!r.ok) { $("pairQr").textContent = r.message; hint.hidden = true; return; }
+  pairCode = r.code;
+  $("pairQr").innerHTML = r.svg; // SVG built on this machine by the qrcode library
+  hint.hidden = false;
+  hint.textContent = r.relay ? "This code works once, for ten minutes. Press New code for another." : "Notifications to the app need the push relay; chat works without it.";
+}
+$("pairCopy").addEventListener("click", async () => { if (!pairCode) return; try { await navigator.clipboard.writeText(pairCode); $("pairCopy").textContent = "Copied"; } catch { $("pairCopy").textContent = "Select and copy"; } });
+$("pairNew").addEventListener("click", loadPairing);
+$("phoneNext").addEventListener("click", () => { paired = true; next(); });
+$("phoneSkip").addEventListener("click", () => { skipped.add("phone"); next(); });
+$("connectNext").addEventListener("click", () => { skipped.add("connect"); next(); });
+
+// ── Try me: the round trip ──
+let trySince = null, tryBusy = false;
+async function renderTry() {
+  if (tryBusy) return;
+  trySince = trySince || new Date(Date.now() - 60_000).toISOString();
+  tryBusy = true;
+  const r = await api("/api/try", { since: trySince }).catch(() => ({}));
+  tryBusy = false;
+  const c = $("tryChat");
+  if (!r.ok) { c.replaceChildren(el("p", { class: "hint" }, r.message || "Waiting for the app…")); return; }
+  if (!r.sent) { c.replaceChildren(el("p", { class: "hint" }, "Waiting for your first message…")); return; }
+  const kids = [el("div", { class: "bubble me" }, r.text)];
+  kids.push(r.answered ? el("div", { class: "bubble jori" }, r.reply) : el("p", { class: "hint" }, "Got it. Thinking…"));
+  if (r.answered) kids.push(el("p", { class: "tag" }, `Connected end to end · answered in ${r.seconds}s`));
+  c.replaceChildren(...kids);
 }
 
 const tail = (s) => String(s || "").trim().split("\n").filter(Boolean).slice(-1)[0] || "";
@@ -513,7 +736,7 @@ async function poll() {
   if (!S) return;
   // Open where the person left off: the first step not done yet.
   const d = doneMap(S);
-  show(ORDER.find((k) => !d[k]) || "reach");
+  show(ORDER.find((k) => !d[k]) || "try");
   polling = setInterval(poll, 2500);
 })();
 </script>

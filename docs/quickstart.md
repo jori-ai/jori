@@ -10,9 +10,11 @@ That installs what is missing (Homebrew, Node.js 22.5+, git, Claude Code, Ollama
 
 1. **Your Mac** — checks Node, Claude Code and memory search, and installs what is missing.
 2. **Claude sign-in** — signs in with your Claude subscription (`claude auth login` underneath) and checks the plan. Jori is built for Max.
-3. **About you** — your name, email, home city, time zone and the assistant's name, filled in from this Mac (macOS account name, the Claude sign-in's email, the system time zone). Fix what is wrong and save.
-4. **Keep it running** — one button. It installs the `ai.jori.session` launch agent (Jori starts now and at every login, and restarts after a crash) and schedules the starter jobs in `system/starter-jobs.json`: the watchdog, the morning brief, hum, memory upkeep and the two repair loops. Other jobs switch on from the control room as you connect what they need.
-5. **Ways to reach you** — the Jori app, iMessage, WhatsApp, Slack and Gmail, each set up from the control room.
+3. **About you** — your name, email, home city, time zone and the assistant's name, filled in from this Mac (macOS account name, the Claude sign-in's email, the system time zone). Each field says what it changes. Fix what is wrong and save.
+4. **Connect services** — one card per outside service, each saying what it switches on and what it costs: Supabase (needed for the phone app; the card also creates its tables), Google, instant mail (a Cloudflare Tunnel), your own email address, WhatsApp, Slack and Jev. **Test and save** checks the keys with the provider and saves only what works. Skip any; the same cards come back with `jori setup` or `jori init`.
+5. **Keep it running** — one button. It installs the `ai.jori.session` launch agent (Jori starts now and at every login, and restarts after a crash) and schedules the starter jobs in `system/starter-jobs.json`, shown as a routine (every morning, all day, each evening, overnight, in the background). Jobs waiting for a service switch on once you connect it.
+6. **Your phone** — a code the Jori app scans to find this installation.
+7. **Try me** — send a message from the app and watch it arrive and get answered, with things to try this week.
 
 Already cloned? Run `./bin/jori setup` from the checkout. It is safe to re-run: it fills only what is missing, never restarts a running service and never adds a job that is already in the crontab. `jori setup status` gives the same checks in the terminal, and `jori setup start` does step 4 without a browser.
 

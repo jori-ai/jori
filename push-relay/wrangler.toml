@@ -1,0 +1,37 @@
+# push-relay — the Jori push relay (docs/push-relay.md).
+#
+# Holds the shared Jori app's APNs key so no host has to. Hosts sign their
+# requests with a per-instance secret; phones pair with a one-time token; every
+# payload is end-to-end encrypted to the phone, so the relay sees ciphertext only.
+#
+# The route and database id below are placeholders. Deploy (instructions only;
+# see docs/push-relay.md § Deploy):
+#   wrangler d1 create jori-push-relay            # paste the id below
+#   wrangler d1 execute jori-push-relay --remote --file=schema.sql
+#   wrangler secret put APNS_KEY_P8               # the .p8 file's full PEM text
+#   wrangler secret put APNS_KEY_ID
+#   wrangler secret put APNS_TEAM_ID
+#   wrangler secret put APNS_TOPIC                # the shared app's bundle id
+#   wrangler deploy
+
+name = "jori-push-relay"
+main = "src/index.js"
+compatibility_date = "2026-01-01"
+workers_dev = false
+preview_urls = false
+
+# The relay's own hostname. Its URL is what a host configures as relay_url
+# (origin only: https://push.example.com).
+routes = [{ pattern = "push.example.com", custom_domain = true }]
+
+[[d1_databases]]
+binding = "DB"
+database_name = "jori-push-relay"
+database_id = "<your-d1-database-id>"
+
+# Hourly sweep: expired pairings, old rate-limit windows, long-dead devices.
+[triggers]
+crons = ["17 * * * *"]
+
+# No [observability]: traces can record subrequest URLs, and an APNs URL
+# carries the device token. The Worker's own logs never include one.
