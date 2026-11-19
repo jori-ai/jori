@@ -12,8 +12,8 @@ import WebKit
 /// host checks against `purchase_device_keys` and answers with a short-lived
 /// session cookie for this web view.
 ///
-/// Opened by tapping a shop-browser link in chat (`ShopBrowser.handles`), or
-/// from the menu.
+/// Opened by tapping a shop-browser link in chat (`ShopBrowser.handles`;
+/// MessageContentParser turns a bare address into one).
 struct ShopBrowserView: View {
     /// The link that opened it (carries the page's `open`/`site` hints), or
     /// the bare address from the menu.

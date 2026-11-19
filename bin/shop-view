@@ -2,11 +2,11 @@
 // shop-view — the link to the phone sign-in page for the shop Chrome
 // (agent/shop-view/server.mjs, SHOP_VIEW_URL behind Cloudflare Access).
 //
-//   shop-view link [--site <domain>] [--url <login url>] [--web]
+//   shop-view link [--site <domain>] [--url <login url>] [--app|--web]
 //       Print the link to put in a "please sign in" message: the in-app link
 //       (the Jori app opens it in its own shop browser screen, over Tailscale)
-//       when purchase.json `shop_view_app_url` is set, else the Cloudflare web
-//       page; --web forces the web page. --url (or the site's home page) is
+//       when purchase.json `shop_view_link` is "app" (and `shop_view_app_url`
+//       is set), else the Cloudflare web page; --app / --web force one. --url (or the site's home page) is
 //       offered on the page as an "Open it" button; it is never opened just
 //       because the link was followed.
 //   shop-view done [--since <unix-seconds>]
@@ -31,7 +31,10 @@ const flag = (n) => { const i = argv.indexOf(`--${n}`); return i > -1 ? argv[i +
 
 switch (argv[0]) {
   case "link":
-    try { console.log((!argv.includes("--web") && V.appSigninLink({ site: flag("site"), url: flag("url") })) || V.signinLink({ site: flag("site"), url: flag("url") })); }
+    try {
+      const wantApp = argv.includes("--app") || (!argv.includes("--web") && (process.env.SHOP_VIEW_LINK || V.DEFAULT_LINK_KIND) === "app");
+      console.log((wantApp && V.appSigninLink({ site: flag("site"), url: flag("url") })) || V.signinLink({ site: flag("site"), url: flag("url") }));
+    }
     catch (e) { console.error(`shop-view: ${e.message}`); process.exit(2); }
     break;
   case "done": {

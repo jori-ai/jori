@@ -71,7 +71,15 @@ struct MessageContentParser {
             markdownBuffer.removeAll()
         }
 
-        for line in lines {
+        for rawLine in lines {
+            // A shop-browser address (an unqualified Tailscale host, which
+            // Markdown won't autolink) becomes a tappable link that opens the
+            // in-app shop browser (ShopBrowserView.swift).
+            let line = linkShopBrowser(rawLine)
+            if line != rawLine {
+                markdownBuffer.append(line)
+                continue
+            }
             let trimmed = line.trimmingCharacters(in: .whitespaces)
 
             // Check if the entire line is a standalone URL, or a 🔗-prefixed URL
@@ -105,6 +113,18 @@ struct MessageContentParser {
 
         flushMarkdown()
         return segments
+    }
+
+    /// Bare shop-browser URLs in a line → `[Open the shop browser](url)`.
+    /// Ones already inside a markdown link are left alone.
+    static func linkShopBrowser(_ line: String) -> String {
+        guard let base = ShopBrowser.base,
+              let host = base.host, line.contains(host) else { return line }
+        let root = base.absoluteString.hasSuffix("/") ? String(base.absoluteString.dropLast()) : base.absoluteString
+        let pattern = "(?<!\\]\\()" + NSRegularExpression.escapedPattern(for: root) + "(?:/[^\\s)>\\]]*)?"
+        guard let re = try? NSRegularExpression(pattern: pattern) else { return line }
+        let range = NSRange(line.startIndex..., in: line)
+        return re.stringByReplacingMatches(in: line, range: range, withTemplate: "[Open the shop browser]($0)")
     }
 
     /// Strip leading emoji + whitespace prefixes commonly used for link lines (e.g., "🔗 https://...")
