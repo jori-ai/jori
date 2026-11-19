@@ -325,6 +325,12 @@ const GROUNDED_PROMOTION_SOURCES = new Set([
   "local:memory", "local:calendar", "local:calendar_title", "local:message", "stated:chat",
 ]);
 
+// Whether a decision's source is one of the grounded tiers. The trigger script
+// reads it off the resolver's output: an ungrounded auto_confirm settles today's
+// ask but is saved row-only (location-confirm save --row-only), so it never
+// reaches confirmed-stops.json by the other door.
+const isGroundedSource = (source) => GROUNDED_PROMOTION_SOURCES.has(source);
+
 // Runs the promotion without ever breaking the pipeline: a failure is loud on
 // stderr (trigger-location-confirm.sh appends it to watchdog.log) but the
 // resolve decision itself still ships.
@@ -590,7 +596,7 @@ if (process.argv.includes("--promote-safely-only")) {
     process.exit(2);
   }
   const r = promoteSafely(payload.ask || {}, payload.decision, payload.venue, payload.candidates || [], payload.source);
-  process.stdout.write(JSON.stringify(r));
+  process.stdout.write(JSON.stringify({ ...r, grounded: isGroundedSource(payload.source) }));
   process.exit(0);
 }
 
@@ -780,6 +786,7 @@ if (!existsSync(LOCAL_OFF)) {
         reasoning: lv.reasoning,
         source: lv.source,
         promoted: promotion.promoted === true,
+        grounded: isGroundedSource(lv.source),
         evidence: { calendar_events: calendarEvents.length, recent_messages: recentMessages.length, wiki_hits: wikiHits.length },
       });
     }
@@ -866,6 +873,7 @@ if (parsed.decision === "auto_confirm") {
     reasoning: (parsed.reasoning || "local_llm").slice(0, 200),
     source: "local_llm_fallback",
     promoted: promotion.promoted === true,
+    grounded: false,
     evidence: {
       calendar_events: calendarEvents.length,
       recent_messages: recentMessages.length,

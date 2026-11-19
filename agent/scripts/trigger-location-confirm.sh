@@ -227,7 +227,16 @@ for i in $(seq 0 $((N_BATCH - 1))); do
     R_REASON=$(echo "$RESOLVE_OUT" | jq -r '.reasoning // ""' 2>/dev/null)
 
     if [ "$R_DECISION" = "auto_confirm" ] && [ -n "$R_VENUE" ]; then
-      if "$CONFIRM_TOOL" save "$ASK_ID_THIS" "$R_VENUE" >/dev/null 2>&1; then
+      # An automated guess (a model's reading, not the user's own words or a past
+      # confirmation) settles today's ask but is saved row-only: it never joins
+      # confirmed-stops.json, which names every future stop near it without asking
+      # (jobs/location-confirm-ask.md § Automated guesses cannot self-confirm).
+      # Only a resolver that says grounded=true saves in full.
+      R_GROUNDED=$(echo "$RESOLVE_OUT" | jq -r '.grounded // false' 2>/dev/null)
+      SAVE_FLAG="--row-only"
+      [ "$R_GROUNDED" = "true" ] && SAVE_FLAG=""
+      # shellcheck disable=SC2086
+      if "$CONFIRM_TOOL" save $SAVE_FLAG "$ASK_ID_THIS" "$R_VENUE" >/dev/null 2>&1; then
         log "auto_confirm:sonnet ask_id=$ASK_ID_THIS venue=\"$R_VENUE\" reason=$R_REASON"
         continue
       fi

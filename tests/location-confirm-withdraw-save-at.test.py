@@ -227,5 +227,49 @@ class SaveCurrentKnownPlace(Base):
         self.assertEqual(self.save("Some Cafe"), (0, ["Some Cafe"]))
 
 
+class SaveRowOnly(Base):
+    """save --row-only: an automated guess (the resolver's model tail, not the
+    user's words or a past confirmation) settles today's ask by patching the visit
+    row, but is never appended to confirmed-stops.json, the trusted list that names
+    every later stop within 30 m without asking."""
+
+    ASK = {"ask_id": "lc-20260101-1930-guess", "centroid": {**fake_at(500, 500)},
+           "first_sample_ts": "2026-01-02T00:10:46+00:00", "last_sample_ts": "2026-01-02T00:30:02+00:00",
+           "duration_min": 19.3, "primary": {"name": "Example Bus Stop", "source": "google_places"},
+           "alternatives": [{"name": "Example Tower", "source": "reverse_geocode"}]}
+
+    def setUp(self):
+        super().setUp()
+        self.drift = []
+        self.lc._record_drift = lambda **k: self.drift.append(k) or True
+        with open(self.lc.PENDING_FILE, "w") as f:
+            json.dump([dict(self.ASK)], f)
+
+    def save(self, **kw):
+        return self.run_cmd(self.lc.cmd_save, ask_id=self.ASK["ask_id"], venue="Example Butcher", **kw)
+
+    def test_row_only_patches_the_row_and_leaves_the_trusted_list_alone(self):
+        before = self.stored()
+        rc, out = self.save(row_only=True)
+        e = out["saved"]
+        self.assertEqual(rc, 0)
+        self.assertEqual(self.stored(), before, "a guess never joins confirmed-stops.json")
+        self.assertEqual(len(self.patched), 1, "the visit row is still patched, so the ask is settled")
+        self.assertIs(e["row_only"], True)
+        self.assertEqual(e["source"], "auto_guess", "an automated guess is not labelled as the user's words")
+        self.assertEqual(self.drift, [], "a guess is not a correction by the user")
+        self.assertEqual(self.stored(self.lc.PENDING_FILE), [], "the ask leaves pending")
+
+    def test_the_default_save_is_unchanged(self):
+        before = self.stored()
+        rc, out = self.save()
+        e = out["saved"]
+        self.assertEqual(rc, 0)
+        self.assertEqual([x["name"] for x in self.stored()], [x["name"] for x in before] + ["Example Butcher"])
+        self.assertEqual(e["source"], "user_freeform")
+        self.assertNotIn("row_only", e)
+        self.assertEqual(len(self.drift), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

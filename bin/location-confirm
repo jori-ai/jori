@@ -422,7 +422,7 @@ def _resolve_candidate(ask: dict, name_or_idx: str) -> dict | None:
 
 
 def _write_confirmation(ask: dict, chosen: dict, ask_id: str, remove_pending: bool = True,
-                        patch_history: bool = True) -> dict | None:
+                        patch_history: bool = True, trust: bool = True) -> dict | None:
     """Shared write path for both save and save-current: append to
     CONFIRMED_FILE, patch location_history, optionally drop the ask from
     pending, and dispatch a silent re-render for any already-shipped day.
@@ -431,6 +431,11 @@ def _write_confirmation(ask: dict, chosen: dict, ask_id: str, remove_pending: bo
 
     patch_history=False (save-at, 2026-10-17): no location_history patch, so no
     re-render; the overlap clause would hand his name to an unrelated row.
+
+    trust=False (save --row-only): the name is an automated guess that settles
+    today's ask only. The visit row is patched and the ask leaves pending, but
+    nothing is appended to confirmed-stops.json, the trusted list that names every
+    future stop within 30 m without asking. A guess never joins it.
 
     This is the ONE place confirmed-stops.json is written from (per
     agent/ops-agent/jobs/location-confirm-ask.md's "Don't write to
@@ -496,7 +501,9 @@ def _write_confirmation(ask: dict, chosen: dict, ask_id: str, remove_pending: bo
         entry["patch_skipped"] = "save-at writes no visit row"
     entry["patched_location_history"] = patched
 
-    if not skipped:
+    if not trust:
+        entry["row_only"] = True
+    elif not skipped:
         confirmed.append(entry)
         _save_json(CONFIRMED_FILE, confirmed)
 
@@ -543,7 +550,11 @@ def cmd_save(args) -> int:
               file=sys.stderr)
         return 3
 
-    entry = _write_confirmation(ask, chosen, args.ask_id)
+    row_only = bool(getattr(args, "row_only", False))
+    if row_only:
+        # Provenance: an automated guess is not the user's own words.
+        chosen = {**chosen, "source": "auto_guess"}
+    entry = _write_confirmation(ask, chosen, args.ask_id, trust=not row_only)
     if entry is None:
         return 4
 
@@ -551,8 +562,9 @@ def cmd_save(args) -> int:
     # Identity, not string comparison: `chosen` IS the primary dict when the user
     # took it (by index or by name), and a different object otherwise.
     primary = ask.get("primary")
+    # A row-only save is a guess, not a correction by the user: no drift row.
     if (primary and chosen is not primary and chosen.get("source") != "user_skipped"
-            and chosen.get("name") and primary.get("name")):
+            and chosen.get("name") and primary.get("name") and not row_only):
         entry["drift_recorded"] = _record_drift(
             centroid=ask.get("centroid"), stop_start=ask.get("first_sample_ts"),
             expected_name=chosen["name"], actual_name=primary["name"],
@@ -1361,6 +1373,11 @@ def main(argv=None) -> int:
     sp_save = sub.add_parser("save", help="record a confirmation for a pending ask")
     sp_save.add_argument("ask_id")
     sp_save.add_argument("venue", help="venue name OR 1-based index from the ask")
+    sp_save.add_argument(
+        "--row-only", action="store_true",
+        help="an automated guess, not the user's answer: patch the visit row and settle the ask, "
+             "but do not add it to confirmed-stops.json",
+    )
     sp_save_current = sub.add_parser(
         "save-current",
         help="record a confirmation against the currently-open (or just-closed) stop — no ask_id needed",
