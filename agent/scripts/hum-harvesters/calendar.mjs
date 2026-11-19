@@ -4,6 +4,7 @@ import path from "node:path";
 import os from "node:os";
 import { execFileSync } from "node:child_process";
 import { readStdinJson, emit, emitNull, stampRun, GOG_ACCOUNT, localConfig } from "./_common.mjs";
+import { eventPeopleLine } from "../../../lib/meeting-event.mjs";
 
 import { installTools } from "../../../lib/root.cjs";
 const HUM_STATE_FILE = installTools("data/hum-state.json");
@@ -143,12 +144,14 @@ export function upcomingSoon(events, now = Date.now()) {
           time_verified: false,
           listed_time: listedTime(e.start),
           location: e.location || null,
+          ...peopleField(e),
         });
       } else {
         soon.push({
           summary: e.summary,
           minsToStart,
           location: e.location || null,
+          ...peopleField(e),
         });
       }
     }
@@ -156,16 +159,28 @@ export function upcomingSoon(events, now = Date.now()) {
   return soon;
 }
 
+/**
+ * Who the event is actually with, from its own organizer and guests (never its
+ * title). A composer may name a person, or say how the user knows them, only
+ * from this line, from the event's notes, or from a page matched on one of
+ * these e-mail addresses; a first name in the title identifies nobody.
+ */
+function peopleField(e) {
+  const people = eventPeopleLine(e);
+  return people ? { people } : {};
+}
+
 /** The candidate's signal for one `upcomingSoon` entry. */
 export function soonSignal(s) {
+  const who = s.people ? ` [the event itself lists: ${s.people}]` : "";
   if (s.time_verified === false) {
     return `"${s.summary}" is on the calendar${s.listed_time ? " for " + s.listed_time : ""}, but that departure time was never checked against a timetable or a booking: check the timetable before counting on it${
       s.location ? " (" + s.location + ")" : ""
-    }`;
+    }${who}`;
   }
   return `"${s.summary}" starts in ${s.minsToStart}min${
     s.location ? " at " + s.location : ""
-  }`;
+  }${who}`;
 }
 
 // ── main (skip when imported for tests) ───────────────────────────────

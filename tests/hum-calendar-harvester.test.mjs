@@ -10,6 +10,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { eventPeople, eventPeopleLine } from "../lib/meeting-event.mjs";
 
 // A synthetic installation: the summary prefixes that mark someone else's
 // events come from agent/local/config/hum-calendar.json.
@@ -264,4 +265,44 @@ test("situationStaleReason drops departures while moving and closed task refs", 
   assert.match(situationStaleReason({ task_ref: "t2" }, {}, ctx), /no longer open/);
   assert.match(situationStaleReason({ task_ref: "gone" }, {}, ctx), /no longer open/);
   assert.equal(situationStaleReason({ task_ref: "gone" }, {}, {}), null);
+});
+
+// ── Who an event is with: its own organizer and guests, never its title ────
+// A first name in a title identifies nobody. The candidate carries what the
+// event itself lists, so a composer can check a name against it.
+const OWNER_EMAIL = "owner@example.org";
+const WITH_GUEST = ev("Sam / Owner - project", "2030-03-11T14:00:00Z", "2030-03-11T14:30:00Z", {
+  organizer: { email: "pat.lane@otherfirm.example", displayName: "Pat Lane" },
+  attendees: [
+    { email: OWNER_EMAIL, self: true, responseStatus: "accepted" },
+    { email: "sam.guest@mail.example", responseStatus: "needsAction" },
+    { email: "room-4@resource.calendar.google.com", resource: true }, // kernel-guard-ok: the calendar service's own room-address domain
+    { email: "pat.lane@otherfirm.example", organizer: true },
+  ],
+});
+
+test("eventPeople: the organizer and guests, not the owner, rooms or groups, and nobody twice", () => {
+  const p = eventPeople(WITH_GUEST, { ownerEmails: [OWNER_EMAIL] });
+  assert.deepEqual(p.organizer, { name: "Pat Lane", email: "pat.lane@otherfirm.example" });
+  assert.deepEqual(p.guests, [{ name: null, email: "sam.guest@mail.example" }]);
+  assert.equal(eventPeopleLine(WITH_GUEST, { ownerEmails: [OWNER_EMAIL] }),
+    "invite from Pat Lane <pat.lane@otherfirm.example>; guests: sam.guest@mail.example");
+});
+
+test("eventPeople: an event only the owner is on names nobody", () => {
+  const solo = { summary: "Sam / Owner", organizer: { email: OWNER_EMAIL, self: true }, attendees: [{ email: OWNER_EMAIL, self: true }] };
+  assert.equal(eventPeopleLine(solo, { ownerEmails: [OWNER_EMAIL] }), "");
+  assert.equal(eventPeopleLine({ summary: "x" }), "");
+  assert.equal(eventPeopleLine(null), "");
+  assert.equal(eventPeopleLine({ organizer: { email: "abc@group.calendar.google.com" } }), "", "a calendar-service address is not a person"); // kernel-guard-ok: the calendar service's own group-address domain
+});
+
+test("the candidate carries who the event lists; an event with no one listed reads exactly as before", () => {
+  const [s] = upcomingSoon(filterScannableEvents([WITH_GUEST]), Date.parse("2030-03-11T13:35:00Z"));
+  assert.match(s.people, /invite from Pat Lane <pat\.lane@otherfirm\.example>/);
+  assert.match(s.people, /guests: sam\.guest@mail\.example/);
+  assert.match(soonSignal(s), /the event itself lists: invite from Pat Lane/);
+  const [b] = upcomingSoon(filterScannableEvents([ev("Weekly sync", "2030-03-11T14:00:00Z", "2030-03-11T15:00:00Z")]), Date.parse("2030-03-11T13:35:00Z"));
+  assert.equal(b.people, undefined);
+  assert.equal(soonSignal(b), '"Weekly sync" starts in 25min');
 });

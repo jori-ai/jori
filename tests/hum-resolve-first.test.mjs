@@ -768,3 +768,60 @@ test("CLI: questions --json measures the gate on questions; --list prints what i
   assert.equal(t.status, 0, t.stderr);
   assert.ok(t.stdout.includes("answered from the records: 1 (50%)") && t.stdout.includes("Booked?"));
 });
+
+// ── who the message names (a first-name match is not an identity) ──────────
+// A calendar ping named a full name and a past introduction for an event titled
+// with only a first name; the first name matched a wiki page. Every calendar
+// line now ends with who the event itself lists, and every reading is told that
+// an identity stands only on the event or message itself.
+
+const ID_EVENT = {
+  summary: "Sam / Owner - project", status: "confirmed",
+  start: { dateTime: "2026-11-19T17:00:00Z" }, end: { dateTime: "2026-11-19T17:30:00Z" },
+  organizer: { email: "pat.lane@otherfirm.example", displayName: "Pat Lane" },
+  attendees: [{ email: "owner@example.org", self: true }, { email: "sam.guest@mail.example" }, { email: "pat.lane@otherfirm.example", organizer: true }],
+};
+const ID_PING = "Sam Wells at 5:00, on Zoom. You introduced him to Alex for the search back in May.";
+const ID_SECTIONS = [{ id: "calendar", title: "Calendar", as_of: "read live", text: "2026-11-19T17:00:00Z → 2026-11-19T17:30:00Z · Sam / Owner - project · invite from Pat Lane <pat.lane@otherfirm.example>; guests: sam.guest@mail.example" }];
+
+test("the calendar section ends every event with who it lists", async () => {
+  const run = async (bin, args) => (args && args[0] === "calendar"
+    ? { ok: true, out: JSON.stringify([ID_EVENT, { summary: "Solo block", start: ID_EVENT.start, end: ID_EVENT.end }]), error: null }
+    : { ok: false, out: "", error: "stub" });
+  const sections = await gatherEvidence({ message: ID_PING, nowMs: Date.parse("2026-11-19T16:35:00Z"), run, fetchFn: async () => ({ ok: false, status: 500 }), storeFile: path.join(tmp(), "store.jsonl"), overlay: [] });
+  const cal = sections.find((x) => x.id === "calendar");
+  assert.ok(cal && cal.text, "the calendar section loaded");
+  assert.match(cal.text, /Sam \/ Owner - project.*invite from Pat Lane <pat\.lane@otherfirm\.example>; guests: sam\.guest@mail\.example/);
+  assert.match(cal.text, /Solo block.*no other organizer or guest listed/);
+});
+
+test("the prompt carries the who-the-message-names rule on every reading, for a comment as well as a question", () => {
+  for (const kind of ["ping", "question"]) {
+    const p = buildPrompt({ message: ID_PING, intent: "hum:calendar:sam-project", lane: "calendar", kind, sections: ID_SECTIONS });
+    assert.match(p, /WHO THE MESSAGE NAMES/);
+    assert.match(p, /A first name matching a wiki page or a contact is NOT enough/);
+    assert.match(p, /never when the rule below on who the message names applies/, "a pure heads-up is not waved through as nothing_to_resolve");
+  }
+  const second = buildPrompt({ message: ID_PING, intent: "hum:calendar:sam-project", lane: "calendar", kind: "question", sections: ID_SECTIONS, lookedUp: { gap: "who" } });
+  assert.match(second, /WHO THE MESSAGE NAMES/);
+});
+
+test("an identity the event does not show becomes a first-name-only FYI instead of going out as written", async () => {
+  const m = async () => ({ error: null, out: JSON.stringify({
+    floats: "who Sam is", verdict: "resolved",
+    answer: "The event lists an invite from pat.lane@otherfirm.example and a guest sam.guest@mail.example; nothing ties either to the Sam on the wiki page.",
+    remaining_gap: null, sources: ["calendar"], checked: "the event's own organizer and guest",
+    useful_fyi: true, fyi_text: "Sam at 5:00, on Zoom. I checked the invite and it doesn't say who he is.", gap_text: null, choices_still_fit: false, look_further: null }) });
+  const d = await resolveFirst({ message: ID_PING, intent: "hum:calendar:sam-project", context: { kind: "ping", dedup_key: "calendar:Sam / Owner - project" } },
+    { gather: async () => ID_SECTIONS, model: m, killSwitch: false, storeFile: path.join(tmp(), "store.jsonl") });
+  assert.equal(d.action, "rewrite");
+  assert.doesNotMatch(d.text, /Wells|introduced/);
+  assert.match(d.text, /^Sam at 5:00/);
+});
+
+test("the hum playbook tells the composer not to float an identity that rests on a first name", () => {
+  const md = fs.readFileSync(path.resolve(HERE, "../agent/ops-agent/jobs/hum.md"), "utf8");
+  assert.match(md, /WHO A MESSAGE NAMES/);
+  assert.match(md, /a wiki hit on a first name is not an identity/);
+  assert.match(md, /matched on THAT E-MAIL ADDRESS/);
+});

@@ -13,6 +13,7 @@ import { createRequire } from "node:module";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { IDENTITY_RULE, rewriteCheckPrompt } from "../lib/speak-gate-agent.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const dir = mkdtempSync(path.join(os.tmpdir(), "sg-lessons-"));
@@ -171,4 +172,78 @@ test("checkRewrite: schema, the time limit, and no 1B first rung", async () => {
     assert.equal(r.ran, true);
     assert.deepEqual(tiers, ["sonnet"]);
   } finally { delete process.env.LOCAL_LLM_BACKEND; }
+});
+
+// ─── Who a message names ───────────────────────────────────────────────────
+//
+// A calendar ping named a full name and a past introduction for an event titled
+// with only a first name; the first name matched a wiki page, and the gate
+// checked the facts against the title and that same page. The event's own
+// organizer and guests were never shown. Made-up people below, the incident's
+// shape: the invite came from a stranger at another firm, the guest is neither
+// of the people the wiki knows by that first name.
+const ID_EVENT = {
+  summary: "Sam / Owner - project", status: "confirmed",
+  start: { dateTime: "2026-11-01T17:00:00Z" }, end: { dateTime: "2026-11-01T17:30:00Z" },
+  organizer: { email: "pat.lane@otherfirm.example", displayName: "Pat Lane" },
+  attendees: [
+    { email: "owner@example.org", self: true, responseStatus: "accepted" },
+    { email: "sam.guest@mail.example", responseStatus: "needsAction" },
+    { email: "room-4@resource.calendar.google.com", resource: true }, // kernel-guard-ok: the calendar service's own room-address domain
+    { email: "pat.lane@otherfirm.example", organizer: true },
+  ],
+};
+const idGog = path.join(dir, "gog-identity.sh");
+writeFileSync(idGog, `#!/bin/sh\ncat <<'J'\n${JSON.stringify([ID_EVENT, { summary: "Solo block", status: "confirmed", start: { dateTime: "2026-11-01T19:00:00Z" }, end: { dateTime: "2026-11-01T20:00:00Z" } }])}\nJ\n`);
+chmodSync(idGog, 0o755);
+const ID_PING = "Sam Wells at 5:00, on Zoom. You introduced him to Alex for the search back in May.";
+const ID_CORRECTED = "Sam at 5:00, on Zoom.";
+
+function identityGate(judgeOut, checkOut = "{}") {
+  const judge = stub(judgeOut), check = stub(checkOut);
+  const r = spawnSync(process.execPath, [path.join(ROOT, "bin", "speak-gate.mjs")], {
+    input: JSON.stringify({ message: ID_PING, intent: "hum:calendar:sam-project", sender: "ops", kind: "proactive", as_of: AS_OF }),
+    encoding: "utf8", timeout: 120000,
+    env: { ...process.env, SPEAK_GATE_NO_LOG: "1", SPEAK_GATE_NO_LESSONS: "1", SUPABASE_SERVICE_ROLE_KEY: "", SUPABASE_ANON_KEY: "",
+      SPEAK_GATE_CLAUDE_BIN: judge.bin, SPEAK_GATE_CHECK_BIN: check.bin, SPEAK_GATE_GOG_BIN: idGog, OUTBOUND_PRECHECK_GOG_BIN: "/usr/bin/false",
+      SPEAK_GATE_SENT_LOG: sentLog },
+  });
+  return { out: JSON.parse(r.stdout.trim().split("\n").pop()), judge, check };
+}
+
+test("the judge is shown the event's organizer and guests, and told a first-name match is not an identity", () => {
+  const { judge } = identityGate(JSON.stringify({ verdict: "send", checks: {}, sources: [], reason: "fine" }));
+  const p = judge.prompt();
+  assert.ok(p.includes(IDENTITY_RULE), "the TRUE check carries the identity rule");
+  assert.match(p, /WHO THE MESSAGE NAMES/);
+  assert.match(p, /first name alone is NOT evidence/);
+  assert.match(p, /"Sam \/ Owner - project".*invite from Pat Lane <pat\.lane@otherfirm\.example>; guests: sam\.guest@mail\.example/);
+  assert.match(p, /"Solo block".*no organizer or guest other than the owner listed/);
+});
+
+test("a name resting on a first-name match is corrected to the bare first name, and the correction is delivered", () => {
+  const judgeOut = JSON.stringify({ verdict: "rewrite", message: ID_CORRECTED,
+    checks: { true: "the event's invite is from pat.lane@otherfirm.example and its guest is sam.guest@mail.example; nothing ties that guest to the Sam on the wiki page, which matched on the first name only",
+      self_resolve: "ok", phrasing: "ok", value: "ok" }, sources: ["calendar event organizer and guests"], reason: "identity rested on a first-name match" });
+  const { out, check } = identityGate(judgeOut, JSON.stringify({ added: [], contradicted: [] }));
+  assert.equal(out.verdict, "rewrite");
+  assert.equal(out.message, ID_CORRECTED);
+  assert.doesNotMatch(out.message, /Wells|introduced/);
+  assert.match(out.checks.true, /first name only/);
+  assert.equal(out.rewrite_added_claim, false);
+  assert.match(check.prompt(), /who a person is/, "the rewrite check counts an identity as a claim");
+});
+
+test("a rewrite that adds a full name or a relationship nothing shows is withdrawn", () => {
+  const judgeOut = JSON.stringify({ verdict: "rewrite", message: "Sam Wells at 5:00, on Zoom.", checks: { true: "ok" }, sources: [], reason: "x" });
+  const { out } = identityGate(judgeOut, JSON.stringify({ added: ["Sam Wells (a full name only a first-name match supports)"], contradicted: [] }));
+  assert.equal(out.verdict, "send");
+  assert.equal(out.rewrite_added_claim, true);
+  assert.match(out.reason, /^Rewrite withdrawn/);
+});
+
+test("the rewrite check's prompt names an identity as a claim that needs an address, an organizer or the thing's own text", () => {
+  const p = rewriteCheckPrompt({ original: ID_PING, rewrite: ID_CORRECTED, findings: {}, records: "" });
+  assert.match(p, /who a person is \(a full name, a company, a relationship\)/);
+  assert.match(p, /never by a first name that happens to match/);
 });

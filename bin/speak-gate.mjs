@@ -75,7 +75,8 @@ import { fileURLToPath } from "node:url";
 import path from "node:path";
 import { createRequire } from "node:module";
 import { resolvedAnswers } from "../lib/speak-gate-live.mjs";
-import { OWNER, ASSISTANT, TOOLS_DOC, GOG, webAllowed as webAllowedFor, runAgent, lastJson, readLessons, checkRewrite } from "../lib/speak-gate-agent.mjs";
+import { OWNER, ASSISTANT, TOOLS_DOC, IDENTITY_RULE, GOG, webAllowed as webAllowedFor, runAgent, lastJson, readLessons, checkRewrite } from "../lib/speak-gate-agent.mjs";
+import { eventPeopleLine } from "../lib/meeting-event.mjs";
 
 const require = createRequire(import.meta.url);
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -229,7 +230,10 @@ function calendarDetails(nowMs) {
               const bits = [e.location ? `@ ${oneLine(e.location, 80)}` : "", e.transparency === "transparent" ? "free" : "",
                 e.eventType && e.eventType !== "default" ? e.eventType : "", e.updated ? `updated ${ts(e.updated)}` : "",
                 (ep && ep.uri) || e.hangoutLink ? `video ${(ep && ep.uri) || e.hangoutLink}` : "",
-                e.description ? `details: ${oneLine(e.description, 240)}` : ""].filter(Boolean).join(" · ");
+                e.description ? `details: ${oneLine(e.description, 240)}` : "",
+                // Who the event is with, from its own organizer and guests: the
+                // only thing that identifies a person the title names by first name.
+                eventPeopleLine(e) || "no organizer or guest other than the owner listed"].filter(Boolean).join(" · ");
               return `- [${when(e.start)} → ${when(e.end)}] "${oneLine(e.summary || "", 100)}"${bits ? ` ${bits}` : ""}`;
             }).join("\n"));
         } catch { resolve(""); }
@@ -297,6 +301,8 @@ Default to "send" only when all four pass. Prefer "rewrite" to "drop" when the c
   return `You are the think-before-you-speak gate for ${OWNER}'s assistant (${ASSISTANT}). Every message to ${OWNER} passes you first. Sender: ${roleName(input.sender)}. Intent: ${input.intent || "unknown"}. Channel: ${input.channel || "chat"}. Now: ${input.as_of || new Date().toISOString()}.${input.as_of ? ` REPLAY: judge as of that instant, the moment it was about to be sent. Anything dated after it (a message, a wiki line, a row, an email) did not exist yet: ignore it. ${OWNER}'s later answer to THIS message never counts as "already answered".` : ""}
 
 ${checks}
+
+${IDENTITY_RULE}
 
 A REWRITE NEVER CLAIMS MORE than the original and the sources you checked show. A message that says a change was approved, applied or committed must not become "live", "running" or "working" unless a source you checked shows it running. Every fact a rewrite states that the original did not (a time, a name, a status, that something did or did not happen) must be one you found: put it in checks with where you found it. Not finding something does not show it is not there: never write that something is missing, unanswered or not on record unless a source you read says so. A separate check reads your rewrite against the original, the evidence below and your checks, and sends the original instead when the rewrite says anything none of them shows.
 
