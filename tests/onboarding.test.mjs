@@ -23,7 +23,7 @@ const { createSetupServer } = await import("../lib/onboarding/server.mjs");
 test("claude auth status: Max on the subscription is the only plan that passes", () => {
   const max = core.parseClaudeStatus({ loggedIn: true, authMethod: "claude.ai", email: "sam@example.com", subscriptionType: "max" });
   assert.deepEqual([max.loggedIn, max.planOk, max.email], [true, true, "sam@example.com"]);
-  assert.equal(core.parseClaudeStatus({ loggedIn: true, authMethod: "claude.ai", subscriptionType: "pro" }).planOk, false);
+  assert.equal(core.parseClaudeStatus({ loggedIn: true, authMethod: "claude.ai", subscriptionType: "pro" }).planOk, true, "every Claude plan is allowed");
   const api = core.parseClaudeStatus({ loggedIn: true, authMethod: "console", subscriptionType: null });
   assert.equal(api.viaSubscription, false);
   assert.equal(api.planOk, false);

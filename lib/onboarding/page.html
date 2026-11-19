@@ -267,7 +267,7 @@ form.code { margin-top: 24px; max-width: 520px; }
         <div class="card"><b>Work sessions</b><p>Sort your mail, run your scheduled jobs, do the research you ask for.</p></div>
         <div class="card"><b>Quick checks</b><p>Small yes/no calls, like whether a message is worth sending you.</p></div>
       </div>
-      <p class="note">I’m built for Claude Max. The control room’s Budget page shows how much of your plan I use each day, and you can turn off the busiest jobs if you get close to the limit.</p>
+      <p class="note">Any Claude plan works; I’m built for Max. The control room’s Budget page shows how much of your plan I use each day, and you can turn off the busiest jobs if you get close to the limit.</p>
     </section>
 
     <section class="step" data-step="you" hidden>
@@ -485,7 +485,7 @@ function render() {
   const plan = cl.plan ? cl.plan[0].toUpperCase() + cl.plan.slice(1) : null;
   setRows("claudeRows", [
     !cl.installed ? row("need", "Claude Code isn’t installed", "Go back one step and install it first.")
-      : cl.loggedIn && cl.planOk ? row("ok", `Signed in as ${cl.email}`, `${plan} plan, which is what I’m built for.`)
+      : cl.loggedIn && cl.planOk ? row("ok", `Signed in as ${cl.email}`, cl.plan === "max" || cl.plan === "ultra" ? `${plan} plan, which is what I’m built for.` : `${plan} plan. That works; on busy days I may reach its limit, and the Budget page shows how much I use.`)
       : cl.loggedIn && !cl.viaSubscription ? row("warn", `Signed in with an API account${cl.email ? ` (${cl.email})` : ""}`, "I only run on a Claude subscription. Sign in again and choose your Claude.ai account.")
       : cl.loggedIn ? row("warn", `Signed in as ${cl.email}`, `${plan || "This"} plan. I work best on Max; on smaller plans I’ll hit the usage limit within hours of a normal day.`)
       : login?.state === "running" ? row("work", "Waiting for you in the browser", "Finish signing in on the Claude page that opened, then come back here.")

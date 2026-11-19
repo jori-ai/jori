@@ -6,7 +6,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { SERVICES, connectService, servicesStatus, supabaseSaved, refFromUrl, configureSupabaseSignIn, APP_REDIRECT } from "../lib/onboarding/services.mjs";
+import { SERVICES, connectService, servicesStatus, supabaseSaved, refFromUrl, configureSupabaseSignIn, configureSupabaseEmailCode, APP_REDIRECT } from "../lib/onboarding/services.mjs";
 import { encodePairing, decodePairing, buildPairing, PAIR_PREFIX } from "../lib/onboarding/pairing.mjs";
 import { starterJobs, waitingJobs } from "../lib/onboarding/core.mjs";
 
@@ -127,4 +127,13 @@ test("a starter job that needs a service waits for it", () => {
   assert.ok(starterJobs(repo, ["whatsapp"]).some((j) => j.name === "message-digest"));
   assert.ok(waitingJobs(repo, []).some((j) => j.name === "message-digest"));
   assert.ok(starterJobs(repo, []).every((j) => j.when));
+});
+
+test("emailed sign-in code: both templates carry the code", async () => {
+  let sent;
+  const c = await configureSupabaseEmailCode({ ref: "abcd1234", token: "t", name: "Jori", fetchFn: async (_u, opt) => { sent = JSON.parse(opt.body); return res(200); } }); // control-scan-ok: test fixture
+  assert.equal(c.ok, true);
+  assert.equal(sent.external_email_enabled, true);
+  assert.match(sent.mailer_templates_magic_link_content, /\{\{ \.Token \}\}/);
+  assert.match(sent.mailer_templates_confirmation_content, /\{\{ \.Token \}\}/);
 });

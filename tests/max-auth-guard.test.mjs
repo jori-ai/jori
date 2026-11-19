@@ -51,9 +51,12 @@ function check(status) {
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 }
 
-test("accepts only a claude.ai login on the Max plan", () => {
+test("accepts a claude.ai login on a subscription plan (Pro, Max, Ultra), nothing else", () => {
   assert.match(check(STATUSES.max), /^rc=0 loggedIn=true authMethod=claude\.ai apiProvider=firstParty subscription=max$/);
-  for (const k of ["apiKey", "bedrock", "loggedOut", "pro", "garbage"]) {
+  assert.match(check(STATUSES.pro), /^rc=0 .*subscription=pro$/, "Pro is allowed (2026-11-18)");
+  assert.match(check(JSON.stringify({ loggedIn: true, authMethod: "claude.ai", apiProvider: "firstParty", subscriptionType: "ultra" })), /^rc=0 /, "Ultra is allowed");
+  assert.match(check(JSON.stringify({ loggedIn: true, authMethod: "claude.ai", apiProvider: "firstParty", subscriptionType: "free" })), /^rc=1 /, "no subscription is refused");
+  for (const k of ["apiKey", "bedrock", "loggedOut", "garbage"]) {
     assert.match(check(STATUSES[k]), /^rc=1 /, `${k} must be refused`);
   }
 });

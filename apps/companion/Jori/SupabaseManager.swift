@@ -105,6 +105,21 @@ enum SupabaseManager {
         _ = try await shared.auth.refreshSession()
     }
 
+    /// Email sign-in, step 1: Supabase emails a one-time code to `email`.
+    /// The installation's setup turns this on for the project
+    /// (lib/onboarding/services.mjs configureSupabaseEmailCode); who may then
+    /// read anything is still the allowlist (`jori_allowed_users`).
+    static func sendEmailCode(to email: String) async throws {
+        try await shared.auth.signInWithOTP(email: email, shouldCreateUser: true)
+    }
+
+    /// Email sign-in, step 2: the code from the email signs this device in.
+    @MainActor
+    static func verifyEmailCode(email: String, code: String) async throws {
+        try await shared.auth.verifyOTP(email: email, token: code, type: .email)
+        await mirrorSessionForExtension()
+    }
+
     /// Launch Google OAuth via a system web view, hand the callback to Supabase,
     /// and persist the resulting session to Keychain. Returns on success; throws on cancel/error.
     @MainActor
