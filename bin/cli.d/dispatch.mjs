@@ -11,7 +11,7 @@
 // With no job, `--task T` posts a free-text task to ops (:9092), the shape a
 // playbook used to build with `curl` and `cat secrets/webhook-token` — which
 // an agent may no longer read itself (docs/agent-secrets.md § 2). `--source S`
-// names the dispatch source (default jori-cli).
+// names the dispatch source (default: the job's name, or jori-cli for a free-text task).
 
 import fs from "node:fs";
 import path from "node:path";
@@ -93,7 +93,10 @@ export default {
       }
       return;
     }
-    const source = getFlag(args, "--source") || "jori-cli";
+    // The job's own name labels the dispatch in the supervisor's log and
+    // /health (what self-status reports), as the cron triggers do; "jori-cli"
+    // only for a free-text task.
+    const source = getFlag(args, "--source") || job || "jori-cli";
     const payload = JSON.stringify({ ...(job ? { job } : {}), source, ...(task ? { task } : {}) });
     let chain = job ? TIERS[resolveTier(job)] : TIERS.heavy;
     const portFlag = getFlag(args, "--port");
