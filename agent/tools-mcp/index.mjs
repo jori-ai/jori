@@ -114,6 +114,9 @@ const DEFAULT_INSTRUCTIONS = `${ASSISTANT}'s built-in tools. Keep responses shor
 
 ## Quick Reference
 
+### Your own state
+- self_status — what ${ASSISTANT} is doing right now: dispatches, purchases + approvals, builds, background jobs, failing jobs, what waits on ${OWNER}. Read it before saying anything about your own work.
+
 ### Loop primitives
 - check_later — one-shot self-wake after N seconds (survives a restart)
 - delegate / delegate_status — hand a self-contained research task to a background sub-agent
@@ -225,6 +228,31 @@ const TOOLS = [
         const tail = r.status === "failed" ? ` — ${r.error || "unknown error"}` : "";
         return `#${r.id} [${r.status}] ${String(r.task).slice(0, 90)}${tail}  (${when})`;
       }).join("\n");
+    },
+  },
+
+  // ── Self-awareness: what Jori is doing right now (lib/self-status.mjs) ──
+  {
+    name: "self_status",
+    description: "What " + ASSISTANT + " is doing right now and how it is going, from live state: dispatches in flight and recent, purchases and their Face-ID approvals, builds, background jobs, failing scheduled jobs, open questions and approvals waiting on " + OWNER + ". Each item has its raw status and age. Call it BEFORE saying anything about the state of your own work (is it done, being built, waiting, why it stopped); never answer that from memory or a guess. `match` narrows to items containing that text (an id, a site, a job name).",
+    schema: {
+      type: "object",
+      properties: {
+        match: { type: "string", description: "keep only items whose id/description/state contains this text (case-insensitive)" },
+        section: { type: "string", description: "comma-separated subset: dispatches,forks,purchases,builds,jobs,cron,questions,approvals,roles,watches,doctor" },
+        deep: { type: "boolean", description: "also run the full health checks (jori doctor, ~10 s)" },
+        json: { type: "boolean", description: "the full JSON instead of the compact text" },
+      },
+    },
+    run: async (a) => {
+      try {
+        const SS = await import("../../lib/self-status.mjs");
+        const sections = String(a.section || "").split(",").map((x) => x.trim()).filter((x) => SS.SECTIONS.includes(x));
+        const snap = await SS.collect({ match: a.match || null, sections, deep: !!a.deep || sections.includes("doctor") });
+        if (a.json) return JSON.stringify(snap, null, 2);
+        let tz; try { tz = require("../../lib/instance.cjs").instanceValue("tz") || undefined; } catch {}
+        return SS.render(snap, { tz });
+      } catch (e) { return `Error: could not read Jori's state: ${e.message}. Say you could not check, rather than guessing.`; }
     },
   },
 

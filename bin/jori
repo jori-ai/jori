@@ -149,7 +149,8 @@ function cmdHelp(extensions = []) {
   console.log('  tasks run <name> [--task T]   dispatch task via webhook (T: this request, for a job)\n');
   console.log(c.bold('HEALTH'));
   console.log('  whereami [--json|--banner|--role]  which machine am I on (the production host vs another)');
-  console.log('  status                        system health dashboard');
+  console.log('  status                        system health dashboard + what Jori is doing');
+  console.log('  status --work [--json] [--match T] [--section S] [--deep]   only the work snapshot: running, waiting on you, stuck, failed, done (bin/self-status)');
   console.log('  services [--json]             LaunchAgents + tmux status');
   console.log('  doctor [--json] [--repair]    run drift checks; --repair auto-fixes schedule drift + orphan scripts');
   console.log(`  activity [--json]             ${OWNER}'s inferred state (active/winding_down/sleeping)`);
@@ -431,7 +432,17 @@ function cmdTasksRun(args) {
 }
 
 // --- status ---
+// `jori status --work [self-status flags]`: what Jori is doing right now
+// (bin/self-status, lib/self-status.mjs). Plain `jori status` shows the health
+// dashboard and then the same work snapshot.
+function runSelfStatus(extra) {
+  const { spawnSync } = require('child_process');
+  const r = spawnSync(process.execPath, [path.join(__dirname, 'self-status'), ...extra], { stdio: 'inherit' });
+  return r.status ?? 1;
+}
+
 function cmdStatus(args) {
+  if (hasFlag(args, '--work')) { process.exit(runSelfStatus(args.filter((a) => a !== '--work'))); }
   if (hasFlag(args, '--json')) { console.log(JSON.stringify(collectStatus(), null, 2)); return; }
   const s = collectStatus();
   console.log(c.bold('SYSTEM STATUS') + c.dim('  ' + new Date().toISOString()) + '\n');
@@ -517,6 +528,10 @@ function cmdStatus(args) {
   } else {
     console.log('  ' + c.dim('(none)'));
   }
+
+  // What Jori is doing (the work snapshot; `jori status --work` for it alone).
+  console.log('\n' + c.bold('WORK') + c.dim('  (jori status --work [--json|--match <text>|--section …])'));
+  runSelfStatus(['--done', '5']);
 }
 
 function fetchJson(url) {

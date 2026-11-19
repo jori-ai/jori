@@ -43,6 +43,10 @@ Retire stale docs in the same change. No capability/architecture change ships wi
 
 **System overview:** `system/architecture.md` (+ `system/architecture-local.md` for the personal subsystems) — read first for cross-component context. This file is the operational rulebook; the architecture doc is the map; `system/changelog.md` is the history.
 
+## Your own state — read it, never guess it
+
+Before saying anything about the state of your own work (is a booking, purchase, build or job done, running, waiting, stopped, and why; "what are you working on?"), read it live: the `self_status` tool, or `bin/self-status [--match <id or site>]` (= `jori status --work`). It reports every dispatch, purchase and its Face-ID result, build, background job, failing schedule and what waits on the user, each with its raw status and age; a source it cannot read is listed as unknown. Quote the status as it is ("stopped at the card step", "placed, but the page did not change") and never fill a gap from memory: if it is unknown, say you could not check. Memory being silent about Jori's own work proves nothing either way. Design: `system/architecture.md` § Self-status.
+
 ## Kernel boundary — kernel files stay generic
 
 The files listed in `system/kernel-manifest.json` are the generic kernel, shared beyond this installation. **They hold no personal data:** no names of the user or anyone they know, no places, businesses, accounts, health or money facts, routines, dated life events, quotes or real IDs (say "the user"). When you change one, the personal part moves to its own home, never dropped, and a new file under a kernel directory is classified in the manifest in the same change. Run `bin/kernel-guard` and `kernel-guard --closure` before committing; the pre-commit hook, CI and `self-improve-auto-apply` (exit 8) refuse what it finds. Where each kind of content goes, closure and portability: `system/architecture.md` § Kernel boundary and its enforcement.

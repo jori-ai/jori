@@ -657,10 +657,28 @@ Edits to these CLAUDE.md files and local rules take effect at the next session s
 └── .github/workflows/               CI (iOS/macOS TestFlight)
 ```
 
+## Self-status — what Jori is doing right now
+
+One read of every place Jori's own work lives, so every agent (chat, the ops tiers, role sessions, forks) answers "is it done?", "what are you working on?" and "why did it stop?" from live state, never from memory (agent/CLAUDE.md § Your own state). `lib/self-status.mjs` (`collect`, `render`), the CLI `bin/self-status` (front door `jori status --work`; plain `jori status` prints it under the health dashboard) and the `self_status` MCP tool in `agent/tools-mcp` (every profile, including `watcher`). Read-only; the default read takes well under a second.
+
+| Section | Source |
+|---|---|
+| dispatches | each supervisor's `/health` (in flight, paused, rate-limit hold, child alive), its persisted queue (`data/dispatcher-queue[-<agent>].json`, chat's `agent/supervisor/state/chat/queue.json`), and its log's `disp <id> → / done / error` lines (a start with neither end, not in flight, after 10 min = interrupted) |
+| forks | `pending_forks` in `data/memory-index.db` (delegate) |
+| purchases | `data/purchases/queue.json` (a stopped request with a later one after it is history, not stuck) and `purchase_approvals` with the poller's `result` (an unchanged page after the click is flagged) |
+| builds | `data/build-queue/{pending,held,running,asks,parked,done,failed}`; a held build carries the allowance governor's reason from `chat-build.log`, a finished one its result's first line |
+| jobs | `job-run` registry, `data/jobs/*.json` |
+| cron | `data/cron-runs.jsonl` (labels whose last run failed), `job-failure-watch` incidents and repair queue, `watchdog.log` `supervisor-code-reload … stale, holding` (new code not loaded) |
+| questions, approvals, roles, watches | `open-questions`, `action_approvals` + `self_improve_approvals`, `data/role-queue`, `watch_rules` counts |
+| doctor | `jori doctor --json`, only with `--deep` (~10 s) |
+
+Each item is `{section, bucket, id, what, state, at, age_s, detail}`; buckets are running, waiting (on the user), stuck, failed, queued, done (last 24 h; purchases 48 h). States are the source's own words. A source that cannot be read is listed under `unknown`, never shown as empty. `--match` is a plain substring filter over our own records (an id, a site, a job name). The outbound precheck reads a local-only snapshot (dispatches, purchases, builds, jobs) as evidence, so a message about Jori's own work is judged against it rather than against silent memory. It does not cover what Jori said (`recall_events`, the transcript) or how Jori is built (this file).
+
 ## Live State Queries
 
 ```
-jori status                   # health dashboard
+jori status                   # health dashboard + what Jori is doing (work snapshot)
+jori status --work [--json] [--match T] [--section S] [--deep] [--local]  # = bin/self-status: running, waiting on the user, stuck, failed, queued, done — each with its raw status and age
 jori services                 # LaunchAgents + tmux
 jori tasks                    # automated task registry
 jori cron                     # scheduled jobs with matched task names

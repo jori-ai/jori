@@ -711,6 +711,22 @@ try {
   if (hits.length) utterancesText = hits.map(u => `  - ${u.rendered}`).join("\n");
 } catch {}
 
+// ─── Jori's own work, live (lib/self-status.mjs) ──────────────────────────
+// A message about Jori's own work (a booking, a purchase, a build, a job) used
+// to be judged against memory alone, which is silent about it: one was
+// suppressed because "memory is silent on the booking", another said a
+// booking was "being built" after it had stopped (2026-11-18). The live
+// snapshot is local-only (no Supabase, no doctor) so it costs well under a
+// second, and skipped in a replay, which cannot see the past state.
+let workStateText = "";
+if (!AS_OF) {
+  try {
+    const SS = await import("../lib/self-status.mjs");
+    const snap = await SS.collect({ remote: false, sections: ["dispatches", "purchases", "builds", "jobs"] });
+    if (snap.items.length) workStateText = SS.render(snap, { tz: instance().tz || undefined, doneLimit: 5, footer: false }).slice(0, 2200);
+  } catch {}
+}
+
 // ─── Build prompt ────────────────────────────────────────────────────────
 const msgBlock = recentMessages.length === 0
   ? "(no phone-channel messages in the last 8h)"
@@ -746,6 +762,10 @@ const contradictionBlock = claimContradictionText
 
 const utterancesBlock = utterancesText
   ? `\nWHAT ${OWNER_UP} SAID (dated, verbatim, from the full reply log — not just the last 48h):\n${utterancesText}\nIf one of these already answers or settles what this message raises, SUPPRESS. Re-asking something they already answered is the failure mode they complain about most.\n`
+  : "";
+
+const workStateBlock = workStateText
+  ? `\n${ASSISTANT.toUpperCase()}'S OWN WORK, LIVE (read from its queues and logs a moment ago; authoritative for ${ASSISTANT}'s own jobs, bookings, purchases and builds, which memory is usually silent about, so that silence is never a reason to suppress). A message saying such work is under way or done when this shows it stopped, failed or never started contradicts it, as in criterion (b); a message that matches it is consistent:\n${workStateText}\n`
   : "";
 
 // ─── The self-narration rule in the prompt below ──────────────────────────
@@ -823,7 +843,7 @@ Proposed message:
 
 Sender (agent label): ${senderLabel}    (ops = autonomous backend / harvester / digest / cron; chat = chat-agent escalating via jori-send-curl; infra = supervisor liveness alert)
 Intent (sender's tag): ${intent}
-${supportingBlock}${claimFactsBlock}${contradictionBlock}${utterancesBlock}${wikiBlock}${resolvedTopicsBlock}${sameDayPingsBlock}
+${supportingBlock}${claimFactsBlock}${contradictionBlock}${utterancesBlock}${workStateBlock}${wikiBlock}${resolvedTopicsBlock}${sameDayPingsBlock}
 Phone-channel transcript, last 8h (oldest first):
 ${msgBlock}
 
@@ -860,6 +880,7 @@ if (EVIDENCE_MODE) {
       authoritative_facts: claimFactsText,
       travel_check_flagged: claimContradictionText,
       owner_said: utterancesText,
+      own_work_live: workStateText,
       long_term_memory: wikiContext,
       acknowledged_topics_48h: resolvedTopicsText,
       hum_pings_today: sameDayPingsText,
