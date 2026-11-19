@@ -40,6 +40,16 @@ test("rewrite delivers the gate's text and keeps the original", async () => {
   assert.equal(r.review.original, "worse");
 });
 
+test("a rewrite the gate withdrew (its check found an added claim) delivers the original and records why", async () => {
+  fakeJudge({ verdict: "send", reason: "Rewrite withdrawn, sent as written (nothing shows the 3pm time).",
+    checks: { true: "ok", rewrite_check: { added_claim: true, added: ["the 3pm time"], contradicted: [], withdrawn: "Call at 3pm" } }, rewrite_added_claim: true });
+  const r = await gateOutbound({ message: "Call this afternoon", channel: "chat" });
+  assert.equal(r.text, "Call this afternoon");
+  assert.equal(r.review.verdict, "send");
+  assert.equal(r.review.checks.rewrite_check.added_claim, true);
+  assert.equal(r.review.checks.rewrite_check.withdrawn, "Call at 3pm");
+});
+
 test("a proactive drop is held and recorded with no message id", async () => {
   fakeJudge({ verdict: "drop", reason: "nothing new" });
   const before = rows().length;

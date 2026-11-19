@@ -43,32 +43,45 @@
 // outbound precheck in evidence mode (transcript, calendar, the user's dated
 // words, wiki hits, acknowledged topics, today's pings, travel facts and any
 // place/date pairing the travel check flagged), the sending role's own
-// conversation with each question's state, the questions still open, and the
-// user's standing rules (agent/local/config/speak-gate.json standing_rules).
+// conversation with each question's state, the questions still open, the
+// newest records (recentRecords: the email the user sent in the last 24 h,
+// show and film verdicts of the last 48 h, the calendar with each event's
+// details), and the user's standing rules (agent/local/config/speak-gate.json
+// standing_rules).
+//
+// A REWRITE IS CHECKED before it replaces the sender's text (vetRewrite): a
+// tool-less Haiku pass, Sonnet if that answer is off schema, asks whether it
+// states anything that neither the original, the evidence nor the judge's own
+// findings show, or that the evidence contradicts. If so, or if the check
+// cannot finish, the original is sent as written: the gate's fail-open path.
 //
 // Claude only, never Jev: money and health messages pass through here too.
 //
 // Stdin:  {message, intent?, sender? (role id), kind?: "proactive"|"reply"|"report",
 //          reply_to_text?, channel?, supporting_data?, fixed_choices? (a card's
 //          option labels), as_of? (replay)}
-// Stdout: {verdict, message?, research_plan?, reason, checks, sources, ms}
+// Stdout: {verdict, message?, research_plan?, reason, checks, sources, ms, evidence_ms?,
+//          rewrite_added_claim?, rewrite_claims?}; a checked rewrite carries
+//          checks.rewrite_check {added_claim, added, contradicted, tier | error, ms, withdrawn?}
 // Fail-open: an error emits {verdict:"send", reason:"gate_error:…"}.
 // Env: SPEAK_GATE_LOG (default data/speak-gate-log.jsonl), SPEAK_GATE_NO_LOG=1,
-//      SPEAK_GATE_TIMEOUT_S (proactive 300, reply 120).
+//      SPEAK_GATE_TIMEOUT_S (proactive 300, reply 120), SPEAK_GATE_SENT_LOG (default
+//      data/email-sent.jsonl), SPEAK_GATE_GOG_BIN / SPEAK_GATE_CHECK_BIN (test stand-ins).
 "use strict";
 
-import { spawnSync } from "node:child_process";
-import { appendFileSync, mkdirSync, readFileSync } from "node:fs";
+import { execFile, spawnSync } from "node:child_process";
+import { appendFileSync, closeSync, fstatSync, mkdirSync, openSync, readFileSync, readSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 import { createRequire } from "node:module";
 import { resolvedAnswers } from "../lib/speak-gate-live.mjs";
-import { OWNER, ASSISTANT, TOOLS_DOC, webAllowed as webAllowedFor, runAgent, lastJson, readLessons } from "../lib/speak-gate-agent.mjs";
+import { OWNER, ASSISTANT, TOOLS_DOC, GOG, webAllowed as webAllowedFor, runAgent, lastJson, readLessons, checkRewrite } from "../lib/speak-gate-agent.mjs";
 
 const require = createRequire(import.meta.url);
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const { MODELS } = require(path.join(ROOT, "lib", "models.cjs"));
 const { localConfig } = require(path.join(ROOT, "lib", "instance.cjs"));
+const { installTools } = require(path.join(ROOT, "lib", "root.cjs"));
 try { require(path.join(ROOT, "lib", "load-env.js")).loadEnv(); } catch { /* env may be set */ }
 const rest = require(path.join(ROOT, "lib", "supabase-rest.js"));
 let org = null;
@@ -159,6 +172,82 @@ function workRecords(message) {
   } catch { return ""; }
 }
 
+// The newest records, picked by time alone (code does not read the message to
+// choose them). The nightly audit's wrong rewrites leaned on searches that
+// missed something written minutes or hours before: a reply the user had just
+// sent, a rating just recorded, what a calendar event itself says. Each source
+// is bounded and fails to nothing; they run beside the other evidence reads.
+const sentLog = () => process.env.SPEAK_GATE_SENT_LOG || installTools("data", "email-sent.jsonl");
+
+function tailLines(file, bytes = 262144) {
+  const fd = openSync(file, "r");
+  try {
+    const size = fstatSync(fd).size;
+    const start = Math.max(0, size - bytes);
+    const buf = Buffer.alloc(size - start);
+    readSync(fd, buf, 0, buf.length, start);
+    const lines = buf.toString("utf8").split("\n");
+    return start > 0 ? lines.slice(1) : lines; // the first line may be cut
+  } finally { closeSync(fd); }
+}
+
+function sentMail(nowMs) {
+  try {
+    const rows = [];
+    for (const l of tailLines(sentLog())) {
+      if (!l.trim()) continue;
+      let e; try { e = JSON.parse(l); } catch { continue; }
+      const t = Date.parse(e.ts || "");
+      if (!e.from_me || !(t > nowMs - 24 * 3600e3 && t <= nowMs)) continue;
+      rows.push(`- [${ts(e.ts)}] to ${e.to || "?"}${e.cc ? ` cc ${e.cc}` : ""} · "${oneLine(e.subject || "", 120)}": ${oneLine(e.text || "", 300)}`);
+    }
+    return rows.slice(-12).reverse().join("\n");
+  } catch { return ""; }
+}
+
+async function watchVerdicts(nowMs, asOf) {
+  try {
+    const before = asOf ? `&created_at=lt.${encodeURIComponent(asOf)}` : "";
+    const rows = await rest.request(`/rest/v1/watch_feedback?select=verdict,note,season_n,source,created_at,watch_titles(name)&created_at=gt.${encodeURIComponent(new Date(nowMs - 48 * 3600e3).toISOString())}${before}&order=created_at.desc&limit=8`, { timeoutMs: 5000 });
+    return (rows || []).map((r) => `- [${ts(r.created_at)}] ${(r.watch_titles && r.watch_titles.name) || "?"}${r.season_n ? ` season ${r.season_n}` : ""}: ${r.verdict}${r.note ? ` (${oneLine(r.note, 160)})` : ""} · via ${r.source || "?"}`).join("\n");
+  } catch { return ""; }
+}
+
+function calendarDetails(nowMs) {
+  const when = (x) => (x && (x.dateTime || x.date)) || "?";
+  return new Promise((resolve) => {
+    try {
+      execFile(GOG, ["calendar", "list", "--json", "--results-only", "--all",
+        "--from", new Date(nowMs - 3 * 3600e3).toISOString(), "--to", new Date(nowMs + 48 * 3600e3).toISOString()],
+      { encoding: "utf8", timeout: 6000, maxBuffer: 4 * 1024 * 1024 }, (err, stdout) => {
+        try {
+          const evs = err ? [] : JSON.parse(stdout);
+          resolve((Array.isArray(evs) ? evs : []).filter((e) => e && e.status !== "cancelled")
+            .sort((a, b) => String(when(a.start)).localeCompare(String(when(b.start)))).slice(0, 15)
+            .map((e) => {
+              const ep = ((e.conferenceData && e.conferenceData.entryPoints) || []).find((p) => p.entryPointType === "video");
+              const bits = [e.location ? `@ ${oneLine(e.location, 80)}` : "", e.transparency === "transparent" ? "free" : "",
+                e.eventType && e.eventType !== "default" ? e.eventType : "", e.updated ? `updated ${ts(e.updated)}` : "",
+                (ep && ep.uri) || e.hangoutLink ? `video ${(ep && ep.uri) || e.hangoutLink}` : "",
+                e.description ? `details: ${oneLine(e.description, 240)}` : ""].filter(Boolean).join(" · ");
+              return `- [${when(e.start)} → ${when(e.end)}] "${oneLine(e.summary || "", 100)}"${bits ? ` ${bits}` : ""}`;
+            }).join("\n"));
+        } catch { resolve(""); }
+      });
+    } catch { resolve(""); }
+  });
+}
+
+async function recentRecords(asOf) {
+  const p = asOf ? Date.parse(asOf) : NaN;
+  const nowMs = Number.isFinite(p) ? p : Date.now();
+  const [watch, cal] = await Promise.all([watchVerdicts(nowMs, asOf), calendarDetails(nowMs)]);
+  const S = (title, body) => (body ? `${title}\n${body}` : "");
+  return [S(`Email ${OWNER} sent, last 24 h (newest first; the text they wrote, without the quoted thread):`, sentMail(nowMs)),
+    S("Shows and films rated, last 48 h:", watch),
+    S("Calendar, 3 h ago to 2 days ahead, with each event's own details:", cal)].filter(Boolean).join("\n\n");
+}
+
 // The research session and its tools live in lib/speak-gate-agent.mjs (shared
 // with the nightly audit). Money and health messages are researched without
 // the web.
@@ -171,11 +260,20 @@ function roleName(id) {
   try { const r = org.org().roles.find((x) => x.id === id); return r ? `${r.name} (${r.title})` : id; } catch { return id; }
 }
 
+const E = (title, body) => (body && String(body).trim() ? `\n## ${title}\n${String(body).trim()}\n` : "");
+
+// Everything the judge is shown besides the message and its instructions. The
+// rewrite check reads the same text, so a claim the judge could take from it
+// is never counted as added.
+function evidenceText(input, ev, extra) {
+  const reply = input.kind === "reply" || input.kind === "report";
+  return `${E("TAPPABLE CHOICES SENT WITH IT (fixed: a rewrite must still be a question these answer)", Array.isArray(input.fixed_choices) ? input.fixed_choices.join(" | ") : "")}${reply ? E(`WHAT ${OWNER.toUpperCase()} WROTE (being answered)`, input.reply_to_text) : ""}${E("THIS ROLE'S CONVERSATION, LAST 14 DAYS (question states are authoritative)", extra.thread)}${E("QUESTIONS STILL OPEN (any role)", extra.open)}${E("NEWEST RECORDS (read by code just before you; they may be newer than a search reaches, and a claim they contradict is false)", extra.recent)}${E(`EARLIER WORK DONE FOR ${OWNER.toUpperCase()} (work records: the newest record and its updates win; a superseded recommendation is not the current one; work-record show <id> has the full text)`, extra.work)}${E("ANSWERS THIS GATE ALREADY FOUND (a question it held because it found the answer; asking one again is a re-ask: resolve it with the same answer)", extra.found)}${E(`WHAT ${OWNER.toUpperCase()} SAID (dated, from the reply log)`, ev.owner_said)}${E("TRAVEL TIMELINE FACTS", ev.authoritative_facts)}${E("TRAVEL CHECK FLAGGED (code paired a place and a date; decide yourself whether the message actually claims where the user is)", ev.travel_check_flagged)}${E("LONG-TERM MEMORY (wiki hits)", ev.long_term_memory)}${E("TOPICS ACKNOWLEDGED IN THE LAST 48H", ev.acknowledged_topics_48h)}${E("PINGS ALREADY SENT TODAY", ev.hum_pings_today)}${E("SENDER'S SUPPORTING DATA", ev.supporting_data)}${E("CHAT, LAST 8H", ev.transcript_last_8h)}${E("CALENDAR, REST OF TODAY", ev.calendar_today)}`;
+}
+
 function prompt(input, ev, extra) {
   // A report email the user set up (kind "report") is checked like a reply:
   // truth and phrasing, never held.
   const reply = input.kind === "reply" || input.kind === "report";
-  const E = (title, body) => (body && String(body).trim() ? `\n## ${title}\n${String(body).trim()}\n` : "");
   const rules = (CFG.standing_rules || []).map((r) => `- ${r}`).join("\n");
   // The nightly audit's feedback (bin/speak-gate-audit.mjs): an Opus review of
   // this gate's past decisions, distilled into lessons.
@@ -200,7 +298,7 @@ Default to "send" only when all four pass. Prefer "rewrite" to "drop" when the c
 
 ${checks}
 
-A REWRITE NEVER CLAIMS MORE than the original and the sources you checked show. A message that says a change was approved, applied or committed must not become "live", "running" or "working" unless a source you checked shows it running.
+A REWRITE NEVER CLAIMS MORE than the original and the sources you checked show. A message that says a change was approved, applied or committed must not become "live", "running" or "working" unless a source you checked shows it running. Every fact a rewrite states that the original did not (a time, a name, a status, that something did or did not happen) must be one you found: put it in checks with where you found it. Not finding something does not show it is not there: never write that something is missing, unanswered or not on record unless a source you read says so. A separate check reads your rewrite against the original, the evidence below and your checks, and sends the original instead when the rewrite says anything none of them shows.
 
 RESEARCH FIRST. Use the tools to verify the claims and look for answers before you decide; check several sources, not one. Budget: a few minutes. You cannot change anything, and must not try.
 
@@ -208,7 +306,7 @@ ${TOOLS_DOC}
 ${rules ? `\n## ${OWNER.toUpperCase()}'S STANDING RULES (their own words; they override your judgment)\n${rules}\n` : ""}${lessons ? `\n## LESSONS FROM THE NIGHTLY AUDIT (a senior reviewer re-checked your past decisions; apply these. ${OWNER}'s standing rules win over them)\n${lessons}\n` : ""}
 THE MESSAGE:
 """${input.message}"""
-${E("TAPPABLE CHOICES SENT WITH IT (fixed: a rewrite must still be a question these answer)", Array.isArray(input.fixed_choices) ? input.fixed_choices.join(" | ") : "")}${reply ? E(`WHAT ${OWNER.toUpperCase()} WROTE (being answered)`, input.reply_to_text) : ""}${E("THIS ROLE'S CONVERSATION, LAST 14 DAYS (question states are authoritative)", extra.thread)}${E("QUESTIONS STILL OPEN (any role)", extra.open)}${E(`EARLIER WORK DONE FOR ${OWNER.toUpperCase()} (work records: the newest record and its updates win; a superseded recommendation is not the current one; work-record show <id> has the full text)`, extra.work)}${E("ANSWERS THIS GATE ALREADY FOUND (a question it held because it found the answer; asking one again is a re-ask: resolve it with the same answer)", extra.found)}${E(`WHAT ${OWNER.toUpperCase()} SAID (dated, from the reply log)`, ev.owner_said)}${E("TRAVEL TIMELINE FACTS", ev.authoritative_facts)}${E("TRAVEL CHECK FLAGGED (code paired a place and a date; decide yourself whether the message actually claims where the user is)", ev.travel_check_flagged)}${E("LONG-TERM MEMORY (wiki hits)", ev.long_term_memory)}${E("TOPICS ACKNOWLEDGED IN THE LAST 48H", ev.acknowledged_topics_48h)}${E("PINGS ALREADY SENT TODAY", ev.hum_pings_today)}${E("SENDER'S SUPPORTING DATA", ev.supporting_data)}${E("CHAT, LAST 8H", ev.transcript_last_8h)}${E("CALENDAR, REST OF TODAY", ev.calendar_today)}
+${evidenceText(input, ev, extra)}
 When done, end your answer with ONE LINE of compact JSON (nothing after it):
 {"verdict":"${reply ? "send|rewrite" : "send|rewrite|resolve|digest|drop"}","message":"<the rewritten text, only for rewrite>","research_plan":"<only for resolve: the answer you found and its source, or what is left to do>","checks":{"true":"ok|<problem>","${reply ? "phrasing" : "self_resolve"}":"ok|<problem>"${reply ? "" : ',"phrasing":"ok|<problem>","value":"ok|<problem>"'}},"sources":["<each source you checked, short>"],"reason":"<≤200 chars>"}`;
 }
@@ -225,6 +323,44 @@ async function judge(input, ev, extra) {
   if (reply && !["send", "rewrite"].includes(p.verdict)) p.verdict = "send";
   if (p.verdict === "rewrite" && !String(p.message || "").trim()) p.verdict = "send";
   return p;
+}
+
+// ─── The rewrite check ──────────────────────────────────────────────────────
+//
+// A rewrite replaces the sender's words, so it is read once more before it
+// goes out (checkRewrite in lib/speak-gate-agent.mjs). When it states anything
+// that neither the original, the evidence nor the judge's own findings show,
+// or that the evidence contradicts, or when the check cannot finish in time,
+// the ORIGINAL is sent as written: the path every gate failure already takes
+// (fail open), and the one text whose claims came from its sender's own
+// sources. A correction the judge found and named in its checks passes, so a
+// false claim it caught is still fixed. The live sender kills the gate at its
+// budget + 90 s (lib/speak-gate-live.mjs runGate), so the check stops 10 s
+// before that.
+async function vetRewrite(input, r, records, t0) {
+  const reply = input.kind === "reply" || input.kind === "report";
+  const budgetS = Number(process.env.SPEAK_GATE_TIMEOUT_S || (reply ? 120 : 300));
+  const c = await checkRewrite({
+    original: input.message, rewrite: r.message, records,
+    findings: { reason: r.reason, checks: r.checks, sources: r.sources },
+    deadline: t0 + (budgetS + 80) * 1000,
+  });
+  const base = r.checks && typeof r.checks === "object" && !Array.isArray(r.checks) ? r.checks : { judge: r.checks ?? null };
+  const claims = c.ran ? [...c.added, ...c.contradicted.map((x) => `contradicted: ${x}`)] : [];
+  const check = c.ran
+    ? { added_claim: claims.length > 0, added: c.added, contradicted: c.contradicted, tier: c.tier, ms: c.ms }
+    : { added_claim: null, error: c.error, ms: c.ms };
+  if (c.ran && !claims.length) return { ...r, checks: { ...base, rewrite_check: check }, rewrite_added_claim: false, rewrite_claims: [] };
+  const why = !c.ran ? `the rewrite check could not run: ${c.error}`
+    : [c.added.length ? `nothing shows ${c.added.join("; ")}` : "", c.contradicted.length ? `the records contradict ${c.contradicted.join("; ")}` : ""].filter(Boolean).join("; and ");
+  return {
+    verdict: "send",
+    reason: `Rewrite withdrawn, sent as written (${why}). Gate: ${r.reason || ""}`.slice(0, 300),
+    checks: { ...base, rewrite_check: { ...check, withdrawn: String(r.message).slice(0, 2000) } },
+    sources: r.sources,
+    rewrite_added_claim: check.added_claim,
+    rewrite_claims: claims,
+  };
 }
 
 // ─── Main ───────────────────────────────────────────────────────────────────
@@ -245,10 +381,13 @@ try {
   }
   const ev = (pre && pre.evidence) || {};
   if (pre && pre.message) input.message = pre.message;
-  const [thread, open, found] = await Promise.all([roleThread(input.sender, input.as_of), openQuestions(input.as_of), foundAnswers(input.as_of)]);
-  const work = workRecords(input.message);
-  const r = await judge(input, ev, { thread, open, found, work });
-  out({ ...r, ms: Date.now() - t0 }, ctx);
+  const te = Date.now();
+  const [thread, open, found, recent] = await Promise.all([roleThread(input.sender, input.as_of), openQuestions(input.as_of), foundAnswers(input.as_of), recentRecords(input.as_of)]);
+  const extra = { thread, open, found, recent, work: workRecords(input.message) };
+  const evidence_ms = Date.now() - te;
+  let r = await judge(input, ev, extra);
+  if (r.verdict === "rewrite") r = await vetRewrite(input, r, evidenceText(input, ev, extra), t0);
+  out({ ...r, ms: Date.now() - t0, evidence_ms }, ctx);
 } catch (e) {
   out({ verdict: "send", reason: `gate_error:${String(e.message || e).slice(0, 160)}`, ms: Date.now() - t0 }, ctx);
 }
