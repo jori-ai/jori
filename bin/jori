@@ -6,7 +6,7 @@ const fs = require('fs');
 const path = require('path');
 const { execSync, execFileSync, spawnSync, spawn } = require('child_process');
 const os = require('os');
-const { installRoot, installTools } = require("../lib/root.cjs");
+const { installRoot, installTools, REPO_ROOT } = require("../lib/root.cjs");
 
 // The shared hum ping budget as lib/ping-budget.mjs pingCaps() enforces
 // it (same env overrides and defaults; this CLI is CommonJS and cannot import
@@ -84,8 +84,25 @@ function shSafe(cmd, opts = {}) {
 
 // A registry read with no install at the expected root (installRoot():
 // $JORI_HOME, else ~/Dev/jori) says so instead of dying on an ENOENT stack.
+// Registry options for `name`. An explicit root reads that checkout's kernel
+// and local files only, with no plugin layer, so the enabled plugins' tasks
+// (plugin.json jobs.<job>.task, lib/plugins.cjs) were invisible to `jori
+// tasks` and doctor. When the install is the checkout this CLI runs from
+// (lib/root.cjs REPO_ROOT; always so on the host), tasks are read the way
+// every other reader reads them: kernel + plugins + local, disabled plugins'
+// jobs left out. The same options go to the write (writeTasks), so a plugin's
+// entries stay out of agent/local/tasks.json. Services keep the root: a
+// plugin's services describe outside services, not processes `jori services`
+// and doctor check.
+function registryOpts(name) {
+  if (name === 'tasks') {
+    const real = (p) => { try { return fs.realpathSync(p); } catch { return path.resolve(p); } };
+    if (real(ROOT) === real(REPO_ROOT)) return {};
+  }
+  return { root: ROOT };
+}
 function loadRegistryOrHint(name) {
-  try { return registry.loadRegistryList(name, { root: ROOT }); }
+  try { return registry.loadRegistryList(name, registryOpts(name)); }
   catch (e) {
     if (e && e.code === 'ENOENT' && !fs.existsSync(SYSTEM)) {
       die(`no Jori install at ${ROOT} (${SYSTEM} is missing). Set JORI_HOME to the repo root, e.g. JORI_HOME=${path.resolve(__dirname, '..', '..')} jori ${process.argv.slice(2).join(' ')}`, 2);  // control-scan-ok: the software's name
@@ -129,7 +146,7 @@ function cmdHelp(extensions = []) {
   console.log('  tasks [list] [--json]         list automated tasks');
   console.log('  tasks show <name>             show full task detail');
   console.log('  tasks match "<phrase>"        find task by natural-language phrase');
-  console.log('  tasks run <name>              dispatch task via webhook\n');
+  console.log('  tasks run <name> [--task T]   dispatch task via webhook (T: this request, for a job)\n');
   console.log(c.bold('HEALTH'));
   console.log('  whereami [--json|--banner|--role]  which machine am I on (the production host vs another)');
   console.log('  status                        system health dashboard');
@@ -190,7 +207,7 @@ function cmdTasks(args) {
 function writeTasks(tasks) {
   // The merged list goes back as local entries/overrides (agent/local/tasks.json);
   // the kernel's tasks.json is never rewritten from here.
-  registry.writeRegistryList('tasks', tasks, { root: ROOT });
+  registry.writeRegistryList('tasks', tasks, registryOpts('tasks'));
 }
 
 function cmdTasksPause(args) {
@@ -251,21 +268,25 @@ function cmdTasksShow(args) {
   console.log(c.bold(task.name));
   console.log(c.dim('  schedule:         ') + (task.schedule_human || 'manual'));
   console.log(c.dim('  cron:             ') + (task.schedule || '—'));
-  console.log(c.dim('  trigger_script:   ') + task.trigger_script);
+  if (task.plugin) console.log(c.dim('  plugin:           ') + task.plugin);
+  console.log(c.dim('  trigger_script:   ') + (task.trigger_script || '—'));
   if (task.cron_label) console.log(c.dim('  cron line label:  ') + task.cron_label);
   // A launchd job has no webhook — it is exec'd directly by its LaunchAgent
   // (the ephemeral-Opus family: cron/webhook can't unlock the Max keychain).
   // Printing "POST undefined" invited exactly the wrong next move.
   console.log(c.dim('  dispatch:         ') + (task.webhook_url
     ? `POST ${task.webhook_url}`
-    : `launchd — ai.claude.${task.name} runs ${task.trigger_script || 'its trigger'} directly (no webhook)`));
+    : isPluginTask(task)
+      ? `jori dispatch ${task.job} — to its tier (job-routing), the job's playbook in plugins/${task.plugin}/jobs/${task.job}.md`
+      : `launchd — ai.claude.${task.name} runs ${task.trigger_script || 'its trigger'} directly (no webhook)`));
   console.log(c.dim('  webhook_task:     ') + task.webhook_task);
-  console.log(c.dim('  playbook section: ') + `ops-agent/CLAUDE.md § ${task.ops_playbook_section}`);
-  console.log(c.dim('  delivers_to:      ') + task.delivers_to);
+  if (task.ops_playbook_section) console.log(c.dim('  playbook section: ') + `ops-agent/CLAUDE.md § ${task.ops_playbook_section}`);
+  else if (task.job) console.log(c.dim('  playbook:         ') + `jobs/${task.job}.md`);
+  console.log(c.dim('  delivers_to:      ') + (task.delivers_to || '—'));
   if (task.paused_until) {
     console.log(c.dim('  paused_until:     ') + task.paused_until + (task.paused_reason ? ` — ${task.paused_reason}` : ''));
   }
-  console.log(c.dim('  phrases:          ') + task.phrases.join(', '));
+  console.log(c.dim('  phrases:          ') + (task.phrases || []).join(', '));
   console.log(c.dim('  description:      ') + task.description);
 }
 
@@ -274,13 +295,14 @@ function matchTask(phrase) {
   const matches = [];
   for (const t of loadTasks()) {
     let best = null;
-    for (const p of t.phrases) {
+    const phrases = t.phrases || [];
+    for (const p of phrases) {
       if (needle.includes(' ' + p.toLowerCase() + ' ') || needle.trim() === p.toLowerCase()) {
         best = p; break;
       }
     }
     if (!best) {
-      for (const p of t.phrases) {
+      for (const p of phrases) {
         if (needle.includes(p.toLowerCase())) { best = p; break; }
       }
     }
@@ -302,6 +324,7 @@ function cmdTasksMatch(args) {
         name: m.task.name,
         matched_phrase: m.matched_phrase,
         webhook_task: m.task.webhook_task,
+        ...(m.task.plugin ? { plugin: m.task.plugin } : {}),
         description: m.task.description,
       })),
     }, null, 2));
@@ -312,7 +335,7 @@ function cmdTasksMatch(args) {
     const m = matches[0];
     console.log(c.green('high confidence: ') + c.bold(m.task.name));
     console.log(c.dim('matched phrase: ') + `"${m.matched_phrase}"`);
-    console.log(c.dim('run with:       ') + `jori tasks run ${m.task.name}`);
+    console.log(c.dim('run with:       ') + `jori tasks run ${m.task.name}${isPluginTask(m.task) ? ' [--task "<this request>"]' : ''}`);
     return;
   }
   console.log(c.yellow(`ambiguous — ${matches.length} matches:`));
@@ -320,10 +343,17 @@ function cmdTasksMatch(args) {
   process.exit(2);
 }
 
-function taskBody(task) {
+// A plugin job's task (lib/plugins.cjs pluginTask): no webhook URL of its own,
+// dispatched by job name to its tier like `jori dispatch`.
+function isPluginTask(task) { return !!(task && task.plugin && !task.webhook_url && task.job); }
+
+function taskBody(task, extra = null) {
   // If the task has a job field, use {"job": "..."} so the webhook handler
-  // loads full instructions from the jobs/*.md file at dispatch time.
-  if (task.job) return JSON.stringify({ job: task.job });
+  // loads full instructions from the jobs/*.md file at dispatch time. `extra`
+  // (`jori tasks run <task> --task "…"`) rides along as `task`; the webhook
+  // appends it to the playbook under "## This dispatch"
+  // (agent/supervisor/http-server.mjs).
+  if (task.job) return JSON.stringify(extra ? { job: task.job, task: extra } : { job: task.job });
   // Legacy fallback for tasks without a job file.
   const bodyText = task.webhook_body
     || `${task.webhook_task}: ${task.description} Follow the ${task.ops_playbook_section} instructions in CLAUDE.md.`;
@@ -353,10 +383,22 @@ function postWebhook(url, body) {
 }
 
 function cmdTasksRun(args) {
-  const name = args.find(a => !a.startsWith('--'));
-  if (!name) die('tasks run: missing <name>. Try: jori tasks');
+  // The first bare word that is not a flag's value (`--task "…" car-rental`).
+  const name = args.find((a, i) => !a.startsWith('--') && args[i - 1] !== '--task');
+  if (!name) die('tasks run: missing <name>. Usage: jori tasks run <name> [--task "this request"] [--dry-run]');
+  const extra = args.includes('--task') ? getFlag(args, '--task') : null;
+  if (args.includes('--task') && !(extra && extra.trim())) die('tasks run: --task needs the request text, e.g. --task "Lisbon airport; Dec 3 10:00; Dec 9 18:00"');
   const task = loadTasks().find(t => t.name === name);
   if (!task) die(`No task named '${name}'. Try: jori tasks`);
+  // A plugin's task has no webhook of its own: `jori dispatch <job>` sends it
+  // to its tier (job-routing.json, Chrome jobs to ops), with the same
+  // health fallback and token the cron triggers use.
+  if (isPluginTask(task)) {
+    const dArgs = ['dispatch', task.job, ...(extra ? ['--task', extra] : []), ...(hasFlag(args, '--dry-run') ? ['--dry-run'] : [])];
+    const r = spawnSync(process.execPath, [__filename, ...dArgs], { stdio: 'inherit' });
+    process.exit(r.status === null ? 1 : r.status);
+  }
+  if (extra && !task.job) die(`tasks run: '${task.name}' has no job playbook, so --task has nothing to add to. Run it without --task.`);
   // Refuse rather than POST to `undefined`. A launchd job (the ephemeral-Opus
   // family) has no webhook by design — dispatching one through the supervisor
   // would run it on the resident Sonnet supervisor instead of the Opus fork it
@@ -366,7 +408,7 @@ function cmdTasksRun(args) {
         `  Run it now:   ${task.trigger_script || '(see tasks.json)'}\n` +
         `  Or via launchd: launchctl kickstart -k gui/$(id -u)/ai.claude.${task.name}`);
   }
-  const body = taskBody(task);
+  const body = taskBody(task, extra);
   if (hasFlag(args, '--dry-run')) {
     console.log(c.dim('(dry-run — no dispatch)'));
     console.log(c.bold('would POST ') + task.webhook_url);
@@ -1425,8 +1467,8 @@ function cmdWhere(args) {
   const hits = [];
   // tasks
   for (const t of loadTasks()) {
-    if (t.name.includes(ql) || t.webhook_task.toLowerCase().includes(ql) || t.phrases.some(p => p.includes(ql)))
-      hits.push({ kind: 'task', name: t.name, location: t.trigger_script });
+    if (t.name.includes(ql) || String(t.webhook_task || '').toLowerCase().includes(ql) || (t.phrases || []).some(p => p.includes(ql)))
+      hits.push({ kind: 'task', name: t.name, location: t.trigger_script || (t.plugin ? `plugins/${t.plugin}` : '') });
   }
   // services
   for (const s of loadServices()) {
@@ -1549,6 +1591,16 @@ function cmdDoctor(args) {
   let clockTz = null;
   const unscheduled = [];
   for (const t of scheduledTasks) {
+    // A plugin's scheduled task (lib/plugins.cjs pluginTask) runs from the
+    // plugin's own cron lines, each marked `# jori-plugin:<plugin>:<label>`
+    // and retimed in place (cron-tz-sync, the control room), so it is found
+    // by that marker, not by its nominal time. No marked line → missing,
+    // like any task. A line the plugin paused (`#<tag># …`) still counts.
+    if (isPluginTask(t)) {
+      const mark = `# jori-plugin:${t.plugin}:`;
+      if (!cron.split('\n').some(l => l.includes(mark))) unscheduled.push(`${t.name} (plugin ${t.plugin})`);
+      continue;
+    }
     // A cron-run-direct task (trigger_script: null, since 2026-10-10) is found by
     // its `--label <name>`; path.basename(null) threw and took doctor down.
     // A task whose cron line runs something OTHER than its trigger_script names
@@ -1621,7 +1673,7 @@ function cmdDoctor(args) {
 
   // 7. phrase uniqueness
   const phraseMap = new Map();
-  for (const t of tasks) for (const p of t.phrases) {
+  for (const t of tasks) for (const p of (t.phrases || [])) {
     const k = p.toLowerCase();
     if (!phraseMap.has(k)) phraseMap.set(k, []);
     phraseMap.get(k).push(t.name);

@@ -169,7 +169,7 @@ Details: `agent/chat-agent/procedures/improvement-threads.md`.
 
 ## System Awareness & Task Delegation
 
-**Trigger:** questions about the Jori system (tasks, agent health, logs, triage, CI, git, architecture), requests to manually trigger a scheduled task ("send me the morning briefing"), or to change triage behavior. Use `~/Dev/jori/bin/jori` (`jori help`). Trigger a task: `jori tasks match "<phrase>" --json` → high confidence → reply "On it — running `<task-name>`." + `jori tasks run <task-name>`; ambiguous → ask; none → list. **Never compose scheduled-task output yourself, even if dispatch fails** — report the failure instead. Always-P1 senders go ONLY through `jori triage p1 add|remove|list`.
+**Trigger:** questions about the Jori system (tasks, agent health, logs, triage, CI, git, architecture), requests to manually trigger a scheduled task ("send me the morning briefing"), or to change triage behavior. Use `~/Dev/jori/bin/jori` (`jori help`). Trigger a task: `jori tasks match "<phrase>" --json` → high confidence → reply "On it — running `<task-name>`." + `jori tasks run <task-name>` (when the request carries its own details — a place, dates, a name — add `--task "<those details, in the user's words>"`; the job reads them under "This dispatch"); ambiguous → ask; none → list. **Never compose scheduled-task output yourself, even if dispatch fails** — report the failure instead. Always-P1 senders go ONLY through `jori triage p1 add|remove|list`.
 
 When this applies, Read `agent/chat-agent/procedures/system-awareness.md` first (subcommand table, triage edits).
 

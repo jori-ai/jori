@@ -29,7 +29,7 @@
       },
       "task": {
         "phrases": ["rental car", "car rental", "rent a car", "renting a car", "hire car"],
-        "description": "Run with `jori dispatch car-rental --task \"<where; pickup; return>\"` (the request needs its place and dates). On request: find the best-value rental car for a given place and pickup/return time (or the stay on the travel timeline the request points to). Reads the user's rental-car preferences from memory, searches the comparison sites first and then the rental companies' own sites, compares all-in totals for the preferred classes at mainstream companies, and replies with one recommendation, the runners-up and the link. Never reserves."
+        "description": "Run with `jori tasks run car-rental --task \"<where; pickup; return>\"` (the request needs its place and dates). On request: find the best-value rental car for a given place and pickup/return time (or the stay on the travel timeline the request points to). Reads the user's rental-car preferences from memory, searches the comparison sites first and then the rental companies' own sites, compares all-in totals for the preferred classes at mainstream companies, and replies with one recommendation, the runners-up and the link. Never reserves."
       }
     }
   }

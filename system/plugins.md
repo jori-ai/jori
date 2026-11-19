@@ -70,6 +70,13 @@ agent/local/plugins/<name>/     this installation's own plugin (private overlay)
   chrome-devtools MCP), only while the plugin is enabled.
 - `jobs.<job>.routing` joins the merged `job-routing` registry and
   `jobs.<job>.task` the `tasks` registry, only while the plugin is enabled.
+  The task becomes a full entry (`lib/plugins.cjs` pluginTask): `phrases`
+  (default none) make it reachable by `jori tasks match`; `job`,
+  `webhook_task` and `name` are the job's; no trigger script and no webhook URL
+  (`jori tasks run <job> [--task "…"]` hands it to `jori dispatch`, which
+  picks the tier); its `schedule` is the task's own, else the plugin schedule
+  labelled as the job, else `on-demand`. Doctor finds a scheduled plugin task
+  by its `# jori-plugin:<name>:` cron marker, not by the time.
 - `services` adds entries to the control room's service catalog.
 - `approvals` declares actions that run only after a Face ID approval:
   `{ "<action>": { "title", "run", "ttl_minutes"?, "timeout_seconds"? } }`.
