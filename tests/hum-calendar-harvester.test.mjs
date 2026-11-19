@@ -18,11 +18,15 @@ fs.mkdirSync(path.join(LOCAL, "config"));
 fs.writeFileSync(path.join(LOCAL, "config", "hum-calendar.json"), JSON.stringify({ ignore_summary_prefixes: ["[Shared]"] }));
 process.env.JORI_LOCAL_DIR = LOCAL;
 test.after(() => fs.rmSync(LOCAL, { recursive: true, force: true }));
+const HARVESTER = new URL("../agent/scripts/hum-harvesters/calendar.mjs", import.meta.url);
 const {
   overlaps,
   filterScannableEvents,
   pairKey,
-} = await import("../agent/scripts/hum-harvesters/calendar.mjs");
+  transitTimeUnverified,
+  upcomingSoon,
+  soonSignal,
+} = await import(HARVESTER.href);
 
 // Helper: build an event with dateTime start/end (UTC; any fixed offset works
 // for predicate tests).
@@ -155,6 +159,100 @@ test("pairKey: stable regardless of ordering + case / whitespace", () => {
     pairKey("  Foo  ", "bar"),
     pairKey("FOO", "Bar"),
   );
+});
+
+// ── Departures whose time nobody checked (jori-calendar --transit) ─────────
+// A countdown to a departure time with no timetable behind it is how a boat
+// gets missed. Stamped by jori-calendar as private extended properties.
+const NOW = ms("2030-03-11T13:35:00Z");
+const DEPART = "2030-03-11T14:00:00+00:00"; // 25 min after NOW
+const ARRIVE = "2030-03-11T15:00:00+00:00";
+const stamped = (priv) => ({ extendedProperties: { private: priv } });
+const UNVERIFIED = ev("Ferry to Island", DEPART, ARRIVE, { location: "Pier 3", ...stamped({ jori_created: "1", jori_transit: "1", jori_transit_verified: "0" }) });
+UNVERIFIED.start.timeZone = "UTC";
+const VERIFIED = ev("Train 123", DEPART, ARRIVE, stamped({ jori_created: "1", jori_transit: "1", jori_transit_verified: "1", jori_transit_source: "https://rail.example/timetable" }));
+const PLAIN = ev("Weekly sync", DEPART, ARRIVE, { location: "Room 4" });
+
+test("transitTimeUnverified: only a departure without a verified stamp", () => {
+  assert.equal(transitTimeUnverified(UNVERIFIED), true);
+  assert.equal(transitTimeUnverified(ev("Bus 7", DEPART, ARRIVE, stamped({ jori_transit: "1" }))), true, "no verified stamp at all counts as unverified");
+  assert.equal(transitTimeUnverified(VERIFIED), false);
+  assert.equal(transitTimeUnverified(PLAIN), false);
+  assert.equal(transitTimeUnverified(ev("Dinner", DEPART, ARRIVE, stamped({ jori_created: "1" }))), false);
+});
+
+test("an unverified departure gets no countdown: it says to check the timetable", () => {
+  const [s] = upcomingSoon(filterScannableEvents([UNVERIFIED]), NOW);
+  assert.equal(s.minsToStart, undefined);
+  assert.equal(s.time_verified, false);
+  assert.equal(s.listed_time, "14:00");
+  const signal = soonSignal(s);
+  assert.doesNotMatch(signal, /starts in|\d+\s*min/);
+  assert.match(signal, /check the timetable/);
+  assert.match(signal, /Ferry to Island/);
+});
+
+test("an unverified departure's listed time is in the event's own zone, never the calendar's offset", () => {
+  // Google renders dateTime in the calendar's zone (here -05:00); the departure is 14:00 where it leaves.
+  const abroad = ev("Ferry to Island", "2030-03-11T08:00:00-05:00", "2030-03-11T09:00:00-05:00",
+    stamped({ jori_transit: "1", jori_transit_verified: "0" }));
+  abroad.start.timeZone = "Etc/GMT-1";
+  const [s] = upcomingSoon(filterScannableEvents([abroad]), Date.parse("2030-03-11T12:35:00Z"));
+  assert.equal(s.listed_time, "14:00");
+  // No zone on the event: no time at all, rather than one that may be hours off.
+  const bare = ev("Bus 7", DEPART, ARRIVE, stamped({ jori_transit: "1" }));
+  delete bare.start.timeZone;
+  const [b] = upcomingSoon(filterScannableEvents([bare]), NOW);
+  assert.equal(b.listed_time, null);
+  assert.ok(soonSignal(b).includes('"Bus 7" is on the calendar, but that departure time was never checked'));
+});
+
+test("a verified departure and an ordinary event count down exactly as before", () => {
+  const soon = upcomingSoon(filterScannableEvents([VERIFIED, PLAIN]), NOW);
+  assert.deepEqual(soon, [
+    { summary: "Train 123", minsToStart: 25, location: null },
+    { summary: "Weekly sync", minsToStart: 25, location: "Room 4" },
+  ]);
+  assert.equal(soonSignal(soon[0]), '"Train 123" starts in 25min');
+  assert.equal(soonSignal(soon[1]), '"Weekly sync" starts in 25min at Room 4');
+});
+
+test("the 10-60 minute window is unchanged for every kind of event", () => {
+  for (const e of [UNVERIFIED, VERIFIED, PLAIN]) {
+    assert.equal(upcomingSoon(filterScannableEvents([e]), ms("2030-03-11T13:55:00Z")).length, 0, "5 min out: too late");
+    assert.equal(upcomingSoon(filterScannableEvents([e]), ms("2030-03-11T12:30:00Z")).length, 0, "90 min out: too early");
+  }
+});
+
+test("end to end: the lane reads the stamp from gog's event JSON", async () => {
+  const { spawnSync } = await import("node:child_process");
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "hum-calendar-home-"));
+  try {
+    const at = (min) => new Date(Date.now() + min * 60000).toISOString();
+    const events = path.join(home, "events.json");
+    fs.writeFileSync(events, JSON.stringify({ events: [
+      { ...UNVERIFIED, start: { dateTime: at(25) }, end: { dateTime: at(85) } },
+    ] }));
+    // A stand-in for gog: never the network, it prints the fixture.
+    const gog = path.join(home, "gog.mjs");
+    fs.writeFileSync(gog, `#!/usr/bin/env node\nimport fs from "node:fs";\nprocess.stdout.write(fs.readFileSync(${JSON.stringify(events)}, "utf8"));\n`);
+    fs.chmodSync(gog, 0o755);
+    const r = spawnSync(process.execPath, [HARVESTER.pathname], {
+      input: JSON.stringify({ situation: {} }),
+      encoding: "utf8",
+      // JORI_HOME: the lane's state files land in the temp dir; preview: no writes at all.
+      env: { ...process.env, GOG_BIN: gog, JORI_HOME: home, JORI_LOCAL_DIR: LOCAL, HUM_HARVEST_PREVIEW: "1" },
+    });
+    assert.equal(r.status, 0, r.stderr);
+    const cand = JSON.parse(r.stdout.trim().split("\n").pop());
+    assert.equal(cand.topic, "calendar");
+    assert.match(cand.signal, /check the timetable/);
+    assert.doesNotMatch(cand.signal, /starts in/);
+    assert.equal(cand.supporting_data.soon[0].time_verified, false);
+    assert.equal(cand.supporting_data.soon[0].minsToStart, undefined);
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
 });
 
 test("situationStaleReason drops departures while moving and closed task refs", async () => {
