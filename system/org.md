@@ -53,10 +53,12 @@ Each role **signs** what its jobs send to the user:
 |---|---|---|
 | An email to the user | it comes **from** the role: From `Name (Title) <agent address>`, the subject untouched (replies too) | `email-send` (from `--sign <job>` or the job in `JORI_SIGN_AS` / `JORI_JOB`), `digest-deliver` (its `--intent`, through `JORI_SIGN_AS`) |
 | An email to anyone else | From stays the assistant (others always hear from the user's assistant); subject `Name (Title): <subject>`, never on a reply | `email-send` |
-| A chat or questions ping | `Name: <text>` | `jori-send-curl` (its `--intent`, else the job in the env), after every gate (precheck, claim-freshness, dedup) and before media |
-| A push | title `Name (Title)` | `jori-notify` (when no `--title` was given) |
+| A chat or questions ping | `Name: <text>` | `jori-send-curl` (`--as-role <id>`, else its `--intent`, else the job in the env), after every gate (precheck, claim-freshness, dedup) and before media |
+| A push | title `Name (Title)` | `jori-notify` (when no `--title` was given; `jori-send-curl --as-role` gives the member's) |
 
-`cron-run` sets `JORI_JOB` to its label and `lib/run-ephemeral-opus.sh` to the fork's job, so a job's sends know who they are from. **Not signed:** the chief of staff's own pings and pushes (it is the assistant's voice: hum, chat replies), the system and improvements channels, the subject of a reply (`Re:` subjects, `--in-reply-to`), an email given an explicit `--from-name`, and anything sent with `JORI_NO_SIGN=1` (the push-failed fallback email, whose exact subject a P1 exception matches). `digest-deliver`'s Gmail lookup accepts the signed form of a subject (`<role>): <subject>`), so labelling still finds a digest that `email-send` signed.
+`--as-role <id>` is how a router sends a message as the member it placed it with (a hum ping, `lib/ping-route.mjs`, system/conversations.md): their conversation, their signature, their push title. Only a member on the team other than the chief of staff counts; anything else is ignored. `--role <id>` only files the message with the role, unsigned.
+
+`cron-run` sets `JORI_JOB` to its label and `lib/run-ephemeral-opus.sh` to the fork's job, so a job's sends know who they are from. **Not signed:** the chief of staff's own pings and pushes (it is the assistant's voice: the hum pings it keeps, chat replies), the system and improvements channels, the subject of a reply (`Re:` subjects, `--in-reply-to`), an email given an explicit `--from-name`, and anything sent with `JORI_NO_SIGN=1` (the push-failed fallback email, whose exact subject a P1 exception matches). `digest-deliver`'s Gmail lookup accepts the signed form of a subject (`<role>): <subject>`), so labelling still finds a digest that `email-send` signed.
 
 ## Rules
 

@@ -1,0 +1,54 @@
+#!/usr/bin/env node
+// ping-route — CLI over lib/ping-route.mjs, for bin/hum-ping: which team
+// member's conversation a hum ping belongs in.
+//
+// Prints one JSON line: {"role":"<role id>","coordinator":bool,"used":...,"reason":...}
+// Always exits 0; any failure or a missed deadline prints the coordinator's
+// route (where every hum ping went before), so a broken router never loses a ping.
+//
+// Usage:
+//   ping-route [--lane <lane>] [--intent <i>] [--ping-id <id>] [--hum-context <file>]
+//              [--choices] < message
+//
+// --hum-context: hum-ping's context file ({finding, dedup_key, …}).
+// --choices: a tappable card rides on the ping (it stays with the coordinator).
+// Deadline: PING_ROUTE_DEADLINE_MS (default 40000).
+
+import fs from "node:fs";
+
+const args = process.argv.slice(2);
+function flag(name, hasValue = true) {
+  const i = args.indexOf(name);
+  if (i < 0) return undefined;
+  if (!hasValue) { args.splice(i, 1); return true; }
+  const v = args[i + 1];
+  args.splice(i, 2);
+  return v;
+}
+
+const DEADLINE_MS = Number(process.env.PING_ROUTE_DEADLINE_MS) || 40000;
+const fallback = (reason) => ({ role: null, coordinator: true, used: "fallback", reason });
+
+try {
+  const lane = flag("--lane") || null;
+  const intent = flag("--intent") || "";
+  const pingId = flag("--ping-id") || null;
+  const ctxFile = flag("--hum-context");
+  const choices = Boolean(flag("--choices", false));
+  let context = null;
+  if (ctxFile) { try { context = JSON.parse(fs.readFileSync(ctxFile, "utf8")); } catch { /* route without it */ } }
+  const text = fs.readFileSync(0, "utf8");
+  const { routePing, logRoute } = await import("../lib/ping-route.mjs");
+  // Bounded: the send waits on this. Past the deadline the ping stays with the coordinator.
+  const deadline = new Promise((resolve) => setTimeout(() => {
+    const r = fallback("router timeout");
+    logRoute({ ping_id: pingId, lane, intent: intent || null, ...r, ms: DEADLINE_MS });
+    resolve(r);
+  }, DEADLINE_MS).unref());
+  const r = await Promise.race([routePing({ text, lane, intent, finding: context?.finding || null, pingId, choices }), deadline]);
+  console.log(JSON.stringify(r));
+  process.exit(0);
+} catch (e) {
+  console.log(JSON.stringify(fallback(`router error: ${String(e?.message || e).slice(0, 120)}`)));
+  process.exit(0);
+}

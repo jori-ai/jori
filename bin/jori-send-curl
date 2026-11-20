@@ -142,6 +142,11 @@ SKIP_PRECHECK=false
 EVIDENCE_AS_OF=""
 INTENT=""
 ROLE_FLAG=""
+# --as-role <id>: send as this team member (a router placed the message with
+# them, lib/ping-route.mjs): their conversation, signed like their own pings,
+# the push titled with their name. Unlike --role, which only files it.
+AS_ROLE=""
+AS_ROLE_TITLE=""
 # --question / --location-question: this message is a question. See "Question
 # routing" below; most question senders are recognised from their intent or hum
 # context and never need the flag.
@@ -198,6 +203,7 @@ while [[ $# -gt 0 ]]; do
     --skip-precheck)  SKIP_PRECHECK=true; shift ;;
     --intent)         INTENT="$2"; shift 2 ;;
     --role)           ROLE_FLAG="$2"; shift 2 ;;
+    --as-role)        AS_ROLE="$2"; shift 2 ;;
     # The conversation this message belongs in (role:<id> or group:<uuid>):
     # a job answering a request passes the one the request came from
     # (`jori tasks run … --reply-to`, lib/reply-to.cjs). Unset: the database
@@ -252,7 +258,7 @@ elif [ ! -t 0 ]; then
   MESSAGE=$(cat)
 fi
 if [ -z "$MESSAGE" ]; then
-  echo "Usage: jori-send-curl [--no-push] [--push] [--keep-in-tab] [--push-body <text>] [--skip-precheck] [--intent <topic>] [--evidence-as-of <iso|live>] [--observed-error <verbatim captured output>] [--agent ops|chat|infra] [--channel chat|system|improvements|questions] [--question|--location-question] [--event-city <metro> --event-date <YYYY-MM-DD> [--event-artist <name>]] [--p1-message <gmail messageId>] <message>" >&2
+  echo "Usage: jori-send-curl [--no-push] [--push] [--keep-in-tab] [--push-body <text>] [--skip-precheck] [--intent <topic>] [--evidence-as-of <iso|live>] [--observed-error <verbatim captured output>] [--agent ops|chat|infra] [--channel chat|system|improvements|questions] [--question|--location-question] [--event-city <metro> --event-date <YYYY-MM-DD> [--event-artist <name>]] [--p1-message <gmail messageId>] [--role <role id> | --as-role <role id>] [--conversation <id>] <message>" >&2
   exit 1
 fi
 
@@ -1150,25 +1156,39 @@ fi
 # the precheck and claim-freshness judge the words, not the name; before the
 # media, which stays last. Chat and questions only (system rows are the
 # watchdog's). The chief of staff's own pings stay unsigned (lib/org.cjs).
+# --as-role <id> speaks as that member instead: signed and titled as their own
+# pings are. Only a member on the team (and not the chief of staff) counts;
+# anything else is dropped here and the message goes as it would have.
+if [ -n "$AS_ROLE" ]; then
+  case "$AS_ROLE" in
+    *[!a-z0-9-]*) AS_ROLE="" ;;
+    *) _AS="$(ORG_ROLE="$AS_ROLE" "${JORI_NODE:-node}" -e '
+         const o=require(process.argv[1]);
+         const r=o.org().roles.find((x)=>x.id===process.env.ORG_ROLE);
+         if(r&&!r.chief_of_staff)process.stdout.write(o.signature(r));' "$_GSC_TOOLS/lib/org.cjs" 2>/dev/null)"
+       if [ -n "$_AS" ]; then AS_ROLE_TITLE="$_AS"; else AS_ROLE=""; fi ;;
+  esac
+fi
 if { [ "$CHANNEL" = "chat" ] || [ "$CHANNEL" = "questions" ]; } && [ -z "${JORI_NO_SIGN:-}" ] \
-   && { [ -n "$INTENT" ] || [ -n "${JORI_SIGN_AS:-${JORI_JOB:-}}" ]; }; then
-  _SIGNED="$(ORG_TEXT="$MESSAGE" ORG_INTENT="$INTENT" "${JORI_NODE:-node}" -e '
+   && { [ -n "$INTENT" ] || [ -n "$AS_ROLE" ] || [ -n "${JORI_SIGN_AS:-${JORI_JOB:-}}" ]; }; then
+  _SIGNED="$(ORG_TEXT="$MESSAGE" ORG_INTENT="$INTENT" ORG_ROLE="$AS_ROLE" "${JORI_NODE:-node}" -e '
     const o=require(process.argv[1]);
-    process.stdout.write(o.signPing(process.env.ORG_TEXT,{job:process.env.JORI_SIGN_AS||process.env.JORI_JOB||null,intent:process.env.ORG_INTENT||null}));' \
-    "$JORI_INSTALL_TOOLS/lib/org.cjs" 2>/dev/null)"
+    process.stdout.write(o.signPing(process.env.ORG_TEXT,{role:process.env.ORG_ROLE||null,job:process.env.JORI_SIGN_AS||process.env.JORI_JOB||null,intent:process.env.ORG_INTENT||null}));' \
+    "$_GSC_TOOLS/lib/org.cjs" 2>/dev/null)"
   [ -n "$_SIGNED" ] && MESSAGE="$_SIGNED"
 fi
 # Which team role is speaking (lib/org.cjs): its id goes on the row as `sender`,
 # and the database files the row in that role's own conversation (migration
-# 0180). --role <id> names it outright; otherwise the job or intent decides.
-# Chat and questions only; the coordinator's own messages need no sender.
-SENDER_ROLE="${ROLE_FLAG:-}"
+# 0180). --role <id> (or --as-role <id>) names it outright; otherwise the job
+# or intent decides. Chat and questions only; the coordinator's own messages
+# need no sender.
+SENDER_ROLE="${ROLE_FLAG:-${AS_ROLE:-}}"
 if [ -z "$SENDER_ROLE" ] && { [ "$CHANNEL" = "chat" ] || [ "$CHANNEL" = "questions" ]; } \
    && { [ -n "$INTENT" ] || [ -n "${JORI_SIGN_AS:-${JORI_JOB:-}}" ]; }; then
   SENDER_ROLE="$(ORG_INTENT="$INTENT" "${JORI_NODE:-node}" -e '
     const o=require(process.argv[1]);
     const r=o.roleFor({job:process.env.JORI_SIGN_AS||process.env.JORI_JOB||null,intent:process.env.ORG_INTENT||null});
-    if(r&&!r.chief_of_staff)process.stdout.write(r.id);' "$JORI_INSTALL_TOOLS/lib/org.cjs" 2>/dev/null)"
+    if(r&&!r.chief_of_staff)process.stdout.write(r.id);' "$_GSC_TOOLS/lib/org.cjs" 2>/dev/null)"
 fi
 JSON_CONVERSATION=""
 if [ -n "${CONVERSATION_FLAG:-}" ]; then
@@ -1392,6 +1412,8 @@ except Exception:
     # Pass --channel so system/infra alerts never touch the app icon badge.
     NOTIFY_ARGS=(--channel "$CHANNEL")
     [ "$URGENT_PUSH" = true ] && NOTIFY_ARGS+=(--urgent)
+    # Sent as a team member (--as-role): the push is titled with their name and title.
+    [ -n "$AS_ROLE_TITLE" ] && [ -z "${JORI_NO_SIGN:-}" ] && NOTIFY_ARGS+=(--title "$AS_ROLE_TITLE")
     # A question to the user is never read aloud (the user's decision of
     # 2026-11-05): --no-announce keeps it a regular push, even an urgent or
     # location one (those still skip the motion gate). Same structural test as

@@ -39,7 +39,8 @@ import { appendResponse } from "../lib/hum-responses.mjs";
 import { localLlmChat } from "../lib/local-llm.mjs";
 import { resolveHumTarget, openHumItems } from "../lib/hum-reply-target.mjs";
 import { splitMultiAnswer, soleTarget } from "../lib/hum-reply-segments.mjs";
-import { decide, privacyOn } from "../lib/jev-shadow.mjs";
+import { decide } from "../lib/jev-shadow.mjs";
+import { privateByLabel } from "../lib/jev-gates.mjs";
 import { answerConfidence, boolOf } from "../lib/jev.mjs";
 import { request } from "../lib/supabase-rest.js";
 import { createRequire } from "node:module";
@@ -438,10 +439,13 @@ async function classifyReply(t, ping, mode, said = null, guessed = false) {
   // review). JEV_DRY_RUN=1 opts a dry run back into Jev (tests, debugging).
   if (dryRun && process.env.JEV_DRY_RUN !== "1") return legacy();
   const { value } = await decide({
-    // Health/exercise-lane replies never reach Jev; everything else is screened
-    // on-device for health/bank content first ("my knee is killing me" to a
-    // dining ping).
-    skipJev: privacyOn() && JEV_EXCLUDED_LANES.has(ping.lane) ? "health-excluded" : undefined,
+    // Replies to health, exercise, finance and stock pings never reach Jev,
+    // whatever privacy_exclusions says (bank and health rows stay off Jev; such
+    // replies also come from a member's own conversation, bin/role-session).
+    // Everything else is screened on-device for health/bank content first
+    // ("my knee is killing me" to a dining ping).
+    skipJev: JEV_EXCLUDED_LANES.has(ping.lane) ? "health-excluded"
+      : privateByLabel(null, ping.lane) ? "private-lane-excluded" : undefined,
     privacyScreen: true,
     site: JEV_SITE,
     id: messageId || null,
