@@ -684,6 +684,25 @@ class HomeDevicesTest(unittest.TestCase):
         self.assertEqual(len(self.fake.digests), 1)  # once a day
         self.assertEqual(self.fake.emails, [])
 
+    def test_daily_section_lists_a_device_every_day_while_it_stays_offline(self):
+        self.tiered()
+        mod = self.load()
+        self.t = dt.datetime(2026, 1, 5, 20, 0, tzinfo=dt.timezone.utc)
+        self.set_listed({"macs": ["02:00:00:00:00:01", "02:00:00:00:00:02", "02:00:00:00:00:03"]})
+        self.sweep(mod, minutes=30)
+        self.set_listed({"macs": ["02:00:00:00:00:02", "02:00:00:00:00:03"]})  # Plug 1 drops off and stays off
+        for _ in range(40):
+            self.sweep(mod, minutes=10)
+        self.assertEqual(self.fake.emails, [])
+        first = [d["text"] for d in self.fake.digests]
+        self.assertEqual(len(first), 1)
+        self.assertIn("Plug 1: offline since", first[0])
+        self.t = dt.datetime(2026, 1, 6, 23, 55, tzinfo=dt.timezone.utc)  # the next day, after the hour
+        self.sweep(mod)
+        self.assertEqual(len(self.fake.digests), 2)
+        self.assertIn("Plug 1: offline since", self.fake.digests[1]["text"])
+        self.assertEqual(self.fake.emails, [])
+
     def test_daily_section_kept_when_the_hand_off_fails(self):
         self.tiered()
         mod = self.load()
