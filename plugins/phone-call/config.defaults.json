@@ -1,0 +1,12 @@
+{
+  "_doc": "Phone calls (plugins/phone-call). provider: the voice-agent service a call uses unless --provider says otherwise (vapi or elevenlabs). owner_number: the user's own phone (E.164), where a hold call connects them. model: the Claude model on the call; empty means the installation's pinned Haiku. voice.voice_id / voice.model: the ElevenLabs voice both providers speak with (same on both, so they can be compared). monthly_budget_usd: new calls stop once a calendar month's calls cost this much; the system channel hears at 80%. max_task_minutes / max_hold_minutes: how long a call may last (hold at most 115). vapi.phone_number_id: the calling number as imported into Vapi (phone-call setup vapi). vapi.optimize_streaming_latency: 0-4, higher answers sooner and sounds less natural. elevenlabs.agent_id / elevenlabs.phone_number_id: from phone-call setup elevenlabs.",
+  "provider": "vapi",
+  "owner_number": "",
+  "model": "",
+  "voice": { "voice_id": "", "model": "eleven_v4_turbo" },
+  "monthly_budget_usd": 25,
+  "max_task_minutes": 20,
+  "max_hold_minutes": 90,
+  "vapi": { "phone_number_id": "", "optimize_streaming_latency": 2, "transcriber_model": "nova-3" },
+  "elevenlabs": { "agent_id": "", "phone_number_id": "" }
+}

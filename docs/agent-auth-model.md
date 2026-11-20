@@ -35,11 +35,19 @@ An automatic switch to the API (Sonnet) when the Max subscription is unavailable
 
 Tests: `tests/api-fallback.test.mjs`, `tests/jev-claude-toolless.test.mjs` (usage_limit).
 
+## Live phone calls
+
+The user's decision, 2026-11-20. A phone call needs a model that hears and speaks in real time; Max drives agent turns, not a live voice loop. The `phone-call` plugin therefore hands the call to a voice-agent provider (Vapi or ElevenLabs Agents), whose speech-to-text and voice models are the capability Claude lacks, and keeps Claude as the call's model.
+
+- **Billing:** Claude on a call is billed to the user's own Anthropic API key (their plan's API budget), not to the provider's own model account. `phone-call setup <provider>` reads `JORI_PHONE_CALL_ANTHROPIC_KEY` from `.env` and registers it with the provider once (Vapi: an `anthropic` credential; ElevenLabs: a workspace secret used by a custom LLM pointed at Anthropic's OpenAI-compatible endpoint). Without that key the provider bills Claude itself. Not `ANTHROPIC_API_KEY`, for the reason given under the wiki carve-out. No Jori code calls Anthropic with it.
+- **Budget and breaker:** the plugin sums each finished call's cost in `data/phone-calls.jsonl`; a call placed with this month's spend at 80% of `monthly_budget_usd` (default 25) pages the system channel, and at 100% new calls are refused. `data/.phone-call-off` refuses every new call.
+- **Bounds:** only live phone calls the user asked for. It never serves a chat or ops turn, never runs when Max is down in Max's place, and the call's prompt never carries health or bank data (`agent/CLAUDE.md` § Outbound Phone Call Policy).
+
 ## Non-Anthropic models
 
 The policy: Jev is already in use, and other models may be used when a use case actually needs them. There is a strong preference for the Max subscription; another model is considered if (and only if) it has a capability Claude doesn't have.
 
-The test is capability, not cost: **if Claude can do the job, it runs on Max.** A cheaper, faster or more convenient model is not a reason. Approved and live today: Jev (TypeSafe — calibrated decision probabilities, `docs/jev.md`). Capabilities Claude lacks that a competitor review surfaced as candidates: image/video generation (`agent/capabilities/create-image.mjs` takes an injected provider), real-time speech-to-speech voice, and outbound phone calls to businesses. Each still needs the user's go-ahead for that use case. Non-model data APIs (search, banking, media, meetings, …) are not models and are outside this section.
+The test is capability, not cost: **if Claude can do the job, it runs on Max.** A cheaper, faster or more convenient model is not a reason. Approved and live today: Jev (TypeSafe — calibrated decision probabilities, `docs/jev.md`), and the voice stack of live phone calls (§ Live phone calls, approved 2026-11-20). Capabilities Claude lacks that a competitor review surfaced as candidates: image/video generation (`agent/capabilities/create-image.mjs` takes an injected provider), real-time speech-to-speech voice, and outbound phone calls to businesses. Each still needs the user's go-ahead for that use case. Non-model data APIs (search, banking, media, meetings, …) are not models and are outside this section.
 
 Each new model ships with:
 - its key in `.env`, canonical copy in the password manager;

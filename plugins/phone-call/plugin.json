@@ -1,0 +1,17 @@
+{
+  "name": "phone-call",
+  "title": "Phone calls",
+  "description": "Makes phone calls for you when you ask: gets a quote, books a table, asks a question, or works a phone menu and waits on hold, then connects you when a person answers. You get a summary and the transcript when the call ends.",
+  "version": "0.1.0",
+  "default": "disabled",
+  "requires": { "plugins": [], "bins": ["bin/jori-send-curl"], "commands": [], "env": [] },
+  "config": { "name": "phone-call", "schedules": false },
+  "settings": [],
+  "schedules": [],
+  "provides_bins": ["phone-call"],
+  "jobs": {},
+  "services": [
+    { "name": "Vapi", "does": "Phone calls (voice agent)", "group": "Messaging", "env": ["VAPI_"] },
+    { "name": "ElevenLabs Agents", "does": "Phone calls (voice agent)", "group": "Messaging", "env": ["ELEVENLABS_"] }
+  ]
+}
