@@ -42,7 +42,7 @@ phone-call list             # recent calls and this month's spend
 
 1. **A calling number.** A local Twilio number of its own (ideally in its own Twilio subaccount), not a number already used for something else: importing a number into a voice provider can rewrite where its inbound calls go. Its account SID and auth token go in `.env` as `PHONE_CALL_TWILIO_ACCOUNT_SID` / `PHONE_CALL_TWILIO_AUTH_TOKEN`.
 2. **Provider accounts and keys** in `.env` (canonical copies in the password manager): `VAPI_API_KEY` (Vapi's private key), `ELEVENLABS_API_KEY`.
-3. **The user's own Anthropic key**, so Claude on calls bills to it: `JORI_PHONE_CALL_ANTHROPIC_KEY` (a key with a spend limit of its own; never an `ANTHROPIC_*` name). Without it each provider bills Claude itself.
+3. **The user's own Anthropic key**, so Claude on calls bills to it: `JORI_PHONE_CALL_ANTHROPIC_KEY` (never an `ANTHROPIC_*` name). Give it a monthly spend limit in the Anthropic console: that limit, not `monthly_budget_usd`, is what caps Claude's cost, since the providers' cost figures leave out a model billed to your own key. Use a separate key for each provider (run `setup` with one, then the other), so a leak at one vendor is contained. Without a key each provider bills Claude itself.
 4. **Settings** in `agent/local/config/phone-call.json` (seeded from `config.defaults.json`): `owner_number`, `voice.voice_id` (an ElevenLabs voice that speaks the languages needed; Hebrew needs `eleven_v3`/`eleven_v4*`), `model`.
 5. **Register with each provider** and copy the printed ids into the settings:
    ```bash
@@ -52,7 +52,9 @@ phone-call list             # recent calls and this month's spend
    `--dry-run` prints what each would send. Run `setup elevenlabs` again after changing `owner_number`, `voice` or `model` (it updates the agent).
 6. `jori plugin enable phone-call`.
 
-**Not yet verified against the live APIs** (written from the providers' docs; the first `setup` and test call will show any field a provider rejects): Vapi's `transferCall` destination shape and `warm-transfer-wait-for-operator-to-speak-first-and-then-say-message` mode; ElevenLabs' `custom_llm` block and secrets endpoint; whether either provider counts hold music as speech.
+**Not yet verified against the live APIs** (written from the providers' docs; the first `setup` and test call will show any field a provider rejects): Vapi's `transferCall` destination shape and `warm-transfer-wait-for-operator-to-speak-first-and-then-say-message` mode, its `11labs` voice provider value, `backgroundSound` and the transcriber block; ElevenLabs' `custom_llm` block and secrets endpoint; whether either provider counts hold music as speech; that recording is really off (the follower logs a `warning` row if not). The `place` → `job-run` → `follow` → chat chain has not run end to end: on the first call, check `job-list` shows the follower and the summary arrives.
+
+**Hold transfer on Vapi** is the simple warm transfer: once the user says hello, a fixed one-sentence brief is spoken, then the calls are joined. If the user does not pick up, the representative may be joined to the user's voicemail. Vapi's assistant-based warm transfer (an AI briefs the user and cancels when they do not answer) is the upgrade if the bake-off picks Vapi.
 
 ## Comparing the two providers
 

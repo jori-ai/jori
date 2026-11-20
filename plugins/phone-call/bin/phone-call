@@ -277,10 +277,18 @@ async function cmdFollow(a) {
   tellUser(core.report({ placed, result: res }), "phone-call:result");
 }
 
+// The outcome goes to the chat as a quiet row (no chat-agent reaction: it holds
+// the other side's words), checked; when the chat cannot take it, by email.
 function tellUser(text, intent) {
   const send = installTools("bin/jori-send-curl");
   if (process.env.NODE_TEST_CONTEXT || !fs.existsSync(send)) { console.log(text); return; }
-  spawnSync(send, ["--intent", intent, text], { stdio: "ignore", timeout: 120_000 });
+  const r = spawnSync(send, ["--intent", intent, "--evidence-as-of", "live", "--suppress-hook", text], { stdio: "ignore", timeout: 180_000 });
+  if (r.status === 0) return;
+  logRow({ kind: "report-failed", intent, exit: r.status, error: r.error ? r.error.message : null });
+  const mail = installTools("bin/email-send");
+  if (!fs.existsSync(mail)) return;
+  const m = spawnSync(mail, ["--to", "me", "--subject", "Phone call outcome", "--body", text], { stdio: "ignore", timeout: 180_000 });
+  if (m.status !== 0) logRow({ kind: "report-failed", intent, via: "email", exit: m.status });
 }
 
 async function cmdEnd(a) {
