@@ -397,9 +397,14 @@ def reconcile_turnaround(r, rows, acted, apply):
     if [x for x in near if x not in mine]:
         acted.append((r, "skip", "a visit row already records a stop there"))
         return
-    note = (f"{TURNAROUND_TOKEN} drove {r['away_m'] / 1000:.1f} km out and back to where it began; "
-            f"{r['n_in']}/{r['n']} fixes within {TURN_RADIUS_M / 1000:.0f} km of the far point "
-            f"over {r['minutes']:.0f} min, no stop seen there. Purpose unknown.")
+    if r.get("rest"):
+        note = (f"{TURNAROUND_TOKEN} drove {r['away_m'] / 1000:.1f} km out and back to where it began; "
+                f"the phone sat still at this spot for {r['minutes']:.0f} min, one of {r['places']} "
+                f"places it sat still at out there. Purpose unknown.")
+    else:
+        note = (f"{TURNAROUND_TOKEN} drove {r['away_m'] / 1000:.1f} km out and back to where it began; "
+                f"{r['n_in']}/{r['n']} fixes within {TURN_RADIUS_M / 1000:.0f} km of the far point "
+                f"over {r['minutes']:.0f} min, no stop seen there. Purpose unknown.")
     body = {"place_name": r["place"]["name"], "place_type": WRITE_PLACE_TYPE,
             "source": WRITE_SOURCE, "confidence": "low", "notes": note}
     if mine:
@@ -1076,6 +1081,43 @@ TURN_RADIUS_M = 3000.0
 TURN_MIN_DWELL_MIN = 8.0
 TURN_NAME = "Far end of a drive out and back"
 
+# A drive's far end can be two places, not one. An errand loop (a plaza, then a
+# market a kilometre on, then the plaza again) leaves fixes at both, and one
+# window over all of them at their mean lands between the two, hundreds of
+# metres from each: the second place is then not in the day at all, and a name
+# given to the row names only one of them. A phone that is still stops
+# reporting, so a silence of TURN_MIN_DWELL_MIN or more between two fixes of the
+# run is where it sat: at the earlier fix's position, for the length of the
+# silence. Two such rests TURN_SPLIT_M or more apart are two places.
+TURN_SPLIT_M = 600.0
+
+
+def silent_rests(span):
+    """Where the phone sat still inside a run: [{start, end, minutes, pos}].
+
+    One per silence of TURN_MIN_DWELL_MIN or more between consecutive fixes,
+    at the earlier fix. A long silence across a hop longer than TURN_RADIUS_M is
+    a signal dropped on the road, not a rest.
+    """
+    out = []
+    for a, b in zip(span, span[1:]):
+        mins = (b["t"] - a["t"]).total_seconds() / 60
+        if mins < TURN_MIN_DWELL_MIN:
+            continue
+        if meters((a["lat"], a["lon"]), (b["lat"], b["lon"])) > TURN_RADIUS_M:
+            continue
+        out.append({"start": a["t"], "end": b["t"], "minutes": mins, "pos": (a["lat"], a["lon"])})
+    return out
+
+
+def distinct_rests(rests):
+    """One rest per place, by start time: a rest within TURN_SPLIT_M of a longer one is part of it."""
+    kept = []
+    for r in sorted(rests, key=lambda r: -r["minutes"]):
+        if all(meters(r["pos"], k["pos"]) >= TURN_SPLIT_M for k in kept):
+            kept.append(r)
+    return sorted(kept, key=lambda r: r["start"])
+
 
 def turnaround_stops(fixes, chosen):
     """Stops at the far end of vehicle runs that came back to where they began.
@@ -1084,7 +1126,9 @@ def turnaround_stops(fixes, chosen):
     TURN_CLOSE_M, includes a ride leg, and reaches TURN_MIN_AWAY_M. The window
     is first-to-last fix within TURN_RADIUS_M of its farthest point and must
     last TURN_MIN_DWELL_MIN. A silence of MAX_GAP_MIN or more splits a run, so a
-    phone that went quiet mid-trip yields nothing rather than a guess.
+    phone that went quiet mid-trip yields nothing rather than a guess. When the
+    phone sat still at two or more places there (silent_rests), each is its own
+    row, at the fix it sat at, instead of one row at their mean.
     """
     out = []
     for run in move_runs(fixes, chosen, close=True):
@@ -1108,6 +1152,16 @@ def turnaround_stops(fixes, chosen):
         if mins < TURN_MIN_DWELL_MIN:
             continue
         span = [f for f in run if start <= f["t"] <= end]
+        rests = distinct_rests(silent_rests(span))
+        if len(rests) >= 2:
+            for rest in rests:
+                pair = [f for f in span if rest["start"] <= f["t"] <= rest["end"]]
+                out.append({"start": rest["start"], "end": rest["end"], "minutes": rest["minutes"],
+                            "n": len(pair), "n_in": len(pair),
+                            "place": {"name": TURN_NAME, "_rung": "turnaround", "type_display": "turnaround"},
+                            "motion": motion(pair), "centroid": rest["pos"], "worst_m": 0.0,
+                            "turnaround": True, "away_m": away, "rest": True, "places": len(rests)})
+            continue
         clat = sum(f["lat"] for f in span) / len(span)
         clon = sum(f["lon"] for f in span) / len(span)
         out.append({"start": start, "end": end, "minutes": mins, "n": len(span), "n_in": len(near),
