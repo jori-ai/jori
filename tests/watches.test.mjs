@@ -295,3 +295,23 @@ test("watch show says why a watch stopped: a retired match reads 'never fired', 
   const j = JSON.parse(spawnSync(process.execPath, [bin, "show", at.id, "--json"], { encoding: "utf8", env: process.env }).stdout);
   assert.equal(j.status_event.detail.reason, "replaced by the noon check");
 });
+
+test("mailbox poll: the inbox alone by default, plus the labels an installation files mail under", () => {
+  assert.equal(W.mailboxQuery({}), "in:inbox newer_than:2d");
+  assert.equal(W.mailboxQuery({ mailbox_labels: [] }), "in:inbox newer_than:2d");
+  assert.equal(W.mailboxQuery({ mailbox_labels: ["show-alerts", " ", null] }), '{in:inbox label:"show-alerts"} newer_than:2d');
+  assert.equal(W.mailboxQuery({ mailbox_labels: ["a b", "x/y"] }), '{in:inbox label:"a b" label:"x/y"} newer_than:2d');
+});
+
+test("mailbox poll: mail a filter labelled and kept out of the inbox still becomes an email.received event", () => {
+  const queries = [];
+  const threads = [{ id: "t1", messageCount: 1, from: "Ticket Site <alerts@tickets.example>", subject: "Presale: a comedian in your city", date: "2026-11-20", labels: ["show-alerts"] }];
+  const deps = { watchConfig: { mailbox_labels: ["show-alerts"] }, gogJson: (args) => { queries.push(args[2]); return { threads }; } };
+  const state = {};
+  assert.deepEqual(W.emailEvents(state, Date.parse("2026-11-20T12:00:00Z"), deps), []); // cold start: watermark only
+  threads.push({ id: "t2", messageCount: 1, from: "Ticket Site <alerts@tickets.example>", subject: "On sale now", date: "2026-11-20", labels: ["show-alerts"] });
+  const ev = W.emailEvents(state, Date.parse("2026-11-20T12:05:00Z"), deps);
+  assert.equal(queries[0], '{in:inbox label:"show-alerts"} newer_than:2d');
+  assert.deepEqual(ev.map((e) => [e.type, e.data.message_id]), [["email.received", "t2"]]);
+  assert.deepEqual(ev[0].data.labels, ["show-alerts"]);
+});
