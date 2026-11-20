@@ -90,3 +90,26 @@ test("an unreadable doc is said so, not hidden", () => {
   const r = W.syncProjectWork({ tasksPath: tasks, readDoc: () => ({ text: null, error: "403" }) });
   assert.match(ws.getPage(r.recorded[0].id).body_md, /could not be read when this was recorded \(403\)/);
 });
+
+test("how to change it: set on add, kept on replace, set and replaced later", () => {
+  const r = W.recordWork({ title: "Probe sheet", bottom_line: "Four probes.", by: "Claude Code (laptop)", date: "2026-11-20",
+    how_to_change: "Repo ~/Dev/x, path sheets/; run sheets/build.sh. Lands as a draft PR." });
+  let p = ws.getPage(r.id);
+  assert.match(p.raw_md, /## Bottom line\n\nFour probes\.\n\n## How to change it\n\nRepo ~\/Dev\/x/);
+  assert.equal(W.howToChangeOf(p.body_md), "Repo ~/Dev/x, path sheets/; run sheets/build.sh. Lands as a draft PR.");
+  W.addUpdate(r.id, "sent to the engineer", { date: "2026-11-21" });
+  W.recordWork({ title: "Probe sheet", bottom_line: "Four probes, 18 in.", by: "Claude Code (laptop)", date: "2026-11-20" }, { replace: true });
+  p = ws.getPage(r.id);
+  assert.match(p.body_md, /## How to change it\n\nRepo ~\/Dev\/x/, "a replace without the field keeps the section");
+  assert.match(p.body_md, /sent to the engineer/, "and the updates");
+  W.setHowToChange(r.id, "Repo ~/Dev/y; run make.");
+  p = ws.getPage(r.id);
+  assert.equal(W.howToChangeOf(p.body_md), "Repo ~/Dev/y; run make.");
+  assert.equal((p.raw_md.match(/## How to change it/g) || []).length, 1);
+  assert.match(p.raw_md, /## Deliverable \(as delivered\)/);
+  const old = W.recordWork({ title: "Old one", bottom_line: "No section yet.", by: "chat", date: "2026-11-01" });
+  W.setHowToChange(old.id, "Drive doc; edit it.");
+  p = ws.getPage(old.id);
+  assert.match(p.raw_md, /No section yet\.\n\n## How to change it\n\nDrive doc; edit it\.\n\n## Deliverable/);
+  assert.throws(() => W.setHowToChange("work_nope", "x"));
+});

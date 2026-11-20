@@ -10,8 +10,12 @@
 //       [--kind comparison|evaluation|research|plan|review|draft|analysis|code|note] \
 //       [--date YYYY-MM-DD] [--as-of "<what the sources ran to>"] [--source "<src>"]... \
 //       [--link <url|path|message id>]... [--related <page_id>]... \
-//       [--deliverable @file.md|@file.html] [--doc <google doc url>] [--key <idempotency key>] [--replace]
+//       [--deliverable @file.md|@file.html] [--doc <google doc url>] [--key <idempotency key>] [--replace] \
+//       [--how-to-change @file|"<text>"]
 //                                    record a piece of work (the doc's full text is read with gog)
+//   work-record how-to-change <id> @file|"<text>"
+//                                    set where the work's sources live, how to rebuild it and how a
+//                                    change may land, so a later change needs no access to the session that made it
 //   work-record update <id> "<what changed, dated today>" [--by "<who>"] [--date YYYY-MM-DD]
 //   work-record find "<query>" [--k N] [--json]     search work records only
 //   work-record list [--project <id>] [--since YYYY-MM-DD] [--limit N] [--json]
@@ -31,7 +35,7 @@ process.stdout.on("error", (e) => { if (e.code === "EPIPE") process.exit(0); thr
 const argv = process.argv.slice(2);
 const cmd = argv[0];
 const MULTI = new Set(["source", "link", "related"]);
-const VALUE = new Set(["title", "bottom-line", "by", "summary", "asked", "project", "kind", "date", "as-of", "source", "link", "related", "deliverable", "doc", "key", "k", "since", "limit"]);
+const VALUE = new Set(["how-to-change", "title", "bottom-line", "by", "summary", "asked", "project", "kind", "date", "as-of", "source", "link", "related", "deliverable", "doc", "key", "k", "since", "limit"]);
 const opts = { source: [], link: [], related: [] };
 const pos = [];
 for (let i = 1; i < argv.length; i++) {
@@ -65,6 +69,7 @@ function add() {
     summary: fileOrText(opts.summary), asked: fileOrText(opts.asked), project: opts.project || null,
     kind: opts.kind || null, date: opts.date || undefined, as_of: opts["as-of"] || null,
     sources: opts.source, links: [...opts.link], related: opts.related, source_key: opts.key || null,
+    how_to_change: fileOrText(opts["how-to-change"]) || undefined,
   };
   if (opts.project && !/^project_/.test(opts.project)) f.project = `project_${opts.project}`;
   if (opts.deliverable) f.deliverable = fileOrText(opts.deliverable);
@@ -88,6 +93,13 @@ const cmds = {
     if (!id || !rest.length) die('usage: work-record update <id> "<what changed>"');
     W.addUpdate(id, rest.join(" "), { by: opts.by || null, ...(opts.date ? { date: opts.date } : {}) });
     out(`updated ${id}`);
+  },
+  "how-to-change"() {
+    const [id, ...rest] = pos;
+    const text = fileOrText(rest.join(" ").trim() || null);
+    if (!id || !text) die('usage: work-record how-to-change <id> @file|"<text>"');
+    W.setHowToChange(id, text);
+    out(`set how-to-change on ${id}`);
   },
   find() {
     const q = pos.join(" ").trim();
@@ -118,7 +130,7 @@ const cmds = {
 };
 
 if (!cmd || !cmds[cmd]) {
-  process.stderr.write(fs.readFileSync(new URL(import.meta.url), "utf8").split("\n").filter((l) => l.startsWith("//")).slice(5, 20).map((l) => l.slice(3)).join("\n") + "\n");
+  process.stderr.write(fs.readFileSync(new URL(import.meta.url), "utf8").split("\n").filter((l) => l.startsWith("//")).slice(5, 23).map((l) => l.slice(3)).join("\n") + "\n");
   process.exit(cmd ? 2 : 0);
 }
 try { await cmds[cmd](); } catch (e) { die(e.message); }

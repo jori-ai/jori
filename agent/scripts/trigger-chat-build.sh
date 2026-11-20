@@ -103,6 +103,25 @@ if [ -z "$SPEC" ]; then
   exit 0
 fi
 
+# A build in another of the user's repositories (build-request --repo): the run
+# starts inside that checkout, so its own CLAUDE.md is loaded, and the playbook's
+# § Another repository applies. build-request checked the path when it queued it;
+# a checkout that has since gone fails the build here, before any model runs.
+REPO="$(node -e 'try{process.stdout.write(String(JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")).repo||""))}catch{}' "$Q/running/$ID.json" 2>/dev/null)"
+RECORD="$(node -e 'try{process.stdout.write(String(JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")).record||""))}catch{}' "$Q/running/$ID.json" 2>/dev/null)"
+TARGET=""
+if [ -n "$REPO" ]; then
+  if [ ! -d "$REPO/.git" ] && ! git -C "$REPO" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    mv "$Q/running/$ID.json" "$Q/failed/$ID.json"
+    log "$ID: repository $REPO is gone — moved to failed/"
+    "$SEND" "${REPORT[@]}" "🛠️ I couldn't start the change you asked for ($(label "$Q/failed/$ID.json")): its repository ($REPO) isn't on $HOST anymore." >> "$LOG" 2>&1 || true
+    exit 0
+  fi
+  RUN_ARGS+=(--cwd "$REPO")
+  TARGET="
+Target: another of the user's repositories, $REPO (playbook § Another repository).${RECORD:+ The earlier work is work record $RECORD: read it first (\`work-record show $RECORD\`).}"
+fi
+
 RESULT="$Q/results/$ID.md"
 rm -f "$RESULT" "$Q/asks/$ID.json"
 # The run's session id, so a build that stops to ask (build-park ask) can be
@@ -122,7 +141,7 @@ else
   unset JORI_FORK_RESUME JORI_FORK_TASK_ONLY
   log "$ID: start (size $SIZE${RUN_ARGS[1]:+, ${RUN_ARGS[1]}})"
   TASK="Run the CHAT BUILD job for request $ID. The user asked for this in chat; the request, verbatim, is between the markers.
-Write your report to $RESULT (Step 6). Build size: $SIZE. $THINK
+Write your report to $RESULT (Step 6). Build size: $SIZE. $THINK$TARGET
 
 ----- REQUEST $ID -----
 $SPEC

@@ -16,7 +16,7 @@
 # restart, and builds run one at a time.
 #
 # Usage:
-#   build-request [--size small|large] "<the full spec, written so it stands alone>"
+#   build-request [--size small|large] [--repo <dir> [--record <work record id>]] "<the full spec, written so it stands alone>"
 #   build-request status            # last 10 requests and where each one is
 #
 # --size (the chat agent's judgment, a model's call, never inferred here):
@@ -26,6 +26,15 @@
 #   large  (default) anything else: a new capability, job or channel, a change
 #          across components, or anything touching money, auth, the supervisors
 #          or the improvement pipeline. Builds on the Opus id at xhigh.
+#
+# --repo: the change is to another of the user's own repositories, not to Jori
+#   (a sheet, a script, a site another session made and committed there). It must
+#   be a git checkout under one of the projects settings' `repo_roots`. The build
+#   runs inside it and lands as a branch and a draft pull request unless the work
+#   record says otherwise (jobs/chat-build.md § Another repository).
+# --record: the work record (bin/work-record) of the earlier work being changed;
+#   its "How to change it" section says where the sources are, how to rebuild
+#   and how a change may land.
 #
 # Prints the request id. Exit 64 on bad usage.
 
@@ -48,14 +57,49 @@ if [ "${1:-}" = "status" ]; then
   exit 0
 fi
 
-SIZE="large"
-if [ "${1:-}" = "--size" ]; then
-  case "${2:-}" in small|large) SIZE="$2" ;; *) echo 'build-request: --size is small or large' >&2; exit 64 ;; esac
-  shift 2
+SIZE="large"; REPO=""; RECORD=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --size)
+      case "${2:-}" in small|large) SIZE="$2" ;; *) echo 'build-request: --size is small or large' >&2; exit 64 ;; esac
+      shift 2 ;;
+    --repo) REPO="${2:-}"; shift 2 ;;
+    --record) RECORD="${2:-}"; shift 2 ;;
+    *) break ;;
+  esac
+done
+if [ -n "$RECORD" ] && [ -z "$REPO" ]; then
+  echo 'build-request: --record goes with --repo (a change to Jori itself needs no record)' >&2; exit 64
+fi
+if [ -n "$RECORD" ] && ! printf '%s' "$RECORD" | grep -Eq '^work_[A-Za-z0-9_-]+$'; then
+  echo "build-request: --record takes a work record id (work_<date>_<slug>), got: $RECORD" >&2; exit 64
+fi
+if [ -n "$REPO" ]; then
+  # One of the user's own checkouts, under a configured repo root, and not Jori.
+  REPO="$(node -e '
+    const fs = require("fs"), path = require("path"), os = require("os");
+    const [repo, cfgFile, jori] = process.argv.slice(1);
+    const tilde = (p) => p.replace(/^~(?=$|\/)/, os.homedir());
+    let roots = [];
+    try { roots = JSON.parse(fs.readFileSync(cfgFile, "utf8")).repo_roots || []; } catch {}
+    let real;
+    try { real = fs.realpathSync(path.resolve(tilde(repo))); } catch { console.error(`no such folder: ${repo}`); process.exit(2); }
+    if (!roots.length) { console.error("no repo_roots in the projects settings: another repository cannot be built in"); process.exit(2); }
+    const inRoot = roots.some((r) => { try { const rr = fs.realpathSync(tilde(r)); return real.startsWith(rr + path.sep); } catch { return false; } });
+    if (!inRoot) { console.error(`${real} is not under the projects repo_roots (${roots.join(", ")})`); process.exit(2); }
+    for (const jr of jori.split("\n")) {
+      let j = ""; try { j = fs.realpathSync(jr); } catch {}
+      if (j && (real === j || real.startsWith(j + path.sep))) { console.error("that is Jori itself: queue the build without --repo"); process.exit(2); }
+    }
+    process.stdout.write(real);
+  ' "$REPO" "$JORI_INSTALL_TOOLS/agent/local/config/projects.json" "$JORI_INSTALL"$'\n'"$JORI_ROOT"$'\n'"$(cd "$(dirname "$0")/.." && pwd)")" || { echo "build-request: --repo refused" >&2; exit 64; }
+  if ! git -C "$REPO" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    echo "build-request: $REPO is not a git checkout" >&2; exit 64
+  fi
 fi
 SPEC="${1:-}"
 if [ -z "${SPEC// /}" ]; then
-  echo 'usage: build-request [--size small|large] "<spec>" | build-request status' >&2
+  echo 'usage: build-request [--size small|large] [--repo <dir> [--record <work id>]] "<spec>" | build-request status' >&2
   exit 64
 fi
 if [ "${#SPEC}" -gt "$MAX_CHARS" ]; then
@@ -67,9 +111,12 @@ mkdir -p "$Q/pending" "$Q/running" "$Q/done" "$Q/failed" "$Q/results"
 ID="$(date +%Y%m%d-%H%M%S)-$$"
 TMP="$Q/.$ID.json"
 node -e '
-  const [id, spec, size] = process.argv.slice(1);
-  process.stdout.write(JSON.stringify({ id, spec, size, source: "chat", requested_at: new Date().toISOString() }, null, 2));
-' "$ID" "$SPEC" "$SIZE" > "$TMP" || { rm -f "$TMP"; echo "build-request: could not write the request" >&2; exit 1; }
+  const [id, spec, size, repo, record] = process.argv.slice(1);
+  const req = { id, spec, size, source: "chat", requested_at: new Date().toISOString() };
+  if (repo) req.repo = repo;
+  if (record) req.record = record;
+  process.stdout.write(JSON.stringify(req, null, 2));
+' "$ID" "$SPEC" "$SIZE" "$REPO" "$RECORD" > "$TMP" || { rm -f "$TMP"; echo "build-request: could not write the request" >&2; exit 1; }
 # Rename into place last, so launchd never sees a half-written file.
 mv "$TMP" "$Q/pending/$ID.json"
 echo "$ID"
