@@ -8,7 +8,7 @@ Working out the answer before asking applies to EVERY question and hum comment b
 
 The trigger was a hum question whose answer was already on file: the booking records and the user's own travel on the timeline together settled it, so asking only made the user do the lookup Jori could have done.
 
-Every gate in front of a hum send already asked something: is it relevant now (outbound precheck), is it new (dedup, novelty), is it still true (claim-freshness), can the user read it now (motion gate). None asked **does Jori already know the answer?**
+Every gate in front of a hum send already asked something: is it relevant now (outbound precheck), is it new (dedup, novelty), is it still true (claim-freshness), can the user read it now (motion gate). None asked **does Jori already know the answer?** (A later gap of the same kind, 2026-11-21: none asked whether the message's own stated reason follows from its facts. That is `bin/coherence-check`, which runs in `hum-ping` before routing and in `jori-send-curl` before the speak gate; this gate does not judge it. See `docs/coherence-check.md`.)
 
 ## Where it runs: the one point every hum send passes
 

@@ -180,6 +180,10 @@ CHANNEL="chat"
 # rewrite it is a no-op — pulse is purely cron-driven and no outbound hook
 # fires from here. Kept so old call sites don't break.
 SUPPRESS_HOOK=false
+# --coherence-checked: the caller already ran bin/coherence-check on this text
+# (hum-ping does, before it routes the ping), so the gate below does not judge
+# it twice.
+COHERENCE_CHECKED=false
 
 # Parse flags
 POSITIONAL=()
@@ -235,6 +239,7 @@ while [[ $# -gt 0 ]]; do
     # The Gmail messageId of the P1 email this message points at. Lets the
     # P1 push fold below send one push per email / per thread burst.
     --p1-message)     P1_MESSAGE="$2"; shift 2 ;;
+    --coherence-checked) COHERENCE_CHECKED=true; shift ;;
     *) POSITIONAL+=("$1"); shift ;;
   esac
 done
@@ -246,7 +251,7 @@ set -- "${POSITIONAL[@]}"
 for arg in "$@"; do
   if [[ "$arg" == --* ]]; then
     echo "FATAL: unknown flag: $arg" >&2
-    echo "jori-send-curl accepts: --no-push, --push, --announce, --keep-in-tab, --push-body, --media, --choices-json, --metadata-json, --capture-id, --suppress-hook, --skip-precheck, --intent, --evidence-as-of, --observed-error, --hum-context, --agent, --channel, --question, --location-question, --event-city, --event-date, --event-artist, --p1-message" >&2
+    echo "jori-send-curl accepts: --no-push, --push, --announce, --keep-in-tab, --push-body, --media, --choices-json, --metadata-json, --capture-id, --suppress-hook, --skip-precheck, --intent, --evidence-as-of, --observed-error, --hum-context, --agent, --channel, --question, --location-question, --event-city, --event-date, --event-artist, --p1-message, --coherence-checked" >&2
     echo "Message body goes via \$1 (inline) or stdin (pipe). For long/multi-line: cat file.txt | jori-send-curl ..." >&2
     exit 2
   fi
@@ -1127,6 +1132,77 @@ except Exception: print("")' 2>/dev/null)
   fi
 elif [ -z "$P1_MESSAGE" ] && [ "${INTENT:-}" = "p1-email" ]; then
   echo "note: --intent p1-email without --p1-message <messageId>; a duplicate push for this email cannot be folded" >&2
+fi
+
+# ─── One subject per message: does every stated reason follow? ──────────
+# A proactive message sometimes staples a second, unrelated item onto its
+# subject with a benefit that does not follow ("check the mailbox before you
+# leave, it saves a trip back", stapled to an airport run): every fact true,
+# the reason invented. The gates above ask whether the facts are true;
+# bin/coherence-check asks whether the message's own stated reasons follow
+# from them (a model reads the text on its own, Rule #0b). keep → unchanged;
+# trim → the stapled-on part is taken off; split → taken off and queued for
+# the hum to offer later as its own candidate. Never holds a message whole.
+# Scope: chat-bound (chat or questions channel), proactive, and reaching the
+# resolve-first or precheck gate above (a hum: intent, or no --skip-precheck).
+# Never: the chat agent's own replies (--agent chat), an answer to something
+# the user asked for (the solicited intents the precheck and the speak gate
+# never drop, or a --conversation reply), a private intent (bank, brokerage,
+# health), or a message hum-ping already judged before routing it
+# (--coherence-checked). Before the role signature is added, so the model reads
+# the words alone; TERM is ignored from here (as for the speak gate below), so
+# a caller's timeout cannot drop the message while it is judged. Not in a test
+# run unless JORI_COHERENCE_CHECK_BIN names a stand-in. Fails open: any error
+# sends the message as written. Off switch: data/.coherence-check-off. Log:
+# data/coherence-check-log.jsonl. Design: docs/coherence-check.md.
+COHERENCE_BIN="${JORI_COHERENCE_CHECK_BIN:-$JORI_INSTALL_TOOLS/bin/coherence-check}"
+_coherence_in_scope() {
+  [ "$COHERENCE_CHECKED" = false ] || return 1
+  case "$CHANNEL" in chat|questions) ;; *) return 1 ;; esac
+  [ "$AGENT" != "chat" ] || return 1
+  [ -z "${CONVERSATION_FLAG:-}" ] || return 1
+  case "${INTENT:-}" in mention-reply|chat-build-question|chat-build-result|improvement-card) return 1 ;; esac
+  case "${INTENT:-}" in hum:*) ;; *) [ "$SKIP_PRECHECK" = false ] || return 1 ;; esac
+  _load_send_intents
+  ! _intent_in "${INTENT:-}" "$PRIVATE_DATA_INTENTS $PRIVATE_HUM_INTENTS"
+}
+if [ -f "$COHERENCE_BIN" ] && { [ "$TEST_RUN" = false ] || [ -n "${JORI_COHERENCE_CHECK_BIN:-}" ]; } && _coherence_in_scope; then
+  trap '' TERM
+  # A question keeps its question (the model is told which messages ask).
+  COHERENCE_Q=false
+  [ "$IS_QUESTION" = true ] && COHERENCE_Q=true
+  [ "${QR_QUESTION:-false}" = true ] && COHERENCE_Q=true
+  [ -n "${CHOICES_JSON:-}" ] && COHERENCE_Q=true
+  case "${INTENT##*:}" in question|ask) COHERENCE_Q=true ;; esac
+  COHERENCE_INPUT=$(CM="$MESSAGE" CI="${INTENT:-}" CCH="${CHOICES_JSON:-}" CQ="$COHERENCE_Q" python3 -c '
+import json, os
+e = os.environ.get
+d = {"message": e("CM"), "intent": e("CI") or None, "source": "jori-send-curl", "question": e("CQ") == "true"}
+try:
+    c = json.loads(e("CCH") or "null")
+    if c is not None: d["choices"] = c
+except Exception:
+    pass
+print(json.dumps(d))' 2>/dev/null)
+  if [ -n "$COHERENCE_INPUT" ]; then
+    COHERENCE_OUT=$(printf '%s' "$COHERENCE_INPUT" | "${JORI_NODE:-node}" "$COHERENCE_BIN" check 2>/dev/null)
+    COHERENCE_ACTION=$(printf '%s' "$COHERENCE_OUT" | python3 -c 'import json,sys
+try: print(json.load(sys.stdin).get("action") or "keep")
+except Exception: print("keep")' 2>/dev/null)
+    case "$COHERENCE_ACTION" in
+      trim|split)
+        COHERENCE_TEXT=$(printf '%s' "$COHERENCE_OUT" | python3 -c 'import json,sys
+try: print(json.load(sys.stdin).get("text",""), end="")
+except Exception: pass' 2>/dev/null)
+        if [ -n "$COHERENCE_TEXT" ]; then
+          echo "coherence-check: ${COHERENCE_ACTION} — took off a part attached to an unrelated subject (see \`coherence-check tail\`)" >&2
+          MESSAGE="$COHERENCE_TEXT"
+          # A caller's custom banner described the original; preview the new text.
+          PUSH_BODY=""
+        fi
+        ;;
+    esac
+  fi
 fi
 
 # ─── --media: pictures ride BEHIND the gates, not through them ───────────
