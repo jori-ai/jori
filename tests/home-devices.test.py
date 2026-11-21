@@ -23,6 +23,7 @@ Run: python3 tests/home-devices.test.py
 """
 import contextlib
 import datetime as dt
+import fcntl
 import importlib.machinery
 import importlib.util
 import io
@@ -31,6 +32,7 @@ import os
 import shutil
 import sys
 import tempfile
+import time
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -716,6 +718,61 @@ class HomeDevicesTest(unittest.TestCase):
         self.sweep(mod)
         self.assertEqual(len(self.fake.digests), 2)
         self.assertEqual(self.state()["daily_digest_on"], "2026-01-05")
+
+    def hold_sweep_lock(self, mod, age_min=0):
+        """Stand in for a sweep that is still running: its flock, taken from here."""
+        os.makedirs(os.path.dirname(mod.SWEEP_LOCK), exist_ok=True)
+        held = open(mod.SWEEP_LOCK, "a+")
+        fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        if age_min:
+            old = time.time() - age_min * 60
+            os.utime(mod.SWEEP_LOCK, (old, old))
+        return held
+
+    def test_a_sweep_that_finds_another_still_running_does_nothing(self):
+        # cron starts one every 2 minutes; a slow one overlapped the next, both held the same
+        # old state and both queued the daily section (2026-11-20, two minutes apart).
+        self.tiered()
+        mod = self.load()
+        self.t = dt.datetime(2026, 1, 5, 23, 51, tzinfo=dt.timezone.utc)
+        self.set_listed({"macs": ["02:00:00:00:00:01", "02:00:00:00:00:02", "02:00:00:00:00:03"]})
+        held = self.hold_sweep_lock(mod)
+        try:
+            probed = len(self.fake.calls)
+            out = self.sweep(mod)
+            self.assertIn("sweep skipped", out)
+            self.assertEqual(len(self.fake.calls), probed)  # nothing probed, nothing handed over
+            self.assertEqual(self.fake.digests, [])
+            self.assertFalse(os.path.exists(mod.STATE))  # and no state written over the running sweep's
+        finally:
+            held.close()
+        out = self.sweep(mod)  # the first sweep is done: this one runs
+        self.assertNotIn("sweep skipped", out)
+        self.assertEqual(len(self.fake.digests), 1)
+        self.sweep(mod)
+        self.assertEqual(len(self.fake.digests), 1)  # still once a day
+
+    def test_a_wedged_sweep_does_not_silence_the_watch(self):
+        mod = self.load()
+        held = self.hold_sweep_lock(mod, age_min=mod.SWEEP_STALE_MIN + 5)
+        try:
+            out = self.sweep(mod)
+        finally:
+            held.close()
+        self.assertNotIn("sweep skipped", out)
+        self.assertEqual(self.state()["devices"]["Test lamp"]["status"], "up")  # it ran and wrote its state
+
+    def test_a_dry_run_ignores_the_lock(self):
+        mod = self.load()
+        held = self.hold_sweep_lock(mod)
+        try:
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+                mod.cmd_sweep(type("A", (), {"dry_run": True, "daily_text": False})(), mod.roster_cfg())
+        finally:
+            held.close()
+        self.assertNotIn("sweep skipped", out.getvalue())
+        self.assertIn("Test lamp", out.getvalue())
 
     def test_client_list_not_judged_while_its_router_is_down(self):
         self.tiered()

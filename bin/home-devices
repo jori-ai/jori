@@ -77,6 +77,11 @@ Tiers: an entry with `tier: "daily"` is watched the same way but never emailed;
 its changes go into the daily summary once a day (flush_daily). Everything else
 is the immediate tier.
 
+One sweep at a time: a sweep takes an flock (`home-devices-state.json.lock`) and
+a sweep that finds it held skips (cron starts one every 2 minutes, and a slow
+one used to overlap the next, so both queued the daily section and could email
+a DOWN twice); a lock held 20 minutes is a wedged sweep and is ignored.
+
 A site's `maintenance_until` (ISO with offset) turns its failures into "not
 judged" until then, so planned work (a router swap) sends no burst of
 Offline / Back online mail. An entry's `down_note` is printed under its
@@ -133,12 +138,15 @@ guests switch off at the wall are indistinguishable from dropped ones, so they
 are never emailed: they belong in the daily tier.
 """
 import argparse
+import contextlib
 import datetime as dt
+import fcntl
 import json
 import os
 import re
 import subprocess
 import sys
+import time
 
 HOME = os.path.expanduser("~")
 # cron's PATH has no /opt/homebrew/bin, and email-send is `#!/usr/bin/env node`.
@@ -171,6 +179,8 @@ OUTAGES = os.path.join(INSTALL_TOOLS, "data", "home-devices-outages.jsonl")
 EMAIL_SEND = os.environ.get("HOME_DEVICES_EMAIL_SEND") or os.path.join(TOOLS, "bin", "email-send")
 DOWN_AFTER = 3  # consecutive failed sweeps; at a 2-min cadence ~6 min
 NOT_CONFIGURED = "no home devices configured (agent/local/config/home-devices.json)"
+SWEEP_LOCK = STATE + ".lock"
+SWEEP_STALE_MIN = 20  # a sweep this old is wedged, not slow: the next one runs anyway
 
 
 def load(path, default):
@@ -1018,7 +1028,49 @@ def flush_daily(cfg, state, t, force=False):
         print(f"{t} daily device section NOT queued, kept for the next sweep: {(r.stdout or r.stderr).strip()[:300]}", file=sys.stderr)
 
 
+@contextlib.contextmanager
+def sweep_lock():
+    """Yields True when this sweep may run, False when another one is still going.
+
+    cron starts a sweep every 2 minutes, a sweep reads the state when it starts and
+    writes it when it ends, and one that takes longer than 2 minutes (a slow router
+    login or cloud read) overlapped the next. Both then held the same old state, so
+    the daily section was queued twice, two minutes apart (2026-11-20), and a DOWN
+    alert could go out twice. The lock is an flock, so it goes with the process
+    when it dies. One held for SWEEP_STALE_MIN minutes is a wedged sweep, which
+    must not silence the watch, so a later sweep runs anyway."""
+    os.makedirs(os.path.dirname(SWEEP_LOCK), exist_ok=True)
+    f = open(SWEEP_LOCK, "a+")
+    try:
+        run = True
+        try:
+            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            age_min = (time.time() - os.path.getmtime(SWEEP_LOCK)) / 60
+            run = age_min >= SWEEP_STALE_MIN
+            if run:
+                print(f"{now_iso()} the sweep holding the lock has run {age_min:.0f} min; sweeping anyway", file=sys.stderr)
+        else:
+            f.seek(0)
+            f.truncate()
+            f.write(f"{os.getpid()}\n")  # also stamps the lock's age
+            f.flush()
+        yield run
+    finally:
+        f.close()  # releases the flock
+
+
 def cmd_sweep(args, cfg):
+    if getattr(args, "dry_run", False):
+        return _sweep(args, cfg)  # reads and prints only: nothing to collide
+    with sweep_lock() as run:
+        if not run:
+            print(f"{now_iso()} sweep skipped: the previous one is still running")
+            return
+        return _sweep(args, cfg)
+
+
+def _sweep(args, cfg):
     roster = cfg.get("devices", [])
     labels = {k: v.get("label", k) for k, v in cfg.get("sites", {}).items()}
     state = load(STATE, {"devices": {}, "pending": []})
