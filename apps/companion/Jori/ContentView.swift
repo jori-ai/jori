@@ -728,7 +728,7 @@ struct ContentView: View {
                     defaultAppliedLabel: viewModel.defaultApplied(for: q.id),
                     onSelect: { option in
                         answeringQuestion = nil
-                        sendAnswer(option.label, to: q)
+                        if option.opensReply { beginReply(to: q) } else { sendAnswer(option.label, to: q) }
                     },
                     onTypeSomething: {
                         answeringQuestion = nil
@@ -1281,7 +1281,9 @@ struct ContentView: View {
                         viewModel.dismissQuestion(q)
                         Task { try? await Task.sleep(for: .seconds(1)); await team.loadSummaries() }
                     },
-                    select: { option, q in sendAnswer(option.label, to: q) },
+                    select: { option, q in
+                        if option.opensReply { beginReply(to: q) } else { sendAnswer(option.label, to: q) }
+                    },
                     improvement: { m in m.improvementId.flatMap { improvementCards.byId[$0] } },
                     act: { action, item in
                         let cards = improvementCards
@@ -2509,7 +2511,7 @@ struct MessageBubble: View, Equatable {
                     answeredLabel: thread.answer,
                     collapsed: collapsed,
                     onSelect: { option in
-                        actions.answer(option.label, message.id)
+                        if option.opensReply { onReply(message) } else { actions.answer(option.label, message.id) }
                     },
                     onTypeSomething: { onReply(message) }
                 )
@@ -2527,8 +2529,9 @@ struct MessageBubble: View, Equatable {
                         defaultAppliedLabel: thread.defaultApplied,
                         collapsed: collapsed
                     ) { option in
-                        // The tap IS the reply — same path as typing it.
-                        actions.answer(option.label, message.id)
+                        // The tap IS the reply — same path as typing it. The
+                        // "something else" button opens a typed reply instead.
+                        if option.opensReply { onReply(message) } else { actions.answer(option.label, message.id) }
                     }
                 }
             }

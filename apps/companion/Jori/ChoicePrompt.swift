@@ -33,11 +33,19 @@ struct ChoiceOption: Codable, Identifiable, Equatable {
     /// page for (the photo repository, bin/photo-repo place-covers), so "was it
     /// this one?" can be answered at a glance. Optional and additive.
     var imageUrl: String?
+    /// The option's stored value. Only read to spot the "none of these"
+    /// button ("No, something else", "Somewhere else", "Type it in").
+    var value: String?
 
     enum CodingKeys: String, CodingKey {
-        case id, label, sublabel
+        case id, label, sublabel, value
         case imageUrl = "image_url"
     }
+
+    /// The "none of these" button (OTHER_VALUE in lib/choice-reply.mjs). A tap
+    /// opens the reply composer on the question instead of sending the label,
+    /// so the answer is typed and threaded to it (the owner, 2026-11-21).
+    var opensReply: Bool { value == "__other__" }
 }
 
 /// What a question is ABOUT — so the user can tell at a glance whether it asks about
