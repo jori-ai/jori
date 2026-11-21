@@ -48,13 +48,13 @@ function main() {
   const pct = (total / b.usd) * 100;
   const out = { provider: b.provider, budget_usd: b.usd, since: b.since, spent_usd: +total.toFixed(4), pct_used: +pct.toFixed(1), per_day_usd: +perDay.toFixed(4), run_out: runOut };
   if (JSON_OUT) console.log(JSON.stringify(out));
-  else console.log(`Jev budget (${b.provider}): $${total.toFixed(3)} of $${b.usd} used (${pct.toFixed(1)}%) since ${b.since}; ~$${perDay.toFixed(3)}/day → runs out ${runOut || "n/a"}`);
+  else console.log(`Jev budget (${b.provider}): $${total.toFixed(3)} of $${b.usd} used (${pct.toFixed(1)}%) since ${b.since}; ~$${perDay.toFixed(3)}/day → runs out ${runOut || "n/a"} (own-spend estimate from this host's ledger, not the provider's balance)`);
 
   const st = readJson(STATE, { paged: [] });
   const due = (b.alert_pcts || [50, 80, 95]).filter((t) => pct >= t && !st.paged.includes(t));
   if (!due.length) return;
   const t = Math.max(...due);
-  const msg = `💳 Jev ${b.provider} budget ${t}% used: $${total.toFixed(2)} of $${b.usd} (~$${perDay.toFixed(3)}/day, runs out ~${runOut || "?"}). Top up at console.typesafe.ai, then raise budget.usd in data/jev-config.json. If it runs dry every site falls back to legacy automatically.`;
+  const msg = `💳 Jev ${b.provider} budget ${t}% used: $${total.toFixed(2)} of $${b.usd} (~$${perDay.toFixed(3)}/day, runs out ~${runOut || "?"}). This is Jori's own-spend estimate, not the provider's balance: check console.typesafe.ai. After a top-up, raise budget.usd by the amount added in data/jev-config.json. If it runs dry every site falls back to legacy automatically.`;
   if (DRY) { console.log(`DRY page: ${msg}`); return; }
   try {
     execFileSync(path.join(ROOT, "bin/jori-send-curl"), ["--channel", "system", "--skip-precheck", "--intent", "jev-budget", msg], { stdio: "ignore", timeout: 30_000 });
