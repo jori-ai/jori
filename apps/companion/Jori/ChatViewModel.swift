@@ -254,7 +254,14 @@ final class ChatViewModel: ObservableObject {
                     // ordering correct across the merge.
                     let merged = (response + inMemoryNewer)
                         .sorted { $0.createdAt < $1.createdAt }
-                    self.messages = merged
+                    // In memory usually holds more than the newest 500 (the
+                    // cache, "load earlier"), so this branch runs on nearly
+                    // every 30 s catch-up. Reassigning an identical array
+                    // still redrew the whole conversation on the main thread:
+                    // the Mac's remaining ~0.3 s hang every 30-40 s.
+                    if merged != self.messages {
+                        self.messages = merged
+                    }
                 }
             } else if self.messages.isEmpty, channel == ConversationID.coordinator,
                       let restored = cloudBackup.restore(), !restored.isEmpty {
