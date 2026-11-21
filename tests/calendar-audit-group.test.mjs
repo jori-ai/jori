@@ -250,9 +250,19 @@ function run({ rows, events, config = null }) {
   fs.writeFileSync(gog, `#!/bin/sh\ncat ${JSON.stringify(evFile)}\n`);
   fs.chmodSync(gog, 0o755);
   try {
+    // The audit exits early, printing a plain line instead of JSON, when it has
+    // no owner address. Pin it (and the local dir it reads config from) here,
+    // so the test never depends on what the parent shell happens to export:
+    // the approval poller runs it from cron with only HOME and PATH set.
     const out = execFileSync(process.execPath, [AUDIT, "--json"], {
       encoding: "utf8",
-      env: { ...process.env, JORI_HOME: home, GOG_BIN: gog },
+      env: {
+        ...process.env,
+        JORI_HOME: home,
+        JORI_LOCAL_DIR: path.join(home, "agent/local"),
+        JORI_OWNER_EMAIL: "user@example.invalid",
+        GOG_BIN: gog,
+      },
     });
     return JSON.parse(out);
   } finally {
