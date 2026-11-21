@@ -102,3 +102,22 @@ test("a late alert names the window actually missed, never the last month seen",
   assert.equal(incomeStatus(eom, [], none, "2026-03-05")[0].cycle_due, "2026-02-28");
   assert.equal(incomeStatus([{ ...exp[0], due_day: 20 }], [], none, "2026-01-02")[0].cycle_due, "2025-12-20");
 });
+
+test("one payer credit that settles a fixed stream and a variable sibling together is not 'late' (2026-11-21)", () => {
+  // A client paid the retainer ($12,000) and the partner's invoice in one ACH
+  // ($37,000 on Nov 2). The classifier gives it to the variable sibling; the
+  // retainer's cycle (due Nov 6) must still read as received. The hum called it
+  // "15d past due" 19 days later.
+  const exp = [
+    { id: "ret", account_id: "biz", payer_contains: "acme", amount: 12000, tolerance: 0, due_day: 6, grace_days: 3, active_from: "2026-01-01" },
+    { id: "inv", account_id: "biz", payer_contains: "acme", amount: null, due_day: null, grace_days: 3, active_from: "2026-01-01" },
+  ];
+  const combined = t("biz", -37000, "2026-11-02", { name: "Acme, Inc. DES:ACH Pmt" });
+  const cls = classify([combined], accounts, { expectedIncome: exp });
+  const ret = incomeStatus(exp, [combined], cls, "2026-11-21").find((r) => r.stream.id === "ret");
+  assert.equal(ret.status, "received");
+  // A credit SMALLER than the retainer from a sibling stream does not cover it.
+  const small = t("biz", -9000, "2026-11-02", { name: "Acme, Inc. DES:ACH Pmt" });
+  const cls2 = classify([small], accounts, { expectedIncome: exp });
+  assert.equal(incomeStatus(exp, [small], cls2, "2026-11-21").find((r) => r.stream.id === "ret").status, "late");
+});
