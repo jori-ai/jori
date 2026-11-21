@@ -201,6 +201,24 @@ struct ContentView: View {
         go(.conversation(id))
     }
 
+    /// The conversation a tapped notification should open: the one its push
+    /// named, else the one its message is stored in.
+    fileprivate func conversation(_ named: String?, of message: UUID) async -> String? {
+        if let named { return named }
+        return await viewModel.conversationOf(message)
+    }
+
+    /// Whether this conversation is the one on screen. On iPhone the list is
+    /// the home screen, so the current conversation is only showing once it
+    /// is pushed; a tap from the list must still open it.
+    fileprivate func isShowing(_ conversation: String) -> Bool {
+        guard !memoryMode, conversation == viewModel.currentConversation else { return false }
+        #if os(iOS)
+        if horizontalSizeClass != .regular { return phonePath == [.conversation(conversation)] }
+        #endif
+        return true
+    }
+
     private var destinationBinding: Binding<Destination> {
         Binding(get: { destination }, set: { go($0) })
     }
@@ -1167,14 +1185,15 @@ struct ContentView: View {
                     pendingScrollId = nil
                     return
                 }
-                // Consume any message ID stashed while the app was launching / locked
-                if let pending = AppDelegate.pendingMessageId {
-                    pendingScrollId = pending
+                // A message stashed by a tap while the app was launching: take it
+                // only if it is in this conversation. Otherwise leave it for the
+                // root, which opens the conversation it belongs to (taking it
+                // here kept a Mac or iPad on whatever conversation it reopened).
+                if let pending = AppDelegate.pendingMessageId,
+                   viewModel.messages.contains(where: { $0.id == pending }) {
                     AppDelegate.pendingMessageId = nil
-                    if viewModel.messages.contains(where: { $0.id == pending }) {
-                        reveal(pending, proxy: proxy)
-                        pendingScrollId = nil
-                    }
+                    NotificationTap.pendingConversation = nil
+                    reveal(pending, proxy: proxy)
                     return
                 }
                 // LazyVStack + defaultScrollAnchor(.bottom) is unreliable on
@@ -1646,9 +1665,11 @@ struct ContentView: View {
                     // A notification that launched the app names a message:
                     // open its conversation first.
                     if let pending = AppDelegate.pendingMessageId {
+                        let named = NotificationTap.pendingConversation
                         AppDelegate.pendingMessageId = nil
+                        NotificationTap.pendingConversation = nil
                         view.pendingScrollId = pending
-                        if let conv = await viewModel.conversationOf(pending) { view.openConversation(conv) }
+                        if let conv = await view.conversation(named, of: pending) { view.openConversation(conv) }
                     }
                     await viewModel.loadMessages()
                     viewModel.startCatchUpTimer()
@@ -1680,12 +1701,16 @@ struct ContentView: View {
                 // conversation; the thread scrolls to it once it has loaded.
                 .onReceive(NotificationCenter.default.publisher(for: .openJoriMessage)) { note in
                     guard let uuid = note.object as? UUID else { return }
+                    let named = note.userInfo?[NotificationTap.conversationKey] as? String
+                    // Taken here; nothing is left for a later launch path.
+                    AppDelegate.pendingMessageId = nil
+                    NotificationTap.pendingConversation = nil
                     Task {
-                        guard let conv = await viewModel.conversationOf(uuid) else { return }
-                        if conv != viewModel.currentConversation || view.memoryMode {
-                            view.pendingScrollId = uuid
-                            view.openConversation(conv)
-                        }
+                        guard let conv = await view.conversation(named, of: uuid) else { return }
+                        // Already on screen: the thread scrolls to it itself.
+                        if view.isShowing(conv) { return }
+                        view.pendingScrollId = uuid
+                        view.openConversation(conv)
                     }
                 }
                 .sheet(isPresented: view.$showNewConversation) {
