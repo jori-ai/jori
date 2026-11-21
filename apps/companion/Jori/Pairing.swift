@@ -52,6 +52,7 @@ enum PairingCoordinator {
     @MainActor
     private static func forgetBackendData() {
         MessageStore.shared.deleteAll()   // another Jori's chat must not show
+        TeamSnapshot.delete()             // nor its conversation list
         // Signing devices registered with the old backend.
         UserDefaults.standard.removeObject(forKey: Install.key("purchase.registered"))
         UserDefaults.standard.removeObject(forKey: Install.key("selfImprove.registered"))
