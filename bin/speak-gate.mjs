@@ -46,8 +46,15 @@
 // conversation with each question's state, the questions still open, the
 // newest records (recentRecords: the email the user sent in the last 24 h,
 // show and film verdicts of the last 48 h, the calendar with each event's
-// details), and the user's standing rules (agent/local/config/speak-gate.json
-// standing_rules).
+// details), the recorded money expectations for a finance-lane message
+// (lib/speak-gate-finance.mjs: every active fin_expected_income and
+// fin_scheduled_payments row with its note and cadence), and the user's
+// standing rules (agent/local/config/speak-gate.json standing_rules).
+//
+// MONEY CLAIMS: money is late, missing or short only against a recorded
+// expectation. The judge reports a `premise`; a proactive message whose premise
+// is contradicted becomes `resolve`, an unbacked one `drop`, never a rewrite
+// into a question (applyPremiseRule; system/speak-gate.md § Money claims).
 //
 // A REWRITE IS CHECKED before it replaces the sender's text (vetRewrite): a
 // tool-less Haiku pass, Sonnet if that answer is off schema, asks whether it
@@ -77,6 +84,7 @@ import { createRequire } from "node:module";
 import { resolvedAnswers } from "../lib/speak-gate-live.mjs";
 import { OWNER, ASSISTANT, TOOLS_DOC, IDENTITY_RULE, GOG, webAllowed as webAllowedFor, runAgent, lastJson, readLessons, checkRewrite } from "../lib/speak-gate-agent.mjs";
 import { eventPeopleLine } from "../lib/meeting-event.mjs";
+import { financeScope, financeRecords, FINANCE_EVIDENCE_TITLE, PREMISE_RULE, applyPremiseRule } from "../lib/speak-gate-finance.mjs";
 
 const require = createRequire(import.meta.url);
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -271,7 +279,7 @@ const E = (title, body) => (body && String(body).trim() ? `\n## ${title}\n${Stri
 // is never counted as added.
 function evidenceText(input, ev, extra) {
   const reply = input.kind === "reply" || input.kind === "report";
-  return `${E("TAPPABLE CHOICES SENT WITH IT (fixed: a rewrite must still be a question these answer)", Array.isArray(input.fixed_choices) ? input.fixed_choices.join(" | ") : "")}${reply ? E(`WHAT ${OWNER.toUpperCase()} WROTE (being answered)`, input.reply_to_text) : ""}${E("THIS ROLE'S CONVERSATION, LAST 14 DAYS (question states are authoritative)", extra.thread)}${E("QUESTIONS STILL OPEN (any role)", extra.open)}${E("NEWEST RECORDS (read by code just before you; they may be newer than a search reaches, and a claim they contradict is false)", extra.recent)}${E(`EARLIER WORK DONE FOR ${OWNER.toUpperCase()} (work records: the newest record and its updates win; a superseded recommendation is not the current one; work-record show <id> has the full text)`, extra.work)}${E("ANSWERS THIS GATE ALREADY FOUND (a question it held because it found the answer; asking one again is a re-ask: resolve it with the same answer)", extra.found)}${E(`WHAT ${OWNER.toUpperCase()} SAID (dated, from the reply log)`, ev.owner_said)}${E("TRAVEL TIMELINE FACTS", ev.authoritative_facts)}${E("TRAVEL CHECK FLAGGED (code paired a place and a date; decide yourself whether the message actually claims where the user is)", ev.travel_check_flagged)}${E("LONG-TERM MEMORY (wiki hits)", ev.long_term_memory)}${E("TOPICS ACKNOWLEDGED IN THE LAST 48H", ev.acknowledged_topics_48h)}${E("PINGS ALREADY SENT TODAY", ev.hum_pings_today)}${E("SENDER'S SUPPORTING DATA", ev.supporting_data)}${E("CHAT, LAST 8H", ev.transcript_last_8h)}${E("CALENDAR, REST OF TODAY", ev.calendar_today)}`;
+  return `${E("TAPPABLE CHOICES SENT WITH IT (fixed: a rewrite must still be a question these answer)", Array.isArray(input.fixed_choices) ? input.fixed_choices.join(" | ") : "")}${reply ? E(`WHAT ${OWNER.toUpperCase()} WROTE (being answered)`, input.reply_to_text) : ""}${E("THIS ROLE'S CONVERSATION, LAST 14 DAYS (question states are authoritative)", extra.thread)}${E("QUESTIONS STILL OPEN (any role)", extra.open)}${E("NEWEST RECORDS (read by code just before you; they may be newer than a search reaches, and a claim they contradict is false)", extra.recent)}${E(FINANCE_EVIDENCE_TITLE, extra.finance)}${E(`EARLIER WORK DONE FOR ${OWNER.toUpperCase()} (work records: the newest record and its updates win; a superseded recommendation is not the current one; work-record show <id> has the full text)`, extra.work)}${E("ANSWERS THIS GATE ALREADY FOUND (a question it held because it found the answer; asking one again is a re-ask: resolve it with the same answer)", extra.found)}${E(`WHAT ${OWNER.toUpperCase()} SAID (dated, from the reply log)`, ev.owner_said)}${E("TRAVEL TIMELINE FACTS", ev.authoritative_facts)}${E("TRAVEL CHECK FLAGGED (code paired a place and a date; decide yourself whether the message actually claims where the user is)", ev.travel_check_flagged)}${E("LONG-TERM MEMORY (wiki hits)", ev.long_term_memory)}${E("TOPICS ACKNOWLEDGED IN THE LAST 48H", ev.acknowledged_topics_48h)}${E("PINGS ALREADY SENT TODAY", ev.hum_pings_today)}${E("SENDER'S SUPPORTING DATA", ev.supporting_data)}${E("CHAT, LAST 8H", ev.transcript_last_8h)}${E("CALENDAR, REST OF TODAY", ev.calendar_today)}`;
 }
 
 function prompt(input, ev, extra) {
@@ -304,6 +312,8 @@ ${checks}
 
 ${IDENTITY_RULE}
 
+${PREMISE_RULE}
+
 A REWRITE NEVER CLAIMS MORE than the original and the sources you checked show. A message that says a change was approved, applied or committed must not become "live", "running" or "working" unless a source you checked shows it running. Every fact a rewrite states that the original did not (a time, a name, a status, that something did or did not happen) must be one you found: put it in checks with where you found it. Not finding something does not show it is not there: never write that something is missing, unanswered or not on record unless a source you read says so. A separate check reads your rewrite against the original, the evidence below and your checks, and sends the original instead when the rewrite says anything none of them shows.
 
 RESEARCH FIRST. Use the tools to verify the claims and look for answers before you decide; check several sources, not one. Budget: a few minutes. You cannot change anything, and must not try.
@@ -314,7 +324,7 @@ THE MESSAGE:
 """${input.message}"""
 ${evidenceText(input, ev, extra)}
 When done, end your answer with ONE LINE of compact JSON (nothing after it):
-{"verdict":"${reply ? "send|rewrite" : "send|rewrite|resolve|digest|drop"}","message":"<the rewritten text, only for rewrite>","research_plan":"<only for resolve: the answer you found and its source, or what is left to do>","checks":{"true":"ok|<problem>","${reply ? "phrasing" : "self_resolve"}":"ok|<problem>"${reply ? "" : ',"phrasing":"ok|<problem>","value":"ok|<problem>"'}},"sources":["<each source you checked, short>"],"reason":"<≤200 chars>"}`;
+{"verdict":"${reply ? "send|rewrite" : "send|rewrite|resolve|digest|drop"}","message":"<the rewritten text, only for rewrite>","research_plan":"<only for resolve: the answer you found and its source, or what is left to do>","checks":{"true":"ok|<problem>","${reply ? "phrasing" : "self_resolve"}":"ok|<problem>"${reply ? "" : ',"phrasing":"ok|<problem>","value":"ok|<problem>"'}},"premise":"n/a|backed|unbacked|contradicted","premise_note":"<only when unbacked or contradicted: what the record shows or lacks>","sources":["<each source you checked, short>"],"reason":"<≤200 chars>"}`;
 }
 
 async function judge(input, ev, extra) {
@@ -388,10 +398,11 @@ try {
   const ev = (pre && pre.evidence) || {};
   if (pre && pre.message) input.message = pre.message;
   const te = Date.now();
-  const [thread, open, found, recent] = await Promise.all([roleThread(input.sender, input.as_of), openQuestions(input.as_of), foundAnswers(input.as_of), recentRecords(input.as_of)]);
-  const extra = { thread, open, found, recent, work: workRecords(input.message) };
+  const [thread, open, found, recent, finance] = await Promise.all([roleThread(input.sender, input.as_of), openQuestions(input.as_of), foundAnswers(input.as_of), recentRecords(input.as_of),
+    financeScope(input) ? financeRecords({ asOf: input.as_of }) : ""]);
+  const extra = { thread, open, found, recent, finance, work: workRecords(input.message) };
   const evidence_ms = Date.now() - te;
-  let r = await judge(input, ev, extra);
+  let r = applyPremiseRule(input, await judge(input, ev, extra));
   if (r.verdict === "rewrite") r = await vetRewrite(input, r, evidenceText(input, ev, extra), t0);
   out({ ...r, ms: Date.now() - t0, evidence_ms }, ctx);
 } catch (e) {
