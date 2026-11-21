@@ -12,6 +12,8 @@
 //   event-followup check --adopt <calendar event id> --now <ISO after it ended>
 //        Backfill: read one past event (the user already said what happened)
 //        and keep it under a ref for `record`, without asking anything.
+//        [--kind screen --screen-title "<title>" --screen-type movie|show] names
+//        the reading instead of asking a model.
 //   event-followup list [--json]          what was judged, asked and recorded
 //   event-followup show <ref>             one event's state
 //
@@ -66,7 +68,14 @@ async function check() {
   if (adopt && !cands.length) return out({ asked: false, why: `event ${adopt} not found in the window` }), 4;
   if (!cands.length) return out({ asked: false, why: "no ended events to judge" });
 
-  const { reading, model } = await readEvents(cands, { tz, owner: instance().owner_name, tasks: openTaskTitles() });
+  // A backfill may name the reading itself (the user already said what it was):
+  // --kind K [--screen-title T --screen-type movie|show]. Otherwise a model reads it.
+  const given = adopt && flag("kind")
+    ? new Map([[adopt, { ask: true, why: "adopted by hand", kind: flag("kind"), screen_title: flag("screen-title") || null,
+        screen_type: flag("screen-type") || (flag("screen-title") ? "movie" : null), question: null }]])
+    : null;
+  const { reading, model } = given ? { reading: given, model: "given" }
+    : await readEvents(cands, { tz, owner: instance().owner_name, tasks: openTaskTitles() });
   if (!reading) return out({ asked: false, why: "no usable model reading (will retry next run)", candidates: cands.length });
 
   const judged = cands.map((ev) => ({ ev, r: reading.get(ev.id) }));
