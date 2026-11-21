@@ -124,6 +124,12 @@ struct Message: Identifiable, Codable, Equatable {
 
     var isUser: Bool { role == "user" }
     var isAssistant: Bool { role == "assistant" }
+    /// The self-improvement card this message carries (self-improve-request
+    /// tags it card=improvement, approval_id=<row>). The bubble draws the
+    /// card from the live approval row, the way a question is drawn.
+    var improvementId: String? {
+        metadata?["card"] == "improvement" ? metadata?["approval_id"] : nil
+    }
 
     func with(reaction: Reaction?) -> Message {
         Message(id: id, role: role, content: content, read: read, createdAt: createdAt,
@@ -178,7 +184,7 @@ enum ConversationID {
     /// mapping as the server's jori_channel_roles defaults.
     static func legacy(channel: String) -> String {
         switch channel {
-        case ChatChannel.system.rawValue: return role("it-security")
+        case ChatChannel.system.rawValue: return role("software-engineer")
         case ChatChannel.improvements.rawValue: return role("software-engineer")
         default: return coordinator
         }

@@ -8,7 +8,8 @@
 //                  (email-triage-rules.md § Decide-then-act triage)
 //                  flips data/triage-decide-config.json mode → "live"
 //
-// A flip is announced once on the system channel with its rollback. A path
+// A flip is announced once on the system channel with its rollback. A config
+// with "auto_flip": false holds the flip: readiness is announced once instead. A path
 // still not ready after STUCK_DAYS of shadow is reported once. Daily cron;
 // idempotent; `--dry-run` decides and prints without writing or sending.
 // State: data/shadow-cutover-state.json. Log: data/logs/shadow-cutover.log.
@@ -72,6 +73,16 @@ function main() {
       if ((v.span || 0) >= STUCK_DAYS && !st.stuck_reported) {
         systemNote(`shadow-cutover: ${p.name} has been in shadow ${Math.floor(v.span)} days and still misses its cutover bar — ${v.reasons.join("; ")}. Staying in shadow.`);
         if (!DRY) st.stuck_reported = new Date().toISOString();
+      }
+      continue;
+    }
+    // The owner can hold a path's flip ("auto_flip": false in its config): the
+    // verdict is then announced once and the mode stays as it is.
+    if (cfg.auto_flip === false) {
+      log(`${p.name}: READY — auto-flip held by its config, staying ${cfg.mode || "shadow"}`);
+      if (!st.ready_reported) {
+        systemNote(`shadow-cutover: ${p.name} now meets its cutover bar, but its auto-flip is held. ${p.what}. To go live: set "mode": "live" in ${path.relative(path.dirname(DATA), p.config)}.`);
+        if (!DRY) st.ready_reported = new Date().toISOString();
       }
       continue;
     }

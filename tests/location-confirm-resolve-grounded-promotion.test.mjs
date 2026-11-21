@@ -75,6 +75,7 @@ for (const source of ["local:memory", "local:calendar", "local:calendar_title", 
     const file = mkFixture();
     const out = promoteSafely(file, { source });
     assert.equal(out.promoted, true, JSON.stringify(out));
+    assert.equal(out.grounded, true, "the trigger saves a grounded decision in full");
     assert.equal(readStore(file).length, 1);
   });
 }
@@ -85,6 +86,7 @@ for (const source of ["jev:candidate", "jev:named_other", "local:message_explici
     const out = promoteSafely(file, { source });
     assert.equal(out.promoted, false, JSON.stringify(out));
     assert.equal(out.reason, `ungrounded_source:${source || "unknown"}`);
+    assert.equal(out.grounded, false, "the trigger saves an ungrounded decision row-only");
     assert.deepEqual(readStore(file), [], "store untouched");
   });
 }

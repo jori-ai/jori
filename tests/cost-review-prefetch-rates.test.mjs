@@ -161,6 +161,41 @@ test("fork_ledger: per-source 24h windows, 3-window mean, prior range, small sou
   }
 });
 
+test("fork_ledger: per-message sources fold by family, so a line of small rows is named and not buried in other", () => {
+  const { home, g } = forksHome();
+  try {
+    const since = Date.now() - DAY;
+    const mid = (k) => since - k * DAY + DAY / 2;
+    const row = (t, source, usd) => JSON.stringify({ ts: iso(t), source, total_cost_usd: usd, num_turns: 0 });
+    const lines = [];
+    // 40 dry one-shots at $0.17 across two windows, each under $3 on its own id: $6.80 in all.
+    for (let i = 0; i < 40; i++) lines.push(row(mid(i < 25 ? 0 : 1), `email-triage-shadow:${String(i).padStart(16, "0")}`, 0.17));
+    // The live strict rows (gmail:<id>) and a by-hand replay family fold the same way.
+    for (let i = 0; i < 20; i++) lines.push(row(mid(0), `gmail:${"a".repeat(15)}${i % 10}`, 0.16));
+    lines.push(row(mid(0), "email-triage-replay:example-id", 0.07));
+    // Sources whose name only contains a colon (a mode, not a message id) stay as they are.
+    lines.push(row(mid(0), "daily-summary-review:review", 0.1));
+    fs.writeFileSync(path.join(g, "agent/logs/ephemeral-forks/job-costs.ndjson"), lines.join("\n") + "\n");
+    const fl = runPrefetch(home, g, since).fork_ledger;
+    const shadow = fl.sources["email-triage-shadow:*"];
+    assert.ok(shadow, JSON.stringify(fl));
+    assert.equal(shadow.runs_14d, 40);
+    assert.equal(shadow.usd_14d, 6.8);
+    assert.deepEqual(shadow.windows_runs.slice(-2), [15, 25]);
+    assert.equal(shadow.current.runs, 25);
+    near(shadow.current.usd, 4.25, "shadow current usd");
+    // 20 x $0.16 = $3.20 is over the $3 fold line only because the family is one source.
+    assert.equal(fl.sources["gmail:*"].runs_14d, 20);
+    assert.equal(fl.sources["gmail:*"].usd_14d, 3.2);
+    // No per-id source survives, and the small ones still fold into other.
+    assert.deepEqual(Object.keys(fl.sources), ["email-triage-shadow:*", "gmail:*"]);
+    assert.deepEqual(fl.other, { runs_14d: 2, usd_14d: 0.17 });
+    assert.ok(fl.note.includes("Per-message sources"), fl.note);
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
 test("fork_ledger: a missing ledger is UNKNOWN, not zero", () => {
   const { home, g } = forksHome();
   try {
@@ -225,6 +260,48 @@ test("floor_cohorts: same cohort across days, light cohort preferred, corroborat
     assert.equal(fc.tiers.ops.matched, null);
     assert.deepEqual(fc.over_1d_line, []);
     assert.deepEqual(fc.over_3d_line, []);
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("floor_cohorts: a one-off cohort cannot shut the well-sampled one out of the match", () => {
+  const { home, g } = forksHome();
+  try {
+    const since = Date.now() - DAY;
+    const at = (k, minute) => since - k * DAY + 3600e3 + minute * 60e3;
+    let n = 0;
+    const start = (k, minute, source, floor) => {
+      n += 1;
+      const t = at(k, minute);
+      return [
+        JSON.stringify({ ts: iso(t - 30e3), kind: "dispatcher.dispatching", item: { source } }),
+        JSON.stringify({ ts: iso(t), kind: "context.floor_measured", sessionId: `o${n}`, floorTokens: floor }),
+      ];
+    };
+    const write = (tier, lines) => fs.writeFileSync(path.join(g, `agent/logs/supervisor-${tier}/events.ndjson`), lines.flat().join("\n") + "\n");
+    // gmail: 3 starts now at 108,000 (-500 on the day). A one-off watch job sits
+    // 6,000 lighter (102,000, one start now, one before): more than the 5k band
+    // under gmail, and only that one start in the report window.
+    write("ops-light", [
+      start(1, 0, "gmail:aaa", 108500),
+      start(0, 0, "gmail:bbb", 108000), start(0, 10, "gmail:ccc", 108000), start(0, 20, "gmail:ddd", 108000),
+      start(2, 30, "watch-action", 105700), start(0, 30, "watch-action", 102000),
+    ]);
+    write("ops-haiku", [start(1, 0, "comedy", 100000), start(0, 0, "comedy", 99500)]);
+    write("ops", []);
+    const out = runPrefetch(home, g, since);
+    assert.deepEqual(out.errors, []);
+    const light = out.floor_cohorts.tiers["ops-light"];
+    assert.equal(light.matched.cohort, "gmail:*");
+    assert.equal(light.matched.current.n, 3);
+    assert.equal(light.matched.delta_1d, -500);
+    // the one-off is still listed, so the reader can see what was set aside
+    assert.deepEqual(light.alternatives.map((a) => a.cohort), ["watch-action", "gmail:*"]);
+    // a tier whose only cohort is a one-off still compares it (nothing sampled)
+    const haiku = out.floor_cohorts.tiers["ops-haiku"];
+    assert.equal(haiku.matched.cohort, "comedy");
+    assert.equal(haiku.matched.delta_1d, -500);
   } finally {
     fs.rmSync(home, { recursive: true, force: true });
   }

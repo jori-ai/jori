@@ -142,6 +142,11 @@ SKIP_PRECHECK=false
 EVIDENCE_AS_OF=""
 INTENT=""
 ROLE_FLAG=""
+# --as-role <id>: send as this team member (a router placed the message with
+# them, lib/ping-route.mjs): their conversation, signed like their own pings,
+# the push titled with their name. Unlike --role, which only files it.
+AS_ROLE=""
+AS_ROLE_TITLE=""
 # --question / --location-question: this message is a question. See "Question
 # routing" below; most question senders are recognised from their intent or hum
 # context and never need the flag.
@@ -198,6 +203,12 @@ while [[ $# -gt 0 ]]; do
     --skip-precheck)  SKIP_PRECHECK=true; shift ;;
     --intent)         INTENT="$2"; shift 2 ;;
     --role)           ROLE_FLAG="$2"; shift 2 ;;
+    --as-role)        AS_ROLE="$2"; shift 2 ;;
+    # The conversation this message belongs in (role:<id> or group:<uuid>):
+    # a job answering a request passes the one the request came from
+    # (`jori tasks run … --reply-to`, lib/reply-to.cjs). Unset: the database
+    # files it by its sender, the role's own conversation (migration 0180).
+    --conversation)   CONVERSATION_FLAG="$2"; shift 2 ;;
     --agent)          AGENT="$2"; shift 2 ;;
     --channel)        CHANNEL="$2"; shift 2 ;;
     --question)       IS_QUESTION=true; shift ;;
@@ -247,7 +258,7 @@ elif [ ! -t 0 ]; then
   MESSAGE=$(cat)
 fi
 if [ -z "$MESSAGE" ]; then
-  echo "Usage: jori-send-curl [--no-push] [--push] [--keep-in-tab] [--push-body <text>] [--skip-precheck] [--intent <topic>] [--evidence-as-of <iso|live>] [--observed-error <verbatim captured output>] [--agent ops|chat|infra] [--channel chat|system|improvements|questions] [--question|--location-question] [--event-city <metro> --event-date <YYYY-MM-DD> [--event-artist <name>]] [--p1-message <gmail messageId>] <message>" >&2
+  echo "Usage: jori-send-curl [--no-push] [--push] [--keep-in-tab] [--push-body <text>] [--skip-precheck] [--intent <topic>] [--evidence-as-of <iso|live>] [--observed-error <verbatim captured output>] [--agent ops|chat|infra] [--channel chat|system|improvements|questions] [--question|--location-question] [--event-city <metro> --event-date <YYYY-MM-DD> [--event-artist <name>]] [--p1-message <gmail messageId>] [--role <role id> | --as-role <role id>] [--conversation <id>] <message>" >&2
   exit 1
 fi
 
@@ -1145,31 +1156,127 @@ fi
 # the precheck and claim-freshness judge the words, not the name; before the
 # media, which stays last. Chat and questions only (system rows are the
 # watchdog's). The chief of staff's own pings stay unsigned (lib/org.cjs).
+# --as-role <id> speaks as that member instead: signed and titled as their own
+# pings are. Only a member on the team (and not the chief of staff) counts;
+# anything else is dropped here and the message goes as it would have.
+if [ -n "$AS_ROLE" ]; then
+  case "$AS_ROLE" in
+    *[!a-z0-9-]*) AS_ROLE="" ;;
+    *) _AS="$(ORG_ROLE="$AS_ROLE" "${JORI_NODE:-node}" -e '
+         const o=require(process.argv[1]);
+         const r=o.org().roles.find((x)=>x.id===process.env.ORG_ROLE);
+         if(r&&!r.chief_of_staff)process.stdout.write(o.signature(r));' "$_GSC_TOOLS/lib/org.cjs" 2>/dev/null)"
+       if [ -n "$_AS" ]; then AS_ROLE_TITLE="$_AS"; else AS_ROLE=""; fi ;;
+  esac
+fi
 if { [ "$CHANNEL" = "chat" ] || [ "$CHANNEL" = "questions" ]; } && [ -z "${JORI_NO_SIGN:-}" ] \
-   && { [ -n "$INTENT" ] || [ -n "${JORI_SIGN_AS:-${JORI_JOB:-}}" ]; }; then
-  _SIGNED="$(ORG_TEXT="$MESSAGE" ORG_INTENT="$INTENT" "${JORI_NODE:-node}" -e '
+   && { [ -n "$INTENT" ] || [ -n "$AS_ROLE" ] || [ -n "${JORI_SIGN_AS:-${JORI_JOB:-}}" ]; }; then
+  _SIGNED="$(ORG_TEXT="$MESSAGE" ORG_INTENT="$INTENT" ORG_ROLE="$AS_ROLE" "${JORI_NODE:-node}" -e '
     const o=require(process.argv[1]);
-    process.stdout.write(o.signPing(process.env.ORG_TEXT,{job:process.env.JORI_SIGN_AS||process.env.JORI_JOB||null,intent:process.env.ORG_INTENT||null}));' \
-    "$JORI_INSTALL_TOOLS/lib/org.cjs" 2>/dev/null)"
+    process.stdout.write(o.signPing(process.env.ORG_TEXT,{role:process.env.ORG_ROLE||null,job:process.env.JORI_SIGN_AS||process.env.JORI_JOB||null,intent:process.env.ORG_INTENT||null}));' \
+    "$_GSC_TOOLS/lib/org.cjs" 2>/dev/null)"
   [ -n "$_SIGNED" ] && MESSAGE="$_SIGNED"
 fi
 # Which team role is speaking (lib/org.cjs): its id goes on the row as `sender`,
 # and the database files the row in that role's own conversation (migration
-# 0180). --role <id> names it outright; otherwise the job or intent decides.
-# Chat and questions only; the coordinator's own messages need no sender.
-SENDER_ROLE="${ROLE_FLAG:-}"
+# 0180). --role <id> (or --as-role <id>) names it outright; otherwise the job
+# or intent decides. Chat and questions only; the coordinator's own messages
+# need no sender.
+SENDER_ROLE="${ROLE_FLAG:-${AS_ROLE:-}}"
 if [ -z "$SENDER_ROLE" ] && { [ "$CHANNEL" = "chat" ] || [ "$CHANNEL" = "questions" ]; } \
    && { [ -n "$INTENT" ] || [ -n "${JORI_SIGN_AS:-${JORI_JOB:-}}" ]; }; then
   SENDER_ROLE="$(ORG_INTENT="$INTENT" "${JORI_NODE:-node}" -e '
     const o=require(process.argv[1]);
     const r=o.roleFor({job:process.env.JORI_SIGN_AS||process.env.JORI_JOB||null,intent:process.env.ORG_INTENT||null});
-    if(r&&!r.chief_of_staff)process.stdout.write(r.id);' "$JORI_INSTALL_TOOLS/lib/org.cjs" 2>/dev/null)"
+    if(r&&!r.chief_of_staff)process.stdout.write(r.id);' "$_GSC_TOOLS/lib/org.cjs" 2>/dev/null)"
+fi
+JSON_CONVERSATION=""
+if [ -n "${CONVERSATION_FLAG:-}" ]; then
+  if "${JORI_NODE:-node}" -e 'process.exit(require(process.argv[1]).validConversation(process.argv[2]) ? 0 : 1)' "$JORI_INSTALL_TOOLS/lib/reply-to.cjs" "$CONVERSATION_FLAG" 2>/dev/null; then
+    JSON_CONVERSATION=",\"conversation_id\":\"${CONVERSATION_FLAG}\""
+  else
+    echo "jori-send-curl: --conversation \"$CONVERSATION_FLAG\" is not a conversation id (role:<id> or group:<uuid>); sending without it" >&2
+  fi
 fi
 JSON_SENDER=""
 case "$SENDER_ROLE" in
   ""|*[!a-z0-9-]*) ;;
   *) JSON_SENDER=",\"sender\":\"${SENDER_ROLE}\"" ;;
 esac
+# ─── Speak gate, live (think before you speak) ───────────────────────────
+# AFTER every gate above has decided to send, and BEFORE the insert and the
+# push: bin/speak-gate-live judges the message (true, could Jori settle it
+# itself, phrased right, worth the user's attention) and its verdict is acted
+# on. A rewrite is sent as the gate's text; drop / digest / resolve holds it
+# (never written, never pushed; the review row shows it, folded, in its
+# conversation). The review is linked to the inserted row below so the app can
+# show the verdict, with the original folded under it, for the user to grade.
+# The user, 2026-11-11: "it should be reviewed before i see it — not after";
+# "review and act". Runs whatever --skip-precheck says: that flag skipped the
+# old narrow check, not this one. Every channel (system alerts too: "everything
+# goes through the gate unless the issue is with the gate itself", 2026-11-12);
+# not in a test run, and not for a message about the gate itself (--intent
+# speak-gate*, decided in lib/speak-gate-live.mjs inScope). Fails open (a gate error sends as written). Off switch:
+# data/.speak-gate-off. Design: system/speak-gate.md § Live.
+SPEAK_GATE_LIVE="${JORI_SPEAK_GATE_LIVE_BIN:-$JORI_INSTALL_TOOLS/bin/speak-gate-live}"
+GATE_REVIEW_FILE=""
+# From here to the insert, a caller's timeout must not drop the message. The
+# gate takes minutes (240 s budget for a proactive message, more when relayed),
+# and many callers wrap this script in a 15–60 s timeout that sends SIGTERM:
+# the gate's verdict then arrived after this script was gone, and a message
+# judged "send" was never written (2026-11-15: an owner's approval-failed
+# notice, killed at 15 s, judged "send" at 208 s, never seen). Ignoring TERM
+# lets the send finish; the caller simply waits for it. The gate bounds its own
+# time, and curl below has --max-time.
+trap '' TERM
+if [ "$TEST_RUN" = false ] && [ -f "$SPEAK_GATE_LIVE" ]; then
+  GATE_KIND=proactive
+  [ "$AGENT" = "chat" ] && GATE_KIND=reply
+  GATE_INPUT=$(GM="$MESSAGE" GS="${SENDER_ROLE:-}" GI="${INTENT:-}" GC="$CHANNEL" GK="$GATE_KIND" GCH="${CHOICES_JSON:-}" python3 -c '
+import json, os
+e = os.environ.get
+d = {"message": e("GM"), "sender": e("GS") or None, "intent": e("GI") or None, "channel": e("GC"), "kind": e("GK")}
+try:
+    c = json.loads(e("GCH") or "null")
+    opts = c.get("options") if isinstance(c, dict) else c
+    if isinstance(opts, list):
+        d["fixed_choices"] = [str(o.get("label", o)) if isinstance(o, dict) else str(o) for o in opts]
+except Exception:
+    pass
+print(json.dumps(d))' 2>/dev/null)
+  if [ -n "$GATE_INPUT" ]; then
+    GATE_OUT=$(printf '%s' "$GATE_INPUT" | "${JORI_NODE:-node}" "$SPEAK_GATE_LIVE" gate 2>/dev/null)
+    GATE_DELIVER=$(printf '%s' "$GATE_OUT" | python3 -c 'import json,sys
+try: print("no" if json.load(sys.stdin).get("deliver") is False else "yes")
+except Exception: print("yes")' 2>/dev/null)
+    if [ "$GATE_DELIVER" = "no" ]; then
+      GATE_VERDICT=$(printf '%s' "$GATE_OUT" | python3 -c 'import json,sys
+try: d=json.load(sys.stdin); print(d.get("verdict","held")+": "+(d.get("reason") or ""))
+except Exception: print("held")' 2>/dev/null)
+      echo "speak-gate: not sent — held by the gate ($GATE_VERDICT). The user sees it folded in the conversation and grades the call. Not an error; do not resend." >&2
+      if [ "$P1_FOLD_CLAIMED" = true ]; then node "$P1_FOLD" release --message "$P1_MESSAGE" > /dev/null 2>&1; fi
+      if [ -n "$CAPTURE_ID_FILE" ]; then
+        TMP_ID="${CAPTURE_ID_FILE}.tmp.$$"
+        # verdict/note apart from the combined reason, so a caller can act on the
+        # verdict (e.g. "resolve": the user already answered it) without parsing words.
+        printf '%s' "$GATE_OUT" | GATE_VERDICT="$GATE_VERDICT" python3 -c 'import json,os,sys
+try: d=json.load(sys.stdin)
+except Exception: d={}
+print(json.dumps({"suppressed": True, "by": "speak-gate", "reason": os.environ.get("GATE_VERDICT", "held"), "verdict": d.get("verdict") or "held", "note": d.get("reason") or ""}))' > "$TMP_ID" \
+          && mv -f "$TMP_ID" "$CAPTURE_ID_FILE"
+      fi
+      exit 0
+    fi
+    GATE_TEXT=$(printf '%s' "$GATE_OUT" | python3 -c 'import json,sys
+try: print(json.load(sys.stdin).get("text",""), end="")
+except Exception: pass' 2>/dev/null)
+    [ -n "$GATE_TEXT" ] && MESSAGE="$GATE_TEXT"
+    GATE_REVIEW_FILE=$(printf '%s' "$GATE_OUT" | python3 -c 'import json,sys
+try: print(json.load(sys.stdin).get("review_file") or "")
+except Exception: pass' 2>/dev/null)
+  fi
+fi
+
 PUSH_TEXT="$MESSAGE"
 if [ ${#MEDIA[@]} -gt 0 ]; then
   for media_url in "${MEDIA[@]}"; do
@@ -1190,7 +1297,7 @@ JSON_CHANNEL=$(printf '%s' "$CHANNEL" | python3 -c 'import json,sys; print(json.
 # capture jori_messages.id and link the outbound ping to subsequent
 # tapback-reaction UPDATEs. Otherwise stay on the default return=minimal for
 # the cheaper path most callers want.
-if [ -n "$CAPTURE_ID_FILE" ]; then
+if [ -n "$CAPTURE_ID_FILE" ] || [ -n "$GATE_REVIEW_FILE" ]; then
   PREFER="return=representation"
 else
   PREFER="return=minimal"
@@ -1237,7 +1344,7 @@ print(",\"metadata\":" + json.dumps(m, ensure_ascii=False) if m else "")' 2>/dev
 fi
 
 RESP_BODY_FILE=""
-if [ -n "$CAPTURE_ID_FILE" ]; then
+if [ -n "$CAPTURE_ID_FILE" ] || [ -n "$GATE_REVIEW_FILE" ]; then
   RESP_BODY_FILE=$(mktemp -t jori-send.XXXXXX)
   HTTP_CODE=$(curl -s -o "$RESP_BODY_FILE" -w '%{http_code}' --max-time 10 \
     -X POST "${SUPABASE_URL}/rest/v1/jori_messages" \
@@ -1245,7 +1352,7 @@ if [ -n "$CAPTURE_ID_FILE" ]; then
     -H "Authorization: Bearer ${SUPABASE_KEY}" \
     -H "Content-Type: application/json" \
     -H "Prefer: ${PREFER}" \
-    -d "{\"role\":\"assistant\",\"content\":${JSON_MESSAGE},\"read\":false,\"channel\":${JSON_CHANNEL}${JSON_SENDER}${JSON_METADATA}}")
+    -d "{\"role\":\"assistant\",\"content\":${JSON_MESSAGE},\"read\":false,\"channel\":${JSON_CHANNEL}${JSON_SENDER}${JSON_CONVERSATION}${JSON_METADATA}}")
 else
   HTTP_CODE=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 \
     -X POST "${SUPABASE_URL}/rest/v1/jori_messages" \
@@ -1253,7 +1360,7 @@ else
     -H "Authorization: Bearer ${SUPABASE_KEY}" \
     -H "Content-Type: application/json" \
     -H "Prefer: ${PREFER}" \
-    -d "{\"role\":\"assistant\",\"content\":${JSON_MESSAGE},\"read\":false,\"channel\":${JSON_CHANNEL}${JSON_SENDER}${JSON_METADATA}}")
+    -d "{\"role\":\"assistant\",\"content\":${JSON_MESSAGE},\"read\":false,\"channel\":${JSON_CHANNEL}${JSON_SENDER}${JSON_CONVERSATION}${JSON_METADATA}}")
 fi
 
 if [ "$HTTP_CODE" = "201" ]; then
@@ -1261,7 +1368,7 @@ if [ "$HTTP_CODE" = "201" ]; then
 
   # Write the inserted row id when requested. PostgREST returns a JSON array
   # ([{...row...}]) under return=representation, so extract data[0].id.
-  if [ -n "$CAPTURE_ID_FILE" ] && [ -s "$RESP_BODY_FILE" ]; then
+  if [ -n "$RESP_BODY_FILE" ] && [ -s "$RESP_BODY_FILE" ]; then
     MSG_ID=$(python3 -c 'import json,sys
 try:
   data = json.load(open(sys.argv[1]))
@@ -1269,7 +1376,14 @@ try:
   print(rows[0].get("id",""))
 except Exception:
   pass' "$RESP_BODY_FILE")
-    if [ -n "$MSG_ID" ]; then
+    # The speak gate's verdict, linked to the row it judged (shown under it).
+    # In the foreground (under a second): launchd kills a job's leftover
+    # background processes when it exits, and the first live review was lost
+    # that way.
+    if [ -n "$GATE_REVIEW_FILE" ]; then
+      "${JORI_NODE:-node}" "$SPEAK_GATE_LIVE" record "$GATE_REVIEW_FILE" "$MSG_ID" > /dev/null 2>&1
+    fi
+    if [ -n "$MSG_ID" ] && [ -n "$CAPTURE_ID_FILE" ]; then
       TMP_ID="${CAPTURE_ID_FILE}.tmp.$$"
       printf '%s\n' "$MSG_ID" > "$TMP_ID" && mv -f "$TMP_ID" "$CAPTURE_ID_FILE"
     fi
@@ -1298,6 +1412,8 @@ except Exception:
     # Pass --channel so system/infra alerts never touch the app icon badge.
     NOTIFY_ARGS=(--channel "$CHANNEL")
     [ "$URGENT_PUSH" = true ] && NOTIFY_ARGS+=(--urgent)
+    # Sent as a team member (--as-role): the push is titled with their name and title.
+    [ -n "$AS_ROLE_TITLE" ] && [ -z "${JORI_NO_SIGN:-}" ] && NOTIFY_ARGS+=(--title "$AS_ROLE_TITLE")
     # A question to the user is never read aloud (the user's decision of
     # 2026-11-05): --no-announce keeps it a regular push, even an urgent or
     # location one (those still skip the motion gate). Same structural test as
@@ -1356,7 +1472,8 @@ else
   echo "$ASSISTANT push failed (HTTP $HTTP_CODE) — falling back to email" >&2
   EMAIL_SEND="$JORI_INSTALL_TOOLS/bin/email-send"
   if [ -x "$EMAIL_SEND" ]; then
-    JORI_NO_SIGN=1 "$EMAIL_SEND" --to "$JORI_OWNER_EMAIL" \
+    # Already judged by the speak gate above (it is the same message): no second review.
+    SPEAK_GATE_EMAIL=0 JORI_NO_SIGN=1 "$EMAIL_SEND" --to "$JORI_OWNER_EMAIL" \
       --subject "${JORI_SENDER_NAME:-$ASSISTANT} notification (push failed)" \
       --body "$MESSAGE" 2>/dev/null
     if [ $? -eq 0 ]; then

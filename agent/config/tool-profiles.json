@@ -1,0 +1,26 @@
+{
+  "_comment": "Tool profiles for Jori's own MCP tool server (agent/tools-mcp). Each launcher of tools-mcp sets JORI_TOOL_PROFILE in its MCP config env; the server then lists AND serves only that profile's tools. A profile is `allow` (glob patterns; absent = every tool) minus `deny` (glob patterns), plus `homectl` = \"read-only\" | \"off\" for the homectl passthrough. Unset or unknown profile = \"full\" with a warning on stderr. An installation overrides or adds profiles in agent/local/config/tool-profiles.json (a top-level profile replaces the kernel one). Not a security boundary while the agent has Bash (bin/* reach the same actions); it removes the tool from the model's context and its call path. Derived from 30 days of real calls (2026-11-15). Design: docs/agent-secrets.md § Tool profiles.",
+  "profiles": {
+    "full": {},
+    "ops": {
+      "deny": ["lock_*", "lights_on", "lights_off", "lights_brightness", "shades_*", "tv_on", "tv_off",
+               "sonos_play", "sonos_pause", "sonos_volume", "sonos_next", "speak", "haptic",
+               "imsg_callerid_set", "resy_snipe", "propose_module"],
+      "homectl": "read-only"
+    },
+    "triage": {
+      "deny": ["lock_*", "lights_on", "lights_off", "lights_brightness", "shades_*", "tv_*", "sonos_*",
+               "speak", "haptic", "imsg_callerid_set", "resy_snipe", "propose_module", "whatsapp_send",
+               "homectl", "office_*", "notes_create", "notes_edit", "notes_append", "delegate"],
+      "homectl": "off"
+    },
+    "watcher": {
+      "allow": ["self_status", "wiki_*", "recall", "recall_events", "episode_*", "context_search", "contacts_search",
+                "contacts_get", "contact_find", "whereami", "location_*", "findme_*", "geofence_check",
+                "places_nearby", "flight_status", "check_later", "notify_*", "email_mem_search", "watch_where",
+                "lights_status", "imsg_search", "imsg_read", "whatsapp_search", "whatsapp_read"],
+      "deny": ["location_annotate"],
+      "homectl": "off"
+    }
+  }
+}

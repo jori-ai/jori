@@ -7,12 +7,15 @@
 // question, numbered options with a grey one-line description, the recommended
 // option first and marked "(Recommended)", and a free-text "Type something".
 //
-//   decision-ask --ref <ref> [--dry-run]   send it (or print the card)
+//   decision-ask --ref <ref> [--dry-run] [--no-push]   send it (or print the card);
+//                                           --no-push: into the chat (and its open-questions
+//                                           tray) without a notification
 //   decision-ask --next [--dry-run]         the lane's pick right now
 //   decision-ask --list                     every open decision, in order
 //
 // Exit: 0 sent (or printed) · 5 nothing to send (unknown/answered ref, already
-// one today) · 6 the outbound precheck held it (nothing recorded) · 3 send failed.
+// one today) · 6 the outbound precheck or speak gate held it (recorded in the lane's held[] for 3 days;
+// stdout {sent:false, held:{by, verdict, note, …}}) · 3 send failed.
 //
 // Sends through jori-send-curl (outbound precheck, push + motion gate),
 // with intent `decision:ask` — deliberately NOT a `hum:` intent: the
@@ -27,12 +30,21 @@ import { spawnSync } from "node:child_process";
 import { createRequire } from "node:module";
 import {
   loadOpen, orderDecisions, nextDecision, findDecision, buildCard, renderDecision, groupOf, UNPACED,
-  readLane, writeLane, hashQuestion, SELF_ASKED,
+  readLane, writeLane, holdRecord, hashQuestion, SELF_ASKED, ASKED_BY_OWNER_ROLE, FOLLOW_UP,
 } from "../lib/decision-queue.mjs";
 import { userTz } from "../lib/hum-events.mjs";
 import { recordQuestionSend, currentScale } from "../lib/question-pacing.mjs";
 
 const BIN = createRequire(import.meta.url)("../lib/root.cjs").installTools("bin");
+
+/** The team role that asks this card (ASKED_BY_OWNER_ROLE), or null for the Chief of Staff. */
+function askingRole(source) {
+  if (!ASKED_BY_OWNER_ROLE.has(source) || !FOLLOW_UP[source]?.task) return null;
+  try {
+    const r = createRequire(import.meta.url)("../lib/org.cjs").roleFor({ job: FOLLOW_UP[source].task });
+    return r && !r.chief_of_staff && /^[a-z0-9-]+$/.test(r.id) ? r.id : null; // lang-regex-ok: validates a role id slug from config, not language
+  } catch { return null; }
+}
 const arg = (n) => { const i = process.argv.indexOf(`--${n}`); return i >= 0 ? process.argv[i + 1] : null; };
 const has = (n) => process.argv.includes(`--${n}`);
 
@@ -67,6 +79,15 @@ async function main() {
 
   const lane = readLane();
   const card = await buildCard(item, { lane });
+  // A question about a page with a cover photo (a restaurant, a museum, any
+  // place page) shows it: the photo repository's cover for that page. Absent
+  // (no place-pages, no photo yet, offline), the card goes out as before.
+  if (!item.q.image_url && item.q.wiki_id) {
+    try {
+      const c = await createRequire(import.meta.url)("../lib/photo-repo.js").coverForPage(item.q.wiki_id);
+      if (c?.url) item.q = { ...item.q, image_url: c.url };
+    } catch { /* a photo is a nicety */ }
+  }
   const { choices, text } = renderDecision(item, card);
 
   if (has("dry-run")) {
@@ -80,7 +101,8 @@ async function main() {
     "--intent", "decision:ask",
     "--choices-json", JSON.stringify(choices),
     "--metadata-json", JSON.stringify({ decision_ref: item.ref }),
-    "--push-body", `Decision: ${card.header}`,
+    ...(has("no-push") ? ["--no-push"] : ["--push-body", `Decision: ${card.header}`]),
+    ...(askingRole(item.source) ? ["--role", askingRole(item.source)] : []),
     text,
   ], { encoding: "utf8", timeout: 180_000 });
   let captured = "";
@@ -91,6 +113,19 @@ async function main() {
   }
   if (!captured || captured.startsWith("{")) {
     console.error(`decision-ask: held before sending (${captured || "no message id"}); nothing recorded`);
+    // The hold itself on stdout, for a caller that acts on it (a speak-gate
+    // "resolve" hold: the user already answered; plugins/shows-seen/lib/ask-now.js).
+    let hold = null;
+    try { hold = captured ? JSON.parse(captured) : null; } catch { hold = null; }
+    // A hold on the card itself (precheck or speak gate) is remembered, so the
+    // lane stops offering the same card every tick; a transient hold is not.
+    const rec = holdRecord(item.ref, hold);
+    if (rec) {
+      const lane = readLane();
+      lane.held = [...(lane.held || []).filter((h) => h.ref !== item.ref), rec].slice(-100);
+      writeLane(lane);
+    }
+    console.log(JSON.stringify({ sent: false, ref: item.ref, held: hold }));
     return 6;
   }
 

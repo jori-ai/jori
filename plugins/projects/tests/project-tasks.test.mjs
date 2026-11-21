@@ -30,6 +30,7 @@ function fakeList(rows = []) {
     add: (_l, { title, due, notes }) => { const id = `g${++n}`; const r = { id, title, due: due ? `${due}T00:00:00.000Z` : undefined, notes, status: "needsAction" }; items.set(id, r); calls.push(["add", title]); return r; },
     update: (_l, id, { title, due }) => { const r = { ...items.get(id), title, due: `${due}T00:00:00.000Z` }; items.set(id, r); calls.push(["update", id]); return r; },
     done: (_l, id) => { items.get(id).status = "completed"; calls.push(["done", id]); },
+    undo: (_l, id) => { items.get(id).status = "needsAction"; calls.push(["undo", id]); return items.get(id); },
     delete: (_l, id) => { items.delete(id); calls.push(["delete", id]); },
   };
 }
@@ -116,6 +117,48 @@ test("Jori's changes are pushed only while the user hasn't touched the task; a d
   assert.ok(g.items.has(d.gtask.id), "a task the user changed is never deleted");
   const r2 = pt.syncGoogle(l, g, { now: NOW });
   assert.equal(Object.values(r2).reduce((n, v) => n + v.length, 0), 0, "settled: nothing more to do");
+});
+
+test("a task the user ticked off and then asked to bring back is un-ticked on their list", () => {
+  const l = fresh();
+  const a = pt.addTask(l, { project: "p", title: "A", owner: "user", due: "2026-11-12" }, { now: NOW });
+  const g = fakeList();
+  pt.syncGoogle(l, g, { now: NOW });
+  // They tick it off on the list; the sync closes it here.
+  g.items.get(a.gtask.id).status = "completed";
+  assert.deepEqual(pt.syncGoogle(l, g, { now: NOW }).closed_by_user, [a.id]);
+  // Then they tell the chat to bring it back for a later date: the ledger reopens.
+  pt.reopenTask(l, a.id, { by: "chat", due: "2026-11-26", now: NOW });
+  const r = pt.syncGoogle(l, g, { now: NOW });
+  assert.deepEqual(r.pushed, [a.id]);
+  assert.equal(g.items.get(a.gtask.id).status, "needsAction", "the tick is taken off");
+  assert.ok(g.calls.some((c) => c[0] === "undo" && c[1] === a.gtask.id));
+  assert.equal(l.tasks[a.id].status, "open");
+  assert.equal(l.tasks[a.id].gtask.synced.status, "needsAction");
+  // The new date follows on the next run, and then nothing more moves.
+  assert.deepEqual(pt.syncGoogle(l, g, { now: NOW }).pushed, [a.id]);
+  assert.equal(g.items.get(a.gtask.id).due.slice(0, 10), "2026-11-26");
+  const settled = pt.syncGoogle(l, g, { now: NOW });
+  assert.equal(Object.values(settled).reduce((n, v) => n + v.length, 0), 0, "settled: nothing more to do");
+  assert.equal(g.calls.filter((c) => c[0] === "undo").length, 1, "un-ticked once, not on every run");
+  // Ticking it off again is theirs and closes it again.
+  g.items.get(a.gtask.id).status = "completed";
+  assert.deepEqual(pt.syncGoogle(l, g, { now: NOW }).closed_by_user, [a.id]);
+  assert.equal(l.tasks[a.id].status, "done");
+});
+
+test("a dry run never un-ticks the task", () => {
+  const l = fresh();
+  const a = pt.addTask(l, { project: "p", title: "A", owner: "user", due: "2026-11-12" }, { now: NOW });
+  const g = fakeList();
+  pt.syncGoogle(l, g, { now: NOW });
+  g.items.get(a.gtask.id).status = "completed";
+  pt.syncGoogle(l, g, { now: NOW });
+  pt.reopenTask(l, a.id, { by: "chat", due: "2026-11-26", now: NOW });
+  const r = pt.syncGoogle(l, g, { now: NOW, dryRun: true });
+  assert.deepEqual(r.pushed, [a.id]);
+  assert.equal(g.items.get(a.gtask.id).status, "completed");
+  assert.ok(!g.calls.some((c) => c[0] === "undo"));
 });
 
 test("a lost link is recovered from the marker in the task's notes", () => {
@@ -205,4 +248,25 @@ test("a page title keeps an amount off the page while the user's list keeps thei
   assert.equal(l.tasks[t.id].title, "Move $2k into the safe");
   pt.updateTask(l, t.id, { page_title: "" }, { now: NOW });
   assert.ok(pt.renderTasksSection(l, "p", { now: NOW }).includes("$2k"));
+});
+
+test("a completion Jori's own job pushed to the list is told apart from the user's tick", () => {
+  const l = fresh();
+  const a = pt.addTask(l, { project: "project_x", title: "Book the car for the trip", owner: "user", due: "2026-11-20", why: "(gap)" }, { now: NOW });
+  const b = pt.addTask(l, { project: "project_x", title: "Renew the parking permit", owner: "user", due: "2026-11-21", why: "(gap)" }, { now: NOW });
+  const c = pt.addTask(l, { project: "project_x", title: "Pay the deposit for the venue", owner: "user", due: "2026-11-22", why: "(gap)" }, { now: NOW });
+  const t0 = Date.parse("2026-11-12T09:43:39Z");
+  pt.closeTask(l, a.id, { status: "done", note: "approved", by: "dream:2026-11-11", now: t0 });
+  pt.closeTask(l, b.id, { status: "done", note: "they said so", by: "chat", now: t0 });
+  pt.closeTask(l, c.id, { status: "done", note: "the nightly pass", by: "projects", now: t0 });
+  l.tasks[c.id].gtask = { id: "g-c" };
+  const test = pt.joriCompletionTest(l);
+  const at = "2026-11-12T09:43:57.000Z";
+  assert.equal(test({ id: "g1", notes: `why\n\n${pt.MARKER(a.id)}`, completed: at }), true);   // by the marker
+  assert.equal(test({ id: "g-c", notes: null, completed: at }), true);                        // by the linked id
+  assert.equal(test({ id: "g2", notes: pt.MARKER(b.id), completed: at }), false);             // chat is the user's word
+  assert.equal(test({ id: "g3", notes: pt.MARKER(a.id), completed: "2026-11-12T08:00:00.000Z" }), false); // the user got there first
+  assert.equal(test({ id: "g4", notes: "no marker", completed: at }), false);                 // not a project task
+  assert.equal(test({ id: "g5", notes: pt.MARKER(a.id), completed: "not a date" }), false);   // unreadable: not hidden
+  assert.equal(pt.joriCompletionTest({})({ id: "g6", notes: pt.MARKER(a.id), completed: at }), false); // empty ledger
 });

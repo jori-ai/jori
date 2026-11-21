@@ -16,7 +16,7 @@
 //
 // Managed by launchd (ai.claude.session).
 
-import { mkdirSync, readFileSync, unlinkSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, unlinkSync } from "node:fs";
 import http from "node:http";
 import path from "node:path";
 import { createRequire } from "node:module";
@@ -121,9 +121,10 @@ function createProcesses() {
   );
 
   // 3. Wiki server — HTTP wiki browser on :9096. Binds to 0.0.0.0 so
-  // it's reachable over Tailscale (e.g. http://<host>:9096) and
-  // on the home LAN, not just localhost. Read-only, no auth — exposure is
-  // gated by network trust (LAN + Tailscale), same model as before.
+  // it's reachable over Tailscale (e.g. http://<host>:9096; the companion
+  // app's Memory tab). No login, so lib/wiki-serve.js answers only loopback
+  // and tailnet callers with one of this host's own names in Host
+  // (lib/net-trust.cjs): the home LAN and DNS-rebinding pages get nothing.
   children.push(
     new ManagedProcess({
       name: "wiki-server",
@@ -144,7 +145,7 @@ function createProcesses() {
   //     mandatory on every request and scopes what each identity may read
   //     (lib/wiki-access.js, data/wiki-share-scopes.json).
   //
-  // Keeping them separate preserves the unauthenticated Tailscale/LAN browsing
+  // Keeping them separate preserves the unauthenticated Tailscale browsing
   // above — which is network-trust gated and works fine — while guaranteeing
   // the internet-facing instance can never serve a page without an identity.
   // One process serving both would have meant choosing between the two.
@@ -161,7 +162,8 @@ function createProcesses() {
   );
 
   // 4. WhatsApp channel — Baileys gateway holding the user's personal WhatsApp
-  // session. HTTP send-server on :9100, inbound to whatsapp-inbox.jsonl,
+  // session. HTTP send-server on 127.0.0.1:9100 (local callers only),
+  // inbound to whatsapp-inbox.jsonl,
   // chat-channel pings on filter-pass. If down, inbound stalls (WhatsApp
   // servers queue messages for Linked Devices for a few hours, not days),
   // so supervision matters here more than for wiki-server.
@@ -180,16 +182,22 @@ function createProcesses() {
   // logs every new message, 1:1 and group, both directions, to
   // imessage-inbox.jsonl within seconds; health on :9107. Needs Full Disk
   // Access for the node binary. Sending stays with `imsg send`.
-  children.push(
-    new ManagedProcess({
-      name: "imessage-channel",
-      command: NODE,
-      args: [path.join(AGENT_DIR, "imessage-channel/index.mjs")],
-      cwd: path.join(AGENT_DIR, "imessage-channel"),
-      logFile: path.join(LOG_DIR, "imessage-channel.log"),
-      log,
-    })
-  );
+  // macOS only: Messages exists nowhere else (a Linux host lists it as not
+  // available here instead of restarting it forever).
+  if (process.platform === "darwin") {
+    children.push(
+      new ManagedProcess({
+        name: "imessage-channel",
+        command: NODE,
+        args: [path.join(AGENT_DIR, "imessage-channel/index.mjs")],
+        cwd: path.join(AGENT_DIR, "imessage-channel"),
+        logFile: path.join(LOG_DIR, "imessage-channel.log"),
+        log,
+      })
+    );
+  } else {
+    log("imessage-channel: not started (macOS only)");
+  }
 
   // 6. Slack channel — realtime runner on the user's own Slack web session
   // (xoxc token + d cookie from .env). Holds one RTM websocket, logs to
@@ -205,6 +213,26 @@ function createProcesses() {
       log,
     })
   );
+
+  // 7. Cloudflare Tunnel, when the setup page's "Instant mail" card set one
+  // up (JORI_TUNNEL_TOKEN in .env, lib/onboarding/services.mjs). An
+  // installation that runs cloudflared on its own (a launchd agent) leaves
+  // the token unset, so there is never a second tunnel process.
+  const tunnelToken = process.env.JORI_TUNNEL_TOKEN;
+  const cloudflared = ["/opt/homebrew/bin/cloudflared", "/usr/local/bin/cloudflared", "/usr/bin/cloudflared", path.join(HOME || "", ".local/bin/cloudflared")].find((p) => existsSync(p));
+  if (tunnelToken && cloudflared) {
+    children.push(
+      new ManagedProcess({
+        name: "cloudflared",
+        command: cloudflared,
+        args: ["tunnel", "--no-autoupdate", "run"],
+        cwd: JORI,
+        env: { TUNNEL_TOKEN: tunnelToken },
+        logFile: path.join(LOG_DIR, "cloudflared.log"),
+        log,
+      })
+    );
+  }
 
   return children;
 }

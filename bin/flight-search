@@ -1,12 +1,39 @@
 #!/usr/bin/env node
-import { execSync } from "node:child_process";
+// flight-search — live flight fares from Duffel and Google Flights, in one list.
+//
+// Two sources because neither sees every airline: Duffel's offers come from the
+// airlines its account can sell, and Google Flights (through bin/serpapi) shows
+// what its own page shows. A carrier missing from one is often on the other,
+// sometimes for far less, so by default both are searched, every row names its
+// source, and the output ends with the airlines each source returned (a missing
+// carrier is visible, not silent).
+//
+// Price basis: both sources price the whole booking. Duffel's total_amount and
+// Google Flights' price are for every passenger together (the two agree on the
+// same flights searched for two adults). Every row shows TOTAL and PER PERSON
+// (TOTAL / passengers), and the --json rows carry price_total and
+// price_per_person.
+//
+// One source failing (no key, quota, network, no results) prints the other's
+// results with a one-line note; the command fails only when every source it
+// searched failed. With --source duffel|google only that source is searched, and
+// its failure is an error as before.
+//
+// Cost: a search that includes Google (the default) spends one SerpApi search
+// from the plan's monthly quota (`serpapi account` shows what is left). Never
+// loop it over many dates; --source duffel spends none.
+//
+// Google round trips and open-jaws: the price covers the whole trip, but only
+// the outbound flights are listed (each return choice is one more search); the
+// return is picked on the Google Flights page linked below the table.
+import { execFile, execSync } from "node:child_process";
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { createRequire } from "node:module";
 
 const require = createRequire(import.meta.url);
-const { installRoot } = require("../lib/root.cjs");
+const { installRoot, toolsPath } = require("../lib/root.cjs");
 const { localConfig } = require("../lib/instance.cjs");
 // Where a non-interactive `op read` bootstraps the token from (optional):
 // agent/local/config/flight-search.json { "op_ref": "<a 1Password secret reference>" }.
@@ -15,11 +42,20 @@ const ENV_FILE = path.join(installRoot(), ".env");
 const DUFFEL_URL =
   "https://api.duffel.com/air/offer_requests?return_offers=true&supplier_timeout=15000";
 const DUFFEL_VERSION = "v2";
+const SERPAPI_BIN = toolsPath("bin", "serpapi");
+const SERPAPI_TIMEOUT_MS = 90_000;
 const VALID_CABINS = new Set(["economy", "premium_economy", "business", "first"]);
 const VALID_SORTS = new Set(["price", "duration", "depart"]);
+const VALID_SOURCES = new Set(["both", "duffel", "google"]);
+const SOURCE_ORDER = ["duffel", "google"];
+const SOURCE_LABEL = { duffel: "Duffel", google: "Google Flights" };
+const BOOLEAN_FLAGS = new Set(["direct", "json", "debug", "help"]);
+// SerpApi google_flights codes (https://serpapi.com/google-flights-api).
+const GOOGLE_CABIN = { economy: "1", premium_economy: "2", business: "3", first: "4" };
+const GOOGLE_SORT = { price: "2", depart: "3", duration: "5" };
 
 function usage() {
-  return `flight-search — search live flight fares via Duffel
+  return `flight-search — live flight fares from Duffel and Google Flights, in one list
 
 Usage:
   flight-search <ORIGIN> <DEST> --date YYYY-MM-DD [options]
@@ -29,23 +65,35 @@ Required:
   --date YYYY-MM-DD         Outbound departure date
 
 Optional:
+  --source WHICH            both | duffel | google (default both). Each run that includes
+                            google spends one SerpApi search from the monthly quota;
+                            never loop it over many dates.
   --return YYYY-MM-DD       Return date → round trip
   --return-to IATA          Open-jaw: end the return at a different airport than ORIGIN
                             (e.g. fly LHR→NRT outbound, return NRT→CDG). Requires --return.
   --adults N                Adult passenger count (default 1)
   --cabin CLASS             economy | premium_economy | business | first (default economy)
-  --max N                   Max offers to return (default 10, cap 100)
+  --max N                   Max offers to show from the merged list (default 10, cap 100)
   --currency CCY            Display currency hint, ISO 4217 (default USD; Duffel may return others)
-  --direct                  Force nonstop only (sent as max_connections=0 server-side)
-  --carrier IATA            Strict carrier filter — every segment's marketing carrier must match
-                            (no codeshare slips through). 2-letter IATA, e.g. BA for British Airways.
+  --direct                  Force nonstop only (Duffel max_connections=0, Google stops=1)
+  --carrier IATA            Strict carrier filter — every listed segment's marketing carrier must
+                            match (no codeshare slips through). 2-letter IATA, e.g. BA for British Airways.
   --sort KEY                price | duration | depart (default price)
-  --json                    Output flattened JSON instead of table
-  --debug                   Echo request + response to stderr (token redacted)
+  --json                    Output flattened JSON (one array of rows) instead of the table;
+                            notes and the coverage lines go to stderr
+  --debug                   Echo requests + responses to stderr (keys are never printed)
   --help, -h                Show this help
 
-Exit codes: 0 ok, 1 runtime/API error, 2 usage error.
-Secret source: DUFFEL_API_TOKEN in the environment or .env${OP_REF ? ` (bootstrap: ${OP_REF})` : ""}
+Output:
+  Every row names its SOURCE. TOTAL is the price for all passengers together; PER PERSON
+  is TOTAL / passengers (JSON: price_total, price_per_person, passengers). The output ends
+  with the airlines each source returned and the ones only one source had. If one source
+  fails, the other's results print with a one-line note. Google round-trip prices cover the
+  whole trip; only the outbound is listed and the return is picked on the Google Flights link.
+
+Exit codes: 0 ok, 1 every searched source failed (or another runtime error), 2 usage error.
+Secrets: DUFFEL_API_TOKEN in the environment or .env${OP_REF ? ` (bootstrap: ${OP_REF})` : ""};
+SERPAPI_API_KEY in .env (read by bin/serpapi).
 `;
 }
 
@@ -64,19 +112,21 @@ function hasFlag(args, name) {
   return args.includes(`--${name}`);
 }
 
-function parseArgs(argv) {
+export function parseArgs(argv) {
   const args = argv.slice(2);
   if (args.length === 0 || hasFlag(args, "help") || args.includes("-h")) {
     process.stdout.write(usage());
     process.exit(0);
   }
 
-  const positionals = args.filter((a) => !a.startsWith("--"));
+  // A token after a value flag is that flag's value; a token after a boolean
+  // flag (--direct, --json, --debug) is still a positional.
   const flagged = new Set();
   for (let i = 0; i < args.length; i++) {
     if (args[i].startsWith("--")) {
       flagged.add(i);
-      if (i + 1 < args.length && !args[i + 1].startsWith("--")) flagged.add(i + 1);
+      const takesValue = !BOOLEAN_FLAGS.has(args[i].slice(2));
+      if (takesValue && i + 1 < args.length && !args[i + 1].startsWith("--")) flagged.add(i + 1);
     }
   }
   const realPositionals = [];
@@ -136,6 +186,11 @@ function parseArgs(argv) {
     fail(`--sort must be one of: ${[...VALID_SORTS].join(", ")}`, 2);
   }
 
+  const source = (flag(args, "source") || "both").toLowerCase();
+  if (!VALID_SOURCES.has(source)) {
+    fail(`--source must be one of: ${[...VALID_SOURCES].join(", ")}`, 2);
+  }
+
   return {
     origin,
     dest,
@@ -149,6 +204,7 @@ function parseArgs(argv) {
     direct: hasFlag(args, "direct"),
     carrier,
     sortKey,
+    source,
     json: hasFlag(args, "json"),
     debug: hasFlag(args, "debug"),
   };
@@ -185,11 +241,15 @@ function readToken() {
     } catch {}
   }
 
-  fail(
+  throw new Error(
     `no Duffel token: set DUFFEL_API_TOKEN in ${ENV_FILE}` +
       (OP_REF ? ` (bootstrap once with: op read ${JSON.stringify(OP_REF)}).` : "."),
-    1,
   );
+}
+
+export function tripKind(opts) {
+  if (opts.returnTo) return "open_jaw";
+  return opts.returnDate ? "round_trip" : "one_way";
 }
 
 function buildBody(opts) {
@@ -225,8 +285,8 @@ async function callDuffel(token, body, debug) {
     });
   } catch (e) {
     clearTimeout(t);
-    if (e.name === "AbortError") fail("Duffel request timed out after 30s");
-    fail(`network error talking to Duffel: ${e.message}`);
+    if (e.name === "AbortError") throw new Error("Duffel request timed out after 30s");
+    throw new Error(`network error talking to Duffel: ${e.message}`);
   }
   clearTimeout(t);
   const text = await res.text();
@@ -239,22 +299,22 @@ async function callDuffel(token, body, debug) {
   try {
     parsed = JSON.parse(text);
   } catch {
-    fail(`Duffel returned non-JSON (HTTP ${res.status}): ${text.slice(0, 200)}`);
+    throw new Error(`Duffel returned non-JSON (HTTP ${res.status}): ${text.slice(0, 200)}`);
   }
   if (!res.ok) {
     if (res.status === 401 || res.status === 403) {
-      fail(`Duffel auth failed (HTTP ${res.status}). Check the token in ${OP_REF}.`);
+      throw new Error(`Duffel auth failed (HTTP ${res.status}). Check DUFFEL_API_TOKEN${OP_REF ? ` (canonical: ${OP_REF})` : ` in ${ENV_FILE}`}.`);
     }
     const errMsg =
       parsed.errors?.[0]?.message || parsed.errors?.[0]?.title || `HTTP ${res.status}`;
-    fail(`Duffel error: ${errMsg}`);
+    throw new Error(`Duffel error: ${errMsg}`);
   }
   return parsed;
 }
 
 function isoDurationToMinutes(d) {
   if (!d) return 0;
-  const m = d.match(/^PT(?:(\d+)H)?(?:(\d+)M)?/);
+  const m = d.match(/^PT(?:(\d+)H)?(?:(\d+)M)?/); // lang-regex-ok: ISO 8601 duration from the Duffel API
   if (!m) return 0;
   return (parseInt(m[1] || "0", 10) * 60) + parseInt(m[2] || "0", 10);
 }
@@ -268,6 +328,21 @@ function fmtDuration(minutes) {
 function fmtDateTime(iso) {
   if (!iso) return "";
   return iso.replace("T", " ").slice(0, 16);
+}
+
+const round2 = (n) => Math.round(n * 100) / 100;
+
+// Both sources price the whole booking: the amount is for every passenger
+// together. PER PERSON is derived, never the other way round.
+export function withPrices(row, adults) {
+  const total = Number.parseFloat(row.total_amount);
+  return {
+    ...row,
+    passengers: adults,
+    price_total: round2(total),
+    price_per_person: round2(total / adults),
+    price_basis: "total_for_all_passengers",
+  };
 }
 
 function summarizeSlice(slice) {
@@ -295,21 +370,195 @@ function summarizeSlice(slice) {
   };
 }
 
-function flattenOffers(offers) {
+/** Duffel offers → rows (source "duffel"). total_amount is the offer's total for all passengers. */
+export function flattenOffers(offers, opts) {
+  const trip = tripKind(opts);
   return offers.map((o) => {
     const out = summarizeSlice(o.slices?.[0]);
     const ret = o.slices?.[1] ? summarizeSlice(o.slices[1]) : null;
-    return {
+    return withPrices({
+      source: "duffel",
       offer_id: o.id,
       total_amount: o.total_amount,
       currency: o.total_currency,
       outbound: out,
       return: ret,
-    };
+      trip,
+    }, opts.adults);
   });
 }
 
-function filterAndSort(flat, opts) {
+/** The bin/serpapi google_flights parameters for a search. */
+export function googleParams(opts) {
+  const p = {
+    hl: "en",
+    currency: opts.currency,
+    adults: String(opts.adults),
+    travel_class: GOOGLE_CABIN[opts.cabin],
+    sort_by: GOOGLE_SORT[opts.sortKey],
+    // The results the Google Flights page itself shows (a slower answer, same one search).
+    deep_search: "true",
+  };
+  if (opts.returnTo) {
+    p.type = "3";
+    p.multi_city_json = JSON.stringify([
+      { departure_id: opts.origin, arrival_id: opts.dest, date: opts.departDate },
+      { departure_id: opts.dest, arrival_id: opts.returnTo, date: opts.returnDate },
+    ]);
+  } else {
+    p.departure_id = opts.origin;
+    p.arrival_id = opts.dest;
+    p.outbound_date = opts.departDate;
+    if (opts.returnDate) {
+      p.type = "1";
+      p.return_date = opts.returnDate;
+    } else {
+      p.type = "2";
+    }
+  }
+  if (opts.direct) p.stops = "1";
+  if (opts.carrier) p.include_airlines = opts.carrier;
+  return p;
+}
+
+/** argv for bin/serpapi: --raw keeps search_metadata (the Google Flights page link). */
+export function serpapiArgs(params) {
+  return ["google_flights", "-", ...Object.entries(params).map(([k, v]) => `--${k}=${v}`), "--raw"];
+}
+
+// "2027-01-20 19:01" (Google, airport-local) → "2027-01-20T19:01:00", the shape Duffel uses.
+function googleTime(t) {
+  if (!t) return null;
+  const s = String(t);
+  return s.length === 16 && s[10] === " " ? `${s.slice(0, 10)}T${s.slice(11)}:00` : s;
+}
+
+// "VS 46" → { carrier: "VS", number: "46" }.
+function splitFlightNumber(fn) {
+  const m = String(fn || "").trim().match(/^([A-Z0-9]{2})\s*(\d{1,4}[A-Z]?)$/); // lang-regex-ok: IATA flight-number structure from the SerpApi response
+  if (m) return { carrier: m[1], number: m[2] };
+  const [carrier = "", number = ""] = String(fn || "").trim().split(" ");
+  return { carrier: carrier || null, number: number || null };
+}
+
+/** A SerpApi google_flights response → { rows (source "google"), link }. price is for all passengers. */
+export function flattenGoogle(resp, opts) {
+  const currency = resp?.search_parameters?.currency || opts.currency;
+  const link = resp?.search_metadata?.google_flights_url || null;
+  const trip = tripKind(opts);
+  const items = [...(resp?.best_flights || []), ...(resp?.other_flights || [])];
+  const rows = [];
+  for (const it of items) {
+    const price = Number(it?.price);
+    const flights = it?.flights || [];
+    if (!Number.isFinite(price) || price <= 0 || flights.length === 0) continue;
+    const segments = flights.map((f) => {
+      const { carrier, number } = splitFlightNumber(f.flight_number);
+      return {
+        from: f.departure_airport?.id,
+        to: f.arrival_airport?.id,
+        depart: googleTime(f.departure_airport?.time),
+        arrive: googleTime(f.arrival_airport?.time),
+        carrier,
+        flight_no: number,
+        aircraft: f.airplane || null,
+      };
+    });
+    const first = segments[0];
+    const last = segments[segments.length - 1];
+    const legMinutes = flights.reduce((n, f) => n + (Number(f.duration) || 0), 0)
+      + (it.layovers || []).reduce((n, l) => n + (Number(l.duration) || 0), 0);
+    rows.push(withPrices({
+      source: "google",
+      offer_id: null,
+      total_amount: price.toFixed(2),
+      currency,
+      outbound: {
+        carrier: [...new Set(segments.map((s) => s.carrier).filter(Boolean))].join("/"),
+        flight_no: `${first.carrier || ""} ${first.flight_no || ""}`.trim(),
+        depart: first.depart,
+        arrive: last.arrive,
+        duration_min: Number(it.total_duration) || legMinutes,
+        stops: Math.max(0, segments.length - 1),
+        segments,
+      },
+      // A round trip's return choices are one more search each; the price
+      // already covers them, and the link shows them.
+      return: null,
+      ...(trip === "one_way" ? {} : { return_listed: false }),
+      trip,
+      link,
+    }, opts.adults));
+  }
+  return { rows, link };
+}
+
+function runSerpapi(args) {
+  return new Promise((resolve, reject) => {
+    execFile(process.execPath, [SERPAPI_BIN, ...args],
+      { encoding: "utf8", timeout: SERPAPI_TIMEOUT_MS, maxBuffer: 32 * 1024 * 1024 },
+      (err, stdout, stderr) => {
+        if (err) {
+          let why = String(stderr || "").trim().split("\n")[0];
+          if (why.startsWith("serpapi: ")) why = why.slice("serpapi: ".length);
+          if (!why) why = err.killed ? `timed out after ${SERPAPI_TIMEOUT_MS / 1000}s` : err.message;
+          return reject(new Error(`Google Flights search (SerpApi) failed: ${why}`));
+        }
+        try {
+          resolve(JSON.parse(stdout));
+        } catch {
+          reject(new Error("Google Flights search (SerpApi) returned unparseable output"));
+        }
+      });
+  });
+}
+
+async function searchDuffel(opts) {
+  const token = readToken();
+  const body = buildBody(opts);
+  if (opts.debug) {
+    process.stderr.write(`--- duffel request ---\n${JSON.stringify(body, null, 2)}\n--- end ---\n`);
+  }
+  const resp = await callDuffel(token, body, opts.debug);
+  return { rows: flattenOffers(resp.data?.offers || [], opts) };
+}
+
+async function searchGoogle(opts) {
+  const params = googleParams(opts);
+  if (opts.debug) {
+    process.stderr.write(`--- serpapi google_flights request ---\n${JSON.stringify(params, null, 2)}\n--- end ---\n`);
+  }
+  const resp = await runSerpapi(serpapiArgs(params));
+  if (opts.debug) {
+    process.stderr.write(`--- serpapi response ---\n${JSON.stringify(resp)}\n--- end ---\n`);
+  }
+  return flattenGoogle(resp, opts);
+}
+
+/**
+ * Search the sources --source names, in parallel. Each settles on its own:
+ * → { duffel?: { rows } | { error }, google?: { rows, link } | { error } }.
+ */
+export async function runSearch(opts, deps = {}) {
+  const fns = { duffel: deps.duffel || searchDuffel, google: deps.google || searchGoogle };
+  const wanted = opts.source === "both" || !opts.source ? SOURCE_ORDER : [opts.source];
+  const settled = await Promise.allSettled(wanted.map((s) => fns[s](opts)));
+  const results = {};
+  wanted.forEach((s, i) => {
+    const r = settled[i];
+    if (r.status === "fulfilled") results[s] = { rows: r.value?.rows || [], link: r.value?.link || null };
+    else {
+      if (opts.debug) process.stderr.write(`--- ${s} failed ---\n${r.reason?.stack || r.reason}\n--- end ---\n`);
+      results[s] = { error: String(r.reason?.message || r.reason || "unknown error") };
+    }
+  });
+  return results;
+}
+
+const carriersOf = (r) => [...new Set([...(r.outbound?.segments || []), ...(r.return?.segments || [])]
+  .map((s) => s.carrier).filter(Boolean))];
+
+export function filterAndSort(flat, opts) {
   let rows = flat;
   const beforeCarrier = rows.length;
   if (opts.direct) {
@@ -336,68 +585,136 @@ function filterAndSort(flat, opts) {
   }
   const totalDuration = (r) => (r.outbound?.duration_min || 0) + (r.return?.duration_min || 0);
   const departTs = (r) => Date.parse(r.outbound?.depart || 0) || 0;
-  rows.sort((a, b) => {
+  return [...rows].sort((a, b) => {
     if (opts.sortKey === "price") return parseFloat(a.total_amount) - parseFloat(b.total_amount);
     if (opts.sortKey === "duration") return totalDuration(a) - totalDuration(b);
     if (opts.sortKey === "depart") return departTs(a) - departTs(b);
     return 0;
   });
-  return rows.slice(0, opts.max);
 }
 
-function renderTable(rows, opts) {
-  if (rows.length === 0) {
-    process.stdout.write("No offers matched the criteria.\n");
-    return;
+const money = (currency, n) => `${currency || ""} ${Number(n).toFixed(2)}`.trim();
+const plural = (n, one, many) => `${n} ${n === 1 ? one : many}`;
+
+// "AA 0104" → "AA 104" (Duffel zero-pads flight numbers; Google does not).
+function displayFlight(seg) {
+  if (!seg) return "";
+  const num = String(seg.flight_no || "").replace(/^0+(?=\d)/, ""); // lang-regex-ok: leading zeros of an API flight number
+  return `${seg.carrier || ""} ${num}`.trim();
+}
+
+/** The airlines each source returned, and the ones only one source had. */
+export function coverageLines(results, matched) {
+  const lines = ["Coverage — airlines each source returned (offers matching the filters, before --max):"];
+  const sets = {};
+  for (const s of SOURCE_ORDER) {
+    const res = results[s];
+    if (!res) continue;
+    if (res.error) {
+      lines.push(`  ${s}: unavailable this run (see the note)`);
+      continue;
+    }
+    const mine = matched.filter((r) => r.source === s);
+    sets[s] = new Set(mine.flatMap(carriersOf));
+    if (!mine.length) {
+      lines.push(`  ${s}: no offers matched`);
+      continue;
+    }
+    const cheapest = mine.reduce((a, b) => (b.price_total < a.price_total ? b : a));
+    lines.push(`  ${s}: ${plural(mine.length, "offer", "offers")}, cheapest ${money(cheapest.currency, cheapest.price_total)} total`
+      + ` (${money(cheapest.currency, cheapest.price_per_person)} per person) — ${[...sets[s]].sort().join(", ") || "no airline codes"}`);
   }
-  const header = `${"#".padEnd(3)} ${"PRICE".padEnd(12)} ${"AIRLINE".padEnd(8)} ${"STOPS".padEnd(5)} ${"DEPART".padEnd(17)} ${"ARRIVE".padEnd(17)} ${"DURATION".padEnd(8)} OFFER`;
-  const sep = "─".repeat(header.length);
-  const lines = [header, sep];
+  const ok = Object.keys(sets);
+  if (ok.length === 2) {
+    for (const s of ok) {
+      const other = ok.find((o) => o !== s);
+      const only = [...sets[s]].filter((c) => !sets[other].has(c)).sort();
+      if (only.length) lines.push(`  only on ${s}: ${only.join(", ")}`);
+    }
+  }
+  if (results.google?.link) lines.push(`Google Flights page: ${results.google.link}`);
+  return lines;
+}
+
+function renderTable(rows) {
+  const header = `${"#".padEnd(3)} ${"SOURCE".padEnd(6)} ${"TOTAL".padEnd(13)} ${"PER PERSON".padEnd(13)} ${"AIRLINE".padEnd(8)} ${"FLIGHT".padEnd(8)} ${"STOPS".padEnd(5)} ${"DEPART".padEnd(17)} ${"ARRIVE".padEnd(17)} ${"DURATION".padEnd(8)} OFFER`;
+  const lines = [header, "─".repeat(header.length)];
+  const leg = (l) => [
+    (l?.carrier || "").padEnd(8),
+    displayFlight(l?.segments?.[0]).padEnd(8),
+    String(l?.stops ?? "").padEnd(5),
+    fmtDateTime(l?.depart).padEnd(17),
+    fmtDateTime(l?.arrive).padEnd(17),
+    fmtDuration(l?.duration_min || 0).padEnd(8),
+  ].join(" ");
   rows.forEach((r, idx) => {
     const num = String(idx + 1).padEnd(3);
-    const price = `${r.currency} ${r.total_amount}`.padEnd(12);
-    const out = r.outbound;
-    const ret = r.return;
-    const carrierOut = (out?.carrier || "").padEnd(8);
-    const stopsOut = String(out?.stops ?? "").padEnd(5);
-    const depOut = fmtDateTime(out?.depart).padEnd(17);
-    const arrOut = fmtDateTime(out?.arrive).padEnd(17);
-    const durOut = fmtDuration(out?.duration_min || 0).padEnd(8);
-    const offerId = r.offer_id;
-    lines.push(`${num} ${price} ${carrierOut} ${stopsOut} ${depOut} ${arrOut} ${durOut} ${offerId}`);
-    if (ret) {
-      const indent = "    ".padEnd(3 + 1 + 12 + 1);
-      const carrierR = (ret.carrier || "").padEnd(8);
-      const stopsR = String(ret.stops ?? "").padEnd(5);
-      const depR = fmtDateTime(ret.depart).padEnd(17);
-      const arrR = fmtDateTime(ret.arrive).padEnd(17);
-      const durR = fmtDuration(ret.duration_min || 0).padEnd(8);
-      lines.push(`${indent}↩ ${carrierR} ${stopsR} ${depR} ${arrR} ${durR}`);
+    const total = money(r.currency, r.price_total).padEnd(13);
+    const each = money(r.currency, r.price_per_person).padEnd(13);
+    lines.push(`${num} ${r.source.padEnd(6)} ${total} ${each} ${leg(r.outbound)} ${r.offer_id || "-"}`);
+    if (r.return) {
+      const indent = " ".repeat(3 + 1 + 6 + 1 + 13 + 1 + 13 - 1);
+      lines.push(`${indent}↩ ${leg(r.return)}`);
     }
   });
-  process.stdout.write(lines.join("\n") + "\n");
+  return lines.join("\n");
+}
+
+function failureNote(source, error, others) {
+  const why = error.endsWith(".") ? error.slice(0, -1) : error;
+  return `Note: ${SOURCE_LABEL[source]} unavailable this run (${why}); showing ${others.map((s) => SOURCE_LABEL[s]).join(" and ")} results only.`;
+}
+
+/**
+ * The whole printout for a search → { out, err, code }. Exit 1 only when every
+ * searched source failed; one failed source is a note beside the other's rows.
+ */
+export function buildReport(results, opts) {
+  const searched = SOURCE_ORDER.filter((s) => results[s]);
+  const ok = searched.filter((s) => !results[s].error);
+  if (!ok.length) {
+    return { out: "", err: searched.map((s) => `flight-search: ${results[s].error}\n`).join(""), code: 1 };
+  }
+  const notes = searched.filter((s) => results[s].error).map((s) => failureNote(s, results[s].error, ok));
+  const matched = filterAndSort(ok.flatMap((s) => results[s].rows), opts);
+  const shown = matched.slice(0, opts.max);
+  const tail = [];
+  if (matched.length > shown.length) tail.push(`Showing ${shown.length} of ${matched.length} matching offers (--max N for more).`);
+  tail.push(...coverageLines(results, matched));
+
+  if (opts.json) {
+    return {
+      out: JSON.stringify(shown, null, 2) + "\n",
+      err: [...notes, ...tail].map((l) => l + "\n").join(""),
+      code: 0,
+    };
+  }
+
+  const head = [...notes];
+  head.push(opts.adults === 1
+    ? "Prices are for 1 adult (TOTAL and PER PERSON are the same)."
+    : `Prices: TOTAL is for all ${opts.adults} adults together; PER PERSON = TOTAL / ${opts.adults}.`);
+  if (shown.some((r) => r.source === "google" && r.trip !== "one_way")) {
+    head.push("Google rows: the price covers the whole trip; only the outbound is listed (pick the return on the Google Flights page below).");
+  }
+  const currencies = [...new Set(shown.map((r) => r.currency).filter(Boolean))];
+  if (currencies.length > 1) head.push(`Note: rows are in different currencies (${currencies.sort().join(", ")}); compare with care.`);
+  const body = shown.length ? renderTable(shown) : "No offers matched the criteria.";
+  return { out: [...head, body, "", ...tail].join("\n") + "\n", err: "", code: 0 };
 }
 
 async function main() {
   const opts = parseArgs(process.argv);
-  const token = readToken();
-  const body = buildBody(opts);
-  if (opts.debug) {
-    process.stderr.write(`--- duffel request ---\n${JSON.stringify(body, null, 2)}\n--- end ---\n`);
-  }
-  const resp = await callDuffel(token, body, opts.debug);
-  const offers = resp.data?.offers || [];
-  const flat = flattenOffers(offers);
-  const final = filterAndSort(flat, opts);
-
-  if (opts.json) {
-    process.stdout.write(JSON.stringify(final, null, 2) + "\n");
-  } else {
-    renderTable(final, opts);
-  }
+  const results = await runSearch(opts);
+  const { out, err, code } = buildReport(results, opts);
+  if (err) process.stderr.write(err);
+  if (out) process.stdout.write(out);
+  process.exitCode = code;
 }
 
-main().catch((e) => {
-  process.stderr.write(`flight-search: unexpected error: ${e.stack || e.message || e}\n`);
-  process.exit(1);
-});
+if (process.argv[1] && fs.realpathSync(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  main().catch((e) => {
+    process.stderr.write(`flight-search: unexpected error: ${e.stack || e.message || e}\n`);
+    process.exit(1);
+  });
+}

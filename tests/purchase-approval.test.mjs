@@ -9,7 +9,7 @@ import crypto from "node:crypto";
 import {
   normalizePurchaseItem, purchaseHash, buildPurchaseRequest, verifyPurchaseRow,
   pageMatchesItem, hostMatchesSite, amountRenderings, summarize, PURCHASE_DOMAIN, EXECUTE_GRACE_MS,
-  cleanPageTitle, placedMessage,
+  cleanPageTitle, placedMessage, clickOutcome,
 } from "../lib/purchase-approval.mjs";
 import { itemHash, buildApprovalRequest } from "../agent/core/app-approval.mjs";
 
@@ -196,5 +196,14 @@ describe("placedMessage", () => {
     assert.match(placedMessage(many, ""), /, for A, plus B and 2 more, shipping to /);
     const three = normalizePurchaseItem({ ...ITEM, items: ["A", "B", "C"].map((t) => ({ title: t, qty: 1, line_cents: 100 })) });
     assert.match(placedMessage(three, ""), /, for A, plus B and C, shipping to /);
+  });
+});
+
+describe("clickOutcome — the evidence behind \"placed\"", () => {
+  it("a new URL, a button that left a redrawn page, a navigation, or nothing", () => {
+    assert.deepEqual(clickOutcome({ beforeUrl: "a", afterUrl: "b", buttonStill: true }), { moved: true, signal: "url_changed" });
+    assert.deepEqual(clickOutcome({ beforeUrl: "a", afterUrl: "a", buttonStill: false }), { moved: true, signal: "button_gone" });
+    assert.deepEqual(clickOutcome({ beforeUrl: "a", afterUrl: "a", navigated: true }), { moved: true, signal: "navigated" });
+    assert.deepEqual(clickOutcome({ beforeUrl: "a", afterUrl: "a", buttonStill: true }), { moved: false, signal: null });
   });
 });

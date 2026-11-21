@@ -1,4 +1,4 @@
-# Historian (role plugin)
+# Memory (role plugin)
 
 Memory: what happened each day, where the CEO was, and everything Jori knows.
 

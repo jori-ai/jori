@@ -10,6 +10,11 @@ const require = createRequire(import.meta.url);
 process.env.JORI_TZ = "America/Chicago"; // a synthetic home zone, before the lib loads
 const H = require("../lib/daily-summary-harvest.js");
 const REVIEW = path.join(path.dirname(fileURLToPath(import.meta.url)), "../bin/daily-summary-review");
+// The reviewer appends code-owned defects to the live repair ledger unless told
+// not to. A test run must never reach that ledger, so every spawn below records
+// nothing and points the ledger at a throwaway file besides.
+const REVIEW_ENV = { ...process.env, DS_REVIEW_NO_ROUTE: "1",
+  DS_REVIEW_DEFECTS_LEDGER: path.join(process.env.TMPDIR || "/tmp", `ds-harvest-test-defects-${process.pid}.jsonl`) };
 
 const NO_MSG = () => ({ facts: [], counts: {}, errors: {} });
 const NO_LOOK = () => ({ facts: [], errors: {} });
@@ -123,7 +128,7 @@ test("review (structural): photo counts and standout amounts", () => {
   fs.writeFileSync(files.html, `<h1>Day</h1><h3>1:00pm–2:00pm · Ping's</h3><p>Lunch at Ping's, 5 photos of dumplings, $44 at the bar.</p>`);
   fs.writeFileSync(files.man, JSON.stringify({ standout_transactions: [{ merchant: "Semma", amount_usd: "$120" }] }));
   try {
-    const r = spawnSync(process.execPath, [REVIEW, date, "--no-model"], { encoding: "utf8" });
+    const r = spawnSync(process.execPath, [REVIEW, date, "--no-model"], { encoding: "utf8", env: REVIEW_ENV });
     const out = JSON.parse(r.stdout);
     const kinds = out.findings.map((f) => `${f.kind}:${f.severity}`);
     assert.ok(kinds.includes("quality:high"), "photo count flagged");
@@ -197,7 +202,7 @@ test("review: the same place either side of another stop is a return, not a spli
   const mk = (...hs) => hs.map((h) => `${h}<p>x</p>`).join("");
   const run = (body) => {
     fs.writeFileSync(html, `<h1>Day</h1>${body}`);
-    const r = spawnSync(process.execPath, [REVIEW, date, "--no-model"], { encoding: "utf8" });
+    const r = spawnSync(process.execPath, [REVIEW, date, "--no-model"], { encoding: "utf8", env: REVIEW_ENV });
     return JSON.parse(r.stdout).findings.filter((f) => f.kind === "duplicate");
   };
   try {

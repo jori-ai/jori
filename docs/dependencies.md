@@ -108,7 +108,7 @@ If you're putting Jori on a dedicated machine (Mac mini, Intel NUC, Raspberry Pi
 |---|---|
 | `gh` | Some Jori scripts use `gh` to inspect runs/issues; without it those features short-circuit silently. |
 | `op` (1Password CLI) | Resolve secrets from a vault at start-up instead of keeping them in `.env`. See [`docs/hardening.md`](hardening.md). |
-| Chrome + chrome-devtools-mcp | Agent-driven browser automation on the `ops` tier (automation Chrome on :9222; `examples/mcp/ops-agent.mcp.example.json`, `browsing-skills/`). Jobs that need it are listed in `agent/config/chrome-jobs.json`. |
+| Chrome + chrome-devtools-mcp | Agent-driven browser automation on the `ops` tier (automation Chrome on :9222; `examples/mcp/ops-agent.mcp.example.json`, `browsing-skills/`). Jobs that need it are listed in `agent/config/chrome-jobs.json`, or declared by their plugin with `"chrome": true` on the job (`system/plugins.md`). |
 | Python 3 | Trainer's `ci/distribute_external.py` uses Python. Not needed if you're not building the iOS apps. |
 
 ## Hardware notes

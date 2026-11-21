@@ -1294,6 +1294,18 @@ guard('floor_attribution', () => {
 // report (window 0 is the report's window, window k ends k days earlier).
 // usd is each row's own total_cost_usd, not the report's re-priced weighted
 // cost: compare within this block, never add it to weighted_cost_usd.
+//
+// A per-message family writes one row per email with the message id in its
+// source (the strict triage one-shot: gmail:<id> live, email-triage-shadow:<id>
+// in shadow, email-triage-replay:<id> by hand). Left as it is, every id is its
+// own source and stays under the MIN_USD_14D fold line, so a whole line of
+// dollars a day sits unnamed in `other`. It is folded by family, like gmail:*
+// in the supervisor ledger rollup above.
+const PER_MESSAGE_SOURCES = ['gmail:', 'email-triage-shadow:', 'email-triage-replay:'];
+const forkSourceFamily = (s) => {
+  const p = PER_MESSAGE_SOURCES.find((x) => s.startsWith(x));
+  return p ? `${p}*` : s;
+};
 guard('fork_ledger', () => {
   const f = path.join(ROOT, 'agent/logs/ephemeral-forks/job-costs.ndjson');
   let content;
@@ -1310,7 +1322,7 @@ guard('fork_ledger', () => {
     let r; try { r = JSON.parse(line); } catch { continue; }
     const ts = Date.parse(r.ts || 0);
     if (!(ts >= START && ts < END)) continue;
-    const s = r.source || '(none)';
+    const s = forkSourceFamily(String(r.source || '(none)'));
     const usd = Number(r.total_cost_usd) || 0;
     const turns = Number(r.num_turns) || 0;
     const b = src[s] || (src[s] = { rows: [], windows_usd: Array(WINDOWS).fill(0), windows_runs: Array(WINDOWS).fill(0) });
@@ -1356,7 +1368,7 @@ guard('fork_ledger', () => {
     };
   }
   return {
-    note: 'Fork rows (agent/logs/ephemeral-forks/job-costs.ndjson) per source. windows_* run oldest -> newest over 7 consecutive 24h windows ending at the report window (last element = the report window). usd = the rows own total_cost_usd, NOT the report weighted cost; compare within this block only. Sources under $3 over 14 days fold into other.',
+    note: 'Fork rows (agent/logs/ephemeral-forks/job-costs.ndjson) per source. windows_* run oldest -> newest over 7 consecutive 24h windows ending at the report window (last element = the report window). usd = the rows own total_cost_usd, NOT the report weighted cost; compare within this block only. Per-message sources (gmail:<id>, email-triage-shadow:<id>, email-triage-replay:<id>) are folded into <family>* first; sources under $3 over 14 days then fold into other.',
     window_ms: WINDOW_MS,
     total_windows_usd: totals.map(r2),
     sources: Object.fromEntries(Object.entries(sources).sort((a, b) => b[1].usd_14d - a[1].usd_14d)),
@@ -1425,10 +1437,11 @@ guard('floor_cohorts', () => {
     // The cohort to compare: present in the report window AND in an earlier
     // one. A cohort's floor carries its own first message (hum's is its whole
     // playbook), so prefer LIGHT cohorts: those within PREFIX_BAND of the
-    // lightest current median, and among them the most session starts over the
+    // lightest current median among cohorts with 3+ session starts in the
+    // report window (a one-off cannot set it), and among them the most session starts over the
     // 7 windows (ties to the lighter). Every candidate is listed in
     // alternatives so the reader can see whether the choice decides the answer.
-    const cur = WINDOWS - 1, PREFIX_BAND = 5000;
+    const cur = WINDOWS - 1, PREFIX_BAND = 5000, PREFIX_MIN_SAMPLES = 3;
     const prevOf = (w) => { for (let i = cur - 1; i >= 0; i--) if (w[i]) return i; return -1; };
     // "Three days back": window cur-3, or the nearest earlier window with data.
     const backOf = (w) => { for (let i = cur - 3; i >= 0; i--) if (w[i]) return i; return -1; };
@@ -1446,8 +1459,15 @@ guard('floor_cohorts', () => {
       });
     let matched = null;
     if (candidates.length) {
-      const lightest = Math.min(...candidates.map((c) => c.current_median));
-      const pick = candidates
+      // A cohort with fewer than PREFIX_MIN_SAMPLES session starts in the report
+      // window is a one-off: it may not set the reference, or its median (one
+      // reading) can sit more than PREFIX_BAND below the well-sampled cohort and
+      // shut that cohort out of the match. Fall back to every candidate only
+      // when none is sampled.
+      const sampled = candidates.filter((c) => c.w[cur].n >= PREFIX_MIN_SAMPLES);
+      const pool = sampled.length ? sampled : candidates;
+      const lightest = Math.min(...pool.map((c) => c.current_median));
+      const pick = pool
         .filter((c) => c.current_median - lightest <= PREFIX_BAND)
         .sort((a, b) => (b.samples_7w - a.samples_7w) || (a.current_median - b.current_median))[0];
       const { w, p, b } = pick;
@@ -1484,7 +1504,7 @@ guard('floor_cohorts', () => {
   };
   const over = (key, line) => TIERS.filter((t) => (tiers[t]?.matched?.[key] ?? 0) > line);
   return {
-    note: 'series[cohort] runs oldest -> newest over 7 consecutive 24h windows ending at the report window; null = no session start of that cohort in that window. matched = among cohorts present now and earlier and within 5k of the lightest current median, the most-sampled one, compared on its median (alternatives lists every candidate). Per-cohort medians on n=1 are hints. corroboration is the ops-haiku:ops-light delta ratio against the standing 0.725 +-0.15.',
+    note: 'series[cohort] runs oldest -> newest over 7 consecutive 24h windows ending at the report window; null = no session start of that cohort in that window. matched = among cohorts present now and earlier with 3+ session starts in the report window (every one when none has) and within 5k of the lightest such median, the most-sampled one, compared on its median (alternatives lists every candidate). Per-cohort medians on n=1 are hints. corroboration is the ops-haiku:ops-light delta ratio against the standing 0.725 +-0.15.',
     expected_haiku_to_light: EXPECTED,
     tiers,
     corroboration_1d: ratio('delta_1d'),

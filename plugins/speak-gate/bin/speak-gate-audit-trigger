@@ -1,0 +1,23 @@
+#!/bin/bash
+# speak-gate-audit-trigger — the speak gate's nightly Opus audit
+# (bin/speak-gate-audit.mjs; system/speak-gate.md § Nightly audit).
+# launchd (ai.claude.speak-gate-audit), nightly. Not cron: the audit forks
+# `claude -p` on Opus, which needs the GUI keychain's Max login, and the
+# Max-auth guard refuses to start it on anything but the subscription.
+# Pause: data/.speak-gate-audit-pause. The script ends itself after a week.
+PLUGIN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+KERNEL_TOOLS="$(cd "$PLUGIN_DIR/../.." && pwd)"
+source "$KERNEL_TOOLS/agent/scripts/lib/script-job-env.sh"
+LOG="$JORI_INSTALL_TOOLS/agent/logs/speak-gate-audit.log"
+mkdir -p "$(dirname "$LOG")"
+if [ -f "$JORI_INSTALL_TOOLS/data/.speak-gate-audit-pause" ]; then
+  echo "$(date '+%Y-%m-%d %H:%M:%S') paused (data/.speak-gate-audit-pause)" >> "$LOG"
+  exit 0
+fi
+source "$KERNEL_TOOLS/agent/scripts/lib/max-auth-guard.sh"
+max_auth_scrub
+if ! max_auth_check "${CLAUDE_BIN:-$HOME/.local/bin/claude}"; then
+  echo "$(date '+%Y-%m-%d %H:%M:%S') REFUSED: $MAX_AUTH_SUMMARY" >> "$LOG"
+  exit "${MAX_AUTH_REFUSED_RC:-78}"
+fi
+{ echo "--- $(date '+%Y-%m-%d %H:%M:%S')"; "${JORI_NODE:-node}" "$PLUGIN_DIR/bin/speak-gate-audit.mjs" "$@"; } >> "$LOG" 2>&1

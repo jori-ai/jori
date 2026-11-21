@@ -188,7 +188,7 @@ Return {"items":[]} only if your searches found nothing that fits.`;
 async function modelSearch() {
   const run = promisify(execFile)(path.join(HOME, ".local/bin/claude"), [
     "-p", "--model", MODELS.sonnet, "--effort", EFFORT, "--allowedTools", "WebSearch", "--output-format", "text", prompt,
-  ], { encoding: "utf8", timeout: 240000, maxBuffer: 4 * 1024 * 1024 });
+  ], { encoding: "utf8", timeout: 240000, maxBuffer: 4 * 1024 * 1024, env: createRequire(import.meta.url)("../lib/agent-env.cjs").modelEnv() });
   run.child.stdin?.end(); // no stdin: `claude -p` would otherwise wait for it
   const { stdout } = await run;
   const m = stdout.match(/\{[\s\S]*"items"[\s\S]*\}/);

@@ -1,4 +1,4 @@
-# Property Manager (role plugin)
+# Properties (role plugin)
 
 The homes: stays and leases, property books, locks, devices, maintenance.
 

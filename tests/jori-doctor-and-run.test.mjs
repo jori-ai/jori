@@ -34,6 +34,12 @@
 //
 // 5. (2026-11-10) `jori triage code-filed` — see its section below.
 //
+// 6. (2026-11-14) a trigger launched only by a LaunchAgent in
+//    agent/launch-agents (question-hold-release) or only by a plugin's
+//    schedule (an installation plugin's cron job) is not an orphan; and a
+//    `transient` service (resilience-test, which removes its own plist after
+//    72h) is not a missing plist. Both read red on every doctor run before.
+//
 // All run the real CLI against a fixture HOME with fake `crontab` / `curl`
 // first on PATH (the jori-doctor-null-trigger.test.mjs harness), so no
 // supervisor, network, real crontab or dispatch is touched.
@@ -54,7 +60,7 @@ const task = (name, schedule, extra = {}) => ({ name, schedule, trigger_script: 
 
 // `cronLines` may use {TOOLS} for the fixture's tools dir; `execs` are
 // executables written under it ({relative path: content}).
-function doctorChecks({ tasks, clockJobs = [], cronLines, execs = {} }) {
+function doctorChecks({ tasks, clockJobs = [], cronLines, execs = {}, services = [] }) {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "doctor-split-clock-"));
   const tools = path.join(home, "Dev/jori");
   const bin = path.join(home, "fakebin");
@@ -62,7 +68,7 @@ function doctorChecks({ tasks, clockJobs = [], cronLines, execs = {} }) {
   fs.mkdirSync(bin);
   fs.symlinkSync(path.join(ROOT, "lib"), path.join(tools, "lib"));
   fs.writeFileSync(path.join(tools, "system/tasks.json"), JSON.stringify({ tasks }));
-  fs.writeFileSync(path.join(tools, "system/services.json"), JSON.stringify({ services: [] }));
+  fs.writeFileSync(path.join(tools, "system/services.json"), JSON.stringify({ services }));
   fs.writeFileSync(path.join(tools, "data/clock-jobs.json"), JSON.stringify(clockJobs));
   // The fixture's zone is the crontab's zone, so the local times are also the crontab's times.
   fs.writeFileSync(path.join(tools, "data/user-timezone.json"),
@@ -504,3 +510,30 @@ it("triage code-filed refuses a bare, non-positive or too-long --days instead of
   } finally { fs.rmSync(fx.home, { recursive: true, force: true }); }
 });
 }
+
+// ─── 6. doctor: LaunchAgent-owned triggers, transient services ──────────
+
+it("doctor: a LaunchAgent-launched trigger is owned; a transient service's absent plist is fine", () => {
+  const plist = (script) => `<?xml version="1.0"?><plist><dict><key>ProgramArguments</key><array><string>/x/agent/scripts/${script}</string></array></dict></plist>`;
+  const checks = doctorChecks({
+    tasks: [],
+    cronLines: [],
+    execs: {
+      "agent/scripts/trigger-zz-launchd-only.sh": "#!/bin/sh\n",
+      "agent/scripts/trigger-zz-nobody.sh": "#!/bin/sh\n",
+      "agent/launch-agents/ai.claude.zz-launchd-only.plist": plist("trigger-zz-launchd-only.sh"),
+    },
+    services: [
+      { name: "zz-transient", type: "launchagent", label: "ai.claude.zz-transient", plist: "~/Library/LaunchAgents/ai.claude.zz-transient.plist", transient: true },
+      { name: "zz-gone", type: "launchagent", label: "ai.claude.zz-gone", plist: "~/Library/LaunchAgents/ai.claude.zz-gone.plist" },
+    ],
+  });
+  const orphans = findCheck(checks, "trigger scripts in tasks.json");
+  assert.equal(orphans.ok, false);
+  assert.ok(orphans.detail.includes("trigger-zz-nobody.sh"), orphans.detail);
+  assert.ok(!orphans.detail.includes("trigger-zz-launchd-only.sh"), orphans.detail);
+  const plists = findCheck(checks, "services.json plists exist");
+  assert.equal(plists.ok, false);
+  assert.ok(plists.detail.includes("ai.claude.zz-gone"), plists.detail);
+  assert.ok(!plists.detail.includes("zz-transient"), plists.detail);
+});

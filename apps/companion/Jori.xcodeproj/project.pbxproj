@@ -39,6 +39,11 @@
 		AA000015 /* JoriIntents.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB000016 /* JoriIntents.swift */; };
 		AA000016 /* NotificationService.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB000017 /* NotificationService.swift */; };
 		AA0000C1 /* AnnounceCache.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB0000C1 /* AnnounceCache.swift */; };
+		AA000A01 /* Pairing.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB000A01 /* Pairing.swift */; };
+		AA000A02 /* PairingView.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB000A02 /* PairingView.swift */; };
+		AA000A03 /* PushCrypto.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB000A03 /* PushCrypto.swift */; };
+		AA000A04 /* PushCrypto.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB000A03 /* PushCrypto.swift */; };
+		AA000A05 /* SupabaseConfig.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB000093 /* SupabaseConfig.swift */; };
 		AA0000C2 /* AnnounceCache.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB0000C1 /* AnnounceCache.swift */; };
 		AA0000C3 /* JoriIntents.appex in Embed App Extensions */ = {isa = PBXBuildFile; fileRef = CC000003 /* JoriIntents.appex */; platformFilter = ios; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
 		AA000017 /* JoriNotificationService.appex in Embed App Extensions */ = {isa = PBXBuildFile; fileRef = CC000002 /* JoriNotificationService.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
@@ -50,6 +55,7 @@
 		AA000060 /* SignInView.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB000060 /* SignInView.swift */; };
 		AA000070 /* MacKeychainStorage.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB000070 /* MacKeychainStorage.swift */; };
 		AA000080 /* MemoryView.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB000080 /* MemoryView.swift */; };
+		AA00F201 /* ShopBrowserView.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB00F201 /* ShopBrowserView.swift */; };
 		CAF3B695C1ACD69D04A5691F /* TradeApprovalReviewView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 863C2965C2FEB4DF738868EC /* TradeApprovalReviewView.swift */; };
 		AA000090 /* SupabaseConfig.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB000093 /* SupabaseConfig.swift */; };
 		AA000091 /* SharedKeychainStorage.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB000094 /* SharedKeychainStorage.swift */; };
@@ -167,6 +173,9 @@
 		BB000015 /* SupabaseManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SupabaseManager.swift; sourceTree = "<group>"; };
 		BB000016 /* JoriIntents.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = JoriIntents.swift; sourceTree = "<group>"; };
 		BB0000C1 /* AnnounceCache.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AnnounceCache.swift; sourceTree = "<group>"; };
+		BB000A01 /* Pairing.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Pairing.swift; sourceTree = "<group>"; };
+		BB000A02 /* PairingView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PairingView.swift; sourceTree = "<group>"; };
+		BB000A03 /* PushCrypto.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PushCrypto.swift; sourceTree = "<group>"; };
 		BB000017 /* NotificationService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NotificationService.swift; sourceTree = "<group>"; };
 		BB000018 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
 		BB000019 /* JoriNotificationService.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = JoriNotificationService.entitlements; sourceTree = "<group>"; };
@@ -178,6 +187,7 @@
 		BB000060 /* SignInView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SignInView.swift; sourceTree = "<group>"; };
 		BB000070 /* MacKeychainStorage.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MacKeychainStorage.swift; sourceTree = "<group>"; };
 		BB000080 /* MemoryView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MemoryView.swift; sourceTree = "<group>"; };
+		BB00F201 /* ShopBrowserView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ShopBrowserView.swift; sourceTree = "<group>"; };
 		CC000001 /* Jori.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Jori.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		CC000002 /* JoriNotificationService.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = JoriNotificationService.appex; sourceTree = BUILT_PRODUCTS_DIR; };
 		CC000003 /* JoriIntents.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = JoriIntents.appex; sourceTree = BUILT_PRODUCTS_DIR; };
@@ -309,8 +319,11 @@
 				BB0000C2 /* AnnounceDiagnostics.swift */,
 				BB000016 /* JoriIntents.swift */,
 				BB000060 /* SignInView.swift */,
+				BB000A01 /* Pairing.swift */,
+				BB000A02 /* PairingView.swift */,
 				BB000070 /* MacKeychainStorage.swift */,
 				BB000080 /* MemoryView.swift */,
+				BB00F201 /* ShopBrowserView.swift */,
 				1B6BC1E802B543B03BFF2296 /* TradeApproval.swift */,
 				6BB776C284508F7ADFFA58CE /* TradeApprovalPairingView.swift */,
 				863C2965C2FEB4DF738868EC /* TradeApprovalReviewView.swift */,
@@ -347,6 +360,7 @@
 			children = (
 				BB000017 /* NotificationService.swift */,
 				BB0000C1 /* AnnounceCache.swift */,
+				BB000A03 /* PushCrypto.swift */,
 				BB000018 /* Info.plist */,
 				BB000019 /* JoriNotificationService.entitlements */,
 			);
@@ -596,8 +610,12 @@
 				AA0000C5 /* AnnounceCache.swift in Sources */,
 				AA000015 /* JoriIntents.swift in Sources */,
 				AA000060 /* SignInView.swift in Sources */,
+				AA000A01 /* Pairing.swift in Sources */,
+				AA000A02 /* PairingView.swift in Sources */,
+				AA000A03 /* PushCrypto.swift in Sources */,
 				AA000070 /* MacKeychainStorage.swift in Sources */,
 				AA000080 /* MemoryView.swift in Sources */,
+				AA00F201 /* ShopBrowserView.swift in Sources */,
 				3F27B96416D060AF08ACA6D9 /* TradeApproval.swift in Sources */,
 				54E9FFBF941875F43A30CE18 /* TradeApprovalPairingView.swift in Sources */,
 				CAF3B695C1ACD69D04A5691F /* TradeApprovalReviewView.swift in Sources */,
@@ -627,6 +645,8 @@
 			files = (
 				AA000016 /* NotificationService.swift in Sources */,
 				AA0000C1 /* AnnounceCache.swift in Sources */,
+				AA000A04 /* PushCrypto.swift in Sources */,
+				AA000A05 /* SupabaseConfig.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

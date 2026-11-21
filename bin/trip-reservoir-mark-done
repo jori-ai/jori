@@ -107,7 +107,9 @@ async function loadEvidence(since) {
   // Keep each area's dates in step with the travel timeline on the same nightly
   // pass — a re-booked leg shifts the guide's dates (and its order on the site)
   // without anyone re-running a publish by hand.
-  const ranges = await areaDateRanges();
+  // All guide keys, not just --area's: a stay matches a combined guide
+  // (a two-city key) only when that guide is among the candidates.
+  const ranges = await areaDateRanges(areaArg ? await listAreas() : areas);
 
   let totalMarked = 0, totalAlready = 0;
   for (const area of areas) {

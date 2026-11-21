@@ -123,24 +123,24 @@ final class Responsiveness: NSObject, MXMetricManagerSubscriber {
 
     // MARK: - MetricKit
 
+    // Apple's JSON is kept as bytes and spliced into the upload untouched
+    // (RawJSONUpload). It used to be decoded into `AnyJSON` and re-encoded:
+    // both walk the tree recursively, and a diagnostic's call-stack tree nests
+    // one level per frame, so a deep stack could overflow the thread and
+    // crash the app while reporting a crash.
+
     func didReceive(_ payloads: [MXMetricPayload]) {
-        let rows = payloads.compactMap { p -> Row? in
-            guard let json = Self.json(p.jsonRepresentation()) else { return nil }
-            return Row.base(kind: "metrics", at: p.timeStampEnd).with(payload: json)
+        let rows = payloads.map { p in
+            Row.base(kind: "metrics", at: p.timeStampEnd).with(payload: p.jsonRepresentation())
         }
         queue.async { self.buffer += rows; self.flush() }
     }
 
     func didReceive(_ payloads: [MXDiagnosticPayload]) {
-        let rows = payloads.compactMap { p -> Row? in
-            guard let json = Self.json(p.jsonRepresentation()) else { return nil }
-            return Row.base(kind: "diagnostic", at: p.timeStampEnd).with(payload: json)
+        let rows = payloads.map { p in
+            Row.base(kind: "diagnostic", at: p.timeStampEnd).with(payload: p.jsonRepresentation())
         }
         queue.async { self.buffer += rows; self.flush() }
-    }
-
-    private static func json(_ data: Data) -> AnyJSON? {
-        try? JSONDecoder().decode(AnyJSON.self, from: data)
     }
 
     // MARK: - Upload
@@ -152,8 +152,8 @@ final class Responsiveness: NSObject, MXMetricManagerSubscriber {
         buffer.removeAll()
         Task.detached(priority: .utility) {
             do {
-                try await SupabaseManager.ensureAuthenticated()
-                try await SupabaseManager.shared.from("app_perf_events").insert(rows).execute()
+                try await RawJSONUpload.send(table: "app_perf_events", rawKey: "payload",
+                                             rows: rows.map { ($0, $0.payload) })
             } catch {
                 print("[Responsiveness] upload of \(rows.count) event(s) failed: \(error.localizedDescription)")
             }
@@ -172,7 +172,13 @@ final class Responsiveness: NSObject, MXMetricManagerSubscriber {
         let build: String?
         var duration_ms: Int?
         var context: String?
-        var payload: AnyJSON?
+        /// Apple's JSON as bytes; sent as the jsonb `payload` column by
+        /// RawJSONUpload, never through the encoder.
+        var payload: Data?
+
+        enum CodingKeys: String, CodingKey {
+            case occurred_at, kind, platform, device, os_version, app_version, build, duration_ms, context
+        }
 
         static func base(kind: String, at date: Date) -> Row {
             Row(occurred_at: ISO8601DateFormatter().string(from: date),
@@ -184,7 +190,7 @@ final class Responsiveness: NSObject, MXMetricManagerSubscriber {
                 build: Bundle.main.infoDictionary?["CFBundleVersion"] as? String)
         }
 
-        func with(duration: Int? = nil, context: String? = nil, payload: AnyJSON? = nil) -> Row {
+        func with(duration: Int? = nil, context: String? = nil, payload: Data? = nil) -> Row {
             var r = self
             r.duration_ms = duration
             r.context = context
@@ -215,5 +221,81 @@ final class Responsiveness: NSObject, MXMetricManagerSubscriber {
             sysctlbyname(key, &chars, &size, nil, 0)
             return String(cString: chars)
         }()
+    }
+}
+
+/// Inserts rows into a Supabase table where one jsonb column arrives as JSON
+/// bytes that are spliced into the request body as they are.
+///
+/// The usual route, decoding the bytes into `AnyJSON` and letting the client
+/// encode it again, recurses once per nesting level on both legs. A deeply
+/// nested document (a MetricKit call-stack tree, a FHIR record) then overflows
+/// the 512 KB stack of a background thread: EXC_BAD_ACCESS in the stack guard,
+/// as in the iPhone crash of 2026-11-10 (build 264). Splicing never walks the
+/// tree.
+enum RawJSONUpload {
+    /// - Parameters:
+    ///   - rawKey: the column the raw bytes fill. Leave it out of `Row`'s
+    ///     CodingKeys; rows whose bytes are nil or not JSON go without it.
+    ///   - onConflict: set to upsert on that column instead of inserting.
+    static func send<Row: Encodable>(table: String, rawKey: String, rows: [(Row, Data?)],
+                                     onConflict: String? = nil) async throws {
+        guard !rows.isEmpty else { return }
+        try await SupabaseManager.ensureAuthenticated()
+        let token = try await SupabaseManager.shared.auth.session.accessToken
+
+        let encoder = JSONEncoder()
+        var body = Data("[".utf8)
+        // Rows may leave out different nil columns; naming the union lets
+        // PostgREST take them in one batch (as the Supabase client does).
+        var columns = Set<String>()
+        for (i, (row, raw)) in rows.enumerated() {
+            if i > 0 { body.append(Data(",".utf8)) }
+            var object = try encoder.encode(row)
+            if let keys = (try? JSONSerialization.jsonObject(with: object)) as? [String: Any] {
+                columns.formUnion(keys.keys)
+            }
+            if let raw, isJSON(raw) {
+                columns.insert(rawKey)
+                // `{...}` → `{...,"key":<raw>}`; `{}` → `{"key":<raw>}`.
+                guard object.last == UInt8(ascii: "}") else { throw URLError(.cannotParseResponse) }
+                object.removeLast()
+                if object.count > 1 { object.append(Data(",".utf8)) }
+                object.append(try encoder.encode(rawKey))
+                object.append(Data(":".utf8))
+                object.append(raw)
+                object.append(Data("}".utf8))
+            }
+            body.append(object)
+        }
+        body.append(Data("]".utf8))
+
+        var components = URLComponents(url: SupabaseManager.url.appendingPathComponent("rest/v1/\(table)"),
+                                       resolvingAgainstBaseURL: false)!
+        var query = [URLQueryItem(name: "columns", value: columns.sorted().joined(separator: ","))]
+        if let onConflict { query.append(URLQueryItem(name: "on_conflict", value: onConflict)) }
+        components.queryItems = query
+        var request = URLRequest(url: components.url!)
+        request.httpMethod = "POST"
+        request.httpBody = body
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue(SupabaseManager.anonKey, forHTTPHeaderField: "apikey")
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        request.setValue(onConflict == nil ? "return=minimal" : "return=minimal,resolution=merge-duplicates",
+                         forHTTPHeaderField: "Prefer")
+        let (data, response) = try await URLSession.shared.data(for: request)
+        guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
+            let detail = String(data: data.prefix(300), encoding: .utf8) ?? ""
+            throw NSError(domain: "RawJSONUpload", code: (response as? HTTPURLResponse)?.statusCode ?? -1,
+                          userInfo: [NSLocalizedDescriptionKey: "\(table): \(detail)"])
+        }
+    }
+
+    /// A cheap shape check: the bytes start with an object or array. Apple's
+    /// and HealthKit's JSON is well formed; this only keeps an empty or
+    /// non-JSON blob from breaking the whole batch.
+    private static func isJSON(_ data: Data) -> Bool {
+        guard let first = data.first(where: { !($0 == 0x20 || $0 == 0x0A || $0 == 0x0D || $0 == 0x09) }) else { return false }
+        return first == UInt8(ascii: "{") || first == UInt8(ascii: "[")
     }
 }

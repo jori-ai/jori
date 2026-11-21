@@ -15,6 +15,7 @@ import {
   signature,
   selectCriticalEscalations,
   pruneDispatched,
+  mergeGateHeldAlerts,
 } from "../lib/system-issue-gate.mjs";
 
 const MAXAUTH = (d) => ({
@@ -182,4 +183,60 @@ test("pruneDispatched drops stale entries and keeps recent ones", () => {
   const now = Date.parse("2026-07-25T00:00:00Z");
   const out = pruneDispatched({ old: "2026-07-01T00:00:00Z", recent: "2026-07-24T00:00:00Z", junk: "nope" }, now);
   assert.deepEqual(Object.keys(out), ["recent"]);
+});
+
+// The speak gate never inserts a system message it holds (drop / digest /
+// resolve); the jori_gate_reviews row is the only record. The review reads the
+// channel, so without this join the alerts the gate calls "plumbing" (a
+// gate-blind page, a low-disk page, a failed job) never reach it.
+const HELD = (id, at, original, verdict = "drop") => ({ id, judged_at: at, original, verdict });
+
+test("mergeGateHeldAlerts folds held system alerts into the batch in time order", () => {
+  const rows = [
+    { id: "a", role: "assistant", content: "\u26a0\ufe0f Mac mini disk space low: 24.6 GiB free", created_at: "2026-11-13T10:00:00+00:00" },
+    { id: "b", role: "assistant", content: "\u2705 later row", created_at: "2026-11-13T20:00:00+00:00" },
+  ];
+  const held = [HELD("g1", "2026-11-13T18:44:23.276+00:00", "\ud83d\udfe0 Truth gate partly blind: the claim-freshness extractor failed 11 of the last 50 checks")];
+  const out = mergeGateHeldAlerts(rows, held, "2026-11-10T00:00:00Z");
+  assert.deepEqual(out.map((r) => r.id), ["a", "gate-held:g1", "b"]);
+  const h = out[1];
+  assert.equal(h.role, "assistant");
+  assert.equal(h.content, held[0].original, "text stays verbatim so cluster patterns and the severity marker still match");
+  assert.equal(h.held_by, "speak-gate");
+  assert.equal(h.held_verdict, "drop");
+  assert.equal(matchesCluster(h.content, { match_patterns: ["truth gate partly blind"] }), true);
+});
+
+test("mergeGateHeldAlerts skips old, empty and malformed held rows and never throws", () => {
+  const rows = [{ id: "a", role: "assistant", content: "x", created_at: "2026-11-13T10:00:00Z" }];
+  const held = [
+    HELD("old", "2026-10-01T00:00:00Z", "\ud83d\udfe0 too old"),
+    HELD("empty", "2026-11-13T11:00:00Z", "   "),
+    { id: "nodate", original: "\ud83d\udfe0 no timestamp" },
+    { id: "notext", judged_at: "2026-11-13T11:00:00Z", original: null },
+    null,
+    42,
+  ];
+  assert.deepEqual(mergeGateHeldAlerts(rows, held, "2026-11-10T00:00:00Z"), rows);
+  assert.deepEqual(mergeGateHeldAlerts(rows, undefined, "2026-11-10T00:00:00Z"), rows);
+  assert.deepEqual(mergeGateHeldAlerts(rows, [], "2026-11-10T00:00:00Z"), rows);
+  assert.deepEqual(mergeGateHeldAlerts(null, null, "2026-11-10T00:00:00Z"), []);
+});
+
+test("a held alert that repeats one already delivered within 30 minutes is not counted twice", () => {
+  const LOCK = "\ud83d\udd10 Lock problem, before anyone needs the door\n- Rental unit \u00b7 Back door: the gateway can't reach the lock";
+  const rows = [{ id: "a", role: "assistant", content: LOCK, created_at: "2026-11-12T04:43:27Z" }];
+  const held = [
+    HELD("twin", "2026-11-12T04:45:30Z", LOCK, "digest"),
+    HELD("later", "2026-11-12T16:47:20Z", LOCK, "drop"),
+  ];
+  const out = mergeGateHeldAlerts(rows, held, "2026-11-10T00:00:00Z");
+  assert.deepEqual(out.map((r) => r.id), ["a", "gate-held:later"], "same text hours later is a new occurrence; minutes later is the same one");
+});
+
+test("a held critical alert reaches the same-day escalation like a delivered one", () => {
+  const held = [HELD("g2", "2026-11-13T09:48:55Z", "\ud83d\udd34 Max auth is DOWN on ops-light. Captured error: nothing usable")];
+  const rows = mergeGateHeldAlerts([], held, "2026-11-10T00:00:00Z");
+  const { escalate } = selectCriticalEscalations({ rows, cursor: "2026-11-13T00:00:00Z", clusters: [] });
+  assert.equal(escalate.length, 1);
 });

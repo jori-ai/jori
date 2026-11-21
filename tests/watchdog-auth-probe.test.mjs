@@ -707,3 +707,96 @@ test("clock: a lone signed-out reading that never became a paged outage leaves n
     assert.ok(!fs.existsSync(path.join(sb.incidents, "auth-outage.signed_out")), "closed unpaged: marker dropped");
   } finally { sb.cleanup(); }
 });
+
+// ---- one non-credential supervisor error is a blip, not an outage -----------
+//
+// THE ALERT THIS DEFENDS: "🔴 Max auth is DOWN on ops-light. Captured error:
+// 'Failed to authenticate. API Error: 403 Attention Required! | Cloudflare'".
+// One supervisor turn got a Cloudflare block page (AUTH ERROR #1); the
+// supervisor itself waits for 3 in a row before it pauses, the next turns ran
+// fine and the launchd sign-in check read signed in. watchdog paged anyway, on
+// any single AUTH ERROR line under 6 minutes old, and told the user to run
+// `claude /login`, which cannot fix a Cloudflare block. A page still goes out
+// for a repeat (#3), a credential-shaped error, a signed-out or missing check,
+// and an outage that is already paged.
+const CF_403 = "Failed to authenticate. API Error: 403 Attention Required! | Cloudflare";
+function freshAuthError(sb, text, n = 1, ageSec = 30) {
+  fs.writeFileSync(path.join(sb.logs, "ops-light-supervisor.log"),
+    `${isoZ(now() - ageSec)} [supervisor] AUTH ERROR #${n}: ${text}\n`);
+}
+const watchdogLog = (sb) => (fs.existsSync(path.join(sb.root, "log")) ? fs.readFileSync(path.join(sb.root, "log"), "utf8") : "");
+
+test("blip: a lone Cloudflare 403 (#1) with a fresh signed-in check does not page, and says why in the log", () => {
+  const sb = makeSandbox();
+  try {
+    writeProbe(sb, { ts: now() - 90, ok: true });
+    freshAuthError(sb, CF_403, 1);
+    const t = tick(sb);
+    assert.deepEqual(t.pages, [], "no 🔴 for one blip");
+    assert.doesNotMatch(t.issues, /auth\(not-logged-in\)/, "the issue line does not claim a sign-out");
+    assert.match(watchdogLog(sb), /non-credential error \(AUTH ERROR #1 in ops-light-supervisor\.log\).*signed in — not paging/);
+    assert.ok(!fs.existsSync(path.join(sb.incidents, "auth-outage.alerted")), "no incident was opened");
+  } finally { sb.cleanup(); }
+});
+
+test("blip: #2 is still below the supervisor's threshold; #3 pages with the real captured error", () => {
+  const sb = makeSandbox();
+  try {
+    writeProbe(sb, { ts: now() - 90, ok: true });
+    freshAuthError(sb, CF_403, 2);
+    assert.deepEqual(tick(sb).pages, []);
+    freshAuthError(sb, CF_403, 3);
+    const t = tick(sb);
+    assert.equal(t.pages.length, 1, "the third failure in a row is an outage");
+    assert.match(t.pages[0], /^🔴 Max auth is DOWN on ops-light\. Captured error: "Failed to authenticate\. API Error: 403 Attention Required/);
+  } finally { sb.cleanup(); }
+});
+
+test("blip: a credential-shaped error (OAuth expired / 401 / not logged in) still pages on the first line", () => {
+  for (const text of [
+    "Failed to authenticate: OAuth session expired and could not be refreshed",
+    'Failed to authenticate. API Error: 401 {"type":"error","error":{"type":"authentication_error"}}',
+    "Not logged in · Please run /login",
+  ]) {
+    const sb = makeSandbox();
+    try {
+      writeProbe(sb, { ts: now() - 90, ok: true });
+      freshAuthError(sb, text, 1);
+      const t = tick(sb);
+      assert.equal(t.pages.length, 1, `must page for: ${text}`);
+      assert.match(t.issues, /auth\(not-logged-in\)/);
+    } finally { sb.cleanup(); }
+  }
+});
+
+test("blip: without a fresh signed-in reading (absent, stale or signed out) it pages as before", () => {
+  const sb = makeSandbox();
+  try {
+    freshAuthError(sb, CF_403, 1);
+    assert.equal(tick(sb).pages.length, 1, "no record at all is no evidence");
+  } finally { sb.cleanup(); }
+  const sb2 = makeSandbox();
+  try {
+    writeProbe(sb2, { ts: now() - 30 * 60, ok: true });   // older than 20 minutes: stale
+    freshAuthError(sb2, CF_403, 1);
+    assert.equal(tick(sb2).pages.length, 1, "a stale check is no evidence");
+  } finally { sb2.cleanup(); }
+  const sb3 = makeSandbox();
+  try {
+    writeProbe(sb3, { ts: now() - 30, ok: false, failSince: now() - 30 });
+    freshAuthError(sb3, CF_403, 1);
+    assert.equal(tick(sb3).pages.length, 1, "a signed-out check is not a blip");
+  } finally { sb3.cleanup(); }
+});
+
+test("blip: an outage that is already paged keeps its re-page cadence (the blip hold never applies)", () => {
+  const sb = makeSandbox();
+  try {
+    writeProbe(sb, { ts: now() - 90, ok: true });
+    markPaged(sb);
+    freshAuthError(sb, CF_403, 1);
+    const t = tick(sb);
+    assert.match(t.issues, /auth\(not-logged-in\)/, "took the old path");
+    assert.doesNotMatch(watchdogLog(sb), /not paging; a repeat/);
+  } finally { sb.cleanup(); }
+});

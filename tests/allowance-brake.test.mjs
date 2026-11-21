@@ -268,6 +268,27 @@ it("learns a job's cost from its ledger, priced by what the pace span cost", () 
   assert.equal(r.json.jobs.dream.estimate.runs, 2);
 });
 
+it("states a small run's share to one decimal on the card, not rounded up to 1%", () => {
+  const fx = fixture({ points: HOT, config: { ...GOV, usd_per_allowance: 1000 } });
+  const dir = path.join(fx.logs, "ephemeral-forks");
+  fs.mkdirSync(dir, { recursive: true });
+  // Outside the pace span, so the config price ($1000 a week) applies: $2 a run is 0.2%.
+  const rows = [
+    { ts: "2026-10-30T10:00:00Z", source: "chat-build", total_cost_usd: 2 },
+    { ts: "2026-10-31T10:00:00Z", source: "chat-build", total_cost_usd: 2 },
+  ];
+  fs.writeFileSync(path.join(dir, "job-costs.ndjson"), rows.map((x) => JSON.stringify(x)).join("\n") + "\n");
+  const r = run(fx, ["check", "chat-build", "--key", "req-1", "--json"]);
+  assert.equal(r.rc, 3);
+  const q = JSON.parse(fs.readFileSync(fx.state, "utf8")).questions[0];
+  assert.equal(q.estimate.share, 0.002);
+  assert.ok(q.question.includes("A run usually costs about 0.2% of the week."), q.question);
+  // A run of 1% or more still reads in whole percent.
+  const big = fixture({ points: HOT, config: { ...GOV, jobs: { ...GOV.jobs, "chat-build": { ...GOV.jobs["chat-build"], cost_estimate: 0.04 } } } });
+  run(big, ["check", "chat-build", "--key", "req-1"]);
+  assert.ok(JSON.parse(fs.readFileSync(big.state, "utf8")).questions[0].question.includes("about 4% of the week"));
+});
+
 it("prices a job from its runs of the last month, not months-old ones", () => {
   const fx = fixture({ points: HOT, config: { ...GOV, usd_per_allowance: 1000 } });
   const dir = path.join(fx.logs, "ephemeral-forks");

@@ -5,7 +5,7 @@ source "$(dirname "$0")/lib/webhook-auth.sh"
 # Flow:
 #   1. Run `bin/location-current-stop` → JSON with current dwell + candidates.
 #   2. Skip if not is_stop, or if needs_confirm=false (already_known / high_conf / photo).
-#   3. Quiet-window check (sleep 00-09 local + active calendar event):
+#   3. Quiet-window check (the user asleep, per the sleep signal + active calendar event):
 #        - In quiet window  → write ask to pending-asks queue, exit 0 (no dispatch)
 #        - Out of quiet     → drain queued + resolve each via the hybrid path
 #   4. Hybrid per-ask resolution:
@@ -53,13 +53,14 @@ if [ -f "$USER_TZ_FILE" ]; then
   [ -n "$PARSED_TZ" ] && USER_TZ="$PARSED_TZ"
 fi
 
-HOUR_LOCAL=$(TZ="$USER_TZ" date +%H)
 
 # --- Quiet-window detection (returns 0 if QUIET, 1 if open) ---
 in_quiet_window() {
-  # Sleep window 00-08 local
-  if [ "$HOUR_LOCAL" -lt 9 ]; then
-    log "quiet:sleep_window hour=$HOUR_LOCAL"
+  # Asleep, from sleep data + the phone's lock/unlock rows, never the clock
+  # (00-09 local is the fallback whenever there is no usable sleep signal). Exit 0 = hold;
+  # any failure reads as awake (fail-open).
+  if SLEEP_GATE=$("${JORI_NODE:-node}" "$(dirname "$0")/../../bin/sleep-night" --gate --fallback 0-9 --tz "$USER_TZ" 2>/dev/null); then
+    log "quiet:asleep ($SLEEP_GATE)"
     return 0
   fi
   # Active calendar event (busy)
@@ -227,7 +228,16 @@ for i in $(seq 0 $((N_BATCH - 1))); do
     R_REASON=$(echo "$RESOLVE_OUT" | jq -r '.reasoning // ""' 2>/dev/null)
 
     if [ "$R_DECISION" = "auto_confirm" ] && [ -n "$R_VENUE" ]; then
-      if "$CONFIRM_TOOL" save "$ASK_ID_THIS" "$R_VENUE" >/dev/null 2>&1; then
+      # An automated guess (a model's reading, not the user's own words or a past
+      # confirmation) settles today's ask but is saved row-only: it never joins
+      # confirmed-stops.json, which names every future stop near it without asking
+      # (jobs/location-confirm-ask.md § Automated guesses cannot self-confirm).
+      # Only a resolver that says grounded=true saves in full.
+      R_GROUNDED=$(echo "$RESOLVE_OUT" | jq -r '.grounded // false' 2>/dev/null)
+      SAVE_FLAG="--row-only"
+      [ "$R_GROUNDED" = "true" ] && SAVE_FLAG=""
+      # shellcheck disable=SC2086
+      if "$CONFIRM_TOOL" save $SAVE_FLAG "$ASK_ID_THIS" "$R_VENUE" >/dev/null 2>&1; then
         log "auto_confirm:sonnet ask_id=$ASK_ID_THIS venue=\"$R_VENUE\" reason=$R_REASON"
         continue
       fi

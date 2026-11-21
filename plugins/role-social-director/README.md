@@ -1,4 +1,4 @@
-# Social Director (role plugin)
+# Social (role plugin)
 
 The fun: shows, comedy, concerts, events, restaurants, movies and TV.
 

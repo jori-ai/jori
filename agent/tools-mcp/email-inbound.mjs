@@ -50,7 +50,7 @@ const exec = promisify(execFile);
 const { TOOLS_DIR } = require("../../lib/root.cjs");
 const STATE = process.env.EMAIL_INBOUND_STATE || "";
 const PAYLOAD = process.env.EMAIL_INBOUND_PAYLOAD || "";
-const GOG = "/opt/homebrew/bin/gog";
+const GOG = process.env.GOG_BIN || "/opt/homebrew/bin/gog";
 
 // The marketing-draft hand-off (mkt_apply): the subject tags that mark a draft
 // approval email and the job that owns the response, from

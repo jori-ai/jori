@@ -88,6 +88,8 @@ It refuses without an explicit file list, rejects whole-tree spellings, and repo
 
 **Kernel files stay generic** (`agent/CLAUDE.md` § Kernel boundary): run `bin/kernel-guard` before committing; when the pre-commit hook refuses, move the content where it says, never `JORI_ALLOW_KERNEL_GUARD_SKIP=1`.
 
+**No secret-shaped strings in commits:** `githooks/pre-commit` runs gitleaks on what you stage, and CI scans the whole history (install merges into main as-is, so a flagged commit can't be edited away later). A made-up key, token or hash in a test fixture ends its line with `gitleaks:allow`, or is built in code (`Buffer.from("test-secret").toString("base64")`). A real secret never goes in a file: it belongs in `.env` / 1Password.
+
 ## Scratch copies of the repo (critics, test runs)
 
 A job or critic that needs a copy of the code to run tests against a change uses a scratch tree. Make it with `bin/scratch-tree make [--label <name>] [--bundle <files.json>]` (tracked files plus the change, nothing gitignored: no `.env`, no `data`), run in it with `scratch-tree run <dir> -- <command>` (sets `JORI_HOME` to the copy), and delete it with `scratch-tree remove <dir>` when done. Never copy the tree by hand: a hand copy carries `.env` and its backups into `/tmp`. The nightly log rotation deletes scratch trees older than 6 hours and any stray copy of a secrets file under the temp dirs.
@@ -146,6 +148,8 @@ Before any digest task, run `jori doctor`. If it reports failures, say so to the
 ## Scheduled Jobs
 
 Scheduled tasks are dispatched via webhook with full instructions loaded from `jobs/*.md` at dispatch time. You do not need to reference CLAUDE.md for these — the instructions arrive in the dispatch message itself. Just follow them.
+
+**Answer where you were asked.** When the dispatch's "This dispatch" section carries a `Reply to: conversation <id>` line (added by `jori tasks run|dispatch --reply-to`, `lib/reply-to.cjs`), every chat message about that request goes there: `jori-send-curl --conversation <id> …`. Without it, the message lands in the conversation of the role that owns the job.
 
 ### Long-form delivery rule (universal, no exceptions)
 

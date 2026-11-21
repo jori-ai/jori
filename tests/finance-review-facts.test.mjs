@@ -21,10 +21,9 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createRequire } from "node:module";
 const require = createRequire(import.meta.url);
-// Deposit answers are attributed to the owner by name (lib/instance.cjs).
 process.env.JORI_OWNER_NAME = "Alex";
 const { classify } = require("../lib/finance-classify.js");
-const { depositsFromHub, depositSection, depositAnswer } = require("../lib/finance-deposit-reconcile.js");
+const { depositsFromHub, depositSection } = require("../lib/finance-deposit-reconcile.js");
 const { reconcileInvoices } = require("../lib/finance-invoice-reconcile.js");
 const { verifySummary } = require("../lib/finance-review-verify.js");
 const { valueByProperty } = require("../lib/finance-real-estate.js");
@@ -201,99 +200,47 @@ test("deposits come from the hub's record: missing only when it shows the money 
   assert.ok(sec.flags.some((f) => f.tag === "deposit-missing" && /Nora/.test(f.text) && /no bank row shows where it is/.test(f.text)));
 });
 
-test("one transfer that fits two sets of tenants is asked, not asserted; the owner's answer settles it", () => {
-  // A $2,400 ••2222 -> ••1111 transfer: the hub linked it to one tenant, and
-  // the review called two others' $1,200 each missing, though their two
-  // credits are what it matched.
+test("the hub's link is the record: a transfer another set of tenants also fits is not second-guessed (2026-11-15)", () => {
+  // A $2,400 ••2222 -> ••1111 transfer the hub linked to Nora. Noel and Lena's
+  // $1,200 each add up to the same amount; that is no reason to doubt the hub.
   const R = "plaid:sep14";
   const leg = (rowId, date, from, to, amount) => ({ rowId, date, from, to, amount, description: `transfer ${from} -> ${to}` });
-  const D = (id, tenant, amount, trail, positions, extra = {}) => ({
+  const D = (id, tenant, amount, trail, positions) => ({
     id, tenant, amount, lease_number: "L", property_id: "birch", property_name: "40 Birch Ave", hub_status: "paid", paid_via: "external", lease_end: null, outside_allowed: null,
     whereabouts: { trail, positions: positions.map(([place, a]) => ({ place, label: place, amount: a })), outside: positions.filter(([p]) => p !== "1111").reduce((s, [, a]) => s + a, 0), receivedOn: trail[0]?.date || null, returnedOn: null, owed: amount },
-    ...extra,
   });
-  const base = () => [
+  const deposits = [
     D("nora", "Nora Wells", 2400, [leg("plaid:jul25", "2025-07-14", "tenant", "2222", 2400), leg(R, "2026-09-14", "2222", "1111", 2400)], [["1111", 2400]]),
     D("noel", "Noel Carter", 1200, [leg("plaid:jun17", "2026-06-17", "tenant", "2222", 1200)], [["2222", 1200]]),
     D("lena", "Lena Ross", 1200, [leg("plaid:jun29", "2026-06-29", "tenant", "2222", 1200)], [["2222", 1200]]),
-    // Arrived after the transfer, so it cannot have been hers: still missing.
-    D("ola", "Ola Late", 2400, [leg("plaid:oct1", "2026-10-01", "tenant", "2222", 2400)], [["2222", 2400]]),
   ];
   const report = { computedAt: "2026-10-18T12:00:00Z", account: { mask: "1111" }, proof: { balance: 2400, deposits: 2400, other: 0, unlinked: 0, unexplained: 0 }, unlinked: [] };
-  const run = (r) => depositSection({ run_at: new Date().toISOString(), report: { ...r, deposit_account: "Security Deposits ••1111" } }, "2026-10-18");
+  const r = depositsFromHub({ deposits, report, depositMask: "1111" });
+  const by = Object.fromEntries(r.rows.map((x) => [x.id, x]));
+  assert.equal(by.nora.location, "deposit_account");
+  assert.equal(by.noel.location, "operating_account");
+  assert.deepEqual(r.missing.map((x) => x.id).sort(), ["lena", "noel"]);
+  assert.deepEqual(r.ambiguities, []);
+  const sec = depositSection({ run_at: new Date().toISOString(), report: { ...r, deposit_account: "Security Deposits ••1111" } }, "2026-10-18");
+  assert.deepEqual(sec.questions, []);
+  assert.ok(!sec.flags.some((f) => /Nora/.test(f.text)));
+  assert.ok(sec.flags.some((f) => f.tag === "deposit-missing" && /Noel Carter/.test(f.text) && f.action === "Move $1,200.00 from 2222 to Security Deposits ••1111."));
+});
 
-  // No answer yet: a question, and neither reading is stated.
-  const q = depositsFromHub({ deposits: base(), report, depositMask: "1111" });
-  const qb = Object.fromEntries(q.rows.map((x) => [x.id, x]));
-  for (const id of ["nora", "noel", "lena"]) assert.equal(qb[id].location, "ambiguous");
-  assert.deepEqual(q.missing.map((x) => x.id), ["ola"]);
-  const fits = q.ambiguities.filter((a) => a.kind === "transfer-fits-two");
-  assert.equal(fits.length, 1);
-  assert.deepEqual(fits[0].options.map((set) => set.map((c) => c.id).sort()), [["nora"], ["lena", "noel"]]);
-  const qs = run(q);
-  assert.ok(qs.flags.some((f) => f.tag === "deposit-ambiguous" && /Nora Wells's/.test(f.text)));
-  assert.ok(!qs.flags.some((f) => f.tag === "deposit-missing" && /Nora|Noel|Lena/.test(f.text)));
-  assert.ok(qs.flags.some((f) => f.tag === "deposit-missing" && /Ola Late/.test(f.text)));
-  assert.equal(qs.questions.length, 1);
-  // The command itself is the installation's (rental-finance.json `deposit_answer_command`).
-  assert.match(qs.questions[0].answer_with, / plaid:sep14 --whose /);
-  assert.equal(qs.section.in_question.length, 3);
-
-  // The owner's answer, as the deposit-answer command records it.
-  const answer = depositAnswer({ rowId: "sep14", deposits: base().map((d) => ({ id: d.id, tenantName: d.tenant, amount: d.amount, status: "paid", whereabouts: d.whereabouts })),
-    depositMask: "1111", whose: ["Noel Carter", "lena ross"], unknown: ["Nora Wells"], said: "Note that so this warning isn't repeated.", saidOn: "2026-10-18" });
-  assert.equal(answer.row_id, R);
-  assert.equal(answer.amount, 2400);
-  assert.equal(answer.from, "2222");
-  const a = depositsFromHub({ deposits: base(), report, depositMask: "1111", answers: [answer] });
-  const ab = Object.fromEntries(a.rows.map((x) => [x.id, x]));
-  assert.equal(ab.noel.location, "deposit_account");
-  assert.equal(ab.lena.amount_in_deposit_account, 1200);
-  // Nora's money arrived in ••2222 and the only row that moved it was not hers:
-  // it is still in ••2222, so she is missing with the move that fixes it.
-  assert.equal(ab.nora.location, "operating_account");
-  assert.equal(ab.nora.location_account_mask, "2222");
-  assert.equal(a.ambiguities.filter((x) => x.kind === "transfer-fits-two").length, 0);
-  assert.deepEqual(a.missing.map((x) => x.id).sort(), ["nora", "ola"]);
-  const as = run(a);
-  assert.ok(!as.flags.some((f) => /Noel|Lena/.test(f.text)));
-  assert.ok(as.flags.some((f) => f.tag === "deposit-missing" && /Nora Wells/.test(f.text) && f.action === "Move $2,400.00 from ••2222 to Security Deposits ••1111."));
-  assert.equal(as.questions.length, 0);
-  assert.equal(as.section.unconfirmed.length, 0);
-  assert.match(as.section.rows.find((x) => x.tenant === "Noel Carter").location, /per Alex, 2026-10-18/);
-
-  // Naming only whose it was still makes the third tenant unknown: the row cannot count twice.
-  const bare = depositAnswer({ rowId: R, deposits: base().map((d) => ({ id: d.id, tenantName: d.tenant, amount: d.amount, status: "paid", whereabouts: d.whereabouts })),
-    depositMask: "1111", whose: ["Noel Carter", "Lena Ross"], said: "x", saidOn: "2026-10-18" });
-  assert.deepEqual(bare.unknown.map((x) => x.deposit_id), ["nora"]);
-  const hand = depositsFromHub({ deposits: base(), report, depositMask: "1111", answers: [{ ...answer, unknown: [] }] });
-  assert.equal(hand.rows.find((x) => x.id === "nora").location, "operating_account");
-  assert.equal(hand.rows.filter((x) => x.location === "deposit_account").reduce((t, x) => t + x.amount_in_deposit_account, 0), 2400);
-
-  // A newer hub row about that tenant does not undo the answer while the hub still
-  // credits them the answered row; once it stops and records something newer, the hub is read again.
-  const natLater = base();
-  natLater[0].whereabouts.trail.push(leg("plaid:oct17", "2026-10-17", "2222", "1111", 2400));
-  // ...and its own trail, less the answered row, says where the money went: the Oct 17 move put it in the deposit account.
-  assert.equal(depositsFromHub({ deposits: natLater, report, depositMask: "1111", answers: [answer] }).rows.find((x) => x.id === "nora").location, "deposit_account");
-  natLater[0].whereabouts.trail = [leg("plaid:jul25", "2025-07-14", "tenant", "2222", 2400), leg("plaid:nov1", "2026-11-01", "2222", "1111", 2400)];
-  const noOla = natLater.filter((d) => d.id !== "ola");          // Ola's $2,400 in ••2222 would make Nov 1 a question of its own
-  assert.equal(depositsFromHub({ deposits: noOla, report, depositMask: "1111", answers: [answer] }).rows.find((x) => x.id === "nora").location, "deposit_account");
-  assert.equal(depositsFromHub({ deposits: natLater, report, depositMask: "1111", answers: [answer] }).rows.find((x) => x.id === "nora").location, "ambiguous");
-
-  // The answer speaks for whose it was only until the hub records them moving again.
-  const later = base();
-  later[1].whereabouts.trail.push(leg("plaid:oct5", "2026-10-05", "2222", "3333", 1200));
-  later[1].whereabouts.positions = [{ place: "3333", label: "3333", amount: 1200 }];
-  const l = depositsFromHub({ deposits: later, report, depositMask: "1111", answers: [answer] });
-  assert.equal(l.rows.find((x) => x.id === "noel").location, "operating_account");
-  assert.ok(l.missing.some((x) => x.id === "noel"));
-
-  // An answer that does not add up, or names a row nobody linked, is refused.
-  const hub = base().map((d) => ({ id: d.id, tenantName: d.tenant, amount: d.amount, status: "paid", whereabouts: d.whereabouts }));
-  assert.throws(() => depositAnswer({ rowId: R, deposits: hub, depositMask: "1111", whose: ["Noel Carter"], said: "x", saidOn: "2026-10-18" }), /add up to \$1,200.00; the transfer was \$2,400.00/);
-  assert.throws(() => depositAnswer({ rowId: "plaid:none", deposits: hub, depositMask: "1111", whose: ["Lena Ross"], said: "x", saidOn: "2026-10-18" }), /answered in the hub/);
-  assert.throws(() => depositAnswer({ rowId: R, deposits: hub, depositMask: "1111", whose: ["Nora Wells"], unknown: ["Nora Wells"], said: "x", saidOn: "2026-10-18" }), /both/);
+test("a refund paid in parts owes only the rest, and the rest is in the deposit account (2026-11-15)", () => {
+  const w = {
+    positions: [{ place: "1111", label: "Security Deposits ••1111", amount: 1700 }, { place: "returned", label: "Returned to the tenant", amount: 2000 }],
+    outside: 0, owed: 1700, trail: [], receivedOn: "2026-09-29", returnedOn: "2026-11-13", returnedAmount: 2000,
+  };
+  const d = { id: "jay", tenant: "Jay", amount: 3700, lease_number: "L", property_id: "birch", property_name: "40 Birch Ave", hub_status: "refund_processing", paid_via: "external", lease_end: "2026-11-30", whereabouts: w, outside_allowed: null };
+  const report = { computedAt: "2026-11-15T12:00:00Z", account: { mask: "1111" }, proof: { balance: 1700, deposits: 1700 }, unlinked: [] };
+  const r = depositsFromHub({ deposits: [d], report, depositMask: "1111" });
+  assert.equal(r.rows[0].location, "deposit_account");
+  assert.equal(r.rows[0].amount_in_deposit_account, 1700);
+  assert.equal(r.liability, 1700);
+  assert.deepEqual(r.missing, []);
+  const sec = depositSection({ run_at: new Date().toISOString(), report: { ...r, deposit_account: "Security Deposits ••1111" } }, "2026-11-15");
+  assert.ok(!sec.flags.some((f) => f.tag === "deposit-hub-status" || f.tag === "deposit-missing"));
 });
 
 test("Client invoices: voids excluded, split payments found, a later lump never steals an earlier invoice, open after the 6th", () => {

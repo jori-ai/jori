@@ -20,6 +20,7 @@ const instanceLib = _identityRequire(import.meta.url)("../../lib/instance.cjs");
 
 const { instance, localDir } = createRequire(import.meta.url)("../../lib/instance.cjs");
 const { REPO_ROOT } = createRequire(import.meta.url)("../../lib/root.cjs");
+const { agentEnv } = createRequire(import.meta.url)("../../lib/agent-env.cjs");
 
 const DEFAULT_CLAUDE = process.env.CLAUDE_BIN || `${process.env.HOME}/.local/bin/claude`;
 
@@ -87,6 +88,20 @@ export function kernelRulebooks({ root, cwd }) {
 }
 
 /**
+ * The path a rulebook is labelled with in the appended prompt: its PHYSICAL path
+ * relative to the root, so the ops tiers, whose own CLAUDE.md is a symlink to
+ * the same file, frame it with the same line. The prompt cache matches a system
+ * block whole, so one differing header line (the tier's cwd) made every tier's
+ * block a different key and a cold session never read a sibling tier's warm
+ * copy. A file whose physical path leaves the root keeps its path as given.
+ */
+function rulebookLabel(root, f) {
+  const real = (p) => { try { return fs.realpathSync(p); } catch { return p; } };
+  const physical = path.relative(real(root), real(f));
+  return physical && !physical.startsWith("..") && !path.isAbsolute(physical) ? physical : path.relative(root, f);
+}
+
+/**
  * The joined local rules for `role` ("chat" | "ops"; "shared" = shared.md
  * alone), or "" when there are none. `rulebooks` (from kernelRulebooks) puts
  * the kernel rulebooks' text first, framed the way claude frames a discovered
@@ -101,7 +116,7 @@ export function readLocalRules({ localDir, role, rulebooks }) {
     // A rulebook that cannot be read throws: the caller must not exclude a
     // file from discovery that the system prompt does not carry.
     const t = fs.readFileSync(f, "utf8");
-    const rel = rulebooks.root ? path.relative(rulebooks.root, f) : f;
+    const rel = rulebooks.root ? rulebookLabel(rulebooks.root, f) : f;
     parts.push(`Contents of ${rel} (project instructions, checked into the codebase):\n\n${t.trimEnd()}\n`);
   }
   for (const name of role === "shared" ? ["shared.md"] : ["shared.md", `${role}.md`]) {
@@ -303,21 +318,39 @@ export class ClaudeSession extends EventEmitter {
       // ANTHROPIC_API_KEY from process.env, otherwise claude -p picks the
       // API key over the Max credentials in ~/.claude/.credentials.json.
       for (const k of this.opts.unsetEnv || []) delete env[k];
+      // Secrets stay out of the agent's environment when the installation
+      // locks this agent down (agent/local/config/agent-env.json, re-read at
+      // every spawn; lib/agent-env.cjs, docs/agent-secrets.md). The tools the
+      // agent runs read what they need from .env themselves.
+      let childEnv = env;
+      if (this.opts.agentEnvId) {
+        try {
+          const r = agentEnv(this.opts.agentEnvId, { parentEnv: env });
+          if (r.locked) {
+            childEnv = r.env;
+            console.error(`[claude-session] agent env lockdown (${this.opts.agentEnvId}): ${Object.keys(childEnv).length} kept, ${r.dropped.length} dropped`);
+          }
+        } catch (e) {
+          // Fail open to the inherited env, loudly: a broken config file must
+          // not stop the agent from starting.
+          console.error(`[claude-session] agent env lockdown skipped (${e.message})`);
+        }
+      }
       // The MCP configs name this installation's Supabase project as
       // ${JORI_SUPABASE_PROJECT}; give the child the instance's value when
       // the environment has none (lib/instance.cjs).
-      if (!env.JORI_SUPABASE_PROJECT) {
+      if (!childEnv.JORI_SUPABASE_PROJECT) {
         const project = instance().supabase_project;
-        if (project) env.JORI_SUPABASE_PROJECT = project;
+        if (project) childEnv.JORI_SUPABASE_PROJECT = project;
       }
       // They also name their servers' scripts as ${JORI_HOME}/agent/…; with
       // it unset the CLI leaves the literal in the path and the server (the
       // chat agent's phone-channel among them) never starts.
-      if (!env.JORI_HOME) env.JORI_HOME = REPO_ROOT;
+      if (!childEnv.JORI_HOME) childEnv.JORI_HOME = REPO_ROOT;
       const child = spawn(bin, args, {
         cwd: this.opts.cwd,
         stdio: ["pipe", "pipe", "pipe"],
-        env,
+        env: childEnv,
       });
       this.child = child;
 

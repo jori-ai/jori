@@ -18,7 +18,9 @@
 #      does not start with ANTHROPIC_ and is not a variable Claude Code reads.)
 #   2. max_auth_check — `claude auth status --json` (no model call, costs
 #      nothing) must say loggedIn, authMethod "claude.ai", apiProvider
-#      "firstParty", subscriptionType "max". Anything else, including a status
+#      "firstParty", and a Claude subscription plan (pro, max or ultra: every
+#      plan is allowed since the owner's decision of 2026-11-18; before that,
+#      Max only). Anything else, including a status
 #      it cannot read, refuses: fail CLOSED, because the failure it prevents is
 #      a silent bill, and a refused run pages loudly.
 #
@@ -50,7 +52,7 @@ max_auth_scrub() {
 }
 
 # Sets MAX_AUTH_SUMMARY to a one-line description of what `auth status` said.
-# Returns 0 only for a claude.ai login on the Max plan.
+# Returns 0 only for a claude.ai login on a Claude subscription plan.
 max_auth_check() {
   local claude="$1" out field
   out="$("$claude" auth status --json 2>&1)"
@@ -59,7 +61,7 @@ max_auth_check() {
   [ "$(field loggedIn)" = "true" ] || return 1
   [ "$(field authMethod)" = "claude.ai" ] || return 1
   [ "$(field apiProvider)" = "firstParty" ] || return 1
-  [ "$(field subscriptionType)" = "max" ] || return 1
+  case "$(field subscriptionType)" in pro|max|ultra) ;; *) return 1 ;; esac
   return 0
 }
 

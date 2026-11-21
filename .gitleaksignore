@@ -5,3 +5,12 @@
 
 # False positive: Google Calendar event id in a test fixture (`key: "4jeg1r…"`) trips generic-api-key.
 6224772e5ad20d035e9eefe63b5d4cb874ab59b3:tests/calendar-audit-group.test.mjs:generic-api-key:69
+
+# Not a credential: Resy's public web-client key (the one resy.com ships in its own
+# JavaScript), hardcoded as a fallback in 82cf231 and removed in the next commit;
+# bin/resy now reads it live from resy.com and never stores one in the repo.
+82cf2312581bc8cc0f677310f3ac8dea6dcb18ad:bin/resy:generic-api-key:36
+
+# Not a credential: a made-up bearer value in a test fixture (checking that the
+# secrets guard never logs the command line), replaced in the next commit.
+bb76718811a8c0a6dbb28a766ab9d8e6976bf32f:tests/secrets-guard.test.mjs:curl-auth-header:48

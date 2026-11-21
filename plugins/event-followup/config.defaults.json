@@ -1,0 +1,12 @@
+{
+  "_doc": "Did it happen? (plugins/event-followup). calendars: which calendars are read (gog ids; primary = the main one). min_after_end_min / max_after_end_h: how soon after an event ends it may be asked about, and how long the question stays worth asking. max_duration_h: longer events are containers, not things that happened. quiet_start_hour / quiet_end_hour: local hours with no questions (an event that ends late is asked about the next morning). max_asks_per_day and min_gap_min: pacing. skip_recurring: leave standing weekly events alone.",
+  "calendars": ["primary"],
+  "min_after_end_min": 30,
+  "max_after_end_h": 36,
+  "max_duration_h": 8,
+  "quiet_start_hour": 23,
+  "quiet_end_hour": 9,
+  "max_asks_per_day": 3,
+  "min_gap_min": 90,
+  "skip_recurring": true
+}

@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # bb-verify — sanity-check the Browserbase MCP config in ~/.claude.json before restarting.
+# Keys are read from ~/.claude.json or, as bin/browserbase-mcp runs it, from .env.
 # Verifies:
 #   1. CLI flags are the right shape (camelCase, no spurious values on boolean flags)
 #   2. Model name is accepted by the currently installed @ai-sdk/anthropic
@@ -10,6 +11,8 @@ set -euo pipefail
 
 CFG="$HOME/.claude.json"
 test -f "$CFG" || { echo "no $CFG"; exit 1; }
+BB_ENV_FILE="$(cd "$(dirname "$0")/.." && pwd)/.env"
+export BB_ENV_FILE
 
 python3 - <<'PY'
 import json, os, subprocess, sys, urllib.request
@@ -31,11 +34,32 @@ def flag(name):
     except ValueError:
         return None
 
+# Keys live in the installation's .env (bin/browserbase-mcp reads them there);
+# a key still in the MCP config is reported, since agents can read that file.
+def dotenv():
+    out = {}
+    p = os.environ.get("BB_ENV_FILE", "")
+    try:
+        for line in open(p):
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                k, v = line.split("=", 1)
+                out[k.strip()] = v.strip().strip('"').strip("'")
+    except OSError:
+        pass
+    return out
+
+denv = dotenv()
+in_config = [n for n in ("modelApiKey", "browserbaseApiKey", "browserbaseProjectId") if flag(n)]
+in_config += [n for n in ("BROWSERBASE_API_KEY", "BROWSERBASE_PROJECT_ID") if env.get(n)]
+if in_config:
+    print(f"  WARNING: keys in ~/.claude.json, readable by agents: {', '.join(in_config)} (move them to .env, run through bin/browserbase-mcp)")
+
 model = flag("modelName")
-api_key = flag("modelApiKey")
+api_key = flag("modelApiKey") or denv.get("BROWSERBASE_MODEL_API_KEY")
 ctx_id  = flag("contextId")
-bb_key  = env.get("BROWSERBASE_API_KEY") or flag("browserbaseApiKey")
-bb_proj = env.get("BROWSERBASE_PROJECT_ID") or flag("browserbaseProjectId")
+bb_key  = env.get("BROWSERBASE_API_KEY") or flag("browserbaseApiKey") or denv.get("BROWSERBASE_API_KEY")
+bb_proj = env.get("BROWSERBASE_PROJECT_ID") or flag("browserbaseProjectId") or denv.get("BROWSERBASE_PROJECT_ID")
 
 print(f"  modelName   = {model or 'MISSING'}")
 print(f"  modelApiKey = {'set' if api_key else 'MISSING'}")

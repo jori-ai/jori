@@ -238,6 +238,107 @@ class ReconcileTurnaround(unittest.TestCase):
         self.assertEqual(self.writes, [])
 
 
+class TwoPlacesOneOuting(unittest.TestCase):
+    """An errand loop: a plaza, then a market a kilometre on (twenty quiet minutes
+    there), back past the plaza, home. Metres east of the flat. One row over the
+    whole outing sat between the two places and the market was never in the day."""
+    PLAZA, MARKET, ROAD = 5300.0, 6300.0, 5800.0
+
+    def trace(self, second_rest_at=None):
+        second = self.PLAZA if second_rest_at is None else second_rest_at
+        rows = [("15:27:32", 250), ("15:33:08", 2000), ("15:36:58", 4500),
+                ("15:43:09", self.PLAZA), ("15:43:45", self.PLAZA), ("15:43:48", self.PLAZA),
+                ("15:48:10", self.MARKET),          # twenty quiet minutes, then the road
+                ("16:08:44", self.ROAD), ("16:18:15", second), ("16:28:10", self.ROAD),
+                ("16:33:10", 3000), ("16:38:11", 1500), ("16:43:12", 50)]
+        return [{"t": t(h, 19), "lat": east(m)[0], "lon": east(m)[1]} for h, m in rows]
+
+    STOPS = [stop("00:00:00", "15:27:32"), stop("16:43:12", "18:00:00")]
+
+    def stops_(self):
+        return [{**s, "start": s["start"].replace(day=19), "end": s["end"].replace(day=19)} for s in self.STOPS]
+
+    def test_each_place_the_phone_sat_still_at_is_its_own_row(self):
+        got = mod.turnaround_stops(self.trace(), self.stops_())
+        self.assertEqual(len(got), 2)
+        market, plaza = got
+        self.assertEqual((market["start"], market["end"]), (t("15:48:10", 19), t("16:08:44", 19)))
+        self.assertEqual((plaza["start"], plaza["end"]), (t("16:18:15", 19), t("16:28:10", 19)))
+        # each sits at the fix the phone was still at, not between the places
+        self.assertLess(miles(market["centroid"], east(self.MARKET)), 1)
+        self.assertLess(miles(plaza["centroid"], east(self.PLAZA)), 1)
+        for r in got:
+            self.assertTrue(r["turnaround"] and r["rest"])
+            self.assertGreaterEqual(r["minutes"], mod.TURN_MIN_DWELL_MIN)
+            self.assertEqual(r["places"], 2)
+            for k in ("n", "n_in", "place", "motion", "worst_m", "away_m"):
+                self.assertIn(k, r)
+
+    def test_the_road_between_them_is_not_a_third_place(self):
+        # the point passed on the way there and back is 500 m from the market: part of it
+        got = mod.turnaround_stops(self.trace(), self.stops_())
+        self.assertFalse(any(miles(r["centroid"], east(self.ROAD)) < 50 for r in got))
+
+    def test_rests_close_together_stay_one_row_as_before(self):
+        got = mod.turnaround_stops(self.trace(second_rest_at=self.MARKET - 300), self.stops_())
+        self.assertEqual(len(got), 1)
+        self.assertNotIn("rest", got[0])
+
+    def test_the_old_blended_row_is_still_what_a_single_far_end_gives(self):
+        got = mod.turnaround_stops(AIRPORT_RUN, FLAT_STOPS)
+        self.assertEqual(len(got), 1)
+        self.assertNotIn("rest", got[0])
+
+    def test_a_dropped_signal_on_a_long_hop_is_not_a_rest(self):
+        span = [{"t": t("10:00:00"), "lat": east(0)[0], "lon": east(0)[1]},
+                {"t": t("10:10:00"), "lat": east(4000)[0], "lon": east(4000)[1]}]
+        self.assertEqual(mod.silent_rests(span), [])
+        span[1] = {"t": t("10:10:00"), "lat": east(500)[0], "lon": east(500)[1]}
+        self.assertEqual(len(mod.silent_rests(span)), 1)
+        self.assertEqual(mod.silent_rests(span)[0]["pos"], (east(0)[0], east(0)[1]))
+
+    def test_a_short_silence_is_not_a_rest(self):
+        span = [{"t": t("10:00:00"), "lat": east(0)[0], "lon": east(0)[1]},
+                {"t": t("10:07:00"), "lat": east(300)[0], "lon": east(300)[1]}]
+        self.assertEqual(mod.silent_rests(span), [])
+
+    def test_the_longest_rest_at_a_place_wins_and_the_rows_run_in_time_order(self):
+        a = {"start": t("10:00:00"), "end": t("10:12:00"), "minutes": 12, "pos": east(0)}
+        b = {"start": t("10:30:00"), "end": t("10:55:00"), "minutes": 25, "pos": east(300)}
+        c = {"start": t("11:10:00"), "end": t("11:20:00"), "minutes": 10, "pos": east(2000)}
+        self.assertEqual(mod.distinct_rests([a, b, c]), [b, c])
+
+    def test_reconcile_writes_one_row_per_place_with_its_own_window(self):
+        rows = mod.turnaround_stops(self.trace(), self.stops_())
+        writes = []
+        mod.write_req = lambda path, method, body=None: writes.append((path, method, body))
+        for r in rows:
+            acted = []
+            mod.reconcile_turnaround(r, [], acted, True)
+            self.assertEqual(acted[0][1], "insert")
+        self.assertEqual([w[1] for w in writes], ["POST", "POST"])
+        first, second = writes[0][2], writes[1][2]
+        self.assertEqual(first["arrived_at"], t("15:48:10", 19).isoformat())
+        self.assertEqual(first["departed_at"], t("16:08:44", 19).isoformat())
+        self.assertEqual(second["arrived_at"], t("16:18:15", 19).isoformat())
+        for body in (first, second):
+            self.assertIn(mod.TURNAROUND_TOKEN, body["notes"])
+            self.assertIn("sat still", body["notes"])
+            self.assertEqual(body["place_name"], mod.TURN_NAME)
+        self.assertAlmostEqual(first["latitude"], east(self.MARKET)[0])
+
+    def test_a_row_the_user_already_named_over_one_place_is_left_alone(self):
+        market = mod.turnaround_stops(self.trace(), self.stops_())[0]
+        writes = []
+        mod.write_req = lambda path, method, body=None: writes.append((path, method, body))
+        named = {"id": "33333333-cccc", "latitude": east(self.MARKET)[0], "longitude": east(self.MARKET)[1],
+                 "source": "day-segments", "place_type": "user-confirmed", "notes": "x", "place_name": "A name"}
+        acted = []
+        mod.reconcile_turnaround(market, [named], acted, True)
+        self.assertEqual(acted[0][1], "skip")
+        self.assertEqual(writes, [])
+
+
 class Agreement(unittest.TestCase):
     def test_every_reader_uses_the_same_token(self):
         # the writer, stop-passage, stop-identify and resolve-day match one string

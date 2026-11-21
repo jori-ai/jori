@@ -233,3 +233,79 @@ test("a piece left after the cut whose own fixes are all elsewhere is not time a
   assert.deepEqual(stops[1].photos.map(p => p.uuid), ["p-cafe", "p-beach"],
     "a photo after the window goes to the nearest stop, so the walk built later can take it");
 });
+
+// A second place the user named inside a longer stop confirmed at another place
+// (a store across the street, "after the market"). The cut needs the fixes of the
+// user's window at the named place; a still phone inside a store left one, a photo
+// the user took, 30 m from the place and 43 m from the stop's own point. One
+// camera fix at the user's place is enough; one GPS fix is not.
+const UPC = (hms) => Date.parse(`2026-11-13T${hms}Z`);
+const PC_FROM = UPC("00:00:00"), PC_TO = UPC("23:59:59");
+const PC_MARKET = { ...LL(0, 0) };
+const PC_SHOP = { ...LL(-10, -38) };
+const PC_SHOP_PHOTO = LL(-33, -22);     // nearer the shop than the market
+const PC_MARKET_PHOTO = LL(8, 6);       // nearer the market than the shop
+function pcMarket() {
+  return { id: "s-20261113-5", start: "18:26", end: "19:17", start_ts_ms: UPC("18:26:34"), end_ts_ms: UPC("19:17:00"),
+    duration_min: 50, ...PC_MARKET, place: { name: "Holiday Market", source: "user_confirmed", confidence: 1 },
+    companions: ["Pat"], photos: [{ uuid: "p-market", ts: "2026-11-13T18:44:15Z" }, { uuid: "p-shop", ts: "2026-11-13T18:58:49Z" }] };
+}
+const pcShopEntry = {
+  ask_id: "lc-at-20261114-091127", name: "Grocery Example", source: "user_stated_at", companions: ["Pat"],
+  centroid: PC_SHOP, stop_window: { start: "2026-11-13T18:58:00Z", end: "2026-11-13T19:13:00Z", duration_min: 15 },
+};
+const pcMarketPings = [
+  { ts: UPC("18:26:34"), ...PC_MARKET, acc: 39, kind: "visit" },
+  { ts: UPC("18:31:11"), ...LL(4, 5), acc: 5, kind: "visit" },
+  { ts: UPC("18:44:15"), ...LL(15, 90), acc: null, kind: "photo" },
+];
+const pcPhoto = (where = PC_SHOP_PHOTO) => ({ ts: UPC("18:58:49"), ...where, acc: null, kind: "photo" });
+
+test("a single camera fix at the user's place cuts the long stop around the user's window", () => {
+  const stops = [pcMarket()];
+  const added = addSavedAtStops(stops, [pcShopEntry], PC_FROM, PC_TO, [...pcMarketPings, pcPhoto()]);
+  assert.equal(added.length, 1);
+  assert.equal(added[0].cut_from && added[0].cut_from.id, "s-20261113-5");
+  assert.deepEqual(stops.map(s => [s.place.name, s.start_ts_ms, s.end_ts_ms]), [
+    ["Holiday Market", UPC("18:26:34"), UPC("18:58:00")],
+    ["Grocery Example", UPC("18:58:00"), UPC("19:13:00")],
+  ], "the tail under ten minutes is a moment at the door and goes");
+  assert.equal(stops[1].place.source, "user_confirmed");
+  assert.deepEqual(stops[1].companions, ["Pat"]);
+  assert.deepEqual(stops[0].photos.map(p => p.uuid), ["p-market"]);
+  assert.deepEqual(stops[1].photos.map(p => p.uuid), ["p-shop"], "the photo taken in the user's window goes with it");
+});
+
+test("a lone GPS fix at the user's place is not enough to cut", () => {
+  const stops = [pcMarket()];
+  const gps = { ...pcPhoto(), kind: "visit", acc: 12 };
+  assert.equal(addSavedAtStops(stops, [pcShopEntry], PC_FROM, PC_TO, [...pcMarketPings, gps]).length, 0);
+  assert.deepEqual(stops.map(s => s.place.name), ["Holiday Market"]);
+});
+
+test("a single camera fix nearer the stop's own point than the user's place, or far from it, does not cut", () => {
+  for (const where of [PC_MARKET_PHOTO, LL(-300, -300)]) {
+    const stops = [pcMarket()];
+    assert.equal(addSavedAtStops(stops, [pcShopEntry], PC_FROM, PC_TO, [...pcMarketPings, pcPhoto(where)]).length, 0);
+    assert.deepEqual(stops.map(s => s.place.name), ["Holiday Market"]);
+  }
+});
+
+test("with a second fix inside the window the two-fix rule decides, as before", () => {
+  const stops = [pcMarket()];
+  const away = { ts: UPC("19:05:00"), ...LL(3, 2), acc: 8, kind: "visit" };
+  assert.equal(addSavedAtStops(stops, [pcShopEntry], PC_FROM, PC_TO, [...pcMarketPings, pcPhoto(), away]).length, 0,
+    "one of two fixes at the user's place is not most of them");
+  assert.equal(stops.length, 1);
+});
+
+test("JORI_SAVED_AT_PHOTO_CARVE=0 restores the two-fix floor, and JORI_SAVED_AT_CARVE=0 still turns every cut off", () => {
+  for (const flag of ["JORI_SAVED_AT_PHOTO_CARVE", "JORI_SAVED_AT_CARVE"]) {
+    const stops = [pcMarket()];
+    process.env[flag] = "0";
+    try {
+      assert.equal(addSavedAtStops(stops, [pcShopEntry], PC_FROM, PC_TO, [...pcMarketPings, pcPhoto()]).length, 0);
+      assert.equal(stops.length, 1);
+    } finally { delete process.env[flag]; }
+  }
+});

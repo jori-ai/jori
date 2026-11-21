@@ -908,7 +908,7 @@ async function main() {
     freeCash != null && { id: "cash.free", text: `Free cash is ${usd0(freeCash)}, ${signed(cashPos.free_cash_week_delta)} on the week.` },
     { id: "flow.week", text: `This week: ${flowFmt.income_in_fmt} of income arrived, ${flowFmt.spending_fmt} was spent, and ${flowFmt.card_payments_from_bank_fmt} of card payments left bank accounts.` },
     runway != null && { id: "runway", text: `Runway is ${runway} days: free cash of ${usd0(freeCash)} at ${usd0(dailySpend)} per day, the average daily spending of the last 90 days.` },
-    deposits && { id: "deposits", text: `Tenant deposits owed back total ${deposits.liability_fmt}; the deposit account holds ${deposits.balance_fmt}, and ${deposits.missing.length} deposit(s) are not in it${deposits.in_question?.length ? `; ${deposits.in_question.length} more wait on a question about whose a transfer was` : ""}${deposits.unconfirmed?.length ? `; ${deposits.unconfirmed.length} more counted neither in nor out (whereabouts not known)` : ""}.` },
+    deposits && { id: "deposits", text: `Tenant deposits owed back total ${deposits.liability_fmt}; the deposit account holds ${deposits.balance_fmt}, and ${deposits.missing.length} deposit(s) are not in it.` },
     { id: "networth", text: brokerNow != null ? `Net worth is ${usd0(netWorth)}, with real estate at ${usd0(reValue)} and ${BROKER.label} at ${usd0(brokerNow)} as of ${fmtD(brokerAsOf)}.` : `Net worth is ${usd0(netWorth)}, with real estate at ${usd0(reValue)}.` },
     nextTax && { id: "tax", text: `The next federal estimated-tax date is ${fmtD(nextTax)}, ${daysBetween(today, nextTax)} days away.` },
   ].filter(Boolean);

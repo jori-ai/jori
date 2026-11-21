@@ -17,13 +17,13 @@ const AGENTS = {
 };
 
 test("target: defaults to ops-light; 'ops'/null roll back; missing ports disable", () => {
-  assert.deepEqual(triageTargetFromConfig(AGENTS), { agent: "ops-light", webhookPort: 9082, healthPort: 9083 });
+  assert.deepEqual(triageTargetFromConfig(AGENTS, { local: null }), { agent: "ops-light", webhookPort: 9082, healthPort: 9083 });
   const roll = structuredClone(AGENTS); roll.agents.ops.gmailTriageTarget = "ops";
-  assert.equal(triageTargetFromConfig(roll), null);
+  assert.equal(triageTargetFromConfig(roll, { local: null }), null);
   const off = structuredClone(AGENTS); off.agents.ops.gmailTriageTarget = null;
-  assert.equal(triageTargetFromConfig(off), null);
+  assert.equal(triageTargetFromConfig(off, { local: null }), null);
   const bad = structuredClone(AGENTS); delete bad.agents["ops-light"].supervisor.webhookPort;
-  assert.equal(triageTargetFromConfig(bad), null);
+  assert.equal(triageTargetFromConfig(bad, { local: null }), null);
 });
 
 function fakeFetch({ healthy = true, postStatus = 200, throwOnPost = false } = {}) {
@@ -101,4 +101,112 @@ test("ClaudeSession passes the flag only when asked", () => {
   const base = { sessionId: "s", model: "m" };
   assert.ok(new ClaudeSession({ ...base, excludeDynamicSystemPromptSections: true })._buildArgs({ resume: false }).includes("--exclude-dynamic-system-prompt-sections"));
   assert.ok(!new ClaudeSession(base)._buildArgs({ resume: false }).includes("--exclude-dynamic-system-prompt-sections"));
+});
+
+test("strict: config value 'strict' targets ops-light as the fallback", () => {
+  const s = structuredClone(AGENTS); s.agents.ops.gmailTriageTarget = "strict";
+  assert.deepEqual(triageTargetFromConfig(s, { local: null }), { agent: "ops-light", webhookPort: 9082, healthPort: 9083, strict: true });
+});
+
+test("strict: a finished one-shot is the whole route; a failed one falls back with what it did", async () => {
+  const strictTarget = { ...target, strict: true };
+  const packet = { messageId: "m1", from: "A <a@x.com>", subject: "s", date: "Mon, 16 Nov 2026 10:00:00 +0000" };
+  // finished
+  let { fn, calls } = fakeFetch();
+  let seen = null;
+  let route = makeTriageRouter({ target: strictTarget, localDispatch: () => {}, tokenFile: "/x", readFile: () => "t", fetchFn: fn,
+    runStrict: async (p) => { seen = p; return { ok: true, actions: [{ tool: "gmail_message" }] }; } });
+  assert.equal((await route("BODY", "gmail:m1", { packet })).routed, "strict");
+  assert.equal(seen.content, "BODY");
+  assert.equal(seen.messageId, "m1");
+  assert.equal(calls.length, 0);
+  // failed after acting → ops-light POST carries the note
+  ({ fn, calls } = fakeFetch());
+  route = makeTriageRouter({ target: strictTarget, localDispatch: () => {}, tokenFile: "/x", readFile: () => "t", fetchFn: fn,
+    runStrict: async () => ({ ok: false, why: "no answer", actions: [{ tool: "gmail_message", summary: "gmail-action label m1 personal" }] }) });
+  assert.equal((await route("BODY", "gmail:m1", { packet })).routed, "ops-light");
+  const post = calls.find((c) => !c.url.endsWith("/health"));
+  const body = JSON.parse(post.init.body);
+  assert.ok(body.task.startsWith("BODY"));
+  assert.ok(body.task.includes("gmail-action label m1 personal"));
+  // no packet (e.g. an old caller) → straight to ops-light, the one-shot never runs
+  ({ fn, calls } = fakeFetch());
+  let ran = false;
+  route = makeTriageRouter({ target: strictTarget, localDispatch: () => {}, tokenFile: "/x", readFile: () => "t", fetchFn: fn, runStrict: async () => { ran = true; return { ok: true }; } });
+  assert.equal((await route("BODY", "gmail:m2")).routed, "ops-light");
+  assert.equal(ran, false);
+});
+
+test("strict: at most strictMax one-shots at once; the rest go to ops-light", async () => {
+  const { fn } = fakeFetch();
+  let release;
+  const gate = new Promise((r) => { release = r; });
+  let started = 0;
+  const route = makeTriageRouter({ target: { ...target, strict: true }, localDispatch: () => {}, tokenFile: "/x", readFile: () => "t", fetchFn: fn, strictMax: 2,
+    runStrict: async () => { started++; await gate; return { ok: true, actions: [] }; } });
+  const p = (id) => route("B", `gmail:${id}`, { packet: { messageId: id } });
+  const a = p("a"), b = p("b");
+  const c = await p("c");
+  assert.equal(c.routed, "ops-light");
+  assert.equal(started, 2);
+  release();
+  assert.equal((await a).routed, "strict");
+  assert.equal((await b).routed, "strict");
+});
+
+test("strict-shadow: the dispatch is untouched and a dry one-shot runs alongside", async () => {
+  const s = structuredClone(AGENTS); s.agents.ops.gmailTriageTarget = "strict-shadow";
+  const t = triageTargetFromConfig(s, { local: null });
+  assert.equal(t.shadow, true); assert.equal(t.strict, undefined);
+  const { fn, calls } = fakeFetch();
+  const runs = [];
+  const route = makeTriageRouter({ target: t, localDispatch: () => {}, tokenFile: "/x", readFile: () => "t", fetchFn: fn,
+    runStrict: async (p, o) => { runs.push(o); return { ok: true, actions: [] }; } });
+  assert.equal((await route("BODY", "gmail:s1", { packet: { messageId: "s1" } })).routed, "ops-light");
+  assert.equal(JSON.parse(calls.find((c) => !c.url.endsWith("/health")).init.body).task, "BODY");
+  await new Promise((r) => setImmediate(r));
+  assert.deepEqual(runs, [{ dry: true }]);
+});
+
+test("strict: a run the supervisor never saw end is dispatched once by the sweep", async () => {
+  const fs = await import("node:fs"); const os = await import("node:os"); const path = await import("node:path");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tr-pending-"));
+  let clock = 1_000_000;
+  const { fn, calls } = fakeFetch();
+  // a run that never returns (the supervisor "restarts" while it is in flight)
+  const route = makeTriageRouter({ target: { ...target, strict: true }, localDispatch: () => {}, tokenFile: "/x", readFile: () => "t", fetchFn: fn,
+    pendingDir: dir, sweepEveryMs: 0, now: () => clock, runStrict: () => new Promise(() => {}) });
+  route("BODY", "gmail:p1", { packet: { messageId: "p1" } });
+  await new Promise((r) => setImmediate(r));
+  assert.equal(fs.readdirSync(dir).length, 1);
+  assert.equal(await route.sweepPending(), 0);           // too fresh
+  clock += 12 * 60 * 1000;
+  assert.equal(await route.sweepPending(), 1);
+  const post = calls.find((c) => !c.url.endsWith("/health"));
+  assert.ok(JSON.parse(post.init.body).task.startsWith("BODY"));
+  assert.equal(fs.readdirSync(dir).length, 0);
+  assert.equal(await route.sweepPending(), 0);           // once
+});
+
+test("the installation's gmail_triage_target overrides the kernel config", () => {
+  assert.equal(triageTargetFromConfig(AGENTS, { local: "strict-shadow" }).shadow, true);
+  assert.equal(triageTargetFromConfig(AGENTS, { local: "ops" }), null);
+});
+
+test("a config-built router follows the installation's mode per email, without a restart", async () => {
+  let mode = "strict-shadow", clock = 0;
+  const t = triageTargetFromConfig(AGENTS, { local: mode });
+  const { fn } = fakeFetch();
+  const runs = [];
+  const local = [];
+  const route = makeTriageRouter({ target: t, localDispatch: (c, s) => local.push(s), tokenFile: "/x", readFile: () => "t", fetchFn: fn,
+    sweepEveryMs: 0, now: () => clock, readMode: () => mode, runStrict: async (p, o = {}) => { runs.push(o.dry ? "dry" : "live"); return { ok: true, actions: [{ tool: "gmail_message" }] }; } });
+  await route("B", "gmail:1", { packet: { messageId: "1" } });
+  await new Promise((r) => setImmediate(r));
+  mode = "strict"; clock += 31_000;
+  assert.equal((await route("B", "gmail:2", { packet: { messageId: "2" } })).routed, "strict");
+  mode = "ops"; clock += 31_000;
+  assert.equal((await route("B", "gmail:3", { packet: { messageId: "3" } })).routed, "local");
+  assert.deepEqual(runs, ["dry", "live"]);
+  assert.deepEqual(local, ["gmail:3"]);
 });

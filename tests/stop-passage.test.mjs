@@ -194,3 +194,56 @@ test("a lone point between two silences can hide a stop across both (2026-10-07 
   assert.notEqual(r.verdict, "passage", r.reason);
   assert.ok(r.features.longest_hidden_min >= STOP_MIN, JSON.stringify(r.features));
 });
+
+// ---------------------------------------------------------------------------
+// The routine walk from home (2026-11-21): a 13-minute iOS visit in the middle
+// of a short loop out of the house and back on foot was asked about ("where was
+// this?"). homeLoopVerdict calls it part of the walk; while the walk is still
+// out it holds, so nobody is asked mid-walk.
+// ---------------------------------------------------------------------------
+import { homeLoopVerdict } from "../lib/stop-passage.mjs";
+import { createRequire } from "node:module";
+const { homeLoopConfig } = createRequire(import.meta.url)("../lib/day-excursions.js");
+
+{
+  const LOOP_CFG = homeLoopConfig({ routineWalk: { homes: ["Home (Example)"], companion: "Dog" },
+    entries: [{ name: "Home (Example)", kind: "home", ...fakeAt(-70, 20) }] });
+  const z = (hms) => `2026-11-20T${hms}Z`;
+  const fx = (hms, e, n, acc, activity) => ({ arrived_at: z(hms), ...fakeRow(e, n), accuracy_m: acc, activity });
+  const vr = (id, hms, dep, e, n, acc, place_type) => ({ id, arrived_at: z(hms), departed_at: dep ? z(dep) : null, ...fakeRow(e, n), accuracy_m: acc, place_type });
+  const FIXES = [
+    fx("21:46:59", 4.2, 7.2, 3, "unknown"), fx("21:47:54", 0, 0, 13, "unknown"), fx("21:50:10", 1.5, -2, 10, "stationary"),
+    fx("22:26:31", 93, 18.3, 26, "walking"), fx("22:29:07", 164.3, 70.5, 15, "walking"), fx("22:38:07", 590, 84.6, 21, "walking"),
+    fx("22:45:24", 329.7, -15.8, 14, "walking"), fx("22:48:05", 185.7, -19.9, 28, "walking"),
+    fx("22:50:34", 71.9, 6, 25, "walking"), fx("22:53:20", 12.3, 3, 17, "unknown"),
+  ];
+  const VISITS = [
+    vr("home-1", "21:33:38", "22:29:32", -4.7, -12.7, 2, "named"),
+    vr("walk-1", "22:29:55", "22:43:07", 380.8, 53.2, 119, "address"),
+    vr("home-2", "22:49:16", null, -2.3, -25.5, 21, "named"),
+  ];
+  const W = { start: z("22:29:55"), end: z("22:43:07"), visitId: "walk-1", cfg: LOOP_CFG };
+
+  test("home loop: a visit on the routine walk is part of it (passage)", () => {
+    const r = homeLoopVerdict({ ...W, fixes: FIXES, visits: VISITS, now: Date.parse(z("23:30:00")) });
+    assert.equal(r && r.verdict, "passage", JSON.stringify(r));
+    assert.match(r.reason, /walk from Home \(Example\) and back/);
+    assert.ok(r.loop.away_m > 580 && r.loop.away_m < 610);
+  });
+
+  test("home loop: still out on the walk, the question waits (hold)", () => {
+    const soFar = FIXES.filter(f => f.arrived_at <= z("22:45:30"));
+    const r = homeLoopVerdict({ ...W, fixes: soFar, visits: VISITS.slice(0, 2), now: Date.parse(z("22:46:00")) });
+    assert.equal(r && r.verdict, "hold", JSON.stringify(r));
+    const late = homeLoopVerdict({ ...W, fixes: soFar, visits: VISITS.slice(0, 2), now: Date.parse(z("23:59:00")) });
+    assert.equal(late, null, "past what a routine walk could be, it is judged as before");
+  });
+
+  test("home loop: a row out there that names its place, or no config, is not the walk", () => {
+    const named = VISITS.concat([vr("cafe", "22:40:00", "22:42:00", 500, 80, 10, "user-confirmed")]);
+    assert.equal(homeLoopVerdict({ ...W, fixes: FIXES, visits: named, now: Date.parse(z("23:30:00")) }), null);
+    assert.equal(homeLoopVerdict({ ...W, cfg: null, fixes: FIXES, visits: VISITS }), null);
+    const driven = FIXES.map(f => f.activity === "walking" ? { ...f, activity: "driving" } : f);
+    assert.equal(homeLoopVerdict({ ...W, fixes: driven, visits: VISITS, now: Date.parse(z("23:30:00")) }), null);
+  });
+}

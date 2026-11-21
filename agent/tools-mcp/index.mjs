@@ -39,7 +39,14 @@ import { localLlmEmbed } from "../../lib/local-llm.mjs";
 // ticker fires only wakes whose session_id matches its Agent's id, "chat").
 import { checkLater } from "../core/check-later.mjs";
 import { requestFork, listForks, MAX_INFLIGHT_FORKS } from "../core/fork-queue.mjs";
-const AGENT_ID = process.env.JORI_AGENT_ID || "chat";
+// No default: a session whose MCP config names no agent (the ops tier, a role
+// session, a chat-build, any ephemeral run on the ops-agent config) used to be
+// filed as "chat", so its background tasks ran under the chat agent and their
+// answers went to the chat agent, never back to the session that asked
+// (2026-11-18: the travel manager's car pricing reached the chief of staff).
+const AGENT_ID = process.env.JORI_AGENT_ID || "unscoped";
+// Self-wakes and forks only where the chat supervisor drains them (profiles.mjs).
+const LOOP_TOOLS_SERVED = servesLoopTools(AGENT_ID);
 // WP11 self-improvement (gated). tools-mcp SERVES owner-approved ext/ modules as
 // real tools; the chat agent (only) can PROPOSE new ones — which stay staged and
 // inert until the user approves out-of-band via `bin/self-improve`.
@@ -50,6 +57,7 @@ import { createToolRegistry } from "../core/tool-registry.mjs";
 import { createPluginLoader } from "../plugins/loader.mjs";
 import * as siStore from "../core/message-store.mjs";
 import { installRoot, installTools } from "../../lib/root.cjs";
+import { resolveProfile, allowsTool, callRefusal, LOOP_TOOLS, servesLoopTools } from "./profiles.mjs";
 
 const exec = promisify(execFile);
 const BIN = installTools("bin");
@@ -57,6 +65,10 @@ const BIN = installTools("bin");
 // Who this installation serves (lib/instance.cjs): tool descriptions
 // name the operator as `OWNER` ("the user" in a fresh install).
 const { instance, localConfig, localDir } = require("../../lib/instance.cjs");
+// Secrets come from .env, not from the agent that started this server: the
+// supervisors hand claude a minimal environment (lib/agent-env.cjs), and the
+// CLIs run() starts (gog, homectl, imsg, …) inherit this process's env.
+require("../../lib/load-env.js").loadEnv();
 const ASSISTANT = require("../../lib/instance.cjs").assistantName(); // the assistant's configured name (lib/instance.cjs)
 const INSTANCE = instance();
 const OWNER = INSTANCE.owner_name;
@@ -72,7 +84,19 @@ const TEXT = localConfig("tools-mcp", {
   episode_assoc_question: "which lunch did <friend> come to",
 });
 
+// What a failed command returns. One the wrapper killed at its timeout used to
+// come back as the bare "Command failed: …", which reads like the command
+// itself broke; say it timed out, and after how long.
+function describeExecError(err, timeoutMs) {
+  if (err && err.killed && (err.signal === "SIGTERM" || err.signal == null) && timeoutMs) {
+    const said = String(err.stderr || "").trim();
+    return `timed out after ${Math.round(timeoutMs / 1000)}s${said ? `: ${said}` : ""}`;
+  }
+  return String((err && (err.stderr || err.message)) ?? err);
+}
+
 async function run(cmd, args = [], opts = {}) {
+  const timeoutMs = opts.timeout ?? 30000;
   try {
     const { env: optsEnv, ...restOpts } = opts;
     const { stdout, stderr } = await exec(cmd, args, {
@@ -86,7 +110,7 @@ async function run(cmd, args = [], opts = {}) {
     });
     return (stdout || stderr || "Done").trim();
   } catch (err) {
-    return `Error: ${err.stderr || err.message}`;
+    return `Error: ${describeExecError(err, timeoutMs)}`;
   }
 }
 
@@ -96,6 +120,9 @@ async function run(cmd, args = [], opts = {}) {
 const DEFAULT_INSTRUCTIONS = `${ASSISTANT}'s built-in tools. Keep responses short — ${OWNER} is usually on the phone.
 
 ## Quick Reference
+
+### Your own state
+- self_status — what ${ASSISTANT} is doing right now: dispatches, purchases + approvals, builds, background jobs, failing jobs, what waits on ${OWNER}, and what you last told ${OWNER}. Read it before saying anything about your own work.
 
 ### Loop primitives
 - check_later — one-shot self-wake after N seconds (survives a restart)
@@ -208,6 +235,31 @@ const TOOLS = [
         const tail = r.status === "failed" ? ` — ${r.error || "unknown error"}` : "";
         return `#${r.id} [${r.status}] ${String(r.task).slice(0, 90)}${tail}  (${when})`;
       }).join("\n");
+    },
+  },
+
+  // ── Self-awareness: what Jori is doing right now (lib/self-status.mjs) ──
+  {
+    name: "self_status",
+    description: "What " + ASSISTANT + " is doing right now and how it is going, from live state: dispatches in flight and recent, purchases and their Face-ID approvals, builds, background jobs, failing scheduled jobs, open questions and approvals waiting on " + OWNER + ", and what you last told " + OWNER + " (with `match`: the last 7 days of your messages containing it). Each item has its raw status and age. Call it BEFORE saying anything about the state of your own work (is it done, being built, waiting, why it stopped); never answer that from memory or a guess. `match` narrows to items containing that text (an id, a site, a job name).",
+    schema: {
+      type: "object",
+      properties: {
+        match: { type: "string", description: "keep only items whose id/description/state contains this text (case-insensitive)" },
+        section: { type: "string", description: "comma-separated subset: dispatches,forks,purchases,builds,jobs,cron,questions,approvals,roles,watches,said,doctor" },
+        deep: { type: "boolean", description: "also run the full health checks (jori doctor, ~10 s)" },
+        json: { type: "boolean", description: "the full JSON instead of the compact text" },
+      },
+    },
+    run: async (a) => {
+      try {
+        const SS = await import("../../lib/self-status.mjs");
+        const sections = String(a.section || "").split(",").map((x) => x.trim()).filter((x) => SS.SECTIONS.includes(x));
+        const snap = await SS.collect({ match: a.match || null, sections, deep: !!a.deep || sections.includes("doctor") });
+        if (a.json) return JSON.stringify(snap, null, 2);
+        let tz; try { tz = require("../../lib/instance.cjs").instanceValue("tz") || undefined; } catch {}
+        return SS.render(snap, { tz });
+      } catch (e) { return `Error: could not read Jori's state: ${e.message}. Say you could not check, rather than guessing.`; }
     },
   },
 
@@ -913,8 +965,19 @@ if (process.env.JORI_AGENT_ID === "chat") {
   );
 }
 
+// Tool profile (JORI_TOOL_PROFILE, set per launcher in its MCP config):
+// list and serve only that profile's tools (profiles.mjs,
+// agent/config/tool-profiles.json).
+if (!LOOP_TOOLS_SERVED) {
+  for (let i = TOOLS.length - 1; i >= 0; i--) if (LOOP_TOOLS.has(TOOLS[i].name)) TOOLS.splice(i, 1);
+}
+
+const PROFILE = resolveProfile(process.env.JORI_TOOL_PROFILE);
+if (PROFILE.warning) console.error(`[tools-mcp] ${PROFILE.warning}`);
+else console.error(`[tools-mcp] tool profile "${PROFILE.name}": ${TOOLS.filter((t) => allowsTool(PROFILE.profile, t.name)).length} of ${TOOLS.length} tools`);
+
 mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
-  tools: TOOLS.map((t) => ({
+  tools: TOOLS.filter((t) => allowsTool(PROFILE.profile, t.name)).map((t) => ({
     name: t.name,
     description: t.description,
     inputSchema: t.schema,
@@ -926,6 +989,8 @@ mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
   if (!tool) {
     return { content: [{ type: "text", text: `Unknown tool: ${request.params.name}` }], isError: true };
   }
+  const refused = callRefusal(PROFILE.name, PROFILE.profile, tool.name, request.params.arguments || {});
+  if (refused) return { content: [{ type: "text", text: refused }], isError: true };
   const result = await tool.run(request.params.arguments || {});
   return { content: [{ type: "text", text: result }] };
 });

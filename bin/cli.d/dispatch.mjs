@@ -7,6 +7,11 @@
 // (:9082), opus / unknown / a Chrome job to ops (:9092); an unhealthy tier
 // degrades upward. The supervisor loads agent/ops-agent/jobs/<job>.md (or the
 // installation's jobs/_ext/<job>.md) plus agent/local/jobs/<job>.md.
+//
+// With no job, `--task T` posts a free-text task to ops (:9092), the shape a
+// playbook used to build with `curl` and `cat secrets/webhook-token` — which
+// an agent may no longer read itself (docs/agent-secrets.md § 2). `--source S`
+// names the dispatch source (default: the job's name, or jori-cli for a free-text task).
 
 import fs from "node:fs";
 import path from "node:path";
@@ -64,12 +69,20 @@ function jobFiles() {
 
 export default {
   summary: "POST a job to its tier's supervisor webhook (no args: list jobs)",
-  usage: "dispatch <job> [--task T]",
+  usage: "dispatch <job> [--task T] [--reply-to CONV] [--source S] | dispatch --task T [--source S]",
   async run(args, ctx) {
     const { c, die, getFlag, hasFlag } = ctx;
-    const job = args.find((a, i) => !a.startsWith("--") && args[i - 1] !== "--task" && args[i - 1] !== "--port");
-    if (!job || isHelp(args)) {
-      console.log("Usage: jori dispatch <job> [--task \"extra instructions\"] [--port N] [--dry-run]");
+    const job = args.find((a, i) => !a.startsWith("--") && !["--task", "--port", "--source", "--reply-to"].includes(args[i - 1]));
+    // --reply-to <conversation>: the job answers in the conversation that asked
+    // (lib/reply-to.cjs), not in the one of the role that owns it.
+    let task = getFlag(args, "--task");
+    if (args.includes("--reply-to")) {
+      try { task = require("../../lib/reply-to.cjs").withReplyTo(task, getFlag(args, "--reply-to")); }
+      catch (e) { die(e.message); }
+    }
+    if ((!job && !task) || isHelp(args)) {
+      console.log("Usage: jori dispatch <job> [--task \"extra instructions\"] [--reply-to <conversation>] [--source S] [--port N] [--dry-run]");
+      console.log("       jori dispatch --task \"what to do\" [--source S]   # a free-text task, to ops");
       console.log("       jori dispatch            # list dispatchable jobs");
       if (!job && !isHelp(args)) {
         const files = jobFiles();
@@ -80,9 +93,12 @@ export default {
       }
       return;
     }
-    const task = getFlag(args, "--task");
-    const payload = JSON.stringify({ job, source: "jori-cli", ...(task ? { task } : {}) });
-    let chain = TIERS[resolveTier(job)];
+    // The job's own name labels the dispatch in the supervisor's log and
+    // /health (what self-status reports), as the cron triggers do; "jori-cli"
+    // only for a free-text task.
+    const source = getFlag(args, "--source") || job || "jori-cli";
+    const payload = JSON.stringify({ ...(job ? { job } : {}), source, ...(task ? { task } : {}) });
+    let chain = job ? TIERS[resolveTier(job)] : TIERS.heavy;
     const portFlag = getFlag(args, "--port");
     if (portFlag) chain = [["(--port)", Number(portFlag), null]];
 
@@ -110,7 +126,7 @@ export default {
         body: payload,
       });
     } catch (e) { die(`dispatch failed: ${e.message}`); }
-    if (res.ok) console.log(c.green("✓") + ` dispatched ${c.bold(job)} to ${target[0]} (HTTP ${res.status})`);
+    if (res.ok) console.log(c.green("✓") + ` dispatched ${c.bold(job || "task")} to ${target[0]} (HTTP ${res.status})`);
     else die(`dispatch failed: HTTP ${res.status} from ${target[0]} (:${target[1]})`);
   },
 };

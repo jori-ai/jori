@@ -1,4 +1,4 @@
-# Sales Ops (role plugin)
+# Sales (role plugin)
 
 Pipeline, renewals and the CRM, kept honest.
 

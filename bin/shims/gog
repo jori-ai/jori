@@ -1,0 +1,28 @@
+#!/bin/bash
+# gog shim — run gog (Google Workspace CLI) with its keyring password read from
+# the installation's .env in THIS process, so the agents' environment never
+# holds it (lib/agent-env.cjs drops GOG_KEYRING_PASSWORD and puts this
+# directory first on PATH and in GOG_BIN for locked-down agents).
+#
+# gog reads the password for its file keyring only from GOG_KEYRING_PASSWORD;
+# it has no file option. A caller that already has it (cron and launchd jobs
+# source .env) passes straight through. Design: docs/agent-secrets.md § 1.
+set -u
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+. "$SELF_DIR/../../agent/scripts/lib/root.sh"   # JORI_INSTALL
+
+REAL="${GOG_REAL:-}"
+if [ -z "$REAL" ]; then
+  for c in /opt/homebrew/bin/gog /usr/local/bin/gog; do [ -x "$c" ] && { REAL="$c"; break; }; done
+fi
+if [ -z "$REAL" ]; then
+  IFS=:; for d in $PATH; do [ "$d" = "$SELF_DIR" ] && continue; [ -x "$d/gog" ] && { REAL="$d/gog"; break; }; done; unset IFS
+fi
+[ -n "$REAL" ] || { echo "gog shim: no gog binary found" >&2; exit 127; }
+
+if [ -z "${GOG_KEYRING_PASSWORD:-}" ] && [ -f "$JORI_INSTALL/.env" ]; then
+  v="$(sed -n 's/^GOG_KEYRING_PASSWORD=//p' "$JORI_INSTALL/.env" | tail -1)"
+  v="${v%\"}"; v="${v#\"}"; v="${v%\'}"; v="${v#\'}"
+  [ -n "$v" ] && export GOG_KEYRING_PASSWORD="$v"
+fi
+exec "$REAL" "$@"

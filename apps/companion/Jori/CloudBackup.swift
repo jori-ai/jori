@@ -7,6 +7,10 @@ final class CloudBackup {
     private let backupKey = "chat_backup"
     private let backupDateKey = "chat_backup_date"
 
+    /// The newest messages kept. iCloud key-value storage caps a value at
+    /// 1 MB; a fuller conversation was silently refused.
+    static let maxMessages = 200
+
     private init() {}
 
     func backup(messages: [Message]) {

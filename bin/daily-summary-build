@@ -44,7 +44,7 @@ const fs = require("fs");
 const path = require("path");
 const { spawnSync } = require("child_process");
 const { buildManifest, buildSkeleton, assemble, photosNotShown, attachNearMissEvents, _internal: { isMainStop } } = require("../lib/daily-summary-render.js");
-const { selectStandouts } = require("../lib/daily-summary-transactions.js");
+const { selectStandouts, chargesOfDay } = require("../lib/daily-summary-transactions.js");
 const { linkStandoutsToStops, placesBesidePhotos } = require("../lib/standout-stop-link.js");
 const { settleDay } = require("../lib/daily-summary-day.js");
 const { fetchCompletedTasks, localizeTasksToStops } = require("../lib/daily-summary-tasks.js");
@@ -136,7 +136,10 @@ function renderStopPhotos(stop) {
 
 // Fetch the day's standout purchases from plaid_transactions. Matches on either
 // the posted `date` or the `authorized_date` (in-person charges post a day or
-// two late but authorize same-day). READ-ONLY, service-role REST. Fail-open:
+// two late but authorize same-day), then keeps only the rows whose purchase day
+// IS the day (chargesOfDay: authorization date, else posted date) — a row that
+// merely POSTED today for something bought yesterday is yesterday's, and used to
+// print as today's purchase and name a stop. READ-ONLY, service-role REST. Fail-open:
 // any error (Plaid not configured, DB unreachable, no rows) yields no standouts
 // and the spine still builds. BANK-DATA: jori-model-only — these rows feed
 // the self-addressed daily-summary email per the rule-5 carve-out; never relay
@@ -147,7 +150,7 @@ async function fetchTxnRows(date) {
     const rows = await request(
       `/rest/v1/plaid_transactions?select=${cols}&or=(date.eq.${date},authorized_date.eq.${date})&order=amount.desc&limit=500`
     );
-    return Array.isArray(rows) ? rows : [];
+    return Array.isArray(rows) ? chargesOfDay(rows, date) : [];
   } catch (e) {
     process.stderr.write(`[daily-summary-build] transaction fetch skipped: ${(e && e.message) || e}\n`);
     return [];
@@ -296,6 +299,28 @@ async function attachDecisions(date, resolved) {
   if (!Array.isArray(resolved.decisions)) resolved.decisions = [];
 }
 
+// Messages the speak gate held for the daily summary (verdict `digest`,
+// system/speak-gate.md § Live): printed in their own section, verbatim, after
+// Decisions — every one not yet printed that was held before this day ended,
+// plus those already printed in THIS day's summary (a re-render keeps them).
+// They are marked printed when the day is published. Email only: the wiki day
+// page does not carry them (they can quote money or health). A failed read
+// keeps what an earlier settling had and says so.
+async function attachHeldDigests(date, resolved) {
+  try {
+    const { heldDigests } = await import(require("url").pathToFileURL(path.join(__dirname, "..", "lib", "speak-gate-live.mjs")).href);
+    const w = dayWindowOf(date, boundaryTzOf(resolved));
+    let names = new Map();
+    try { names = new Map(require("../lib/org.cjs").org().roles.map((r) => [r.id, `${r.name} (${r.title})`])); } catch {}
+    resolved.held_digests = (await heldDigests(date, w.end)).map((r) => ({ ...r, from: names.get(r.sender) || null }));
+    delete resolved.held_digests_error;
+  } catch (e) {
+    resolved.held_digests = Array.isArray(resolved.held_digests) ? resolved.held_digests : [];
+    resolved.held_digests_error = String((e && e.message) || e).split("\n")[0].slice(0, 200);
+    process.stderr.write(`[daily-summary-build] held messages read failed: ${resolved.held_digests_error}\n`);
+  }
+}
+
 // prep — settle the JSON. NO HTML: photos aren't rendered and no skeleton is
 // written, so a re-prep after vetting costs nothing but the settle loop: the day
 // is settled as JSON, in as many passes as it takes, and only then formatted.
@@ -355,6 +380,7 @@ async function cmdPrep(date, resolvedOverride, confirmedPath, freshHarvest = fal
   }
   await attachCalls(date, resolved);
   await attachDecisions(date, resolved);
+  await attachHeldDigests(date, resolved);
   // A place-less event that missed every stop by minutes is the stop the person it
   // names joined the user at ("Pick up Sam"; attachNearMissEvents).
   const nearMiss = attachNearMissEvents(resolved);
@@ -579,6 +605,17 @@ async function cmdPublish(date, prosePath, force = false) {
   await request(`/rest/v1/daily_summaries?on_conflict=date`, {
     method: "POST", body, prefer: "resolution=merge-duplicates,return=minimal",
   });
+  // The held messages this summary printed are now delivered: mark them, so
+  // the next day's summary does not print them again.
+  const heldIds = (day.held_digests || []).map((h) => h.id).filter(Boolean);
+  if (heldIds.length) {
+    try {
+      const { markDigested } = await import(require("url").pathToFileURL(path.join(__dirname, "..", "lib", "speak-gate-live.mjs")).href);
+      await markDigested(heldIds, date);
+    } catch (e) {
+      process.stderr.write(`[daily-summary-build] held messages not marked printed: ${(e && e.message) || e}\n`);
+    }
+  }
   const photos = (day.stops || []).reduce((t, s) => t + (s.photo_urls || []).length, 0);
   process.stdout.write(JSON.stringify({ date, stops: (day.stops || []).length, photos,
                                         prose_slots: Object.keys(prose.prose || {}).length }) + "\n");
@@ -642,6 +679,15 @@ async function cmdConfirmVenue(date, stopId, name, source, resolvedOverride) {
   const resolved = loadResolved(date, resolvedOverride);
   const stop = (resolved.stops || []).find(s => s.id === stopId);
   if (!stop) die(`confirm-venue: stop ${stopId} not found in resolved day ${date}`);
+  // A span the phone never saw (resolve-day's moved_place_unknown) has no row of its
+  // own: the rows under it are the place it was cut FROM, so naming them would
+  // rename that place. The answer is a place named for a window.
+  if (stop.moved_place_unknown) {
+    die(`confirm-venue: stop ${stopId} is a span the phone never saw (place unknown, cut from `
+      + `${stop.moved_place_unknown.from_place}); record the answer with: location-confirm save-at "<place>" `
+      + `--lat <the place's lat> --lon <the place's lon> --start ${new Date(stop.start_ts_ms).toISOString()} `
+      + `--end ${new Date(stop.end_ts_ms).toISOString()} (or the window the user named)`);
+  }
   if (stop.lat == null || stop.lon == null) die(`confirm-venue: stop ${stopId} has no centroid`);
   // ± a 30-min window around the stop covers the visit row whose arrived_at lags
   // the first GPS sample slightly.

@@ -24,9 +24,11 @@ if [ -f "$REPO/data/.segment-ask-off" ]; then
   exit 0
 fi
 
-# 2. Quiet window. The user's timezone is whatever the phone last reported;
-#    fall back to the home zone rather than guessing UTC, which could put the
-#    quiet window in the middle of the afternoon.
+# 2. Not while the user is asleep: decided from sleep data and the phone's
+#    lock/unlock rows (bin/sleep-night --gate), never the clock; awake means an
+#    ask at any hour. 23:00-09:00 is the fallback whenever there is
+#    no usable sleep signal (sensing off, no recent phone rows, stale), in the zone the phone last reported (else the home zone
+#    rather than UTC, which could put it in the middle of the afternoon).
 TZNAME=$(TZ_FILE="$REPO/data/user-timezone.json" HOME_TZ="${JORI_TZ:-UTC}" python3 - <<'PY'
 import json, os
 try:
@@ -36,9 +38,8 @@ except Exception:
     print(os.environ["HOME_TZ"])
 PY
 )
-HOUR=$(TZ="$TZNAME" date +%H)
-if [ "$HOUR" -lt 9 ] || [ "$HOUR" -ge 23 ]; then
-  echo "[segment-ask] quiet window ($HOUR:00 $TZNAME) — not asking"
+if SLEEP_GATE=$("${JORI_NODE:-node}" "$(dirname "$0")/../../bin/sleep-night" --gate --fallback 23-9 --tz "$TZNAME" 2>/dev/null); then
+  echo "[segment-ask] asleep ($SLEEP_GATE) — not asking"
   exit 0
 fi
 

@@ -21,10 +21,16 @@
 // paced — and it STOPS on a bot challenge rather than hardening the block.
 //
 // AUTH. The automation Chrome keeps its own profile, separate from the one the
-// user browses with, so it needs its own Amazon login done once by hand. This
-// tool never types a password and never logs itself in: on a sign-in wall it
-// stops and says so. An automated Amazon login means CAPTCHA and OTP, and a
-// locked account is a much worse outcome than a stale ledger.
+// user browses with. When Amazon has signed it out, the run signs it back in
+// once with the user's saved login through bin/site-login (the standing rule
+// for every job: log in automatically; credentials go from the password store
+// straight into the page, never through this process). One attempt per run,
+// never a retry loop: a locked account is a much worse outcome than a stale
+// ledger. Only two outcomes reach the user: the saved login did not work (ask
+// for the right one), or something else blocked it (a robot check, a one-time
+// code, no sign-in form), named so a way around it can be found. This used to
+// stop and ask for a sign-in by hand ("Sign it in once by hand"), which the
+// rule retired.
 //
 // OFF without the amazon.com browsing skill (browsing-skills/skills/amazon.com/
 // references/order-details.md — the page's selectors live there, private to
@@ -37,7 +43,8 @@
 //   amazon-order-detail --limit 20          cap one run (default 25)
 //   amazon-order-detail --only <id,...>     just these order numbers, any age
 //   amazon-order-detail --rescan            re-read orders already fetched
-//   amazon-order-detail --dry-run           fetch + print, write nothing
+//   amazon-order-detail --dry-run           fetch + print, write nothing (never signs in)
+//   amazon-order-detail --retry-signin      try the sign-in even inside the 3-day backoff
 //   amazon-order-detail --json              machine-readable summary
 
 import fs from "node:fs";
@@ -47,10 +54,21 @@ import { connect } from "../lib/cdp.mjs";
 import { port } from "../lib/ports.cjs";
 import supa from "../lib/supabase-rest.js";
 import rootLib from "../lib/root.cjs";
+import instanceLib from "../lib/instance.cjs";
 const { request } = supa;
 const { installRoot, installTools } = rootLib;
+const { instance } = instanceLib;
 
 const SKILL = path.join(installRoot(), "browsing-skills/skills/amazon.com/references/order-details.md");
+
+// Where bin/site-login signs in, and the page it checks afterwards: the order
+// history only loads for a signed-in session.
+const SIGNIN_URL =
+  "https://www.amazon.com/ap/signin?openid.pape.max_auth_age=0&openid.return_to=https%3A%2F%2Fwww.amazon.com%2F" +
+  "&openid.identity=http%3A%2F%2Fspecs.openid.net%2Fauth%2F2.0%2Fidentifier_select&openid.assoc_handle=usflex" +
+  "&openid.mode=checkid_setup&openid.claimed_id=http%3A%2F%2Fspecs.openid.net%2Fauth%2F2.0%2Fidentifier_select" +
+  "&openid.ns=http%3A%2F%2Fspecs.openid.net%2Fauth%2F2.0";
+const SIGNED_IN_CHECK_URL = "https://www.amazon.com/gp/css/order-history";
 
 const ARGV = process.argv.slice(2);
 const FLAGS = new Set(ARGV.filter((a) => a.startsWith("--")));
@@ -137,16 +155,149 @@ function alert(message, observedError) {
   }
 }
 
-function alertHuman(status, receipt) {
-  alert(
-    status === "login_required"
-      ? "amazon-order-detail stopped: the automation Chrome is signed out of Amazon. " +
-          "Sign it in once by hand (profile ~/.cache/chrome-devtools-mcp/chrome-profile) — " +
-          "receipts will keep saying \"1 Electronics item\" until then."
-      : "amazon-order-detail stopped: Amazon showed a bot challenge. Left alone deliberately; " +
-          "re-run later rather than hammering it.",
-    `order-details returned status="${status}" for order ${receipt.order_id}`
-  );
+/**
+ * How long a refused or blocked sign-in keeps the next runs from trying again.
+ * A daily run that retried a refused password would be how an Amazon account
+ * gets locked, which costs far more than a stale ledger. `--retry-signin`
+ * lifts it for one run, e.g. right after the saved login was corrected.
+ * no_credentials and error are not here: nothing was typed into Amazon, so
+ * there is nothing to protect and the next run simply tries again.
+ */
+const BACKOFF_MS = 3 * 86400000;
+const BACKOFF_STATUSES = new Set(["bad_credentials", "captcha", "needs_2fa", "no_login_form", "still_signed_out"]);
+const CHROME_PORT = String(port("chrome_cdp"));
+const LOGIN_LOG = path.join(installRoot(), "data", "site-login-log.jsonl"); // the file bin/site-login appends to
+
+/**
+ * The newest site-login attempt on amazon.com in THIS Chrome (its port: the
+ * shop Chrome signs in to Amazon too, and its outcome says nothing about this
+ * profile), when it was a refusal or a blocker inside the backoff window; null
+ * when a sign-in may be tried.
+ */
+function recentRefusal() {
+  if (FLAGS.has("--retry-signin")) return null;
+  let rows;
+  try {
+    rows = fs.readFileSync(LOGIN_LOG, "utf8").trim().split("\n");
+  } catch {
+    return null; // no log yet: nothing has been tried
+  }
+  for (let i = rows.length - 1; i >= 0; i--) {
+    let row;
+    try { row = JSON.parse(rows[i]); } catch { continue; }
+    if (!row || row.site !== "amazon.com" || String(row.port) !== CHROME_PORT) continue;
+    const at = Date.parse(row.ts);
+    if (Number.isNaN(at)) continue;
+    const age = Date.now() - at;
+    return BACKOFF_STATUSES.has(row.status) && age >= 0 && age < BACKOFF_MS ? row : null;
+  }
+  return null;
+}
+
+/** Write an outcome into the same log site-login uses, so the backoff sees it. */
+function recordLogin(status, detail) {
+  try {
+    fs.appendFileSync(LOGIN_LOG, JSON.stringify({ ts: new Date().toISOString(), site: "amazon.com", port: CHROME_PORT, status, detail }) + "\n");
+  } catch {
+    /* only a courtesy to the backoff: without it the next run may try once more */
+  }
+}
+
+const shortDate = (ms) =>
+  new Date(ms).toLocaleDateString("en-US", { month: "short", day: "numeric", timeZone: instance().tz });
+
+/**
+ * Sign the automation Chrome back in to Amazon, once, with the saved login.
+ * site-login prints one JSON line {site, status, detail} (never a credential)
+ * and exits non-zero for every outcome that is not a sign-in, so the line is
+ * read from stdout either way.
+ *
+ * site-login reads the login through site-pass/dev-pass, which call `op` by
+ * name. Cron's PATH (and cron-run's, which adds only node's own directory)
+ * does not have it, and without it the read fails and looks like "no saved
+ * login": a false ask for credentials. So the Homebrew directories are
+ * appended here, after whatever PATH the run already has.
+ */
+function signIn() {
+  const args = ["amazon.com", "--login-url", SIGNIN_URL, "--check-url", SIGNED_IN_CHECK_URL, "--port", CHROME_PORT];
+  const env = { ...process.env, PATH: [process.env.PATH, "/opt/homebrew/bin", "/usr/local/bin"].filter(Boolean).join(":") };
+  const done = (r) => ({ ...r, at: new Date().toISOString() });
+  let out = "";
+  try {
+    out = execFileSync(installTools("bin", "site-login"), args,
+      { encoding: "utf8", timeout: 240000, env, stdio: ["ignore", "pipe", "pipe"] });
+  } catch (e) {
+    out = e && e.stdout ? String(e.stdout) : "";
+    if (!out.trim()) return done({ site: "amazon.com", status: "error", detail: String((e && e.message) || e).slice(0, 200) });
+  }
+  try {
+    return done(JSON.parse(out.trim().split("\n").pop()));
+  } catch {
+    return done({ site: "amazon.com", status: "error", detail: `unreadable site-login output: ${out.slice(0, 120)}` });
+  }
+}
+
+const SIGNED_IN = new Set(["signed_in", "already_signed_in"]);
+
+/** Plain words for why the automatic sign-in did not get the profile back in. */
+function signInBlocker(result) {
+  switch (result && result.status) {
+    case "captcha": return "Amazon put a robot check on the sign-in form";
+    case "needs_2fa": return "Amazon asked for a one-time code";
+    case "no_login_form": return "it could not find Amazon's sign-in form";
+    case "still_signed_out": return "the login went in without an error but Amazon still shows it signed out";
+    case "denylisted": return "Amazon is on the list of sites that are never signed in automatically";
+    case "signed_in":
+    case "already_signed_in": return "it signed in, but Amazon signed it out again during the run";
+    default: return `the sign-in tool stopped with "${(result && result.status) || "no answer"}"`;
+  }
+}
+
+function alertHuman(status, receipt, signInResult) {
+  const observed =
+    `order-details returned status="${status}" for order ${receipt.order_id}` +
+    (signInResult ? `; site-login: ${JSON.stringify({ status: signInResult.status, detail: signInResult.detail })}` : "");
+  if (status !== "login_required") {
+    alert(
+      "amazon-order-detail stopped: Amazon showed a bot challenge. Left alone deliberately; " +
+        "re-run later rather than hammering it.",
+      observed
+    );
+    return;
+  }
+  const st = signInResult && signInResult.status;
+  const tail = "Receipts keep saying \"1 Electronics item\" until it is back in.";
+  // The attempt's own date and the retry date are the same on every day of a
+  // backoff, so the text stays identical and the system channel's repeat
+  // filter treats it as one condition.
+  const tried = signInResult && signInResult.at ? shortDate(Date.parse(signInResult.at)) : "today";
+  const retry = signInResult && signInResult.at ? shortDate(Date.parse(signInResult.at) + BACKOFF_MS) : "";
+  let message;
+  if (st === "no_credentials") {
+    // A missing saved login and a password store that did not answer (a
+    // network or 1Password hiccup) read the same to site-login, so the words
+    // do not claim which one it is. Nothing reached Amazon.
+    message =
+      "amazon-order-detail is signed out of Amazon and could not read a saved Amazon login " +
+      "(none is saved, or the password store did not answer). It tries again on the next run. " + tail;
+  } else if (st === "error") {
+    // The sign-in tool itself failed (Chrome or a page failed, a timeout, an
+    // unreadable answer): no claim about the login. The detail is in the quote.
+    message =
+      "amazon-order-detail is signed out of Amazon and the sign-in tool failed before it could finish " +
+      "(the detail is attached). It tries again on the next run. " + tail;
+  } else if (st === "bad_credentials") {
+    message =
+      `amazon-order-detail is signed out of Amazon and the saved Amazon login was refused on ${tried}. ` +
+      `Send the right one: it signs itself in on the first run after ${retry}, or sooner if you ask for a retry ` +
+      "(it does not retry a refused login in between, so the account is not put at risk of a lockout). " + tail;
+  } else {
+    message =
+      `amazon-order-detail is signed out of Amazon and its sign-in attempt on ${tried} did not get back in: ` +
+      `${signInBlocker(signInResult)}.` +
+      (BACKOFF_STATUSES.has(st) ? ` It does not try again before ${retry}, so a refused login is not retried into a lockout.` : "") + " " + tail;
+  }
+  alert(message, observed);
 }
 
 /**
@@ -257,7 +408,7 @@ async function main() {
     process.exit(2);
   }
 
-  const summary = { considered: rows.length, filled: 0, items: 0, skipped: [], stoppedOn: null };
+  const summary = { considered: rows.length, filled: 0, items: 0, skipped: [], stoppedOn: null, signIn: null };
 
   for (const [index, receipt] of rows.entries()) {
     if (index > 0) await sleep(DELAY_MS);
@@ -272,11 +423,48 @@ async function main() {
       continue;
     }
 
-    // Stop rather than grind. Once the profile is challenged or signed out,
-    // every further load makes it worse and none of them can succeed.
+    // Signed out: sign back in once with the saved login, then read this
+    // order again. Never a second attempt in the same run, never within the
+    // backoff of a refused or blocked one, and never on a dry run (it types
+    // the real password and can make Amazon send a code, with the alert off).
+    if (detail.status === "login_required" && !summary.signIn && !DRY_RUN) {
+      const refused = recentRefusal();
+      if (refused) {
+        summary.signIn = { site: "amazon.com", status: refused.status, detail: refused.detail, backedOff: true, at: refused.ts };
+        log(`  ${receipt.order_id}: signed out of Amazon; not signing in again, the attempt on ${shortDate(Date.parse(refused.ts))} ended "${refused.status}".`);
+      } else {
+        log(`  ${receipt.order_id}: signed out of Amazon — signing back in with the saved login.`);
+        summary.signIn = signIn();
+        log(`  sign-in: ${summary.signIn.status}`);
+      }
+      if (SIGNED_IN.has(summary.signIn.status)) {
+        try {
+          await browser.goto(orderUrl(receipt.order_id));
+          detail = await browser.evaluate(expression);
+        } catch (e) {
+          summary.skipped.push({ orderId: receipt.order_id, reason: e.message.slice(0, 120) });
+          log(`  ${receipt.order_id}: could not read after signing in — ${e.message.slice(0, 90)}`);
+          continue;
+        }
+        // The tool said it was in and the order page still asks for a sign-in:
+        // that is a blocker like any other. Record it, so the next runs back
+        // off instead of typing the real password again every day.
+        if (detail.status === "login_required") {
+          summary.signIn = {
+            site: "amazon.com", status: "still_signed_out", at: new Date().toISOString(),
+            detail: "site-login reported signed in but the order page still asks for a sign-in",
+          };
+          recordLogin(summary.signIn.status, summary.signIn.detail);
+        }
+      }
+    }
+
+    // Stop rather than grind. Once the profile is challenged, or still signed
+    // out after its one sign-in attempt, every further load makes it worse and
+    // none of them can succeed.
     if (detail.status === "login_required" || detail.status === "blocked") {
       summary.stoppedOn = detail.status;
-      if (!DRY_RUN) alertHuman(detail.status, receipt);
+      if (!DRY_RUN) alertHuman(detail.status, receipt, summary.signIn);
       log(
         detail.status === "login_required"
           ? `  ${receipt.order_id}: the automation profile is signed out of Amazon — stopping.`
@@ -322,11 +510,13 @@ async function main() {
         (DRY_RUN ? "  (dry run — nothing written)" : "")
     );
     if (summary.stoppedOn === "login_required") {
+      const st = summary.signIn && summary.signIn.status;
       log(
-        `\n⚠ Sign the automation profile into Amazon, once, by hand:\n` +
-          `    the Chrome on --user-data-dir=~/.cache/chrome-devtools-mcp/chrome-profile\n` +
-          `  Nothing here will log itself in — that path is CAPTCHA and OTP, and a\n` +
-          `  locked account is worse than a stale ledger.`
+        !summary.signIn
+          ? `\n⚠ Signed out of Amazon (dry run: no sign-in was tried).`
+          : st === "bad_credentials" || st === "no_credentials"
+            ? `\n⚠ Signed out of Amazon, and the saved Amazon login ${st === "no_credentials" ? "could not be read" : "was refused"}.`
+            : `\n⚠ Signed out of Amazon and ${summary.signIn.backedOff ? "the earlier sign-in attempt is still inside its backoff" : "the sign-in attempt did not get back in"}: ${signInBlocker(summary.signIn)}.`
       );
     }
     if (summary.stoppedOn === "blocked") {

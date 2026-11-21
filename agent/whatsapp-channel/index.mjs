@@ -10,6 +10,8 @@
 // WebSocket protocol directly). See docs/whatsapp-gateway-setup.md
 // for the pairing flow and TOS notes.
 
+// First: re-exec without the .env in the starting environment (lib/env-isolate.cjs).
+import "../../lib/env-isolate-first.mjs";
 import {
   default as makeWASocket,
   useMultiFileAuthState,
@@ -36,6 +38,7 @@ import { createRequire } from "node:module";
 import { installTools } from "../../lib/root.cjs";
 const require = createRequire(import.meta.url);
 const { loadEnv } = require("../../lib/load-env.js");
+const netTrust = require("../../lib/net-trust.cjs");
 
 loadEnv();
 
@@ -99,8 +102,19 @@ function normalizeJid(to) {
   return `${digits}@s.whatsapp.net`;
 }
 
+// The latest pairing QR WhatsApp offered (GET /qr), cleared once linked.
+const pairing = { qr: null };
+
 function buildHttpServer(socketRef, groupsRef) {
   return createServer(async (req, res) => {
+    // No login on this server, and /send speaks as the user. It binds
+    // 127.0.0.1; the checks below also stop a web page in a browser on this
+    // machine from driving it: a DNS-rebinding page fails the Host check, and
+    // a cross-site POST can't set Content-Type: application/json without a
+    // CORS preflight, which this server never answers.
+    if (!netTrust.isLoopback(req.socket.remoteAddress) || !netTrust.isTrustedHost(req.headers.host)) {
+      res.writeHead(403); res.end("forbidden"); return;
+    }
     const url = new URL(req.url, `http://localhost:${PORT}`);
     if (req.method === "GET" && url.pathname === "/health") {
       const sock = socketRef.current;
@@ -112,6 +126,14 @@ function buildHttpServer(socketRef, groupsRef) {
         host_jid: host,
         host_name: sock?.user?.name || null,
       }));
+      return;
+    }
+    // The pairing QR for the setup page (lib/onboarding/services.mjs): the
+    // latest code WhatsApp offered, until the link is made.
+    if (req.method === "GET" && url.pathname === "/qr") {
+      const sock = socketRef.current;
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ ok: true, paired: !!sock?.user, qr: sock?.user ? null : pairing.qr }));
       return;
     }
     if (req.method === "GET" && url.pathname === "/groups") {
@@ -130,6 +152,9 @@ function buildHttpServer(socketRef, groupsRef) {
       return;
     }
     if (req.method === "POST" && url.pathname === "/send") {
+      if (!String(req.headers["content-type"] || "").toLowerCase().startsWith("application/json")) {
+        res.writeHead(415); res.end("Content-Type must be application/json"); return;
+      }
       const chunks = [];
       let size = 0;
       req.on("data", (c) => { size += c.length; if (size > 64 * 1024) { req.destroy(); return; } chunks.push(c); });
@@ -354,6 +379,8 @@ async function start() {
         // just past it). Fire on the first non-close update.
         maybeRequestPairingCode().catch(() => {});
       }
+      if (qr) pairing.qr = qr;
+      if (connection === "open") pairing.qr = null;
       if (qr && !PAIR_PHONE) {
         log("QR code received — scan with WhatsApp (Settings, Linked Devices, Link a Device):");
         qrcode.generate(qr, { small: true });
@@ -392,7 +419,7 @@ async function start() {
   connect();
 
   const server = buildHttpServer(socketRef, groupsRef);
-  server.listen(PORT, () => log(`HTTP send-server on :${PORT}`));
+  server.listen(PORT, "127.0.0.1", () => log(`HTTP send-server on 127.0.0.1:${PORT}`));
 
   const shutdown = (signal) => {
     log(`${signal} received, shutting down`);

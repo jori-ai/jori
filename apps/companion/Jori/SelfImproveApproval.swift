@@ -2,10 +2,11 @@
 //  SelfImproveApproval.swift
 //  Jori
 //
-//  Owner approval + status feed for Jori's UNIFIED self-improvement flow (WP11
+//  Owner approval + status for Jori's UNIFIED self-improvement flow (WP11
 //  capabilities + the nightly executor's fixes). Every improvement is a row in
-//  `self_improve_approvals` and surfaces as a card in the app's "Improvements"
-//  channel:
+//  `self_improve_approvals`, and its card is a message in the software
+//  engineer's conversation, drawn like a question (ImprovementCardView;
+//  there is no separate Improvements tab since 2026-11-15):
 //    - HIGH-risk changes start as `pending` — the user approves from the card,
 //      which signs a canonical message with a P-256 key held in THIS device's
 //      Secure Enclave (Face ID gated). The signature is written back to Supabase;
@@ -91,6 +92,25 @@ enum SelfImproveApproval {
         /// bytes match the host's to the millisecond. Optional so a malformed row
         /// can't fail-decode the whole feed; approve() requires it.
         let expiresAtMs: Int64?
+        /// What the host recorded about the last apply: why it failed, or what
+        /// it checked to call it running (lib/self-improve-live.mjs).
+        let result: ResultInfo?
+
+        struct ResultInfo: Codable, Equatable {
+            let error: String?
+            let notes: [String]?
+            /// Written and committed, but not running (a plugin left off, a
+            /// schedule not installed, its tests failing).
+            let notLive: Bool?
+            /// Set when its tests fail and the host queued a fix for it (a
+            /// fresh card that, once in, turns this one green).
+            let repairRequest: String?
+            enum CodingKeys: String, CodingKey {
+                case error, notes
+                case notLive = "not_live"
+                case repairRequest = "repair_request"
+            }
+        }
 
         enum CodingKeys: String, CodingKey {
             case id
@@ -104,6 +124,7 @@ enum SelfImproveApproval {
             case skipped
             case chatMessageId = "chat_message_id"
             case expiresAtMs = "expires_at_ms"
+            case result
         }
 
         init(from decoder: Decoder) throws {
@@ -120,11 +141,14 @@ enum SelfImproveApproval {
             skipped = (try c.decodeIfPresent(Bool.self, forKey: .skipped)) ?? false
             chatMessageId = try c.decodeIfPresent(UUID.self, forKey: .chatMessageId)
             expiresAtMs = try c.decodeIfPresent(Int64.self, forKey: .expiresAtMs)
+            // Free-form jsonb: a shape this model doesn't know must not fail the row.
+            result = (try? c.decodeIfPresent(ResultInfo.self, forKey: .result)) ?? nil
         }
 
         init(id: String, itemType: String, summary: String, rationale: String?,
              itemHash: String?, nonce: String?, status: String, risk: String?,
-             skipped: Bool = false, chatMessageId: UUID? = nil, expiresAtMs: Int64?) {
+             skipped: Bool = false, chatMessageId: UUID? = nil, expiresAtMs: Int64?,
+             result: ResultInfo? = nil) {
             self.id = id
             self.itemType = itemType
             self.summary = summary
@@ -136,6 +160,7 @@ enum SelfImproveApproval {
             self.skipped = skipped
             self.chatMessageId = chatMessageId
             self.expiresAtMs = expiresAtMs
+            self.result = result
         }
 
         var isExpired: Bool {
@@ -183,6 +208,11 @@ enum SelfImproveApproval {
         /// without a new signature. `failed` (a signature/authorization miss) is
         /// NOT retryable this way — see SelfImproveApproval.retry().
         var isRetryable: Bool { !skipped && status == "apply_failed" }
+
+        /// Waiting on the owner: a Face ID, or a Retry on a failed apply. These
+        /// sit in the tray at the bottom of the conversation with the open
+        /// questions (ContentView.trayQuestions).
+        var isPending: Bool { needsApproval || isRetryable }
     }
 
     /// The exact byte string the host reconstructs and verifies. MUST match
@@ -202,7 +232,7 @@ enum SelfImproveApproval {
     /// newest first, with pending items floated to the top so action is obvious.
     static func fetchFeed() async throws -> [Improvement] {
         try await SupabaseManager.ensureAuthenticated()
-        let columns = "id,item_type,summary,rationale,item_hash,nonce,status,risk,skipped,chat_message_id,expires_at_ms"
+        let columns = "id,item_type,summary,rationale,item_hash,nonce,status,risk,skipped,chat_message_id,expires_at_ms,result"
         let recent: [Improvement] = try await SupabaseManager.shared
             .from("self_improve_approvals")
             .select(columns)
@@ -362,12 +392,25 @@ enum SelfImproveApproval {
     static func fetchOne(_ id: String) async throws -> Improvement? {
         let rows: [Improvement] = try await SupabaseManager.shared
             .from("self_improve_approvals")
-            .select("id,item_type,summary,rationale,item_hash,nonce,status,risk,skipped,chat_message_id,expires_at_ms")
+            .select("id,item_type,summary,rationale,item_hash,nonce,status,risk,skipped,chat_message_id,expires_at_ms,result")
             .eq("id", value: id)
             .limit(1)
             .execute()
             .value
         return rows.first
+    }
+
+    /// The rows behind the improvement cards in a conversation (each card is a
+    /// message whose metadata names its approval row; see Message.improvementId).
+    static func fetch(ids: [String]) async throws -> [Improvement] {
+        guard !ids.isEmpty else { return [] }
+        try await SupabaseManager.ensureAuthenticated()
+        return try await SupabaseManager.shared
+            .from("self_improve_approvals")
+            .select("id,item_type,summary,rationale,item_hash,nonce,status,risk,skipped,chat_message_id,expires_at_ms,result")
+            .in("id", values: ids)
+            .execute()
+            .value
     }
 
     /// Skip ("we're not implementing this") or un-skip a card.

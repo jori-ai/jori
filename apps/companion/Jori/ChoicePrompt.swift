@@ -29,6 +29,23 @@ struct ChoiceOption: Codable, Identifiable, Equatable {
     let id: String
     let label: String
     var sublabel: String?
+    /// A small photo beside the option: the cover of a place the user has a
+    /// page for (the photo repository, bin/photo-repo place-covers), so "was it
+    /// this one?" can be answered at a glance. Optional and additive.
+    var imageUrl: String?
+    /// The option's stored value. Only read to spot the "none of these"
+    /// button ("No, something else", "Somewhere else", "Type it in").
+    var value: String?
+
+    enum CodingKeys: String, CodingKey {
+        case id, label, sublabel, value
+        case imageUrl = "image_url"
+    }
+
+    /// The "none of these" button (OTHER_VALUE in lib/choice-reply.mjs). A tap
+    /// opens the reply composer on the question instead of sending the label,
+    /// so the answer is typed and threaded to it (the owner, 2026-11-21).
+    var opensReply: Bool { value == "__other__" }
 }
 
 /// What a question is ABOUT — so the user can tell at a glance whether it asks about
@@ -116,9 +133,13 @@ struct ChoicePrompt: Codable, Equatable {
     var header: String?
     var recommendedId: String?
     var freeText: Bool?
+    /// A picture of what is asked about — a place's cover photo on "how was
+    /// it?" — drawn over the question. Optional and additive.
+    var imageUrl: String?
 
     enum CodingKeys: String, CodingKey {
         case v, id, kind, ref, prompt, options, subject, header
+        case imageUrl = "image_url"
         case defaultId = "default_id"
         case expiresAt = "expires_at"
         case recommendedId = "recommended_id"
@@ -134,14 +155,40 @@ struct ChoicePrompt: Codable, Equatable {
     /// Decode from a message's metadata. Returns nil on anything unexpected —
     /// a malformed prompt must not take the message down with it.
     static func from(metadata: [String: String]?) -> ChoicePrompt? {
-        guard let raw = metadata?[metadataKey],
-              let data = raw.data(using: .utf8) else { return nil }
-        // No date strategy: nothing in the payload decodes to a Date any more.
-        guard let p = try? JSONDecoder().decode(ChoicePrompt.self, from: data) else { return nil }
-        // A card with a subject may carry no buttons — the user answers by typing
-        // a reply; the card is there to make plain what is being asked.
-        guard p.v == supportedVersion, !p.options.isEmpty || p.subject != nil else { return nil }
-        return p
+        guard let raw = metadata?[metadataKey] else { return nil }
+        // Asked for every message on every redraw (open-question checks, the
+        // tray, the bubble); decode each distinct payload once.
+        return cache.value(for: raw) {
+            guard let data = raw.data(using: .utf8) else { return nil }
+            // No date strategy: nothing in the payload decodes to a Date any more.
+            guard let p = try? JSONDecoder().decode(ChoicePrompt.self, from: data) else { return nil }
+            // A card with a subject may carry no buttons — the user answers by typing
+            // a reply; the card is there to make plain what is being asked.
+            guard p.v == supportedVersion, !p.options.isEmpty || p.subject != nil else { return nil }
+            return p
+        }
+    }
+
+    private static let cache = DecodeCache<ChoicePrompt>()
+}
+
+/// Remembers the result of decoding a metadata string, nil results included.
+/// Metadata is immutable per string, so a hit is always right. Thread-safe;
+/// NSCache drops entries under memory pressure.
+final class DecodeCache<Value>: @unchecked Sendable {
+    private final class Box { let value: Value?; init(_ v: Value?) { value = v } }
+    private let cache: NSCache<NSString, Box> = {
+        let c = NSCache<NSString, Box>()
+        c.countLimit = 2000
+        return c
+    }()
+
+    func value(for raw: String, decode: () -> Value?) -> Value? {
+        let key = raw as NSString
+        if let hit = cache.object(forKey: key) { return hit.value }
+        let v = decode()
+        cache.setObject(Box(v), forKey: key)
+        return v
     }
 }
 
@@ -161,6 +208,9 @@ struct ChoicePromptView: View {
     /// and a late tap supersedes it. Locking on a default would make being busy
     /// permanent, which is the opposite of what defaulting is for.
     var defaultAppliedLabel: String? = nil
+    /// Minimized in the feed: the question alone, the options hidden until the
+    /// card is tapped (QuestionCollapsedFooter says what a tap does).
+    var collapsed: Bool = false
     let onSelect: (ChoiceOption) -> Void
 
     /// Only THEIR tap closes the question.
@@ -168,8 +218,19 @@ struct ChoicePromptView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
+            if collapsed {
+                if let text = prompt.subject?.question ?? prompt.prompt, !text.isEmpty {
+                    Text(text)
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(.primary)
+                }
+                QuestionCollapsedFooter(answer: answeredLabel ?? defaultAppliedLabel, provisional: answeredLabel == nil)
+            } else {
             if let subject = prompt.subject {
                 SubjectHeader(subject: subject)
+                    .padding(.bottom, 4)
+            } else if let s = prompt.imageUrl, let url = URL(string: s) {
+                CardPhoto(url: url)
                     .padding(.bottom, 4)
             }
             if let text = prompt.subject?.question ?? prompt.prompt, !text.isEmpty {
@@ -189,6 +250,9 @@ struct ChoicePromptView: View {
                     onSelect(option)
                 } label: {
                     HStack(spacing: 8) {
+                        if let s = option.imageUrl, let url = URL(string: s) {
+                            OptionThumb(url: url)
+                        }
                         VStack(alignment: .leading, spacing: 1) {
                             Text(option.label)
                                 .font(.callout.weight(.medium))
@@ -243,9 +307,11 @@ struct ChoicePromptView: View {
                 .opacity(isAnswered && !chosen(option) ? 0.45 : 1.0)
                 .disabled(isAnswered)
             }
+            }
         }
         .padding(.top, 2)
         .animation(.spring(response: 0.32, dampingFraction: 0.8), value: answeredLabel)
+        .animation(.spring(response: 0.32, dampingFraction: 0.85), value: collapsed)
         .sensoryFeedback(.selection, trigger: answeredLabel) { _, new in new != nil }
     }
 
@@ -282,6 +348,9 @@ struct DecisionCardView: View {
     let prompt: ChoicePrompt
     /// Whatever the user replied to the card — a tapped label or their own words.
     let answeredLabel: String?
+    /// Minimized in the feed: header and question, the options hidden until
+    /// the card is tapped.
+    var collapsed: Bool = false
     let onSelect: (ChoiceOption) -> Void
     let onTypeSomething: () -> Void
 
@@ -307,12 +376,18 @@ struct DecisionCardView: View {
                     .padding(.vertical, 4)
                     .background(Capsule().fill(JoriTheme.staff.opacity(0.18)))
             }
+            if !collapsed, let s = prompt.imageUrl, let url = URL(string: s) {
+                CardPhoto(url: url)
+            }
             if let q = prompt.prompt, !q.isEmpty {
                 Text(q)
                     .font(.body.weight(.semibold))
                     .foregroundStyle(.primary)
                     .fixedSize(horizontal: false, vertical: true)
             }
+            if collapsed {
+                QuestionCollapsedFooter(answer: answeredLabel, provisional: false)
+            } else {
             ForEach(Array(ordered.enumerated()), id: \.element.id) { index, option in
                 Button {
                     guard !isAnswered else { return }
@@ -322,7 +397,8 @@ struct DecisionCardView: View {
                         label: option.label,
                         recommended: option.id == prompt.recommendedId,
                         description: option.sublabel,
-                        chosen: chosen(option))
+                        chosen: chosen(option),
+                        imageUrl: option.imageUrl)
                 }
                 .buttonStyle(PressableStyle())
                 .opacity(isAnswered && !chosen(option) ? 0.45 : 1.0)
@@ -345,20 +421,25 @@ struct DecisionCardView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
+            }
         }
         .padding(.top, 2)
         .animation(.spring(response: 0.32, dampingFraction: 0.8), value: answeredLabel)
+        .animation(.spring(response: 0.32, dampingFraction: 0.85), value: collapsed)
         .sensoryFeedback(.selection, trigger: answeredLabel) { _, new in new != nil }
     }
 
     private func row(number: Int, label: String, recommended: Bool, description: String?,
-                     chosen: Bool, systemImage: String? = nil) -> some View {
-        HStack(alignment: .firstTextBaseline, spacing: 10) {
+                     chosen: Bool, systemImage: String? = nil, imageUrl: String? = nil) -> some View {
+        HStack(alignment: imageUrl == nil ? .firstTextBaseline : .center, spacing: 10) {
             Text("\(number)")
                 .font(.caption.monospacedDigit().weight(.bold))
                 .foregroundStyle(recommended && !isAnswered ? JoriTheme.staffInk : Color.secondary)
                 .frame(width: 22, height: 22)
                 .background(Circle().fill(recommended && !isAnswered ? JoriTheme.staff.opacity(0.22) : Color.primary.opacity(0.07)))
+            if let s = imageUrl, let url = URL(string: s) {
+                OptionThumb(url: url)
+            }
             VStack(alignment: .leading, spacing: 2) {
                 HStack(spacing: 4) {
                     if let systemImage {
@@ -403,6 +484,74 @@ struct DecisionCardView: View {
     private func chosen(_ option: ChoiceOption) -> Bool {
         guard let a = answeredLabel else { return false }
         return a.compare(option.label, options: [.caseInsensitive, .diacriticInsensitive]) == .orderedSame
+    }
+}
+
+// MARK: - Photos on a card
+
+/// The picture of what a card asks about (a place's cover), full width over
+/// the question. A failed load leaves a quiet tint, never a broken frame.
+struct CardPhoto: View {
+    let url: URL
+
+    var body: some View {
+        AsyncImage(url: url) { phase in
+            switch phase {
+            case .success(let image): image.resizable().scaledToFill()
+            case .failure: Color.primary.opacity(0.05)
+            default: Color.primary.opacity(0.06).overlay(ProgressView())
+            }
+        }
+        .frame(maxWidth: .infinity)
+        .aspectRatio(16.0 / 9.0, contentMode: .fit)
+        .clipShape(RoundedRectangle(cornerRadius: Radius.row, style: .continuous))
+        .accessibilityHidden(true)
+    }
+}
+
+/// A place's cover beside an option: small, square, rounded.
+struct OptionThumb: View {
+    let url: URL
+    var size: CGFloat = 40
+
+    var body: some View {
+        AsyncImage(url: url) { phase in
+            if let image = phase.image { image.resizable().scaledToFill() } else { Color.primary.opacity(0.07) }
+        }
+        .frame(width: size, height: size)
+        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .accessibilityHidden(true)
+    }
+}
+
+// MARK: - Collapsed footer
+
+/// The last line of a minimized question card in the feed: the answer once
+/// given (the owner, 2026-11-15: "questions should show minimized hiding the
+/// answers so they don't overwhelm the feed. tapping one should focus on it and
+/// show the answers"), or what a tap does while it is still open.
+struct QuestionCollapsedFooter: View {
+    let answer: String?
+    /// A default the server applied, not their own answer: a dotted mark.
+    var provisional = false
+
+    var body: some View {
+        HStack(spacing: 5) {
+            if let answer {
+                Image(systemName: provisional ? "checkmark.circle.dotted" : "checkmark.circle.fill")
+                    .foregroundStyle(provisional ? Color.secondary : Color.accentColor)
+                Text(answer)
+                    .lineLimit(1)
+                    .foregroundStyle(.secondary)
+            } else {
+                Text("Tap to answer")
+                    .foregroundStyle(JoriTheme.staffInk)
+                Image(systemName: "chevron.down")
+                    .foregroundStyle(JoriTheme.staffInk)
+            }
+        }
+        .font(.caption.weight(.semibold))
+        .padding(.top, 2)
     }
 }
 
@@ -529,13 +678,38 @@ struct SubjectStyle {
 /// "Now, since 17:25" / "17:25–18:05, ended 12 min ago" / "Today 17:25–18:05" /
 /// "Yesterday …" / "Mon …". Times are shown in the zone it happened in.
 enum SubjectTime {
-    static func parse(_ s: String?) -> Date? {
-        guard let s else { return nil }
+    // Formatters are built once and reused: creating one opens an ICU
+    // formatter, and these run on the main thread inside a once-a-minute
+    // TimelineView for every card on screen — three new formatters per card
+    // per redraw showed up as ICU frames in main-thread watchdog kills.
+    private static let lock = NSLock()
+    private static let isoFractional: ISO8601DateFormatter = {
         let f = ISO8601DateFormatter()
         f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        if let d = f.date(from: s) { return d }
+        return f
+    }()
+    private static let isoPlain: ISO8601DateFormatter = {
+        let f = ISO8601DateFormatter()
         f.formatOptions = [.withInternetDateTime]
-        return f.date(from: s)
+        return f
+    }()
+    private static var formatters: [String: DateFormatter] = [:]
+
+    private static func formatter(_ format: String, _ tz: TimeZone) -> DateFormatter {
+        lock.lock(); defer { lock.unlock() }
+        let key = "\(format)|\(tz.identifier)"
+        if let f = formatters[key] { return f }
+        let f = DateFormatter()
+        f.timeZone = tz
+        f.dateFormat = format
+        formatters[key] = f
+        return f
+    }
+
+    static func parse(_ s: String?) -> Date? {
+        guard let s else { return nil }
+        lock.lock(); defer { lock.unlock() }
+        return isoFractional.date(from: s) ?? isoPlain.date(from: s)
     }
 
     static func describe(_ s: ChoiceSubject, now: Date) -> String {
@@ -544,9 +718,7 @@ enum SubjectTime {
         let tz = s.tz.flatMap(TimeZone.init(identifier:)) ?? .current
         var cal = Calendar(identifier: .gregorian)
         cal.timeZone = tz
-        let hm = DateFormatter()
-        hm.timeZone = tz
-        hm.dateFormat = "HH:mm"
+        let hm = formatter("HH:mm", tz)
         if s.ongoing == true {
             return "Now, since \(hm.string(from: start))"
         }
@@ -565,9 +737,7 @@ enum SubjectTime {
         if let y = cal.date(byAdding: .day, value: -1, to: now), cal.isDate(start, inSameDayAs: y) {
             return "Yesterday \(span)"
         }
-        let day = DateFormatter()
-        day.timeZone = tz
-        day.dateFormat = "EEE d MMM"
+        let day = formatter("EEE d MMM", tz)
         return "\(day.string(from: start)) \(span)"
     }
 }
@@ -729,11 +899,16 @@ struct Checklist: Codable, Equatable {
     static let uncheck = "↩ "
 
     static func from(metadata: [String: String]?) -> Checklist? {
-        guard let raw = metadata?[metadataKey], let data = raw.data(using: .utf8),
-              let c = try? JSONDecoder().decode(Checklist.self, from: data),
-              c.v == 1, !c.items.isEmpty else { return nil }
-        return c
+        guard let raw = metadata?[metadataKey] else { return nil }
+        return cache.value(for: raw) {
+            guard let data = raw.data(using: .utf8),
+                  let c = try? JSONDecoder().decode(Checklist.self, from: data),
+                  c.v == 1, !c.items.isEmpty else { return nil }
+            return c
+        }
     }
+
+    private static let cache = DecodeCache<Checklist>()
 
     /// The label a tick/untick reply carries, and which way it went.
     static func toggle(in content: String) -> (label: String, checked: Bool)? {

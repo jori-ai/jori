@@ -77,8 +77,15 @@ a { color: var(--accent); }
 .chip .wd { font-size: 11px; font-weight: 700; letter-spacing: 0.04em; text-transform: uppercase; color: var(--muted); }
 .chip .dt { font-size: 15px; font-weight: 700; margin: 1px 0; }
 .chip .loc { font-size: 12px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 140px; }
+.chip .date { font-size: 13px; font-weight: 700; margin-top: 1px; white-space: nowrap; }
 .chip.active { background: var(--accent); border-color: var(--accent); }
-.chip.active .wd, .chip.active .dt, .chip.active .loc { color: #fff; }
+.chip.active .wd, .chip.active .dt, .chip.active .loc, .chip.active .date { color: #fff; }
+/* A past stay (shown only with "Show past") and a stop whose guide isn't built
+   yet both read as secondary. */
+.chip.past:not(.active) { opacity: 0.6; }
+.chip.noguide:not(.active) { border-style: dashed; background: transparent; }
+.chip.toggle { min-width: 0; background: transparent; border-style: dashed; }
+.chip.toggle .date { font-weight: 400; font-size: 12px; color: var(--muted); }
 
 /* ---- day content ---- */
 .daywrap { max-width: 700px; margin: 0 auto; padding: 6px 12px 40px; }

@@ -1,0 +1,28 @@
+{
+  "name": "place-pages",
+  "title": "Place pages",
+  "description": "A wiki page for every café, restaurant, bar, lounge, hotel, shop, museum or park you spend time at: every visit, who came, and every photo you took there, linked from one photo library so a photo is never stored twice. Questions and messages about a place can then show it. Homes, offices, doctors and transit never get a page. It runs every morning over the past week, so your corrections to a day move its photos with them.",
+  "version": "0.1.0",
+  "default": "disabled",
+  "requires": {
+    "plugins": [],
+    "bins": ["bin/wiki", "bin/live-day", "bin/photos", "bin/photo-repo"],
+    "commands": [],
+    "env": ["SUPABASE_SERVICE_ROLE_KEY"]
+  },
+  "config": {
+    "name": "place-pages",
+    "schedules": false
+  },
+  "settings": [],
+  "schedules": [
+    {
+      "label": "place-pages",
+      "cron": "17 11 * * *",
+      "run": "{node} bin/place-pages sweep --apply",
+      "log": "agent/logs/place-pages.log"
+    }
+  ],
+  "provides_bins": ["place-pages"],
+  "jobs": {}
+}

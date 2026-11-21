@@ -169,7 +169,7 @@ Output ONE JSON object and nothing else:
   try {
     const out = execFileSync(path.join(HOME, ".local/bin/claude"), [
       "-p", "--model", MODELS.sonnet, "--effort", "low", "--allowedTools", "WebSearch", "--output-format", "text", prompt,
-    ], { encoding: "utf8", timeout: 420000, maxBuffer: 4 * 1024 * 1024, stdio: ["ignore", "pipe", "ignore"] });
+    ], { encoding: "utf8", timeout: 420000, maxBuffer: 4 * 1024 * 1024, stdio: ["ignore", "pipe", "ignore"], env: require("../lib/agent-env.cjs").modelEnv() });
     const json = out.slice(out.indexOf("{"), out.lastIndexOf("}") + 1);
     return new Map((JSON.parse(json).items || []).map((x) => [x.id, x]));
   } catch (e) {

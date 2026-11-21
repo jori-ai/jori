@@ -1,0 +1,94 @@
+#!/usr/bin/env node
+"use strict";
+// photo-repo — the photo repository's links and covers (lib/photo-repo.js).
+// A photo is stored once (photos row + one thumbnail); this records where it is used.
+//
+//   photo-repo for <target> [--json]                 the photos linked to a target (a wiki page id), newest first
+//   photo-repo uses <uuid> [--json]                  every target one photo is used on
+//   photo-repo link <uuid> <target> [--by <tool>] [--context <c>]   use a photo on a target
+//   photo-repo pin-cover <target> <uuid>             the user's choice of cover (sticky; a sweep never moves it)
+//   photo-repo cover <page_id>                       the cover of a place's page → JSON {url, …} (exit 1: none)
+//   photo-repo place-covers [--lat L --lon L] [--radius M] --name "A" [--name "B"]…
+//                                                    covers for names near a point → JSON {name: {url, page_id, …}}
+//                                                    (what bin/choice asks to put a thumbnail beside each option)
+
+const path = require("node:path");
+const { loadEnv } = require(path.join(__dirname, "..", "lib", "load-env.js"));
+loadEnv();
+const repo = require(path.join(__dirname, "..", "lib", "photo-repo.js"));
+
+const args = process.argv.slice(2);
+const cmd = args[0];
+const flag = (n) => { const i = args.indexOf(`--${n}`); return i >= 0 ? args[i + 1] : undefined; };
+const multi = (n) => args.flatMap((a, i) => (a === `--${n}` && args[i + 1] !== undefined ? [args[i + 1]] : []));
+const pos = () => {
+  const out = [];
+  for (let i = 1; i < args.length; i++) {
+    if (args[i].startsWith("--")) { if (args[i] !== "--json") i++; continue; }
+    out.push(args[i]);
+  }
+  return out;
+};
+const asJson = args.includes("--json");
+const num = (v) => (v === undefined ? null : Number(v));
+
+async function main() {
+  switch (cmd) {
+    case "for": {
+      const [target] = pos();
+      if (!target) return usage();
+      const rows = await repo.photosFor(target);
+      if (asJson) return console.log(JSON.stringify(rows, null, 2));
+      for (const r of rows) console.log(`${r.photo.taken_at}  ${r.role.padEnd(7)} ${r.photo_uuid}  ${r.photo.thumb_url || "(no thumbnail)"}`);
+      console.log(`${rows.length} photo(s) on ${target}`);
+      return 0;
+    }
+    case "uses": {
+      const [uuid] = pos();
+      if (!uuid) return usage();
+      const rows = await repo.usesOf(uuid);
+      if (asJson) return console.log(JSON.stringify(rows, null, 2));
+      for (const r of rows) console.log(`${r.target}  ${r.role}  ${r.context || ""}  (by ${r.added_by})`);
+      return 0;
+    }
+    case "link": {
+      const [uuid, target] = pos();
+      if (!uuid || !target) return usage();
+      const n = await repo.link([{ photo_uuid: uuid, target, added_by: flag("by") || "user", context: flag("context") || null }]);
+      console.log(n ? `linked ${uuid} → ${target}` : `${uuid} is already pinned as ${target}'s cover`);
+      return 0;
+    }
+    case "pin-cover": {
+      const [target, uuid] = pos();
+      if (!target || !uuid) return usage();
+      await repo.pinCover(target, uuid);
+      console.log(`${uuid} is now ${target}'s cover (the next place-pages run puts it on the page)`);
+      return 0;
+    }
+    case "cover": {
+      const [pageId] = pos();
+      if (!pageId) return usage();
+      const c = await repo.coverForPage(pageId);
+      if (!c) { console.error(`no cover for ${pageId}`); return 1; }
+      console.log(JSON.stringify(c));
+      return 0;
+    }
+    case "place-covers": {
+      const names = multi("name");
+      if (!names.length) return usage();
+      const r = await repo.placeCovers({ lat: num(flag("lat")), lon: num(flag("lon")), names, ...(flag("radius") ? { radiusM: Number(flag("radius")) } : {}) });
+      console.log(JSON.stringify(r));
+      return 0;
+    }
+    default:
+      return usage();
+  }
+}
+
+function usage() {
+  const lines = require("node:fs").readFileSync(__filename, "utf8").split("\n").slice(2, 15).map((l) => l.replace(/^\/\/ ?/, "")); // lang-regex-ok: strips comment markers from this file's own header
+  console.error(lines.join("\n"));
+  return 2;
+}
+
+main().then((code) => process.exit(code || 0), (e) => { console.error(`photo-repo: ${e.message}`); process.exit(1); });

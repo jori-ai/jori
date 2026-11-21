@@ -9,7 +9,7 @@ export const meta = { name: "tasks", lanes: ["tasks", "situation"] };
 
 export default async function detect(ctx) {
   const { memo, setMemo, local } = ctx;
-  const plain = await sh("/opt/homebrew/bin/gog",
+  const plain = await sh(process.env.GOG_BIN || "/opt/homebrew/bin/gog",
     ["tasks", "list", "@default", "--plain", ...(GOG_ACCOUNT ? ["-a", GOG_ACCOUNT] : [])], { timeout: 12000 });
   // Same reasoning as the calendar sensor: `gog tasks` prints something even
   // for an empty list, so empty output means the probe failed rather than

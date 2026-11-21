@@ -19,9 +19,14 @@
 # recounted first (lines read, minus the tagged ones, plus the new ones, never
 # empty); and only then does anything reach `crontab -`.
 #
-# Env: CRONTAB_SAFE_TIMEOUT seconds per crontab call (default 20; a caller
-# with its own timeout setting passes it in this one). CRONTAB_SAFE_LOG gets
-# one line per skip (default data/logs/crontab-safe.log).
+# Env: CRONTAB_SAFE_TIMEOUT seconds for reading the crontab (default 20; a
+# caller with its own timeout setting passes it in this one).
+# CRONTAB_SAFE_INSTALL_TIMEOUT seconds for installing it (default 120, and never
+# less than the read's unless set): writing a crontab of a few hundred lines can
+# take tens of seconds on a busy host, far longer than reading it, and a write
+# cut short by the timeout changes nothing. A value that is not a positive whole
+# number is ignored (an alarm of 0 would mean no timeout at all). CRONTAB_SAFE_LOG
+# gets one line per skip (default data/logs/crontab-safe.log).
 
 CMD="$1"; TAG="$2"
 usage() { echo "usage: crontab-safe {remove|replace} <tag> [line ...]${1:+ ($1)}" >&2; exit 2; }
@@ -34,7 +39,13 @@ for l in "$@"; do
   case "$l" in *$'\n'*) usage "a new line contains a newline" ;; esac
 done
 
-TIMEOUT="${CRONTAB_SAFE_TIMEOUT:-20}"
+# A positive whole number of seconds, else the default.
+secs() { case "$1" in ''|*[!0-9]*) echo "$2" ;; *) if [ "$((10#$1))" -gt 0 ]; then echo "$((10#$1))"; else echo "$2"; fi ;; esac; }
+READ_TIMEOUT=$(secs "${CRONTAB_SAFE_TIMEOUT:-}" 20)
+INSTALL_SET=$(secs "${CRONTAB_SAFE_INSTALL_TIMEOUT:-}" "")
+INSTALL_TIMEOUT=${INSTALL_SET:-120}
+# Not set: never shorter than the read's.
+if [ -z "$INSTALL_SET" ] && [ "$READ_TIMEOUT" -gt "$INSTALL_TIMEOUT" ]; then INSTALL_TIMEOUT=$READ_TIMEOUT; fi
 LOG="${CRONTAB_SAFE_LOG:-$HOME/Dev/jori/data/logs/crontab-safe.log}"
 PERL=/usr/bin/perl; [ -x "$PERL" ] || PERL=perl
 
@@ -45,13 +56,14 @@ skip() {
   exit 1
 }
 # perl's alarm survives the exec; a hung crontab dies of SIGALRM (status 142).
-timed() { "$PERL" -e 'alarm shift; exec @ARGV or exit 127' "$TIMEOUT" "$@"; }
+# Usage: timed <seconds> <command> [args...]
+timed() { local t="$1"; shift; "$PERL" -e 'alarm shift; exec @ARGV or exit 127' "$t" "$@"; }
 
 TMP=$(mktemp -d -t crontab-safe) || skip "no temp dir"
 trap 'rm -rf "$TMP"' EXIT
 
-timed crontab -l > "$TMP/read" 2> "$TMP/err"; rc=$?
-[ "$rc" -eq 142 ] && skip "crontab -l timed out after ${TIMEOUT}s"
+timed "$READ_TIMEOUT" crontab -l > "$TMP/read" 2> "$TMP/err"; rc=$?
+[ "$rc" -eq 142 ] && skip "crontab -l timed out after ${READ_TIMEOUT}s"
 [ "$rc" -ne 0 ] && skip "crontab -l exited $rc: $(head -c 200 "$TMP/err" | tr '\n' ' ')"
 [ -s "$TMP/read" ] || skip "crontab -l returned nothing"
 
@@ -68,6 +80,9 @@ m=$(grep -c '' "$TMP/kept")
 f=$(grep -c '' "$TMP/new")
 [ "$f" -eq $((m + k)) ] || skip "recount: $m kept + $k new, but $f to install"
 
-timed crontab - < "$TMP/new" 2> "$TMP/err"; rc=$?
+# The install has its own, longer timeout: on a busy host writing the whole
+# crontab takes far longer than reading it.
+timed "$INSTALL_TIMEOUT" crontab - < "$TMP/new" 2> "$TMP/err"; rc=$?
+[ "$rc" -eq 142 ] && skip "crontab install timed out after ${INSTALL_TIMEOUT}s"
 [ "$rc" -eq 0 ] || skip "crontab install exited $rc: $(head -c 200 "$TMP/err" | tr '\n' ' ')"
 exit 0

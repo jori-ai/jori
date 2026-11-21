@@ -239,7 +239,9 @@ async function daemon() {
     if (running || !newest) return;
     if (fs.existsSync(L.OFF_SWITCH)) return;
     const pos = newest;
-    const v = L.shouldEvaluate(pos, lastEval, { hour: localHour(userTz()) });
+    let asleep; // undefined = no usable sleep signal → the clock quiet hours
+    try { const sig = require("../lib/sleep-night.js").sleepSignal(); if (sig.usable) asleep = sig.state === "asleep"; } catch {}
+    const v = L.shouldEvaluate(pos, lastEval, { hour: localHour(userTz()), asleep });
     if (!v.ok) return;
     lastEval = pos;
     running = true;

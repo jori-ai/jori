@@ -80,12 +80,84 @@ async function prepare(queueFile, roleId) {
     : owner === roleId
       ? `your own conversation with ${ceo} (${conv})`
       : `${names.get(owner) || owner}'s conversation with ${ceo} (${conv}), and brought you into it with an @mention. Read the recent messages below first: you are joining mid-thread, and ${ceo} expects you to pick up from them`;
+  // Answers the speak gate found for this role's own questions (it held each
+  // question instead of letting it through: system/speak-gate.md § Live). The
+  // role records them now and never asks them again. Fails soft.
+  let found = [];
+  try {
+    const { resolvedAnswers, markHandedBack } = await import("../lib/speak-gate-live.mjs");
+    found = await resolvedAnswers({ sender: roleId, notHandedBack: true, since: new Date(Date.now() - 30 * 864e5).toISOString() });
+    if (found.length) await markHandedBack(found.map((r) => r.id));
+  } catch { found = []; }
+  const foundBlock = found.length ? [
+    "",
+    `----- ANSWERS FOUND FOR YOU (you were going to ask ${ceo} these; the review before delivery found the answers, so they were not sent) -----`,
+    ...found.reverse().map((r) => `- [${String(r.judged_at).slice(0, 16).replace("T", " ")}Z] You were going to ask: ${String(r.original || "").slice(0, 400)}\n  The answer found: ${String(r.suggestion).slice(0, 600)}`),
+    `Take each as settled: record it wherever your area keeps such facts, act on it if it needed acting on, and never ask ${ceo} it again. Mention it to ${ceo} only if it changes something they need to know.`,
+  ] : [];
+  // A hum ping can be sent into a member's own conversation (bin/hum-ping →
+  // bin/ping-route → jori-send-curl --as-role). A reply to it here must teach hum
+  // what the same reply in the coordinator's conversation would: the reaction
+  // classifier runs pinned to that ping, and the task carries hum's filing line.
+  let humBlock = [];
+  if (owner === roleId) {
+    try {
+      const { routedPingReply, humRoutingLine } = await import("../lib/hum-reply-target.mjs");
+      const me = await rest.request(`/rest/v1/jori_messages?select=reply_to&id=eq.${encodeURIComponent(q.message_id)}`);
+      const target = routedPingReply({ messageId: q.message_id, replyTo: (me && me[0] && me[0].reply_to) || null, rows: rows || [] });
+      const line = target ? humRoutingLine(target) : "";
+      if (line) {
+        humBlock = [
+          "",
+          "----- HUM -----",
+          `The new message answers a ping that hum (${ceo}'s proactive check-ins) sent into this conversation. Answer it as yourself, as usual. If it reacts to the ping (helpful, more, skip, snooze) or answers what the ping asked, also file that with the command below, so hum learns from it exactly as it would in the coordinator's conversation. Nothing to file when it is simply a new request. (The jori CLI is ${path.join(ROOT, "bin", "jori")}, the watchlist CLI ${path.join(ROOT, "bin", "watchlist")}.)`,
+          line,
+        ];
+        const { spawn } = require("node:child_process");
+        const child = spawn(installTools("bin/suggestion-classify"), ["--message-id", String(q.message_id), "--text", String(q.text || ""), "--reply-to", String(target)], { stdio: "ignore", detached: true });
+        child.on("error", () => { /* the classifier is best effort, as in the coordinator's conversation */ });
+        child.unref();
+      }
+    } catch { humBlock = []; }
+  }
+  // An answer to a question Jori is waiting on (the daily summary's fix questions, hum's open
+  // questions) is filed by code, in whatever conversation it is typed (lib/answer-router.mjs;
+  // phone-channel starts it the moment the message arrives). Done here too, idempotently per
+  // message id, so a role never has to file it and the reply can say so. Fails soft.
+  let answerBlock = [];
+  try {
+    const AR = await import("../lib/answer-router.mjs");
+    let res = await AR.routeAnswer({ messageId: q.message_id, text: q.text, conversationId: conv, history: AR.historyFrom(rows, { ceo, excludeId: q.message_id }) });
+    if (res.status === "already_routed" && !res.previous) res = { status: "already_routed", previous: await AR.waitForOutcome(q.message_id) };
+    const b = AR.routingBlock(res, ceo);
+    if (b) answerBlock = ["", "----- ANSWER FILED -----", b.trim()];
+  } catch { answerBlock = []; }
+  // A typed reply to a waiting card (a decision, a build's question, an installation's own kind)
+  // is filed by whoever reads it, and the coordinator gets the card's filing line with the reply
+  // (phone-channel). A role session gets it from the same function.
+  let cardBlock = [];
+  try {
+    const me = await rest.request(`/rest/v1/jori_messages?select=reply_to&id=eq.${encodeURIComponent(q.message_id)}`);
+    const parentId = me && me[0] && me[0].reply_to;
+    if (parentId) {
+      const par = await rest.request(`/rest/v1/jori_messages?select=id,role,content,metadata&id=eq.${encodeURIComponent(parentId)}`);
+      const { cardReplyHint } = await import("../lib/card-reply-hint.mjs");
+      const { loadHook } = await import("../lib/ext-hooks.mjs");
+      const hints = (await loadHook(path.join(ROOT, "agent", "phone-channel"), "reply-hints"))?.cardHints || {};
+      const hint = par && par[0] ? cardReplyHint(par[0], hints) : "";
+      if (hint) cardBlock = ["", "----- CARD REPLY -----", hint.trim()];
+    }
+  } catch { cardBlock = []; }
   const task = [
     `ROLE SESSION. You are ${role.name}, ${role.title} on ${ceo}'s team. ${ceo} wrote to you in ${where}.`,
     `Answer as ${role.name}, then deliver it with exactly one call:`,
     `  ${path.join(ROOT, "bin", "role-session")} reply --conversation ${conv} --role ${roleId} --reply-to ${q.message_id} --text-file <your file>`,
     "",
     brief,
+    ...foundBlock,
+    ...humBlock,
+    ...answerBlock,
+    ...cardBlock,
     "",
     `----- RECENT CONVERSATION (oldest first; the last line is the new message) -----`,
     history || "(no earlier messages)",
@@ -115,11 +187,31 @@ async function reply() {
   const o = org.org();
   const role = roleById(roleId, o);
   if (!role) die(`no role ${roleId} on the team`, 3);
-  const row = { role: "assistant", content: String(text).trim(), read: false, conversation_id: conv, sender: roleId, channel: "chat", ...(replyTo ? { reply_to: replyTo } : {}) };
+  // The speak gate, before the user sees it (system/speak-gate.md § Live): a
+  // role's answer is a reply, so it is sent as written or as the gate's
+  // correction, never held. Fails open.
+  let body = String(text).trim();
+  let review = null;
+  try {
+    const { gateOutbound } = await import("../lib/speak-gate-live.mjs");
+    let replyToText = null;
+    try {
+      const q = replyTo
+        ? `/rest/v1/jori_messages?select=content&id=eq.${encodeURIComponent(replyTo)}`
+        : `/rest/v1/jori_messages?select=content&conversation_id=eq.${encodeURIComponent(conv)}&role=eq.user&order=created_at.desc&limit=1`;
+      const p = await rest.request(q);
+      replyToText = p && p[0] ? p[0].content : null;
+    } catch {}
+    const g = await gateOutbound({ message: body, sender: roleId, intent: `role:${roleId}`, channel: "chat", kind: "reply", reply_to_text: replyToText, conversation_id: conv });
+    if (g.deliver && g.text) body = g.text;
+    review = g.review;
+  } catch { /* gate unavailable: send as written */ }
+  const row = { role: "assistant", content: body, read: false, conversation_id: conv, sender: roleId, channel: "chat", ...(replyTo ? { reply_to: replyTo } : {}) };
   const out = await rest.request("/rest/v1/jori_messages", { method: "POST", body: row, prefer: "return=representation" });
   const id = Array.isArray(out) && out[0] ? out[0].id : null;
+  if (review && id) { const { recordReview } = await import("../lib/speak-gate-live.mjs"); await recordReview(review, id); }
   // The push names who answered. Fail-open: the message is already in the app.
-  spawnSync(path.join(ROOT, "bin", "jori-notify"), ["--title", org.signature(role), ...(id ? ["--message-id", id] : []), String(text).trim().slice(0, 300)],
+  spawnSync(path.join(ROOT, "bin", "jori-notify"), ["--title", org.signature(role), ...(id ? ["--message-id", id] : []), body.slice(0, 300)],
     { stdio: "ignore", timeout: 30000, env: { ...process.env, JORI_NO_SIGN: "1" } });
   console.log(JSON.stringify({ id, conversation: conv, sender: roleId }));
 }

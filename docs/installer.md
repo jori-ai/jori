@@ -105,7 +105,7 @@ launchctl kickstart -k gui/$(id -u)/ai.jori.session  # restart the whole tree
 
 The installer handles a Linux VM end to end without root where it can: Node 22 from nodejs.org (checksum-verified) into `~/.local/node`, Claude Code into `~/.local`, the `jori` command in `~/.local/bin`; with sudo it also installs git, cron and Ollama, links `/opt/homebrew/bin/node` and turns on lingering. `jori setup start` (or **Start** on the setup page) writes and enables the unit below. Tested on Ubuntu 26.04 (x86_64).
 
-Linux is not a primary target: the macOS-only pieces (launchd jobs, Keychain auth, `ioreg`, AppleScript tools) stay off, and the Node path convention above still applies (`sudo ln -s "$(command -v node)" /opt/homebrew/bin/node`). A user unit for the process manager:
+Linux is not a primary target: the macOS-only pieces (Keychain auth, `ioreg`, AppleScript tools, the iMessage channel) stay off. Jobs that macOS hands to an on-demand launchd agent run straight from cron here: `agent/scripts/lib/launchd-kick.sh` sees no launchd and runs the agent's program itself (`launchd-run-direct.mjs`, one copy at a time), because Claude Code keeps its login in a file cron can read, and the Node path convention above still applies (`sudo ln -s "$(command -v node)" /opt/homebrew/bin/node`). A user unit for the process manager:
 
 ```ini
 # ~/.config/systemd/user/jori.service

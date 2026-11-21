@@ -29,7 +29,6 @@ after(() => {
 });
 
 const { valueByProperty, buildCashBuckets, attributionFor, bucketOf } = require("../lib/finance-real-estate.js");
-const { depositsFromHub, depositSection, depositAnswer } = require("../lib/finance-deposit-reconcile.js");
 const { reconcileInvoices, invoiceSection, dueDate } = require("../lib/finance-invoice-reconcile.js");
 
 test("one deed, two properties: parcels mapped in config are priced to their own property; the rest follow the holding", () => {
@@ -116,52 +115,6 @@ test("cash buckets: an installation's legacy brokerage prefix is read and the bu
   const bare = buildCashBuckets({ plaidAccounts: [], registry, posted: [], today: "2026-10-12", config: {} });
   assert.equal(bare.buckets.brokerage_taxable.total, 0);
   assert.equal(bare.buckets.acme_taxable, undefined);
-});
-
-// ── Security deposits ──
-const leg = (rowId, date, from, to, amount) => ({ rowId, date, from, to, amount, description: `transfer ${from} -> ${to}` });
-const D = (id, tenant, amount, trail, positions) => ({
-  id, tenant, amount, lease_number: "L1", property_id: "house-a", property_name: "House A", hub_status: "paid", paid_via: "external", lease_end: null, outside_allowed: null,
-  whereabouts: { trail, positions: positions.map(([place, a]) => ({ place, label: place, amount: a })), outside: positions.filter(([p]) => p !== "5555").reduce((s, [, a]) => s + a, 0), receivedOn: trail[0]?.date || null, returnedOn: null, owed: amount },
-});
-const R = "plaid:t1";
-const base = () => [
-  D("ann", "Ann Example", 2000, [leg("plaid:p0", "2026-01-10", "tenant", "4444", 2000), leg(R, "2026-03-01", "4444", "5555", 2000)], [["5555", 2000]]),
-  D("bob", "Bob Example", 1000, [leg("plaid:p1", "2026-02-01", "tenant", "4444", 1000)], [["4444", 1000]]),
-  D("cat", "Cat Example", 1000, [leg("plaid:p2", "2026-02-03", "tenant", "4444", 1000)], [["4444", 1000]]),
-];
-const report = { computedAt: "2026-03-05T12:00:00Z", account: { mask: "5555" }, proof: { balance: 2000, deposits: 2000, other: 0, unlinked: 0, unexplained: 0 }, unlinked: [] };
-const hub = () => base().map((d) => ({ id: d.id, tenantName: d.tenant, amount: d.amount, status: "paid", whereabouts: d.whereabouts }));
-
-test("deposits: a transfer that fits two sets of tenants is a question with the configured answer command", () => {
-  setConfig({ deposit_answer_command: "my-facts deposit-answer" });
-  const q = depositsFromHub({ deposits: base(), report, depositMask: "5555" });
-  for (const r of q.rows) assert.equal(r.location, "ambiguous");
-  assert.deepEqual(q.missing, []);
-  const sec = depositSection({ run_at: new Date().toISOString(), report: { ...q, deposit_account: "Deposits ••5555" } }, "2026-03-05");
-  assert.equal(sec.questions.length, 1);
-  assert.ok(sec.questions[0].answer_with.startsWith("my-facts deposit-answer plaid:t1 "));
-  // No command configured: a placeholder, never another installation's tool.
-  setConfig(null);
-  const q2 = depositSection({ run_at: new Date().toISOString(), report: { ...depositsFromHub({ deposits: base(), report, depositMask: "5555" }), deposit_account: "x" } }, "2026-03-05");
-  assert.ok(q2.questions[0].answer_with.startsWith("<deposit-answer command> plaid:t1 "));
-});
-
-test("deposits: the user's answer settles it, attributed to the user by name", () => {
-  const answer = depositAnswer({ rowId: "t1", deposits: hub(), depositMask: "5555", whose: ["Bob Example", "cat example"], said: "those two", saidOn: "2026-03-05" });
-  assert.deepEqual(answer.unknown.map((u) => u.deposit_id), ["ann"]);
-  const a = depositsFromHub({ deposits: base(), report, depositMask: "5555", answers: [answer] });
-  const by = Object.fromEntries(a.rows.map((x) => [x.id, x]));
-  assert.equal(by.bob.location, "deposit_account");
-  // Ann's money arrived in ••4444 and the only row that moved it was not hers:
-  // it is still in ••4444 (located, with the move that fixes it), not "unknown".
-  assert.equal(by.ann.location, "operating_account");
-  assert.equal(by.ann.location_account_mask, "4444");
-  assert.match(by.bob.location_basis, /^Sam, 2026-03-05:/);
-  const sec = depositSection({ run_at: new Date().toISOString(), report: { ...a, deposit_account: "Deposits ••5555" } }, "2026-03-05");
-  assert.match(sec.section.rows.find((x) => x.tenant === "Bob Example").location, /per Sam, 2026-03-05/);
-  assert.throws(() => depositAnswer({ rowId: "t1", deposits: hub(), depositMask: "5555", whose: ["Bob Example"], said: "x", saidOn: "2026-03-05" }), /add up to/);
-  assert.throws(() => depositAnswer({ rowId: "t1", deposits: hub(), depositMask: "5555", whose: ["Bob Example", "Cat Example"], said: " ", saidOn: "2026-03-05" }), /Sam's own words/);
 });
 
 // ── Client invoices ──

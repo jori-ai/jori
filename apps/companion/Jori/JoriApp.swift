@@ -27,6 +27,9 @@ struct JoriApp: App {
 
     // nil = still checking Keychain for a persisted session; true/false once resolved.
     @State private var isSignedIn: Bool?
+    /// The backend the Supabase client talks to; changes on pairing, which
+    /// restarts the work bound to the old client.
+    @State private var backendID = SupabaseManager.backendID
 
     var body: some Scene {
         WindowGroup {
@@ -37,8 +40,27 @@ struct JoriApp: App {
                 // scenePhase starts out active, so its onChange never fires
                 // for the first launch: start the watchdog here too.
                 .onAppear { Responsiveness.shared.resume() }
-                .task { isSignedIn = await SupabaseManager.hasSession() }
-                .task { await SupabaseManager.mirrorOnTokenChanges() }
+                .task {
+                    // Open on the cached app at once when a session is saved:
+                    // `hasSession()` refreshes an expired token first (an
+                    // hour old is expired), so every launch after a break sat
+                    // on the splash for a network round trip, or until a
+                    // timeout with no signal. The check runs behind the app
+                    // and sends the user to sign in only when the server
+                    // turned the session down, not when the network failed.
+                    if SupabaseManager.hasStoredSession {
+                        isSignedIn = true
+                        if await SupabaseManager.sessionIsGone() {
+                            isSignedIn = false
+                        }
+                    } else {
+                        isSignedIn = await SupabaseManager.hasSession()
+                    }
+                }
+                .task(id: backendID) { await SupabaseManager.mirrorOnTokenChanges() }
+                .onReceive(NotificationCenter.default.publisher(for: .joriBackendChanged)) { _ in
+                    backendID = SupabaseManager.backendID
+                }
                 #if os(macOS)
                 // 480 = traffic lights + sidebar toggle + the conversation header, with no title.
                 .frame(minWidth: 480, minHeight: 480)
@@ -116,6 +138,16 @@ struct JoriApp: App {
                             #endif
                         }
                     }
+                }, onUseAnotherJori: {
+                    Task {
+                        await PairingCoordinator.unpair()
+                        await MainActor.run {
+                            isSignedIn = false
+                            #if os(iOS)
+                            isUnlocked = false
+                            #endif
+                        }
+                    }
                 })
             } else {
                 LockScreen(isUnlocked: $isUnlocked)
@@ -126,6 +158,32 @@ struct JoriApp: App {
 
 extension Notification.Name {
     static let openJoriMessage = Notification.Name("openJoriMessage")
+}
+
+/// A tapped chat notification: the message it names and, when the push
+/// carries it, the conversation the message lives in, so the app can open
+/// that conversation without first asking the server (the owner, 2026-11-21:
+/// "tapping a chat notification should go directly to the channel it came
+/// from"). The conversation rides in the posted note's userInfo under `conversationKey`.
+enum NotificationTap {
+    static let conversationKey = "conversation"
+    /// Conversation named by a tap that arrived before the UI could take it.
+    static var pendingConversation: String?
+
+    /// Stash and announce the tap. A relayed push whose service extension did
+    /// not run still has its payload sealed, so it is opened here first.
+    static func open(_ raw: [AnyHashable: Any]) {
+        let userInfo = PushCrypto.unwrapped(raw)
+        guard let idString = userInfo["message_id"] as? String,
+              let uuid = UUID(uuidString: idString) else { return }
+        let conversation = (userInfo["conversation_id"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+        AppDelegate.pendingMessageId = uuid
+        pendingConversation = conversation
+        NotificationCenter.default.post(
+            name: .openJoriMessage, object: uuid,
+            userInfo: conversation.map { [conversationKey: $0] }
+        )
+    }
 }
 
 /// A message read on one device takes its banner off the others. The server
@@ -166,7 +224,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     /// Set when a trade-approval push arrives (TradeApproval.swift).
     static var pendingApprovalRequest: TradeApproval.Request?
 
-    private lazy var supabase = SupabaseManager.shared
+    /// Read each time: the client is rebuilt when the app is paired (the first
+    /// token save runs at launch, before any pairing).
+    private var supabase: SupabaseClient { SupabaseManager.shared }
 
     func applicationDidBecomeActive(_ notification: Notification) {
         NSApplication.shared.dockTile.badgeLabel = nil
@@ -179,6 +239,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        #if DEBUG
+        PushCrypto.selfCheck()
+        #endif
         UNUserNotificationCenter.current().delegate = self
         PurchaseApproval.registerNotificationCategory()
         ActionApproval.registerNotificationCategory()
@@ -199,7 +262,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
 
     /// Background pushes reach the Mac app only while it is running.
     func application(_ application: NSApplication, didReceiveRemoteNotification userInfo: [String: Any]) {
-        DeliveredNotifications.handle(userInfo) { _ in }
+        // A relayed push arrives sealed (`enc`); open it first.
+        DeliveredNotifications.handle(PushCrypto.unwrapped(userInfo)) { _ in }
     }
 
     func application(_ application: NSApplication, didRegisterForRemoteNotificationsWithDeviceToken deviceToken: Data) {
@@ -208,6 +272,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         // TradeApproval.register() sends this token to the trading web app at pairing.
         UserDefaults.standard.set(token, forKey: Install.key("apnsDeviceToken"))
         saveDeviceToken(token)
+        // A Jori paired through the shared push relay also needs the token there.
+        Task { await PushRelay.shared.sync(apnsToken: token) }
     }
 
     func application(_ application: NSApplication, didFailToRegisterForRemoteNotificationsWithError error: Error) {
@@ -276,11 +342,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
             completionHandler()
             return
         }
-        if let idString = response.notification.request.content.userInfo["message_id"] as? String,
-           let uuid = UUID(uuidString: idString) {
-            AppDelegate.pendingMessageId = uuid
-            NotificationCenter.default.post(name: .openJoriMessage, object: uuid)
-        }
+        NotificationTap.open(response.notification.request.content.userInfo)
+        NSApplication.shared.activate(ignoringOtherApps: true)
         completionHandler()
     }
 
@@ -315,12 +378,17 @@ final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCent
     /// Same, for a plugin-action approval push (ActionApproval.swift).
     static var pendingActionApprovalId: String?
 
-    private lazy var supabase = SupabaseManager.shared
+    /// Read each time: the client is rebuilt when the app is paired (the first
+    /// token save runs at launch, before any pairing).
+    private var supabase: SupabaseClient { SupabaseManager.shared }
 
     func application(
         _ application: UIApplication,
         didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil
     ) -> Bool {
+        #if DEBUG
+        PushCrypto.selfCheck()
+        #endif
         UNUserNotificationCenter.current().delegate = self
         TradeApproval.registerNotificationCategory()
         PurchaseApproval.registerNotificationCategory()
@@ -401,6 +469,8 @@ final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCent
         print("[APNs] Device token: \(token)")
         UserDefaults.standard.set(token, forKey: Install.key("apnsDeviceToken"))
         saveDeviceToken(token)
+        // A Jori paired through the shared push relay also needs the token there.
+        Task { await PushRelay.shared.sync(apnsToken: token) }
     }
 
     func application(
@@ -408,6 +478,8 @@ final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCent
         didReceiveRemoteNotification userInfo: [AnyHashable: Any],
         fetchCompletionHandler completionHandler: @escaping (UIBackgroundFetchResult) -> Void
     ) {
+        // A relayed push arrives sealed (`enc`); open it so `kind` is readable.
+        let userInfo = PushCrypto.unwrapped(userInfo)
         // The server asking for the photos taken during a stop (PhotoProbeResponder):
         // answer before iOS's ~30 s background budget runs out.
         if userInfo["kind"] as? String == "photo_probe" {
@@ -509,11 +581,7 @@ final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCent
             return
         }
 
-        if let idString = userInfo["message_id"] as? String,
-           let uuid = UUID(uuidString: idString) {
-            AppDelegate.pendingMessageId = uuid
-            NotificationCenter.default.post(name: .openJoriMessage, object: uuid)
-        }
+        NotificationTap.open(userInfo)
         completionHandler()
     }
 

@@ -139,6 +139,47 @@ test("hum-ask: the chat row carries the finding's key (finding_key) beside quest
   assert.deepEqual(Object.keys(run("q-bare", "ideas", [], "Still keen on the exhibit?")), ["question_id"]);
 });
 
+// A question with fixed answers goes out as a tappable card, not a numbered list
+// typed into the text (2026-11-15: an airport-pickup question arrived as
+// plain text with "1. … (my pick)" and no buttons).
+test("hum-ask --options: sends a decision-style card with no ref; the text is the numbered copy", () => {
+  const env = home();
+  const r = ask(env, "ok", ["--options", JSON.stringify(["They take a taxi", { label: "We pick them up", description: "a late run" }]),
+    "--recommended", "2", "--header", "Travel"]);
+  assert.equal(r.status, 0, r.stderr);
+  const rec = JSON.parse(fs.readFileSync(env.record, "utf8"));
+  const choices = JSON.parse(rec.argv[rec.argv.indexOf("--choices-json") + 1]);
+  assert.equal(choices.v, 1);
+  assert.equal(choices.kind, "decision");
+  assert.equal(choices.ref, undefined, "no ref: a tap falls through to the chat agent and hum-answer");
+  assert.equal(choices.header, "Travel");
+  assert.equal(choices.prompt, "Is Jordan heading out or extending?");
+  assert.deepEqual(choices.options.map((o) => o.label), ["We pick them up", "They take a taxi"], "recommended first");
+  assert.equal(choices.recommended_id, choices.options[0].id);
+  assert.equal(choices.options[0].sublabel, "a late run");
+  assert.equal(choices.free_text, true);
+  assert.ok(choices.expires_at);
+  const text = rec.argv[rec.argv.length - 1];
+  assert.ok(text.includes("1. We pick them up (Recommended)"));
+  assert.ok(text.includes("3. Type something"));
+  assert.equal(pendingOf(env).question, text, "the slot holds what the user saw");
+  const meta = JSON.parse(rec.argv[rec.argv.indexOf("--metadata-json") + 1]);
+  assert.equal(meta.question_id, "q-1", "still an open question in the tray");
+});
+
+test("hum-ask --options: bad option sets are usage errors; no --choices-json without --options", () => {
+  for (const extra of [["--options", "[\"only one\"]"], ["--options", "[\"a\",\"a\"]"], ["--options", "[\"a\",\"Type something\"]"],
+    ["--options", "[\"a\",\"b\"]", "--recommended", "3"], ["--options", "not json"], ["--recommended", "1"]]) {
+    const env = home();
+    assert.equal(ask(env, "ok", extra).status, 2, JSON.stringify(extra));
+    assert.equal(pendingOf(env), null);
+  }
+  const env = home();
+  assert.equal(ask(env, "ok").status, 0);
+  const rec = JSON.parse(fs.readFileSync(env.record, "utf8"));
+  assert.ok(!rec.argv.includes("--choices-json"));
+});
+
 test("hum-ask: send failure is 3; usage errors are 2", () => {
   const env = home();
   assert.equal(ask(env, "fail").status, 3);

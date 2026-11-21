@@ -18,5 +18,5 @@ export default async function Home() {
       </main>
     );
   }
-  redirect(`/reservoir/${defaultArea(areas)}`);
+  redirect(`/reservoir/${(await defaultArea()) ?? areas[0].area}`);
 }

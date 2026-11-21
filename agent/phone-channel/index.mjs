@@ -10,10 +10,12 @@ import { sendApnsPush, sendClearPush } from "../../lib/apns-push.mjs";
 import { writeFileAtomic } from "../../lib/atomic-write.js";
 import { autoRecallBlock, useWarmJudge } from "../../lib/auto-recall.mjs";
 import { WarmClaude } from "../../lib/warm-claude.mjs";
+import { cardReplyHint } from "../../lib/card-reply-hint.mjs";
 import { spoolEvent } from "../../lib/hum-events.mjs";
 import { displayableDraft } from "../../lib/reply-stream.mjs";
 import { composeReply } from "../../lib/reply-file.mjs";
 import { recordSuperseded } from "../../lib/superseded-replies.mjs";
+import { gateOutbound, recordReview, liveEnabled as speakGateLive } from "../../lib/speak-gate-live.mjs";
 import { ShareBundler, laterTimestamp } from "./share-bundle.mjs";
 import { loadHook } from "../../lib/ext-hooks.mjs";
 import { fileURLToPath } from "node:url";
@@ -295,7 +297,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
     // + adjudication. A solicited reply can only ever be rewritten, never
     // withheld, so nothing is lost by sending first and correcting the same
     // row in place (send-then-correct, the user's choice).
-    const deliveredMessage = message;
+    let deliveredMessage = message;
 
     // Stop the ack refresh interval. If we have an ack row, UPDATE it in place
     // with the real reply — that keeps a single stable message row in the
@@ -329,6 +331,28 @@ mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
             .then(({ error }) => { if (error) log(`superseded ack delete error: ${error.message}`); });
         }
         reuseAckId = streamed.rowId;
+      }
+    }
+
+    // THE SPEAK GATE, before the user sees it (system/speak-gate.md § Live).
+    // A reply is only ever sent as written or as the gate's correction, never
+    // held; its verdict is linked to the row below and shown under it with the
+    // original folded. A message_file reply was composed by a tool from the
+    // source of record seconds ago and is sent exactly as written (see the
+    // freshness note below), so it is not judged. Fails open.
+    let gateReview = null;
+    if (!request.params.arguments?.message_file) {
+      try {
+        const g = await gateOutbound({
+          message, kind: "reply", channel: replyChannel, intent: "chat-reply",
+          sender: null, reply_to_text: pendingEntry?.text || null,
+          conversation_id: pendingEntry?.conversation_id || null,
+        });
+        if (g.deliver && g.text) deliveredMessage = g.text;
+        gateReview = g.review;
+        if (g.verdict === "rewrite") console.error(`[phone-channel] speak gate rewrote the reply: ${String(g.reason || "").slice(0, 160)}`);
+      } catch (e) {
+        console.error(`[phone-channel] speak gate skipped: ${e?.message || e}`);
       }
     }
 
@@ -382,7 +406,10 @@ mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
       // of record seconds ago — it IS the live evidence, so the freshness gate has nothing to
       // re-check; and a rewrite would replace the whole row with prose (e.g. a poster list cut
       // to 1,200 chars, with "as of when I looked" hedges on live data).
-      if (msgId && !request.params.arguments?.message_file) correctReplyInPlace(msgId, message, pendingEntry?.text || null, replyChannel);
+      if (msgId && gateReview) recordReview(gateReview, msgId);
+      // The speak gate already judged it before delivery; the older
+      // send-then-correct freshness pass runs only when the gate did not.
+      if (msgId && !request.params.arguments?.message_file && (!gateReview || gateReview.verdict === "error")) correctReplyInPlace(msgId, deliveredMessage, pendingEntry?.text || null, replyChannel);
       setTimeout(async () => {
         try {
           if (msgId) {
@@ -408,7 +435,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
           // time-sensitive, the user's decision 2026-11-05), with no Jev call;
           // `urgent` additionally marks the NSE's urgent flag.
           await sendApnsPush(supabase, {
-            body, messageId: msgId, channel: replyChannel, urgent: timeSensitive, skipMotionGate: true, announce: "always",
+            body, messageId: msgId, channel: replyChannel, urgent: timeSensitive, skipMotionGate: true, announce: "always", pickupProof: true,
           });
         } catch (err) {
           console.error(`[phone-channel] Push failed: ${err.message}`);
@@ -591,6 +618,30 @@ async function buildHumBlock(row, text) {
  * into the anchor's text. Empty string for every other reply. Fail-soft — a
  * missing hint is never worth losing the message over.
  */
+/**
+ * Answers the speak gate found for the coordinator's (or an unsigned job's)
+ * own questions: it held each question instead of sending it
+ * (system/speak-gate.md § Live). Handed to the next chat turn once, so the
+ * coordinator records them and never asks them again. Fail-soft → "".
+ */
+async function buildFoundAnswersBlock() {
+  try {
+    const { resolvedAnswers, markHandedBack } = await import("../../lib/speak-gate-live.mjs");
+    const since = new Date(Date.now() - 30 * 864e5).toISOString();
+    const rows = [
+      ...(await resolvedAnswers({ sender: "chief-of-staff", notHandedBack: true, since })),
+      ...(await resolvedAnswers({ notHandedBack: true, since })).filter((r) => !r.sender),
+    ];
+    if (!rows.length) return "";
+    await markHandedBack(rows.map((r) => r.id));
+    const lines = rows.reverse().map((r) => `- You were going to ask: ${String(r.original || "").slice(0, 300)}\n  The answer found: ${String(r.suggestion).slice(0, 500)}`);
+    return `Answers found for you (the review before delivery held these questions because it found the answers; take them as settled, record them where they belong, and never ask ${OWNER} them again; mention one only if it changes something ${OWNER} needs to know):\n${lines.join("\n")}\n\n`;
+  } catch (err) {
+    console.error(`[phone-channel] found-answers block failed: ${err.message}`);
+    return "";
+  }
+}
+
 async function buildImprovementBlock(row) {
   if (!row?.reply_to) return "";
   try {
@@ -610,20 +661,7 @@ async function buildImprovementBlock(row) {
  * only (our own metadata); what the user meant is the agent's reading.
  */
 function decisionReplyHint(parent) {
-  try {
-    const raw = parent?.metadata?.choices;
-    const p = typeof raw === "string" ? JSON.parse(raw) : raw;
-    // An installation's own card kind (REPLY_HINTS, from _ext/reply-hints.mjs):
-    // the user's typed answer is the agent's reading; the hint only names the
-    // ref and how to file it. The kernel's decision card is never overridden.
-    const extHint = p?.kind !== "decision" && p?.ref ? REPLY_HINTS[p.kind] : null;
-    if (typeof extHint === "function") return extHint(p) || "";
-    if (p?.kind !== "decision" || !p.ref) return "";
-    const opts = (p.options || []).map((o, i) => `${i + 1}. ${o.label}`).join("; ");
-    return `[Decision card ${p.ref}] That message was a decision ${ASSISTANT} asked them (options: ${opts}). Once you know their answer — an option (by number or meaning) or their own words — file it with \`~/Dev/jori/bin/decision-answer --ref ${p.ref} --option "<that option's label, exactly>"\` or \`--text "<their answer>"\`, then confirm in one short line. If they are asking about it rather than answering, answer and leave it open.\n\n`;
-  } catch {
-    return "";
-  }
+  return cardReplyHint(parent, REPLY_HINTS);
 }
 
 async function buildReplyBlock(row, tz) {
@@ -713,11 +751,83 @@ function teamRoute(row) {
   return { roles: [], coordinator: true };
 }
 
+// A role the user just added in the app (jori_team.requested_at, system/org.md
+// § Growing the team) joins the team before its first message is routed, so it
+// answers that message itself; `org sync` does the same every 10 minutes.
+async function adoptRequestedRoles(row) {
+  const conv = row.conversation_id || "";
+  const O = require("../../lib/org.cjs");
+  const onTeam = new Set(O.org().roles.map((r) => r.id));
+  let ids = [];
+  if (conv.startsWith("role:")) ids = [conv.slice(5)];
+  else if (conv.startsWith("group:")) {
+    const { data } = await supabase.from("jori_conversations").select("members").eq("id", conv).maybeSingle();
+    ids = data?.members || [];
+  }
+  ids = ids.filter((id) => !onTeam.has(id));
+  if (!ids.length) return;
+  const { data: rows } = await supabase.from("jori_team").select("id,requested_at").in("id", ids);
+  const asked = (rows || []).filter((r) => r.requested_at).map((r) => r.id);
+  if (!asked.length) return;
+  const done = O.adoptRoles(asked);
+  if (done.length) {
+    await supabase.from("jori_team").update({ requested_at: null, enabled: true }).in("id", done);
+    log(`team: ${done.join(", ")} joined (added in the app)`);
+    // The app's team table now: the coordinator's title (chief of staff once
+    // it is not alone) and the roles still to add.
+    const org = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "bin", "org");
+    import("node:child_process").then(({ spawn }) => spawn(process.execPath, [org, "sync"], { detached: true, stdio: "ignore" }).unref())
+      .catch(() => { /* the 10-minute sync catches up */ });
+  }
+}
+
 function enqueueRoleSession(row, roles) {
   const dir = installTools("data/role-queue/pending");
   fs.mkdirSync(dir, { recursive: true });
   const body = { message_id: row.id, conversation_id: row.conversation_id, roles, text: row.content, created_at: row.created_at, queued_at: new Date().toISOString() };
   writeFileAtomic(path.join(dir, `${row.created_at.replace(/[^0-9]/g, "").slice(0, 17)}-${row.id}.json`), JSON.stringify(body) + "\n"); // lang-regex-ok: digits of a timestamp for a sortable file name
+}
+
+// An answer to a question Jori is waiting on (the daily summary's, hum's) registers wherever
+// it is typed: this conversation, a role's, a group (lib/answer-router.mjs). Code, on every
+// inbound message, so it never depends on which agent session happens to read the reply.
+// A model reads the message against the open questions; the flow files the user's words.
+// Never blocks or fails the message: resolves to the router's outcome, or null.
+async function routeOpenAnswer(row, text) {
+  try {
+    const { routeAnswer, historyFrom } = await import("../../lib/answer-router.mjs");
+    let q = supabase.from("jori_messages").select("id, role, content, created_at").order("created_at", { ascending: false }).limit(7);
+    q = row.conversation_id ? q.eq("conversation_id", row.conversation_id) : q.eq("channel", row.channel || "chat");
+    const { data } = await q;
+    const history = historyFrom((data || []).reverse(), { ceo: OWNER_LABEL, excludeId: row.id });
+    const outcome = await routeAnswer({ messageId: row.id, text, conversationId: row.conversation_id || null, history });
+    if (!["none", "no_open_questions", "skipped"].includes(outcome.status)) log(`answer-router: ${outcome.status} ${JSON.stringify(outcome.filed || outcome.failed || outcome.attempts || "")}`.slice(0, 300));
+    return outcome;
+  } catch (err) {
+    console.error(`[phone-channel] answer routing failed (the message is handled as usual): ${err.message}`);
+    return null;
+  }
+}
+
+/**
+ * Mark the user's row as received, the moment this process takes it. The app's
+ * pickup watch (apps/companion PickupWatch.swift) arms a 10-minute "not picked
+ * up" alarm on the phone at send time and cancels it on the first sign the
+ * message got here. Until 2026-11-21 the only signs were assistant rows (the
+ * "working" placeholder, a reply), which a message that gets no placeholder
+ * (a short "thanks", a role's conversation, a choice tap) or a slow one did
+ * not produce in time, so the alarm went off while everything was fine. The
+ * stamp is `metadata.picked_up_at` (PickupRules.stampKeys), merged into the
+ * row's existing metadata. Fire-and-forget: a failed stamp only leaves the
+ * old signs to decide. (A share bundle stamps its newest row; the share
+ * extension's rows are not watched.)
+ */
+function stampPickedUp(row) {
+  if (!row?.id || row?.metadata?.picked_up_at) return;
+  const metadata = { ...(row.metadata || {}), picked_up_at: new Date().toISOString() };
+  supabase.from("jori_messages").update({ metadata }).eq("id", row.id)
+    .then(({ error }) => { if (error) log(`pickup stamp failed for ${row.id}: ${error.message}`); },
+      (err) => log(`pickup stamp failed for ${row.id}: ${err?.message || err}`));
 }
 
 async function handleIncomingMessage(row) {
@@ -734,6 +844,7 @@ async function handleIncomingMessage(row) {
   if (!row.shareBundleIds) shareBundler.flush();
   pendingMessages.set(msgId, { text, t0_created: createdAt, channel: row.channel || "chat", conversation_id: row.conversation_id || null });
   ensureStreamPoll();
+  stampPickedUp(row);
 
   // Persist the user's current timezone for trigger scripts (pulse sleep-window check).
   //
@@ -798,11 +909,21 @@ async function handleIncomingMessage(row) {
     console.error(`[phone-channel] choice fast-path error, dispatching normally: ${err.message}`);
   }
 
+  // Started now, in parallel with everything below: the coordinator's turn waits for it
+  // (capped) to know what was already filed; a role's session reads the same outcome from the
+  // router's ledger (bin/role-session prepare), so the message is never held up here.
+  const answerP = routeOpenAnswer(row, text);
+
   // The team (system/conversations.md): a message written to a role's own
   // conversation, or mentioning roles in a group, is answered by those roles'
   // own sessions (bin/role-session), not by this coordinator session. The
   // coordinator still answers in its own conversation, and in a group when it
   // is mentioned or nobody is.
+  try {
+    await adoptRequestedRoles(row);
+  } catch (err) {
+    console.error(`[phone-channel] adding a requested role failed: ${err.message}`);
+  }
   try {
     const route = teamRoute(row);
     if (route.roles.length) enqueueRoleSession(row, route.roles);
@@ -839,6 +960,7 @@ async function handleIncomingMessage(row) {
   const replyBlockP = buildReplyBlock(row, tz);
   const humBlockP = buildHumBlock(row, text);
   const improvementBlockP = buildImprovementBlock(row);
+  const foundBlockP = buildFoundAnswersBlock();
 
   // Fire-and-forget; see the header on startAck for the race with the reply.
   startAck(msgId, row, text).catch((err) => log(`ack task error: ${err.message}`));
@@ -894,10 +1016,15 @@ async function handleIncomingMessage(row) {
     // them into this one message, photos first.
     const shareLine = metadata.source === "share" ? "\n[Shared into Jori from another app via the share sheet]" : ""; // control-scan-ok: the software's name
 
-    const [recallBlock, replyBlock, humBlock, improvementBlock] =
-      await Promise.all([recallP, replyBlockP, humBlockP, improvementBlockP]);
+    const [recallBlock, replyBlock, humBlock, improvementBlock, foundBlock, answerOutcome] =
+      await Promise.all([recallP, replyBlockP, humBlockP, improvementBlockP, foundBlockP, withCap(answerP, ANSWER_ROUTE_CAP_MS, null)]);
+    let answerBlock = "";
+    try { answerBlock = (await import("../../lib/answer-router.mjs")).routingBlock(answerOutcome, OWNER_LABEL); } catch { /* the hint is optional */ }
     profLog(msgId, "t1b_context", `recall=${recallBlock ? "yes" : "no"}`);
-    const builtContent = `${recallBlock}${convoBlock}${replyBlock}${humBlock}${improvementBlock}New message from ${OWNER}:\n\n${text}\n\n[Current time: ${localTimeStr} ${tzAbbr}]${locationLine}${shareLine}`;
+    // The conversation the user wrote in, so a job started for this request can
+    // answer there (`jori tasks run … --reply-to <id>`, lib/reply-to.cjs).
+    const conversationLine = row.conversation_id ? `\n[Conversation: ${row.conversation_id}]` : "";
+    const builtContent = `${recallBlock}${convoBlock}${replyBlock}${humBlock}${improvementBlock}${foundBlock}${answerBlock}New message from ${OWNER}:\n\n${text}\n\n[Current time: ${localTimeStr} ${tzAbbr}]${locationLine}${shareLine}${conversationLine}`;
     const DISPATCH_URL = process.env.JORI_DISPATCH_URL;
 
     if (DISPATCH_URL) {
@@ -943,6 +1070,9 @@ async function handleIncomingMessage(row) {
 // bounds retrieval (1.2s) and its judge (Jev 2.5s → Sonnet 4s) itself; this is
 // the backstop so no future change inside it can stall the chat again.
 const AUTO_RECALL_CAP_MS = 6_000;
+// How long the coordinator's turn waits for the answer router (lib/answer-router.mjs) to say what it filed.
+// The router runs to completion either way; past this the turn starts without the note.
+const ANSWER_ROUTE_CAP_MS = 3_000;
 
 function withCap(p, ms, fallback) {
   let timer;
@@ -1049,7 +1179,10 @@ async function startAck(msgId, row, text) {
 //     message.
 // Streamed writes never push; the reply handler's push is the only one. The
 // truth gate still runs on the final text only (send-then-correct).
-const STREAM_ENABLED = process.env.CHAT_REPLY_STREAM !== "0";
+// With the speak gate live (lib/speak-gate-live.mjs) nothing is streamed: the
+// user must see a reply only after the gate has judged it (the user,
+// 2026-11-11: "it should be reviewed before i see it").
+const STREAM_ENABLED = process.env.CHAT_REPLY_STREAM !== "0" && !speakGateLive();
 const STREAM_POLL_MS = 400;
 // Short replies finish in about a second; streaming them only adds a flicker.
 const STREAM_MIN_CHARS = 60;

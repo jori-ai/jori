@@ -244,14 +244,22 @@ Only create delivery tasks from **shipping confirmation emails** (item has shipp
 - `order-update@amazon.com` → delivery confirmation (item has arrived). P3 personal, notify + close matching delivery task.
 
 When you detect a shipping confirmation (Amazon or any other carrier/retailer):
-1. Extract: item name, carrier (if the email names one), estimated delivery date, tracking/order link
+1. Extract: item name(s), carrier (if the email names one), estimated delivery date, destination (city or address line the notice gives), tracking/order link. **Resolve the real item names before notifying** (§ "A delivery notice names exactly what arrived", below, applies to shipped notices exactly as to delivered ones): a generic category in the email ("Coffee accessories and coffee (2 items)", "Household items") is never the item name.
 2. **Verify the due date in the home timezone** (see Timezone Rule above) — if the email says "arriving today" or a relative day, compute the correct `YYYY-MM-DD` there.
-3. Notify via Jori using `$'...'` ANSI-C quoting so `\n` becomes a real newline: `jori-send-curl --evidence-as-of <the email's own Date, ISO-8601> $'Shipped: [item name] — arriving [delivery date]\n[order/tracking link]'`
-4. Create a task with due date set to the **scheduled delivery date**: `gog tasks add @default --title "[item name] arriving" --due YYYY-MM-DD --no-input`
+3. Notify via Jori using `$'...'` ANSI-C quoting so `\n` becomes a real newline: `jori-send-curl --evidence-as-of <the email's own Date, ISO-8601> $'Shipped:\n• [item name, shortened if long] — [variant/qty when it matters]\n• …\nArriving [delivery date] — [destination]\n🔗 [order/tracking link]'` (one bullet per item in this shipment; a single item may sit on the first line, `Shipped: [item name] — arriving …`)
+4. Create a task with due date set to the **scheduled delivery date** (title from the real item name; for several items the first one plus "+N more"): `gog tasks add @default --title "[item name] arriving" --due YYYY-MM-DD --no-input`
 5. **When the notice gives a time window** (e.g. "between 5:15 PM - 7:15 PM", "by 9:00 PM" with a start the carrier states), put the window on the calendar as a **free** (transparent) event through `bin/jori-calendar create` (no attendees): title `📦 [item or sender] arriving ([carrier])`, start/end = the window in the home timezone, the tracking link in the description, `--transparency transparent`. A date with no window ("arriving Wednesday", "by end of day") gets the task only, no calendar event. One event per shipment: when a later notice for the same tracking number moves the window or the date, `update` that event (and the task's due date) instead of adding a second; on a delay with no new window, delete Jori's event and keep the task.
 6. Label the email as usual (vendor/personal, P3) and mark read
 
-If the email is a delivery confirmation (item already delivered), notify: `jori-send-curl --evidence-as-of <the email's own Date, ISO-8601> $'✅ Delivered: [item name]\n🔗 [link]'` and mark any matching delivery task as complete: `gog tasks done @default <taskId> --no-input`. Leave a matching arrival-window event where it is (it is free time and records when it came).
+If the email is a delivery confirmation (item already delivered), notify: `jori-send-curl --evidence-as-of <the email's own Date, ISO-8601> $'✅ Delivered: [item name(s)]\n[location line, when the notice gives one]\n🔗 [tracking/order link]'` and mark any matching delivery task as complete: `gog tasks done @default <taskId> --no-input`. Leave a matching arrival-window event where it is (it is free time and records when it came).
+
+**A shipping or delivery notice names exactly what is in the package, not the generic term in the email (shipped notices included, 2026-11-14).** Carriers and retailers often send a category ("Household items", "Your package") instead of the product. So before notifying:
+- **Where the retailer has an order page the user is signed in to** (the installation's local rules name the retailer, the browser and the page), open the order there and name **each item actually in this delivery**: the full product title, its variant (size, colour, pack) and quantity, and the seller when it is not the retailer itself. One delivery can hold some of an order's items: name only those this notice covers (match by the shipment/tracking number, or the item names the email does give). A multi-item delivery is one line per item.
+- **Never include price, tax, payment card or return/refund information**, in the notification or the task, even though the order page shows them.
+- **Every other carrier or retailer** (no order page to read): use the item names the email gives. When the email gives only a generic description, say so in the notification ("Delivered, but the notice only says 'household items'") rather than presenting the generic term as the item.
+- If the lookup fails (signed out, page error, order not found), fall back to the email's own words, say that the exact items could not be confirmed, and do not retry in a loop. The lookup is read-only: never click anything that changes the order.
+- For a **shipped** notice, use the same lookup and name each item in this shipment, shortening a long product title to its recognisable core (brand, product, variant), never to a category; keep the arrival date, the destination and the tracking link. When the email gives only a generic description and the lookup fails, say so ("Shipped, but the notice only says 'coffee accessories'").
+- Keep the location line (where it was left, from the notice) and the tracking link.
 
 **Every notify in this section carries `--evidence-as-of <the email's own Date, ISO-8601>` — same rule and same reason as the P1 pointer (§ Phone-channel notification policy above), including a delay or exception update, not just the two commands above.** The carrier's notice IS the evidence and you are already holding it, so pass its `Date` header rather than the literal `live`: a catch-up run on a three-day-old notice then still gets re-checked, anchored at its own arrival, instead of claiming to be fresh. Leave the flag off and the truthfulness gate (`lib/claim-freshness.mjs`, Rule #2) sees `undated_evidence` and widens the mailbox re-check to a **14-day lookback** — and for shipping mail that window is mostly the *previous* shipment of the same thing. What that cost on 2026-09-26: a UPS "package was delivered" notice was notified 91 seconds later and **suppressed as a stale premise** — the 14-day search surfaced only the previous month's shipment of the same thing under a different tracking number, which the adjudicator read as "memory is silent about this one". With the `Date` header the identical message exits at stage 0 as `fresh_evidence` (age 91.9s) and costs nothing at all.
 
@@ -414,10 +422,11 @@ When triaging a reply from the user's address on a Jori-originated thread (a dig
 Instead: label + star + mark read as a normal P2 personal email (it needs follow-through, so don't silence it), then dispatch it as its own top-level task so it gets a fresh turn and proper budget — the usual webhook dispatch shape:
 
 ```bash
-TOKEN=$(cat ~/Dev/jori/secrets/webhook-token) && curl -s -X POST http://localhost:9092 \
-  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
-  -d '{"task":"The user replied to <original subject> with an instruction: \"<verbatim instruction text>\". Context: <one-line summary of what the original email was about>. Follow the instruction.","source":"triage-reply-instruction"}'
+~/Dev/jori/bin/jori dispatch --source triage-reply-instruction \
+  --task 'The user replied to <original subject> with an instruction: "<verbatim instruction text>". Context: <one-line summary of what the original email was about>. Follow the instruction.'
 ```
+
+(`jori dispatch` reads the webhook token itself; an agent never reads `secrets/` — agent/CLAUDE.md § Secrets.)
 
 This only applies to genuine instructions — a plain acknowledgment ("thanks", "got it"), a question, or commentary with nothing actionable stays as ordinary triage (label + read, no dispatch). When in doubt about whether something rises to "instruction," lean toward dispatching — a redundant task that finds nothing to do is cheap; a silently dropped instruction is not.
 
@@ -439,7 +448,7 @@ This only applies to genuine instructions — a plain acknowledgment ("thanks", 
 
 **Current mode: `shadow`** (`data/triage-decide-config.json`). Live triage is unchanged: every email still dispatches to you. Alongside each dispatch a detached `triage-decide shadow` logs what it WOULD have done to `data/triage-decide-shadow.jsonl`. You do not interact with it.
 
-**Measuring it.** `triage-decide report [--days N]` compares each shadow decision with what actually happened — the `triage_decisions` row (final label + priority, including any later reclassify or unstar by the user) — after a 20-minute settle.
+**Measuring it.** `triage-decide report [--days N]` compares each shadow decision with what actually happened — the `triage_decisions` row (final label + priority, including any later reclassification) — after a 20-minute settle. A P1 that was later **handled** (the user replied, unstarred it or resolved it by text; `p1-downgrade` sources `reply`, `unstar-scan`, `text-resolve`, `paired-followup`) stays a P1 in that row: the resolution is stamped in `resolved_at` / `resolved_by` and never rewrites the decision. Before 2026-11-16 it did, so every handled P1 read as P3 and the report showed ~61% priority agreement where the shadow had mostly matched the agent; the old rows were repaired from `data/p1-resolutions.jsonl` (`lib/triage-decisions.js` `repairFromResolutions`).
 
 **Cutover criteria — all must hold, over the report window:**
 1. ≥ 150 compared emails spanning ≥ 7 days;
@@ -447,4 +456,4 @@ This only applies to genuine instructions — a plain acknowledgment ("thanks", 
 3. **zero missed P1s** (the actual outcome was P1 and the shadow said P2/P3);
 4. (was: a human read of every disagreement first — waived by the user on 2026-10-05; read the `≠` rows in `triage-decide report` after the flip instead.)
 
-**The flip is automatic.** The daily `shadow-cutover-check` cron (10:00 local) sets `"mode": "live"` in the config when `report --json` says `verdict.ready`, and announces it once on the system channel. Rollback is the same edit back to `"shadow"` (read per email; no restart). In live mode any model failure, invalid output, failed gmail-action call, or agent-needing tag falls back to the normal dispatch — an email is never dropped.
+**The flip is held for the owner (since 2026-11-16).** The daily `shadow-cutover-check` cron (10:00 local) reads `report --json`; with `"auto_flip": false` in the config it announces readiness once on the system channel and leaves the mode alone, and the owner sets `"mode": "live"`. Without that key it flips on its own when `verdict.ready`, and announces it once. Rollback is the same edit back to `"shadow"` (read per email; no restart). In live mode any model failure, invalid output, failed gmail-action call, or agent-needing tag falls back to the normal dispatch — an email is never dropped.

@@ -580,3 +580,237 @@ test("a failed lookup with nothing kept returns no features and writes nothing",
     fs.rmSync(cacheDir, { recursive: true, force: true });
   }
 });
+
+// ---------------------------------------------------------------------------
+// The routine walk from home (2026-11-21): a short loop out of the house and
+// back on foot is its own named event. Geometry from a real evening (metres east
+// / north of the house, synthetic origin): out at 17:26, 596 m east at 17:38,
+// back in at 17:49, every fix out there tagged walking, a 13-minute iOS visit row
+// in the middle of it that the user was asked about. Titles come from the
+// routine-walk config; "Dog" here.
+// ---------------------------------------------------------------------------
+{
+  const { homeLoopConfig, findHomeLoops, applyHomeLoopWalks, dropHomeLoopCompanion, HOME_LOOP_DEFAULTS } =
+    require(path.join(ROOT, "lib/day-excursions.js"));
+  const TN = (hms) => Date.parse(`2026-11-20T${hms.length === 5 ? hms + ":00" : hms}-05:00`);
+  const fixN = (hms, e, n, acc, activity) => ({ ts: TN(hms), ...at(e, n), acc, activity, kind: "transit" });
+  const visitN = (hms, e, n, acc = 10) => ({ ts: TN(hms), ...at(e, n), acc, activity: null, kind: "visit" });
+  // The named location sits ~70 m off the door, as real ones do: the trace's own
+  // points at home decide where the house is.
+  const ENTRY = { name: "Home (Example)", kind: "home", ...at(-70, 20) };
+  const CFG = homeLoopConfig({ routineWalk: { homes: ["Home (Example)"], companion: "Dog" }, entries: [ENTRY] });
+  const EVENING = [
+    visitN("16:33:38", -4.7, -12.7, 2),
+    fixN("16:46:59", 4.2, 7.2, 3, "unknown"),
+    fixN("16:47:54", 0, 0, 13, "unknown"),
+    fixN("16:50:10", 1.5, -2, 10, "stationary"),
+    fixN("17:26:31", 93, 18.3, 26, "walking"),
+    fixN("17:29:07", 164.3, 70.5, 15, "walking"),
+    visitN("17:29:55", 380.8, 53.2, 119),        // the iOS visit on the walk: never a point out
+    fixN("17:38:07", 590, 84.6, 21, "walking"),
+    fixN("17:45:24", 329.7, -15.8, 14, "walking"),
+    fixN("17:48:05", 185.7, -19.9, 28, "walking"),
+    visitN("17:49:16", -2.3, -25.5, 21),
+    fixN("17:50:34", 71.9, 6, 25, "walking"),
+    fixN("17:53:20", 12.3, 3, 17, "unknown"),
+    fixN("18:00:57", -323.4, -70.9, 1414, "walking"),   // a cell-tower fix: places him nowhere
+    fixN("19:05:42", 0, 0, 13, "stationary"),
+  ];
+  const hm = (ms) => new Date(ms - 5 * 3600_000).toISOString().slice(11, 16);
+  const homeN = (id, start, end, extra = {}) => ({
+    id, start, end, start_ts_ms: TN(start), end_ts_ms: TN(end), duration_min: Math.round((TN(end) - TN(start)) / 60000),
+    ...at(0, 0), place: { name: "Home (Example)", source: "named_location", confidence: 0.95 },
+    companions: ["Partner"], photos: [], ...extra,
+  });
+  const orphanN = () => ({
+    id: "s-3", start: "17:29", end: "17:43", start_ts_ms: TN("17:29:55"), end_ts_ms: TN("17:43:07"), duration_min: 13,
+    ...at(380.8, 53.2), place: { name: "100 Example St", source: "address", confidence: 0.4 },
+    companions: ["Dog"], photos: [{ uuid: "p-walk", ts: "2026-11-20T22:35:00Z" }],
+  });
+
+  test("routine walk: the real evening's loop is found, timed from the trace and measured from the door", () => {
+    assert.ok(CFG, "the config resolves");
+    assert.equal(CFG.title, "Dog's walk");
+    const { loops, rejected } = findHomeLoops(EVENING, CFG);
+    assert.equal(loops.length, 1, JSON.stringify(rejected));
+    const L = loops[0];
+    assert.ok(Math.abs(L.away_m - 596) <= 3, `${L.away_m} m out`);
+    assert.ok(L.on_foot >= 4, `${L.on_foot} on foot`);
+    assert.equal(L.end_ms, TN("17:49:16"), "back home at the visit row's arrival");
+    assert.ok(L.start_ms >= TN("17:25:00") && L.start_ms <= TN("17:27:30"), `left ${hm(L.start_ms)}`);
+    assert.ok(L.minutes > 20 && L.minutes < 25, `${L.minutes} min`);
+    assert.ok(L.longest_silence_min < 10);
+  });
+
+  test("routine walk: a silence from one home fix to the next is no walk, and nothing is recorded", () => {
+    const quiet = [fixN("23:01:07", 0, 0, 13, "stationary"), fixN("23:50:05", 3, 5, 17, "unknown"), fixN("23:52:15", -1, 0, 8, "stationary")];
+    const r = findHomeLoops(quiet, CFG);
+    assert.deepEqual([r.loops.length, r.open.length, r.rejected.length], [0, 0, 0]);
+  });
+
+  test("routine walk: no fix on foot, a vehicle, a rest out there, a long silence, or too far: not one", () => {
+    const base = (pts) => [fixN("16:50", 1, -1, 8, "stationary"), fixN("17:00", 0, 0, 10, "stationary"), ...pts, fixN("17:40", 2, 1, 10, "stationary")];
+    const cases = {
+      "no fix out of the house on foot": [fixN("17:10", 200, 0, 10, "unknown"), fixN("17:20", 300, 0, 10, "unknown")],
+      "a point out of the house was in a vehicle": [fixN("17:10", 200, 0, 10, "walking"), fixN("17:20", 600, 0, 10, "driving")],
+      "km/h": [fixN("17:10", 200, 0, 10, "walking"), fixN("17:11", 800, 0, 10, "walking")],
+      "stood still": [fixN("17:10", 300, 0, 10, "walking"), fixN("17:14", 305, 3, 10, "stationary"), fixN("17:22", 302, 1, 10, "stationary")],
+      "silence out of the house": [fixN("17:08", 300, 0, 10, "walking"), fixN("17:34", 250, 0, 10, "walking")],
+      "a longer walk": [fixN("17:10", 600, 0, 10, "walking"), fixN("17:20", 1400, 0, 10, "walking"), fixN("17:30", 500, 0, 10, "walking")],
+      "never got further": [fixN("17:10", 120, 0, 5, "walking"), fixN("17:20", 140, 0, 5, "walking")],
+    };
+    for (const [why, pts] of Object.entries(cases)) {
+      const r = findHomeLoops(base(pts), CFG);
+      assert.equal(r.loops.length, 0, why);
+      assert.equal(r.rejected.length, 1, why);
+      assert.ok(r.rejected[0].reason.includes(why), `${why}: ${r.rejected[0].reason}`);
+    }
+  });
+
+  test("routine walk: added as its own event, the sliver swallowed, the stays at home giving up its minutes", () => {
+    // The first stay's window runs a minute into the walk, as iOS departures do.
+    const stops = [homeN("s-1", "16:33", "17:28"), orphanN(), homeN("s-4", "17:49", "23:59")];
+    const { stops: out, walks } = applyHomeLoopWalks(stops, EVENING, { cfg: CFG, hmFromMs: hm });
+    const walk = out.find(s => s.home_loop_walk);
+    assert.ok(walk, JSON.stringify(walks));
+    assert.equal(walk.place.name, "Dog's walk");
+    assert.equal(walk.place.source, "excursion");
+    assert.equal(walk.excursion.home_loop, true);
+    assert.equal(walk.excursion.mode, "walking");
+    assert.equal(walk.excursion.absorbed.length, 1, "the iOS visit is part of the walk");
+    assert.deepEqual(walk.photos.map(p => p.uuid), ["p-walk"]);
+    assert.deepEqual(walk.companions, [], "the walk's own companion is its title, not a person on it");
+    assert.equal(out.find(s => s.id === "s-1").end_ts_ms, walk.start_ts_ms);
+    assert.equal(out.find(s => s.id === "s-4").start_ts_ms, walk.end_ts_ms);
+    assert.ok(!out.some(s => s.id === "s-3"));
+    assert.deepEqual(out.map(s => s.id), ["s-1", walk.id, "s-4"], "in time order");
+    assert.equal(walks.filter(w => w.emitted).length, 1);
+    // It renders as its own line: a confirmed walk block, always shown.
+    const prov = computeProvenance(walk, {});
+    assert.equal(prov.excursion, true);
+    assert.equal(prov.tier, "CONFIRMED");
+    assert.equal(isMainStop({ ...walk, provenance: prov }), true);
+  });
+
+  test("routine walk: inside one long stay at home, the stay is cut around it", () => {
+    const stops = [homeN("s-1", "16:30", "23:59", { photos: [{ uuid: "early", ts: "2026-11-20T21:40:00Z" }, { uuid: "late", ts: "2026-11-21T00:10:00Z" }] })];
+    const { stops: out } = applyHomeLoopWalks(stops, EVENING, { cfg: CFG, hmFromMs: hm });
+    assert.deepEqual(out.map(s => s.place.name), ["Home (Example)", "Dog's walk", "Home (Example)"]);
+    const [head, walk, tail] = out;
+    assert.equal(head.end_ts_ms, walk.start_ts_ms);
+    assert.equal(tail.start_ts_ms, walk.end_ts_ms);
+    assert.equal(tail.end_ts_ms, TN("23:59"));
+    assert.deepEqual(head.photos.map(p => p.uuid), ["early"]);
+    assert.deepEqual(tail.photos.map(p => p.uuid), ["late"]);
+    assert.deepEqual(tail.companions, ["Partner"], "the people at home stay at home");
+  });
+
+  test("routine walk: a walk block another pass built is retitled, keeping what it measured", () => {
+    const block = { id: "s-1-loop", start: "17:26", end: "17:49", start_ts_ms: TN("17:26"), end_ts_ms: TN("17:49"), duration_min: 23,
+      ...at(590, 84.6), place: { name: "Walk around Example Park", source: "excursion", confidence: 0.7 },
+      companions: [], photos: [], excursion: { routed_m: 1180, away_m: 596, kmh: 3.1, mode: "walking", feature: { name: "Example Park", kind: "green" }, absorbed: [] } };
+    const { stops: out, walks } = applyHomeLoopWalks([homeN("s-1", "16:33", "17:26"), block, homeN("s-4", "17:49", "23:59")], EVENING, { cfg: CFG, hmFromMs: hm });
+    const w = out.find(s => s.id === "s-1-loop");
+    assert.equal(w.place.name, "Dog's walk");
+    assert.equal(w.excursion.routed_m, 1180);
+    assert.equal(w.excursion.feature.name, "Example Park");
+    assert.equal(w.home_loop_walk.was, "Walk around Example Park");
+    assert.equal(walks.find(x => x.emitted).how, "retitled");
+    assert.equal(out.length, 3);
+  });
+
+  test("routine walk: the user's own answer inside it is the slot, and nothing changes", () => {
+    const answered = { ...orphanN(), place: { name: "Example Bakery", source: "user_confirmed", confidence: 1 } };
+    const stops = [homeN("s-1", "16:33", "17:26"), answered, homeN("s-4", "17:49", "23:59")];
+    const before = JSON.stringify(stops);
+    const { stops: out, walks } = applyHomeLoopWalks(stops, EVENING, { cfg: CFG, hmFromMs: hm });
+    assert.equal(JSON.stringify(out), before);
+    const w = walks.find(x => x.from === "17:26" || x.from === "17:27");
+    assert.equal(w.emitted, false);
+    assert.ok(w.reason.includes("Example Bakery"), w.reason);
+  });
+
+  test("routine walk: a longer walk built by another pass keeps its own title", () => {
+    const long = { id: "s-1-loop", start: "16:50", end: "18:40", start_ts_ms: TN("16:50"), end_ts_ms: TN("18:40"), duration_min: 110,
+      ...at(590, 84.6), place: { name: "Walk to Example Town", source: "excursion", confidence: 0.7 }, companions: [], photos: [],
+      excursion: { routed_m: 6000, away_m: 2400, mode: "walking", absorbed: [] } };
+    const { stops: out, walks } = applyHomeLoopWalks([long], EVENING, { cfg: CFG, hmFromMs: hm });
+    assert.equal(out[0].place.name, "Walk to Example Town");
+    assert.ok(walks.find(x => !x.emitted && /longer walk/.test(x.reason)));
+  });
+
+  test("routine walk: the switch, and no title without a companion or a loop_title", () => {
+    assert.equal(homeLoopConfig({ routineWalk: { homes: ["Home (Example)"] }, entries: [ENTRY] }), null);
+    assert.equal(homeLoopConfig({ routineWalk: { homes: ["Home (Example)"], companion: "Dog", loop_walk: false }, entries: [ENTRY] }), null);
+    assert.equal(homeLoopConfig({ routineWalk: { homes: ["Elsewhere"], companion: "Dog" }, entries: [ENTRY] }), null, "no home, no walk");
+    const t = homeLoopConfig({ routineWalk: { companion: "Dog", loop_title: "Evening stroll", loop_thresholds: { max_min: 30 } }, entries: [ENTRY] });
+    assert.equal(t.title, "Evening stroll");
+    assert.equal(t.max_min, 30);
+    assert.equal(t.min_away_m, HOME_LOOP_DEFAULTS.min_away_m);
+    assert.equal(t.homes[0].name, "Home (Example)", "default homes: every entry of kind home");
+    const was = process.env.JORI_HOME_LOOP_WALK;
+    process.env.JORI_HOME_LOOP_WALK = "0";
+    try {
+      assert.equal(homeLoopConfig({ routineWalk: { companion: "Dog" }, entries: [ENTRY] }), null);
+      const stops = [homeN("s-1", "16:33", "17:26"), orphanN(), homeN("s-4", "17:49", "23:59")];
+      assert.equal(applyHomeLoopWalks(stops, EVENING, { cfg: homeLoopConfig({ routineWalk: { companion: "Dog" }, entries: [ENTRY] }) }).stops.length, 3);
+    } finally {
+      if (was === undefined) delete process.env.JORI_HOME_LOOP_WALK; else process.env.JORI_HOME_LOOP_WALK = was;
+    }
+  });
+
+  test("routine walk: one loose point out of the house is too weak alone", () => {
+    // 23:32 at home, one walking fix 167 m out at ±33 m, home again at 23:48.
+    const r = findHomeLoops([fixN("23:20", 1, 1, 13, "stationary"), fixN("23:32:45", 0, 1, 13, "unknown"),
+      fixN("23:46:23", 160, -48, 33, "walking"), visitN("23:48:50", -1, -19, 11)], CFG);
+    assert.equal(r.loops.length, 0);
+    assert.match(r.rejected[0].reason, /too weak alone/);
+  });
+
+  test("routine walk: a quiet way back that could hide a stop, or only loose points out, is no walk", () => {
+    const home = [fixN("17:00", 0, 0, 10, "stationary"), fixN("17:05", 1, 1, 10, "stationary")];
+    const slowBack = findHomeLoops([...home, fixN("17:20", 200, 0, 10, "walking"), fixN("17:30", 300, 0, 10, "walking"),
+      fixN("17:49", 2, 0, 10, "unknown")], CFG);
+    assert.equal(slowBack.loops.length, 0);
+    assert.match(slowBack.rejected[0].reason, /silence/);
+    const loose = findHomeLoops([...home, fixN("17:20", 160, 0, 55, "walking"), fixN("17:27", 158, 8, 55, "unknown"),
+      fixN("17:30", 2, 0, 10, "unknown")], CFG);
+    assert.equal(loose.loops.length, 0);
+    assert.match(loose.rejected[0].reason, /too weak alone/);
+  });
+
+  test("routine walk: the stops handed in are left as they were (resolve-day falls back to them)", () => {
+    const stops = [homeN("s-1", "16:30", "23:59"), orphanN()];
+    const before = JSON.stringify(stops);
+    const { stops: out } = applyHomeLoopWalks(stops, EVENING, { cfg: CFG, hmFromMs: hm });
+    assert.equal(JSON.stringify(stops), before);
+    assert.equal(out.length, 3);
+  });
+
+  test("routine walk: a named place right by the house is a destination, not the house", () => {
+    const neighbour = { id: "s-n", start: "17:40", end: "17:44", start_ts_ms: TN("17:40"), end_ts_ms: TN("17:44"), duration_min: 4,
+      ...at(110, 0), place: { name: "Example Neighbour", source: "user_confirmed", confidence: 1 }, companions: [], photos: [] };
+    const stops = [homeN("s-1", "16:33", "17:28"), neighbour, homeN("s-4", "17:49", "23:59")];
+    const { stops: out, walks } = applyHomeLoopWalks(stops, EVENING, { cfg: CFG, hmFromMs: hm });
+    assert.ok(!out.some(s => s.home_loop_walk));
+    assert.ok(walks.some(w => !w.emitted && /Example Neighbour/.test(w.reason)), JSON.stringify(walks));
+  });
+
+  test("routine walk: a morning walk after a silent night leaves from the night's stay", () => {
+    const night = homeN("s-1", "00:00", "07:40");
+    const morning = [fixN("07:42", 120, 30, 12, "walking"), fixN("07:47", 380, 60, 15, "walking"),
+      fixN("07:52", 200, -10, 14, "walking"), fixN("07:56", 3, 2, 9, "unknown"), fixN("08:20", 0, 1, 8, "stationary")];
+    const { stops: out, walks } = applyHomeLoopWalks([night, homeN("s-2", "07:56", "12:00")], morning, { cfg: CFG, hmFromMs: hm });
+    const w = out.find(s => s.home_loop_walk);
+    assert.ok(w, JSON.stringify(walks));
+    assert.equal(w.end_ts_ms, TN("07:56"));
+  });
+
+  test("routine walk: a later pass's people never put the walk's own companion on it", () => {
+    const stops = [{ id: "w", companions: ["Dog", "Partner", { name: "Dog" }], home_loop_walk: { companion: "Dog" } },
+                   { id: "h", companions: ["Dog", "Partner"] }];
+    dropHomeLoopCompanion(stops);
+    assert.deepEqual(stops[0].companions, ["Partner"]);
+    assert.deepEqual(stops[1].companions, ["Dog", "Partner"], "other stops keep everyone");
+  });
+}

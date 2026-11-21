@@ -28,6 +28,17 @@ test("processorOf: real processor hosts and their subdomains, never look-alikes"
   assert.equal(C.processorOf("https://notstripe.com/x"), null);
   assert.equal(C.processorOf("javascript:alert(1)"), null);
   assert.equal(C.processorOf("about:blank"), null);
+  // Booking Holdings' payment component: that host only, not the rest of booking.com.
+  assert.equal(C.processorOf("https://paymentcomponent.booking.com/v2/card?x=1"), "paymentcomponent.booking.com");
+  assert.equal(C.processorOf("https://www.booking.com/ads/frame"), null);
+  assert.equal(C.processorOf("https://paymentcomponent.booking.com.evil.io/x"), null);
+});
+
+test("chainVerdict: a merchant that embeds Booking's payment component", () => {
+  const site = "rentals.example";
+  assert.deepEqual(C.chainVerdict(["https://www.rentals.example/checkout/abc", "https://paymentcomponent.booking.com/v2/card"], site),
+    { ok: true, processor: "paymentcomponent.booking.com" });
+  assert.equal(C.chainVerdict(["https://www.rentals.example/checkout/abc", "https://secure.booking.com/x"], site).ok, false);
 });
 
 test("chainVerdict: the merchant's own frames, then one processor", () => {
@@ -236,6 +247,20 @@ test("end to end: fills a processor's cross-origin frame with real keys, clicks 
   assert.equal(r.added, true);
   assert.equal(r.button, "continue");
   assert.equal(JSON.stringify(r).includes("4111"), false, "the result never carries a value");
+
+  // The review step can vouch for the last 4 from the frame's own field (true/false only).
+  s = await B.connect(tab);
+  assert.equal(await C.cardNumberEndsWith(s, { site: "merchant.test", last4: "1111", processors: ["processor.test"] }), true);
+  s.close();
+  s = await B.connect(tab);
+  assert.equal(await C.cardNumberEndsWith(s, { site: "merchant.test", last4: "4242", processors: ["processor.test"] }), false);
+  s.close();
+  s = await B.connect(tab);
+  assert.equal(await C.cardNumberEndsWith(s, { site: "merchant.test", last4: "1111", processors: ["stripe.com"] }), false, "a processor not on the list cannot vouch");
+  s.close();
+  s = await B.connect(tab);
+  assert.equal(await C.cardNumberEndsWith(s, { site: "other.test", last4: "1111", processors: ["processor.test"] }), false);
+  s.close();
 
   await B.sleep(300);
   const inFrame = await frameEval(chrome.port, "pay.processor.test", `({

@@ -36,6 +36,9 @@ export PATH="$NODE_DIR:$PATH"
 
 if "$JORI_NODE" "$HERE/supabase-token" --configured; then
   SUPABASE_ACCESS_TOKEN="$("$JORI_NODE" "$HERE/supabase-token")"
+elif [ -z "${SUPABASE_ACCESS_TOKEN:-}" ] && [ -f "$HERE/../.env" ] \
+  && SUPABASE_ACCESS_TOKEN="$(sed -n 's/^SUPABASE_ACCESS_TOKEN=//p' "$HERE/../.env" | head -1)" && [ -n "$SUPABASE_ACCESS_TOKEN" ]; then
+  : # from .env: the agent that starts this server may run without secrets in its env (docs/agent-secrets.md)
 elif [ -z "${SUPABASE_ACCESS_TOKEN:-}" ]; then
   echo "supabase-mcp: no token (no OAuth app for bin/supabase-token, no SUPABASE_ACCESS_TOKEN)" >&2
   exit 1

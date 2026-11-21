@@ -94,6 +94,13 @@ async function readActivityState() {
   return value;
 }
 
+function sleepGateState(nowMs) {
+  try {
+    const sig = createRequire(import.meta.url)("../lib/sleep-night.js").sleepSignal({ nowMs });
+    return sig.usable ? sig.state : undefined;
+  } catch { return undefined; }
+}
+
 async function gatherGates(state, config, nowMs) {
   const tz = userTz();
   const local = localParts(tz, new Date(nowMs));
@@ -137,8 +144,14 @@ async function gatherGates(state, config, nowMs) {
     (nowMs - new Date(cursor.lastSeenAt).getTime()) / 60000 < (config.conversation_grace_min ?? 4)
   );
 
+  // Asleep or not, from sleep data + the phone's lock/unlock rows (never the
+  // clock); undefined when there is no usable sleep signal (sensing off, no
+  // recent phone rows, a stale reading), so the gate's clock quiet hours apply then (lib/hum-events.mjs applyQuietHours).
+  const sleep = sleepGateState(nowMs);
+
   return {
     local_hour: local.hour,
+    sleep,
     paused,
     activity_state: await readActivityState(),
     in_meeting: inMeeting,
@@ -179,6 +192,9 @@ async function runSensor(entry, { state, config, nowMs }) {
     nowMs,
     tz: userTz(),
     local: localParts(userTz(), new Date(nowMs)),
+    // "asleep" | "awake" from the sleep signal; undefined with no usable signal
+    // (then a sensor falls back to its clock quiet hours).
+    sleep: sleepGateState(nowMs),
     config,
     state,
     memo: state.sensors?.[name]?.memo ?? {},

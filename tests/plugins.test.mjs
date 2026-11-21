@@ -27,8 +27,9 @@ function mk(name, manifest, files = {}) {
 }
 
 mk("alpha", { schedules: [{ label: "alpha-tick", cron: "*/15 * * * *", run: "bin/alpha --go", log: "logs/alpha.log" }], provides_bins: ["alpha"],
-  jobs: { "alpha-job": { routing: { target: "ops", model: "sonnet" }, task: { description: "does alpha" } } } },
-  { "bin/alpha": "#!/bin/sh\n", "jobs/alpha-job.md": "ALPHA\n" });
+  jobs: { "alpha-job": { routing: { target: "ops", model: "sonnet" }, task: { description: "does alpha" } },
+    "alpha-browse": { chrome: true, routing: { target: "ops", model: "sonnet" } } } },
+  { "bin/alpha": "#!/bin/sh\n", "jobs/alpha-job.md": "ALPHA\n", "jobs/alpha-browse.md": "BROWSE\n" });
 mk("beta", { requires: { plugins: ["alpha"] }, config: { name: "beta", schedules: true } });
 mk("gamma", { default: "disabled" });
 mk("broken", { schedules: [{ label: "x", cron: "* *", run: "" }] });
@@ -60,6 +61,8 @@ test("an enabled plugin contributes its playbooks, routing, tasks and settings-d
   assert.ok(P.jobDirs()[0].endsWith(path.join("alpha", "jobs")));
   assert.deepEqual(P.registryContributions("job-routing")["alpha-job"], { target: "ops", model: "sonnet", plugin: "alpha" });
   assert.equal(P.registryContributions("tasks")[0].name, "alpha-job");
+  assert.deepEqual(P.registryContributions("chrome-jobs"), ["alpha-browse"], "a job marked chrome: true is pinned to ops");
+  assert.ok(P.validate({ name: "x", title: "t", description: "d", jobs: { y: { chrome: "yes" } } }).some((e) => /chrome must be true or false/.test(e)));
   assert.deepEqual(P.schedulesOf(P.plugin("beta")).map((s) => s.label), ["beta-daily"]);
   assert.equal(P.ownerOf({ label: "beta-daily" }), "beta");
   assert.equal(P.ownerOf({ job: "alpha-job" }), "alpha");
@@ -197,4 +200,13 @@ test("plugin new: the template becomes a valid, off-by-default plugin with its s
   assert.equal(fs.existsSync(path.join(plain.dir, "jobs")), false, "no playbook without --job");
   fs.rmSync(path.join(KDIR, "mu-check"), { recursive: true });
   fs.rmSync(path.join(KDIR, "nu-check"), { recursive: true });
+});
+
+test("a sync's crontab-safe call is capped above crontab-safe's own read and install timeouts", () => {
+  // Defaults: 20 s read + 120 s install (+ room to start). The install never gets less than the read.
+  assert.equal(M.crontabSafeMs({}), (20 + 120 + 30) * 1000);
+  assert.equal(M.crontabSafeMs({ CRONTAB_SAFE_TIMEOUT: "150" }), (150 + 150 + 30) * 1000);
+  assert.equal(M.crontabSafeMs({ CRONTAB_SAFE_INSTALL_TIMEOUT: "300" }), (20 + 300 + 30) * 1000);
+  // Not a positive whole number: the default, as crontab-safe reads it.
+  assert.equal(M.crontabSafeMs({ CRONTAB_SAFE_TIMEOUT: "0", CRONTAB_SAFE_INSTALL_TIMEOUT: "soon" }), (20 + 120 + 30) * 1000);
 });

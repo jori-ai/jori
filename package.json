@@ -11,6 +11,7 @@
     "@photostructure/tz-lookup": "^11.7.0",
     "docx": "^9.6.1",
     "exceljs": "^4.4.0",
+    "qrcode": "^1.5.4",
     "xlsx": "^0.18.5"
   }
 }

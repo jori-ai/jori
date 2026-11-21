@@ -130,6 +130,14 @@ test("a routes[] leg under a spine leg takes the spine's mode and keeps its own 
   assert.equal(out[0].legs[0].spine_leg, "l3");
 });
 
+test("a routes[] leg the classifier flew keeps it under a spine leg that can only say driving", () => {
+  const spine = [{ type: "leg", id: "l1", mode: "driving", mode_uncertain: false, start_ms: ET(16, 48), end_ms: ET(19, 30) }];
+  const routes = [{ id: "r", legs: [{ mode: "flew", start: iso(ET(16, 48)), end: iso(ET(19, 30)), distance_km: 1887 }] }];
+  const out = supersedeRouteModesBySpine(routes, spine);
+  assert.equal(out[0].legs[0].mode, "flew");
+  assert.equal(out[0].legs[0].mode_was, undefined);
+});
+
 test("a routes[] leg the spine does not cover keeps its own mode", () => {
   const spine = [{ type: "leg", id: "l0", mode: "walking", start_ms: ET(9, 0), end_ms: ET(9, 30) }];
   const routes = [{ id: "r", legs: [{ mode: "drove", start: iso(ET(15, 0)), end: iso(ET(15, 20)) }] }];

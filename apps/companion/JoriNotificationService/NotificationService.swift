@@ -39,9 +39,33 @@ class NotificationService: UNNotificationServiceExtension {
             return
         }
 
+        // A push through the shared relay arrives sealed (`enc`) behind a
+        // placeholder alert. Open it first, so everything below — the urgent
+        // flag, what Siri reads, the tap's message_id — sees the real message.
+        // Any failure leaves the placeholder.
+        if request.content.userInfo["enc"] != nil {
+            do {
+                if let payload = try PushCrypto.payload(of: request.content.userInfo) {
+                    Self.apply(payload, to: bestAttemptContent)
+                }
+            } catch {
+                NSLog("[JoriNSE] could not open sealed push: \(error)")
+                AnnounceCache.trace("nse open failed: \(error)")
+            }
+        }
+        let userInfo = bestAttemptContent.userInfo
+
+        // A reply from the phone link proves the message got through, so the
+        // app's 10-minute "hasn't received your message" alarm for that
+        // channel (PickupWatch) must not go off. The app can only cancel it
+        // while it runs; this runs for every push, suspended or not.
+        if let channel = userInfo["pickup_channel"] as? String {
+            Self.cancelPickupAlarms(channel: channel)
+        }
+
         // Urgent pings (apns-push --urgent) carry an `urgent` flag. Promote them
         // to time-sensitive so they pierce Driving/Reduce-Interruptions Focus.
-        let urgent = request.content.userInfo["urgent"]
+        let urgent = userInfo["urgent"]
         if (urgent as? Bool) == true || (urgent as? Int) == 1 {
             bestAttemptContent.interruptionLevel = .timeSensitive
         }
@@ -49,10 +73,10 @@ class NotificationService: UNNotificationServiceExtension {
         // What Siri reads aloud for this notification: the Intents extension
         // answers Siri's INSearchForMessagesIntent (keyed by this request id)
         // from this cache. See AnnounceCache.swift.
-        AnnounceCache.trace("nse received req=\(request.identifier) msg=\(request.content.userInfo["message_id"] as? String ?? "-") cat=\(request.content.categoryIdentifier) group=\(AnnounceCache.groupDescription)")
+        AnnounceCache.trace("nse received req=\(request.identifier) msg=\(userInfo["message_id"] as? String ?? "-") cat=\(bestAttemptContent.categoryIdentifier) group=\(AnnounceCache.groupDescription)")
         AnnounceCache.record(AnnouncedMessage(
             requestId: request.identifier,
-            messageId: request.content.userInfo["message_id"] as? String,
+            messageId: userInfo["message_id"] as? String,
             title: bestAttemptContent.title,
             body: bestAttemptContent.body,
             date: Date()))
@@ -119,17 +143,77 @@ class NotificationService: UNNotificationServiceExtension {
         }
     }
 
+    /// Same prefix as PickupWatch.notificationPrefix in the app target.
+    private static let pickupPrefix = "pickup-watch-"
+
+    /// Remove the pending (and any delivered) pickup alarms for `channel`. An
+    /// alarm scheduled before it carried a channel is removed too: a reply
+    /// proves the link is up whichever conversation it is in. Waits at most a
+    /// second, so a slow notification center cannot hold up the push.
+    static func cancelPickupAlarms(channel: String) {
+        let center = UNUserNotificationCenter.current()
+        let matches: (UNNotificationContent) -> Bool = { content in
+            guard let c = content.userInfo["channel"] as? String else { return true }
+            return c == channel
+        }
+        let done = DispatchSemaphore(value: 0)
+        center.getPendingNotificationRequests { requests in
+            let ids = requests.filter { $0.identifier.hasPrefix(pickupPrefix) && matches($0.content) }.map(\.identifier)
+            if !ids.isEmpty {
+                center.removePendingNotificationRequests(withIdentifiers: ids)
+                AnnounceCache.trace("nse cancelled \(ids.count) pickup alarm(s) for \(channel)")
+            }
+            done.signal()
+        }
+        _ = done.wait(timeout: .now() + 1)
+        center.getDeliveredNotifications { delivered in
+            let ids = delivered.map(\.request).filter { $0.identifier.hasPrefix(pickupPrefix) && matches($0.content) }.map(\.identifier)
+            if !ids.isEmpty { center.removeDeliveredNotifications(withIdentifiers: ids) }
+        }
+    }
+
     /// Jori's face as the sender photo (without one iOS draws a grey "J"). The
     /// image is the containing app's `JoriAvatar` asset, so this extension needs
     /// no resources of its own: the .appex sits in the app's PlugIns folder
     /// (Jori.app/PlugIns on iOS, Jori.app/Contents/PlugIns on macOS).
-    /// What the assistant is called: this extension's own Info.plist key
-    /// (JoriDisplayName ← JORI_DISPLAY_NAME), the same one `Install.displayName`
-    /// reads in the targets that compile SupabaseConfig.swift.
-    private static var assistantName: String {
-        let v = ((Bundle.main.object(forInfoDictionaryKey: "JoriDisplayName") as? String) ?? "")
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        return v.isEmpty || v.contains("$(") ? "Jori" : v // control-scan-ok: the setting's default
+    /// What the assistant is called: the pairing's name, else this
+    /// extension's own Info.plist key (JoriDisplayName ← JORI_DISPLAY_NAME).
+    private static var assistantName: String { Install.displayName }
+
+    /// Put a relayed push's real content on the notification: the decrypted
+    /// payload's `aps` (alert, sound, badge, thread, category, interruption
+    /// level) and its custom keys merged into userInfo, so the app's tap
+    /// handling reads them as if the push had come direct.
+    static func apply(_ payload: [String: Any], to content: UNMutableNotificationContent) {
+        if let aps = payload["aps"] as? [String: Any] {
+            switch aps["alert"] {
+            case let body as String:
+                content.title = ""
+                content.subtitle = ""
+                content.body = body
+            case let alert as [String: Any]:
+                content.title = alert["title"] as? String ?? ""
+                content.subtitle = alert["subtitle"] as? String ?? ""
+                content.body = alert["body"] as? String ?? ""
+            default:
+                break
+            }
+            if let name = (aps["sound"] as? String) ?? ((aps["sound"] as? [String: Any])?["name"] as? String) {
+                content.sound = name == "default" ? .default : UNNotificationSound(named: UNNotificationSoundName(name))
+            }
+            if let badge = aps["badge"] as? NSNumber { content.badge = badge }
+            if let thread = aps["thread-id"] as? String { content.threadIdentifier = thread }
+            if let category = aps["category"] as? String { content.categoryIdentifier = category }
+            if let target = aps["target-content-id"] as? String { content.targetContentIdentifier = target }
+            if let score = aps["relevance-score"] as? NSNumber { content.relevanceScore = score.doubleValue }
+            switch aps["interruption-level"] as? String {
+            case "passive": content.interruptionLevel = .passive
+            case "active": content.interruptionLevel = .active
+            case "time-sensitive": content.interruptionLevel = .timeSensitive
+            default: break   // "critical" needs an entitlement this app doesn't have
+            }
+        }
+        content.userInfo = PushCrypto.merged(content.userInfo, with: payload)
     }
 
     private static func senderAvatar() -> INImage? {

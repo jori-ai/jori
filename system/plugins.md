@@ -65,8 +65,18 @@ agent/local/plugins/<name>/     this installation's own plugin (private overlay)
 - `requires.bins` are files that must exist (relative to the install),
   `requires.commands` programs on PATH, `requires.env` `.env` keys,
   `requires.plugins` other plugins that must be enabled first.
+- `jobs.<job>.chrome: true` adds the job to the merged `chrome-jobs` registry
+  (`webhook-auth.sh` then pins it to ops, the only supervisor with the
+  chrome-devtools MCP), only while the plugin is enabled.
 - `jobs.<job>.routing` joins the merged `job-routing` registry and
   `jobs.<job>.task` the `tasks` registry, only while the plugin is enabled.
+  The task becomes a full entry (`lib/plugins.cjs` pluginTask): `phrases`
+  (default none) make it reachable by `jori tasks match`; `job`,
+  `webhook_task` and `name` are the job's; no trigger script and no webhook URL
+  (`jori tasks run <job> [--task "…"]` hands it to `jori dispatch`, which
+  picks the tier); its `schedule` is the task's own, else the plugin schedule
+  labelled as the job, else `on-demand`. Doctor finds a scheduled plugin task
+  by its `# jori-plugin:<name>:` cron marker, not by the time.
 - `services` adds entries to the control room's service catalog.
 - `approvals` declares actions that run only after a Face ID approval:
   `{ "<action>": { "title", "run", "ttl_minutes"?, "timeout_seconds"? } }`.
@@ -105,7 +115,24 @@ manifest's `default`. Everything reads the state through `lib/plugins.cjs`.
 - `sync` — makes the machine match the state: adds missing schedule lines and
   agents for enabled plugins, removes those of disabled or removed ones. A
   line's time is left alone if it exists (cron-tz-sync and the control room
-  retime lines in place). Run by `jori-sync` after a pull.
+  retime lines in place). Run by `jori-sync` after a pull, and hourly by the
+  watchdog (from cron).
+- **Where a sync can write the crontab (macOS).** Writing the crontab needs the
+  "administer your computer" permission (TCC `SystemPolicySysAdminFiles`) for
+  the process macOS holds responsible. Cron holds it on a set-up host; an
+  agent's Claude Code session may not. Writing is also slow: installing a
+  crontab of a few hundred lines can take tens of seconds, far longer than
+  reading it, so `crontab-safe` gives the install its own timeout
+  (`CRONTAB_SAFE_INSTALL_TIMEOUT`, default 120 s, never shorter than the
+  read's) while the read keeps its 20 s (`CRONTAB_SAFE_TIMEOUT`), and a sync
+  caps each `crontab-safe` call above both (`crontabSafeMs` in
+  `lib/plugin-manager.mjs`). A write that still does not finish in time (a
+  permission prompt nobody answers) is a skip: exit 1, a `timed out` line in
+  `data/logs/crontab-safe.log`, the crontab exactly as it was; reading the
+  crontab is not affected.
+  Nothing is lost: the watchdog's hourly sync installs the lines within the
+  hour. To install at once, run `jori plugin sync` from a Terminal that has
+  the permission.
 - `check` — manifests valid, no file claimed by two plugins, nothing outside a
   plugin imports a plugin's files, schedules match. Fails the pre-commit hook
   on a manifest error.

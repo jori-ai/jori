@@ -11,7 +11,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { canRebuild, queueCardRebuild, rebuildSpec, rebuildStatePath } from "../lib/self-improve-rebuild.mjs";
+import { canRebuild, queueCardRebuild, rebuildSpec, rebuildStatePath, queuedRebuild, withdrawQueuedRebuild } from "../lib/self-improve-rebuild.mjs";
 
 const root = () => fs.mkdtempSync(path.join(os.tmpdir(), "si-rebuild-test-"));
 const row = (extra = {}) => ({
@@ -68,4 +68,59 @@ test("never throws: an unwritable root reports why", () => {
   const out = queueCardRebuild({ root: "/dev/null/nope", row: row(), error: "e", now });
   assert.equal(out.queued, false);
   assert.match(out.reason, /could not queue/);
+});
+
+test("a card that went in but whose tests fail is queued once for a repair, not a rebuild", () => {
+  const r = root();
+  const card = row({ item_json: { files: { "bin/segment-ask": "x", "tests/segment-ask.test.mjs": "y" } } });
+  const out = queueCardRepair(r, card);
+  assert.equal(out.queued, true);
+  assert.match(out.requestId, /-rp3f1c2a90$/);
+  const req = JSON.parse(fs.readFileSync(path.join(r, "data/build-queue/pending", `${out.requestId}.json`), "utf8"));
+  assert.equal(req.source, "approval-rebuild", "same landing rules as a rebuild");
+  assert.equal(req.kind, "repair");
+  assert.equal(req.rebuild_of, card.id);
+  assert.match(req.spec, /^REPAIR OF AN APPLIED CARD — approval 3f1c2a90/);
+  assert.match(req.spec, /- asks once \(boom\)/);
+  assert.match(req.spec, /Do not revert the change/);
+  assert.match(req.spec, /Its test files: tests\/segment-ask\.test\.mjs/);
+  assert.ok(req.spec.length < 6000);
+  // Retried, same failure: no second request, and it says it is a repair already queued.
+  const again = queueCardRepair(r, card);
+  assert.equal(again.queued, false);
+  assert.match(again.reason, /^repair already queued/);
+});
+
+function queueCardRepair(r, card) {
+  return queueCardRebuild({ root: r, row: card, kind: "repair", error: "its tests fail: asks once (boom).", failures: ["asks once (boom)"], now });
+}
+
+// 2026-11-19: a retry said "already rebuilt once" of a rebuild that was only
+// waiting in held/; and if the original then goes in, the waiting rebuild would
+// come back as a second card for a live change.
+test("a waiting rebuild is reported where it is, and withdrawn once the original applies", () => {
+  const r = root();
+  const out = queueCardRebuild({ root: r, row: row(), error: "x", now });
+  const q = path.join(r, "data/build-queue");
+  fs.mkdirSync(path.join(q, "held"), { recursive: true });
+  fs.renameSync(path.join(q, "pending", `${out.requestId}.json`), path.join(q, "held", `${out.requestId}.json`));
+  assert.deepEqual(queuedRebuild({ root: r, id: row().id }), { requestId: out.requestId, kind: "rebuild", where: "held" });
+  const wd = withdrawQueuedRebuild({ root: r, id: row().id, now });
+  assert.equal(wd.withdrawn, true);
+  assert.equal(fs.existsSync(path.join(q, "held", `${out.requestId}.json`)), false);
+  assert.equal(queuedRebuild({ root: r, id: row().id }).where, "withdrawn");
+  // The once-rule still holds after a withdrawal.
+  assert.equal(queueCardRebuild({ root: r, row: row(), error: "x", now }).queued, false);
+  assert.equal(withdrawQueuedRebuild({ root: r, id: row().id, now }).withdrawn, false);
+});
+
+test("a running rebuild is never withdrawn; no rebuild means nothing to do", () => {
+  const r = root();
+  const out = queueCardRebuild({ root: r, row: row(), error: "x", now });
+  const q = path.join(r, "data/build-queue");
+  fs.renameSync(path.join(q, "pending", `${out.requestId}.json`), path.join(q, "running", `${out.requestId}.json`));
+  assert.equal(withdrawQueuedRebuild({ root: r, id: row().id, now }).withdrawn, false);
+  assert.equal(fs.existsSync(path.join(q, "running", `${out.requestId}.json`)), true);
+  assert.equal(queuedRebuild({ root: r, id: "nope" }), null);
+  assert.equal(withdrawQueuedRebuild({ root: r, id: "nope", now }).withdrawn, false);
 });

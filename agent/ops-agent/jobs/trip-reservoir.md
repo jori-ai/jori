@@ -45,7 +45,7 @@ For an ad-hoc area not in the builder's preset areas (trip-planning.json `areas`
    **Resumable (2026-07-09):** the parsed research is checkpointed to `data/trip-reservoir/.<area>.ckpt.json` the instant it succeeds, and verified entries are checkpointed every 5, so a run killed mid-verify **resumes** (reusing the research + already-verified entries) rather than re-forking. The checkpoint is deleted on successful completion.
 
    **Build SEQUENTIALLY, not concurrently.** Running 5 area builds at once exhausted the Max pool on 2026-07-09 and killed every build but the first. Launch one leg, let it finish (~5-15 min on Sonnet), then the next — or a small controlled batch, never the whole trip at once.
-2. **Verify + resolve** — every named place goes through `trip-place-verify "<query>" <lat> <lon>` (direct Places Text Search biased to the base). Resolved → attach mapsUri/address/rating/lat/lon; unresolved → drop (except a unique experience with no fixed location, which may legitimately have no venue).
+2. **Verify + resolve** — every named place goes through `trip-place-verify "<query>" <lat> <lon>` (direct Places Text Search biased to the base). Resolved → attach mapsUri/address/rating/lat/lon; unresolved → drop (except a unique experience with no fixed location, which may legitimately have no venue). **A Places refusal is not "unresolved" (2026-11-18):** when `trip-place-verify` exits 3–6 (month blocked, the daily 80 Atmosphere searches used, month ceiling, cannot verify) the venue was never checked, so the build checkpoints, logs `Places refused (daily cap reached, retry after 00:00 UTC): …` and exits **3** without saving a reservoir (re-running after the reset resumes from the checkpoint; the 30-day verify cache makes already-checked venues free). The area center is geocoded by `trip-place-verify --geocode` (a below-Enterprise field mask, so it is not counted against the venue cap); a refused geocode also exits 3, and "could not geocode" (exit 2) now means only that the label matched nothing.
 3. **Carry annotations** — on a rebuild, prior `state`/`skip_reason`/`felt` are preserved by name so feedback isn't lost.
 4. **Write** — JSON state file (machine source of truth) + a browsable `trip_reservoir_<area>` wiki page (readable via `wiki_read`).
 
@@ -64,5 +64,6 @@ For an ad-hoc area not in the builder's preset areas (trip-planning.json `areas`
 
 - **Sonnet research fork fails after 2 attempts:** alert via system channel, exit 1, write nothing — next run retries.
 - **Places verification finds nothing for any bucket:** exit 2, write no empty reservoir.
+- **Places refused a call (exit 3):** budget, not a bad label or place. Nothing is saved; retry after 00:00 UTC (daily cap) or when the month resets / the owner raises it. Never re-run the same day, and never read it as "could not geocode".
 - **Wiki write fails:** non-fatal — the JSON (the source of truth) is already written; log and continue.
 - **Script bug (not transient):** fix `bin/trip-reservoir-build`, verify with `--dry-run`, do not hand-run the research in a conversational turn.

@@ -1,4 +1,4 @@
-# Travel Manager (role plugin)
+# Travel (role plugin)
 
 Trips: flights and bookings, the travel timeline, area guides and fares.
 

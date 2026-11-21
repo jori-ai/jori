@@ -1,0 +1,50 @@
+#!/usr/bin/env node
+// self-status — what Jori is doing right now and how it is going: in-flight and
+// recent dispatches, purchases and their approvals, builds, background jobs,
+// failing scheduled jobs, open questions and approvals waiting on the user, and
+// what Jori last told the user (so a claim can be checked against the state).
+// Every item carries its state as its source wrote it and its age. A source
+// that cannot be read is listed as unknown, never shown as empty.
+//
+// The front door is `jori status --work` (this command); agents also have the
+// `self_status` MCP tool. Read it before saying anything about the state of
+// Jori's own work (agent/CLAUDE.md § Your own state). Logic: lib/self-status.mjs.
+//
+// Usage:
+//   self-status [--json] [--section dispatches,purchases,…] [--match <text>]
+//               [--deep] [--local] [--done N]
+//     --section  only these sections (dispatches forks purchases builds jobs
+//                cron questions approvals roles watches said doctor)
+//     --match    keep items whose id/what/state/detail contains this text
+//                (plain, case-insensitive substring; e.g. a queue id or a site);
+//                "said" then lists the last 7 days of Jori's messages containing it
+//     --deep     also run `jori doctor --json` (~10 s)
+//     --local    no network calls beyond the local supervisors (no Supabase)
+//     --done N   how many recently-done items to print (text mode; default 12)
+
+import { createRequire } from "node:module";
+import { collect, render, SECTIONS } from "../lib/self-status.mjs";
+
+const require = createRequire(import.meta.url);
+const argv = process.argv.slice(2);
+const flag = (n) => { const i = argv.indexOf(`--${n}`); return i >= 0 ? argv[i + 1] : null; };
+const has = (n) => argv.includes(`--${n}`);
+
+if (has("help") || has("h")) {
+  console.log("usage: self-status [--json] [--section a,b] [--match <text>] [--deep] [--local] [--done N]");
+  console.log(`sections: ${SECTIONS.join(" ")}`);
+  process.exit(0);
+}
+
+const sections = (flag("section") || "").split(",").map((s) => s.trim()).filter(Boolean);
+const bad = sections.filter((s) => !SECTIONS.includes(s));
+if (bad.length) { console.error(`self-status: unknown section(s): ${bad.join(", ")} (known: ${SECTIONS.join(" ")})`); process.exit(64); }
+
+const snap = await collect({ sections, deep: has("deep") || sections.includes("doctor"), match: flag("match"), remote: !has("local") });
+if (has("json")) {
+  console.log(JSON.stringify(snap, null, 2));
+} else {
+  let tz;
+  try { tz = require("../lib/instance.cjs").instanceValue("tz") || undefined; } catch {}
+  console.log(render(snap, { tz, doneLimit: Number(flag("done") || 12) }));
+}

@@ -156,3 +156,89 @@ test("the policy is the kernel file with the installation's own merged over it",
     if (old === undefined) delete process.env.JORI_LOCAL_DIR; else process.env.JORI_LOCAL_DIR = old;
   }
 });
+
+// ── A refused call is not a failed lookup; a geocode does not spend the venue cap ──
+// (bin/trip-place-verify --geocode, bin/trip-reservoir-build, lib/places-client.js classifyVerifyExit)
+{
+const { GEOCODE_MASK, classifyVerifyExit, refusalMessage } = require("../lib/places-client.js");
+const { tierForMask } = require("../lib/places-log.js");
+const guard = require("../lib/places-guard.js");
+const { spawnSync } = require("node:child_process");
+const TVR_TMP = fs.mkdtempSync(path.join(os.tmpdir(), "trip-verify-"));
+const policyFile = path.join(TVR_TMP, "policy.json");
+const countsFile = path.join(TVR_TMP, "counts.json");
+const policy = (over = {}) => ({
+  allowed_hosts: [], monthly_ceiling_usd: 40, assumed_free_per_month: {},
+  daily_live_caps: { enterprise_atmosphere: { "trip-place-verify": 80 } }, ...over,
+});
+const today = new Date().toISOString().slice(0, 10);
+fs.writeFileSync(policyFile, JSON.stringify(policy()));
+fs.writeFileSync(countsFile, JSON.stringify({ day: today, counts: { "enterprise_atmosphere|trip-place-verify": 80 } }));
+
+const env = (extra = {}) => ({
+  ...process.env, GOOGLE_PLACES_API_KEY: "test-key-never-sent",
+  PLACES_POLICY_FILE: policyFile, PLACES_TIER_COUNTS_FILE: countsFile,
+  PLACES_LEDGER_FILE: path.join(TVR_TMP, "ledger.json"), PLACES_LOG_FILE: path.join(TVR_TMP, "calls.jsonl"),
+  PLACES_BUDGET_STATE_FILE: path.join(TVR_TMP, "none.json"), ...extra,
+});
+
+test("the geocode mask is below the Enterprise tier, so it is not the Atmosphere cap's business", () => {
+  assert.equal(tierForMask(GEOCODE_MASK), "pro");
+  assert.ok(GEOCODE_MASK.includes("places.location"));
+});
+
+test("with the venue cap used up, a venue search is capped but a geocode is not", () => {
+  assert.match(guard.tierCapReason("trip-place-verify", "enterprise_atmosphere", { policyFile, countsFile }) || "", /80/);
+  assert.equal(guard.tierCapReason("trip-place-geocode", tierForMask(GEOCODE_MASK), { policyFile, countsFile }), null);
+  const pc = require("../lib/places-client.js");
+  const saved = { ...process.env };
+  Object.assign(process.env, env());
+  try {
+    const r = pc.preflight("trip-place-geocode", "searchText", tierForMask(GEOCODE_MASK));
+    assert.equal(r.sku, "Places API Text Search Pro");
+    assert.throws(() => pc.preflight("trip-place-verify", "searchText", "enterprise_atmosphere"), (e) => e.code === 4);
+  } finally { for (const k of Object.keys(env())) if (k in saved) process.env[k] = saved[k]; else delete process.env[k]; }
+});
+
+test("classifyVerifyExit: a refusal is told apart from no-match and from a crash", () => {
+  assert.deepEqual(classifyVerifyExit(0, ""), { kind: "ok" });
+  assert.deepEqual(classifyVerifyExit(1, "trip-place-verify: no match for \"x\""), { kind: "no_match" });
+  assert.deepEqual(classifyVerifyExit(null, ""), { kind: "error" });
+  assert.deepEqual(classifyVerifyExit(2, "usage"), { kind: "error" });
+  const daily = classifyVerifyExit(4, "trip-place-verify: 'trip-place-verify' used its 80 enterprise_atmosphere text searches for today (UTC).\n");
+  assert.equal(daily.kind, "refused");
+  assert.equal(daily.code, 4);
+  assert.equal(daily.daily_cap, true);
+  assert.ok(!daily.reason.startsWith("trip-place-verify:"));
+  assert.equal(classifyVerifyExit(4, "'x' has no opt-in for enterprise text search").daily_cap, false);
+  for (const code of [3, 5, 6]) assert.equal(classifyVerifyExit(code, "nope").kind, "refused");
+});
+
+test("refusalMessage says cap reached and when to retry, never 'could not geocode' on its own", () => {
+  const daily = classifyVerifyExit(4, "'trip-place-verify' used its 80 enterprise_atmosphere text searches for today (UTC).");
+  const m = refusalMessage(daily, 'could not geocode "Macau"');
+  assert.match(m, /daily cap reached, retry after 00:00 UTC/);
+  assert.match(m, /Places refused/);
+  assert.match(refusalMessage(classifyVerifyExit(5, "Places month ceiling: $40"), "x"), /month's Places budget/);
+});
+
+test("trip-place-verify: a capped venue search exits 4 with the cap named, before any network call", () => {
+  const r = spawnSync(path.join(ROOT, "bin", "trip-place-verify"),
+    [`Cap Test Venue ${process.pid}`, "1.5", "1.5"], { encoding: "utf8", env: env(), timeout: 20000 });
+  assert.equal(r.status, 4, r.stderr);
+  assert.match(r.stderr, /text searches for today/);
+});
+
+test("trip-reservoir-build: a refused geocode says Places refused and exits 3, not 'could not geocode' exit 2", () => {
+  // A month ceiling of 0 refuses the (Pro) geocode in the guard, offline.
+  const ceiling = path.join(TVR_TMP, "policy-ceiling.json");
+  fs.writeFileSync(ceiling, JSON.stringify(policy({ monthly_ceiling_usd: 0 })));
+  const r = spawnSync(path.join(ROOT, "bin", "trip-reservoir-build"),
+    ["--label", `Nowhereville ${process.pid}, Testland`, "--dry-run"],
+    { encoding: "utf8", env: env({ PLACES_POLICY_FILE: ceiling }), timeout: 60000 });
+  const out = `${r.stdout}${r.stderr}`;
+  assert.equal(r.status, 3, out);
+  assert.match(out, /Places refused/);
+  assert.doesNotMatch(out, /check the label/);
+});
+}

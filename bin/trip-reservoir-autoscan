@@ -81,46 +81,37 @@ async function scan() {
     return Object.values(b).some(a => Array.isArray(a) && a.length);
   }).map(r => r.area));
 
-  // Group every non-transit segment by metro. A metro can appear as several
-  // segments — a flights-derived destination span PLUS one or more lodging
-  // stays. Prefer the lodging/manual dates (the flights span covers the whole
-  // arrival→final-departure and would give a wrong, over-wide window, e.g. a city
-  // 7/9→8/12 vs the real 8/6→8/12 stay); fall back to flights only when there's
-  // no booked stay yet (a place we're flying to but haven't booked — still a
-  // visit worth a guide, e.g. a city before lodging is booked).
-  const byMetro = new Map();
-  for (const s of segs) {
-    if (!s.metro || s.metro === "transit") continue;
-    const arrive = Date.parse(s.arrive_at);
-    const depart = Date.parse(s.depart_at);
-    if (Number.isNaN(arrive)) continue;
-    const booked = s.source === "lodging" || s.source === "manual";
-    const g = byMetro.get(s.metro) || { metro: s.metro, booked: null, flights: null };
-    const tier = booked ? "booked" : "flights";
-    const cur = g[tier];
-    if (!cur) g[tier] = { arrive, depart, label: areaLabel(s) };
-    else { cur.arrive = Math.min(cur.arrive, arrive); if (Number.isFinite(depart)) cur.depart = Math.max(cur.depart || 0, depart); }
-    byMetro.set(s.metro, g);
-  }
+  // Resolve the timeline into STAYS (lib/trip-stays.mjs, the lib/presence.js
+  // overlap rule): a coarse flights row spanning a whole multi-city loop no
+  // longer reads as one long stay at the gateway, and two short layovers in the
+  // same airport city weeks apart are two slivers, not one three-week stay —
+  // the old group-by-metro widening queued exactly that kind of phantom guide.
+  const { resolveStays, guideFor, prettyMetro } = await import("../lib/trip-stays.mjs");
+  const stays = resolveStays(segs, { minStayHours: MIN_STAY_HOURS });
+
+  // The label to research under: the place_label of the segment the stay came
+  // from (booked rows first), cut at its dash and stripped of "(3 nights)"-style
+  // notes, else the metro itself.
+  const labelFor = (stay) => {
+    const covering = segs.filter((s) => s.metro === stay.metro && Date.parse(s.arrive_at) <= stay.startMs
+      && (!s.depart_at || Date.parse(s.depart_at) > stay.startMs));
+    covering.sort((a, b) => (b.source === "flights" ? 0 : 1) - (a.source === "flights" ? 0 : 1));
+    const raw = covering.length ? areaLabel(covering[0]) : "";
+    const clean = raw.replace(/\s*\([^)]*\)\s*/g, " ").trim();
+    return clean || prettyMetro(stay.metro);
+  };
 
   const missing = [];
-  for (const g of byMetro.values()) {
-    if (HOME_METROS.has(g.metro)) continue;
-    const win = g.booked || g.flights;           // lodging dates win
-    if (!win) continue;
-    if (!Number.isFinite(win.depart) || win.depart <= now) continue;   // over / open-ended
-    if (win.arrive > horizon) continue;                                // beyond lookahead
-    if ((win.depart - win.arrive) < MIN_STAY_HOURS * 3600000) continue; // layover / airport overnight
-
-    const key = slug(g.metro);
-    if (!key || haveArea.has(key)) continue;     // already researched
-
-    missing.push({
-      key,
-      label: win.label,
-      from: new Date(win.arrive).toISOString().slice(0, 10),
-      to: new Date(win.depart).toISOString().slice(0, 10),
-    });
+  const seen = new Set();
+  for (const st of stays) {
+    if (HOME_METROS.has(st.metro)) continue;
+    if (st.endMs == null || st.endMs <= now) continue;          // over / open-ended
+    if (st.startMs > horizon) continue;                         // beyond lookahead
+    const key = slug(st.metro);
+    if (!key || seen.has(key)) continue;                        // a second visit: first one wins
+    if (guideFor(key, [...haveArea])) continue;                 // already researched
+    seen.add(key);
+    missing.push({ key, label: labelFor(st), from: st.start, to: st.end });
   }
   return { missing };
 }

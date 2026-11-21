@@ -51,6 +51,7 @@ import { rosterHits, cardDate, onsalePhrase, itemKey, pingText, to24, urlDate,
 import { loadSightings, forComedian, repeatCheck } from "../lib/comedy-seen.mjs";
 
 const require = createRequire(import.meta.url);
+require("../lib/load-env.js").loadEnv(); // TICKETMASTER_* from .env (docs/agent-secrets.md)
 const { comedyConfig, root } = require("../lib/comedy-config.cjs");
 const { instance } = require("../lib/instance.cjs");
 
@@ -359,10 +360,13 @@ async function cronRun() {
   const venues = CFG.venues_file ? readJson(CFG.venues_file, { venues: [] }).venues || [] : [];
   if (!venues.length) { log("no rooms configured (comedy-club-watch venues_file) — nothing to do"); return; }
   const hour = Number(new Intl.DateTimeFormat("en-US", { timeZone: TZ, hour: "numeric", hourCycle: "h23" }).format(new Date()));
-  // Quiet hours and the pause file hold the schedule only (the trigger passes
-  // --scheduled); a run started by hand always runs.
+  // The sleep hold and the pause file hold the schedule only (the trigger passes
+  // --scheduled); a run started by hand always runs. Asleep comes from the sleep
+  // signal (sleep data + the phone's lock/unlock rows), never the clock;
+  // `quiet_before_hour` whenever there is no usable sleep signal.
   if (has("--scheduled")) {
-    if (hour < (CFG.quiet_before_hour || 0)) { log(`quiet hours (before ${CFG.quiet_before_hour}:00 local) — nothing to do`); return; }
+    const sleep = require("../lib/sleep-night.js").holdForSleep({ tz: TZ, fallback: CFG.quiet_before_hour ? { from: 0, to: CFG.quiet_before_hour } : null });
+    if (sleep.source === "sleep" ? sleep.hold : hour < (CFG.quiet_before_hour || 0)) { log(`${sleep.source === "sleep" ? "asleep" : "quiet hours"} (${sleep.reason}) — nothing to do`); return; }
     if (CFG.pause_file && fs.existsSync(CFG.pause_file)) { log(`paused (${path.basename(CFG.pause_file)})`); return; }
   }
   const deep = has("--deep") || state.last_deep_run !== today;

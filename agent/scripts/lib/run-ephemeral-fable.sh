@@ -120,7 +120,11 @@ LOCAL_RULES_FILE="$OUT_TMP.local-rules"
 jori_local_rules_file "$(jori_local_rules_role "$CWD")" "$LOCAL_RULES_FILE" || LOCAL_RULES_FILE=""
 
 cd "$CWD" || { rm -f "$OUT_TMP.prompt" "$OUT_TMP.local-rules"; exit 1; }
-"$CLAUDE" -p \
+# The agent environment, not this runner's: secrets stay out of the fork when
+# the installation locks forks down (lib/agent-env.sh, docs/agent-secrets.md).
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/agent-env.sh"
+jori_agent_env_cmd forks
+${AGENT_ENV_CMD[@]+"${AGENT_ENV_CMD[@]}"} "$CLAUDE" -p \
   --model "$MODEL" \
   --effort xhigh \
   --permission-mode bypassPermissions \

@@ -206,7 +206,7 @@ test("[Hum state] tells the chat agent about an unanswered decision card", () =>
 // (2026-10-27: every tap got the same "recorded, I'll act on it at the
 // next review run", which said nothing about what happens or when.)
 const NY = "US/Eastern"; // EST after Nov 1
-const SCHED = { "nightly-review": "0 5 * * 2", "cost-efficiency-review": "37 2 * * *", "people-watch": "5 3 * * *" };
+const SCHED = { "nightly-review": "0 5 * * 2", "cost-efficiency-review": "37 2 * * *", "people-watch": "5 3 * * *", "shows-seen": "51 3 * * *" };
 const TUE_3PM = Date.parse("2026-10-27T19:00:00Z");
 
 test("nextRun reads a cron schedule in the scheduler's zone, across a clock change", () => {
@@ -227,6 +227,8 @@ test("followUp names the job that acts on the answer and when, from the registry
   assert.equal(at("cost:q", TUE_3PM).when, "by tomorrow morning");
   assert.equal(at("cost:q", Date.parse("2026-10-28T05:00:00Z")).when, "by this morning", "1am: tonight's run");
   assert.equal(at("ppl:x", TUE_3PM).who, "the people tracker");
+  assert.equal(at("shw:x", TUE_3PM).who, "the shows tracker");
+  assert.equal(at("shw:x", TUE_3PM).when, "by tomorrow morning");
   assert.equal(dq.followUp("imp:abc", { now: TUE_3PM, scheduleOf: () => null }).when, null, "no schedule, no promised time");
   assert.equal(dq.followUp("zzz:1", { now: TUE_3PM }), null);
 });
@@ -295,4 +297,64 @@ test("withoutHeld drops items the pre-rank filter already holds as settled, and 
   assert.deepEqual(dq.withoutHeld(items, new Map([["decision:ppl:a", "2026-11-07T00:00:00Z"]])).map((i) => i.ref), ["si-1"]);
   assert.equal(dq.withoutHeld(items, new Set()), items);
   assert.equal(dq.withoutHeld(items, null), items);
+});
+
+// ─── shows (2026-11-15): the shows tracker's morning-after questions ──────
+test("shows questions: their own ref; sent at once by the tracker, never picked by the hum lane", () => {
+  const q = (id, extra = {}) => ({ id, question: `How was ${id}?`, options: ["Loved it", "Not for us"], asked_at: "2026-11-15T08:00:00Z", status: "open", ...extra });
+  const items = dq.loadOpen({ improvement: { questions: [{ question: "Plan?", options: ["a", "b"], asked_at: "2026-11-14T08:00:00Z", status: "open" }] }, cost: {}, people: { questions: [q("p1")] }, shows: { questions: [q("s1"), q("s2", { status: "answered" })] }, budget: {}, finance: {} });
+  const shows = items.filter((it) => it.source === "shows");
+  assert.deepEqual(shows.map((it) => it.ref), ["shw:s1"]);
+  const now = Date.parse("2026-11-15T15:00:00Z");
+  const first = dq.nextDecision({ items, lane: { asked: [] }, now, tz: "UTC" });
+  assert.equal(first.decision.source, "improvement", "review decisions first");
+  // Review and people asked today: the lane has nothing left — the show is not its to ask.
+  const lane = { asked: [{ ref: first.decision.ref, at: "2026-11-15T09:00:00Z" }, { ref: "ppl:p1", at: "2026-11-15T10:00:00Z" }] };
+  assert.equal(dq.nextDecision({ items, lane, now, tz: "UTC" }).decision, null);
+  assert.equal(dq.nextDecision({ items, lane: { asked: [] }, now, tz: "UTC", group: "shows" }).decision, null);
+  for (const s of ["shows", "restaurants", "museums"]) {
+    assert.ok(dq.ASKED_AT_ONCE.has(s), `${s}: sent the moment it is raised`);
+    assert.ok(dq.UNPACED.has(s), `${s}: no daily slot`);
+  }
+});
+
+// ─── museums (2026-11-15): the museum tracker's morning-after questions ───
+test("museum questions: their own ref and group; never the hum lane's pick", () => {
+  const q = (id, extra = {}) => ({ id, question: `How was ${id}?`, options: ["Loved it", "Not for us"], asked_at: "2026-11-15T08:00:00Z", status: "open", ...extra });
+  const items = dq.loadOpen({ improvement: {}, cost: {}, people: {}, shows: { questions: [q("s1")] }, restaurants: { questions: [q("r1")] }, museums: { questions: [q("m1"), q("m2", { status: "answered" })] }, budget: {}, finance: {} });
+  assert.deepEqual(items.filter((it) => it.source === "museums").map((it) => it.ref), ["mus:m1"]);
+  assert.equal(dq.groupOf("museums"), "museums");
+  assert.ok(dq.LATE_GROUPS.has("museums"), "behind review decisions, like shows and meals");
+  const now = Date.parse("2026-11-15T15:00:00Z");
+  assert.equal(dq.nextDecision({ items, lane: { asked: [] }, now, tz: "UTC" }).decision, null, "the tracker sends these itself");
+  assert.equal(dq.FOLLOW_UP.museums.task, "shows-seen");
+});
+
+// ─── who asks (2026-11-15): social and entertainment cards come from the role that owns the job ───
+test("social and entertainment cards are asked by the role owning their job; review decisions stay with the Chief of Staff", () => {
+  for (const s of ["people", "shows", "restaurants", "museums"]) {
+    assert.ok(dq.ASKED_BY_OWNER_ROLE.has(s), s);
+    assert.ok(dq.FOLLOW_UP[s]?.task, `${s} names its job`);
+  }
+  for (const s of ["improvement", "cost", "budget", "finance"]) assert.ok(!dq.ASKED_BY_OWNER_ROLE.has(s), s);
+});
+
+// ─── a card the precheck or speak gate held is not re-offered for 3 days ───
+test("holdRecord keeps precheck and speak-gate holds, drops transient ones", () => {
+  const now = new Date("2026-11-17T15:00:00Z");
+  assert.equal(dq.holdRecord("cost:q-urgent", { suppressed: true, reason: "already answered" }, now).by, "precheck");
+  assert.equal(dq.holdRecord("cost:q-urgent", { suppressed: true, by: "speak-gate", verdict: "resolve", note: "n" }, now).by, "speak-gate");
+  assert.equal(dq.holdRecord("cost:q-urgent", { suppressed: true, by: "question-hold", reason: "x" }, now), null);
+  assert.equal(dq.holdRecord("cost:q-urgent", { suppressed: true, by: "p1-push-fold" }, now), null);
+  assert.equal(dq.holdRecord("cost:q-urgent", null, now), null);
+});
+
+test("nextDecision skips a recently held card and offers it again after 3 days", () => {
+  seed();
+  const now = Date.now();
+  const held = [{ ref: "cost:q-urgent", held_at: new Date(now - 3600e3).toISOString(), by: "precheck", reason: "x" }];
+  const r = dq.nextDecision({ lane: { asked: [], held }, now });
+  assert.notEqual(r.decision?.ref, "cost:q-urgent");
+  const old = [{ ...held[0], held_at: new Date(now - 4 * 86400e3).toISOString() }];
+  assert.equal(dq.nextDecision({ lane: { asked: [], held: old }, now }).decision.ref, "cost:q-urgent");
 });

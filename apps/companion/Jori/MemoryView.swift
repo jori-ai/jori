@@ -33,7 +33,7 @@ struct MemoryView: View {
 
     private func browser(_ url: URL) -> some View {
         ZStack(alignment: .top) {
-            WebView(initialURL: url, state: state)
+            WebView(initialURL: WebViewState.lastPage(under: url) ?? url, state: state, base: url)
             if state.isLoading {
                 ProgressView()
                     .progressViewStyle(.linear)
@@ -108,12 +108,34 @@ final class WebViewState: ObservableObject {
     }
 
     fileprivate var pendingInitialURL: URL?
+
+    /// The wiki page last on screen, so Memory reopens on it after a relaunch.
+    private static let lastPageKey = Install.key("memoryLastPage")
+
+    /// The saved page, only while it is still on the wiki at `base` — a
+    /// changed wiki address (or a page off the wiki) falls back to its home.
+    static func lastPage(under base: URL) -> URL? {
+        guard let saved = UserDefaults.standard.string(forKey: lastPageKey).flatMap(URL.init(string:)),
+              onWiki(saved, base: base) else { return nil }
+        return saved
+    }
+
+    fileprivate static func remember(_ page: URL, base: URL) {
+        guard onWiki(page, base: base) else { return }
+        UserDefaults.standard.set(page.absoluteString, forKey: lastPageKey)
+    }
+
+    private static func onWiki(_ page: URL, base: URL) -> Bool {
+        page.scheme == base.scheme && page.host == base.host && page.port == base.port
+    }
 }
 
 #if os(iOS)
 private struct WebView: UIViewRepresentable {
     let initialURL: URL
     let state: WebViewState
+    /// The wiki's home: pages on it are remembered (WebViewState.lastPage).
+    let base: URL
 
     func makeCoordinator() -> Coordinator { Coordinator(state: state) }
 
@@ -123,7 +145,7 @@ private struct WebView: UIViewRepresentable {
         webView.allowsBackForwardNavigationGestures = true
         state.webView = webView
         state.pendingInitialURL = initialURL
-        context.coordinator.attach(webView)
+        context.coordinator.attach(webView, base: base)
         webView.load(URLRequest(url: initialURL))
         return webView
     }
@@ -136,6 +158,8 @@ private struct WebView: UIViewRepresentable {
 private struct WebView: NSViewRepresentable {
     let initialURL: URL
     let state: WebViewState
+    /// The wiki's home: pages on it are remembered (WebViewState.lastPage).
+    let base: URL
 
     func makeCoordinator() -> Coordinator { Coordinator(state: state) }
 
@@ -145,7 +169,7 @@ private struct WebView: NSViewRepresentable {
         webView.allowsBackForwardNavigationGestures = true
         state.webView = webView
         state.pendingInitialURL = initialURL
-        context.coordinator.attach(webView)
+        context.coordinator.attach(webView, base: base)
         webView.load(URLRequest(url: initialURL))
         return webView
     }
@@ -164,7 +188,12 @@ private class WebViewCoordinator: NSObject, WKNavigationDelegate {
         self.state = state
     }
 
-    func attach(_ webView: WKWebView) {
+    func attach(_ webView: WKWebView, base: URL) {
+        // Every page change, links and in-page (history API) navigation alike.
+        observers.append(webView.observe(\.url, options: [.new]) { wv, _ in
+            guard let page = wv.url else { return }
+            Task { @MainActor in WebViewState.remember(page, base: base) }
+        })
         observers.append(webView.observe(\.canGoBack, options: [.initial, .new]) { [weak self] wv, _ in
             Task { @MainActor in self?.state.canGoBack = wv.canGoBack }
         })

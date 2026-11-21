@@ -5,6 +5,8 @@
 //   agent/local/instance.json  who and where this installation is (read by
 //                              lib/instance.cjs; JORI_* env vars override it)
 //   agent/local/config/supabase.json   the project's public anon key, if given
+// then offers each outside service (lib/onboarding/services.mjs, the same
+// table and checks the setup page's Connect step uses).
 //   secrets/webhook-token      the supervisors' shared webhook Bearer token
 // creates the runtime dirs, seeds data/ and agent/local/ from examples/
 // (never overwriting a file), and — only with consent — sends one anonymous
@@ -16,6 +18,7 @@ import crypto from "node:crypto";
 import readline from "node:readline";
 import { CHECKOUT, readJson, isHelp } from "./_common.mjs";
 import { sendInstallPing } from "./_telemetry.mjs";
+import { SERVICES, connectService } from "../../lib/onboarding/services.mjs";
 import { createRequire } from "node:module";
 const { port: registryPort } = createRequire(import.meta.url)("../../lib/ports.cjs");
 
@@ -90,9 +93,9 @@ export default {
       const env = {};
       env.JORI_HOME = await ask("JORI_HOME (absolute path to this checkout)", base);
 
-      console.log(c.bold("\n  Anthropic auth"));
-      console.log(c.dim("  Paste an API key, or leave blank to run on a `claude` login (Max subscription)."));
-      env.ANTHROPIC_API_KEY = await ask("ANTHROPIC_API_KEY", "");
+      // No API key question: the agents run only on a Claude Max sign-in
+      // (`claude`), and the supervisors strip ANTHROPIC_API_KEY anyway
+      // (docs/agent-auth-model.md).
 
       console.log(c.bold("\n  Identity") + c.dim(" (stored in agent/local/instance.json)"));
       const existing = readJson(instPath, {}) || {};
@@ -113,14 +116,6 @@ export default {
       const token = crypto.randomBytes(32).toString("hex");
       console.log(c.dim("  generated a random webhook token → secrets/webhook-token"));
 
-      console.log(c.bold("\n  Optional integrations") + c.dim(" (blank = skip; edit .env later)"));
-      inst.supabase_project = await ask("Supabase project ref (the <ref> in <ref>.supabase.co)", existing.supabase_project || "");
-      let anonKey = "";
-      if (inst.supabase_project) {
-        env.SUPABASE_SERVICE_ROLE_KEY = await ask("SUPABASE_SERVICE_ROLE_KEY", "");
-        env.SUPABASE_ACCESS_TOKEN = await ask("SUPABASE_ACCESS_TOKEN (for the Supabase MCP server)", "");
-        anonKey = await ask("Supabase anon (public) key", "");
-      }
       env.OLLAMA_URL = await ask("OLLAMA_URL", "http://127.0.0.1:11434");
       env.LOCAL_EMBED_MODEL = await ask("LOCAL_EMBED_MODEL", "nomic-embed-text");
 
@@ -135,8 +130,6 @@ export default {
         telemetry = /^n(o)?$/i.test(ans) ? "off" : "on";
       }
       env.JORI_TELEMETRY = telemetry;
-      rl.close();
-
       // ── write ───────────────────────────────────────────────────────────
       for (const d of RUNTIME_DIRS) fs.mkdirSync(path.join(base, d), { recursive: true });
 
@@ -152,11 +145,6 @@ export default {
       const cleanInst = Object.fromEntries(Object.entries(inst).filter(([, v]) => v !== "" && v != null));
       fs.writeFileSync(instPath, JSON.stringify(cleanInst, null, 2) + "\n");
 
-      if (anonKey) {
-        const supaPath = path.join(base, "agent", "local", "config", "supabase.json");
-        const cur = readJson(supaPath, {}) || {};
-        fs.writeFileSync(supaPath, JSON.stringify({ ...cur, anon_key: anonKey }, null, 2) + "\n");
-      }
 
       const tokenPath = path.join(base, "secrets", "webhook-token");
       if (!fs.existsSync(tokenPath) || force) fs.writeFileSync(tokenPath, token + "\n", { mode: 0o600 });
@@ -184,6 +172,26 @@ export default {
         console.log(c.green(`  ✓ seeded ${seeded.length} file(s) from examples/:`));
         for (const s of seeded) console.log(c.dim("      " + s));
       }
+
+      // ── services: each one tested before anything is saved ──────────────
+      console.log(c.bold("\n  Services") + c.dim(" (each says what it switches on; blank = skip, connect later with `jori setup`)"));
+      for (const svc of SERVICES.filter((x) => x.fields.length)) {
+        console.log(`\n  ${c.bold(svc.title)}` + c.dim(` · ${svc.cost}`));
+        console.log(c.dim(`  Switches on: ${svc.switchesOn}`));
+        const yes = await ask(`Connect ${svc.name} now? (y/N)`, "N");
+        if (!/^y(es)?$/i.test(yes)) continue;
+        svc.steps.forEach((t, i) => console.log(c.dim(`    ${i + 1}. ${t}`)));
+        const fields = {};
+        for (const f of svc.fields) fields[f.key] = await ask(`${f.label}${f.optional ? " (optional)" : ""}`, "");
+        try {
+          const r = await connectService(base, svc.id, fields);
+          for (const k of r.checks || []) console.log(`    ${k.ok ? c.green("✓") : c.red("✗")} ${k.name}${k.detail ? c.dim(` — ${k.detail}`) : ""}`);
+          if (r.next === "authorize") console.log(c.dim("    Then authorize Gmail: node agent/scripts/gmail-auth.mjs"));
+        } catch (e) {
+          console.log(c.red(`    ✗ ${e.message}`));
+        }
+      }
+      rl.close();
       console.log(c.dim("\nNext: ") + c.bold("./bin/jori setup start") + c.dim(" (runs Jori in the background and schedules the starter jobs), or ") + c.bold("./bin/jori up") + c.dim(" in the foreground"));  // control-scan-ok: the software's name
       console.log(c.dim("Then open the control room's Setup page, which lists what each feature still needs:"));
       console.log("  " + c.bold(`http://127.0.0.1:${registryPort("wiki")}/control#setup`) + c.dim(" (or this machine's tailnet name instead of 127.0.0.1)"));

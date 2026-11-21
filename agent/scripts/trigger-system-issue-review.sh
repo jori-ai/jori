@@ -111,13 +111,20 @@ const q="/rest/v1/jori_messages?select=id,role,content,created_at&channel=eq.sys
 const now=Date.now();
 const due=clusters.filter(c=>c&&["verifying","awaiting_approval"].includes(c.status)
   &&c.verify_after&&Date.parse(c.verify_after)<=now).length;
-fetchJson(q,{timeoutMs:10000}).then(rows=>import("./lib/system-issue-gate.mjs").then(g=>{
+// The speak gate never inserts a system message it holds (drop, digest or
+// resolve); the review row is the only record of it. Read those held rows too,
+// so an alert the gate judged "plumbing" still reaches the review. A failed
+// read here never fails the run: the channel rows are the batch.
+const hq="/rest/v1/jori_gate_reviews?select=id,original,judged_at,verdict&channel=eq.system"
+  +"&live=eq.true&held=eq.true&judged_at=gt."+encodeURIComponent(since)+"&order=judged_at.asc&limit=500";
+Promise.all([fetchJson(q,{timeoutMs:10000}),fetchJson(hq,{timeoutMs:10000}).catch(()=>[])]).then(([rows,held])=>import("./lib/system-issue-gate.mjs").then(g=>{
   // ✅ recoveries are kept out of the System tab and logged locally instead
   // (jori-send-curl § Recoveries stay out of the System tab). They are still
   // evidence here (§ Step 2c), so they join the batch in time order.
   let recoveryLog="";
   try{ recoveryLog=fs.readFileSync(process.env.JORI_SYSTEM_RECOVERY_LOG||path.join(D,"system-recoveries.jsonl"),"utf8"); }catch{}
   rows=g.mergeRecoveryLog(Array.isArray(rows)?rows:[],recoveryLog,since);
+  rows=g.mergeGateHeldAlerts(rows,Array.isArray(held)?held:[],since);
   rows=rows.filter(r=>r&&typeof r.content==="string"&&r.content.trim());
   // Jev shadow-week disagreement pages ("🔀 Jev disagreement [...]") are owned
   // by jev-disagreement-review, which has the decision logs this job lacks.

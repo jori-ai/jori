@@ -1,4 +1,4 @@
-# Health Coach (role plugin)
+# Health (role plugin)
 
 Sleep, exercise and health patterns, framed as patterns and always deferring to the doctor.
 

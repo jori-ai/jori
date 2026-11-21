@@ -64,6 +64,9 @@ if [ "$1" = "-l" ]; then
     hang) sleep 6; cat "${cronFile}" ;;
   esac
 else
+  # A slow install (a busy host): CRONTAB_STUB_INSTALL_SLEEP seconds first.
+  # (Its output goes nowhere, so a sleep left behind when the stub is killed holds no pipe open.)
+  [ -n "$CRONTAB_STUB_INSTALL_SLEEP" ] && sleep "$CRONTAB_STUB_INSTALL_SLEEP" > /dev/null 2>&1
   # Like the real crontab(1): read all of stdin, then replace the file whole.
   cat > "${cronFile}.new" && mv "${cronFile}.new" "${cronFile}"
 fi
@@ -78,8 +81,13 @@ fi
     r.elapsed = Date.now() - t0;
     return r;
   };
-  const safe = (args) => spawnSync("bash", [SAFE, ...args], { encoding: "utf8",
-    env: { ...process.env, PATH: `${dir}:${process.env.PATH}`, CRONTAB_SAFE_LOG: log } });
+  const safe = (args, extraEnv = {}) => {
+    const t0 = Date.now();
+    const r = spawnSync("bash", [SAFE, ...args], { encoding: "utf8", timeout: 30_000,
+      env: { ...process.env, PATH: `${dir}:${process.env.PATH}`, CRONTAB_SAFE_LOG: log, ...extraEnv } });
+    r.elapsed = Date.now() - t0;
+    return r;
+  };
   const cron = () => fs.readFileSync(cronFile, "utf8");
   const writes = () => (fs.existsSync(calls) ? fs.readFileSync(calls, "utf8").split("\n").filter((l) => l === "-") : []);
   const skipLog = () => (fs.existsSync(log) ? fs.readFileSync(log, "utf8") : "");
@@ -180,6 +188,38 @@ test("crontab-safe: nothing tagged and nothing to add means no install at all", 
   const sb = sandbox("ok", "0 7 * * * /bin/echo digest\n");
   assert.equal(sb.safe(["remove", TAG]).status, 0);
   assert.deepEqual(sb.writes(), []);
+});
+
+// The install has its own timeout (CRONTAB_SAFE_INSTALL_TIMEOUT, default 120 s
+// and never shorter than the read's): writing a few-hundred-line crontab on a
+// busy host takes far longer than reading it, and the read's 20 s used to cut
+// every install short (exit 142), so plugin schedules never went in.
+test("crontab-safe: a slow install is not held to the read's timeout; it goes in, recounted", () => {
+  const sb = sandbox("ok");
+  const r = sb.safe(["remove", TAG], { CRONTAB_SAFE_TIMEOUT: "1", CRONTAB_SAFE_INSTALL_TIMEOUT: "", CRONTAB_STUB_INSTALL_SLEEP: "2" });
+  assert.equal(r.status, 0, r.stderr);
+  assert.ok(r.elapsed >= 2000, `took ${r.elapsed}ms`);
+  assert.deepEqual(sb.writes(), ["-"]);
+  assert.equal(sb.cron(), SEED.split("\n").filter((l) => !l.includes(TAG)).join("\n"), "only the tagged lines went");
+  assert.equal(sb.skipLog(), "");
+});
+
+test("crontab-safe: an install that outlasts CRONTAB_SAFE_INSTALL_TIMEOUT is abandoned and the crontab is left as it was", () => {
+  const sb = sandbox("ok");
+  const r = sb.safe(["remove", TAG], { CRONTAB_SAFE_TIMEOUT: "5", CRONTAB_SAFE_INSTALL_TIMEOUT: "1", CRONTAB_STUB_INSTALL_SLEEP: "6" });
+  assert.equal(r.status, 1, r.stderr);
+  assert.ok(r.elapsed < 4500, `took ${r.elapsed}ms`);
+  assert.equal(sb.cron(), SEED);
+  assert.match(sb.skipLog(), /crontab install timed out after 1s/);
+});
+
+test("crontab-safe: the read keeps its own short timeout when the install's is long", () => {
+  const sb = sandbox("hang");
+  const r = sb.safe(["remove", TAG], { CRONTAB_SAFE_TIMEOUT: "1", CRONTAB_SAFE_INSTALL_TIMEOUT: "120" });
+  assert.equal(r.status, 1, r.stderr);
+  assert.ok(r.elapsed < 4000, `took ${r.elapsed}ms`);
+  assert.deepEqual(sb.writes(), []);
+  assert.match(sb.skipLog(), /crontab -l timed out after 1s/);
 });
 
 test("crontab-safe: a new line without the tag is a usage error; nothing read or written", () => {

@@ -1389,11 +1389,36 @@ def match_known_recurring(lat: float, lon: float, entries: List[Dict[str, Any]]
             best = (e, d)
     return best
 
+def _fold_name(s: Any) -> str:
+    """Case, accents and punctuation folded, so two spellings of one answer compare
+    equal. Formatting only: decides nothing about what a name means."""
+    import unicodedata
+    t = unicodedata.normalize("NFKD", str(s or ""))
+    t = "".join(c for c in t if not unicodedata.combining(c)).casefold()
+    return " ".join("".join(c if c.isalnum() else " " for c in t).split())
+
+
+def _confirmed_ambiguous(hits: List[Tuple[Dict[str, Any], float]]) -> bool:
+    """Two DIFFERENT places inside the ring: ask, don't pick (the same rule as
+    resolve-day's saved places). The nearest-wins pick let a cafe 12 m from a
+    rental name whole nights at the rental. One answer worded two ways ("X" and
+    "X - coffee this morning") is one place: a folded name contained in the
+    other's is the same."""
+    names = []
+    for e, _d in hits:
+        n = _fold_name(e.get("name"))
+        if n and not any(n in m or m in n for m in names):
+            names.append(n)
+    return len(names) > 1
+
+
 def match_confirmed_stop(lat: float, lon: float, entries: List[Dict[str, Any]]
                          ) -> Optional[Tuple[Dict[str, Any], float]]:
-    """Closest past confirmation within CONFIRMED_STOP_MATCH_M, if any. The saver
-    writes centroid as `{"lat":..., "lon":...}` but tolerate `[lat, lon]` lists too."""
+    """Closest past confirmation within CONFIRMED_STOP_MATCH_M, if any -- and none
+    when two different places are inside the ring. The saver writes centroid as
+    `{"lat":..., "lon":...}` but tolerate `[lat, lon]` lists too."""
     best: Optional[Tuple[Dict[str, Any], float]] = None
+    hits: List[Tuple[Dict[str, Any], float]] = []
     for e in entries:
         c = e.get("centroid") or e.get("coords")
         if not c:
@@ -1407,8 +1432,12 @@ def match_confirmed_stop(lat: float, lon: float, entries: List[Dict[str, Any]]
         if elat is None or elon is None:
             continue
         d = haversine_m(lat, lon, elat, elon)
-        if d <= CONFIRMED_STOP_MATCH_M and (best is None or d < best[1]):
-            best = (e, d)
+        if d <= CONFIRMED_STOP_MATCH_M:
+            hits.append((e, d))
+            if best is None or d < best[1]:
+                best = (e, d)
+    if _confirmed_ambiguous(hits):
+        return None
     return best
 
 REST_ACC_MAX_M = 35.0  # a sample must be this precise to say where he SAT (mirrors stop-rests.js)
@@ -1428,6 +1457,7 @@ def match_confirmed_stop_at_rest(stop: StopCandidate, entries: List[Dict[str, An
     if len(precise) < 2:
         return None
     best: Optional[Tuple[Dict[str, Any], float]] = None
+    hits: List[Tuple[Dict[str, Any], float]] = []
     for e in entries:
         c = e.get("centroid") or e.get("coords")
         if isinstance(c, dict):
@@ -1443,8 +1473,11 @@ def match_confirmed_stop_at_rest(stop: StopCandidate, entries: List[Dict[str, An
         if len(at) < 2 or len(at) * 2 < len(precise):
             continue
         d = min(at)
+        hits.append((e, d))
         if best is None or d < best[1]:
             best = (e, d)
+    if _confirmed_ambiguous(hits):
+        return None
     return best
 
 def match_wifi(stop: StopCandidate, wifi_entries: List[Dict[str, Any]]

@@ -34,7 +34,7 @@ Every setting, with its default and meaning, is documented in
 | `JORI_SUPABASE_URL`, `JORI_SUPABASE_ANON_KEY`, `JORI_ATTACHMENTS_BUCKET` | The backend |
 | `JORI_SIGNING_PURCHASE`, `JORI_SIGNING_APPROVE` | Face ID signing contexts; must equal the server's, never change once a device is paired |
 | `JORI_STORAGE_PREFIX`, `JORI_KEY_TAG_PREFIX`, `JORI_LEGACY_NAME` | Only for an app that already shipped under other names (keeps its stored data and paired keys) |
-| `JORI_WIKI_URL`, `JORI_TRADE_APPROVAL_*`, `JORI_FEATURES` | Optional surfaces, off until set |
+| `JORI_WIKI_URL`, `JORI_SHOP_VIEW_URL`, `JORI_TRADE_APPROVAL_*`, `JORI_FEATURES` | Optional surfaces, off until set (`JORI_SHOP_VIEW_URL`: the host's shop browser over Tailscale, equal to purchase.json `shop_view_app_url`) |
 | `JORI_APP_ENTITLEMENTS`, `JORI_USAGE_MONITOR_ENTITLEMENTS` | Point at the `-ScreenTime` variants once Apple has granted your team Family Controls |
 
 Named places the location tracker should recognize go in

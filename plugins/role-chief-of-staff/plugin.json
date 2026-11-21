@@ -1,7 +1,7 @@
 {
   "name": "role-chief-of-staff",
   "title": "Chief of Staff (role)",
-  "description": "The Chief of Staff on your team: coordinates the team: keeps every project and its tasks on track, holds everyone accountable, and runs the morning digest and the proactive check-ins. Owns those jobs, signs what they send, and brings this role's specialty to every one of them.",
+  "description": "The Chief of Staff role on your team: coordinates the team: keeps every project and its tasks on track, holds everyone accountable, and runs the morning digest and the proactive check-ins. Owns those jobs, signs what they send, and brings this role's specialty to every one of them.",
   "version": "1.0.0",
   "default": "disabled",
   "requires": {

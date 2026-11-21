@@ -1,4 +1,4 @@
-# Marketer (role plugin)
+# Marketing (role plugin)
 
 Growth for the CEO's products: app stores, search, reviews, communities and outreach.
 

@@ -1,0 +1,136 @@
+#!/usr/bin/env node
+// work-record — the record of one-off work done for the user (a comparison, an
+// evaluation, research, a plan, a review): what was asked, the bottom line, the
+// deliverable's full text, and dated updates. Each record is a wiki page
+// `type: work` (lib/work-records.mjs); design: system/wiki-architecture.md § Work records.
+//
+// Usage:
+//   work-record add --title "<t>" --bottom-line "<one sentence>" --by "<who>" \
+//       [--summary @file|"<text>"] [--asked "<the request>"] [--project <project_page_id>] \
+//       [--kind comparison|evaluation|research|plan|review|draft|analysis|code|note] \
+//       [--date YYYY-MM-DD] [--as-of "<what the sources ran to>"] [--source "<src>"]... \
+//       [--link <url|path|message id>]... [--related <page_id>]... \
+//       [--deliverable @file.md|@file.html] [--doc <google doc url>] [--key <idempotency key>] [--replace] \
+//       [--how-to-change @file|"<text>"]
+//                                    record a piece of work (the doc's full text is read with gog)
+//   work-record how-to-change <id> @file|"<text>"
+//                                    set where the work's sources live, how to rebuild it and how a
+//                                    change may land, so a later change needs no access to the session that made it
+//   work-record update <id> "<what changed, dated today>" [--by "<who>"] [--date YYYY-MM-DD]
+//   work-record find "<query>" [--k N] [--json]     search work records only
+//   work-record list [--project <id>] [--since YYYY-MM-DD] [--limit N] [--json]
+//   work-record show <id>                           the whole record
+//   work-record sync-project-work [--dry-run]       record every project-work result not yet recorded
+
+import fs from "node:fs";
+import { createRequire } from "node:module";
+import * as W from "../lib/work-records.mjs";
+
+const require = createRequire(import.meta.url);
+require("../lib/load-env.js").loadEnv();
+
+// `work-record list | head` closes the pipe early: that is not an error.
+process.stdout.on("error", (e) => { if (e.code === "EPIPE") process.exit(0); throw e; });
+
+const argv = process.argv.slice(2);
+const cmd = argv[0];
+const MULTI = new Set(["source", "link", "related"]);
+const VALUE = new Set(["how-to-change", "title", "bottom-line", "by", "summary", "asked", "project", "kind", "date", "as-of", "source", "link", "related", "deliverable", "doc", "key", "k", "since", "limit"]);
+const opts = { source: [], link: [], related: [] };
+const pos = [];
+for (let i = 1; i < argv.length; i++) {
+  const a = argv[i];
+  if (a.startsWith("--")) {
+    const n = a.slice(2);
+    if (VALUE.has(n)) {
+      const v = argv[++i];
+      if (MULTI.has(n)) opts[n].push(v); else opts[n] = v;
+    } else opts[n] = true;
+  } else pos.push(a);
+}
+const die = (m, c = 1) => { process.stderr.write(`work-record: ${m}\n`); process.exit(c); };
+const out = (o) => process.stdout.write((typeof o === "string" ? o : JSON.stringify(o, null, 2)) + "\n");
+const fileOrText = (v) => {
+  if (v == null || v === true) return null;
+  if (String(v).startsWith("@")) {
+    const p = String(v).slice(1);
+    const t = fs.readFileSync(p, "utf8");
+    return /\.html?$/i.test(p) || /^\s*<(!doctype|html|div|p|table|h\d)/i.test(t) ? W.htmlToText(t) : t;
+  }
+  return String(v);
+};
+
+function add() {
+  if (!opts.title) die("--title is required");
+  if (!opts["bottom-line"] && !opts.summary) die("--bottom-line (one sentence) is required: record the substance, not just a link");
+  if (!opts.by) die("--by is required (who did the work: a role, chat, project-work, Claude Code on <host>)");
+  const f = {
+    title: opts.title, bottom_line: opts["bottom-line"] || null, by: opts.by,
+    summary: fileOrText(opts.summary), asked: fileOrText(opts.asked), project: opts.project || null,
+    kind: opts.kind || null, date: opts.date || undefined, as_of: opts["as-of"] || null,
+    sources: opts.source, links: [...opts.link], related: opts.related, source_key: opts.key || null,
+    how_to_change: fileOrText(opts["how-to-change"]) || undefined,
+  };
+  if (opts.project && !/^project_/.test(opts.project)) f.project = `project_${opts.project}`;
+  if (opts.deliverable) f.deliverable = fileOrText(opts.deliverable);
+  if (opts.doc) {
+    if (!f.links.includes(opts.doc)) f.links.unshift(opts.doc);
+    if (!f.deliverable) {
+      const d = W.readGoogleDoc(opts.doc);
+      if (d.text) { f.deliverable = d.text; f.deliverable_note = `Full text of the Google Doc, read ${W.localDate()}.`; }
+      else f.deliverable_note = `The Google Doc could not be read when this was recorded (${d.error}); open the link.`;
+    }
+  }
+  const r = W.recordWork(f, { replace: !!opts.replace });
+  if (r.skipped) die(`${r.id} already exists (pass --replace to rewrite it, or use update to add what changed)`, 3);
+  out(`${r.created ? "recorded" : "replaced"} ${r.id}`);
+}
+
+const cmds = {
+  add,
+  update() {
+    const [id, ...rest] = pos;
+    if (!id || !rest.length) die('usage: work-record update <id> "<what changed>"');
+    W.addUpdate(id, rest.join(" "), { by: opts.by || null, ...(opts.date ? { date: opts.date } : {}) });
+    out(`updated ${id}`);
+  },
+  "how-to-change"() {
+    const [id, ...rest] = pos;
+    const text = fileOrText(rest.join(" ").trim() || null);
+    if (!id || !text) die('usage: work-record how-to-change <id> @file|"<text>"');
+    W.setHowToChange(id, text);
+    out(`set how-to-change on ${id}`);
+  },
+  find() {
+    const q = pos.join(" ").trim();
+    if (!q) die('usage: work-record find "<query>"');
+    const rows = W.findWork(q, { k: Number(opts.k) || 8 });
+    if (opts.json) return out(rows);
+    if (!rows.length) return out(`(no work record matches "${q}")`);
+    for (const r of rows) out(`${r.id} — ${r.title}\n    ${(r.description || "").slice(0, 200)}`);
+  },
+  list() {
+    const rows = W.listWork({ project: opts.project || null, since: opts.since || null, limit: Number(opts.limit) || 0 });
+    if (opts.json) return out(rows);
+    if (!rows.length) return out("(no work records)");
+    for (const r of rows) out(`${r.date}  ${r.id}\n    ${r.title}${r.project ? `  [[${r.project}]]` : ""}${r.by ? ` · ${r.by}` : ""}\n    ${(r.description || "").slice(0, 200)}`);
+  },
+  show() {
+    const id = pos[0];
+    if (!id) die("usage: work-record show <id>");
+    const p = require("../lib/wiki-store.js").getPage(id);
+    if (!p) die(`no page ${id}`);
+    out(p.raw_md);
+  },
+  "sync-project-work"() {
+    const r = W.syncProjectWork({ dryRun: !!opts["dry-run"] });
+    if (r.error) die(r.error);
+    out(r);
+  },
+};
+
+if (!cmd || !cmds[cmd]) {
+  process.stderr.write(fs.readFileSync(new URL(import.meta.url), "utf8").split("\n").filter((l) => l.startsWith("//")).slice(5, 23).map((l) => l.slice(3)).join("\n") + "\n");
+  process.exit(cmd ? 2 : 0);
+}
+try { await cmds[cmd](); } catch (e) { die(e.message); }

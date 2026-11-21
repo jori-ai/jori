@@ -29,7 +29,7 @@ Dispatched by `trigger-purchase-signin.sh` (weekly, daytime) or on demand ("sign
 
 ## Deliver
 
-Only when something needs the user — one chat line via `jori-send-curl`, with the phone sign-in link (`~/Dev/jori/bin/shop-view link`, or `--site <domain>` when only one site is left), e.g. "I've got the shopping browser signed in to 18 of your 23 stores. Three want you to sign in yourself — you can do it from your phone here: <link>." Nothing to say when every site is already signed in (silent run). Never list the sites that worked one by one, and never ask the user to do something on the host itself: the page is how the user reaches the shop Chrome (`needs_password`, `needs_2fa`, `blocked` all fit it). After the user taps Done (`shop-view done --since <run start>`), the next run — or the user's "check again" — re-verifies those sites.
+Only when something needs the user — one chat line via `jori-send-curl`, with the shop browser link (`~/Dev/jori/bin/shop-view link`, which opens in the Jori app, or `--site <domain>` when only one site is left), e.g. "I've got the shopping browser signed in to 18 of your 23 stores. Three want you to sign in yourself — you can do it in the app here: <link>." Nothing to say when every site is already signed in (silent run). Never list the sites that worked one by one, and never ask the user to do something on the host itself: the page is how the user reaches the shop Chrome (`needs_password`, `needs_2fa`, `blocked` all fit it). After the user taps Done (`shop-view done --since <run start>`), the next run — or the user's "check again" — re-verifies those sites.
 
 ## Failure modes
 

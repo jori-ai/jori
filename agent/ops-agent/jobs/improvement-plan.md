@@ -76,10 +76,10 @@ Exclude an item when any of these is true:
 Query the card table directly rather than trusting state alone — state can lag a run that was cut short:
 
 ```bash
-source ~/Dev/jori/.env
-curl -s "$SUPABASE_URL/rest/v1/self_improve_approvals?select=id,summary,status,skipped,created_at&order=created_at.desc&limit=60" \
-  -H "apikey: $SUPABASE_SERVICE_ROLE_KEY" -H "Authorization: Bearer $SUPABASE_SERVICE_ROLE_KEY"
+~/Dev/jori/bin/db-read self_improve_approvals "select=id,summary,status,skipped,created_at&order=created_at.desc&limit=60"
 ```
+
+(`db-read` reads the key itself; agents never source `.env`: `docs/agent-secrets.md`.)
 
 ## Step 3 — Write the plan
 

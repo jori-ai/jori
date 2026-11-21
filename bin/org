@@ -8,7 +8,10 @@
 //   org sign-subject <job> <subject>   The subject as that job's email would carry it.
 //   org sign-ping <job> <text>         The text as that job's ping would carry it.
 //   org sync [--dry-run]       Push the team (names, titles, responsibilities) to the app's
-//                              jori_team table; keep and cache the names the user changed there.
+//                              jori_team table, with the roles the user can still add
+//                              (enabled = false); turn on the ones the user added in the app
+//                              (requested_at); keep and cache the names the user changed there.
+//   org adopt <role-id>…       Turn those roles' plugins on (the user added them).
 //
 // The roster is agent/local/config/org.json. No LLM anywhere in here.
 "use strict";
@@ -40,6 +43,8 @@ if (cmd === "who") {
 }
 if (cmd === "audit") {
   const c = org.chart();
+  // A personal assistant alone (or no team at all) handles every job itself.
+  if (c.roles.length <= 1) { if (json) console.log(JSON.stringify({ unassigned: [], solo: true })); else console.log("No team: every job goes through the assistant."); process.exit(0); }
   if (json) console.log(JSON.stringify({ unassigned: c.unassigned }));
   else console.log(c.unassigned.length ? `Unassigned (${c.unassigned.length}): ${c.unassigned.join(", ")}` : "Every job has a role.");
   process.exit(c.unassigned.length ? 1 : 0);
@@ -57,5 +62,12 @@ if (cmd === "sync") {
     .catch((e) => { console.error(`org sync: ${e.message}`); process.exit(1); });
   return;
 }
-console.error("usage: org [list|who|audit|sign-subject|sign-ping|sync]");
+if (cmd === "adopt") {
+  const ids = rest.filter((a) => !a.startsWith("--"));
+  if (!ids.length) { console.error("org adopt <role-id>…"); process.exit(64); }
+  const done = org.adoptRoles(ids);
+  console.log(done.length ? `On the team now: ${done.join(", ")}` : "Nothing to turn on (already on the team, or not an installed role).");
+  process.exit(0);
+}
+console.error("usage: org [list|who|audit|sign-subject|sign-ping|sync|adopt]");
 process.exit(64);

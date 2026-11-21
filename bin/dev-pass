@@ -62,12 +62,33 @@ if jori_financial_domain "$DOMAIN"; then
   exit 77
 fi
 
-if [[ -z "${OP_SERVICE_ACCOUNT_TOKEN:-}" ]]; then
-  echo "dev-pass: OP_SERVICE_ACCOUNT_TOKEN is not set; cannot read the 1Password $DEV_VAULT vault." >&2
-  exit 78
+ITEM="site:${DOMAIN}"
+
+# The secrets broker (docs/secrets-broker.md) holds the token where one is
+# installed; this script then never sees it.
+if "$SCRIPT_DIR/secrets-broker" available dev 2>/dev/null; then
+  if [[ "$MODE" == "json" ]]; then exec "$SCRIPT_DIR/secrets-broker" dev-site "$DOMAIN"; fi
+  set +e
+  BERR="$(mktemp)"
+  VAL="$("$SCRIPT_DIR/secrets-broker" dev-site "$DOMAIN" --field "$FIELD" 2>"$BERR")"
+  RC=$?
+  set -e
+  # Not found (5) gets this script's own message below; anything else is the broker's.
+  if [[ $RC -ne 0 && $RC -ne 5 ]]; then cat "$BERR" >&2; rm -f "$BERR"; exit "$RC"; fi
+  rm -f "$BERR"
 fi
 
-ITEM="site:${DOMAIN}"
+# Without a broker, the token: the agents' environment no longer carries it
+# (docs/agent-secrets.md), so read it from .env, as site-pass and card-pass do.
+if [[ -z "${VAL:-}" && -z "${RC:-}" && -z "${OP_SERVICE_ACCOUNT_TOKEN:-}" && -f "$JORI_TOOLS/.env" ]]; then
+  OP_SERVICE_ACCOUNT_TOKEN="$(sed -n 's/^OP_SERVICE_ACCOUNT_TOKEN=//p' "$JORI_TOOLS/.env" | head -1)"
+  export OP_SERVICE_ACCOUNT_TOKEN
+fi
+if [[ -z "${RC:-}" ]]; then
+if [[ -z "${OP_SERVICE_ACCOUNT_TOKEN:-}" ]]; then
+  echo "dev-pass: OP_SERVICE_ACCOUNT_TOKEN is not set and no secrets broker answers; cannot read the 1Password $DEV_VAULT vault." >&2
+  exit 78
+fi
 
 if [[ "$MODE" == "json" ]]; then
   op item get "$ITEM" --vault="$DEV_VAULT" --format=json
@@ -75,6 +96,7 @@ if [[ "$MODE" == "json" ]]; then
 fi
 
 VAL="$(op read "op://${DEV_VAULT}/${ITEM}/${FIELD}" 2>/dev/null || true)" # kernel-guard-ok: the reference is built from the configured vault; no vault is spelled
+fi
 if [[ -z "$VAL" ]]; then
   echo "dev-pass: no value for field '${FIELD}' on item '${ITEM}' in the ${DEV_VAULT} vault." >&2
   echo "          create with: op item create --vault=${DEV_VAULT} --category=Login --title='${ITEM}' \\" >&2

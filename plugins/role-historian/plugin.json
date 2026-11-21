@@ -1,7 +1,7 @@
 {
   "name": "role-historian",
-  "title": "Historian (role)",
-  "description": "The Historian on your team: memory: what happened each day, where the CEO was, and everything Jori knows. Owns those jobs, signs what they send, and brings this role's specialty to every one of them.",
+  "title": "Memory (role)",
+  "description": "The Memory role on your team: memory: what happened each day, where the CEO was, and everything Jori knows. Owns those jobs, signs what they send, and brings this role's specialty to every one of them.",
   "version": "1.0.0",
   "default": "disabled",
   "requires": {
@@ -14,7 +14,7 @@
   "launchd": [],
   "role": {
     "id": "historian",
-    "title": "Historian",
+    "title": "Memory",
     "responsibility": "Memory: what happened each day, where the CEO was, and everything Jori knows.",
     "jobs": [
       "daily-summary",

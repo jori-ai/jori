@@ -54,6 +54,14 @@
 // after the wait returns `hold` for up to PROBE_HOLD_MIN, then the run goes on
 // without it (fail-open). --no-probe skips it.
 //
+//   `passage`, layer `home-loop` — (2026-11-21) the window sits inside the
+//                routine walk from home: a short loop out of the house and back on
+//                foot (lib/day-excursions.js § the routine walk from home, via
+//                homeLoopVerdict in lib/stop-passage.mjs). Marked non-stop with
+//                --apply like any passage; the day resolver makes the walk its
+//                own named event. While that walk is still out, `hold`.
+//                JORI_HOME_LOOP_WALK=0 (or the config) turns it off.
+//
 // Usage:
 //   stop-passage --visit <id> [--start ISO --end ISO] [--tz Area/City]
 //                [--apply] [--no-jev] [--no-probe] [--no-stated] [--evidence-dry] [--audit] [--json]
@@ -75,9 +83,10 @@ import { instance, localConfig, supabaseUrl } from "../lib/instance.cjs";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { createRequire } from "node:module";
-import { pointsFrom, classifyWindow, isTurnaround, asTurnaround, JEV_MAX_HIDDEN_MIN, PATH_ACC_MAX_M } from "../lib/stop-passage.mjs";
+import { pointsFrom, classifyWindow, isTurnaround, asTurnaround, homeLoopVerdict, JEV_MAX_HIDDEN_MIN, PATH_ACC_MAX_M } from "../lib/stop-passage.mjs";
 import { calendarPlaceAt, venueForCalendarMatch, businessesNear } from "../lib/calendar-place.mjs";
 const { haversineMeters } = createRequire(import.meta.url)("../lib/stop-rests.js");
+const { homeLoopConfig } = createRequire(import.meta.url)("../lib/day-excursions.js");
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(HERE, "..");
@@ -102,6 +111,11 @@ const CRON_RUNS = path.join(DATA, "cron-runs.jsonl");
 // How long the phone may sit on a probe before the run goes ahead without it.
 const PROBE_HOLD_MIN = 15;
 const PROBE_WAIT_MS = 30000;
+// The routine-walk check reads further back than CONTEXT_PAD_MIN: a still phone
+// at home can be silent for hours before the walk, and the loop has to start at
+// a point at home.
+const HOME_LOOP_BACK_MIN = 240;
+const HOME_LOOP_AHEAD_MIN = 90;
 
 /** Start (ms) of the last successful photo sync run, or null if unknown
  *  (no job configured, or no log here — e.g. a laptop run — so don't hold on
@@ -180,6 +194,13 @@ function confirmVisit(visitId, name) {
   if (r.status !== 0 || !out) return { ok: false, error: `exit ${r.status}: ${String(r.stderr || r.stdout || "").trim().slice(-200)}` };
   return { ok: true, promoted: !!out.promoted, reason: out.reason || null,
     patched: out.saved ? out.saved.patched_location_history === true : null };
+}
+
+/** What the log keeps of a routine-walk loop: times and distances, no path. */
+function homeLoopSummary(l) {
+  if (!l) return null;
+  return { home: l.home, start: iso(l.start_ms), end: l.end_ms == null ? null : iso(l.end_ms), minutes: l.minutes,
+    away_m: l.away_m, on_foot: l.on_foot, points_out: l.points_out };
 }
 
 function log(row) {
@@ -284,8 +305,43 @@ async function main() {
   let l1 = classifyWindow({ points, start, end });
   if (turnaround) l1 = asTurnaround(l1);
 
+  // The routine walk from home: a stop on it is part of the walk. Not for a row
+  // that already names its place, and fail-open (an error judges as before).
+  let homeLoop = null;
+  const loopCfg = !turnaround && visit.segment_type === "visit" && visit.place_type !== "named" ? homeLoopConfig() : null;
+  if (loopCfg) {
+    try {
+      const from = iso(start - HOME_LOOP_BACK_MIN * 60000), to = iso(end + HOME_LOOP_AHEAD_MIN * 60000);
+      const [loopFixes, loopVisits] = await Promise.all([
+        sb(`location_history?segment_type=eq.transit&arrived_at=gte.${q(from)}&arrived_at=lte.${q(to)}`
+          + `&select=latitude,longitude,accuracy_m,activity,arrived_at&order=arrived_at.asc&limit=5000`),
+        // Overlapping, not arriving, in the window: the stay at home the walk left
+        // from can have begun the evening before (a still phone all night).
+        sb(`location_history?segment_type=eq.visit&arrived_at=lte.${q(to)}&arrived_at=gte.${q(iso(start - 36 * 3600000))}`
+          + `&or=(departed_at.gte.${q(from)},departed_at.is.null)`
+          + `&select=id,latitude,longitude,accuracy_m,arrived_at,departed_at,place_type&order=arrived_at.asc&limit=500`),
+      ]);
+      homeLoop = homeLoopVerdict({ fixes: loopFixes, photos, visits: loopVisits, visitId, start, end, cfg: loopCfg });
+    } catch (e) {
+      console.error(`[stop-passage] routine-walk check failed: ${String(e.message || e).slice(0, 160)}`);
+    }
+  }
+  if (homeLoop && homeLoop.verdict === "hold" && l1.verdict !== "rest") {
+    const out = { visit_id: visitId, window: { start: iso(start), end: iso(end) }, verdict: "hold", layer: "home-loop",
+      reason: homeLoop.reason, applied: false, protected: protectedRow, home_loop: homeLoopSummary(homeLoop.loop), probe };
+    log(out);
+    if (has("--json")) process.stdout.write(JSON.stringify(out) + "\n"); else console.log(`hold (home-loop) — ${out.reason}`);
+    return;
+  }
+
   let verdict = l1.verdict, layer = "geometry", reason = l1.reason, jev = null;
-  if (l1.verdict === "inconclusive" && !turnaround && !has("--no-jev")) {
+  // The window's own geometry still speaks first: a rest it saw (STOP_MIN), or a
+  // silence in it that could hide a stop, is a stop to ask about on any walk.
+  const loopOverruled = homeLoop && homeLoop.verdict === "passage"
+    && (l1.verdict === "rest" || (l1.features.longest_hidden_min ?? 0) >= JEV_MAX_HIDDEN_MIN);
+  if (homeLoop && homeLoop.verdict === "passage" && !loopOverruled) {
+    verdict = "passage"; layer = "home-loop"; reason = homeLoop.reason;
+  } else if (l1.verdict === "inconclusive" && !turnaround && !has("--no-jev")) {
     const { buildState, judgeWindow } = await import("../lib/stop-passage-jev.mjs");
     const near = photos.filter((p) => Date.parse(p.taken_at) >= start - ppad && Date.parse(p.taken_at) <= end + ppad && p.self_captured !== false);
     let messages = [];
@@ -311,6 +367,8 @@ async function main() {
       reason = `${l1.reason}; jev failed: ${String(e.message || e).slice(0, 120)}`;
     }
   }
+
+  if (loopOverruled) reason = `${reason}; on the routine walk, but the window itself may hold a stop`;
 
   // A passage that runs straight into (or out of) a stay must leave that stay
   // recorded elsewhere — otherwise withdrawing this row could lose the stop.
@@ -413,7 +471,8 @@ async function main() {
   }
 
   const out = { visit_id: visitId, window: { start: iso(start), end: iso(end) }, verdict, layer, reason,
-    applied, protected: protectedRow, features: l1.features, geometry_verdict: l1.verdict, jev, evidence, probe };
+    applied, protected: protectedRow, features: l1.features, geometry_verdict: l1.verdict, jev, evidence, probe,
+    ...(homeLoop ? { home_loop: homeLoopSummary(homeLoop.loop) } : {}) };
   log(out);
   if (has("--json")) process.stdout.write(JSON.stringify(out) + "\n");
   else console.log(`${verdict} (${layer}) — ${reason}${applied ? "  [marked non-stop]" : ""}`);

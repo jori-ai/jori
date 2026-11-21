@@ -21,15 +21,10 @@ struct RichMessageView: View {
     @State private var expanded = false
 
     init(content: String) {
-        if let fold = MessageContentParser.fold(content) {
-            self.segments = MessageContentParser.parse(fold.head)
-            self.fullSegments = MessageContentParser.parse(fold.full)
-            self.foldLabel = fold.label
-        } else {
-            self.segments = MessageContentParser.parse(content)
-            self.fullSegments = nil
-            self.foldLabel = ""
-        }
+        let parsed = MessageContentParser.parsed(content)
+        self.segments = parsed.segments
+        self.fullSegments = parsed.fullSegments
+        self.foldLabel = parsed.foldLabel
     }
 
     /// Cheap fast-path: if the text has no markdown syntax characters, skip

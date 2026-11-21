@@ -30,6 +30,8 @@ import os from "node:os";
 import { spawn } from "node:child_process";
 
 import { installTools } from "../../lib/root.cjs";
+import { createRequire } from "node:module";
+const { modelEnv } = createRequire(import.meta.url)("../../lib/agent-env.cjs");
 const DEFAULT_SPILL_THRESHOLD = 20_000;   // chars of serialized result → spill
 const DEFAULT_TIMEOUT_MS = 30_000;
 
@@ -215,8 +217,7 @@ export function makeClaudeSampler({ claudeBin = null, timeoutMs = 45_000 } = {})
     return new Promise((resolve) => {
       const prompt = [system, ...messages.map((m) => `${(m.role || "user").toUpperCase()}: ${typeof m.content === "string" ? m.content : JSON.stringify(m.content)}`)]
         .filter(Boolean).join("\n");
-      const env = { ...process.env };
-      delete env.ANTHROPIC_API_KEY;
+      const env = modelEnv(); // Max-only, no .env secrets (lib/agent-env.cjs)
       let out = "", done = false;
       const finish = (t) => { if (done) return; done = true; resolve((t || "").trim()); };
       let child;

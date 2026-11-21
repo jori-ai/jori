@@ -445,7 +445,8 @@ function structural(html) {
     // Zoom's own record of the call (or the user's notes for it), and its
     // figures are the call's ("$2 million in August bookings"). Amounts
     // are looked for in the rest of the report.
-    const moneyText = html.replace(/<(p|ul) class="call-talk"[^>]*>[\s\S]*?<\/\1>/g, " ")   // lang-regex-ok: our own call-paragraph markup
+    // The held-messages list is the messages' own words (speak gate digest), not prose either.
+    const moneyText = html.replace(/<(p|ul) class="(?:call-talk|held-digest)"[^>]*>[\s\S]*?<\/\1>/g, " ")   // lang-regex-ok: our own call-paragraph and held-list markup
       .replace(/<[^>]*>/g, " ");                                                     // lang-regex-ok: strips our own markup
     const seenAmts = moneyText.match(/\$\d[\d,]*(?:\.\d{1,2})?/g) || [];     // lang-regex-ok: machine-formatted currency figures
     // A closed task prints exactly as it was titled ("Tasks closed today", code's own

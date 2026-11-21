@@ -1,0 +1,149 @@
+#!/usr/bin/env node
+// car-rental — Rental cars (plugins/car-rental, system/plugins.md).
+//
+// The deterministic half of the car-rental playbook (jobs/car-rental.md): the
+// billing-day count and the aggregator search links, so the agent spends its
+// browser time reading prices, not rebuilding URLs or doing day math.
+//
+// Usage:
+//   car-rental settings
+//   car-rental days  --pickup 2026-12-13T21:00 --return 2026-12-23T09:00
+//   car-rental links --iata DEN --pickup 2027-03-05T21:00 --return 2027-03-15T09:00
+//                    [--return-iata COS] [--companies Hertz,Avis] [--classes compact,midsize,suv]
+// Times are local to the rental counter (no zone). Output is JSON.
+//
+// Settings: agent/local/config/car-rental.json over the defaults below. The
+// user's own preferences (car class, which companies) live in memory, on the
+// wiki page named by preferences_page; companies/classes here are only the
+// fallback filter when that page names none.
+
+const path = require("node:path");
+const LIB = path.join(__dirname, "..", "..", "..", "lib");
+const { localConfig } = require(path.join(LIB, "instance.cjs"));
+
+const DEFAULTS = {
+  preferences_page: "travel_car_rental_preferences",
+  aggregators: ["carrentals.com", "rentalcars.com"], // kernel-guard-ok: public comparison sites this plugin has link builders for
+  direct: ["sixt.com", "avis.com", "hertz.com", "nationalcar.com", "enterprise.com", "budget.com", "alamo.com"],
+  companies: ["Alamo", "Avis", "Budget", "Dollar", "Enterprise", "Hertz", "National", "Sixt", "Thrifty"],
+  classes: ["compact", "midsize", "suv"],
+  driver_age: 40,
+  grace_minutes: 29,
+};
+
+// Each aggregator's own filter values for a company and a class.
+const CARRENTALS_VENDOR = {
+  alamo: "alamo rent a car", avis: "avis", budget: "budget", dollar: "dollar rent a car",
+  enterprise: "enterprise", hertz: "hertz", national: "national car rental", sixt: "sixt",
+  thrifty: "thrifty car rental",
+};
+const CARRENTALS_CLASS = { economy: "economy", compact: "compact", midsize: "midsize", standard: "standard", fullsize: "fullsize", suv: "suv", minivan: "minivan" };
+const RENTALCARS_CLASS = { compact: "small", midsize: "medium", fullsize: "large", suv: "suvs", minivan: "carriers" };
+
+function arg(argv, name, dflt = null) {
+  const i = argv.indexOf(`--${name}`);
+  return i >= 0 && i + 1 < argv.length ? argv[i + 1] : dflt;
+}
+
+// "2026-12-13T21:00" → parts, read as wall-clock time (no zone conversion).
+function parseLocal(s) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2})$/.exec(String(s || "").trim());
+  if (!m) throw new Error(`bad time "${s}" (want YYYY-MM-DDTHH:MM, local to the counter)`);
+  const [, y, mo, d, h, mi] = m.map(Number);
+  return { y, mo, d, h, mi, ms: Date.UTC(y, mo - 1, d, h, mi) };
+}
+
+const pad = (n) => String(n).padStart(2, "0");
+
+// Rental companies bill in 24-hour periods from the pickup time, with a short
+// grace before an extra day (or a pricier hourly charge) starts.
+function billingDays(pickup, ret, graceMinutes) {
+  const p = parseLocal(pickup), r = parseLocal(ret);
+  const minutes = (r.ms - p.ms) / 60000;
+  if (minutes <= 0) throw new Error("return must be after pickup");
+  const full = Math.floor(minutes / 1440);
+  const rem = minutes - full * 1440;
+  const days = Math.max(1, rem > graceMinutes ? full + 1 : full);
+  const back = new Date(p.ms + days * 1440 * 60000);
+  const latest = `${back.getUTCFullYear()}-${pad(back.getUTCMonth() + 1)}-${pad(back.getUTCDate())}T${pad(back.getUTCHours())}:${pad(back.getUTCMinutes())}`;
+  return { hours: Math.round((minutes / 60) * 10) / 10, billing_days: days, return_by_for_same_price: latest };
+}
+
+function ampm(t) {
+  const h12 = t.h % 12 === 0 ? 12 : t.h % 12;
+  return `${pad(h12)}${pad(t.mi)}${t.h < 12 ? "AM" : "PM"}`;
+}
+
+function links({ iata, returnIata, pickup, ret, companies, classes, driverAge }) {
+  const p = parseLocal(pickup), r = parseLocal(ret);
+  const to = (returnIata || iata).toUpperCase();
+  const from = iata.toUpperCase();
+  const keys = companies.map((c) => String(c).toLowerCase());
+
+  const cr = new URLSearchParams();
+  cr.append("locn", from);
+  if (to !== from) cr.append("loc2", to);
+  cr.append("date1", `${pad(p.mo)}/${pad(p.d)}/${p.y}`);
+  cr.append("date2", `${pad(r.mo)}/${pad(r.d)}/${r.y}`);
+  cr.append("time1", ampm(p));
+  cr.append("time2", ampm(r));
+  for (const k of keys) if (CARRENTALS_VENDOR[k]) cr.append("selVen", CARRENTALS_VENDOR[k]);
+  for (const c of classes) if (CARRENTALS_CLASS[c]) cr.append("selCC", CARRENTALS_CLASS[c]);
+  cr.append("sort", "TOTAL_PRICE_LOW_TO_HIGH");
+
+  const rc = new URLSearchParams({
+    locationIata: from, dropLocationIata: to,
+    puDay: p.d, puMonth: p.mo, puYear: p.y, puHour: p.h, puMinute: p.mi,
+    doDay: r.d, doMonth: r.mo, doYear: r.y, doHour: r.h, doMinute: r.mi,
+    driversAge: driverAge, ftsType: "A", dropFtsType: "A",
+  });
+  for (const c of companies) rc.append("filterCriteria_supplier", c);
+  for (const c of classes) if (RENTALCARS_CLASS[c]) rc.append("filterCriteria_carCategory", RENTALCARS_CLASS[c]);
+  rc.append("filterCriteria_sortBy", "PRICE");
+  rc.append("filterCriteria_sortAscending", "true");
+
+  return {
+    "carrentals.com": `https://www.carrentals.com/carsearch?${cr.toString().replace(/\+/g, "%20")}`, // kernel-guard-ok: a public comparison site
+    "rentalcars.com": `https://www.rentalcars.com/search-results?${rc.toString().replace(/\+/g, "%20")}`,
+    unmapped_companies: keys.filter((k) => !CARRENTALS_VENDOR[k]),
+  };
+}
+
+function list(s) {
+  return s ? String(s).split(",").map((x) => x.trim()).filter(Boolean) : null;
+}
+
+function main(argv) {
+  const cfg = localConfig("car-rental", DEFAULTS);
+  const cmd = argv[0];
+  let out;
+  try {
+    if (cmd === "settings") out = cfg;
+    else if (cmd === "days") out = billingDays(arg(argv, "pickup"), arg(argv, "return"), Number(cfg.grace_minutes));
+    else if (cmd === "links") {
+      const iata = arg(argv, "iata");
+      if (!iata) throw new Error("--iata is required (the pickup airport)");
+      out = {
+        ...billingDays(arg(argv, "pickup"), arg(argv, "return"), Number(cfg.grace_minutes)),
+        links: links({
+          iata, returnIata: arg(argv, "return-iata"),
+          pickup: arg(argv, "pickup"), ret: arg(argv, "return"),
+          companies: list(arg(argv, "companies")) || cfg.companies,
+          classes: (list(arg(argv, "classes")) || cfg.classes).map((c) => c.toLowerCase()),
+          driverAge: cfg.driver_age,
+        }),
+      };
+    } else {
+      process.stderr.write("usage: car-rental settings | days --pickup T --return T | links --iata XXX --pickup T --return T [--return-iata YYY] [--companies a,b] [--classes a,b]\n");
+      return 2;
+    }
+  } catch (e) {
+    process.stderr.write(`car-rental: ${e.message}\n`);
+    return 1;
+  }
+  process.stdout.write(JSON.stringify(out, null, 2) + "\n");
+  return 0;
+}
+
+if (require.main === module) process.exit(main(process.argv.slice(2)));
+module.exports = { main, DEFAULTS, billingDays, links };

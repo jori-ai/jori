@@ -6,7 +6,7 @@ const fs = require('fs');
 const path = require('path');
 const { execSync, execFileSync, spawnSync, spawn } = require('child_process');
 const os = require('os');
-const { installRoot, installTools } = require("../lib/root.cjs");
+const { installRoot, installTools, REPO_ROOT } = require("../lib/root.cjs");
 
 // The shared hum ping budget as lib/ping-budget.mjs pingCaps() enforces
 // it (same env overrides and defaults; this CLI is CommonJS and cannot import
@@ -84,8 +84,25 @@ function shSafe(cmd, opts = {}) {
 
 // A registry read with no install at the expected root (installRoot():
 // $JORI_HOME, else ~/Dev/jori) says so instead of dying on an ENOENT stack.
+// Registry options for `name`. An explicit root reads that checkout's kernel
+// and local files only, with no plugin layer, so the enabled plugins' tasks
+// (plugin.json jobs.<job>.task, lib/plugins.cjs) were invisible to `jori
+// tasks` and doctor. When the install is the checkout this CLI runs from
+// (lib/root.cjs REPO_ROOT; always so on the host), tasks are read the way
+// every other reader reads them: kernel + plugins + local, disabled plugins'
+// jobs left out. The same options go to the write (writeTasks), so a plugin's
+// entries stay out of agent/local/tasks.json. Services keep the root: a
+// plugin's services describe outside services, not processes `jori services`
+// and doctor check.
+function registryOpts(name) {
+  if (name === 'tasks') {
+    const real = (p) => { try { return fs.realpathSync(p); } catch { return path.resolve(p); } };
+    if (real(ROOT) === real(REPO_ROOT)) return {};
+  }
+  return { root: ROOT };
+}
 function loadRegistryOrHint(name) {
-  try { return registry.loadRegistryList(name, { root: ROOT }); }
+  try { return registry.loadRegistryList(name, registryOpts(name)); }
   catch (e) {
     if (e && e.code === 'ENOENT' && !fs.existsSync(SYSTEM)) {
       die(`no Jori install at ${ROOT} (${SYSTEM} is missing). Set JORI_HOME to the repo root, e.g. JORI_HOME=${path.resolve(__dirname, '..', '..')} jori ${process.argv.slice(2).join(' ')}`, 2);  // control-scan-ok: the software's name
@@ -129,10 +146,11 @@ function cmdHelp(extensions = []) {
   console.log('  tasks [list] [--json]         list automated tasks');
   console.log('  tasks show <name>             show full task detail');
   console.log('  tasks match "<phrase>"        find task by natural-language phrase');
-  console.log('  tasks run <name>              dispatch task via webhook\n');
+  console.log('  tasks run <name> [--task T] [--reply-to CONV]   dispatch task via webhook (T: this request, for a job; CONV: the conversation the answer goes to)\n');
   console.log(c.bold('HEALTH'));
   console.log('  whereami [--json|--banner|--role]  which machine am I on (the production host vs another)');
-  console.log('  status                        system health dashboard');
+  console.log('  status                        system health dashboard + what Jori is doing');
+  console.log('  status --work [--json] [--match T] [--section S] [--deep]   only the work snapshot: running, waiting on you, stuck, failed, done (bin/self-status)');
   console.log('  services [--json]             LaunchAgents + tmux status');
   console.log('  doctor [--json] [--repair]    run drift checks; --repair auto-fixes schedule drift + orphan scripts');
   console.log(`  activity [--json]             ${OWNER}'s inferred state (active/winding_down/sleeping)`);
@@ -190,7 +208,7 @@ function cmdTasks(args) {
 function writeTasks(tasks) {
   // The merged list goes back as local entries/overrides (agent/local/tasks.json);
   // the kernel's tasks.json is never rewritten from here.
-  registry.writeRegistryList('tasks', tasks, { root: ROOT });
+  registry.writeRegistryList('tasks', tasks, registryOpts('tasks'));
 }
 
 function cmdTasksPause(args) {
@@ -251,21 +269,25 @@ function cmdTasksShow(args) {
   console.log(c.bold(task.name));
   console.log(c.dim('  schedule:         ') + (task.schedule_human || 'manual'));
   console.log(c.dim('  cron:             ') + (task.schedule || '—'));
-  console.log(c.dim('  trigger_script:   ') + task.trigger_script);
+  if (task.plugin) console.log(c.dim('  plugin:           ') + task.plugin);
+  console.log(c.dim('  trigger_script:   ') + (task.trigger_script || '—'));
   if (task.cron_label) console.log(c.dim('  cron line label:  ') + task.cron_label);
   // A launchd job has no webhook — it is exec'd directly by its LaunchAgent
   // (the ephemeral-Opus family: cron/webhook can't unlock the Max keychain).
   // Printing "POST undefined" invited exactly the wrong next move.
   console.log(c.dim('  dispatch:         ') + (task.webhook_url
     ? `POST ${task.webhook_url}`
-    : `launchd — ai.claude.${task.name} runs ${task.trigger_script || 'its trigger'} directly (no webhook)`));
+    : isPluginTask(task)
+      ? `jori dispatch ${task.job} — to its tier (job-routing), the job's playbook in plugins/${task.plugin}/jobs/${task.job}.md`
+      : `launchd — ai.claude.${task.name} runs ${task.trigger_script || 'its trigger'} directly (no webhook)`));
   console.log(c.dim('  webhook_task:     ') + task.webhook_task);
-  console.log(c.dim('  playbook section: ') + `ops-agent/CLAUDE.md § ${task.ops_playbook_section}`);
-  console.log(c.dim('  delivers_to:      ') + task.delivers_to);
+  if (task.ops_playbook_section) console.log(c.dim('  playbook section: ') + `ops-agent/CLAUDE.md § ${task.ops_playbook_section}`);
+  else if (task.job) console.log(c.dim('  playbook:         ') + `jobs/${task.job}.md`);
+  console.log(c.dim('  delivers_to:      ') + (task.delivers_to || '—'));
   if (task.paused_until) {
     console.log(c.dim('  paused_until:     ') + task.paused_until + (task.paused_reason ? ` — ${task.paused_reason}` : ''));
   }
-  console.log(c.dim('  phrases:          ') + task.phrases.join(', '));
+  console.log(c.dim('  phrases:          ') + (task.phrases || []).join(', '));
   console.log(c.dim('  description:      ') + task.description);
 }
 
@@ -274,13 +296,14 @@ function matchTask(phrase) {
   const matches = [];
   for (const t of loadTasks()) {
     let best = null;
-    for (const p of t.phrases) {
+    const phrases = t.phrases || [];
+    for (const p of phrases) {
       if (needle.includes(' ' + p.toLowerCase() + ' ') || needle.trim() === p.toLowerCase()) {
         best = p; break;
       }
     }
     if (!best) {
-      for (const p of t.phrases) {
+      for (const p of phrases) {
         if (needle.includes(p.toLowerCase())) { best = p; break; }
       }
     }
@@ -302,6 +325,7 @@ function cmdTasksMatch(args) {
         name: m.task.name,
         matched_phrase: m.matched_phrase,
         webhook_task: m.task.webhook_task,
+        ...(m.task.plugin ? { plugin: m.task.plugin } : {}),
         description: m.task.description,
       })),
     }, null, 2));
@@ -312,7 +336,7 @@ function cmdTasksMatch(args) {
     const m = matches[0];
     console.log(c.green('high confidence: ') + c.bold(m.task.name));
     console.log(c.dim('matched phrase: ') + `"${m.matched_phrase}"`);
-    console.log(c.dim('run with:       ') + `jori tasks run ${m.task.name}`);
+    console.log(c.dim('run with:       ') + `jori tasks run ${m.task.name}${isPluginTask(m.task) ? ' [--task "<this request>"]' : ''}`);
     return;
   }
   console.log(c.yellow(`ambiguous — ${matches.length} matches:`));
@@ -320,10 +344,17 @@ function cmdTasksMatch(args) {
   process.exit(2);
 }
 
-function taskBody(task) {
+// A plugin job's task (lib/plugins.cjs pluginTask): no webhook URL of its own,
+// dispatched by job name to its tier like `jori dispatch`.
+function isPluginTask(task) { return !!(task && task.plugin && !task.webhook_url && task.job); }
+
+function taskBody(task, extra = null) {
   // If the task has a job field, use {"job": "..."} so the webhook handler
-  // loads full instructions from the jobs/*.md file at dispatch time.
-  if (task.job) return JSON.stringify({ job: task.job });
+  // loads full instructions from the jobs/*.md file at dispatch time. `extra`
+  // (`jori tasks run <task> --task "…"`) rides along as `task`; the webhook
+  // appends it to the playbook under "## This dispatch"
+  // (agent/supervisor/http-server.mjs).
+  if (task.job) return JSON.stringify(extra ? { job: task.job, task: extra } : { job: task.job });
   // Legacy fallback for tasks without a job file.
   const bodyText = task.webhook_body
     || `${task.webhook_task}: ${task.description} Follow the ${task.ops_playbook_section} instructions in CLAUDE.md.`;
@@ -353,10 +384,28 @@ function postWebhook(url, body) {
 }
 
 function cmdTasksRun(args) {
-  const name = args.find(a => !a.startsWith('--'));
-  if (!name) die('tasks run: missing <name>. Try: jori tasks');
+  // The first bare word that is not a flag's value (`--task "…" car-rental`).
+  const name = args.find((a, i) => !a.startsWith('--') && args[i - 1] !== '--task' && args[i - 1] !== '--reply-to');
+  if (!name) die('tasks run: missing <name>. Usage: jori tasks run <name> [--task "this request"] [--reply-to <conversation>] [--dry-run]');
+  let extra = args.includes('--task') ? getFlag(args, '--task') : null;
+  if (args.includes('--task') && !(extra && extra.trim())) die('tasks run: --task needs the request text, e.g. --task "Lisbon airport; Dec 3 10:00; Dec 9 18:00"');
+  // --reply-to <conversation>: the job answers in the conversation that asked,
+  // not in the one of the role that owns the job (lib/reply-to.cjs).
+  if (args.includes('--reply-to')) {
+    try { extra = require(path.join(TOOLS, 'lib/reply-to.cjs')).withReplyTo(extra, getFlag(args, '--reply-to')); }
+    catch (e) { die(`tasks run: ${e.message}`); }
+  }
   const task = loadTasks().find(t => t.name === name);
   if (!task) die(`No task named '${name}'. Try: jori tasks`);
+  // A plugin's task has no webhook of its own: `jori dispatch <job>` sends it
+  // to its tier (job-routing.json, Chrome jobs to ops), with the same
+  // health fallback and token the cron triggers use.
+  if (isPluginTask(task)) {
+    const dArgs = ['dispatch', task.job, ...(extra ? ['--task', extra] : []), ...(hasFlag(args, '--dry-run') ? ['--dry-run'] : [])];
+    const r = spawnSync(process.execPath, [__filename, ...dArgs], { stdio: 'inherit' });
+    process.exit(r.status === null ? 1 : r.status);
+  }
+  if (extra && !task.job) die(`tasks run: '${task.name}' has no job playbook, so --task has nothing to add to. Run it without --task.`);
   // Refuse rather than POST to `undefined`. A launchd job (the ephemeral-Opus
   // family) has no webhook by design — dispatching one through the supervisor
   // would run it on the resident Sonnet supervisor instead of the Opus fork it
@@ -366,7 +415,7 @@ function cmdTasksRun(args) {
         `  Run it now:   ${task.trigger_script || '(see tasks.json)'}\n` +
         `  Or via launchd: launchctl kickstart -k gui/$(id -u)/ai.claude.${task.name}`);
   }
-  const body = taskBody(task);
+  const body = taskBody(task, extra);
   if (hasFlag(args, '--dry-run')) {
     console.log(c.dim('(dry-run — no dispatch)'));
     console.log(c.bold('would POST ') + task.webhook_url);
@@ -389,7 +438,17 @@ function cmdTasksRun(args) {
 }
 
 // --- status ---
+// `jori status --work [self-status flags]`: what Jori is doing right now
+// (bin/self-status, lib/self-status.mjs). Plain `jori status` shows the health
+// dashboard and then the same work snapshot.
+function runSelfStatus(extra) {
+  const { spawnSync } = require('child_process');
+  const r = spawnSync(process.execPath, [path.join(__dirname, 'self-status'), ...extra], { stdio: 'inherit' });
+  return r.status ?? 1;
+}
+
 function cmdStatus(args) {
+  if (hasFlag(args, '--work')) { process.exit(runSelfStatus(args.filter((a) => a !== '--work'))); }
   if (hasFlag(args, '--json')) { console.log(JSON.stringify(collectStatus(), null, 2)); return; }
   const s = collectStatus();
   console.log(c.bold('SYSTEM STATUS') + c.dim('  ' + new Date().toISOString()) + '\n');
@@ -475,6 +534,10 @@ function cmdStatus(args) {
   } else {
     console.log('  ' + c.dim('(none)'));
   }
+
+  // What Jori is doing (the work snapshot; `jori status --work` for it alone).
+  console.log('\n' + c.bold('WORK') + c.dim('  (jori status --work [--json|--match <text>|--section …])'));
+  runSelfStatus(['--done', '5']);
 }
 
 function fetchJson(url) {
@@ -1425,8 +1488,8 @@ function cmdWhere(args) {
   const hits = [];
   // tasks
   for (const t of loadTasks()) {
-    if (t.name.includes(ql) || t.webhook_task.toLowerCase().includes(ql) || t.phrases.some(p => p.includes(ql)))
-      hits.push({ kind: 'task', name: t.name, location: t.trigger_script });
+    if (t.name.includes(ql) || String(t.webhook_task || '').toLowerCase().includes(ql) || (t.phrases || []).some(p => p.includes(ql)))
+      hits.push({ kind: 'task', name: t.name, location: t.trigger_script || (t.plugin ? `plugins/${t.plugin}` : '') });
   }
   // services
   for (const s of loadServices()) {
@@ -1481,8 +1544,26 @@ function cmdDoctor(args) {
   const allTriggers = [...triggerScripts, ...checkScripts];
   // Exclude event-driven scripts (not scheduled tasks) from orphan check
   const eventDriven = new Set(['trigger-startup-catchup.sh']);
-  const orphans = allTriggers.filter(f => !eventDriven.has(f) && !tasks.some(t => t.trigger_script && t.trigger_script.endsWith(f)));
-  add('trigger scripts in tasks.json', orphans.length === 0, orphans.length ? `orphans: ${orphans.join(', ')}` : `${allTriggers.length} trigger scripts, all registered`);
+  // A trigger is owned when a task names it, a plugin's schedule runs it (a
+  // plugin's cron lines never reach tasks.json; a disabled plugin still owns
+  // its scripts), or a LaunchAgent in agent/launch-agents launches it (the
+  // launchd-driven ones, e.g. question-hold-release, have no task at all).
+  const ownedElsewhere = new Set();
+  try {
+    const pl = require(path.join(__dirname, '..', 'lib', 'plugins.cjs'));
+    for (const p of pl.plugins()) {
+      if (p.errors && p.errors.length) continue;
+      for (const sch of pl.schedulesOf(p)) for (const m of String(sch.command || '').matchAll(/agent\/scripts\/([\w.-]+\.sh)/g)) ownedElsewhere.add(m[1]);
+    }
+  } catch { /* no plugins: tasks alone decide */ }
+  for (const dir of [path.join(TOOLS, 'agent/launch-agents'), path.join(TOOLS, 'agent/local/launch-agents')]) {
+    if (!fs.existsSync(dir)) continue;
+    for (const f of fs.readdirSync(dir).filter(f => f.endsWith('.plist'))) {
+      for (const m of fs.readFileSync(path.join(dir, f), 'utf8').matchAll(/agent\/scripts\/([\w.-]+\.sh)/g)) ownedElsewhere.add(m[1]);
+    }
+  }
+  const orphans = allTriggers.filter(f => !eventDriven.has(f) && !ownedElsewhere.has(f) && !tasks.some(t => t.trigger_script && t.trigger_script.endsWith(f)));
+  add('trigger scripts in tasks.json', orphans.length === 0, orphans.length ? `orphans: ${orphans.join(', ')}` : `${allTriggers.length} trigger scripts, all registered (tasks, plugin schedules or LaunchAgents)`);
 
   // A task with paused_until = YYYY-MM-DD (or full ISO) is expected to be
   // absent from crontab until that date. When it passes, the check starts
@@ -1531,6 +1612,16 @@ function cmdDoctor(args) {
   let clockTz = null;
   const unscheduled = [];
   for (const t of scheduledTasks) {
+    // A plugin's scheduled task (lib/plugins.cjs pluginTask) runs from the
+    // plugin's own cron lines, each marked `# jori-plugin:<plugin>:<label>`
+    // and retimed in place (cron-tz-sync, the control room), so it is found
+    // by that marker, not by its nominal time. No marked line → missing,
+    // like any task. A line the plugin paused (`#<tag># …`) still counts.
+    if (isPluginTask(t)) {
+      const mark = `# jori-plugin:${t.plugin}:`;
+      if (!cron.split('\n').some(l => l.includes(mark))) unscheduled.push(`${t.name} (plugin ${t.plugin})`);
+      continue;
+    }
     // A cron-run-direct task (trigger_script: null, since 2026-10-10) is found by
     // its `--label <name>`; path.basename(null) threw and took doctor down.
     // A task whose cron line runs something OTHER than its trigger_script names
@@ -1579,13 +1670,19 @@ function cmdDoctor(args) {
   add('ops playbook sections exist', missingSections.length === 0, missingSections.length ? `missing: ${missingSections.join('; ')}` : `${tasks.length} sections verified in ops-agent/CLAUDE.md`);
 
   // 5. services.json plists → exist
+  // A `transient` service installs its plist only while it runs and removes
+  // it itself (resilience-test self-removes after 72h), so absence is normal.
   const missingPlists = [];
+  let transientAbsent = 0;
   for (const s of services) {
     if (s.type !== 'launchagent') continue;
     const p = expandHome(s.plist);
-    if (!fs.existsSync(p)) missingPlists.push(s.label);
+    if (fs.existsSync(p)) continue;
+    if (s.transient) transientAbsent++;
+    else missingPlists.push(s.label);
   }
-  add('services.json plists exist', missingPlists.length === 0, missingPlists.length ? `missing: ${missingPlists.join(', ')}` : `${services.filter(s => s.type === 'launchagent').length} plists verified`);
+  const transientNote = transientAbsent ? ` (${transientAbsent} transient, not installed)` : '';
+  add('services.json plists exist', missingPlists.length === 0, missingPlists.length ? `missing: ${missingPlists.join(', ')}` : `${services.filter(s => s.type === 'launchagent' && !s.transient).length} plists verified${transientNote}`);
 
   // 6. no old Dev/Tools paths in tracked text files
   // Use git grep — it natively skips binary files and respects .gitignore.
@@ -1597,7 +1694,7 @@ function cmdDoctor(args) {
 
   // 7. phrase uniqueness
   const phraseMap = new Map();
-  for (const t of tasks) for (const p of t.phrases) {
+  for (const t of tasks) for (const p of (t.phrases || [])) {
     const k = p.toLowerCase();
     if (!phraseMap.has(k)) phraseMap.set(k, []);
     phraseMap.get(k).push(t.name);
@@ -1914,7 +2011,7 @@ function cmdDoctor(args) {
   // target was inspected instead of the actual binary. Probe by invoking a
   // no-op subcommand: a non-zero exit surfaces real auth/binary regressions
   // (renamed binary, expired token bucket) without reading the symlink.
-  const gogProbe = shSafe(`/opt/homebrew/bin/gog tasks lists --plain ${OWNER_EMAIL ? `--account=${OWNER_EMAIL} ` : ''}--no-input 2>&1 | head -3`);
+  const gogProbe = shSafe(`${process.env.GOG_BIN || '/opt/homebrew/bin/gog'} tasks lists --plain ${OWNER_EMAIL ? `--account=${OWNER_EMAIL} ` : ''}--no-input 2>&1 | head -3`);
   const gogOk = gogProbe && !/no auth|missing|not found|error/i.test(gogProbe);
   add('gog tasks CLI reachable', !!gogOk, gogOk
     ? `lists fetched (${gogProbe.split('\n').filter(Boolean).length} rows)`
@@ -1985,6 +2082,26 @@ function cmdDoctor(args) {
     }
   }
 
+  // The secrets broker (docs/secrets-broker.md), where one is installed: it
+  // answers, holds its tokens, and .env no longer carries a copy of them.
+  {
+    const brokerClient = require(path.join(TOOLS, 'lib/secrets-broker/client.cjs'));
+    if (brokerClient.present() || fs.existsSync('/Library/LaunchDaemons/com.jori.secrets-broker.plist')) {
+      const r = spawnSync(path.join(TOOLS, 'bin/secrets-broker'), ['health'], { encoding: 'utf8', timeout: 15_000 });
+      let h = null;
+      try { h = JSON.parse(r.stdout); } catch { /* no answer */ }
+      if (!h) add('secrets broker answers', false, `no answer from ${brokerClient.sockPath()} (${String(r.stderr || '').trim().slice(0, 160) || `exit ${r.status}`}); see /Library/JoriSecrets/log/broker.log`);
+      else {
+        const missing = Object.entries(h.tokens || {}).filter(([, v]) => !v).map(([k]) => k);
+        let dup = [];
+        try { dup = fs.readFileSync(path.join(TOOLS, '.env'), 'utf8').split('\n').map((l) => l.split('=')[0].trim()).filter((k) => /^OP_(LOGINS_)?SERVICE_ACCOUNT_TOKEN$/.test(k)); } catch { /* no .env */ }
+        add('secrets broker answers', missing.length === 0, missing.length
+          ? `broker v${h.version} holds no ${missing.join(', ')} token (sudo secrets-broker-install --set …)`
+          : `broker v${h.version} holds the 1Password tokens${dup.length ? `; .env still has ${dup.join(', ')}, so an agent can read them there: remove them and rotate` : '; .env has none of them'}`, dup.length > 0);
+      }
+    }
+  }
+
   if (hasFlag(args, '--json')) { console.log(JSON.stringify(checks, null, 2)); process.exit(checks.every(c => c.ok) ? 0 : 1); }
 
   // --repair: auto-fix repairable drift (schedule mismatches + orphan scripts in cron)
@@ -2024,6 +2141,7 @@ function cmdDoctor(args) {
     const taskScriptsR = new Set(mutableTasks.map(t => t.trigger_script && t.trigger_script.split('/').pop()).filter(Boolean));
     for (const [bname, scheds] of Object.entries(cronMapR)) {
       if (taskScriptsR.has(bname)) continue;
+      if (ownedElsewhere.has(bname)) continue; // a plugin's schedule or a LaunchAgent owns it
       const scriptPath = path.join(TOOLS, 'agent/scripts', bname);
       if (!fs.existsSync(scriptPath)) continue;
       // Read the first comment line for a description
@@ -2721,7 +2839,7 @@ function buildSituation() {
   // trumps most other candidates).
   let upcomingEvents = [];
   try {
-    const raw = shSafe(`/opt/homebrew/bin/gog calendar list ${OWNER_EMAIL ? `--account ${OWNER_EMAIL} ` : ''}--days 1 --max 20 --json 2>/dev/null`) || '';
+    const raw = shSafe(`${process.env.GOG_BIN || '/opt/homebrew/bin/gog'} calendar list ${OWNER_EMAIL ? `--account ${OWNER_EMAIL} ` : ''}--days 1 --max 20 --json 2>/dev/null`) || '';
     const data = JSON.parse(raw || '{}');
     const events = data?.events || data?.items || [];
     const now = Date.now();
@@ -2745,7 +2863,7 @@ function buildSituation() {
   // Due-today + overdue tasks — lightweight counts + top-3 titles
   let dueToday = [], overdueCount = 0;
   try {
-    const plain = shSafe(`/opt/homebrew/bin/gog tasks list @default --plain 2>/dev/null`) || '';
+    const plain = shSafe(`${process.env.GOG_BIN || '/opt/homebrew/bin/gog'} tasks list @default --plain 2>/dev/null`) || '';
     const today = new Date().toISOString().slice(0, 10);
     for (const line of plain.split('\n').filter(Boolean)) {
       if (line.includes('completed')) continue;
@@ -2921,8 +3039,8 @@ function cmdHumAudit(args) {
     }
   }
 
-  const runs = parseJsonl(HUM_RUNS);
-  const feedback = parseJsonl(HUM_FEEDBK);
+  const runs = parseJsonl(process.env.HUM_RUNS_FILE || HUM_RUNS);
+  const feedback = parseJsonl(process.env.HUM_FEEDBACK_FILE || HUM_FEEDBK);
 
   // A run "sent" if outcome.sent === true (new schema) OR decision === 'PING'
   // with a ping_id (legacy schema, pre-2026-04-15 rewrite). Accept `ts` or
@@ -2936,15 +3054,21 @@ function cmdHumAudit(args) {
     return newSchema || legacy;
   }).map((r) => r.outcome?.ping_id || r.ping_id);
 
-  const feedbackPings = feedback.filter((r) => {
+  // Live-lane pings (nearby / local_history) go out outside the tick loop, so
+  // they never have a run row. Structured fields only: lane + budget_pool.
+  const isLiveLane = (r) => r.lane === 'nearby' && r.budget_pool === 'local_history';
+  const windowFeedback = feedback.filter((r) => {
     const ts = Date.parse(r.sent_at || '');
     return Number.isFinite(ts) && ts >= cutoff;
-  }).map((r) => r.ping_id);
+  });
+  const liveLaneIds = new Set(windowFeedback.filter(isLiveLane).map((r) => r.ping_id));
+  const feedbackPings = windowFeedback.map((r) => r.ping_id);
 
   const sentSet = new Set(sentPings);
   const feedbackSet = new Set(feedbackPings);
   const missingFeedback = [...sentSet].filter((id) => !feedbackSet.has(id));
-  const orphanFeedback = [...feedbackSet].filter((id) => !sentSet.has(id));
+  const orphanFeedback = [...feedbackSet].filter((id) => !sentSet.has(id) && !liveLaneIds.has(id));
+  const liveLaneNoRun = [...liveLaneIds].filter((id) => !sentSet.has(id));
   const drift = missingFeedback.length + orphanFeedback.length;
 
   const report = {
@@ -2954,6 +3078,7 @@ function cmdHumAudit(args) {
     pings_logged_in_feedback: feedbackPings.length,
     missing_feedback_for_sent: missingFeedback,
     orphan_feedback_no_run: orphanFeedback,
+    live_lane_no_run_count: liveLaneNoRun.length,
     drift_count: drift,
     healthy: drift === 0,
   };
@@ -2965,6 +3090,7 @@ function cmdHumAudit(args) {
     console.log(`${c.bold('hum audit')} (last ${windowHours}h) — ${mark}`);
     console.log(`  sent in runs:      ${report.pings_sent_in_runs}`);
     console.log(`  logged in feedback: ${report.pings_logged_in_feedback}`);
+    console.log(`  live-lane (no run expected): ${liveLaneNoRun.length}`);
     if (missingFeedback.length) {
       console.log(c.red(`  missing feedback (${missingFeedback.length}):`));
       for (const id of missingFeedback) console.log(`    ${id}`);
@@ -3516,10 +3642,11 @@ async function cmdHumLane(args) {
   die(`unknown: hum lane ${sub}. Try: status | enable <name> [reason] | disable <name> [reason]`);
 }
 
-// Infer the user's current activity state from existing signals. Reads
-// phone-channel-cursor.json (last inbound) + user-timezone.json (local TZ),
-// classifies as active / winding_down / sleeping / waking. Used by
-// trigger-hum.sh as a soft gate and exposed here for ad-hoc inspection.
+// Infer the user's current activity state from existing signals. With a usable
+// sleep signal it is that signal alone (sleeping / active); without one, reads
+// phone-channel-cursor.json (last inbound) + user-timezone.json (local TZ) and
+// classifies by the clock as active / winding_down / sleeping / waking. Used by
+// trigger-hum.sh and hum-sense as a soft gate and exposed here for ad-hoc inspection.
 function inferActivityState() {
   const fs = require('fs');
   const dataDir = path.join(TOOLS, 'data');
@@ -3535,6 +3662,21 @@ function inferActivityState() {
   );
   let state = 'active';
   let reason = `${localHour}:00 local, inbound ${ageMin ?? '?'}m ago`;
+
+  // The sleep signal (lib/sleep-night.js sleepSignal: sleep data + the phone's
+  // lock/unlock rows) is the whole answer when the installation has one:
+  // asleep → sleeping, awake → active, at any hour. The clock rules below run
+  // whenever there is no usable signal (sensing off, no recent rows, stale).
+  try {
+    const sig = require(path.join(TOOLS, 'lib/sleep-night.js')).sleepSignal();
+    if (sig.usable) {
+      return {
+        state: sig.state === 'asleep' ? 'sleeping' : 'active',
+        last_inbound_min_ago: ageMin, local_hour: localHour, local_tz: tz,
+        reason: `sleep signal: ${sig.state} (${sig.reason})`,
+      };
+    }
+  } catch {}
 
   // A device signal the installation has (cliExt().activityOverride: the phone
   // locked since bed hours → sleeping, whatever the clock says) beats the clock

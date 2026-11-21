@@ -153,3 +153,42 @@ test("JORI_TRAVEL_OVER_HIDDEN=0 prints no line there", () => {
   }
 });
 }
+
+// The spine's pace words have no flight, so the hop between two airports arrived
+// as `driving` at flight pace and the line read "Drove" with a floor distance.
+const HOP_FROM = (t) => ({ id: "s-a", end: "16:48", end_ts_ms: t, tz: "Asia/Jerusalem" });
+const HOP_TO = (t) => ({ id: "s-b", start: "19:30", start_ts_ms: t, tz: "Asia/Jerusalem" });
+
+test("a leg flown between two airports says Flew, with the straight line as its distance", () => {
+  const t0 = U("21:48:00"), t1 = t0 + 162 * 60000;
+  const hop = { from: "s-a", to: "s-b", duration_min: 162, distance_km: 1888.6, mode: null };
+  const line = text(travelHtml(hop, HOP_FROM(t0), HOP_TO(t1), day([spineLeg({ start_ms: t0, end_ms: t1, straight_m: 1888623 })])));
+  assert.match(line, /Flew 2h 42m \(1888\.6 km\) to next\./);
+  assert.doesNotMatch(line, /Drove|at least/);
+});
+
+test("a long slow drive stays a drive", () => {
+  const t0 = U("06:00:00"), t1 = t0 + 10 * 3600000;
+  const hop = { from: "s-a", to: "s-b", duration_min: 600, distance_km: 900, mode: null };
+  const line = text(travelHtml(hop, HOP_FROM(t0), HOP_TO(t1), day([spineLeg({ start_ms: t0, end_ms: t1, straight_m: 900000 })])));
+  assert.match(line, /Drove 10h \(at least 900\.0 km\) to next\./);
+});
+
+test("a short hop at a flight's pace is not a flight under 100 km", () => {
+  const t0 = U("06:00:00"), t1 = t0 + 10 * 60000;
+  const hop = { from: "s-a", to: "s-b", duration_min: 10, distance_km: 60, mode: null };
+  const line = text(travelHtml(hop, HOP_FROM(t0), HOP_TO(t1), day([spineLeg({ start_ms: t0, end_ms: t1, straight_m: 60000 })])));
+  assert.doesNotMatch(line, /Flew/);
+});
+
+test("JORI_TRAVEL_FLIGHT=0 restores the old wording", () => {
+  process.env.JORI_TRAVEL_FLIGHT = "0";
+  try {
+    const t0 = U("21:48:00"), t1 = t0 + 162 * 60000;
+    const hop = { from: "s-a", to: "s-b", duration_min: 162, distance_km: 1888.6, mode: null };
+    const line = text(travelHtml(hop, HOP_FROM(t0), HOP_TO(t1), day([spineLeg({ start_ms: t0, end_ms: t1, straight_m: 1888623 })])));
+    assert.match(line, /Drove 2h 42m \(at least 1888\.6 km\)/);
+  } finally {
+    delete process.env.JORI_TRAVEL_FLIGHT;
+  }
+});

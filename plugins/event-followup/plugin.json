@@ -1,0 +1,21 @@
+{
+  "name": "event-followup",
+  "title": "Did it happen?",
+  "description": "After a personal event on your calendar ends (a movie night at home, a dinner out, a show), Jori asks whether it happened and how it was. Your answer goes on the day's record, and a film or show you watched is marked on your watchlist so recommendations learn your taste. Work calls, deliveries, flights and events tied to a task are left alone.",
+  "version": "1.0.0",
+  "default": "enabled",
+  "requires": {
+    "plugins": [],
+    "bins": ["bin/hum-ask", "bin/day-correction", "bin/watchlist"],
+    "commands": ["gog"],
+    "env": []
+  },
+  "config": { "name": "event-followup" },
+  "settings": [],
+  "schedules": [],
+  "launchd": [
+    { "label": "ai.claude.event-followup", "file": "ai.claude.event-followup.plist" }
+  ],
+  "provides_bins": ["event-followup"],
+  "jobs": {}
+}

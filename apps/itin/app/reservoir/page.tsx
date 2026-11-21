@@ -17,5 +17,5 @@ export default async function ReservoirIndex() {
   }
   // The per-area page carries the full area nav; land on the leg that's current
   // (or next upcoming), not always the first.
-  redirect(`/reservoir/${defaultArea(areas)}`);
+  redirect(`/reservoir/${(await defaultArea()) ?? areas[0].area}`);
 }

@@ -47,6 +47,10 @@ JORI_SIGNING_APPROVE = jori-approve.v1
 // Optional surfaces. Each is off until set.
 // The Memory tab's wiki, e.g. http:/$()/<host>:9096
 JORI_WIKI_URL =
+// The shop browser (the host's shop Chrome, live) over Tailscale: the
+// shop-view app listener, e.g. http:/$()/<host>:9088. Must equal
+// purchase.json `shop_view_app_url` on the host.
+JORI_SHOP_VIEW_URL =
 // Trade approval: the trading web app that verifies the Face ID signature.
 JORI_TRADE_APPROVAL_URL =
 JORI_TRADE_APPROVAL_NAMESPACE = trade

@@ -1,4 +1,4 @@
-// Events the user created. Jori may change anything
+// Events the user created (and, at the end, departures: --transit). Jori may change anything
 // (time, name, details) only when the new details come from a confirmation
 // email for the same booking (--from-confirmation <gmail messageId>);
 // otherwise it may only ADD details. Events Jori created are stamped
@@ -106,4 +106,126 @@ test("every create is stamped as Jori's", () => {
   const i = r.write.indexOf("--private-prop");
   assert.ok(i > 0);
   assert.equal(r.write[i + 1], "jori_created=1");
+});
+
+// ── Departures (--transit / --transit-source) ───────────────────────────────
+// A departure time with no timetable behind it is saved, marked unverified (a
+// private stamp plus a line in its notes), so the hum never counts down to it;
+// a source marks it verified. The departure stamps go on the user's own events
+// too, so they must never make one look like Jori's.
+const priv = (w) => {
+  const out = {};
+  w.forEach((t, i) => { if (w[i - 1] === "--private-prop") { const [k, ...v] = t.split("="); out[k] = v.join("="); } });
+  return out;
+};
+const desc = (w) => (w.includes("--description") ? w[w.indexOf("--description") + 1] : undefined);
+const lastRow = () => JSON.parse(fs.readFileSync(LOG, "utf8").trim().split("\n").pop());
+const CREATE_FERRY = ["create", "--calendar", "primary", "--summary", "Ferry to Island", ...T];
+const NOTE = desc(run([...CREATE_FERRY, "--transit"]).write);
+
+test("a departure with no source is saved, marked unverified, never refused", () => {
+  const r = run([...CREATE_FERRY, "--transit"]);
+  assert.equal(r.code, 0, r.err);
+  assert.match(r.err, /NOT verified/);
+  const p = priv(r.write);
+  assert.equal(p.jori_created, "1");
+  assert.equal(p.jori_transit, "1");
+  assert.equal(p.jori_transit_verified, "0");
+  assert.equal(p.jori_transit_source, undefined);
+  assert.match(NOTE, /hasn't been checked against a timetable/);
+  assert.equal(lastRow().transit_verified, false);
+  const r2 = run([...CREATE_FERRY, "--transit", "--description", "Pier 3"]);
+  assert.equal(desc(r2.write), `Pier 3\n\n${NOTE}`, "the note goes under the caller's own notes");
+});
+
+test("a departure with a source is verified; the source is stored whole, escaped for gog's list syntax", () => {
+  const src = "https://ferry.example/timetable?route=5,6";
+  const r = run([...CREATE_FERRY, "--transit", "--transit-source", src]);
+  assert.equal(r.code, 0, r.err);
+  assert.doesNotMatch(r.err, /NOT verified/);
+  const p = priv(r.write);
+  assert.equal(p.jori_transit, "1");
+  assert.equal(p.jori_transit_verified, "1");
+  assert.equal(p.jori_transit_source, "https://ferry.example/timetable?route%3D5%2C6");
+  assert.equal(decodeURIComponent(p.jori_transit_source), src);
+  assert.equal(desc(r.write), undefined, "a verified departure gets no note");
+  assert.equal(lastRow().transit_source, src);
+  // --transit-source alone implies --transit.
+  assert.equal(priv(run([...CREATE_FERRY, "--transit-source=Booking ABC123"]).write).jori_transit_verified, "1");
+});
+
+test("a malformed source is refused before anything is written; delete takes neither flag", () => {
+  for (const args of [[...CREATE_FERRY, "--transit-source", "ok"], [...CREATE_FERRY, "--transit-source", "--location", "Pier 3"],
+    ["delete", "EV1", "--calendar", "primary", "--transit"]]) {
+    const r = run(args);
+    assert.equal(r.code, 2, r.err);
+    assert.equal(r.write, undefined);
+  }
+});
+
+test("an event that is not a departure is written exactly as before", () => {
+  const r = run(["update", "EV1", "--calendar", "primary", ...T], JORIS);
+  assert.equal(r.code, 0, r.err);
+  assert.deepEqual(Object.keys(priv(r.write)), []);
+  assert.equal(desc(r.write), undefined);
+  assert.equal(lastRow().transit_verified, null);
+  const c = run(["create", "--calendar", "primary", "--summary", "Show", ...T]);
+  assert.deepEqual(Object.keys(priv(c.write)), ["jori_created"]);
+  assert.equal(desc(c.write), undefined);
+});
+
+const FERRY_VERIFIED = { ...JORIS, summary: "Ferry to Island", description: "Pier 3",
+  extendedProperties: { private: { jori_created: "1", jori_transit: "1", jori_transit_verified: "1", jori_transit_source: "https://ferry.example/t" } } };
+const FERRY_UNVERIFIED = { ...JORIS, summary: "Ferry to Island", description: `Pier 3\n\n${NOTE}`,
+  extendedProperties: { private: { jori_created: "1", jori_transit: "1", jori_transit_verified: "0" } } };
+
+test("moving a departure's time without a source makes it unverified again", () => {
+  const r = run(["update", "EV1", "--calendar", "primary", ...T], FERRY_VERIFIED);
+  assert.equal(r.code, 0, r.err);
+  assert.equal(priv(r.write).jori_transit_verified, "0");
+  assert.equal(desc(r.write), `Pier 3\n\n${NOTE}`);
+});
+
+test("a source on update verifies the departure and takes the note out", () => {
+  const r = run(["update", "EV1", "--calendar", "primary", "--transit-source", "Operator timetable page"], FERRY_UNVERIFIED);
+  assert.equal(r.code, 0, r.err);
+  assert.equal(priv(r.write).jori_transit_verified, "1");
+  assert.equal(desc(r.write), "Pier 3");
+});
+
+test("a confirmation email that sets the time counts as the departure's source", () => {
+  const r = run(["update", "EV1", "--calendar", "primary", "--from-confirmation", "test-confirmation-id", ...T], FERRY_UNVERIFIED);
+  assert.equal(r.code, 0, r.err);
+  const p = priv(r.write);
+  assert.equal(p.jori_transit_verified, "1");
+  assert.equal(p.jori_transit_source, "confirmation email test-confirmation-id");
+  assert.equal(desc(r.write), "Pier 3");
+});
+
+test("an update that neither moves the time nor gives a source leaves the verification alone", () => {
+  const loc = run(["update", "EV1", "--calendar", "primary", "--location", "Pier 3"], FERRY_VERIFIED);
+  assert.equal(loc.code, 0, loc.err);
+  assert.deepEqual(Object.keys(priv(loc.write)), []);
+  const again = run(["update", "EV1", "--calendar", "primary", "--transit"], FERRY_VERIFIED);
+  assert.equal(again.code, 0, again.err);
+  assert.equal(priv(again.write).jori_transit_verified, undefined, "a verified departure is not downgraded by re-declaring it");
+  assert.equal(desc(again.write), undefined);
+});
+
+test("the user's own event: marking it a departure is additive, and the stamp never makes it Jori's", () => {
+  const r = run(["update", "EV1", "--calendar", "primary", "--transit"], USERS);
+  assert.equal(r.code, 0, r.err);
+  assert.equal(priv(r.write).jori_transit_verified, "0");
+  assert.equal(desc(r.write), `the user's notes\n\n${NOTE}`, "their notes stay, the mark goes underneath");
+  const stampedUsers = { ...USERS, extendedProperties: { private: { jori_transit: "1", jori_transit_verified: "0", jori_transit_source: "x-source" } } };
+  const move = run(["update", "EV1", "--calendar", "primary", ...T], stampedUsers);
+  assert.equal(move.code, 8, move.err);
+  assert.match(move.err, /an event the user made/);
+});
+
+test("a create from a booking confirmation email counts as the departure's source", () => {
+  const r = run([...CREATE_FERRY, "--transit", "--from-confirmation", "test-confirmation-id"]);
+  assert.equal(r.code, 0, r.err);
+  assert.equal(priv(r.write).jori_transit_verified, "1");
+  assert.equal(desc(r.write), undefined);
 });

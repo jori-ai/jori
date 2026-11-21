@@ -5,7 +5,8 @@
       "command": "node",
       "args": ["${JORI_HOME}/agent/tools-mcp/index.mjs"],
       "env": {
-        "JORI_AGENT_ID": "ops-light"
+        "JORI_AGENT_ID": "ops-light",
+        "JORI_TOOL_PROFILE": "triage"
       },
       "alwaysLoad": true
     },

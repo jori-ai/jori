@@ -30,6 +30,7 @@ const os = require("node:os");
 
 const { installTools } = require("../lib/root.cjs");
 const GMAIL_ACTION = process.env.P1_DOWNGRADE_GMAIL_ACTION || installTools("bin/gmail-action");
+const { resolutionActor } = require("../lib/triage-decisions.js");
 const AUDIT_LOG = process.env.P1_DOWNGRADE_AUDIT_LOG || installTools("data/p1-resolutions.jsonl");
 const GOOGLE_AUTH = path.join(__dirname, "..", "lib", "google-auth.js");
 
@@ -88,8 +89,8 @@ Sources (convention):
   return out;
 }
 
-function run(cmd, args) {
-  const r = spawnSync(cmd, args, { encoding: "utf8" });
+function run(cmd, args, env = process.env) {
+  const r = spawnSync(cmd, args, { encoding: "utf8", env });
   if (r.status !== 0) {
     const stderr = (r.stderr || "").trim();
     throw new Error(`${path.basename(cmd)} ${args.join(" ")} failed: ${stderr || `exit ${r.status}`}`);
@@ -188,8 +189,12 @@ function downgradeOne(messageId, { reason, source, keepTask = false }) {
     ["label_p3", ["label", messageId, "p3"]],
     ["label_p1_resolved", ["label", messageId, "p1-resolved"]],
   ];
+  // A handled P1 (reply, unstar, text resolve, paired follow-up) is recorded as
+  // a resolution, not as a P3 decision (lib/triage-decisions.js).
+  const resolutionBy = resolutionActor(source);
+  const gaEnv = resolutionBy ? { ...process.env, JORI_TRIAGE_ACTOR: resolutionBy } : process.env;
   for (const [key, cmdArgs] of steps) {
-    try { run(GMAIL_ACTION, cmdArgs); }
+    try { run(GMAIL_ACTION, cmdArgs, gaEnv); }
     catch (e) { errors[key] = e.message; console.error(`  ${key}: ${e.message}`); }
   }
   const success = Object.keys(errors).length === 0;

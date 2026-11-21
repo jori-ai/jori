@@ -122,6 +122,30 @@ test("hum_asks: the idea's reasoning goes out dated, never as today's state", ()
   assert.equal(c.supporting_data.evidence_as_of, "2026-05-31T13:27:25.563461Z");
 });
 
+test("hum_asks: an idea the ranker retired in the reservoir is not offered again", () => {
+  // `hum-reservoir-prune --expire` writes to the reservoir, which this lane did not read, so a retired
+  // idea was re-offered (and re-vetoed) on every tick.
+  const dir = mkdtempSync(join(tmpdir(), "hask-"));
+  const f = join(dir, "ideas.jsonl"), r = join(dir, "runs.jsonl"), res_f = join(dir, "reservoir.jsonl");
+  writeFileSync(f, [ask("x"), ask("y", { risk: "high" })].map((x) => JSON.stringify(x)).join("\n") + "\n");
+  writeFileSync(r, "");
+  const run = (reservoir) => {
+    writeFileSync(res_f, reservoir);
+    return spawnSync(process.execPath, [join(BIN, "../agent/scripts/hum-harvesters/hum_asks.mjs")], {
+      input: "{}", encoding: "utf8",
+      env: { ...process.env, HUM_IDEAS_FILE: f, HUM_RUNS_FILE: r, HUM_IDEAS_RESERVOIR_FILE: res_f, HUM_HARVEST_PREVIEW: "1" },
+    });
+  };
+  const before = run("");
+  assert.equal(before.status, 0, before.stderr);
+  assert.equal(JSON.parse(before.stdout).dedup_key, "hum_asks:x");
+  const after = run(JSON.stringify({ id: "x", expired: true, expire_reason: "ranker_retired" }) + "\n");
+  assert.equal(after.status, 0, after.stderr);
+  assert.equal(JSON.parse(after.stdout).dedup_key, "hum_asks:y", "the retired idea is skipped, the next one is offered");
+  const none = run([{ id: "x", expired: true }, { id: "y", expired: true }].map((o) => JSON.stringify(o)).join("\n") + "\n");
+  assert.equal(none.stdout.trim(), "null");
+});
+
 function decide(args, rows, runs = []) {
   const dir = mkdtempSync(join(tmpdir(), "hid-"));
   const f = join(dir, "ideas.jsonl"), r = join(dir, "runs.jsonl");

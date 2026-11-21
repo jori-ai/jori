@@ -54,11 +54,7 @@ if [ -n "$ANSWERED" ] && [ "$ANSWERED" != "null" ]; then
   DEDUP=$(~/Dev/jori/bin/hum-metrics-collect --dedup-check --lane "$LANE")
   BLOCKED=$(echo "$DEDUP" | jq -r '.blocked // false')
   if [ "$BLOCKED" != "true" ]; then
-    TOKEN=$(cat ~/Dev/jori/secrets/webhook-token)
-    curl -s -X POST http://localhost:9092 \
-      -H "Authorization: Bearer $TOKEN" \
-      -H "Content-Type: application/json" \
-      -d "{\"task\":\"HUM IMPROVEMENT IDEATION: decay $LANE\",\"source\":\"cron-hum-metrics\"}"
+    ~/Dev/jori/bin/jori dispatch --source cron-hum-metrics --task "HUM IMPROVEMENT IDEATION: decay $LANE"
   fi
 fi
 ```

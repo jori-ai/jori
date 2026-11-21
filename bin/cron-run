@@ -67,6 +67,22 @@ for (const k of AUTH_OVERRIDE_KEYS) delete dotenv[k];
 const childEnv = { ...dotenv, ...process.env }; // process.env wins on conflict
 for (const k of AUTH_OVERRIDE_KEYS) delete childEnv[k]; // belt-and-suspenders
 
+// Max from cron (the user's decision, 2026-11-12). `claude` keeps the Max login
+// in the login keychain, which only the GUI session can open: from cron every
+// `claude -p` printed "Not logged in" (the speak gate, the hum gates, every
+// judgment a cron job made), and jobs were moved to launchd one by one to get
+// around it. A Max subscription token (`claude setup-token`, ~1 year; the same
+// subscription, never the API) lives in .env as JORI_CRON_CLAUDE_TOKEN, a name
+// Claude Code does not read, and is handed to the child as
+// CLAUDE_CODE_OAUTH_TOKEN only under cron. Under launchd (XPC_SERVICE_NAME is
+// set; the agents run cron-run too) the keychain works and is left in charge.
+// docs/agent-auth-model.md § Cron. JORI_CRON_CLAUDE_TOKEN never reaches a child.
+const cronToken = childEnv.JORI_CRON_CLAUDE_TOKEN;
+delete childEnv.JORI_CRON_CLAUDE_TOKEN;
+if (cronToken && !process.env.XPC_SERVICE_NAME && !childEnv.CLAUDE_CODE_OAUTH_TOKEN) {
+  childEnv.CLAUDE_CODE_OAUTH_TOKEN = cronToken;
+}
+
 // Cron hands its children a bare PATH (/usr/bin:/bin:/usr/sbin:/sbin) that does
 // not contain the directory Homebrew installs node into. A child whose shebang
 // is `#!/usr/bin/env node` therefore dies with exit 127 before it runs a single

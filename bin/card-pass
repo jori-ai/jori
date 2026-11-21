@@ -28,14 +28,24 @@ LOGINS_VAULT="${JORI_OP_LOGINS_VAULT:-Logins}"
 # else jori-purchase.
 CARD_TAG="${JORI_OP_CARD_TAG:-$("${JORI_NODE:-node}" -e 'const c = require(process.argv[1]).localConfig("purchase", { card_tag: "" }); process.stdout.write(String(c.card_tag || ""))' "$SCRIPT_DIR/../lib/instance.cjs" 2>/dev/null || true)}"
 CARD_TAG="${CARD_TAG:-jori-purchase}"
-TOKEN="${OP_LOGINS_SERVICE_ACCOUNT_TOKEN:-}"
-if [[ -z "$TOKEN" && -f "$ROOT/.env" ]]; then
-  TOKEN="$(sed -n 's/^OP_LOGINS_SERVICE_ACCOUNT_TOKEN=//p' "$ROOT/.env" | head -1)"
+# The secrets broker (docs/secrets-broker.md) holds the token where one is
+# installed, and holds cards to its own copy of the tag; without one, the token
+# is read from the environment or .env, as before.
+if "$SCRIPT_DIR/secrets-broker" available logins 2>/dev/null; then
+  op_cards() { "$SCRIPT_DIR/secrets-broker" logins-list card; }
+  op_card() { "$SCRIPT_DIR/secrets-broker" card "$1"; }
+else
+  TOKEN="${OP_LOGINS_SERVICE_ACCOUNT_TOKEN:-}"
+  if [[ -z "$TOKEN" && -f "$ROOT/.env" ]]; then
+    TOKEN="$(sed -n 's/^OP_LOGINS_SERVICE_ACCOUNT_TOKEN=//p' "$ROOT/.env" | head -1)"
+  fi
+  [[ -n "$TOKEN" ]] || { echo "card-pass: OP_LOGINS_SERVICE_ACCOUNT_TOKEN is not set and no secrets broker answers." >&2; exit 78; }
+  export OP_SERVICE_ACCOUNT_TOKEN="$TOKEN"
+  op_cards() { op item list --vault "$LOGINS_VAULT" --categories "Credit Card" --tags "$CARD_TAG" --format=json; }
+  op_card() { op item get "$1" --vault "$LOGINS_VAULT" --format=json --reveal; }
 fi
-[[ -n "$TOKEN" ]] || { echo "card-pass: OP_LOGINS_SERVICE_ACCOUNT_TOKEN is not set." >&2; exit 78; }
-export OP_SERVICE_ACCOUNT_TOKEN="$TOKEN"
 
-LIST="$(op item list --vault "$LOGINS_VAULT" --categories "Credit Card" --tags "$CARD_TAG" --format=json)"
+LIST="$(op_cards)"
 
 if [[ "${1:-}" == "--list" ]]; then
   printf '%s' "$LIST" | /usr/bin/python3 -c '
@@ -57,7 +67,7 @@ hits = [i for i in json.load(sys.stdin) if (i.get("additional_information") or "
 if hits: print(max(hits, key=lambda i: i.get("updated_at", ""))["id"])' "$LAST4")"
 [[ -n "$ID" ]] || { echo "card-pass: no $CARD_TAG card ending $LAST4 in the $LOGINS_VAULT vault." >&2; exit 5; }
 
-op item get "$ID" --vault "$LOGINS_VAULT" --format=json --reveal | /usr/bin/python3 -c '
+op_card "$ID" | /usr/bin/python3 -c '
 import json, sys
 last4, want = sys.argv[1], sys.argv[2]
 item = json.load(sys.stdin)

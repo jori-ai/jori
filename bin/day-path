@@ -631,6 +631,101 @@ def valhalla_route_points(pts, costing):
     return shape, ordered, meters, legs, runs
 
 
+# Street names as the router returns them are the map's own `name` tag, which
+# is in the local script; the daily summary is written in English. A name with
+# a letter outside the Latin script is swapped for the same street's `name:en`
+# from OpenStreetMap (one Overpass call per segment, only for names not yet in
+# the cache), and a name the map has no English form for is left out of the
+# segment's street list instead of being printed in that script. Answers are
+# cached per name and ~10 km area, including "no English form" (None), so a day
+# rebuilt many times asks once; a failed lookup caches nothing and is retried
+# on the next build. JORI_STREET_NAMES_EN=0 keeps the router's names as-is.
+STREET_EN_CACHE = os.path.join(REPO, "data", ".cache", "street-names-en.json")
+STREET_EN_PAD_DEG = 0.002      # ~200 m around the segment's waypoints
+STREET_EN_TIMEOUT_S = 20       # the whole Overpass call, across mirrors
+_street_en_down = []           # set after a failed lookup: the rest of this build asks no more
+
+
+def non_latin(name):
+    """True when the name has a letter outside the Latin script."""
+    return any(ch.isalpha() and not unicodedata.name(ch, "").startswith("LATIN")
+               for ch in (name or ""))
+
+
+def _street_en_key(pts, name):
+    lat = sum(p["lat"] for p in pts) / len(pts)
+    lon = sum(p["lon"] for p in pts) / len(pts)
+    return f"{lat:.1f},{lon:.1f}|{name}"
+
+
+def _overpass_quote(s):
+    return s.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def lookup_street_names_en(names, pts):
+    """{name: its OSM name:en, or None when the map has none} for streets near
+    the waypoints. Returns None when the lookup itself failed."""
+    lats, lons = [p["lat"] for p in pts], [p["lon"] for p in pts]
+    bbox = (f"{min(lats) - STREET_EN_PAD_DEG:.6f},{min(lons) - STREET_EN_PAD_DEG:.6f},"
+            f"{max(lats) + STREET_EN_PAD_DEG:.6f},{max(lons) + STREET_EN_PAD_DEG:.6f}")
+    q = (f"[out:json][timeout:{STREET_EN_TIMEOUT_S}];("
+         + "".join(f'way["highway"]["name"="{_overpass_quote(n)}"]({bbox});' for n in names)
+         + ");out tags;")
+    try:
+        lib = os.path.join(HERE, "..", "lib")
+        if lib not in sys.path:
+            sys.path.insert(0, lib)
+        from overpass_client import post as overpass_post
+        d = overpass_post(q, timeout_s=STREET_EN_TIMEOUT_S)
+    except Exception:
+        return None
+    found = {}
+    for el in (d or {}).get("elements", []) or []:
+        tags = el.get("tags") or {}
+        en = (tags.get("name:en") or "").strip()
+        if tags.get("name") in names and en and not non_latin(en):
+            found.setdefault(tags["name"], en)
+    return {n: found.get(n) for n in names}
+
+
+def english_street_names(names, pts):
+    """The segment's street names in a Latin-script form, in order, deduped."""
+    if os.environ.get("JORI_STREET_NAMES_EN") == "0" or not pts:
+        return names
+    foreign = [n for n in names if non_latin(n)]
+    if not foreign:
+        return names
+    try:
+        with open(STREET_EN_CACHE) as f:
+            cache = json.load(f)
+        if not isinstance(cache, dict):
+            cache = {}
+    except Exception:
+        cache = {}
+    missing = [n for n in foreign if _street_en_key(pts, n) not in cache]
+    if missing and not _street_en_down:
+        got = lookup_street_names_en(missing, pts)
+        if got is None:
+            _street_en_down.append(True)
+        else:
+            for n, en in got.items():
+                cache[_street_en_key(pts, n)] = en
+            try:
+                os.makedirs(os.path.dirname(STREET_EN_CACHE), exist_ok=True)
+                tmp = STREET_EN_CACHE + ".tmp"
+                with open(tmp, "w") as f:
+                    json.dump(cache, f, ensure_ascii=False, indent=1, sort_keys=True)
+                os.replace(tmp, STREET_EN_CACHE)
+            except Exception:
+                pass
+    out = []
+    for n in names:
+        en = cache.get(_street_en_key(pts, n)) if non_latin(n) else n
+        if en and en not in out:
+            out.append(en)
+    return out
+
+
 def osrm_match(pts):
     coords = ";".join(f"{round(p['lon'],6)},{round(p['lat'],6)}" for p in pts)
     url = (f"{OSRM}/match/v1/driving/{coords}"
@@ -657,7 +752,7 @@ def match_segments(segments, verbose=False):
         seg["median_kmh"] = median_kmh(pts if os.environ.get("JORI_PACE_FROM_WAYPOINTS") == "1" else seg["pts"])
         try:
             shape, names, meters, legs, runs = valhalla_route_points(pts, seg["costing"])
-            seg["matched"], seg["streets"], seg["matched_m"] = shape, names[:12], meters
+            seg["matched"], seg["streets"], seg["matched_m"] = shape, english_street_names(names, pts)[:12], meters
             seg["legs"], seg["runs"] = legs, runs
         except Exception as e:
             if verbose:

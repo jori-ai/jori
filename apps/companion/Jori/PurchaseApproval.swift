@@ -52,7 +52,8 @@ enum PurchaseApproval {
     private static var legacyPushKind: String? {
         Install.legacyName.isEmpty ? nil : "\(Install.legacyName)-purchase-approval"
     }
-    private static let domain = Install.purchaseSigningDomain
+    /// Computed: a pairing can supply the domain at runtime.
+    private static var domain: String { Install.purchaseSigningDomain }
     private static let keyTag = Install.keyTag("purchaseKey")
     private static let deviceIdKey = Install.key("purchase.deviceId")
     private static let registeredKey = Install.key("purchase.registered")
@@ -471,6 +472,16 @@ enum PurchaseApproval {
             throw error("sign", err)
         }
         return sig
+    }
+
+    /// The shop browser's sign-in (ShopBrowserView.swift): this paired key
+    /// over `<purchase domain>/shop-view` — never the bare purchase domain, so
+    /// it can't pass for a purchase approval. Mirrors lib/shop-view.mjs
+    /// appSessionMessage byte for byte. Returns the signature in base64.
+    static func signShopViewSession(nonce: String, expiresAtMs: Int64) throws -> String {
+        guard isRegistered else { throw ApprovalError.notPaired }
+        let message = "\(domain)/shop-view\n\(deviceId)\n\(nonce)\n\(expiresAtMs)"
+        return try sign(Data(message.utf8), reason: "Open the shop browser").base64EncodedString()
     }
 
     /// Plugin-action approvals (ActionApproval.swift) sign with this same

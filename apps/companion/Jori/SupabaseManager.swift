@@ -10,19 +10,40 @@ import UIKit
 
 enum SupabaseManager {
     // Connection constants live in SupabaseConfig (from the build
-    // configuration) so the JoriIntents
-    // extension can share them. Aliased here to keep existing call sites
-    // (SupabaseManager.url / .anonKey) working.
-    static let url = SupabaseConfig.url
+    // configuration, or a runtime pairing) so the extensions can share them.
+    // Aliased here to keep existing call sites (SupabaseManager.url / .anonKey)
+    // working. Computed: pairing can change them while the app runs.
+    static var url: URL { SupabaseConfig.url }
     // Supabase anon JWT — intentionally public (RLS enforces access, not secrecy).
-    static let anonKey = SupabaseConfig.anonKey
+    static var anonKey: String { SupabaseConfig.anonKey }
 
     // OAuth redirect — must match a CFBundleURLScheme in Info.plist and the
     // Supabase Auth "Redirect URLs" allowlist (Dashboard → Auth → URL Configuration).
     static let callbackScheme = Install.urlScheme
     static let redirectURL = URL(string: "\(callbackScheme)://auth-callback")!
 
-    static let shared: SupabaseClient = {
+    /// Which backend the client talks to; changes when the app is paired or
+    /// unpaired. Views restart backend-bound work with `.task(id:)` on it.
+    static var backendID: String { "\(url.absoluteString)|\(anonKey)" }
+
+    private static let clientLock = NSLock()
+    private static var client: (backend: String, client: SupabaseClient)?
+
+    /// The client for the current backend. Built on first use and rebuilt
+    /// when the backend changes (pairing), so a pairing takes effect without a
+    /// relaunch. Callers must not keep it in a stored property: read it here
+    /// each time. The session store is per backend (the SDK keys it by the
+    /// project host), so a rebuilt client never inherits another's session.
+    static var shared: SupabaseClient {
+        let backend = backendID
+        clientLock.lock(); defer { clientLock.unlock() }
+        if let client, client.backend == backend { return client.client }
+        let made = makeClient()
+        client = (backend, made)
+        return made
+    }
+
+    private static func makeClient() -> SupabaseClient {
         #if os(macOS)
         // Sandboxed macOS apps need the data-protection keychain; the SDK's
         // default keychain backend reads return errSecMissingEntitlement /
@@ -39,7 +60,7 @@ enum SupabaseManager {
         // session via SharedSession (token mirror), not by sharing this store.
         return SupabaseClient(supabaseURL: url, supabaseKey: anonKey)
         #endif
-    }()
+    }
 
     enum AuthError: LocalizedError {
         case noSession
@@ -52,7 +73,33 @@ enum SupabaseManager {
         }
     }
 
-    /// Read-only check — does the Keychain hold a session (valid or stale)?
+    /// A session is saved on this device, without checking it is still
+    /// valid: no network, so launch can open on the cached app at once.
+    /// `hasSession()` is the checked answer (it refreshes an expired token).
+    static var hasStoredSession: Bool {
+        shared.auth.currentSession != nil
+    }
+
+    /// Whether the saved session is still good, telling a session the server
+    /// turned down (refresh token revoked or expired: sign in again) apart
+    /// from a network that didn't answer (keep the user in, on the cache).
+    /// The client never drops a session whose refresh failed, so the stored
+    /// one alone can't tell.
+    static func sessionIsGone() async -> Bool {
+        do {
+            _ = try await shared.auth.session
+            return false
+        } catch Auth.AuthError.sessionMissing {
+            return true
+        } catch Auth.AuthError.api(_, _, _, let response) where (400..<500).contains(response.statusCode) && response.statusCode != 429 {
+            return true
+        } catch {
+            return false
+        }
+    }
+
+    /// Does the Keychain hold a usable session? Refreshes an expired token
+    /// over the network first, so it can take a round trip.
     static func hasSession() async -> Bool {
         (try? await shared.auth.session) != nil
     }
@@ -84,13 +131,32 @@ enum SupabaseManager {
         _ = try await shared.auth.refreshSession()
     }
 
+    /// Email sign-in, step 1: Supabase emails a one-time code to `email`.
+    /// The installation's setup turns this on for the project
+    /// (lib/onboarding/services.mjs configureSupabaseEmailCode); who may then
+    /// read anything is still the allowlist (`jori_allowed_users`).
+    static func sendEmailCode(to email: String) async throws {
+        try await shared.auth.signInWithOTP(email: email, shouldCreateUser: true)
+    }
+
+    /// Email sign-in, step 2: the code from the email signs this device in.
+    @MainActor
+    static func verifyEmailCode(email: String, code: String) async throws {
+        try await shared.auth.verifyOTP(email: email, token: code, type: .email)
+        await mirrorSessionForExtension()
+    }
+
     /// Launch Google OAuth via a system web view, hand the callback to Supabase,
     /// and persist the resulting session to Keychain. Returns on success; throws on cancel/error.
     @MainActor
     static func signInWithGoogle() async throws {
+        // A pairing may name the owner's account: preselect it in Google's
+        // picker (a hint only; any allowed account can still sign in).
+        let hint = PairingStore.current?.ownerEmail.map { [(name: "login_hint", value: Optional($0))] } ?? []
         let authURL = try shared.auth.getOAuthSignInURL(
             provider: .google,
-            redirectTo: redirectURL
+            redirectTo: redirectURL,
+            queryParams: hint
         )
         let callbackURL = try await presentWebAuth(url: authURL, scheme: callbackScheme)
         try await shared.auth.session(from: callbackURL)

@@ -1,0 +1,132 @@
+#!/usr/bin/env node
+"use strict";
+// place-pages — a wiki page for every public place the user spends time at,
+// with every visit and the photos taken there (plugins/place-pages, lib/place-pages.js).
+//
+//   place-pages sweep [--date D | --from D --to D | --all] [--apply] [--json]
+//                         match the days' stops to places, give public places pages,
+//                         link the visits' photos, re-render the pages. Dry run without
+//                         --apply. Default dates: the last lookback_days complete days.
+//   place-pages backfill --apply     sweep every archived day (same as sweep --all)
+//   place-pages list [--kind k] [--private] [--json]
+//   place-pages show "<name>|<page id>|<place id>" [--json]
+//   place-pages cover "<name>" [--near LAT,LON]    the place's cover → JSON {url, page_id, name, kind}
+//                         (exit 1: no such place, or no photo yet). For anything that refers
+//                         to a place and wants to show it.
+//   place-pages render <place id|page id>          rebuild one page's block now
+//   place-pages set-kind <place id> <kind>         the user's correction of what a place is
+//   place-pages rename <place id> "<name>"         the user's correction of its name (the old one stays an alias)
+//
+// Settings: agent/local/config/place-pages.json (defaults in config.defaults.json).
+
+const path = require("node:path");
+const LIB = path.join(__dirname, "..", "..", "..", "lib");
+const { loadEnv } = require(path.join(LIB, "load-env.js"));
+loadEnv();
+const pp = require(path.join(__dirname, "..", "lib", "place-pages.js"));
+
+const args = process.argv.slice(2);
+const cmd = args[0] || "sweep";
+const flag = (n) => { const i = args.indexOf(`--${n}`); return i >= 0 && args[i + 1] && !args[i + 1].startsWith("--") ? args[i + 1] : undefined; };
+const has = (n) => args.includes(`--${n}`);
+const pos = () => {
+  const out = [];
+  for (let i = 1; i < args.length; i++) {
+    if (args[i].startsWith("--")) { if (flag(args[i].slice(2)) !== undefined) i++; continue; }
+    out.push(args[i]);
+  }
+  return out;
+};
+const stamp = () => new Date().toISOString();
+
+async function main() {
+  const deps = pp.liveDeps();
+  switch (cmd) {
+    case "sweep":
+    case "backfill": {
+      const r = await pp.sweep({
+        apply: has("apply"), all: cmd === "backfill" || has("all"),
+        date: flag("date"), from: flag("from"), to: flag("to"), deps,
+        log: (m) => console.error(`${stamp()} place-pages: ${m}`),
+      });
+      if (has("json")) { console.log(JSON.stringify(r, null, 2)); return r.errors?.length ? 1 : 0; }
+      if (r.skipped) { console.log(r.skipped); return 0; }
+      console.log(`${stamp()} place-pages ${has("apply") ? "" : "(dry run) "}${r.dates} day(s): ${r.stops} stop(s), ${r.matched} known place(s), `
+        + `${r.new_places.length} new place(s), ${r.aliases.length} new name(s) for known places, ${r.private.length} private, `
+        + `${r.visits} visit(s), ${r.photos_linked} photo link(s), ${r.thumbs_made} thumbnail(s) made, ${r.pages.length} page(s)`);
+      for (const p of r.new_places) console.log(`  + ${p.name} (${p.kind}) → ${p.page_id}${p.adopted ? " (existing page)" : ""}`);
+      for (const a of r.aliases) console.log(`  = "${a.name}" is ${a.place}`);
+      for (const p of r.private) console.log(`  - ${p.name}: ${p.kind}, no page`);
+      for (const k of r.skipped_small_hours || []) console.log(`  ~ ${k.date} ${k.name}: runs through the small hours, not counted as a visit`);
+      for (const e of r.errors) console.log(`  ! ${e}`);
+      return r.errors.length ? 1 : 0;
+    }
+    case "list": {
+      const rows = (await deps.request("/rest/v1/places?select=id,name,kind,page_id,visit_count,photo_count,last_visit&order=last_visit.desc.nullslast&limit=10000")) || [];
+      const kind = flag("kind");
+      const shown = rows.filter((r) => (kind ? r.kind === kind : true) && (has("private") ? !r.page_id : Boolean(r.page_id)));
+      if (has("json")) { console.log(JSON.stringify(shown, null, 2)); return 0; }
+      for (const r of shown) console.log(`${String(r.last_visit || "").padEnd(10)}  ${r.kind.padEnd(12)} ${String(r.visit_count).padStart(3)}v ${String(r.photo_count).padStart(4)}p  ${r.name}  ${r.page_id || ""}  [${r.id}]`);
+      console.log(`${shown.length} place(s)`);
+      return 0;
+    }
+    case "show": {
+      const [q] = pos();
+      if (!q) return usage();
+      const rows = (await deps.request(`/rest/v1/places?select=*&or=(id.eq.${encodeURIComponent(q)},page_id.eq.${encodeURIComponent(q)})`)) || [];
+      const hits = rows.length ? rows : await pp.findPlaces(q, { deps });
+      if (has("json")) { console.log(JSON.stringify(hits, null, 2)); return hits.length ? 0 : 1; }
+      if (!hits.length) { console.error(`no place matches ${JSON.stringify(q)}`); return 1; }
+      for (const p of hits.slice(0, 10)) {
+        console.log(`${p.name} — ${p.kind}${p.page_id ? ` · page ${p.page_id}` : " · no page"} · ${p.visit_count} visit(s), ${p.photo_count} photo(s)${p.last_visit ? ` · last ${p.last_visit}` : ""} [${p.id}]`);
+        if ((p.names || []).length > 1) console.log(`  also: ${p.names.filter((n) => n !== p.name).join("; ")}`);
+        if (p.cover_url) console.log(`  cover: ${p.cover_url}`);
+      }
+      return 0;
+    }
+    case "cover": {
+      const [q] = pos();
+      if (!q) return usage();
+      const near = flag("near");
+      const [lat, lon] = near ? near.split(",").map(Number) : [null, null];
+      const hit = (await pp.findPlaces(q, { lat, lon, deps })).find((p) => p.page_id && p.cover_url && (lat == null || p.distance_m <= 2000));
+      if (!hit) { console.error(`no place with a photo matches ${JSON.stringify(q)}`); return 1; }
+      console.log(JSON.stringify({ url: hit.cover_url, page_id: hit.page_id, name: hit.name, kind: hit.kind, place_id: hit.id }));
+      return 0;
+    }
+    case "render": {
+      const [q] = pos();
+      if (!q) return usage();
+      const [place] = (await deps.request(`/rest/v1/places?select=*&or=(id.eq.${encodeURIComponent(q)},page_id.eq.${encodeURIComponent(q)})`)) || [];
+      if (!place || !place.page_id) { console.error(`no place with a page: ${q}`); return 1; }
+      console.log(JSON.stringify(await pp.renderPlace(place, { deps })));
+      return 0;
+    }
+    case "set-kind": {
+      const [id, kind] = pos();
+      if (!id || !kind) return usage();
+      const place = await pp.setKind(id, kind, { deps });
+      console.log(`${place.name} is now ${kind}${place.page_id ? ` (page ${place.page_id})` : ""}`);
+      if (place.page_id) console.log(JSON.stringify(await pp.renderPlace(place, { deps })));
+      return 0;
+    }
+    case "rename": {
+      const [id, name] = pos();
+      if (!id || !name) return usage();
+      const { place, moved } = await pp.rename(id, name, { deps });
+      console.log(`${id} is now "${place.name}"${moved ? ` (page ${moved.from} → ${moved.to})` : ""}`);
+      if (place.page_id) console.log(JSON.stringify(await pp.renderPlace(place, { deps })));
+      return 0;
+    }
+    default:
+      return usage();
+  }
+}
+
+function usage() {
+  const lines = require("node:fs").readFileSync(__filename, "utf8").split("\n").slice(2, 22).map((l) => l.slice(3));
+  console.error(lines.join("\n"));
+  return 2;
+}
+
+main().then((code) => process.exit(code || 0), (e) => { console.error(`place-pages: ${e.stack || e.message}`); process.exit(1); });

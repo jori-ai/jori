@@ -23,6 +23,8 @@
 // Env:
 //   CLAUDE_BIN             fallback claude binary path
 
+// First: re-exec without the .env in the starting environment (lib/env-isolate.cjs).
+import "../../lib/env-isolate-first.mjs";
 import fs from "node:fs";
 import path from "node:path";
 import { spawn as spawnProc } from "node:child_process";
@@ -277,12 +279,23 @@ function parseArgs(argv) {
 // An agent's config from agents.json, with the installation's own connector
 // deny list for it appended to `disallowedTools`
 // (agent/local/config/agents.json `disallowed_tools: { <agent>: [...] }`).
+const PERMISSION_MODES = new Set(["bypassPermissions", "auto", "dontAsk", "acceptEdits"]);
+
 function loadAgentConfig(configPath, agentName) {
   const cfg = JSON.parse(fs.readFileSync(configPath, "utf8"));
   const a = cfg.agents[agentName];
   if (!a) throw new Error(`agent "${agentName}" not found in ${configPath}`);
-  const extra = createRequire(import.meta.url)("../../lib/instance.cjs").localConfig("agents", { disallowed_tools: {} }).disallowed_tools?.[agentName];
+  const local = createRequire(import.meta.url)("../../lib/instance.cjs").localConfig("agents", { disallowed_tools: {}, permission_mode: {} });
+  const extra = local.disallowed_tools?.[agentName];
   if (Array.isArray(extra) && extra.length) a.disallowedTools = [...(a.disallowedTools || []), ...extra];
+  // The installation may run one tier in another permission mode (e.g. the
+  // auto-mode trial: Claude Code's classifier screens each action;
+  // docs/agent-secrets.md § Auto mode). Read at supervisor start.
+  const mode = local.permission_mode?.[agentName];
+  if (mode) {
+    if (PERMISSION_MODES.has(mode)) a.permissionMode = mode;
+    else console.error(`[supervisor] ignoring permission_mode "${mode}" for ${agentName} (not one of ${[...PERMISSION_MODES].join(", ")})`);
+  }
   return a;
 }
 
@@ -521,6 +534,24 @@ class Supervisor {
     if (this._triageRulesTimer) { clearInterval(this._triageRulesTimer); this._triageRulesTimer = null; }
   }
 
+  // A restart re-reads agents.json (allowlists, model, effort, MCP flags), so a
+  // config change takes effect with `jori restart <agent>` without bouncing the
+  // supervisor process. Before this, the config read at process start was reused
+  // on every restart: an allowlist entry removed from agents.json stayed on the
+  // respawned session until launchd restarted the supervisor. A file that does
+  // not parse (mid-edit) keeps the config already loaded. Values the
+  // constructor derived from the config at boot are not recomputed.
+  reloadConfig() {
+    const p = this.args.config || path.join(JORI_ROOT, "agent/config/agents.json");
+    try {
+      this.cfg = loadAgentConfig(p, this.args.agent || "ops");
+      return true;
+    } catch (e) {
+      console.error(`[supervisor] config reload failed, keeping the loaded config: ${e.message}`);
+      return false;
+    }
+  }
+
   async startSession({ resume }) {
     this.sessionStartedAt = Date.now();
     const cfg = this.cfg;
@@ -549,6 +580,8 @@ class Supervisor {
       // credentials in ~/.claude/.credentials.json; otherwise the API key
       // takes precedence and ops hits the same usage cap as the chat agent.
       unsetEnv: ["ANTHROPIC_API_KEY"],
+      // Which agent-env lockdown entry applies (lib/agent-env.cjs).
+      agentEnvId: this.args.agent || "ops",
       // Keep the session's prompt prefix byte-stable across rotations. With
       // git context on, claude -p snapshots `git status` + recent commits into
       // the context at session start; the repo always has churning untracked
@@ -1626,6 +1659,7 @@ class Supervisor {
       this.state.rotateSession();
       this._resetContextTracking();
     }
+    this.reloadConfig();
     await this.startSession({ resume: shouldResume });
     this.restarting = false;
   }

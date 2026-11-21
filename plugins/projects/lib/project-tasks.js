@@ -398,6 +398,37 @@ function markerIn(notes) {
   return b === -1 ? null : s.slice(a + 6, b);
 }
 
+// Which Google Tasks completions are Jori's own jobs ticking the list, not the
+// user. A ledger task Jori closes (the dream, the projects job) is completed on
+// the user's list by the next sync, and Google stamps that moment as the task's
+// `completed` time: a closing in the small hours the user never made. `closed_by` names the
+// job ("dream:2026-11-11" → "dream"); "user" and "chat" (the user's own word,
+// relayed) are the user's, and so is any name not listed here, so an unknown
+// closer is listed rather than hidden. Jori ticks the list only after closing
+// the task here, so a completion that predates `closed_at` was the user's own
+// (they got there first). Matches by the marker in the notes, else by the
+// linked Google task id (an adopted task has no marker).
+const JOB_CLOSERS = new Set(["projects", "project-work", "dream", "dream-deep"]);
+
+function closedByJob(t) {
+  const by = String((t && t.closed_by) || "").split(":")[0];
+  return JOB_CLOSERS.has(by);
+}
+
+function joriCompletionTest(ledger) {
+  const tasks = (ledger && ledger.tasks) || {};
+  const byGoogleId = new Map();
+  for (const t of Object.values(tasks)) if (t && t.gtask && t.gtask.id) byGoogleId.set(t.gtask.id, t);
+  return (g) => {
+    if (!g) return false;
+    const t = tasks[markerIn(g.notes)] || byGoogleId.get(g.id);
+    if (!t || t.status !== "done" || !closedByJob(t)) return false;
+    const done = Date.parse(g.completed);
+    const closed = Date.parse(t.closed_at);
+    return Number.isFinite(done) && Number.isFinite(closed) && done >= closed;
+  };
+}
+
 // Make the user's task list and the ledger agree. The user's side wins every
 // disagreement it can express: completing or deleting a task closes it here,
 // a new title or date is adopted. Jori's side is pushed only where the user has
@@ -457,6 +488,19 @@ function syncGoogle(ledger, gt, { list = "@default", projectNames = {}, now = Da
       }
 
       if (t.status === "open") {
+        // Reopened here (the user said "bring it back" and the task was reopened) while their
+        // list still shows it ticked off. Their tick was already taken in (the snapshot says
+        // completed), so nothing of theirs is overwritten: the list is behind, so un-tick it.
+        // Before 2026-11-20 only the title and date were pushed onto the ticked task; it stayed
+        // ticked, the next job to read the list took that for "done" and closed it again.
+        if (r.status === "completed" && s.status === "completed") {
+          if (!dryRun) {
+            const u = gt.undo(list, r.id);
+            snap(t, { ...r, ...(u && typeof u === "object" ? u : {}), status: "needsAction" });
+          }
+          report.pushed.push(t.id);
+          continue;
+        }
         if (touched && r.status !== "completed") {
           // The user edited it on their list: their title and date win.
           const before = { title: t.title, due: t.due };
@@ -509,6 +553,7 @@ function gogTasksAdapter(gogJson) {
     add: (list, { title, due, notes }) => one(gogJson(["tasks", "add", list, "--title", title, ...(due ? ["--due", due] : []), ...(notes ? ["--notes", notes] : [])])),
     update: (list, id, { title, due }) => one(gogJson(["tasks", "update", list, id, "--title", title, "--due", due || ""])),
     done: (list, id) => one(gogJson(["tasks", "done", list, id])),
+    undo: (list, id) => one(gogJson(["tasks", "undo", list, id])),
     delete: (list, id) => gogJson(["tasks", "delete", list, id, "--force"]),
   };
 }
@@ -538,4 +583,5 @@ module.exports = {
   workQueue, approveWork, startWork, recordWork, workBudget,
   renderTasksSection, injectTasks,
   syncGoogle, gogTasksAdapter, markerIn, gtaskNotes, bundleView,
+  joriCompletionTest,
 };

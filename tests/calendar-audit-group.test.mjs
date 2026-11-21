@@ -23,7 +23,7 @@ import os from "node:os";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { seriesKey, collapseFindings, formatFindingLine, inAuditScope } from "../lib/calendar-audit-group.js";
+import { seriesKey, collapseFindings, formatFindingLine, inAuditScope, madeInCalendarEditor } from "../lib/calendar-audit-group.js";
 
 const SERIES = "_8ksk8e9n64pk4ba58h1j0b9k8co46ba2610jab9j8cpjac266gr3gdpj6g";
 const PARTNER = "partner@example.invalid";
@@ -250,9 +250,19 @@ function run({ rows, events, config = null }) {
   fs.writeFileSync(gog, `#!/bin/sh\ncat ${JSON.stringify(evFile)}\n`);
   fs.chmodSync(gog, 0o755);
   try {
+    // The audit exits early, printing a plain line instead of JSON, when it has
+    // no owner address. Pin it (and the local dir it reads config from) here,
+    // so the test never depends on what the parent shell happens to export:
+    // the approval poller runs it from cron with only HOME and PATH set.
     const out = execFileSync(process.execPath, [AUDIT, "--json"], {
       encoding: "utf8",
-      env: { ...process.env, JORI_HOME: home, GOG_BIN: gog },
+      env: {
+        ...process.env,
+        JORI_HOME: home,
+        JORI_LOCAL_DIR: path.join(home, "agent/local"),
+        JORI_OWNER_EMAIL: "user@example.invalid",
+        GOG_BIN: gog,
+      },
     });
     return JSON.parse(out);
   } finally {
@@ -310,4 +320,70 @@ test("rsvp-window: the same pre-attendee-log row inside the window still covers 
   const blanket = { ts: new Date(now - 6 * H).toISOString(), action: "update", event_id: "evt-show-1", attendees: [], authorization: "an old quote", dry_run: false };
   const out = run({ rows: [olderRow, blanket], events: [event], config: { attendee_log_epoch: new Date(now + 24 * H).toISOString() } });
   assert.equal(out.findings.length, 0);
+});
+
+// ── editor-made ─────────────────────────────────────────────────────────────
+// What this defends against: the system-channel page "⚠️ N calendar event(s)
+// with attendees Jori cannot account for" naming a meeting the user made in the
+// Google Calendar editor with a video-meeting add-on attached. creator/organizer
+// read the user's own address for that and for an API write that dodged the
+// wrapper alike, but only the editor session can attach an add-on conference.
+// The exemption is narrow: no log row of any kind, and an add-on conference.
+
+const ADD_ON = { conferenceSolution: { key: { type: "addOn" }, name: "Video Meeting" } };
+const MEET = { conferenceSolution: { key: { type: "hangoutsMeet" }, name: "Google Meet" } };
+
+test("editor-made: madeInCalendarEditor is true only for an add-on conference", () => {
+  assert.equal(madeInCalendarEditor({ conferenceData: ADD_ON }), true);
+  assert.equal(madeInCalendarEditor({ conferenceData: MEET }), false, "a Google Meet can be attached by an API write");
+  assert.equal(madeInCalendarEditor({}), false);
+  assert.equal(madeInCalendarEditor({ conferenceData: {} }), false);
+  assert.equal(madeInCalendarEditor({ conferenceData: { conferenceSolution: {} } }), false);
+  assert.equal(madeInCalendarEditor(null), false);
+  assert.equal(madeInCalendarEditor(undefined), false);
+  assert.equal(madeInCalendarEditor("addOn"), false);
+  assert.equal(madeInCalendarEditor({ conferenceData: { conferenceSolution: { key: { type: "ADDON" } } } }), false, "strict equality, case included");
+  assert.equal(madeInCalendarEditor({ conferenceData: { conferenceSolution: { key: { type: " addOn" } } } }), false, "strict equality, no trimming");
+});
+
+const editorEvent = (over = {}) => ({ ...event, id: "evt-editor-1", summary: "A call", ...over });
+
+test("editor-made: no log row and an add-on conference is not reported, but is counted", () => {
+  const out = run({ rows: [olderRow], events: [editorEvent({ conferenceData: ADD_ON })] });
+  assert.equal(out.findings.length, 0);
+  assert.equal(out.fresh, 0);
+  assert.equal(out.explained_by_editor, 1);
+  assert.equal(out.explained.length, 1);
+  assert.equal(out.explained[0].id, "evt-editor-1");
+  assert.deepEqual(out.explained[0].uncovered, ["guest@example.com"]);
+});
+
+test("editor-made: the same event without a conference is still reported as unexplained", () => {
+  const out = run({ rows: [olderRow], events: [editorEvent()] });
+  assert.equal(out.findings.length, 1);
+  assert.equal(out.findings[0].kind, "unexplained");
+  assert.equal(out.explained_by_editor, 0);
+});
+
+test("editor-made: a Google Meet conference with no log row is still reported", () => {
+  const out = run({ rows: [olderRow], events: [editorEvent({ conferenceData: MEET })] });
+  assert.equal(out.findings.length, 1);
+  assert.equal(out.findings[0].kind, "unexplained");
+  assert.equal(out.explained_by_editor, 0);
+});
+
+test("editor-made: an add-on conference does not clear an event a log row covers differently (partial)", () => {
+  const unquoted = { ts: new Date(now - 20 * H).toISOString(), action: "update", event_id: "evt-editor-1", attendees: [], authorization: null, dry_run: false };
+  const out = run({ rows: [olderRow, unquoted], events: [editorEvent({ conferenceData: ADD_ON })] });
+  assert.equal(out.findings.length, 1);
+  assert.equal(out.findings[0].kind, "partial");
+  assert.deepEqual(out.findings[0].uncovered, ["guest@example.com"]);
+  assert.equal(out.explained_by_editor, 0);
+});
+
+test("editor-made: an add-on event whose guests a quoted row covers is neither reported nor counted", () => {
+  const quoted = { ts: new Date(now - 20 * H).toISOString(), action: "update", event_id: "evt-editor-1", attendees: ["guest@example.com"], authorization: "a quote", dry_run: false };
+  const out = run({ rows: [olderRow, quoted], events: [editorEvent({ conferenceData: ADD_ON })] });
+  assert.equal(out.findings.length, 0);
+  assert.equal(out.explained_by_editor, 0);
 });

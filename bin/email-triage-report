@@ -1,0 +1,97 @@
+#!/usr/bin/env node
+// email-triage-report — score the strict triage one-shot's shadow runs against
+// what triage actually decided (docs/email-triage-strict.md § Rollout).
+//
+// The router's "strict-shadow" mode runs the one-shot in dry run on each
+// per-message email, alongside the ordinary ops-light dispatch; the runner logs
+// what it would have done (data/email-triage-oneshot-log.jsonl, mode "shadow").
+// This compares each settled run (≥ 20 min old) with the email's
+// triage_decisions row (lib/triage-decisions.js: the label and priority triage
+// left, a handled P1 still a P1). Escalated runs are counted, not scored:
+// ops decides those.
+//
+// Bar — the same one email-triage-rules.md sets for replacing triage
+// (§ Decide-then-act triage): ≥ 150 scored emails over ≥ 7 days, label and
+// priority agreement ≥ 95%, zero missed P1s. The report says when it is met;
+// switching to "strict" stays the owner's call.
+//
+// Usage: email-triage-report [--days N] [--json]
+
+import fs from "node:fs";
+import { createRequire } from "node:module";
+
+const require = createRequire(import.meta.url);
+const { installTools } = require("../lib/root.cjs");
+const td = require("../lib/triage-decisions.js");
+const { LABELS } = require("../lib/triage-labels.cjs");
+
+const argv = process.argv.slice(2);
+const DAYS = Number(argv[argv.indexOf("--days") + 1]) || 14;
+const JSON_OUT = argv.includes("--json");
+const SETTLE_MS = 20 * 60 * 1000;
+const BAR = { n: 150, days: 7, rate: 0.95 };
+
+/** What a shadow run would have left: { label, priority }. */
+export function shadowOutcome(row) {
+  const s = row.summaries || [];
+  const id = row.messageId;
+  const labels = s.filter((x) => x.startsWith(`gmail-action label ${id} `)).map((x) => x.split(" ").pop());
+  const triageLabels = labels.filter((l) => LABELS.includes(l));
+  const downgraded = s.some((x) => x.startsWith("p1-downgrade") || x === `gmail-action unlabel ${id} p1`);
+  const p1 = labels.includes("p1") || s.some((x) => x.startsWith("p1-task add")) || (row.intake_p1 && !downgraded);
+  const star = s.some((x) => x === `gmail-action star ${id}`);
+  return { label: triageLabels.length ? triageLabels[triageLabels.length - 1] : null, priority: p1 ? "P1" : star ? "P2" : "P3" };
+}
+
+export function score(rows, { now = Date.now(), getRow = td.get } = {}) {
+  const latest = new Map();
+  for (const r of rows) if (r.mode === "shadow" && r.messageId) latest.set(r.messageId, r);
+  const out = { core_incomplete: 0, scored: 0, label_agree: 0, priority_agree: 0, missed_p1: [], escalated: 0, failed: 0, unsettled: 0, no_actual: 0, disagreements: [], first: null, last: null };
+  for (const r of latest.values()) {
+    const t = Date.parse(r.ts);
+    if (now - t < SETTLE_MS) { out.unsettled++; continue; }
+    if (r.outcome === "fallback") { out.failed++; continue; }
+    if (r.outcome === "escalated") { out.escalated++; continue; }
+    if (r.core_complete === false) out.core_incomplete++;
+    const actual = getRow(r.messageId);
+    if (!actual || !actual.label) { out.no_actual++; continue; }
+    const sh = shadowOutcome(r);
+    out.scored++;
+    out.first = out.first == null || t < out.first ? t : out.first;
+    out.last = out.last == null || t > out.last ? t : out.last;
+    const labOk = sh.label === actual.label;
+    const priOk = sh.priority === actual.priority;
+    if (labOk) out.label_agree++;
+    if (priOk) out.priority_agree++;
+    if (actual.priority === "P1" && sh.priority !== "P1") out.missed_p1.push(r.messageId);
+    if (!labOk || !priOk) out.disagreements.push({ messageId: r.messageId, shadow: `${sh.label}/${sh.priority}`, actual: `${actual.label}/${actual.priority}` });
+  }
+  const span = out.first == null ? 0 : (out.last - out.first) / 86400e3;
+  const lr = out.scored ? out.label_agree / out.scored : 0, pr = out.scored ? out.priority_agree / out.scored : 0;
+  const reasons = [];
+  if (out.scored < BAR.n) reasons.push(`${out.scored} scored < ${BAR.n}`);
+  if (span < BAR.days) reasons.push(`span ${span.toFixed(1)}d < ${BAR.days}d`);
+  if (lr < BAR.rate) reasons.push(`label agreement ${(lr * 100).toFixed(1)}% < 95%`);
+  if (pr < BAR.rate) reasons.push(`priority agreement ${(pr * 100).toFixed(1)}% < 95%`);
+  if (out.missed_p1.length) reasons.push(`${out.missed_p1.length} missed P1(s) — must be 0`);
+  out.span_days = span; out.label_rate = lr; out.priority_rate = pr;
+  out.verdict = { ready: reasons.length === 0, reasons };
+  return out;
+}
+
+if (import.meta.url === `file://${process.argv[1]}` || process.argv[1]?.endsWith("/email-triage-report")) {
+  const since = Date.now() - DAYS * 86400e3;
+  const rows = [];
+  try {
+    for (const l of fs.readFileSync(installTools("data/email-triage-oneshot-log.jsonl"), "utf8").split("\n")) {
+      if (!l.trim()) continue;
+      try { const r = JSON.parse(l); if (Date.parse(r.ts) >= since) rows.push(r); } catch {}
+    }
+  } catch {}
+  const r = score(rows);
+  if (JSON_OUT) { console.log(JSON.stringify(r)); process.exit(0); }
+  console.log(`strict triage shadow report — last ${DAYS}d, span ${r.span_days.toFixed(1)}d`);
+  console.log(`  scored ${r.scored} | label ${(r.label_rate * 100).toFixed(1)}% | priority ${(r.priority_rate * 100).toFixed(1)}% | missed P1 ${r.missed_p1.length} | escalated ${r.escalated} | fell back ${r.failed} | no actual ${r.no_actual} | settling ${r.unsettled} | read only part of the rules core ${r.core_incomplete}`);
+  console.log(`  ${r.verdict.ready ? "MEETS THE BAR — switching to \"strict\" is the owner's call" : `not ready — ${r.verdict.reasons.join("; ")}`}`);
+  for (const d of r.disagreements.slice(0, 25)) console.log(`  ≠ ${d.messageId} ${d.shadow} vs ${d.actual}`);
+}

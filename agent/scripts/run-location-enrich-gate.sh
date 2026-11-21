@@ -25,7 +25,9 @@ PAYLOAD='{"job": "location-enrich"}'
 
 log() { echo "$(date '+%Y-%m-%d %H:%M:%S') [location-enrich] $1" >> "$LOGFILE"; }
 
-# Sleep-window gate: skip 01:00-08:00 in the user's local TZ (phone, else home).
+# Sleep gate: skip while the user is asleep, from sleep data and the phone's
+# lock/unlock rows, never the clock. 01:00-08:00 in the user's local TZ (phone,
+# else home) is the fallback whenever there is no usable sleep signal.
 USER_TZ_FILE="$JORI_INSTALL_TOOLS/data/user-timezone.json"
 USER_TZ="${JORI_TZ:-UTC}"
 if [ -f "$USER_TZ_FILE" ]; then
@@ -34,8 +36,7 @@ if [ -f "$USER_TZ_FILE" ]; then
     USER_TZ="$PARSED_TZ"
   fi
 fi
-HOUR_LOCAL=$(TZ="$USER_TZ" date +%H)
-if [ "$HOUR_LOCAL" -ge 1 ] && [ "$HOUR_LOCAL" -lt 8 ]; then
+if "${JORI_NODE:-node}" "$(dirname "$0")/../../bin/sleep-night" --gate --fallback 1-8 --tz "$USER_TZ" >/dev/null 2>&1; then
   exit 0
 fi
 

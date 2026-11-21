@@ -13,6 +13,8 @@
 
 import { execFile } from "node:child_process";
 import { MODELS } from "../../lib/models.cjs";
+import { createRequire } from "node:module";
+const { modelEnv } = createRequire(import.meta.url)("../../lib/agent-env.cjs");
 
 const MAX_RESULTS = 5;
 const SNIPPET_CAP = 400;
@@ -65,8 +67,7 @@ export function makeClaudeWebSearch({
         `{"title":..,"url":..,"snippet":..}. The snippet must be your own ` +
         `<=${SNIPPET_CAP}-char summary (no verbatim article text). ` +
         `No prose outside the JSON.`;
-      const env = { ...process.env };
-      delete env.ANTHROPIC_API_KEY; // Max-only invariant: never key-billed.
+      const env = modelEnv(); // Max-only, no .env secrets (lib/agent-env.cjs)
       execFile(
         bin,
         ["-p", "--model", model, "--effort", effort, "--allowedTools", "WebSearch", "--output-format", "text", prompt],

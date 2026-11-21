@@ -1,0 +1,298 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Get started · Jori</title>
+<meta name="description" content="Meet Jori, an open-source assistant that pays attention even when you're not asking, then pick how to run it: on your own Mac or server for free, or soon on a server we run at cost.">
+<meta property="og:title" content="Get started with Jori">
+<meta property="og:description" content="An assistant that pays attention, even when you're not asking. Run it yourself for free, or soon let us run it for you at cost.">
+<link rel="icon" type="image/png" href="/icon.png?v=4">
+<link rel="apple-touch-icon" href="/apple-touch-icon.png?v=4">
+<meta property="og:image" content="https://getjori.ai/og.png?v=4">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:image" content="https://getjori.ai/og.png?v=4">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,600;1,8..60,400;1,8..60,600&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400&display=swap" rel="stylesheet">
+<style>
+  /* Palettes: life = red, work = blue, neutral when a page speaks to both. Each page maps its accent to one. */
+  :root { --bg:#f4efe6; --ink:#141414; --muted:#5e5a52; --line:#d9d1c3; --life:#b42318; --life-tint:#f7e2de; --work:#1d4ed8; --work-tint:#e1e7f4; --neutral:#57534e; --neutral-tint:#ebe4d8; --accent:var(--neutral); --us:var(--neutral-tint); --yes:#1f7a4d; --no:#a3473a; --bubble:#fbf8f3; --me:#1d4ed8; --me-ink:#ffffff; --soon:#8a5a0b; --soon-tint:#f6e7c8; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#121110; --ink:#f1ece3; --muted:#a39d92; --line:#2c2925; --life:#f87171; --life-tint:#2d1716; --work:#7aa2f7; --work-tint:#151f36; --neutral:#d6d0c4; --neutral-tint:#24211d; --yes:#5fc28f; --no:#e08a7c; --bubble:#181614; --me:#7aa2f7; --me-ink:#121110; --soon:#e2b45c; --soon-tint:#2e2414; } }
+  * { box-sizing:border-box; margin:0; }
+  body { background:var(--bg); color:var(--ink); font:16px/1.6 Inter, system-ui, sans-serif; }
+  .wrap { width:100%; max-width:1080px; margin:0 auto; padding:0 24px; }
+  code, .mono { font-family:"JetBrains Mono", ui-monospace, monospace; font-size:.88em; }
+  a:focus-visible, button:focus-visible { outline:2px solid var(--ink); outline-offset:3px; border-radius:6px; }
+
+  /* Nav, as on /personal and /business */
+  .nav { display:flex; align-items:center; justify-content:space-between; gap:16px; padding:20px 0; }
+  .nav .brand { display:flex; align-items:center; gap:10px; color:var(--ink); text-decoration:none; font-family:"Source Serif 4", Georgia, serif; font-weight:600; font-size:22px; }
+  .nav .brand img { width:30px; height:30px; }
+  .nav .seg { display:flex; gap:4px; background:var(--us); border-radius:999px; padding:4px; }
+  .nav .seg a { color:var(--muted); text-decoration:none; font-size:14px; font-weight:500; padding:6px 14px; border-radius:999px; }
+  .nav .seg a[aria-current="page"] { background:var(--accent); color:var(--bg); }
+  .nav .gh { color:var(--muted); font-size:14px; text-decoration:none; }
+  @media (max-width:560px) { .nav .gh { display:none; } }
+
+  /* Shared type */
+  .tag { font-size:13px; letter-spacing:.08em; text-transform:uppercase; color:var(--muted); margin-bottom:20px; }
+  h1 { font-family:"Source Serif 4", Georgia, serif; font-weight:600; font-size:clamp(38px, 5.6vw, 62px); line-height:1.04; letter-spacing:-.02em; }
+  h1 em { color:var(--accent); }
+  h2 { font-family:"Source Serif 4", Georgia, serif; font-weight:600; font-size:clamp(32px, 5vw, 48px); line-height:1.05; }
+  .lede { font-size:clamp(18px, 2.3vw, 21px); color:var(--muted); max-width:560px; margin-top:24px; }
+  .lede strong { color:var(--ink); font-weight:500; }
+  .sub { color:var(--muted); margin:12px 0 28px; max-width:660px; }
+  .ctas { margin-top:32px; display:flex; gap:24px; flex-wrap:wrap; align-items:center; }
+  .btn { display:inline-block; background:var(--ink); color:var(--bg); text-decoration:none; padding:12px 20px; border-radius:999px; font-weight:500; font-size:15px; }
+  .link { color:var(--ink); text-decoration:none; border-bottom:1px solid var(--ink); padding-bottom:2px; font-weight:500; font-size:15px; }
+  section { padding:56px 0; border-top:1px solid var(--line); }
+
+  /* Hero */
+  .hero { display:grid; grid-template-columns:1.15fr .85fr; gap:40px; align-items:center; padding:8vh 0 64px; }
+  .hero > * { min-width:0; }
+  .hero figure { margin:0; }
+  .hero figure img { display:block; width:100%; max-width:380px; height:auto; margin:0 auto; }
+  .hero figcaption { color:var(--muted); font-size:14.5px; text-align:center; margin-top:6px; }
+  .hero figcaption b { color:var(--ink); font-weight:600; }
+  @media (max-width:760px) { .hero { grid-template-columns:1fr; gap:24px; padding-top:5vh; } .hero figure img { max-width:320px; } }
+
+  /* Gallery */
+  .gallery { display:grid; grid-template-columns:1fr 1fr; gap:24px; }
+  .gallery figure { margin:0; min-width:0; }
+  .frame { aspect-ratio:4 / 3; background:var(--us); border-radius:14px; padding:12px; display:flex; align-items:center; justify-content:center; }
+  .frame img { display:block; width:100%; height:100%; object-fit:contain; }
+  .gallery figcaption { color:var(--muted); font-size:14.5px; margin-top:10px; }
+  .gallery figcaption b { color:var(--ink); font-weight:600; }
+  .note { color:var(--muted); font-size:12.5px; margin-top:18px; }
+  .note a { color:var(--muted); }
+  @media (max-width:760px) { .gallery { grid-template-columns:1fr; } }
+
+  /* Six lines */
+  .six { list-style:none; padding:0; display:grid; grid-template-columns:repeat(3, 1fr); gap:20px; }
+  .six li { background:var(--us); border-radius:14px; padding:22px 22px 20px; min-width:0; display:flex; flex-direction:column; }
+  .six h3 { font-family:"Source Serif 4", Georgia, serif; font-weight:600; font-size:24px; line-height:1.15; margin-bottom:6px; }
+  .six p { color:var(--muted); font-size:15px; }
+  .six .msg { margin-top:auto; padding-top:16px; }
+  .bubble { display:block; background:var(--bubble); color:var(--ink); border:1px solid var(--line); border-radius:16px 16px 16px 4px; padding:10px 14px; font-size:14.5px; line-height:1.45; }
+  .bubble.me { background:var(--me); color:var(--me-ink); border-color:var(--me); border-radius:16px 16px 4px 16px; margin-left:auto; width:fit-content; max-width:85%; }
+  .bubble + .bubble { margin-top:8px; }
+  .who { display:block; font-size:12px; color:var(--muted); margin-bottom:4px; }
+  @media (max-width:900px) { .six { grid-template-columns:1fr 1fr; } }
+  @media (max-width:560px) { .six { grid-template-columns:1fr; } }
+
+  /* Claude band */
+  .band { background:var(--ink); color:var(--bg); border-radius:18px; padding:36px 34px; display:grid; grid-template-columns:1fr 1.1fr; gap:32px; align-items:start; }
+  .band > * { min-width:0; }
+  .band h2 { font-size:clamp(28px, 4vw, 40px); }
+  .band ul { list-style:none; padding:0; display:grid; gap:14px; }
+  .band li { padding-left:22px; position:relative; font-size:16px; }
+  .band li::before { content:"✓"; position:absolute; left:0; top:0; font-weight:600; }
+  .band li b { font-weight:600; }
+  section.claude { border-top:0; padding-top:8px; }
+  @media (max-width:760px) { .band { grid-template-columns:1fr; padding:28px 22px; gap:20px; } }
+
+  /* Where should I run? */
+  .options { display:grid; grid-template-columns:1fr 1fr; gap:20px; align-items:stretch; }
+  .opt { background:var(--us); border-radius:18px; padding:30px 28px 28px; min-width:0; display:flex; flex-direction:column; }
+  .opt .k { font-size:13px; letter-spacing:.08em; text-transform:uppercase; color:var(--accent); margin-bottom:10px; display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
+  .soon { display:inline-block; background:var(--soon-tint); color:var(--soon); border-radius:999px; padding:2px 10px; font-size:12px; font-weight:600; letter-spacing:.06em; }
+  .opt h3 { font-family:"Source Serif 4", Georgia, serif; font-weight:600; font-size:clamp(28px, 3.6vw, 36px); line-height:1.08; margin-bottom:10px; }
+  .opt > p { color:var(--muted); font-size:15.5px; }
+  .opt h4 { font-size:13px; letter-spacing:.08em; text-transform:uppercase; color:var(--muted); font-weight:500; margin:22px 0 8px; }
+  .opt ul { list-style:none; padding:0; display:grid; gap:8px; font-size:15px; }
+  .opt li { padding-left:24px; position:relative; }
+  .opt li::before { position:absolute; left:0; top:0; font-weight:600; width:16px; text-align:center; }
+  .opt ul.pro li::before { content:"+"; color:var(--yes); }
+  .opt ul.con li::before { content:"–"; color:var(--no); }
+  .opt ul.plain li::before { content:"•"; color:var(--muted); }
+  .opt li span { color:var(--muted); }
+  .opt .end { margin-top:auto; padding-top:24px; }
+  .term { display:flex; align-items:center; gap:12px; background:var(--ink); color:var(--bg); border-radius:14px; padding:14px 16px; }
+  .term code { flex:1; min-width:0; white-space:normal; overflow-wrap:anywhere; font-size:13.5px; line-height:1.5; }
+  .copy { flex:none; background:transparent; color:var(--bg); border:1px solid currentColor; border-radius:999px; padding:5px 14px; font:500 13px Inter, system-ui, sans-serif; cursor:pointer; opacity:.85; }
+  .copy:hover { opacity:1; }
+  .copy:focus-visible { outline-color:var(--bg); }
+  .docs { display:flex; flex-wrap:wrap; gap:8px 20px; margin-top:16px; font-size:14.5px; }
+  .docs a { color:var(--ink); }
+  .opt .small { color:var(--muted); font-size:13px; margin-top:12px; }
+  @media (max-width:760px) { .options { grid-template-columns:1fr; } .opt { padding:24px 20px 22px; } }
+
+  /* FAQ */
+  .faq { display:grid; grid-template-columns:1fr; gap:20px; margin-top:36px; }
+  .faq > div { min-width:0; }
+  .faq h3 { font-size:16px; font-weight:600; margin-bottom:4px; }
+  .faq p { color:var(--muted); font-size:15px; }
+  @media (max-width:760px) { .faq { grid-template-columns:1fr; } }
+
+  footer { padding:48px 0 40px; color:var(--muted); font-size:13px; display:flex; justify-content:space-between; gap:16px; flex-wrap:wrap; border-top:1px solid var(--line); }
+  footer a { color:var(--muted); }
+  @media (max-width:560px) { .wrap { padding:0 16px; } .term code { font-size:13px; } }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <nav class="nav" aria-label="Main">
+    <a class="brand" href="/"><img src="/logo.png?v=4" alt="" width="30" height="30">Jori</a>
+    <div class="seg"><a href="/personal">Personal</a><a href="/business">Business</a></div>
+    <a class="gh" href="https://github.com/jori-ai/jori">GitHub</a>
+  </nav>
+
+  <main>
+  <header class="hero">
+    <div>
+      <div class="tag">Meet Jori</div>
+      <h1>An assistant that pays attention, <em>even when you're not asking</em>.</h1>
+      <p class="lede">Jori remembers what matters to you, reaches out before you think to ask, and gets things done. <strong>Nothing spends without your yes.</strong> It's open source and runs on the Claude subscription you already have.</p>
+      <div class="ctas">
+        <a class="btn" href="#run">Pick how to run it</a>
+        <a class="link" href="#see">See it working →</a>
+      </div>
+    </div>
+    <figure>
+      <img src="/img/app-chat.png?v=1" alt="The Jori app on a phone. At 7:02 AM Jori sends Sam a morning brief: rain from 4 PM so walk Biscuit before then, the Lisbon fare dropped $142, and Jordan's birthday is in three weeks. Sam asks Jori to book the Lisbon flights, Jori finds them and asks for Face ID, then suggests two birthday gifts." width="610" height="1060" fetchpriority="high">
+      <figcaption><b>The morning brief,</b> then a booking you asked for.</figcaption>
+    </figure>
+  </header>
+
+  <section id="see" aria-labelledby="see-h">
+    <h2 id="see-h">See it working.</h2>
+    <p class="sub">A sample household: Sam, Jordan and their dog Biscuit. Jori keeps a memory you can ask, and reaches you in its app, in your messages and at work.</p>
+    <div class="gallery">
+      <figure>
+        <div class="frame"><img src="/img/wiki-answer.png?v=4" alt="Asking the memory site what to get Jordan for their birthday. Jori answers with sources." width="1460" height="1120" loading="lazy"></div>
+        <figcaption><b>Ask your memory.</b> Plain answers, with the pages they came from.</figcaption>
+      </figure>
+      <figure>
+        <div class="frame"><img src="/img/app-approval.png?v=7" alt="The Jori app asking to approve a $1,284 flight purchase with Face ID" width="610" height="1060" loading="lazy"></div>
+        <figcaption><b>Nothing spends without you.</b> Purchases wait for Face ID.</figcaption>
+      </figure>
+      <figure>
+        <div class="frame"><img src="/img/personal-app-trip-dinner.png?v=8" alt="Two phone screens: a Saturday plan in Lisbon with a lunch swapped for one with a view, and three dinner picks near a theater with a table booked" width="1096" height="1060" loading="lazy"></div>
+        <figcaption><b>For life.</b> Trips, tables, tickets, money and the home.</figcaption>
+      </figure>
+      <figure>
+        <div class="frame"><img src="/img/work-slack.png?v=4" alt="A team channel where people mention @Jori to find a meeting time across four calendars, book it with a reminder, and recall what was promised at a meeting" width="1460" height="1080" loading="lazy"></div>
+        <figcaption><b>For work.</b> @Jori in the team channel.</figcaption>
+      </figure>
+    </div>
+    <p class="note">Simulated screens with a made-up household.</p>
+  </section>
+
+  <section aria-labelledby="six-h">
+    <h2 id="six-h">What I do, in six lines.</h2>
+    <p class="sub">Each one comes with a sample of how it sounds.</p>
+    <ul class="six">
+      <li>
+        <h3>I remember you.</h3>
+        <p>People, places, preferences and what you decided, kept as pages you can read and fix.</p>
+        <div class="msg"><span class="who">Jori</span><span class="bubble">Noted: Jordan doesn't eat oysters, and Biscuit's walk is at 8:30. I won't ask again.</span></div>
+      </li>
+      <li>
+        <h3>I reach out first.</h3>
+        <p>A brief before you're up. Quiet when nothing matters.</p>
+        <div class="msg"><span class="who">Jori · 7:02 AM</span><span class="bubble">Good morning, Sam. Rain from 4 PM, so walk Biscuit before then. Nothing else needs you today.</span></div>
+      </li>
+      <li>
+        <h3>I get things done.</h3>
+        <p>Bookings, orders and errands, start to finish. Anything that spends waits for your Face ID.</p>
+        <div class="msg"><span class="who">Jori</span><span class="bubble">Found them: same seats as last time, $1,284 for two. Approve with Face ID and they're booked.</span></div>
+      </li>
+      <li>
+        <h3>I keep watch.</h3>
+        <p>Prices, shows, birthdays and the things you'd otherwise check by hand.</p>
+        <div class="msg"><span class="who">Jori</span><span class="bubble">The Lisbon fare dropped $142 overnight. And Jordan's birthday is in three weeks, no gift yet.</span></div>
+      </li>
+      <li>
+        <h3>I handle the inbox.</h3>
+        <p>Mail sorted and filed, with only what needs you brought to you.</p>
+        <div class="msg"><span class="who">Jori</span><span class="bubble">14 new emails. One needs you: the plumber can come Tuesday at 9. The rest are filed.</span></div>
+      </li>
+      <li>
+        <h3>I get better every week.</h3>
+        <p>Every "skip" teaches me what to leave out.</p>
+        <div class="msg"><span class="bubble me">skip</span><span class="bubble">Got it. Weekend picks only when the forecast is good from now on.</span></div>
+      </li>
+    </ul>
+  </section>
+
+  <section class="claude" aria-labelledby="claude-h">
+    <div class="band">
+      <h2 id="claude-h">On the Claude subscription you already have.</h2>
+      <ul>
+        <li><b>No API key.</b> Jori signs in with your Claude Max account, the same way Claude Code does.</li>
+        <li><b>No per-message bill.</b> Your subscription covers it. There's no meter running in the background.</li>
+        <li><b>No surprises.</b> If the subscription isn't available, Jori stops and tells you. It never switches to something you pay for by the message.</li>
+      </ul>
+    </div>
+  </section>
+
+  <section id="run" aria-labelledby="run-h">
+    <h2 id="run-h">Where should I run?</h2>
+    <p class="sub">Jori needs a computer that stays on. Use your own, or let us run one for you.</p>
+    <div class="options">
+      <div class="opt">
+        <div class="k">Free · Open source</div>
+        <h3>Run it yourself.</h3>
+        <p>On a Mac that stays on, or a Linux server you rent (Linux support is new). You create the accounts Jori uses, and the setup page walks you through each one and tests it before saving.</p>
+        <h4>Why</h4>
+        <ul class="pro">
+          <li>Everything works, including iMessage and Notes on a Mac.</li>
+          <li>Your data stays on machines and accounts you own.</li>
+        </ul>
+        <h4>What it takes</h4>
+        <ul class="con">
+          <li>About 30–60 minutes of setup.</li>
+          <li>You keep the computer on.</li>
+        </ul>
+        <div class="end">
+          <div class="term"><code id="install-cmd">curl -fsSL https://getjori.ai/install.sh | bash</code><button type="button" class="copy" data-copy="install-cmd" aria-label="Copy the install command">Copy</button></div>
+          <div class="docs">
+            <a href="https://github.com/jori-ai/jori/blob/main/docs/quickstart.md">Quickstart guide</a>
+            <a href="/#install">Other ways to install</a>
+            <a href="/install.sh">Read the script</a>
+          </div>
+        </div>
+      </div>
+
+      <div class="opt">
+        <div class="k">Managed <span class="soon">Coming soon</span></div>
+        <h3>We run it for you.</h3>
+        <p>Your own private Jori on a server we run. Nothing to install and no computer to keep on.</p>
+        <h4>How it works</h4>
+        <ul class="plain">
+          <li>Your Jori is yours alone, not shared with anyone else's.</li>
+          <li>You sign in to Claude yourself, and Anthropic bills you directly.</li>
+          <li>Everything else comes on one monthly invoice, at cost: every line itemized, with the provider's price and no markup.</li>
+        </ul>
+        <h4>What it takes</h4>
+        <ul class="con">
+          <li>The Mac-only features, like iMessage and Notes, aren't available on our servers.</li>
+        </ul>
+        <div class="end">
+          <a class="btn" href="https://github.com/jori-ai/jori">Watch for it</a>
+          <p class="small">Prices will be published, line by line, before it opens. Star or watch the project on GitHub to hear when it does.</p>
+        </div>
+      </div>
+    </div>
+
+    <div class="faq">
+      <div>
+        <h3>Which Claude plan?</h3>
+        <p>Jori is built for Claude Max.</p>
+      </div>
+    </div>
+  </section>
+  </main>
+
+  <footer>
+    <span>© 2026 Jori · <a href="/personal">Jori for you</a> · <a href="/business">Jori for business</a></span>
+    <a href="https://github.com/jori-ai/jori">github.com/jori-ai/jori</a>
+  </footer>
+</div>
+<script src="https://ask.silo.co/embed.js" data-site="jori" async></script><!-- kernel-guard-ok: getjori.ai website chat widget, hosted by the project owner's Site Chat service -->
+<script>document.querySelectorAll('.copy').forEach(b=>b.addEventListener('click',()=>{const t=document.getElementById(b.dataset.copy).textContent;navigator.clipboard.writeText(t).then(()=>{b.textContent='Copied';setTimeout(()=>b.textContent='Copy',1600)}).catch(()=>{})}));</script>
+</body>
+</html>

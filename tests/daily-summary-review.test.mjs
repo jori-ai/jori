@@ -603,6 +603,33 @@ test("factPack says the walked figure can exceed all travel by the hop no leg jo
   assert.doesNotMatch(R.factPack({ date: "2026-09-06", manifest: { stops: [] }, day: joined, statements: {}, corrections: [] }), /straight-line ground/);
 });
 
+test("factPack does not call an unprinted walked total zero beside a step-only walk line", () => {
+  // The header prints no walked-miles figure when it rounds to nothing, and a walk line
+  // under a stop prints its steps and no distance on a day with no measured stride. The
+  // fact sheet said "walked 0.0 miles (the header's figure)", so the review called a
+  // 20-minute walk line under a stop impossible beside it (2026-11-17).
+  const T = (h, m) => Date.UTC(2026, 10, 17, h + 5, m);
+  const place = (name) => ({ name, source: "user_confirmed" });
+  const base = { id: "a", place_name: "Base", start: "08:00", end: "12:08", start_ts_ms: T(8, 0), end_ts_ms: T(12, 8), place: place("Base") };
+  const shop = { id: "b", place_name: "Shop", start: "13:00", end: "14:00", start_ts_ms: T(13, 0), end_ts_ms: T(14, 0), place: place("Shop") };
+  const dwell = (id, name, lat, start, end) => ({ type: "dwell", id, place: { name, tier: "corroborated", lat, lon: -75 }, // kernel-guard-ok: synthetic fixture coordinates
+    start, end, start_ms: T(...start.split(":").map(Number)), end_ms: T(...end.split(":").map(Number)), major: true });
+  const spine = [dwell("d0", "Base", 40.0, "08:00", "12:08"),
+    { type: "leg", id: "l0", start: "12:08", end: "13:00", start_ms: T(12, 8), end_ms: T(13, 0), mins: 52, mode: "driving", routed_m: 9000, holes: [], confidence: "observed" },
+    dwell("d1", "Shop", 40.05, "13:00", "14:00")];
+  const steps = { total: 900, walks: [{ kind: "in_stop", stop_id: "b", start_ms: T(13, 10), end_ms: T(13, 30), mins: 20, steps: 985 }] };
+  const day = { date: "2026-11-17", stops: [base, shop], steps, path: { stats: { observed_km: 9, inferred_km: 0, matched_km: 9, walked_km: 0, geometry_source: "map_matched" }, spine } };
+  const text = R.factPack({ date: "2026-11-17", manifest: { stops: [] }, day, statements: {}, corrections: [] });
+  assert.doesNotMatch(text, /walked 0\.0 miles/);
+  assert.match(text, /MOVEMENT TOTALS \(code\): no walked-miles figure \(under 0\.05 miles measured, so the header prints none/);
+  assert.match(text, /step-only walk lines under a stop \(minutes and step count, no distance/);
+  // a day that does walk keeps its figure, and has no such note
+  const walked = { ...day, steps: { total: 900, walks: [] }, path: { ...day.path, spine: [spine[0], { type: "leg", id: "l1", start: "12:08", end: "13:00", start_ms: T(12, 8), end_ms: T(13, 0), mins: 52, mode: "walking", walked_m: 800, routed_m: 800, holes: [] }, spine[2]] } };
+  const t2 = R.factPack({ date: "2026-11-17", manifest: { stops: [] }, day: walked, statements: {}, corrections: [] });
+  assert.match(t2, /walked 0\.5 miles/);
+  assert.doesNotMatch(t2, /step-only walk lines/);
+});
+
 test("factPack's all-travel total counts the legs the map-matcher missed", () => {
   // 2026-10-15: two of four segments were not matched, so "all travel 1.4 km" sat
   // beside a 24.3 km evening drive and the review called the report contradictory.

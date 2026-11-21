@@ -1,7 +1,7 @@
 {
   "name": "role-social-director",
-  "title": "Social Director (role)",
-  "description": "The Social Director on your team: the fun: shows, comedy, concerts, events, restaurants, movies and TV. Owns those jobs, signs what they send, and brings this role's specialty to every one of them.",
+  "title": "Social (role)",
+  "description": "The Social role on your team: the fun: shows, comedy, concerts, events, restaurants, movies and TV. Owns those jobs, signs what they send, and brings this role's specialty to every one of them.",
   "version": "1.0.0",
   "default": "disabled",
   "requires": {
@@ -14,7 +14,7 @@
   "launchd": [],
   "role": {
     "id": "social-director",
-    "title": "Social Director",
+    "title": "Social",
     "responsibility": "The fun: shows, comedy, concerts, events, restaurants, movies and TV.",
     "jobs": [
       "weekend-events",

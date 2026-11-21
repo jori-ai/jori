@@ -24,7 +24,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { createHash } from "node:crypto";
-import { readStdinJson, readCache, writeCache, emit, emitNull, emitNoop, stampRun } from "./_common.mjs";
+import { situationStaleReason, readStdinJson, readCache, writeCache, emit, emitNull, emitNoop, stampRun } from "./_common.mjs";
 import { extractJsonObject } from "../../../lib/extract-json.mjs";
 import { createRequire } from "node:module";
 
@@ -42,12 +42,19 @@ const { situation: sit, context } = await readStdinJson();
 // Cheap escape hatches — skip the LLM call entirely when there's nothing to
 // reason about. The harvester pays Sonnet only when situation has substance.
 
-// 1. Sleeping / no-typing-no-location windows: no point reasoning.
+// 1. Asleep: no point reasoning. From the sleep signal (sleep data + the
+//    phone's lock/unlock rows), never the clock; 07:00-23:00 whenever there
+//    is no usable sleep signal.
 const audio = (sit.environment || {}).audio_class || "unknown";
 const hour = (sit.time || {}).local_hour;
-if (hour !== undefined && (hour < 7 || hour >= 23)) {
+let asleep;
+try {
+  const sig = createRequire(import.meta.url)("../../../lib/sleep-night.js").sleepSignal();
+  if (sig.usable) asleep = sig.state === "asleep";
+} catch {}
+if (asleep === undefined ? (hour !== undefined && (hour < 7 || hour >= 23)) : asleep) {
   stampRun("situation", false);
-  emitNull("outside active hours");
+  emitNull(asleep ? "asleep" : "outside active hours");
   process.exit(0);
 }
 
@@ -167,6 +174,8 @@ Output a strict JSON object — pick exactly one shape, no prose, no markdown:
    "signal":"<≤2 lines, ${ASSISTANT} voice; lead with the anchor + the timely ask>",
    "urgency":0.55-0.95,
    "anchor":"<event-id or commitment phrase or HH:MM window>",
+   "kind":"DEPARTURE"|"DELIVERY"|"TASK"|"OTHER",
+   "task_ref":"<id of the task list item this is about, or null>",
    "dedup_key":"situation:<class>:<short anchor>:<YYYY-MM-DD>",
    "boost_during":["pre_event_30min"|"post_event_15min"|"evening_wind_down"|"free_block_aligned"|...],
    "rationale":"<one line why timely now>"}
@@ -227,6 +236,15 @@ if (!parsed || parsed.emit !== true) {
   process.exit(0);
 }
 
+// Drop at harvest what resolve-first would refuse after ranking: a departure
+// nudge while already moving, or a candidate about a task no longer open.
+const stale = situationStaleReason(parsed, sit, context);
+if (stale) {
+  stampRun("situation", false);
+  emitNull(`stale premise: ${stale}`);
+  process.exit(0);
+}
+
 // Build the candidate. temporal_fit is the headline — this lane exists to
 // carry that signal.
 const today = new Date().toISOString().slice(0, 10);
@@ -239,6 +257,8 @@ const candidate = {
   supporting_data: {
     class: parsed.class || "NOW",
     anchor: parsed.anchor || anchorHint,
+    kind: parsed.kind || null,
+    task_ref: parsed.task_ref || null,
     rationale: parsed.rationale || "",
     hour_bucket: hourBucket,
   },

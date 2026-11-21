@@ -15,6 +15,8 @@
 //   --no-resume           don't try to resume previous session
 //   --claude-bin <path>   override claude binary path
 
+// First: re-exec without the .env in the starting environment (lib/env-isolate.cjs).
+import "../../lib/env-isolate-first.mjs";
 import fs from "node:fs";
 import { MODELS } from "../../lib/models.cjs";
 import { createRequire } from "node:module";
@@ -394,6 +396,24 @@ class ChatSupervisor {
     this._stopLocalRulesWatch = watchLocalRules(this, { localDir: LOCAL_DIR, role: "chat", logPrefix: "[chat-supervisor]" });
   }
 
+  // A restart re-reads agents.json (allowlists, model, effort, MCP flags), so a
+  // config change takes effect with `jori restart <agent>` without bouncing the
+  // supervisor process. Before this, the config read at process start was reused
+  // on every restart: an allowlist entry removed from agents.json stayed on the
+  // respawned session until launchd restarted the supervisor. A file that does
+  // not parse (mid-edit) keeps the config already loaded. Values the
+  // constructor derived from the config at boot are not recomputed.
+  reloadConfig() {
+    const p = this.args.config || path.join(JORI_ROOT, "agent/config/agents.json");
+    try {
+      this.cfg = loadAgentConfig(p, this.args.agent || "chat");
+      return true;
+    } catch (e) {
+      console.error(`[chat-supervisor] config reload failed, keeping the loaded config: ${e.message}`);
+      return false;
+    }
+  }
+
   async startSession({ resume }) {
     this.sessionStartedAt = Date.now();
     const cfg = this.cfg;
@@ -424,6 +444,8 @@ class ChatSupervisor {
       // ~/.claude/.credentials.json; the API key is reserved exclusively for
       // phone-channel ack generation (Haiku only).
       unsetEnv: ["ANTHROPIC_API_KEY"],
+      // Which agent-env lockdown entry applies (lib/agent-env.cjs).
+      agentEnvId: this.args.agent || "chat",
       // No idle compaction for the long-running chat session (Claude Code
       // 2.1.299+ would otherwise compact it after ~54 idle minutes). Chat has its
       // own context guard; this is per supervisor session, so the user's own
@@ -1449,6 +1471,7 @@ class ChatSupervisor {
       console.error(`[chat-supervisor] session never initialized — starting fresh`);
       this.state.rotateSession();
     }
+    this.reloadConfig();
     await this.startSession({ resume: shouldResume });
     this.sendInit(); // Kick the lazy session so MCP servers start.
     this.restarting = false;

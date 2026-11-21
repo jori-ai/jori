@@ -63,6 +63,25 @@
 // and refuse, naming the event to `update` instead. Fails open on a read error,
 // like the overlap guard.
 //
+// WHY A DEPARTURE CARRIES WHERE ITS TIME CAME FROM (--transit, 2026-11-18). A
+// ferry departure went on the calendar at a time no timetable stood behind, a
+// quarter of an hour off. The hum's calendar lane then counted down to it
+// ("starts in 25 min"), and the outbound gate checked that ping against the
+// same wrong entry, so nothing caught it. A confident countdown to a wrong
+// departure is how a boat or a train gets missed. So a scheduled departure
+// (ferry, train, bus, flight) is declared with `--transit`, and
+// `--transit-source "<timetable URL | confirmation number | operator page>"`
+// says where its time came from; both are stamped as private properties
+// (jori_transit=1, jori_transit_verified=1|0, jori_transit_source), the same
+// mechanism as jori_created and jori_booking_ref. A departure with no source is
+// SAVED, marked unverified (jori_transit_verified=0 plus a line in its notes),
+// not refused: a refusal would block the user who asked for it to be added, and
+// would teach a caller to drop `--transit`, which is the original bug. Moving a
+// departure's time without a source marks it unverified again; a
+// `--from-confirmation <messageId>` that sets the time counts as the source.
+// The calendar lane (agent/scripts/hum-harvesters/calendar.mjs) never counts
+// down to an unverified departure; it says to check the timetable instead.
+//
 // WHAT THIS DOES NOT CLOSE. Bash is open to every agent, so a determined turn
 // can call `gog calendar` directly. Three further layers cover that: the MCP
 // write tools are removed from every agent's grant (agent/config/
@@ -86,6 +105,12 @@
 //   …and on update of an event the user made (see below):
 //     --from-confirmation <gmail messageId>   the booking's confirmation email licenses changing time/name/details
 //     --jori-event <job>                   this id came from <job>'s own earlier create
+//   …and for a scheduled departure (ferry, train, bus, flight), create or update:
+//     --transit                               this event is a departure
+//     --transit-source "<where the time came from>"   a timetable URL, a confirmation number,
+//                                             an operator page (implies --transit). Without
+//                                             one (or a --from-confirmation that sets the time)
+//                                             the departure is saved with its time unverified.
 
 import fs from "node:fs";
 import os from "node:os";
@@ -219,6 +244,22 @@ if (bookingRefRaw && !BOOKING_REF_RE.test(bookingRef)) {
   die([`jori-calendar: --booking-ref takes the provider's confirmation number (letters, digits, dashes; 4+ characters), got "${bookingRefRaw}".`]);
 }
 if (bookingRef && cmd === "delete") die(["jori-calendar delete: --booking-ref only applies to create and update."]);
+
+// A scheduled departure and where its time came from (see the departure note in
+// the header). --transit-source alone implies --transit. An empty source is no
+// source (the departure is saved unverified); a too-short one is a shrug, and a
+// value that is itself a flag means the source was left out mid-command.
+const MIN_TRANSIT_SOURCE_CHARS = 4;
+const transitSourceGiven = argv.some((a) => a === "--transit-source" || (typeof a === "string" && a.startsWith("--transit-source=")));
+const transitSourceArg = String(flag("--transit-source") ?? "").trim();
+const transitDeclared = Boolean(flag("--transit", false) || transitSourceGiven);
+if (transitDeclared && cmd === "delete") die(["jori-calendar delete: --transit and --transit-source only apply to create and update."]);
+if (transitSourceArg && (transitSourceArg.length < MIN_TRANSIT_SOURCE_CHARS || transitSourceArg.startsWith("--"))) {
+  die([
+    `jori-calendar: --transit-source says where the departure time came from (a timetable URL, a confirmation number, an operator page), got "${transitSourceArg}".`,
+    "If there is no such source, leave it off: the departure is saved with its time marked unverified.",
+  ]);
+}
 
 // ── Positional sanity, before anything is logged ──────────────────────────
 // `jori-calendar update --help` used to shift "--help" in as the eventId and
@@ -450,6 +491,23 @@ function setFlag(name, value) {
   if (argv[i] === name) argv[i + 1] = value; else argv[i] = `${name}=${value}`;
 }
 
+// Private properties this wrapper also stamps on the user's OWN events (update
+// --booking-ref, update --transit): they describe the booking or the departure,
+// so they never mark an event as Jori's.
+const USER_EVENT_STAMPS = new Set(["jori_booking_ref", "jori_transit", "jori_transit_verified", "jori_transit_source"]);
+
+// The event being updated, read from Google at most once per run (the owner
+// rule below and the departure stamps after it both need it). null = the read
+// failed or returned nothing parseable.
+let eventRead;
+function readEvent() {
+  if (eventRead !== undefined) return eventRead;
+  eventRead = null;
+  const probe = spawnSync(GOG, ["calendar", "event", calendar, eventId, ...ACCOUNT_ARGS, "--no-input", "-j"], { encoding: "utf8" });
+  if (probe.status === 0 && probe.stdout) { try { const j = JSON.parse(probe.stdout); eventRead = j.event || j; } catch {} }
+  return eventRead;
+}
+
 let ownerEvent = null;
 if (cmd === "update") {
   const changed = argv.filter((t) => typeof t === "string" && t.startsWith("--")).map((t) => t.split("=")[0])
@@ -464,15 +522,13 @@ if (cmd === "update") {
     die(["jori-calendar update: --jori-event takes the name of the job whose own create stored this event id."]);
   }
   if (!confirmed && !joriEventClaim && (changed.length || wantsDescription || wantsLocation)) {
-    const probe = spawnSync(GOG, ["calendar", "event", calendar, eventId, ...ACCOUNT_ARGS, "--no-input", "-j"], { encoding: "utf8" });
-    let ev = null;
-    if (probe.status === 0 && probe.stdout) { try { const j = JSON.parse(probe.stdout); ev = j.event || j; } catch {} }
+    const ev = readEvent();
     const readFailed = !ev || !ev.id;
     const organizerSelf = ev && ev.organizer && (ev.organizer.self || SELF.has(String(ev.organizer.email || "").toLowerCase()));
     const priv = (ev && ev.extendedProperties && ev.extendedProperties.private) || {};
-    // jori_booking_ref is stamped on the user's own events too (update
-    // --booking-ref), so it never marks an event as Jori's.
-    const joriMade = priv.jori_created === "1" || priv.gandalf_created === "1" || Object.keys(priv).some((k) => k !== "jori_booking_ref");
+    // jori_booking_ref and the departure stamps are put on the user's own events
+    // too (update --booking-ref / --transit), so they never mark an event as Jori's.
+    const joriMade = priv.jori_created === "1" || priv.gandalf_created === "1" || Object.keys(priv).some((k) => !USER_EVENT_STAMPS.has(k));
     ownerEvent = readFailed ? null : Boolean(organizerSelf && !joriMade);
     if (readFailed || ownerEvent) {
       const refusals = [];
@@ -507,6 +563,85 @@ if (cmd === "update") {
   }
 }
 
+// ── Departures: where the time came from (create and update) ──────────────
+// See the departure note in the header. Runs after the owner rule, so a
+// restricted change to the user's own event has already been refused, and an
+// allowed description edit already keeps their notes in front.
+//
+// The departure is known from this run's flags, or, on an update that moves the
+// time, from the event's own stamp. Its time counts as verified only with a
+// source: --transit-source, or --from-confirmation when this run sets the time
+// (the owner rule's licence: the new details come from that email). An update
+// that neither gives a source nor moves the time leaves the verification as it
+// was: what was checked is still the time on the event. The notes line is the
+// user-visible half of the mark; it is added while the time is unverified and
+// taken out once a source is given. On an update whose event cannot be read,
+// the stamps are still written (an unknown prior state is left untouched) and
+// the notes are left alone.
+const TRANSIT_UNVERIFIED_NOTE = "Heads-up: this departure time hasn't been checked against a timetable or a booking yet.";
+const transitProps = [];
+let transitVerified = null; // null: not a departure, or its state is not known
+let transitSource = "";
+if (cmd === "create" || cmd === "update") {
+  const setsTime = peekFlag("--from") !== undefined || peekFlag("--to") !== undefined;
+  const confirmationOk = fromConfirmation.trim().length >= MIN_CONFIRMATION_ID_CHARS && CONFIRMATION_ID_RE.test(fromConfirmation.trim());
+  transitSource = transitSourceArg || (confirmationOk && setsTime ? `confirmation email ${fromConfirmation.trim()}` : "");
+  let current = null;
+  if (cmd === "update" && (transitDeclared || setsTime)) {
+    const ev = readEvent();
+    current = ev && ev.id ? ev : null;
+  }
+  const currentPriv = (current && current.extendedProperties && current.extendedProperties.private) || {};
+  const keep = cmd === "update" && !transitSource && !setsTime;
+  if (transitDeclared || currentPriv.jori_transit === "1") {
+    transitProps.push("jori_transit=1");
+    if (!(keep && !current)) {
+      transitVerified = keep ? currentPriv.jori_transit_verified === "1" : Boolean(transitSource);
+      if (!(keep && transitVerified)) transitProps.push(`jori_transit_verified=${transitVerified ? 1 : 0}`);
+      if (transitVerified && !keep) transitProps.push(`jori_transit_source=${privatePropValue(transitSource)}`);
+      const given = peekFlag("--description");
+      const base = given !== undefined ? String(given) : cmd === "create" ? "" : current ? String(current.description || "") : null;
+      if (base !== null) {
+        const next = transitVerified ? withoutTransitNote(base) : withTransitNote(base);
+        if (next !== base) {
+          if (given !== undefined) setFlag("--description", next); else argv.push("--description", next);
+        }
+      }
+    }
+    if (transitVerified === false) {
+      console.error([
+        "jori-calendar: saved as a departure whose time is NOT verified (no --transit-source).",
+        "The hum will not count down to it; it will say to check the timetable. Once the time is",
+        "checked against a timetable or the booking, mark it:",
+        `  jori-calendar update ${eventId || "<eventId>"} --calendar ${calendar} --transit-source "<timetable URL | confirmation number | operator page>"`,
+      ].join("\n"));
+    }
+  }
+}
+
+function withTransitNote(text) {
+  if (text.includes(TRANSIT_UNVERIFIED_NOTE)) return text;
+  return text.trim() ? `${text}\n\n${TRANSIT_UNVERIFIED_NOTE}` : TRANSIT_UNVERIFIED_NOTE;
+}
+function withoutTransitNote(text) {
+  if (!text.includes(TRANSIT_UNVERIFIED_NOTE)) return text;
+  return text.split(`\n\n${TRANSIT_UNVERIFIED_NOTE}`).join("").split(TRANSIT_UNVERIFIED_NOTE).join("").trim();
+}
+
+// gog reads --private-prop as a comma-separated list of key=value pairs, and
+// Google caps a property's value (1024 characters): escape the three characters
+// that would break the pair (% , =) and stop short of the cap. The full source
+// is in the audit row.
+function privatePropValue(s) {
+  let out = "";
+  for (const ch of String(s)) {
+    const e = ch === "%" ? "%25" : ch === "," ? "%2C" : ch === "=" ? "%3D" : ch;
+    if (out.length + e.length > 1000) break;
+    out += e;
+  }
+  return out;
+}
+
 // ── Build the gog invocation ─────────────────────────────────────────────
 const gogArgs = ["calendar", cmd === "create" ? "create" : cmd, calendar];
 if (eventId) gogArgs.push(eventId);
@@ -523,6 +658,8 @@ gogArgs.push("--send-updates", sendUpdates || (attendees.length ? "all" : "none"
 if (cmd === "create") gogArgs.push("--private-prop", "jori_created=1");
 // The booking's confirmation number, so the guard above finds it by its stamp.
 if (bookingRef) gogArgs.push("--private-prop", `jori_booking_ref=${bookingRef}`);
+// A departure, and whether its time is verified (the hum's calendar lane reads these).
+for (const p of transitProps) gogArgs.push("--private-prop", p);
 gogArgs.push(...argv);
 if (dryRun) gogArgs.push("--dry-run");
 
@@ -556,6 +693,10 @@ try {
     jori_event_claim: joriEventClaim || null,
     booking_ref: bookingRef || null,
     booking_dup_override: bookingDupOk || null,
+    // A departure: whether its time was verified and where it came from
+    // (null = not a departure, or not known to be one).
+    transit_verified: transitVerified,
+    transit_source: transitVerified && transitSource ? transitSource : null,
     dry_run: Boolean(dryRun),
   }) + "\n");
 } catch (e) {

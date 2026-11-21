@@ -193,7 +193,7 @@ PROPOSED TUNING
 Send:
 ```bash
 ~/Dev/jori/bin/email-send \
-  --to <the user's address> \
+  --to me \
   --subject "Hum weekly — <YYYY-MM-DD>" \
   --body-file /tmp/hum-review-<YYYY-MM-DD>.html \
   --html

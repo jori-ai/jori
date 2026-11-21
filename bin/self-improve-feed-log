@@ -1,7 +1,11 @@
 #!/usr/bin/env node
 // self-improve-feed-log — record an already-decided LOW/MODERATE self-improvement
-// into self_improve_approvals so it shows in the app's "Improvements" channel with
-// a green check (or a spinning "applying" glyph if you log it in-progress first).
+// into self_improve_approvals, and post it as a quiet (no-push) card message in
+// the software engineer's conversation: the app draws it from the row with a
+// green "In and running" (or "Applying" if you log it in-progress first).
+// There is no separate Improvements tab since 2026-11-15, so the message is the
+// only place it shows; the speak gate may hold a routine one (intent
+// improvement-applied), unlike a Face-ID card (improvement-card).
 //
 // This is DISPLAY-ONLY: low/moderate items auto-apply on the production host and never need
 // the user's signature. High-risk items must go through `self-improve-request`
@@ -19,6 +23,7 @@ import path from "node:path";
 import { createRequire } from "node:module";
 import fs from "node:fs";
 import crypto from "node:crypto";
+import { spawn } from "node:child_process";
 import { installRoot } from "../lib/root.cjs";
 
 const ROOT = installRoot();
@@ -66,4 +71,14 @@ const row = {
 
 const res = await fetch(`${BASE}/rest/v1/self_improve_approvals`, { method: "POST", headers: H, body: JSON.stringify(row) });
 if (!res.ok) { console.error(`self-improve-feed-log: insert ${res.status}: ${await res.text()}`); process.exit(1); }
-console.log(`logged ${status} improvement ${row.id} to the Improvements channel`);
+// Detached: the speak gate takes minutes, and this logger's callers should not wait on it.
+try {
+  const child = spawn(path.join(ROOT, "bin/jori-send-curl"), [
+    "--channel", "improvements", "--no-push", "--skip-precheck", "--intent", "improvement-applied",
+    "--metadata-json", JSON.stringify({ card: "improvement", approval_id: row.id }),
+    `🛠️ ${summary}${rationale ? `\n${rationale}` : ""}`,
+  ], { detached: true, stdio: "ignore", cwd: ROOT });
+  child.on("error", () => {});
+  child.unref();
+} catch {}
+console.log(`logged ${status} improvement ${row.id} to the software engineer's conversation`);

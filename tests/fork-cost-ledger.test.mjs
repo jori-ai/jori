@@ -236,3 +236,94 @@ test("fork-cost-record completes a partial result from the transcript it finds",
   assert.equal(row.duration_ms, 600_000);
   assert.equal(row.turns_source, "transcript");
 });
+
+// A resumed session (`--resume`) reports the WHOLE session's cost and tokens in
+// every result. The ledger must hold each invocation's own spend, so a
+// session's rows sum to its real cost.
+const { asSessionDelta, lastSessionRow, recordForkCost } = require("../lib/fork-cost-ledger.cjs");
+
+function resumed(n, over = {}) {
+  // n-th result of one session: every counter is the running total
+  return {
+    ...ENVELOPE, session_id: "resume00-0000-0000-0000-000000000000", num_turns: 10 * n, duration_ms: 1000,
+    total_cost_usd: n, usage: undefined,
+    modelUsage: { "claude-sonnet-5-5": { inputTokens: 100 * n, outputTokens: 1000 * n, cacheReadInputTokens: 50_000 * n, cacheCreationInputTokens: 10_000 * n, webSearchRequests: n } },
+    ...over,
+  };
+}
+
+test("a resumed session's later rows hold only what that invocation spent", () => {
+  const first = rowFromResult({ job: "role-x", result: resumed(1) });
+  const r1 = asSessionDelta(first, null);
+  assert.equal(r1.total_cost_usd, 1);
+  assert.equal(r1.session_cumulative.cost, 1);
+  assert.ok(!("session_delta" in r1));
+
+  const r2 = asSessionDelta(rowFromResult({ job: "role-x", result: resumed(3) }), r1);
+  assert.equal(r2.session_delta, true);
+  assert.equal(r2.total_cost_usd, 2);
+  assert.equal(r2.session_cumulative_cost_usd, 3);
+  assert.equal(r2.input_tokens, 200);
+  assert.equal(r2.output_tokens, 2000);
+  assert.equal(r2.cache_read_tokens, 100_000);
+  assert.equal(r2.cache_creation_tokens, 20_000);
+  assert.equal(r2.web_search_requests, 2);
+  assert.equal(r2.num_turns, 30); // not a transcript count: kept as reported
+
+  const r3 = asSessionDelta(rowFromResult({ job: "role-x", result: resumed(4) }), r2);
+  assert.equal(r3.total_cost_usd, 1);
+  assert.equal(r1.total_cost_usd + r2.total_cost_usd + r3.total_cost_usd, 4, "the rows sum to the session's cumulative");
+});
+
+test("a transcript turn count (whole session) is diffed too; a row from before session_cumulative is read as cumulative", () => {
+  // A row an older writer left: its own fields ARE the running totals.
+  const legacy = { ...rowFromResult({ job: "role-x", result: resumed(1, { num_turns: 18 }) }), turns_source: "transcript" };
+  const next = rowFromResult({ job: "role-x", result: resumed(2, { num_turns: 4, duration_ms: 20_000 }), transcript: { wall_ms: 900_000, replies: 26 } });
+  assert.equal(next.turns_source, "transcript");
+  const d = asSessionDelta(next, legacy);
+  assert.equal(d.total_cost_usd, 1);
+  assert.equal(d.num_turns, 8);
+  assert.equal(d.session_cumulative.turns, 26);
+});
+
+test("counters that went down are not a cumulative report: the row is kept as reported", () => {
+  const prior = asSessionDelta(rowFromResult({ job: "role-x", result: resumed(5) }), null);
+  const smaller = rowFromResult({ job: "role-x", result: resumed(2) });
+  const row = asSessionDelta(smaller, prior);
+  assert.equal(row.total_cost_usd, 2);
+  assert.ok(!("session_delta" in row));
+});
+
+test("the same result recorded twice writes nothing the second time", () => {
+  const first = asSessionDelta(rowFromResult({ job: "role-x", result: resumed(2) }), null);
+  assert.equal(asSessionDelta(rowFromResult({ job: "role-x", result: resumed(2) }), first), null);
+});
+
+test("fork-cost-record diffs a resumed session against the ledger and leaves other sessions alone", () => {
+  const dir = tmp();
+  const ledger = path.join(dir, "ledger.ndjson");
+  const env = { ...process.env, JORI_FORK_COST_LEDGER: ledger, JORI_CLAUDE_PROJECTS_DIR: dir };
+  const cli = path.join(ROOT, "bin/fork-cost-record");
+  const out = path.join(dir, "out.json");
+  const run = (job, result) => {
+    fs.writeFileSync(out, JSON.stringify(result));
+    execFileSync(process.execPath, [cli, job, out], { env });
+  };
+  try {
+    run("role-x", resumed(1));
+    run("other-job", { ...ENVELOPE, session_id: "other000-0000-0000-0000-000000000000", total_cost_usd: 7 });
+    run("role-x", resumed(3));
+    run("role-x", resumed(3)); // a duplicate record: no row
+    run("role-x", resumed(6));
+    const rows = readRows(ledger);
+    assert.deepEqual(rows.filter((r) => r.source === "role-x").map((r) => r.total_cost_usd), [1, 2, 3]);
+    assert.equal(rows.find((r) => r.source === "other-job").total_cost_usd, 7);
+    assert.equal(rows.length, 4);
+    assert.equal(lastSessionRow("resume00-0000-0000-0000-000000000000", ledger).session_cumulative_cost_usd, 6);
+    assert.equal(lastSessionRow("nosuch", ledger), null);
+    assert.equal(lastSessionRow(null, ledger), null);
+    assert.equal(lastSessionRow("x", path.join(dir, "missing.ndjson")), null);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});

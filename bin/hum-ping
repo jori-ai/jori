@@ -12,6 +12,10 @@
 // `jori hum feedback` calls can't clobber the new row via read-modify-
 // write on the same file.
 //
+// Which conversation: hum is the coordinator's job, but each ping is sent as the
+// team member whose area it is about (bin/ping-route, see "Which team member's
+// conversation" below), so a stock move lands with the finance member.
+//
 // Usage:
 //   hum-ping --ping-id <id> --lane <lane> --score <num> [--findings <json>]
 //            [--suppress-hook] [--no-push] [--push-body <text>]
@@ -530,6 +534,31 @@ for (const url of mediaUrls(headlineMedia)) sendArgs.push("--media", url);
 // A location question rides as a tappable card (ChoicePrompt subject + options).
 if (headlineMedia && headlineMedia.choice) sendArgs.push("--choices-json", JSON.stringify(headlineMedia.choice));
 
+// ─── Which team member's conversation it belongs in ─────────────────────
+//
+// Hum is the coordinator's job, but a ping about money belongs with the member
+// who owns money, a ping about a trip with the one who owns trips. bin/ping-route
+// (lib/ping-route.mjs) decides: Jev site `ping-route`, the model ladder below its
+// threshold, never Jev for bank or health content. A member other than the
+// coordinator → `--as-role`: their conversation, signed and titled as theirs.
+// Absent, failing or slow (PING_ROUTE_DEADLINE_MS, 40 s; killed at 45 s), the
+// ping stays with the coordinator, where every hum ping went before. A local
+// explanation (`nearby`) is not routed: it is the coordinator's (where the user
+// is) and is worth something only while they are still standing there.
+let routedRole = null;
+const ROUTE_BIN = process.env.JORI_PING_ROUTE_BIN || installTools("bin/ping-route");
+if (!isLocalHistoryPing && fs.existsSync(ROUTE_BIN)) {
+  const routeArgs = ["--lane", lane, "--intent", sendIntent, "--ping-id", pingId];
+  if (fs.existsSync(humContextFile)) routeArgs.push("--hum-context", humContextFile);
+  if (headlineMedia && headlineMedia.choice) routeArgs.push("--choices");
+  const rr = spawnSync(ROUTE_BIN, routeArgs, { input: message, encoding: "utf8", timeout: 45000 });
+  let route = null;
+  try { route = JSON.parse(String(rr.stdout || "").trim().split("\n").pop()); } catch { /* stays with the coordinator */ }
+  if (route && route.role && !route.coordinator) routedRole = String(route.role);
+  console.error(`hum-ping: route → ${routedRole || "coordinator"} (${route ? `${route.used}: ${route.reason || ""}` : `router exit ${rr.status}`})`);
+}
+if (routedRole) sendArgs.push("--as-role", routedRole);
+
 sendArgs.push(message);
 
 const sendResult = spawnSync(SEND_BIN, sendArgs, { encoding: "utf8" });
@@ -632,6 +661,8 @@ const entry = {
 };
 if (messageId) entry.message_id = messageId;
 else entry.capture_id_missing = true;
+// Sent as this team member, in their conversation (bin/ping-route); absent = the coordinator.
+if (routedRole) entry.role = routedRole;
 if (headlineIsRetrospectiveAsk) {
   entry.budget_pool = "question";
   recordQuestionSend({ lane, id: pingId });

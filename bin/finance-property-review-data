@@ -592,7 +592,7 @@ async function main() {
     flag(46, "income-unattributed-history", `${strayOlder.length} earlier booking-platform payment(s) totalling ${usd0(sum(strayOlder, (r) => r.amount))} are also attributed to no property — the same gap, going back to ${strayOlder[strayOlder.length - 1].date}.`);
   }
   for (const f of dep.flags.filter((f) => ["deposit-recon-unbalanced", "deposit-missing"].includes(f.tag))) flag(85, f.tag, f.text);
-  // A transfer that fits two sets of tenants: none of them is called missing, so say it is in question rather than say nothing.
+  // A row on the deposit account the hub has not attributed: say so, to be answered in the hub.
   for (const f of dep.flags.filter((f) => f.tag === "deposit-ambiguous")) flag(f.priority, f.tag, f.text);
   if (ownerUseError) {
     flag(60, "owner-use-unavailable", `The owner-stay adjustment could not run (${ownerUseError}), so ${properties.filter((r) => r.owner_use).map((r) => r.name).join(" and ")} are shown as the ledger booked them, including your own nights.`);

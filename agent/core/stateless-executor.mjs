@@ -29,6 +29,8 @@
 import { spawn as nodeSpawn } from "node:child_process";
 import { MODELS } from "../../lib/models.cjs";
 import os from "node:os";
+import { createRequire } from "node:module";
+const { modelEnv } = createRequire(import.meta.url)("../../lib/agent-env.cjs");
 
 function resolveClaudeBin(claudeBin) {
   if (Array.isArray(claudeBin)) return claudeBin;
@@ -82,7 +84,9 @@ export function parseClaudeJson(stdout) {
       : typeof obj.text === "string" ? obj.text
       : "";
     const usage = obj.usage || (obj.total_cost_usd != null ? { total_cost_usd: obj.total_cost_usd } : null);
-    return { text: text.trim(), usage };
+    // The run's cost is top-level in the envelope, not inside usage; callers that
+    // keep a cost ledger read it here (added only when present).
+    return obj.total_cost_usd != null ? { text: text.trim(), usage, cost_usd: obj.total_cost_usd } : { text: text.trim(), usage };
   } catch {
     return { text: raw, usage: null };
   }
@@ -152,9 +156,9 @@ export function makeStatelessExecutor({
         if (toks.length) args.push("--allowedTools", ...toks);
       }
 
-      // Max-only invariant: never let the child see an API key.
-      const env = { ...process.env };
-      delete env.ANTHROPIC_API_KEY;
+      // Max-only invariant (no API key), and no .env secrets once
+      // "model-calls" is locked down (lib/agent-env.cjs modelEnv).
+      const env = modelEnv();
 
       let child, out = "", done = false;
       const finish = (stdout) => {

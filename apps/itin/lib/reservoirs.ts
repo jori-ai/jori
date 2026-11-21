@@ -23,6 +23,17 @@ export type {
 export { visible } from "./reservoir-entry";
 
 import type { ReservoirStructured } from "./reservoir-entry";
+import { resolveStays, ribbonItems, landingArea } from "./trip-stays.mjs";
+
+export type RibbonItem = {
+  key: string;
+  area: string;
+  label: string;
+  start: string | null;
+  end: string | null;
+  hasGuide: boolean;
+  past: boolean;
+};
 
 export type DateRange = { start?: string; end?: string; from?: string; to?: string };
 
@@ -56,38 +67,54 @@ export function formatRange(r: DateRange | null | undefined): string | null {
   return end && end !== start ? `${md(start)}-${md(end)}` : md(start);
 }
 
-/** The leg to open by default: the one whose dates contain today, else the
- *  nearest upcoming leg, else the most recent past leg, else the first.
- *
- *  `areas` is assumed sorted by visit order (ascending start) — the order
- *  listReservoirs returns — so the first future match is the closest one and
- *  the last dated entry is the most recent past.
- *
- *  "Today" is resolved in the site's display zone (SITE_TZ — the user's home
- *  zone, UTC when unset). Legs span many days, so a few hours of
- *  timezone skew at midnight never changes which leg is current; picking a
- *  destination-local zone would be more precise but it isn't stored per area. */
-export function defaultArea(areas: ReservoirSummary[]): string | null {
-  if (!areas.length) return null;
-  const today = new Intl.DateTimeFormat("en-CA", { timeZone: SITE_TZ }).format(new Date());
-  const dated = areas.filter((a) => rangeStart(a.date_range));
+/** A ribbon item's dates: "12/5-12/13", "1/14-" when open-ended. */
+export function formatItemRange(it: { start: string | null; end: string | null }): string | null {
+  if (!it.start) return null;
+  if (it.end == null) return `${formatRange({ start: it.start })}-`;
+  return formatRange({ start: it.start, end: it.end });
+}
 
-  // A leg's checkout day is the next leg's check-in day, so both can contain
-  // today. Keep the LAST match (dated is ascending by start) so on a transition
-  // day you land on the leg you're arriving into, not the one you're leaving.
-  let current: ReservoirSummary | undefined;
-  for (const a of dated) {
-    const s = rangeStart(a.date_range)!;
-    const e = rangeEnd(a.date_range) || s;
-    if (s <= today && today <= e) current = a;
-  }
-  if (current) return current.area;
+/** The area to open by default: the stay under way today (on a changeover
+ *  day, the one being arrived into), else the next one, else the most recent —
+ *  preferring stays that have a guide. Dates come from the travel timeline (see
+ *  listRibbon), "today" from the site's display zone (SITE_TZ). */
+export async function defaultArea(): Promise<string | null> {
+  const { items, today } = await listRibbon();
+  return landingArea(items, today);
+}
 
-  const upcoming = dated.find((a) => rangeStart(a.date_range)! > today);
-  if (upcoming) return upcoming.area;
+/** Today's date (YYYY-MM-DD) in the site's display zone. */
+export function siteToday(): string {
+  return new Intl.DateTimeFormat("en-CA", { timeZone: SITE_TZ }).format(new Date());
+}
 
-  if (dated.length) return dated[dated.length - 1].area; // all past → most recent
-  return areas[0].area; // nothing dated → first
+export type TimelineSegment = {
+  metro: string;
+  source: string | null;
+  arrive_at: string;
+  depart_at: string | null;
+};
+
+/** The travel timeline (travel_segments) — the actual dates of travel. Read
+ *  live on every page so a re-booked leg shows at once, not after the nightly
+ *  date sync. Allowlisted users only (RLS, system/migrations/0192). Empty when
+ *  unreadable, so the ribbon falls back to each guide's stored dates. */
+export async function listTimeline(): Promise<TimelineSegment[]> {
+  const supabase = await createClient();
+  const { data } = await supabase
+    .from("travel_segments")
+    .select("metro,source,arrive_at,depart_at")
+    .order("arrive_at", { ascending: true });
+  return (data as TimelineSegment[]) ?? [];
+}
+
+/** The location ribbon: every stay on the timeline (each matched to its guide)
+ *  plus the guides the timeline doesn't cover, in date order. */
+export async function listRibbon(): Promise<{ items: RibbonItem[]; today: string }> {
+  const [segments, guides] = await Promise.all([listTimeline(), listReservoirs()]);
+  const today = siteToday();
+  const stays = resolveStays(segments, { tz: SITE_TZ });
+  return { items: ribbonItems(stays, guides, today) as RibbonItem[], today };
 }
 
 export async function listReservoirs(): Promise<ReservoirSummary[]> {

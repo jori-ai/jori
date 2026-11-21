@@ -87,7 +87,9 @@ final class ChatViewModel: ObservableObject {
     @Published private(set) var notPickedUp: Set<UUID> = []
 
     private static let draftKey = Install.key("messageDraft")
-    private static let conversationKey = Install.key("currentConversation")
+    /// The conversation on screen, kept so the app reopens in it (ContentView
+    /// reads it too, to reopen the iPhone inside it rather than on the list).
+    static let conversationKey = Install.key("currentConversation")
 
     private let supabase: SupabaseClient
     private let cloudBackup = CloudBackup.shared
@@ -96,6 +98,8 @@ final class ChatViewModel: ObservableObject {
     private var commandsChannel: RealtimeChannelV2?
     private var reconnectTask: Task<Void, Never>?
     private var catchUpTimer: Task<Void, Never>?
+    /// What `backupToCloud` last wrote, so an unchanged conversation isn't rewritten.
+    private var lastCloudBackup: [Message] = []
     private var staleRetryTask: Task<Void, Never>?
     private var isLoadingMessages = false
     private let locationManager = LocationManager.shared
@@ -176,7 +180,10 @@ final class ChatViewModel: ObservableObject {
                                                                                                              // in a LazyVStack blows up scroll performance (each bubble runs
                                                                                                              // MarkdownUI), and cache eviction already bounds persistent storage.
                                                                                                              // Older history still reachable via the "Load older" button.
-            let hasCache = !store.loadAll(conversation: channel).isEmpty
+            // Cheap on purpose: this runs every 30 s on the main thread, and
+            // `loadAll` faulted in and decoded every cached row just to ask.
+            let hasCache = (!messages.isEmpty && messages.allSatisfy { $0.conversationId == channel })
+                || store.hasRows(conversation: channel)
             let response: [Message]
             if hasCache {
                 let newestFirst: [Message] = try await query
@@ -828,7 +835,13 @@ final class ChatViewModel: ObservableObject {
     /// overwrote it with System rows.
     private func backupToCloud() {
         guard currentConversation == ConversationID.coordinator else { return }
-        let snapshot = self.messages.filter { $0.conversationId == ConversationID.coordinator }
+        let snapshot = Array(self.messages.filter { $0.conversationId == ConversationID.coordinator }
+            .suffix(CloudBackup.maxMessages))
+        // The catch-up timer lands here every 30 s; most of the time nothing
+        // changed, and rewriting the iCloud key-value store each time was
+        // steady disk traffic for no reason.
+        guard snapshot != lastCloudBackup else { return }
+        lastCloudBackup = snapshot
         Task.detached(priority: .utility) {
             CloudBackup.shared.backup(messages: snapshot)
         }

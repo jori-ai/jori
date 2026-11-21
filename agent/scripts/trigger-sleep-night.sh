@@ -1,8 +1,9 @@
 #!/bin/bash
 # sleep-night: combine the phone's last lock / first unlock with the Apple
 # Watch's sleep stages into sleep_nights, and refresh
-# data/sleep-night-state.json for `jori activity` (hum's quiet-hours
-# gate). Saves the current night and the one before it, because the Watch's
+# data/sleep-night-state.json, including `asleep_now`: the live reading
+# every "may Jori ping now?" gate asks instead of the clock
+# (lib/sleep-night.js sleepSignal / bin/sleep-night --gate). Saves the current night and the one before it, because the Watch's
 # batch can land hours after waking. Direct local script — no agent, no API.
 # Design: lib/sleep-night.js. Kill switch: data/.sleep-night-off.
 source "$(dirname "$0")/lib/root.sh"

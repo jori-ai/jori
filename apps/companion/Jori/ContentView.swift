@@ -39,6 +39,8 @@ private func attachmentContentType(forExtension ext: String) -> String {
 
 struct ContentView: View {
     var onSignOut: () -> Void = {}
+    /// Unpair from this Jori (a paired public app only) and scan another.
+    var onUseAnotherJori: () -> Void = {}
 
     @StateObject private var viewModel = ChatViewModel()
     /// The team and its conversations (ChannelBadges.swift).
@@ -68,10 +70,29 @@ struct ContentView: View {
     private static let renderPage = 60
     @State private var scrollToBottomTick: Int = 0
     @State private var confirmSignOut = false
-    @State private var memoryMode = false
+    @State private var confirmUseAnotherJori = false
+    /// Memory on screen instead of a conversation. Kept, with the
+    /// conversation (ChatViewModel) and the improvement cards, so the app
+    /// reopens on the screen it was left on.
+    @AppStorage(ContentView.memoryOpenKey) private var memoryMode = false
+    private static let memoryOpenKey = Install.key("memoryOpen")
     @StateObject private var memoryState = WebViewState()
     @StateObject private var commandCenter = CommandCenter()
-    @State private var columnVisibility: NavigationSplitViewVisibility = .automatic
+    @State private var columnVisibility: NavigationSplitViewVisibility
+    #if os(macOS)
+    /// The user folded the sidebar to the rail themselves (not by narrowing
+    /// the window), so it reopens folded.
+    @AppStorage(ContentView.sidebarFoldedKey) private var sidebarFolded = false
+    private static let sidebarFoldedKey = Install.key("sidebarFolded")
+    /// How much the window shrank when the user hid the sidebar themselves, so opening
+    /// it again gives that width back — also after a relaunch. 0 when nothing was taken.
+    @AppStorage(Install.key("windowShrunkForSidebar")) private var windowShrunkForSidebar: Double = 0
+    #endif
+    #if os(iOS)
+    /// iPhone: the app was left inside a conversation (or Memory), not on the list.
+    @AppStorage(ContentView.phoneInDetailKey) private var phoneInDetail = false
+    private static let phoneInDetailKey = Install.key("phoneInDetail")
+    #endif
     /// True when the sidebar was hidden by narrowing the window, so widening
     /// it again brings the sidebar back. A sidebar the user hid themselves stays hidden.
     @State private var sidebarAutoHidden = false
@@ -90,9 +111,6 @@ struct ContentView: View {
     /// The sidebar column's width while open — the user can drag it — so hiding it
     /// takes exactly that much off the window.
     @State private var sidebarColumnWidth: CGFloat = 230
-    /// How much the window shrank when the user hid the sidebar themselves, so opening
-    /// it again gives that width back. nil when nothing was taken.
-    @State private var windowShrunkForSidebar: CGFloat?
     #endif
     /// True while the conversation is scrolled away from the latest message
     /// (iOS 18 / macOS 15 and later — older systems never report it, and keep
@@ -104,15 +122,52 @@ struct ContentView: View {
     /// those out — it exists for questions the stream has scrolled away —
     /// and disappears when every open question is already in view.
     @State private var onScreenQuestionIds: Set<UUID> = []
+    /// The question card drawn open in the feed. Every other choice or
+    /// decision card is minimized to its question (and the answer, once given)
+    /// so a run of questions does not take over the stream; tapping one focuses
+    /// it (the owner, 2026-11-15).
+    @State private var focusedQuestionId: UUID?
+    /// A question opened from the tray's Answer button, shown with its choices
+    /// in a sheet, the same card as in the feed.
+    @State private var answeringQuestion: Message?
+    /// Questions whose answer is on its way to the server. The reply row only
+    /// lands in `messages` after the insert returns, so without this the
+    /// question would pop back into the tray for that round trip. A failed
+    /// send clears it, and the question returns to the tray.
+    @State private var sendingAnswerIds: Set<UUID> = []
     @State private var isDropTargeted = false
     /// iPhone: the conversation list is the home screen; a conversation (or
     /// Memory) is pushed on top of it.
-    @State private var phonePath: [Destination] = []
+    @State private var phonePath: [Destination]
     @State private var showNewConversation = false
     @State private var showConversationInfo = false
-    /// In the software engineer's conversation: the improvement cards instead
-    /// of the messages (the old Improvements channel lives there now).
-    @State private var showImprovementCards = false
+    /// The approval rows behind the improvement cards in the feed (each card is
+    /// a message, drawn like a question; there is no Improvements tab).
+    @StateObject private var improvementCards = ImprovementCards()
+
+    init(onSignOut: @escaping () -> Void = {}, onUseAnotherJori: @escaping () -> Void = {}) {
+        self.onSignOut = onSignOut
+        self.onUseAnotherJori = onUseAnotherJori
+        let defaults = UserDefaults.standard
+        // Reopen where the app was left, set before the first frame so
+        // nothing visibly pushes or folds on launch.
+        #if os(macOS)
+        _columnVisibility = State(initialValue: defaults.bool(forKey: Self.sidebarFoldedKey) ? .detailOnly : .automatic)
+        #else
+        _columnVisibility = State(initialValue: .automatic)
+        #endif
+        #if os(iOS)
+        if defaults.bool(forKey: Self.phoneInDetailKey) {
+            let conversation = defaults.string(forKey: ChatViewModel.conversationKey) ?? ConversationID.coordinator
+            let screen: Destination = defaults.bool(forKey: Self.memoryOpenKey) ? .memory : .conversation(conversation)
+            _phonePath = State(initialValue: [screen])
+        } else {
+            _phonePath = State(initialValue: [])
+        }
+        #else
+        _phonePath = State(initialValue: [])
+        #endif
+    }
 
     // Trade-approval second factor (only when the build sets a trading app)
     @State private var showApprovalPairing = false
@@ -128,6 +183,8 @@ struct ContentView: View {
     @State private var pendingPurchase: PurchaseApproval.Ref?
     // Face-ID approval for plugin actions (ActionApproval.swift)
     @State private var pendingAction: ActionApproval.Ref?
+    // The shop browser (ShopBrowserView.swift), opened from a chat link.
+    @State private var shopBrowserLink: ShopBrowserLink?
 
     /// Wiki HTTP browser served from the host (Tailscale / home LAN), from
     /// the build's JORI_WIKI_URL. Nil: the Memory tab explains it is not set up.
@@ -139,14 +196,27 @@ struct ContentView: View {
         memoryMode ? .memory : .conversation(viewModel.currentConversation)
     }
 
-    /// The software engineer's conversation, where the improvement cards live.
-    private var isImprovementsConversation: Bool {
-        ConversationID.roleId(viewModel.currentConversation) == TeamStore.improvementsRole
-    }
-
     /// Open a conversation (a notification, a new group, an @mention).
     fileprivate func openConversation(_ id: String) {
         go(.conversation(id))
+    }
+
+    /// The conversation a tapped notification should open: the one its push
+    /// named, else the one its message is stored in.
+    fileprivate func conversation(_ named: String?, of message: UUID) async -> String? {
+        if let named { return named }
+        return await viewModel.conversationOf(message)
+    }
+
+    /// Whether this conversation is the one on screen. On iPhone the list is
+    /// the home screen, so the current conversation is only showing once it
+    /// is pushed; a tap from the list must still open it.
+    fileprivate func isShowing(_ conversation: String) -> Bool {
+        guard !memoryMode, conversation == viewModel.currentConversation else { return false }
+        #if os(iOS)
+        if horizontalSizeClass != .regular { return phonePath == [.conversation(conversation)] }
+        #endif
+        return true
     }
 
     private var destinationBinding: Binding<Destination> {
@@ -166,7 +236,6 @@ struct ContentView: View {
             memoryMode = true
         case .conversation(let id):
             memoryMode = false
-            showImprovementCards = false
             if id != viewModel.currentConversation {
                 viewModel.switchConversation(to: id)
             }
@@ -222,6 +291,14 @@ struct ContentView: View {
                 Button("Sign Out", role: .destructive) { onSignOut() }
                 Button("Cancel", role: .cancel) { }
             }
+            .confirmationDialog("Use another Jori?",
+                                isPresented: $confirmUseAnotherJori,
+                                titleVisibility: .visible) {
+                Button("Sign Out and Scan a New Code", role: .destructive) { onUseAnotherJori() }
+                Button("Cancel", role: .cancel) { }
+            } message: {
+                Text("You'll be signed out of \(Install.displayName) on this device, and its messages are removed from it.")
+            }
             .modifier(lifecycle)
             .modifier(approvals)
     }
@@ -245,19 +322,76 @@ struct ContentView: View {
         #endif
     }
 
+    #if os(macOS)
+    /// The Mac: the sidebar and the conversation side by side in our own
+    /// layout, not a NavigationSplitView. Hiding the sidebar folds it to the
+    /// avatar rail (ConversationRail) and takes the difference off the window
+    /// in the same instant, so the conversation keeps its width and nothing
+    /// slides, re-wraps or blinks. The split view's own collapse animated the
+    /// column away while the rail appeared beside it and the window resized
+    /// on its own clock: a gap, then a jump, then a redraw.
+    private var splitNavigation: some View {
+        HStack(spacing: 0) {
+            if isSidebarHidden {
+                ConversationRail(team: team, chat: viewModel, inMemory: memoryMode,
+                                 open: { go(.conversation($0)) },
+                                 onDeleted: { gone in
+                                     if viewModel.currentConversation == gone { go(.conversation(team.coordinatorConversation)) }
+                                 })
+            } else {
+                sidebar
+                    .scrollContentBackground(.hidden)
+                    .background(.bar)
+                    .frame(width: Self.sidebarWidth)
+            }
+            Divider()
+            detail
+                .frame(minWidth: 0, maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        }
+        .toolbar {
+            ToolbarItem(placement: .navigation) {
+                Button { columnVisibility = isSidebarHidden ? .all : .detailOnly } label: {
+                    Label(isSidebarHidden ? "Show Sidebar" : "Hide Sidebar", systemImage: "sidebar.left")
+                }
+                .help(isSidebarHidden ? "Show the sidebar (⌃⌘S)" : "Fold the sidebar to avatars (⌃⌘S)")
+                .keyboardShortcut("s", modifiers: [.control, .command])
+            }
+        }
+        // The Mac reads the WINDOW's width from its resize notifications.
+        .background(WindowReader(box: hostWindow) { window in windowResized(to: window.frame.width) })
+        .onReceive(NotificationCenter.default.publisher(for: NSWindow.didResizeNotification)) { note in
+            guard let window = note.object as? NSWindow, window === hostWindow.window else { return }
+            windowResized(to: window.frame.width)
+        }
+        .onChange(of: columnVisibility) { old, new in
+            // Only a fold the user made reopens folded; narrowing the window
+            // folds it again by itself on the next launch.
+            sidebarFolded = new == .detailOnly && !sidebarAutoHidden
+            if new == .detailOnly {
+                // The user folded the sidebar: the window gives up the
+                // sidebar's width minus the rail's, so the conversation keeps
+                // its width. Not when narrowing the window folded it — the
+                // user is already sizing the window themselves.
+                if old != .detailOnly, !sidebarAutoHidden { shrinkWindowForHiddenSidebar() }
+                return
+            }
+            // Open again, by whatever route: a later fold is their own.
+            sidebarAutoHidden = false
+            guard old == .detailOnly, let now = currentWindow?.frame else { return }
+            // Give back what folding took; a narrow window gets the
+            // sidebar's room regardless, so the conversation isn't squeezed.
+            let given = CGFloat(windowShrunkForSidebar)
+            windowShrunkForSidebar = 0
+            let needed = now.width < Self.sidebarRestoreWidth ? Self.sidebarWidth - Self.railWidth : 0
+            let grow = max(given, needed)
+            if grow > 0 { growWindowForSidebar(from: now, by: grow) }
+        }
+    }
+    #else
     private var splitNavigation: some View {
         NavigationSplitView(columnVisibility: $columnVisibility) {
             sidebar
                 .navigationSplitViewColumnWidth(min: 200, ideal: Self.sidebarWidth, max: 320)
-                #if os(macOS)
-                .background {
-                    GeometryReader { geo in
-                        Color.clear
-                            .onAppear { noteSidebarWidth(geo.size.width) }
-                            .onChange(of: geo.size.width) { _, width in noteSidebarWidth(width) }
-                    }
-                }
-                #endif
         } detail: {
             detail
                 .frame(width: detailHeldWidth, alignment: .leading)
@@ -272,49 +406,6 @@ struct ContentView: View {
                 }
         }
         .onChange(of: columnVisibility) { _, _ in holdDetailWidthDuringSidebarAnimation() }
-        #if os(macOS)
-        // The Mac reads the WINDOW's width from its resize notifications.
-        // Both SwiftUI ways of measuring broke the split view there: a
-        // reader attached as a modifier measured the sidebar column (so the
-        // sidebar re-hid every time it opened), and a reader wrapping the
-        // split view collapsed it into a narrow centred column.
-        .background(WindowReader(box: hostWindow) { window in windowResized(to: window.frame.width) })
-        .onReceive(NotificationCenter.default.publisher(for: NSWindow.didResizeNotification)) { note in
-            guard let window = note.object as? NSWindow, window === hostWindow.window else { return }
-            windowResized(to: window.frame.width)
-        }
-        .onChange(of: columnVisibility) { old, new in
-            if new == .detailOnly {
-                // The user hid the sidebar: the window becomes just the
-                // conversation, instead of the conversation stretching into
-                // the sidebar's space. Not when narrowing the window hid it —
-                // the user is already sizing the window themselves.
-                if old != .detailOnly, !sidebarAutoHidden { shrinkWindowForHiddenSidebar() }
-                return
-            }
-            // Open again, by whatever route: a later hide is their own.
-            sidebarAutoHidden = false
-            // The user opened the sidebar: grow the window by the sidebar, from where it stood while
-            // hidden, instead of squeezing the conversation. The frame is
-            // remembered from before, because AppKit may already have
-            // widened the window to the right by the time this runs.
-            // (The automatic restore only happens once the window is
-            // already wide, so it never lands here.)
-            // Grow from where the window is NOW (AppKit hasn't resized it yet
-            // when this runs): a frame remembered at hide time goes stale as
-            // soon as the user moves the window, and growing from it threw the
-            // window back to where it used to be.
-            guard old == .detailOnly, let now = currentWindow?.frame else { return }
-            // Give back what hiding took; and a narrow window gets the
-            // sidebar's full width regardless, so the conversation isn't
-            // squeezed (hiding at the minimum width takes less than that).
-            let given = windowShrunkForSidebar ?? 0
-            windowShrunkForSidebar = nil
-            let needed = now.width < Self.sidebarRestoreWidth ? sidebarColumnWidth : 0
-            let grow = max(given, needed)
-            if grow > 0 { growWindowForSidebar(from: now, by: grow) }
-        }
-        #else
         .background {
             GeometryReader { geo in
                 Color.clear
@@ -322,8 +413,8 @@ struct ContentView: View {
                     .onChange(of: geo.size.width) { _, width in fitSidebar(to: width) }
             }
         }
-        #endif
     }
+    #endif
 
     /// Hold the conversation at its current width until the sidebar (and, on
     /// the Mac, the window: its resize is re-applied at 0.4 s) has settled.
@@ -358,15 +449,9 @@ struct ContentView: View {
         var frame = hidden
         frame.size.width += width
         if frame.maxX > visible.maxX { frame.size.width = max(hidden.width, visible.maxX - frame.minX) }
-        // Instant, not animated: an animated window resize ran on AppKit's
-        // own clock beside the sidebar's slide (plus a corrective re-apply at
-        // 0.4 s), and the two motions fought, so the conversation jittered.
-        // Now the slide is the only motion; the conversation's width is held
-        // meanwhile (holdDetailWidthDuringSidebarAnimation).
+        // Instant and in the same pass as the sidebar's swap, so the
+        // conversation never changes width on screen.
         window.setFrame(frame, display: true, animate: false)
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.45) {
-            if window.frame != frame { window.setFrame(frame, display: true, animate: false) }
-        }
     }
 
     /// The reverse of `growWindowForSidebar`: take the sidebar's width off the
@@ -377,15 +462,14 @@ struct ContentView: View {
         guard let window = currentWindow else { return }
         var frame = window.frame
         let minWidth = max(window.minSize.width, 480)
-        let target = max(minWidth, frame.width - sidebarColumnWidth)
+        // The rail stays, so only the rest of the sidebar's width comes off.
+        let target = max(minWidth, frame.width - (Self.sidebarWidth - Self.railWidth))
         let taken = frame.width - target
         guard taken > 0 else { return }
         frame.size.width = target
-        windowShrunkForSidebar = taken
-        // Instant, after the sidebar has slid away (see growWindowForSidebar).
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
-            window.setFrame(frame, display: true, animate: false)
-        }
+        windowShrunkForSidebar = Double(taken)
+        // Instant, in the same pass as the swap (see growWindowForSidebar).
+        window.setFrame(frame, display: true, animate: false)
     }
 
     /// Only while the sidebar is open: during the hide animation the column
@@ -400,6 +484,8 @@ struct ContentView: View {
     /// it folds away; it returns a little above it (the gap keeps a resize
     /// hovering at the edge from flickering it in and out).
     private static let sidebarWidth: CGFloat = 230
+    /// The folded sidebar (ConversationRail) that stays when it is hidden.
+    private static let railWidth: CGFloat = ConversationRail.width + 1
     private static let sidebarCollapseWidth: CGFloat = 720
     private static let sidebarRestoreWidth: CGFloat = 760
 
@@ -412,12 +498,18 @@ struct ContentView: View {
         let previous = lastMeasuredWidth
         lastMeasuredWidth = width
         let wasNarrow = previous.map { $0 < Self.sidebarCollapseWidth } ?? false
+        #if os(macOS)
+        let fold: Animation? = nil   // the Mac swaps sidebar and rail in place
+        #else
+        let fold: Animation? = .snappy(duration: 0.3)
+        #endif
         if width < Self.sidebarCollapseWidth, !wasNarrow {
             guard !isSidebarHidden else { return }
-            withAnimation(.snappy(duration: 0.3)) { columnVisibility = .detailOnly }
+            // Set before the change, so the window isn't shrunk for it.
             sidebarAutoHidden = true
+            withAnimation(fold) { columnVisibility = .detailOnly }
         } else if width >= Self.sidebarRestoreWidth, sidebarAutoHidden {
-            withAnimation(.snappy(duration: 0.3)) { columnVisibility = .all }
+            withAnimation(fold) { columnVisibility = .all }
             sidebarAutoHidden = false
         }
     }
@@ -434,8 +526,19 @@ struct ContentView: View {
 
     private var sidebar: some View {
         List(selection: Binding<Destination?>(get: { destination }, set: { if let d = $0 { go(d) } })) {
+            if !team.pinnedConversations.isEmpty {
+                PinnedConversationsGrid(team: team,
+                                        selected: memoryMode ? nil : viewModel.currentConversation,
+                                        open: { go(.conversation($0)) },
+                                        onDeleted: { gone in
+                                            if viewModel.currentConversation == gone { go(.conversation(team.coordinatorConversation)) }
+                                        })
+                    .listRowSeparator(.hidden)
+                    .listRowBackground(Color.clear)
+                    .selectionDisabled()
+            }
             Section {
-                ForEach(team.visibleConversations) { conversation in
+                ForEach(team.unpinnedConversations) { conversation in
                     ConversationRowView(conversation: conversation, team: team)
                         .tag(Destination.conversation(conversation.id))
                         .modifier(ConversationDeleteActions(conversation: conversation, team: team) { gone in
@@ -454,10 +557,13 @@ struct ContentView: View {
                     .accessibilityLabel("New conversation")
                 }
             }
+            #if os(iOS)
+            // On the Mac, Memory is in the Go menu (⌘2), not the sidebar.
             Section("Library") {
                 Label("Memory", systemImage: "book.closed")
                     .tag(Destination.memory)
             }
+            #endif
             Section("Approvals") {
                 if TradeApproval.isEnabled {
                     Button { showApprovalPairing = true } label: {
@@ -484,13 +590,20 @@ struct ContentView: View {
                 #endif
             }
             Section {
+                if PairingStore.current != nil {
+                    Button { confirmUseAnotherJori = true } label: {
+                        Label("Use another Jori", systemImage: "qrcode.viewfinder")
+                    }
+                }
                 Button(role: .destructive) { confirmSignOut = true } label: {
                     Label("Sign Out", systemImage: "rectangle.portrait.and.arrow.right")
                 }
             }
         }
         .listStyle(.sidebar)
+        #if os(iOS)
         .navigationTitle(Install.displayName)
+        #endif
         .sensoryFeedback(.selection, trigger: destination)
     }
 
@@ -499,10 +612,16 @@ struct ContentView: View {
     #if os(iOS)
     private var phoneConversationList: some View {
         List {
-            ForEach(team.visibleConversations) { conversation in
+            if !team.pinnedConversations.isEmpty {
+                PinnedConversationsGrid(team: team, open: { go(.conversation($0)) }, phone: true)
+                    .listRowSeparator(.hidden)
+                    .listRowInsets(EdgeInsets(top: 4, leading: 16, bottom: 8, trailing: 16))
+            }
+            ForEach(team.unpinnedConversations) { conversation in
                 Button { go(.conversation(conversation.id)) } label: {
-                    ConversationRowView(conversation: conversation, team: team)
+                    ConversationRowView(conversation: conversation, team: team, phone: true)
                 }
+                .listRowInsets(EdgeInsets(top: 0, leading: 16, bottom: 0, trailing: 16))
                 .buttonStyle(.plain)
                 .modifier(ConversationDeleteActions(conversation: conversation, team: team))
             }
@@ -511,6 +630,7 @@ struct ContentView: View {
         .refreshable { await team.refresh() }
         // Back on the list, the conversation just left counts its unread again.
         .onChange(of: phonePath) { _, path in
+            phoneInDetail = !path.isEmpty
             let left = team.activeConversation
             team.activeConversation = path.isEmpty ? "" : viewModel.currentConversation
             // Mark the conversation just left read BEFORE recounting, so its
@@ -518,11 +638,10 @@ struct ContentView: View {
             if path.isEmpty { Task { await team.markRead(left); await team.loadSummaries() } }
         }
         .navigationTitle(Install.displayName)
+        // Messages keeps its title small and centred over the pins.
+        .navigationBarTitleDisplayMode(.inline)
         .toolbar {
             ToolbarItem(placement: .topBarLeading) { settingsMenu }
-            ToolbarItem(placement: .topBarTrailing) {
-                Button { go(.memory) } label: { Label("Memory", systemImage: "book.closed") }
-            }
             ToolbarItem(placement: .topBarTrailing) {
                 Button { showNewConversation = true } label: {
                     Label("New conversation", systemImage: "square.and.pencil")
@@ -567,7 +686,9 @@ struct ContentView: View {
     private func sendWithMentions(_ text: String, replyTo threadParent: UUID?) {
         let current = viewModel.currentConversation
         let mentioned = team.mentioned(in: text)
+        if let threadParent { sendingAnswerIds.insert(threadParent) }
         Task {
+            defer { if let threadParent { sendingAnswerIds.remove(threadParent) } }
             var target = current
             var extra: [String: String] = [:]
             if !mentioned.isEmpty {
@@ -606,7 +727,7 @@ struct ContentView: View {
             #else
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             #endif
-            .background(showImprovementCards && isImprovementsConversation && !memoryMode ? JoriTheme.groupedCanvas : JoriTheme.canvas)
+            .background(JoriTheme.canvas)
             .overlay(alignment: .top) { offlineBanner }
             .animation(.snappy(duration: 0.3), value: viewModel.isOffline)
             .navigationTitle(memoryMode ? "Memory" : team.title(of: viewModel.currentConversation))
@@ -618,6 +739,28 @@ struct ContentView: View {
             .modifier(HiddenToolbarTitle())
             #endif
             .toolbar { detailToolbar }
+            .sheet(item: $answeringQuestion) { q in
+                QuestionAnswerSheet(
+                    message: q,
+                    answeredLabel: viewModel.tappedAnswer(for: q.id),
+                    defaultAppliedLabel: viewModel.defaultApplied(for: q.id),
+                    onSelect: { option in
+                        answeringQuestion = nil
+                        if option.opensReply { beginReply(to: q) } else { sendAnswer(option.label, to: q) }
+                    },
+                    onTypeSomething: {
+                        answeringQuestion = nil
+                        beginReply(to: q)
+                    },
+                    onClose: { answeringQuestion = nil }
+                )
+                #if os(iOS)
+                .presentationDetents([.medium, .large])
+                .presentationDragIndicator(.visible)
+                #else
+                .frame(minWidth: 420, idealWidth: 480, minHeight: 360, idealHeight: 480)
+                #endif
+            }
             .sheet(isPresented: $showConversationInfo) {
                 ConversationInfoSheet(team: team, conversationId: viewModel.currentConversation) { ids in
                     Task {
@@ -629,34 +772,29 @@ struct ContentView: View {
                 .frame(minWidth: 420, idealWidth: 460, minHeight: 420, idealHeight: 520)
                 #endif
             }
+            // A shop-browser link (a merchant sign-in, a card field the agent
+            // couldn't finish) opens the host's shop Chrome here, not in a browser.
+            .sheet(item: $shopBrowserLink) { link in
+                ShopBrowserView(link: link.url)
+                #if os(iOS)
+                .presentationDetents([.large])
+                .interactiveDismissDisabled()
+                #endif
+            }
+            .onReceive(NotificationCenter.default.publisher(for: ShopBrowser.openRequest)) { note in
+                if let url = note.object as? URL { shopBrowserLink = ShopBrowserLink(url: url) }
+            }
+            .environment(\.openURL, OpenURLAction { url in
+                guard ShopBrowser.handles(url) else { return .systemAction }
+                ShopBrowser.open(url)
+                return .handled
+            })
     }
 
     @ViewBuilder
     private var detailContent: some View {
         if memoryMode {
             MemoryView(url: Self.memoryWikiURL, state: memoryState)
-        } else if isImprovementsConversation {
-            // The software engineer's conversation holds the improvement cards
-            // (the old Improvements channel) beside the messages.
-            VStack(spacing: 0) {
-                Picker("Show", selection: $showImprovementCards) {
-                    Text("Messages").tag(false)
-                    Text(team.pendingImprovements > 0 ? "Improvements (\(team.pendingImprovements))" : "Improvements").tag(true)
-                }
-                .pickerStyle(.segmented)
-                .padding(.horizontal, 14)
-                .padding(.vertical, 8)
-                if showImprovementCards {
-                    // A card feed, not a chat log — every action lives in the
-                    // card's menu; no input bar, no reactions. "Chat" hands the
-                    // card back to a conversation, where there is a keyboard.
-                    SelfImproveFeedView(onChat: { improvement in
-                        Task { await openImprovementThread(improvement) }
-                    })
-                } else {
-                    chatPane
-                }
-            }
         } else {
             chatPane
         }
@@ -709,6 +847,8 @@ struct ContentView: View {
 
     private var settingsMenu: some View {
         Menu {
+            // Memory lives here on the iPhone (the Go menu, ⌘2, elsewhere).
+            Button { go(.memory) } label: { Label("Memory", systemImage: "book.closed") }
             Section("Approvals") {
                 if TradeApproval.isEnabled {
                     Button { showApprovalPairing = true } label: {
@@ -747,6 +887,11 @@ struct ContentView: View {
             }
             #endif
             Divider()
+            if PairingStore.current != nil {
+                Button { confirmUseAnotherJori = true } label: {
+                    Label("Use another Jori", systemImage: "qrcode.viewfinder")
+                }
+            }
             Button(role: .destructive) { confirmSignOut = true } label: {
                 Label("Sign Out", systemImage: "rectangle.portrait.and.arrow.right")
             }
@@ -780,6 +925,25 @@ struct ContentView: View {
 
     private var chatPane: some View {
         chatMessages
+            // Improvement cards in this conversation read their live approval
+            // row; poll while it is open so Applying → In and running (or →
+            // Didn't go in) shows without leaving.
+            .task(id: viewModel.currentConversation) {
+                while !Task.isCancelled {
+                    let ids = Set(viewModel.messages.compactMap(\.improvementId))
+                    if !ids.isEmpty { await improvementCards.refresh(ids: ids) }
+                    await improvementCards.refreshPending()
+                    try? await Task.sleep(for: .seconds(8))
+                }
+            }
+            .sensoryFeedback(.success, trigger: improvementCards.approvedTick)
+            .alert("Couldn’t complete", isPresented: Binding(
+                get: { improvementCards.errorText != nil }, set: { if !$0 { improvementCards.errorText = nil } })
+            ) {
+                Button("OK") { improvementCards.errorText = nil }
+            } message: {
+                Text(improvementCards.errorText ?? "")
+            }
             .overlay { replyBackdrop }
             .safeAreaInset(edge: .bottom, spacing: 0) { composerStack }
             .overlay { dropOverlay }
@@ -855,9 +1019,15 @@ struct ContentView: View {
 
     @ViewBuilder
     private var messagesListContent: some View {
-        let all = viewModel.messages.filter { !viewModel.isChecklistTick($0) && !viewModel.isQuestionDismissal($0) }
+        // Open questions one after the other: only the first stays in the
+        // stream, the rest wait in the tray (queuedQuestionIds).
+        let queued = queuedQuestionIds
+        let all = viewModel.messages.filter { !viewModel.isChecklistTick($0) && !viewModel.isQuestionDismissal($0) && !queued.contains($0.id) }
         let visible = Array(all.suffix(renderLimit))
-        let layout = BubbleLayout.compute(visible)
+        // Over the whole conversation, not just the drawn window: whether a
+        // reply needs its quote depends on what came just before it.
+        let quoted = BubbleLayout.quotedReplies(all)
+        let layout = BubbleLayout.compute(visible, quoted: quoted)
         let actions = bubbleActions
         // Name the speaker over the first bubble of each run when the
         // conversation has more than one person in it, or the message came
@@ -877,14 +1047,15 @@ struct ContentView: View {
                     thread: thread(for: message,
                                    senderLabel: place.startsGroup && message.isAssistant
                                        && (multi || (message.sender != nil && message.sender != conversationRole))
-                                       ? team.senderLabel(message.sender) : nil),
+                                       ? team.senderLabel(message.sender) : nil,
+                                   showsQuote: quoted.contains(message.id)),
                     isPaletteOpen: activeReactionMessageId == message.id,
                     actions: actions
                 )
                 .equatable()
             }
             .padding(.top, place.startsGroup && place.separator == nil ? 10 : 0)
-            .modifier(OnScreenReader(id: message.id, tracked: viewModel.isOpenQuestion(message), onScreen: $onScreenQuestionIds))
+            .modifier(OnScreenReader(id: message.id, tracked: viewModel.isOpenQuestion(message) || isPendingCard(message), onScreen: $onScreenQuestionIds))
             .id(message.id)
             .zIndex(activeReactionMessageId == message.id ? 1 : 0)
         }
@@ -892,24 +1063,39 @@ struct ContentView: View {
 
     private var bubbleActions: BubbleActions {
         let vm = viewModel
+        let cards = improvementCards
         return BubbleActions(
             reply: { beginReply(to: $0) },
             quoteTap: { quoteJumpTarget = $0 },
             setPalette: { activeReactionMessageId = $0 },
             react: { message, reaction in Task { await vm.setReaction(for: message, to: reaction) } },
-            answer: { label, parent in Task { await vm.sendMessage(label, replyTo: parent) } },
+            answer: { label, parent in
+                // Answered: the card folds back to its question and the answer.
+                if focusedQuestionId == parent { withAnimation(.spring(response: 0.32, dampingFraction: 0.85)) { focusedQuestionId = nil } }
+                Task { await vm.sendMessage(label, replyTo: parent) }
+            },
+            focus: { id in
+                withAnimation(.spring(response: 0.32, dampingFraction: 0.85)) { focusedQuestionId = id }
+                quoteJumpTarget = id
+            },
             toggleChecklist: { label, on, id in vm.toggleChecklistItem(label, checked: on, on: id) },
             resolveParent: { vm.resolveQuotedParent($0) },
             dismiss: { vm.dismissQuestion($0) },
-            gradeGate: { id, grade, note in Task { await team.gradeGate(id, grade: grade, note: note) } }
+            improvement: { action, item in
+                Task { await cards.perform(action, item) }
+            }
         )
     }
 
-    private func thread(for m: Message, senderLabel: String? = nil) -> BubbleThread {
+    private func thread(for m: Message, senderLabel: String? = nil, showsQuote: Bool = false) -> BubbleThread {
         var t = BubbleThread()
         t.senderLabel = senderLabel
-        if m.isAssistant { t.gate = team.gateReviews[m.id] }
-        if let parent = m.replyTo { t.quotedParent = viewModel.quotedParent(parent) }
+        t.showsQuote = showsQuote
+        if showsQuote, let parent = m.replyTo { t.quotedParent = viewModel.quotedParent(parent) }
+        if let id = m.improvementId {
+            t.improvement = improvementCards.byId[id]
+            t.improvementWorking = improvementCards.workingId == id
+        }
         if m.isUser {
             t.notPickedUp = viewModel.isNotPickedUp(m.id)
             return t
@@ -922,6 +1108,7 @@ struct ContentView: View {
         if m.metadata?[ChoicePrompt.metadataKey] != nil {
             t.answer = viewModel.tappedAnswer(for: m.id)
             t.defaultApplied = viewModel.defaultApplied(for: m.id)
+            t.isFocused = focusedQuestionId == m.id
         }
         return t
     }
@@ -998,14 +1185,15 @@ struct ContentView: View {
                     pendingScrollId = nil
                     return
                 }
-                // Consume any message ID stashed while the app was launching / locked
-                if let pending = AppDelegate.pendingMessageId {
-                    pendingScrollId = pending
+                // A message stashed by a tap while the app was launching: take it
+                // only if it is in this conversation. Otherwise leave it for the
+                // root, which opens the conversation it belongs to (taking it
+                // here kept a Mac or iPad on whatever conversation it reopened).
+                if let pending = AppDelegate.pendingMessageId,
+                   viewModel.messages.contains(where: { $0.id == pending }) {
                     AppDelegate.pendingMessageId = nil
-                    if viewModel.messages.contains(where: { $0.id == pending }) {
-                        reveal(pending, proxy: proxy)
-                        pendingScrollId = nil
-                    }
+                    NotificationTap.pendingConversation = nil
+                    reveal(pending, proxy: proxy)
                     return
                 }
                 // LazyVStack + defaultScrollAnchor(.bottom) is unreliable on
@@ -1078,33 +1266,112 @@ struct ContentView: View {
                 }
                 .padding(.horizontal, 14)
             }
-            Group {
+            // The tray steps aside while a question is being answered (the
+            // reply composer or the choice sheet is open) and comes back if the
+            // answer is abandoned; an answered question leaves it for good (the
+            // owner, 2026-11-21).
+            if !isComposingAnswer {
                 OpenQuestionsTray(
                     questions: trayQuestions,
-                    reveal: { quoteJumpTarget = $0.id },
-                    answer: { beginReply(to: $0) },
+                    reveal: { q in
+                        // A question waiting its turn is not in the stream: open its card here.
+                        if queuedQuestionIds.contains(q.id) {
+                            if let prompt = ChoicePrompt.from(metadata: q.metadata), !prompt.options.isEmpty {
+                                answeringQuestion = q
+                            } else {
+                                beginReply(to: q)
+                            }
+                            return
+                        }
+                        // Jump to the card, drawn open with its choices.
+                        withAnimation(.spring(response: 0.32, dampingFraction: 0.85)) { focusedQuestionId = q.id }
+                        quoteJumpTarget = q.id
+                    },
+                    answer: { q in
+                        // A question with choices opens as its card, choices and
+                        // all, the same as in the feed; one without is a typed reply.
+                        if let prompt = ChoicePrompt.from(metadata: q.metadata), !prompt.options.isEmpty {
+                            answeringQuestion = q
+                        } else {
+                            beginReply(to: q)
+                        }
+                    },
                     dismiss: { q in
                         viewModel.dismissQuestion(q)
                         Task { try? await Task.sleep(for: .seconds(1)); await team.loadSummaries() }
                     },
-                    select: { option, q in Task { await viewModel.sendMessage(option.label, replyTo: q.id); await team.loadSummaries() } }
+                    select: { option, q in
+                        if option.opensReply { beginReply(to: q) } else { sendAnswer(option.label, to: q) }
+                    },
+                    improvement: { m in m.improvementId.flatMap { improvementCards.byId[$0] } },
+                    act: { action, item in
+                        let cards = improvementCards
+                        Task { await cards.perform(action, item); await team.loadSummaries() }
+                    }
                 )
                 .padding(.horizontal, 14)
+                .transition(.move(edge: .bottom).combined(with: .opacity))
             }
             inputBar
         }
         .animation(.spring(response: 0.35, dampingFraction: 0.8), value: viewModel.isWaitingForResponse)
         .animation(.spring(response: 0.35, dampingFraction: 0.8), value: isScrolledUp)
+        .animation(.spring(response: 0.32, dampingFraction: 0.86), value: isComposingAnswer)
+    }
+
+    /// A reply is being written, or a question's choice sheet is up.
+    private var isComposingAnswer: Bool {
+        replyTarget != nil || answeringQuestion != nil
+    }
+
+    /// Answer `q` with a tapped choice, keeping it out of the tray until the
+    /// answer has landed (or failed, which puts it back).
+    private func sendAnswer(_ label: String, to q: Message) {
+        sendingAnswerIds.insert(q.id)
+        Task {
+            defer { sendingAnswerIds.remove(q.id) }
+            await viewModel.sendMessage(label, replyTo: q.id)
+            await team.loadSummaries()
+        }
+    }
+
+    /// Open questions that came straight after another open question: the
+    /// stream draws only the first of such a run and the tray holds the rest
+    /// (the owner, 2026-11-15: "we shouldn't show multiple questions one after
+    /// the other. show one and the rest in the tray"). Answering the first ends
+    /// its run, so the next one takes its place in the stream.
+    private var queuedQuestionIds: Set<UUID> {
+        BubbleLayout.queuedQuestions(
+            viewModel.messages.filter { !viewModel.isChecklistTick($0) && !viewModel.isQuestionDismissal($0) },
+            isOpen: { viewModel.isOpenQuestion($0) && $0.improvementId == nil }
+        )
     }
 
     /// The tray: the thread's own open questions not on screen, plus any the
     /// badge counts that are too old to be loaded here (answer or dismiss them
     /// from the tray), oldest first.
+    ///
+    /// Improvement cards waiting on the owner (a Face ID, or a Retry on a
+    /// failed apply) stack here too, the same way: the owner, 2026-11-15, "if
+    /// there are multiple improvements (new or retries) pending it should show
+    /// the bottom stack (similar to pending questions)."
     private var trayQuestions: [Message] {
         let loaded = viewModel.openQuestions.filter { !onScreenQuestionIds.contains($0.id) }
         let loadedIds = Set(viewModel.messages.map(\.id))
         let older = (team.openQuestionMessages[viewModel.currentConversation] ?? []).filter { !loadedIds.contains($0.id) }
-        return (older + loaded).sorted { $0.createdAt < $1.createdAt }
+        let cardsLoaded = viewModel.messages.filter { isPendingCard($0) && !onScreenQuestionIds.contains($0.id) }
+        let cardsOlder = improvementCards.pendingMessages.filter {
+            $0.conversationId == viewModel.currentConversation && !loadedIds.contains($0.id) && isPendingCard($0)
+        }
+        return (older + loaded + cardsOlder + cardsLoaded)
+            .filter { !sendingAnswerIds.contains($0.id) }
+            .sorted { $0.createdAt < $1.createdAt }
+    }
+
+    /// An improvement card whose row is waiting on the owner.
+    private func isPendingCard(_ m: Message) -> Bool {
+        guard let id = m.improvementId, let row = improvementCards.byId[id] else { return false }
+        return row.isPending
     }
 
     private var jumpToLatestButton: some View {
@@ -1154,39 +1421,6 @@ struct ContentView: View {
 
     private func cancelReply() {
         withAnimation(.easeOut(duration: 0.2)) { replyTarget = nil }
-    }
-
-    /// "Chat" on an improvement card: land in its conversation with the reply
-    /// composer already open on that improvement, so the next thing typed is a
-    /// question or feedback about it.
-    ///
-    /// The anchor is a real chat message (find-or-create, see
-    /// SelfImproveApproval.chatAnchor) rather than a synthetic quote: `reply_to`
-    /// is a foreign key, and phone-channel builds the agent's context by reading
-    /// the parent row — a fake target would thread to nothing and the agent
-    /// would answer the question against whatever it last said instead.
-    fileprivate func openImprovementThread(_ improvement: SelfImproveApproval.Improvement) async {
-        do {
-            let anchor = try await SelfImproveApproval.chatAnchor(for: improvement)
-            await MainActor.run {
-                // Wherever the anchor landed (the server files it by role).
-                showImprovementCards = false
-                go(.conversation(anchor.conversationId))
-                // The anchor may be brand new (or older than the loaded window),
-                // so seed it locally instead of waiting for the channel's fetch —
-                // beginReply needs the message present for the quote to render.
-                if !viewModel.messages.contains(where: { $0.id == anchor.id }) {
-                    viewModel.messages.append(anchor)
-                }
-                pendingScrollId = anchor.id
-                // Hand off rather than calling beginReply() here: the chat view
-                // (and the input bar the composer focuses) hasn't mounted yet
-                // this run loop, so the focus request would land on nothing.
-                viewModel.pendingReplyMessage = anchor
-            }
-        } catch {
-            print("[SelfImprove] opening chat thread failed: \(error)")
-        }
     }
 
     /// Send `text`, threading it to `replyTarget` when the reply composer is open.
@@ -1431,9 +1665,11 @@ struct ContentView: View {
                     // A notification that launched the app names a message:
                     // open its conversation first.
                     if let pending = AppDelegate.pendingMessageId {
+                        let named = NotificationTap.pendingConversation
                         AppDelegate.pendingMessageId = nil
+                        NotificationTap.pendingConversation = nil
                         view.pendingScrollId = pending
-                        if let conv = await viewModel.conversationOf(pending) { view.openConversation(conv) }
+                        if let conv = await view.conversation(named, of: pending) { view.openConversation(conv) }
                     }
                     await viewModel.loadMessages()
                     viewModel.startCatchUpTimer()
@@ -1465,12 +1701,16 @@ struct ContentView: View {
                 // conversation; the thread scrolls to it once it has loaded.
                 .onReceive(NotificationCenter.default.publisher(for: .openJoriMessage)) { note in
                     guard let uuid = note.object as? UUID else { return }
+                    let named = note.userInfo?[NotificationTap.conversationKey] as? String
+                    // Taken here; nothing is left for a later launch path.
+                    AppDelegate.pendingMessageId = nil
+                    NotificationTap.pendingConversation = nil
                     Task {
-                        guard let conv = await viewModel.conversationOf(uuid) else { return }
-                        if conv != viewModel.currentConversation || view.memoryMode {
-                            view.pendingScrollId = uuid
-                            view.openConversation(conv)
-                        }
+                        guard let conv = await view.conversation(named, of: uuid) else { return }
+                        // Already on screen: the thread scrolls to it itself.
+                        if view.isShowing(conv) { return }
+                        view.pendingScrollId = uuid
+                        view.openConversation(conv)
                     }
                 }
                 .sheet(isPresented: view.$showNewConversation) {
@@ -1766,8 +2006,17 @@ private struct OnScreenReader: ViewModifier {
 
     func body(content: Content) -> some View {
         if tracked, #available(iOS 18.0, macOS 15.0, *) {
+            // Measured against the scroll view's visible rect on every layout
+            // pass. onScrollVisibilityChange fired only on a change, so a card
+            // already in view when the stream loaded (or when the tray resized
+            // it) was never counted and showed in the tray as well (2026-11-15).
             content
-                .onScrollVisibilityChange(threshold: 0.5) { visible in
+                .onGeometryChange(for: Bool.self) { proxy in
+                    guard let viewport = proxy.bounds(of: .scrollView) else { return false }
+                    let frame = proxy.frame(in: .local)
+                    let seen = frame.intersection(viewport)
+                    return !seen.isNull && seen.height >= min(frame.height, viewport.height) * 0.5
+                } action: { visible in
                     if visible { onScreen.insert(id) } else { onScreen.remove(id) }
                 }
                 .onDisappear { onScreen.remove(id) }
@@ -1794,7 +2043,41 @@ struct BubbleLayout: Equatable {
     private static let groupGap: TimeInterval = 5 * 60
     private static let sectionGap: TimeInterval = 60 * 60
 
-    static func compute(_ messages: [Message]) -> [UUID: BubbleLayout] {
+    /// The replies that show the message they answer, quoted above them.
+    ///
+    /// The owner, 2026-11-15: no reply formatting for questions and answers —
+    /// it is a regular conversation in the feed, "except if my reply was to a
+    /// question or improvement earlier in the feed - in that case my answer is
+    /// a reply - and the rest of the conversation after that is a regular chat
+    /// feed." So only the owner's own message is ever drawn as a reply, and
+    /// only when it answers something other than the latest message from the
+    /// assistant before it. Jori's answers to a reply are plain messages.
+    /// In each run of open questions with nothing else between them, every
+    /// one after the first (the stream shows one; the tray holds the rest).
+    static func queuedQuestions(_ messages: [Message], isOpen: (Message) -> Bool) -> Set<UUID> {
+        var queued = Set<UUID>()
+        var runStarted = false
+        for m in messages {
+            if isOpen(m) {
+                if runStarted { queued.insert(m.id) } else { runStarted = true }
+            } else {
+                runStarted = false
+            }
+        }
+        return queued
+    }
+
+    static func quotedReplies(_ messages: [Message]) -> Set<UUID> {
+        var quoted = Set<UUID>()
+        var lastAssistant: UUID?
+        for m in messages {
+            if m.isUser, let parent = m.replyTo, parent != lastAssistant { quoted.insert(m.id) }
+            if m.isAssistant { lastAssistant = m.id }
+        }
+        return quoted
+    }
+
+    static func compute(_ messages: [Message], quoted: Set<UUID> = []) -> [UUID: BubbleLayout] {
         var result: [UUID: BubbleLayout] = [:]
         result.reserveCapacity(messages.count)
         var places: [BubbleLayout] = []
@@ -1814,7 +2097,7 @@ struct BubbleLayout: Equatable {
                     || prev.role != m.role
                     || prev.sender != m.sender
                     || gap > groupGap
-                    || m.replyTo != nil
+                    || quoted.contains(m.id)
             }
             places.append(place)
         }
@@ -1868,8 +2151,14 @@ struct BubbleThread: Equatable {
     var notPickedUp = false
     /// "Ada · CFO" over the first bubble of a run, where it isn't obvious who is speaking.
     var senderLabel: String?
-    /// The speak gate's shadow verdict on this message, for the user to grade.
-    var gate: GateReview?
+    /// Draw the quoted parent above this reply (BubbleLayout.quotedReplies).
+    var showsQuote = false
+    /// The live approval row behind an improvement card message.
+    var improvement: SelfImproveApproval.Improvement?
+    var improvementWorking = false
+    /// The question card the feed shows open (choices visible); every other
+    /// one is drawn minimized.
+    var isFocused = false
 }
 
 /// What a bubble can ask the conversation to do.
@@ -1879,10 +2168,12 @@ struct BubbleActions {
     var setPalette: (UUID?) -> Void
     var react: (Message, Reaction?) -> Void
     var answer: (String, UUID) -> Void
+    /// Open a minimized question card in the feed (and scroll to it).
+    var focus: (UUID) -> Void
     var toggleChecklist: (String, Bool, UUID) -> Void
     var resolveParent: (UUID) -> Void
     var dismiss: (Message) -> Void
-    var gradeGate: (UUID, String, String) -> Void = { _, _, _ in }
+    var improvement: (ImprovementCardAction, SelfImproveApproval.Improvement) -> Void
 }
 
 /// Equatable on its inputs (the closures are deliberately left out — they
@@ -1945,13 +2236,6 @@ struct MessageBubble: View, Equatable {
                                       style: .continuous)
     }
 
-    private func openPalette() {
-        reactionTick &+= 1
-        withAnimation(.spring(response: 0.3, dampingFraction: 0.72)) {
-            actions.setPalette(message.id)
-        }
-    }
-
     private func apply(_ reaction: Reaction?) {
         let target = message
         reactionTick &+= 1
@@ -1963,7 +2247,7 @@ struct MessageBubble: View, Equatable {
 
     var body: some View {
         VStack(spacing: 0) {
-            if let parentId = message.replyTo {
+            if let parentId = message.replyTo, thread.showsQuote {
                 QuotedReplyView(
                     parent: thread.quotedParent,
                     onTap: { actions.quoteTap(parentId) }
@@ -2002,10 +2286,6 @@ struct MessageBubble: View, Equatable {
                         notPickedUpLine
                             .transition(.opacity)
                     }
-
-                    if let gate = thread.gate {
-                        GateReviewLine(review: gate) { grade, note in actions.gradeGate(message.id, grade, note) }
-                    }
                 }
 
                 if message.isAssistant { Spacer(minLength: 56) }
@@ -2035,7 +2315,7 @@ struct MessageBubble: View, Equatable {
         // Resolve the quoted parent when it has scrolled out of the loaded
         // window (no-ops when it's already on screen or cached).
         .task(id: message.replyTo) {
-            if let parentId = message.replyTo {
+            if let parentId = message.replyTo, thread.showsQuote {
                 actions.resolveParent(parentId)
             }
         }
@@ -2044,12 +2324,12 @@ struct MessageBubble: View, Equatable {
     /// Calm on purpose: it reports what the app can see (no sign of pickup),
     /// not a diagnosis, and it leaves on its own when a sign arrives.
     private var notPickedUpLine: some View {
-        Label("Not picked up yet — \(Install.displayName) may be down", systemImage: "clock.badge.exclamationmark")
+        Label("Not received yet. Check that the Mac running \(Install.displayName) is awake and online.", systemImage: "clock.badge.exclamationmark")
             .font(.caption2)
             .foregroundStyle(.secondary)
             .padding(.horizontal, 8)
             .padding(.bottom, 2)
-            .accessibilityLabel("Not picked up yet. \(Install.displayName) may be down.")
+            .accessibilityLabel("Not received yet. Check that the Mac running \(Install.displayName) is awake and online.")
     }
 
     // MARK: Pointer — quick actions on hover (Mac, iPad with a pointer)
@@ -2206,7 +2486,9 @@ struct MessageBubble: View, Equatable {
 
     @ViewBuilder
     private var assistantBubble: some View {
-        let openQuestion = thread.isOpenQuestion
+        // An improvement card waiting on the owner's Face ID is drawn as an
+        // open question: the same gold, the same "waiting on you".
+        let openQuestion = thread.isOpenQuestion || (thread.improvement?.needsApproval ?? false)
         let choice = ChoicePrompt.from(metadata: message.metadata)
         // A decision card stays question-gold after it is answered too
         // (decisions are drawn as questions).
@@ -2216,18 +2498,26 @@ struct MessageBubble: View, Equatable {
         // highlighted confirmation in the chat.
         let isConfirmed = message.metadata?["card"] == "purchase" && message.metadata?["status"] == "placed"
         let fill: Color = isConfirmed ? JoriTheme.confirmedWash : (openQuestion || isDecision ? JoriTheme.staffWash : JoriTheme.slate)
+        // A card with choices is minimized in the feed until it is tapped.
+        let collapsed = (choice.map { !$0.options.isEmpty } ?? false) && !thread.isFocused
         VStack(alignment: .leading, spacing: 10) {
             if isConfirmed {
                 Label("Purchase confirmed", systemImage: "checkmark.seal.fill")
                     .font(.subheadline.weight(.bold))
                     .foregroundStyle(JoriTheme.confirmed)
             }
-            if openQuestion {
+            if openQuestion && thread.improvement == nil {
                 Label("Waiting for your answer", systemImage: "sparkle")
                     .font(.caption.weight(.semibold))
                     .foregroundStyle(JoriTheme.staffInk)
             }
-            if let checklist = Checklist.from(metadata: message.metadata) {
+            if let card = thread.improvement {
+                // The card is drawn from the live approval row; the message
+                // text is the plain copy for the push and older builds.
+                ImprovementCardView(item: card, working: thread.improvementWorking) { action in
+                    actions.improvement(action, card)
+                }
+            } else if let checklist = Checklist.from(metadata: message.metadata) {
                 // The checklist carries the agenda; the message text is the
                 // plain copy for older builds and the push.
                 if let title = checklist.title, !title.isEmpty {
@@ -2244,8 +2534,9 @@ struct MessageBubble: View, Equatable {
                 DecisionCardView(
                     prompt: prompt,
                     answeredLabel: thread.answer,
+                    collapsed: collapsed,
                     onSelect: { option in
-                        actions.answer(option.label, message.id)
+                        if option.opensReply { onReply(message) } else { actions.answer(option.label, message.id) }
                     },
                     onTypeSomething: { onReply(message) }
                 )
@@ -2260,10 +2551,12 @@ struct MessageBubble: View, Equatable {
                     ChoicePromptView(
                         prompt: prompt,
                         answeredLabel: thread.answer,
-                        defaultAppliedLabel: thread.defaultApplied
+                        defaultAppliedLabel: thread.defaultApplied,
+                        collapsed: collapsed
                     ) { option in
-                        // The tap IS the reply — same path as typing it.
-                        actions.answer(option.label, message.id)
+                        // The tap IS the reply — same path as typing it. The
+                        // "something else" button opens a typed reply instead.
+                        if option.opensReply { onReply(message) } else { actions.answer(option.label, message.id) }
                     }
                 }
             }
@@ -2271,6 +2564,17 @@ struct MessageBubble: View, Equatable {
         .padding(.horizontal, 14)
         .padding(.vertical, 10)
         .frame(maxWidth: .infinity, alignment: .leading)
+        .overlay {
+            // Minimized: the whole card is the tap target that opens it.
+            if collapsed {
+                Color.clear
+                    .contentShape(Rectangle())
+                    .onTapGesture { actions.focus(message.id) }
+                    .accessibilityElement()
+                    .accessibilityLabel(thread.answer == nil ? "Show the choices" : "Show the question")
+                    .accessibilityAddTraits(.isButton)
+            }
+        }
         .background {
             // The staff light: an unanswered question glows faintly gold, the
             // one place in the stream that is waiting on you. The shadow is
@@ -2311,11 +2615,10 @@ struct MessageBubble: View, Equatable {
                 .transition(.scale(scale: 0.6, anchor: .bottomLeading).combined(with: .opacity))
             }
         }
-        #if os(iOS)
-        .onLongPressGesture(minimumDuration: 0.35) {
-            openPalette()
-        }
-        #endif
+        // Long-press opens the system menu on iOS (Reply, reactions, Copy,
+        // Share…). A custom 0.35 s long-press for the reaction palette used to
+        // sit here; it fired first and the system menu never opened, so a
+        // Jori message could not be copied or forwarded on the phone.
         .contextMenu {
             replyMenuItem
             if thread.isOpenQuestion {
@@ -2863,6 +3166,71 @@ private struct MacTextViewRepresentable: NSViewRepresentable {
 }
 
 
+// MARK: - Answer sheet
+
+/// A question opened from the tray's Answer button: the same card the feed
+/// draws, every choice tappable (the owner, 2026-11-15: "tapping 'answer' in
+/// the bottom tray should show the question with multiple choice, just like it
+/// appears in the feed"). A tap is the same reply as a tap on the card.
+struct QuestionAnswerSheet: View {
+    let message: Message
+    let answeredLabel: String?
+    let defaultAppliedLabel: String?
+    let onSelect: (ChoiceOption) -> Void
+    let onTypeSomething: () -> Void
+    let onClose: () -> Void
+
+    var body: some View {
+        let prompt = ChoicePrompt.from(metadata: message.metadata)
+        VStack(alignment: .leading, spacing: 0) {
+            HStack {
+                Label("Waiting for your answer", systemImage: "sparkle")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(JoriTheme.staffInk)
+                Spacer()
+                Button { onClose() } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .font(.system(size: 22))
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Close")
+            }
+            .padding(.horizontal, 18)
+            .padding(.top, 16)
+            .padding(.bottom, 8)
+            ScrollView {
+                VStack(alignment: .leading, spacing: 10) {
+                    if let prompt, prompt.isDecision {
+                        DecisionCardView(prompt: prompt, answeredLabel: answeredLabel,
+                                         onSelect: onSelect, onTypeSomething: onTypeSomething)
+                    } else if let prompt {
+                        if prompt.subject == nil {
+                            RichMessageView(content: message.content)
+                        }
+                        ChoicePromptView(prompt: prompt, answeredLabel: answeredLabel,
+                                         defaultAppliedLabel: defaultAppliedLabel, onSelect: onSelect)
+                        Button { onTypeSomething() } label: {
+                            Label("Type an answer instead", systemImage: "pencil")
+                                .font(.callout.weight(.medium))
+                        }
+                        .buttonStyle(.borderless)
+                        .foregroundStyle(JoriTheme.staffInk)
+                        .padding(.top, 4)
+                    } else {
+                        RichMessageView(content: message.content)
+                    }
+                }
+                .padding(14)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(JoriTheme.staffWash, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+                .padding(.horizontal, 14)
+                .padding(.bottom, 18)
+            }
+        }
+    }
+}
+
 // MARK: - Open questions tray
 
 /// The questions still waiting for an answer in this channel, pinned at the
@@ -2870,6 +3238,11 @@ private struct MacTextViewRepresentable: NSViewRepresentable {
 /// however far the flow of messages has pushed the question itself. Tap a row
 /// to jump to the question; Answer opens a reply to it; the x dismisses it
 /// (a silent reply the server closes in code — see ChatViewModel.dismissQuestion).
+///
+/// Only the most recent questions are listed — three on Mac/iPad, one on a
+/// phone — the header still counts them all. With more than one open, rows show
+/// the question alone (no option buttons) and each row gets its own shade, the
+/// most recent lightest, so neighbouring questions read as separate.
 struct OpenQuestionsTray: View {
     let questions: [Message]
     var reveal: (Message) -> Void
@@ -2877,7 +3250,27 @@ struct OpenQuestionsTray: View {
     var dismiss: (Message) -> Void
     /// A tapped option: the same pre-composed reply a tap on the card sends.
     var select: (ChoiceOption, Message) -> Void
+    /// The live row behind an improvement card in the tray (nil for a question).
+    var improvement: (Message) -> SelfImproveApproval.Improvement? = { _ in nil }
+    /// Implement / Retry / Skip on a card row.
+    var act: (ImprovementCardAction, SelfImproveApproval.Improvement) -> Void = { _, _ in }
     @AppStorage(Install.key("openQuestionsTrayExpanded")) private var expanded = true
+    #if os(iOS)
+    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
+    #endif
+
+    /// How many rows the tray lists: one on a phone, three on Mac/iPad.
+    private var visibleLimit: Int {
+        #if os(iOS)
+        return horizontalSizeClass == .compact ? 1 : 3
+        #else
+        return 3
+        #endif
+    }
+
+    /// The most recent `visibleLimit` questions, oldest first (the newest sits
+    /// nearest the composer).
+    private var shown: [Message] { Array(questions.suffix(visibleLimit)) }
 
     var body: some View {
         if !questions.isEmpty {
@@ -2887,7 +3280,7 @@ struct OpenQuestionsTray: View {
                 } label: {
                     HStack(spacing: 6) {
                         Image(systemName: "sparkle")
-                        Text(questions.count == 1 ? "1 open question" : "\(questions.count) open questions")
+                        Text(headerText)
                         Spacer(minLength: 0)
                         Image(systemName: expanded ? "chevron.down" : "chevron.up")
                     }
@@ -2899,30 +3292,94 @@ struct OpenQuestionsTray: View {
                 }
                 .buttonStyle(.plain)
                 if expanded {
-                    ScrollView {
-                        VStack(spacing: 0) {
-                            ForEach(questions) { q in
-                                Divider().overlay(JoriTheme.hairline)
-                                row(q)
+                    let rows = shown
+                    VStack(spacing: 0) {
+                        ForEach(Array(rows.enumerated()), id: \.element.id) { index, q in
+                            Divider().overlay(JoriTheme.hairline)
+                            Group {
+                                if let card = improvement(q) {
+                                    cardRow(q, card)
+                                } else {
+                                    row(q, showOptions: questions.count == 1)
+                                }
                             }
+                            .background(shade(fromNewest: rows.count - 1 - index, of: rows.count))
                         }
                     }
-                    .frame(maxHeight: 280)
-                    .fixedSize(horizontal: false, vertical: questions.count <= 3)
                 }
             }
             .background(JoriTheme.staffWash, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+            .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
             .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous).stroke(JoriTheme.staff.opacity(0.35), lineWidth: 0.5))
             .transition(.move(edge: .bottom).combined(with: .opacity))
         }
     }
 
-    private func row(_ q: Message) -> some View {
+    /// "2 open questions · 1 improvement", counting each kind.
+    private var headerText: String {
+        let cards = questions.filter { improvement($0) != nil }.count
+        let asks = questions.count - cards
+        var parts: [String] = []
+        if asks > 0 { parts.append(asks == 1 ? "1 open question" : "\(asks) open questions") }
+        if cards > 0 { parts.append(cards == 1 ? "1 improvement" : "\(cards) improvements") }
+        return parts.joined(separator: " · ")
+    }
+
+    /// An improvement card waiting on the owner: its summary, Implement (Face
+    /// ID) or Retry, and the x skips it.
+    private func cardRow(_ m: Message, _ card: SelfImproveApproval.Improvement) -> some View {
+        HStack(alignment: .center, spacing: 8) {
+            Button { reveal(m) } label: {
+                HStack(spacing: 6) {
+                    Image(systemName: card.isRetryable ? "exclamationmark.triangle.fill" : "wrench.and.screwdriver")
+                        .font(.caption)
+                        .foregroundStyle(card.isRetryable ? Color.orange : JoriTheme.staffInk)
+                    Text(card.summary)
+                        .font(.subheadline)
+                        .lineLimit(2)
+                        .multilineTextAlignment(.leading)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            if card.needsApproval {
+                Button { act(.implement, card) } label: { Label("Implement", systemImage: "faceid") }
+                    .font(.caption.weight(.semibold))
+                    .buttonStyle(.borderless)
+                    .foregroundStyle(JoriTheme.staffInk)
+            } else {
+                Button("Retry") { act(.retry, card) }
+                    .font(.caption.weight(.semibold))
+                    .buttonStyle(.borderless)
+                    .foregroundStyle(JoriTheme.staffInk)
+            }
+            Button { act(.skip, card) } label: {
+                Image(systemName: "xmark.circle.fill")
+                    .font(.system(size: 18))
+                    .foregroundStyle(.secondary)
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Skip improvement")
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 7)
+    }
+
+    /// A row's tint: none for the newest, a step deeper for each older one.
+    /// Only drawn when several rows share the tray.
+    private func shade(fromNewest step: Int, of count: Int) -> Color {
+        count > 1 ? JoriTheme.staff.opacity(0.09 * Double(step)) : .clear
+    }
+
+    private func row(_ q: Message, showOptions: Bool) -> some View {
         // A question that carries tappable options (a decision card, a choice
         // prompt) is answered by tapping one right here. The "Answer" button
         // alone only opens a typed reply, so a card scrolled out of view used to
         // be answerable only in words (2026-11-10: a "stay in touch?" card).
-        let options = ChoicePrompt.from(metadata: q.metadata)?.options ?? []
+        // With several open, the tray lists questions only; answer by tapping
+        // the row (jumps to the card) or Answer.
+        let options = showOptions ? (ChoicePrompt.from(metadata: q.metadata)?.options ?? []) : []
         return VStack(alignment: .leading, spacing: 6) {
             HStack(alignment: .center, spacing: 8) {
                 Button { reveal(q) } label: {
