@@ -268,7 +268,7 @@ The area reservoir (`lib/reservoir-*.js`, `bin/trip-reservoir-*`: research once 
 
 ## Memory and knowledge jobs
 
-`chat-consolidate` (nightly chat facts), `wiki-link-audit` (nightly name-list links), `wiki-link-weave` (weekly people pages and relations), `memory-consolidation` (weekly prune), `memory-reindex`, `wiki-dedup-sweep` (monthly) and `episode-archive` (nightly `day_*` / `week_*` / `month_*` pages through `bin/wiki-day-write`, `wiki-week-write`, `wiki-month-write`, `bin/episode`). Apple Notes (`bin/notes`) and contact lookup (`bin/contact-lookup`) are tool modules. An installation's specifics ride `agent/local/jobs/<job>.md` companions. The dream and deep dream stay installation code until the location helpers they import move.
+`chat-consolidate` (nightly chat facts), `wiki-link-audit` (nightly name-list links), `wiki-link-weave` (weekly people pages and relations), `memory-consolidation` (weekly prune), `memory-reindex`, `wiki-dedup-sweep` (monthly) and `episode-archive` (nightly `day_*` / `week_*` / `month_*` pages through `bin/wiki-day-write`, `wiki-week-write`, `wiki-month-write`, `bin/episode`). Apple Notes (`bin/notes`) and contact lookup (`bin/contact-lookup`; `save` also writes through to Google Contacts without duplicating, `lib/google-contacts.cjs`) are tool modules. An installation's specifics ride `agent/local/jobs/<job>.md` companions. The dream and deep dream stay installation code until the location helpers they import move.
 
 ## Rentals (optional)
 
