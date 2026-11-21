@@ -130,6 +130,11 @@ struct ContentView: View {
     /// A question opened from the tray's Answer button, shown with its choices
     /// in a sheet, the same card as in the feed.
     @State private var answeringQuestion: Message?
+    /// Questions whose answer is on its way to the server. The reply row only
+    /// lands in `messages` after the insert returns, so without this the
+    /// question would pop back into the tray for that round trip. A failed
+    /// send clears it, and the question returns to the tray.
+    @State private var sendingAnswerIds: Set<UUID> = []
     @State private var isDropTargeted = false
     /// iPhone: the conversation list is the home screen; a conversation (or
     /// Memory) is pushed on top of it.
@@ -663,7 +668,9 @@ struct ContentView: View {
     private func sendWithMentions(_ text: String, replyTo threadParent: UUID?) {
         let current = viewModel.currentConversation
         let mentioned = team.mentioned(in: text)
+        if let threadParent { sendingAnswerIds.insert(threadParent) }
         Task {
+            defer { if let threadParent { sendingAnswerIds.remove(threadParent) } }
             var target = current
             var extra: [String: String] = [:]
             if !mentioned.isEmpty {
@@ -721,7 +728,7 @@ struct ContentView: View {
                     defaultAppliedLabel: viewModel.defaultApplied(for: q.id),
                     onSelect: { option in
                         answeringQuestion = nil
-                        Task { await viewModel.sendMessage(option.label, replyTo: q.id); await team.loadSummaries() }
+                        sendAnswer(option.label, to: q)
                     },
                     onTypeSomething: {
                         answeringQuestion = nil
@@ -1240,7 +1247,11 @@ struct ContentView: View {
                 }
                 .padding(.horizontal, 14)
             }
-            Group {
+            // The tray steps aside while a question is being answered (the
+            // reply composer or the choice sheet is open) and comes back if the
+            // answer is abandoned; an answered question leaves it for good (the
+            // owner, 2026-11-21).
+            if !isComposingAnswer {
                 OpenQuestionsTray(
                     questions: trayQuestions,
                     reveal: { q in
@@ -1270,7 +1281,7 @@ struct ContentView: View {
                         viewModel.dismissQuestion(q)
                         Task { try? await Task.sleep(for: .seconds(1)); await team.loadSummaries() }
                     },
-                    select: { option, q in Task { await viewModel.sendMessage(option.label, replyTo: q.id); await team.loadSummaries() } },
+                    select: { option, q in sendAnswer(option.label, to: q) },
                     improvement: { m in m.improvementId.flatMap { improvementCards.byId[$0] } },
                     act: { action, item in
                         let cards = improvementCards
@@ -1278,11 +1289,29 @@ struct ContentView: View {
                     }
                 )
                 .padding(.horizontal, 14)
+                .transition(.move(edge: .bottom).combined(with: .opacity))
             }
             inputBar
         }
         .animation(.spring(response: 0.35, dampingFraction: 0.8), value: viewModel.isWaitingForResponse)
         .animation(.spring(response: 0.35, dampingFraction: 0.8), value: isScrolledUp)
+        .animation(.spring(response: 0.32, dampingFraction: 0.86), value: isComposingAnswer)
+    }
+
+    /// A reply is being written, or a question's choice sheet is up.
+    private var isComposingAnswer: Bool {
+        replyTarget != nil || answeringQuestion != nil
+    }
+
+    /// Answer `q` with a tapped choice, keeping it out of the tray until the
+    /// answer has landed (or failed, which puts it back).
+    private func sendAnswer(_ label: String, to q: Message) {
+        sendingAnswerIds.insert(q.id)
+        Task {
+            defer { sendingAnswerIds.remove(q.id) }
+            await viewModel.sendMessage(label, replyTo: q.id)
+            await team.loadSummaries()
+        }
     }
 
     /// Open questions that came straight after another open question: the
@@ -1313,7 +1342,9 @@ struct ContentView: View {
         let cardsOlder = improvementCards.pendingMessages.filter {
             $0.conversationId == viewModel.currentConversation && !loadedIds.contains($0.id) && isPendingCard($0)
         }
-        return (older + loaded + cardsOlder + cardsLoaded).sorted { $0.createdAt < $1.createdAt }
+        return (older + loaded + cardsOlder + cardsLoaded)
+            .filter { !sendingAnswerIds.contains($0.id) }
+            .sorted { $0.createdAt < $1.createdAt }
     }
 
     /// An improvement card whose row is waiting on the owner.
