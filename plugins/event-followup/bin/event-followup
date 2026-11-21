@@ -1,0 +1,11 @@
+#!/usr/bin/env node
+// event-followup — ask whether a past calendar event happened and how it went,
+// then put the answer on the day's record and into taste
+// (plugins/event-followup; the code is lib/cli.mjs, usage there).
+"use strict";
+const path = require("node:path");
+const { pathToFileURL } = require("node:url");
+import(pathToFileURL(path.join(__dirname, "..", "lib", "cli.mjs")).href).catch((e) => {
+  process.stderr.write(`event-followup: ${e && e.stack || e}\n`);
+  process.exit(1);
+});

@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  EVENT FOLLOW-UP: every 30 minutes, read the calendar events that ended in
+  the last day and a half, let a model pick the personal ones worth a
+  "did it happen, how was it?" question, and ask about one (bin/hum-ask).
+  launchd USER agent, not crontab: the model fork needs the GUI keychain's Max
+  login. Rendered and loaded by `jori plugin sync` while the plugin is on.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>ai.claude.event-followup</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>__HOME__/.local/node/bin/node</string>
+        <string>__JORI_TOOLS__/plugins/event-followup/bin/event-followup</string>
+        <string>check</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>__HOME__</string>
+        <key>PATH</key>
+        <string>__HOME__/.local/node/bin:__HOME__/.local/bin:/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:__JORI_TOOLS__/bin</string>
+        <key>LANG</key>
+        <string>en_US.UTF-8</string>
+    </dict>
+    <key>WorkingDirectory</key>
+    <string>__JORI_TOOLS__</string>
+    <key>RunAtLoad</key>
+    <false/>
+    <key>StartInterval</key>
+    <integer>1800</integer>
+    <key>StandardOutPath</key>
+    <string>__JORI_TOOLS__/agent/logs/event-followup.log</string>
+    <key>StandardErrorPath</key>
+    <string>__JORI_TOOLS__/agent/logs/event-followup.log</string>
+</dict>
+</plist>
