@@ -89,9 +89,9 @@ enum SupabaseManager {
         do {
             _ = try await shared.auth.session
             return false
-        } catch AuthError.sessionMissing {
+        } catch Auth.AuthError.sessionMissing {
             return true
-        } catch AuthError.api(_, _, _, let response) where (400..<500).contains(response.statusCode) && response.statusCode != 429 {
+        } catch Auth.AuthError.api(_, _, _, let response) where (400..<500).contains(response.statusCode) && response.statusCode != 429 {
             return true
         } catch {
             return false
