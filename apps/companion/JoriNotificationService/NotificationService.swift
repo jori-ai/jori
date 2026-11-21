@@ -55,6 +55,14 @@ class NotificationService: UNNotificationServiceExtension {
         }
         let userInfo = bestAttemptContent.userInfo
 
+        // A reply from the phone link proves the message got through, so the
+        // app's 10-minute "hasn't received your message" alarm for that
+        // channel (PickupWatch) must not go off. The app can only cancel it
+        // while it runs; this runs for every push, suspended or not.
+        if let channel = userInfo["pickup_channel"] as? String {
+            Self.cancelPickupAlarms(channel: channel)
+        }
+
         // Urgent pings (apns-push --urgent) carry an `urgent` flag. Promote them
         // to time-sensitive so they pierce Driving/Reduce-Interruptions Focus.
         let urgent = userInfo["urgent"]
@@ -132,6 +140,35 @@ class NotificationService: UNNotificationServiceExtension {
                 AnnounceCache.trace("nse upcast threw: \(error.localizedDescription)")
                 self.deliver(bestAttemptContent)
             }
+        }
+    }
+
+    /// Same prefix as PickupWatch.notificationPrefix in the app target.
+    private static let pickupPrefix = "pickup-watch-"
+
+    /// Remove the pending (and any delivered) pickup alarms for `channel`. An
+    /// alarm scheduled before it carried a channel is removed too: a reply
+    /// proves the link is up whichever conversation it is in. Waits at most a
+    /// second, so a slow notification center cannot hold up the push.
+    static func cancelPickupAlarms(channel: String) {
+        let center = UNUserNotificationCenter.current()
+        let matches: (UNNotificationContent) -> Bool = { content in
+            guard let c = content.userInfo["channel"] as? String else { return true }
+            return c == channel
+        }
+        let done = DispatchSemaphore(value: 0)
+        center.getPendingNotificationRequests { requests in
+            let ids = requests.filter { $0.identifier.hasPrefix(pickupPrefix) && matches($0.content) }.map(\.identifier)
+            if !ids.isEmpty {
+                center.removePendingNotificationRequests(withIdentifiers: ids)
+                AnnounceCache.trace("nse cancelled \(ids.count) pickup alarm(s) for \(channel)")
+            }
+            done.signal()
+        }
+        _ = done.wait(timeout: .now() + 1)
+        center.getDeliveredNotifications { delivered in
+            let ids = delivered.map(\.request).filter { $0.identifier.hasPrefix(pickupPrefix) && matches($0.content) }.map(\.identifier)
+            if !ids.isEmpty { center.removeDeliveredNotifications(withIdentifiers: ids) }
         }
     }
 
