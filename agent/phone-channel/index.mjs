@@ -10,6 +10,7 @@ import { sendApnsPush, sendClearPush } from "../../lib/apns-push.mjs";
 import { writeFileAtomic } from "../../lib/atomic-write.js";
 import { autoRecallBlock, useWarmJudge } from "../../lib/auto-recall.mjs";
 import { WarmClaude } from "../../lib/warm-claude.mjs";
+import { cardReplyHint } from "../../lib/card-reply-hint.mjs";
 import { spoolEvent } from "../../lib/hum-events.mjs";
 import { displayableDraft } from "../../lib/reply-stream.mjs";
 import { composeReply } from "../../lib/reply-file.mjs";
@@ -660,27 +661,7 @@ async function buildImprovementBlock(row) {
  * only (our own metadata); what the user meant is the agent's reading.
  */
 function decisionReplyHint(parent) {
-  try {
-    const raw = parent?.metadata?.choices;
-    const p = typeof raw === "string" ? JSON.parse(raw) : raw;
-    // An installation's own card kind (REPLY_HINTS, from _ext/reply-hints.mjs):
-    // the user's typed answer is the agent's reading; the hint only names the
-    // ref and how to file it. The kernel's decision card is never overridden.
-    const extHint = p?.kind !== "decision" && p?.ref ? REPLY_HINTS[p.kind] : null;
-    if (typeof extHint === "function") return extHint(p) || "";
-    // A chat build parked on a question (lib/build-park.mjs): the typed answer
-    // resumes that build's own session. Drawn as a decision card, routed by
-    // `handler` (cards sent before 2026-11-16 carry kind "build-park").
-    if ((p?.handler || p?.kind) === "build-park" && p.ref) {
-      const bopts = (p.options || []).map((o, i) => `${i + 1}. ${o.label}`).join("; ");
-      return `[Build question ${p.ref}] That message was a build they asked for, stopped to ask them this (options: ${bopts}). Once you know their answer, file it with \`${installTools("bin/build-park")} answer --id ${p.ref} --option "<that option's label, exactly>"\` or \`--text "<their answer, in their words>"\`; the build then resumes where it stopped. Confirm in one short line. If they are asking about it rather than answering, answer and leave it open.\n\n`;
-    }
-    if (p?.kind !== "decision" || p.handler || !p.ref) return "";
-    const opts = (p.options || []).map((o, i) => `${i + 1}. ${o.label}`).join("; ");
-    return `[Decision card ${p.ref}] That message was a decision ${ASSISTANT} asked them (options: ${opts}). Once you know their answer — an option (by number or meaning) or their own words — file it with \`~/Dev/jori/bin/decision-answer --ref ${p.ref} --option "<that option's label, exactly>"\` or \`--text "<their answer>"\`, then confirm in one short line. If they are asking about it rather than answering, answer and leave it open.\n\n`;
-  } catch {
-    return "";
-  }
+  return cardReplyHint(parent, REPLY_HINTS);
 }
 
 async function buildReplyBlock(row, tz) {
@@ -807,6 +788,27 @@ function enqueueRoleSession(row, roles) {
   writeFileAtomic(path.join(dir, `${row.created_at.replace(/[^0-9]/g, "").slice(0, 17)}-${row.id}.json`), JSON.stringify(body) + "\n"); // lang-regex-ok: digits of a timestamp for a sortable file name
 }
 
+// An answer to a question Jori is waiting on (the daily summary's, hum's) registers wherever
+// it is typed: this conversation, a role's, a group (lib/answer-router.mjs). Code, on every
+// inbound message, so it never depends on which agent session happens to read the reply.
+// A model reads the message against the open questions; the flow files the user's words.
+// Never blocks or fails the message: resolves to the router's outcome, or null.
+async function routeOpenAnswer(row, text) {
+  try {
+    const { routeAnswer, historyFrom } = await import("../../lib/answer-router.mjs");
+    let q = supabase.from("jori_messages").select("id, role, content, created_at").order("created_at", { ascending: false }).limit(7);
+    q = row.conversation_id ? q.eq("conversation_id", row.conversation_id) : q.eq("channel", row.channel || "chat");
+    const { data } = await q;
+    const history = historyFrom((data || []).reverse(), { ceo: OWNER_LABEL, excludeId: row.id });
+    const outcome = await routeAnswer({ messageId: row.id, text, conversationId: row.conversation_id || null, history });
+    if (!["none", "no_open_questions", "skipped"].includes(outcome.status)) log(`answer-router: ${outcome.status} ${JSON.stringify(outcome.filed || outcome.failed || outcome.attempts || "")}`.slice(0, 300));
+    return outcome;
+  } catch (err) {
+    console.error(`[phone-channel] answer routing failed (the message is handled as usual): ${err.message}`);
+    return null;
+  }
+}
+
 async function handleIncomingMessage(row) {
   if (!row.shareBundleIds && shareBundler.add(row)) return;
   const msgId = row.id;
@@ -884,6 +886,11 @@ async function handleIncomingMessage(row) {
   } catch (err) {
     console.error(`[phone-channel] choice fast-path error, dispatching normally: ${err.message}`);
   }
+
+  // Started now, in parallel with everything below: the coordinator's turn waits for it
+  // (capped) to know what was already filed; a role's session reads the same outcome from the
+  // router's ledger (bin/role-session prepare), so the message is never held up here.
+  const answerP = routeOpenAnswer(row, text);
 
   // The team (system/conversations.md): a message written to a role's own
   // conversation, or mentioning roles in a group, is answered by those roles'
@@ -987,13 +994,15 @@ async function handleIncomingMessage(row) {
     // them into this one message, photos first.
     const shareLine = metadata.source === "share" ? "\n[Shared into Jori from another app via the share sheet]" : ""; // control-scan-ok: the software's name
 
-    const [recallBlock, replyBlock, humBlock, improvementBlock, foundBlock] =
-      await Promise.all([recallP, replyBlockP, humBlockP, improvementBlockP, foundBlockP]);
+    const [recallBlock, replyBlock, humBlock, improvementBlock, foundBlock, answerOutcome] =
+      await Promise.all([recallP, replyBlockP, humBlockP, improvementBlockP, foundBlockP, withCap(answerP, ANSWER_ROUTE_CAP_MS, null)]);
+    let answerBlock = "";
+    try { answerBlock = (await import("../../lib/answer-router.mjs")).routingBlock(answerOutcome, OWNER_LABEL); } catch { /* the hint is optional */ }
     profLog(msgId, "t1b_context", `recall=${recallBlock ? "yes" : "no"}`);
     // The conversation the user wrote in, so a job started for this request can
     // answer there (`jori tasks run … --reply-to <id>`, lib/reply-to.cjs).
     const conversationLine = row.conversation_id ? `\n[Conversation: ${row.conversation_id}]` : "";
-    const builtContent = `${recallBlock}${convoBlock}${replyBlock}${humBlock}${improvementBlock}${foundBlock}New message from ${OWNER}:\n\n${text}\n\n[Current time: ${localTimeStr} ${tzAbbr}]${locationLine}${shareLine}${conversationLine}`;
+    const builtContent = `${recallBlock}${convoBlock}${replyBlock}${humBlock}${improvementBlock}${foundBlock}${answerBlock}New message from ${OWNER}:\n\n${text}\n\n[Current time: ${localTimeStr} ${tzAbbr}]${locationLine}${shareLine}${conversationLine}`;
     const DISPATCH_URL = process.env.JORI_DISPATCH_URL;
 
     if (DISPATCH_URL) {
@@ -1039,6 +1048,9 @@ async function handleIncomingMessage(row) {
 // bounds retrieval (1.2s) and its judge (Jev 2.5s → Sonnet 4s) itself; this is
 // the backstop so no future change inside it can stall the chat again.
 const AUTO_RECALL_CAP_MS = 6_000;
+// How long the coordinator's turn waits for the answer router (lib/answer-router.mjs) to say what it filed.
+// The router runs to completion either way; past this the turn starts without the note.
+const ANSWER_ROUTE_CAP_MS = 3_000;
 
 function withCap(p, ms, fallback) {
   let timer;

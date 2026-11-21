@@ -74,6 +74,13 @@
 //       (--evening: the evening pass for this day; the sweep's own request, by hand only to re-run it)
 //       queue a fix run (the daily-summary fork on a non-confirmed review; the
 //       chat agent with the user's answer to a fixer question; the hourly sweep)
+//       --message-id M: the chat message the words came from (kept on the answer). An answer already
+//       recorded, by that id or the same words within DUP_ANSWER_MS, is not recorded or queued twice:
+//       the code that files an answer from any conversation (lib/answer-router.mjs) and the chat agent
+//       may both pass the same reply.
+//   daily-summary-fix open-asks                      JSON list of every question the user has been asked and not yet
+//       answered, across days (asked within OPEN_ASK_MAX_MS): [{date, n, text, asked_at, evening, status}].
+//       The answer router reads it to know what a reply may be answering.
 //   daily-summary-fix status <date>                  the state JSON, with its computed `phase`
 //   daily-summary-fix phase <date>                   before_summary | after_summary (the launchd runner reads it):
 //       before_summary only for a day the evening pass started whose summary is not built yet
@@ -169,6 +176,11 @@ const CORRECTION_QUIET_MS = (() => {
 const CORRECTION_STALE_MS = 3 * 3600e3;  // a newer correction whose run never finished: the newest copy goes anyway
 const SENDING_CLAIM_MS = 15 * 60e3;      // a send in flight (or one that died mid-way) is left alone this long
 const SEND_PAGE_AFTER = 3;               // failed sends of a staged correction before the system channel hears of it
+// An answer is a duplicate of one already recorded when it carries the same message id, or the same
+// words arrive within this long (the router and the chat agent both filing one reply).
+const DUP_ANSWER_MS = 15 * 60e3;
+// `open-asks` lists questions asked this recently; an older one is the sweep's business, not a reply's.
+const OPEN_ASK_MAX_MS = 72 * 3600e3;
 const SEND_DUE_MARKER = "send-due";      // the launchd queue marker for `send-due`
 const PENDING = path.join(DIR, "pending");
 // The evening pass. It starts at the first sweep (:52) at or after this local hour
@@ -634,13 +646,20 @@ if (cmd === "request") {
     // A confirmed day can still be reopened by the user's answer or a new reason.
     if (!opt("--answer") && !opt("--reason")) { console.log(`${date} already ${s.status}`); process.exit(0); }
   }
+  const answerText = opt("--answer") ? String(opt("--answer")).slice(0, 2000) : null;
+  const messageId = opt("--message-id");
+  if (answerText) {
+    const nowMs = clock().getTime();
+    const dup = (s.answers || []).find((a) => (messageId && a.message_id === messageId) || (a.text === answerText && nowMs - Date.parse(a.at) < DUP_ANSWER_MS));
+    if (dup) { console.log(`${date}: that answer is already recorded`); process.exit(0); }
+  }
   const evening = has("--evening");
   // An evening pass only fits a day whose summary is not built yet (today, or last night before the build).
   if (evening && phaseOf({ ...s, evening_at: s.evening_at || now() }) !== "before_summary") { console.log(`${date}: its summary is already built; no evening pass`); process.exit(0); }
   if (evening) s.evening_at = s.evening_at || now();
   const from = has("--from-review") ? "review" : evening ? "evening" : null;
   s.requests.push({ at: now(), reason: opt("--reason") || (opt("--answer") ? "his answer" : evening ? "evening pass: settle or ask about the day while it is fresh" : "unspecified"), ...(from ? { from } : {}) });
-  if (opt("--answer")) s.answers.push({ at: now(), text: String(opt("--answer")).slice(0, 2000) });
+  if (answerText) s.answers.push({ at: now(), text: answerText, ...(messageId ? { message_id: messageId } : {}) });
   s.status = "queued";
   save(s);
   if (!has("--no-kick")) kick(date);
@@ -656,6 +675,21 @@ if (cmd === "request") {
   s.tier_runs = [...(s.tier_runs || []), { at: now(), tier, ...snapshot(s) }].slice(-20);
   save(s);
   console.log(JSON.stringify(s.tier_runs[s.tier_runs.length - 1]));
+} else if (cmd === "open-asks") {
+  const nowMs = clock().getTime();
+  const rows = [];
+  let days = [];
+  try { days = fs.readdirSync(DIR).filter((f) => f.endsWith(".json")).map((f) => f.slice(0, -5)).filter(isDate); } catch { /* no state yet */ }
+  for (const d of days) {
+    const s = load(d);
+    (s.questions || []).forEach((q, i) => {
+      const asked = reachedAt(q);                       // a question still held, or dropped, was never put to him
+      if (!asked || q.answered_at || nowMs - Date.parse(asked) > OPEN_ASK_MAX_MS) return;
+      rows.push({ date: d, n: q.n || i + 1, text: q.text, asked_at: asked, evening: !!q.evening, status: s.status });
+    });
+  }
+  rows.sort((a, b) => String(a.asked_at).localeCompare(String(b.asked_at)));
+  console.log(JSON.stringify(rows));
 } else if (cmd === "status") {
   if (!isDate(date)) die("usage: status <YYYY-MM-DD>");
   const s = load(date);
@@ -1095,7 +1129,7 @@ if (cmd === "request") {
   fs.writeFileSync(into, doc);
   console.log(html ? "section inserted" : "no review notes; nothing inserted");
 } else {
-  die("usage: request|status|phase|idle|log|ask|gate|answered|release|mark-sent|stage|send-due|done|sweep|release-held|section — see the header");
+  die("usage: request|open-asks|status|phase|idle|log|ask|gate|answered|release|mark-sent|stage|send-due|done|sweep|release-held|section — see the header");
 }
 
 /**

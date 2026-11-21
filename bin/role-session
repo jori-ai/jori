@@ -120,6 +120,34 @@ async function prepare(queueFile, roleId) {
       }
     } catch { humBlock = []; }
   }
+  // An answer to a question Jori is waiting on (the daily summary's fix questions, hum's open
+  // questions) is filed by code, in whatever conversation it is typed (lib/answer-router.mjs;
+  // phone-channel starts it the moment the message arrives). Done here too, idempotently per
+  // message id, so a role never has to file it and the reply can say so. Fails soft.
+  let answerBlock = [];
+  try {
+    const AR = await import("../lib/answer-router.mjs");
+    let res = await AR.routeAnswer({ messageId: q.message_id, text: q.text, conversationId: conv, history: AR.historyFrom(rows, { ceo, excludeId: q.message_id }) });
+    if (res.status === "already_routed" && !res.previous) res = { status: "already_routed", previous: await AR.waitForOutcome(q.message_id) };
+    const b = AR.routingBlock(res, ceo);
+    if (b) answerBlock = ["", "----- ANSWER FILED -----", b.trim()];
+  } catch { answerBlock = []; }
+  // A typed reply to a waiting card (a decision, a build's question, an installation's own kind)
+  // is filed by whoever reads it, and the coordinator gets the card's filing line with the reply
+  // (phone-channel). A role session gets it from the same function.
+  let cardBlock = [];
+  try {
+    const me = await rest.request(`/rest/v1/jori_messages?select=reply_to&id=eq.${encodeURIComponent(q.message_id)}`);
+    const parentId = me && me[0] && me[0].reply_to;
+    if (parentId) {
+      const par = await rest.request(`/rest/v1/jori_messages?select=id,role,content,metadata&id=eq.${encodeURIComponent(parentId)}`);
+      const { cardReplyHint } = await import("../lib/card-reply-hint.mjs");
+      const { loadHook } = await import("../lib/ext-hooks.mjs");
+      const hints = (await loadHook(path.join(ROOT, "agent", "phone-channel"), "reply-hints"))?.cardHints || {};
+      const hint = par && par[0] ? cardReplyHint(par[0], hints) : "";
+      if (hint) cardBlock = ["", "----- CARD REPLY -----", hint.trim()];
+    }
+  } catch { cardBlock = []; }
   const task = [
     `ROLE SESSION. You are ${role.name}, ${role.title} on ${ceo}'s team. ${ceo} wrote to you in ${where}.`,
     `Answer as ${role.name}, then deliver it with exactly one call:`,
@@ -128,6 +156,8 @@ async function prepare(queueFile, roleId) {
     brief,
     ...foundBlock,
     ...humBlock,
+    ...answerBlock,
+    ...cardBlock,
     "",
     `----- RECENT CONVERSATION (oldest first; the last line is the new message) -----`,
     history || "(no earlier messages)",
