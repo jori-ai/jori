@@ -47,7 +47,9 @@ final class PickupWatch {
     private let supabase: SupabaseClient
     private static let entriesKey = Install.key("pickupWatch.entries")
     private static let stampKey = Install.key("pickupWatch.stampSupported")
-    private static let notificationPrefix = "pickup-watch-"
+    /// Also named in JoriNotificationService/NotificationService.swift, which
+    /// cancels these when a reply push arrives.
+    static let notificationPrefix = "pickup-watch-"
 
     init(supabase: SupabaseClient) {
         self.supabase = supabase
@@ -145,8 +147,15 @@ final class PickupWatch {
             self?.endBackgroundTask()
         }
         Task { @MainActor [weak self] in
-            try? await Task.sleep(for: .seconds(4))
-            await self?.check()
+            // Twice: most messages are stamped as received within a second,
+            // but a busy host can take longer, and a missed check here leaves
+            // the alarm armed (iOS gives a backgrounded app about 30 s).
+            for delay in [4, 16] {
+                try? await Task.sleep(for: .seconds(delay))
+                guard let self else { return }
+                await self.check()
+                if self.entries.isEmpty { break }
+            }
             self?.endBackgroundTask()
         }
         #else
@@ -219,10 +228,16 @@ final class PickupWatch {
 
     private func scheduleNotification(for entry: PickupEntry) {
         let content = UNMutableNotificationContent()
-        content.title = "Not picked up yet"
-        content.body = "Your message hasn't been picked up in 10 minutes. \(Install.displayName) may be down."
+        // Says what is wrong, what it means for the message, and what to do
+        // (the owner, 2026-11-21: "not clear what this is about and what I
+        // can do when I get it").
+        content.title = "\(Install.displayName) hasn't received your message"
+        content.body = "It's been 10 minutes and the Mac running \(Install.displayName) hasn't picked it up. "
+            + "Check that the Mac is awake and online. Your message is saved and will be answered once it's back."
         // message_id deep-links to the bubble, like any Jori notification.
-        content.userInfo = ["message_id": entry.id.uuidString, "kind": "pickup_watch"]
+        // channel lets the notification service extension cancel it when a
+        // reply in that channel arrives while the app is suspended.
+        content.userInfo = ["message_id": entry.id.uuidString, "kind": "pickup_watch", "channel": entry.channel]
         content.sound = .default
         let fireIn = entry.sentAt.addingTimeInterval(PickupRules.deadline + PickupRules.notificationGrace)
             .timeIntervalSinceNow

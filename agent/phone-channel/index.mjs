@@ -435,7 +435,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
           // time-sensitive, the user's decision 2026-11-05), with no Jev call;
           // `urgent` additionally marks the NSE's urgent flag.
           await sendApnsPush(supabase, {
-            body, messageId: msgId, channel: replyChannel, urgent: timeSensitive, skipMotionGate: true, announce: "always",
+            body, messageId: msgId, channel: replyChannel, urgent: timeSensitive, skipMotionGate: true, announce: "always", pickupProof: true,
           });
         } catch (err) {
           console.error(`[phone-channel] Push failed: ${err.message}`);
@@ -809,6 +809,27 @@ async function routeOpenAnswer(row, text) {
   }
 }
 
+/**
+ * Mark the user's row as received, the moment this process takes it. The app's
+ * pickup watch (apps/companion PickupWatch.swift) arms a 10-minute "not picked
+ * up" alarm on the phone at send time and cancels it on the first sign the
+ * message got here. Until 2026-11-21 the only signs were assistant rows (the
+ * "working" placeholder, a reply), which a message that gets no placeholder
+ * (a short "thanks", a role's conversation, a choice tap) or a slow one did
+ * not produce in time, so the alarm went off while everything was fine. The
+ * stamp is `metadata.picked_up_at` (PickupRules.stampKeys), merged into the
+ * row's existing metadata. Fire-and-forget: a failed stamp only leaves the
+ * old signs to decide. (A share bundle stamps its newest row; the share
+ * extension's rows are not watched.)
+ */
+function stampPickedUp(row) {
+  if (!row?.id || row?.metadata?.picked_up_at) return;
+  const metadata = { ...(row.metadata || {}), picked_up_at: new Date().toISOString() };
+  supabase.from("jori_messages").update({ metadata }).eq("id", row.id)
+    .then(({ error }) => { if (error) log(`pickup stamp failed for ${row.id}: ${error.message}`); },
+      (err) => log(`pickup stamp failed for ${row.id}: ${err?.message || err}`));
+}
+
 async function handleIncomingMessage(row) {
   if (!row.shareBundleIds && shareBundler.add(row)) return;
   const msgId = row.id;
@@ -823,6 +844,7 @@ async function handleIncomingMessage(row) {
   if (!row.shareBundleIds) shareBundler.flush();
   pendingMessages.set(msgId, { text, t0_created: createdAt, channel: row.channel || "chat", conversation_id: row.conversation_id || null });
   ensureStreamPoll();
+  stampPickedUp(row);
 
   // Persist the user's current timezone for trigger scripts (pulse sleep-window check).
   //

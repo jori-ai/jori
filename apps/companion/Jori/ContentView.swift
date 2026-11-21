@@ -2324,12 +2324,12 @@ struct MessageBubble: View, Equatable {
     /// Calm on purpose: it reports what the app can see (no sign of pickup),
     /// not a diagnosis, and it leaves on its own when a sign arrives.
     private var notPickedUpLine: some View {
-        Label("Not picked up yet — \(Install.displayName) may be down", systemImage: "clock.badge.exclamationmark")
+        Label("Not received yet. Check that the Mac running \(Install.displayName) is awake and online.", systemImage: "clock.badge.exclamationmark")
             .font(.caption2)
             .foregroundStyle(.secondary)
             .padding(.horizontal, 8)
             .padding(.bottom, 2)
-            .accessibilityLabel("Not picked up yet. \(Install.displayName) may be down.")
+            .accessibilityLabel("Not received yet. Check that the Mac running \(Install.displayName) is awake and online.")
     }
 
     // MARK: Pointer — quick actions on hover (Mac, iPad with a pointer)
