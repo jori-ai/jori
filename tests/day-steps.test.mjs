@@ -920,3 +920,57 @@ test("cutting a stop around a moved span loses no photo, and two answers in one 
   assert.deepEqual(two.stops.map(s => s.place.name), ["Home", "Bakery", "Bookshop"]);
   assert.deepEqual(two.stops.slice(1).map(s => s.id), ["s1-m1-1", "s1-m1-2"]);
 });
+
+// ---------------------------------------------------------------------------
+// A quiet stretch at one place with a short walk away in it is one stay.
+// The shape: one still fix at home at 23:01, then nothing until 23:50, both at
+// the house. A second device counted an 11-minute walk at 23:02 while the phone
+// counted nothing (a short walk, phone left behind); at 23:25 both devices
+// counted a 13-minute walk (the phone went along, its GPS quiet). The span ran
+// from the first walk away to the end of the LAST walk of any kind: a 37-minute
+// stop of unknown place, and the summary asked where the user was. The user's
+// own answer is not in these readings. A walk with the phone that starts under
+// min_moved_min after the walk away ended no longer stretches the span; after
+// a long still stretch it still does (the walk home from a café).
+// ---------------------------------------------------------------------------
+const lateStop = () => homeStop(at(17, 49), at(24));
+const latePings = () => [fix(at(17, 49), 1), fix(at(19), -2), fix(at(20, 30), 1), fix(at(22, 10)), fix(at(22, 34), 3),
+  fix(at(23, 1), 1), fix(at(23, 50), 2), fix(at(23, 55), 2)];
+const lateSteps = () => [one(at(22), at(22, 1), 40, PHONE), one(at(22, 30), at(22, 31), 35, PHONE),
+  one(at(23, 2), at(23, 13), 620, WATCH),
+  one(at(23, 25), at(23, 38), 700, WATCH), one(at(23, 25), at(23, 38), 690, PHONE),
+  one(at(23, 52), at(23, 53), 30, PHONE)];
+
+test("a short walk the phone sat out, then a walk with it, stays one stay at home", () => {
+  for (const phone_sources of [[], [PHONE]]) {
+    const r = splitStopsOnMovedSilence([lateStop()], latePings(), lateSteps(), { config: cfg({ phone_sources }), hm });
+    assert.deepEqual(r.stops.map(s => s.id), ["s1"], JSON.stringify(r.split));
+    assert.ok(!r.stops.some(s => s.moved_place_unknown), "no place-unknown stop, so nothing to ask about");
+    const sil = r.silences.find(x => x.from_ms === at(23, 1));
+    assert.equal(sil.verdict, "moved_briefly");
+    assert.deepEqual(sil.walks.map(w => w.away), [true, false]);
+    assert.equal(r.split.length, 0);
+  }
+});
+
+test("after a long still stretch the walk with the phone is the way home, and the span stands", () => {
+  const steps = [...lateSteps().filter(x => x.start_date !== iso(at(23, 25))),
+    one(at(23, 34), at(23, 46), 700, WATCH), one(at(23, 34), at(23, 46), 690, PHONE)];   // 21 minutes after the walk away
+  const r = splitStopsOnMovedSilence([lateStop()], latePings(), steps, { config: cfg(), hm });
+  const m = r.stops.find(s => s.moved_place_unknown);
+  assert.ok(m, JSON.stringify(r.silences));
+  assert.equal(hm(m.start_ts_ms), hm(at(23, 1)));
+});
+
+test("JORI_MOVED_SILENCE_AWAY_END=0 ends the span at the last walk of any kind again", () => {
+  const prev = process.env.JORI_MOVED_SILENCE_AWAY_END;
+  process.env.JORI_MOVED_SILENCE_AWAY_END = "0";
+  try {
+    const r = splitStopsOnMovedSilence([lateStop()], latePings(), lateSteps(), { config: cfg(), hm });
+    const m = r.stops.find(s => s.moved_place_unknown);
+    assert.ok(m);
+    assert.equal(`${hm(m.start_ts_ms)}-${hm(m.end_ts_ms)}`, `${hm(at(23, 1))}-${hm(at(23, 38))}`);
+  } finally {
+    if (prev === undefined) delete process.env.JORI_MOVED_SILENCE_AWAY_END; else process.env.JORI_MOVED_SILENCE_AWAY_END = prev;
+  }
+});
