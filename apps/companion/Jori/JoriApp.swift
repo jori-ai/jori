@@ -160,6 +160,32 @@ extension Notification.Name {
     static let openJoriMessage = Notification.Name("openJoriMessage")
 }
 
+/// A tapped chat notification: the message it names and, when the push
+/// carries it, the conversation the message lives in, so the app can open
+/// that conversation without first asking the server (the owner, 2026-11-21:
+/// "tapping a chat notification should go directly to the channel it came
+/// from"). The conversation rides in the posted note's userInfo under `conversationKey`.
+enum NotificationTap {
+    static let conversationKey = "conversation"
+    /// Conversation named by a tap that arrived before the UI could take it.
+    static var pendingConversation: String?
+
+    /// Stash and announce the tap. A relayed push whose service extension did
+    /// not run still has its payload sealed, so it is opened here first.
+    static func open(_ raw: [AnyHashable: Any]) {
+        let userInfo = PushCrypto.unwrapped(raw)
+        guard let idString = userInfo["message_id"] as? String,
+              let uuid = UUID(uuidString: idString) else { return }
+        let conversation = (userInfo["conversation_id"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+        AppDelegate.pendingMessageId = uuid
+        pendingConversation = conversation
+        NotificationCenter.default.post(
+            name: .openJoriMessage, object: uuid,
+            userInfo: conversation.map { [conversationKey: $0] }
+        )
+    }
+}
+
 /// A message read on one device takes its banner off the others. The server
 /// sends a silent push {kind: "clear_notifications", message_ids, badge} when a
 /// pushed message flips to read (sendClearPush, lib/apns-push.mjs);
@@ -316,11 +342,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
             completionHandler()
             return
         }
-        if let idString = response.notification.request.content.userInfo["message_id"] as? String,
-           let uuid = UUID(uuidString: idString) {
-            AppDelegate.pendingMessageId = uuid
-            NotificationCenter.default.post(name: .openJoriMessage, object: uuid)
-        }
+        NotificationTap.open(response.notification.request.content.userInfo)
+        NSApplication.shared.activate(ignoringOtherApps: true)
         completionHandler()
     }
 
@@ -558,11 +581,7 @@ final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCent
             return
         }
 
-        if let idString = userInfo["message_id"] as? String,
-           let uuid = UUID(uuidString: idString) {
-            AppDelegate.pendingMessageId = uuid
-            NotificationCenter.default.post(name: .openJoriMessage, object: uuid)
-        }
+        NotificationTap.open(userInfo)
         completionHandler()
     }
 
