@@ -73,7 +73,33 @@ enum SupabaseManager {
         }
     }
 
-    /// Read-only check — does the Keychain hold a session (valid or stale)?
+    /// A session is saved on this device, without checking it is still
+    /// valid: no network, so launch can open on the cached app at once.
+    /// `hasSession()` is the checked answer (it refreshes an expired token).
+    static var hasStoredSession: Bool {
+        shared.auth.currentSession != nil
+    }
+
+    /// Whether the saved session is still good, telling a session the server
+    /// turned down (refresh token revoked or expired: sign in again) apart
+    /// from a network that didn't answer (keep the user in, on the cache).
+    /// The client never drops a session whose refresh failed, so the stored
+    /// one alone can't tell.
+    static func sessionIsGone() async -> Bool {
+        do {
+            _ = try await shared.auth.session
+            return false
+        } catch Auth.AuthError.sessionMissing {
+            return true
+        } catch Auth.AuthError.api(_, _, _, let response) where (400..<500).contains(response.statusCode) && response.statusCode != 429 {
+            return true
+        } catch {
+            return false
+        }
+    }
+
+    /// Does the Keychain hold a usable session? Refreshes an expired token
+    /// over the network first, so it can take a round trip.
     static func hasSession() async -> Bool {
         (try? await shared.auth.session) != nil
     }

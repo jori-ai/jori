@@ -40,7 +40,23 @@ struct JoriApp: App {
                 // scenePhase starts out active, so its onChange never fires
                 // for the first launch: start the watchdog here too.
                 .onAppear { Responsiveness.shared.resume() }
-                .task { isSignedIn = await SupabaseManager.hasSession() }
+                .task {
+                    // Open on the cached app at once when a session is saved:
+                    // `hasSession()` refreshes an expired token first (an
+                    // hour old is expired), so every launch after a break sat
+                    // on the splash for a network round trip, or until a
+                    // timeout with no signal. The check runs behind the app
+                    // and sends the user to sign in only when the server
+                    // turned the session down, not when the network failed.
+                    if SupabaseManager.hasStoredSession {
+                        isSignedIn = true
+                        if await SupabaseManager.sessionIsGone() {
+                            isSignedIn = false
+                        }
+                    } else {
+                        isSignedIn = await SupabaseManager.hasSession()
+                    }
+                }
                 .task(id: backendID) { await SupabaseManager.mirrorOnTokenChanges() }
                 .onReceive(NotificationCenter.default.publisher(for: .joriBackendChanged)) { _ in
                     backendID = SupabaseManager.backendID

@@ -95,7 +95,7 @@ struct Conversation: Identifiable, Codable, Equatable, Hashable {
 }
 
 /// What a conversation's row shows besides its people.
-struct ConversationSummary: Equatable {
+struct ConversationSummary: Equatable, Codable {
     var preview: String?
     var previewAt: Date?
     var previewFromUser = false
@@ -103,19 +103,89 @@ struct ConversationSummary: Equatable {
     var openQuestions = 0
 }
 
+// MARK: - Cache
+
+/// The conversation list as it last stood, on disk, so launch can draw it
+/// before the network answers. One small JSON file: the team, the
+/// conversations and their previews and counts. Belongs to one backend, so
+/// unpairing deletes it (Pairing.forgetBackendData).
+struct TeamSnapshot: Codable {
+    var team: [TeamMember]
+    var available: [TeamMember]
+    var conversations: [Conversation]
+    var summaries: [String: ConversationSummary]
+    var pendingImprovements: Int
+    var openQuestionMessages: [String: [Message]]
+
+    /// Bumped when the shape changes; an older file is ignored, not migrated.
+    private static let version = 1
+
+    static var url: URL {
+        let dir = (try? FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask,
+                                                appropriateFor: nil, create: true))
+            ?? FileManager.default.temporaryDirectory
+        return dir.appendingPathComponent("\(Install.storagePrefix)_conversations.v\(version).json")
+    }
+
+    static func load() -> TeamSnapshot? {
+        guard let data = try? Data(contentsOf: url) else { return nil }
+        return try? JSONDecoder().decode(TeamSnapshot.self, from: data)
+    }
+
+    func save() {
+        guard let data = try? JSONEncoder().encode(self) else { return }
+        try? data.write(to: Self.url, options: .atomic)
+    }
+
+    static func delete() {
+        try? FileManager.default.removeItem(at: url)
+    }
+}
+
 // MARK: - Store
 
 @MainActor
 final class TeamStore: ObservableObject {
-    @Published private(set) var team: [TeamMember] = []
+    // Every published list below is saved to disk when it changes and read
+    // back in init (TeamSnapshot), so the conversation list is on screen the
+    // moment the app opens instead of after four network round trips; the
+    // first refresh then brings it up to date (2026-11-21).
+    @Published private(set) var team: [TeamMember] = [] { didSet { scheduleSave() } }
     /// Roles installed but not on the team yet (jori_team.enabled = false): the
     /// user can add one, and it joins the team (system/org.md § Growing the
     /// team). A personal assistant becomes the chief of staff when one does.
-    @Published private(set) var available: [TeamMember] = []
-    @Published private(set) var conversations: [Conversation] = []
-    @Published private(set) var summaries: [String: ConversationSummary] = [:]
+    @Published private(set) var available: [TeamMember] = [] { didSet { scheduleSave() } }
+    @Published private(set) var conversations: [Conversation] = [] { didSet { scheduleSave() } }
+    @Published private(set) var summaries: [String: ConversationSummary] = [:] { didSet { scheduleSave() } }
     /// Improvement cards waiting on Face ID: counted on the software engineer's conversation.
-    @Published private(set) var pendingImprovements = 0
+    @Published private(set) var pendingImprovements = 0 { didSet { scheduleSave() } }
+
+    init() {
+        if let s = TeamSnapshot.load() {
+            team = s.team
+            available = s.available
+            conversations = s.conversations
+            summaries = s.summaries
+            pendingImprovements = s.pendingImprovements
+            openQuestionMessages = s.openQuestionMessages
+        }
+    }
+
+    private var saveTask: Task<Void, Never>?
+
+    /// Save a beat after the last change, so a refresh that publishes four
+    /// lists writes the file once.
+    private func scheduleSave() {
+        saveTask?.cancel()
+        saveTask = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(1))
+            guard !Task.isCancelled, let self else { return }
+            let snapshot = TeamSnapshot(team: team, available: available, conversations: conversations,
+                                        summaries: summaries, pendingImprovements: pendingImprovements,
+                                        openQuestionMessages: openQuestionMessages)
+            await Task.detached(priority: .utility) { snapshot.save() }.value
+        }
+    }
 
     /// The conversation on screen: its unread count reads zero.
     var activeConversation: String = ConversationID.coordinator
@@ -349,7 +419,7 @@ final class TeamStore: ObservableObject {
     }
 
     /// Every open question the badges count, by conversation (loadSummaries).
-    @Published var openQuestionMessages: [String: [Message]] = [:]
+    @Published var openQuestionMessages: [String: [Message]] = [:] { didSet { scheduleSave() } }
 
     /// Everything in a conversation the user has opened is read: clear its
     /// count here at once, and mark every unread assistant row in it read on
