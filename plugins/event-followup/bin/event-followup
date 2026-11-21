@@ -5,6 +5,9 @@
 "use strict";
 const path = require("node:path");
 const { pathToFileURL } = require("node:url");
+// gog needs GOG_KEYRING_PASSWORD and the watchlist its Supabase key, from .env
+// (launchd hands this job no secrets); existing values are never overridden.
+try { require(path.join(__dirname, "..", "..", "..", "lib", "load-env.js")).loadEnv(); } catch { /* no .env: the calendar read reports it */ }
 import(pathToFileURL(path.join(__dirname, "..", "lib", "cli.mjs")).href).catch((e) => {
   process.stderr.write(`event-followup: ${e && e.stack || e}\n`);
   process.exit(1);
