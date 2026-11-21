@@ -41,7 +41,7 @@ Never use the 9222 automation profile or the chrome-devtools MCP for a purchase:
 2. `curl -s localhost:9224/json/version` must answer. If not, tell the user in one line that the shopping browser on the host is down, and stop.
 3. Resolve the delivery address and card BEFORE shopping:
    - **Address:** what the user said, else the default for where the user will be at delivery time (the local additions name this instance's homes; `travel-schedule` skill for where the user will be). Gifts go where the user says; never guess a third party's address — ask.
-   - **Card:** what the user said, else the card the merchant account already defaults to. You will read its label + last 4 off the review page.
+   - **Card:** what the user said, else the card the merchant account already defaults to. You will read its label + last 4 off the review page (for a card you entered with `purchase card`, they are that card's, which the page may not print).
 
 ## Step 1 — Sign in (only if needed)
 
@@ -108,7 +108,7 @@ Then:
   [--note "<why this pick, plain text>"] [--image <seat map / shop-snap URL>]
 ```
 
-It checks the live page shows your total and card last 4 (and the ship-to ZIP), screenshots it, files the approval and pushes it to the user's phone. **Exit 3 means the page doesn't show what you wrote — re-read the page and fix the JSON. Never edit the JSON to something the page doesn't show.**
+It checks the live page shows your total and card last 4 (and the ship-to ZIP), screenshots it, files the approval and pushes it to the user's phone. A card typed into a processor's frame with `purchase card` often never appears in the review page's text; then it checks the last 4 inside that frame instead (the number field must end in them; yes or no only, the value never leaves the page), and the order step re-checks it the same way after Face ID. So write the card's real last 4 even when the page doesn't print them. **Exit 3 means the page doesn't show what you wrote — re-read the page and fix the JSON. Never edit the JSON to something the page (or its card frame) doesn't show.**
 
 ## Step 4 — Tell the user, then wait
 
