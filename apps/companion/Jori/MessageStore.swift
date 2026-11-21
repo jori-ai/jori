@@ -72,17 +72,32 @@ final class CachedMessage {
                   sender: message.sender)
     }
 
-    func apply(_ message: Message) {
-        self.role = message.role
-        self.content = message.content
-        self.read = message.read
-        self.createdAt = message.createdAt
-        self.reaction = message.reaction?.rawValue
-        self.channel = message.channel
-        self.replyTo = message.replyTo
-        self.metadataJSON = Self.encode(message.metadata)
-        self.conversationId = message.conversationId
-        self.sender = message.sender
+    /// Copy the message's fields onto this row. Writes only the fields that
+    /// differ and returns whether any did: assigning an unchanged value still
+    /// dirties a SwiftData row, and the 30 s catch-up used to rewrite all 500
+    /// cached rows to disk every time (MetricKit disk-write reports, and a
+    /// ~0.5 s main-thread hang every ~35 s on the Mac, 2026-11-21).
+    @discardableResult
+    func apply(_ message: Message) -> Bool {
+        var changed = false
+        func set<T: Equatable>(_ path: ReferenceWritableKeyPath<CachedMessage, T>, _ value: T) {
+            if self[keyPath: path] != value { self[keyPath: path] = value; changed = true }
+        }
+        set(\.role, message.role)
+        set(\.content, message.content)
+        set(\.read, message.read)
+        set(\.createdAt, message.createdAt)
+        set(\.reaction, message.reaction?.rawValue)
+        set(\.channel, Optional(message.channel))
+        set(\.replyTo, message.replyTo)
+        // Compare decoded, not encoded: dictionary key order makes the JSON
+        // text of equal metadata differ from encode to encode.
+        if Self.decode(metadataJSON) != message.metadata {
+            metadataJSON = Self.encode(message.metadata); changed = true
+        }
+        set(\.conversationId, Optional(message.conversationId))
+        set(\.sender, message.sender)
+        return changed
     }
 
     var asMessage: Message {
@@ -106,6 +121,7 @@ final class MessageStore {
     private let container: ModelContainer
     private var context: ModelContext { container.mainContext }
     private var runningBytes: Int = 0
+    private var runningBytesSeeded = false
 
     private init() {
         let schema = Schema([CachedMessage.self])
@@ -137,10 +153,27 @@ final class MessageStore {
             runningBytes = 0
             return []
         }
-        runningBytes = rows.reduce(0) { $0 + cost(for: $1.content) }
+        if !runningBytesSeeded {
+            runningBytes = rows.reduce(0) { $0 + cost(for: $1.content) }
+            runningBytesSeeded = true
+        }
         return rows
             .filter { $0.conversation == conversation }
             .map(\.asMessage)
+    }
+
+    /// Whether anything is cached for this conversation. A count query with
+    /// limit 1 — `loadAll` would fault in and decode every cached row, and
+    /// the catch-up timer asked this every 30 s on the main thread.
+    /// Rows cached before conversation ids existed (2026-11-10) don't count;
+    /// for those the next fetch is just the fresh-install one.
+    func hasRows(conversation: String) -> Bool {
+        let target = conversation
+        var descriptor = FetchDescriptor<CachedMessage>(
+            predicate: #Predicate { $0.conversationId == target }
+        )
+        descriptor.fetchLimit = 1
+        return ((try? context.fetchCount(descriptor)) ?? 0) > 0
     }
 
     /// Full reconciliation against a fresh server response, scoped to one
@@ -151,26 +184,41 @@ final class MessageStore {
         let descriptor = FetchDescriptor<CachedMessage>()
         guard let cached = try? context.fetch(descriptor) else { return }
 
+        if !runningBytesSeeded {
+            runningBytes = cached.reduce(0) { $0 + cost(for: $1.content) }
+            runningBytesSeeded = true
+        }
+
         var existingById: [UUID: CachedMessage] = [:]
+        var changed = false
         for row in cached {
             if row.conversation != conversation { continue }   // out of scope
             if freshIds.contains(row.id) {
                 existingById[row.id] = row
             } else {
+                runningBytes -= cost(for: row.content)
                 context.delete(row)
+                changed = true
             }
         }
 
         for msg in freshMessages {
             if let existing = existingById[msg.id] {
-                existing.apply(msg)
+                let before = cost(for: existing.content)
+                if existing.apply(msg) {
+                    runningBytes += cost(for: existing.content) - before
+                    changed = true
+                }
             } else {
                 context.insert(CachedMessage(from: msg))
+                runningBytes += cost(for: msg.content)
+                changed = true
             }
         }
 
+        // Nothing new (the usual catch-up): no save, no disk write.
+        guard changed else { return }
         try? context.save()
-        runningBytes = recomputeRunningBytes()
         if runningBytes > Self.budgetBytes {
             evictOverBudget()
         }
@@ -223,12 +271,6 @@ final class MessageStore {
 
     private func cost(for content: String) -> Int {
         Self.perRowOverheadBytes + content.utf8.count
-    }
-
-    private func recomputeRunningBytes() -> Int {
-        let descriptor = FetchDescriptor<CachedMessage>()
-        guard let rows = try? context.fetch(descriptor) else { return 0 }
-        return rows.reduce(0) { $0 + cost(for: $1.content) }
     }
 
     /// Walk newest → oldest and evict anything past the budget.

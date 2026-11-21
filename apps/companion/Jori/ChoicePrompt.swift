@@ -147,14 +147,40 @@ struct ChoicePrompt: Codable, Equatable {
     /// Decode from a message's metadata. Returns nil on anything unexpected —
     /// a malformed prompt must not take the message down with it.
     static func from(metadata: [String: String]?) -> ChoicePrompt? {
-        guard let raw = metadata?[metadataKey],
-              let data = raw.data(using: .utf8) else { return nil }
-        // No date strategy: nothing in the payload decodes to a Date any more.
-        guard let p = try? JSONDecoder().decode(ChoicePrompt.self, from: data) else { return nil }
-        // A card with a subject may carry no buttons — the user answers by typing
-        // a reply; the card is there to make plain what is being asked.
-        guard p.v == supportedVersion, !p.options.isEmpty || p.subject != nil else { return nil }
-        return p
+        guard let raw = metadata?[metadataKey] else { return nil }
+        // Asked for every message on every redraw (open-question checks, the
+        // tray, the bubble); decode each distinct payload once.
+        return cache.value(for: raw) {
+            guard let data = raw.data(using: .utf8) else { return nil }
+            // No date strategy: nothing in the payload decodes to a Date any more.
+            guard let p = try? JSONDecoder().decode(ChoicePrompt.self, from: data) else { return nil }
+            // A card with a subject may carry no buttons — the user answers by typing
+            // a reply; the card is there to make plain what is being asked.
+            guard p.v == supportedVersion, !p.options.isEmpty || p.subject != nil else { return nil }
+            return p
+        }
+    }
+
+    private static let cache = DecodeCache<ChoicePrompt>()
+}
+
+/// Remembers the result of decoding a metadata string, nil results included.
+/// Metadata is immutable per string, so a hit is always right. Thread-safe;
+/// NSCache drops entries under memory pressure.
+final class DecodeCache<Value>: @unchecked Sendable {
+    private final class Box { let value: Value?; init(_ v: Value?) { value = v } }
+    private let cache: NSCache<NSString, Box> = {
+        let c = NSCache<NSString, Box>()
+        c.countLimit = 2000
+        return c
+    }()
+
+    func value(for raw: String, decode: () -> Value?) -> Value? {
+        let key = raw as NSString
+        if let hit = cache.object(forKey: key) { return hit.value }
+        let v = decode()
+        cache.setObject(Box(v), forKey: key)
+        return v
     }
 }
 
@@ -644,13 +670,38 @@ struct SubjectStyle {
 /// "Now, since 17:25" / "17:25–18:05, ended 12 min ago" / "Today 17:25–18:05" /
 /// "Yesterday …" / "Mon …". Times are shown in the zone it happened in.
 enum SubjectTime {
-    static func parse(_ s: String?) -> Date? {
-        guard let s else { return nil }
+    // Formatters are built once and reused: creating one opens an ICU
+    // formatter, and these run on the main thread inside a once-a-minute
+    // TimelineView for every card on screen — three new formatters per card
+    // per redraw showed up as ICU frames in main-thread watchdog kills.
+    private static let lock = NSLock()
+    private static let isoFractional: ISO8601DateFormatter = {
         let f = ISO8601DateFormatter()
         f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        if let d = f.date(from: s) { return d }
+        return f
+    }()
+    private static let isoPlain: ISO8601DateFormatter = {
+        let f = ISO8601DateFormatter()
         f.formatOptions = [.withInternetDateTime]
-        return f.date(from: s)
+        return f
+    }()
+    private static var formatters: [String: DateFormatter] = [:]
+
+    private static func formatter(_ format: String, _ tz: TimeZone) -> DateFormatter {
+        lock.lock(); defer { lock.unlock() }
+        let key = "\(format)|\(tz.identifier)"
+        if let f = formatters[key] { return f }
+        let f = DateFormatter()
+        f.timeZone = tz
+        f.dateFormat = format
+        formatters[key] = f
+        return f
+    }
+
+    static func parse(_ s: String?) -> Date? {
+        guard let s else { return nil }
+        lock.lock(); defer { lock.unlock() }
+        return isoFractional.date(from: s) ?? isoPlain.date(from: s)
     }
 
     static func describe(_ s: ChoiceSubject, now: Date) -> String {
@@ -659,9 +710,7 @@ enum SubjectTime {
         let tz = s.tz.flatMap(TimeZone.init(identifier:)) ?? .current
         var cal = Calendar(identifier: .gregorian)
         cal.timeZone = tz
-        let hm = DateFormatter()
-        hm.timeZone = tz
-        hm.dateFormat = "HH:mm"
+        let hm = formatter("HH:mm", tz)
         if s.ongoing == true {
             return "Now, since \(hm.string(from: start))"
         }
@@ -680,9 +729,7 @@ enum SubjectTime {
         if let y = cal.date(byAdding: .day, value: -1, to: now), cal.isDate(start, inSameDayAs: y) {
             return "Yesterday \(span)"
         }
-        let day = DateFormatter()
-        day.timeZone = tz
-        day.dateFormat = "EEE d MMM"
+        let day = formatter("EEE d MMM", tz)
         return "\(day.string(from: start)) \(span)"
     }
 }
@@ -844,11 +891,16 @@ struct Checklist: Codable, Equatable {
     static let uncheck = "↩ "
 
     static func from(metadata: [String: String]?) -> Checklist? {
-        guard let raw = metadata?[metadataKey], let data = raw.data(using: .utf8),
-              let c = try? JSONDecoder().decode(Checklist.self, from: data),
-              c.v == 1, !c.items.isEmpty else { return nil }
-        return c
+        guard let raw = metadata?[metadataKey] else { return nil }
+        return cache.value(for: raw) {
+            guard let data = raw.data(using: .utf8),
+                  let c = try? JSONDecoder().decode(Checklist.self, from: data),
+                  c.v == 1, !c.items.isEmpty else { return nil }
+            return c
+        }
     }
+
+    private static let cache = DecodeCache<Checklist>()
 
     /// The label a tick/untick reply carries, and which way it went.
     static func toggle(in content: String) -> (label: String, checked: Bool)? {

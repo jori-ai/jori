@@ -55,6 +55,45 @@ struct MessageContentParser {
         return (head, full, label.isEmpty ? "Show more" : label)
     }
 
+    struct Parsed {
+        let segments: [MessageSegment]
+        /// The whole message when it folds (see `fold`).
+        let fullSegments: [MessageSegment]?
+        let foldLabel: String
+    }
+
+    /// `parse` (and `fold`) for a bubble, remembered per content. A bubble's
+    /// view is rebuilt on every hover, palette or list change, and parsing
+    /// runs link detection and regexes (ICU) on the main thread each time;
+    /// the content of a message never changes.
+    static func parsed(_ content: String) -> Parsed {
+        let key = ((ShopBrowser.base?.absoluteString ?? "") + "\u{0}" + content) as NSString
+        if let hit = parsedCache.object(forKey: key) { return hit.value }
+        let value: Parsed
+        if let fold = fold(content) {
+            value = Parsed(segments: parse(fold.head), fullSegments: parse(fold.full), foldLabel: fold.label)
+        } else {
+            value = Parsed(segments: parse(content), fullSegments: nil, foldLabel: "")
+        }
+        parsedCache.setObject(ParsedBox(value), forKey: key)
+        return value
+    }
+
+    private final class ParsedBox {
+        let value: Parsed
+        init(_ value: Parsed) { self.value = value }
+    }
+
+    private static let parsedCache: NSCache<NSString, ParsedBox> = {
+        let c = NSCache<NSString, ParsedBox>()
+        c.countLimit = 1000
+        return c
+    }()
+
+    /// Built once: an NSDataDetector compiles its patterns on creation, and one
+    /// was being made for every URL-looking line of every bubble.
+    private static let linkDetector = try? NSDataDetector(types: NSTextCheckingResult.CheckingType.link.rawValue)
+
     /// Parse message content into renderable segments.
     /// Standalone URLs on their own line become images or link previews.
     /// Everything else is coalesced into markdown segments.
@@ -120,11 +159,24 @@ struct MessageContentParser {
     static func linkShopBrowser(_ line: String) -> String {
         guard let base = ShopBrowser.base,
               let host = base.host, line.contains(host) else { return line }
-        let root = base.absoluteString.hasSuffix("/") ? String(base.absoluteString.dropLast()) : base.absoluteString
-        let pattern = "(?<!\\]\\()" + NSRegularExpression.escapedPattern(for: root) + "(?:/[^\\s)>\\]]*)?"
-        guard let re = try? NSRegularExpression(pattern: pattern) else { return line }
+        guard let re = shopBrowserRegex(for: base) else { return line }
         let range = NSRange(line.startIndex..., in: line)
         return re.stringByReplacingMatches(in: line, range: range, withTemplate: "[Open the shop browser]($0)")
+    }
+
+    private static let regexLock = NSLock()
+    nonisolated(unsafe) private static var shopRegex: (base: URL, re: NSRegularExpression)?
+
+    /// The shop-browser link pattern, compiled once per base address rather
+    /// than once per line.
+    private static func shopBrowserRegex(for base: URL) -> NSRegularExpression? {
+        regexLock.lock(); defer { regexLock.unlock() }
+        if let cached = shopRegex, cached.base == base { return cached.re }
+        let root = base.absoluteString.hasSuffix("/") ? String(base.absoluteString.dropLast()) : base.absoluteString
+        let pattern = "(?<!\\]\\()" + NSRegularExpression.escapedPattern(for: root) + "(?:/[^\\s)>\\]]*)?"
+        guard let re = try? NSRegularExpression(pattern: pattern) else { return nil }
+        shopRegex = (base, re)
+        return re
     }
 
     /// Strip leading emoji + whitespace prefixes commonly used for link lines (e.g., "🔗 https://...")
@@ -155,8 +207,7 @@ struct MessageContentParser {
         }
 
         // Verify the URL spans the entire line (no extra text)
-        let detector = try? NSDataDetector(types: NSTextCheckingResult.CheckingType.link.rawValue)
-        guard let match = detector?.firstMatch(in: trimmed, range: NSRange(trimmed.startIndex..., in: trimmed)) else {
+        guard let match = linkDetector?.firstMatch(in: trimmed, range: NSRange(trimmed.startIndex..., in: trimmed)) else {
             return nil
         }
         // The match must cover the full string
