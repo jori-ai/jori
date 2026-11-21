@@ -714,7 +714,16 @@ final class HealthKitManager {
         let received_date: String
         let source_name: String?
         let source_bundle_id: String?
-        let fhir_json: AnyJSON
+        /// The FHIR resource as HealthKit gave it; sent as the jsonb
+        /// `fhir_json` column by RawJSONUpload, never through the encoder
+        /// (decoding it into AnyJSON recursed per level and could overflow
+        /// the stack on a deep record).
+        let fhir_json: Data
+
+        enum CodingKeys: String, CodingKey {
+            case hk_uuid, device_id, hk_clinical_type, fhir_resource_type, fhir_id, fhir_version,
+                 display_name, received_date, source_name, source_bundle_id
+        }
     }
 
     private func syncClinicalType(_ type: HKClinicalType, reason: String, deviceId: String) async {
@@ -757,16 +766,12 @@ final class HealthKitManager {
                 // clinical types that were written before FHIR support.
                 continue
             }
-            let jsonObj = (try? JSONSerialization.jsonObject(with: fhir.data)) as? [String: Any]
-            let resourceType = jsonObj?["resourceType"] as? String ?? fhir.resourceType.rawValue
-            let fhirId = jsonObj?["id"] as? String ?? fhir.identifier
-            let anyJson: AnyJSON
-            do {
-                anyJson = try JSONDecoder().decode(AnyJSON.self, from: fhir.data)
-            } catch {
-                print("[Health] clinical \(r.uuid) FHIR decode failed: \(error.localizedDescription) — skipping")
+            guard let jsonObj = (try? JSONSerialization.jsonObject(with: fhir.data)) as? [String: Any] else {
+                print("[Health] clinical \(r.uuid) FHIR payload is not a JSON object — skipping")
                 continue
             }
+            let resourceType = jsonObj["resourceType"] as? String ?? fhir.resourceType.rawValue
+            let fhirId = jsonObj["id"] as? String ?? fhir.identifier
             rows.append(ClinicalRow(
                 hk_uuid: r.uuid.uuidString,
                 device_id: deviceId,
@@ -778,10 +783,14 @@ final class HealthKitManager {
                 received_date: iso.string(from: r.startDate),
                 source_name: r.sourceRevision.source.name,
                 source_bundle_id: r.sourceRevision.source.bundleIdentifier,
-                fhir_json: anyJson
+                fhir_json: fhir.data
             ))
         }
-        try await sendBatches(rows, table: "health_clinical_records", conflict: "hk_uuid")
+        guard !rows.isEmpty else { return }
+        for chunk in rows.chunked(into: batchSize) {
+            try await RawJSONUpload.send(table: "health_clinical_records", rawKey: "fhir_json",
+                                         rows: chunk.map { ($0, $0.fhir_json) }, onConflict: "hk_uuid")
+        }
     }
 
     private func uploadWorkouts(_ workouts: [HKWorkout], deviceId: String) async throws {
