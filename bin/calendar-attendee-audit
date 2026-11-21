@@ -23,6 +23,13 @@
 //                    was bypassed. Report it.
 //   UNEXPLAINED    — no log row at all → written around the wrapper entirely.
 //                    Report it.
+//   EXPLAINED      — no log row at all, but the event carries a third-party
+//                    conference add-on (conferenceSolution.key.type "addOn").
+//                    Only a person's own Calendar editing session can attach
+//                    one; an API write cannot. So it was made in the editor by
+//                    a person: counted and shown in --json, never paged, never
+//                    written to the seen ledger. A row-covered event (partial)
+//                    is judged as above even with an add-on conference.
 //
 // Reports to the SYSTEM channel, never to chat: this is Jori's own hygiene.
 // Silent when everything reconciles, which should be almost every night.
@@ -43,7 +50,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { execFileSync, spawnSync } from "node:child_process";
 import { createRequire } from "node:module";
-import { seriesKey, collapseFindings, formatFindingLine, inAuditScope } from "../lib/calendar-audit-group.js";
+import { seriesKey, collapseFindings, formatFindingLine, inAuditScope, madeInCalendarEditor } from "../lib/calendar-audit-group.js";
 
 const require = createRequire(import.meta.url);
 const { instance, localConfig } = require("../lib/instance.cjs");
@@ -57,9 +64,10 @@ const LOG = installTools("data/logs/calendar-writes.jsonl");
 // Events already reported once. A detective control has to be impossible to
 // MISS, which it is on the first firing; it does not have to be repeated. The
 // population it flags is {a write that dodged the wrapper} UNION {an invite
-// the user created themselves}, and Google gives no field that separates them —
-// creator.self is true for both. So re-reporting the same event every time it
-// is touched turns the one channel that guards an irreversible action into
+// the user created themselves}. No Google field separates them in general —
+// creator.self is true for both; the one structural exception, a third-party
+// conference add-on, is handled below (madeInCalendarEditor). So re-reporting
+// the same event every time it is touched turns the one channel that guards an irreversible action into
 // wallpaper: two meetings the user booked by hand were once paged as "Jori
 // cannot account for", with a closing line asking the user to go and check the
 // creator. Report once, remember, stay quiet.
@@ -237,6 +245,9 @@ const rows = auditRows();
 // event per occurrence, so these are folded by series below before anything is
 // reported or remembered — see lib/calendar-audit-group.js.
 const rawFindings = [];
+// Events with no log row that a person made in the Calendar editor (see
+// madeInCalendarEditor). Counted and shown, never paged or remembered.
+const explainedByEditor = [];
 
 for (const ev of events) {
   if (!userOrganized(ev)) continue;
@@ -307,6 +318,15 @@ for (const ev of events) {
     has_description: Boolean(String(ev?.description || "").trim()),
   };
   if (!uncovered.length) continue;                 // every guest has a quote on file
+  // No log row of any kind references this event, and it carries an add-on
+  // conference only the Calendar editor can attach: a person made it there.
+  if (evRows.length === 0 && madeInCalendarEditor(ev)) {
+    explainedByEditor.push({
+      id: facts.id, summary: facts.summary, uncovered: facts.uncovered,
+      created: facts.created, updated: facts.updated,
+    });
+    continue;
+  }
   rawFindings.push({ kind: evRows.length ? "partial" : "unexplained", ...facts });
 }
 
@@ -335,17 +355,22 @@ if (AS_JSON) {
     window_days: DAYS, events_checked: events.length,
     findings: findings.map((f) => ({ ...f, reported_before: alreadyReported(seen, f) })),
     fresh: fresh.length,
+    explained_by_editor: explainedByEditor.length,
+    explained: explainedByEditor,
   }, null, 2));
   process.exit(0);
 }
 
+const editorNote = explainedByEditor.length
+  ? ` (${explainedByEditor.length} made in the calendar editor via a conference add-on, not paged)` : "";
+
 if (!findings.length) {
-  console.log(`calendar-attendee-audit: ${events.length} event(s) in the last ${DAYS}d, no unexplained invites.`);
+  console.log(`calendar-attendee-audit: ${events.length} event(s) in the last ${DAYS}d, no unexplained invites${editorNote}.`);
   process.exit(0);
 }
 
 if (!fresh.length) {
-  console.log(`calendar-attendee-audit: ${findings.length} finding(s), all previously reported — staying quiet.`);
+  console.log(`calendar-attendee-audit: ${findings.length} finding(s), all previously reported — staying quiet${editorNote}.`);
   process.exit(0);
 }
 
