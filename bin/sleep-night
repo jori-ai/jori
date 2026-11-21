@@ -8,11 +8,21 @@
 //   sleep-night --save              also upsert into sleep_nights; with no --night,
 //                                   saves the current night AND the one before it
 //                                   (the Watch batch can land many hours late)
+//   sleep-night --now               is the user asleep right now (live, from the phone
+//                                   rows and the Watch; lib/sleep-night.js asleepNow)
+//   sleep-night --gate [--fallback FROM-TO] [--tz ZONE]
+//                                   should a ping hold now? exit 0 = asleep, HOLD;
+//                                   1 = awake or unknown, go (any failure is "go"
+//                                   to a shell `if …; then hold; fi`: fail-open).
+//                                   FROM-TO = the caller's old quiet hours, used
+//                                   only without any sleep sensing. Reads the
+//                                   cron's state file, no network.
 //   sleep-night --json
 //
 // With --save it also writes data/sleep-night-state.json (the current
-// night + written_at), which `jori activity` reads synchronously so hum's
-// quiet-hours gate follows the phone instead of the clock.
+// night + `asleep_now`, the live reading, + written_at). Every "may Jori ping
+// now?" gate reads `asleep_now` through SN.sleepSignal / --gate, so pings follow
+// whether the user is asleep, never the clock.
 
 const fs = require("node:fs");
 const path = require("node:path");
@@ -20,10 +30,38 @@ const SN = require("../lib/sleep-night.js");
 const { installTools } = require("../lib/root.cjs");
 const STATE = installTools("data/sleep-night-state.json");
 
+// The last message the user typed to Jori (phone or desktop app): proof of being up.
+function lastUserMessageMs() {
+  try {
+    const c = JSON.parse(fs.readFileSync(installTools("data/phone-channel-cursor.json"), "utf8"));
+    const ms = Date.parse(c.lastSeenAt);
+    return Number.isFinite(ms) ? ms : null;
+  } catch { return null; }
+}
+
 (async () => {
   const argv = process.argv.slice(2);
   const json = argv.includes("--json");
   const save = argv.includes("--save");
+  if (argv.includes("--gate")) {
+    const val = (f) => { const i = argv.indexOf(f); return i >= 0 ? argv[i + 1] : undefined; };
+    let fallback = null;
+    const fb = val("--fallback");
+    if (fb) { const [from, to] = fb.split("-").map(Number); if (Number.isFinite(from) && Number.isFinite(to)) fallback = { from, to }; }
+    const r = SN.holdForSleep({ tz: val("--tz") || SN.userTz(), fallback });
+    console.log(json ? JSON.stringify(r) : `${r.hold ? "hold" : "go"} [${r.source}] ${r.reason}`);
+    process.exit(r.hold ? 0 : 1);
+  }
+  if (argv.includes("--now")) {
+    const tz = SN.userTz();
+    let night = null;
+    try { night = await SN.fetchNight(SN.currentNightOf(tz), { tz }); } catch {}
+    const r = await SN.fetchAsleepNow({ tz, night, lastUserMessageMs: lastUserMessageMs() });
+    if (json) { console.log(JSON.stringify(r, null, 2)); return; }
+    const word = r.asleep === true ? "ASLEEP — pings hold" : r.asleep === false ? "awake — pings may go out" : "unknown — pings may go out (fail-open)";
+    console.log(`${word}\n  ${r.reason}`);
+    return;
+  }
   const ni = argv.indexOf("--night");
   let nights;
   if (ni >= 0 && argv[ni + 1]) nights = [argv[ni + 1]];
@@ -45,8 +83,11 @@ const STATE = installTools("data/sleep-night-state.json");
   if (save && ni < 0) {
     const cur = out[out.length - 1];
     if (!cur.fetch_errors) {
+      // A failed read leaves the file as it was; after 15 min its live reading is
+      // stale, which SN.sleepSignal reads as unknown (never holds).
+      const asleepNow = await SN.fetchAsleepNow({ tz: cur.tz, night: cur, lastUserMessageMs: lastUserMessageMs() });
       const tmp = `${STATE}.tmp`;
-      fs.writeFileSync(tmp, JSON.stringify({ ...cur, written_at: new Date().toISOString() }, null, 2));
+      fs.writeFileSync(tmp, JSON.stringify({ ...cur, asleep_now: asleepNow, written_at: new Date().toISOString() }, null, 2));
       fs.renameSync(tmp, STATE);
     }
   }

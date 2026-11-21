@@ -30,12 +30,12 @@ dispatch (an event bundle from hum-sense, or the idle/watchdog fallback)
 **Jev gate (2026-09-23).** `hum-sense` also asks Jev (`lib/jev-hum-gate.mjs`); a confident "nothing worth pinging" skips the dispatch, anything else reaches this playbook unchanged. Health, exercise, finance, stocks, workout events and idle-only bundles never go to Jev. See `docs/jev.md`.
 
 By the time a dispatch reaches this playbook, the `hum-sense` gate (`lib/hum-events.mjs`) has already verified — for an event dispatch — that:
-- Not in the quiet window (00:00-09:00 local), activity is not `sleeping` / `winding_down`, hum is not paused
+- The user is not asleep (the sleep signal: sleep data + the phone's lock/unlock rows, never the clock; awake means any hour, unknown fails open; the 00:00-09:00 quiet window only without sleep sensing), activity is not `sleeping` (nor, without sleep sensing, `winding_down`), hum is not paused
 - They are not in a meeting, not mid-conversation with the chat agent, and have no outstanding hum question
 - Nothing was dispatched inside the 10-min refractory window, and this moment's salience cleared the (rising) threshold
 - No event in the bundle repeats a `dedup_key` inside its cooldown
 
-The `watchdog-fallback` path (`trigger-hum.sh`, engine down) applies its own subset: sleep window, activity state, calendar-busy, pause. That check is cron-only — it never runs inside this playbook.
+The `watchdog-fallback` path (`trigger-hum.sh`, engine down) applies its own subset: the sleep hold (`sleep-night --gate`, the same signal), activity state, calendar-busy, pause. That check is cron-only — it never runs inside this playbook.
 
 **Do NOT re-derive the quiet/sleep window from the `<live-state>` banner's clock** — it is always the installation's home time zone (`instance.cjs tz`); `hum-sense` gates on `data/user-timezone.json` (their current location). If a dispatch reached this playbook, every gate above is satisfied — go straight to Step 1. The only clock you reason about is what Step 1 reports. (Incident: hum-detail.md § Step 0.)
 

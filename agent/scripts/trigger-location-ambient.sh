@@ -23,11 +23,11 @@ DATA="$ROOT/data"
 LOG="$DATA/logs/location-ambient.log"
 log() { mkdir -p "$(dirname "$LOG")" 2>/dev/null; echo "$(date '+%Y-%m-%d %H:%M:%S') [location-ambient] $1" >> "$LOG"; }
 
-# 1. Sleep window check — abort if in the user's sleep hours (01:00–08:00 LOCAL).
-# Resolve the user's current tz (phone-reported → user-timezone.json, home-zone
-# fallback) so this gate follows the user when travelling. Mirrors
-# trigger-hum.sh / trigger-location-enrich.sh. Base-10 normalize to avoid octal
-# parse of "08"/"09".
+# 1. Sleep check — abort while the user is asleep, decided from sleep data and
+# the phone's lock/unlock rows (bin/sleep-night --gate), never the clock. Only an
+# installation with no sleep sensing falls back to 01:00–08:00 in the user's
+# current tz (phone-reported → user-timezone.json, home-zone fallback), so it
+# follows the user when travelling. Mirrors trigger-hum.sh.
 USER_TZ_FILE="$DATA/user-timezone.json"
 USER_TZ="${JORI_TZ:-UTC}"
 if [[ -f "$USER_TZ_FILE" ]]; then
@@ -36,8 +36,7 @@ if [[ -f "$USER_TZ_FILE" ]]; then
     USER_TZ="$PARSED_TZ"
   fi
 fi
-HOUR=$((10#$(TZ="$USER_TZ" date +%H)))
-if (( HOUR >= 1 && HOUR < 8 )); then
+if "${JORI_NODE:-node}" "$(dirname "$0")/../../bin/sleep-night" --gate --fallback 1-8 --tz "$USER_TZ" >/dev/null 2>&1; then
   exit 0
 fi
 

@@ -1,7 +1,7 @@
 # Comedy Club Watch — big-name comedians booking small rooms
 
 **Schedule:** the installation's (typically every 3h through the day); the first run of each local day is the **deep pass**.
-**Runs as code:** cron → `agent/scripts/trigger-comedy-club-watch.sh` (overlap lock) → `bin/comedy-club-watch-run --scheduled` (quiet hours, pause file, then the sweep). Log: `data/logs/comedy-club-watch.log`. Tests: `tests/comedy-club-watch.test.mjs`.
+**Runs as code:** cron → `agent/scripts/trigger-comedy-club-watch.sh` (overlap lock) → `bin/comedy-club-watch-run --scheduled` (the sleep hold — asleep per the sleep signal, never the clock; `quiet_before_hour` only without sleep sensing —, pause file, then the sweep). Log: `data/logs/comedy-club-watch.log`. Tests: `tests/comedy-club-watch.test.mjs`.
 **You (Haiku) are dispatched for exactly two things**, both below: the **Hits check** and **Direction A**. Everything else is the script's.
 **Configuration:** `lib/comedy-config.cjs` (agent/local/config/comedy-club-watch.json, and the private `data_file` it names): the roster (`roster_file`, via `bin/comedian`), the rooms (`venues_file`), their metro, quiet hours, companions, the state file (`seen_file`) and the hand-kept sightings (`sightings_file`, via `comedian seen`). No rooms configured: the job is off.
 

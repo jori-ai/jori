@@ -61,9 +61,11 @@ dispatch() {
 
 # --- bash gates (skip most ticks before the LLM call) ---
 
-# Hard quiet window: 00:00-09:00 local, the same span as the hum gate's default
-# quiet_hours (lib/hum-events.mjs). Manual mode bypasses it. No reason to
-# tick while the user is likely asleep.
+# Sleep hold: no tick while the user is asleep, decided from sleep data and the
+# phone's lock/unlock rows (bin/sleep-night --gate), never the clock; awake means
+# a tick at any hour. Manual mode bypasses it. 00:00-09:00 local (the hum gate's
+# default quiet_hours, lib/hum-events.mjs) is only the fallback for an
+# installation with no sleep sensing.
 USER_TZ_FILE="$HOME/Dev/jori/data/user-timezone.json"
 # Fallback: the home timezone (lib/instance.cjs tz, as JORI_TZ).
 source "$(dirname "$0")/lib/instance.sh"
@@ -74,8 +76,8 @@ if [ -f "$USER_TZ_FILE" ]; then
     USER_TZ="$PARSED_TZ"
   fi
 fi
-HOUR_LOCAL=$(TZ="$USER_TZ" date +%H)
-if [ "$MODE" != "manual" ] && [ "$HOUR_LOCAL" -lt 9 ]; then
+if [ "$MODE" != "manual" ] && SLEEP_GATE=$("${JORI_NODE:-node}" "$(dirname "$0")/../../bin/sleep-night" --gate --fallback 0-9 --tz "$USER_TZ" 2>/dev/null); then
+  log "skip:asleep ($SLEEP_GATE)"
   exit 0
 fi
 

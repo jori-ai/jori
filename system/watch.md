@@ -61,11 +61,11 @@ New sources: spool an event with `spoolEvents()` (`{type, subject_key, summary, 
 
 - **Does this candidate satisfy the condition?** Jev, site `watch-match` (`data/jev-questions/watch-match.json`, choice match / no_match / unclear, threshold 0.85) through `decide()`; below threshold, tool-less Sonnet with the same question. At most 4 Sonnet fallbacks per tick; the rest wait for the next tick.
 - **Unclear → a hum question.** `hum-ask --id watch-<match id> --lane watch` (one per tick, only when hum's question slot is free and they're awake). The user's reply lands in `hum-responses.jsonl` through the normal `hum-answer` path; Jev site `watch-answer` reads it: yes → fire, no → rejected for good, unclear → stays asked (the open-questions lane re-asks).
-- Code owns only structure: type globs, trip geometry, fire times, the awake window.
+- Code owns only structure: type globs, trip geometry, fire times, whether the owner is asleep (the sleep signal).
 
 ## Firing
 
-- By default only inside **08:00–21:59 local** (`AWAKE`, `quiet-hours.json`). A match at 03:00 is held and fires at 08:00; nothing is dropped for timing. An installation that sets `fire_any_time: true` in `agent/local/config/watches.json` fires at any hour (asking about an unclear match still waits for the awake window).
+- Only while the owner is **awake**, decided from sleep data and the phone's lock/unlock rows, never the clock (since 2026-11-21: `awakeNow()` → `lib/sleep-night.js` `holdForSleep`, the sleep plugin's live `asleep_now`). Awake means any hour; a match while they sleep is held and fires on the first tick after they are up; nothing is dropped for timing. An unknown reading (stale, unreadable) never holds. Only an installation with no sleep sensing falls back to **08:00–21:59 local** (`AWAKE`, `quiet-hours.json`). An installation that sets `fire_any_time: true` in `agent/local/config/watches.json` fires even while the owner sleeps (asking about an unclear match still waits until they are awake).
 - **notify** → `jori-send-curl --intent watch:<id> --evidence-as-of live` on chat; the precheck stays on. The message is the rule's `notify` text plus one line naming what set it off. A failed send is retried next tick (the match stays unfired).
 - **email** → `bin/email-send` to the owner (Jori's identity, straight into the inbox). `{"subject": "…"}` sets the subject; `{"subject_from": "event"}` uses the triggering event's summary, so the inbox line says what happened. The body is `email.body` (or `notify`) plus the event summary. A failed email with no other action sent is retried next tick, like a failed chat send.
 - **task** → `gog tasks add @default`.

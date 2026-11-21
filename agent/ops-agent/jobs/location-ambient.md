@@ -23,7 +23,7 @@ This job is the reason the system-wide motion gate (`lib/motion-state.mjs`, appl
 Apply in order, exit silently on match:
 
 1. **Lock check:** if `data/pulse.lock` exists and is <5 min old, exit (another pulse job is running)
-2. **Sleep window:** if hour is 01:00–08:00 in the user's local tz (phone-reported, home-zone fallback — handled by trigger script), exit
+2. **Asleep:** if the sleep signal says the user is asleep (sleep data + the phone's lock/unlock rows, never the clock; 01:00–08:00 local only without sleep sensing — handled by the trigger script), exit
 3. **Cool-down:** if a Jori message was sent <20 min ago (read `last-jori-message-at.json`), exit
 4. **Daily ping budget:** if `bin/ping-budget check` exits 1 (6 pings today across hum + ambient, or the last one < 45 min ago — the live counter in `hum-state.json` plus the `hum-feedback.jsonl` ledger, see `lib/ping-budget.mjs`), exit
 5. **Session cool-down:** if this walking session already emitted an ambient ping <90 min ago (read `location-ambient-last.json`), exit

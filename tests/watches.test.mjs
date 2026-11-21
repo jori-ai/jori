@@ -47,6 +47,8 @@ function fakeDeps(over = {}) {
     askQuestion: (q) => { calls.asked.push(q); return { code: 0 }; },
     pendingQuestionOpen: () => false,
     readResponses: () => [],
+    // The clock fallback, so these tests do not read this host's sleep state.
+    awakeNow: (ms, tz) => W.nextAwake(ms, tz) === ms,
     ...over,
   };
   return { deps, calls };
@@ -142,6 +144,48 @@ test("event watch: a 3am match is held until 08:00, then fires", async () => {
   assert.match(calls.sent[0].text, /ACME BANK/);
   assert.equal(calls.judged.length, 1);
   assert.equal(W.getRule(BOFA.id).status, "active", "recurrence each: stays armed for the next piece");
+});
+
+test("sleep signal, not the clock: asleep at 10:00 holds a match, awake at 03:00 fires it", async () => {
+  reset();
+  W.upsertRule(BOFA);
+  let awake = false;
+  const { deps, calls } = fakeDeps({
+    judgeMatch: async (rule, item) => ({ verdict: item.type === "mail.piece" ? "match" : "no_match", used: "jev" }),
+    awakeNow: () => awake,
+  });
+  W.spoolEvents([{ type: "mail.piece", subject_key: "mail:sig:1.jpg", summary: "Physical mail piece arriving today (ACME BANK)", data: {} }]);
+  await W.tick({ nowMs: Date.parse("2026-10-27T14:00:00Z"), deps, anyTime: false }); // 10:00 EDT, asleep
+  assert.equal(calls.sent.length, 0, "held while asleep, whatever the hour");
+  awake = true;
+  await W.tick({ nowMs: Date.parse("2026-10-28T07:00:00Z"), deps, anyTime: false }); // 03:00 EDT, awake
+  assert.equal(calls.sent.length, 1, "fires at 03:00 when awake");
+});
+
+test("awakeNow: the sleep reading decides; the clock only without sleep sensing", () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "sleep-sig-"));
+  const file = path.join(tmp, "state.json");
+  const prev = { s: process.env.JORI_SLEEP_STATE, g: process.env.JORI_SLEEP_SIGNAL };
+  process.env.JORI_SLEEP_STATE = file;
+  process.env.JORI_SLEEP_SIGNAL = "on";
+  try {
+    const at3 = Date.parse("2026-10-27T07:00:00Z"); // 03:00 EDT
+    const write = (asleep, asOfMs) => fs.writeFileSync(file, JSON.stringify({ asleep_now: { asleep, reason: "test", as_of: new Date(asOfMs).toISOString() } }));
+    write(false, at3);
+    assert.equal(W.awakeNow(at3, "America/New_York"), true, "awake at 03:00 → may ping");
+    write(true, Date.parse("2026-10-27T18:00:00Z"));
+    assert.equal(W.awakeNow(Date.parse("2026-10-27T18:05:00Z"), "America/New_York"), false, "asleep at 14:00 → hold");
+    assert.equal(W.awakeNow(Date.parse("2026-10-27T19:00:00Z"), "America/New_York"), true, "a stale reading is unknown → fail open");
+    write(false, Date.parse("2026-10-27T03:00:00Z"));
+    assert.equal(W.awakeNow(at3, "America/New_York"), false, "no reading for 4 h: sensing stopped, the 08-22 window stands in");
+    fs.rmSync(file);
+    process.env.JORI_SLEEP_SIGNAL = "off";
+    assert.equal(W.awakeNow(at3, "America/New_York"), false, "no sleep sensing: the old 08-22 window");
+    assert.equal(W.awakeNow(Date.parse("2026-10-27T14:00:00Z"), "America/New_York"), true);
+  } finally {
+    if (prev.s === undefined) delete process.env.JORI_SLEEP_STATE; else process.env.JORI_SLEEP_STATE = prev.s;
+    if (prev.g === undefined) delete process.env.JORI_SLEEP_SIGNAL; else process.env.JORI_SLEEP_SIGNAL = prev.g;
+  }
 });
 
 test("unclear → one hum question; his yes fires it, through the answer judge", async () => {
@@ -274,7 +318,7 @@ test("fire_any_time: only an explicit true lets firings out of the awake window"
   assert.equal(W.fireAnyTime(null), false);
 });
 
-test("quiet hours: next awake moment is 08:00 local", () => {
+test("no-sleep-sensing fallback: next awake moment is 08:00 local", () => {
   assert.equal(new Date(W.nextAwake(Date.parse("2026-10-27T07:00:00Z"), "America/New_York")).toISOString(), "2026-10-27T12:00:00.000Z");
   assert.equal(new Date(W.nextAwake(Date.parse("2026-10-28T03:30:00Z"), "America/New_York")).toISOString(), "2026-10-28T12:00:00.000Z");
 });

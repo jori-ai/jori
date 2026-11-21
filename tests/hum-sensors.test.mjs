@@ -134,7 +134,7 @@ test("a healthy sensor with no error history logs nothing", () => {
 
 // ── questions: turns a waiting queue into ticks, backs off when they send nothing ──
 
-async function questionsSensor({ waiting = 0, sends = [], pending = null, memo = {}, hour = 14, nowMs = Date.now() } = {}) {
+async function questionsSensor({ waiting = 0, sends = [], pending = null, memo = {}, hour = 14, nowMs = Date.now(), sleep } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "q-sensor-"));
   process.env.HUM_QUESTION_BACKLOG_DIR = path.join(dir, "backlog");
   process.env.HUM_QUESTION_SENDS_PATH = path.join(dir, "sends.jsonl");
@@ -147,7 +147,7 @@ async function questionsSensor({ waiting = 0, sends = [], pending = null, memo =
   if (pending) fs.writeFileSync(process.env.HUM_PENDING_QUESTION_PATH, JSON.stringify(pending));
   const mod = await import(pathToFileURL(path.join(SENSOR_DIR, "questions.mjs")).href);
   let saved = null;
-  const events = await mod.default({ config: { quiet_hours: { end: 9 } }, local: { hour }, nowMs, memo, setMemo: (m) => { saved = m; } });
+  const events = await mod.default({ config: { quiet_hours: { end: 9 } }, local: { hour }, sleep, nowMs, memo, setMemo: (m) => { saved = m; } });
   fs.rmSync(dir, { recursive: true, force: true });
   return { events, memo: saved };
 }
@@ -166,6 +166,12 @@ test("questions stays quiet overnight and while a question holds the slot", asyn
   assert.equal((await questionsSensor({ waiting: 5, hour: 7 })).events.length, 0);
   const pending = { id: "q1", expires_at: new Date(Date.now() + 600_000).toISOString() };
   assert.equal((await questionsSensor({ waiting: 5, pending })).events.length, 0);
+});
+
+test("questions follows the sleep signal, not the clock: awake at 07:00 ticks, asleep at 14:00 does not", async () => {
+  assert.equal((await questionsSensor({ waiting: 5, hour: 7, sleep: "awake" })).events.length, 1);
+  assert.equal((await questionsSensor({ waiting: 5, hour: 14, sleep: "asleep" })).events.length, 0);
+  assert.equal((await questionsSensor({ waiting: 5, hour: 3, sleep: "unknown" })).events.length, 1, "unknown fails open");
 });
 
 test("questions ticks every 5 minutes while anything waits", async () => {

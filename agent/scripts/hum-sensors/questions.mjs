@@ -11,7 +11,7 @@
 // reports, the question pool's cap and spacing, and the pending-question slot.
 // The event is `no_ramp`: the question pool is already the rate limiter for
 // questions, so the gate's chattiness ramp does not stack on top of it (the
-// question refractory (5 min), meetings and quiet hours still apply).
+// question refractory (5 min), meetings and the sleep hold still apply).
 //
 // One tick every WAIT_MIN while anything waits (the user, 2026-10-27: "make
 // ticks 5 minutes apart unless the queue is empty"). A tick whose lanes have
@@ -27,8 +27,11 @@ export const WAIT_MIN = 5;
 
 export default async function detect(ctx) {
   const { config, local, nowMs, memo, setMemo } = ctx;
-  // Overnight fires would only be dropped by the gate and count as misses.
-  if (local && local.hour < (config.quiet_hours?.end ?? 9)) return [];
+  // Fires while the user sleeps would only be dropped by the gate and count as
+  // misses. Asleep comes from the sleep signal (ctx.sleep), never the clock; the
+  // clock quiet hours only for an installation with no sleep sensing.
+  if (ctx.sleep !== undefined) { if (ctx.sleep === "asleep") return []; }
+  else if (local && local.hour < (config.quiet_hours?.end ?? 9)) return [];
 
   const { total, lanes } = questionBacklog({ now: nowMs });
   if (!total) return [];

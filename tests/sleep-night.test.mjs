@@ -216,3 +216,61 @@ test("watchSamplesQuery is the window fetchNight reads", () => {
   assert.match(q, /source_name=ilike\.\*watch\*/);
 });
 
+
+// ── asleepNow: the live "is the user asleep right now?" every ping gate asks ──
+{
+  const LIVE_TZ = "America/New_York";
+  const at = (hm, day = "2026-11-21") => `${day}T${hm}:00-05:00`;
+  const ms = (hm, day) => Date.parse(at(hm, day));
+  const tl = (rows) => rows.map(([hm, state, day]) => ({ ts: at(hm, day), state }));
+  const asleepNow = SN.asleepNow;
+
+  test("asleepNow: silence after the last unlock reads as the phone down, then asleep after liveDownMin", () => {
+    const ev = tl([["23:40", "unlocked", "2026-11-20"], ["00:13", "unlocked"]]);
+    assert.equal(asleepNow({ events: ev, nowMs: ms("00:30"), tz: LIVE_TZ }).asleep, false, "17 min down: not yet");
+    const r = asleepNow({ events: ev, nowMs: ms("01:10"), tz: LIVE_TZ });
+    assert.equal(r.asleep, true, "57 min of silence since a night-start unlock: asleep");
+    assert.equal(r.down_since, new Date(ms("00:13")).toISOString());
+  });
+
+  test("asleepNow: an unlock means awake at any hour; a brief 3am glance merges back into the night", () => {
+    const ev = tl([["00:13", "unlocked"], ["02:38", "sample_locked"], ["07:12", "unlocked"]]);
+    assert.equal(asleepNow({ events: ev, nowMs: ms("07:13"), tz: LIVE_TZ }).asleep, false, "up at 07:12, not held to 09:00");
+    const glance = tl([["00:13", "unlocked"], ["02:38", "sample_locked"], ["03:01", "unlocked"], ["03:02", "locked"]]);
+    assert.equal(asleepNow({ events: glance, nowMs: ms("03:10"), tz: LIVE_TZ }).asleep, true);
+  });
+
+  test("asleepNow: an afternoon with the phone face-down is never a night", () => {
+    const ev = tl([["13:05", "unlocked"]]);
+    assert.equal(asleepNow({ events: ev, nowMs: ms("15:30"), tz: LIVE_TZ }).asleep, false);
+  });
+
+  test("asleepNow: the Watch's wake or a chat message after the phone went down means awake", () => {
+    const ev = tl([["00:13", "unlocked"], ["02:38", "sample_locked"]]);
+    assert.equal(asleepNow({ events: ev, nowMs: ms("07:50"), tz: LIVE_TZ }).asleep, true);
+    assert.equal(asleepNow({ events: ev, nowMs: ms("07:50"), tz: LIVE_TZ, awakeAtMs: [ms("07:05")] }).asleep, false);
+  });
+
+  test("asleepNow: the night's last chat message restarts the count instead of cancelling the night", () => {
+    const ev = tl([["00:13", "unlocked"]]);
+    const msg = [ms("00:41")];
+    assert.equal(asleepNow({ events: ev, nowMs: ms("01:00"), tz: LIVE_TZ, awakeAtMs: msg }).asleep, false, "19 min since the message");
+    const r = asleepNow({ events: ev, nowMs: ms("01:30"), tz: LIVE_TZ, awakeAtMs: msg });
+    assert.equal(r.asleep, true, "45+ min since the last message, still in the night");
+    assert.equal(r.down_since, new Date(ms("00:41")).toISOString());
+  });
+
+  test("asleepNow: back down after a short wake before 06:00 carries the night on", () => {
+    const ev = tl([["00:13", "unlocked"], ["02:38", "sample_locked"], ["05:30", "unlocked"], ["05:32", "locked"], ["05:32", "sample_unlocked"]]);
+    assert.equal(asleepNow({ events: ev, nowMs: ms("05:40"), tz: LIVE_TZ }).asleep, true, "a 2-minute glance");
+    const longer = tl([["00:13", "unlocked"], ["02:38", "sample_locked"], ["05:10", "unlocked"], ["05:40", "sample_unlocked"]]);
+    assert.equal(asleepNow({ events: longer, nowMs: ms("06:00"), tz: LIVE_TZ }).asleep, false, "up 30 min: back down only 20 min");
+    assert.equal(asleepNow({ events: longer, nowMs: ms("06:30"), tz: LIVE_TZ }).asleep, true, "down 50 min again");
+  });
+
+  test("asleepNow: no rows, or a silence longer than any night, is unknown (never holds)", () => {
+    assert.equal(asleepNow({ events: [], nowMs: ms("03:00"), tz: LIVE_TZ }).asleep, null);
+    const ev = tl([["22:00", "unlocked", "2026-11-19"]]);
+    assert.equal(asleepNow({ events: ev, nowMs: ms("16:00"), tz: LIVE_TZ }).asleep, null);
+  });
+}

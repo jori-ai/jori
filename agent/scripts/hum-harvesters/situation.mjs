@@ -42,12 +42,19 @@ const { situation: sit, context } = await readStdinJson();
 // Cheap escape hatches — skip the LLM call entirely when there's nothing to
 // reason about. The harvester pays Sonnet only when situation has substance.
 
-// 1. Sleeping / no-typing-no-location windows: no point reasoning.
+// 1. Asleep: no point reasoning. From the sleep signal (sleep data + the
+//    phone's lock/unlock rows), never the clock; 07:00-23:00 only for an
+//    installation with no sleep sensing.
 const audio = (sit.environment || {}).audio_class || "unknown";
 const hour = (sit.time || {}).local_hour;
-if (hour !== undefined && (hour < 7 || hour >= 23)) {
+let asleep;
+try {
+  const sig = createRequire(import.meta.url)("../../../lib/sleep-night.js").sleepSignal();
+  if (sig.installed) asleep = sig.state === "asleep";
+} catch {}
+if (asleep === undefined ? (hour !== undefined && (hour < 7 || hour >= 23)) : asleep) {
   stampRun("situation", false);
-  emitNull("outside active hours");
+  emitNull(asleep ? "asleep" : "outside active hours");
   process.exit(0);
 }
 

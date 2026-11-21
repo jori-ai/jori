@@ -399,6 +399,21 @@ test("applyQuietHours reports which band it landed in", () => {
   assert.equal(applyQuietHours(CONFIG, g(8), [ev()]).band, "shoulder:awake");
 });
 
+test("sleep signal decides, never the clock: awake at 03:00 goes, asleep at 14:00 holds, unknown goes", () => {
+  const g = (local_hour, sleep, extra = {}) => ({ local_hour, sleep, ...extra });
+  assert.deepEqual(applyQuietHours(CONFIG, g(3, "awake"), []), { inQuiet: false, band: "awake:signal" });
+  assert.deepEqual(applyQuietHours(CONFIG, g(14, "asleep"), []), { inQuiet: true, band: "asleep:signal" });
+  assert.deepEqual(applyQuietHours(CONFIG, g(3, "unknown"), []), { inQuiet: false, band: "unknown:signal" });
+  const awake3am = run([ev()], { gates: { local_hour: 3, sleep: "awake" } });
+  assert.notEqual(awake3am.dropped[0]?.reason, "quiet_hours");
+  const asleepNoon = run([ev()], { gates: { local_hour: 12, sleep: "asleep" } });
+  assert.equal(asleepNoon.decision, "idle");
+  assert.equal(asleepNoon.dropped[0].reason, "quiet_hours");
+  // With a signal, a clock-derived activity state does not hold a tick.
+  const late = run([ev()], { gates: { local_hour: 23, sleep: "awake", activity_state: "winding_down" } });
+  assert.ok(!late.dropped.some((d) => /^activity:/.test(d.reason)));
+});
+
 // ── perishable moments ───────────────────────────────────────────────────
 
 test("a perishable event routes the dispatch to the priority source", () => {

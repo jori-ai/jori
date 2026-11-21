@@ -30,6 +30,9 @@ test("stale, coarse and night-time fixes are not", () => {
   assert.equal(shouldEvaluate(pos({ at: at(200) }), null, { nowMs: now, hour: 14 }).ok, false);
   assert.equal(shouldEvaluate(pos({ accuracy_m: MAX_ACCURACY_M + 1 }), null, { nowMs: now, hour: 14 }).ok, false);
   assert.equal(shouldEvaluate(pos(), null, { nowMs: now, hour: 3 }).ok, false);
+  // With a sleep signal the clock is never read: awake at 03:00 goes, asleep at 14:00 holds.
+  assert.equal(shouldEvaluate(pos(), null, { nowMs: now, hour: 3, asleep: false }).ok, true);
+  assert.equal(shouldEvaluate(pos(), null, { nowMs: now, hour: 14, asleep: true }).ok, false);
 });
 
 test("a fix barely moved from the last evaluation waits; a real step or a long pause does not", () => {
