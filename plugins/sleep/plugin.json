@@ -1,7 +1,7 @@
 {
   "name": "sleep",
   "title": "Sleep",
-  "description": "Nightly sleep summary, and the live asleep-or-awake reading every ping gate asks instead of the clock (off: the gates use their clock quiet hours).",
+  "description": "Nightly sleep summary, and the live asleep-or-awake reading every ping gate asks instead of the clock (no usable signal, or sensing off: each gate uses its old clock quiet hours).",
   "version": "1.0.0",
   "default": "disabled",
   "schedules": [

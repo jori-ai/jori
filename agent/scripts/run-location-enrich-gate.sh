@@ -27,7 +27,7 @@ log() { echo "$(date '+%Y-%m-%d %H:%M:%S') [location-enrich] $1" >> "$LOGFILE"; 
 
 # Sleep gate: skip while the user is asleep, from sleep data and the phone's
 # lock/unlock rows, never the clock. 01:00-08:00 in the user's local TZ (phone,
-# else home) is only the fallback for an installation with no sleep sensing.
+# else home) is the fallback whenever there is no usable sleep signal.
 USER_TZ_FILE="$JORI_INSTALL_TOOLS/data/user-timezone.json"
 USER_TZ="${JORI_TZ:-UTC}"
 if [ -f "$USER_TZ_FILE" ]; then

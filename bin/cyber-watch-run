@@ -370,10 +370,10 @@ async function alertLane(cfg, state) {
   const { tz } = resolveTz();
   const hour = localHour(tz);
   // Not while the user is asleep: the sleep signal (sleep data + the phone's
-  // lock/unlock rows), never the clock; `quiet_local` only without sleep sensing.
+  // lock/unlock rows), never the clock; `quiet_local` whenever there is no usable sleep signal.
   const q = cfg.alert.quiet_local || {};
   const sleep = require("../lib/sleep-night.js").holdForSleep({ tz, fallback: { from: q.start, to: q.end } });
-  if (!DRY && (sleep.source === "none" ? inQuiet(hour, cfg.alert.quiet_local) : sleep.hold)) { log(`asleep (${sleep.reason}) — skip, items stay unseen`); return; }
+  if (!DRY && (sleep.source === "none" ? inQuiet(hour, cfg.alert.quiet_local) : sleep.hold)) { log(`${sleep.source === "sleep" ? "asleep" : "quiet hours"} (${sleep.reason}) — skip, items stay unseen`); return; }
 
   const items = await fetchFeeds(cfg, log);
   let kev = [], hibp = [];

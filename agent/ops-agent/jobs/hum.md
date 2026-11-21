@@ -30,7 +30,7 @@ dispatch (an event bundle from hum-sense, or the idle/watchdog fallback)
 **Jev gate (2026-09-23).** `hum-sense` also asks Jev (`lib/jev-hum-gate.mjs`); a confident "nothing worth pinging" skips the dispatch, anything else reaches this playbook unchanged. Health, exercise, finance, stocks, workout events and idle-only bundles never go to Jev. See `docs/jev.md`.
 
 By the time a dispatch reaches this playbook, the `hum-sense` gate (`lib/hum-events.mjs`) has already verified — for an event dispatch — that:
-- The user is not asleep (the sleep signal: sleep data + the phone's lock/unlock rows, never the clock; awake means any hour, unknown fails open; the 00:00-09:00 quiet window only without sleep sensing), activity is not `sleeping` (nor, without sleep sensing, `winding_down`), hum is not paused
+- The user is not asleep (the sleep signal: sleep data + the phone's lock/unlock rows, never the clock; with a usable signal asleep holds and awake means any hour; with no usable signal (sensing off, no recent phone rows, a stale reading) the 00:00-09:00 quiet window), activity is not `sleeping` (nor, without sleep sensing, `winding_down`), hum is not paused
 - They are not in a meeting, not mid-conversation with the chat agent, and have no outstanding hum question
 - Nothing was dispatched inside the 10-min refractory window, and this moment's salience cleared the (rising) threshold
 - No event in the bundle repeats a `dedup_key` inside its cooldown

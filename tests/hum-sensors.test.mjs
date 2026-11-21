@@ -171,7 +171,11 @@ test("questions stays quiet overnight and while a question holds the slot", asyn
 test("questions follows the sleep signal, not the clock: awake at 07:00 ticks, asleep at 14:00 does not", async () => {
   assert.equal((await questionsSensor({ waiting: 5, hour: 7, sleep: "awake" })).events.length, 1);
   assert.equal((await questionsSensor({ waiting: 5, hour: 14, sleep: "asleep" })).events.length, 0);
-  assert.equal((await questionsSensor({ waiting: 5, hour: 3, sleep: "unknown" })).events.length, 1, "unknown fails open");
+  // No usable signal (unknown, or undefined = sensing off): the clock quiet hours (before 09:00).
+  for (const none of ["unknown", undefined]) {
+    assert.equal((await questionsSensor({ waiting: 5, hour: 3, sleep: none })).events.length, 0, `no signal at 03:00: quiet (${none})`);
+    assert.equal((await questionsSensor({ waiting: 5, hour: 14, sleep: none })).events.length, 1, `no signal at 14:00: ticks (${none})`);
+  }
 });
 
 test("questions ticks every 5 minutes while anything waits", async () => {

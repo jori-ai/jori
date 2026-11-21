@@ -91,7 +91,7 @@ The detector returns `needs_confirm: false` and the cron silently exits when:
 
 ## Quiet windows (in the trigger script)
 
-Defined as: the user asleep (the sleep signal, `bin/sleep-night --gate`: sleep data + the phone's lock/unlock rows, never the clock; local hour < 9 only without sleep sensing) OR an active non-transparent Google Calendar event right now.
+Defined as: the user asleep (the sleep signal, `bin/sleep-night --gate`: sleep data + the phone's lock/unlock rows, never the clock; local hour < 9 whenever there is no usable sleep signal) OR an active non-transparent Google Calendar event right now.
 
 In a quiet window: the ask is appended to `location-confirm-pending.json` (deduped by `ask_key`) and the script exits. The next 10-min tick that's outside quiet window drains all pending asks alongside any new one — each gets its own Gemma-phrased message and its own `jori-send` push.
 

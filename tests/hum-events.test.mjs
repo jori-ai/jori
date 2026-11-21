@@ -399,11 +399,15 @@ test("applyQuietHours reports which band it landed in", () => {
   assert.equal(applyQuietHours(CONFIG, g(8), [ev()]).band, "shoulder:awake");
 });
 
-test("sleep signal decides, never the clock: awake at 03:00 goes, asleep at 14:00 holds, unknown goes", () => {
+test("a usable sleep signal decides, never the clock: awake at 03:00 goes, asleep at 14:00 holds; no signal (unknown) uses the clock hours", () => {
   const g = (local_hour, sleep, extra = {}) => ({ local_hour, sleep, ...extra });
   assert.deepEqual(applyQuietHours(CONFIG, g(3, "awake"), []), { inQuiet: false, band: "awake:signal" });
   assert.deepEqual(applyQuietHours(CONFIG, g(14, "asleep"), []), { inQuiet: true, band: "asleep:signal" });
-  assert.deepEqual(applyQuietHours(CONFIG, g(3, "unknown"), []), { inQuiet: false, band: "unknown:signal" });
+  // No usable signal ("unknown", or undefined = sensing off): the old clock hours.
+  for (const none of ["unknown", undefined]) {
+    assert.equal(applyQuietHours(CONFIG, g(3, none), []).inQuiet, true, `no signal at 03:00: quiet (${none})`);
+    assert.equal(applyQuietHours(CONFIG, g(14, none), []).inQuiet, false, `no signal at 14:00: not quiet (${none})`);
+  }
   const awake3am = run([ev()], { gates: { local_hour: 3, sleep: "awake" } });
   assert.notEqual(awake3am.dropped[0]?.reason, "quiet_hours");
   const asleepNoon = run([ev()], { gates: { local_hour: 12, sleep: "asleep" } });

@@ -24,8 +24,8 @@ LOG="$DATA/logs/location-ambient.log"
 log() { mkdir -p "$(dirname "$LOG")" 2>/dev/null; echo "$(date '+%Y-%m-%d %H:%M:%S') [location-ambient] $1" >> "$LOG"; }
 
 # 1. Sleep check — abort while the user is asleep, decided from sleep data and
-# the phone's lock/unlock rows (bin/sleep-night --gate), never the clock. Only an
-# installation with no sleep sensing falls back to 01:00–08:00 in the user's
+# the phone's lock/unlock rows (bin/sleep-night --gate), never the clock. With no
+# usable sleep signal (sensing off, no recent phone rows, a stale reading) it falls back to 01:00–08:00 in the user's
 # current tz (phone-reported → user-timezone.json, home-zone fallback), so it
 # follows the user when travelling. Mirrors trigger-hum.sh.
 USER_TZ_FILE="$DATA/user-timezone.json"

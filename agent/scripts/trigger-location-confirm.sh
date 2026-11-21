@@ -57,7 +57,7 @@ fi
 # --- Quiet-window detection (returns 0 if QUIET, 1 if open) ---
 in_quiet_window() {
   # Asleep, from sleep data + the phone's lock/unlock rows, never the clock
-  # (00-09 local is only the fallback without sleep sensing). Exit 0 = hold;
+  # (00-09 local is the fallback whenever there is no usable sleep signal). Exit 0 = hold;
   # any failure reads as awake (fail-open).
   if SLEEP_GATE=$("${JORI_NODE:-node}" "$(dirname "$0")/../../bin/sleep-night" --gate --fallback 0-9 --tz "$USER_TZ" 2>/dev/null); then
     log "quiet:asleep ($SLEEP_GATE)"

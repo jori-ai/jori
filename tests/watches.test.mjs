@@ -162,7 +162,7 @@ test("sleep signal, not the clock: asleep at 10:00 holds a match, awake at 03:00
   assert.equal(calls.sent.length, 1, "fires at 03:00 when awake");
 });
 
-test("awakeNow: the sleep reading decides; the clock only without sleep sensing", () => {
+test("awakeNow: the sleep reading decides; the clock whenever there is no usable signal", () => {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "sleep-sig-"));
   const file = path.join(tmp, "state.json");
   const prev = { s: process.env.JORI_SLEEP_STATE, g: process.env.JORI_SLEEP_SIGNAL };
@@ -175,12 +175,14 @@ test("awakeNow: the sleep reading decides; the clock only without sleep sensing"
     assert.equal(W.awakeNow(at3, "America/New_York"), true, "awake at 03:00 → may ping");
     write(true, Date.parse("2026-10-27T18:00:00Z"));
     assert.equal(W.awakeNow(Date.parse("2026-10-27T18:05:00Z"), "America/New_York"), false, "asleep at 14:00 → hold");
-    assert.equal(W.awakeNow(Date.parse("2026-10-27T19:00:00Z"), "America/New_York"), true, "a stale reading is unknown → fail open");
+    assert.equal(W.awakeNow(Date.parse("2026-10-27T19:00:00Z"), "America/New_York"), true, "a stale reading at 15:00 is no signal: the 08-22 window says awake");
+    write(false, Date.parse("2026-10-27T06:00:00Z"));
+    assert.equal(W.awakeNow(Date.parse("2026-10-27T07:00:00Z"), "America/New_York"), false, "a stale reading at 03:00 is no signal: the 08-22 window holds");
     write(false, Date.parse("2026-10-27T03:00:00Z"));
     assert.equal(W.awakeNow(at3, "America/New_York"), false, "no reading for 4 h: sensing stopped, the 08-22 window stands in");
     fs.rmSync(file);
     process.env.JORI_SLEEP_SIGNAL = "off";
-    assert.equal(W.awakeNow(at3, "America/New_York"), false, "no sleep sensing: the old 08-22 window");
+    assert.equal(W.awakeNow(at3, "America/New_York"), false, "sensing off: the old 08-22 window");
     assert.equal(W.awakeNow(Date.parse("2026-10-27T14:00:00Z"), "America/New_York"), true);
   } finally {
     if (prev.s === undefined) delete process.env.JORI_SLEEP_STATE; else process.env.JORI_SLEEP_STATE = prev.s;

@@ -43,14 +43,14 @@ const { situation: sit, context } = await readStdinJson();
 // reason about. The harvester pays Sonnet only when situation has substance.
 
 // 1. Asleep: no point reasoning. From the sleep signal (sleep data + the
-//    phone's lock/unlock rows), never the clock; 07:00-23:00 only for an
-//    installation with no sleep sensing.
+//    phone's lock/unlock rows), never the clock; 07:00-23:00 whenever there
+//    is no usable sleep signal.
 const audio = (sit.environment || {}).audio_class || "unknown";
 const hour = (sit.time || {}).local_hour;
 let asleep;
 try {
   const sig = createRequire(import.meta.url)("../../../lib/sleep-night.js").sleepSignal();
-  if (sig.installed) asleep = sig.state === "asleep";
+  if (sig.usable) asleep = sig.state === "asleep";
 } catch {}
 if (asleep === undefined ? (hour !== undefined && (hour < 7 || hour >= 23)) : asleep) {
   stampRun("situation", false);

@@ -29,8 +29,8 @@ export default async function detect(ctx) {
   const { config, local, nowMs, memo, setMemo } = ctx;
   // Fires while the user sleeps would only be dropped by the gate and count as
   // misses. Asleep comes from the sleep signal (ctx.sleep), never the clock; the
-  // clock quiet hours only for an installation with no sleep sensing.
-  if (ctx.sleep !== undefined) { if (ctx.sleep === "asleep") return []; }
+  // clock quiet hours whenever there is no usable sleep signal (ctx.sleep undefined).
+  if (ctx.sleep === "asleep" || ctx.sleep === "awake") { if (ctx.sleep === "asleep") return []; }
   else if (local && local.hour < (config.quiet_hours?.end ?? 9)) return [];
 
   const { total, lanes } = questionBacklog({ now: nowMs });

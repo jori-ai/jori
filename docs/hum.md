@@ -29,7 +29,7 @@ Everything in `data/` is gitignored; the templates live in `examples/`.
 cp examples/hum-sensors.example.json data/hum-sensors.json
 ```
 
-Each sensor entry names a script in `agent/scripts/hum-sensors/` (or your own in `hum-sensors/_ext/`), its interval and whether it is enabled; `config` tunes the gate (salience threshold, refractory period, quiet hours — `start`–`wake_floor` is a hard drop, `wake_floor`–`end` a soft shoulder; used only when the installation has no sleep sensing, otherwise the gate holds exactly while the sleep signal says the user is asleep). The daemon re-reads the file every tick. Defaults for every `config` key are in `lib/hum-events.mjs`.
+Each sensor entry names a script in `agent/scripts/hum-sensors/` (or your own in `hum-sensors/_ext/`), its interval and whether it is enabled; `config` tunes the gate (salience threshold, refractory period, quiet hours — `start`–`wake_floor` is a hard drop, `wake_floor`–`end` a soft shoulder; used whenever there is no usable sleep signal (sensing off, no recent phone rows, a stale reading), otherwise the gate holds exactly while the sleep signal says the user is asleep). The daemon re-reads the file every tick. Defaults for every `config` key are in `lib/hum-events.mjs`.
 
 Run the engine:
 

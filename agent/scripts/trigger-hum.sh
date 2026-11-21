@@ -64,8 +64,8 @@ dispatch() {
 # Sleep hold: no tick while the user is asleep, decided from sleep data and the
 # phone's lock/unlock rows (bin/sleep-night --gate), never the clock; awake means
 # a tick at any hour. Manual mode bypasses it. 00:00-09:00 local (the hum gate's
-# default quiet_hours, lib/hum-events.mjs) is only the fallback for an
-# installation with no sleep sensing.
+# default quiet_hours, lib/hum-events.mjs) is the fallback whenever
+# there is no usable sleep signal (sensing off, no recent phone rows, a stale reading).
 USER_TZ_FILE="$HOME/Dev/jori/data/user-timezone.json"
 # Fallback: the home timezone (lib/instance.cjs tz, as JORI_TZ).
 source "$(dirname "$0")/lib/instance.sh"

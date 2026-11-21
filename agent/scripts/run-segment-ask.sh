@@ -26,8 +26,8 @@ fi
 
 # 2. Not while the user is asleep: decided from sleep data and the phone's
 #    lock/unlock rows (bin/sleep-night --gate), never the clock; awake means an
-#    ask at any hour. 23:00-09:00 is only the fallback for an installation with
-#    no sleep sensing, in the zone the phone last reported (else the home zone
+#    ask at any hour. 23:00-09:00 is the fallback whenever there is
+#    no usable sleep signal (sensing off, no recent phone rows, stale), in the zone the phone last reported (else the home zone
 #    rather than UTC, which could put it in the middle of the afternoon).
 TZNAME=$(TZ_FILE="$REPO/data/user-timezone.json" HOME_TZ="${JORI_TZ:-UTC}" python3 - <<'PY'
 import json, os

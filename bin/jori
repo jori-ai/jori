@@ -3642,8 +3642,8 @@ async function cmdHumLane(args) {
   die(`unknown: hum lane ${sub}. Try: status | enable <name> [reason] | disable <name> [reason]`);
 }
 
-// Infer the user's current activity state from existing signals. With sleep
-// sensing it is the sleep signal alone (sleeping / active); without it, reads
+// Infer the user's current activity state from existing signals. With a usable
+// sleep signal it is that signal alone (sleeping / active); without one, reads
 // phone-channel-cursor.json (last inbound) + user-timezone.json (local TZ) and
 // classifies by the clock as active / winding_down / sleeping / waking. Used by
 // trigger-hum.sh and hum-sense as a soft gate and exposed here for ad-hoc inspection.
@@ -3665,11 +3665,11 @@ function inferActivityState() {
 
   // The sleep signal (lib/sleep-night.js sleepSignal: sleep data + the phone's
   // lock/unlock rows) is the whole answer when the installation has one:
-  // asleep → sleeping, awake or unknown → active, at any hour. The clock rules
-  // below run only for an installation with no sleep sensing.
+  // asleep → sleeping, awake → active, at any hour. The clock rules below run
+  // whenever there is no usable signal (sensing off, no recent rows, stale).
   try {
     const sig = require(path.join(TOOLS, 'lib/sleep-night.js')).sleepSignal();
-    if (sig.installed) {
+    if (sig.usable) {
       return {
         state: sig.state === 'asleep' ? 'sleeping' : 'active',
         last_inbound_min_ago: ageMin, local_hour: localHour, local_tz: tz,

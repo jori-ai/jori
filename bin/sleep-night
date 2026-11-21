@@ -12,10 +12,11 @@
 //                                   rows and the Watch; lib/sleep-night.js asleepNow)
 //   sleep-night --gate [--fallback FROM-TO] [--tz ZONE]
 //                                   should a ping hold now? exit 0 = asleep, HOLD;
-//                                   1 = awake or unknown, go (any failure is "go"
-//                                   to a shell `if …; then hold; fi`: fail-open).
+//                                   1 = go (any failure is "go" to a shell
+//                                   `if …; then hold; fi`: fail-open).
 //                                   FROM-TO = the caller's old quiet hours, used
-//                                   only without any sleep sensing. Reads the
+//                                   whenever there is no usable sleep signal (sensing
+//                                   off, no recent phone rows, a stale reading). Reads the
 //                                   cron's state file, no network.
 //   sleep-night --json
 //
@@ -58,7 +59,7 @@ function lastUserMessageMs() {
     try { night = await SN.fetchNight(SN.currentNightOf(tz), { tz }); } catch {}
     const r = await SN.fetchAsleepNow({ tz, night, lastUserMessageMs: lastUserMessageMs() });
     if (json) { console.log(JSON.stringify(r, null, 2)); return; }
-    const word = r.asleep === true ? "ASLEEP — pings hold" : r.asleep === false ? "awake — pings may go out" : "unknown — pings may go out (fail-open)";
+    const word = r.asleep === true ? "ASLEEP — pings hold" : r.asleep === false ? "awake — pings may go out" : "unknown — no usable signal: each window uses its old clock hours";
     console.log(`${word}\n  ${r.reason}`);
     return;
   }
@@ -84,7 +85,7 @@ function lastUserMessageMs() {
     const cur = out[out.length - 1];
     if (!cur.fetch_errors) {
       // A failed read leaves the file as it was; after 15 min its live reading is
-      // stale, which SN.sleepSignal reads as unknown (never holds).
+      // stale, which SN.sleepSignal reads as no usable signal (clock hours).
       const asleepNow = await SN.fetchAsleepNow({ tz: cur.tz, night: cur, lastUserMessageMs: lastUserMessageMs() });
       const tmp = `${STATE}.tmp`;
       fs.writeFileSync(tmp, JSON.stringify({ ...cur, asleep_now: asleepNow, written_at: new Date().toISOString() }, null, 2));
