@@ -41,6 +41,7 @@ const aw = require("../lib/awardwallet-api.js");
 const { port } = require("../lib/ports.cjs");
 const { LOCKOUT_RISK_CODES } = require("../lib/awardwallet-map.js");
 const { installTools } = require("../lib/root.cjs");
+const loginLog = require("../lib/login-log.cjs");
 
 const LIST_URL = "https://awardwallet.com/account/list/";
 const FLAGS = new Set(process.argv.slice(2));
@@ -84,7 +85,7 @@ const ROWS = `JSON.stringify([...document.querySelectorAll('input[id^="account_a
 // `op`, which cron's PATH lacks, so the Homebrew directories are appended.
 let lastSignIn = null;
 function signIn() {
-  const args = ["awardwallet.com", "--login-url", "https://awardwallet.com/login", "--check-url", LIST_URL, "--port", String(port("chrome_cdp"))];
+  const args = ["awardwallet.com", "--login-url", "https://awardwallet.com/login", "--check-url", LIST_URL, "--port", String(port("chrome_cdp")), "--source", "awardwallet-refresh"];
   const env = { ...process.env, PATH: [process.env.PATH, "/opt/homebrew/bin", "/usr/local/bin"].filter(Boolean).join(":") };
   let out = "";
   try {
@@ -119,6 +120,7 @@ async function main() {
 
     let href = await tab.evaluate("location.href");
     if (/\/login/.test(href)) {
+      loginLog.record({ site: "awardwallet.com", port: port("chrome_cdp"), status: "signed_out", source: "awardwallet-refresh", detail: href });
       // The user's standing rule: sign in automatically. One attempt per run,
       // with the saved login (never a retry loop: a bad password stays bad).
       const si = signIn();

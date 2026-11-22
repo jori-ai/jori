@@ -1,0 +1,153 @@
+#!/usr/bin/env node
+"use strict";
+// login-log — record, report and watch website sign-in failures (lib/login-log.cjs).
+//
+//   login-log record <site> <status> [--detail TEXT] [--source NAME] [--port N]
+//       Append one outcome. Any script, any language. <status> is one of
+//       signed_in already_signed_in session_restored token_renewed (success),
+//       bad_credentials no_credentials needs_2fa captcha no_login_form
+//       still_signed_out error (a sign-in that failed), signed_out (a job
+//       found itself signed out — an observation, not an attempt). The cause is
+//       derived; prints the stored row.
+//
+//   login-log report [--days 14] [--json] [--all]
+//       Per site: latest outcome, last success, failures and their causes,
+//       with the fix in plain words. Failing sites first; --all lists healthy
+//       sites too.
+//
+//   login-log watch [--dry-run]
+//       The alerting half (run every 15 min from chrome-cdp-watch.sh). Once
+//       per site per cause, when a site's latest outcome is a failure:
+//         needs the user (password, code, no saved login) → chat + push,
+//           intent login-alert, one batched message;
+//         anything else → the system channel, for root-causing.
+//       A site that signs in again clears it (a ✅ line on the system channel).
+//       Only 09:00–22:00 in the home time zone; outside that it waits.
+//       State: data/login-watch-state.json {"alerted": {"<site>": "<cause>"}}
+//
+// Never prints or stores a credential: rows carry what the page showed.
+
+const fs = require("node:fs");
+const path = require("node:path");
+const { execFileSync } = require("node:child_process");
+const L = require("../lib/login-log.cjs");
+const { installTools } = require("../lib/root.cjs");
+
+const argv = process.argv.slice(2);
+const cmd = argv[0];
+const opt = (n, d = null) => { const i = argv.indexOf(n); return i >= 0 && argv[i + 1] !== undefined ? argv[i + 1] : d; };
+const flag = (n) => argv.includes(n);
+const STATE_FILE = installTools("data", "login-watch-state.json");
+const SEND = path.join(__dirname, "jori-send-curl");
+const WINDOW_DAYS = Number(opt("--days", "14"));
+
+function ago(ts) {
+  const m = Math.round((Date.now() - Date.parse(ts)) / 60000);
+  if (m < 60) return `${m}m ago`;
+  if (m < 48 * 60) return `${Math.round(m / 60)}h ago`;
+  return `${Math.round(m / 1440)}d ago`;
+}
+
+function sitesInWindow() {
+  return L.summarize(L.read({ sinceMs: Date.now() - WINDOW_DAYS * 86400000 }));
+}
+
+function cmdRecord() {
+  const [site, status] = argv.slice(1);
+  if (!site || !status || site.startsWith("-")) {
+    console.error("usage: login-log record <site> <status> [--detail TEXT] [--source NAME] [--port N]");
+    process.exit(64);
+  }
+  const row = L.record({ site, status, detail: opt("--detail", ""), source: opt("--source"), port: opt("--port") });
+  console.log(JSON.stringify(row));
+}
+
+function cmdReport() {
+  const rows = L.read({ sinceMs: Date.now() - WINDOW_DAYS * 86400000 });
+  let sites = L.summarize(rows).sort((a, b) => (b.failing - a.failing) || String(b.last.ts).localeCompare(a.last.ts));
+  if (!flag("--all")) sites = sites.filter((s) => s.failures > 0);
+  if (flag("--json")) { console.log(JSON.stringify(sites, null, 2)); return; }
+  if (!sites.length) { console.log(`No sign-in failures in the last ${WINDOW_DAYS} days.`); return; }
+  for (const s of sites) {
+    const c = L.CAUSES[s.last.cause] || L.CAUSES.other;
+    const head = s.failing ? `FAILING ${s.site}` : `ok      ${s.site}`;
+    console.log(`${head} — last ${s.last.status} ${ago(s.last.ts)}${s.last.source ? ` (${s.last.source})` : ""}; ${s.failures}/${s.attempts} failed in ${WINDOW_DAYS}d; last success ${s.last_ok ? ago(s.last_ok.ts) : "none"}`);
+    if (s.failing) {
+      console.log(`        cause: ${c.why}${c.needs_user ? " — NEEDS YOU" : ""}`);
+      if (c.fix) console.log(`        fix:   ${c.fix}`);
+      if (s.last.detail) console.log(`        seen:  ${s.last.detail.slice(0, 160)}`);
+    }
+    const mix = Object.entries(s.causes).map(([k, n]) => `${k}×${n}`).join(", ");
+    if (mix) console.log(`        causes: ${mix}`);
+  }
+}
+
+function loadState() { try { return JSON.parse(fs.readFileSync(STATE_FILE, "utf8")); } catch { return { alerted: {} }; } }
+function saveState(s) {
+  const tmp = STATE_FILE + ".tmp";
+  fs.writeFileSync(tmp, JSON.stringify(s, null, 2));
+  fs.renameSync(tmp, STATE_FILE);
+}
+function localHour() {
+  let tz = "UTC";
+  try { tz = require("../lib/instance.cjs").instance().tz || tz; } catch {}
+  try { const u = JSON.parse(fs.readFileSync(installTools("data", "user-timezone.json"), "utf8")); if (u.timezone) tz = u.timezone; } catch {}
+  return Number(new Intl.DateTimeFormat("en-US", { timeZone: tz, hour: "numeric", hourCycle: "h23" }).format(new Date()));
+}
+function send(args, text) {
+  execFileSync(SEND, [...args, text], { stdio: ["ignore", "inherit", "inherit"], timeout: 60000 });
+}
+
+function cmdWatch() {
+  const dry = flag("--dry-run");
+  const h = localHour();
+  if (!dry && (h < 9 || h >= 22)) return;
+  const state = loadState();
+  state.alerted = state.alerted || {};
+  const all = sitesInWindow();
+  const failing = all.filter((s) => s.failing && s.last.status !== "denylisted");
+  const healthy = new Set(all.filter((s) => !s.failing).map((s) => s.site));
+  const forUser = [], forSystem = [], recovered = [];
+  for (const s of failing) {
+    const cause = s.last.cause;
+    if (state.alerted[s.site] === cause) continue;
+    const c = L.CAUSES[cause] || L.CAUSES.other;
+    const line = `${s.site}: ${c.why}${c.fix ? `. ${c.fix[0].toUpperCase()}${c.fix.slice(1)}` : ""}`;
+    (c.needs_user ? forUser : forSystem).push({ site: s.site, cause, line, s });
+  }
+  // Recovered = signed in since; a site that only aged out of the window is
+  // dropped silently (nothing tried it, so nothing is known).
+  const inWindow = new Set(all.map((s) => s.site));
+  for (const site of Object.keys(state.alerted)) {
+    if (healthy.has(site)) recovered.push(site);
+    else if (!inWindow.has(site)) delete state.alerted[site];
+  }
+
+  if (forUser.length) {
+    const text = forUser.length === 1
+      ? `🔑 I couldn't sign in to ${forUser[0].line}.`
+      : `🔑 I couldn't sign in to ${forUser.length} sites:\n${forUser.map((x) => `• ${x.line}`).join("\n")}`;
+    if (dry) console.log(`[chat] ${text}`); else send(["--skip-precheck", "--intent", "login-alert", "--agent", "ops"], text);
+  }
+  if (forSystem.length) {
+    const text = `🔐 Sign-in failing (${forSystem.length}):\n${forSystem.map((x) => `• ${x.line} [${x.s.last.status}${x.s.last.source ? `, ${x.s.last.source}` : ""}, failing since ${ago(x.s.failing_since)}]`).join("\n")}\nDetails: bin/login-log report`;
+    if (dry) console.log(`[system] ${text}`); else send(["--skip-precheck", "--channel", "system", "--intent", "login-failure"], text);
+  }
+  if (recovered.length) {
+    const text = `✅ Signed in again: ${recovered.join(", ")}`;
+    if (dry) console.log(`[system] ${text}`); else send(["--skip-precheck", "--channel", "system", "--intent", "login-failure"], text);
+  }
+  if (dry) return;
+  for (const x of [...forUser, ...forSystem]) state.alerted[x.site] = x.cause;
+  for (const site of recovered) delete state.alerted[site];
+  saveState(state);
+}
+
+switch (cmd) {
+  case "record": cmdRecord(); break;
+  case "report": cmdReport(); break;
+  case "watch": cmdWatch(); break;
+  default:
+    console.error("usage: login-log record|report|watch  (see the header of bin/login-log)");
+    process.exit(64);
+}
