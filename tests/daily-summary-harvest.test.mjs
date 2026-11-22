@@ -182,6 +182,56 @@ test("readCorrections skips a torn line and a missing file is empty", () => {
   assert.deepEqual(H.readCorrections("2026-10-09", dir), []);
 });
 
+test("applyCorrectionArrivals: a stated arrival replaces the first visit row's time, on the stop it falls in only", () => {
+  const stops = [
+    { id: "day", start_ts_ms: ms("2026-03-14T04:00:00Z"), end_ts_ms: ms("2026-03-14T22:00:00Z"), tz: "America/New_York",
+      companions: ["Sam", { name: "Alex" }], companion_joins: { Sam: "13:03", Alex: "16:19" } },
+    { id: "walk", start_ts_ms: ms("2026-03-14T22:00:00Z"), end_ts_ms: ms("2026-03-14T22:30:00Z"), tz: "America/New_York", companions: [] },
+    { id: "evening", start_ts_ms: ms("2026-03-14T22:30:00Z"), end_ts_ms: ms("2026-03-15T02:00:00Z"), tz: "America/New_York",
+      companions: ["Alex"], companion_joins: { Alex: "20:30" } },
+  ];
+  const applied = H.applyCorrectionArrivals(stops, [
+    { said_at: "2026-03-15T13:00:00Z", text: "Alex got here around 3:30", arrivals: { alex: "2026-03-14T15:30:00-04:00" } },
+  ], "America/Chicago");
+  assert.deepEqual(stops[0].companion_joins, { Sam: "13:03", Alex: "15:30" }, "his time, in the stop's own zone; other joins untouched");
+  assert.equal(stops[1].companion_joins, undefined, "a stop the person is not on is left alone");
+  assert.equal(stops[2].companion_joins, undefined, "a stop that began after the arrival has them from its first minute");
+  assert.deepEqual(applied.map((a) => [a.id, a.name]), [["day", "Alex"], ["evening", "Alex"]]);
+});
+
+test("applyCorrectionArrivals: nothing changes without a usable arrival, an unknown person, or a stop that ended first", () => {
+  const mk = () => [{ id: "day", start_ts_ms: ms("2026-03-14T04:00:00Z"), end_ts_ms: ms("2026-03-14T22:00:00Z"), tz: "America/New_York",
+    companions: ["Sam"], companion_joins: { Sam: "13:03" } }];
+  const cases = [
+    [{ text: "no arrivals" }],
+    [{ text: "bad time", arrivals: { Sam: "later" } }],
+    [{ text: "not on the stop", arrivals: { Alex: "2026-03-14T15:30:00-04:00" } }],
+    [{ text: "after it ended", arrivals: { Sam: "2026-03-14T20:00:00-04:00" } }],
+    [null],
+  ];
+  for (const c of cases) {
+    const stops = mk();
+    assert.deepEqual(H.applyCorrectionArrivals(stops, c, "America/Chicago"), [], c[0] && c[0].text);
+    assert.deepEqual(stops[0].companion_joins, { Sam: "13:03" });
+  }
+  assert.deepEqual(H.applyCorrectionArrivals(undefined, undefined), []);
+});
+
+test("day-correction add --arrival stores it, list shows it, readCorrections returns it; a bad one is refused", () => {
+  const dir = fs.mkdtempSync(path.join(process.env.TMPDIR || "/tmp", "day-corr-arr-"));
+  const bin = path.join(path.dirname(fileURLToPath(import.meta.url)), "../bin/day-correction");
+  const run = (...a) => spawnSync(process.execPath, [bin, ...a], { encoding: "utf8", env: { ...process.env, JORI_DAY_CORRECTIONS_DIR: dir } });
+  const ok = run("add", "2099-03-14", "--text", "Sam got here around 3:30", "--arrival", "Sam=2099-03-14T15:30:00-04:00", "--arrival", "Alex=2099-03-14T16:00:00-04:00");
+  assert.equal(ok.status, 0, ok.stderr);
+  assert.deepEqual(H.readCorrections("2099-03-14", dir)[0].arrivals, { Sam: "2099-03-14T15:30:00-04:00", Alex: "2099-03-14T16:00:00-04:00" });
+  assert.match(run("list", "2099-03-14").stdout, /arrivals: Sam=2099-03-14T15:30:00-04:00, Alex=/);
+  for (const bad of ["Sam", "=2099-03-14T15:30:00-04:00", "Sam=3:30pm", "Sam=2099-03-14T15:30:00"]) {
+    const r = run("add", "2099-03-14", "--text", `bad ${bad}`, "--arrival", bad);
+    assert.equal(r.status, 2, bad);
+  }
+  assert.equal(H.readCorrections("2099-03-14", dir).length, 1, "a refused add records nothing");
+});
+
 test("harvestDay carries corrections into counts and the anchored facts, uncached", () => {
   const morning = [{ id: "cafe", start_ts_ms: ms("2026-10-10T04:55:00Z"), end_ts_ms: ms("2026-10-10T05:52:00Z") }];
   const stub = { git: () => ({ commits: [], added: [] }), sentMail: () => [], messages: NO_MSG, lookbackLinks: NO_LOOK, notes: () => [],
