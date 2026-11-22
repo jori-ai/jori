@@ -974,3 +974,62 @@ test("JORI_MOVED_SILENCE_AWAY_END=0 ends the span at the last walk of any kind a
     if (prev === undefined) delete process.env.JORI_MOVED_SILENCE_AWAY_END; else process.env.JORI_MOVED_SILENCE_AWAY_END = prev;
   }
 });
+
+// A walk block that is the leg's own window: the spine keeps a walking leg across the window of a
+// loop out from the house and back, and the steps' walk begins before the block and ends after it.
+// Only the stops beside the block moved, so the email drew a "Walked" line, the block and a
+// "between stops" line for one outing, with the route counted twice.
+// (The edges carry odd seconds on purpose: the block must pass the "half inside the leg" test
+// against its own window after the first stop has widened it, not only at exactly half.)
+function blockAmidLeg(blockEnd = [18, 23], legEnd = [18, 23]) {
+  return {
+    date: "2026-03-02", tz: day().tz, map_url: "https://example.invalid/map.png",
+    stops: [
+      { id: "h1", start: "00:00", end: "18:10", start_ts_ms: at(0), end_ts_ms: at(18, 10) + 9883, duration_min: 1090, place: { name: "Home" } },
+      { id: "w", start: "18:10", end: "18:23", start_ts_ms: at(18, 10) + 9883, end_ts_ms: at(...blockEnd) + 18000, duration_min: 13,
+        place: { name: "Evening walk", source: "excursion" }, provenance: { excursion: true },
+        excursion: { from_base: "Home", mode: "walking", routed_m: 543, away_m: 260, loop_in_gap: true, home_loop: true } },
+      { id: "h2", start: "18:23", end: "23:59", start_ts_ms: at(18, 23) + 18000, end_ts_ms: at(23, 59), duration_min: 336, place: { name: "Home" } },
+    ],
+    travel_legs: [{ from: "h1", to: "w", duration_min: 0, distance_km: 0.26 }, { from: "w", to: "h2", duration_min: 0, distance_km: 0.26 }],
+    path: { stats: {}, segments: [], spine: [
+      { type: "leg", id: "l0", mode: "walking", median_kmh: 2.5, start_ms: at(18, 10) + 9883, end_ms: at(...legEnd) + 18000, mins: 13,
+        routed_m: 543, walked_m: 543, geometry: "map_matched", fixes: 2 },
+    ] },
+    routes: [],
+  };
+}
+const blockWalk = (a, b) => [...readings(at(0, 5), at(0, 10), 2), ...readings(a, b, 76), ...readings(at(23, 50), at(23, 55), 2)];
+
+test("a walk block the walking leg runs under takes the steps' walk edges with the stops beside it, so the outing is one line", () => {
+  const d = blockAmidLeg();
+  const st = annotateDaySteps(d, blockWalk(at(17, 57), at(18, 25)), null, { startMs: at(0), endMs: at(24) });
+  assert.deepEqual(d.stops.map(s => [s.start, s.end]), [["00:00", "17:57"], ["17:57", "18:25"], ["18:25", "23:59"]]);
+  assert.deepEqual(d.travel_legs.map(t => t.duration_min), [0, 0]);
+  assert.deepEqual(st.stops_aligned.map(m => [m.stop_id, m.edge]).sort(), [["h1", "end"], ["h2", "start"], ["w", "end"], ["w", "start"]]);
+  assert.equal(d.stops[1].excursion.steps, 28 * 76, "the block's count is the whole walk's");
+  const text = plain(buildSkeleton(d));
+  assert.doesNotMatch(text, /Walked [\d.]+ miles/, text);
+  assert.doesNotMatch(text, /between stops/, text);
+  assert.match(text, /5:57pm · Evening walk/, text);
+});
+
+test("a walk block that only touches the leg, or sits mostly outside it, keeps its own edges", () => {
+  // the leg is the first five minutes of a thirty-minute block: it is not the block's own window
+  const d = blockAmidLeg([18, 40], [18, 15]);
+  annotateDaySteps(d, blockWalk(at(18), at(18, 15)), null, { startMs: at(0), endMs: at(24) });
+  assert.equal(d.stops[0].end, "18:00", "the stop left still follows the walk");
+  assert.equal(d.stops[1].start, "18:10", "the block that is not the leg's window does not");
+});
+
+test("JORI_STEPS_ALIGN_BLOCK=0 leaves the block's edges where the phone put them", () => {
+  const prev = process.env.JORI_STEPS_ALIGN_BLOCK;
+  process.env.JORI_STEPS_ALIGN_BLOCK = "0";
+  try {
+    const d = blockAmidLeg();
+    annotateDaySteps(d, blockWalk(at(17, 57), at(18, 25)), null, { startMs: at(0), endMs: at(24) });
+    assert.deepEqual(d.stops.map(s => [s.start, s.end]), [["00:00", "17:57"], ["18:10", "18:23"], ["18:25", "23:59"]]);
+  } finally {
+    if (prev === undefined) delete process.env.JORI_STEPS_ALIGN_BLOCK; else process.env.JORI_STEPS_ALIGN_BLOCK = prev;
+  }
+});
