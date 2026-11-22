@@ -649,7 +649,7 @@ async function loadPairing() {
   pairCode = r.code;
   $("pairQr").innerHTML = r.svg; // SVG built on this machine by the qrcode library
   hint.hidden = false;
-  hint.textContent = r.relay ? "This code works once, for ten minutes. Press New code for another." : "Notifications to the app need the push relay; chat works without it.";
+  hint.textContent = r.relay ? "This code works once, for ten minutes. Press New code for another." : r.relayError ? `I couldn’t reach the notification service (${r.relayError}). Chat works without it; press New code to try again.` : "Notifications to the app need the push relay; chat works without it.";
 }
 $("pairCopy").addEventListener("click", async () => { if (!pairCode) return; try { await navigator.clipboard.writeText(pairCode); $("pairCopy").textContent = "Copied"; } catch { $("pairCopy").textContent = "Select and copy"; } });
 $("pairNew").addEventListener("click", loadPairing);

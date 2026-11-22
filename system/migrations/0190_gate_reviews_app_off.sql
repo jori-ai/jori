@@ -12,6 +12,6 @@ drop policy if exists jori_gate_reviews_update on public.jori_gate_reviews;
 do $$
 begin
   if exists (select 1 from pg_publication_tables where pubname = 'supabase_realtime' and schemaname = 'public' and tablename = 'jori_gate_reviews') then
-    alter publication supabase_realtime drop table public.jori_gate_reviews;
+    execute format('alter publication supabase_realtime drop table public.%I', 'jori_gate_reviews');
   end if;
 end $$;
