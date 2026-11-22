@@ -55,6 +55,7 @@ import { port } from "../lib/ports.cjs";
 import supa from "../lib/supabase-rest.js";
 import rootLib from "../lib/root.cjs";
 import instanceLib from "../lib/instance.cjs";
+import loginLog from "../lib/login-log.cjs";
 const { request } = supa;
 const { installRoot, installTools } = rootLib;
 const { instance } = instanceLib;
@@ -186,6 +187,7 @@ function recentRefusal() {
     let row;
     try { row = JSON.parse(rows[i]); } catch { continue; }
     if (!row || row.site !== "amazon.com" || String(row.port) !== CHROME_PORT) continue;
+    if (row.attempt === false) continue; // an observation (lib/login-log.cjs), not a sign-in that was typed
     const at = Date.parse(row.ts);
     if (Number.isNaN(at)) continue;
     const age = Date.now() - at;
@@ -196,11 +198,8 @@ function recentRefusal() {
 
 /** Write an outcome into the same log site-login uses, so the backoff sees it. */
 function recordLogin(status, detail) {
-  try {
-    fs.appendFileSync(LOGIN_LOG, JSON.stringify({ ts: new Date().toISOString(), site: "amazon.com", port: CHROME_PORT, status, detail }) + "\n");
-  } catch {
-    /* only a courtesy to the backoff: without it the next run may try once more */
-  }
+  // lib/login-log.cjs never throws: a lost row only means the next run may try once more.
+  loginLog.record({ site: "amazon.com", port: CHROME_PORT, status, detail, source: "amazon-order-detail" });
 }
 
 const shortDate = (ms) =>

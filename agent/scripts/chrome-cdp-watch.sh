@@ -112,6 +112,15 @@ for tid in sorted(set(cur) & prev):
   fi
 fi
 
+# --- Sign-in durability (every Chrome with a debugging port, not only 9222) ---
+# chrome-session-vault: save each profile's saved cookies (encrypted), or put
+# them back when a Chrome has lost them (a Chrome update / keychain change can
+# wipe the whole jar). login-log watch: one alert per site per cause for
+# a failed sign-in (needs-you → chat, the rest → system). Both log one line here
+# only when they act.
+"$JORI_NODE" "$JORI_TOOLS/bin/chrome-session-vault" sweep 2>&1 | grep -v " save " | sed "s/^/$(date '+%Y-%m-%d %H:%M:%S') [chrome-session-vault] /" >> "$LOG" || true
+"$JORI_NODE" "$JORI_TOOLS/bin/login-log" watch >> "$LOG" 2>&1 || true
+
 # Read previous state (default: "unknown" on first ever run).
 PREV="unknown"
 PREV_NOTIFIED=""

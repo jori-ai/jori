@@ -1,0 +1,224 @@
+#!/usr/bin/env node
+// chrome-session-vault — keep the automation Chromes' sign-ins across Chrome
+// updates, keychain changes and reboots by holding an encrypted copy of their
+// saved cookies, and putting them back when a Chrome loses them.
+//
+// WHY. Chrome on macOS encrypts cookies with a key held in the login keychain
+// ("Chrome Safe Storage"). When a relaunch cannot use that key (seen after a
+// major-version update applied on relaunch; the Chrome log then repeats
+// "Failed to decrypt token"), Chrome starts over and every saved session in
+// the profile is gone at once. Sites then turn up signed out one by one over
+// the following days, each looking like its own failure. A restart of the same
+// version keeps the cookies, so this is the update / keychain case. Re-typing
+// every password trips captchas and one-time codes; putting the sessions back
+// does not. (Incident history: system/changelog.md.)
+//
+// HOW. Every 15 min (chrome-cdp-watch.sh → `sweep`), for each running Chrome
+// started with --remote-debugging-port and --user-data-dir:
+//   - read its cookies over CDP (Storage.getCookies, decrypted by Chrome);
+//   - if it now holds far fewer saved cookies than the vault (under half of a
+//     vault of at least 50), the jar was wiped: put back every vault cookie
+//     that has not expired and is missing (Storage.setCookies), record a
+//     `cookie_jar_wiped` row in the sign-in log (lib/login-log.cjs), page the
+//     system channel, and keep the vault as it was;
+//   - otherwise save the jar to the vault (the previous copy is kept as .prev).
+// Session-only cookies are not kept (they end with the browser anyway).
+//
+// STORAGE. secrets/chrome-sessions/<profile dir name>.vault, AES-256-GCM, key
+// CHROME_SESSION_VAULT_KEY in .env (64 hex chars, created on first use), files
+// 0600 in a 0700 directory. The plaintext cookies never touch disk and are
+// never printed; output is counts and cookie domains only.
+//
+// Usage:
+//   chrome-session-vault sweep [--dry-run] [--json]   check + save every Chrome
+//   chrome-session-vault status [--json]              counts, no writes
+//   chrome-session-vault restore --port N [--site D]  put the vault back into
+//                                 one Chrome now (optionally one site only)
+// Exit: 0 ok, 1 a Chrome could not be read or restored.
+
+import fs from "node:fs";
+import path from "node:path";
+import crypto from "node:crypto";
+import { execFileSync } from "node:child_process";
+import { createRequire } from "node:module";
+const require = createRequire(import.meta.url);
+const { installTools } = require("../lib/root.cjs");
+const loginLog = require("../lib/login-log.cjs");
+
+const argv = process.argv.slice(2);
+const cmd = argv[0];
+const opt = (n, d = null) => { const i = argv.indexOf(n); return i >= 0 && argv[i + 1] !== undefined ? argv[i + 1] : d; };
+const DRY = argv.includes("--dry-run");
+const JSON_OUT = argv.includes("--json");
+const VAULT_DIR = installTools("secrets", "chrome-sessions");
+const ENV_FILE = installTools(".env");
+const MIN_VAULT = 50;      // a vault this small is not trusted to call a wipe
+const WIPE_RATIO = 0.5;    // live under half of the vault = wiped
+const log = (...a) => { if (!JSON_OUT) console.log(...a); };
+
+// ── key ─────────────────────────────────────────────────────────────────────
+function vaultKey({ create }) {
+  let hex = process.env.CHROME_SESSION_VAULT_KEY;
+  if (!hex) {
+    try { hex = (fs.readFileSync(ENV_FILE, "utf8").match(/^CHROME_SESSION_VAULT_KEY=([0-9a-f]{64})\s*$/m) || [])[1]; } catch {}
+  }
+  if (!hex && create) {
+    hex = crypto.randomBytes(32).toString("hex");
+    fs.appendFileSync(ENV_FILE, `\n# chrome-session-vault: key for secrets/chrome-sessions/*.vault (losing it only loses the backup)\nCHROME_SESSION_VAULT_KEY=${hex}\n`, { mode: 0o600 });
+  }
+  return hex ? Buffer.from(hex, "hex") : null;
+}
+function seal(obj, key) {
+  const iv = crypto.randomBytes(12);
+  const c = crypto.createCipheriv("aes-256-gcm", key, iv);
+  const body = Buffer.concat([c.update(JSON.stringify(obj), "utf8"), c.final()]);
+  return Buffer.concat([Buffer.from("JCV1"), iv, c.getAuthTag(), body]);
+}
+function open(buf, key) {
+  if (buf.subarray(0, 4).toString() !== "JCV1") throw new Error("not a vault file");
+  const d = crypto.createDecipheriv("aes-256-gcm", key, buf.subarray(4, 16));
+  d.setAuthTag(buf.subarray(16, 32));
+  return JSON.parse(Buffer.concat([d.update(buf.subarray(32)), d.final()]).toString("utf8"));
+}
+const vaultPath = (profile) => path.join(VAULT_DIR, `${profile}.vault`);
+function loadVault(profile, key) {
+  try { return open(fs.readFileSync(vaultPath(profile)), key); } catch { return null; }
+}
+function writeVault(profile, key, data) {
+  fs.mkdirSync(VAULT_DIR, { recursive: true, mode: 0o700 });
+  const f = vaultPath(profile);
+  if (fs.existsSync(f)) fs.copyFileSync(f, f + ".prev");
+  const tmp = f + ".tmp";
+  fs.writeFileSync(tmp, seal(data, key), { mode: 0o600 });
+  fs.renameSync(tmp, f);
+}
+
+// ── Chromes ─────────────────────────────────────────────────────────────────
+/** Running main Chrome processes with a debugging port and their own profile. */
+function chromes() {
+  let out = "";
+  try { out = execFileSync("/bin/ps", ["-axo", "pid=,lstart=,command="], { encoding: "utf8", maxBuffer: 32 << 20 }); } catch { return []; }
+  const seen = new Map();
+  for (const line of out.split("\n")) {
+    if (!/Google Chrome(\.app)?\/Contents\/MacOS\/Google Chrome |\/chrome /.test(line) || / --type=/.test(line)) continue;
+    const port = (line.match(/--remote-debugging-port=(\d+)/) || [])[1];
+    const dir = (line.match(/--user-data-dir=(\S+)/) || [])[1];
+    if (!port || !dir) continue;
+    const m = line.trim().match(/^(\d+)\s+(\w{3} \w{3}\s+\d+ [\d:]+ \d{4})/);
+    seen.set(port, { port, dir, profile: path.basename(dir), pid: m && m[1], started: m ? new Date(m[2]).toISOString() : null });
+  }
+  return [...seen.values()];
+}
+
+async function cdp(port) {
+  const v = await (await fetch(`http://localhost:${port}/json/version`, { signal: AbortSignal.timeout(5000) })).json();
+  const ws = new WebSocket(v.webSocketDebuggerUrl);
+  await new Promise((res, rej) => { ws.onopen = res; ws.onerror = () => rej(new Error(`CDP :${port} websocket failed`)); });
+  let id = 0; const pend = new Map();
+  ws.onmessage = (m) => { const d = JSON.parse(m.data); const p = pend.get(d.id); if (p) { pend.delete(d.id); d.error ? p.rej(new Error(d.error.message)) : p.res(d.result); } };
+  const send = (method, params = {}) => new Promise((res, rej) => {
+    const i = ++id; pend.set(i, { res, rej }); ws.send(JSON.stringify({ id: i, method, params }));
+    setTimeout(() => { if (pend.has(i)) { pend.delete(i); rej(new Error(`${method} timed out`)); } }, 20000);
+  });
+  return { send, close: () => ws.close() };
+}
+
+const keyOf = (c) => `${c.domain}|${c.path}|${c.name}`;
+const persistent = (cs) => cs.filter((c) => !c.session && c.expires > Date.now() / 1000);
+const site = (domain) => domain.replace(/^\./, "").split(".").slice(-2).join(".");
+const toParam = (c) => {
+  const p = { name: c.name, value: c.value, domain: c.domain, path: c.path, secure: c.secure, httpOnly: c.httpOnly, expires: c.expires };
+  if (c.sameSite) p.sameSite = c.sameSite;
+  if (c.priority) p.priority = c.priority;
+  if (c.sameParty !== undefined) p.sameParty = c.sameParty;
+  if (c.sourceScheme) p.sourceScheme = c.sourceScheme;
+  if (c.partitionKey) p.partitionKey = c.partitionKey;
+  return p;
+};
+
+async function restoreInto(conn, live, vault, onlySite = null) {
+  const have = new Set(live.map(keyOf));
+  const now = Date.now() / 1000;
+  const put = vault.cookies.filter((c) => c.expires > now && !have.has(keyOf(c)) && (!onlySite || site(c.domain) === onlySite));
+  let ok = 0;
+  for (let i = 0; i < put.length; i += 200) {
+    const batch = put.slice(i, i + 200).map(toParam);
+    try { await conn.send("Storage.setCookies", { cookies: batch }); ok += batch.length; }
+    catch {
+      for (const c of batch) { try { await conn.send("Storage.setCookies", { cookies: [c] }); ok++; } catch {} }
+    }
+  }
+  return { tried: put.length, restored: ok, sites: [...new Set(put.map((c) => site(c.domain)))].sort() };
+}
+
+function page(text) {
+  if (DRY) { log(`[system] ${text}`); return; }
+  try { execFileSync(installTools("bin", "jori-send-curl"), ["--skip-precheck", "--channel", "system", "--intent", "chrome-session-vault", text], { stdio: "ignore", timeout: 60000 }); } catch {}
+}
+
+async function sweepOne(ch, key) {
+  const r = { port: ch.port, profile: ch.profile, chrome_started: ch.started };
+  let conn;
+  try {
+    conn = await cdp(ch.port);
+    const live = persistent((await conn.send("Storage.getCookies")).cookies);
+    const vault = loadVault(ch.profile, key);
+    r.live = live.length; r.vault = vault ? persistent(vault.cookies).length : 0; // unexpired only
+    r.vault_saved = vault && vault.saved_at;
+    if (vault && r.vault >= MIN_VAULT && live.length < r.vault * WIPE_RATIO) {
+      r.action = "restore";
+      if (!DRY) {
+        const res = await restoreInto(conn, live, vault);
+        Object.assign(r, res);
+        loginLog.record({ site: `chrome:${ch.profile}`, port: ch.port, status: "cookie_jar_wiped", source: "chrome-session-vault",
+          detail: `live ${live.length} vs vault ${r.vault} (saved ${vault.saved_at}); Chrome started ${ch.started}; restored ${res.restored}/${res.tried} for ${res.sites.length} sites` });
+        for (const s of res.sites) loginLog.record({ site: s, port: ch.port, status: "session_restored", source: "chrome-session-vault", detail: `restored from the vault saved ${vault.saved_at}` });
+      }
+      page(`🔐 Chrome :${ch.port} (${ch.profile}) lost its saved sign-ins (${live.length} cookies left of ${r.vault}; Chrome started ${ch.started}). ${DRY ? "Would restore" : `Restored ${r.restored ?? 0} cookies for ${(r.sites || []).length} sites`} from the session vault (saved ${vault.saved_at}).`);
+    } else {
+      r.action = "save";
+      if (!DRY) writeVault(ch.profile, key, { saved_at: new Date().toISOString(), port: ch.port, chrome_started: ch.started, cookies: live });
+    }
+  } catch (e) {
+    r.action = "error"; r.error = String(e.message || e).slice(0, 200);
+  } finally { try { conn && conn.close(); } catch {} }
+  return r;
+}
+
+async function main() {
+  if (cmd === "sweep" || cmd === "status") {
+    const key = vaultKey({ create: cmd === "sweep" && !DRY });
+    if (!key) { log("no CHROME_SESSION_VAULT_KEY yet (the first sweep creates it)"); if (cmd === "status") return 0; }
+    const out = [];
+    for (const ch of chromes()) {
+      if (cmd === "status") {
+        let live = null;
+        try { const c = await cdp(ch.port); live = persistent((await c.send("Storage.getCookies")).cookies).length; c.close(); } catch {}
+        const v = key && loadVault(ch.profile, key);
+        out.push({ port: ch.port, profile: ch.profile, chrome_started: ch.started, live, vault: v ? v.cookies.length : 0, vault_saved: v && v.saved_at });
+      } else out.push(await sweepOne(ch, key));
+    }
+    if (JSON_OUT) console.log(JSON.stringify(out));
+    else for (const r of out) log(`:${r.port} ${r.profile}: ${r.action || "status"} live=${r.live ?? "?"} vault=${r.vault ?? 0}${r.restored != null ? ` restored=${r.restored}` : ""}${r.error ? ` error=${r.error}` : ""}`);
+    return out.some((r) => r.action === "error") ? 1 : 0;
+  }
+  if (cmd === "restore") {
+    const port = opt("--port"); const only = opt("--site");
+    const ch = chromes().find((c) => c.port === String(port));
+    if (!ch) { console.error(`no Chrome with --remote-debugging-port=${port}`); return 1; }
+    const key = vaultKey({ create: false });
+    const vault = key && loadVault(ch.profile, key);
+    if (!vault) { console.error(`no vault for ${ch.profile}`); return 1; }
+    const conn = await cdp(port);
+    const live = persistent((await conn.send("Storage.getCookies")).cookies);
+    const res = DRY ? { tried: 0, restored: 0, sites: [] } : await restoreInto(conn, live, vault, only);
+    conn.close();
+    if (!DRY && res.restored) for (const s of res.sites) loginLog.record({ site: s, port, status: "session_restored", source: "chrome-session-vault restore", detail: `restored from the vault saved ${vault.saved_at}` });
+    log(`:${port} restored ${res.restored}/${res.tried} cookies (${res.sites.join(", ") || "nothing missing"})`);
+    return 0;
+  }
+  console.error("usage: chrome-session-vault sweep|status|restore  (see the header)");
+  return 64;
+}
+
+process.exitCode = await main();
