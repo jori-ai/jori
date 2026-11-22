@@ -23,7 +23,8 @@ const LLG = (e, n) => { const p = fakeAt(e, n); return { lat: p.lat, lng: p.lon 
 
 const require = createRequire(import.meta.url);
 const ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
-const { pruneShrunkCompanions, pieceCompanions } = require(path.join(ROOT, "lib/resolve-day.js"))._internal;
+const { pruneShrunkCompanions, pieceCompanions, annotateCompanionJoins } = require(path.join(ROOT, "lib/resolve-day.js"))._internal;
+const { stopHeaderHtml } = require(path.join(ROOT, "lib/daily-summary-render.js"))._internal;
 
 const iso = (s) => Date.parse(s);
 const FLAT = { ...LL(0.0, 0.0) };
@@ -139,4 +140,59 @@ test("a short row wholly inside a piece, or one it holds minutes of, still count
   const sliver = [{ arrived_at: "2026-10-23T11:00:00Z", departed_at: "2026-10-23T12:00:30Z",
                     ...LLR(0.0, 0.0), companions: ["Olin"] }];
   assert.deepEqual(pieceCompanions(blend, piece, sliver), ["Paige"]);
+});
+
+// ---------------------------------------------------------------------------
+// A guest who arrives partway through a long stay is noted with when. A stop's
+// people are the union of every visit row it holds, so a stay from midnight to
+// evening listed a visitor whose first row began in the afternoon from its first
+// minute (annotateCompanionJoins; the header prints it "(from 1:03pm)").
+// ---------------------------------------------------------------------------
+const STAY = (over = {}) => ({ id: "s-9", start: "00:00", end: "18:10", tz: "UTC",
+  start_ts_ms: iso("2026-10-24T00:00:00Z"), end_ts_ms: iso("2026-10-24T18:10:00Z"), ...FLAT,
+  companions: ["Paige", "Olin"], ...over });
+const stayRows = () => [
+  { arrived_at: "2026-10-23T17:49:00Z", departed_at: "2026-10-24T18:05:00Z", ...LLR(0, 0), companions: ["Paige"] },
+  { arrived_at: "2026-10-24T13:03:00Z", departed_at: "2026-10-24T13:08:00Z", ...LLR(0, 0), companions: ["Olin", "Paige"] },
+  { arrived_at: "2026-10-24T14:33:00Z", departed_at: "2026-10-24T14:59:00Z", ...LLR(0, 0), companions: ["Paige", "Olin"] },
+];
+
+test("a guest whose rows begin hours into a long stay is noted with the time their first row began", () => {
+  const stop = STAY();
+  const out = annotateCompanionJoins([stop], stayRows());
+  assert.deepEqual(stop.companion_joins, { Olin: "13:03" });   // Paige is on the row the stay began with
+  assert.deepEqual(stop.companions, ["Paige", "Olin"], "nobody leaves the stop");
+  assert.deepEqual(out, [{ id: "s-9", window: "00:00\u201318:10", joins: { Olin: "13:03" } }]);
+});
+
+test("no note for a short stay, a late row under two hours in, a name the user's words or the fixes placed, or one no row names", () => {
+  const short = STAY({ start: "12:00", end: "15:00", start_ts_ms: iso("2026-10-24T12:00:00Z"), end_ts_ms: iso("2026-10-24T15:00:00Z") });
+  annotateCompanionJoins([short], stayRows());
+  assert.equal("companion_joins" in short, false, "a stay under four hours cannot hide a late arrival");
+  const early = STAY();
+  annotateCompanionJoins([early], [{ arrived_at: "2026-10-24T01:30:00Z", departed_at: "2026-10-24T02:00:00Z", ...LLR(0, 0), companions: ["Olin"] }]);
+  assert.equal("companion_joins" in early, false, "first seen 90 minutes into the stay is not a late arrival");
+  const told = STAY();
+  annotateCompanionJoins([told], stayRows(), [{ id: "s-9", companions: ["Olin"] }]);
+  assert.equal("companion_joins" in told, false, "the user's words put the guest there");
+  const fixed = STAY();
+  annotateCompanionJoins([fixed], stayRows(), [], [{ id: "s-9", name: "Home", added: ["Olin"], fixes: 9 }]);
+  assert.equal("companion_joins" in fixed, false, "the fixes put the guest there");
+  const stranger = STAY({ companions: ["Paige", "Quinn"] });
+  annotateCompanionJoins([stranger], stayRows());
+  assert.equal("companion_joins" in stranger, false, "a name no row gives is not this pass's to date");
+  const off = STAY();
+  process.env.JORI_COMPANION_JOINS = "0";
+  try { annotateCompanionJoins([off], stayRows()); } finally { delete process.env.JORI_COMPANION_JOINS; }
+  assert.equal("companion_joins" in off, false);
+});
+
+test("the header reads the guest's time, and only when it is after the stop's own start", () => {
+  const day = { date: "2026-10-24", tz: "UTC", stops: [] };
+  const stop = { id: "s-9", start: "00:00", end: "18:10", place: { name: "Home" }, companions: ["Paige", "Olin"],
+                 companion_joins: { Olin: "13:03" } };
+  const text = (s) => stopHeaderHtml(s, day).replace(/<[^>]+>/g, "");
+  assert.match(text(stop), /with Paige \+ Olin \(from 1:03pm\)/);
+  assert.doesNotMatch(text({ ...stop, start: "13:03" }), /from/, "a stop that begins when the guest arrived needs no note");
+  assert.doesNotMatch(text({ ...stop, companion_joins: undefined }), /from/);
 });
