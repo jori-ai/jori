@@ -34,11 +34,13 @@
 
 import fs from "node:fs";
 import { openTab, goto, clickElement as clickVisible, sleep } from "../lib/cdp-tab.mjs";
+import { execFileSync } from "node:child_process";
 import { createRequire } from "node:module";
 const require = createRequire(import.meta.url);
 const aw = require("../lib/awardwallet-api.js");
 const { port } = require("../lib/ports.cjs");
 const { LOCKOUT_RISK_CODES } = require("../lib/awardwallet-map.js");
+const { installTools } = require("../lib/root.cjs");
 
 const LIST_URL = "https://awardwallet.com/account/list/";
 const FLAGS = new Set(process.argv.slice(2));
@@ -76,6 +78,38 @@ const ROWS = `JSON.stringify([...document.querySelectorAll('input[id^="account_a
     state: /Error occurred/i.test(t) ? "error" : /Updated/i.test(t) ? "updated" : "running" };
 }))`;
 
+// Sign the automation Chrome back in with the saved login (bin/site-login prints
+// one JSON line {site, status, detail}, never a credential, and exits non-zero
+// for every outcome that is not a sign-in). site-login reads the login through
+// `op`, which cron's PATH lacks, so the Homebrew directories are appended.
+let lastSignIn = null;
+function signIn() {
+  const args = ["awardwallet.com", "--login-url", "https://awardwallet.com/login", "--check-url", LIST_URL, "--port", String(port("chrome_cdp"))];
+  const env = { ...process.env, PATH: [process.env.PATH, "/opt/homebrew/bin", "/usr/local/bin"].filter(Boolean).join(":") };
+  let out = "";
+  try {
+    out = execFileSync(installTools("bin", "site-login"), args, { encoding: "utf8", timeout: 240000, env, stdio: ["ignore", "pipe", "pipe"] });
+  } catch (e) {
+    out = e && e.stdout ? String(e.stdout) : "";
+    if (!out.trim()) return (lastSignIn = { status: "error", detail: String((e && e.message) || e).slice(0, 160) });
+  }
+  try { return (lastSignIn = JSON.parse(out.trim().split("\n").pop())); }
+  catch { return (lastSignIn = { status: "error", detail: "unreadable site-login output" }); }
+}
+
+/** Plain words for why the automatic sign-in did not get AwardWallet back in. */
+function signInBlocker(r) {
+  switch (r && r.status) {
+    case "no_credentials": return "no saved AwardWallet login could be read";
+    case "bad_credentials": return "AwardWallet refused the saved login, send the right one";
+    case "captcha": return "AwardWallet put a robot check on the sign-in form";
+    case "needs_2fa": return "AwardWallet asked for a one-time code";
+    case "no_login_form": return "the sign-in form could not be found";
+    case "still_signed_out": return "the login went in but AwardWallet still shows signed out";
+    default: return `the sign-in tool stopped with "${(r && r.status) || "no answer"}"`;
+  }
+}
+
 async function main() {
   if (!aw.isConfigured()) return { off: true, clicked: false, updated: 0, errors: [], excluded: [], waited_s: 0 };
   const tab = await openTab();
@@ -83,9 +117,19 @@ async function main() {
   try {
     await goto(tab, LIST_URL);
 
-    const href = await tab.evaluate("location.href");
+    let href = await tab.evaluate("location.href");
     if (/\/login/.test(href)) {
-      const e = new Error(`AwardWallet is signed out in the automation Chrome (:${port("chrome_cdp")}) — sign in at awardwallet.com there`);
+      // The user's standing rule: sign in automatically. One attempt per run,
+      // with the saved login (never a retry loop: a bad password stays bad).
+      const si = signIn();
+      log(`  signed out; site-login: ${si.status}${si.detail ? ` (${si.detail})` : ""}`);
+      if (si.status === "signed_in" || si.status === "already_signed_in") {
+        await goto(tab, LIST_URL);
+        href = await tab.evaluate("location.href");
+      }
+    }
+    if (/\/login/.test(href)) {
+      const e = new Error(`AwardWallet is signed out in the automation Chrome (:${port("chrome_cdp")}) and the automatic sign-in did not work — ${signInBlocker(lastSignIn)}`);
       e.code = "SIGNED_OUT";
       throw e;
     }

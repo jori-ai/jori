@@ -42,7 +42,8 @@ done <<< "$READERS"
 # Step 1: make AwardWallet re-read every program first. Many programs only
 # update through the AwardWallet extension in the automation Chrome (:9222), so
 # without this the API just hands back whatever AwardWallet last saw.
-# Exit 2 = signed out of AwardWallet in that Chrome: warn the user once (marker
+# Exit 2 = signed out of AwardWallet in that Chrome and the refresh's own automatic
+# sign-in failed: warn the user once (marker
 # file), clear the marker when a refresh succeeds again. Any other refresh
 # failure is logged only — the sync below still runs on AwardWallet's last copy,
 # and a program that goes stale will trip the 21-day disconnect warning.
@@ -56,7 +57,7 @@ if [ "$RRC" -eq 2 ]; then
   if [ ! -f "$SIGNED_OUT_MARK" ]; then
     touch "$SIGNED_OUT_MARK"
     "$JORI_REPO/bin/jori-send-curl" --skip-precheck --intent "$ALERT_INTENT" --agent ops \
-      "🎫 AwardWallet is signed out in the automation Chrome, so this week's points refresh couldn't run. Sign in at awardwallet.com in that Chrome and balances will update next run." >> "$LOGFILE" 2>&1
+      "🎫 AwardWallet is signed out in the automation Chrome and signing back in automatically didn't work, so this week's points refresh couldn't run. Sign in at awardwallet.com in that Chrome and balances will update next run." >> "$LOGFILE" 2>&1
   fi
 elif [ "$RRC" -eq 0 ]; then
   rm -f "$SIGNED_OUT_MARK"
