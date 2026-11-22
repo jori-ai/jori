@@ -1033,3 +1033,39 @@ test("JORI_STEPS_ALIGN_BLOCK=0 leaves the block's edges where the phone put them
     if (prev === undefined) delete process.env.JORI_STEPS_ALIGN_BLOCK; else process.env.JORI_STEPS_ALIGN_BLOCK = prev;
   }
 });
+
+// A loop out and back over a stretch the phone was silent has a route the router drew between the
+// points it did see: the least the walk covered. Printed beside a step count no walker's stride
+// joins to it ("0.3 mi · 2,122 steps", 0.26 m a step) it read as a mistake, and the reviewer held
+// the day; the steps' floor is the distance then, said "at least".
+test("a loop over a silent stretch whose steps outrun its route prints the steps' floor, said at least, and the header says so", () => {
+  const d = blockDay({ routed_m: 543, loop_in_gap: true, steps: 2122 });
+  const block = d.stops[1];
+  const r = excursionDistance(block, d);
+  assert.equal(Math.round(r.m), Math.round(2122 * 0.45));
+  assert.equal(r.floor, true);
+  assert.equal(r.estimated, true);
+  const info = {};
+  printedWalkMeters(d, d.stops, info);
+  assert.equal(info.floor, true);
+  assert.match(plain(stopHeaderHtml(block, d)), /Walk along the river · at least 0\.6 mi · 2,122 steps/);
+  assert.match(buildSkeleton(d), /at least [\d.]+ miles walked/);
+  assert.match(buildMarkdown(d), /Walk along the river\*\* · at least 0\.6 mi/);
+});
+
+test("a gap loop the steps do not outrun, and a block the phone traced, keep their route; JORI_GAP_LOOP_STEPS_FLOOR=0 restores it", () => {
+  const long = blockDay({ routed_m: 1200, loop_in_gap: true, steps: 2122 });
+  assert.deepEqual(excursionDistance(long.stops[1], long), { m: 1200, estimated: false });
+  const traced = blockDay({ routed_m: 543, steps: 2122 });
+  assert.deepEqual(excursionDistance(traced.stops[1], traced), { m: 543, estimated: false });
+  const few = blockDay({ routed_m: 543, loop_in_gap: true, steps: 90 });
+  assert.deepEqual(excursionDistance(few.stops[1], few), { m: 543, estimated: false });
+  const prev = process.env.JORI_GAP_LOOP_STEPS_FLOOR;
+  process.env.JORI_GAP_LOOP_STEPS_FLOOR = "0";
+  try {
+    const off = blockDay({ routed_m: 543, loop_in_gap: true, steps: 2122 });
+    assert.deepEqual(excursionDistance(off.stops[1], off), { m: 543, estimated: false });
+  } finally {
+    if (prev === undefined) delete process.env.JORI_GAP_LOOP_STEPS_FLOOR; else process.env.JORI_GAP_LOOP_STEPS_FLOOR = prev;
+  }
+});
