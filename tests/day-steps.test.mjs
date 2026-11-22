@@ -894,6 +894,33 @@ test("bursts: a few steps just before a walk do not stretch it, and tiny batches
   assert.equal(stepBursts(stepSeries([one(at(9), at(9, 1), 18, WATCH), one(at(9, 5), at(9, 6), 30, WATCH)]), cfg()).length, 0);
 });
 
+test("bursts: moving about a house at a slow cadence is not a walk; a stroll with stops is", () => {
+  // 16 a minute then 23 a minute (a Watch counting room to room): no burst
+  const about = stepSeries([one(at(9), at(9, 10), 160, WATCH), one(at(9, 10), at(9, 20), 230, WATCH)]);
+  assert.equal(stepBursts(about, cfg()).length, 0);
+  // 35 a minute for ten minutes: a burst
+  assert.equal(stepBursts(stepSeries([one(at(9), at(9, 10), 350, WATCH)]), cfg()).length, 1);
+  assert.equal(SILENT_GAP_DEFAULTS.burst_steps / SILENT_GAP_DEFAULTS.burst_window_min, 30);
+});
+
+test("the phone put down while the Watch counts a slow twenty minutes about the house: the stay is not cut", () => {
+  const stop = homeStop(at(7), at(18));
+  const pings = fixesAround(at(7), at(11, 30), at(13, 5), at(18));
+  const phoneUse = [one(at(11, 0), at(11, 1), 25, PHONE), one(at(13, 10), at(13, 11), 25, PHONE)];
+  const about = [...phoneUse, one(at(12, 27), at(12, 38), 160, WATCH), one(at(12, 39), at(12, 49), 230, WATCH)];
+  for (const phone_sources of [[], [PHONE]]) {
+    const r = splitStopsOnMovedSilence([stop], pings, about, { config: cfg({ phone_sources }), hm });
+    assert.equal(r.stops.length, 1, JSON.stringify(r.silences));
+    assert.ok(!r.stops.some(s => s.moved_place_unknown), "no place-unknown stop, so nothing to ask about");
+    assert.equal(r.silences.find(x => x.from_ms === at(11, 30)).verdict, "still");
+    // the same twenty minutes at a stroll's cadence is a walk the phone sat out, as ever
+    const stroll = [...phoneUse, one(at(12, 27), at(12, 49), 700, WATCH)];
+    const s = splitStopsOnMovedSilence([stop], pings, stroll, { config: cfg({ phone_sources }), hm });
+    assert.equal(s.silences.find(x => x.from_ms === at(11, 30)).verdict, "moved");
+    assert.ok(s.stops.some(x => x.moved_place_unknown));
+  }
+});
+
 test("silentGapConfig: the defaults stand when the installation sets nothing usable", () => {
   const c = silentGapConfig({ gap_min: "x", burst_steps: 200, phone_sources: "nope" });
   assert.equal(c.gap_min, SILENT_GAP_DEFAULTS.gap_min);
