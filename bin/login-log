@@ -112,7 +112,7 @@ function cmdWatch() {
     const cause = s.last.cause;
     if (state.alerted[s.site] === cause) continue;
     const c = L.CAUSES[cause] || L.CAUSES.other;
-    const line = `${s.site}: ${c.why}${c.fix ? `. ${c.fix}` : ""}`;
+    const line = `${s.site}: ${c.why}${c.fix ? `. ${c.fix[0].toUpperCase()}${c.fix.slice(1)}` : ""}`;
     (c.needs_user ? forUser : forSystem).push({ site: s.site, cause, line, s });
   }
   // Recovered = signed in since; a site that only aged out of the window is

@@ -110,8 +110,8 @@ function chromes() {
   return [...seen.values()];
 }
 
-async function cdp(port) {
-  const v = await (await fetch(`http://localhost:${port}/json/version`, { signal: AbortSignal.timeout(5000) })).json();
+async function cdp(port, wsUrl = null) {
+  const v = wsUrl ? { webSocketDebuggerUrl: wsUrl } : await (await fetch(`http://localhost:${port}/json/version`, { signal: AbortSignal.timeout(5000) })).json();
   const ws = new WebSocket(v.webSocketDebuggerUrl);
   await new Promise((res, rej) => { ws.onopen = res; ws.onerror = () => rej(new Error(`CDP :${port} websocket failed`)); });
   let id = 0; const pend = new Map();
@@ -120,7 +120,35 @@ async function cdp(port) {
     const i = ++id; pend.set(i, { res, rej }); ws.send(JSON.stringify({ id: i, method, params }));
     setTimeout(() => { if (pend.has(i)) { pend.delete(i); rej(new Error(`${method} timed out`)); } }, 20000);
   });
-  return { send, close: () => ws.close() };
+  const conn = { send, close: () => ws.close() };
+  // Some Chromes refuse the browser-level Storage domain ("Browser context
+  // management is not supported"); the Network domain of a page target sees
+  // the same profile-wide jar.
+  conn.getCookies = async () => {
+    try { return (await send("Storage.getCookies")).cookies; }
+    catch (e) { return (await viaPage(port, (p) => p.send("Network.getAllCookies"))).cookies; }
+  };
+  conn.setCookies = async (cookies) => {
+    try { return await send("Storage.setCookies", { cookies }); }
+    catch (e) { if (!/not supported/i.test(e.message)) throw e; return viaPage(port, (p) => p.send("Network.setCookies", { cookies })); }
+  };
+  return conn;
+}
+async function viaPage(port, fn) {
+  const targets = await (await fetch(`http://localhost:${port}/json/list`, { signal: AbortSignal.timeout(5000) })).json();
+  let t = targets.find((x) => x.type === "page" && x.webSocketDebuggerUrl);
+  let made = null;
+  if (!t) {
+    // No window open (the tab reaper can leave none): open a blank one for the call.
+    const r = await fetch(`http://localhost:${port}/json/new?about:blank`, { method: "PUT", signal: AbortSignal.timeout(10000) });
+    if (!r.ok) throw new Error(`no page target on :${port} and none could be opened (HTTP ${r.status})`);
+    t = made = await r.json();
+  }
+  const p = await cdp(port, t.webSocketDebuggerUrl);
+  try { return await fn(p); } finally {
+    p.close();
+    if (made) await fetch(`http://localhost:${port}/json/close/${made.id}`, { signal: AbortSignal.timeout(5000) }).catch(() => {});
+  }
 }
 
 const keyOf = (c) => `${c.domain}|${c.path}|${c.name}`;
@@ -143,9 +171,9 @@ async function restoreInto(conn, live, vault, onlySite = null) {
   let ok = 0;
   for (let i = 0; i < put.length; i += 200) {
     const batch = put.slice(i, i + 200).map(toParam);
-    try { await conn.send("Storage.setCookies", { cookies: batch }); ok += batch.length; }
+    try { await conn.setCookies(batch); ok += batch.length; }
     catch {
-      for (const c of batch) { try { await conn.send("Storage.setCookies", { cookies: [c] }); ok++; } catch {} }
+      for (const c of batch) { try { await conn.setCookies([c]); ok++; } catch {} }
     }
   }
   return { tried: put.length, restored: ok, sites: [...new Set(put.map((c) => site(c.domain)))].sort() };
@@ -161,7 +189,7 @@ async function sweepOne(ch, key) {
   let conn;
   try {
     conn = await cdp(ch.port);
-    const live = persistent((await conn.send("Storage.getCookies")).cookies);
+    const live = persistent(await conn.getCookies());
     const vault = loadVault(ch.profile, key);
     r.live = live.length; r.vault = vault ? persistent(vault.cookies).length : 0; // unexpired only
     r.vault_saved = vault && vault.saved_at;
@@ -193,7 +221,7 @@ async function main() {
     for (const ch of chromes()) {
       if (cmd === "status") {
         let live = null;
-        try { const c = await cdp(ch.port); live = persistent((await c.send("Storage.getCookies")).cookies).length; c.close(); } catch {}
+        try { const c = await cdp(ch.port); live = persistent(await c.getCookies()).length; c.close(); } catch {}
         const v = key && loadVault(ch.profile, key);
         out.push({ port: ch.port, profile: ch.profile, chrome_started: ch.started, live, vault: v ? v.cookies.length : 0, vault_saved: v && v.saved_at });
       } else out.push(await sweepOne(ch, key));
@@ -210,7 +238,7 @@ async function main() {
     const vault = key && loadVault(ch.profile, key);
     if (!vault) { console.error(`no vault for ${ch.profile}`); return 1; }
     const conn = await cdp(port);
-    const live = persistent((await conn.send("Storage.getCookies")).cookies);
+    const live = persistent(await conn.getCookies());
     const res = DRY ? { tried: 0, restored: 0, sites: [] } : await restoreInto(conn, live, vault, only);
     conn.close();
     if (!DRY && res.restored) for (const s of res.sites) loginLog.record({ site: s, port, status: "session_restored", source: "chrome-session-vault restore", detail: `restored from the vault saved ${vault.saved_at}` });
