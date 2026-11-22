@@ -17,7 +17,9 @@ run) and the `outages` report; named locks read in one call; the daily tier
 day after its hour, kept when the hand-off fails); client lists (not judged
 while their router is down or when they show none of the expected devices,
 read at most every every_min, a refused password not retried until it
-changes); a maintenance window.
+changes); a maintenance window; a home's internet judged by its TTLock gateways
+(down only when every one is offline, not judged when TTLock can't be read,
+TTLock named as the likelier cause when the whole account is offline).
 
 Run: python3 tests/home-devices.test.py
 """
@@ -43,6 +45,8 @@ ROSTER = {
     "ring_battery_alert_pct": 25,
     "sites": {
         "home": {"label": "Home", "kind": "router", "router_ssh": "root@192.0.2.1", "router_ip": "192.0.2.1", "ring_prefix": "hm "},
+        "flat": {"label": "Flat", "kind": "cloud"},
+        "barn": {"label": "Barn", "kind": "cloud"},
         "cabin": {"label": "Cabin", "kind": "remote", "ring_prefix": "cb ", "unreachable_cause": "Cause is one of: the cabin's internet or its gateway."},
     },
     "devices": [
@@ -54,6 +58,8 @@ ROSTER = {
         {"site": "cabin", "name": "Test anchor", "check": "remote", "anchor": True, "ip": "198.51.100.5", "ports": [443]},
         {"site": "cabin", "name": "Test switch", "check": "remote", "ip": "198.51.100.36", "ports": [80]},
         {"site": "cabin", "name": "Test camera", "check": "ring", "ring_name": "cb porch"},
+        {"site": "flat", "name": "Cable internet", "check": "ttlock_internet", "gateways": [101, 102], "down_note": "Codes queue until it is back."},
+        {"site": "barn", "name": "Fiber internet", "check": "ttlock_internet", "gateways": [201]},
     ],
     "ignore": {"02:00:00:00:00:99": "a phone"},
 }
@@ -70,6 +76,7 @@ class Fake:
         self.remote_up = {"198.51.100.5": True, "198.51.100.36": True}
         self.ring = {"CB Porch": {"conn": "online", "battery": 80}}
         self.lock = True
+        self.gateways = {101: True, 102: True, 201: True}  # TTLock gateway id -> online; None = account unreadable
         self.ssh_ok = True
         self.emails = []
         self.email_envs = []
@@ -102,6 +109,12 @@ class Fake:
                 out = json.dumps(self.ring)
             else:  # lock_cloud: {lock key: connected}; "_default" = the script's own lock
                 out = json.dumps(self.lock if isinstance(self.lock, dict) else {"_default": self.lock})
+        elif exe == "lock-health":
+            assert argv[1:] == ["gateways", "--json"], argv
+            if self.gateways is None:
+                out, rc = json.dumps({"ok": False, "error": "token expired"}), 1
+            else:
+                out = json.dumps({"ok": True, "gateways": [{"id": i, "name": f"G{i}", "online": o} for i, o in self.gateways.items()]})
         elif exe == "speak-gate-live":
             self.digests.append(json.loads(input))
             out = self.digest_out
@@ -199,6 +212,39 @@ class HomeDevicesTest(unittest.TestCase):
         self.assertEqual({k: v["status"] for k, v in state["devices"].items()}, {d["name"]: "up" for d in ROSTER["devices"]})
         self.assertEqual(state["devices"]["Test lock"]["detail"], "cloud: connected")
         self.assertEqual(state["devices"]["Test camera"]["detail"], "Ring: online")
+
+    def test_ttlock_internet_down_only_when_every_gateway_is_offline(self):
+        mod = self.load()
+        self.fake.gateways[101] = False  # one flaky gateway: still up
+        for _ in range(3):
+            self.sweep(mod)
+        self.assertEqual(self.fake.emails, [])
+        self.assertEqual(self.state()["devices"]["Cable internet"]["detail"], "TTLock: 1 of 2 gateways online")
+        self.fake.gateways[102] = False
+        for _ in range(2):
+            self.sweep(mod)
+        self.assertEqual(self.fake.emails, [])
+        self.sweep(mod)
+        self.assertEqual(self.subjects(), ["Offline: Flat Cable internet"])
+        body = self.fake.emails[0][self.fake.emails[0].index("--body") + 1]
+        self.assertIn("TTLock: all 2 gateways offline", body)
+        self.assertIn("Codes queue until it is back.", body)
+        self.fake.gateways[102] = True
+        self.sweep(mod)
+        self.assertEqual(self.subjects()[-1], "Back online: Flat Cable internet")
+
+    def test_ttlock_internet_unreadable_or_account_wide_outage(self):
+        mod = self.load()
+        self.fake.gateways = None  # the account can't be read: not judged, never DOWN
+        for _ in range(4):
+            self.sweep(mod)
+        self.assertEqual(self.fake.emails, [])
+        self.assertEqual(self.state()["devices"]["Cable internet"]["detail"], "TTLock cloud unavailable")
+        self.fake.gateways = {101: False, 102: False, 201: False, 301: False}
+        for _ in range(3):
+            self.sweep(mod)
+        body = self.fake.emails[0][self.fake.emails[0].index("--body") + 1]
+        self.assertIn("more likely TTLock itself", body)
 
     def test_down_after_three_misses_then_back_up(self):
         mod = self.load()
