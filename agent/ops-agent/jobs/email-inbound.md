@@ -94,10 +94,11 @@ If the request needs the user's confirmation (purchases, mail to third parties, 
 ```bash
 ~/Dev/jori/bin/day-correction add <YYYY-MM-DD> --text "<their sentence, verbatim>" \
   --from <ISO+offset> --to <ISO+offset> --channel email --source gmail:<messageId> \
-  [--reading "<your own reading: which activity goes where, and what the map/photos say>"]
+  [--reading "<your own reading: which activity goes where, and what the map/photos say>"] \
+  [--arrival "<name>=<ISO+offset>"]   # when their sentence says when someone arrived ("Sam got here around 3:30"); repeatable
 ```
 
-Use `--reading` when their sentence is ambiguous against the evidence (one "at" joining two activities the map puts apart); it is stored apart from their words, never in place of them.
+Use `--reading` when their sentence is ambiguous against the evidence (one "at" joining two activities the map puts apart); it is stored apart from their words, never in place of them. **Pass `--arrival` whenever the sentence says when a person arrived** (the name as it is on the user's companion records, the instant in the stop's own zone): the header's "(from 4:19pm)" is only when the phone first logged them, and the arrival you give replaces it (`jobs/daily-summary.md` § Step 1, `companion_joins`). The person still goes on the stop through `location-annotate`; `--arrival` only dates it.
 
 **When their sentence points at something a person sent** ("the place Sam sent me", "the link from yesterday"), find it before you say it is not on record: read that person's last two days with `imsg read <name> --days 2` (or the matching WhatsApp/Slack read) and look at what was sent, not for a word from the sentence. A place usually arrives as a bare link plus attachments, with no word like "restaurant" in the text, so a keyword search for the cuisine finds nothing (2026-11-08: a dim sum link sent the evening before was reported missing from a thread that held it). Read a link's title with `og-card --json <url>`, then put the place name in `--reading`.
 
