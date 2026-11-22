@@ -85,9 +85,6 @@ if (prev && prev._cached_at) {
   if (prev.precip_chance < 0.3 && (cur.precip_chance || 0) >= 0.5) {
     findings.push(`Rain likely (${Math.round((cur.precip_chance || 0) * 100)}%)`);
   }
-  if (cur.condition !== prev.condition && cur.condition) {
-    findings.push(`Conditions: ${cur.condition}`);
-  }
 }
 
 // Proactive "heading out with weather concern" trigger — only relevant if outside
