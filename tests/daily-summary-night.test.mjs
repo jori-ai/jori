@@ -29,6 +29,36 @@ test("summary night line: phone-only night", () => {
   assert.equal(R.nightLine(day, [], (hm) => hm), "Phone down 23:20 · Woke 07:05");
 });
 
+// A weak sleep reading is a time with no date: on the day's own page it must not read as the day's own evening.
+test("summary night line: a weak reading from before the day's midnight says it was the evening before", () => {
+  const day = { date: "2026-10-09", tz: TZ, stops: [],
+    sleep: { at: "21:26", source: "last_user_message", ts_ms: Date.parse("2026-10-08T21:26:00+03:00") },
+    wake: { at: "11:28", source: "first_photo", ts_ms: Date.parse("2026-10-09T11:28:00+03:00") } };
+  assert.equal(R.nightLine(day, [], (hm) => hm), "Last seen up 21:26 the evening before (last message) · Up by 11:28 (first photo)");
+  const phone = { ...day, sleep: { at: "23:58", source: "phone_usage", ts_ms: Date.parse("2026-10-08T23:58:00+03:00") } };
+  assert.equal(R.nightLine(phone, [], (hm) => hm), "Phone last used 23:58 the evening before · Up by 11:28 (first photo)");
+});
+
+test("summary night line: a weak reading after the day's midnight, one with no instant, or the Watch keep their wording", () => {
+  const wake = { at: "11:28", source: "first_photo", ts_ms: Date.parse("2026-10-09T11:28:00+03:00") };
+  const after = { date: "2026-10-09", tz: TZ, stops: [], wake,
+    sleep: { at: "00:41", source: "last_user_message", ts_ms: Date.parse("2026-10-09T00:41:00+03:00") } };
+  assert.equal(R.nightLine(after, [], (hm) => hm), "Last seen up 00:41 (last message) · Up by 11:28 (first photo)");
+  const noInstant = { date: "2026-10-09", tz: TZ, stops: [], wake, sleep: { at: "21:26", source: "last_user_message" } };
+  assert.equal(R.nightLine(noInstant, [], (hm) => hm), "Last seen up 21:26 (last message) · Up by 11:28 (first photo)");
+  const watch = { date: "2026-10-09", tz: TZ, stops: [], sleep: { at: "23:48", source: "night_watch", ts_ms: Date.parse("2026-10-08T23:48:00+03:00") },
+    wake: { at: "06:52", source: "night_watch", asleep_min: 414 } };
+  assert.equal(R.nightLine(watch, [], (hm) => hm), "Fell asleep 23:48 (Watch) · Woke 06:52 (Watch) · 6h 54m asleep");
+});
+
+test("summary night line: JORI_SLEEP_LINE_DAY=0 keeps the old wording", () => {
+  const day = { date: "2026-10-09", tz: TZ, stops: [],
+    sleep: { at: "21:26", source: "last_user_message", ts_ms: Date.parse("2026-10-08T21:26:00+03:00") } };
+  process.env.JORI_SLEEP_LINE_DAY = "0";
+  try { assert.equal(R.nightLine(day, [], (hm) => hm), "Last seen up 21:26 (last message)"); }
+  finally { delete process.env.JORI_SLEEP_LINE_DAY; }
+});
+
 const NIGHT = [
   ["23:10:09", "23:23:39", 3], ["23:23:39", "23:49:11", 4], ["23:49:11", "00:01:11", 3],
   ["00:01:11", "00:02:11", 2], ["00:02:11", "00:57:44", 3], ["00:57:44", "01:12:14", 5],
