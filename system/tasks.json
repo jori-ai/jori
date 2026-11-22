@@ -834,7 +834,7 @@
         "zoom summary",
         "call summaries"
       ],
-      "description": "Logs every call the user hosts on Zoom (not only the recurring meetings'): code finds the ended meetings in the user's room(s) and any meeting a Zoom summary email names, a model writes an English log (summary, one-line points, next steps for the user and for the others) and matches participants to wiki person pages; stored in data/call-log.json, written to each person page's Calls block and the day page, and added to the daily summary. Recurring meetings' calls are left to their notes. Read-only on Zoom and Gmail; messages no one. No agent turn.",
+      "description": "Logs every call the user hosts on Zoom (not only the recurring meetings'): code finds the ended meetings in the user's room(s) and any meeting a Zoom summary email names; a model writes an English log from the call's transcript (Zoom's AI summary only when no transcript came): summary, facts worth remembering, one-line points, and action items for the user and for the others with due dates, and closes earlier items a later call shows done. Stored in data/call-log.json (transcripts in data/call-transcripts/), written to each person page's Calls block and the day page, and added to the daily summary. Messages the user only: a recap after each call and, from cron in code, at most one follow-up a day of open action items that are due one. Recurring meetings' calls are left to their notes. Read-only on Zoom and Gmail. No agent turn.",
       "job": "call-log",
       "runtime": "launchd-script",
       "launchd_label": "ai.claude.call-log",
