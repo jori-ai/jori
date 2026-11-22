@@ -1,0 +1,149 @@
+#!/bin/bash
+# tcc-stable-bins — keep macOS privacy grants across CLI upgrades.
+#
+# macOS keys a privacy grant (Full Disk Access, "access data from other apps",
+# Google Drive / file-provider access, Apple Events…) for a bare command-line
+# binary on its resolved PATH plus its code signature. Claude Code installs
+# every release at a new path (~/.local/share/claude/versions/<ver>) and
+# Homebrew puts op at Caskroom/1password-cli/<ver>/op, so each upgrade looks
+# like a brand-new app and the prompts come back. Child processes (op, node,
+# python…) are attributed to the claude that launched them, so claude's path
+# is the one that matters most.
+#
+# Fix (same idea as bin/node-signed-install): keep one signed copy of each
+# binary at a fixed path, and point the usual symlink at that copy. Upgrades
+# re-point the symlink at the new versioned file; this script notices (a
+# LaunchAgent watches the install dirs), checks the new file's signature and
+# team, copies it over the fixed one (atomic rename, so running processes
+# keep their old inode) and re-points the symlink. The signature's designated
+# requirement is the same across releases, so every grant carries over.
+#
+# Usage:
+#   tcc-stable-bins            sync now (default; silent when nothing changed)
+#   tcc-stable-bins status     show each link, its target and whether it's fixed
+#   tcc-stable-bins install    copy this script next to the binaries and load
+#                              the LaunchAgent that re-syncs after upgrades
+#   tcc-stable-bins uninstall  unload the agent and point the links back at
+#                              the versioned files (full rollback)
+#
+# Grant Full Disk Access by hand once, to the fixed paths printed by `status`
+# (System Settings → Privacy & Security → Full Disk Access → +, Cmd-Shift-G).
+
+set -euo pipefail
+
+DEST="${TCC_STABLE_DIR:-$HOME/.local/stable-bin}"
+LABEL="ai.claude.tcc-stable-bins"
+PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
+LOG="$DEST/sync.log"
+
+# name | symlink the callers use | signing team the copy must carry
+ENTRIES=(
+  "claude|$HOME/.local/bin/claude|Q6L2SF6YDW"
+  "op|/opt/homebrew/bin/op|2BUA8C4S2C"
+)
+
+log() { echo "$(date '+%F %T') [tcc-stable-bins] $*"; }
+
+abs_target() {   # resolved target of symlink $1 (one hop, made absolute)
+  local link="$1" t
+  t="$(readlink "$link")"
+  case "$t" in
+    /*) printf '%s\n' "$t" ;;
+    *)  printf '%s/%s\n' "$(cd "$(dirname "$link")" && cd "$(dirname "$t")" && pwd)" "$(basename "$t")" ;;
+  esac
+}
+
+sync_one() {
+  local name="$1" link="$2" team="$3" stable target
+  stable="$DEST/$name"
+  if [ ! -L "$link" ]; then log "skip $name: $link is not a symlink"; return 0; fi
+  target="$(abs_target "$link")"
+  [ "$target" = "$stable" ] && return 0
+  if [ ! -f "$target" ]; then log "skip $name: $link points at missing $target"; return 0; fi
+  if ! codesign --verify --strict "$target" 2>/dev/null; then
+    log "REFUSING $name: $target fails codesign --verify"; return 1
+  fi
+  if ! codesign -dv "$target" 2>&1 | grep -q "^TeamIdentifier=$team\$"; then
+    log "REFUSING $name: $target is not signed by team $team"; return 1
+  fi
+  mkdir -p "$DEST"
+  if ! cmp -s "$target" "$stable" 2>/dev/null; then
+    cp -p "$target" "$stable.tmp.$$"
+    mv -f "$stable.tmp.$$" "$stable"
+    log "copied $target -> $stable"
+  fi
+  ln -s "$stable" "$link.tmp.$$"
+  mv -f "$link.tmp.$$" "$link"      # rename(2) replaces the symlink atomically
+  log "re-pointed $link -> $stable (was $target)"
+}
+
+cmd_sync() {
+  local e rc=0
+  for e in "${ENTRIES[@]}"; do
+    IFS='|' read -r n l t <<<"$e"
+    sync_one "$n" "$l" "$t" || rc=1
+  done
+  return $rc
+}
+
+cmd_status() {
+  local e
+  for e in "${ENTRIES[@]}"; do
+    IFS='|' read -r n l t <<<"$e"
+    local tgt="(not a symlink)" ok="DRIFTED"
+    [ -L "$l" ] && tgt="$(abs_target "$l")"
+    [ "$tgt" = "$DEST/$n" ] && ok="fixed"
+    printf '%-7s %-8s %s -> %s\n' "$n" "$ok" "$l" "$tgt"
+  done
+  if launchctl print "gui/$(id -u)/$LABEL" >/dev/null 2>&1; then echo "agent   loaded   $LABEL"; else echo "agent   NOT LOADED $LABEL"; fi
+  echo "Full Disk Access paths: $DEST/claude  $DEST/op"
+}
+
+cmd_install() {
+  mkdir -p "$DEST" "$(dirname "$PLIST")"
+  local self; self="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+  [ "$self" = "$DEST/tcc-stable-bins" ] || cp -p "$self" "$DEST/tcc-stable-bins"
+  chmod +x "$DEST/tcc-stable-bins"
+  cat > "$PLIST" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>$LABEL</string>
+  <key>ProgramArguments</key><array><string>/bin/bash</string><string>$DEST/tcc-stable-bins</string><string>sync</string></array>
+  <key>WatchPaths</key><array>
+    <string>$HOME/.local/bin</string>
+    <string>$HOME/.local/share/claude/versions</string>
+    <string>/opt/homebrew/bin</string>
+  </array>
+  <key>StartInterval</key><integer>3600</integer>
+  <key>RunAtLoad</key><true/>
+  <key>ThrottleInterval</key><integer>10</integer>
+  <key>StandardOutPath</key><string>$LOG</string>
+  <key>StandardErrorPath</key><string>$LOG</string>
+</dict></plist>
+PLIST
+  launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
+  launchctl bootstrap "gui/$(id -u)" "$PLIST"
+  sleep 2
+  cmd_status
+}
+
+cmd_uninstall() {
+  launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
+  rm -f "$PLIST"
+  # point claude back at its newest versioned file, op back at its Caskroom file
+  local v c
+  v="$(ls -1 "$HOME/.local/share/claude/versions" 2>/dev/null | sort -V | tail -1)"
+  [ -n "$v" ] && ln -sfn "$HOME/.local/share/claude/versions/$v" "$HOME/.local/bin/claude"
+  c="$(ls -1d /opt/homebrew/Caskroom/1password-cli/*/op 2>/dev/null | sort -V | tail -1)"
+  [ -n "$c" ] && ln -sfn "$c" /opt/homebrew/bin/op
+  cmd_status
+}
+
+case "${1:-sync}" in
+  sync)      cmd_sync ;;
+  status)    cmd_status ;;
+  install)   cmd_install ;;
+  uninstall) cmd_uninstall ;;
+  *) echo "usage: tcc-stable-bins [sync|status|install|uninstall]" >&2; exit 2 ;;
+esac
