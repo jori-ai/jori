@@ -905,11 +905,38 @@ def reverse_geocode_nominatim(lat: float, lon: float) -> Optional[Tuple[str, str
     except Exception:
         return None
 
-def nominatim_neighborhood(lat: float, lon: float) -> Optional[str]:
-    """Just the neighborhood/suburb (else city) name for a point — the fallback
-    label for the confidence-gated naming ladder, so a caller always has a
-    locality even when the primary resolve is a confident venue. Lower zoom (14)
-    biases toward the neighborhood, not a street/POI."""
+# The area fields of one Nominatim address, fine to coarse. A response carries
+# several levels at once (the small neighbourhood AND the wider suburb that
+# contains it), which is what lets a caller tell "inside my own district" from
+# "in another one".
+_NOMINATIM_AREA_FIELDS = ("neighbourhood", "quarter", "city_district", "suburb",
+                          "borough", "city", "town", "village")
+
+def neighborhood_and_areas(addr: Optional[Dict[str, Any]]) -> Tuple[Optional[str], List[str]]:
+    """Pure function of one Nominatim `address` dict. Returns (neighborhood, areas).
+    `neighborhood` is the first non-empty field of the fine-to-coarse chain (its
+    value and semantics are what nominatim_neighborhood always returned);
+    `areas` is every area name the same response holds, fine to coarse, deduped
+    case-insensitively, empty ones dropped."""
+    addr = addr or {}
+    neighborhood = (addr.get("neighbourhood") or addr.get("quarter")
+                    or addr.get("city_district") or addr.get("suburb")
+                    or addr.get("city") or addr.get("town") or addr.get("village"))
+    areas: List[str] = []
+    seen = set()
+    for field in _NOMINATIM_AREA_FIELDS:
+        v = addr.get(field)
+        if not isinstance(v, str) or not v.strip() or v.strip().lower() in seen:
+            continue
+        seen.add(v.strip().lower())
+        areas.append(v)
+    return neighborhood, areas
+
+def nominatim_neighborhood_areas(lat: float, lon: float) -> Tuple[Optional[str], List[str]]:
+    """(neighborhood, areas) for a point from ONE Nominatim reverse call — the
+    fallback label for the confidence-gated naming ladder, so a caller always has
+    a locality even when the primary resolve is a confident venue. On any
+    failure: (None, [])."""
     try:
         # zoom 15 surfaces the actual neighborhood — zoom 14 collapses to the
         # borough/city. Prefer the neighborhood-grain fields; in a big city
@@ -919,12 +946,13 @@ def nominatim_neighborhood(lat: float, lon: float) -> Optional[str]:
         req = urllib.request.Request(url, headers={"User-Agent": "location-segment/1.0"})
         with urllib.request.urlopen(req, timeout=8) as resp:
             data = json.loads(resp.read())
-        addr = data.get("address", {}) or {}
-        return (addr.get("neighbourhood") or addr.get("quarter")
-                or addr.get("city_district") or addr.get("suburb")
-                or addr.get("city") or addr.get("town") or addr.get("village"))
+        return neighborhood_and_areas(data.get("address", {}) or {})
     except Exception:
-        return None
+        return None, []
+
+def nominatim_neighborhood(lat: float, lon: float) -> Optional[str]:
+    """Just the neighborhood/suburb (else city) name for a point."""
+    return nominatim_neighborhood_areas(lat, lon)[0]
 
 # ============================================================================
 # Google Places
@@ -2739,10 +2767,11 @@ def parse_args(argv: List[str]) -> Tuple[argparse.Namespace, Options]:
 def cmd_resolve_point(argv: List[str]) -> int:
     """resolve-point <lat> <lon> [--at <iso>] — name a single point via the full
     resolve_place ladder. Returns JSON {name, source, confidence, address,
-    primary_type, distance_m, neighborhood, alternatives}. `neighborhood` is
-    ALWAYS populated (separate Nominatim call) so the caller can apply the
-    confidence gate: use `name` when confidence is high, else fall back to
-    `neighborhood`. Reuses every existing resolver — no new geocoding."""
+    primary_type, distance_m, neighborhood, areas, alternatives}. `neighborhood` is
+    ALWAYS populated (one Nominatim call, shared with `areas`: every area name
+    in that response, fine to coarse) so the caller can apply the confidence
+    gate: use `name` when confidence is high, else fall back to `neighborhood`.
+    Reuses every existing resolver — no new geocoding."""
     p = argparse.ArgumentParser(prog="location-segment resolve-point")
     p.add_argument("lat", type=float)
     p.add_argument("lon", type=float)
@@ -2774,6 +2803,7 @@ def cmd_resolve_point(argv: List[str]) -> int:
     wifi_entries = load_wifi_map()
     confirmed = load_confirmed_stops()
     primary, alts = resolve_place(sc, opts, recurring, wifi_entries, confirmed)
+    nbhd, areas = nominatim_neighborhood_areas(a.lat, a.lon)   # one call for both
     out = {
         "name": primary.name,
         "source": primary.source,
@@ -2781,7 +2811,8 @@ def cmd_resolve_point(argv: List[str]) -> int:
         "address": primary.address,
         "primary_type": primary.primary_type,
         "distance_m": primary.distance_m,
-        "neighborhood": nominatim_neighborhood(a.lat, a.lon),
+        "neighborhood": nbhd,
+        "areas": areas,
         "alternatives": [
             {"name": x.name, "source": x.source, "confidence": x.confidence}
             for x in (alts or [])[:4]

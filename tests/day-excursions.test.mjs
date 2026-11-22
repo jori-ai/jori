@@ -377,6 +377,98 @@ test("with no feature and no neighborhood the walk is still a walk", () => {
 });
 
 // ---------------------------------------------------------------------------
+// 3b. REGRESSION GUARD: a walk INSIDE one district must not read as a walk TO it.
+//
+// One geocode answers with its finest area (a small neighbourhood) and another,
+// a few hundred metres away in the same district, only with the wider name that
+// CONTAINS the small one. The two strings differ though the walk never left the
+// district, and "Walk to <district>" was written. The start's geocode holds both
+// levels (`areas`); a turnaround named after one of them is "around". The rule is
+// one-directional and never an intersection of area sets.
+// ---------------------------------------------------------------------------
+
+const OLD_QUARTER_AREAS = ["Old Quarter", "Harbour District", "Metro City"];
+
+test("a turnaround named for a wider area that contains the start is 'around', not 'to'", () => {
+  const { titleFor } = _internal;
+  assert.equal(
+    titleFor({ turnNeighborhood: "Harbour District", baseNeighborhood: "Old Quarter", baseAreas: OLD_QUARTER_AREAS }),
+    "Walk around Harbour District");
+  assert.equal(
+    titleFor({ turnNeighborhood: "harbour district", baseNeighborhood: "Old Quarter", baseAreas: OLD_QUARTER_AREAS }),
+    "Walk around harbour district", "the match is case-insensitive");
+});
+
+test("two different neighbourhoods that share only the city still read 'to'", () => {
+  const { titleFor } = _internal;
+  // "Metro City" is in both area sets; the turnaround is "Riverside", which is
+  // not in the start's areas. Set intersection would have merged them.
+  assert.equal(
+    titleFor({ turnNeighborhood: "Riverside", baseNeighborhood: "Old Quarter", baseAreas: OLD_QUARTER_AREAS }),
+    "Walk to Riverside");
+});
+
+test("a start known only coarsely that turns in a finer name keeps 'to' (one direction only)", () => {
+  const { titleFor } = _internal;
+  assert.equal(
+    titleFor({ turnNeighborhood: "Harbour District", baseNeighborhood: "Metro City", baseAreas: ["Metro City"] }),
+    "Walk to Harbour District");
+});
+
+test("with no baseAreas the title is exactly what it was: 'to' when they differ, 'around' when equal", () => {
+  const { titleFor } = _internal;
+  for (const baseAreas of [undefined, null, []]) {
+    assert.equal(titleFor({ turnNeighborhood: "Harbour District", baseNeighborhood: "Old Quarter", baseAreas }),
+                 "Walk to Harbour District");
+    assert.equal(titleFor({ turnNeighborhood: "Old Quarter", baseNeighborhood: "Old Quarter", baseAreas }),
+                 "Walk around Old Quarter");
+  }
+  assert.equal(titleFor({ turnNeighborhood: "Harbour District", baseNeighborhood: "Old Quarter" }),
+               "Walk to Harbour District");
+});
+
+test("driving follows the same rule: 'Drive around' inside the start's district, 'Drive to' otherwise", () => {
+  const { titleFor } = _internal;
+  const mode = "driving";
+  assert.equal(titleFor({ mode, turnNeighborhood: "Harbour District", baseNeighborhood: "Old Quarter", baseAreas: OLD_QUARTER_AREAS }),
+               "Drive around Harbour District");
+  assert.equal(titleFor({ mode, turnNeighborhood: "Riverside", baseNeighborhood: "Old Quarter", baseAreas: OLD_QUARTER_AREAS }),
+               "Drive to Riverside");
+  assert.equal(titleFor({ mode, turnNeighborhood: "Harbour District", baseNeighborhood: "Old Quarter" }),
+               "Drive to Harbour District");
+  assert.equal(titleFor({ mode, turnNeighborhood: "Old Quarter", baseNeighborhood: "Old Quarter", baseAreas: OLD_QUARTER_AREAS }),
+               "Drive around Old Quarter");
+});
+
+test("a named feature still wins over the neighbourhood rule", () => {
+  const { titleFor } = _internal;
+  const args = { turnNeighborhood: "Harbour District", baseNeighborhood: "Old Quarter", baseAreas: OLD_QUARTER_AREAS };
+  assert.equal(titleFor({ ...args, feature: { name: "North River", kind: "water" } }), "Walk along North River");
+  assert.equal(titleFor({ ...args, feature: { name: "Example Park", kind: "green" } }), "Walk in Example Park");
+  assert.equal(titleFor({ ...args, mode: "driving", feature: { name: "Example Park", kind: "green" } }), "Drive through Example Park");
+});
+
+test("a walk from the base to a wider area holding the base is titled 'around' end to end", async () => {
+  // The turnaround resolves only to the wider district; the base's geocode holds
+  // both its own small neighbourhood and that district (`areas` from resolve-point).
+  const resolvePoint = (lat) => lat > NORTH_OF
+    ? { neighborhood: "Harbour District", areas: ["Harbour District", "Metro City"] }
+    : { neighborhood: "Old Quarter", areas: OLD_QUARTER_AREAS };
+  const stops = [homeStop("s-1", "00:00", "17:00"), SLIVER, homeStop("s-3", "17:43", "21:12")];
+  const { stops: out } = await detectExcursions(stops, DAY_PATH, { resolvePoint, features: noFeatures });
+  assert.equal(out.find(s => s.excursion).place.name, "Walk around Harbour District");
+
+  // Same geometry, a turnaround in a district the base does not sit in: still "to".
+  const elsewhere = (lat) => lat > NORTH_OF
+    ? { neighborhood: "Riverside", areas: ["Riverside", "Metro City"] }
+    : { neighborhood: "Old Quarter", areas: OLD_QUARTER_AREAS };
+  const { stops: out2 } = await detectExcursions(
+    [homeStop("s-1", "00:00", "17:00"), SLIVER, homeStop("s-3", "17:43", "21:12")],
+    DAY_PATH, { resolvePoint: elsewhere, features: noFeatures });
+  assert.equal(out2.find(s => s.excursion).place.name, "Walk to Riverside");
+});
+
+// ---------------------------------------------------------------------------
 // 4. Provenance + rendering: the walk asserts, it does not hedge.
 // ---------------------------------------------------------------------------
 
