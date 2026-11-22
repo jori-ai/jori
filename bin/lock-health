@@ -32,6 +32,10 @@
 //   lock-health preflight --property <name> [--unit <id>]
 //                                            live check of the locks one stay needs;
 //                                            exit 0 ready, 1 a problem, 2 can't tell
+//   lock-health gateways [--where] [--json]  every TTLock gateway and whether it is online
+//                                            (--where: the homes its locks serve). Read by
+//                                            home-devices' ttlock_internet check every sweep;
+//                                            exit 0 read, 1 TTLock unreadable, 2 TTLock off here
 //
 // Config: agent/local/config/lock-health.json (none = nothing to check).
 // State: data/lock-health-state.json. Kill switch: data/.lock-health-off.
@@ -319,12 +323,56 @@ async function cmdPreflight() {
   process.exitCode = !v.locks.length ? 2 : v.ok ? 0 : 1;
 }
 
+/** One read of the account's gateways: the internet watch at homes where they are all we have. */
+async function cmdGateways() {
+  const t = CFG.ttlock;
+  const clientId = t?.client_id_env ? process.env[t.client_id_env] : null;
+  const json = has("--json");
+  const fail = (error, code) => {
+    if (json) console.log(JSON.stringify({ ok: false, error }));
+    else console.error(`lock-health gateways: ${error}`);
+    process.exitCode = code;
+  };
+  if (!t || !clientId) return fail("TTLock is off here (no lock-health.json ttlock, or its client id is not set)", 2);
+  let client, db;
+  try {
+    db = firestore();
+    const tok = await borrowedToken(db, t.token_doc, Date.now());
+    if (tok.error) return fail(tok.error, 1);
+    client = new TTLockClient({ clientId, accessToken: tok.accessToken, base: (t.api_base_env && process.env[t.api_base_env]) || DEFAULT_BASE });
+  } catch (e) { return fail(e.message, 1); }
+  let gateways;
+  try { gateways = await client.listGateways(); } catch (e) { return fail(e.message, 1); }
+  let where = null;
+  if (has("--where")) {
+    where = new Map();
+    let availability = [];
+    try { availability = await db.list("unit-availability"); } catch { /* the seed map stands in */ }
+    for (const [lockId, ws] of ttlockUnits(availability)) {
+      let paired = [];
+      try { paired = await client.gatewaysForLock(lockId); } catch (e) { log(`lock ${lockId}: gateway lookup failed: ${e.message}`); }
+      for (const p of paired) {
+        if (!where.has(p.gatewayId)) where.set(p.gatewayId, new Set());
+        for (const w of ws) where.get(p.gatewayId).add(w.property);
+      }
+      await sleep(300);
+    }
+  }
+  const rows = gateways.map((g) => ({
+    id: g.gatewayId, name: g.gatewayName || null, online: g.isOnline === 1, locks: Number.isFinite(g.lockNum) ? g.lockNum : null,
+    ...(where ? { properties: [...(where.get(g.gatewayId) || [])] } : {}),
+  }));
+  if (json) console.log(JSON.stringify({ ok: true, gateways: rows }));
+  else for (const r of rows) console.log(`${r.online ? "online " : "OFFLINE"} ${r.id} ${r.name || "(no name)"}${r.properties ? `  ${r.properties.join(", ") || "no mapped lock"}` : ""}`);
+}
+
 async function main() {
   if (fs.existsSync(OFF) && cmd === "check") { log("kill switch present, skipping"); return; }
+  if (cmd === "gateways") return cmdGateways();  // says itself when TTLock is off
   if (!CFG.ttlock && !CFG.schlage) { log("no locks configured (agent/local/config/lock-health.json), nothing to do"); return; }
   if (cmd === "check" || cmd === "status") return cmdCheck();
   if (cmd === "preflight") return cmdPreflight();
-  console.error("usage: lock-health check|status|preflight (see the header)");
+  console.error("usage: lock-health check|status|preflight|gateways (see the header)");
   process.exitCode = 2;
 }
 
