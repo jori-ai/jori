@@ -17,13 +17,26 @@
 //   call-log list [--days N] [--json]  the log, newest first
 //   call-log show <uuid|YYYY-MM-DD> [--json]
 //
-// Read-only on Zoom and Gmail. Messages no one. Calls of a recurring meeting are
+// Action items (lib/call-actions.mjs), for the user and for the others on the call:
+//   call-log actions [--all] [--json]  open items (with --all, closed ones too)
+//   call-log done <id> [--note "<their words>"] [--by chat]
+//   call-log drop <id> [--note "<why>"] [--by chat]
+//   call-log reopen <id> [--due YYYY-MM-DD]
+//   call-log due <id> YYYY-MM-DD       a new date
+//   call-log relog [--days 7] [--dry-run]  the last N days' calls written again by the next sync
+//       (from the transcript); items nobody touched yet are replaced by the new log's
+//   call-log followup [--dry-run]      code only: today's follow-up of open items, at most one a
+//       day after 9:00 local, only when an item is due one (run from cron by trigger-call-log.sh)
+//
+// Read-only on Zoom and Gmail. Messages the user only: a recap after each newly
+// logged call (sync, calls that ended in the last 12 h) and the daily follow-up;
+// never a participant. Calls of a recurring meeting are
 // left to that meeting's flow (bin/meeting-notes-from-zoom): recorded as
 // "recurring", nothing more. Playbook: agent/ops-agent/jobs/call-log.md.
 
 import fs from "node:fs";
 import path from "node:path";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
 import { loadCredentials, createZoomClient } from "../lib/zoom-client.mjs";
@@ -31,6 +44,7 @@ import { callContent } from "../lib/zoom-content.mjs";
 import { meetings as recurringMeetings } from "../lib/meetings.mjs";
 import { runHook } from "../lib/ext-hooks.mjs";
 import * as CL from "../lib/call-log.mjs";
+import * as CA from "../lib/call-actions.mjs";
 
 const require = createRequire(import.meta.url);
 const { instance } = require("../lib/instance.cjs");
@@ -38,6 +52,10 @@ const LIB = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "lib")
 const GOG = process.env.GOG_BIN || (fs.existsSync("/opt/homebrew/bin/gog") ? "/opt/homebrew/bin/gog" : "gog");
 const ACCOUNT = process.env.JORI_CAL_ACCOUNT || instance().owner_email;
 const LOCK = `${CL.STORE}.lock`;
+const SEND = require("../lib/root.cjs").installTools("bin/jori-send-curl");
+const TRANSCRIPTS = path.join(path.dirname(CL.STORE), "call-transcripts");
+const RECAP_MAX_AGE_MS = 12 * 3600_000; // a call logged later than this after it ended gets no recap (a backfill)
+const BACKFILL_MS = 10 * 86400_000;      // calls logged before the ledger: this far back they get their items
 
 const argv = process.argv.slice(2);
 const cmd = argv[0];
@@ -49,7 +67,8 @@ const DAYS = Math.max(1, Math.min(30, Number(flag("--days", CL.LOOKBACK_DAYS)) |
 const say = (s) => { if (!QUIET || s.startsWith("ERROR")) process.stdout.write(`${new Date().toISOString()} ${s}\n`); };
 
 function usage(code = 2) {
-  process.stderr.write("usage: call-log pending|sync|list|show [<uuid|date>] [--days N] [--dry-run] [--quiet] [--json]\n");
+  process.stderr.write("usage: call-log pending|sync|list|show [<uuid|date>] [--days N] [--dry-run] [--quiet] [--json]\n"
+    + "       call-log actions [--all] [--json] | done|drop <id> [--note ..] | reopen <id> [--due ..] | due <id> <YYYY-MM-DD> | followup [--dry-run]\n");
   process.exit(code);
 }
 
@@ -93,6 +112,13 @@ async function discover(client, store, days, now = Date.now()) {
 }
 
 const isOpen = (e) => !e || e.status === "waiting";
+
+/** The days to look back: --days, widened to reach a call sent back to be logged again (relog). */
+function windowDays(store, now = Date.now()) {
+  const starts = Object.values(store.calls).filter((e) => e.status === "waiting" && e.start).map((e) => Date.parse(e.start));
+  const oldest = Math.min(now, ...starts);
+  return Math.min(30, Math.max(DAYS, Math.ceil((now - oldest) / 86400_000) + 1));
+}
 
 function withLock(fn) {
   try {
@@ -193,7 +219,7 @@ function client() {
 async function cmdPending() {
   if (!CL.rooms().length) { say("no Zoom room configured (call-log rooms, or a recurring meeting's zoom.room_id); nothing to log"); process.exit(3); }
   const store = CL.readStore();
-  const { meetings } = await discover(client(), store, DAYS);
+  const { meetings } = await discover(client(), store, windowDays(store));
   const open = meetings.filter((m) => isOpen(store.calls[m.uuid]));
   say(open.length ? `${open.length} call(s) wait to be logged` : "no call waits to be logged");
   process.exit(open.length ? 0 : 3);
@@ -207,7 +233,7 @@ async function cmdSync() {
   const z = client();
   const store = CL.readStore();
   const now = Date.now();
-  const { meetings, emails } = await discover(z, store, DAYS, now);
+  const { meetings, emails } = await discover(z, store, windowDays(store, now), now);
   store.emails = store.emails || {};
   for (const e of emails) store.emails[e.id] = e.uuids;
   const logged = [];
@@ -246,23 +272,33 @@ async function cmdSync() {
       store.calls[m.uuid] = { ...base, status: "waiting", attempts: (prev && prev.attempts) || 0, ...extra };
       say(`${base.local_date} call with ${who}: ${why}`);
     };
+    // The transcript first: the log is written from what was said, not from Zoom's AI summary. The summary
+    // only when no transcript has come TRANSCRIPT_WAIT_MS after the end (the call was not cloud-recorded).
     let content = null, readFailed = false;
-    try { content = await callContent(z, [m.uuid], { order: ["summary", "transcript"] }); } catch (e) { readFailed = true; say(`content of ${m.uuid} not read: ${e.message}`); }
+    const age = now - Date.parse(rec.end);
+    try {
+      content = await callContent(z, [m.uuid], { order: ["transcript"] });
+      if (!content && (age >= CL.TRANSCRIPT_WAIT_MS || late)) content = await callContent(z, [m.uuid], { order: ["summary"] });
+    } catch (e) { readFailed = true; say(`content of ${m.uuid} not read: ${e.message}`); }
     if (!content && readFailed && !late) { wait("Zoom could not be read; trying again next tick"); continue; }
-    if (!content && now - Date.parse(rec.end) < CL.SUMMARY_WAIT_MS) { wait("waiting for Zoom's summary"); continue; }
+    if (!content && age < CL.TRANSCRIPT_WAIT_MS) { wait("waiting for the call's transcript"); continue; }
     const candidates = personCandidates(rec.guests);
-    const ctx = { rec, candidates, hasContent: !!content };
+    const openItems = CA.openItemsFor(store, [...candidates.map((c) => ({ wiki_id: c.id, name: c.title })), ...rec.guests.map((g) => ({ name: g.name }))]);
+    const ctx = { rec, candidates, hasContent: !!content, openItems };
     let got = null;
     try {
-      got = await readLog(CL.logPrompt(rec, content, candidates, tz, content ? vocabulary(candidates) : []), ctx);
+      got = await readLog(CL.logPrompt(rec, content, candidates, tz, content ? vocabulary(candidates) : [], openItems), ctx);
     } catch (e) {
       const attempts = ((prev && prev.attempts) || 0) + (e.transient ? 0 : 1);
       say(`ERROR ${base.local_date} call with ${who}: ${e.message} (${e.transient ? "no model answered" : `attempt ${attempts}`})`);
       if (attempts < CL.MAX_ATTEMPTS && !late) { store.calls[m.uuid] = { ...base, status: "waiting", attempts, error: String(e.message).slice(0, 300) }; continue; }
       got = { tier: null, log: null }; // logged with who and when only, so the call is never missing
     }
+    // A call written again (relog) that could not be: it keeps the log it had.
+    if (!got.log && prev && prev.prev_log) { got = { tier: prev.read_by || null, log: prev.prev_log }; content = { kind: prev.prev_source }; }
     const entry = { ...base, status: "logged", source: content ? content.kind : null, read_by: got.tier, log: got.log,
-      ai_generated: !!content, day_block: dayPageExists(base.local_date), logged_at: new Date().toISOString() };
+      ai_generated: !!content, day_block: dayPageExists(base.local_date), logged_at: new Date().toISOString(),
+      transcript_file: content && content.kind === "transcript" && !DRY ? keepTranscript(base, who, content.text) : null };
     store.calls[m.uuid] = entry;
     logged.push(entry);
     say(`${DRY ? "would log" : "logged"} ${base.local_date} ${CL.clockIn(rec.start, tz)} call with ${who} (${content ? content.kind : "no summary"}, ${got.tier || "no model"})`);
@@ -270,8 +306,102 @@ async function cmdSync() {
   }
   store.synced_at = new Date(now).toISOString();
   if (DRY) { say("dry run: nothing written"); return; }
+  // The action items are the user's too (call-log done|drop from chat, the follow-up's marks): take
+  // them from the file as it is now, so a change made while this sync ran is kept, then add this run's.
+  const fresh = CL.readStore();
+  store.actions = fresh.actions || {};
+  store.followup = fresh.followup || store.followup;
+  const recaps = [];
+  backfill(store, now, logged);
+  for (const e of logged) {
+    const { added, closed } = CA.recordEntry(store, e, CL.selfStepsKey(), now);
+    if (added.length || closed.length) say(`${e.local_date} call: ${added.length} action item(s) added, ${closed.length} closed`);
+    if (e.log && e.log.summary && now - Date.parse(e.end) < RECAP_MAX_AGE_MS && !has("--no-recap")) recaps.push({ e, added, closed });
+  }
   CL.writeStore(store);
   if (logged.length) say(`wiki pages updated: ${writeWiki(store, logged).join(", ") || "none"}`);
+  for (const { e, added, closed } of recaps) {
+    const who = CL.whoText(CL.withoutRejoins(e.log.people, e.guests, e.minutes).map((p) => p.name));
+    if (send(CA.recapText(e, added, closed, { who }), "call-log:recap")) {
+      store.calls[e.uuid].recap_sent = new Date().toISOString();
+    }
+  }
+  if (recaps.length) { const f = CL.readStore(); for (const { e } of recaps) if (store.calls[e.uuid].recap_sent) f.calls[e.uuid] = { ...f.calls[e.uuid], recap_sent: store.calls[e.uuid].recap_sent }; CL.writeStore(f); }
+}
+
+/** The transcript as Jori keeps it (Zoom deletes recordings in time): data/call-transcripts/<date>_<id>.txt. */
+function keepTranscript(base, who, text) {
+  try {
+    fs.mkdirSync(TRANSCRIPTS, { recursive: true, mode: 0o700 });
+    const file = path.join(TRANSCRIPTS, `${base.local_date}_${CA.itemId(base.uuid, 0).slice(3, 9)}.txt`);
+    fs.writeFileSync(file, `Zoom call with ${who}, ${base.local_date} ${CL.clockIn(base.start, base.tz)}-${CL.clockIn(base.end, base.tz)} (${base.tz}), ${base.minutes} min\nmeeting ${base.uuid}\n\n${text}\n`, { mode: 0o600 });
+    return path.relative(path.dirname(path.dirname(CL.STORE)), file);
+  } catch (e) { say(`transcript not kept: ${e.message}`); return null; }
+}
+
+/** One message to the user through jori-send-curl (the outbound precheck and push). */
+function send(text, intent) {
+  const r = spawnSync(SEND, ["--intent", intent, text], { encoding: "utf8", timeout: 60_000 });
+  if (r.status !== 0) { say(`ERROR send failed (exit ${r.status}): ${String(r.stderr || "").trim().slice(-200)}`); return false; }
+  return true;
+}
+
+/** Calls logged before the ledger existed (or by an older version) get their items too: idempotent by id. */
+function backfill(store, now, skip = []) {
+  let n = 0;
+  for (const e of Object.values(store.calls)) {
+    if (e.status === "logged" && !skip.includes(e) && now - Date.parse(e.end) < BACKFILL_MS) n += CA.recordEntry(store, e, CL.selfStepsKey(), now).added.length;
+  }
+  return n;
+}
+
+/**
+ * Have the last N days' calls written again (from the transcript where there is one): each logged
+ * call goes back to waiting, its earlier log kept as prev_log, and its items nobody has touched yet
+ * (open, never followed up) are removed so the new log's items replace them.
+ */
+function cmdRelog() {
+  const days = Number(flag("--days", 7)) || 7;
+  const store = CL.readStore();
+  const since = Date.now() - days * 86400_000;
+  let n = 0;
+  for (const e of Object.values(store.calls)) {
+    if (e.status !== "logged" || Date.parse(e.start) < since) continue;
+    store.calls[e.uuid] = { ...e, status: "waiting", attempts: 0, prev_log: e.log, prev_source: e.source, log: null, relog: true };
+    for (const [id, a] of Object.entries(store.actions || {})) if (a.uuid === e.uuid && a.status === "open" && !(a.nudges || []).length) delete store.actions[id];
+    n++;
+  }
+  if (!DRY) CL.writeStore(store);
+  say(`${DRY ? "would send" : "sent"} ${n} call(s) back to be logged again; the next sync rewrites them`);
+}
+
+function cmdFollowup() {
+  const store = CL.readStore();
+  if (!DRY && backfill(store, Date.now())) { const fresh = CL.readStore(); fresh.actions = { ...store.actions, ...(fresh.actions || {}) }; CL.writeStore(fresh); Object.assign(store, fresh); }
+  const plan = CA.followupPlan(store, { tz: instance().tz });
+  if (!plan.send) { say(`no follow-up: ${plan.why}`); return; }
+  if (DRY) { process.stdout.write(`${plan.text}\n`); say(`dry run: ${plan.items.length} item(s), nothing sent`); return; }
+  if (!send(plan.text, "call-log:followup")) process.exit(1);
+  const fresh = CL.readStore();
+  CA.markFollowedUp(fresh, plan);
+  CL.writeStore(fresh);
+  process.stdout.write(`${new Date().toISOString()} follow-up sent: ${plan.items.map((x) => x.item.id).join(", ")}\n`); // logged even with --quiet
+}
+
+function printItem(a) {
+  const whose = a.owner === "self" ? instance().owner_name : a.who;
+  const extra = [a.due ? `due ${a.due}` : null, a.status !== "open" ? `${a.status}${a.note ? `: ${a.note}` : ""}` : null].filter(Boolean).join(", ");
+  process.stdout.write(`${a.id}  ${whose}: ${a.step}  (call ${a.call_date}${extra ? `; ${extra}` : ""})\n`);
+}
+
+function cmdItem(change) {
+  const id = argv[1];
+  if (!id) usage();
+  const store = CL.readStore();
+  const due = change === "due" ? argv[2] : flag("--due");
+  const a = CA.setStatus(store, id, change, { note: flag("--note"), by: flag("--by", "chat"), due });
+  CL.writeStore(store);
+  if (has("--json")) process.stdout.write(`${JSON.stringify(a, null, 1)}\n`); else printItem(a);
 }
 
 function entriesFor(store, days) {
@@ -285,8 +415,14 @@ function printEntry(e) {
   process.stdout.write(`${e.local_date} ${CL.clockIn(e.start, e.tz)}-${CL.clockIn(e.end, e.tz)} (${e.tz}) · ${who} · ${e.minutes} min\n`);
   if (!e.log || !e.log.summary) { process.stdout.write("  no Zoom summary\n\n"); return; }
   process.stdout.write(`  ${e.log.title}\n  ${e.log.summary}\n`);
-  for (const s of e.log[CL.selfStepsKey()] || []) process.stdout.write(`  ${instance().owner_name}: ${s}\n`);
-  for (const o of e.log.next_steps_others) process.stdout.write(`  ${o.who}: ${o.step}\n`);
+  for (const r of e.log.remember || []) process.stdout.write(`  remember: ${r}\n`);
+  const items = Object.values(CL.readStore().actions || {}).filter((a) => a.uuid === e.uuid);
+  if (items.length) for (const a of items) process.stdout.write(`  [${a.id} ${a.status}] ${a.owner === "self" ? instance().owner_name : a.who}: ${a.step}${a.due ? ` (by ${a.due})` : ""}\n`);
+  else {
+    for (const s of e.log[CL.selfStepsKey()] || []) process.stdout.write(`  ${instance().owner_name}: ${s}\n`);
+    for (const o of e.log.next_steps_others) process.stdout.write(`  ${o.who}: ${o.step}\n`);
+  }
+  if (e.transcript_file) process.stdout.write(`  transcript: ${e.transcript_file}\n`);
   process.stdout.write(`  (${CL.noteOf(e)})\n\n`);
 }
 
@@ -294,7 +430,17 @@ async function main() {
   require("../lib/load-env.js").loadEnv();
   if (cmd === "pending") return cmdPending();
   if (cmd === "sync") return withLock(cmdSync);
+  if (cmd === "followup") return cmdFollowup();
+  if (cmd === "relog") return cmdRelog();
+  if (["done", "drop", "reopen", "due"].includes(cmd)) return cmdItem(cmd);
   const store = CL.readStore();
+  if (cmd === "actions") {
+    const rows = CA.listItems(store, { all: has("--all") });
+    if (has("--json")) { process.stdout.write(JSON.stringify(rows, null, 1) + "\n"); return; }
+    if (!rows.length) process.stdout.write("no open action items from calls\n");
+    rows.forEach(printItem);
+    return;
+  }
   if (cmd === "list") {
     const rows = entriesFor(store, Number(flag("--days", 30)) || 30);
     if (has("--json")) { process.stdout.write(JSON.stringify(rows, null, 1) + "\n"); return; }
