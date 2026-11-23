@@ -11,6 +11,11 @@
 //   jori setup --no-open       print the address instead of opening a browser
 //   jori setup status [--json] what is done and what is not, in the terminal
 //   jori setup start           the "Keep it running" step without the page
+//   jori setup --public-host <name> --token <t>
+//                              a rented server set up from the browser
+//                              (site/cloud-init.sh): serve on 127.0.0.1 behind
+//                              the HTTPS proxy that answers for <name>, with a
+//                              token the owner already holds; no time limit
 //
 // The question-by-question terminal wizard is still `jori init`.
 
@@ -24,8 +29,18 @@ import * as host from "../../lib/onboarding/host.mjs";
 const { port } = createRequire(import.meta.url)("../../lib/ports.cjs");
 
 function openBrowser(url) {
-  const cmd = process.platform === "darwin" ? "open" : process.platform === "win32" ? "start" : "xdg-open";
-  try { spawn(cmd, [url], { stdio: "ignore", detached: true }).unref(); return true; } catch { return false; }
+  // Inside WSL the browser is Windows's: hand the address to it (WSL forwards
+  // localhost, so the Windows browser reaches this server).
+  const [cmd, args] = process.platform === "darwin" ? ["open", [url]]
+    : host.isWsl() ? ["cmd.exe", ["/c", "start", "", url]]
+    : process.platform === "win32" ? ["cmd", ["/c", "start", "", url]]
+    : ["xdg-open", [url]];
+  try {
+    const child = spawn(cmd, args, { stdio: "ignore", detached: true });
+    child.on("error", () => {});
+    child.unref();
+    return true;
+  } catch { return false; }
 }
 
 async function status(ctx, args) {
@@ -65,6 +80,24 @@ async function start(ctx) {
   if (!sc.ok) process.exitCode = 1;
 }
 
+// A rented server (site/cloud-init.sh): the owner opens https://<publicHost>/?t=<token>
+// from the getjori.ai page that made the token. Caddy terminates HTTPS and
+// proxies to 127.0.0.1:<setup port>; the service unit that runs this removes
+// the proxy when setup finishes.
+async function servePublic(ctx, { publicHost, token, prepared }) {
+  const { c, die } = ctx;
+  if (!token || token.length < 24) die("--public-host needs --token (24+ characters), or JORI_SETUP_TOKEN");
+  const { server } = createSetupServer({
+    base: CHECKOUT, token, publicHost,
+    onEvent: (m) => console.log(`  · ${m}`),
+    onFinish: () => { console.log("  ✓ Setup finished."); server.close(); process.exit(0); },
+  });
+  await new Promise((resolve, reject) => { server.once("error", reject); server.listen(port("setup"), "127.0.0.1", resolve); });
+  console.log(c.bold("\n  Jori setup") + ` — https://${publicHost}/  (${CHECKOUT})`);  // control-scan-ok: the software's name
+  if (prepared.length) console.log(c.dim(`  prepared: ${prepared.join(", ")}`));
+  await new Promise(() => {});
+}
+
 export default {
   summary: "first-run setup in the browser (safe to re-run)",
   usage: "setup [status|start] [--no-open] [--local-only]",
@@ -76,7 +109,9 @@ export default {
       console.log("  jori setup --no-open       print its address instead of opening a browser");
       console.log("  jori setup --local-only    over SSH, don't also answer on the Tailscale address");
       console.log("  jori setup status [--json] what is done and what is not");
-      console.log("  jori setup start           start the service and schedule the starter jobs\n");
+      console.log("  jori setup start           start the service and schedule the starter jobs");
+      console.log("  jori setup --public-host <name> --token <t>");
+      console.log("                             a rented server: answer behind its HTTPS proxy for <name>\n");
       console.log("On an always-on Mac or a VM reached over SSH, setup prints how to open the");
       console.log("page from your own computer: its Tailscale address, or an SSH tunnel.\n");
       console.log("Re-running only fills what is missing: answers already saved, a running");
@@ -88,6 +123,10 @@ export default {
     if (args[0] === "start") return start(ctx);
 
     const prepared = core.prepareCheckout(CHECKOUT);
+    const getFlag = (f) => { const i = args.indexOf(f); return i >= 0 ? args[i + 1] : null; };
+    const publicHost = getFlag("--public-host");
+    const fixedToken = getFlag("--token") || process.env.JORI_SETUP_TOKEN || null;
+    if (publicHost) return servePublic(ctx, { publicHost, token: fixedToken, prepared });
     // Over SSH (an always-on Mac, a VM) there is no browser here: the page is
     // opened from the owner's own computer, through Tailscale when this
     // machine is on a tailnet, or through an SSH tunnel either way.

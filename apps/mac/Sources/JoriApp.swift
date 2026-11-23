@@ -114,8 +114,6 @@ struct WelcomeView: View {
             HStack {
                 Spacer()
                 switch model.state {
-                case .notInstalled where !model.hasHomebrew:
-                    Button("Install in Terminal") { model.installInTerminal() }.keyboardShortcut(.defaultAction)
                 case .notInstalled:
                     Button("Install Jori") { model.install() }.keyboardShortcut(.defaultAction)
                 case .installing:
@@ -139,10 +137,8 @@ struct WelcomeView: View {
 
     private var subtitle: String {
         switch model.state {
-        case .notInstalled where !model.hasHomebrew:
-            return "First Homebrew, which asks for your Mac password, so this part runs in Terminal. It takes about five minutes."
         case .notInstalled:
-            return "I’ll install what’s missing (Node.js, Claude Code, local memory search) and put Jori in \(model.home.path.replacingOccurrences(of: NSHomeDirectory(), with: "~")). About three minutes."
+            return "I’ll install what’s missing (Node.js, Claude Code, local memory search) and put Jori in \(model.home.path.replacingOccurrences(of: NSHomeDirectory(), with: "~")). No password needed. If Apple asks to install its developer tools, click Install. About five minutes."
         case .installing:
             return "This takes a few minutes. You can close this window; Jori opens the setup page when it’s done."
         default:

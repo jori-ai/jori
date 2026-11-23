@@ -2,8 +2,9 @@ name: mac app
 
 # Builds the Jori menu bar app (apps/mac) into Jori.dmg.
 # - Every run uploads the .dmg as a workflow artifact.
-# - A tag mac-vX.Y.Z also publishes it as a GitHub release (getjori.ai links
-#   to the latest one).
+# - Releases come from .github/workflows/installers.yml (tag installer-vX.Y.Z),
+#   which puts Jori.dmg and JoriSetup.exe in one release: getjori.ai links to
+#   releases/latest/download/<file>, so both must be in the latest release.
 # Signing: with MAC_DEVID_P12 (+ MAC_DEVID_PASSWORD) — a base64 .p12 of a
 # "Developer ID Application" certificate — the app is signed with the
 # hardened runtime and notarized with the App Store Connect key already used
@@ -12,8 +13,6 @@ name: mac app
 
 on:
   workflow_dispatch:
-  push:
-    tags: ["mac-v*"]
   pull_request:
     paths: [apps/mac/**, site/install.sh, .github/workflows/mac-app.yml]
 
@@ -30,7 +29,7 @@ jobs:
       - name: Version
         id: v
         run: |
-          v="${GITHUB_REF_NAME#mac-v}"; [[ $GITHUB_REF == refs/tags/mac-v* ]] || v=0.0.0-dev
+          v=0.0.0-dev
           echo "version=$v" >> "$GITHUB_OUTPUT"
       - name: Signing keychain
         if: env.HAS_DEVID == 'true'
@@ -60,12 +59,3 @@ jobs:
         with:
           name: Jori-${{ steps.v.outputs.version }}
           path: ${{ runner.temp }}/out/Jori.dmg
-      - name: Release
-        if: startsWith(github.ref, 'refs/tags/mac-v')
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          gh release create "$GITHUB_REF_NAME" "$RUNNER_TEMP/out/Jori.dmg" \
-            --title "Jori for Mac ${{ steps.v.outputs.version }}" \
-            --notes "Download Jori.dmg, open it and drag Jori to Applications. On first launch it installs Jori and opens the setup page." \
-            --latest

@@ -20,7 +20,8 @@ set -euo pipefail
 
 TMUX=/opt/homebrew/bin/tmux
 CLAUDE="$HOME/.local/bin/claude"
-NODE=/opt/homebrew/bin/node
+NODE=/opt/homebrew/bin/node  # the Homebrew path, else node from PATH or ~/.local (installs without Homebrew)
+[ -x "$NODE" ] || NODE="$(command -v node 2>/dev/null || echo "$HOME/.local/bin/node")"
 SESSION=claude
 WORKDIR="$HOME/Dev/jori/agent"
 CHAT_DIR="$WORKDIR/chat-agent"
