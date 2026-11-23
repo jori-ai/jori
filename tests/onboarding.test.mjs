@@ -186,6 +186,26 @@ test("over Tailscale the page answers to the tailnet name; otherwise loopback on
   }
 });
 
+test("a rented server's page answers to its public name through the local proxy only, with a long token", async () => {
+  assert.throws(() => createSetupServer({ base: tmp, token: "short", publicHost: "1-2-3-4.sslip.io" }), /24 characters/);
+  const tok = "a".repeat(48);
+  const pub = createSetupServer({ base: tmp, token: tok, publicHost: "1-2-3-4.sslip.io" });
+  await new Promise((r) => pub.server.listen(0, "127.0.0.1", r));
+  const port = pub.server.address().port;
+  try {
+    assert.equal((await req(port, { p: `/?t=${tok}`, headers: { host: "1-2-3-4.sslip.io" } })).status, 200, "Caddy connects from loopback with the public Host");
+    assert.equal((await req(port, { p: "/?t=wrong", headers: { host: "1-2-3-4.sslip.io" } })).status, 403, "the token still guards it");
+    assert.equal((await req(port, { p: `/?t=${tok}`, headers: { host: "5-6-7-8.sslip.io" } })).status, 403, "another name is refused");
+  } finally {
+    pub.server.close();
+  }
+});
+
+test("WSL is detected from its environment", () => {
+  if (process.platform !== "linux") return;
+  assert.equal(host.isWsl({ WSL_DISTRO_NAME: "Jori" }), true);
+});
+
 test("use: personal turns on the coordinator alone; work and both the whole team; an unknown answer is refused", async () => {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "onb-use-"));
   for (const [d, cos] of [["role-cfo", false], ["role-chief-of-staff", true], ["role-travel-manager", false]]) {

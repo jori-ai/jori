@@ -1,5 +1,5 @@
 #!/bin/sh
-':' //; for n in /opt/homebrew/bin/node /usr/local/bin/node "$(command -v node 2>/dev/null)"; do [ -x "$n" ] && exec "$n" "$0" "$@"; done; echo "$0: no node interpreter found" >&2; exit 127
+':' //; for n in /opt/homebrew/bin/node /usr/local/bin/node "$(command -v node 2>/dev/null)" "$HOME/.local/bin/node"; do [ -x "$n" ] && exec "$n" "$0" "$@"; done; echo "$0: no node interpreter found" >&2; exit 127
 // cron-unpause — switch a `#MARKER#`-paused family of cron jobs back on.
 // (Lines 1-2: a sh launcher that is also valid JS — node reads line 2 as a
 // string and a comment. cron runs this with a bare PATH that has no node, so

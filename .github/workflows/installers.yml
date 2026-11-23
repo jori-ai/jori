@@ -1,0 +1,115 @@
+name: installers
+
+# Builds both downloadable installers and, on a tag installer-vX.Y.Z, publishes
+# them together as the latest GitHub release (getjori.ai and the README link to
+# releases/latest/download/Jori.dmg and .../JoriSetup.exe):
+#   - Jori.dmg       the Mac menu bar app (apps/mac/build.sh). Signed and
+#                    notarized when MAC_DEVID_P12 is set, else ad-hoc.
+#   - JoriSetup.exe  the Windows installer (apps/windows/build.sh, NSIS),
+#                    wrapping site/install.ps1. Not code-signed yet.
+# A pull request touching either builds both as workflow artifacts. Running it
+# by hand with `release: X.Y.Z` publishes installer-vX.Y.Z from that ref (the
+# tag is created by the release).
+
+on:
+  workflow_dispatch:
+    inputs:
+      release:
+        description: "Publish as release installer-v<this> (e.g. 0.2.0); empty = build only"
+        required: false
+        default: ""
+  push:
+    tags: ["installer-v*"]
+  pull_request:
+    paths: [apps/mac/**, apps/windows/**, site/install.sh, site/install.ps1, .github/workflows/installers.yml]
+
+permissions:
+  contents: write
+
+jobs:
+  mac:
+    runs-on: macos-15
+    env:
+      HAS_DEVID: ${{ secrets.MAC_DEVID_P12 != '' }}
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Version
+        id: v
+        run: |
+          v="${GITHUB_REF_NAME#installer-v}"; [[ $GITHUB_REF == refs/tags/installer-v* ]] || v=0.0.0-dev
+          [[ -n "${{ inputs.release }}" ]] && v="${{ inputs.release }}"
+          [[ $v =~ ^[0-9]+\.[0-9]+\.[0-9]+(-dev)?$ ]] || { echo "bad version: $v"; exit 1; }
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+      - name: Signing keychain
+        if: env.HAS_DEVID == 'true'
+        env:
+          MAC_DEVID_P12: ${{ secrets.MAC_DEVID_P12 }}
+          MAC_DEVID_PASSWORD: ${{ secrets.MAC_DEVID_PASSWORD }}
+          ASC_PRIVATE_KEY: ${{ secrets.ASC_PRIVATE_KEY }}
+        run: |
+          KC="$RUNNER_TEMP/sign.keychain-db"; PW=$(uuidgen)
+          security create-keychain -p "$PW" "$KC"
+          security set-keychain-settings -lut 3600 "$KC"
+          security unlock-keychain -p "$PW" "$KC"
+          echo "$MAC_DEVID_P12" | base64 --decode > "$RUNNER_TEMP/devid.p12"
+          security import "$RUNNER_TEMP/devid.p12" -k "$KC" -P "$MAC_DEVID_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$PW" "$KC" >/dev/null
+          security list-keychains -d user -s "$KC" $(security list-keychains -d user | tr -d '"')
+          id=$(security find-identity -v -p codesigning "$KC" | grep -o '"Developer ID Application[^"]*"' | head -1 | tr -d '"')
+          echo "MAC_DEVID_IDENTITY=$id" >> "$GITHUB_ENV"
+          printf '%s' "$ASC_PRIVATE_KEY" > "$RUNNER_TEMP/notary.p8"
+          echo "NOTARY_KEY_PATH=$RUNNER_TEMP/notary.p8" >> "$GITHUB_ENV"
+      - name: Build
+        env:
+          NOTARY_KEY_ID: ${{ env.HAS_DEVID == 'true' && secrets.ASC_KEY_ID || '' }}
+          NOTARY_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+        run: bash apps/mac/build.sh --version "${{ steps.v.outputs.version }}" --build "${{ github.run_number }}" --out "$RUNNER_TEMP/out"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: Jori.dmg
+          path: ${{ runner.temp }}/out/Jori.dmg
+
+  windows:
+    needs: [mac]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Tools
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq nsis python3-pil >/dev/null
+      - name: Build
+        env:
+          V: ${{ needs.mac.outputs.version }}
+        run: |
+          v="${V%-dev}"
+          bash apps/windows/build.sh --version "$v" --out "$RUNNER_TEMP/out"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: JoriSetup.exe
+          path: ${{ runner.temp }}/out/JoriSetup.exe
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/installer-v') || inputs.release != ''
+    needs: [mac, windows]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          V: ${{ needs.mac.outputs.version }}
+        run: |
+          tag="installer-v$V"
+          gh release create "$tag" dist/Jori.dmg dist/JoriSetup.exe \
+            --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+            --title "Jori installers $V" \
+            --notes "Jori needs a computer that stays on. Pick one:
+
+          - **Mac:** download Jori.dmg, open it, drag Jori to Applications and open it. It installs Jori (no password) and opens the setup page. If macOS says it can't check the app, right-click it and choose Open.
+          - **Windows 10 (2004+) or 11:** run JoriSetup.exe. It sets up WSL, installs Jori inside it and opens the setup page. If Windows says it protected your PC, choose More info, then Run anyway.
+          - **No computer to keep on:** rent a small server; https://getjori.ai/cloud walks you through it." \
+            --latest

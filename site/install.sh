@@ -3,9 +3,15 @@
 #
 #   curl -fsSL https://getjori.ai/install.sh | bash
 #
-# Installs what Jori needs on a Mac (Homebrew, Node.js, git, Ollama, Claude
-# Code), puts Jori in ~/Dev/jori, then opens the setup page in your browser
-# (`jori setup`), which signs you in to Claude and starts Jori.
+# Installs what Jori needs (Node.js, git, Ollama, Claude Code), puts Jori in
+# ~/Dev/jori, then opens the setup page in your browser (`jori setup`), which
+# signs you in to Claude and starts Jori. Runs on a Mac, on Linux, and on
+# Windows inside WSL (site/install.ps1 sets that up and then runs this).
+#
+# On a Mac it uses Homebrew when it is there. Without Homebrew it needs no
+# password and no Terminal: Node.js comes from nodejs.org (checksum-verified)
+# into ~/.local/node, git from Apple's Command Line Tools, Ollama from
+# ollama.com into ~/Applications. That is how the Mac app (apps/mac) installs.
 #
 # Re-running it updates an existing checkout (fast-forward only, never over
 # local changes) and reopens setup. Nothing is installed that is already there.
@@ -16,6 +22,7 @@
 #   JORI_NO_OLLAMA=1      skip Ollama (memory search stays off until you add it)
 #   JORI_NO_SETUP=1       install only; run `jori setup` yourself later
 #   JORI_NO_LINK=1        don't put a `jori` symlink in Homebrew's bin
+#   JORI_NO_BREW=1        Mac: don't use or install Homebrew even when it's there
 
 set -euo pipefail
 
@@ -39,8 +46,11 @@ printf '\n%sInstalling Jori%s %s→ %s%s\n' "$B" "$N" "$D" "$JORI_HOME" "$N"
 
 case "$(uname -s)" in
   Darwin) ;;
-  Linux) note "Linux: the service runs under systemd; the Mac-only parts (Messages, Photos, Find My, AppleScript) stay off." ;;
-  *) die "Jori runs on macOS (and, partly, Linux)." ;;
+  Linux)
+    if grep -qi microsoft /proc/version 2>/dev/null; then note "Windows (WSL): the service runs under systemd in WSL; the Mac-only parts (Messages, Photos, Find My, AppleScript) stay off."
+    else note "Linux: the service runs under systemd; the Mac-only parts (Messages, Photos, Find My, AppleScript) stay off."; fi ;;
+  MINGW*|MSYS*|CYGWIN*) die "On Windows, run the Windows installer instead: https://getjori.ai/#install (it sets up WSL and runs this inside it)." ;;
+  *) die "Jori runs on macOS, Linux, and Windows (through WSL)." ;;
 esac
 
 OS="$(uname -s)"
@@ -55,40 +65,37 @@ pkg_install() {  # Linux: apt / dnf / yum / apk / pacman
   elif command -v pacman >/dev/null; then as_root pacman -S --noconfirm --needed "$@"
   else return 1; fi
 }
-# Linux: the official Node.js build into ~/.local/node, checked against
-# nodejs.org's published SHA-256 sums. No root needed.
-install_node_linux() {
-  local arch; case "$(uname -m)" in x86_64|amd64) arch=x64 ;; aarch64|arm64) arch=arm64 ;; *) die "No Node.js build for $(uname -m); install Node 22.5+ yourself." ;; esac
+# The official Node.js build into ~/.local/node, checked against nodejs.org's
+# published SHA-256 sums. No root needed. Linux, and a Mac without Homebrew.
+install_node_local() {
+  local arch plat; case "$(uname -m)" in x86_64|amd64) arch=x64 ;; aarch64|arm64) arch=arm64 ;; *) die "No Node.js build for $(uname -m); install Node 22.5+ yourself." ;; esac
+  [[ $OS == Darwin ]] && plat=darwin || plat=linux
   local base=https://nodejs.org/dist/latest-v22.x sums file tmp
   sums=$(curl -fsSL "$base/SHASUMS256.txt") || die "Couldn't reach nodejs.org."
-  file=$(printf '%s\n' "$sums" | awk -v a="linux-$arch.tar.xz" '$2 ~ a"$" {print $2; exit}')
-  [[ -n $file ]] || die "nodejs.org lists no linux-$arch build."
+  file=$(printf '%s\n' "$sums" | awk -v a="$plat-$arch.tar.xz" '$2 ~ a"$" {print $2; exit}')
+  [[ -n $file ]] || die "nodejs.org lists no $plat-$arch build."
   tmp=$(mktemp -d)
   curl -fsSL "$base/$file" -o "$tmp/$file" || die "Couldn't download $file."
-  (cd "$tmp" && printf '%s\n' "$sums" | grep " $file\$" | sha256sum -c --status) || die "$file didn't match its published checksum; nothing was installed."
+  local want got; want=$(printf '%s\n' "$sums" | awk -v f="$file" '$2 == f {print $1; exit}')
+  if command -v sha256sum >/dev/null 2>&1; then got=$(sha256sum "$tmp/$file" | awk '{print $1}'); else got=$(shasum -a 256 "$tmp/$file" | awk '{print $1}'); fi
+  [[ -n $want && $want == "$got" ]] || die "$file didn't match its published checksum; nothing was installed."
   rm -rf "$HOME/.local/node" && mkdir -p "$HOME/.local/node" "$HOME/.local/bin"
   tar -xJf "$tmp/$file" -C "$HOME/.local/node" --strip-components=1 && rm -rf "$tmp"
   for b in node npm npx; do ln -sf "$HOME/.local/node/bin/$b" "$HOME/.local/bin/$b"; done
   export PATH="$HOME/.local/bin:$HOME/.local/node/bin:$PATH"
 }
-[[ $OS == Linux ]] && export PATH="$HOME/.local/bin:$HOME/.local/node/bin:$PATH"
+export PATH="$HOME/.local/bin:$HOME/.local/node/bin:$PATH"
 
 # ── Homebrew ───────────────────────────────────────────────────────────────
 brew_env() {
   for b in /opt/homebrew/bin/brew /usr/local/bin/brew; do [[ -x $b ]] && eval "$("$b" shellenv)" && return 0; done
   return 1
 }
-if [[ $(uname -s) == Darwin ]]; then
-  step "Homebrew"
-  if command -v brew >/dev/null 2>&1 || brew_env; then
-    ok "installed"
-  else
-    [[ $TTY == /dev/tty ]] || die "Homebrew needs your Mac password, so install it from Terminal: curl -fsSL https://getjori.ai/install.sh | bash"
-    note "Homebrew installs the tools below. It asks for your Mac password once."
-    /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)" < "$TTY"
-    brew_env || die "Homebrew didn't finish installing. Run this installer again."
-    ok "installed"
-  fi
+# Homebrew is used when it is already there; it is never installed, so the
+# install needs no password (the Mac app runs this with no terminal at all).
+USE_BREW=0
+if [[ $OS == Darwin && ${JORI_NO_BREW:-} != 1 ]] && { command -v brew >/dev/null 2>&1 || brew_env; }; then
+  USE_BREW=1
 fi
 
 # ── Node.js + git ──────────────────────────────────────────────────────────
@@ -100,18 +107,25 @@ node_ok() {
   (( maj > 22 || (maj == 22 && min >= 5) ))
 }
 if node_ok; then ok "Node $(node -v)"
-elif [[ $OS == Linux ]]; then
-  install_node_linux && node_ok && ok "Node $(node -v) in ~/.local/node" || die "Node didn't install."
-else
-  command -v brew >/dev/null 2>&1 || die "Install Node.js 22.5 or newer from https://nodejs.org, then run this again."
+elif [[ $USE_BREW == 1 ]]; then
   brew install node >/dev/null && ok "Node $(node -v)"
   node_ok || die "Node $(node -v) is older than 22.5. Update it (brew upgrade node) and run this again."
+else
+  install_node_local && node_ok && ok "Node $(node -v) in ~/.local/node" || die "Node didn't install."
 fi
-if command -v git >/dev/null 2>&1; then ok "git"
+if command -v git >/dev/null 2>&1 && { [[ $OS != Darwin ]] || xcode-select -p >/dev/null 2>&1 || [[ $(command -v git) != /usr/bin/git ]]; }; then ok "git"
 elif [[ $OS == Linux ]]; then
   can_sudo && pkg_install git >/dev/null && ok "git" || die "Install git (sudo apt-get install git), then run this again."
+elif [[ $USE_BREW == 1 ]]; then
+  brew install git >/dev/null && ok "git" || die "Install git, then run this again."
 else
-  command -v brew >/dev/null 2>&1 && brew install git >/dev/null && ok "git" || die "Install git, then run this again."
+  # macOS's git comes with Apple's Command Line Tools. This opens Apple's own
+  # installer window; it needs no password and takes a few minutes.
+  note "Apple's developer tools bring git. A window opens: click Install, then wait."
+  xcode-select --install >/dev/null 2>&1 || true
+  for _ in $(seq 1 360); do xcode-select -p >/dev/null 2>&1 && break; sleep 5; done
+  xcode-select -p >/dev/null 2>&1 || die "Apple's developer tools didn't finish installing. Install them (xcode-select --install), then run this again."
+  ok "git"
 fi
 if [[ $OS == Linux ]] && ! command -v crontab >/dev/null 2>&1; then
   if can_sudo && { pkg_install cron >/dev/null 2>&1 || pkg_install cronie >/dev/null 2>&1; }; then
@@ -149,16 +163,30 @@ if [[ ${JORI_NO_OLLAMA:-} != 1 && $OS == Linux ]]; then
 fi
 if [[ ${JORI_NO_OLLAMA:-} != 1 && $OS == Darwin ]]; then
   step "Memory search (Ollama)"
-  if ! command -v ollama >/dev/null 2>&1; then brew install ollama >/dev/null && ok "installed"; else ok "installed"; fi
+  OLLAMA_APP=""
+  for a in /Applications/Ollama.app "$HOME/Applications/Ollama.app"; do [[ -d $a ]] && OLLAMA_APP=$a; done
+  if command -v ollama >/dev/null 2>&1 || [[ -n $OLLAMA_APP ]]; then ok "installed"
+  elif [[ $USE_BREW == 1 ]]; then brew install ollama >/dev/null && ok "installed"
+  else
+    # Ollama's own Mac app (Apple-notarized), into ~/Applications: no password.
+    tmp=$(mktemp -d)
+    if curl -fsSL https://ollama.com/download/Ollama-darwin.zip -o "$tmp/o.zip" && mkdir -p "$HOME/Applications" && ditto -x -k "$tmp/o.zip" "$HOME/Applications/"; then
+      OLLAMA_APP="$HOME/Applications/Ollama.app"; ok "installed in ~/Applications"
+    else warn "Ollama didn't install; memory search stays off. Later: https://ollama.com/download"; fi
+    rm -rf "$tmp"
+  fi
   if ! curl -sf http://127.0.0.1:11434/api/tags >/dev/null 2>&1; then
-    brew services start ollama >/dev/null 2>&1 || (nohup ollama serve >/dev/null 2>&1 &)
-    for _ in $(seq 1 20); do curl -sf http://127.0.0.1:11434/api/tags >/dev/null 2>&1 && break; sleep 1; done
+    if [[ -n $OLLAMA_APP ]]; then open -g "$OLLAMA_APP" >/dev/null 2>&1 || true
+    else brew services start ollama >/dev/null 2>&1 || (nohup ollama serve >/dev/null 2>&1 &); fi
+    for _ in $(seq 1 30); do curl -sf http://127.0.0.1:11434/api/tags >/dev/null 2>&1 && break; sleep 1; done
   fi
   if curl -sf http://127.0.0.1:11434/api/tags 2>/dev/null | grep -q nomic-embed-text; then ok "model ready"
-  else
+  elif curl -sf http://127.0.0.1:11434/api/tags >/dev/null 2>&1; then
     # ~270 MB; finishes in the background while setup carries on.
-    nohup ollama pull nomic-embed-text >/dev/null 2>&1 &
+    curl -sf http://127.0.0.1:11434/api/pull -d '{"name":"nomic-embed-text"}' >/dev/null 2>&1 &
     note "downloading its model in the background"
+  else
+    note "Ollama isn't answering yet; setup offers to finish this later"
   fi
 fi
 
@@ -201,13 +229,22 @@ if [[ $OS == Linux ]]; then
   case ":$PATH:" in *":$HOME/.local/bin:"*) ;; *) note "Add ~/.local/bin to your PATH (most distributions do this at your next login)." ;; esac
 fi
 
-# `jori` on PATH, when a Homebrew bin dir is writable and nothing is there yet.
-[[ ${JORI_NO_LINK:-} == 1 || $OS == Linux ]] || for d in /opt/homebrew/bin /usr/local/bin; do
-  if [[ -d $d && -w $d ]]; then
-    if [[ ! -e $d/jori ]]; then ln -s "$JORI_HOME/bin/jori" "$d/jori" && ok "the jori command is ready"; fi
-    break
+# `jori` on PATH: in a writable Homebrew bin dir when there is one, else in
+# ~/.local/bin, which a login shell is then told about (~/.zprofile).
+if [[ ${JORI_NO_LINK:-} != 1 && $OS == Darwin ]]; then
+  linked=0
+  for d in /opt/homebrew/bin /usr/local/bin; do
+    if [[ -d $d && -w $d ]]; then
+      [[ -e $d/jori ]] || ln -s "$JORI_HOME/bin/jori" "$d/jori"
+      linked=1; ok "the jori command is ready"; break
+    fi
+  done
+  if [[ $linked == 0 ]]; then
+    mkdir -p "$HOME/.local/bin" && ln -sf "$JORI_HOME/bin/jori" "$HOME/.local/bin/jori"
+    grep -qs '.local/bin' "$HOME/.zprofile" || printf '\n# Added by the Jori installer: node, claude and jori live here.\nexport PATH="$HOME/.local/bin:$PATH"\n' >> "$HOME/.zprofile"
+    ok "the jori command is in ~/.local/bin (new Terminal windows find it)"
   fi
-done
+fi
 
 if [[ ${JORI_NO_SETUP:-} == 1 ]]; then
   printf '\n%sInstalled.%s Run %sjori setup%s to finish.\n\n' "$B" "$N" "$B" "$N"

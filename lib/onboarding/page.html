@@ -226,10 +226,10 @@ form.code { margin-top: 24px; max-width: 520px; }
     </div>
     <div>
       <p class="face-name" id="faceName">Jori</p>
-      <p class="face-line" id="faceLine">Getting ready on this Mac.</p>
+      <p class="face-line" id="faceLine">Getting ready on this computer.</p>
     </div>
     <ol class="steps" id="steps" aria-label="Setup steps">
-      <li data-step="mac"><button type="button">Your Mac</button></li>
+      <li data-step="mac"><button type="button" id="macNav">This computer</button></li>
       <li data-step="claude"><button type="button">Claude sign-in</button></li>
       <li data-step="you"><button type="button">About you</button></li>
       <li data-step="connect"><button type="button">Connect services</button></li>
@@ -242,7 +242,7 @@ form.code { margin-top: 24px; max-width: 520px; }
 
   <main id="main" aria-live="polite">
     <section class="step" data-step="mac">
-      <h1 id="macTitle">Let me look around your Mac.</h1>
+      <h1 id="macTitle">Let me look around this computer.</h1>
       <p class="lede">I check what I need and install anything that’s missing. You’ll only be asked when I can’t do it myself.</p>
       <ul class="rows" id="macRows"></ul>
       <h2 class="sub">What you can do from here</h2>
@@ -272,7 +272,7 @@ form.code { margin-top: 24px; max-width: 520px; }
 
     <section class="step" data-step="you" hidden>
       <h1>What should I call you?</h1>
-      <p class="lede">I filled in what I could find on this Mac. Fix anything that’s wrong; you can change it later in the control room.</p>
+      <p class="lede">I filled in what I could find on this computer. Fix anything that’s wrong; you can change it later in the control room.</p>
       <form class="about" id="aboutForm" novalidate>
         <label>Your first name<input type="text" name="owner_name" autocomplete="given-name" required><small>How I address you, and how I sign mail I send for you</small></label>
         <label>Your email<input type="email" name="owner_email" autocomplete="email" required><small>Who may sign in to the app and your memory site</small></label>
@@ -303,7 +303,7 @@ form.code { margin-top: 24px; max-width: 520px; }
 
     <section class="step" data-step="on" hidden>
       <h1>Keep me running.</h1>
-      <p class="lede" id="onLede">I’ll start now and again whenever this Mac starts, then do a small set of jobs on a schedule. More jobs switch on as you connect things.</p>
+      <p class="lede" id="onLede">I’ll start now and again whenever this computer starts, then do a small set of jobs on a schedule. More jobs switch on as you connect things.</p>
       <ul class="rows" id="onRows"></ul>
       <div id="stayOn" hidden>
         <h2 class="sub" id="stayOnTitle">Staying on by itself</h2>
@@ -452,7 +452,7 @@ $("steps").addEventListener("click", (e) => {
 function render() {
   if (!S) return;
   const H = S.host || {};
-  const thisOne = H.os === "darwin" ? `this ${H.kind || "Mac"}` : "this machine";
+  const thisOne = H.os === "darwin" ? `this ${H.kind || "Mac"}` : H.wsl ? "this PC" : "this machine";
   const d = doneMap(S);
   for (const li of $("steps").children) {
     li.classList.toggle("done", !!d[li.dataset.step] && li.dataset.step !== current);
@@ -469,7 +469,7 @@ function render() {
       S.claude.installed ? `Version ${S.claude.version || "installed"}` : ci?.state === "running" ? "Installing…" : ci?.state === "error" ? `That didn’t work: ${tail(ci.out)}` : "I need it to think. It installs in about a minute.",
       !S.claude.installed && ci?.state !== "running" && S.npm ? el("button", { class: "btn small", onclick: () => api("/api/claude/install", {}).then(poll) }, "Install") : null),
     row(S.ollama.running && S.ollama.model ? "ok" : mem?.state === "running" ? "work" : mem?.state === "error" ? "warn" : "todo", "Memory search",
-      S.ollama.running && S.ollama.model ? "Running on this Mac" : mem?.state === "running" ? "Setting up a small local model (about 270 MB)…" : mem?.state === "error" ? `That didn’t finish: ${tail(mem.out)}` : "Optional. Lets me find things you told me by meaning, not just exact words.",
+      S.ollama.running && S.ollama.model ? "Running on this computer" : mem?.state === "running" ? "Setting up a small local model (about 270 MB)…" : mem?.state === "error" ? `That didn’t finish: ${tail(mem.out)}` : "Optional. Lets me find things you told me by meaning, not just exact words.",
       !(S.ollama.running && S.ollama.model) && mem?.state !== "running" ? el("button", { class: "btn small quiet", onclick: () => api("/api/memory", {}).then(poll) }, "Set up") : null),
   ]);
   $("macNext").disabled = !d.mac;
@@ -515,7 +515,8 @@ function render() {
   }
 
   // Which machine this is: an always-on Mac or a VM is set up from another computer.
-  $("macTitle").textContent = H.os === "darwin" && !H.laptop && H.kind ? `Let me look around this ${H.kind}.` : H.os && H.os !== "darwin" ? "Let me look around this machine." : "Let me look around your Mac.";
+  $("macTitle").textContent = H.os === "darwin" && !H.laptop && H.kind ? `Let me look around this ${H.kind}.` : H.os === "darwin" ? "Let me look around your Mac." : H.wsl ? "Let me look around this PC." : H.remote || H.vm ? "Let me look around this server." : "Let me look around this computer.";
+  $("macNav").textContent = H.os === "darwin" ? "Your Mac" : H.wsl ? "Your PC" : H.remote || H.vm ? "The server" : "This computer";
   $("onLede").textContent = `I’ll start now and again whenever ${thisOne} starts, then do a small set of jobs on a schedule. More jobs switch on as you connect things.`;
   const stay = S.alwaysOn || [];
   $("stayOn").hidden = !stay.length;
@@ -529,10 +530,10 @@ function render() {
   // Keep it running
   const sv = S.service, sc = S.schedule, starting = starting_;
   setRows("onRows", [
-    row(sv.running ? "ok" : starting ? "work" : "todo", "Background service", sv.running ? "Running, and starts again with this Mac" : starting ? "Starting…" : "Starts with this Mac and restarts itself if anything crashes"),
+    row(sv.running ? "ok" : starting ? "work" : "todo", "Background service", sv.running ? "Running, and starts again with this computer" : starting ? "Starting…" : "Starts with this computer and restarts itself if anything crashes"),
     row(sv.chat ? "ok" : sv.running || starting ? "work" : "todo", "Chat", sv.chat ? "Answering" : sv.running ? "Waking up… the first start takes a minute" : "Where your messages go"),
     row(sv.ops ? "ok" : sv.running || starting ? "work" : "todo", "Background work", sv.ops ? "Answering" : sv.running ? "Waking up…" : "Where scheduled jobs run"),
-    row(!sc.ok ? "need" : sc.missing === 0 ? "ok" : starting ? "work" : "todo", "Scheduled jobs", !sc.ok ? `I couldn’t read this Mac’s schedule: ${sc.error}` : sc.missing === 0 ? `${sc.total} jobs scheduled` : `${sc.total} jobs, from a morning brief to keeping memory backed up`),
+    row(!sc.ok ? "need" : sc.missing === 0 ? "ok" : starting ? "work" : "todo", "Scheduled jobs", !sc.ok ? `I couldn’t read this computer’s schedule: ${sc.error}` : sc.missing === 0 ? `${sc.total} jobs scheduled` : `${sc.total} jobs, from a morning brief to keeping memory backed up`),
   ]);
   const oa = [];
   if (!d.on) oa.push(el("button", { class: "btn", disabled: starting || !d.claude ? "" : null, onclick: startJori }, sv.running ? "Finish setting up" : "Start " + (S.identity.assistant_name || "Jori"))); // control-scan-ok: the setting's default
@@ -551,7 +552,7 @@ function render() {
   if (current === "try" && d.on) setFace("happy", "All set. I’ll be here.");
   else if (Object.values(jobs).some((j) => j.state === "running") || starting) setFace("busy", "Working on it…");
   else if (d.mac) setFace("awake", current === "you" ? "Nice to meet you." : current === "connect" ? "Each one gives me a new sense." : current === "on" ? "Almost there." : current === "phone" ? "Let’s get me in your pocket." : "Awake and listening.");
-  else setFace("sleep", "Getting ready on this Mac.");
+  else setFace("sleep", "Getting ready on this computer.");
 }
 
 // ── Connect: one card per service, built once so typing survives the poll ──

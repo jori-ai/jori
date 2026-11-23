@@ -19,7 +19,8 @@
 set -euo pipefail
 
 source "$(dirname "${BASH_SOURCE[0]}")/lib/root.sh"   # JORI_INSTALL, JORI_INSTALL_TOOLS
-NODE=/opt/homebrew/bin/node
+NODE=/opt/homebrew/bin/node  # the Homebrew path, else node from PATH or ~/.local (installs without Homebrew)
+[ -x "$NODE" ] || NODE="$(command -v node 2>/dev/null || echo "$HOME/.local/bin/node")"
 BIN="$JORI_INSTALL_TOOLS/bin/inbox-mem"
 LOG="$JORI_INSTALL_TOOLS/agent/logs/inbox-mem-sync.log"
 

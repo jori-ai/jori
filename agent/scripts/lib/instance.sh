@@ -6,7 +6,7 @@
 # The kernel tree (root.sh, in a subshell so its variables do not leak into the caller).
 _jori_instance_tools="$(source "$(dirname "${BASH_SOURCE[0]}")/root.sh" && printf '%s' "$JORI_TOOLS")"
 _jori_instance_node="$(command -v node 2>/dev/null || true)"
-for _n in /opt/homebrew/bin/node /usr/local/bin/node; do
+for _n in /opt/homebrew/bin/node /usr/local/bin/node "$HOME/.local/bin/node"; do
   [ -n "$_jori_instance_node" ] && break
   [ -x "$_n" ] && _jori_instance_node="$_n"
 done

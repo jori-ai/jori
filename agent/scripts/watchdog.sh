@@ -26,7 +26,8 @@ JORI_PROBE_HEADER="X-Jori-Probe: watchdog"  # control-scan-ok: the software's na
 # It no longer manages tmux sessions or panes.
 
 LOG="$HOME/Dev/jori/agent/logs/watchdog.log"
-NODE=/opt/homebrew/bin/node
+NODE=/opt/homebrew/bin/node  # the Homebrew path, else node from PATH or ~/.local (installs without Homebrew)
+[ -x "$NODE" ] || NODE="$(command -v node 2>/dev/null || echo "$HOME/.local/bin/node")"
 SEND="$HOME/Dev/jori/bin/jori-send-curl"
 GMAIL_ACTION="$HOME/Dev/jori/bin/gmail-action"
 EMAIL_SEND="$HOME/Dev/jori/bin/email-send"

@@ -80,13 +80,18 @@ Five things most AI assistants miss.
 
 ## Quickstart
 
-On a Mac, one line installs everything and opens a setup page in your browser:
+Jori needs a computer that stays on: a Mac, a Windows PC, or a Linux server you rent. Pick one:
+
+- **Mac:** [Jori.dmg](https://github.com/jori-ai/jori/releases/latest/download/Jori.dmg). Open it, drag Jori to Applications, open it.
+- **Windows 10/11:** [JoriSetup.exe](https://github.com/jori-ai/jori/releases/latest/download/JoriSetup.exe). It sets up WSL and installs Jori inside it.
+- **A rented server:** [getjori.ai/cloud](https://getjori.ai/cloud) gives you a few lines to paste when you create an Ubuntu server, then a link to its setup page.
+- **Terminal (Mac or Linux):**
 
 ```bash
 curl -fsSL https://getjori.ai/install.sh | bash
 ```
 
-Sign in with Claude, confirm a few details it already filled in, press **Start Jori**. Or `brew trust jori-ai/tap && brew install jori-ai/tap/jori`, `npm create jori`, or the Mac app from [releases](https://github.com/jori-ai/jori/releases). Details: [docs/quickstart.md](docs/quickstart.md). Later, `jori update` keeps it current.
+Each one ends on a setup page in your browser: sign in with Claude, confirm a few details it already filled in, press **Start Jori**. Or `brew trust jori-ai/tap && brew install jori-ai/tap/jori`, or `npm create jori`. Details: [docs/quickstart.md](docs/quickstart.md). Later, `jori update` keeps it current.
 
 Or step by step in the terminal:
 
@@ -143,7 +148,7 @@ Jori is deliberately a small, opinionated kernel — not a turnkey product. The 
 
 Minimum:
 
-- **macOS** (Apple Silicon preferred) or **Linux**
+- **macOS** (Apple Silicon preferred), **Windows 10/11** (through WSL 2, set up by the installer) or **Linux** (your own machine or a rented server). iMessage, Notes, Photos and Find My need macOS.
 - **Node.js 22.5+** (built-in `node:sqlite`)
 - **[Ollama](https://ollama.com)** with `gemma3:1b` and `nomic-embed-text` pulled
 - A **Claude Max subscription**, with the Claude Code CLI logged in on the host (`claude`)
