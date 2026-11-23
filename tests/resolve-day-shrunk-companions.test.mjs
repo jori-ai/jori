@@ -14,6 +14,8 @@ import assert from "node:assert/strict";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { createRequire } from "node:module";
+import fs from "node:fs";
+import os from "node:os";
 import { at as fakeAt } from "./fixtures/fake-geo.mjs";
 // Synthetic places (tests/fixtures/fake-geo.mjs): `e` metres east and `n` north
 // of an obviously fake origin, keeping the real day's geometry.
@@ -23,7 +25,7 @@ const LLG = (e, n) => { const p = fakeAt(e, n); return { lat: p.lat, lng: p.lon 
 
 const require = createRequire(import.meta.url);
 const ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
-const { pruneShrunkCompanions, pieceCompanions, annotateCompanionJoins } = require(path.join(ROOT, "lib/resolve-day.js"))._internal;
+const { pruneShrunkCompanions, pieceCompanions, annotateCompanionJoins, settleJoinsOnFindMy, loadCompanionReadings } = require(path.join(ROOT, "lib/resolve-day.js"))._internal;
 const { stopHeaderHtml } = require(path.join(ROOT, "lib/daily-summary-render.js"))._internal;
 
 const iso = (s) => Date.parse(s);
@@ -195,4 +197,71 @@ test("the header reads the guest's time, and only when it is after the stop's ow
   assert.match(text(stop), /with Paige \+ Olin \(from 1:03pm\)/);
   assert.doesNotMatch(text({ ...stop, start: "13:03" }), /from/, "a stop that begins when the guest arrived needs no note");
   assert.doesNotMatch(text({ ...stop, companion_joins: undefined }), /from/);
+});
+
+// ---------------------------------------------------------------------------
+// Find My dates a guest better than a visit row does. A long stay's own row cannot
+// carry anyone who stepped out for a while, so the first row naming the household's
+// people was a short one hours in and the header said they arrived then; the 10-minute
+// readings had them with the user from the first one of the day (settleJoinsOnFindMy).
+// ---------------------------------------------------------------------------
+const rd = (person, hm, verdict = "together") => ({ person, t: iso(`2026-10-24T${hm}:00Z`), verdict });
+const joined = () => { const stop = STAY(); const noted = annotateCompanionJoins([stop], stayRows()); return { stop, noted }; };
+
+test("a guest Find My had with the user from the stop's first hours has no 'from' time", () => {
+  const { stop, noted } = joined();
+  assert.deepEqual(stop.companion_joins, { Olin: "13:03" });
+  const changed = settleJoinsOnFindMy([stop], [rd("Olin", "00:20"), rd("Olin", "00:32"), rd("Olin", "09:00", "apart"), rd("Olin", "13:05")]);
+  assert.equal("companion_joins" in stop, false, "they were there from the start");
+  assert.deepEqual(changed, [{ id: "s-9", name: "Olin", was: "13:03", now: null, findmy_at: "00:20" }]);
+  assert.deepEqual(noted[0].joins, {}, "the noted entry shares the joins object, so the day-level list can drop it");
+});
+
+test("a tracked guest who arrives mid-stay is dated by their first run of readings when it is earlier than the row", () => {
+  const { stop } = joined();
+  const changed = settleJoinsOnFindMy([stop], [rd("Olin", "01:00", "apart"), rd("Olin", "12:00", "apart"), rd("Olin", "12:50"), rd("Olin", "13:00")]);
+  assert.deepEqual(stop.companion_joins, { Olin: "12:50" });
+  assert.deepEqual(changed, [{ id: "s-9", name: "Olin", was: "13:03", now: "12:50", findmy_at: "12:50" }]);
+});
+
+test("Find My never adds a join, never moves one later, and a lone reading is not evidence", () => {
+  const later = joined().stop;
+  assert.deepEqual(settleJoinsOnFindMy([later], [rd("Olin", "13:20"), rd("Olin", "13:30")]), []);
+  assert.deepEqual(later.companion_joins, { Olin: "13:03" }, "the row's earlier time stands");
+  const lone = joined().stop;
+  assert.deepEqual(settleJoinsOnFindMy([lone], [rd("Olin", "00:20"), rd("Olin", "09:00")]), []);
+  assert.deepEqual(lone.companion_joins, { Olin: "13:03" }, "one reading with nothing near it settles nothing");
+  const none = STAY();
+  assert.deepEqual(settleJoinsOnFindMy([none], [rd("Olin", "00:20"), rd("Olin", "00:32")]), []);
+  assert.equal("companion_joins" in none, false, "a stop with no join gains none");
+});
+
+test("a guest Find My does not follow keeps the row's time; so do readings of someone else", () => {
+  const { stop } = joined();
+  assert.deepEqual(settleJoinsOnFindMy([stop], [rd("Paige", "00:20"), rd("Paige", "00:32")]), []);
+  assert.deepEqual(settleJoinsOnFindMy([stop], []), []);
+  assert.deepEqual(stop.companion_joins, { Olin: "13:03" });
+});
+
+test("the switch turns the Find My pass off", () => {
+  const { stop } = joined();
+  process.env.JORI_JOINS_FINDMY = "0";
+  try { assert.deepEqual(settleJoinsOnFindMy([stop], [rd("Olin", "00:20"), rd("Olin", "00:32")]), []); } finally { delete process.env.JORI_JOINS_FINDMY; }
+  assert.deepEqual(stop.companion_joins, { Olin: "13:03" });
+});
+
+test("the readings come from the day files, and a missing or broken file changes nothing", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "readings-"));
+  try {
+    const { stop } = joined();
+    assert.deepEqual(loadCompanionReadings([stop], dir), [], "no files, no readings");
+    fs.writeFileSync(path.join(dir, "readings-2026-10-24.json"), JSON.stringify([
+      { person: "Olin", t: "2026-10-24T00:20:00+00:00", verdict: "together" },
+      { person: "Olin", t: "2026-10-25T00:20:00+00:00", verdict: "together" },
+      { person: "Paige", t: "not a time", verdict: "together" },
+    ]));
+    fs.writeFileSync(path.join(dir, "readings-2026-10-23.json"), "{ not json");
+    assert.deepEqual(loadCompanionReadings([stop], dir), [{ person: "Olin", t: iso("2026-10-24T00:20:00Z"), verdict: "together" }]);
+    assert.deepEqual(loadCompanionReadings([STAY()], dir), [], "no stop with a join, no files read");
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
