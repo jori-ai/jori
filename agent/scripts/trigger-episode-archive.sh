@@ -52,6 +52,30 @@ else
   trigger_log "day_$YESTERDAY already present"
 fi
 
+# --- Step 1c: catch up the days just before yesterday -------------------------
+# Step 1 and the watchdog's heal look only at the newest "yesterday", so a day
+# whose daily_summaries row landed after both had looked (the host was down
+# overnight and the summary backfill finished hours late) would stay out of the
+# wiki for good once the date rolled on. Sweep the week before yesterday: a page
+# that exists costs one read; a date with no row is a no-op in wiki-day-write
+# ("no daily_summaries row", exit 0). Verify the outcome by re-reading the page,
+# as Step 1 does.
+for N in 1 2 3 4 5 6 7; do
+  PAST=$(date -j -v-"${N}"d -f "%Y-%m-%d %H:%M:%S" "$YESTERDAY 12:00:00" +%Y-%m-%d 2>/dev/null) || continue
+  "$BIN/wiki" read "day_$PAST" >/dev/null 2>&1 && continue
+  CU_OUT=$(run_capped 300 node "$BIN/wiki-day-write" "$PAST" 2>&1)
+  if "$BIN/wiki" read "day_$PAST" >/dev/null 2>&1; then
+    trigger_log "catch-up: wrote day_$PAST that an earlier run missed: ${CU_OUT:-(no output)}"
+  else
+    # A date with no row is expected and stays quiet; anything else is logged so
+    # a writer that keeps failing on a day that has a row is visible.
+    case "$CU_OUT" in
+      *"no daily_summaries row"*) ;;
+      *) trigger_log "catch-up: day_$PAST still missing after wiki-day-write: $(echo "${CU_OUT:-no output}" | tail -1 | cut -c1-200)" ;;
+    esac
+  fi
+done
+
 # --- Step 1a: rollups on Monday / 1st (local calendar) ------------------------
 DOW=$(node -e 'console.log(new Date(process.argv[1]+"T12:00:00Z").getUTCDay())' "$TODAY")   # 1 = Monday
 DOM=${TODAY:8:2}

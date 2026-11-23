@@ -2568,8 +2568,33 @@ if [ "$HOME_HOUR" -ge "$EA_GATE_HOUR" ]; then
     # success), and a heal by the same kind of actor fails the same way.
     # wiki-day-write is one fixed command with no language judgment in it
     # (Rule #0b), matching the cron trigger (trigger-episode-archive.sh).
+    #
+    # The once-per-24h heal is spent only when the daily_summaries row exists.
+    # wiki-day-write exits 0 with "no daily_summaries row" when there is nothing
+    # to archive, so a heal run before the row lands writes nothing yet uses up
+    # the day's single try. That is the usual order after a host outage: the
+    # watchdog's daily-summary backfill takes a quarter of an hour, the heal
+    # here ran in the first tick, and nothing re-armed it once the row arrived,
+    # so both 🔴 pages fired for a day the watchdog could have written itself.
+    # An empty `[]` answer means no row yet: wait, and leave the page to the
+    # daily-summary-missing detector above, which owns a missing row. An
+    # unreadable answer fails open to the old behaviour (heal, then page).
+    # The marker holds the date it was spent on, so a marker left by an earlier
+    # target (or the old empty file) never blocks a new day.
+    DS_ROW_FOR_EA=$(curl -s --max-time 8 \
+      -H "apikey: $SUPABASE_KEY" -H "Authorization: Bearer $SUPABASE_KEY" \
+      "$SUPABASE_URL/rest/v1/daily_summaries?date=eq.${EA_TARGET}&select=date,narrative&limit=1" 2>/dev/null)
+    EA_ROW_READY=1
+    [ "$(printf '%s' "$DS_ROW_FOR_EA" | tr -d '[:space:]')" = "[]" ] && EA_ROW_READY=0
+    # Only an answer that shows a row proves the heal can succeed; an unreadable
+    # one (network down right after a reboot, an error body) still tries, but
+    # does not spend the day's marker on the strength of a guess.
+    EA_ROW_CONFIRMED=0
+    case "$DS_ROW_FOR_EA" in *'"date"'*) EA_ROW_CONFIRMED=1 ;; esac
     SHOULD_HEAL=1
-    if [ -f "$EA_HEAL_MARKER" ]; then
+    if [ "$EA_ROW_READY" -ne 1 ]; then
+      SHOULD_HEAL=0
+    elif [ -f "$EA_HEAL_MARKER" ] && [ "$(cat "$EA_HEAL_MARKER" 2>/dev/null)" = "$EA_TARGET" ]; then
       HEAL_AGE=$(( $(date +%s) - $(stat -f%m "$EA_HEAL_MARKER") ))
       [ "$HEAL_AGE" -lt 86400 ] && SHOULD_HEAL=0
     fi
@@ -2579,15 +2604,25 @@ if [ "$HOME_HOUR" -ge "$EA_GATE_HOUR" ]; then
     if [ "$SHOULD_HEAL" -eq 1 ] && [ -f "$EA_DAY_WRITER" ]; then
       EA_HEAL_OUT=$(timeout 60 node "$EA_DAY_WRITER" "$EA_TARGET" 2>&1)
       EA_HEAL_RC=$?
-      touch "$EA_HEAL_MARKER"
+      if [ "$EA_ROW_CONFIRMED" -eq 1 ]; then
+        printf '%s\n' "$EA_TARGET" > "$EA_HEAL_MARKER"
+      elif [ ! -f "$EA_HEAL_MARKER" ]; then
+        # Unconfirmed lookup: start the 20-minute page clock, but leave the
+        # heal armed (an empty marker never matches the target) so the next
+        # tick tries again once the row can be seen.
+        : > "$EA_HEAL_MARKER"
+      fi
       log "Self-heal: ran wiki-day-write $EA_TARGET directly (rc=$EA_HEAL_RC): ${EA_HEAL_OUT:-(no output)}"
     fi
 
     # Page only after the heal has had ≥20 min to land the page and it's still
     # missing — avoids paging while a freshly-dispatched backfill is running.
+    # No page while the row itself is missing: the daily-summary detector pages
+    # that, and an episode-archive 🔴 for a day with nothing to archive is the
+    # same root cause twice.
     HEAL_AGE=999999
     [ -f "$EA_HEAL_MARKER" ] && HEAL_AGE=$(( $(date +%s) - $(stat -f%m "$EA_HEAL_MARKER") ))
-    if [ "$HEAL_AGE" -ge 1200 ] && incident_should_alert "episode-archive-missing" 86400 2 86400; then
+    if [ "$EA_ROW_READY" -eq 1 ] && [ "$HEAL_AGE" -ge 1200 ] && incident_should_alert "episode-archive-missing" 86400 2 86400; then
       notify "🔴 Episode-archive missing for $EA_TARGET — the ${EA_CRON_HOUR}:xx $(home_tz_label) cron didn't produce a day_${EA_TARGET} wiki page and a watchdog backfill dispatch didn't recover it. A day of episodic memory is at risk. Backfill manually: ~/Dev/jori/bin/wiki-day-write $EA_TARGET, or check the ops supervisor (:$JORI_PORT_OPS_HEALTH) health + watchdog.log."
     fi
 
@@ -2603,9 +2638,7 @@ if [ "$HOME_HOUR" -ge "$EA_GATE_HOUR" ]; then
     # one actually happened, and tracks it under its own incident key so a
     # genuine "row exists, archive is broken" case pages distinctly instead
     # of hiding inside the generic episode-archive-missing noise.
-    DS_ROW_FOR_EA=$(curl -s --max-time 8 \
-      -H "apikey: $SUPABASE_KEY" -H "Authorization: Bearer $SUPABASE_KEY" \
-      "$SUPABASE_URL/rest/v1/daily_summaries?date=eq.${EA_TARGET}&select=date,narrative&limit=1" 2>/dev/null)
+    # (DS_ROW_FOR_EA is the row lookup made above, before the heal.)
     if echo "$DS_ROW_FOR_EA" | grep -q '"narrative":"'; then
       ISSUES="$ISSUES daily-summary-orphan-row:$EA_TARGET"
       if [ "$HEAL_AGE" -ge 1200 ] && incident_should_alert "daily-summary-orphan-row" 86400 2 86400; then
@@ -2618,7 +2651,10 @@ if [ "$HOME_HOUR" -ge "$EA_GATE_HOUR" ]; then
     # Escalation: still missing 3h past the grace window (~90 ticks) means the
     # self-heal has demonstrably failed and this is not transient. Separate
     # incident key so it isn't swallowed by the 24h cooldown on the 🔴 above.
-    if [ "$ATTEMPT" -ge 90 ] && incident_should_alert "episode-archive-escalation" 86400 1 86400; then
+    # Not while the row itself is missing: no heal ran and the writer would be a
+    # no-op, so "automated backfill has failed" would be untrue; the
+    # daily-summary detector owns that case.
+    if [ "$EA_ROW_READY" -eq 1 ] && [ "$ATTEMPT" -ge 90 ] && incident_should_alert "episode-archive-escalation" 86400 1 86400; then
       # kernel-closure-ok: advice text in a page, not a call
       notify "🚨 ESCALATION: day_${EA_TARGET} wiki page STILL missing after 3h and $ATTEMPT watchdog checks. Automated backfill has failed — this needs hands. Run ~/Dev/jori/bin/wiki-day-write $EA_TARGET, and check whether the ops supervisor (:$JORI_PORT_OPS_HEALTH) is dropping dispatches at /compact boundaries."
     fi

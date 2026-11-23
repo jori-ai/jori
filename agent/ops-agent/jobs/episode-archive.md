@@ -19,9 +19,12 @@ Every "what did I do on …?" lookup, `wiki_search`, and `wiki_backlinks <person
 "Yesterday" and "today" are the user's **local** calendar (`bin/local-day`), not the home zone's — the same fix daily-summary got on 2026-10-03, so the page looked for is the page daily-summary named.
 
 1. **Day page.** If `wiki read day_<yesterday>` fails, run `wiki-day-write <yesterday>`, then re-check that the page exists. Verify the outcome, never the exit code: `wiki-day-write` prints `no daily_summaries row for <date>` and **exits 0** on a missing row. Still missing → system-channel alert. Read-then-write is deliberate: `wiki-day-write` is not a no-op on unchanged input — each run appends two identical `page_revisions` rows.
+1c. **Catch-up sweep.** For each of the seven days before yesterday with no `day_<date>` page, run `wiki-day-write <date>` and verify by re-reading the page; a date with no `daily_summaries` row is a no-op. This is what writes a day whose summary row landed after both this job and the watchdog's heal had looked at it (a host outage overnight), which would otherwise stay missing once the date rolls on. Logged as `catch-up: wrote day_<date> …`.
 2. **Rollups.** Local Monday → `wiki-week-write <yesterday>`; local 1st → `wiki-month-write <yesterday's YYYY-MM>`. Non-fatal; logged.
 3. **Embeddings.** `embed-daily-summaries` fills `daily_summaries.embedding` (local Ollama `nomic-embed-text`) for `episode_search(semantic=true)`. Non-fatal; next run retries.
 4. **Verify.** If `episode <yesterday>` renders fewer than 8 lines, alert the system channel (narrative null or a stub) and leave it for manual inspection.
+
+**The watchdog's heal** (`watchdog.sh` § Episode-archive cron-miss detection) is the same-morning backstop: after the job's hour + 2 it runs `wiki-day-write` for yesterday once per 24 h, and only when that day's `daily_summaries` row exists (its marker `data/.episode-archive-heal-cooldown` holds the date it was spent on). While the row is missing it waits and pages nothing: the daily-summary detector owns a missing row. It pages (🔴) only when the row exists and the heal could not produce the page.
 
 Success is silent: no email, no ping, no push. Failures go to the system channel (`jori-send-curl --channel system --skip-precheck`, class 5 — a job reporting its own failure).
 
